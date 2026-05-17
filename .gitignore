@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+target/
+
+# Build output
+dist/
+
+# Models (large files, downloaded separately)
+models/*.onnx
+models/**/*.onnx
+models/**/*.npy
+
+# Embedded Python runtime (too large for git)
+python/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+training/**/__pycache__/
+
+# Model files (user data)
+*.pth
+*.index
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Tauri
+src-tauri/target/
+WixTools/
+
+# Training output
+training/output/
+training/logs/
+training/datasets/
+
+# Temp
+*.tmp
+*.bak
+
+# Legacy v1 files
+.claude-memory/
+S2H/
+
+# Tauri generated schemas (regenerated on build)
+src-tauri/gen/

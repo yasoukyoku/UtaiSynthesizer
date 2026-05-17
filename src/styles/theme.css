@@ -1,0 +1,102 @@
+:root {
+  /* === UTAI Theme — Vocaloid/UTAU Retro Dark === */
+
+  /* Base colors — deep navy/indigo foundation */
+  --bg-deep: #080b14;
+  --bg-base: #0d1220;
+  --bg-surface: #131a2b;
+  --bg-panel: #1a2236;
+  --bg-elevated: #212b42;
+  --bg-hover: #283350;
+
+  /* Borders */
+  --border-subtle: #1e2a45;
+  --border-default: #2a3a5c;
+  --border-strong: #3d4f75;
+  --border-active: var(--accent-primary);
+
+  /* Primary accent — teal/cyan (Miku-adjacent) */
+  --accent-primary: #39c5bb;
+  --accent-primary-dim: #2a9d95;
+  --accent-primary-glow: rgba(57, 197, 187, 0.15);
+  --accent-primary-bright: #5dddd4;
+
+  /* Secondary — purple (Vocaloid heritage) */
+  --accent-secondary: #8b5cf6;
+  --accent-secondary-dim: #6d3fd4;
+  --accent-secondary-glow: rgba(139, 92, 246, 0.15);
+
+  /* Tertiary — pink (highlight, alerts) */
+  --accent-tertiary: #ff6b9d;
+  --accent-tertiary-dim: #d44d7a;
+
+  /* Functional */
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+  --color-info: #60a5fa;
+
+  /* Text */
+  --text-primary: #e8ecf4;
+  --text-secondary: #8b9ec2;
+  --text-muted: #556b94;
+  --text-inverse: #0d1220;
+
+  /* Piano roll specific */
+  --piano-white: #c8d0e0;
+  --piano-black: #1a2236;
+  --piano-grid: rgba(57, 197, 187, 0.06);
+  --piano-grid-beat: rgba(57, 197, 187, 0.12);
+  --piano-grid-bar: rgba(57, 197, 187, 0.22);
+  --note-fill: var(--accent-primary);
+  --note-selected: var(--accent-secondary);
+  --note-rest: #2a3a5c;
+
+  /* Track colors */
+  --track-vocal: #39c5bb;
+  --track-audio: #60a5fa;
+  --track-instrument: #a78bfa;
+
+  /* Typography */
+  --font-ui: 'Inter', 'Noto Sans SC', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 13px;
+  --font-size-lg: 15px;
+  --font-size-xl: 18px;
+  --font-size-2xl: 24px;
+
+  /* Spacing */
+  --space-xs: 2px;
+  --space-sm: 4px;
+  --space-md: 8px;
+  --space-lg: 12px;
+  --space-xl: 16px;
+  --space-2xl: 24px;
+  --space-3xl: 32px;
+
+  /* Radius */
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.5);
+  --shadow-glow: 0 0 12px var(--accent-primary-glow);
+
+  /* Transitions */
+  --transition-fast: 100ms ease;
+  --transition-normal: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  /* Z-index layers */
+  --z-base: 0;
+  --z-panel: 10;
+  --z-overlay: 100;
+  --z-modal: 1000;
+  --z-tooltip: 2000;
+}

@@ -1,0 +1,121 @@
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 var(--space-lg);
+  background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-surface) 100%);
+  border-bottom: 1px solid var(--border-subtle);
+  -webkit-app-region: drag;
+}
+
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-brand {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--accent-primary);
+  letter-spacing: 2px;
+  text-shadow: 0 0 8px var(--accent-primary-glow);
+}
+
+.titlebar-menu {
+  display: flex;
+  gap: var(--space-xs);
+}
+
+.menu-item {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  padding: var(--space-xs) var(--space-md);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+}
+
+.menu-item:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.titlebar-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.project-name {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.dirty-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-tertiary);
+}
+
+.titlebar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  -webkit-app-region: no-drag;
+}
+
+.training-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-success);
+  font-family: var(--font-mono);
+}
+
+.pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-success);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.titlebar-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  padding: 0;
+}
+
+.titlebar-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-default);
+}
+
+.titlebar-btn.active {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary-dim);
+  background: var(--accent-primary-glow);
+}

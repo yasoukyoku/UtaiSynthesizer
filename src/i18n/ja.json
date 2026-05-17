@@ -1,0 +1,58 @@
+{
+  "untitled": "無題プロジェクト",
+  "menu": {
+    "file": "ファイル",
+    "edit": "編集",
+    "view": "表示",
+    "tools": "ツール"
+  },
+  "transport": {
+    "play": "再生",
+    "stop": "停止",
+    "record": "録音"
+  },
+  "toolbar": {
+    "bpm": "BPM",
+    "position": "位置",
+    "snap": "スナップ",
+    "free": "フリー",
+    "addTrack": "トラック追加"
+  },
+  "tracks": {
+    "title": "トラック",
+    "empty": "音声ファイルをドロップまたは新規トラック追加"
+  },
+  "training": {
+    "title": "トレーニング",
+    "panel": "トレーニングパネル",
+    "active": "トレーニング中",
+    "modelName": "モデル名",
+    "modelNamePlaceholder": "モデル名を入力...",
+    "backend": "バックエンド",
+    "dataset": "データセットパス",
+    "datasetPlaceholder": "データセットフォルダを選択...",
+    "selectDataset": "データセットフォルダを選択",
+    "epochs": "エポック数",
+    "batchSize": "バッチサイズ",
+    "sampleRate": "サンプルレート",
+    "augmentation": "データ拡張強度",
+    "augNone": "なし",
+    "augStrong": "強い",
+    "start": "トレーニング開始",
+    "stop": "トレーニング停止",
+    "epoch": "エポック",
+    "loss": "損失",
+    "elapsed": "経過時間",
+    "eta": "残り時間",
+    "modelExists": "モデルが既に存在します",
+    "modelExistsDesc": "モデル「{{name}}」は既に存在します。既存のモデルで続行しますか、削除して再トレーニングしますか？",
+    "continueTraining": "続行",
+    "deleteRetrain": "削除して再トレーニング"
+  },
+  "common": {
+    "cancel": "キャンセル",
+    "confirm": "確認",
+    "save": "保存",
+    "open": "開く"
+  }
+}

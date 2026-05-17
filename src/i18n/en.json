@@ -1,0 +1,58 @@
+{
+  "untitled": "Untitled Project",
+  "menu": {
+    "file": "File",
+    "edit": "Edit",
+    "view": "View",
+    "tools": "Tools"
+  },
+  "transport": {
+    "play": "Play",
+    "stop": "Stop",
+    "record": "Record"
+  },
+  "toolbar": {
+    "bpm": "BPM",
+    "position": "Position",
+    "snap": "Snap",
+    "free": "Free",
+    "addTrack": "Add Track"
+  },
+  "tracks": {
+    "title": "Tracks",
+    "empty": "Drop audio files or add a new track"
+  },
+  "training": {
+    "title": "Training",
+    "panel": "Training Panel",
+    "active": "Training",
+    "modelName": "Model Name",
+    "modelNamePlaceholder": "Enter model name...",
+    "backend": "Backend Engine",
+    "dataset": "Dataset Path",
+    "datasetPlaceholder": "Select dataset folder...",
+    "selectDataset": "Select Dataset Folder",
+    "epochs": "Epochs",
+    "batchSize": "Batch Size",
+    "sampleRate": "Sample Rate",
+    "augmentation": "Data Augmentation",
+    "augNone": "None",
+    "augStrong": "Strong",
+    "start": "Start Training",
+    "stop": "Stop Training",
+    "epoch": "Epoch",
+    "loss": "Loss",
+    "elapsed": "Elapsed",
+    "eta": "ETA",
+    "modelExists": "Model Already Exists",
+    "modelExistsDesc": "Model \"{{name}}\" already exists. Would you like to continue training on the existing model, or delete and retrain?",
+    "continueTraining": "Continue Training",
+    "deleteRetrain": "Delete & Retrain"
+  },
+  "common": {
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "save": "Save",
+    "open": "Open"
+  }
+}

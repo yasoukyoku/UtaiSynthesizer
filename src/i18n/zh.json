@@ -1,0 +1,58 @@
+{
+  "untitled": "未命名项目",
+  "menu": {
+    "file": "文件",
+    "edit": "编辑",
+    "view": "视图",
+    "tools": "工具"
+  },
+  "transport": {
+    "play": "播放",
+    "stop": "停止",
+    "record": "录制"
+  },
+  "toolbar": {
+    "bpm": "BPM",
+    "position": "位置",
+    "snap": "吸附",
+    "free": "自由",
+    "addTrack": "添加轨道"
+  },
+  "tracks": {
+    "title": "轨道",
+    "empty": "拖放音频文件或添加新轨道"
+  },
+  "training": {
+    "title": "训练",
+    "panel": "训练面板",
+    "active": "训练中",
+    "modelName": "模型名称",
+    "modelNamePlaceholder": "输入模型名称...",
+    "backend": "后端引擎",
+    "dataset": "数据集路径",
+    "datasetPlaceholder": "选择数据集文件夹...",
+    "selectDataset": "选择数据集文件夹",
+    "epochs": "训练轮数",
+    "batchSize": "批大小",
+    "sampleRate": "采样率",
+    "augmentation": "数据增强强度",
+    "augNone": "无",
+    "augStrong": "强",
+    "start": "开始训练",
+    "stop": "停止训练",
+    "epoch": "轮次",
+    "loss": "损失",
+    "elapsed": "已用时间",
+    "eta": "预计剩余",
+    "modelExists": "模型已存在",
+    "modelExistsDesc": "模型「{{name}}」已经存在。你想要继续在现有模型上训练，还是删除后重新训练？",
+    "continueTraining": "续训",
+    "deleteRetrain": "删除并重训"
+  },
+  "common": {
+    "cancel": "取消",
+    "confirm": "确认",
+    "save": "保存",
+    "open": "打开"
+  }
+}

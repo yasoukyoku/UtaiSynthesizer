@@ -1,0 +1,192 @@
+@import './theme.css';
+
+/* === Reset & Base === */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background: var(--bg-deep);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* === Subtle background pattern (retro grid) === */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(var(--bg-deep) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bg-deep) 1px, transparent 1px);
+  background-size: 40px 40px;
+  opacity: 0.03;
+  z-index: -1;
+}
+
+/* === Scrollbar (retro styled) === */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-base);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-primary-dim);
+}
+
+/* === Selection === */
+::selection {
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+/* === Links === */
+a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+/* === Utility classes === */
+.mono {
+  font-family: var(--font-mono);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.text-secondary {
+  color: var(--text-secondary);
+}
+
+.glow {
+  box-shadow: var(--shadow-glow);
+}
+
+/* === Common component styles === */
+button {
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  padding: var(--space-sm) var(--space-lg);
+  transition: all var(--transition-fast);
+}
+
+button:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-primary-dim);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button.primary {
+  background: var(--accent-primary-dim);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+button.primary:hover {
+  background: var(--accent-primary);
+  box-shadow: 0 0 8px var(--accent-primary-glow);
+}
+
+button.danger {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+button.danger:hover {
+  background: rgba(248, 113, 113, 0.1);
+}
+
+/* === Input fields === */
+input, select {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  padding: var(--space-sm) var(--space-md);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+input:focus, select:focus {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary-glow);
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+input[type="range"]::-webkit-slider-track {
+  height: 4px;
+  background: var(--border-default);
+  border-radius: 2px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  margin-top: -5px;
+  cursor: pointer;
+}
+
+/* === Tooltips === */
+[data-tooltip] {
+  position: relative;
+}
+
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
+  z-index: var(--z-tooltip);
+}
+
+[data-tooltip]:hover::after {
+  opacity: 1;
+}

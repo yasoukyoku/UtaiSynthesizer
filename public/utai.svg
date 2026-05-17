@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="#0d1220" stroke="#39c5bb" stroke-width="2"/>
+  <!-- Waveform / note stylized -->
+  <path d="M16 32 Q22 22 28 32 Q34 42 40 32 Q46 22 52 32" stroke="#39c5bb" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <!-- Musical note accent -->
+  <circle cx="44" cy="24" r="4" fill="#8b5cf6"/>
+  <line x1="48" y1="24" x2="48" y2="14" stroke="#8b5cf6" stroke-width="2" stroke-linecap="round"/>
+  <!-- Bottom text region hint -->
+  <path d="M20 44 L44 44" stroke="#39c5bb" stroke-width="1" opacity="0.5" stroke-dasharray="2 2"/>
+</svg>

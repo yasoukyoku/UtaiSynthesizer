@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/.vscode/tauri.conf.schema.json",
+  "productName": "UTAI",
+  "version": "2.0.0-alpha.1",
+  "identifier": "com.utai.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "UTAI",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "decorations": true,
+        "resizable": true
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": []
+  },
+  "plugins": {
+    "shell": {
+      "open": true,
+      "scope": [
+        {
+          "name": "python-training",
+          "cmd": "./python/python.exe",
+          "args": true
+        }
+      ]
+    },
+    "fs": {
+      "scope": ["$APPDATA/**", "$RESOURCE/**", "$HOME/.utai/**"]
+    }
+  }
+}

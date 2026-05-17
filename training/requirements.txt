@@ -1,0 +1,12 @@
+torch>=2.1.0
+torchaudio>=2.1.0
+numpy>=1.24.0,<2.0
+librosa>=0.10.0
+soundfile>=0.12.0
+scipy>=1.11.0
+faiss-cpu>=1.7.4
+tensorboard>=2.14.0
+tqdm>=4.65.0
+praat-parselmouth>=0.4.3
+pyworld>=0.3.4
+torchcrepe>=0.0.20
