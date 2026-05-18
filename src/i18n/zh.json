@@ -49,6 +49,14 @@
     "continueTraining": "续训",
     "deleteRetrain": "删除并重训"
   },
+  "workflow": {
+    "title": "工作流编辑器",
+    "nodes": "节点",
+    "catVoice": "声音转换",
+    "catEffects": "效果器",
+    "catSeparation": "音频分离",
+    "catIO": "输入/输出"
+  },
   "common": {
     "cancel": "取消",
     "confirm": "确认",

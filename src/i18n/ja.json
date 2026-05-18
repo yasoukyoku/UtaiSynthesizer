@@ -49,6 +49,14 @@
     "continueTraining": "続行",
     "deleteRetrain": "削除して再トレーニング"
   },
+  "workflow": {
+    "title": "ワークフローエディタ",
+    "nodes": "ノード",
+    "catVoice": "ボイス変換",
+    "catEffects": "エフェクト",
+    "catSeparation": "音声分離",
+    "catIO": "入力 / 出力"
+  },
   "common": {
     "cancel": "キャンセル",
     "confirm": "確認",

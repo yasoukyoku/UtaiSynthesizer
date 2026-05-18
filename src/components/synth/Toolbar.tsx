@@ -1,9 +1,11 @@
 import { useProjectStore } from "../../store/project";
+import { useAppStore } from "../../store/app";
 import { useTranslation } from "react-i18next";
 import "./Toolbar.css";
 
 export function Toolbar() {
   const { t } = useTranslation();
+  const { openWorkflow } = useAppStore();
   const { tempo, setTempo, playheadTick, timeSignature } = useProjectStore();
 
   return (
@@ -69,6 +71,13 @@ export function Toolbar() {
       <div className="toolbar-section">
         <button className="toolbar-btn" data-tooltip={t("toolbar.addTrack")}>
           + Track
+        </button>
+        <button
+          className="toolbar-btn"
+          onClick={() => openWorkflow("demo-segment")}
+          data-tooltip={t("workflow.title")}
+        >
+          ⚙ Workflow
         </button>
       </div>
     </div>

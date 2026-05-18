@@ -49,6 +49,14 @@
     "continueTraining": "Continue Training",
     "deleteRetrain": "Delete & Retrain"
   },
+  "workflow": {
+    "title": "Workflow Editor",
+    "nodes": "Nodes",
+    "catVoice": "Voice Conversion",
+    "catEffects": "Effects",
+    "catSeparation": "Separation",
+    "catIO": "Input / Output"
+  },
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm",

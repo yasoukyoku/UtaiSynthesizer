@@ -1,0 +1,45 @@
+.wf-node {
+  min-width: 140px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--node-color, var(--border-default));
+  background: var(--bg-surface);
+}
+
+.wf-node-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: color-mix(in srgb, var(--node-color, var(--accent-primary)) 15%, var(--bg-panel));
+  border-bottom: 1px solid var(--node-color, var(--border-subtle));
+}
+
+.wf-node-icon {
+  font-size: 12px;
+}
+
+.wf-node-label {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.wf-node-body {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.wf-node-body label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.wf-node-body select,
+.wf-node-body input {
+  font-size: 10px;
+  padding: 2px 4px;
+  width: 100%;
+}

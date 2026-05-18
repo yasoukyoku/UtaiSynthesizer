@@ -1,0 +1,114 @@
+.workflow-editor {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-deep);
+}
+
+.workflow-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  padding: 0 var(--space-xl);
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.workflow-title {
+  font-size: var(--font-size-sm);
+  color: var(--accent-secondary);
+  font-weight: 600;
+}
+
+.workflow-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  padding: 0;
+}
+
+.workflow-close:hover {
+  color: var(--color-error);
+  background: rgba(248, 113, 113, 0.1);
+}
+
+.workflow-body {
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.workflow-canvas {
+  flex: 1;
+  position: relative;
+}
+
+/* React Flow theme overrides */
+.workflow-canvas .react-flow__node {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  box-shadow: var(--shadow-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.workflow-canvas .react-flow__node.selected {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 12px var(--accent-primary-glow);
+}
+
+.workflow-canvas .react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  border: 2px solid var(--bg-panel);
+}
+
+.workflow-canvas .react-flow__handle-left {
+  left: -5px;
+}
+
+.workflow-canvas .react-flow__handle-right {
+  right: -5px;
+}
+
+.workflow-canvas .react-flow__edge-path {
+  stroke: var(--accent-primary-dim);
+  stroke-width: 2;
+}
+
+.workflow-canvas .react-flow__controls {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.workflow-canvas .react-flow__controls button {
+  background: var(--bg-panel);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  width: 28px;
+  height: 28px;
+}
+
+.workflow-canvas .react-flow__controls button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.workflow-canvas .react-flow__minimap {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+}
