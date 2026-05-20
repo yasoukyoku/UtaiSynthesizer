@@ -23,8 +23,9 @@ __pycache__/
 *.pyo
 training/**/__pycache__/
 
-# Converter inspection output (generated, machine-specific)
+# Converter outputs (generated, machine-specific)
 converter/inspections/
+converter/test_output/
 
 # Model files (user data)
 *.pth
