@@ -1,6 +1,6 @@
 use ndarray::Array2;
 
-use super::engine::OnnxEngine;
+use super::engine::{InputTensor, OnnxEngine};
 use crate::{Result, UtaiError};
 
 #[derive(Debug, Clone)]
@@ -23,27 +23,29 @@ pub fn infer(
 ) -> Result<S2HOutput> {
     let seq_len = score.phonemes.len();
 
-    // Encode i64 phonemes and durations as f32 for run_f32 interface
-    let phonemes_f32: Vec<f32> = score.phonemes.iter().map(|&x| x as f32).collect();
-    let durations_f32: Vec<f32> = score.durations.iter().map(|&x| x as f32).collect();
+    let phonemes = InputTensor::I64 {
+        data: score.phonemes.clone(),
+        shape: vec![1, seq_len as i64],
+    };
 
-    // phonemes: [1, seq_len]
-    let phonemes_shape = vec![1usize, seq_len];
-    // durations: [1, seq_len]
-    let durations_shape = vec![1usize, seq_len];
-    // pitches: [1, seq_len]
-    let pitches_shape = vec![1usize, seq_len];
+    let durations = InputTensor::I64 {
+        data: score.durations.clone(),
+        shape: vec![1, seq_len as i64],
+    };
 
-    let inputs: Vec<(&str, &[f32], &[usize])> = vec![
-        ("phonemes", &phonemes_f32, &phonemes_shape),
-        ("durations", &durations_f32, &durations_shape),
-        ("pitches", &score.pitches, &pitches_shape),
+    let pitches = InputTensor::F32 {
+        data: score.pitches.clone(),
+        shape: vec![1, seq_len as i64],
+    };
+
+    let inputs = vec![
+        ("phonemes", phonemes),
+        ("durations", durations),
+        ("pitches", pitches),
     ];
 
-    let outputs = engine.run_f32(session_id, &inputs)?;
+    let outputs = engine.run(session_id, inputs)?;
 
-    // Dual-head output: [0] = HuBERT-base features, [1] = ContentVec features
-    // Each output is a flat Vec<f32> representing [1, T, 768] → reshape to [T, 768]
     let hubert_features = reshape_features(&outputs, 0)?;
     let contentvec_features = reshape_features(&outputs, 1)?;
 
@@ -59,11 +61,9 @@ fn reshape_features(outputs: &[Vec<f32>], index: usize) -> Result<Array2<f32>> {
     })?;
 
     if data.is_empty() {
-        // Placeholder: return empty array when engine returns stub data
         return Ok(Array2::zeros((0, 768)));
     }
 
-    // Assume feature dim is 768; derive T from total length
     let feature_dim = 768usize;
     let t = data.len() / feature_dim;
     if t * feature_dim != data.len() {

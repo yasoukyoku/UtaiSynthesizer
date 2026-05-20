@@ -1,10 +1,8 @@
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 
-use super::engine::OnnxEngine;
+use super::engine::{InputTensor, OnnxEngine};
 use super::{apply_pitch_shift, ConvertOptions, SynthesisResult};
-use crate::{Result, UtaiError};
-
-const SOVITS_SAMPLE_RATE: u32 = 44100;
+use crate::Result;
 
 pub fn infer(
     engine: &OnnxEngine,
@@ -12,48 +10,52 @@ pub fn infer(
     contentvec_features: &Array2<f32>,
     f0: &[f32],
     options: &ConvertOptions,
-    shallow_diffusion: bool,
+    _shallow_diffusion: bool,
+    sample_rate: u32,
 ) -> Result<SynthesisResult> {
     let f0_shifted = apply_pitch_shift(f0, options.f0_shift);
+    let t = contentvec_features.shape()[0];
+    let ssl_dim = contentvec_features.shape()[1] as i64;
 
-    // c: [1, T, 768]
-    let features = contentvec_features.clone().insert_axis(Axis(0));
-    let c_shape = vec![
-        features.shape()[0],
-        features.shape()[1],
-        features.shape()[2],
-    ];
-    let c_data = features.as_slice().ok_or_else(|| {
-        UtaiError::Inference("Features array not contiguous".to_string())
-    })?;
+    // c: [1, T, ssl_dim]
+    let c_data: Vec<f32> = contentvec_features.iter().copied().collect();
+    let c = InputTensor::F32 {
+        data: c_data,
+        shape: vec![1, t as i64, ssl_dim],
+    };
 
     // f0: [1, T]
-    let f0_shape = vec![1usize, f0_shifted.len()];
+    let f0_input = InputTensor::F32 {
+        data: f0_shifted.clone(),
+        shape: vec![1, t as i64],
+    };
 
-    // sid: [1] — speaker id as f32
-    let speaker_id = options.speaker_id.unwrap_or(0);
-    let sid_data = vec![speaker_id as f32];
-    let sid_shape = vec![1usize];
+    // uv: [1, T] — voiced/unvoiced flags
+    let uv_data: Vec<i64> = f0_shifted.iter().map(|&x| if x > 0.0 { 1i64 } else { 0i64 }).collect();
+    let uv = InputTensor::I64 {
+        data: uv_data,
+        shape: vec![1, t as i64],
+    };
 
-    let mut inputs: Vec<(&str, &[f32], &[usize])> = vec![
-        ("c", c_data, &c_shape),
-        ("f0", &f0_shifted, &f0_shape),
-        ("sid", &sid_data, &sid_shape),
+    // sid: [1]
+    let sid = InputTensor::I64 {
+        data: vec![options.speaker_id.unwrap_or(0) as i64],
+        shape: vec![1],
+    };
+
+    let inputs = vec![
+        ("c", c),
+        ("f0", f0_input),
+        ("uv", uv),
+        ("sid", sid),
     ];
 
-    // shallow diffusion: n_steps as f32
-    let n_steps_data = vec![20.0f32];
-    let n_steps_shape = vec![1usize];
-    if shallow_diffusion {
-        inputs.push(("n_steps", &n_steps_data, &n_steps_shape));
-    }
-
-    let outputs = engine.run_f32(session_id, &inputs)?;
+    let outputs = engine.run(session_id, inputs)?;
     let audio = outputs.into_iter().next().unwrap_or_default();
 
     Ok(SynthesisResult {
         audio,
-        sample_rate: SOVITS_SAMPLE_RATE,
+        sample_rate,
     })
 }
 
@@ -65,50 +67,12 @@ pub fn infer_blended(
     options: &ConvertOptions,
     speaker_weights: &[(u32, f32)],
     shallow_diffusion: bool,
+    sample_rate: u32,
 ) -> Result<SynthesisResult> {
-    let f0_shifted = apply_pitch_shift(f0, options.f0_shift);
-
-    // c: [1, T, 768]
-    let features = contentvec_features.clone().insert_axis(Axis(0));
-    let c_shape = vec![
-        features.shape()[0],
-        features.shape()[1],
-        features.shape()[2],
-    ];
-    let c_data = features.as_slice().ok_or_else(|| {
-        UtaiError::Inference("Features array not contiguous".to_string())
-    })?;
-
-    // f0: [1, T]
-    let f0_shape = vec![1usize, f0_shifted.len()];
-
-    // blend_ids: [N] — as f32
-    let blend_ids_data: Vec<f32> = speaker_weights.iter().map(|(id, _)| *id as f32).collect();
-    let blend_ids_shape = vec![speaker_weights.len()];
-
-    // blend_weights: [N]
-    let blend_weights_data: Vec<f32> = speaker_weights.iter().map(|(_, w)| *w).collect();
-    let blend_weights_shape = vec![speaker_weights.len()];
-
-    let mut inputs: Vec<(&str, &[f32], &[usize])> = vec![
-        ("c", c_data, &c_shape),
-        ("f0", &f0_shifted, &f0_shape),
-        ("blend_ids", &blend_ids_data, &blend_ids_shape),
-        ("blend_weights", &blend_weights_data, &blend_weights_shape),
-    ];
-
-    let n_steps_data = vec![20.0f32];
-    let n_steps_shape = vec![1usize];
-    if shallow_diffusion {
-        inputs.push(("n_steps", &n_steps_data, &n_steps_shape));
-    }
-
-    let outputs = engine.run_f32(session_id, &inputs)?;
-    let audio = outputs.into_iter().next().unwrap_or_default();
-
-    Ok(SynthesisResult {
-        audio,
-        sample_rate: SOVITS_SAMPLE_RATE,
-    })
+    // Voice blending requires a custom ONNX model that accepts blend_ids + blend_weights
+    // For now, use the primary speaker from the first weight
+    let primary_sid = speaker_weights.first().map(|(id, _)| *id).unwrap_or(0);
+    let mut opts = options.clone();
+    opts.speaker_id = Some(primary_sid);
+    infer(engine, session_id, contentvec_features, f0, &opts, shallow_diffusion, sample_rate)
 }
-

@@ -16,146 +16,128 @@ import sys
 from pathlib import Path
 
 import torch
-import numpy as np
+
+from architectures.rvc_v2 import build_from_checkpoint as build_rvc_v2
+from architectures.sovits_v4 import build_from_checkpoint as build_sovits_v4
 
 
 def convert_rvc(input_path: Path, output_path: Path):
-    """Convert RVC .pth model to ONNX."""
+    """Convert RVC v2 .pth model to ONNX."""
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
 
-    # Detect model version and config
-    config = checkpoint.get("config", {})
+    config = checkpoint.get("config")
+    if config is None:
+        print("ERROR: checkpoint has no 'config' key", file=sys.stderr)
+        sys.exit(1)
+
     if isinstance(config, (list, tuple)):
-        # RVC format: config is a list [sr, model_version, ...]
-        sample_rate = config[0] if len(config) > 0 else 40000
+        sample_rate = config[17] if len(config) > 17 else 40000
+        n_speakers = config[15] if len(config) > 15 else 1
     else:
         sample_rate = config.get("sample_rate", 40000)
+        n_speakers = config.get("n_speakers", 1)
 
-    # Extract model weights
-    state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    model = build_rvc_v2(checkpoint)
 
-    # Build minimal RVC inference model
-    model = build_rvc_model(state_dict, config)
-    model.eval()
-
-    # Prepare dummy inputs
-    seq_len = 100
+    seq_len = 50
     phone = torch.randn(1, seq_len, 768)
     phone_lengths = torch.tensor([seq_len], dtype=torch.long)
-    pitch = torch.randint(0, 256, (1, seq_len)).float()
+    pitch = torch.randint(0, 256, (1, seq_len))
     pitchf = torch.randn(1, seq_len)
+    sid = torch.zeros(1, dtype=torch.long)
 
-    # Export to ONNX
     torch.onnx.export(
         model,
-        (phone, phone_lengths, pitch, pitchf),
+        (phone, phone_lengths, pitch, pitchf, sid),
         str(output_path),
-        input_names=["phone", "phone_lengths", "pitch", "pitchf"],
+        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid"],
         output_names=["audio"],
         dynamic_axes={
             "phone": {1: "seq_len"},
-            "phone_lengths": {0: "batch"},
             "pitch": {1: "seq_len"},
             "pitchf": {1: "seq_len"},
-            "audio": {1: "audio_len"},
+            "audio": {2: "audio_len"},
         },
         opset_version=17,
         do_constant_folding=True,
+        dynamo=False,
     )
 
-    # Save config alongside
+    import onnx
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+    print(f"ONNX check passed: {output_path}", file=sys.stderr)
+
     config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "rvc",
-        "sample_rate": sample_rate,
         "version": "v2",
+        "sample_rate": sample_rate,
         "features_dim": 768,
+        "n_speakers": n_speakers,
     }
     config_path.write_text(json.dumps(config_data, indent=2))
 
     print(f"Converted RVC: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
+    print(f"Sample rate: {sample_rate}, Speakers: {n_speakers}")
 
 
 def convert_sovits(input_path: Path, output_path: Path):
-    """Convert SoVITS .pth model to ONNX."""
+    """Convert SoVITS 4.0 .pth model to ONNX."""
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
 
-    config = checkpoint.get("config", {})
-    state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    if "model" not in checkpoint:
+        print("ERROR: checkpoint has no 'model' key", file=sys.stderr)
+        sys.exit(1)
 
-    model = build_sovits_model(state_dict, config)
-    model.eval()
+    model = build_sovits_v4(checkpoint)
 
-    # Dummy inputs for SoVITS
-    seq_len = 100
-    c = torch.randn(1, seq_len, 768)  # ContentVec features
-    f0 = torch.randn(1, seq_len)
-    sid = torch.tensor([0], dtype=torch.long)
+    seq_len = 50
+    c = torch.randn(1, seq_len, 256)
+    f0 = torch.abs(torch.randn(1, seq_len)) * 200 + 100
+    uv = (f0 > 150).long()
+    sid = torch.zeros(1, dtype=torch.long)
 
     torch.onnx.export(
         model,
-        (c, f0, sid),
+        (c, f0, uv, sid),
         str(output_path),
-        input_names=["c", "f0", "sid"],
+        input_names=["c", "f0", "uv", "sid"],
         output_names=["audio"],
         dynamic_axes={
             "c": {1: "seq_len"},
             "f0": {1: "seq_len"},
-            "audio": {1: "audio_len"},
+            "uv": {1: "seq_len"},
+            "audio": {2: "audio_len"},
         },
         opset_version=17,
         do_constant_folding=True,
+        dynamo=False,
     )
+
+    import onnx
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+    print(f"ONNX check passed: {output_path}", file=sys.stderr)
+
+    # Infer config from model
+    ssl_dim = checkpoint["model"]["pre.weight"].shape[1]
+    n_speakers = checkpoint["model"]["emb_g.weight"].shape[0]
 
     config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "sovits",
-        "sample_rate": config.get("sample_rate", 44100),
-        "version": "4.1",
-        "features_dim": 768,
-        "speakers": config.get("speakers", ["default"]),
+        "version": "4.0",
+        "sample_rate": 44100,
+        "features_dim": ssl_dim,
+        "n_speakers": int(n_speakers),
     }
     config_path.write_text(json.dumps(config_data, indent=2))
 
     print(f"Converted SoVITS: {input_path} -> {output_path}")
-
-
-def build_rvc_model(state_dict: dict, config) -> torch.nn.Module:
-    """Build minimal RVC inference model from state dict.
-
-    TODO: Import actual RVC SynthesizerTrn architecture and load weights.
-    This requires the model architecture definition from RVC.
-    """
-    # Placeholder — in production, this imports and builds the actual VITS model
-    return PlaceholderModel(768, 1)
-
-
-def build_sovits_model(state_dict: dict, config: dict) -> torch.nn.Module:
-    """Build minimal SoVITS inference model from state dict.
-
-    TODO: Import actual SoVITS architecture and load weights.
-    """
-    return PlaceholderModel(768, 1)
-
-
-class PlaceholderModel(torch.nn.Module):
-    """Placeholder for actual model architecture during development."""
-
-    def __init__(self, in_dim: int, out_channels: int):
-        super().__init__()
-        self.linear = torch.nn.Linear(in_dim, 256)
-        self.out = torch.nn.Linear(256, out_channels)
-
-    def forward(self, *args):
-        # Take first positional arg as features
-        x = args[0]
-        if x.dim() == 3:
-            x = x.squeeze(0)
-        x = self.linear(x)
-        x = torch.relu(x)
-        x = self.out(x)
-        return x.unsqueeze(0)
+    print(f"Config saved: {config_path}")
+    print(f"Sample rate: 44100, SSL dim: {ssl_dim}, Speakers: {n_speakers}")
 
 
 def main():

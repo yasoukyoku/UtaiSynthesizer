@@ -1,8 +1,8 @@
 use ndarray::Array2;
 
-use super::engine::OnnxEngine;
+use super::engine::{InputTensor, OnnxEngine};
 use super::SynthesisResult;
-use crate::{Result, UtaiError};
+use crate::Result;
 
 const NSF_HIFIGAN_SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
@@ -31,26 +31,31 @@ pub fn synthesize(
         VocoderMode::AudioEnhance => f0.to_vec(),
     };
 
-    // mel_input: [1, n_mel, T] — insert batch dim
-    let mel_input = mel.clone().insert_axis(ndarray::Axis(0));
-    let mel_shape = vec![
-        mel_input.shape()[0],
-        mel_input.shape()[1],
-        mel_input.shape()[2],
-    ];
-    let mel_data = mel_input.as_slice().ok_or_else(|| {
-        UtaiError::Inference("Mel array not contiguous".to_string())
-    })?;
+    let n_mel = mel.shape()[1] as i64;
+    let t = mel.shape()[0] as i64;
 
-    // f0_input: [1, T]
-    let f0_shape = vec![1usize, f0_processed.len()];
+    // mel: [1, n_mel, T]
+    let mel_transposed: Vec<f32> = {
+        let mut data = vec![0.0f32; (n_mel * t) as usize];
+        for frame in 0..t as usize {
+            for bin in 0..n_mel as usize {
+                data[bin * t as usize + frame] = mel[[frame, bin]];
+            }
+        }
+        data
+    };
 
-    let inputs: Vec<(&str, &[f32], &[usize])> = vec![
-        ("mel", mel_data, &mel_shape),
-        ("f0", &f0_processed, &f0_shape),
-    ];
+    let mel_input = InputTensor::F32 {
+        data: mel_transposed,
+        shape: vec![1, n_mel, t],
+    };
 
-    let outputs = engine.run_f32(session_id, &inputs)?;
+    let f0_input = InputTensor::F32 {
+        data: f0_processed,
+        shape: vec![1, t],
+    };
+
+    let outputs = engine.run(session_id, vec![("mel", mel_input), ("f0", f0_input)])?;
     let audio = outputs.into_iter().next().unwrap_or_default();
 
     Ok(SynthesisResult {
@@ -60,8 +65,7 @@ pub fn synthesize(
 }
 
 pub fn audio_to_mel(audio: &[f32], _sample_rate: u32) -> Result<Array2<f32>> {
-    // Simplified mel spectrogram extraction
-    // In production, this would use a proper STFT + mel filterbank
+    // Simplified mel spectrogram — placeholder until proper STFT + mel filterbank
     let hop = HOP_SIZE;
     let n_frames = audio.len() / hop;
 

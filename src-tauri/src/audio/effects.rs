@@ -209,7 +209,7 @@ fn apply_fade_out(buffer: &AudioBuffer, duration_ms: u32) -> AudioBuffer {
 
     for i in 0..fade_frames.min(total_frames) {
         let frame = total_frames - 1 - i;
-        let gain = 1.0 - (i as f32 / fade_frames as f32);
+        let gain = i as f32 / fade_frames as f32;
         for ch in 0..channels {
             samples[frame * channels + ch] *= gain;
         }

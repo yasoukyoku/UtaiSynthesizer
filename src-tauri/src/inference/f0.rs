@@ -1,4 +1,4 @@
-use super::engine::OnnxEngine;
+use super::engine::{InputTensor, OnnxEngine};
 use crate::{Result, UtaiError};
 
 const RMVPE_SAMPLE_RATE: u32 = 16000;
@@ -27,14 +27,12 @@ pub fn detect(
     let input_len = frame_count * RMVPE_HOP_SIZE;
     let trimmed = &resampled[..input_len];
 
-    // Input shape: [1, input_len]
-    let input_shape = vec![1usize, input_len];
+    let input = InputTensor::F32 {
+        data: trimmed.to_vec(),
+        shape: vec![1, input_len as i64],
+    };
 
-    let inputs: Vec<(&str, &[f32], &[usize])> = vec![
-        ("audio", trimmed, &input_shape),
-    ];
-
-    let outputs = engine.run_f32(session_id, &inputs)?;
+    let outputs = engine.run(session_id, vec![("audio", input)])?;
     let f0_raw = outputs.into_iter().next().unwrap_or_default();
 
     let voiced: Vec<bool> = f0_raw.iter().map(|&x| x > 50.0).collect();

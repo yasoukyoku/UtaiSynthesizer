@@ -26,6 +26,7 @@ struct LoadedVoice {
     backend_type: VoiceBackendType,
     _model_path: PathBuf,
     session_id: String,
+    sample_rate: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -66,12 +67,14 @@ impl InferenceManager {
         name: &str,
         model_path: &PathBuf,
         backend_type: VoiceBackendType,
+        sample_rate: u32,
     ) -> Result<()> {
         let session_id = self.engine.load_model(model_path)?;
         let voice = LoadedVoice {
             backend_type,
             _model_path: model_path.clone(),
             session_id,
+            sample_rate,
         };
         self.loaded_voices.write().insert(name.to_string(), voice);
         Ok(())
@@ -91,7 +94,7 @@ impl InferenceManager {
 
         match &voice.backend_type {
             VoiceBackendType::Rvc => {
-                rvc::infer(&self.engine, &voice.session_id, features, f0, options)
+                rvc::infer(&self.engine, &voice.session_id, features, f0, options, voice.sample_rate)
             }
             VoiceBackendType::SoVits { shallow_diffusion } => {
                 sovits::infer(
@@ -101,6 +104,7 @@ impl InferenceManager {
                     f0,
                     options,
                     *shallow_diffusion,
+                    voice.sample_rate,
                 )
             }
         }

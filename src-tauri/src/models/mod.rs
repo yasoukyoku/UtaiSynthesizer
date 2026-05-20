@@ -41,11 +41,26 @@ pub enum ModelFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    #[serde(default)]
+    pub r#type: String,
+    #[serde(default = "default_version")]
     pub version: String,
-    pub speakers: Vec<String>,
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
+    #[serde(default = "default_features_dim")]
     pub features_dim: u32,
+    #[serde(default)]
+    pub n_speakers: u32,
+    #[serde(default = "default_speakers")]
+    pub speakers: Vec<String>,
+    #[serde(flatten)]
     pub extra: serde_json::Value,
 }
+
+fn default_version() -> String { "unknown".to_string() }
+fn default_sample_rate() -> u32 { 40000 }
+fn default_features_dim() -> u32 { 768 }
+fn default_speakers() -> Vec<String> { vec!["default".to_string()] }
 
 impl ModelRegistry {
     pub fn new() -> Self {
@@ -100,15 +115,7 @@ impl ModelRegistry {
                             default_config()
                         };
 
-                        let sample_rate = config
-                            .extra
-                            .get("sample_rate")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32)
-                            .unwrap_or(match &model_type {
-                                ModelType::SoVits => 44100,
-                                _ => 40000,
-                            });
+                        let sample_rate = config.sample_rate;
 
                         let index_path = path.with_extension("npy");
                         let index = if index_path.exists() {
@@ -167,14 +174,28 @@ impl ModelRegistry {
     ) -> Result<ModelEntry> {
         let onnx_path = convert::convert_pth_to_onnx(pth_path, &self.models_dir, &model_type)?;
 
+        let config_path = onnx_path.with_extension("json");
+        let config = if config_path.exists() {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .unwrap_or_else(default_config)
+        } else {
+            default_config()
+        };
+        let sample_rate = config.sample_rate;
+
+        let index_path = pth_path.with_extension("npy");
+        let index = if index_path.exists() { Some(index_path) } else { None };
+
         let entry = ModelEntry {
             name: name.to_string(),
             model_type,
             format: ModelFormat::Onnx,
             path: onnx_path,
-            sample_rate: 40000,
-            config: default_config(),
-            index_path: None,
+            sample_rate,
+            config,
+            index_path: index,
         };
 
         self.entries.write().push(entry.clone());
@@ -199,9 +220,12 @@ impl ModelRegistry {
 
 fn default_config() -> ModelConfig {
     ModelConfig {
-        version: "unknown".to_string(),
-        speakers: vec!["default".to_string()],
-        features_dim: 768,
-        extra: serde_json::Value::Null,
+        r#type: String::new(),
+        version: default_version(),
+        sample_rate: default_sample_rate(),
+        features_dim: default_features_dim(),
+        n_speakers: 0,
+        speakers: default_speakers(),
+        extra: serde_json::Value::Object(serde_json::Map::new()),
     }
 }

@@ -30,6 +30,7 @@ pub struct ProjectMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Track {
     pub id: String,
     pub name: String,
@@ -42,6 +43,7 @@ pub struct Track {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TrackType {
     Vocal { voice_model: Option<String> },
     Audio,
@@ -49,6 +51,7 @@ pub enum TrackType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub id: String,
     pub start_tick: u64,
@@ -58,9 +61,14 @@ pub struct Segment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum SegmentContent {
-    Notes(Vec<Note>),
-    AudioClip { source_path: String, offset_ms: f64 },
+    Notes { notes: Vec<Note> },
+    AudioClip {
+        source_path: String,
+        offset_ms: f64,
+        total_duration_ms: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +88,7 @@ pub struct Workflow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkflowNode {
     pub id: String,
     pub node_type: WorkflowNodeType,
@@ -88,10 +97,12 @@ pub struct WorkflowNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum WorkflowNodeType {
     Input,
     Output,
     Rvc,
+    #[serde(rename = "sovits")]
     SoVits,
     PitchShift,
     FormantShift,
@@ -101,6 +112,7 @@ pub enum WorkflowNodeType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkflowConnection {
     pub from_node: String,
     pub from_port: u32,
