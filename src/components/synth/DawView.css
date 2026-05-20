@@ -24,8 +24,9 @@
   grid-row: 1; grid-column: 2;
 }
 
-.track-list {
+.daw-tracklist-wrap {
   grid-row: 2; grid-column: 1;
+  overflow: hidden;
 }
 
 .daw-canvas-container {
@@ -40,4 +41,3 @@
   border-right: 1px solid var(--border-subtle);
   border-top: 1px solid var(--border-subtle);
 }
-

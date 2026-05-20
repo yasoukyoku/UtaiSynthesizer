@@ -6,7 +6,6 @@ use parking_lot::RwLock;
 use tokio::time;
 
 use super::Project;
-use crate::Result;
 
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_AUTOSAVES: usize = 5;
@@ -40,17 +39,19 @@ impl AutosaveManager {
                     break;
                 }
 
-                let proj = project.read();
-                if let Some(ref p) = *proj {
-                    if p.dirty {
-                        let filename = format!("autosave_{}.utai", timestamp_suffix());
-                        let path = dir.join(&filename);
-                        if let Ok(json) = serde_json::to_string(p) {
-                            if std::fs::write(&path, json).is_ok() {
-                                tracing::debug!("Autosaved: {}", filename);
-                                cleanup_old_autosaves(&dir);
-                            }
-                        }
+                let json_opt = {
+                    let proj = project.read();
+                    match &*proj {
+                        Some(p) if p.dirty => serde_json::to_string(p).ok(),
+                        _ => None,
+                    }
+                };
+                if let Some(json) = json_opt {
+                    let filename = format!("autosave_{}.utai", timestamp_suffix());
+                    let path = dir.join(&filename);
+                    if std::fs::write(&path, json).is_ok() {
+                        tracing::debug!("Autosaved: {}", filename);
+                        cleanup_old_autosaves(&dir);
                     }
                 }
             }

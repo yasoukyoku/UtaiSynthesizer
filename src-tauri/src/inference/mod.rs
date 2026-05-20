@@ -113,3 +113,13 @@ impl InferenceManager {
         }
     }
 }
+
+pub fn apply_pitch_shift(f0: &[f32], semitones: f32) -> Vec<f32> {
+    if semitones.abs() < 0.001 {
+        return f0.to_vec();
+    }
+    let ratio = 2.0f32.powf(semitones / 12.0);
+    f0.iter()
+        .map(|&x| if x > 0.0 { x * ratio } else { 0.0 })
+        .collect()
+}

@@ -30,7 +30,7 @@ class ProgressReporter:
             self._emit("loss", round(loss, 6))
 
         if len(self._epoch_times) >= 2 and epoch < total:
-            avg_time = (self._epoch_times[-1] - self._epoch_times[0]) / len(self._epoch_times)
+            avg_time = (self._epoch_times[-1] - self._epoch_times[0]) / (len(self._epoch_times) - 1)
             eta = int(avg_time * (total - epoch))
             self._emit("eta", eta)
 

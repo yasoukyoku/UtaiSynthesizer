@@ -1,0 +1,47 @@
+.vol-fader {
+  position: relative;
+  height: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.vol-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--border-default);
+}
+
+.vol-zero {
+  position: absolute;
+  width: 1px;
+  height: 7px;
+  background: var(--text-muted);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.vol-fill {
+  position: absolute;
+  left: 0;
+  height: 3px;
+  background: var(--accent-primary-dim);
+  pointer-events: none;
+}
+
+.vol-thumb {
+  position: absolute;
+  width: 4px;
+  height: 10px;
+  background: var(--accent-primary);
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.vol-fader:hover .vol-thumb {
+  background: var(--accent-primary-bright);
+  box-shadow: 0 0 4px var(--accent-primary-glow);
+}

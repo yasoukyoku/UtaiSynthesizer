@@ -123,7 +123,7 @@ fn pitch_shift_nsf(
     Ok(AudioBuffer::new_mono(result.audio, result.sample_rate))
 }
 
-fn formant_shift_world(buffer: &AudioBuffer, ratio: f32) -> Result<AudioBuffer> {
+fn formant_shift_world(buffer: &AudioBuffer, _ratio: f32) -> Result<AudioBuffer> {
     // WORLD-based formant shifting
     // Modifies spectral envelope while keeping F0 unchanged
     // TODO: Implement with WORLD C bindings

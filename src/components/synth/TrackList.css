@@ -19,8 +19,8 @@
 .track-item {
   display: flex;
   align-items: center;
-  padding: 0 var(--space-md);
-  gap: var(--space-md);
+  padding: 0 var(--space-sm) 0 0;
+  gap: var(--space-sm);
   border-bottom: 1px solid var(--border-subtle);
   cursor: pointer;
   transition: background var(--transition-fast);
@@ -39,6 +39,7 @@
 .track-color-bar {
   width: 3px;
   height: 28px;
+  flex-shrink: 0;
 }
 
 .track-info {
@@ -47,28 +48,27 @@
   flex-direction: column;
   gap: 1px;
   min-width: 0;
+  padding-left: var(--space-sm);
 }
 
 .track-name {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.track-type {
-  font-size: var(--font-size-xs);
-}
-
 .track-controls {
   display: flex;
+  align-items: center;
   gap: 2px;
+  flex-shrink: 0;
 }
 
 .track-btn {
-  width: 20px;
-  height: 20px;
-  font-size: 9px;
+  width: 18px;
+  height: 18px;
+  font-size: 8px;
   font-weight: 700;
   padding: 0;
   display: flex;
@@ -88,3 +88,4 @@
   border-color: var(--color-warning);
   color: var(--text-inverse);
 }
+

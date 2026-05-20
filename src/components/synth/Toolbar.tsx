@@ -1,72 +1,79 @@
 import { useState, useEffect, useRef } from "react";
 import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
+import { useAppStore } from "../../store/app";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import * as playback from "../../lib/audio/playback";
+import { TICKS_PER_BEAT } from "../../lib/constants";
 import { OverviewMap } from "./OverviewMap";
+import { importAudioToTrack } from "../../lib/audio/import";
 import i18n from "../../i18n";
-import type { Track, Segment } from "../../types/project";
 import "./Toolbar.css";
 
 export function Toolbar() {
   const { t } = useTranslation();
-  const { addTrack, tempo, setTempo, playheadTick, setPlayhead, timeSignature, tracks } =
+  const { addTrack, tempo, setTempo, playheadTick, setPlayhead, timeSignature, tracks, updateTrack } =
     useProjectStore();
-  const { loadAudioFile, trackAudio, isPlaying, setPlaying, setPlayStart } = useAudioStore();
+  const { loadAudioFile, audioFiles, isPlaying, setPlaying, setPlayStart } = useAudioStore();
+  const { selectedSegment, clearSelection } = useAppStore();
+  const { splitSegment, deleteSegment } = useProjectStore();
   const [showAddMenu, setShowAddMenu] = useState(false);
   const animRef = useRef<number>(0);
+  const playStartTickRef = useRef(0);
+  const animatingRef = useRef(false);
+  const addMenuRef = useRef<HTMLDivElement>(null);
 
-  // Playhead animation during playback
   useEffect(() => {
     if (!isPlaying) {
+      animatingRef.current = false;
       cancelAnimationFrame(animRef.current);
       return;
     }
 
+    playStartTickRef.current = playheadTick;
+    animatingRef.current = true;
     const startTime = playback.getContextTime();
-    const startTick = playheadTick;
 
     const animate = () => {
+      if (!animatingRef.current) return;
       const elapsed = playback.getContextTime() - startTime;
       const ticksElapsed = playback.secondsToTicks(elapsed, tempo);
-      setPlayhead(Math.round(startTick + ticksElapsed));
+      setPlayhead(Math.round(playStartTickRef.current + ticksElapsed));
       animRef.current = requestAnimationFrame(animate);
     };
     animRef.current = requestAnimationFrame(animate);
 
-    return () => cancelAnimationFrame(animRef.current);
-  }, [isPlaying, tempo, playheadTick, setPlayhead]);
+    return () => {
+      animatingRef.current = false;
+      cancelAnimationFrame(animRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, tempo]);
 
-  const handlePlay = () => {
-    if (isPlaying) return;
-
-    for (const track of tracks) {
-      const data = trackAudio[track.id];
-      if (!data) continue;
-
-      // Find the segment the playhead is in (or the first one)
-      const seg = track.segments.find(
-        (s) => playheadTick >= s.startTick && playheadTick < s.startTick + s.durationTicks
-      ) ?? track.segments[0];
-      if (!seg) continue;
-
-      const segOffsetMs = seg.content.type === "audioClip" ? seg.content.offsetMs : 0;
-
-      playback.loadAudioBuffer(data.filePath).then(() => {
-        playback.playFromTickWithOffset(
-          data.filePath, playheadTick, tempo,
-          seg.startTick, segOffsetMs,
-          () => setPlaying(false),
-        );
-        setPlaying(true);
-        setPlayStart(playback.getContextTime(), playheadTick);
-      });
+  const handleTogglePlay = async () => {
+    if (isPlaying) {
+      animatingRef.current = false;
+      playback.stopPlayback();
+      setPlaying(false);
       return;
+    }
+
+    const started = await playback.playAllTracks(
+      tracks,
+      audioFiles,
+      playheadTick,
+      tempo,
+      () => setPlaying(false),
+    );
+    if (started) {
+      setPlaying(true);
+      setPlayStart(playback.getContextTime(), playheadTick);
     }
   };
 
-  const handleStop = () => {
+  const handleReturnToStart = () => {
+    animatingRef.current = false;
     playback.stopPlayback();
     setPlaying(false);
     setPlayhead(0);
@@ -80,35 +87,9 @@ export function Toolbar() {
         filters: [{ name: "Audio", extensions: ["wav", "mp3", "flac", "ogg"] }],
       });
       if (!path) return;
-
-      const filePath = path as string;
-      const fileName = filePath.split(/[/\\]/).pop() ?? "audio";
-      const trackId = `track-${Date.now()}`;
-
-      // Load audio through Rust backend → get real duration + peaks
-      const audioData = await loadAudioFile(trackId, filePath);
-      const durationTicks = playback.durationMsToTicks(audioData.durationMs, tempo);
-
-      const seg: Segment = {
-        id: `seg-${Date.now()}`,
-        startTick: 0,
-        durationTicks: Math.round(durationTicks),
-        content: { type: "audioClip", sourcePath: filePath, offsetMs: 0, totalDurationMs: audioData.durationMs },
-      };
-      const track: Track = {
-        id: trackId,
-        name: fileName,
-        trackType: "audio",
-        segments: [seg],
-        volumeDb: 0,
-        pan: 0,
-        muted: false,
-        solo: false,
-      };
-      addTrack(track);
-
-      // Pre-load into Web Audio
-      playback.loadAudioBuffer(filePath);
+      await importAudioToTrack(
+        path as string, tempo, playheadTick, tracks, addTrack, loadAudioFile, updateTrack,
+      );
     } catch (e) {
       console.error("Import failed:", e);
     }
@@ -116,41 +97,81 @@ export function Toolbar() {
 
   const handleAddMidiTrack = () => {
     setShowAddMenu(false);
-    const track: Track = {
+    addTrack({
       id: `track-${Date.now()}`,
-      name: `MIDI ${Math.floor(Math.random() * 100)}`,
+      name: `Vocal ${tracks.filter((t) => t.trackType === "vocal").length + 1}`,
       trackType: "vocal",
       segments: [],
       volumeDb: 0,
       pan: 0,
       muted: false,
       solo: false,
-    };
-    addTrack(track);
+    });
   };
+
+  const handleSplit = () => {
+    if (!selectedSegment) return;
+    splitSegment(selectedSegment.trackId, selectedSegment.segmentId, playheadTick);
+  };
+
+  const handleDelete = () => {
+    if (!selectedSegment) return;
+    deleteSegment(selectedSegment.trackId, selectedSegment.segmentId);
+    clearSelection();
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === " ") {
+        e.preventDefault();
+        handleTogglePlay();
+      } else if (e.key === "Delete" && selectedSegment) {
+        handleDelete();
+      } else if (e.key === "k" && e.ctrlKey && selectedSegment) {
+        e.preventDefault();
+        handleSplit();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  });
+
+  useEffect(() => {
+    if (!showAddMenu) return;
+    const onClick = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setShowAddMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [showAddMenu]);
 
   const cycleLang = () => {
     const langs = ["zh", "en", "ja"];
     const cur = langs.indexOf(i18n.language);
-    const next = langs[(cur + 1) % langs.length]!;
-    i18n.changeLanguage(next);
+    i18n.changeLanguage(langs[(cur + 1) % langs.length]!);
   };
 
   return (
     <div className="toolbar">
       <div className="toolbar-section transport">
-        <button className="transport-btn" onClick={handleStop} data-tooltip={t("transport.stop")}>
-          &#x23F9;
+        <button
+          className="transport-btn"
+          onClick={handleReturnToStart}
+          data-tooltip={t("transport.returnToStart")}
+        >
+          <span className="transport-icon icon-return" />
         </button>
         <button
           className={`transport-btn play ${isPlaying ? "playing" : ""}`}
-          onClick={handlePlay}
-          data-tooltip={t("transport.play")}
+          onClick={handleTogglePlay}
+          data-tooltip={isPlaying ? t("transport.pause") : t("transport.play")}
         >
-          &#x25B6;
-        </button>
-        <button className="transport-btn rec" data-tooltip={t("transport.record")}>
-          &#x23FA;
+          {isPlaying
+            ? <span className="transport-icon icon-pause" />
+            : <span className="transport-icon icon-play" />
+          }
         </button>
       </div>
 
@@ -200,9 +221,30 @@ export function Toolbar() {
         </select>
       </div>
 
+      <div className="toolbar-divider" />
+
+      <div className="toolbar-section edit-section">
+        <button
+          className="toolbar-btn"
+          onClick={handleSplit}
+          disabled={!selectedSegment}
+          data-tooltip={`${t("toolbar.split")} [Ctrl+K]`}
+        >
+          {t("toolbar.split")}
+        </button>
+        <button
+          className="toolbar-btn"
+          onClick={handleDelete}
+          disabled={!selectedSegment}
+          data-tooltip={`${t("toolbar.delete")} [Del]`}
+        >
+          {t("toolbar.delete")}
+        </button>
+      </div>
+
       <div className="toolbar-spacer" />
 
-      <div className="toolbar-section" style={{ position: "relative" }}>
+      <div className="toolbar-section" style={{ position: "relative" }} ref={addMenuRef}>
         <button className="toolbar-btn" onClick={() => setShowAddMenu(!showAddMenu)}>
           + {t("toolbar.addTrack")}
         </button>
@@ -230,10 +272,9 @@ export function Toolbar() {
 }
 
 function formatPosition(tick: number, timeSig: [number, number]): string {
-  const ticksPerBeat = 480;
-  const ticksPerBar = ticksPerBeat * timeSig[0];
+  const ticksPerBar = TICKS_PER_BEAT * timeSig[0];
   const bar = Math.floor(tick / ticksPerBar) + 1;
-  const beat = Math.floor((tick % ticksPerBar) / ticksPerBeat) + 1;
-  const sub = Math.floor(((tick % ticksPerBar) % ticksPerBeat) / (ticksPerBeat / 4));
+  const beat = Math.floor((tick % ticksPerBar) / TICKS_PER_BEAT) + 1;
+  const sub = Math.floor(((tick % ticksPerBar) % TICKS_PER_BEAT) / (TICKS_PER_BEAT / 4));
   return `${bar}:${beat}:${sub.toString().padStart(2, "0")}`;
 }

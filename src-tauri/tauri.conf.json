@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/.vscode/tauri.conf.schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "UTAI",
   "version": "2.0.0-alpha.1",
   "identifier": "com.utai.app",

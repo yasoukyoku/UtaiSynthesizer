@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::{Result, UtaiError};
+use crate::Result;
 
 pub struct ModelRegistry {
     models_dir: PathBuf,
@@ -100,6 +100,16 @@ impl ModelRegistry {
                             default_config()
                         };
 
+                        let sample_rate = config
+                            .extra
+                            .get("sample_rate")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .unwrap_or(match &model_type {
+                                ModelType::SoVits => 44100,
+                                _ => 40000,
+                            });
+
                         let index_path = path.with_extension("npy");
                         let index = if index_path.exists() {
                             Some(index_path)
@@ -112,7 +122,7 @@ impl ModelRegistry {
                             model_type: model_type.clone(),
                             format: ModelFormat::Onnx,
                             path,
-                            sample_rate: 40000,
+                            sample_rate,
                             config,
                             index_path: index,
                         });

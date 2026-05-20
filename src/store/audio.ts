@@ -9,23 +9,26 @@ export interface AudioTrackData {
 }
 
 interface AudioState {
-  trackAudio: Record<string, AudioTrackData>;
+  audioFiles: Record<string, AudioTrackData>;
   isPlaying: boolean;
   playStartTime: number;
   playStartTick: number;
 
-  loadAudioFile: (trackId: string, filePath: string) => Promise<AudioTrackData>;
+  loadAudioFile: (filePath: string) => Promise<AudioTrackData>;
   setPlaying: (playing: boolean) => void;
   setPlayStart: (time: number, tick: number) => void;
 }
 
-export const useAudioStore = create<AudioState>((set) => ({
-  trackAudio: {},
+export const useAudioStore = create<AudioState>((set, get) => ({
+  audioFiles: {},
   isPlaying: false,
   playStartTime: 0,
   playStartTick: 0,
 
-  loadAudioFile: async (trackId, filePath) => {
+  loadAudioFile: async (filePath) => {
+    const existing = get().audioFiles[filePath];
+    if (existing) return existing;
+
     const info = await invoke<{
       duration_ms: number;
       sample_rate: number;
@@ -41,7 +44,7 @@ export const useAudioStore = create<AudioState>((set) => ({
     };
 
     set((s) => ({
-      trackAudio: { ...s.trackAudio, [trackId]: data },
+      audioFiles: { ...s.audioFiles, [filePath]: data },
     }));
 
     return data;

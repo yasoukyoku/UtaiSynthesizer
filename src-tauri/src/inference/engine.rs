@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use parking_lot::RwLock;
 

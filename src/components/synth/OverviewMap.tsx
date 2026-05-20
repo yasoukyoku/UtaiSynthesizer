@@ -2,16 +2,14 @@ import { useRef, useEffect, useCallback } from "react";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
+import { TICKS_PER_BEAT, PIXELS_PER_TICK } from "../../lib/constants";
 import "./OverviewMap.css";
-
-const TICKS_PER_BEAT = 480;
-const PIXELS_PER_TICK = 0.15;
 
 export function OverviewMap() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const { tracks, playheadTick, setPlayhead, timeSignature } = useProjectStore();
   const { zoom, scrollX } = useAppStore();
-  const { trackAudio } = useAudioStore();
+  const { audioFiles } = useAudioStore();
 
   const totalTicks = Math.max(
     TICKS_PER_BEAT * timeSignature[0] * 4,
@@ -44,14 +42,15 @@ export function OverviewMap() {
     ctx.fillRect(0, 0, width, height);
 
     // Draw combined waveform overview
+    const midY = height / 2;
+    const amp = height / 2 - 1;
+
     for (const track of tracks) {
-      const audio = trackAudio[track.id];
-      if (!audio || !audio.peaks.length) continue;
-
-      const midY = height / 2;
-      const amp = height / 2 - 1;
-
       for (const seg of track.segments) {
+        if (seg.content.type !== "audioClip") continue;
+        const audio = audioFiles[seg.content.sourcePath];
+        if (!audio || !audio.peaks.length) continue;
+
         const segStart = seg.startTick / totalTicks;
         const segEnd = (seg.startTick + seg.durationTicks) / totalTicks;
         const sx = segStart * width;
@@ -98,7 +97,7 @@ export function OverviewMap() {
     ctx.strokeStyle = "#2a3a5c";
     ctx.lineWidth = 1;
     ctx.strokeRect(0, 0, width, height);
-  }, [tracks, trackAudio, totalTicks, playheadTick, zoom, scrollX]);
+  }, [tracks, audioFiles, totalTicks, playheadTick, zoom, scrollX]);
 
   useEffect(() => {
     draw();

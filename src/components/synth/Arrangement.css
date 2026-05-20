@@ -1,6 +1,6 @@
 .arrangement {
-  flex: 1;
-  position: relative;
+  position: absolute;
+  inset: 0;
   overflow: hidden;
 }
 

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { Track } from "../types/project";
+import type { Track, Segment } from "../types/project";
+import { TICKS_PER_BEAT } from "../lib/constants";
 
 interface ProjectState {
   name: string;
@@ -18,6 +19,8 @@ interface ProjectState {
   addTrack: (track: Track) => void;
   removeTrack: (id: string) => void;
   updateTrack: (id: string, updates: Partial<Track>) => void;
+  splitSegment: (trackId: string, segmentId: string, atTick: number) => void;
+  deleteSegment: (trackId: string, segmentId: string) => void;
   setTempo: (bpm: number) => void;
   setPlayhead: (tick: number) => void;
   selectNotes: (ids: string[]) => void;
@@ -82,8 +85,52 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       dirty: true,
     })),
 
+  splitSegment: (trackId, segmentId, atTick) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const segIdx = t.segments.findIndex((seg) => seg.id === segmentId);
+        if (segIdx < 0) return t;
+        const seg = t.segments[segIdx]!;
+
+        if (atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return t;
+
+        const leftDuration = atTick - seg.startTick;
+        const rightDuration = seg.durationTicks - leftDuration;
+        const leftSeg: Segment = { ...seg, durationTicks: leftDuration };
+
+        let rightContent = seg.content;
+        if (seg.content.type === "audioClip") {
+          const splitOffsetMs = (leftDuration / TICKS_PER_BEAT) * (60000 / s.tempo);
+          rightContent = {
+            ...seg.content,
+            offsetMs: seg.content.offsetMs + splitOffsetMs,
+          };
+        }
+        const rightSeg: Segment = {
+          id: `seg-${Date.now()}`,
+          startTick: atTick,
+          durationTicks: rightDuration,
+          content: rightContent,
+        };
+
+        const newSegments = [...t.segments];
+        newSegments.splice(segIdx, 1, leftSeg, rightSeg);
+        return { ...t, segments: newSegments };
+      }),
+    })),
+
+  deleteSegment: (trackId, segmentId) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        return { ...t, segments: t.segments.filter((seg) => seg.id !== segmentId) };
+      }),
+    })),
+
   setTempo: (bpm) => {
-    const TICKS_PER_BEAT = 480;
     set((s) => ({
       tempo: bpm,
       dirty: true,

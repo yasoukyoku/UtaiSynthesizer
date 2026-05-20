@@ -8,8 +8,8 @@
   },
   "transport": {
     "play": "再生",
-    "stop": "停止",
-    "record": "録音"
+    "pause": "一時停止",
+    "returnToStart": "先頭に戻る"
   },
   "toolbar": {
     "bpm": "速度",
@@ -17,14 +17,16 @@
     "snap": "スナップ",
     "free": "フリー",
     "triplet": "三連符",
-    "addTrack": "トラック追加",
-    "importAudio": "音声ファイルをインポート",
-    "addMidi": "MIDIトラック追加 (スタブ)",
-    "workflow": "ワークフロー"
+    "addTrack": "追加",
+    "importAudio": "オーディオ追加",
+    "addMidi": "MIDIトラック作成",
+    "split": "分割",
+    "delete": "削除"
   },
   "tracks": {
     "title": "トラック",
     "empty": "音声ファイルをドロップまたは新規トラック追加",
+    "delete": "トラック削除",
     "vocal": "ボーカル",
     "audio": "オーディオ",
     "instrument": "楽器"

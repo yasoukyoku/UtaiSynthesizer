@@ -9,8 +9,6 @@ use parking_lot::Mutex;
 use super::{TrainingConfig, TrainingState, TrainingStatus};
 use crate::{Result, UtaiError};
 
-const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-
 pub struct TrainingSidecar {
     child: Arc<Mutex<Option<Child>>>,
     status: Arc<Mutex<TrainingStatus>>,

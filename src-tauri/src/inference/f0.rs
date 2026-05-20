@@ -1,5 +1,3 @@
-use ndarray::Array2;
-
 use super::engine::OnnxEngine;
 use crate::{Result, UtaiError};
 

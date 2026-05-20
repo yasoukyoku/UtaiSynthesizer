@@ -8,8 +8,8 @@
   },
   "transport": {
     "play": "Play",
-    "stop": "Stop",
-    "record": "Record"
+    "pause": "Pause",
+    "returnToStart": "Return to start"
   },
   "toolbar": {
     "bpm": "BPM",
@@ -17,14 +17,16 @@
     "snap": "Snap",
     "free": "Free",
     "triplet": "Triplet",
-    "addTrack": "Add Track",
-    "importAudio": "Import Audio",
-    "addMidi": "Add MIDI Track (stub)",
-    "workflow": "Workflow"
+    "addTrack": "Add",
+    "importAudio": "Add Audio",
+    "addMidi": "Create MIDI Track",
+    "split": "Split",
+    "delete": "Delete"
   },
   "tracks": {
     "title": "Tracks",
     "empty": "Drop audio files or add a new track",
+    "delete": "Delete Track",
     "vocal": "Vocal",
     "audio": "Audio",
     "instrument": "Instrument"

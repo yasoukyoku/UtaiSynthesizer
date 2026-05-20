@@ -38,12 +38,56 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
   padding: 0;
 }
 
+.transport-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+/* Play triangle — pure CSS border trick */
+.icon-play {
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 6px 0 6px 10px;
+  border-color: transparent transparent transparent var(--color-success);
+  margin-left: 2px;
+}
+
+/* Pause — two vertical bars */
+.icon-pause {
+  width: 10px;
+  height: 12px;
+  border-left: 3px solid var(--color-success);
+  border-right: 3px solid var(--color-success);
+}
+
+/* Return to start — bar + left triangle */
+.icon-return {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+.icon-return::before {
+  content: "";
+  display: block;
+  width: 2px;
+  height: 10px;
+  background: var(--text-secondary);
+}
+.icon-return::after {
+  content: "";
+  display: block;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 5px 7px 5px 0;
+  border-color: transparent var(--text-secondary) transparent transparent;
+}
+
 .transport-btn.play {
-  color: var(--color-success);
   border-color: var(--color-success);
 }
 
@@ -55,15 +99,6 @@
 .transport-btn.play.playing {
   background: rgba(74, 222, 128, 0.2);
   box-shadow: 0 0 8px rgba(74, 222, 128, 0.3);
-}
-
-.transport-btn.rec {
-  color: var(--color-error);
-  border-color: var(--color-error);
-}
-
-.transport-btn.rec:hover {
-  background: rgba(248, 113, 113, 0.1);
 }
 
 .tempo-input {
@@ -86,6 +121,16 @@
 .snap-select {
   width: 72px;
   font-size: var(--font-size-xs);
+}
+
+.edit-section .toolbar-btn {
+  font-size: var(--font-size-xs);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.edit-section .toolbar-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .toolbar-btn {

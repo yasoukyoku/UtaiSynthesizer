@@ -1,0 +1,45 @@
+.ctx-menu {
+  position: fixed;
+  z-index: var(--z-overlay);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  min-width: 160px;
+  padding: 2px 0;
+}
+
+.ctx-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 5px 12px;
+  font-size: var(--font-size-sm);
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  gap: 16px;
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: var(--accent-primary-glow);
+  color: var(--accent-primary-bright);
+}
+
+.ctx-item:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.ctx-item.ctx-danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.1);
+  color: var(--color-error);
+}
+
+.ctx-shortcut {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}

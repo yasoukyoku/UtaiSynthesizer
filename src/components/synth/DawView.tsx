@@ -6,14 +6,13 @@ import { Arrangement } from "./Arrangement";
 import { HScrollbar } from "./HScrollbar";
 import { useAppStore } from "../../store/app";
 import { useProjectStore } from "../../store/project";
+import { TICKS_PER_BEAT, PIXELS_PER_TICK } from "../../lib/constants";
 import "./DawView.css";
 
 const HEADER_WIDTH = 200;
-const PIXELS_PER_TICK = 0.15;
-const TICKS_PER_BEAT = 480;
 
 export function DawView() {
-  const { scrollX, scrollY, setScroll, zoom, setZoom } = useAppStore();
+  const { scrollX, scrollY, setScroll, zoom } = useAppStore();
   const { tracks, timeSignature } = useProjectStore();
   const canvasContainerRef = useRef<HTMLDivElement>(null);
 
@@ -23,28 +22,24 @@ export function DawView() {
   );
   const totalWidth = totalTicks * PIXELS_PER_TICK * zoom;
 
-  const handleWheel = useCallback(
+  // Track header area: scroll always vertical
+  const handleTrackListWheel = useCallback(
     (e: React.WheelEvent) => {
-      if (e.ctrlKey) {
-        e.preventDefault();
-        const factor = e.deltaY > 0 ? 0.9 : 1.1;
-        setZoom(zoom * factor);
-      } else if (e.shiftKey) {
-        setScroll(Math.max(0, scrollX + e.deltaY), scrollY);
-      } else {
-        setScroll(scrollX, Math.max(0, scrollY + e.deltaY));
-      }
+      e.stopPropagation();
+      setScroll(scrollX, Math.max(0, scrollY + e.deltaY));
     },
-    [scrollX, scrollY, zoom, setScroll, setZoom]
+    [scrollX, scrollY, setScroll],
   );
 
   return (
     <div className="daw-view">
       <Toolbar />
-      <div className="daw-grid" onWheel={handleWheel}>
+      <div className="daw-grid">
         <div className="daw-corner" style={{ width: HEADER_WIDTH }} />
         <TimelineRuler scrollX={scrollX} zoom={zoom} />
-        <TrackList width={HEADER_WIDTH} scrollY={scrollY} />
+        <div className="daw-tracklist-wrap" onWheel={handleTrackListWheel}>
+          <TrackList width={HEADER_WIDTH} scrollY={scrollY} />
+        </div>
         <div className="daw-canvas-container" ref={canvasContainerRef}>
           <Arrangement />
         </div>

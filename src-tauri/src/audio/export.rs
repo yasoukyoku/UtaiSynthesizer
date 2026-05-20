@@ -52,12 +52,24 @@ pub fn mixdown(tracks: &[TrackAudio]) -> Result<AudioBuffer> {
         }
 
         let offset = (track.offset_secs * sample_rate as f64) as usize;
-        let gain = 10.0f32.powf(track.volume_db / 20.0) * track.pan_gain_l();
+        let vol = 10.0f32.powf(track.volume_db / 20.0);
+        let gain_l = vol * track.pan_gain_l();
+        let gain_r = vol * track.pan_gain_r();
+        let channels = track.buffer.channels as usize;
 
-        for (i, &sample) in track.buffer.samples.iter().enumerate() {
-            let idx = offset + i;
-            if idx < mix.len() {
-                mix[idx] += sample * gain;
+        let frames = track.buffer.samples.len() / channels;
+        for frame in 0..frames {
+            let idx = offset + frame;
+            if idx >= mix.len() {
+                break;
+            }
+            if channels == 1 {
+                let s = track.buffer.samples[frame];
+                mix[idx] += s * (gain_l + gain_r) * 0.5;
+            } else {
+                let l = track.buffer.samples[frame * channels];
+                let r = track.buffer.samples[frame * channels + 1];
+                mix[idx] += l * gain_l + r * gain_r;
             }
         }
     }
@@ -124,6 +136,11 @@ pub struct TrackAudio {
 
 impl TrackAudio {
     fn pan_gain_l(&self) -> f32 {
-        ((1.0 - self.pan) * std::f32::consts::FRAC_PI_2).cos()
+        // Constant-power pan law: pan in [-1, 1], center=0
+        ((self.pan + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2).cos()
+    }
+
+    fn pan_gain_r(&self) -> f32 {
+        ((self.pan + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2).sin()
     }
 }

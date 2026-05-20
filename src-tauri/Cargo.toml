@@ -30,9 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-notify = "7"
 parking_lot = "0.12"
-directories = "6"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

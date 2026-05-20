@@ -1,7 +1,7 @@
 use ndarray::{Array2, Axis};
 
 use super::engine::OnnxEngine;
-use super::{ConvertOptions, SynthesisResult};
+use super::{apply_pitch_shift, ConvertOptions, SynthesisResult};
 use crate::{Result, UtaiError};
 
 const SOVITS_SAMPLE_RATE: u32 = 44100;
@@ -112,10 +112,3 @@ pub fn infer_blended(
     })
 }
 
-fn apply_pitch_shift(f0: &[f32], semitones: f32) -> Vec<f32> {
-    if semitones.abs() < 0.001 {
-        return f0.to_vec();
-    }
-    let ratio = 2.0f32.powf(semitones / 12.0);
-    f0.iter().map(|&x| if x > 0.0 { x * ratio } else { 0.0 }).collect()
-}

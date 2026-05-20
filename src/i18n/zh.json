@@ -8,8 +8,8 @@
   },
   "transport": {
     "play": "播放",
-    "stop": "停止",
-    "record": "录制"
+    "pause": "暂停",
+    "returnToStart": "回到起点"
   },
   "toolbar": {
     "bpm": "速度",
@@ -17,14 +17,16 @@
     "snap": "吸附",
     "free": "自由",
     "triplet": "三连音",
-    "addTrack": "添加轨道",
-    "importAudio": "导入音频素材",
-    "addMidi": "添加MIDI轨 (占位)",
-    "workflow": "工作流"
+    "addTrack": "添加素材",
+    "importAudio": "添加音频",
+    "addMidi": "创建MIDI轨",
+    "split": "分割",
+    "delete": "删除"
   },
   "tracks": {
     "title": "轨道",
     "empty": "拖放音频文件或添加新轨道",
+    "delete": "删除轨道",
     "vocal": "声乐",
     "audio": "音频",
     "instrument": "乐器"
