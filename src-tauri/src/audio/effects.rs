@@ -74,30 +74,113 @@ pub fn apply_effect(
 }
 
 fn pitch_shift_world(buffer: &AudioBuffer, semitones: f32) -> Result<AudioBuffer> {
-    // WORLD-based pitch shifting (DSP approach)
-    // Uses analysis-modification-synthesis:
-    // 1. Extract F0, spectral envelope, aperiodicity (DIO + CheapTrick + D4C)
-    // 2. Modify F0 by semitone ratio
-    // 3. Resynthesize with WORLD synthesizer
-
-    // TODO: Implement WORLD C bindings via world-sys crate
-    // For now, simple time-domain pitch shift as placeholder
+    // WORLD C bindings not yet available — use STFT-based pitch shift as interim.
+    // Shifts frequency bins in the spectrogram, preserves duration.
+    let channels = buffer.channels as usize;
+    if channels == 0 {
+        return Ok(buffer.clone());
+    }
+    let frame_count = buffer.samples.len() / channels;
     let ratio = 2.0f32.powf(semitones / 12.0);
-    let new_len = (buffer.samples.len() as f32 / ratio) as usize;
-    let mut output = Vec::with_capacity(new_len);
 
-    for i in 0..new_len {
-        let src_pos = i as f32 * ratio;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f32;
+    let mut all_samples = Vec::with_capacity(buffer.samples.len());
 
-        if idx + 1 < buffer.samples.len() {
-            let sample = buffer.samples[idx] * (1.0 - frac) + buffer.samples[idx + 1] * frac;
-            output.push(sample);
+    for ch in 0..channels {
+        let mono: Vec<f32> = (0..frame_count)
+            .map(|i| buffer.samples[i * channels + ch])
+            .collect();
+
+        let n_fft = 2048;
+        let hop = 512;
+        let win: Vec<f32> = (0..n_fft).map(|i| {
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_fft as f32).cos())
+        }).collect();
+
+        let n_frames = if mono.len() >= n_fft { (mono.len() - n_fft) / hop + 1 } else { 0 };
+        let freq_bins = n_fft / 2 + 1;
+
+        // Forward STFT
+        use std::f32::consts::PI;
+        let mut mag = vec![vec![0.0f32; n_frames]; freq_bins];
+        let mut phase = vec![vec![0.0f32; n_frames]; freq_bins];
+
+        for t in 0..n_frames {
+            let offset = t * hop;
+            for k in 0..freq_bins {
+                let mut re = 0.0f32;
+                let mut im = 0.0f32;
+                for n in 0..n_fft {
+                    if offset + n < mono.len() {
+                        let angle = -2.0 * PI * k as f32 * n as f32 / n_fft as f32;
+                        re += mono[offset + n] * win[n] * angle.cos();
+                        im += mono[offset + n] * win[n] * angle.sin();
+                    }
+                }
+                mag[k][t] = (re * re + im * im).sqrt();
+                phase[k][t] = im.atan2(re);
+            }
+        }
+
+        // Shift frequency bins
+        let mut shifted_mag = vec![vec![0.0f32; n_frames]; freq_bins];
+        for k in 0..freq_bins {
+            let src = k as f32 / ratio;
+            let lo = src as usize;
+            let frac = src - lo as f32;
+            if lo + 1 < freq_bins {
+                for t in 0..n_frames {
+                    shifted_mag[k][t] = mag[lo][t] * (1.0 - frac) + mag[lo + 1][t] * frac;
+                }
+            } else if lo < freq_bins {
+                for t in 0..n_frames {
+                    shifted_mag[k][t] = mag[lo][t] * (1.0 - frac);
+                }
+            }
+        }
+
+        // Inverse STFT (Griffin-Lim-like: use original phase)
+        let out_len = (n_frames - 1) * hop + n_fft;
+        let mut output = vec![0.0f32; out_len];
+        let mut window_sum = vec![0.0f32; out_len];
+
+        for t in 0..n_frames {
+            let offset = t * hop;
+            for n in 0..n_fft {
+                if offset + n >= out_len { break; }
+                let mut sample = 0.0f32;
+                for k in 0..freq_bins {
+                    let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
+                    sample += shifted_mag[k][t] * (phase[k][t] + angle).cos();
+                }
+                sample *= 2.0 / n_fft as f32;
+                output[offset + n] += sample * win[n];
+                window_sum[offset + n] += win[n] * win[n];
+            }
+        }
+
+        for i in 0..out_len.min(frame_count) {
+            if window_sum[i] > 1e-8 {
+                output[i] /= window_sum[i];
+            }
+        }
+
+        output.truncate(frame_count);
+        all_samples.extend_from_slice(&output);
+    }
+
+    // Re-interleave channels
+    let mut interleaved = vec![0.0f32; buffer.samples.len()];
+    for ch in 0..channels {
+        for i in 0..frame_count {
+            interleaved[i * channels + ch] = all_samples[ch * frame_count + i];
         }
     }
 
-    Ok(AudioBuffer::new_mono(output, buffer.sample_rate))
+    Ok(AudioBuffer {
+        samples: interleaved,
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+    })
 }
 
 fn pitch_shift_nsf(
@@ -123,11 +206,13 @@ fn pitch_shift_nsf(
     Ok(AudioBuffer::new_mono(result.audio, result.sample_rate))
 }
 
-fn formant_shift_world(buffer: &AudioBuffer, _ratio: f32) -> Result<AudioBuffer> {
-    // WORLD-based formant shifting
-    // Modifies spectral envelope while keeping F0 unchanged
-    // TODO: Implement with WORLD C bindings
-    Ok(buffer.clone())
+fn formant_shift_world(buffer: &AudioBuffer, ratio: f32) -> Result<AudioBuffer> {
+    if (ratio - 1.0).abs() < 0.001 {
+        return Ok(buffer.clone());
+    }
+    Err(UtaiError::Audio(
+        "Formant shift with WORLD vocoder is not yet implemented. Use NSF-HiFiGAN vocoder instead.".into()
+    ))
 }
 
 fn formant_shift_nsf(

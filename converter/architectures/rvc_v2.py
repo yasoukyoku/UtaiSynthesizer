@@ -452,25 +452,23 @@ class SynthesizerTrnMs768NSFsid(nn.Module):
 
         self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-    def forward(self, phone, phone_lengths, pitch, pitchf, sid):
+    def forward(self, phone, phone_lengths, pitch, pitchf, sid, noise_scale):
         """
         phone: [B, T, 768] — HuBERT features
         phone_lengths: [B] — valid lengths (int)
         pitch: [B, T] — coarse pitch (0-255, int for embedding lookup)
         pitchf: [B, T] — continuous F0 in Hz (float, 0 = unvoiced)
         sid: [B] — speaker ID (int)
+        noise_scale: [1] — 0.0 = deterministic, 0.667 = original RVC default
         Returns: audio [B, 1, L]
         """
         g = self.emb_g(sid).unsqueeze(-1)  # [B, gin_channels, 1]
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
 
-        # Sample from posterior (deterministic at inference — use mean only)
-        z_p = m_p * x_mask
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
 
-        # Reverse flow
         z = self.flow(z_p, x_mask, g=g, reverse=True)
 
-        # Decode to audio
         o = self.dec(z * x_mask, pitchf, g=g)
         return o
 

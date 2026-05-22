@@ -61,3 +61,45 @@
   font-size: var(--font-size-xs);
   color: var(--text-primary);
 }
+
+.palette-node[draggable="true"] {
+  cursor: grab;
+}
+
+.palette-node[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.palette-empty {
+  font-size: 9px;
+  color: var(--text-muted);
+  padding: var(--space-xs) var(--space-md);
+}
+
+.palette-manage-btn {
+  background: none;
+  border: none;
+  font-size: 10px;
+  color: var(--accent-primary);
+  text-align: left;
+  padding: var(--space-xs) var(--space-md);
+  cursor: pointer;
+}
+
+.palette-manage-btn:hover {
+  text-decoration: underline;
+}
+
+.palette-drag-ghost {
+  position: fixed;
+  pointer-events: none;
+  z-index: 99999;
+  padding: 4px 12px;
+  background: var(--bg-surface, #1a1f2e);
+  border: 1px solid var(--accent-primary, #39c5bb);
+  color: var(--text-primary, #e2e8f0);
+  font-size: 11px;
+  font-family: monospace;
+  opacity: 0.9;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}

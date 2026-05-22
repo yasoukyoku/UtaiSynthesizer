@@ -1,9 +1,9 @@
 import type { NodeProps } from "@xyflow/react";
 import { NodeShell } from "./NodeShell";
 
-export function SoVitsNode(_props: NodeProps) {
+export function SoVitsNode(props: NodeProps) {
   return (
-    <NodeShell label="SoVITS" icon="[S]" color="#8b5cf6" inputs={1} outputs={1}>
+    <NodeShell nodeId={props.id} label="SoVITS" icon="[S]" color="#8b5cf6" inputs={1} outputs={1}>
       <label>Model</label>
       <select>
         <option value="">Select voice...</option>

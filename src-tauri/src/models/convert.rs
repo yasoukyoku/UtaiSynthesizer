@@ -8,6 +8,7 @@ pub fn convert_pth_to_onnx(
     pth_path: &PathBuf,
     models_dir: &PathBuf,
     model_type: &ModelType,
+    app_dir: &PathBuf,
 ) -> Result<PathBuf> {
     let subdir = match model_type {
         ModelType::Rvc => "rvc",
@@ -27,8 +28,8 @@ pub fn convert_pth_to_onnx(
         .to_string();
     let onnx_path = output_dir.join(format!("{}.onnx", stem));
 
-    let python = find_converter_python();
-    let script = PathBuf::from("converter/convert.py");
+    let python = find_converter_python(app_dir);
+    let script = app_dir.join("converter").join("convert.py");
 
     let output = Command::new(&python)
         .arg(&script)
@@ -69,13 +70,68 @@ pub fn convert_pth_to_onnx(
     Ok(onnx_path)
 }
 
-fn find_converter_python() -> PathBuf {
-    // Converter can use embedded Python (has PyTorch CPU)
-    let embedded = PathBuf::from("./python/python.exe");
+pub fn convert_index_to_npy(
+    index_path: &PathBuf,
+    output_path: &PathBuf,
+    app_dir: &PathBuf,
+) -> Result<PathBuf> {
+    let python = find_converter_python(app_dir);
+    let script = app_dir.join("converter").join("extract_index.py");
+
+    if !script.exists() {
+        return Err(UtaiError::Model(format!(
+            "Index extractor not found: {}",
+            script.display()
+        )));
+    }
+
+    let output = Command::new(&python)
+        .arg(&script)
+        .arg("--input")
+        .arg(index_path)
+        .arg("--output")
+        .arg(output_path)
+        .output()
+        .map_err(|e| {
+            UtaiError::Model(format!(
+                "Failed to run index extractor (python={}): {}",
+                python.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(UtaiError::Model(format!(
+            "Index extraction failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    if !output_path.exists() {
+        return Err(UtaiError::Model(
+            "Index extraction completed but .npy file not found".to_string(),
+        ));
+    }
+
+    tracing::info!(
+        "Extracted index {} -> {}",
+        index_path.display(),
+        output_path.display()
+    );
+    Ok(output_path.clone())
+}
+
+fn find_converter_python(app_dir: &PathBuf) -> PathBuf {
+    let venv = app_dir.join("converter").join(".venv").join("Scripts").join("python.exe");
+    if venv.exists() {
+        return venv;
+    }
+
+    let embedded = app_dir.join("python").join("python.exe");
     if embedded.exists() {
         return embedded;
     }
 
-    // Fallback: system Python with torch installed
     PathBuf::from("python")
 }

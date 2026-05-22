@@ -43,10 +43,12 @@ export async function importAudioToTrack(
       pan: 0,
       muted: false,
       solo: false,
+      expanded: false,
+      laneControls: {},
     });
   }
 
-  playback.loadAudioBuffer(filePath);
+  playback.loadAudioBuffer(audioData.playbackPath || filePath);
 }
 
 function findTrackWithSpace(

@@ -4,7 +4,8 @@
     "file": "文件",
     "edit": "编辑",
     "view": "视图",
-    "tools": "工具"
+    "tools": "工具",
+    "settings": "设置"
   },
   "transport": {
     "play": "播放",
@@ -65,6 +66,11 @@
     "catEffects": "效果器",
     "catSeparation": "音频分离",
     "catIO": "输入/输出"
+  },
+  "titlebar": {
+    "log": "日志",
+    "models": "资源管理",
+    "training": "训练"
   },
   "common": {
     "cancel": "取消",

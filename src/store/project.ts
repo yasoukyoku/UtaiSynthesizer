@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { Track, Segment } from "../types/project";
+import type { Track, Segment, LaneControl, ProcessedOutput } from "../types/project";
 import { TICKS_PER_BEAT } from "../lib/constants";
 
 interface ProjectState {
@@ -24,6 +24,10 @@ interface ProjectState {
   setTempo: (bpm: number) => void;
   setPlayhead: (tick: number) => void;
   selectNotes: (ids: string[]) => void;
+  toggleTrackExpanded: (trackId: string) => void;
+  updateLaneControl: (trackId: string, laneLabel: string, updates: Partial<LaneControl>) => void;
+  setProcessedOutputs: (trackId: string, segmentId: string, outputs: ProcessedOutput[]) => void;
+  clearProcessedOutputs: (trackId: string, segmentId: string) => void;
 }
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
@@ -149,4 +153,51 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
   setPlayhead: (tick) => set({ playheadTick: tick }),
   selectNotes: (ids) => set({ selectedNotes: ids }),
+
+  toggleTrackExpanded: (trackId) =>
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === trackId ? { ...t, expanded: !t.expanded } : t,
+      ),
+    })),
+
+  updateLaneControl: (trackId, laneLabel, updates) =>
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const existing = t.laneControls[laneLabel] ?? { volumeDb: 0, pan: 0, muted: false };
+        return {
+          ...t,
+          laneControls: { ...t.laneControls, [laneLabel]: { ...existing, ...updates } },
+        };
+      }),
+    })),
+
+  setProcessedOutputs: (trackId, segmentId, outputs) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        return {
+          ...t,
+          segments: t.segments.map((seg) =>
+            seg.id === segmentId ? { ...seg, processedOutputs: outputs } : seg,
+          ),
+        };
+      }),
+    })),
+
+  clearProcessedOutputs: (trackId, segmentId) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        return {
+          ...t,
+          segments: t.segments.map((seg) =>
+            seg.id === segmentId ? { ...seg, processedOutputs: undefined } : seg,
+          ),
+        };
+      }),
+    })),
 }));

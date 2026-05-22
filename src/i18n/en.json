@@ -4,7 +4,8 @@
     "file": "File",
     "edit": "Edit",
     "view": "View",
-    "tools": "Tools"
+    "tools": "Tools",
+    "settings": "Settings"
   },
   "transport": {
     "play": "Play",
@@ -65,6 +66,11 @@
     "catEffects": "Effects",
     "catSeparation": "Separation",
     "catIO": "Input / Output"
+  },
+  "titlebar": {
+    "log": "Log",
+    "models": "Resources",
+    "training": "Training"
   },
   "common": {
     "cancel": "Cancel",

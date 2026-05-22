@@ -93,16 +93,16 @@
 
 .titlebar-btn {
   background: none;
-  border: 1px solid transparent;
+  border: 1px solid var(--border-default);
   color: var(--text-secondary);
-  width: 28px;
-  height: 28px;
+  height: 24px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-sm);
-  font-size: 14px;
-  padding: 0;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  padding: 0 var(--space-md);
+  white-space: nowrap;
 }
 
 .titlebar-btn:hover {

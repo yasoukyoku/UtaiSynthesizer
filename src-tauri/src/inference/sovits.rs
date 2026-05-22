@@ -51,7 +51,10 @@ pub fn infer(
     ];
 
     let outputs = engine.run(session_id, inputs)?;
-    let audio = outputs.into_iter().next().unwrap_or_default();
+    let audio = outputs
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::UtaiError::Inference("SoVITS model returned no output tensors".into()))?;
 
     Ok(SynthesisResult {
         audio,

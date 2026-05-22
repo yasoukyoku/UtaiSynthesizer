@@ -7,7 +7,7 @@ import "./Titlebar.css";
 export function Titlebar() {
   const { t } = useTranslation();
   const { name, dirty } = useProjectStore();
-  const { toggleTrainingPanel, trainingPanelOpen } = useAppStore();
+  const { toggleTrainingPanel, trainingPanelOpen, toggleModelManager, modelManagerOpen, toggleLogViewer, logViewerOpen, toggleSettings, settingsOpen } = useAppStore();
   const { status } = useTrainingStore();
 
   const isTraining =
@@ -24,6 +24,7 @@ export function Titlebar() {
           <button className="menu-item">{t("menu.edit")}</button>
           <button className="menu-item">{t("menu.view")}</button>
           <button className="menu-item">{t("menu.tools")}</button>
+          <button className={`menu-item ${settingsOpen ? "active" : ""}`} onClick={toggleSettings}>{t("menu.settings")}</button>
         </nav>
       </div>
 
@@ -42,11 +43,22 @@ export function Titlebar() {
           </span>
         )}
         <button
+          className={`titlebar-btn ${logViewerOpen ? "active" : ""}`}
+          onClick={toggleLogViewer}
+        >
+          {t("titlebar.log")}
+        </button>
+        <button
+          className={`titlebar-btn ${modelManagerOpen ? "active" : ""}`}
+          onClick={toggleModelManager}
+        >
+          {t("titlebar.models")}
+        </button>
+        <button
           className={`titlebar-btn ${trainingPanelOpen ? "active" : ""}`}
           onClick={toggleTrainingPanel}
-          data-tooltip={t("training.panel")}
         >
-          TRN
+          {t("titlebar.training")}
         </button>
       </div>
     </header>

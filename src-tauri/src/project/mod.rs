@@ -1,6 +1,7 @@
 pub mod autosave;
 pub mod undo;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,14 @@ pub struct ProjectMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LaneControl {
+    pub volume_db: f32,
+    pub pan: f32,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Track {
     pub id: String,
     pub name: String,
@@ -40,6 +49,10 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub expanded: bool,
+    #[serde(default)]
+    pub lane_controls: HashMap<String, LaneControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,12 +65,24 @@ pub enum TrackType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProcessedOutput {
+    pub lane_label: String,
+    pub audio_path: String,
+    pub total_duration_ms: f64,
+    #[serde(default)]
+    pub waveform_peaks: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Segment {
     pub id: String,
     pub start_tick: u64,
     pub duration_ticks: u64,
     pub content: SegmentContent,
     pub workflow: Option<Workflow>,
+    #[serde(default)]
+    pub processed_outputs: Option<Vec<ProcessedOutput>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +98,7 @@ pub enum SegmentContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
+    pub id: String,
     pub tick: u64,
     pub duration: u64,
     pub pitch: u8,
@@ -88,11 +114,17 @@ pub struct Workflow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowNode {
     pub id: String,
     pub node_type: WorkflowNodeType,
-    pub position: (f64, f64),
+    pub position: Position,
     pub params: serde_json::Value,
 }
 

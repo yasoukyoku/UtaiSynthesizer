@@ -18,16 +18,19 @@ struct LoadedSession {
     _path: PathBuf,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeviceConfig {
     Cpu,
+    #[serde(rename = "directml")]
     DirectMl { device_id: u32 },
     Cuda { device_id: u32 },
+    Auto,
 }
 
 impl Default for DeviceConfig {
     fn default() -> Self {
-        Self::Cpu
+        Self::Auto
     }
 }
 
@@ -45,7 +48,12 @@ impl OnnxEngine {
     }
 
     pub fn set_device(&self, config: DeviceConfig) {
+        tracing::info!("Device preference set to: {:?}", config);
         *self.device.write() = config;
+    }
+
+    pub fn device(&self) -> DeviceConfig {
+        self.device.read().clone()
     }
 
     pub fn load_model(&self, path: &PathBuf) -> Result<String> {
@@ -126,7 +134,9 @@ impl OnnxEngine {
 
 fn build_session(path: &PathBuf, device: &DeviceConfig) -> Result<Session> {
     let mut builder = Session::builder()
-        .map_err(|e| UtaiError::Inference(format!("Session builder: {}", e)))?;
+        .map_err(|e| UtaiError::Inference(format!("Session builder: {}", e)))?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(|e| UtaiError::Inference(format!("Optimization: {}", e)))?;
 
     match device {
         DeviceConfig::Cpu => {
@@ -153,6 +163,16 @@ fn build_session(path: &PathBuf, device: &DeviceConfig) -> Result<Session> {
                     ort::ep::CPU::default().build(),
                 ])
                 .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))?;
+        }
+        DeviceConfig::Auto => {
+            // Try CUDA → DirectML → CPU
+            builder = builder
+                .with_execution_providers([
+                    ort::ep::CUDA::default().build(),
+                    ort::ep::DirectML::default().build(),
+                    ort::ep::CPU::default().build(),
+                ])
+                .map_err(|e| UtaiError::Inference(format!("Auto EP: {}", e)))?;
         }
     }
 

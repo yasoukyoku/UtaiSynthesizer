@@ -1,5 +1,9 @@
 pub mod audio;
 pub mod inference;
+pub mod logs;
 pub mod models;
+pub mod msst_models;
 pub mod project;
+pub mod separation;
+pub mod settings;
 pub mod training;

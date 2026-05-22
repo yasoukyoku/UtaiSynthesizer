@@ -1,9 +1,9 @@
 import type { NodeProps } from "@xyflow/react";
 import { NodeShell } from "./NodeShell";
 
-export function RvcNode(_props: NodeProps) {
+export function RvcNode(props: NodeProps) {
   return (
-    <NodeShell label="RVC" icon="[R]" color="#39c5bb" inputs={1} outputs={1}>
+    <NodeShell nodeId={props.id} label="RVC" icon="[R]" color="#39c5bb" inputs={1} outputs={1}>
       <label>Model</label>
       <select>
         <option value="">Select voice...</option>

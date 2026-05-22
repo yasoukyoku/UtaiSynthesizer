@@ -28,6 +28,8 @@ pub async fn import_model(
     name: String,
     path: String,
     model_type: String,
+    index_path: Option<String>,
+    avatar_path: Option<String>,
 ) -> Result<ModelEntry, String> {
     let mt = match model_type.as_str() {
         "rvc" => ModelType::Rvc,
@@ -35,9 +37,27 @@ pub async fn import_model(
         _ => return Err(format!("Unsupported model type: {}", model_type)),
     };
 
+    let idx = index_path.map(PathBuf::from);
+    let avatar = avatar_path.map(PathBuf::from);
     state
         .models
-        .import_pth(&name, &PathBuf::from(path), mt)
+        .import_pth(&name, &PathBuf::from(path), mt, &state.app_dir, idx.as_ref(), avatar.as_ref())
+        .map_err(|e| {
+            tracing::error!("Model import failed: {}", e);
+            e.to_string()
+        })
+}
+
+#[tauri::command]
+pub async fn set_model_avatar(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    avatar_path: String,
+) -> Result<Option<String>, String> {
+    state
+        .models
+        .set_avatar(&name, &PathBuf::from(avatar_path))
+        .map(|p| p.map(|x| x.to_string_lossy().to_string()))
         .map_err(|e| e.to_string())
 }
 

@@ -105,6 +105,13 @@
   width: 56px;
   text-align: center;
   font-size: var(--font-size-sm);
+  -moz-appearance: textfield;
+}
+
+.tempo-input::-webkit-inner-spin-button,
+.tempo-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
 .time-display {

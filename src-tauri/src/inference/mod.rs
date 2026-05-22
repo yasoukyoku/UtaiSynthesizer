@@ -14,6 +14,7 @@ use crate::Result;
 pub struct InferenceManager {
     pub engine: engine::OnnxEngine,
     loaded_voices: RwLock<HashMap<String, LoadedVoice>>,
+    cached_f0_session: RwLock<Option<(PathBuf, String)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +28,7 @@ struct LoadedVoice {
     _model_path: PathBuf,
     session_id: String,
     sample_rate: u32,
+    index: Option<rvc::RvcIndex>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,6 +37,7 @@ pub struct ConvertOptions {
     pub speaker_id: Option<u32>,
     pub index_ratio: f32,
     pub protect_voiceless: f32,
+    pub l2_normalize: bool,
 }
 
 impl Default for ConvertOptions {
@@ -43,7 +46,8 @@ impl Default for ConvertOptions {
             f0_shift: 0.0,
             speaker_id: None,
             index_ratio: 0.6,
-            protect_voiceless: 0.5,
+            protect_voiceless: 0.33,
+            l2_normalize: false,
         }
     }
 }
@@ -59,6 +63,31 @@ impl InferenceManager {
         Self {
             engine: engine::OnnxEngine::new(),
             loaded_voices: RwLock::new(HashMap::new()),
+            cached_f0_session: RwLock::new(None),
+        }
+    }
+
+    pub fn ensure_f0_loaded(&self, f0_model_path: &PathBuf) -> Result<String> {
+        {
+            let cached = self.cached_f0_session.read();
+            if let Some((path, sid)) = cached.as_ref() {
+                if path == f0_model_path && self.engine.is_loaded(sid) {
+                    return Ok(sid.clone());
+                }
+            }
+        }
+        let sid = self.engine.load_model(f0_model_path)?;
+        *self.cached_f0_session.write() = Some((f0_model_path.clone(), sid.clone()));
+        tracing::info!("F0 model cached: {}", f0_model_path.display());
+        Ok(sid)
+    }
+
+    pub fn is_voice_loaded(&self, name: &str) -> bool {
+        let voices = self.loaded_voices.read();
+        if let Some(voice) = voices.get(name) {
+            self.engine.is_loaded(&voice.session_id)
+        } else {
+            false
         }
     }
 
@@ -68,13 +97,33 @@ impl InferenceManager {
         model_path: &PathBuf,
         backend_type: VoiceBackendType,
         sample_rate: u32,
+        index_path: Option<&PathBuf>,
     ) -> Result<()> {
+        if self.is_voice_loaded(name) {
+            return Ok(());
+        }
+        self.unload_voice(name);
         let session_id = self.engine.load_model(model_path)?;
+
+        let index = match (&backend_type, index_path) {
+            (VoiceBackendType::Rvc, Some(path)) if path.exists() => {
+                match rvc::RvcIndex::load(path) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        tracing::warn!("Failed to load index, continuing without: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let voice = LoadedVoice {
             backend_type,
             _model_path: model_path.clone(),
             session_id,
             sample_rate,
+            index,
         };
         self.loaded_voices.write().insert(name.to_string(), voice);
         Ok(())
@@ -94,7 +143,7 @@ impl InferenceManager {
 
         match &voice.backend_type {
             VoiceBackendType::Rvc => {
-                rvc::infer(&self.engine, &voice.session_id, features, f0, options, voice.sample_rate)
+                rvc::infer(&self.engine, &voice.session_id, features, f0, options, voice.index.as_ref(), voice.sample_rate)
             }
             VoiceBackendType::SoVits { shallow_diffusion } => {
                 sovits::infer(

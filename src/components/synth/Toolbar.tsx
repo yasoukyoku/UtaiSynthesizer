@@ -22,18 +22,23 @@ export function Toolbar() {
   const animRef = useRef<number>(0);
   const playStartTickRef = useRef(0);
   const animatingRef = useRef(false);
+  const wasPlayingRef = useRef(false);
   const addMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!isPlaying) {
       animatingRef.current = false;
       cancelAnimationFrame(animRef.current);
+      wasPlayingRef.current = false;
       return;
     }
 
     playStartTickRef.current = playheadTick;
     animatingRef.current = true;
-    const startTime = playback.getContextTime();
+    const startTime = !wasPlayingRef.current
+      ? playback.getScheduleTimeOrigin()
+      : playback.getContextTime();
+    wasPlayingRef.current = true;
 
     const animate = () => {
       if (!animatingRef.current) return;
@@ -51,6 +56,7 @@ export function Toolbar() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying, tempo]);
 
+  const playPendingRef = useRef(false);
   const handleTogglePlay = async () => {
     if (isPlaying) {
       animatingRef.current = false;
@@ -59,16 +65,23 @@ export function Toolbar() {
       return;
     }
 
-    const started = await playback.playAllTracks(
-      tracks,
-      audioFiles,
-      playheadTick,
-      tempo,
-      () => setPlaying(false),
-    );
-    if (started) {
-      setPlaying(true);
-      setPlayStart(playback.getContextTime(), playheadTick);
+    if (playPendingRef.current) return;
+    playPendingRef.current = true;
+
+    try {
+      const started = await playback.playAllTracks(
+        tracks,
+        audioFiles,
+        playheadTick,
+        tempo,
+        () => setPlaying(false),
+      );
+      if (started) {
+        setPlaying(true);
+        setPlayStart(playback.getContextTime(), playheadTick);
+      }
+    } finally {
+      playPendingRef.current = false;
     }
   };
 
@@ -84,7 +97,7 @@ export function Toolbar() {
     try {
       const path = await open({
         title: t("toolbar.importAudio"),
-        filters: [{ name: "Audio", extensions: ["wav", "mp3", "flac", "ogg"] }],
+        filters: [{ name: "Audio", extensions: ["wav", "mp3", "flac", "ogg", "aac", "m4a", "webm", "opus", "wma"] }],
       });
       if (!path) return;
       await importAudioToTrack(
@@ -92,6 +105,7 @@ export function Toolbar() {
       );
     } catch (e) {
       console.error("Import failed:", e);
+      useAppStore.getState().showToast(e instanceof Error ? e.message : String(e), "error");
     }
   };
 
@@ -106,6 +120,8 @@ export function Toolbar() {
       pan: 0,
       muted: false,
       solo: false,
+      expanded: false,
+      laneControls: {},
     });
   };
 
@@ -120,21 +136,30 @@ export function Toolbar() {
     clearSelection();
   };
 
+  const togglePlayRef = useRef(handleTogglePlay);
+  togglePlayRef.current = handleTogglePlay;
+  const splitRef = useRef(handleSplit);
+  splitRef.current = handleSplit;
+  const deleteRef = useRef(handleDelete);
+  deleteRef.current = handleDelete;
+  const selRef = useRef(selectedSegment);
+  selRef.current = selectedSegment;
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === " ") {
         e.preventDefault();
-        handleTogglePlay();
-      } else if (e.key === "Delete" && selectedSegment) {
-        handleDelete();
-      } else if (e.key === "k" && e.ctrlKey && selectedSegment) {
+        togglePlayRef.current();
+      } else if (e.key === "Delete" && selRef.current) {
+        deleteRef.current();
+      } else if (e.key === "k" && e.ctrlKey && selRef.current) {
         e.preventDefault();
-        handleSplit();
+        splitRef.current();
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [isPlaying, selectedSegment, tracks, audioFiles, playheadTick, tempo]);
+  }, []);
 
   useEffect(() => {
     if (!showAddMenu) return;

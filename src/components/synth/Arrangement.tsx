@@ -3,7 +3,8 @@ import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { useTranslation } from "react-i18next";
-import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEIGHT } from "../../lib/constants";
+import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT } from "../../lib/constants";
+import { computeTrackYOffsets, computeTrackHeight, findTrackAtY, getMaxLaneCount } from "../../lib/trackLayout";
 import { importAudioToTrack } from "../../lib/audio/import";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import "./Arrangement.css";
@@ -11,6 +12,7 @@ import "./Arrangement.css";
 const EDGE_ZONE = 6;
 const AUTOSCROLL_ZONE = 40;
 const AUTOSCROLL_SPEED = 8;
+const laneColors = ["78,205,196", "255,184,108", "168,130,255", "255,107,129", "114,224,175", "255,214,102"];
 
 type DragMode = null | "playhead" | "move" | "resizeL" | "resizeR";
 
@@ -83,14 +85,18 @@ export function Arrangement() {
       const rect = canvas.getBoundingClientRect();
       const x = clientX - rect.left + scrollX;
       const y = clientY - rect.top + scrollY;
+      const yOffsets = computeTrackYOffsets(tracks);
 
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i];
         if (!track) continue;
-        const trackY = i * TRACK_HEIGHT;
-        if (y < trackY || y > trackY + TRACK_HEIGHT) continue;
+        const trackY = yOffsets[i]!;
+        const trackH = computeTrackHeight(track);
+        if (y < trackY || y > trackY + trackH) continue;
 
-        // Iterate in reverse: later segments (higher z-order) are hit first
+        // Only match segments in the header row, not in lane area
+        if (y > trackY + TRACK_HEADER_HEIGHT) continue;
+
         for (let si = track.segments.length - 1; si >= 0; si--) {
           const seg = track.segments[si]!;
           const sx = seg.startTick * ppt;
@@ -113,9 +119,9 @@ export function Arrangement() {
       if (!canvas) return -1;
       const rect = canvas.getBoundingClientRect();
       const y = clientY - rect.top + scrollY;
-      return Math.floor(y / TRACK_HEIGHT);
+      return findTrackAtY(computeTrackYOffsets(tracks), y);
     },
-    [scrollY],
+    [scrollY, tracks],
   );
 
   // Auto-scroll during drag near edges
@@ -176,7 +182,9 @@ export function Arrangement() {
         const rect = canvas.getBoundingClientRect();
         const scrollYNow = useAppStore.getState().scrollY;
         const mouseY = e.clientY - rect.top + scrollYNow;
-        const targetIdx = Math.max(0, Math.min(trks.length - 1, Math.floor(mouseY / TRACK_HEIGHT)));
+        const yOffsets = computeTrackYOffsets(trks);
+        const rawIdx = findTrackAtY(yOffsets, mouseY);
+        const targetIdx = Math.max(0, Math.min(trks.length - 1, rawIdx));
         const targetTrack = trks[targetIdx];
 
         if (targetTrack && targetIdx !== drag.trackIdx
@@ -371,7 +379,7 @@ export function Arrangement() {
     async (e: React.DragEvent) => {
       e.preventDefault();
       setDragOver(false);
-      const files = Array.from(e.dataTransfer.files).filter((f) => /\.(wav|mp3|flac|ogg)$/i.test(f.name));
+      const files = Array.from(e.dataTransfer.files).filter((f) => /\.(wav|mp3|flac|ogg|aac|m4a|webm|opus|wma)$/i.test(f.name));
       if (!files.length) return;
       const dropTick = canvasToTick(e.clientX);
       for (const file of files) {
@@ -381,13 +389,17 @@ export function Arrangement() {
           await importAudioToTrack(filePath, tempo, dropTick, tracks, addTrack, loadAudioFile, updateTrack);
         } catch (err) {
           console.error("Drop import failed:", err);
+          useAppStore.getState().showToast(err instanceof Error ? err.message : String(err), "error");
         }
       }
     },
     [canvasToTick, tempo, tracks, addTrack, loadAudioFile, updateTrack],
   );
 
-  // Drawing
+  // Drawing — static content cached in OffscreenCanvas, playhead drawn per frame
+  const offscreenRef = useRef<OffscreenCanvas | null>(null);
+  const staticDepsRef = useRef("");
+
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -395,97 +407,37 @@ export function Arrangement() {
     if (!ctx) return;
 
     const { width, height } = canvas.getBoundingClientRect();
-    canvas.width = width * devicePixelRatio;
-    canvas.height = height * devicePixelRatio;
+    const cw = Math.round(width * devicePixelRatio);
+    const ch = Math.round(height * devicePixelRatio);
+    canvas.width = cw;
+    canvas.height = ch;
     ctx.scale(devicePixelRatio, devicePixelRatio);
 
-    const ticksPerBar = TICKS_PER_BEAT * timeSignature[0];
+    const staticKey = `${tracks.length}:${ppt}:${scrollX}:${scrollY}:${tempo}:${timeSignature[0]}:${selectedSegment?.segmentId}:${dragOver}:${Object.keys(audioFiles).length}:${tracks.map(t => {
+      const laneMutes = Object.entries(t.laneControls).map(([k, v]) => `${k}${v?.muted ? 1 : 0}`).join("|");
+      const segs = t.segments.map(s => `${s.startTick}.${s.durationTicks}.${s.processedOutputs?.map(o => o.audioPath).join(",") ?? ""}`).join(";");
+      return `${t.segments.length}:${t.expanded}:${t.muted}:${laneMutes}:${segs}`;
+    }).join(",")}`;
 
-    ctx.fillStyle = "#0d1220";
-    ctx.fillRect(0, 0, width, height);
+    const needsStaticRedraw = !offscreenRef.current
+      || staticDepsRef.current !== staticKey
+      || offscreenRef.current.width !== cw
+      || offscreenRef.current.height !== ch;
 
-    if (dragOver) {
-      ctx.fillStyle = "rgba(57, 197, 187, 0.06)";
-      ctx.fillRect(0, 0, width, height);
-      ctx.strokeStyle = "rgba(57, 197, 187, 0.3)";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([6, 4]);
-      ctx.strokeRect(2, 2, width - 4, height - 4);
-      ctx.setLineDash([]);
+    if (needsStaticRedraw) {
+      offscreenRef.current = new OffscreenCanvas(cw, ch);
+      const oc = offscreenRef.current.getContext("2d")!;
+      oc.scale(devicePixelRatio, devicePixelRatio);
+      drawStaticContent(oc, width, height, tracks, audioFiles, ppt, scrollX, scrollY, timeSignature, tempo, selectedSegment, dragOver);
+      staticDepsRef.current = staticKey;
     }
 
-    const startTick = Math.floor(scrollX / ppt);
-    const endTick = Math.ceil((scrollX + width) / ppt);
-    for (let tick = startTick - (startTick % TICKS_PER_BEAT); tick < endTick; tick += TICKS_PER_BEAT) {
-      const x = tick * ppt - scrollX;
-      const isBar = tick % ticksPerBar === 0;
-      ctx.strokeStyle = isBar ? "rgba(57,197,187,0.18)" : "rgba(57,197,187,0.05)";
-      ctx.lineWidth = isBar ? 1 : 0.5;
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
-    }
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(offscreenRef.current!, 0, 0);
+    ctx.restore();
 
-    for (let i = 0; i < tracks.length; i++) {
-      const track = tracks[i];
-      if (!track) continue;
-      const y = i * TRACK_HEIGHT - scrollY;
-
-      ctx.strokeStyle = "rgba(30,42,69,0.8)"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(0, y + TRACK_HEIGHT); ctx.lineTo(width, y + TRACK_HEIGHT); ctx.stroke();
-
-      const c = track.trackType === "audio" ? [96, 165, 250]
-        : track.trackType === "vocal" ? [57, 197, 187] : [167, 139, 250];
-
-      // Draw in array order: later entries render on top (higher z-order)
-      for (const seg of track.segments) {
-        const sx = seg.startTick * ppt - scrollX;
-        const sw = seg.durationTicks * ppt;
-        const sy = y + 2;
-        const sh = TRACK_HEIGHT - 4;
-
-        const isSel = selectedSegment?.trackId === track.id && selectedSegment?.segmentId === seg.id;
-
-        ctx.fillStyle = isSel ? `rgba(${c[0]},${c[1]},${c[2]},0.28)` : `rgba(${c[0]},${c[1]},${c[2]},0.15)`;
-        ctx.fillRect(sx, sy, sw, sh);
-        ctx.strokeStyle = isSel ? `rgba(${c[0]},${c[1]},${c[2]},0.9)` : `rgba(${c[0]},${c[1]},${c[2]},0.5)`;
-        ctx.lineWidth = isSel ? 1.5 : 1;
-        ctx.strokeRect(sx, sy, sw, sh);
-
-        ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.3)`;
-        ctx.fillRect(sx, sy, 3, sh);
-        ctx.fillRect(sx + sw - 3, sy, 3, sh);
-
-        if (seg.content.type === "audioClip" && sw > 2) {
-          const audio = audioFiles[seg.content.sourcePath];
-          if (audio && audio.peaks.length > 0) {
-            const offMs = seg.content.offsetMs;
-            const totalMs = seg.content.totalDurationMs;
-            const segMs = (seg.durationTicks / TICKS_PER_BEAT) * (60000 / tempo);
-            drawWaveform(ctx, audio.peaks, sx, sy, sw, sh, `rgba(${c[0]},${c[1]},${c[2]},0.6)`, offMs, totalMs, segMs);
-          }
-        }
-
-        if (track.muted) {
-          ctx.fillStyle = "rgba(13, 18, 32, 0.5)";
-          ctx.fillRect(sx, sy, sw, sh);
-        }
-      }
-
-      // Draw crossfade X markers (need time-sorted order to detect overlaps)
-      const timeSorted = [...track.segments].sort((a, b) => a.startTick - b.startTick);
-      for (let si = 0; si + 1 < timeSorted.length; si++) {
-        const seg = timeSorted[si]!;
-        const next = timeSorted[si + 1]!;
-        const segEnd = seg.startTick + seg.durationTicks;
-        if (next.startTick < segEnd) {
-          const overlapEnd = Math.min(segEnd, next.startTick + next.durationTicks);
-          const ox = next.startTick * ppt - scrollX;
-          const ow = (overlapEnd - next.startTick) * ppt;
-          drawCrossfade(ctx, ox, y + 2, ow, TRACK_HEIGHT - 4, c);
-        }
-      }
-    }
-
-    // Playhead
+    // Playhead (drawn every frame — just one line + triangle, trivially cheap)
     const phx = playheadTick * ppt - scrollX;
     if (phx >= -1 && phx <= width + 1) {
       const near = Math.abs(mouseXRef.current - phx) < 10;
@@ -554,6 +506,150 @@ function drawWaveform(
     ctx.moveTo(x + px, midY - peak * amp); ctx.lineTo(x + px, midY + peak * amp);
   }
   ctx.stroke();
+}
+
+function drawStaticContent(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  width: number, height: number,
+  tracks: import("../../types/project").Track[],
+  audioFiles: Record<string, import("../../store/audio").AudioTrackData>,
+  ppt: number, scrollX: number, scrollY: number,
+  timeSignature: [number, number], tempo: number,
+  selectedSegment: { trackId: string; segmentId: string } | null,
+  dragOver: boolean,
+) {
+  const ticksPerBar = TICKS_PER_BEAT * timeSignature[0];
+
+  ctx.fillStyle = "#0d1220";
+  ctx.fillRect(0, 0, width, height);
+
+  if (dragOver) {
+    ctx.fillStyle = "rgba(57, 197, 187, 0.06)";
+    ctx.fillRect(0, 0, width, height);
+    ctx.strokeStyle = "rgba(57, 197, 187, 0.3)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(2, 2, width - 4, height - 4);
+    ctx.setLineDash([]);
+  }
+
+  const startTick = Math.floor(scrollX / ppt);
+  const endTick = Math.ceil((scrollX + width) / ppt);
+  for (let tick = startTick - (startTick % TICKS_PER_BEAT); tick < endTick; tick += TICKS_PER_BEAT) {
+    const x = tick * ppt - scrollX;
+    const isBar = tick % ticksPerBar === 0;
+    ctx.strokeStyle = isBar ? "rgba(57,197,187,0.18)" : "rgba(57,197,187,0.05)";
+    ctx.lineWidth = isBar ? 1 : 0.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+  }
+
+  const yOffsets = computeTrackYOffsets(tracks);
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i];
+    if (!track) continue;
+    const y = yOffsets[i]! - scrollY;
+    const trackH = computeTrackHeight(track);
+    const headerH = TRACK_HEADER_HEIGHT;
+
+    ctx.strokeStyle = "rgba(30,42,69,0.8)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, y + trackH); ctx.lineTo(width, y + trackH); ctx.stroke();
+
+    const c = track.trackType === "audio" ? [96, 165, 250]
+      : track.trackType === "vocal" ? [57, 197, 187] : [167, 139, 250];
+
+    const maxLanes = getMaxLaneCount(track);
+
+    for (const seg of track.segments) {
+      const sx = seg.startTick * ppt - scrollX;
+      const sw = seg.durationTicks * ppt;
+      const sy = y + 2;
+      const sh = headerH - 4;
+
+      const isSel = selectedSegment?.trackId === track.id && selectedSegment?.segmentId === seg.id;
+
+      ctx.fillStyle = isSel ? `rgba(${c[0]},${c[1]},${c[2]},0.28)` : `rgba(${c[0]},${c[1]},${c[2]},0.15)`;
+      ctx.fillRect(sx, sy, sw, sh);
+      ctx.strokeStyle = isSel ? `rgba(${c[0]},${c[1]},${c[2]},0.9)` : `rgba(${c[0]},${c[1]},${c[2]},0.5)`;
+      ctx.lineWidth = isSel ? 1.5 : 1;
+      ctx.strokeRect(sx, sy, sw, sh);
+
+      ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.3)`;
+      ctx.fillRect(sx, sy, 3, sh);
+      ctx.fillRect(sx + sw - 3, sy, 3, sh);
+
+      if (seg.content.type === "audioClip" && sw > 2) {
+        const audio = audioFiles[seg.content.sourcePath];
+        if (audio && audio.peaks.length > 0) {
+          const offMs = seg.content.offsetMs;
+          const totalMs = seg.content.totalDurationMs;
+          const segMs = (seg.durationTicks / TICKS_PER_BEAT) * (60000 / tempo);
+          drawWaveform(ctx as CanvasRenderingContext2D, audio.peaks, sx, sy, sw, sh, `rgba(${c[0]},${c[1]},${c[2]},0.6)`, offMs, totalMs, segMs);
+        }
+      }
+
+      if (seg.processedOutputs && seg.processedOutputs.length > 0) {
+        ctx.fillStyle = "#4ade80";
+        ctx.beginPath();
+        ctx.arc(sx + 8, sy + 8, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (track.muted) {
+        ctx.fillStyle = "rgba(13, 18, 32, 0.5)";
+        ctx.fillRect(sx, sy, sw, sh);
+      }
+
+      if (track.expanded && seg.processedOutputs) {
+        for (let li = 0; li < seg.processedOutputs.length; li++) {
+          const out = seg.processedOutputs[li]!;
+          const laneY = y + headerH + li * LANE_HEIGHT;
+          const laneH = LANE_HEIGHT - 2;
+          const laneColor = laneColors[li % laneColors.length]!;
+
+          ctx.fillStyle = `rgba(${laneColor},0.08)`;
+          ctx.fillRect(sx, laneY, sw, laneH);
+          ctx.strokeStyle = `rgba(${laneColor},0.3)`;
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(sx, laneY, sw, laneH);
+
+          if (out.waveformPeaks && out.waveformPeaks.length > 0 && sw > 2) {
+            drawWaveform(ctx as CanvasRenderingContext2D, out.waveformPeaks, sx, laneY, sw, laneH, `rgba(${laneColor},0.6)`, 0, out.totalDurationMs, out.totalDurationMs);
+          }
+
+          ctx.fillStyle = `rgba(${laneColor},0.7)`;
+          ctx.font = "9px monospace";
+          ctx.fillText(out.laneLabel, sx + 4, laneY + 10);
+
+          const ctrl = track.laneControls[out.laneLabel];
+          if (ctrl?.muted) {
+            ctx.fillStyle = "rgba(13, 18, 32, 0.5)";
+            ctx.fillRect(sx, laneY, sw, laneH);
+          }
+        }
+      }
+    }
+
+    if (track.expanded && maxLanes > 0) {
+      for (let li = 0; li < maxLanes; li++) {
+        const laneY = y + headerH + li * LANE_HEIGHT;
+        ctx.strokeStyle = "rgba(30,42,69,0.5)"; ctx.lineWidth = 0.5;
+        ctx.beginPath(); ctx.moveTo(0, laneY); ctx.lineTo(width, laneY); ctx.stroke();
+      }
+    }
+
+    const timeSorted = [...track.segments].sort((a, b) => a.startTick - b.startTick);
+    for (let si = 0; si + 1 < timeSorted.length; si++) {
+      const seg = timeSorted[si]!;
+      const next = timeSorted[si + 1]!;
+      const segEnd = seg.startTick + seg.durationTicks;
+      if (next.startTick < segEnd) {
+        const overlapEnd = Math.min(segEnd, next.startTick + next.durationTicks);
+        const ox = next.startTick * ppt - scrollX;
+        const ow = (overlapEnd - next.startTick) * ppt;
+        drawCrossfade(ctx as CanvasRenderingContext2D, ox, y + 2, ow, headerH - 4, c);
+      }
+    }
+  }
 }
 
 function drawCrossfade(

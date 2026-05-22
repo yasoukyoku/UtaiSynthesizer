@@ -4,7 +4,8 @@
     "file": "ファイル",
     "edit": "編集",
     "view": "表示",
-    "tools": "ツール"
+    "tools": "ツール",
+    "settings": "設定"
   },
   "transport": {
     "play": "再生",
@@ -65,6 +66,11 @@
     "catEffects": "エフェクト",
     "catSeparation": "音声分離",
     "catIO": "入出力"
+  },
+  "titlebar": {
+    "log": "ログ",
+    "models": "リソース管理",
+    "training": "トレーニング"
   },
   "common": {
     "cancel": "キャンセル",

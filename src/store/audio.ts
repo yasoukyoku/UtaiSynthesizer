@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface AudioTrackData {
   filePath: string;
+  playbackPath: string;
   durationMs: number;
   sampleRate: number;
   peaks: number[];
@@ -34,10 +35,12 @@ export const useAudioStore = create<AudioState>((set, get) => ({
       sample_rate: number;
       channels: number;
       peaks: number[];
+      playback_path: string;
     }>("load_audio_file", { path: filePath });
 
     const data: AudioTrackData = {
       filePath,
+      playbackPath: info.playback_path,
       durationMs: info.duration_ms,
       sampleRate: info.sample_rate,
       peaks: info.peaks,

@@ -10,6 +10,9 @@ models/*.onnx
 models/**/*.onnx
 models/**/*.npy
 
+# ORT runtime DLLs (downloaded, not checked in)
+runtime/
+
 # Embedded Python runtime (too large for git)
 python/
 

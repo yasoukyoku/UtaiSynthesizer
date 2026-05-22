@@ -1,3 +1,9 @@
+export interface LaneControl {
+  volumeDb: number;
+  pan: number;
+  muted: boolean;
+}
+
 export interface Track {
   id: string;
   name: string;
@@ -8,6 +14,16 @@ export interface Track {
   muted: boolean;
   solo: boolean;
   voiceModel?: string;
+  voiceModelAvatar?: string;
+  expanded: boolean;
+  laneControls: Record<string, LaneControl>;
+}
+
+export interface ProcessedOutput {
+  laneLabel: string;
+  audioPath: string;
+  totalDurationMs: number;
+  waveformPeaks?: number[];
 }
 
 export interface Segment {
@@ -16,6 +32,7 @@ export interface Segment {
   durationTicks: number;
   content: SegmentContent;
   workflow?: Workflow;
+  processedOutputs?: ProcessedOutput[];
 }
 
 export type SegmentContent =

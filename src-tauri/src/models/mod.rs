@@ -1,4 +1,3 @@
-pub mod cache;
 pub mod convert;
 
 use std::path::PathBuf;
@@ -22,6 +21,7 @@ pub struct ModelEntry {
     pub sample_rate: u32,
     pub config: ModelConfig,
     pub index_path: Option<PathBuf>,
+    pub avatar_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,21 +63,16 @@ fn default_features_dim() -> u32 { 768 }
 fn default_speakers() -> Vec<String> { vec!["default".to_string()] }
 
 impl ModelRegistry {
-    pub fn new() -> Self {
-        let models_dir = PathBuf::from("models");
+    pub fn new(models_dir: PathBuf) -> Self {
         Self {
             models_dir,
             entries: RwLock::new(Vec::new()),
         }
     }
 
-    pub fn set_models_dir(&self, dir: PathBuf) {
-        // Re-scan would happen here
-        let _ = dir;
-    }
-
     pub fn scan(&self) -> Result<()> {
         let mut entries = self.entries.write();
+        let prev_count = entries.len();
         entries.clear();
 
         for subdir in &["rvc", "sovits", "s2h", "f0", "nsf_hifigan"] {
@@ -124,6 +119,8 @@ impl ModelRegistry {
                             None
                         };
 
+                        let avatar = find_avatar(&path, &name);
+
                         entries.push(ModelEntry {
                             name,
                             model_type: model_type.clone(),
@@ -132,13 +129,16 @@ impl ModelRegistry {
                             sample_rate,
                             config,
                             index_path: index,
+                            avatar_path: avatar,
                         });
                     }
                 }
             }
         }
 
-        tracing::info!("Model scan complete: {} models found", entries.len());
+        if entries.len() != prev_count {
+            tracing::info!("Model scan: {} models found (was {})", entries.len(), prev_count);
+        }
         Ok(())
     }
 
@@ -171,8 +171,11 @@ impl ModelRegistry {
         name: &str,
         pth_path: &PathBuf,
         model_type: ModelType,
+        app_dir: &PathBuf,
+        index_file: Option<&PathBuf>,
+        avatar_file: Option<&PathBuf>,
     ) -> Result<ModelEntry> {
-        let onnx_path = convert::convert_pth_to_onnx(pth_path, &self.models_dir, &model_type)?;
+        let onnx_path = convert::convert_pth_to_onnx(pth_path, &self.models_dir, &model_type, app_dir)?;
 
         let config_path = onnx_path.with_extension("json");
         let config = if config_path.exists() {
@@ -185,8 +188,8 @@ impl ModelRegistry {
         };
         let sample_rate = config.sample_rate;
 
-        let index_path = pth_path.with_extension("npy");
-        let index = if index_path.exists() { Some(index_path) } else { None };
+        let index_path = self.resolve_index(name, &model_type, pth_path, index_file, app_dir);
+        let avatar_path = self.import_avatar(name, &model_type, avatar_file);
 
         let entry = ModelEntry {
             name: name.to_string(),
@@ -195,11 +198,123 @@ impl ModelRegistry {
             path: onnx_path,
             sample_rate,
             config,
-            index_path: index,
+            index_path,
+            avatar_path,
         };
 
         self.entries.write().push(entry.clone());
         Ok(entry)
+    }
+
+    fn import_avatar(
+        &self,
+        name: &str,
+        model_type: &ModelType,
+        avatar_file: Option<&PathBuf>,
+    ) -> Option<PathBuf> {
+        let avatar_src = avatar_file.filter(|p| p.exists())?;
+        let ext = avatar_src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+        let subdir = match model_type {
+            ModelType::Rvc => "rvc",
+            ModelType::SoVits => "sovits",
+            _ => return None,
+        };
+        let dest = self.models_dir.join(subdir).join(format!("{}.avatar.{}", name, ext));
+        match std::fs::copy(avatar_src, &dest) {
+            Ok(_) => {
+                tracing::info!("Imported avatar for {}: {}", name, dest.display());
+                Some(dest)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to copy avatar: {}", e);
+                None
+            }
+        }
+    }
+
+    pub fn set_avatar(&self, name: &str, avatar_file: &PathBuf) -> Result<Option<PathBuf>> {
+        let mut entries = self.entries.write();
+        let entry = entries.iter_mut().find(|e| e.name == name)
+            .ok_or_else(|| crate::UtaiError::Model(format!("Model '{}' not found", name)))?;
+        let path = self.import_avatar(name, &entry.model_type, Some(avatar_file));
+        entry.avatar_path = path.clone();
+        Ok(path)
+    }
+
+    fn resolve_index(
+        &self,
+        name: &str,
+        model_type: &ModelType,
+        pth_path: &PathBuf,
+        index_file: Option<&PathBuf>,
+        app_dir: &PathBuf,
+    ) -> Option<PathBuf> {
+        if !matches!(model_type, ModelType::Rvc) {
+            return None;
+        }
+
+        let subdir = self.models_dir.join("rvc");
+        let npy_dest = subdir.join(format!("{}.npy", name));
+
+        if let Some(idx_path) = index_file {
+            if idx_path.exists() {
+                let ext = idx_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext == "npy" {
+                    if let Err(e) = std::fs::copy(idx_path, &npy_dest) {
+                        tracing::warn!("Failed to copy .npy index: {}", e);
+                        return None;
+                    }
+                    return Some(npy_dest);
+                }
+                if ext == "index" {
+                    match convert::convert_index_to_npy(idx_path, &npy_dest, app_dir) {
+                        Ok(p) => return Some(p),
+                        Err(e) => {
+                            tracing::warn!("Index conversion failed: {}", e);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-detect: check for .index or .npy next to the .pth
+        let auto_npy = pth_path.with_extension("npy");
+        if auto_npy.exists() {
+            if let Err(e) = std::fs::copy(&auto_npy, &npy_dest) {
+                tracing::warn!("Failed to copy auto-detected .npy: {}", e);
+                return None;
+            }
+            return Some(npy_dest);
+        }
+
+        let auto_index = pth_path.with_extension("index");
+        if auto_index.exists() {
+            match convert::convert_index_to_npy(&auto_index, &npy_dest, app_dir) {
+                Ok(p) => return Some(p),
+                Err(e) => tracing::warn!("Auto index conversion failed: {}", e),
+            }
+        }
+
+        // Also check for added_*.index in the same directory
+        if let Some(parent) = pth_path.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("index") {
+                        let fname = p.file_name().unwrap_or_default().to_string_lossy();
+                        if fname.starts_with("added_") || fname.contains(name) {
+                            match convert::convert_index_to_npy(&p, &npy_dest, app_dir) {
+                                Ok(p) => return Some(p),
+                                Err(e) => tracing::warn!("Index conversion failed for {}: {}", fname, e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
@@ -210,12 +325,27 @@ impl ModelRegistry {
             if let Some(index) = &entry.index_path {
                 std::fs::remove_file(index).ok();
             }
+            if let Some(avatar) = &entry.avatar_path {
+                std::fs::remove_file(avatar).ok();
+            }
             let config_path = entry.path.with_extension("json");
             std::fs::remove_file(config_path).ok();
             tracing::info!("Deleted model: {}", name);
         }
         Ok(())
     }
+}
+
+fn find_avatar(onnx_path: &std::path::Path, name: &str) -> Option<PathBuf> {
+    for ext in &["png", "jpg", "jpeg", "bmp", "webp"] {
+        let p = onnx_path.with_extension(format!("avatar.{}", ext));
+        if p.exists() { return Some(p); }
+        if let Some(dir) = onnx_path.parent() {
+            let p2 = dir.join(format!("{}.avatar.{}", name, ext));
+            if p2.exists() { return Some(p2); }
+        }
+    }
+    None
 }
 
 fn default_config() -> ModelConfig {
