@@ -12,7 +12,9 @@
   left: 0;
   right: 0;
   height: 3px;
-  background: var(--border-default);
+  /* Slightly brighter than --border-default: on the dark headers the base track was near-invisible,
+     making adjacent faders read as one smear (user feedback). */
+  background: rgba(148, 163, 184, 0.32);
 }
 
 .vol-zero {

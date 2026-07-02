@@ -3,38 +3,105 @@
   "menu": {
     "file": "ファイル",
     "edit": "編集",
-    "view": "表示",
     "tools": "ツール",
-    "settings": "設定"
+    "settings": "設定",
+    "undo": "元に戻す",
+    "redo": "やり直し",
+    "new": "新規",
+    "open": "開く",
+    "save": "保存",
+    "saveAs": "名前を付けて保存"
   },
-  "transport": {
-    "play": "再生",
-    "pause": "一時停止",
-    "returnToStart": "先頭に戻る"
+  "project": {
+    "discardTitle": "未保存の変更",
+    "discardBody": "現在のプロジェクトに未保存の変更があります。破棄しますか？",
+    "openTitle": "プロジェクトを開く",
+    "saveAsTitle": "プロジェクトを保存",
+    "saved": "保存しました",
+    "saveMissing": "保存しましたが、参照している一部の音声ファイルが見つからずスキップされました",
+    "loaded": "開きました",
+    "emptyNoSave": "プロジェクトが空です",
+    "discard": "破棄",
+    "closeBody": "閉じる前に現在のプロジェクトを保存しますか？",
+    "dontSave": "保存しない",
+    "recoverTitle": "プロジェクトの復元",
+    "recoverBody": "前回 UTAI が正常に終了しませんでした。未保存の作業を復元しますか？",
+    "recover": "復元",
+    "recovered": "復元しました"
+  },
+  "close": {
+    "title": "UTAI を閉じる",
+    "body": "トレイに最小化しますか、それとも UTAI を終了しますか？",
+    "minimize": "トレイに最小化",
+    "quit": "終了",
+    "busyTitle": "進行中のタスクがあります",
+    "busyIntro": "以下のタスクが実行中です。今終了すると進行状況が失われます：",
+    "busyOutro": "終了しますか？",
+    "quitAnyway": "終了する",
+    "task_training": "モデル学習",
+    "task_separation": "音声分離",
+    "task_workflow": "ワークフロー処理",
+    "task_download": "モデルのダウンロード",
+    "task_convert": "モデル変換",
+    "task_cuda_download": "CUDA ランタイムのダウンロード"
+  },
+  "tray": {
+    "show": "ウィンドウを表示",
+    "quit": "終了"
+  },
+  "history": {
+    "undone": "元に戻しました",
+    "redone": "やり直しました",
+    "movedClip": "クリップを移動",
+    "resizedClip": "クリップをリサイズ",
+    "addedClip": "クリップを追加",
+    "deletedClip": "クリップを削除",
+    "splitClip": "クリップを分割",
+    "addedTrack": "トラックを追加",
+    "removedTrack": "トラックを削除",
+    "reorderedTrack": "トラックを並べ替え",
+    "renamedTrack": "トラック名を変更",
+    "volume": "音量",
+    "mute": "ミュート",
+    "solo": "ソロ",
+    "pan": "パン",
+    "laneVolume": "レーン音量",
+    "lanePan": "レーンパン",
+    "laneMute": "レーンミュート",
+    "playOriginal": "元音源/レーン切替",
+    "tempo": "テンポ",
+    "timeSignature": "拍子",
+    "change": "変更",
+    "nodeAdd": "ノードを追加",
+    "nodeRemove": "ノードを削除",
+    "nodeConnect": "ノードを接続",
+    "nodeDisconnect": "接続を解除",
+    "nodeMove": "ノードを移動",
+    "nodeParam": "ノード設定を変更",
+    "nodeEdit": "ノードを編集"
   },
   "toolbar": {
     "bpm": "速度",
     "position": "位置",
     "snap": "スナップ",
-    "free": "フリー",
-    "triplet": "三連符",
+    "snapClipTip": "クリップを端/再生位置にスナップ",
+    "snapPlayheadTip": "再生位置をクリップ端にスナップ",
     "addTrack": "追加",
     "importAudio": "オーディオ追加",
+    "addAudio": "オーディオトラック作成",
     "addMidi": "MIDIトラック作成",
     "split": "分割",
     "delete": "削除"
   },
   "tracks": {
-    "title": "トラック",
     "empty": "音声ファイルをドロップまたは新規トラック追加",
     "delete": "トラック削除",
-    "vocal": "ボーカル",
-    "audio": "オーディオ",
-    "instrument": "楽器"
+    "rename": "名前を変更",
+    "loading": "読み込み中",
+    "playOriginal": "元の音声を再生（レーンは出力から外れる）"
   },
   "training": {
     "title": "トレーニング",
-    "panel": "トレーニングパネル",
     "active": "トレーニング中",
     "modelName": "モデル名",
     "modelNamePlaceholder": "モデル名を入力...",
@@ -61,11 +128,34 @@
   },
   "workflow": {
     "title": "ワークフローエディタ",
+    "clearRender": "レンダリングをクリア",
     "nodes": "ノード",
     "catVoice": "ボイス変換",
     "catEffects": "エフェクト",
     "catSeparation": "音声分離",
-    "catIO": "入出力"
+    "catIO": "入出力",
+    "nodeOutput": "トラックへ出力",
+    "lane": "レーングループ",
+    "deleteConnection": "接続を削除",
+    "depositFailed": "トラックへの配置に失敗しました",
+    "noOutputs": "実行は完了しましたがトラック出力がありません — Output ノードが接続されているか確認してください",
+    "newGroup": "+ 新規レーングループ…",
+    "newGroupTitle": "新規レーングループ",
+    "newGroupPlaceholder": "レーングループ名",
+    "groupNameInvalid": "このレーングループ名は使用できません",
+    "detachGroup": "グループ解除"
+  },
+  "log": {
+    "title": "ログ",
+    "all": "すべて",
+    "error": "エラー",
+    "warn": "警告",
+    "info": "情報",
+    "debug": "デバッグ",
+    "search": "検索...",
+    "copy": "コピー",
+    "copyTitle": "すべてコピー",
+    "empty": "ログがありません"
   },
   "titlebar": {
     "log": "ログ",
@@ -74,9 +164,6 @@
   },
   "common": {
     "cancel": "キャンセル",
-    "confirm": "確認",
-    "save": "保存",
-    "open": "開く",
-    "close": "閉じる"
+    "confirm": "確認"
   }
 }

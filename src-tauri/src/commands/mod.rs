@@ -7,3 +7,4 @@ pub mod project;
 pub mod separation;
 pub mod settings;
 pub mod training;
+pub mod window;

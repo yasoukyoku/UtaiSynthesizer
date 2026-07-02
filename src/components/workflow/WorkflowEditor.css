@@ -1,10 +1,14 @@
 .workflow-editor {
-  position: absolute;
-  inset: 0;
-  z-index: var(--z-overlay);
+  /* Docked as an in-flow bottom panel (height set inline by the split container). Was a full-screen
+     overlay (position:absolute; inset:0); now it really occupies layout height so the track area
+     above genuinely shrinks and its scroll/hit geometry self-corrects. */
+  position: relative;
+  flex: none;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg-deep, #080c16);
+  border-top: 1px solid var(--border-default);
 }
 
 .workflow-header {
@@ -23,6 +27,12 @@
   font-weight: 600;
   font-family: var(--font-mono);
   letter-spacing: 0.5px;
+}
+
+.workflow-header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
 }
 
 .workflow-header-actions {
@@ -70,7 +80,7 @@
 
 .workflow-close {
   background: none;
-  border: 1px solid transparent;
+  border: 1px solid var(--border-default);
   color: var(--text-muted);
   font-size: 14px;
   width: 24px;
@@ -106,6 +116,22 @@
   box-shadow: none;
   font-size: var(--font-size-sm);
   color: var(--text-primary);
+}
+
+/* ReactFlow tags every node with its own `.selectable` class (meaning "clickable"). That collides
+   with our GLOBAL `.selectable` copyable-content allowlist (global.css), which was unintentionally
+   re-enabling `user-select: text` on ALL node chrome — so node labels/params became drag-selectable.
+   Force selection back off for the node subtree here (higher specificity wins regardless of import
+   order); the param inputs keep their own text selection so model paths / numbers stay editable. */
+.workflow-canvas .react-flow__node,
+.workflow-canvas .react-flow__node * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+.workflow-canvas .react-flow__node input,
+.workflow-canvas .react-flow__node textarea {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .workflow-canvas .react-flow__node.selected .wf-node {

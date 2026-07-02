@@ -1,0 +1,62 @@
+.app-banner {
+  position: fixed;
+  top: 88px; /* below the 36px titlebar + 40px toolbar, clear of their content */
+  right: 16px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-left: 3px solid var(--ab-color, var(--accent-primary));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.2);
+  /* chamfered bottom-left corner — angular, deliberately NOT a rounded rectangle */
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 14px 100%, 0 calc(100% - 14px));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease; /* fade-out when `show` is removed */
+  z-index: 500;
+  overflow: hidden;
+}
+
+.app-banner.show {
+  opacity: 1;
+}
+
+/* Slide-in lives on the seq-keyed inner element so it REPLAYS on each retrigger (the inner remounts
+   per event), giving a re-pulse on rapid undo. The outer only handles the fade-out. */
+.app-banner-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center; /* snug to content + centered — no left-heavy whitespace on short messages */
+  gap: 10px;
+  max-width: 360px;
+  padding: 11px 18px;
+  animation: ab-slidein 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes ab-slidein {
+  from { transform: translateX(22px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.app-banner-icon {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ab-color, var(--accent-primary));
+  filter: drop-shadow(0 0 5px var(--ab-color, var(--accent-primary)));
+}
+
+.app-banner-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.app-banner-text {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}

@@ -182,8 +182,8 @@ def convert_bs_roformer(input_path: Path, output_path: Path):
         input_names=["stft_repr"],
         output_names=["mask"],
         dynamic_axes={
-            "stft_repr": {2: "time_frames"},
-            "mask": {3: "time_frames"},
+            "stft_repr": {0: "batch", 2: "time_frames"},
+            "mask": {0: "batch", 3: "time_frames"},
         },
         opset_version=17,
         do_constant_folding=True,
@@ -200,6 +200,17 @@ def convert_bs_roformer(input_path: Path, output_path: Path):
     ort_out = sess.run(None, {"stft_repr": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
+    # Batch-axis self-check: a B=2 batch must equal two independent B=1 runs, item-for-item. Proves the
+    # dynamic batch axis exported correctly (constant-folding didn't bake batch=1) AND that the Rust
+    # unbind offset (j*N + stem) matches the real [B, N, ...] output layout. If this asserts, the batched
+    # Rust path would silently corrupt output — fail loudly here at export time instead.
+    dummy2 = torch.cat([dummy, dummy + 0.01], dim=0).numpy()
+    ort_b2 = sess.run(None, {"stft_repr": dummy2})[0]
+    s0 = sess.run(None, {"stft_repr": dummy.numpy()})[0]
+    s1 = sess.run(None, {"stft_repr": (dummy + 0.01).numpy()})[0]
+    b2_diff = max(abs(ort_b2[0] - s0[0]).max(), abs(ort_b2[1] - s1[0]).max())
+    assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
+    print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
     hop_length = config.get("stft_hop_length", 441)
     chunk_size = 131584  # ~3s at 44100Hz — keeps T≈299 frames, avoids O(T²) attention blowup
@@ -217,6 +228,7 @@ def convert_bs_roformer(input_path: Path, output_path: Path):
         "chunk_size": chunk_size,
         "num_overlap": 2,
         "batch_size": 1,
+        "dynamic_batch": True,
     }
     config_path.write_text(json.dumps(config_data, indent=2))
 
@@ -252,8 +264,8 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
         input_names=["stft_repr"],
         output_names=["mask"],
         dynamic_axes={
-            "stft_repr": {2: "time_frames"},
-            "mask": {3: "time_frames"},
+            "stft_repr": {0: "batch", 2: "time_frames"},
+            "mask": {0: "batch", 3: "time_frames"},
         },
         opset_version=17,
         do_constant_folding=True,
@@ -270,6 +282,17 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     ort_out = sess.run(None, {"stft_repr": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
+    # Batch-axis self-check: a B=2 batch must equal two independent B=1 runs, item-for-item. Proves the
+    # dynamic batch axis exported correctly (constant-folding didn't bake batch=1) AND that the Rust
+    # unbind offset (j*N + stem) matches the real [B, N, ...] output layout. If this asserts, the batched
+    # Rust path would silently corrupt output — fail loudly here at export time instead.
+    dummy2 = torch.cat([dummy, dummy + 0.01], dim=0).numpy()
+    ort_b2 = sess.run(None, {"stft_repr": dummy2})[0]
+    s0 = sess.run(None, {"stft_repr": dummy.numpy()})[0]
+    s1 = sess.run(None, {"stft_repr": (dummy + 0.01).numpy()})[0]
+    b2_diff = max(abs(ort_b2[0] - s0[0]).max(), abs(ort_b2[1] - s1[0]).max())
+    assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
+    print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
     hop_length = config.get("stft_hop_length", 441)
     chunk_size = 131584  # ~3s at 44100Hz — keeps T≈299 frames, avoids O(T²) attention blowup

@@ -1,0 +1,73 @@
+.daw-split {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative; /* anchor for the active-pane cue (top line) */
+}
+
+.workflow-divider {
+  flex: none;
+  height: 6px;
+  cursor: row-resize;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  position: relative;
+  z-index: 1;
+  touch-action: none;
+}
+
+/* Grip hint: a short centered bar (no rounded corners — house style). */
+.workflow-divider::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 36px;
+  height: 2px;
+  transform: translate(-50%, -50%);
+  background: var(--border-default);
+}
+
+.workflow-divider:hover {
+  background: var(--bg-elevated, var(--bg-panel));
+}
+
+.workflow-divider:hover::after {
+  background: var(--accent-primary);
+}
+
+/* Active-pane cue. `activePane` decides which pane owns Ctrl+Z / Delete / Ctrl+K, but it was invisible
+   before — the user couldn't tell where a keystroke would land (the reported "undo feels confused").
+   TWO accent lines placed FAR APART so they can never be confused (adjacent same-colour lines were too
+   easy to misread): timeline active → a line across the very TOP of the arrangement pane; node editor
+   active → a line hugging the divider on the editor's side. Both are overlays (absolute → no layout
+   shift) and only appear while the panel is open (`.panel-open`), so a closed panel has no cue and no
+   ambiguity. */
+.daw-split.panel-open.pane-timeline::before {
+  content: "";
+  position: absolute;
+  /* At the very TOP sill of the pane — mirrors the workflow cue (which hugs its own top edge). */
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--accent-primary);
+  box-shadow: 0 0 8px var(--accent-primary-glow); /* soft low-alpha halo */
+  z-index: 5;
+  pointer-events: none;
+}
+
+.daw-split.panel-open.pane-workflow .workflow-divider::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px; /* line hugs the node-editor (lower) pane */
+  height: 1px;
+  background: var(--accent-primary);
+  box-shadow: 0 0 8px var(--accent-primary-glow); /* soft low-alpha halo */
+  pointer-events: none;
+}

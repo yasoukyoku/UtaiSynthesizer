@@ -1,7 +1,9 @@
-import { useState, useCallback } from "react";
-import { type NodeProps, useReactFlow } from "@xyflow/react";
-import { NodeShell } from "./NodeShell";
+import { useCallback } from "react";
+import { type NodeProps } from "@xyflow/react";
 import { useTranslation } from "react-i18next";
+import { NodeShell } from "./NodeShell";
+import { useNodeParams } from "./useNodeParams";
+import { t18, type I18nText } from "../../../lib/models/msst-catalog";
 
 type EffectType = "pitchShift" | "formantShift" | "enhance";
 
@@ -11,7 +13,7 @@ interface EffectEntry {
   params: Record<string, unknown>;
 }
 
-const EFFECT_DEFS: Record<EffectType, { label: Record<string, string>; defaults: Record<string, unknown> }> = {
+const EFFECT_DEFS: Record<EffectType, { label: I18nText; defaults: Record<string, unknown> }> = {
   pitchShift: {
     label: { zh: "变调", en: "Pitch Shift", ja: "ピッチシフト" },
     defaults: { semitones: 0, vocoder: "world" },
@@ -26,23 +28,31 @@ const EFFECT_DEFS: Record<EffectType, { label: Record<string, string>; defaults:
   },
 };
 
+const EFFECT_STRINGS: Record<string, I18nText> = {
+  add: { zh: "+ 添加效果", en: "+ Add Effect", ja: "+ エフェクト追加" },
+  empty: { zh: "无效果 — 音频直通", en: "No effects — audio passthrough", ja: "エフェクトなし — パススルー" },
+  semitones: { zh: "半音", en: "Semitones", ja: "半音" },
+  ratio: { zh: "比例", en: "Ratio", ja: "比率" },
+  vocoder: { zh: "声码器", en: "Vocoder", ja: "ボコーダー" },
+  enhanceDesc: { zh: "NSF-HiFiGAN 后处理", en: "NSF-HiFiGAN post-process", ja: "NSF-HiFiGAN 後処理" },
+};
+
 export function EffectsNode(props: NodeProps) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
-  const { setNodes } = useReactFlow();
-  const nodeParams = (props.data?.params as Record<string, unknown>) ?? {};
-  const [effects, setEffects] = useState<EffectEntry[]>(
-    (nodeParams.effects as EffectEntry[]) ?? [],
-  );
+  const [nodeParams, updateParams] = useNodeParams(props);
+  // Derived from the GRAPH params, never mirrored into local state: the modal-local undo restores node
+  // params via setNodes WITHOUT remounting this component — a useState mirror kept rendering the undone
+  // effect stack, and the next add/remove/update silently re-committed it over the restored params.
+  const effects = (nodeParams.effects as EffectEntry[]) ?? [];
+  const l = (key: string) => {
+    const s = EFFECT_STRINGS[key];
+    return s ? t18(s, lang) : key;
+  };
 
   const syncToNode = useCallback((newEffects: EffectEntry[]) => {
-    setEffects(newEffects);
-    setNodes((nds) => nds.map((n) =>
-      n.id === props.id
-        ? { ...n, data: { ...n.data, params: { ...nodeParams, effects: newEffects } } }
-        : n,
-    ));
-  }, [props.id, nodeParams, setNodes]);
+    updateParams({ effects: newEffects });
+  }, [updateParams]);
 
   const addEffect = useCallback((type: EffectType) => {
     const entry: EffectEntry = {
@@ -63,20 +73,8 @@ export function EffectsNode(props: NodeProps) {
     ));
   }, [effects, syncToNode]);
 
-  const l = (key: string) => {
-    const map: Record<string, Record<string, string>> = {
-      add: { zh: "+ 添加效果", en: "+ Add Effect", ja: "+ エフェクト追加" },
-      empty: { zh: "无效果 — 音频直通", en: "No effects — audio passthrough", ja: "エフェクトなし — パススルー" },
-      semitones: { zh: "半音", en: "Semitones", ja: "半音" },
-      ratio: { zh: "比例", en: "Ratio", ja: "比率" },
-      vocoder: { zh: "声码器", en: "Vocoder", ja: "ボコーダー" },
-      enhanceDesc: { zh: "NSF-HiFiGAN 后处理", en: "NSF-HiFiGAN post-process", ja: "NSF-HiFiGAN 後処理" },
-    };
-    return map[key]?.[lang] ?? map[key]?.en ?? key;
-  };
-
   return (
-    <NodeShell nodeId={props.id} label={lang === "zh" ? "效果器" : "Effects"} icon="FX" color="#fbbf24" inputs={1} outputs={1}>
+    <NodeShell nodeId={props.id} label={t18({ zh: "效果器", en: "Effects", ja: "エフェクト" }, lang)} icon="FX" color="#fbbf24" inputs={1} outputs={1}>
       <div className="fx-stack">
         {effects.length === 0 && (
           <span className="fx-empty">{l("empty")}</span>
@@ -84,7 +82,7 @@ export function EffectsNode(props: NodeProps) {
         {effects.map((fx) => (
           <div key={fx.id} className="fx-entry">
             <div className="fx-entry-header">
-              <span className="fx-entry-type">{EFFECT_DEFS[fx.type].label[lang] ?? EFFECT_DEFS[fx.type].label.en}</span>
+              <span className="fx-entry-type">{t18(EFFECT_DEFS[fx.type].label, lang)}</span>
               <button className="fx-remove" onClick={() => removeEffect(fx.id)}>x</button>
             </div>
             <EffectParams fx={fx} onChange={(u) => updateEffect(fx.id, u)} l={l} />
@@ -96,13 +94,23 @@ export function EffectsNode(props: NodeProps) {
             onChange={(e) => { if (e.target.value) addEffect(e.target.value as EffectType); }}
           >
             <option value="">{l("add")}</option>
-            {(Object.keys(EFFECT_DEFS) as EffectType[]).map((t) => (
-              <option key={t} value={t}>{EFFECT_DEFS[t].label[lang] ?? EFFECT_DEFS[t].label.en}</option>
+            {(Object.keys(EFFECT_DEFS) as EffectType[]).map((tp) => (
+              <option key={tp} value={tp}>{t18(EFFECT_DEFS[tp].label, lang)}</option>
             ))}
           </select>
         </div>
       </div>
     </NodeShell>
+  );
+}
+
+/** WORLD / NSF-HiFiGAN vocoder select — was pasted in both the pitch- and formant-shift branches. */
+function VocoderSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="world">WORLD</option>
+      <option value="nsf">NSF-HiFiGAN</option>
+    </select>
   );
 }
 
@@ -118,11 +126,7 @@ function EffectParams({ fx, onChange, l }: { fx: EffectEntry; onChange: (u: Reco
         </div>
         <div className="sep-param-row">
           <label>{l("vocoder")}</label>
-          <select value={(fx.params.vocoder as string) ?? "world"}
-            onChange={(e) => onChange({ vocoder: e.target.value })}>
-            <option value="world">WORLD</option>
-            <option value="nsf">NSF-HiFiGAN</option>
-          </select>
+          <VocoderSelect value={(fx.params.vocoder as string) ?? "world"} onChange={(v) => onChange({ vocoder: v })} />
         </div>
       </div>
     );
@@ -138,11 +142,7 @@ function EffectParams({ fx, onChange, l }: { fx: EffectEntry; onChange: (u: Reco
         </div>
         <div className="sep-param-row">
           <label>{l("vocoder")}</label>
-          <select value={(fx.params.vocoder as string) ?? "world"}
-            onChange={(e) => onChange({ vocoder: e.target.value })}>
-            <option value="world">WORLD</option>
-            <option value="nsf">NSF-HiFiGAN</option>
-          </select>
+          <VocoderSelect value={(fx.params.vocoder as string) ?? "world"} onChange={(v) => onChange({ vocoder: v })} />
         </div>
       </div>
     );

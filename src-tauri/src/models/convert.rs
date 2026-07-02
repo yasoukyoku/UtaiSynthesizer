@@ -28,7 +28,7 @@ pub fn convert_pth_to_onnx(
         .to_string();
     let onnx_path = output_dir.join(format!("{}.onnx", stem));
 
-    let python = find_converter_python(app_dir);
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("convert.py");
 
     let output = Command::new(&python)
@@ -75,7 +75,7 @@ pub fn convert_index_to_npy(
     output_path: &PathBuf,
     app_dir: &PathBuf,
 ) -> Result<PathBuf> {
-    let python = find_converter_python(app_dir);
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("extract_index.py");
 
     if !script.exists() {
@@ -122,16 +122,4 @@ pub fn convert_index_to_npy(
     Ok(output_path.clone())
 }
 
-fn find_converter_python(app_dir: &PathBuf) -> PathBuf {
-    let venv = app_dir.join("converter").join(".venv").join("Scripts").join("python.exe");
-    if venv.exists() {
-        return venv;
-    }
-
-    let embedded = app_dir.join("python").join("python.exe");
-    if embedded.exists() {
-        return embedded;
-    }
-
-    PathBuf::from("python")
-}
+// find_converter_python moved to crate::util::find_python (shared with commands/msst_models.rs).

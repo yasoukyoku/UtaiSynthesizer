@@ -8,11 +8,12 @@ import {
   ALL_CATEGORIES,
   CATEGORY_LABELS,
   ARCHITECTURE_LABELS,
+  t18,
   type MsstCatalogEntry,
   type MsstCategory,
   type MirrorSource,
-  type I18nText,
 } from "../../lib/models/msst-catalog";
+import { useDraggable } from "../../lib/useDraggable";
 import "./MsstModelManager.css";
 
 type TopTab = "separation" | "voice";
@@ -28,12 +29,6 @@ interface VoiceModelEntry {
   avatar_path: string | null;
 }
 
-function t18(text: I18nText, lang: string): string {
-  if (lang === "zh") return text.zh;
-  if (lang === "ja") return text.ja;
-  return text.en;
-}
-
 export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
@@ -42,6 +37,8 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
     fetchInstalled, fetchModelsDir, modelsDir,
     clearError, deleteModel, setMirror, downloadEntry,
   } = useMsstModelStore();
+
+  const { pos, startDrag } = useDraggable(() => ({ x: 100, y: 96 }));
 
   const [topTab, setTopTab] = useState<TopTab>("separation");
   const [category, setCategory] = useState<MsstCategory>("vocals");
@@ -82,8 +79,8 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const mirrorLabel = mirror.type === "hf-mirror" ? "HF Mirror" : mirror.type === "custom" ? "Custom" : "HuggingFace";
 
   return (
-    <aside className="msst-model-manager">
-      <div className="panel-header">
+    <aside className="msst-model-manager" style={{ left: pos.x, top: pos.y }}>
+      <div className="panel-header" onMouseDown={startDrag}>
         <span className="panel-title">{lang === "zh" ? "资源管理" : lang === "ja" ? "リソース管理" : "Resource Manager"}</span>
         <button className="panel-close" onClick={onClose}>X</button>
       </div>

@@ -3,38 +3,105 @@
   "menu": {
     "file": "文件",
     "edit": "编辑",
-    "view": "视图",
     "tools": "工具",
-    "settings": "设置"
+    "settings": "设置",
+    "undo": "撤销",
+    "redo": "重做",
+    "new": "新建",
+    "open": "打开",
+    "save": "保存",
+    "saveAs": "另存为"
   },
-  "transport": {
-    "play": "播放",
-    "pause": "暂停",
-    "returnToStart": "回到起点"
+  "project": {
+    "discardTitle": "未保存的更改",
+    "discardBody": "当前工程有未保存的更改，确定要放弃吗？",
+    "openTitle": "打开工程",
+    "saveAsTitle": "保存工程",
+    "saved": "已保存",
+    "saveMissing": "已保存，但有引用的音频文件在磁盘上缺失（已跳过）",
+    "loaded": "已打开",
+    "emptyNoSave": "项目内容为空",
+    "discard": "丢弃",
+    "closeBody": "关闭前保存当前工程的更改吗？",
+    "dontSave": "不保存",
+    "recoverTitle": "恢复工程",
+    "recoverBody": "上次 UTAI 未正常关闭。是否恢复未保存的工作？",
+    "recover": "恢复",
+    "recovered": "已恢复"
+  },
+  "close": {
+    "title": "关闭 UTAI",
+    "body": "最小化到托盘，还是退出 UTAI？",
+    "minimize": "最小化到托盘",
+    "quit": "退出",
+    "busyTitle": "有任务正在进行",
+    "busyIntro": "以下任务正在进行，现在退出会丢失它们的进度：",
+    "busyOutro": "仍然退出吗？",
+    "quitAnyway": "仍然退出",
+    "task_training": "模型训练",
+    "task_separation": "音频分离",
+    "task_workflow": "工作流渲染",
+    "task_download": "模型下载",
+    "task_convert": "模型转换",
+    "task_cuda_download": "CUDA 运行时下载"
+  },
+  "tray": {
+    "show": "显示窗口",
+    "quit": "退出"
+  },
+  "history": {
+    "undone": "已撤销",
+    "redone": "已重做",
+    "movedClip": "移动片段",
+    "resizedClip": "缩放片段",
+    "addedClip": "添加片段",
+    "deletedClip": "删除片段",
+    "splitClip": "切分片段",
+    "addedTrack": "添加轨道",
+    "removedTrack": "删除轨道",
+    "reorderedTrack": "轨道重排",
+    "renamedTrack": "重命名轨道",
+    "volume": "音量",
+    "mute": "静音",
+    "solo": "独奏",
+    "pan": "声像",
+    "laneVolume": "子轨道音量",
+    "lanePan": "子轨道声像",
+    "laneMute": "子轨道静音",
+    "playOriginal": "原音频/子轨道切换",
+    "tempo": "速度",
+    "timeSignature": "拍号",
+    "change": "更改",
+    "nodeAdd": "添加节点",
+    "nodeRemove": "删除节点",
+    "nodeConnect": "连接节点",
+    "nodeDisconnect": "断开连接",
+    "nodeMove": "移动节点",
+    "nodeParam": "更改节点参数",
+    "nodeEdit": "编辑节点"
   },
   "toolbar": {
     "bpm": "速度",
     "position": "位置",
     "snap": "吸附",
-    "free": "自由",
-    "triplet": "三连音",
+    "snapClipTip": "片段吸附（首/尾/播放头）",
+    "snapPlayheadTip": "播放头吸附到片段首/尾",
     "addTrack": "添加素材",
     "importAudio": "添加音频",
+    "addAudio": "新建音频轨",
     "addMidi": "创建MIDI轨",
     "split": "分割",
     "delete": "删除"
   },
   "tracks": {
-    "title": "轨道",
     "empty": "拖放音频文件或添加新轨道",
     "delete": "删除轨道",
-    "vocal": "声乐",
-    "audio": "音频",
-    "instrument": "乐器"
+    "rename": "重命名",
+    "loading": "加载中",
+    "playOriginal": "播放原始音频（子轨道不进输出）"
   },
   "training": {
     "title": "训练",
-    "panel": "训练面板",
     "active": "训练中",
     "modelName": "模型名称",
     "modelNamePlaceholder": "输入模型名称...",
@@ -61,11 +128,34 @@
   },
   "workflow": {
     "title": "工作流编辑器",
+    "clearRender": "清除渲染",
     "nodes": "节点",
     "catVoice": "声音转换",
     "catEffects": "效果器",
     "catSeparation": "音频分离",
-    "catIO": "输入/输出"
+    "catIO": "输入/输出",
+    "nodeOutput": "输出到轨道",
+    "lane": "轨道组",
+    "deleteConnection": "删除连接",
+    "depositFailed": "放入轨道失败",
+    "noOutputs": "运行结束但没有产生轨道输出——请检查 Output 节点是否连到了已渲染的上游",
+    "newGroup": "+ 新建轨道组…",
+    "newGroupTitle": "新建轨道组",
+    "newGroupPlaceholder": "轨道组名",
+    "groupNameInvalid": "轨道组名不可用",
+    "detachGroup": "解组"
+  },
+  "log": {
+    "title": "日志",
+    "all": "全部",
+    "error": "错误",
+    "warn": "警告",
+    "info": "信息",
+    "debug": "调试",
+    "search": "搜索...",
+    "copy": "复制",
+    "copyTitle": "复制全部",
+    "empty": "暂无日志"
   },
   "titlebar": {
     "log": "日志",
@@ -74,9 +164,6 @@
   },
   "common": {
     "cancel": "取消",
-    "confirm": "确认",
-    "save": "保存",
-    "open": "打开",
-    "close": "关闭"
+    "confirm": "确认"
   }
 }

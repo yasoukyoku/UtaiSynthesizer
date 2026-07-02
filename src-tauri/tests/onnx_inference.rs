@@ -37,6 +37,7 @@ fn test_rvc_onnx_inference() {
         ("pitch", InputTensor::I64 { data: pitch_data, shape: vec![1, t] }),
         ("pitchf", InputTensor::F32 { data: pitchf_data, shape: vec![1, t] }),
         ("sid", InputTensor::I64 { data: vec![0], shape: vec![1] }),
+        ("noise_scale", InputTensor::F32 { data: vec![0.667], shape: vec![1] }),
     ];
 
     let outputs = engine.run(&session_id, inputs).expect("RVC inference failed");

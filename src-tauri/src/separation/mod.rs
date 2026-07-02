@@ -17,13 +17,22 @@ pub struct SeparationManager {
     venv_python: PathBuf,
     fallback_python: PathBuf,
     active: Mutex<Option<ActiveJob>>,
-    native_status: Arc<Mutex<SeparationStatus>>,
-    cancel_flag: Arc<AtomicBool>,
+    /// The CURRENT (or most recent) native job's status slot. Each start_native installs a FRESH Arc:
+    /// cancel is cooperative (the worker only polls between chunks), so a cancelled worker can outlive
+    /// its job by up to a chunk — writing to its own now-orphaned slot, where its late progress/stems
+    /// can never masquerade as the NEXT job's result (they used to share one slot: cancel → restart
+    /// could deposit the OLD job's stems as the new node's output).
+    native_status: Mutex<Arc<Mutex<SeparationStatus>>>,
 }
 
 enum ActiveJob {
     Sidecar(sidecar::SeparationSidecar),
-    NativeHandle(std::thread::JoinHandle<()>),
+    NativeHandle {
+        handle: std::thread::JoinHandle<()>,
+        /// This job's OWN cancel flag. A shared manager-level flag was reset to `false` by the next
+        /// start() — un-cancelling the still-running previous worker, which then RESUMED to completion.
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +43,20 @@ pub struct SeparationConfig {
     pub output_dir: String,
     #[serde(default = "default_device")]
     pub device: String,
+    #[serde(default)]
+    pub normalize: bool,
+    /// UI override for MSST overlap-add window count (None → keep the model JSON default).
+    #[serde(default)]
+    pub num_overlap: Option<usize>,
+    /// Test-time augmentation: average original / polarity-flip / channel-swap passes.
+    #[serde(default)]
+    pub use_tta: bool,
+    /// HTDemucs random time-shift passes (0 = off).
+    #[serde(default)]
+    pub shifts: usize,
+    /// Inference batch size (UI). None → single-chunk. Effective only on dynamic-batch models.
+    #[serde(default)]
+    pub batch: Option<usize>,
 }
 
 fn default_device() -> String {
@@ -70,12 +93,11 @@ impl SeparationManager {
             venv_python: msst_dir.join(".venv").join("Scripts").join("python.exe"),
             fallback_python: PathBuf::from("python"),
             active: Mutex::new(None),
-            native_status: Arc::new(Mutex::new(SeparationStatus {
+            native_status: Mutex::new(Arc::new(Mutex::new(SeparationStatus {
                 state: SeparationState::Idle,
                 stems: None,
                 progress: 0.0,
-            })),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            }))),
         }
     }
 
@@ -108,23 +130,37 @@ impl SeparationManager {
         engine: &OnnxEngine,
         model_path: &Path,
     ) -> Result<()> {
-        let pipe = pipeline::NativePipeline::new(engine, model_path)?;
+        let mut pipe = pipeline::NativePipeline::new(engine, model_path)?;
+        pipe.set_normalize(config.normalize);
+        if let Some(n) = config.num_overlap {
+            pipe.set_num_overlap(n);
+        }
+        pipe.set_use_tta(config.use_tta);
+        pipe.set_shifts(config.shifts);
+        if let Some(b) = config.batch {
+            pipe.set_batch(b);
+        }
+        // Report the EP actually backing this run so the user can confirm what hardware ran (and
+        // whether Auto / an explicit pick ended up on GPU or fell back).
+        if let Some(dev) = engine.resolved_device(pipe.session_id()) {
+            tracing::info!("MSST inference backend: {}", dev);
+        }
         let sample_rate = pipe.config().sample_rate;
 
-        {
-            let mut s = self.native_status.lock();
-            s.state = SeparationState::LoadingModel;
-            s.stems = None;
-            s.progress = 0.0;
-        }
-
-        self.cancel_flag.store(false, Ordering::Relaxed);
+        // Fresh per-JOB status slot + cancel flag (see the field docs): the previous job's detached
+        // worker keeps its own pair, so it stays cancelled and its late writes stay invisible.
+        let status = Arc::new(Mutex::new(SeparationStatus {
+            state: SeparationState::LoadingModel,
+            stems: None,
+            progress: 0.0,
+        }));
+        *self.native_status.lock() = Arc::clone(&status);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let audio_path = PathBuf::from(&config.audio_path);
         let output_dir = PathBuf::from(&config.output_dir);
-        let status = Arc::clone(&self.native_status);
-        let cancel = Arc::clone(&self.cancel_flag);
 
+        let cancel_job = Arc::clone(&cancel);
         let handle = std::thread::spawn(move || {
             let audio = match load_audio_for_separation(&audio_path, sample_rate) {
                 Ok(a) => a,
@@ -182,7 +218,7 @@ impl SeparationManager {
             }
         });
 
-        *active = Some(ActiveJob::NativeHandle(handle));
+        *active = Some(ActiveJob::NativeHandle { handle, cancel: cancel_job });
         tracing::info!("Native MSST separation started: {}", model_path.display());
         Ok(())
     }
@@ -217,14 +253,41 @@ impl SeparationManager {
         let active = self.active.lock();
         match active.as_ref() {
             Some(ActiveJob::Sidecar(s)) => s.status(),
-            Some(ActiveJob::NativeHandle(_)) => self.native_status.lock().clone(),
+            Some(ActiveJob::NativeHandle { handle, .. }) => {
+                // Read liveness BEFORE the status (not after): a worker that writes its terminal state
+                // and exits between the two reads must never be seen as (non-terminal, finished) — that
+                // combination is reported as a crash. is_finished() is an acquire load set after the
+                // closure returns, so once it's true the closure's final status write is visible below.
+                let finished = handle.is_finished();
+                let slot = self.native_status.lock().clone();
+                let s = slot.lock().clone();
+                // If the worker thread has ended but never reached a terminal state, it
+                // panicked or was killed (e.g. OOM). Surface an error immediately instead
+                // of letting the frontend poll until its timeout.
+                if finished
+                    && matches!(
+                        s.state,
+                        SeparationState::LoadingModel | SeparationState::Separating
+                    )
+                {
+                    let msg = "Separation worker exited unexpectedly (possible crash or out of memory) — check logs".to_string();
+                    tracing::error!("{}", msg);
+                    return SeparationStatus {
+                        state: SeparationState::Error(msg),
+                        stems: None,
+                        progress: s.progress,
+                    };
+                }
+                s
+            }
             None => {
-                let s = self.native_status.lock();
+                let slot = self.native_status.lock().clone();
+                let s = slot.lock().clone();
                 if matches!(
                     s.state,
                     SeparationState::Completed | SeparationState::Error(_)
                 ) {
-                    return s.clone();
+                    return s;
                 }
                 SeparationStatus {
                     state: SeparationState::Idle,
@@ -236,15 +299,28 @@ impl SeparationManager {
     }
 
     pub fn cancel(&self) -> Result<()> {
-        self.cancel_flag.store(true, Ordering::Relaxed);
         let mut active = self.active.lock();
         match active.take() {
             Some(ActiveJob::Sidecar(s)) => {
                 s.cancel()?;
-            }
-            Some(ActiveJob::NativeHandle(_handle)) => {
-                self.native_status.lock().state =
+                // Mark the (native) slot terminal too: status()'s None branch reads it, and a PREVIOUS
+                // native job's Completed+stems left there would otherwise settle as this sidecar job's
+                // result on the frontend's post-cancel re-poll.
+                self.native_status.lock().lock().state =
                     SeparationState::Error("Cancelled".to_string());
+            }
+            Some(ActiveJob::NativeHandle { cancel, .. }) => {
+                // Flip THIS job's flag (the worker polls it between chunks) and mark its slot terminal
+                // for the frontend. The detached worker keeps only its own flag + slot: the next start()
+                // installs fresh ones, so it can neither un-cancel this worker nor see its late writes.
+                // A slot ALREADY Completed is kept — the run finished just before the cancel landed, and
+                // the frontend's post-cancel re-poll deliberately accepts a completed result.
+                cancel.store(true, Ordering::Relaxed);
+                let slot = self.native_status.lock().clone();
+                let mut s = slot.lock();
+                if !matches!(s.state, SeparationState::Completed) {
+                    s.state = SeparationState::Error("Cancelled".to_string());
+                }
             }
             None => {}
         }
@@ -261,7 +337,7 @@ impl SeparationManager {
                     SeparationState::Completed | SeparationState::Error(_)
                 )
             }
-            Some(ActiveJob::NativeHandle(h)) => h.is_finished(),
+            Some(ActiveJob::NativeHandle { handle, .. }) => handle.is_finished(),
             None => false,
         };
         if should_clear {

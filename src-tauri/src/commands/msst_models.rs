@@ -181,6 +181,7 @@ pub async fn convert_msst_model(
     state: State<'_, Arc<AppState>>,
     filename: String,
 ) -> Result<String, String> {
+    let _task = state.begin_task("convert"); // listed in the close-flow's in-progress warning
     let dir = &state.msst_models_dir;
     let path = dir.join(&filename);
     if !path.exists() {
@@ -269,7 +270,7 @@ pub fn import_local_msst_model(
 // ─── Converter ───────────────────────────────────────────────
 
 async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<String, String> {
-    let python = find_converter_python(app_dir);
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("convert.py");
 
     if !script.exists() {
@@ -313,23 +314,7 @@ async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<
     Ok(onnx_path.to_string_lossy().to_string())
 }
 
-fn find_converter_python(app_dir: &Path) -> PathBuf {
-    let venv = app_dir
-        .join("converter")
-        .join(".venv")
-        .join("Scripts")
-        .join("python.exe");
-    if venv.exists() {
-        return venv;
-    }
-
-    let embedded = app_dir.join("python").join("python.exe");
-    if embedded.exists() {
-        return embedded;
-    }
-
-    PathBuf::from("python")
-}
+// find_converter_python moved to crate::util::find_python (shared with models/convert.rs).
 
 fn detect_architecture_from_name(filename: &str) -> String {
     let lower = filename.to_lowercase();

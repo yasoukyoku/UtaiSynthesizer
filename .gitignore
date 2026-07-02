@@ -61,6 +61,15 @@ training/datasets/
 *.tmp
 *.bak
 
+# App data dir (models + caches, configurable data_dir default — S23)
+data/
+
+# Crash-recovery autosave slot (runtime artifact)
+autosave.json
+
+# TypeScript incremental build state
+tsconfig.tsbuildinfo
+
 # Legacy v1 files
 .claude-memory/
 S2H/

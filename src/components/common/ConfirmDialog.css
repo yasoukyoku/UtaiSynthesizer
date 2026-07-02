@@ -1,0 +1,128 @@
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 11, 20, 0.6);
+  backdrop-filter: blur(2px);
+  animation: confirm-fade 0.14s ease both;
+}
+
+@keyframes confirm-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.confirm-dialog {
+  min-width: 340px;
+  max-width: 460px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.3);
+  /* chamfered top-left + bottom-right — angular, deliberately NOT a rounded rectangle */
+  clip-path: polygon(0 14px, 14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%);
+  padding: 20px 22px 18px;
+  animation: confirm-pop 0.18s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes confirm-pop {
+  from { transform: translateY(10px) scale(0.98); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
+.confirm-title {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.3px;
+  margin-bottom: 10px;
+}
+
+.confirm-body {
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-secondary);
+  line-height: 1.55;
+  margin-bottom: 20px;
+  white-space: pre-line;
+}
+
+.confirm-input-row {
+  margin-bottom: 18px;
+}
+
+.confirm-input {
+  width: 100%;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  border-radius: 0; /* house rule: no rounded corners */
+  padding: 7px 10px;
+}
+
+.confirm-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+  box-shadow: none;
+}
+
+.confirm-input-error {
+  margin-top: 6px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  color: var(--accent-tertiary);
+}
+
+.confirm-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.confirm-btn {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  letter-spacing: 0.4px;
+  padding: 7px 16px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  /* small chamfer on the bottom-right corner to echo the dialog */
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%);
+}
+
+.confirm-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-active);
+}
+
+.confirm-btn.primary {
+  background: var(--accent-primary-dim);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+  font-weight: 600;
+}
+
+.confirm-btn.primary:hover {
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+.confirm-btn.danger {
+  background: transparent;
+  border-color: var(--accent-tertiary-dim);
+  color: var(--accent-tertiary);
+}
+
+.confirm-btn.danger:hover {
+  background: var(--accent-tertiary-dim);
+  color: var(--text-primary);
+}

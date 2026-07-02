@@ -6,6 +6,20 @@
 
 .track-list-scroll {
   will-change: transform;
+  position: relative;
+}
+
+/* Hover hint shown at a track boundary in the header column (right-click there to add a track). */
+.track-boundary-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  margin-top: -1px;
+  background: rgba(96, 165, 250, 0.9);
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.8);
+  pointer-events: none;
+  z-index: 5;
 }
 
 .track-list-empty {
@@ -19,11 +33,39 @@
 .track-item-group {
   border-bottom: 1px solid var(--border-subtle);
   box-sizing: border-box;
+  /* Smooth expand/collapse: the inline height (computeTrackHeight) animates, and the child lanes are
+     clipped during the transition so they wipe in/out instead of popping in instantly. */
+  overflow: hidden;
+  transition: height 0.18s ease;
+}
+
+.track-item-group .lane-item,
+.track-item-group .lane-group-bar {
+  animation: lane-reveal 0.2s ease;
+}
+
+@keyframes lane-reveal {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+/* Placeholder slot shown while dragging a new track in between existing ones (mirrors the
+   canvas gap so the two columns stay aligned during the drag). */
+.track-ghost-slot {
+  box-sizing: border-box;
+  background: rgba(96, 165, 250, 0.07);
+  border-top: 1px dashed rgba(96, 165, 250, 0.5);
+  border-bottom: 1px dashed rgba(96, 165, 250, 0.5);
 }
 
 .track-item-group.active {
   background: var(--accent-primary-glow);
   border-left: 2px solid var(--accent-primary);
+}
+
+/* Empty track (no segments) — dim the header so it reads as a placeholder, not active content. */
+.track-item-group.empty .track-item {
+  opacity: 0.55;
 }
 
 .track-item {
@@ -32,8 +74,32 @@
   height: 48px;
   padding: 0 var(--space-sm) 0 0;
   gap: var(--space-sm);
-  cursor: pointer;
-  transition: background var(--transition-fast);
+  cursor: grab; /* grab the header to reorder; name/controls keep their own cursors */
+  transition: background var(--transition-fast), box-shadow var(--transition-fast);
+  box-sizing: border-box;
+}
+
+/* Picked-up track while drag-reordering. */
+.track-item-group.dragging {
+  position: relative;
+  z-index: 10;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+}
+.track-item-group.dragging .track-item {
+  background: var(--bg-hover);
+  cursor: grabbing;
+}
+
+/* Inline rename editor (double-click the name, or right-click → rename). */
+.track-name-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent-primary);
+  color: var(--text-primary);
+  font-size: var(--font-size-xs);
+  padding: 1px 4px;
+  outline: none;
   box-sizing: border-box;
 }
 
@@ -62,6 +128,45 @@
   border-color: var(--accent-primary);
 }
 
+/* ── Sub-lane GROUP block (P5): a slim group BAR (name + the 组-level volume/pan, drawn once)
+      followed by its member rows. `--lane-rgb` (set inline per group) is the group's LANE_COLORS hue —
+      the same entry the canvas rows use, so header and canvas echo each other. ── */
+.lane-group {
+  position: relative;
+}
+
+.lane-group-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0 var(--space-sm) 0 8px;
+  background: rgba(var(--lane-rgb), 0.05);
+  border-top: 1px solid var(--border-default);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.lane-group-swatch {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  background: rgb(var(--lane-rgb));
+  box-shadow: 0 0 4px rgba(var(--lane-rgb), 0.5);
+}
+
+.lane-group-name {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .lane-item {
   display: flex;
   align-items: center;
@@ -70,6 +175,33 @@
   background: rgba(255, 255, 255, 0.02);
   border-top: 1px solid rgba(30, 42, 69, 0.4);
   box-sizing: border-box;
+  position: relative;
+}
+
+/* Bracket the member rows to their GROUP BAR: a vertical trunk (in the group hue, descending from
+   under the bar's swatch) + an elbow stub into each row — rows read as members of the 组 above. */
+.lane-item::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: -1px;
+  height: 100%;
+  width: 1px;
+  background: rgba(var(--lane-rgb), 0.45);
+  pointer-events: none;
+}
+.lane-item:last-child::before {
+  height: calc(50% + 1px); /* last lane: trunk stops at the elbow (tree corner) */
+}
+.lane-item::after {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: rgba(var(--lane-rgb), 0.45);
+  pointer-events: none;
 }
 
 .lane-label {
@@ -117,6 +249,7 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: text; /* hint: double-click to rename (not a drag handle) */
 }
 
 .track-controls {
@@ -124,6 +257,36 @@
   align-items: center;
   gap: 2px;
   flex-shrink: 0;
+}
+
+/* Main-header volume + pan, stacked vertically — near one fader's footprint, name keeps its width. */
+.fader-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fader-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+/* Micro-label in front of each fader (V = volume, P = pan) — two identical-looking sliders side by
+   side read as an unexplained blob without it (user feedback). */
+.fader-tag {
+  font-size: 7px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  line-height: 1;
+  user-select: none;
+}
+
+/* Group bar: breathing room BETWEEN the V and P fader pairs (each pair stays tight via .fader-row). */
+.lane-group-controls {
+  gap: 14px;
 }
 
 .track-btn {
@@ -148,5 +311,75 @@
   background: var(--color-warning);
   border-color: var(--color-warning);
   color: var(--text-inverse);
+}
+
+/* SOURCE selector lit — the original audio plays, sub-lanes are out of the output. */
+.track-btn.active-orig {
+  background: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: var(--text-inverse);
+}
+
+/* While the original plays, the sub-lane blocks are "out of the output" — dim them (controls stay
+   clickable; the canvas rows dim the same way, so both columns tell one story). */
+.track-item-group.play-original .lane-group {
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+
+/* ── Add-track control (bottom of track column) ── */
+
+.track-add {
+  position: relative;
+}
+
+.track-add-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  height: 32px;
+  padding: 0 var(--space-md);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.track-add-btn:hover {
+  background: var(--bg-hover);
+  color: var(--accent-primary);
+}
+
+.track-add-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.track-add-menu {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-top: none;
+}
+
+.track-add-option {
+  text-align: left;
+  padding: 8px var(--space-md);
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+.track-add-option:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 

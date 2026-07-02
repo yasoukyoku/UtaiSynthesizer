@@ -3,38 +3,105 @@
   "menu": {
     "file": "File",
     "edit": "Edit",
-    "view": "View",
     "tools": "Tools",
-    "settings": "Settings"
+    "settings": "Settings",
+    "undo": "Undo",
+    "redo": "Redo",
+    "new": "New",
+    "open": "Open",
+    "save": "Save",
+    "saveAs": "Save As"
   },
-  "transport": {
-    "play": "Play",
-    "pause": "Pause",
-    "returnToStart": "Return to start"
+  "project": {
+    "discardTitle": "Unsaved Changes",
+    "discardBody": "The current project has unsaved changes. Discard them?",
+    "openTitle": "Open Project",
+    "saveAsTitle": "Save Project",
+    "saved": "Saved",
+    "saveMissing": "Saved, but some referenced audio files were missing on disk (skipped)",
+    "loaded": "Opened",
+    "emptyNoSave": "Project is empty",
+    "discard": "Discard",
+    "closeBody": "Save changes to the current project before closing?",
+    "dontSave": "Don't Save",
+    "recoverTitle": "Recover Project",
+    "recoverBody": "UTAI didn't close normally last time. Recover your unsaved work?",
+    "recover": "Recover",
+    "recovered": "Recovered"
+  },
+  "close": {
+    "title": "Close UTAI",
+    "body": "Minimize to the tray, or quit UTAI?",
+    "minimize": "Minimize to Tray",
+    "quit": "Quit",
+    "busyTitle": "Tasks In Progress",
+    "busyIntro": "These tasks are still running — quitting now will lose their progress:",
+    "busyOutro": "Quit anyway?",
+    "quitAnyway": "Quit Anyway",
+    "task_training": "Model training",
+    "task_separation": "Audio separation",
+    "task_workflow": "Workflow rendering",
+    "task_download": "Model download",
+    "task_convert": "Model conversion",
+    "task_cuda_download": "CUDA runtime download"
+  },
+  "tray": {
+    "show": "Show Window",
+    "quit": "Quit"
+  },
+  "history": {
+    "undone": "Undone",
+    "redone": "Redone",
+    "movedClip": "Moved clip",
+    "resizedClip": "Resized clip",
+    "addedClip": "Added clip",
+    "deletedClip": "Deleted clip",
+    "splitClip": "Split clip",
+    "addedTrack": "Added track",
+    "removedTrack": "Removed track",
+    "reorderedTrack": "Reordered tracks",
+    "renamedTrack": "Renamed track",
+    "volume": "Volume",
+    "mute": "Mute",
+    "solo": "Solo",
+    "pan": "Pan",
+    "laneVolume": "Lane volume",
+    "lanePan": "Lane pan",
+    "laneMute": "Lane mute",
+    "playOriginal": "Source toggle",
+    "tempo": "Tempo",
+    "timeSignature": "Time signature",
+    "change": "Change",
+    "nodeAdd": "Added node",
+    "nodeRemove": "Removed node",
+    "nodeConnect": "Connected nodes",
+    "nodeDisconnect": "Disconnected nodes",
+    "nodeMove": "Moved node",
+    "nodeParam": "Changed node setting",
+    "nodeEdit": "Edited nodes"
   },
   "toolbar": {
     "bpm": "BPM",
     "position": "Position",
     "snap": "Snap",
-    "free": "Free",
-    "triplet": "Triplet",
+    "snapClipTip": "Snap clips (start/end/playhead)",
+    "snapPlayheadTip": "Snap playhead to clip edges",
     "addTrack": "Add",
     "importAudio": "Add Audio",
+    "addAudio": "New Audio Track",
     "addMidi": "Create MIDI Track",
     "split": "Split",
     "delete": "Delete"
   },
   "tracks": {
-    "title": "Tracks",
     "empty": "Drop audio files or add a new track",
     "delete": "Delete Track",
-    "vocal": "Vocal",
-    "audio": "Audio",
-    "instrument": "Instrument"
+    "rename": "Rename",
+    "loading": "Loading",
+    "playOriginal": "Play the original audio (sub-lanes leave the output)"
   },
   "training": {
     "title": "Training",
-    "panel": "Training Panel",
     "active": "Training",
     "modelName": "Model Name",
     "modelNamePlaceholder": "Enter model name...",
@@ -61,11 +128,34 @@
   },
   "workflow": {
     "title": "Workflow Editor",
+    "clearRender": "Clear Render",
     "nodes": "Nodes",
     "catVoice": "Voice Conversion",
     "catEffects": "Effects",
     "catSeparation": "Separation",
-    "catIO": "Input / Output"
+    "catIO": "Input / Output",
+    "nodeOutput": "Output to track",
+    "lane": "Lane Group",
+    "deleteConnection": "Delete Connection",
+    "depositFailed": "Failed to deposit output to track",
+    "noOutputs": "Run finished but produced no track output — check the Output node is connected to a rendered upstream",
+    "newGroup": "+ New lane group…",
+    "newGroupTitle": "New Lane Group",
+    "newGroupPlaceholder": "Lane group name",
+    "groupNameInvalid": "Invalid lane group name",
+    "detachGroup": "Ungroup"
+  },
+  "log": {
+    "title": "Log",
+    "all": "All",
+    "error": "Error",
+    "warn": "Warning",
+    "info": "Info",
+    "debug": "Debug",
+    "search": "Search...",
+    "copy": "COPY",
+    "copyTitle": "Copy all",
+    "empty": "No log entries"
   },
   "titlebar": {
     "log": "Log",
@@ -74,9 +164,6 @@
   },
   "common": {
     "cancel": "Cancel",
-    "confirm": "Confirm",
-    "save": "Save",
-    "open": "Open",
-    "close": "Close"
+    "confirm": "Confirm"
   }
 }

@@ -1,14 +1,17 @@
 import { useRef, useCallback, useEffect } from "react";
+import { useAppStore } from "../../store/app";
 import "./HScrollbar.css";
 
 interface Props {
-  scrollX: number;
   totalWidth: number;
   viewWidth: number;
   onChange: (x: number) => void;
 }
 
-export function HScrollbar({ scrollX, totalWidth, viewWidth, onChange }: Props) {
+export function HScrollbar({ totalWidth, viewWidth, onChange }: Props) {
+  // Self-subscribe scrollX so horizontal scroll re-renders ONLY this tiny component
+  // (two styled divs), not the whole DawView subtree.
+  const scrollX = useAppStore((s) => s.scrollX);
   const trackRef = useRef<HTMLDivElement>(null);
   const isDragging = useRef(false);
   const justDragged = useRef(false);
@@ -44,8 +47,8 @@ export function HScrollbar({ scrollX, totalWidth, viewWidth, onChange }: Props) 
     e.preventDefault();
     isDragging.current = true;
     dragStartMouseX.current = e.clientX;
-    dragStartScrollX.current = scrollX;
-  }, [scrollX]);
+    dragStartScrollX.current = useAppStore.getState().scrollX;
+  }, []);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {

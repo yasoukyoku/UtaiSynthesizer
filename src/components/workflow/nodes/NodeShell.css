@@ -89,18 +89,25 @@
 
 .wf-node-waiting {
   border-color: #eab308 !important;
-  opacity: 0.75;
+  /* Gentle pulse so a QUEUED node reads as "pending in the pipeline", never frozen. */
+  animation: node-waiting-pulse 1.6s ease-in-out infinite;
 }
 
+@keyframes node-waiting-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.92; }
+}
+
+/* Node status colors follow the v1 convention: yellow = locked/queued, BLUE = processing, green = done. */
 .wf-node-running {
-  border-color: var(--accent-primary) !important;
-  box-shadow: 0 0 10px rgba(57, 197, 187, 0.35);
+  border-color: #3b82f6 !important; /* 蓝 = 正在处理 */
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.35);
   animation: node-border-pulse 1.5s ease-in-out infinite;
 }
 
 @keyframes node-border-pulse {
-  0%, 100% { box-shadow: 0 0 6px rgba(57, 197, 187, 0.2); }
-  50% { box-shadow: 0 0 14px rgba(57, 197, 187, 0.5); }
+  0%, 100% { box-shadow: 0 0 6px rgba(59, 130, 246, 0.2); }
+  50% { box-shadow: 0 0 14px rgba(59, 130, 246, 0.5); }
 }
 
 .wf-node-completed {
@@ -210,6 +217,8 @@
 }
 
 .sep-param-row input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
   width: 52px;
   font-size: 10px;
   font-family: var(--font-mono);
@@ -218,6 +227,71 @@
   background: var(--bg-base);
   border: 1px solid var(--border-subtle);
   color: var(--text-primary);
+}
+
+/* Remove the up/down spinner arrows on number inputs — ugly + easy to mis-click. */
+.sep-param-row input[type="number"]::-webkit-inner-spin-button,
+.sep-param-row input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Overlap slider (replaces the number input — a number input appended digits → clamped to 2 or 8). */
+.sep-overlap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+}
+
+/* Stylized thin-bar slider — no default circle thumb (house style: no abstract solid dots). The
+ * `.sep-overlap` prefix raises specificity ABOVE the global `input[type="range"]::-webkit-slider-thumb`
+ * (which is a 14px circle), otherwise the global rule wins and the custom thumb never shows. */
+.sep-overlap .sep-overlap-range {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  min-width: 56px;
+  height: 14px;
+  background: transparent;
+  border: none;
+  outline: none;
+  cursor: pointer;
+}
+
+.sep-overlap .sep-overlap-range:focus,
+.sep-overlap .sep-overlap-range:focus-visible {
+  outline: none;
+  box-shadow: none; /* kill the thin focus ring drawn around the whole control on click */
+}
+
+.sep-overlap .sep-overlap-range::-webkit-slider-runnable-track {
+  height: 2px;
+  background: var(--border-default);
+  border-radius: 0;
+}
+
+.sep-overlap .sep-overlap-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 4px;
+  height: 12px;
+  margin-top: -5px;
+  background: var(--accent-primary);
+  border: none;
+  border-radius: 0;
+}
+
+.sep-overlap .sep-overlap-range:hover::-webkit-slider-thumb {
+  box-shadow: 0 0 5px var(--accent-primary);
+}
+
+.sep-overlap-val {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  min-width: 8px;
+  text-align: right;
 }
 
 .sep-param-row input[type="checkbox"] {
@@ -308,70 +382,16 @@
   color: var(--text-muted);
 }
 
-/* ── Audio preview ── */
+/* ── Node progress bar ── */
 
-.sep-preview {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  margin-top: var(--space-xs);
-  padding-top: var(--space-xs);
-  border-top: 1px solid var(--border-subtle);
-}
-
-.sep-preview-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  height: 18px;
-}
-
-.sep-preview-btn {
-  background: none;
-  border: 1px solid var(--border-subtle);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 8px;
-  width: 20px;
-  height: 16px;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-
-.sep-preview-btn:hover {
-  border-color: var(--accent-primary);
-  color: var(--accent-primary);
-}
-
-.sep-preview-btn.playing {
-  color: var(--accent-primary);
-  border-color: var(--accent-primary);
-}
-
-.sep-preview-label {
-  font-size: 8px;
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  width: 50px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
-.sep-preview-bar {
-  flex: 1;
+.wf-node-progress {
   height: 3px;
   background: var(--bg-base);
-  min-width: 20px;
+  border-bottom: 1px solid color-mix(in srgb, var(--node-color, var(--accent-primary)) 30%, transparent);
 }
 
-.sep-preview-fill {
+.wf-node-progress-fill {
   height: 100%;
-  background: var(--accent-primary);
-  transition: width 0.1s linear;
+  background: var(--node-color, var(--accent-primary));
+  transition: width 0.2s linear;
 }

@@ -15,6 +15,27 @@ html, body, #root {
   color: var(--text-primary);
   background: var(--bg-deep);
   -webkit-font-smoothing: antialiased;
+  /* The app chrome isn't selectable — stray blue highlights on hover/drag hurt the feel.
+     Re-enabled below for form fields and explicitly-marked copyable content (.selectable). */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Re-enable text selection where it's genuinely useful: form fields (always — so the BPM input and
+   the track-name rename input select only when focused, not on hover), the `.selectable` escape
+   hatch, and the audited set of copyable CONTENT below (logs / hardware info / paths / model names /
+   error detail / training readouts). user-select inherits, so a container re-enables its children.
+   A renamed/removed selector here is a harmless no-op (selection simply won't re-enable there). */
+input, textarea, [contenteditable="true"], .selectable, .selectable *,
+.log-entries, .log-dir,
+.settings-value, .settings-error,
+.model-card-name, .model-card-arch, .model-card-desc, .model-card-meta,
+.msst-installed-name, .msst-installed-header .mono,
+.rm-voice-item-name, .rm-import-error, .msst-error,
+.progress-header .mono, .stat-value,
+.wf-error {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 /* Retro grid is rendered via Canvas in the arrangement view, not as CSS overlay */
@@ -148,32 +169,4 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--accent-primary);
   margin-top: -5px;
   cursor: pointer;
-}
-
-/* === Tooltips === */
-[data-tooltip] {
-  position: relative;
-}
-
-[data-tooltip]::after {
-  content: attr(data-tooltip);
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  padding: 2px 6px;
-  font-size: var(--font-size-xs);
-  color: var(--text-secondary);
-  white-space: nowrap;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--transition-fast);
-  z-index: var(--z-tooltip);
-}
-
-[data-tooltip]:hover::after {
-  opacity: 1;
 }

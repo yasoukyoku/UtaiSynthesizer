@@ -14,14 +14,14 @@ crate-type = ["lib", "staticlib", "cdylib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
 ndarray = "0.16"
 ndarray-npy = "0.9"
 hound = "3.5"
@@ -37,6 +37,7 @@ parking_lot = "0.12"
 rustfft = "6.2"
 rayon = "1.10"
 zip = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { version = "0.12", features = ["stream"] }
 futures-util = "0.3"
 

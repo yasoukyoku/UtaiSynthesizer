@@ -18,6 +18,14 @@ export interface MsstCatalogEntry {
   source: "official" | "community";
 }
 
+/** Pick the active-language string from an I18nText. ONE source of truth for the zh/ja/en dispatch
+ *  (previously copy-pasted as t18/l in SeparationNode, NodePalette, MsstModelManager, EffectsNode). */
+export function t18(text: I18nText, lang: string): string {
+  if (lang === "zh") return text.zh;
+  if (lang === "ja") return text.ja;
+  return text.en;
+}
+
 export const CATEGORY_LABELS: Record<MsstCategory, I18nText> = {
   vocals:       { zh: "提取人声", en: "Vocals", ja: "ボーカル抽出" },
   instrumental: { zh: "提取伴奏", en: "Instrumental", ja: "伴奏抽出" },
@@ -28,11 +36,33 @@ export const CATEGORY_LABELS: Record<MsstCategory, I18nText> = {
   special:      { zh: "特殊", en: "Special", ja: "特殊" },
 };
 
+/** Per-category accent color (was duplicated identically in SeparationNode + NodePalette). */
+export const CATEGORY_COLORS: Record<MsstCategory, string> = {
+  vocals: "#ec4899",
+  instrumental: "#60a5fa",
+  denoise: "#4ade80",
+  dereverb: "#a78bfa",
+  karaoke: "#fbbf24",
+  multistem: "#f97316",
+  special: "#94a3b8",
+};
+
 export const ARCHITECTURE_LABELS: Record<MsstArchitecture, string> = {
   bs_roformer: "BS-Roformer",
   mel_band_roformer: "MelBand Roformer",
   mdx23c: "MDX23C",
   htdemucs: "HTDemucs",
+};
+
+/** Per-architecture default `num_overlap` — MUST mirror what converter/convert.py writes into each
+ *  model's JSON. Used ONLY to DISPLAY the model's true default in the node when the user hasn't
+ *  overridden it; the actual value still comes from the model JSON on the Rust side. Keep in sync
+ *  with the converter (bs/mel roformer use 2; mdx23c and htdemucs use 4). */
+export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
+  bs_roformer: 2,
+  mel_band_roformer: 2,
+  mdx23c: 4,
+  htdemucs: 4,
 };
 
 export const ALL_CATEGORIES: MsstCategory[] = [

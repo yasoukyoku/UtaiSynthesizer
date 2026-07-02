@@ -210,6 +210,64 @@ fn load_with_symphonia(path: &Path) -> Result<AudioBuffer> {
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+/// Decode `path` to PCM f32 WAV via ffmpeg, then load the WAV back. `target_sr` resamples (`-ar`) during
+/// decode when Some. The CALLER resolves `ffmpeg` (so it can emit a context-specific not-found error).
+/// Single source for the ffmpeg→wav→load_wav core shared by `load_with_ffmpeg` (decode) and
+/// `load_audio_at_rate` (resample) — keeps the codec flags / stdio / CREATE_NO_WINDOW / temp-file
+/// strategy in ONE place so the two paths can't drift.
+fn ffmpeg_decode_to_wav(ffmpeg: &Path, path: &Path, target_sr: Option<u32>) -> Result<AudioBuffer> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp_path = std::env::temp_dir().join(format!(
+        "utai_ffmpeg_{}_{}.wav",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+
+    // Run ffmpeg with the given resample args, decoding to a temp f32 wav.
+    let run = |resample: &[String]| -> Result<AudioBuffer> {
+        let mut cmd = std::process::Command::new(ffmpeg);
+        cmd.arg("-i").arg(path);
+        for a in resample {
+            cmd.arg(a);
+        }
+        cmd.args(["-f", "wav", "-acodec", "pcm_f32le", "-v", "error", "-y"])
+            .arg(&temp_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(crate::util::CREATE_NO_WINDOW);
+        let output = cmd.output().map_err(|e| {
+            crate::UtaiError::Audio(format!("Failed to run ffmpeg ({}): {}", ffmpeg.display(), e))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::UtaiError::Audio(format!(
+                "ffmpeg failed for '{}': {}",
+                path.display(),
+                stderr.trim()
+            )));
+        }
+        load_wav(&temp_path)
+    };
+
+    let result = match target_sr {
+        None => run(&[]),
+        // Prefer soxr (high quality, 28-bit precision) for the model's required resample; fall back to
+        // ffmpeg's default swresample (-ar) if this ffmpeg has no libsoxr, so a stripped bundled build
+        // never just fails the run. (16→32-bit precision is handled at WAV-write time, separately.)
+        Some(sr) => {
+            let soxr = ["-af".to_string(), format!("aresample={sr}:resampler=soxr:precision=28")];
+            run(&soxr).or_else(|_| {
+                tracing::warn!("ffmpeg soxr resampler unavailable — falling back to swresample ({}Hz)", sr);
+                run(&["-ar".to_string(), sr.to_string()])
+            })
+        }
+    };
+
+    let _ = std::fs::remove_file(&temp_path);
+    result
+}
+
 fn load_with_ffmpeg(path: &Path) -> Result<AudioBuffer> {
     let ffmpeg = find_ffmpeg().ok_or_else(|| {
         crate::UtaiError::Audio(format!(
@@ -219,56 +277,134 @@ fn load_with_ffmpeg(path: &Path) -> Result<AudioBuffer> {
         ))
     })?;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let temp_path = std::env::temp_dir().join(format!(
-        "utai_decode_{}_{}.wav",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
+    let buf = ffmpeg_decode_to_wav(&ffmpeg, path, None)?;
+    tracing::info!(
+        "Loaded via ffmpeg: {} ({} ch, {}Hz, {:.1}s)",
+        path.display(),
+        buf.channels,
+        buf.sample_rate,
+        buf.duration_secs(),
+    );
+    Ok(buf)
+}
 
-    let result = (|| -> Result<AudioBuffer> {
-        let output = std::process::Command::new(&ffmpeg)
-            .args(["-i"])
-            .arg(path)
-            .args(["-f", "wav", "-acodec", "pcm_f32le", "-v", "error", "-y"])
-            .arg(&temp_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| {
-                crate::UtaiError::Audio(format!(
-                    "Failed to run ffmpeg ({}): {}",
-                    ffmpeg.display(),
-                    e
-                ))
-            })?;
+/// Fast duration probe (no full sample decode) — used for the drag-import ghost preview and
+/// the loading-segment placeholder width, where the file isn't decoded yet.
+///   1. WAV  → hound header (frame count / sample rate), instant.
+///   2. other → `ffmpeg -i` and parse the `Duration:` line from stderr (header read only).
+///   3. fallback → symphonia container metadata (`n_frames`) when ffmpeg is unavailable
+///                 (symphonia's `n_frames` is unreliable for matroska/webm, hence the fallback).
+///
+/// Returns the full (untrimmed) container length — an upper-bound estimate. For non-WAV files
+/// `load_audio_file` may strip leading codec/lead-in silence, so the finalized segment can be
+/// slightly shorter than this; the placeholder simply snaps to the exact length on decode.
+pub fn probe_duration_ms(path: &Path) -> Result<f64> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::UtaiError::Audio(format!(
-                "ffmpeg failed for '{}': {}",
-                path.display(),
-                stderr.trim()
-            )));
+    if ext == "wav" {
+        if let Ok(reader) = hound::WavReader::open(path) {
+            let spec = reader.spec();
+            if spec.sample_rate > 0 {
+                // hound's `duration()` is samples-per-channel (i.e. frame count).
+                return Ok(reader.duration() as f64 / spec.sample_rate as f64 * 1000.0);
+            }
         }
+    }
 
-        let buf = load_wav(&temp_path)?;
+    // ffmpeg's container `Duration` is authoritative across formats and matches what `load_audio`
+    // actually decodes. symphonia's `n_frames` is UNRELIABLE for some containers — matroska/webm
+    // report a wildly wrong frame count (e.g. ~8s for a 393s file) — so ffmpeg is the primary
+    // probe and symphonia is only a last-resort fallback when ffmpeg isn't available (in which
+    // case webm/opus can't be decoded anyway, so the inaccuracy is moot).
+    if let Ok(ms) = probe_with_ffmpeg(path) {
+        return Ok(ms);
+    }
 
-        tracing::info!(
-            "Loaded via ffmpeg: {} ({} ch, {}Hz, {:.1}s)",
-            path.display(),
-            buf.channels,
-            buf.sample_rate,
-            buf.duration_secs(),
-        );
+    probe_with_symphonia(path)
+}
 
-        Ok(buf)
-    })();
+fn probe_with_symphonia(path: &Path) -> Result<f64> {
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
 
-    let _ = std::fs::remove_file(&temp_path);
-    result
+    let file = std::fs::File::open(path)
+        .map_err(|e| crate::UtaiError::Audio(format!("Failed to open: {}", e)))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| crate::UtaiError::Audio(format!("Unsupported format: {}", e)))?;
+
+    let track = probed
+        .format
+        .default_track()
+        .ok_or_else(|| crate::UtaiError::Audio("No audio track found".into()))?;
+
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .filter(|&sr| sr > 0)
+        .ok_or_else(|| crate::UtaiError::Audio("Unknown sample rate".into()))?;
+    let n_frames = track
+        .codec_params
+        .n_frames
+        .ok_or_else(|| crate::UtaiError::Audio("Unknown frame count".into()))?;
+
+    Ok(n_frames as f64 / sample_rate as f64 * 1000.0)
+}
+
+fn probe_with_ffmpeg(path: &Path) -> Result<f64> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| {
+        crate::UtaiError::Audio(format!(
+            "Cannot probe '{}' — no header metadata and ffmpeg was not found.",
+            path.display()
+        ))
+    })?;
+
+    // `ffmpeg -i <file>` with no output file exits non-zero ("At least one output file...")
+    // but still prints the container's `Duration:` to stderr after only reading the header.
+    let output = std::process::Command::new(&ffmpeg)
+        .arg("-i")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| crate::UtaiError::Audio(format!("Failed to run ffmpeg probe: {}", e)))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_ffmpeg_duration(&stderr).ok_or_else(|| {
+        crate::UtaiError::Audio(format!("Could not determine duration of '{}'", path.display()))
+    })
+}
+
+/// Parse `Duration: HH:MM:SS.ss` (the first occurrence) from ffmpeg's stderr into milliseconds.
+fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
+    let idx = stderr.find("Duration:")?;
+    let ts = stderr[idx + "Duration:".len()..]
+        .trim_start()
+        .split(',')
+        .next()?
+        .trim();
+    if ts.starts_with("N/A") {
+        return None;
+    }
+    let mut parts = ts.split(':');
+    let h: f64 = parts.next()?.trim().parse().ok()?;
+    let m: f64 = parts.next()?.trim().parse().ok()?;
+    let s: f64 = parts.next()?.trim().parse().ok()?;
+    Some((h * 3600.0 + m * 60.0 + s) * 1000.0)
 }
 
 fn find_ffmpeg() -> Option<std::path::PathBuf> {
@@ -297,18 +433,14 @@ fn find_ffmpeg() -> Option<std::path::PathBuf> {
         }
     }
 
-    // Dev fallback: system PATH
-    if let Ok(output) = std::process::Command::new("where")
-        .arg("ffmpeg.exe")
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = stdout.lines().next() {
-                let p = std::path::PathBuf::from(line.trim());
-                if p.exists() {
-                    return Some(p);
-                }
+    // Dev fallback: scan %PATH% entries directly. (Unicode-safe — avoids round-tripping `where`
+    // stdout, which Windows emits in the console OEM codepage and which from_utf8_lossy mangles
+    // for non-ASCII directory names, breaking ffmpeg discovery under Chinese/Japanese paths.)
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("ffmpeg.exe");
+            if p.exists() {
+                return Some(p);
             }
         }
     }
@@ -320,37 +452,7 @@ pub fn load_audio_at_rate(path: &Path, target_sr: u32) -> Result<AudioBuffer> {
     let ffmpeg = find_ffmpeg().ok_or_else(|| {
         crate::UtaiError::Audio("ffmpeg not found — needed for sample rate conversion".into())
     })?;
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let temp_path = std::env::temp_dir().join(format!(
-        "utai_resample_{}_{}.wav",
-        std::process::id(),
-        CTR.fetch_add(1, Ordering::Relaxed),
-    ));
-
-    let result = (|| -> Result<AudioBuffer> {
-        let output = std::process::Command::new(&ffmpeg)
-            .args(["-i"])
-            .arg(path)
-            .args(["-ar", &target_sr.to_string(), "-f", "wav", "-acodec", "pcm_f32le", "-v", "error", "-y"])
-            .arg(&temp_path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| crate::UtaiError::Audio(format!("ffmpeg: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::UtaiError::Audio(format!("ffmpeg resample failed: {}", stderr.trim())));
-        }
-
-        load_wav(&temp_path)
-    })();
-
-    let _ = std::fs::remove_file(&temp_path);
-    result
+    ffmpeg_decode_to_wav(&ffmpeg, path, Some(target_sr))
 }
 
 pub fn save_wav(path: &Path, buffer: &AudioBuffer) -> Result<()> {

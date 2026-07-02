@@ -1,15 +1,22 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useLogStore, type LogEntry } from "../../store/logs";
+import { useDraggable } from "../../lib/useDraggable";
 import "./LogViewer.css";
 
 const LEVEL_FILTERS = ["ALL", "ERROR", "WARN", "INFO", "DEBUG"] as const;
+const LEVEL_KEY: Record<string, string> = {
+  ALL: "all", ERROR: "error", WARN: "warn", INFO: "info", DEBUG: "debug",
+};
 
 export function LogViewer({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation();
   const { entries, logDir, startPolling, stopPolling } = useLogStore();
   const [filter, setFilter] = useState<string>("ALL");
   const [search, setSearch] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const listRef = useRef<HTMLDivElement>(null);
+  const { pos, startDrag } = useDraggable(() => ({ x: 128, y: 108 }));
 
   useEffect(() => {
     startPolling();
@@ -43,9 +50,9 @@ export function LogViewer({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <aside className="log-viewer">
-      <div className="panel-header">
-        <span className="panel-title">Log</span>
+    <aside className="log-viewer" style={{ left: pos.x, top: pos.y }}>
+      <div className="panel-header" onMouseDown={startDrag}>
+        <span className="panel-title">{t("log.title")}</span>
         <button className="panel-close" onClick={onClose}>X</button>
       </div>
 
@@ -57,19 +64,19 @@ export function LogViewer({ onClose }: { onClose: () => void }) {
               className={filter === lvl ? "active" : ""}
               onClick={() => setFilter(lvl)}
             >
-              {lvl}
+              {t(`log.${LEVEL_KEY[lvl]}`)}
             </button>
           ))}
         </div>
         <input
           type="text"
           className="log-search"
-          placeholder="Search..."
+          placeholder={t("log.search")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        <button className="log-copy-btn" onClick={handleCopy} title="Copy all">
-          CP
+        <button className="log-copy-btn" onClick={handleCopy} title={t("log.copyTitle")}>
+          {t("log.copy")}
         </button>
       </div>
 
@@ -78,7 +85,7 @@ export function LogViewer({ onClose }: { onClose: () => void }) {
           <LogLine key={i} entry={entry} />
         ))}
         {filtered.length === 0 && (
-          <div className="log-empty">No log entries</div>
+          <div className="log-empty">{t("log.empty")}</div>
         )}
       </div>
 

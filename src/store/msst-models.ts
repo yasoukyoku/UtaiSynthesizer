@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type MsstCatalogEntry } from "../lib/models/msst-catalog";
+import { loadSetting, saveSetting } from "../lib/settings";
 
 export interface InstalledModel {
   filename: string;
@@ -41,7 +42,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   modelsDir: "",
   downloading: {},
   error: null,
-  mirror: DEFAULT_MIRROR,
+  mirror: loadSetting<MirrorSource>("utai.mirror", DEFAULT_MIRROR),
 
   fetchInstalled: async () => {
     try {
@@ -121,7 +122,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
 
   clearError: () => set({ error: null }),
 
-  setMirror: (mirror) => set({ mirror }),
+  setMirror: (mirror) => { saveSetting("utai.mirror", mirror); set({ mirror }); },
 
   updateDownloadProgress: (filename, downloaded, total, stage) =>
     set((s) => ({

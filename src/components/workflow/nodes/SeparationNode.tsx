@@ -1,32 +1,18 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import { type NodeProps, useReactFlow } from "@xyflow/react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useCallback, useEffect } from "react";
+import { type NodeProps } from "@xyflow/react";
 import { NodeShell } from "./NodeShell";
+import { useNodeParams } from "./useNodeParams";
 import { useMsstModelStore } from "../../../store/msst-models";
-import { useWorkflowStore } from "../../../store/workflow";
 import {
   MSST_CATALOG,
   type MsstCategory,
   type MsstArchitecture,
   CATEGORY_LABELS,
+  CATEGORY_COLORS,
+  MSST_DEFAULT_NUM_OVERLAP,
+  t18,
 } from "../../../lib/models/msst-catalog";
 import { useTranslation } from "react-i18next";
-
-function t18(text: { zh: string; en: string; ja: string }, lang: string) {
-  if (lang === "zh") return text.zh;
-  if (lang === "ja") return text.ja;
-  return text.en;
-}
-
-const CATEGORY_COLORS: Record<MsstCategory, string> = {
-  vocals: "#ec4899",
-  instrumental: "#60a5fa",
-  denoise: "#4ade80",
-  dereverb: "#a78bfa",
-  karaoke: "#fbbf24",
-  multistem: "#f97316",
-  special: "#94a3b8",
-};
 
 interface InstalledOption { filename: string; displayName: string; arch: MsstArchitecture; stems: string[] }
 
@@ -39,27 +25,21 @@ function getModelsForCategory(category: MsstCategory, installedFiles: Set<string
 export function SeparationNode(props: NodeProps) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
-  const { setNodes } = useReactFlow();
+  const [params, updateParams] = useNodeParams(props);
   const installed = useMsstModelStore((s) => s.installed);
   const modelsDir = useMsstModelStore((s) => s.modelsDir);
   const installedFiles = new Set(installed.map((m) => m.filename));
 
-  const params = (props.data?.params as Record<string, unknown>) ?? {};
   const category = (params.category as MsstCategory) ?? "vocals";
   const models = getModelsForCategory(category, installedFiles);
 
-  const [selectedModel, setSelectedModel] = useState<string>((params.modelFile as string) ?? models[0]?.filename ?? "");
+  // Derived from the GRAPH params, never mirrored into local state: the modal-local undo restores node
+  // params via setNodes WITHOUT remounting this component — a useState mirror kept displaying (and, on
+  // the next edit, silently re-committing) the undone model while Run used the restored one.
+  const selectedModel = (params.modelFile as string) ?? models[0]?.filename ?? "";
   const currentModel = models.find((m) => m.filename === selectedModel) ?? models[0];
   const stems = currentModel?.stems ?? ["Output"];
   const arch = currentModel?.arch ?? "bs_roformer";
-
-  const updateParams = useCallback((updates: Record<string, unknown>) => {
-    setNodes((nds) => nds.map((n) =>
-      n.id === props.id
-        ? { ...n, data: { ...n.data, params: { ...params, ...updates } } }
-        : n,
-    ));
-  }, [props.id, params, setNodes]);
 
   useEffect(() => {
     if (!modelsDir) return;
@@ -79,7 +59,6 @@ export function SeparationNode(props: NodeProps) {
   }, [modelsDir]);
 
   const handleModelChange = useCallback((filename: string) => {
-    setSelectedModel(filename);
     const m = models.find((x) => x.filename === filename);
     if (m) {
       updateParams({ modelFile: filename, stemLabels: m.stems, modelPath: resolveOnnxPath(filename) });
@@ -87,11 +66,6 @@ export function SeparationNode(props: NodeProps) {
   }, [models, updateParams, resolveOnnxPath]);
 
   const catLabel = t18(CATEGORY_LABELS[category], lang);
-
-  const nodeOutputs = useWorkflowStore((s) => s.nodeOutputs);
-  const outputPaths = Object.values(nodeOutputs)
-    .map((segs) => segs[props.id])
-    .find((p) => p && p.length > 0);
 
   return (
     <NodeShell
@@ -105,7 +79,7 @@ export function SeparationNode(props: NodeProps) {
       <div className="sep-node-body">
         {models.length === 0 ? (
           <span className="sep-no-model">
-            {lang === "zh" ? "未安装模型" : "No models installed"}
+            {t18({ zh: "未安装模型", en: "No models installed", ja: "モデル未インストール" }, lang)}
           </span>
         ) : (
           <>
@@ -122,66 +96,8 @@ export function SeparationNode(props: NodeProps) {
             <SepParams arch={arch} params={params} onChange={updateParams} lang={lang} />
           </>
         )}
-        {outputPaths && outputPaths.length > 0 && (
-          <AudioPreview paths={outputPaths} stems={stems} />
-        )}
       </div>
     </NodeShell>
-  );
-}
-
-function AudioPreview({ paths, stems }: { paths: string[]; stems: string[] }) {
-  const [playing, setPlaying] = useState<number | null>(null);
-  const [progress, setProgress] = useState(0);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const rafRef = useRef(0);
-
-  const toggle = useCallback((idx: number) => {
-    if (playing === idx) {
-      audioRef.current?.pause();
-      setPlaying(null);
-      cancelAnimationFrame(rafRef.current);
-      return;
-    }
-    if (audioRef.current) { audioRef.current.pause(); }
-    const path = paths[idx];
-    if (!path) return;
-    const audio = new Audio(convertFileSrc(path));
-    audioRef.current = audio;
-    audio.onended = () => { setPlaying(null); setProgress(0); cancelAnimationFrame(rafRef.current); };
-    audio.play();
-    setPlaying(idx);
-    const tick = () => {
-      if (audio.duration) setProgress(audio.currentTime / audio.duration);
-      rafRef.current = requestAnimationFrame(tick);
-    };
-    rafRef.current = requestAnimationFrame(tick);
-  }, [playing, paths]);
-
-  useEffect(() => () => {
-    audioRef.current?.pause();
-    cancelAnimationFrame(rafRef.current);
-  }, []);
-
-  return (
-    <div className="sep-preview">
-      {paths.map((_, i) => (
-        <div key={i} className="sep-preview-row">
-          <button
-            className={`sep-preview-btn ${playing === i ? "playing" : ""}`}
-            onClick={() => toggle(i)}
-          >
-            {playing === i ? "||" : ">>"}
-          </button>
-          <span className="sep-preview-label">{stems[i] ?? `#${i}`}</span>
-          {playing === i && (
-            <div className="sep-preview-bar">
-              <div className="sep-preview-fill" style={{ width: `${progress * 100}%` }} />
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
   );
 }
 
@@ -191,31 +107,64 @@ function SepParams({ arch, params, onChange, lang }: {
   onChange: (u: Record<string, unknown>) => void;
   lang: string;
 }) {
-  const overlap = (params.overlap as number) ?? 0.25;
+  const numOverlap = (params.numOverlap as number) ?? MSST_DEFAULT_NUM_OVERLAP[arch] ?? 2;
   const normalize = (params.normalize as boolean) ?? false;
+  const useTta = (params.useTta as boolean) ?? false;
+  const shifts = (params.shifts as number) ?? 0;
+  const isSpectral = arch === "bs_roformer" || arch === "mel_band_roformer" || arch === "mdx23c";
 
   return (
     <div className="sep-params">
       <div className="sep-param-row">
-        <label>{lang === "zh" ? "重叠" : "Overlap"}</label>
-        <input type="number" min={0} max={0.99} step={0.05} value={overlap}
-          onChange={(e) => onChange({ overlap: parseFloat(e.target.value) || 0.25 })} />
+        <label title={t18({ zh: "重叠窗口数，越大越精细也越慢（MSST num_overlap）", en: "Overlap windows — higher = finer & slower (MSST num_overlap)", ja: "オーバーラップ数 — 大きいほど高精度・低速（MSST num_overlap）" }, lang)}>
+          {t18({ zh: "重叠次数", en: "Overlap", ja: "オーバーラップ" }, lang)}
+        </label>
+        <span className="sep-overlap nodrag">
+          <input
+            className="sep-overlap-range nodrag"
+            type="range" min={2} max={8} step={1} value={numOverlap}
+            onPointerDown={(e) => e.stopPropagation()}
+            onChange={(e) => onChange({ numOverlap: parseInt(e.target.value, 10) })}
+          />
+          <span className="sep-overlap-val">{numOverlap}</span>
+        </span>
       </div>
 
-      {(arch === "bs_roformer" || arch === "mel_band_roformer" || arch === "mdx23c") && (
+      {isSpectral && (
         <div className="sep-param-row">
-          <label>{lang === "zh" ? "归一化" : "Normalize"}</label>
+          <label title={t18({ zh: "批大小：一次喂多个 chunk 给 GPU（需重导出的新模型；旧模型自动按 1 跑）。显存不够会报错，调低即可", en: "Batch size — feed several chunks to the GPU at once (needs a re-exported model; old models run at 1). Lower it on out-of-memory", ja: "バッチサイズ — 複数チャンクを同時に GPU へ（再エクスポート済みモデルが必要。旧モデルは 1 で動作）。VRAM 不足なら下げてください" }, lang)}>
+            {t18({ zh: "批大小", en: "Batch", ja: "バッチ" }, lang)}
+          </label>
+          <input type="number" min={1} max={16} step={1} value={(params.batch as number) ?? 1}
+            onChange={(e) => onChange({ batch: Math.max(1, Math.min(16, parseInt(e.target.value) || 1)) })} />
+        </div>
+      )}
+
+      {isSpectral && (
+        <div className="sep-param-row">
+          <label title={t18({ zh: "按 mean/std 归一化输入再推理（安静/过响素材有用）", en: "Mean/std-normalize the input before inference", ja: "推論前に mean/std で入力を正規化（音量が極端な素材に有効）" }, lang)}>
+            {t18({ zh: "归一化", en: "Normalize", ja: "正規化" }, lang)}
+          </label>
           <input type="checkbox" checked={normalize}
             onChange={(e) => onChange({ normalize: e.target.checked })} />
         </div>
       )}
 
+      <div className="sep-param-row">
+        <label title={t18({ zh: "测试时增强：原始/反相/声道交换三遍平均，更准但约慢 3 倍", en: "Test-time augmentation — averages original / polarity / channel-swap passes (~3× slower)", ja: "テスト時拡張 — 原音/極性反転/チャンネル入替の平均（約3倍遅い）" }, lang)}>
+          TTA
+        </label>
+        <input type="checkbox" checked={useTta}
+          onChange={(e) => onChange({ useTta: e.target.checked })} />
+      </div>
+
       {arch === "htdemucs" && (
         <div className="sep-param-row">
-          <label>{lang === "zh" ? "TTA 偏移" : "Shifts (TTA)"}</label>
-          <input type="number" min={0} max={5} step={1}
-            value={(params.shifts as number) ?? 0}
-            onChange={(e) => onChange({ shifts: parseInt(e.target.value) || 0 })} />
+          <label title={t18({ zh: "随机时移次数（仅 Demucs，0 = 关闭）", en: "Random time-shift passes (Demucs only, 0 = off)", ja: "タイムシフト回数（Demucs のみ、0 = 無効）" }, lang)}>
+            {t18({ zh: "时移", en: "Shifts", ja: "シフト" }, lang)}
+          </label>
+          <input type="number" min={0} max={5} step={1} value={shifts}
+            onChange={(e) => onChange({ shifts: Math.max(0, Math.min(5, parseInt(e.target.value) || 0)) })} />
         </div>
       )}
     </div>

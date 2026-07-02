@@ -1,14 +1,20 @@
 .settings-panel {
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
+  position: fixed;
   width: 340px;
+  height: 70vh;
+  min-height: 280px;
+  max-height: 84vh;
   background: var(--bg-surface);
-  border-left: 1px solid var(--border-default);
-  z-index: var(--z-panel);
+  border: 1px solid var(--border-default);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+  z-index: calc(var(--z-overlay, 100) + 10);
   display: flex;
   flex-direction: column;
+}
+
+.settings-panel .panel-header {
+  cursor: move;
+  user-select: none;
 }
 
 .settings-content {

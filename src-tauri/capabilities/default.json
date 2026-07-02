@@ -11,6 +11,8 @@
     "core:window:allow-set-title",
     "dialog:default",
     "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-ask",
     {
       "identifier": "fs:allow-read-file",
       "allow": [{ "path": "**" }]

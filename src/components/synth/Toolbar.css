@@ -41,6 +41,14 @@
   padding: 0;
 }
 
+/* Transport hover: a crisp INSET ring + subtle fill — NOT an outer glow. The old `box-shadow: 0 0 8px`
+   glow bled outside the button onto the workflow active-pane cue line AND was too faint to read; an inset
+   ring stays inside the button, so it's clearer and can't touch the cue. (Return-to-start had no hover
+   feedback at all before.) */
+.transport-btn:hover {
+  box-shadow: inset 0 0 0 1px var(--border-default); /* crisp ring only — no fill (the fill read as an inner halo) */
+}
+
 .transport-icon {
   display: block;
   flex-shrink: 0;
@@ -92,13 +100,12 @@
 }
 
 .transport-btn.play:hover {
-  background: rgba(74, 222, 128, 0.1);
-  box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.55); /* green inset ring only — no fill */
 }
 
 .transport-btn.play.playing {
-  background: rgba(74, 222, 128, 0.2);
-  box-shadow: 0 0 8px rgba(74, 222, 128, 0.3);
+  background: rgba(74, 222, 128, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(74, 222, 128, 0.7); /* stronger ring = distinct active state, still no glow */
 }
 
 .tempo-input {
@@ -125,9 +132,28 @@
   min-width: 70px;
 }
 
-.snap-select {
-  width: 72px;
-  font-size: var(--font-size-xs);
+.snap-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 24px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.snap-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.snap-toggle.active {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  background: rgba(57, 197, 187, 0.12);
+}
+
+.snap-toggle svg {
+  display: block;
 }
 
 .edit-section .toolbar-btn {
@@ -145,36 +171,3 @@
   padding: var(--space-sm) var(--space-md);
 }
 
-.add-track-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  margin-top: 2px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-strong);
-  z-index: var(--z-overlay);
-  min-width: 160px;
-  box-shadow: var(--shadow-md);
-}
-
-.add-track-option {
-  display: block;
-  width: 100%;
-  text-align: left;
-  padding: var(--space-md) var(--space-lg);
-  font-size: var(--font-size-sm);
-  background: none;
-  border: none;
-  border-bottom: 1px solid var(--border-subtle);
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.add-track-option:last-child {
-  border-bottom: none;
-}
-
-.add-track-option:hover {
-  background: var(--bg-hover);
-  color: var(--accent-primary);
-}

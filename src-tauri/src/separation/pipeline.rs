@@ -32,8 +32,21 @@ pub struct ModelConfig {
     pub num_overlap: usize,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Model was exported with a DYNAMIC batch axis (new converter marker). Old models lack this → the
+    /// batched path is gated OFF and they keep the single-chunk loop (a batch-pinned ONNX hard-fails on B>1).
+    #[serde(default)]
+    pub dynamic_batch: bool,
+    /// Runtime batch-size override (UI). Effective only on dynamic_batch models; else forced to 1.
+    #[serde(default)]
+    pub batch: usize,
     #[serde(default)]
     pub normalize: bool,
+    /// Test-time augmentation (averaged augmented passes) — runtime override, not from model JSON.
+    #[serde(default)]
+    pub use_tta: bool,
+    /// HTDemucs random time-shift passes — runtime override.
+    #[serde(default)]
+    pub shifts: usize,
     #[serde(default)]
     pub segment_samples: usize,
     #[serde(default)]
@@ -83,9 +96,143 @@ impl NativePipeline {
     pub fn config(&self) -> &ModelConfig { &self.config }
     pub fn session_id(&self) -> &str { &self.session_id }
 
+    /// Override the normalize flag (UI checkbox takes precedence over the model JSON default).
+    pub fn set_normalize(&mut self, v: bool) {
+        self.config.normalize = v;
+    }
+
+    /// Override the overlap-add window count (UI). Clamped to ≥1.
+    pub fn set_num_overlap(&mut self, n: usize) {
+        self.config.num_overlap = n.max(1);
+    }
+
+    /// Override the inference batch size (UI). Only takes effect on dynamic-batch models; clamped ≥1.
+    pub fn set_batch(&mut self, n: usize) {
+        self.config.batch = n.max(1);
+    }
+
+    /// Effective batch size for inference: the runtime override on dynamic-batch models, else 1 (old
+    /// models pin batch=1 in the ONNX and would hard-fail on B>1).
+    fn effective_batch(&self) -> usize {
+        if self.config.dynamic_batch { self.config.batch.max(1) } else { 1 }
+    }
+
+    /// Enable test-time augmentation (UI).
+    pub fn set_use_tta(&mut self, v: bool) {
+        self.config.use_tta = v;
+    }
+
+    /// Set HTDemucs random time-shift passes (UI).
+    pub fn set_shifts(&mut self, n: usize) {
+        self.config.shifts = n;
+    }
+
     /// Run separation. Returns (stem_label, audio_data) pairs.
     /// `progress_cb` returns `true` to continue, `false` to cancel.
+    ///
+    /// When `normalize` is on, the input is mean/std-normalized before inference and the
+    /// stems are denormalized afterwards (MSST convention) — keeps quiet/loud inputs in the
+    /// model's expected range.
     pub fn separate(
+        &self,
+        audio: &AudioData,
+        progress_cb: &dyn Fn(f32) -> bool,
+    ) -> Result<Vec<StemAudio>> {
+        // htdemucs (hybrid demucs) is NOT mean/std-normalized in MSST, and its node UI hides the
+        // Normalize toggle — so a stale `normalize=true` carried over from a spectral model on the
+        // same node must not apply here. Guarding at this single point keeps the UI and engine honest.
+        if self.config.normalize && self.config.model_type != "htdemucs" {
+            let (mean, std) = compute_audio_mean_std(audio);
+            tracing::info!("MSST normalize ON (mean={:.6}, std={:.6})", mean, std);
+            let normed = normalize_audio(audio, mean, std);
+            let mut stems = self.run_augmented(&normed, progress_cb)?;
+            for stem in &mut stems {
+                denormalize_stem(stem, mean, std);
+            }
+            Ok(stems)
+        } else {
+            self.run_augmented(audio, progress_cb)
+        }
+    }
+
+    /// Test-time augmentation wrapper. Dispatches over a set of input transforms (identity +
+    /// optional polarity-flip / channel-swap for `use_tta`, + optional time-shifts for HTDemucs
+    /// `shifts`), inverts each result back to the original frame, and averages them.
+    ///
+    /// With NO augmentation enabled (no TTA, no shifts) `augs` is a single identity pass and this
+    /// calls `dispatch` directly — byte-for-byte the previous behavior (zero regression risk).
+    fn run_augmented(
+        &self,
+        audio: &AudioData,
+        progress_cb: &dyn Fn(f32) -> bool,
+    ) -> Result<Vec<StemAudio>> {
+        let stereo = self.config.stereo && audio.channels == 2;
+        let mut augs: Vec<Aug> = vec![Aug::Identity];
+        if self.config.use_tta {
+            augs.push(Aug::Polarity);
+            if stereo {
+                augs.push(Aug::ChannelSwap);
+            }
+        }
+        if self.config.model_type == "htdemucs" && self.config.shifts > 0 {
+            let max_shift = (audio.sample_rate as usize / 2).max(1); // ~0.5s (MSST demucs convention)
+            let n = self.config.shifts;
+            for i in 0..n {
+                // Deterministic, evenly-spaced offsets in (0, max_shift) — reproducible (vs random).
+                let off = (max_shift * (i + 1) / (n + 1)).max(1);
+                augs.push(Aug::Shift(off));
+            }
+        }
+
+        let num_passes = augs.len();
+        if num_passes == 1 {
+            return self.dispatch(audio, progress_cb);
+        }
+        tracing::info!("MSST TTA: averaging {} augmented passes", num_passes);
+
+        // Per-sample contribution count, NOT a flat 1/num_passes. A Shift pass's inverse (shift_left)
+        // zero-fills the last `off` output samples, so that pass contributes nothing there; dividing
+        // those samples by num_passes would silently attenuate the stem's tail (up to ~0.5s). Each
+        // pass adds 1.0 over the region it actually fills; we divide by that per-sample count.
+        let orig_len = audio.left.len();
+        let mut weights = vec![0.0f32; orig_len];
+        let mut acc: Option<Vec<StemAudio>> = None;
+        for (i, aug) in augs.iter().enumerate() {
+            let transformed = aug.apply(audio);
+            let base = i as f32;
+            let span = num_passes as f32;
+            let sub_cb = |p: f32| progress_cb((base + p) / span);
+            let mut stems = self.dispatch(&transformed, &sub_cb)?;
+            for stem in &mut stems {
+                aug.invert_stem(stem);
+            }
+            let valid = aug.valid_len(orig_len).min(orig_len);
+            for w in weights[..valid].iter_mut() {
+                *w += 1.0;
+            }
+            match acc.as_mut() {
+                None => acc = Some(stems),
+                Some(a) => add_stems_into(a, &stems),
+            }
+        }
+
+        let mut result = acc.expect("num_passes >= 1");
+        for stem in &mut result {
+            for (x, &w) in stem.left.iter_mut().zip(weights.iter()) {
+                if w > 0.0 {
+                    *x /= w;
+                }
+            }
+            for (x, &w) in stem.right.iter_mut().zip(weights.iter()) {
+                if w > 0.0 {
+                    *x /= w;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn dispatch(
         &self,
         audio: &AudioData,
         progress_cb: &dyn Fn(f32) -> bool,
@@ -161,49 +308,70 @@ impl NativePipeline {
             .map(|_| AudioAccumulator::new(padded_len, is_stereo))
             .collect();
 
-        for chunk_idx in 0..total_chunks {
-            let (spec, num_frames) = &spectrograms[chunk_idx];
-            let input_data: Vec<f32> = spec.iter().copied().collect();
+        // Inference in batches of `b` chunks (b=1 on old/batch-pinned models → exact single-chunk path).
+        // All chunks are padded to chunk_size → identical num_frames, so a batch stacks rectangularly.
+        let b = self.effective_batch();
+        tracing::info!(
+            "MSST spectral inference: batch={} (dynamic_batch={}, config.batch={}), {} chunks",
+            b, self.config.dynamic_batch, self.config.batch, total_chunks
+        );
+        let mut chunk_idx = 0;
+        while chunk_idx < total_chunks {
+            let bg = b.min(total_chunks - chunk_idx); // group size, remainder-safe
+
+            // Stack bg spectrograms into one [bg, freq_dim, num_frames, 2] input.
+            let num_frames = spectrograms[chunk_idx].1;
+            let chunk_floats = freq_dim * num_frames * 2;
+            let mut input_data: Vec<f32> = Vec::with_capacity(bg * chunk_floats);
+            for j in 0..bg {
+                input_data.extend(spectrograms[chunk_idx + j].0.iter().copied());
+            }
             let input = InputTensor::F32 {
                 data: input_data,
-                shape: vec![1, freq_dim as i64, *num_frames as i64, 2],
+                shape: vec![bg as i64, freq_dim as i64, num_frames as i64, 2],
             };
             let outputs = self.engine().run(&self.session_id, vec![("stft_repr", input)])?;
             let output_data = outputs.into_iter().next().ok_or_else(||
                 UtaiError::Audio("Model produced no output".into()))?;
 
-            // Immediately iSTFT + accumulate
-            let offset = chunks[chunk_idx].offset;
-            let chunk_len = chunks[chunk_idx].left.len();
+            // Unbind: output is [bg, num_stems, freq_dim, num_frames, 2]; item j stem s starts at
+            // (j*num_stems + s) * chunk_floats. At bg==1 this reduces to stem_idx*chunk_floats (old path).
+            for j in 0..bg {
+                let ci = chunk_idx + j;
+                let (spec, nf) = &spectrograms[ci];
+                let offset = chunks[ci].offset;
+                let chunk_len = chunks[ci].left.len();
 
-            let mut win = window.clone();
-            if chunk_idx == 0 {
-                for i in 0..fade_size.min(win.len()) { win[i] = 1.0; }
-            }
-            if chunk_idx == total_chunks - 1 {
-                let wl = win.len();
-                for i in 0..fade_size.min(wl) { win[wl - 1 - i] = 1.0; }
-            }
+                let mut win = window.clone();
+                if ci == 0 {
+                    for i in 0..fade_size.min(win.len()) { win[i] = 1.0; }
+                }
+                if ci == total_chunks - 1 {
+                    let wl = win.len();
+                    for i in 0..fade_size.min(wl) { win[wl - 1 - i] = 1.0; }
+                }
 
-            for stem_idx in 0..self.config.num_stems {
-                let stem_offset = stem_idx * freq_dim * num_frames * 2;
-                let mask = Array3::from_shape_vec(
-                    (freq_dim, *num_frames, 2),
-                    output_data[stem_offset..stem_offset + freq_dim * num_frames * 2].to_vec(),
-                ).map_err(|e| UtaiError::Audio(format!("Mask reshape: {}", e)))?;
+                for stem_idx in 0..self.config.num_stems {
+                    let base = (j * self.config.num_stems + stem_idx) * chunk_floats;
+                    let mask = Array3::from_shape_vec(
+                        (freq_dim, *nf, 2),
+                        output_data[base..base + chunk_floats].to_vec(),
+                    ).map_err(|e| UtaiError::Audio(format!("Mask reshape: {}", e)))?;
 
-                let masked = stft::apply_complex_mask(spec, &mask);
+                    let masked = stft::apply_complex_mask(spec, &mask);
 
-                if is_stereo {
-                    let (left, right) = proc.istft_stereo(&masked, chunk_len);
-                    stem_accumulators[stem_idx].add_windowed_stereo(&left, &right, offset, &win);
-                } else {
-                    let mono = proc.istft(&masked, chunk_len);
-                    stem_accumulators[stem_idx].add_windowed_mono(&mono, offset, &win);
+                    if is_stereo {
+                        let (left, right) = proc.istft_stereo(&masked, chunk_len);
+                        stem_accumulators[stem_idx].add_windowed_stereo(&left, &right, offset, &win);
+                    } else {
+                        let mono = proc.istft(&masked, chunk_len);
+                        stem_accumulators[stem_idx].add_windowed_mono(&mono, offset, &win);
+                    }
                 }
             }
 
-            let progress = 0.05 + 0.90 * (chunk_idx + 1) as f32 / total_chunks as f32;
+            chunk_idx += bg;
+            let progress = 0.05 + 0.90 * chunk_idx as f32 / total_chunks as f32;
             if !progress_cb(progress) {
                 return Err(UtaiError::Audio("Stopped by user".into()));
             }
@@ -580,12 +748,163 @@ impl NativePipeline {
     pub fn unload(&self) { self.engine().unload_model(&self.session_id); }
 }
 
-impl Drop for NativePipeline {
-    fn drop(&mut self) { self.engine().unload_model(&self.session_id); }
+// NOTE: NativePipeline intentionally does NOT unload its session on Drop. Sessions are
+// cached + LRU-bounded by OnnxEngine so that repeated separations of the same model reuse
+// the already-optimized session instead of reloading from disk every run. Call `unload()`
+// or OnnxEngine::clear_sessions() to free explicitly.
+
+// ─── Input normalization (MSST-style mean/std, optional) ─────────
+
+fn compute_audio_mean_std(audio: &AudioData) -> (f32, f32) {
+    let n = audio.left.len();
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let stereo = audio.channels >= 2 && audio.right.len() == n;
+    let mono = |i: usize| if stereo { (audio.left[i] + audio.right[i]) * 0.5 } else { audio.left[i] };
+    let mut sum = 0.0f64;
+    for i in 0..n {
+        sum += mono(i) as f64;
+    }
+    let mean = (sum / n as f64) as f32;
+    let mut var = 0.0f64;
+    for i in 0..n {
+        let d = (mono(i) - mean) as f64;
+        var += d * d;
+    }
+    let std = ((var / n as f64).sqrt() as f32).max(1e-8);
+    (mean, std)
+}
+
+fn normalize_audio(audio: &AudioData, mean: f32, std: f32) -> AudioData {
+    let inv = 1.0 / std;
+    AudioData {
+        left: audio.left.iter().map(|&x| (x - mean) * inv).collect(),
+        right: audio.right.iter().map(|&x| (x - mean) * inv).collect(),
+        channels: audio.channels,
+        sample_rate: audio.sample_rate,
+    }
+}
+
+fn denormalize_stem(stem: &mut StemAudio, mean: f32, std: f32) {
+    for x in stem.left.iter_mut() {
+        *x = *x * std + mean;
+    }
+    for x in stem.right.iter_mut() {
+        *x = *x * std + mean;
+    }
+}
+
+// ─── Test-time augmentation (TTA) ────────────────────────────────
+//
+// Each pass transforms the input, runs the model, then inverts the transform on the OUTPUT so all
+// passes line up before averaging. Polarity/channel-swap are general (any architecture); shifts are
+// HTDemucs-only (matching MSST). compute_residual uses the per-pass (transformed) mix, so the
+// derived "instrumental" stem inverts correctly too.
+
+enum Aug {
+    Identity,
+    Polarity,
+    ChannelSwap,
+    Shift(usize),
+}
+
+impl Aug {
+    /// Transform the input for this pass (length preserved).
+    fn apply(&self, a: &AudioData) -> AudioData {
+        match self {
+            Aug::Identity => a.clone(),
+            Aug::Polarity => AudioData {
+                left: a.left.iter().map(|x| -x).collect(),
+                right: a.right.iter().map(|x| -x).collect(),
+                channels: a.channels,
+                sample_rate: a.sample_rate,
+            },
+            Aug::ChannelSwap => AudioData {
+                left: a.right.clone(),
+                right: a.left.clone(),
+                channels: a.channels,
+                sample_rate: a.sample_rate,
+            },
+            Aug::Shift(off) => AudioData {
+                left: shift_right(&a.left, *off),
+                right: shift_right(&a.right, *off),
+                channels: a.channels,
+                sample_rate: a.sample_rate,
+            },
+        }
+    }
+
+    /// Undo the transform on the model's OUTPUT so every pass aligns before averaging.
+    fn invert_stem(&self, s: &mut StemAudio) {
+        match self {
+            Aug::Identity => {}
+            Aug::Polarity => {
+                for x in s.left.iter_mut() {
+                    *x = -*x;
+                }
+                for x in s.right.iter_mut() {
+                    *x = -*x;
+                }
+            }
+            Aug::ChannelSwap => std::mem::swap(&mut s.left, &mut s.right),
+            Aug::Shift(off) => {
+                s.left = shift_left(&s.left, *off);
+                s.right = shift_left(&s.right, *off);
+            }
+        }
+    }
+
+    /// Number of leading output samples this pass actually fills. A Shift's inverse (shift_left)
+    /// zero-fills the last `off` samples, which must be excluded from the TTA average.
+    fn valid_len(&self, n: usize) -> usize {
+        match self {
+            Aug::Shift(off) => n.saturating_sub(*off),
+            _ => n,
+        }
+    }
+}
+
+/// Shift right by `off` samples (zero-fill the front), length preserved.
+fn shift_right(x: &[f32], off: usize) -> Vec<f32> {
+    if off == 0 || x.is_empty() {
+        return x.to_vec();
+    }
+    let n = x.len();
+    let off = off.min(n);
+    let mut out = vec![0.0f32; n];
+    out[off..].copy_from_slice(&x[..n - off]);
+    out
+}
+
+/// Shift left by `off` samples (zero-fill the tail) — exact inverse of `shift_right`.
+fn shift_left(x: &[f32], off: usize) -> Vec<f32> {
+    if off == 0 || x.is_empty() {
+        return x.to_vec();
+    }
+    let n = x.len();
+    let off = off.min(n);
+    let mut out = vec![0.0f32; n];
+    out[..n - off].copy_from_slice(&x[off..]);
+    out
+}
+
+/// Accumulate `b` into `a` element-wise. Same stem count / length is guaranteed: identical model and
+/// identical (length-preserving) input across passes → identical output shape.
+fn add_stems_into(a: &mut [StemAudio], b: &[StemAudio]) {
+    for (sa, sb) in a.iter_mut().zip(b.iter()) {
+        for (x, y) in sa.left.iter_mut().zip(sb.left.iter()) {
+            *x += *y;
+        }
+        for (x, y) in sa.right.iter_mut().zip(sb.right.iter()) {
+            *x += *y;
+        }
+    }
 }
 
 // ─── Audio Data Types ────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct AudioData {
     pub left: Vec<f32>,
     pub right: Vec<f32>,
@@ -870,28 +1189,29 @@ pub fn load_wav(path: &Path) -> Result<AudioData> {
 }
 
 pub fn save_wav(path: &Path, stem: &StemAudio, sample_rate: u32) -> Result<()> {
+    // 32-bit float (not 16-bit int) so the separated stems keep FULL precision — the model works in
+    // f32 and the source may be 24/32-bit; quantizing to 16-bit here would add audible noise to a result
+    // the user may process further. No clamping: preserve any inter-sample overshoot for downstream gain.
     let spec = hound::WavSpec {
         channels: stem.channels as u16,
         sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
     };
 
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
 
-    let to_i16 = |s: f32| -> i16 { (s.clamp(-1.0, 1.0) * 32767.0) as i16 };
-
     if stem.channels == 2 {
         for i in 0..stem.left.len() {
-            writer.write_sample(to_i16(stem.left[i]))
+            writer.write_sample(stem.left[i])
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
-            writer.write_sample(to_i16(stem.right[i]))
+            writer.write_sample(stem.right[i])
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
         }
     } else {
         for &s in &stem.left {
-            writer.write_sample(to_i16(s))
+            writer.write_sample(s)
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
         }
     }

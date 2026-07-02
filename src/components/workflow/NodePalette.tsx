@@ -2,24 +2,14 @@ import { useCallback, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useAppStore } from "../../store/app";
-import { MSST_CATALOG, ALL_CATEGORIES, CATEGORY_LABELS, type MsstCategory } from "../../lib/models/msst-catalog";
+import { MSST_CATALOG, ALL_CATEGORIES, CATEGORY_LABELS, CATEGORY_COLORS, t18 } from "../../lib/models/msst-catalog";
+import { OUTPUT_NODE_COLOR } from "../../lib/constants";
 import "./NodePalette.css";
 
 interface Props {
   onAddNode: (type: string, label: string, extraParams?: Record<string, unknown>) => void;
   onDropNode?: (type: string, label: string, clientX: number, clientY: number, extraParams?: Record<string, unknown>) => void;
 }
-
-function t18(text: { zh: string; en: string; ja: string }, lang: string) {
-  if (lang === "zh") return text.zh;
-  if (lang === "ja") return text.ja;
-  return text.en;
-}
-
-const CATEGORY_COLORS: Record<MsstCategory, string> = {
-  vocals: "#ec4899", instrumental: "#60a5fa", denoise: "#4ade80",
-  dereverb: "#a78bfa", karaoke: "#fbbf24", multistem: "#f97316", special: "#94a3b8",
-};
 
 export function NodePalette({ onAddNode, onDropNode }: Props) {
   const { t, i18n } = useTranslation();
@@ -87,7 +77,7 @@ export function NodePalette({ onAddNode, onDropNode }: Props) {
 
       <div className="palette-category">
         <div className="palette-category-title">{t("workflow.catEffects")}</div>
-        <PaletteItem type="effects" label={lang === "zh" ? "效果器" : "Effects"} icon="FX" color="#fbbf24" onAdd={onAddNode} onDrag={startDrag} />
+        <PaletteItem type="effects" label={t18({ zh: "效果器", en: "Effects", ja: "エフェクト" }, lang)} icon="FX" color="#fbbf24" onAdd={onAddNode} onDrag={startDrag} />
       </div>
 
       <div className="palette-category">
@@ -106,17 +96,17 @@ export function NodePalette({ onAddNode, onDropNode }: Props) {
         ))}
         {availableCategories.length === 0 && (
           <span className="palette-empty">
-            {lang === "zh" ? "未安装分离模型" : "No separation models"}
+            {t18({ zh: "未安装分离模型", en: "No separation models", ja: "分離モデル未インストール" }, lang)}
           </span>
         )}
         <button className="palette-manage-btn" onClick={toggleModelManager}>
-          {lang === "zh" ? "管理模型..." : "Manage models..."}
+          {t18({ zh: "管理模型...", en: "Manage models...", ja: "モデル管理..." }, lang)}
         </button>
       </div>
 
       <div className="palette-category">
         <div className="palette-category-title">{t("workflow.catIO")}</div>
-        <PaletteItem type="audioOutput" label="Output" icon=">" color="#4ade80" onAdd={onAddNode} onDrag={startDrag} />
+        <PaletteItem type="audioOutput" label={t("workflow.nodeOutput")} icon=">" color={OUTPUT_NODE_COLOR} onAdd={onAddNode} onDrag={startDrag} />
       </div>
     </aside>
   );

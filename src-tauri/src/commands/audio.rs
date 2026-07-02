@@ -5,15 +5,20 @@ use tauri::State;
 use crate::audio::effects::Effect;
 use crate::AppState;
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AudioFileInfo {
     pub duration_ms: f64,
     pub sample_rate: u32,
     pub channels: u16,
     pub peaks: Vec<f32>,
-    /// Path to a WAV-format copy for playback (same as input if already WAV).
-    /// Ensures browser decodeAudioData and Rust peaks use identical sample data.
+    /// Path to a content-addressed WAV copy (in audio_cache) for playback. Ensures browser
+    /// decodeAudioData and Rust peaks use identical sample data.
     pub playback_path: String,
+    /// XXH3-64 hex of the original file's bytes — content identity (same content ⇒ same hash,
+    /// regardless of path/name). Backend-internal: the decode cache is keyed by it (the frontend has
+    /// no consumer — reserved for a future frontend-side dedup UI).
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -29,46 +34,103 @@ pub struct EffectResult {
     pub duration_secs: f64,
 }
 
+/// Per-call unique suffix for the content-addressed WAV temp file (see load_audio_file).
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[tauri::command]
 pub async fn load_audio_file(
     state: State<'_, Arc<AppState>>,
     path: String,
 ) -> Result<AudioFileInfo, String> {
     let input_path = PathBuf::from(&path);
-    let mut buf = crate::audio::load_audio(&input_path).map_err(|e| e.to_string())?;
 
+    // CONTENT IDENTITY: hash the raw file bytes (read once). Identical content under a different
+    // path/name produces the same hash, so we cache decode results by CONTENT, not path — "stop
+    // fighting file names". XXH3-64 is fast (~GB/s) and ample for dedup (not security).
+    let bytes = std::fs::read(&input_path).map_err(|e| format!("read {}: {e}", input_path.display()))?;
+    let content_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+    drop(bytes);
+
+    let cache_dir = state.cache_dir.join("audio_cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let sidecar = cache_dir.join(format!("{content_hash}.json"));
+
+    // CACHE HIT: same content was decoded before → return its metadata WITHOUT re-decoding. This is
+    // the payoff: a re-import of the same audio (even renamed/moved) skips the expensive decode+peaks.
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        if let Ok(info) = serde_json::from_str::<AudioFileInfo>(&text) {
+            if std::path::Path::new(&info.playback_path).exists() {
+                return Ok(info);
+            }
+        }
+    }
+
+    // MISS: decode (load_audio re-reads by path — cheap after the hash read warms the OS page cache).
+    let mut buf = crate::audio::load_audio(&input_path).map_err(|e| e.to_string())?;
     let ext = input_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     if ext != "wav" {
         buf = trim_codec_silence(buf);
     }
 
     let duration_ms = buf.duration_secs() * 1000.0;
-    let peak_count = ((buf.duration_secs() * 200.0) as usize).clamp(4000, 64000);
+    // 300 peaks/sec gives the waveform more horizontal detail. The ceiling stays high (the zoomed-in
+    // per-pixel renderer draws from the full peaks, so long clips keep their detail; the cache
+    // downsamples to its own column cap for the zoomed-out blit).
+    let peak_count = ((buf.duration_secs() * 300.0) as usize).clamp(4000, 64000);
     let peaks = extract_peaks(&buf.samples, buf.channels, peak_count);
 
-    let playback_path = if ext == "wav" {
-        path.clone()
-    } else {
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            path.hash(&mut h);
-            h.finish()
+    // Content-addressed playback WAV (same content ⇒ one cache file, shared by all paths/names; also
+    // means deleting the original doesn't break playback). For a WAV input, copy the bytes VERBATIM so
+    // the original bit depth (24-bit / 32-bit float) is preserved — save_wav would requantize to 16-bit.
+    // Non-WAV is decoded → 16-bit WAV (same as before content-addressing).
+    //
+    // Write via a UNIQUE temp + atomic rename, and skip if it already exists. Two decodes of the SAME
+    // content can run CONCURRENTLY (e.g. a workflow run's collectOutputs + the live reconciler both
+    // loading a freshly-rendered separation stem) — a direct copy/write to the shared `{hash}.wav` then
+    // raced into "The process cannot access the file because it is being used by another process"
+    // (os error 32) on Windows, which silently dropped a stem (e.g. instrumental) and fell the track back
+    // to the original mix. Per-call temp + atomic publish removes the shared-destination contention.
+    let wav_path = cache_dir.join(format!("{content_hash}.wav"));
+    if !wav_path.exists() {
+        let tmp = cache_dir.join(format!(
+            "{content_hash}.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let write = if ext == "wav" {
+            std::fs::copy(&input_path, &tmp).map(|_| ()).map_err(|e| format!("copy wav: {e}"))
+        } else {
+            crate::audio::save_wav(&tmp, &buf).map_err(|e| e.to_string())
         };
-        let cache_dir = state.cache_dir.join("audio_cache");
-        let _ = std::fs::create_dir_all(&cache_dir);
-        let wav_path = cache_dir.join(format!("{:016x}.wav", hash));
-        crate::audio::save_wav(&wav_path, &buf).map_err(|e| e.to_string())?;
-        wav_path.to_string_lossy().to_string()
-    };
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        // Atomic publish. If a concurrent decode of the same content already published it, our rename
+        // fails on Windows (it won't overwrite) — fine, the content is identical; drop our temp.
+        if std::fs::rename(&tmp, &wav_path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
 
-    Ok(AudioFileInfo {
+    let info = AudioFileInfo {
         duration_ms,
         sample_rate: buf.sample_rate,
         channels: buf.channels,
         peaks,
-        playback_path,
-    })
+        playback_path: wav_path.to_string_lossy().to_string(),
+        content_hash,
+    };
+    // Persist the sidecar so the next import of this content short-circuits the whole decode.
+    let _ = std::fs::write(&sidecar, serde_json::to_string(&info).unwrap_or_default());
+    Ok(info)
+}
+
+/// Fast duration probe (milliseconds) without decoding samples — for the drag-import ghost
+/// preview and loading-segment placeholder, where the file isn't loaded yet.
+#[tauri::command]
+pub async fn probe_audio_duration(path: String) -> Result<f64, String> {
+    crate::audio::probe_duration_ms(&PathBuf::from(&path)).map_err(|e| e.to_string())
 }
 
 fn extract_peaks(samples: &[f32], channels: u16, target_count: usize) -> Vec<f32> {
@@ -200,18 +262,3 @@ pub async fn ensure_cache_dir(
     Ok(cache_dir.to_string_lossy().to_string())
 }
 
-#[tauri::command]
-pub async fn export_audio(
-    state: State<'_, Arc<AppState>>,
-    _output_path: String,
-    _format: String,
-    _sample_rate: u32,
-    _normalize: bool,
-) -> Result<(), String> {
-    let proj = state.project.read();
-    let _project = proj
-        .as_ref()
-        .ok_or_else(|| "No project open".to_string())?;
-
-    Err("Export requires rendered tracks — pending full pipeline integration".to_string())
-}

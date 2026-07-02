@@ -3,13 +3,12 @@ pub mod commands;
 pub mod inference;
 pub mod logging;
 pub mod models;
-pub mod project;
 pub mod separation;
 pub mod training;
+pub mod util;
 
 use std::sync::Arc;
-use parking_lot::RwLock;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -42,7 +41,6 @@ pub type Result<T> = std::result::Result<T, UtaiError>;
 
 pub struct AppState {
     pub inference: inference::InferenceManager,
-    pub project: RwLock<Option<project::Project>>,
     pub training: training::TrainingManager,
     pub models: models::ModelRegistry,
     pub separation: separation::SeparationManager,
@@ -50,6 +48,10 @@ pub struct AppState {
     pub cache_dir: std::path::PathBuf,
     pub app_dir: std::path::PathBuf,
     pub msst_models_dir: std::path::PathBuf,
+    /// Long tasks currently running (stable ids → `close.task_<id>` labels), so the close-flow's
+    /// in-progress warning can LIST what's running. Registered via `begin_task` (RAII). Training +
+    /// separation are queried directly in `running_tasks`, not stored here.
+    pub active_tasks: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>>,
 }
 
 impl AppState {
@@ -62,7 +64,6 @@ impl AppState {
         let msst_models_dir = models_dir.join("msst");
         Self {
             inference: inference::InferenceManager::new(),
-            project: RwLock::new(None),
             training: training::TrainingManager::new(),
             models: models::ModelRegistry::new(models_dir),
             separation: separation::SeparationManager::new(app_dir.clone()),
@@ -70,6 +71,37 @@ impl AppState {
             cache_dir,
             app_dir,
             msst_models_dir,
+            active_tasks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Register a long-running task so the close-flow's in-progress warning can list it. Returns a guard
+    /// that unregisters on drop (panic-safe). Use a stable id with a matching `close.task_<id>` locale key.
+    pub fn begin_task(&self, id: &str) -> TaskGuard {
+        *self.active_tasks.lock().entry(id.to_string()).or_insert(0) += 1;
+        TaskGuard {
+            tasks: Arc::clone(&self.active_tasks),
+            id: id.to_string(),
+        }
+    }
+}
+
+/// RAII guard from `AppState::begin_task` — decrements the task's refcount when dropped (removing the id at
+/// 0), so N concurrent same-id tasks all stay listed until the LAST finishes. Clears on normal return, `?`
+/// early-return, OR panic.
+pub struct TaskGuard {
+    tasks: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>>,
+    id: String,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let mut tasks = self.tasks.lock();
+        if let Some(n) = tasks.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                tasks.remove(&self.id);
+            }
         }
     }
 }
@@ -80,19 +112,36 @@ fn init_ort_runtime(app_dir: &std::path::Path) {
     let dll_name = "onnxruntime.dll";
     let runtime_dir = app_dir.join("runtime").join("ort");
 
-    // Read device preference early to decide which DLL to load
-    let prefer_cuda = read_early_device_preference(app_dir);
+    // Decide which ORT BUILD to load. ORT bundles ONE provider set per DLL: the DirectML build has
+    // no CUDA provider and vice-versa. Explicit "cuda" → CUDA build; "directml"/"cpu" → DirectML
+    // build. Auto/unset → load the CUDA build ONLY when this machine actually has CUDA (Toolkit cudart
+    // present) AND the CUDA build is downloaded — that's what lets Auto's "CUDA → … → CPU" chain
+    // actually light up CUDA. On a non-CUDA machine we keep the DirectML build, because loading the
+    // CUDA build there has no DirectML provider and would drop Auto straight to CPU.
+    let cuda_dll = runtime_dir.join("cuda").join(dll_name);
+    // Auto/unset → load the CUDA build when this machine actually has CUDA (Toolkit cudart present) AND
+    // the CUDA build is downloaded — the whole point of Auto: light up CUDA without a manual pick. The
+    // CUDA build MUST be the version matching the ort crate's API (1.24.x / API 24); a mismatch deadlocks.
+    let prefer_cuda = match read_device_preference(app_dir).as_deref() {
+        Some("cuda") => true,
+        Some("directml") | Some("cpu") => false,
+        _ => cuda_dll.exists() && crate::commands::settings::is_cuda_available(),
+    };
 
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
 
     if prefer_cuda {
-        // Try CUDA DLL first, then fall back to default
-        let cuda_dll = runtime_dir.join("cuda").join(dll_name);
         if cuda_dll.exists() {
+            // PRELOAD CUDA + cuDNN dylibs in the top-level loader context BEFORE ort's init_from loads the
+            // CUDA build. Without this, ort's nested load of providers_cuda (under the loader-lock) hangs.
+            // VERIFIED with the version-matched 1.24.x build: preload + init_from + CUDA session all succeed.
+            let cuda_bin = std::env::var("CUDA_PATH").ok().map(|p| std::path::PathBuf::from(p).join("bin"));
+            let cudnn_dir = app_dir.join("runtime").join("cuda");
+            let _ = ort::ep::cuda::preload_dylibs(cuda_bin.as_deref(), Some(&cudnn_dir));
             search_paths.push(cuda_dll);
-            tracing::info!("CUDA runtime requested — trying CUDA ORT DLL");
+            tracing::info!("CUDA available — preloaded CUDA dylibs + loading CUDA ORT build");
         } else {
-            tracing::warn!("CUDA requested but runtime/ort/cuda/ not found — falling back to DirectML");
+            tracing::warn!("CUDA preferred but runtime/ort/cuda/ missing — using DirectML build");
         }
     }
 
@@ -144,21 +193,17 @@ fn init_ort_runtime(app_dir: &std::path::Path) {
     ort::init().commit();
 }
 
-/// Read device preference from config.json without full AppState setup.
-fn read_early_device_preference(app_dir: &std::path::Path) -> bool {
+/// Read the saved device string ("cuda"/"directml"/"cpu"/"auto") from config.json, if any.
+/// Handles both the unit form ("auto"/"cpu") and the struct form ({"cuda":{"device_id":0}}).
+fn read_device_preference(app_dir: &std::path::Path) -> Option<String> {
     let cfg_path = app_dir.join("config.json");
-    if let Ok(content) = std::fs::read_to_string(&cfg_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(device) = val.get("device").and_then(|d| d.as_str()) {
-                return device == "cuda";
-            }
-            // Also handle the object form {"cuda": {"device_id": 0}}
-            if val.get("device").and_then(|d| d.get("cuda")).is_some() {
-                return true;
-            }
-        }
+    let content = std::fs::read_to_string(&cfg_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let device = val.get("device")?;
+    if let Some(s) = device.as_str() {
+        return Some(s.to_string());
     }
-    false
+    device.as_object().and_then(|o| o.keys().next().cloned())
 }
 
 /// Add CUDA runtime DLL directories to PATH so ORT CUDA EP can find cuDNN/cublas.
@@ -167,13 +212,23 @@ fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
     {
         let mut dirs_to_add: Vec<std::path::PathBuf> = Vec::new();
 
-        // 1. App-local CUDA runtime dir (downloaded via settings panel)
+        // 1. App-local CUDA runtime dir (downloaded via settings panel — holds cuDNN)
         let cuda_dir = app_dir.join("runtime").join("cuda");
         if cuda_dir.exists() {
             dirs_to_add.push(cuda_dir);
         }
 
-        // 2. Python site-packages nvidia dirs (dev convenience)
+        // 2. System CUDA Toolkit bin (cudart / cublas / cublasLt) — providers_cuda.dll needs these and
+        //    runtime/cuda only ships cuDNN. Without this the CUDA build can't resolve cudart and the EP
+        //    fails to register (or, before SetErrorMode, hung). Prefer CUDA_PATH from the Toolkit installer.
+        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+            let bin = std::path::PathBuf::from(&cuda_path).join("bin");
+            if bin.exists() {
+                dirs_to_add.push(bin);
+            }
+        }
+
+        // 3. Python site-packages nvidia dirs (dev convenience) — only if nothing else was found.
         if dirs_to_add.is_empty() {
             if let Ok(local) = std::env::var("LOCALAPPDATA") {
                 let python_base = std::path::PathBuf::from(&local)
@@ -210,6 +265,114 @@ fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
     }
 }
 
+/// Startup sweep of the on-disk cache (`local_data/cache`). Two policies:
+///  1. `audio_cache/` — playback WAV copies of non-WAV imports are rewritten on next load, so they
+///     cost nothing to regenerate: wipe the whole folder.
+///  2. `cache/<segment_id>/` — per-segment workflow outputs (separation/voice-conversion) are
+///     expensive to regenerate and may be referenced by saved projects, so keep recent ones and
+///     enforce a budget: drop dirs older than MAX_AGE, then, if still over MAX_TOTAL_BYTES, drop
+///     oldest-first (LRU by newest-file mtime) until under budget.
+/// Only touches `local_data/cache`; autosaves and models live in sibling dirs.
+fn cleanup_cache_on_startup(cache_dir: &std::path::Path) {
+    const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+    const MAX_TOTAL_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GB
+
+    let audio_cache = cache_dir.join("audio_cache");
+    if audio_cache.exists() {
+        match std::fs::remove_dir_all(&audio_cache) {
+            Ok(()) => tracing::info!("Cache: cleared audio_cache"),
+            Err(e) => tracing::warn!("Cache: failed to clear audio_cache: {}", e),
+        }
+    }
+
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return, // no cache dir yet
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut dirs: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some("audio_cache") => continue, // already handled
+            // usp_work = the open .usp's extracted media — lifecycle is owned by open_project_archive/
+            // prune_usp_work + the recovery-aware removal in setup; the age/budget sweep must never eat
+            // a pending recovery's files.
+            Some("usp_work") => continue,
+            _ => {}
+        }
+        // Nested per-RUN output dirs (cache/<segId>/r*/ — every render writes a fresh one so re-runs
+        // never overwrite a split sibling's referenced audio): age-prune the stale ones individually,
+        // or a long-lived segment's dead old runs would count against the byte budget forever while
+        // its newest file keeps the whole segment dir "recent".
+        if let Ok(runs) = std::fs::read_dir(&path) {
+            for run in runs.flatten() {
+                let rp = run.path();
+                if !rp.is_dir() {
+                    continue;
+                }
+                let (rm, _) = dir_mtime_and_size(&rp);
+                if now.duration_since(rm).map(|a| a.as_secs() > MAX_AGE_SECS).unwrap_or(false) {
+                    let _ = std::fs::remove_dir_all(&rp);
+                    tracing::info!("Cache: pruned aged run dir {}", rp.display());
+                }
+            }
+        }
+        let (mtime, size) = dir_mtime_and_size(&path);
+        // Age prune first.
+        if now.duration_since(mtime).map(|a| a.as_secs() > MAX_AGE_SECS).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&path);
+            tracing::info!("Cache: pruned aged segment dir {}", path.display());
+            continue;
+        }
+        dirs.push((path, mtime, size));
+    }
+
+    // Budget prune: oldest-first until under the total-size cap.
+    let mut total: u64 = dirs.iter().map(|(_, _, s)| *s).sum();
+    if total > MAX_TOTAL_BYTES {
+        dirs.sort_by_key(|(_, m, _)| *m); // oldest first
+        for (path, _, size) in &dirs {
+            if total <= MAX_TOTAL_BYTES {
+                break;
+            }
+            let _ = std::fs::remove_dir_all(path);
+            total = total.saturating_sub(*size);
+            tracing::info!("Cache: budget-pruned segment dir {} ({} bytes)", path.display(), size);
+        }
+    }
+}
+
+/// Recursively compute a directory's total byte size and its newest contained-file mtime
+/// (used as a "last activity" proxy for LRU). Returns (UNIX_EPOCH, 0) for an empty/unreadable dir.
+fn dir_mtime_and_size(dir: &std::path::Path) -> (std::time::SystemTime, u64) {
+    fn walk(d: &std::path::Path, newest: &mut std::time::SystemTime, size: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let Ok(md) = e.metadata() else { continue };
+                if md.is_dir() {
+                    walk(&e.path(), newest, size);
+                } else {
+                    *size += md.len();
+                    if let Ok(m) = md.modified() {
+                        if m > *newest {
+                            *newest = m;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    let mut size = 0u64;
+    walk(dir, &mut newest, &mut size);
+    (newest, size)
+}
+
 fn resolve_app_dir() -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_default();
     if cwd.join("converter").join("convert.py").exists() {
@@ -225,6 +388,20 @@ fn resolve_app_dir() -> std::path::PathBuf {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    {
+        // Stop Windows from popping a MODAL "DLL not found" dialog that BLOCKS startup when a CUDA
+        // dependency (cudart/cublas) can't be resolved — let LoadLibrary fail fast so init_ort_runtime
+        // falls back to the DirectML build instead of hanging (observed: Auto loading the CUDA build hung).
+        extern "system" {
+            fn SetErrorMode(u_mode: u32) -> u32;
+        }
+        const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+        const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+        unsafe {
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
+        }
+    }
     let log_dir = logging::get_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
@@ -259,15 +436,106 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        // Exclude VISIBLE from restore so the plugin doesn't show() the window EARLY (before the frontend
+        // registers onCloseRequested) — that would re-open the startup close-race that visible:false closes.
+        // Size/position/maximized still restore; the frontend's show() (after the listener) is the sole reveal.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all() & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         .setup(move |app| {
-            let local_data = app.path().app_local_data_dir()
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(".utai_data"));
-            let cache_dir = local_data.join("cache");
-            let models_dir = local_data.join("models");
+            // Big growable files (models + cache) live under the DATA ROOT — default app_dir/data (next
+            // to the program, NOT C: AppData; these reach tens of GB). Resolved from config BEFORE
+            // deriving the dirs (so a user-set drive takes effect); changing it requires a restart.
+            let mut data_dir = commands::settings::resolve_data_dir(&app_dir_early);
+            // Legacy fallback: existing installs kept data under AppData. ONLY when the user hasn't set a
+            // custom dir (data_dir is still the default app_dir/data) and it has no models yet but the old
+            // AppData location does, fall back to AppData so upgraders don't "lose" their models — the
+            // settings UI then prompts them to migrate off C:.
+            if data_dir == app_dir_early.join("data") && !data_dir.join("models").exists() {
+                if let Ok(appdata) = app.path().app_local_data_dir() {
+                    if appdata.join("models").exists() {
+                        tracing::warn!("Using legacy AppData data dir ({}); migrate via Settings", appdata.display());
+                        data_dir = appdata;
+                    }
+                }
+            }
+            let cache_dir = data_dir.join("cache");
+            let models_dir = data_dir.join("models");
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::create_dir_all(&models_dir);
+            // Sweep stale on-disk caches on startup (background thread — don't block window show).
+            // This is also the crash/power-loss recovery path: a startup sweep always runs, unlike a
+            // shutdown hook that wouldn't fire on a hard exit.
+            {
+                let cd = cache_dir.clone();
+                // usp_work (extracted .usp archives) is NOT wiped in-session anymore (a failed open must
+                // never destroy the still-open project's media — see open_project_archive). Reclaim it
+                // here instead, but ONLY when no autosave recovery is pending: a crash-recovered
+                // .usp-opened project's media lives in usp_work and must survive until recovery resolves.
+                let recovery_pending = app_dir_early.join("autosave.json").exists();
+                std::thread::spawn(move || {
+                    if !recovery_pending {
+                        let usp_work = cd.join("usp_work");
+                        if usp_work.exists() {
+                            match std::fs::remove_dir_all(&usp_work) {
+                                Ok(()) => tracing::info!("Cache: cleared usp_work (no recovery pending)"),
+                                Err(e) => tracing::warn!("Cache: failed to clear usp_work: {}", e),
+                            }
+                        }
+                    }
+                    cleanup_cache_on_startup(&cd);
+                });
+            }
             let state = Arc::new(AppState::new(app_dir_early, cache_dir, models_dir, Arc::clone(&log_buffer)));
             commands::settings::load_and_apply_config(&state);
+            // Idle-release sweeper: free GPU sessions (+ the resident ORT CUDA arena) after a stretch of
+            // no inference, so VRAM returns to the driver once the user stops working. A new run reloads
+            // on demand (reload-on-miss). An in-flight separation keeps refreshing last_activity per chunk,
+            // so this never fires mid-job.
+            {
+                let st = Arc::clone(&state);
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    st.inference.engine.release_if_idle(std::time::Duration::from_secs(60));
+                });
+            }
             app.manage(state);
+
+            // System tray — minimize-to-tray + a Show/Quit menu. Menu/click events route to the FRONTEND,
+            // which owns the close-flow (in-progress-work + unsaved-changes prompts). Labels follow the UI
+            // language via `set_tray_labels` on mount; the English here is just the pre-mount fallback.
+            let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let tray_menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
+            tauri::tray::TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("UTAI")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => commands::window::show_main(app),
+                    "quit" => {
+                        commands::window::show_main(app);
+                        let _ = app.emit("tray-quit", ());
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        commands::window::show_main(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -275,10 +543,13 @@ pub fn run() {
             commands::inference::run_sovits,
             commands::inference::detect_f0,
             commands::inference::run_s2h,
-            commands::project::new_project,
-            commands::project::open_project,
-            commands::project::save_project,
-            commands::project::get_project_state,
+            commands::project::save_project_archive,
+            commands::project::open_project_archive,
+            commands::project::prune_usp_work,
+            commands::project::path_exists,
+            commands::project::write_autosave,
+            commands::project::read_autosave,
+            commands::project::clear_autosave,
             commands::training::start_training,
             commands::training::stop_training,
             commands::training::get_training_status,
@@ -289,10 +560,10 @@ pub fn run() {
             commands::models::check_model_exists,
             commands::models::set_model_avatar,
             commands::audio::load_audio_file,
+            commands::audio::probe_audio_duration,
             commands::audio::process_effects,
             commands::audio::save_temp_audio,
             commands::audio::ensure_cache_dir,
-            commands::audio::export_audio,
             commands::separation::run_msst_separation,
             commands::separation::get_separation_status,
             commands::separation::cancel_separation,
@@ -304,30 +575,23 @@ pub fn run() {
             commands::msst_models::convert_msst_model,
             commands::logs::get_recent_logs,
             commands::logs::get_logs_since,
+            commands::logs::log_message,
             commands::logs::get_log_file_path,
             commands::settings::get_hardware_info,
             commands::settings::set_device_preference,
             commands::settings::get_device_preference,
+            commands::settings::get_data_dir,
+            commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
+            commands::window::quit_app,
+            commands::window::running_tasks,
+            commands::window::set_tray_labels,
         ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.state::<Arc<AppState>>();
-                if state.training.is_active() {
-                    api.prevent_close();
-                    let _ = window.minimize();
-                }
-            }
-        })
+        // Window close + app exit are driven ENTIRELY by the frontend now (App.tsx onCloseRequested →
+        // minimize-to-tray / quit decision → in-progress + unsaved prompts → invoke("quit_app")). No
+        // Rust-side close/exit guard: the frontend confirms before quit_app, which exits unconditionally.
         .build(tauri::generate_context!())
         .expect("Failed to build UTAI")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                let state = app.state::<Arc<AppState>>();
-                if state.training.is_active() {
-                    api.prevent_exit();
-                }
-            }
-        });
+        .run(|_app, _event| {});
 }
