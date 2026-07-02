@@ -269,7 +269,9 @@ export function Arrangement() {
           const sx = seg.startTick * ppt;
           const sw = seg.durationTicks * ppt;
           if (x < sx || x > sx + sw) continue;
-          const out = seg.processedOutputs?.find((o) => laneRowKey(o) === laneInfo.id && !o.loading);
+          // Members: a merged visual row (equivalent 组s) resolves to whichever member THIS segment
+          // carries — the clicked piece then edits/selects its own 组, exactly as unmerged.
+          const out = seg.processedOutputs?.find((o) => !o.loading && laneInfo.members.some((m) => m.rowKey === laneRowKey(o)));
           if (!out) return null; // the row exists for the track, but THIS segment has no such lane → empty
           const group = laneGroupId(out);
           const stemDurMs = seg.content.totalDurationMs;
@@ -1307,11 +1309,10 @@ export function Arrangement() {
           // Lane-level loading: an Output-node deposit is decoding this lane's audio. Same look, on the
           // expanded lane row, until the real waveform merges in.
           if (track.expanded && seg.processedOutputs) {
-            const lanes = getLanes(track);
             const layout = getLaneLayout(track);
             for (const out of seg.processedOutputs) {
               if (!out.loading) continue;
-              const li = lanes.findIndex((l) => l.id === laneRowKey(out));
+              const li = layout.rowByKey.get(laneRowKey(out)) ?? -1;
               if (li < 0) continue;
               const laneY = trackY + layout.rowY[li]! * scale;
               drawLoadingIndicator(ctx as CanvasRenderingContext2D, sx, laneY, sw, laneH, c, now, label);
@@ -1565,10 +1566,9 @@ function drawStaticContent(
 
       if (track.expanded && seg.processedOutputs) {
         for (const out of seg.processedOutputs) {
-          // Position by the lane's index in the DEDUPED lane set (by laneRowKey) — NOT the array index —
-          // so the row matches computeTrackHeight (which sizes by distinct rows). Otherwise extra lanes
-          // render past the track's allocated height and overflow into the track below.
-          const li = lanes.findIndex((l) => l.id === laneRowKey(out));
+          // Position through the shared rowByKey map (covers MERGED rows: every member rowKey resolves
+          // to its visual row) — never the array index, so the row always matches computeTrackHeight.
+          const li = layout.rowByKey.get(laneRowKey(out)) ?? -1;
           if (li < 0) continue;
           const laneY = y + layout.rowY[li]! * scale;
           // Color by the 轨道组 NAME (run.colorIndex — same name shares a hue; 组 boundaries are the
@@ -1696,7 +1696,7 @@ function drawStaticContent(
             // actually reach the seam — a piece trimmed away from the boundary fades nothing, so the
             // mark would promise a crossfade the audio doesn't do.
             if (!laneReachesSeam(seg, rowKey, tempo, "end") || !laneReachesSeam(next, rowKey, tempo, "start")) continue;
-            const li = xfLanes.findIndex((l) => l.id === rowKey);
+            const li = layout.rowByKey.get(rowKey) ?? -1;
             if (li < 0) continue;
             drawCrossfade(ctx as CanvasRenderingContext2D, ox, y + layout.rowY[li]! * scale, ow, laneH, c);
           }

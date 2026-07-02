@@ -110,7 +110,9 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
       style={{ width }}
       onMouseDown={handleDown}
       onClick={(e) => e.stopPropagation()}
-      title={format ? format(value) : `${value > 0 ? "+" : ""}${value.toFixed(1)} dB`}
+      // Default dB formatter: the fader BOTTOM reads −∞ (mute — see FADER_MIN_DB); a custom `format`
+      // (the pan fader) is never affected.
+      title={format ? format(value) : value <= min ? "-∞ dB" : `${value > 0 ? "+" : ""}${value.toFixed(1)} dB`}
     >
       <div className="vol-track" />
       <div className="vol-zero" style={{ left: `${zeroRatio * 100}%` }} />

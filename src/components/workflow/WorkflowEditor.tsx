@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { flushAutosaveNow } from "../../lib/project/autosave";
 import {
@@ -36,6 +36,7 @@ import { setUndoScope, useHistoryStore } from "../../store/history";
 import { DEFAULT_OUTPUT_GROUP } from "../../lib/constants";
 import i18n from "../../i18n";
 import { executeWorkflow, executeSingleNode, collectCachedPaths, loadCachedOutput, outputLanes, rehydrateRenderState, planDetachGroup, type CachedPath } from "../../lib/workflow/engine";
+import { nodeHistoryFor } from "../../lib/workflow/nodeHistory";
 import { logToBackend } from "../../lib/log";
 import { clearBufferCache, loadAudioBuffer } from "../../lib/audio/playback";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
@@ -198,6 +199,11 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   const setActivePane = useAppStore((s) => s.setActivePane);
   const activePane = useAppStore((s) => s.activePane);
   const focusEditor = useCallback(() => setActivePane("workflow"), [setActivePane]);
+  // TEMP [undoDbg]: catch the activePane=workflow-while-editor-unmounted desync (the phantom-undo root).
+  useEffect(() => {
+    logToBackend("info", `[undoDbg] WorkflowEditor MOUNT seg=${segmentId}`);
+    return () => logToBackend("info", `[undoDbg] WorkflowEditor UNMOUNT seg=${segmentId} (activePane now=${useAppStore.getState().activePane})`);
+  }, [segmentId]);
 
   useEffect(() => {
     useMsstModelStore.getState().fetchModelsDir();
@@ -249,29 +255,40 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   // will get its own, more complex rule later). The persisted segment.workflow is deliberately kept
   // OUT of the timeline undo (excluded from its meaningful diff), so node editing never makes a
   // timeline step.
-  const lpPast = useRef<{ nodes: Node[]; edges: Edge[] }[]>([]);
-  const lpFuture = useRef<{ nodes: Node[]; edges: Edge[] }[]>([]);
-  const commitRef = useRef<{ nodes: Node[]; edges: Edge[] }>({ nodes: initialData.nodes, edges: initialData.edges });
-  const lastLocalSig = useRef(sigOfGraph(initialData.nodes, initialData.edges));
+  // The stack lives PER SEGMENT in the module-level nodeHistory map, NOT in refs — the keyed remount
+  // on a segment switch used to destroy the previous segment's history (detach piece 1 → detach piece
+  // 2 → back to piece 1: its 解组 could never be undone). The map entry is mutated in place; a
+  // remount resumes it (safe — only this segment's own open editor ever mutates its graph).
+  const hist = useMemo(
+    () =>
+      nodeHistoryFor(segmentId, () => ({
+        past: [],
+        future: [],
+        commit: { nodes: initialData.nodes, edges: initialData.edges },
+        sig: sigOfGraph(initialData.nodes, initialData.edges),
+      })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [segmentId],
+  );
   const draggingNodeRef = useRef(false);
   const applyingLocalRef = useRef(false);
 
   const captureLocal = useCallback(() => {
     if (draggingNodeRef.current) return; // mid-drag frames coalesce; recorded on dragStop
     const sig = sigOfGraph(nodesRef.current, edgesRef.current);
-    if (sig === lastLocalSig.current) {
+    if (sig === hist.sig) {
       // No STRUCTURAL change (e.g. a pure node MOVE — position is out of the signature, so dragging a node
       // is not an undo step, or a selection-only change). Still refresh the baseline graph so a LATER real
       // edit's undo doesn't snap nodes back to a stale position.
-      commitRef.current = { nodes: nodesRef.current, edges: edgesRef.current };
+      hist.commit = { nodes: nodesRef.current, edges: edgesRef.current };
       return;
     }
-    lpPast.current.push(commitRef.current);
-    if (lpPast.current.length > 100) lpPast.current.shift();
-    lpFuture.current = [];
-    commitRef.current = { nodes: nodesRef.current, edges: edgesRef.current };
-    lastLocalSig.current = sig;
-  }, []);
+    hist.past.push(hist.commit);
+    if (hist.past.length > 100) hist.past.shift();
+    hist.future = [];
+    hist.commit = { nodes: nodesRef.current, edges: edgesRef.current };
+    hist.sig = sig;
+  }, [hist]);
 
   const applyLocal = useCallback((snap: { nodes: Node[]; edges: Edge[] }) => {
     applyingLocalRef.current = true; // consumed by the capture effect so undo/redo doesn't re-record
@@ -286,29 +303,29 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     });
     setNodes(nodes);
     setEdges(snap.edges);
-    commitRef.current = { nodes, edges: snap.edges };
-    lastLocalSig.current = sigOfGraph(nodes, snap.edges);
-  }, [setNodes, setEdges]);
+    hist.commit = { nodes, edges: snap.edges };
+    hist.sig = sigOfGraph(nodes, snap.edges);
+  }, [setNodes, setEdges, hist]);
 
   const localUndo = useCallback(() => {
     if (draggingNodeRef.current || applyingLocalRef.current) return; // not mid-drag / re-entrant
-    if (lpPast.current.length === 0) return;
-    const cur = commitRef.current;
-    lpFuture.current.push(cur);
-    const before = lpPast.current.pop()!;
+    if (hist.past.length === 0) return;
+    const cur = hist.commit;
+    hist.future.push(cur);
+    const before = hist.past.pop()!;
     applyLocal(before);
     announceNode(before, cur, "undo"); // the undone node op transformed before→cur
-  }, [applyLocal]);
+  }, [applyLocal, hist]);
 
   const localRedo = useCallback(() => {
     if (draggingNodeRef.current || applyingLocalRef.current) return;
-    if (lpFuture.current.length === 0) return;
-    const cur = commitRef.current;
-    lpPast.current.push(cur);
-    const after = lpFuture.current.pop()!;
+    if (hist.future.length === 0) return;
+    const cur = hist.commit;
+    hist.past.push(cur);
+    const after = hist.future.pop()!;
     applyLocal(after);
     announceNode(cur, after, "redo");
-  }, [applyLocal]);
+  }, [applyLocal, hist]);
 
   const onNodeDragStart = useCallback(() => { draggingNodeRef.current = true; }, []);
   const onNodeDragStop = useCallback(() => { draggingNodeRef.current = false; captureLocal(); }, [captureLocal]);
@@ -326,11 +343,11 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     setUndoScope({
       undo: localUndo,
       redo: localRedo,
-      canUndo: () => lpPast.current.length > 0,
-      canRedo: () => lpFuture.current.length > 0,
+      canUndo: () => hist.past.length > 0,
+      canRedo: () => hist.future.length > 0,
     });
     return () => setUndoScope(null);
-  }, [localUndo, localRedo]);
+  }, [localUndo, localRedo, hist]);
 
   useEffect(() => {
     const trackId = segTrackIdRef.current;
@@ -500,17 +517,17 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     const wf = reactFlowToWorkflow(nodes, edges);
     // Barrier floor captured at DISPATCH so edits made DURING the async render stay undoable down to —
     // but not past — this point.
-    const dispatchPastLen = lpPast.current.length;
+    const dispatchPastLen = hist.past.length;
     try {
       // The RECONCILER (running live during + after the run) owns the track lanes: at run start it places
       // loading placeholders for the connected Output lanes, then deposits each lane the moment its branch
       // finishes (executeWorkflow caches per node → the reconcile effect fires), and cleans the
       // placeholders of branches that never ran. So handleExecute no longer touches processedOutputs — it
       // only drives the render + the node-graph undo barrier.
-      // Re-run with edited params overwrites node outputs at the SAME deterministic path, so the live
-      // reconciler's path-equality check would KEEP the stale deposited lane (stale waveform + playback
-      // buffer). Invalidate this segment's prior deposit + buffers UP FRONT, so each branch re-decodes
-      // fresh as it finishes during the run (no stale lane, and no post-run flash-out-and-back).
+      // Invalidate this segment's prior deposit + decoded buffers UP FRONT so every connected lane
+      // shows a loading placeholder from the first moment of the run and each branch re-decodes fresh
+      // as it finishes. (Output paths are run-unique now, so this is pure UX immediacy — staleness
+      // itself is already impossible.)
       const segBefore = useProjectStore.getState().tracks.find((t) => t.id === trackId)?.segments.find((s) => s.id === segmentId);
       const stale = new Set<string>();
       for (const o of segBefore?.processedOutputs ?? []) {
@@ -528,8 +545,8 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       flushAutosaveNow(); // a render is a commit — snapshot to disk NOW (don't wait for the 1.5s debounce)
       // A render is a COMMIT BARRIER for the node-graph undo: drop the pre-render history (and any redo
       // branch) but KEEP edits made while the render was in flight undoable.
-      lpPast.current = lpPast.current.slice(Math.min(dispatchPastLen, lpPast.current.length));
-      lpFuture.current = [];
+      hist.past = hist.past.slice(Math.min(dispatchPastLen, hist.past.length));
+      hist.future = [];
     } catch (err) {
       // Live-deposit model: branches that FINISHED stay on the track (what rendered, rendered); the
       // reconciler removes the loading placeholders of branches that didn't. Just drop stuck badges here.
@@ -537,7 +554,7 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       if (err instanceof Error && err.message === "Cancelled") return;
       console.error("Workflow execution failed:", err);
     }
-  }, [segmentId, segment, nodes, edges]);
+  }, [segmentId, segment, nodes, edges, hist]);
 
   const handleCancel = useCallback(() => {
     useWorkflowStore.getState().cancelExecution(segmentId);
@@ -807,7 +824,12 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
         id: nn.id,
         type: "audioOutput",
         position: nn.position,
-        data: { label: "output", params: { laneLabel: nn.group } },
+        // `detached: true` = the PERSISTENT independence marker (rides the graph → .usp / split copies;
+        // graph-undo of the detach removes it with the node). getLanes exempts detached 组s from the
+        // same-name row merging — without it a detached 组 is structurally identical to a re-created
+        // Output node and would merge right back onto the sibling pieces' original rows/bar, making
+        // 解组's independent volume/pan impossible.
+        data: { label: "output", params: { laneLabel: nn.group, detached: true } },
         deletable: true,
         zIndex: zBase + i,
       })),

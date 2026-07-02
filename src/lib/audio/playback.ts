@@ -1,4 +1,5 @@
 import { readFile } from "@tauri-apps/plugin-fs";
+import { FADER_MIN_DB } from "../constants";
 import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, msToTicks, ticksToMs } from "./laneOps";
 import { isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayout";
 import { useProjectStore } from "../../store/project";
@@ -454,6 +455,8 @@ export function durationMsToTicks(ms: number, tempo: number): number {
 }
 
 function dbToLinear(db: number): number {
+  // The fader floor means −∞/MUTE (DAW convention: bounded up, unbounded down) — see FADER_MIN_DB.
+  if (db <= FADER_MIN_DB) return 0;
   return Math.pow(10, db / 20);
 }
 

@@ -19,3 +19,10 @@ export const DEFAULT_OUTPUT_GROUP = "Main";
 /** The Output node's accent color — ONE constant for the node chrome AND its palette entry (they had
  *  drifted: palette green vs node amber). Amber = the established Output/deposit status color. */
 export const OUTPUT_NODE_COLOR = "#f59e0b";
+
+/** Volume-fader floor (dB). The BOTTOM of a volume fader means −∞/MUTE (the universal DAW convention:
+ *  bounded upward, unbounded downward) — dbToLinear maps any value at/below this to gain 0, and the
+ *  fader tooltip shows "-∞ dB" there. The STORED volumeDb stays at this finite floor (−Infinity does
+ *  not survive JSON). ONE constant for the faders (TrackList), the gain math (playback), and the
+ *  future mixdown export. */
+export const FADER_MIN_DB = -24;

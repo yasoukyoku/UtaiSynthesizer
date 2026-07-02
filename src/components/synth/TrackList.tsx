@@ -4,8 +4,8 @@ import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
-import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT } from "../../lib/constants";
-import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor } from "../../lib/trackLayout";
+import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB } from "../../lib/constants";
+import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
 import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
 import { importAudioToNewTrack } from "../../lib/audio/import";
@@ -279,18 +279,32 @@ export function TrackList({ width }: Props) {
             }}
             onToggleExpand={() => toggleTrackExpanded(track.id)}
             onTogglePlayOriginal={() => setTrackPlayOriginal(track.id, !track.playOriginal)}
-            onLaneMute={(rowKey, laneId, groupId) => {
-              const newMuted = !isLaneRowMuted(track, rowKey, laneId);
-              setLaneMute(track.id, rowKey, newMuted);
-              playback.updateLaneMute(track.id, rowKey, newMuted, laneControlFor(track, groupId, laneId)?.volumeDb ?? 0);
+            onLaneMute={(members) => {
+              // A merged row toggles as ONE: "muted" reads as all-members-muted, and the write fans
+              // out over every member rowKey — inside one transaction so the click is one undo step
+              // (each setLaneMute is a separate store set that would otherwise auto-capture).
+              const newMuted = !members.every((m) => isLaneRowMuted(track, m.rowKey, m.laneId));
+              useHistoryStore.getState().beginTransaction();
+              for (const m of members) {
+                setLaneMute(track.id, m.rowKey, newMuted);
+                playback.updateLaneMute(track.id, m.rowKey, newMuted, laneControlFor(track, m.groupId, m.laneId)?.volumeDb ?? 0);
+              }
+              useHistoryStore.getState().commitTransaction();
             }}
-            onLaneVolumeChange={(groupId, laneId, v) => {
-              updateLaneControl(track.id, groupId, { volumeDb: v }, laneId);
-              playback.updateLaneVolume(track.id, groupId, v);
+            onLaneVolumeChange={(run, v) => {
+              // Fan out over every member 组 under this bar (merged rows stay in lockstep; the legacy
+              // laneId seed applies only to the primary 组 — other members' legacy entries key by
+              // THEIR laneIds and simply start fresh, converging on this first touch).
+              for (const gid of run.groupIds) {
+                updateLaneControl(track.id, gid, { volumeDb: v }, gid === run.groupId ? run.laneId : undefined);
+                playback.updateLaneVolume(track.id, gid, v);
+              }
             }}
-            onLanePanChange={(groupId, laneId, v) => {
-              updateLaneControl(track.id, groupId, { pan: v }, laneId);
-              playback.updateLanePan(track.id, groupId, v);
+            onLanePanChange={(run, v) => {
+              for (const gid of run.groupIds) {
+                updateLaneControl(track.id, gid, { pan: v }, gid === run.groupId ? run.laneId : undefined);
+                playback.updateLanePan(track.id, gid, v);
+              }
             }}
           />
           </Fragment>
@@ -347,9 +361,9 @@ interface TrackItemProps {
   onPanChange: (v: number) => void;
   onToggleExpand: () => void;
   onTogglePlayOriginal: () => void;
-  onLaneMute: (rowKey: string, laneId: string, groupId: string) => void;
-  onLaneVolumeChange: (groupId: string, laneId: string, v: number) => void;
-  onLanePanChange: (groupId: string, laneId: string, v: number) => void;
+  onLaneMute: (members: LaneMember[]) => void;
+  onLaneVolumeChange: (run: LaneGroupRun, v: number) => void;
+  onLanePanChange: (run: LaneGroupRun, v: number) => void;
 }
 
 function TrackItem({
@@ -440,7 +454,7 @@ function TrackItem({
               <span className="fader-tag">V</span>
               <VolumeFader
                 value={track.volumeDb}
-                min={-24}
+                min={FADER_MIN_DB}
                 max={6}
                 onChange={onVolumeChange}
                 onGestureStart={() => useHistoryStore.getState().beginTransaction()}
@@ -505,10 +519,10 @@ function TrackItem({
                   <span className="fader-tag">V</span>
                   <VolumeFader
                     value={ctrl?.volumeDb ?? 0}
-                    min={-24}
+                    min={FADER_MIN_DB}
                     max={6}
                     width={42}
-                    onChange={(v) => onLaneVolumeChange(run.groupId, run.laneId, v)}
+                    onChange={(v) => onLaneVolumeChange(run, v)}
                     onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                     onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
                   />
@@ -523,15 +537,17 @@ function TrackItem({
                     fillFrom="center"
                     format={formatPan}
                     width={28}
-                    onChange={(v) => onLanePanChange(run.groupId, run.laneId, v)}
+                    onChange={(v) => onLanePanChange(run, v)}
                     onGestureStart={() => useHistoryStore.getState().beginTransaction()}
                     onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
                   />
                 </div>
               </div>
             </div>
-            {lanes.slice(run.start, run.start + run.count).map(({ id, label, laneId, groupId }) => {
-              const muted = isLaneRowMuted(track, id, laneId);
+            {lanes.slice(run.start, run.start + run.count).map(({ id, label, members }) => {
+              // A merged row reads muted only when ALL members are (the toggle fans out, so they
+              // only diverge via legacy state — the canvas dims each piece by its own member truth).
+              const muted = members.every((m) => isLaneRowMuted(track, m.rowKey, m.laneId));
               // Show only the sub-name within the group (labels are "Group · stem") — the group name
               // lives on the bar above, and the bracket ties the rows to it (members, not peers).
               const subName = laneLabelParts(label).stem ?? label;
@@ -541,7 +557,7 @@ function TrackItem({
                   <div className="track-controls">
                     <button
                       className={`track-btn ${muted ? "active-mute" : ""}`}
-                      onClick={(e) => { e.stopPropagation(); onLaneMute(id, laneId, groupId); }}
+                      onClick={(e) => { e.stopPropagation(); onLaneMute(members); }}
                     >
                       M
                     </button>

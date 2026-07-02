@@ -2,6 +2,16 @@ import { create } from "zustand";
 import { useProjectStore } from "./project";
 import { useAppStore } from "./app";
 import { useAudioStore } from "./audio";
+import { useWorkflowStore } from "./workflow";
+import { logToBackend } from "../lib/log";
+
+/** TEMP diagnostic probes for the reported "undo banner shows but nothing reverts" (timeline-stack
+ *  disorder after output/sub-lane ops). Logs land in the dev stdout as `[UI] [undoDbg] …` — grep the
+ *  dev output. REMOVE once the phantom source is pinned. */
+const UNDO_DBG = true;
+function dbg(msg: string) {
+  if (UNDO_DBG) logToBackend("info", `[undoDbg] ${msg}`);
+}
 import i18n from "../i18n";
 import {
   clearDetachLineage,
@@ -163,6 +173,37 @@ function applySnapshot(snap: Snapshot) {
   for (const t of liveTracks) for (const s of t.segments) liveSegById.set(s.id, s);
   const audioFiles = useAudioStore.getState().audioFiles;
 
+  // Render sources a RESTORED mid-render split half can re-link to: live segments that own a render
+  // (running, or settled with a warm cache). Node-id overlap is THE split signature — a split copies
+  // the graph, so a half's loading lanes carry outputNodeIds present in the source's workflow.
+  const wfState = useWorkflowStore.getState();
+  const renderSources: { id: string; nodeIds: Set<string> }[] = [];
+  for (const [id, exec] of Object.entries(wfState.executions)) {
+    const src = liveSegById.get(id);
+    if (!src?.workflow) continue;
+    const warm = wfState.nodeOutputs[id] && Object.keys(wfState.nodeOutputs[id]!).length > 0;
+    if (exec.status !== "running" && !warm) continue;
+    renderSources.push({ id, nodeIds: new Set(src.workflow.nodes.map((n) => n.id)) });
+  }
+  const relinks: { toId: string; fromId: string }[] = [];
+  // Snapshot-fallback lanes (segment not live): a restored segment with mid-render LOADING placeholders
+  // is a redone split half — if a live split SIBLING still owns the render, RE-LINK it instead of
+  // stripping: RenderLinkWatcher then finishes it exactly like an original split half (tracks the run,
+  // or — already settled — immediately clones the cache and headless-deposits). With no such source the
+  // placeholders can never resolve, so they are stripped (a stuck spinner drives a permanent rAF).
+  const fallbackOutputs = (s: Segment) => {
+    const outs = s.processedOutputs;
+    if (!outs?.some((o) => o.loading)) return outs;
+    const src = renderSources.find(
+      (r) => r.id !== s.id && outs.some((o) => o.loading && o.outputNodeId && r.nodeIds.has(o.outputNodeId)),
+    );
+    if (src) {
+      relinks.push({ toId: s.id, fromId: src.id });
+      return outs;
+    }
+    return outs.filter((o) => !o.loading);
+  };
+
   const merged: Track[] = snap.tracks.map((t) => {
     const lt = liveTrackById.get(t.id);
     return {
@@ -177,12 +218,11 @@ function applySnapshot(snap: Snapshot) {
         const seg = {
           ...s,
           loading: ls ? ls.loading : s.loading,
-          // Snapshot fallback (segment not live): STRIP lane-level loading placeholders. A redo of a split
-          // made mid-render would otherwise rehydrate a stuck spinner (the renderLink + reconciler that
-          // would finalize it are gone), driving a permanent 60fps rAF. A live segment keeps its current
-          // overlay (a genuine in-flight deposit). Non-loading lanes (a fully-rendered restored segment)
-          // are untouched, so undoing a delete still restores real lanes.
-          processedOutputs: ls ? ls.processedOutputs : s.processedOutputs?.filter((o) => !o.loading),
+          // Snapshot fallback (segment not live): loading placeholders either RE-LINK to a live render
+          // source (redone mid-render split half — see fallbackOutputs above) or are stripped. A live
+          // segment keeps its current overlay (a genuine in-flight deposit). Non-loading lanes (a
+          // fully-rendered restored segment) are untouched, so undoing a delete still restores real lanes.
+          processedOutputs: ls ? ls.processedOutputs : fallbackOutputs(s),
           workflow: ls ? ls.workflow : s.workflow,
         } as Segment;
         // Reconcile a restored LOADING placeholder against the decode cache: if its source is already
@@ -276,6 +316,10 @@ function applySnapshot(snap: Snapshot) {
         : useAppStore.getState().activeTrackId,
   });
   applying = false;
+
+  // Re-link redone mid-render split halves AFTER the tracks landed, so RenderLinkWatcher's effect
+  // (subscribed to renderLinks + tracks) sees the restored segment when it fires.
+  for (const l of relinks) useWorkflowStore.getState().linkRender(l.toId, l.fromId);
 
   lastSig = sig;
 
@@ -391,8 +435,14 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (past.length === 0) return;
     const before = past.pop()!;
     const cur = snapshotCurrent();
+    if (UNDO_DBG) {
+      const beforeSig = meaningfulSig(before.tracks, before.tempo, before.timeSignature);
+      const curSig = currentSig();
+      dbg(`undo pop depth=${past.length} delta=${describeDelta(before, cur)}${beforeSig === curSig ? " *** PHANTOM (popped sig == current sig — applying changes nothing) ***" : ""}`);
+    }
     future.push(cur);
     applySnapshot(before);
+    if (UNDO_DBG) dbg(`undo applied — sig ${currentSig() === meaningfulSig(cur.tracks, cur.tempo, cur.timeSignature) ? "UNCHANGED vs pre-undo (no visible revert!)" : "changed (reverted ok)"}`);
     syncFlags();
     announce(before, cur, "undo"); // the undone op transformed before→cur
   },
@@ -402,6 +452,10 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (future.length === 0) return;
     const after = future.pop()!;
     const cur = snapshotCurrent();
+    if (UNDO_DBG) {
+      const afterSig = meaningfulSig(after.tracks, after.tempo, after.timeSignature);
+      dbg(`redo pop depth=${future.length} delta=${describeDelta(cur, after)}${afterSig === currentSig() ? " *** PHANTOM ***" : ""}`);
+    }
     past.push(cur);
     applySnapshot(after);
     syncFlags();
@@ -426,6 +480,7 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (!before) return;
     const sig = currentSig();
     if (sig === txnSigBefore) return; // gesture made no real change (a click, or returned to start)
+    if (UNDO_DBG) dbg(`txn-commit depth=${past.length + 1} delta=${describeDelta(before, snapshotCurrent())}`);
     pushPast(before);
     future = [];
     lastSig = sig;
@@ -484,35 +539,44 @@ let scopedHandler: UndoScope | null = null;
 
 export function setUndoScope(h: UndoScope | null) {
   scopedHandler = h;
+  if (UNDO_DBG) dbg(`setUndoScope(${h ? "register" : "CLEAR"}) — workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"}`);
 }
 
-/** The editor stack, but only while the workflow pane is focused; else null → timeline acts. */
-function activeScope(): UndoScope | null {
-  return scopedHandler && useAppStore.getState().activePane === "workflow" ? scopedHandler : null;
+/** Is the WORKFLOW pane the ACTIVE undo surface? Requires the panel to actually be OPEN
+ *  (workflowSegmentId) — NOT just `activePane`, which can go stale at "workflow" after the editor
+ *  closed (observed: a phantom timeline undo fired from a "workflow"-marked pane whose editor was gone).
+ *  The panel-open truth (workflowSegmentId) gates it: no panel ⇒ the timeline owns Ctrl+Z. */
+function workflowUndoActive(): boolean {
+  const a = useAppStore.getState();
+  return a.workflowSegmentId != null && a.activePane === "workflow";
 }
 
 export function routeUndo() {
-  const h = activeScope();
-  if (h) h.undo();
+  const wf = workflowUndoActive();
+  if (UNDO_DBG) dbg(`routeUndo → ${wf ? (scopedHandler ? "WORKFLOW node stack" : "WORKFLOW (no scope → no-op)") : "timeline"} (activePane=${useAppStore.getState().activePane}, workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"})`);
+  // In the workflow pane, Ctrl+Z acts ONLY on the node stack (or no-ops if none) — it must NEVER revert
+  // the timeline arrangement (that was the phantom "回退·子轨道静音" from a stale-pane / gone-editor state).
+  if (wf) scopedHandler?.undo();
   else useHistoryStore.getState().undo();
 }
 
 export function routeRedo() {
-  const h = activeScope();
-  if (h) h.redo();
+  const wf = workflowUndoActive();
+  if (UNDO_DBG) dbg(`routeRedo → ${wf ? (scopedHandler ? "WORKFLOW node stack" : "WORKFLOW (no scope → no-op)") : "timeline"} (activePane=${useAppStore.getState().activePane}, workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"})`);
+  if (wf) scopedHandler?.redo();
   else useHistoryStore.getState().redo();
 }
 
-/** canUndo / canRedo for whichever stack Ctrl+Z would act on RIGHT NOW (focus-aware), so the Edit
- *  menu's enablement matches. */
+/** canUndo / canRedo for whichever stack Ctrl+Z would act on RIGHT NOW, so the Edit menu's enablement
+ *  matches. In the workflow pane with no scope yet, nothing is undoable (mirrors routeUndo's no-op). */
 export function routeCanUndo(): boolean {
-  const h = activeScope();
-  return h ? h.canUndo() : useHistoryStore.getState().canUndo;
+  if (workflowUndoActive()) return scopedHandler ? scopedHandler.canUndo() : false;
+  return useHistoryStore.getState().canUndo;
 }
 
 export function routeCanRedo(): boolean {
-  const h = activeScope();
-  return h ? h.canRedo() : useHistoryStore.getState().canRedo;
+  if (workflowUndoActive()) return scopedHandler ? scopedHandler.canRedo() : false;
+  return useHistoryStore.getState().canRedo;
 }
 
 /**
@@ -529,6 +593,11 @@ export function installHistory(): () => void {
     if (next.tracks === prev.tracks && next.tempo === prev.tempo && next.timeSignature === prev.timeSignature) return;
     const sig = meaningfulSig(next.tracks, next.tempo, next.timeSignature);
     if (sig === lastSig) return; // only overlay fields changed (expand / render / workflow / loading)
+    if (UNDO_DBG) {
+      const from: Snapshot = { tracks: prev.tracks, tempo: prev.tempo, timeSignature: prev.timeSignature, selection: currentSelection(), seq: 0 };
+      const to: Snapshot = { tracks: next.tracks, tempo: next.tempo, timeSignature: next.timeSignature, selection: currentSelection(), seq: 0 };
+      dbg(`capture depth=${past.length + 1} delta=${describeDelta(from, to)}`);
+    }
     pushPast({
       tracks: prev.tracks,
       tempo: prev.tempo,

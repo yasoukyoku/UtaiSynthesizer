@@ -2,7 +2,6 @@ import { create } from "zustand";
 import type { Track, Segment, LaneControl, ProcessedOutput, LaneClip } from "../types/project";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
-  flooredDurationTicks,
   laneGroupName,
   laneLabelParts,
   recordDetachLineage,
@@ -23,6 +22,10 @@ function cancelRunningRenders(segmentIds: string[]) {
     if (wf.executions[id]?.status === "running") wf.cancelExecution(id);
   }
 }
+
+/** Gesture base for the BPM edit session (beginTempoScale/endTempoScale): setTempo scales geometry
+ *  from THIS fixed snapshot so per-keystroke intermediate values can't accumulate rounding error. */
+let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | null = null;
 
 interface ProjectState {
   name: string;
@@ -49,6 +52,10 @@ interface ProjectState {
   /** Delete many segments at once (multi-selection) in one update. */
   deleteSegments: (items: { trackId: string; segmentId: string }[]) => void;
   setTempo: (bpm: number) => void;
+  /** Open/close a BPM edit session (the Toolbar input's focus/blur) — setTempo scales from the
+   *  session-start geometry so intermediate keystroke values can't compound rounding error. */
+  beginTempoScale: () => void;
+  endTempoScale: () => void;
   setPlayhead: (tick: number) => void;
   selectNotes: (ids: string[]) => void;
   toggleTrackExpanded: (trackId: string) => void;
@@ -272,23 +279,51 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   setTempo: (bpm) => {
-    set((s) => ({
+    // REAL-TIME-preserving rescale: audio clips keep their absolute positions AND lengths in SECONDS —
+    // startTick and durationTicks both scale by newBpm/baseTempo (end computed from the scaled edges so
+    // touching pieces stay touching). The old formula rescaled ONLY durations, and from the FULL source
+    // length (`totalDurationMs`) — correct back when every clip spanned its whole source, but a SPLIT
+    // piece was blown up to "the whole song" long: pieces overlapped, stacked audibly, and gap lengths
+    // changed. Note segments (MIDI) are musical — their ticks deliberately do NOT move with tempo.
+    // Scaled from a stable BASE captured at gesture start (beginTempoScale) so per-keystroke edits
+    // ("1" → "12" → "120") can't accumulate rounding damage; a call outside a gesture uses the current
+    // state as a one-shot base. Geometry is applied onto the CURRENT tracks (never the base objects) so
+    // concurrent overlay writes — a deposit landing mid-gesture — are not rolled back.
+    const base = tempoScaleBase ?? { tempo: get().tempo, tracks: get().tracks, playheadTick: get().playheadTick };
+    const k = bpm / base.tempo;
+    if (!Number.isFinite(k) || k <= 0) return;
+    const geo = new Map<string, { start: number; dur: number }>();
+    for (const t of base.tracks) {
+      for (const s of t.segments) {
+        if (s.content.type !== "audioClip") continue;
+        const start = Math.round(s.startTick * k);
+        const end = Math.round((s.startTick + s.durationTicks) * k);
+        geo.set(s.id, { start, dur: Math.max(1, end - start) });
+      }
+    }
+    set((st) => ({
       tempo: bpm,
       dirty: true,
-      tracks: s.tracks.map((t) => ({
+      // The playhead is second-anchored too, so the audible position survives a tempo change.
+      playheadTick: Math.max(0, Math.round(base.playheadTick * k)),
+      tracks: st.tracks.map((t) => ({
         ...t,
         segments: t.segments.map((seg) => {
-          if (seg.content.type === "audioClip") {
-            return { ...seg, durationTicks: flooredDurationTicks(seg.content.totalDurationMs, bpm) };
-          }
-          return seg;
+          const g = geo.get(seg.id);
+          return g ? { ...seg, startTick: g.start, durationTicks: g.dur } : seg;
         }),
       })),
     }));
-    // Tempo changes the tick↔seconds mapping AND every clip's real start/length — the already-scheduled
-    // Web Audio sources keep the old layout while the playhead advances at the new rate. Reschedule like
-    // every other timing edit (undoing a tempo change already did via applySnapshot's bump).
+    // Tempo changes the tick↔seconds mapping — the already-scheduled Web Audio sources keep the old
+    // layout while the playhead advances at the new rate. Reschedule like every other timing edit.
     if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
+  },
+
+  beginTempoScale: () => {
+    tempoScaleBase = { tempo: get().tempo, tracks: get().tracks, playheadTick: get().playheadTick };
+  },
+  endTempoScale: () => {
+    tempoScaleBase = null;
   },
   setPlayhead: (tick) => set({ playheadTick: tick }),
   selectNotes: (ids) => set({ selectedNotes: ids }),
@@ -316,11 +351,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       tracks: s.tracks.map((t) => {
         if (t.id !== trackId) return t;
         // Seed a missing group entry through THE read accessor (laneControlFor) so the first write
-        // inherits exactly what the fader displayed (incl. the legacy per-laneId fallback) instead
-        // of resetting the other field to its default.
-        const existing =
-          (legacyLaneId ? laneControlFor(t, groupId, legacyLaneId) : t.laneControls[groupId])
-          ?? { volumeDb: 0, pan: 0, muted: false };
+        // inherits exactly the VOLUME/PAN the fader displayed (incl. the legacy per-laneId fallback)
+        // instead of resetting the other field to its default. `muted` is deliberately forced FALSE:
+        // the group entry's muted is INERT (isLaneRowMuted reads laneMutes[rowKey] ?? the per-LANEID
+        // control, never the groupId one), so inheriting a legacy laneId's muted=true here would both
+        // be meaningless AND make a pure V/P drag flip a muted flag → describeDelta (which checks muted
+        // before volume) mislabels the step "回退·子轨道静音" for an edit that only moved a fader.
+        const base = legacyLaneId ? laneControlFor(t, groupId, legacyLaneId) : t.laneControls[groupId];
+        const existing = { volumeDb: base?.volumeDb ?? 0, pan: base?.pan ?? 0, muted: false };
         return {
           ...t,
           laneControls: { ...t.laneControls, [groupId]: { ...existing, ...updates } },

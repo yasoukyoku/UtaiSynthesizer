@@ -47,21 +47,41 @@ export function contentEndTick(tracks: Track[]): number {
   return end;
 }
 
+/** One storage-identity member of a (possibly merged) visual lane row. */
+export interface LaneMember {
+  /** `laneRowKey` — the STORAGE identity: laneMutes key, crossfade pairing, playback source matching. */
+  rowKey: string;
+  laneId: string;
+  /** The member's 组 id (`laneGroupId` = producing Output node) — its laneControls key. */
+  groupId: string;
+}
+
 export interface LaneInfo {
-  /** ROW identity = `laneRowKey` (轨道组 name + laneId). Keys the header rows, canvas row positioning,
-   *  and crossfade pairing. Including the NAME lets two split halves that share a laneId (a split copies
-   *  the graph, so node ids match) separate onto their own rows when one half's Output node is renamed —
-   *  instead of the first-seen label swallowing the sibling. NOT the mixer key (that's `laneId`). */
+  /** Primary member's `laneRowKey` (轨道组 name + laneId) — the stable VISUAL-row key (header list
+   *  keys, selection cues). Storage identities live in `members`; NOT the mixer key (that's laneId). */
   id: string;
   /** Display name; same-label rows are de-collided with a " 2"/" 3" suffix in first-seen order. */
   label: string;
   /** The row's 轨道组 name (laneRowKey's name part) — for group visuals / bracket rendering. */
   group: string;
-  /** The row's ProcessedOutput.laneId — used for the LEGACY mixer fallback + mute's legacy fallback. */
+  /** Primary member's ProcessedOutput.laneId — the LEGACY mixer/mute fallback key. */
   laneId: string;
-  /** The row's 组 id (`laneGroupId` = producing Output node) — the laneControls (volume/pan) key.
+  /** Primary member's 组 id — the mixer DISPLAY key (fan-out writes cover every member's 组).
    *  All rows of one 组 share the mix by design (解组 to control independently). */
   groupId: string;
+  /** ALL merged members (≥1). Rows merge PER LABEL: same 轨道组名 + same stem label + fully
+   *  segment-DISJOINT (no segment carries lanes of two members) — so a re-created Output node re-joins
+   *  the original rows, and a PARTIAL 组 (e.g. a piece keeping only "instr") folds onto the matching
+   *  row while the others stay with whichever pieces still have them (parity with how a same-组 edge
+   *  delete leaves remaining pieces' lanes in place). Same-segment lanes never merge (they'd overdraw),
+   *  which also keeps a 解组's new single-edge 组s on their own bars (independent control — the point
+   *  of 解组: they share segments / differ in label, so they can neither share a row nor a bar). Mute +
+   *  mixer writes FAN OUT over members; reads show the primary member (legacy divergent values converge
+   *  on the first touch). Crossfade pairing stays per-member rowKey (different 组s = hard cut). */
+  members: LaneMember[];
+  /** Bar-cluster key: 组s LINKED by sharing at least one merged row (union-find connected component,
+   *  within one 轨道组名) render under ONE group bar. getLaneLayout scans contiguous runs of THIS. */
+  runKey: string;
 }
 
 /** Per-track memo for getLanes: tracks are replaced immutably on every mutation, so the track object
@@ -83,26 +103,101 @@ function laneRunKey(l: Pick<LaneInfo, "groupId" | "group">): string {
 export function getLanes(track: Track): LaneInfo[] {
   const memo = lanesMemo.get(track);
   if (memo) return memo;
-  const seen = new Map<string, { label: string; group: string; laneId: string; groupId: string }>();
+  // 1) RAW rows: one per laneRowKey, first-seen order, plus which SEGMENTS carry each row (the merge
+  //    conflict test below is segment-membership, deliberately NOT time-overlap — overlap is a normal
+  //    arrangement state, so merged rows never re-split during a drag).
+  interface RawRow { rowKey: string; label: string; group: string; laneId: string; groupId: string; segIds: Set<string>; detached: boolean }
+  const seen = new Map<string, RawRow>();
   for (const seg of track.segments) {
     for (const out of seg.processedOutputs ?? []) {
       const key = laneRowKey(out);
-      if (!seen.has(key)) {
-        seen.set(key, { label: out.laneLabel, group: laneGroupName(out), laneId: out.laneId, groupId: laneGroupId(out) });
+      let r = seen.get(key);
+      if (!r) {
+        const gid = laneGroupId(out);
+        // 解组's independence marker lives on the Output NODE (params.detached — the graph is the truth
+        // source; split copies it, graph-undo of the detach removes it). A detached 组 is otherwise
+        // structurally identical to a re-created node, but must NEVER merge back onto the original
+        // rows still living on sibling pieces — that would re-couple the volume/pan 解组 just split.
+        const detached = seg.workflow?.nodes.some((n) => n.id === gid && n.params?.detached === true) ?? false;
+        r = { rowKey: key, label: out.laneLabel, group: laneGroupName(out), laneId: out.laneId, groupId: gid, segIds: new Set(), detached };
+        seen.set(key, r);
       }
+      r.segIds.add(seg.id);
     }
   }
-  const lanes = Array.from(seen, ([id, { label, group, laneId, groupId }]) => ({ id, label, group, laneId, groupId }));
-  // Cluster rows so every 组+名 run is CONTIGUOUS (one group bar / one bracket per run — P5). Rows
-  // arrive in per-segment deposit order, which can interleave groups across heterogeneous segments;
-  // a STABLE sort by first-seen run key keeps within-run row order. The header column and the canvas
-  // both consume THIS order, so their row geometry stays aligned by construction.
-  const runOrder = new Map<string, number>();
-  for (const l of lanes) {
-    const k = laneRunKey(l);
-    if (!runOrder.has(k)) runOrder.set(k, runOrder.size);
+  // 2) VISUAL rows: merge PER (轨道组名, stem-label) — greedy in first-seen order; a raw row joins the
+  //    first visual row of its bucket whose accumulated SEGMENTS are disjoint from its own (same-segment
+  //    lanes must stay separate rows or they'd overdraw). A PARTIAL 组 (a piece keeping only one stem)
+  //    thus folds onto the matching row while other rows stay with whichever pieces still carry them.
+  //    Time overlap is deliberately NOT a conflict — merged rows never re-split during a drag.
+  interface VisualRow { rows: RawRow[]; segIds: Set<string> }
+  const visual: VisualRow[] = [];
+  const byBucket = new Map<string, VisualRow[]>();
+  for (const r of seen.values()) {
+    // A DETACHED row always stands alone: it neither joins an existing visual row nor registers as a
+    // merge candidate for later rows (its bar stays its own — see the RawRow.detached note).
+    if (r.detached) {
+      visual.push({ rows: [r], segIds: new Set(r.segIds) });
+      continue;
+    }
+    const bucket = JSON.stringify([r.group, r.label]);
+    const cands = byBucket.get(bucket) ?? [];
+    let placed: VisualRow | undefined;
+    for (const v of cands) {
+      let ok = true;
+      for (const id of r.segIds) {
+        if (v.segIds.has(id)) { ok = false; break; }
+      }
+      if (ok) { placed = v; break; }
+    }
+    if (!placed) {
+      placed = { rows: [], segIds: new Set() };
+      cands.push(placed);
+      byBucket.set(bucket, cands);
+      visual.push(placed);
+    }
+    placed.rows.push(r);
+    for (const id of r.segIds) placed.segIds.add(id);
   }
-  lanes.sort((a, b) => runOrder.get(laneRunKey(a))! - runOrder.get(laneRunKey(b))!);
+  // 3) BAR clusters: 组-runs LINKED by sharing a visual row render under ONE bar (union-find connected
+  //    components — e.g. a full 组 and a partial re-created 组 sharing just the "instr" row). 解组
+  //    outputs can never link (same segments / distinct labels ⇒ no shared row), keeping their bars —
+  //    and thus their volume/pan — independent.
+  const parent = new Map<string, string>();
+  const find = (k: string): string => {
+    let root = k;
+    while (parent.has(root) && parent.get(root) !== root) root = parent.get(root)!;
+    parent.set(k, root);
+    return root;
+  };
+  for (const v of visual) {
+    const first = find(laneRunKey(v.rows[0]!));
+    for (const r of v.rows) {
+      const rk = find(laneRunKey(r));
+      if (rk !== first) parent.set(rk, first);
+    }
+  }
+  // 4) Emit: bar clusters in first-seen order, each cluster's visual rows in first-seen order (keeps a
+  //    bar's rows contiguous — getLaneLayout scans contiguous runKey). Primary member = first-seen.
+  const clusterOrder = new Map<string, number>();
+  const rooted = visual.map((v, idx) => {
+    const root = find(laneRunKey(v.rows[0]!));
+    if (!clusterOrder.has(root)) clusterOrder.set(root, clusterOrder.size);
+    return { v, idx, root };
+  });
+  rooted.sort((a, b) => clusterOrder.get(a.root)! - clusterOrder.get(b.root)! || a.idx - b.idx);
+  const lanes: LaneInfo[] = rooted.map(({ v, root }) => {
+    const p = v.rows[0]!;
+    return {
+      id: p.rowKey,
+      label: p.label,
+      group: p.group,
+      laneId: p.laneId,
+      groupId: p.groupId,
+      members: v.rows.map((r) => ({ rowKey: r.rowKey, laneId: r.laneId, groupId: r.groupId })),
+      runKey: root,
+    };
+  });
   // Display de-collision: number duplicate labels ("instr", "instr 2", …) in first-seen order.
   // Purely cosmetic — identity is `id`; numbers may shift when rows come/go (like file managers).
   // Generated names skip values that ALREADY exist as literal labels (a row the user named "… 2").
@@ -219,8 +314,11 @@ export function laneControlFor(track: Track, groupId: string, laneId: string): L
 export interface LaneGroupRun {
   /** Run identity (`laneRunKey`) — keys the header column's group blocks. */
   key: string;
-  /** The 组 id (`laneGroupId` = producing Output node) — the laneControls (volume/pan) key. */
+  /** Primary 组 id (`laneGroupId` = producing Output node) — the mixer DISPLAY key. */
   groupId: string;
+  /** EVERY member 组 under this bar (≥1; >1 when equivalent 组s merged — see LaneInfo.members).
+   *  The bar's volume/pan writes FAN OUT over these so all merged members stay in lockstep. */
+  groupIds: string[];
   /** The run's 轨道组 display name (shown once, on the bar). */
   name: string;
   /** First row's laneId — laneControlFor's legacy pre-S28 fallback key. */
@@ -245,6 +343,9 @@ export interface LaneLayout {
   /** Group-run index of each row (index-aligned with getLanes) — e.g. the lane-color key. */
   rowRun: number[];
   runs: LaneGroupRun[];
+  /** Visual row index for EVERY member `laneRowKey` (merged rows map all their members here) — THE
+   *  lookup for placing a ProcessedOutput on its row; never findIndex over getLanes by id. */
+  rowByKey: Map<string, number>;
   /** Unscaled total height of the expanded lanes area (all bars + rows, header excluded). */
   lanesHeight: number;
 }
@@ -258,24 +359,29 @@ export function getLaneLayout(track: Track): LaneLayout {
   const rowY: number[] = [];
   const rowRun: number[] = [];
   const runs: LaneGroupRun[] = [];
+  const rowByKey = new Map<string, number>();
   const nameColor = new Map<string, number>(); // 轨道组 name → first-seen color index
   let y = TRACK_HEADER_HEIGHT;
   for (let i = 0; i < lanes.length; i++) {
     const l = lanes[i]!;
-    const key = laneRunKey(l);
+    const key = l.runKey; // bar-cluster key (union-find component) — NOT laneRunKey (a bar can span 组s)
     let run = runs[runs.length - 1];
     if (!run || run.key !== key) {
       if (!nameColor.has(l.group)) nameColor.set(l.group, nameColor.size);
-      run = { key, groupId: l.groupId, name: l.group, laneId: l.laneId, start: i, count: 0, barY: y, colorIndex: nameColor.get(l.group)! };
+      run = { key, groupId: l.groupId, groupIds: [], name: l.group, laneId: l.laneId, start: i, count: 0, barY: y, colorIndex: nameColor.get(l.group)! };
       runs.push(run);
       y += LANE_GROUP_BAR_HEIGHT;
     }
     run.count++;
+    for (const m of l.members) {
+      rowByKey.set(m.rowKey, i);
+      if (!run.groupIds.includes(m.groupId)) run.groupIds.push(m.groupId);
+    }
     rowRun.push(runs.length - 1);
     rowY.push(y);
     y += LANE_HEIGHT;
   }
-  const layout: LaneLayout = { rowY, rowRun, runs, lanesHeight: y - TRACK_HEADER_HEIGHT };
+  const layout: LaneLayout = { rowY, rowRun, runs, rowByKey, lanesHeight: y - TRACK_HEADER_HEIGHT };
   laneLayoutMemo.set(track, layout);
   return layout;
 }

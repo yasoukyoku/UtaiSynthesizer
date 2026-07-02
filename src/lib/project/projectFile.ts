@@ -8,6 +8,7 @@ import { useHistoryStore } from "../../store/history";
 import { clearWaveformCache } from "../waveformCache";
 import { stopPlayback, clearBufferCache } from "../audio/playback";
 import { useWorkflowStore } from "../../store/workflow";
+import { clearNodeHistories } from "../workflow/nodeHistory";
 import { buildSaveBundle, parseLoadedBundle, type LoadedProject } from "./bundle";
 import { hasUnsavedWork, isRecoveryPending, markAutosaveBaseline } from "./autosave";
 
@@ -85,6 +86,8 @@ function teardownForLoad() {
   // workflowSegmentId (unmounts it) + resets activePane:'timeline'. Covers new/open/recover (all 3
   // route through here).
   useAppStore.getState().closeWorkflow();
+  // Per-segment node-graph undo stacks reference the OLD document's segments — no undo across a load.
+  clearNodeHistories();
 }
 
 export async function newProjectFile(): Promise<void> {

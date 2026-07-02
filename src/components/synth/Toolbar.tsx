@@ -301,9 +301,11 @@ export function Toolbar() {
           max={400}
           step={1}
           // BPM typing/spinning fires onChange repeatedly and rescales every clip each time — coalesce
-          // the whole edit-session into ONE undo step (focus → begin, blur/Enter → commit).
-          onFocus={() => useHistoryStore.getState().beginTransaction()}
-          onBlur={() => useHistoryStore.getState().commitTransaction()}
+          // the whole edit-session into ONE undo step (focus → begin, blur/Enter → commit), and anchor
+          // the rescale base (beginTempoScale) so intermediate keystrokes ("1"→"12"→"120") scale from
+          // the session-start geometry instead of compounding.
+          onFocus={() => { useHistoryStore.getState().beginTransaction(); useProjectStore.getState().beginTempoScale(); }}
+          onBlur={() => { useProjectStore.getState().endTempoScale(); useHistoryStore.getState().commitTransaction(); }}
           onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
           onChange={(e) => setTempo(Number(e.target.value))}
         />
