@@ -3,9 +3,12 @@
 THE single fp16 implementation (NO-DUP): imported by convert.py (--precision
 fp16/both) and invoked directly as a CLI by the Rust-side post-conversion
 command. Recipe numerically proven vs fp32 on all four separation
-architectures (45 dB gate): BSRoformer 53.5/59.2 dB, MelBandRoformer
-58.4/53.7 dB, MDX23C, and HTDemucs 6-stem (52.9-56.8 dB on the four
-non-quiet stems; needs the step-0 fp32 stats island below).
+architectures (45 dB gate): BSRoformer 65.8/70.2 dB, MelBandRoformer
+67.8/63.0 dB (S33 fused-attention exports — the com.microsoft RotaryEmbedding
+caches store cos/sin VALUES, fixing the old decomposed graphs' fp16
+large-angle rotary degradation, ~+9-12 dB), MDX23C 71.0/75.5 dB, and
+HTDemucs 6-stem (52.9-56.8 dB on the four non-quiet stems; needs the step-0
+fp32 stats island below).
 
 The recipe (all steps are required — ORT load hard-fails otherwise):
 0. htdemucs only: keep the input-normalization stats subgraph fp32 via

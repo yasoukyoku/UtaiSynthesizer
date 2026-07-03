@@ -4,6 +4,14 @@ Inference-only, no external deps (no einops/beartype/rotary_embedding_torch).
 STFT/iSTFT excluded — handled in Rust via rustfft.
 Module hierarchy matches the original exactly so load_state_dict works.
 
+Attention exports as ORT contrib ops (com.microsoft::RotaryEmbedding +
+com.microsoft::MultiHeadAttention) via autograd.Function symbolics — ORT's
+hand-written-QKV fuser never matched our decomposed graph (0 fused nodes),
+so attention materialized the full T*T score matrix per head. The contrib
+kernels use fused/memory-efficient attention on CUDA for both fp32 and fp16.
+The torch forward stays pure math, so architecture-equivalence checks vs the
+original MSST implementation still run on this same code path.
+
 Input:  stft_repr [B, F*S, T, 2]  (S=audio_channels, 2=real/imag)
 Output: mask      [B, N, F*S, T, 2]  (N=num_stems)
 """
@@ -28,31 +36,111 @@ class RMSNorm(nn.Module):
 
 
 # ─── Rotary Position Embedding ──────────────────────────────────
-# Matches rotary_embedding_torch: interleaved freq layout [f0,f0,f1,f1,...].
+# Matches rotary_embedding_torch: interleaved freq layout [f0,f0,f1,f1,...],
+# FULL-width rotation (dim=dim_head — the MSST lineage never uses the
+# lucidrains dim_head//2 partial rotation; ckpt freqs shape proves it).
+
+# cos/sin cache length. The ONNX time axis is dynamic; the kernel indexes the
+# cache by position, so any sequence up to this length works. Real sequences:
+# time transformer = chunk STFT frames (ep317 352800/441+1 = 801, melband
+# 485100/441+1 = 1101), freq transformer = num_bands (~60). chunk_size is a
+# model-JSON constant the UI cannot grow, so 8192 is far beyond reachable.
+MAX_ROPE_SEQ = 8192
+
+
+class _RotaryOnnxFn(torch.autograd.Function):
+    """RoPE on heads-major 3D [B, T, heads*dim_head].
+
+    forward = the exact rotate-pairs math of rotary_embedding_torch applied
+    per head; symbolic = com.microsoft::RotaryEmbedding with interleaved=1
+    (rotates pairs (x[2i], x[2i+1]) with freq i — verified 2.4e-7 vs the
+    torch math). position_ids is built in-graph from Shape(x) so the dynamic
+    time axis survives export (a traced arange would bake the dummy length).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, cos_cache: torch.Tensor,
+                sin_cache: torch.Tensor, heads: int) -> torch.Tensor:
+        B, T, D = x.shape
+        # [T, dim_head/2] -> [T, 1, dim_head]: duplicate per rotation pair
+        # ([f0,f0,f1,f1,...]), broadcast over the heads axis.
+        cos = cos_cache[:T].repeat_interleave(2, dim=-1).unsqueeze(1)
+        sin = sin_cache[:T].repeat_interleave(2, dim=-1).unsqueeze(1)
+        xh = x.view(B, T, heads, -1)
+        x_r = xh.unflatten(-1, (-1, 2))
+        x1, x2 = x_r.unbind(-1)
+        rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
+        return (xh * cos + rotated * sin).view(B, T, D)
+
+    @staticmethod
+    def symbolic(g, x, cos_cache, sin_cache, heads: int):
+        def const(vals, scalar=False):
+            t = torch.tensor(vals, dtype=torch.long)
+            return g.op("Constant", value_t=t if not scalar else t.squeeze())
+
+        shape = g.op("Shape", x)                      # [3] = (B, T, D)
+        batch = g.op("Gather", shape, const([0]), axis_i=0)   # [1]
+        seq = g.op("Gather", shape, const([1]), axis_i=0)     # [1]
+        seq_scalar = g.op("Squeeze", seq)
+        arange = g.op("Range", const(0, scalar=True), seq_scalar,
+                      const(1, scalar=True))          # [T]
+        arange2d = g.op("Unsqueeze", arange, const([0]))      # [1, T]
+        bs_shape = g.op("Concat", batch, seq, axis_i=0)       # [2] = (B, T)
+        pos = g.op("Expand", arange2d, bs_shape)              # [B, T]
+        return g.op("com.microsoft::RotaryEmbedding",
+                    x, pos, cos_cache, sin_cache,
+                    interleaved_i=1, num_heads_i=heads)
+
+
+class _MhaOnnxFn(torch.autograd.Function):
+    """Attention on heads-major 3D q/k/v [B, T, heads*dim_head].
+
+    forward = plain SDPA (default scale 1/sqrt(dim_head), matching the
+    original Attend); symbolic = com.microsoft::MultiHeadAttention, whose
+    default scale is the same and whose output layout is heads-major 3D.
+    """
+
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                heads: int) -> torch.Tensor:
+        B, T, D = q.shape
+
+        def to4(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, T, heads, -1).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(to4(q), to4(k), to4(v))
+        return out.transpose(1, 2).reshape(B, T, D)
+
+    @staticmethod
+    def symbolic(g, q, k, v, heads: int):
+        return g.op("com.microsoft::MultiHeadAttention", q, k, v,
+                    num_heads_i=heads)
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        t = torch.arange(MAX_ROPE_SEQ, dtype=inv_freq.dtype)
+        half_freqs = torch.outer(t, inv_freq)         # [MAX_ROPE_SEQ, dim/2]
+        self.register_buffer("cos_cache", half_freqs.cos(), persistent=False)
+        self.register_buffer("sin_cache", half_freqs.sin(), persistent=False)
 
-    def rotate_queries_or_keys(self, x: torch.Tensor) -> torch.Tensor:
-        T = x.shape[-2]
-        t = torch.arange(T, device=x.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        freqs = torch.stack([freqs, freqs], dim=-1).flatten(-2)
-
-        x_r = x.unflatten(-1, (-1, 2))
-        x1, x2 = x_r.unbind(-1)
-        rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
-
-        return x * freqs.cos() + rotated * freqs.sin()
+    def rotate_heads_3d(self, x: torch.Tensor, heads: int) -> torch.Tensor:
+        """Rotate q or k given as [B, T, heads*dim_head] (heads-major)."""
+        return _RotaryOnnxFn.apply(x, self.cos_cache, self.sin_cache, heads)
 
 
 # ─── Attention ──────────────────────────────────────────────────
 
 class Attend(nn.Module):
-    """Placeholder to match original module hierarchy (no learnable params)."""
+    """Placeholder to match original module hierarchy (no learnable params).
+
+    Not called by Attention.forward anymore — attention runs through
+    _MhaOnnxFn so it exports as com.microsoft::MultiHeadAttention. Kept so
+    the module tree (attend.attn_dropout) mirrors the original checkpoint
+    layout exactly.
+    """
     def __init__(self, flash: bool = True, dropout: float = 0.0):
         super().__init__()
         self.attn_dropout = nn.Dropout(dropout)
@@ -103,23 +191,25 @@ class Attention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Heads-major 3D layout throughout: [B, T, heads*dim_head]. The
+        # original's `(qkv h d)` packing makes chunk(3) yield exactly that,
+        # and MultiHeadAttention's output layout is the same — so RoPE,
+        # attention, and gating all compose without transposes.
         B, T, _ = x.shape
         x_norm = self.norm(x)
 
-        qkv = self.to_qkv(x_norm)
-        qkv = qkv.view(B, T, 3, self.heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self.to_qkv(x_norm).chunk(3, dim=-1)
 
         if self.rotary_embed is not None:
-            q = self.rotary_embed.rotate_queries_or_keys(q)
-            k = self.rotary_embed.rotate_queries_or_keys(k)
+            q = self.rotary_embed.rotate_heads_3d(q, self.heads)
+            k = self.rotary_embed.rotate_heads_3d(k, self.heads)
 
-        out = self.attend(q, k, v)
+        out = _MhaOnnxFn.apply(q, k, v, self.heads)
 
-        gates = self.to_gates(x_norm).permute(0, 2, 1).unsqueeze(-1)
-        out = out * gates.sigmoid()
-
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, T, -1)
+        # sigmoid(to_gates) scales each head: [B,T,H,1] against [B,T,H,dh]
+        # == the original's 'b n h -> b h n 1' gating on 'b h n d'.
+        gates = self.to_gates(x_norm).sigmoid().unsqueeze(-1)
+        out = (out.view(B, T, self.heads, -1) * gates).view(B, T, -1)
         return self.to_out(out)
 
 
@@ -422,6 +512,11 @@ def load_state_checked(model: nn.Module, state: dict) -> None:
     RotaryEmbedding computes them on the fly. Any missing key or any other
     unexpected key means the detected config diverged from the checkpoint,
     which would silently produce garbage output — hard-error instead.
+
+    The dropped freqs are VERIFIED against our recomputed inv_freq before
+    being discarded: a mismatch means the checkpoint used a non-default
+    rotary config (partial rotation dim_head//2, custom theta, ...) that our
+    full-width theta=10000 RoPE would silently mis-rotate. Refuse loudly.
     """
     missing, unexpected = model.load_state_dict(state, strict=False)
     bad_unexpected = [k for k in unexpected if not k.endswith(".rotary_embed.freqs")]
@@ -432,6 +527,26 @@ def load_state_checked(model: nn.Module, state: dict) -> None:
             f"  unexpected keys ({len(bad_unexpected)}): {bad_unexpected[:8]}"
             f"{' ...' if len(bad_unexpected) > 8 else ''}"
         )
+
+    dim_head = next(
+        m.to_qkv.out_features // (3 * m.heads)
+        for m in model.modules() if isinstance(m, Attention)
+    )
+    for key in unexpected:
+        if not key.endswith(".rotary_embed.freqs"):
+            continue
+        freqs = state[key].detach().float().flatten()
+        expected = 1.0 / (10000.0 ** (
+            torch.arange(0, dim_head, 2).float() / dim_head))
+        if freqs.numel() != expected.numel() or \
+                not torch.allclose(freqs, expected, rtol=1e-4, atol=0.0):
+            raise RuntimeError(
+                f"Checkpoint rotary freqs '{key}' (len {freqs.numel()}) do not "
+                f"match the default full-width theta=10000 RoPE for "
+                f"dim_head={dim_head} (expected len {expected.numel()}). This "
+                f"model was trained with a non-default rotary config; "
+                f"converting it with our RoPE would silently corrupt output."
+            )
 
 
 def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None) -> BSRoformer:

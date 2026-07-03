@@ -29,7 +29,11 @@ import torch
 
 from architectures.rvc_v2 import build_from_checkpoint as build_rvc_v2
 from architectures.sovits_v4 import build_from_checkpoint as build_sovits_v4
-from architectures.bs_roformer import load_from_checkpoint as load_bs_roformer, detect_config
+from architectures.bs_roformer import (
+    load_from_checkpoint as load_bs_roformer,
+    detect_config,
+    MAX_ROPE_SEQ,
+)
 from architectures.mel_band_roformer import (
     load_from_checkpoint as load_mel_band_roformer,
     detect_config as detect_mel_config,
@@ -190,12 +194,29 @@ def _write_model_json(output_path: Path, config_data: dict) -> Path:
     return config_path
 
 
-def _write_roformer_json(output_path: Path, model_type: str, config: dict,
-                         config_yaml, fallback_chunk: int, fallback_overlap: int):
-    """Shared bs_roformer/mel_band_roformer .json tail (ONE source of truth —
-    the melband copy had drifted and lost dynamic_batch)."""
+def _roformer_chunk_params(config: dict, config_yaml,
+                           fallback_chunk: int, fallback_overlap: int):
+    """Resolve chunk/overlap BEFORE the expensive export and hard-fail if the
+    chunk's STFT frame count exceeds the exported RoPE cos/sin cache
+    (MAX_ROPE_SEQ) — the model would export cleanly and then die at runtime
+    with a cryptic out-of-range read inside com.microsoft::RotaryEmbedding."""
     chunk_size, num_overlap = _inference_params_from_yaml(
         config_yaml, fallback_chunk, fallback_overlap)
+    hop = config.get("stft_hop_length", 441)
+    frames = chunk_size // hop + 1
+    if frames > MAX_ROPE_SEQ:
+        raise ValueError(
+            f"chunk_size {chunk_size} @ hop {hop} gives {frames} STFT frames, "
+            f"exceeding the exported rotary cache MAX_ROPE_SEQ={MAX_ROPE_SEQ} "
+            f"(architectures/bs_roformer.py). Raise MAX_ROPE_SEQ and re-export."
+        )
+    return chunk_size, num_overlap
+
+
+def _write_roformer_json(output_path: Path, model_type: str, config: dict,
+                         config_yaml, chunk_size: int, num_overlap: int):
+    """Shared bs_roformer/mel_band_roformer .json tail (ONE source of truth —
+    the melband copy had drifted and lost dynamic_batch)."""
     n_fft = config.get("stft_n_fft", 2048)
     num_stems = config.get("num_stems", 1)
     config_data = {
@@ -214,12 +235,14 @@ def _write_roformer_json(output_path: Path, model_type: str, config: dict,
     }
     config_data.update(stem_fields_from_yaml(load_msst_yaml(config_yaml), num_stems))
     config_path = _write_model_json(output_path, config_data)
-    return config_path, chunk_size, num_overlap
+    return config_path
 
 
 def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path = None):
     """Convert BSRoformer .ckpt model to ONNX."""
     config = detect_config(str(input_path))
+    # Fallback = viperx BSRoformer family (ep_317/ep_368 yamls both say 352800/4).
+    chunk_size, num_overlap = _roformer_chunk_params(config, config_yaml, 352800, 4)
     model = load_bs_roformer(str(input_path), config)
 
     stereo = config.get("stereo", False)
@@ -271,9 +294,8 @@ def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path =
     assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
-    # Fallback = viperx BSRoformer family (ep_317/ep_368 yamls both say 352800/4).
-    config_path, _, _ = _write_roformer_json(
-        output_path, "bs_roformer", config, config_yaml, 352800, 4)
+    config_path = _write_roformer_json(
+        output_path, "bs_roformer", config, config_yaml, chunk_size, num_overlap)
 
     print(f"Converted BSRoformer: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
@@ -286,6 +308,8 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     """Convert MelBandRoformer .ckpt model to ONNX."""
     yaml_str = str(config_yaml) if config_yaml else None
     config = detect_mel_config(str(input_path), yaml_str)
+    # Fallback = melband_roformer_inst_v2 yaml (485100/4); pass --config for other melband models.
+    chunk_size, num_overlap = _roformer_chunk_params(config, config_yaml, 485100, 4)
     model = load_mel_band_roformer(str(input_path), config=config, yaml_path=yaml_str)
 
     stereo = config.get("stereo", False)
@@ -337,9 +361,8 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
-    # Fallback = melband_roformer_inst_v2 yaml (485100/4); pass --config for other melband models.
-    config_path, _, _ = _write_roformer_json(
-        output_path, "mel_band_roformer", config, config_yaml, 485100, 4)
+    config_path = _write_roformer_json(
+        output_path, "mel_band_roformer", config, config_yaml, chunk_size, num_overlap)
 
     print(f"Converted MelBandRoformer: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")

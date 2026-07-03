@@ -70,11 +70,11 @@ export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
 
 export type MsstPrecision = "fp32" | "fp16";
 
-/** Per-architecture default inference precision. fp16 ≈ 2-5x faster + half VRAM/size, 53-59 dB vs
- *  fp32 (inaudible in practice) — VERIFIED for the two roformers only. MelBand defaults to fp16
- *  because it is the only usable mode on ≤12GB cards (inst_v2 fp32 saturates 12GB VRAM into WDDM
- *  paging, unusably slow). mdx23c/htdemucs fp16 is UNVERIFIED and the converter hard-refuses it,
- *  so they stay fp32 (and the UI must never offer fp16 for them — gate on MSST_FP16_ARCHS). */
+/** Per-architecture default inference precision. fp16 ≈ 2x faster + half VRAM/size, 63-70 dB vs
+ *  fp32 (inaudible in practice; fused-attention exports, S33 re-gate). MelBand keeps fp16 as the
+ *  default for speed — since the S33 attention fusion its fp32 also FITS 12GB cards (~6.3GB peak;
+ *  pre-fusion exports saturated 12GB into WDDM paging, so old installs need a re-download/补转 to
+ *  get the fused graph). mdx23c/htdemucs stay fp32 by default (conv archs, smaller fp16 gain). */
 export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
   bs_roformer: "fp32",
   mel_band_roformer: "fp16",
@@ -82,8 +82,10 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
   htdemucs: "fp32",
 };
 
-/** Archs the converter can produce fp16 for (SNR-gated per arch on CUDA: bs 53.5/59.2 dB,
- *  melband 58.4/53.7 dB, mdx23c 71.0/75.5 dB, htdemucs 52.9-56.8 dB non-quiet stems vs fp32).
+/** Archs the converter can produce fp16 for (SNR-gated per arch on CUDA: bs 65.8/70.2 dB,
+ *  melband 67.8/63.0 dB — S33 fused-attention exports, ~+9-12 dB over the old decomposed graphs
+ *  whose fp16 computed rotary angles in fp16; mdx23c 71.0/75.5 dB, htdemucs 52.9-56.8 dB
+ *  non-quiet stems vs fp32).
  *  ONE source of truth for every fp16 choice in the UI (download precision, 补转 actions).
  *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. Gate rule: fp16 verification MUST run
  *  on the CUDA EP — the CPU EP emulates fp16 in fp32 and false-passes (htdemucs NaN case). */
@@ -92,9 +94,9 @@ export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_rofor
 /** fp16 tradeoff copy shared by the model manager (download / 补转 tooltips) and the separation
  *  node's precision row — measured facts, keep in ONE place. */
 export const MSST_FP16_TIP: I18nText = {
-  zh: "fp16：速度约 2-5 倍、显存与体积减半；与 fp32 相比 53-59 dB（听感无差异）。MelBand 伴奏 V2 在 12GB 显卡上仅 fp16 可用",
-  en: "fp16 — about 2-5x faster at half the VRAM/size; 53-59 dB vs fp32 (inaudible). MelBand Inst V2 needs fp16 on 12GB cards",
-  ja: "fp16 — 約2-5倍高速、VRAM/サイズ半減。fp32 比 53-59 dB（聴感上の差なし）。MelBand 伴奏 V2 は 12GB では fp16 のみ実用的",
+  zh: "fp16：速度约 2 倍、显存与体积减半；与 fp32 相比 63-70 dB（听感无差异）",
+  en: "fp16 — about 2x faster at half the VRAM/size; 63-70 dB vs fp32 (inaudible)",
+  ja: "fp16 — 約2倍高速、VRAM/サイズ半減。fp32 比 63-70 dB（聴感上の差なし）",
 };
 
 export const ALL_CATEGORIES: MsstCategory[] = [
