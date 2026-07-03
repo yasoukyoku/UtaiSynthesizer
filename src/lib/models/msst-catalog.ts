@@ -65,6 +65,32 @@ export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
   htdemucs: 4,
 };
 
+export type MsstPrecision = "fp32" | "fp16";
+
+/** Per-architecture default inference precision. fp16 ≈ 2-5x faster + half VRAM/size, 53-59 dB vs
+ *  fp32 (inaudible in practice) — VERIFIED for the two roformers only. MelBand defaults to fp16
+ *  because it is the only usable mode on ≤12GB cards (inst_v2 fp32 saturates 12GB VRAM into WDDM
+ *  paging, unusably slow). mdx23c/htdemucs fp16 is UNVERIFIED and the converter hard-refuses it,
+ *  so they stay fp32 (and the UI must never offer fp16 for them — gate on MSST_FP16_ARCHS). */
+export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
+  bs_roformer: "fp32",
+  mel_band_roformer: "fp16",
+  mdx23c: "fp32",
+  htdemucs: "fp32",
+};
+
+/** Archs the converter can produce fp16 for (the two verified roformers). ONE source of truth for
+ *  every fp16 choice in the UI (download precision, 补转 actions). */
+export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer"]);
+
+/** fp16 tradeoff copy shared by the model manager (download / 补转 tooltips) and the separation
+ *  node's precision row — measured facts, keep in ONE place. */
+export const MSST_FP16_TIP: I18nText = {
+  zh: "fp16：速度约 2-5 倍、显存与体积减半；与 fp32 相比 53-59 dB（听感无差异）。MelBand 伴奏 V2 在 12GB 显卡上仅 fp16 可用",
+  en: "fp16 — about 2-5x faster at half the VRAM/size; 53-59 dB vs fp32 (inaudible). MelBand Inst V2 needs fp16 on 12GB cards",
+  ja: "fp16 — 約2-5倍高速、VRAM/サイズ半減。fp32 比 53-59 dB（聴感上の差なし）。MelBand 伴奏 V2 は 12GB では fp16 のみ実用的",
+};
+
 export const ALL_CATEGORIES: MsstCategory[] = [
   "vocals", "instrumental", "denoise", "dereverb", "karaoke", "multistem", "special",
 ];

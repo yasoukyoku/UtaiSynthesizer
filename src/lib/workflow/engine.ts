@@ -8,6 +8,7 @@ import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
+import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 
 interface AudioFileInfo {
   duration_ms: number;
@@ -294,6 +295,16 @@ async function executeNode(
     }
 
     case "msstSeparation": {
+      // Effective inference precision: the node's explicit choice, else the ARCH default
+      // (melband = fp16 — inst_v2 fp32 saturates 12GB VRAM). Always SEND the effective value;
+      // Rust degrades gracefully (missing .fp16.onnx → fp32 with a warning, and vice versa).
+      // Arch comes from the catalog entry for the node's model file, falling back to the
+      // installed list's detected architecture (covers locally imported models).
+      const modelFile = (params.modelFile as string) ?? "";
+      const arch =
+        MSST_CATALOG.find((e) => e.filename === modelFile)?.architecture ??
+        (useMsstModelStore.getState().installed.find((m) => m.filename === modelFile)
+          ?.architecture as MsstArchitecture | undefined);
       const config = {
         audioPath: primaryInput,
         modelPath: (params.modelPath as string) ?? (params.modelName as string) ?? "",
@@ -310,6 +321,9 @@ async function executeNode(
         // every model to it and silently coarsen mdx23c/htdemucs (whose real default is 4).
         ...(params.numOverlap !== undefined ? { numOverlap: params.numOverlap as number } : {}),
         ...(params.batch !== undefined ? { batch: params.batch as number } : {}),
+        precision: (params.precision as string | undefined)
+          ?? (arch !== undefined ? MSST_DEFAULT_PRECISION[arch] : undefined)
+          ?? "fp32", // arch "unknown"/unresolvable → fp32 (Rust auto-uses fp16 if it's the only file)
       };
       await invoke("run_msst_separation", { config });
       let status = await invoke<{ state: string | Record<string, string>; stems?: { label: string; path: string }[]; progress?: number }>("get_separation_status");

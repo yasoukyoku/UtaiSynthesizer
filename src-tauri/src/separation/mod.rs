@@ -57,10 +57,23 @@ pub struct SeparationConfig {
     /// Inference batch size (UI). None → single-chunk. Effective only on dynamic-batch models.
     #[serde(default)]
     pub batch: Option<usize>,
+    /// Inference precision: "fp16" selects the `<stem>.fp16.onnx` sibling when it exists
+    /// (falls back to fp32 with a warning otherwise). None/"fp32" → the fp32 model.
+    /// fp16 halves VRAM+size and is ~2x faster; verified 53-59 dB vs fp32 for both roformers —
+    /// and REQUIRED for MelBand inst_v2 on 12GB cards (fp32 saturates VRAM into WDDM paging).
+    #[serde(default)]
+    pub precision: Option<String>,
 }
 
 fn default_device() -> String {
     "cpu".to_string()
+}
+
+/// `x.onnx` → `x.fp16.onnx` (same dir). The fp16 variant shares the fp32 model's `.json`
+/// (see `pipeline::model_config_path`) so the two precisions can never drift apart.
+pub fn fp16_sibling(p: &Path) -> PathBuf {
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    p.with_file_name(format!("{stem}.fp16.onnx"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,9 +125,29 @@ impl SeparationManager {
             ));
         }
 
-        let model_path = PathBuf::from(&config.model_path);
+        let mut model_path = PathBuf::from(&config.model_path);
+        if config.precision.as_deref() == Some("fp16") {
+            let fp16 = fp16_sibling(&model_path);
+            if fp16.exists() {
+                tracing::info!("Using fp16 model variant: {}", fp16.display());
+                model_path = fp16;
+            } else {
+                tracing::warn!(
+                    "fp16 precision requested but {} not found — falling back to fp32",
+                    fp16.display()
+                );
+            }
+        } else if !model_path.exists() {
+            // Download-time precision choice may have installed ONLY the fp16 variant — the
+            // frontend always addresses models by their fp32 path.
+            let fp16 = fp16_sibling(&model_path);
+            if fp16.exists() {
+                tracing::info!("fp32 model absent, using installed fp16 variant: {}", fp16.display());
+                model_path = fp16;
+            }
+        }
         let has_onnx_config = model_path.extension().map_or(false, |ext| ext == "onnx")
-            && model_path.with_extension("json").exists();
+            && pipeline::model_config_path(&model_path).exists();
 
         if has_onnx_config {
             self.start_native(&mut active, config, engine, &model_path)

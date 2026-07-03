@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ndarray::Array3;
 use rayon::prelude::*;
@@ -88,9 +88,24 @@ pub struct NativePipeline {
 unsafe impl Send for NativePipeline {}
 unsafe impl Sync for NativePipeline {}
 
+/// Config JSON for a model file. fp16 variants (`<stem>.fp16.onnx`) share the fp32 model's
+/// `<stem>.json` — ONE json per model so the two precisions can never drift apart.
+pub fn model_config_path(model_path: &Path) -> PathBuf {
+    let direct = model_path.with_extension("json"); // x.onnx → x.json; x.fp16.onnx → x.fp16.json
+    if direct.exists() {
+        return direct;
+    }
+    if let Some(name) = model_path.file_name().and_then(|n| n.to_str()) {
+        if let Some(base) = name.strip_suffix(".fp16.onnx") {
+            return model_path.with_file_name(format!("{base}.json"));
+        }
+    }
+    direct
+}
+
 impl NativePipeline {
     pub fn new(engine: &OnnxEngine, model_path: &Path) -> Result<Self> {
-        let config_path = model_path.with_extension("json");
+        let config_path = model_config_path(model_path);
         if !config_path.exists() {
             return Err(UtaiError::Audio(format!(
                 "Model config not found: {}", config_path.display()

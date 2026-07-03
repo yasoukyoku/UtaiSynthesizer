@@ -11,7 +11,11 @@ pub struct MsstModelFile {
     pub filename: String,
     pub size: u64,
     pub architecture: String,
+    /// The fp32 ONNX exists (usable natively).
     pub has_onnx: bool,
+    /// The `<stem>.fp16.onnx` variant exists. Either precision alone is runnable — the node's
+    /// precision selector only appears when BOTH do.
+    pub has_fp16: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,20 +51,23 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
         }
 
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // fp16 variants are surfaced as `has_fp16` on their base entry, not as standalone rows.
+        if filename.ends_with(".fp16.onnx") {
+            continue;
+        }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let architecture = detect_architecture_from_name(&filename);
 
-        let has_onnx = if ext == "onnx" {
-            true
-        } else {
-            path.with_extension("onnx").exists()
-        };
+        let fp32_onnx = path.with_extension("onnx");
+        let has_onnx = if ext == "onnx" { true } else { fp32_onnx.exists() };
+        let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
 
         models.push(MsstModelFile {
             filename,
             size,
             architecture,
             has_onnx,
+            has_fp16,
         });
     }
 
@@ -74,6 +81,9 @@ pub async fn download_msst_model(
     state: State<'_, Arc<AppState>>,
     url: String,
     filename: String,
+    // Download-time precision choice ("fp32" | "fp16", None = fp32). fp16 exports through an
+    // fp32 intermediate then deletes it — the other precision can be back-converted later.
+    precision: Option<String>,
 ) -> Result<String, String> {
     let dir = state.msst_models_dir.clone();
     let app_dir = state.app_dir.clone();
@@ -168,7 +178,7 @@ pub async fn download_msst_model(
             },
         );
 
-        match run_converter(&dest, &arch, &app_dir).await {
+        match run_converter(&dest, &arch, &app_dir, precision.as_deref()).await {
             Ok(onnx_path) => {
                 tracing::info!("Converted {} -> {}", filename, onnx_path);
             }
@@ -185,6 +195,10 @@ pub async fn download_msst_model(
 pub async fn convert_msst_model(
     state: State<'_, Arc<AppState>>,
     filename: String,
+    // Target precision ("fp32" | "fp16", None = fp32). 补转 fast path: when fp16 is requested
+    // and the fp32 ONNX already exists, only the cheap post-hoc fp16 conversion runs (no
+    // torch re-export). fp32 (or fp16 without an fp32 on disk) does the full ckpt export.
+    precision: Option<String>,
 ) -> Result<String, String> {
     let _task = state.begin_task("convert"); // listed in the close-flow's in-progress warning
     let dir = &state.msst_models_dir;
@@ -193,12 +207,21 @@ pub async fn convert_msst_model(
         return Err(format!("Model file not found: {}", filename));
     }
 
+    if precision.as_deref() == Some("fp16") {
+        let fp32_onnx = path.with_extension("onnx");
+        if fp32_onnx.exists() {
+            return run_fp16_converter(&fp32_onnx, &state.app_dir)
+                .await
+                .map_err(|e| format!("fp16 conversion failed: {}", e));
+        }
+    }
+
     let arch = detect_architecture_from_name(&filename);
     if arch == "unknown" {
         return Err("Cannot detect architecture from filename".into());
     }
 
-    let onnx_path = run_converter(&path, &arch, &state.app_dir)
+    let onnx_path = run_converter(&path, &arch, &state.app_dir, precision.as_deref())
         .await
         .map_err(|e| format!("Conversion failed: {}", e))?;
 
@@ -261,7 +284,9 @@ pub fn import_local_msst_model(
 
     let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
     let architecture = detect_architecture_from_name(&filename);
-    let has_onnx = dest.with_extension("onnx").exists();
+    let fp32_onnx = dest.with_extension("onnx");
+    let has_onnx = fp32_onnx.exists();
+    let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
 
     tracing::info!("Imported MSST model: {}", filename);
     Ok(MsstModelFile {
@@ -269,12 +294,18 @@ pub fn import_local_msst_model(
         size,
         architecture,
         has_onnx,
+        has_fp16,
     })
 }
 
 // ─── Converter ───────────────────────────────────────────────
 
-async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<String, String> {
+async fn run_converter(
+    model_path: &Path,
+    arch: &str,
+    app_dir: &Path,
+    precision: Option<&str>,
+) -> Result<String, String> {
     let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
     let script = app_dir.join("converter").join("convert.py");
 
@@ -289,6 +320,10 @@ async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<
         .arg("--input").arg(model_path)
         .arg("--output").arg(&onnx_path)
         .arg("--type").arg(arch);
+
+    if let Some(p) = precision {
+        cmd.arg("--precision").arg(p);
+    }
 
     // Pass the model's ORIGINAL yaml whenever it sits next to the ckpt (the frontend downloads
     // the catalog's configUrl there). Roformers take chunk_size/num_overlap from it; melband/
@@ -318,6 +353,37 @@ async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<
     }
 
     Ok(onnx_path.to_string_lossy().to_string())
+}
+
+/// 补转 fast path: post-hoc fp16 conversion of an existing fp32 ONNX (converter/onnx_fp16.py,
+/// the proven convert_float_to_float16 + Cast-retarget recipe). Writes `<stem>.fp16.onnx`
+/// next to the input; the shared `<stem>.json` is untouched. Takes ~1-2 min, no torch export.
+async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, String> {
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let script = app_dir.join("converter").join("onnx_fp16.py");
+    if !script.exists() {
+        return Err(format!("fp16 converter script not found: {}", script.display()));
+    }
+
+    let out_path = crate::separation::fp16_sibling(fp32_onnx);
+    tracing::info!("Converting to fp16: {} -> {}", fp32_onnx.display(), out_path.display());
+
+    let output = tokio::process::Command::new(&python)
+        .arg(&script)
+        .arg(fp32_onnx)
+        .arg(&out_path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run fp16 converter ({}): {}", python.display(), e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(stderr.trim().to_string());
+    }
+    if !out_path.exists() {
+        return Err("fp16 converter finished but output file not found".into());
+    }
+    Ok(out_path.to_string_lossy().to_string())
 }
 
 // find_converter_python moved to crate::util::find_python (shared with models/convert.rs).

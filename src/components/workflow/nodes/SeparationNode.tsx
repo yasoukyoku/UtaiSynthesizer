@@ -10,6 +10,8 @@ import {
   CATEGORY_LABELS,
   CATEGORY_COLORS,
   MSST_DEFAULT_NUM_OVERLAP,
+  MSST_DEFAULT_PRECISION,
+  MSST_FP16_TIP,
   t18,
 } from "../../../lib/models/msst-catalog";
 import { useTranslation } from "react-i18next";
@@ -40,6 +42,10 @@ export function SeparationNode(props: NodeProps) {
   const currentModel = models.find((m) => m.filename === selectedModel) ?? models[0];
   const stems = currentModel?.stems ?? ["Output"];
   const arch = currentModel?.arch ?? "bs_roformer";
+  // Precision is choosable only when BOTH onnx variants are on disk — otherwise Rust already
+  // runs the only one that exists (with graceful fallback), so a selector would be a lie.
+  const installedModel = installed.find((m) => m.filename === currentModel?.filename);
+  const hasBothPrecisions = !!installedModel?.has_onnx && !!installedModel?.has_fp16;
 
   useEffect(() => {
     if (!modelsDir) return;
@@ -93,7 +99,7 @@ export function SeparationNode(props: NodeProps) {
               ))}
             </select>
 
-            <SepParams arch={arch} params={params} onChange={updateParams} lang={lang} />
+            <SepParams arch={arch} params={params} onChange={updateParams} lang={lang} showPrecision={hasBothPrecisions} />
           </>
         )}
       </div>
@@ -101,11 +107,12 @@ export function SeparationNode(props: NodeProps) {
   );
 }
 
-function SepParams({ arch, params, onChange, lang }: {
+function SepParams({ arch, params, onChange, lang, showPrecision }: {
   arch: MsstArchitecture;
   params: Record<string, unknown>;
   onChange: (u: Record<string, unknown>) => void;
   lang: string;
+  showPrecision: boolean;
 }) {
   const numOverlap = (params.numOverlap as number) ?? MSST_DEFAULT_NUM_OVERLAP[arch] ?? 2;
   const normalize = (params.normalize as boolean) ?? false;
@@ -129,6 +136,21 @@ function SepParams({ arch, params, onChange, lang }: {
           <span className="sep-overlap-val">{numOverlap}</span>
         </span>
       </div>
+
+      {showPrecision && (
+        <div className="sep-param-row">
+          <label title={t18(MSST_FP16_TIP, lang)}>
+            {t18({ zh: "推理精度", en: "Precision", ja: "推論精度" }, lang)}
+          </label>
+          <select
+            value={(params.precision as string) ?? MSST_DEFAULT_PRECISION[arch]}
+            onChange={(e) => onChange({ precision: e.target.value })}
+          >
+            <option value="fp32">fp32</option>
+            <option value="fp16">fp16</option>
+          </select>
+        </div>
+      )}
 
       {isSpectral && (
         <div className="sep-param-row">

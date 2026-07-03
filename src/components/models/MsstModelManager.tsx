@@ -8,9 +8,14 @@ import {
   ALL_CATEGORIES,
   CATEGORY_LABELS,
   ARCHITECTURE_LABELS,
+  MSST_DEFAULT_PRECISION,
+  MSST_FP16_ARCHS,
+  MSST_FP16_TIP,
   t18,
+  type MsstArchitecture,
   type MsstCatalogEntry,
   type MsstCategory,
+  type MsstPrecision,
   type MirrorSource,
 } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
@@ -35,7 +40,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const {
     installed, downloading, error, mirror,
     fetchInstalled, fetchModelsDir, modelsDir,
-    clearError, deleteModel, setMirror, downloadEntry,
+    clearError, deleteModel, setMirror, downloadEntry, convertPrecision,
   } = useMsstModelStore();
 
   const { pos, startDrag } = useDraggable(() => ({ x: 100, y: 96 }));
@@ -43,7 +48,8 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const [topTab, setTopTab] = useState<TopTab>("separation");
   const [category, setCategory] = useState<MsstCategory>("vocals");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [converting, setConverting] = useState<Set<string>>(new Set());
+  // Download-time precision choice per catalog entry (roformers only); absent = arch default.
+  const [dlPrecision, setDlPrecision] = useState<Record<string, MsstPrecision>>({});
   const [showMirrorConfig, setShowMirrorConfig] = useState(false);
 
   useEffect(() => {
@@ -55,7 +61,13 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const installedFilenames = new Set(installed.map((m) => m.filename));
   const filtered = MSST_CATALOG.filter((m) => m.category === category);
 
-  const handleDownload = useCallback(async (entry: MsstCatalogEntry) => { await downloadEntry(entry); }, [downloadEntry]);
+  const handleDownload = useCallback(async (entry: MsstCatalogEntry) => {
+    // Only the fp16-verified roformers get a precision choice; other archs download as before.
+    const precision = MSST_FP16_ARCHS.has(entry.architecture)
+      ? (dlPrecision[entry.id] ?? MSST_DEFAULT_PRECISION[entry.architecture])
+      : undefined;
+    await downloadEntry(entry, precision);
+  }, [downloadEntry, dlPrecision]);
 
   const handleMsstImport = useCallback(async () => {
     const path = await open({
@@ -66,15 +78,6 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   }, [lang]);
 
   const handleDelete = useCallback(async (filename: string) => { await deleteModel(filename); setConfirmDelete(null); }, [deleteModel]);
-
-  const handleConvert = useCallback(async (filename: string) => {
-    setConverting((s) => new Set(s).add(filename));
-    try {
-      await invoke("convert_msst_model", { filename });
-      await fetchInstalled();
-    } catch (e) { useMsstModelStore.setState({ error: String(e) }); }
-    setConverting((s) => { const n = new Set(s); n.delete(filename); return n; });
-  }, [fetchInstalled]);
 
   const mirrorLabel = mirror.type === "hf-mirror" ? "HF Mirror" : mirror.type === "custom" ? "Custom" : "HuggingFace";
 
@@ -127,6 +130,8 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
               const isInstalled = installedFilenames.has(entry.filename);
               const dl = downloading[entry.filename];
               const isDownloading = !!dl;
+              const fp16Capable = MSST_FP16_ARCHS.has(entry.architecture);
+              const chosenPrecision = dlPrecision[entry.id] ?? MSST_DEFAULT_PRECISION[entry.architecture];
               return (
                 <div key={entry.id} className={`msst-model-card-wrap ${isInstalled ? "installed" : ""}`}>
                   {!isInstalled && !isDownloading && (
@@ -150,6 +155,24 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                       {entry.sdrScore && <span className="model-card-sdr">SDR {entry.sdrScore}</span>}
                       <span className="model-card-size">{formatSize(entry.fileSize)}</span>
                     </div>
+                    {!isInstalled && !isDownloading && fp16Capable && (
+                      <div className="model-card-precision">
+                        <span className="model-precision-label">
+                          {t18({ zh: "下载精度", en: "Precision", ja: "精度" }, lang)}
+                        </span>
+                        <div className="model-precision-seg" title={t18(MSST_FP16_TIP, lang)}>
+                          {(["fp32", "fp16"] as const).map((p) => (
+                            <button
+                              key={p}
+                              className={chosenPrecision === p ? "active" : ""}
+                              onClick={() => setDlPrecision((s) => ({ ...s, [entry.id]: p }))}
+                            >
+                              {p}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     {isDownloading && <DownloadBar dl={dl} lang={lang} />}
                     {isInstalled && (
                       <div className="model-card-actions">
@@ -180,17 +203,41 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
               <p className="msst-empty">{lang === "zh" ? "暂无模型" : "No models installed"}</p>
             ) : (
               <div className="msst-installed-list">
-                {installed.map((m) => (
-                  <div key={m.filename} className="msst-installed-item">
-                    <span className="msst-installed-name" title={m.filename}>{m.filename}</span>
-                    <span className="msst-installed-meta">
-                      {m.has_onnx ? <span className="msst-onnx-ok">ONNX</span> : converting.has(m.filename) ? <span className="msst-converting">...</span> : (
-                        <button className="msst-convert-btn" onClick={() => handleConvert(m.filename)}>Convert</button>
-                      )}
-                      {" "}{formatSize(m.size)}
-                    </span>
-                  </div>
-                ))}
+                {installed.map((m) => {
+                  const isConverting = downloading[m.filename]?.stage === "converting";
+                  const fp16Capable = MSST_FP16_ARCHS.has(m.architecture as MsstArchitecture);
+                  return (
+                    <div key={m.filename} className="msst-installed-item">
+                      <span className="msst-installed-name" title={m.filename}>{m.filename}</span>
+                      <span className="msst-installed-meta">
+                        {m.has_onnx && <span className="msst-onnx-ok">fp32</span>}
+                        {m.has_fp16 && <span className="msst-onnx-ok">fp16</span>}
+                        {isConverting ? (
+                          <span className="msst-converting">...</span>
+                        ) : !m.has_onnx && !m.has_fp16 ? (
+                          <button className="msst-convert-btn" onClick={() => convertPrecision(m.filename)}>Convert</button>
+                        ) : fp16Capable && !m.has_fp16 ? (
+                          <button
+                            className="msst-convert-btn"
+                            title={t18(MSST_FP16_TIP, lang)}
+                            onClick={() => convertPrecision(m.filename, "fp16")}
+                          >
+                            {t18({ zh: "补转 fp16", en: "Convert to fp16", ja: "fp16に変換" }, lang)}
+                          </button>
+                        ) : fp16Capable && !m.has_onnx ? (
+                          <button
+                            className="msst-convert-btn"
+                            title={t18({ zh: "从 ckpt 完整导出 fp32（较慢）", en: "Full fp32 export from the ckpt (slower)", ja: "ckpt から fp32 を完全エクスポート（時間がかかります）" }, lang)}
+                            onClick={() => convertPrecision(m.filename, "fp32")}
+                          >
+                            {t18({ zh: "补转 fp32", en: "Convert to fp32", ja: "fp32に変換" }, lang)}
+                          </button>
+                        ) : null}
+                        {" "}{formatSize(m.size)}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

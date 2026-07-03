@@ -1,14 +1,17 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type MsstCatalogEntry } from "../lib/models/msst-catalog";
+import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type MsstCatalogEntry, type MsstPrecision } from "../lib/models/msst-catalog";
 import { loadSetting, saveSetting } from "../lib/settings";
 
 export interface InstalledModel {
   filename: string;
   size: number;
   architecture: string;
+  /** fp32 `<stem>.onnx` exists. */
   has_onnx: boolean;
+  /** fp16 `<stem>.fp16.onnx` sibling exists (never listed as its own row). */
+  has_fp16: boolean;
 }
 
 interface DownloadState {
@@ -27,8 +30,9 @@ interface MsstModelStore {
 
   fetchInstalled: () => Promise<void>;
   fetchModelsDir: () => Promise<void>;
-  downloadEntry: (entry: MsstCatalogEntry) => Promise<void>;
-  downloadUrl: (url: string, filename: string) => Promise<void>;
+  downloadEntry: (entry: MsstCatalogEntry, precision?: MsstPrecision) => Promise<void>;
+  downloadUrl: (url: string, filename: string, precision?: MsstPrecision) => Promise<void>;
+  convertPrecision: (filename: string, precision?: MsstPrecision) => Promise<void>;
   deleteModel: (filename: string) => Promise<void>;
   importLocal: (path: string) => Promise<void>;
   clearError: () => void;
@@ -62,7 +66,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
     }
   },
 
-  downloadEntry: async (entry) => {
+  downloadEntry: async (entry, precision) => {
     const mirror = get().mirror;
     // The original yaml must land BEFORE the ckpt and be named <ckpt stem>.yaml:
     // the ckpt download auto-converts on completion, and the converter reads the SIBLING
@@ -78,10 +82,11 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
       }
     }
     const url = applyMirror(entry.downloadUrl, mirror);
-    await get().downloadUrl(url, entry.filename);
+    // precision only applies to the MODEL download (auto-convert target), never the yaml sidecar.
+    await get().downloadUrl(url, entry.filename, precision);
   },
 
-  downloadUrl: async (url, filename) => {
+  downloadUrl: async (url, filename, precision) => {
     set((s) => ({
       downloading: {
         ...s.downloading,
@@ -91,7 +96,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
     }));
 
     try {
-      await invoke("download_msst_model", { url, filename });
+      await invoke("download_msst_model", { url, filename, precision });
       set((s) => {
         const { [filename]: _, ...rest } = s.downloading;
         return { downloading: rest };
@@ -103,6 +108,27 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
         return { downloading: rest, error: String(e) };
       });
     }
+  },
+
+  // 补转/convert an INSTALLED model to the given precision (undefined = full fp32 export from
+  // ckpt). fp16 with the fp32 onnx on disk is the fast post-hoc path (~1-2 min); fp32 (or fp16
+  // without the fp32 file) is a full re-export. Reuses the download record's "converting" stage
+  // so the existing DownloadBar / indicators track it.
+  convertPrecision: async (filename, precision) => {
+    set((s) => ({
+      downloading: {
+        ...s.downloading,
+        [filename]: { filename, downloaded: 0, total: 0, stage: "converting" as const },
+      },
+      error: null,
+    }));
+    try {
+      await invoke("convert_msst_model", { filename, precision });
+      await get().fetchInstalled();
+    } catch (e) {
+      set({ error: String(e) });
+    }
+    get().removeDownload(filename);
   },
 
   deleteModel: async (filename) => {

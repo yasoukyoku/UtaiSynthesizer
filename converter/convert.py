@@ -12,6 +12,11 @@ Usage:
     python convert.py --input model.ckpt --output model.onnx --type mel_band_roformer [--config model.yaml]
     python convert.py --input model.ckpt --output model.onnx --type mdx23c --config model.yaml
     python convert.py --input model.th   --output model.onnx --type htdemucs [--config model.yaml]
+
+Separation types accept --precision fp32|fp16|both (default fp32). fp16 keeps
+the shared <stem>.json and writes <stem>.fp16.onnx (deleting the fp32 .onnx);
+both keeps both files. rvc/sovits ignore --precision. fp16 is numerically
+verified for the roformer types only; mdx23c/htdemucs are refused.
 """
 
 import argparse
@@ -38,6 +43,11 @@ from architectures.htdemucs import (
     detect_config as detect_htdemucs_config,
 )
 from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_from_yaml
+
+# --precision applies to these (rvc/sovits ignore it); fp16 is numerically
+# verified (>45 dB vs fp32) for the roformer archs ONLY — refuse the rest.
+SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
+FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer"}
 
 
 def convert_rvc(input_path: Path, output_path: Path):
@@ -513,7 +523,19 @@ def main():
                         help="Optional MSST training YAML (STFT params for mel_band_roformer / "
                              "mdx23c; inference chunk_size/num_overlap; hyperparams + segment "
                              "for htdemucs; stem labels for all separation models)")
+    parser.add_argument("--precision", type=str, default="fp32",
+                        choices=["fp32", "fp16", "both"],
+                        help="Separation types only (rvc/sovits ignore it). fp32: <stem>.onnx "
+                             "as today. fp16: convert to <stem>.fp16.onnx and delete the fp32 "
+                             ".onnx (the shared <stem>.json is kept). both: keep both files.")
     args = parser.parse_args()
+
+    # Refuse unverified archs BEFORE touching any file — the torch export is
+    # expensive and the result would be numerically unvalidated.
+    if args.precision != "fp32" and args.type in SEPARATION_TYPES - FP16_VERIFIED_TYPES:
+        print(f"Error: fp16 not yet numerically verified for {args.type}; use fp32",
+              file=sys.stderr)
+        sys.exit(1)
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -540,6 +562,19 @@ def main():
     elif args.type == "htdemucs":
         config_yaml = Path(args.config) if args.config else None
         convert_htdemucs(input_path, output_path, config_yaml)
+
+    if args.precision != "fp32" and args.type in SEPARATION_TYPES:
+        # The torch export above MUST stay fp32 — it is the intermediate the
+        # fp16 conversion consumes. Lazy import: rvc/sovits-only environments
+        # don't need onnxconverter-common.
+        from onnx_fp16 import convert_onnx_to_fp16, default_fp16_path
+        fp16_path = default_fp16_path(output_path)
+        convert_onnx_to_fp16(output_path, fp16_path)
+        print(f"Converted to fp16: {fp16_path}")
+        if args.precision == "fp16":
+            # Keep the .json — it is shared by both precisions.
+            output_path.unlink()
+            print(f"Removed fp32 intermediate: {output_path}")
 
 
 if __name__ == "__main__":

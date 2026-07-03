@@ -351,6 +351,42 @@
   border-color: var(--accent-primary);
 }
 
+/* Download-time precision choice (roformer entries only) */
+.model-card-precision {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+}
+
+.model-precision-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.model-precision-seg {
+  display: flex;
+  border: 1px solid var(--border-subtle);
+}
+
+.model-precision-seg button {
+  padding: 0 var(--space-sm);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  background: none;
+  border: none;
+  color: var(--text-muted);
+}
+
+.model-precision-seg button + button {
+  border-left: 1px solid var(--border-subtle);
+}
+
+.model-precision-seg button.active {
+  color: var(--accent-primary);
+  background: var(--accent-primary-glow);
+}
+
 .model-convert-bar {
   animation: convert-pulse 1.5s ease-in-out infinite;
 }

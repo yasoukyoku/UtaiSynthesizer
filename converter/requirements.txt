@@ -2,3 +2,4 @@ torch>=2.1.0
 numpy>=1.24.0,<2.0
 onnx>=1.14.0
 onnxruntime>=1.16.0
+onnxconverter-common>=1.14.0
