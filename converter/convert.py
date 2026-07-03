@@ -8,9 +8,10 @@ Requires PyTorch (CPU is sufficient for conversion).
 Usage:
     python convert.py --input model.pth  --output model.onnx --type rvc
     python convert.py --input model.pth  --output model.onnx --type sovits
-    python convert.py --input model.ckpt --output model.onnx --type bs_roformer
+    python convert.py --input model.ckpt --output model.onnx --type bs_roformer [--config model.yaml]
     python convert.py --input model.ckpt --output model.onnx --type mel_band_roformer [--config model.yaml]
     python convert.py --input model.ckpt --output model.onnx --type mdx23c --config model.yaml
+    python convert.py --input model.th   --output model.onnx --type htdemucs [--config model.yaml]
 """
 
 import argparse
@@ -36,6 +37,7 @@ from architectures.htdemucs import (
     load_from_checkpoint as load_htdemucs,
     detect_config as detect_htdemucs_config,
 )
+from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_from_yaml
 
 
 def convert_rvc(input_path: Path, output_path: Path):
@@ -162,15 +164,46 @@ def _inference_params_from_yaml(config_yaml, fallback_chunk: int, fallback_overl
     """Original MSST inference recipe: audio.chunk_size + inference.num_overlap.
     Roformer separation quality depends on the inference chunk length matching the
     training dim_t — do NOT shrink these for speed (S16 did: 131584/2 vs the trained
-    352800/4, a real audible SDR hit). The app's overlap slider is the speed knob."""
-    if config_yaml is None:
-        return fallback_chunk, fallback_overlap
-    import yaml  # hard-fail if pyyaml missing: silent fallback would bake wrong params
-    with open(config_yaml) as f:
-        y = yaml.safe_load(f) or {}
+    352800/4, a real audible SDR hit). The app's overlap slider is the speed knob.
+    Hard-fails on unparseable yaml (load_msst_yaml) — silent fallback would bake
+    wrong params."""
+    y = load_msst_yaml(config_yaml)
     chunk = (y.get("audio") or {}).get("chunk_size", fallback_chunk)
     overlap = (y.get("inference") or {}).get("num_overlap", fallback_overlap)
     return chunk, overlap
+
+
+def _write_model_json(output_path: Path, config_data: dict) -> Path:
+    config_path = output_path.with_suffix(".json")
+    config_path.write_text(json.dumps(config_data, indent=2))
+    return config_path
+
+
+def _write_roformer_json(output_path: Path, model_type: str, config: dict,
+                         config_yaml, fallback_chunk: int, fallback_overlap: int):
+    """Shared bs_roformer/mel_band_roformer .json tail (ONE source of truth —
+    the melband copy had drifted and lost dynamic_batch)."""
+    chunk_size, num_overlap = _inference_params_from_yaml(
+        config_yaml, fallback_chunk, fallback_overlap)
+    n_fft = config.get("stft_n_fft", 2048)
+    num_stems = config.get("num_stems", 1)
+    config_data = {
+        "type": model_type,
+        "sample_rate": config.get("sample_rate", 44100),
+        "stereo": config.get("stereo", False),
+        "num_stems": num_stems,
+        "n_fft": n_fft,
+        "hop_length": config.get("stft_hop_length", 441),
+        "win_length": config.get("stft_win_length", n_fft),
+        "freq_bins": n_fft // 2 + 1,
+        "chunk_size": chunk_size,
+        "num_overlap": num_overlap,
+        "batch_size": 1,
+        "dynamic_batch": True,
+    }
+    config_data.update(stem_fields_from_yaml(load_msst_yaml(config_yaml), num_stems))
+    config_path = _write_model_json(output_path, config_data)
+    return config_path, chunk_size, num_overlap
 
 
 def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path = None):
@@ -227,31 +260,14 @@ def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path =
     assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
-    hop_length = config.get("stft_hop_length", 441)
     # Fallback = viperx BSRoformer family (ep_317/ep_368 yamls both say 352800/4).
-    chunk_size, num_overlap = _inference_params_from_yaml(config_yaml, 352800, 4)
-
-    config_path = output_path.with_suffix(".json")
-    config_data = {
-        "type": "bs_roformer",
-        "sample_rate": config.get("sample_rate", 44100),
-        "stereo": stereo,
-        "num_stems": config.get("num_stems", 1),
-        "n_fft": n_fft,
-        "hop_length": hop_length,
-        "win_length": config.get("stft_win_length", 2048),
-        "freq_bins": freq_bins,
-        "chunk_size": chunk_size,
-        "num_overlap": num_overlap,
-        "batch_size": 1,
-        "dynamic_batch": True,
-    }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    config_path, _, _ = _write_roformer_json(
+        output_path, "bs_roformer", config, config_yaml, 352800, 4)
 
     print(f"Converted BSRoformer: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
     print(f"Stereo: {stereo}, Stems: {config.get('num_stems', 1)}, "
-          f"FFT: {n_fft}, Hop: {hop_length}")
+          f"FFT: {n_fft}, Hop: {config.get('stft_hop_length', 441)}")
 
 
 def convert_mel_band_roformer(input_path: Path, output_path: Path,
@@ -310,30 +326,14 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     assert b2_diff < 1e-3, f"BATCH-AXIS EXPORT BROKEN: B=2 != 2x(B=1) (diff {b2_diff:.3e})"
     print(f"Batch-axis check passed: B=2 == 2x(B=1), diff = {b2_diff:.3e}")
 
-    hop_length = config.get("stft_hop_length", 441)
     # Fallback = melband_roformer_inst_v2 yaml (485100/4); pass --config for other melband models.
-    chunk_size, num_overlap = _inference_params_from_yaml(config_yaml, 485100, 4)
-
-    config_path = output_path.with_suffix(".json")
-    config_data = {
-        "type": "mel_band_roformer",
-        "sample_rate": config.get("sample_rate", 44100),
-        "stereo": stereo,
-        "num_stems": config.get("num_stems", 1),
-        "n_fft": n_fft,
-        "hop_length": hop_length,
-        "win_length": config.get("stft_win_length", n_fft),
-        "freq_bins": freq_bins,
-        "chunk_size": chunk_size,
-        "num_overlap": num_overlap,
-        "batch_size": 1,
-    }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    config_path, _, _ = _write_roformer_json(
+        output_path, "mel_band_roformer", config, config_yaml, 485100, 4)
 
     print(f"Converted MelBandRoformer: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
     print(f"Stereo: {stereo}, Stems: {config.get('num_stems', 1)}, "
-          f"FFT: {n_fft}, Hop: {hop_length}")
+          f"FFT: {n_fft}, Hop: {config.get('stft_hop_length', 441)}")
 
 
 def convert_mdx23c(input_path: Path, output_path: Path, config_yaml: Path = None):
@@ -347,6 +347,24 @@ def convert_mdx23c(input_path: Path, output_path: Path, config_yaml: Path = None
     n_fft = config["n_fft"]
     hop_length = config["hop_length"]
     sample_rate = config.get("sample_rate", 44100)
+
+    # Chunk/overlap from the model's own yaml — the old hardcoded 261120 broke
+    # models trained with other geometries (e.g. chunk 130560 @ hop 512).
+    chunk_size, num_overlap = _inference_params_from_yaml(config_yaml, 261120, 4)
+
+    # The U-Net downsamples time by 2 per scale; the decoder skip-cat hard-fails
+    # at runtime unless the frame count divides 2^num_scales. Check BEFORE export.
+    num_scales = config["num_scales"]
+    frames = chunk_size // hop_length + 1
+    if frames % (2 ** num_scales) != 0:
+        raise ValueError(
+            f"MDX23C chunk/hop geometry is invalid for this model: chunk_size "
+            f"{chunk_size} @ hop {hop_length} gives {frames} STFT frames, which is "
+            f"not divisible by 2^{num_scales}={2 ** num_scales} (the U-Net's total "
+            f"time downsampling). Inference WOULD hard-fail in the decoder skip-cat. "
+            f"Pass the model's training yaml via --config so the trained chunk_size "
+            f"is used instead of the 261120 default."
+        )
 
     # CaC input: [B, 4, dim_f, T]
     dummy = torch.randn(1, 4, dim_f, 256)
@@ -381,9 +399,6 @@ def convert_mdx23c(input_path: Path, output_path: Path, config_yaml: Path = None
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
 
-    chunk_size = 261120  # matches MSST default for MDX23C
-
-    config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "mdx23c",
         "sample_rate": sample_rate,
@@ -395,25 +410,31 @@ def convert_mdx23c(input_path: Path, output_path: Path, config_yaml: Path = None
         "dim_f": dim_f,
         "num_subbands": config["num_subbands"],
         "chunk_size": chunk_size,
-        "num_overlap": 4,
+        "num_overlap": num_overlap,
         "batch_size": 1,
     }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    config_data.update(stem_fields_from_yaml(load_msst_yaml(config_yaml), num_stems))
+    config_path = _write_model_json(output_path, config_data)
 
     print(f"Converted MDX23C: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
     print(f"Stems: {num_stems}, dim_f: {dim_f}, FFT: {n_fft}, Hop: {hop_length}")
 
 
-def convert_htdemucs(input_path: Path, output_path: Path):
+def convert_htdemucs(input_path: Path, output_path: Path, config_yaml: Path = None):
     """Convert HTDemucs .th/.ckpt model to ONNX."""
-    config = detect_htdemucs_config(str(input_path))
+    yaml_str = str(config_yaml) if config_yaml else None
+    yaml_config = load_msst_yaml(yaml_str)
+    config = detect_htdemucs_config(str(input_path), yaml_str)
     model = load_htdemucs(str(input_path), config=config)
 
     nfft = config.get("nfft", 4096)
     samplerate = config.get("samplerate", 44100)
-    segment = config.get("segment", 10)
+    # segment: ckpt kwargs > yaml training.segment > 11 (resolved by detect_config;
+    # MSST runs its htdemucs vocal models at 11s, not the demucs default 10s)
+    segment = config.get("segment", 11)
     sources = config.get("sources", 4)
+    num_stems = len(sources) if isinstance(sources, (list, tuple)) else int(sources)
     freq_bins = nfft // 2
 
     # Fixed segment size (HTDemucs requires fixed input for ONNX)
@@ -454,21 +475,27 @@ def convert_htdemucs(input_path: Path, output_path: Path):
     diff_t = abs(time_out.numpy() - ort_out[1]).max()
     print(f"ORT verification: freq max diff = {diff_f:.6e}, time max diff = {diff_t:.6e}")
 
-    config_path = output_path.with_suffix(".json")
+    num_overlap = (yaml_config.get("inference") or {}).get("num_overlap", 4)
+
     config_data = {
         "type": "htdemucs",
         "sample_rate": samplerate,
         "stereo": True,
-        "num_stems": sources,
+        "num_stems": num_stems,
         "n_fft": nfft,
         "hop_length": hop,
         "win_length": nfft,
         "segment_samples": segment_samples,
         "processing_mode": "hybrid",
-        "num_overlap": 4,
+        "num_overlap": num_overlap,
         "batch_size": 1,
     }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    # Stem labels: ckpt kwargs['sources'] (official demucs) beats yaml training.
+    if isinstance(sources, (list, tuple)):
+        config_data.update(stem_fields(sources, None, num_stems))
+    else:
+        config_data.update(stem_fields_from_yaml(yaml_config, num_stems))
+    config_path = _write_model_json(output_path, config_data)
 
     print(f"Converted HTDemucs: {input_path} -> {output_path}")
     print(f"Config saved: {config_path}")
@@ -483,8 +510,9 @@ def main():
                         choices=["rvc", "sovits", "bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"],
                         help="Model type")
     parser.add_argument("--config", type=str, default=None,
-                        help="Optional YAML config (STFT params for mel_band_roformer / mdx23c; "
-                             "original inference chunk_size/num_overlap for roformers)")
+                        help="Optional MSST training YAML (STFT params for mel_band_roformer / "
+                             "mdx23c; inference chunk_size/num_overlap; hyperparams + segment "
+                             "for htdemucs; stem labels for all separation models)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -510,7 +538,8 @@ def main():
         config_yaml = Path(args.config) if args.config else None
         convert_mdx23c(input_path, output_path, config_yaml)
     elif args.type == "htdemucs":
-        convert_htdemucs(input_path, output_path)
+        config_yaml = Path(args.config) if args.config else None
+        convert_htdemucs(input_path, output_path, config_yaml)
 
 
 if __name__ == "__main__":

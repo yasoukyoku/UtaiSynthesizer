@@ -414,6 +414,26 @@ def detect_config(ckpt_path: str) -> dict:
     )
 
 
+def load_state_checked(model: nn.Module, state: dict) -> None:
+    """strict=False load hygiene for the roformer family.
+
+    The ONLY legitimate extra checkpoint keys are the original
+    rotary_embedding_torch persistent buffers (*.rotary_embed.freqs) — our
+    RotaryEmbedding computes them on the fly. Any missing key or any other
+    unexpected key means the detected config diverged from the checkpoint,
+    which would silently produce garbage output — hard-error instead.
+    """
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    bad_unexpected = [k for k in unexpected if not k.endswith(".rotary_embed.freqs")]
+    if missing or bad_unexpected:
+        raise RuntimeError(
+            "Checkpoint does not match the detected architecture:\n"
+            f"  missing keys ({len(missing)}): {missing[:8]}{' ...' if len(missing) > 8 else ''}\n"
+            f"  unexpected keys ({len(bad_unexpected)}): {bad_unexpected[:8]}"
+            f"{' ...' if len(bad_unexpected) > 8 else ''}"
+        )
+
+
 def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None) -> BSRoformer:
     """Load BSRoformer from a .ckpt file, returning inference-ready model."""
     if config is None:
@@ -427,6 +447,6 @@ def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None) -> BSRof
     elif isinstance(state, dict) and "model" in state:
         state = state["model"]
 
-    model.load_state_dict(state, strict=False)
+    load_state_checked(model, state)
     model.eval()
     return model

@@ -19,8 +19,9 @@ from typing import Tuple, Optional
 
 from .bs_roformer import (
     RMSNorm, RotaryEmbedding, Attend, Attention, FeedForward,
-    Transformer, BandSplit, MaskEstimator, _build_mlp,
+    Transformer, BandSplit, MaskEstimator, _build_mlp, load_state_checked,
 )
+from .msst_yaml import load_msst_yaml
 
 
 # ─── Mel Filterbank (pure numpy, matches librosa Slaney scale) ─
@@ -298,22 +299,20 @@ def detect_config(ckpt_path: str, yaml_path: Optional[str] = None) -> dict:
     while f"band_split.to_features.{num_bands_detected}.1.weight" in sd:
         num_bands_detected += 1
 
-    first_band_in = sd["band_split.to_features.0.1.weight"].shape[1]
-    audio_ch = 2 if first_band_in > 4 else 1
-    stereo = audio_ch == 2
-
+    # Mask-estimator MLP hidden dim from its OWN first linear (dim -> dim_hidden).
+    # Do NOT conflate with the transformer FFN hidden — they are independent knobs
+    # in the original (FeedForward mult vs mlp_expansion_factor).
+    me_hidden = sd["mask_estimators.0.to_freqs.0.0.0.weight"].shape[0]
+    if me_hidden % dim != 0:
+        raise RuntimeError(
+            f"Mask-estimator hidden dim {me_hidden} is not a multiple of dim {dim}; "
+            f"cannot express as mlp_expansion_factor"
+        )
+    mlp_exp = me_hidden // dim
     ffn_hidden = sd["layers.0.0.layers.0.1.net.1.weight"].shape[0]
-    mlp_exp = ffn_hidden // dim
 
-    # Try to load YAML for STFT params and num_bands
-    yaml_config = {}
-    if yaml_path:
-        try:
-            import yaml
-            with open(yaml_path) as f:
-                yaml_config = yaml.safe_load(f)
-        except Exception as e:
-            print(f"Warning: could not load YAML config: {e}")
+    # YAML (FullLoader — MSST yamls contain !!python/tuple; hard-fails on parse error)
+    yaml_config = load_msst_yaml(yaml_path)
 
     model_yaml = yaml_config.get("model", {})
     audio_yaml = yaml_config.get("audio", {})
@@ -325,9 +324,29 @@ def detect_config(ckpt_path: str, yaml_path: Optional[str] = None) -> dict:
     win_length = model_yaml.get("stft_win_length", n_fft)
     dim_freqs_in = n_fft // 2 + 1
 
+    first_band_in = sd["band_split.to_features.0.1.weight"].shape[1]
+    if "stereo" in model_yaml:
+        stereo = bool(model_yaml["stereo"])
+        audio_ch = 2 if stereo else 1
+    else:
+        # Derive channels from band 0's input width: 2 * (bins in mel band 0) * channels.
+        # (A plain `first_band_in > 4` misreads mono as stereo — band 0 spans ~7 bins.)
+        fb = mel_filterbank(sample_rate, n_fft, num_bands)
+        fb[0][0] = 1.0  # same fixup the model applies before freqs_per_band = fb > 0
+        band0_bins = int((fb[0] > 0).sum())
+        audio_ch, rem = divmod(first_band_in, 2 * band0_bins)
+        if rem != 0 or audio_ch not in (1, 2):
+            raise RuntimeError(
+                f"Cannot infer stereo/mono: band 0 input width {first_band_in} vs "
+                f"{band0_bins} mel bins (sr={sample_rate}, n_fft={n_fft}, "
+                f"num_bands={num_bands}). Pass the model's training yaml via --config."
+            )
+        stereo = audio_ch == 2
+
     print(f"  dim={dim}, depth={depth}, stereo={stereo}, stems={stems}")
     print(f"  time_depth={t_depth}, freq_depth={f_depth}, bands={num_bands}")
-    print(f"  heads={heads}, dim_head={dim_head}, mlp_exp={mlp_exp}, me_depth={me_depth}")
+    print(f"  heads={heads}, dim_head={dim_head}, mlp_exp={mlp_exp} "
+          f"(me_hidden={me_hidden}, ffn_hidden={ffn_hidden}), me_depth={me_depth}")
     print(f"  n_fft={n_fft}, hop={hop_length}, sample_rate={sample_rate}")
 
     return dict(
@@ -355,6 +374,6 @@ def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None,
     elif isinstance(state, dict) and "model" in state:
         state = state["model"]
 
-    model.load_state_dict(state, strict=False)
+    load_state_checked(model, state)
     model.eval()
     return model

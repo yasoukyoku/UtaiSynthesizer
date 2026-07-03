@@ -51,6 +51,16 @@ pub struct ModelConfig {
     pub segment_samples: usize,
     #[serde(default)]
     pub processing_mode: ProcessingMode,
+    /// Labels of the model's DIRECT outputs in training order (from the original yaml's
+    /// training.instruments / target_instrument). Single-stem instrumental-target models
+    /// (e.g. melband inst_v2) output the INSTRUMENTAL — without this the old heuristic
+    /// labeled stem 0 "vocals" and content-swapped the two stems.
+    #[serde(default)]
+    pub stem_names: Option<Vec<String>>,
+    /// Label of the mix-minus-stem residual for num_stems==1 models ("vocals" for
+    /// instrumental-target models; "instrumental" otherwise).
+    #[serde(default)]
+    pub residual_name: Option<String>,
     // Legacy field — ignored if num_overlap is set
     #[serde(default)]
     pub overlap: usize,
@@ -88,7 +98,9 @@ impl NativePipeline {
         }
         let config_text = std::fs::read_to_string(&config_path)?;
         let config: ModelConfig = serde_json::from_str(&config_text)?;
+        let t_load = std::time::Instant::now();
         let session_id = engine.load_model(&model_path.to_path_buf())?;
+        tracing::debug!("[perf] session build (load_model): {:.1} ms", t_load.elapsed().as_secs_f64() * 1e3);
         Ok(Self { engine: engine as *const OnnxEngine, session_id, config })
     }
 
@@ -141,7 +153,7 @@ impl NativePipeline {
         // htdemucs (hybrid demucs) is NOT mean/std-normalized in MSST, and its node UI hides the
         // Normalize toggle — so a stale `normalize=true` carried over from a spectral model on the
         // same node must not apply here. Guarding at this single point keeps the UI and engine honest.
-        if self.config.normalize && self.config.model_type != "htdemucs" {
+        let mut stems = if self.config.normalize && self.config.model_type != "htdemucs" {
             let (mean, std) = compute_audio_mean_std(audio);
             tracing::info!("MSST normalize ON (mean={:.6}, std={:.6})", mean, std);
             let normed = normalize_audio(audio, mean, std);
@@ -149,10 +161,23 @@ impl NativePipeline {
             for stem in &mut stems {
                 denormalize_stem(stem, mean, std);
             }
-            Ok(stems)
+            stems
         } else {
-            self.run_augmented(audio, progress_cb)
+            self.run_augmented(audio, progress_cb)?
+        };
+
+        // Single-stem models: derive the residual (mix - stem) HERE — against the ORIGINAL
+        // un-normalized mix, AFTER denormalization and TTA averaging. Computing it inside the
+        // per-path functions against the normalized mix and then denormalizing left a +mean DC
+        // offset (stem + residual summed to mix + mean). Hybrid (htdemucs) never derives a
+        // residual — unchanged. Empty stems = empty input (0 chunks), nothing to derive.
+        if self.config.num_stems == 1
+            && !matches!(self.config.processing_mode, ProcessingMode::Hybrid)
+            && !stems.is_empty()
+        {
+            stems.push(compute_residual(audio, &stems[0], &residual_label(&self.config)));
         }
+        Ok(stems)
     }
 
     /// Test-time augmentation wrapper. Dispatches over a set of input transforms (identity +
@@ -282,8 +307,10 @@ impl NativePipeline {
 
         let window = build_msst_window(chunk_size, fade_size);
 
+        let t_total = std::time::Instant::now();
         // ── Phase 1: Parallel STFT on all chunks ──
         tracing::info!("STFT: {} chunks (parallel)...", total_chunks);
+        let t_stft = std::time::Instant::now();
         let spectrograms: Vec<(Array3<f32>, usize)> = chunks.par_iter().map(|chunk| {
             let spec = if is_stereo {
                 proc.stft_stereo(&chunk.left, &chunk.right)
@@ -293,6 +320,7 @@ impl NativePipeline {
             let num_frames = spec.shape()[1];
             (spec, num_frames)
         }).collect();
+        tracing::debug!("[perf] STFT phase: {:.1} ms ({} chunks)", t_stft.elapsed().as_secs_f64() * 1e3, total_chunks);
 
         if !progress_cb(0.05) {
             return Err(UtaiError::Audio("Stopped by user".into()));
@@ -316,9 +344,17 @@ impl NativePipeline {
             b, self.config.dynamic_batch, self.config.batch, total_chunks
         );
         let mut chunk_idx = 0;
+        // Phase timing accumulators — summarized once per run (tracing) for perf regressions.
+        let mut perf_assemble = 0.0f64;
+        let mut perf_infer = 0.0f64;
+        let mut perf_infer_min = f64::MAX;
+        let mut perf_infer_max = 0.0f64;
+        let mut perf_runs = 0usize;
+        let mut perf_post = 0.0f64;
         while chunk_idx < total_chunks {
             let bg = b.min(total_chunks - chunk_idx); // group size, remainder-safe
 
+            let t_asm = std::time::Instant::now();
             // Stack bg spectrograms into one [bg, freq_dim, num_frames, 2] input.
             let num_frames = spectrograms[chunk_idx].1;
             let chunk_floats = freq_dim * num_frames * 2;
@@ -330,7 +366,15 @@ impl NativePipeline {
                 data: input_data,
                 shape: vec![bg as i64, freq_dim as i64, num_frames as i64, 2],
             };
+            perf_assemble += t_asm.elapsed().as_secs_f64();
+            let t_run = std::time::Instant::now();
             let outputs = self.engine().run(&self.session_id, vec![("stft_repr", input)])?;
+            let dt_run = t_run.elapsed().as_secs_f64();
+            perf_infer += dt_run;
+            perf_infer_min = perf_infer_min.min(dt_run);
+            perf_infer_max = perf_infer_max.max(dt_run);
+            perf_runs += 1;
+            let t_post = std::time::Instant::now();
             let output_data = outputs.into_iter().next().ok_or_else(||
                 UtaiError::Audio("Model produced no output".into()))?;
 
@@ -370,23 +414,34 @@ impl NativePipeline {
                 }
             }
 
+            perf_post += t_post.elapsed().as_secs_f64();
+
             chunk_idx += bg;
             let progress = 0.05 + 0.90 * chunk_idx as f32 / total_chunks as f32;
             if !progress_cb(progress) {
                 return Err(UtaiError::Audio("Stopped by user".into()));
             }
         }
+        // One summary line per run. avg-vs-max spread flags the CUDA-arena/WDDM-paging slow mode
+        // (S31 perf investigation: same config runs at ~890 ms or 2.6-3.7 s per chunk when VRAM fills).
+        tracing::info!(
+            "[perf] inference: {:.1} ms total over {} runs (avg {:.1} / min {:.1} / max {:.1} ms per run, batch={})",
+            perf_infer * 1e3, perf_runs, perf_infer * 1e3 / perf_runs.max(1) as f64,
+            perf_infer_min * 1e3, perf_infer_max * 1e3, b
+        );
+        tracing::debug!("[perf] input assemble: {:.1} ms total", perf_assemble * 1e3);
+        tracing::debug!("[perf] iSTFT+mask+overlap-add (post): {:.1} ms total", perf_post * 1e3);
 
         progress_cb(1.0);
 
-        let mut stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
-            let label = default_stem_label(&self.config.model_type, i, self.config.num_stems);
+        let t_fin = std::time::Instant::now();
+        let stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
+            let label = stem_label(&self.config, i);
             acc.finalize_with_border(label, border, orig_len)
         }).collect();
-
-        if self.config.num_stems == 1 {
-            stems.push(compute_residual(audio, &stems[0], "instrumental"));
-        }
+        // Residual for num_stems==1 is derived in separate() against the un-normalized mix.
+        tracing::debug!("[perf] finalize: {:.1} ms", t_fin.elapsed().as_secs_f64() * 1e3);
+        tracing::info!("[perf] separate_spectral TOTAL: {:.1} ms", t_total.elapsed().as_secs_f64() * 1e3);
         Ok(stems)
     }
 
@@ -432,49 +487,45 @@ impl NativePipeline {
             return Err(UtaiError::Audio("Stopped by user".into()));
         }
 
-        // Phase 2: GPU inference
-        tracing::info!("MDX23C phase 2: GPU inference on {} chunks...", total_chunks);
-        let mut inference_outputs: Vec<Vec<f32>> = Vec::with_capacity(total_chunks);
-
-        for (chunk_idx, (spec_l, spec_r, num_frames)) in stft_pairs.iter().enumerate() {
-            let f = dim_f.min(spec_l.shape()[0]);
-            let mut cac_data = Vec::with_capacity(4 * f * num_frames);
-            for ch_spec in [spec_l, spec_r] {
-                for ri in 0..2 {
-                    for freq in 0..f {
-                        for t in 0..*num_frames {
-                            cac_data.push(ch_spec[[freq, t, ri]]);
-                        }
-                    }
-                }
-            }
-
-            let input = InputTensor::F32 {
-                data: cac_data,
-                shape: vec![1, 4, f as i64, *num_frames as i64],
-            };
-            let outputs = self.engine().run(&self.session_id, vec![("stft_repr", input)])?;
-            inference_outputs.push(outputs.into_iter().next().ok_or_else(||
-                UtaiError::Audio("Model produced no output".into()))?);
-
-            let progress = 0.05 + 0.85 * (chunk_idx + 1) as f32 / total_chunks as f32;
-            if !progress_cb(progress) {
-                return Err(UtaiError::Audio("Stopped by user".into()));
-            }
-        }
-
-        // Phase 3: iSTFT + windowed overlap-add
-        tracing::info!("MDX23C phase 3: iSTFT + overlap-add...");
+        // Phase 2: GPU inference + immediate iSTFT + overlap-add (merged — same pattern as
+        // separate_spectral). Each chunk's inference output AND its STFT pair are dropped as
+        // soon as they're consumed, so peak RAM is O(one chunk) instead of retaining every
+        // inference output (+ all STFT pairs) until a separate phase 3.
+        tracing::info!("MDX23C phase 2: inference + iSTFT on {} chunks...", total_chunks);
         let padded_len = padded_left.len();
         let mut stem_accumulators: Vec<AudioAccumulator> = (0..self.config.num_stems)
             .map(|_| AudioAccumulator::new(padded_len, true))
             .collect();
 
-        for (chunk_idx, output_data) in inference_outputs.iter().enumerate() {
-            let (spec_l, _spec_r, num_frames) = &stft_pairs[chunk_idx];
+        for (chunk_idx, (spec_l, spec_r, num_frames)) in stft_pairs.into_iter().enumerate() {
+            let f = dim_f.min(spec_l.shape()[0]);
+            let mut cac_data = Vec::with_capacity(4 * f * num_frames);
+            for ch_spec in [&spec_l, &spec_r] {
+                for ri in 0..2 {
+                    for freq in 0..f {
+                        for t in 0..num_frames {
+                            cac_data.push(ch_spec[[freq, t, ri]]);
+                        }
+                    }
+                }
+            }
+            // STFT pair consumed — free it before inference (the model outputs the full
+            // spectrum directly, so unlike the mask-based spectral path it's not needed again).
+            drop(spec_l);
+            drop(spec_r);
+
+            let input = InputTensor::F32 {
+                data: cac_data,
+                shape: vec![1, 4, f as i64, num_frames as i64],
+            };
+            let outputs = self.engine().run(&self.session_id, vec![("stft_repr", input)])?;
+            let output_data = outputs.into_iter().next().ok_or_else(||
+                UtaiError::Audio("Model produced no output".into()))?;
+
+            // iSTFT + windowed overlap-add for this chunk (identical numerics to the old
+            // phase 3 — same window variants for first/last chunk, same accumulation).
             let offset = chunks[chunk_idx].offset;
             let chunk_len = chunks[chunk_idx].left.len();
-            let f = dim_f.min(spec_l.shape()[0]);
             let chan_size = f * num_frames;
             let stem_size = 4 * chan_size;
 
@@ -490,11 +541,11 @@ impl NativePipeline {
             for stem_idx in 0..self.config.num_stems {
                 let stem_off = stem_idx * stem_size;
                 let freq_bins = proc.freq_bins();
-                let mut spec_out_l = Array3::<f32>::zeros((freq_bins, *num_frames, 2));
-                let mut spec_out_r = Array3::<f32>::zeros((freq_bins, *num_frames, 2));
+                let mut spec_out_l = Array3::<f32>::zeros((freq_bins, num_frames, 2));
+                let mut spec_out_r = Array3::<f32>::zeros((freq_bins, num_frames, 2));
 
                 for freq in 0..f {
-                    for t in 0..*num_frames {
+                    for t in 0..num_frames {
                         let ft = freq * num_frames + t;
                         spec_out_l[[freq, t, 0]] = output_data[stem_off + ft];
                         spec_out_l[[freq, t, 1]] = output_data[stem_off + chan_size + ft];
@@ -507,18 +558,20 @@ impl NativePipeline {
                 let right = proc.istft(&spec_out_r, chunk_len);
                 stem_accumulators[stem_idx].add_windowed_stereo(&left, &right, offset, &win);
             }
+
+            let progress = 0.05 + 0.85 * (chunk_idx + 1) as f32 / total_chunks as f32;
+            if !progress_cb(progress) {
+                return Err(UtaiError::Audio("Stopped by user".into()));
+            }
         }
 
         progress_cb(1.0);
 
-        let mut stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
-            let label = default_stem_label(&self.config.model_type, i, self.config.num_stems);
+        let stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
+            let label = stem_label(&self.config, i);
             acc.finalize_with_border(label, border, orig_len)
         }).collect();
-
-        if self.config.num_stems == 1 {
-            stems.push(compute_residual(audio, &stems[0], "instrumental"));
-        }
+        // Residual for num_stems==1 is derived in separate() against the un-normalized mix.
         Ok(stems)
     }
 
@@ -547,17 +600,17 @@ impl NativePipeline {
 
         // MSST: HTDemucs uses num_overlap for step, simple counter accumulation
         let num_overlap = self.config.num_overlap.max(1);
-        let step = segment_samples / num_overlap;
+        let step = (segment_samples / num_overlap).max(1);
 
         let mut stem_accumulators: Vec<AudioAccumulator> = (0..self.config.num_stems)
             .map(|_| AudioAccumulator::new(orig_len, true))
             .collect();
 
-        let total_segments = if orig_len <= segment_samples {
-            1
-        } else {
-            (orig_len + step - 1) / step
-        };
+        // MSST demix (utils/utils.py:144-157) visits EVERY step start while pos < len —
+        // including tail starts whose window crosses EOF (those chunks are zero-padded to
+        // segment_samples and averaged by the accumulator counter) — so the segment count
+        // is ceil(len / step), never "1 if it fits".
+        let total_segments = ((orig_len + step - 1) / step).max(1);
         let mut seg_idx = 0;
         let mut pos = 0;
 
@@ -572,8 +625,11 @@ impl NativePipeline {
                 right_chunk[..chunk_len].copy_from_slice(&audio.right[pos..end]);
             }
 
-            let spec_l = proc.stft(&left_chunk);
-            let spec_r = proc.stft(&right_chunk);
+            // demucs `_spec` convention — NOT a plain centered STFT (see demucs_spec below;
+            // feeding proc.stft directly costs ~80 dB of stem SNR, measured 6.22 vs 86.22 dB).
+            let spec_l = demucs_spec(&proc, &left_chunk);
+            let spec_r = demucs_spec(&proc, &right_chunk);
+            debug_assert_eq!(spec_l.shape()[1], le);
             let num_frames = spec_l.shape()[1].min(le);
             let f = freq_bins.min(spec_l.shape()[0]);
 
@@ -615,9 +671,8 @@ impl NativePipeline {
             for stem_idx in 0..self.config.num_stems {
                 let foff = stem_idx * freq_stem_size;
                 let chan_size = f * num_frames;
-                let full_bins = proc.freq_bins();
-                let mut spec_out_l = Array3::<f32>::zeros((full_bins, num_frames, 2));
-                let mut spec_out_r = Array3::<f32>::zeros((full_bins, num_frames, 2));
+                let mut spec_out_l = Array3::<f32>::zeros((f, num_frames, 2));
+                let mut spec_out_r = Array3::<f32>::zeros((f, num_frames, 2));
                 for freq in 0..f {
                     for t in 0..num_frames {
                         let ft = freq * num_frames + t;
@@ -627,8 +682,9 @@ impl NativePipeline {
                         spec_out_r[[freq, t, 1]] = freq_data[foff + 3 * chan_size + ft];
                     }
                 }
-                let freq_l = proc.istft(&spec_out_l, segment_samples);
-                let freq_r = proc.istft(&spec_out_r, segment_samples);
+                // demucs `_ispec` — re-adds the nyquist row + cropped edge frames as zeros.
+                let freq_l = demucs_ispec(&proc, &spec_out_l, segment_samples);
+                let freq_r = demucs_ispec(&proc, &spec_out_r, segment_samples);
 
                 let toff = stem_idx * time_stem_size;
                 let time_l = &time_data[toff..toff + segment_samples];
@@ -652,12 +708,13 @@ impl NativePipeline {
                 return Err(UtaiError::Audio("Stopped by user".into()));
             }
 
-            if pos + segment_samples >= orig_len { break; }
+            // No early break: MSST demix visits every step start < orig_len (tail chunks
+            // were zero-padded above; the accumulator counter averages the overlap).
             pos += step;
         }
 
         let stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
-            let label = default_stem_label(&self.config.model_type, i, self.config.num_stems);
+            let label = stem_label(&self.config, i);
             acc.finalize(label)
         }).collect();
 
@@ -734,14 +791,11 @@ impl NativePipeline {
             }
         }
 
-        let mut stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
-            let label = default_stem_label(&self.config.model_type, i, self.config.num_stems);
+        let stems: Vec<StemAudio> = stem_accumulators.into_iter().enumerate().map(|(i, acc)| {
+            let label = stem_label(&self.config, i);
             acc.finalize_with_border(label, border, orig_len)
         }).collect();
-
-        if self.config.num_stems == 1 {
-            stems.push(compute_residual(audio, &stems[0], "instrumental"));
-        }
+        // Residual for num_stems==1 is derived in separate() against the un-normalized mix.
         Ok(stems)
     }
 
@@ -752,6 +806,76 @@ impl NativePipeline {
 // cached + LRU-bounded by OnnxEngine so that repeated separations of the same model reuse
 // the already-optimized session instead of reloading from disk every run. Call `unload()`
 // or OnnxEngine::clear_sessions() to free explicitly.
+
+// ─── demucs `_spec` / `_ispec` STFT convention (HTDemucs) ────────
+//
+// HTDemucs' spectral branch does NOT consume a plain centered STFT. demucs
+// (demucs4ht.py::_spec) reflect-pads the chunk by pad = hop/2*3 on the left and
+// pad + (le*hop - length) on the right (le = ceil(length/hop)) BEFORE the centered
+// STFT, then keeps frames [2 : 2+le] and drops the nyquist bin. Net effect: output
+// frame j is centered at j*hop + hop/2 — whereas a plain centered STFT centers frame
+// j at j*hop. This half-hop shift is what keeps the freq and time branches aligned
+// inside the model; feeding a plain STFT costs ~80 dB of stem SNR (measured 6.22 dB
+// vs 86.22 dB against the original torch pipeline).
+//
+// Scale invariant: demucs runs torch.stft(normalized=True), i.e. a 1/sqrt(n_fft)
+// factor. That factor is deliberately OMITTED here: the exported graph normalizes the
+// spec in-graph by its own mean/std and denormalizes its output, so a constant input
+// scale k scales mean/std by k and the model output by k — which our matching
+// unnormalized iSTFT then inverts exactly. Proven numerically (our spec == demucs
+// _spec × sqrt(n_fft) bit-exact; end-to-end 86.22 dB). Do NOT add the factor.
+
+/// demucs `_spec`: signal [T] → [n_fft/2 bins, ceil(T/hop) frames, 2] (nyquist dropped).
+fn demucs_spec(proc: &StftProcessor, signal: &[f32]) -> Array3<f32> {
+    let n_fft = proc.config().n_fft;
+    let hop = proc.config().hop_length;
+    debug_assert_eq!(n_fft, hop * 4, "demucs convention requires hop == n_fft/4");
+    let t = signal.len();
+    let le = (t + hop - 1) / hop;
+    let pad = hop / 2 * 3;
+    // Torch-exact asymmetric reflect pad (demucs pad1d); the extra le*hop - t on the
+    // right rounds the signal up to a whole number of hops.
+    let padded = reflect_pad_lr(signal, pad, pad + le * hop - t);
+    // proc.stft additionally center-pads by n_fft/2 internally (stft.rs) — exactly like
+    // torch.stft(center=True) inside demucs' spectro(). The demucs pad sits OUTSIDE that
+    // center pad, so the padded signal yields exactly le + 4 frames.
+    let full = proc.stft(&padded);
+    debug_assert_eq!(full.shape()[1], le + 4);
+    let bins = n_fft / 2; // drop the nyquist row
+    let mut out = Array3::<f32>::zeros((bins, le, 2));
+    for b in 0..bins {
+        for fr in 0..le {
+            out[[b, fr, 0]] = full[[b, fr + 2, 0]];
+            out[[b, fr, 1]] = full[[b, fr + 2, 1]];
+        }
+    }
+    out
+}
+
+/// demucs `_ispec`: spec [n_fft/2 bins, ceil(length/hop) frames, 2] → signal [length].
+/// Re-adds a zero nyquist row + 2 zero frames per side (undoing the `[2 : 2+le]` crop),
+/// runs the plain centered iSTFT over le*hop + 2*pad samples, then slices
+/// [pad : pad+length]. The edge frames it re-inserts are zeros, so the outer pad region
+/// is reconstructed from incomplete overlap-add — same as demucs; chunk overlap covers it.
+fn demucs_ispec(proc: &StftProcessor, spec: &Array3<f32>, length: usize) -> Vec<f32> {
+    let hop = proc.config().hop_length;
+    let full_bins = proc.freq_bins(); // n_fft/2 + 1
+    let bins = spec.shape()[0].min(full_bins);
+    let frames = spec.shape()[1];
+    debug_assert_eq!((length + hop - 1) / hop, frames, "frames must equal ceil(length/hop)");
+    let pad = hop / 2 * 3;
+    let mut padded = Array3::<f32>::zeros((full_bins, frames + 4, 2));
+    for b in 0..bins {
+        for fr in 0..frames {
+            padded[[b, fr + 2, 0]] = spec[[b, fr, 0]];
+            padded[[b, fr + 2, 1]] = spec[[b, fr, 1]];
+        }
+    }
+    let le_len = hop * ((length + hop - 1) / hop) + 2 * pad;
+    let x = proc.istft(&padded, le_len);
+    let end = (pad + length).min(x.len());
+    x[pad.min(end)..end].to_vec()
+}
 
 // ─── Input normalization (MSST-style mean/std, optional) ─────────
 
@@ -799,8 +923,10 @@ fn denormalize_stem(stem: &mut StemAudio, mean: f32, std: f32) {
 //
 // Each pass transforms the input, runs the model, then inverts the transform on the OUTPUT so all
 // passes line up before averaging. Polarity/channel-swap are general (any architecture); shifts are
-// HTDemucs-only (matching MSST). compute_residual uses the per-pass (transformed) mix, so the
-// derived "instrumental" stem inverts correctly too.
+// HTDemucs-only (matching MSST). Only the model's DIRECT outputs are averaged here — the derived
+// mix-minus-stem residual is computed once in separate(), against the original mix, after averaging
+// and denormalization (per-sample: avg over passes of (mix - stem) == mix - avg(stem), since every
+// pass's inverted mix contribution is the mix itself over the region it fills).
 
 enum Aug {
     Identity,
@@ -952,26 +1078,36 @@ fn prepare_padded_audio(
     }
 }
 
-/// Reflect padding matching `torch.nn.functional.pad(x, (pad, pad), mode='reflect')`.
-/// Requires pad < signal.len() (enforced by caller via `orig_len > 2 * border` check).
-fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
+/// Reflect padding matching `torch.nn.functional.pad(x, (pad_left, pad_right), mode='reflect')`.
+/// Requires pad_left < signal.len() and pad_right < signal.len() (torch's own constraint).
+fn reflect_pad_lr(signal: &[f32], pad_left: usize, pad_right: usize) -> Vec<f32> {
     let len = signal.len();
-    assert!(pad < len, "reflect_pad requires pad ({}) < signal length ({})", pad, len);
-    let mut out = Vec::with_capacity(pad + len + pad);
-    // Left pad: signal[pad], signal[pad-1], ..., signal[1]
-    for i in (1..=pad).rev() {
+    assert!(
+        pad_left < len && pad_right < len,
+        "reflect_pad requires pads ({}, {}) < signal length ({})", pad_left, pad_right, len
+    );
+    let mut out = Vec::with_capacity(pad_left + len + pad_right);
+    // Left pad: signal[pad_left], signal[pad_left-1], ..., signal[1] (edge sample excluded)
+    for i in (1..=pad_left).rev() {
         out.push(signal[i]);
     }
     out.extend_from_slice(signal);
-    // Right pad: signal[len-2], signal[len-3], ..., signal[len-1-pad]
-    for i in 0..pad {
+    // Right pad: signal[len-2], signal[len-3], ..., signal[len-1-pad_right]
+    for i in 0..pad_right {
         out.push(signal[len - 2 - i]);
     }
     out
 }
 
+/// Symmetric reflect pad (MSST `generic` border padding) — thin wrapper over
+/// `reflect_pad_lr`, the single source of truth for torch-exact reflect padding.
+fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
+    reflect_pad_lr(signal, pad, pad)
+}
+
 /// MSST-style chunking: step = chunk_size / num_overlap.
-/// Last chunk padded to chunk_size (reflect if >50% filled, zero otherwise).
+/// Last chunk padded to chunk_size (edge-excluded reflect if filled past C/2 + 1
+/// samples — MSST `length > C // 2 + 1` — zero otherwise).
 fn msst_chunk_audio(
     left: &[f32],
     right: &[f32],
@@ -1001,13 +1137,18 @@ fn msst_chunk_audio(
                 cr[..actual_len].copy_from_slice(&right[pos..end]);
             }
 
-            // Reflect pad if >50% filled
-            if actual_len > chunk_size / 2 {
+            // Reflect pad, matching original MSST (utils.py): threshold `length > C // 2 + 1`,
+            // torch 'reflect' mode which EXCLUDES the edge sample — first pad value is
+            // x[len-2], not a duplicate of x[len-1]. The threshold guarantees
+            // need <= actual_len - 3, so `actual_len - 2 - i` never underflows;
+            // saturating_sub is a defensive guard for degenerate tiny chunk_size.
+            if actual_len > chunk_size / 2 + 1 {
                 let need = chunk_size - actual_len;
-                for i in 0..need.min(actual_len) {
-                    cl[actual_len + i] = left[end - 1 - i.min(end - pos - 1)];
+                for i in 0..need {
+                    let src = pos + actual_len.saturating_sub(2 + i);
+                    cl[actual_len + i] = left[src];
                     if is_stereo {
-                        cr[actual_len + i] = right[end - 1 - i.min(end - pos - 1)];
+                        cr[actual_len + i] = right[src];
                     }
                 }
             }
@@ -1134,6 +1275,25 @@ fn build_msst_window(window_size: usize, fade_size: usize) -> Vec<f32> {
     win
 }
 
+/// Stem label for the model's direct output `stem_idx`: the config's `stem_names` (from the
+/// original training yaml) when present, else the legacy per-arch heuristic below. The heuristic
+/// is WRONG for instrumental-target single-stem models and for MSST-trained htdemucs (which
+/// trains [vocals, other], not the official [drums, bass, other, vocals]) — new conversions
+/// always carry stem_names.
+fn stem_label(config: &ModelConfig, stem_idx: usize) -> String {
+    if let Some(names) = &config.stem_names {
+        if let Some(name) = names.get(stem_idx) {
+            return name.clone();
+        }
+    }
+    default_stem_label(&config.model_type, stem_idx, config.num_stems)
+}
+
+/// Label for the derived mix-minus-stem residual (num_stems==1 models only).
+fn residual_label(config: &ModelConfig) -> String {
+    config.residual_name.clone().unwrap_or_else(|| "instrumental".to_string())
+}
+
 fn default_stem_label(model_type: &str, stem_idx: usize, num_stems: usize) -> String {
     match model_type {
         "bs_roformer" | "mel_band_roformer" | "mdx23c" => {
@@ -1218,4 +1378,121 @@ pub fn save_wav(path: &Path, stem: &StemAudio, sample_rate: u32) -> Result<()> {
 
     writer.finalize().map_err(|e| UtaiError::Audio(format!("WAV finalize: {}", e)))?;
     Ok(())
+}
+
+// ─── HTDemucs `_spec` convention tests ───────────────────────────
+// These lock the demucs frame convention (frames centered at j*hop + hop/2, nyquist
+// dropped, [2 : 2+le] crop) against future regressions. Verified against the torch
+// reference numerically (86.22 dB end-to-end); the tests below are self-contained.
+#[cfg(test)]
+mod htdemucs_spec_tests {
+    use super::*;
+
+    const N_FFT: usize = 4096;
+    const HOP: usize = 1024;
+    const SR: usize = 44100;
+
+    fn make_proc() -> StftProcessor {
+        StftProcessor::new(stft::StftConfig {
+            n_fft: N_FFT,
+            hop_length: HOP,
+            win_length: N_FFT,
+        })
+    }
+
+    /// Deterministic test signal: sines + band-limited noise. The 2-tap averager on the
+    /// noise nulls the response at nyquist, so the convention's dropped-nyquist-bin error
+    /// stays negligible and the roundtrip bound below is meaningful.
+    fn synth_signal(len: usize) -> Vec<f32> {
+        let mut state = 0x1234_5678u32;
+        let mut noise = Vec::with_capacity(len + 1);
+        for _ in 0..=len {
+            // xorshift32 — deterministic, no rand dependency
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            noise.push((state as f32 / u32::MAX as f32) - 0.5);
+        }
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / SR as f32;
+                let tau = 2.0 * std::f32::consts::PI;
+                (tau * 440.0 * t).sin() * 0.4
+                    + (tau * 1234.5 * t).sin() * 0.25
+                    + (tau * 3210.0 * t).sin() * 0.15
+                    + 0.05 * (noise[i] + noise[i + 1]) * 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reflect_pad_lr_matches_torch() {
+        // torch.nn.functional.pad([0,1,2,3,4], (3,2), mode='reflect') == [3,2,1,0,1,2,3,4,3,2]
+        let x = [0.0f32, 1.0, 2.0, 3.0, 4.0];
+        assert_eq!(
+            reflect_pad_lr(&x, 3, 2),
+            vec![3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0]
+        );
+    }
+
+    /// Alignment property: demucs_spec frame j is centered at j*hop + hop/2, so it must
+    /// equal frame j of a PLAIN centered STFT of the signal advanced by hop/2 samples
+    /// (whose frame j is centered at j*hop in ITS coordinates = j*hop + hop/2 in ours) —
+    /// sample-exactly on interior frames, where neither transform's window touches any
+    /// padded region (the two paths then window bit-identical samples).
+    #[test]
+    fn demucs_spec_frame_alignment() {
+        let proc = make_proc();
+        let t = 3 * SR; // 3 s
+        let x = synth_signal(t);
+        let le = (t + HOP - 1) / HOP;
+
+        let ds = demucs_spec(&proc, &x);
+        assert_eq!(ds.shape(), &[N_FFT / 2, le, 2]);
+
+        let advanced = &x[HOP / 2..];
+        let plain = proc.stft(advanced);
+
+        // Interior frames: window [j*hop + hop/2 - n_fft/2, j*hop + hop/2 + n_fft/2)
+        // must lie inside [0, t - hop/2) so BOTH transforms window pure signal samples.
+        let j_lo = (N_FFT / 2 - HOP / 2 + HOP - 1) / HOP; // ceil -> 2
+        let j_hi = (t - HOP - N_FFT / 2) / HOP; // floor, inclusive
+        assert!(j_hi > j_lo + 8, "test signal too short for interior frames");
+        assert!(j_hi < le && j_hi < plain.shape()[1]);
+
+        let mut max_diff = 0.0f32;
+        for j in j_lo..=j_hi {
+            for b in 0..N_FFT / 2 {
+                for ri in 0..2 {
+                    max_diff = max_diff.max((ds[[b, j, ri]] - plain[[b, j, ri]]).abs());
+                }
+            }
+        }
+        assert!(max_diff < 1e-6, "interior frame mismatch: {max_diff}");
+    }
+
+    /// demucs_spec → demucs_ispec must round-trip to identity on the interior. The first
+    /// and last pad = 3*hop/2 samples are excluded: the `[2 : 2+le]` crop discards the
+    /// analysis frames covering the outer reflect pad and _ispec re-inserts them as ZERO
+    /// frames, so the pad region is reconstructed from incomplete overlap-add (exactly as
+    /// in demucs — chunk overlap covers it in real use).
+    #[test]
+    fn demucs_spec_ispec_roundtrip() {
+        let proc = make_proc();
+        let t = 3 * SR;
+        let x = synth_signal(t);
+        let le = (t + HOP - 1) / HOP;
+
+        let spec = demucs_spec(&proc, &x);
+        let rec = demucs_ispec(&proc, &spec, t);
+        assert_eq!(rec.len(), t);
+
+        let pad = HOP / 2 * 3;
+        let hi = (le * HOP - pad).min(t);
+        let mut max_err = 0.0f32;
+        for i in pad..hi {
+            max_err = max_err.max((rec[i] - x[i]).abs());
+        }
+        assert!(max_err < 1e-4, "roundtrip interior error: {max_err}");
+    }
 }

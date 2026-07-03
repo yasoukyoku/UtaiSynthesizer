@@ -285,13 +285,14 @@ async fn run_converter(model_path: &Path, arch: &str, app_dir: &Path) -> Result<
         .arg("--output").arg(&onnx_path)
         .arg("--type").arg(arch);
 
-    if arch == "mdx23c" {
-        for ext in &["yaml", "yml"] {
-            let cfg = model_path.with_extension(ext);
-            if cfg.exists() {
-                cmd.arg("--config").arg(&cfg);
-                break;
-            }
+    // Pass the model's ORIGINAL yaml whenever it sits next to the ckpt (the frontend downloads
+    // the catalog's configUrl there). Roformers take chunk_size/num_overlap from it; melband/
+    // mdx23c also STFT/mel params. Archs that ignore --config just don't read it.
+    for ext in &["yaml", "yml"] {
+        let cfg = model_path.with_extension(ext);
+        if cfg.exists() {
+            cmd.arg("--config").arg(&cfg);
+            break;
         }
     }
 

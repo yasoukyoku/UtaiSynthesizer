@@ -332,7 +332,17 @@ fn commit(mut builder: ort::session::builder::SessionBuilder, path: &Path) -> Re
 /// over real frame SHAPES, NOT a fidelity check), so they wait until that crash is root-caused. Both
 /// call sites stay in lockstep.
 fn cuda_ep(device_id: Option<i32>) -> ort::ep::CUDA {
-    let mut ep = ort::ep::CUDA::default().with_tf32(true);
+    // SameAsRequested: grow the CUDA arena only by what each allocation needs, instead of the
+    // default power-of-two doubling. Measured (S31 perf investigation): with the default strategy
+    // the arena for the BSRoformer T=801 attention workload balloons to 11.9 of 12 GiB, WDDM
+    // starts paging VRAM over PCIe, and per-chunk inference intermittently drops from ~890 ms to
+    // 2.6-3.7 s (bit-identical outputs — pure residency thrash; the user-facing "5-minute song").
+    // Numerics are unaffected by allocator strategy. NOT adding gpu_mem_limit: a hard cap turns
+    // "slow" into "allocation failed" on smaller cards. (S23 HARD RULE: any new EP option must be
+    // A/B-run on the real model against this exact ort/ORT pair before shipping — done for this one.)
+    let mut ep = ort::ep::CUDA::default()
+        .with_tf32(true)
+        .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested);
     if let Some(id) = device_id {
         ep = ep.with_device_id(id);
     }

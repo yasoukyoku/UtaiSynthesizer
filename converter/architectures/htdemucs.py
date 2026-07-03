@@ -411,7 +411,7 @@ class HTDemucs(nn.Module):
         growth=2, nfft=4096, depth=4, rewrite=True, freq_emb=0.2,
         emb_scale=10, emb_smooth=True, kernel_size=8, time_stride=2,
         stride=4, context=1, context_enc=0, norm_starts=4, norm_groups=4,
-        dconv_depth=2, dconv_comp=8, dconv_init=1e-3,
+        dconv_mode=1, dconv_depth=2, dconv_comp=8, dconv_init=1e-3,
         bottom_channels=0,
         t_layers=5, t_hidden_scale=4.0, t_heads=8, t_dropout=0.0,
         t_max_positions=10000, t_norm_in=True, t_norm_in_group=False,
@@ -471,22 +471,26 @@ class HTDemucs(nn.Module):
                 chout_z = max(chout, chout_z)
                 chout = chout_z
 
+            # dconv_mode: official demucs semantics — bit 1 = encoder, bit 2 = decoder.
+            # Official ckpts use dconv_mode=1 (encoder only); MSST yamls often use 3.
             self.encoder.append(
-                HEncLayer(chin_z, chout_z, dconv=True, context=context_enc, **kw))
+                HEncLayer(chin_z, chout_z, dconv=bool(dconv_mode & 1),
+                          context=context_enc, **kw))
             if freq:
                 self.tencoder.append(
-                    HEncLayer(chin, chout, dconv=True, context=context_enc,
-                              empty=last_freq, **kwt))
+                    HEncLayer(chin, chout, dconv=bool(dconv_mode & 1),
+                              context=context_enc, empty=last_freq, **kwt))
 
             if index == 0:
                 chin = audio_channels * self.sources
                 chin_z = chin * 2
 
             self.decoder.insert(0,
-                HDecLayer(chout_z, chin_z, dconv=True, last=index == 0, context=context, **kw_dec))
+                HDecLayer(chout_z, chin_z, dconv=bool(dconv_mode & 2),
+                          last=index == 0, context=context, **kw_dec))
             if freq:
                 self.tdecoder.insert(0,
-                    HDecLayer(chout, chin, dconv=True, empty=last_freq,
+                    HDecLayer(chout, chin, dconv=bool(dconv_mode & 2), empty=last_freq,
                               last=index == 0, context=context, **kwt))
 
             chin = chout
@@ -608,54 +612,104 @@ class HTDemucs(nn.Module):
 
 # ─── Config detection ─────────────────────────────────────────
 
-def detect_config(ckpt_path: str) -> dict:
-    """Detect HTDemucs config from checkpoint."""
+def _guard_unsupported(params: dict, origin: str) -> None:
+    """Hard-fail on HTDemucs variants this ONNX reimplementation does not cover.
+    Loading them with a mismatched graph would silently corrupt output."""
+    if params.get("cac", True) is not True:
+        raise RuntimeError(
+            f"Unsupported HTDemucs variant ({origin}): cac=false (magnitude+Wiener "
+            f"mode). This converter only supports cac=true models."
+        )
+    if int(params.get("num_subbands", 1) or 1) > 1:
+        raise RuntimeError(
+            f"Unsupported HTDemucs variant ({origin}): num_subbands="
+            f"{params.get('num_subbands')} > 1 is not supported."
+        )
+    if params.get("multi_freqs"):
+        raise RuntimeError(
+            f"Unsupported HTDemucs variant ({origin}): non-empty multi_freqs "
+            f"(MultiWrap band-split layers) is not supported."
+        )
+
+
+def _accepted_hparams(params: dict) -> dict:
+    """Filter a kwargs/yaml-htdemucs mapping down to HTDemucs.__init__ params,
+    sanitizing values (MSST yamls carry dconv_init as the string '1e-3')."""
+    import inspect
+    accepted = set(inspect.signature(HTDemucs.__init__).parameters) - {"self"}
+    cfg = {k: v for k, v in params.items() if k in accepted}
+    if "dconv_init" in cfg:
+        cfg["dconv_init"] = float(cfg["dconv_init"])
+    if "segment" in cfg:
+        cfg["segment"] = float(cfg["segment"])
+    return cfg
+
+
+def detect_config(ckpt_path: str, yaml_path: Optional[str] = None) -> dict:
+    """Detect HTDemucs config from checkpoint (+ optional MSST training yaml).
+
+    Official demucs ckpts carry full 'kwargs'; MSST fine-tunes are raw state
+    dicts, where structure is detected from the weights and remaining
+    hyperparameters come from the yaml's htdemucs section.
+    """
+    from .msst_yaml import load_msst_yaml
+    yaml_config = load_msst_yaml(yaml_path)
+    training_yaml = yaml_config.get("training") or {}
+
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-    # Handle different checkpoint formats
-    if isinstance(state, dict):
-        if "kwargs" in state:
-            kw = state["kwargs"]
-            sd = state.get("state", state.get("state_dict", {}))
-            sources = kw.get("sources", ["drums", "bass", "other", "vocals"])
-            return dict(
-                sources=len(sources) if isinstance(sources, list) else sources,
-                audio_channels=kw.get("audio_channels", 2),
-                channels=kw.get("channels", 48),
-                growth=kw.get("growth", 2),
-                nfft=kw.get("nfft", 4096),
-                depth=kw.get("depth", 4),
-                kernel_size=kw.get("kernel_size", 8),
-                stride=kw.get("stride", 4),
-                time_stride=kw.get("time_stride", 2),
-                t_layers=kw.get("t_layers", 5),
-                t_heads=kw.get("t_heads", 8),
-                t_hidden_scale=kw.get("t_hidden_scale", 4.0),
-                bottom_channels=kw.get("bottom_channels", 0),
-                samplerate=kw.get("samplerate", 44100),
-                segment=kw.get("segment", 10),
-            )
-        if "state_dict" in state:
-            sd = state["state_dict"]
-        elif "state" in state:
-            sd = state["state"]
-        else:
-            sd = state
+    # Official demucs format: {'klass', 'kwargs', 'state'}
+    if isinstance(state, dict) and "kwargs" in state:
+        kw = dict(state["kwargs"])
+        _guard_unsupported(kw, "ckpt kwargs")
+        cfg = _accepted_hparams(kw)
+        sources = kw.get("sources", ["drums", "bass", "other", "vocals"])
+        cfg["sources"] = list(sources) if isinstance(sources, (list, tuple)) else sources
+        # Official demucs default is dconv_mode=1 (encoder only) — NOT both.
+        cfg["dconv_mode"] = int(kw.get("dconv_mode", 1))
+        if "segment" not in cfg:
+            cfg["segment"] = float(training_yaml.get("segment", 11))
+        print(f"  [kwargs] sources={cfg['sources']}, channels={cfg.get('channels', 48)}, "
+              f"depth={cfg.get('depth', 4)}, dconv_mode={cfg['dconv_mode']}, "
+              f"segment={cfg['segment']}")
+        return cfg
+
+    # Raw state_dict (MSST format)
+    if isinstance(state, dict) and "state_dict" in state:
+        sd = state["state_dict"]
+    elif isinstance(state, dict) and "state" in state:
+        sd = state["state"]
     else:
         sd = state
 
-    # Auto-detect from weights
+    ht_yaml = yaml_config.get("htdemucs") or {}
+    _guard_unsupported(ht_yaml, "yaml htdemucs section")
+    cfg = _accepted_hparams(ht_yaml)
+
+    # Structure detected from the weights overrides the yaml.
     channels = sd["encoder.0.conv.weight"].shape[0]
-    chin_z = sd["encoder.0.conv.weight"].shape[1]  # 4 for stereo CaC
-    sources = sd["decoder.0.conv_tr.weight"].shape[1] // chin_z
+    chin_z = sd["encoder.0.conv.weight"].shape[1]  # audio_channels * 2 (CaC)
+    audio_channels = chin_z // 2
 
-    n_enc = 0
-    while f"encoder.{n_enc}.conv.weight" in sd:
-        n_enc += 1
-    depth = n_enc
+    depth = 0
+    while f"encoder.{depth}.conv.weight" in sd:
+        depth += 1
 
-    growth_factor = sd["encoder.1.conv.weight"].shape[0] / channels if depth > 1 else 2
-    growth = int(growth_factor)
+    # sources: the OUTERMOST freq decoder is decoder.{depth-1} (the constructor
+    # builds with decoder.insert(0, ...), so decoder.0 is the DEEPEST layer —
+    # reading sources there gives channels*growth^(depth-1)-scale garbage).
+    # Its conv_tr outputs sources * audio_channels * 2 (CaC) channels.
+    sources = sd[f"decoder.{depth - 1}.conv_tr.weight"].shape[1] // (2 * audio_channels)
+    t_key = f"tdecoder.{depth - 1}.conv_tr.weight"
+    if t_key in sd:
+        t_sources = sd[t_key].shape[1] // audio_channels
+        if t_sources != sources:
+            raise RuntimeError(
+                f"Inconsistent sources: freq decoder says {sources}, "
+                f"time decoder says {t_sources}"
+            )
+
+    growth = int(sd["encoder.1.conv.weight"].shape[0] / channels) if depth > 1 else 2
 
     t_layers = 0
     while f"crosstransformer.layers.{t_layers}.self_attn.in_proj_weight" in sd or \
@@ -666,20 +720,34 @@ def detect_config(ckpt_path: str) -> dict:
     if "channel_upsampler.weight" in sd:
         bottom_channels = sd["channel_upsampler.weight"].shape[0]
 
-    print(f"  sources={sources}, channels={channels}, depth={depth}, growth={growth}")
-    print(f"  t_layers={t_layers}, bottom_channels={bottom_channels}")
+    # dconv per branch from actual key presence (official=encoder only,
+    # MSST yamls often say 3=both; the weights are the ground truth).
+    enc_dconv = any(k.startswith("encoder.") and ".dconv." in k for k in sd)
+    dec_dconv = any(k.startswith("decoder.") and ".dconv." in k for k in sd)
+    dconv_mode = (1 if enc_dconv else 0) | (2 if dec_dconv else 0)
 
-    return dict(
-        sources=sources, channels=channels, depth=depth, growth=growth,
-        nfft=4096, t_layers=t_layers, bottom_channels=bottom_channels,
-        samplerate=44100, segment=10,
+    cfg.update(
+        sources=sources, audio_channels=audio_channels, channels=channels,
+        depth=depth, growth=growth, t_layers=t_layers,
+        bottom_channels=bottom_channels, dconv_mode=dconv_mode,
     )
+    cfg.setdefault("nfft", 4096)
+    cfg["samplerate"] = int(training_yaml.get("samplerate", cfg.get("samplerate", 44100)))
+    # MSST trains/runs with training.segment (11s for the vocal models) — 10 is wrong.
+    cfg["segment"] = float(training_yaml.get("segment", 11))
+
+    print(f"  sources={sources}, channels={channels}, depth={depth}, growth={growth}")
+    print(f"  t_layers={t_layers}, bottom_channels={bottom_channels}, "
+          f"dconv_mode={dconv_mode}, segment={cfg['segment']}")
+
+    return cfg
 
 
-def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None) -> HTDemucs:
+def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None,
+                         yaml_path: Optional[str] = None) -> HTDemucs:
     """Load HTDemucs from checkpoint."""
     if config is None:
-        config = detect_config(ckpt_path)
+        config = detect_config(ckpt_path, yaml_path)
 
     model = HTDemucs(**config)
 
@@ -694,11 +762,9 @@ def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None) -> HTDem
     else:
         sd = state
 
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        print(f"  Missing keys: {len(missing)}")
-    if unexpected:
-        print(f"  Unexpected keys: {len(unexpected)}")
+    # strict=True: any mismatch means the detected config diverged from the
+    # checkpoint (e.g. wrong dconv_mode), which would silently corrupt output.
+    model.load_state_dict(sd, strict=True)
 
     model.eval()
     return model

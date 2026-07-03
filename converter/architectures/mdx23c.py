@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from typing import Optional, List
 
+from .msst_yaml import load_msst_yaml
+
 
 # ─── Normalization / Activation ──────────────────────────────────
 
@@ -254,15 +256,9 @@ def detect_config(ckpt_path: str, yaml_path: Optional[str] = None) -> dict:
     has_running_mean = any("running_mean" in k for k in sd.keys())
     norm_type = "BatchNorm" if has_running_mean else "InstanceNorm"
 
-    # YAML overrides for STFT params (not detectable from weights)
-    yaml_config = {}
-    if yaml_path:
-        try:
-            import yaml
-            with open(yaml_path) as f:
-                yaml_config = yaml.safe_load(f)
-        except Exception as e:
-            print(f"Warning: could not load YAML config: {e}")
+    # YAML overrides for STFT params (not detectable from weights).
+    # FullLoader — MSST yamls contain !!python/tuple; hard-fails on parse error.
+    yaml_config = load_msst_yaml(yaml_path)
 
     audio_yaml = yaml_config.get("audio", {})
     model_yaml = yaml_config.get("model", {})
@@ -305,11 +301,9 @@ def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None,
     elif isinstance(state, dict) and "model" in state:
         state = state["model"]
 
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"  Missing keys: {len(missing)} (expected if STFT-related)")
-    if unexpected:
-        print(f"  Unexpected keys: {len(unexpected)}")
+    # strict=True: the original's STFT module holds no parameters, so a correct
+    # config loads with 0 missing / 0 unexpected keys. Any mismatch = wrong config.
+    model.load_state_dict(state, strict=True)
 
     model.eval()
     return model
