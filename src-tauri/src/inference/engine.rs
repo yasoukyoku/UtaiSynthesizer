@@ -52,7 +52,7 @@ impl Drop for InFlightGuard<'_> {
 
 struct LoadedSession {
     session: Mutex<Session>,
-    _path: PathBuf,
+    path: PathBuf,
     last_used: AtomicU64,
     /// Human label of the EP actually backing this session ("CUDA (GPU)", "DirectML (GPU)", "CPU").
     /// Logged at inference time so the user can confirm what really ran (and catch silent fallbacks).
@@ -181,7 +181,7 @@ impl OnnxEngine {
                 key.clone(),
                 LoadedSession {
                     session: Mutex::new(session),
-                    _path: path.clone(),
+                    path: path.clone(),
                     last_used: AtomicU64::new(tick),
                     actual_device,
                 },
@@ -199,6 +199,27 @@ impl OnnxEngine {
         if self.sessions.write().remove(id).is_some() {
             tracing::info!("Unloaded ONNX session");
         }
+    }
+
+    /// Free every cached session EXCEPT the one for `keep_path`. Call before loading a
+    /// separation-size model: two separation CUDA arenas cannot coexist on a 12 GB card
+    /// (S31: BSRoformer's resident post-run arena + MelBand's T=1101 working set → WDDM
+    /// shared-memory overcommit, per-chunk time explodes and the run looks hung; the idle
+    /// sweeper would only reclaim it minutes later). Evicted sessions rebuild on demand via
+    /// run()'s reload-on-miss — the `paths` map survives — so voice/vocoder models just pay
+    /// a few seconds' reload on their next use.
+    pub fn release_others(&self, keep_path: &Path) -> usize {
+        let mut sessions = self.sessions.write();
+        let before = sessions.len();
+        sessions.retain(|_, s| s.path == keep_path);
+        let n = before - sessions.len();
+        if n > 0 {
+            tracing::info!(
+                "Released {} other cached ONNX session(s) before loading {} (GPU memory headroom)",
+                n, keep_path.display()
+            );
+        }
+        n
     }
 
     /// Drop all cached sessions (frees their memory). Safe to call between runs.

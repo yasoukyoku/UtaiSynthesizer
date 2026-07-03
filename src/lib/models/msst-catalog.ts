@@ -217,6 +217,7 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "melband_roformer_inst_v2.ckpt", fileSize: 1_500_000_000,
     stems: ["Instrumental", "Vocals"], sdrScore: 16.1,
     downloadUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/melband_roformer_inst_v2.ckpt`,
+    configUrl: `${HF}/pcunwa/Mel-Band-Roformer-Inst/resolve/main/config_melbandroformer_inst_v2.yaml`,
   },
   {
     id: "mel_inst_v1e", category: "instrumental", architecture: "mel_band_roformer", source: "official",

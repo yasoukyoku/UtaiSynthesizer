@@ -150,9 +150,14 @@ pub async fn download_msst_model(
 
     tracing::info!("Downloaded MSST model: {} ({} bytes)", filename, downloaded);
 
-    // Auto-convert to ONNX
+    // Auto-convert to ONNX — model files only. Sidecar downloads (the catalog's configUrl yaml
+    // lands next to the ckpt) match arch names too and used to get "converted" (traceback WARN).
+    let is_model_file = matches!(
+        dest.extension().and_then(|e| e.to_str()),
+        Some("ckpt") | Some("pth") | Some("th") | Some("bin")
+    );
     let arch = detect_architecture_from_name(&filename);
-    if arch != "unknown" {
+    if arch != "unknown" && is_model_file {
         let _ = app.emit(
             "msst-download-progress",
             DownloadProgress {

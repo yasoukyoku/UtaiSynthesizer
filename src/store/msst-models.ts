@@ -64,18 +64,21 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
 
   downloadEntry: async (entry) => {
     const mirror = get().mirror;
-    const url = applyMirror(entry.downloadUrl, mirror);
-    await get().downloadUrl(url, entry.filename);
-
+    // The original yaml must land BEFORE the ckpt and be named <ckpt stem>.yaml:
+    // the ckpt download auto-converts on completion, and the converter reads the SIBLING
+    // yaml (chunk/overlap, stem labels). The URL basename can differ from the ckpt name
+    // (e.g. config_melbandroformer_inst_v2.yaml), so always rename to the ckpt stem.
     if (entry.configUrl) {
       try {
         const cfgUrl = applyMirror(entry.configUrl, mirror);
-        const cfgFilename = entry.configUrl.split("/").pop() ?? "";
-        if (cfgFilename) await get().downloadUrl(cfgUrl, cfgFilename);
+        const stem = entry.filename.replace(/\.[^.]+$/, "");
+        await get().downloadUrl(cfgUrl, `${stem}.yaml`);
       } catch {
         // config download failure is non-fatal
       }
     }
+    const url = applyMirror(entry.downloadUrl, mirror);
+    await get().downloadUrl(url, entry.filename);
   },
 
   downloadUrl: async (url, filename) => {

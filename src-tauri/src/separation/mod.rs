@@ -130,6 +130,10 @@ impl SeparationManager {
         engine: &OnnxEngine,
         model_path: &Path,
     ) -> Result<()> {
+        // Evict all other cached sessions first — see OnnxEngine::release_others. Running two
+        // separation nodes back-to-back otherwise keeps the previous model's multi-GB CUDA arena
+        // resident while the next one loads, and 12 GB cards fall into WDDM paging.
+        engine.release_others(model_path);
         let mut pipe = pipeline::NativePipeline::new(engine, model_path)?;
         pipe.set_normalize(config.normalize);
         if let Some(n) = config.num_overlap {
