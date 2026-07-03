@@ -50,6 +50,11 @@ S32 增补的管线改动 A/B 手法：cargo 会把旧的测试 exe 留在 `targ
 separation_pipeline-<hash>.exe` —— 新旧 exe 直接各跑一遍比 md5，免 git stash；harness 另有
 `UTAI_SEP_OVERLAP=<n>` 覆盖模型 JSON 的 num_overlap（chunk 几何实验用，同 UI 滑条语义）。
 
+跨几何（如 ov4 vs ov2）质量门：`overlap_ab_check.py <mix> <dirA> <dirB> <stepB>` ——
+每 stem corr/电平 + sum(stems)-vs-mix 可加性残差 + 步长边界接缝探针。读数校准（S32 htdemucs
+实测）：响 stem corr 0.998+/SNR 25-33 dB = 正常 split-jitter；安静 stem（RMS<0.02）的低
+corr/SNR 是效应假象，看绝对误差底是否与响 stem 一致；接缝探针 ratio ~1.0 过 / >2 查边界。
+
 ## 关卡 5 — stem 顺序 / 端口映射
 模型真实输出顺序 = json `stem_names`（converter 从 kwargs/yaml training.instruments 读出）。
 catalog 手写 stems 只是未安装时的展示兜底。**E2E 测试按 json 命名存文件，永远抓不到前端
