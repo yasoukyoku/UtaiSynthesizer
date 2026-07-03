@@ -5128,9 +5128,18 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "utai-dsp",
  "uuid",
  "xxhash-rust",
  "zip",
+]
+
+[[package]]
+name = "utai-dsp"
+version = "0.1.0"
+dependencies = [
+ "ndarray 0.16.1",
+ "rustfft",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 pub mod pipeline;
 pub mod sidecar;
-pub mod stft;
+// stft moved to the utai-dsp sub-crate (dev opt-3); re-export keeps the public path
+// `utai_lib::separation::stft::*` (tests) working unchanged.
+pub use utai_dsp::stft;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

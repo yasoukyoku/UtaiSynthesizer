@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/utai-dsp"]
+
 [package]
 name = "utai"
 version = "2.0.0-alpha.1"
@@ -40,10 +43,26 @@ zip = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { version = "0.12", features = ["stream"] }
 futures-util = "0.3"
+utai-dsp = { path = "crates/utai-dsp" }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 
+# The separation hot loops live in utai-dsp precisely so dev builds can run them at
+# opt-3 without slowing the app crate's incremental compiles. S32 measured opt-0 DSP
+# at 10-30x the wall time of release on the conv-arch pipelines (dev htdemucs 380s vs
+# release 12s per 120s of audio). The per-dependency overrides below do NOT cover
+# ndarray-indexing loops in opt-0 caller crates (monomorphization happens in the
+# calling crate) — that is WHY the sub-crate exists.
+[profile.dev.package.utai-dsp]
+opt-level = 3
+# The ort BINDING layer (Value construction / output extraction) sits on the per-chunk
+# path too — at opt-0 it added ~250 ms per htdemucs segment (S32: dev "inference"
+# 350 ms/seg vs release 94 ms/seg on identical GPU work).
+[profile.dev.package.ort]
+opt-level = 3
+[profile.dev.package.ort-sys]
+opt-level = 3
 [profile.dev.package.rustfft]
 opt-level = 3
 [profile.dev.package.ndarray]

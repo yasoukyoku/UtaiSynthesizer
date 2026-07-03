@@ -1,0 +1,8 @@
+[package]
+name = "utai-dsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndarray = "0.16"
+rustfft = "6.2"

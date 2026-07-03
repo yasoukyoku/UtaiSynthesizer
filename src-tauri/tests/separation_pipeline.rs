@@ -10,6 +10,14 @@ fn app_root() -> PathBuf {
 /// The app does this in run() before any ort use; without it, `cargo test` hangs forever at
 /// 0 CPU on the first session build (invisible modal DLL dialog + uninitialized load-dynamic ORT).
 fn init_ort() {
+    // Tests have no tracing subscriber by default, so the [perf] probes in pipeline.rs are
+    // invisible without this. RUST_LOG overrides; default surfaces utai_lib debug (= all probes).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=debug")),
+        )
+        .try_init();
     utai_lib::suppress_windows_dll_error_dialogs();
     utai_lib::init_ort_runtime(&app_root());
 }
@@ -80,8 +88,10 @@ fn test_stft_roundtrip_quality() {
         })
         .collect();
 
-    let spec = stft::stft(&signal, &config);
-    let reconstructed = stft::istft(&spec, &config, signal.len());
+    // The free-function stft API was removed with the utai-dsp move — use the processor.
+    let proc = stft::StftProcessor::new(config);
+    let spec = proc.stft(&signal);
+    let reconstructed = proc.istft(&spec, signal.len());
 
     assert_eq!(reconstructed.len(), signal.len());
 
@@ -142,7 +152,12 @@ fn separate_env_wav() {
     if std::env::var("UTAI_SEP_DEVICE").as_deref() != Ok("auto") {
         engine.set_device(DeviceConfig::Cpu);
     }
-    let pipe = NativePipeline::new(&engine, &model_path).expect("Failed to create pipeline");
+    let mut pipe = NativePipeline::new(&engine, &model_path).expect("Failed to create pipeline");
+    // UTAI_SEP_OVERLAP overrides the model JSON's num_overlap (chunk-geometry experiments,
+    // e.g. the S32 htdemucs ov4→ov2 gate) — same knob as the UI slider.
+    if let Some(n) = std::env::var("UTAI_SEP_OVERLAP").ok().and_then(|v| v.parse::<usize>().ok()) {
+        pipe.set_num_overlap(n);
+    }
     let audio = pipeline::load_wav(&PathBuf::from(&input)).unwrap();
 
     let stems = pipe.separate(&audio, &|_p| true).expect("Separation failed");

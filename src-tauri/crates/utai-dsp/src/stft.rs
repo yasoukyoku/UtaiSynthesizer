@@ -217,43 +217,9 @@ pub fn apply_complex_mask(stft_repr: &Array3<f32>, mask: &Array3<f32>) -> Array3
     result
 }
 
-// ─── Legacy free-function API (used by existing code, delegates to StftProcessor) ──
-
-pub fn stft(signal: &[f32], config: &StftConfig) -> Array3<f32> {
-    let proc = StftProcessor::new(StftConfig {
-        n_fft: config.n_fft,
-        hop_length: config.hop_length,
-        win_length: config.win_length,
-    });
-    proc.stft(signal)
-}
-
-pub fn istft(spectrogram: &Array3<f32>, config: &StftConfig, length: usize) -> Vec<f32> {
-    let proc = StftProcessor::new(StftConfig {
-        n_fft: config.n_fft,
-        hop_length: config.hop_length,
-        win_length: config.win_length,
-    });
-    proc.istft(spectrogram, length)
-}
-
-pub fn stft_stereo(left: &[f32], right: &[f32], config: &StftConfig) -> Array3<f32> {
-    let proc = StftProcessor::new(StftConfig {
-        n_fft: config.n_fft,
-        hop_length: config.hop_length,
-        win_length: config.win_length,
-    });
-    proc.stft_stereo(left, right)
-}
-
-pub fn istft_stereo(spectrogram: &Array3<f32>, config: &StftConfig, length: usize) -> (Vec<f32>, Vec<f32>) {
-    let proc = StftProcessor::new(StftConfig {
-        n_fft: config.n_fft,
-        hop_length: config.hop_length,
-        win_length: config.win_length,
-    });
-    proc.istft_stereo(spectrogram, length)
-}
+// NOTE: the old free-function API (stft/istft/stft_stereo/istft_stereo re-building a
+// StftProcessor — and thus re-planning the FFT — on every call) was deleted in the S32
+// move. Use StftProcessor directly.
 
 #[cfg(test)]
 mod tests {
