@@ -12,6 +12,10 @@ export interface InstalledModel {
   has_onnx: boolean;
   /** fp16 `<stem>.fp16.onnx` sibling exists (never listed as its own row). */
   has_fp16: boolean;
+  /** TRUE output order from the model json — ports/lane labels must follow this, not catalog lists. */
+  stem_names?: string[] | null;
+  /** Residual (mix-minus-stem) label for single-stem models — the LAST output port. */
+  residual_name?: string | null;
 }
 
 interface DownloadState {

@@ -367,8 +367,11 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     id: "htdemucs_6s", category: "multistem", architecture: "htdemucs", source: "official",
     name: { zh: "HTDemucs 6轨", en: "HTDemucs 6-Stem", ja: "HTDemucs 6ステム" },
     description: { zh: "6轨: 鼓/贝斯/吉他/钢琴/其他/人声, ~52MB", en: "6-stem: drums/bass/guitar/piano/other/vocals, ~52MB", ja: "6ステム: ドラム/ベース/ギター/ピアノ/その他/ボーカル、~52MB" },
+    // TRUE weight output order (ckpt kwargs) — the model card lists guitar/piano mid-list, but
+    // labeling ports from that order put VOCALS on the Piano port. Port labels now come from the
+    // installed json anyway; this is the pre-install display fallback and must still be correct.
     filename: "5c90dfd2-34c22ccb.th", fileSize: 55_000_000,
-    stems: ["Drums", "Bass", "Guitar", "Piano", "Other", "Vocals"],
+    stems: ["Drums", "Bass", "Other", "Vocals", "Guitar", "Piano"],
     downloadUrl: `${FB_CDN}/5c90dfd2-34c22ccb.th`,
     configUrl: `${GH_DEMUCS}/htdemucs_6s.yaml`,
   },

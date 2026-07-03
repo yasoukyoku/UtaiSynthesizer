@@ -40,23 +40,42 @@ export function SeparationNode(props: NodeProps) {
   // the next edit, silently re-committing) the undone model while Run used the restored one.
   const selectedModel = (params.modelFile as string) ?? models[0]?.filename ?? "";
   const currentModel = models.find((m) => m.filename === selectedModel) ?? models[0];
-  const stems = currentModel?.stems ?? ["Output"];
   const arch = currentModel?.arch ?? "bs_roformer";
   // Precision is choosable only when BOTH onnx variants are on disk — otherwise Rust already
   // runs the only one that exists (with graceful fallback), so a selector would be a lie.
   const installedModel = installed.find((m) => m.filename === currentModel?.filename);
   const hasBothPrecisions = !!installedModel?.has_onnx && !!installedModel?.has_fp16;
+  // Output ports MUST follow the model's TRUE order from its json (stem_names [+ residual]) —
+  // Rust deposits stems by index in that order. Hand-written catalog `stems` lists are only the
+  // pre-conversion display fallback: htdemucs_6s's model card says drums/bass/guitar/piano/other/
+  // vocals but the weights output [drums,bass,other,vocals,guitar,piano] — labeling ports from
+  // the catalog put VOCALS on the Piano port.
+  const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+  const stems = installedModel?.stem_names?.length
+    ? [...installedModel.stem_names, ...(installedModel.residual_name ? [installedModel.residual_name] : [])].map(cap)
+    : currentModel?.stems ?? ["Output"];
 
   useEffect(() => {
     if (!modelsDir) return;
     if (currentModel && (params.modelFile !== currentModel.filename || !params.modelPath || params.modelPath === `/${currentModel.filename.replace(/\.(ckpt|th|pth)$/, ".onnx")}`)) {
       updateParams({
         modelFile: currentModel.filename,
-        stemLabels: currentModel.stems,
+        stemLabels: stems,
         modelPath: resolveOnnxPath(currentModel.filename),
       });
     }
   }, [modelsDir]);
+
+  // Keep the persisted port labels in sync with the model's true order — the json's stem_names
+  // only become available after install/convert, which can be AFTER the params were first written
+  // (and lane naming reads params.stemLabels, not this component).
+  useEffect(() => {
+    const saved = params.stemLabels as string[] | undefined;
+    if (currentModel && saved && JSON.stringify(saved) !== JSON.stringify(stems)) {
+      updateParams({ stemLabels: stems });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stems.join("")]);
 
   const resolveOnnxPath = useCallback((filename: string) => {
     const onnxName = filename.replace(/\.(ckpt|th|pth)$/, ".onnx");
@@ -67,9 +86,14 @@ export function SeparationNode(props: NodeProps) {
   const handleModelChange = useCallback((filename: string) => {
     const m = models.find((x) => x.filename === filename);
     if (m) {
-      updateParams({ modelFile: filename, stemLabels: m.stems, modelPath: resolveOnnxPath(filename) });
+      // Same true-order rule as above: prefer the installed json's stem_names over catalog stems.
+      const inst = installed.find((x) => x.filename === filename);
+      const labels = inst?.stem_names?.length
+        ? [...inst.stem_names, ...(inst.residual_name ? [inst.residual_name] : [])].map(cap)
+        : m.stems;
+      updateParams({ modelFile: filename, stemLabels: labels, modelPath: resolveOnnxPath(filename) });
     }
-  }, [models, updateParams, resolveOnnxPath]);
+  }, [models, installed, updateParams, resolveOnnxPath]);
 
   const catLabel = t18(CATEGORY_LABELS[category], lang);
 

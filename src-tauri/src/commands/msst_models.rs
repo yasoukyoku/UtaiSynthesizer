@@ -16,6 +16,25 @@ pub struct MsstModelFile {
     /// The `<stem>.fp16.onnx` variant exists. Either precision alone is runnable — the node's
     /// precision selector only appears when BOTH do.
     pub has_fp16: bool,
+    /// The model's TRUE output order from its json (converter reads it from ckpt kwargs/yaml).
+    /// The frontend MUST label output ports from this, not from hand-written catalog lists:
+    /// htdemucs_6s really outputs [drums,bass,other,vocals,guitar,piano] while its model card
+    /// says drums/bass/guitar/piano/other/vocals — the catalog order put VOCALS on the Piano port.
+    pub stem_names: Option<Vec<String>>,
+    /// Residual (mix-minus-stem) label for single-stem models — the LAST output port.
+    pub residual_name: Option<String>,
+}
+
+/// Read stem_names/residual_name from the model's json sibling (None when absent/unparseable).
+fn read_stem_fields(fp32_onnx: &Path) -> (Option<Vec<String>>, Option<String>) {
+    let json_path = fp32_onnx.with_extension("json");
+    let Ok(text) = std::fs::read_to_string(&json_path) else { return (None, None) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return (None, None) };
+    let names = v.get("stem_names").and_then(|a| a.as_array()).map(|a| {
+        a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect::<Vec<_>>()
+    }).filter(|n| !n.is_empty());
+    let residual = v.get("residual_name").and_then(|s| s.as_str()).map(str::to_string);
+    (names, residual)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +80,7 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
         let fp32_onnx = path.with_extension("onnx");
         let has_onnx = if ext == "onnx" { true } else { fp32_onnx.exists() };
         let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
+        let (stem_names, residual_name) = read_stem_fields(&fp32_onnx);
 
         models.push(MsstModelFile {
             filename,
@@ -68,6 +88,8 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
             architecture,
             has_onnx,
             has_fp16,
+            stem_names,
+            residual_name,
         });
     }
 
@@ -294,6 +316,7 @@ pub fn import_local_msst_model(
     let fp32_onnx = dest.with_extension("onnx");
     let has_onnx = fp32_onnx.exists();
     let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
+    let (stem_names, residual_name) = read_stem_fields(&fp32_onnx);
 
     tracing::info!("Imported MSST model: {}", filename);
     Ok(MsstModelFile {
@@ -302,6 +325,8 @@ pub fn import_local_msst_model(
         architecture,
         has_onnx,
         has_fp16,
+        stem_names,
+        residual_name,
     })
 }
 
