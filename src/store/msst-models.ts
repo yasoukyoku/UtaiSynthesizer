@@ -31,8 +31,8 @@ interface MsstModelStore {
   fetchInstalled: () => Promise<void>;
   fetchModelsDir: () => Promise<void>;
   downloadEntry: (entry: MsstCatalogEntry, precision?: MsstPrecision) => Promise<void>;
-  downloadUrl: (url: string, filename: string, precision?: MsstPrecision) => Promise<void>;
-  convertPrecision: (filename: string, precision?: MsstPrecision) => Promise<void>;
+  downloadUrl: (url: string, filename: string, precision?: MsstPrecision, architecture?: string) => Promise<void>;
+  convertPrecision: (filename: string, precision?: MsstPrecision, architecture?: string) => Promise<void>;
   deleteModel: (filename: string) => Promise<void>;
   importLocal: (path: string) => Promise<void>;
   clearError: () => void;
@@ -82,11 +82,13 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
       }
     }
     const url = applyMirror(entry.downloadUrl, mirror);
-    // precision only applies to the MODEL download (auto-convert target), never the yaml sidecar.
-    await get().downloadUrl(url, entry.filename, precision);
+    // precision/architecture only apply to the MODEL download (auto-convert target), never the
+    // yaml sidecar. Passing the catalog architecture matters for hash-named official weights
+    // (e.g. demucs 5c90dfd2-34c22ccb.th) that Rust's name detection cannot classify.
+    await get().downloadUrl(url, entry.filename, precision, entry.architecture);
   },
 
-  downloadUrl: async (url, filename, precision) => {
+  downloadUrl: async (url, filename, precision, architecture) => {
     set((s) => ({
       downloading: {
         ...s.downloading,
@@ -96,7 +98,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
     }));
 
     try {
-      await invoke("download_msst_model", { url, filename, precision });
+      await invoke("download_msst_model", { url, filename, precision, architecture });
       set((s) => {
         const { [filename]: _, ...rest } = s.downloading;
         return { downloading: rest };
@@ -114,7 +116,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   // ckpt). fp16 with the fp32 onnx on disk is the fast post-hoc path (~1-2 min); fp32 (or fp16
   // without the fp32 file) is a full re-export. Reuses the download record's "converting" stage
   // so the existing DownloadBar / indicators track it.
-  convertPrecision: async (filename, precision) => {
+  convertPrecision: async (filename, precision, architecture) => {
     set((s) => ({
       downloading: {
         ...s.downloading,
@@ -123,7 +125,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
       error: null,
     }));
     try {
-      await invoke("convert_msst_model", { filename, precision });
+      await invoke("convert_msst_model", { filename, precision, architecture });
       await get().fetchInstalled();
     } catch (e) {
       set({ error: String(e) });

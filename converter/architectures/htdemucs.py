@@ -525,6 +525,23 @@ class HTDemucs(nn.Module):
             gelu=t_gelu, weight_pos_embed=t_weight_pos_embed,
         ) if t_layers > 0 else None
 
+    @staticmethod
+    def _stats(x: torch.Tensor, dims) -> tuple:
+        """mean/std with an fp16-convertible export, two tricks:
+        1. pow-2 pre-scale (2^-8, rescale after): power-of-two scaling commutes
+           with IEEE rounding, so fp32 is unchanged, but the squared terms stay
+           inside fp16 range (real CaC spec peaks ~400; 400^2 > fp16 max 65504).
+        2. biased variance via mean-of-squares: torch.std's Bessel correction
+           exports a dynamic element-count subgraph (ReduceProd over the shape,
+           then Cast to float) — the count (~2.7M) overflows to inf when the
+           graph is converted to fp16, NaN-poisoning every stem. ReduceMean has
+           no count node. Bessel on ~1e6 elements is ~1e-6 relative: negligible.
+        """
+        xs = x * (1.0 / 256.0)
+        m = xs.mean(dim=dims, keepdim=True)
+        var = (xs - m).pow(2).mean(dim=dims, keepdim=True)
+        return m * 256.0, var.sqrt() * 256.0
+
     def forward(self, cac_spec: torch.Tensor, mix: torch.Tensor):
         """
         Args:
@@ -538,13 +555,11 @@ class HTDemucs(nn.Module):
         B, C, Fq, T = x.shape
         S = self.sources
 
-        mean = x.mean(dim=(1, 2, 3), keepdim=True)
-        std = x.std(dim=(1, 2, 3), keepdim=True)
+        mean, std = self._stats(x, (1, 2, 3))
         x = (x - mean) / (1e-5 + std)
 
         xt = mix
-        meant = xt.mean(dim=(1, 2), keepdim=True)
-        stdt = xt.std(dim=(1, 2), keepdim=True)
+        meant, stdt = self._stats(xt, (1, 2))
         xt = (xt - meant) / (1e-5 + stdt)
 
         saved = []
@@ -632,6 +647,36 @@ def _guard_unsupported(params: dict, origin: str) -> None:
         )
 
 
+def _stub_demucs_modules():
+    """Official demucs .th checkpoints pickle a class reference ('klass', e.g.
+    demucs.htdemucs.HTDemucs). We only read 'kwargs'/'state', so satisfying the
+    unpickler with a stub module is enough — the real demucs package is not a
+    dependency. No-op if demucs is actually installed/already stubbed."""
+    import sys
+    import types
+    if "demucs" in sys.modules:
+        return
+    pkg = types.ModuleType("demucs")
+
+    def _fake_class(attr):
+        # Tolerate any class name (HTDemucs, HDemucs, Demucs, ...) but NOT
+        # dunders — inspect.getmodule probes __file__ on every sys.modules
+        # entry, and a fake __file__ crashes it.
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        return type(attr, (), {})
+
+    def _make_sub(name):
+        sub = types.ModuleType(f"demucs.{name}")
+        sub.__getattr__ = _fake_class
+        sys.modules[f"demucs.{name}"] = sub
+        setattr(pkg, name, sub)
+
+    for name in ("htdemucs", "hdemucs", "demucs", "transformer", "states"):
+        _make_sub(name)
+    sys.modules["demucs"] = pkg
+
+
 def _accepted_hparams(params: dict) -> dict:
     """Filter a kwargs/yaml-htdemucs mapping down to HTDemucs.__init__ params,
     sanitizing values (MSST yamls carry dconv_init as the string '1e-3')."""
@@ -656,6 +701,7 @@ def detect_config(ckpt_path: str, yaml_path: Optional[str] = None) -> dict:
     yaml_config = load_msst_yaml(yaml_path)
     training_yaml = yaml_config.get("training") or {}
 
+    _stub_demucs_modules()
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # Official demucs format: {'klass', 'kwargs', 'state'}
@@ -751,6 +797,7 @@ def load_from_checkpoint(ckpt_path: str, config: Optional[dict] = None,
 
     model = HTDemucs(**config)
 
+    _stub_demucs_modules()
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(state, dict):
         if "state" in state:

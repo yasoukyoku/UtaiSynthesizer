@@ -16,7 +16,7 @@ Usage:
 Separation types accept --precision fp32|fp16|both (default fp32). fp16 keeps
 the shared <stem>.json and writes <stem>.fp16.onnx (deleting the fp32 .onnx);
 both keeps both files. rvc/sovits ignore --precision. fp16 is numerically
-verified for the roformer types only; mdx23c/htdemucs are refused.
+verified (45 dB gate) for all four separation types (FP16_VERIFIED_TYPES).
 """
 
 import argparse
@@ -48,7 +48,7 @@ from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_fro
 # verified (>45 dB vs fp32) for the roformer archs + mdx23c (71.0/75.5 dB)
 # ONLY — refuse the rest.
 SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
-FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c"}
+FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
 
 
 def convert_rvc(input_path: Path, output_path: Path):

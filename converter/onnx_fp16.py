@@ -2,11 +2,15 @@
 
 THE single fp16 implementation (NO-DUP): imported by convert.py (--precision
 fp16/both) and invoked directly as a CLI by the Rust-side post-conversion
-command. Recipe numerically proven vs fp32 on both roformer architectures
-(BSRoformer 53.5/59.2 dB, MelBandRoformer 58.4/53.7 dB — both pass the 45 dB
-gate); mdx23c/htdemucs are NOT yet verified and are refused by convert.py.
+command. Recipe numerically proven vs fp32 on all four separation
+architectures (45 dB gate): BSRoformer 53.5/59.2 dB, MelBandRoformer
+58.4/53.7 dB, MDX23C, and HTDemucs 6-stem (52.9-56.8 dB on the four
+non-quiet stems; needs the step-0 fp32 stats island below).
 
-The recipe (all three steps are required — ORT load hard-fails otherwise):
+The recipe (all steps are required — ORT load hard-fails otherwise):
+0. htdemucs only: keep the input-normalization stats subgraph fp32 via
+   node_block_list (see _input_norm_block_list — global spec stats overflow
+   AND underflow fp16 on real CUDA kernels; CPU EP masks it).
 1. onnxconverter_common.float16.convert_float_to_float16(keep_io_types=True)
    — model IO stays fp32; internals + weights become fp16.
 2. Retarget Cast nodes carried over from the torch export whose `to=FLOAT` is
@@ -42,6 +46,72 @@ def default_fp16_path(in_path) -> Path:
     return in_path.with_name(in_path.stem + ".fp16.onnx")
 
 
+def _input_norm_block_list(model) -> list:
+    """Nodes that must STAY fp32: the htdemucs input-normalization stats.
+
+    HTDemucs normalizes inside the graph: (x - mean) / (1e-5 + std) with
+    GLOBAL mean/std over the whole CaC spec. Real spec values span ~1e-5..400,
+    so the squared terms span ~1e-11..1e5 — fp16 can represent NEITHER end
+    (subnormal floor 6e-8, max 65504). On true fp16 kernels (CUDA EP) the
+    variance collapses to 0 or inf and every stem output is NaN. The CPU EP
+    hides this by emulating fp16 ops in fp32 — do NOT trust CPU-only checks.
+
+    Detection is structural, not name-based: a normalization Div has a SMALL
+    ancestor closure (<= 64 nodes) that touches a graph input and contains a
+    ReduceMean. Mid-network norms (LayerNorm etc.) have the whole upstream
+    graph as ancestors, so the closure bound excludes them. Blocked nodes are
+    kept fp32 by convert_float_to_float16, which auto-inserts boundary casts;
+    downstream consumers of mean/std (the output de-normalization) get fp16
+    copies, which is safe — the stats VALUES fit fp16 fine, only their
+    COMPUTATION doesn't.
+
+    Gated on the htdemucs IO signature (cac_spec + mix, our own converter's
+    naming contract) so every other arch keeps the exact conversion path its
+    45 dB gate verified (a roformer's first-layer LayerNorm could otherwise
+    match the structural rule).
+    """
+    if {i.name for i in model.graph.input} != {"cac_spec", "mix"}:
+        return []
+    producer = {}
+    for node in model.graph.node:
+        for o in node.output:
+            if o:
+                producer[o] = node
+    input_names = {i.name for i in model.graph.input}
+
+    def closure_of(names):
+        closure, queue, seen = [], list(names), set()
+        while queue:
+            name = queue.pop()
+            if name in seen or name not in producer:
+                continue
+            seen.add(name)
+            up = producer[name]
+            closure.append(up)
+            if len(closure) > 64:
+                return None  # unbounded: not a near-input norm
+            queue.extend(up.input)
+        return closure
+
+    blocked = {}
+    for node in model.graph.node:
+        if node.op_type != "Div" or len(node.input) < 2:
+            continue
+        # A norm Div's DENOMINATOR (eps + std) reduces over the data — a
+        # ReduceMean ancestor. (A GELU div's denominator is a constant.)
+        denom = closure_of([node.input[1]])
+        if denom is None or not any(n.op_type == "ReduceMean" for n in denom):
+            continue
+        full = closure_of(node.input)
+        if full is None:
+            continue
+        if any(i in input_names for n in full + [node] for i in n.input):
+            for n in full + [node]:
+                if n.name:
+                    blocked[n.name] = True
+    return list(blocked)
+
+
 def convert_onnx_to_fp16(in_path, out_path) -> Path:
     """Convert a fp32 .onnx to fp16 weights/internals (IO kept fp32).
 
@@ -54,14 +124,22 @@ def convert_onnx_to_fp16(in_path, out_path) -> Path:
     orig_cast_names = {n.name for n in model.graph.node if n.op_type == "Cast"}
     print(f"original graph has {len(orig_cast_names)} Cast nodes")
 
-    fp16_model = float16.convert_float_to_float16(model, keep_io_types=True)
+    block_list = _input_norm_block_list(model)
+    if block_list:
+        print(f"keeping {len(block_list)} input-norm stats nodes fp32: {block_list}")
+    fp16_model = float16.convert_float_to_float16(
+        model, keep_io_types=True, node_block_list=block_list or None)
 
     # Only casts carried over from the torch export have stale to=FLOAT;
     # converter-inserted casts (io boundary etc.) are new names with correct
     # `to` attrs. Exact rule: the node name existed before conversion.
+    # Blocked (kept-fp32) casts must keep their FLOAT target.
+    blocked_names = set(block_list)
     fixed = 0
     for node in fp16_model.graph.node:
         if node.op_type != "Cast" or node.name not in orig_cast_names:
+            continue
+        if node.name in blocked_names:
             continue
         for attr in node.attribute:
             if attr.name == "to" and attr.i == TensorProto.FLOAT:

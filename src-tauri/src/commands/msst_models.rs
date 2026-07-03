@@ -84,6 +84,11 @@ pub async fn download_msst_model(
     // Download-time precision choice ("fp32" | "fp16", None = fp32). fp16 exports through an
     // fp32 intermediate then deletes it — the other precision can be back-converted later.
     precision: Option<String>,
+    // The catalog KNOWS the architecture — official demucs weights have hash filenames
+    // (5c90dfd2-34c22ccb.th) that name-detection can't classify, which silently skipped
+    // auto-convert and dropped runs into the python sidecar. Name detection stays as the
+    // fallback for URL/local imports without catalog metadata.
+    architecture: Option<String>,
 ) -> Result<String, String> {
     let dir = state.msst_models_dir.clone();
     let app_dir = state.app_dir.clone();
@@ -166,7 +171,7 @@ pub async fn download_msst_model(
         dest.extension().and_then(|e| e.to_str()),
         Some("ckpt") | Some("pth") | Some("th") | Some("bin")
     );
-    let arch = detect_architecture_from_name(&filename);
+    let arch = resolve_architecture(architecture.as_deref(), &filename);
     if arch != "unknown" && is_model_file {
         let _ = app.emit(
             "msst-download-progress",
@@ -199,6 +204,8 @@ pub async fn convert_msst_model(
     // and the fp32 ONNX already exists, only the cheap post-hoc fp16 conversion runs (no
     // torch re-export). fp32 (or fp16 without an fp32 on disk) does the full ckpt export.
     precision: Option<String>,
+    // Catalog-provided architecture (hash-named official weights defeat name detection).
+    architecture: Option<String>,
 ) -> Result<String, String> {
     let _task = state.begin_task("convert"); // listed in the close-flow's in-progress warning
     let dir = &state.msst_models_dir;
@@ -216,7 +223,7 @@ pub async fn convert_msst_model(
         }
     }
 
-    let arch = detect_architecture_from_name(&filename);
+    let arch = resolve_architecture(architecture.as_deref(), &filename);
     if arch == "unknown" {
         return Err("Cannot detect architecture from filename".into());
     }
@@ -387,6 +394,18 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
 }
 
 // find_converter_python moved to crate::util::find_python (shared with models/convert.rs).
+
+/// Catalog-provided architecture wins (validated against the known set); filename heuristics
+/// are only the fallback for URL/local imports without catalog metadata.
+fn resolve_architecture(explicit: Option<&str>, filename: &str) -> String {
+    if let Some(a) = explicit {
+        if matches!(a, "bs_roformer" | "mel_band_roformer" | "mdx23c" | "htdemucs") {
+            return a.to_string();
+        }
+        tracing::warn!("Ignoring unknown architecture hint '{}' — falling back to name detection", a);
+    }
+    detect_architecture_from_name(filename)
+}
 
 fn detect_architecture_from_name(filename: &str) -> String {
     let lower = filename.to_lowercase();

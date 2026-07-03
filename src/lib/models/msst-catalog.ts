@@ -79,11 +79,12 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
   htdemucs: "fp32",
 };
 
-/** Archs the converter can produce fp16 for (SNR-gated per arch: bs 53.5/59.2 dB, melband
- *  58.4/53.7 dB, mdx23c 71.0/75.5 dB vs fp32). ONE source of truth for every fp16 choice in the
- *  UI (download precision, 补转 actions). htdemucs pending — gate it when a model is installed.
- *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. */
-export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer", "mdx23c"]);
+/** Archs the converter can produce fp16 for (SNR-gated per arch on CUDA: bs 53.5/59.2 dB,
+ *  melband 58.4/53.7 dB, mdx23c 71.0/75.5 dB, htdemucs 52.9-56.8 dB non-quiet stems vs fp32).
+ *  ONE source of truth for every fp16 choice in the UI (download precision, 补转 actions).
+ *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. Gate rule: fp16 verification MUST run
+ *  on the CUDA EP — the CPU EP emulates fp16 in fp32 and false-passes (htdemucs NaN case). */
+export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"]);
 
 /** fp16 tradeoff copy shared by the model manager (download / 补转 tooltips) and the separation
  *  node's precision row — measured facts, keep in ONE place. */

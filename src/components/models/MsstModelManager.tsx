@@ -205,7 +205,12 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
               <div className="msst-installed-list">
                 {installed.map((m) => {
                   const isConverting = downloading[m.filename]?.stage === "converting";
-                  const fp16Capable = MSST_FP16_ARCHS.has(m.architecture as MsstArchitecture);
+                  // Catalog arch wins: hash-named official weights (demucs .th) defeat Rust's
+                  // filename detection, which reports "unknown" for them.
+                  const arch = (MSST_CATALOG.find((e) => e.filename === m.filename)?.architecture
+                    ?? m.architecture) as MsstArchitecture;
+                  const archHint = arch === ("unknown" as string) ? undefined : arch;
+                  const fp16Capable = MSST_FP16_ARCHS.has(arch);
                   return (
                     <div key={m.filename} className="msst-installed-item">
                       <span className="msst-installed-name" title={m.filename}>{m.filename}</span>
@@ -215,12 +220,12 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                         {isConverting ? (
                           <span className="msst-converting">...</span>
                         ) : !m.has_onnx && !m.has_fp16 ? (
-                          <button className="msst-convert-btn" onClick={() => convertPrecision(m.filename)}>Convert</button>
+                          <button className="msst-convert-btn" onClick={() => convertPrecision(m.filename, undefined, archHint)}>Convert</button>
                         ) : fp16Capable && !m.has_fp16 ? (
                           <button
                             className="msst-convert-btn"
                             title={t18(MSST_FP16_TIP, lang)}
-                            onClick={() => convertPrecision(m.filename, "fp16")}
+                            onClick={() => convertPrecision(m.filename, "fp16", archHint)}
                           >
                             {t18({ zh: "补转 fp16", en: "Convert to fp16", ja: "fp16に変換" }, lang)}
                           </button>
@@ -228,7 +233,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                           <button
                             className="msst-convert-btn"
                             title={t18({ zh: "从 ckpt 完整导出 fp32（较慢）", en: "Full fp32 export from the ckpt (slower)", ja: "ckpt から fp32 を完全エクスポート（時間がかかります）" }, lang)}
-                            onClick={() => convertPrecision(m.filename, "fp32")}
+                            onClick={() => convertPrecision(m.filename, "fp32", archHint)}
                           >
                             {t18({ zh: "补转 fp32", en: "Convert to fp32", ja: "fp32に変換" }, lang)}
                           </button>
