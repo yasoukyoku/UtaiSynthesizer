@@ -45,9 +45,10 @@ from architectures.htdemucs import (
 from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_from_yaml
 
 # --precision applies to these (rvc/sovits ignore it); fp16 is numerically
-# verified (>45 dB vs fp32) for the roformer archs ONLY — refuse the rest.
+# verified (>45 dB vs fp32) for the roformer archs + mdx23c (71.0/75.5 dB)
+# ONLY — refuse the rest.
 SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}
-FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer"}
+FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c"}
 
 
 def convert_rvc(input_path: Path, output_path: Path):

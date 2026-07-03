@@ -79,9 +79,11 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
   htdemucs: "fp32",
 };
 
-/** Archs the converter can produce fp16 for (the two verified roformers). ONE source of truth for
- *  every fp16 choice in the UI (download precision, 补转 actions). */
-export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer"]);
+/** Archs the converter can produce fp16 for (SNR-gated per arch: bs 53.5/59.2 dB, melband
+ *  58.4/53.7 dB, mdx23c 71.0/75.5 dB vs fp32). ONE source of truth for every fp16 choice in the
+ *  UI (download precision, 补转 actions). htdemucs pending — gate it when a model is installed.
+ *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. */
+export const MSST_FP16_ARCHS: ReadonlySet<MsstArchitecture> = new Set(["bs_roformer", "mel_band_roformer", "mdx23c"]);
 
 /** fp16 tradeoff copy shared by the model manager (download / 补转 tooltips) and the separation
  *  node's precision row — measured facts, keep in ONE place. */
