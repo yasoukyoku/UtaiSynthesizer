@@ -1,6 +1,18 @@
 use std::path::PathBuf;
 use utai_lib::inference::engine::{InputTensor, OnnxEngine};
 
+fn app_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+/// Same contract as tests/separation_pipeline.rs: these tests predate the load-dynamic
+/// ORT switch (S12) — without this init any ORT touch hangs FOREVER at 0 CPU behind an
+/// invisible modal DLL dialog (S32 found this exact landmine via a full `cargo test`).
+fn init_ort() {
+    utai_lib::suppress_windows_dll_error_dialogs();
+    utai_lib::init_ort_runtime(&app_root());
+}
+
 fn rvc_onnx_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -23,6 +35,7 @@ fn test_rvc_onnx_inference() {
         return;
     }
 
+    init_ort();
     let engine = OnnxEngine::new();
     let session_id = engine.load_model(&path).expect("Failed to load RVC model");
 
@@ -64,6 +77,7 @@ fn test_sovits_onnx_inference() {
         return;
     }
 
+    init_ort();
     let engine = OnnxEngine::new();
     let session_id = engine.load_model(&path).expect("Failed to load SoVITS model");
 
