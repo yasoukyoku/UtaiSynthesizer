@@ -233,7 +233,9 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     filename: "MDX23C_D1581.ckpt", fileSize: 900_000_000,
     stems: ["Vocals", "Instrumental"],
     downloadUrl: `${UVR}/MDX23C_D1581.ckpt`,
-    configUrl: `${GH_CFG}/model_2_stem_full_band_8k.yaml`,
+    // UVR pairs D1581 with model_2_stem_061321 (12288-FFT family) — the 8K-FFT yaml previously
+    // referenced here belongs to the InstVoc HQ models and would misconvert this one.
+    configUrl: `${GH_CFG}/model_2_stem_061321.yaml`,
   },
 
   // ════════════════════════════════════════
@@ -389,7 +391,9 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     name: { zh: "MDX23C 鼓组分离", en: "MDX23C Drum Separator", ja: "MDX23C ドラム分離" },
     description: { zh: "6种鼓组分离 (aufr33+jarredou)", en: "6 drum types by aufr33+jarredou", ja: "6種ドラム分離 (aufr33+jarredou)" },
     filename: "MDX23C-DrumSep-aufr33-jarredou.ckpt", fileSize: 900_000_000,
-    stems: ["Kick", "Snare", "Hi-hat", "Toms", "Cymbals", "Other"],
+    // TRUE training order per its own configUrl yaml: [kick, snare, toms, hh, ride, crash] —
+    // the old hand-written list swapped toms/hh and invented "Cymbals"/"Other".
+    stems: ["Kick", "Snare", "Toms", "Hi-hat", "Ride", "Crash"],
     downloadUrl: `${UVR}/MDX23C-DrumSep-aufr33-jarredou.ckpt`,
     configUrl: `${UVR}/config_drumsep_mdx23c.yaml`,
   },
@@ -402,7 +406,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     name: { zh: "MelBand 人群噪声", en: "MelBand Crowd Noise", ja: "MelBand クラウドノイズ" },
     description: { zh: "去除人群/现场录音背景声，SDR 8.71", en: "Remove crowd/live background, SDR 8.71", ja: "クラウドノイズ除去、SDR 8.71" },
     filename: "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt", fileSize: 1_500_000_000,
-    stems: ["Clean", "Crowd"], sdrScore: 8.71,
+    // target_instrument = crowd → port 0 is the CROWD noise, port 1 the clean residual.
+    stems: ["Crowd", "Clean"], sdrScore: 8.71,
     downloadUrl: `${MSST}/mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt`,
   },
   {
@@ -419,7 +424,8 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     name: { zh: "MelBand 气息检测", en: "MelBand Aspiration", ja: "MelBand 気息検出" },
     description: { zh: "检测分离呼吸声 (Sucial)，SDR 18.98", en: "Detect breath sounds by Sucial, SDR 18.98", ja: "呼吸音検出 (Sucial)、SDR 18.98" },
     filename: "aspiration_mel_band_roformer_sdr_18.9845.ckpt", fileSize: 1_500_000_000,
-    stems: ["Clean", "Breath"], sdrScore: 18.98,
+    // direct 2-stem [aspiration, other] → port 0 is the BREATH stem, port 1 the clean track.
+    stems: ["Breath", "Clean"], sdrScore: 18.98,
     downloadUrl: `${HF}/Sucial/Aspiration_Mel_Band_Roformer/resolve/main/aspiration_mel_band_roformer_sdr_18.9845.ckpt`,
   },
   {
@@ -427,7 +433,10 @@ export const MSST_CATALOG: MsstCatalogEntry[] = [
     name: { zh: "BS-Roformer 鼓+贝斯", en: "BS-Roformer Drum+Bass", ja: "BS-Roformer ドラム+ベース" },
     description: { zh: "分离鼓和贝斯，SDR 10.53", en: "Separate drums+bass, SDR 10.53", ja: "ドラム+ベース分離、SDR 10.53" },
     filename: "model_bs_roformer_ep_937_sdr_10.5309.ckpt", fileSize: 1_500_000_000,
-    stems: ["Drums+Bass", "Other"], sdrScore: 10.53,
+    // Its configUrl yaml (authoritative — the ARCHIVE copy for this ckpt is itself wrong):
+    // target_instrument = "No Drum-Bass" → port 0 is everything EXCEPT drums+bass (vocals
+    // included), port 1 is the drums+bass stem.
+    stems: ["Other", "Drums+Bass"], sdrScore: 10.53,
     downloadUrl: `${MSST}/model_bs_roformer_ep_937_sdr_10.5309.ckpt`,
     configUrl: `${GH_CFG}/model_bs_roformer_ep_937_sdr_10.5309.yaml`,
   },
