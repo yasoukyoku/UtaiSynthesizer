@@ -486,7 +486,13 @@ def convert_htdemucs(input_path: Path, output_path: Path, config_yaml: Path = No
     diff_t = abs(time_out.numpy() - ort_out[1]).max()
     print(f"ORT verification: freq max diff = {diff_f:.6e}, time max diff = {diff_t:.6e}")
 
-    num_overlap = (yaml_config.get("inference") or {}).get("num_overlap", 4)
+    # Fallback 2 (NOT 4): official demucs weights ship signature-only yamls (no inference
+    # section), and the model authors' own tooling (demucs apply_model) runs overlap=0.25
+    # ≈ effective coverage 1.33 with triangular crossfades — ov4 is 2.95x that compute for
+    # no proven quality gain (MSST's blanket 4 is an app-wide convention, not htdemucs
+    # tuning). An MSST yaml that explicitly says num_overlap still wins (faithful).
+    # Mirror: msst-catalog.ts MSST_DEFAULT_NUM_OVERLAP.htdemucs.
+    num_overlap = (yaml_config.get("inference") or {}).get("num_overlap", 2)
 
     config_data = {
         "type": "htdemucs",

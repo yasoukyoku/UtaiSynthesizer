@@ -54,15 +54,18 @@ export const ARCHITECTURE_LABELS: Record<MsstArchitecture, string> = {
   htdemucs: "HTDemucs",
 };
 
-/** Per-architecture default `num_overlap` — MUST mirror what converter/convert.py writes into each
- *  model's JSON. Used ONLY to DISPLAY the model's true default in the node when the user hasn't
- *  overridden it; the actual value still comes from the model JSON on the Rust side. Keep in sync
- *  with the converter (all 4 use the original MSST inference recipe: num_overlap 4). */
+/** Per-architecture default `num_overlap` — MUST mirror the converter/convert.py FALLBACK it
+ *  writes into each model's JSON when the yaml has no explicit inference.num_overlap. Used ONLY
+ *  to DISPLAY the model's default in the node when the user hasn't overridden it; the actual
+ *  value still comes from the model JSON on the Rust side (a yaml-explicit value wins there, so
+ *  this display can differ for yaml-carrying models — e.g. Kim-family melbands say 2).
+ *  htdemucs = 2: official demucs weights have signature-only yamls, and the authors' own
+ *  apply_model runs overlap=0.25 (~1.33x coverage) — ov4 was 2.95x that compute for nothing. */
 export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {
   bs_roformer: 4,
   mel_band_roformer: 4,
   mdx23c: 4,
-  htdemucs: 4,
+  htdemucs: 2,
 };
 
 export type MsstPrecision = "fp32" | "fp16";
