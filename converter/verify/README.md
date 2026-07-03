@@ -37,10 +37,18 @@ NaN 级 bug 就是 CUDA-only 的）。过门后同步更新 convert.py `FP16_VER
 msst-catalog.ts `MSST_FP16_ARCHS`（镜像对，注释里有各架构的门值）。
 
 ## 关卡 4 — 波形审计（怀疑"输出没换/覆盖/串轨"时）
-`cross_model_check.py`：md5 + 两两 corr/SNR 矩阵，一分钟定案。读数参考（S31 实测）：
-- 同模型同精度重跑 ≈ 逐位一致；同模型 fp32 vs fp16 ≈ corr 1.0000 / ~50 dB；
+`cross_model_check.py`：md5 + 两两 corr/SNR 矩阵，一分钟定案。读数参考（S31 实测，S32 修正）：
+- 同模型同精度重跑：**roformer/mdx23c 在 CUDA 上逐位一致；htdemucs 不是**（cudnn 卷积
+  算法按计时选型，S32 实测同一二进制两次 GPU 运行 6/6 stem md5 全不同）——**htdemucs 的
+  bitwise A/B 门必须在 CPU EP 上跑**（确定性；20s 素材即可）。GPU md5 对 htdemucs 出 DIFF
+  先怀疑这个，不要先怀疑代码。
+- 同模型 fp32 vs fp16 ≈ corr 1.0000 / ~50 dB；
 - 不同架构分同一首歌 ≈ corr 0.98 / 14-15 dB（波形缩略图看不出差别，这是正常态）。
 配套检查 autosave.json 的 lane 路径是否指向各节点**最新** run 目录。
+
+S32 增补的管线改动 A/B 手法：cargo 会把旧的测试 exe 留在 `target/release/deps/
+separation_pipeline-<hash>.exe` —— 新旧 exe 直接各跑一遍比 md5，免 git stash；harness 另有
+`UTAI_SEP_OVERLAP=<n>` 覆盖模型 JSON 的 num_overlap（chunk 几何实验用，同 UI 滑条语义）。
 
 ## 关卡 5 — stem 顺序 / 端口映射
 模型真实输出顺序 = json `stem_names`（converter 从 kwargs/yaml training.instruments 读出）。
