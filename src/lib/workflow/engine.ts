@@ -5,6 +5,7 @@ import type { Workflow } from "../../types/project";
 import { parseWorkflowGraph } from "./graph";
 import { useProjectStore } from "../../store/project";
 import { useWorkflowStore } from "../../store/workflow";
+import { useAppStore } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
@@ -18,6 +19,51 @@ interface AudioFileInfo {
 }
 
 let runSeq = 0;
+
+/** Live voice invokes per segment. A cancelled run_rvc/run_sovits invoke keeps DRAINING
+ *  until the Rust pipeline hits its next cancel poll (the cancel flag LATCHES — one click
+ *  always takes effect at the next poll — but that poll can sit behind a multi-second
+ *  ONNX Run) — starting a new run for the same segment during that window produced two
+ *  live runs emitting `voice-progress` for the SAME node (the "possessed" jumping bar) and
+ *  a late「已取消」rejection that looked like the NEW run failing. Both run entry points
+ *  AWAIT the drain and then start automatically (no manual retry); a second click while
+ *  one is already queued is dropped. Keyed per segment so other segments are unaffected. */
+const voiceInvokesInFlight = new Map<string, number>();
+const voiceDrainWaiters = new Set<string>();
+
+/** Wait for the segment's draining voice invoke(s) to settle, then proceed. Returns false
+ *  when this attempt should be dropped (a run is already queued, or the drain timed out). */
+async function waitVoiceDrain(segmentId: string): Promise<boolean> {
+  if ((voiceInvokesInFlight.get(segmentId) ?? 0) === 0) return true;
+  const toast = useAppStore.getState().showToast;
+  if (voiceDrainWaiters.has(segmentId)) {
+    toast("已有一次渲染在排队等待上一次停止——本次点击已忽略", "info");
+    return false;
+  }
+  voiceDrainWaiters.add(segmentId);
+  toast("上一次渲染停止中——完成后将自动开始本次渲染", "info");
+  try {
+    // Generous cap: a CPU-mode extractor pass over a 30 s piece is the longest single
+    // uninterruptible step. A hang past this is a real bug, not a slow drain.
+    const deadline = Date.now() + 120_000;
+    while ((voiceInvokesInFlight.get(segmentId) ?? 0) > 0) {
+      if (Date.now() > deadline) {
+        toast("上一次渲染停止超时——请查看日志", "error");
+        return false;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return true;
+  } finally {
+    voiceDrainWaiters.delete(segmentId);
+  }
+}
+
+/** Rust cancel rejections arrive as strings like "Inference error: 已取消" — the backend
+ *  counterpart of the frontend "Cancelled" sentinel. Both settle a run silently. */
+function isCancelMessage(msg: string): boolean {
+  return msg === "Cancelled" || msg.includes("已取消");
+}
 
 /** Per-RUN output directory under the segment's cache dir. Node output paths were previously
  *  deterministic (`${cacheDir}/${nodeId}_rvc.wav`, MSST stems by label), which ALIASED across a split:
@@ -39,6 +85,7 @@ export async function executeWorkflow(
   segment: Segment,
   workflow: Workflow,
 ): Promise<ProcessedOutput[]> {
+  if (!(await waitVoiceDrain(segmentId))) return [];
   const store = useWorkflowStore.getState();
   store.startExecution(segmentId);
   store.clearNodeStatuses(segmentId);
@@ -115,7 +162,7 @@ export async function executeWorkflow(
     return results;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    const cancelled = msg === "Cancelled";
+    const cancelled = isCancelMessage(msg);
     logToBackend(cancelled ? "warn" : "error", cancelled ? "Workflow cancelled" : `Workflow failed: ${msg}`);
     const store = useWorkflowStore.getState();
     // A real failure marks the offending node red; a user cancel marks nothing. Either way clear the
@@ -145,6 +192,7 @@ export async function executeSingleNode(
   workflow: Workflow,
   targetNodeId: string,
 ): Promise<void> {
+  if (!(await waitVoiceDrain(segmentId))) return;
   const store = useWorkflowStore.getState();
   // NOTE: we deliberately DON'T clear the target's cache here. The stale-in-place-overwrite hazard is
   // handled AFTER a successful run by handleRunSingleNode (clearBufferCache + removeProcessedOutputsForNode
@@ -214,7 +262,7 @@ export async function executeSingleNode(
     store.completeExecution(segmentId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg !== "Cancelled") {
+    if (!isCancelMessage(msg)) {
       store.setNodeStatus(segmentId, targetNodeId, "error");
       store.setNodeError(segmentId, targetNodeId, msg);
     }
@@ -269,6 +317,7 @@ async function executeNode(
         },
       );
       let result: { audio: number[]; sample_rate: number };
+      voiceInvokesInFlight.set(segmentId, (voiceInvokesInFlight.get(segmentId) ?? 0) + 1);
       try {
         // Options are EXACTLY the snake_case contract keys (voiceDefaults.ts, THE single source of
         // truth): node params store them verbatim, defaults fill anything unset. No other invoke
@@ -285,6 +334,7 @@ async function executeNode(
         );
       } finally {
         unlisten();
+        voiceInvokesInFlight.set(segmentId, Math.max(0, (voiceInvokesInFlight.get(segmentId) ?? 1) - 1));
       }
       await invoke("save_temp_audio", {
         samples: result.audio,

@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
 import type { Track, Segment, LaneControl, ProcessedOutput, LaneClip } from "../types/project";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
@@ -13,14 +14,19 @@ import { useAudioStore } from "./audio";
 /** Cancel any in-flight render for the given segment ids — used when a segment/track is DELETED, the only
  *  op besides the Stop button that should cancel a render (split/move/rename/etc. must NOT). The still-
  *  running engine loop polls isCancelled and then stops the (single, global) Rust separation; flipping the
- *  execution off 'running' also un-sticks the quit/busy warning that scans for running executions. Scoped
- *  strictly per segment id (never a sibling's render); only touches ids with a running execution, so
- *  cancelExecution's presence assertion is safe. */
+ *  execution off 'running' also un-sticks the quit/busy warning that scans for running executions. The JS
+ *  execution flip is per segment id; the cancel_voice invoke below is app-GLOBAL (same semantics as
+ *  cancel_separation) — a concurrent voice render of ANOTHER segment would also abort. Accepted trade-off:
+ *  voice invokes carry no job id, and the deleted segment's run must not keep burning GPU minutes. */
 function cancelRunningRenders(segmentIds: string[]) {
   const wf = useWorkflowStore.getState();
+  let hadRunning = false;
   for (const id of segmentIds) {
-    if (wf.executions[id]?.status === "running") wf.cancelExecution(id);
+    if (wf.executions[id]?.status === "running") { wf.cancelExecution(id); hadRunning = true; }
   }
+  // Separation stops via the engine loop's isCancelled polling, but voice invokes
+  // (run_rvc/run_sovits) are direct awaits — only the Rust-side flag can abort them mid-run.
+  if (hadRunning) void invoke("cancel_voice").catch(() => {});
 }
 
 /** Gesture base for the BPM edit session (beginTempoScale/endTempoScale): setTempo scales geometry

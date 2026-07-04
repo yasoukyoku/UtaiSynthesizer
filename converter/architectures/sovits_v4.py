@@ -26,8 +26,9 @@ per-sample ramp — sin-invariant identity; see rvc_v2.SineGen).
 Where so-vits DIFFERS from RVC, the so-vits variant is ported here: Flip
 (returns bare x in reverse), ResidualCouplingLayer/-Block (wn_sharing_parameter
 / share_parameter support), TextEncoder (f0 embedding, z-as-input export
-variant), F0Decoder + attentions.FFT (loaded for strict=True; runtime
-predict_f0 is deferred by user decision and NOT wired into the export),
+variant), F0Decoder + attentions.FFT (strict=True load; exported as the
+STANDALONE <stem>.f0.onnx companion graph via F0PredictorWrapper — the main
+graph stays predict_f0-free, matching the official onnx export),
 PosteriorEncoder (enc_q, training-only, conditional: compressed checkpoints
 strip it), vdecoder Generator (weight-normed conv_pre/conv_post, (k-u+1)//2
 and (stride_f0+1)//2 paddings, harmonic_num=8, unconditional cond).
@@ -106,6 +107,32 @@ def f0_to_coarse(f0):
     f0_coarse = f0_coarse * (f0_coarse < f0_bin)
     f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
     return f0_coarse
+
+
+def normalize_f0(f0, x_mask, uv, random_scale=True):
+    """ported from utils.py normalize_f0 — voiced-mean removal of the lf0
+    contour ([B,1,T]); the F0PredictorWrapper calls it with random_scale=False
+    (models.py infer()'s predict_f0 branch)."""
+    # calculate means based on x_mask
+    uv_sum = torch.sum(uv, dim=1, keepdim=True)
+    # DEVIATION (export ergonomics, numerically identical): the original does
+    # an in-place boolean-mask assignment `uv_sum[uv_sum == 0] = 9999`, which
+    # traces into an index_put graph; rewritten as torch.where. Identical for
+    # every input incl. the all-unvoiced guard (uv all 0 -> uv_sum 9999 ->
+    # means = 0/9999 = 0). Gated by verify/voice/gate_autof0.py (exact-0 tier).
+    uv_sum = torch.where(uv_sum == 0, torch.full_like(uv_sum, 9999.0), uv_sum)
+    means = torch.sum(f0[:, 0, :] * uv, dim=1, keepdim=True) / uv_sum
+
+    if random_scale:
+        factor = torch.Tensor(f0.shape[0], 1).uniform_(0.8, 1.2).to(f0.device)
+    else:
+        factor = torch.ones(f0.shape[0], 1).to(f0.device)
+    # normalize f0 based on means and factor
+    f0_norm = (f0 - means.unsqueeze(-1)) * factor.unsqueeze(-1)
+    # The original's `if torch.isnan(f0_norm).any(): exit(0)` is dropped:
+    # data-dependent control flow cannot trace, and with the 9999 guard above
+    # the division can never produce NaN from finite inputs (dead branch).
+    return f0_norm * x_mask
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +313,10 @@ class TextEncoder(nn.Module):
 
 class FFT(nn.Module):
     """ported from modules/attentions.py FFT — post-norm transformer with
-    causal self-attention + causal FFN. Used by F0Decoder (loaded for
-    strict=True; predict_f0 is not wired into the export)."""
+    causal self-attention + causal FFN. Used by F0Decoder (exported inside
+    the standalone <stem>.f0.onnx via F0PredictorWrapper; the main graph
+    never calls it). No relative-position embeddings (window_size=None), so
+    no T >= window_size + 2 trace constraint here."""
 
     def __init__(self, hidden_channels, filter_channels, n_heads, n_layers=1,
                  kernel_size=1, p_dropout=0., proximal_bias=False,
@@ -354,8 +383,9 @@ class FFT(nn.Module):
 
 class F0Decoder(nn.Module):
     """ported from models.py F0Decoder (parameter namespace f0_decoder.*).
-    Loaded for strict=True; runtime predict_f0 is deferred by user decision
-    and deliberately NOT wired into the export graph."""
+    Loaded for strict=True; exported as part of the standalone auto-f0
+    companion graph (F0PredictorWrapper -> <stem>.f0.onnx). The MAIN export
+    graph deliberately does not call it (official onnx export parity)."""
 
     def __init__(self, out_channels, hidden_channels, filter_channels, n_heads,
                  n_layers, kernel_size, p_dropout, spk_channels=0):
@@ -666,6 +696,59 @@ def set_deterministic(model, deterministic=True):
     model.dec.m_source.l_sin_gen.deterministic = deterministic
 
 
+class F0PredictorWrapper(nn.Module):
+    """Standalone auto-f0 predictor export graph (<stem>.f0.onnx).
+
+    Wraps the predict_f0 branch of models.py infer() (:520, :523-527) around
+    the ALREADY-LOADED synthesizer's own modules: pre / emb_uv / emb_vol /
+    emb_g / f0_decoder are the SAME nn.Module objects (python-level weight
+    sharing — same nn.Parameter tensors, no copies), so the wrapper's `x` is
+    computed by the exact op sequence the main export graph uses.
+
+    inputs : c[1,T,ssl_dim] f32 (expanded, same layout as the main graph),
+             f0[1,T] f32 (source F0 in Hz, AFTER transpose/key shift),
+             uv[1,T] f32, sid[1] i64,
+             vol[1,T] f32 — present IFF the model has vol_embedding
+    output : f0_pred[1,T] f32 (Hz) — feed as the main graph's `f0` input
+             (uv stays the SOURCE uv: the original never recomputes it).
+    x_mask = ones (matches the main export; the original's sequence_mask is
+    all-ones for single-segment inference too). The graph contains NO
+    randomness — a shipping export is already deterministic.
+    """
+
+    def __init__(self, synth):
+        super().__init__()
+        if not getattr(synth, "use_automatic_f0_prediction", False):
+            raise ValueError(
+                "该模型没有 f0_decoder 权重，无法导出自动音高预测器")
+        self.vol_embedding = synth.vol_embedding
+        # nn.Module attribute assignment registers the SAME module objects —
+        # shared parameters with the synthesizer, not copies.
+        self.pre = synth.pre
+        self.emb_uv = synth.emb_uv
+        self.emb_g = synth.emb_g
+        if synth.vol_embedding:
+            self.emb_vol = synth.emb_vol
+        self.f0_decoder = synth.f0_decoder
+
+    def forward(self, c, f0, uv, sid, vol=None):
+        # models.py infer() steps :511-520, identical to SynthesizerTrn.forward
+        # above (same tensors, same op order — bit-compatible `x`).
+        g = self.emb_g(sid.unsqueeze(0)).transpose(1, 2)  # [1, gin, 1]
+        x_mask = torch.unsqueeze(torch.ones_like(f0), 1).to(c.dtype)
+        vol = self.emb_vol(vol[:, :, None]).transpose(1, 2) \
+            if vol is not None and self.vol_embedding else 0
+        x = self.pre(c.transpose(1, 2)) * x_mask \
+            + self.emb_uv(uv.long()).transpose(1, 2) + vol
+
+        # models.py infer() :523-527 (predict_f0 branch), verbatim
+        lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
+        norm_lf0 = normalize_f0(lf0, x_mask, uv, random_scale=False)
+        pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
+        f0_pred = (700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)).squeeze(1)
+        return f0_pred
+
+
 # ---------------------------------------------------------------------------
 # config loading / validation
 # ---------------------------------------------------------------------------
@@ -900,5 +983,9 @@ def build_from_checkpoint(checkpoint, config=None):
         "inter_channels": int(inter_channels),
         # traced attention rel-pos branch is valid for T >= window_size + 2
         "min_frames": int(window_size) + 2,
+        # weights are the truth (4.0-era configs lack the
+        # use_automatic_f0_prediction key entirely — never read the config):
+        # drives the <stem>.f0.onnx companion export + sidecar "auto_f0".
+        "has_f0_decoder": bool(has_f0_decoder),
     }
     return model, meta

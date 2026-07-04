@@ -1,6 +1,8 @@
+pub mod diffusion;
 pub mod engine;
 pub mod f0;
 pub mod features;
+pub mod mel;
 pub mod nsf_hifigan;
 pub mod rvc;
 pub mod s2h;
@@ -28,6 +30,9 @@ pub struct RvcOptions {
     pub l2_normalize: bool,
     pub resample_sr: u32,
     pub seed: u64,
+    /// Run the aux extractors (ContentVec + RMVPE) on the global GPU device instead of the
+    /// S35 forced-CPU default. Faster, costs VRAM (see ensure_aux_loaded_on rationale).
+    pub gpu_extract: bool,
 }
 
 impl Default for RvcOptions {
@@ -42,6 +47,7 @@ impl Default for RvcOptions {
             l2_normalize: false,
             resample_sr: 0,
             seed: 0,
+            gpu_extract: false,
         }
     }
 }
@@ -56,6 +62,34 @@ pub struct SovitsOptions {
     pub cluster_ratio: f32,
     pub loudness_envelope: f32,
     pub seed: u64,
+    // ── S36 quality path (original so-vits-svc CLI semantics; validation in the command
+    //    layer — see commands/inference.rs resolve_sovits_quality) ──
+    /// VITS output → mel → q_sample(k_step-1) → sampler → NSF-HiFiGAN. Needs `.diffusion/`.
+    pub shallow_diffusion: bool,
+    /// Diffusion depth (original -ks default 100). Must be ≤ the diffusion model's
+    /// k_step_max. IGNORED in only_diffusion (original: t = k_step_max unconditionally).
+    pub k_step: u32,
+    /// "naive" | "ddim" | "pndm" | "dpm-solver" | "dpm-solver++" | "unipc".
+    pub diffusion_method: String,
+    /// Solver steps ≈ k_step / speedup; ≤1 → the plain DDPM loop (original semantics).
+    pub diffusion_speedup: u32,
+    /// Skip VITS entirely; full-depth from-noise generation (k_step_max == timesteps only).
+    pub only_diffusion: bool,
+    /// Re-extract ContentVec from the VITS output before diffusing (shallow only).
+    pub second_encoding: bool,
+    /// NSF-HiFiGAN enhancer — mutually exclusive with any diffusion mode (original
+    /// force-disable, infer_tool.py:183-184).
+    pub nsf_enhance: bool,
+    /// Enhancer high-range adaptation in semitones (original enhancer_adaptive_key).
+    pub enhancer_adaptive_key: i32,
+    /// Automatic f0 prediction via `<stem>.f0.onnx` (predict_f0=True semantics).
+    pub auto_f0: bool,
+    /// See RvcOptions::gpu_extract.
+    pub gpu_extract: bool,
+    /// TEST-ONLY (E2E gates): zero every diffusion noise draw (q_sample / initial randn /
+    /// naive per-step noise) to mirror the python reference's ZeroNoise monkeypatch.
+    /// Deliberately NOT in voiceDefaults.ts — never reachable from the UI.
+    pub debug_zero_noise: bool,
 }
 
 impl Default for SovitsOptions {
@@ -67,6 +101,17 @@ impl Default for SovitsOptions {
             cluster_ratio: 0.0,
             loudness_envelope: 1.0,
             seed: 0,
+            shallow_diffusion: false,
+            k_step: 100,
+            diffusion_method: "dpm-solver++".into(),
+            diffusion_speedup: 10,
+            only_diffusion: false,
+            second_encoding: false,
+            nsf_enhance: false,
+            enhancer_adaptive_key: 0,
+            auto_f0: false,
+            gpu_extract: false,
+            debug_zero_noise: false,
         }
     }
 }
@@ -85,7 +130,9 @@ pub enum VoiceBackendType {
 
 struct LoadedVoice {
     _backend_type: VoiceBackendType,
-    _model_path: PathBuf,
+    /// Also the key for evicting companion sessions (`<stem>.f0.onnx` / `<stem>.diffusion/`)
+    /// on unload — see unload_voice.
+    model_path: PathBuf,
     session_id: String,
     sample_rate: u32,
     index: Option<Arc<rvc::RvcIndex>>,
@@ -102,11 +149,22 @@ pub struct InferenceManager {
     pub engine: engine::OnnxEngine,
     /// Voice sessions keyed by VOICE NAME — model delete/reimport calls unload_voice(name).
     loaded_voices: RwLock<HashMap<String, LoadedVoice>>,
-    /// Aux model sessions (ContentVec variants, RMVPE) keyed by path — the generalization
-    /// of the old single cached_f0_session slot.
-    aux_sessions: RwLock<HashMap<PathBuf, String>>,
+    /// Aux model sessions (ContentVec variants, RMVPE) keyed by (path, on_gpu) — the same
+    /// file can hold a CPU and a GPU session simultaneously (the engine key embeds the
+    /// device too, so they never collide there either).
+    aux_sessions: RwLock<HashMap<(PathBuf, bool), String>>,
     /// Small .npy cache (RMVPE mel filters, so-vits cluster assets) keyed by path.
     npy_cache: RwLock<HashMap<PathBuf, Arc<ndarray::Array2<f32>>>>,
+    /// Voice-run cancel, epoch-based. `cancel_voice` cancels every voice run STARTED at or
+    /// before the moment of the click (cancel_epoch = current epoch); runs started later
+    /// (epoch > cancel_epoch) are unaffected. This kills two races a single reset-on-start
+    /// bool had: (a) a cancel aimed at run A being swallowed by run B's start clearing the
+    /// flag, and (b) a cancel during A's session-loading phase getting lost. Scope is still
+    /// app-global like cancel_separation — cancelling one pane can abort another segment's
+    /// CONCURRENT voice run (rare: needs two simultaneous voice renders); a per-run handle
+    /// registry is deliberately out of scope, matching the separation cancel's semantics.
+    voice_epoch: std::sync::atomic::AtomicU64,
+    voice_cancel_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl InferenceManager {
@@ -116,33 +174,69 @@ impl InferenceManager {
             loaded_voices: RwLock::new(HashMap::new()),
             aux_sessions: RwLock::new(HashMap::new()),
             npy_cache: RwLock::new(HashMap::new()),
+            voice_epoch: std::sync::atomic::AtomicU64::new(0),
+            voice_cancel_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Load (or reuse) an aux ONNX session (ContentVec / RMVPE) cached by path.
-    pub fn ensure_aux_loaded(&self, path: &Path) -> Result<String> {
+    /// Arm a new voice run: returns this run's epoch (pass it to voice_cancelled). Call at
+    /// the very START of the command — before session loading — so a cancel during the
+    /// multi-second load phase is honored at the first pipeline poll.
+    pub fn begin_voice_run(&self) -> u64 {
+        self.voice_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// Cancel every voice run started at or before now (later runs unaffected).
+    pub fn cancel_voice(&self) {
+        let now = self.voice_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        self.voice_cancel_epoch
+            .store(now, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn voice_cancelled(&self, run_epoch: u64) -> bool {
+        self.voice_cancel_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= run_epoch
+    }
+
+    /// Load (or reuse) an aux ONNX session (ContentVec / RMVPE), cached by (path, device).
+    ///
+    /// Default (`on_gpu=false`): CPU — aux extractors are one-shot passes whose fp32
+    /// activations were the dominant VRAM consumer (a 2-min song peaked ~9 GB on GPU,
+    /// S35), and CPU is numerically MORE faithful than the TF32 GPU path (the E2E gate
+    /// ran on CPU). `on_gpu=true` (the per-node GPU特征提取 toggle) follows the global
+    /// device instead — viable since S35's 30 s chunking bounded the activations, but
+    /// still a deliberate user opt-in. mem_pattern stays OFF either way (dynamic T).
+    pub fn ensure_aux_loaded_on(&self, path: &Path, on_gpu: bool) -> Result<String> {
+        let key = (path.to_path_buf(), on_gpu);
         {
             let cached = self.aux_sessions.read();
-            if let Some(sid) = cached.get(path) {
+            if let Some(sid) = cached.get(&key) {
                 if self.engine.is_loaded(sid) {
                     return Ok(sid.clone());
                 }
             }
         }
-        // Aux feature extractors (ContentVec / RMVPE) run on CPU: they're one-shot passes over the
-        // WHOLE (up to full-song) signal, whose fp32 activations are the dominant VRAM consumer —
-        // a 2-min song peaked ~9 GB with them on GPU. On CPU their RAM is unbounded-enough (32 GB)
-        // and numerically they're MORE faithful than the TF32 GPU path (the E2E gate ran on CPU).
-        // The voice synthesizer (the per-chunk hot loop) stays on the global device (GPU). Also
-        // mem_pattern OFF — varying-length inputs would make the pattern planner over-reserve.
-        let sid = self
-            .engine
-            .load_model_on(&path.to_path_buf(), false, engine::DeviceConfig::Cpu)?;
-        self.aux_sessions
-            .write()
-            .insert(path.to_path_buf(), sid.clone());
-        tracing::info!("Aux model cached: {}", path.display());
+        let sid = if on_gpu {
+            self.engine.load_model_with(&path.to_path_buf(), false)?
+        } else {
+            self.engine
+                .load_model_on(&path.to_path_buf(), false, engine::DeviceConfig::Cpu)?
+        };
+        self.aux_sessions.write().insert(key, sid.clone());
+        tracing::info!(
+            "Aux model cached: {} ({})",
+            path.display(),
+            if on_gpu { "global device" } else { "CPU" }
+        );
         Ok(sid)
+    }
+
+    /// Back-compat wrapper: CPU-forced aux session (the S35 default).
+    pub fn ensure_aux_loaded(&self, path: &Path) -> Result<String> {
+        self.ensure_aux_loaded_on(path, false)
     }
 
     /// Load a .npy as Array2<f32>, cached by path (mel filters / cluster assets).
@@ -200,7 +294,7 @@ impl InferenceManager {
 
         let voice = LoadedVoice {
             _backend_type: backend_type,
-            _model_path: model_path.clone(),
+            model_path: model_path.clone(),
             session_id,
             sample_rate,
             index,
@@ -225,6 +319,17 @@ impl InferenceManager {
         let mut voices = self.loaded_voices.write();
         if let Some(voice) = voices.remove(name) {
             self.engine.unload_model(&voice.session_id);
+            // The engine caches companion sessions BY PATH — on a same-name re-import the
+            // replaced `<stem>.f0.onnx` / `<stem>.diffusion/*.onnx` files keep their paths,
+            // so without this the next run would silently serve the OLD graphs.
+            let p = &voice.model_path;
+            if let (Some(dir), Some(stem)) = (p.parent(), p.file_stem()) {
+                let stem = stem.to_string_lossy();
+                self.engine
+                    .unload_paths_with_prefix(&dir.join(format!("{}.f0.onnx", stem)));
+                self.engine
+                    .unload_paths_with_prefix(&dir.join(format!("{}.diffusion", stem)));
+            }
         }
         // Model files may be replaced on reimport — drop cached npy assets (cheap reloads)
         // so a stale cluster index / retrieval asset can't outlive its file.

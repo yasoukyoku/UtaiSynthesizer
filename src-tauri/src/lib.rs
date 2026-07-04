@@ -601,6 +601,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::inference::run_rvc,
             commands::inference::run_sovits,
+            commands::inference::cancel_voice,
             commands::inference::detect_f0,
             commands::inference::run_s2h,
             commands::project::save_project_archive,

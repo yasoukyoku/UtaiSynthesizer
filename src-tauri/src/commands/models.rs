@@ -41,6 +41,8 @@ pub async fn import_model(
     path: String,
     model_type: String,
     index_path: Option<String>,
+    diffusion_path: Option<String>,
+    diffusion_config_path: Option<String>,
     avatar_path: Option<String>,
 ) -> Result<ImportOutcome, String> {
     let mt = parse_voice_type(&model_type)
@@ -51,6 +53,8 @@ pub async fn import_model(
     state.inference.unload_voice(&name);
 
     let idx = index_path.map(PathBuf::from);
+    let diff = diffusion_path.map(PathBuf::from);
+    let diff_cfg = diffusion_config_path.map(PathBuf::from);
     let avatar = avatar_path.map(PathBuf::from);
     state
         .models
@@ -60,6 +64,8 @@ pub async fn import_model(
             mt,
             &state.app_dir,
             idx.as_deref(),
+            diff.as_deref(),
+            diff_cfg.as_deref(),
             avatar.as_deref(),
         )
         .map_err(|e| {

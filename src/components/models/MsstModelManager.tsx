@@ -20,6 +20,7 @@ import {
   type MirrorSource,
 } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
+import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
 import {
   useVoiceModelStore,
   voiceVersionBadge,
@@ -261,6 +262,8 @@ interface ImportDialogProps {
 function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
   const [modelPath, setModelPath] = useState("");
   const [indexPath, setIndexPath] = useState("");
+  const [diffusionPath, setDiffusionPath] = useState("");
+  const [diffusionConfigPath, setDiffusionConfigPath] = useState("");
   const [avatarPath, setAvatarPath] = useState("");
   const [modelName, setModelName] = useState("");
   const [importing, setImporting] = useState(false);
@@ -292,6 +295,19 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
     if (p) setIndexPath(p);
   }, [browse, lang, voiceType]);
 
+  // SoVITS only: the separate shallow-diffusion model pair (.pt + config .yaml). The .yaml is
+  // optional here — export_diffusion.py auto-resolves it next to the .pt (same stem → unique
+  // .yaml in dir → config.yaml) and errors in Chinese when ambiguous.
+  const handleBrowseDiffusion = useCallback(async () => {
+    const p = await browse(lang === "zh" ? "选择扩散模型 (.pt)" : "Select diffusion model (.pt)", ["pt"]);
+    if (p) setDiffusionPath(p);
+  }, [browse, lang]);
+
+  const handleBrowseDiffusionConfig = useCallback(async () => {
+    const p = await browse(lang === "zh" ? "选择扩散配置 (.yaml)" : "Select diffusion config (.yaml)", ["yaml", "yml"]);
+    if (p) setDiffusionConfigPath(p);
+  }, [browse, lang]);
+
   const handleBrowseAvatar = useCallback(async () => {
     const p = await browse(lang === "zh" ? "选择角色头图" : "Select character avatar", ["png", "jpg", "jpeg", "bmp", "webp"]);
     if (p) setAvatarPath(p);
@@ -307,6 +323,8 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
         path: modelPath,
         modelType: voiceType,
         indexPath: indexPath || null,
+        diffusionPath: diffusionPath || null,
+        diffusionConfigPath: diffusionConfigPath || null,
         avatarPath: avatarPath || null,
       });
       for (const w of outcome?.warnings ?? []) {
@@ -317,7 +335,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       setErr(String(e));
     }
     setImporting(false);
-  }, [modelPath, modelName, voiceType, indexPath, avatarPath, onDone]);
+  }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, onDone]);
 
   const isRvc = voiceType === "rvc";
   const Z = (key: string) => {
@@ -326,6 +344,8 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       model: { zh: "模型文件 (.pth)", en: "Model file (.pth)", ja: "モデルファイル (.pth)" },
       index: { zh: "索引文件 (.index)  — 可选", en: "Index file (.index) — optional", ja: "インデックス (.index) — 任意" },
       cluster: { zh: "聚类/检索模型 (.pt / .pkl)  — 可选", en: "Cluster/retrieval model (.pt / .pkl) — optional", ja: "クラスタ/検索モデル (.pt / .pkl) — 任意" },
+      diffusion: { zh: "扩散模型 (.pt)  — 可选，启用浅扩散", en: "Diffusion model (.pt) — optional, enables shallow diffusion", ja: "拡散モデル (.pt) — 任意、浅い拡散を有効化" },
+      diffusionCfg: { zh: "扩散配置 (.yaml)  — 可留空自动查找", en: "Diffusion config (.yaml) — blank = auto-detect", ja: "拡散設定 (.yaml) — 空欄で自動検出" },
       avatar: { zh: "角色头图 — 可选", en: "Character avatar — optional", ja: "キャラクター画像 — 任意" },
       name: { zh: "模型名称", en: "Model name", ja: "モデル名" },
       import: { zh: "导入", en: "Import", ja: "取り込み" },
@@ -359,6 +379,27 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
             <button onClick={handleBrowseIndex}>{Z("browseBtn")}</button>
           </div>
         </div>
+
+        {!isRvc && (
+          <>
+            <div className="rm-import-field">
+              <label>{Z("diffusion")}</label>
+              <div className="rm-import-row">
+                <input type="text" readOnly value={diffusionPath} placeholder="..." className="rm-import-path" />
+                <button onClick={handleBrowseDiffusion}>{Z("browseBtn")}</button>
+              </div>
+            </div>
+            {diffusionPath && (
+              <div className="rm-import-field">
+                <label>{Z("diffusionCfg")}</label>
+                <div className="rm-import-row">
+                  <input type="text" readOnly value={diffusionConfigPath} placeholder="..." className="rm-import-path" />
+                  <button onClick={handleBrowseDiffusionConfig}>{Z("browseBtn")}</button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
 
         <div className="rm-import-field">
           <label>{Z("avatar")}</label>
@@ -499,6 +540,11 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   {m.index_path && (
                     <span className="msst-onnx-ok" title={t18({ zh: "已附带检索/聚类文件", en: "Index/cluster asset present", ja: "インデックス/クラスタあり" }, lang)}>
                       {voiceType === "rvc" ? "IDX" : t18({ zh: "聚类", en: "CLUSTER", ja: "クラスタ" }, lang)}
+                    </span>
+                  )}
+                  {m.diffusion_path && (
+                    <span className="msst-onnx-ok" title={t18(VOICE_STRINGS.diffBadgeTip, lang)}>
+                      {t18({ zh: "扩散", en: "DIFF", ja: "拡散" }, lang)}
                     </span>
                   )}
                   <span>{formatSampleRateKhz(m.sample_rate)}</span>

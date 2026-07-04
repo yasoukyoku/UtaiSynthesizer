@@ -50,6 +50,7 @@ from architectures.sovits_v4 import (
     build_from_checkpoint as build_sovits_v4,
     load_sovits_config,
     set_deterministic as sovits_set_deterministic,
+    F0PredictorWrapper,
 )
 from architectures.bs_roformer import (
     load_from_checkpoint as load_bs_roformer,
@@ -236,6 +237,11 @@ def convert_sovits(input_path: Path, output_path: Path,
     `deterministic` additionally zeroes SineGen's in-graph randomness
     (gate builds only — shipping exports keep the original noise semantics).
 
+    When the checkpoint carries f0_decoder weights (both 4.0/4.1 eras do), a
+    companion auto-f0 predictor graph is exported next to the main onnx as
+    <stem>.f0.onnx (c/f0/uv/sid[/vol] -> f0_pred[1,T] Hz) and the sidecar
+    gains an "auto_f0" object; otherwise "auto_f0": {"available": false}.
+
     Reads the config.json next to the .pth (or --config); a missing config
     falls back to weight-shape inference with warnings."""
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
@@ -328,6 +334,65 @@ def convert_sovits(input_path: Path, output_path: Path,
             )
         print(f"ORT sanity run passed: T={t} -> audio (1, 1, {t * hop_size})")
 
+    # ── auto-f0 companion graph (<stem>.f0.onnx) ────────────────────────────
+    # Both 4.0- and 4.1-era checkpoints carry f0_decoder weights; the weights
+    # are the truth (meta["has_f0_decoder"] — 4.0 configs lack the key). The
+    # predictor graph shares the synthesizer's nn.Parameters at the python
+    # level and contains NO randomness, so `deterministic` is irrelevant here
+    # (a shipping export is already reproducible). Gated by
+    # verify/voice/gate_autof0.py against models.py infer(predict_f0=True).
+    auto_f0_path = None
+    f0_input_names = None
+    if meta["has_f0_decoder"]:
+        auto_f0_path = output_path.with_name(output_path.stem + ".f0.onnx")
+        predictor = F0PredictorWrapper(model)
+        predictor.eval()
+        f0_input_names = ["c", "f0", "uv", "sid"] + (["vol"] if vol_embedding else [])
+        f0_dynamic_axes = {
+            "c": {1: "seq_len"},
+            "f0": {1: "seq_len"},
+            "uv": {1: "seq_len"},
+            "f0_pred": {1: "seq_len"},
+        }
+        f0_inputs = (c, f0, uv, sid)
+        if vol_embedding:
+            f0_dynamic_axes["vol"] = {1: "seq_len"}
+            f0_inputs = f0_inputs + (vol,)
+        torch.onnx.export(
+            predictor,
+            f0_inputs,
+            str(auto_f0_path),
+            input_names=f0_input_names,
+            output_names=["f0_pred"],
+            dynamic_axes=f0_dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+        onnx.checker.check_model(onnx.load(str(auto_f0_path)))
+        print(f"ONNX check passed: {auto_f0_path}", file=sys.stderr)
+
+        f0_sess = ort.InferenceSession(auto_f0_path.read_bytes())
+        for t in (seq_len, 137):
+            f0_np = (150.0 + 250.0 * np.random.rand(1, t)).astype(np.float32)
+            f0_np[:, t // 5:t // 5 + 10] = 0.0
+            feeds = {
+                "c": np.random.randn(1, t, ssl_dim).astype(np.float32),
+                "f0": f0_np,
+                "uv": (f0_np > 0).astype(np.float32),
+                "sid": np.zeros(1, dtype=np.int64),
+            }
+            if vol_embedding:
+                feeds["vol"] = (0.1 * np.random.rand(1, t)).astype(np.float32)
+            f0_pred = f0_sess.run(None, feeds)[0]
+            if f0_pred.shape != (1, t) or not np.isfinite(f0_pred).all():
+                raise ValueError(
+                    f"auto-f0 ORT sanity run failed at T={t}: shape "
+                    f"{f0_pred.shape} (expected (1, {t})), "
+                    f"finite={np.isfinite(f0_pred).all()}"
+                )
+            print(f"ORT sanity run passed: T={t} -> f0_pred (1, {t})")
+
     config_path = output_path.with_suffix(".json")
     config_data = {
         "type": "sovits",
@@ -349,6 +414,14 @@ def convert_sovits(input_path: Path, output_path: Path,
         # Shortest supported input: the traced attention rel-pos branch is only
         # valid for T >= window_size + 2 (gated in verify/voice/gate1_sovits.py).
         "min_frames": meta["min_frames"],
+        # Appended AFTER every pre-existing key: older sidecar consumers parse
+        # the fields above and must see them byte-compatibly (ModelConfig keeps
+        # unknown keys in `extra`, exposing auto_f0 to the frontend verbatim).
+        "auto_f0": (
+            {"available": True, "file": auto_f0_path.name,
+             "inputs": f0_input_names}
+            if auto_f0_path is not None else {"available": False}
+        ),
     }
     # utf-8 + ensure_ascii=False: Chinese speaker names must survive verbatim.
     config_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False),
@@ -359,7 +432,8 @@ def convert_sovits(input_path: Path, output_path: Path,
     print(f"Config saved: {config_path}")
     print(f"Sample rate: {meta['sample_rate']}, SSL dim: {ssl_dim} "
           f"({meta['speech_encoder']}), Hop: {hop_size}, "
-          f"Speakers: {meta['n_speakers']}, vol_embedding: {vol_embedding}")
+          f"Speakers: {meta['n_speakers']}, vol_embedding: {vol_embedding}, "
+          f"auto_f0: {auto_f0_path.name if auto_f0_path is not None else False}")
 
 
 def _inference_params_from_yaml(config_yaml, fallback_chunk: int, fallback_overlap: int):

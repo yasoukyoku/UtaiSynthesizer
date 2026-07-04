@@ -166,7 +166,8 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, &|_p| {}).expect("rvc pipeline")
+            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, &|_p| {}, &|| false)
+                .expect("rvc pipeline")
         }
         "sovits" => {
             let options: SovitsOptions =
@@ -186,6 +187,78 @@ fn voice_env_wav() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("left")
                 .to_string();
+            // S36 quality-path env plumbing (all optional; mirrors resolve_sovits_quality
+            // WITHOUT its validations — the gate scripts control their own inputs):
+            //   UTAI_VOICE_DIFF   = <stem>.diffusion dir (encoder/denoiser onnx + diffusion.json)
+            //   UTAI_VOICE_VOCODER= path to nsf_hifigan.onnx (sidecar .json + mel .npy siblings
+            //                       named nsf_hifigan.json / nsf_hifigan_mel.npy in the same dir)
+            //   UTAI_VOICE_F0PRED = path to <stem>.f0.onnx
+            let vocoder = std::env::var("UTAI_VOICE_VOCODER").ok().map(|p| {
+                let voc_path = PathBuf::from(&p);
+                let dir = voc_path.parent().expect("vocoder parent dir").to_path_buf();
+                let vj: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("nsf_hifigan.json")).expect("vocoder json"),
+                )
+                .expect("parse vocoder json");
+                let filters: ndarray::Array2<f32> =
+                    ndarray_npy::read_npy(dir.join("nsf_hifigan_mel.npy")).expect("vocoder mel npy");
+                let sid = engine.load_model_with(&voc_path, false).expect("load vocoder");
+                utai_lib::inference::sovits::VocoderRuntime {
+                    session: sid,
+                    mel_filters: std::sync::Arc::new(filters),
+                    cfg: utai_lib::inference::nsf_hifigan::VocoderConfig {
+                        sample_rate: vj["sample_rate"].as_u64().unwrap_or(44100) as u32,
+                        hop_size: vj["hop_size"].as_u64().unwrap_or(512) as usize,
+                        num_mels: vj["num_mels"].as_u64().unwrap_or(128) as usize,
+                    },
+                }
+            });
+            let diffusion = std::env::var("UTAI_VOICE_DIFF").ok().map(|p| {
+                let dir = PathBuf::from(&p);
+                let dj: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("diffusion.json")).expect("diffusion json"),
+                )
+                .expect("parse diffusion json");
+                let as_f32_vec = |v: &serde_json::Value, dflt: f32| -> Vec<f32> {
+                    v.as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect())
+                        .filter(|v: &Vec<f32>| !v.is_empty())
+                        .unwrap_or_else(|| vec![dflt])
+                };
+                let schedule = utai_lib::inference::diffusion::DiffusionSchedule::linear(
+                    dj["timesteps"].as_u64().expect("timesteps") as usize,
+                    dj["max_beta"].as_f64().unwrap_or(0.02),
+                    &as_f32_vec(&dj["spec_min"], -12.0),
+                    &as_f32_vec(&dj["spec_max"], 2.0),
+                    dj["k_step_max"].as_u64().unwrap_or(0) as usize,
+                );
+                let enc = engine
+                    .load_model_with(&dir.join("encoder.onnx"), false)
+                    .expect("load diffusion encoder");
+                let den = engine
+                    .load_model_with(&dir.join("denoiser.onnx"), false)
+                    .expect("load diffusion denoiser");
+                utai_lib::inference::sovits::DiffusionRuntime {
+                    encoder_session: enc,
+                    denoiser_session: den,
+                    schedule,
+                    method: utai_lib::inference::diffusion::SamplerMethod::parse(
+                        &options.diffusion_method,
+                    )
+                    .expect("diffusion_method"),
+                    n_hidden: dj["n_hidden"].as_u64().unwrap_or(256) as usize,
+                    n_spk: dj["n_spk"].as_u64().unwrap_or(1) as usize,
+                    unit_interpolate_mode: dj["unit_interpolate_mode"]
+                        .as_str()
+                        .unwrap_or("left")
+                        .to_string(),
+                }
+            });
+            let f0_predictor = std::env::var("UTAI_VOICE_F0PRED").ok().map(|p| {
+                engine
+                    .load_model_with(&PathBuf::from(p), false)
+                    .expect("load f0 predictor")
+            });
             let m = utai_lib::inference::sovits::SovitsModel {
                 engine: &engine,
                 voice_session: &voice_sid,
@@ -193,6 +266,9 @@ fn voice_env_wav() {
                 rmvpe_session: &rmvpe_sid,
                 mel_filters: &mel,
                 cluster: None,
+                diffusion,
+                vocoder,
+                f0_predictor_session: f0_predictor,
                 sample_rate,
                 hop_size,
                 features_dim: dim,
@@ -201,7 +277,8 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, &|_p| {}).expect("sovits pipeline")
+            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, &|_p| {}, &|| false)
+                .expect("sovits pipeline")
         }
         other => panic!("UTAI_VOICE_KIND must be rvc|sovits (got {})", other),
     };

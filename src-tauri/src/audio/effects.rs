@@ -1,5 +1,4 @@
 use crate::inference::engine::OnnxEngine;
-use crate::inference::nsf_hifigan::{self, VocoderMode};
 use crate::{Result, UtaiError};
 
 use super::AudioBuffer;
@@ -183,27 +182,20 @@ fn pitch_shift_world(buffer: &AudioBuffer, semitones: f32) -> Result<AudioBuffer
     })
 }
 
+// The NSF-HiFiGAN effect paths below were opus4.6-era scaffolding built on a placeholder
+// mel (frame-energy × ramp) and a fake f0 — never reachable (process_effects always passed
+// session=None). S36 removed that dead API when nsf_hifigan.rs became the REAL so-vits
+// vocoder/enhancer; the effects vocoder (pc-nsf-hifigan) is its own post-① work item and
+// will be built on mel::nsf_mel + a real f0 extractor when it lands.
 fn pitch_shift_nsf(
-    buffer: &AudioBuffer,
-    semitones: f32,
-    engine: &OnnxEngine,
-    session_id: &str,
+    _buffer: &AudioBuffer,
+    _semitones: f32,
+    _engine: &OnnxEngine,
+    _session_id: &str,
 ) -> Result<AudioBuffer> {
-    let mel = nsf_hifigan::audio_to_mel(&buffer.samples, buffer.sample_rate)?;
-
-    // Extract F0 for the buffer (simplified — in production use RMVPE)
-    let n_frames = mel.shape()[0];
-    let f0 = estimate_f0_simple(&buffer.samples, buffer.sample_rate, n_frames);
-
-    let result = nsf_hifigan::synthesize(
-        engine,
-        session_id,
-        &mel,
-        &f0,
-        &VocoderMode::PitchShift { semitones },
-    )?;
-
-    Ok(AudioBuffer::new_mono(result.audio, result.sample_rate))
+    Err(UtaiError::Audio(
+        "NSF-HiFiGAN 音频效果尚未实现（效果器声码器属于后续打包阶段）".into(),
+    ))
 }
 
 fn formant_shift_world(buffer: &AudioBuffer, ratio: f32) -> Result<AudioBuffer> {
@@ -216,44 +208,24 @@ fn formant_shift_world(buffer: &AudioBuffer, ratio: f32) -> Result<AudioBuffer> 
 }
 
 fn formant_shift_nsf(
-    buffer: &AudioBuffer,
-    ratio: f32,
-    engine: &OnnxEngine,
-    session_id: &str,
+    _buffer: &AudioBuffer,
+    _ratio: f32,
+    _engine: &OnnxEngine,
+    _session_id: &str,
 ) -> Result<AudioBuffer> {
-    let mel = nsf_hifigan::audio_to_mel(&buffer.samples, buffer.sample_rate)?;
-    let n_frames = mel.shape()[0];
-    let f0 = estimate_f0_simple(&buffer.samples, buffer.sample_rate, n_frames);
-
-    let result = nsf_hifigan::synthesize(
-        engine,
-        session_id,
-        &mel,
-        &f0,
-        &VocoderMode::FormantShift { ratio },
-    )?;
-
-    Ok(AudioBuffer::new_mono(result.audio, result.sample_rate))
+    Err(UtaiError::Audio(
+        "NSF-HiFiGAN 音频效果尚未实现（效果器声码器属于后续打包阶段）".into(),
+    ))
 }
 
 fn audio_enhance(
-    buffer: &AudioBuffer,
-    engine: &OnnxEngine,
-    session_id: &str,
+    _buffer: &AudioBuffer,
+    _engine: &OnnxEngine,
+    _session_id: &str,
 ) -> Result<AudioBuffer> {
-    let mel = nsf_hifigan::audio_to_mel(&buffer.samples, buffer.sample_rate)?;
-    let n_frames = mel.shape()[0];
-    let f0 = estimate_f0_simple(&buffer.samples, buffer.sample_rate, n_frames);
-
-    let result = nsf_hifigan::synthesize(
-        engine,
-        session_id,
-        &mel,
-        &f0,
-        &VocoderMode::AudioEnhance,
-    )?;
-
-    Ok(AudioBuffer::new_mono(result.audio, result.sample_rate))
+    Err(UtaiError::Audio(
+        "NSF-HiFiGAN 音频效果尚未实现（效果器声码器属于后续打包阶段）".into(),
+    ))
 }
 
 fn apply_gain(buffer: &AudioBuffer, gain_db: f32) -> AudioBuffer {
@@ -329,27 +301,3 @@ pub fn normalize(buffer: &AudioBuffer, target_db: f32) -> AudioBuffer {
     }
 }
 
-fn estimate_f0_simple(audio: &[f32], sample_rate: u32, n_frames: usize) -> Vec<f32> {
-    // Simplified F0 estimation via zero-crossing rate
-    // In production, use RMVPE through the inference engine
-    let hop = audio.len() / n_frames.max(1);
-    let mut f0 = Vec::with_capacity(n_frames);
-
-    for frame in 0..n_frames {
-        let start = frame * hop;
-        let end = (start + hop).min(audio.len());
-        let frame_audio = &audio[start..end];
-
-        let mut crossings = 0u32;
-        for i in 1..frame_audio.len() {
-            if (frame_audio[i] >= 0.0) != (frame_audio[i - 1] >= 0.0) {
-                crossings += 1;
-            }
-        }
-
-        let freq = crossings as f32 * sample_rate as f32 / (2.0 * (end - start) as f32);
-        f0.push(if freq > 50.0 && freq < 1200.0 { freq } else { 0.0 });
-    }
-
-    f0
-}

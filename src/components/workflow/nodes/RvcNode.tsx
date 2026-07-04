@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
-import { VoiceModelPicker, SpeakerSelect, useVoiceModelSelection, VOICE_STRINGS } from "./VoiceModelPicker";
+import { VoiceModelPicker, SpeakerSelect, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
 import { RVC_DEFAULTS } from "../../../lib/workflow/voiceDefaults";
 import type { VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
@@ -22,6 +22,7 @@ export function RvcNode(props: NodeProps) {
   const noiseScale = (params.noise_scale as number) ?? RVC_DEFAULTS.noise_scale;
   const rmsMixRate = (params.rms_mix_rate as number) ?? RVC_DEFAULTS.rms_mix_rate;
   const l2Normalize = (params.l2_normalize as boolean) ?? RVC_DEFAULTS.l2_normalize;
+  const gpuExtract = (params.gpu_extract as boolean) ?? RVC_DEFAULTS.gpu_extract;
   const speakerId = (params.speaker_id as number | null) ?? RVC_DEFAULTS.speaker_id;
   const hasIndex = !!selected?.index_path;
 
@@ -42,15 +43,15 @@ export function RvcNode(props: NodeProps) {
               min={-24} max={24} step={1} value={f0Shift}
               onChange={(v) => updateParams({ f0_shift: v })}
             />
+            {/* hidden without the KNN index — 不能选择的控件一律不渲染（S36 用户拍板） */}
+            {hasIndex && (
             <ParamSlider
               label={t18({ zh: "检索占比", en: "Index ratio", ja: "インデックス率" }, lang)}
-              title={hasIndex
-                ? t18({ zh: "检索特征替换比例：越高越像目标音色，过高咬字可能发糊", en: "KNN index feature blend — higher = closer to the target timbre, too high can slur articulation", ja: "検索特徴の置換率 — 高いほど目標声質に近づくが、上げすぎると発音が不明瞭に" }, lang)
-                : t18({ zh: "该模型没有检索索引（导入时附带 .index/.npy 可启用）", en: "This model has no KNN index (import with an .index/.npy to enable)", ja: "このモデルにはインデックスがありません（.index/.npy と一緒に取り込むと有効化）" }, lang)}
-              disabled={!hasIndex}
+              title={t18({ zh: "检索特征替换比例：越高越像目标音色，过高咬字可能发糊", en: "KNN index feature blend — higher = closer to the target timbre, too high can slur articulation", ja: "検索特徴の置換率 — 高いほど目標声質に近づくが、上げすぎると発音が不明瞭に" }, lang)}
               min={0} max={1} step={0.01} value={indexRatio} format={formatRatio}
               onChange={(v) => updateParams({ index_ratio: v })}
             />
+            )}
             <ParamSlider
               label={t18({ zh: "清辅音保护", en: "Protect", ja: "無声子音保護" }, lang)}
               title={t18({ zh: "保护清辅音和呼吸声，防止电音撕裂；0.5 = 关闭", en: "Protects voiceless consonants & breaths from artifacts; 0.5 = off", ja: "無声子音と息を保護しアーティファクトを防ぐ。0.5 = 無効" }, lang)}
@@ -72,13 +73,18 @@ export function RvcNode(props: NodeProps) {
             />
             <SpeakerSelect model={selected} value={speakerId} lang={lang}
               onChange={(id) => updateParams({ speaker_id: id })} />
+            {/* retrieval-metric option — meaningless without an index, hidden with it */}
+            {hasIndex && (
             <div className="sep-param-row">
-              <label title={t18({ zh: "官方不做归一化；索引咬字发糊时可尝试", en: "The official pipeline does NOT normalize; try it if the index slurs articulation", ja: "公式パイプラインは正規化しません。インデックスで発音が不明瞭なときに試してください" }, lang)}>
+              <label title={t18({ zh: "检索改按余弦（方向）选近邻，忽略特征幅度；官方按 L2 距离。索引咬字发糊时可尝试", en: "Pick index neighbors by cosine (direction) instead of the official L2 distance; try it if the index slurs articulation", ja: "インデックス近傍を公式の L2 距離でなくコサイン（方向）で選択。インデックスで発音が不明瞭なときに試してください" }, lang)}>
                 {t18({ zh: "L2 归一化", en: "L2 normalize", ja: "L2 正規化" }, lang)}
               </label>
               <input type="checkbox" checked={l2Normalize}
                 onChange={(e) => updateParams({ l2_normalize: e.target.checked })} />
             </div>
+            )}
+            <GpuExtractRow value={gpuExtract} lang={lang}
+              onChange={(v) => updateParams({ gpu_extract: v })} />
           </div>
         )}
       </div>

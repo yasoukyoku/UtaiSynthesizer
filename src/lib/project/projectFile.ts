@@ -79,7 +79,10 @@ function teardownForLoad() {
   for (const [id, e] of Object.entries(wf.executions)) {
     if (e.status === "running") { wf.cancelExecution(id); hadRunning = true; }
   }
-  if (hadRunning) void invoke("cancel_separation").catch(() => {});
+  if (hadRunning) {
+    void invoke("cancel_separation").catch(() => {});
+    void invoke("cancel_voice").catch(() => {}); // voice runs are direct awaits — flag is the only abort
+  }
   // Close the docked node editor before the document is replaced: its segment is about to vanish (a
   // phantom panel would otherwise stay mounted), and a stale activePane:'workflow' would suppress
   // timeline Delete/Ctrl+K and misroute Ctrl+Z to the dead node stack. closeWorkflow() clears

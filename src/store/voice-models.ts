@@ -20,6 +20,9 @@ export interface VoiceModelConfig {
    * size (that's n_speakers, which is huge/phantom for typical single-speaker models). */
   /** Speaker display names; serde default ["default"]. */
   speakers?: Record<string, number>;
+  /** SoVITS S36: automatic-f0 predictor export info written by the converter when the
+   * checkpoint carries f0_decoder weights: { available: boolean, file?: string, inputs?: string[] }. */
+  auto_f0?: { available?: boolean; file?: string; inputs?: string[] };
   /** serde(flatten)-ed extras from the json pass through untyped. */
   [extra: string]: unknown;
 }
@@ -40,6 +43,9 @@ export interface VoiceModelEntry {
   config?: VoiceModelConfig;
   /** RVC: converted KNN index (.npy). Also the SoVITS cluster/index asset when present. */
   index_path: string | null;
+  /** SoVITS S36: `<stem>.diffusion/` attachment dir (encoder+denoiser onnx + diffusion.json)
+   * when the model has a converted shallow-diffusion model — gates the 浅扩散 UI. */
+  diffusion_path?: string | null;
   avatar_path: string | null;
 }
 
@@ -126,4 +132,15 @@ export function voiceSpeakerOptions(m: VoiceModelEntry): { id: number; label: st
 /** "40kHz" / "44.1kHz" — shared by the node meta rows and the resource manager list. */
 export function formatSampleRateKhz(sr: number): string {
   return sr % 1000 === 0 ? `${sr / 1000}kHz` : `${(sr / 1000).toFixed(1)}kHz`;
+}
+
+/** Whether the model has a converted `.diffusion/` attachment (gates 浅扩散/仅扩散 UI). */
+export function voiceHasDiffusion(m: VoiceModelEntry | undefined): boolean {
+  return !!m?.diffusion_path;
+}
+
+/** Whether the model's export includes the automatic-f0 predictor (gates 自动音高预测 UI).
+ * Truth source = converter-written sidecar key (weight-derived), NOT the model config. */
+export function voiceHasAutoF0(m: VoiceModelEntry | undefined): boolean {
+  return m?.config?.auto_f0?.available === true;
 }

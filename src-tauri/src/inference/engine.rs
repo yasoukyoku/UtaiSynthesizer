@@ -16,10 +16,13 @@ use crate::{Result, UtaiError};
 /// repeated runs of the same model reuse the loaded session (skips the multi-second
 /// parse + graph optimization + EP init). To bound memory, the cache is an LRU capped
 /// at this size; the least-recently-used session is evicted on overflow, and the whole
-/// cache is cleared when the device changes. Keep this small: each MSST/voice session
-/// can be hundreds of MB. 4 leaves headroom for a separation model + a couple of voice
-/// models without unbounded growth.
-const MAX_CACHED_SESSIONS: usize = 4;
+/// cache is cleared when the device changes. Keep this small-ish: each MSST/voice session
+/// can be hundreds of MB. S36 raised 4 → 8: the SoVITS quality path holds SIX sessions at
+/// once (voice + contentvec + rmvpe + diffusion encoder + denoiser + nsf-hifigan vocoder)
+/// and round-robins them per piece — at 4 the LRU would evict/rebuild a session EVERY
+/// piece (multi-second stalls that read as a hang). Aux/vocoder sessions are small and the
+/// aux ones sit on CPU; MSST still bounds its own footprint via release_others().
+const MAX_CACHED_SESSIONS: usize = 8;
 
 pub struct OnnxEngine {
     sessions: RwLock<HashMap<String, LoadedSession>>,
@@ -268,6 +271,77 @@ impl OnnxEngine {
             );
         }
         n
+    }
+
+    /// Free every GPU-bound cached session whose path is NOT under one of `keep`
+    /// (prefix match). "GPU-bound" = LoadSpec.device ≠ forced-CPU — the CPU aux
+    /// extractors hold no VRAM and stay warm. The symmetric counterpart of
+    /// release_others(): separation evicts voice sessions before ITS big load; a voice
+    /// run calls this with its OWN model family, so a leftover MSST arena / the other
+    /// backend's fleet is released before the new load peaks (S36: cap 4→8 removed the
+    /// LRU pressure that used to evict them incidentally — a stale SoVITS fleet + a
+    /// full-GPU RVC run stacked to ~12 GB). The GPU AUX extractor sessions are
+    /// deliberately NOT in any keep-set: ORT CUDA arenas only ever GROW, so a "kept
+    /// warm" extractor carries the previous run's activation high-water mark into the
+    /// next run (live-measured +1.4 GB) — every run's VRAM must equal its OWN
+    /// footprint. Reload specs survive (reload-on-miss).
+    pub fn release_gpu_sessions_except(&self, keep: &[PathBuf]) -> usize {
+        let paths = self.paths.read();
+        let mut sessions = self.sessions.write();
+        let before = sessions.len();
+        sessions.retain(|key, _| {
+            let Some(spec) = paths.get(key) else { return true };
+            if matches!(spec.device, Some(DeviceConfig::Cpu)) {
+                return true; // forced-CPU sessions hold no VRAM
+            }
+            keep.iter().any(|k| spec.path.starts_with(k))
+        });
+        let n = before - sessions.len();
+        if n > 0 {
+            tracing::info!(
+                "Released {} GPU session(s) not needed by this voice run (VRAM headroom)",
+                n
+            );
+        }
+        n
+    }
+
+    /// Unload every session (AND its reload spec) whose file path equals `prefix` or lives
+    /// under it. Used when a model's on-disk artifacts are replaced/deleted (re-import):
+    /// the engine caches by path, so without this a re-imported `<stem>.f0.onnx` /
+    /// `<stem>.diffusion/*.onnx` would keep serving the OLD graph. Removing from `paths`
+    /// too is deliberate — reload-on-miss must not resurrect a stale spec for a replaced
+    /// file. Prefix matching is on the raw stored path (same base the loaders passed in).
+    pub fn unload_paths_with_prefix(&self, prefix: &Path) -> usize {
+        let keys: Vec<String> = {
+            let paths = self.paths.read();
+            paths
+                .iter()
+                .filter(|(_, spec)| spec.path.starts_with(prefix))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        if keys.is_empty() {
+            return 0;
+        }
+        {
+            let mut sessions = self.sessions.write();
+            for k in &keys {
+                sessions.remove(k);
+            }
+        }
+        {
+            let mut paths = self.paths.write();
+            for k in &keys {
+                paths.remove(k);
+            }
+        }
+        tracing::info!(
+            "Unloaded {} session spec(s) under {} (files replaced)",
+            keys.len(),
+            prefix.display()
+        );
+        keys.len()
     }
 
     /// Drop all cached sessions (frees their memory). Safe to call between runs.

@@ -171,3 +171,67 @@ shim 必须 flatten，否则 `f0[:p_len]` 切到 size-1 batch 轴变 no-op，vc(
 `sys.modules.setdefault` 塞空模块即可。③ torchaudio 无匹配 torch 2.12 的 wheel，`pip install
 torchaudio --no-deps` 装 2.11.0（Resample 是纯 torch functional，无需 libtorchaudio C 扩展，可用）
 —— 仅变体 A 需要。④ 中文路径导出走 `PYTHONUTF8=1`（cp932 控制台会崩在打印路径处）。
+
+---
+
+## S36 质量路径关卡（浅扩散 / NSF-HiFiGAN / 自动f0 / E2E 全变体，2026-07-05 实测全过）
+
+### gate1_diffusion.py — 扩散模型（Unit2Mel + GaussianDiffusion + WaveNet）
+对照 `D:\MyDev\so-vits-svc\so-vits-svc\diffusion\{unit2mel,diffusion,wavenet}.py`（dpm/unipc
+采样档 lazy-import 原版 solver 模块驱动）。真权重 = 东雪莲扩散模型.pt（191 tensors，yaml
+vocoder.ckpt 缺失 → 临时补丁 yaml 指向 pretrain/nsf_hifigan 绝对路径的先例在此建立）。
+- **(a) 全采样 torch-vs-torch**（真 gt mel + 真 Volume_Extractor + 固定噪声）：naive/ddim/
+  pndm/dpm-solver/dpm-solver++/unipc + 纯扩散 **全部 0.0 bit-exact**（8 档；含 dpm
+  `lower_order_final steps<10` 两分支）。
+- **(c) torch vs ORT**：encoder 2.0e-6；denoiser 整数/分数 t（13.7/456.789）3.2e-6–9.6e-6
+  < 1e-4；动态 T 扫描 < 5e-4。schedule 重算（f64 np.linspace→f32）vs ckpt buffer **逐位 0.0**
+  —— Rust 侧 f64 重算调度的依据。
+- **(f) 随机移植补档**：n_spk=8 one-hot MatMul（**蓄意偏差**：`spk_mix@W` 替代 Embedding
+  gather，0-based forward:161 语义）vs 原版 sid 路径 0.0；分数 mix 2.4e-7；k_step_max=100
+  shallow-only 守卫两侧同 raise。
+- 图边界：**encoder.onnx（条件嵌入）+ denoiser.onnx（ε 网络，time 输入 f32 —— dpm/unipc
+  喂非整数 t）两图；采样循环全在 Rust 宿主**（`betas[:t]` 截断使 schedule 依赖运行时 k_step，
+  不可烘图）。sidecar 契约见 `export_diffusion.py`/已装 diffusion.json。
+
+### gate1_nsf_hifigan.py — NSF-HiFiGAN 声码器（aux，扩散+增强器共用）
+对照 `vdecoder\nsf_hifigan\models.py`，真权重 pretrain/nsf_hifigan/model（14.2M 参数）。
+SineGen 复用 rvc_v2 稳定相位重排（同一蓄意偏差）：零噪声 sine 2.98e-6 / audio 8.3e-7
+corr 1.000000；torch vs ORT det 3.5e-6，动态 T 全 < 5e-4；活噪声两跑差 1.2e-1（证噪声在图）。
+nvSTFT get_mel 原版 vs 独立 numpy f64 参照 4.6e-6/7.3e-7（**注意**：真实音频上近 clamp(1e-5)
+的 mel bin 经 ln 放大 fp 舍入至 ~1.8e-4 —— mel 对拍必须用带噪声底的合成信号，静音素材
+不可卡紧线）。Rust `inference/mel.rs` 参考向量由此关卡产出（实测精度 ~2e-6，测试线 1e-4）。
+
+### gate_autof0.py — 自动 f0（<stem>.f0.onnx 独立小图）
+对照 models.py:520,523-527（predict_f0 分支）。akiko(4.0)+东雪莲(4.1) 双真权重：
+- torch wrapper vs `orig.infer(predict_f0=True)` 返回的 f0：**0.0 bitwise**（含全无声守卫）。
+  normalize_f0 的 `uv_sum[uv_sum==0]=9999` → torch.where 改写（蓄意偏差）恒等 0.0。
+- ORT：lf0 域 <1.2e-6（**容差按网络输出域（lf0）与相对 Hz 判**，f0 是 O(400Hz) 量纲，
+  裸 Hz 读数天然 ×440 —— coarse-bin 翻转 0/200 是下游无害证明）。
+- **链路档（接线序证明）**：f0.onnx→主图（f0=f0_pred，uv 不变）vs 原版整体 infer：
+  c-torch audio ≤2.1e-5；c-ort ≤1.2e-3（f0 亚 mHz 扰动经 SineGen 相位积分放大，固有敏感、
+  非接线错，硬帽 1e-2）。主 onnx 重建 **MD5 与已装文件一致**（主图零扰动证明）。
+
+### e2e_quality_ref.py — 关卡2 E2E 全变体（vs 原版 torch 转写，REFPOLY 判定路径）
+两侧同一 20s 44.1k 素材（vocal.wav offset 5s，原版 slicer 实证单块）；ZeroNoise ↔ Rust
+`debug_zero_noise`（SovitsOptions 隐藏测试口）+ det 主图/det 声码器；Rust harness 用
+`UTAI_VOICE_DIFF/VOCODER/F0PRED` env 直驱（tests/voice_pipeline.rs）。2026-07-05 实测：
+
+| 变体 | SNR (dB) | corr |
+|---|---|---|
+| 浅扩散 dpm-solver++ k100 sp10 | 57.37 | 0.999999 |
+| 浅扩散 naive k100 | 59.17 | 0.999999 |
+| 浅扩散 unipc k100 sp10 | 57.63 | 0.999999 |
+| 纯扩散 dpm++ sp10 (t=1000) | 62.69 | 1.000000 |
+| 浅扩散+二次编码 | 57.86 | 0.999999 |
+| 自动f0 东雪莲 / akiko | 48.89 / 42.09 | 0.999994 / 0.999969 |
+| 增强器 key=0 / key=+4 | 54.10 / 54.63 | 0.999998 |
+
+全部 > 40 过线；残差解剖：浅扩散 57-59 ≈ VITS onnx-vs-torch 基线残差主导（纯扩散无 VITS
+→ 62.7 最高）；autof0 42-49 = f0 微扰相位积分（gate_autof0 已归因）。
+**second_encoding 实证裁决**（原版 infer_tool.py:313 缺 unsqueeze 疑似 bug）：逐字执行不崩
+—— 2-D c 被 torch 广播救回，与规范 batched 版差 7.6e-6（纯求和序）→ 非 bug，Rust 用规范
+布局，无偏差。
+**CUDA 冒烟**（V1）：36.8 dB / corr 0.9999 / 无 NaN；vs 同二进制 CPU 输出同值同频带剖面
+（TF32 → NSF 相位去相关，误差集中 4-24kHz）→ 100% EP 数值。**校准更新：SoVITS 浅扩散链
+CUDA 基线 ≈ 37 dB/corr 0.9999（比 S35 RVC 的 42 dB 更低是链更长），CUDA 回归看
+corr/无NaN/CPU自比，不拿波形 SNR 卡线。**

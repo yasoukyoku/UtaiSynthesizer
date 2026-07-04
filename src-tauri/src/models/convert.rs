@@ -155,4 +155,53 @@ pub fn convert_cluster_assets(input: &Path, outdir: &Path, app_dir: &Path) -> Re
     Ok(())
 }
 
+/// SoVITS shallow-diffusion attachment: the separate diffusion `.pt` (+ its `config.yaml`)
+/// → `encoder.onnx` + `denoiser.onnx` + `diffusion.json` inside `outdir`
+/// (converter/export_diffusion.py). `config` = the user-picked yaml; None lets the script
+/// auto-resolve it next to the .pt (same stem → unique .yaml in dir → config.yaml), erroring
+/// in Chinese when ambiguous.
+pub fn convert_diffusion_assets(
+    input: &Path,
+    config: Option<&Path>,
+    outdir: &Path,
+    app_dir: &Path,
+) -> Result<()> {
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let script = app_dir.join("converter").join("export_diffusion.py");
+
+    if !script.exists() {
+        return Err(UtaiError::Model(format!(
+            "Diffusion converter not found: {}",
+            script.display()
+        )));
+    }
+    std::fs::create_dir_all(outdir)?;
+
+    let mut cmd = crate::util::python_command(&python);
+    cmd.arg(&script).arg("--input").arg(input);
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    let output = cmd.arg("--outdir").arg(outdir).output().map_err(|e| {
+        UtaiError::Model(format!(
+            "Failed to run diffusion converter (python={}): {}",
+            python.display(),
+            e
+        ))
+    })?;
+
+    if !output.status.success() {
+        return Err(UtaiError::Model(format!(
+            "Diffusion conversion failed: {}",
+            spawn_error_detail(&output)
+        )));
+    }
+    if !outdir.join("diffusion.json").exists() {
+        return Err(UtaiError::Model(
+            "Diffusion conversion completed but diffusion.json not found".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // find_converter_python moved to crate::util::find_python (shared with commands/msst_models.rs).

@@ -27,6 +27,11 @@ pub struct ModelEntry {
     pub sample_rate: u32,
     pub config: ModelConfig,
     pub index_path: Option<PathBuf>,
+    /// SoVITS S36: `<stem>.diffusion/` attachment dir (encoder+denoiser onnx +
+    /// diffusion.json) — present iff the dir holds a diffusion.json. Gates 浅扩散.
+    /// Mirrored by the TS `VoiceModelEntry` (src/store/voice-models.ts) — keep in sync.
+    #[serde(default)]
+    pub diffusion_path: Option<PathBuf>,
     pub avatar_path: Option<PathBuf>,
 }
 
@@ -104,6 +109,26 @@ pub struct ModelConfig {
     pub inputs: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: serde_json::Value,
+}
+
+impl ModelConfig {
+    /// Effective ContentVec feature dim: speech_encoder wins when present (SoVITS sidecars;
+    /// unknown encoder = error, never a silent fallback), else features_dim (RVC sidecars).
+    /// THE single source — used by the inference command layer AND the import-time
+    /// diffusion-attachment cross-check.
+    pub fn resolved_features_dim(&self) -> std::result::Result<usize, String> {
+        if let Some(enc) = self.speech_encoder.as_deref() {
+            return match enc {
+                "vec768l12" => Ok(768),
+                "vec256l9" => Ok(256),
+                other => Err(format!(
+                    "不支持的 speech_encoder：{}（仅支持 vec768l12 / vec256l9）",
+                    other
+                )),
+            };
+        }
+        Ok(self.features_dim as usize)
+    }
 }
 
 fn default_version() -> String { "unknown".to_string() }
@@ -193,6 +218,16 @@ impl ModelRegistry {
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        // `<stem>.f0.onnx` is the SoVITS auto-f0 predictor COMPANION of
+                        // `<stem>.onnx` (S36), not a model of its own — a phantom entry here
+                        // would show up in the UI and crash on run. Only skip when the base
+                        // model actually exists, so a model legitimately NAMED `…​.f0`
+                        // (sanitize keeps dots) doesn't silently vanish from the list.
+                        if let Some(base) = stem.strip_suffix(".f0") {
+                            if dir.join(format!("{}.onnx", base)).exists() {
+                                continue;
+                            }
+                        }
 
                         let config_path = path.with_extension("json");
                         let config = if config_path.exists() {
@@ -224,6 +259,19 @@ impl ModelRegistry {
 
                         let avatar = find_avatar(&path);
 
+                        // SoVITS shallow-diffusion attachment: `<stem>.diffusion/` counts
+                        // only when its diffusion.json exists (a half-written dir from a
+                        // failed conversion must not light the 浅扩散 UI).
+                        let diffusion = if matches!(model_type, ModelType::SoVits) {
+                            let d = path
+                                .parent()
+                                .unwrap_or(&dir)
+                                .join(format!("{}.diffusion", stem));
+                            if d.join("diffusion.json").exists() { Some(d) } else { None }
+                        } else {
+                            None
+                        };
+
                         fresh.push(ModelEntry {
                             name,
                             model_type: model_type.clone(),
@@ -232,6 +280,7 @@ impl ModelRegistry {
                             sample_rate,
                             config,
                             index_path: index,
+                            diffusion_path: diffusion,
                             avatar_path: avatar,
                         });
                     }
@@ -293,6 +342,8 @@ impl ModelRegistry {
         model_type: ModelType,
         app_dir: &Path,
         index_file: Option<&Path>,
+        diffusion_file: Option<&Path>,
+        diffusion_config: Option<&Path>,
         avatar_file: Option<&Path>,
     ) -> Result<ImportOutcome> {
         self.ensure_scanned();
@@ -336,6 +387,25 @@ impl ModelRegistry {
             if src_json.exists() {
                 std::fs::copy(&src_json, onnx_path.with_extension("json"))?;
             }
+            // S36 companions travel with a converter-exported .onnx: the auto-f0 predictor
+            // (`<stem>.f0.onnx` — the sidecar may claim auto_f0.available and the run would
+            // hard-error without the file) and a converted `.diffusion/` attachment dir.
+            let src_f0 = src_path.with_extension("f0.onnx");
+            if src_f0.exists() {
+                if let Err(e) = std::fs::copy(&src_f0, onnx_path.with_extension("f0.onnx")) {
+                    warnings.push(format!("自动音高预测器复制失败：{}——自动f0不可用", e));
+                }
+            }
+            if let (Some(src_dir), Some(src_stem)) = (src_path.parent(), src_path.file_stem()) {
+                let src_diff = src_dir.join(format!("{}.diffusion", src_stem.to_string_lossy()));
+                if src_diff.join("diffusion.json").exists() {
+                    let dest_diff = subdir.join(format!("{}.diffusion", stem));
+                    if let Err(e) = copy_dir_flat(&src_diff, &dest_diff) {
+                        warnings.push(format!("扩散附件复制失败：{}——浅扩散不可用", e));
+                        std::fs::remove_dir_all(&dest_diff).ok();
+                    }
+                }
+            }
         } else {
             convert::convert_pth_to_onnx(src_path, &onnx_path, &model_type, app_dir)?;
         }
@@ -345,6 +415,23 @@ impl ModelRegistry {
 
         let index_path =
             self.resolve_index(&stem, &model_type, src_path, index_file, app_dir, &mut warnings);
+
+        let diffusion_path = self
+            .resolve_diffusion_assets(
+                &stem,
+                &model_type,
+                &config,
+                diffusion_file,
+                diffusion_config,
+                app_dir,
+                &mut warnings,
+            )
+            .or_else(|| {
+                // A direct-.onnx import may have brought an already-converted `.diffusion/`
+                // dir along (copied above) — surface it on the entry like scan() would.
+                let d = subdir.join(format!("{}.diffusion", stem));
+                if d.join("diffusion.json").exists() { Some(d) } else { None }
+            });
 
         let avatar_path = match avatar_file {
             Some(src) if src.exists() => match copy_avatar(&subdir, &stem, src) {
@@ -373,11 +460,77 @@ impl ModelRegistry {
             sample_rate,
             config,
             index_path,
+            diffusion_path,
             avatar_path,
         };
 
         self.entries.write().push(entry.clone());
         Ok(ImportOutcome { entry, warnings })
+    }
+
+    /// SoVITS shallow-diffusion attachment (S36): the user-picked diffusion `.pt` (+ optional
+    /// `.yaml`) is converted (converter/export_diffusion.py) into `<subdir>/<stem>.diffusion/`
+    /// (encoder.onnx + denoiser.onnx + diffusion.json). Failures are WARNINGS (model still
+    /// imports, 浅扩散 unavailable — the cluster-asset posture). A successful conversion is
+    /// additionally cross-checked against the MAIN model: the diffusion model's ContentVec
+    /// dim must match, else the pair could never run together and the dir is dropped.
+    fn resolve_diffusion_assets(
+        &self,
+        stem: &str,
+        model_type: &ModelType,
+        main_config: &ModelConfig,
+        diffusion_file: Option<&Path>,
+        diffusion_config: Option<&Path>,
+        app_dir: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Option<PathBuf> {
+        let src = diffusion_file?;
+        if !matches!(model_type, ModelType::SoVits) {
+            warnings.push("扩散模型仅支持 SoVITS——已忽略".to_string());
+            return None;
+        }
+        if !src.exists() {
+            warnings.push(format!("扩散模型文件不存在：{}", src.display()));
+            return None;
+        }
+        let diffusion_dir = self
+            .models_dir
+            .join(type_subdir(&ModelType::SoVits))
+            .join(format!("{}.diffusion", stem));
+
+        if let Err(e) =
+            convert::convert_diffusion_assets(src, diffusion_config, &diffusion_dir, app_dir)
+        {
+            tracing::warn!("Diffusion conversion failed for {}: {}", src.display(), e);
+            warnings.push(format!(
+                "扩散模型转换失败（{}）：{}——模型已导入，浅扩散不可用",
+                src.file_name().unwrap_or_default().to_string_lossy(),
+                e
+            ));
+            std::fs::remove_dir_all(&diffusion_dir).ok(); // no half-written attachment
+            return None;
+        }
+
+        // Cross-check: diffusion encoder dim vs the main model's ContentVec dim
+        // (resolved_features_dim = the shared single source; an unknown speech_encoder
+        // would already have failed the main import, treat it as unknown here).
+        let sidecar = diffusion_dir.join("diffusion.json");
+        let enc_dim = std::fs::read_to_string(&sidecar)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("encoder_out_channels").and_then(|d| d.as_u64()));
+        let main_dim = main_config.resolved_features_dim().ok().map(|d| d as u64);
+        if let (Some(ed), Some(md)) = (enc_dim, main_dim) {
+            if ed != md {
+                warnings.push(format!(
+                    "扩散模型的特征维度（{}）与主模型（{}）不一致——两者无法配合使用，已移除该扩散附件",
+                    ed, md
+                ));
+                std::fs::remove_dir_all(&diffusion_dir).ok();
+                return None;
+            }
+        }
+        Some(diffusion_dir)
     }
 
     pub fn set_avatar(&self, name: &str, avatar_file: &Path) -> Result<Option<PathBuf>> {
@@ -627,6 +780,18 @@ fn finalize_sidecar(
     )
 }
 
+/// Copy a single-level asset dir (the `.diffusion/` attachment — flat files only).
+fn copy_dir_flat(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            std::fs::copy(&p, dest.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 /// First per-speaker .npy inside a `<stem>.cluster/` dir (alphabetical for stability), or None.
 fn first_cluster_asset(cluster_dir: &Path) -> Option<PathBuf> {
     let mut assets: Vec<PathBuf> = std::fs::read_dir(cluster_dir)
@@ -692,15 +857,19 @@ fn remove_stem_avatars(dir: &Path, stem: &str) {
 }
 
 /// Remove every on-disk artifact keyed on the entry's stem (onnx + sidecar json + index npy +
-/// avatar). Shared by delete and the re-import REPLACE path — one source of truth for "which
-/// files belong to a model".
+/// f0-predictor onnx + diffusion dir + avatar). Shared by delete and the re-import REPLACE
+/// path — one source of truth for "which files belong to a model".
 fn remove_entry_files(entry: &ModelEntry) {
     std::fs::remove_file(&entry.path).ok();
     std::fs::remove_file(entry.path.with_extension("json")).ok();
     std::fs::remove_file(entry.path.with_extension("npy")).ok();
-    // SoVITS cluster/retrieval asset dir (see resolve_cluster_assets).
+    // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
+    std::fs::remove_file(entry.path.with_extension("f0.onnx")).ok();
+    // SoVITS cluster/retrieval asset dir (see resolve_cluster_assets) + the S36
+    // shallow-diffusion attachment dir (see resolve_diffusion_assets).
     if let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem()) {
         std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem.to_string_lossy()))).ok();
+        std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem.to_string_lossy()))).ok();
     }
     if let Some(index) = &entry.index_path {
         std::fs::remove_file(index).ok();
@@ -821,7 +990,7 @@ mod tests {
         let reg = ModelRegistry::new(models_dir.clone());
         let outcome = reg
             .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir,
-                Some(&src_index), Some(&src_avatar))
+                Some(&src_index), None, None, Some(&src_avatar))
             .unwrap();
 
         // Every artifact shares the sanitized stem (CJK preserved; nothing to strip here).
@@ -853,7 +1022,7 @@ mod tests {
 
         // Same-name re-import → REPLACE (single row, stable stem), old index/avatar cleaned up.
         let outcome2 = reg2
-            .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir, None, None)
+            .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None)
             .unwrap();
         assert_eq!(reg2.list_by_type(&ModelType::Rvc).len(), 1);
         assert_eq!(outcome2.entry.path, outcome.entry.path);
@@ -862,8 +1031,8 @@ mod tests {
         assert!(!rvc_dir.join(format!("{}.avatar.png", stem)).exists());
 
         // Two DIFFERENT display names sanitizing to the same stem → numbered suffix, no clobber.
-        let a = reg2.import_file("A/B", &src_onnx, ModelType::Rvc, &app_dir, None, None).unwrap();
-        let b = reg2.import_file("A\\B", &src_onnx, ModelType::Rvc, &app_dir, None, None).unwrap();
+        let a = reg2.import_file("A/B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None).unwrap();
+        let b = reg2.import_file("A\\B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None).unwrap();
         assert_eq!(a.entry.path, rvc_dir.join("AB.onnx"));
         assert_eq!(b.entry.path, rvc_dir.join("AB (2).onnx"));
         assert!(a.entry.path.exists() && b.entry.path.exists());

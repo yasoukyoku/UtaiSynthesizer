@@ -341,13 +341,6 @@ pub fn upsample_2x_nearest(feats: &Array2<f32>) -> Array2<f32> {
 
 /// L2-normalize feature rows in place (optional post-retrieval step; NOT in the official
 /// pipeline — exposed as the l2_normalize option).
-pub fn l2_normalize_rows(features: &mut Array2<f32>) {
-    for mut row in features.rows_mut() {
-        let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        row.iter_mut().for_each(|x| *x /= norm);
-    }
-}
-
 // ─── KNN feature retrieval (RVC vc() faiss semantics, shared with so-vits) ──
 
 const KNN_TOP_K: usize = 8;
@@ -389,7 +382,18 @@ impl KnnIndex {
 ///   feats = ratio * npy + (1 - ratio) * feats
 /// Ours is EXACT brute-force top-8 (faiss IVF nprobe=1 is approximate) and clamps the
 /// squared distance at 1e-9 — the original's exact-match case is 1/0 = inf → NaN.
-pub fn knn_blend(features: &Array2<f32>, index: &KnnIndex, ratio: f32) -> Array2<f32> {
+///
+/// `cosine_metric` (RVC's L2归一化 option, OUR extra): neighbor selection + 1/d⁴ weights
+/// use the unit-normalized distance d² = 2 − 2·cos(q,v) instead of raw squared-L2, but the
+/// retrieved vectors are blended at their ORIGINAL scale. S36 fix: the first version
+/// normalized the blended features THEMSELVES (the model input) — unit-norm ContentVec is
+/// far outside the synthesizer's training distribution and audibly muffles the output.
+pub fn knn_blend(
+    features: &Array2<f32>,
+    index: &KnnIndex,
+    ratio: f32,
+    cosine_metric: bool,
+) -> Array2<f32> {
     let t = features.nrows();
     let dim = features.ncols();
     if index.len() == 0 || dim != index.dim() {
@@ -414,9 +418,16 @@ pub fn knn_blend(features: &Array2<f32>, index: &KnnIndex, ratio: f32) -> Array2
             let mut cand: Vec<(f32, usize)> = Vec::with_capacity(index.len());
             for (bi, q_row) in q.rows().into_iter().enumerate() {
                 let qn: f32 = q_row.iter().map(|&v| v * v).sum();
+                let q_norm = qn.sqrt().max(1e-12);
                 cand.clear();
                 for j in 0..index.len() {
-                    let d2 = qn - 2.0 * sims[[bi, j]] + index.norms[j];
+                    let d2 = if cosine_metric {
+                        // squared L2 of the unit-normalized pair: 2 − 2·cos(q, v)
+                        let v_norm = index.norms[j].sqrt().max(1e-12);
+                        2.0 - 2.0 * sims[[bi, j]] / (q_norm * v_norm)
+                    } else {
+                        qn - 2.0 * sims[[bi, j]] + index.norms[j]
+                    };
                     cand.push((d2, j));
                 }
                 cand.select_nth_unstable_by(k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -556,12 +567,37 @@ mod tests {
 
         let index = KnnIndex::new(Array2::from_shape_vec((10, 4), KNN_INDEX.to_vec()).unwrap());
         let queries = Array2::from_shape_vec((3, 4), KNN_QUERIES.to_vec()).unwrap();
-        let b075 = knn_blend(&queries, &index, 0.75);
-        let b100 = knn_blend(&queries, &index, 1.0);
+        let b075 = knn_blend(&queries, &index, 0.75, false);
+        let b100 = knn_blend(&queries, &index, 1.0, false);
         assert_close(b075.as_slice().unwrap(), KNN_BLEND_075, 1e-4, "knn 0.75");
         assert_close(b100.as_slice().unwrap(), KNN_BLEND_100, 1e-4, "knn 1.0");
         // exact-match row must come back as the index vector itself (eps clamp, no NaN)
         assert!(b100.iter().all(|v| v.is_finite()), "NaN in knn output");
+    }
+
+    // cosine-metric mode (RVC L2归一化, S36 semantics): neighbor CHOICE ignores vector
+    // magnitude, but the blended output stays at the ORIGINAL index-vector scale.
+    #[test]
+    fn knn_blend_cosine_metric_selects_by_angle_keeps_scale() {
+        // index: v0 = big vector along +x, v1 = tiny vector along +y
+        let index = KnnIndex::new(
+            Array2::from_shape_vec((2, 2), vec![10.0, 0.0, 0.0, 0.01]).unwrap(),
+        );
+        // query along +y: L2-nearest is v1 for both metrics, but for a query along +x
+        // with small magnitude, squared-L2 prefers TINY v1 (closer in space) while
+        // cosine prefers v0 (same direction).
+        let q = Array2::from_shape_vec((1, 2), vec![0.02, 0.0]).unwrap();
+        let l2 = knn_blend(&q, &index, 1.0, false);
+        let cosine = knn_blend(&q, &index, 1.0, true);
+        // k = min(8, 2) = 2 → both neighbors contribute, but weights (1/d²)² concentrate
+        // on the nearest: L2 → v1 (y-axis), cosine → v0 (x-axis, ORIGINAL 10.0 scale).
+        assert!(l2[[0, 1]].abs() > l2[[0, 0]].abs(), "L2 metric should favor tiny v1");
+        assert!(
+            cosine[[0, 0]] > 9.0,
+            "cosine metric must pick same-direction v0 at ORIGINAL scale, got {:?}",
+            cosine
+        );
+        assert!(cosine.iter().all(|v| v.is_finite()));
     }
 
     // python (original so-vits utils.repeat_expand_2d, ast-exec):
@@ -661,19 +697,6 @@ mod tests {
             vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0]
         );
         assert_eq!(reflect_pad_np(&[7.0], 3, 2), vec![7.0; 6]);
-    }
-
-    #[test]
-    fn l2_normalize_produces_unit_vectors() {
-        let mut features =
-            Array2::from_shape_vec((3, 2), vec![3.0, 4.0, 0.0, 5.0, 1.0, 0.0]).unwrap();
-        l2_normalize_rows(&mut features);
-        for row in features.rows() {
-            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((norm - 1.0).abs() < 1e-6);
-        }
-        assert!((features[[0, 0]] - 0.6).abs() < 1e-6);
-        assert!((features[[0, 1]] - 0.8).abs() < 1e-6);
     }
 
     #[test]

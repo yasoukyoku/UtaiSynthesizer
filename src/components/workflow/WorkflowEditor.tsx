@@ -560,6 +560,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     useWorkflowStore.getState().cancelExecution(segmentId);
     useWorkflowStore.getState().clearPendingStatuses(segmentId); // 立即清掉蓝/黄框（后端随后停止）
     invoke("cancel_separation").catch(() => {});
+    // Voice invokes (run_rvc/run_sovits) are direct awaits — no polling loop ever re-checks
+    // isCancelled mid-run, so the Rust-side flag is the only way to abort a long
+    // diffusion/synthesis. Global like the separation cancel.
+    invoke("cancel_voice").catch(() => {});
   }, [segmentId]);
 
   const segmentRef = useRef(segment);

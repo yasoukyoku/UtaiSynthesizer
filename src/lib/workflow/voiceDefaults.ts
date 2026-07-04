@@ -4,14 +4,27 @@
  * options deserialization must mirror (run_rvc / run_sovits in src-tauri).
  *
  * The engine serializes EXACTLY these snake_case keys as the `options` object of the invoke
- * payload `{ voiceName, modelPath, audioPath, options }` — nothing else (the old
- * `shallowDiffusion` arg is gone: shallow-diffusion / auto-f0 / spk-mix are DEFERRED by user
- * decision, so they have no params and no UI).
+ * payload `{ voiceName, modelPath, audioPath, options }` — nothing else. (S36: the SoVITS
+ * quality path — shallow diffusion / only_diffusion / second_encoding / NSF enhancer /
+ * auto-f0 — is now wired; spk-mix remains deferred. Rust also accepts a test-only
+ * `debug_zero_noise` key that deliberately has NO entry here — gate harnesses only.)
  *
  * Node params store the SAME snake_case keys (plus `voiceName` / `modelPath`), so there is no
  * UI-key → wire-key mapping layer to drift: an absent key means "use the default below".
  * f0 method is rmvpe-only for now — no selector param.
  */
+
+/** Diffusion sampler ids — EXACT wire strings the Rust pipeline matches on (original
+ * so-vits-svc method names; "naive" = the plain DDPM p_sample fallback branch). */
+export const DIFFUSION_METHODS = [
+  "dpm-solver++",
+  "dpm-solver",
+  "unipc",
+  "pndm",
+  "ddim",
+  "naive",
+] as const;
+export type DiffusionMethod = (typeof DIFFUSION_METHODS)[number];
 
 export interface RvcOptions {
   /** Pitch shift in semitones, -24..24. */
@@ -31,6 +44,9 @@ export interface RvcOptions {
   /** Output resample rate; 0 = keep the model's sample rate. */
   resample_sr: number;
   seed: number;
+  /** Run the aux feature/f0 extractors (ContentVec + RMVPE) on the global GPU device instead
+   * of the S35 forced-CPU default. Faster, but costs VRAM. */
+  gpu_extract: boolean;
 }
 
 export interface SovitsOptions {
@@ -45,6 +61,32 @@ export interface SovitsOptions {
   /** Input-loudness-envelope replacement mix, 0..1 — 1.0 means OFF (keep output loudness). */
   loudness_envelope: number;
   seed: number;
+  /** Shallow diffusion: VITS output → mel → k_step-noised → denoised → NSF-HiFiGAN vocoder.
+   * Requires the model's `.diffusion/` attachment; mutually exclusive with nsf_enhance. */
+  shallow_diffusion: boolean;
+  /** Diffusion depth 1..1000 (≤ the diffusion model's k_step_max — Rust validates).
+   * IGNORED by only_diffusion (full-depth generation, original semantics). */
+  k_step: number;
+  /** Sampler — one of DIFFUSION_METHODS. */
+  diffusion_method: string;
+  /** Step-skip factor: solver steps ≈ k_step / speedup. 1 disables acceleration
+   * (falls back to the plain DDPM loop, same as "naive"). */
+  diffusion_speedup: number;
+  /** Skip VITS entirely — pure from-noise diffusion of the input (needs a full-depth
+   * diffusion model, k_step_max == timesteps). */
+  only_diffusion: boolean;
+  /** Re-extract ContentVec from the VITS output before diffusing (原版「玄学选项」). */
+  second_encoding: boolean;
+  /** NSF-HiFiGAN enhancer on the plain VITS path — force-disabled while any diffusion
+   * mode is on (original mutual exclusion). */
+  nsf_enhance: boolean;
+  /** Enhancer high-range adaptation in semitones (原版 enhancer_adaptive_key). */
+  enhancer_adaptive_key: number;
+  /** Automatic f0 prediction via the model's f0_decoder (`<stem>.f0.onnx`). Speech only —
+   * singing will drift badly (original warning); f0_shift is largely neutralized. */
+  auto_f0: boolean;
+  /** Same as RvcOptions.gpu_extract. */
+  gpu_extract: boolean;
 }
 
 export const RVC_DEFAULTS: RvcOptions = {
@@ -57,6 +99,7 @@ export const RVC_DEFAULTS: RvcOptions = {
   l2_normalize: false,
   resample_sr: 0,
   seed: 0,
+  gpu_extract: false,
 };
 
 export const SOVITS_DEFAULTS: SovitsOptions = {
@@ -66,6 +109,18 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   cluster_ratio: 0,
   loudness_envelope: 1.0,
   seed: 0,
+  // Quality path (S36). k_step 100 / dpm-solver++ / speedup 10 = the original template
+  // defaults (Svc.infer k_step + configs_template/diffusion_template.yaml infer block).
+  shallow_diffusion: false,
+  k_step: 100,
+  diffusion_method: "dpm-solver++",
+  diffusion_speedup: 10,
+  only_diffusion: false,
+  second_encoding: false,
+  nsf_enhance: false,
+  enhancer_adaptive_key: 0,
+  auto_f0: false,
+  gpu_extract: false,
 };
 
 /**

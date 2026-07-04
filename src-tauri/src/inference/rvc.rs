@@ -26,8 +26,8 @@ use std::path::Path;
 
 use super::engine::{InputTensor, OnnxEngine};
 use super::features::{
-    change_rms, contentvec_extract, highpass_48hz_16k, knn_blend, l2_normalize_rows,
-    reflect_pad_np, resample, upsample_2x_nearest, KnnIndex,
+    change_rms, contentvec_extract, highpass_48hz_16k, knn_blend, reflect_pad_np, resample,
+    upsample_2x_nearest, KnnIndex,
 };
 use super::{RvcOptions, SynthesisResult};
 use crate::audio::AudioBuffer;
@@ -87,6 +87,7 @@ pub fn run_pipeline(
     audio: &AudioBuffer,
     options: &RvcOptions,
     progress: &dyn Fn(f32),
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
     if audio.samples.is_empty() {
         return Err(UtaiError::Audio("输入音频为空".into()));
@@ -175,6 +176,9 @@ pub fn run_pipeline(
     let mut s_ix = 0usize;
     let mut chunk_idx: u64 = 0;
     for &ot in &opt_ts {
+        if cancel() {
+            return Err(UtaiError::Inference("已取消".into()));
+        }
         let t = ot / WINDOW * WINDOW;
         // Clamp to buffer length: Python's `audio_pad[s : t+t_pad2+window]` TRUNCATES, but Rust
         // slicing PANICS. When the last silence-seek cut lands in the final partial <WINDOW window
@@ -191,6 +195,9 @@ pub fn run_pipeline(
         progress(0.2 + 0.75 * (chunk_idx as f32 / total_chunks));
     }
     // final chunk: audio_pad[t:] with the remaining pitch tail (t=None → whole signal)
+    if cancel() {
+        return Err(UtaiError::Inference("已取消".into()));
+    }
     let chunk = &audio_pad[s_ix..];
     let out = vc_chunk(
         m,
@@ -253,12 +260,10 @@ fn vc_chunk(
     };
     if options.index_ratio > 0.0 {
         if let Some(index) = m.index {
-            feats = knn_blend(&feats, &index.knn, options.index_ratio);
+            // l2_normalize = cosine NEIGHBOR METRIC only (S36 fix — normalizing the
+            // blended model input itself muffled the audio; see knn_blend docs).
+            feats = knn_blend(&feats, &index.knn, options.index_ratio, options.l2_normalize);
         }
-    }
-    // our extra option — AFTER retrieval, applied to the blended features only
-    if options.l2_normalize {
-        l2_normalize_rows(&mut feats);
     }
     // 2x nearest upsample 50 → 100 fps (both copies, original lines 247-251)
     let feats = upsample_2x_nearest(&feats);

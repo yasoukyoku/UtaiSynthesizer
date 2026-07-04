@@ -17,10 +17,21 @@ struct VoiceProgress {
 }
 
 /// Build a progress callback that emits throttled `voice-progress` events (only on a ≥1% step,
-/// plus the terminal 1.0) so a many-chunk RVC run doesn't spam the event bus.
-fn progress_emitter(app: tauri::AppHandle, node_id: String) -> impl Fn(f32) {
+/// plus the terminal 1.0) so a many-chunk RVC run doesn't spam the event bus. A CANCELLED run
+/// goes silent immediately: its pipeline may keep draining until the next cancel poll (a
+/// multi-second ONNX Run), and late emissions would fight a freshly started run's bar for the
+/// same node.
+fn progress_emitter(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    run_epoch: u64,
+    node_id: String,
+) -> impl Fn(f32) {
     let last = AtomicU32::new(0);
     move |p: f32| {
+        if state.inference.voice_cancelled(run_epoch) {
+            return;
+        }
         let pct = (p * 100.0).round() as u32;
         if p >= 1.0 || pct > last.load(Ordering::Relaxed) {
             last.store(pct, Ordering::Relaxed);
@@ -41,6 +52,11 @@ const AUX_CONTENTVEC_768: &str = "contentvec_768l12.onnx";
 const AUX_CONTENTVEC_256: &str = "contentvec_256l9.onnx";
 const AUX_RMVPE: &str = "rmvpe_e2e.onnx";
 const AUX_RMVPE_MEL: &str = "rmvpe_mel_filters.npy";
+// S36 quality path: the NSF-HiFiGAN vocoder (shared by shallow diffusion + the enhancer),
+// exported once by converter/export_nsf_hifigan.py alongside its sidecar json + filterbank.
+const AUX_NSF_HIFIGAN: &str = "nsf_hifigan.onnx";
+const AUX_NSF_HIFIGAN_JSON: &str = "nsf_hifigan.json";
+const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
 
 /// models_dir/aux/<filename>, with a clear Chinese error naming the missing file + the
 /// exact directory it must be placed in.
@@ -70,20 +86,10 @@ fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
     }
 }
 
-/// Effective feature dim: speech_encoder wins when present (SoVITS sidecars), else
-/// features_dim (RVC sidecars carry it directly).
+/// Effective feature dim — delegates to the single source on ModelConfig (shared with the
+/// import-time diffusion-attachment cross-check).
 fn features_dim(config: &ModelConfig) -> Result<usize, String> {
-    if let Some(enc) = config.speech_encoder.as_deref() {
-        return match enc {
-            "vec768l12" => Ok(768),
-            "vec256l9" => Ok(256),
-            other => Err(format!(
-                "不支持的 speech_encoder：{}（仅支持 vec768l12 / vec256l9）",
-                other
-            )),
-        };
-    }
-    Ok(config.features_dim as usize)
+    config.resolved_features_dim()
 }
 
 /// inter_channels of the model's noise input, from the sidecar "noise" block when present
@@ -148,6 +154,363 @@ fn get_entry(state: &AppState, voice_name: &str) -> Result<ModelEntry, String> {
     })
 }
 
+// ─── cancel_voice ────────────────────────────────────────────────────────────
+
+/// Abort the in-flight voice run(s). Global like cancel_separation — the pipelines poll the
+/// flag per piece / per diffusion step; each run_rvc/run_sovits re-arms it at start.
+#[tauri::command]
+pub async fn cancel_voice(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.inference.cancel_voice();
+    Ok(())
+}
+
+// ─── S36 quality-path sidecars ───────────────────────────────────────────────
+
+/// `<stem>.diffusion/diffusion.json` — written by converter/export_diffusion.py. Strict on
+/// the fields the runtime cannot guess (schedule facts); everything is validated against the
+/// MAIN model in resolve_sovits_quality.
+#[derive(serde::Deserialize)]
+struct DiffusionSidecar {
+    #[serde(default)]
+    encoder_out_channels: u32,
+    #[serde(default)]
+    sample_rate: u32,
+    #[serde(default)]
+    block_size: u32,
+    // Schedule/net facts have NO silent fallbacks: the converter always writes them, so a
+    // missing one means a corrupt/foreign diffusion.json — hard-error (re-attach) instead
+    // of quietly running with guessed constants that produce garbage audio.
+    n_hidden: Option<u32>,
+    #[serde(default)]
+    timesteps: u32,
+    #[serde(default)]
+    k_step_max: u32,
+    #[serde(default)]
+    schedule: String,
+    max_beta: Option<f64>,
+    spec_min: Option<Vec<f32>>,
+    spec_max: Option<Vec<f32>>,
+    #[serde(default = "one")]
+    n_spk: u32,
+    #[serde(default)]
+    unit_interpolate_mode: Option<String>,
+    #[serde(default)]
+    files: DiffusionFiles,
+}
+fn one() -> u32 {
+    1
+}
+
+#[derive(serde::Deserialize, Default)]
+struct DiffusionFiles {
+    #[serde(default)]
+    encoder: String,
+    #[serde(default)]
+    denoiser: String,
+}
+
+/// models/aux/nsf_hifigan.json — export_nsf_hifigan.py sidecar.
+#[derive(serde::Deserialize)]
+struct VocoderSidecar {
+    #[serde(default)]
+    sample_rate: u32,
+    #[serde(default)]
+    hop_size: u32,
+    #[serde(default)]
+    num_mels: u32,
+    #[serde(default)]
+    mel_filters: Option<String>,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Result<T, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("无法读取{}（{}）：{}", what, path.display(), e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("{}解析失败（{}）：{}", what, path.display(), e))
+}
+
+/// Everything the SoVITS quality path needs beyond the plain S35 pipeline: the vocoder
+/// runtime (diffusion OR enhancer), the diffusion runtime (validated against the main
+/// model + the run options), and the auto-f0 predictor session. Also enforces the original
+/// mutual exclusions by MUTATING options (enhancer forced off under diffusion — original
+/// infer_tool.py:183-184 behavior, surfaced as a warn instead of silence).
+fn resolve_sovits_quality(
+    app: &Arc<AppState>,
+    entry: &ModelEntry,
+    dim: usize,
+    hop_size: usize,
+    options: &mut SovitsOptions,
+) -> Result<
+    (
+        Option<sovits::DiffusionRuntime>,
+        Option<sovits::VocoderRuntime>,
+        Option<String>,
+    ),
+    String,
+> {
+    let diffusion_on = options.shallow_diffusion || options.only_diffusion;
+
+    // Original mutual exclusion: any diffusion mode disables the enhancer.
+    if diffusion_on && options.nsf_enhance {
+        tracing::warn!("浅扩散/仅扩散开启——按原版行为禁用 NSF 增强器");
+        options.nsf_enhance = false;
+    }
+
+    // ── vocoder (needed by diffusion AND the enhancer) ──
+    let vocoder = if diffusion_on || options.nsf_enhance {
+        let voc_path = aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN声码器")?;
+        let voc_json = aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN声码器配置")?;
+        let sidecar: VocoderSidecar = read_json(&voc_json, "声码器配置")?;
+        let mel_name = sidecar
+            .mel_filters
+            .clone()
+            .unwrap_or_else(|| AUX_NSF_HIFIGAN_MEL.to_string());
+        let voc_mel_path = aux_path(app, &mel_name, "NSF-HiFiGAN滤波器")?;
+        if sidecar.sample_rate != entry.sample_rate || sidecar.hop_size as usize != hop_size {
+            return Err(format!(
+                "NSF-HiFiGAN 声码器（{}Hz/hop {}）与模型（{}Hz/hop {}）几何不一致——浅扩散/增强器仅支持 44.1kHz/512 的 SoVITS 模型",
+                sidecar.sample_rate, sidecar.hop_size, entry.sample_rate, hop_size
+            ));
+        }
+        let filters = app
+            .inference
+            .load_npy(&voc_mel_path)
+            .map_err(|e| e.to_string())?;
+        if filters.nrows() != sidecar.num_mels as usize {
+            return Err(format!(
+                "声码器滤波器形状（{}×{}）与配置 num_mels={} 不一致",
+                filters.nrows(),
+                filters.ncols(),
+                sidecar.num_mels
+            ));
+        }
+        // The vocoder is a per-piece hot loop → global device (GPU when available),
+        // mem_pattern off (dynamic T).
+        let sid = app
+            .inference
+            .engine
+            .load_model_with(&voc_path, false)
+            .map_err(|e| e.to_string())?;
+        Some(sovits::VocoderRuntime {
+            session: sid,
+            mel_filters: filters,
+            cfg: crate::inference::nsf_hifigan::VocoderConfig {
+                sample_rate: sidecar.sample_rate,
+                hop_size: sidecar.hop_size as usize,
+                num_mels: sidecar.num_mels as usize,
+            },
+        })
+    } else {
+        None
+    };
+
+    // ── diffusion runtime ──
+    let diffusion = if diffusion_on {
+        let diff_dir = entry.diffusion_path.clone().ok_or_else(|| {
+            format!(
+                "模型 '{}' 未附带扩散模型——导入时附加扩散 .pt+.yaml 可启用浅扩散",
+                entry.name
+            )
+        })?;
+        let sidecar: DiffusionSidecar =
+            read_json(&diff_dir.join("diffusion.json"), "扩散模型配置")?;
+
+        if sidecar.schedule != "linear" || sidecar.timesteps == 0 {
+            return Err(format!(
+                "扩散模型的 schedule（{}，timesteps={}）不受支持——请用当前版本的转换器重新导入",
+                sidecar.schedule, sidecar.timesteps
+            ));
+        }
+        if sidecar.encoder_out_channels as usize != dim {
+            return Err(format!(
+                "扩散模型的特征维度（{}）与主模型（{}）不一致，无法配合使用",
+                sidecar.encoder_out_channels, dim
+            ));
+        }
+        if sidecar.sample_rate != entry.sample_rate || sidecar.block_size as usize != hop_size {
+            return Err(format!(
+                "扩散模型（{}Hz/block {}）与主模型（{}Hz/hop {}）几何不一致",
+                sidecar.sample_rate, sidecar.block_size, entry.sample_rate, hop_size
+            ));
+        }
+        let method = crate::inference::diffusion::SamplerMethod::parse(&options.diffusion_method)
+            .ok_or_else(|| {
+                format!(
+                    "未知的扩散采样器：{}（支持 naive/ddim/pndm/dpm-solver/dpm-solver++/unipc）",
+                    options.diffusion_method
+                )
+            })?;
+        let timesteps = sidecar.timesteps as usize;
+        // Same resolution rule as unit2mel.py:87 / DiffusionSchedule::linear: 0 or
+        // ≥timesteps → timesteps (full-diffusion-capable) — NOT a floor of 1.
+        let k_step_max = {
+            let k = sidecar.k_step_max as usize;
+            if k > 0 && k < timesteps { k } else { timesteps }
+        };
+        if options.only_diffusion {
+            if k_step_max < timesteps {
+                return Err(
+                    "该扩散模型仅支持浅扩散，无法单独推理（k_step_max < timesteps）".to_string(),
+                );
+            }
+        } else {
+            if options.k_step == 0 {
+                return Err("扩散步数 k_step 不能为 0".to_string());
+            }
+            if options.k_step as usize > k_step_max {
+                return Err(format!(
+                    "浅扩散 k_step（{}）超过该扩散模型的上限 k_step_max={}",
+                    options.k_step, k_step_max
+                ));
+            }
+        }
+        // dpm/unipc need ≥2 solver steps (original asserts steps >= order); the ≤1-speedup
+        // case legitimately falls back to the plain DDPM loop (original semantics).
+        if options.diffusion_speedup > 1
+            && matches!(
+                method,
+                crate::inference::diffusion::SamplerMethod::DpmSolver
+                    | crate::inference::diffusion::SamplerMethod::DpmSolverPp
+                    | crate::inference::diffusion::SamplerMethod::UniPc
+            )
+        {
+            let t_total = if options.only_diffusion {
+                k_step_max
+            } else {
+                options.k_step as usize
+            };
+            let solver_steps = t_total / options.diffusion_speedup.max(1) as usize;
+            if solver_steps < 2 {
+                return Err(format!(
+                    "扩散步数 ÷ 加速倍数 = {} 步，dpm/unipc 采样器至少需要 2 步——请降低加速倍数",
+                    solver_steps
+                ));
+            }
+        }
+        if sidecar.n_spk > 1 {
+            let spk = options.speaker_id.unwrap_or(0);
+            if spk >= sidecar.n_spk {
+                return Err(format!(
+                    "说话人 id {} 超出扩散模型的 n_spk={}",
+                    spk, sidecar.n_spk
+                ));
+            }
+        }
+
+        let enc_name = if sidecar.files.encoder.is_empty() {
+            "encoder.onnx".to_string()
+        } else {
+            sidecar.files.encoder.clone()
+        };
+        let den_name = if sidecar.files.denoiser.is_empty() {
+            "denoiser.onnx".to_string()
+        } else {
+            sidecar.files.denoiser.clone()
+        };
+        let enc_path = diff_dir.join(&enc_name);
+        let den_path = diff_dir.join(&den_name);
+        for p in [&enc_path, &den_path] {
+            if !p.exists() {
+                return Err(format!("扩散模型文件缺失：{}——请重新附加扩散模型", p.display()));
+            }
+        }
+        let enc_sid = app
+            .inference
+            .engine
+            .load_model_with(&enc_path, false)
+            .map_err(|e| e.to_string())?;
+        let den_sid = app
+            .inference
+            .engine
+            .load_model_with(&den_path, false)
+            .map_err(|e| e.to_string())?;
+
+        // No silent fallbacks (converter always writes these — absent = corrupt sidecar).
+        let corrupt = |what: &str| {
+            format!(
+                "扩散附件配置缺少 {}（diffusion.json 损坏或版本过旧）——请重新附加扩散模型",
+                what
+            )
+        };
+        let max_beta = sidecar.max_beta.ok_or_else(|| corrupt("max_beta"))?;
+        let spec_min = sidecar.spec_min.clone().filter(|v| !v.is_empty()).ok_or_else(|| corrupt("spec_min"))?;
+        let spec_max = sidecar.spec_max.clone().filter(|v| !v.is_empty()).ok_or_else(|| corrupt("spec_max"))?;
+        let n_hidden = sidecar.n_hidden.filter(|&v| v > 0).ok_or_else(|| corrupt("n_hidden"))? as usize;
+
+        let schedule = crate::inference::diffusion::DiffusionSchedule::linear(
+            timesteps,
+            max_beta,
+            &spec_min,
+            &spec_max,
+            k_step_max,
+        );
+
+        Some(sovits::DiffusionRuntime {
+            encoder_session: enc_sid,
+            denoiser_session: den_sid,
+            schedule,
+            method,
+            n_hidden,
+            n_spk: sidecar.n_spk as usize,
+            // only_diffusion expands ContentVec with the DIFFUSION yaml's mode (original
+            // infer_tool.py:156); shallow keeps the main model's (line 142). Default 'left'
+            // mirrors the original's None-fallback.
+            unit_interpolate_mode: sidecar
+                .unit_interpolate_mode
+                .clone()
+                .unwrap_or_else(|| "left".to_string()),
+        })
+    } else {
+        None
+    };
+
+    // ── auto-f0 predictor ──
+    let f0_predictor = if options.auto_f0 {
+        let auto = entry.config.extra.get("auto_f0");
+        let available = auto
+            .and_then(|v| v.get("available"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !available {
+            return Err(format!(
+                "模型 '{}' 导出时未包含自动音高预测器（该模型可能没有 f0_decoder 权重，或导出于旧版转换器——重新导入 .pth 可生成）",
+                entry.name
+            ));
+        }
+        let file = auto
+            .and_then(|v| v.get("file"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}.f0.onnx",
+                    entry.path.file_stem().unwrap_or_default().to_string_lossy()
+                )
+            });
+        let f0_path = entry
+            .path
+            .parent()
+            .map(|p| p.join(&file))
+            .filter(|p| p.exists())
+            .ok_or_else(|| {
+                format!(
+                    "自动音高预测器文件缺失：{}——请重新导入模型",
+                    file
+                )
+            })?;
+        let sid = app
+            .inference
+            .engine
+            .load_model_with(&f0_path, false)
+            .map_err(|e| e.to_string())?;
+        Some(sid)
+    } else {
+        None
+    };
+
+    Ok((diffusion, vocoder, f0_predictor))
+}
+
 // ─── run_rvc ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -161,6 +524,9 @@ pub async fn run_rvc(
     options: RvcOptions,
 ) -> Result<SynthesisResult, String> {
     let app = state.inner().clone();
+    // Arm the cancel epoch BEFORE the multi-second load phase (a cancel during loading
+    // must be honored at the first pipeline poll).
+    let run_epoch = app.inference.begin_voice_run();
     let entry = get_entry(&app, &voice_name)?;
     require_input(&entry, "rnd")?;
 
@@ -172,6 +538,13 @@ pub async fn run_rvc(
     let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
 
     let path = PathBuf::from(&model_path);
+    // Evict every GPU session this run doesn't own (leftover MSST arena / the SoVITS
+    // fleet / GPU aux extractors with their previous-run arena high-water) BEFORE
+    // loading. Keep = the model itself only; a re-run reloads aux in a couple seconds
+    // and the run's VRAM equals its own footprint (see release_gpu_sessions_except).
+    app.inference
+        .engine
+        .release_gpu_sessions_except(&[path.clone()]);
     app.inference
         .load_voice(
             &voice_name,
@@ -182,8 +555,16 @@ pub async fn run_rvc(
         )
         .map_err(|e| e.to_string())?;
 
-    let cv_sid = app.inference.ensure_aux_loaded(&cv_path).map_err(|e| e.to_string())?;
-    let rmvpe_sid = app.inference.ensure_aux_loaded(&rmvpe_path).map_err(|e| e.to_string())?;
+    // gpu_extract: the per-node aux-device toggle (ContentVec + RMVPE only; the voice
+    // synthesizer is on the global device regardless).
+    let cv_sid = app
+        .inference
+        .ensure_aux_loaded_on(&cv_path, options.gpu_extract)
+        .map_err(|e| e.to_string())?;
+    let rmvpe_sid = app
+        .inference
+        .ensure_aux_loaded_on(&rmvpe_path, options.gpu_extract)
+        .map_err(|e| e.to_string())?;
     let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
     let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
 
@@ -191,8 +572,9 @@ pub async fn run_rvc(
         crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
 
     // The pipeline is minutes of CPU+GPU work — keep it off the async runtime workers.
-    let progress = progress_emitter(app_handle, node_id);
+    let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
     tauri::async_runtime::spawn_blocking(move || {
+        let cancel = || app.inference.voice_cancelled(run_epoch);
         let model = rvc::RvcModel {
             engine: &app.inference.engine,
             voice_session: &handle.session_id,
@@ -205,7 +587,8 @@ pub async fn run_rvc(
             noise_channels: nch,
             min_frames: min_t,
         };
-        rvc::run_pipeline(&model, &audio_buf, &options, &progress).map_err(|e| e.to_string())
+        rvc::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("推理任务失败: {}", e))?
@@ -223,7 +606,10 @@ pub async fn run_sovits(
     node_id: String,
     options: SovitsOptions,
 ) -> Result<SynthesisResult, String> {
+    let mut options = options;
     let app = state.inner().clone();
+    // See run_rvc: arm the cancel epoch before the load phase.
+    let run_epoch = app.inference.begin_voice_run();
     let entry = get_entry(&app, &voice_name)?;
     require_input(&entry, "noise")?;
 
@@ -249,6 +635,22 @@ pub async fn run_sovits(
     let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
 
     let path = PathBuf::from(&model_path);
+    // Evict every GPU session this run doesn't own (leftover MSST arena / the RVC
+    // family / another voice / GPU aux extractors carrying the previous run's arena
+    // high-water — see release_gpu_sessions_except) BEFORE the quality-path fleet
+    // loads. Keep = this model's own family: consecutive re-renders of the same node
+    // skip the big reloads (main graph + 220 MB denoiser). Path::starts_with is
+    // COMPONENT-wise, so each companion is listed explicitly (the .diffusion dir
+    // covers its contents; a bare `<stem>` would NOT cover `<stem>.f0.onnx`).
+    {
+        let mut keep = vec![path.clone()];
+        if let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) {
+            let stem = stem.to_string_lossy();
+            keep.push(dir.join(format!("{}.f0.onnx", stem)));
+            keep.push(dir.join(format!("{}.diffusion", stem)));
+        }
+        app.inference.engine.release_gpu_sessions_except(&keep);
+    }
     app.inference
         .load_voice(
             &voice_name,
@@ -259,8 +661,24 @@ pub async fn run_sovits(
         )
         .map_err(|e| e.to_string())?;
 
-    let cv_sid = app.inference.ensure_aux_loaded(&cv_path).map_err(|e| e.to_string())?;
-    let rmvpe_sid = app.inference.ensure_aux_loaded(&rmvpe_path).map_err(|e| e.to_string())?;
+    // S36 quality path: vocoder / diffusion / auto-f0 resolution + validation (also
+    // enforces the original diffusion↔enhancer mutual exclusion by mutating options).
+    // MUST come AFTER load_voice: a cold-start (or idle-swept) voice triggers
+    // unload_voice inside load_voice, which evicts the model's companion sessions
+    // (`<stem>.f0.onnx` / `.diffusion/*`) INCLUDING their reload specs — resolving the
+    // companions first would hand the pipeline session ids that no longer exist
+    // ("Session ... not found" on the first piece).
+    let (diffusion, vocoder, f0_predictor) =
+        resolve_sovits_quality(&app, &entry, dim, hop_size, &mut options)?;
+
+    let cv_sid = app
+        .inference
+        .ensure_aux_loaded_on(&cv_path, options.gpu_extract)
+        .map_err(|e| e.to_string())?;
+    let rmvpe_sid = app
+        .inference
+        .ensure_aux_loaded_on(&rmvpe_path, options.gpu_extract)
+        .map_err(|e| e.to_string())?;
     let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
     let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
 
@@ -324,8 +742,9 @@ pub async fn run_sovits(
     let audio_buf =
         crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
 
-    let progress = progress_emitter(app_handle, node_id);
+    let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
     tauri::async_runtime::spawn_blocking(move || {
+        let cancel = || app.inference.voice_cancelled(run_epoch);
         let model = sovits::SovitsModel {
             engine: &app.inference.engine,
             voice_session: &handle.session_id,
@@ -333,6 +752,9 @@ pub async fn run_sovits(
             rmvpe_session: &rmvpe_sid,
             mel_filters: mel.as_ref(),
             cluster: cluster.as_ref(),
+            diffusion,
+            vocoder,
+            f0_predictor_session: f0_predictor,
             sample_rate: handle.sample_rate,
             hop_size,
             features_dim: dim,
@@ -341,7 +763,8 @@ pub async fn run_sovits(
             noise_channels: nch,
             min_frames: min_t,
         };
-        sovits::run_pipeline(&model, &audio_buf, &options, &progress).map_err(|e| e.to_string())
+        sovits::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("推理任务失败: {}", e))?
