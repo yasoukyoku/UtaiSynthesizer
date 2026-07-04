@@ -123,7 +123,7 @@ export function SeparationNode(props: NodeProps) {
               ))}
             </select>
 
-            <SepParams arch={arch} params={params} onChange={updateParams} lang={lang} showPrecision={hasBothPrecisions} />
+            <SepParams arch={arch} params={params} onChange={updateParams} lang={lang} showPrecision={hasBothPrecisions} installedNumOverlap={installedModel?.num_overlap ?? undefined} />
           </>
         )}
       </div>
@@ -131,14 +131,18 @@ export function SeparationNode(props: NodeProps) {
   );
 }
 
-function SepParams({ arch, params, onChange, lang, showPrecision }: {
+function SepParams({ arch, params, onChange, lang, showPrecision, installedNumOverlap }: {
   arch: MsstArchitecture;
   params: Record<string, unknown>;
   onChange: (u: Record<string, unknown>) => void;
   lang: string;
   showPrecision: boolean;
+  /** The installed model json's real num_overlap — what Rust actually runs when the user
+   *  never touches the slider. Display truth beats the per-arch catalog constant. */
+  installedNumOverlap?: number;
 }) {
-  const numOverlap = (params.numOverlap as number) ?? MSST_DEFAULT_NUM_OVERLAP[arch] ?? 2;
+  const numOverlap = (params.numOverlap as number) ?? installedNumOverlap
+    ?? MSST_DEFAULT_NUM_OVERLAP[arch] ?? 2;
   const normalize = (params.normalize as boolean) ?? false;
   const useTta = (params.useTta as boolean) ?? false;
   const shifts = (params.shifts as number) ?? 0;

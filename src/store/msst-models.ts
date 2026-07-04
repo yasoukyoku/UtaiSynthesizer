@@ -16,6 +16,10 @@ export interface InstalledModel {
   stem_names?: string[] | null;
   /** Residual (mix-minus-stem) label for single-stem models — the LAST output port. */
   residual_name?: string | null;
+  /** The model json's ACTUAL num_overlap (from its training yaml). The overlap slider's
+   *  display default must use this; MSST_DEFAULT_NUM_OVERLAP is only the pre-install fallback
+   *  (it lies for models whose yaml differs, e.g. Kim family yaml=2 vs arch default 4). */
+  num_overlap?: number | null;
 }
 
 interface DownloadState {

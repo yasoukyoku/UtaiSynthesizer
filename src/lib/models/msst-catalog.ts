@@ -57,10 +57,10 @@ export const ARCHITECTURE_LABELS: Record<MsstArchitecture, string> = {
 };
 
 /** Per-architecture default `num_overlap` — MUST mirror the converter/convert.py FALLBACK it
- *  writes into each model's JSON when the yaml has no explicit inference.num_overlap. Used ONLY
- *  to DISPLAY the model's default in the node when the user hasn't overridden it; the actual
- *  value still comes from the model JSON on the Rust side (a yaml-explicit value wins there, so
- *  this display can differ for yaml-carrying models — e.g. Kim-family melbands say 2).
+ *  writes into each model's JSON when the yaml has no explicit inference.num_overlap. Since S34
+ *  this is ONLY the pre-install display fallback: for INSTALLED models the node's slider shows
+ *  the json's real num_overlap (list_msst_models returns it), so yaml-carrying models (e.g.
+ *  Kim-family melbands, yaml=2) no longer display a value Rust doesn't actually run.
  *  htdemucs = 2: official demucs weights have signature-only yamls, and the authors' own
  *  apply_model runs overlap=0.25 (~1.33x coverage) — ov4 was 2.95x that compute for nothing. */
 export const MSST_DEFAULT_NUM_OVERLAP: Record<MsstArchitecture, number> = {

@@ -23,18 +23,25 @@ pub struct MsstModelFile {
     pub stem_names: Option<Vec<String>>,
     /// Residual (mix-minus-stem) label for single-stem models — the LAST output port.
     pub residual_name: Option<String>,
+    /// The model json's ACTUAL num_overlap (converter wrote it from the training yaml).
+    /// The node's overlap slider must display THIS as its default — the per-arch
+    /// MSST_DEFAULT_NUM_OVERLAP constant is only the pre-install fallback and lies for
+    /// models whose yaml carries a different value (e.g. Kim family yaml=2, arch default 4).
+    pub num_overlap: Option<usize>,
 }
 
-/// Read stem_names/residual_name from the model's json sibling (None when absent/unparseable).
-fn read_stem_fields(fp32_onnx: &Path) -> (Option<Vec<String>>, Option<String>) {
+/// Read stem_names/residual_name/num_overlap from the model's json sibling
+/// (None when absent/unparseable).
+fn read_json_fields(fp32_onnx: &Path) -> (Option<Vec<String>>, Option<String>, Option<usize>) {
     let json_path = fp32_onnx.with_extension("json");
-    let Ok(text) = std::fs::read_to_string(&json_path) else { return (None, None) };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return (None, None) };
+    let Ok(text) = std::fs::read_to_string(&json_path) else { return (None, None, None) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return (None, None, None) };
     let names = v.get("stem_names").and_then(|a| a.as_array()).map(|a| {
         a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect::<Vec<_>>()
     }).filter(|n| !n.is_empty());
     let residual = v.get("residual_name").and_then(|s| s.as_str()).map(str::to_string);
-    (names, residual)
+    let num_overlap = v.get("num_overlap").and_then(|n| n.as_u64()).map(|n| n as usize);
+    (names, residual, num_overlap)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,7 +87,7 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
         let fp32_onnx = path.with_extension("onnx");
         let has_onnx = if ext == "onnx" { true } else { fp32_onnx.exists() };
         let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
-        let (stem_names, residual_name) = read_stem_fields(&fp32_onnx);
+        let (stem_names, residual_name, num_overlap) = read_json_fields(&fp32_onnx);
 
         models.push(MsstModelFile {
             filename,
@@ -90,6 +97,7 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
             has_fp16,
             stem_names,
             residual_name,
+            num_overlap,
         });
     }
 
@@ -321,7 +329,7 @@ pub fn import_local_msst_model(
     let fp32_onnx = dest.with_extension("onnx");
     let has_onnx = fp32_onnx.exists();
     let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
-    let (stem_names, residual_name) = read_stem_fields(&fp32_onnx);
+    let (stem_names, residual_name, num_overlap) = read_json_fields(&fp32_onnx);
 
     tracing::info!("Imported MSST model: {}", filename);
     Ok(MsstModelFile {
@@ -332,6 +340,7 @@ pub fn import_local_msst_model(
         has_fp16,
         stem_names,
         residual_name,
+        num_overlap,
     })
 }
 
