@@ -407,7 +407,7 @@ fn parse_ffmpeg_duration(stderr: &str) -> Option<f64> {
     Some((h * 3600.0 + m * 60.0 + s) * 1000.0)
 }
 
-fn find_ffmpeg() -> Option<std::path::PathBuf> {
+pub(crate) fn find_ffmpeg() -> Option<std::path::PathBuf> {
     // Next to the running binary (bundled — release mode)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

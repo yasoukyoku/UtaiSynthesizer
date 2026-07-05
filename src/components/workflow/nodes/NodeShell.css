@@ -254,9 +254,9 @@
   flex: 1;
 }
 
-/* Stylized thin-bar slider — no default circle thumb (house style: no abstract solid dots). The
- * `.sep-overlap` prefix raises specificity ABOVE the global `input[type="range"]::-webkit-slider-thumb`
- * (which is a 14px circle), otherwise the global rule wins and the custom thumb never shows. */
+/* Stylized thin-bar slider — no default circle thumb (house style: no abstract solid dots).
+ * Fully self-contained (appearance/track/thumb): the old global input[type="range"] circle-thumb
+ * rule was removed in S37; the `.sep-overlap` prefix remains for scoping. */
 .sep-overlap .sep-overlap-range {
   -webkit-appearance: none;
   appearance: none;

@@ -12,9 +12,24 @@
   flex-direction: column;
 }
 
+/* Header base styles were silently inherited from the (deleted) TrainingPanel.css
+ * UNSCOPED .panel-header/.panel-title — restored here scoped, matching the
+ * LogViewer/MsstModelManager copies (values identical to the old global rule). */
 .settings-panel .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-lg);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
   cursor: move;
   user-select: none;
+}
+
+.settings-panel .panel-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--accent-secondary);
 }
 
 .settings-content {

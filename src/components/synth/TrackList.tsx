@@ -5,7 +5,7 @@ import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB } from "../../lib/constants";
+import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
 import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
@@ -161,7 +161,7 @@ export function TrackList({ width }: Props) {
     setAddMenuOpen(false);
     const path = await open({
       title: t("toolbar.importAudio"),
-      filters: [{ name: "Audio", extensions: ["wav", "mp3", "flac", "ogg", "aac", "m4a", "webm", "opus", "wma"] }],
+      filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
     });
     if (!path) return;
     // import.ts creates the track + loading segment immediately + owns decode/error handling.

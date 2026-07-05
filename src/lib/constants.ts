@@ -20,6 +20,13 @@ export const DEFAULT_OUTPUT_GROUP = "Main";
  *  drifted: palette green vs node amber). Amber = the established Output/deposit status color. */
 export const OUTPUT_NODE_COLOR = "#f59e0b";
 
+/** Audio file extensions the app accepts — ONE source of truth for every entry
+ *  point (timeline drop, training-page drop, file-picker dialog filters). The
+ *  dialog list and the drop regex MUST stay the same set: a format pickable in
+ *  the dialog but silently ignored on drop (or vice versa) is drift. */
+export const AUDIO_EXTENSIONS = ["wav", "mp3", "flac", "ogg", "aac", "m4a", "webm", "opus", "wma"];
+export const AUDIO_EXT_RE = new RegExp(`\\.(${AUDIO_EXTENSIONS.join("|")})$`, "i");
+
 /** Volume-fader floor (dB). The BOTTOM of a volume fader means −∞/MUTE (the universal DAW convention:
  *  bounded upward, unbounded downward) — dbToLinear maps any value at/below this to gain 0, and the
  *  fader tooltip shows "-∞ dB" there. The STORED volumeDb stays at this finite floor (−Infinity does

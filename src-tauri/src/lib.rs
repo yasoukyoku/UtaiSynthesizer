@@ -64,7 +64,7 @@ impl AppState {
         let msst_models_dir = models_dir.join("msst");
         Self {
             inference: inference::InferenceManager::new(),
-            training: training::TrainingManager::new(),
+            training: training::TrainingManager::new(app_dir.clone()),
             models: models::ModelRegistry::new(models_dir),
             separation: separation::SeparationManager::new(app_dir.clone()),
             log_buffer,
@@ -613,8 +613,10 @@ pub fn run() {
             commands::project::clear_autosave,
             commands::training::start_training,
             commands::training::stop_training,
+            commands::training::force_stop_training,
             commands::training::get_training_status,
-            commands::training::check_can_close,
+            commands::training::get_training_history,
+            commands::training::check_training_workspace,
             commands::models::list_models,
             commands::models::import_model,
             commands::models::delete_model,
@@ -625,6 +627,7 @@ pub fn run() {
             commands::audio::process_effects,
             commands::audio::save_temp_audio,
             commands::audio::ensure_cache_dir,
+            commands::audio::save_binary_file,
             commands::separation::run_msst_separation,
             commands::separation::get_separation_status,
             commands::separation::cancel_separation,

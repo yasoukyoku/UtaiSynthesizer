@@ -8,11 +8,11 @@ import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs, re
 import { installAutosave, clearAutosave, readAutosave, setRecoveryPending, hasUnsavedWork, rearmAutosave } from "./lib/project/autosave";
 import { Titlebar } from "./components/common/Titlebar";
 import { DawWorkflowSplit } from "./components/synth/DawWorkflowSplit";
-import { TrainingPanel } from "./components/training/TrainingPanel";
+import { TrainingPage } from "./components/training/TrainingPage";
 import { MsstModelManager } from "./components/models/MsstModelManager";
 import { LogViewer } from "./components/common/LogViewer";
 import { Settings } from "./components/common/Settings";
-import { useTrainingStore } from "./store/training";
+import { setupTrainingListeners, useTrainingStore } from "./store/training";
 import { ToastContainer } from "./components/common/Toast";
 import { HistoryBanner } from "./components/common/HistoryBanner";
 import { ConfirmDialog } from "./components/common/ConfirmDialog";
@@ -89,13 +89,14 @@ async function runExitFlow(): Promise<void> {
 }
 
 export function App() {
-  const { trainingPanelOpen, modelManagerOpen, toggleModelManager, logViewerOpen, toggleLogViewer, settingsOpen, toggleSettings } = useAppStore();
-  const { fetchStatus } = useTrainingStore();
+  const { trainingPageOpen, modelManagerOpen, toggleModelManager, logViewerOpen, toggleLogViewer, settingsOpen, toggleSettings } = useAppStore();
 
+  // Training is event-driven (no polling): install the global listeners once and
+  // resync — an app reload during a run reattaches to the still-running Rust side.
   useEffect(() => {
-    const interval = setInterval(fetchStatus, 2000);
-    return () => clearInterval(interval);
-  }, [fetchStatus]);
+    void setupTrainingListeners();
+    void useTrainingStore.getState().refresh();
+  }, []);
 
   // Install the undo/redo auto-capture subscription (cleanup unsubscribes — HMR-safe).
   useEffect(() => installHistory(), []);
@@ -207,10 +208,14 @@ export function App() {
         const k = e.key.toLowerCase();
         if (k === "z" && !e.shiftKey) {
           if (editable) return; // let the focused input do its own text-undo
+          // the full-screen training page covers the DAW — undo would silently
+          // mutate the invisible timeline (Ctrl+S/O/N stay: explicit app actions)
+          if (useAppStore.getState().trainingPageOpen) return;
           e.preventDefault();
           routeUndo();
         } else if (k === "y" || (k === "z" && e.shiftKey)) {
           if (editable) return;
+          if (useAppStore.getState().trainingPageOpen) return;
           e.preventDefault();
           routeRedo();
         } else if (k === "s") {
@@ -238,7 +243,7 @@ export function App() {
       <Titlebar />
       <div className="app-content">
         <DawWorkflowSplit />
-        {trainingPanelOpen && <TrainingPanel />}
+        {trainingPageOpen && <TrainingPage />}
         {logViewerOpen && <LogViewer onClose={toggleLogViewer} />}
         {settingsOpen && <Settings onClose={toggleSettings} />}
         {modelManagerOpen && <MsstModelManager onClose={toggleModelManager} />}

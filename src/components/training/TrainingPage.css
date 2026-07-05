@@ -1,0 +1,732 @@
+/* Full-screen training page — angular house style, theme tokens only. */
+
+.training-page {
+  position: absolute;
+  inset: 0;
+  z-index: var(--z-panel);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+  border-left: 1px solid var(--border-default);
+}
+
+.training-page-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  padding: var(--space-md) var(--space-xl);
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.training-header-spacer {
+  flex: 1;
+}
+
+.training-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+  border: 2px dashed var(--accent-primary);
+  color: var(--accent-primary);
+  font-size: var(--font-size-lg);
+  pointer-events: none;
+}
+
+/* Every panel owns its scoped header styles (the old unscoped .panel-header rules
+ * died with TrainingPanel.css — Settings got its own scoped copy then too). */
+.training-page-header .panel-title {
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+}
+
+.training-page-header .panel-close {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+  padding: var(--space-xs) var(--space-md);
+  border-radius: var(--radius-sm);
+}
+
+.training-page-header .panel-close:hover {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.training-live {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--accent-primary);
+  font-size: var(--font-size-xs);
+}
+
+.training-steps {
+  display: flex;
+  gap: var(--space-xs);
+  padding: var(--space-md) var(--space-xl) 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.training-step-tab {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-xl);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.training-step-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent-primary);
+}
+
+.training-step-tab:disabled {
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.5;
+}
+
+.training-step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 10px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.training-step-tab.active .training-step-num {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.training-step-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-2xl) var(--space-3xl);
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+.training-hint {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-lg);
+}
+
+/* buttons */
+.training-btn {
+  padding: var(--space-sm) var(--space-xl);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.training-btn:hover {
+  background: var(--bg-hover);
+}
+
+/* NB no .training-btn.primary override: the GLOBAL button.primary (teal bg +
+ * --text-inverse dark text, same as ConfirmDialog's primary) is the readable,
+ * app-consistent look — a local color override here produced teal-on-teal. */
+
+.training-btn.danger {
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.training-btn.small {
+  padding: 1px var(--space-md);
+  font-size: var(--font-size-xs);
+}
+
+.training-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.training-step-nav {
+  margin-top: var(--space-2xl);
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* -------- data step -------- */
+.training-data-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xl);
+  margin-bottom: var(--space-lg);
+}
+
+.training-data-total {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.training-empty {
+  padding: var(--space-3xl);
+  text-align: center;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-default);
+}
+
+.training-file-list {
+  border: 1px solid var(--border-subtle);
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.training-file-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--font-size-sm);
+}
+
+.training-file-row:last-child {
+  border-bottom: none;
+}
+
+.training-file-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.training-file-play {
+  width: 22px;
+  height: 18px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  font-size: 9px;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.training-file-play.on {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.training-file-play.loading {
+  color: var(--accent-primary);
+  cursor: default;
+  animation: training-spin 0.9s linear infinite;
+}
+
+@keyframes training-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Preview scrubber — thin track + square head (house style: no solid dot). */
+.training-scrubber {
+  position: relative;
+  height: 12px;
+  margin: 0 2px 2px 30px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.training-scrubber::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--border-default);
+}
+
+.training-scrubber-fill {
+  position: absolute;
+  left: 0;
+  height: 2px;
+  background: var(--accent-primary-dim);
+  pointer-events: none;
+}
+
+.training-scrubber-head {
+  position: absolute;
+  width: 4px;
+  height: 12px;
+  background: var(--accent-primary);
+  transform: translateX(-2px);
+  pointer-events: none;
+}
+
+.training-scrubber:hover .training-scrubber-head {
+  box-shadow: 0 0 5px var(--accent-primary);
+}
+
+.training-file-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.training-file-dur {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.training-file-remove {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+}
+
+.training-file-remove:hover {
+  color: var(--color-error);
+}
+
+/* -------- target step -------- */
+.training-backend-cards {
+  display: flex;
+  gap: var(--space-lg);
+  margin-bottom: var(--space-lg);
+}
+
+.training-backend-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  align-items: flex-start;
+  padding: var(--space-xl);
+  min-width: 220px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  cursor: pointer;
+  text-align: left;
+}
+
+.training-backend-card.active {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 1px var(--accent-primary-glow);
+}
+
+.training-backend-name {
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+}
+
+.training-backend-desc {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.training-name-exists {
+  color: var(--color-warning);
+  font-size: var(--font-size-xs);
+  margin-top: var(--space-sm);
+}
+
+/* -------- params step -------- */
+.training-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(240px, 1fr));
+  gap: var(--space-md) var(--space-2xl);
+  margin-bottom: var(--space-lg);
+}
+
+.training-form-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.training-form-row label {
+  min-width: 120px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.training-form-row input,
+.training-form-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Number stepper — native spinner hidden, our own angular ▲/▼ buttons (NumberField). */
+.training-number {
+  flex: 1;
+  display: flex;
+  min-width: 0;
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+}
+.training-number input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+}
+.training-number input::-webkit-inner-spin-button,
+.training-number input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.training-number-steps {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  border-left: 1px solid var(--border-default);
+}
+.training-number-steps button {
+  width: 18px;
+  height: 50%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 7px;
+  line-height: 1;
+  cursor: pointer;
+}
+.training-number-steps button:first-child {
+  border-bottom: 1px solid var(--border-default);
+}
+.training-number-steps button:hover {
+  background: var(--bg-hover);
+  color: var(--accent-primary);
+}
+
+.training-check-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+/* Angular checkbox — square, themed, custom check mark (no default OS control). */
+.training-check-row input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 0;
+  cursor: pointer;
+}
+.training-check-row input[type="checkbox"]:hover {
+  border-color: var(--accent-primary-dim);
+}
+.training-check-row input[type="checkbox"]:checked {
+  background: var(--accent-primary-dim);
+  border-color: var(--accent-primary);
+}
+.training-check-row input[type="checkbox"]:checked::after {
+  content: "";
+  /* flex-centered in the box; translateY nudges for the tick's downward visual
+   * weight (both strokes sit on the lower-right). No hard-coded left/top. */
+  width: 3px;
+  height: 7px;
+  border: solid var(--text-inverse);
+  border-width: 0 2px 2px 0;
+  transform: translateY(-1px) rotate(45deg);
+}
+.training-check-row input[type="checkbox"]:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.training-fixed-note {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  padding: var(--space-md);
+  background: var(--bg-surface);
+  border-left: 2px solid var(--accent-primary-dim);
+  margin-bottom: var(--space-lg);
+}
+
+.training-advanced-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  padding: var(--space-sm) 0;
+  margin-bottom: var(--space-md);
+}
+
+/* -------- run step -------- */
+.training-run-summary-line {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--space-2xl);
+}
+
+.training-start-btn {
+  font-size: var(--font-size-md);
+  padding: var(--space-md) var(--space-3xl);
+}
+
+.training-stages {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-2xl);
+}
+
+.training-stage-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.training-stage-row.done {
+  color: var(--color-success);
+}
+
+.training-stage-row.active {
+  color: var(--text-primary);
+}
+
+.training-stage-mark {
+  width: 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+
+.training-stage-label {
+  min-width: 110px;
+}
+
+.training-stage-bar {
+  flex: 0 0 220px;
+  height: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+}
+
+.training-stage-bar-fill {
+  height: 100%;
+  background: var(--accent-primary);
+  transition: width var(--transition-fast);
+}
+
+.training-stage-msg {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.training-monitor-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xl);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  margin-bottom: var(--space-md);
+}
+
+.loss-chart {
+  position: relative;
+  border: 1px solid var(--border-subtle);
+}
+
+.loss-chart canvas {
+  display: block;
+  width: 100%;
+}
+
+.loss-chart-legend {
+  position: absolute;
+  top: var(--space-sm);
+  right: var(--space-sm);
+  display: flex;
+  gap: var(--space-sm);
+}
+
+.loss-legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px var(--space-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+.loss-legend-chip.on {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+
+.loss-legend-swatch {
+  width: 4px;
+  height: 10px;
+  display: inline-block;
+}
+
+.training-chart-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--space-sm);
+}
+
+.training-run-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  margin-top: var(--space-2xl);
+}
+
+.training-stopping {
+  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+}
+
+.training-summary-card,
+.training-error-card {
+  margin-top: var(--space-2xl);
+  padding: var(--space-xl);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+}
+
+.training-error-card {
+  border-color: var(--color-error);
+}
+
+.training-summary-title {
+  color: var(--color-success);
+  margin-bottom: var(--space-md);
+}
+
+.training-error-title {
+  color: var(--color-error);
+  margin-bottom: var(--space-md);
+}
+
+.training-summary-facts {
+  display: flex;
+  gap: var(--space-2xl);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--space-lg);
+}
+
+.training-ckpt-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.training-ckpt-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  padding: var(--space-sm) 0;
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--font-size-sm);
+}
+
+.training-ckpt-kind {
+  min-width: 56px;
+  text-align: center;
+  font-size: var(--font-size-xs);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+  padding: 0 var(--space-sm);
+}
+
+.training-ckpt-kind.best {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.training-ckpt-kind.final {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.training-ckpt-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.training-ckpt-meta {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.training-error-msg {
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  white-space: pre-wrap;
+}
+
+.training-error-tail {
+  margin-top: var(--space-md);
+  max-height: 180px;
+  overflow: auto;
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  padding: var(--space-md);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+.training-error-hint {
+  margin-top: var(--space-md);
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}

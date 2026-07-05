@@ -5,7 +5,7 @@ import { useAudioStore } from "../../store/audio";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER } from "../../lib/constants";
+import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER, AUDIO_EXT_RE } from "../../lib/constants";
 import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
 import { importAudioToNewTrack, importAudioToExistingTrack, probeAudioDuration, DEFAULT_DURATION_MS } from "../../lib/audio/import";
 import { durationMsToTicks } from "../../lib/audio/playback";
@@ -31,7 +31,6 @@ const AUTOSCROLL_SPEED = 14; // px/frame at the edge; ramps up to 2× when the p
 // During drag-import, a cursor within this many px of a track boundary creates a NEW track there
 // (vs. inserting into the track body) — mirrors the track-header boundary "add track" affordance.
 const DROP_BOUNDARY_PX = 7;
-const AUDIO_EXT_RE = /\.(wav|mp3|flac|ogg|aac|m4a|webm|opus|wma)$/i;
 
 /** Where a drag/drop lands. "insert" = add a segment onto the existing audio track at `index`;
  *  "new" = create a new track at position `index` (the dragged spot); "none" = not a drop target. */
@@ -1124,6 +1123,14 @@ export function Arrangement() {
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const p = event.payload;
+        // The webview drag event is GLOBAL: while the full-screen training page is
+        // open (covering the timeline), it owns the drop as dataset import. Ignore
+        // it here, but first tear down any affordance a drag started before the
+        // page opened would have left behind (ghost gap / highlight).
+        if (useAppStore.getState().trainingPageOpen) {
+          if (dragPathsRef.current.length > 0) clearDragState();
+          return;
+        }
         if (p.type === "enter") {
           const audioPaths = p.paths.filter((pp) => AUDIO_EXT_RE.test(pp));
           dragPathsRef.current = audioPaths;

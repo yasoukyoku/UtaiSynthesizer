@@ -232,6 +232,12 @@ export function Toolbar() {
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) {
         return;
       }
+      // The full-screen training page covers the DAW: space/Delete/Ctrl+K must not
+      // start playback of, or edit, the invisible timeline underneath (live-test hit:
+      // space during dataset preview started hidden-DAW playback on top of it).
+      if (useAppStore.getState().trainingPageOpen) {
+        return;
+      }
       // Delete is pane-scoped: when the workflow editor pane is FOCUSED, Delete removes a NODE there
       // (ReactFlow, gated on the same activePane), so don't ALSO delete a timeline segment. Ctrl+K, by
       // contrast, has NO meaning in the node editor, so it is NEVER gated — it always slices the selected

@@ -164,25 +164,6 @@ input:focus, select:focus {
   box-shadow: 0 0 0 1px var(--accent-primary-glow);
 }
 
-input[type="range"] {
-  -webkit-appearance: none;
-  background: transparent;
-  border: none;
-  padding: 0;
-}
-
-input[type="range"]::-webkit-slider-track {
-  height: 4px;
-  background: var(--border-default);
-  border-radius: 2px;
-}
-
-input[type="range"]::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--accent-primary);
-  margin-top: -5px;
-  cursor: pointer;
-}
+/* No global range styling: the old 14px solid-circle thumb here was the banned
+ * "abstract dot" look. Every slider goes through ParamSlider (.sep-overlap in
+ * NodeShell.css — self-contained appearance/track/thumb) or a custom component. */

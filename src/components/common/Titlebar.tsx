@@ -12,18 +12,15 @@ export function Titlebar() {
   const { t } = useTranslation();
   const { name, dirty } = useProjectStore();
   const trackCount = useProjectStore((s) => s.tracks.length);
-  const { toggleTrainingPanel, trainingPanelOpen, toggleModelManager, modelManagerOpen, toggleLogViewer, logViewerOpen, toggleSettings, settingsOpen } = useAppStore();
-  const { status } = useTrainingStore();
+  const { toggleTrainingPage, trainingPageOpen, toggleModelManager, modelManagerOpen, toggleLogViewer, logViewerOpen, toggleSettings, settingsOpen } = useAppStore();
+  const trainingState = useTrainingStore((s) => s.snapshot.state);
   // The Edit menu's enablement is read via routeCanUndo/routeCanRedo when the menu opens (opening it
   // sets editMenu → re-render), so it reflects whichever stack is active (the workflow editor's
   // modal-local stack while open, else the timeline) without a live subscription.
   const [editMenu, setEditMenu] = useState<{ x: number; y: number } | null>(null);
   const [fileMenu, setFileMenu] = useState<{ x: number; y: number } | null>(null);
 
-  const isTraining =
-    status.state === "Training" ||
-    status.state === "Preprocessing" ||
-    status.state === "Preparing";
+  const isTraining = trainingState === "running" || trainingState === "starting";
 
   const fileItems: MenuItem[] = [
     { label: t("menu.new"), shortcut: "Ctrl+N", onClick: () => void newProjectFile() },
@@ -92,8 +89,8 @@ export function Titlebar() {
           </span>
         )}
         <button
-          className={`titlebar-btn ${trainingPanelOpen ? "active" : ""}`}
-          onClick={toggleTrainingPanel}
+          className={`titlebar-btn ${trainingPageOpen ? "active" : ""}`}
+          onClick={toggleTrainingPage}
         >
           {t("titlebar.training")}
         </button>

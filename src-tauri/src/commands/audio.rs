@@ -262,3 +262,10 @@ pub async fn ensure_cache_dir(
     Ok(cache_dir.to_string_lossy().to_string())
 }
 
+
+/// Write user-chosen export bytes (e.g. the training loss-curve PNG) to a path picked
+/// via the save dialog — the fs plugin scope doesn't cover arbitrary user paths.
+#[tauri::command]
+pub async fn save_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, data).map_err(|e| format!("write {}: {}", path, e))
+}

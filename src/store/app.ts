@@ -49,7 +49,7 @@ interface ConfirmRequest {
 }
 
 interface AppState {
-  trainingPanelOpen: boolean;
+  trainingPageOpen: boolean;
   modelManagerOpen: boolean;
   logViewerOpen: boolean;
   settingsOpen: boolean;
@@ -92,7 +92,7 @@ interface AppState {
   /** A pending styled confirm dialog (replaces the native `ask` popup). null = nothing shown. */
   confirm: ConfirmRequest | null;
 
-  toggleTrainingPanel: () => void;
+  toggleTrainingPage: () => void;
   toggleModelManager: () => void;
   toggleLogViewer: () => void;
   setActiveTrack: (id: string | null) => void;
@@ -126,7 +126,7 @@ interface AppState {
 export type BannerKind = "undo" | "redo" | "save" | "load" | "info";
 
 export const useAppStore = create<AppState>((set, get) => ({
-  trainingPanelOpen: false,
+  trainingPageOpen: false,
   modelManagerOpen: false,
   logViewerOpen: false,
   settingsOpen: false,
@@ -151,8 +151,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   banner: null,
   confirm: null,
 
-  toggleTrainingPanel: () =>
-    set((s) => ({ trainingPanelOpen: !s.trainingPanelOpen })),
+  toggleTrainingPage: () =>
+    set((s) => ({ trainingPageOpen: !s.trainingPageOpen })),
   toggleModelManager: () =>
     set((s) => ({ modelManagerOpen: !s.modelManagerOpen })),
   toggleLogViewer: () =>
