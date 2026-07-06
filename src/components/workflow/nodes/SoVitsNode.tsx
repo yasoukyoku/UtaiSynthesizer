@@ -6,7 +6,7 @@ import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
 import { VoiceModelPicker, SpeakerSelect, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
 import { SOVITS_DEFAULTS, DIFFUSION_METHODS } from "../../../lib/workflow/voiceDefaults";
-import { voiceHasDiffusion, voiceHasAutoF0 } from "../../../store/voice-models";
+import { voiceHasDiffusion, voiceHasAutoF0, vocoderFormatMatches, useVoiceModelStore } from "../../../store/voice-models";
 import type { VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
@@ -41,6 +41,24 @@ export function SoVitsNode(props: NodeProps) {
   const enhancerAdaptiveKey = (params.enhancer_adaptive_key as number) ?? SOVITS_DEFAULTS.enhancer_adaptive_key;
   const autoF0 = (params.auto_f0 as boolean) ?? SOVITS_DEFAULTS.auto_f0;
   const gpuExtract = (params.gpu_extract as boolean) ?? SOVITS_DEFAULTS.gpu_extract;
+  const vocoderName = (params.vocoder_name as string | null) ?? SOVITS_DEFAULTS.vocoder_name;
+  // S40 vocoder resources — shared across every 44.1k SoVITS model of a singer;
+  // format-mismatched entries are hidden (不能选隐藏), the Rust side re-validates.
+  // Dangling pick sentinel (审查修复): the select's value must ALWAYS have an
+  // option or the control renders blank — deleted entry vs still-installed-but-
+  // format-mismatched (a same-name re-import can change the recipe) get
+  // distinct labels; NOT auto-cleared (the list loads async — clearing on a
+  // transient empty list would silently flip the run to the default vocoder;
+  // Rust errors loudly on a dangling name as the backstop).
+  const vocoders = useVoiceModelStore((s) => s.models.vocoder);
+  const vocoderMatched = vocoders.filter(vocoderFormatMatches);
+  const vocoderDangling =
+    vocoderName && !vocoderMatched.some((v) => v.name === vocoderName)
+      ? vocoderName +
+        (vocoders.some((v) => v.name === vocoderName)
+          ? t18({ zh: "（格式不匹配）", en: " (format mismatch)", ja: "（フォーマット不一致）" }, lang)
+          : t18({ zh: "（已缺失）", en: " (missing)", ja: "（欠落）" }, lang))
+      : null;
   // Cluster/index asset presence comes from the SAME ModelEntry field RVC's index uses (Rust
   // scan() picks up any sibling .npy regardless of model type).
   const hasCluster = !!selected?.index_path;
@@ -191,6 +209,43 @@ export function SoVitsNode(props: NodeProps) {
                   />
                 )}
               </>
+            )}
+
+            {/* ---- S40 vocoder pick — only meaningful on the two mel→audio paths
+                 (shallow diffusion / enhancer), hidden otherwise. A deleted pick
+                 stays visible as「已缺失」instead of being auto-cleared: the
+                 vocoder list loads async, and clearing on a transient empty list
+                 would silently flip the run to the default vocoder — the Rust
+                 side errors loudly on a dangling name as the backstop. ---- */}
+            {(diffusionOn || nsfEnhance) && (
+              <div className="sep-param-row">
+                <label title={t18({
+                  zh: "浅扩散/增强器使用的 NSF-HiFiGAN 声码器。可选资源管理中已微调/导入的声码器（同一歌手的声码器可被其所有 SoVITS 模型共享；仅列出频谱格式一致的）；默认 = 内置通用声码器",
+                  en: "NSF-HiFiGAN vocoder used by shallow diffusion / the enhancer. Pick a fine-tuned/imported vocoder from the Resource Manager (one singer's vocoder is shared by all their SoVITS models; only format-matching ones are listed); default = the built-in general vocoder",
+                  ja: "浅い拡散/エンハンサーが使う NSF-HiFiGAN ボコーダー。リソース管理で微調整/取り込んだボコーダーを選択可能（同じ歌手のボコーダーは全 SoVITS モデルで共有可。フォーマット一致のもののみ表示）。既定 = 内蔵汎用ボコーダー",
+                }, lang)}>
+                  {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
+                </label>
+                {/* native select — the node's own control style (sampler/
+                    speaker are native too); the training-page Dropdown reads
+                    oversized inside a node (user call) */}
+                <select
+                  value={vocoderName ?? ""}
+                  onChange={(e) =>
+                    updateParams({ vocoder_name: e.target.value === "" ? null : e.target.value })
+                  }
+                >
+                  <option value="">
+                    {t18({ zh: "默认声码器", en: "Default vocoder", ja: "既定ボコーダー" }, lang)}
+                  </option>
+                  {vocoderMatched.map((v) => (
+                    <option key={v.name} value={v.name}>{v.name}</option>
+                  ))}
+                  {vocoderDangling && (
+                    <option value={vocoderName ?? ""}>{vocoderDangling}</option>
+                  )}
+                </select>
+              </div>
             )}
 
             {/* ---- auto-f0 — HIDDEN unless the export carries the f0 predictor ---- */}

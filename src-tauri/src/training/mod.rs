@@ -44,6 +44,9 @@ fn d_total_steps() -> u32 {
 fn d_force_save() -> u32 {
     10_000
 }
+fn d_crop_mel() -> u32 {
+    32
+}
 
 /// Workspace lineage for the cross-backend collision guard: sovits_diff shares
 /// the sovits workspace (that is the whole point — the diffusion companion
@@ -60,10 +63,11 @@ pub(crate) fn backend_family(backend: &str) -> &str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
-    pub backend: String, // "rvc" | "sovits" | "sovits_diff" (vocoder lands later)
-    /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0"
+    pub backend: String, // "rvc" | "sovits" | "sovits_diff" | "vocoder"
+    /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0" — vocoder: fixed
+    /// "nsf_hifigan" (a manifest marker, not a user choice — 一期单格式类)
     pub version: String,
-    /// rvc: "32k" | "40k" | "48k" — sovits: fixed "44k"
+    /// rvc: "32k" | "40k" | "48k" — sovits/vocoder: fixed "44k"
     pub sample_rate: String,
     pub dataset_files: Vec<String>,
     pub total_epoch: u32,
@@ -123,6 +127,15 @@ pub struct StartTrainingRequest {
     /// cache the whole dataset in RAM during diffusion training
     #[serde(default = "d_true")]
     pub cache_all_data: bool,
+    // ---- vocoder-only knobs (ignored by the other backends) ----
+    /// dataset crop window in mel frames (upstream crop_mel_frames; 32 = the
+    /// ft_hifigan 16G preset, 48 = 24G)
+    #[serde(default = "d_crop_mel")]
+    pub crop_mel_frames: u32,
+    /// freeze the MPD discriminator (upstream README: small-step finetunes
+    /// may benefit; couples freezing_enabled + frozen_params python-side)
+    #[serde(default)]
+    pub freeze_mpd: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -252,6 +265,28 @@ fn has_main_progress(workspace: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Max numbered model_ckpt_steps_<N>.ckpt at the workspace root — the vocoder
+/// backend's lightning checkpoints (mirrors get_latest_checkpoint_path in the
+/// sidecar). ⚠️ N is in lightning GLOBAL units: the manual-opt GAN counts the
+/// D and G optimizer steps separately, so N = 2 × 实际步 — every comparison
+/// against total_steps must divide by 2 first (设计红队 A8).
+fn max_vocoder_ckpt_step(workspace: &Path) -> Option<u64> {
+    let rd = std::fs::read_dir(workspace).ok()?;
+    let mut max: Option<u64> = None;
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if let Some(num) = n
+            .strip_prefix("model_ckpt_steps_")
+            .and_then(|s| s.strip_suffix(".ckpt"))
+        {
+            if let Ok(v) = num.parse::<u64>() {
+                max = Some(max.map_or(v, |m| m.max(v)));
+            }
+        }
+    }
+    max
 }
 
 /// Max numbered model_<n>.pt in workspace/diffusion — mirrors the sidecar's
@@ -439,9 +474,33 @@ impl TrainingManager {
                     return Err(UtaiError::Training("总步数必须大于 0".into()));
                 }
             }
+            "vocoder" => {
+                // version is a manifest marker (一期单格式类), not a user choice
+                if req.version != "nsf_hifigan" {
+                    return Err(UtaiError::Training(format!(
+                        "非法声码器格式 {}（一期仅支持经典 NSF-HiFiGAN）",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "声码器微调固定 44.1kHz（收到 {}）",
+                        req.sample_rate
+                    )));
+                }
+                if req.save_every_steps == 0 {
+                    return Err(UtaiError::Training("存档间隔必须大于 0".into()));
+                }
+                if req.total_steps == 0 {
+                    return Err(UtaiError::Training("总步数必须大于 0".into()));
+                }
+                if req.crop_mel_frames == 0 {
+                    return Err(UtaiError::Training("裁剪帧数必须大于 0".into()));
+                }
+            }
             other => {
                 return Err(UtaiError::Training(format!(
-                    "训练后端「{}」尚未实现（当前支持 RVC / SoVITS / 浅扩散）",
+                    "训练后端「{}」尚未实现（当前支持 RVC / SoVITS / 浅扩散 / 声码器微调）",
                     other
                 )));
             }
@@ -484,6 +543,7 @@ impl TrainingManager {
         let mut pretrain_d = PathBuf::new();
         let mut nsf_hifigan_model = PathBuf::new();
         let mut diffusion_pretrain = PathBuf::new();
+        let mut vocoder_pretrain = PathBuf::new();
         match req.backend.as_str() {
             "rvc" => {
                 let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
@@ -506,7 +566,26 @@ impl TrainingManager {
                 required.push(("预训练底模 G", pretrain_g.clone()));
                 required.push(("预训练底模 D", pretrain_d.clone()));
             }
-            _ => {
+            "vocoder" => {
+                // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
+                // 2024.02 community base checkpoint (lightning format, G+D).
+                // CC BY-NC-SA weights — never bundled, the user downloads it;
+                // the label doubles as the download guidance in the missing-
+                // file error. ContentVec/RMVPE/configs/mute are NOT used by
+                // this pipeline (设计红队 A17: required 收敛进各臂).
+                vocoder_pretrain = data_dir
+                    .join("models")
+                    .join("training")
+                    .join("vocoder")
+                    .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
+                required.push((
+                    "声码器微调底模（从 github.com/openvpi/SingingVocoders releases \
+                     v0.0.2 下载 nsf_hifigan_44.1k_hop512_128bin_2024.02.zip 并解压其中的 \
+                     .ckpt；权重许可 CC BY-NC-SA 4.0，微调产物同样继承该许可）",
+                    vocoder_pretrain.clone(),
+                ));
+            }
+            "sovits_diff" => {
                 // sovits_diff: the mel recipe IS the vocoder's (torch ckpt, not
                 // the aux onnx) + the diffusion base model. The vec256 ecosystem
                 // has NO public diffusion base (the one community HF repo went
@@ -536,11 +615,24 @@ impl TrainingManager {
                     required.push(("扩散底模 (model_0.pt)", base));
                 }
             }
+            // the whitelist match above already rejected unknown backends —
+            // this arm exists so a future backend CANNOT silently inherit
+            // another backend's asset resolution (设计红队 A17)
+            other => {
+                return Err(UtaiError::Training(format!(
+                    "训练后端「{}」缺少资产解析分支（内部错误）",
+                    other
+                )));
+            }
         }
         let ffmpeg = crate::audio::find_ffmpeg()
             .ok_or_else(|| UtaiError::Training("找不到 ffmpeg.exe（训练预处理需要）".into()))?;
-        required.push(("ContentVec 特征提取器", contentvec.clone()));
-        required.push(("RMVPE 音高模型 (rmvpe.pt)", rmvpe_pt.clone()));
+        if req.backend != "vocoder" {
+            // the vocoder pipeline extracts neither features nor f0-by-model
+            // (parselmouth is in-process) — requiring these would be a lie
+            required.push(("ContentVec 特征提取器", contentvec.clone()));
+            required.push(("RMVPE 音高模型 (rmvpe.pt)", rmvpe_pt.clone()));
+        }
         for (label, p) in &required {
             if !p.is_file() {
                 return Err(UtaiError::Training(format!(
@@ -610,6 +702,21 @@ impl TrainingManager {
         if !req.fresh && workspace.exists() && old_manifest.is_none() && has_main {
             return Err(UtaiError::Training(
                 "同名训练工作区缺少 run_manifest.json（状态异常，无法校验续训参数）：请选择重训（将清空该工作区）或换一个模型名"
+                    .into(),
+            ));
+        }
+        // vocoder twin: a manifest-less workspace holding lightning checkpoints
+        // would let get_latest_checkpoint_path resume into it AND silently skip
+        // the finetune base seeding (setup() only loads the base when no ckpt
+        // exists) — the S39 尾修 4 lineage of "quiet fake resume"
+        if req.backend == "vocoder"
+            && !req.fresh
+            && workspace.exists()
+            && old_manifest.is_none()
+            && max_vocoder_ckpt_step(&workspace).is_some()
+        {
+            return Err(UtaiError::Training(
+                "同名训练工作区缺少 run_manifest.json（状态异常，无法确认归属）：请选择重训（将清空该工作区）或换一个模型名"
                     .into(),
             ));
         }
@@ -717,6 +824,19 @@ impl TrainingManager {
                 }
             }
         }
+        // vocoder twin of the guard — ckpt numbers are GLOBAL (2× real), the
+        // //2 here is exactly the ×2-class bug the design flagged (红队 A8)
+        if req.backend == "vocoder" && !req.fresh {
+            if let Some(max_global) = max_vocoder_ckpt_step(&workspace) {
+                let real = max_global / 2;
+                if real > 0 && real >= req.total_steps as u64 {
+                    return Err(UtaiError::Training(format!(
+                        "声码器已训练至 {} 步，不小于目标总步数 {}：请增大总步数再续训，或选择重训",
+                        real, req.total_steps
+                    )));
+                }
+            }
+        }
 
         // merge-write: a diff run must not drop the main run's fields (the
         // vol_embedding guard above dies silently if its key vanishes) and
@@ -802,6 +922,7 @@ impl TrainingManager {
             pretrain_d,
             nsf_hifigan_model,
             diffusion_pretrain,
+            vocoder_pretrain,
             vol_embedding: eff_vol_embedding,
             loudnorm: eff_loudnorm,
             interval_force_save,
@@ -883,6 +1004,8 @@ struct RunCtx {
     nsf_hifigan_model: PathBuf,
     /// sovits_diff only; empty = train from scratch (no vec256 base exists)
     diffusion_pretrain: PathBuf,
+    /// vocoder only: the classic NSF-HiFiGAN finetune base (lightning ckpt, G+D)
+    vocoder_pretrain: PathBuf,
     /// effective values (manifest-inherited for sovits_diff)
     vol_embedding: bool,
     loudnorm: bool,
@@ -970,6 +1093,9 @@ fn run_worker(
         "k_step_max": req.k_step_max,
         "interval_force_save": ctx.interval_force_save,
         "cache_all_data": req.cache_all_data,
+        // vocoder-only knobs (ignored by the other pipelines)
+        "crop_mel_frames": req.crop_mel_frames,
+        "freeze_mpd": req.freeze_mpd,
         "seed": SEED,
         // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
         // visible) — CPU mode must be the explicit sentinel "-1"
@@ -986,6 +1112,7 @@ fn run_worker(
             "mute_dir": app_dir.join("training").join("assets").join("mute"),
             "nsf_hifigan_model": ctx.nsf_hifigan_model,
             "diffusion_pretrain": ctx.diffusion_pretrain,
+            "vocoder_pretrain": ctx.vocoder_pretrain,
         },
     });
     let run_json = workspace.join("run.json");

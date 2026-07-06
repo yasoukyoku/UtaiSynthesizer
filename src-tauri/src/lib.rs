@@ -609,6 +609,7 @@ pub fn run() {
             commands::inference::cancel_voice,
             commands::inference::detect_f0,
             commands::inference::run_s2h,
+            commands::inference::get_default_vocoder_info,
             commands::project::save_project_archive,
             commands::project::open_project_archive,
             commands::project::prune_usp_work,

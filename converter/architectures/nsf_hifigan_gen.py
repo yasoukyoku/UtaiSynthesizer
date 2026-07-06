@@ -185,10 +185,41 @@ REQUIRED_KEYS = (
 )
 
 
+def load_generator_state(model_path):
+    """Normalize the two community checkpoint layouts to the bare generator
+    state dict (S40, vocoder-as-resource import):
+      {'generator': sd}            — deploy format (openvpi releases, so-vits
+                                     pretrain, our training weights/ snapshots)
+      {'state_dict': {'generator.*', 'discriminator.*', ...}}
+                                   — SingingVocoders lightning training ckpt;
+                                     strip the prefix (export_ckpt.py:30-35
+                                     semantics, startswith instead of the
+                                     upstream substring match — tighter, same
+                                     result on real checkpoints)"""
+    cp_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(cp_dict, dict):
+        if "generator" in cp_dict and isinstance(cp_dict["generator"], dict):
+            return cp_dict["generator"]
+        sd = cp_dict.get("state_dict")
+        if isinstance(sd, dict):
+            stripped = {
+                k[len("generator."):]: v
+                for k, v in sd.items()
+                if k.startswith("generator.")
+            }
+            if stripped:
+                return stripped
+    raise ValueError(
+        "该文件不是 NSF-HiFiGAN 声码器权重（缺少 'generator' 键，"
+        "也不是含 generator.* 的 SingingVocoders 训练 ckpt）"
+    )
+
+
 def build_from_checkpoint(model_path, h):
     """Original load_model() semantics (vdecoder/nsf_hifigan/models.py:17-27):
     Generator(h) -> load_state_dict(ckpt['generator'], strict=True) -> eval()
-    -> remove_weight_norm(). h = the config.json dict."""
+    -> remove_weight_norm(). h = the config.json dict. Checkpoint layout is
+    normalized by load_generator_state (deploy format | lightning ckpt)."""
     missing = [k for k in REQUIRED_KEYS if k not in h]
     if missing:
         raise ValueError(f"NSF-HiFiGAN config.json 缺少字段: {missing}")
@@ -200,11 +231,7 @@ def build_from_checkpoint(model_path, h):
             f"{math.prod(h['upsample_rates'])} != hop_size={h['hop_size']}"
         )
     generator = Generator(h)
-    cp_dict = torch.load(model_path, map_location="cpu", weights_only=False)
-    if "generator" not in cp_dict:
-        raise ValueError("该文件不是 NSF-HiFiGAN 声码器权重（缺少 'generator' 键）")
-    generator.load_state_dict(cp_dict["generator"], strict=True)
+    generator.load_state_dict(load_generator_state(model_path), strict=True)
     generator.eval()
     generator.remove_weight_norm()
-    del cp_dict
     return generator

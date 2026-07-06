@@ -26,6 +26,8 @@ import {
   voiceVersionBadge,
   voiceSpeakerOptions,
   formatSampleRateKhz,
+  vocoderFormatMatches,
+  vocoderFormatLabel,
   type VoiceType,
 } from "../../store/voice-models";
 import "./MsstModelManager.css";
@@ -265,22 +267,39 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
   const [diffusionPath, setDiffusionPath] = useState("");
   const [diffusionConfigPath, setDiffusionConfigPath] = useState("");
   const [avatarPath, setAvatarPath] = useState("");
+  const [vocoderConfigPath, setVocoderConfigPath] = useState("");
   const [modelName, setModelName] = useState("");
   const [importing, setImporting] = useState(false);
   const [err, setErr] = useState("");
+  const isVocoder = voiceType === "vocoder";
 
   const browse = useCallback(async (title: string, exts: string[]) => {
-    const path = await open({ title, filters: [{ name: "File", extensions: exts }] });
+    // "*" filter: community vocoder checkpoints are often extensionless
+    // (so-vits pretrain names the file just "model")
+    const filters = exts.includes("*")
+      ? [{ name: "File", extensions: exts.filter((e) => e !== "*") }, { name: "All", extensions: ["*"] }]
+      : [{ name: "File", extensions: exts }];
+    const path = await open({ title, filters });
     return path ? (path as string) : "";
   }, []);
 
   const handleBrowseModel = useCallback(async () => {
-    const p = await browse(lang === "zh" ? "选择模型文件 (.pth)" : "Select model file (.pth)", ["pth", "onnx"]);
+    const p = isVocoder
+      ? await browse(
+          lang === "zh" ? "选择声码器权重 (.ckpt / .pt / .onnx)" : "Select vocoder checkpoint (.ckpt / .pt / .onnx)",
+          ["ckpt", "pt", "onnx", "*"],
+        )
+      : await browse(lang === "zh" ? "选择模型文件 (.pth)" : "Select model file (.pth)", ["pth", "onnx"]);
     if (p) {
       setModelPath(p);
       const filename = p.split(/[/\\]/).pop() ?? "";
-      setModelName(filename.replace(/\.(pth|onnx)$/i, ""));
+      setModelName(filename.replace(/\.(pth|onnx|ckpt|pt)$/i, ""));
     }
+  }, [browse, lang, isVocoder]);
+
+  const handleBrowseVocoderConfig = useCallback(async () => {
+    const p = await browse(lang === "zh" ? "选择声码器配置 (config.json)" : "Select vocoder config (config.json)", ["json"]);
+    if (p) setVocoderConfigPath(p);
   }, [browse, lang]);
 
   const handleBrowseIndex = useCallback(async () => {
@@ -326,6 +345,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
         diffusionPath: diffusionPath || null,
         diffusionConfigPath: diffusionConfigPath || null,
         avatarPath: avatarPath || null,
+        vocoderConfigPath: vocoderConfigPath || null,
       });
       for (const w of outcome?.warnings ?? []) {
         useAppStore.getState().showToast(w, "info");
@@ -335,13 +355,23 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       setErr(String(e));
     }
     setImporting(false);
-  }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, onDone]);
+  }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, vocoderConfigPath, onDone]);
 
   const isRvc = voiceType === "rvc";
   const Z = (key: string) => {
     const map: Record<string, Record<string, string>> = {
-      title: { zh: `导入 ${voiceType.toUpperCase()} 模型`, en: `Import ${voiceType.toUpperCase()} Model`, ja: `${voiceType.toUpperCase()} モデル取り込み` },
-      model: { zh: "模型文件 (.pth)", en: "Model file (.pth)", ja: "モデルファイル (.pth)" },
+      title: isVocoder
+        ? { zh: "导入声码器", en: "Import Vocoder", ja: "ボコーダー取り込み" }
+        : { zh: `导入 ${voiceType.toUpperCase()} 模型`, en: `Import ${voiceType.toUpperCase()} Model`, ja: `${voiceType.toUpperCase()} モデル取り込み` },
+      model: isVocoder
+        ? { zh: "声码器权重 (.ckpt / .pt / .onnx，社区包内常为无后缀的 model 文件)", en: "Vocoder checkpoint (.ckpt / .pt / .onnx; community zips often name it just \"model\")", ja: "ボコーダー重み (.ckpt / .pt / .onnx。コミュニティ配布では拡張子なしの model の場合あり)" }
+        : { zh: "模型文件 (.pth)", en: "Model file (.pth)", ja: "モデルファイル (.pth)" },
+      vocoderCfg: { zh: "声码器配置 (config.json)  — 可留空自动查找", en: "Vocoder config (config.json) — blank = auto-detect", ja: "ボコーダー設定 (config.json) — 空欄で自動検出" },
+      vocoderNote: {
+        zh: "支持经典 NSF-HiFiGAN（如 openvpi 2022.12/2024.02 社区声码器及其微调产物）；PC-NSF（mini_nsf）暂不支持。导入后在 SoVITS 推理节点的「声码器」下拉中选用。",
+        en: "Classic NSF-HiFiGAN only (openvpi 2022.12/2024.02 community vocoders and their fine-tunes); PC-NSF (mini_nsf) is not supported yet. After import, pick it in the SoVITS node's Vocoder dropdown.",
+        ja: "クラシック NSF-HiFiGAN のみ対応（openvpi 2022.12/2024.02 コミュニティボコーダーとその微調整版）。PC-NSF（mini_nsf）は未対応。取り込み後、SoVITS ノードの「ボコーダー」で選択できます。",
+      },
       index: { zh: "索引文件 (.index)  — 可选", en: "Index file (.index) — optional", ja: "インデックス (.index) — 任意" },
       cluster: { zh: "聚类/检索模型 (.pt / .pkl)  — 可选", en: "Cluster/retrieval model (.pt / .pkl) — optional", ja: "クラスタ/検索モデル (.pt / .pkl) — 任意" },
       diffusion: { zh: "扩散模型 (.pt)  — 可选，启用浅扩散", en: "Diffusion model (.pt) — optional, enables shallow diffusion", ja: "拡散モデル (.pt) — 任意、浅い拡散を有効化" },
@@ -372,6 +402,20 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
           </div>
         </div>
 
+        {isVocoder && (
+          <>
+            <div className="rm-import-field">
+              <label>{Z("vocoderCfg")}</label>
+              <div className="rm-import-row">
+                <input type="text" readOnly value={vocoderConfigPath} placeholder="..." className="rm-import-path" />
+                <button onClick={handleBrowseVocoderConfig}>{Z("browseBtn")}</button>
+              </div>
+            </div>
+            <p className="rm-voice-hint">{Z("vocoderNote")}</p>
+          </>
+        )}
+
+        {!isVocoder && (
         <div className="rm-import-field">
           <label>{isRvc ? Z("index") : Z("cluster")}</label>
           <div className="rm-import-row">
@@ -379,8 +423,9 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
             <button onClick={handleBrowseIndex}>{Z("browseBtn")}</button>
           </div>
         </div>
+        )}
 
-        {!isRvc && (
+        {!isRvc && !isVocoder && (
           <>
             <div className="rm-import-field">
               <label>{Z("diffusion")}</label>
@@ -401,6 +446,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
           </>
         )}
 
+        {!isVocoder && (
         <div className="rm-import-field">
           <label>{Z("avatar")}</label>
           <div className="rm-import-row">
@@ -408,6 +454,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
             <button onClick={handleBrowseAvatar}>{Z("browseBtn")}</button>
           </div>
         </div>
+        )}
 
         <div className="rm-import-field">
           <label>{Z("name")}</label>
@@ -487,6 +534,16 @@ function VoiceAvatar({ path, name, onSet }: { path: string | null; name: string;
   );
 }
 
+/** Facts about the BUILT-IN default vocoder (Rust get_default_vocoder_info):
+ *  aux infrastructure, shown as a pinned read-only row in the vocoder tab. */
+interface DefaultVocoderInfo {
+  present: boolean;
+  missing: string[];
+  sample_rate: number | null;
+  hop_size: number | null;
+  num_mels: number | null;
+}
+
 function VoiceModelsTab({ lang }: { lang: string }) {
   const [voiceType, setVoiceType] = useState<VoiceType>("rvc");
   const [showImport, setShowImport] = useState(false);
@@ -495,13 +552,24 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   const models = useVoiceModelStore((s) => s.models[voiceType]);
   const voiceError = useVoiceModelStore((s) => s.error);
   const { fetchModels, deleteModel, setAvatar, clearError } = useVoiceModelStore();
+  // built-in default vocoder facts — refetched on tab entry (cheap disk stat)
+  const [defaultVoc, setDefaultVoc] = useState<DefaultVocoderInfo | null>(null);
+  useEffect(() => {
+    if (voiceType !== "vocoder") return;
+    void invoke<DefaultVocoderInfo>("get_default_vocoder_info")
+      .then(setDefaultVoc)
+      .catch(() => setDefaultVoc(null));
+  }, [voiceType]);
 
   useEffect(() => { void fetchModels(); }, [fetchModels]);
 
   const handleDelete = useCallback(async (name: string) => {
-    await deleteModel(name); // errors land in voiceError
+    // type-scoped: same-name entries across types are standard (rvc+sovits pair
+    // + a vocoder named after the singer) — an untyped delete hits the first
+    // scan match, i.e. potentially the WRONG model's files (S40 红队 A5)
+    await deleteModel(name, voiceType); // errors land in voiceError
     setDeleteConfirm(null);
-  }, [deleteModel]);
+  }, [deleteModel, voiceType]);
 
   return (
     <div className="rm-voice-tab">
@@ -509,6 +577,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
       <div className="msst-filter">
         <button className={voiceType === "rvc" ? "active" : ""} onClick={() => setVoiceType("rvc")}>RVC</button>
         <button className={voiceType === "sovits" ? "active" : ""} onClick={() => setVoiceType("sovits")}>SoVITS</button>
+        <button className={voiceType === "vocoder" ? "active" : ""} onClick={() => setVoiceType("vocoder")}>
+          {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
+        </button>
         <div className="rm-filter-spacer" />
         <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
           + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
@@ -516,24 +587,127 @@ function VoiceModelsTab({ lang }: { lang: string }) {
       </div>
 
       <div className="rm-voice-list">
-        {models.length === 0 && (
+        {models.length === 0 && voiceType !== "vocoder" && (
           <p className="msst-empty">
             {lang === "zh"
               ? `暂无 ${voiceType.toUpperCase()} 模型`
               : `No ${voiceType.toUpperCase()} models`}
           </p>
         )}
+        {voiceType === "vocoder" && (
+          // zero-knowledge banner: THE answer to "为什么我的声码器不能用于某个模型"
+          <p className="rm-voice-hint">
+            {t18({
+              zh: "声码器供 SoVITS 浅扩散/增强器使用（在 SoVITS 推理节点里选择）；同一歌手微调的声码器可被其所有 SoVITS 模型共享。仅频谱格式一致（44.1kHz / hop 512 / 128 mel）的声码器可被选用；RVC 模型无外部声码器接口，不适用。",
+              en: "Vocoders serve SoVITS shallow diffusion / the enhancer (picked inside the SoVITS node); one singer's fine-tuned vocoder is shared by all their SoVITS models. Only format-matching vocoders (44.1kHz / hop 512 / 128 mel) are selectable; RVC models have no external vocoder interface.",
+              ja: "ボコーダーは SoVITS の浅い拡散/エンハンサー用（SoVITS ノード内で選択）。同じ歌手のボコーダーは全 SoVITS モデルで共有可。フォーマット一致（44.1kHz / hop 512 / 128 mel）のもののみ選択可能。RVC には外部ボコーダーの接続点がありません。",
+            }, lang)}
+          </p>
+        )}
+        {voiceType === "vocoder" && defaultVoc && (
+          // pinned read-only row: what the node dropdown's「默认声码器」IS —
+          // the built-in aux vocoder; its facts come from disk (get_default_
+          // vocoder_info), so a missing aux install surfaces HERE as a loud
+          // chip instead of only erroring at render time
+          <div
+            className="rm-voice-item rm-voice-item-builtin"
+            title={t18({
+              zh: "随应用分发的 OpenVPI 社区通用声码器——未选择自定义声码器时，浅扩散/增强器使用它；也是声码器格式类的基准。不可删除。",
+              en: "The OpenVPI community general vocoder shipped with the app — shallow diffusion / the enhancer use it unless a custom vocoder is picked; also the format-class reference. Not deletable.",
+              ja: "アプリ同梱の OpenVPI コミュニティ汎用ボコーダー。カスタム未選択時に浅い拡散/エンハンサーが使用。フォーマットの基準でもあります。削除不可。",
+            }, lang)}
+          >
+            <div className="rm-voice-item-info">
+              <span className="rm-voice-item-name">
+                {t18({ zh: "默认声码器", en: "Default vocoder", ja: "既定ボコーダー" }, lang)}
+              </span>
+              <span className="rm-voice-item-meta">
+                <span className="ver-badge">NSF-HiFiGAN</span>
+                <span className="msst-onnx-ok">
+                  {t18({ zh: "内置", en: "Built-in", ja: "内蔵" }, lang)}
+                </span>
+                {defaultVoc.present ? (
+                  <>
+                    <span>
+                      {formatSampleRateKhz(defaultVoc.sample_rate ?? 44100)} · hop{" "}
+                      {defaultVoc.hop_size ?? "?"} · {defaultVoc.num_mels ?? "?"} mel
+                    </span>
+                    <span
+                      className="msst-onnx-ok"
+                      title={t18({
+                        zh: "标准格式：可用于所有 SoVITS 模型的浅扩散/增强器",
+                        en: "Standard format: usable by every SoVITS model's shallow diffusion / enhancer",
+                        ja: "標準フォーマット：全 SoVITS モデルの浅い拡散/エンハンサーで使用可能",
+                      }, lang)}
+                    >
+                      {t18({ zh: "SoVITS 扩散/增强", en: "SoVITS diff/enhance", ja: "SoVITS 拡散/強化" }, lang)}
+                    </span>
+                  </>
+                ) : (
+                  <span
+                    className="rm-voice-item-warn"
+                    title={t18({
+                      zh: `缺少文件：${defaultVoc.missing.join("、")}——请将其放入 data/models/aux/，否则浅扩散/增强器无法运行`,
+                      en: `Missing: ${defaultVoc.missing.join(", ")} — place them in data/models/aux/ or shallow diffusion / the enhancer cannot run`,
+                      ja: `欠落ファイル：${defaultVoc.missing.join("、")} — data/models/aux/ に配置してください。ないと浅い拡散/エンハンサーは動きません`,
+                    }, lang)}
+                  >
+                    {t18({ zh: "缺失", en: "Missing", ja: "欠落" }, lang)}
+                  </span>
+                )}
+              </span>
+            </div>
+          </div>
+        )}
+        {voiceType === "vocoder" && models.length === 0 && (
+          <p className="msst-empty">
+            {t18({
+              zh: "尚无自定义声码器——可在训练页微调后保存，或导入社区声码器（ckpt/onnx）",
+              en: "No custom vocoders yet — fine-tune one on the training page, or import a community vocoder (ckpt/onnx)",
+              ja: "カスタムボコーダーはまだありません — トレーニングページで微調整して保存するか、コミュニティボコーダー（ckpt/onnx）を取り込めます",
+            }, lang)}
+          </p>
+        )}
         {models.map((m) => {
-          const ver = voiceVersionBadge(m);
-          const speakerCount = voiceSpeakerOptions(m).length;
+          const isVocoder = voiceType === "vocoder";
+          const ver = isVocoder ? null : voiceVersionBadge(m);
+          const speakerCount = isVocoder ? 0 : voiceSpeakerOptions(m).length;
+          const vocFormatOk = isVocoder ? vocoderFormatMatches(m) : true;
           return (
             <div key={m.name} className="rm-voice-item">
+              {!isVocoder && (
               <VoiceAvatar path={m.avatar_path} name={m.name} onSet={async () => {
                 const file = await open({ title: lang === "zh" ? "选择角色头图" : "Select avatar", filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "bmp", "webp"] }] });
                 if (file) await setAvatar(m.name, file as string);
               }} />
+              )}
               <div className="rm-voice-item-info">
                 <span className="rm-voice-item-name">{m.name}</span>
+                {isVocoder ? (
+                  <span className="rm-voice-item-meta">
+                    <span className="ver-badge" title={t18({ zh: "经典 NSF-HiFiGAN 架构", en: "Classic NSF-HiFiGAN architecture", ja: "クラシック NSF-HiFiGAN アーキテクチャ" }, lang)}>
+                      NSF-HiFiGAN
+                    </span>
+                    <span>{vocoderFormatLabel(m)}</span>
+                    {vocFormatOk ? (
+                      <span className="msst-onnx-ok" title={t18({
+                        zh: "标准格式：可用于所有 SoVITS 模型的浅扩散/增强器",
+                        en: "Standard format: usable by every SoVITS model's shallow diffusion / enhancer",
+                        ja: "標準フォーマット：全 SoVITS モデルの浅い拡散/エンハンサーで使用可能",
+                      }, lang)}>
+                        {t18({ zh: "SoVITS 扩散/增强", en: "SoVITS diff/enhance", ja: "SoVITS 拡散/強化" }, lang)}
+                      </span>
+                    ) : (
+                      <span className="rm-voice-item-warn" title={t18({
+                        zh: "梅尔频谱格式与标准格式（44.1kHz / hop 512 / 128 mel / 40-16000Hz）不一致——不会出现在推理节点的声码器列表中",
+                        en: "Mel format differs from the standard (44.1kHz / hop 512 / 128 mel / 40-16000Hz) — will not appear in the node's vocoder list",
+                        ja: "メルフォーマットが標準（44.1kHz / hop 512 / 128 mel / 40-16000Hz）と不一致 — ノードのボコーダー一覧に表示されません",
+                      }, lang)}>
+                        {t18({ zh: "格式不匹配", en: "Format mismatch", ja: "フォーマット不一致" }, lang)}
+                      </span>
+                    )}
+                  </span>
+                ) : (
                 <span className="rm-voice-item-meta">
                   {ver && <span className="ver-badge">{ver}</span>}
                   {m.format === "Onnx" ? <span className="msst-onnx-ok">ONNX</span> : <span>{m.format}</span>}
@@ -563,9 +737,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   )}
                   {/* companion-asset badges — the label matches the inference
                       node's badge verbatim so users can pattern-match across
-                      the two surfaces; the future vocoder attachment
-                      (`<stem>.vocoder/`, ①b 声码器微调) adds its "VOC" chip
-                      right here + in VoiceModelPicker */}
+                      the two surfaces. (S39 had reserved a per-model "VOC"
+                      attachment chip here — SUPERSEDED by S40's standalone
+                      vocoder resource class, see the 声码器 tab.) */}
                   {m.diffusion_path && (
                     <span className="msst-onnx-ok" title={t18(VOICE_STRINGS.diffBadgeTip, lang)}>
                       DIFF
@@ -579,6 +753,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                     <span>{speakerCount} {t18({ zh: "说话人", en: "speakers", ja: "話者" }, lang)}</span>
                   )}
                 </span>
+                )}
               </div>
               {deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">

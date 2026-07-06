@@ -209,7 +209,8 @@ struct DiffusionFiles {
     denoiser: String,
 }
 
-/// models/aux/nsf_hifigan.json — export_nsf_hifigan.py sidecar.
+/// nsf_hifigan sidecar json — export_nsf_hifigan.py schema (the aux default
+/// AND the S40 vocoder resources under models/nsf_hifigan/ share it).
 #[derive(serde::Deserialize)]
 struct VocoderSidecar {
     #[serde(default)]
@@ -220,6 +221,72 @@ struct VocoderSidecar {
     num_mels: u32,
     #[serde(default)]
     mel_filters: Option<String>,
+    // full mel recipe — resource vocoders are checked field-by-field against
+    // the standard format (设计红队 A9: same geometry with a different recipe,
+    // e.g. fmax 8000, would silently mismatch the diffusion training domain)
+    #[serde(default)]
+    n_fft: Option<f64>,
+    #[serde(default)]
+    win_size: Option<f64>,
+    #[serde(default)]
+    fmin: Option<f64>,
+    #[serde(default)]
+    fmax: Option<f64>,
+}
+
+/// 一期唯一声码器格式类 = the OpenVPI standard (the aux default vocoder's
+/// recipe — the domain every SoVITS diffusion attachment and the enhancer mel
+/// are anchored to). Mirrored by VOCODER_STD_FORMAT in src/store/voice-models.ts.
+const VOCODER_STD_N_FFT: f64 = 2048.0;
+const VOCODER_STD_WIN_SIZE: f64 = 2048.0;
+const VOCODER_STD_FMIN: f64 = 40.0;
+const VOCODER_STD_FMAX: f64 = 16000.0;
+/// 审查修复: A9 says FULL-field equality incl. 128 — an 80-mel vocoder passes
+/// every geometry check (its own filterbank is self-consistently 80 rows) and
+/// only dies two layers away inside the denoiser graph (or silently degrades
+/// the enhancer path, which is self-consistent at ANY bin count).
+const VOCODER_STD_NUM_MELS: f64 = 128.0;
+
+/// S40: facts about the BUILT-IN default vocoder (aux/nsf_hifigan.* — app
+/// infrastructure, not a registry entry) for the resource manager's pinned
+/// read-only row: zero-knowledge users must be able to see what the node
+/// dropdown's「默认声码器」refers to, its format class, and — when the aux
+/// files are missing — learn it HERE instead of at render time.
+#[derive(serde::Serialize)]
+pub struct DefaultVocoderInfo {
+    /// all three files (onnx + sidecar json + mel filterbank npy) present
+    pub present: bool,
+    /// file names missing from models/aux (diagnostics for the warning chip)
+    pub missing: Vec<String>,
+    pub sample_rate: Option<u32>,
+    pub hop_size: Option<u32>,
+    pub num_mels: Option<u32>,
+}
+
+#[tauri::command]
+pub fn get_default_vocoder_info(state: State<'_, Arc<AppState>>) -> DefaultVocoderInfo {
+    let aux = state.models.models_dir().join("aux");
+    let json_path = aux.join(AUX_NSF_HIFIGAN_JSON);
+    let sidecar: Option<VocoderSidecar> = std::fs::read_to_string(&json_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let mel_name = sidecar
+        .as_ref()
+        .and_then(|s| s.mel_filters.clone())
+        .unwrap_or_else(|| AUX_NSF_HIFIGAN_MEL.to_string());
+    let mut missing = Vec::new();
+    for name in [AUX_NSF_HIFIGAN, AUX_NSF_HIFIGAN_JSON, mel_name.as_str()] {
+        if !aux.join(name).is_file() {
+            missing.push(name.to_string());
+        }
+    }
+    DefaultVocoderInfo {
+        present: missing.is_empty(),
+        missing,
+        sample_rate: sidecar.as_ref().map(|s| s.sample_rate),
+        hop_size: sidecar.as_ref().map(|s| s.hop_size),
+        num_mels: sidecar.as_ref().map(|s| s.num_mels),
+    }
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Result<T, String> {
@@ -258,18 +325,108 @@ fn resolve_sovits_quality(
 
     // ── vocoder (needed by diffusion AND the enhancer) ──
     let vocoder = if diffusion_on || options.nsf_enhance {
-        let voc_path = aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN声码器")?;
-        let voc_json = aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN声码器配置")?;
+        // S40: an installed vocoder RESOURCE by registry name, else the aux
+        // default (byte-identical S36 path). "" normalizes to None (设计红队
+        // A21 — the frontend sentinel for「默认声码器」).
+        let picked = options
+            .vocoder_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (voc_path, voc_json, voc_base_dir, voc_what) = match picked.as_deref() {
+            None => (
+                aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN声码器")?,
+                aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN声码器配置")?,
+                app.models.models_dir().join("aux"),
+                "NSF-HiFiGAN 声码器".to_string(),
+            ),
+            Some(name) => {
+                // type-scoped lookup (设计红队 A5): singers commonly own a
+                // same-name rvc/sovits pair AND a same-name vocoder
+                let ventry = app
+                    .models
+                    .get_by_type(name, &crate::models::ModelType::NsfHifigan)
+                    .ok_or_else(|| {
+                        format!(
+                            "声码器「{}」不存在或已被删除——请在节点里重新选择声码器（或选回默认声码器）",
+                            name
+                        )
+                    })?;
+                let json = ventry.path.with_extension("json");
+                if !json.is_file() {
+                    return Err(format!(
+                        "声码器「{}」缺少配置文件 {}——请在资源管理中重新导入",
+                        name,
+                        json.display()
+                    ));
+                }
+                let base = ventry
+                    .path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                (ventry.path.clone(), json, base, format!("声码器「{}」", name))
+            }
+        };
         let sidecar: VocoderSidecar = read_json(&voc_json, "声码器配置")?;
         let mel_name = sidecar
             .mel_filters
             .clone()
             .unwrap_or_else(|| AUX_NSF_HIFIGAN_MEL.to_string());
-        let voc_mel_path = aux_path(app, &mel_name, "NSF-HiFiGAN滤波器")?;
+        // mel_filters resolves against ITS OWN sidecar's directory — a resource
+        // vocoder's filterbank must NEVER fall back to the aux file of the same
+        // name (设计红队 A6: silent wrong-filterbank path)
+        let voc_mel_path = voc_base_dir.join(&mel_name);
+        if !voc_mel_path.is_file() {
+            // 审查修复: the aux default vocoder is NOT importable — telling the
+            // user to "re-import" it is a dead end; restore the S36-style
+            // place-the-file guidance for the None branch
+            return Err(if picked.is_some() {
+                format!(
+                    "缺少{}的滤波器文件 {}——请在资源管理中重新导入该声码器",
+                    voc_what,
+                    voc_mel_path.display()
+                )
+            } else {
+                format!(
+                    "缺少NSF-HiFiGAN滤波器 {}，请将其放入 {}",
+                    mel_name,
+                    voc_base_dir.display()
+                )
+            });
+        }
+        if picked.is_some() {
+            // resource vocoders: FULL recipe equality against the standard
+            // format class; a missing field = an unverifiable format = refuse
+            for (key, got, want) in [
+                ("n_fft", sidecar.n_fft, VOCODER_STD_N_FFT),
+                ("win_size", sidecar.win_size, VOCODER_STD_WIN_SIZE),
+                ("fmin", sidecar.fmin, VOCODER_STD_FMIN),
+                ("fmax", sidecar.fmax, VOCODER_STD_FMAX),
+                ("num_mels", Some(sidecar.num_mels as f64), VOCODER_STD_NUM_MELS),
+            ] {
+                match got {
+                    None => {
+                        return Err(format!(
+                            "{}的配置缺少字段「{}」——无法确认梅尔频谱格式，请重新导入",
+                            voc_what, key
+                        ))
+                    }
+                    Some(v) if v != want => {
+                        return Err(format!(
+                            "{}的梅尔频谱格式与模型不一致（{} = {}，标准格式需要 {}）——声码器只能用于频谱格式一致的模型",
+                            voc_what, key, v, want
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+        }
         if sidecar.sample_rate != entry.sample_rate || sidecar.hop_size as usize != hop_size {
             return Err(format!(
-                "NSF-HiFiGAN 声码器（{}Hz/hop {}）与模型（{}Hz/hop {}）几何不一致——浅扩散/增强器仅支持 44.1kHz/512 的 SoVITS 模型",
-                sidecar.sample_rate, sidecar.hop_size, entry.sample_rate, hop_size
+                "{}（{}Hz/hop {}）与模型（{}Hz/hop {}）几何不一致——浅扩散/增强器仅支持 44.1kHz/512 的 SoVITS 模型",
+                voc_what, sidecar.sample_rate, sidecar.hop_size, entry.sample_rate, hop_size
             ));
         }
         let filters = app

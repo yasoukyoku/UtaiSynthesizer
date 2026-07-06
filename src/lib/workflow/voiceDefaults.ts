@@ -87,6 +87,10 @@ export interface SovitsOptions {
   auto_f0: boolean;
   /** Same as RvcOptions.gpu_extract. */
   gpu_extract: boolean;
+  /** S40 vocoder resource: registry NAME of an installed NSF-HiFiGAN vocoder to use for
+   * shallow diffusion + the enhancer; null = the built-in aux default. An unknown name is a
+   * loud Rust error (never a silent fallback to the default). */
+  vocoder_name: string | null;
 }
 
 export const RVC_DEFAULTS: RvcOptions = {
@@ -121,6 +125,7 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   enhancer_adaptive_key: 0,
   auto_f0: false,
   gpu_extract: false,
+  vocoder_name: null,
 };
 
 /**

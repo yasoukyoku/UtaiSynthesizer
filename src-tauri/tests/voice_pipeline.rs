@@ -24,6 +24,24 @@ fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
+/// S40 wire-compat pin: every pre-S40 payload (old .usp projects, older
+/// frontends) carries NO vocoder_name key and must land on None — the
+/// byte-identical aux-default vocoder path; unknown future keys must not
+/// break deserialization either (no deny_unknown_fields).
+#[test]
+fn sovits_options_vocoder_name_serde_compat() {
+    let legacy: SovitsOptions = serde_json::from_str("{}").unwrap();
+    assert!(legacy.vocoder_name.is_none(), "legacy payload => default vocoder");
+    let null: SovitsOptions = serde_json::from_str(r#"{"vocoder_name":null}"#).unwrap();
+    assert!(null.vocoder_name.is_none());
+    let named: SovitsOptions =
+        serde_json::from_str(r#"{"vocoder_name":"かざね 声码器"}"#).unwrap();
+    assert_eq!(named.vocoder_name.as_deref(), Some("かざね 声码器"));
+    let forward: SovitsOptions =
+        serde_json::from_str(r#"{"vocoder_name":"x","some_future_key":123}"#).unwrap();
+    assert_eq!(forward.vocoder_name.as_deref(), Some("x"));
+}
+
 /// The app does this in run() before any ort use; without it, `cargo test` hangs forever
 /// at 0 CPU on the first session build (invisible modal DLL dialog + uninitialized
 /// load-dynamic ORT). Copied from separation_pipeline.rs.

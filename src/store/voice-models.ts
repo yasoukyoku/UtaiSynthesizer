@@ -49,38 +49,45 @@ export interface VoiceModelEntry {
   avatar_path: string | null;
 }
 
-export type VoiceType = "rvc" | "sovits";
+/** "vocoder" = the S40 NSF-HiFiGAN vocoder RESOURCE class (fine-tuned/imported,
+ * models/nsf_hifigan/ on disk, Rust ModelType::NsfHifigan) — shared across every
+ * SoVITS model of the same singer; consumed by the SoVITS node's vocoder dropdown. */
+export type VoiceType = "rvc" | "sovits" | "vocoder";
 
 interface VoiceModelStore {
   models: Record<VoiceType, VoiceModelEntry[]>;
   error: string | null;
 
-  /** Refresh BOTH lists (backend scan() runs inside list_models, so this picks up disk changes). */
+  /** Refresh ALL lists (backend scan() runs inside list_models, so this picks up disk changes). */
   fetchModels: () => Promise<void>;
-  deleteModel: (name: string) => Promise<void>;
+  /** Type-scoped delete — same-name entries across types are a standard workflow
+   * (an rvc+sovits pair per singer + a vocoder named after the singer), an
+   * untyped delete would hit the first scan match instead (Rust 红队 A5). */
+  deleteModel: (name: string, voiceType: VoiceType) => Promise<void>;
   setAvatar: (name: string, avatarPath: string) => Promise<void>;
   clearError: () => void;
 }
 
 export const useVoiceModelStore = create<VoiceModelStore>((set, get) => ({
-  models: { rvc: [], sovits: [] },
+  models: { rvc: [], sovits: [], vocoder: [] },
   error: null,
 
   fetchModels: async () => {
     try {
-      const [rvc, sovits] = await Promise.all([
+      const [rvc, sovits, vocoder] = await Promise.all([
         invoke<VoiceModelEntry[]>("list_models", { modelType: "rvc" }),
         invoke<VoiceModelEntry[]>("list_models", { modelType: "sovits" }),
+        invoke<VoiceModelEntry[]>("list_models", { modelType: "vocoder" }),
       ]);
-      set({ models: { rvc, sovits } });
+      set({ models: { rvc, sovits, vocoder } });
     } catch (e) {
       set({ error: String(e) });
     }
   },
 
-  deleteModel: async (name) => {
+  deleteModel: async (name, voiceType) => {
     try {
-      await invoke("delete_model", { name });
+      await invoke("delete_model", { name, modelType: voiceType });
       await get().fetchModels();
     } catch (e) {
       set({ error: String(e) });
@@ -155,4 +162,38 @@ export function voiceHasDiffusion(m: VoiceModelEntry | undefined): boolean {
  * Truth source = converter-written sidecar key (weight-derived), NOT the model config. */
 export function voiceHasAutoF0(m: VoiceModelEntry | undefined): boolean {
   return m?.config?.auto_f0?.available === true;
+}
+
+/** 一期唯一声码器格式类 = the OpenVPI standard (the aux default vocoder's recipe;
+ * every SoVITS diffusion attachment / the enhancer mel is anchored to it).
+ * MIRRORS the Rust constants in commands/inference.rs (VOCODER_STD_*) — the Rust
+ * side re-validates strictly at run time, this filter only decides visibility. */
+export const VOCODER_STD_FORMAT = {
+  sample_rate: 44100,
+  hop_size: 512,
+  n_fft: 2048,
+  win_size: 2048,
+  num_mels: 128,
+  fmin: 40,
+  fmax: 16000,
+} as const;
+
+/** Whether an installed vocoder's sidecar recipe matches the standard format class —
+ * mismatches are HIDDEN from the node dropdown (不能选隐藏), the resource list
+ * explains the format instead. Missing fields = unverifiable = no match. */
+export function vocoderFormatMatches(m: VoiceModelEntry): boolean {
+  const c = m.config;
+  if (!c) return false;
+  return (Object.keys(VOCODER_STD_FORMAT) as (keyof typeof VOCODER_STD_FORMAT)[]).every(
+    (k) => Number(c[k]) === VOCODER_STD_FORMAT[k],
+  );
+}
+
+/** "44.1kHz · hop 512 · 128 mel" — the resource-list format line for a vocoder row. */
+export function vocoderFormatLabel(m: VoiceModelEntry): string {
+  const c = m.config ?? {};
+  const sr = typeof c.sample_rate === "number" ? c.sample_rate : m.sample_rate;
+  const hop = c.hop_size ?? "?";
+  const mels = (c as Record<string, unknown>).num_mels ?? "?";
+  return `${formatSampleRateKhz(sr)} · hop ${hop} · ${mels} mel`;
 }

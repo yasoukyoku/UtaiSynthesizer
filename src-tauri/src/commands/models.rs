@@ -9,6 +9,10 @@ fn parse_voice_type(model_type: &str) -> Option<ModelType> {
     match model_type {
         "rvc" => Some(ModelType::Rvc),
         "sovits" => Some(ModelType::SoVits),
+        // S40: the vocoder RESOURCE class (fine-tuned / imported NSF-HiFiGAN
+        // vocoders under models/nsf_hifigan/); the aux default vocoder stays
+        // aux-resolved and outside the registry
+        "vocoder" => Some(ModelType::NsfHifigan),
         _ => None,
     }
 }
@@ -28,6 +32,9 @@ pub async fn list_models(
         Some("s2h") => Ok(state.models.list_by_type(&ModelType::S2H)),
         Some("f0") => Ok(state.models.list_by_type(&ModelType::F0)),
         Some("nsf_hifigan") => Ok(state.models.list_by_type(&ModelType::NsfHifigan)),
+        // S40 alias — the frontend voice store speaks "vocoder" everywhere
+        // (import/delete via parse_voice_type do too)
+        Some("vocoder") => Ok(state.models.list_by_type(&ModelType::NsfHifigan)),
         _ => Ok(state.models.list()),
     }
 }
@@ -35,6 +42,7 @@ pub async fn list_models(
 /// Returns the created entry PLUS non-fatal warnings (failed index conversion, synthesized
 /// sidecar config, avatar problems) — the frontend must surface these, not just "success".
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn import_model(
     state: State<'_, Arc<AppState>>,
     name: String,
@@ -44,6 +52,7 @@ pub async fn import_model(
     diffusion_path: Option<String>,
     diffusion_config_path: Option<String>,
     avatar_path: Option<String>,
+    vocoder_config_path: Option<String>,
 ) -> Result<ImportOutcome, String> {
     let mt = parse_voice_type(&model_type)
         .ok_or_else(|| format!("Unsupported model type: {}", model_type))?;
@@ -51,11 +60,20 @@ pub async fn import_model(
     // A same-name re-import REPLACES the model on disk — drop any live inference session first,
     // or it would keep serving the stale ONNX (and leak the old RvcIndex RAM).
     state.inference.unload_voice(&name);
+    // Vocoder resources are cached BY PATH (engine session + mel filterbank
+    // npy), not by voice name — evict them too before the files are replaced
+    // (设计红队 A18; a live session also holds a Windows file lock).
+    if matches!(mt, ModelType::NsfHifigan) {
+        if let Some(old) = state.models.get_by_type(&name, &mt) {
+            state.inference.unload_model_file(&old.path);
+        }
+    }
 
     let idx = index_path.map(PathBuf::from);
     let diff = diffusion_path.map(PathBuf::from);
     let diff_cfg = diffusion_config_path.map(PathBuf::from);
     let avatar = avatar_path.map(PathBuf::from);
+    let voc_cfg = vocoder_config_path.map(PathBuf::from);
     state
         .models
         .import_file(
@@ -67,6 +85,7 @@ pub async fn import_model(
             diff.as_deref(),
             diff_cfg.as_deref(),
             avatar.as_deref(),
+            voc_cfg.as_deref(),
         )
         .map_err(|e| {
             tracing::error!("Model import failed: {}", e);
@@ -132,11 +151,21 @@ pub async fn set_model_avatar(
 pub async fn delete_model(
     state: State<'_, Arc<AppState>>,
     name: String,
+    model_type: Option<String>,
 ) -> Result<(), String> {
+    // Type-scoped when the caller knows the type (设计红队 A5): an untyped
+    // first-match delete of a vocoder named after its singer would remove the
+    // SINGER MODEL's files (scan order rvc→sovits→…→nsf_hifigan).
+    let mt = model_type.as_deref().and_then(parse_voice_type);
     // Unload BEFORE removing files: a loaded session would keep serving the deleted model (and
     // on Windows can hold the .onnx file open, blocking removal).
     state.inference.unload_voice(&name);
-    state.models.delete(&name).map_err(|e| e.to_string())
+    if let Some(ModelType::NsfHifigan) = mt {
+        if let Some(old) = state.models.get_by_type(&name, &ModelType::NsfHifigan) {
+            state.inference.unload_model_file(&old.path);
+        }
+    }
+    state.models.delete(&name, mt.as_ref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -18,13 +18,18 @@ export interface LossChartHandle {
 
 /** Known loss keys → colors. The rendered series = the subset present in the
  *  run's history: RVC/SoVITS runs emit mel/g_total/d_total (+more, deliberately
- *  not charted), the diffusion trainer emits loss (train) + val (validation). */
+ *  not charted), the diffusion trainer emits loss (train) + val (validation),
+ *  the vocoder fine-tune (S40) emits aux_mel_loss + per-discriminator G terms
+ *  (its D/feature terms stay uncharted like RVC's extras — 9 lines is noise). */
 const KNOWN_SERIES: { key: string; varName: string; fallback: string }[] = [
   { key: "mel", varName: "--accent-primary", fallback: "#39c5bb" },
   { key: "g_total", varName: "--accent-secondary", fallback: "#8b5cf6" },
   { key: "d_total", varName: "--accent-tertiary", fallback: "#ff6b9d" },
   { key: "loss", varName: "--accent-primary", fallback: "#39c5bb" },
   { key: "val", varName: "--accent-secondary", fallback: "#8b5cf6" },
+  { key: "aux_mel_loss", varName: "--accent-primary", fallback: "#39c5bb" },
+  { key: "Gmsdloss", varName: "--accent-secondary", fallback: "#8b5cf6" },
+  { key: "Gmpdloss", varName: "--accent-tertiary", fallback: "#ff6b9d" },
 ];
 
 const PAD_L = 44;

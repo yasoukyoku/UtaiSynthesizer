@@ -84,7 +84,7 @@ export interface TrainingSnapshot {
 
 export interface TrainingFormConfig {
   modelName: string;
-  backend: "rvc" | "sovits" | "sovits_diff";
+  backend: "rvc" | "sovits" | "sovits_diff" | "vocoder";
   version: "v1" | "v2";
   sampleRate: "32k" | "40k" | "48k";
   totalEpoch: number;
@@ -129,6 +129,20 @@ export interface TrainingFormConfig {
   /** amp fp16 (upstream amp_dtype; default fp32) */
   diffFp16: boolean;
   diffCacheAllData: boolean;
+  // ---- 声码器微调 vocoder (S40; separate fields — card switches must not
+  // clobber). Steps are REAL optimizer rounds (the lightning GAN counts D+G
+  // separately internally — sidecar handles the 2× mapping). ----
+  /** completion target in REAL steps (official guidance: ~2000 finishes a fine-tune) */
+  vocTotalSteps: number;
+  /** save + validation cadence in REAL steps */
+  vocSaveEverySteps: number;
+  vocBatchSize: number;
+  /** workspace lightning checkpoints kept (weights/ snapshots are never pruned) */
+  vocKeepCkpts: number;
+  /** dataset crop window in mel frames (32 = upstream 16G preset, 48 = 24G) */
+  vocCropMelFrames: number;
+  /** freeze the MPD discriminator (upstream README: may help small-step fine-tunes) */
+  vocFreezeMpd: boolean;
 }
 
 const IDLE_SNAPSHOT: TrainingSnapshot = {
@@ -176,6 +190,12 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   diffKStepMax: 0,
   diffFp16: false,
   diffCacheAllData: true,
+  vocTotalSteps: 2000,
+  vocSaveEverySteps: 500,
+  vocBatchSize: 8,
+  vocKeepCkpts: 5,
+  vocCropMelFrames: 32,
+  vocFreezeMpd: false,
 };
 
 /** Client-side mirror of the Rust history cap: thin to half when exceeded. */
@@ -285,6 +305,21 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               cache_gpu: config.cacheGpu,
               fp16: config.fp16,
             }
+          : config.backend === "vocoder"
+            ? {
+                ...base,
+                // fixed markers, not user choices (一期单格式类); total_epoch 0
+                // = the step-based sentinel (the UI hides epoch displays)
+                version: "nsf_hifigan",
+                sample_rate: "44k",
+                total_epoch: 0,
+                batch_size: config.vocBatchSize,
+                total_steps: config.vocTotalSteps,
+                save_every_steps: config.vocSaveEverySteps,
+                keep_ckpts: config.vocKeepCkpts,
+                crop_mel_frames: config.vocCropMelFrames,
+                freeze_mpd: config.vocFreezeMpd,
+              }
           : config.backend === "sovits_diff"
             ? {
                 ...base,

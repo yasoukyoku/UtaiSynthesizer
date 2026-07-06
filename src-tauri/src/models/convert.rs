@@ -204,4 +204,67 @@ pub fn convert_diffusion_assets(
     Ok(())
 }
 
+/// NSF-HiFiGAN vocoder resource (S40): a torch checkpoint ({'generator':sd}
+/// deploy format, a SingingVocoders lightning training ckpt, or our training
+/// weights/ snapshot) → `<stem>.onnx` + `<stem>.json` + `<stem>_mel.npy`
+/// inside `outdir` (converter/export_nsf_hifigan.py --stem). `config` = the
+/// user-picked config.json; None lets the script auto-resolve it next to the
+/// checkpoint (original load_config semantics), erroring in Chinese when
+/// absent. The script self-checks torch-vs-ORT numerics before returning
+/// (mini_nsf / PC-NSF configs are rejected loudly — 一期 classic-only).
+pub fn convert_vocoder_to_onnx(
+    input: &Path,
+    config: Option<&Path>,
+    outdir: &Path,
+    stem: &str,
+    app_dir: &Path,
+) -> Result<()> {
+    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let script = app_dir.join("converter").join("export_nsf_hifigan.py");
+
+    if !script.exists() {
+        return Err(UtaiError::Model(format!(
+            "Vocoder converter not found: {}",
+            script.display()
+        )));
+    }
+    std::fs::create_dir_all(outdir)?;
+
+    let mut cmd = crate::util::python_command(&python);
+    cmd.arg(&script).arg("--model").arg(input);
+    if let Some(cfg) = config {
+        cmd.arg("--config").arg(cfg);
+    }
+    let output = cmd
+        .arg("--outdir")
+        .arg(outdir)
+        .arg("--stem")
+        .arg(stem)
+        .output()
+        .map_err(|e| {
+            UtaiError::Model(format!(
+                "Failed to run vocoder converter (python={}): {}",
+                python.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(UtaiError::Model(format!(
+            "Vocoder conversion failed: {}",
+            spawn_error_detail(&output)
+        )));
+    }
+    for suffix in [".onnx", ".json", "_mel.npy"] {
+        let p = outdir.join(format!("{}{}", stem, suffix));
+        if !p.exists() {
+            return Err(UtaiError::Model(format!(
+                "Vocoder conversion completed but {} not found",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 // find_converter_python moved to crate::util::find_python (shared with commands/msst_models.rs).

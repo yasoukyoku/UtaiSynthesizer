@@ -228,6 +228,12 @@ impl ModelRegistry {
                                 continue;
                             }
                         }
+                        // `<stem>.selfcheck.onnx` = the vocoder exporter's deterministic
+                        // twin (deleted in its finally; survives only a hard kill) —
+                        // never a model, unconditionally invisible (S40 审查).
+                        if stem.ends_with(".selfcheck") {
+                            continue;
+                        }
 
                         let config_path = path.with_extension("json");
                         let config = if config_path.exists() {
@@ -319,6 +325,23 @@ impl ModelRegistry {
         self.entries.read().iter().find(|e| e.name == name).cloned()
     }
 
+    /// Type-scoped lookup. Same-name entries across types are a STANDARD
+    /// workflow here (an rvc+sovits pair per singer — S39 review F3; S40 adds
+    /// vocoders named after the singer too), so any consumer that knows the
+    /// type must use this instead of the first-match `get`.
+    pub fn get_by_type(&self, name: &str, model_type: &ModelType) -> Option<ModelEntry> {
+        self.ensure_scanned();
+        self.entries
+            .read()
+            .iter()
+            .find(|e| {
+                e.name == name
+                    && std::mem::discriminant(&e.model_type)
+                        == std::mem::discriminant(model_type)
+            })
+            .cloned()
+    }
+
     pub fn exists(&self, name: &str, model_type: &ModelType) -> bool {
         self.ensure_scanned();
         self.entries.read().iter().any(|e| {
@@ -335,6 +358,7 @@ impl ModelRegistry {
     /// A same-name same-type re-import REPLACES the old entry (files removed first — which also
     /// keeps the stem stable). The caller must unload any live inference session for `name`
     /// BEFORE calling (commands/models.rs does), or the old session would keep serving stale ONNX.
+    #[allow(clippy::too_many_arguments)]
     pub fn import_file(
         &self,
         name: &str,
@@ -345,12 +369,55 @@ impl ModelRegistry {
         diffusion_file: Option<&Path>,
         diffusion_config: Option<&Path>,
         avatar_file: Option<&Path>,
+        vocoder_config: Option<&Path>,
     ) -> Result<ImportOutcome> {
         self.ensure_scanned();
         let mut warnings: Vec<String> = Vec::new();
 
         let subdir = self.models_dir.join(type_subdir(&model_type));
         std::fs::create_dir_all(&subdir)?;
+
+        // ---- S40 vocoder PRE-FLIGHT (审查 HIGH 修复): everything that can fail
+        // must fail BEFORE the destructive REPLACE below — a failed import must
+        // neither destroy the old resource nor leave scan-able residue that
+        // resurrects a self-check-rejected graph as a selectable ghost.
+        //   direct .onnx  → validate the source triple in place;
+        //   torch ckpt    → convert + ORT-self-check into a TEMP dir
+        //                   (attach_diffusion pattern), then import the temp
+        //                   output through the ordinary direct-onnx flow.
+        let mut vocoder_tmp: Option<PathBuf> = None;
+        let mut effective_src = src_path.to_path_buf();
+        if matches!(model_type, ModelType::NsfHifigan) {
+            let src_is_onnx = src_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("onnx"))
+                .unwrap_or(false);
+            if src_is_onnx {
+                read_vocoder_source(src_path)?; // json + fields + mini_nsf + npy
+            } else {
+                let tmp = subdir.join(".vocimport_tmp");
+                if tmp.exists() {
+                    // only ever populated mid-import — an existing one is a
+                    // crashed run's residue
+                    std::fs::remove_dir_all(&tmp).ok();
+                }
+                std::fs::create_dir_all(&tmp)?;
+                if let Err(e) = convert::convert_vocoder_to_onnx(
+                    src_path,
+                    vocoder_config,
+                    &tmp,
+                    "vocoder",
+                    app_dir,
+                ) {
+                    std::fs::remove_dir_all(&tmp).ok();
+                    return Err(e);
+                }
+                effective_src = tmp.join("vocoder.onnx");
+                vocoder_tmp = Some(tmp);
+            }
+        }
+        let src_path = effective_src.as_path();
 
         // Same-name re-import = REPLACE, not a duplicate row + silent file overwrite.
         let old_entry = {
@@ -382,10 +449,31 @@ impl ModelRegistry {
         if is_onnx {
             // Direct ONNX import: no conversion. Bring a same-stem sidecar json along if the
             // source has one; otherwise finalize_sidecar synthesizes a minimal default below.
-            std::fs::copy(src_path, &onnx_path)?;
-            let src_json = src_path.with_extension("json");
-            if src_json.exists() {
-                std::fs::copy(&src_json, onnx_path.with_extension("json"))?;
+            // The materialization is guarded: a partial trio left behind by an IO failure
+            // would resurrect on the next scan() as a broken ghost entry (审查 HIGH).
+            let materialized: Result<()> = (|| {
+                std::fs::copy(src_path, &onnx_path)?;
+                let src_json = src_path.with_extension("json");
+                if src_json.exists() {
+                    std::fs::copy(&src_json, onnx_path.with_extension("json"))?;
+                }
+                // S40 vocoder resource: a converter-exported vocoder is a THREE-piece
+                // set — the mel filterbank npy must travel and the sidecar's
+                // mel_filters field must follow the (possibly re-sanitized) stem;
+                // without them the vocoder is 100% unusable, so failures are FATAL
+                // here, not warnings (设计红队 A6). The source was pre-flight
+                // validated above, so failures here are raw IO only.
+                if matches!(model_type, ModelType::NsfHifigan) {
+                    import_vocoder_filterbank(src_path, &onnx_path, &stem)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = materialized {
+                sweep_partial_import(&subdir, &stem);
+                if let Some(tmp) = &vocoder_tmp {
+                    std::fs::remove_dir_all(tmp).ok();
+                }
+                return Err(e);
             }
             // S36 companions travel with a converter-exported .onnx: the auto-f0 predictor
             // (`<stem>.f0.onnx` — the sidecar may claim auto_f0.available and the run would
@@ -407,11 +495,28 @@ impl ModelRegistry {
                 }
             }
         } else {
+            // (NsfHifigan never reaches here: its torch-ckpt sources were
+            // converted into the temp dir during pre-flight, making
+            // effective_src an .onnx — the branch above handles it.)
             convert::convert_pth_to_onnx(src_path, &onnx_path, &model_type, app_dir)?;
         }
 
-        let config = finalize_sidecar(&onnx_path, name, &model_type, &mut warnings)?;
+        let config = match finalize_sidecar(&onnx_path, name, &model_type, &mut warnings) {
+            Ok(c) => c,
+            Err(e) => {
+                if matches!(model_type, ModelType::NsfHifigan) {
+                    sweep_partial_import(&subdir, &stem);
+                }
+                if let Some(tmp) = &vocoder_tmp {
+                    std::fs::remove_dir_all(tmp).ok();
+                }
+                return Err(e);
+            }
+        };
         let sample_rate = config.sample_rate;
+        if let Some(tmp) = &vocoder_tmp {
+            std::fs::remove_dir_all(tmp).ok();
+        }
 
         let index_path =
             self.resolve_index(&stem, &model_type, src_path, index_file, app_dir, &mut warnings);
@@ -802,13 +907,24 @@ impl ModelRegistry {
         }
     }
 
-    pub fn delete(&self, name: &str) -> Result<()> {
+    /// Delete by name, TYPE-SCOPED when the caller knows it (设计红队 A5: the
+    /// scan order is rvc→sovits→…→nsf_hifigan, so an untyped delete of a
+    /// vocoder named after its singer would remove the SINGER MODEL's files
+    /// instead). `None` keeps the legacy first-match behavior for callers
+    /// that genuinely have no type context.
+    pub fn delete(&self, name: &str, model_type: Option<&ModelType>) -> Result<()> {
         self.ensure_scanned();
         let removed = {
             let mut entries = self.entries.write();
             entries
                 .iter()
-                .position(|e| e.name == name)
+                .position(|e| {
+                    e.name == name
+                        && model_type.map_or(true, |t| {
+                            std::mem::discriminant(&e.model_type)
+                                == std::mem::discriminant(t)
+                        })
+                })
                 .map(|idx| entries.remove(idx))
         };
         if let Some(entry) = removed {
@@ -816,6 +932,85 @@ impl ModelRegistry {
             tracing::info!("Deleted model: {}", name);
         }
         Ok(())
+    }
+}
+
+/// S40 vocoder source validation (设计红队 A6 + 审查 HIGH): parse the SOURCE
+/// sidecar json, reject mini_nsf / missing recipe fields, and locate the mel
+/// filterbank npy — WITHOUT touching the destination. Runs as the import
+/// pre-flight (before the destructive REPLACE) and again inside the copy step.
+/// Returns (sidecar_root, source_npy_path).
+fn read_vocoder_source(src_path: &Path) -> Result<(serde_json::Value, PathBuf)> {
+    let src_json = src_path.with_extension("json");
+    if !src_json.is_file() {
+        return Err(crate::UtaiError::Model(
+            "声码器 .onnx 导入需要配套的 .json 配置文件（与 onnx 同名同目录）——缺少梅尔频谱参数的声码器无法使用"
+                .to_string(),
+        ));
+    }
+    let text = std::fs::read_to_string(&src_json)?;
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| crate::UtaiError::Model(format!("声码器配置 .json 解析失败：{}", e)))?;
+    if root["mini_nsf"].as_bool().unwrap_or(false) {
+        return Err(crate::UtaiError::Model(
+            "暂不支持 PC-NSF（mini_nsf）架构的声码器——目前仅支持经典 NSF-HiFiGAN".to_string(),
+        ));
+    }
+    for key in ["sample_rate", "hop_size", "num_mels", "n_fft", "win_size", "fmin", "fmax"] {
+        if root.get(key).map(|v| v.is_null()).unwrap_or(true) {
+            return Err(crate::UtaiError::Model(format!(
+                "声码器配置缺少字段「{}」——无法确认梅尔频谱格式，拒绝导入",
+                key
+            )));
+        }
+    }
+    // the sidecar's mel_filters name resolves against the SOURCE dir (that is
+    // the field's contract), with the exporter's default naming as fallback
+    let src_dir = src_path.parent().unwrap_or_else(|| Path::new("."));
+    let src_stem = src_path.file_stem().unwrap_or_default().to_string_lossy();
+    let mel_name = root["mel_filters"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}_mel.npy", src_stem));
+    let src_npy = src_dir.join(&mel_name);
+    if !src_npy.is_file() {
+        return Err(crate::UtaiError::Model(format!(
+            "找不到声码器滤波器文件 {}（应与 onnx/json 同目录）——三件套缺一不可",
+            src_npy.display()
+        )));
+    }
+    Ok((root, src_npy))
+}
+
+/// S40 vocoder direct-.onnx import (设计红队 A6): carry the mel filterbank npy
+/// over under OUR stem and rewrite the destination sidecar's `mel_filters`
+/// field to match. Validation lives in read_vocoder_source (also the pre-flight).
+fn import_vocoder_filterbank(src_path: &Path, onnx_path: &Path, stem: &str) -> Result<()> {
+    let (mut root, src_npy) = read_vocoder_source(src_path)?;
+    let dest_name = format!("{}_mel.npy", stem);
+    let dest_npy = onnx_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&dest_name);
+    std::fs::copy(&src_npy, &dest_npy)?;
+    root["mel_filters"] = serde_json::Value::from(dest_name);
+    std::fs::write(
+        onnx_path.with_extension("json"),
+        serde_json::to_string_pretty(&root)?,
+    )?;
+    Ok(())
+}
+
+/// Remove a half-materialized import's files (审查 HIGH): a partial trio left
+/// on disk would resurrect on the next scan() as a selectable ghost entry —
+/// for vocoders that would even bypass the exporter's ORT self-check verdict.
+fn sweep_partial_import(subdir: &Path, stem: &str) {
+    for name in [
+        format!("{}.onnx", stem),
+        format!("{}.json", stem),
+        format!("{}_mel.npy", stem),
+    ] {
+        std::fs::remove_file(subdir.join(name)).ok();
     }
 }
 
@@ -1014,10 +1209,13 @@ fn remove_entry_files(entry: &ModelEntry) {
     // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
     std::fs::remove_file(entry.path.with_extension("f0.onnx")).ok();
     // SoVITS cluster/retrieval asset dir (see resolve_cluster_assets) + the S36
-    // shallow-diffusion attachment dir (see resolve_diffusion_assets).
+    // shallow-diffusion attachment dir (see resolve_diffusion_assets) + the S40
+    // vocoder mel filterbank (`<stem>_mel.npy` — underscore, NOT an extension:
+    // `<stem>.npy` is the RVC index slot).
     if let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem()) {
         std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem.to_string_lossy()))).ok();
         std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem.to_string_lossy()))).ok();
+        std::fs::remove_file(dir.join(format!("{}_mel.npy", stem.to_string_lossy()))).ok();
     }
     if let Some(index) = &entry.index_path {
         std::fs::remove_file(index).ok();
@@ -1138,7 +1336,7 @@ mod tests {
         let reg = ModelRegistry::new(models_dir.clone());
         let outcome = reg
             .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir,
-                Some(&src_index), None, None, Some(&src_avatar))
+                Some(&src_index), None, None, Some(&src_avatar), None)
             .unwrap();
 
         // Every artifact shares the sanitized stem (CJK preserved; nothing to strip here).
@@ -1170,7 +1368,7 @@ mod tests {
 
         // Same-name re-import → REPLACE (single row, stable stem), old index/avatar cleaned up.
         let outcome2 = reg2
-            .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None)
+            .import_file(display_name, &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None, None)
             .unwrap();
         assert_eq!(reg2.list_by_type(&ModelType::Rvc).len(), 1);
         assert_eq!(outcome2.entry.path, outcome.entry.path);
@@ -1179,8 +1377,8 @@ mod tests {
         assert!(!rvc_dir.join(format!("{}.avatar.png", stem)).exists());
 
         // Two DIFFERENT display names sanitizing to the same stem → numbered suffix, no clobber.
-        let a = reg2.import_file("A/B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None).unwrap();
-        let b = reg2.import_file("A\\B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None).unwrap();
+        let a = reg2.import_file("A/B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None, None).unwrap();
+        let b = reg2.import_file("A\\B", &src_onnx, ModelType::Rvc, &app_dir, None, None, None, None, None).unwrap();
         assert_eq!(a.entry.path, rvc_dir.join("AB.onnx"));
         assert_eq!(b.entry.path, rvc_dir.join("AB (2).onnx"));
         assert!(a.entry.path.exists() && b.entry.path.exists());

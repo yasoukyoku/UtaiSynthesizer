@@ -86,6 +86,11 @@ pub struct SovitsOptions {
     pub auto_f0: bool,
     /// See RvcOptions::gpu_extract.
     pub gpu_extract: bool,
+    /// S40 vocoder resource: registry NAME of an installed NSF-HiFiGAN vocoder
+    /// (models/nsf_hifigan/) to use for shallow diffusion + the enhancer.
+    /// None / "" = the aux default vocoder (S36 behavior, byte-identical path).
+    /// An unknown name is a LOUD error, never a silent fallback.
+    pub vocoder_name: Option<String>,
     /// TEST-ONLY (E2E gates): zero every diffusion noise draw (q_sample / initial randn /
     /// naive per-step noise) to mirror the python reference's ZeroNoise monkeypatch.
     /// Deliberately NOT in voiceDefaults.ts — never reachable from the UI.
@@ -111,6 +116,7 @@ impl Default for SovitsOptions {
             enhancer_adaptive_key: 0,
             auto_f0: false,
             gpu_extract: false,
+            vocoder_name: None,
             debug_zero_noise: false,
         }
     }
@@ -313,6 +319,17 @@ impl InferenceManager {
             sample_rate: voice.sample_rate,
             index: voice.index.clone(),
         })
+    }
+
+    /// S40 vocoder resource hygiene (设计红队 A18): a same-name re-import
+    /// REPLACES files on disk while the engine caches sessions BY PATH and
+    /// npy assets by path — evict both BEFORE the file swap so the next run
+    /// cannot serve the old graph/filterbank (a live ORT session would also
+    /// hold a Windows file lock and fail the copy).
+    pub fn unload_model_file(&self, onnx_path: &Path) {
+        self.engine.unload_paths_with_prefix(onnx_path);
+        // blunt like unload_voice below: npy reloads are cheap
+        self.npy_cache.write().clear();
     }
 
     pub fn unload_voice(&self, name: &str) {

@@ -568,6 +568,31 @@
   gap: var(--space-sm);
 }
 
+/* S40 vocoder tab: the zero-knowledge format/usage banner + the
+   format-mismatch chip (loud counterpart of .msst-onnx-ok) */
+.rm-voice-hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  line-height: 1.6;
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  margin: 0 0 var(--space-sm) 0;
+}
+
+.rm-voice-item-warn {
+  color: var(--accent-warning, #c88a2b);
+  border: 1px solid currentColor;
+  padding: 0 4px;
+  font-size: var(--font-size-xs);
+}
+
+/* pinned built-in default-vocoder row: visually a resident, not a user item */
+.rm-voice-item-builtin {
+  background: var(--bg-secondary);
+  border-left: 2px solid var(--accent-primary);
+}
+
 .rm-voice-actions {
   padding: var(--space-md) var(--space-lg);
   border-top: 1px solid var(--border-subtle);

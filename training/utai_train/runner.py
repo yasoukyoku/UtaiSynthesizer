@@ -46,6 +46,10 @@ def main():
             from .sovits import diff_pipeline
 
             diff_pipeline.run(cfg, reporter, stop)
+        elif backend == "vocoder":
+            from .vocoder import pipeline
+
+            pipeline.run(cfg, reporter, stop)
         else:
             raise RuntimeError("未知训练后端: %s" % backend)
     except StopRequested:

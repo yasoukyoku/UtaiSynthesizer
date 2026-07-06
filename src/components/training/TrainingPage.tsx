@@ -34,6 +34,7 @@ const STAGE_ORDERS: Record<string, string[]> = {
   rvc: ["import", "slice", "f0", "feature", "index", "filelist", "train_prep"],
   sovits: ["import", "slice", "filelist", "extract", "index", "train_prep"],
   sovits_diff: ["import", "slice", "filelist", "extract", "diff_prep", "train_prep"],
+  vocoder: ["import", "slice", "process", "filelist", "train_prep"],
 };
 
 function fmtDur(totalSecs: number): string {
@@ -597,6 +598,13 @@ function TargetStep() {
       name: t("training.backendDiff"),
       desc: t("training.backendDiffDesc"),
     },
+    {
+      key: "vocoder",
+      active: config.backend === "vocoder",
+      pick: () => updateConfig({ backend: "vocoder" as const }),
+      name: t("training.backendVocoder"),
+      desc: t("training.backendVocoderDesc"),
+    },
   ];
 
   const diffHint =
@@ -627,8 +635,6 @@ function TargetStep() {
           </button>
         ))}
       </div>
-      <div className="training-hint">{t("training.comingSoon")}</div>
-
       {isDiffCard ? (
         sovitsModels.length > 0 ? (
           <div className="training-form-row">
@@ -772,6 +778,7 @@ function ParamsStep() {
 
   const sovits = config.backend === "sovits";
   const diff = config.backend === "sovits_diff";
+  const voc = config.backend === "vocoder";
 
   const gpuRow = gpus.length > 0 && !config.forceCpu && (
     <div className="training-form-row">
@@ -854,6 +861,47 @@ function ParamsStep() {
           {config.diffVersion === "4.0" && (
             <div className="training-hint">{t("training.diffNoBase40")}</div>
           )}
+        </>
+      ) : voc ? (
+        <>
+          <div className="training-form-grid">
+            <div className="training-form-row">
+              <label>{t("training.vocScope")}</label>
+              {/* 一期单格式类 — an informational row, not a choice (不能选隐藏) */}
+              <span className="training-fixed-value">{t("training.vocScopeValue")}</span>
+            </div>
+            <div className="training-form-row">
+              <label title={t("training.vocTotalStepsTip")}>{t("training.totalSteps")}</label>
+              <NumberField
+                min={100}
+                max={100000}
+                step={100}
+                value={config.vocTotalSteps}
+                onChange={(v) => updateConfig({ vocTotalSteps: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label title={t("training.vocBatchTip")}>{t("training.batchSize")}</label>
+              <NumberField
+                min={1}
+                max={64}
+                value={config.vocBatchSize}
+                onChange={(v) => updateConfig({ vocBatchSize: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.saveEverySteps")}</label>
+              <NumberField
+                min={50}
+                max={10000}
+                step={50}
+                value={config.vocSaveEverySteps}
+                onChange={(v) => updateConfig({ vocSaveEverySteps: v })}
+              />
+            </div>
+            {gpuRow}
+          </div>
+          <div className="training-hint">{t("training.vocLicenseNote")}</div>
         </>
       ) : !sovits ? (
         <div className="training-form-grid">
@@ -946,9 +994,11 @@ function ParamsStep() {
       <div className="training-fixed-note">
         {diff
           ? t("training.diffFixedNote")
-          : sovits
-            ? t("training.sovitsFixedNote")
-            : t("training.fixedNote")}
+          : voc
+            ? t("training.vocFixedNote")
+            : sovits
+              ? t("training.sovitsFixedNote")
+              : t("training.fixedNote")}
       </div>
 
       <button
@@ -985,6 +1035,37 @@ function ParamsStep() {
                 onChange={(e) => updateConfig({ diffCacheAllData: e.target.checked })}
               />
               {t("training.cacheAllData")}
+            </label>
+            {forceCpuRow}
+          </div>
+        ) : voc ? (
+          <div className="training-form-grid">
+            <div className="training-form-row">
+              <label title={t("training.vocCropTip")}>{t("training.vocCrop")}</label>
+              <NumberField
+                min={16}
+                max={128}
+                step={8}
+                value={config.vocCropMelFrames}
+                onChange={(v) => updateConfig({ vocCropMelFrames: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.keepCkpts")}</label>
+              <NumberField
+                min={1}
+                max={50}
+                value={config.vocKeepCkpts}
+                onChange={(v) => updateConfig({ vocKeepCkpts: v })}
+              />
+            </div>
+            <label className="training-check-row" title={t("training.vocFreezeMpdTip")}>
+              <input
+                type="checkbox"
+                checked={config.vocFreezeMpd}
+                onChange={(e) => updateConfig({ vocFreezeMpd: e.target.checked })}
+              />
+              {t("training.vocFreezeMpd")}
             </label>
             {forceCpuRow}
           </div>
@@ -1114,6 +1195,9 @@ function RunStep() {
   const running = snapshot.state === "starting" || snapshot.state === "running";
   const finished = snapshot.state === "completed" || snapshot.state === "stopped";
   const isDiff = snapshot.backend === "sovits_diff";
+  // vocoder shares the "best = true validation loss" semantics with diff
+  // (labels only; its checkpoints go through importCkpt, not the attach flow)
+  const isVocoderRun = snapshot.backend === "vocoder";
 
   // ---- diffusion attach flow (S39): a trained diffusion ckpt is not a
   // standalone model — it converts into `<stem>.diffusion/` of an INSTALLED
@@ -1121,6 +1205,7 @@ function RunStep() {
   // installed-model version check in onStart ----
   const sovitsModels = useVoiceModelStore((s) => s.models.sovits);
   const rvcModels = useVoiceModelStore((s) => s.models.rvc);
+  const vocoderModels = useVoiceModelStore((s) => s.models.vocoder);
   const [attachTarget, setAttachTarget] = useState("");
   const [attaching, setAttaching] = useState<string | null>(null);
   const summaryDim = (snapshot.summary as { encoder_dim?: number } | null)?.encoder_dim;
@@ -1265,7 +1350,15 @@ function RunStep() {
       }
     }
 
-    const selectedVersion = config.backend === "rvc" ? config.version : config.sovitsVersion;
+    // vocoder's "version" is the fixed manifest marker — hitting the sovits
+    // fallback here would compare "nsf_hifigan" vs "4.1" and lock every
+    // vocoder workspace into the retrain-only mismatch dialog (红队 A16)
+    const selectedVersion =
+      config.backend === "rvc"
+        ? config.version
+        : config.backend === "vocoder"
+          ? "nsf_hifigan"
+          : config.sovitsVersion;
     const selectedSr = config.backend === "rvc" ? config.sampleRate : "44k";
     // the wipe would also destroy any diffusion training progress living in
     // this workspace — the user must see that before choosing 重训
@@ -1314,9 +1407,13 @@ function RunStep() {
       // installed model, NO workspace: there is nothing to resume —「续训」
       // would silently train from scratch; say what actually happens (and
       // call out a version mismatch when the registry knows the version)
-      const installed = (config.backend === "rvc" ? rvcModels : sovitsModels).find(
-        (m) => m.name === name,
-      );
+      const installed = (
+        config.backend === "rvc"
+          ? rvcModels
+          : config.backend === "vocoder"
+            ? vocoderModels
+            : sovitsModels
+      ).find((m) => m.name === name);
       const installedVersion = installed ? voiceVersionBadge(installed) : null;
       const mismatch = installedVersion && installedVersion !== selectedVersion;
       const choice = await showConfirm({
@@ -1390,14 +1487,15 @@ function RunStep() {
   };
 
   const importCkpt = async (ckpt: CkptInfo) => {
-    // sovits periodics are step-cadenced (several per epoch) — an epoch-keyed
-    // suggestion would collide and silently replace the previous import
+    // sovits/vocoder periodics are step-cadenced (several per epoch) — an
+    // epoch-keyed suggestion would collide and silently replace the previous
+    // import (rvc keeps its historical epoch tag)
     const tag =
       ckpt.kind === "best"
         ? "best"
-        : snapshot.backend === "sovits"
-          ? `s${ckpt.step}`
-          : `e${ckpt.epoch}`;
+        : snapshot.backend === "rvc"
+          ? `e${ckpt.epoch}`
+          : `s${ckpt.step}`;
     const suggested =
       ckpt.kind === "final" ? snapshot.model_name : `${snapshot.model_name}_${tag}`;
     const name = await showConfirm({
@@ -1418,7 +1516,9 @@ function RunStep() {
     // historical total_fea.npy; sovits probes the workspace cluster assets
     // (built before training, so they exist even for early stops)
     let indexPath = summaryIndex;
-    if (!indexPath) {
+    if (!indexPath && snapshot.backend !== "vocoder") {
+      // vocoders have no index/cluster companion — probing would only find
+      // another backend's leftovers (红队 A16 fallback-site sweep)
       if (snapshot.backend === "rvc") {
         indexPath = `${snapshot.workspace}\\total_fea.npy`;
       } else {
@@ -1456,6 +1556,11 @@ function RunStep() {
             <>
               {config.modelName || "—"} · RVC {config.version} · {config.sampleRate} ·{" "}
               {t("training.totalEpoch")} {config.totalEpoch} · batch {config.batchSize}
+            </>
+          ) : config.backend === "vocoder" ? (
+            <>
+              {config.modelName || "—"} · {t("training.backendVocoder")} · 44.1k ·{" "}
+              {t("training.totalSteps")} {config.vocTotalSteps} · batch {config.vocBatchSize}
             </>
           ) : config.backend === "sovits_diff" ? (
             <>
@@ -1539,7 +1644,7 @@ function RunStep() {
               </span>
             )}
             <span>
-              {isDiff ? t("training.bestVal") : t("training.best")}:{" "}
+              {isDiff || isVocoderRun ? t("training.bestVal") : t("training.best")}:{" "}
               {bestCkpt
                 ? `${bestCkpt.metric?.toFixed(3) ?? "?"} @ ${bestCkpt.step}`
                 : t("training.bestNone")}
@@ -1589,7 +1694,7 @@ function RunStep() {
             </span>
             {bestCkpt && (
               <span>
-                {isDiff ? t("training.sumBestVal") : t("training.sumBest")}:{" "}
+                {isDiff || isVocoderRun ? t("training.sumBestVal") : t("training.sumBest")}:{" "}
                 {bestCkpt.metric?.toFixed(3)} @ {bestCkpt.step}
               </span>
             )}
