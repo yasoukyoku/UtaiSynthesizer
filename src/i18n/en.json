@@ -178,6 +178,7 @@
     "start": "Start training",
     "clearResult": "Clear results",
     "clearResultTip": "Clears only the last run's results and curve shown on this page; the workspace and checkpoints are kept, resuming is unaffected",
+    "clearResultConfirmBody": "Clear this page's training results and curve? Workspace and checkpoint files are kept and resuming is unaffected, but this list (with each checkpoint's import/attach buttons) will no longer be shown.",
     "started": "Training started",
     "stop": "Stop training",
     "stopping": "Stopping… (saving after the current step)",

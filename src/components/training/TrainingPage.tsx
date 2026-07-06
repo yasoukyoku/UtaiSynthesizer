@@ -1343,6 +1343,23 @@ function RunStep() {
     await stop();
   };
 
+  // confirm before clearing: the ckpt list (with its import/attach buttons)
+  // is the LAST surface for this run's artifacts — a confirmed clear means
+  // the user is done with them, which is why there is deliberately no
+  // "re-attach later" entry elsewhere (user decision 2026-07-06)
+  const onClearResult = async () => {
+    const choice = await showConfirm({
+      title: t("training.clearResult"),
+      body: t("training.clearResultConfirmBody"),
+      buttons: [
+        { id: "clear", label: t("training.clearResult"), kind: "primary" },
+        { id: "cancel", label: t("training.cancel") },
+      ],
+    });
+    if (choice !== "clear") return;
+    await resetRun();
+  };
+
   const onForceStop = async () => {
     const choice = await showConfirm({
       title: t("training.forceStopConfirmTitle"),
@@ -1661,7 +1678,7 @@ function RunStep() {
             className="training-btn"
             disabled={starting}
             title={t("training.clearResultTip")}
-            onClick={() => void resetRun()}
+            onClick={() => void onClearResult()}
           >
             {t("training.clearResult")}
           </button>
