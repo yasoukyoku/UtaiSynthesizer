@@ -51,6 +51,20 @@ export interface StepPoint {
   losses: Record<string, number>;
 }
 
+/** Mirror of Rust `training::WorkspaceInfo` (get_training_workspace_info). */
+export interface WorkspaceInfo {
+  exists: boolean;
+  /** manifest family ("rvc"/"sovits"); "" when absent */
+  family: string;
+  /** manifest version ("v1"/"v2"/"4.1"/"4.0"); "" when absent */
+  version: string;
+  /** manifest sample rate ("32k"/"40k"/"48k"/"44k"); "" when absent */
+  sample_rate: string;
+  has_main_progress: boolean;
+  /** max diffusion checkpoint step; 0 = none/base only */
+  diff_steps: number;
+}
+
 export interface TrainingSnapshot {
   state: "idle" | "starting" | "running" | "completed" | "stopped" | "error";
   error?: string | null;
@@ -70,7 +84,7 @@ export interface TrainingSnapshot {
 
 export interface TrainingFormConfig {
   modelName: string;
-  backend: "rvc" | "sovits";
+  backend: "rvc" | "sovits" | "sovits_diff";
   version: "v1" | "v2";
   sampleRate: "32k" | "40k" | "48k";
   totalEpoch: number;
@@ -99,6 +113,22 @@ export interface TrainingFormConfig {
   /** kmeans cluster centers instead of the retrieval matrix */
   sovitsKmeans: boolean;
   sovitsAllInMem: boolean;
+  // ---- 浅扩散 sovits_diff (separate fields — card switches must not clobber;
+  // no loudnorm/vol_embedding here: a diff run INHERITS them from the
+  // workspace manifest, flipping them would wipe the shared caches) ----
+  diffVersion: "4.1" | "4.0";
+  /** completion target in global steps (diffusion progress is step-based) */
+  diffTotalSteps: number;
+  diffBatchSize: number;
+  /** save + validation cadence in steps (upstream interval_val) */
+  diffSaveEverySteps: number;
+  /** milestone keep cadence; Rust normalizes to a multiple of diffSaveEverySteps */
+  diffForceSaveSteps: number;
+  /** 0 = full diffusion (train all 1000 t) — most capable; 100/200/300 = shallow-only */
+  diffKStepMax: number;
+  /** amp fp16 (upstream amp_dtype; default fp32) */
+  diffFp16: boolean;
+  diffCacheAllData: boolean;
 }
 
 const IDLE_SNAPSHOT: TrainingSnapshot = {
@@ -138,6 +168,14 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   sovitsLoudnorm: false,
   sovitsKmeans: false,
   sovitsAllInMem: false,
+  diffVersion: "4.1",
+  diffTotalSteps: 100000,
+  diffBatchSize: 48,
+  diffSaveEverySteps: 2000,
+  diffForceSaveSteps: 10000,
+  diffKStepMax: 0,
+  diffFp16: false,
+  diffCacheAllData: true,
 };
 
 /** Client-side mirror of the Rust history cap: thin to half when exceeded. */
@@ -247,7 +285,23 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               cache_gpu: config.cacheGpu,
               fp16: config.fp16,
             }
-          : {
+          : config.backend === "sovits_diff"
+            ? {
+                ...base,
+                version: config.diffVersion,
+                sample_rate: "44k",
+                // sentinel: diffusion progress is step-based; the UI hides
+                // epoch displays when total_epochs is 0
+                total_epoch: 0,
+                batch_size: config.diffBatchSize,
+                save_every_steps: config.diffSaveEverySteps,
+                total_steps: config.diffTotalSteps,
+                k_step_max: config.diffKStepMax,
+                interval_force_save: config.diffForceSaveSteps,
+                cache_all_data: config.diffCacheAllData,
+                fp16: config.diffFp16,
+              }
+            : {
               ...base,
               version: config.sovitsVersion,
               sample_rate: "44k",

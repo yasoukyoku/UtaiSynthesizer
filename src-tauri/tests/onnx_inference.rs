@@ -22,6 +22,11 @@ fn app_root() -> PathBuf {
 /// invisible modal DLL dialog (S32 found this exact landmine via a full `cargo test`).
 fn init_ort() {
     utai_lib::suppress_windows_dll_error_dialogs();
+    // PATH must carry runtime/cuda BEFORE ORT builds a CUDA session: the cudnn 9
+    // shim resolves its sub-DLLs via PATH at graph-build time — without this the
+    // first Conv dies with CUDNN_BACKEND_API_FAILED (bare-harness-only failure
+    // that reads like an environment drift; the app does this in run()).
+    utai_lib::setup_cuda_dll_paths(&app_root());
     utai_lib::init_ort_runtime(&app_root());
 }
 

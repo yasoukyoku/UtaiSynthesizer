@@ -538,13 +538,37 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   {ver && <span className="ver-badge">{ver}</span>}
                   {m.format === "Onnx" ? <span className="msst-onnx-ok">ONNX</span> : <span>{m.format}</span>}
                   {m.index_path && (
-                    <span className="msst-onnx-ok" title={t18({ zh: "已附带检索/聚类文件", en: "Index/cluster asset present", ja: "インデックス/クラスタあり" }, lang)}>
-                      {voiceType === "rvc" ? "IDX" : t18({ zh: "聚类", en: "CLUSTER", ja: "クラスタ" }, lang)}
+                    // SoVITS carries ONE of two mutually exclusive asset kinds
+                    // (inference prefers retrieval): `*.index_vectors.npy` =
+                    // the retrieval matrix (training default), anything else
+                    // in `.cluster/` = kmeans centers — labelling both 聚类
+                    // told users their non-kmeans runs produced kmeans
+                    <span
+                      className="msst-onnx-ok"
+                      title={t18(
+                        voiceType === "rvc"
+                          ? { zh: "已附带检索索引", en: "Retrieval index present", ja: "検索インデックスあり" }
+                          : m.index_path.endsWith(".index_vectors.npy")
+                            ? { zh: "已附带检索特征库", en: "Retrieval feature bank present", ja: "検索特徴バンクあり" }
+                            : { zh: "已附带聚类中心 (kmeans)", en: "Kmeans cluster centers present", ja: "クラスタ中心 (kmeans) あり" },
+                        lang,
+                      )}
+                    >
+                      {voiceType === "rvc"
+                        ? "IDX"
+                        : m.index_path.endsWith(".index_vectors.npy")
+                          ? t18({ zh: "检索", en: "RETR", ja: "検索" }, lang)
+                          : t18({ zh: "聚类", en: "KMEANS", ja: "クラスタ" }, lang)}
                     </span>
                   )}
+                  {/* companion-asset badges — the label matches the inference
+                      node's badge verbatim so users can pattern-match across
+                      the two surfaces; the future vocoder attachment
+                      (`<stem>.vocoder/`, ①b 声码器微调) adds its "VOC" chip
+                      right here + in VoiceModelPicker */}
                   {m.diffusion_path && (
                     <span className="msst-onnx-ok" title={t18(VOICE_STRINGS.diffBadgeTip, lang)}>
-                      {t18({ zh: "扩散", en: "DIFF", ja: "拡散" }, lang)}
+                      DIFF
                     </span>
                   )}
                   <span>{formatSampleRateKhz(m.sample_rate)}</span>

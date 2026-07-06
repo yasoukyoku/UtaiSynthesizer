@@ -15,8 +15,14 @@ import {
   setupTrainingListeners,
   useTrainingStore,
   type CkptInfo,
+  type WorkspaceInfo,
 } from "../../store/training";
-import { useVoiceModelStore } from "../../store/voice-models";
+import {
+  useVoiceModelStore,
+  voiceFeatureDim,
+  voiceVersionBadge,
+  type VoiceModelEntry,
+} from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { Dropdown } from "../common/Dropdown";
 import { LossChart, type LossChartHandle } from "./LossChart";
@@ -27,6 +33,7 @@ import "./TrainingPage.css";
 const STAGE_ORDERS: Record<string, string[]> = {
   rvc: ["import", "slice", "f0", "feature", "index", "filelist", "train_prep"],
   sovits: ["import", "slice", "filelist", "extract", "index", "train_prep"],
+  sovits_diff: ["import", "slice", "filelist", "extract", "diff_prep", "train_prep"],
 };
 
 function fmtDur(totalSecs: number): string {
@@ -472,26 +479,93 @@ function TargetStep() {
   const { t } = useTranslation();
   const { config, updateConfig, setWizard } = useTrainingStore();
   const [exists, setExists] = useState(false);
+  const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
+  // the diffusion companion is BOUND to a SoVITS model — the diff card picks
+  // one from the installed registry instead of free-typing a name (its
+  // version/dim derive from the pick; a same-named training workspace reuses
+  // its preprocessing caches)
+  const sovitsModels = useVoiceModelStore((s) => s.models.sovits);
+  useEffect(() => {
+    void useVoiceModelStore.getState().fetchModels();
+  }, []);
+  const isDiffCard = config.backend === "sovits_diff";
+  const diffModelPicked =
+    isDiffCard && sovitsModels.some((m) => m.name === config.modelName);
+
+  const pickDiffModel = (name: string) => {
+    const m = sovitsModels.find((x) => x.name === name);
+    if (!m) return;
+    updateConfig({
+      modelName: m.name,
+      diffVersion: voiceFeatureDim(m) === 256 ? ("4.0" as const) : ("4.1" as const),
+    });
+    void checkName(m.name);
+  };
+
+  // keep the derived version in lock-step with the picked model on EVERY path
+  // (card switch with a pre-filled matching name, registry refresh, dropdown)
+  useEffect(() => {
+    if (!isDiffCard) return;
+    const m = sovitsModels.find((x) => x.name === config.modelName);
+    if (!m) return;
+    const v = voiceFeatureDim(m) === 256 ? ("4.0" as const) : ("4.1" as const);
+    if (v !== config.diffVersion) updateConfig({ diffVersion: v });
+  }, [isDiffCard, config.modelName, config.diffVersion, sovitsModels, updateConfig]);
+  // the name the current hints were computed FOR — typing a different name
+  // must hide them instead of showing stale facts until blur (review F19)
+  const [checkedName, setCheckedName] = useState("");
   // card switches re-check with the new backend — a slower older invoke must
   // not overwrite the newer answer
   const checkSeq = useRef(0);
+
+  // re-check on mount: the page may be reopened with a name already filled in
+  useEffect(() => {
+    void checkName(config.modelName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const checkName = async (name: string) => {
     const mySeq = ++checkSeq.current;
     if (!name.trim()) {
       setExists(false);
+      setWsInfo(null);
+      setCheckedName("");
+      return;
+    }
+    const backend = useTrainingStore.getState().config.backend;
+    if (backend === "sovits_diff") {
+      // the diff card's same-name semantics are INVERTED: a same-named sovits
+      // workspace is the good case (its preprocessing caches get reused) —
+      // check_model_exists doesn't apply (the product is an attachment)
+      let info: WorkspaceInfo | null = null;
+      try {
+        info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
+          name: name.trim(),
+        });
+      } catch {
+        info = null;
+      }
+      if (mySeq === checkSeq.current) {
+        setWsInfo(info);
+        setExists(false);
+        setCheckedName(name.trim());
+      }
       return;
     }
     let found = false;
     try {
       found = await invoke<boolean>("check_model_exists", {
         name: name.trim(),
-        modelType: useTrainingStore.getState().config.backend,
+        modelType: backend,
       });
     } catch {
       found = false;
     }
-    if (mySeq === checkSeq.current) setExists(found);
+    if (mySeq === checkSeq.current) {
+      setExists(found);
+      setWsInfo(null);
+      setCheckedName(name.trim());
+    }
   };
 
   const cards = [
@@ -516,7 +590,25 @@ function TargetStep() {
       name: t("training.backendSovits40"),
       desc: t("training.backendSovits40Desc"),
     },
+    {
+      key: "sovits_diff",
+      active: config.backend === "sovits_diff",
+      pick: () => updateConfig({ backend: "sovits_diff" as const }),
+      name: t("training.backendDiff"),
+      desc: t("training.backendDiffDesc"),
+    },
   ];
+
+  const diffHint =
+    config.backend === "sovits_diff" &&
+    wsInfo?.exists &&
+    checkedName === config.modelName.trim()
+      ? wsInfo.family && wsInfo.family !== "sovits"
+        ? { kind: "warn" as const, text: t("training.diffWorkspaceForeign", { family: wsInfo.family }) }
+        : wsInfo.diff_steps > 0
+          ? { kind: "info" as const, text: t("training.diffWorkspaceProgress", { steps: wsInfo.diff_steps }) }
+          : { kind: "info" as const, text: t("training.diffWorkspaceReuse") }
+      : null;
 
   return (
     <div className="training-target-step">
@@ -537,22 +629,47 @@ function TargetStep() {
       </div>
       <div className="training-hint">{t("training.comingSoon")}</div>
 
-      <div className="training-form-row">
-        <label>{t("training.modelName")}</label>
-        <input
-          type="text"
-          value={config.modelName}
-          placeholder={t("training.modelNamePlaceholder")}
-          onChange={(e) => updateConfig({ modelName: e.target.value })}
-          onBlur={(e) => void checkName(e.target.value)}
-        />
-      </div>
-      {exists && <div className="training-name-exists">{t("training.nameExists")}</div>}
+      {isDiffCard ? (
+        sovitsModels.length > 0 ? (
+          <div className="training-form-row">
+            <label>{t("training.diffPickModel")}</label>
+            <Dropdown
+              value={diffModelPicked ? config.modelName : ""}
+              options={sovitsModels.map((m) => ({
+                value: m.name,
+                label: `${m.name} · ${voiceFeatureDim(m) === 256 ? "4.0" : "4.1"}`,
+              }))}
+              onChange={(v) => pickDiffModel(v)}
+            />
+          </div>
+        ) : (
+          <div className="training-name-exists">{t("training.diffNoModels")}</div>
+        )
+      ) : (
+        <div className="training-form-row">
+          <label>{t("training.modelName")}</label>
+          <input
+            type="text"
+            value={config.modelName}
+            placeholder={t("training.modelNamePlaceholder")}
+            onChange={(e) => updateConfig({ modelName: e.target.value })}
+            onBlur={(e) => void checkName(e.target.value)}
+          />
+        </div>
+      )}
+      {exists && !isDiffCard && (
+        <div className="training-name-exists">{t("training.nameExists")}</div>
+      )}
+      {diffHint && (
+        <div className={diffHint.kind === "warn" ? "training-name-exists" : "training-hint"}>
+          {diffHint.text}
+        </div>
+      )}
 
       <div className="training-step-nav">
         <button
           className="training-btn primary"
-          disabled={!config.modelName.trim()}
+          disabled={!config.modelName.trim() || (isDiffCard && !diffModelPicked)}
           onClick={() => setWizard(3)}
         >
           {t("training.next")}
@@ -654,6 +771,7 @@ function ParamsStep() {
   }, []);
 
   const sovits = config.backend === "sovits";
+  const diff = config.backend === "sovits_diff";
 
   const gpuRow = gpus.length > 0 && !config.forceCpu && (
     <div className="training-form-row">
@@ -679,7 +797,65 @@ function ParamsStep() {
 
   return (
     <div className="training-params-step">
-      {!sovits ? (
+      {diff ? (
+        <>
+          <div className="training-form-grid">
+            <div className="training-form-row">
+              <label>{t("training.version")}</label>
+              {/* bound to the SoVITS model picked in step 2 — not a choice */}
+              <span className="training-fixed-value">
+                SoVITS {config.diffVersion} · {t("training.versionFollowsModel")}
+              </span>
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.totalSteps")}</label>
+              <NumberField
+                min={1000}
+                max={1000000}
+                step={1000}
+                value={config.diffTotalSteps}
+                onChange={(v) => updateConfig({ diffTotalSteps: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.batchSize")}</label>
+              <NumberField
+                min={1}
+                max={128}
+                value={config.diffBatchSize}
+                onChange={(v) => updateConfig({ diffBatchSize: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.saveEverySteps")}</label>
+              <NumberField
+                min={100}
+                max={20000}
+                step={100}
+                value={config.diffSaveEverySteps}
+                onChange={(v) => updateConfig({ diffSaveEverySteps: v })}
+              />
+            </div>
+            <div className="training-form-row">
+              <label>{t("training.kStepMax")}</label>
+              <Dropdown
+                value={config.diffKStepMax}
+                options={[
+                  { value: 0, label: t("training.kStepFull") },
+                  { value: 100, label: "100" },
+                  { value: 200, label: "200" },
+                  { value: 300, label: "300" },
+                ]}
+                onChange={(v) => updateConfig({ diffKStepMax: v })}
+              />
+            </div>
+            {gpuRow}
+          </div>
+          {config.diffVersion === "4.0" && (
+            <div className="training-hint">{t("training.diffNoBase40")}</div>
+          )}
+        </>
+      ) : !sovits ? (
         <div className="training-form-grid">
           <div className="training-form-row">
             <label>{t("training.version")}</label>
@@ -768,7 +944,11 @@ function ParamsStep() {
       )}
 
       <div className="training-fixed-note">
-        {sovits ? t("training.sovitsFixedNote") : t("training.fixedNote")}
+        {diff
+          ? t("training.diffFixedNote")
+          : sovits
+            ? t("training.sovitsFixedNote")
+            : t("training.fixedNote")}
       </div>
 
       <button
@@ -778,7 +958,37 @@ function ParamsStep() {
         {showAdvanced ? "▼" : "▶"} {t("training.advanced")}
       </button>
       {showAdvanced &&
-        (!sovits ? (
+        (diff ? (
+          <div className="training-form-grid">
+            <div className="training-form-row">
+              <label>{t("training.forceSaveSteps")}</label>
+              <NumberField
+                min={1000}
+                max={200000}
+                step={1000}
+                value={config.diffForceSaveSteps}
+                onChange={(v) => updateConfig({ diffForceSaveSteps: v })}
+              />
+            </div>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.diffFp16}
+                onChange={(e) => updateConfig({ diffFp16: e.target.checked })}
+              />
+              {t("training.fp16")}
+            </label>
+            <label className="training-check-row">
+              <input
+                type="checkbox"
+                checked={config.diffCacheAllData}
+                onChange={(e) => updateConfig({ diffCacheAllData: e.target.checked })}
+              />
+              {t("training.cacheAllData")}
+            </label>
+            {forceCpuRow}
+          </div>
+        ) : !sovits ? (
           <div className="training-form-grid">
             <div className="training-form-row">
               <label>{t("training.saveEvery")}</label>
@@ -902,6 +1112,60 @@ function RunStep() {
   const [, forceTick] = useState(0);
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
+  const finished = snapshot.state === "completed" || snapshot.state === "stopped";
+  const isDiff = snapshot.backend === "sovits_diff";
+
+  // ---- diffusion attach flow (S39): a trained diffusion ckpt is not a
+  // standalone model — it converts into `<stem>.diffusion/` of an INSTALLED
+  // SoVITS model whose ContentVec dim matches; the rvc list feeds the
+  // installed-model version check in onStart ----
+  const sovitsModels = useVoiceModelStore((s) => s.models.sovits);
+  const rvcModels = useVoiceModelStore((s) => s.models.rvc);
+  const [attachTarget, setAttachTarget] = useState("");
+  const [attaching, setAttaching] = useState<string | null>(null);
+  const summaryDim = (snapshot.summary as { encoder_dim?: number } | null)?.encoder_dim;
+  const attachCandidates = isDiff
+    ? sovitsModels.filter((m: VoiceModelEntry) => {
+        if (!summaryDim) return true; // dim unknown (e.g. force-stopped run) — Rust re-validates
+        const dim = voiceFeatureDim(m);
+        return dim === null || dim === summaryDim;
+      })
+    : [];
+
+  useEffect(() => {
+    if (isDiff && finished) void useVoiceModelStore.getState().fetchModels();
+  }, [isDiff, finished]);
+
+  // a NEW run invalidates any previously chosen target — without this reset a
+  // still-valid selection from the last run survives and the default-target
+  // effect below early-returns, silently pointing this run's checkpoints at
+  // the previous run's model (review F16)
+  useEffect(() => {
+    setAttachTarget("");
+  }, [snapshot.model_name, snapshot.workspace]);
+
+  // default the target to the same-named model (the intended pairing)
+  useEffect(() => {
+    if (!isDiff) return;
+    if (attachTarget && attachCandidates.some((m) => m.name === attachTarget)) return;
+    const sameName = attachCandidates.find((m) => m.name === snapshot.model_name);
+    setAttachTarget(sameName?.name ?? attachCandidates[0]?.name ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDiff, sovitsModels, summaryDim, snapshot.model_name]);
+
+  const attachCkpt = async (ckpt: CkptInfo) => {
+    if (!attachTarget || attaching) return;
+    setAttaching(ckpt.path);
+    try {
+      await invoke("attach_diffusion", { name: attachTarget, ckptPath: ckpt.path });
+      await useVoiceModelStore.getState().fetchModels();
+      showToast(t("training.diffAttached", { name: attachTarget }), "success");
+    } catch (e) {
+      showToast(String(e), "error");
+    } finally {
+      setAttaching(null);
+    }
+  };
 
   // elapsed ticker (1 Hz) while running
   useEffect(() => {
@@ -926,29 +1190,118 @@ function RunStep() {
       showToast(t("training.needName"), "error");
       return;
     }
+
+    if (config.backend === "sovits_diff") {
+      // diff semantics: a same-named workspace is the EXPECTED case (cache
+      // reuse); the dialog fires whenever one exists so the user always gets
+      // the 重训-only-diffusion escape hatch (a half-baked diff-first
+      // workspace version-locks the manifest — retrain is the way out)
+      let info: WorkspaceInfo | null = null;
+      try {
+        info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+      } catch {
+        info = null;
+      }
+      if (info?.exists && info.family && info.family !== "sovits") {
+        showToast(t("training.diffWorkspaceForeign", { family: info.family }), "error");
+        return;
+      }
+      let fresh = false;
+      if (info?.exists) {
+        const hasProgress = info.diff_steps > 0;
+        // 重训 only spares the workspace when a main model lives in it — a
+        // diff-only workspace gets fully wiped (that is what unlocks a version
+        // change); the dialog must not promise otherwise (review F17)
+        const wipeNote = info.has_main_progress
+          ? ""
+          : " " + t("training.diffRetrainFullWipeNote");
+        const choice = await showConfirm({
+          title: t("training.diffConfirmTitle"),
+          body:
+            (hasProgress
+              ? t("training.diffConfirmResumeBody", { name, steps: info.diff_steps })
+              : t("training.diffConfirmReuseBody", { name })) + wipeNote,
+          buttons: [
+            {
+              id: "resume",
+              label: hasProgress ? t("training.resume") : t("training.continueTrain"),
+              kind: "primary",
+            },
+            { id: "retrain", label: t("training.retrainDiff"), kind: "danger" },
+            { id: "cancel", label: t("training.cancel") },
+          ],
+        });
+        if (choice !== "resume" && choice !== "retrain") return;
+        fresh = choice === "retrain";
+      }
+      await start(fresh).catch(() => undefined);
+      return;
+    }
+
     let fresh = true;
-    let exists = false;
+    let modelExists = false;
     try {
-      exists = await invoke<boolean>("check_model_exists", {
+      modelExists = await invoke<boolean>("check_model_exists", {
         name,
         modelType: config.backend,
       });
     } catch {
-      exists = false;
+      modelExists = false;
     }
-    // an existing WORKSPACE (checkpoints not yet imported into the registry) must
-    // fire the same confirm — retrain wipes it entirely
-    if (!exists) {
+    let info: WorkspaceInfo | null = null;
+    try {
+      info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+    } catch {
+      info = null;
+    }
+    let wsExists = info?.exists ?? false;
+    if (!info) {
+      // legacy fallback: unknown version → the generic dialog below (whose
+      // 续训 the Rust manifest guard still backstops)
       try {
-        exists = await invoke<boolean>("check_training_workspace", { name });
+        wsExists = await invoke<boolean>("check_training_workspace", { name });
       } catch {
         /* keep false */
       }
     }
-    if (exists) {
+
+    const selectedVersion = config.backend === "rvc" ? config.version : config.sovitsVersion;
+    const selectedSr = config.backend === "rvc" ? config.sampleRate : "44k";
+    // the wipe would also destroy any diffusion training progress living in
+    // this workspace — the user must see that before choosing 重训
+    const diffWarn =
+      info && info.diff_steps > 0
+        ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps })
+        : "";
+
+    if (
+      wsExists &&
+      info &&
+      ((info.version && info.version !== selectedVersion) ||
+        (info.sample_rate && info.sample_rate !== selectedSr))
+    ) {
+      // a version/sample-rate mismatch can NEVER be resumed (the Rust manifest
+      // guard refuses it) — offering 续训 here would be a lie; retrain-only
+      const choice = await showConfirm({
+        title: t("training.versionMismatchTitle"),
+        body:
+          t("training.versionMismatchBody", {
+            name,
+            old: `${info.version}/${info.sample_rate}`,
+            new: `${selectedVersion}/${selectedSr}`,
+          }) + diffWarn,
+        buttons: [
+          { id: "retrain", label: t("training.retrain"), kind: "danger" },
+          { id: "cancel", label: t("training.cancel") },
+        ],
+      });
+      if (choice !== "retrain") return;
+      fresh = true;
+    } else if (wsExists) {
+      // same-version workspace: the classic resume/retrain choice
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
-        body: t("training.confirmExistBody", { name }),
+        body: t("training.confirmExistBody", { name }) + diffWarn,
         buttons: [
           { id: "resume", label: t("training.resume"), kind: "primary" },
           { id: "retrain", label: t("training.retrain"), kind: "danger" },
@@ -957,6 +1310,31 @@ function RunStep() {
       });
       if (choice !== "resume" && choice !== "retrain") return;
       fresh = choice === "retrain";
+    } else if (modelExists) {
+      // installed model, NO workspace: there is nothing to resume —「续训」
+      // would silently train from scratch; say what actually happens (and
+      // call out a version mismatch when the registry knows the version)
+      const installed = (config.backend === "rvc" ? rvcModels : sovitsModels).find(
+        (m) => m.name === name,
+      );
+      const installedVersion = installed ? voiceVersionBadge(installed) : null;
+      const mismatch = installedVersion && installedVersion !== selectedVersion;
+      const choice = await showConfirm({
+        title: t("training.confirmExistTitle"),
+        body: mismatch
+          ? t("training.modelVersionMismatchBody", {
+              name,
+              old: installedVersion,
+              new: selectedVersion,
+            })
+          : t("training.noWorkspaceBody", { name }),
+        buttons: [
+          { id: "go", label: t("training.continueTrain"), kind: "primary" },
+          { id: "cancel", label: t("training.cancel") },
+        ],
+      });
+      if (choice !== "go") return;
+      fresh = true;
     }
     await start(fresh).catch(() => undefined);
   };
@@ -1062,6 +1440,12 @@ function RunStep() {
               {config.modelName || "—"} · RVC {config.version} · {config.sampleRate} ·{" "}
               {t("training.totalEpoch")} {config.totalEpoch} · batch {config.batchSize}
             </>
+          ) : config.backend === "sovits_diff" ? (
+            <>
+              {config.modelName || "—"} · {t("training.backendDiff")} · SoVITS{" "}
+              {config.diffVersion} · {t("training.totalSteps")} {config.diffTotalSteps} ·
+              batch {config.diffBatchSize}
+            </>
           ) : (
             <>
               {config.modelName || "—"} · SoVITS {config.sovitsVersion} · 44.1k ·{" "}
@@ -1122,9 +1506,13 @@ function RunStep() {
             <span>
               {t("training.step")} {snapshot.step?.step ?? 0}/{snapshot.step?.total_steps ?? 0}
             </span>
-            <span>
-              epoch {snapshot.step?.epoch ?? 0}/{snapshot.step?.total_epochs ?? snapshot.total_epochs}
-            </span>
+            {/* diffusion runs are step-based — total_epochs 0 is a sentinel,
+                a meaningless "epoch 3/0" line is hidden (house rule) */}
+            {(snapshot.step?.total_epochs ?? snapshot.total_epochs) > 0 && (
+              <span>
+                epoch {snapshot.step?.epoch ?? 0}/{snapshot.step?.total_epochs ?? snapshot.total_epochs}
+              </span>
+            )}
             <span>
               {t("training.elapsed")} {fmtDur(elapsed)}
             </span>
@@ -1134,7 +1522,7 @@ function RunStep() {
               </span>
             )}
             <span>
-              {t("training.best")}:{" "}
+              {isDiff ? t("training.bestVal") : t("training.best")}:{" "}
               {bestCkpt
                 ? `${bestCkpt.metric?.toFixed(3) ?? "?"} @ ${bestCkpt.step}`
                 : t("training.bestNone")}
@@ -1184,10 +1572,26 @@ function RunStep() {
             </span>
             {bestCkpt && (
               <span>
-                {t("training.sumBest")}: {bestCkpt.metric?.toFixed(3)} @ {bestCkpt.step}
+                {isDiff ? t("training.sumBestVal") : t("training.sumBest")}:{" "}
+                {bestCkpt.metric?.toFixed(3)} @ {bestCkpt.step}
               </span>
             )}
           </div>
+          {/* diffusion products attach to an INSTALLED SoVITS model (dim-matched);
+              no candidates -> hide the buttons, show guidance (house rule) */}
+          {isDiff &&
+            (attachCandidates.length > 0 ? (
+              <div className="training-attach-row">
+                <label>{t("training.attachTarget")}</label>
+                <Dropdown
+                  value={attachTarget}
+                  options={attachCandidates.map((m) => ({ value: m.name, label: m.name }))}
+                  onChange={(v) => setAttachTarget(v)}
+                />
+              </div>
+            ) : (
+              <div className="training-hint">{t("training.noAttachTarget")}</div>
+            ))}
           <div className="training-ckpt-list">
             {snapshot.ckpts.map((c) => (
               <div key={`${c.kind}-${c.step}-${c.path}`} className="training-ckpt-row">
@@ -1198,12 +1602,27 @@ function RunStep() {
                   {c.path.replace(/\\/g, "/").split("/").pop()}
                 </span>
                 <span className="training-ckpt-meta">
-                  e{c.epoch} · s{c.step}
+                  {/* diffusion epochs are sentinel units — steps only */}
+                  {isDiff ? <>s{c.step}</> : <>e{c.epoch} · s{c.step}</>}
                   {c.metric != null && <> · {c.metric.toFixed(3)}</>}
                 </span>
-                <button className="training-btn small" onClick={() => void importCkpt(c)}>
-                  {t("training.import")}
-                </button>
+                {isDiff ? (
+                  attachCandidates.length > 0 && (
+                    <button
+                      className="training-btn small"
+                      disabled={!attachTarget || attaching != null}
+                      onClick={() => void attachCkpt(c)}
+                    >
+                      {attaching === c.path
+                        ? t("training.attaching")
+                        : t("training.attach")}
+                    </button>
+                  )
+                ) : (
+                  <button className="training-btn small" onClick={() => void importCkpt(c)}>
+                    {t("training.import")}
+                  </button>
+                )}
               </div>
             ))}
           </div>

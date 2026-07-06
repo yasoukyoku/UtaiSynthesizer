@@ -115,6 +115,18 @@ export function voiceVersionBadge(m: VoiceModelEntry): string | null {
 }
 
 /**
+ * A model's ContentVec feature dim (speech_encoder wins, features_dim
+ * fallback) — the pairing key for shallow-diffusion companions: the diffusion
+ * card derives its training version from it and the attach flow filters
+ * candidates by it. Null = unknown (let the Rust side validate).
+ */
+export function voiceFeatureDim(m: VoiceModelEntry): number | null {
+  if (m.config?.speech_encoder === "vec768l12") return 768;
+  if (m.config?.speech_encoder === "vec256l9") return 256;
+  return m.config?.features_dim ?? null;
+}
+
+/**
  * Speaker dropdown options — EMPTY unless the model really is multi-speaker, driven by the
  * `speakers` NAME→id map (NOT n_speakers: that's the emb_g embedding-table row count, e.g. 109
  * for a single-speaker RVC voice / 200 for akiko — selecting a phantom id gathers an UNTRAINED

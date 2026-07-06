@@ -75,3 +75,14 @@ pub async fn check_training_workspace(
     let ws = crate::training::workspace_path(&data_root(&state), &name);
     Ok(ws.join("config.json").exists() || ws.join("weights").exists())
 }
+
+/// Structured workspace facts (S39): the main-model retrain dialog must warn
+/// when the wipe would also destroy diffusion training progress, and the
+/// 浅扩散 card phrases its own dialog by resume-vs-cache-reuse.
+#[tauri::command]
+pub async fn get_training_workspace_info(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<crate::training::WorkspaceInfo, String> {
+    Ok(crate::training::workspace_info(&data_root(&state), &name))
+}

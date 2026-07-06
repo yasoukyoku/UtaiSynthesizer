@@ -1,8 +1,9 @@
 # 训练链验证关卡（①b，S37 起）
 
 方法论同 `converter/verify/README.md`：**参照物永远是原版仓库的真实执行，绝不自证**。
-本目录覆盖 RVC 训练链（关卡0/1）与 SoVITS 训练链（gate0_sovits_* / gate1_sovits_*，
-见文末章节）；扩散/声码器各阶段落地时在此追加。
+本目录覆盖 RVC 训练链（关卡0/1）、SoVITS 训练链（gate0_sovits_* / gate1_sovits_*）
+与浅扩散 train_diff 链（gate0_diff_* / gate1_diff_* + regress_extract_sovits，S39，
+见文末章节）；声码器阶段落地时在此追加。
 
 原版参照：`D:\MyDev\RVC\RVC20240604Nvidia`（20240604 NVIDIA 整合包，自带 runtime =
 python3.9 + torch 2.0.0+cu118 + fairseq 0.12.2 + librosa 0.9.1）。
@@ -194,3 +195,97 @@ mel>75/kl>9 显示夹取（TB 记原始值），对拍脚本无 clamp。
   persistent_workers（Windows spawn 每 epoch 重启 worker 之灾）/ 停止旗标逐 step /
   ckpt 原子写 / best=EMA(mel) / 完训补存 latest G/D + release 导出
   （compress_model 语义：去 enc_q + fp16）。
+
+---
+
+# 浅扩散 train_diff 关卡（S39 起，gate0_diff_* / gate1_diff_*）
+
+原版参照：`D:\MyDev\so-vits-svc\so-vits-svc`（4.1-Stable @ 730930d，代码零改动）。
+gate0 原版侧仍 = RVC 整合包 runtime（torch 2.0.0 / torchaudio 2.0.1+cpu /
+librosa 0.9.1）；gate1 双方 = 我们的 venv（torch 2.5.1，隔离代码轴，S37/S38 同款）。
+输入复用 S38 sovits gate 的 33 切片（同 44k wav 喂双方 = C 层；aug 抽样上界依赖
+max|wav|，输入轴会使 aug 产物不可比）。
+
+## gate0_diff —— --use_diff 预处理对拍（vol/mel/aug_mel/aug_vol）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_prepare.py
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_diff_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_diff_compare.py
+```
+
+原版侧 harness（零数值影响，脚本头登记）：预置 soft/f0/spec（skip-if-exists 跳过
+→ 无需 fairseq/GPU）+ 逐文件直调 process_one（绕开 spawn 执行器与 shuffle——
+spawn 子进程不继承种子、shuffle 先消耗随机流）+ random.seed(1234) + sorted 文件序
++ configs 快照/恢复 + CUDA_VISIBLE_DEVICES=-1。我方侧 = extract_all(diff_mode=True,
+aug_seed=1234)（random.Random(1234) 与全局 random.seed(1234) 同 MT19937 流）。
+
+**S39 实测读数（2026-07-06，全 PASS；33 切片）：**
+
+| 项 | 读数 |
+|---|---|
+| .vol.npy | **逐位 0.0** |
+| .mel.npy（torch 2.0↔2.5 轴） | max_abs 9.5e-7 |
+| .aug_mel keyshift（随机流对齐证明） | **33/33 逐 draw 一致** |
+| .aug_mel 响亮位（ln-mel > -10） | max_abs 7.6e-6 |
+| .aug_mel 近 clamp 位 | max_abs 1.1e-4（12/21632 项，全部 ln<-10.1 = S36 记档的近 clamp ln 放大；变调路径非 2 幂 FFT 的 torch 版本轴） |
+| .aug_vol.npy（同响度 shift） | **逐位 0.0** |
+| librosa mel 滤波器组 0.9.1↔0.11 | **逐位一致**（melbasis_091.npy 留档） |
+
+## gate1_diff —— 训练等价（逐 step loss 轨迹 vs 原版 train_diff.py）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_prepare.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_ours.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_compare.py
+```
+
+同 gate0 我方产物 + 同 vec768 底模 + 同 yaml（fp32 CPU / num_workers 0 /
+cache_all_data / batch 4 / interval_val 8 / 3 epochs = 24 步 = 我方 total_steps，
+完成判定与自然结束重合）。原版侧 harness：runpy 原样跑 train_diff.py + 种子 +
+loguru/faiss 桩 + librosa.get_duration(filename=)→path= shim（librosa 0.11 环境轴）。
+**≥2 个 interval_val 边界是硬要求**：第一个边界含 NsfHifiGAN 懒加载 Generator
+构造的 RNG 大块消耗，之后的不含——两段都逐 step 对齐才证明 RNG 消耗模型完整
+（vendored 代码严禁"预热优化"该懒加载）。
+
+**S39 实测读数（全 PASS）：**
+
+| 项 | 读数 |
+|---|---|
+| train/loss（24/24 步） | **max_rel 0.0（逐位一致）** |
+| validation/loss（交集 8/16） | **max_rel 0.0** |
+| validation/loss step 24 | 原版 TB 缓冲丢失（原版不 close SummaryWriter，flush_secs=120）→ 用原版 stdout 3 位小数补核：0.081 vs 0.081112 ✓ |
+
+## regress_extract_sovits —— 共享文件回归（S38 基线）
+
+```
+training\.venv\Scripts\python.exe converter\verify\training\regress_extract_sovits.py
+```
+
+extract.py 是 S38 主链共享文件（本次加 diff_mode 分支 + vol 门扩展）：对同输入
+全新跑非 diff 模式，与 S38 存档产物比对。**S39 读数：132 产物精确相等（.pt 按
+张量精确相等——S38 基线早于原子写修复，zip 档案根名不同属序列化元数据轴；
+.npy 逐字节），非 diff 模式零杂散 diff 产物。**
+
+## 冒烟（runner 直驱，TESTING/smoke_diff4{0,1}*.json）
+
+- run A：共享工作区（S38 smoke_sovits41）30 步完训——soft/f0/spec 缓存 mtime
+  与 S38 时代逐秒一致（增量承诺兑现），val 10/20/30，best/final，encoder_dim=768。
+- run B：续训至 60——首步 31 零跳号；存档清扫后恰保留 0/20/40/60/best（幸存者
+  网格 = 里程碑谓词）。
+- run C：优雅停 @130——stop 存档**含 optimizer**（periodic 不含 = save_opt 拆分
+  偏离），done(stopped)。
+- run D：停后续训至 150——best@110 跨续训保留（diffusion/best_state.json）。
+- 4.0：vec256 无底模从零训 + k_step_max=100（浅扩散 config）完训。
+- 转换链：export_diffusion.py 直接吃 model_150.pt + expdir/config.yaml（自动解析）
+  ——schedule 重算逐位 0、ORT sanity ≤3.1e-6、sidecar speakers = 中文显示名。
+- 三段式：主模型（S38 smoke）在 diff 之后续训 2 epochs 正常（G_91 续、GAN loss
+  健康、diffusion/ 产物无扰）。
+
+### train_diff 复跑注意
+- gate1 prepare 会清双侧 expdir；gate0 prepare 会清 diff_orig/diff_ours。
+- 原版侧 gate0 需要 diff_orig 里已预置 soft/f0/spec（prepare 负责）。
+- Reporter.stage 有 0.4s 节流：一次性通知（如"无扩散底模，将从零训练"）必须
+  force=True，否则会被同窗口的前一条吞掉（S39 冒烟实锤后已修）。

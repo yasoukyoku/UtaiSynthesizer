@@ -74,6 +74,47 @@ pub async fn import_model(
         })
 }
 
+/// Attach a TRAINED shallow-diffusion checkpoint (model_<step>.pt with its
+/// config.yaml auto-resolved next to it) to an installed SoVITS model (S39).
+/// Conversion + validation run into a temp dir BEFORE the model's live
+/// sessions are dropped — a failure leaves an existing attachment untouched
+/// and still loaded; the swap itself is rename-based with rollback.
+#[tauri::command]
+pub async fn attach_diffusion(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    ckpt_path: String,
+    config_path: Option<String>,
+) -> Result<ModelEntry, String> {
+    let cfg = config_path.map(PathBuf::from);
+    let tmp = state
+        .models
+        .prepare_diffusion_attachment(
+            &name,
+            &PathBuf::from(&ckpt_path),
+            cfg.as_deref(),
+            &state.app_dir,
+        )
+        .map_err(|e| {
+            tracing::error!("Diffusion attach (prepare) failed: {}", e);
+            e.to_string()
+        })?;
+    // sessions hold Windows file handles on the OLD attachment — drop them
+    // only now, after everything that can fail has succeeded
+    state.inference.unload_voice(&name);
+    state
+        .models
+        .commit_diffusion_attachment(&name, &tmp)
+        .map_err(|e| {
+            tracing::error!("Diffusion attach (commit) failed: {}", e);
+            e.to_string()
+        })?;
+    state
+        .models
+        .get(&name)
+        .ok_or_else(|| format!("找不到模型「{}」", name))
+}
+
 #[tauri::command]
 pub async fn set_model_avatar(
     state: State<'_, Arc<AppState>>,

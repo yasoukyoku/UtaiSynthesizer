@@ -42,6 +42,10 @@ def main():
             from .sovits import pipeline
 
             pipeline.run(cfg, reporter, stop)
+        elif backend == "sovits_diff":
+            from .sovits import diff_pipeline
+
+            diff_pipeline.run(cfg, reporter, stop)
         else:
             raise RuntimeError("未知训练后端: %s" % backend)
     except StopRequested:

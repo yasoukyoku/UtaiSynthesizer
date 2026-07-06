@@ -15,9 +15,24 @@
 #   - sequential over sorted files instead of shuffle + ProcessPoolExecutor
 #     (per-file products are independent; upstream's spawn workers each loading
 #     an encoder copy is a Windows minefield)
-#   - --use_diff mel/aug_mel products are NOT produced here (the shallow
-#     diffusion trainer is a later backend; its products slot into this same
-#     stage incrementally)
+# --use_diff products (diff_mode=True, the shallow-diffusion trainer), same
+# names/layout as upstream preprocess_hubert_f0.py:84-103:
+#   <wav>.mel.npy      nsf_hifigan-recipe mel [T,128] (Vocoder.extract — the
+#                      diffusion mel, NOT the 80-mel loss recipe / 2048 spec)
+#   <wav>.aug_mel.npy  np object (aug_mel, keyshift): loudness shift
+#                      uniform(-1, min(1, log10(1/max_amp))) + keyshift
+#                      uniform(-5,5) re-extraction
+#   <wav>.aug_vol.npy  Volume_Extractor of the SAME loudness-shifted audio
+#   (and .vol.npy gates on `diff_mode or vol_embedding` — upstream :77)
+# diff deviations (deliberate):
+#   - (aug_mel, aug_vol) are ONE augmentation unit: if EITHER file is missing
+#     BOTH are recomputed from a single fresh draw and rewritten (upstream
+#     draws every run and checks each file independently — a kill between the
+#     two writes would permanently pair a mel with a foreign volume, silently
+#     poisoning the aug branch of every later training run)
+#   - draws come from a per-run seeded random.Random (upstream: unseeded
+#     global random); compute-if-missing instead of upstream's
+#     recompute-but-never-overwrite (their recompute is pure waste)
 import logging
 import os
 import traceback
@@ -41,9 +56,12 @@ def extract_all(
     hps,               # HParams from the workspace config.json
     contentvec_onnx,
     rmvpe_pt,
-    device,            # "cuda" | "cpu" (for the f0 predictor)
+    device,            # "cuda" | "cpu" (for the f0 predictor / mel extractor)
     reporter,
     stop,
+    diff_mode=False,   # also produce the --use_diff products (see header)
+    nsf_hifigan_model=None,  # path to the nsf_hifigan torch ckpt (diff_mode only)
+    aug_seed=1234,     # seed for the augmentation draws (diff_mode only)
 ):
     import onnxruntime as ort
 
@@ -64,6 +82,20 @@ def extract_all(
         model_path=rmvpe_pt,
     )
     volume_extractor = Volume_Extractor(hop_length)
+
+    mel_extractor = None
+    aug_rng = None
+    if diff_mode:
+        if not nsf_hifigan_model:
+            raise RuntimeError("扩散预处理缺少 NSF-HiFiGAN 声码器资产路径")
+        import random
+
+        from .diffusion.vocoder import Vocoder
+
+        # constructed ONCE like upstream's main; extraction device follows the
+        # run device (upstream passes the same device it extracts features on)
+        mel_extractor = Vocoder("nsf-hifigan", nsf_hifigan_model, device=device)
+        aug_rng = random.Random(aug_seed)
 
     filenames = []
     for spk in sorted(os.listdir(dataset_44k_dir)):
@@ -91,6 +123,10 @@ def extract_all(
                 sampling_rate,
                 hps,
                 vol_embedding,
+                diff_mode,
+                mel_extractor,
+                aug_rng,
+                device,
             )
         except Exception:
             logger.error("extract failed for %s\n%s", filename, traceback.format_exc())
@@ -114,7 +150,8 @@ def _atomic_np_save(arr, path):
     os.replace(tmp, path)
 
 
-def _process_one(filename, sess, f0_predictor, volume_extractor, sampling_rate, hps, vol_embedding):
+def _process_one(filename, sess, f0_predictor, volume_extractor, sampling_rate, hps, vol_embedding,
+                 diff_mode=False, mel_extractor=None, aug_rng=None, device="cpu"):
     wav, sr = librosa.load(filename, sr=sampling_rate)
     audio_norm = torch.FloatTensor(wav)
     audio_norm = audio_norm.unsqueeze(0)
@@ -155,8 +192,34 @@ def _process_one(filename, sess, f0_predictor, volume_extractor, sampling_rate, 
         spec = torch.squeeze(spec, 0)
         _atomic_torch_save(spec, spec_path)
 
-    if vol_embedding:
+    # upstream preprocess_hubert_f0.py:77 — .vol.npy gates on `diff or vol_embedding`
+    if diff_mode or vol_embedding:
         volume_path = filename + ".vol.npy"
         if not os.path.exists(volume_path):
             volume = volume_extractor.extract(audio_norm)
             _atomic_np_save(volume.to("cpu").numpy(), volume_path)
+
+    if diff_mode:
+        mel_path = filename + ".mel.npy"
+        if not os.path.exists(mel_path):
+            mel_t = mel_extractor.extract(audio_norm.to(device), sampling_rate)
+            mel = mel_t.squeeze().to("cpu").numpy()
+            _atomic_np_save(mel, mel_path)
+
+        # (aug_mel, aug_vol) = ONE augmentation unit sharing one draw — if
+        # either is missing, recompute BOTH (see file header)
+        aug_mel_path = filename + ".aug_mel.npy"
+        aug_vol_path = filename + ".aug_vol.npy"
+        if not (os.path.exists(aug_mel_path) and os.path.exists(aug_vol_path)):
+            # upstream :92-98 verbatim math, draws in the same order
+            max_amp = float(torch.max(torch.abs(audio_norm))) + 1e-5
+            max_shift = min(1, np.log10(1 / max_amp))
+            log10_vol_shift = aug_rng.uniform(-1, max_shift)
+            keyshift = aug_rng.uniform(-5, 5)
+            aug_mel_t = mel_extractor.extract(
+                audio_norm.to(device) * (10 ** log10_vol_shift), sampling_rate, keyshift=keyshift
+            )
+            aug_mel = aug_mel_t.squeeze().to("cpu").numpy()
+            aug_vol = volume_extractor.extract(audio_norm * (10 ** log10_vol_shift))
+            _atomic_np_save(np.asanyarray((aug_mel, keyshift), dtype=object), aug_mel_path)
+            _atomic_np_save(aug_vol.to("cpu").numpy(), aug_vol_path)

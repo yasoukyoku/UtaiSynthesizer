@@ -16,10 +16,15 @@ export interface LossChartHandle {
   toPngBlob: () => Promise<Blob | null>;
 }
 
-const SERIES: { key: string; varName: string; fallback: string }[] = [
+/** Known loss keys → colors. The rendered series = the subset present in the
+ *  run's history: RVC/SoVITS runs emit mel/g_total/d_total (+more, deliberately
+ *  not charted), the diffusion trainer emits loss (train) + val (validation). */
+const KNOWN_SERIES: { key: string; varName: string; fallback: string }[] = [
   { key: "mel", varName: "--accent-primary", fallback: "#39c5bb" },
   { key: "g_total", varName: "--accent-secondary", fallback: "#8b5cf6" },
   { key: "d_total", varName: "--accent-tertiary", fallback: "#ff6b9d" },
+  { key: "loss", varName: "--accent-primary", fallback: "#39c5bb" },
+  { key: "val", varName: "--accent-secondary", fallback: "#8b5cf6" },
 ];
 
 const PAD_L = 44;
@@ -43,11 +48,20 @@ export const LossChart = forwardRef<
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(600);
-  const [enabled, setEnabled] = useState<Record<string, boolean>>({
-    mel: true,
-    g_total: true,
-    d_total: true,
-  });
+  // per-key visibility; keys absent from the map default to ON (the series
+  // set is history-driven, so a fixed initial map cannot enumerate them)
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
+  const isOn = (key: string) => enabled[key] ?? true;
+
+  // the series present in THIS run's history — FULL scan: the val series only
+  // lands one point per validation interval, so any sampling window slides
+  // past it between validations and the whole curve (+ its legend chip) would
+  // flicker out of existence. O(historyCap) per render is sub-millisecond.
+  const presentKeys = new Set<string>();
+  for (const p of history) {
+    for (const k in p.losses) presentKeys.add(k);
+  }
+  const SERIES = KNOWN_SERIES.filter((s) => presentKeys.has(s.key));
 
   useImperativeHandle(ref, () => ({
     toPngBlob: () =>
@@ -91,7 +105,7 @@ export const LossChart = forwardRef<
 
     const plotW = width - PAD_L - PAD_R;
     const plotH = height - PAD_T - PAD_B;
-    const active = SERIES.filter((s) => enabled[s.key]);
+    const active = SERIES.filter((s) => isOn(s.key));
     const pts = history;
     if (!pts.length || !active.length || plotW < 10) {
       return;
@@ -194,9 +208,9 @@ export const LossChart = forwardRef<
         {SERIES.map((s) => (
           <button
             key={s.key}
-            className={`loss-legend-chip ${enabled[s.key] ? "on" : ""}`}
+            className={`loss-legend-chip ${isOn(s.key) ? "on" : ""}`}
             onClick={() =>
-              setEnabled((e) => ({ ...e, [s.key]: !e[s.key] }))
+              setEnabled((e) => ({ ...e, [s.key]: !(e[s.key] ?? true) }))
             }
           >
             <span

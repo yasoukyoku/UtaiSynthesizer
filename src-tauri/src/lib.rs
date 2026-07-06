@@ -240,7 +240,12 @@ fn read_device_preference(app_dir: &std::path::Path) -> Option<String> {
 }
 
 /// Add CUDA runtime DLL directories to PATH so ORT CUDA EP can find cuDNN/cublas.
-fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
+/// pub because out-of-app harnesses (integration tests) must replicate this too:
+/// the cudnn 9 shim resolves its sub-DLLs (cudnn_graph/engines_*) via PATH at
+/// graph-build time — preload_dylibs alone leaves a bare `cargo test` failing
+/// with CUDNN_BACKEND_API_FAILED at the first Conv (S39: masqueraded as an
+/// environment drift until the app-vs-test PATH difference was isolated).
+pub fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
     #[cfg(windows)]
     {
         let mut dirs_to_add: Vec<std::path::PathBuf> = Vec::new();
@@ -618,11 +623,13 @@ pub fn run() {
             commands::training::get_training_history,
             commands::training::reset_training_display,
             commands::training::check_training_workspace,
+            commands::training::get_training_workspace_info,
             commands::models::list_models,
             commands::models::import_model,
             commands::models::delete_model,
             commands::models::check_model_exists,
             commands::models::set_model_avatar,
+            commands::models::attach_diffusion,
             commands::audio::load_audio_file,
             commands::audio::probe_audio_duration,
             commands::audio::process_effects,

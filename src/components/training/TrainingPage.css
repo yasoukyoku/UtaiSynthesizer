@@ -317,6 +317,8 @@
 /* -------- target step -------- */
 .training-backend-cards {
   display: flex;
+  flex-wrap: wrap; /* 4+ cards (S39 浅扩散, later 声码器) flow onto extra rows
+                      instead of clipping at the panel edge */
   gap: var(--space-lg);
   margin-bottom: var(--space-lg);
 }
@@ -328,6 +330,7 @@
   align-items: flex-start;
   padding: var(--space-xl);
   min-width: 220px;
+  max-width: 320px;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   cursor: pointer;
@@ -729,4 +732,28 @@
   margin-top: var(--space-md);
   color: var(--text-muted);
   font-size: var(--font-size-xs);
+}
+
+/* S39: diffusion attach-target row (finished summary card) */
+.training-attach-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  margin-bottom: var(--space-md);
+  font-size: var(--font-size-sm);
+}
+
+.training-attach-row label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.training-attach-row .ut-dropdown {
+  min-width: 220px;
+}
+
+/* read-only value in a params row (e.g. diff version — bound to the picked model) */
+.training-fixed-value {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
 }

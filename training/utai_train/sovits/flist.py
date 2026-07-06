@@ -35,26 +35,13 @@ def _p(path):
     return path.replace("\\", "/")
 
 
-def build_flist_and_config(
-    exp_dir,
-    spk,               # speaker key in the training config = workspace slug (ASCII)
-    dataset_44k_dir,   # <exp_dir>/dataset_44k
-    encoder,           # "vec768l12" | "vec256l9"
-    vol_embedding,
-    fp16,
-    total_epoch,
-    batch_size,
-    save_every_steps,
-    keep_ckpts,
-    all_in_mem,
-    seed,
-    configs_dir,
-    reporter,
-):
+def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
+    """Slice collection + seeded train/val split + filelist write — the shared
+    half of build_flist_and_config (the diffusion pipeline rebuilds filelists
+    every run but must NOT rewrite an existing main config.json, so this half
+    stands alone). Returns (train_list, val_list, n_train, n_val)."""
     # stage name "filelist" matches the RVC trainer's — the UI label is shared
     reporter.stage("filelist", message="生成训练清单与配置")
-    if encoder not in ENCODER_DIMS:
-        raise RuntimeError("未知语音编码器: %s" % encoder)
 
     spk_dir = os.path.join(dataset_44k_dir, spk)
     wavs = []
@@ -93,6 +80,31 @@ def build_flist_and_config(
         for fname in val:
             f.write(fname + "\n")
     logger.info("filelists written: %d train / %d val", len(train), len(val))
+    return train_list, val_list, len(train), len(val)
+
+
+def build_flist_and_config(
+    exp_dir,
+    spk,               # speaker key in the training config = workspace slug (ASCII)
+    dataset_44k_dir,   # <exp_dir>/dataset_44k
+    encoder,           # "vec768l12" | "vec256l9"
+    vol_embedding,
+    fp16,
+    total_epoch,
+    batch_size,
+    save_every_steps,
+    keep_ckpts,
+    all_in_mem,
+    seed,
+    configs_dir,
+    reporter,
+):
+    if encoder not in ENCODER_DIMS:
+        raise RuntimeError("未知语音编码器: %s" % encoder)
+
+    train_list, val_list, n_train, n_val = build_filelists(
+        exp_dir, spk, dataset_44k_dir, seed, reporter
+    )
 
     with open(
         os.path.join(configs_dir, "config_template.json"), encoding="utf-8"
@@ -122,8 +134,13 @@ def build_flist_and_config(
     config["data"]["training_files"] = _p(train_list)
     config["data"]["validation_files"] = _p(val_list)
 
+    # atomic: the diffusion pipeline trusts an EXISTING config.json (it must
+    # not clobber the main model's train section) — a kill mid-write must not
+    # strand a truncated file for it to trip over
     config_path = os.path.join(exp_dir, "config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
+    tmp = config_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    return len(train), len(val)
+    os.replace(tmp, config_path)
+    return n_train, n_val

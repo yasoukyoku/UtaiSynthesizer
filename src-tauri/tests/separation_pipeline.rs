@@ -19,6 +19,10 @@ fn init_ort() {
         )
         .try_init();
     utai_lib::suppress_windows_dll_error_dialogs();
+    // cudnn 9's shim resolves its sub-DLLs via PATH at graph-build time — the
+    // app sets this up in run(); a bare harness without it fails the first
+    // CUDA Conv with CUDNN_BACKEND_API_FAILED (looks like environment drift).
+    utai_lib::setup_cuda_dll_paths(&app_root());
     utai_lib::init_ort_runtime(&app_root());
 }
 

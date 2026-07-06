@@ -514,11 +514,7 @@ impl ModelRegistry {
         // Cross-check: diffusion encoder dim vs the main model's ContentVec dim
         // (resolved_features_dim = the shared single source; an unknown speech_encoder
         // would already have failed the main import, treat it as unknown here).
-        let sidecar = diffusion_dir.join("diffusion.json");
-        let enc_dim = std::fs::read_to_string(&sidecar)
-            .ok()
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| v.get("encoder_out_channels").and_then(|d| d.as_u64()));
+        let enc_dim = diffusion_sidecar_dim(&diffusion_dir);
         let main_dim = main_config.resolved_features_dim().ok().map(|d| d as u64);
         if let (Some(ed), Some(md)) = (enc_dim, main_dim) {
             if ed != md {
@@ -531,6 +527,106 @@ impl ModelRegistry {
             }
         }
         Some(diffusion_dir)
+    }
+
+    /// S39 attach flow, step 1 — SAFE: the live attachment is untouched.
+    /// Convert the trained diffusion .pt (+ auto-resolved yaml) into a TEMP
+    /// dir next to the target model and cross-check the encoder dim. Any
+    /// failure removes the temp dir and changes nothing else. Returns the
+    /// temp dir for commit_diffusion_attachment.
+    pub fn prepare_diffusion_attachment(
+        &self,
+        name: &str,
+        ckpt: &Path,
+        config: Option<&Path>,
+        app_dir: &Path,
+    ) -> Result<PathBuf> {
+        self.ensure_scanned();
+        // type-filtered lookup: an RVC model may share the display name (the
+        // standard dual-backend workflow) — a name-only get() would hit it and
+        // dead-end the attach (review F11)
+        let entry = self
+            .entries
+            .read()
+            .iter()
+            .find(|e| e.name == name && matches!(e.model_type, ModelType::SoVits))
+            .cloned()
+            .ok_or_else(|| {
+                crate::UtaiError::Model(format!("找不到 SoVITS 模型「{}」", name))
+            })?;
+        if !ckpt.exists() {
+            return Err(crate::UtaiError::Model(format!(
+                "扩散模型文件不存在：{}",
+                ckpt.display()
+            )));
+        }
+        let (subdir, stem) = entry_dir_and_stem(&entry)?;
+        // unique temp dir per invocation: a re-entrant attach (the UI guard is
+        // component-local state and dies on unmount) must not delete a
+        // conversion already in flight. Stale .tmp*/.old* dirs (crashed or
+        // failed attempts, ~hundreds of MB of onnx each) are swept first, but
+        // only when older than an hour — a fresh one may be a live conversion.
+        sweep_stale_attachment_dirs(&subdir, &stem);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp_dir = subdir.join(format!("{}.diffusion.tmp{}", stem, nonce));
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)?;
+        }
+        if let Err(e) = convert::convert_diffusion_assets(ckpt, config, &tmp_dir, app_dir) {
+            std::fs::remove_dir_all(&tmp_dir).ok();
+            return Err(e);
+        }
+        let enc_dim = diffusion_sidecar_dim(&tmp_dir);
+        let main_dim = entry.config.resolved_features_dim().ok().map(|d| d as u64);
+        if let (Some(ed), Some(md)) = (enc_dim, main_dim) {
+            if ed != md {
+                std::fs::remove_dir_all(&tmp_dir).ok();
+                return Err(crate::UtaiError::Model(format!(
+                    "扩散模型的特征维度（{}）与主模型「{}」（{}）不一致——两者无法配合使用",
+                    ed, name, md
+                )));
+            }
+        }
+        Ok(tmp_dir)
+    }
+
+    /// S39 attach flow, step 2 — the caller must have dropped the model's live
+    /// sessions FIRST (they hold Windows file handles on the OLD attachment):
+    /// swap the prepared temp dir into place, rolling back on failure.
+    pub fn commit_diffusion_attachment(&self, name: &str, tmp_dir: &Path) -> Result<PathBuf> {
+        self.ensure_scanned();
+        let mut entries = self.entries.write();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.name == name && matches!(e.model_type, ModelType::SoVits))
+            .ok_or_else(|| crate::UtaiError::Model(format!("找不到模型「{}」", name)))?;
+        let (subdir, stem) = entry_dir_and_stem(entry)?;
+        let final_dir = subdir.join(format!("{}.diffusion", stem));
+        let bak = subdir.join(format!("{}.diffusion.old", stem));
+        if bak.exists() {
+            std::fs::remove_dir_all(&bak)?;
+        }
+        let had_old = final_dir.exists();
+        if had_old {
+            std::fs::rename(&final_dir, &bak)
+                .map_err(|e| crate::UtaiError::Model(format!("移出旧扩散附件失败: {}", e)))?;
+        }
+        if let Err(e) = std::fs::rename(tmp_dir, &final_dir) {
+            if had_old {
+                let _ = std::fs::rename(&bak, &final_dir); // rollback
+            }
+            let _ = std::fs::remove_dir_all(tmp_dir); // no half-attach residue
+            return Err(crate::UtaiError::Model(format!("扩散附件替换失败: {}", e)));
+        }
+        if had_old {
+            let _ = std::fs::remove_dir_all(&bak);
+        }
+        entry.diffusion_path = Some(final_dir.clone());
+        tracing::info!("attached diffusion assets for {}: {}", name, final_dir.display());
+        Ok(final_dir)
     }
 
     pub fn set_avatar(&self, name: &str, avatar_file: &Path) -> Result<Option<PathBuf>> {
@@ -833,6 +929,58 @@ fn try_index_conversion(
             None
         }
     }
+}
+
+/// Remove leftover `<stem>.diffusion.tmp*` / `<stem>.diffusion.old*` dirs
+/// older than an hour (crashed/failed attach attempts). Fresh ones are kept —
+/// they may belong to a conversion still in flight.
+fn sweep_stale_attachment_dirs(subdir: &Path, stem: &str) {
+    let tmp_prefix = format!("{}.diffusion.tmp", stem);
+    let old_prefix = format!("{}.diffusion.old", stem);
+    let Ok(rd) = std::fs::read_dir(subdir) else { return };
+    for e in rd.filter_map(|e| e.ok()) {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if !(n.starts_with(&tmp_prefix) || n.starts_with(&old_prefix)) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age.as_secs() > 3600)
+            .unwrap_or(true);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// `encoder_out_channels` from a `.diffusion/diffusion.json` sidecar — the
+/// dim-compat cross-check input, shared by the import-time attachment
+/// (resolve_diffusion_assets) and the S39 trained-checkpoint attach flow.
+fn diffusion_sidecar_dim(diffusion_dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(diffusion_dir.join("diffusion.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("encoder_out_channels").and_then(|d| d.as_u64()))
+}
+
+/// The directory + file stem a model's companion assets key off
+/// (`<dir>/<stem>.diffusion` etc.).
+fn entry_dir_and_stem(entry: &ModelEntry) -> Result<(PathBuf, String)> {
+    let dir = entry
+        .path
+        .parent()
+        .ok_or_else(|| crate::UtaiError::Model("Model path has no parent dir".to_string()))?
+        .to_path_buf();
+    let stem = entry
+        .path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    Ok((dir, stem))
 }
 
 /// Copy `avatar_src` to `<dir>/<stem>.avatar.<ext>`, clearing any previous `<stem>.avatar.*`

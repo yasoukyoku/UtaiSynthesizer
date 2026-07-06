@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 VERSION_ENCODER = {"4.1": "vec768l12", "4.0": "vec256l9"}
 
 
+def extract_cache_fp_text(dataset_dir, encoder, loudnorm):
+    """THE cache-identity string for the dataset_44k tree — the sovits main
+    pipeline and the diffusion pipeline share the workspace, so both MUST
+    build this string identically or a diff run would silently wipe the main
+    run's feature caches (and vice versa). Single source, do not inline."""
+    return "%s|enc=%s|loudnorm=%d" % (
+        dataset_fingerprint(dataset_dir), encoder, int(loudnorm)
+    )
+
+
 def run(cfg, reporter, stop):
     import torch
 
@@ -63,9 +73,7 @@ def run(cfg, reporter, stop):
     # whole tree when the dataset OR any parameter that changes slice output /
     # feature space changes (loudnorm rewrites every wav; encoder switches the
     # .soft.pt dimension — version is manifest-immutable, belt and suspenders)
-    fp_text = "%s|enc=%s|loudnorm=%d" % (
-        dataset_fingerprint(cfg["dataset_dir"]), encoder, int(loudnorm)
-    )
+    fp_text = extract_cache_fp_text(cfg["dataset_dir"], encoder, loudnorm)
     invalidate_extract_caches(exp_dir, fp_text, ("dataset_44k",))
 
     dataset_44k = os.path.join(exp_dir, "dataset_44k")

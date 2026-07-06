@@ -56,9 +56,11 @@ class Reporter:
         self._last_emit[key] = now
         return False
 
-    def stage(self, stage, done=None, total=None, message=None):
-        # per-item calls inside a stage are throttled; the final item always emits
-        force = done is not None and total is not None and done >= total
+    def stage(self, stage, done=None, total=None, message=None, force=False):
+        # per-item calls inside a stage are throttled; the final item always
+        # emits, and a caller can force (one-shot notices like "training from
+        # scratch" must never be swallowed by the throttle window)
+        force = force or (done is not None and total is not None and done >= total)
         if self._throttled("stage:" + stage, force):
             return
         obj = {"type": "stage", "stage": stage}
