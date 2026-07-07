@@ -1,11 +1,37 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::inference::{rvc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType};
 use crate::models::{ModelConfig, ModelEntry};
 use crate::AppState;
+
+/// S41 audition interlock (审查修复 S41-INT-3): formal voice renders and
+/// audition renders both open by evicting every foreign GPU session and share
+/// the global cancel epoch — running them concurrently is a VRAM tug-of-war
+/// with cross-kill cancels. Both sides reject the other with a friendly error.
+static VOICE_RENDER_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn voice_render_active() -> bool {
+    VOICE_RENDER_ACTIVE.load(Ordering::SeqCst) > 0
+}
+
+struct VoiceRunGuard;
+impl VoiceRunGuard {
+    fn acquire() -> Result<Self, String> {
+        if crate::commands::audition::AUDITION_IN_FLIGHT.load(Ordering::SeqCst) {
+            return Err("试听渲染进行中，请等待完成后再渲染".into());
+        }
+        VOICE_RENDER_ACTIVE.fetch_add(1, Ordering::SeqCst);
+        Ok(VoiceRunGuard)
+    }
+}
+impl Drop for VoiceRunGuard {
+    fn drop(&mut self) {
+        VOICE_RENDER_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Per-node inference progress, emitted as the `voice-progress` event. The frontend workflow
 /// engine listens during the run_rvc/run_sovits invoke and drives the node's progress bar,
@@ -48,19 +74,21 @@ fn progress_emitter(
 
 // ─── aux model resolution (models_dir/aux/...) ───────────────────────────────
 
-const AUX_CONTENTVEC_768: &str = "contentvec_768l12.onnx";
-const AUX_CONTENTVEC_256: &str = "contentvec_256l9.onnx";
-const AUX_RMVPE: &str = "rmvpe_e2e.onnx";
-const AUX_RMVPE_MEL: &str = "rmvpe_mel_filters.npy";
+// pub(crate): the S41 audition commands (commands/audition.rs) resolve the
+// same aux fleet without going through the registry
+pub(crate) const AUX_CONTENTVEC_768: &str = "contentvec_768l12.onnx";
+pub(crate) const AUX_CONTENTVEC_256: &str = "contentvec_256l9.onnx";
+pub(crate) const AUX_RMVPE: &str = "rmvpe_e2e.onnx";
+pub(crate) const AUX_RMVPE_MEL: &str = "rmvpe_mel_filters.npy";
 // S36 quality path: the NSF-HiFiGAN vocoder (shared by shallow diffusion + the enhancer),
 // exported once by converter/export_nsf_hifigan.py alongside its sidecar json + filterbank.
-const AUX_NSF_HIFIGAN: &str = "nsf_hifigan.onnx";
-const AUX_NSF_HIFIGAN_JSON: &str = "nsf_hifigan.json";
-const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
+pub(crate) const AUX_NSF_HIFIGAN: &str = "nsf_hifigan.onnx";
+pub(crate) const AUX_NSF_HIFIGAN_JSON: &str = "nsf_hifigan.json";
+pub(crate) const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
 
 /// models_dir/aux/<filename>, with a clear Chinese error naming the missing file + the
 /// exact directory it must be placed in.
-fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<PathBuf, String> {
+pub(crate) fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<PathBuf, String> {
     let dir = state.models.models_dir().join("aux");
     let path = dir.join(filename);
     if !path.exists() {
@@ -75,7 +103,7 @@ fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<PathBuf, St
 }
 
 /// ContentVec variant routing: vec768l12 → RVC v2 / SoVITS 4.1, vec256l9 → RVC v1 / SoVITS 4.0.
-fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
+pub(crate) fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
     match dim {
         768 => aux_path(state, AUX_CONTENTVEC_768, "内容特征模型"),
         256 => aux_path(state, AUX_CONTENTVEC_256, "内容特征模型"),
@@ -95,7 +123,7 @@ fn features_dim(config: &ModelConfig) -> Result<usize, String> {
 /// inter_channels of the model's noise input, from the sidecar "noise" block when present
 /// (converter writes {"rnd_input"/"noise_input": [1, C, "T"]}); 192 for every standard
 /// RVC v1/v2 and SoVITS 4.x config.
-fn noise_channels(config: &ModelConfig) -> usize {
+pub(crate) fn noise_channels(config: &ModelConfig) -> usize {
     config
         .noise
         .as_ref()
@@ -109,7 +137,7 @@ fn noise_channels(config: &ModelConfig) -> usize {
 
 /// Sidecar "min_frames": the minimum T the exported graph accepts (final contract:
 /// RVC 12 / SoVITS 6). Tolerant field — lives in ModelConfig.extra.
-fn min_frames(config: &ModelConfig, default: usize) -> usize {
+pub(crate) fn min_frames(config: &ModelConfig, default: usize) -> usize {
     config
         .extra
         .get("min_frames")
@@ -135,7 +163,7 @@ fn sidecar_has_input(entry: &ModelEntry, input: &str) -> Option<bool> {
 /// missing input (Some(false), old export WITH an inputs list) and a missing inputs array
 /// (None, pre-rework sidecar that never wrote one) mean the ONNX predates the rework — fail with
 /// an actionable message instead of a cryptic raw ORT "Invalid Feed Input Name" crash.
-fn require_input(entry: &ModelEntry, input: &str) -> Result<(), String> {
+pub(crate) fn require_input(entry: &ModelEntry, input: &str) -> Result<(), String> {
     if sidecar_has_input(entry, input) != Some(true) {
         return Err(format!(
             "模型 '{}' 是旧版导出格式（缺少 {} 输入签名），请删除后重新导入以完成升级",
@@ -145,7 +173,7 @@ fn require_input(entry: &ModelEntry, input: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn get_entry(state: &AppState, voice_name: &str) -> Result<ModelEntry, String> {
+pub(crate) fn get_entry(state: &AppState, voice_name: &str) -> Result<ModelEntry, String> {
     state.models.get(voice_name).ok_or_else(|| {
         format!(
             "未找到模型 '{}'，请先在资源管理器中导入",
@@ -289,7 +317,7 @@ pub fn get_default_vocoder_info(state: State<'_, Arc<AppState>>) -> DefaultVocod
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Result<T, String> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Result<T, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("无法读取{}（{}）：{}", what, path.display(), e))?;
     serde_json::from_str(&content)
@@ -301,12 +329,18 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Resu
 /// model + the run options), and the auto-f0 predictor session. Also enforces the original
 /// mutual exclusions by MUTATING options (enhancer forced off under diffusion — original
 /// infer_tool.py:183-184 behavior, surfaced as a warn instead of silence).
-fn resolve_sovits_quality(
+/// `diffusion_dir_override`: S41 audition ONLY — render through a candidate's
+/// freshly converted `.diffusion` assets in the workspace audition dir instead
+/// of the entry's attached ones. `None` = the S36/S40 behavior, line-for-line
+/// (every production caller passes None; the override changes nothing but
+/// WHERE the diffusion dir is looked up).
+pub(crate) fn resolve_sovits_quality(
     app: &Arc<AppState>,
     entry: &ModelEntry,
     dim: usize,
     hop_size: usize,
     options: &mut SovitsOptions,
+    diffusion_dir_override: Option<&std::path::Path>,
 ) -> Result<
     (
         Option<sovits::DiffusionRuntime>,
@@ -463,12 +497,15 @@ fn resolve_sovits_quality(
 
     // ── diffusion runtime ──
     let diffusion = if diffusion_on {
-        let diff_dir = entry.diffusion_path.clone().ok_or_else(|| {
-            format!(
-                "模型 '{}' 未附带扩散模型——导入时附加扩散 .pt+.yaml 可启用浅扩散",
-                entry.name
-            )
-        })?;
+        let diff_dir = match diffusion_dir_override {
+            Some(dir) => dir.to_path_buf(),
+            None => entry.diffusion_path.clone().ok_or_else(|| {
+                format!(
+                    "模型 '{}' 未附带扩散模型——导入时附加扩散 .pt+.yaml 可启用浅扩散",
+                    entry.name
+                )
+            })?,
+        };
         let sidecar: DiffusionSidecar =
             read_json(&diff_dir.join("diffusion.json"), "扩散模型配置")?;
 
@@ -681,6 +718,7 @@ pub async fn run_rvc(
     options: RvcOptions,
 ) -> Result<SynthesisResult, String> {
     let app = state.inner().clone();
+    let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
     // Arm the cancel epoch BEFORE the multi-second load phase (a cancel during loading
     // must be honored at the first pipeline poll).
     let run_epoch = app.inference.begin_voice_run();
@@ -765,6 +803,7 @@ pub async fn run_sovits(
 ) -> Result<SynthesisResult, String> {
     let mut options = options;
     let app = state.inner().clone();
+    let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
     // See run_rvc: arm the cancel epoch before the load phase.
     let run_epoch = app.inference.begin_voice_run();
     let entry = get_entry(&app, &voice_name)?;
@@ -826,7 +865,7 @@ pub async fn run_sovits(
     // companions first would hand the pipeline session ids that no longer exist
     // ("Session ... not found" on the first piece).
     let (diffusion, vocoder, f0_predictor) =
-        resolve_sovits_quality(&app, &entry, dim, hop_size, &mut options)?;
+        resolve_sovits_quality(&app, &entry, dim, hop_size, &mut options, None)?;
 
     let cv_sid = app
         .inference

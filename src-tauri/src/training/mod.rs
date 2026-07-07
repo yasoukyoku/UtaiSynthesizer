@@ -91,6 +91,12 @@ pub struct StartTrainingRequest {
     /// true = 重训 (wipe the workspace), false = 续训 (resume from latest ckpt)
     #[serde(default)]
     pub fresh: bool,
+    /// S41 PSOLA data augmentation: pitch-shifted copies per slice (0-3, 0 =
+    /// off). Applies to rvc / sovits / vocoder; sovits_diff IGNORES the
+    /// request value and inherits the workspace manifest's (shared dataset_44k
+    /// — same posture as vol_embedding/loudnorm).
+    #[serde(default)]
+    pub aug_copies: u32,
     // ---- SoVITS-only knobs (ignored by the rvc backend) ----
     /// 响度嵌入 (couples train.vol_aug + model.vol_embedding, like upstream --vol_aug)
     #[serde(default)]
@@ -237,6 +243,24 @@ pub struct WorkspaceInfo {
     pub has_main_progress: bool,
     /// max numbered diffusion checkpoint step (model_<n>.pt); 0 = none/base only
     pub diff_steps: u64,
+    /// manifest aug_copies (S41 数据增强份数) — diff runs inherit it from the
+    /// main training; surfaced so the diff params page shows the real value
+    pub aug_copies: u64,
+    /// a reusable shared slice pool exists (prior completed import): diff runs
+    /// may start WITHOUT re-importing data when this is true (S41 共享池模式)
+    pub has_dataset: bool,
+}
+
+/// A reusable shared slice pool: raw dataset files from a prior import plus
+/// the fingerprint marker (written when a run ENTERS preprocessing — partial
+/// caches are fine, the diff pipeline re-runs the shared preprocess chain and
+/// fills whatever is missing; what matters is that dataset/ holds a real
+/// prior import, not that it finished).
+fn has_dataset_pool(ws: &Path) -> bool {
+    ws.join("dataset.fingerprint").is_file()
+        && std::fs::read_dir(ws.join("dataset"))
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
 }
 
 pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
@@ -253,6 +277,8 @@ pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
         sample_rate: field("sample_rate"),
         has_main_progress: has_main_progress(&ws),
         diff_steps: max_diffusion_step(&ws).unwrap_or(0),
+        aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
+        has_dataset: has_dataset_pool(&ws),
     }
 }
 
@@ -505,11 +531,35 @@ impl TrainingManager {
                 )));
             }
         }
+        if req.aug_copies > 3 {
+            return Err(UtaiError::Training(format!(
+                "数据增强份数最多 3（收到 {}）",
+                req.aug_copies
+            )));
+        }
         if req.model_name.trim().is_empty() {
             return Err(UtaiError::Training("模型名不能为空".into()));
         }
         if req.dataset_files.is_empty() {
-            return Err(UtaiError::Training("请先导入训练数据".into()));
+            // 共享池模式（S41 用户裁定）：浅扩散与主训练共享 dataset/dataset_44k
+            // 切片池——宿主工作区已有完整导入时无须重新导入数据。其余后端一律
+            // 拒绝（这是防「空数据逃课」的权威闸门，前端禁用只是第一道线）。
+            let pool_ok = req.backend == "sovits_diff" && {
+                let ws = workspace_path(&data_dir, &req.model_name);
+                let family = std::fs::read_to_string(ws.join("run_manifest.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .map(|m| m["backend"].as_str().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                family == "sovits" && has_dataset_pool(&ws)
+            };
+            if !pool_ok {
+                return Err(UtaiError::Training(if req.backend == "sovits_diff" {
+                    "该模型没有可复用的主训练工作区数据——请先导入训练数据".into()
+                } else {
+                    "请先导入训练数据".to_string()
+                }));
+            }
         }
         for f in &req.dataset_files {
             if !Path::new(f).is_file() {
@@ -531,8 +581,12 @@ impl TrainingManager {
         });
         // rmvpe is TWO different lineages: aux/rmvpe.pt = RVC's raw-state-dict E2E;
         // so-vits vendors the yxlllc/RMVPE fork (E2E0, +unet.tf.* layers, wrapped
-        // as {'model': sd}) — the files are NOT interchangeable
-        let rmvpe_pt = if backend_family(&req.backend) == "sovits" {
+        // as {'model': sd}) — the files are NOT interchangeable.
+        // vocoder also gets the SOVITS lineage: its own f0 products are
+        // parselmouth-blooded and measurably blind to PSOLA glitches, so the
+        // S41 aug quality gate re-analyzes the audio with the sovits RMVPE
+        // (gate_aug_semantic part 4 keeps the blind spot on record)
+        let rmvpe_pt = if backend_family(&req.backend) == "sovits" || req.backend == "vocoder" {
             sovits_train_dir.join("rmvpe.pt")
         } else {
             aux_dir.join("rmvpe.pt")
@@ -632,6 +686,10 @@ impl TrainingManager {
             // (parselmouth is in-process) — requiring these would be a lie
             required.push(("ContentVec 特征提取器", contentvec.clone()));
             required.push(("RMVPE 音高模型 (rmvpe.pt)", rmvpe_pt.clone()));
+        } else if req.aug_copies > 0 {
+            // ...except the S41 aug quality gate, which is rmvpe-blooded by
+            // design (see the lineage comment above) — only when augmenting
+            required.push(("RMVPE 音高模型 (rmvpe.pt，数据增强质检用)", rmvpe_pt.clone()));
         }
         for (label, p) in &required {
             if !p.is_file() {
@@ -855,6 +913,12 @@ impl TrainingManager {
             // from the main model's)
             manifest["loudnorm"] = serde_json::json!(req.loudnorm);
         }
+        if req.backend != "sovits_diff" {
+            // S41: recorded for every non-diff backend; the sovits value is
+            // the diff inheritance source (shared dataset_44k slice pool),
+            // rvc/vocoder entries are informational
+            manifest["aug_copies"] = serde_json::json!(req.aug_copies);
+        }
         if req.backend == "sovits_diff" {
             manifest["diff_k_step_max"] = serde_json::json!(req.k_step_max);
         }
@@ -886,6 +950,15 @@ impl TrainingManager {
             }
         } else {
             req.loudnorm
+        };
+        // pure inheritance, NO rejection branch (loudnorm posture; a missing
+        // key = pre-S41 or diff-first workspace = 0). The diff pipeline runs
+        // the same augment stage with this value so a cache-wipe rebuild
+        // regenerates the aug slices the manifest promises.
+        let eff_aug_copies = if req.backend == "sovits_diff" {
+            manifest["aug_copies"].as_u64().unwrap_or(0) as u32
+        } else {
+            req.aug_copies
         };
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
         // milestone cadence normalized onto the save grid (see field docs)
@@ -926,6 +999,7 @@ impl TrainingManager {
             vol_embedding: eff_vol_embedding,
             loudnorm: eff_loudnorm,
             interval_force_save,
+            aug_copies: eff_aug_copies,
         };
         let inner = Arc::clone(&self.inner);
         let app_dir = self.app_dir.clone();
@@ -1011,6 +1085,8 @@ struct RunCtx {
     loudnorm: bool,
     /// normalized to a multiple of save_every_steps
     interval_force_save: u32,
+    /// S41 effective augmentation copies (manifest-inherited for sovits_diff)
+    aug_copies: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1027,10 +1103,26 @@ fn run_worker(
 ) -> Result<()> {
     // ---- stage: import the dataset into the ASCII workspace ----
     let dataset_dir = workspace.join("dataset");
-    if dataset_dir.exists() {
-        std::fs::remove_dir_all(&dataset_dir)?;
+    if req.dataset_files.is_empty() {
+        // shared-pool reuse (only sovits_diff reaches here — start() validated
+        // the pool): dataset/ and dataset.fingerprint stay UNTOUCHED, so the
+        // python side reads an unchanged dataset and takes the cache-reuse
+        // path — wiping here would destroy the very pool being shared
+        let stage = StageInfo {
+            stage: "import".into(),
+            done: Some(1),
+            total: Some(1),
+            progress: Some(1.0),
+            message: Some("复用共享切片池（未重新导入）".into()),
+        };
+        inner.snapshot.lock().stage = Some(stage.clone());
+        let _ = app.emit("training-stage", &stage);
+    } else {
+        if dataset_dir.exists() {
+            std::fs::remove_dir_all(&dataset_dir)?;
+        }
+        std::fs::create_dir_all(&dataset_dir)?;
     }
-    std::fs::create_dir_all(&dataset_dir)?;
     // deterministic import order: the workspace copies are named 000..N in
     // list order and the extraction-cache fingerprint hashes name+content, so
     // the same SELECTION re-picked in a different dialog order must not read
@@ -1084,6 +1176,9 @@ fn run_worker(
         // loudnorm are the EFFECTIVE values (manifest-inherited for diff runs)
         "vol_embedding": ctx.vol_embedding,
         "loudnorm": ctx.loudnorm,
+        // S41 augmentation copies — the EFFECTIVE value (manifest-inherited
+        // for diff runs); every pipeline reads it uniformly
+        "aug_copies": ctx.aug_copies,
         "kmeans": req.kmeans,
         "save_every_steps": req.save_every_steps,
         "keep_ckpts": req.keep_ckpts,

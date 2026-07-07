@@ -48,11 +48,24 @@ import shutil
 
 import yaml
 
+from ..augment import (
+    augment_slices,
+    is_aug_name,
+    list_aug_entries,
+    read_wav,
+    run_f0_gate,
+)
 from ..cache import invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
-from .flist import ENCODER_DIMS, _wav_duration, build_filelists, build_flist_and_config
-from .pipeline import VERSION_ENCODER, extract_cache_fp_text
+from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists
+from .pipeline import (
+    VERSION_ENCODER,
+    _load_gate_f0,
+    _remove_aug_products,
+    _write_slice_int16,
+    extract_cache_fp_text,
+)
 from .preprocess import slice_and_resample
 from . import utils as sovits_utils
 
@@ -95,6 +108,26 @@ def run(cfg, reporter, stop):
     spk_dir = os.path.join(dataset_44k, slug)
     slice_and_resample(cfg["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop)
 
+    # S41: the diff run runs the SAME augment stage with the manifest-inherited
+    # copies (Rust writes the effective value into run.json) — a cache-wipe
+    # path (dataset change) rebuilds dataset_44k here, and without this the
+    # workspace would claim "augmented" (manifest) while holding zero aug
+    # slices (red-team R2/A5)
+    stop.check()
+    aug_copies = int(cfg.get("aug_copies", 0))
+    meta_dir = os.path.join(exp_dir, "aug_meta")
+    augment_slices(
+        spk_dir,
+        aug_copies,
+        seed,
+        meta_dir,
+        read_wav,
+        _write_slice_int16,
+        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
+        reporter,
+        stop,
+    )
+
     stop.check()
     config_path = os.path.join(exp_dir, "config.json")
     hps_probe = None
@@ -108,27 +141,24 @@ def run(cfg, reporter, stop):
             logger.warning("workspace config.json unreadable — regenerating")
             hps_probe = None
     if hps_probe is not None:
-        # main config present: rebuild filelists only (deterministic — same
-        # slices + same seed give the same split the main run trained on)
         existing_encoder = hps_probe.model.speech_encoder
         if existing_encoder != encoder:
             raise RuntimeError(
                 "工作区主模型的语音编码器 (%s) 与所选版本 %s (%s) 不一致——"
                 "扩散模型必须与主模型同版本" % (existing_encoder, version, encoder)
             )
-        build_filelists(exp_dir, slug, dataset_44k, seed, reporter)
     else:
-        build_flist_and_config(
-            exp_dir, slug, dataset_44k, encoder, vol_embedding,
+        build_config(
+            exp_dir, slug, encoder, vol_embedding,
             _PLACEHOLDER_MAIN["fp16"], _PLACEHOLDER_MAIN["total_epoch"],
             _PLACEHOLDER_MAIN["batch_size"], _PLACEHOLDER_MAIN["save_every_steps"],
             _PLACEHOLDER_MAIN["keep_ckpts"], _PLACEHOLDER_MAIN["all_in_mem"],
-            seed, assets["configs_dir"], reporter,
+            seed, assets["configs_dir"],
         )
 
     stop.check()
     hps = sovits_utils.get_hparams_from_file(config_path)
-    extract_all(
+    failed_aug = extract_all(
         dataset_44k,
         hps,
         assets["contentvec_onnx"],
@@ -140,6 +170,26 @@ def run(cfg, reporter, stop):
         nsf_hifigan_model=assets["nsf_hifigan_model"],
         aug_seed=seed,
     )
+    for filename in failed_aug or ():
+        stem = os.path.basename(filename).split(".")[0]
+        logger.warning("removing aug slice with failed extraction: %s", stem)
+        _remove_aug_products(spk_dir, meta_dir, stem)
+
+    stop.check()
+    run_f0_gate(
+        list_aug_entries(spk_dir, meta_dir),
+        lambda stem: _load_gate_f0(spk_dir, stem),
+        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
+        reporter,
+        stop,
+        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+    )
+
+    # filelists AFTER the gate (they must not reference rejected aug slices);
+    # deterministic — a main-model run rebuilds the identical split from the
+    # same seed (val = originals only, S41 split protocol in flist.py)
+    stop.check()
+    build_filelists(exp_dir, slug, dataset_44k, seed, reporter)
 
     stop.check()
     reporter.stage("diff_prep", message="准备扩散配置与底模")
@@ -257,7 +307,20 @@ def _ensure_long_samples(exp_dir, duration):
             "各需至少 1 个）。请提供更长的连续干声素材" % (need, duration)
         )
     if not val_has_long:
-        promote = train_long[0]
+        # S41 (red-team V20): the promoted slice must not be an aug copy — val
+        # is originals-only by protocol. An aug slice can only be long when its
+        # source is equally long (same duration), so a non-aug candidate
+        # normally exists; the fallback is a belt with a loud log.
+        train_long_orig = [p for p in train_long if not is_aug_name(p)]
+        if train_long_orig:
+            promote = train_long_orig[0]
+        else:
+            promote = train_long[0]
+            logger.warning(
+                "no non-aug long slice available — promoting AUG slice %s into "
+                "val (should be impossible: aug duration == source duration)",
+                os.path.basename(promote),
+            )
         demote = min(val, key=_wav_duration)
         train[train.index(promote)] = demote
         val[val.index(demote)] = promote

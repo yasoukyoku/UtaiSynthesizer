@@ -412,3 +412,63 @@ training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_compar
 11. 上游 spec_to_figure 用 plt.pcolor 在 1025×万列网格逐格画 quad——每次 val 10 张图
    ≈ 用户实测 ~2min 边界停顿的大头；vendored 登记偏离改 pcolormesh
    （openvpi 自家 DiffSinger HEAD commit #302 同款修法），单图 0.20s。
+
+---
+
+# S41：PSOLA 数据增强关卡（2026-07-07）
+
+方法论提醒：增强是我们自己的设计（音频域 PSOLA 变调副本，歌声领域零先例——证据链与
+红队裁决全在 `D:\MyDev\TESTING\utai-v2-testing\research\s41_two_features_design.md`），
+没有上游端到端参照，所以验证拆层：引擎语义关卡 + 份数0 逐字节 noop（vs git HEAD 真旧码
+冷跑）+ 管线不变量阶梯 + 跨代 extract 回归 + runner 冒烟。
+
+## gate_aug_semantic.py（引擎/门语义，27 检查全 PASS）
+- 干净真人素材（kaz mp3）生产切片链 ×2 份：f0 目标 worst median 3.5 / p90 30.6 cents；
+  时长守恒 ≤1 hop；跨 run 逐位确定（parselmouth 0.4.7 版本内性质）。
+- 共振峰：PSOLA ±3st 位移 est=0.00st；度量锚（重采样 +3st）est=+3.00st（度量自身测得准，
+  V11 反自证）。
+- 真实脏片双臂：human(OpenUtau 渲染) p90 臂 1/1 剔除；kazane@30s median 臂 1/3 剔除；
+  逐片分布档 gate_aug_semantic_dist.json。
+- ⚠ V9 裁决实据：**parselmouth 对 PSOLA 毛刺失明**（同批片 rmvpe p90=323/245 cents，
+  praat 读 12/17 且浊覆盖率不变=连续性先验平滑）→ 生产门四链统一 rmvpe 血统
+  （vocoder 门对音频现算 rmvpe，禁用其自产 parselmouth npz f0）；part4 = 盲区在案断言
+  （praat 若某天看见了会翻红提醒重评估）。
+- 单元语义：全清拒/忠实留/不变调拒/高音截顶豁免（sweep 700→1000Hz +3st）。
+
+## gate_aug0_noop.py（份数0 = 逐字节 no-op，四链全 PASS）
+冷跑协议（V1 反自证）：git worktree 检出基线（默认 HEAD）跑 pipeline.run 编排层（V3，
+gate_aug0_driver.py，CPU 钉死 CUDA_VISIBLE_DEVICES=-1）→ 同路径快照 → 现行代码冷跑 →
+按后缀比对（V6：wav/npy/txt/json=字节；.pt=字节→张量级降级[torch zip 档案名轴]；
+.wav 字节不等时=采样级降级[**libsndfile float32 wav 的 PEAK chunk 带写入时间戳**，
+vocoder 切片跨 run 恒差 1 字节，本次实测定责]）。读数：sovits 21/21、rvc 43/43、
+vocoder 12/12、sovits_diff 37/37 文件全等。复跑：
+`.venv\Scripts\python.exe ..\converter\verify\training\gate_aug0_noop.py --backend <b>`
+
+## gate_aug_pipeline.py（管线不变量，52 检查全 PASS）
+每链 0→2→2(rerun)→3→1→0 档位阶梯：val 与份数0 逐字节同且永无 aug；检索/index 资产
+与份数0 逐字节同（原片-only 拍板）；meta==幸存 aug 数；rerun 逐位稳定+缓存 mtime 不变
+（rvc 每 run 重算但逐位相同=名键特征缓存有效性的实证）；降档产物连坐清除（vocoder 含
+npz 侧）；**2→…→0 树 == fresh-0**。dirty 混合集：≥1 剔除 + 幸存片全材料化 + 零残渣。
+diff 继承：增量路径 aug 不动 + 缓存失效重建再生 aug + diff 产物齐全。
+
+## 既有关卡复跑协议（V13）
+- 基线归档：`TESTING/utai-v2-testing/sovits_ours_s38_archive`（永久只读参照）。
+- **regress_extract_sovits.py 实跑 PASS**：新 extract.py（含 aug 失败降级改动）vs S38
+  时代存档 132 产物逐字节 0 失配、零杂散。
+- **传递规则生效**：四链 noop 树等价 + 训练循环文件（train.py/solver/data_loaders/
+  losses/harness）git diff 为空 ⇒ S37-40 的 gate1 结论直接传递，不重跑（S33 先例）。
+- 旧 gate 脚本调用面：既有阶段函数签名零改动（build_flist_and_config 保留为兼容包装；
+  extract_all 仅新增返回值）。
+
+## smoke_aug.py（runner 直驱真训练，21 检查全 PASS）
+sovits(dirty 混合, 剔除消息实证)→sovits_diff(同工作区继承)→rvc→vocoder 各 aug=1 短训完训：
+协议全 JSON、augment/aug_check 阶段齐、done=completed、step 消息正常。JSONL 存档
+`TESTING/utai-v2-testing/gate_aug/smoke_*.jsonl`。
+
+## 坑（本次新增）
+- libsndfile float32 WAV 的 PEAK chunk 时间戳（见上）——凡逐字节比较 soundfile 写的
+  float wav 都要有采样级降级；scipy wavfile / int16 无此轴。
+- serde_json::json! 宏递归深度：run.json 字面量加键顶爆默认 128 上限 → lib.rs
+  `#![recursion_limit = "256"]`（纯编译期）。
+- augment 的 seed 状态防线（aug_meta/_state.json）：aug 文件名不含 keyshift，seed 变更
+  会让名键下游缓存静默错配——状态守卫先全清再生成（生产 seed 恒 1234，属 belt）。

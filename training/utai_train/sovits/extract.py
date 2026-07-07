@@ -41,6 +41,7 @@ import librosa
 import numpy as np
 import torch
 
+from ..augment import is_aug_name
 from .f0.RMVPEF0Predictor import RMVPEF0Predictor
 from .modules.mel_processing import spectrogram_torch
 from .utils import Volume_Extractor
@@ -106,9 +107,13 @@ def extract_all(
             if name.endswith(".wav"):
                 filenames.append(os.path.join(spk_dir, name))
 
-    # fail-fast on ANY file: the filelists are already written — a tolerated
-    # failure here would surface 800 steps later as a raw FileNotFoundError
-    # inside a DataLoader worker (upstream preprocess aborts loudly too)
+    # fail-fast on ANY base slice: the filelists reference them — a tolerated
+    # failure would surface 800 steps later as a raw FileNotFoundError inside
+    # a DataLoader worker (upstream preprocess aborts loudly too).
+    # S41 deviation: _aug slices are OUR OWN generated products — a failure
+    # there degrades to "reject this aug copy" (returned to the caller, which
+    # removes it before the filelists are built) instead of killing the run.
+    failed_aug = []
     for n, filename in enumerate(filenames):
         stop.check()
         reporter.stage(
@@ -130,10 +135,14 @@ def extract_all(
             )
         except Exception:
             logger.error("extract failed for %s\n%s", filename, traceback.format_exc())
+            if is_aug_name(filename):
+                failed_aug.append(filename)
+                continue
             raise RuntimeError(
                 "切片 %s 特征提取失败（详见日志）" % os.path.basename(filename)
             )
     reporter.stage("extract", done=len(filenames), total=len(filenames))
+    return failed_aug
 
 
 def _atomic_torch_save(obj, path):

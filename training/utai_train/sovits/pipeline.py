@@ -2,10 +2,15 @@
 upstream ran as separate scripts (slice by hand -> resample.py ->
 preprocess_flist_config.py -> preprocess_hubert_f0.py -> train_index.py /
 cluster/train_cluster.py -> train.py), driven from one run config. Stage order
-deviation vs upstream: the retrieval/kmeans asset is built right after feature
-extraction instead of after training — it only depends on the extracted
-features, so it exists even if the user stops mid-training (same policy as the
-RVC trainer).
+deviations vs upstream:
+  - retrieval/kmeans asset is built right after feature extraction instead of
+    after training (early stop still leaves a usable index; RVC policy)
+  - S41: stage order is slice -> augment -> config -> extract -> aug_check ->
+    filelist -> index. The PSOLA augmentation writes extra slices; the f0
+    quality gate (aug_check) consumes the .f0.npy products of BOTH source and
+    aug slices (zero extra compute) and deletes rejected aug slices + all
+    companions, so the filelists MUST be written after the gate — config.json
+    is split out (extract needs hps from it) and written before extract.
 
 Run config (JSON, written by the Rust TrainingManager) — required keys:
   backend "sovits", workspace, dataset_dir, model_slug, version "4.1|4.0",
@@ -14,24 +19,30 @@ Run config (JSON, written by the Rust TrainingManager) — required keys:
 optional: model_name (display name for the release config), seed(1234),
   fp16(false), vol_embedding(false), loudnorm(false), kmeans(false),
   save_every_steps(800), keep_ckpts(3), all_in_mem(false),
+  aug_copies(0, S41 PSOLA augmentation copies per slice, 0-3),
   gpu (handled by runner via CUDA_VISIBLE_DEVICES)
 
 The version picks the ContentVec space: 4.1 -> vec768l12, 4.0 -> vec256l9
 (4.0 = the same 4.1-Stable code with the vec256l9 encoder and default switches —
 verified weight-isomorphic to old 4.0 checkpoints). version / vol_embedding /
-sample rate are per-workspace immutables, guarded by the Rust run manifest.
+sample rate are per-workspace immutables, guarded by the Rust run manifest;
+aug_copies is manifest-recorded and INHERITED by diffusion runs (shared
+dataset_44k — a diff run regenerating the tree must re-augment identically).
 """
 import glob
 import logging
 import os
 import shutil
 
+import numpy as np
+
+from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint, invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from . import utils
 from .cluster import build_kmeans, build_retrieval
 from .extract import extract_all
-from .flist import build_flist_and_config
+from .flist import build_config, build_filelists
 from .preprocess import slice_and_resample
 from .train import train
 
@@ -81,10 +92,24 @@ def run(cfg, reporter, stop):
     slice_and_resample(cfg["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop)
 
     stop.check()
-    build_flist_and_config(
+    aug_copies = int(cfg.get("aug_copies", 0))
+    meta_dir = os.path.join(exp_dir, "aug_meta")
+    augment_slices(
+        spk_dir,
+        aug_copies,
+        seed,
+        meta_dir,
+        read_wav,
+        _write_slice_int16,
+        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
+        reporter,
+        stop,
+    )
+
+    stop.check()
+    build_config(
         exp_dir,
         slug,
-        dataset_44k,
         encoder,
         vol_embedding,
         fp16,
@@ -95,12 +120,11 @@ def run(cfg, reporter, stop):
         bool(cfg.get("all_in_mem", False)),
         seed,
         assets["configs_dir"],
-        reporter,
     )
 
     stop.check()
     hps = utils.get_hparams_from_file(os.path.join(exp_dir, "config.json"))
-    extract_all(
+    failed_aug = extract_all(
         dataset_44k,
         hps,
         assets["contentvec_onnx"],
@@ -109,6 +133,25 @@ def run(cfg, reporter, stop):
         reporter,
         stop,
     )
+    # aug slices whose extraction failed have PARTIAL companion sets — remove
+    # them before the gate/filelists (the gate would only catch missing f0)
+    for filename in failed_aug or ():
+        stem = os.path.basename(filename).split(".")[0]
+        logger.warning("removing aug slice with failed extraction: %s", stem)
+        _remove_aug_products(spk_dir, meta_dir, stem)
+
+    stop.check()
+    run_f0_gate(
+        list_aug_entries(spk_dir, meta_dir),
+        lambda stem: _load_gate_f0(spk_dir, stem),
+        lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
+        reporter,
+        stop,
+        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+    )
+
+    stop.check()
+    build_filelists(exp_dir, slug, dataset_44k, seed, reporter)
 
     stop.check()
     if bool(cfg.get("kmeans", False)):
@@ -131,6 +174,47 @@ def run(cfg, reporter, stop):
     summary["index"] = index_path
     summary["index_rows"] = index_rows
     reporter.done("stopped" if summary.pop("stopped") else "completed", summary)
+
+
+def _write_slice_int16(tmp_path, samples, sr):
+    """Aug slice writer — MUST match the base-slice disk format (int16 PCM;
+    stdlib `wave` in flist.py rejects IEEE-float wavs, red-team F7)."""
+    from scipy.io import wavfile
+
+    pcm = (np.clip(samples, -1.0, 1.0) * np.iinfo(np.int16).max).astype(np.int16)
+    wavfile.write(tmp_path, sr, pcm)
+
+
+def _remove_aug_products(spk_dir, meta_dir, aug_stem):
+    """Delete an aug slice and EVERY companion product (first dot-segment match:
+    .wav / .wav.soft.pt / .spec.pt / .wav.f0.npy / .wav.vol.npy / diff's
+    .wav.mel.npy + aug pair) plus its meta json."""
+    for name in os.listdir(spk_dir):
+        if name.split(".")[0] == aug_stem:
+            try:
+                os.remove(os.path.join(spk_dir, name))
+            except OSError:
+                pass
+    try:
+        os.remove(os.path.join(meta_dir, aug_stem + ".json"))
+    except OSError:
+        pass
+
+
+def _load_gate_f0(spk_dir, stem):
+    """(f0_hz, voiced_mask) from the extraction product for the aug gate.
+    .f0.npy = np object (f0, uv); f0 is INTERPOLATED through unvoiced spans,
+    uv is float with 1.0 = voiced — the mask is mandatory (red-team F6)."""
+    path = os.path.join(spk_dir, stem + ".wav.f0.npy")
+    try:
+        f0, uv = np.load(path, allow_pickle=True)
+        f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
+        uv = np.asarray(uv, dtype=np.float64).reshape(-1)
+        n = min(len(f0), len(uv))
+        return f0[:n], uv[:n] > 0.5
+    except Exception:
+        logger.warning("gate: unreadable f0 product for %s", stem)
+        return None
 
 
 def _seed_base_checkpoints(exp_dir, cfg):

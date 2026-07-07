@@ -27,13 +27,24 @@ import traceback
 import numpy as np
 import torch
 
+from ..augment import is_aug_name
+
 logger = logging.getLogger(__name__)
 
 N_CLUSTERS = 10000
 
 
 def _load_features(spk_dir, stop):
-    names = [n for n in sorted(os.listdir(spk_dir)) if n.endswith(".wav.soft.pt")]
+    # S41: retrieval/kmeans assets are built from ORIGINAL slices only —
+    # PSOLA aug copies are near-duplicate ContentVec vectors (formant-
+    # preserving) that inflate the index ~x(1+copies) with ~zero retrieval
+    # benefit, and excluding them keeps the inference-side assets identical
+    # to a non-augmented run (design S41 B3, red-team F3/R3/A3)
+    names = [
+        n
+        for n in sorted(os.listdir(spk_dir))
+        if n.endswith(".wav.soft.pt") and not is_aug_name(n)
+    ]
     if not names:
         raise RuntimeError("特征目录为空，无法构建检索/聚类库")
     mats = []

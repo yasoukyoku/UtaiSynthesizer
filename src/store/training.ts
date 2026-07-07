@@ -63,6 +63,22 @@ export interface WorkspaceInfo {
   has_main_progress: boolean;
   /** max diffusion checkpoint step; 0 = none/base only */
   diff_steps: number;
+  /** manifest 数据增强份数 (S41) — what a diff run will inherit */
+  aug_copies: number;
+  /** a reusable shared slice pool exists — diff may start without importing */
+  has_dataset: boolean;
+}
+
+/** S41 共享池模式 — THE single predicate for "a diff run may start without
+ *  importing data" (root tab gating, DataStep next button, RunStep start
+ *  guard all share it; Rust start_training re-verifies authoritatively). */
+export function diffPoolReady(backend: string, info: WorkspaceInfo | null): boolean {
+  return (
+    backend === "sovits_diff" &&
+    !!info?.exists &&
+    info.family === "sovits" &&
+    info.has_dataset
+  );
 }
 
 export interface TrainingSnapshot {
@@ -96,6 +112,10 @@ export interface TrainingFormConfig {
   fp16: boolean;
   gpu: number;
   forceCpu: boolean;
+  /** S41 PSOLA 数据增强份数 (0-3, 0=off) — rvc card (per-card fields so
+   *  switching cards never clobbers; diff has NO field: it inherits the
+   *  workspace manifest's like loudnorm/vol_embedding) */
+  augCopies: number;
   // ---- SoVITS (44.1kHz fixed; separate fields so switching cards never
   // clobbers the RVC values with SoVITS-scaled ones) ----
   sovitsVersion: "4.1" | "4.0";
@@ -113,6 +133,9 @@ export interface TrainingFormConfig {
   /** kmeans cluster centers instead of the retrieval matrix */
   sovitsKmeans: boolean;
   sovitsAllInMem: boolean;
+  /** S41 PSOLA 数据增强份数 (0-3, 0=off) — sovits card; the value a later
+   *  diff run inherits via the workspace manifest */
+  sovitsAugCopies: number;
   // ---- 浅扩散 sovits_diff (separate fields — card switches must not clobber;
   // no loudnorm/vol_embedding here: a diff run INHERITS them from the
   // workspace manifest, flipping them would wipe the shared caches) ----
@@ -143,6 +166,8 @@ export interface TrainingFormConfig {
   vocCropMelFrames: number;
   /** freeze the MPD discriminator (upstream README: may help small-step fine-tunes) */
   vocFreezeMpd: boolean;
+  /** S41 PSOLA 数据增强份数 (0-3, 0=off) — vocoder card */
+  vocAugCopies: number;
 }
 
 const IDLE_SNAPSHOT: TrainingSnapshot = {
@@ -172,6 +197,7 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   fp16: true,
   gpu: 0,
   forceCpu: false,
+  augCopies: 0,
   sovitsVersion: "4.1",
   sovitsTotalEpoch: 1000,
   sovitsBatchSize: 6,
@@ -182,6 +208,7 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   sovitsLoudnorm: false,
   sovitsKmeans: false,
   sovitsAllInMem: false,
+  sovitsAugCopies: 0,
   diffVersion: "4.1",
   diffTotalSteps: 100000,
   diffBatchSize: 48,
@@ -196,6 +223,7 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   vocKeepCkpts: 5,
   vocCropMelFrames: 32,
   vocFreezeMpd: false,
+  vocAugCopies: 0,
 };
 
 /** Client-side mirror of the Rust history cap: thin to half when exceeded. */
@@ -210,8 +238,13 @@ interface TrainingStoreState {
   config: TrainingFormConfig;
   wizard: 1 | 2 | 3 | 4;
   starting: boolean;
+  /** workspace info for the CURRENT diff host pick (null when backend≠diff or
+   *  no pick) — fetched by the TrainingPage root effect, consumed everywhere
+   *  via diffPoolReady() */
+  diffWsInfo: WorkspaceInfo | null;
 
   setWizard: (w: 1 | 2 | 3 | 4) => void;
+  setDiffWsInfo: (info: WorkspaceInfo | null) => void;
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
   addFiles: (paths: string[]) => Promise<void>;
   removeFile: (path: string) => void;
@@ -220,8 +253,10 @@ interface TrainingStoreState {
   stop: () => Promise<void>;
   forceStop: () => Promise<void>;
   /** Clear the finished run's display state (snapshot + curve) back to idle.
-   *  Files are untouched — the workspace stays resumable. */
-  resetRun: () => Promise<void>;
+   *  Files are untouched — the workspace stays resumable. Resolves true only
+   *  when the backend accepted (it refuses while running / audition in
+   *  flight) — the caller's wizard jump must not fire on a refused clear. */
+  resetRun: () => Promise<boolean>;
 }
 
 export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
@@ -232,8 +267,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   config: { ...DEFAULT_CONFIG },
   wizard: 1,
   starting: false,
+  diffWsInfo: null,
 
   setWizard: (w) => set({ wizard: w }),
+  setDiffWsInfo: (info) => set({ diffWsInfo: info }),
   updateConfig: (u) => set((s) => ({ config: { ...s.config, ...u } })),
 
   addFiles: async (paths) => {
@@ -304,6 +341,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               keep_only_latest: config.keepOnlyLatest,
               cache_gpu: config.cacheGpu,
               fp16: config.fp16,
+              aug_copies: config.augCopies,
             }
           : config.backend === "vocoder"
             ? {
@@ -319,6 +357,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
                 keep_ckpts: config.vocKeepCkpts,
                 crop_mel_frames: config.vocCropMelFrames,
                 freeze_mpd: config.vocFreezeMpd,
+                aug_copies: config.vocAugCopies,
               }
           : config.backend === "sovits_diff"
             ? {
@@ -352,6 +391,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               loudnorm: config.sovitsLoudnorm,
               kmeans: config.sovitsKmeans,
               all_in_mem: config.sovitsAllInMem,
+              aug_copies: config.sovitsAugCopies,
             };
       await invoke("start_training", { request });
       set({ wizard: 4, history: [] });
@@ -387,8 +427,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       await invoke("reset_training_display");
       // only clear locally once the backend agreed (it refuses while running)
       set({ snapshot: IDLE_SNAPSHOT, history: [], snapshotAt: Date.now() });
+      return true;
     } catch (e) {
       useAppStore.getState().showToast(String(e), "error");
+      return false;
     }
   },
 }));

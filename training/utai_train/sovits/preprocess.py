@@ -22,6 +22,7 @@ import numpy as np
 from scipy.io import wavfile
 
 from ..audio import load_audio
+from ..augment import is_aug_name
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,10 @@ def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, sto
     dataset fingerprint."""
     os.makedirs(out_spk_dir, exist_ok=True)
     for name in os.listdir(out_spk_dir):
-        if name.endswith(".wav"):
+        # S41: _aug slices are a cross-run skip-if-exists cache owned by the
+        # augment stage (which prunes stale ones itself); base slices are
+        # rebuilt every run as before
+        if name.endswith(".wav") and not is_aug_name(name):
             os.remove(os.path.join(out_spk_dir, name))
 
     names = sorted(os.listdir(dataset_dir))

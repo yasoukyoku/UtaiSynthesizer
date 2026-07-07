@@ -13,6 +13,8 @@ import traceback
 
 import numpy as np
 
+from ..augment import is_aug_name
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +23,11 @@ def build_index(exp_dir, version, seed, reporter, n_cpu=None):
     feature_dir = os.path.join(
         exp_dir, "3_feature256" if version == "v1" else "3_feature768"
     )
-    names = sorted(os.listdir(feature_dir))
+    # S41: the retrieval asset is built from ORIGINAL slices only — PSOLA aug
+    # copies are near-duplicate vectors that inflate the index for ~zero
+    # retrieval benefit, and excluding them keeps total_fea.npy identical to a
+    # non-augmented run (also immunizes against stale aug orphans; design B3)
+    names = sorted(n for n in os.listdir(feature_dir) if not is_aug_name(n))
     if not names:
         raise RuntimeError("特征目录为空，无法构建检索库")
     npys = []

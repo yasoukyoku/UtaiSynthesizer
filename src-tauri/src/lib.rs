@@ -1,3 +1,8 @@
+// the training run.json serde_json::json! literal outgrew the default macro
+// recursion limit when the S41 aug_copies key landed (the macro recurses per
+// token, not per key — this is a compile-time-only knob)
+#![recursion_limit = "256"]
+
 pub mod audio;
 pub mod commands;
 pub mod inference;
@@ -625,6 +630,10 @@ pub fn run() {
             commands::training::reset_training_display,
             commands::training::check_training_workspace,
             commands::training::get_training_workspace_info,
+            commands::audition::render_audition_voice,
+            commands::audition::render_audition_vocoder,
+            commands::audition::render_audition_diffusion,
+            commands::audition::audition_active,
             commands::models::list_models,
             commands::models::import_model,
             commands::models::delete_model,

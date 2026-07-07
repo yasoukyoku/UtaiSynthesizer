@@ -218,6 +218,14 @@ def run_export(model_path, config_path, outdir, deterministic=False,
     _export_graph(model, h["num_mels"], h["hop_size"], onnx_path)
     print(f"exported{' (deterministic)' if deterministic else ''} -> {onnx_path}")
 
+    # 审查修复 S41-RUST-1: selfcheck BEFORE the sidecar json — the json is the
+    # completion marker downstream (audition cache, import preflight), so a
+    # selfcheck-rejected graph must never own a complete-looking triple
+    # (export_diffusion.py has always been json-last; this aligns the two).
+    if selfcheck:
+        _selfcheck(model, h, onnx_path, outdir, stem, deterministic)
+        print("selfcheck OK")
+
     sidecar = {
         "type": "nsf_hifigan",
         "sample_rate": h["sampling_rate"],
@@ -233,10 +241,6 @@ def run_export(model_path, config_path, outdir, deterministic=False,
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(sidecar, f, ensure_ascii=False, indent=2)
     print(f"sidecar -> {json_path}")
-
-    if selfcheck:
-        _selfcheck(model, h, onnx_path, outdir, stem, deterministic)
-        print("selfcheck OK")
     return onnx_path, json_path, mel_npy_path
 
 

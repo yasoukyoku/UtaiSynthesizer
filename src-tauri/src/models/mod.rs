@@ -1056,6 +1056,32 @@ fn finalize_sidecar(
     // Display name INTO the sidecar — the disk rescan reads it back (file stems are sanitized).
     root.insert("name".into(), serde_json::Value::from(display_name));
 
+    // 审查修复 S41-INT-1: auto_f0.file names the SOURCE stem's companion (an
+    // audition conversion says "model.f0.onnx") — after a stem-renaming copy
+    // the runtime lookup would miss the file or hit a foreign one. Normalize
+    // from the actual on-disk companion next to the destination onnx; a
+    // claimed-but-absent companion flips available=false (the run would
+    // otherwise hard-error at render time).
+    let dest_f0 = onnx_path.with_extension("f0.onnx");
+    if let Some(auto) = root.get_mut("auto_f0").and_then(|v| v.as_object_mut()) {
+        let claims = auto.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+        if claims {
+            if dest_f0.is_file() {
+                let fname = dest_f0
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                auto.insert("file".into(), serde_json::Value::from(fname));
+            } else {
+                auto.insert("available".into(), serde_json::Value::from(false));
+                warnings.push(
+                    "自动音高预测器文件缺失——该模型的自动f0已禁用（重新导入 .pth 可恢复）"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     std::fs::write(
         &json_path,
         serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))?,
@@ -1230,7 +1256,8 @@ fn remove_entry_files(entry: &ModelEntry) {
 
 /// Strip characters Windows can't have in filenames (CJK and other Unicode pass through
 /// untouched), trim trailing dots/spaces, and dodge reserved device names. Empty → "model".
-fn sanitize_file_stem(name: &str) -> String {
+/// pub(crate): the S41 audition cache names its per-host wav with this (single source).
+pub(crate) fn sanitize_file_stem(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter(|c| {

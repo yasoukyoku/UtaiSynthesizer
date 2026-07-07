@@ -7,11 +7,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { exists, readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/app";
 import {
+  diffPoolReady,
   setupTrainingListeners,
   useTrainingStore,
   type CkptInfo,
@@ -25,16 +27,20 @@ import {
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { Dropdown } from "../common/Dropdown";
+import { preview } from "../common/previewPlayer";
 import { LossChart, type LossChartHandle } from "./LossChart";
 import "./TrainingPage.css";
 
 /** Preprocessing stage sequence per backend (stage names come from the sidecar
  *  protocol; these arrays only order/tick the checklist display). */
 const STAGE_ORDERS: Record<string, string[]> = {
-  rvc: ["import", "slice", "f0", "feature", "index", "filelist", "train_prep"],
-  sovits: ["import", "slice", "filelist", "extract", "index", "train_prep"],
-  sovits_diff: ["import", "slice", "filelist", "extract", "diff_prep", "train_prep"],
-  vocoder: ["import", "slice", "process", "filelist", "train_prep"],
+  // S41: augment + aug_check always emit (an instant "skipped" tick when
+  // copies=0), and the sovits/diff filelist stage moved AFTER extract/gate
+  // (the aug quality gate must finish before the filelists are written)
+  rvc: ["import", "slice", "augment", "f0", "feature", "aug_check", "index", "filelist", "train_prep"],
+  sovits: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
+  sovits_diff: ["import", "slice", "augment", "extract", "aug_check", "filelist", "diff_prep", "train_prep"],
+  vocoder: ["import", "slice", "augment", "process", "aug_check", "filelist", "train_prep"],
 };
 
 function fmtDur(totalSecs: number): string {
@@ -50,13 +56,36 @@ function fmtDur(totalSecs: number): string {
 export function TrainingPage() {
   const { t } = useTranslation();
   const closePage = useAppStore((s) => s.toggleTrainingPage);
-  const { wizard, setWizard, dataset, snapshot, refresh } = useTrainingStore();
+  const { wizard, setWizard, dataset, snapshot, refresh, config, diffWsInfo } =
+    useTrainingStore();
   const [dropActive, setDropActive] = useState(false);
 
   useEffect(() => {
     void setupTrainingListeners();
     void refresh();
   }, [refresh]);
+
+  // single fetch site for the diff host's workspace info (S41 共享池模式):
+  // DataStep/ParamsStep/RunStep all consume the store copy via diffPoolReady
+  useEffect(() => {
+    const name = config.modelName.trim();
+    if (config.backend !== "sovits_diff" || !name) {
+      useTrainingStore.getState().setDiffWsInfo(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+        if (!cancelled) useTrainingStore.getState().setDiffWsInfo(info);
+      } catch {
+        if (!cancelled) useTrainingStore.getState().setDiffWsInfo(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [config.backend, config.modelName]);
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
 
@@ -89,7 +118,7 @@ export function TrainingPage() {
           if (audio.length === 0) return;
           const st = useTrainingStore.getState();
           void st.addFiles(audio);
-          st.setWizard(1);
+          st.setWizard(2); // the data page (step 2 since the S41 order swap)
         }
       })
       .then((u) => {
@@ -101,12 +130,21 @@ export function TrainingPage() {
       if (unlisten) unlisten();
     };
   }, []);
-  const stepOk = [
-    true,
-    dataset.length > 0,
-    dataset.length > 0,
-    dataset.length > 0 || running || snapshot.state !== "idle",
-  ];
+  // S41 order: 1=训练对象 2=数据 3=参数 4=运行 (the object decides whether
+  // data is even needed, so it comes first; diff with a reusable shared pool
+  // skips step 2). Steps 1/2 are always reachable — every ACTION is guarded
+  // downstream (step gating here, start button, Rust validation).
+  const diffPool = diffPoolReady(config.backend, diffWsInfo);
+  const step3Ok = dataset.length > 0 || diffPool;
+  const step4Ok = step3Ok || running || snapshot.state !== "idle";
+  const stepOk = [true, true, step3Ok, step4Ok];
+
+  // 防逃课 invariant (S41 user report): whatever path INVALIDATES the current
+  // step (清空结果 with no data, backend switched away from diff, ...) bounces
+  // back to step 1 instead of stranding the user on a locked stage.
+  useEffect(() => {
+    if ((wizard === 3 && !step3Ok) || (wizard === 4 && !step4Ok)) setWizard(1);
+  }, [wizard, step3Ok, step4Ok, setWizard]);
   const steps = [
     t("training.step1"),
     t("training.step2"),
@@ -147,8 +185,11 @@ export function TrainingPage() {
         })}
       </nav>
       <div className="training-step-body">
-        {wizard === 1 && <DataStep />}
-        {wizard === 2 && <TargetStep />}
+        {/* S41 order swap (user ruling): the training object decides whether
+            data is even needed, so it comes FIRST — diff with a reusable pool
+            skips the data page entirely (TargetStep's next jumps to 3) */}
+        {wizard === 1 && <TargetStep />}
+        {wizard === 2 && <DataStep />}
         {wizard === 3 && <ParamsStep />}
         {wizard === 4 && <RunStep />}
       </div>
@@ -159,114 +200,11 @@ export function TrainingPage() {
   );
 }
 
-/* ---------------------------------- step 1: data ---------------------------------- */
+/* -------------------- step 2 (since the S41 order swap): data -------------------- */
 
-/** Single-file preview player: one AudioContext, decodes into ITS OWN buffer (not
- *  the DAW's shared loadedBuffers cache — a preview must not pin decoded PCM there
- *  for the session). WebAudio sources are one-shot, so pause/seek = stop + restart
- *  at an offset; `seq` guards a stop's onended from a superseded gesture. */
-class PreviewPlayer {
-  private ctx: AudioContext | null = null;
-  private src: AudioBufferSourceNode | null = null;
-  private buffer: AudioBuffer | null = null;
-  private startedAt = 0; // ctx time when the current source started
-  private offset = 0; // seconds into the buffer at startedAt
-  private seq = 0;
-  path: string | null = null;
-  paused = false;
-  onEnd: (() => void) | null = null;
-
-  private ensureCtx(): AudioContext {
-    if (!this.ctx) this.ctx = new AudioContext();
-    if (this.ctx.state === "suspended") void this.ctx.resume();
-    return this.ctx;
-  }
-
-  /** Decode on the player's OWN context (one per session) — a fresh AudioContext
-   *  per decode would hit the browser's ~6-context cap after a few previews. */
-  decode(bytes: Uint8Array): Promise<AudioBuffer> {
-    const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    return this.ensureCtx().decodeAudioData(ab as ArrayBuffer);
-  }
-
-  get duration(): number {
-    return this.buffer?.duration ?? 0;
-  }
-
-  get position(): number {
-    if (!this.ctx || this.paused || !this.src) return this.offset;
-    return Math.min(this.duration, this.offset + (this.ctx.currentTime - this.startedAt));
-  }
-
-  private startSource(offsetSec: number) {
-    const ctx = this.ensureCtx();
-    this.stopSource();
-    const src = ctx.createBufferSource();
-    src.buffer = this.buffer;
-    src.connect(ctx.destination);
-    const mySeq = ++this.seq;
-    src.onended = () => {
-      if (mySeq !== this.seq) return; // stopped for seek/pause/switch, not a real end
-      this.path = null;
-      this.onEnd?.();
-    };
-    this.offset = offsetSec;
-    this.startedAt = ctx.currentTime;
-    src.start(0, offsetSec);
-    this.src = src;
-    this.paused = false;
-  }
-
-  private stopSource() {
-    this.seq++; // invalidate the outgoing source's onended
-    if (this.src) {
-      try {
-        this.src.stop();
-      } catch {
-        /* already stopped */
-      }
-      this.src = null;
-    }
-  }
-
-  async play(path: string, buffer: AudioBuffer) {
-    this.buffer = buffer;
-    this.path = path;
-    this.startSource(0);
-  }
-
-  pause() {
-    if (!this.src || this.paused) return;
-    this.offset = this.position;
-    this.stopSource();
-    this.paused = true;
-  }
-
-  resume() {
-    if (!this.paused || !this.buffer) return;
-    this.startSource(this.offset);
-  }
-
-  seek(frac: number) {
-    if (!this.buffer) return;
-    const target = Math.max(0, Math.min(1, frac)) * this.duration;
-    if (this.paused) {
-      this.offset = target;
-    } else {
-      this.startSource(target);
-    }
-  }
-
-  stop() {
-    this.stopSource();
-    this.path = null;
-    this.paused = false;
-    this.offset = 0;
-    this.buffer = null; // release the decoded PCM (a long file is hundreds of MB)
-  }
-}
-
-const preview = new PreviewPlayer();
+// PreviewPlayer extracted to components/common/previewPlayer.ts in S41 (the
+// audition rows share it; singleton = data-step preview and audition playback
+// preempt each other, which is the intended behavior)
 
 /** Thin div scrubber (house style: square 4×12 head, no solid dot). Click/drag to
  *  seek; parent drives `value` via rAF. */
@@ -296,7 +234,9 @@ function Scrubber({ value, onSeek }: { value: number; onSeek: (frac: number) => 
 
 function DataStep() {
   const { t } = useTranslation();
-  const { dataset, addFiles, removeFile, setWizard } = useTrainingStore();
+  const { dataset, addFiles, removeFile, setWizard, config, diffWsInfo } =
+    useTrainingStore();
+  const diffPool = diffPoolReady(config.backend, diffWsInfo);
   const [playingPath, setPlayingPath] = useState<string | null>(null);
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -404,7 +344,12 @@ function DataStep() {
         </span>
       </div>
       {dataset.length === 0 ? (
-        <div className="training-empty">{t("training.empty")}</div>
+        <div className="training-empty">
+          {t("training.empty")}
+          {diffPool && (
+            <div className="training-fixed-note">{t("training.diffPoolHint")}</div>
+          )}
+        </div>
       ) : (
         <div className="training-file-list">
           {dataset.map((f) => {
@@ -464,8 +409,8 @@ function DataStep() {
       <div className="training-step-nav">
         <button
           className="training-btn primary"
-          disabled={dataset.length === 0}
-          onClick={() => setWizard(2)}
+          disabled={dataset.length === 0 && !diffPool}
+          onClick={() => setWizard(3)}
         >
           {t("training.next")}
         </button>
@@ -474,11 +419,11 @@ function DataStep() {
   );
 }
 
-/* ---------------------------------- step 2: target ---------------------------------- */
+/* ------------------- step 1 (since the S41 order swap): target ------------------- */
 
 function TargetStep() {
   const { t } = useTranslation();
-  const { config, updateConfig, setWizard } = useTrainingStore();
+  const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
   const [exists, setExists] = useState(false);
   const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
   // the diffusion companion is BOUND to a SoVITS model — the diff card picks
@@ -676,7 +621,12 @@ function TargetStep() {
         <button
           className="training-btn primary"
           disabled={!config.modelName.trim() || (isDiffCard && !diffModelPicked)}
-          onClick={() => setWizard(3)}
+          onClick={() =>
+            // diff with a reusable shared pool skips the data page (S41 order
+            // swap rationale); the data tab stays clickable for a manual
+            // dataset update
+            setWizard(diffPoolReady(config.backend, diffWsInfo) ? 3 : 2)
+          }
         >
           {t("training.next")}
         </button>
@@ -748,10 +698,14 @@ function NumberField({
 
 function ParamsStep() {
   const { t } = useTranslation();
-  const { config, updateConfig, setWizard } = useTrainingStore();
+  const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
   const [gpus, setGpus] = useState<string[]>([]);
   const [cudaOk, setCudaOk] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // diff inherits 数据增强份数 from the host workspace manifest — show the
+  // REAL inherited value (store diffWsInfo, fetched by the root effect)
+  const diffAugInherit =
+    config.backend === "sovits_diff" && diffWsInfo?.exists ? diffWsInfo.aug_copies : null;
 
   useEffect(() => {
     void (async () => {
@@ -1020,6 +974,17 @@ function ParamsStep() {
                 onChange={(v) => updateConfig({ diffForceSaveSteps: v })}
               />
             </div>
+            <div className="training-form-row">
+              <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
+              {/* inherited from the workspace manifest (shared dataset_44k
+                  slice pool) — not a diff-run choice, like loudnorm */}
+              <span className="training-fixed-value">
+                {t("training.augFollowWorkspace")}
+                {diffAugInherit !== null
+                  ? ` · ${t("training.augInheritCount", { count: diffAugInherit })}`
+                  : ""}
+              </span>
+            </div>
             <label className="training-check-row">
               <input
                 type="checkbox"
@@ -1067,6 +1032,15 @@ function ParamsStep() {
               />
               {t("training.vocFreezeMpd")}
             </label>
+            <div className="training-form-row">
+              <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
+              <NumberField
+                min={0}
+                max={3}
+                value={config.vocAugCopies}
+                onChange={(v) => updateConfig({ vocAugCopies: v })}
+              />
+            </div>
             {forceCpuRow}
           </div>
         ) : !sovits ? (
@@ -1112,6 +1086,15 @@ function ParamsStep() {
               />
               {t("training.fp16")}
             </label>
+            <div className="training-form-row">
+              <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
+              <NumberField
+                min={0}
+                max={3}
+                value={config.augCopies}
+                onChange={(v) => updateConfig({ augCopies: v })}
+              />
+            </div>
             {forceCpuRow}
           </div>
         ) : (
@@ -1158,6 +1141,15 @@ function ParamsStep() {
               />
               {t("training.allInMem")}
             </label>
+            <div className="training-form-row">
+              <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
+              <NumberField
+                min={0}
+                max={3}
+                value={config.sovitsAugCopies}
+                onChange={(v) => updateConfig({ sovitsAugCopies: v })}
+              />
+            </div>
             {forceCpuRow}
           </div>
         ))}
@@ -1188,6 +1180,8 @@ function RunStep() {
     stop,
     forceStop,
     resetRun,
+    setWizard,
+    diffWsInfo,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
@@ -1252,6 +1246,238 @@ function RunStep() {
     }
   };
 
+  // ---- S41 audition (试听多选保留): candidates render the bundled 10s clip
+  // through the app inference chain; rvc/sovits/vocoder = multi-select keep,
+  // diff = listen → pick one → attach (existing attach flow) ----
+  type AuditionPhase = "converting" | "rendering" | "ready" | "playing";
+  const [auditionState, setAuditionState] = useState<Record<string, AuditionPhase>>({});
+  const [auditionWavs, setAuditionWavs] = useState<Record<string, string>>({});
+  const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
+  const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
+  const [importingAll, setImportingAll] = useState(false);
+  const auditionBusy = Object.values(auditionState).some(
+    (s) => s === "converting" || s === "rendering",
+  );
+
+  // stale-resolution fence (审查修复 FE-3/FE-5/AUD-HOST-SWITCH-STALE): every
+  // context change that invalidates in-flight results bumps the epoch; a
+  // resolving invoke compares its captured epoch and discards itself
+  const auditionEpochRef = useRef(0);
+
+  // new-run reset (red-team R9): best/final snapshot PATHS are identical across
+  // runs of the same model — a stale ready-state would replay the previous
+  // run's render as this run's voice
+  useEffect(() => {
+    auditionEpochRef.current += 1;
+    setAuditionState({});
+    setAuditionWavs({});
+    setSelectedCkpts({});
+    setMissingCkpts({});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshot.model_name, snapshot.workspace, running]);
+
+  // the diff audition cache is host-specific — switching the host must
+  // invalidate every rendered result INCLUDING one still in flight
+  useEffect(() => {
+    if (!isDiff) return;
+    auditionEpochRef.current += 1;
+    setAuditionState({});
+    setAuditionWavs({});
+  }, [attachTarget, isDiff]);
+
+  // remount reconciliation (审查修复 FE-1/AUD-DONE-DROPPED): transient
+  // converting/rendering phases die with the page — if Rust says nothing is
+  // in flight, drop any stranded busy phase so auditionBusy can't deadlock
+  // the whole finished area
+  useEffect(() => {
+    if (!finished) return;
+    void (async () => {
+      try {
+        const active = await invoke<boolean>("audition_active");
+        if (!active) {
+          setAuditionState((s) => {
+            const n: typeof s = {};
+            for (const [k, v] of Object.entries(s)) {
+              if (v === "ready" || v === "playing") n[k] = v;
+            }
+            return n;
+          });
+        }
+      } catch {
+        /* reconciliation is best-effort */
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finished]);
+
+  // archive policies prune files the snapshot still lists (diff periodics,
+  // red-team F16) — grey those rows instead of offering dead buttons
+  useEffect(() => {
+    if (!finished || snapshot.ckpts.length === 0) return;
+    let alive = true;
+    void (async () => {
+      const gone: Record<string, boolean> = {};
+      for (const c of snapshot.ckpts) {
+        try {
+          if (!(await exists(c.path))) gone[c.path] = true;
+        } catch {
+          /* treat unprobeable as present — Rust errors loudly on use */
+        }
+      }
+      if (alive) setMissingCkpts(gone);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [finished, snapshot.ckpts]);
+
+  // conversion/render phases arrive as events (the invoke itself resolves with
+  // the wav path; a closed page loses transient phases — the wav cache makes a
+  // re-click instant, design A19)
+  useEffect(() => {
+    const un = listen<{ candidate_id: string; phase: string; wav?: string | null }>(
+      "audition-progress",
+      (e) => {
+        const { candidate_id, phase, wav } = e.payload;
+        if (phase === "converting" || phase === "rendering") {
+          setAuditionState((s) => ({ ...s, [candidate_id]: phase as AuditionPhase }));
+        } else if (phase === "done") {
+          // terminal events are the busy-state ground truth (审查修复 FE-1):
+          // the invoke resolution may belong to a dead component instance
+          if (wav) setAuditionWavs((s) => ({ ...s, [candidate_id]: wav }));
+          setAuditionState((s) =>
+            s[candidate_id] === "playing" ? s : { ...s, [candidate_id]: "ready" },
+          );
+        } else if (phase === "error") {
+          setAuditionState((s) => {
+            const n = { ...s };
+            delete n[candidate_id];
+            return n;
+          });
+        }
+      },
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+
+  // shared preview singleton — consumer contract (previewPlayer.ts): stop +
+  // release onEnd on unmount so a stale callback can't drive dead state
+  useEffect(() => {
+    return () => {
+      auditionEpochRef.current += 1; // in-flight resolutions become no-ops
+      preview.stop();
+      preview.onEnd = null;
+    };
+  }, []);
+
+  const playAuditionWav = async (id: string, wavPath: string) => {
+    preview.stop();
+    const bytes = await readFile(wavPath);
+    const buf = await preview.decode(bytes);
+    preview.onEnd = () => setAuditionState((s) => ({ ...s, [id]: "ready" }));
+    await preview.play(wavPath, buf);
+    // single-playing invariant (审查修复 FE-4): the preview singleton can only
+    // play one thing — every other 'playing' marker demotes to 'ready'
+    setAuditionState((s) => {
+      const n: typeof s = {};
+      for (const [k, v] of Object.entries(s)) n[k] = v === "playing" ? "ready" : v;
+      n[id] = "playing";
+      return n;
+    });
+  };
+
+  /** c === null → the built-in default vocoder A/B reference row. */
+  const auditionCandidate = async (c: CkptInfo | null) => {
+    const id = c ? c.path : "__default__";
+    const phase = auditionState[id];
+    // pause only when this row REALLY owns the playback — a stale 'playing'
+    // marker (superseded by another row) falls through to replay (FE-4)
+    if (phase === "playing" && preview.path === auditionWavs[id]) {
+      preview.pause();
+      setAuditionState((s) => ({ ...s, [id]: "ready" }));
+      return;
+    }
+    if ((phase === "ready" || phase === "playing") && auditionWavs[id]) {
+      try {
+        await playAuditionWav(id, auditionWavs[id]);
+      } catch {
+        // cache swept underneath us (清空结果/new run) — drop back to idle
+        setAuditionState((s) => {
+          const n = { ...s };
+          delete n[id];
+          return n;
+        });
+        setAuditionWavs((s) => {
+          const n = { ...s };
+          delete n[id];
+          return n;
+        });
+      }
+      return;
+    }
+    if (phase === "converting" || phase === "rendering" || auditionBusy || importingAll) return;
+    if (isDiff && !attachTarget) {
+      showToast(t("training.auditionNeedHost"), "error");
+      return;
+    }
+    // stale fence: unmount / new run / host switch bump the epoch — a late
+    // resolution must not populate state or start playback (FE-3/FE-5)
+    const epoch = auditionEpochRef.current;
+    setAuditionState((s) => ({ ...s, [id]: "converting" }));
+    try {
+      let wav: string;
+      if (isVocoderRun || c === null) {
+        wav = await invoke<string>("render_audition_vocoder", {
+          ckptPath: c?.path ?? null,
+          workspace: snapshot.workspace,
+          candidateId: id,
+        });
+      } else if (isDiff) {
+        wav = await invoke<string>("render_audition_diffusion", {
+          hostName: attachTarget,
+          ckptPath: c.path,
+          workspace: snapshot.workspace,
+          candidateId: id,
+        });
+      } else {
+        wav = await invoke<string>("render_audition_voice", {
+          backend: snapshot.backend,
+          ckptPath: c.path,
+          workspace: snapshot.workspace,
+          candidateId: id,
+        });
+      }
+      if (epoch !== auditionEpochRef.current) return; // superseded — discard
+      setAuditionWavs((s) => ({ ...s, [id]: wav }));
+      await playAuditionWav(id, wav);
+    } catch (e) {
+      if (epoch !== auditionEpochRef.current) return;
+      setAuditionState((s) => {
+        const n = { ...s };
+        delete n[id];
+        return n;
+      });
+      showToast(String(e), "error");
+    }
+  };
+
+  const auditionLabel = (id: string) => {
+    switch (auditionState[id]) {
+      case "converting":
+        return t("training.auditionConverting");
+      case "rendering":
+        return t("training.auditionRendering");
+      case "playing":
+        return "❚❚";
+      case "ready":
+        return "▶";
+      default:
+        return t("training.audition");
+    }
+  };
+
   // elapsed ticker (1 Hz) while running
   useEffect(() => {
     if (!running) return;
@@ -1266,7 +1492,9 @@ function RunStep() {
   const bestCkpt = snapshot.ckpts.find((c) => c.kind === "best");
 
   const onStart = async () => {
-    if (dataset.length === 0) {
+    // S41 共享池模式: diff may start with no fresh import when the host
+    // workspace has a reusable pool (Rust re-verifies authoritatively)
+    if (dataset.length === 0 && !diffPoolReady(config.backend, diffWsInfo)) {
       showToast(t("training.needData"), "error");
       return;
     }
@@ -1454,7 +1682,12 @@ function RunStep() {
       ],
     });
     if (choice !== "clear") return;
-    await resetRun();
+    // anti-escape (user report, S41 live test): after a page refresh the
+    // dataset list is gone (in-memory) while the snapshot survives (backend);
+    // clearing from that state used to leave the wizard parked on step 4 with
+    // zero data. 清空 semantically ends the round — jump back to step 1
+    // (only on an ACCEPTED clear; a refused one keeps the results visible).
+    if (await resetRun()) setWizard(1);
   };
 
   const onForceStop = async () => {
@@ -1486,35 +1719,25 @@ function RunStep() {
     }
   };
 
-  const importCkpt = async (ckpt: CkptInfo) => {
-    // sovits/vocoder periodics are step-cadenced (several per epoch) — an
-    // epoch-keyed suggestion would collide and silently replace the previous
-    // import (rvc keeps its historical epoch tag)
+  // sovits/vocoder periodics are step-cadenced (several per epoch) — an
+  // epoch-keyed suggestion would collide and silently replace the previous
+  // import (rvc keeps its historical epoch tag)
+  const suggestedName = (ckpt: CkptInfo) => {
     const tag =
       ckpt.kind === "best"
         ? "best"
         : snapshot.backend === "rvc"
           ? `e${ckpt.epoch}`
           : `s${ckpt.step}`;
-    const suggested =
-      ckpt.kind === "final" ? snapshot.model_name : `${snapshot.model_name}_${tag}`;
-    const name = await showConfirm({
-      title: t("training.import"),
-      body: t("training.importName"),
-      buttons: [
-        { id: "ok", label: t("training.import"), kind: "primary" },
-        // "__cancel": with input mode the PRIMARY resolves the typed VALUE, other
-        // buttons resolve their id — a plain "cancel" id would collide with a
-        // model literally named "cancel"
-        { id: "__cancel", label: t("training.cancel") },
-      ],
-      input: { initial: suggested },
-    });
-    if (!name || name === "__cancel") return;
+    return ckpt.kind === "final" ? snapshot.model_name : `${snapshot.model_name}_${tag}`;
+  };
+
+  // fallbacks for runs without a summary (e.g. force-stopped): rvc keeps its
+  // historical total_fea.npy; sovits probes the workspace cluster assets
+  // (built before training, so they exist even for early stops). Shared by the
+  // single-import prompt and the S41 batch import (single source).
+  const resolveIndexPath = async (): Promise<string | undefined> => {
     const summaryIndex = (snapshot.summary as { index?: string } | null)?.index;
-    // fallbacks for runs without a summary (e.g. force-stopped): rvc keeps its
-    // historical total_fea.npy; sovits probes the workspace cluster assets
-    // (built before training, so they exist even for early stops)
     let indexPath = summaryIndex;
     if (!indexPath && snapshot.backend !== "vocoder") {
       // vocoders have no index/cluster companion — probing would only find
@@ -1533,6 +1756,24 @@ function RunStep() {
         }
       }
     }
+    return indexPath;
+  };
+
+  const importCkpt = async (ckpt: CkptInfo) => {
+    const name = await showConfirm({
+      title: t("training.import"),
+      body: t("training.importName"),
+      buttons: [
+        { id: "ok", label: t("training.import"), kind: "primary" },
+        // "__cancel": with input mode the PRIMARY resolves the typed VALUE, other
+        // buttons resolve their id — a plain "cancel" id would collide with a
+        // model literally named "cancel"
+        { id: "__cancel", label: t("training.cancel") },
+      ],
+      input: { initial: suggestedName(ckpt) },
+    });
+    if (!name || name === "__cancel") return;
+    const indexPath = await resolveIndexPath();
     try {
       await invoke("import_model", {
         name,
@@ -1544,6 +1785,101 @@ function RunStep() {
       showToast(t("training.imported", { name }), "success");
     } catch (e) {
       showToast(String(e), "error");
+    }
+  };
+
+  /** S41 batch import of the checked candidates, auto-named by the single-
+   *  import suggestion rules with in-batch dedupe (red-team A9: a stop archive
+   *  can share its step/epoch with a periodic — REPLACE would silently eat
+   *  one). Prefers the audition-converted onnx when present (instant copy). */
+  const importSelected = async () => {
+    const chosen = snapshot.ckpts.filter(
+      (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
+    );
+    if (chosen.length === 0 || importingAll) return;
+    const names = new Map<string, string>();
+    const used = new Set<string>();
+    for (const c of chosen) {
+      let n = suggestedName(c);
+      if (used.has(n)) n = `${n}_${c.kind}`;
+      let i = 2;
+      while (used.has(n)) {
+        n = `${suggestedName(c)}_${c.kind}${i}`;
+        i += 1;
+      }
+      used.add(n);
+      names.set(c.path, n);
+    }
+    const lines = chosen.map(
+      (c) => `${names.get(c.path)}  ←  ${c.path.split(/[\\/]/).pop()}`,
+    );
+    const okId = await showConfirm({
+      title: t("training.importSelectedTitle"),
+      body: `${t("training.importSelectedBody")}\n\n${lines.join("\n")}`,
+      buttons: [
+        { id: "ok", label: t("training.import"), kind: "primary" },
+        { id: "cancel", label: t("training.cancel") },
+      ],
+    });
+    if (okId !== "ok") return;
+    setImportingAll(true);
+    try {
+      const indexPath = await resolveIndexPath();
+      const audName = isVocoderRun ? "vocoder" : "model";
+      let ok = 0;
+      const failed: string[] = [];
+      const warns: string[] = [];
+      for (const c of chosen) {
+        let path = c.path;
+        try {
+          const stem = c.path
+            .split(/[\\/]/)
+            .pop()!
+            .replace(/\.[^.]+$/, "");
+          const dir = `${snapshot.workspace}\\audition\\${stem}`;
+          // the sidecar json is the conversion's COMPLETION marker (exporters
+          // write it last, 审查修复 S41-RUST-1/2) — a bare onnx is an
+          // interrupted/rejected conversion and must fall back to the raw ckpt
+          if (
+            (await exists(`${dir}\\${audName}.onnx`)) &&
+            (await exists(`${dir}\\${audName}.json`))
+          ) {
+            path = `${dir}\\${audName}.onnx`;
+          }
+        } catch {
+          /* fall back to the raw ckpt (import converts it itself) */
+        }
+        try {
+          const outcome = await invoke<{ warnings?: string[] }>("import_model", {
+            name: names.get(c.path),
+            path,
+            modelType: snapshot.backend,
+            indexPath,
+          });
+          ok += 1;
+          for (const w of outcome?.warnings ?? []) {
+            warns.push(`${names.get(c.path)}: ${w}`);
+          }
+        } catch (e) {
+          failed.push(`${names.get(c.path)}: ${e}`);
+        }
+      }
+      await useVoiceModelStore.getState().fetchModels();
+      if (failed.length > 0) {
+        showToast(
+          `${t("training.importSelectedPartial", { ok, total: chosen.length })}\n${[...failed, ...warns].join("\n")}`,
+          "error",
+        );
+      } else if (warns.length > 0) {
+        showToast(
+          `${t("training.importSelectedDone", { count: ok })}\n${warns.join("\n")}`,
+          "info",
+        );
+      } else {
+        showToast(t("training.importSelectedDone", { count: ok }), "success");
+      }
+    } finally {
+      setImportingAll(false);
     }
   };
 
@@ -1715,39 +2051,121 @@ function RunStep() {
               <div className="training-hint">{t("training.noAttachTarget")}</div>
             ))}
           <div className="training-ckpt-list">
-            {snapshot.ckpts.map((c) => (
-              <div key={`${c.kind}-${c.step}-${c.path}`} className="training-ckpt-row">
-                <span className={`training-ckpt-kind ${c.kind}`}>
-                  {t(`training.kind_${c.kind}`)}
-                </span>
-                <span className="training-ckpt-name" title={c.path}>
-                  {c.path.replace(/\\/g, "/").split("/").pop()}
-                </span>
-                <span className="training-ckpt-meta">
-                  {/* diffusion epochs are sentinel units — steps only */}
-                  {isDiff ? <>s{c.step}</> : <>e{c.epoch} · s{c.step}</>}
-                  {c.metric != null && <> · {c.metric.toFixed(3)}</>}
-                </span>
-                {isDiff ? (
-                  attachCandidates.length > 0 && (
-                    <button
-                      className="training-btn small"
-                      disabled={!attachTarget || attaching != null}
-                      onClick={() => void attachCkpt(c)}
-                    >
-                      {attaching === c.path
-                        ? t("training.attaching")
-                        : t("training.attach")}
-                    </button>
-                  )
-                ) : (
-                  <button className="training-btn small" onClick={() => void importCkpt(c)}>
-                    {t("training.import")}
-                  </button>
-                )}
+            {/* S41: the vocoder run gets a pinned A/B reference row — the
+                built-in default vocoder rendering the SAME clip */}
+            {isVocoderRun && (
+              <div className="training-ckpt-row reference">
+                <span className="training-ckpt-kind reference">A/B</span>
+                <span className="training-ckpt-name">{t("training.auditionRef")}</span>
+                <button
+                  className="training-btn small"
+                  disabled={(auditionBusy && !auditionState["__default__"]) || importingAll}
+                  onClick={() => void auditionCandidate(null)}
+                >
+                  {auditionLabel("__default__")}
+                </button>
               </div>
-            ))}
+            )}
+            {snapshot.ckpts.map((c) => {
+              const gone = missingCkpts[c.path] === true;
+              const phase = auditionState[c.path];
+              return (
+                <div
+                  key={`${c.kind}-${c.step}-${c.path}`}
+                  className={`training-ckpt-row${gone ? " missing" : ""}`}
+                  title={gone ? t("training.ckptMissing") : undefined}
+                >
+                  {/* multi-select keep (rvc/sovits/vocoder; diff keeps its
+                      listen→pick-one→attach semantics — no checkbox) */}
+                  {!isDiff && (
+                    <input
+                      type="checkbox"
+                      className="training-ckpt-check"
+                      disabled={gone}
+                      checked={!gone && (selectedCkpts[c.path] ?? true)}
+                      onChange={(e) =>
+                        setSelectedCkpts((s) => ({ ...s, [c.path]: e.target.checked }))
+                      }
+                    />
+                  )}
+                  <span className={`training-ckpt-kind ${c.kind}`}>
+                    {t(`training.kind_${c.kind}`)}
+                  </span>
+                  <span className="training-ckpt-name" title={c.path}>
+                    {c.path.replace(/\\/g, "/").split("/").pop()}
+                  </span>
+                  <span className="training-ckpt-meta">
+                    {/* diffusion epochs are sentinel units — steps only */}
+                    {isDiff ? <>s{c.step}</> : <>e{c.epoch} · s{c.step}</>}
+                    {c.metric != null && <> · {c.metric.toFixed(3)}</>}
+                  </span>
+                  {gone ? (
+                    <span className="training-ckpt-missing">{t("training.ckptMissing")}</span>
+                  ) : (
+                    <>
+                      <button
+                        className="training-btn small"
+                        disabled={
+                          (auditionBusy && phase !== "converting" && phase !== "rendering") ||
+                          (isDiff && !attachTarget) ||
+                          // batch import copies audition onnx files — a render
+                          // writing one concurrently would be a TOCTOU (FE-2)
+                          importingAll
+                        }
+                        onClick={() => void auditionCandidate(c)}
+                      >
+                        {auditionLabel(c.path)}
+                      </button>
+                      {isDiff ? (
+                        attachCandidates.length > 0 && (
+                          <button
+                            className="training-btn small"
+                            disabled={!attachTarget || attaching != null}
+                            onClick={() => void attachCkpt(c)}
+                          >
+                            {attaching === c.path
+                              ? t("training.attaching")
+                              : t("training.attach")}
+                          </button>
+                        )
+                      ) : (
+                        <button
+                          className="training-btn small"
+                          onClick={() => void importCkpt(c)}
+                        >
+                          {t("training.import")}
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </div>
+          {/* S41 batch keep — default all-checked (user spec) */}
+          {!isDiff && snapshot.ckpts.some((c) => !missingCkpts[c.path]) && (
+            <div className="training-audition-bar">
+              <button
+                className="training-btn primary small"
+                disabled={
+                  importingAll ||
+                  auditionBusy ||
+                  snapshot.ckpts.filter(
+                    (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
+                  ).length === 0
+                }
+                onClick={() => void importSelected()}
+              >
+                {importingAll
+                  ? t("training.importingSelected")
+                  : t("training.importSelected", {
+                      count: snapshot.ckpts.filter(
+                        (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
+                      ).length,
+                    })}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -1772,16 +2190,19 @@ function RunStep() {
         snapshot.state === "stopped" ||
         snapshot.state === "error") && (
         <div className="training-run-controls">
+          {/* auditionBusy: a conversion subprocess is writing into the
+              audition dir — starting/clearing would race it (Rust enforces
+              this too; the disable is the friendly first line) */}
           <button
             className="training-btn primary"
-            disabled={starting}
+            disabled={starting || auditionBusy || importingAll}
             onClick={() => void onStart()}
           >
             {t("training.start")}
           </button>
           <button
             className="training-btn"
-            disabled={starting}
+            disabled={starting || auditionBusy || importingAll}
             title={t("training.clearResultTip")}
             onClick={() => void onClearResult()}
           >

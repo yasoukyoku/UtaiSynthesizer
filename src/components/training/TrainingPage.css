@@ -93,10 +93,16 @@
   border-bottom-color: var(--accent-primary);
 }
 
+.training-step-tab:not(:disabled):not(.active):hover {
+  color: var(--text-primary);
+}
+
+/* locked steps (S41 user feedback): the old 0.5-opacity dim on already-muted
+ * text read as "normal" — the lock must be unmistakable at a glance */
 .training-step-tab:disabled {
   color: var(--text-muted);
-  cursor: default;
-  opacity: 0.5;
+  cursor: not-allowed;
+  opacity: 0.3;
 }
 
 .training-step-num {
@@ -113,6 +119,12 @@
 .training-step-tab.active .training-step-num {
   border-color: var(--accent-primary);
   color: var(--accent-primary);
+}
+
+.training-step-tab:disabled .training-step-num {
+  border-color: var(--border-default);
+  border-style: dashed;
+  color: var(--text-muted);
 }
 
 .training-step-body {
@@ -440,8 +452,11 @@
   cursor: pointer;
 }
 
-/* Angular checkbox — square, themed, custom check mark (no default OS control). */
-.training-check-row input[type="checkbox"] {
+/* Angular checkbox — square, themed, custom check mark (no default OS control).
+ * Shared by the params check rows AND the S41 audition keep-checkboxes (single
+ * source — do not restyle per-site). */
+.training-check-row input[type="checkbox"],
+.training-ckpt-check {
   -webkit-appearance: none;
   appearance: none;
   width: 14px;
@@ -456,14 +471,17 @@
   border-radius: 0;
   cursor: pointer;
 }
-.training-check-row input[type="checkbox"]:hover {
+.training-check-row input[type="checkbox"]:hover,
+.training-ckpt-check:hover {
   border-color: var(--accent-primary-dim);
 }
-.training-check-row input[type="checkbox"]:checked {
+.training-check-row input[type="checkbox"]:checked,
+.training-ckpt-check:checked {
   background: var(--accent-primary-dim);
   border-color: var(--accent-primary);
 }
-.training-check-row input[type="checkbox"]:checked::after {
+.training-check-row input[type="checkbox"]:checked::after,
+.training-ckpt-check:checked::after {
   content: "";
   /* flex-centered in the box; translateY nudges for the tick's downward visual
    * weight (both strokes sit on the lower-right). No hard-coded left/top. */
@@ -473,7 +491,8 @@
   border-width: 0 2px 2px 0;
   transform: translateY(-1px) rotate(45deg);
 }
-.training-check-row input[type="checkbox"]:disabled {
+.training-check-row input[type="checkbox"]:disabled,
+.training-ckpt-check:disabled {
   opacity: 0.45;
   cursor: default;
 }
@@ -756,4 +775,27 @@
 .training-fixed-value {
   color: var(--text-secondary);
   font-size: var(--font-size-sm);
+}
+
+/* ─── S41 audition rows (试听多选保留) ─────────────────────────────────── */
+.training-ckpt-row.missing {
+  opacity: 0.45;
+}
+.training-ckpt-row.reference .training-ckpt-kind.reference {
+  background: var(--bg-tertiary, rgba(128, 128, 128, 0.2));
+  color: var(--text-secondary);
+}
+/* (checkbox visuals live in the shared angular-checkbox block above) */
+.training-ckpt-check {
+  margin-right: 2px;
+}
+.training-ckpt-missing {
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.training-audition-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
 }

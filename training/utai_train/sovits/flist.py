@@ -15,11 +15,19 @@
 #     separate backend and brings its own preprocessing products)
 #   - hard error when a speaker has fewer than 3 slices (upstream would write an
 #     empty train list and crash mid-training)
+#   - S41 augmentation protocol: PSOLA _aug slices NEVER enter val; the val
+#     split is computed on the original (non-aug) pool with the exact RNG
+#     stream of the pre-aug code (copies=0 stays byte-identical; val.txt is
+#     identical across aug settings so val loss stays comparable), surviving
+#     aug slices are then appended to the train side and shuffled with a
+#     SECOND rng (touching the primary stream would shift the val order)
 import json
 import logging
 import os
 import random
 import wave
+
+from ..augment import is_aug_name
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +53,7 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
 
     spk_dir = os.path.join(dataset_44k_dir, spk)
     wavs = []
+    augs = []
     for file_name in sorted(os.listdir(spk_dir)):
         if not file_name.endswith("wav"):
             continue
@@ -54,8 +63,10 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
         if _wav_duration(file_path) < 0.3:
             logger.info("Skip too short audio: %s", file_path)
             continue
-        wavs.append(file_path)
+        (augs if is_aug_name(file_name) else wavs).append(file_path)
 
+    # the 3-slice floor is judged on ORIGINALS — aug copies must not rescue a
+    # dataset that is too small to split honestly
     if len(wavs) < 3:
         raise RuntimeError(
             "切片后可用样本只有 %d 个（至少需要 3 个：2 个验证 + 1 个训练）。"
@@ -68,6 +79,12 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
     val = wavs[:2]
     rng.shuffle(train)
     rng.shuffle(val)
+    if augs:
+        # append-then-shuffle with an independent rng: the primary stream above
+        # is byte-compatible with the pre-aug code, so copies=0 output and the
+        # val split/order under ANY copies stay identical to baseline
+        train = train + augs
+        random.Random("%s|aug-train" % seed).shuffle(train)
 
     flist_dir = os.path.join(exp_dir, "filelists")
     os.makedirs(flist_dir, exist_ok=True)
@@ -83,10 +100,9 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter):
     return train_list, val_list, len(train), len(val)
 
 
-def build_flist_and_config(
+def build_config(
     exp_dir,
     spk,               # speaker key in the training config = workspace slug (ASCII)
-    dataset_44k_dir,   # <exp_dir>/dataset_44k
     encoder,           # "vec768l12" | "vec256l9"
     vol_embedding,
     fp16,
@@ -97,14 +113,18 @@ def build_flist_and_config(
     all_in_mem,
     seed,
     configs_dir,
-    reporter,
 ):
+    """config.json only — the filelist PATHS it references are static
+    (<exp_dir>/filelists/{train,val}.txt), so the config can be written before
+    the filelists exist. S41 split: extract_all needs hps from config.json,
+    while the filelists must be (re)built AFTER the aug quality gate — the
+    pre-S41 build_flist_and_config coupling made that ordering impossible."""
     if encoder not in ENCODER_DIMS:
         raise RuntimeError("未知语音编码器: %s" % encoder)
 
-    train_list, val_list, n_train, n_val = build_filelists(
-        exp_dir, spk, dataset_44k_dir, seed, reporter
-    )
+    flist_dir = os.path.join(exp_dir, "filelists")
+    train_list = os.path.join(flist_dir, "train.txt")
+    val_list = os.path.join(flist_dir, "val.txt")
 
     with open(
         os.path.join(configs_dir, "config_template.json"), encoding="utf-8"
@@ -143,4 +163,43 @@ def build_flist_and_config(
         json.dump(config, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, config_path)
+
+
+def build_flist_and_config(
+    exp_dir,
+    spk,
+    dataset_44k_dir,
+    encoder,
+    vol_embedding,
+    fp16,
+    total_epoch,
+    batch_size,
+    save_every_steps,
+    keep_ckpts,
+    all_in_mem,
+    seed,
+    configs_dir,
+    reporter,
+):
+    """Pre-S41 combined entry, kept as a thin wrapper so existing verify/gate
+    scripts (gate0_sovits_run_ours etc.) keep their exact old call face and
+    semantics. The production pipeline now calls build_config and
+    build_filelists separately (gate between them)."""
+    _, _, n_train, n_val = build_filelists(
+        exp_dir, spk, dataset_44k_dir, seed, reporter
+    )
+    build_config(
+        exp_dir,
+        spk,
+        encoder,
+        vol_embedding,
+        fp16,
+        total_epoch,
+        batch_size,
+        save_every_steps,
+        keep_ckpts,
+        all_in_mem,
+        seed,
+        configs_dir,
+    )
     return n_train, n_val

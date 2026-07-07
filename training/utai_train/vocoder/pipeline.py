@@ -88,6 +88,13 @@ import re
 import numpy as np
 import yaml
 
+from ..augment import (
+    augment_slices,
+    is_aug_name,
+    list_aug_entries,
+    read_wav,
+    run_f0_gate,
+)
 from ..cache import dataset_fingerprint, invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
@@ -129,8 +136,22 @@ def run(cfg, reporter, stop):
     slice_dataset(cfg["dataset_dir"], slices_dir, assets["ffmpeg"], reporter, stop)
 
     stop.check()
+    _augment_vocoder(exp_dir, slices_dir, npz_dir,
+                     int(cfg.get("aug_copies", 0)), int(cfg.get("seed", 1234)),
+                     reporter, stop)
+
+    stop.check()
     config = build_train_config(cfg, pretrain, flist_dir)
     process_slices(slices_dir, npz_dir, config, reporter, stop)
+
+    stop.check()
+    # S41 quality gate — rmvpe-blooded BY DESIGN: parselmouth (this chain's own
+    # f0 lineage) is measurably blind to the PSOLA glitch tail (its continuity
+    # prior smooths over frames rmvpe reads as 300+ cents off — gate_aug_semantic
+    # part 4 keeps that blind spot on record), so the gate must not use the
+    # npz f0 products
+    _vocoder_aug_gate(exp_dir, slices_dir, npz_dir,
+                      assets.get("rmvpe_pt", ""), reporter, stop)
 
     stop.check()
     build_filelists(npz_dir, flist_dir, int(cfg.get("seed", 1234)),
@@ -237,6 +258,7 @@ def process_slices(slices_dir, npz_dir, config, reporter, stop):
     os.makedirs(npz_dir, exist_ok=True)
     names = sorted(n for n in os.listdir(slices_dir) if n.endswith(".wav"))
     failures = []
+    aug_dropped = 0
     for i, name in enumerate(names):
         stop.check()
         reporter.stage("process", done=i, total=len(names), message=name)
@@ -248,7 +270,18 @@ def process_slices(slices_dir, npz_dir, config, reporter, stop):
             config, pathlib.Path(os.path.join(slices_dir, name)), pathlib.Path(tmp)
         )
         if not ok:
-            failures.append("  %s: %s" % (name, result))
+            if is_aug_name(name):
+                # S41: aug slices are OUR OWN products — degrade to "drop this
+                # copy" instead of taking the whole run down (deviation 3 is a
+                # user-material contract; red-team A4)
+                logger.warning("dropping aug slice with failed wav2spec: %s (%s)",
+                               name, result)
+                _remove_vocoder_aug_products(
+                    slices_dir, npz_dir, os.path.splitext(name)[0]
+                )
+                aug_dropped += 1
+            else:
+                failures.append("  %s: %s" % (name, result))
             try:
                 os.remove(tmp)
             except OSError:
@@ -256,7 +289,10 @@ def process_slices(slices_dir, npz_dir, config, reporter, stop):
             continue
         os.replace(tmp, out)
     reporter.stage("process", done=len(names), total=len(names))
-    if failures:  # deviation 3: never a silent skip
+    if aug_dropped:
+        reporter.stage("process", message="剔除 %d 个特征提取失败的增强片" % aug_dropped,
+                       force=True)
+    if failures:  # deviation 3: never a silent skip (user material only)
         raise RuntimeError("以下切片特征提取失败：\n" + "\n".join(failures))
 
 
@@ -279,15 +315,22 @@ def build_filelists(npz_dir, flist_dir, seed, crop_frames, reporter):
             ", ".join(os.path.basename(p) for p in short),
         )
         reporter.stage("filelist", message="剔除 %d 个过短切片" % len(short), force=True)
-    if len(usable) < 4:
+    # S41 split protocol: val is drawn from ORIGINAL slices only, with the
+    # exact pre-aug rng semantics — copies=0 stays byte-identical, and the val
+    # set is identical across aug settings (val loss stays comparable);
+    # surviving aug slices go to the train side only. The 4-slice floor is
+    # judged on originals (aug copies must not rescue a too-small dataset).
+    originals = [p for p in usable if not is_aug_name(p)]
+    augs = [p for p in usable if is_aug_name(p)]
+    if len(originals) < 4:
         raise RuntimeError(
             "有效切片过少（%d 个，至少需要 4 个）：请提供更多/更长的连续干声素材"
-            % len(usable)
+            % len(originals)
         )
-    val_num = min(10, max(1, len(usable) // 10))
+    val_num = min(10, max(1, len(originals) // 10))
     rng = random.Random(seed)  # deviation 5: upstream samples an unordered set, unseeded
-    val = set(rng.sample(usable, val_num))
-    train = [p for p in usable if p not in val]
+    val = set(rng.sample(originals, val_num))
+    train = [p for p in originals if p not in val] + augs
 
     os.makedirs(flist_dir, exist_ok=True)
     for fname, rows in (("train", sorted(train)), ("valid", sorted(val))):
@@ -295,6 +338,111 @@ def build_filelists(npz_dir, flist_dir, seed, crop_frames, reporter):
             for p in rows:  # upstream writes sorted posix lines (process.py:94-97)
                 print(pathlib.Path(p).as_posix(), file=f)
     logger.info("filelists: %d train / %d val", len(train), len(val))
+
+
+# ─── S41 PSOLA augmentation (design doc B3, vocoder row) ─────────────────────
+
+def _vocoder_meta_dir(exp_dir):
+    return os.path.join(exp_dir, "aug_meta")
+
+
+def _remove_vocoder_aug_products(slices_dir, npz_dir, stem):
+    """wav + npz + meta as ONE unit — the trainer reads npz only (audio is
+    embedded), so a deleted wav with a surviving npz would keep training on
+    'removed' data invisibly (red-team F4/V18, the quietest pollution channel)."""
+    for p in (
+        os.path.join(slices_dir, stem + ".wav"),
+        os.path.join(npz_dir, stem + ".npz"),
+        os.path.join(os.path.dirname(slices_dir), "aug_meta", stem + ".json"),
+    ):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _augment_vocoder(exp_dir, slices_dir, npz_dir, copies, seed, reporter, stop):
+    import soundfile as sf
+
+    meta_dir = _vocoder_meta_dir(exp_dir)
+
+    def write_float(tmp_path, samples, sr):
+        # explicit format: the .tmp suffix defeats soundfile's inference; the
+        # slice dir contract is float32 WAV (FLOAT subtype), matching
+        # slice_dataset's own writes
+        sf.write(tmp_path, samples, sr, format="WAV", subtype="FLOAT")
+
+    augment_slices(
+        slices_dir,
+        copies,
+        seed,
+        meta_dir,
+        read_wav,
+        write_float,
+        lambda stem: _remove_vocoder_aug_products(slices_dir, npz_dir, stem),
+        reporter,
+        stop,
+    )
+
+    # orphan npz sweep: a crash between wav removal and npz removal leaves an
+    # npz the stale sweep can no longer see (it enumerates wavs)
+    if os.path.isdir(npz_dir):
+        for name in os.listdir(npz_dir):
+            if not name.endswith(".npz") or not is_aug_name(name):
+                continue
+            stem = os.path.splitext(name)[0]
+            if not os.path.exists(os.path.join(slices_dir, stem + ".wav")):
+                try:
+                    os.remove(os.path.join(npz_dir, name))
+                except OSError:
+                    pass
+
+
+def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, reporter, stop):
+    """rmvpe-blooded f0 gate over the aug AUDIO pairs (never the npz f0 — its
+    parselmouth lineage is blind to the PSOLA glitch tail, see run())."""
+    entries = list_aug_entries(slices_dir, _vocoder_meta_dir(exp_dir))
+    if not entries:
+        run_f0_gate(entries, lambda stem: None,
+                    lambda stem: None, reporter, stop)
+        return
+    if not rmvpe_pt or not os.path.isfile(rmvpe_pt):
+        raise RuntimeError(
+            "数据增强质检需要 RMVPE 资产（assets.rmvpe_pt），未找到: %s" % rmvpe_pt
+        )
+    import torch
+
+    from ..sovits.f0.RMVPEF0Predictor import RMVPEF0Predictor
+
+    predictor = RMVPEF0Predictor(
+        hop_length=512,
+        sampling_rate=TARGET_SR,
+        dtype=torch.float32,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        threshold=0.05,
+        model_path=rmvpe_pt,
+    )
+
+    def load_f0(stem):
+        try:
+            wav, _sr = read_wav(os.path.join(slices_dir, stem + ".wav"))
+            f0, uv = predictor.compute_f0_uv(wav)
+            f0 = np.asarray(f0, dtype=np.float64).reshape(-1)
+            uv = np.asarray(uv, dtype=np.float64).reshape(-1)
+            n = min(len(f0), len(uv))
+            return f0[:n], uv[:n] > 0.5
+        except Exception:
+            logger.warning("gate: f0 failed for %s", stem)
+            return None
+
+    run_f0_gate(
+        entries,
+        load_f0,
+        lambda stem: _remove_vocoder_aug_products(slices_dir, npz_dir, stem),
+        reporter,
+        stop,
+        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+    )
 
 
 # ─── config assembly (deviation 6 — see module header decision table) ────────
