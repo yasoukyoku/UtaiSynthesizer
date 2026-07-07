@@ -1,8 +1,12 @@
 pub mod pipeline;
-pub mod sidecar;
 // stft moved to the utai-dsp sub-crate (dev opt-3); re-export keeps the public path
 // `utai_lib::separation::stft::*` (tests) working unchanged.
 pub use utai_dsp::stft;
+// The python (audio-separator) fallback sidecar was removed in S42: its venv never shipped
+// (python/msst/.venv did not exist — the fallback was effectively dead since S31 made the
+// native ONNX pipeline the sole production path), and the S42 embedded-runtime work
+// deliberately does NOT carry the audio-separator dependency family. Un-converted models
+// now fail loudly with a "convert first" message instead of silently limping into python.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,9 +19,6 @@ use crate::inference::engine::OnnxEngine;
 use crate::{Result, UtaiError};
 
 pub struct SeparationManager {
-    script_path: PathBuf,
-    venv_python: PathBuf,
-    fallback_python: PathBuf,
     active: Mutex<Option<ActiveJob>>,
     /// The CURRENT (or most recent) native job's status slot. Each start_native installs a FRESH Arc:
     /// cancel is cooperative (the worker only polls between chunks), so a cancelled worker can outlive
@@ -28,7 +29,6 @@ pub struct SeparationManager {
 }
 
 enum ActiveJob {
-    Sidecar(sidecar::SeparationSidecar),
     NativeHandle {
         handle: std::thread::JoinHandle<()>,
         /// This job's OWN cancel flag. A shared manager-level flag was reset to `false` by the next
@@ -109,12 +109,8 @@ pub struct StemOutput {
 }
 
 impl SeparationManager {
-    pub fn new(app_dir: PathBuf) -> Self {
-        let msst_dir = app_dir.join("python").join("msst");
+    pub fn new(_app_dir: PathBuf) -> Self {
         Self {
-            script_path: msst_dir.join("separate.py"),
-            venv_python: msst_dir.join(".venv").join("Scripts").join("python.exe"),
-            fallback_python: PathBuf::from("python"),
             active: Mutex::new(None),
             native_status: Mutex::new(Arc::new(Mutex::new(SeparationStatus {
                 state: SeparationState::Idle,
@@ -124,9 +120,8 @@ impl SeparationManager {
         }
     }
 
-    /// Auto-detects native vs sidecar:
-    /// - .onnx file with matching .json config → native Rust pipeline
-    /// - Otherwise → Python sidecar fallback
+    /// Native Rust pipeline only (.onnx + matching .json config). Un-converted models are
+    /// rejected with a "convert first" error — the python fallback was removed in S42.
     pub fn start(&self, config: SeparationConfig, engine: &OnnxEngine) -> Result<()> {
         let mut active = self.active.lock();
         if active.is_some() {
@@ -162,7 +157,10 @@ impl SeparationManager {
         if has_onnx_config {
             self.start_native(&mut active, config, engine, &model_path)
         } else {
-            self.start_sidecar(&mut active, config)
+            Err(UtaiError::Audio(format!(
+                "该模型尚未转换为 ONNX（缺 .onnx 或配套 .json）：{}。请先在模型管理中完成转换后再分离。",
+                model_path.display()
+            )))
         }
     }
 
@@ -276,36 +274,9 @@ impl SeparationManager {
         Ok(())
     }
 
-    fn start_sidecar(
-        &self,
-        active: &mut Option<ActiveJob>,
-        config: SeparationConfig,
-    ) -> Result<()> {
-        let sidecar_config = serde_json::json!({
-            "audioPath": config.audio_path,
-            "modelName": config.model_path,
-            "outputDir": config.output_dir,
-            "device": config.device,
-        });
-        let config_json = serde_json::to_string(&sidecar_config)?;
-
-        let python = if self.venv_python.exists() {
-            &self.venv_python
-        } else {
-            &self.fallback_python
-        };
-
-        let sidecar =
-            sidecar::SeparationSidecar::spawn(python, &self.script_path, &config_json)?;
-        *active = Some(ActiveJob::Sidecar(sidecar));
-        tracing::info!("Sidecar MSST separation started: {}", config.model_path);
-        Ok(())
-    }
-
     pub fn status(&self) -> SeparationStatus {
         let active = self.active.lock();
         match active.as_ref() {
-            Some(ActiveJob::Sidecar(s)) => s.status(),
             Some(ActiveJob::NativeHandle { handle, .. }) => {
                 // Read liveness BEFORE the status (not after): a worker that writes its terminal state
                 // and exits between the two reads must never be seen as (non-terminal, finished) — that
@@ -354,14 +325,6 @@ impl SeparationManager {
     pub fn cancel(&self) -> Result<()> {
         let mut active = self.active.lock();
         match active.take() {
-            Some(ActiveJob::Sidecar(s)) => {
-                s.cancel()?;
-                // Mark the (native) slot terminal too: status()'s None branch reads it, and a PREVIOUS
-                // native job's Completed+stems left there would otherwise settle as this sidecar job's
-                // result on the frontend's post-cancel re-poll.
-                self.native_status.lock().lock().state =
-                    SeparationState::Error("Cancelled".to_string());
-            }
             Some(ActiveJob::NativeHandle { cancel, .. }) => {
                 // Flip THIS job's flag (the worker polls it between chunks) and mark its slot terminal
                 // for the frontend. The detached worker keeps only its own flag + slot: the next start()
@@ -383,13 +346,6 @@ impl SeparationManager {
     pub fn clear_completed(&self) {
         let mut active = self.active.lock();
         let should_clear = match active.as_ref() {
-            Some(ActiveJob::Sidecar(s)) => {
-                let st = s.status();
-                matches!(
-                    st.state,
-                    SeparationState::Completed | SeparationState::Error(_)
-                )
-            }
             Some(ActiveJob::NativeHandle { handle, .. }) => handle.is_finished(),
             None => false,
         };

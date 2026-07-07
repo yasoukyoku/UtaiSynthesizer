@@ -155,9 +155,16 @@
   text-align: center;
 }
 
-.settings-download-btn:hover {
+.settings-download-btn:hover:not(:disabled) {
   background: var(--accent-primary);
   color: var(--bg-base);
+}
+
+/* S42：该类首次被 disabled 属性使用（安装进行中）；无此规则时禁用态与可点态
+   外观完全相同（WebView2 里 :hover 对 disabled 按钮照样命中）。 */
+.settings-download-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .settings-progress {
@@ -190,4 +197,48 @@
   line-height: 1.4;
   margin: 0;
   word-break: break-all;
+}
+
+/* S42 训练环境（runtime pack）段 —— 组件语言与本面板一致：mono、细边框、方角 */
+.settings-pack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.settings-pack:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.settings-pack-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.settings-mini-btn {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 3px 8px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.settings-mini-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.settings-mini-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.settings-mini-btn.danger:hover:not(:disabled) {
+  border-color: #ef4444;
+  color: #ef4444;
 }

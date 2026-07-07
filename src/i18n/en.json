@@ -43,7 +43,8 @@
     "task_workflow": "Workflow rendering",
     "task_download": "Model download",
     "task_convert": "Model conversion",
-    "task_cuda_download": "CUDA runtime download"
+    "task_cuda_download": "CUDA runtime download",
+    "task_pyenv_install": "Training runtime pack install"
   },
   "tray": {
     "show": "Show Window",

@@ -10,6 +10,20 @@ pub struct HardwareInfo {
     pub cuda_available: bool,
     pub directml_available: bool,
     pub current_device: String,
+    /// Per-adapter vendor classification (S42, for runtime-pack recommendation).
+    /// Vendor comes from PNPDeviceID's VEN_xxxx — NEVER from WMI AdapterRAM (a lying
+    /// uint32: this dev box reports the 3080 Ti as 4 GB) and never from name heuristics.
+    pub gpus: Vec<GpuAdapter>,
+    /// Which runtime-pack variant this machine should default to
+    /// ("nv-cu130" | "amd" | "xpu" | "cpu") — the user can always override.
+    pub recommended_variant: String,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct GpuAdapter {
+    pub name: String,
+    /// "nvidia" | "amd" | "intel" | "other"
+    pub vendor: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -41,12 +55,85 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         DeviceConfig::Auto => "auto".to_string(),
     };
 
+    let gpus = query_gpu_adapters();
+    let gpu_name = if gpus.is_empty() {
+        "Unknown GPU".to_string()
+    } else {
+        gpus.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
+    };
     Ok(HardwareInfo {
-        gpu_name: detect_gpu_name(),
+        gpu_name,
         cuda_available: is_cuda_available(),
         directml_available: cfg!(windows),
         current_device: current_str,
+        recommended_variant: recommend_variant(&gpus).to_string(),
+        gpus,
     })
+}
+
+/// Default runtime-pack variant for this machine. NVIDIA wins over everything (the
+/// only fully-supported training path); AMD over Intel. iGPU-vs-dGPU is deliberately
+/// NOT guessed — the pick is only a DEFAULT and the UI lets the user override
+/// (Pinokio's silent wrong-variant installs are the anti-pattern we're avoiding).
+fn recommend_variant(gpus: &[GpuAdapter]) -> &'static str {
+    if gpus.iter().any(|g| g.vendor == "nvidia") {
+        "nv-cu130"
+    } else if gpus.iter().any(|g| g.vendor == "amd") {
+        "amd"
+    } else if gpus.iter().any(|g| g.vendor == "intel") {
+        "xpu"
+    } else {
+        "cpu"
+    }
+}
+
+/// Enumerate video adapters with PCI vendor ids via WMI. One query serves both the
+/// display string and the vendor classification (single source — replaces the old
+/// name-only `detect_gpu_name`).
+fn query_gpu_adapters() -> Vec<GpuAdapter> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance -ClassName Win32_VideoController | Select-Object Name, PNPDeviceID | ConvertTo-Json -Compress",
+            ])
+            .creation_flags(crate::util::CREATE_NO_WINDOW)
+            .output();
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                // ConvertTo-Json yields an OBJECT for one adapter, an ARRAY for several.
+                let items: Vec<&serde_json::Value> = match &val {
+                    serde_json::Value::Array(a) => a.iter().collect(),
+                    other => vec![other],
+                };
+                let adapters: Vec<GpuAdapter> = items
+                    .into_iter()
+                    .filter_map(|item| {
+                        let name = item.get("Name")?.as_str()?.trim().to_string();
+                        let pnp = item.get("PNPDeviceID").and_then(|v| v.as_str()).unwrap_or("");
+                        let vendor = if pnp.contains("VEN_10DE") {
+                            "nvidia"
+                        } else if pnp.contains("VEN_1002") {
+                            "amd"
+                        } else if pnp.contains("VEN_8086") {
+                            "intel"
+                        } else {
+                            "other"
+                        };
+                        Some(GpuAdapter { name, vendor: vendor.to_string() })
+                    })
+                    .collect();
+                if !adapters.is_empty() {
+                    return adapters;
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[tauri::command]
@@ -85,11 +172,27 @@ pub fn get_device_preference(state: State<'_, Arc<AppState>>) -> Result<String, 
 }
 
 pub fn load_and_apply_config(state: &AppState) {
+    // Logging rules (S22 + S42): state FACTS, not the fallback chain — which ORT
+    // build this process committed is already known (ORT_LOADED_BUILD), and the
+    // per-inference "ONNX device=..." lines remain the truth source for what each
+    // run executes on. Logs are English/standard format (Chinese belongs to the
+    // user-facing error strings, not tracing). NB: an absent config.json MEANS the
+    // preference IS Auto (the default is simply never written to disk) — the old
+    // wording ("No config found") read like breakage and was mistaken for a CUDA
+    // regression in the field.
+    let build = crate::ORT_LOADED_BUILD.get().map(|s| s.as_str()).unwrap_or("?");
     if let Some(cfg) = load_config(&state.app_dir) {
-        tracing::info!("Loaded device preference: {:?}", cfg.device);
+        tracing::info!(
+            "device preference: {:?} (config.json); ORT build loaded: {}; per-run EP is logged as \"ONNX device=...\"",
+            cfg.device,
+            build
+        );
         state.inference.engine.set_device(cfg.device);
     } else {
-        tracing::info!("No config found, using Auto (CUDA → DirectML → CPU)");
+        tracing::info!(
+            "device preference: Auto (default; config.json is only written once changed in Settings); ORT build loaded: {}; per-run EP is logged as \"ONNX device=...\"",
+            build
+        );
     }
 }
 
@@ -188,7 +291,26 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
             return Err("Target directory overlaps the current data directory".into());
         }
         copy_dir_all(&data_root.join("models"), &target.join("models")).map_err(|e| format!("Copy models: {e}"))?;
-        copy_dir_all(&data_root.join("cache"), &target.join("cache")).map_err(|e| format!("Copy cache: {e}"))
+        copy_dir_all(&data_root.join("cache"), &target.join("cache")).map_err(|e| format!("Copy cache: {e}"))?;
+        // Runtime packs (S42) live under <data_root>/runtimes and must MOVE WITH the
+        // data dir — lib.rs roots pyenv on the resolved data dir, so leaving them
+        // behind would make every installed pack "vanish" after migration (and strand
+        // gigabytes on the old drive with no UI to reclaim them). `.staging` (torn
+        // installs / resumable part files) is transient — skip it.
+        let runtimes_src = data_root.join("runtimes");
+        if runtimes_src.exists() {
+            let runtimes_dst = target.join("runtimes");
+            std::fs::create_dir_all(&runtimes_dst).map_err(|e| format!("Create runtimes: {e}"))?;
+            for entry in std::fs::read_dir(&runtimes_src).map_err(|e| format!("Read runtimes: {e}"))?.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                copy_dir_all(&entry.path(), &runtimes_dst.join(&name))
+                    .map_err(|e| format!("Copy runtimes/{}: {e}", name.to_string_lossy()))?;
+            }
+        }
+        Ok(())
     })
     .await
     .map_err(|e| format!("Copy task failed: {e}"))??;
@@ -197,25 +319,6 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
     save_config(&state.app_dir, &cfg).map_err(|e| format!("Save config: {e}"))?;
     tracing::info!("Migrated data dir → {} (restart to apply)", new.display());
     Ok(())
-}
-
-fn detect_gpu_name() -> String {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                   "(Get-CimInstance -ClassName Win32_VideoController).Name -join ', '"])
-            .creation_flags(crate::util::CREATE_NO_WINDOW)
-            .output();
-        if let Ok(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    "Unknown GPU".to_string()
 }
 
 /// Whether CUDA is ACTUALLY usable, not just "files downloaded". Verifies that the CUDA ORT build is

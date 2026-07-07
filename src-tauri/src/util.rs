@@ -1,24 +1,32 @@
 use std::path::{Path, PathBuf};
 
-/// Resolve the Python interpreter for a bundled sidecar/tool. Priority:
+/// Resolve the Python interpreter for the TRAINING sidecar. Priority:
 ///   1. the tool's own venv:        `<venv_dir>/.venv/Scripts/python.exe`
-///   2. the bundled portable Python: `<app_dir>/python/python.exe`
+///   2. the manual portable slot:    `<app_dir>/python/python.exe`
 ///   3. the system `python` on PATH (dev fallback)
 ///
-/// `venv_dir` is the directory CONTAINING `.venv` (e.g. `app_dir/converter`), NOT the `.venv` itself.
-/// Single source of truth: this was previously copy-pasted as `find_converter_python` in both
-/// models/convert.rs and commands/msst_models.rs (and a broken cwd-relative, venv-skipping variant in
-/// training/mod.rs). Windows-only layout (`Scripts/python.exe`), matching the original call sites.
+/// `venv_dir` is the directory CONTAINING `.venv` (e.g. `app_dir/training`), NOT the `.venv` itself.
+/// S42: the CONVERTER role moved to `crate::pyenv::converter_python` (venv → installed runtime
+/// packs → manual slot → PATH); training deliberately does NOT consult runtime packs yet — the
+/// vendored training code is only validated against packs after the Phase B torch-axis migration
+/// (running it on a 2.11 pack before that would break at the first weights_only torch.load).
 pub fn find_python(venv_dir: &Path, app_dir: &Path) -> PathBuf {
     let venv = venv_dir.join(".venv").join("Scripts").join("python.exe");
     if venv.exists() {
         return venv;
     }
-    let embedded = app_dir.join("python").join("python.exe");
+    let embedded = manual_python_slot(app_dir);
     if embedded.exists() {
         return embedded;
     }
     PathBuf::from("python")
+}
+
+/// The manual portable-python slot `<app_dir>/python/python.exe` — ONE definition
+/// shared by `find_python` (training) and `pyenv::converter_python` (converter), so
+/// the two roles can never drift onto different "manual slot" locations.
+pub fn manual_python_slot(app_dir: &Path) -> PathBuf {
+    app_dir.join("python").join("python.exe")
 }
 
 /// Windows `CREATE_NO_WINDOW` process-creation flag — pass to `Command::creation_flags(...)` so spawned
@@ -38,6 +46,16 @@ pub fn python_command(python: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(python);
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PYTHONUTF8", "1");
+    // Isolate from the HOST machine's Python environment (S42): a user-set
+    // PYTHONHOME makes the embedded runtime-pack interpreter fail at startup
+    // ("init_fs_encoding"), and an inherited PYTHONPATH / user-site can shadow the
+    // pack's site-packages with foreign versions (e.g. a numpy 2.x that breaks the
+    // pack's numpy-1.26 C-API wheels) — silently, which is worse. `-E` would also
+    // kill our OWN env vars above, so strip the two inherited ones explicitly and
+    // disable user-site. Dev venvs are unaffected (venvs need neither variable).
+    cmd.env_remove("PYTHONHOME");
+    cmd.env_remove("PYTHONPATH");
+    cmd.env("PYTHONNOUSERSITE", "1");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

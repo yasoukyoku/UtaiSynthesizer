@@ -5,9 +5,11 @@
 
 pub mod audio;
 pub mod commands;
+pub mod download;
 pub mod inference;
 pub mod logging;
 pub mod models;
+pub mod pyenv;
 pub mod separation;
 pub mod training;
 pub mod util;
@@ -30,6 +32,10 @@ pub enum UtaiError {
     Training(String),
     #[error("Model error: {0}")]
     Model(String),
+    #[error("Download error: {0}")]
+    Download(String),
+    #[error("Runtime pack error: {0}")]
+    Pyenv(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
@@ -129,6 +135,12 @@ pub fn suppress_windows_dll_error_dialogs() {
     }
 }
 
+/// Which ORT BUILD init_ort_runtime actually committed ("CUDA" / "DirectML" / a
+/// dev-cache/system path). Recorded so later startup lines can state the FACT of
+/// what loaded instead of re-announcing the Auto chain — the S22 logging rule
+/// ("log the actual hardware, not the intent") applied to the startup path.
+pub static ORT_LOADED_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Find and initialize the ORT runtime DLL.
 /// Picks CUDA or DirectML DLL based on user's saved device preference.
 /// pub so out-of-app harnesses (integration tests) can reuse the exact app init path.
@@ -204,7 +216,16 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
                 Ok(builder) => {
                     builder.commit();
                     quiet_ort_logging();
-                    tracing::info!("ORT runtime loaded successfully");
+                    // Classify what ACTUALLY loaded (fact, not intent) for later log lines.
+                    let build = if path.components().any(|c| c.as_os_str() == "cuda") {
+                        "CUDA".to_string()
+                    } else if *path == runtime_dir.join(dll_name) {
+                        "DirectML".to_string()
+                    } else {
+                        format!("dev/system ({})", path.display())
+                    };
+                    tracing::info!("ORT runtime loaded successfully ({build} build)");
+                    let _ = ORT_LOADED_BUILD.set(build);
                     return;
                 }
                 Err(e) => {
@@ -217,6 +238,7 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
     tracing::warn!("No local ORT DLL found, trying system PATH...");
     ort::init().commit();
     quiet_ort_logging();
+    let _ = ORT_LOADED_BUILD.set("system PATH".to_string());
 }
 
 /// Silence ORT's per-op VERBOSE logging AT THE SOURCE. The `ort` crate's tracing bridge creates
@@ -531,6 +553,10 @@ pub fn run() {
             let models_dir = data_dir.join("models");
             let _ = std::fs::create_dir_all(&cache_dir);
             let _ = std::fs::create_dir_all(&models_dir);
+            // Embedded Python runtime packs live under <data_root>/runtimes (S42) —
+            // rooted on the SAME resolved data dir (incl. the legacy AppData fallback)
+            // so a user data-dir migration moves the packs' home along with models/cache.
+            pyenv::init_runtime_root(&data_dir);
             // Sweep stale on-disk caches on startup (background thread — don't block window show).
             // This is also the crash/power-loss recovery path: a startup sweep always runs, unlike a
             // shutdown hook that wouldn't fire on a hard exit.
@@ -552,6 +578,10 @@ pub fn run() {
                         }
                     }
                     cleanup_cache_on_startup(&cd);
+                    // Reclaim torn runtime-pack installs / deferred deletes (and
+                    // RECOVER a pack stranded mid-reinstall) — nothing else GCs
+                    // <data>/runtimes/.staging (S42 audit).
+                    pyenv::sweep_staging();
                 });
             }
             // Model avatars render via the asset protocol (asset.localhost). The models dir is
@@ -666,6 +696,12 @@ pub fn run() {
             commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
+            commands::pyenv::get_runtime_env_info,
+            commands::pyenv::download_runtime_pack,
+            commands::pyenv::install_runtime_pack_local,
+            commands::pyenv::cancel_runtime_install,
+            commands::pyenv::delete_runtime_pack,
+            commands::pyenv::run_pack_envtest,
             commands::window::quit_app,
             commands::window::running_tasks,
             commands::window::set_tray_labels,

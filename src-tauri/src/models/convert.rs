@@ -23,7 +23,7 @@ pub fn convert_pth_to_onnx(
     model_type: &ModelType,
     app_dir: &Path,
 ) -> Result<()> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
     let script = app_dir.join("converter").join("convert.py");
 
     let output = crate::util::python_command(&python)
@@ -69,7 +69,7 @@ pub fn convert_index_to_npy(
     output_path: &Path,
     app_dir: &Path,
 ) -> Result<()> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
     let script = app_dir.join("converter").join("extract_index.py");
 
     if !script.exists() {
@@ -120,7 +120,7 @@ pub fn convert_index_to_npy(
 /// `<speaker_name>.centers.npy` / `<speaker_id>.index_vectors.npy` — exactly what the
 /// SoVITS inference pipeline probes for).
 pub fn convert_cluster_assets(input: &Path, outdir: &Path, app_dir: &Path) -> Result<()> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
     let script = app_dir.join("converter").join("export_cluster.py");
 
     if !script.exists() {
@@ -166,7 +166,7 @@ pub fn convert_diffusion_assets(
     outdir: &Path,
     app_dir: &Path,
 ) -> Result<()> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
     let script = app_dir.join("converter").join("export_diffusion.py");
 
     if !script.exists() {
@@ -219,7 +219,7 @@ pub fn convert_vocoder_to_onnx(
     stem: &str,
     app_dir: &Path,
 ) -> Result<()> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir)?;
     let script = app_dir.join("converter").join("export_nsf_hifigan.py");
 
     if !script.exists() {
@@ -267,4 +267,7 @@ pub fn convert_vocoder_to_onnx(
     Ok(())
 }
 
-// find_converter_python moved to crate::util::find_python (shared with commands/msst_models.rs).
+// Converter interpreter resolution = crate::pyenv::converter_python_checked (S42):
+// dev venv → installed runtime packs (newest per variant) → manual slot → LOUD error
+// (never a doomed bare-"python" spawn on end-user machines). util::find_python now
+// serves the TRAINING role only.

@@ -1,5 +1,19 @@
+# Converter runtime-chain dependencies (the 6 scripts Rust invokes + architectures/).
+# S42 audit: this file previously omitted four runtime deps (pyyaml/librosa/tqdm/
+# faiss-cpu) and claimed numpy<2 while the live-tested dev venv runs numpy 2.2.6 —
+# both fixed below. verify/-only heavies (transformers, audio-separator, einops, …)
+# are deliberately NOT listed: they belong to the dev venv only.
+#
+# Distribution note (S42): shipped builds run these scripts on the embedded runtime
+# packs (training/packs/, unified set @ torch 2.11 / numpy 1.26.4 — converter A/B
+# gate-verified). This file documents the DEV venv envelope (torch 2.12.0+cpu /
+# numpy 2.2.6 known-good).
 torch>=2.1.0
-numpy>=1.24.0,<2.0
+numpy>=1.24.0
 onnx>=1.14.0
 onnxruntime>=1.16.0
 onnxconverter-common>=1.14.0
+pyyaml
+librosa
+tqdm
+faiss-cpu

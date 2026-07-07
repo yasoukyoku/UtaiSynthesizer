@@ -1,9 +1,17 @@
 # Training sidecar venv (training/.venv). Dev machine: python 3.10.
-# torch/torchaudio are installed separately with the CUDA index (release-time env
-# configurator will own this step; see project memory "torch 环境配置" backlog):
+# torch/torchaudio are installed separately with the CUDA index:
 #   python -m pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 # (torchaudio: the vendored so-vits rmvpe f0 predictor resamples with
 #  torchaudio.transforms.Resample — same-version pair with torch is mandatory)
+#
+# ---- S42: the SHIPPED environment is no longer a venv ----
+# Distribution = embedded runtime packs (training/packs/): ONE unified dependency
+# set (this file + the converter runtime additions onnx/onnxconverter-common/
+# faiss-cpu) built per torch backend (cpu / nv-cu130 / xpu / amd — torch 2.11 axis).
+# Lockfiles in training/packs/locks/ are generated from the VALIDATED staging env;
+# regenerate ONLY after re-running the gates (converter A/B + envtest + Phase B
+# training gates). THIS dev venv stays on torch 2.5.1+cu121 until the Phase B axis
+# migration lands (weights_only / nvSTFT return_complex / torch.amp shim).
 numpy<2
 scipy
 librosa>=0.10

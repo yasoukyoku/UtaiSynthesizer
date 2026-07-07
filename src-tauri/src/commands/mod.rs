@@ -5,6 +5,7 @@ pub mod logs;
 pub mod models;
 pub mod msst_models;
 pub mod project;
+pub mod pyenv;
 pub mod separation;
 pub mod settings;
 pub mod training;

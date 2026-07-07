@@ -57,6 +57,9 @@ training/output/
 training/logs/
 training/datasets/
 
+# Runtime-pack builder output (S42 — interpreter downloads + staged trees + dist archives)
+training/packs/build/
+
 # Temp
 *.tmp
 *.bak

@@ -11,6 +11,20 @@ export default defineConfig(async () => ({
     strictPort: true,
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
-    watch: { ignored: ["**/src-tauri/**"] },
+    // Ignore every non-frontend tree — vite otherwise watches the WHOLE repo root:
+    // installing a runtime pack (10k+ files under data/runtimes) OOM'd Node's 4 GB
+    // heap and took the entire dev server down (S42 live crash), and the .venv /
+    // model dirs are GB-scale watcher churn for zero HMR value.
+    watch: {
+      ignored: [
+        "**/src-tauri/**",
+        "**/data/**",
+        "**/training/**",
+        "**/converter/**",
+        "**/runtime/**",
+        "**/models/**",
+        "**/python/**",
+      ],
+    },
   },
 }));

@@ -353,7 +353,7 @@ pub(crate) fn resolve_sovits_quality(
 
     // Original mutual exclusion: any diffusion mode disables the enhancer.
     if diffusion_on && options.nsf_enhance {
-        tracing::warn!("浅扩散/仅扩散开启——按原版行为禁用 NSF 增强器");
+        tracing::warn!("shallow/only-diffusion active — NSF enhancer disabled (upstream mutual exclusion)");
         options.nsf_enhance = false;
     }
 
@@ -911,7 +911,7 @@ pub async fn run_sovits(
                         ));
                         break;
                     }
-                    Err(e) => tracing::warn!("检索资产 {} 无法加载，跳过聚类混合：{}", index_path.display(), e),
+                    Err(e) => tracing::warn!("retrieval asset {} failed to load — skipping cluster blend: {}", index_path.display(), e),
                 }
             }
             // kmeans 文件名用 speaker 名（config.speakers 反查 id）
@@ -925,7 +925,7 @@ pub async fn run_sovits(
                             ));
                             break 'dirs;
                         }
-                        Err(e) => tracing::warn!("聚类资产 {} 无法加载，跳过聚类混合：{}", kmeans_path.display(), e),
+                        Err(e) => tracing::warn!("cluster asset {} failed to load — skipping cluster blend: {}", kmeans_path.display(), e),
                     }
                 }
             }

@@ -43,6 +43,10 @@ zip = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 reqwest = { version = "0.12", features = ["stream"] }
 futures-util = "0.3"
+# S42 embedded-runtime packs: sha256 part verification + .tar.zst pack extraction
+sha2 = "0.10"
+tar = "0.4"
+zstd = "0.13"
 rand = "0.8"
 rand_distr = "0.4"
 utai-dsp = { path = "crates/utai-dsp" }

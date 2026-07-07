@@ -43,7 +43,8 @@
     "task_workflow": "ワークフロー処理",
     "task_download": "モデルのダウンロード",
     "task_convert": "モデル変換",
-    "task_cuda_download": "CUDA ランタイムのダウンロード"
+    "task_cuda_download": "CUDA ランタイムのダウンロード",
+    "task_pyenv_install": "トレーニング環境ランタイムのインストール"
   },
   "tray": {
     "show": "ウィンドウを表示",

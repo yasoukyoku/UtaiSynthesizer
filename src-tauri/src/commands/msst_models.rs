@@ -116,8 +116,8 @@ pub async fn download_msst_model(
     precision: Option<String>,
     // The catalog KNOWS the architecture — official demucs weights have hash filenames
     // (5c90dfd2-34c22ccb.th) that name-detection can't classify, which silently skipped
-    // auto-convert and dropped runs into the python sidecar. Name detection stays as the
-    // fallback for URL/local imports without catalog metadata.
+    // auto-convert and left the model unrunnable (native pipeline only since S42).
+    // Name detection stays as the fallback for URL/local imports without catalog metadata.
     architecture: Option<String>,
 ) -> Result<String, String> {
     let dir = state.msst_models_dir.clone();
@@ -203,8 +203,8 @@ pub async fn download_msst_model(
     );
     let arch = resolve_architecture(architecture.as_deref(), &filename);
     // Legacy MDX-Net models are ALREADY .onnx — the "conversion" validates the graph and
-    // writes the sidecar json (without which the native pipeline refuses the model and it
-    // silently falls into the python sidecar). Only that arch may convert an .onnx.
+    // writes the sidecar json (without which the native pipeline refuses the model).
+    // Only that arch may convert an .onnx.
     let is_mdx_net_onnx = arch == "mdx_net"
         && dest.extension().and_then(|e| e.to_str()) == Some("onnx");
     if arch != "unknown" && (is_model_file || is_mdx_net_onnx) {
@@ -223,7 +223,7 @@ pub async fn download_msst_model(
                 tracing::info!("Converted {} -> {}", filename, onnx_path);
             }
             Err(e) => {
-                tracing::warn!("Auto-conversion failed for {}: {} (model still usable via sidecar)", filename, e);
+                tracing::warn!("Auto-conversion failed for {}: {} (model unusable until converted — retry via the convert button)", filename, e);
             }
         }
     }
@@ -352,7 +352,7 @@ async fn run_converter(
     app_dir: &Path,
     precision: Option<&str>,
 ) -> Result<String, String> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir).map_err(|e| e.to_string())?;
     let script = app_dir.join("converter").join("convert.py");
 
     if !script.exists() {
@@ -406,7 +406,7 @@ async fn run_converter(
 /// the proven convert_float_to_float16 + Cast-retarget recipe). Writes `<stem>.fp16.onnx`
 /// next to the input; the shared `<stem>.json` is untouched. Takes ~1-2 min, no torch export.
 async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, String> {
-    let python = crate::util::find_python(&app_dir.join("converter"), app_dir);
+    let python = crate::pyenv::converter_python_checked(app_dir).map_err(|e| e.to_string())?;
     let script = app_dir.join("converter").join("onnx_fp16.py");
     if !script.exists() {
         return Err(format!("fp16 converter script not found: {}", script.display()));
@@ -433,7 +433,8 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
     Ok(out_path.to_string_lossy().to_string())
 }
 
-// find_converter_python moved to crate::util::find_python (shared with models/convert.rs).
+// Converter interpreter resolution = crate::pyenv::converter_python_checked (S42) —
+// see models/convert.rs. util::find_python now serves the TRAINING role only.
 
 /// Catalog-provided architecture wins (validated against the known set); filename heuristics
 /// are only the fallback for URL/local imports without catalog metadata.
