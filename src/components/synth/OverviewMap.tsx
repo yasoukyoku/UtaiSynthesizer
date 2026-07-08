@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { useProjectStore } from "../../store/project";
+import { useProjectStore, useTimeAxis } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { PIXELS_PER_TICK } from "../../lib/constants";
@@ -17,7 +17,7 @@ export function OverviewMap() {
   // mute/solo flips), so it's cached in an offscreen and rebuilt only when its content key changes — every
   // scroll/playback frame just blits the cache and draws the cheap overlay (viewport + playhead).
   const tracks = useProjectStore((s) => s.tracks);
-  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const timeAxis = useTimeAxis();
   const tempo = useProjectStore((s) => s.tempo);
   const playheadTick = useProjectStore((s) => s.playheadTick);
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
@@ -28,7 +28,7 @@ export function OverviewMap() {
 
   // SAME basis as DawView's scroll width, so the viewport box + drag map 1:1 to the real scroll range
   // (a smaller minimap range made the box fill the map on short projects → seek/scroll both dead).
-  const totalTicks = computeTotalTicks(tracks, timeSignature[0]);
+  const totalTicks = computeTotalTicks(tracks, timeAxis);
 
   const waveRef = useRef<OffscreenCanvas | null>(null);
   const waveKeyRef = useRef("");

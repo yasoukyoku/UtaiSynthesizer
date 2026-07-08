@@ -1,6 +1,8 @@
 import { create } from "zustand";
+import { useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Track, Segment, LaneControl, ProcessedOutput, LaneClip } from "../types/project";
+import { TimeAxis } from "../lib/timeAxis";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
   laneGroupName,
@@ -58,6 +60,12 @@ interface ProjectState {
   /** Delete many segments at once (multi-selection) in one update. */
   deleteSegments: (items: { trackId: string; segmentId: string }[]) => void;
   setTempo: (bpm: number) => void;
+  /** Set the GLOBAL time signature (tempo & meter are timeline-level, shared by every track — never
+   *  per-track). Keeps the scalar `[num,den]` shape (no serialization/undo-snapshot migration): the
+   *  new array reference makes installHistory capture one undo step and marks the project dirty. Unlike
+   *  setTempo this moves NO ticks — notes/clips keep their positions; only the bar/beat GRID re-derives
+   *  (via TimeAxis). Denominator finally goes live (den=8 ⇒ 240 ticks/beat, 1440/bar for 6/8). */
+  setTimeSignature: (num: number, den: number) => void;
   /** Open/close a BPM edit session (the Toolbar input's focus/blur) — setTempo scales from the
    *  session-start geometry so intermediate keystroke values can't compound rounding error. */
   beginTempoScale: () => void;
@@ -325,6 +333,19 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
   },
 
+  setTimeSignature: (num, den) => {
+    // Sanitize to a valid meter: numerator ≥1 integer; denominator a power of two (the only values
+    // for which TICKS_PER_BEAT*4/den is an exact tick count). The Toolbar only offers valid options,
+    // so this is defensive. A NEW array reference is required — installHistory & autosave both key off
+    // `timeSignature !== prev.timeSignature`. No tick geometry moves (meter only re-grids).
+    const n = Math.max(1, Math.round(num));
+    const ALLOWED = [1, 2, 4, 8, 16, 32];
+    const d = ALLOWED.includes(den) ? den : 4;
+    const cur = get().timeSignature;
+    if (cur[0] === n && cur[1] === d) return; // no-op guard: don't churn undo/dirty on a same-value set
+    set({ timeSignature: [n, d], dirty: true });
+  },
+
   beginTempoScale: () => {
     tempoScaleBase = { tempo: get().tempo, tracks: get().tracks, playheadTick: get().playheadTick };
   },
@@ -542,3 +563,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       }),
     })),
 }));
+
+/**
+ * THE single construction site for the current project's TimeAxis (S48 Phase 0) — the one place bar
+ * geometry is derived from the global meter, so no component re-implements `ticksPerBar` math. Rebuilds
+ * only when the meter changes (the store's `timeSignature` array is reference-stable between meter edits,
+ * so the memo holds). Phase 0 = a single meter section at bar 0; when per-section meter (`timeSignatures[]`)
+ * lands, ONLY this hook's construction changes — every consumer already calls position-based TimeAxis
+ * methods, so they need no edit.
+ */
+export function useTimeAxis(): TimeAxis {
+  const ts = useProjectStore((s) => s.timeSignature);
+  return useMemo(() => TimeAxis.global(ts[0], ts[1]), [ts]);
+}

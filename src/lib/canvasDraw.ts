@@ -1,5 +1,5 @@
-import { TICKS_PER_BEAT } from "./constants";
 import { rgba, ACCENT_RGB } from "./trackColors";
+import type { TimeAxis } from "./timeAxis";
 
 /**
  * Single source of truth for the timeline chrome that the arrangement canvas, the timeline ruler and the
@@ -22,8 +22,9 @@ export interface BeatGridOpts {
   scrollX: number;
   width: number;
   height: number;
-  /** TICKS_PER_BEAT * timeSignature[0]. */
-  ticksPerBar: number;
+  /** THE bar/beat geometry authority (S48 Phase 0) — replaces the fixed `ticksPerBar` + 480-spaced loop
+   *  so the beat spacing and downbeats follow the (possibly per-section) meter. */
+  axis: TimeAxis;
   /** Accent alpha for bar (downbeat) lines. */
   barAlpha: number;
   /** Accent alpha for the in-between beat lines. */
@@ -35,8 +36,10 @@ export interface BeatGridOpts {
 
 /**
  * Draw the vertical bar/beat grid over the visible tick range. ONE source for the grid-line loop shared
- * by the arrangement canvas and the timeline ruler — each passes its own alphas + beat-tick top. Aligns
- * the first line to the beat at/below the left edge (lines left of x=0 are simply clipped).
+ * by the arrangement canvas and the timeline ruler — each passes its own alphas + beat-tick top. The
+ * lines (positions + which are downbeats) come from the TimeAxis, which floors the first line to the
+ * beat at/below the left edge (lines left of x=0 are simply clipped). For a 4/4 project this is the exact
+ * pre-Phase-0 line set (beats every 480, bars every 1920) — the grid is bit-for-bit unchanged.
  */
 export function drawBeatGrid(ctx: AnyCtx, o: BeatGridOpts) {
   const beatTop = o.beatTop ?? 0;
@@ -44,9 +47,8 @@ export function drawBeatGrid(ctx: AnyCtx, o: BeatGridOpts) {
   const beatColor = rgba(ACCENT_RGB, o.beatAlpha);
   const startTick = Math.floor(o.scrollX / o.ppt);
   const endTick = Math.ceil((o.scrollX + o.width) / o.ppt);
-  for (let tick = startTick - (startTick % TICKS_PER_BEAT); tick < endTick; tick += TICKS_PER_BEAT) {
+  for (const { tick, isBar } of o.axis.gridLinesInRange(startTick, endTick)) {
     const x = tick * o.ppt - o.scrollX;
-    const isBar = tick % o.ticksPerBar === 0;
     ctx.strokeStyle = isBar ? barColor : beatColor;
     ctx.lineWidth = isBar ? 1 : 0.5;
     ctx.beginPath();

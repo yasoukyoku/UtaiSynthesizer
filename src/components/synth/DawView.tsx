@@ -5,7 +5,7 @@ import { TimelineRuler } from "./TimelineRuler";
 import { Arrangement } from "./Arrangement";
 import { HScrollbar } from "./HScrollbar";
 import { useAppStore } from "../../store/app";
-import { useProjectStore } from "../../store/project";
+import { useProjectStore, useTimeAxis } from "../../store/project";
 import { PIXELS_PER_TICK, TRACK_ADD_FOOTER } from "../../lib/constants";
 import { computeTotalTracksHeight, computeTotalTicks } from "../../lib/trackLayout";
 import "./DawView.css";
@@ -23,7 +23,7 @@ export function DawView() {
   const setCanvasWidth = useAppStore((s) => s.setCanvasWidth);
   const setCanvasHeight = useAppStore((s) => s.setCanvasHeight);
   const tracks = useProjectStore((s) => s.tracks);
-  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const timeAxis = useTimeAxis();
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   // Vertical-zoom wheel events are coalesced into one setVZoom per frame (high-res wheels fire many
   // per frame; applying each = many re-renders/redraws = sluggish).
@@ -56,7 +56,7 @@ export function DawView() {
     if (st.scrollY > maxY) st.setScroll(st.scrollX, maxY);
   }, [tracks, canvasHeight]);
 
-  const totalWidth = computeTotalTicks(tracks, timeSignature[0]) * PIXELS_PER_TICK * zoom;
+  const totalWidth = computeTotalTicks(tracks, timeAxis) * PIXELS_PER_TICK * zoom;
 
   // Wheel over the track-header column: Alt or Ctrl → vertical (track-height) zoom; plain →
   // vertical scroll, clamped so a partially-filled column can't scroll its content out of view.

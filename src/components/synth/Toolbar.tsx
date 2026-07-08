@@ -1,20 +1,28 @@
 import { useEffect, useRef, useCallback } from "react";
-import { useProjectStore } from "../../store/project";
+import { useProjectStore, useTimeAxis } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
-import { TICKS_PER_BEAT } from "../../lib/constants";
+import type { TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece, liveSelectedLane } from "../../lib/laneEdit";
+import { Dropdown } from "../common/Dropdown";
 import { OverviewMap } from "./OverviewMap";
 import "./Toolbar.css";
 
+// Editable time-signature options (house-styled custom Dropdown — no native <select>). Numerator 1–16
+// covers every common meter (5/4, 7/8, 12/8, …); denominator is restricted to powers of two — the only
+// values for which TICKS_PER_BEAT*4/den is a whole tick count (den=8 ⇒ 240 ticks/beat, 1440/bar).
+const TS_NUM_OPTIONS = Array.from({ length: 16 }, (_, i) => ({ value: i + 1, label: String(i + 1) }));
+const TS_DEN_OPTIONS = [2, 4, 8, 16].map((d) => ({ value: d, label: String(d) }));
+
 export function Toolbar() {
   const { t } = useTranslation();
-  const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, tracks } =
+  const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature, tracks } =
     useProjectStore();
+  const timeAxis = useTimeAxis();
   const { isPlaying, setPlaying, audioFiles, seeking, scheduleVersion } = useAudioStore();
   const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
   const { splitSegment, deleteSegments } = useProjectStore();
@@ -318,9 +326,19 @@ export function Toolbar() {
       </div>
 
       <div className="toolbar-section time-sig">
-        <span className="mono time-display">
-          {timeSignature[0]}/{timeSignature[1]}
-        </span>
+        <Dropdown
+          className="timesig-dd"
+          value={timeSignature[0]}
+          options={TS_NUM_OPTIONS}
+          onChange={(n) => setTimeSignature(n, timeSignature[1])}
+        />
+        <span className="mono time-sig-slash">/</span>
+        <Dropdown
+          className="timesig-dd"
+          value={timeSignature[1]}
+          options={TS_DEN_OPTIONS}
+          onChange={(d) => setTimeSignature(timeSignature[0], d)}
+        />
       </div>
 
       <div className="toolbar-divider" />
@@ -328,7 +346,7 @@ export function Toolbar() {
       <div className="toolbar-section position-section">
         <label className="toolbar-label">{t("toolbar.position")}</label>
         <span className="mono position-display">
-          {formatPosition(playheadTick, timeSignature)}
+          {formatPosition(playheadTick, timeAxis)}
         </span>
       </div>
 
@@ -382,10 +400,9 @@ export function Toolbar() {
   );
 }
 
-function formatPosition(tick: number, timeSig: [number, number]): string {
-  const ticksPerBar = TICKS_PER_BEAT * timeSig[0];
-  const bar = Math.floor(tick / ticksPerBar) + 1;
-  const beat = Math.floor((tick % ticksPerBar) / TICKS_PER_BEAT) + 1;
-  const sub = Math.floor(((tick % ticksPerBar) % TICKS_PER_BEAT) / (TICKS_PER_BEAT / 4));
+function formatPosition(tick: number, axis: TimeAxis): string {
+  // bar:beat:sub via the meter authority — identical to the old fixed 480-based math for 4/4, but a
+  // 6/8 bar now reads 6 beats of 240 ticks. `sub` is a 0-based quarter-of-beat (matches the old readout).
+  const { bar, beat, sub } = axis.tickToBarBeat(tick);
   return `${bar}:${beat}:${sub.toString().padStart(2, "0")}`;
 }

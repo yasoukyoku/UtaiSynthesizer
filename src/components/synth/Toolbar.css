@@ -121,7 +121,24 @@
   margin: 0;
 }
 
-.time-display {
+/* Editable time signature — two compact custom Dropdowns (square, house-styled) + a slash. Override the
+   shared Dropdown's default flex:1 so each stays a fixed narrow width inside the toolbar row, and tighten
+   the trigger padding to fit the 40px-tall toolbar. */
+.time-sig {
+  gap: 2px;
+}
+
+.time-sig .timesig-dd {
+  flex: none;
+  width: 46px;
+}
+
+.time-sig .timesig-dd .ut-dropdown-trigger {
+  padding: 3px 6px;
+  gap: 4px;
+}
+
+.time-sig-slash {
   font-size: var(--font-size-sm);
   color: var(--text-secondary);
 }

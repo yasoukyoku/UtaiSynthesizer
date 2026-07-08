@@ -1,8 +1,9 @@
 import { useRef, useEffect, useCallback } from "react";
-import { useProjectStore } from "../../store/project";
+import { useProjectStore, useTimeAxis } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
-import { TICKS_PER_BEAT, PIXELS_PER_TICK } from "../../lib/constants";
+import { PIXELS_PER_TICK } from "../../lib/constants";
+import { ticksToMs } from "../../lib/audio/laneOps";
 import { collectSnapTicks, snapTick, SNAP_PX } from "../../lib/snapping";
 import { drawBeatGrid, drawPlayhead, CANVAS_BORDER } from "../../lib/canvasDraw";
 import "./TimelineRuler.css";
@@ -16,7 +17,7 @@ export function TimelineRuler() {
   // Per-field selectors — re-render only on tempo/timeSignature change (NOT on playheadTick,
   // which would re-render every playback frame). scroll/zoom/playhead drive the canvas via subs.
   const tempo = useProjectStore((s) => s.tempo);
-  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const timeAxis = useTimeAxis();
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
   const dragging = useRef(false);
   const mouseClientXRef = useRef(0); // latest pointer X, so the auto-scroll tick can re-seek while held still
@@ -162,28 +163,28 @@ export function TimelineRuler() {
     const ppt = pptRef.current;
     const playheadTick = playheadRef.current;
 
-    const ticksPerBar = TICKS_PER_BEAT * timeSignature[0];
-    const secsPerBar = (60.0 / tempo) * timeSignature[0];
-
     ctx.fillStyle = "#1a2236";
     ctx.fillRect(0, 0, width, height);
 
     const startTick = Math.floor(scrollX / ppt);
-    const endTick = Math.ceil((scrollX + width) / ppt);
-    const startBar = Math.floor(startTick / ticksPerBar);
-    const endBar = Math.ceil(endTick / ticksPerBar);
 
-    drawBeatGrid(ctx, { ppt, scrollX, width, height, ticksPerBar, barAlpha: 0.4, beatAlpha: 0.15, beatTop: height - 6 });
+    drawBeatGrid(ctx, { ppt, scrollX, width, height, axis: timeAxis, barAlpha: 0.4, beatAlpha: 0.15, beatTop: height - 6 });
 
-    for (let bar = startBar; bar <= endBar; bar++) {
-      const tick = bar * ticksPerBar;
+    // Bar number + wall-clock label at each bar downbeat. Bar POSITIONS come from the TimeAxis
+    // (meter-aware: 6/8 bars are 1440 ticks, not 4*480), and the label TIME is the tick→ms of the
+    // downbeat (tempo-only, meter never enters ticksToMs), so a 6/8 bar reads 3 quarter-beats of time,
+    // not 6. For a 4/4 project this is bit-for-bit the old `bar*ticksPerBar` / `bar*secsPerBar`.
+    const startBar = timeAxis.tickToBarBeat(startTick).bar - 1; // 0-based bar containing the left edge
+    for (let bar = startBar; ; bar++) {
+      const tick = timeAxis.tickAtBar(bar);
       const x = tick * ppt - scrollX;
+      if (x > width) break; // past the right edge — every later bar is further right
       ctx.fillStyle = "#e8ecf4";
       ctx.font = "bold 10px monospace";
       ctx.fillText(String(bar + 1), x + 3, 10);
       ctx.fillStyle = "#556b94";
       ctx.font = "9px monospace";
-      ctx.fillText(formatTime(bar * secsPerBar), x + 3, 20);
+      ctx.fillText(formatTime(ticksToMs(tick, tempo) / 1000), x + 3, 20);
     }
 
     // Playhead marker on ruler
@@ -198,12 +199,12 @@ export function TimelineRuler() {
     ctx.moveTo(0, height - 0.5);
     ctx.lineTo(width, height - 0.5);
     ctx.stroke();
-  }, [tempo, timeSignature]);
+  }, [tempo, timeAxis]);
 
   drawRef.current = draw;
 
-  // Redraw when content (tempo/timeSignature) changes. scroll/zoom/playhead redraws come from
-  // the store subscriptions below.
+  // Redraw when content (tempo/meter) changes — timeAxis is a stable memo that only changes when the
+  // time signature does. scroll/zoom/playhead redraws come from the store subscriptions below.
   useEffect(() => { draw(); }, [draw]);
 
   // Subscribe to scroll/zoom (app) + playhead (project); update refs and repaint imperatively.

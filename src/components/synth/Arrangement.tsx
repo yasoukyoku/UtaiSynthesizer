@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { useProjectStore } from "../../store/project";
+import { useProjectStore, useTimeAxis } from "../../store/project";
+import type { TimeAxis } from "../../lib/timeAxis";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { useHistoryStore } from "../../store/history";
@@ -103,7 +104,8 @@ export function Arrangement() {
   // subscriptions and drive the canvas imperatively (see the subscription effect below), so
   // scrolling and playback don't re-render this component or its DAW siblings.
   const tracks = useProjectStore((s) => s.tracks);
-  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const timeSignature = useProjectStore((s) => s.timeSignature); // scalar kept for the static-layer cache key
+  const timeAxis = useTimeAxis();
   const tempo = useProjectStore((s) => s.tempo);
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
   const updateTrack = useProjectStore((s) => s.updateTrack);
@@ -1242,7 +1244,7 @@ export function Arrangement() {
       }
     }
 
-    const staticKey = `${ppt}:${scale}:${scrollX}:${scrollY}:${tempo}:${timeSignature[0]}:${selKeyStr}:${selectedLaneKey ?? ""}:${dragOver}:${ghostGap ? `${ghostGap.index}_${ghostGap.height}` : ""}:${Object.keys(audioFiles).length}:${tracks.map(t => {
+    const staticKey = `${ppt}:${scale}:${scrollX}:${scrollY}:${tempo}:${timeSignature[0]}/${timeSignature[1]}:${selKeyStr}:${selectedLaneKey ?? ""}:${dragOver}:${ghostGap ? `${ghostGap.index}_${ghostGap.height}` : ""}:${Object.keys(audioFiles).length}:${tracks.map(t => {
       // Both mute sources: per-row laneMutes + the legacy per-laneId muted flag (isLaneRowMuted reads both).
       const laneMutes = Object.entries(t.laneControls).map(([k, v]) => `${k}${v?.muted ? 1 : 0}`).join("|")
         + "/" + Object.entries(t.laneMutes ?? {}).map(([k, v]) => `${k}${v ? 1 : 0}`).join("|");
@@ -1275,7 +1277,7 @@ export function Arrangement() {
       }
       const oc = offscreenRef.current!.getContext("2d")!;
       oc.setTransform(dpr, 0, 0, dpr, 0, 0);
-      drawStaticContent(oc, width, height, tracks, audioFiles, ppt, scrollX, scrollY, timeSignature, tempo, selectedKeys, selectedLaneKey, dragOver, scale, ghostGap);
+      drawStaticContent(oc, width, height, tracks, audioFiles, ppt, scrollX, scrollY, timeAxis, tempo, selectedKeys, selectedLaneKey, dragOver, scale, ghostGap);
       staticDepsRef.current = staticKey;
     }
 
@@ -1395,7 +1397,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, tempo, selectedSegments, selectedLane, dragOver, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, t]);
 
   drawRef.current = draw;
 
@@ -1451,15 +1453,13 @@ function drawStaticContent(
   tracks: import("../../types/project").Track[],
   audioFiles: Record<string, import("../../store/audio").AudioTrackData>,
   ppt: number, scrollX: number, scrollY: number,
-  timeSignature: [number, number], tempo: number,
+  axis: TimeAxis, tempo: number,
   selectedKeys: Set<string>,
   selectedLaneKey: string | null,
   dragOver: boolean,
   scale: number,
   ghostGap: { index: number; height: number } | null,
 ) {
-  const ticksPerBar = TICKS_PER_BEAT * timeSignature[0];
-
   // Open a new waveform-cache generation: every getWaveformCache call below is protected from
   // eviction for this pass, so the visible working set never thrashes (rebuilds) frame-to-frame.
   beginWaveformFrame();
@@ -1475,7 +1475,7 @@ function drawStaticContent(
     ctx.strokeRect(1.5, 1.5, width - 3, height - 3);
   }
 
-  drawBeatGrid(ctx, { ppt, scrollX, width, height, ticksPerBar, barAlpha: 0.18, beatAlpha: 0.05 });
+  drawBeatGrid(ctx, { ppt, scrollX, width, height, axis, barAlpha: 0.18, beatAlpha: 0.05 });
 
   const yOffsets = computeTrackYOffsets(tracks, scale);
   const headerH = TRACK_HEADER_HEIGHT * scale;

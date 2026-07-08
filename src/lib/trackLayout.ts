@@ -1,5 +1,6 @@
 import type { Track, Segment, ProcessedOutput, Workflow, LaneControl } from "../types/project";
-import { TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TICKS_PER_BEAT } from "./constants";
+import { TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT } from "./constants";
+import type { TimeAxis } from "./timeAxis";
 import { laneRowKey, laneGroupName, laneGroupId, laneOpsSig, materializeClips } from "./audio/laneOps";
 import { peaksSignature } from "./waveformCache";
 
@@ -23,10 +24,11 @@ export function orderProcessedOutputs(outputs: ProcessedOutput[], workflow?: Wor
 
 /** Total tick span of the arrangement: at least 32 bars of scroll headroom, or the last segment end.
  *  Shared by DawView (scroll width / HScrollbar) and OverviewMap so the minimap's viewport box and
- *  drag map 1:1 to the real scrollable range. */
-export function computeTotalTicks(tracks: Track[], beatsPerBar: number): number {
+ *  drag map 1:1 to the real scrollable range. The 32-bar floor is meter-aware (TimeAxis.ticksForBars);
+ *  for a 4/4 project it is 480*4*32 = 61440, unchanged. */
+export function computeTotalTicks(tracks: Track[], axis: TimeAxis): number {
   return Math.max(
-    TICKS_PER_BEAT * beatsPerBar * 32,
+    axis.ticksForBars(32),
     ...tracks.flatMap((t) => t.segments.map((s) => s.startTick + s.durationTicks)),
   );
 }
