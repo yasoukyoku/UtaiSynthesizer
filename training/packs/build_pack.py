@@ -60,7 +60,13 @@ VARIANTS = {
         "lock": "runtime-nv-cu130.lock.txt",
         "label": "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）",
     },
-    # Phase C/D: "xpu", "amd" — one lockfile each, same recipe.
+    "amd": {
+        "lock": "runtime-amd.lock.txt",
+        # AMD/TheRock ROCm; cp310 (SAME PBS interpreter as cpu/nv — no per-variant
+        # python needed, the earlier ABI worry was moot). Experimental tier.
+        "label": "AMD 运行时（TheRock ROCm；RDNA3/4 训练 + 模型转换，实验性）",
+    },
+    # Phase C: "xpu" — one lockfile, same recipe (cp310, download.pytorch.org/whl/xpu).
 }
 
 PART_BYTES = 1_900_000_000  # < GitHub release 2 GiB per-file cap

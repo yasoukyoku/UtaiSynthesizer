@@ -320,7 +320,25 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-nv-cu130-v1.manifest.json",
     ],
-    // xpu / amd 变体按 Phase C/D 依次加入 —— 见 s42 设计 §5。
+}, CatalogEntry {
+    id: "runtime-amd-v1",
+    variant: "amd",
+    label: "AMD 运行时（TheRock ROCm；RDNA3/4 训练 + 模型转换，实验性）",
+    // Real numbers from the S44 build: 1.172 GB download / 4.50 GB on disk (single
+    // part, under the 1.9 GiB split cap). Validated end-to-end on the dev machine's
+    // Radeon 780M (gfx1103): flat-PBS-layout torch-rocm import + full envtest 20/20
+    // PASS (tiny_gan conv/convT converges identically to NVIDIA; fp16+GradScaler OK).
+    download_bytes: 1_171_991_360,
+    disk_bytes: 4_504_503_445,
+    // EXPERIMENTAL tier (design §4.3): TheRock ROCm is a pinned nightly; MIOpen ships
+    // no precompiled conv DB for gfx1103 (#6335) → first-encounter conv configs pay a
+    // one-time kernel-compile cost, then cache. envtest is the release gate.
+    experimental: true,
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
+    ],
+    // xpu 变体按 Phase C 加入 —— 见 s42 设计 §5。
 }];
 
 /// Manifest URL candidates for a catalog entry: published URLs + the dev override.

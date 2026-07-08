@@ -36,6 +36,68 @@ def _emit(obj):
     sys.stdout.flush()
 
 
+# ─── §4.5(c) XPU CPU-fallback capture ──────────────────────────────────────
+# On an Intel-GPU machine, PYTORCH_ENABLE_XPU_FALLBACK lets an unimplemented xpu op
+# run on the CPU instead of hard-crashing, and PYTORCH_DEBUG_XPU_FALLBACK makes torch
+# WARN once per fallen-back op. We record those warnings during the on-device checks
+# and surface any HOT op (conv/stft/fft — the HiFi-GAN / mel throughput path) as an
+# explicit WARN: a silent CPU fallback that tanks training must never read as a green
+# pass (design §4.5). Inert on cpu/cuda — no xpu fallback path exists there, so the
+# accumulator stays empty and the cuda/cpu verdict is byte-unchanged.
+import contextlib  # noqa: E402
+import re  # noqa: E402
+import warnings  # noqa: E402
+
+_FALLBACK_OPS = set()
+# torch's fallback WARN text (same shape as the MPS fallback message); tolerate a few
+# phrasings so a torch-version wording tweak doesn't silently stop the capture.
+_FALLBACK_SIG = re.compile(
+    r"fall\s*back to run on the CPU"
+    r"|not currently supported on the XPU"
+    r"|falling back to (?:the )?CPU",
+    re.I,
+)
+_OP_QUOTED = re.compile(r"operator '([^']+)'")
+_OP_ATEN = re.compile(r"(aten::[A-Za-z0-9_.]+)")
+_HOT_SUBSTRINGS = ("conv", "stft", "istft", "fft")
+
+
+class _Warn:
+    """A check returns _Warn(detail) to report status='warn' — visible but non-fatal:
+    it does NOT flip report['overall'] (so the pass/fail gate the Rust side reads is
+    unchanged and a tolerable cold-op fallback never blocks a pack); the amber UI
+    treatment keys off report['warnings_present'] instead."""
+
+    __slots__ = ("detail",)
+
+    def __init__(self, detail):
+        self.detail = detail
+
+
+def _extract_fallback_op(msg):
+    m = _OP_QUOTED.search(msg) or _OP_ATEN.search(msg)
+    return m.group(1) if m else msg.strip()[:60]
+
+
+def _classify_hot(ops):
+    return {op for op in ops if any(s in op.lower() for s in _HOT_SUBSTRINGS)}
+
+
+@contextlib.contextmanager
+def _capture_fallbacks(sink):
+    """Record torch's XPU→CPU fallback warnings emitted inside the block into `sink`.
+    try/finally so a check that raises part-way still contributes what it triggered."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            yield
+        finally:
+            for wm in caught:
+                msg = str(getattr(wm, "message", wm))
+                if _FALLBACK_SIG.search(msg):
+                    sink.add(_extract_fallback_op(msg))
+
+
 def _tone(sr=44100, freq=220.0, secs=1.0, amp=0.6):
     import numpy as np
 
@@ -361,7 +423,10 @@ def check_tiny_gan(ctx):
     """A miniature GAN with Conv1d + ConvTranspose1d — front/backward/optimizer on the
     op family HiFi-GAN training lives on (and the exact family with known MIOpen /
     XPU risk on non-NVIDIA backends). Asserts the L1 term actually LEARNS (robust
-    decrease), gradients flow, everything stays finite."""
+    decrease), gradients flow AND are finite on BOTH nets (§4.5(b): non-zero non-NaN —
+    a partially-NaN grad set must fail loudly, not masquerade as 'no gradient'),
+    everything stays finite. Runs under the fallback capture at its call site, so a
+    conv silently falling to CPU on xpu is recorded, not hidden."""
     import torch
     import torch.nn as nn
 
@@ -395,6 +460,9 @@ def check_tiny_gan(ctx):
         opt_d.zero_grad(set_to_none=True)
         loss_d = torch.mean((d(target) - 1.0) ** 2) + torch.mean(d(fake.detach()) ** 2)
         loss_d.backward()
+        for p in d.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                raise RuntimeError("D 梯度含 NaN/Inf (step %d)" % _step)
         opt_d.step()
         # G step (L1 dominates so the learning check is deterministic-ish)
         opt_g.zero_grad(set_to_none=True)
@@ -402,9 +470,12 @@ def check_tiny_gan(ctx):
         loss_g = l1 + 0.1 * torch.mean((d(fake) - 1.0) ** 2)
         loss_g.backward()
         for p in g.parameters():
-            if p.grad is not None and float(p.grad.abs().sum()) > 0:
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                raise RuntimeError("G 梯度含 NaN/Inf (step %d)" % _step)
+            if float(p.grad.abs().sum()) > 0:
                 grad_seen = True
-                break
         opt_g.step()
         if not (torch.isfinite(loss_d) and torch.isfinite(loss_g)):
             raise RuntimeError("loss 出现 NaN/Inf (step %d)" % _step)
@@ -450,12 +521,21 @@ def check_gpu_stft_vs_cpu(ctx):
     win = torch.hann_window(2048)
     ref = torch.stft(x, 2048, hop_length=512, window=win, center=True, return_complex=True)
     xd = x.to(dev)
-    sd = torch.stft(xd, 2048, hop_length=512, window=win.to(dev), center=True, return_complex=True)
+    wd = win.to(dev)
+    sd = torch.stft(xd, 2048, hop_length=512, window=wd, center=True, return_complex=True)
     err = (sd.cpu() - ref).abs().max().item()
     scale = ref.abs().max().item()
     if not (err < 1e-3 * max(scale, 1.0)):
         raise RuntimeError("GPU stft 偏离 CPU 参考: max_abs=%.3e (scale %.2f)" % (err, scale))
-    return "max_abs=%.2e vs CPU (scale %.2f)" % (err, scale)
+    # §4.5(a) reconstruction half: run istft ON DEVICE and compare to the CPU roundtrip
+    # elementwise — exercises the inverse-FFT kernel (the other half of every vocoder
+    # path), not just the forward transform. fp32 device↔cpu error is ~1e-6; 1e-3 loud.
+    y_ref = torch.istft(ref, 2048, hop_length=512, window=win, center=True, length=x.shape[-1])
+    yd = torch.istft(sd, 2048, hop_length=512, window=wd, center=True, length=x.shape[-1])
+    err_i = (yd.cpu() - y_ref).abs().max().item()
+    if not (err_i < 1e-3):
+        raise RuntimeError("GPU istft 偏离 CPU 参考: max_abs=%.3e (阈 1e-3)" % err_i)
+    return "stft %.2e / istft %.2e vs CPU (scale %.2f)" % (err, err_i, scale)
 
 
 def check_gpu_amp_step(ctx):
@@ -470,6 +550,7 @@ def check_gpu_amp_step(ctx):
         opt = torch.optim.Adam(model.parameters(), lr=1e-3)
         scaler = torch.amp.GradScaler(dev)
         x = torch.randn(2, 4, 128, device=dev)
+        w0 = model.weight.detach().clone()
         with torch.amp.autocast(dev, dtype=torch.float16):
             y = model(x)
             loss = y.pow(2).mean()
@@ -478,20 +559,78 @@ def check_gpu_amp_step(ctx):
         scaler.update()
         if not torch.isfinite(loss):
             raise RuntimeError("amp loss 非有限")
-        return "fp16 autocast + GradScaler 一步 OK"
+        # A weight MUST move: catches a silently no-op autocast/scaler (grads all
+        # zeroed / step skipped on a spurious inf) that a loss-finite check alone
+        # would pass green (§4.5 anti-self-deception).
+        delta = float((model.weight.detach() - w0).abs().max())
+        if not (delta > 0):
+            raise RuntimeError("amp 一步后权重未更新（autocast/scaler 静默空转？）")
+        return "fp16 autocast + GradScaler 一步 OK (Δw %.2e)" % delta
     if dev == "xpu":
         # bf16 WITHOUT GradScaler — Arc A 系无 fp64，scaler 必崩（设计 §4.1）。
         model = torch.nn.Conv1d(4, 4, 3, padding=1).to(dev)
         opt = torch.optim.Adam(model.parameters(), lr=1e-3)
         x = torch.randn(2, 4, 128, device=dev)
+        w0 = model.weight.detach().clone()
         with torch.amp.autocast(dev, dtype=torch.bfloat16):
             loss = model(x).pow(2).mean()
         loss.backward()
         opt.step()
         if not torch.isfinite(loss):
             raise RuntimeError("bf16 loss 非有限")
-        return "bf16 autocast (no scaler) 一步 OK"
+        delta = float((model.weight.detach() - w0).abs().max())
+        if not (delta > 0):
+            raise RuntimeError("bf16 一步后权重未更新（autocast 静默空转？）")
+        return "bf16 autocast (no scaler) 一步 OK (Δw %.2e)" % delta
     return None
+
+
+def check_fallback_selftest(ctx):
+    """Validates the CPU-fallback capture+classify harness itself — the ONE piece of
+    §4.5(c) reachable WITHOUT an Intel GPU. Emit a synthetic PyTorch-shaped fallback
+    warning, assert the parser extracts the op AND flags it hot, and assert an
+    unrelated warning is NOT captured (no false-green from noise). The real trigger
+    only fires on xpu silicon; here we prove the reporting logic is correct so the
+    first xpu run only has to exercise the trigger, not debug the plumbing.
+    Uses a LOCAL sink so nothing leaks into the global _FALLBACK_OPS."""
+    local = set()
+    with _capture_fallbacks(local):
+        warnings.warn(
+            "The operator 'aten::_fft_r2c' is not currently supported on the XPU "
+            "backend and will fall back to run on the CPU. This may have performance "
+            "implications.",
+            UserWarning,
+            stacklevel=1,
+        )
+    if "aten::_fft_r2c" not in local:
+        raise RuntimeError("fallback 捕获失败：未从告警提取算子（got %s）" % sorted(local))
+    if "aten::_fft_r2c" not in _classify_hot(local):
+        raise RuntimeError("fallback 分类失败：_fft_r2c 未被判为热点算子")
+    noise = set()
+    with _capture_fallbacks(noise):
+        warnings.warn("some unrelated deprecation notice", DeprecationWarning, stacklevel=1)
+    if noise:
+        raise RuntimeError("误捕获无关告警：%s" % sorted(noise))
+    return "capture+classify OK（合成 aten::_fft_r2c → hot；噪声不误捕）"
+
+
+def check_fallback_ops(ctx):
+    """§4.5(c): surface any aten op that silently ran on CPU because the xpu backend
+    lacks it (accumulated by _capture_fallbacks around the on-device checks). Empty on
+    cpu/cuda → skip/pass. A HOT op (conv/stft/fft) that fell back tanks training
+    throughput → explicit WARN (visible, not a silent green); a cold op is tolerable
+    (still WARN, but flagged as limited impact). Never a hard FAIL — a fallback is
+    'neither green nor a crash' (design §4.5)."""
+    if ctx["device"] == "cpu":
+        return None  # no xpu fallback path on the cpu tier
+    ops = sorted(_FALLBACK_OPS)
+    if not ops:
+        return "无 CPU 回退算子（全部算子在设备上原生执行）"
+    hot = sorted(_classify_hot(_FALLBACK_OPS))
+    if hot:
+        return _Warn("热点算子回退 CPU（严重拖慢训练，尤其声码器 ConvTranspose）："
+                     "%s ｜ 全部回退：%s" % (", ".join(hot), ", ".join(ops)))
+    return _Warn("算子回退 CPU（非热点，影响有限）：%s" % ", ".join(ops))
 
 
 CHECKS = [
@@ -513,7 +652,15 @@ CHECKS = [
     ("dataloader_spawn", check_dataloader_spawn),
     ("gpu_stft_vs_cpu", check_gpu_stft_vs_cpu),
     ("gpu_amp_step", check_gpu_amp_step),
+    # last: after every on-device check has run under the fallback capture, so the
+    # accumulator is fully populated before we summarize it.
+    ("fallback_selftest", check_fallback_selftest),
+    ("fallback_ops", check_fallback_ops),
 ]
+
+# on-device checks run inside _capture_fallbacks so a hot op silently falling to CPU
+# on xpu is recorded (not the selftest — it uses its own local sink — nor fallback_ops).
+_FALLBACK_TIER = {"tiny_gan", "gpu_stft_vs_cpu", "gpu_amp_step"}
 
 
 def main():
@@ -522,6 +669,16 @@ def main():
     ap.add_argument("--out", required=True, help="report json path (pack_dir/envtest.json)")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda", "xpu"])
     args = ap.parse_args()
+
+    # Design §4.1/§4.5: enable the xpu CPU-fallback net + its debug logging BEFORE any
+    # torch import (torch is imported lazily inside the checks, and protocol.py pulls in
+    # no torch, so this is still pre-import). A missing xpu op then becomes a loud,
+    # diagnosable CPU fallback (captured by check_fallback_ops) instead of a hard crash.
+    # Harmless/ignored on cpu & cuda. setdefault: never clobber an explicit caller value
+    # (the Rust launcher sets these too; doing it here makes a manual
+    # `python -m utai_train.envtest --device xpu` behave identically, not hard-crash).
+    os.environ.setdefault("PYTORCH_ENABLE_XPU_FALLBACK", "1")
+    os.environ.setdefault("PYTORCH_DEBUG_XPU_FALLBACK", "1")
 
     _reporter = Reporter()  # stdout/stderr UTF-8 reconfigure (single source in protocol.py)
 
@@ -535,9 +692,19 @@ def main():
     for name, fn in CHECKS:
         t0 = time.monotonic()
         try:
-            detail = fn(ctx)
-            status = "skip" if detail is None else "pass"
-            detail = detail or "（该档位不适用）"
+            if name in _FALLBACK_TIER:
+                with _capture_fallbacks(_FALLBACK_OPS):
+                    detail = fn(ctx)
+            else:
+                detail = fn(ctx)
+            if isinstance(detail, _Warn):
+                status = "warn"
+                detail = detail.detail
+            elif detail is None:
+                status = "skip"
+                detail = "（该档位不适用）"
+            else:
+                status = "pass"
         except Exception as e:
             status = "fail"
             tb = traceback.format_exc().strip().splitlines()
@@ -549,6 +716,7 @@ def main():
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     failed = [i["name"] for i in items if i["status"] == "fail"]
+    warned = [i["name"] for i in items if i["status"] == "warn"]
     report = {
         "schema": 1,
         "device": args.device,
@@ -558,12 +726,17 @@ def main():
         "finished": datetime.datetime.now().isoformat(timespec="seconds"),
         "items": items,
         "failed_names": failed,
+        # §4.5(c): warns do NOT flip overall — the Rust pass/fail gate stays unchanged
+        # and a tolerable fallback never blocks a pack; the UI ambers off warnings_present.
+        "warned_names": warned,
+        "warnings_present": bool(warned),
+        "fallback_ops": sorted(_FALLBACK_OPS),
         "overall": "fail" if failed else "pass",
         "versions": ctx.get("versions", {}),
     }
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
-    _emit({"type": "done", "overall": report["overall"], "failed": failed})
+    _emit({"type": "done", "overall": report["overall"], "failed": failed, "warned": warned})
     # Same hard-exit posture as runner.py — a lingering spawn worker must not hang us.
     sys.stdout.flush()
     sys.stderr.flush()

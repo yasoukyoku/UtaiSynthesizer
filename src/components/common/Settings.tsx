@@ -367,6 +367,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       rtRecommend: { zh: "本机推荐变体", en: "Recommended variant", ja: "推奨バリアント" },
       rtPackLabel_cpu: { zh: "CPU 运行时（模型转换基座 + CPU 训练）", en: "CPU runtime (model conversion base + CPU training)", ja: "CPU ランタイム（モデル変換基盤 + CPU トレーニング）" },
       rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
+      rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RDNA3/4 训练 + 模型转换）", en: "AMD runtime (ROCm; RDNA3/4 training + conversion)", ja: "AMD ランタイム（ROCm；RDNA3/4 トレーニング + 変換）" },
       srcTitle: { zh: "下载源 / 网络", en: "Download Source / Network", ja: "ダウンロードソース / ネットワーク" },
       srcHF: { zh: "HuggingFace（默认）", en: "HuggingFace (default)", ja: "HuggingFace（既定）" },
       srcMirror: { zh: "HF Mirror (hf-mirror.com) — 中国大陆加速", en: "HF Mirror (hf-mirror.com) — China mainland", ja: "HF Mirror (hf-mirror.com) — 中国本土" },
