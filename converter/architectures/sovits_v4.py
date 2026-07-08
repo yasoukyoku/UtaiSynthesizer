@@ -605,6 +605,11 @@ class SynthesizerTrn(nn.Module):
         self.ssl_dim = ssl_dim
         self.vol_embedding = vol_embedding
         self.emb_g = nn.Embedding(n_speakers, gin_channels)
+        # ①c: convert.py flips this True for GENUINE multi-speaker models
+        # (len(speakers) > 1) — then `sid` is fed as a spk_mix [1, n_spk] f32
+        # blend (matmul emb_g.weight) instead of a scalar id. Single-speaker
+        # exports keep the scalar-id gather → byte-identical.
+        self.export_spk_mix = False
         self.use_automatic_f0_prediction = use_automatic_f0_prediction
         if vol_embedding:
             self.emb_vol = nn.Linear(1, hidden_channels)
@@ -668,8 +673,13 @@ class SynthesizerTrn(nn.Module):
            vol_embedding models (the input is omitted from the export otherwise)
         returns audio [1, 1, T * prod(upsample_rates)]
         """
-        # models.py infer(): g.dim() == 1 -> unsqueeze(0); emb; transpose
-        g = self.emb_g(sid.unsqueeze(0)).transpose(1, 2)  # [1, gin, 1]
+        if self.export_spk_mix:
+            # ①c: `sid` is a spk_mix [1, n_spk] f32 blend of the emb_g rows; a
+            # one-hot row is bit-identical to emb_g(id) (the diffusion gate proves it)
+            g = torch.matmul(sid, self.emb_g.weight).unsqueeze(-1)  # [1, gin, 1]
+        else:
+            # models.py infer(): g.dim() == 1 -> unsqueeze(0); emb; transpose
+            g = self.emb_g(sid.unsqueeze(0)).transpose(1, 2)  # [1, gin, 1]
 
         x_mask = torch.unsqueeze(torch.ones_like(f0), 1).to(c.dtype)
         # vol proj
@@ -730,11 +740,18 @@ class F0PredictorWrapper(nn.Module):
         if synth.vol_embedding:
             self.emb_vol = synth.emb_vol
         self.f0_decoder = synth.f0_decoder
+        # ①c: inherit the main graph's spk_mix export mode (convert.py sets it on
+        # the synth BEFORE this wrapper is built) so both graphs share one
+        # speaker-conditioning convention
+        self.export_spk_mix = getattr(synth, "export_spk_mix", False)
 
     def forward(self, c, f0, uv, sid, vol=None):
         # models.py infer() steps :511-520, identical to SynthesizerTrn.forward
         # above (same tensors, same op order — bit-compatible `x`).
-        g = self.emb_g(sid.unsqueeze(0)).transpose(1, 2)  # [1, gin, 1]
+        if self.export_spk_mix:
+            g = torch.matmul(sid, self.emb_g.weight).unsqueeze(-1)  # [1, gin, 1]
+        else:
+            g = self.emb_g(sid.unsqueeze(0)).transpose(1, 2)  # [1, gin, 1]
         x_mask = torch.unsqueeze(torch.ones_like(f0), 1).to(c.dtype)
         vol = self.emb_vol(vol[:, :, None]).transpose(1, 2) \
             if vol is not None and self.vol_embedding else 0

@@ -256,6 +256,15 @@ def convert_sovits(input_path: Path, output_path: Path,
     model, meta = build_sovits_v4(checkpoint, config)
     sovits_set_deterministic(model, deterministic)
 
+    # ①c: a GENUINE multi-speaker model (len(speakers) > 1 — the real trained
+    # count, NOT emb_g's table size n_speakers, which is large even for a
+    # single-speaker import) exports a spk_mix [1, n_spk] f32 blend in place of
+    # the scalar sid, so speaker embeddings can be blended at inference. Every
+    # single-speaker export keeps sid → BYTE-IDENTICAL to pre-①c.
+    export_spk_mix = len(meta.get("speakers") or {}) > 1
+    n_spk = meta["n_speakers"]
+    model.export_spk_mix = export_spk_mix
+
     ssl_dim = meta["features_dim"]     # detected — NOT hardcoded (old 256 bug)
     inter_channels = meta["inter_channels"]
     hop_size = meta["hop_size"]
@@ -269,9 +278,18 @@ def convert_sovits(input_path: Path, output_path: Path,
     f0[:, 40:60] = 0.0
     uv = (f0 > 0).float()
     noise = torch.randn(1, inter_channels, seq_len) * SOVITS_NOISE_SCALE
-    sid = torch.zeros(1, dtype=torch.int64)
+    # speaker input: scalar sid (single-speaker) OR a normalized spk_mix
+    # [1, n_spk] (multi) — the emb_g gather vs `spk_mix @ emb_g.weight` matmul is
+    # bit-identical for a one-hot row. n_spk is FIXED, so spk_mix has no dyn axis.
+    if export_spk_mix:
+        spk = torch.rand(1, n_spk)
+        spk = spk / spk.sum(dim=1, keepdim=True)
+        spk_name = "spk_mix"
+    else:
+        spk = torch.zeros(1, dtype=torch.int64)
+        spk_name = "sid"
 
-    input_names = ["c", "f0", "uv", "noise", "sid"]
+    input_names = ["c", "f0", "uv", "noise", spk_name]
     dynamic_axes = {
         "c": {1: "seq_len"},
         "f0": {1: "seq_len"},
@@ -279,7 +297,7 @@ def convert_sovits(input_path: Path, output_path: Path,
         "noise": {2: "seq_len"},
         "audio": {2: "audio_len"},
     }
-    inputs = (c, f0, uv, noise, sid)
+    inputs = (c, f0, uv, noise, spk)
     if vol_embedding:
         vol = torch.rand(1, seq_len) * 0.1
         input_names.append("vol")
@@ -322,8 +340,12 @@ def convert_sovits(input_path: Path, output_path: Path,
             "uv": (f0_np > 0).astype(np.float32),
             "noise": (np.random.randn(1, inter_channels, t)
                       * SOVITS_NOISE_SCALE).astype(np.float32),
-            "sid": np.zeros(1, dtype=np.int64),
         }
+        if export_spk_mix:
+            m = np.random.rand(1, n_spk).astype(np.float32)
+            feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
+        else:
+            feeds["sid"] = np.zeros(1, dtype=np.int64)
         if vol_embedding:
             feeds["vol"] = (0.1 * np.random.rand(1, t)).astype(np.float32)
         audio = sess.run(None, feeds)[0]
@@ -347,14 +369,14 @@ def convert_sovits(input_path: Path, output_path: Path,
         auto_f0_path = output_path.with_name(output_path.stem + ".f0.onnx")
         predictor = F0PredictorWrapper(model)
         predictor.eval()
-        f0_input_names = ["c", "f0", "uv", "sid"] + (["vol"] if vol_embedding else [])
+        f0_input_names = ["c", "f0", "uv", spk_name] + (["vol"] if vol_embedding else [])
         f0_dynamic_axes = {
             "c": {1: "seq_len"},
             "f0": {1: "seq_len"},
             "uv": {1: "seq_len"},
             "f0_pred": {1: "seq_len"},
         }
-        f0_inputs = (c, f0, uv, sid)
+        f0_inputs = (c, f0, uv, spk)
         if vol_embedding:
             f0_dynamic_axes["vol"] = {1: "seq_len"}
             f0_inputs = f0_inputs + (vol,)
@@ -380,8 +402,12 @@ def convert_sovits(input_path: Path, output_path: Path,
                 "c": np.random.randn(1, t, ssl_dim).astype(np.float32),
                 "f0": f0_np,
                 "uv": (f0_np > 0).astype(np.float32),
-                "sid": np.zeros(1, dtype=np.int64),
             }
+            if export_spk_mix:
+                m = np.random.rand(1, n_spk).astype(np.float32)
+                feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
+            else:
+                feeds["sid"] = np.zeros(1, dtype=np.int64)
             if vol_embedding:
                 feeds["vol"] = (0.1 * np.random.rand(1, t)).astype(np.float32)
             f0_pred = f0_sess.run(None, feeds)[0]
@@ -423,6 +449,11 @@ def convert_sovits(input_path: Path, output_path: Path,
             if auto_f0_path is not None else {"available": False}
         ),
     }
+    # ①c: multi-speaker models take a spk_mix [1, n_spk] f32 blend (rows sum to 1)
+    # in place of sid — appended ONLY for multi so single-speaker sidecars stay
+    # byte-identical (the "inputs" list already carries "spk_mix" vs "sid").
+    if export_spk_mix:
+        config_data["spk_mix"] = {"available": True, "n_spk": n_spk}
     # utf-8 + ensure_ascii=False: Chinese speaker names must survive verbatim.
     config_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False),
                            encoding="utf-8")
