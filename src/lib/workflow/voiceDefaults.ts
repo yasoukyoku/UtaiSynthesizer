@@ -6,7 +6,8 @@
  * The engine serializes EXACTLY these snake_case keys as the `options` object of the invoke
  * payload `{ voiceName, modelPath, audioPath, options }` — nothing else. (S36: the SoVITS
  * quality path — shallow diffusion / only_diffusion / second_encoding / NSF enhancer /
- * auto-f0 — is now wired; spk-mix remains deferred. Rust also accepts a test-only
+ * auto-f0 — is now wired. S46 ①c: `spk_mix` (speaker-blend) is wired for genuine
+ * multi-speaker SoVITS exports — see SpkMixEntry below. Rust also accepts a test-only
  * `debug_zero_noise` key that deliberately has NO entry here — gate harnesses only.)
  *
  * Node params store the SAME snake_case keys (plus `voiceName` / `modelPath`), so there is no
@@ -26,11 +27,24 @@ export const DIFFUSION_METHODS = [
 ] as const;
 export type DiffusionMethod = (typeof DIFFUSION_METHODS)[number];
 
+/** ①c speaker-blend entry: emb_g row `id` weighted by `weight` (≥0). The Rust pipeline
+ * normalizes the stack to sum 1 and builds a dense `spk_mix` [1, n_spk] f32 vector fed in
+ * place of the scalar `sid` — ONLY for a genuine multi-speaker export (the model's ONNX graph
+ * carries a "spk_mix" input; single-speaker / pre-①c models ignore this and use speaker_id).
+ * An empty stack degrades to a one-hot on `speaker_id` (byte-identical to picking one speaker). */
+export interface SpkMixEntry {
+  id: number;
+  weight: number;
+}
+
 export interface RvcOptions {
   /** Pitch shift in semitones, -24..24. */
   f0_shift: number;
   /** Target speaker index for multi-speaker models; null = 0 (single-speaker default). */
   speaker_id: number | null;
+  /** ①c speaker blend — non-empty ONLY for a genuine multi-speaker RVC export (α′, ONNX
+   * "spk_mix" input). Empty = use speaker_id (single-speaker / pre-①c: byte-identical). */
+  spk_mix: SpkMixEntry[];
   /** KNN index feature blend, 0..1. */
   index_ratio: number;
   /** Voiceless-consonant/breath protection, 0..0.5 — 0.5 means OFF. */
@@ -54,6 +68,9 @@ export interface SovitsOptions {
   f0_shift: number;
   /** Target speaker index for multi-speaker models; null = 0. */
   speaker_id: number | null;
+  /** ①c speaker blend — a stack of {id, weight} rows. Non-empty ONLY for a genuine
+   * multi-speaker export (ONNX "spk_mix" input). Empty = use speaker_id (byte-identical). */
+  spk_mix: SpkMixEntry[];
   /** Synthesis randomness, 0..1. */
   noise_scale: number;
   /** Cluster-model / feature-index blend, 0..1; 0 = off. */
@@ -96,6 +113,7 @@ export interface SovitsOptions {
 export const RVC_DEFAULTS: RvcOptions = {
   f0_shift: 0,
   speaker_id: null,
+  spk_mix: [],
   index_ratio: 0.75,
   protect: 0.33,
   noise_scale: 0.66666,
@@ -109,6 +127,7 @@ export const RVC_DEFAULTS: RvcOptions = {
 export const SOVITS_DEFAULTS: SovitsOptions = {
   f0_shift: 0,
   speaker_id: null,
+  spk_mix: [],
   noise_scale: 0.4,
   cluster_ratio: 0,
   loudness_envelope: 1.0,

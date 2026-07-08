@@ -83,6 +83,12 @@ def build_hps(cfg, exp_dir):
     hps.save_every_weights = "1" if cfg.get("save_every_weights", True) else "0"
     hps.if_cache_data_in_gpu = 1 if cfg.get("cache_gpu", False) else 0
     hps.data.training_files = os.path.join(exp_dir, "filelist.txt")
+    # ①c: multi-speaker co-train — carry the ordered speaker display names (list index = spk_id
+    # = emb_g row) so savee can embed them in the .pth; the converter reads them to gate the
+    # spk_mix export + write the speaker map (the RVC .pth is otherwise nameless). Single = absent.
+    spks = cfg.get("speakers")
+    if spks and len(spks) > 1:
+        hps.speakers = [s["name"] for s in spks]
     if device_shim.resolve_backend(cfg) != "cuda":
         # fp16 amp/GradScaler are CUDA-only; cpu AND xpu run fp32 (design §4.5).
         # NB `!= "cuda"` (never `== "cpu"`) — xpu must also force fp16 off.

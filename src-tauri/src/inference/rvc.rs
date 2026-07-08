@@ -74,6 +74,10 @@ pub struct RvcModel<'a> {
     pub index: Option<&'a RvcIndex>,
     pub sample_rate: u32,
     pub features_dim: usize,
+    /// ①c (α′): `Some(n_spk)` iff the graph HAS a "spk_mix" input (genuine multi-speaker RVC
+    /// export, n_spk = emb_g table width) — then a dense [1, n_spk] blend replaces scalar `sid`.
+    /// `None` = single-speaker / pre-①c export → the `sid` i64 path (byte-identical).
+    pub spk_mix: Option<usize>,
     /// inter_channels of the rnd input (sidecar "noise.rnd_input"[1]; 192 for v1/v2).
     pub noise_channels: usize,
     /// Minimum frame count the exported graph accepts (sidecar "min_frames", 12 for RVC).
@@ -172,6 +176,11 @@ pub fn run_pipeline(
     // f0 (0.2) → chunks span [0.2, 0.95] → tail + post (0.95 → 1.0)
     let total_chunks = (opt_ts.len() + 1) as f32;
     let sid = options.speaker_id.unwrap_or(0) as i64;
+    // ①c (α′): a multi-speaker RVC graph (m.spk_mix = Some(n_spk)) takes a dense [1, n_spk] blend
+    // in place of scalar sid; built once and re-fed each chunk. None → the sid path (byte-identical).
+    let spk_mix_dense: Option<Vec<f32>> = m
+        .spk_mix
+        .map(|n_spk| super::build_spk_mix_dense(&options.spk_mix, options.speaker_id, n_spk));
     let mut audio_opt: Vec<f32> = Vec::new();
     let mut s_ix = 0usize;
     let mut chunk_idx: u64 = 0;
@@ -188,7 +197,7 @@ pub fn run_pipeline(
         let chunk = &audio_pad[s_ix..(t + t_pad2 + WINDOW).min(audio_pad.len())];
         let pl = s_ix / WINDOW;
         let ph = (t + t_pad2) / WINDOW;
-        let out = vc_chunk(m, chunk, &pitch[pl..ph], &pitchf[pl..ph], sid, options, chunk_idx)?;
+        let out = vc_chunk(m, chunk, &pitch[pl..ph], &pitchf[pl..ph], sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
         append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
         s_ix = t;
         chunk_idx += 1;
@@ -205,6 +214,7 @@ pub fn run_pipeline(
         &pitch[s_ix / WINDOW..],
         &pitchf[s_ix / WINDOW..],
         sid,
+        spk_mix_dense.as_deref(),
         options,
         chunk_idx,
     )?;
@@ -247,6 +257,8 @@ fn vc_chunk(
     pitch: &[i64],
     pitchf: &[f32],
     sid: i64,
+    // ①c: Some = dense spk_mix [n_spk] blend fed in place of scalar sid (multi-speaker export)
+    spk_mix: Option<&[f32]>,
     options: &RvcOptions,
     chunk_idx: u64,
 ) -> Result<Vec<f32>> {
@@ -310,7 +322,7 @@ fn vc_chunk(
 
     let t = p_len as i64;
     let phone_data: Vec<f32> = feats.iter().copied().collect();
-    let inputs = vec![
+    let mut inputs = vec![
         (
             "phone",
             InputTensor::F32 {
@@ -339,21 +351,33 @@ fn vc_chunk(
                 shape: vec![1, t],
             },
         ),
-        (
+    ];
+    // ①c (α′): dense spk_mix [1, n_spk] blend (multi-speaker export) OR scalar sid i64 (single /
+    // pre-①c: byte-identical). The graph renamed the input in the export, so the name must match.
+    if let Some(mix) = spk_mix {
+        inputs.push((
+            "spk_mix",
+            InputTensor::F32 {
+                data: mix.to_vec(),
+                shape: vec![1, mix.len() as i64],
+            },
+        ));
+    } else {
+        inputs.push((
             "sid",
             InputTensor::I64 {
                 data: vec![sid],
                 shape: vec![1],
             },
-        ),
-        (
-            "rnd",
-            InputTensor::F32 {
-                data: rnd,
-                shape: vec![1, m.noise_channels as i64, t],
-            },
-        ),
-    ];
+        ));
+    }
+    inputs.push((
+        "rnd",
+        InputTensor::F32 {
+            data: rnd,
+            shape: vec![1, m.noise_channels as i64, t],
+        },
+    ));
 
     let outputs = m.engine.run(m.voice_session, inputs)?;
     outputs

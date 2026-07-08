@@ -46,7 +46,12 @@ def build_filelist_and_config(
     seed,
     fp16_run,
     reporter,
+    multi_speaker=False,
 ):
+    # ①c: for a multi-speaker run every slice stem is "<spk_id>_<idx0>_<idx1>[_aug<n>]" (the
+    # preprocess prefix), so the per-line spk_id is recovered from the stem's first "_"-token
+    # instead of the single scalar `spk_id` (which is used only for the mute rows then). The
+    # single-speaker path (multi_speaker=False) stamps every line with `spk_id` = byte-identical.
     reporter.stage("filelist", message="生成训练清单与配置")
     gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
     fea_dim = 256 if version == "v1" else 768
@@ -67,6 +72,7 @@ def build_filelist_and_config(
     # (str hash randomization), which would defeat the seed
     opt = []
     for name in sorted(names):
+        line_spk = int(name.split("_")[0]) if multi_speaker else spk_id
         opt.append(
             "%s/%s.wav|%s/%s.npy|%s/%s.wav.npy|%s/%s.wav.npy|%s"
             % (
@@ -78,7 +84,7 @@ def build_filelist_and_config(
                 name,
                 _p(f0nsf_dir),
                 name,
-                spk_id,
+                line_spk,
             )
         )
 

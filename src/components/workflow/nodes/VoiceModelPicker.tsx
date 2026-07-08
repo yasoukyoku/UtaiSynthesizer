@@ -8,6 +8,8 @@ import {
   type VoiceModelEntry,
   type VoiceType,
 } from "../../../store/voice-models";
+import { ParamSlider } from "./ParamSlider";
+import type { SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
 import { t18, type I18nText } from "../../../lib/models/msst-catalog";
 
 /** Strings shared by BOTH voice nodes (RVC + SoVITS) — node-specific ones stay in the nodes. */
@@ -20,6 +22,11 @@ export const VOICE_STRINGS = {
   gpuExtract: { zh: "GPU特征提取", en: "GPU extraction", ja: "GPU特徴抽出" },
   gpuExtractTip: { zh: "特征/音高提取（ContentVec+RMVPE）改在 GPU 上跑：更快但占显存；默认 CPU 更稳更省显存", en: "Run ContentVec+RMVPE extraction on the GPU: faster but uses VRAM; the CPU default is safer", ja: "特徴/ピッチ抽出（ContentVec+RMVPE）を GPU で実行：高速だが VRAM を消費。既定の CPU が安全" },
   diffBadgeTip: { zh: "已附带扩散模型（可用浅扩散）", en: "Diffusion attachment present (shallow diffusion available)", ja: "拡散モデルあり（浅い拡散が利用可能）" },
+  blendTitle: { zh: "声线混合", en: "Voice blend", ja: "声質ブレンド" },
+  blendTip: { zh: "混合多个歌手的音色生成新声线：各歌手权重会自动归一化为占比；未添加时使用默认歌手", en: "Blend multiple speakers' timbres into a new voice — weights are auto-normalized to a share; the default speaker is used when empty", ja: "複数話者の声質を混ぜて新しい声を作る — 各重みは自動で比率に正規化。未追加時は既定の話者を使用" },
+  blendEmpty: { zh: "未混合 — 使用默认歌手", en: "No blend — default speaker", ja: "ブレンドなし — 既定の話者" },
+  blendAdd: { zh: "＋ 添加歌手", en: "+ Add speaker", ja: "＋ 話者を追加" },
+  blendWeight: { zh: "占比", en: "Weight", ja: "比重" },
 } satisfies Record<string, I18nText>;
 
 /** The aux-extractor device toggle row — identical on BOTH voice nodes. */
@@ -139,7 +146,7 @@ export function VoiceModelPicker({ models, selected, lang, onSelect }: {
             </span>
           )}
           {speakerCount > 1 && (
-            <span>{speakerCount} {t18({ zh: "说话人", en: "speakers", ja: "話者" }, lang)}</span>
+            <span>{speakerCount} {t18({ zh: "歌手", en: "speakers", ja: "話者" }, lang)}</span>
           )}
         </div>
       )}
@@ -158,14 +165,89 @@ export function SpeakerSelect({ model, value, onChange, lang }: {
   if (opts.length === 0) return null;
   return (
     <div className="sep-param-row">
-      <label title={t18({ zh: "多说话人模型的目标说话人", en: "Target speaker of a multi-speaker model", ja: "マルチスピーカーモデルの話者" }, lang)}>
-        {t18({ zh: "说话人", en: "Speaker", ja: "話者" }, lang)}
+      <label title={t18({ zh: "多歌手模型的目标歌手", en: "Target speaker of a multi-speaker model", ja: "マルチスピーカーモデルの話者" }, lang)}>
+        {t18({ zh: "歌手", en: "Speaker", ja: "話者" }, lang)}
       </label>
       <select value={String(value ?? 0)} onChange={(e) => onChange(parseInt(e.target.value, 10))}>
         {opts.map((o) => (
           <option key={o.id} value={o.id}>{o.label}</option>
         ))}
       </select>
+    </div>
+  );
+}
+
+/**
+ * ①c speaker-blend stack — the multi-speaker replacement for SpeakerSelect on a GENUINE spk_mix
+ * export (gate: voiceHasSpkMix). A list of {id, weight} rows (Rust normalizes to sum 1 and builds
+ * the dense spk_mix vector); each row shows the speaker name + a weight slider reading its
+ * effective blend %. SHARED by RvcNode + SoVitsNode. Modeled on EffectsNode's params.effects[]
+ * stack — derived from GRAPH params (never a useState mirror; the modal-local undo restores
+ * params via setNodes WITHOUT remounting, so a mirror would re-commit undone rows) and every
+ * mutation is a single onChange for clean single-step JSON-diff undo. An EMPTY stack degrades to
+ * the default speaker 0 (byte-identical to picking that one speaker). Reuses the `.fx-*` CSS.
+ */
+export function SpeakerBlend({ model, value, onChange, lang }: {
+  model: VoiceModelEntry | undefined;
+  value: SpkMixEntry[];
+  onChange: (rows: SpkMixEntry[]) => void;
+  lang: string;
+}) {
+  const opts = model ? voiceSpeakerOptions(model) : [];
+  // Keep only rows whose id still exists on THIS model. A same-name re-import can drop a speaker
+  // whose id is still < n_speakers (emb_g width, e.g. 3 < 109) — Rust would blend that UNTRAINED
+  // emb_g row (subtly wrong timbre) even though the row is never shown. SWITCH_RESETS only fires
+  // on a NAME change, so we ACTIVELY prune stale ids from params here (mirrors SoVitsNode's
+  // stale-flag effect). Fires once when stale rows exist, then converges (pruned value has none).
+  const rows = value.filter((r) => opts.some((o) => o.id === r.id));
+  useEffect(() => {
+    if (rows.length !== value.length) onChange(rows);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows.length, value.length]);
+  if (opts.length <= 1) return null;
+  const nameOf = (id: number) => opts.find((o) => o.id === id)?.label ?? `#${id}`;
+  const total = rows.reduce((s, r) => s + Math.max(0, r.weight), 0);
+  const used = new Set(rows.map((r) => r.id));
+  const addable = opts.filter((o) => !used.has(o.id));
+
+  const addSpeaker = (id: number) => onChange([...rows, { id, weight: 1 }]);
+  const removeSpeaker = (id: number) => onChange(rows.filter((r) => r.id !== id));
+  const updateWeight = (id: number, weight: number) =>
+    onChange(rows.map((r) => (r.id === id ? { ...r, weight } : r)));
+
+  return (
+    <div className="fx-stack">
+      <span className="fx-stack-title" title={t18(VOICE_STRINGS.blendTip, lang)}>
+        {t18(VOICE_STRINGS.blendTitle, lang)}
+      </span>
+      {rows.length === 0 && (
+        <span className="fx-empty">{t18(VOICE_STRINGS.blendEmpty, lang)}</span>
+      )}
+      {rows.map((r) => (
+        <div key={r.id} className="fx-entry">
+          <div className="fx-entry-header">
+            <span className="fx-entry-type">{nameOf(r.id)}</span>
+            <button className="fx-remove" title={t18({ zh: "移除", en: "Remove", ja: "削除" }, lang)}
+              onClick={() => removeSpeaker(r.id)}>x</button>
+          </div>
+          <ParamSlider
+            label={t18(VOICE_STRINGS.blendWeight, lang)}
+            min={0} max={1} step={0.01} value={r.weight}
+            format={() => (total > 0 ? `${Math.round((Math.max(0, r.weight) / total) * 100)}%` : "—")}
+            onChange={(v) => updateWeight(r.id, v)}
+          />
+        </div>
+      ))}
+      {addable.length > 0 && (
+        <div className="fx-add-row">
+          <select value="" onChange={(e) => { if (e.target.value !== "") addSpeaker(parseInt(e.target.value, 10)); }}>
+            <option value="">{t18(VOICE_STRINGS.blendAdd, lang)}</option>
+            {addable.map((o) => (
+              <option key={o.id} value={o.id}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+      )}
     </div>
   );
 }

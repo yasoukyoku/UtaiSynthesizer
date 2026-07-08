@@ -80,6 +80,14 @@ export interface WorkspaceInfo {
   aug_copies: number;
   /** a reusable shared slice pool exists — diff may start without importing */
   has_dataset: boolean;
+  /** ①c resume config-diff: manifest vol_embedding (SoVITS); null when absent/not-sovits */
+  vol_embedding: boolean | null;
+  /** ①c: manifest n_speakers (multi-speaker); 1 when single-speaker */
+  n_speakers: number;
+  /** ①c: ordered speaker display names (index = emb_g id); empty for single-speaker */
+  speakers: string[];
+  /** ①c: manifest diff_k_step_max (sovits_diff); 0 when absent */
+  diff_k_step_max: number;
 }
 
 /** S41 共享池模式 — THE single predicate for "a diff run may start without
@@ -94,9 +102,16 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
   );
 }
 
+/** ①c: which backends take a SINGER LIST (multi-speaker co-train) — SoVITS (α) + RVC (α′).
+ *  THE single source for the DataStep singer-list gating so the store + page never drift.
+ *  Shallow-diffusion / vocoder stay flat-dataset (their loaders assume one speaker). */
+export function backendSupportsMultiSpeaker(backend: string): boolean {
+  return backend === "sovits" || backend === "rvc";
+}
+
 /** THE single predicate for "step 2 (data) is satisfied" — shared by the root
  *  wizard gating (step3Ok) AND the DataStep next button so they never drift.
- *  ①c: SoVITS data is a SINGER LIST (default 1 singer = single-speaker, the
+ *  ①c: SoVITS/RVC data is a SINGER LIST (default 1 singer = single-speaker, the
  *  degenerate case of N). Every singer needs files; with ≥2 singers each also
  *  needs a (unique) name. Other backends keep the flat-dataset / shared-pool rule. */
 export function trainingDataOk(
@@ -105,7 +120,7 @@ export function trainingDataOk(
   speakerGroups: SpeakerGroupDraft[],
   diffPool: boolean,
 ): boolean {
-  if (backend === "sovits") {
+  if (backendSupportsMultiSpeaker(backend)) {
     const allHaveFiles =
       speakerGroups.length > 0 && speakerGroups.every((g) => g.files.length > 0);
     if (speakerGroups.length <= 1) return allHaveFiles;
@@ -152,6 +167,9 @@ export interface TrainingSnapshot {
   stop_requested: boolean;
   elapsed_secs: number;
   stderr_tail: string[];
+  /** ①c: ordered speaker display names for a multi-speaker run (index = emb_g id); empty for
+   *  single-speaker. Reflects the RUN (frozen at start), used by the audition speaker picker. */
+  speakers?: string[];
 }
 
 export interface TrainingFormConfig {
@@ -423,19 +441,20 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     set((s) => (s.flashSpeaker?.nonce === nonce ? { flashSpeaker: null } : {})),
   migrateOnBackendSwitch: (prev, next) =>
     set((s) => {
-      const wasSovits = prev === "sovits";
-      const isSovits = next === "sovits";
-      if (isSovits === wasSovits) return {}; // both sovits / both non-sovits: same list
+      // ①c: SoVITS (α) + RVC (α′) both use the singer list; diff/vocoder use the flat dataset.
+      const wasMulti = backendSupportsMultiSpeaker(prev);
+      const isMulti = backendSupportsMultiSpeaker(next);
+      if (isMulti === wasMulti) return {}; // both singer-list / both flat: same list, no migration
       // only ever migrate a LONE singer (never clobber a real multi-singer setup)
       const g0 = s.speakerGroups[0];
       if (!g0 || s.speakerGroups.length !== 1) return {};
-      if (isSovits) {
+      if (isMulti) {
         // flat dataset -> the (empty default) first singer
         if (s.dataset.length > 0 && g0.files.length === 0) {
           return { dataset: [], speakerGroups: [{ ...g0, files: s.dataset }] };
         }
       } else if (s.dataset.length === 0 && g0.files.length > 0) {
-        // leaving sovits with a lone singer -> the (empty) flat dataset
+        // leaving a singer-list backend with a lone singer -> the (empty) flat dataset
         return { dataset: g0.files, speakerGroups: [{ ...g0, files: [] }] };
       }
       return {};
@@ -466,16 +485,15 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     const { config, dataset, speakerGroups } = get();
     set({ starting: true });
     try {
-      // ①c: SoVITS data is the singer list. 1 singer = single-speaker: send its
-      // files as the flat dataset_files, NO `speakers` key -> byte-identical to
-      // pre-①c. ≥2 singers: send `speakers` (matching Rust
-      // StartTrainingRequest.speakers: Vec<SpeakerGroup{name,files}>) + empty
-      // dataset_files. Non-sovits backends keep the flat `dataset`.
-      const isSovits = config.backend === "sovits";
-      const multi = isSovits && speakerGroups.length > 1;
+      // ①c: SoVITS (α) + RVC (α′) data is the singer list. 1 singer = single-speaker: send its
+      // files as the flat dataset_files, NO `speakers` key -> byte-identical to pre-①c. ≥2
+      // singers: send `speakers` (matching Rust StartTrainingRequest.speakers:
+      // Vec<SpeakerGroup{name,files}>) + empty dataset_files. diff/vocoder keep the flat `dataset`.
+      const isMulti = backendSupportsMultiSpeaker(config.backend);
+      const multi = isMulti && speakerGroups.length > 1;
       const datasetFiles = multi
         ? []
-        : isSovits
+        : isMulti
           ? (speakerGroups[0]?.files ?? []).map((f) => f.path)
           : dataset.map((f) => f.path);
       const base = {

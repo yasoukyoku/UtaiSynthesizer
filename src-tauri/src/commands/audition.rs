@@ -261,6 +261,9 @@ pub async fn render_audition_voice(
     ckpt_path: String,
     workspace: String,
     candidate_id: String,
+    // ①c: which speaker to audition for a multi-speaker candidate. None = single-speaker (or
+    // pre-①c) → speaker 0 via the sid/one-hot fallback. Some(id) one-hots that emb_g row.
+    speaker_id: Option<u32>,
 ) -> Result<String, String> {
     let app = state.inner().clone();
     // guard FIRST, state checks after — holding the flag through the checks
@@ -270,7 +273,13 @@ pub async fn render_audition_voice(
     ensure_no_voice_render()?;
     let stem = ckpt_stem(&ckpt_path)?;
     let dir = audition_dir(&workspace, &stem);
-    let out = dir.join("audition.wav");
+    // ①c: cache the rendered clip PER speaker (the onnx is shared across speakers — only the fed
+    // speaker differs). A single-speaker candidate (speaker_id None) keeps "audition.wav" =
+    // byte-identical caching to pre-①c.
+    let out = dir.join(match speaker_id {
+        Some(s) => format!("audition_spk{}.wav", s),
+        None => "audition.wav".to_string(),
+    });
     if out.is_file() {
         drop(guard);
         return Ok(out.to_string_lossy().into_owned());
@@ -350,6 +359,20 @@ pub async fn render_audition_voice(
                     .inference
                     .ensure_aux_loaded_on(&contentvec_for_dim(&app, dim)?, false)
                     .map_err(|e| e.to_string())?;
+                // ①c: a genuine multi-speaker RVC candidate exports "spk_mix" (no "sid") — the
+                // audition recipe has no blend UI so this falls to a one-hot on speaker 0.
+                let rvc_spk_mix = if config
+                    .inputs
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .map(|l| l.iter().any(|v| v.as_str() == Some("spk_mix")))
+                    == Some(true)
+                    && config.n_speakers > 0
+                {
+                    Some(config.n_speakers as usize)
+                } else {
+                    None
+                };
                 let model = rvc::RvcModel {
                     engine: &app.inference.engine,
                     voice_session: &sid,
@@ -359,12 +382,14 @@ pub async fn render_audition_voice(
                     index: None,
                     sample_rate,
                     features_dim: dim,
+                    spk_mix: rvc_spk_mix,
                     noise_channels: noise_channels(&config),
                     min_frames: min_frames(&config, 12),
                 };
                 let options = RvcOptions {
                     index_ratio: 0.0,
                     gpu_extract: false,
+                    speaker_id,
                     ..Default::default()
                 };
                 rvc::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
@@ -380,12 +405,22 @@ pub async fn render_audition_voice(
                     .inference
                     .ensure_aux_loaded_on(&contentvec_for_dim(&app, dim)?, false)
                     .map_err(|e| e.to_string())?;
-                let vol_embedding = config
-                    .inputs
-                    .as_ref()
-                    .and_then(|v| v.as_array())
-                    .map(|l| l.iter().any(|v| v.as_str() == Some("vol")))
+                let has_input = |name: &str| {
+                    config
+                        .inputs
+                        .as_ref()
+                        .and_then(|v| v.as_array())
+                        .map(|l| l.iter().any(|v| v.as_str() == Some(name)))
+                };
+                let vol_embedding = has_input("vol")
                     .unwrap_or_else(|| config.vol_embedding.unwrap_or(false));
+                // ①c: a genuine multi-speaker candidate exports "spk_mix" (no "sid") — the audition
+                // recipe has no blend UI so this falls to a one-hot on speaker 0 (default options).
+                let spk_mix = if has_input("spk_mix") == Some(true) && config.n_speakers > 0 {
+                    Some(config.n_speakers as usize)
+                } else {
+                    None
+                };
                 let model = sovits::SovitsModel {
                     engine: &app.inference.engine,
                     voice_session: &sid,
@@ -400,6 +435,7 @@ pub async fn render_audition_voice(
                     hop_size,
                     features_dim: dim,
                     vol_embedding,
+                    spk_mix,
                     unit_interpolate_mode: config
                         .unit_interpolate_mode
                         .clone()
@@ -410,6 +446,7 @@ pub async fn render_audition_voice(
                 let options = SovitsOptions {
                     cluster_ratio: 0.0,
                     gpu_extract: false,
+                    speaker_id,
                     ..Default::default()
                 };
                 sovits::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
@@ -727,13 +764,24 @@ pub async fn render_audition_diffusion(
             .inference
             .voice_handle(&host_name)
             .map_err(|e| e.to_string())?;
-        let vol_embedding = entry
-            .config
-            .inputs
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .map(|l| l.iter().any(|v| v.as_str() == Some("vol")))
+        let host_has_input = |name: &str| {
+            entry
+                .config
+                .inputs
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|l| l.iter().any(|v| v.as_str() == Some(name)))
+        };
+        let vol_embedding = host_has_input("vol")
             .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+        // ①c: multi-speaker host graph → feed the dense spk_mix (one-hot on speaker 0 here, no
+        // blend UI on the audition path). α refuses multi-speaker diffusion so this is rarely hit,
+        // but a multi-speaker host must not be fed the absent scalar `sid`.
+        let spk_mix = if host_has_input("spk_mix") == Some(true) && entry.config.n_speakers > 0 {
+            Some(entry.config.n_speakers as usize)
+        } else {
+            None
+        };
 
         let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
         let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
@@ -752,6 +800,7 @@ pub async fn render_audition_diffusion(
             hop_size,
             features_dim: dim,
             vol_embedding,
+            spk_mix,
             unit_interpolate_mode: entry
                 .config
                 .unit_interpolate_mode

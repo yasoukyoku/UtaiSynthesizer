@@ -199,6 +199,8 @@
     "auditionConverting": "Converting…",
     "auditionRendering": "Rendering…",
     "auditionRef": "Built-in default vocoder (reference)",
+    "auditionSpeaker": "Audition speaker",
+    "auditionSpeakerTip": "Which speaker of the multi-speaker model to audition; does not affect the kept checkpoints (a checkpoint always contains every speaker)",
     "auditionNeedHost": "Select an attach target model first",
     "ckptMissing": "Pruned by the archive policy",
     "importSelectedTitle": "Import selected checkpoints",

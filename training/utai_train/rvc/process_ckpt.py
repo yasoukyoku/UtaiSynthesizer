@@ -40,6 +40,12 @@ def savee(ckpt, sr, if_f0, out_path, epoch, version, hps):
     opt["sr"] = sr
     opt["f0"] = if_f0
     opt["version"] = version
+    # ①c deviation (single-speaker byte-compatible: absent unless >1 speaker): carry the ordered
+    # speaker display names so converter/convert.py can gate the spk_mix export + emit the speaker
+    # name map. List index = spk_id = emb_g row. Set on hps by train.build_hps for multi-speaker.
+    speakers = getattr(hps, "speakers", None)
+    if speakers and len(speakers) > 1:
+        opt["speakers"] = list(speakers)
     tmp_path = out_path + ".tmp"
     torch.save(opt, tmp_path)
     os.replace(tmp_path, out_path)

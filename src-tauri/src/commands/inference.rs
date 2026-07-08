@@ -728,6 +728,15 @@ pub async fn run_rvc(
     let dim = entry.config.features_dim as usize; // RVC sidecars carry features_dim directly
     let nch = noise_channels(&entry.config);
     let min_t = min_frames(&entry.config, 12);
+    // ①c (α′): a genuine multi-speaker RVC export renames scalar `sid` to a dense `spk_mix`
+    // [1, n_spk] blend (n_spk = emb_g table width = config.n_speakers). Feed the blend IFF the
+    // graph actually carries that input; None → the sid path (single-speaker / pre-①c, unchanged).
+    let rvc_spk_mix = if sidecar_has_input(&entry, "spk_mix") == Some(true) && entry.config.n_speakers > 0
+    {
+        Some(entry.config.n_speakers as usize)
+    } else {
+        None
+    };
     let cv_path = contentvec_for_dim(&app, dim)?;
     let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?;
     let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
@@ -779,6 +788,7 @@ pub async fn run_rvc(
             index: handle.index.as_deref(),
             sample_rate: handle.sample_rate,
             features_dim: dim,
+            spk_mix: rvc_spk_mix,
             noise_channels: nch,
             min_frames: min_t,
         };
@@ -820,6 +830,15 @@ pub async fn run_sovits(
     // authority (final contract); vol_embedding bool is the fallback for older sidecars.
     let vol_embedding = sidecar_has_input(&entry, "vol")
         .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+    // ①c: a genuine multi-speaker export renames the scalar `sid` input to a dense `spk_mix`
+    // [1, n_spk] blend (n_spk = emb_g table width = config.n_speakers). Feed the blend IFF the
+    // graph actually carries that input; None → the sid path (single-speaker / pre-①c export).
+    let spk_mix = if sidecar_has_input(&entry, "spk_mix") == Some(true) && entry.config.n_speakers > 0
+    {
+        Some(entry.config.n_speakers as usize)
+    } else {
+        None
+    };
     let unit_interpolate_mode = entry
         .config
         .unit_interpolate_mode
@@ -886,7 +905,9 @@ pub async fn run_sovits(
     //             路径非法字符按 export_cluster 的 _safe_name 规则 →'_'，[K, dim]）
     // 兼容手动平铺在模型旁的旧摆法。
     let cluster = if options.cluster_ratio > 0.0 {
-        let spk = options.speaker_id.unwrap_or(0);
+        // ①c: under a blend, the retrieval/cluster asset follows the DOMINANT (max-weight)
+        // speaker; without a blend this is just speaker_id (fallback 0) — unchanged behavior.
+        let spk = crate::inference::dominant_speaker(&options.spk_mix, options.speaker_id);
         let parent = entry.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let stem = entry.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
         let cluster_dir = parent.join(format!("{}.cluster", stem));
@@ -955,6 +976,7 @@ pub async fn run_sovits(
             hop_size,
             features_dim: dim,
             vol_embedding,
+            spk_mix,
             unit_interpolate_mode,
             noise_channels: nch,
             min_frames: min_t,

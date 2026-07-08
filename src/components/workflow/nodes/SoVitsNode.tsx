@@ -4,9 +4,9 @@ import { useTranslation } from "react-i18next";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
-import { VoiceModelPicker, SpeakerSelect, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
-import { SOVITS_DEFAULTS, DIFFUSION_METHODS } from "../../../lib/workflow/voiceDefaults";
-import { voiceHasDiffusion, voiceHasAutoF0, vocoderFormatMatches, useVoiceModelStore } from "../../../store/voice-models";
+import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
+import { SOVITS_DEFAULTS, DIFFUSION_METHODS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
+import { voiceHasDiffusion, voiceHasAutoF0, voiceHasSpkMix, vocoderFormatMatches, useVoiceModelStore } from "../../../store/voice-models";
 import type { VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
@@ -14,6 +14,9 @@ import { t18 } from "../../../lib/models/msst-catalog";
  * toggles (diffusion attachment / f0 predictor) from the previous model are runtime errors. */
 const SOVITS_SWITCH_RESETS = {
   speaker_id: null,
+  // ①c: blend rows key on the OLD model's speaker ids — clear on any model switch so a
+  // phantom id never reaches the wire (it would gather an untrained emb_g row Rust-side).
+  spk_mix: [],
   shallow_diffusion: false,
   only_diffusion: false,
   auto_f0: false,
@@ -31,6 +34,7 @@ export function SoVitsNode(props: NodeProps) {
   const clusterRatio = (params.cluster_ratio as number) ?? SOVITS_DEFAULTS.cluster_ratio;
   const loudnessEnvelope = (params.loudness_envelope as number) ?? SOVITS_DEFAULTS.loudness_envelope;
   const speakerId = (params.speaker_id as number | null) ?? SOVITS_DEFAULTS.speaker_id;
+  const spkMix = (params.spk_mix as SpkMixEntry[]) ?? SOVITS_DEFAULTS.spk_mix;
   const shallowDiffusion = (params.shallow_diffusion as boolean) ?? SOVITS_DEFAULTS.shallow_diffusion;
   const kStep = (params.k_step as number) ?? SOVITS_DEFAULTS.k_step;
   const diffusionMethod = (params.diffusion_method as string) ?? SOVITS_DEFAULTS.diffusion_method;
@@ -122,8 +126,15 @@ export function SoVitsNode(props: NodeProps) {
               format={(v) => (v >= 1 ? t18(VOICE_STRINGS.off, lang) : v.toFixed(2))}
               onChange={(v) => updateParams({ loudness_envelope: v })}
             />
-            <SpeakerSelect model={selected} value={speakerId} lang={lang}
-              onChange={(id) => updateParams({ speaker_id: id })} />
+            {/* ①c: genuine multi-speaker export → blend stack; else the plain speaker dropdown
+                 (a pre-①c multi-speaker model has a speaker map but no spk_mix graph input) */}
+            {voiceHasSpkMix(selected) ? (
+              <SpeakerBlend model={selected} value={spkMix} lang={lang}
+                onChange={(rows) => updateParams({ spk_mix: rows })} />
+            ) : (
+              <SpeakerSelect model={selected} value={speakerId} lang={lang}
+                onChange={(id) => updateParams({ speaker_id: id })} />
+            )}
 
             {/* ---- 浅扩散 group (S36 quality path) — HIDDEN entirely without the
                  .diffusion/ attachment (user call: disabled-grey rows read as clutter) ---- */}

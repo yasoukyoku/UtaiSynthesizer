@@ -23,6 +23,10 @@ export interface VoiceModelConfig {
   /** SoVITS S36: automatic-f0 predictor export info written by the converter when the
    * checkpoint carries f0_decoder weights: { available: boolean, file?: string, inputs?: string[] }. */
   auto_f0?: { available?: boolean; file?: string; inputs?: string[] };
+  /** ①c S46: present ONLY for a genuine multi-speaker export (the ONNX graph carries a
+   * "spk_mix" input replacing scalar "sid"). `n_spk` = emb_g table width (the blend vector
+   * length). Absent on single-speaker / pre-①c models — gates the δ blend stack UI. */
+  spk_mix?: { available?: boolean; n_spk?: number };
   /** serde(flatten)-ed extras from the json pass through untyped. */
   [extra: string]: unknown;
 }
@@ -162,6 +166,15 @@ export function voiceHasDiffusion(m: VoiceModelEntry | undefined): boolean {
  * Truth source = converter-written sidecar key (weight-derived), NOT the model config. */
 export function voiceHasAutoF0(m: VoiceModelEntry | undefined): boolean {
   return m?.config?.auto_f0?.available === true;
+}
+
+/** ①c: whether the model is a GENUINE multi-speaker export whose ONNX graph takes a `spk_mix`
+ * blend input (converter writes `spk_mix.available` ONLY for len(speakers) > 1). This — NOT
+ * merely voiceSpeakerOptions().length > 1 — gates the blend-stack UI: a pre-①c multi-speaker
+ * model has a speaker map but a scalar `sid` input, so it uses the plain SpeakerSelect instead.
+ * Requires ≥2 named speakers too (the blend needs real names to pick from). */
+export function voiceHasSpkMix(m: VoiceModelEntry | undefined): boolean {
+  return m?.config?.spk_mix?.available === true && voiceSpeakerOptions(m).length > 1;
 }
 
 /** 一期唯一声码器格式类 = the OpenVPI standard (the aux default vocoder's recipe;

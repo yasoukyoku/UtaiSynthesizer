@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class PreProcess:
-    def __init__(self, sr, exp_dir, per=3.7, ffmpeg="ffmpeg"):
+    def __init__(self, sr, exp_dir, per=3.7, ffmpeg="ffmpeg", name_prefix=""):
+        # ①c: `name_prefix` = "<spk_id>_" for multi-speaker runs so every speaker's slices share
+        # ONE flat pool without colliding on the per-file idx0 (the flat pool has no parent-dir
+        # speaker channel like SoVITS). Empty for single-speaker = names unchanged = byte-identical.
+        self.name_prefix = name_prefix
         self.slicer = Slicer(
             sr=sr,
             threshold=-42,
@@ -52,14 +56,16 @@ class PreProcess:
         tmp_audio = (tmp_audio / tmp_max * (self.max * self.alpha)) + (
             1 - self.alpha
         ) * tmp_audio
+        # ①c: name_prefix is "" (single-speaker, byte-identical) or "<spk_id>_" (multi) — the
+        # spk_id becomes the stem's first "_"-token, which filelist.py recovers per line.
         wavfile.write(
-            os.path.join(self.gt_wavs_dir, "%s_%s.wav" % (idx0, idx1)),
+            os.path.join(self.gt_wavs_dir, "%s%s_%s.wav" % (self.name_prefix, idx0, idx1)),
             self.sr,
             tmp_audio.astype(np.float32),
         )
         tmp_audio = librosa.resample(tmp_audio, orig_sr=self.sr, target_sr=16000)
         wavfile.write(
-            os.path.join(self.wavs16k_dir, "%s_%s.wav" % (idx0, idx1)),
+            os.path.join(self.wavs16k_dir, "%s%s_%s.wav" % (self.name_prefix, idx0, idx1)),
             16000,
             tmp_audio.astype(np.float32),
         )
@@ -86,7 +92,7 @@ class PreProcess:
             self.norm_write(tmp_audio, idx0, idx1)
 
 
-def preprocess_trainset(inp_root, sr, exp_dir, per, ffmpeg, reporter, stop):
+def _wipe_slice_dirs(exp_dir):
     # Rebuild the slice dirs from scratch: slicing is deterministic, and stale
     # slices from a previous (different) dataset would otherwise pollute the
     # filelist (the 4-dir intersection then excludes stale f0/feature entries).
@@ -96,7 +102,16 @@ def preprocess_trainset(inp_root, sr, exp_dir, per, ffmpeg, reporter, stop):
             for name in os.listdir(d):
                 os.remove(os.path.join(d, name))
 
-    pp = PreProcess(sr, exp_dir, per, ffmpeg)
+
+def preprocess_trainset(inp_root, sr, exp_dir, per, ffmpeg, reporter, stop,
+                        spk_prefix="", wipe=True):
+    # ①c: `wipe` defaults True (single-speaker: unchanged). For a multi-speaker run the caller
+    # wipes ONCE before the per-speaker loop and passes wipe=False so speaker B's slices append
+    # to the shared pool instead of clobbering speaker A's. `spk_prefix` = "<spk_id>_" per speaker.
+    if wipe:
+        _wipe_slice_dirs(exp_dir)
+
+    pp = PreProcess(sr, exp_dir, per, ffmpeg, name_prefix=spk_prefix)
     infos = [
         (os.path.join(inp_root, name), idx)
         for idx, name in enumerate(sorted(os.listdir(inp_root)))

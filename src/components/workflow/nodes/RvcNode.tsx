@@ -4,16 +4,18 @@ import { useTranslation } from "react-i18next";
 import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
-import { VoiceModelPicker, SpeakerSelect, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
-import { RVC_DEFAULTS } from "../../../lib/workflow/voiceDefaults";
-import type { VoiceModelEntry } from "../../../store/voice-models";
+import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VOICE_STRINGS } from "./VoiceModelPicker";
+import { RVC_DEFAULTS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
+import { voiceHasSpkMix, type VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
 export function RvcNode(props: NodeProps) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
   const [params, updateParams] = useNodeParams(props);
-  const { models, selected } = useVoiceModelSelection("rvc", params, updateParams);
+  // spk_mix cleared alongside speaker_id on ANY model switch (incl. the silent deleted-model
+  // fallback inside useVoiceModelSelection) — stale blend ids reference the old model's speakers.
+  const { models, selected } = useVoiceModelSelection("rvc", params, updateParams, { speaker_id: null, spk_mix: [] });
 
   // Param keys ARE the wire contract keys (see voiceDefaults.ts) — absent = contract default.
   const f0Shift = (params.f0_shift as number) ?? RVC_DEFAULTS.f0_shift;
@@ -24,11 +26,13 @@ export function RvcNode(props: NodeProps) {
   const l2Normalize = (params.l2_normalize as boolean) ?? RVC_DEFAULTS.l2_normalize;
   const gpuExtract = (params.gpu_extract as boolean) ?? RVC_DEFAULTS.gpu_extract;
   const speakerId = (params.speaker_id as number | null) ?? RVC_DEFAULTS.speaker_id;
+  const spkMix = (params.spk_mix as SpkMixEntry[]) ?? RVC_DEFAULTS.spk_mix;
   const hasIndex = !!selected?.index_path;
 
   const handleSelect = useCallback((m: VoiceModelEntry) => {
-    // Model switch resets the speaker — a stale index could exceed the new model's n_speakers.
-    updateParams({ voiceName: m.name, modelPath: m.path, speaker_id: null });
+    // Model switch resets the speaker AND blend — stale ids could exceed the new model's
+    // n_speakers / reference the wrong emb_g rows (①c: phantom blend id = untrained embedding).
+    updateParams({ voiceName: m.name, modelPath: m.path, speaker_id: null, spk_mix: [] });
   }, [updateParams]);
 
   return (
@@ -71,8 +75,14 @@ export function RvcNode(props: NodeProps) {
               min={0} max={1} step={0.01} value={rmsMixRate} format={formatRatio}
               onChange={(v) => updateParams({ rms_mix_rate: v })}
             />
-            <SpeakerSelect model={selected} value={speakerId} lang={lang}
-              onChange={(id) => updateParams({ speaker_id: id })} />
+            {/* ①c: genuine multi-speaker RVC export (α′) → blend stack; else the plain dropdown */}
+            {voiceHasSpkMix(selected) ? (
+              <SpeakerBlend model={selected} value={spkMix} lang={lang}
+                onChange={(rows) => updateParams({ spk_mix: rows })} />
+            ) : (
+              <SpeakerSelect model={selected} value={speakerId} lang={lang}
+                onChange={(id) => updateParams({ speaker_id: id })} />
+            )}
             {/* retrieval-metric option — meaningless without an index, hidden with it */}
             {hasIndex && (
             <div className="sep-param-row">

@@ -199,6 +199,8 @@
     "auditionConverting": "変換中…",
     "auditionRendering": "レンダリング中…",
     "auditionRef": "内蔵デフォルトボコーダー（参照）",
+    "auditionSpeaker": "試聴する話者",
+    "auditionSpeakerTip": "マルチスピーカーモデルのどの話者で試聴するか；保存するチェックポイントには影響しません（全話者を含みます）",
     "auditionNeedHost": "先にアタッチ先モデルを選択してください",
     "ckptMissing": "保存ポリシーにより削除済み",
     "importSelectedTitle": "選択した保存を一括インポート",

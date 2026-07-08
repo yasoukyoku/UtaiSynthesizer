@@ -15,6 +15,7 @@ import { useAppStore } from "../../store/app";
 import {
   diffPoolReady,
   trainingDataOk,
+  backendSupportsMultiSpeaker,
   setupTrainingListeners,
   useTrainingStore,
   type CkptInfo,
@@ -29,6 +30,7 @@ import {
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { Dropdown } from "../common/Dropdown";
+import { t18 } from "../../lib/models/msst-catalog";
 import { preview } from "../common/previewPlayer";
 import { LossChart, type LossChartHandle } from "./LossChart";
 import "./TrainingPage.css";
@@ -120,7 +122,7 @@ export function TrainingPage() {
         // are CSS px, so divide by DPR.
         const hitTestSpeaker = (position?: { x: number; y: number }): string | null => {
           const st = useTrainingStore.getState();
-          if (st.config.backend !== "sovits" || st.speakerGroups.length <= 1) {
+          if (!backendSupportsMultiSpeaker(st.config.backend) || st.speakerGroups.length <= 1) {
             return null;
           }
           if (position) {
@@ -164,10 +166,10 @@ export function TrainingPage() {
           const audio = p.paths.filter((pp) => AUDIO_EXT_RE.test(pp));
           if (audio.length === 0) return;
           const st = useTrainingStore.getState();
-          // ①c: SoVITS data is the singer list — a drop lands on the card under
+          // ①c: SoVITS/RVC data is the singer list — a drop lands on the card under
           // the cursor (or the first singer if not over a card, so files are
-          // never lost); every other backend uses the flat dataset.
-          if (st.config.backend === "sovits") {
+          // never lost); diff/vocoder use the flat dataset.
+          if (backendSupportsMultiSpeaker(st.config.backend)) {
             const gid = target ?? st.speakerGroups[0]?.id;
             if (gid) void st.addSpeakerFiles(gid, audio);
           } else {
@@ -266,7 +268,7 @@ export function TrainingPage() {
           steps the cards aren't mounted, so keep the overlay (an off-step drop
           routes to singer #1 by design) */}
       {dropActive &&
-        !(config.backend === "sovits" && speakerGroups.length > 1 && wizard === 2) && (
+        !(backendSupportsMultiSpeaker(config.backend) && speakerGroups.length > 1 && wizard === 2) && (
           <div className="training-drop-overlay">{t("training.dropHint")}</div>
         )}
     </div>
@@ -325,9 +327,9 @@ function DataStep() {
     diffWsInfo,
   } = useTrainingStore();
   const diffPool = diffPoolReady(config.backend, diffWsInfo);
-  // ①c: SoVITS data is a SINGER LIST (default 1 singer = single-speaker); every
-  // other backend keeps the flat file list.
-  const sovits = config.backend === "sovits";
+  // ①c: SoVITS (α) + RVC (α′) data is a SINGER LIST (default 1 singer = single-speaker);
+  // diff/vocoder keep the flat file list.
+  const singerList = backendSupportsMultiSpeaker(config.backend);
   const [playingPath, setPlayingPath] = useState<string | null>(null);
   const [loadingPath, setLoadingPath] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -505,7 +507,7 @@ function DataStep() {
     <div className="training-data-step">
       <div className="training-hint">{t("training.dataHint")}</div>
 
-      {sovits ? (
+      {singerList ? (
         <div className="training-spk-stack">
           {speakerGroups.map((g, i) => {
             const gMs = g.files.reduce((a, f) => a + (f.durationMs ?? 0), 0);
@@ -1394,7 +1396,8 @@ function ParamsStep() {
 /* ---------------------------------- step 4: run ---------------------------------- */
 
 function RunStep() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const rlang = i18n.language;
   const showConfirm = useAppStore((s) => s.showConfirm);
   const showToast = useAppStore((s) => s.showToast);
   const {
@@ -1484,6 +1487,15 @@ function RunStep() {
   const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
   const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
   const [importingAll, setImportingAll] = useState(false);
+  // ①c: audition a chosen speaker of a multi-speaker rvc/sovits run. Names come from the RUN's
+  // frozen speaker list (snapshot.speakers, index = emb_g id = the converter's speaker-map id) —
+  // NOT the editable DataStep state, so it survives a DataStep edit and reflects what was trained.
+  // Empty for single-speaker / diff / vocoder → the render falls back to speaker 0 (unchanged).
+  const [auditionSpeaker, setAuditionSpeaker] = useState(0);
+  const auditionSpeakers =
+    backendSupportsMultiSpeaker(snapshot.backend) && (snapshot.speakers?.length ?? 0) > 1
+      ? snapshot.speakers!.map((name, i) => ({ id: i, name: name.trim() || `#${i}` }))
+      : [];
   const auditionBusy = Object.values(auditionState).some(
     (s) => s === "converting" || s === "rendering",
   );
@@ -1502,6 +1514,7 @@ function RunStep() {
     setAuditionWavs({});
     setSelectedCkpts({});
     setMissingCkpts({});
+    setAuditionSpeaker(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshot.model_name, snapshot.workspace, running]);
 
@@ -1676,6 +1689,8 @@ function RunStep() {
           ckptPath: c.path,
           workspace: snapshot.workspace,
           candidateId: id,
+          // ①c: null for single-speaker (→ speaker 0, byte-identical); the chosen speaker otherwise
+          speakerId: auditionSpeakers.length > 0 ? auditionSpeaker : null,
         });
       }
       if (epoch !== auditionEpochRef.current) return; // superseded — discard
@@ -1705,6 +1720,19 @@ function RunStep() {
       default:
         return t("training.audition");
     }
+  };
+
+  // ①c: switching the audition speaker invalidates every rendered clip (they were the OLD
+  // speaker's voice) — bump the epoch (discard in-flight) + clear the display caches so the
+  // next play re-renders with the new speaker (the Rust side caches per speaker, so re-picking
+  // a previously-heard speaker is an instant cache hit).
+  const changeAuditionSpeaker = (id: number) => {
+    if (id === auditionSpeaker) return;
+    preview.stop();
+    auditionEpochRef.current += 1;
+    setAuditionState({});
+    setAuditionWavs({});
+    setAuditionSpeaker(id);
   };
 
   // elapsed ticker (1 Hz) while running
@@ -1832,31 +1860,83 @@ function RunStep() {
         ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps })
         : "";
 
-    if (
-      wsExists &&
-      info &&
-      ((info.version && info.version !== selectedVersion) ||
-        (info.sample_rate && info.sample_rate !== selectedSr))
-    ) {
-      // a version/sample-rate mismatch can NEVER be resumed (the Rust manifest
-      // guard refuses it) — offering 续训 here would be a lie; retrain-only
-      const choice = await showConfirm({
-        title: t("training.versionMismatchTitle"),
-        body:
-          t("training.versionMismatchBody", {
-            name,
-            old: `${info.version}/${info.sample_rate}`,
-            new: `${selectedVersion}/${selectedSr}`,
-          }) + diffWarn,
-        buttons: [
-          { id: "retrain", label: t("training.retrain"), kind: "danger" },
-          { id: "cancel", label: t("training.cancel") },
-        ],
-      });
-      if (choice !== "retrain") return;
-      fresh = true;
+    if (wsExists && info) {
+      // ①c: item-by-item diff of the new form vs the stored workspace. Resume needs EVERY
+      // resume-guarded param to match (the Rust guard rejects otherwise) — surface the mismatches
+      // HERE so the user can调回一致 and resume, instead of a red error toast at start time. (Was
+      // just the 2-field version/sr check; now generalized to every guarded param.) vol_embedding
+      // mirrors start()'s expression; speakers compares the RUN's names (info.speakers, from
+      // run.json) BY ORDER = emb_g id — the exact thing the slug guard checks, shown as names.
+      const onOff = (b: boolean) =>
+        t18({ zh: b ? "开" : "关", en: b ? "On" : "Off", ja: b ? "オン" : "オフ" }, rlang);
+      const singleSpk = t18({ zh: "单歌手", en: "single speaker", ja: "単一話者" }, rlang);
+      const diffRows: { label: string; oldv: string; newv: string }[] = [];
+      if (info.version && info.version !== selectedVersion)
+        diffRows.push({ label: t18({ zh: "版本", en: "Version", ja: "バージョン" }, rlang), oldv: info.version, newv: selectedVersion });
+      if (info.sample_rate && info.sample_rate !== selectedSr)
+        diffRows.push({ label: t18({ zh: "采样率", en: "Sample rate", ja: "サンプルレート" }, rlang), oldv: info.sample_rate, newv: selectedSr });
+      if (config.backend === "sovits" && info.vol_embedding != null) {
+        const curVol = config.sovitsVersion === "4.1" ? config.sovitsVolEmbedding : false;
+        if (info.vol_embedding !== curVol)
+          diffRows.push({ label: t18({ zh: "响度嵌入", en: "Vol embedding", ja: "音量埋め込み" }, rlang), oldv: onOff(info.vol_embedding), newv: onOff(curVol) });
+      }
+      if (backendSupportsMultiSpeaker(config.backend)) {
+        const oldNames = info.speakers ?? [];
+        const curNames = speakerGroups.length > 1 ? speakerGroups.map((g) => g.name.trim()) : [];
+        const same = oldNames.length === curNames.length && oldNames.every((n, i) => n === curNames[i]);
+        if (!same)
+          diffRows.push({
+            label: t18({ zh: "歌手（含顺序）", en: "Speakers (order)", ja: "話者（順序）" }, rlang),
+            oldv: oldNames.length ? oldNames.join("、") : singleSpk,
+            newv: curNames.length ? curNames.join("、") : singleSpk,
+          });
+      }
+      // (扩散深度 k_step_max resume-diff belongs to the sovits_diff variant handled in its own
+      // earlier branch — config.backend is already narrowed to rvc/sovits/vocoder here.)
+
+      if (diffRows.length > 0) {
+        // any mismatch → resume impossible (guard would reject). Show WHAT differs (old → new) so
+        // the user can fix the form and resume; else retrain (wipe). Retrain-only here, exactly as
+        // the old version/sr branch did — but now itemized for every guarded param.
+        const list = diffRows.map((r) => `· ${r.label}：${r.oldv} → ${r.newv}`).join("\n");
+        const choice = await showConfirm({
+          title: t18({ zh: "配置与原工作区不一致", en: "Config differs from workspace", ja: "設定が元と不一致" }, rlang),
+          body:
+            t18(
+              {
+                zh: `「${name}」续训要求新配置与原工作区完全一致。以下不同——调回一致即可正常续训，或重训（清空重来）：`,
+                en: `Resuming "${name}" needs the config to match the workspace exactly. These differ — set them back to resume, or retrain (wipe):`,
+                ja: `「${name}」の続行には設定が元と完全一致が必要です。以下が相違——一致させれば続行可、または再学習（消去）：`,
+              },
+              rlang,
+            ) +
+            "\n\n" +
+            list +
+            diffWarn,
+          buttons: [
+            { id: "retrain", label: t("training.retrain"), kind: "danger" },
+            { id: "cancel", label: t("training.cancel") },
+          ],
+        });
+        if (choice !== "retrain") return;
+        fresh = true;
+      } else {
+        // everything matches → the classic resume/retrain choice
+        const choice = await showConfirm({
+          title: t("training.confirmExistTitle"),
+          body: t("training.confirmExistBody", { name }) + diffWarn,
+          buttons: [
+            { id: "resume", label: t("training.resume"), kind: "primary" },
+            { id: "retrain", label: t("training.retrain"), kind: "danger" },
+            { id: "cancel", label: t("training.cancel") },
+          ],
+        });
+        if (choice !== "resume" && choice !== "retrain") return;
+        fresh = choice === "retrain";
+      }
     } else if (wsExists) {
-      // same-version workspace: the classic resume/retrain choice
+      // info unreadable (manifest missing/corrupt): classic resume/retrain — the Rust guard is the
+      // authoritative backstop for any param mismatch we couldn't diff here.
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
         body: t("training.confirmExistBody", { name }) + diffWarn,
@@ -2287,6 +2367,18 @@ function RunStep() {
             ) : (
               <div className="training-hint">{t("training.noAttachTarget")}</div>
             ))}
+          {/* ①c: pick which speaker of a multi-speaker run to audition (names from the run's
+              singer list). Hidden for single-speaker / diff / vocoder. */}
+          {auditionSpeakers.length > 0 && (
+            <div className="training-attach-row">
+              <label title={t("training.auditionSpeakerTip")}>{t("training.auditionSpeaker")}</label>
+              <Dropdown
+                value={String(auditionSpeaker)}
+                options={auditionSpeakers.map((s) => ({ value: String(s.id), label: s.name }))}
+                onChange={(v) => changeAuditionSpeaker(parseInt(v, 10))}
+              />
+            </div>
+          )}
           <div className="training-ckpt-list">
             {/* S41: the vocoder run gets a pinned A/B reference row — the
                 built-in default vocoder rendering the SAME clip */}

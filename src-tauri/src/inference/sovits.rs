@@ -116,6 +116,10 @@ pub struct SovitsModel<'a> {
     /// Whether the exported graph HAS a vol input — decided by the sidecar "inputs"
     /// array (fallback: vol_embedding bool). The vol tensor is only fed when true.
     pub vol_embedding: bool,
+    /// ①c: `Some(n_spk)` iff the graph HAS a "spk_mix" input (genuine multi-speaker export,
+    /// n_spk = emb_g table width) — then a dense [1, n_spk] blend is fed in place of scalar `sid`.
+    /// `None` = single-speaker / pre-①c export → the `sid` i64 path (byte-identical).
+    pub spk_mix: Option<usize>,
     /// config.unit_interpolate_mode, default 'left' (infer_tool.py line 142).
     pub unit_interpolate_mode: String,
     /// inter_channels of the noise input (192 for sovits 4.0/4.1).
@@ -327,6 +331,14 @@ fn infer_segment(
 
     let t = n_frames as i64;
 
+    // ── ①c speaker feed: a multi-speaker graph (m.spk_mix = Some(n_spk)) takes a dense
+    //    spk_mix [1, n_spk] f32 blend in place of the scalar sid; both the main graph and the
+    //    f0 companion share the SAME vector (matching the export, which renamed the input in
+    //    both). None → the sid i64 path (single-speaker / pre-①c export, byte-identical). ──
+    let spk_mix_dense: Option<Vec<f32>> = m
+        .spk_mix
+        .map(|n_spk| super::build_spk_mix_dense(&options.spk_mix, options.speaker_id, n_spk));
+
     // ── auto f0 (models.py:523-527 via `<stem>.f0.onnx`): the predictor consumes the SAME
     //    inputs the main graph is about to get (post-cluster c, shifted f0, uv, sid[, vol])
     //    and its output REPLACES f0 everywhere downstream — enc_p (coarse in-graph), the NSF
@@ -355,14 +367,24 @@ fn infer_segment(
                     shape: vec![1, t],
                 },
             ),
-            (
+        ];
+        if let Some(mix) = &spk_mix_dense {
+            p_inputs.push((
+                "spk_mix",
+                InputTensor::F32 {
+                    data: mix.clone(),
+                    shape: vec![1, mix.len() as i64],
+                },
+            ));
+        } else {
+            p_inputs.push((
                 "sid",
                 InputTensor::I64 {
                     data: vec![options.speaker_id.unwrap_or(0) as i64],
                     shape: vec![1],
                 },
-            ),
-        ];
+            ));
+        }
         if let Some(v) = &vol {
             p_inputs.push((
                 "vol",
@@ -430,14 +452,24 @@ fn infer_segment(
                     shape: vec![1, m.noise_channels as i64, t],
                 },
             ),
-            (
+        ];
+        if let Some(mix) = &spk_mix_dense {
+            inputs.push((
+                "spk_mix",
+                InputTensor::F32 {
+                    data: mix.clone(),
+                    shape: vec![1, mix.len() as i64],
+                },
+            ));
+        } else {
+            inputs.push((
                 "sid",
                 InputTensor::I64 {
                     data: vec![options.speaker_id.unwrap_or(0) as i64],
                     shape: vec![1],
                 },
-            ),
-        ];
+            ));
+        }
         if let Some(v) = &vol {
             inputs.push((
                 "vol",

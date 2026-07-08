@@ -78,7 +78,7 @@ pub struct StartTrainingRequest {
     /// rvc: "32k" | "40k" | "48k" — sovits/vocoder: fixed "44k"
     pub sample_rate: String,
     pub dataset_files: Vec<String>,
-    /// ①c multi-speaker co-training (SoVITS-only for now). Empty or 1 group =
+    /// ①c multi-speaker co-training (SoVITS = α, RVC = α′). Empty or 1 group =
     /// single-speaker = the byte-identical legacy path (uses dataset_files).
     /// >1 groups = per-speaker subdir import + run.json "speakers"; the emb_g
     /// speaker id is the group's index (list order, frozen in the manifest).
@@ -212,6 +212,11 @@ pub struct TrainingSnapshot {
     pub elapsed_secs: u64,
     /// last stderr lines — populated when state == error (loud failures)
     pub stderr_tail: Vec<String>,
+    /// ①c: ordered speaker DISPLAY names for a multi-speaker run (index = emb_g id), so the
+    /// audition speaker picker can label by name without depending on the editable DataStep
+    /// state. Empty for single-speaker runs. Reflects the RUN (frozen at start), not the form.
+    #[serde(default)]
+    pub speakers: Vec<String>,
 }
 
 struct Inner {
@@ -263,6 +268,17 @@ pub struct WorkspaceInfo {
     /// a reusable shared slice pool exists (prior completed import): diff runs
     /// may start WITHOUT re-importing data when this is true (S41 共享池模式)
     pub has_dataset: bool,
+    /// ①c resume config-diff: manifest vol_embedding (SoVITS main model) — None when absent /
+    /// not sovits. Surfaced so the resume dialog can show a mismatch BEFORE start (the Rust guard
+    /// rejects it otherwise, but only after the dialog already promised 续训).
+    pub vol_embedding: Option<bool>,
+    /// ①c: manifest n_speakers (multi-speaker co-train); 1 when absent (single-speaker).
+    pub n_speakers: u64,
+    /// ①c: ordered speaker DISPLAY names (from the prior run.json, index = emb_g id = DataStep
+    /// order); empty for single-speaker. The manifest stores only slugs, so names come from run.json.
+    pub speakers: Vec<String>,
+    /// ①c: manifest diff_k_step_max (sovits_diff); 0 when absent.
+    pub diff_k_step_max: u64,
 }
 
 /// A reusable shared slice pool: raw dataset files from a prior import plus
@@ -284,6 +300,32 @@ pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_default();
     let field = |k: &str| manifest[k].as_str().unwrap_or("").to_string();
+    // ①c: display speaker names (ordered = emb_g id) from the manifest's `speaker_names` — the
+    // manifest is merge-preserved across a sovits_diff run (unlike run.json, which the diff run
+    // overwrites without a speakers key). Empty for single-speaker. (Falls back to run.json for a
+    // pre-fix multi-speaker workspace that predates speaker_names — cheap, keeps old runs correct.)
+    let speakers: Vec<String> = manifest["speaker_names"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<String>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(ws.join("run.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("speakers").and_then(|s| s.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from))
+                            .collect()
+                    })
+                })
+                .filter(|v: &Vec<String>| !v.is_empty())
+        })
+        .unwrap_or_default();
     WorkspaceInfo {
         exists: ws.exists(),
         family: field("backend"),
@@ -293,6 +335,10 @@ pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
         diff_steps: max_diffusion_step(&ws).unwrap_or(0),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         has_dataset: has_dataset_pool(&ws),
+        vol_embedding: manifest["vol_embedding"].as_bool(),
+        n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
+        speakers,
+        diff_k_step_max: manifest["diff_k_step_max"].as_u64().unwrap_or(0),
     }
 }
 
@@ -585,27 +631,37 @@ impl TrainingManager {
         // 1 group) falls through to the byte-identical legacy path.
         let is_multi = req.speakers.len() > 1;
         if is_multi {
-            if req.backend != "sovits" {
+            // ①c: multi-speaker co-train = SoVITS (α) + RVC (α′). Shallow-diffusion / vocoder
+            // stay single-speaker (their loaders assume one speaker).
+            if req.backend != "sovits" && req.backend != "rvc" {
                 return Err(UtaiError::Training(
-                    "多说话人共训暂仅支持 SoVITS（RVC 待后续）".into(),
+                    "多歌手共训暂仅支持 SoVITS 与 RVC".into(),
                 ));
+            }
+            // RVC emb_g is a FIXED 109-row table (spk_embed_dim in the config templates) — cap
+            // the co-train count so a huge set fails loud here, not as an out-of-range train id.
+            if req.backend == "rvc" && req.speakers.len() > 109 {
+                return Err(UtaiError::Training(format!(
+                    "RVC 多歌手共训最多 109 个歌手（当前 {}）",
+                    req.speakers.len()
+                )));
             }
             let mut seen = std::collections::HashSet::new();
             for sp in &req.speakers {
                 let name = sp.name.trim();
                 if name.is_empty() {
-                    return Err(UtaiError::Training("每个说话人都必须有名字".into()));
+                    return Err(UtaiError::Training("每个歌手都必须有名字".into()));
                 }
                 if !seen.insert(name.to_string()) {
                     // duplicate display names would collapse the release config's
                     // spk dict (train.py) -> a missing sidecar speaker
                     return Err(UtaiError::Training(format!(
-                        "说话人名字重复：{}（多说话人共训要求名字唯一）",
+                        "歌手名字重复：{}（多歌手共训要求名字唯一）",
                         name
                     )));
                 }
                 if sp.files.is_empty() {
-                    return Err(UtaiError::Training(format!("说话人「{}」没有数据文件", name)));
+                    return Err(UtaiError::Training(format!("歌手「{}」没有数据文件", name)));
                 }
                 for f in &sp.files {
                     if !Path::new(f).is_file() {
@@ -899,11 +955,13 @@ impl TrainingManager {
                             )));
                         }
                     }
-                    // ①c: n_speakers + the ordered speaker set are baked into the
-                    // emb_g rows — resuming with a different count / order / set
-                    // would silently mis-assign every speaker's timbre. Immutable.
-                    // (Old single-speaker manifests have no n_speakers key -> 1,
-                    // which matches a single-speaker resume = no false rejection.)
+                }
+                // ①c: n_speakers + the ordered speaker set are baked into the emb_g
+                // rows — resuming with a different count / order / set would silently
+                // mis-assign every speaker's timbre. Immutable for BOTH SoVITS (α) and
+                // RVC (α′). (Old single-speaker manifests have no n_speakers key -> 1,
+                // which matches a single-speaker resume = no false rejection.)
+                if matches!(req.backend.as_str(), "sovits" | "rvc") {
                     let old_n = old["n_speakers"].as_u64().unwrap_or(1);
                     let cur_n = if req.speakers.len() > 1 {
                         req.speakers.len() as u64
@@ -912,7 +970,7 @@ impl TrainingManager {
                     };
                     if old_n != cur_n {
                         return Err(UtaiError::Training(format!(
-                            "说话人数量与原工作区不一致（原 {} 现 {}）：多说话人共训必须沿用，或选择重训",
+                            "歌手数量与原工作区不一致（原 {} 现 {}）：多歌手共训必须沿用，或选择重训",
                             old_n, cur_n
                         )));
                     }
@@ -931,7 +989,7 @@ impl TrainingManager {
                             .collect();
                         if old_slugs != cur_slugs {
                             return Err(UtaiError::Training(
-                                "说话人集合或顺序与原工作区不一致：多说话人共训必须沿用同样的说话人与顺序，或选择重训".into(),
+                                "歌手集合或顺序与原工作区不一致：多歌手共训必须沿用同样的歌手与顺序，或选择重训".into(),
                             ));
                         }
                     }
@@ -1021,17 +1079,21 @@ impl TrainingManager {
             // wipe the shared caches AND desync the diffusion training domain
             // from the main model's)
             manifest["loudnorm"] = serde_json::json!(req.loudnorm);
-            // ①c: freeze the speaker count + ordered slug set (resume-immutable,
-            // guarded above). Only written for a genuine co-training (>1) so a
-            // single-speaker manifest stays byte-identical to pre-①c.
-            if req.speakers.len() > 1 {
-                let slugs: Vec<String> = assign_speaker_slugs(&req.speakers)
-                    .into_iter()
-                    .map(|(_, s)| s)
-                    .collect();
-                manifest["n_speakers"] = serde_json::json!(slugs.len());
-                manifest["speakers"] = serde_json::json!(slugs);
-            }
+        }
+        // ①c: freeze the speaker count + ordered slug set (resume-immutable, guarded above)
+        // for BOTH SoVITS (α) and RVC (α′). Only written for a genuine co-training (>1) so a
+        // single-speaker manifest stays byte-identical to pre-①c.
+        if matches!(req.backend.as_str(), "sovits" | "rvc") && req.speakers.len() > 1 {
+            let assigned = assign_speaker_slugs(&req.speakers);
+            let slugs: Vec<String> = assigned.iter().map(|(_, s)| s.clone()).collect();
+            let names: Vec<String> = assigned.iter().map(|(n, _)| n.clone()).collect();
+            manifest["n_speakers"] = serde_json::json!(slugs.len());
+            manifest["speakers"] = serde_json::json!(slugs);
+            // ①c: display NAMES too. The manifest is merge-preserved across a later sovits_diff run
+            // (which reuses this workspace and OVERWRITES run.json WITHOUT a speakers key) — so the
+            // resume config-diff must read names from HERE, not run.json, or it would falsely report
+            // a speaker mismatch after any diffusion run and block a valid multi-speaker resume.
+            manifest["speaker_names"] = serde_json::json!(names);
         }
         if req.backend != "sovits_diff" {
             // S41: recorded for every non-diff backend; the sovits value is
@@ -1099,6 +1161,13 @@ impl TrainingManager {
                 model_slug: slug.clone(),
                 workspace: workspace.to_string_lossy().into_owned(),
                 total_epochs: req.total_epoch,
+                // ①c: freeze the run's speaker names (id order) for the audition picker; empty
+                // for a single-speaker run (len ≤ 1) so nothing changes there.
+                speakers: if req.speakers.len() > 1 {
+                    req.speakers.iter().map(|sp| sp.name.clone()).collect()
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             };
         }
@@ -1225,7 +1294,7 @@ fn run_worker(
     let dataset_dir = workspace.join("dataset");
     // ①c: >1 speaker group = per-speaker subdir import; else the pre-①c flat
     // (or shared-pool) path, verbatim. run_speakers is filled only for multi
-    // and becomes run.json "speakers" so the sovits pipeline co-trains them.
+    // and becomes run.json "speakers" so the sovits/rvc pipeline co-trains them.
     let is_multi = req.speakers.len() > 1;
     let mut run_speakers: Vec<serde_json::Value> = Vec::new();
     if is_multi {

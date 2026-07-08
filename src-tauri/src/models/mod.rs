@@ -869,13 +869,47 @@ impl ModelRegistry {
                     return None;
                 }
                 let dest = cluster_dir.join(src.file_name()?);
-                match std::fs::copy(src, &dest) {
-                    Ok(_) => Some(dest),
-                    Err(e) => {
-                        warnings.push(format!("聚类资产复制失败：{}", e));
-                        None
+                if let Err(e) = std::fs::copy(src, &dest) {
+                    warnings.push(format!("聚类资产复制失败：{}", e));
+                    return None;
+                }
+                // ①c: a multi-speaker RETRIEVAL model has ONE `<id>.index_vectors.npy` PER speaker
+                // in the same source dir (exp_dir/cluster/), but the import flow only conveys ONE
+                // of them. When the conveyed file is such a retrieval index, install EVERY sibling
+                // so per-speaker (dominant-of-blend) inference can find each `<id>.index_vectors.npy`.
+                // Single-speaker: only `0.index_vectors.npy` exists → this copies exactly that one
+                // (byte-identical to pre-①c). A per-speaker copy failure is warned, not fatal
+                // (partial retrieval degrades gracefully — the pipeline skips a missing index).
+                let src_name = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if src_name.ends_with(".index_vectors.npy") {
+                    if let Some(src_dir) = src.parent() {
+                        if let Ok(read_dir) = std::fs::read_dir(src_dir) {
+                            for sib in read_dir.flatten() {
+                                let sp = sib.path();
+                                if sp == src {
+                                    continue; // already copied above
+                                }
+                                let matches = sp
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|n| n.ends_with(".index_vectors.npy"))
+                                    .unwrap_or(false);
+                                if matches {
+                                    if let Some(fname) = sp.file_name() {
+                                        if let Err(e) = std::fs::copy(&sp, cluster_dir.join(fname)) {
+                                            warnings.push(format!(
+                                                "多说话人检索资产 {} 复制失败：{}",
+                                                sp.display(),
+                                                e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                Some(dest)
             }
             "pt" | "pkl" | "pickle" => {
                 match convert::convert_cluster_assets(src, &cluster_dir, app_dir) {

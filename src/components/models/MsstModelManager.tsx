@@ -705,7 +705,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                     <span>{m.config.features_dim} {t18({ zh: "维", en: "dim", ja: "次元" }, lang)}</span>
                   )}
                   {speakerCount > 1 && (
-                    <span>{speakerCount} {t18({ zh: "说话人", en: "speakers", ja: "話者" }, lang)}</span>
+                    <span>{speakerCount} {t18({ zh: "歌手", en: "speakers", ja: "話者" }, lang)}</span>
                   )}
                 </span>
                 )}

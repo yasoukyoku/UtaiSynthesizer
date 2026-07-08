@@ -1068,6 +1068,11 @@ class SynthesizerTrnMsNSFsidM(nn.Module):
             inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels
         )
         self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
+        # ①c: convert.py flips this True for a GENUINE multi-speaker export (the .pth carries a
+        # `speakers` name list, len > 1) — then `sid` is fed as a spk_mix [1, n_spk] f32 blend
+        # (matmul emb_g.weight) instead of a scalar id. Single-speaker exports keep the scalar-id
+        # gather → byte-identical. Mirrors sovits_v4.py's proven branch.
+        self.export_spk_mix = False
 
     def remove_weight_norm(self):
         self.dec.remove_weight_norm()
@@ -1084,7 +1089,12 @@ class SynthesizerTrnMsNSFsidM(nn.Module):
              by noise_scale (feed zeros for deterministic output)
         returns audio [1, 1, T * upp]
         """
-        g = self.emb_g(sid).unsqueeze(-1)  # [b, gin, 1]
+        if self.export_spk_mix:
+            # ①c: `sid` is a spk_mix [1, n_spk] f32 blend of the emb_g rows; a one-hot row is
+            # bit-identical to emb_g(id). matmul([1,n_spk] @ [n_spk,gin]) = [1,gin] → [1,gin,1].
+            g = torch.matmul(sid, self.emb_g.weight).unsqueeze(-1)  # [1, gin, 1]
+        else:
+            g = self.emb_g(sid).unsqueeze(-1)  # [b, gin, 1]
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
         z_p = (m_p + torch.exp(logs_p) * rnd) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)

@@ -36,7 +36,7 @@ from .extract_f0 import extract_f0
 from .extract_feature import extract_features
 from .filelist import build_filelist_and_config
 from .index_npy import build_index
-from .preprocess import preprocess_trainset
+from .preprocess import preprocess_trainset, _wipe_slice_dirs
 from .train import train
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,19 @@ SR_MAP = {"32k": 32000, "40k": 40000, "48k": 48000}
 
 # f0/feature caches are keyed by slice file name — see utai_train/cache.py
 EXTRACT_CACHE_SUBDIRS = ("2a_f0", "2b-f0nsf", "3_feature256", "3_feature768")
+
+
+def _resolve_rvc_speakers(cfg):
+    """①c: the ordered speaker list for a multi-speaker co-train, or None (single-speaker =
+    byte-identical legacy path). List index = spk_id = emb_g row (matches the Rust
+    assign_speaker_slugs order + the .pth `speakers` name list + the converter's speaker map)."""
+    spks = cfg.get("speakers")
+    if not spks:
+        return None
+    return [
+        {"name": s["name"], "slug": s["slug"], "dataset_dir": s["dataset_dir"], "spk_id": i}
+        for i, s in enumerate(spks)
+    ]
 
 
 def run(cfg, reporter, stop):
@@ -67,19 +80,33 @@ def run(cfg, reporter, stop):
     fp16 = bool(cfg.get("fp16", True)) and backend == "cuda"
     ffmpeg = assets["ffmpeg"]
 
-    invalidate_extract_caches(
-        exp_dir, dataset_fingerprint(cfg["dataset_dir"]), EXTRACT_CACHE_SUBDIRS
-    )
+    # ①c: multi-speaker co-train drives preprocess per speaker into ONE flat pool with a
+    # "<spk_id>_" slice-name prefix (each speaker gets its own imported dataset_dir). None =
+    # single-speaker legacy path (byte-identical). List index = spk_id = emb_g row.
+    speakers = _resolve_rvc_speakers(cfg)
+    is_multi = speakers is not None and len(speakers) > 1
 
-    preprocess_trainset(
-        cfg["dataset_dir"],
-        SR_MAP[sr_str],
-        exp_dir,
-        float(cfg.get("per", 3.7)),
-        ffmpeg,
-        reporter,
-        stop,
+    # cache fingerprint spans ALL speakers' datasets (a change in any invalidates the caches)
+    fp_src = (
+        "|".join(dataset_fingerprint(sp["dataset_dir"]) for sp in speakers)
+        if is_multi
+        else dataset_fingerprint(cfg["dataset_dir"])
     )
+    invalidate_extract_caches(exp_dir, fp_src, EXTRACT_CACHE_SUBDIRS)
+
+    per = float(cfg.get("per", 3.7))
+    if is_multi:
+        _wipe_slice_dirs(exp_dir)  # once, before the loop — later speakers must not clobber earlier
+        for sp in speakers:
+            stop.check()
+            preprocess_trainset(
+                sp["dataset_dir"], SR_MAP[sr_str], exp_dir, per, ffmpeg, reporter, stop,
+                spk_prefix="%d_" % sp["spk_id"], wipe=False,
+            )
+    else:
+        preprocess_trainset(
+            cfg["dataset_dir"], SR_MAP[sr_str], exp_dir, per, ffmpeg, reporter, stop,
+        )
 
     stop.check()
     _augment_rvc(exp_dir, int(cfg.get("aug_copies", 0)), seed, reporter, stop)
@@ -107,12 +134,15 @@ def run(cfg, reporter, stop):
         exp_dir,
         sr_str,
         version,
-        int(cfg.get("spk_id", 0)),
+        # ①c: mute rows use spk 0 (silence — negligible per-speaker bias); real slices resolve
+        # their own spk_id from the stem prefix inside build_filelist_and_config when multi.
+        0 if is_multi else int(cfg.get("spk_id", 0)),
         assets["configs_dir"],
         assets["mute_dir"],
         seed,
         fp16,
         reporter,
+        multi_speaker=is_multi,
     )
 
     stop.check()

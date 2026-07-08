@@ -23,6 +23,9 @@ use crate::Result;
 pub struct RvcOptions {
     pub f0_shift: f32,
     pub speaker_id: Option<u32>,
+    /// ①c speaker blend — empty = use speaker_id (single-speaker / pre-①c: byte-identical).
+    /// Consumed by α′ (multi-speaker RVC export); see SovitsOptions::spk_mix.
+    pub spk_mix: Vec<SpkMixEntry>,
     pub index_ratio: f32,
     pub protect: f32,
     pub noise_scale: f32,
@@ -40,6 +43,7 @@ impl Default for RvcOptions {
         Self {
             f0_shift: 0.0,
             speaker_id: None,
+            spk_mix: Vec::new(),
             index_ratio: 0.75,
             protect: 0.33,
             noise_scale: 0.66666,
@@ -52,12 +56,65 @@ impl Default for RvcOptions {
     }
 }
 
+/// ①c speaker-blend entry (voiceDefaults.ts `SpkMixEntry` mirror): emb_g row `id` weighted by
+/// `weight` (≥0). Consumed ONLY by a genuine multi-speaker SoVITS export (the ONNX graph carries
+/// a "spk_mix" input); normalized to sum 1 and expanded to a dense [1, n_spk] f32 vector.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpkMixEntry {
+    pub id: u32,
+    pub weight: f32,
+}
+
+/// ①c: build the dense `spk_mix` [n_spk] f32 blend a multi-speaker graph consumes in place of the
+/// scalar `sid` (SHARED by the RVC + SoVITS pipelines). Weights are clamped ≥0 and normalized to
+/// sum 1; out-of-range ids are dropped. An empty / all-zero / all-out-of-range stack degrades to a
+/// ONE-HOT on the selected speaker (fallback 0) — a one-hot row through `spk_mix @ emb_g.weight` is
+/// bit-identical to `emb_g(id)`, so a multi-speaker model with no blend behaves exactly like
+/// picking that single speaker.
+pub(crate) fn build_spk_mix_dense(
+    spk_mix: &[SpkMixEntry],
+    speaker_id: Option<u32>,
+    n_spk: usize,
+) -> Vec<f32> {
+    let mut dense = vec![0.0f32; n_spk];
+    for e in spk_mix {
+        let id = e.id as usize;
+        if id < n_spk && e.weight > 0.0 {
+            dense[id] += e.weight;
+        }
+    }
+    let sum: f32 = dense.iter().sum();
+    if sum > 0.0 {
+        for w in &mut dense {
+            *w /= sum;
+        }
+    } else {
+        let spk = (speaker_id.unwrap_or(0) as usize).min(n_spk.saturating_sub(1));
+        dense[spk] = 1.0;
+    }
+    dense
+}
+
+/// ①c: the dominant (max-weight) speaker id of a blend, else `speaker_id` (fallback 0). Used to
+/// pick the per-speaker retrieval/cluster asset when a blend is active. Ties → first max in stack
+/// order.
+pub(crate) fn dominant_speaker(spk_mix: &[SpkMixEntry], speaker_id: Option<u32>) -> u32 {
+    spk_mix
+        .iter()
+        .filter(|e| e.weight > 0.0)
+        .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|e| e.id)
+        .unwrap_or_else(|| speaker_id.unwrap_or(0))
+}
+
 /// Wire-contract options for run_sovits (voiceDefaults.ts mirror).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SovitsOptions {
     pub f0_shift: f32,
     pub speaker_id: Option<u32>,
+    /// ①c speaker blend — empty = use speaker_id (single-speaker / pre-①c models: byte-identical).
+    pub spk_mix: Vec<SpkMixEntry>,
     pub noise_scale: f32,
     pub cluster_ratio: f32,
     pub loudness_envelope: f32,
@@ -102,6 +159,7 @@ impl Default for SovitsOptions {
         Self {
             f0_shift: 0.0,
             speaker_id: None,
+            spk_mix: Vec::new(),
             noise_scale: 0.4,
             cluster_ratio: 0.0,
             loudness_envelope: 1.0,

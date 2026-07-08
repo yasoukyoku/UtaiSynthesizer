@@ -125,6 +125,15 @@ def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False
     # speaker count from emb_g.weight (checkpoints lie about it).
     model = build_rvc_v2(checkpoint, deterministic=deterministic)
 
+    # ①c: a GENUINE multi-speaker RVC co-train embeds an ordered `speakers` name list in the .pth
+    # (savee, len > 1). This is the ONLY trustworthy multi signal — n_speakers = emb_g table size
+    # (109) even for a single-speaker import, so it CANNOT gate this (would flip every single-
+    # speaker export to spk_mix and break byte-identity). Multi → export a spk_mix [1, n_spk] blend
+    # input replacing scalar sid so emb_g can be interpolated at inference. Mirrors convert_sovits.
+    rvc_speakers = checkpoint.get("speakers")
+    export_spk_mix = isinstance(rvc_speakers, (list, tuple)) and len(rvc_speakers) > 1
+    model.export_spk_mix = export_spk_mix
+
     features_dim = 256 if version == "v1" else 768
     inter_channels = config[2]
     sample_rate = config[-1]
@@ -140,14 +149,23 @@ def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False
     # Plausible f0 contour with an unvoiced stretch (exercises the uv path).
     pitchf = 150.0 + 100.0 * torch.rand(1, seq_len)
     pitchf[:, 40:60] = 0.0
-    sid = torch.zeros(1, dtype=torch.int64)
+    # speaker input: scalar sid (single) OR a normalized spk_mix [1, n_speakers] blend (multi) —
+    # the emb_g gather vs `spk_mix @ emb_g.weight` matmul is bit-identical for a one-hot row.
+    # n_speakers (emb_g rows) is FIXED, so spk_mix has no dynamic axis.
+    if export_spk_mix:
+        spk = torch.rand(1, n_speakers)
+        spk = spk / spk.sum(dim=1, keepdim=True)
+        spk_name = "spk_mix"
+    else:
+        spk = torch.zeros(1, dtype=torch.int64)
+        spk_name = "sid"
     rnd = torch.randn(1, inter_channels, seq_len)
 
     torch.onnx.export(
         model,
-        (phone, phone_lengths, pitch, pitchf, sid, rnd),
+        (phone, phone_lengths, pitch, pitchf, spk, rnd),
         str(output_path),
-        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
+        input_names=["phone", "phone_lengths", "pitch", "pitchf", spk_name, "rnd"],
         output_names=["audio"],
         dynamic_axes={
             "phone": {1: "seq_len"},
@@ -178,9 +196,13 @@ def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False
             "phone_lengths": np.array([t], dtype=np.int64),
             "pitch": np.random.randint(1, 256, (1, t)).astype(np.int64),
             "pitchf": (150.0 + 100.0 * np.random.rand(1, t)).astype(np.float32),
-            "sid": np.zeros(1, dtype=np.int64),
             "rnd": np.random.randn(1, inter_channels, t).astype(np.float32),
         }
+        if export_spk_mix:
+            m = np.random.rand(1, n_speakers).astype(np.float32)
+            feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
+        else:
+            feeds["sid"] = np.zeros(1, dtype=np.int64)
         audio = sess.run(None, feeds)[0]
         if audio.shape != (1, 1, t * upp) or not np.isfinite(audio).all():
             raise ValueError(
@@ -202,12 +224,22 @@ def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False
             "rnd_input": [1, int(inter_channels), "T"],
             "default_scale": 0.66666,
         },
-        "inputs": ["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd"],
+        "inputs": ["phone", "phone_lengths", "pitch", "pitchf", spk_name, "rnd"],
         # Shortest supported input: the traced attention rel-pos branch is only
         # valid for T >= window_size + 2 (gated in verify/voice/gate1_rvc.py).
         "min_frames": RVC_MIN_FRAMES,
     }
-    config_path.write_text(json.dumps(config_data, indent=2))
+    # ①c: for a genuine multi-speaker model, add the speaker NAME→id map (RVC .pth is otherwise
+    # nameless — names come from the embedded `speakers` list, index = spk_id = emb_g row) and the
+    # spk_mix block. Appended ONLY for multi so single-speaker sidecars stay byte-identical (the
+    # "inputs" list already carries "spk_mix" vs "sid").
+    if export_spk_mix:
+        config_data["speakers"] = {str(name): i for i, name in enumerate(rvc_speakers)}
+        config_data["spk_mix"] = {"available": True, "n_spk": n_speakers}
+    # utf-8 + ensure_ascii=False: CJK speaker names must survive verbatim. For single-speaker
+    # (ASCII-only content) this is byte-identical to the old default write_text/ensure_ascii=True.
+    config_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
 
     print(f"Converted RVC {version}: {input_path} -> {output_path}"
           + (" [deterministic gate build]" if deterministic else ""))
