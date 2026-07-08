@@ -338,7 +338,33 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
         "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
         "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-amd-v1.manifest.json",
     ],
-    // xpu 变体按 Phase C 加入 —— 见 s42 设计 §5。
+}, CatalogEntry {
+    id: "runtime-xpu-v1",
+    variant: "xpu",
+    label: "Intel 运行时（XPU；Arc 训练 + 模型转换，实验性）",
+    // Real numbers from the S45 build: 1.356 GB download / 5.27 GB on disk (single part,
+    // under the 1.9 GiB split cap). Bulkier than cpu/nv because the Intel SYCL/oneMKL
+    // runtime + triton-xpu (359 MB) ship as separate wheels. Built + verified on the dev
+    // machine (RTX 3080 Ti, NO Intel GPU): flat-PBS torch-2.11.0+xpu import OK + envtest
+    // --device cpu 20/20 PASS (tiny_gan 0.6350→0.4609 bitwise-identical to cpu/nv/amd).
+    download_bytes: 1_355_876_805,
+    disk_bytes: 5_273_762_795,
+    // EXPERIMENTAL tier (design §4.3/§4.5). xpu runs fp32 (no bf16). Four of the five training
+    // objects (RVC / SoVITS 4.0 / 4.1 / shallow-diffusion) use the Intel GPU via the device
+    // shim; the vocoder finetune trains on CPU (Lightning 2.6.5 ships no XPU accelerator — it
+    // warns loudly rather than silently fall back). torch 2.11.0+xpu is on the
+    // download.pytorch.org/whl/xpu RELEASE channel (permanent, no HF wheel mirror). No numeric
+    // xpu gate is possible without Intel silicon — correctness is by-construction + the
+    // on-device envtest, validated by the first community reports (keep the flag until then).
+    experimental: true,
+    // Published S45 to datasets/yasoukyoku/utai-runtimes. Verified live: HF LFS oid ==
+    // local sha256 (6e9610e0…, byte-identical 1.36 GB), manifest HTTP 200 on both sources,
+    // tar Range→206 (resumable), served manifest id/variant/sha correct. Official first,
+    // hf-mirror second (downloader fails over with resume carried).
+    manifest_urls: &[
+        "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
+        "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-xpu-v1.manifest.json",
+    ],
 }];
 
 /// Manifest URL candidates for a catalog entry: published URLs + the dev override.

@@ -58,6 +58,11 @@ pub struct CatalogItem {
     /// override) — drives whether the 下载 button shows at all.
     pub downloadable: bool,
     pub installed: bool,
+    /// Whether THIS machine's hardware can actually run this variant (settings.rs
+    /// `variant_supported`: CPU always; nv needs an sm_75+ NVIDIA card; amd/intel need
+    /// the matching-vendor GPU). The UI hides download entries for unsupported variants
+    /// so a box is only offered packs it can use. Local-file install is NOT gated by this.
+    pub supported: bool,
 }
 
 #[tauri::command]
@@ -67,6 +72,10 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
         .unwrap_or_default();
     let root_ascii_ok = root.is_ascii() && !root.is_empty();
     let packs = pyenv::list_packs();
+    // Hardware facts for the per-variant support gate — queried ONCE per refresh (each
+    // is a subprocess: WMI for vendors, nvidia-smi for the NVIDIA compute cap).
+    let gpus = crate::commands::settings::query_gpu_adapters();
+    let nv_cc = crate::commands::settings::nvidia_max_compute_cap();
     let catalog = pyenv::CATALOG
         .iter()
         .map(|e| CatalogItem {
@@ -80,6 +89,7 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
             // By ID, not variant: during a v1→v2 upgrade both coexist and the v2
             // catalog row must stay visible/downloadable while v1 is installed.
             installed: packs.iter().any(|p| p.meta.id == e.id),
+            supported: crate::commands::settings::variant_supported(&e.variant, &gpus, nv_cc),
         })
         .collect();
     Ok(RuntimeEnvInfo {

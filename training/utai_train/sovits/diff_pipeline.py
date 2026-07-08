@@ -55,6 +55,7 @@ from ..augment import (
     read_wav,
     run_f0_gate,
 )
+from .. import device as device_shim
 from ..cache import invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
@@ -81,7 +82,9 @@ _PLACEHOLDER_MAIN = dict(
 
 
 def run(cfg, reporter, stop):
-    import torch
+    # backend = effective device (cuda|xpu|cpu), single source (shim). Byte-identical
+    # to torch.cuda.is_available() on cpu/cuda; resolves to "xpu" on an Intel box.
+    backend = device_shim.resolve_backend(cfg)
 
     exp_dir = cfg["workspace"]
     os.makedirs(exp_dir, exist_ok=True)
@@ -163,7 +166,7 @@ def run(cfg, reporter, stop):
         hps,
         assets["contentvec_onnx"],
         assets["rmvpe_pt"],
-        "cuda" if torch.cuda.is_available() else "cpu",
+        backend,  # "cuda"|"xpu"|"cpu" for the f0 predictor + diff mel extractor (Vocoder)
         reporter,
         stop,
         diff_mode=True,
@@ -229,8 +232,6 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
     the data pipeline never consults the spk map (data_loaders.py:149), it
     only reaches the exported sidecar's speakers list. Returns data.duration
     (the short-sample pre-check needs it)."""
-    import torch
-
     with open(
         os.path.join(cfg["assets"]["configs_dir"], "diffusion_template.yaml"),
         encoding="utf-8",
@@ -239,8 +240,8 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
 
     display = cfg.get("model_name") or cfg["model_slug"]
     flist_dir = os.path.join(exp_dir, "filelists")
-    use_cuda = torch.cuda.is_available()
-    fp16 = bool(cfg.get("fp16", False)) and use_cuda  # CPU autocast has no fp16
+    backend = device_shim.resolve_backend(cfg)
+    fp16 = bool(cfg.get("fp16", False)) and backend == "cuda"  # xpu/cpu = fp32; CPU autocast has no fp16
 
     config["data"]["encoder"] = encoder
     config["data"]["encoder_out_channels"] = dim
@@ -249,7 +250,7 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
     config["model"]["n_spk"] = 1
     config["model"]["k_step_max"] = int(cfg.get("k_step_max", 0))
     config["spk"] = {display: 0}
-    config["device"] = "cuda" if use_cuda else "cpu"
+    config["device"] = backend  # "cuda"|"xpu"|"cpu" -> solver args.device (shim-driven amp; xpu=fp32)
     config["vocoder"]["ckpt"] = _p(cfg["assets"]["nsf_hifigan_model"])
     config["env"]["expdir"] = _p(expdir)
     config["env"]["gpu_id"] = 0  # device selection is CUDA_VISIBLE_DEVICES (runner)

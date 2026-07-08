@@ -90,7 +90,7 @@ fn recommend_variant(gpus: &[GpuAdapter]) -> &'static str {
 /// Enumerate video adapters with PCI vendor ids via WMI. One query serves both the
 /// display string and the vendor classification (single source — replaces the old
 /// name-only `detect_gpu_name`).
-fn query_gpu_adapters() -> Vec<GpuAdapter> {
+pub(crate) fn query_gpu_adapters() -> Vec<GpuAdapter> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -134,6 +134,58 @@ fn query_gpu_adapters() -> Vec<GpuAdapter> {
         }
     }
     Vec::new()
+}
+
+/// Max NVIDIA compute capability across installed NVIDIA GPUs, via nvidia-smi
+/// (authoritative — WMI/PNPDeviceID can't report it). `None` when nvidia-smi is
+/// absent or unreadable (no driver, or a non-NVIDIA box): callers treat `None` as
+/// "undetermined → do not architecture-gate" (fail open, envtest is the real gate).
+#[cfg(windows)]
+pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let max = text
+        .lines()
+        .filter_map(|l| l.trim().parse::<f32>().ok())
+        .fold(f32::NAN, f32::max); // f32::max ignores NaN → seeds cleanly, stays NaN if no rows
+    if max.is_nan() {
+        None
+    } else {
+        Some(max)
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
+    None
+}
+
+/// Whether THIS machine's hardware can run a given runtime-pack VARIANT — the gate for
+/// which download entries the settings UI offers (only expose packs the user can actually
+/// use; a fresh box always sees CPU). Vendor comes from PNPDeviceID. The NVIDIA pack
+/// ADDITIONALLY needs an sm_75+ card (compute cap ≥ 7.5): torch cu130's fatbin floor is
+/// sm_75, so a GTX 10-series / Pascal card can't run it and must not be offered the pack.
+/// AMD/Intel are gated on vendor presence ONLY (experimental tier — the on-device envtest
+/// is the true capability gate, and robust RDNA/Arc arch detection needs tooling we don't
+/// bundle). An UNDETERMINED NVIDIA compute cap (nvidia-smi absent) fails OPEN so a valid
+/// RTX user is never hidden. NB: LOCAL-FILE install is deliberately NOT gated by this.
+pub(crate) fn variant_supported(variant: &str, gpus: &[GpuAdapter], nv_cc: Option<f32>) -> bool {
+    let has = |v: &str| gpus.iter().any(|g| g.vendor == v);
+    match variant {
+        "cpu" => true,
+        "nv-cu130" => has("nvidia") && nv_cc.map_or(true, |cc| cc >= 7.5),
+        "amd" => has("amd"),
+        "xpu" => has("intel"),
+        _ => false,
+    }
 }
 
 #[tauri::command]

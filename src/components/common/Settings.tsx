@@ -50,6 +50,10 @@ interface RuntimeCatalogItem {
   experimental: boolean;
   downloadable: boolean;
   installed: boolean;
+  /** Whether THIS machine's hardware can run the variant (backend variant_supported):
+   *  CPU always; NVIDIA needs an sm_75+ card; AMD/Intel need the matching-vendor GPU.
+   *  Unsupported variants are hidden from the download list (local-file install still works). */
+  supported: boolean;
 }
 
 interface RuntimeEnvInfo {
@@ -368,6 +372,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       rtPackLabel_cpu: { zh: "CPU 运行时（模型转换基座 + CPU 训练）", en: "CPU runtime (model conversion base + CPU training)", ja: "CPU ランタイム（モデル変換基盤 + CPU トレーニング）" },
       rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
       rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RDNA3/4 训练 + 模型转换）", en: "AMD runtime (ROCm; RDNA3/4 training + conversion)", ja: "AMD ランタイム（ROCm；RDNA3/4 トレーニング + 変換）" },
+      rtPackLabel_xpu: { zh: "Intel 运行时（XPU；Arc 训练 + 模型转换）", en: "Intel runtime (XPU; Arc training + conversion)", ja: "Intel ランタイム（XPU；Arc トレーニング + 変換）" },
       srcTitle: { zh: "下载源 / 网络", en: "Download Source / Network", ja: "ダウンロードソース / ネットワーク" },
       srcHF: { zh: "HuggingFace（默认）", en: "HuggingFace (default)", ja: "HuggingFace（既定）" },
       srcMirror: { zh: "HF Mirror (hf-mirror.com) — 中国大陆加速", en: "HF Mirror (hf-mirror.com) — China mainland", ja: "HF Mirror (hf-mirror.com) — 中国本土" },
@@ -606,7 +611,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 </div>
               )}
 
-              {rt.catalog.filter((c) => !c.installed).map((c) => (
+              {/* Only offer packs this machine's hardware can run (backend-gated:
+                  CPU always; NVIDIA needs sm_75+; AMD/Intel need the matching GPU).
+                  Unsupported variants are hidden here — local-file install stays open. */}
+              {rt.catalog.filter((c) => !c.installed && c.supported).map((c) => (
                 <div key={c.id} className="settings-field">
                   <label>{packLabel(c)}{c.experimental ? `（${L("rtExperimental")}）` : ""}</label>
                   {c.downloadable ? (

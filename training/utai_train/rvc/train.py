@@ -83,8 +83,9 @@ def build_hps(cfg, exp_dir):
     hps.save_every_weights = "1" if cfg.get("save_every_weights", True) else "0"
     hps.if_cache_data_in_gpu = 1 if cfg.get("cache_gpu", False) else 0
     hps.data.training_files = os.path.join(exp_dir, "filelist.txt")
-    if not torch.cuda.is_available():
-        # CPU fallback (RVC only): amp/GradScaler are CUDA-only
+    if device_shim.resolve_backend(cfg) != "cuda":
+        # fp16 amp/GradScaler are CUDA-only; cpu AND xpu run fp32 (design §4.5).
+        # NB `!= "cuda"` (never `== "cpu"`) — xpu must also force fp16 off.
         hps.train.fp16_run = False
     return hps
 
@@ -101,9 +102,16 @@ def train(cfg, exp_dir, reporter, stop):
         from .infer_pack.models import SynthesizerTrnMs768NSFsid as RVC_Model_f0
 
     torch.manual_seed(hps.train.seed)
-    use_cuda = torch.cuda.is_available()
-    amp_backend = "cuda" if use_cuda else "cpu"
-    if use_cuda:
+    # backend = the effective device: "cuda" | "xpu" | "cpu" (single source, shim).
+    # Two DISTINCT gates (do NOT collapse into one boolean — S44/critic overload trap):
+    #   use_cuda gates DEVICE PLACEMENT and is true for ANY accelerator (cuda or xpu);
+    #   `backend == "cuda"` gates CUDA-ONLY ops (set_device) — xpu selects its device
+    #   via ZE_AFFINITY_MASK in setup_visibility (pre-import), never set_device.
+    backend = device_shim.resolve_backend(cfg)
+    use_cuda = backend != "cpu"
+    amp_backend = backend
+    device = device_shim.torch_device(backend)
+    if backend == "cuda":
         torch.cuda.set_device(0)
 
     writer = SummaryWriter(log_dir=hps.model_dir)
@@ -137,10 +145,10 @@ def train(cfg, exp_dir, reporter, stop):
         sr=hps.sample_rate,
     )
     if use_cuda:
-        net_g = net_g.cuda()
+        net_g = net_g.to(device)
     net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm)
     if use_cuda:
-        net_d = net_d.cuda()
+        net_d = net_d.to(device)
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
         hps.train.learning_rate,
@@ -259,15 +267,15 @@ def train(cfg, exp_dir, reporter, stop):
                         sid,
                     ) = info
                     if use_cuda:
-                        phone = phone.cuda(0, non_blocking=True)
-                        phone_lengths = phone_lengths.cuda(0, non_blocking=True)
-                        pitch = pitch.cuda(0, non_blocking=True)
-                        pitchf = pitchf.cuda(0, non_blocking=True)
-                        sid = sid.cuda(0, non_blocking=True)
-                        spec = spec.cuda(0, non_blocking=True)
-                        spec_lengths = spec_lengths.cuda(0, non_blocking=True)
-                        wave = wave.cuda(0, non_blocking=True)
-                        wave_lengths = wave_lengths.cuda(0, non_blocking=True)
+                        phone = phone.to(device, non_blocking=True)
+                        phone_lengths = phone_lengths.to(device, non_blocking=True)
+                        pitch = pitch.to(device, non_blocking=True)
+                        pitchf = pitchf.to(device, non_blocking=True)
+                        sid = sid.to(device, non_blocking=True)
+                        spec = spec.to(device, non_blocking=True)
+                        spec_lengths = spec_lengths.to(device, non_blocking=True)
+                        wave = wave.to(device, non_blocking=True)
+                        wave_lengths = wave_lengths.to(device, non_blocking=True)
                     cache.append(
                         (
                             batch_idx,
@@ -308,14 +316,14 @@ def train(cfg, exp_dir, reporter, stop):
                 sid,
             ) = info
             if (hps.if_cache_data_in_gpu == False) and use_cuda:
-                phone = phone.cuda(0, non_blocking=True)
-                phone_lengths = phone_lengths.cuda(0, non_blocking=True)
-                pitch = pitch.cuda(0, non_blocking=True)
-                pitchf = pitchf.cuda(0, non_blocking=True)
-                sid = sid.cuda(0, non_blocking=True)
-                spec = spec.cuda(0, non_blocking=True)
-                spec_lengths = spec_lengths.cuda(0, non_blocking=True)
-                wave = wave.cuda(0, non_blocking=True)
+                phone = phone.to(device, non_blocking=True)
+                phone_lengths = phone_lengths.to(device, non_blocking=True)
+                pitch = pitch.to(device, non_blocking=True)
+                pitchf = pitchf.to(device, non_blocking=True)
+                sid = sid.to(device, non_blocking=True)
+                spec = spec.to(device, non_blocking=True)
+                spec_lengths = spec_lengths.to(device, non_blocking=True)
+                wave = wave.to(device, non_blocking=True)
 
             with device_shim.autocast(amp_backend, enabled=hps.train.fp16_run):
                 (

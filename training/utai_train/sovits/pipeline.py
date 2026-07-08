@@ -36,6 +36,7 @@ import shutil
 
 import numpy as np
 
+from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint, invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
@@ -62,7 +63,9 @@ def extract_cache_fp_text(dataset_dir, encoder, loudnorm):
 
 
 def run(cfg, reporter, stop):
-    import torch
+    # backend = effective device (cuda|xpu|cpu), single source (shim). Byte-identical
+    # to torch.cuda.is_available() on cpu/cuda; resolves to "xpu" on an Intel box.
+    backend = device_shim.resolve_backend(cfg)
 
     exp_dir = cfg["workspace"]
     os.makedirs(exp_dir, exist_ok=True)
@@ -75,7 +78,7 @@ def run(cfg, reporter, stop):
     encoder = VERSION_ENCODER[version]
     slug = cfg["model_slug"]
     seed = int(cfg.get("seed", 1234))
-    fp16 = bool(cfg.get("fp16", False)) and torch.cuda.is_available()
+    fp16 = bool(cfg.get("fp16", False)) and backend == "cuda"
     vol_embedding = bool(cfg.get("vol_embedding", False))
     loudnorm = bool(cfg.get("loudnorm", False))
     ffmpeg = assets["ffmpeg"]
@@ -129,7 +132,7 @@ def run(cfg, reporter, stop):
         hps,
         assets["contentvec_onnx"],
         assets["rmvpe_pt"],
-        "cuda" if torch.cuda.is_available() else "cpu",
+        backend,  # "cuda"|"xpu"|"cpu" device for f0 predictor + mel extractor (sovits rmvpe is fp32 on every backend)
         reporter,
         stop,
     )

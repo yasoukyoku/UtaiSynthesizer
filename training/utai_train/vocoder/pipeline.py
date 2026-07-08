@@ -95,6 +95,7 @@ from ..augment import (
     read_wav,
     run_f0_gate,
 )
+from .. import device as device_shim
 from ..cache import dataset_fingerprint, invalidate_extract_caches
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
@@ -120,6 +121,9 @@ def run(cfg, reporter, stop):
     get_logger(exp_dir)
 
     assets = cfg["assets"]
+    # backend = effective device (cuda|xpu|cpu). Drives the aug-gate rmvpe device;
+    # the Lightning trainer handles xpu separately in _train (Lightning has no XPU).
+    backend = device_shim.resolve_backend(cfg)
     pretrain = assets.get("vocoder_pretrain") or ""
     if not os.path.isfile(pretrain):
         raise RuntimeError("找不到声码器微调底模: %s" % pretrain)
@@ -151,7 +155,7 @@ def run(cfg, reporter, stop):
     # part 4 keeps that blind spot on record), so the gate must not use the
     # npz f0 products
     _vocoder_aug_gate(exp_dir, slices_dir, npz_dir,
-                      assets.get("rmvpe_pt", ""), reporter, stop)
+                      assets.get("rmvpe_pt", ""), backend, reporter, stop)
 
     stop.check()
     build_filelists(npz_dir, flist_dir, int(cfg.get("seed", 1234)),
@@ -398,7 +402,7 @@ def _augment_vocoder(exp_dir, slices_dir, npz_dir, copies, seed, reporter, stop)
                     pass
 
 
-def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, reporter, stop):
+def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter, stop):
     """rmvpe-blooded f0 gate over the aug AUDIO pairs (never the npz f0 — its
     parselmouth lineage is blind to the PSOLA glitch tail, see run())."""
     entries = list_aug_entries(slices_dir, _vocoder_meta_dir(exp_dir))
@@ -418,7 +422,7 @@ def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, reporter, stop):
         hop_length=512,
         sampling_rate=TARGET_SR,
         dtype=torch.float32,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=backend,  # "cuda"|"xpu"|"cpu"; sovits rmvpe is fp32 on every backend (no is_half)
         threshold=0.05,
         model_path=rmvpe_pt,
     )
@@ -591,6 +595,23 @@ def _train(cfg, exp_dir, config, reporter, stop):
 
     from .harness import UtaiNsfTask, UtaiProtocolCallback, save_weights_snapshot
     from .utils.training_utils import DsModelCheckpoint, get_latest_checkpoint_path
+
+    # Lightning 2.6.5 ships NO XPU accelerator (accelerators/ = cpu/cuda/mps/xla only),
+    # so accelerator="auto" would SILENTLY pick CPU on an Intel box — design §4.5 forbids
+    # a silent fallback. The other four training objects are plain torch loops on the
+    # device shim and DO use the Intel GPU; only this Lightning trainer cannot. So when the
+    # resolved backend is xpu, force CPU EXPLICITLY and warn LOUDLY (log + protocol). Set
+    # before the config.yaml dump so the record reflects the real accelerator. cuda/cpu keep
+    # the config's "auto" (byte-noop — auto resolves to the same accelerator there, and
+    # gate1/noop run on CPU where backend != "xpu", so this branch never fires under a gate).
+    if device_shim.resolve_backend(cfg) == "xpu":
+        config["pl_trainer_accelerator"] = "cpu"
+        _xpu_msg = (
+            "声码器微调：Intel(XPU) 显卡暂不支持 GPU 训练（Lightning 无 XPU 后端），"
+            "本对象将在 CPU 上训练（可能很慢）——其余训练对象正常使用 Intel GPU"
+        )
+        logger.warning(_xpu_msg)
+        reporter.stage("train_prep", message=_xpu_msg, force=True)
 
     work_dir = str(exp_dir)
     # config.yaml dump BEFORE the work_dir key lands in the dict (train.py:42-44)

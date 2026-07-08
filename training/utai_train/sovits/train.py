@@ -89,18 +89,25 @@ def train(cfg, exp_dir, reporter, stop):
     hps.model_dir = exp_dir
     name = cfg["model_slug"]
 
-    use_cuda = torch.cuda.is_available()
-    amp_backend = "cuda" if use_cuda else "cpu"
-    if not use_cuda:
-        # CPU fallback: GradScaler/autocast are CUDA-only
+    # backend = effective device (cuda|xpu|cpu), single source (shim). Same
+    # two-gate split as the RVC trainer: use_cuda gates DEVICE PLACEMENT (true for
+    # any accelerator, cuda or xpu — the 8x `.to(device)` below follow it), while
+    # `backend == "cuda"` gates cuda-only ops (set_device) + the fp16 precision
+    # gate. xpu runs fp32 and selects its device via ZE_AFFINITY_MASK (setup_visibility).
+    backend = device_shim.resolve_backend(cfg)
+    use_cuda = backend != "cpu"
+    amp_backend = backend
+    if backend != "cuda":
+        # fp16 GradScaler/autocast are CUDA-only; cpu AND xpu run fp32 (design §4.5).
+        # NB `!= "cuda"` (never `== "cpu"`) — xpu must also force fp16 off.
         hps.train.fp16_run = False
 
     global_step = 0
 
     torch.manual_seed(hps.train.seed)
-    if use_cuda:
+    if backend == "cuda":
         torch.cuda.set_device(0)
-    device = torch.device("cuda:0" if use_cuda else "cpu")
+    device = device_shim.torch_device(backend)
 
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))

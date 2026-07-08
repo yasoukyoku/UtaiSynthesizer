@@ -29,6 +29,7 @@ import os
 import numpy as np
 
 from . import train_utils as utils
+from .. import device as device_shim
 from ..augment import augment_slices, is_aug_name, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint, invalidate_extract_caches
 from .extract_f0 import extract_f0
@@ -47,7 +48,11 @@ EXTRACT_CACHE_SUBDIRS = ("2a_f0", "2b-f0nsf", "3_feature256", "3_feature768")
 
 
 def run(cfg, reporter, stop):
-    import torch
+    # backend = effective device (cuda|xpu|cpu), single source (shim). setup_visibility
+    # (runner, pre-torch-import) has already applied the device mask, so resolve_backend's
+    # availability check reflects the selected device. Byte-identical to the old
+    # torch.cuda.is_available() on cpu/cuda; on an Intel box it resolves to "xpu".
+    backend = device_shim.resolve_backend(cfg)
 
     exp_dir = cfg["workspace"]
     os.makedirs(exp_dir, exist_ok=True)
@@ -59,7 +64,7 @@ def run(cfg, reporter, stop):
         raise RuntimeError("非法采样率: %s（可选 32k/40k/48k）" % sr_str)
     version = cfg["version"]
     seed = int(cfg.get("seed", 1234))
-    fp16 = bool(cfg.get("fp16", True)) and torch.cuda.is_available()
+    fp16 = bool(cfg.get("fp16", True)) and backend == "cuda"
     ffmpeg = assets["ffmpeg"]
 
     invalidate_extract_caches(
@@ -79,12 +84,11 @@ def run(cfg, reporter, stop):
     stop.check()
     _augment_rvc(exp_dir, int(cfg.get("aug_copies", 0)), seed, reporter, stop)
 
-    use_cuda = torch.cuda.is_available()
     extract_f0(
         exp_dir,
         assets["rmvpe_pt"],
-        "cuda" if use_cuda else "cpu",
-        use_cuda,  # matches upstream's de-facto always-half-on-NVIDIA behavior
+        backend,  # "cuda"|"xpu"|"cpu" bare device string (rmvpe checks str(device)=="cuda")
+        backend == "cuda",  # is_half: rmvpe half is CUDA-only (upstream always-half-on-NVIDIA); xpu/cpu run float
         ffmpeg,
         reporter,
         stop,

@@ -66,7 +66,15 @@ VARIANTS = {
         # python needed, the earlier ABI worry was moot). Experimental tier.
         "label": "AMD 运行时（TheRock ROCm；RDNA3/4 训练 + 模型转换，实验性）",
     },
-    # Phase C: "xpu" — one lockfile, same recipe (cp310, download.pytorch.org/whl/xpu).
+    "xpu": {
+        "lock": "runtime-xpu.lock.txt",
+        # Intel Arc / xpu; cp310 (SAME PBS interpreter as cpu/nv — torch 2.11.0+xpu is on
+        # the download.pytorch.org/whl/xpu RELEASE channel, permanent like cpu/nv, so no HF
+        # wheel mirror is needed). Experimental tier. xpu runs fp32 (no bf16); four of the
+        # five objects use the Intel GPU via the device shim, but the vocoder finetune trains
+        # on CPU (Lightning 2.6.5 ships no XPU accelerator — it warns rather than silent-CPU).
+        "label": "Intel 运行时（XPU；Arc 训练 + 模型转换，实验性）",
+    },
 }
 
 PART_BYTES = 1_900_000_000  # < GitHub release 2 GiB per-file cap
