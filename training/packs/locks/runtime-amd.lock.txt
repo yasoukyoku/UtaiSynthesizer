@@ -1,30 +1,30 @@
 # runtime-amd lock — the unified dependency set (design §2.1) with the torch backend
 # segment swapped to AMD/TheRock ROCm. Frozen from the S44 staging venv
 # (envs/s44_staging_amd), validated on the dev machine's Radeon 780M (gfx1103, RDNA3):
-# import + torch.cuda.is_available()==True + full envtest --device cuda 20/20 PASS
-# (tiny_gan conv/convT converges 0.6354→0.4947 identical to the NVIDIA run; stft/istft
-# vs CPU 2.4e-5/9.5e-7; fp16+GradScaler OK).
+# import + torch.cuda.is_available()==True + full envtest --device cuda 20/20 PASS + a full
+# RVC training dogfood (converges, mel 36→23). TheRock's torch on whl-multi-arch is a THIN
+# HOST wheel; the ROCm runtime + device kernels ship as SEPARATE packages — all 9 pinned
+# EXPLICITLY (incl. the rocm-bootstrap DLL-loader shim + the tiny `rocm` sdist metapackage;
+# omitting either is untested). No system ROCm/HIP SDK required (confirmed on 780M).
 #
-# TheRock's torch on whl-multi-arch is a THIN HOST wheel; the ROCm runtime + device
-# kernels ship as SEPARATE same-index packages (the `torch[device-gfx1103]` extra pulls
-# them, here pinned EXPLICITLY for determinism). No system ROCm/HIP SDK is required — the
-# rocm-sdk-* wheels vendor everything (design §4.4 self-contained model, confirmed on 780M).
-#
-# ⚠️ REPRODUCIBILITY: the +rocm7.15.0a20260707 nightly is a DATED wheel on a rolling
-# index — it ages off in ~weeks. A future rebuild after it rolls needs the frozen wheels
-# (mirrored to our HF, see build note) via --find-links; the BUILT pack is self-contained
-# and users never touch this index. ALL +rocm packages MUST share the identical date tag
+# REPRODUCIBILITY (S44): TheRock has NO stable release channel on Windows — only a ROLLING
+# nightly index whose dated builds age off in ~weeks (unlike runtime-cpu/nv-cu130, which pin
+# the PERMANENT download.pytorch.org release channel and therefore rebuild forever). So the
+# 9 rocm wheels for THIS pinned nightly (rocm7.15.0a20260707) are MIRRORED to our own HF
+# dataset (wheels/amd/) and referenced below by DIRECT URL — `build_pack.py --variant amd`
+# now rebuilds from HF with NO nightly index, exactly as reproducible as cpu/nv. (The
+# distributed PACK was always self-contained; end users never touch any index — this only
+# restores OUR ability to rebuild/patch the pack.) All 9 share the identical date tag
 # (mixing dates = ABI-mismatched runtime). numpy stays 1.26.4 (cp310, same ABI as N axis).
---extra-index-url https://rocm.nightlies.amd.com/whl-multi-arch/
-torch==2.11.0+rocm7.15.0a20260707
-torchaudio==2.11.0+rocm7.15.0a20260707
-amd-torch-device-gfx1103==2.11.0+rocm7.15.0a20260707
-amd-torch-device-gfx110x==2.11.0+rocm7.15.0a20260707
-rocm==7.15.0a20260707
-rocm-bootstrap==0.1.0
-rocm-sdk-core==7.15.0a20260707
-rocm-sdk-device-gfx1103==7.15.0a20260707
-rocm-sdk-libraries==7.15.0a20260707
+torch @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/torch-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+torchaudio @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/torchaudio-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx1103-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+amd-torch-device-gfx110x @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/amd_torch_device_gfx110x-2.11.0%2Brocm7.15.0a20260707-cp310-cp310-win_amd64.whl
+rocm @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm-7.15.0a20260707.tar.gz
+rocm-bootstrap @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_bootstrap-0.1.0-py3-none-any.whl
+rocm-sdk-core @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_core-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-device-gfx1103 @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_device_gfx1103-7.15.0a20260707-py3-none-win_amd64.whl
+rocm-sdk-libraries @ https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/wheels/amd/rocm_sdk_libraries-7.15.0a20260707-py3-none-win_amd64.whl
 absl-py==2.5.0
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.1
