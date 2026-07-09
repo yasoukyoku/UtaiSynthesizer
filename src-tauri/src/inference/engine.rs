@@ -92,6 +92,8 @@ impl Default for DeviceConfig {
 pub enum InputTensor {
     F32 { data: Vec<f32>, shape: Vec<i64> },
     I64 { data: Vec<i64>, shape: Vec<i64> },
+    /// Boolean tensor — the ScoreToCV `phone_mask` input (all-true at deploy, B=1). Added S48 Phase 1c.
+    Bool { data: Vec<bool>, shape: Vec<i64> },
 }
 
 impl OnnxEngine {
@@ -431,6 +433,11 @@ impl OnnxEngine {
                         .into()
                 }
                 InputTensor::I64 { data, shape } => {
+                    Tensor::from_array((shape, data.into_boxed_slice()))
+                        .map_err(|e| UtaiError::Inference(format!("Input '{}': {}", name, e)))?
+                        .into()
+                }
+                InputTensor::Bool { data, shape } => {
                     Tensor::from_array((shape, data.into_boxed_slice()))
                         .map_err(|e| UtaiError::Inference(format!("Input '{}': {}", name, e)))?
                         .into()

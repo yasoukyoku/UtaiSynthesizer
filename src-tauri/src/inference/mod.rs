@@ -5,7 +5,8 @@ pub mod features;
 pub mod mel;
 pub mod nsf_hifigan;
 pub mod rvc;
-pub mod s2h;
+pub mod score2cv;
+mod score2cv_tables;
 pub mod sovits;
 
 use parking_lot::RwLock;

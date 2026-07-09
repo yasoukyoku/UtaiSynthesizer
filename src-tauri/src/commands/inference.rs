@@ -1024,57 +1024,6 @@ pub async fn detect_f0(
     .map_err(|e| format!("音高检测任务失败: {}", e))?
 }
 
-// ─── run_s2h (untouched) ─────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn run_s2h(
-    state: State<'_, Arc<AppState>>,
-    phonemes: Vec<i64>,
-    durations: Vec<i64>,
-    pitches: Vec<f32>,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), String> {
-    let s2h_model = state
-        .models
-        .list_by_type(&crate::models::ModelType::S2H)
-        .first()
-        .cloned()
-        .ok_or_else(|| "No S2H model available".to_string())?;
-
-    let session_id = state
-        .inference
-        .engine
-        .load_model(&s2h_model.path)
-        .map_err(|e| e.to_string())?;
-
-    let score = crate::inference::s2h::ScoreInput {
-        phonemes,
-        durations,
-        pitches,
-    };
-
-    let output = match crate::inference::s2h::infer(&state.inference.engine, &session_id, &score) {
-        Ok(o) => {
-            state.inference.engine.unload_model(&session_id);
-            o
-        }
-        Err(e) => {
-            state.inference.engine.unload_model(&session_id);
-            return Err(e.to_string());
-        }
-    };
-
-    let hubert: Vec<Vec<f32>> = output
-        .hubert_features
-        .rows()
-        .into_iter()
-        .map(|r| r.to_vec())
-        .collect();
-    let contentvec: Vec<Vec<f32>> = output
-        .contentvec_features
-        .rows()
-        .into_iter()
-        .map(|r| r.to_vec())
-        .collect();
-
-    Ok((hubert, contentvec))
-}
+// run_s2h + the s2h double-head module were removed in S48 Phase 1c — that pre-S35 contract
+// (phonemes/durations/pitches → hubert+contentvec) was wrong for ScoreToCV. The real score→cv path is
+// inference::score2cv (build_arrays + ONNX), wired into the vocal render pipeline in a later phase.
