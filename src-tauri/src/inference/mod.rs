@@ -9,6 +9,9 @@ pub mod score2cv;
 mod score2cv_tables;
 #[cfg(test)]
 mod score2cv_cv_ref;
+pub mod score2svc;
+#[cfg(test)]
+mod score2svc_ref;
 pub mod sovits;
 
 use parking_lot::RwLock;

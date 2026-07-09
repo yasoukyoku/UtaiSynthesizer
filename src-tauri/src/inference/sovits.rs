@@ -415,13 +415,7 @@ fn infer_segment(
         None
     } else {
         // per-piece seeded noise (independent reproducible pieces)
-        let mut rng = seg_rng(options.seed, seg_idx);
-        let noise: Vec<f32> = (0..m.noise_channels * n_frames)
-            .map(|_| {
-                let n: f32 = rng.sample(StandardNormal);
-                n * options.noise_scale
-            })
-            .collect();
+        let noise = seg_noise(m.noise_channels, n_frames, options.seed, seg_idx, options.noise_scale);
 
         let mut inputs = vec![
             (
@@ -763,6 +757,27 @@ fn seg_rng(seed: u64, seg_idx: u64) -> StdRng {
     StdRng::seed_from_u64(seed ^ seg_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
+/// The net_g explicit `noise` input: N(0,1)·scale, `channels·n_frames` values row-major (the ONNX
+/// input is `[1, channels, T]`), drawn from the per-piece seg_rng. Extracted so the cover path
+/// (infer_segment) and the S48 score path (score2svc) build the SAME noise byte-for-byte — the
+/// S35 export moved net_g's internal randn OUT to this graph input, so reproducibility hinges on an
+/// identical draw (seed + seg_idx + channel×frame count + scale, in this exact order).
+pub(crate) fn seg_noise(
+    channels: usize,
+    n_frames: usize,
+    seed: u64,
+    seg_idx: u64,
+    scale: f32,
+) -> Vec<f32> {
+    let mut rng = seg_rng(seed, seg_idx);
+    (0..channels * n_frames)
+        .map(|_| {
+            let n: f32 = rng.sample(StandardNormal);
+            n * scale
+        })
+        .collect()
+}
+
 /// One slice of the input: (silent?, start_sample, end_sample) in NATIVE-sr samples.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Slice {
@@ -989,6 +1004,26 @@ mod tests {
             (0..8).map(|_| r.sample(StandardNormal)).collect()
         };
         assert_eq!(draw(42, 0), old, "piece 0 must match the pre-chunking noise draw");
+    }
+
+    // seg_noise must be byte-identical to the old inline draw (channels·frames values, row-major,
+    // ·scale, from seg_rng) — the refactor that shares it with the score path must not drift the
+    // S35 cover-path noise.
+    #[test]
+    fn seg_noise_matches_inline_draw() {
+        let (channels, n_frames, seed, seg_idx, scale) = (3usize, 4usize, 42u64, 1u64, 0.4f32);
+        let got = seg_noise(channels, n_frames, seed, seg_idx, scale);
+        let want: Vec<f32> = {
+            let mut rng = seg_rng(seed, seg_idx);
+            (0..channels * n_frames)
+                .map(|_| {
+                    let n: f32 = rng.sample(StandardNormal);
+                    n * scale
+                })
+                .collect()
+        };
+        assert_eq!(got.len(), channels * n_frames);
+        assert_eq!(got, want, "seg_noise must reproduce the inline per-piece draw exactly");
     }
 
     // A pure-loud signal has no silence → one non-silent slice covering [0, n].

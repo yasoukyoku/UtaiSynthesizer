@@ -312,13 +312,7 @@ fn vc_chunk(
 
     // rnd: N(0,1)·noise_scale, [1, inter_channels, T]. Seeded; the chunk index is mixed in
     // so chunks get independent (but reproducible) noise like the original's fresh randn.
-    let mut rng = chunk_rng(options.seed, chunk_idx);
-    let rnd: Vec<f32> = (0..m.noise_channels * p_len)
-        .map(|_| {
-            let n: f32 = rng.sample(StandardNormal);
-            n * options.noise_scale
-        })
-        .collect();
+    let rnd = chunk_noise(m.noise_channels, p_len, options.seed, chunk_idx, options.noise_scale);
 
     let t = p_len as i64;
     let phone_data: Vec<f32> = feats.iter().copied().collect();
@@ -389,6 +383,26 @@ fn vc_chunk(
 /// Deterministic per-chunk RNG: user seed splitmixed with the chunk index.
 fn chunk_rng(seed: u64, chunk_idx: u64) -> StdRng {
     StdRng::seed_from_u64(seed ^ chunk_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// The net_g explicit `rnd` input: N(0,1)·scale, `channels·t` values row-major (ONNX `[1, channels, T]`),
+/// drawn from the per-chunk chunk_rng. Extracted so the cover path (vc_chunk) and the S48 score path
+/// (score2svc) build the SAME noise byte-for-byte — the export moved net_g's internal randn out to this
+/// input, so reproducibility hinges on an identical draw (seed + chunk_idx + channel×frame count + scale).
+pub(crate) fn chunk_noise(
+    channels: usize,
+    t: usize,
+    seed: u64,
+    chunk_idx: u64,
+    scale: f32,
+) -> Vec<f32> {
+    let mut rng = chunk_rng(seed, chunk_idx);
+    (0..channels * t)
+        .map(|_| {
+            let n: f32 = rng.sample(StandardNormal);
+            n * scale
+        })
+        .collect()
 }
 
 /// RVC f0 → coarse 1..255 (pipeline.py get_f0 mel-scale quantization).

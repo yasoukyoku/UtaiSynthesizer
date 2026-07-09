@@ -237,12 +237,16 @@ pub fn torch_interp_linear(src: &[f32], dst_len: usize) -> Vec<f32> {
         .collect()
 }
 
-/// torch F.interpolate(mode="nearest") 1-D: src index = floor(dst_index * src/dst).
+/// torch F.interpolate(mode="nearest") 1-D: `src[min(floor(dst_index·scale), src_len−1)]`. The index
+/// arithmetic is in **float32**, exactly like PyTorch's CPU nearest kernel (`scale = float(src)/float(dst)`,
+/// `floorf(float(dst_index)·scale)`). Computing it in f64 diverges by +1 frame at an isolated boundary for
+/// ~7% of target lengths (29 of the first 400 SoVITS-grid counts, e.g. 30→52 at frame 26) — see the
+/// `nearest_index_is_float32` test. This matters for the S48 score→SVC resample being bit-exact vs Python.
 pub fn torch_interp_nearest(src: &[f32], dst_len: usize) -> Vec<f32> {
     let src_len = src.len();
-    let scale = src_len as f64 / dst_len as f64;
+    let scale = src_len as f32 / dst_len as f32;
     (0..dst_len)
-        .map(|i| src[((i as f64 * scale) as usize).min(src_len - 1)])
+        .map(|i| src[(((i as f32) * scale) as usize).min(src_len - 1)])
         .collect()
 }
 
@@ -313,9 +317,11 @@ pub fn repeat_expand_2d(content: &Array2<f32>, target_len: usize, mode: &str) ->
             out.row_mut(i).assign(&content.row(current_pos));
         }
     } else if mode == "nearest" {
-        let scale = src_len as f64 / target_len as f64;
+        // float32 index arithmetic to bit-match PyTorch's nearest kernel (see torch_interp_nearest);
+        // an f64 scale diverges by +1 row at isolated boundaries for ~7% of target lengths.
+        let scale = src_len as f32 / target_len as f32;
         for i in 0..target_len {
-            let src_i = ((i as f64 * scale) as usize).min(src_len - 1);
+            let src_i = (((i as f32) * scale) as usize).min(src_len - 1);
             out.row_mut(i).assign(&content.row(src_i));
         }
     } else {
@@ -635,6 +641,33 @@ mod tests {
         let want13 = to_frames(RE2D_LEFT_7TO13, 13);
         assert_close(left7.as_slice().unwrap(), want13.as_slice().unwrap(), 0.0, "left 7→13");
         assert_close(nearest7.as_slice().unwrap(), want13.as_slice().unwrap(), 0.0, "nearest 7→13");
+    }
+
+    // PyTorch F.interpolate(mode='nearest') computes the source index in FLOAT32; an f64 computation
+    // diverges by +1 frame at an isolated boundary for ~7% of target lengths. 30→52 (a SoVITS-grid count)
+    // differs at output frame 26: torch picks src 15, an f64 index picks 14. Reference = torch 2.13
+    // F.interpolate on arange(30). Locks the f32 index in BOTH torch_interp_nearest and
+    // repeat_expand_2d('nearest') — this f64→f32 fix is what makes the S48 score→SVC resample bit-exact
+    // vs the Python reference for ANY score (5→12 / 7→13 above are non-divergent, so stay unchanged).
+    #[test]
+    fn nearest_index_is_float32() {
+        const IDX_30_52: [usize; 52] = [
+            0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6, 7, 8, 8, 9, 9, 10, 10, 11, 12, 12, 13, 13, 14, 15,
+            15, 16, 16, 17, 17, 18, 19, 19, 20, 20, 21, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28,
+            28, 29,
+        ];
+        let src: Vec<f32> = (0..30).map(|i| i as f32).collect();
+        let got = torch_interp_nearest(&src, 52);
+        assert_eq!(got.len(), 52);
+        for (i, (&g, &w)) in got.iter().zip(IDX_30_52.iter()).enumerate() {
+            assert_eq!(g as usize, w, "torch_interp_nearest 30→52 frame {} (f64 would give the wrong src at 26)", i);
+        }
+        // 2D nearest must pick the SAME source rows (cv resample on the score path routes through here).
+        let content = Array2::from_shape_fn((30, 1), |(r, _)| r as f32);
+        let rs = repeat_expand_2d(&content, 52, "nearest").unwrap();
+        for (i, &w) in IDX_30_52.iter().enumerate() {
+            assert_eq!(rs[[i, 0]] as usize, w, "repeat_expand_2d nearest 30→52 frame {}", i);
+        }
     }
 
     // python: F.interpolate(feats.permute(0,2,1), scale_factor=2).permute(0,2,1)
