@@ -89,6 +89,11 @@ function teardownForLoad() {
   // workflowSegmentId (unmounts it) + resets activePane:'timeline'. Covers new/open/recover (all 3
   // route through here).
   useAppStore.getState().closeWorkflow();
+  // ② Same for the docked vocal (piano-roll) editor: its notes segment is about to vanish; a stale
+  // activePane:'vocal' would misroute Ctrl+Z + suppress timeline Delete, and dangling selectedNotes ids
+  // would highlight ghosts. closeVocalEditor resets vocalSegmentId + activePane:'timeline' (§9.6).
+  useAppStore.getState().closeVocalEditor();
+  useProjectStore.getState().selectNotes([]);
   // Per-segment node-graph undo stacks reference the OLD document's segments — no undo across a load.
   clearNodeHistories();
 }

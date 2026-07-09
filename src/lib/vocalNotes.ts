@@ -1,0 +1,210 @@
+// ② Vocal-note DATA HYGIENE — the SINGLE source of truth for normalizing / sanitizing / clamping vocal
+// notes and their curves (S48 Phase 4a, §9.5/§9.8). Every write path funnels through here so the store,
+// the .usp loader, AND the editor share ONE definition of "a canonical note":
+//   - canonical shape (omit-default + fixed key/element order) keeps the raw-JSON save/autosave compare
+//     byte-stable (§5 false-dirty) and the undo sig (history.contentSig) phantom-free (absent ≡ default),
+//   - finite/bounds clamps + string sanitization treat a hand-edited or hostile `.usp` as untrusted input
+//     (§9.8.1): a NaN tick / out-of-range pitch / control-char lyric can never reach the canvas or render.
+// PURE (no store / no i18n / no async) so it is trivially unit-testable and importable from both the store
+// and the loader without a cycle. The reserved-token / OOV classifier that decides rest/sustain/绿-render
+// is Rust `validate_lyrics` (§9.5) — NOT here; the tie-mirror invariant lands in Phase 6 with render.
+import type { Note, PitchCurve, PitchPoint, VocalTrackParams } from "../types/project";
+
+// ── bounds (defensive; valid editor input never trips them, a corrupt file does) ──
+export const PITCH_MIN = 0;
+export const PITCH_MAX = 127;
+/** Fine-detune bound in cents (±1 octave) — a loaded |detune| beyond this is clamped, not trusted. */
+export const DETUNE_CAP = 1200;
+export const MAX_LYRIC_LEN = 64;
+/** DoS caps: a single note's control points, a segment's note count, a curve's point count. A malicious
+ *  `.usp` with a million points can't blow up the canvas / a Phase-6 render index. */
+export const MAX_POINTS_PER_NOTE = 512;
+export const MAX_NOTES_PER_SEGMENT = 100_000;
+export const MAX_CURVE_POINTS = 100_000;
+
+const SHAPES = new Set<PitchPoint["shape"]>(["linear", "sineIn", "sineOut", "sineInOut"]);
+const HUGE = 1e9;
+
+/** Round to int + clamp to [lo,hi]; a non-finite value falls back (never propagates NaN/Infinity). */
+function clampInt(v: number, lo: number, hi: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.round(v))) : fallback;
+}
+/** Clamp a finite float to [lo,hi]; non-finite → fallback. */
+function clampNum(v: number, lo: number, hi: number, fallback: number): number {
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
+}
+
+/**
+ * THE single string-sanitization choke (§9.5/§9.8.4): NFC-normalize, strip every Unicode Control/Format/
+ * Surrogate/Private-Use/Unassigned code point (`\p{C}` — covers C0/C1 controls incl. NUL, zero-width,
+ * bidi overrides, the BOM, lone surrogates), and cap the length. Applied to every user string that enters
+ * a Note (lyric / phoneme / phonemeInput / lang) on inline edit, batch, paste AND load — so a hostile
+ * `.usp` can't inject control/bidi glyphs or an unbounded string, and the same input always canonicalizes
+ * the same way (byte-stable). A space (Zs) is kept; tab/newline (Cc) are stripped — lyrics are single-line.
+ */
+export function sanitizeText(s: string, maxLen: number = MAX_LYRIC_LEN): string {
+  return (typeof s === "string" ? s : "").normalize("NFC").replace(/\p{C}/gu, "").slice(0, maxLen);
+}
+
+/**
+ * Canonicalize ONE vocal note. Rebuilds the 6 base fields (finite-clamped) then re-adds each optional
+ * ONLY when non-default, in a FIXED key/element order — so the same logical note always serializes to the
+ * same bytes regardless of how a caller built it (the omit-default + canonical-order rule the undo sig in
+ * history.noteSig folds to match). Also the load-safety clamp point (§9.8.1): out-of-range/NaN numbers are
+ * clamped, strings sanitized, bad shapes coerced. Idempotent (normalizeNote(normalizeNote(n)) === …).
+ * NOTE tie is kept as-is (settable) in Phase 4; the §9.5 tie-mirror (tie ≡ isSustainToken(lyric)) enforces
+ * in Phase 6 when render reads it — forcing it now would break nothing at render but churn Phase-3 tests
+ * for zero editor benefit.
+ */
+export function normalizeNote(n: Note): Note {
+  const out: Note = {
+    id: String(n.id),
+    tick: clampInt(n.tick, 0, HUGE, 0),
+    duration: clampInt(n.duration, 1, HUGE, 1),
+    pitch: clampInt(n.pitch, PITCH_MIN, PITCH_MAX, 60),
+    lyric: sanitizeText(n.lyric),
+    velocity: clampInt(n.velocity, 0, 127, 100),
+  };
+  if (n.phoneme) out.phoneme = sanitizeText(n.phoneme);
+  if (n.detune && Number.isFinite(n.detune)) out.detune = clampNum(n.detune, -DETUNE_CAP, DETUNE_CAP, 0);
+  // Rebuild pitchPoints: drop non-finite, round X→int tick / Y→int cent, coerce a bad shape to "linear",
+  // cap the count, and SORT by x (canonical). The sig reads sub-fields by name (order-independent) but
+  // JSON.stringify preserves key insertion order, so the fixed {x,y,shape} order keeps serialize stable.
+  if (n.pitchPoints && n.pitchPoints.length > 0) {
+    const pts = n.pitchPoints
+      .slice(0, MAX_POINTS_PER_NOTE)
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
+      .map((p): PitchPoint => ({ x: Math.round(p.x), y: Math.round(p.y), shape: SHAPES.has(p.shape) ? p.shape : "linear" }))
+      .sort((a, b) => a.x - b.x);
+    if (pts.length > 0) out.pitchPoints = pts;
+  }
+  if (n.vibrato) {
+    const v = n.vibrato;
+    if ([v.length, v.period, v.depth, v.in, v.out, v.shift, v.drift].every((x) => Number.isFinite(x))) {
+      // Clamp to sane ranges (§9.8.1) so a hostile/corrupt .usp can't inject unbounded vibrato before the
+      // Phase-5/6 render reads it: length/in/out/shift are fractions [0,1]; period ms (>0); depth/drift cents.
+      out.vibrato = {
+        length: clampNum(v.length, 0, 1, 0), period: clampNum(v.period, 1, 10000, 200), depth: clampNum(v.depth, 0, 2400, 0),
+        in: clampNum(v.in, 0, 1, 0), out: clampNum(v.out, 0, 1, 0), shift: clampNum(v.shift, 0, 1, 0), drift: clampNum(v.drift, -1200, 1200, 0),
+      };
+    }
+  }
+  if (n.pitchAuto === false) out.pitchAuto = false; // absent/true (default) → absent
+  if (n.tie) out.tie = true; // false → absent (Phase-6 mirror enforces tie ≡ sustain-lyric)
+  if (n.lang) out.lang = sanitizeText(n.lang, 8);
+  if (n.phonemeInput) out.phonemeInput = sanitizeText(n.phonemeInput);
+  return out;
+}
+
+/**
+ * THE single write funnel for a notes array (§9.5): drop malformed (id-less) notes, cap the count (load
+ * DoS guard), normalize each, and SORT by (tick, id). Storage order becomes a pure function of content →
+ * no false-dirty from insertion order, and draw / hit-test can rely on the stored order (no per-frame
+ * copy-sort). Every write entrypoint (the store note actions, applyNoteEdits, createVocalPart, and the
+ * `.usp` loader) passes through here, so a saved file's baseline sig is captured in canonical order too
+ * (a legacy file's first edit can't false-dirty). Idempotent.
+ */
+export function normalizeNotesArray(notes: Note[], cap: number = MAX_NOTES_PER_SEGMENT): Note[] {
+  return (Array.isArray(notes) ? notes : [])
+    .filter((n): n is Note => !!n && typeof n.id === "string" && n.id.length > 0)
+    .slice(0, cap)
+    .map(normalizeNote)
+    .sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/**
+ * Canonicalize a pitch/param curve (§9.5): drop non-finite points, round X→int tick, round Y by KIND
+ * (`cents` = integer cents for pitchDev; `param` = 0.001 quantum for loudness/tension/… — NEVER integer
+ * cents, which would flatten a loudness lane into a staircase), sort + dedup by X (strictly increasing),
+ * cap the count. Empty → undefined (the caller clears the field). Keeps sig↔serialize byte-stable when the
+ * Phase-5 editor writes float curves.
+ */
+export function normalizeCurve(curve: PitchCurve | undefined, kind: "cents" | "param"): PitchCurve | undefined {
+  if (!curve || !Array.isArray(curve.xs) || !Array.isArray(curve.ys)) return undefined;
+  const roundY = kind === "cents" ? (y: number) => Math.round(y) : (y: number) => Math.round(y * 1000) / 1000;
+  const pts: { x: number; y: number }[] = [];
+  const n = Math.min(curve.xs.length, curve.ys.length, MAX_CURVE_POINTS);
+  for (let i = 0; i < n; i++) {
+    const x = curve.xs[i]!;
+    const y = curve.ys[i]!;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    pts.push({ x: Math.round(x), y: roundY(y) });
+  }
+  pts.sort((a, b) => a.x - b.x);
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const p of pts) {
+    if (xs.length > 0 && p.x === xs[xs.length - 1]) {
+      ys[ys.length - 1] = p.y; // duplicate x → last value wins (a paint pass overwrites)
+      continue;
+    }
+    xs.push(p.x);
+    ys.push(p.y);
+  }
+  return xs.length > 0 ? { xs, ys } : undefined;
+}
+
+/**
+ * Retime a note by a start delta and a duration delta, rebasing its note-relative `pitchPoints.x` when the
+ * START moves (a point at x is relative to the note onset). ONE helper shared by user resize AND the
+ * one-note-per-position truncation (§9.5 two-X-origins fix) so both keep pitch shaping aligned. Vibrato
+ * span is fraction-based (rides the new duration) so it needs no rebase. Re-normalized on the way out.
+ */
+export function retimeNote(note: Note, dTickStart: number, dDuration: number): Note {
+  const tick = Math.max(0, note.tick + dTickStart);
+  const duration = Math.max(1, note.duration + dDuration);
+  let pitchPoints = note.pitchPoints;
+  if (pitchPoints && pitchPoints.length > 0 && dTickStart !== 0) {
+    pitchPoints = pitchPoints.map((p) => ({ ...p, x: p.x - dTickStart }));
+  }
+  return normalizeNote({ ...note, tick, duration, pitchPoints });
+}
+
+/**
+ * One-position-one-note (§9.2, §5): given the post-edit notes and the set of ACTIVE (just added/moved/
+ * resized) note ids, clip every PASSIVE note so it no longer overlaps ANY active interval, over the WHOLE
+ * array in tick order — NOT just each active note's immediate neighbor (the multi-select-resize
+ * committed-overlap bug). Half-open intervals `[tick, tick+duration)`: an abutting boundary
+ * (`passive.end === active.start`) is legato-legal, not overlap. A passive note swallowed by an active
+ * one, or clipped below `minTicks`, is dropped. Active notes pass through untouched (they win). Pure.
+ */
+export function resolveOverlaps(notes: Note[], activeIds: Set<string>, minTicks: number): Note[] {
+  const active = notes
+    .filter((n) => activeIds.has(n.id))
+    .map((n) => ({ start: n.tick, end: n.tick + n.duration }))
+    .sort((a, b) => a.start - b.start);
+  if (active.length === 0) return notes;
+  const out: Note[] = [];
+  for (const n of notes) {
+    if (activeIds.has(n.id)) {
+      out.push(n);
+      continue;
+    }
+    let start = n.tick;
+    let end = n.tick + n.duration;
+    for (const a of active) {
+      if (a.end <= start || a.start >= end) continue; // disjoint / abutting (legato-legal)
+      if (a.start <= start)
+        start = Math.max(start, a.end); // active covers/precedes head → push head to its end
+      else end = Math.min(end, a.start); // active starts inside → truncate tail to its start (keep head)
+    }
+    const dur = end - start;
+    if (dur < minTicks) continue; // swallowed / clipped below the audible floor → drop
+    out.push(start === n.tick && dur === n.duration ? n : retimeNote(n, start - n.tick, dur - n.duration));
+  }
+  return out;
+}
+
+/**
+ * Sanitize loaded track vocal params (§9.8.1): a corrupt `.usp` can carry a bad backend / out-of-range
+ * speaker or lang id / non-finite transpose that later mis-indexes a ScoreToCV input. Absent → undefined.
+ */
+export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrackParams | undefined {
+  if (!p || typeof p !== "object") return undefined;
+  return {
+    backend: p.backend === "rvc" ? "rvc" : "sovits",
+    speakerId: clampInt(p.speakerId, 0, 76, 49),
+    langId: clampInt(p.langId, 0, 6, 2),
+    transpose: clampInt(p.transpose, -48, 48, 0),
+  };
+}

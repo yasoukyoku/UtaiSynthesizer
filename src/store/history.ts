@@ -329,12 +329,24 @@ function applySnapshot(snap: Snapshot) {
       ? snap.selection.selectedSegment
       : validSegs[validSegs.length - 1] ?? null;
 
+  // Reconcile the vocal NOTE selection (§9.5): note ids are globally-unique UUIDs (segment-independent),
+  // so an undo/redo that deleted notes must drop their now-dangling ids from projectStore.selectedNotes —
+  // else the highlight lingers and a subsequent Delete/nudge acts on ghosts. Only write when it shrank
+  // (a new array ref during applying is inert to installHistory, but avoid needless churn).
+  const liveNoteIds = new Set<string>();
+  for (const t of merged) for (const s of t.segments) {
+    if (s.content.type === "notes") for (const nn of s.content.notes) liveNoteIds.add(nn.id);
+  }
+  const prevSelectedNotes = useProjectStore.getState().selectedNotes;
+  const nextSelectedNotes = prevSelectedNotes.filter((id) => liveNoteIds.has(id));
+
   applying = true;
   useProjectStore.setState({
     tracks: merged,
     tempo: snap.tempo,
     timeSignature: snap.timeSignature,
     dirty: savedSig === null ? true : sig !== savedSig,
+    ...(nextSelectedNotes.length !== prevSelectedNotes.length ? { selectedNotes: nextSelectedNotes } : {}),
   });
   useAppStore.setState({
     selectedSegments: validSegs,
@@ -393,6 +405,7 @@ function describeDelta(from: Snapshot, to: Snapshot): string {
     for (const mk of muteKeys) {
       if ((ft.laneMutes?.[mk] ?? false) !== (tt.laneMutes?.[mk] ?? false)) return "laneMute";
     }
+    if (vocalParamsSig(ft.vocalParams) !== vocalParamsSig(tt.vocalParams)) return "vocalParams"; // ② vocal
   }
 
   // Segment-level, GLOBAL (so a cross-track move reads as a move, not a delete+add).
@@ -414,6 +427,17 @@ function describeDelta(from: Snapshot, to: Snapshot): string {
   if (removed) return "deletedClip";
   if (moved) return "movedClip";
   if (resized) return "resizedClip";
+
+  // ② Vocal-note content edit (editor): same segment geometry, different notes/pitch/param curves.
+  for (const ft of from.tracks) {
+    const tt = toById.get(ft.id);
+    if (!tt) continue;
+    for (const s of ft.segments) {
+      if (s.content.type !== "notes") continue;
+      const ts = tt.segments.find((x) => x.id === s.id);
+      if (ts && ts.content.type === "notes" && contentSig(s.content) !== contentSig(ts.content)) return "notes";
+    }
+  }
   return "change";
 }
 

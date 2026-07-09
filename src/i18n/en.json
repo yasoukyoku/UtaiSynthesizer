@@ -79,7 +79,9 @@
     "nodeDisconnect": "Disconnected nodes",
     "nodeMove": "Moved node",
     "nodeParam": "Changed node setting",
-    "nodeEdit": "Edited nodes"
+    "nodeEdit": "Edited nodes",
+    "notes": "Edited notes",
+    "vocalParams": "Vocal settings"
   },
   "toolbar": {
     "bpm": "BPM",
@@ -307,5 +309,16 @@
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm"
+  },
+  "vocalEditor": {
+    "title": "Vocal",
+    "toolArrow": "Select / move (1)",
+    "toolPen": "Draw notes (2)",
+    "toolPitch": "Pitch (3)",
+    "toolDelete": "Delete (4)",
+    "grid": "Grid",
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "close": "Close"
   }
 }

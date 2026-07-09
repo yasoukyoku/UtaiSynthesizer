@@ -62,15 +62,21 @@ interface AppState {
   /** Selected sub-lane group (P3), or null. Non-null makes Ctrl+K/Delete act on the lane, not the segment. */
   selectedLane: LaneSelection | null;
   workflowSegmentId: string | null;
+  /** ② The notes segment whose VOCAL (piano-roll) editor is docked at the bottom, or null. Mutually
+   *  exclusive with workflowSegmentId — the bottom dock shows one editor at a time (a segment is either a
+   *  notes part or an audioClip). Mirrors workflowSegmentId (§9.6). */
+  vocalSegmentId: string | null;
   /** A requested Output-group DETACH ("ungroup") waiting for that segment's workflow editor to perform
    *  it — the editor is the ONE code path (its graph state + local undo own the op); a timeline
    *  right-click first opens the editor, then this hands the request over. Consumed on mount/change. */
   pendingLaneDetach: { segmentId: string; outputNodeId: string } | null;
-  /** Which pane owns Ctrl+Z and the Delete/Ctrl+K edit keys: the track timeline, or the (now
-   *  persistent, bottom-docked) workflow editor. Set on pointer/focus into each pane. */
-  activePane: "timeline" | "workflow";
+  /** Which pane owns Ctrl+Z and the Delete/Ctrl+K edit keys: the track timeline, the bottom-docked
+   *  workflow editor, or the bottom-docked vocal (piano-roll) editor. Set on pointer/focus into each pane. */
+  activePane: "timeline" | "workflow" | "vocal";
   /** Height (px) of the bottom workflow panel when open; persisted across sessions. */
   workflowPanelHeight: number;
+  /** ② Height (px) of the bottom vocal-editor panel when open; persisted (own value, §9.0). */
+  vocalPanelHeight: number;
   zoom: number;
   /** Vertical zoom — scales track display height (header + lanes). */
   vZoom: number;
@@ -103,10 +109,14 @@ interface AppState {
   clearSelection: () => void;
   openWorkflow: (segmentId: string) => void;
   closeWorkflow: () => void;
+  /** ② Open the vocal (piano-roll) editor on a notes segment; closes any open workflow editor (§9.6). */
+  openVocalEditor: (segmentId: string) => void;
+  closeVocalEditor: () => void;
   requestLaneDetach: (segmentId: string, outputNodeId: string) => void;
   clearLaneDetach: () => void;
-  setActivePane: (pane: "timeline" | "workflow") => void;
+  setActivePane: (pane: "timeline" | "workflow" | "vocal") => void;
   setWorkflowPanelHeight: (h: number) => void;
+  setVocalPanelHeight: (h: number) => void;
   setZoom: (zoom: number) => void;
   setVZoom: (vZoom: number) => void;
   setScroll: (x: number, y: number) => void;
@@ -135,9 +145,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedSegments: [],
   selectedLane: null,
   workflowSegmentId: null,
+  vocalSegmentId: null,
   pendingLaneDetach: null,
   activePane: "timeline",
   workflowPanelHeight: loadSetting("utai.workflowPanelHeight", 460),
+  vocalPanelHeight: loadSetting("utai.vocalPanelHeight", 460),
   zoom: 1.0,
   vZoom: 1.0,
   scrollX: 0,
@@ -192,12 +204,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       activeTrackId: trackId,
     }),
   clearSelection: () => set({ selectedSegment: null, selectedSegments: [], selectedLane: null }),
-  openWorkflow: (segmentId) => set({ workflowSegmentId: segmentId, activePane: "workflow" }),
+  // Opening either bottom-dock editor closes the OTHER (the dock shows one at a time) so activePane, the
+  // divider cue, and undo routing can never point at a hidden editor (§9.6 exclusivity).
+  openWorkflow: (segmentId) => set({ workflowSegmentId: segmentId, vocalSegmentId: null, activePane: "workflow" }),
   closeWorkflow: () => set({ workflowSegmentId: null, activePane: "timeline" }),
+  openVocalEditor: (segmentId) => set({ vocalSegmentId: segmentId, workflowSegmentId: null, activePane: "vocal" }),
+  closeVocalEditor: () => set({ vocalSegmentId: null, activePane: "timeline" }),
   requestLaneDetach: (segmentId, outputNodeId) => set({ pendingLaneDetach: { segmentId, outputNodeId } }),
   clearLaneDetach: () => set({ pendingLaneDetach: null }),
   setActivePane: (pane) => set((s) => (s.activePane === pane ? s : { activePane: pane })),
   setWorkflowPanelHeight: (h) => set({ workflowPanelHeight: h }),
+  setVocalPanelHeight: (h) => set({ vocalPanelHeight: h }),
   setZoom: (zoom) => set({ zoom: Math.max(0.1, Math.min(10, zoom)) }),
   setVZoom: (vZoom) => set({ vZoom: Math.max(0.6, Math.min(3, vZoom)) }),
   setScroll: (x, y) => set({ scrollX: x, scrollY: y }),

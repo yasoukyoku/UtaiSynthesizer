@@ -109,7 +109,7 @@
 }
 
 .tempo-input {
-  width: 56px;
+  width: 44px;
   text-align: center;
   font-size: var(--font-size-sm);
   -moz-appearance: textfield;

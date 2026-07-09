@@ -1,0 +1,897 @@
+// ② Vocal (piano-roll) editor — S48 Phase 4 (§9). Docked at the bottom (mirrors WorkflowEditor), the
+// canvas is OFF-React (store.subscribe + rAF; drag paints from off-store refs and commits ONCE on mouseup
+// via applyNoteEdits — §9.4), geometry is the single lib/vocalGeometry module (absolute tick space), and
+// undo is Route-A timeline-native (vocal fields are already in meaningfulSig; the editor just claims the
+// pane so Ctrl+Z/Delete route correctly). Tools: Arrow / Pen / Delete functional this phase; Pitch shows
+// the baseline f0 line (full pitch editing = Phase 5). One-position-one-note truncation runs at commit.
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useProjectStore } from "../../store/project";
+import { useAppStore } from "../../store/app";
+import { useTranslation } from "react-i18next";
+import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
+import { msToTicks } from "../../lib/audio/laneOps";
+import { TimeAxis } from "../../lib/timeAxis";
+import * as playback from "../../lib/audio/playback";
+import { resolveOverlaps } from "../../lib/vocalNotes";
+import {
+  type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
+  tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
+  rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
+} from "../../lib/vocalGeometry";
+import type { Note } from "../../types/project";
+import "./VocalEditor.css";
+
+type Tool = "arrow" | "pen" | "pitch" | "delete";
+
+/** Grid / snap divisions per beat (§9.4 — all land on the constant 12/beat six-based grid; triplets 3/6). */
+const GRID_DIVS = [
+  { div: 1, key: "1/4" }, { div: 2, key: "1/8" }, { div: 4, key: "1/16" },
+  { div: 3, key: "1/8T" }, { div: 6, key: "1/16T" }, { div: 12, key: "1/12" },
+];
+const KEY_COL_W = 56; // fixed piano-key column at the canvas left edge
+const RULER_H = 18; // bar-number ruler strip along the top of the note area
+const EDGE_PX = 6; // note right-edge resize hotzone (screen px)
+const DEFAULT_LYRIC = "あ"; // JA vowel — always in PHONE_TO_ID, never OOV/empty (§9.2)
+const DETUNE_DRAG_CAP = 200; // ± cents reachable by a Pitch-tool fine-tune drag (a Phase-4 taste of §9.3)
+
+type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "detune";
+interface DragState {
+  kind: DragKind;
+  clientX0: number; clientY0: number;
+  curX: number; curY: number;
+  activeIds: string[];
+  orig: Map<string, Note>; // snapshot of the dragged notes
+  newNote: Note | null; // create: the note being drawn
+  anchorRelTick: number; // create/move reference
+  moved: boolean;
+  additive: boolean; // marquee: keep existing selection
+  previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
+}
+
+interface Props {
+  segmentId: string;
+  onClose: () => void;
+  style?: React.CSSProperties;
+}
+
+export function VocalEditor({ segmentId, onClose, style }: Props) {
+  const { t } = useTranslation();
+  const tracks = useProjectStore((s) => s.tracks);
+  const tempo = useProjectStore((s) => s.tempo);
+  const timeSignature = useProjectStore((s) => s.timeSignature);
+  const selectedNotes = useProjectStore((s) => s.selectedNotes);
+  const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
+  const selectNotes = useProjectStore((s) => s.selectNotes);
+  const setActivePane = useAppStore((s) => s.setActivePane);
+
+  // Resolve the notes part by the STABLE segment id (a track reorder / rename must not lose it).
+  const part = useMemo(() => {
+    for (const tr of tracks) {
+      const sg = tr.segments.find((s) => s.id === segmentId);
+      if (sg && sg.content.type === "notes") {
+        return { trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks };
+      }
+    }
+    return null;
+  }, [tracks, segmentId]);
+
+  const [tool, setTool] = useState<Tool>("arrow");
+  const [gridDiv, setGridDiv] = useState(2); // 1/8 default
+  const [maximized, setMaximized] = useState(false);
+  const [lyricEdit, setLyricEdit] = useState<{ id: string; x: number; y: number; w: number; value: string } | null>(null);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const drawRef = useRef(() => {});
+  const dragRef = useRef<DragState | null>(null);
+  const mouseRef = useRef<{ x: number; y: number } | null>(null);
+  const clipboardRef = useRef<Note[]>([]);
+  const lyricCancelRef = useRef(false); // Escape in the lyric input → suppress the unmount-blur commit
+
+  // Local view state (NOT the arrangement's global scroll/zoom, §9.4).
+  const viewRef = useRef<VocalView>({ scrollX: 0, scrollY: 0, ppt: PIXELS_PER_TICK * 2, rowH: 16, top: RULER_H });
+  const sizeRef = useRef({ w: 800, h: 300, dpr: 1 });
+
+  // Content refs (synced each render) so the imperative draw/pointer code reads fresh values.
+  const notesRef = useRef<Note[]>(part?.notes ?? []);
+  notesRef.current = part?.notes ?? [];
+  const startRef = useRef(part?.start ?? 0);
+  startRef.current = part?.start ?? 0;
+  const durRef = useRef(part?.dur ?? 0);
+  durRef.current = part?.dur ?? 0;
+  const selRef = useRef<Set<string>>(new Set(selectedNotes));
+  selRef.current = new Set(selectedNotes);
+  const toolRef = useRef(tool);
+  toolRef.current = tool;
+  const gridDivRef = useRef(gridDiv);
+  gridDivRef.current = gridDiv;
+  const tempoRef = useRef(tempo);
+  tempoRef.current = tempo;
+  // Same meter authority as the arrangement — for the sub-beat grid (built from the global time signature).
+  const timeAxis = useMemo(() => TimeAxis.global(timeSignature[0], timeSignature[1]), [timeSignature]);
+  const axisRef = useRef(timeAxis);
+  axisRef.current = timeAxis;
+
+  const minNoteTicks = () => Math.max(1, Math.ceil(msToTicks(60, tempoRef.current))); // §9.2 60ms floor
+  const snapTicks = () => TICKS_PER_BEAT / gridDivRef.current; // 480/div: 1/4=480,1/8=240,1/16=120,1/8T=160,1/16T=80,1/12=40
+
+  // rAF-coalesced redraw.
+  const rafRef = useRef(0);
+  const requestRedraw = useCallback(() => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; drawRef.current(); });
+  }, []);
+
+  // ── size / DPR ──
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const measure = () => {
+      const r = wrap.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      sizeRef.current = { w: Math.max(1, r.width), h: Math.max(1, r.height), dpr };
+      const cv = canvasRef.current;
+      if (cv) {
+        cv.width = Math.round(sizeRef.current.w * dpr);
+        cv.height = Math.round(sizeRef.current.h * dpr);
+        cv.style.width = `${sizeRef.current.w}px`;
+        cv.style.height = `${sizeRef.current.h}px`;
+      }
+      requestRedraw();
+    };
+    measure();
+    const ob = new ResizeObserver(measure);
+    ob.observe(wrap);
+    return () => ob.disconnect();
+  }, [requestRedraw]);
+
+  // Center the vertical view on the notes' pitch range (or C4) once, on first mount for this segment.
+  useEffect(() => {
+    const ns = notesRef.current;
+    const avg = ns.length > 0 ? ns.reduce((a, n) => a + n.pitch, 0) / ns.length : 60;
+    const v = viewRef.current;
+    const visH = sizeRef.current.h - RULER_H; // visible note-area height (below the ruler)
+    v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visH), pitchToY(avg, { ...v, scrollY: 0 }) - (sizeRef.current.h + RULER_H) / 2));
+    v.scrollX = Math.max(0, startRef.current * v.ppt - 24);
+    requestRedraw();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segmentId]);
+
+  // ── the draw closure (rebuilt when content/selection/tool change) ──
+  useEffect(() => {
+    drawRef.current = () => {
+      const cv = canvasRef.current;
+      if (!cv) return;
+      const ctx = cv.getContext("2d");
+      if (!ctx) return;
+      const { w, h, dpr } = sizeRef.current;
+      const v = viewRef.current;
+      const notes = notesRef.current;
+      const start = startRef.current;
+      const sel = selRef.current;
+      const css = getComputedStyle(document.documentElement);
+      const col = (n: string) => css.getPropertyValue(n).trim();
+
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+
+      // background
+      ctx.fillStyle = col("--bg-base") || "#0d1220";
+      ctx.fillRect(0, 0, w, h);
+
+      const noteAreaX = KEY_COL_W;
+      const noteAreaW = w - KEY_COL_W;
+
+      // ── pitch-class row striping + per-semitone row lines ──
+      const topPitch = yToPitch(0, v);
+      const botPitch = yToPitch(h, v);
+      for (let p = botPitch; p <= topPitch; p++) {
+        const y = pitchToY(p, v);
+        // black-key rows DARKER than white-key rows (visual bands). ⚠ theme's --piano-black is LIGHTER than
+        // --bg-base, so tinting with it inverts the shading — use an explicit dark overlay instead.
+        if (isBlackKey(p)) {
+          ctx.fillStyle = "#000000"; ctx.globalAlpha = 0.22;
+          ctx.fillRect(noteAreaX, y, noteAreaW, v.rowH);
+          ctx.globalAlpha = 1;
+        }
+        // a faint line at EVERY semitone boundary so adjacent white keys (E|F, B|C) read as separate rows,
+        ctx.strokeStyle = "rgba(130,150,185,0.13)"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(noteAreaX, Math.round(y) + 0.5); ctx.lineTo(w, Math.round(y) + 0.5); ctx.stroke();
+        // and a STRONGER line at the bottom of each C (octave separation) — white, like the meter lines.
+        if (p % 12 === 0) {
+          ctx.strokeStyle = "rgba(226,232,244,0.2)"; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(noteAreaX, Math.round(y + v.rowH) + 0.5); ctx.lineTo(w, Math.round(y + v.rowH) + 0.5); ctx.stroke();
+        }
+      }
+
+      // ── vertical grid (bar / beat / 1-6 / 1-12) via the single TimeAxis sub-grid (triplet-capable). A
+      //    CLEAR prominence hierarchy so the meter reads at a glance — bar ≫ beat ≫ 1/6 ≫ 1/12 (the alphas
+      //    were too close before → the sub-grid competed with bar/beat and it all read as clutter). ──
+      const absFrom = xToTick(0, v);
+      const absTo = xToTick(noteAreaW, v);
+      for (const g of axisRef.current.subGridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo), 12)) {
+        const x = noteAreaX + tickToX(g.tick, v);
+        if (x < noteAreaX - 1) continue;
+        // WHITE/gray meter lines (cyan is reserved for the "current position" guide, so they don't clash).
+        let a: number, lw: number;
+        if (g.level === "bar") { a = 0.4; lw = 1.6; }        // bar = STRONGEST
+        else if (g.level === "beat") { a = 0.19; lw = 1.1; } // beat = clearly second
+        else if (g.sub % 2 === 0) { a = 0.06; lw = 1; }      // 1/6-beat = faint
+        else { a = 0.03; lw = 1; }                           // 1/12-beat = barely there
+        ctx.strokeStyle = `rgba(226,232,244,${a})`; // = --text-primary-ish white
+        ctx.lineWidth = lw;
+        ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, h); ctx.stroke();
+      }
+
+      // ── out-of-part dimming: anything outside [partStart, partStart+dur] is NOT part of THIS segment and
+      //    very likely won't be rendered — dim it so notes drawn there read as "outside the part" (§ user). ──
+      const partX0 = noteAreaX + tickToX(start, v);
+      const partX1 = noteAreaX + tickToX(start + durRef.current, v);
+      ctx.fillStyle = col("--bg-deep") || "#080b14";
+      ctx.globalAlpha = 0.55;
+      if (partX0 > noteAreaX) ctx.fillRect(noteAreaX, 0, partX0 - noteAreaX, h);
+      if (partX1 < w) { const rx = Math.max(noteAreaX, partX1); ctx.fillRect(rx, 0, w - rx, h); }
+      ctx.globalAlpha = 1;
+
+      // ── part bounds (the editable window) — crisp accent lines on top of the dimming ──
+      ctx.strokeStyle = col("--accent-secondary") || "#8b5cf6";
+      ctx.globalAlpha = 0.7; ctx.lineWidth = 1.5;
+      for (const px of [partX0, partX1]) {
+        if (px >= noteAreaX && px <= w) { ctx.beginPath(); ctx.moveTo(Math.round(px) + 0.5, 0); ctx.lineTo(Math.round(px) + 0.5, h); ctx.stroke(); }
+      }
+      ctx.globalAlpha = 1;
+
+      // ── notes (from off-ref drag preview if a gesture is live, else the store) ──
+      const drawNotes = dragRef.current?.previewNotes?.() ?? notes;
+      ctx.font = `${Math.min(13, Math.max(9, v.rowH - 4))}px system-ui, sans-serif`;
+      ctx.textBaseline = "middle";
+      for (const n of drawNotes) {
+        const x0 = noteAreaX + noteTickToX(n.tick, start, v);
+        const x1 = noteAreaX + noteTickToX(n.tick + n.duration, start, v);
+        if (x1 < noteAreaX || x0 > w) continue;
+        const y = pitchToY(n.pitch, v);
+        const selected = sel.has(n.id);
+        const cx0 = Math.max(noteAreaX, x0);
+        ctx.fillStyle = selected ? (col("--note-selected") || "#8b5cf6") : (col("--note-fill") || "#39c5bb");
+        ctx.globalAlpha = 0.9;
+        ctx.fillRect(cx0, y + 1, Math.max(2, x1 - cx0), Math.max(2, v.rowH - 2));
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = selected ? (col("--accent-secondary") || "#8b5cf6") : "rgba(0,0,0,0.4)";
+        ctx.lineWidth = selected ? 1.5 : 1;
+        ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
+        // lyric
+        if (x1 - cx0 > 14 && v.rowH >= 11) {
+          ctx.fillStyle = "#0a0f18";
+          ctx.save();
+          ctx.beginPath(); ctx.rect(cx0 + 2, y, x1 - cx0 - 3, v.rowH); ctx.clip();
+          ctx.fillText(n.lyric, cx0 + 4, y + v.rowH / 2 + 0.5);
+          ctx.restore();
+        }
+      }
+
+      // ── baseline pitch line (Pitch tool preview; full f0 = Phase 5) ──
+      if (toolRef.current === "pitch") {
+        ctx.strokeStyle = col("--accent-tertiary") || "#ff6b9d";
+        ctx.lineWidth = 1.5; ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        let first = true;
+        for (const n of [...drawNotes].sort((a, b) => a.tick - b.tick)) {
+          const x0 = noteAreaX + noteTickToX(n.tick, start, v);
+          const x1 = noteAreaX + noteTickToX(n.tick + n.duration, start, v);
+          const y = centsToY(n.pitch * 100 + (n.detune ?? 0), v);
+          if (first) { ctx.moveTo(x0, y); first = false; } else ctx.lineTo(x0, y);
+          ctx.lineTo(x1, y);
+        }
+        ctx.stroke(); ctx.globalAlpha = 1;
+      }
+
+      // ── live gesture overlays ──
+      const d = dragRef.current;
+      if (d && (d.kind === "marquee" || d.kind === "marquee-delete")) {
+        const x = Math.min(d.clientX0, d.curX), yy = Math.min(d.clientY0, d.curY);
+        const ww = Math.abs(d.curX - d.clientX0), hh = Math.abs(d.curY - d.clientY0);
+        const del = d.kind === "marquee-delete";
+        ctx.fillStyle = del ? (col("--color-error") || "#f87171") : (col("--accent-primary") || "#39c5bb");
+        ctx.globalAlpha = 0.12; ctx.fillRect(x, yy, ww, hh);
+        ctx.globalAlpha = 0.8; ctx.strokeStyle = del ? (col("--color-error") || "#f87171") : (col("--accent-primary") || "#39c5bb");
+        ctx.lineWidth = 1; ctx.setLineDash([4, 3]); ctx.strokeRect(x + 0.5, yy + 0.5, ww, hh); ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
+
+      // ── piano key column (fixed left) — real-keyboard look: light WHITE keys full width, dark BLACK keys
+      //    inset from the right (so they read as shorter, between the whites), thin white-key separators. ──
+      // The whole column is WHITE-key surface first; on a real keyboard the black keys are SHORT and sit at
+      // the back, with the white keys extending past them to the FRONT. Here the front = the right side, so
+      // black keys are dark rects inset from the right and the WHITE shows to their right (that white — not
+      // a dark gap — is what makes the inset read).
+      ctx.fillStyle = col("--piano-white") || "#c8d0e0";
+      ctx.fillRect(0, 0, KEY_COL_W, h);
+      const blackW = Math.round(KEY_COL_W * 0.6);
+      // black keys: dark, short (inset from the right) → white front stays visible to their right
+      for (let p = botPitch; p <= topPitch; p++) {
+        if (!isBlackKey(p)) continue;
+        const y = pitchToY(p, v);
+        ctx.fillStyle = "#10192c";
+        ctx.fillRect(0, Math.round(y), blackW, Math.max(1, Math.round(v.rowH)));
+      }
+      // thin separator at EVERY row boundary so each key (white or black) is framed
+      ctx.strokeStyle = "rgba(10,15,24,0.4)"; ctx.lineWidth = 1;
+      for (let p = botPitch; p <= topPitch; p++) {
+        const y = Math.round(pitchToY(p, v)) + 0.5;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(KEY_COL_W, y); ctx.stroke();
+      }
+      // C labels (dark text on the white front, right side — always visible even on a black-key neighbour)
+      if (v.rowH >= 10) {
+        ctx.font = "10px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+        ctx.fillStyle = "#0a0f18";
+        for (let p = botPitch; p <= topPitch; p++) {
+          if (p % 12 !== 0) continue;
+          ctx.fillText(pitchName(p), KEY_COL_W - 20, pitchToY(p, v) + v.rowH / 2 + 0.5);
+        }
+      }
+      ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(KEY_COL_W + 0.5, 0); ctx.lineTo(KEY_COL_W + 0.5, h); ctx.stroke();
+
+      // ── bar-number ruler (top strip) — always know which bar you're in (mirrors the arrangement ruler) ──
+      ctx.fillStyle = col("--bg-panel") || "#1a2236";
+      ctx.fillRect(0, 0, w, RULER_H);
+      ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, RULER_H + 0.5); ctx.lineTo(w, RULER_H + 0.5); ctx.stroke();
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+      for (const g of axisRef.current.gridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo))) {
+        const gx = noteAreaX + tickToX(g.tick, v);
+        if (gx < noteAreaX) continue;
+        ctx.strokeStyle = g.isBar ? "rgba(226,232,244,0.5)" : "rgba(226,232,244,0.26)"; // white, match the note-grid
+        ctx.lineWidth = g.isBar ? 1.4 : 1;
+        ctx.beginPath(); ctx.moveTo(Math.round(gx) + 0.5, g.isBar ? 3 : RULER_H - 5); ctx.lineTo(Math.round(gx) + 0.5, RULER_H); ctx.stroke();
+        if (g.isBar) {
+          ctx.fillStyle = col("--text-muted") || "#556b94";
+          ctx.fillText(String(axisRef.current.tickToBarBeat(g.tick).bar), gx + 3, RULER_H / 2);
+        }
+      }
+
+      // ── mouse-position guide (ALL tools): a vertical line at the snapped tick under the cursor, drawn
+      //    LAST (over the key column + ruler) so it is NEVER covered — fixes "disappears at the leftmost".
+      const mp = mouseRef.current;
+      if (mp && !dragRef.current && mp.x >= KEY_COL_W && mp.y >= RULER_H) {
+        const gx = noteAreaX + noteTickToX(snapFloor(xToNoteTick(mp.x - KEY_COL_W, start, v), snapTicks()), start, v);
+        if (gx <= w) {
+          const gxr = Math.max(KEY_COL_W, Math.round(gx)) + 0.5;
+          ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
+          ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(gxr, RULER_H); ctx.lineTo(gxr, h); ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      ctx.restore();
+    };
+    requestRedraw();
+  }, [part?.notes, selectedNotes, tool, gridDiv, requestRedraw]);
+
+  // Warm the shared AudioContext on mount so the first key-preview isn't delayed by an on-gesture resume;
+  // and make focus-loss / unmount RELEASE a sustained preview tone (belt-and-suspenders with pointerup/
+  // cancel/Esc): if the window loses focus or is hidden mid-drag, the terminal pointerup may never arrive
+  // (release over another window), so cancel the gesture + stop the tone here (verify: stuck-tone race).
+  useEffect(() => {
+    playback.getPreviewContext();
+    const release = () => {
+      if (dragRef.current) { dragRef.current = null; requestRedraw(); }
+      playback.stopPreviewTone();
+    };
+    window.addEventListener("blur", release);
+    document.addEventListener("visibilitychange", release);
+    return () => {
+      window.removeEventListener("blur", release);
+      document.removeEventListener("visibilitychange", release);
+      playback.stopPreviewTone();
+    };
+  }, [requestRedraw]);
+
+  // Redraw when the part boundary (moved / resized on the ARRANGEMENT) or the meter changes. The boundary
+  // edit keeps the notes array ref (only startTick/durationTicks move), so the draw effect above does NOT
+  // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
+  // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
+  // so re-invoking it is enough (no rebuild).
+  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, timeSignature, requestRedraw]);
+
+  // Attach the live preview-notes closure to the drag state (draw reads it).
+  const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {
+    const dd = d as DragState & { previewNotes: () => Note[] };
+    dd.previewNotes = () => computePreview(dd);
+    return dd;
+  };
+
+  // ── geometry helpers on the live view ──
+  const relTickAt = (clientX: number) => {
+    const cv = canvasRef.current; if (!cv) return 0;
+    const r = cv.getBoundingClientRect();
+    return xToNoteTick(clientX - r.left - KEY_COL_W, startRef.current, viewRef.current);
+  };
+  const pitchAt = (clientY: number) => {
+    const cv = canvasRef.current; if (!cv) return 60;
+    const r = cv.getBoundingClientRect();
+    return yToPitch(clientY - r.top, viewRef.current);
+  };
+  const centsAt = (clientY: number) => {
+    const cv = canvasRef.current; if (!cv) return 6000;
+    const r = cv.getBoundingClientRect();
+    return yToCents(clientY - r.top, viewRef.current);
+  };
+  const localXY = (clientX: number, clientY: number) => {
+    const cv = canvasRef.current; if (!cv) return { x: 0, y: 0 };
+    const r = cv.getBoundingClientRect();
+    return { x: clientX - r.left, y: clientY - r.top };
+  };
+
+  // note under a point (reverse z so the topmost/last wins); returns {note, onEdge}
+  const noteAt = (clientX: number, clientY: number): { note: Note; onEdge: boolean } | null => {
+    const { x } = localXY(clientX, clientY);
+    if (x < KEY_COL_W) return null;
+    const p = pitchAt(clientY);
+    const rel = relTickAt(clientX);
+    const v = viewRef.current;
+    for (let i = notesRef.current.length - 1; i >= 0; i--) {
+      const n = notesRef.current[i]!;
+      if (n.pitch !== p) continue;
+      if (rel >= n.tick && rel < n.tick + n.duration) {
+        const x1 = noteTickToX(n.tick + n.duration, startRef.current, v) + KEY_COL_W;
+        const onEdge = (x1 - x) <= EDGE_PX && n.duration * v.ppt > EDGE_PX * 2;
+        return { note: n, onEdge };
+      }
+    }
+    return null;
+  };
+
+  // ── compute the off-ref preview note array for a live gesture (no store writes) ──
+  const computePreview = (d: DragState): Note[] => {
+    const base = notesRef.current;
+    const snap = snapTicks();
+    if (d.kind === "create" && d.newNote) {
+      return [...base, d.newNote];
+    }
+    if (d.kind === "resize") {
+      return base.map((n) => {
+        const o = d.orig.get(n.id);
+        if (!o) return n;
+        const newEnd = Math.max(o.tick + minNoteTicks(), snapRound(relTickAt(d.curX), snap)); // right edge ≥ minNote
+        return { ...o, duration: newEnd - o.tick };
+      });
+    }
+    if (d.kind === "move") {
+      const origs = [...d.orig.values()];
+      const rawDTick = snapRound(relTickAt(d.curX), snap) - snapRound(relTickAt(d.clientX0), snap);
+      const rawDPitch = pitchAt(d.curY) - pitchAt(d.clientY0);
+      // GROUP clamp (§9.2): clamp the SHARED delta by the group's headroom so spacing is preserved and two
+      // notes can't collapse onto one tick/pitch at a wall. Translate whole notes — pitchPoints RIDE ALONG
+      // (note-relative), NO retimeNote rebase (rebase is only for the truncation head-move, not a move).
+      const dTick = Math.max(rawDTick, -Math.min(...origs.map((o) => o.tick)));
+      const loP = Math.min(...origs.map((o) => o.pitch));
+      const hiP = Math.max(...origs.map((o) => o.pitch));
+      const dPitch = Math.max(V_PITCH_MIN - loP, Math.min(V_PITCH_MAX - hiP, rawDPitch));
+      return base.map((n) => {
+        const o = d.orig.get(n.id);
+        return o ? { ...o, tick: o.tick + dTick, pitch: o.pitch + dPitch } : n;
+      });
+    }
+    if (d.kind === "detune") {
+      // Pitch-tool fine-tune (§9.3 layer ①): drag a note vertically → per-note detune in cents (the note
+      // BLOCK stays at its semitone; only the f0 line moves). Fuller curve editing is Phase 5.
+      const o = [...d.orig.values()][0];
+      if (!o) return base;
+      const detune = Math.max(-DETUNE_DRAG_CAP, Math.min(DETUNE_DRAG_CAP, Math.round(centsAt(d.curY) - o.pitch * 100)));
+      return base.map((n) => (n.id === o.id ? { ...o, detune } : n));
+    }
+    return base;
+  };
+
+  const clampPitch = (p: number) => Math.min(V_PITCH_MAX, Math.max(V_PITCH_MIN, p));
+
+  // ── commit: diff the resolved next-array vs current → applyNoteEdits (ONE step); skip a no-op ──
+  const commitNotes = (nextNotes: Note[], activeIds: string[]) => {
+    if (!part) return;
+    const resolved = resolveOverlaps(nextNotes, new Set(activeIds), minNoteTicks());
+    const cur = new Map(part.notes.map((n) => [n.id, n]));
+    const next = new Map(resolved.map((n) => [n.id, n]));
+    const add: Note[] = [];
+    const update: Record<string, Partial<Note>> = {};
+    const remove: string[] = [];
+    for (const [id, n] of next) {
+      const c = cur.get(id);
+      if (!c) add.push(n);
+      else if (noteSig(c) !== noteSig(n)) update[id] = n;
+    }
+    for (const id of cur.keys()) if (!next.has(id)) remove.push(id);
+    if (add.length === 0 && remove.length === 0 && Object.keys(update).length === 0) return; // no-op → no dirty
+    applyNoteEdits(part.trackId, segmentId, { add, update, remove });
+  };
+
+  // ── pointer handlers ──
+  const onPointerDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    setActivePane("vocal");
+    (e.currentTarget as Element).setPointerCapture(e.pointerId);
+    const { x } = localXY(e.clientX, e.clientY);
+    if (x < KEY_COL_W) { // piano key → preview tone
+      playback.playPreviewTone(pitchToHz(pitchAt(e.clientY)), 220);
+      return;
+    }
+    const hit = noteAt(e.clientX, e.clientY);
+    const tl = toolRef.current;
+
+    if (tl === "pitch") {
+      // Pitch tool = per-note fine-tune (detune) this phase; full pitch-curve drawing is Phase 5. Drag a
+      // note vertically to bend its f0 line; empty space does nothing (no curve painting yet).
+      if (hit) {
+        selectNotes(selRef.current.has(hit.note.id) ? [...selRef.current] : [hit.note.id]);
+        const o = notesRef.current.find((n) => n.id === hit.note.id)!;
+        playback.playPreviewTone(centsToHz(o.pitch * 100 + (o.detune ?? 0)), 0); // sustained; retunes on drag
+        dragRef.current = withPreview({
+          kind: "detune", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+          activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+        });
+      }
+      requestRedraw();
+      return;
+    }
+
+    if (tl === "delete") {
+      if (hit) { commitNotes(notesRef.current.filter((n) => n.id !== hit.note.id), []); }
+      else { dragRef.current = withPreview({ kind: "marquee-delete", clientX0: x, clientY0: localXY(e.clientX, e.clientY).y, curX: x, curY: localXY(e.clientX, e.clientY).y, activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false }); }
+      requestRedraw();
+      return;
+    }
+
+    if (hit) {
+      // select (respect shift/ctrl multi-select), then move or resize
+      let nextSel: string[];
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+        nextSel = selRef.current.has(hit.note.id) ? [...selRef.current].filter((i) => i !== hit.note.id) : [...selRef.current, hit.note.id];
+      } else {
+        nextSel = selRef.current.has(hit.note.id) ? [...selRef.current] : [hit.note.id];
+      }
+      selectNotes(nextSel);
+      const ids = nextSel.includes(hit.note.id) ? nextSel : [hit.note.id];
+      const orig = new Map(notesRef.current.filter((n) => ids.includes(n.id)).map((n) => [n.id, n]));
+      // A MOVE gets a SUSTAINED tone that retunes along the drag (audition the pitch the whole way, §user);
+      // a resize (edge) just gets a brief click. Stopped on pointerup/cancel/Esc/unmount (all wired).
+      playback.playPreviewTone(pitchToHz(hit.note.pitch), hit.onEdge ? 160 : 0);
+      dragRef.current = withPreview({
+        kind: hit.onEdge ? "resize" : "move",
+        clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+        activeIds: ids, orig, newNote: null, anchorRelTick: hit.note.tick, moved: false, additive: false,
+      });
+      return;
+    }
+
+    // empty space
+    const drawNote = tl === "pen" || ((tl === "arrow") && (e.ctrlKey || e.metaKey));
+    if (drawNote) {
+      const snap = snapTicks();
+      const relStart = Math.max(0, snapFloor(relTickAt(e.clientX), snap));
+      const p = clampPitch(pitchAt(e.clientY));
+      // Created note honors the 60ms floor like resize/truncation do (§9.2) — a fine grid can't make an
+      // inaudible sub-floor note.
+      const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(snap, minNoteTicks()), pitch: p, lyric: DEFAULT_LYRIC, velocity: 100 };
+      playback.playPreviewTone(pitchToHz(p), 0); // sustained while drawing; stops on pointerup
+      dragRef.current = withPreview({
+        kind: "create", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+        activeIds: [newNote.id], orig: new Map(), newNote, anchorRelTick: relStart, moved: false, additive: false,
+      });
+      requestRedraw();
+      return;
+    }
+
+    // arrow on empty → marquee select
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    if (!additive) selectNotes([]);
+    const p0 = localXY(e.clientX, e.clientY);
+    dragRef.current = withPreview({ kind: "marquee", clientX0: p0.x, clientY0: p0.y, curX: p0.x, curY: p0.y, activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive });
+    requestRedraw();
+  }, [setActivePane, selectNotes, applyNoteEdits, part, segmentId]);
+
+  const onPointerMove = useCallback((e: React.PointerEvent) => {
+    const p = localXY(e.clientX, e.clientY);
+    mouseRef.current = p;
+    const d = dragRef.current;
+    if (!d) { requestRedraw(); return; } // hover → redraw so the mouse-position guide follows (all tools)
+    d.moved = true;
+    if (d.kind === "marquee" || d.kind === "marquee-delete") { d.curX = p.x; d.curY = p.y; }
+    else {
+      d.curX = e.clientX; d.curY = e.clientY;
+      // live retune preview for move
+      if (d.kind === "move") {
+        const dPitch = pitchAt(e.clientY) - pitchAt(d.clientY0);
+        const anyId = d.activeIds[0];
+        const o = anyId ? d.orig.get(anyId) : undefined;
+        if (o) playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + dPitch)));
+      } else if (d.kind === "detune") {
+        const o = [...d.orig.values()][0];
+        if (o) {
+          const detune = Math.max(-DETUNE_DRAG_CAP, Math.min(DETUNE_DRAG_CAP, Math.round(centsAt(e.clientY) - o.pitch * 100)));
+          playback.setPreviewToneHz(centsToHz(o.pitch * 100 + detune));
+        }
+      } else if (d.kind === "create" && d.newNote) {
+        const snap = snapTicks();
+        const end = Math.max(d.anchorRelTick + snap, snapRound(relTickAt(e.clientX), snap));
+        d.newNote = { ...d.newNote, duration: Math.max(minNoteTicks(), snap, end - d.anchorRelTick) };
+      }
+    }
+    requestRedraw();
+  }, [requestRedraw]);
+
+  const onPointerUp = useCallback((e: React.PointerEvent) => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (!d) return; // a bare key/note click (no drag) — let its short audition tone ring out
+    playback.stopPreviewTone();
+    (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+
+    if (d.kind === "marquee" || d.kind === "marquee-delete") {
+      const ids = notesInMarquee(d);
+      if (d.kind === "marquee-delete") {
+        if (ids.length) commitNotes(notesRef.current.filter((n) => !ids.includes(n.id)), []);
+      } else {
+        const base = d.additive ? [...selRef.current] : [];
+        selectNotes([...new Set([...base, ...ids])]);
+      }
+      requestRedraw();
+      return;
+    }
+    if (d.kind === "create" && d.newNote) {
+      const nn = d.newNote;
+      commitNotes([...notesRef.current, nn], [nn.id]);
+      selectNotes([nn.id]);
+      return;
+    }
+    // move / resize
+    commitNotes(computePreview(d), d.activeIds);
+  }, [selectNotes, part, segmentId]);
+
+  const notesInMarquee = (d: DragState): string[] => {
+    const v = viewRef.current;
+    const start = startRef.current;
+    const x0 = Math.min(d.clientX0, d.curX), x1 = Math.max(d.clientX0, d.curX);
+    const y0 = Math.min(d.clientY0, d.curY), y1 = Math.max(d.clientY0, d.curY);
+    const out: string[] = [];
+    for (const n of notesRef.current) {
+      const nx0 = KEY_COL_W + noteTickToX(n.tick, start, v);
+      const nx1 = KEY_COL_W + noteTickToX(n.tick + n.duration, start, v);
+      const ny0 = pitchToY(n.pitch, v);
+      const ny1 = ny0 + v.rowH;
+      if (nx1 >= x0 && nx0 <= x1 && ny1 >= y0 && ny0 <= y1) out.push(n.id);
+    }
+    return out;
+  };
+
+  const onDoubleClick = useCallback((e: React.MouseEvent) => {
+    const hit = noteAt(e.clientX, e.clientY);
+    if (!hit || !part) return;
+    const v = viewRef.current;
+    const x0 = KEY_COL_W + noteTickToX(hit.note.tick, part.start, v);
+    const y = pitchToY(hit.note.pitch, v);
+    const w = Math.max(40, noteTickToX(hit.note.tick + hit.note.duration, part.start, v) - noteTickToX(hit.note.tick, part.start, v));
+    setLyricEdit({ id: hit.note.id, x: Math.max(KEY_COL_W, x0), y, w, value: hit.note.lyric });
+  }, [part]);
+
+  const commitLyric = (id: string, value: string) => {
+    if (!part) { setLyricEdit(null); return; }
+    const tokens = splitLyricTokens(value.trim());
+    const ordered = [...part.notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
+    const startIdx = ordered.findIndex((n) => n.id === id);
+    if (tokens.length <= 1 || startIdx < 0) {
+      applyNoteEdits(part.trackId, segmentId, { update: { [id]: { lyric: tokens[0] ?? DEFAULT_LYRIC } } });
+    } else {
+      const update: Record<string, Partial<Note>> = {};
+      for (let i = 0; i < tokens.length && startIdx + i < ordered.length; i++) {
+        update[ordered[startIdx + i]!.id] = { lyric: tokens[i]! };
+      }
+      applyNoteEdits(part.trackId, segmentId, { update });
+    }
+    setLyricEdit(null);
+  };
+
+  // ── keyboard (own handler; MUST bail on editable targets — §9.6) ──
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (useAppStore.getState().activePane !== "vocal") return;
+      const el = e.target as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) return;
+      const p = part;
+      if (!p) return;
+      const sel = [...selRef.current];
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (sel.length) { e.preventDefault(); commitNotes(p.notes.filter((n) => !selRef.current.has(n.id)), []); selectNotes([]); }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault(); selectNotes(p.notes.map((n) => n.id));
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id));
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x") {
+        clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id));
+        if (sel.length) { commitNotes(p.notes.filter((n) => !selRef.current.has(n.id)), []); selectNotes([]); }
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v") {
+        pasteAt();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+        e.preventDefault(); clipboardRef.current = p.notes.filter((n) => selRef.current.has(n.id)); pasteAt(true);
+      } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) && sel.length) {
+        e.preventDefault(); nudge(e.key);
+      } else if (e.key === "Escape") {
+        // Cancel a live gesture — MUST also stop the sustained preview tone (else an Esc'd move-drag leaves
+        // it ringing: the race you flagged). No drag → clear selection.
+        if (dragRef.current) { dragRef.current = null; playback.stopPreviewTone(); requestRedraw(); } else selectNotes([]);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [part, segmentId]);
+
+  const pasteAt = (dupInPlace = false) => {
+    if (!part || clipboardRef.current.length === 0) return;
+    const clip = clipboardRef.current;
+    const minTick = Math.min(...clip.map((n) => n.tick));
+    const anchor = dupInPlace ? minTick + snapTicks() : Math.max(0, relTickAt((mouseRef.current?.x ?? KEY_COL_W + 20) + (canvasRef.current?.getBoundingClientRect().left ?? 0)));
+    const shift = dupInPlace ? snapTicks() : anchor - minTick;
+    const pasted = clip.map((n): Note => ({ ...n, id: crypto.randomUUID(), tick: Math.max(0, n.tick + shift) }));
+    commitNotes([...part.notes, ...pasted], pasted.map((n) => n.id));
+    selectNotes(pasted.map((n) => n.id));
+  };
+
+  const nudge = (key: string) => {
+    if (!part) return;
+    const snap = snapTicks();
+    const dTick = key === "ArrowLeft" ? -snap : key === "ArrowRight" ? snap : 0;
+    const dPitch = key === "ArrowUp" ? 1 : key === "ArrowDown" ? -1 : 0;
+    const sel = part.notes.filter((n) => selRef.current.has(n.id));
+    if (sel.length === 0) return;
+    // GROUP clamp at the tick=0 / pitch 0-127 walls so the selection keeps its shape (no collapse/overlap).
+    const dT = dTick < 0 ? Math.max(dTick, -Math.min(...sel.map((n) => n.tick))) : dTick;
+    const loP = Math.min(...sel.map((n) => n.pitch));
+    const hiP = Math.max(...sel.map((n) => n.pitch));
+    const dP = Math.max(V_PITCH_MIN - loP, Math.min(V_PITCH_MAX - hiP, dPitch));
+    const next = part.notes.map((n) => (selRef.current.has(n.id) ? { ...n, tick: n.tick + dT, pitch: n.pitch + dP } : n));
+    commitNotes(next, [...selRef.current]);
+  };
+
+  // ── wheel (Ctrl=h-zoom cursor-anchored / Alt=row-height / plain=v-scroll / Shift=h-scroll) ──
+  const onWheel = useCallback((e: React.WheelEvent) => {
+    e.stopPropagation();
+    const v = viewRef.current;
+    // Upper scroll bound: the part's right edge (+ a margin) — can't scroll off into empty space.
+    const maxScrollX = () => Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, sizeRef.current.w - KEY_COL_W));
+    if (e.ctrlKey) {
+      e.preventDefault();
+      const cv = canvasRef.current; const r = cv?.getBoundingClientRect();
+      const cx = (r ? e.clientX - r.left : sizeRef.current.w / 2) - KEY_COL_W;
+      const tickAt = (cx + v.scrollX) / v.ppt;
+      v.ppt = Math.max(0.02, Math.min(4, v.ppt * (e.deltaY > 0 ? 0.9 : 1.1)));
+      v.scrollX = Math.max(0, Math.min(maxScrollX(), tickAt * v.ppt - cx));
+    } else if (e.altKey) {
+      // Vertical (row-height) zoom, ANCHORED at the cursor — the pitch under the mouse stays at the same
+      // screen y (mirrors the horizontal ctrl-zoom; unified with the arrangement's Alt+wheel). This is the
+      // fiddly coordinate part: solve scrollY so the cursor's continuous cents map back to its screen y.
+      e.preventDefault();
+      const cvR = canvasRef.current?.getBoundingClientRect();
+      const cy = Math.max(RULER_H, cvR ? e.clientY - cvR.top : (sizeRef.current.h + RULER_H) / 2); // cursor y (in the note area)
+      const anchorCents = yToCents(cy, v);
+      v.rowH = Math.max(V_ROW_H_MIN, Math.min(V_ROW_H_MAX, v.rowH * (e.deltaY > 0 ? 0.9 : 1.1)));
+      const maxSY = Math.max(0, rowsContentHeight(v.rowH) - (sizeRef.current.h - RULER_H));
+      v.scrollY = Math.max(0, Math.min(maxSY, centsToY(anchorCents, { ...v, scrollY: 0 }) - cy)); // keep anchorCents under the cursor
+    } else if (e.shiftKey) {
+      v.scrollX = Math.max(0, Math.min(maxScrollX(), v.scrollX + e.deltaY));
+    } else {
+      v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - (sizeRef.current.h - RULER_H)), v.scrollY + e.deltaY));
+    }
+    requestRedraw();
+  }, [requestRedraw]);
+
+  if (!part) return null;
+
+  const TOOLS: { id: Tool; label: string; icon: ReactElement }[] = [
+    { id: "arrow", label: t("vocalEditor.toolArrow"), icon: <path d="M5 3l14 8-6 1.5L10 19 8 12 5 3z" /> },
+    { id: "pen", label: t("vocalEditor.toolPen"), icon: <path d="M4 20l3-1 10-10-2-2L5 17l-1 3zM15 5l2 2 2-2-2-2-2 2z" /> },
+    { id: "pitch", label: t("vocalEditor.toolPitch"), icon: <path d="M3 17c4 0 4-10 8-10s4 10 9 4" fill="none" stroke="currentColor" strokeWidth="2" /> },
+    { id: "delete", label: t("vocalEditor.toolDelete"), icon: <path d="M6 7h12l-1 13H7L6 7zm3-3h6l1 2H8l1-2z" /> },
+  ];
+
+  return (
+    <div
+      className={`vocal-editor${maximized ? " vocal-editor--max" : ""}`}
+      style={maximized ? undefined : style}
+      onPointerDownCapture={() => { setActivePane("vocal"); playback.getPreviewContext(); }}
+      onFocusCapture={() => setActivePane("vocal")}
+    >
+      <div className="vocal-editor-header">
+        <span className="vocal-editor-title">{part.trackName || t("vocalEditor.title")}</span>
+        <div className="vocal-editor-header-spacer" />
+        <label className="vocal-grid-label">{t("vocalEditor.grid")}</label>
+        <div className="vocal-grid-select">
+          {GRID_DIVS.map((g) => (
+            <button key={g.div} className={`snap-toggle vocal-grid-btn${gridDiv === g.div ? " active" : ""}`} onClick={() => setGridDiv(g.div)}>{g.key}</button>
+          ))}
+        </div>
+        <button className="vocal-icon-btn" title={maximized ? t("vocalEditor.restore") : t("vocalEditor.maximize")} onClick={() => setMaximized((m) => !m)}>
+          <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d={maximized ? "M8 8h8v8H8V8zM4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4z" : "M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM6 14v4h4v2H4v-6h2zm12 0h2v6h-6v-2h4v-4z"} /></svg>
+        </button>
+        <button className="vocal-icon-btn" title={t("vocalEditor.close")} onClick={onClose}>
+          <svg viewBox="0 0 24 24" width="15" height="15"><path fill="none" d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeWidth="2" /></svg>
+        </button>
+      </div>
+      <div className="vocal-editor-body">
+        <div className={`vocal-tools${tool === "delete" ? " danger" : ""}`}>
+          {TOOLS.map((tt) => (
+            <button
+              key={tt.id}
+              className={`snap-toggle vocal-tool${tool === tt.id ? " active" : ""}${tt.id === "delete" ? " vocal-tool-delete" : ""}`}
+              title={tt.label}
+              onClick={() => setTool(tt.id)}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">{tt.icon}</svg>
+            </button>
+          ))}
+        </div>
+        <div className={`vocal-canvas-wrap${tool === "delete" ? " delete-mode" : ""}`} ref={wrapRef}>
+          <canvas
+            ref={canvasRef}
+            className="vocal-canvas"
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerCancel={onPointerUp}
+            onLostPointerCapture={onPointerUp}
+            onDoubleClick={onDoubleClick}
+            onWheel={onWheel}
+          />
+          {tool === "delete" && <div className="vocal-delete-overlay" />}
+          {lyricEdit && (
+            <input
+              className="vocal-lyric-input"
+              autoFocus
+              style={{ left: lyricEdit.x, top: lyricEdit.y, width: Math.max(40, lyricEdit.w) }}
+              defaultValue={lyricEdit.value}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitLyric(lyricEdit.id, (e.target as HTMLInputElement).value);
+                else if (e.key === "Escape") { lyricCancelRef.current = true; setLyricEdit(null); }
+                e.stopPropagation();
+              }}
+              onBlur={(e) => {
+                if (lyricCancelRef.current) { lyricCancelRef.current = false; return; } // Escape cancelled
+                commitLyric(lyricEdit.id, e.target.value);
+              }}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── module helpers ──
+
+/** A cheap per-note signature for the commit diff (only fields the editor mutates in Phase 4). */
+function noteSig(n: Note): string {
+  return `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.detune ?? 0}`;
+}
+
+const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
+/** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
+ *  else an all-kana run splits per mora (a base kana + trailing small kana); otherwise one token (latin
+ *  needs explicit spaces). Minimal + JS-side (a splitter, NOT a dictionary — the Rust classifier owns
+ *  phoneme validation). */
+function splitLyricTokens(s: string): string[] {
+  if (!s) return [DEFAULT_LYRIC];
+  if (/\s/.test(s)) return s.split(/\s+/).filter(Boolean);
+  const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);
+  if (!isKana) return [s];
+  const out: string[] = [];
+  for (const ch of s) {
+    if (out.length > 0 && SMALL_KANA.has(ch)) out[out.length - 1] += ch;
+    else out.push(ch);
+  }
+  return out;
+}

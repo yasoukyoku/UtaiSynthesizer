@@ -1,5 +1,6 @@
-import type { Track, Segment, ProcessedOutput } from "../../types/project";
+import type { Track, Segment, ProcessedOutput, PitchCurve } from "../../types/project";
 import { laneGroupName, rowKeyLaneId } from "../audio/laneOps";
+import { normalizeNotesArray, normalizeCurve, sanitizeVocalParams, sanitizeText } from "../vocalNotes";
 
 /**
  * `.usp` project-bundle (de)serialization. A `.usp` is a self-contained FOLDER:
@@ -169,6 +170,28 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
       let content = rest.content;
       if (content.type === "audioClip") {
         content = { ...content, sourcePath: resolve(content.sourcePath) };
+      } else if (content.type === "notes") {
+        // UNTRUSTED LOAD BOUNDARY (§9.8.1): a hand-edited / corrupt .usp must not slip NaN ticks, out-of-
+        // range pitch, control-char lyrics, or unbounded arrays past the editor's clamps straight into the
+        // store (→ permanent false-dirty + canvas NaN + Phase-6 out-of-range index). The SAME canonical
+        // funnel the editor writes with (normalizeNotesArray / normalizeCurve) runs here too.
+        const pitchDev = normalizeCurve(content.pitchDev, "cents");
+        let paramCurves: Record<string, PitchCurve> | undefined;
+        if (content.paramCurves && typeof content.paramCurves === "object") {
+          const out: Record<string, PitchCurve> = {};
+          for (const k of Object.keys(content.paramCurves).sort()) {
+            const key = sanitizeText(k, 32);
+            const nc = normalizeCurve(content.paramCurves[k], "param");
+            if (key && nc) out[key] = nc;
+          }
+          if (Object.keys(out).length > 0) paramCurves = out;
+        }
+        content = {
+          type: "notes",
+          notes: normalizeNotesArray(content.notes ?? []),
+          ...(pitchDev ? { pitchDev } : {}),
+          ...(paramCurves ? { paramCurves } : {}),
+        };
       }
       let processedOutputs = rest.processedOutputs;
       if (processedOutputs) {
@@ -287,7 +310,13 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
       }
       if (changed) laneControls = promoted;
     }
-    return { ...t, segments, laneControls };
+    // Untrusted load boundary for the track's vocal params (§9.8.1): coerce backend enum, clamp
+    // speaker/lang/transpose. Absent (non-vocal track) → stays absent.
+    const track: Track = { ...t, segments, laneControls };
+    const vp = sanitizeVocalParams(t.vocalParams);
+    if (vp) track.vocalParams = vp;
+    else delete (track as { vocalParams?: unknown }).vocalParams;
+    return track;
   });
 
   return {

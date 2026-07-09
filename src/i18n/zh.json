@@ -79,7 +79,9 @@
     "nodeDisconnect": "断开连接",
     "nodeMove": "移动节点",
     "nodeParam": "更改节点参数",
-    "nodeEdit": "编辑节点"
+    "nodeEdit": "编辑节点",
+    "notes": "编辑音符",
+    "vocalParams": "人声设置"
   },
   "toolbar": {
     "bpm": "速度",
@@ -307,5 +309,16 @@
   "common": {
     "cancel": "取消",
     "confirm": "确认"
+  },
+  "vocalEditor": {
+    "title": "人声",
+    "toolArrow": "选择/移动 (1)",
+    "toolPen": "画音符 (2)",
+    "toolPitch": "音高 (3)",
+    "toolDelete": "删除 (4)",
+    "grid": "网格",
+    "maximize": "最大化",
+    "restore": "还原",
+    "close": "关闭"
   }
 }

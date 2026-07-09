@@ -45,6 +45,68 @@ function getContext(): AudioContext {
   return audioCtx;
 }
 
+// ── ② Vocal-editor light preview tones (§9.7) ────────────────────────────────────────────────────────
+// A single-oscillator PLACEHOLDER voice for the piano-roll editor: click a key / audition a note pitch so
+// pitch editing isn't blind. Reuses THE singleton AudioContext above (never opens a second one — the §9.7
+// constraint). NOT the SVC voice/timbre; the real render is Phase 6. Separate nodes from the transport's
+// scheduledSources, so previewing never disturbs playback.
+let previewTone: { osc: OscillatorNode; gain: GainNode } | null = null;
+
+/** Warm-up handle for the vocal editor: create + resume THE shared AudioContext ahead of the first key
+ *  click, so the initial preview isn't delayed by an on-gesture resume (that's the audible first-click lag).
+ *  Same singleton as the transport (§9.7) — never a second context. */
+export function getPreviewContext(): AudioContext {
+  return getContext();
+}
+
+/** Play a short (or sustained, durationMs=0) preview tone at `hz`. Replaces any still-sounding preview. */
+export function playPreviewTone(hz: number, durationMs = 180): void {
+  const ctx = getContext();
+  stopPreviewTone();
+  const osc = ctx.createOscillator();
+  osc.type = "triangle";
+  osc.frequency.value = Math.max(20, Math.min(20000, hz));
+  const gain = ctx.createGain();
+  const now = ctx.currentTime;
+  const peak = 0.2;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(peak, now + 0.0025); // 2.5ms attack — snappy onset, still click-free
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(now);
+  if (durationMs > 0) {
+    const end = now + durationMs / 1000;
+    gain.gain.setValueAtTime(peak, Math.max(now + 0.0025, end - 0.05));
+    gain.gain.linearRampToValueAtTime(0, end); // 50ms release
+    osc.stop(end + 0.02);
+    const self = { osc, gain };
+    osc.onended = () => { if (previewTone === self) previewTone = null; };
+  }
+  previewTone = { osc, gain };
+}
+
+/** Live-retune the sustained preview tone (dragging a note's pitch), no re-trigger. */
+export function setPreviewToneHz(hz: number): void {
+  if (previewTone) previewTone.osc.frequency.setValueAtTime(Math.max(20, Math.min(20000, hz)), getContext().currentTime);
+}
+
+// Dev-only: on an HMR reload of THIS module, stop any sustained preview tone before the module var
+// (previewTone) is reset — else a durationMs=0 tone would orphan on the old context (verify: stuck tone).
+if (import.meta.hot) import.meta.hot.dispose(() => stopPreviewTone());
+
+/** Stop the sustained preview tone with a short release, if any. */
+export function stopPreviewTone(): void {
+  if (!previewTone) return;
+  const { osc, gain } = previewTone;
+  previewTone = null;
+  try {
+    const now = getContext().currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(gain.gain.value, now);
+    gain.gain.linearRampToValueAtTime(0, now + 0.03);
+    osc.stop(now + 0.05);
+  } catch { /* already stopped */ }
+}
+
 export async function loadAudioBuffer(filePath: string): Promise<AudioBuffer> {
   if (loadedBuffers.has(filePath)) {
     return loadedBuffers.get(filePath)!;

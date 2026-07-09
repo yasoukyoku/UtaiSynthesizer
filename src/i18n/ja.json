@@ -79,7 +79,9 @@
     "nodeDisconnect": "接続を解除",
     "nodeMove": "ノードを移動",
     "nodeParam": "ノード設定を変更",
-    "nodeEdit": "ノードを編集"
+    "nodeEdit": "ノードを編集",
+    "notes": "ノート編集",
+    "vocalParams": "ボーカル設定"
   },
   "toolbar": {
     "bpm": "速度",
@@ -307,5 +309,16 @@
   "common": {
     "cancel": "キャンセル",
     "confirm": "確認"
+  },
+  "vocalEditor": {
+    "title": "ボーカル",
+    "toolArrow": "選択 / 移動 (1)",
+    "toolPen": "ノート描画 (2)",
+    "toolPitch": "ピッチ (3)",
+    "toolDelete": "削除 (4)",
+    "grid": "グリッド",
+    "maximize": "最大化",
+    "restore": "元に戻す",
+    "close": "閉じる"
   }
 }

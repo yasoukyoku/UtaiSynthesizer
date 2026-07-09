@@ -26,6 +26,11 @@ export function Toolbar() {
   const { isPlaying, setPlaying, audioFiles, seeking, scheduleVersion } = useAudioStore();
   const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
   const { splitSegment, deleteSegments } = useProjectStore();
+  // ② A notes (vocal) segment can't be split (§9.6) — the Split button is disabled for it. Delete stays
+  // enabled (deleting a whole notes part from the timeline is legitimate, like any segment).
+  const selectedIsNotes =
+    !!selectedSegment &&
+    tracks.find((t) => t.id === selectedSegment.trackId)?.segments.find((s) => s.id === selectedSegment.segmentId)?.content.type === "notes";
   const animRef = useRef<number>(0);
   const baseTickRef = useRef(0);
   const baseTimeRef = useRef(0);
@@ -198,6 +203,11 @@ export function Toolbar() {
       return;
     }
     if (!selectedSegment) return;
+    // ② A notes segment does not split via the audioClip path (§9.6 gate — the store early-returns too);
+    // read the live tracks (not a stale closure) to classify the target.
+    const tr = useProjectStore.getState().tracks.find((t) => t.id === selectedSegment.trackId);
+    const sg = tr?.segments.find((s) => s.id === selectedSegment.segmentId);
+    if (sg?.content.type === "notes") return;
     splitSegment(selectedSegment.trackId, selectedSegment.segmentId, playheadTick);
   };
 
@@ -246,13 +256,13 @@ export function Toolbar() {
       if (useAppStore.getState().trainingPageOpen) {
         return;
       }
-      // Delete is pane-scoped: when the workflow editor pane is FOCUSED, Delete removes a NODE there
-      // (ReactFlow, gated on the same activePane), so don't ALSO delete a timeline segment. Ctrl+K, by
-      // contrast, has NO meaning in the node editor, so it is NEVER gated — it always slices the selected
-      // timeline segment at the playhead, even while the panel is focused (fixes the reported "Ctrl+K
-      // stops working when the workflow is open" dead-zone). Focus-based, not just "open": the editor is a
-      // persistent bottom panel co-visible with the tracks.
-      if (useAppStore.getState().activePane === "workflow" && e.key === "Delete") {
+      // Delete is pane-scoped: when a bottom-dock editor pane is FOCUSED (workflow OR ② vocal), Delete
+      // acts THERE (ReactFlow node / vocal note, each gated on the same activePane) — never ALSO on a
+      // timeline segment. ⚠ The guard is `!== "timeline"` (NOT `=== "workflow"`): with the vocal pane a
+      // third value, an `=== "workflow"` check would let the timeline Delete FIRE while the vocal editor is
+      // focused → it would delete the whole segment being edited (catastrophic silent loss, §9.6 blocker).
+      // Ctrl+K has NO node-editor meaning so it is not gated for workflow, but IS bailed for vocal (below).
+      if (useAppStore.getState().activePane !== "timeline" && e.key === "Delete") {
         return;
       }
       if (e.key === " ") {
@@ -261,6 +271,9 @@ export function Toolbar() {
       } else if (e.key === "Delete" && selRef.current) {
         deleteRef.current();
       } else if (e.key === "k" && e.ctrlKey && selRef.current) {
+        // ② In the vocal pane Ctrl+K belongs to the editor (note split, future) — never slice the timeline
+        // segment underneath (§9.6 "Ctrl+K 对 vocal pane 关掉").
+        if (useAppStore.getState().activePane === "vocal") return;
         // Ctrl+K is ungated across panes (no node-editor meaning), but in the workflow pane only slice
         // when the SELECTED segment IS the one whose workflow is open. Selection and the open segment can
         // diverge (click another clip, then click back into the panel) — without this guard Ctrl+K would
@@ -382,7 +395,7 @@ export function Toolbar() {
         <button
           className="toolbar-btn"
           onClick={handleSplit}
-          disabled={!selectedSegment}
+          disabled={!selectedSegment || selectedIsNotes}
         >
           {t("toolbar.split")}
         </button>

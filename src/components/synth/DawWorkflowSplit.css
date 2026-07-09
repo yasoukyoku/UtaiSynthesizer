@@ -60,7 +60,9 @@
   pointer-events: none;
 }
 
-.daw-split.panel-open.pane-workflow .workflow-divider::before {
+/* node-editor OR ② vocal-editor active → the same cue hugging the divider on the (lower) editor's side. */
+.daw-split.panel-open.pane-workflow .workflow-divider::before,
+.daw-split.panel-open.pane-vocal .workflow-divider::before {
   content: "";
   position: absolute;
   left: 0;

@@ -636,6 +636,26 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            // Disable WebView2's browser-accelerator keys (Ctrl+F find / Ctrl+P print / F5·Ctrl+R reload /
+            // F7 caret / Ctrl+±·0 zoom / Alt+Arrow nav). These are handled by the WebView2 HOST, above the
+            // DOM, so a page-level keydown preventDefault can't stop them — only this native setting does.
+            // The app's OWN shortcuts (Ctrl+S/O/N/Z/Y + the vocal-editor keys) are plain DOM handlers and
+            // stay unaffected. Fail-soft: any COM step erroring just leaves the accelerators enabled.
+            #[cfg(windows)]
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.with_webview(|webview| unsafe {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+                    use windows::core::Interface;
+                    if let Ok(core) = webview.controller().CoreWebView2() {
+                        if let Ok(settings) = core.Settings() {
+                            if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+                                let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
+                            }
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

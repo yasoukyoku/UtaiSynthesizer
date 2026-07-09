@@ -199,6 +199,24 @@ export function App() {
       if (e.key === "Alt") {
         e.preventDefault();
       }
+      // Suppress browser-CHROME accelerator keys that leak through the WebView (Find / Find-next / Print /
+      // View-source / Downloads / Reload / Zoom / Caret-browsing / history Back-Forward) — no place in a
+      // desktop-app window. preventDefault ONLY (no stopPropagation), so the app's own keydown handlers
+      // still receive the event and app shortcuts keep working; only the browser's default is cancelled.
+      // DevTools (F12 / Ctrl+Shift+I) is deliberately LEFT alone so it stays usable in dev. Ctrl+S/O/N and
+      // the editor's Ctrl+A/C/X/V/D + Ctrl+Z/Y are app-owned (handled elsewhere) and NOT blocked here.
+      {
+        const bk = e.key.toLowerCase();
+        const mod = e.ctrlKey || e.metaKey;
+        if (
+          (mod && !e.altKey && ["f", "g", "p", "u", "j", "r"].includes(bk)) || // find/find-next/print/view-source/downloads/reload
+          (mod && ["+", "-", "=", "0"].includes(e.key)) || // browser zoom
+          e.key === "F3" || e.key === "F5" || e.key === "F7" || // find / reload / caret-browsing
+          (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) // history back/forward
+        ) {
+          e.preventDefault();
+        }
+      }
       // Undo / Redo. Skip while typing in a field (so Ctrl+Z reaches the input's own text undo).
       // Routes to the workflow editor's modal-local history when it's open, else the timeline.
       const el = e.target as HTMLElement | null;
@@ -234,8 +252,15 @@ export function App() {
         }
       }
     };
+    // Kill Chromium's middle-click autoscroll (the round anchor + drift) — a browser artifact in a native
+    // DAW window. preventDefault on the button-1 mousedown suppresses it app-wide.
+    const noMiddleAutoscroll = (e: MouseEvent) => { if (e.button === 1) e.preventDefault(); };
     document.addEventListener("keydown", block);
-    return () => document.removeEventListener("keydown", block);
+    document.addEventListener("mousedown", noMiddleAutoscroll);
+    return () => {
+      document.removeEventListener("keydown", block);
+      document.removeEventListener("mousedown", noMiddleAutoscroll);
+    };
   }, []);
 
   return (

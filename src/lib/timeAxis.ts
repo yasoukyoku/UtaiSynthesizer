@@ -156,4 +156,42 @@ export class TimeAxis {
     }
     return lines;
   }
+
+  /**
+   * ② SUB-BEAT grid for the vocal piano-roll (S48 Phase 4) — divides each BEAT into `div` equal parts and
+   * yields every line over `[startTick, endTick)`, tagged with a `level` ("bar" downbeat / "beat" / "sub")
+   * and its 0-based sub index within the beat (`sub`), so the draw can shade coarser vs finer subdivisions.
+   * `div` SUPPORTS TRIPLETS (÷3/÷6/÷12, not just powers of two) — the base vocal grid is 12/beat, so both
+   * binary (8th=÷2, 16th=÷4) and triplet (8th-T=÷3, 16th-T=÷6) snap targets land on it, which is exactly
+   * why v2 uses a constant six-based grid instead of a switchable triplet mode (the v1 position-corruption
+   * trap). Floors the first line to the left edge like `gridLinesInRange`. Leaves `gridLinesInRange`
+   * (the arrangement's bar/beat set) BIT-FOR-BIT untouched — this is a new, additive method.
+   */
+  subGridLinesInRange(
+    startTick: number,
+    endTick: number,
+    div: number,
+  ): { tick: number; level: "bar" | "beat" | "sub"; sub: number }[] {
+    const out: { tick: number; level: "bar" | "beat" | "sub"; sub: number }[] = [];
+    if (endTick <= startTick || !Number.isFinite(div) || div < 1) return out;
+    for (let si = 0; si < this.segs.length; si++) {
+      const s = this.segs[si]!;
+      const next = this.segs[si + 1];
+      const segEnd = next ? next.startTick : endTick;
+      if (segEnd <= startTick) continue;
+      if (s.startTick >= endTick) break;
+      const step = s.ticksPerBeat / div;
+      const from = Math.max(startTick, s.startTick);
+      const stop = Math.min(endTick, segEnd);
+      let k = Math.floor((from - s.startTick) / step); // floor to the sub-line at/below the left edge
+      for (; ; k++) {
+        const tick = s.startTick + Math.round(k * step);
+        if (tick >= stop) break;
+        const rel = tick - s.startTick;
+        const level = rel % s.ticksPerBar === 0 ? "bar" : rel % s.ticksPerBeat === 0 ? "beat" : "sub";
+        out.push({ tick, level, sub: ((k % div) + div) % div });
+      }
+    }
+    return out;
+  }
 }

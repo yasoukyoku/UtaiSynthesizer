@@ -51,6 +51,13 @@ rand = "0.8"
 rand_distr = "0.4"
 utai-dsp = { path = "crates/utai-dsp" }
 
+# Windows-only: disable WebView2 browser-accelerator keys (Ctrl+F/P, F5/F7, zoom, reload…) natively — a
+# page-level keydown preventDefault can't stop them (they're handled by the WebView2 host above the DOM).
+# Versions pinned to what Tauri 2 already resolves (Cargo.lock) so the COM interface types match.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = "0.61"
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 

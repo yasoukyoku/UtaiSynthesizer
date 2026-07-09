@@ -5218,6 +5218,8 @@ dependencies = [
  "tracing-subscriber",
  "utai-dsp",
  "uuid",
+ "webview2-com",
+ "windows",
  "xxhash-rust",
  "zip",
  "zstd",

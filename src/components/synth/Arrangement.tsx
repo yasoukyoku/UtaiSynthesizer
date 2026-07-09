@@ -110,9 +110,11 @@ export function Arrangement() {
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
   const updateTrack = useProjectStore((s) => s.updateTrack);
   const splitSegment = useProjectStore((s) => s.splitSegment);
+  const createVocalPart = useProjectStore((s) => s.createVocalPart);
   const deleteSegment = useProjectStore((s) => s.deleteSegment);
   const updateSegmentLaneOps = useProjectStore((s) => s.updateSegmentLaneOps);
   const openWorkflow = useAppStore((s) => s.openWorkflow);
+  const openVocalEditor = useAppStore((s) => s.openVocalEditor);
   const selectedSegments = useAppStore((s) => s.selectedSegments);
   const selectedLane = useAppStore((s) => s.selectedLane);
   const selectSegment = useAppStore((s) => s.selectSegment);
@@ -833,9 +835,31 @@ export function Arrangement() {
   const handleDoubleClick = useCallback(
     (e: React.MouseEvent) => {
       const hit = hitTest(e.clientX, e.clientY);
-      if (hit) openWorkflow(hit.segId);
+      if (!hit) {
+        // ② Empty space on a VOCAL track → create a one-bar notes part at the clicked bar and open the
+        // editor (createVocalTrack seeds no parts; this is how you start singing, §9.5).
+        const ti = hitTrackIdx(e.clientY);
+        const tr = useProjectStore.getState().tracks[ti];
+        if (tr && tr.trackType === "vocal") {
+          const bar = Math.max(0, timeAxis.tickToBarBeat(canvasToTick(e.clientX)).bar - 1);
+          const startTick = timeAxis.tickAtBar(bar);
+          const segId = createVocalPart(tr.id, startTick, timeAxis.ticksPerBarAt(startTick));
+          openVocalEditor(segId);
+        }
+        return;
+      }
+      // ② Route by content type — a NOTES part opens the vocal (piano-roll) editor, an audioClip opens the
+      // node workflow editor (§9.6). Classify from the LIVE store by the stable segId (never a stale
+      // closure / trackIdx that a concurrent split/delete could have shifted).
+      let isNotes = false;
+      for (const tr of useProjectStore.getState().tracks) {
+        const sg = tr.segments.find((s) => s.id === hit.segId);
+        if (sg) { isNotes = sg.content.type === "notes"; break; }
+      }
+      if (isNotes) openVocalEditor(hit.segId);
+      else openWorkflow(hit.segId);
     },
-    [hitTest, openWorkflow],
+    [hitTest, hitTrackIdx, canvasToTick, timeAxis, createVocalPart, openWorkflow, openVocalEditor],
   );
 
   // Wheel: scroll = horizontal, shift = vertical, ctrl = zoom.
@@ -954,7 +978,8 @@ export function Arrangement() {
     if (ctxMenu.segId) {
       const seg = track.segments.find((s) => s.id === ctxMenu.segId);
       const ph = useProjectStore.getState().playheadTick;
-      const canSplit = seg && ph > seg.startTick && ph < seg.startTick + seg.durationTicks;
+      // ② A notes (vocal) part can't be split (§9.6 gate) — only audioClip segments split at the playhead.
+      const canSplit = !!seg && seg.content.type === "audioClip" && ph > seg.startTick && ph < seg.startTick + seg.durationTicks;
       items.push({
         label: t("toolbar.split"), shortcut: "Ctrl+K", disabled: !canSplit,
         onClick: () => { if (canSplit) splitSegment(track.id, ctxMenu.segId!, useProjectStore.getState().playheadTick); },
@@ -1255,12 +1280,19 @@ export function Arrangement() {
         // peaks finish loading (the key count alone doesn't change when an existing audioFiles entry
         // gets populated) — otherwise the real waveform never repaints over the empty box.
         const srcPeaks = s.content.type === "audioClip" ? (audioFiles[s.content.sourcePath]?.peaks.length ?? 0) : 0;
+        // ② A cheap notes signature so the mini-note THUMBNAIL re-bakes when the vocal editor adds / moves /
+        // edits notes — the segment's geometry fields alone don't change, so without this the static layer
+        // stays stale (the reported "canvas doesn't update after drawing notes"). Rolling int hash over
+        // tick/pitch/duration + count catches every change the thumbnail draws.
+        const notesSig = s.content.type === "notes"
+          ? s.content.notes.reduce((acc, n) => (Math.imul(acc, 31) + n.tick * 7 + n.pitch * 13 + n.duration) | 0, s.content.notes.length)
+          : 0;
         // laneLabel + group are in the key so a group RENAME (relabel-in-place, same audioPath) still
         // repaints the canvas row text — without them the header updates but the canvas text goes stale.
         // laneId too: a DETACH rewrites laneId/outputNodeId in place with the same path/label/group,
         // but it splits one group RUN into several → new bars/row positions must repaint (P5).
         // o.loading: a lane turning ready flips the main row original-waveform → lane-sum switch.
-        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
+        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
       }).join(";");
       // playOriginal: flips the main-row waveform (sum ↔ original) + dims every lane row.
       return `${t.segments.length}:${t.expanded}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
@@ -1530,6 +1562,27 @@ function drawStaticContent(
       ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.3)`;
       ctx.fillRect(sx, sy, 3, sh);
       ctx.fillRect(sx + sw - 3, sy, 3, sh);
+
+      // ② Notes (vocal) part → a MIDI-clip-style mini-note thumbnail (pitch mapped into the box height),
+      // so a notes segment reads as content, not a blank box (§9.6). Note ticks are segment-relative.
+      if (seg.content.type === "notes" && sw > 2 && seg.content.notes.length > 0) {
+        const ns = seg.content.notes;
+        let lo = Infinity, hi = -Infinity;
+        for (const n of ns) { if (n.pitch < lo) lo = n.pitch; if (n.pitch > hi) hi = n.pitch; }
+        const span = Math.max(1, hi - lo);
+        const padTop = sy + 3;
+        const usable = sh - 6;
+        const nh = Math.max(1.5, Math.min(3, usable / (span + 1)));
+        ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.85)`;
+        for (const n of ns) {
+          const nx = sx + n.tick * ppt;
+          const nw = Math.max(1, n.duration * ppt);
+          if (nx > sx + sw || nx + nw < sx) continue;
+          const ny = padTop + (1 - (n.pitch - lo) / span) * usable;
+          const cx = Math.max(sx + 1, nx);
+          ctx.fillRect(cx, ny, Math.max(1, Math.min(nw, sx + sw - 1 - cx)), nh);
+        }
+      }
 
       // The loading look (stripes + spinner) is drawn per-frame in the main draw() via
       // drawLoadingIndicator (keyed on isSegLoading) — NOT here — so it can animate. The static layer

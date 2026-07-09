@@ -13,6 +13,7 @@ import type {
   VocalTrackParams,
 } from "../types/project";
 import { TimeAxis } from "../lib/timeAxis";
+import { normalizeNotesArray, normalizeCurve } from "../lib/vocalNotes";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
   laneGroupName,
@@ -50,37 +51,10 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
 const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0 };
 
-/** Canonicalize a vocal note so the SAME logical note ALWAYS has the SAME shape — the omit-default rule
- *  that keeps the raw-JSON save/autosave compare byte-stable (§5 false-dirty) AND the undo sig phantom-free:
- *  drop every optional equal to its default, and keep `pitchPoints` in canonical x-order. The undo sig
- *  (history.contentSig) folds the same defaults, so absent ≡ default on BOTH sides. (When the Phase-5 pitch
- *  editor writes float curves, round them HERE — one place feeds both the sig and serialize, so they can't
- *  disagree.) */
-function normalizeNote(n: Note): Note {
-  const out: Note = {
-    id: n.id, tick: n.tick, duration: n.duration, pitch: n.pitch, lyric: n.lyric, velocity: n.velocity,
-  };
-  if (n.phoneme) out.phoneme = n.phoneme;
-  if (n.detune) out.detune = n.detune; // 0 → absent
-  // Rebuild pitchPoints (sorted by x) and vibrato with FIXED key order — the sig reads sub-fields by
-  // name (order-independent) but JSON.stringify preserves object key insertion order, so canonicalizing
-  // here keeps serialize byte-stable regardless of how a future caller constructs these objects (the same
-  // sig↔serialize agreement the paramCurves sort guards).
-  if (n.pitchPoints && n.pitchPoints.length > 0) {
-    out.pitchPoints = [...n.pitchPoints]
-      .sort((a, b) => a.x - b.x)
-      .map((p) => ({ x: p.x, y: p.y, shape: p.shape }));
-  }
-  if (n.vibrato) {
-    const v = n.vibrato;
-    out.vibrato = { length: v.length, period: v.period, depth: v.depth, in: v.in, out: v.out, shift: v.shift, drift: v.drift };
-  }
-  if (n.pitchAuto === false) out.pitchAuto = false; // absent/true (the default) → absent
-  if (n.tie) out.tie = true; // false → absent
-  if (n.lang) out.lang = n.lang;
-  if (n.phonemeInput) out.phonemeInput = n.phonemeInput;
-  return out;
-}
+// `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
+// live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;
+// §9.5). Every note-mutating action below passes its result array through `normalizeNotesArray` so storage
+// order is a pure function of content (sort-on-write), and curves through `normalizeCurve`.
 
 type NotesContent = Extract<SegmentContent, { type: "notes" }>;
 
@@ -170,6 +144,16 @@ interface ProjectState {
   updateVocalNote: (trackId: string, segmentId: string, noteId: string, updates: Partial<Note>) => void;
   /** Delete one or many vocal notes by id (box-select delete). */
   deleteVocalNotes: (trackId: string, segmentId: string, noteIds: string[]) => void;
+  /** Atomic BATCH note edit = ONE undo step (§9.5). Every editor gesture (create/move/resize/truncate/
+   *  paste/delete) routes through here; the result array is sort-canonicalized (normalizeNotesArray). */
+  applyNoteEdits: (
+    trackId: string,
+    segmentId: string,
+    edits: { add?: Note[]; update?: Record<string, Partial<Note>>; remove?: string[] },
+  ) => void;
+  /** Create an EMPTY notes segment (part) on a vocal track and return its id (the editor then opens it).
+   *  createVocalTrack seeds no segments — this is the missing "insert a notes part" action (§9.5). */
+  createVocalPart: (trackId: string, startTick: number, durationTicks: number) => string;
   /** Set (or clear, when `curve` is undefined/empty) the part-level hand-drawn pitch deviation. */
   setSegmentPitchDev: (trackId: string, segmentId: string, curve: PitchCurve | undefined) => void;
   /** Set (or clear) one named parameter automation lane on a notes-segment. */
@@ -275,6 +259,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   splitSegment: (trackId, segmentId, atTick) => {
     const newId = crypto.randomUUID();
+    // Upfront no-op guard (§5 false-dirty): a NOTES segment (§9.6 gate), an out-of-range tick, or a
+    // missing segment are all no-ops — return WITHOUT entering set(), so `dirty` is never falsely flipped
+    // (the inner checks below stay as belt-and-braces). Fixes the latent no-op-dirty on every reject path.
+    {
+      const st = get();
+      const seg = st.tracks.find((t) => t.id === trackId)?.segments.find((sg) => sg.id === segmentId);
+      if (!seg || seg.content.type === "notes" || atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return null;
+    }
     // Is a render in flight for this segment? If so the split must NOT drop the in-progress sub-lanes:
     // carry the loading placeholders to the right half too + link it, so the single ongoing render lands
     // on BOTH halves once it settles (RenderLinkWatcher mirrors the source's final lanes onto the new half).
@@ -292,6 +284,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         const segIdx = t.segments.findIndex((seg) => seg.id === segmentId);
         if (segIdx < 0) return t;
         const seg = t.segments[segIdx]!;
+
+        // ② GATE (§9.6, highest-risk anchor): a NOTES segment must NOT split via this audioClip path —
+        // it would give both halves the SAME notes array + SAME note ids + un-rebased segment-relative
+        // ticks = silent corruption. notes-aware split (partition + deep-copy + tick-rebase + clip) is
+        // future work; until then splitting a notes part is a no-op (the UI also gates it — belt & braces).
+        if (seg.content.type === "notes") return t;
 
         if (atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return t;
 
@@ -513,7 +511,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       dirty: true,
       tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
         ...c,
-        notes: [...c.notes, normalizeNote(note)],
+        notes: normalizeNotesArray([...c.notes, note]), // append then sort-on-write (§9.5 single funnel)
       })),
     })),
 
@@ -522,8 +520,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       dirty: true,
       tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
         ...c,
-        // Re-normalize the merged note so a field set back to its default drops out (no false-dirty).
-        notes: c.notes.map((n) => (n.id === noteId ? normalizeNote({ ...n, ...updates }) : n)),
+        // Re-normalize the WHOLE array so a field set to its default drops out AND order stays canonical
+        // (a pitch edit can move a note past a neighbor → tick-sort funnel keeps storage order pure).
+        notes: normalizeNotesArray(c.notes.map((n) => (n.id === noteId ? { ...n, ...updates } : n))),
       })),
     })),
 
@@ -534,17 +533,64 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         dirty: true,
         tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({
           ...c,
-          notes: c.notes.filter((n) => !ids.has(n.id)),
+          notes: normalizeNotesArray(c.notes.filter((n) => !ids.has(n.id))),
         })),
       };
     }),
+
+  applyNoteEdits: (trackId, segmentId, edits) =>
+    set((s) => {
+      // ONE atomic batch = ONE undo step (§9.5): remove, then patch, then add, then the single sort/
+      // canonicalize funnel. All of create/move/resize/truncate/paste/delete/lyric route through here.
+      const track = s.tracks.find((t) => t.id === trackId);
+      const seg = track?.segments.find((sg) => sg.id === segmentId);
+      if (!seg || seg.content.type !== "notes") return {};
+      const removeSet = edits.remove && edits.remove.length > 0 ? new Set(edits.remove) : null;
+      let next = removeSet ? seg.content.notes.filter((n) => !removeSet.has(n.id)) : seg.content.notes;
+      if (edits.update) {
+        const u = edits.update;
+        next = next.map((n) => (u[n.id] ? { ...n, ...u[n.id] } : n));
+      }
+      if (edits.add && edits.add.length > 0) next = [...next, ...edits.add];
+      const nextNotes = normalizeNotesArray(next);
+      // No-op guard (§5 false-dirty, the user's #1 pain): a same-value edit — e.g. re-confirming a lyric
+      // unchanged — must NOT set dirty (a stuck dirty flag never reconciles). Both arrays are canonical
+      // (normalizeNotesArray), so JSON equality is reliable; identical → change nothing (empty set).
+      if (JSON.stringify(seg.content.notes) === JSON.stringify(nextNotes)) return {};
+      return { dirty: true, tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => ({ ...c, notes: nextNotes })) };
+    }),
+
+  createVocalPart: (trackId, startTick, durationTicks) => {
+    const id = crypto.randomUUID();
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) =>
+        t.id === trackId
+          ? {
+              ...t,
+              segments: [
+                ...t.segments,
+                {
+                  id,
+                  startTick: Math.max(0, Math.round(startTick)),
+                  durationTicks: Math.max(1, Math.round(durationTicks)),
+                  content: { type: "notes", notes: [] } as SegmentContent,
+                },
+              ],
+            }
+          : t,
+      ),
+    }));
+    return id;
+  },
 
   setSegmentPitchDev: (trackId, segmentId, curve) =>
     set((s) => ({
       dirty: true,
       tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => {
         const next: NotesContent = { ...c };
-        if (curve && curve.xs.length > 0) next.pitchDev = curve;
+        const norm = normalizeCurve(curve, "cents"); // pitchDev = integer cents
+        if (norm) next.pitchDev = norm;
         else delete next.pitchDev;
         return next;
       }),
@@ -555,7 +601,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       dirty: true,
       tracks: mapNotesContent(s.tracks, trackId, segmentId, (c) => {
         const src = { ...(c.paramCurves ?? {}) };
-        if (curve && curve.xs.length > 0) src[param] = curve;
+        const norm = normalizeCurve(curve, "param"); // param quantum (0.001) — NEVER integer cents
+        if (norm) src[param] = norm;
         else delete src[param];
         const next: NotesContent = { ...c };
         const keys = Object.keys(src);
