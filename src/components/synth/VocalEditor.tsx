@@ -884,6 +884,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const onWheel = useCallback((e: React.WheelEvent) => {
     e.stopPropagation();
     const v = viewRef.current;
+    const sx0 = v.scrollX, sy0 = v.scrollY; // capture pre-scroll → re-anchor an in-progress marquee below
     // Upper scroll bound: the part's right edge (+ a margin) — can't scroll off into empty space.
     const maxScrollX = () => Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, sizeRef.current.w - KEY_COL_W));
     if (e.ctrlKey) {
@@ -916,6 +917,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (d?.kind === "move" && d.activeY) {
       const o = d.activeIds[0] ? d.orig.get(d.activeIds[0]) : undefined;
       if (o) playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + (pitchAt(d.curY) - (d.startPitch ?? 0)))));
+    } else if (d && (d.kind === "marquee" || d.kind === "marquee-delete")) {
+      // pin the marquee's anchor to content while scrolling — else the box stays at its screen position and
+      // selects the wrong notes as content scrolls under it (§user bug; same fix the edge auto-scroll uses).
+      d.clientX0 -= v.scrollX - sx0;
+      d.clientY0 -= v.scrollY - sy0;
     }
     requestRedraw();
   }, [requestRedraw]);
