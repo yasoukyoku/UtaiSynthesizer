@@ -319,6 +319,8 @@
     "grid": "网格",
     "maximize": "最大化",
     "restore": "还原",
+    "preview": "试听",
+    "stop": "停止",
     "close": "关闭"
   }
 }

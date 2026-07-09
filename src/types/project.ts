@@ -130,11 +130,11 @@ export interface Note {
   velocity: number;
   /** Fine pitch offset in cents (± ), added to `pitch`. Absent = 0. */
   detune?: number;
-  /** Per-note pitch-transition control points (Pointer tool): X = ticks relative to the note start,
-   *  Y = cents. Ordered by X. A first point BEFORE the note start makes the transition slide in from the
-   *  previous note (OpenUTAU snapFirst / §3.2 layer ②). Absent = no per-note pitch shaping. */
-  pitchPoints?: PitchPoint[];
-  /** Tail vibrato (OpenUTAU-style). All fields present when vibrato is on; absent = none. */
+  /** ② Per-note pitch-TRANSITION override (SynthV Pitch Transition, §10.3). Shapes how this note connects
+   *  to its neighbours (glide in from prev / out to next). Every field optional → absent fields fall back
+   *  to the track default (VocalTrackParams.transition). Absent whole = pure track default. */
+  transition?: NoteTransition;
+  /** ④ Tail/mid vibrato (SynthV model). All fields present when on; absent = none. */
   vibrato?: VibratoSpec;
   /** false = the note's pitch baseline is FROZEN to the user's manual edits (v1 "Path B"); absent/true =
    *  re-derived from the score (Path A). Stored ONLY when false. */
@@ -148,12 +148,20 @@ export interface Note {
   phonemeInput?: string;
 }
 
-/** A pitch-transition control point: X = ticks (rel. note start), Y = cents, with an easing SHAPE for the
- *  segment leading UP TO this point (ported from OpenUTAU MusicMath.InterpolateShape). */
-export interface PitchPoint {
-  x: number;
-  y: number;
-  shape: "linear" | "sineIn" | "sineOut" | "sineInOut";
+/** ② SynthV Pitch Transition — how a note connects to its neighbours (§10.3). ALL times are ABSOLUTE ms
+ *  (NOT ticks) so a glide sounds the same at any tempo; overshoot depths are cents. As a per-note override
+ *  every field is optional (absent → the concrete track default in VocalTrackParams.transition). */
+export interface NoteTransition {
+  /** Shift the whole cross-note transition earlier(−)/later(+), ms (SynthV Offset). */
+  offsetMs?: number;
+  /** How long AFTER this note's onset the pitch arrives from the previous note (arrive-late), ms ≥ 0. */
+  durLeftMs?: number;
+  /** How long BEFORE this note's end the pitch begins leaving toward the next note (leave-early), ms ≥ 0. */
+  durRightMs?: number;
+  /** Arrival overshoot at the left transition, signed cents (SynthV Depth Left; ~15¢ default = human feel). */
+  depthLeftCents?: number;
+  /** Departure overshoot at the right transition, signed cents (SynthV Depth Right). */
+  depthRightCents?: number;
 }
 
 /** An ordered polyline (X = ticks, Y = cents/param-value). Parallel arrays keep it compact + JSON-stable;
@@ -163,19 +171,20 @@ export interface PitchCurve {
   ys: number[];
 }
 
+/** ④ Vibrato (SynthV model, §10.3). Times ABSOLUTE ms; frequency Hz; amplitude cents. The onset delay
+ *  (startMs) is why short notes don't visibly vibrate. (jitter = natural pitch flutter — deferred Phase 6.) */
 export interface VibratoSpec {
-  /** Fraction of the note covered by vibrato, 0–1 (tail-anchored). */
-  length: number;
-  /** Period in ms. */
-  period: number;
-  /** Depth in cents. */
-  depth: number;
-  /** Fade-in / fade-out fractions of the vibrato span, 0–1. */
-  in: number;
-  out: number;
-  /** Phase shift (0–1) and pitch drift (cents) — OpenUTAU VBR P/D. */
-  shift: number;
-  drift: number;
+  /** Amplitude in cents (peak deviation, ± around the base). SynthV default ≈ 100¢ (1 semitone). */
+  depthCents: number;
+  /** Oscillation rate in Hz (SynthV 1–10, default 5.5). */
+  freqHz: number;
+  /** Start phase, −1…+1 (fraction of a cycle). */
+  phase: number;
+  /** Onset delay after the note's start, ms (short notes stay flat). */
+  startMs: number;
+  /** Linear fade-in / fade-out durations, ms. */
+  easeInMs: number;
+  easeOutMs: number;
 }
 
 /** ② Vocal-track (自己唱) parameters (§3.1). The SVC voice/singer stays in `Track.voiceModel`; this holds
@@ -188,6 +197,9 @@ export interface VocalTrackParams {
   langId: number;
   /** Track-level transpose in semitones, applied to every note's pitch → f0. */
   transpose: number;
+  /** Track-level DEFAULT note transition — every field concrete. A note's NoteTransition overrides it
+   *  per-field, so every note has a smooth SynthV-style glide by default (§10.3). */
+  transition: Required<NoteTransition>;
 }
 
 export interface Workflow {

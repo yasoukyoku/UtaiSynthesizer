@@ -12,13 +12,14 @@ import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
 import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
-import { resolveOverlaps } from "../../lib/vocalNotes";
+import { resolveOverlaps, DEFAULT_TRANSITION } from "../../lib/vocalNotes";
+import { evalF0CentsAt } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
   tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
   rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
 } from "../../lib/vocalGeometry";
-import type { Note } from "../../types/project";
+import type { Note, PitchCurve, NoteTransition } from "../../types/project";
 import "./VocalEditor.css";
 
 type Tool = "arrow" | "pen" | "pitch" | "delete";
@@ -32,9 +33,10 @@ const KEY_COL_W = 56; // fixed piano-key column at the canvas left edge
 const RULER_H = 18; // bar-number ruler strip along the top of the note area
 const EDGE_PX = 6; // note right-edge resize hotzone (screen px)
 const DEFAULT_LYRIC = "あ"; // JA vowel — always in PHONE_TO_ID, never OOV/empty (§9.2)
-const DETUNE_DRAG_CAP = 200; // ± cents reachable by a Pitch-tool fine-tune drag (a Phase-4 taste of §9.3)
+const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
+// can always drag down to it WITHOUT switching grid; the 60ms singability floor is a Phase-6 render concern (§user)
 
-type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "detune";
+type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "pitch-paint";
 interface DragState {
   kind: DragKind;
   clientX0: number; clientY0: number;
@@ -45,6 +47,11 @@ interface DragState {
   anchorRelTick: number; // create/move reference
   moved: boolean;
   additive: boolean; // marquee: keep existing selection
+  activeX?: boolean; // move: X/Y axes activate INDEPENDENTLY past a threshold, each measured from the ORIGIN,
+  activeY?: boolean; // so switching axis mid-drag keeps the delta already applied — no jump-back (§user bug)
+  startRel?: number; // move: CONTENT tick/pitch captured at pointerdown — dTick/dPitch measure from THESE
+  startPitch?: number; // (not the screen origin), so scrolling mid-drag re-anchors to the cursor, no drift
+  paint?: { xs: number[]; ys: number[] }; // pitch-paint: the drawn (relTick, absCents) path
   previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
 }
 
@@ -62,6 +69,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const selectedNotes = useProjectStore((s) => s.selectedNotes);
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const selectNotes = useProjectStore((s) => s.selectNotes);
+  const setSegmentPitchDev = useProjectStore((s) => s.setSegmentPitchDev);
   const setActivePane = useAppStore((s) => s.setActivePane);
 
   // Resolve the notes part by the STABLE segment id (a track reorder / rename must not lose it).
@@ -69,7 +77,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     for (const tr of tracks) {
       const sg = tr.segments.find((s) => s.id === segmentId);
       if (sg && sg.content.type === "notes") {
-        return { trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks };
+        return {
+          trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
+          pitchDev: sg.content.pitchDev, transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
+        };
       }
     }
     return null;
@@ -78,6 +89,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const [tool, setTool] = useState<Tool>("arrow");
   const [gridDiv, setGridDiv] = useState(2); // 1/8 default
   const [maximized, setMaximized] = useState(false);
+  const [playing, setPlaying] = useState(false);
   const [lyricEdit, setLyricEdit] = useState<{ id: string; x: number; y: number; w: number; value: string } | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -95,6 +107,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // Content refs (synced each render) so the imperative draw/pointer code reads fresh values.
   const notesRef = useRef<Note[]>(part?.notes ?? []);
   notesRef.current = part?.notes ?? [];
+  // Pitch-line inputs (the always-shown real f0 = evalF0Cents): the segment's hand-drawn deviation curve +
+  // the track's default transition (per-note transitions live on each note).
+  const pitchDevRef = useRef(part?.pitchDev);
+  pitchDevRef.current = part?.pitchDev;
+  const transitionRef = useRef(part?.transition ?? DEFAULT_TRANSITION);
+  transitionRef.current = part?.transition ?? DEFAULT_TRANSITION;
   const startRef = useRef(part?.start ?? 0);
   startRef.current = part?.start ?? 0;
   const durRef = useRef(part?.dur ?? 0);
@@ -112,15 +130,64 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const axisRef = useRef(timeAxis);
   axisRef.current = timeAxis;
 
-  const minNoteTicks = () => Math.max(1, Math.ceil(msToTicks(60, tempoRef.current))); // §9.2 60ms floor
   const snapTicks = () => TICKS_PER_BEAT / gridDivRef.current; // 480/div: 1/4=480,1/8=240,1/16=120,1/8T=160,1/16T=80,1/12=40
 
-  // rAF-coalesced redraw.
+  // rAF-coalesced redraw + preview-playback rAF (scrubs the segment following evalF0Cents so you can HEAR
+  // the smooth transitions / vibrato — placeholder tone, not the SVC voice, §9.7).
   const rafRef = useRef(0);
+  const playRafRef = useRef(0);
+  const edgeRafRef = useRef(0); // marquee edge auto-scroll rAF
+  const edgeScrollRef = useRef<() => void>(() => {});
   const requestRedraw = useCallback(() => {
     if (rafRef.current) return;
     rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; drawRef.current(); });
   }, []);
+
+  // ── preview playback: scrub the segment following the single evalF0Cents so you HEAR the smooth
+  //    transitions / vibrato / drawn pitchDev (placeholder tone, not the SVC voice, §9.7). ──
+  const stopPreviewPlay = useCallback(() => {
+    if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; }
+    playback.stopPreviewTone();
+    setPlaying(false);
+  }, []);
+  const startPreviewPlay = useCallback(() => {
+    if (!part) return;
+    if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; } // clear any orphan
+    const startMs = performance.now();
+    const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+    playback.playPreviewTone(centsToHz(6000), 0); // seed a sustained tone; retuned each frame
+    setPlaying(true);
+    const tick = () => {
+      const rel = msToTicks(performance.now() - startMs, tempoRef.current);
+      if (rel > durRef.current) { stopPreviewPlay(); return; } // reached the segment end
+      const sorted = [...notesRef.current].sort((a, b) => a.tick - b.tick);
+      const r = evalF0CentsAt(sorted, pitchDevRef.current, rel, opts);
+      playback.setPreviewToneHz(r.voiced ? centsToHz(r.cents) : 20); // rest → near-silent low freq
+      playRafRef.current = requestAnimationFrame(tick);
+    };
+    playRafRef.current = requestAnimationFrame(tick);
+  }, [part, stopPreviewPlay]);
+
+  // marquee edge auto-scroll (§9.4): while the cursor is held at a border during a marquee, scroll the view
+  // and PIN the box's anchor to the content (its screen origin shifts opposite the scroll) so the box grows
+  // over the newly-revealed area. Reassigned each render so it reads fresh refs; recurses via the ref.
+  edgeScrollRef.current = () => {
+    const d = dragRef.current, m = mouseRef.current;
+    if (!d || (d.kind !== "marquee" && d.kind !== "marquee-delete") || !m) { edgeRafRef.current = 0; return; }
+    const { w, h } = sizeRef.current, v = viewRef.current;
+    const EDGE = 28, SPEED = 10;
+    let dx = 0, dy = 0;
+    if (m.x < KEY_COL_W + EDGE) dx = -SPEED; else if (m.x > w - EDGE) dx = SPEED;
+    if (m.y < RULER_H + EDGE) dy = -SPEED; else if (m.y > h - EDGE) dy = SPEED;
+    if (!dx && !dy) { edgeRafRef.current = 0; return; } // cursor left the border → stop
+    const maxSX = Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, w - KEY_COL_W));
+    const maxSY = Math.max(0, rowsContentHeight(v.rowH) - (h - RULER_H));
+    const nSX = Math.max(0, Math.min(maxSX, v.scrollX + dx)), nSY = Math.max(0, Math.min(maxSY, v.scrollY + dy));
+    d.clientX0 -= nSX - v.scrollX; d.clientY0 -= nSY - v.scrollY; // pin the anchor to content
+    v.scrollX = nSX; v.scrollY = nSY;
+    requestRedraw();
+    edgeRafRef.current = requestAnimationFrame(edgeScrollRef.current);
+  };
 
   // ── size / DPR ──
   useEffect(() => {
@@ -270,18 +337,25 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         }
       }
 
-      // ── baseline pitch line (Pitch tool preview; full f0 = Phase 5) ──
-      if (toolRef.current === "pitch") {
+      // ── PITCH LINE: the always-shown REAL f0 (SynthV — the sounding pitch = base ⊕ transition + pitchDev
+      //    + vibrato, all summed by the single evalF0Cents). Sampled across the note area every few px; an
+      //    unvoiced (rest) sample BREAKS the line (carrier-aware, §9.3). Emphasized under the Pitch tool. ──
+      {
+        const sorted = [...drawNotes].sort((a, b) => a.tick - b.tick);
+        const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+        const dr0 = dragRef.current; // live pitch-paint → preview the drawn curve on the line
+        const dev = dr0?.kind === "pitch-paint" && dr0.paint ? paintedDev(sorted, dr0.paint, pitchDevRef.current, opts) : pitchDevRef.current;
         ctx.strokeStyle = col("--accent-tertiary") || "#ff6b9d";
-        ctx.lineWidth = 1.5; ctx.globalAlpha = 0.85;
+        ctx.lineWidth = toolRef.current === "pitch" ? 2 : 1.5;
+        ctx.globalAlpha = toolRef.current === "pitch" ? 0.95 : 0.7;
         ctx.beginPath();
-        let first = true;
-        for (const n of [...drawNotes].sort((a, b) => a.tick - b.tick)) {
-          const x0 = noteAreaX + noteTickToX(n.tick, start, v);
-          const x1 = noteAreaX + noteTickToX(n.tick + n.duration, start, v);
-          const y = centsToY(n.pitch * 100 + (n.detune ?? 0), v);
-          if (first) { ctx.moveTo(x0, y); first = false; } else ctx.lineTo(x0, y);
-          ctx.lineTo(x1, y);
+        let pen = false; // whether a voiced sub-path is open
+        for (let px = noteAreaX; px <= w; px += 2) {
+          const rel = xToNoteTick(px - KEY_COL_W, start, v);
+          const r = evalF0CentsAt(sorted, dev, rel, opts);
+          if (!r.voiced) { pen = false; continue; } // rest → break the line
+          const y = centsToY(r.cents, v);
+          if (!pen) { ctx.moveTo(px, y); pen = true; } else ctx.lineTo(px, y);
         }
         ctx.stroke(); ctx.globalAlpha = 1;
       }
@@ -382,6 +456,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     playback.getPreviewContext();
     const release = () => {
       if (dragRef.current) { dragRef.current = null; requestRedraw(); }
+      if (edgeRafRef.current) { cancelAnimationFrame(edgeRafRef.current); edgeRafRef.current = 0; }
+      if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; setPlaying(false); }
       playback.stopPreviewTone();
     };
     window.addEventListener("blur", release);
@@ -389,6 +465,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     return () => {
       window.removeEventListener("blur", release);
       document.removeEventListener("visibilitychange", release);
+      if (playRafRef.current) cancelAnimationFrame(playRafRef.current);
+      if (edgeRafRef.current) cancelAnimationFrame(edgeRafRef.current);
       playback.stopPreviewTone();
     };
   }, [requestRedraw]);
@@ -398,7 +476,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
   // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
   // so re-invoking it is enough (no rebuild).
-  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, timeSignature, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.transition, timeSignature, tempo, requestRedraw]);
 
   // Attach the live preview-notes closure to the drag state (draw reads it).
   const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {
@@ -451,7 +529,6 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ── compute the off-ref preview note array for a live gesture (no store writes) ──
   const computePreview = (d: DragState): Note[] => {
     const base = notesRef.current;
-    const snap = snapTicks();
     if (d.kind === "create" && d.newNote) {
       return [...base, d.newNote];
     }
@@ -459,17 +536,23 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       return base.map((n) => {
         const o = d.orig.get(n.id);
         if (!o) return n;
-        const newEnd = Math.max(o.tick + minNoteTicks(), snapRound(relTickAt(d.curX), snap)); // right edge ≥ minNote
+        const newEnd = Math.max(o.tick + MIN_LEN_TICKS, snapRound(relTickAt(d.curX), MIN_LEN_TICKS)); // step by 1/12 (40t)
         return { ...o, duration: newEnd - o.tick };
       });
     }
     if (d.kind === "move") {
       const origs = [...d.orig.values()];
-      const rawDTick = snapRound(relTickAt(d.curX), snap) - snapRound(relTickAt(d.clientX0), snap);
-      const rawDPitch = pitchAt(d.curY) - pitchAt(d.clientY0);
+      // AXIS LOCK: a mostly-vertical drag is PURE pitch (dTick=0); a mostly-horizontal drag is PURE timing
+      // (dPitch=0). Fixes "multi-note vertical drag drifts sideways" — a tiny x-jitter used to jump a whole
+      // snap cell (felt like huge sideways sensitivity), amplified across a multi-selection. Free move (§user).
+      // Adjustment drags step by 1/12 (40t), NOT the (possibly coarse) grid cell (§user: only CREATION uses
+      // the grid). Each axis is INDEPENDENT (activeX/activeY set in onPointerMove) and measured from the
+      // origin — so switching direction mid-drag keeps what the other axis already moved (no jump-back).
+      const rawDTick = d.activeX ? snapRound(relTickAt(d.curX), MIN_LEN_TICKS) - snapRound(d.startRel ?? 0, MIN_LEN_TICKS) : 0;
+      const rawDPitch = d.activeY ? pitchAt(d.curY) - (d.startPitch ?? 0) : 0;
       // GROUP clamp (§9.2): clamp the SHARED delta by the group's headroom so spacing is preserved and two
-      // notes can't collapse onto one tick/pitch at a wall. Translate whole notes — pitchPoints RIDE ALONG
-      // (note-relative), NO retimeNote rebase (rebase is only for the truncation head-move, not a move).
+      // notes can't collapse onto one tick/pitch at a wall. Translate whole notes — transition/vibrato are
+      // in ABSOLUTE ms so they ride along unchanged; NO retimeNote rebase (that's only the truncation head-move).
       const dTick = Math.max(rawDTick, -Math.min(...origs.map((o) => o.tick)));
       const loP = Math.min(...origs.map((o) => o.pitch));
       const hiP = Math.max(...origs.map((o) => o.pitch));
@@ -479,14 +562,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         return o ? { ...o, tick: o.tick + dTick, pitch: o.pitch + dPitch } : n;
       });
     }
-    if (d.kind === "detune") {
-      // Pitch-tool fine-tune (§9.3 layer ①): drag a note vertically → per-note detune in cents (the note
-      // BLOCK stays at its semitone; only the f0 line moves). Fuller curve editing is Phase 5.
-      const o = [...d.orig.values()][0];
-      if (!o) return base;
-      const detune = Math.max(-DETUNE_DRAG_CAP, Math.min(DETUNE_DRAG_CAP, Math.round(centsAt(d.curY) - o.pitch * 100)));
-      return base.map((n) => (n.id === o.id ? { ...o, detune } : n));
-    }
+    // pitch-paint doesn't touch notes — the drawn pitchDev is previewed via paintedDev() in draw/commit.
     return base;
   };
 
@@ -495,7 +571,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ── commit: diff the resolved next-array vs current → applyNoteEdits (ONE step); skip a no-op ──
   const commitNotes = (nextNotes: Note[], activeIds: string[]) => {
     if (!part) return;
-    const resolved = resolveOverlaps(nextNotes, new Set(activeIds), minNoteTicks());
+    // min 1 tick = zero-length guard only. The 60ms singability floor is a Phase-6 RENDER concern (Rust
+    // min_frames), NOT a UI clamp — clamping here to 60ms would conflict with a 1/12 grid cell (§user).
+    const resolved = resolveOverlaps(nextNotes, new Set(activeIds), 1);
     const cur = new Map(part.notes.map((n) => [n.id, n]));
     const next = new Map(resolved.map((n) => [n.id, n]));
     const add: Note[] = [];
@@ -525,17 +603,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const tl = toolRef.current;
 
     if (tl === "pitch") {
-      // Pitch tool = per-note fine-tune (detune) this phase; full pitch-curve drawing is Phase 5. Drag a
-      // note vertically to bend its f0 line; empty space does nothing (no curve painting yet).
-      if (hit) {
-        selectNotes(selRef.current.has(hit.note.id) ? [...selRef.current] : [hit.note.id]);
-        const o = notesRef.current.find((n) => n.id === hit.note.id)!;
-        playback.playPreviewTone(centsToHz(o.pitch * 100 + (o.detune ?? 0)), 0); // sustained; retunes on drag
-        dragRef.current = withPreview({
-          kind: "detune", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
-          activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: 0, moved: false, additive: false,
-        });
-      }
+      // Pitch tool = paint Pitch Deviation (SynthV Pencil): drag across the pitch area to draw the TARGET f0
+      // line; on commit the delta vs the automatic line (base ⊕ transition + vibrato) is stored into the
+      // segment's pitchDev (interval-replace). A single click seeds one point; dragging appends the path.
+      // QUANTIZE to whole ticks / whole cents so sub-pixel mouse jitter (the pitch line is ~6¢/px) can't make
+      // the drawn line shiver; 1¢ is far below the audible/visible floor and matches normalizeCurve on commit.
+      const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+      const c0 = Math.round(centsAt(e.clientY));
+      playback.playPreviewTone(centsToHz(c0), 0); // sustained; follows the drawn pitch
+      dragRef.current = withPreview({
+        kind: "pitch-paint", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+        activeIds: [], orig: new Map(), newNote: null, anchorRelTick: rel, moved: false, additive: false,
+        paint: { xs: [rel], ys: [c0] },
+      });
       requestRedraw();
       return;
     }
@@ -548,7 +628,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     }
 
     if (hit) {
-      // select (respect shift/ctrl multi-select), then move or resize
+      // Pen tool: grabbing a note EXTENDS its length (resize its tail), never moves it (§user — a click on a
+      // note in draw mode most likely means "make it longer", and there was no other easy way to resize).
+      if (toolRef.current === "pen") {
+        selectNotes([hit.note.id]);
+        const o = notesRef.current.find((n) => n.id === hit.note.id)!;
+        playback.playPreviewTone(pitchToHz(o.pitch), 160);
+        dragRef.current = withPreview({
+          kind: "resize", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+          activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: o.tick, moved: false, additive: false,
+        });
+        return;
+      }
+      // Arrow tool: select (respect shift/ctrl multi-select), then move or resize by edge
       let nextSel: string[];
       if (e.shiftKey || e.ctrlKey || e.metaKey) {
         nextSel = selRef.current.has(hit.note.id) ? [...selRef.current].filter((i) => i !== hit.note.id) : [...selRef.current, hit.note.id];
@@ -565,6 +657,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         kind: hit.onEdge ? "resize" : "move",
         clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
         activeIds: ids, orig, newNote: null, anchorRelTick: hit.note.tick, moved: false, additive: false,
+        startRel: relTickAt(e.clientX), startPitch: pitchAt(e.clientY),
       });
       return;
     }
@@ -577,7 +670,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const p = clampPitch(pitchAt(e.clientY));
       // Created note honors the 60ms floor like resize/truncation do (§9.2) — a fine grid can't make an
       // inaudible sub-floor note.
-      const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(snap, minNoteTicks()), pitch: p, lyric: DEFAULT_LYRIC, velocity: 100 };
+      const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: DEFAULT_LYRIC, velocity: 100 };
       playback.playPreviewTone(pitchToHz(p), 0); // sustained while drawing; stops on pointerup
       dragRef.current = withPreview({
         kind: "create", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
@@ -599,27 +692,47 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const p = localXY(e.clientX, e.clientY);
     mouseRef.current = p;
     const d = dragRef.current;
-    if (!d) { requestRedraw(); return; } // hover → redraw so the mouse-position guide follows (all tools)
+    if (!d) {
+      // hover cursor: a left-right resize affordance where grabbing would change a note's LENGTH (Arrow near
+      // the tail / Pen anywhere on a note, §user). Delete keeps its CSS crosshair.
+      const cv = canvasRef.current;
+      if (cv) {
+        if (toolRef.current === "delete") cv.style.cursor = "";
+        else { const hov = noteAt(e.clientX, e.clientY); cv.style.cursor = hov && (toolRef.current === "pen" || hov.onEdge) ? "ew-resize" : ""; }
+      }
+      requestRedraw(); return; // hover → redraw so the mouse-position guide follows (all tools)
+    }
     d.moved = true;
-    if (d.kind === "marquee" || d.kind === "marquee-delete") { d.curX = p.x; d.curY = p.y; }
+    if (d.kind === "marquee" || d.kind === "marquee-delete") {
+      d.curX = p.x; d.curY = p.y;
+      if (!edgeRafRef.current) { // kick off edge auto-scroll when the cursor reaches a border
+        const { w, h } = sizeRef.current, EDGE = 28;
+        if (p.x < KEY_COL_W + EDGE || p.x > w - EDGE || p.y < RULER_H + EDGE || p.y > h - EDGE)
+          edgeRafRef.current = requestAnimationFrame(edgeScrollRef.current);
+      }
+    }
     else {
       d.curX = e.clientX; d.curY = e.clientY;
-      // live retune preview for move
+      // live retune preview for move (only when pitch is unlocked; else the tone stays put — pitch is locked)
       if (d.kind === "move") {
-        const dPitch = pitchAt(e.clientY) - pitchAt(d.clientY0);
+        // Each axis ACTIVATES independently once its OWN motion passes a threshold; both are then measured
+        // from the origin. A pure-vertical drag never nudges timing (X stays inactive); switching to
+        // horizontal mid-drag KEEPS the pitch already moved (no jump back to the start height — §user bug).
+        if (!d.activeX && Math.abs(e.clientX - d.clientX0) > 4) d.activeX = true;
+        if (!d.activeY && Math.abs(e.clientY - d.clientY0) > 4) d.activeY = true;
+        const dPitch = d.activeY ? pitchAt(e.clientY) - (d.startPitch ?? 0) : 0; // CONTENT origin (scroll-safe, matches computePreview)
         const anyId = d.activeIds[0];
         const o = anyId ? d.orig.get(anyId) : undefined;
         if (o) playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + dPitch)));
-      } else if (d.kind === "detune") {
-        const o = [...d.orig.values()][0];
-        if (o) {
-          const detune = Math.max(-DETUNE_DRAG_CAP, Math.min(DETUNE_DRAG_CAP, Math.round(centsAt(e.clientY) - o.pitch * 100)));
-          playback.setPreviewToneHz(centsToHz(o.pitch * 100 + detune));
-        }
+      } else if (d.kind === "pitch-paint" && d.paint) {
+        const cy = Math.round(centsAt(e.clientY)); // quantize (see pointerdown) — kills sub-pixel line shiver
+        d.paint.xs.push(Math.max(0, Math.round(relTickAt(e.clientX))));
+        d.paint.ys.push(cy);
+        playback.setPreviewToneHz(centsToHz(cy)); // hear the pitch being drawn
       } else if (d.kind === "create" && d.newNote) {
         const snap = snapTicks();
         const end = Math.max(d.anchorRelTick + snap, snapRound(relTickAt(e.clientX), snap));
-        d.newNote = { ...d.newNote, duration: Math.max(minNoteTicks(), snap, end - d.anchorRelTick) };
+        d.newNote = { ...d.newNote, duration: Math.max(snap, end - d.anchorRelTick) };
       }
     }
     requestRedraw();
@@ -628,6 +741,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     const d = dragRef.current;
     dragRef.current = null;
+    if (edgeRafRef.current) { cancelAnimationFrame(edgeRafRef.current); edgeRafRef.current = 0; }
     if (!d) return; // a bare key/note click (no drag) — let its short audition tone ring out
     playback.stopPreviewTone();
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
@@ -649,9 +763,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       selectNotes([nn.id]);
       return;
     }
+    if (d.kind === "pitch-paint" && d.paint && part) {
+      const sorted = [...notesRef.current].sort((a, b) => a.tick - b.tick);
+      const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
+      setSegmentPitchDev(part.trackId, segmentId, paintedDev(sorted, d.paint, pitchDevRef.current, opts)); // normalizeCurve inside
+      requestRedraw();
+      return;
+    }
     // move / resize
     commitNotes(computePreview(d), d.activeIds);
-  }, [selectNotes, part, segmentId]);
+  }, [selectNotes, part, segmentId, setSegmentPitchDev, requestRedraw]);
 
   const notesInMarquee = (d: DragState): string[] => {
     const v = viewRef.current;
@@ -670,6 +791,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   };
 
   const onDoubleClick = useCallback((e: React.MouseEvent) => {
+    if (toolRef.current === "pitch" || toolRef.current === "delete") return; // lyric editing lives in Arrow/Pen only (§user)
     const hit = noteAt(e.clientX, e.clientY);
     if (!hit || !part) return;
     const v = viewRef.current;
@@ -721,9 +843,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       } else if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key) && sel.length) {
         e.preventDefault(); nudge(e.key);
       } else if (e.key === "Escape") {
-        // Cancel a live gesture — MUST also stop the sustained preview tone (else an Esc'd move-drag leaves
-        // it ringing: the race you flagged). No drag → clear selection.
-        if (dragRef.current) { dragRef.current = null; playback.stopPreviewTone(); requestRedraw(); } else selectNotes([]);
+        // Cancel a live gesture / stop preview playback — MUST also stop the sustained tone (else it rings).
+        if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; playback.stopPreviewTone(); setPlaying(false); }
+        else if (dragRef.current) { dragRef.current = null; playback.stopPreviewTone(); requestRedraw(); } else selectNotes([]);
       }
     };
     document.addEventListener("keydown", onKey);
@@ -787,6 +909,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     } else {
       v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - (sizeRef.current.h - RULER_H)), v.scrollY + e.deltaY));
     }
+    // A wheel-scroll during a note-move changes the cursor's CONTENT pitch, but onPointerMove doesn't fire
+    // (the mouse didn't move) — so refresh the sustained preview tone here, else it keeps sounding the old
+    // pitch while the note visibly follows the scroll (§user preview race).
+    const d = dragRef.current;
+    if (d?.kind === "move" && d.activeY) {
+      const o = d.activeIds[0] ? d.orig.get(d.activeIds[0]) : undefined;
+      if (o) playback.setPreviewToneHz(pitchToHz(clampPitch(o.pitch + (pitchAt(d.curY) - (d.startPitch ?? 0)))));
+    }
     requestRedraw();
   }, [requestRedraw]);
 
@@ -815,6 +945,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             <button key={g.div} className={`snap-toggle vocal-grid-btn${gridDiv === g.div ? " active" : ""}`} onClick={() => setGridDiv(g.div)}>{g.key}</button>
           ))}
         </div>
+        <button className="vocal-icon-btn" title={playing ? t("vocalEditor.stop") : t("vocalEditor.preview")} onClick={() => (playing ? stopPreviewPlay() : startPreviewPlay())}>
+          <svg viewBox="0 0 24 24" width="13" height="13"><path fill="currentColor" d={playing ? "M6 5h4v14H6zM14 5h4v14h-4z" : "M7 5l12 7-12 7z"} /></svg>
+        </button>
         <button className="vocal-icon-btn" title={maximized ? t("vocalEditor.restore") : t("vocalEditor.maximize")} onClick={() => setMaximized((m) => !m)}>
           <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d={maximized ? "M8 8h8v8H8V8zM4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4z" : "M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM6 14v4h4v2H4v-6h2zm12 0h2v6h-6v-2h4v-4z"} /></svg>
         </button>
@@ -873,17 +1006,54 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
 // ── module helpers ──
 
+/** Merge a pitch-paint drag into the segment's pitchDev: each drawn (relTick, absCents) point becomes a
+ *  DELTA vs the AUTOMATIC line (evalF0Cents with pitchDev=undefined — base ⊕ transition + vibrato), and the
+ *  drawn x-span REPLACES that interval of the base curve (SynthV Pencil = interval-replace). Points outside
+ *  the span are kept. Deduped by x (last wins); the store's normalizeCurve does the final rounding/quantize. */
+const PAINT_SMOOTH_PAD = 30; // ticks — PLACEHOLDER "reconnect" distance; the real pitch-smoothing is a future
+// tunable param (§10.4). The painted deviation eases back to 0 (the original pitch) over this pad on each side.
+function paintedDev(
+  notes: Note[],
+  paint: { xs: number[]; ys: number[] },
+  base: PitchCurve | undefined,
+  opts: { tempo: number; defaultTransition: Required<NoteTransition> },
+): PitchCurve {
+  // Each drawn (relTick, absCents) → the DELTA vs the automatic line (pitchDev=undefined); last sample per x.
+  const map = new Map<number, number>();
+  for (let i = 0; i < paint.xs.length; i++) {
+    const x = Math.round(paint.xs[i]!);
+    map.set(x, paint.ys[i]! - evalF0CentsAt(notes, undefined, x, opts).cents);
+  }
+  const dxs = [...map.keys()].sort((a, b) => a - b);
+  const xMin = dxs[0]!, xMax = dxs[dxs.length - 1]!;
+  // OUTSIDE the painted span the deviation returns to 0 (keep the un-edited pitch — §user: "the un-tuned part
+  // stays put; the tuned part follows the edit, then eases smoothly back to the original pitch at the ends").
+  // A pad on each side lets it ease back instead of stepping. Base points outside the padded span are kept.
+  const loA = Math.max(0, xMin - PAINT_SMOOTH_PAD), hiA = xMax + PAINT_SMOOTH_PAD;
+  const merged = new Map<number, number>();
+  if (base) for (let i = 0; i < base.xs.length; i++) {
+    const x = base.xs[i]!;
+    if (x < loA || x > hiA) merged.set(x, base.ys[i]!);
+  }
+  merged.set(loA, 0); // ease-in anchor at the original pitch
+  merged.set(hiA, 0); // ease-out anchor
+  for (const x of dxs) merged.set(x, map.get(x)!); // painted span overrides (incl. an anchor at the same x)
+  const xs = [...merged.keys()].sort((a, b) => a - b);
+  return { xs, ys: xs.map((x) => merged.get(x)!) };
+}
+
 /** Full per-note content signature for the commit diff (mirrors history.ts noteSig, minus id which is the
  *  diff key). ⚠ MUST cover EVERY editable field: commitNotes drops an edit whose sig is unchanged, so a
- *  pitchPoints/vibrato/pitchAuto-only edit (Phase 5) would be SILENTLY lost if the sig omitted them
- *  (silent-regression class). Extended in S50 to unblock Phase-5 pitch writes. */
+ *  transition/vibrato/pitchAuto-only edit would be SILENTLY lost if the sig omitted them (silent-regression
+ *  class). Keep in lockstep with history.ts noteSig. */
 function noteSig(n: Note): string {
-  const pts = (n.pitchPoints ?? []).map((p) => `${p.x},${p.y},${p.shape}`).join(">");
+  const t = n.transition;
+  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}` : "";
   const v = n.vibrato;
-  const vib = v ? `${v.length},${v.period},${v.depth},${v.in},${v.out},${v.shift},${v.drift}` : "";
+  const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
   return (
     `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
-    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${pts}.${vib}`
+    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}`
   );
 }
 

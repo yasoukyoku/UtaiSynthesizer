@@ -8,7 +8,7 @@
 // PURE (no store / no i18n / no async) so it is trivially unit-testable and importable from both the store
 // and the loader without a cycle. The reserved-token / OOV classifier that decides rest/sustain/绿-render
 // is Rust `validate_lyrics` (§9.5) — NOT here; the tie-mirror invariant lands in Phase 6 with render.
-import type { Note, PitchCurve, PitchPoint, VocalTrackParams } from "../types/project";
+import type { Note, PitchCurve, NoteTransition, VocalTrackParams } from "../types/project";
 
 // ── bounds (defensive; valid editor input never trips them, a corrupt file does) ──
 export const PITCH_MIN = 0;
@@ -22,8 +22,25 @@ export const MAX_POINTS_PER_NOTE = 512;
 export const MAX_NOTES_PER_SEGMENT = 100_000;
 export const MAX_CURVE_POINTS = 100_000;
 
-const SHAPES = new Set<PitchPoint["shape"]>(["linear", "sineIn", "sineOut", "sineInOut"]);
 const HUGE = 1e9;
+
+/** Track-level DEFAULT note transition — every field concrete (a note's partial NoteTransition overrides
+ *  per field). This is why every note glides smoothly by default (SynthV, §10.3). */
+export const DEFAULT_TRANSITION = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15 } as const;
+const TRANSITION_KEYS = ["offsetMs", "durLeftMs", "durRightMs", "depthLeftCents", "depthRightCents"] as const;
+const TRANSITION_BOUNDS: Record<(typeof TRANSITION_KEYS)[number], readonly [number, number]> = {
+  offsetMs: [-2000, 2000], durLeftMs: [0, 2000], durRightMs: [0, 2000], depthLeftCents: [-1200, 1200], depthRightCents: [-1200, 1200],
+};
+/** Canonicalize a PARTIAL NoteTransition: keep only finite fields (clamped) in a FIXED key order so a
+ *  per-note override serializes byte-stable; drop non-finite. Empty object if nothing survives (caller omits). */
+function normalizeTransition(t: NoteTransition): NoteTransition {
+  const out: NoteTransition = {};
+  for (const k of TRANSITION_KEYS) {
+    const v = t[k];
+    if (typeof v === "number" && Number.isFinite(v)) out[k] = clampNum(v, TRANSITION_BOUNDS[k][0], TRANSITION_BOUNDS[k][1], 0);
+  }
+  return out;
+}
 
 /** Round to int + clamp to [lo,hi]; a non-finite value falls back (never propagates NaN/Infinity). */
 function clampInt(v: number, lo: number, hi: number, fallback: number): number {
@@ -67,25 +84,20 @@ export function normalizeNote(n: Note): Note {
   };
   if (n.phoneme) out.phoneme = sanitizeText(n.phoneme);
   if (n.detune && Number.isFinite(n.detune)) out.detune = clampNum(n.detune, -DETUNE_CAP, DETUNE_CAP, 0);
-  // Rebuild pitchPoints: drop non-finite, round X→int tick / Y→int cent, coerce a bad shape to "linear",
-  // cap the count, and SORT by x (canonical). The sig reads sub-fields by name (order-independent) but
-  // JSON.stringify preserves key insertion order, so the fixed {x,y,shape} order keeps serialize stable.
-  if (n.pitchPoints && n.pitchPoints.length > 0) {
-    const pts = n.pitchPoints
-      .slice(0, MAX_POINTS_PER_NOTE)
-      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
-      .map((p): PitchPoint => ({ x: Math.round(p.x), y: Math.round(p.y), shape: SHAPES.has(p.shape) ? p.shape : "linear" }))
-      .sort((a, b) => a.x - b.x);
-    if (pts.length > 0) out.pitchPoints = pts;
+  // ② Per-note transition override (SynthV): keep only finite fields (clamped) in fixed key order; all-
+  //    absent → omit entirely (§5 omit-default, so a partial override can't false-dirty).
+  if (n.transition) {
+    const tr = normalizeTransition(n.transition);
+    if (Object.keys(tr).length > 0) out.transition = tr;
   }
+  // ④ Vibrato (SynthV): all fields finite AND a real amplitude (depthCents > 0), else canonicalize to
+  //    ABSENT — a zero-amplitude vibrato and no vibrato must be byte-identical (§5 false-dirty; 审查 #3).
   if (n.vibrato) {
     const v = n.vibrato;
-    if ([v.length, v.period, v.depth, v.in, v.out, v.shift, v.drift].every((x) => Number.isFinite(x))) {
-      // Clamp to sane ranges (§9.8.1) so a hostile/corrupt .usp can't inject unbounded vibrato before the
-      // Phase-5/6 render reads it: length/in/out/shift are fractions [0,1]; period ms (>0); depth/drift cents.
+    if ([v.depthCents, v.freqHz, v.phase, v.startMs, v.easeInMs, v.easeOutMs].every((x) => Number.isFinite(x)) && v.depthCents > 0) {
       out.vibrato = {
-        length: clampNum(v.length, 0, 1, 0), period: clampNum(v.period, 1, 10000, 200), depth: clampNum(v.depth, 0, 2400, 0),
-        in: clampNum(v.in, 0, 1, 0), out: clampNum(v.out, 0, 1, 0), shift: clampNum(v.shift, 0, 1, 0), drift: clampNum(v.drift, -1200, 1200, 0),
+        depthCents: clampNum(v.depthCents, 0, 2400, 0), freqHz: clampNum(v.freqHz, 0.1, 20, 5.5), phase: clampNum(v.phase, -1, 1, 0),
+        startMs: clampNum(v.startMs, 0, 60000, 0), easeInMs: clampNum(v.easeInMs, 0, 10000, 0), easeOutMs: clampNum(v.easeOutMs, 0, 10000, 0),
       };
     }
   }
@@ -145,19 +157,14 @@ export function normalizeCurve(curve: PitchCurve | undefined, kind: "cents" | "p
 }
 
 /**
- * Retime a note by a start delta and a duration delta, rebasing its note-relative `pitchPoints.x` when the
- * START moves (a point at x is relative to the note onset). ONE helper shared by user resize AND the
- * one-note-per-position truncation (§9.5 two-X-origins fix) so both keep pitch shaping aligned. Vibrato
- * span is fraction-based (rides the new duration) so it needs no rebase. Re-normalized on the way out.
+ * Retime a note by a start delta and a duration delta. ONE helper shared by user resize AND the one-note-
+ * per-position truncation (§9.5). SynthV transition/vibrato are keyed in ABSOLUTE ms (NOT note-relative
+ * ticks), so moving/resizing a note needs NO pitch-shape rebase — just clamp tick/duration + re-normalize.
  */
 export function retimeNote(note: Note, dTickStart: number, dDuration: number): Note {
   const tick = Math.max(0, note.tick + dTickStart);
   const duration = Math.max(1, note.duration + dDuration);
-  let pitchPoints = note.pitchPoints;
-  if (pitchPoints && pitchPoints.length > 0 && dTickStart !== 0) {
-    pitchPoints = pitchPoints.map((p) => ({ ...p, x: p.x - dTickStart }));
-  }
-  return normalizeNote({ ...note, tick, duration, pitchPoints });
+  return normalizeNote({ ...note, tick, duration });
 }
 
 /**
@@ -201,10 +208,18 @@ export function resolveOverlaps(notes: Note[], activeIds: Set<string>, minTicks:
  */
 export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrackParams | undefined {
   if (!p || typeof p !== "object") return undefined;
+  const tr = (p.transition && typeof p.transition === "object" ? p.transition : {}) as Partial<NoteTransition>;
   return {
     backend: p.backend === "rvc" ? "rvc" : "sovits",
     speakerId: clampInt(p.speakerId, 0, 76, 49),
     langId: clampInt(p.langId, 0, 6, 2),
     transpose: clampInt(p.transpose, -48, 48, 0),
+    transition: {
+      offsetMs: clampNum(tr.offsetMs ?? NaN, -2000, 2000, DEFAULT_TRANSITION.offsetMs),
+      durLeftMs: clampNum(tr.durLeftMs ?? NaN, 0, 2000, DEFAULT_TRANSITION.durLeftMs),
+      durRightMs: clampNum(tr.durRightMs ?? NaN, 0, 2000, DEFAULT_TRANSITION.durRightMs),
+      depthLeftCents: clampNum(tr.depthLeftCents ?? NaN, -1200, 1200, DEFAULT_TRANSITION.depthLeftCents),
+      depthRightCents: clampNum(tr.depthRightCents ?? NaN, -1200, 1200, DEFAULT_TRANSITION.depthRightCents),
+    },
   };
 }

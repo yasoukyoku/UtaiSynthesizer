@@ -319,6 +319,8 @@
     "grid": "グリッド",
     "maximize": "最大化",
     "restore": "元に戻す",
+    "preview": "試聴",
+    "stop": "停止",
     "close": "閉じる"
   }
 }

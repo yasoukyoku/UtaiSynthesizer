@@ -85,7 +85,7 @@ describe("Phase 3 — undo captures + reverts vocal edits (GATE A/B)", () => {
     expect(useProjectStore.getState().dirty).toBe(false);
   });
 
-  it("captures pitch curves (pitchDev / paramCurves / pitchPoints)", () => {
+  it("captures pitch curves (pitchDev / paramCurves)", () => {
     useProjectStore.getState().setSegmentPitchDev(T, S, { xs: [0, 240], ys: [0, 50] });
     expect(content().pitchDev).toEqual({ xs: [0, 240], ys: [0, 50] });
     expect(useHistoryStore.getState().canUndo).toBe(true);
@@ -102,16 +102,14 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
         {
           id: "n1", tick: 0, duration: 240, pitch: 60, lyric: "か", velocity: 100,
           detune: 30, tie: true, pitchAuto: false, lang: "ja", phonemeInput: "ka",
-          pitchPoints: [
-            { x: -20, y: -100, shape: "sineIn" },
-            { x: 120, y: 0, shape: "linear" },
-          ],
-          vibrato: { length: 0.5, period: 200, depth: 50, in: 0.1, out: 0.1, shift: 0, drift: 0 },
+          transition: { offsetMs: -10, durLeftMs: 120, durRightMs: 50, depthLeftCents: 20, depthRightCents: 10 },
+          vibrato: { depthCents: 50, freqHz: 5.5, phase: 0, startMs: 250, easeInMs: 200, easeOutMs: 200 },
         },
       ],
       { pitchDev: { xs: [0, 240], ys: [0, 50] }, paramCurves: { loudness: { xs: [0, 480], ys: [0, -3] } } },
     ),
-    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2 },
+    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2,
+      transition: { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15 } },
   );
 
   it("preserves vocalParams + all note/curve fields through save→load", () => {
@@ -140,15 +138,18 @@ describe("Phase 3 — no false-dirty (GATE D)", () => {
   });
 
   it("normalizeNote strips default optionals on write (no JSON growth)", () => {
-    // A note added with explicit default values must NOT store them (detune:0 / tie:false → absent).
+    // A note added with explicit default values must NOT store them (detune:0 / tie:false → absent); an
+    // empty transition object and a no-op (zero-amplitude) vibrato canonicalize to absent too.
     useProjectStore.getState().addVocalNote(T, S, {
-      ...plainNote(), id: "n2", tick: 480, pitch: 62, detune: 0, tie: false, pitchAuto: true, pitchPoints: [],
+      ...plainNote(), id: "n2", tick: 480, pitch: 62, detune: 0, tie: false, pitchAuto: true,
+      transition: {}, vibrato: { depthCents: 0, freqHz: 5.5, phase: 0, startMs: 0, easeInMs: 0, easeOutMs: 0 },
     });
     const n2 = notes().find((n) => n.id === "n2")!;
     expect(n2.detune).toBeUndefined();
     expect(n2.tie).toBeUndefined();
     expect(n2.pitchAuto).toBeUndefined();
-    expect(n2.pitchPoints).toBeUndefined();
+    expect(n2.transition).toBeUndefined();
+    expect(n2.vibrato).toBeUndefined();
   });
 
   it("setting a field back to its default returns to the byte-identical baseline", () => {
@@ -171,18 +172,18 @@ describe("Phase 3 — no false-dirty (GATE D)", () => {
     expect(Object.keys(content().paramCurves!)).toEqual(["loudness", "tension"]); // sorted
   });
 
-  it("normalizeNote canonicalizes vibrato/pitchPoints element key order (input order can't false-dirty)", () => {
+  it("normalizeNote canonicalizes vibrato/transition key order (input order can't false-dirty)", () => {
     const P = () => useProjectStore.getState();
-    // same values, NON-canonical key/element order (a future editor might build objects either way)
+    // same values, NON-canonical key order (a future editor might build objects either way)
     P().updateVocalNote(T, S, "n1", {
-      vibrato: { drift: 0, shift: 0, out: 0.1, in: 0.1, depth: 50, period: 200, length: 0.5 },
-      pitchPoints: [{ shape: "linear", y: 0, x: 120 }, { y: -100, shape: "sineIn", x: -20 }],
+      vibrato: { easeOutMs: 200, easeInMs: 200, startMs: 250, phase: 0, freqHz: 5.5, depthCents: 50 },
+      transition: { depthRightCents: 10, depthLeftCents: 20, durRightMs: 50, durLeftMs: 120, offsetMs: -10 },
     });
     const jsonA = buildAutosaveJson("P", P().tracks, 120, [4, 4]);
-    // same values, canonical key/element order
+    // same values, canonical key order
     P().updateVocalNote(T, S, "n1", {
-      vibrato: { length: 0.5, period: 200, depth: 50, in: 0.1, out: 0.1, shift: 0, drift: 0 },
-      pitchPoints: [{ x: -20, y: -100, shape: "sineIn" }, { x: 120, y: 0, shape: "linear" }],
+      vibrato: { depthCents: 50, freqHz: 5.5, phase: 0, startMs: 250, easeInMs: 200, easeOutMs: 200 },
+      transition: { offsetMs: -10, durLeftMs: 120, durRightMs: 50, depthLeftCents: 20, depthRightCents: 10 },
     });
     expect(buildAutosaveJson("P", P().tracks, 120, [4, 4])).toBe(jsonA); // normalized → identical bytes
   });
@@ -263,7 +264,8 @@ describe("Phase 4a — untrusted .usp load boundary (§9.8.1)", () => {
           notes: [
             {
               id: "bad", tick: 1e12, duration: 0, pitch: 999, lyric: badLyric, velocity: 5000, detune: 99999,
-              pitchPoints: [{ x: 5, y: 1e9, shape: "nope" }, { x: 1, y: 0, shape: "linear" }],
+              transition: { durLeftMs: 1e9, depthLeftCents: 1e9, offsetMs: NaN },
+              vibrato: { depthCents: 1e9, freqHz: 1e9, phase: 9, startMs: -5, easeInMs: 1e9, easeOutMs: 1e9 },
             },
             { id: "", tick: 100, duration: 240, pitch: 60, lyric: "x", velocity: 100 }, // id-less → dropped
           ],
@@ -285,8 +287,12 @@ describe("Phase 4a — untrusted .usp load boundary (§9.8.1)", () => {
     expect(b.velocity).toBe(127);
     expect(b.lyric).toBe("abc"); // control/bidi stripped
     expect(b.detune).toBe(1200); // clamped to ±DETUNE_CAP
-    expect(b.pitchPoints!.map((p) => p.x)).toEqual([1, 5]); // sorted by x
-    expect(b.pitchPoints!.every((p) => ["linear", "sineIn", "sineOut", "sineInOut"].includes(p.shape))).toBe(true);
+    expect(b.transition!.durLeftMs).toBe(2000); // 1e9 → clamped [0,2000]
+    expect(b.transition!.depthLeftCents).toBe(1200); // 1e9 → clamped [-1200,1200]
+    expect(b.transition!.offsetMs).toBeUndefined(); // NaN dropped (finite-only, canonical)
+    expect(b.vibrato!.depthCents).toBe(2400); // 1e9 → clamped [0,2400]
+    expect(b.vibrato!.freqHz).toBe(20); // 1e9 → clamped [0.1,20]
+    expect(b.vibrato!.phase).toBe(1); // 9 → clamped [-1,1]
 
     const vp = loaded.tracks[0]!.vocalParams!;
     expect(vp.backend).toBe("sovits"); // "evil" → default

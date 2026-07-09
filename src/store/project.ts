@@ -13,7 +13,7 @@ import type {
   VocalTrackParams,
 } from "../types/project";
 import { TimeAxis } from "../lib/timeAxis";
-import { normalizeNotesArray, normalizeCurve } from "../lib/vocalNotes";
+import { normalizeNotesArray, normalizeCurve, DEFAULT_TRANSITION } from "../lib/vocalNotes";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
   laneGroupName,
@@ -49,7 +49,7 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 // ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
 
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
-const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0 };
+const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, transition: { ...DEFAULT_TRANSITION } };
 
 // `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
 // live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;

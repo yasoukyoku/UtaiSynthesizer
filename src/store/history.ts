@@ -107,13 +107,14 @@ function curveSig(c?: PitchCurve): string {
  *  defaults, so a note that never gained a `detune` and one whose `detune` returned to 0 are the same edit
  *  (no phantom undo step / no false-dirty). Order is fixed; arrays serialize in element order. */
 function noteSig(n: Note): string {
-  const pts = (n.pitchPoints ?? []).map((p) => `${p.x},${p.y},${p.shape}`).join(">");
+  const t = n.transition;
+  const tr = t ? `${t.offsetMs ?? ""}|${t.durLeftMs ?? ""}|${t.durRightMs ?? ""}|${t.depthLeftCents ?? ""}|${t.depthRightCents ?? ""}` : "";
   const v = n.vibrato;
-  const vib = v ? `${v.length},${v.period},${v.depth},${v.in},${v.out},${v.shift},${v.drift}` : "";
+  const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
   return (
     `${n.id}.${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
     `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}` +
-    `.${pts}.${vib}`
+    `.${tr}.${vib}`
   );
 }
 
@@ -130,7 +131,10 @@ function contentSig(c: SegmentContent): string {
 
 /** Deterministic signature of a track's vocal params (undoable, like voiceModel). */
 function vocalParamsSig(p?: VocalTrackParams): string {
-  return p ? `${p.backend},${p.speakerId},${p.langId},${p.transpose}` : "";
+  if (!p) return "";
+  const t = p.transition;
+  const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents}` : "";
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${tr}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

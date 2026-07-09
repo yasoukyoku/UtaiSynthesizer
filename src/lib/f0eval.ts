@@ -1,21 +1,26 @@
-// ② Vocal pitch — evalF0Cents, THE single f0 evaluator (S50 Phase-5 foundation, §10, Option A).
+// ② Vocal pitch — evalF0Cents, THE single f0 evaluator (S51 SynthV-aligned rewrite, §10.3, Option A).
 // One source of truth for the sounding pitch line, feeding: the editor OVERLAY draw + the light PREVIEW
 // oscillator (→ centsToHz) + (Phase 6) the Rust render array. Option A = TS computes this array and Rust
-// consumes it (+transpose → Hz → resample), so "what you see == hear == render" holds by construction —
-// no two-port drift. Returns WRITTEN-pitch cents (transpose is applied ONLY in the Rust render, §9.3).
+// consumes it (+transpose → Hz → resample), so "what you see == hear == render" holds by construction.
+// Returns WRITTEN-pitch cents (transpose is applied ONLY in the Rust render, §9.3).
 //
-// ⚠ FOUNDATION SCOPE (S50): the layer STRUCTURE + the certain layers (base / pitchPoints within a note /
-// pitchDev) are solid; the vibrato constants + the CROSS-note-boundary pre-onset slide (a pitchPoint x<0
-// rendering into the previous note's tail) are distilled from OpenUTAU semantics but NOT verified against
-// OpenUTAU source — VERIFY + thread neighbor context before freezing the composed golden-vector gate
-// (§10.2). See lib/interpolateShape.ts for the easings.
-import type { Note, PitchCurve } from "../types/project";
-import { evalPitchPoints } from "./interpolateShape";
-import { ticksToMs } from "./audio/laneOps";
+// LAYERS (SynthV two-level add, §10.3):
+//   ① base staircase — the covering note's tone*100 + detune.
+//   ② note-to-note TRANSITION — a smooth glide across a boundary (SynthV durLeft/durRight + depth overshoot)
+//      that OVERRIDES the staircase inside the transition span (interval-replace, NOT additive — avoids
+//      double-counting the step). Times are ABSOLUTE ms so a glide sounds the same at any tempo.
+//   ③ Pitch Deviation — hand-drawn segment-relative cents curve — ADDITIVE.
+//   ④ Vibrato — mid/tail LFO (SynthV freqHz/depthCents/start/ease/phase) — ADDITIVE.
+// Pure. Notes MUST be tick-sorted (normalizeNotesArray); the overlay sorts its live-preview array too.
+import type { Note, PitchCurve, NoteTransition } from "../types/project";
+import { interpShape } from "./interpolateShape";
+import { ticksToMs, msToTicks } from "./audio/laneOps";
 
 export interface F0EvalOpts {
-  /** Tempo (BPM) — vibrato period is in ms, so tick↔ms needs it. */
+  /** Tempo (BPM) — transition/vibrato times are ABSOLUTE ms, so ms↔tick needs it. */
   tempo: number;
+  /** Track-level DEFAULT transition (VocalTrackParams.transition); a note's partial transition overrides it. */
+  defaultTransition: Required<NoteTransition>;
 }
 
 /** Linear-interpolate a PitchCurve (parallel strictly-increasing xs / ys) at `x`; hold flat outside; 0 if empty. */
@@ -33,41 +38,95 @@ function evalCurveAt(c: PitchCurve | undefined, x: number): number {
 }
 
 /** Index of the note covering segment-relative `relTick` (half-open [tick, tick+duration)); -1 = rest.
- *  Notes are tick-sorted (normalizeNotesArray) → a linear scan suits editor note counts (binary search is
- *  a trivial later optimization). Returns the LAST match so an abutting note's onset wins over the prior end. */
+ *  Full linear scan returning the LAST match (no early break) so an unsorted live-preview array can't drop a
+ *  note into a false rest-gap (审查 #2); on the sorted array the last match = the higher-onset note, so an
+ *  abutting note's onset correctly wins over the prior note's end. */
 function findNoteAt(notes: readonly Note[], relTick: number): number {
   let found = -1;
   for (let i = 0; i < notes.length; i++) {
     const n = notes[i]!;
     if (relTick >= n.tick && relTick < n.tick + n.duration) found = i;
-    else if (n.tick > relTick) break; // sorted → no later note can cover an earlier tick
   }
   return found;
 }
 
-/** ④ Vibrato tail LFO (OpenUTAU UVibrato semantics; ⚠ verify vs OpenUTAU before freezing golden vectors).
- *  Tail-anchored to the last `length` fraction of the note: depth cents, period ms, in/out linear fade
- *  fractions of the span, shift phase (cycles), drift cents linear across the span. */
+/** Note's WRITTEN base pitch in cents (tone + fine detune). */
+const noteCents = (n: Note): number => n.pitch * 100 + (n.detune ?? 0);
+
+/** Effective transition for a note = track default ⊕ per-note override (per field). */
+function effTransition(n: Note, def: Required<NoteTransition>): Required<NoteTransition> {
+  const t = n.transition;
+  if (!t) return def;
+  return {
+    offsetMs: t.offsetMs ?? def.offsetMs,
+    durLeftMs: t.durLeftMs ?? def.durLeftMs,
+    durRightMs: t.durRightMs ?? def.durRightMs,
+    depthLeftCents: t.depthLeftCents ?? def.depthLeftCents,
+    depthRightCents: t.depthRightCents ?? def.depthRightCents,
+  };
+}
+
+// Overshoot bumps: 0 at both ends (s=0,1) so the transition still lands exactly on each note's tone; the
+// peak is biased toward the arriving end (→1) / departing end (→0). This is OUR clean design (手感 aligned
+// with SynthV's "slight overshoot on landing", not a bit-for-bit port).
+const arriveBump = (s: number): number => Math.sin(Math.PI * s * s); // peak ≈ s=0.707 (toward B)
+const departBump = (s: number): number => Math.sin(Math.PI * (1 - s) * (1 - s)); // peak ≈ s=0.293 (toward A)
+
+/**
+ * The single cross-boundary transition curve A→B evaluated at `relTick`, or null if `relTick` is outside the
+ * transition span or the two notes are too far apart to connect (gap > LEGATO). The span is
+ * [A.end − durRight(A), B.start + durLeft(B)] (each side clamped to half its own note so short notes don't
+ * overrun), centred on the boundary: a sineInOut glide A.tone→B.tone + signed depth overshoot at each end.
+ */
+function crossCents(A: Note, B: Note, relTick: number, opts: F0EvalOpts): number | null {
+  // Only ABUTTING notes glide (B starts exactly where A ends). A short-GAP legato glide (承前元音) needs a
+  // carrier in the gap, which is Phase-6 render territory (§3.4); drawing a glide over an uncovered gap would
+  // leave a broken "half-slide + silent hole", so until then each note holds flat to its own edge.
+  if (B.tick !== A.tick + A.duration) return null;
+  const tA = effTransition(A, opts.defaultTransition);
+  const tB = effTransition(B, opts.defaultTransition);
+  const durR = Math.min(msToTicks(tA.durRightMs, opts.tempo), A.duration / 2); // A leaves early, ≤ half of A
+  const durL = Math.min(msToTicks(tB.durLeftMs, opts.tempo), B.duration / 2); // B arrives late, ≤ half of B
+  // SynthV Offset shifts the crossover in time (B owns the seam); CLAMP it so the glide always straddles the
+  // boundary — a larger offset would detach the glide from the note edge and jump discontinuously.
+  const off = Math.max(-durL, Math.min(durR, msToTicks(tB.offsetMs, opts.tempo)));
+  const t0 = A.tick + A.duration - durR + off;
+  const t1 = B.tick + durL + off;
+  const span = t1 - t0;
+  if (span <= 0 || relTick < t0 || relTick > t1) return null; // durLeft=durRight=0 → pure staircase (parity)
+  const cA = noteCents(A), cB = noteCents(B);
+  const s = (relTick - t0) / span;
+  const base = cA + (cB - cA) * interpShape(s, "sineInOut");
+  // Overshoot follows the GLIDE DIRECTION: an up-glide overshoots above the target, a down-glide below; a
+  // SAME-pitch seam (dir 0) gets NO bump, so a sustained/tie seam stays flat (审查 #2/#4).
+  const dir = Math.sign(cB - cA);
+  return base + dir * (tA.depthRightCents * departBump(s) + tB.depthLeftCents * arriveBump(s));
+}
+
+/** ④ Vibrato (SynthV): starts after `startMs` (short notes stay flat), oscillates at `freqHz` with `phase`
+ *  offset and `depthCents` amplitude, linearly faded in/out over `easeIn/easeOut` ms of the active span. */
 function evalVibrato(note: Note, noteRel: number, tempo: number): number {
   const v = note.vibrato!;
-  const dur = note.duration;
-  if (v.length <= 0 || dur <= 0 || v.period <= 0) return 0;
-  const p = noteRel / dur; // note-normalized position [0,1]
-  const nStart = 1 - v.length; // vibrato span starts here
-  if (p < nStart) return 0; // before the span → no vibrato
-  const inSpan = (p - nStart) / v.length; // [0,1] within the span
-  const elapsedMs = ticksToMs((p - nStart) * dur, tempo);
-  const base = v.depth * Math.sin(2 * Math.PI * (elapsedMs / v.period + v.shift));
+  if (v.depthCents <= 0 || v.freqHz <= 0) return 0;
+  const startTicks = msToTicks(v.startMs, tempo);
+  const activeTicks = note.duration - startTicks; // vibrato-active span [start, note end]
+  const inSpan = noteRel - startTicks;
+  if (inSpan < 0 || activeTicks <= 0) return 0; // before onset delay / no room
+  const elapsedMs = ticksToMs(inSpan, tempo);
+  const amp = v.depthCents * Math.sin(2 * Math.PI * ((elapsedMs / 1000) * v.freqHz + v.phase));
+  const easeIn = msToTicks(v.easeInMs, tempo);
+  const easeOut = msToTicks(v.easeOutMs, tempo);
   let env = 1;
-  if (v.in > 0 && inSpan < v.in) env = inSpan / v.in; // linear fade-in
-  if (v.out > 0 && inSpan > 1 - v.out) env = Math.min(env, (1 - inSpan) / v.out); // linear fade-out
-  return base * env + v.drift * inSpan; // drift = slow linear pitch drift across the span
+  if (easeIn > 0 && inSpan < easeIn) env = inSpan / easeIn; // fade-in
+  const remain = activeTicks - inSpan; // ticks to the note end
+  if (easeOut > 0 && remain < easeOut) env = Math.min(env, remain / easeOut); // fade-out
+  return amp * Math.max(0, env);
 }
 
 /**
- * ★ evalF0Cents at one segment-relative tick → { WRITTEN-pitch cents, voiced }. Layered (§3.2):
- *   ① base = note.pitch*100 + detune   ② pitchPoints transition   ③ pitchDev additive   ④ vibrato.
- * A rest (no note) → voiced:false (the overlay breaks the line; the Rust render's uv=(f0<30) mirrors it).
+ * ★ evalF0Cents at one segment-relative tick → { WRITTEN-pitch cents, voiced }. Layered per §10.3
+ * (① base staircase / ② transition interval-replace / ③ pitchDev additive / ④ vibrato additive).
+ * A rest (no covering note) → voiced:false (the overlay breaks the line; Rust render mirrors via the mask).
  */
 export function evalF0CentsAt(
   notes: readonly Note[],
@@ -75,15 +134,19 @@ export function evalF0CentsAt(
   relTick: number,
   opts: F0EvalOpts,
 ): { cents: number; voiced: boolean } {
-  const dev = evalCurveAt(pitchDev, relTick); // ③ (segment-relative; applies over rests too, but they're unvoiced)
+  const dev = evalCurveAt(pitchDev, relTick); // ③ (segment-relative; also over rests, but they're unvoiced)
   const idx = findNoteAt(notes, relTick);
   if (idx < 0) return { cents: dev, voiced: false };
   const note = notes[idx]!;
-  const noteRel = relTick - note.tick;
-  let cents = note.pitch * 100 + (note.detune ?? 0); // ①
-  if (note.pitchPoints && note.pitchPoints.length > 0) cents += evalPitchPoints(note.pitchPoints, noteRel); // ②
-  cents += dev;
-  if (note.vibrato) cents += evalVibrato(note, noteRel, opts.tempo); // ④
+  // ② transition OVERRIDES the staircase in its span: try the incoming (prev→note) then outgoing (note→next)
+  //    boundary; the half-note clamps keep the two spans from overlapping inside the note, so at most one
+  //    applies. (Neighbor selection notes[idx±1] relies on tick-sorted input, as findNoteAt does.)
+  let cents: number | null = null;
+  if (idx > 0) cents = crossCents(notes[idx - 1]!, note, relTick, opts);
+  if (cents === null && idx < notes.length - 1) cents = crossCents(note, notes[idx + 1]!, relTick, opts);
+  if (cents === null) cents = noteCents(note); // ① stable staircase
+  cents += dev; // ③
+  if (note.vibrato) cents += evalVibrato(note, relTick - note.tick, opts.tempo); // ④
   return { cents, voiced: true };
 }
 

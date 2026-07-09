@@ -319,6 +319,8 @@
     "grid": "Grid",
     "maximize": "Maximize",
     "restore": "Restore",
+    "preview": "Preview",
+    "stop": "Stop",
     "close": "Close"
   }
 }
