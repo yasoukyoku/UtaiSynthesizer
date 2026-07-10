@@ -666,6 +666,7 @@ pub fn run() {
             commands::inference::cancel_voice,
             commands::inference::detect_f0,
             commands::inference::get_default_vocoder_info,
+            commands::import::import_score_file,
             commands::project::save_project_archive,
             commands::project::open_project_archive,
             commands::project::prune_usp_work,

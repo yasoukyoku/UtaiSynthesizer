@@ -10,7 +10,12 @@
     "new": "New",
     "open": "Open",
     "save": "Save",
-    "saveAs": "Save As"
+    "saveAs": "Save As",
+    "import": "Import"
+  },
+  "import": {
+    "done": "Imported",
+    "empty": "No importable notes found"
   },
   "project": {
     "discardTitle": "Unsaved Changes",

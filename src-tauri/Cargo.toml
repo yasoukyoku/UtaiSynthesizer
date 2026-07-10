@@ -49,6 +49,10 @@ tar = "0.4"
 zstd = "0.13"
 rand = "0.8"
 rand_distr = "0.4"
+# S56 score import: ustx (YAML) / ust (INI, Shift-JIS legacy) / midi (binary SMF) → 人声轨
+serde_yaml_ng = "0.10"
+midly = "0.5"
+encoding_rs = "0.8"
 utai-dsp = { path = "crates/utai-dsp" }
 
 # Windows-only: disable WebView2 browser-accelerator keys (Ctrl+F/P, F5/F7, zoom, reload…) natively — a

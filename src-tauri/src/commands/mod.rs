@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod audition;
+pub mod import;
 pub mod inference;
 pub mod logs;
 pub mod models;

@@ -6,6 +6,7 @@ import { useTrainingStore } from "../../store/training";
 import { useTranslation } from "react-i18next";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs } from "../../lib/project/projectFile";
+import { importScoreFile } from "../../lib/vocal/import";
 import "./Titlebar.css";
 
 export function Titlebar() {
@@ -27,6 +28,7 @@ export function Titlebar() {
     { label: t("menu.open"), shortcut: "Ctrl+O", onClick: () => void openProjectFile() },
     { label: t("menu.save"), shortcut: "Ctrl+S", disabled: trackCount === 0, onClick: () => void saveProjectFile() },
     { label: t("menu.saveAs"), shortcut: "Ctrl+Shift+S", disabled: trackCount === 0, onClick: () => void saveProjectFileAs() },
+    { label: t("menu.import"), onClick: () => void importScoreFile() },
   ];
 
   const editItems: MenuItem[] = [

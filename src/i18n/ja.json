@@ -10,7 +10,12 @@
     "new": "新規",
     "open": "開く",
     "save": "保存",
-    "saveAs": "名前を付けて保存"
+    "saveAs": "名前を付けて保存",
+    "import": "インポート"
+  },
+  "import": {
+    "done": "インポート完了",
+    "empty": "インポート可能なノートが見つかりません"
   },
   "project": {
     "discardTitle": "未保存の変更",

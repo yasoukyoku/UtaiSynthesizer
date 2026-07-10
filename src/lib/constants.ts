@@ -27,6 +27,11 @@ export const OUTPUT_NODE_COLOR = "#f59e0b";
 export const AUDIO_EXTENSIONS = ["wav", "mp3", "flac", "ogg", "aac", "m4a", "webm", "opus", "wma"];
 export const AUDIO_EXT_RE = new RegExp(`\\.(${AUDIO_EXTENSIONS.join("|")})$`, "i");
 
+/** Score/notation formats the "导入 / Import" File-menu action accepts — ONE source of truth for the
+ *  native dialog filter (src/lib/vocal/import.ts). ust/ustx are 480-ppq (1:1 with our resolution); midi
+ *  is scaled from its header PPQ. The Rust `import_score_file` command dispatches on this same set. */
+export const SCORE_EXTENSIONS = ["ustx", "ust", "mid", "midi"];
+
 /** Volume-fader floor (dB). The BOTTOM of a volume fader means −∞/MUTE (the universal DAW convention:
  *  bounded upward, unbounded downward) — dbToLinear maps any value at/below this to gain 0, and the
  *  fader tooltip shows "-∞ dB" there. The STORED volumeDb stays at this finite floor (−Infinity does

@@ -10,7 +10,12 @@
     "new": "新建",
     "open": "打开",
     "save": "保存",
-    "saveAs": "另存为"
+    "saveAs": "另存为",
+    "import": "导入"
+  },
+  "import": {
+    "done": "已导入",
+    "empty": "未找到可导入的音符"
   },
   "project": {
     "discardTitle": "未保存的更改",
