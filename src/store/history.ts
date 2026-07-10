@@ -126,7 +126,7 @@ function noteSig(n: Note): string {
   );
 }
 
-function contentSig(c: SegmentContent): string {
+export function contentSig(c: SegmentContent): string {
   if (c.type === "audioClip") return `a:${c.sourcePath}:${c.offsetMs}:${c.totalDurationMs}`;
   const notes = c.notes.map(noteSig).join("|");
   const dev = curveSig(c.pitchDev);
@@ -147,7 +147,7 @@ function sigOpts(o?: Record<string, unknown>): string {
     .map((k) => `${k}=${JSON.stringify(o[k])}`)
     .join(",");
 }
-function vocalParamsSig(p?: VocalTrackParams): string {
+export function vocalParamsSig(p?: VocalTrackParams): string {
   if (!p) return "";
   const t = p.transition;
   const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents},${t.openEdgeCents}` : "";

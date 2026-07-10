@@ -323,6 +323,8 @@
     "stop": "停止",
     "close": "关闭",
     "sidebar": {
+      "tabSinger": "歌手",
+      "tabPitch": "调教",
       "voice": "歌手 / 渲染",
       "transpose": "移调",
       "pickVoice": "选择歌手…",
@@ -369,7 +371,9 @@
       "noVoice": "请先选择歌手模型",
       "empty": "没有音符可渲染",
       "failed": "渲染失败",
-      "busy": "已有渲染进行中，请稍候"
+      "busy": "已有渲染进行中，请稍候",
+      "autoRendering": "渲染改动的人声轨…",
+      "autoRenderingCancel": "再次点击取消渲染"
     }
   }
 }

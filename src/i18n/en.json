@@ -323,6 +323,8 @@
     "stop": "Stop",
     "close": "Close",
     "sidebar": {
+      "tabSinger": "Singer",
+      "tabPitch": "Tuning",
       "voice": "Voice / Render",
       "transpose": "Transpose",
       "pickVoice": "Pick a singer…",
@@ -369,7 +371,9 @@
       "noVoice": "Pick a voice model first",
       "empty": "No notes to render",
       "failed": "Render failed",
-      "busy": "A render is already in progress"
+      "busy": "A render is already in progress",
+      "autoRendering": "Rendering changed vocal tracks…",
+      "autoRenderingCancel": "Click again to cancel"
     }
   }
 }

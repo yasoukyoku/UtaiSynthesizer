@@ -11,7 +11,7 @@
 // Sliders reuse VolumeFader (the one gesture-bracketed fader — TrackList uses the same begin/commitTransaction
 // pattern); a drag = ONE undo step. effTransition is imported (not re-derived) so the shown effective value ==
 // what f0eval evaluates. All strings go through i18n.
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
@@ -76,6 +76,9 @@ interface Props {
 
 export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTransition, vocalParams, voiceModel, onRender, rendering }: Props) {
   const { t, i18n } = useTranslation();
+  // SynthV-style tabs: "singer" = voice + tone/quality; "pitch" = pitch tuning. Splits the (previously long)
+  // single scroll into two focused panels; the Render action is a pinned footer visible on both.
+  const [tab, setTab] = useState<"singer" | "pitch">("singer");
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const updateTrack = useProjectStore((s) => s.updateTrack);
@@ -148,8 +151,17 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
 
   return (
     <div className="vocal-sidebar">
-      {/* ⓪ track · VOICE + render — ONE unified singer list (SoVITS + RVC); the picked model's TYPE drives
-          the backend automatically. Then bake the notes to singing; the stem plays as a deposited overlay. */}
+      {/* Two tabs (SynthV-style): 歌手 = singer + tone/quality; 调教 = pitch tuning. The Render action is a
+          pinned footer, visible on both tabs. */}
+      <div className="vsb-tabs">
+        <button className={tab === "singer" ? "active" : ""} onClick={() => setTab("singer")}>{t("vocalEditor.sidebar.tabSinger")}</button>
+        <button className={tab === "pitch" ? "active" : ""} onClick={() => setTab("pitch")}>{t("vocalEditor.sidebar.tabPitch")}</button>
+      </div>
+      <div className="vsb-body">
+      {tab === "singer" ? (
+      <>
+      {/* ⓪ track · VOICE — ONE unified singer list (SoVITS + RVC); the picked model's TYPE drives the
+          backend automatically. */}
       <div className="vsb-section">
         <div className="vsb-head">
           <span>{t("vocalEditor.sidebar.voice")}</span>
@@ -197,13 +209,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
           />
         </div>
-        <button
-          className="snap-toggle vsb-render"
-          disabled={rendering || !selectedVoice || notes.length === 0}
-          onClick={onRender}
-        >
-          {rendering ? t("vocalEditor.render.rendering") : t("vocalEditor.render.render")}
-        </button>
       </div>
 
       {/* ⓪.5 音质 (Item-1): the singer's quality knobs — SoVITS = cluster + shallow diffusion + NSF
@@ -262,7 +267,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           </>
         )}
       </div>
-
+      </>
+      ) : (
+      <>
       {/* ① selected-note transition override (glide / portamento between notes) */}
       <div className="vsb-section">
         <div className="vsb-head">
@@ -334,6 +341,19 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(v) => setVocalParams(trackId, { transition: { ...trackTransition, [f.key]: v } })}
           />
         ))}
+      </div>
+      </>
+      )}
+      </div>
+      {/* pinned footer — the Render action is needed regardless of tab (bake without playing / re-bake). */}
+      <div className="vsb-foot">
+        <button
+          className="snap-toggle vsb-render"
+          disabled={rendering || !selectedVoice || notes.length === 0}
+          onClick={onRender}
+        >
+          {rendering ? t("vocalEditor.render.rendering") : t("vocalEditor.render.render")}
+        </button>
       </div>
     </div>
   );

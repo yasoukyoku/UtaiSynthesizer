@@ -1,10 +1,13 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore, useTimeAxis } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
+import { useWorkflowStore } from "../../store/workflow";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
+import { collectDirtyVocals, renderDirtyVocals } from "../../lib/vocal/vocalRender";
 import type { TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece, liveSelectedLane } from "../../lib/laneEdit";
@@ -23,7 +26,7 @@ export function Toolbar() {
   const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature, tracks } =
     useProjectStore();
   const timeAxis = useTimeAxis();
-  const { isPlaying, setPlaying, audioFiles, seeking, scheduleVersion } = useAudioStore();
+  const { isPlaying, setPlaying, seeking, scheduleVersion } = useAudioStore();
   const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
   const { splitSegment, deleteSegments } = useProjectStore();
   // ② A notes (vocal) segment can't be split (§9.6) — the Split button is disabled for it. Delete stays
@@ -177,6 +180,12 @@ export function Toolbar() {
   }, [scheduleVersion]);
 
   const playPendingRef = useRef(false);
+  // ② Auto-render-on-Play (S55): while the pre-play batch of changed vocal tracks bakes, the play button
+  // shows a "rendering" state and a second press CANCELS it (renders can be long). abortRef flips on that
+  // second press; renderingRef gates the button into cancel-mode; the local state drives the pulse class.
+  const autoRenderingRef = useRef(false);
+  const autoRenderAbortRef = useRef(false);
+  const [autoRendering, setAutoRendering] = useState(false);
   const handleTogglePlay = async () => {
     if (isPlaying) {
       animatingRef.current = false;
@@ -184,21 +193,58 @@ export function Toolbar() {
       setPlaying(false);
       return;
     }
+    // A second Play/Space press WHILE the pre-play auto-render runs → cancel the batch and DON'T start
+    // playback. cancel_voice aborts the in-flight GPU render; renderDirtyVocals bails between/within items.
+    if (autoRenderingRef.current) {
+      autoRenderAbortRef.current = true;
+      void invoke("cancel_voice").catch(() => {});
+      return;
+    }
 
     if (playPendingRef.current) return;
     playPendingRef.current = true;
 
     try {
+      // Bake vocal tracks whose notes/params CHANGED since their last render (skip unchanged — the v1
+      // render-on-play convenience). Skipped entirely when nothing is dirty (zero added latency), or when a
+      // workflow (audio-clip) render is running — its SVC node shares the Rust voice guard, so starting a
+      // vocal render would cross-kill it (better to play with the existing bakes than break that render).
+      const dirty = collectDirtyVocals(tempo);
+      const workflowBusy = Object.values(useWorkflowStore.getState().executions).some((e) => e?.status === "running");
+      if (dirty.length > 0 && !workflowBusy) {
+        autoRenderAbortRef.current = false;
+        autoRenderingRef.current = true;
+        setAutoRendering(true);
+        useAppStore.getState().showToast(t("vocalEditor.render.autoRendering"), "info");
+        try {
+          await renderDirtyVocals(dirty, tempo, t("vocalEditor.render.laneLabel"), {
+            shouldCancel: () => autoRenderAbortRef.current,
+          });
+        } finally {
+          autoRenderingRef.current = false;
+          setAutoRendering(false);
+        }
+        if (autoRenderAbortRef.current) return; // user cancelled the batch → don't start playback
+      }
+
+      // Read FRESH state — a bake just deposited (it changes what plays / the content extent), and the
+      // playhead / tempo may have changed during the await. tempo MUST be fresh too: the playhead-advance
+      // effect uses the reactive (post-await) tempo, so scheduling with the stale closure tempo would
+      // desync the audio from the playhead if the user edited BPM mid-render.
+      const st = useProjectStore.getState();
+      const freshTracks = st.tracks;
+      const ph = st.playheadTick;
+      const freshTempo = st.tempo;
       // If the playhead is at/after the end of all content, restart from the beginning (rather than
       // starting at the end with nothing to play → instant auto-pause flicker).
-      const end = contentEndTick(tracks);
-      const startTick = end > 0 && playheadTick >= end ? 0 : playheadTick;
-      if (startTick !== playheadTick) setPlayhead(startTick);
+      const end = contentEndTick(freshTracks);
+      const startTick = end > 0 && ph >= end ? 0 : ph;
+      if (startTick !== ph) setPlayhead(startTick);
       const result = await playback.playAllTracks(
-        tracks,
-        audioFiles,
+        freshTracks,
+        useAudioStore.getState().audioFiles,
         startTick,
-        tempo,
+        freshTempo,
         onPlaybackEnded,
       );
       if (result === "started") {
@@ -328,8 +374,9 @@ export function Toolbar() {
           <span className="transport-icon icon-return" />
         </button>
         <button
-          className={`transport-btn play ${isPlaying ? "playing" : ""}`}
+          className={`transport-btn play ${isPlaying ? "playing" : ""} ${autoRendering ? "rendering" : ""}`}
           onClick={handleTogglePlay}
+          title={autoRendering ? t("vocalEditor.render.autoRenderingCancel") : undefined}
         >
           {isPlaying
             ? <span className="transport-icon icon-pause" />

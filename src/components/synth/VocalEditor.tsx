@@ -15,8 +15,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { buildVocalScore, renderVocalSegment, VOCAL_RENDER_BUSY } from "../../lib/vocal/vocalRender";
-import { RVC_DEFAULTS, SOVITS_DEFAULTS } from "../../lib/workflow/voiceDefaults";
+import { renderVocalPart, VOCAL_RENDER_BUSY, VOCAL_NO_VOICE, VOCAL_EMPTY } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
@@ -135,43 +134,21 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // path). The SVC voice/backend/transpose/speaker come from the track's vocalParams + voiceModel (sidebar).
   const render = useCallback(async () => {
     if (!part) return;
-    const vp = part.vocalParams;
-    const entry = useVoiceModelStore.getState().models[vp.backend].find((m) => m.name === part.voiceModel);
-    if (!entry) {
-      useAppStore.getState().showToast(t("vocalEditor.render.noVoice"), "error");
-      return;
-    }
-    const { triples, f0Cents, f0Voiced } = buildVocalScore(part.notes, part.pitchDev, tempoRef.current, transitionRef.current, vp.breathToken ?? "AP");
-    if (triples.length === 0) {
-      useAppStore.getState().showToast(t("vocalEditor.render.empty"), "error");
-      return;
-    }
+    // Resolve the live Track + Segment and delegate to the ONE shared render path (renderVocalPart) — the
+    // SAME code the Play-time auto-render batch runs, so the manual button and auto-render can never drift.
+    const track = useProjectStore.getState().tracks.find((tr) => tr.id === part.trackId);
+    const seg = track?.segments.find((s) => s.id === segmentId);
+    if (!track || !seg) return;
     try {
-      await renderVocalSegment({
-        trackId: part.trackId,
-        segmentId,
-        laneLabel: t("vocalEditor.render.laneLabel"),
-        voiceName: entry.name,
-        modelPath: entry.path,
-        triples,
-        f0Cents,
-        f0Voiced,
-        options: {
-          backend: vp.backend,
-          cv_speaker_id: vp.speakerId,
-          lang_id: vp.langId,
-          transpose: vp.transpose,
-          // full backend contracts = defaults overlaid with the track's quality overrides (Item-1).
-          sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
-          rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
-        },
-      });
+      await renderVocalPart(track, seg, tempoRef.current, t("vocalEditor.render.laneLabel"));
     } catch (e) {
       const msg = String(e);
-      useAppStore.getState().showToast(
-        msg.includes(VOCAL_RENDER_BUSY) ? t("vocalEditor.render.busy") : `${t("vocalEditor.render.failed")}: ${msg}`,
-        "error",
-      );
+      const toast =
+        msg.includes(VOCAL_NO_VOICE) ? t("vocalEditor.render.noVoice")
+        : msg.includes(VOCAL_EMPTY) ? t("vocalEditor.render.empty")
+        : msg.includes(VOCAL_RENDER_BUSY) ? t("vocalEditor.render.busy")
+        : `${t("vocalEditor.render.failed")}: ${msg}`;
+      useAppStore.getState().showToast(toast, "error");
     }
   }, [part, segmentId, t]);
 

@@ -323,6 +323,8 @@
     "stop": "停止",
     "close": "閉じる",
     "sidebar": {
+      "tabSinger": "歌手",
+      "tabPitch": "調教",
       "voice": "ボイス / 合成",
       "transpose": "移調",
       "pickVoice": "歌手を選択…",
@@ -369,7 +371,9 @@
       "noVoice": "先にボイスモデルを選択してください",
       "empty": "合成する音符がありません",
       "failed": "合成に失敗しました",
-      "busy": "他の合成を実行中です"
+      "busy": "他の合成を実行中です",
+      "autoRendering": "変更した人声トラックを合成中…",
+      "autoRenderingCancel": "もう一度で中止"
     }
   }
 }

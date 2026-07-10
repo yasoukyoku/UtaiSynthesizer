@@ -82,6 +82,12 @@ export interface ProcessedOutput {
   /** True while an Output-node deposit is decoding this lane's audio — the track renders a loading
    *  placeholder (same look as an audio import) until the real waveform is merged in. */
   loading?: boolean;
+  /** ② Vocal bake ONLY: the render-input signature (notes+pitchDev+params+voice+tempo) this stem was
+   *  baked from — set on the ② vocal lane's deposit (vocalRenderSig). Lets "auto-render changed tracks on
+   *  Play" skip a segment whose bake still matches. Overlay-only (excluded from the history meaningfulSig,
+   *  like the rest of processedOutputs) so it never causes false-dirty / a phantom undo step; it rides the
+   *  `.usp` with the bake so a reloaded project doesn't needlessly re-render on first Play. */
+  renderedSig?: string;
 }
 
 export interface Segment {
