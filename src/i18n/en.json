@@ -323,6 +323,11 @@
     "stop": "Stop",
     "close": "Close",
     "sidebar": {
+      "voice": "Voice / Render",
+      "transpose": "Transpose",
+      "pickVoice": "Pick a singer…",
+      "noVoiceModel": "No voice models",
+      "goImport": "Import in Resource Manager",
       "noteTransition": "Note transition",
       "selectNoteHint": "Select a note to edit",
       "vibrato": "Vibrato",
@@ -343,6 +348,15 @@
       "vib_startMs": "Onset",
       "vib_easeInMs": "Fade in",
       "vib_easeOutMs": "Fade out"
+    },
+    "render": {
+      "render": "Render vocal",
+      "rendering": "Rendering…",
+      "laneLabel": "Vocal",
+      "noVoice": "Pick a voice model first",
+      "empty": "No notes to render",
+      "failed": "Render failed",
+      "busy": "A render is already in progress"
     }
   }
 }

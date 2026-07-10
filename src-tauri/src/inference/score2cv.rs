@@ -101,6 +101,32 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
     Lyric::Unknown
 }
 
+/// Public classification of ONE lyric token for the frontend (§9.5 single Rust classifier: the editor's
+/// rest/sustain/OOV verdict MUST equal the render's — no JS dictionary copy that drifts from
+/// `lyric_to_phones`). Serialized as `{kind:"rest"|"sustain"|"phones"|"unknown", phones?:[…]}`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum LyricClass {
+    /// A rest token (`R`/`r`/``/`rest`/`sil`/`pau`) — silence, no phones.
+    Rest,
+    /// A sustain token (`-`/`ー`/`+`) — continues the previous vowel (承前元音 legato).
+    Sustain,
+    /// A pronounceable lyric → its IPA phones (all in the 210-token vocab).
+    Phones { phones: Vec<&'static str> },
+    /// OOV — no G2P mapping. The editor must LOUD-mark it (never silent SP), the render LOUD-errors.
+    Unknown,
+}
+
+/// Classify one lyric token via the SAME `lyric_to_phones` the render uses (owned result for the wire).
+pub fn classify_lyric(lyr: &str) -> LyricClass {
+    match lyric_to_phones(lyr) {
+        Lyric::Rest => LyricClass::Rest,
+        Lyric::Sustain => LyricClass::Sustain,
+        Lyric::Phones(ph) => LyricClass::Phones { phones: ph },
+        Lyric::Unknown => LyricClass::Unknown,
+    }
+}
+
 /// Port of `render_ust.split_dur`: distribute a note's frames across its phones — each leading consonant
 /// gets ≤4 frames, the (final) vowel gets the remainder. `n` = phone count.
 fn split_dur(fr: i64, n: usize) -> Vec<i64> {
@@ -130,8 +156,24 @@ pub struct ScoreArrays {
 /// frames) per note. Rest frames are capped (first/last note → `CAP_LEAD`, mid → `CAP_MID`); a sustain
 /// (`-`/`ー`/`+`) continues the previous vowel (default `a`); notes are grouped into `note_to_phone` by
 /// consecutive equal pitch. An OOV lyric is a LOUD error (never the reference's silent SP fallback — the
-/// v1 "啊啊啊" regression).
+/// v1 "啊啊啊" regression). This is the Phase-1c PARITY entry (rest-capped, == render_ust); the ② vocal
+/// DAW render uses `build_arrays_daw` (rests uncapped) so the rendered stem aligns to the segment timeline.
 pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
+    build_arrays_impl(score, true)
+}
+
+/// ② 自己唱 DAW render entry: identical to `build_arrays` EXCEPT rest frames are NOT capped, so the cv
+/// frame count == the DAW frame count (a rest holds its full duration) and the rendered stem stays
+/// aligned to the segment's tick timeline. A deliberate fork from the Python parity (which caps rests for
+/// a standalone song render, where absolute timing doesn't matter); the Phase-1c gate still tests the
+/// capped `build_arrays`. ⚠ `chunk_at_sp` CANNOT subdivide a single rest (it only splits AT an SP after
+/// the running count exceeds max_frames), so one very long rest becomes one big chunk — the TOTAL frame
+/// count is bounded upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
+pub fn build_arrays_daw(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
+    build_arrays_impl(score, false)
+}
+
+fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool) -> Result<ScoreArrays> {
     let m = score.len();
     let mut phon: Vec<&'static str> = Vec::new();
     let mut pdur: Vec<i64> = Vec::new();
@@ -141,7 +183,13 @@ pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
     for (k, &(lyr, nn, fr)) in score.iter().enumerate() {
         match lyric_to_phones(lyr) {
             Lyric::Rest => {
-                let cap = if k == 0 || k == m - 1 { tbl::CAP_LEAD } else { tbl::CAP_MID };
+                let cap = if !cap_rests {
+                    i64::MAX // DAW render: keep the full rest so the stem aligns to the timeline
+                } else if k == 0 || k == m - 1 {
+                    tbl::CAP_LEAD
+                } else {
+                    tbl::CAP_MID
+                };
                 phon.push("SP");
                 pdur.push(fr.min(cap).max(1));
                 npitch.push(0);
@@ -349,6 +397,34 @@ mod tests {
         assert!(build_arrays(&[("か", 60, 100), ("zzzz", 62, 80)]).is_err());
         // …but a clean score of the same shape must succeed.
         assert!(build_arrays(&[("か", 60, 100), ("き", 62, 80)]).is_ok());
+    }
+
+    // ② vocal DAW render (S53): `build_arrays_daw` keeps the FULL rest so the stem aligns to the
+    // timeline; `build_arrays` (parity) caps it (CAP_MID=70 mid / CAP_LEAD=25 first/last).
+    #[test]
+    fn build_arrays_daw_uncaps_rests() {
+        let score = [("か", 60, 80), ("R", 0, 300), ("お", 67, 80)];
+        let capped = build_arrays(&score).unwrap();
+        let daw = build_arrays_daw(&score).unwrap();
+        // find the SP phone's frame count in each.
+        let sp_capped = capped.phon.iter().zip(&capped.phone_dur).find(|(p, _)| **p == "SP").map(|(_, d)| *d);
+        let sp_daw = daw.phon.iter().zip(&daw.phone_dur).find(|(p, _)| **p == "SP").map(|(_, d)| *d);
+        assert_eq!(sp_capped, Some(tbl::CAP_MID), "parity build caps a mid rest to CAP_MID");
+        assert_eq!(sp_daw, Some(300), "DAW build keeps the full 300-frame rest");
+    }
+
+    // §9.5 single Rust classifier: `classify_lyric` (exposed via the validate_lyrics command) MUST agree
+    // with `lyric_to_phones` (which build_arrays uses) so the editor's verdict == the render's.
+    #[test]
+    fn classify_lyric_matches_render() {
+        assert!(matches!(classify_lyric("R"), LyricClass::Rest));
+        assert!(matches!(classify_lyric(""), LyricClass::Rest));
+        assert!(matches!(classify_lyric("ー"), LyricClass::Sustain));
+        assert!(matches!(classify_lyric("zzzz"), LyricClass::Unknown));
+        match classify_lyric("か") {
+            LyricClass::Phones { phones } => assert_eq!(phones, vec!["k", "a"]),
+            other => panic!("か should classify as phones [k,a], got {:?}", other),
+        }
     }
 
     #[test]

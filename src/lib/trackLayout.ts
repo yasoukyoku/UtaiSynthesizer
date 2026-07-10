@@ -33,15 +33,15 @@ export function computeTotalTicks(tracks: Track[], axis: TimeAxis): number {
   );
 }
 
-/** Tick where the last PLAYABLE (audio-clip, non-loading) segment ends — the real audible content
- *  end (no 32-bar scroll floor). 0 when there's none. Used to detect "playhead at the end" so Play
- *  restarts from 0; counts only audio clips since playback schedules only those (a trailing notes
- *  segment must not push the natural-end playhead snap past where the audio actually stopped). */
+/** Tick where the last PLAYABLE (non-loading) segment ends — the real audible content end (no 32-bar
+ *  scroll floor). 0 when there's none. Used to detect "playhead at the end" so Play restarts from 0.
+ *  Counts audio clips AND baked ② vocal renders (notes segments playing their deposited lane) — the
+ *  segments playback actually schedules — so the natural-end snap lands where the audio really stopped. */
 export function contentEndTick(tracks: Track[]): number {
   let end = 0;
   for (const t of tracks) {
     for (const s of t.segments) {
-      if (s.loading || s.content.type !== "audioClip") continue;
+      if (s.loading || (s.content.type !== "audioClip" && !segmentPlaysLanes(t, s))) continue;
       const e = s.startTick + s.durationTicks;
       if (e > end) end = e;
     }

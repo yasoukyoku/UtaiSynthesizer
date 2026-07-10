@@ -323,6 +323,11 @@
     "stop": "停止",
     "close": "閉じる",
     "sidebar": {
+      "voice": "ボイス / 合成",
+      "transpose": "移調",
+      "pickVoice": "歌手を選択…",
+      "noVoiceModel": "ボイスモデル未インストール",
+      "goImport": "リソース管理で取り込む",
       "noteTransition": "ノート間の遷移",
       "selectNoteHint": "編集するノートを選択",
       "vibrato": "ビブラート",
@@ -343,6 +348,15 @@
       "vib_startMs": "開始",
       "vib_easeInMs": "フェードイン",
       "vib_easeOutMs": "フェードアウト"
+    },
+    "render": {
+      "render": "人声を合成",
+      "rendering": "合成中…",
+      "laneLabel": "ボーカル",
+      "noVoice": "先にボイスモデルを選択してください",
+      "empty": "合成する音符がありません",
+      "failed": "合成に失敗しました",
+      "busy": "他の合成を実行中です"
     }
   }
 }

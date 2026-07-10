@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, State};
 
-use crate::inference::{rvc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType};
+use crate::inference::{
+    rvc, score2cv, score2svc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType,
+};
 use crate::models::{ModelConfig, ModelEntry};
 use crate::AppState;
 
@@ -85,6 +87,11 @@ pub(crate) const AUX_RMVPE_MEL: &str = "rmvpe_mel_filters.npy";
 pub(crate) const AUX_NSF_HIFIGAN: &str = "nsf_hifigan.onnx";
 pub(crate) const AUX_NSF_HIFIGAN_JSON: &str = "nsf_hifigan.json";
 pub(crate) const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
+// ② 自己唱 (S48 Phase 6): the ScoreToCV content models (score → cv[T,dim] @50fps), aux infra like
+// ContentVec — resolved by direct path, NOT the registry (models/mod.rs scan() must not surface them
+// as phantom user voices). 768 = SoVITS4.1/RVCv2, 256 = SoVITS4.0 (picked by the VOICE's features_dim).
+pub(crate) const AUX_SCORE2CV_768: &str = "score2cv_768.onnx";
+pub(crate) const AUX_SCORE2CV_256: &str = "score2cv_256.onnx";
 
 /// models_dir/aux/<filename>, with a clear Chinese error naming the missing file + the
 /// exact directory it must be placed in.
@@ -109,6 +116,20 @@ pub(crate) fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf
         256 => aux_path(state, AUX_CONTENTVEC_256, "内容特征模型"),
         other => Err(format!(
             "不支持的内容特征维度 {}（仅支持 256 / 768）——请检查模型配置 features_dim / speech_encoder",
+            other
+        )),
+    }
+}
+
+/// ② 自己唱: the ScoreToCV model for a voice's feature dim (768 → SoVITS4.1/RVCv2, 256 → SoVITS4.0).
+/// Same aux-by-path resolution as `contentvec_for_dim` (the score render swaps ScoreToCV in for the
+/// audio ContentVec extractor). A missing model names the file + the aux dir it must go in.
+pub(crate) fn score2cv_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
+    match dim {
+        768 => aux_path(state, AUX_SCORE2CV_768, "自己唱内容模型"),
+        256 => aux_path(state, AUX_SCORE2CV_256, "自己唱内容模型"),
+        other => Err(format!(
+            "不支持的自己唱内容维度 {}（仅支持 256 / 768）——请检查所选歌手模型的 features_dim",
             other
         )),
     }
@@ -1024,6 +1045,240 @@ pub async fn detect_f0(
     .map_err(|e| format!("音高检测任务失败: {}", e))?
 }
 
-// run_s2h + the s2h double-head module were removed in S48 Phase 1c — that pre-S35 contract
-// (phonemes/durations/pitches → hubert+contentvec) was wrong for ScoreToCV. The real score→cv path is
-// inference::score2cv (build_arrays + ONNX), wired into the vocal render pipeline in a later phase.
+// ─── ② 自己唱 vocal render (S48 Phase 6) ─────────────────────────────────────
+//
+// (run_s2h + the s2h double-head module were removed in S48 Phase 1c — that pre-S35 contract was wrong
+//  for ScoreToCV. The real score→cv path is inference::score2cv (build_arrays + ONNX); Phase 6 wires it
+//  into a render command here.)
+
+/// §9.5 single Rust classifier: classify each lyric token (rest / sustain / valid phones / OOV) so the
+/// editor's verdict == the render's — NO JS dictionary copy that could drift from `lyric_to_phones`
+/// (which `build_arrays` uses). Double-side capped (DoS): token count + per-token char length. Language
+/// is JA for now (the only shipped G2P; the §3.7 dictionary work-line is the Phase-6 前置门 for the rest).
+#[tauri::command]
+pub fn validate_lyrics(lyrics: Vec<String>) -> Result<Vec<score2cv::LyricClass>, String> {
+    const MAX_TOKENS: usize = 100_000;
+    const MAX_LEN: usize = 256;
+    if lyrics.len() > MAX_TOKENS {
+        return Err(format!("歌词 token 过多（{} > {}）", lyrics.len(), MAX_TOKENS));
+    }
+    Ok(lyrics
+        .iter()
+        .map(|l| {
+            if l.chars().count() > MAX_LEN {
+                score2cv::LyricClass::Unknown // pathologically long = treat as OOV, never classify
+            } else {
+                score2cv::classify_lyric(l)
+            }
+        })
+        .collect())
+}
+
+/// One note of the score from the frontend. `lyric` = the note's lyric (JA kana / rest `R` / sustain
+/// `ー`); `note_num` = the RAW note MIDI (transpose is applied Rust-side, §9.3); `frames` = the note's
+/// duration in 50fps frames (TimeAxis.tick_to_frame absolute diff — NEVER per-note round). Gap
+/// rests/sustains are inserted by the frontend (§3.4, never inferred from note_num==0).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ScoreNote {
+    pub lyric: String,
+    pub note_num: i64,
+    pub frames: i64,
+}
+
+/// Wire-contract options for render_vocal_segment — mirrored by src\lib\vocal\vocalRender.ts (VocalRenderOptions).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct VocalRenderOptions {
+    /// "sovits" | "rvc".
+    pub backend: String,
+    /// ScoreToCV conditioning speaker (0–76; near speaker-invariant, default 49). NOT the SVC voice.
+    pub cv_speaker_id: i64,
+    /// ScoreToCV language id (zh0 en1 ja2 de3 fr4 es5 it6).
+    pub lang_id: i64,
+    /// Track-level transpose in semitones (applied to content note_pitch AND f0, Rust-side).
+    pub transpose: i64,
+    pub noise_scale: f32,
+    pub seed: u64,
+    /// Run ScoreToCV on the global GPU device instead of the forced-CPU default (faster, costs VRAM).
+    pub gpu_extract: bool,
+}
+
+impl Default for VocalRenderOptions {
+    fn default() -> Self {
+        Self {
+            backend: "sovits".into(),
+            cv_speaker_id: 49,
+            lang_id: 2,
+            transpose: 0,
+            noise_scale: 0.4,
+            seed: 0,
+            gpu_extract: false,
+        }
+    }
+}
+
+/// Flat placeholder loudness for vol_embedding (SoVITS 4.1) models — Phase-2 validated (东雪莲 audition,
+/// 用户耳审 OK). A real per-frame 响度泳道 (SegmentContent.paramCurves["loudness"]) is deferred (§10.5).
+const VOCAL_FLAT_VOL: f32 = 0.1;
+/// DoS cap on the note count of one render request.
+const MAX_SCORE_NOTES: usize = 500_000;
+/// DoS cap on the TOTAL 50fps frames of one render request (~200 min @50fps). Rests are UNCAPPED in the
+/// DAW build (for timeline alignment) and `chunk_at_sp` can't subdivide a single rest, so a pathological
+/// `frames` value would otherwise attempt a multi-TB alloc → process abort (uncatchable). Split long parts.
+const MAX_TOTAL_FRAMES: i64 = 600_000;
+
+/// Render a vocal-track notes segment → singing wav (自己唱). Mirrors run_sovits' load/guard/evict flow
+/// but swaps ScoreToCV in for the audio ContentVec extractor and takes a DAW score + Option-A f0 (§10.1)
+/// instead of an input wav. `score` = the per-note triples (built frontend-side incl. gap rests); when
+/// `f0_cents`/`f0_voiced` are non-empty they are the whole-segment 50fps layered pitch (else bare
+/// noteonly). Returns raw samples like run_sovits (the frontend deposits them as a processedOutputs
+/// overlay). `node_id` = the segment id (progress routing).
+#[tauri::command]
+pub async fn render_vocal_segment(
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    voice_name: String,
+    model_path: String,
+    node_id: String,
+    score: Vec<ScoreNote>,
+    f0_cents: Vec<f32>,
+    f0_voiced: Vec<u8>,
+    options: VocalRenderOptions,
+) -> Result<SynthesisResult, String> {
+    let app = state.inner().clone();
+    let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
+    let run_epoch = app.inference.begin_voice_run();
+
+    // ── validate the request (敌意输入边界) ──
+    if score.is_empty() {
+        return Err("人声段没有音符，无法渲染".into());
+    }
+    if score.len() > MAX_SCORE_NOTES {
+        return Err(format!("音符过多（{} > {}）", score.len(), MAX_SCORE_NOTES));
+    }
+    if !f0_cents.is_empty() && f0_cents.len() != f0_voiced.len() {
+        return Err(format!(
+            "f0 数组长度不一致：cents {} != voiced {}",
+            f0_cents.len(),
+            f0_voiced.len()
+        ));
+    }
+    let total_frames: i64 = score.iter().map(|n| n.frames.max(0)).sum();
+    if total_frames > MAX_TOTAL_FRAMES {
+        return Err(format!(
+            "人声段过长（{} 帧 > 上限 {}，约 {} 分钟），请拆分为多段渲染",
+            total_frames,
+            MAX_TOTAL_FRAMES,
+            MAX_TOTAL_FRAMES / 3000
+        ));
+    }
+    // Option-A f0 is indexed by DAW frame, so its length MUST equal Σframes — a disagreement would
+    // SILENTLY drift the pitch (build_note_hz clamps the index rather than crash). Reject the mismatch.
+    if !f0_cents.is_empty() && f0_cents.len() as i64 != total_frames {
+        return Err(format!(
+            "f0 帧数与音符总帧数不一致：{} != {}（渲染中止，避免音高错位）",
+            f0_cents.len(),
+            total_frames
+        ));
+    }
+    let backend_type = match options.backend.as_str() {
+        "rvc" => VoiceBackendType::Rvc,
+        "sovits" => VoiceBackendType::SoVits,
+        other => return Err(format!("未知后端 '{}'（仅 sovits / rvc）", other)),
+    };
+
+    // ── resolve the voice + ScoreToCV facts ──
+    let entry = get_entry(&app, &voice_name)?;
+    // ①c multi-speaker (spk_mix) voices rename the scalar `sid` graph input to a dense blend. The score
+    // render feeds a scalar sid=0, so a spk_mix export would fail with a raw ORT "Invalid Feed Input Name".
+    // 自己唱 is single-speaker for now (multi-speaker vocal = a later feature) — fail with a friendly message.
+    if sidecar_has_input(&entry, "spk_mix") == Some(true) {
+        return Err(format!(
+            "歌手模型 '{}' 是多歌手声线（spk_mix）模型，自己唱暂不支持，请选择单歌手模型",
+            voice_name
+        ));
+    }
+    let dim = features_dim(&entry.config)?; // 768 → SoVITS4.1/RVCv2, 256 → SoVITS4.0
+    let nch = noise_channels(&entry.config);
+    let sample_rate = entry.sample_rate;
+    let (min_default, noise_input) = match backend_type {
+        VoiceBackendType::Rvc => (12usize, "rnd"),
+        VoiceBackendType::SoVits => (6usize, "noise"),
+    };
+    require_input(&entry, noise_input)?;
+    let min_t = min_frames(&entry.config, min_default);
+    let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
+    if matches!(backend_type, VoiceBackendType::SoVits) && hop_size == 0 {
+        return Err(format!("模型 '{}' 配置的 hop_size 为 0，无法推理", voice_name));
+    }
+    let vol_embedding = sidecar_has_input(&entry, "vol")
+        .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+
+    let s2cv_path = score2cv_for_dim(&app, dim)?;
+
+    // ── load: evict foreign GPU sessions (keep this voice), load voice + ScoreToCV aux ──
+    let path = PathBuf::from(&model_path);
+    app.inference.engine.release_gpu_sessions_except(&[path.clone()]);
+    app.inference
+        .load_voice(&voice_name, &path, backend_type.clone(), sample_rate, None)
+        .map_err(|e| e.to_string())?;
+    let s2cv_sid = app
+        .inference
+        .ensure_aux_loaded_on(&s2cv_path, options.gpu_extract)
+        .map_err(|e| e.to_string())?;
+    let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
+
+    // own the score strings so the render can borrow them as &[(&str, i64, i64)] inside spawn_blocking.
+    let score_owned: Vec<(String, i64, i64)> =
+        score.into_iter().map(|n| (n.lyric, n.note_num, n.frames)).collect();
+    let cv_speaker_id = options.cv_speaker_id;
+    let lang_id = options.lang_id;
+    let transpose = options.transpose;
+    let noise_scale = options.noise_scale;
+    let seed = options.seed;
+
+    let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
+    tauri::async_runtime::spawn_blocking(move || {
+        let cancel = || app.inference.voice_cancelled(run_epoch);
+        let score_ref: Vec<(&str, i64, i64)> =
+            score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
+        let f0 = if f0_cents.is_empty() {
+            None
+        } else {
+            Some(score2svc::VocalF0 { cents: f0_cents.as_slice(), voiced: f0_voiced.as_slice() })
+        };
+        let engine = &app.inference.engine;
+        match backend_type {
+            VoiceBackendType::SoVits => {
+                let voice = score2svc::SovitsVoice {
+                    features_dim: dim,
+                    noise_channels: nch,
+                    vol_embedding,
+                    sample_rate,
+                    hop_size,
+                    min_frames: min_t,
+                };
+                score2svc::render_score_sovits(
+                    engine, &s2cv_sid, &handle.session_id, &score_ref, dim, cv_speaker_id, lang_id,
+                    &voice, 0, VOCAL_FLAT_VOL, seed, noise_scale, transpose, f0.as_ref(), &cancel,
+                    &progress,
+                )
+            }
+            VoiceBackendType::Rvc => {
+                let voice = score2svc::RvcVoice {
+                    features_dim: dim,
+                    noise_channels: nch,
+                    sample_rate,
+                    min_frames: min_t,
+                };
+                score2svc::render_score_rvc(
+                    engine, &s2cv_sid, &handle.session_id, &score_ref, dim, cv_speaker_id, lang_id,
+                    &voice, 0, seed, noise_scale, transpose, f0.as_ref(), &cancel, &progress,
+                )
+            }
+        }
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("渲染任务失败: {}", e))?
+}

@@ -109,8 +109,9 @@ export function laneVisiblePieces(
   stemDurMs: number,
   tempo: number,
 ): LanePiece[] {
-  if (seg.content.type !== "audioClip") return [];
-  const offset = seg.content.offsetMs;
+  // ② vocal render: a notes segment's baked stem starts at the segment start (stem-ms 0 = segStart) and
+  // plays 1:1 — offset 0 (an audioClip's offsetMs is where its window sits inside a longer source stem).
+  const offset = seg.content.type === "audioClip" ? seg.content.offsetMs : 0;
   const winStart = offset;
   const winEnd = offset + ticksToMs(seg.durationTicks, tempo);
   const clips = materializeClips(stored, stemDurMs);

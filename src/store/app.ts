@@ -91,6 +91,10 @@ interface AppState {
   snapSegments: boolean;
   /** Snap the playhead (drag on ruler / arrangement) to clip edges. */
   snapPlayhead: boolean;
+  /** ② A vocal (score→singing) render is in flight — GLOBAL single-flight: only one at a time, since the
+   *  shared ORT engine + release_gpu_sessions_except would make concurrent renders evict each other's
+   *  session mid-inference. Gates the Render button everywhere + backs the throw-guard in vocalRender.ts. */
+  vocalRenderActive: boolean;
   toasts: ToastState[];
   /** Transient corner banner (undo/redo info, save/load confirmation, …). `seq` bumps each time so a
    *  rapid retrigger updates the same single banner in place (no stacking, no viewport jump). */
@@ -125,6 +129,7 @@ interface AppState {
   setGhostInsert: (g: { index: number; count: number } | null) => void;
   toggleSnapSegments: () => void;
   toggleSnapPlayhead: () => void;
+  setVocalRenderActive: (v: boolean) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
@@ -159,6 +164,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   ghostInsert: null,
   snapSegments: loadSetting("utai.snapSegments", true),
   snapPlayhead: loadSetting("utai.snapPlayhead", true),
+  vocalRenderActive: false,
   toasts: [],
   banner: null,
   confirm: null,
@@ -233,6 +239,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveSetting("utai.snapPlayhead", v);
       return { snapPlayhead: v };
     }),
+  setVocalRenderActive: (v) => set({ vocalRenderActive: v }),
   showToast: (message, type = "error") => {
     const id = Date.now();
     set((s) => ({ toasts: [...s.toasts, { message, type, id }] }));

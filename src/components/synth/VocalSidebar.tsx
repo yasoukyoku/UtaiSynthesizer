@@ -16,10 +16,17 @@ import { useTranslation } from "react-i18next";
 import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore } from "../../store/history";
+import { useAppStore } from "../../store/app";
+import { useVoiceModelStore, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_TRANSITION } from "../../lib/vocalNotes";
-import type { Note, NoteTransition, VibratoSpec } from "../../types/project";
+import type { Note, NoteTransition, VibratoSpec, VocalTrackParams } from "../../types/project";
 import "./VocalSidebar.css";
+
+/** The backend a singer model runs on, from its serde `model_type` ("Rvc" | "SoVits") — the model's TYPE
+ *  drives the backend, so there's no manual toggle (§user: unified SoVITS/RVC singer list). */
+const backendOf = (m: VoiceModelEntry): "sovits" | "rvc" => (m.model_type === "Rvc" ? "rvc" : "sovits");
+const backendLabel = (m: VoiceModelEntry): string => (backendOf(m) === "sovits" ? "SoVITS" : "RVC");
 
 /** Default vibrato seeded by "Add vibrato" (depthCents>0 so normalizeNote keeps it). ⚠ startMs/ease are SMALL
  *  on purpose so vibrato is VISIBLE the instant it's added, even on a shorter (tail) note — the old SynthV-ish
@@ -57,12 +64,37 @@ interface Props {
   notes: Note[];
   selectedIds: string[];
   trackTransition: Required<NoteTransition>;
+  /** Track-level render config (backend / ScoreToCV speaker+lang / transpose). */
+  vocalParams: VocalTrackParams;
+  /** Selected SVC voice (singer) name, from Track.voiceModel. */
+  voiceModel?: string;
+  onRender: () => void;
+  rendering: boolean;
 }
 
-export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTransition }: Props) {
+export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTransition, vocalParams, voiceModel, onRender, rendering }: Props) {
   const { t } = useTranslation();
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
+  const updateTrack = useProjectStore((s) => s.updateTrack);
+  const toggleModelManager = useAppStore((s) => s.toggleModelManager);
+  const models = useVoiceModelStore((s) => s.models);
+
+  // ONE unified singer list (SoVITS + RVC). Identity is (model_type, name) — same-name rvc/sovits pairs are
+  // a standard workflow, so never key by name alone; the picked model's type auto-sets the backend.
+  const allVoices = useMemo(() => [...models.sovits, ...models.rvc], [models]);
+  const selectedVoice = useMemo(
+    () => allVoices.find((m) => m.name === voiceModel && backendOf(m) === vocalParams.backend),
+    [allVoices, voiceModel, vocalParams.backend],
+  );
+  // Pick a singer → set voiceModel + auto-detect its backend, as ONE undo step.
+  const pickVoice = (m: VoiceModelEntry) => {
+    const hist = useHistoryStore.getState();
+    hist.beginTransaction();
+    updateTrack(trackId, { voiceModel: m.name, voiceModelAvatar: m.avatar_path ?? undefined });
+    setVocalParams(trackId, { backend: backendOf(m) });
+    hist.commitTransaction();
+  };
 
   // The selection = the notes to edit; the FIRST is the display anchor (its values fill the sliders; edits
   // apply to ALL selected). Recomputed only when the ids/notes change.
@@ -100,6 +132,52 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
 
   return (
     <div className="vocal-sidebar">
+      {/* ⓪ track · VOICE + render — ONE unified singer list (SoVITS + RVC); the picked model's TYPE drives
+          the backend automatically. Then bake the notes to singing; the stem plays as a deposited overlay. */}
+      <div className="vsb-section">
+        <div className="vsb-head">
+          <span>{t("vocalEditor.sidebar.voice")}</span>
+          {selectedVoice && <span className="vsb-backend-tag">{backendLabel(selectedVoice)}</span>}
+        </div>
+        {allVoices.length === 0 ? (
+          <div className="voice-no-model">
+            <span className="sep-no-model">{t("vocalEditor.sidebar.noVoiceModel")}</span>
+            <button className="voice-manage-btn" onClick={() => toggleModelManager()}>
+              {t("vocalEditor.sidebar.goImport")}
+            </button>
+          </div>
+        ) : (
+          <select
+            className="sep-model-select"
+            value={selectedVoice ? String(allVoices.indexOf(selectedVoice)) : ""}
+            onChange={(e) => {
+              const m = allVoices[Number(e.target.value)];
+              if (m) pickVoice(m);
+            }}
+          >
+            <option value="" disabled>{t("vocalEditor.sidebar.pickVoice")}</option>
+            {allVoices.map((m, i) => (
+              <option key={`${m.model_type}:${m.name}:${i}`} value={i}>
+                {m.name} · {backendLabel(m)}
+              </option>
+            ))}
+          </select>
+        )}
+        <Slider
+          label={t("vocalEditor.sidebar.transpose")}
+          value={vocalParams.transpose}
+          cfg={{ min: -24, max: 24, step: 1, unit: "st", bipolar: true }}
+          onChange={(v) => setVocalParams(trackId, { transpose: v })}
+        />
+        <button
+          className="snap-toggle vsb-render"
+          disabled={rendering || !selectedVoice || notes.length === 0}
+          onClick={onRender}
+        >
+          {rendering ? t("vocalEditor.render.rendering") : t("vocalEditor.render.render")}
+        </button>
+      </div>
+
       {/* ① selected-note transition override (glide / portamento between notes) */}
       <div className="vsb-section">
         <div className="vsb-head">

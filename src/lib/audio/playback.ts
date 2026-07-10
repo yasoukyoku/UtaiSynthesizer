@@ -158,12 +158,13 @@ export async function playAllTracks(
 
   for (const track of tracks) {
     const sorted = [...track.segments]
-      .filter((s) => s.content.type === "audioClip" && !s.loading)
+      // ② vocal render: a notes segment with a ready baked lane plays too (segmentPlaysLanes admits it —
+      // the single source-selection predicate). audioClip is always admitted (it may play original audio).
+      .filter((s) => (s.content.type === "audioClip" || segmentPlaysLanes(track, s)) && !s.loading)
       .sort((a, b) => a.startTick - b.startTick);
 
     for (let si = 0; si < sorted.length; si++) {
       const seg = sorted[si]!;
-      if (seg.content.type !== "audioClip") continue;
 
       const segEnd = seg.startTick + seg.durationTicks;
       if (segEnd <= playheadTick) continue;
@@ -293,7 +294,10 @@ export async function playAllTracks(
         continue;
       }
 
-      // Original audio scheduling (no lane outputs)
+      // Original audio scheduling (no lane outputs). A notes segment always took the lane branch above
+      // (a render deposits processedOutputs → segmentPlaysLanes → continue); it has no source audio, so
+      // this guard is type-safety + a defensive skip (never reached for a notes segment in practice).
+      if (seg.content.type !== "audioClip") continue;
       const filePath = seg.content.sourcePath;
       const audioMeta = audioFiles[filePath];
       if (!audioMeta) continue;

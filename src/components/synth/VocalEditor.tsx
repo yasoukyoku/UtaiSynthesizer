@@ -13,6 +13,9 @@ import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION } from "../../lib/vocalNotes";
+import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
+import { useVoiceModelStore } from "../../store/voice-models";
+import { buildVocalScore, renderVocalSegment, VOCAL_RENDER_BUSY } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
@@ -81,6 +84,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         return {
           trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
           pitchDev: sg.content.pitchDev, transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
+          vocalParams: tr.vocalParams ?? DEFAULT_VOCAL_PARAMS, voiceModel: tr.voiceModel,
         };
       }
     }
@@ -91,6 +95,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const [gridDiv, setGridDiv] = useState(2); // 1/8 default
   const [maximized, setMaximized] = useState(false);
   const [playing, setPlaying] = useState(false);
+  // GLOBAL render flag (one vocal render at a time) — reactive so every editor's button disables together.
+  const vocalRenderActive = useAppStore((s) => s.vocalRenderActive);
   const [lyricEdit, setLyricEdit] = useState<{ id: string; x: number; y: number; w: number; value: string } | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -118,6 +124,57 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   startRef.current = part?.start ?? 0;
   const durRef = useRef(part?.dur ?? 0);
   durRef.current = part?.dur ?? 0;
+
+  // ② Render (Phase 6): build the score triples + Option-A f0 from the edited notes and invoke the Rust
+  // score→singing render; the baked wav deposits as a processedOutputs overlay (plays back via the lane
+  // path). The SVC voice/backend/transpose/speaker come from the track's vocalParams + voiceModel (sidebar).
+  const render = useCallback(async () => {
+    if (!part) return;
+    const vp = part.vocalParams;
+    const entry = useVoiceModelStore.getState().models[vp.backend].find((m) => m.name === part.voiceModel);
+    if (!entry) {
+      useAppStore.getState().showToast(t("vocalEditor.render.noVoice"), "error");
+      return;
+    }
+    const { triples, f0Cents, f0Voiced } = buildVocalScore(part.notes, part.pitchDev, tempoRef.current, transitionRef.current);
+    if (triples.length === 0) {
+      useAppStore.getState().showToast(t("vocalEditor.render.empty"), "error");
+      return;
+    }
+    try {
+      await renderVocalSegment({
+        trackId: part.trackId,
+        segmentId,
+        laneLabel: t("vocalEditor.render.laneLabel"),
+        voiceName: entry.name,
+        modelPath: entry.path,
+        triples,
+        f0Cents,
+        f0Voiced,
+        options: {
+          backend: vp.backend,
+          cv_speaker_id: vp.speakerId,
+          lang_id: vp.langId,
+          transpose: vp.transpose,
+          noise_scale: vp.backend === "rvc" ? 0.66666 : 0.4,
+          seed: 0,
+          gpu_extract: false,
+        },
+      });
+    } catch (e) {
+      const msg = String(e);
+      useAppStore.getState().showToast(
+        msg.includes(VOCAL_RENDER_BUSY) ? t("vocalEditor.render.busy") : `${t("vocalEditor.render.failed")}: ${msg}`,
+        "error",
+      );
+    }
+  }, [part, segmentId, t]);
+
+  // Load the installed voice models once when the editor opens — the sidebar's singer picker needs them
+  // (otherwise the list stays empty until the Resource Manager is opened, which triggers the scan; §user).
+  useEffect(() => {
+    void useVoiceModelStore.getState().fetchModels();
+  }, []);
   const selRef = useRef<Set<string>>(new Set(selectedNotes));
   selRef.current = new Set(selectedNotes);
   const toolRef = useRef(tool);
@@ -1015,6 +1072,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           notes={part.notes}
           selectedIds={selectedNotes}
           trackTransition={part.transition}
+          vocalParams={part.vocalParams}
+          voiceModel={part.voiceModel}
+          onRender={render}
+          rendering={vocalRenderActive}
         />
       </div>
     </div>

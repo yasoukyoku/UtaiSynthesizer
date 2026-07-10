@@ -661,6 +661,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::inference::run_rvc,
             commands::inference::run_sovits,
+            commands::inference::render_vocal_segment,
+            commands::inference::validate_lyrics,
             commands::inference::cancel_voice,
             commands::inference::detect_f0,
             commands::inference::get_default_vocoder_info,
