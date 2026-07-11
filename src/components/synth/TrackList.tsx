@@ -483,6 +483,10 @@ function TrackItem({
               >
                 {track.voiceModelAvatar ? (
                   <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />
+                ) : track.voiceModel ? (
+                  // singer picked but no avatar linked → first letter/char, mirroring the resource
+                  // manager's rm-voice-avatar-empty fallback (§user).
+                  <span className="track-avatar-initial">{track.voiceModel.charAt(0).toUpperCase()}</span>
                 ) : (
                   <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
                     <path fill="currentColor" d="M12 3a4 4 0 0 1 4 4v3a4 4 0 0 1-8 0V7a4 4 0 0 1 4-4zm-7 17v-2c0-2.8 4.7-4 7-4s7 1.2 7 4v2H5z" />

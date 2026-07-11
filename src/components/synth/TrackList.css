@@ -306,6 +306,15 @@
   color: var(--text-primary);
 }
 
+/* singer picked but no avatar linked → first letter/char (mirrors the resource manager's
+   rm-voice-avatar-empty look at header scale). */
+.track-avatar-initial {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  line-height: 1;
+}
+
 /* ② S58 language badge — two-letter code in a .track-btn shell; slightly wider than the 18px square so
    "ZH"/"JA" never clip, still one row-height. */
 .track-btn.track-lang {
