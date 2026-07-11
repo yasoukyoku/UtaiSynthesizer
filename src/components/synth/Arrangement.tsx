@@ -21,7 +21,7 @@ import { splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
 import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
 import { evalCurveAt } from "../../lib/f0eval";
 import { collectSnapTicks, snapTick, snapMovedStart, SNAP_PX } from "../../lib/snapping";
-import { trackRgb, rgba, ACCENT, ACCENT_RGB, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
+import { trackRgb, rgba, ACCENT, ACCENT_RGB, ENVELOPE_HALO, ENVELOPE_LINE, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
 import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB } from "../../lib/canvasDraw";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece } from "../../lib/laneEdit";
@@ -2106,30 +2106,43 @@ function drawStaticContent(
             ctx.setLineDash([]);
             const ex0 = Math.max(sx, 0);
             const ex1 = Math.min(sx + sw, width);
-            ctx.strokeStyle = `rgba(${laneColor},0.95)`;
-            ctx.lineWidth = 1.2;
-            if (cv && cv.xs.length > 0) {
+            // The envelope is the dedicated near-white over a dark halo (ENVELOPE_LINE/HALO) —
+            // the lane's OWN hue sank straight into its own waveform (§user: 真串色了); the
+            // halo keeps the line readable over dense waveform pixels of ANY hue.
+            const strokeEnvelope = (trace: () => void) => {
               ctx.beginPath();
-              for (let px = ex0; px <= ex1; px += 2) {
-                const relTick = (px + scrollX) / ppt - seg.startTick;
-                const py = paramToY(evalCurveAt(cv, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
-                if (px === ex0) ctx.moveTo(px, py);
-                else ctx.lineTo(px, py);
-              }
+              trace();
+              ctx.strokeStyle = ENVELOPE_HALO;
+              ctx.lineWidth = 3;
               ctx.stroke();
-              ctx.fillStyle = `rgba(${laneColor},1)`;
+              ctx.strokeStyle = ENVELOPE_LINE;
+              ctx.lineWidth = 1.4;
+              ctx.stroke();
+            };
+            if (cv && cv.xs.length > 0) {
+              strokeEnvelope(() => {
+                for (let px = ex0; px <= ex1; px += 2) {
+                  const relTick = (px + scrollX) / ppt - seg.startTick;
+                  const py = paramToY(evalCurveAt(cv, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
+                  if (px === ex0) ctx.moveTo(px, py);
+                  else ctx.lineTo(px, py);
+                }
+              });
               for (let pi = 0; pi < cv.xs.length; pi++) {
                 const px = (seg.startTick + cv.xs[pi]!) * ppt - scrollX;
                 if (px < -CULL_PAD || px > width + CULL_PAD) continue;
                 const py = paramToY(cv.ys[pi]!, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
+                ctx.fillStyle = ENVELOPE_HALO;
+                ctx.fillRect(px - 4, py - 4, 8, 8);
+                ctx.fillStyle = ENVELOPE_LINE;
                 ctx.fillRect(px - 3, py - 3, 6, 6);
               }
             } else {
               // untouched = a flat 0 dB envelope LINE (matches the bottom band's initial state)
-              ctx.beginPath();
-              ctx.moveTo(ex0, zeroRowY);
-              ctx.lineTo(ex1, zeroRowY);
-              ctx.stroke();
+              strokeEnvelope(() => {
+                ctx.moveTo(ex0, zeroRowY);
+                ctx.lineTo(ex1, zeroRowY);
+              });
             }
           }
 

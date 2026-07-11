@@ -51,3 +51,10 @@ export const LANE_COLORS = ["78,205,196", "255,184,108", "168,130,255", "255,107
  *  NOTE: equals LANE_COLORS[5] by coincidence — a 6th lane group's hue matching the selection cue is a
  *  known (accepted) collision; change the palette entry, not this, if it ever bites. */
 export const SELECTION_GLOW_RGB = "255,214,102";
+
+/** S59c: the sub-lane loudness ENVELOPE line — a dedicated near-white, always drawn over a dark
+ *  halo under-stroke. Deliberately NOT hue-based: LANE_COLORS[0] ≈ the accent teal and [3] ≈ the
+ *  playhead pink, so any palette-derived envelope color eventually sinks into the very waveform
+ *  it rides (§user: 真串色了). White-on-halo reads on every hue. */
+export const ENVELOPE_LINE = "#e8edf5";
+export const ENVELOPE_HALO = "rgba(10, 14, 24, 0.85)";
