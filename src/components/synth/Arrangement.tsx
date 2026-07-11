@@ -26,6 +26,7 @@ import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB } from "../../lib/canvasDraw"
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece } from "../../lib/laneEdit";
 import { detectSegmentTempo, doubleTempoDetect, halveTempoDetect, nudgeDownbeat } from "../../lib/audio/tempoDetect";
+import { extractMidiForLaneGroup, extractKey, midiExtractProgress } from "../../lib/vocal/midiExtract";
 import { TempoStretchPanel } from "./TempoStretchPanel";
 import type { Track, Segment, LaneClip, PitchCurve } from "../../types/project";
 import "./Arrangement.css";
@@ -164,6 +165,9 @@ export function Arrangement() {
   // ② S58 OOV verdicts — a draw dep (in the useCallback dep list + the staticKey) so the async verdict
   // arriving AFTER the notes edit still re-bakes the static layer with the segment badge.
   const vocalOov = useAppStore((s) => s.vocalOov);
+  // S60 MIDI-extraction jobs — a draw dep (per-frame overlay + rAF-loop predicate); progress %
+  // is read from the module map each frame (no store churn), only the SET membership lives here.
+  const midiExtracting = useAppStore((s) => s.midiExtracting);
   const selectedSegments = useAppStore((s) => s.selectedSegments);
   const selectedLane = useAppStore((s) => s.selectedLane);
   const selectSegment = useAppStore((s) => s.selectSegment);
@@ -1205,6 +1209,16 @@ export function Arrangement() {
           },
         });
       }
+      // S60 GAME 人声→MIDI: transcribe every stem of this lane group into a NEW vocal track each.
+      // Works on any audio lane (a user aiming it at an accompaniment stem gets what the model gives).
+      if (seg?.content.type === "audioClip" && !seg.loading) {
+        const segId = ctxMenu.segId;
+        items.push({
+          label: t("midiExtract.menu"),
+          disabled: !!useAppStore.getState().midiExtracting[extractKey(segId, group)],
+          onClick: () => { void extractMidiForLaneGroup(track.id, segId, group); },
+        });
+      }
       return items;
     }
     if (ctxMenu.segId) {
@@ -1650,11 +1664,20 @@ export function Arrangement() {
           if (track.expanded && seg.processedOutputs) {
             const layout = getLaneLayout(track);
             for (const out of seg.processedOutputs) {
-              if (!out.loading) continue;
               const li = layout.rowByKey.get(laneRowKey(out)) ?? -1;
               if (li < 0) continue;
               const laneY = trackY + layout.rowY[li]! * scale;
-              drawLoadingIndicator(ctx as CanvasRenderingContext2D, sx, laneY, sw, laneH, c, now, label);
+              if (out.loading) {
+                drawLoadingIndicator(ctx as CanvasRenderingContext2D, sx, laneY, sw, laneH, c, now, label);
+                continue;
+              }
+              // S60: GAME extraction in flight on this lane's group — same loading look with a
+              // progress label, so the minutes-long inference never reads as "frozen".
+              const exKey = extractKey(seg.id, laneGroupId(out));
+              if (midiExtracting[exKey]) {
+                const pct = Math.round(midiExtractProgress(exKey) * 100);
+                drawLoadingIndicator(ctx as CanvasRenderingContext2D, sx, laneY, sw, laneH, c, now, `${t("midiExtract.extracting")} ${pct}%`);
+              }
             }
           }
         }
@@ -1727,7 +1750,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, midiExtracting, t]);
 
   drawRef.current = draw;
 
@@ -1737,13 +1760,14 @@ export function Arrangement() {
   useEffect(() => {
     if (
       loadingPaths.length === 0 &&
+      Object.keys(midiExtracting).length === 0 &&
       !tracks.some((tk) => tk.segments.some((s) => s.loading || s.processedOutputs?.some((o) => o.loading)))
     ) return;
     let raf = 0;
     const tick = () => { requestRedraw(); raf = requestAnimationFrame(tick); };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [tracks, loadingPaths, requestRedraw]);
+  }, [tracks, loadingPaths, midiExtracting, requestRedraw]);
 
   useEffect(() => {
     draw();

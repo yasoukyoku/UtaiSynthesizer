@@ -7,6 +7,7 @@ mod g2p_tables;
 #[cfg(test)]
 mod g2p_golden_ref;
 pub mod mel;
+pub mod midi_extract;
 pub mod nsf_hifigan;
 pub mod rvc;
 pub mod score2cv;

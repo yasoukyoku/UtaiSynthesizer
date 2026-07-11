@@ -96,6 +96,14 @@ pub enum InputTensor {
     Bool { data: Vec<bool>, shape: Vec<i64> },
 }
 
+/// Typed output tensor with shape (S60). GAME's graphs return bool tensors (boundaries/
+/// presence/masks) and the caller needs the dynamic dims (T frames / N notes) back.
+pub enum OutputTensor {
+    F32 { shape: Vec<i64>, data: Vec<f32> },
+    Bool { shape: Vec<i64>, data: Vec<bool> },
+    I64 { shape: Vec<i64>, data: Vec<i64> },
+}
+
 impl OnnxEngine {
     pub fn new() -> Self {
         Self {
@@ -213,17 +221,27 @@ impl OnnxEngine {
         let mut sessions = self.sessions.write();
         // Another thread may have built the same model while we were compiling.
         if !sessions.contains_key(&key) {
-            // Evict least-recently-used entries while at capacity (bounds memory).
-            while sessions.len() >= MAX_CACHED_SESSIONS {
+            // Evict least-recently-used entries while at capacity. The cap is PER DEVICE
+            // CLASS (S60): GPU sessions keep the original MAX_CACHED_SESSIONS semantics
+            // among themselves (the cap exists to bound VRAM — S36), while CPU sessions
+            // (aux extractors + GAME's 4-graph fleet) count against their OWN cap. Without
+            // the split, a minutes-long GAME extraction (4 CPU sessions, last_used
+            // constantly refreshed) squeezes the SoVITS quality path's 6 GPU sessions out
+            // of the shared cap → the S36 "evict/rebuild every piece, reads as a hang"
+            // regression returns whenever both run concurrently.
+            let new_is_cpu = actual_device == "CPU";
+            let same_class = |v: &LoadedSession| (v.actual_device == "CPU") == new_is_cpu;
+            while sessions.values().filter(|v| same_class(v)).count() >= MAX_CACHED_SESSIONS {
                 let evict = sessions
                     .iter()
+                    .filter(|(_, v)| same_class(v))
                     .min_by_key(|(_, v)| v.last_used.load(Ordering::Relaxed))
                     .map(|(k, _)| k.clone());
                 match evict {
                     Some(k) => {
                         sessions.remove(&k);
                         tracing::info!(
-                            "Evicted least-recently-used ONNX session (cache cap {})",
+                            "Evicted least-recently-used ONNX session (per-class cache cap {})",
                             MAX_CACHED_SESSIONS
                         );
                     }
@@ -385,11 +403,38 @@ impl OnnxEngine {
         n
     }
 
+    /// f32-only convenience wrapper over `run_typed` — every voice/aux model returns f32
+    /// tensors, so this stays the pipeline-facing signature. Non-f32 graphs (GAME's bool
+    /// boundaries/presence) go through `run_typed` directly.
     pub fn run(
         &self,
         session_id: &str,
         inputs: Vec<(&str, InputTensor)>,
     ) -> Result<Vec<Vec<f32>>> {
+        let outputs = self.run_typed(session_id, inputs)?;
+        let mut result = Vec::with_capacity(outputs.len());
+        for (i, out) in outputs.into_iter().enumerate() {
+            match out {
+                OutputTensor::F32 { data, .. } => result.push(data),
+                _ => {
+                    return Err(UtaiError::Inference(format!(
+                        "Output {}: expected an f32 tensor",
+                        i
+                    )))
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Run returning TYPED outputs with shapes. Needed by graphs whose outputs are not all
+    /// f32 and whose dynamic dims (T frames / N notes) the caller must recover from the
+    /// shape (GAME midi_extract, S60). Same session/reload/in-flight semantics as `run`.
+    pub fn run_typed(
+        &self,
+        session_id: &str,
+        inputs: Vec<(&str, InputTensor)>,
+    ) -> Result<Vec<OutputTensor>> {
         *self.last_activity.lock() = Instant::now();
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _in_flight = InFlightGuard(self); // declared before `sessions` so its Drop runs lock-free
@@ -451,10 +496,20 @@ impl OnnxEngine {
 
         let mut result = Vec::with_capacity(outputs.len());
         for i in 0..outputs.len() {
-            let (_, data) = outputs[i]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| UtaiError::Inference(format!("Output {}: {}", i, e)))?;
-            result.push(data.to_vec());
+            let out = &outputs[i];
+            let typed = if let Ok((shape, data)) = out.try_extract_tensor::<f32>() {
+                OutputTensor::F32 { shape: shape.to_vec(), data: data.to_vec() }
+            } else if let Ok((shape, data)) = out.try_extract_tensor::<bool>() {
+                OutputTensor::Bool { shape: shape.to_vec(), data: data.to_vec() }
+            } else if let Ok((shape, data)) = out.try_extract_tensor::<i64>() {
+                OutputTensor::I64 { shape: shape.to_vec(), data: data.to_vec() }
+            } else {
+                return Err(UtaiError::Inference(format!(
+                    "Output {}: unsupported tensor dtype (expected f32/bool/i64)",
+                    i
+                )));
+            };
+            result.push(typed);
         }
 
         Ok(result)

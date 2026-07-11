@@ -644,7 +644,47 @@ function workflowUndoActive(): boolean {
   return a.workflowSegmentId != null && a.activePane === "workflow";
 }
 
+/** S60: pre-undo interceptors — the MIDI-extraction job registers one so undo-during-inference
+ *  CANCELS the extraction (the pending "add track" is what's being undone) instead of reverting
+ *  the timeline. Two-phase on purpose (audit S60): `wouldConsume` is a SIDE-EFFECT-FREE probe so
+ *  routeCanUndo/the Edit menu stay truthful, `consume` performs the cancel. The registrant must
+ *  scope wouldConsume tightly — e.g. NOT while the workflow pane owns Ctrl+Z, NOT when newer
+ *  timeline edits exist (those must undo normally while the extraction keeps running).
+ *  Registrants are singleton lib jobs holding the returned unregister; iteration copies the list
+ *  so an interceptor that unregisters itself mid-dispatch is safe. */
+export interface UndoInterceptor {
+  wouldConsume: () => boolean;
+  consume: () => void;
+}
+const undoInterceptors: UndoInterceptor[] = [];
+export function registerUndoInterceptor(i: UndoInterceptor): () => void {
+  undoInterceptors.push(i);
+  return () => {
+    const at = undoInterceptors.indexOf(i);
+    if (at >= 0) undoInterceptors.splice(at, 1);
+  };
+}
+
+/** Depth of the TIMELINE undo stack — lets an interceptor detect "edits newer than me". */
+export function timelineUndoDepth(): number {
+  return past.length;
+}
+
+/** A continuous gesture transaction (drag/slider held) is currently open. Async completions
+ *  that beginTransaction their own step (e.g. extraction landing tracks) must WAIT for this
+ *  to clear, or their step gets folded into the user's held gesture (audit S60). */
+export function inGestureTransaction(): boolean {
+  return txnDepth > 0;
+}
+
 export function routeUndo() {
+  for (const it of [...undoInterceptors]) {
+    if (it.wouldConsume()) {
+      if (UNDO_DBG) dbg("routeUndo → consumed by interceptor (midi-extract cancel)");
+      it.consume();
+      return;
+    }
+  }
   const wf = workflowUndoActive();
   if (UNDO_DBG) dbg(`routeUndo → ${wf ? (scopedHandler ? "WORKFLOW node stack" : "WORKFLOW (no scope → no-op)") : "timeline"} (activePane=${useAppStore.getState().activePane}, workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"})`);
   // In the workflow pane, Ctrl+Z acts ONLY on the node stack (or no-ops if none) — it must NEVER revert
@@ -663,6 +703,9 @@ export function routeRedo() {
 /** canUndo / canRedo for whichever stack Ctrl+Z would act on RIGHT NOW, so the Edit menu's enablement
  *  matches. In the workflow pane with no scope yet, nothing is undoable (mirrors routeUndo's no-op). */
 export function routeCanUndo(): boolean {
+  // interceptor-aware (audit S60): Ctrl+Z would cancel a pending extraction even with an
+  // empty stack — the Edit menu's enablement must match what the key actually does.
+  if (undoInterceptors.some((i) => i.wouldConsume())) return true;
   if (workflowUndoActive()) return scopedHandler ? scopedHandler.canUndo() : false;
   return useHistoryStore.getState().canUndo;
 }

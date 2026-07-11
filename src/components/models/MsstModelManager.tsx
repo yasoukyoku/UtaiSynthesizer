@@ -1,6 +1,7 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useMsstModelStore, setupDownloadListener } from "../../store/msst-models";
 import { useAppStore } from "../../store/app";
@@ -31,7 +32,7 @@ import {
 } from "../../store/voice-models";
 import "./MsstModelManager.css";
 
-type TopTab = "separation" | "voice";
+type TopTab = "separation" | "voice" | "tools";
 
 export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
@@ -93,9 +94,14 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
         <button className={topTab === "voice" ? "active" : ""} onClick={() => setTopTab("voice")}>
           {lang === "zh" ? "声音模型" : lang === "ja" ? "ボイスモデル" : "Voice Models"}
         </button>
+        <button className={topTab === "tools" ? "active" : ""} onClick={() => setTopTab("tools")}>
+          {lang === "zh" ? "工具模型" : lang === "ja" ? "ツールモデル" : "Tool Models"}
+        </button>
       </div>
 
       {topTab === "voice" && <VoiceModelsTab lang={lang} />}
+
+      {topTab === "tools" && <GameEngineTab lang={lang} />}
 
       {topTab === "separation" && (
         <>
@@ -470,6 +476,156 @@ function DownloadBar({ dl, lang }: { dl: { downloaded: number; total: number; st
           <span className="model-download-text">{formatSize(dl.downloaded)} / {dl.total > 0 ? formatSize(dl.total) : "..."}</span>
         </>
       )}
+    </div>
+  );
+}
+
+// ─── S60: Tool models tab — the GAME 人声→MIDI engine (downloaded on demand: CC BY-NC-SA
+// weights must not ship in the bundle; GitHub release primary → HF mirror fallback in Rust) ───
+
+interface GameDlProgress {
+  stage: string; // download | extract | done
+  downloaded: number;
+  total: number;
+}
+
+function GameEngineTab({ lang }: { lang: string }) {
+  const [installed, setInstalled] = useState<boolean | null>(null);
+  const [dl, setDl] = useState<GameDlProgress | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const showToast = useAppStore((s) => s.showToast);
+  const unlistenRef = useRef<UnlistenFn | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const st = await invoke<{ installed: boolean; downloading: boolean }>("midi_extract_status");
+      setInstalled(st.installed);
+      // a download started before an unmount is still running (Rust single-flight) —
+      // restore the busy view instead of offering a second download (audit S60)
+      if (st.downloading) setBusy(true);
+    } catch {
+      setInstalled(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    let disposed = false;
+    void listen<GameDlProgress>("game-download-progress", (e) => {
+      setDl(e.payload);
+      // remounted mid-download: no pending invoke here, so the terminal event drives the state
+      if (e.payload.stage === "done") {
+        setBusy(false);
+        setDl(null);
+        void refresh();
+      } else {
+        setBusy(true);
+      }
+    }).then((un) => {
+      if (disposed) un();
+      else unlistenRef.current = un;
+    });
+    return () => {
+      disposed = true;
+      unlistenRef.current?.();
+      unlistenRef.current = null;
+    };
+  }, [refresh]);
+
+  const handleDownload = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    setDl({ stage: "download", downloaded: 0, total: 0 });
+    try {
+      const st = await invoke<{ installed: boolean }>("download_game_package");
+      setInstalled(st.installed);
+      showToast(t18({ zh: "GAME 引擎已安装", en: "GAME engine installed", ja: "GAME エンジンをインストールしました" }, lang), "success");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("GAME_DL_BUSY")) return; // another flight is running — its events drive the UI
+      const base = msg.includes("GAME_DL_EXTRACT")
+        ? t18({ zh: "解压安装失败", en: "Extraction failed", ja: "展開に失敗しました" }, lang)
+        : t18({ zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" }, lang);
+      showToast(`${base}: ${msg}`, "error");
+    } finally {
+      setBusy(false);
+      setDl(null);
+    }
+  }, [busy, lang, showToast]);
+
+  const handleDelete = useCallback(async () => {
+    setConfirmDelete(false);
+    try {
+      const st = await invoke<{ installed: boolean }>("delete_game_package");
+      setInstalled(st.installed);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const base = t18({ zh: "删除失败", en: "Delete failed", ja: "削除に失敗しました" }, lang);
+      showToast(msg.includes("GAME_DELETE_FAILED") ? `${base}: ${msg}` : msg, "error");
+    }
+  }, [lang, showToast]);
+
+  const stageText = (p: GameDlProgress): string => {
+    if (p.stage === "extract") return t18({ zh: "解压安装中...", en: "Extracting...", ja: "展開中..." }, lang);
+    return `${formatSize(p.downloaded)} / ${p.total > 0 ? formatSize(p.total) : "..."}`;
+  };
+
+  return (
+    <div className="msst-model-list">
+      <div className={`msst-model-card-wrap ${installed ? "installed" : ""}`}>
+        {installed === false && !busy && (
+          <div className="msst-model-card-slide">
+            <button className="primary" onClick={handleDownload} title={lang === "zh" ? "下载" : lang === "ja" ? "ダウンロード" : "Download"}>↓</button>
+          </div>
+        )}
+        <div className="msst-model-card">
+          <div className="model-card-header">
+            <span className="model-card-name">GAME · {t18({ zh: "人声转 MIDI", en: "Vocal-to-MIDI", ja: "歌声→MIDI" }, lang)}</span>
+            <span className="model-card-arch">openvpi · 1.0.3 medium</span>
+          </div>
+          <p className="model-card-desc">
+            {t18({
+              zh: "从人声干声/分离声提取音符（右键子轨道 →「提取 MIDI」）。识别为无歌词音符，自动填入占位词供改词翻唱。",
+              en: "Transcribes vocal stems into notes (right-click a sub-lane → \"Extract MIDI\"). Notes carry no lyrics; placeholder lyrics are filled in for re-lyric covers.",
+              ja: "ボーカルステムからノートを抽出します（サブレーン右クリック →「MIDI 抽出」）。歌詞なしのノートとして認識され、置き換え用のプレースホルダー歌詞が入ります。",
+            }, lang)}
+          </p>
+          <div className="model-card-meta">
+            <span className="model-card-stems">en / ja / yue / zh</span>
+            <span className="model-card-size">{formatSize(179775226)}</span>
+          </div>
+          <p className="model-card-desc">
+            {t18({
+              zh: "模型权重按 CC BY-NC-SA 4.0 由 openvpi 发布（代码 MIT），因此不随本体分发、需在此下载。",
+              en: "Weights are released by openvpi under CC BY-NC-SA 4.0 (code MIT), so they are downloaded here instead of shipping with the app.",
+              ja: "モデル重みは openvpi が CC BY-NC-SA 4.0 で公開しています（コードは MIT）。そのためアプリには同梱されず、ここでダウンロードします。",
+            }, lang)}
+          </p>
+          {busy && dl && (
+            <div className="model-download-progress">
+              <div
+                className={`model-download-bar ${dl.stage !== "download" ? "model-convert-bar" : ""}`}
+                style={{ width: dl.stage !== "download" ? "100%" : dl.total > 0 ? `${(dl.downloaded / dl.total) * 100}%` : "0%" }}
+              />
+              <span className="model-download-text">{stageText(dl)}</span>
+            </div>
+          )}
+          {installed && (
+            <div className="model-card-actions">
+              <span className="model-status-installed">{lang === "zh" ? "已安装" : lang === "ja" ? "インストール済み" : "Installed"}</span>
+              {confirmDelete ? (
+                <div className="model-confirm-delete">
+                  <button className="danger" onClick={handleDelete}>{lang === "zh" ? "确认" : "OK"}</button>
+                  <button onClick={() => setConfirmDelete(false)}>{lang === "zh" ? "取消" : lang === "ja" ? "キャンセル" : "Cancel"}</button>
+                </div>
+              ) : (
+                <button className="model-delete-btn" onClick={() => setConfirmDelete(true)}>{lang === "zh" ? "删除" : lang === "ja" ? "削除" : "Delete"}</button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

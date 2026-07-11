@@ -103,6 +103,10 @@ interface AppState {
    *  §9.5 single Rust classifier, so this ALWAYS equals what the render would reject). Drives the red
    *  note marking (VocalEditor), the segment badge (Arrangement) and the track header warning (TrackList). */
   vocalOov: Record<string, string[]>;
+  /** S60 GAME MIDI extraction in flight — key = `${segmentId}:${group}` (lane group), value =
+   *  the job context. Drives the lane-row "extracting" indicator (Arrangement per-frame overlay),
+   *  the menu-item double-trigger guard, and the undo-cancels-extraction interceptor. Runtime-only. */
+  midiExtracting: Record<string, { trackId: string; segId: string; group: string; jobIds: string[] }>;
   toasts: ToastState[];
   /** Transient corner banner (undo/redo info, save/load confirmation, …). `seq` bumps each time so a
    *  rapid retrigger updates the same single banner in place (no stacking, no viewport jump). */
@@ -142,6 +146,8 @@ interface AppState {
   /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
    *  verdicts don't re-render subscribers). Written ONLY by the oovWatch validation watcher. */
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
+  /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
+  setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
@@ -182,6 +188,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vocalRenderActive: false,
   renderingVocalTrackId: null,
   vocalOov: {},
+  midiExtracting: {},
   toasts: [],
   banner: null,
   confirm: null,
@@ -268,6 +275,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (noteIds === null) delete next[segmentId];
       else next[segmentId] = noteIds;
       return { vocalOov: next };
+    }),
+  setMidiExtracting: (key, v) =>
+    set((s) => {
+      const next = { ...s.midiExtracting };
+      if (v === null) {
+        if (!(key in next)) return {};
+        delete next[key];
+      } else {
+        next[key] = v;
+      }
+      return { midiExtracting: next };
     }),
   showToast: (message, type = "error") => {
     // monotonic id — Date.now() collides when two toasts fire in the same millisecond (e.g. the

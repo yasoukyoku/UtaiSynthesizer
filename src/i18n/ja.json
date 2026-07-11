@@ -12,7 +12,8 @@
     "current": "現在",
     "apply": "適用",
     "reset": "1:1 に戻す",
-    "processing": "処理中…",    "detect": "テンポ／グリッド検出",
+    "processing": "処理中…",
+    "detect": "テンポ／グリッド検出",
     "x2": "グリッド BPM ×2",
     "half": "グリッド BPM ÷2",
     "nudge": "小節線を1拍後ろへ",
@@ -21,7 +22,20 @@
     "errTooShort": "セグメントが短すぎて検出できません（約5秒必要）",
     "errNoBeat": "安定した拍が検出できませんでした",
     "errFailed": "テンポ検出に失敗しました"
-  },  "menu": {
+  },
+  "midiExtract": {
+    "menu": "MIDI 抽出（歌声→ノート）",
+    "extracting": "MIDI 抽出中…",
+    "done": "MIDI 抽出が完了し、新しいボーカルトラックを作成しました",
+    "noNotes": "ノートを抽出できませんでした",
+    "cancelled": "MIDI 抽出をキャンセルしました",
+    "stale": "抽出中にクリップが変更されたため、結果を破棄しました",
+    "errNotInstalled": "GAME エンジンが未インストールです——リソース管理・ツールモデルからダウンロードしてください",
+    "errTooShort": "オーディオが短すぎて抽出できません",
+    "errLoad": "オーディオの読み込みに失敗しました",
+    "errFailed": "MIDI 抽出に失敗しました"
+  },
+  "menu": {
     "file": "ファイル",
     "edit": "編集",
     "tools": "ツール",
@@ -79,7 +93,9 @@
     "task_download": "モデルのダウンロード",
     "task_convert": "モデル変換",
     "task_cuda_download": "CUDA ランタイムのダウンロード",
-    "task_pyenv_install": "トレーニング環境ランタイムのインストール"
+    "task_pyenv_install": "トレーニング環境ランタイムのインストール",
+    "task_midi-extract": "MIDI 抽出",
+    "task_game-download": "GAME エンジンのダウンロード"
   },
   "tray": {
     "show": "ウィンドウを表示",

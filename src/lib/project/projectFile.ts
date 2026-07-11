@@ -9,6 +9,10 @@ import { clearWaveformCache } from "../waveformCache";
 import { stopPlayback, clearBufferCache } from "../audio/playback";
 import { useWorkflowStore } from "../../store/workflow";
 import { clearNodeHistories } from "../workflow/nodeHistory";
+// NOTE deliberate runtime-only import cycle: midiExtract.ts imports getLoadEpoch from this
+// module. Neither side calls the other during module EVALUATION (both are plain function
+// references used at runtime), which ESM resolves safely.
+import { cancelExtractionsForTeardown } from "../vocal/midiExtract";
 import { buildSaveBundle, parseLoadedBundle, type LoadedProject } from "./bundle";
 import { hasUnsavedWork, isRecoveryPending, markAutosaveBaseline } from "./autosave";
 
@@ -92,6 +96,10 @@ function teardownForLoad() {
     void invoke("cancel_separation").catch(() => {});
     void invoke("cancel_voice").catch(() => {}); // voice runs are direct awaits — flag is the only abort
   }
+  // S60: same for in-flight MIDI extractions — the old document's jobs would keep burning CPU for
+  // minutes (results dropped by the epoch guard anyway) AND leave the undo interceptor armed to eat
+  // the NEW document's first Ctrl+Z. Cancels + clears job state + unregisters, no toast.
+  cancelExtractionsForTeardown();
   // Close the docked node editor before the document is replaced: its segment is about to vanish (a
   // phantom panel would otherwise stay mounted), and a stale activePane:'workflow' would suppress
   // timeline Delete/Ctrl+K and misroute Ctrl+Z to the dead node stack. closeWorkflow() clears

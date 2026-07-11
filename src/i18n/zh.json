@@ -12,7 +12,8 @@
     "current": "当前",
     "apply": "应用",
     "reset": "还原 1:1",
-    "processing": "处理中…",    "detect": "检测速度/网格",
+    "processing": "处理中…",
+    "detect": "检测速度/网格",
     "x2": "网格 BPM ×2",
     "half": "网格 BPM ÷2",
     "nudge": "小节线后移一拍",
@@ -21,7 +22,20 @@
     "errTooShort": "片段太短，无法检测速度（至少约 5 秒）",
     "errNoBeat": "未检测到稳定节拍",
     "errFailed": "速度检测失败"
-  },  "menu": {
+  },
+  "midiExtract": {
+    "menu": "提取 MIDI（人声→音符）",
+    "extracting": "提取 MIDI 中…",
+    "done": "MIDI 提取完成，已新建人声轨",
+    "noNotes": "未提取到音符",
+    "cancelled": "已取消 MIDI 提取",
+    "stale": "片段在提取期间被修改，结果已丢弃",
+    "errNotInstalled": "未安装 GAME 提取引擎——请到资源管理·工具模型下载",
+    "errTooShort": "音频太短，无法提取",
+    "errLoad": "音频读取失败",
+    "errFailed": "MIDI 提取失败"
+  },
+  "menu": {
     "file": "文件",
     "edit": "编辑",
     "tools": "工具",
@@ -79,7 +93,9 @@
     "task_download": "模型下载",
     "task_convert": "模型转换",
     "task_cuda_download": "CUDA 运行时下载",
-    "task_pyenv_install": "训练环境运行时包安装"
+    "task_pyenv_install": "训练环境运行时包安装",
+    "task_midi-extract": "MIDI 提取",
+    "task_game-download": "GAME 引擎下载"
   },
   "tray": {
     "show": "显示窗口",

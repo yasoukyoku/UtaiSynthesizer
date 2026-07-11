@@ -3,6 +3,7 @@ pub mod audition;
 pub mod import;
 pub mod inference;
 pub mod logs;
+pub mod midi_extract;
 pub mod models;
 pub mod msst_models;
 pub mod project;

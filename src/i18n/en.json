@@ -12,7 +12,8 @@
     "current": "Current",
     "apply": "Apply",
     "reset": "Reset 1:1",
-    "processing": "Processing…",    "detect": "Detect tempo / grid",
+    "processing": "Processing…",
+    "detect": "Detect tempo / grid",
     "x2": "Grid BPM ×2",
     "half": "Grid BPM ÷2",
     "nudge": "Shift bar line +1 beat",
@@ -21,7 +22,20 @@
     "errTooShort": "Segment too short for tempo detection (needs ~5 s)",
     "errNoBeat": "No steady beat detected",
     "errFailed": "Tempo detection failed"
-  },  "menu": {
+  },
+  "midiExtract": {
+    "menu": "Extract MIDI (vocal→notes)",
+    "extracting": "Extracting MIDI…",
+    "done": "MIDI extracted — new vocal track created",
+    "noNotes": "No notes were extracted",
+    "cancelled": "MIDI extraction cancelled",
+    "stale": "Segment changed during extraction — result dropped",
+    "errNotInstalled": "GAME engine not installed — download it under Resource Manager · Tool Models",
+    "errTooShort": "Audio too short to extract",
+    "errLoad": "Failed to read audio",
+    "errFailed": "MIDI extraction failed"
+  },
+  "menu": {
     "file": "File",
     "edit": "Edit",
     "tools": "Tools",
@@ -79,7 +93,9 @@
     "task_download": "Model download",
     "task_convert": "Model conversion",
     "task_cuda_download": "CUDA runtime download",
-    "task_pyenv_install": "Training runtime pack install"
+    "task_pyenv_install": "Training runtime pack install",
+    "task_midi-extract": "MIDI extraction",
+    "task_game-download": "GAME engine download"
   },
   "tray": {
     "show": "Show Window",
