@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/utai-dsp"]
+members = ["crates/utai-dsp", "crates/utai-stretch"]
 
 [package]
 name = "utai"
@@ -54,6 +54,8 @@ serde_yaml_ng = "0.10"
 midly = "0.5"
 encoding_rs = "0.8"
 utai-dsp = { path = "crates/utai-dsp" }
+# S59 Tempo Slider: offline time-stretch via vendored Signalsmith Stretch (MIT, FFI shim crate)
+utai-stretch = { path = "crates/utai-stretch" }
 
 # Windows-only: disable WebView2 browser-accelerator keys (Ctrl+F/P, F5/F7, zoom, reload…) natively — a
 # page-level keydown preventDefault can't stop them (they're handled by the WebView2 host above the DOM).

@@ -698,6 +698,8 @@ pub fn run() {
             commands::audio::save_temp_audio,
             commands::audio::ensure_cache_dir,
             commands::audio::save_binary_file,
+            commands::audio::analyze_segment_tempo,
+            commands::audio::stretch_segment_audio,
             commands::separation::run_msst_separation,
             commands::separation::get_separation_status,
             commands::separation::cancel_separation,

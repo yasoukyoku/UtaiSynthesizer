@@ -42,6 +42,7 @@ pub async fn load_audio_file(
     state: State<'_, Arc<AppState>>,
     path: String,
 ) -> Result<AudioFileInfo, String> {
+    let t0 = std::time::Instant::now();
     let input_path = PathBuf::from(&path);
 
     // CONTENT IDENTITY: hash the raw file bytes (read once). Identical content under a different
@@ -50,6 +51,7 @@ pub async fn load_audio_file(
     let bytes = std::fs::read(&input_path).map_err(|e| format!("read {}: {e}", input_path.display()))?;
     let content_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
     drop(bytes);
+    let hash_ms = t0.elapsed().as_millis();
 
     let cache_dir = state.cache_dir.join("audio_cache");
     let _ = std::fs::create_dir_all(&cache_dir);
@@ -60,6 +62,7 @@ pub async fn load_audio_file(
     if let Ok(text) = std::fs::read_to_string(&sidecar) {
         if let Ok(info) = serde_json::from_str::<AudioFileInfo>(&text) {
             if std::path::Path::new(&info.playback_path).exists() {
+                tracing::debug!("[perf] load_audio_file HIT {}ms hash={}ms {}", t0.elapsed().as_millis(), hash_ms, input_path.display());
                 return Ok(info);
             }
         }
@@ -84,14 +87,34 @@ pub async fn load_audio_file(
     // the original bit depth (24-bit / 32-bit float) is preserved — save_wav would requantize to 16-bit.
     // Non-WAV is decoded → 16-bit WAV (same as before content-addressing).
     //
+    // S59 deposit-perf O4: a WAV that ALREADY lives inside our cache tree (separation stems in
+    // run dirs, stretch artifacts — all under state.cache_dir) is its own playback copy: skip the
+    // ~85MB fs::copy per stem, point playback_path at the file itself (S32's stem-deposit
+    // bottleneck #2 — the copy had no consumer on the deposit path; playback uses the run-dir
+    // path). If the run dir is later swept, the sidecar's exists() check above misses and we
+    // simply re-decode. External user files still get the durable content-addressed copy.
+    //
     // Write via a UNIQUE temp + atomic rename, and skip if it already exists. Two decodes of the SAME
-    // content can run CONCURRENTLY (e.g. a workflow run's collectOutputs + the live reconciler both
+    // content can run CONCURRENTLY (e.g. a workflow run finishing + the live reconciler both
     // loading a freshly-rendered separation stem) — a direct copy/write to the shared `{hash}.wav` then
     // raced into "The process cannot access the file because it is being used by another process"
     // (os error 32) on Windows, which silently dropped a stem (e.g. instrumental) and fell the track back
     // to the original mix. Per-call temp + atomic publish removes the shared-destination contention.
-    let wav_path = cache_dir.join(format!("{content_hash}.wav"));
-    if !wav_path.exists() {
+    let t_copy = std::time::Instant::now();
+    // usp_work extractions are EXCLUDED from the skip: prune_usp_work deletes them mid-session /
+    // on the next open, so a sidecar pinning playback_path there would silently mute the track
+    // (audit MAJOR). Archive media keeps the durable {hash}.wav copy — the pre-S59 behavior; run
+    // dirs and stretch artifacts (the actual S32 bottleneck) keep the optimization, their sweep
+    // lifecycle just re-decodes on a stale sidecar.
+    let in_cache_wav = ext == "wav"
+        && input_path.starts_with(&state.cache_dir)
+        && !input_path.starts_with(state.cache_dir.join("usp_work"));
+    let wav_path = if in_cache_wav {
+        input_path.clone()
+    } else {
+        cache_dir.join(format!("{content_hash}.wav"))
+    };
+    if !in_cache_wav && !wav_path.exists() {
         let tmp = cache_dir.join(format!(
             "{content_hash}.{}.{}.tmp",
             std::process::id(),
@@ -123,6 +146,10 @@ pub async fn load_audio_file(
     };
     // Persist the sidecar so the next import of this content short-circuits the whole decode.
     let _ = std::fs::write(&sidecar, serde_json::to_string(&info).unwrap_or_default());
+    tracing::debug!(
+        "[perf] load_audio_file MISS total={}ms hash={}ms copy={}ms in_cache={} {}",
+        t0.elapsed().as_millis(), hash_ms, t_copy.elapsed().as_millis(), in_cache_wav, input_path.display()
+    );
     Ok(info)
 }
 
@@ -268,4 +295,163 @@ pub async fn ensure_cache_dir(
 #[tauri::command]
 pub async fn save_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
     std::fs::write(&path, data).map_err(|e| format!("write {}: {}", path, e))
+}
+
+// ─── S59: segment BPM/beat-grid analysis + Tempo Slider time-stretch ───
+
+#[derive(serde::Serialize, Clone)]
+pub struct TempoAnalysisResult {
+    /// Constant-grid tempo (regression-refined).
+    pub bpm: f64,
+    /// First grid beat in SOURCE-audio ms (window offset already folded back in).
+    pub grid_anchor_ms: f64,
+    /// Which grid beat (0-based from the anchor) is bar-beat 1.
+    pub downbeat_index: u32,
+    pub downbeat_margin: f32,
+    pub confidence: f32,
+    pub not_constant: bool,
+    /// Alternative BPM readings (octave/dotted family) for the correction UI.
+    pub candidates: Vec<f64>,
+}
+
+/// Analyze the tempo/beat grid of a source-audio WINDOW (the segment's visible window, in
+/// SOURCE ms — pass 0/0 to analyze the whole file). Classical DSP (utai-dsp tempo.rs), no ML.
+/// Errors are stable CODEs per the i18n rule: TEMPO_LOAD_FAILED / TEMPO_TOO_SHORT / TEMPO_NO_BEAT.
+#[tauri::command]
+pub async fn analyze_segment_tempo(
+    path: String,
+    window_start_ms: f64,
+    window_end_ms: f64,
+    beats_per_bar: u32,
+) -> Result<TempoAnalysisResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let input = PathBuf::from(&path);
+        let buf = crate::audio::load_audio(&input).map_err(|e| format!("TEMPO_LOAD_FAILED: {e}"))?;
+        let ch = buf.channels.max(1) as usize;
+        let total_frames = buf.samples.len() / ch;
+        let sr = buf.sample_rate as f64;
+        let mut a = ((window_start_ms.max(0.0) / 1000.0) * sr).round() as usize;
+        let mut b = (((window_end_ms.max(0.0) / 1000.0) * sr).round() as usize).min(total_frames);
+        // whole-file analysis is ONLY the explicit 0/0 sentinel — a window lying entirely past
+        // the source's end must error, not silently analyze audio outside the segment (audit).
+        let whole_file = window_start_ms <= 0.0 && window_end_ms <= 0.0;
+        if b <= a {
+            if !whole_file {
+                return Err("TEMPO_TOO_SHORT".to_string());
+            }
+            a = 0;
+            b = total_frames;
+        }
+        let mono: Vec<f32> = buf.samples[a * ch..b * ch]
+            .chunks_exact(ch)
+            .map(|fr| fr.iter().sum::<f32>() / ch as f32)
+            .collect();
+        let res = utai_dsp::tempo::analyze_tempo(&mono, buf.sample_rate, beats_per_bar).map_err(|e| {
+            match e {
+                utai_dsp::tempo::TempoError::TooShort => "TEMPO_TOO_SHORT".to_string(),
+                utai_dsp::tempo::TempoError::NoBeat => "TEMPO_NO_BEAT".to_string(),
+            }
+        })?;
+        Ok(TempoAnalysisResult {
+            bpm: res.bpm,
+            // anchor comes back window-relative — express it in source coordinates so it is
+            // stable under segment split/resize (both halves keep the same grid)
+            grid_anchor_ms: (a as f64 / sr) * 1000.0 + res.grid_anchor_ms,
+            downbeat_index: res.downbeat_index,
+            downbeat_margin: res.downbeat_margin,
+            confidence: res.confidence,
+            not_constant: res.not_constant,
+            candidates: res.candidates,
+        })
+    })
+    .await
+    .map_err(|e| format!("TEMPO_JOIN: {e}"))?
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct StretchResult {
+    pub output_path: String,
+    pub duration_ms: f64,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Offline time-stretch (tempo change, pitch preserved) of a whole source/stem file.
+/// `time_factor` = output duration / input duration. Output is a CONTENT-ADDRESSED 32-bit float
+/// WAV under audio_cache/stretch/ ({content_hash}_r{factor}.wav) — same input content + factor
+/// ⇒ same artifact, so undo/redo and .usp reload re-resolve without recomputing, and a source
+/// overwritten in place can never serve a stale stretch (the hash changes). Errors are stable
+/// CODEs: STRETCH_RATIO_RANGE / STRETCH_INPUT_MISSING / STRETCH_ENGINE_FAILED.
+#[tauri::command]
+pub async fn stretch_segment_audio(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    time_factor: f64,
+) -> Result<StretchResult, String> {
+    if !(time_factor.is_finite() && (0.25..=4.0).contains(&time_factor)) {
+        return Err("STRETCH_RATIO_RANGE".to_string());
+    }
+    let cache_dir = state.cache_dir.join("audio_cache").join("stretch");
+    tauri::async_runtime::spawn_blocking(move || {
+        let input = PathBuf::from(&path);
+        let bytes = std::fs::read(&input).map_err(|e| format!("STRETCH_INPUT_MISSING: {e}"))?;
+        let content_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&bytes));
+        drop(bytes);
+
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let key = format!("{content_hash}_r{time_factor:.6}");
+        let wav_path = cache_dir.join(format!("{key}.wav"));
+        let sidecar = cache_dir.join(format!("{key}.json"));
+
+        // cache hit (sidecar is written LAST = completion marker, per the export convention)
+        if let Ok(text) = std::fs::read_to_string(&sidecar) {
+            if let Ok(info) = serde_json::from_str::<StretchResult>(&text) {
+                if std::path::Path::new(&info.output_path).exists() {
+                    return Ok(info);
+                }
+            }
+        }
+
+        let buf = crate::audio::load_audio(&input).map_err(|e| format!("STRETCH_INPUT_MISSING: {e}"))?;
+        let stretched = utai_stretch::stretch_interleaved(
+            &buf.samples,
+            buf.channels.max(1) as usize,
+            buf.sample_rate,
+            time_factor,
+        )?;
+        let out_buf = crate::audio::AudioBuffer {
+            samples: stretched,
+            sample_rate: buf.sample_rate,
+            channels: buf.channels.max(1),
+        };
+        // unique temp + atomic publish (same pattern as load_audio_file: concurrent stretches of
+        // the same (content, factor) must not collide on Windows)
+        let tmp = cache_dir.join(format!(
+            "{key}.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        if let Err(e) = crate::audio::save_wav_f32(&tmp, &out_buf) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("STRETCH_ENGINE_FAILED: {e}"));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &wav_path) {
+            let _ = std::fs::remove_file(&tmp);
+            // a lost race is fine (identical content already published); any OTHER rename failure
+            // must not return a path that does not exist (the sidecar is the completion marker)
+            if !wav_path.exists() {
+                return Err(format!("STRETCH_ENGINE_FAILED: publish: {e}"));
+            }
+        }
+        let info = StretchResult {
+            output_path: wav_path.to_string_lossy().to_string(),
+            duration_ms: out_buf.duration_secs() * 1000.0,
+            sample_rate: out_buf.sample_rate,
+            channels: out_buf.channels,
+        };
+        let _ = std::fs::write(&sidecar, serde_json::to_string(&info).unwrap_or_default());
+        Ok(info)
+    })
+    .await
+    .map_err(|e| format!("STRETCH_JOIN: {e}"))?
 }

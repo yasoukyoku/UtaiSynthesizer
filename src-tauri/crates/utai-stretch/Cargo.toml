@@ -1,0 +1,13 @@
+[package]
+name = "utai-stretch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+# FFI wrapper around the vendored Signalsmith Stretch C++ library (MIT — see
+# vendor/signalsmith-stretch/LICENSE.txt and vendor/signalsmith-stretch/dsp/LICENSE.txt).
+# Hand-written extern "C" shim compiled with `cc`: no bindgen (needs libclang, absent on the
+# build machine) and no cxx (the published ssstretch binding fails to compile under MSVC).
+
+[build-dependencies]
+cc = "1"

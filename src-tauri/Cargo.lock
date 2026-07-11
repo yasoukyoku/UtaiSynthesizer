@@ -5248,6 +5248,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "utai-dsp",
+ "utai-stretch",
  "uuid",
  "webview2-com",
  "windows",
@@ -5262,6 +5263,13 @@ version = "0.1.0"
 dependencies = [
  "ndarray 0.16.1",
  "rustfft",
+]
+
+[[package]]
+name = "utai-stretch"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

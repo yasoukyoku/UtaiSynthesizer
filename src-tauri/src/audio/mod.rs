@@ -478,3 +478,23 @@ pub fn save_wav(path: &Path, buffer: &AudioBuffer) -> Result<()> {
 
     Ok(())
 }
+
+/// 32-bit float writer for INTERLEAVED buffers — full precision, no clamping (preserve
+/// inter-sample overshoot for downstream gain), same philosophy as the separation stems'
+/// planar twin (separation/pipeline.rs save_wav, which is numerics-locked and takes
+/// StemAudio; the layouts differ, so the two writers stay separate on purpose).
+pub fn save_wav_f32(path: &Path, buffer: &AudioBuffer) -> Result<()> {
+    let spec = hound::WavSpec {
+        channels: buffer.channels,
+        sample_rate: buffer.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| crate::UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
+    for &sample in &buffer.samples {
+        writer.write_sample(sample).map_err(|e| crate::UtaiError::Audio(format!("Write error: {}", e)))?;
+    }
+    writer.finalize().map_err(|e| crate::UtaiError::Audio(format!("Finalize error: {}", e)))?;
+    Ok(())
+}
