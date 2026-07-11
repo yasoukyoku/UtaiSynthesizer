@@ -99,10 +99,19 @@ export async function importScoreFile(): Promise<void> {
       if (score.bpm != null && Number.isFinite(score.bpm) && score.bpm > 0) store.setTempo(score.bpm);
       if (score.time_sig) store.setTimeSignature(score.time_sig[0], score.time_sig[1]);
 
+      // Track naming: prefer the file's OWN track name (ustx track_name, midi TrackName); a nameless track
+      // (every ust; a nameless midi/ustx track) is named by the FILE basename — with a 1-based index when
+      // several nameless tracks live in one file (so importing a multi-track file doesn't yield "song song").
+      const fileBase = sel.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "").trim() || "Vocal";
+      const namelessTotal = score.tracks.filter((tk) => tk.notes.length && !tk.name.trim()).length;
+      let namelessIdx = 0;
+
       for (const it of score.tracks) {
         if (!it.notes.length) continue; // defensive: Rust already skips empty tracks
         const trackId = crypto.randomUUID();
-        store.addTrack(blankTrack(trackId, it.name || "Vocal", "vocal"));
+        const named = it.name.trim();
+        const name = named || (namelessTotal > 1 ? `${fileBase} ${++namelessIdx}` : fileBase);
+        store.addTrack(blankTrack(trackId, name, "vocal"));
 
         // Part spans from the first note (tick 0, rebased in Rust) to the last note's end.
         const lastEnd = it.notes.reduce((m, n) => Math.max(m, n.tick + n.duration), 0);

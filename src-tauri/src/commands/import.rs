@@ -194,7 +194,8 @@ fn parse_ust(bytes: &[u8]) -> Result<ImportedScore, String> {
     let tracks = if notes.is_empty() {
         Vec::new()
     } else {
-        vec![ImportedTrack { name: "UST".to_string(), start_tick: start_tick.unwrap_or(0), notes }]
+        // ust carries no track name → empty; the frontend names it by the file (per-file, one track).
+        vec![ImportedTrack { name: String::new(), start_tick: start_tick.unwrap_or(0), notes }]
     };
     Ok(ImportedScore { tracks, bpm: tempo, time_sig: None }) // ust has NO time signature
 }
@@ -356,7 +357,7 @@ fn parse_ustx(bytes: &[u8]) -> Result<ImportedScore, String> {
             .and_then(|t| t.track_name.clone())
             .filter(|s| !s.trim().is_empty())
             .or_else(|| vp.name.clone().filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| "Vocal".to_string());
+            .unwrap_or_default(); // no track/part name → empty; the frontend names it by the file (+ index).
         let notes: Vec<ImportedNote> = abs
             .iter()
             .map(|(t, n)| {
@@ -503,9 +504,8 @@ fn parse_midi(bytes: &[u8]) -> Result<ImportedScore, String> {
                 }
             })
             .collect();
-        let name = track_name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("Track {}", tracks.len() + 1));
+        // no MIDI TrackName → empty; the frontend names nameless tracks by the file (+ index if several).
+        let name = track_name.filter(|s| !s.trim().is_empty()).unwrap_or_default();
         tracks.push(ImportedTrack { name, start_tick: base_our, notes });
     }
 
@@ -732,7 +732,7 @@ voice_parts:
         assert_eq!(mel.notes[0].lyric, "か");
         // Track 2: lyric-less note → placeholder あ; PPQ scaling 480 midi → 960 our.
         let plain = &s.tracks[1];
-        assert_eq!(plain.name, "Track 2");
+        assert_eq!(plain.name, ""); // no TrackName → empty; the frontend names it by the file (+ index)
         assert_eq!(plain.start_tick, 0);
         assert_eq!(plain.notes[0].lyric, "あ");
         assert_eq!(plain.notes[0].duration, 960);
