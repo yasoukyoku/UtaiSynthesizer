@@ -2104,12 +2104,12 @@ function drawStaticContent(
             ctx.lineTo(Math.min(sx + sw, width), zeroRowY);
             ctx.stroke();
             ctx.setLineDash([]);
+            const ex0 = Math.max(sx, 0);
+            const ex1 = Math.min(sx + sw, width);
+            ctx.strokeStyle = `rgba(${laneColor},0.95)`;
+            ctx.lineWidth = 1.2;
             if (cv && cv.xs.length > 0) {
-              ctx.strokeStyle = `rgba(${laneColor},0.95)`;
-              ctx.lineWidth = 1.2;
               ctx.beginPath();
-              const ex0 = Math.max(sx, 0);
-              const ex1 = Math.min(sx + sw, width);
               for (let px = ex0; px <= ex1; px += 2) {
                 const relTick = (px + scrollX) / ppt - seg.startTick;
                 const py = paramToY(evalCurveAt(cv, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
@@ -2124,6 +2124,12 @@ function drawStaticContent(
                 const py = paramToY(cv.ys[pi]!, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
                 ctx.fillRect(px - 3, py - 3, 6, 6);
               }
+            } else {
+              // untouched = a flat 0 dB envelope LINE (matches the bottom band's initial state)
+              ctx.beginPath();
+              ctx.moveTo(ex0, zeroRowY);
+              ctx.lineTo(ex1, zeroRowY);
+              ctx.stroke();
             }
           }
 
@@ -2191,12 +2197,20 @@ function drawStaticContent(
           ctx.strokeStyle = rgba(ACCENT_RGB, 0.15);
           ctx.strokeRect(gsx + 0.5, bandTop + 1.5, gsw - 1, gBandH - 3);
           const curve = seg.content.paramCurves?.["loudness"];
-          if (!curve || curve.xs.length === 0) continue;
-          ctx.strokeStyle = rgba(ACCENT_RGB, 0.85);
-          ctx.lineWidth = 1.2;
-          ctx.beginPath();
           const x0 = Math.max(gsx, 0);
           const x1 = Math.min(gsx + gsw, width);
+          ctx.strokeStyle = rgba(ACCENT_RGB, 0.85);
+          ctx.lineWidth = 1.2;
+          if (!curve || curve.xs.length === 0) {
+            // an untouched clip still shows its (flat 0 dB) envelope LINE — the initial state
+            // must read as "here is the line you grab", not an empty box (§user S59b feedback)
+            ctx.beginPath();
+            ctx.moveTo(x0, zeroY);
+            ctx.lineTo(x1, zeroY);
+            ctx.stroke();
+            continue;
+          }
+          ctx.beginPath();
           for (let px = x0; px <= x1; px += 2) {
             const relTick = (px + scrollX) / ppt - seg.startTick;
             const py = paramToY(evalCurveAt(curve, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, bandTop, gBandH);

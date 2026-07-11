@@ -12,9 +12,11 @@ import { tempoErrorMessage } from "../../lib/audio/tempoDetect";
 import { ParamSlider } from "../workflow/nodes/ParamSlider";
 import "./TempoStretchPanel.css";
 
-/** Engine sweet spot (signalsmith 0.75–1.5×); UI stays inside it, the backend clamps [0.25, 4]. */
-const F_MIN = 0.74;
-const F_MAX = 1.35;
+/** Duration-factor travel. Deliberately WIDE (⅓×–3×, §user: 自由度给用户打开,推坏了自己会降) —
+ *  the engine's official sweet spot is 0.75–1.5×, beyond it artifacts grow but nothing breaks;
+ *  the backend still hard-clamps [0.25, 4]. */
+const F_MIN = 1 / 3;
+const F_MAX = 3;
 
 export function TempoStretchPanel({ x, y, trackId, segId, onClose }: {
   x: number;

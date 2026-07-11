@@ -625,6 +625,19 @@ function TrackItem({
           <div key={run.key} className="lane-group" style={{ "--lane-rgb": laneRgb } as React.CSSProperties}>
             <div className="lane-group-bar" style={{ height: LANE_GROUP_BAR_HEIGHT * vZoom }}>
               <span className="lane-group-swatch" />
+              {/* S59b: the GROUP's loudness-envelope toggle. Placed LEFT of the name on purpose:
+                  the name is the flex-shrink absorber (flex:1 min-width:0) — as the LAST child of
+                  the controls this button sat past the bar's right edge and overflow:hidden
+                  clipped it invisible (the reported "看不到 dB 按钮"). AUDIO tracks only. */}
+              {track.trackType === "audio" && (
+                <button
+                  className={`track-btn lane-db-btn ${track.laneLoudnessOpen?.[run.groupId] ? "active-orig" : ""}`}
+                  title={t("tracks.loudnessLane")}
+                  onClick={(e) => { e.stopPropagation(); useProjectStore.getState().toggleLaneLoudnessOpen(track.id, run.groupId); }}
+                >
+                  dB
+                </button>
+              )}
               <span className="lane-group-name" title={run.name}>{run.name}</span>
               <div className="track-controls lane-group-controls">
                 <div className="fader-row">
@@ -656,19 +669,6 @@ function TrackItem({
                   />
                   <span className="fader-val">{formatPan(ctrl?.pan ?? 0)}</span>
                 </div>
-                {/* S59b: the GROUP's loudness envelope toggle — lives beside the group V/P because
-                    the envelope shares their identity (group-keyed; 解组 for per-stem control).
-                    While ON the group's rows edit envelope points instead of piece trims. AUDIO
-                    tracks only: a vocal track's loudness is render-domain (the vocal editor lane). */}
-                {track.trackType === "audio" && (
-                  <button
-                    className={`track-btn track-btn-db ${track.laneLoudnessOpen?.[run.groupId] ? "active-orig" : ""}`}
-                    title={t("tracks.loudnessLane")}
-                    onClick={(e) => { e.stopPropagation(); useProjectStore.getState().toggleLaneLoudnessOpen(track.id, run.groupId); }}
-                  >
-                    dB
-                  </button>
-                )}
               </div>
             </div>
             {lanes.slice(run.start, run.start + run.count).map(({ id, label, members }) => {

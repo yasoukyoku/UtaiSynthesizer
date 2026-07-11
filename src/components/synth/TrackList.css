@@ -539,3 +539,12 @@
   font-size: 8px;
   letter-spacing: 0;
 }
+
+/* S59b: compact GROUP-bar dB toggle — fits the 18px bar, pinned left of the (shrinkable) name
+   so a full bar can never clip it off the right edge. */
+.lane-db-btn {
+  width: 18px;
+  height: 14px;
+  font-size: 7px;
+  flex-shrink: 0;
+}
