@@ -15,6 +15,7 @@ import {
   materializeClips, laneRowKey, laneLabelParts, laneReachesSeam, flooredDurationTicks, MIN_LANE_PIECE_MS,
 } from "../../lib/audio/laneOps";
 import { drawWaveform, beginWaveformFrame, peaksSignature } from "../../lib/waveformCache";
+import { splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
 import { collectSnapTicks, snapTick, snapMovedStart, SNAP_PX } from "../../lib/snapping";
 import { trackRgb, rgba, ACCENT, ACCENT_RGB, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
 import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB } from "../../lib/canvasDraw";
@@ -109,7 +110,6 @@ export function Arrangement() {
   const tempo = useProjectStore((s) => s.tempo);
   const setPlayhead = useProjectStore((s) => s.setPlayhead);
   const updateTrack = useProjectStore((s) => s.updateTrack);
-  const splitSegment = useProjectStore((s) => s.splitSegment);
   const createVocalPart = useProjectStore((s) => s.createVocalPart);
   const deleteSegment = useProjectStore((s) => s.deleteSegment);
   const updateSegmentLaneOps = useProjectStore((s) => s.updateSegmentLaneOps);
@@ -978,11 +978,17 @@ export function Arrangement() {
     if (ctxMenu.segId) {
       const seg = track.segments.find((s) => s.id === ctxMenu.segId);
       const ph = useProjectStore.getState().playheadTick;
-      // ② A notes (vocal) part can't be split (§9.6 gate) — only audioClip segments split at the playhead.
-      const canSplit = !!seg && seg.content.type === "audioClip" && ph > seg.startTick && ph < seg.startTick + seg.durationTicks;
+      // ② Both audioClip AND notes (vocal) parts split at the playhead now — the store partitions a notes part
+      // (fresh ids + rebased ticks + sliced curves) and snaps a mid-note split to the note's end (§user).
+      const canSplit = !!seg && ph > seg.startTick && ph < seg.startTick + seg.durationTicks;
       items.push({
         label: t("toolbar.split"), shortcut: "Ctrl+K", disabled: !canSplit,
-        onClick: () => { if (canSplit) splitSegment(track.id, ctxMenu.segId!, useProjectStore.getState().playheadTick); },
+        onClick: () => {
+          if (!canSplit) return;
+          // ② carry+window the bake, no re-render — splitSegmentVocalAware applies the DIRTY guard so a stale
+          // bake is never windowed clean (it re-renders instead of playing pre-edit audio).
+          splitSegmentVocalAware(track.id, ctxMenu.segId!, useProjectStore.getState().playheadTick, useProjectStore.getState().tempo);
+        },
       });
       items.push({
         label: t("toolbar.delete"), shortcut: "Del",
@@ -1292,7 +1298,7 @@ export function Arrangement() {
         // laneId too: a DETACH rewrites laneId/outputNodeId in place with the same path/label/group,
         // but it splits one group RUN into several → new bars/row positions must repaint (P5).
         // o.loading: a lane turning ready flips the main row original-waveform → lane-sum switch.
-        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
+        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
       }).join(";");
       // playOriginal: flips the main-row waveform (sum ↔ original) + dims every lane row.
       return `${t.segments.length}:${t.expanded}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
@@ -1678,15 +1684,18 @@ function drawStaticContent(
                 // sung duration (tail stays empty = silence) instead of being stretched to fill the box — the
                 // "waveform tied to the segment length, not the sounding length" bug the user re-flagged.
                 const stemMs = lTotalMs; // = out.totalDurationMs
-                const fill = stemMs > 0 && lSegMs > 0 ? Math.min(1, stemMs / lSegMs) : 1; // how much of the box it covers
-                const lEnd = stemMs > 0 ? Math.min(1, lSegMs / stemMs) : 1; // window into the stem (if it runs past the box)
-                drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw * fill, laneH, 0, lEnd, width);
+                const off = Math.max(0, out.offsetMs ?? 0); // ② split: window [off, off+seg] into the SAME stem (off 0 = un-split)
+                const availMs = Math.max(0, stemMs - off); // stem length remaining after the offset
+                const fill = stemMs > 0 && lSegMs > 0 ? Math.min(1, availMs / lSegMs) : 1; // how much of the box it covers
+                const lStart = stemMs > 0 ? Math.min(1, off / stemMs) : 0;
+                const lEnd = stemMs > 0 ? Math.min(1, (off + lSegMs) / stemMs) : 1; // window into the stem (clip past the stem end)
+                drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw * fill, laneH, lStart, lEnd, width);
               }
             } else {
               // EDITED lane → draw each kept piece's waveform window + its edge handles; the gaps between
               // pieces stay the faint bg (silence). Ratios are into the stem peaks with the SAME source-total
               // denominator as the main track, so lane + main stay aligned.
-              for (const p of laneVisiblePieces(seg, stored, lTotalMs, tempo)) {
+              for (const p of laneVisiblePieces(seg, stored, lTotalMs, tempo, out.offsetMs ?? 0)) {
                 const px = p.startTick * ppt - scrollX;
                 const pw = (p.endTick - p.startTick) * ppt;
                 if (pw < 0.5 || px > width + CULL_PAD || px + pw < -CULL_PAD) continue;

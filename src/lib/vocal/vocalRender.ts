@@ -7,7 +7,7 @@
 //      the SAME lane machinery as an audio track's sub-lanes, so it plays back / persists / mutes for free.
 import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
-import { evalF0CentsFrames } from "../f0eval";
+import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
 import { isBreathLyric } from "../vocalNotes";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
@@ -64,7 +64,9 @@ export function buildVocalScore(
   tempo: number,
   defaultTransition: Required<NoteTransition>,
   breathToken: string,
-): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[] } {
+  paramCurves?: Record<string, PitchCurve>,
+  formantScalar = 0,
+): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[]; loudnessEnv: number[]; formantEnv: number[] } {
   const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
   const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
   const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
@@ -99,7 +101,31 @@ export function buildVocalScore(
     { frameStartTick: 0, ticksPerFrame, frameCount },
     { tempo, defaultTransition },
   );
-  return { triples, f0Cents: Array.from(cents), f0Voiced: Array.from(voiced) };
+  // ② loudness + formant per-frame envelopes on the SAME 50fps grid as f0 (so Rust aligns them via the same
+  // note-group remap). loudness = dB curve → linear multiplier (evalCurveAt returns 0 dB when absent → ×1);
+  // formant = track scalar + lane semitones (additive). An absent loudness lane, or a 0 formant scalar with
+  // no formant lane, yields an EMPTY array → Rust treats it as "no lane" (flat = exact-parity no-op). §M-defer.
+  const loudCurve = paramCurves?.["loudness"];
+  const formantCurve = paramCurves?.["formant"];
+  const loudnessEnv = loudCurve ? sampleParamFrames(loudCurve, ticksPerFrame, frameCount, (db) => Math.pow(10, db / 20)) : [];
+  const formantEnv =
+    formantScalar !== 0 || formantCurve
+      ? sampleParamFrames(formantCurve, ticksPerFrame, frameCount, (semi) => formantScalar + semi)
+      : [];
+  return { triples, f0Cents: Array.from(cents), f0Voiced: Array.from(voiced), loudnessEnv, formantEnv };
+}
+
+/** Sample a segment-relative param curve at each of `frameCount` 50fps frames (`f·ticksPerFrame`), applying
+ *  `transform` (dB→linear / +scalar). Mirrors evalF0CentsFrames' grid so the envelope aligns with f0. */
+function sampleParamFrames(
+  curve: PitchCurve | undefined,
+  ticksPerFrame: number,
+  frameCount: number,
+  transform: (v: number) => number,
+): number[] {
+  const out = new Array<number>(frameCount);
+  for (let f = 0; f < frameCount; f++) out[f] = transform(evalCurveAt(curve, f * ticksPerFrame));
+  return out;
 }
 
 interface AudioFileInfo {
@@ -128,6 +154,9 @@ export async function renderVocalSegment(req: {
   triples: ScoreTriple[];
   f0Cents: number[];
   f0Voiced: number[];
+  /** ② per-frame @50fps loudness (linear multiplier) + formant (semitones) envelopes; empty = no lane. */
+  loudnessEnv: number[];
+  formantEnv: number[];
   options: VocalRenderOptions;
   /** The render-input signature this bake corresponds to — stamped on the deposited lane so a later Play
    *  can skip re-rendering an unchanged segment (see vocalRenderSig / isVocalDirty). */
@@ -136,6 +165,7 @@ export async function renderVocalSegment(req: {
   const { trackId, segmentId, laneLabel } = req;
   if (useAppStore.getState().vocalRenderActive) throw new Error(VOCAL_RENDER_BUSY);
   useAppStore.getState().setVocalRenderActive(true);
+  useAppStore.getState().setRenderingVocalTrackId(trackId); // ② spinner on this track's header while rendering (§user)
 
   const seg = () =>
     useProjectStore.getState().tracks.find((t) => t.id === trackId)?.segments.find((s) => s.id === segmentId);
@@ -160,6 +190,8 @@ export async function renderVocalSegment(req: {
       score: req.triples,
       f0Cents: req.f0Cents,
       f0Voiced: req.f0Voiced,
+      loudnessEnv: req.loudnessEnv,
+      formantEnv: req.formantEnv,
       options: req.options,
     });
     await invoke("save_temp_audio", { samples: result.audio, sampleRate: result.sample_rate, outputPath });
@@ -172,6 +204,7 @@ export async function renderVocalSegment(req: {
     throw e;
   } finally {
     useAppStore.getState().setVocalRenderActive(false);
+    useAppStore.getState().setRenderingVocalTrackId(null);
   }
 }
 
@@ -189,6 +222,47 @@ export function vocalRenderSig(track: Track, seg: Segment, tempo: number): strin
   return `${contentSig(seg.content)}|vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}`;
 }
 
+/** Split a segment (audioClip OR notes) at `tick`, carrying + windowing a CLEAN vocal bake so the split needs
+ *  no re-render (§user: split is not a re-render). THE single split entry point for the toolbar + context menu
+ *  (the dirty guard below must never be duplicated / forgotten). Returns the new right-half id (null = no-op).
+ *
+ *  THE DIRTY GUARD (audit): window-stamp ONLY when the parent bake was CLEAN. A DIRTY parent (edited / tempo /
+ *  param / singer changed but not yet re-rendered) carries a STALE stem; stamping its CURRENT-content windowSig
+ *  would launder that stale audio into false-clean → both halves play the pre-edit stem forever (silent wrong
+ *  audio — the exact mirror of the split-then-edit case). So we compute `wasDirty` on the WHOLE parent BEFORE
+ *  the split, and when dirty we CLEAR windowSig (see stampSplitWindowSigs) so only the parent `renderedSig`
+ *  governs → both halves mismatch current content → dirty → Play re-renders them correctly. */
+export function splitSegmentVocalAware(trackId: string, segId: string, tick: number, tempo: number): string | null {
+  const track = useProjectStore.getState().tracks.find((t) => t.id === trackId);
+  const seg = track?.segments.find((s) => s.id === segId);
+  const parentWasDirty = !!(track && seg) && isVocalDirty(track, seg, tempo);
+  const newId = useProjectStore.getState().splitSegment(trackId, segId, tick);
+  if (newId) stampSplitWindowSigs(trackId, [segId, newId], tempo, parentWasDirty);
+  return newId;
+}
+
+/** After a notes SPLIT carries + windows the baked stem, mark each half's window validity. When the parent was
+ *  CLEAN, stamp `windowSig` = vocalRenderSig of THIS half's (windowed) content, so isVocalDirty accepts the
+ *  window (dual-sig) with no re-render. When the parent was DIRTY, CLEAR windowSig (a stale carried stem must
+ *  never read clean — the carried window does NOT match this half's content). The bake's `renderedSig` (the
+ *  PARENT whole-stem content) is LEFT UNCHANGED either way so an undo-of-split still matches the restored full
+ *  content. Both sigs ride the OVERLAY (never undoable → can never desync from the bake — unlike an undoable
+ *  flag). No-op for a non-notes / un-baked half. Exposed only for splitSegmentVocalAware. */
+export function stampSplitWindowSigs(trackId: string, segIds: string[], tempo: number, parentWasDirty: boolean): void {
+  for (const segId of segIds) {
+    const track = useProjectStore.getState().tracks.find((t) => t.id === trackId);
+    const seg = track?.segments.find((s) => s.id === segId);
+    if (!track || !seg || seg.content.type !== "notes" || !seg.processedOutputs?.length) continue;
+    if (!seg.processedOutputs.some((o) => o.laneId === VOCAL_LANE_ID && !o.loading)) continue;
+    // Clean → this half's own sig accepts the window; Dirty → undefined so only the (mismatching) parent
+    // renderedSig governs and both halves stay dirty → re-render (never launder a stale stem clean).
+    const sig = parentWasDirty ? undefined : vocalRenderSig(track, seg, tempo);
+    const outs = seg.processedOutputs.map((o) => (o.laneId === VOCAL_LANE_ID ? { ...o, windowSig: sig } : o));
+    useProjectStore.getState().replaceProcessedOutputs(trackId, segId, outs);
+  }
+}
+
+
 /** Resolve a track's singer + build its score + invoke the render, stamping the render-input sig on the
  *  deposit. The ONE render code path (the sidebar button and the Play batch both call this). Throws
  *  VOCAL_NO_VOICE / VOCAL_EMPTY (caller maps to a toast); VOCAL_RENDER_BUSY bubbles from renderVocalSegment. */
@@ -197,8 +271,9 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   if (!entry) throw new Error(VOCAL_NO_VOICE);
-  const { triples, f0Cents, f0Voiced } = buildVocalScore(
+  const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
     seg.content.notes, seg.content.pitchDev, tempo, vp.transition, vp.breathToken ?? "AP",
+    seg.content.paramCurves, vp.formant ?? 0,
   );
   if (triples.length === 0) throw new Error(VOCAL_EMPTY);
   await renderVocalSegment({
@@ -210,6 +285,8 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
     triples,
     f0Cents,
     f0Voiced,
+    loudnessEnv,
+    formantEnv,
     options: {
       backend: vp.backend,
       cv_speaker_id: vp.speakerId,
@@ -237,7 +314,15 @@ export function isVocalDirty(track: Track, seg: Segment, tempo: number): boolean
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   if (!entry) return false;
   if (!bake) return true;
-  return bake.renderedSig !== vocalRenderSig(track, seg, tempo);
+  // ② DUAL-SIG acceptance (§user: split is not a re-render). A carried SPLIT-WINDOW bake keeps the PARENT's
+  // whole-stem `renderedSig` but is windowed to this half; `windowSig` is THIS half's own content sig (stamped
+  // by stampSplitWindowSigs). Accept when EITHER matches the current content: `renderedSig` matches after an
+  // undo-of-split (the full stem == the restored full content) OR `windowSig` matches right after the split
+  // (the window == this half). Any REAL drift (edit / tempo / param / singer) changes vocalRenderSig → fails
+  // BOTH → re-render. Both sigs ride the OVERLAY, so they can never desync from the bake (the undoable-flag
+  // desync the audit caught — silent wrong audio on split→edit→render→undo / tempo — is structurally gone).
+  const cur = vocalRenderSig(track, seg, tempo);
+  return bake.renderedSig !== cur && bake.windowSig !== cur;
 }
 
 /** Every dirty vocal segment across all tracks (read live). Empty ⇒ Play proceeds with zero added latency. */

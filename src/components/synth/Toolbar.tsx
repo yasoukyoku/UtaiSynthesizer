@@ -7,8 +7,8 @@ import { useHistoryStore } from "../../store/history";
 import { useWorkflowStore } from "../../store/workflow";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
-import { collectDirtyVocals, renderDirtyVocals } from "../../lib/vocal/vocalRender";
-import type { TimeAxis } from "../../lib/timeAxis";
+import { collectDirtyVocals, renderDirtyVocals, splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { formatBarBeat, type TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece, liveSelectedLane } from "../../lib/laneEdit";
 import { Dropdown } from "../common/Dropdown";
@@ -23,17 +23,12 @@ const TS_DEN_OPTIONS = [2, 4, 8, 16].map((d) => ({ value: d, label: String(d) })
 
 export function Toolbar() {
   const { t } = useTranslation();
-  const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature, tracks } =
+  const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature } =
     useProjectStore();
   const timeAxis = useTimeAxis();
   const { isPlaying, setPlaying, seeking, scheduleVersion } = useAudioStore();
   const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
-  const { splitSegment, deleteSegments } = useProjectStore();
-  // ② A notes (vocal) segment can't be split (§9.6) — the Split button is disabled for it. Delete stays
-  // enabled (deleting a whole notes part from the timeline is legitimate, like any segment).
-  const selectedIsNotes =
-    !!selectedSegment &&
-    tracks.find((t) => t.id === selectedSegment.trackId)?.segments.find((s) => s.id === selectedSegment.segmentId)?.content.type === "notes";
+  const { deleteSegments } = useProjectStore();
   const animRef = useRef<number>(0);
   const baseTickRef = useRef(0);
   const baseTimeRef = useRef(0);
@@ -273,12 +268,11 @@ export function Toolbar() {
       return;
     }
     if (!selectedSegment) return;
-    // ② A notes segment does not split via the audioClip path (§9.6 gate — the store early-returns too);
-    // read the live tracks (not a stale closure) to classify the target.
-    const tr = useProjectStore.getState().tracks.find((t) => t.id === selectedSegment.trackId);
-    const sg = tr?.segments.find((s) => s.id === selectedSegment.segmentId);
-    if (sg?.content.type === "notes") return;
-    splitSegment(selectedSegment.trackId, selectedSegment.segmentId, playheadTick);
+    // ② A notes (vocal) segment now splits too: the store partitions its notes + pitchDev/param curves at the
+    // playhead, giving fresh ids + rebased ticks, and SNAPS a mid-note split to that note's end (§user). The
+    // baked stem is CARRIED + windowed (no re-render) via splitSegmentVocalAware, which also applies the DIRTY
+    // guard (a stale bake is never windowed clean — it re-renders). audioClip + notes both go through it.
+    splitSegmentVocalAware(selectedSegment.trackId, selectedSegment.segmentId, playheadTick, tempo);
   };
 
   const handleDelete = () => {
@@ -466,7 +460,7 @@ export function Toolbar() {
         <button
           className="toolbar-btn"
           onClick={handleSplit}
-          disabled={!selectedSegment || selectedIsNotes}
+          disabled={!selectedSegment}
         >
           {t("toolbar.split")}
         </button>
@@ -484,9 +478,6 @@ export function Toolbar() {
   );
 }
 
-function formatPosition(tick: number, axis: TimeAxis): string {
-  // bar:beat:sub via the meter authority — identical to the old fixed 480-based math for 4/4, but a
-  // 6/8 bar now reads 6 beats of 240 ticks. `sub` is a 0-based quarter-of-beat (matches the old readout).
-  const { bar, beat, sub } = axis.tickToBarBeat(tick);
-  return `${bar}:${beat}:${sub.toString().padStart(2, "0")}`;
-}
+// bar:beat:sub via the meter authority — identical to the old fixed 480-based math for 4/4, but a 6/8 bar
+// now reads 6 beats of 240 ticks. `sub` is a 0-based quarter-of-beat. Shared with the ② vocal-editor playhead.
+const formatPosition = (tick: number, axis: TimeAxis): string => formatBarBeat(axis, tick);

@@ -35,6 +35,7 @@ use super::score2cv::{
 use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
 use super::{build_spk_mix_dense, RvcOptions, SovitsOptions, SynthesisResult};
 use crate::{Result, UtaiError};
+use utai_dsp::formant_warp;
 
 /// ScoreToCV frame rate (score2cv sidecar `fps`). The per-phone `phone_dur` frames are 20 ms.
 const CV_FPS: f64 = 50.0;
@@ -106,6 +107,69 @@ fn transpose_note_pitch(note_pitch: &mut [i64], transpose: i64) {
     }
 }
 
+/// Per-note-group cv↔DAW 50fps frame ranges — the SHARED remap core of `build_note_hz`/`build_note_param`.
+/// The cv side comes from `arr.note_to_phone`/`arr.phone_dur`; the DAW side from the score triples grouped
+/// by the SAME `npitch` rule `build_arrays` uses (rest/breath → 0, else note_num, via `classify_lyric`), so
+/// f0 / loudness / formant all share ONE alignment source (NO-duplication). Pure.
+struct NoteGroups {
+    ng: usize,
+    cv_start: Vec<usize>,
+    cv_count: Vec<usize>,
+    daw_start: Vec<usize>,
+    daw_count: Vec<usize>,
+    group_pitch: Vec<i64>,
+}
+
+fn compute_note_groups(arr: &ScoreArrays, score: &[(&str, i64, i64)]) -> NoteGroups {
+    let ng = arr.note_to_phone.last().map(|&g| g as usize + 1).unwrap_or(0);
+    // Per-group cv frame range (from arr): the group's start cv frame + total cv frames.
+    let mut cv_start = vec![0usize; ng];
+    let mut cv_count = vec![0usize; ng];
+    if ng > 0 {
+        let mut cursor = 0usize;
+        let mut seen = vec![false; ng];
+        for (i, &g) in arr.note_to_phone.iter().enumerate() {
+            let g = g as usize;
+            if !seen[g] {
+                cv_start[g] = cursor;
+                seen[g] = true;
+            }
+            let d = arr.phone_dur[i].max(0) as usize;
+            cv_count[g] += d;
+            cursor += d;
+        }
+    }
+    // Per-group DAW frame range (from the score triples). Grouped by the SAME `npitch` rule build_arrays
+    // uses — rest → 0, else → note_num (classified via the single `classify_lyric`, so a rest triple with
+    // a stray non-zero note_num still groups as a rest, matching the cv side; §9.5 editor==render).
+    let mut daw_start = vec![0usize; ng];
+    let mut daw_count = vec![0usize; ng];
+    let mut group_pitch = vec![0i64; ng];
+    if ng > 0 {
+        let mut g: i64 = -1;
+        let mut prev: Option<i64> = None;
+        let mut cursor = 0usize;
+        let mut seen = vec![false; ng];
+        for &(lyr, nn, fr) in score {
+            let npitch = if matches!(classify_lyric(lyr), LyricClass::Rest | LyricClass::Breath) { 0 } else { nn };
+            if prev != Some(npitch) {
+                g += 1;
+                prev = Some(npitch);
+            }
+            let gi = (g as usize).min(ng - 1);
+            if !seen[gi] {
+                daw_start[gi] = cursor;
+                group_pitch[gi] = npitch;
+                seen[gi] = true;
+            }
+            let d = fr.max(0) as usize;
+            daw_count[gi] += d;
+            cursor += d;
+        }
+    }
+    NoteGroups { ng, cv_start, cv_count, daw_start, daw_count, group_pitch }
+}
+
 /// Build the per-frame f0 (Hz) @50fps for the WHOLE score (length = Σ arr.phone_dur = T50 total).
 /// `arr.note_pitch` is RAW here (transpose is applied to the OUTPUT Hz, and to the content pitch
 /// separately by the caller). Two modes:
@@ -136,72 +200,24 @@ pub fn build_note_hz(
         Some(f0) => f0,
     };
 
-    let ng = arr.note_to_phone.last().map(|&g| g as usize + 1).unwrap_or(0);
-    if ng == 0 || f0.cents.is_empty() {
+    let g = compute_note_groups(arr, score);
+    if g.ng == 0 || f0.cents.is_empty() {
         return vec![0.0; t_total];
     }
-
-    // Per-group cv frame range (from arr): the group's start cv frame + total cv frames.
-    let mut cv_start = vec![0usize; ng];
-    let mut cv_count = vec![0usize; ng];
-    {
-        let mut cursor = 0usize;
-        let mut seen = vec![false; ng];
-        for (i, &g) in arr.note_to_phone.iter().enumerate() {
-            let g = g as usize;
-            if !seen[g] {
-                cv_start[g] = cursor;
-                seen[g] = true;
-            }
-            let d = arr.phone_dur[i].max(0) as usize;
-            cv_count[g] += d;
-            cursor += d;
-        }
-    }
-
-    // Per-group DAW frame range (from the score triples). Grouped by the SAME `npitch` rule build_arrays
-    // uses — rest → 0, else → note_num (classified via the single `classify_lyric`, so a rest triple with
-    // a stray non-zero note_num still groups as a rest, matching the cv side; §9.5 editor==render).
-    let mut daw_start = vec![0usize; ng];
-    let mut daw_count = vec![0usize; ng];
-    let mut group_pitch = vec![0i64; ng];
-    {
-        let mut g: i64 = -1;
-        let mut prev: Option<i64> = None;
-        let mut cursor = 0usize;
-        let mut seen = vec![false; ng];
-        for &(lyr, nn, fr) in score {
-            let npitch = if matches!(classify_lyric(lyr), LyricClass::Rest | LyricClass::Breath) { 0 } else { nn };
-            if prev != Some(npitch) {
-                g += 1;
-                prev = Some(npitch);
-            }
-            let gi = (g as usize).min(ng - 1);
-            if !seen[gi] {
-                daw_start[gi] = cursor;
-                group_pitch[gi] = npitch;
-                seen[gi] = true;
-            }
-            let d = fr.max(0) as usize;
-            daw_count[gi] += d;
-            cursor += d;
-        }
-    }
-
     let flen = f0.cents.len();
     let mut out = vec![0.0f32; t_total];
-    for g in 0..ng {
-        if group_pitch[g] <= 0 || cv_count[g] == 0 {
+    for gi in 0..g.ng {
+        if g.group_pitch[gi] <= 0 || g.cv_count[gi] == 0 {
             continue; // rest group → 0 Hz (unvoiced); nothing to sample
         }
-        for k in 0..cv_count[g] {
-            let cv_i = cv_start[g] + k;
+        for k in 0..g.cv_count[gi] {
+            let cv_i = g.cv_start[gi] + k;
             if cv_i >= t_total {
                 break;
             }
             // map this cv frame (center) to a DAW 50fps index within the group's DAW span.
-            let frac = (k as f64 + 0.5) / cv_count[g] as f64;
-            let daw_f = daw_start[g] as f64 + frac * daw_count[g] as f64;
+            let frac = (k as f64 + 0.5) / g.cv_count[gi] as f64;
+            let daw_f = g.daw_start[gi] as f64 + frac * g.daw_count[gi] as f64;
             let idx = (daw_f.floor() as usize).min(flen - 1);
             if f0.voiced.get(idx).copied().unwrap_or(0) != 0 {
                 out[cv_i] = cents_to_hz(f0.cents[idx] as f64 + (transpose as f64) * 100.0);
@@ -209,6 +225,70 @@ pub fn build_note_hz(
         }
     }
     out
+}
+
+/// Map a whole-score @50fps DAW envelope (`env`, length = Σ triple frames) to a per-cv-frame @50fps array
+/// (length = t_total = Σ phone_dur) via the SAME note-group cv↔DAW remap as `build_note_hz` — so a loudness
+/// or formant lane aligns with cv/f0 exactly even where a short note inflated its cv frames. EVERY group is
+/// sampled (rests too, for a continuous envelope — unlike f0 which zeroes rest groups). Empty `env` → all
+/// `default` (the flat / no-lane path = a no-op at the render). Pure.
+fn build_note_param(arr: &ScoreArrays, score: &[(&str, i64, i64)], env: &[f32], default: f32) -> Vec<f32> {
+    let t_total: usize = arr.phone_dur.iter().map(|&d| d.max(0) as usize).sum();
+    if env.is_empty() {
+        return vec![default; t_total];
+    }
+    let g = compute_note_groups(arr, score);
+    let flen = env.len();
+    let mut out = vec![default; t_total];
+    for gi in 0..g.ng {
+        if g.cv_count[gi] == 0 {
+            continue;
+        }
+        for k in 0..g.cv_count[gi] {
+            let cv_i = g.cv_start[gi] + k;
+            if cv_i >= t_total {
+                break;
+            }
+            let frac = (k as f64 + 0.5) / g.cv_count[gi] as f64;
+            let daw_f = g.daw_start[gi] as f64 + frac * g.daw_count[gi] as f64;
+            let idx = (daw_f.floor() as usize).min(flen - 1);
+            out[cv_i] = env[idx];
+        }
+    }
+    out
+}
+
+/// Apply a per-cv-frame absolute-gain envelope (loudness multiplier, length = t_total) to the concatenated
+/// mono audio IN PLACE: sample `s` maps to cv frame `floor(s/len · t_total)`, scaled by `gain_cv[cv]`.
+/// Uniform map (each cv frame ≈ equal audio samples). Applied BEFORE `peak_normalize` so it shapes RELATIVE
+/// dynamics — the volume fader owns the absolute level (§M-defer). Empty/flat env ⇒ untouched.
+fn apply_gain_env(audio: &mut [f32], gain_cv: &[f32]) {
+    if gain_cv.is_empty() || audio.is_empty() {
+        return;
+    }
+    let n = audio.len() as f64;
+    let tt = gain_cv.len();
+    for (s, v) in audio.iter_mut().enumerate() {
+        let cv = ((s as f64 / n) * tt as f64).floor() as usize;
+        *v *= gain_cv[cv.min(tt - 1)];
+    }
+}
+
+/// Warp the formant envelope of the concatenated mono audio by a per-cv-frame SEMITONE envelope
+/// (`formant_cv`, length = t_total), ratio = 2^(semi/12); sample→cv via the same uniform map as
+/// `apply_gain_env`. `formant_warp` passes ratio≈1 frames through verbatim, so an all-zero envelope is
+/// (near) lossless. Empty env ⇒ returns the audio unchanged. Applied AFTER the loudness gain, BEFORE
+/// `peak_normalize` (§M-defer order: 响度增益 → 共振腔 → 归一化).
+fn apply_formant_env(audio: Vec<f32>, formant_cv: &[f32]) -> Vec<f32> {
+    if formant_cv.is_empty() || audio.is_empty() {
+        return audio;
+    }
+    let n = audio.len() as f64;
+    let tt = formant_cv.len();
+    formant_warp(&audio, |s| {
+        let cv = ((s as f64 / n) * tt as f64).floor() as usize;
+        2.0_f32.powf(formant_cv[cv.min(tt - 1)] / 12.0)
+    })
 }
 
 // ─── resample 50 fps → SVC grid ──────────────────────────────────────────────────────────────────
@@ -322,12 +402,18 @@ pub fn render_score_sovits(
     flat_vol: f32,
     transpose: i64,
     f0: Option<&VocalF0>,
+    loudness: Option<&[f32]>,
+    formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score)?;
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
     let note_hz_full = build_note_hz(&arr, score, transpose, f0);
+    // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
+    // aligned to cv via the SAME group remap as f0 (short-note-inflation safe). None/empty ⇒ flat = no-op.
+    let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
+    let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
     // content note_pitch is transposed separately (grouping is shift-invariant).
     transpose_note_pitch(&mut arr.note_pitch, transpose);
     let chunks = chunk_at_sp(&arr, 400);
@@ -346,7 +432,19 @@ pub fn render_score_sovits(
         let mut feed = resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size)?;
         let real_t = pad_sovits_feed(&mut feed, m.min_frames); // M3: short trailing chunk
         apply_cluster_blend(&mut feed.cv, m.cluster, options.cluster_ratio); // SHARED retrieval blend
-        let vol = if m.vol_embedding { Some(vec![flat_vol; feed.t_tgt]) } else { None };
+        // vol_embedding (SoVITS 4.1): feed net_g a per-frame loudness = flat_vol · lane multiplier (this
+        // chunk's cv slice resampled to the hop grid). No lane ⇒ the original flat placeholder (parity).
+        let vol = if m.vol_embedding {
+            Some(match &loud_cv {
+                Some(lc) => {
+                    let seg = &lc[cv_cursor..(cv_cursor + chunk.t).min(lc.len())];
+                    torch_interp_nearest(seg, feed.t_tgt).into_iter().map(|mult| flat_vol * mult).collect()
+                }
+                None => vec![flat_vol; feed.t_tgt],
+            })
+        } else {
+            None
+        };
         let padded_t = feed.t_tgt;
         // score has no source wav → wav_m is `&[]` (only read by only_diffusion + no-vol, which the
         // command layer disallows for the score path).
@@ -360,6 +458,16 @@ pub fn render_score_sovits(
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
+    }
+    // Post-decode (§M-defer order 响度增益 → 共振腔 → 归一化): a vol_embedding model already got loudness in
+    // net_g above, so gain it here ONLY when there's no vol port (4.0); formant warps both. Then normalize.
+    if !m.vol_embedding {
+        if let Some(lc) = &loud_cv {
+            apply_gain_env(&mut audio, lc);
+        }
+    }
+    if let Some(fc) = &formant_cv {
+        audio = apply_formant_env(audio, fc);
     }
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
@@ -416,11 +524,16 @@ pub fn render_score_rvc(
     options: &RvcOptions,
     transpose: i64,
     f0: Option<&VocalF0>,
+    loudness: Option<&[f32]>,
+    formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score)?;
     let note_hz_full = build_note_hz(&arr, score, transpose, f0);
+    // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
+    let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
+    let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
     transpose_note_pitch(&mut arr.note_pitch, transpose);
     let chunks = chunk_at_sp(&arr, 400);
     let n_chunks = chunks.len().max(1);
@@ -448,6 +561,14 @@ pub fn render_score_rvc(
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
+    }
+    // Post-decode (§M-defer order 响度增益 → 共振腔 → 归一化): RVC has no net_g vol port, so loudness is an
+    // absolute gain envelope; formant warps the timbre. Both no-op when their env is None/flat.
+    if let Some(lc) = &loud_cv {
+        apply_gain_env(&mut audio, lc);
+    }
+    if let Some(fc) = &formant_cv {
+        audio = apply_formant_env(audio, fc);
     }
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
@@ -541,6 +662,40 @@ mod tests {
         assert!(hz[0..5].iter().all(|&h| h > 200.0), "note0 voiced, got {:?}", &hz[0..5]);
         assert!(hz[5..10].iter().all(|&h| h == 0.0), "rest group → silent, got {:?}", &hz[5..10]);
         assert!(hz[10..15].iter().all(|&h| h > 200.0), "note2 voiced, got {:?}", &hz[10..15]);
+    }
+
+    // ── ② M-defer: loudness/formant envelope alignment (build_note_param) + gain/formant application ──
+    #[test]
+    fn build_note_param_aligns_via_group_remap_and_defaults() {
+        // note / rest / note, uncapped rest → 15 cv == 15 DAW frames (1:1 here). A @50fps env samples through
+        // the SAME group remap as f0; EVERY group is sampled (rests too, unlike f0); empty env → default.
+        let score = [("あ", 60, 5), ("R", 0, 5), ("い", 62, 5)];
+        let arr = build_arrays_daw(&score).unwrap();
+        let env: Vec<f32> = (0..15).map(|i| i as f32).collect(); // one value per DAW frame
+        let out = build_note_param(&arr, &score, &env, 1.0);
+        assert_eq!(out.len(), 15);
+        assert!((out[0] - 0.0).abs() < 1.0, "frame 0 ≈ env[0], got {}", out[0]);
+        assert!((out[14] - 14.0).abs() < 1.0, "last frame ≈ env[14], got {}", out[14]);
+        assert!(out[7] > 4.0 && out[7] < 10.0, "rest group IS sampled (continuity), got {}", out[7]);
+        let flat = build_note_param(&arr, &score, &[], 0.5);
+        assert!(flat.iter().all(|&v| v == 0.5), "empty env → default everywhere (the flat/no-lane path)");
+    }
+
+    #[test]
+    fn apply_gain_env_scales_by_cv_frame() {
+        // 4 samples, 2-frame gain [1,3] → first half ×1, second half ×3 (uniform sample→cv map).
+        let mut audio = vec![1.0f32, 1.0, 1.0, 1.0];
+        apply_gain_env(&mut audio, &[1.0, 3.0]);
+        assert_eq!(audio, vec![1.0, 1.0, 3.0, 3.0]);
+        let mut a2 = vec![0.5f32, 0.5];
+        apply_gain_env(&mut a2, &[]); // empty → untouched
+        assert_eq!(a2, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn apply_formant_env_empty_is_identity() {
+        let audio = vec![0.1f32; 5000];
+        assert_eq!(apply_formant_env(audio.clone(), &[]), audio, "empty formant env → unchanged (no warp)");
     }
 
     // Note-model contrast (user Q, 2026-07-09): `ー` sustain (prolongation) vs a repeated `か` token
@@ -768,16 +923,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, pr::SCORE, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, LEGATO, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, REST, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, SUSTAIN, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, REARTIC, 256, 49, 2, &sopts, 0.0, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, pr::SCORE, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, LEGATO, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, REST, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, SUSTAIN, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, REARTIC, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, pr::SCORE, 768, 49, 2, &sopts, 0.1, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, pr::SCORE, 768, 49, 2, &sopts, 0.1, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -786,7 +941,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, pr::SCORE, 768, 49, 2, &ropts, 0, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, pr::SCORE, 768, 49, 2, &ropts, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

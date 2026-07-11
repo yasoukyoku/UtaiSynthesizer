@@ -95,6 +95,9 @@ interface AppState {
    *  shared ORT engine + release_gpu_sessions_except would make concurrent renders evict each other's
    *  session mid-inference. Gates the Render button everywhere + backs the throw-guard in vocalRender.ts. */
   vocalRenderActive: boolean;
+  /** ② The TRACK id whose vocal segment is CURRENTLY (re-)rendering — drives a spinner on that track's header
+   *  so a re-render (which keeps the old bake, no loading placeholder) doesn't LOOK frozen (§user). null = idle. */
+  renderingVocalTrackId: string | null;
   toasts: ToastState[];
   /** Transient corner banner (undo/redo info, save/load confirmation, …). `seq` bumps each time so a
    *  rapid retrigger updates the same single banner in place (no stacking, no viewport jump). */
@@ -130,6 +133,7 @@ interface AppState {
   toggleSnapSegments: () => void;
   toggleSnapPlayhead: () => void;
   setVocalRenderActive: (v: boolean) => void;
+  setRenderingVocalTrackId: (id: string | null) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
@@ -165,6 +169,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   snapSegments: loadSetting("utai.snapSegments", true),
   snapPlayhead: loadSetting("utai.snapPlayhead", true),
   vocalRenderActive: false,
+  renderingVocalTrackId: null,
   toasts: [],
   banner: null,
   confirm: null,
@@ -240,6 +245,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return { snapPlayhead: v };
     }),
   setVocalRenderActive: (v) => set({ vocalRenderActive: v }),
+  setRenderingVocalTrackId: (id) => set({ renderingVocalTrackId: id }),
   showToast: (message, type = "error") => {
     const id = Date.now();
     set((s) => ({ toasts: [...s.toasts, { message, type, id }] }));

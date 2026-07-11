@@ -195,3 +195,10 @@ export class TimeAxis {
     return out;
   }
 }
+
+/** Format an absolute tick as a "bar:beat:sub" transport readout (1-based bar/beat, 2-digit sub). ONE format,
+ *  shared by the Toolbar position display and the ② vocal-editor playhead readout (no drift). */
+export function formatBarBeat(axis: TimeAxis, tick: number): string {
+  const { bar, beat, sub } = axis.tickToBarBeat(tick);
+  return `${bar}:${beat}:${sub.toString().padStart(2, "0")}`;
+}

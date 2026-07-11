@@ -11,7 +11,7 @@
     "open": "打开",
     "save": "保存",
     "saveAs": "另存为",
-    "import": "导入"
+    "import": "导入乐谱"
   },
   "import": {
     "done": "已导入",
@@ -336,11 +336,17 @@
     "preview": "试听",
     "stop": "停止",
     "close": "关闭",
+    "lane": {
+      "loudness": "响度",
+      "formant": "共振腔"
+    },
     "sidebar": {
       "tabSinger": "歌手",
       "tabPitch": "调教",
       "voice": "歌手 / 渲染",
       "transpose": "移调",
+      "formant": "共振腔",
+      "formantTip": "整轨共振峰偏移（半音），与底部共振腔泳道叠加。正=更亮/更年轻，负=更暗/更浑厚；0=不改。",
       "pickVoice": "选择歌手…",
       "noVoiceModel": "未安装歌手模型",
       "goImport": "去资源管理导入",

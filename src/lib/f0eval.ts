@@ -23,8 +23,11 @@ export interface F0EvalOpts {
   defaultTransition: Required<NoteTransition>;
 }
 
-/** Linear-interpolate a PitchCurve (parallel strictly-increasing xs / ys) at `x`; hold flat outside; 0 if empty. */
-function evalCurveAt(c: PitchCurve | undefined, x: number): number {
+/** Linear-interpolate a PitchCurve (parallel strictly-increasing xs / ys) at `x`; hold flat outside; 0 if empty.
+ *  Exported (single interpolator, no fork) so the ② param lanes (loudness/formant) sample the SAME way pitchDev
+ *  does — the lane draw + the render feed both call it. Generic (no cents assumption); 0 = the neutral value
+ *  for both current params (loudness dB, formant semitones). */
+export function evalCurveAt(c: PitchCurve | undefined, x: number): number {
   if (!c || c.xs.length === 0) return 0;
   const { xs, ys } = c;
   const n = xs.length;
@@ -253,7 +256,52 @@ export function paintedDev(
     const x = Math.round(paint.xs[i]!);
     map.set(x, paint.ys[i]! - evalF0CentsAt(notes, undefined, x, opts).cents);
   }
-  const dxs = [...map.keys()].sort((a, b) => a - b);
+  return mergePaintedInterval(map, base);
+}
+
+/**
+ * ② Merge a param-lane paint drag (loudness / formant) into a segment's param curve. Unlike paintedDev, each
+ * drawn (relTick, value) point is the ABSOLUTE param value (no delta-vs-baseline subtraction). Interval-replace
+ * + the same zero-anchor ease-back to neutral 0 outside the painted span (so a locally-drawn hump can't bleed a
+ * constant offset out to the segment start). Pure — the store's normalizeCurve does the final round/dedup.
+ */
+export function paintedParamCurve(paint: { xs: number[]; ys: number[] }, base: PitchCurve | undefined): PitchCurve {
+  const map = new Map<number, number>();
+  for (let i = 0; i < paint.xs.length; i++) map.set(Math.round(paint.xs[i]!), paint.ys[i]!);
+  return mergePaintedInterval(map, base);
+}
+
+/**
+ * ② Slice a segment-relative curve (pitchDev / a param lane, X = ticks) at `boundary` into {left, right} for
+ * splitSegment. `left` keeps points with x < boundary + a lossless boundary SAMPLE (so it reproduces the
+ * source over [0, boundary]); `right` keeps points with x > boundary REBASED by −boundary + a lossless x=0
+ * SAMPLE. A point exactly on the seam goes to both. Our painted curves zero-anchor their ends, so a half with
+ * no source points is correctly `undefined` (= flat neutral). Reuses evalCurveAt for the seam value. Pure.
+ */
+export function sliceCurveAtTick(curve: PitchCurve | undefined, boundary: number): { left?: PitchCurve; right?: PitchCurve } {
+  if (!curve || curve.xs.length === 0) return {};
+  const bVal = evalCurveAt(curve, boundary);
+  const lxs: number[] = [], lys: number[] = [], rxs: number[] = [], rys: number[] = [];
+  for (let i = 0; i < curve.xs.length; i++) {
+    const x = curve.xs[i]!, y = curve.ys[i]!;
+    if (x < boundary) { lxs.push(x); lys.push(y); }
+    else if (x > boundary) { rxs.push(x - boundary); rys.push(y); }
+    else { lxs.push(x); lys.push(y); rxs.push(0); rys.push(y); } // exactly on the seam → both halves
+  }
+  // ALWAYS give each half a boundary seam sample so a half with NO explicit points still holds the source's
+  // value there — a flat non-zero region (e.g. a single +3dB point held across the back half) SURVIVES the
+  // split on BOTH halves (§user: the new segment's lane keeps +3dB), instead of dropping to neutral 0.
+  if (!lxs.length || lxs[lxs.length - 1] !== boundary) { lxs.push(boundary); lys.push(bVal); }
+  if (!rxs.length || rxs[0] !== 0) { rxs.unshift(0); rys.unshift(bVal); }
+  return { left: { xs: lxs, ys: lys }, right: { xs: rxs, ys: rys } };
+}
+
+/** Interval-replace merge shared by paintedDev/paintedParamCurve: the painted x-span (padded PAINT_EDGE_PAD,
+ *  zero-anchored just outside → linear ease back to 0, no 整条平移 bleed) replaces `base` there; base points
+ *  outside are kept. `paint` maps rounded relTick → the curve VALUE at that tick. Pure. */
+function mergePaintedInterval(paint: Map<number, number>, base: PitchCurve | undefined): PitchCurve {
+  const dxs = [...paint.keys()].sort((a, b) => a - b);
+  if (dxs.length === 0) return base ? { xs: [...base.xs], ys: [...base.ys] } : { xs: [], ys: [] };
   const xMin = dxs[0]!, xMax = dxs[dxs.length - 1]!;
   const loA = Math.max(0, xMin - PAINT_EDGE_PAD), hiA = xMax + PAINT_EDGE_PAD;
   const merged = new Map<number, number>();
@@ -261,9 +309,9 @@ export function paintedDev(
     const x = base.xs[i]!;
     if (x < loA || x > hiA) merged.set(x, base.ys[i]!);
   }
-  merged.set(loA, 0); // zero anchors just outside → linear ease back to the original pitch (no 整条平移 bleed)
+  merged.set(loA, 0); // zero anchors just outside → linear ease back to neutral (no 整条平移 bleed)
   merged.set(hiA, 0);
-  for (const x of dxs) merged.set(x, map.get(x)!); // painted points (interval-replace); an anchor at xMin is overridden
+  for (const x of dxs) merged.set(x, paint.get(x)!); // painted points (interval-replace); an anchor at xMin is overridden
   const xs = [...merged.keys()].sort((a, b) => a - b);
   return { xs, ys: xs.map((x) => merged.get(x)!) };
 }

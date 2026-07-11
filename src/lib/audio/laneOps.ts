@@ -108,10 +108,12 @@ export function laneVisiblePieces(
   stored: LaneClip[] | undefined,
   stemDurMs: number,
   tempo: number,
+  bakeOffsetMs = 0,
 ): LanePiece[] {
-  // ② vocal render: a notes segment's baked stem starts at the segment start (stem-ms 0 = segStart) and
-  // plays 1:1 — offset 0 (an audioClip's offsetMs is where its window sits inside a longer source stem).
-  const offset = seg.content.type === "audioClip" ? seg.content.offsetMs : 0;
+  // ② vocal render: a notes bake normally starts at the segment start (offset 0), BUT a notes SPLIT windows
+  // the same stem — the right half's bake carries `bakeOffsetMs` (ms into the stem) so it plays [off, off+dur]
+  // without re-rendering (an audioClip's offsetMs plays the same role). 0 ⇒ byte-identical to the un-split case.
+  const offset = seg.content.type === "audioClip" ? seg.content.offsetMs : bakeOffsetMs;
   const winStart = offset;
   const winEnd = offset + ticksToMs(seg.durationTicks, tempo);
   const clips = materializeClips(stored, stemDurMs);

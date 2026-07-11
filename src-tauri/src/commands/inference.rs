@@ -1184,6 +1184,8 @@ pub async fn render_vocal_segment(
     score: Vec<ScoreNote>,
     f0_cents: Vec<f32>,
     f0_voiced: Vec<u8>,
+    loudness_env: Vec<f32>,
+    formant_env: Vec<f32>,
     options: VocalRenderOptions,
 ) -> Result<SynthesisResult, String> {
     let app = state.inner().clone();
@@ -1221,6 +1223,17 @@ pub async fn render_vocal_segment(
             f0_cents.len(),
             total_frames
         ));
+    }
+    // ② loudness/formant lanes are @50fps DAW-frame envelopes (like f0). A non-empty one MUST match Σframes,
+    // else build_note_param would silently misalign it. Empty = no lane (flat = no-op). This is a DEFENSIVE
+    // backstop, practically unreachable — buildVocalScore samples both envelopes on the SAME frameCount as f0,
+    // and f0 is already length-checked above. It returns a stable English CODE (honors the S56 no-hardcoded-
+    // Chinese rule); the frontend has no special toast for it (unreachable), so it falls through to the generic
+    // render-failed message — acceptable for an internal invariant that can't fire on real input.
+    if (!loudness_env.is_empty() && loudness_env.len() as i64 != total_frames)
+        || (!formant_env.is_empty() && formant_env.len() as i64 != total_frames)
+    {
+        return Err("VOCAL_ENV_LEN".into());
     }
     let backend_type = match options.backend.as_str() {
         "rvc" => VoiceBackendType::Rvc,
@@ -1283,6 +1296,7 @@ pub async fn render_vocal_segment(
             sv.f0_shift = 0.0; // pitch shift is the Rust-side `transpose` (double-apply otherwise)
             sv.loudness_envelope = 1.0; // change_rms needs a source wav — the score has none
             sv.only_diffusion = false; // self-sing keeps the VITS synthesis of its own content
+            sv.formant = 0.0; // the audio-NODE formant scalar is separate — the vocal editor owns its formant lane/scalar (formant_env)
 
             // mirror run_sovits: evict foreign GPU sessions, keep this model's own family.
             {
@@ -1343,9 +1357,11 @@ pub async fn render_vocal_segment(
                     noise_channels: nch,
                     min_frames: min_t,
                 };
+                let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
+                let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &sv, VOCAL_FLAT_VOL,
-                    transpose, f0.as_ref(), &cancel, &progress,
+                    transpose, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })
@@ -1357,6 +1373,7 @@ pub async fn render_vocal_segment(
             let mut rv = options.rvc.clone();
             rv.f0_shift = 0.0;
             rv.rms_mix_rate = 1.0;
+            rv.formant = 0.0; // audio-node formant is separate from the vocal editor's formant lane/scalar (formant_env)
 
             app.inference.engine.release_gpu_sessions_except(&[path.clone()]);
             app.inference
@@ -1393,9 +1410,11 @@ pub async fn render_vocal_segment(
                     noise_channels: nch,
                     min_frames: min_t,
                 };
+                let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
+                let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &rv, transpose,
-                    f0.as_ref(), &cancel, &progress,
+                    f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })

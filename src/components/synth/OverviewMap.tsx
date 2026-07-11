@@ -156,7 +156,7 @@ export function OverviewMap() {
         ? `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.content.offsetMs}.${s.content.sourcePath}.${audioFiles[s.content.sourcePath]?.peaks.length ?? 0}.${segmentPlaysLanes(t, s) ? 1 : 0}.${laneSumSig(t, s)}`
         // ② vocal bake: rebake the preview when the rendered stem lands/changes (peaks length + path + dur).
         : (s.content.type === "notes" && s.processedOutputs?.length
-          ? `n${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.processedOutputs.map((o) => `${o.audioPath}:${o.totalDurationMs}:${o.waveformPeaks?.length ?? 0}`).join("+")}`
+          ? `n${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.processedOutputs.map((o) => `${o.audioPath}:${o.totalDurationMs}:${o.offsetMs ?? 0}:${o.waveformPeaks?.length ?? 0}`).join("+")}`
           : ""))).join(",")}`)
       .join(";")}`;
     const sizeChanged = !waveRef.current || waveRef.current.width !== cw || waveRef.current.height !== ch;
@@ -201,17 +201,19 @@ export function OverviewMap() {
             }
             if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
           } else if (seg.content.type === "notes" && seg.processedOutputs && seg.processedOutputs.length > 0) {
-            // ② Vocal bake: the rendered stem drawn across the segment (offset 0, whole stem — mirrors the
-            // arrangement main-row / sub-lane window). Vocal hue so it reads distinct from audio clips.
+            // ② Vocal bake: the rendered stem windowed [offset, offset+seg] into the box (offset from a notes
+            // SPLIT, else 0 = whole stem; mirrors the arrangement sub-lane window). Vocal hue to read distinct.
             const sx = (seg.startTick / totalTicks) * width;
             const sw = (seg.durationTicks / totalTicks) * width;
             const segMs = ticksToMs(seg.durationTicks, tempo);
             const vColor = rgba(TRACK_RGB.vocal, 0.6);
             for (const out of seg.processedOutputs) {
               if (!out.waveformPeaks || out.waveformPeaks.length === 0 || out.totalDurationMs <= 0) continue;
-              const endRatio = Math.min(1, segMs / out.totalDurationMs);
+              const off = Math.max(0, out.offsetMs ?? 0); // ② split: window into the SAME stem (off 0 = un-split)
+              const startRatio = Math.min(1, off / out.totalDurationMs);
+              const endRatio = Math.min(1, (off + segMs) / out.totalDurationMs);
               const wave = getWaveformCache(out.audioPath, out.waveformPeaks, vColor);
-              if (wave) blitWaveform(wc, wave, sx, 0, sw, height, 0, endRatio, width);
+              if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
             }
           }
         }

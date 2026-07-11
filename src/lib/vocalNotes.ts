@@ -228,6 +228,7 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     speakerId: clampInt(p.speakerId, 0, 76, 49),
     langId: clampInt(p.langId, 0, 6, 2),
     transpose: clampInt(p.transpose, -48, 48, 0),
+    formant: clampNum(p.formant ?? NaN, -24, 24, 0),
     transition: {
       offsetMs: clampNum(tr.offsetMs ?? NaN, -2000, 2000, DEFAULT_TRANSITION.offsetMs),
       durLeftMs: clampNum(tr.durLeftMs ?? NaN, 0, 2000, DEFAULT_TRANSITION.durLeftMs),

@@ -19,6 +19,7 @@ export function RvcNode(props: NodeProps) {
 
   // Param keys ARE the wire contract keys (see voiceDefaults.ts) — absent = contract default.
   const f0Shift = (params.f0_shift as number) ?? RVC_DEFAULTS.f0_shift;
+  const formant = (params.formant as number) ?? RVC_DEFAULTS.formant;
   const indexRatio = (params.index_ratio as number) ?? RVC_DEFAULTS.index_ratio;
   const protect = (params.protect as number) ?? RVC_DEFAULTS.protect;
   const noiseScale = (params.noise_scale as number) ?? RVC_DEFAULTS.noise_scale;
@@ -46,6 +47,13 @@ export function RvcNode(props: NodeProps) {
               title={t18(VOICE_STRINGS.f0ShiftTip, lang)}
               min={-24} max={24} step={1} value={f0Shift}
               onChange={(v) => updateParams({ f0_shift: v })}
+            />
+            {/* ② 共振腔/formant node scalar — post-decode formant_warp (pitch-preserving timbre shift). */}
+            <ParamSlider
+              label={t18({ zh: "共振腔", en: "Formant", ja: "フォルマント" }, lang)}
+              title={t18({ zh: "共振峰偏移（半音）：正=更亮/更年轻，负=更暗/更浑厚；0=不改。音高不变。", en: "Formant shift (semitones): higher = brighter/younger, lower = darker/fuller; 0 = no change. Pitch is preserved.", ja: "フォルマントシフト（半音）：高い=明るい/若い、低い=暗い/太い、0=変化なし。音高は不変。" }, lang)}
+              min={-12} max={12} step={1} value={formant}
+              onChange={(v) => updateParams({ formant: v })}
             />
             {/* hidden without the KNN index — 不能选择的控件一律不渲染（S36 用户拍板） */}
             {hasIndex && (

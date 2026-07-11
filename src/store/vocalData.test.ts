@@ -108,7 +108,7 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
       ],
       { pitchDev: { xs: [0, 240], ys: [0, 50] }, paramCurves: { loudness: { xs: [0, 480], ys: [0, -3] } } },
     ),
-    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2, breathToken: "AP",
+    { backend: "sovits", speakerId: 49, langId: 2, transpose: 2, formant: -3, breathToken: "AP",
       transition: { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 50 } },
   );
 
@@ -242,12 +242,78 @@ describe("Phase 4a — store additions", () => {
     expect(useHistoryStore.getState().canUndo).toBe(false); // no phantom undo step
   });
 
-  it("splitSegment on a notes segment is a no-op and never false-dirties (§9.6 gate)", () => {
+  it("splitSegment on a notes part: partitions notes + rebases + slices curves + one undo step (§user)", () => {
+    // fixture: n1@[0,240]. Add n2@[480,960] + a pitchDev/loudness curve spanning the part.
+    P().addVocalNote(T, S, { ...plainNote(), id: "n2", tick: 480, duration: 480, pitch: 64 });
+    P().setSegmentPitchDev(T, S, { xs: [0, 600, 1000], ys: [0, 50, 0] });
+    P().setSegmentParamCurve(T, S, "loudness", { xs: [0, 600, 1000], ys: [0, -3, 0] });
+    const r = P().splitSegment(T, S, 300); // 300 = in the REST between n1(ends 240) and n2(starts 480) → clean
+    expect(r).not.toBeNull();
+    const segs = P().tracks[0]!.segments;
+    expect(segs).toHaveLength(2);
+    const [left, right] = segs;
+    expect(left!.durationTicks).toBe(300);
+    expect(right!.startTick).toBe(300);
+    expect(right!.durationTicks).toBe(1920 - 300);
+    // n1(0-240) → left; n2(480-960) → right, tick rebased to 180 with a FRESH id (no shared-id corruption).
+    expect((left!.content as NotesContent).notes.map((n) => n.id)).toEqual(["n1"]);
+    const rn = (right!.content as NotesContent).notes;
+    expect(rn).toHaveLength(1);
+    expect(rn[0]!.tick).toBe(180); // 480 − 300
+    expect(rn[0]!.id).not.toBe("n2"); // fresh uuid
+    // curves sliced+rebased onto both halves (segment-relative). No bake in THIS fixture → processedOutputs
+    // stays undefined (a real bake is CARRIED + windowed via offsetMs — see the dedicated split-window test).
+    expect((left!.content as NotesContent).pitchDev).toBeDefined();
+    expect((right!.content as NotesContent).pitchDev).toBeDefined();
+    expect((left!.content as NotesContent).paramCurves?.loudness).toBeDefined();
+    expect((right!.content as NotesContent).paramCurves?.loudness).toBeDefined();
+    expect(left!.processedOutputs).toBeUndefined(); // no bake in this fixture → nothing to carry
+    // ONE undo step reverts the whole split back to a single segment.
+    useHistoryStore.getState().undo();
+    expect(P().tracks[0]!.segments).toHaveLength(1);
+  });
+
+  it("splitSegment CARRIES + WINDOWS a baked stem (offsetMs, renderedSig unchanged); UNDO restores it clean (§user)", () => {
+    // give the fixture a baked vocal stem; n1 is [0,240], split at 300 (in the rest) → leftDur 300 ticks.
+    P().replaceProcessedOutputs(T, S, [{ laneId: "vocal", laneLabel: "V", group: "V", audioPath: "stem.wav", totalDurationMs: 2000, waveformPeaks: [0.1], outputNodeId: "vocal", renderedSig: "sigFull" }]);
+    P().splitSegment(T, S, 300);
+    const [left, right] = P().tracks[0]!.segments;
+    // BOTH halves carry the SAME stem (not cleared) — split windows it like an audioClip, no re-bake.
+    expect(left!.processedOutputs?.[0]?.audioPath).toBe("stem.wav");
+    expect(right!.processedOutputs?.[0]?.audioPath).toBe("stem.wav");
+    // left keeps offset 0; right advances by the left duration in ms (ticksToMs(300,120)=312.5).
+    expect(left!.processedOutputs?.[0]?.offsetMs ?? 0).toBe(0);
+    expect(right!.processedOutputs?.[0]?.offsetMs).toBeCloseTo(312.5, 1);
+    // renderedSig stays the PARENT whole-stem sig on both (no re-stamp) — so an undo-of-split matches the full
+    // content. windowSig (this half's own sig) is stamped frontend-side (stampSplitWindowSigs) — not tested here.
+    expect(left!.processedOutputs?.[0]?.renderedSig).toBe("sigFull");
+    expect(right!.processedOutputs?.[0]?.renderedSig).toBe("sigFull");
+    // UNDO → back to ONE full segment; its whole-stem bake (offset 0, renderedSig=full) is restored, so the
+    // normal dirty-check matches the full content → no re-render on undo (dual-sig, real-window verified).
+    useHistoryStore.getState().undo();
+    const un = P().tracks[0]!.segments;
+    expect(un).toHaveLength(1);
+    expect(un[0]!.processedOutputs?.[0]?.offsetMs ?? 0).toBe(0);
+    expect(un[0]!.processedOutputs?.[0]?.renderedSig).toBe("sigFull");
+  });
+
+  it("splitSegment SNAPS a mid-note split to the note's END, keeping the note whole (§user)", () => {
+    const r = P().splitSegment(T, S, 100); // 100 is INSIDE n1[0,240] → snaps to 240
+    expect(r).not.toBeNull();
+    const segs = P().tracks[0]!.segments;
+    expect(segs[0]!.durationTicks).toBe(240); // snapped to n1's end
+    expect((segs[0]!.content as NotesContent).notes).toHaveLength(1); // n1 whole, on the left
+    expect((segs[1]!.content as NotesContent).notes).toHaveLength(0); // right half is the trailing rest
+  });
+
+  it("splitSegment at a segment edge / straddle-that-empties-a-half is a no-op (no false-dirty)", () => {
+    // With the fixture's single n1[0,240], splitting at 0 (edge) is a no-op; splitting inside n1 near the
+    // segment END would snap past it — but here n1 ends at 240 (mid-segment) so that path can't trigger; test
+    // the edge no-op which must NOT enter set() (dirty stays false).
     expect(P().dirty).toBe(false);
-    const r = P().splitSegment(T, S, 480); // 480 is inside the part, but a notes segment can't split
-    expect(r).toBeNull();
-    expect(P().dirty).toBe(false); // returned before entering set() — no dirty
-    expect(notes()).toHaveLength(1); // notes untouched (no shared-array corruption)
+    expect(P().splitSegment(T, S, 0)).toBeNull();
+    expect(P().dirty).toBe(false);
+    expect(P().tracks[0]!.segments).toHaveLength(1);
   });
 });
 

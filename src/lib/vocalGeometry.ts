@@ -54,6 +54,20 @@ export const yToCents = (y: number, v: VocalView): number =>
 /** Total content height of all 128 rows (for vertical scroll clamps). */
 export const rowsContentHeight = (rowH: number): number => (V_PITCH_MAX - V_PITCH_MIN + 1) * rowH;
 
+// ── ② bottom automation lane (loudness / formant) value↔y — the band is a FIXED strip [laneTop, laneTop+laneH]
+//    at the canvas bottom (NOT scrolled with the note rows). Higher value = higher on screen; neutral (0) sits
+//    at whatever y its [min,max] maps to. Pure (laneTop/laneH passed explicitly, like the rest of this module). ──
+/** Param value in [min,max] → screen Y within the lane band. Clamped so the line never leaves the band. */
+export const paramToY = (value: number, min: number, max: number, laneTop: number, laneH: number): number => {
+  const t = max > min ? (value - min) / (max - min) : 0.5;
+  return laneTop + (1 - Math.min(1, Math.max(0, t))) * laneH;
+};
+/** Screen Y within the lane band → the param value in [min,max] (clamped) — inverse of paramToY (for painting). */
+export const yToParam = (y: number, min: number, max: number, laneTop: number, laneH: number): number => {
+  const t = laneH > 0 ? 1 - (y - laneTop) / laneH : 0.5;
+  return min + Math.min(1, Math.max(0, t)) * (max - min);
+};
+
 // ── snapping (grid IS the snap unit, §9.1). floor for placement, round for move. ──
 export const snapFloor = (relTick: number, snapTicks: number): number =>
   snapTicks > 0 ? Math.floor(relTick / snapTicks) * snapTicks : Math.round(relTick);

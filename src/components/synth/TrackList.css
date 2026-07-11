@@ -447,3 +447,19 @@
   color: var(--text-primary);
 }
 
+
+/* ② vocal re-render spinner on the track header (§user: a re-render keeps the old bake, so without this it
+   looks frozen). Reuses the accent colour; a small rotating arc next to the track name. */
+.track-render-spinner {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent-primary);
+  margin-left: 4px;
+  flex: none;
+}
+.track-render-spinner svg {
+  animation: track-render-spin 0.8s linear infinite;
+}
+@keyframes track-render-spin {
+  to { transform: rotate(360deg); }
+}

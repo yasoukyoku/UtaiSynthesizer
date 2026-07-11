@@ -7,20 +7,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
+import { useAudioStore } from "../../store/audio";
 import { useTranslation } from "react-i18next";
 import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
 import { msToTicks } from "../../lib/audio/laneOps";
-import { TimeAxis } from "../../lib/timeAxis";
+import { TimeAxis, formatBarBeat } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { renderVocalPart, VOCAL_RENDER_BUSY, VOCAL_NO_VOICE, VOCAL_EMPTY, VOCAL_SPK_MIX_DIFFUSION } from "../../lib/vocal/vocalRender";
-import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
+import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
+import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
   tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
   rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
+  paramToY, yToParam,
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
 import { VocalSidebar } from "./VocalSidebar";
@@ -35,12 +38,23 @@ const GRID_DIVS = [
 ];
 const KEY_COL_W = 56; // fixed piano-key column at the canvas left edge
 const RULER_H = 18; // bar-number ruler strip along the top of the note area
+const LANE_H = 88; // ② bottom automation-lane band height (only reserved when the lane is OPEN — §M-defer)
 const EDGE_PX = 6; // note right-edge resize hotzone (screen px)
+
+// ② The bottom automation lane shows ONE param at a time (SynthV-style selector). Keys MUST match the
+// paramCurves keys the render feed reads (vocalRender.ts: "loudness" / "formant"). Ranges = the 稳健 defaults
+// (user pick); values are RELATIVE offsets, neutral 0 = "no change" at the band midline.
+type LaneParam = "loudness" | "formant";
+const LANE_PARAMS: { id: LaneParam; min: number; max: number; unit: string; labelKey: string }[] = [
+  { id: "loudness", min: -12, max: 12, unit: "dB", labelKey: "vocalEditor.lane.loudness" },
+  { id: "formant", min: -12, max: 12, unit: "st", labelKey: "vocalEditor.lane.formant" },
+];
+const laneCfg = (p: LaneParam) => LANE_PARAMS.find((x) => x.id === p)!;
 const DEFAULT_LYRIC = "あ"; // JA vowel — always in PHONE_TO_ID, never OOV/empty (§9.2)
 const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
 // can always drag down to it WITHOUT switching grid; the 60ms singability floor is a Phase-6 render concern (§user)
 
-type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "pitch-paint";
+type DragKind = "marquee" | "move" | "resize" | "create" | "marquee-delete" | "pitch-paint" | "param-point" | "ruler-seek";
 interface DragState {
   kind: DragKind;
   clientX0: number; clientY0: number;
@@ -56,6 +70,9 @@ interface DragState {
   startRel?: number; // move: CONTENT tick/pitch captured at pointerdown — dTick/dPitch measure from THESE
   startPitch?: number; // (not the screen origin), so scrolling mid-drag re-anchors to the cursor, no drift
   paint?: { xs: number[]; ys: number[] }; // pitch-paint: the drawn (relTick, absCents) path
+  param?: LaneParam; // param-point: which lane is being edited
+  pointCurve?: { xs: number[]; ys: number[] }; // param-point: the WORKING curve (points) being dragged
+  pointIdx?: number; // param-point: index of the point under the cursor
   previewNotes?: () => Note[]; // off-ref draw source during the gesture (attached by withPreview)
 }
 
@@ -74,6 +91,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const selectNotes = useProjectStore((s) => s.selectNotes);
   const setSegmentPitchDev = useProjectStore((s) => s.setSegmentPitchDev);
+  const setSegmentParamCurve = useProjectStore((s) => s.setSegmentParamCurve);
   const setActivePane = useAppStore((s) => s.setActivePane);
 
   // Resolve the notes part by the STABLE segment id (a track reorder / rename must not lose it).
@@ -83,7 +101,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (sg && sg.content.type === "notes") {
         return {
           trackId: tr.id, trackName: tr.name, seg: sg, notes: sg.content.notes, start: sg.startTick, dur: sg.durationTicks,
-          pitchDev: sg.content.pitchDev, transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
+          pitchDev: sg.content.pitchDev, paramCurves: sg.content.paramCurves,
+          transition: tr.vocalParams?.transition ?? DEFAULT_TRANSITION,
           vocalParams: tr.vocalParams ?? DEFAULT_VOCAL_PARAMS, voiceModel: tr.voiceModel,
         };
       }
@@ -93,6 +112,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const [tool, setTool] = useState<Tool>("arrow");
   const [gridDiv, setGridDiv] = useState(2); // 1/8 default
+  const [laneOpen, setLaneOpen] = useState(false); // ② bottom automation lane — collapsed by default (§user)
+  const [laneParam, setLaneParam] = useState<LaneParam>("loudness");
   const [maximized, setMaximized] = useState(false);
   const [playing, setPlaying] = useState(false);
   // GLOBAL render flag (one vocal render at a time) — reactive so every editor's button disables together.
@@ -119,6 +140,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // the track's default transition (per-note transitions live on each note).
   const pitchDevRef = useRef(part?.pitchDev);
   pitchDevRef.current = part?.pitchDev;
+  // ② automation-lane curves (loudness/formant) — synced every render so the imperative draw/pointer read fresh.
+  const paramCurvesRef = useRef(part?.paramCurves);
+  paramCurvesRef.current = part?.paramCurves;
   const transitionRef = useRef(part?.transition ?? DEFAULT_TRANSITION);
   transitionRef.current = part?.transition ?? DEFAULT_TRANSITION;
   // M3 breath: the pitch line skips breath notes (unvoiced — they break the line so the prev note releases /
@@ -165,6 +189,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   toolRef.current = tool;
   const gridDivRef = useRef(gridDiv);
   gridDivRef.current = gridDiv;
+  const laneOpenRef = useRef(laneOpen);
+  laneOpenRef.current = laneOpen;
+  const laneParamRef = useRef(laneParam);
+  laneParamRef.current = laneParam;
+  // ② global transport playhead (project store, ABSOLUTE tick) — read via ref inside the draw closure and
+  // driven by a dedicated store.subscribe (below), NOT a reactive selector (that would re-render 60×/s).
+  const playheadTickRef = useRef(useProjectStore.getState().playheadTick);
   const tempoRef = useRef(tempo);
   tempoRef.current = tempo;
   // Same meter authority as the arrangement — for the sub-beat grid (built from the global time signature).
@@ -173,6 +204,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   axisRef.current = timeAxis;
 
   const snapTicks = () => TICKS_PER_BEAT / gridDivRef.current; // 480/div: 1/4=480,1/8=240,1/16=120,1/8T=160,1/16T=80,1/12=40
+
+  // ② lane geometry (live, from refs): when the bottom automation lane is OPEN it reserves LANE_H at the
+  // canvas bottom, so the note-row area shrinks — EVERY visible-note-height / scroll clamp must subtract it
+  // (else the lowest rows sit permanently behind the lane at max scroll). laneOpen=false ⇒ 0 = exact old behavior.
+  const laneBandH = () => (laneOpenRef.current ? LANE_H : 0);
+  const noteBottom = () => sizeRef.current.h - laneBandH(); // y where the note rows end (lane band below it)
+  const visNoteH = () => Math.max(1, sizeRef.current.h - RULER_H - laneBandH()); // visible note-row height
 
   // rAF-coalesced redraw + preview-playback rAF (scrubs the segment following evalF0Cents so you can HEAR
   // the smooth transitions / vibrato — placeholder tone, not the SVC voice, §9.7).
@@ -220,14 +258,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   edgeScrollRef.current = () => {
     const d = dragRef.current, m = mouseRef.current;
     if (!d || (d.kind !== "marquee" && d.kind !== "marquee-delete") || !m) { edgeRafRef.current = 0; return; }
-    const { w, h } = sizeRef.current, v = viewRef.current;
+    const { w } = sizeRef.current, v = viewRef.current;
     const EDGE = 28, SPEED = 10;
     let dx = 0, dy = 0;
     if (m.x < KEY_COL_W + EDGE) dx = -SPEED; else if (m.x > w - EDGE) dx = SPEED;
-    if (m.y < RULER_H + EDGE) dy = -SPEED; else if (m.y > h - EDGE) dy = SPEED;
+    if (m.y < RULER_H + EDGE) dy = -SPEED; else if (m.y > noteBottom() - EDGE) dy = SPEED; // note-area bottom (above the lane)
     if (!dx && !dy) { edgeRafRef.current = 0; return; } // cursor left the border → stop
     const maxSX = Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, w - KEY_COL_W));
-    const maxSY = Math.max(0, rowsContentHeight(v.rowH) - (h - RULER_H));
+    const maxSY = Math.max(0, rowsContentHeight(v.rowH) - visNoteH());
     const nSX = Math.max(0, Math.min(maxSX, v.scrollX + dx)), nSY = Math.max(0, Math.min(maxSY, v.scrollY + dy));
     d.clientX0 -= nSX - v.scrollX; d.clientY0 -= nSY - v.scrollY; // pin the anchor to content
     v.scrollX = nSX; v.scrollY = nSY;
@@ -263,12 +301,38 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const ns = notesRef.current;
     const avg = ns.length > 0 ? ns.reduce((a, n) => a + n.pitch, 0) / ns.length : 60;
     const v = viewRef.current;
-    const visH = sizeRef.current.h - RULER_H; // visible note-area height (below the ruler)
-    v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visH), pitchToY(avg, { ...v, scrollY: 0 }) - (sizeRef.current.h + RULER_H) / 2));
+    const visH = visNoteH(); // visible note-row height (below the ruler, above the lane band if open)
+    // center avg at the MIDDLE of the visible note area [RULER_H, noteBottom()] — not the full canvas, else
+    // an open lane pushes the average pitch ~LANE_H/2 too low (into/behind the band). noteBottom()==h when closed.
+    v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visH), pitchToY(avg, { ...v, scrollY: 0 }) - (RULER_H + noteBottom()) / 2));
     v.scrollX = Math.max(0, startRef.current * v.ppt - 24);
     requestRedraw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentId]);
+
+  // ② Re-clamp scrollY when the lane opens/closes. Toggling the lane reserves/frees LANE_H, changing the
+  // visible note-row height, so a scroll position valid for the old height can overshoot the new max — leaving
+  // the lowest rows behind the band (open) or a blank strip below the last row (close) until the next wheel
+  // event. Clamp to the new max here (band from the `laneOpen` STATE, not the ref, so timing is unambiguous).
+  useEffect(() => {
+    const v = viewRef.current;
+    const vis = Math.max(1, sizeRef.current.h - RULER_H - (laneOpen ? LANE_H : 0));
+    const max = Math.max(0, rowsContentHeight(v.rowH) - vis);
+    if (v.scrollY > max) { v.scrollY = max; requestRedraw(); }
+  }, [laneOpen, requestRedraw]);
+
+  // ② Drive a redraw when the global transport playhead moves (playback / seek), OFF-React (a reactive
+  // selector would re-render the whole editor 60×/s). Mirrors TimelineRuler's imperative subscribe — the
+  // draw closure reads playheadTickRef.current, so it just needs re-invoking each time the tick changes.
+  useEffect(() => {
+    const unsub = useProjectStore.subscribe((s) => {
+      if (s.playheadTick !== playheadTickRef.current) {
+        playheadTickRef.current = s.playheadTick;
+        requestRedraw();
+      }
+    });
+    return unsub;
+  }, [requestRedraw]);
 
   // ── the draw closure (rebuilt when content/selection/tool change) ──
   useEffect(() => {
@@ -478,6 +542,65 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         }
       }
 
+      // ── ② bottom automation lane (loudness / formant) — a FIXED band drawn OVER the bottom LANE_H of the
+      //    note area (its opaque bg covers the note rows/pitch-line that painted into this region). Shows ONE
+      //    param at a time (selector in the header); the curve is a RELATIVE offset, neutral 0 at the midline. ──
+      if (laneOpenRef.current) {
+        const cfg = laneCfg(laneParamRef.current);
+        const laneTop = h - LANE_H;
+        ctx.fillStyle = col("--bg-panel") || "#1a2236";
+        ctx.fillRect(0, laneTop, w, LANE_H);
+        ctx.strokeStyle = col("--border-default") || "#2a3a5c"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, laneTop + 0.5); ctx.lineTo(w, laneTop + 0.5); ctx.stroke();
+        // vertical meter grid within the band (time alignment with the notes above)
+        for (const g of axisRef.current.subGridLinesInRange(Math.max(0, Math.floor(absFrom)), Math.ceil(absTo), 12)) {
+          const gx = noteAreaX + tickToX(g.tick, v);
+          if (gx < noteAreaX) continue;
+          const a = g.level === "bar" ? 0.28 : g.level === "beat" ? 0.13 : g.sub % 2 === 0 ? 0.05 : 0.025;
+          ctx.strokeStyle = `rgba(226,232,244,${a})`; ctx.lineWidth = g.level === "bar" ? 1.4 : 1;
+          ctx.beginPath(); ctx.moveTo(Math.round(gx) + 0.5, laneTop + 1); ctx.lineTo(Math.round(gx) + 0.5, h); ctx.stroke();
+        }
+        // neutral (0) midline
+        const midY = paramToY(0, cfg.min, cfg.max, laneTop, LANE_H);
+        ctx.strokeStyle = "rgba(226,232,244,0.22)"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(noteAreaX, Math.round(midY) + 0.5); ctx.lineTo(w, Math.round(midY) + 0.5); ctx.stroke(); ctx.setLineDash([]);
+        // the param ENVELOPE = a piecewise-linear curve through the user's control POINTS (§user: insert +
+        // drag points, not freehand). Live = the working curve during a point drag, else the stored curve.
+        const stored = paramCurvesRef.current?.[cfg.id];
+        const dr0 = dragRef.current;
+        const live = dr0?.kind === "param-point" && dr0.pointCurve && dr0.param === cfg.id ? dr0.pointCurve : stored;
+        ctx.strokeStyle = col("--accent-primary") || "#39c5bb"; ctx.lineWidth = 1.8; ctx.globalAlpha = 0.95;
+        ctx.beginPath();
+        for (let px = noteAreaX; px <= w; px += 2) {
+          const rel = xToNoteTick(px - KEY_COL_W, start, v);
+          const y = paramToY(evalCurveAt(live, rel), cfg.min, cfg.max, laneTop, LANE_H);
+          if (px === noteAreaX) ctx.moveTo(px, y); else ctx.lineTo(px, y);
+        }
+        ctx.stroke(); ctx.globalAlpha = 1;
+        // control-point HANDLES (grabbable squares) — the dragged one highlighted.
+        if (live && live.xs.length) {
+          for (let i = 0; i < live.xs.length; i++) {
+            const hx = noteAreaX + noteTickToX(live.xs[i]!, start, v);
+            if (hx < noteAreaX - 4 || hx > w + 4) continue;
+            const hy = paramToY(live.ys[i]!, cfg.min, cfg.max, laneTop, LANE_H);
+            const activePt = dr0?.kind === "param-point" && dr0.pointIdx === i && dr0.param === cfg.id;
+            ctx.fillStyle = activePt ? (col("--note-selected") || "#8b5cf6") : (col("--accent-primary") || "#39c5bb");
+            ctx.fillRect(Math.round(hx) - 3, Math.round(hy) - 3, 6, 6);
+          }
+        }
+        // left scale column (over the key-column width): +max / 0 / min + unit — numbers + symbol, no i18n.
+        ctx.fillStyle = col("--bg-deep") || "#080b14"; ctx.fillRect(0, laneTop, KEY_COL_W, LANE_H);
+        ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+        ctx.beginPath(); ctx.moveTo(KEY_COL_W + 0.5, laneTop); ctx.lineTo(KEY_COL_W + 0.5, h); ctx.stroke();
+        ctx.fillStyle = col("--text-muted") || "#556b94"; ctx.font = "9px system-ui, sans-serif";
+        ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        ctx.fillText(`+${cfg.max}`, KEY_COL_W - 4, laneTop + 9);
+        ctx.fillText("0", KEY_COL_W - 4, midY);
+        ctx.fillText(`${cfg.min}`, KEY_COL_W - 4, h - 9);
+        ctx.textAlign = "left"; ctx.textBaseline = "top";
+        ctx.fillText(cfg.unit, 4, laneTop + 3);
+      }
+
       // ── mouse-position guide (ALL tools): a vertical line at the snapped tick under the cursor, drawn
       //    LAST (over the key column + ruler) so it is NEVER covered — fixes "disappears at the leftmost".
       const mp = mouseRef.current;
@@ -492,10 +615,30 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         }
       }
 
+      // ── ② pink transport playhead (absolute tick → note-area x), drawn LAST so it's never covered; spans
+      //    the note rows AND the lane band. Solid #ff6b9d (PLAYHEAD, shared) + a triangle cap in the ruler
+      //    disambiguates it from the same-pink f0 line. Its bar:beat readout sits top-right of the ruler. ──
+      {
+        const phx = noteAreaX + tickToX(playheadTickRef.current, v);
+        if (phx >= noteAreaX && phx <= w) {
+          const xr = Math.round(phx) + 0.5;
+          ctx.strokeStyle = PLAYHEAD; ctx.lineWidth = 2; ctx.globalAlpha = 1;
+          ctx.beginPath(); ctx.moveTo(xr, RULER_H); ctx.lineTo(xr, h); ctx.stroke();
+          ctx.fillStyle = PLAYHEAD;
+          ctx.beginPath(); ctx.moveTo(phx - 4, RULER_H - 7); ctx.lineTo(phx + 4, RULER_H - 7); ctx.lineTo(phx, RULER_H); ctx.closePath(); ctx.fill();
+        }
+        // bar:beat:sub readout (transport position) — top-right of the ruler, reuses formatBarBeat (no drift).
+        const txt = formatBarBeat(axisRef.current, Math.max(0, playheadTickRef.current));
+        ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+        const tw = ctx.measureText(txt).width;
+        ctx.fillStyle = col("--bg-panel") || "#1a2236"; ctx.fillRect(w - tw - 10, 0, tw + 10, RULER_H);
+        ctx.fillStyle = PLAYHEAD; ctx.fillText(txt, w - 5, RULER_H / 2);
+      }
+
       ctx.restore();
     };
     requestRedraw();
-  }, [part?.notes, selectedNotes, tool, gridDiv, requestRedraw]);
+  }, [part?.notes, selectedNotes, tool, gridDiv, laneOpen, laneParam, requestRedraw]);
 
   // Warm the shared AudioContext on mount so the first key-preview isn't delayed by an on-gesture resume;
   // and make focus-loss / unmount RELEASE a sustained preview tone (belt-and-suspenders with pointerup/
@@ -525,7 +668,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
   // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
   // so re-invoking it is enough (no rebuild).
-  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.transition, part?.vocalParams?.breathToken, timeSignature, tempo, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.paramCurves, part?.transition, part?.vocalParams?.breathToken, timeSignature, tempo, requestRedraw]);
 
   // Attach the live preview-notes closure to the drag state (draw reads it).
   const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {
@@ -573,6 +716,25 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       }
     }
     return null;
+  };
+
+  // ② index of the lane control-point under the cursor (within LANE_PT_HIT px), or -1. Uses the CURRENTLY
+  // selected lane's stored curve; the caller has already confirmed the cursor is in the lane band.
+  const LANE_PT_HIT = 8;
+  const laneParamPointAt = (clientX: number, clientY: number): number => {
+    const cfg = laneCfg(laneParamRef.current);
+    const curve = paramCurvesRef.current?.[cfg.id];
+    if (!curve || curve.xs.length === 0) return -1;
+    const { x: cx, y: cy } = localXY(clientX, clientY);
+    const v = viewRef.current, laneTop = noteBottom();
+    let best = -1, bestD = LANE_PT_HIT;
+    for (let i = 0; i < curve.xs.length; i++) {
+      const px = KEY_COL_W + noteTickToX(curve.xs[i]!, startRef.current, v);
+      const py = paramToY(curve.ys[i]!, cfg.min, cfg.max, laneTop, LANE_H);
+      const d = Math.hypot(px - cx, py - cy);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
   };
 
   // ── compute the off-ref preview note array for a live gesture (no store writes) ──
@@ -643,9 +805,49 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (e.button !== 0) return;
     setActivePane("vocal");
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
-    const { x } = localXY(e.clientX, e.clientY);
-    if (x < KEY_COL_W) { // piano key → preview tone
-      playback.playPreviewTone(pitchToHz(pitchAt(e.clientY)), 220);
+    const { x, y } = localXY(e.clientX, e.clientY);
+    if (x < KEY_COL_W) { // left column: a piano key (note area) → preview tone; the lane's scale column → INERT
+      if (y < noteBottom()) playback.playPreviewTone(pitchToHz(pitchAt(e.clientY)), 220);
+      return; // never fall through to the note-area marquee (which would clear the selection)
+    }
+    // ② TOP RULER → seek the global transport playhead (§user: re-listen after an edit WITHOUT going to the main
+    // arrangement to find the spot). Drag scrubs; during playback set `seeking` so the transport reschedules from
+    // the new tick on release (mirrors TimelineRuler). Absolute tick space (playhead is absolute; x already ≥ KEY_COL_W).
+    if (y < RULER_H) {
+      useProjectStore.getState().setPlayhead(Math.max(0, Math.round(xToTick(x - KEY_COL_W, viewRef.current))));
+      if (useAudioStore.getState().isPlaying) useAudioStore.getState().setSeeking(true);
+      dragRef.current = withPreview({
+        kind: "ruler-seek", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+        activeIds: [], orig: new Map(), newNote: null, anchorRelTick: 0, moved: false, additive: false,
+      });
+      requestRedraw();
+      return;
+    }
+    // ② bottom automation lane: INSERT / DRAG control points (§user: point-based, not freehand). Guarded FIRST so
+    // a lane gesture never touches notes. Click on empty → insert a point + drag it; click ON a point → drag it;
+    // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
+    if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
+      const cfg = laneCfg(laneParamRef.current);
+      const laneTop = noteBottom();
+      const stored = paramCurvesRef.current?.[cfg.id];
+      const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+      const val = Math.round(yToParam(y, cfg.min, cfg.max, laneTop, LANE_H) * 10) / 10; // 0.1-unit quantize
+      const hitIdx = laneParamPointAt(e.clientX, e.clientY);
+      let curve: { xs: number[]; ys: number[] }, idx: number;
+      if (hitIdx >= 0 && stored) {
+        curve = { xs: [...stored.xs], ys: [...stored.ys] }; idx = hitIdx; // grab the existing point
+      } else {
+        const xs = stored ? [...stored.xs] : [], ys = stored ? [...stored.ys] : [];
+        const exact = xs.indexOf(rel);
+        if (exact >= 0) { curve = { xs, ys }; idx = exact; } // a point already sits at this tick → move it
+        else { let pos = xs.findIndex((xx) => xx > rel); if (pos < 0) pos = xs.length; xs.splice(pos, 0, rel); ys.splice(pos, 0, val); curve = { xs, ys }; idx = pos; }
+      }
+      dragRef.current = withPreview({
+        kind: "param-point", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
+        activeIds: [], orig: new Map(), newNote: null, anchorRelTick: rel, moved: false, additive: false,
+        param: cfg.id, pointCurve: curve, pointIdx: idx,
+      });
+      requestRedraw();
       return;
     }
     const hit = noteAt(e.clientX, e.clientY);
@@ -746,7 +948,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       // the tail / Pen anywhere on a note, §user). Delete keeps its CSS crosshair.
       const cv = canvasRef.current;
       if (cv) {
-        if (toolRef.current === "delete") cv.style.cursor = "";
+        if (p.y < RULER_H && p.x >= KEY_COL_W) cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
+        else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
+          cv.style.cursor = laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
+        else if (toolRef.current === "delete") cv.style.cursor = "";
         else { const hov = noteAt(e.clientX, e.clientY); cv.style.cursor = hov && (toolRef.current === "pen" || hov.onEdge) ? "ew-resize" : ""; }
       }
       requestRedraw(); return; // hover → redraw so the mouse-position guide follows (all tools)
@@ -755,8 +960,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (d.kind === "marquee" || d.kind === "marquee-delete") {
       d.curX = p.x; d.curY = p.y;
       if (!edgeRafRef.current) { // kick off edge auto-scroll when the cursor reaches a border
-        const { w, h } = sizeRef.current, EDGE = 28;
-        if (p.x < KEY_COL_W + EDGE || p.x > w - EDGE || p.y < RULER_H + EDGE || p.y > h - EDGE)
+        const { w } = sizeRef.current, EDGE = 28;
+        // bottom trigger = the note-area bottom (above the lane band), MATCHING edgeScrollRef's condition —
+        // else the lane's LANE_H creates a dead zone where the loop wants to scroll but was never kicked off.
+        if (p.x < KEY_COL_W + EDGE || p.x > w - EDGE || p.y < RULER_H + EDGE || p.y > noteBottom() - EDGE)
           edgeRafRef.current = requestAnimationFrame(edgeScrollRef.current);
       }
     }
@@ -778,6 +985,20 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         d.paint.xs.push(Math.max(0, Math.round(relTickAt(e.clientX))));
         d.paint.ys.push(cy);
         playback.setPreviewToneHz(centsToHz(cy)); // hear the pitch being drawn
+      } else if (d.kind === "param-point" && d.pointCurve && d.pointIdx !== undefined && d.param) {
+        const cfg = laneCfg(d.param); // ② drag the grabbed point: x clamped strictly between neighbors (xs stays sorted), y in range
+        const c = d.pointCurve, i = d.pointIdx;
+        const rel = Math.max(0, Math.round(relTickAt(e.clientX)));
+        const lo = i > 0 ? c.xs[i - 1]! + 1 : 0;
+        const hi = i < c.xs.length - 1 ? c.xs[i + 1]! - 1 : Number.MAX_SAFE_INTEGER;
+        c.xs[i] = Math.min(hi, Math.max(lo, rel));
+        c.ys[i] = Math.round(yToParam(localXY(e.clientX, e.clientY).y, cfg.min, cfg.max, noteBottom(), LANE_H) * 10) / 10;
+      } else if (d.kind === "ruler-seek") {
+        // playback may have STARTED mid-drag (Space is a global key) → pin `seeking` here too, not just at
+        // pointerdown, so the transport reschedules from the drop tick on release (mirrors TimelineRuler:124).
+        const a = useAudioStore.getState();
+        if (a.isPlaying && !a.seeking) a.setSeeking(true);
+        useProjectStore.getState().setPlayhead(Math.max(0, Math.round(xToTick(localXY(e.clientX, e.clientY).x - KEY_COL_W, viewRef.current))));
       } else if (d.kind === "create" && d.newNote) {
         const snap = snapTicks();
         const end = Math.max(d.anchorRelTick + snap, snapRound(relTickAt(e.clientX), snap));
@@ -819,9 +1040,41 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       requestRedraw();
       return;
     }
+    if (d.kind === "ruler-seek") {
+      // release the seek flag so the transport reschedules from the new playhead (if it was playing).
+      if (useAudioStore.getState().seeking) useAudioStore.getState().setSeeking(false);
+      requestRedraw();
+      return;
+    }
+    if (d.kind === "param-point" && d.pointCurve && d.param && part) {
+      // ② one set() → one undo step. An empty curve (last point dragged out of use / deleted) clears the lane.
+      // normalizeCurve(...,"param") rounds/dedups + canonical key order (sig↔serialize consistent).
+      setSegmentParamCurve(part.trackId, segmentId, d.param, d.pointCurve.xs.length ? d.pointCurve : undefined);
+      requestRedraw();
+      return;
+    }
     // move / resize
     commitNotes(computePreview(d), d.activeIds);
-  }, [selectNotes, part, segmentId, setSegmentPitchDev, requestRedraw]);
+  }, [selectNotes, part, segmentId, setSegmentPitchDev, setSegmentParamCurve, requestRedraw]);
+
+  // ② right-click a lane control point → delete it (onPointerDown bails on non-left buttons). Suppress the
+  // native context menu inside the editor either way. One set() = one undo step; empty curve clears the lane.
+  const onContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!part || !laneOpenRef.current) return;
+    const { x, y } = localXY(e.clientX, e.clientY);
+    if (y < noteBottom() || x < KEY_COL_W) return;
+    const idx = laneParamPointAt(e.clientX, e.clientY);
+    if (idx < 0) return;
+    const cfg = laneCfg(laneParamRef.current);
+    const stored = paramCurvesRef.current?.[cfg.id];
+    if (!stored) return;
+    const xs = stored.xs.filter((_, i) => i !== idx);
+    const ys = stored.ys.filter((_, i) => i !== idx);
+    setSegmentParamCurve(part.trackId, segmentId, cfg.id, xs.length ? { xs, ys } : undefined);
+    requestRedraw();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [part, segmentId, setSegmentParamCurve, requestRedraw]);
 
   const notesInMarquee = (d: DragState): string[] => {
     const v = viewRef.current;
@@ -854,6 +1107,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const onDoubleClick = useCallback((e: React.MouseEvent) => {
     if (toolRef.current === "pitch" || toolRef.current === "delete") return; // lyric editing lives in Arrow/Pen only (§user)
+    // ② lane guard (mirror onPointerDown:818 / onContextMenu:1055): never open a lyric editor inside the bottom
+    // automation lane — a note can scroll behind the band, and the <input> would render overlaying the lane.
+    if (laneOpenRef.current && localXY(e.clientX, e.clientY).y >= noteBottom()) return;
     const hit = noteAt(e.clientX, e.clientY);
     if (!hit || !part) return;
     setLyricEdit(lyricEditFor(hit.note));
@@ -971,15 +1227,15 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       // fiddly coordinate part: solve scrollY so the cursor's continuous cents map back to its screen y.
       e.preventDefault();
       const cvR = canvasRef.current?.getBoundingClientRect();
-      const cy = Math.max(RULER_H, cvR ? e.clientY - cvR.top : (sizeRef.current.h + RULER_H) / 2); // cursor y (in the note area)
+      const cy = Math.min(noteBottom(), Math.max(RULER_H, cvR ? e.clientY - cvR.top : (sizeRef.current.h + RULER_H) / 2)); // cursor y clamped to the note area (not the lane)
       const anchorCents = yToCents(cy, v);
       v.rowH = Math.max(V_ROW_H_MIN, Math.min(V_ROW_H_MAX, v.rowH * (e.deltaY > 0 ? 0.9 : 1.1)));
-      const maxSY = Math.max(0, rowsContentHeight(v.rowH) - (sizeRef.current.h - RULER_H));
+      const maxSY = Math.max(0, rowsContentHeight(v.rowH) - visNoteH());
       v.scrollY = Math.max(0, Math.min(maxSY, centsToY(anchorCents, { ...v, scrollY: 0 }) - cy)); // keep anchorCents under the cursor
     } else if (e.shiftKey) {
       v.scrollX = Math.max(0, Math.min(maxScrollX(), v.scrollX + e.deltaY));
     } else {
-      v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - (sizeRef.current.h - RULER_H)), v.scrollY + e.deltaY));
+      v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visNoteH()), v.scrollY + e.deltaY));
     }
     // A wheel-scroll during a note-move changes the cursor's CONTENT pitch, but onPointerMove doesn't fire
     // (the mouse didn't move) — so refresh the sustained preview tone here, else it keeps sounding the old
@@ -1015,6 +1271,21 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     >
       <div className="vocal-editor-header">
         <span className="vocal-editor-title">{part.trackName || t("vocalEditor.title")}</span>
+        {/* ② loudness / formant automation — two labels sitting DIRECTLY next to the track title (§user: no
+            "lane" jargon, no extra open step). Each is a self-toggle: click opens + selects that param's bottom
+            editor; click the active one again closes it; clicking the other switches param with it staying open. */}
+        <div className="vocal-lane-ctl">
+          {LANE_PARAMS.map((lp) => (
+            <button
+              key={lp.id}
+              className={`snap-toggle vocal-grid-btn${laneOpen && laneParam === lp.id ? " active" : ""}`}
+              onClick={() => {
+                if (laneOpen && laneParam === lp.id) setLaneOpen(false);
+                else { setLaneParam(lp.id); setLaneOpen(true); }
+              }}
+            >{t(lp.labelKey)}</button>
+          ))}
+        </div>
         <div className="vocal-editor-header-spacer" />
         <label className="vocal-grid-label">{t("vocalEditor.grid")}</label>
         <div className="vocal-grid-select">
@@ -1055,6 +1326,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             onPointerCancel={onPointerUp}
             onLostPointerCapture={onPointerUp}
             onDoubleClick={onDoubleClick}
+            onContextMenu={onContextMenu}
             onWheel={onWheel}
           />
           {tool === "delete" && <div className="vocal-delete-overlay" />}

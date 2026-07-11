@@ -386,6 +386,7 @@ function TrackItem({
 }: TrackItemProps) {
   const { t } = useTranslation();
   const colorVar = trackTypeCssVar(track.trackType);
+  const rendering = useAppStore((s) => s.renderingVocalTrackId) === track.id; // ② spinner while this track re-renders
 
   const lanes = getLanes(track);
   const laneLayout = getLaneLayout(track);
@@ -438,6 +439,11 @@ function TrackItem({
                 </span>
               )}
             </div>
+            {rendering && (
+              <span className="track-render-spinner" title={t("vocalEditor.render.rendering")}>
+                <svg viewBox="0 0 24 24" width="12" height="12"><path fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" d="M12 3a9 9 0 1 0 9 9" /></svg>
+              </span>
+            )}
             {/* SOURCE selector — AUDIO tracks only: a vocal track has no "original" audio to fall back to,
                 so the toggle would only mislead. lit = the original plays and the sub-lanes leave the output. */}
             {hasLanes && track.trackType !== "vocal" && (

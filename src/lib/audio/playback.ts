@@ -206,7 +206,7 @@ export async function playAllTracks(
           // source. Sliced/trimmed/deleted regions simply produce no piece → silence; the stem is untouched.
           const group = laneGroupId(out);
           const stemDurMs = seg.content.type === "audioClip" ? seg.content.totalDurationMs : out.totalDurationMs;
-          const pieces = laneVisiblePieces(seg, seg.laneOps?.[group], stemDurMs, tempo);
+          const pieces = laneVisiblePieces(seg, seg.laneOps?.[group], stemDurMs, tempo, out.offsetMs ?? 0);
 
           for (const piece of pieces) {
             if (piece.endTick <= playheadTick) continue;

@@ -30,6 +30,7 @@ export function SoVitsNode(props: NodeProps) {
 
   // Param keys ARE the wire contract keys (see voiceDefaults.ts) — absent = contract default.
   const f0Shift = (params.f0_shift as number) ?? SOVITS_DEFAULTS.f0_shift;
+  const formant = (params.formant as number) ?? SOVITS_DEFAULTS.formant;
   const noiseScale = (params.noise_scale as number) ?? SOVITS_DEFAULTS.noise_scale;
   const clusterRatio = (params.cluster_ratio as number) ?? SOVITS_DEFAULTS.cluster_ratio;
   const loudnessEnvelope = (params.loudness_envelope as number) ?? SOVITS_DEFAULTS.loudness_envelope;
@@ -86,6 +87,13 @@ export function SoVitsNode(props: NodeProps) {
               title={t18(VOICE_STRINGS.f0ShiftTip, lang)}
               min={-24} max={24} step={1} value={f0Shift}
               onChange={(v) => updateParams({ f0_shift: v })}
+            />
+            {/* ② 共振腔/formant node scalar — post-decode formant_warp (pitch-preserving timbre shift). */}
+            <ParamSlider
+              label={t18({ zh: "共振腔", en: "Formant", ja: "フォルマント" }, lang)}
+              title={t18({ zh: "共振峰偏移（半音）：正=更亮/更年轻，负=更暗/更浑厚；0=不改。音高不变。", en: "Formant shift (semitones): higher = brighter/younger, lower = darker/fuller; 0 = no change. Pitch is preserved.", ja: "フォルマントシフト（半音）：高い=明るい/若い、低い=暗い/太い、0=変化なし。音高は不変。" }, lang)}
+              min={-12} max={12} step={1} value={formant}
+              onChange={(v) => updateParams({ formant: v })}
             />
             <ParamSlider
               label={t18(VOICE_STRINGS.noise, lang)}

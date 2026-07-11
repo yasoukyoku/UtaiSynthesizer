@@ -3,7 +3,7 @@
 // command exists (Option A: Rust consumes the TS cents array).
 import { describe, it, expect } from "vitest";
 import { interpShape } from "./interpolateShape";
-import { evalF0CentsAt, evalF0CentsFrames, paintedDev } from "./f0eval";
+import { evalF0CentsAt, evalF0CentsFrames, paintedDev, paintedParamCurve, sliceCurveAtTick, evalCurveAt } from "./f0eval";
 import type { Note, NoteTransition } from "../types/project";
 
 describe("interpolateShape", () => {
@@ -191,5 +191,43 @@ describe("evalF0Cents (SynthV-aligned layering §10.3)", () => {
     expect(c.ys[0]).toBe(0);
     expect(c.ys[c.ys.length - 1]).toBe(0);
     expect(Math.max(...c.ys)).toBe(300); // +300¢ peak preserved exactly
+  });
+});
+
+describe("② param lanes — paintedParamCurve + sliceCurveAtTick", () => {
+  it("paintedParamCurve: stores the ABSOLUTE drawn value (no delta), zero-anchored outside the span", () => {
+    const c = paintedParamCurve({ xs: [200, 240, 280], ys: [3, 5, 3] }, undefined);
+    expect(c.ys[0]).toBe(0); // loA zero anchor
+    expect(c.ys[c.ys.length - 1]).toBe(0); // hiA zero anchor
+    expect(Math.max(...c.ys)).toBe(5); // absolute painted value (unlike paintedDev, no baseline subtraction)
+    expect(evalCurveAt(c, 240)).toBeCloseTo(5, 6); // inside the span → the painted value
+    expect(evalCurveAt(c, 0)).toBe(0); // outside → neutral 0 (no 整条平移 bleed)
+  });
+
+  it("sliceCurveAtTick: partitions + rebases each half with a lossless seam", () => {
+    const { left, right } = sliceCurveAtTick({ xs: [0, 600, 1000], ys: [0, 50, 0] }, 300);
+    expect(left).toBeDefined();
+    expect(evalCurveAt(left, 0)).toBeCloseTo(0, 6);
+    expect(evalCurveAt(left, 300)).toBeCloseTo(25, 6); // interp of 0@0..50@600 at the seam
+    expect(right).toBeDefined();
+    expect(evalCurveAt(right, 0)).toBeCloseTo(25, 6); // rebased seam sample at x=0
+    expect(evalCurveAt(right, 300)).toBeCloseTo(50, 6); // 600 − 300
+    expect(evalCurveAt(right, 700)).toBeCloseTo(0, 6); // 1000 − 300
+  });
+
+  it("sliceCurveAtTick: undefined curve → empty halves", () => {
+    expect(sliceCurveAtTick(undefined, 100)).toEqual({});
+  });
+
+  it("sliceCurveAtTick: a flat held region survives on BOTH halves — no reset to neutral (§user split)", () => {
+    // a single point at 1000 (+3) → the curve holds +3 EVERYWHERE (flat). Split at 500 → both halves flat +3
+    // (the new segment's lane keeps +3dB, instead of the point-less left half dropping to neutral 0).
+    const { left, right } = sliceCurveAtTick({ xs: [1000], ys: [3] }, 500);
+    expect(left).toBeDefined();
+    expect(evalCurveAt(left, 0)).toBeCloseTo(3, 6);
+    expect(evalCurveAt(left, 500)).toBeCloseTo(3, 6);
+    expect(right).toBeDefined();
+    expect(evalCurveAt(right, 0)).toBeCloseTo(3, 6);
+    expect(evalCurveAt(right, 500)).toBeCloseTo(3, 6);
   });
 });

@@ -11,7 +11,7 @@
     "open": "Open",
     "save": "Save",
     "saveAs": "Save As",
-    "import": "Import"
+    "import": "Import Score"
   },
   "import": {
     "done": "Imported",
@@ -336,11 +336,17 @@
     "preview": "Preview",
     "stop": "Stop",
     "close": "Close",
+    "lane": {
+      "loudness": "Loudness",
+      "formant": "Formant"
+    },
     "sidebar": {
       "tabSinger": "Singer",
       "tabPitch": "Tuning",
       "voice": "Voice / Render",
       "transpose": "Transpose",
+      "formant": "Formant",
+      "formantTip": "Track-wide formant shift (semitones), added on top of the bottom formant lane. Higher = brighter/younger, lower = darker/fuller; 0 = no change.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",

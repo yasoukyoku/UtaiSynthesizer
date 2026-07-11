@@ -208,6 +208,11 @@ pub fn run_pipeline(
     //    (matches the old single-segment run_pipeline's final pad_array_center). For
     //    native_sr == model_sr this is a no-op — the per-piece pads already sum exactly. ──
     audio_out = pad_array_center(audio_out, out_len(total_in));
+    // ② node-level 共振腔/formant (scalar): warp the WHOLE final signal (mono at m.sample_rate). ratio =
+    // 2^(semi/12); ≈1 passes through verbatim, so formant=0 is a near-lossless no-op. Self-sing neutralizes it.
+    if options.formant.abs() > 1e-6 {
+        audio_out = utai_dsp::formant_warp(&audio_out, |_| 2.0_f32.powf(options.formant / 12.0));
+    }
     progress(1.0);
 
     Ok(SynthesisResult {

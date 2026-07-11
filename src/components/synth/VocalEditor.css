@@ -51,6 +51,12 @@
   gap: 2px;
 }
 
+/* ② automation-lane header controls (toggle + param selector) — sits next to the track title, left side */
+.vocal-lane-ctl {
+  display: flex;
+  gap: 2px;
+}
+
 /* the grid/snap buttons — small, fit "1/16T" text, truly square */
 .vocal-grid-btn {
   width: auto;

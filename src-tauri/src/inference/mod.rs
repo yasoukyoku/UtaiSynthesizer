@@ -42,6 +42,10 @@ pub struct RvcOptions {
     /// Run the aux extractors (ContentVec + RMVPE) on the global GPU device instead of the
     /// S35 forced-CPU default. Faster, costs VRAM (see ensure_aux_loaded_on rationale).
     pub gpu_extract: bool,
+    /// ② 共振腔/formant — node-level SCALAR in semitones (post-decode formant_warp ratio = 2^(semi/12)).
+    /// 0 = no shift (a ratio-1 pass-through, near-lossless). Higher = brighter/younger. Neutralized in the
+    /// self-sing render (render_vocal_segment) — the vocal editor owns its own formant lane.
+    pub formant: f32,
 }
 
 impl Default for RvcOptions {
@@ -58,6 +62,7 @@ impl Default for RvcOptions {
             resample_sr: 0,
             seed: 0,
             gpu_extract: false,
+            formant: 0.0,
         }
     }
 }
@@ -205,6 +210,9 @@ pub struct SovitsOptions {
     /// None / "" = the aux default vocoder (S36 behavior, byte-identical path).
     /// An unknown name is a LOUD error, never a silent fallback.
     pub vocoder_name: Option<String>,
+    /// ② 共振腔/formant — node-level SCALAR in semitones (post-decode formant_warp ratio = 2^(semi/12));
+    /// 0 = no shift. Neutralized in the self-sing render (render_vocal_segment). See RvcOptions::formant.
+    pub formant: f32,
     /// TEST-ONLY (E2E gates): zero every diffusion noise draw (q_sample / initial randn /
     /// naive per-step noise) to mirror the python reference's ZeroNoise monkeypatch.
     /// Deliberately NOT in voiceDefaults.ts — never reachable from the UI.
@@ -232,6 +240,7 @@ impl Default for SovitsOptions {
             auto_f0: false,
             gpu_extract: false,
             vocoder_name: None,
+            formant: 0.0,
             debug_zero_noise: false,
         }
     }

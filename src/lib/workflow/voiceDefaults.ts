@@ -61,6 +61,8 @@ export interface RvcOptions {
   /** Run the aux feature/f0 extractors (ContentVec + RMVPE) on the global GPU device instead
    * of the S35 forced-CPU default. Faster, but costs VRAM. */
   gpu_extract: boolean;
+  /** ② 共振腔/formant — node-level SCALAR in semitones (post-decode formant_warp). 0 = no shift. */
+  formant: number;
 }
 
 export interface SovitsOptions {
@@ -108,6 +110,8 @@ export interface SovitsOptions {
    * shallow diffusion + the enhancer; null = the built-in aux default. An unknown name is a
    * loud Rust error (never a silent fallback to the default). */
   vocoder_name: string | null;
+  /** ② 共振腔/formant — node-level SCALAR in semitones (post-decode formant_warp). 0 = no shift. */
+  formant: number;
 }
 
 export const RVC_DEFAULTS: RvcOptions = {
@@ -122,6 +126,7 @@ export const RVC_DEFAULTS: RvcOptions = {
   resample_sr: 0,
   seed: 0,
   gpu_extract: false,
+  formant: 0,
 };
 
 export const SOVITS_DEFAULTS: SovitsOptions = {
@@ -145,6 +150,7 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   auto_f0: false,
   gpu_extract: false,
   vocoder_name: null,
+  formant: 0,
 };
 
 /**

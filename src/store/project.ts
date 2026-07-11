@@ -14,6 +14,7 @@ import type {
 } from "../types/project";
 import { TimeAxis } from "../lib/timeAxis";
 import { normalizeNotesArray, normalizeCurve, DEFAULT_TRANSITION } from "../lib/vocalNotes";
+import { sliceCurveAtTick } from "../lib/f0eval";
 import { orderProcessedOutputs, laneControlFor } from "../lib/trackLayout";
 import {
   laneGroupName,
@@ -49,7 +50,7 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 // ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
 
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
-export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: "AP" };
+export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: "AP" };
 
 // `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
 // live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;
@@ -259,13 +260,21 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   splitSegment: (trackId, segmentId, atTick) => {
     const newId = crypto.randomUUID();
-    // Upfront no-op guard (§5 false-dirty): a NOTES segment (§9.6 gate), an out-of-range tick, or a
-    // missing segment are all no-ops — return WITHOUT entering set(), so `dirty` is never falsely flipped
-    // (the inner checks below stay as belt-and-braces). Fixes the latent no-op-dirty on every reject path.
+    // Upfront no-op guard (§5 false-dirty): an out-of-range tick / missing segment are no-ops — return WITHOUT
+    // entering set() so `dirty` never falsely flips. ② NOTES snap: if the split falls INSIDE a note, SNAP it
+    // to that note's END so the note stays WHOLE on the left half (§user — a mid-note cut can't cleanly halve
+    // the 1/12 grid and a straddling note would poke out of its box). A snap that empties either half = no-op.
+    let splitAt = atTick;
     {
       const st = get();
       const seg = st.tracks.find((t) => t.id === trackId)?.segments.find((sg) => sg.id === segmentId);
-      if (!seg || seg.content.type === "notes" || atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return null;
+      if (!seg || atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return null;
+      if (seg.content.type === "notes") {
+        const rel = atTick - seg.startTick;
+        const straddler = seg.content.notes.find((n) => n.tick < rel && rel < n.tick + n.duration);
+        if (straddler) splitAt = seg.startTick + straddler.tick + straddler.duration;
+        if (splitAt <= seg.startTick || splitAt >= seg.startTick + seg.durationTicks) return null;
+      }
     }
     // Is a render in flight for this segment? If so the split must NOT drop the in-progress sub-lanes:
     // carry the loading placeholders to the right half too + link it, so the single ongoing render lands
@@ -277,6 +286,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const linkedSource: string | undefined = wfState.renderLinks[segmentId];
     const rendering = wfState.executions[segmentId]?.status === "running" || linkedSource !== undefined;
     let didSplit = false;
+    let splitNotes = false;
     set((s) => ({
       dirty: true,
       tracks: s.tracks.map((t) => {
@@ -285,16 +295,61 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (segIdx < 0) return t;
         const seg = t.segments[segIdx]!;
 
-        // ② GATE (§9.6, highest-risk anchor): a NOTES segment must NOT split via this audioClip path —
-        // it would give both halves the SAME notes array + SAME note ids + un-rebased segment-relative
-        // ticks = silent corruption. notes-aware split (partition + deep-copy + tick-rebase + clip) is
-        // future work; until then splitting a notes part is a no-op (the UI also gates it — belt & braces).
-        if (seg.content.type === "notes") return t;
+        if (splitAt <= seg.startTick || splitAt >= seg.startTick + seg.durationTicks) return t;
 
-        if (atTick <= seg.startTick || atTick >= seg.startTick + seg.durationTicks) return t;
-
-        const leftDuration = atTick - seg.startTick;
+        const leftDuration = splitAt - seg.startTick;
         const rightDuration = seg.durationTicks - leftDuration;
+
+        // ── ② NOTES split (§9.6): partition by ONSET (the straddler was snapped to its end upfront, so no
+        //    note crosses the seam), give the RIGHT notes FRESH ids + rebase ticks by −leftDuration (SAME ids
+        //    = corruption), slice+rebase pitchDev/paramCurves, run each half through the write-hygiene funnel
+        //    (normalizeNotesArray/normalizeCurve — canonical order, omit-empty → no false-dirty), and CARRY +
+        //    WINDOW the baked stem onto both halves (a split is NOT a re-render — see the deposit block below). ──
+        if (seg.content.type === "notes") {
+          const c = seg.content;
+          const leftNotes: Note[] = [];
+          const rightNotes: Note[] = [];
+          for (const n of c.notes) {
+            if (n.tick < leftDuration) leftNotes.push(n);
+            else rightNotes.push({ ...n, id: crypto.randomUUID(), tick: n.tick - leftDuration });
+          }
+          const dev = sliceCurveAtTick(c.pitchDev, leftDuration);
+          const sliceParams = (which: "left" | "right"): Record<string, PitchCurve> | undefined => {
+            if (!c.paramCurves) return undefined;
+            const out: Record<string, PitchCurve> = {};
+            for (const k of Object.keys(c.paramCurves).sort()) {
+              const norm = normalizeCurve(sliceCurveAtTick(c.paramCurves[k], leftDuration)[which], "param");
+              if (norm) out[k] = norm;
+            }
+            return Object.keys(out).length ? out : undefined;
+          };
+          const devL = normalizeCurve(dev.left, "cents");
+          const devR = normalizeCurve(dev.right, "cents");
+          const paramsL = sliceParams("left");
+          const paramsR = sliceParams("right");
+          const leftContent: SegmentContent = { type: "notes", notes: normalizeNotesArray(leftNotes), ...(devL ? { pitchDev: devL } : {}), ...(paramsL ? { paramCurves: paramsL } : {}) };
+          const rightContent: SegmentContent = { type: "notes", notes: normalizeNotesArray(rightNotes), ...(devR ? { pitchDev: devR } : {}), ...(paramsR ? { paramCurves: paramsR } : {}) };
+          // ② CARRY + WINDOW the baked stem — a split is NOT a re-render (§user: "把已有整段在切点切开"). Both halves
+          // share the parent stem; the left keeps its offset (its shorter box windows [offset, offset+leftDur]),
+          // the right advances the stem offset by the left duration (ms) → plays [offset+leftDur, …]. Loading
+          // placeholders are dropped. The bakes keep their ORIGINAL renderedSig (the whole-stem content); the
+          // frontend caller then stamps each half's `windowSig` = vocalRenderSig(this half's content) so
+          // isVocalDirty accepts the window with NO re-render (dual-sig: renderedSig OR windowSig must match).
+          // Both sigs live on the OVERLAY (never undoable) so they can't desync — an undo-of-split leaves the
+          // whole-stem renderedSig matching the restored full content (clean), and any real drift fails BOTH.
+          const leftMs = ticksToMs(leftDuration, s.tempo);
+          const settled = (seg.processedOutputs ?? []).filter((o) => !o.loading);
+          const leftOuts = settled.map((o) => ({ ...o }));
+          const rightOuts = settled.map((o) => ({ ...o, offsetMs: (o.offsetMs ?? 0) + leftMs }));
+          const leftSeg: Segment = { ...seg, durationTicks: leftDuration, content: leftContent, processedOutputs: leftOuts.length ? leftOuts : undefined };
+          const rightSeg: Segment = { id: newId, startTick: splitAt, durationTicks: rightDuration, content: rightContent, ...(rightOuts.length ? { processedOutputs: rightOuts } : {}) };
+          didSplit = true;
+          splitNotes = true;
+          const newSegments = [...t.segments];
+          newSegments.splice(segIdx, 1, leftSeg, rightSeg);
+          return { ...t, segments: newSegments };
+        }
+
         const leftSeg: Segment = { ...seg, durationTicks: leftDuration };
 
         let rightContent = seg.content;
@@ -315,7 +370,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         ).map((o) => ({ ...o }));
         const rightSeg: Segment = {
           id: newId,
-          startTick: atTick,
+          startTick: splitAt,
           durationTicks: rightDuration,
           content: rightContent,
           // Carry the per-segment node graph AND the baked sub-lane render to the right half — dropping
@@ -337,11 +392,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         return { ...t, segments: newSegments };
       }),
     }));
-    if (didSplit) {
-      // Clone the render CACHE (+ settled node badges/execution) onto the new half so a POST-render split
-      // "remembers" it was rendered: deleting + reconnecting an Output edge re-deposits from the cache
-      // instead of treating the upstream as never-executed and forcing a full re-run. The cache paths
-      // point at the original segment's cache dir, whose stem files (whole-source) both halves window into.
+    if (didSplit && !splitNotes) {
+      // audioClip only: clone the render CACHE (+ settled node badges/execution) onto the new half so a
+      // POST-render split "remembers" it was rendered: deleting + reconnecting an Output edge re-deposits
+      // from the cache instead of a full re-run. NOTES have no workflow cache/execution (their bake is a
+      // vocalRender overlay, CARRIED + windowed above via offsetMs+windowSig → no re-render), so this is skipped.
       useWorkflowStore.getState().cloneSegmentState(segmentId, newId);
       // Mid-render: link the new half to the ULTIMATE render owner (chain through an existing link) so the
       // single ongoing render deposits onto it too when it settles.

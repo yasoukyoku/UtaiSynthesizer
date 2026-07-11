@@ -197,6 +197,16 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           cfg={{ min: -24, max: 24, step: 1, unit: "st", bipolar: true }}
           onChange={(v) => setVocalParams(trackId, { transpose: v })}
         />
+        {/* ② 共振腔/formant track-level SCALAR (semitones), ADDED to the bottom formant lane at render. */}
+        <Slider
+          label={t("vocalEditor.sidebar.formant")}
+          value={vocalParams.formant ?? 0}
+          cfg={{ min: -12, max: 12, step: 1, unit: "st", bipolar: true }}
+          overridden={(vocalParams.formant ?? 0) !== 0}
+          resetTitle={t("vocalEditor.sidebar.formantTip")}
+          onReset={() => setVocalParams(trackId, { formant: 0 })}
+          onChange={(v) => setVocalParams(trackId, { formant: v })}
+        />
         {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
             custom trigger never steals a glyph the user needs as a real lyric. */}
         <div className="vsb-inline">

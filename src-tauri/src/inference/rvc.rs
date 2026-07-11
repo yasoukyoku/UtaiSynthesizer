@@ -231,6 +231,11 @@ pub fn run_pipeline(
         audio_opt = resample(&audio_opt, m.sample_rate, options.resample_sr);
         final_sr = options.resample_sr;
     }
+    // ② node-level 共振腔/formant (scalar): warp the WHOLE final signal (mono at final_sr) after the optional
+    // resample. ratio = 2^(semi/12); ≈1 passes through verbatim → formant=0 is a near-lossless no-op.
+    if options.formant.abs() > 1e-6 {
+        audio_opt = utai_dsp::formant_warp(&audio_opt, |_| 2.0_f32.powf(options.formant / 12.0));
+    }
     // NO int16 quantization (original's audio_max/max_int16 normalize skipped — we stay f32).
     progress(1.0);
 

@@ -88,6 +88,18 @@ export interface ProcessedOutput {
    *  like the rest of processedOutputs) so it never causes false-dirty / a phantom undo step; it rides the
    *  `.usp` with the bake so a reloaded project doesn't needlessly re-render on first Play. */
   renderedSig?: string;
+  /** ② Vocal bake ONLY: on a notes SPLIT the carried stem is the PARENT's (renderedSig stays the parent's full
+   *  sig), but this half only shows a WINDOW of it — `windowSig` = the vocalRenderSig of THIS half's (windowed)
+   *  content. isVocalDirty accepts the bake when EITHER renderedSig OR windowSig matches the current content:
+   *  renderedSig matches after an undo-of-split (the full stem == the restored full content) and windowSig
+   *  matches right after the split (the window == this half). Both live on the OVERLAY (never undoable), so
+   *  they can't desync from the bake — any real drift (edit / tempo / param / singer) fails BOTH → re-render. */
+  windowSig?: string;
+  /** ② Vocal bake ONLY: ms INTO the stem where this half's playback + waveform begin — set on the RIGHT half
+   *  of a notes SPLIT so BOTH halves WINDOW the same baked stem (like an audioClip's offsetMs) instead of
+   *  re-rendering (§user: "把已有整段在切点切开"). 0/absent = the stem starts at the segment start (the normal,
+   *  un-split case → byte-identical). Overlay-only, like renderedSig (rides the bake, not the history sig). */
+  offsetMs?: number;
 }
 
 export interface Segment {
@@ -210,6 +222,10 @@ export interface VocalTrackParams {
   langId: number;
   /** Track-level transpose in semitones, applied to every note's pitch → f0. */
   transpose: number;
+  /** ② 共振腔/formant — track-level SCALAR in semitones (singer-tab), ADDED to the per-frame formant lane
+   *  (`paramCurves["formant"]`); the sum → `formant_warp` ratio = 2^(semi/12) at render. 0 = no shift (a
+   *  ratio-1 pass-through). Always present (default 0), mirroring `transpose` — never optional-stripped. */
+  formant: number;
   /** Track-level DEFAULT note transition — every field concrete. A note's NoteTransition overrides it
    *  per-field, so every note has a smooth SynthV-style glide by default (§10.3). */
   transition: Required<NoteTransition>;
