@@ -101,6 +101,11 @@ function serializeProject(
     // bundles too (optional field — an open→close cycle must not leave `false` in the JSON, else a
     // never-touched project and a touched-then-restored one differ byte-wise; playOriginal precedent).
     if (stripView || !track.loudnessLaneOpen) delete (track as { loudnessLaneOpen?: boolean }).loudnessLaneOpen;
+    // S59b per-group envelope visibility — identical posture (the store toggle keeps only true
+    // entries with sorted keys, so a kept record is already canonical).
+    if (stripView || !track.laneLoudnessOpen || Object.keys(track.laneLoudnessOpen).length === 0) {
+      delete (track as { laneLoudnessOpen?: Record<string, boolean> }).laneLoudnessOpen;
+    }
     return track;
   });
 
@@ -245,6 +250,29 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
           ...(pitchDev ? { pitchDev } : {}),
           ...(paramCurves ? { paramCurves } : {}),
         };
+      }
+      // S59b UNTRUSTED LOAD BOUNDARY for the per-group loudness envelopes (same funnel as the
+      // clip curves: normalizeCurve + dB clamp; hostile group keys sanitized, empty bag dropped).
+      // audioClip-only: a hand-edited file must not smuggle a playback-domain envelope onto a
+      // vocal bake (vocal loudness is render-domain by design).
+      if (rest.laneLoudness !== undefined) {
+        let laneLoudness: Record<string, PitchCurve> | undefined;
+        if (content.type === "audioClip" && rest.laneLoudness && typeof rest.laneLoudness === "object") {
+          const out: Record<string, PitchCurve> = {};
+          for (const k of Object.keys(rest.laneLoudness).sort()) {
+            const key = sanitizeText(k, 64);
+            const nc = normalizeCurve(rest.laneLoudness[k], "param");
+            if (key && nc) {
+              out[key] = {
+                xs: nc.xs,
+                ys: nc.ys.map((y) => Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, y))),
+              };
+            }
+          }
+          if (Object.keys(out).length > 0) laneLoudness = out;
+        }
+        if (laneLoudness) rest.laneLoudness = laneLoudness;
+        else delete rest.laneLoudness;
       }
       let processedOutputs = rest.processedOutputs;
       if (processedOutputs) {

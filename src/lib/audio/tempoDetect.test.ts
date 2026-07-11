@@ -183,3 +183,42 @@ describe("setSegmentStretch (S59 Tempo Slider)", () => {
     expect(rc.stretch).toBe(1.25);
   });
 });
+
+describe("laneLoudness (S59b per-group envelopes)", () => {
+  const G = "out-node-1";
+
+  beforeEach(() => {
+    useProjectStore.setState({ tracks: [audioTrack(audioSeg())], tempo: 120, dirty: false });
+  });
+
+  function seg() {
+    return useProjectStore.getState().tracks[0]!.segments[0]!;
+  }
+
+  it("canonical write funnel: set, overwrite, clear", () => {
+    useProjectStore.getState().setSegmentLaneLoudness(T, S, G, { xs: [0, 960], ys: [0, -6] });
+    expect(seg().laneLoudness?.[G]?.xs).toEqual([0, 960]);
+    expect(useProjectStore.getState().dirty).toBe(true);
+    useProjectStore.getState().setSegmentLaneLoudness(T, S, G, undefined);
+    expect("laneLoudness" in seg()).toBe(false); // bag deleted when empty
+  });
+
+  it("splits per half with a seam sample (held offset survives on both)", () => {
+    // single point at tick 300 holding -6 dB across the whole clip
+    useProjectStore.getState().setSegmentLaneLoudness(T, S, G, { xs: [300], ys: [-6] });
+    useProjectStore.getState().splitSegment(T, S, 960);
+    const [left, right] = useProjectStore.getState().tracks[0]!.segments;
+    expect(left!.laneLoudness?.[G]?.ys).toContain(-6);
+    // right half got a rebased seam sample at 0 carrying the held value
+    expect(right!.laneLoudness?.[G]?.xs?.[0]).toBe(0);
+    expect(right!.laneLoudness?.[G]?.ys?.[0]).toBe(-6);
+  });
+
+  it("scales xs with stretch AND with tempo (glued to second-anchored audio)", () => {
+    useProjectStore.getState().setSegmentLaneLoudness(T, S, G, { xs: [0, 960], ys: [0, -6] });
+    useProjectStore.getState().setSegmentStretch(T, S, 1.25);
+    expect(seg().laneLoudness?.[G]?.xs).toEqual([0, 1200]); // ×1.25 with the box
+    useProjectStore.getState().setTempo(60); // k = 0.5 → box ticks halve, curve follows
+    expect(seg().laneLoudness?.[G]?.xs).toEqual([0, 600]);
+  });
+});

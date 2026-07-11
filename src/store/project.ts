@@ -108,6 +108,23 @@ function mapAudioContent(
   });
 }
 
+/** Apply a transform to EVERY curve in a bag with a canonical rebuild (sorted keys, transforms
+ *  returning undefined drop the entry, empty bag → undefined). THE shared shape for the S59
+ *  geometry ops that must move ALL box-relative curves together (clip paramCurves + S59b
+ *  laneLoudness): setTempo ×k, setSegmentStretch ×rNew/rOld, split slice, resizeL rebase. */
+export function mapCurveBag(
+  bag: Record<string, PitchCurve> | undefined,
+  fn: (cv: PitchCurve) => PitchCurve | undefined,
+): Record<string, PitchCurve> | undefined {
+  if (!bag) return undefined;
+  const out: Record<string, PitchCurve> = {};
+  for (const k of Object.keys(bag).sort()) {
+    const next = fn(bag[k]!);
+    if (next) out[k] = next;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 /** Slice every curve in a paramCurves bag at a split boundary (ticks, segment-relative) — THE
  *  shared split helper for notes parts AND audio clips (both carry box-relative curves). Each half
  *  gets a boundary seam sample (sliceCurveAtTick) so a held non-zero region survives on both.
@@ -231,6 +248,11 @@ interface ProjectState {
   /** S59: set (or clear) an audio clip's detected BPM/beat grid. The SINGLE canonical write point —
    *  values are rounded here so serialize stays byte-stable. Undoable (contentSig). */
   setSegmentTempoDetect: (trackId: string, segmentId: string, detect: TempoDetect | undefined) => void;
+  /** S59b: set (or clear) one GROUP's sub-lane loudness envelope on an audio segment (canonical
+   *  funnel: normalizeCurve param + sorted keys + delete-when-empty). Undoable (meaningfulSig). */
+  setSegmentLaneLoudness: (trackId: string, segmentId: string, groupId: string, curve: PitchCurve | undefined) => void;
+  /** S59b: toggle a GROUP's envelope display/edit mode (view state; canonical true-only record). */
+  toggleLaneLoudnessOpen: (trackId: string, groupId: string) => void;
   /** S59 Tempo Slider: set an audio clip's stretch factor (played/source duration). Rescales
    *  durationTicks so the SOURCE window stays fixed (left edge anchored); r≈1 deletes the field
    *  (false-dirty rule). One set = one undo step. Caller pre-generates the stretched artifacts
@@ -434,7 +456,13 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           rightContent = { ...c, offsetMs: c.offsetMs + splitOffsetMs, ...(pcR ? { paramCurves: pcR } : {}) };
           if (!pcR) delete rightContent.paramCurves;
         }
+        // S59b: the per-group lane envelopes are box-relative like the clip curves — slice them
+        // for both halves the same way (seam sample keeps a held offset alive on both sides).
+        const llL = mapCurveBag(seg.laneLoudness, (cv) => normalizeCurve(sliceCurveAtTick(cv, leftDuration).left, "param"));
+        const llR = mapCurveBag(seg.laneLoudness, (cv) => normalizeCurve(sliceCurveAtTick(cv, leftDuration).right, "param"));
         const leftSeg: Segment = { ...seg, durationTicks: leftDuration, content: leftClipContent };
+        if (llL) leftSeg.laneLoudness = llL;
+        else delete leftSeg.laneLoudness;
         // Carry the baked sub-lane render onto the right half too (the left half keeps it via the spread).
         // POST-render (settled): drop loading placeholders — a stale one would spin forever (no reconciler
         // on the new id finalizes it). MID-render (rendering): KEEP the placeholders — the new half is
@@ -459,6 +487,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           // split's offset advance), so both halves reference the same recipe and each intersects it with
           // its own visible window at read time. The left half keeps it via the {...seg} spread above.
           laneOps: seg.laneOps,
+          // S59b lane envelopes are box-relative → SLICED (unlike laneOps), see llL/llR above.
+          ...(llR ? { laneLoudness: llR } : {}),
         };
 
         didSplit = true;
@@ -523,26 +553,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const base = tempoScaleBase ?? { tempo: get().tempo, tracks: get().tracks, playheadTick: get().playheadTick };
     const k = bpm / base.tempo;
     if (!Number.isFinite(k) || k <= 0) return;
-    const geo = new Map<string, { start: number; dur: number; pc?: Record<string, PitchCurve> }>();
+    const geo = new Map<string, { start: number; dur: number; pc?: Record<string, PitchCurve>; ll?: Record<string, PitchCurve> }>();
     for (const t of base.tracks) {
       for (const s of t.segments) {
         if (s.content.type !== "audioClip") continue;
         const start = Math.round(s.startTick * k);
         const end = Math.round((s.startTick + s.durationTicks) * k);
-        // S59: the clip's loudness lane is box-relative TICKS glued to second-anchored audio —
-        // its xs must scale with the box (from the BASE, like the geometry, so per-keystroke
-        // edits can't accumulate rounding). Notes segments' curves stay musical (unscaled).
-        let pc: Record<string, PitchCurve> | undefined;
-        if (s.content.paramCurves) {
-          const out: Record<string, PitchCurve> = {};
-          for (const key of Object.keys(s.content.paramCurves).sort()) {
-            const cv = s.content.paramCurves[key]!;
-            const norm = normalizeCurve({ xs: cv.xs.map((x) => x * k), ys: [...cv.ys] }, "param");
-            if (norm) out[key] = norm;
-          }
-          if (Object.keys(out).length) pc = out;
-        }
-        geo.set(s.id, { start, dur: Math.max(1, end - start), pc });
+        // S59: the clip's loudness curves are box-relative TICKS glued to second-anchored audio —
+        // xs must scale with the box (from the BASE, like the geometry, so per-keystroke edits
+        // can't accumulate rounding). BOTH bags: clip paramCurves + S59b per-group laneLoudness.
+        // Notes segments' curves stay musical (unscaled).
+        const scaleXs = (cv: PitchCurve) =>
+          normalizeCurve({ xs: cv.xs.map((x) => x * k), ys: [...cv.ys] }, "param");
+        geo.set(s.id, {
+          start,
+          dur: Math.max(1, end - start),
+          pc: mapCurveBag(s.content.paramCurves, scaleXs),
+          ll: mapCurveBag(s.laneLoudness, scaleXs),
+        });
       }
     }
     set((st) => ({
@@ -557,12 +585,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
           if (!g) return seg;
           let content = seg.content;
           if (content.type === "audioClip") {
-            const next = { ...content };
-            if (g.pc) next.paramCurves = g.pc;
-            else delete next.paramCurves;
-            content = next;
+            const nc = { ...content };
+            if (g.pc) nc.paramCurves = g.pc;
+            else delete nc.paramCurves;
+            content = nc;
           }
-          return { ...seg, startTick: g.start, durationTicks: g.dur, content };
+          const next = { ...seg, startTick: g.start, durationTicks: g.dur, content };
+          if (g.ll) next.laneLoudness = g.ll;
+          else delete next.laneLoudness;
+          return next;
         }),
       })),
     }));
@@ -804,27 +835,75 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
               const content = { ...seg.content };
               if (Math.abs(rNew - 1) < 1e-9) delete content.stretch;
               else content.stretch = rNew;
-              // The loudness lane's box-relative xs are glued to second-anchored audio — the box
-              // just changed by rNew/rOld, so the xs must scale with it (the same conversion
-              // setTempo performs, audit MAJOR: without it the envelope silently ducks the WRONG
-              // audio after a stretch change). One-shot Apply gesture → scaling from the stored
-              // canon-rounded rOld accumulates no rounding.
-              if (content.paramCurves) {
-                const out: Record<string, PitchCurve> = {};
-                for (const key of Object.keys(content.paramCurves).sort()) {
-                  const cv = content.paramCurves[key]!;
-                  const norm = normalizeCurve({ xs: cv.xs.map((x) => (x * rNew) / rOld), ys: [...cv.ys] }, "param");
-                  if (norm) out[key] = norm;
-                }
-                if (Object.keys(out).length) content.paramCurves = out;
-                else delete content.paramCurves;
-              }
-              return { ...seg, durationTicks, content };
+              // The loudness envelopes' box-relative xs are glued to second-anchored audio — the
+              // box just changed by rNew/rOld, so the xs must scale with it (the same conversion
+              // setTempo performs, audit MAJOR: without it an envelope silently ducks the WRONG
+              // audio after a stretch change). BOTH bags move together: the clip-wide curves AND
+              // the S59b per-group lane envelopes. One-shot Apply gesture → scaling from the
+              // stored canon-rounded rOld accumulates no rounding.
+              const scaleXs = (cv: PitchCurve) =>
+                normalizeCurve({ xs: cv.xs.map((x) => (x * rNew) / rOld), ys: [...cv.ys] }, "param");
+              const pc = mapCurveBag(content.paramCurves, scaleXs);
+              if (pc) content.paramCurves = pc;
+              else delete content.paramCurves;
+              const ll = mapCurveBag(seg.laneLoudness, scaleXs);
+              const next = { ...seg, durationTicks, content };
+              if (ll) next.laneLoudness = ll;
+              else delete next.laneLoudness;
+              return next;
             }),
           };
         }),
       };
     }),
+
+  setSegmentLaneLoudness: (trackId, segmentId, groupId, curve) =>
+    set((s) => ({
+      dirty: true,
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        return {
+          ...t,
+          segments: t.segments.map((seg) => {
+            if (seg.id !== segmentId || seg.content.type !== "audioClip") return seg;
+            const src = { ...(seg.laneLoudness ?? {}) };
+            const norm = normalizeCurve(curve, "param");
+            if (norm) src[groupId] = norm;
+            else delete src[groupId];
+            const next = { ...seg };
+            const keys = Object.keys(src);
+            if (keys.length > 0) {
+              const canonical: Record<string, PitchCurve> = {};
+              for (const k of keys.sort()) canonical[k] = src[k]!;
+              next.laneLoudness = canonical;
+            } else {
+              delete next.laneLoudness;
+            }
+            return next;
+          }),
+        };
+      }),
+    })),
+
+  toggleLaneLoudnessOpen: (trackId, groupId) =>
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const cur = { ...(t.laneLoudnessOpen ?? {}) };
+        if (cur[groupId]) delete cur[groupId];
+        else cur[groupId] = true;
+        const next = { ...t };
+        const keys = Object.keys(cur);
+        if (keys.length > 0) {
+          const canonical: Record<string, boolean> = {};
+          for (const k of keys.sort()) canonical[k] = true;
+          next.laneLoudnessOpen = canonical;
+        } else {
+          delete next.laneLoudnessOpen;
+        }
+        return next;
+      }),
+    })),
 
   setSegmentTempoDetect: (trackId, segmentId, detect) =>
     set((s) => ({

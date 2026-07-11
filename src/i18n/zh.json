@@ -132,7 +132,7 @@
     "delete": "删除"
   },
   "tracks": {
-    "loudnessLane": "响度包络泳道",
+    "loudnessLane": "响度包络",
     "empty": "拖放音频文件或添加新轨道",
     "delete": "删除轨道",
     "rename": "重命名",

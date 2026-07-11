@@ -188,7 +188,9 @@ function meaningfulSig(tracks: Track[], tempo: number, timeSig: [number, number]
           `${t.playOriginal ? 1 : 0}~` +
           `${t.voiceModel ?? ""}~${t.voiceModelAvatar ?? ""}~${vocalParamsSig(t.vocalParams)}~${laneSig(t.laneControls, t.laneMutes)}~` +
           t.segments
-            .map((s) => `${s.id}.${s.startTick}.${s.durationTicks}.${contentSig(s.content)}.${laneOpsSig(s.laneOps)}`)
+            // S59b laneLoudness rides the sig like laneOps (an ARRANGEMENT edit, undoable);
+            // paramCurvesSig gives it the same sorted-key stability as the content curves.
+            .map((s) => `${s.id}.${s.startTick}.${s.durationTicks}.${contentSig(s.content)}.${laneOpsSig(s.laneOps)}.${paramCurvesSig(s.laneLoudness)}`)
             .join(";"),
       )
       .join("||")
@@ -272,6 +274,8 @@ function applySnapshot(snap: Snapshot) {
       expanded: lt ? lt.expanded : t.expanded,
       // S59 loudness-lane band open state — same view-overlay treatment as expanded.
       loudnessLaneOpen: lt ? lt.loudnessLaneOpen : t.loudnessLaneOpen,
+      // S59b per-group envelope visibility — same view-overlay treatment.
+      laneLoudnessOpen: lt ? lt.laneLoudnessOpen : t.laneLoudnessOpen,
       segments: t.segments.map((s) => {
         const ls = liveSegById.get(s.id);
         // Overlay the runtime/render fields from the LIVE segment if it still exists, else fall back

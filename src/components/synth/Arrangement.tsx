@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { useProjectStore, useTimeAxis, sliceParamCurves } from "../../store/project";
+import { useProjectStore, useTimeAxis, sliceParamCurves, mapCurveBag } from "../../store/project";
 import { normalizeCurve } from "../../lib/vocalNotes";
 import type { TimeAxis } from "../../lib/timeAxis";
 import { useAppStore } from "../../store/app";
@@ -96,12 +96,18 @@ interface DragState {
   /** S59 loudness-band point drag: the index being dragged. Band geometry is recomputed per
    *  frame from live state (an async lane deposit on a track above shifts the band mid-drag). */
   gainPointIndex?: number;
+  /** S59b: set when the drag edits a GROUP's lane envelope (else the clip-wide bottom band). */
+  gainGroup?: string;
+  /** Row identity for the live per-frame row-geometry lookup (rowByKey survives layout shifts). */
+  gainRowKey?: string;
   /** True when the press INSERTED a point (vs grabbing an existing one) — a zero-change grab
    *  must not bump the playback schedule on release. */
   gainPointInserted?: boolean;
   /** S59 resizeL: the audioClip's paramCurves at grab — each frame rebases the curves from this
    *  BASE by the current shrink (like origOffsetMs), so per-frame writes can't accumulate. */
   origParamCurves?: Record<string, PitchCurve>;
+  /** S59b: same BASE capture for the per-group lane envelopes (box-relative like paramCurves). */
+  origLaneLoudness?: Record<string, PitchCurve>;
 }
 
 /** S59: index of the loudness-lane point within 8px (screen) of the cursor, else -1 (nearest wins —
@@ -263,7 +269,7 @@ export function Arrangement() {
 
   const hitTest = useCallback(
     (clientX: number, clientY: number):
-      { trackIdx: number; segId: string; zone: "body" | "left" | "right" | "gain"; lane?: { group: string; clipIndex: number }; gain?: { bandTop: number; bandH: number } } | null => {
+      { trackIdx: number; segId: string; zone: "body" | "left" | "right" | "gain"; lane?: { group: string; clipIndex: number }; gain?: { bandTop: number; bandH: number; group?: string; rowKey?: string } } | null => {
       const canvas = canvasRef.current;
       if (!canvas) return null;
       const rect = canvas.getBoundingClientRect();
@@ -339,6 +345,17 @@ export function Arrangement() {
           const out = seg.processedOutputs?.find((o) => !o.loading && laneInfo.members.some((m) => m.rowKey === laneRowKey(o)));
           if (!out) return null; // the row exists for the track, but THIS segment has no such lane → empty
           const group = laneGroupId(out);
+          // S59b: while the group's envelope is OPEN (group-bar dB toggle), its rows edit
+          // envelope points INSTEAD of piece trims — a mode switch, so the two gesture sets
+          // never fight over the same 32px row. Same "gain" zone as the bottom band; the row
+          // geometry rides along (rowKey lets the drag re-locate the row live).
+          if (track.laneLoudnessOpen?.[group]) {
+            const layout = getLaneLayout(track);
+            return {
+              trackIdx: i, segId: seg.id, zone: "gain",
+              gain: { bandTop: trackY + layout.rowY[li]! * scale, bandH: LANE_HEIGHT * scale, group, rowKey: laneRowKey(out) },
+            };
+          }
           const stemDurMs = seg.content.totalDurationMs;
           const stored = seg.laneOps?.[group];
           const xTick = x / ppt;
@@ -491,17 +508,29 @@ export function Arrangement() {
     if (drag.mode === "gainPoint") {
       const seg = srcTrack.segments.find((s) => s.id === drag.segId);
       if (!seg || seg.content.type !== "audioClip" || drag.gainPointIndex === undefined) return;
-      const curve = seg.content.paramCurves?.["loudness"];
+      const curve = drag.gainGroup ? seg.laneLoudness?.[drag.gainGroup] : seg.content.paramCurves?.["loudness"];
       if (!curve || drag.gainPointIndex >= curve.xs.length) return;
       const R = LOUDNESS_DB_RANGE;
       const x = clientX - rect.left + scrollXRef.current;
       const yC = clientY - rect.top + scrollYRef.current;
-      // recompute the band strip from LIVE state each frame (audit: geometry frozen at mousedown
+      // recompute the strip from LIVE state each frame (audit: geometry frozen at mousedown
       // mis-mapped dB when an async deposit re-laid-out a track above mid-drag)
       const scale = vZoomRef.current;
       const trks = tracksRef.current;
-      const bandTop = computeTrackYOffsets(trks, scale)[drag.trackIdx]! + computeTrackHeight(srcTrack, scale) - loudnessBandH(srcTrack) * scale;
-      const bandH = loudnessBandH(srcTrack) * scale;
+      const trackTop = computeTrackYOffsets(trks, scale)[drag.trackIdx]!;
+      let bandTop: number;
+      let bandH: number;
+      if (drag.gainGroup) {
+        // lane-row envelope: re-locate the row through rowByKey (indexes shift with deposits)
+        const layout = getLaneLayout(srcTrack);
+        const li = drag.gainRowKey !== undefined ? layout.rowByKey.get(drag.gainRowKey) : undefined;
+        if (li === undefined) return;
+        bandTop = trackTop + layout.rowY[li]! * scale;
+        bandH = LANE_HEIGHT * scale;
+      } else {
+        bandTop = trackTop + computeTrackHeight(srcTrack, scale) - loudnessBandH(srcTrack) * scale;
+        bandH = loudnessBandH(srcTrack) * scale;
+      }
       if (bandH <= 0) return;
       const i = drag.gainPointIndex;
       const xs = [...curve.xs];
@@ -510,7 +539,8 @@ export function Arrangement() {
       const hi = i + 1 < xs.length ? xs[i + 1]! - 1 : seg.durationTicks;
       xs[i] = Math.round(Math.min(hi, Math.max(lo, x / ppt - seg.startTick)));
       ys[i] = Math.round(yToParam(yC, -R, R, bandTop, bandH) * 10) / 10;
-      useProjectStore.getState().setSegmentParamCurve(srcTrack.id, seg.id, "loudness", { xs, ys });
+      if (drag.gainGroup) useProjectStore.getState().setSegmentLaneLoudness(srcTrack.id, seg.id, drag.gainGroup, { xs, ys });
+      else useProjectStore.getState().setSegmentParamCurve(srcTrack.id, seg.id, "loudness", { xs, ys });
       return;
     }
 
@@ -646,26 +676,29 @@ export function Arrangement() {
           if (seg.content.type !== "audioClip") {
             return { ...seg, startTick: newStart, durationTicks: newDur, content: seg.content };
           }
-          // S59: the loudness curve's xs are box-relative but the audio stays timeline-anchored
-          // (offsetMs compensates) — rebase the curve by the same shrink or every point slides
+          // S59: the loudness curves' xs are box-relative but the audio stays timeline-anchored
+          // (offsetMs compensates) — rebase BOTH bags by the same shrink or every point slides
           // off the audio it was drawn on (audit; splitSegment's sliceParamCurves precedent).
           // Rebased from the BASE curves each frame, mirroring origOffsetMs.
-          let paramCurves = drag.origParamCurves;
-          if (paramCurves && shrink > 0) {
-            paramCurves = sliceParamCurves(paramCurves, shrink, "right");
-          } else if (paramCurves && shrink < 0) {
-            const shifted: Record<string, PitchCurve> = {};
-            for (const k of Object.keys(paramCurves).sort()) {
-              const cv = paramCurves[k]!;
-              const norm = normalizeCurve({ xs: cv.xs.map((xv) => xv - shrink), ys: [...cv.ys] }, "param");
-              if (norm) shifted[k] = norm;
+          const rebase = (bag: Record<string, PitchCurve> | undefined) => {
+            if (!bag) return undefined;
+            if (shrink > 0) return sliceParamCurves(bag, shrink, "right");
+            if (shrink < 0) {
+              return mapCurveBag(bag, (cv) =>
+                normalizeCurve({ xs: cv.xs.map((xv) => xv - shrink), ys: [...cv.ys] }, "param"),
+              );
             }
-            paramCurves = Object.keys(shifted).length ? shifted : undefined;
-          }
+            return bag;
+          };
+          const paramCurves = rebase(drag.origParamCurves);
+          const laneLoudness = rebase(drag.origLaneLoudness);
           const content = { ...seg.content, offsetMs: newOff };
           if (paramCurves) content.paramCurves = paramCurves;
           else delete content.paramCurves;
-          return { ...seg, startTick: newStart, durationTicks: newDur, content };
+          const nextSeg = { ...seg, startTick: newStart, durationTicks: newDur, content };
+          if (laneLoudness) nextSeg.laneLoudness = laneLoudness;
+          else delete nextSeg.laneLoudness;
+          return nextSeg;
         }
         if (drag.mode === "resizeR") {
           let newEnd = drag.origStartTick + drag.origDurationTicks + deltaTicks;
@@ -832,7 +865,14 @@ export function Arrangement() {
           if (!gTrack || !gSeg || gSeg.content.type !== "audioClip" || !hit.gain || ctrl) return;
           const ppt = pptRef.current;
           const yContent = rect ? e.clientY - rect.top + scrollYRef.current : 0;
-          const curve = gSeg.content.paramCurves?.["loudness"];
+          // S59b: same gesture, two hosts — the clip-wide curve (bottom band) or a group's lane
+          // envelope (gain.group set). ONE write funnel each; everything else is shared.
+          const gainGroup = hit.gain.group;
+          const curve = gainGroup ? gSeg.laneLoudness?.[gainGroup] : gSeg.content.paramCurves?.["loudness"];
+          const writeCurve = (cv: { xs: number[]; ys: number[] }) => {
+            if (gainGroup) useProjectStore.getState().setSegmentLaneLoudness(gTrack.id, gSeg.id, gainGroup, cv);
+            else useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", cv);
+          };
           const R = LOUDNESS_DB_RANGE;
           const { bandTop, bandH } = hit.gain;
           let idx = curve ? gainPointAt(curve, gSeg.startTick, startContentX, yContent, bandTop, bandH, ppt) : -1;
@@ -855,7 +895,7 @@ export function Arrangement() {
               ys.splice(pos, 0, db);
               idx = pos;
             }
-            useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", { xs, ys });
+            writeCurve({ xs, ys });
           }
           dragRef.current = {
             mode: "gainPoint", trackIdx: hit.trackIdx, segId: gSeg.id,
@@ -863,6 +903,7 @@ export function Arrangement() {
             origStartTick: gSeg.startTick, origDurationTicks: gSeg.durationTicks, origOffsetMs: gSeg.content.offsetMs,
             moving: [], dragged: false, collapseTo: null,
             gainPointIndex: idx, gainPointInserted: inserted,
+            gainGroup, gainRowKey: hit.gain.rowKey,
           };
           startAutoScroll();
           return;
@@ -921,9 +962,10 @@ export function Arrangement() {
             origStartTick: seg.startTick, origDurationTicks: seg.durationTicks, origOffsetMs: offsetMs,
             moving: [{ trackId: track.id, segId: seg.id, origStartTick: seg.startTick }],
             dragged: false, collapseTo: null,
-            // S59: resizeL rebases the loudness curve alongside offsetMs — from this BASE each
+            // S59: resizeL rebases the loudness curves alongside offsetMs — from this BASE each
             // frame (like origOffsetMs), so the per-frame writes can't accumulate.
             origParamCurves: seg.content.type === "audioClip" ? seg.content.paramCurves : undefined,
+            origLaneLoudness: seg.content.type === "audioClip" ? seg.laneLoudness : undefined,
           };
           useHistoryStore.getState().beginTransaction(); // coalesce the resize into one undo step
           startAutoScroll();
@@ -1095,7 +1137,10 @@ export function Arrangement() {
         if (hit.segId && hit.gain) {
           const gTrack = tracks[hit.trackIdx];
           const gSeg = gTrack?.segments.find((s) => s.id === hit.segId);
-          const curve = gSeg?.content.type === "audioClip" ? gSeg.content.paramCurves?.["loudness"] : undefined;
+          const gainGroup = hit.gain.group;
+          const curve = gSeg?.content.type === "audioClip"
+            ? (gainGroup ? gSeg.laneLoudness?.[gainGroup] : gSeg.content.paramCurves?.["loudness"])
+            : undefined;
           if (gTrack && gSeg && curve) {
             const r2 = canvasRef.current!.getBoundingClientRect();
             const x = e.clientX - r2.left + scrollXRef.current;
@@ -1104,7 +1149,9 @@ export function Arrangement() {
             if (idx >= 0) {
               const xs = curve.xs.filter((_, i) => i !== idx);
               const ys = curve.ys.filter((_, i) => i !== idx);
-              useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", xs.length ? { xs, ys } : undefined);
+              const next = xs.length ? { xs, ys } : undefined;
+              if (gainGroup) useProjectStore.getState().setSegmentLaneLoudness(gTrack.id, gSeg.id, gainGroup, next);
+              else useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", next);
               if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
             }
           }
@@ -1533,11 +1580,20 @@ export function Arrangement() {
         const clipSig = s.content.type === "audioClip"
           ? `${s.content.stretch ?? 1}~${s.content.tempoDetect ? `${s.content.tempoDetect.bpm}/${s.content.tempoDetect.anchorMs}/${s.content.tempoDetect.downbeat}/${s.content.tempoDetect.conf}/${s.content.tempoDetect.notConstant ? 1 : 0}` : ""}~${loudSig}`
           : "";
-        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${oovCount}.${clipSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
+        // S59b: per-group lane envelopes are baked onto the rows — every point edit must rebake.
+        const llBag = s.laneLoudness;
+        const llSig = llBag
+          ? Object.keys(llBag).sort().map((g) => {
+              const cv = llBag[g]!;
+              return `${g}#${cv.xs.reduce((acc, xv, i) => (Math.imul(acc, 31) + xv * 7 + Math.round(cv.ys[i]! * 1000)) | 0, cv.xs.length)}`;
+            }).join("&")
+          : "";
+        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${oovCount}.${clipSig}.${llSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
       }).join(";");
       // playOriginal: flips the main-row waveform (sum ↔ original) + dims every lane row.
       // loudnessLaneOpen: the S59 band's open/close changes the baked band area (S50 key lesson).
-      return `${t.segments.length}:${t.expanded}:${t.loudnessLaneOpen ? 1 : 0}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
+      // laneLoudnessOpen: S59b per-group envelope visibility is baked onto the rows too.
+      return `${t.segments.length}:${t.expanded}:${t.loudnessLaneOpen ? 1 : 0}:${Object.keys(t.laneLoudnessOpen ?? {}).join("|")}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
     }).join(",")}`;
 
     const sizeChanged = !offscreenRef.current
@@ -2032,6 +2088,43 @@ function drawStaticContent(
           if (track.playOriginal || isLaneRowMuted(track, laneRowKey(out), out.laneId)) {
             ctx.fillStyle = "rgba(13, 18, 32, 0.5)";
             ctx.fillRect(sx, laneY, sw, laneH);
+          }
+
+          // S59b: the group's loudness envelope drawn ON its rows while the dB toggle is open —
+          // the lane's OWN color (别串色), ±12 dB mapped across the row height, AFTER the dim so
+          // the editable curve stays readable on a muted row.
+          if (track.laneLoudnessOpen?.[group]) {
+            const cv = seg.laneLoudness?.[group];
+            const zeroRowY = paramToY(0, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
+            ctx.strokeStyle = `rgba(${laneColor},0.35)`;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(Math.max(sx, 0), zeroRowY);
+            ctx.lineTo(Math.min(sx + sw, width), zeroRowY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            if (cv && cv.xs.length > 0) {
+              ctx.strokeStyle = `rgba(${laneColor},0.95)`;
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              const ex0 = Math.max(sx, 0);
+              const ex1 = Math.min(sx + sw, width);
+              for (let px = ex0; px <= ex1; px += 2) {
+                const relTick = (px + scrollX) / ppt - seg.startTick;
+                const py = paramToY(evalCurveAt(cv, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
+                if (px === ex0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+              }
+              ctx.stroke();
+              ctx.fillStyle = `rgba(${laneColor},1)`;
+              for (let pi = 0; pi < cv.xs.length; pi++) {
+                const px = (seg.startTick + cv.xs[pi]!) * ppt - scrollX;
+                if (px < -CULL_PAD || px > width + CULL_PAD) continue;
+                const py = paramToY(cv.ys[pi]!, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, laneY, laneH);
+                ctx.fillRect(px - 3, py - 3, 6, 6);
+              }
+            }
           }
 
           // Selected sub-lane GROUP → a soft gold outline on every row of that group (matches the segment

@@ -656,6 +656,19 @@ function TrackItem({
                   />
                   <span className="fader-val">{formatPan(ctrl?.pan ?? 0)}</span>
                 </div>
+                {/* S59b: the GROUP's loudness envelope toggle — lives beside the group V/P because
+                    the envelope shares their identity (group-keyed; 解组 for per-stem control).
+                    While ON the group's rows edit envelope points instead of piece trims. AUDIO
+                    tracks only: a vocal track's loudness is render-domain (the vocal editor lane). */}
+                {track.trackType === "audio" && (
+                  <button
+                    className={`track-btn track-btn-db ${track.laneLoudnessOpen?.[run.groupId] ? "active-orig" : ""}`}
+                    title={t("tracks.loudnessLane")}
+                    onClick={(e) => { e.stopPropagation(); useProjectStore.getState().toggleLaneLoudnessOpen(track.id, run.groupId); }}
+                  >
+                    dB
+                  </button>
+                )}
               </div>
             </div>
             {lanes.slice(run.start, run.start + run.count).map(({ id, label, members }) => {

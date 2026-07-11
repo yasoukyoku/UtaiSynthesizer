@@ -132,7 +132,7 @@
     "delete": "Delete"
   },
   "tracks": {
-    "loudnessLane": "Loudness envelope lane",
+    "loudnessLane": "Loudness envelope",
     "empty": "Drop audio files or add a new track",
     "delete": "Delete Track",
     "rename": "Rename",

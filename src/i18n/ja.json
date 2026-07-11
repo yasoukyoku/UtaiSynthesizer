@@ -132,7 +132,7 @@
     "delete": "削除"
   },
   "tracks": {
-    "loudnessLane": "ラウドネス エンベロープ レーン",
+    "loudnessLane": "ラウドネス エンベロープ",
     "empty": "音声ファイルをドロップまたは新規トラック追加",
     "delete": "トラック削除",
     "rename": "名前を変更",

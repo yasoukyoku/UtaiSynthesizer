@@ -27,6 +27,11 @@ export interface Track {
    *  open. Pure VIEW state, mirroring `expanded` exactly: excluded from undo/dirty, overlay
    *  re-merged on snapshot restore, stripped from the autosave compare. Absent/false = closed. */
   loudnessLaneOpen?: boolean;
+  /** S59b: which sub-lane GROUPS are showing/editing their loudness envelope (keyed by
+   *  laneGroupId, the group-bar dB toggle). Same view-state posture as loudnessLaneOpen; while
+   *  ON, the group's rows edit envelope points instead of piece trims. Canonical write: true
+   *  entries only, sorted keys, record deleted when empty. */
+  laneLoudnessOpen?: Record<string, boolean>;
   /** Per-GROUP mix (volume/pan), keyed by the producing Output node id (`laneGroupId`) — "recorded ON
    *  the Output node", exactly like laneOps: all lanes of one 组 share the setting (解组 to control
    *  independently), a 轨道组 rename OR any upstream rewiring (insert an effects node, reconnect to the
@@ -119,6 +124,13 @@ export interface Segment {
    *  (the baked render = a non-undoable overlay), laneOps is an ARRANGEMENT edit: it IS in the history
    *  meaningfulSig (undoable) and survives a re-render (keyed by node id, not baked into the audio). */
   laneOps?: Record<string, LaneClip[]>;
+  /** S59b: per-GROUP loudness envelope for the sub-lanes, keyed by the producing Output node id
+   *  (laneGroupId — the SAME identity as laneControls volume/laneOps; 解组 for independent
+   *  stems, exactly like the V/P faders). Values are dB curves on BOX-RELATIVE ticks, drawn on
+   *  the group's lane rows and ADDED on top of the clip-wide loudness curve at playback (dB sum,
+   *  playback-domain only — never fed to rendering). Undoable (meaningfulSig, like laneOps);
+   *  box-relative ⇒ sliced on split and rescaled with tempo/stretch alongside paramCurves. */
+  laneLoudness?: Record<string, PitchCurve>;
   /** True while the audio file backing this segment is still being decoded after a drag/import.
    *  A loading segment renders as a striped placeholder and is skipped during playback;
    *  `content.totalDurationMs` holds the probed (approximate) duration until decode finishes. */

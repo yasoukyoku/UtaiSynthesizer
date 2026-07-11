@@ -4,7 +4,7 @@ import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, msToTicks,
 import { ensureStretched } from "./stretchCache";
 import { evalCurveAt } from "../f0eval";
 import { LOUDNESS_DB_RANGE } from "../vocalGeometry";
-import type { Segment } from "../../types/project";
+import type { PitchCurve, Segment } from "../../types/project";
 import { isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayout";
 import { useProjectStore } from "../../store/project";
 import type { Track } from "../../types/project";
@@ -313,7 +313,7 @@ export async function playAllTracks(
 
             const source = ctx.createBufferSource();
             source.buffer = buf;
-            const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration);
+            const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration, seg.laneLoudness?.[group]);
             const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
             (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
             source.onended = () => { if (gen !== playGeneration) return; endedCount++; if (schedulingDone && endedCount >= totalScheduled) onAllEnded(); };
@@ -604,9 +604,16 @@ function loudnessEnvNode(
   now: number,
   startDelay: number,
   playDuration: number,
+  laneCurve?: PitchCurve,
 ): GainNode | null {
-  const curve = seg.content.type === "audioClip" ? seg.content.paramCurves?.["loudness"] : undefined;
-  if (!curve || curve.xs.length === 0 || playDuration <= 0.001) return null;
+  // S59b: a lane source can carry TWO envelopes — the clip-wide curve (the bottom band) and its
+  // group's own curve (drawn on the lane row). They ADD in dB (the vocal-track "标量+泳道加性"
+  // philosophy), so riding a stem down doesn't fight a clip-wide fade.
+  const clipCurve = seg.content.type === "audioClip" ? seg.content.paramCurves?.["loudness"] : undefined;
+  const curves: PitchCurve[] = [];
+  if (clipCurve && clipCurve.xs.length > 0) curves.push(clipCurve);
+  if (laneCurve && laneCurve.xs.length > 0) curves.push(laneCurve);
+  if (curves.length === 0 || playDuration <= 0.001) return null;
   const node = ctx.createGain();
   const fromTick = playheadTick + msToTicks(startDelay * 1000, tempo);
   // ~20 Hz envelope resolution, capped — ample for mix automation, cheap to build
@@ -615,8 +622,11 @@ function loudnessEnvNode(
   for (let i = 0; i < n; i++) {
     const sec = (i / (n - 1)) * playDuration;
     const tick = fromTick + msToTicks(sec * 1000, tempo);
-    // belt-and-suspenders clamp: no write path may hand the AudioParam an absurd/non-finite gain
-    const db = Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, evalCurveAt(curve, tick - seg.startTick)));
+    // belt-and-suspenders clamp PER CURVE: no write path may hand the AudioParam an absurd gain
+    let db = 0;
+    for (const cv of curves) {
+      db += Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, evalCurveAt(cv, tick - seg.startTick)));
+    }
     vals[i] = Math.pow(10, db / 20);
   }
   node.gain.setValueCurveAtTime(vals, now + startDelay, playDuration);
