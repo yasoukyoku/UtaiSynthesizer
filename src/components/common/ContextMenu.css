@@ -6,7 +6,17 @@
   box-shadow: var(--shadow-lg);
   min-width: 160px;
   padding: 2px 0;
+  /* ② S58: long picker menus (track-header singer list) cap + scroll instead of towering past the
+     viewport (mirrors the Dropdown panel's max-height+overflow precedent; the slim themed scrollbar
+     matches .vsb-body). Short menus are unaffected. */
+  max-height: min(340px, 60vh);
+  overflow-y: auto;
 }
+
+.ctx-menu::-webkit-scrollbar { width: 10px; }
+.ctx-menu::-webkit-scrollbar-track { background: transparent; }
+.ctx-menu::-webkit-scrollbar-thumb { background: var(--border-default); border: 2px solid var(--bg-panel); }
+.ctx-menu::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 .ctx-item {
   display: flex;
