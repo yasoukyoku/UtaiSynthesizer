@@ -420,7 +420,6 @@ function TrackItem({
                 {track.expanded ? "▼" : "▶"}
               </button>
             )}
-            <div className="track-divider" />
             {track.voiceModelAvatar && (
               <div className="track-avatar">
                 <img src={convertFileSrc(track.voiceModelAvatar)} alt="" />

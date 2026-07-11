@@ -1664,14 +1664,24 @@ function drawStaticContent(
               ctx.fillRect(px + pw - 1.5, laneY + 1, 1.5, laneH - 2);
             };
             if (!stored) {
-              // UNEDITED lane → the exact pre-P3 single-window draw (byte-identical, zero regression). The
-              // stem spans the whole (trimmed) source, so draw the SAME [offset, offset+segment] window as
-              // the original audio above (whole stem 0..1 would shift the lane vs the main track).
               const lSegMs = ticksToMs(seg.durationTicks, tempo);
-              const lStart = lTotalMs > 0 ? lOffMs / lTotalMs : 0;
-              const lEnd = lTotalMs > 0 ? Math.min(1, (lOffMs + lSegMs) / lTotalMs) : 1;
-              drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw, laneH, lStart, lEnd, width);
-              drawEdgeBars(sx, sw);
+              if (seg.content.type === "audioClip") {
+                // AUDIO — the box is a WINDOW [offset, offset+segment] into a source that spans it, so the
+                // waveform fills the box (byte-identical to the pre-P3 single-window draw, zero regression).
+                const lStart = lTotalMs > 0 ? lOffMs / lTotalMs : 0;
+                const lEnd = lTotalMs > 0 ? Math.min(1, (lOffMs + lSegMs) / lTotalMs) : 1;
+                drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw, laneH, lStart, lEnd, width);
+                drawEdgeBars(sx, sw);
+              } else {
+                // ② VOCAL bake — the stem starts at the segment start and is NOT a window into a longer
+                // source: draw it 1:1 with the timeline so a stem SHORTER than the box occupies only its REAL
+                // sung duration (tail stays empty = silence) instead of being stretched to fill the box — the
+                // "waveform tied to the segment length, not the sounding length" bug the user re-flagged.
+                const stemMs = lTotalMs; // = out.totalDurationMs
+                const fill = stemMs > 0 && lSegMs > 0 ? Math.min(1, stemMs / lSegMs) : 1; // how much of the box it covers
+                const lEnd = stemMs > 0 ? Math.min(1, lSegMs / stemMs) : 1; // window into the stem (if it runs past the box)
+                drawWaveform(ctx, out.audioPath, out.waveformPeaks, `rgba(${laneColor},0.6)`, sx, laneY, sw * fill, laneH, 0, lEnd, width);
+              }
             } else {
               // EDITED lane → draw each kept piece's waveform window + its edge handles; the gaps between
               // pieces stay the faint bg (silence). Ratios are into the stem peaks with the SAME source-total

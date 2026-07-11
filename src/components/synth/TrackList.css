@@ -101,14 +101,6 @@
   cursor: grabbing;
 }
 
-/* Plain divider where the coloured bar used to sit (left of the name) — a subtle separator now. */
-.track-divider {
-  width: 1px;
-  height: 16px;
-  background: var(--border-subtle);
-  flex-shrink: 0;
-}
-
 /* Two rows in the fixed 48px header — Row 1: NAME (owns the width) + M/S/O; Row 2: V/P faders + readouts
    side by side. The single-row layout squeezed the name to nothing on expandable tracks (expand + faders). */
 .track-row-top {
