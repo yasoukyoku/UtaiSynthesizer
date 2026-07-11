@@ -1,6 +1,27 @@
 {
   "untitled": "無題プロジェクト",
-  "menu": {
+  "tempo": {
+    "errStretchMissing": "音源ファイルが見つからず、タイムストレッチできません",
+    "errStretchFailed": "タイムストレッチに失敗しました",
+    "stretch": "タイムストレッチ…",
+    "stretchTitle": "セグメント変速",
+    "targetBpm": "目標 BPM",
+    "speedPct": "速度",
+    "detectedBpm": "検出 BPM",
+    "durationPct": "長さ",
+    "current": "現在",
+    "apply": "適用",
+    "reset": "1:1 に戻す",
+    "processing": "処理中…",    "detect": "テンポ／グリッド検出",
+    "x2": "グリッド BPM ×2",
+    "half": "グリッド BPM ÷2",
+    "nudge": "小節線を1拍後ろへ",
+    "clear": "テンポグリッドを消去",
+    "notConstant": "テンポが一定ではありません。グリッドは参考程度です",
+    "errTooShort": "セグメントが短すぎて検出できません（約5秒必要）",
+    "errNoBeat": "安定した拍が検出できませんでした",
+    "errFailed": "テンポ検出に失敗しました"
+  },  "menu": {
     "file": "ファイル",
     "edit": "編集",
     "tools": "ツール",
@@ -111,6 +132,7 @@
     "delete": "削除"
   },
   "tracks": {
+    "loudnessLane": "ラウドネス エンベロープ レーン",
     "empty": "音声ファイルをドロップまたは新規トラック追加",
     "delete": "トラック削除",
     "rename": "名前を変更",

@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from "react";
-import { useProjectStore, useTimeAxis } from "../../store/project";
+import { useProjectStore, useTimeAxis, sliceParamCurves } from "../../store/project";
+import { normalizeCurve } from "../../lib/vocalNotes";
 import type { TimeAxis } from "../../lib/timeAxis";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
@@ -7,21 +8,26 @@ import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { TICKS_PER_BEAT, PIXELS_PER_TICK, TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_ADD_FOOTER, AUDIO_EXT_RE } from "../../lib/constants";
-import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
+import { computeTrackYOffsets, computeTrackHeight, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, laneRowAtY, isLaneRowMuted, laneControlFor, loudnessBandH, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
 import { importAudioToNewTrack, importAudioToExistingTrack, probeAudioDuration, DEFAULT_DURATION_MS } from "../../lib/audio/import";
 import { durationMsToTicks } from "../../lib/audio/playback";
 import {
   laneGroupId, laneVisiblePieces, clipIndexAtMs, trimClip, isWholeClips, ticksToMs, laneOpsSig,
   materializeClips, laneRowKey, laneLabelParts, laneReachesSeam, flooredDurationTicks, MIN_LANE_PIECE_MS,
+  segStretch, segmentSourceWindowMs,
 } from "../../lib/audio/laneOps";
 import { drawWaveform, beginWaveformFrame, peaksSignature } from "../../lib/waveformCache";
 import { splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
+import { evalCurveAt } from "../../lib/f0eval";
 import { collectSnapTicks, snapTick, snapMovedStart, SNAP_PX } from "../../lib/snapping";
 import { trackRgb, rgba, ACCENT, ACCENT_RGB, LANE_COLORS, SELECTION_GLOW_RGB } from "../../lib/trackColors";
 import { drawBeatGrid, drawPlayhead, SEPARATOR_RGB } from "../../lib/canvasDraw";
 import { ContextMenu, type MenuItem } from "../common/ContextMenu";
 import { sliceLaneGroupAtPlayhead, deleteLanePiece } from "../../lib/laneEdit";
-import type { Track, Segment, LaneClip } from "../../types/project";
+import { detectSegmentTempo, doubleTempoDetect, halveTempoDetect, nudgeDownbeat } from "../../lib/audio/tempoDetect";
+import { TempoStretchPanel } from "./TempoStretchPanel";
+import type { Track, Segment, LaneClip, PitchCurve } from "../../types/project";
 import "./Arrangement.css";
 
 const EDGE_ZONE = 6;
@@ -52,7 +58,7 @@ function boundaryIndexAt(contentY: number, trks: Track[], offsets: number[], tot
   return null;
 }
 
-type DragMode = null | "playhead" | "move" | "resizeL" | "resizeR" | "laneResizeL" | "laneResizeR" | "laneBoundary";
+type DragMode = null | "playhead" | "move" | "resizeL" | "resizeR" | "laneResizeL" | "laneResizeR" | "laneBoundary" | "gainPoint";
 
 interface DragState {
   mode: DragMode;
@@ -87,6 +93,40 @@ interface DragState {
    *  release for every track the segment merely passed over (else a round-trip drag that visually did
    *  nothing leaves sig-visible residue → a phantom undo step + a spurious unsaved-changes prompt). */
   mixCopies?: { trackId: string; controlKeys: string[]; muteKeys: string[] }[];
+  /** S59 loudness-band point drag: the index being dragged. Band geometry is recomputed per
+   *  frame from live state (an async lane deposit on a track above shifts the band mid-drag). */
+  gainPointIndex?: number;
+  /** True when the press INSERTED a point (vs grabbing an existing one) — a zero-change grab
+   *  must not bump the playback schedule on release. */
+  gainPointInserted?: boolean;
+  /** S59 resizeL: the audioClip's paramCurves at grab — each frame rebases the curves from this
+   *  BASE by the current shrink (like origOffsetMs), so per-frame writes can't accumulate. */
+  origParamCurves?: Record<string, PitchCurve>;
+}
+
+/** S59: index of the loudness-lane point within 8px (screen) of the cursor, else -1 (nearest wins —
+ *  mirrors the vocal lane's LANE_PT_HIT euclidean test). Coordinates are CONTENT-space. */
+function gainPointAt(
+  curve: PitchCurve,
+  segStartTick: number,
+  xContent: number,
+  yContent: number,
+  bandTop: number,
+  bandH: number,
+  ppt: number,
+): number {
+  let best = -1;
+  let bestD = 8;
+  for (let i = 0; i < curve.xs.length; i++) {
+    const px = (segStartTick + curve.xs[i]!) * ppt;
+    const py = paramToY(curve.ys[i]!, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, bandTop, bandH);
+    const d = Math.hypot(px - xContent, py - yContent);
+    if (d <= bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
 }
 
 interface CtxState {
@@ -130,6 +170,8 @@ export function Arrangement() {
   const [cursor, setCursor] = useState("default");
   const [dragOver, setDragOver] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<CtxState | null>(null);
+  // S59 Tempo Slider panel (opened from the segment context menu)
+  const [stretchPanel, setStretchPanel] = useState<{ x: number; y: number; trackId: string; segId: string } | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const mouseXRef = useRef(-9999);
   const mouseClientXRef = useRef(0);
@@ -221,7 +263,7 @@ export function Arrangement() {
 
   const hitTest = useCallback(
     (clientX: number, clientY: number):
-      { trackIdx: number; segId: string; zone: "body" | "left" | "right"; lane?: { group: string; clipIndex: number } } | null => {
+      { trackIdx: number; segId: string; zone: "body" | "left" | "right" | "gain"; lane?: { group: string; clipIndex: number }; gain?: { bandTop: number; bandH: number } } | null => {
       const canvas = canvasRef.current;
       if (!canvas) return null;
       const rect = canvas.getBoundingClientRect();
@@ -239,6 +281,23 @@ export function Arrangement() {
         const trackY = yOffsets[i]!;
         const trackH = computeTrackHeight(track, scale);
         if (y < trackY || y > trackY + trackH) continue;
+
+        // S59 loudness-lane band (the bottom strip when open) — intercepted BEFORE the header/lane
+        // dispatch: without this a band click falls through to `return null` → a playhead scrub
+        // that also clears the selection (the recon's #1 trap). The whole band Y-range is claimed:
+        // a press over a clip returns a "gain" hit; empty band returns segId "" (inert swallow).
+        const gBandH = loudnessBandH(track) * scale;
+        if (gBandH > 0 && y >= trackY + trackH - gBandH) {
+          const gain = { bandTop: trackY + trackH - gBandH, bandH: gBandH };
+          for (let si = track.segments.length - 1; si >= 0; si--) {
+            const seg = track.segments[si]!;
+            if (seg.loading || seg.content.type !== "audioClip") continue;
+            const sx = seg.startTick * ppt;
+            const sw = seg.durationTicks * ppt;
+            if (x >= sx && x <= sx + sw) return { trackIdx: i, segId: seg.id, zone: "gain", gain };
+          }
+          return { trackIdx: i, segId: "", zone: "gain", gain };
+        }
 
         // Header row → the main segment (move / resize-edge).
         if (y <= trackY + headerH) {
@@ -283,7 +342,8 @@ export function Arrangement() {
           const stemDurMs = seg.content.totalDurationMs;
           const stored = seg.laneOps?.[group];
           const xTick = x / ppt;
-          const clickMs = seg.content.offsetMs + ticksToMs(xTick - seg.startTick, tp);
+          // S59: click position → SOURCE ms (a stretched box covers tickWidth/r source ms)
+          const clickMs = seg.content.offsetMs + ticksToMs(xTick - seg.startTick, tp) / segStretch(seg);
           const pieces = laneVisiblePieces(seg, stored, stemDurMs, tp);
           const clipAt = (pc: { startMs: number; endMs: number }) => clipIndexAtMs(stored, stemDurMs, (pc.startMs + pc.endMs) / 2);
           // 1) Piece whose BODY the cursor is over → its near edge. Containment disambiguates a shared slice
@@ -425,6 +485,35 @@ export function Arrangement() {
     if (!drag.dragged && Math.hypot(clientX - drag.startMouseX, clientY - drag.startMouseY) > 3) drag.dragged = true;
     if (!drag.dragged) return;
 
+    // S59 loudness-band point drag: x clamps between neighbour points (xs stay sorted) and the
+    // segment span; y quantizes to 0.1 dB (vocal-lane parity). Writes through the shared
+    // setSegmentParamCurve funnel each frame inside the mousedown transaction (one undo step).
+    if (drag.mode === "gainPoint") {
+      const seg = srcTrack.segments.find((s) => s.id === drag.segId);
+      if (!seg || seg.content.type !== "audioClip" || drag.gainPointIndex === undefined) return;
+      const curve = seg.content.paramCurves?.["loudness"];
+      if (!curve || drag.gainPointIndex >= curve.xs.length) return;
+      const R = LOUDNESS_DB_RANGE;
+      const x = clientX - rect.left + scrollXRef.current;
+      const yC = clientY - rect.top + scrollYRef.current;
+      // recompute the band strip from LIVE state each frame (audit: geometry frozen at mousedown
+      // mis-mapped dB when an async deposit re-laid-out a track above mid-drag)
+      const scale = vZoomRef.current;
+      const trks = tracksRef.current;
+      const bandTop = computeTrackYOffsets(trks, scale)[drag.trackIdx]! + computeTrackHeight(srcTrack, scale) - loudnessBandH(srcTrack) * scale;
+      const bandH = loudnessBandH(srcTrack) * scale;
+      if (bandH <= 0) return;
+      const i = drag.gainPointIndex;
+      const xs = [...curve.xs];
+      const ys = [...curve.ys];
+      const lo = i > 0 ? xs[i - 1]! + 1 : 0;
+      const hi = i + 1 < xs.length ? xs[i + 1]! - 1 : seg.durationTicks;
+      xs[i] = Math.round(Math.min(hi, Math.max(lo, x / ppt - seg.startTick)));
+      ys[i] = Math.round(yToParam(yC, -R, R, bandTop, bandH) * 10) / 10;
+      useProjectStore.getState().setSegmentParamCurve(srcTrack.id, seg.id, "loudness", { xs, ys });
+      return;
+    }
+
     // Sub-lane trim (non-destructive edge-stretch): re-trim the clip list captured at grab to the pointer
     // position (stem-ms), then write the recipe. No snapping / no move — the lane is pinned to its parent.
     if (drag.mode === "laneResizeL" || drag.mode === "laneResizeR" || drag.mode === "laneBoundary") {
@@ -433,9 +522,11 @@ export function Arrangement() {
       const tp = tempoRef.current;
       const offset = seg.content.offsetMs;
       const stemDurMs = seg.content.totalDurationMs;
-      const winEnd = offset + ticksToMs(seg.durationTicks, tp);
+      // S59: trims live in SOURCE (stem) ms — divide the timeline distances by the stretch factor
+      const rr = segStretch(seg);
+      const winEnd = offset + ticksToMs(seg.durationTicks, tp) / rr;
       const edgeTick = (clientX - rect.left + scrollXRef.current) / ppt;
-      const newMs = offset + ticksToMs(edgeTick - seg.startTick, tp);
+      const newMs = offset + ticksToMs(edgeTick - seg.startTick, tp) / rr;
       // A shared-boundary drag: the FIRST dragged frame's DIRECTION locks which piece shrinks for the rest
       // of this drag (right of the boundary → the right piece's front = its start; left → the left piece's
       // back = its end), by resolving into a plain laneResizeL/R. Locking — vs re-deciding at M every frame —
@@ -549,12 +640,32 @@ export function Arrangement() {
           const newDur = Math.max(TICKS_PER_BEAT / 4, drag.origDurationTicks - shrink);
           const newOff =
             seg.content.type === "audioClip"
-              ? Math.max(0, drag.origOffsetMs + ticksToMs(shrink, tempoRef.current))
+              // S59: offsetMs advances in SOURCE ms — a stretched clip's tick shrink covers /r source ms
+              ? Math.max(0, drag.origOffsetMs + ticksToMs(shrink, tempoRef.current) / segStretch(seg))
               : 0;
-          return {
-            ...seg, startTick: newStart, durationTicks: newDur,
-            content: seg.content.type === "audioClip" ? { ...seg.content, offsetMs: newOff } : seg.content,
-          };
+          if (seg.content.type !== "audioClip") {
+            return { ...seg, startTick: newStart, durationTicks: newDur, content: seg.content };
+          }
+          // S59: the loudness curve's xs are box-relative but the audio stays timeline-anchored
+          // (offsetMs compensates) — rebase the curve by the same shrink or every point slides
+          // off the audio it was drawn on (audit; splitSegment's sliceParamCurves precedent).
+          // Rebased from the BASE curves each frame, mirroring origOffsetMs.
+          let paramCurves = drag.origParamCurves;
+          if (paramCurves && shrink > 0) {
+            paramCurves = sliceParamCurves(paramCurves, shrink, "right");
+          } else if (paramCurves && shrink < 0) {
+            const shifted: Record<string, PitchCurve> = {};
+            for (const k of Object.keys(paramCurves).sort()) {
+              const cv = paramCurves[k]!;
+              const norm = normalizeCurve({ xs: cv.xs.map((xv) => xv - shrink), ys: [...cv.ys] }, "param");
+              if (norm) shifted[k] = norm;
+            }
+            paramCurves = Object.keys(shifted).length ? shifted : undefined;
+          }
+          const content = { ...seg.content, offsetMs: newOff };
+          if (paramCurves) content.paramCurves = paramCurves;
+          else delete content.paramCurves;
+          return { ...seg, startTick: newStart, durationTicks: newDur, content };
         }
         if (drag.mode === "resizeR") {
           let newEnd = drag.origStartTick + drag.origDurationTicks + deltaTicks;
@@ -675,7 +786,8 @@ export function Arrangement() {
         }
         // A committed clip move/resize changed segment timing → reschedule playback so it doesn't
         // keep playing the old layout (playhead drags reschedule via the seeking flag instead).
-        if (drag.dragged && drag.mode !== "playhead" && useAudioStore.getState().isPlaying) {
+        // gainPoint reschedules on drag OR on a no-drag INSERT press (a zero-change grab doesn't).
+        if ((drag.dragged || (drag.mode === "gainPoint" && drag.gainPointInserted)) && drag.mode !== "playhead" && useAudioStore.getState().isPlaying) {
           useAudioStore.getState().bumpSchedule();
         }
         // Close the undo transaction opened at mousedown for a move/resize — commits ONE step iff
@@ -711,6 +823,50 @@ export function Arrangement() {
       const startContentX = rect ? e.clientX - rect.left + scrollXRef.current : 0;
       const hit = hitTest(e.clientX, e.clientY);
       if (hit) {
+        // S59 loudness band press — handled before the generic lookup (an empty-band hit carries
+        // segId "" and must SWALLOW the press: no playhead scrub, no selection clear). On a clip:
+        // grab the point under the cursor, else insert one there and drag it (vocal-lane gesture).
+        if (hit.zone === "gain") {
+          const gTrack = tracks[hit.trackIdx];
+          const gSeg = gTrack?.segments.find((s) => s.id === hit.segId);
+          if (!gTrack || !gSeg || gSeg.content.type !== "audioClip" || !hit.gain || ctrl) return;
+          const ppt = pptRef.current;
+          const yContent = rect ? e.clientY - rect.top + scrollYRef.current : 0;
+          const curve = gSeg.content.paramCurves?.["loudness"];
+          const R = LOUDNESS_DB_RANGE;
+          const { bandTop, bandH } = hit.gain;
+          let idx = curve ? gainPointAt(curve, gSeg.startTick, startContentX, yContent, bandTop, bandH, ppt) : -1;
+          const inserted = idx < 0; // a zero-change grab of an existing point won't bump playback
+          useHistoryStore.getState().beginTransaction(); // insert+drag = ONE undo step
+          if (idx < 0) {
+            const relTick = Math.round(Math.min(gSeg.durationTicks, Math.max(0, startContentX / ppt - gSeg.startTick)));
+            const db = Math.round(yToParam(yContent, -R, R, bandTop, bandH) * 10) / 10;
+            const xs = curve ? [...curve.xs] : [];
+            const ys = curve ? [...curve.ys] : [];
+            // exactly on top of an existing point's x (±1 tick) → move THAT point, never stack two
+            const near = xs.findIndex((px) => Math.abs(px - relTick) < 1);
+            if (near >= 0) {
+              ys[near] = db;
+              idx = near;
+            } else {
+              let pos = xs.findIndex((px) => px > relTick);
+              if (pos < 0) pos = xs.length;
+              xs.splice(pos, 0, relTick);
+              ys.splice(pos, 0, db);
+              idx = pos;
+            }
+            useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", { xs, ys });
+          }
+          dragRef.current = {
+            mode: "gainPoint", trackIdx: hit.trackIdx, segId: gSeg.id,
+            startMouseX: e.clientX, startMouseY: e.clientY, startContentX,
+            origStartTick: gSeg.startTick, origDurationTicks: gSeg.durationTicks, origOffsetMs: gSeg.content.offsetMs,
+            moving: [], dragged: false, collapseTo: null,
+            gainPointIndex: idx, gainPointInserted: inserted,
+          };
+          startAutoScroll();
+          return;
+        }
         const track = tracks[hit.trackIdx];
         const seg = track?.segments.find((s) => s.id === hit.segId);
         if (!track || !seg) return;
@@ -765,6 +921,9 @@ export function Arrangement() {
             origStartTick: seg.startTick, origDurationTicks: seg.durationTicks, origOffsetMs: offsetMs,
             moving: [{ trackId: track.id, segId: seg.id, origStartTick: seg.startTick }],
             dragged: false, collapseTo: null,
+            // S59: resizeL rebases the loudness curve alongside offsetMs — from this BASE each
+            // frame (like origOffsetMs), so the per-frame writes can't accumulate.
+            origParamCurves: seg.content.type === "audioClip" ? seg.content.paramCurves : undefined,
           };
           useHistoryStore.getState().beginTransaction(); // coalesce the resize into one undo step
           startAutoScroll();
@@ -823,7 +982,7 @@ export function Arrangement() {
       if (!dragRef.current) {
         const hit = hitTest(e.clientX, e.clientY);
         // Lane edge → trim (ew-resize); lane body → select (pointer, no move); segment edge → resize; body → move.
-        setCursor(!hit ? "crosshair" : hit.zone !== "body" ? "ew-resize" : hit.lane ? "pointer" : "grab");
+        setCursor(!hit ? "crosshair" : hit.zone === "gain" ? "crosshair" : hit.zone !== "body" ? "ew-resize" : hit.lane ? "pointer" : "grab");
         drawRef.current();
       }
     },
@@ -838,6 +997,7 @@ export function Arrangement() {
   const handleDoubleClick = useCallback(
     (e: React.MouseEvent) => {
       const hit = hitTest(e.clientX, e.clientY);
+      if (hit?.zone === "gain") return; // S59: the loudness band never opens an editor
       if (!hit) {
         // ② Empty space on a VOCAL track → create a one-bar notes part at the clicked bar and open the
         // editor (createVocalTrack seeds no parts; this is how you start singing, §9.5).
@@ -929,6 +1089,28 @@ export function Arrangement() {
       e.preventDefault();
       const hit = hitTest(e.clientX, e.clientY);
       const trackIdx = hitTrackIdx(e.clientY);
+      // S59 loudness band: right-click deletes the point under the cursor (vocal-lane gesture);
+      // the band never opens the segment context menu.
+      if (hit?.zone === "gain") {
+        if (hit.segId && hit.gain) {
+          const gTrack = tracks[hit.trackIdx];
+          const gSeg = gTrack?.segments.find((s) => s.id === hit.segId);
+          const curve = gSeg?.content.type === "audioClip" ? gSeg.content.paramCurves?.["loudness"] : undefined;
+          if (gTrack && gSeg && curve) {
+            const r2 = canvasRef.current!.getBoundingClientRect();
+            const x = e.clientX - r2.left + scrollXRef.current;
+            const yC = e.clientY - r2.top + scrollYRef.current;
+            const idx = gainPointAt(curve, gSeg.startTick, x, yC, hit.gain.bandTop, hit.gain.bandH, pptRef.current);
+            if (idx >= 0) {
+              const xs = curve.xs.filter((_, i) => i !== idx);
+              const ys = curve.ys.filter((_, i) => i !== idx);
+              useProjectStore.getState().setSegmentParamCurve(gTrack.id, gSeg.id, "loudness", xs.length ? { xs, ys } : undefined);
+              if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
+            }
+          }
+        }
+        return;
+      }
       if (hit) {
         const track = tracks[hit.trackIdx];
         if (hit.lane) {
@@ -1012,6 +1194,42 @@ export function Arrangement() {
             if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
           },
         });
+      }
+      // S59 BPM/beat-grid detection + the standard correction set (×2 / ÷2 / downbeat nudge /
+      // clear). Corrections are plain undoable store writes (contentSig carries tempoDetect).
+      if (seg?.content.type === "audioClip" && !seg.loading) {
+        const segId = ctxMenu.segId;
+        const clip = seg.content;
+        const bpb = Math.max(1, Math.round(timeAxis.ticksPerBarAt(seg.startTick) / timeAxis.ticksPerBeatAt(seg.startTick)));
+        items.push({
+          label: t("tempo.detect"),
+          onClick: () => { void detectSegmentTempo(track.id, segId, bpb); },
+        });
+        items.push({
+          label: t("tempo.stretch"),
+          onClick: () => setStretchPanel({ x: ctxMenu.x, y: ctxMenu.y, trackId: track.id, segId }),
+        });
+        const td = clip.tempoDetect;
+        if (td) {
+          const x2 = doubleTempoDetect(td, bpb);
+          const half = halveTempoDetect(td, bpb);
+          items.push({
+            label: t("tempo.x2"), disabled: !x2,
+            onClick: () => { if (x2) useProjectStore.getState().setSegmentTempoDetect(track.id, segId, x2); },
+          });
+          items.push({
+            label: t("tempo.half"), disabled: !half,
+            onClick: () => { if (half) useProjectStore.getState().setSegmentTempoDetect(track.id, segId, half); },
+          });
+          items.push({
+            label: t("tempo.nudge"),
+            onClick: () => useProjectStore.getState().setSegmentTempoDetect(track.id, segId, nudgeDownbeat(td, bpb)),
+          });
+          items.push({
+            label: t("tempo.clear"),
+            onClick: () => useProjectStore.getState().setSegmentTempoDetect(track.id, segId, undefined),
+          });
+        }
       }
     }
     items.push({
@@ -1304,10 +1522,22 @@ export function Arrangement() {
         // ② S58: the OOV badge is baked into the static layer, so its state must key the re-bake (the
         // verdict lives in the app store — async, arrives AFTER the notes edit that keyed notesSig).
         const oovCount = vocalOov[s.id]?.length ?? 0;
-        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${oovCount}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
+        // S59: the detected grid + stretch factor + loudness envelope are baked into the static
+        // layer — without these terms detect/×2/÷2/nudge/clear, a stretch change, or an envelope
+        // point edit would not repaint (the S50 static-cache-key lesson: every content kind needs
+        // its own sig term).
+        const pcl = s.content.type === "audioClip" ? s.content.paramCurves?.["loudness"] : undefined;
+        const loudSig = pcl
+          ? pcl.xs.reduce((acc, xv, i) => (Math.imul(acc, 31) + xv * 7 + Math.round(pcl.ys[i]! * 1000)) | 0, pcl.xs.length)
+          : 0;
+        const clipSig = s.content.type === "audioClip"
+          ? `${s.content.stretch ?? 1}~${s.content.tempoDetect ? `${s.content.tempoDetect.bpm}/${s.content.tempoDetect.anchorMs}/${s.content.tempoDetect.downbeat}/${s.content.tempoDetect.conf}/${s.content.tempoDetect.notConstant ? 1 : 0}` : ""}~${loudSig}`
+          : "";
+        return `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${srcPeaks}.${notesSig}.${oovCount}.${clipSig}.${s.processedOutputs?.map(o => `${o.audioPath}:${o.laneId}:${o.laneLabel}:${o.group ?? ""}:${o.loading ? 1 : 0}:${o.offsetMs ?? 0}:${peaksSignature(o.waveformPeaks ?? [])}`).join(",") ?? ""}.${laneOpsSig(s.laneOps)}`;
       }).join(";");
       // playOriginal: flips the main-row waveform (sum ↔ original) + dims every lane row.
-      return `${t.segments.length}:${t.expanded}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
+      // loudnessLaneOpen: the S59 band's open/close changes the baked band area (S50 key lesson).
+      return `${t.segments.length}:${t.expanded}:${t.loudnessLaneOpen ? 1 : 0}:${t.muted}:${t.playOriginal ? 1 : 0}:${laneMutes}:${segs}`;
     }).join(",")}`;
 
     const sizeChanged = !offscreenRef.current
@@ -1487,6 +1717,7 @@ export function Arrangement() {
         onWheel={handleWheel}
       />
       {ctxMenu && <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={ctxItems} onClose={() => setCtxMenu(null)} />}
+      {stretchPanel && <TempoStretchPanel {...stretchPanel} onClose={() => setStretchPanel(null)} />}
     </div>
   );
 }
@@ -1603,7 +1834,10 @@ function drawStaticContent(
       if (seg.content.type === "audioClip" && sw > 2 && seg.content.totalDurationMs > 0) {
         const offMs = seg.content.offsetMs;
         const totalMs = seg.content.totalDurationMs;
-        const segMs = ticksToMs(seg.durationTicks, tempo);
+        // S59: peaks are SOURCE-coordinate — a stretched box windows tickWidth/r source ms, and the
+        // horizontal scale-up of the source waveform IS the correct visualization (time-stretch
+        // preserves the amplitude envelope in time).
+        const segMs = segmentSourceWindowMs(seg, tempo);
         const startRatio = offMs / totalMs;
         const endRatio = Math.min(1, (offMs + segMs) / totalMs);
         // WHAT PLAYS IS WHAT SHOWS: when the sub-lanes are the source (segmentPlaysLanes), the main
@@ -1621,6 +1855,58 @@ function drawStaticContent(
           if (audio && audio.peaks.length > 0) {
             drawWaveform(ctx, seg.content.sourcePath, audio.peaks, `rgba(${c[0]},${c[1]},${c[2]},0.6)`, sx, sy, sw, sh, startRatio, endRatio, width);
           }
+        }
+      }
+
+      // S59 detected BPM/beat grid — vertical beat lines clipped to the box (downbeats stronger,
+      // full height; plain beats start lower) + a small BPM readout. Grid positions live in
+      // SOURCE ms: x = box-left + (beatMs − offsetMs) / windowSourceMs. Drawn after the waveform
+      // (lines read on top of it), before the status dot / mute dimming.
+      if (seg.content.type === "audioClip" && seg.content.tempoDetect && sw > 24) {
+        const td = seg.content.tempoDetect;
+        const srcWinMs = segmentSourceWindowMs(seg, tempo);
+        const offMs = seg.content.offsetMs;
+        const periodMs = 60000 / td.bpm;
+        const bpb = Math.max(1, Math.round(axis.ticksPerBarAt(seg.startTick) / axis.ticksPerBeatAt(seg.startTick)));
+        const beatPx = (periodMs / srcWinMs) * sw;
+        // cull the k-range to the VISIBLE canvas span (audit: iterating the whole source window
+        // stroked thousands of clipped off-screen lines per rebake, and the old raw-count bail
+        // silently dropped the grid on long clips at every zoom)
+        const vx0 = Math.max(sx, 0);
+        const vx1 = Math.min(sx + sw, width);
+        const msAt = (vx: number) => offMs + ((vx - sx) / sw) * srcWinMs;
+        const k0 = Math.max(0, Math.ceil((msAt(vx0) - td.anchorMs) / periodMs));
+        const kEnd = Math.floor((msAt(vx1) - td.anchorMs) / periodMs);
+        // legibility floor: below ~4px/beat draw only downbeats; below ~1.5px/bar skip the grid
+        if (vx1 > vx0 && beatPx * bpb >= 1.5 && kEnd - k0 <= 8000) {
+          const drawBeatsToo = beatPx >= 4;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(sx, sy, sw, sh);
+          ctx.clip();
+          ctx.lineWidth = 1;
+          for (let k = k0; k <= kEnd; k++) {
+            const isDown = (((k - td.downbeat) % bpb) + bpb) % bpb === 0;
+            if (!isDown && !drawBeatsToo) continue;
+            const beatMs = td.anchorMs + k * periodMs;
+            const x = Math.round(sx + ((beatMs - offMs) / srcWinMs) * sw) + 0.5;
+            ctx.strokeStyle = rgba(ACCENT_RGB, isDown ? 0.5 : 0.18);
+            ctx.beginPath();
+            ctx.moveTo(x, isDown ? sy + 1 : sy + sh * 0.35);
+            ctx.lineTo(x, sy + sh - 1);
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+        if (sw > 70) {
+          // EFFECTIVE tempo (source bpm ÷ stretch) — the grid lines beside it are spaced at the
+          // as-played tempo, and the panel already treats td.bpm/r as the effective value; showing
+          // raw source BPM here misled tempo-matching on stretched clips (audit).
+          const effBpm = td.bpm / segStretch(seg);
+          const label = `${effBpm.toFixed(1)}${td.notConstant ? "~" : td.conf < 0.5 ? "?" : ""} BPM`;
+          ctx.font = "9px monospace";
+          ctx.fillStyle = rgba(ACCENT_RGB, 0.9);
+          ctx.fillText(label, sx + 16, sy + 11);
         }
       }
 
@@ -1695,7 +1981,9 @@ function drawStaticContent(
               ctx.fillRect(px + pw - 1.5, laneY + 1, 1.5, laneH - 2);
             };
             if (!stored) {
-              const lSegMs = ticksToMs(seg.durationTicks, tempo);
+              // S59: for audioClip the window length is in SOURCE ms (÷ stretch); a notes bake never
+              // stretches (segmentSourceWindowMs folds r=1 for it, so the vocal branch is unchanged).
+              const lSegMs = segmentSourceWindowMs(seg, tempo);
               if (seg.content.type === "audioClip") {
                 // AUDIO — the box is a WINDOW [offset, offset+segment] into a source that spans it, so the
                 // waveform fills the box (byte-identical to the pre-P3 single-window draw, zero regression).
@@ -1780,6 +2068,56 @@ function drawStaticContent(
           const ry = y + layout.rowY[run.start + k]! * scale;
           ctx.strokeStyle = rgba(SEPARATOR_RGB, 0.5); ctx.lineWidth = 0.5;
           ctx.beginPath(); ctx.moveTo(0, ry); ctx.lineTo(width, ry); ctx.stroke();
+        }
+      }
+    }
+
+    // S59 loudness-lane band: bg + neutral 0 dB midline + per-clip envelope (2px-sampled
+    // evalCurveAt polyline, square point handles — the vocal lane's draw style). Geometry = the
+    // track's bottom strip (computeTrackHeight includes it; it is NOT a lane row).
+    {
+      const gBandH = loudnessBandH(track) * scale;
+      if (gBandH > 0) {
+        const bandTop = y + computeTrackHeight(track, scale) - gBandH;
+        ctx.fillStyle = "rgba(13, 18, 32, 0.55)";
+        ctx.fillRect(0, bandTop, width, gBandH);
+        ctx.strokeStyle = rgba(SEPARATOR_RGB, 0.8);
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, bandTop + 0.5); ctx.lineTo(width, bandTop + 0.5); ctx.stroke();
+        const zeroY = paramToY(0, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, bandTop, gBandH);
+        ctx.strokeStyle = rgba(ACCENT_RGB, 0.25);
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(width, zeroY); ctx.stroke();
+        ctx.setLineDash([]);
+        for (const seg of track.segments) {
+          if (seg.loading || seg.content.type !== "audioClip") continue;
+          const gsx = seg.startTick * ppt - scrollX;
+          const gsw = seg.durationTicks * ppt;
+          if (gsx > width + CULL_PAD || gsx + gsw < -CULL_PAD) continue;
+          // faint clip extent so the editable range reads inside the band
+          ctx.strokeStyle = rgba(ACCENT_RGB, 0.15);
+          ctx.strokeRect(gsx + 0.5, bandTop + 1.5, gsw - 1, gBandH - 3);
+          const curve = seg.content.paramCurves?.["loudness"];
+          if (!curve || curve.xs.length === 0) continue;
+          ctx.strokeStyle = rgba(ACCENT_RGB, 0.85);
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          const x0 = Math.max(gsx, 0);
+          const x1 = Math.min(gsx + gsw, width);
+          for (let px = x0; px <= x1; px += 2) {
+            const relTick = (px + scrollX) / ppt - seg.startTick;
+            const py = paramToY(evalCurveAt(curve, relTick), -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, bandTop, gBandH);
+            if (px === x0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+          ctx.fillStyle = rgba(ACCENT_RGB, 0.95);
+          for (let i = 0; i < curve.xs.length; i++) {
+            const px = (seg.startTick + curve.xs[i]!) * ppt - scrollX;
+            if (px < -CULL_PAD || px > width + CULL_PAD) continue;
+            const py = paramToY(curve.ys[i]!, -LOUDNESS_DB_RANGE, LOUDNESS_DB_RANGE, bandTop, gBandH);
+            ctx.fillRect(px - 3, py - 3, 6, 6);
+          }
         }
       }
     }

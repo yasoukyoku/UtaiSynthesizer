@@ -61,10 +61,19 @@ function deriveName(dir: string): string {
   return bn.replace(/\.usp$/i, "") || "Untitled";
 }
 
+/** S59: monotonic DOCUMENT-LOAD epoch. Async analysis/stretch flows capture it before their
+ *  awaits and drop their store write if a load replaced the document mid-flight — matching ids +
+ *  values alone can't tell "same project reopened" apart from "nothing changed" (audit). */
+let loadEpoch = 0;
+export function getLoadEpoch(): number {
+  return loadEpoch;
+}
+
 /** Stop the transport and drop the previous project's audio caches before loading a different
  *  document — otherwise the old project keeps playing and its decoded buffers/peaks are served stale
  *  (and leak). Called only once we're committed to replacing the project. */
 function teardownForLoad() {
+  loadEpoch++;
   stopPlayback();
   useAudioStore.getState().setPlaying(false);
   clearWaveformCache();

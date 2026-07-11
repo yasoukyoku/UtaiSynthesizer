@@ -2,7 +2,7 @@ import { useProjectStore } from "../store/project";
 import { useAudioStore } from "../store/audio";
 import { useAppStore } from "../store/app";
 import {
-  sliceClips, deleteClip, isWholeClips, ticksToMs, clipIndexAtMs, materializeClips, laneGroupId,
+  sliceClips, deleteClip, isWholeClips, ticksToMs, clipIndexAtMs, materializeClips, laneGroupId, segStretch,
 } from "./audio/laneOps";
 import type { Segment } from "../types/project";
 
@@ -41,7 +41,8 @@ export function sliceLaneGroupAtPlayhead(trackId: string, segmentId: string, out
   const ph = st.playheadTick;
   if (ph <= seg.startTick || ph >= seg.startTick + seg.durationTicks) return;
   const stemDurMs = seg.content.totalDurationMs;
-  const cutMs = seg.content.offsetMs + ticksToMs(ph - seg.startTick, st.tempo);
+  // S59: the cut position is a SOURCE (stem) coordinate — a stretched box's tick distance covers /r source ms
+  const cutMs = seg.content.offsetMs + ticksToMs(ph - seg.startTick, st.tempo) / segStretch(seg);
   const clips = sliceClips(seg.laneOps?.[outputNodeId], stemDurMs, cutMs);
   st.updateSegmentLaneOps(trackId, segmentId, outputNodeId, isWholeClips(clips, stemDurMs) ? undefined : clips);
   resyncSelectedClip(trackId, segmentId, outputNodeId, stemDurMs, cutMs);

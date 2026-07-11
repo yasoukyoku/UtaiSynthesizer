@@ -126,14 +126,24 @@ function noteSig(n: Note): string {
   );
 }
 
+/** Sorted-key sig of a paramCurves bag (shared by both content variants). */
+function paramCurvesSig(pc?: Record<string, PitchCurve>): string {
+  if (!pc) return "";
+  return Object.keys(pc).sort().map((k) => `${k}=${curveSig(pc[k])}`).join("&");
+}
+
 export function contentSig(c: SegmentContent): string {
-  if (c.type === "audioClip") return `a:${c.sourcePath}:${c.offsetMs}:${c.totalDurationMs}`;
+  if (c.type === "audioClip") {
+    // stretch folds to 1 and tempoDetect to "" so untouched clips keep their pre-S59 identity
+    // (no phantom undo step / false-dirty on old projects).
+    const td = c.tempoDetect;
+    const tdSig = td ? `${td.bpm},${td.anchorMs},${td.downbeat},${td.conf},${td.notConstant ? 1 : 0}` : "";
+    return `a:${c.sourcePath}:${c.offsetMs}:${c.totalDurationMs}:${c.stretch ?? 1}:${tdSig}:${paramCurvesSig(c.paramCurves)}`;
+  }
   const notes = c.notes.map(noteSig).join("|");
   const dev = curveSig(c.pitchDev);
   // paramCurves is a Record — key order is not guaranteed, so SORT (like laneSig) for a stable signature.
-  const params = c.paramCurves
-    ? Object.keys(c.paramCurves).sort().map((k) => `${k}=${curveSig(c.paramCurves![k])}`).join("&")
-    : "";
+  const params = paramCurvesSig(c.paramCurves);
   return `n:${notes}#${dev}#${params}`;
 }
 
@@ -260,6 +270,8 @@ function applySnapshot(snap: Snapshot) {
       ...t,
       // expanded is a view overlay — keep the current value rather than the snapshot's.
       expanded: lt ? lt.expanded : t.expanded,
+      // S59 loudness-lane band open state — same view-overlay treatment as expanded.
+      loudnessLaneOpen: lt ? lt.loudnessLaneOpen : t.loudnessLaneOpen,
       segments: t.segments.map((s) => {
         const ls = liveSegById.get(s.id);
         // Overlay the runtime/render fields from the LIVE segment if it still exists, else fall back
@@ -286,7 +298,10 @@ function applySnapshot(snap: Snapshot) {
             return {
               ...seg,
               loading: false,
-              durationTicks: flooredDurationTicks(af.durationMs, snap.tempo),
+              // S59: a stretched clip's box is source-duration × r — reconciling without the
+              // factor would silently snap a stretched segment back to 1:1 length (the recon's
+              // top silent-regression risk for the stretch feature).
+              durationTicks: flooredDurationTicks(af.durationMs * (seg.content.stretch ?? 1), snap.tempo),
               content: { ...seg.content, totalDurationMs: af.durationMs },
             } as Segment;
           }

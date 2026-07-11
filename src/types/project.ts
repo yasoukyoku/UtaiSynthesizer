@@ -23,6 +23,10 @@ export interface Track {
    *  inference knobs (noise_scale…) join here in Phase 6 when the vocal render is wired. (S48 Phase 3) */
   vocalParams?: VocalTrackParams;
   expanded: boolean;
+  /** S59: the audio track's LOUDNESS LANE band (playback-domain clip-gain envelope editor) is
+   *  open. Pure VIEW state, mirroring `expanded` exactly: excluded from undo/dirty, overlay
+   *  re-merged on snapshot restore, stripped from the autosave compare. Absent/false = closed. */
+  loudnessLaneOpen?: boolean;
   /** Per-GROUP mix (volume/pan), keyed by the producing Output node id (`laneGroupId`) — "recorded ON
    *  the Output node", exactly like laneOps: all lanes of one 组 share the setting (解组 to control
    *  independently), a 轨道组 rename OR any upstream rewiring (insert an effects node, reconnect to the
@@ -133,7 +137,40 @@ export type SegmentContent =
        *  Same PitchCurve shape (X = ticks rel. segment start, Y = param value). Absent = all defaults. */
       paramCurves?: Record<string, PitchCurve>;
     }
-  | { type: "audioClip"; sourcePath: string; offsetMs: number; totalDurationMs: number };
+  | {
+      type: "audioClip";
+      sourcePath: string;
+      offsetMs: number;
+      totalDurationMs: number;
+      /** S59 detected BPM/beat grid. Anchored in SOURCE-audio ms → stable under split/resize/stretch
+       *  (both split halves keep the same grid). Absent = never analyzed / cleared. Undoable (contentSig). */
+      tempoDetect?: TempoDetect;
+      /** S59 Tempo Slider: played duration / source duration (>1 = slower). The clip window
+       *  (offsetMs/totalDurationMs, laneOps, stems) stays in UNSTRETCHED source coordinates — r applies
+       *  only at the tick↔source-ms boundary and playback feeds per-(content,r) stretched artifacts.
+       *  Stored ONLY when ≠ 1 (false-dirty rule: old projects stay byte-identical). */
+      stretch?: number;
+      /** S59 loudness lane (playback-domain clip-gain envelope, dB) — mirrors the notes variant's
+       *  paramCurves ("loudness" key; X = ticks rel. segment start). Applied as a WebAudio gain
+       *  envelope at schedule time, NEVER fed into rendering (the cover pipeline already derives its
+       *  loudness from the source audio itself — vol_embedding / rms_mix). */
+      paramCurves?: Record<string, PitchCurve>;
+    };
+
+/** S59 BPM/beat-grid detection result carried on an audio clip. All values canonical-rounded at the
+ *  single store write point (setSegmentTempoDetect) so serialize stays byte-stable. */
+export interface TempoDetect {
+  /** Constant-grid tempo in BPM (regression-refined). */
+  bpm: number;
+  /** First grid beat in SOURCE-audio ms; the grid is anchorMs + k·(60000/bpm) for all k ≥ 0. */
+  anchorMs: number;
+  /** Which grid beat (0-based, counting from the anchor) is bar-beat 1. */
+  downbeat: number;
+  /** Detector confidence ∈ [0,1]. */
+  conf: number;
+  /** True = the material did not fit a constant grid (UI marks the grid advisory). Stored ONLY when true. */
+  notConstant?: boolean;
+}
 
 /** One vocal note (§3.1 "VocalNote"). A SUPERSET of the original 7-field Note: the base fields are the
  *  musical note; the optional fields (all absent = a plain note at its谱-derived pitch) carry the pitch/

@@ -1,5 +1,5 @@
 import type { Track, Segment, ProcessedOutput, Workflow, LaneControl } from "../types/project";
-import { TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT } from "./constants";
+import { TRACK_HEADER_HEIGHT, LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, LOUDNESS_LANE_HEIGHT } from "./constants";
 import type { TimeAxis } from "./timeAxis";
 import { laneRowKey, laneGroupName, laneGroupId, laneOpsSig, materializeClips } from "./audio/laneOps";
 import { peaksSignature } from "./waveformCache";
@@ -403,13 +403,21 @@ export function laneRowAtY(track: Track, yUnscaled: number): number {
   return -1;
 }
 
+/** S59: the UNSCALED height of the track's loudness-lane band (0 when closed / not an audio
+ *  track). Deliberately OUTSIDE getLaneLayout's rowY — the band is not a lane row, so
+ *  laneRowAtY/rowByKey consumers (hit-test, loading overlay, crossfade row positioning) never
+ *  see it; it just extends computeTrackHeight below the rows. */
+export function loudnessBandH(track: Track): number {
+  return track.loudnessLaneOpen && track.trackType === "audio" ? LOUDNESS_LANE_HEIGHT : 0;
+}
+
 /** Track display height. `scale` is the vertical zoom (vZoom) applied to header + lanes.
  *  Expanded lanes = one row per distinct laneRowKey + one GROUP BAR per 组+名 run (getLaneLayout),
  *  matching the header column's rendering, so the column never overflows its box when a track's
  *  segments emit heterogeneous lane sets. */
 export function computeTrackHeight(track: Track, scale = 1): number {
   const lanesH = track.expanded ? getLaneLayout(track).lanesHeight : 0;
-  return (TRACK_HEADER_HEIGHT + lanesH) * scale;
+  return (TRACK_HEADER_HEIGHT + lanesH + loudnessBandH(track)) * scale;
 }
 
 export function computeTrackYOffsets(tracks: Track[], scale = 1): number[] {

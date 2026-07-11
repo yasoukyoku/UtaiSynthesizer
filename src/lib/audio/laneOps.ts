@@ -39,6 +39,20 @@ export function flooredDurationTicks(ms: number, tempo: number): number {
   return Math.max(1, Math.round(msToTicks(ms, tempo)));
 }
 
+/** S59 Tempo Slider: the segment's stretch factor (played duration / source duration; 1 = none).
+ *  THE single accessor — every "segment window ↔ source ms" conversion divides/multiplies through
+ *  here. The clip window (offsetMs/totalDurationMs), laneOps recipes and stems all stay in
+ *  UNSTRETCHED source coordinates; only the tick↔source boundary and the playback buffer offsets
+ *  (which read per-(content, r) stretched artifacts) see r. */
+export function segStretch(seg: Pick<Segment, "content">): number {
+  return seg.content.type === "audioClip" ? (seg.content.stretch ?? 1) : 1;
+}
+
+/** The segment window's length in SOURCE ms: the box's tick width divided by the stretch factor. */
+export function segmentSourceWindowMs(seg: Segment, tempo: number): number {
+  return ticksToMs(seg.durationTicks, tempo) / segStretch(seg);
+}
+
 /** The Output-node group a lane belongs to = its `outputNodeId`, or (legacy / defensive) the laneId
  *  prefix before "::" (laneId is ALWAYS `${outputNodeId}::${fromNode}:${fromPort}`). laneOps is keyed
  *  by this, so all lanes fanned into one Output node share ONE recipe ("group-operate"). */
@@ -114,8 +128,11 @@ export function laneVisiblePieces(
   // the same stem — the right half's bake carries `bakeOffsetMs` (ms into the stem) so it plays [off, off+dur]
   // without re-rendering (an audioClip's offsetMs plays the same role). 0 ⇒ byte-identical to the un-split case.
   const offset = seg.content.type === "audioClip" ? seg.content.offsetMs : bakeOffsetMs;
+  // S59: the window spans srcWin = tickWidth/r in SOURCE ms, and a source-ms distance maps to the
+  // timeline at ×r (stems/recipes stay source-coordinate; the box is in played time).
+  const r = segStretch(seg);
   const winStart = offset;
-  const winEnd = offset + ticksToMs(seg.durationTicks, tempo);
+  const winEnd = offset + ticksToMs(seg.durationTicks, tempo) / r;
   const clips = materializeClips(stored, stemDurMs);
   const pieces: LanePiece[] = [];
   for (const c of clips) {
@@ -123,8 +140,8 @@ export function laneVisiblePieces(
     const e = Math.min(c.end, winEnd);
     if (e - s <= EPS_MS) continue;
     pieces.push({
-      startTick: seg.startTick + msToTicks(s - offset, tempo),
-      endTick: seg.startTick + msToTicks(e - offset, tempo),
+      startTick: seg.startTick + msToTicks((s - offset) * r, tempo),
+      endTick: seg.startTick + msToTicks((e - offset) * r, tempo),
       startMs: s,
       endMs: e,
     });

@@ -6,6 +6,10 @@ export const LANE_HEIGHT = 32;
  *  volume/pan controls, drawn ONCE per 组 — P5). Part of the shared track-height math: the header
  *  column and the canvas both position rows through getLaneLayout, never by `index * LANE_HEIGHT`. */
 export const LANE_GROUP_BAR_HEIGHT = 18;
+/** S59: height of the audio track's LOUDNESS LANE band (playback clip-gain envelope editor),
+ *  appended BELOW the lane rows when track.loudnessLaneOpen — part of computeTrackHeight, never
+ *  of getLaneLayout's rowY (it is NOT a lane row; laneRowAtY must keep returning -1 inside it). */
+export const LOUDNESS_LANE_HEIGHT = 44;
 /** Height of the "+ add track" footer below the track stack — vertical scroll must leave room
  *  for it (it lives inside the scrolled track-header column), so it can't be clipped off. */
 export const TRACK_ADD_FOOTER = 36;
@@ -31,6 +35,12 @@ export const AUDIO_EXT_RE = new RegExp(`\\.(${AUDIO_EXTENSIONS.join("|")})$`, "i
  *  native dialog filter (src/lib/vocal/import.ts). ust/ustx are 480-ppq (1:1 with our resolution); midi
  *  is scaled from its header PPQ. The Rust `import_score_file` command dispatches on this same set. */
 export const SCORE_EXTENSIONS = ["ustx", "ust", "mid", "midi"];
+
+/** S59: upper bound for a stored TempoDetect.downbeat phase. The UI meter numerator maxes at 16,
+ *  and the ×2 grid correction stores the phase mod (2·bpb) to keep ÷2 a perfect round-trip — so
+ *  the legal range is [0, 31]. ONE constant for the store's canonical write clamp AND the .usp
+ *  load sanitizer (they must agree or a saved value bounces on reload). */
+export const MAX_DOWNBEAT = 31;
 
 /** Volume-fader floor (dB). The BOTTOM of a volume fader means −∞/MUTE (the universal DAW convention:
  *  bounded upward, unbounded downward) — dbToLinear maps any value at/below this to gain 0, and the

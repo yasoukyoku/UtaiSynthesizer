@@ -5,8 +5,8 @@ import { useHistoryStore } from "../../store/history";
 import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB, FADER_MAX_DB, AUDIO_EXTENSIONS } from "../../lib/constants";
-import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
+import { LANE_HEIGHT, LANE_GROUP_BAR_HEIGHT, LOUDNESS_LANE_HEIGHT, TRACK_HEADER_HEIGHT, FADER_MIN_DB, FADER_MAX_DB, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { computeTrackHeight, computeTrackYOffsets, computeTotalTracksHeight, findTrackAtY, getLanes, getLaneLayout, isLaneRowMuted, laneControlFor, loudnessBandH, type LaneGroupRun, type LaneMember } from "../../lib/trackLayout";
 import { laneLabelParts } from "../../lib/audio/laneOps";
 import { trackTypeCssVar, LANE_COLORS } from "../../lib/trackColors";
 import { importAudioToNewTrack } from "../../lib/audio/import";
@@ -552,6 +552,17 @@ function TrackItem({
                 O
               </button>
             )}
+            {/* S59 loudness-lane band toggle — audio tracks only (the vocal loudness lane lives in
+                the vocal editor). View state like expanded: no undo step, no dirty. */}
+            {track.trackType === "audio" && (
+              <button
+                className={`track-btn track-btn-db ${track.loudnessLaneOpen ? "active-orig" : ""}`}
+                title={t("tracks.loudnessLane")}
+                onClick={(e) => { e.stopPropagation(); useProjectStore.getState().toggleLoudnessLane(track.id); }}
+              >
+                dB
+              </button>
+            )}
             <button
               className={`track-btn ${track.muted ? "active-mute" : ""}`}
               onClick={(e) => { e.stopPropagation(); onMute(); }}
@@ -671,6 +682,13 @@ function TrackItem({
           </div>
         );
       })}
+      {/* S59 loudness-band header block — MUST render whenever the canvas band is open, else the
+          header column's total height drifts from computeTrackHeight and every row below desyncs. */}
+      {loudnessBandH(track) > 0 && (
+        <div className="loudness-band-header" style={{ height: LOUDNESS_LANE_HEIGHT * vZoom }}>
+          <span className="loudness-band-label">{t("tracks.loudnessLane")}</span>
+        </div>
+      )}
     </div>
   );
 }

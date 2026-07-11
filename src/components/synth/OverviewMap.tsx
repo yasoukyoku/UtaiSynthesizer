@@ -3,7 +3,7 @@ import { useProjectStore, useTimeAxis } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
 import { PIXELS_PER_TICK } from "../../lib/constants";
-import { ticksToMs } from "../../lib/audio/laneOps";
+import { segmentSourceWindowMs, ticksToMs } from "../../lib/audio/laneOps";
 import { computeTotalTicks, segmentPlaysLanes, segmentLaneSumPeaks, laneSumSig } from "../../lib/trackLayout";
 import { getWaveformCache, blitWaveform } from "../../lib/waveformCache";
 import { rgba, ACCENT_RGB, TRACK_RGB } from "../../lib/trackColors";
@@ -153,7 +153,8 @@ export function OverviewMap() {
         // identical — without this the cached bitmap blits forever and the clip never appears.
         // segmentPlaysLanes + laneSumSig: the source switch (playOriginal / lanes turning ready) and
         // every lane-sum input (lane peaks, row mutes, slice recipes) must rebake the preview.
-        ? `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.content.offsetMs}.${s.content.sourcePath}.${audioFiles[s.content.sourcePath]?.peaks.length ?? 0}.${segmentPlaysLanes(t, s) ? 1 : 0}.${laneSumSig(t, s)}`
+        // S59: the stretch factor changes the source window (segMs/r) → must rebake the preview.
+        ? `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.content.offsetMs}.${s.content.stretch ?? 1}.${s.content.sourcePath}.${audioFiles[s.content.sourcePath]?.peaks.length ?? 0}.${segmentPlaysLanes(t, s) ? 1 : 0}.${laneSumSig(t, s)}`
         // ② vocal bake: rebake the preview when the rendered stem lands/changes (peaks length + path + dur).
         : (s.content.type === "notes" && s.processedOutputs?.length
           ? `n${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.processedOutputs.map((o) => `${o.audioPath}:${o.totalDurationMs}:${o.offsetMs ?? 0}:${o.waveformPeaks?.length ?? 0}`).join("+")}`
@@ -186,7 +187,7 @@ export function OverviewMap() {
             // so the SAME window ratios apply to both branches.)
             const offMs = seg.content.offsetMs;
             const totalMs = seg.content.totalDurationMs;
-            const segMs = ticksToMs(seg.durationTicks, tempo);
+            const segMs = segmentSourceWindowMs(seg, tempo); // S59: window length in SOURCE ms (÷ stretch)
             const startRatio = offMs / totalMs;
             const endRatio = Math.min(1, (offMs + segMs) / totalMs);
             // WHAT MIXES IS WHAT SHOWS: lanes' real audible sum when they are the source, else the

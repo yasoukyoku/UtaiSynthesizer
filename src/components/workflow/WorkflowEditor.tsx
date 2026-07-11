@@ -536,8 +536,8 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
         if (o.outputNodeId) stale.add(o.outputNodeId);
       }
       for (const outId of stale) useProjectStore.getState().removeProcessedOutputsForNode(trackId, segmentId, outId);
-      const outputs = await executeWorkflow(segmentId, segment.seg, wf);
-      if (outputs.length === 0) {
+      const laneCount = await executeWorkflow(segmentId, segment.seg, wf);
+      if (laneCount === 0) {
         // Nothing reached an Output node (none connected, or no stems produced) — say so, don't sit silent.
         useAppStore.getState().showToast(i18n.t("workflow.noOutputs"), "error");
         return;
@@ -695,12 +695,16 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       setStatus(anyLoading ? "running" : "completed");
       reschedule();
       if (toDecode.length > 0) {
+        // S59 deposit-perf O2: decode lanes CONCURRENTLY (the old per-lane sequential awaits
+        // serialized 4-5 multi-second stem decodes). Promise.all keeps the throw-on-any-failure
+        // semantics the catch below depends on (drop placeholders, keep finished lanes).
         const decoded = new Map<string, ProcessedOutput>();
-        for (const p of toDecode) {
+        const results = await Promise.all(toDecode.map((p) => {
           clearBufferCache(p.audioPath);
-          loadAudioBuffer(p.audioPath);
-          decoded.set(p.laneId, await loadCachedOutput(p));
-        }
+          void loadAudioBuffer(p.audioPath); // warm the playback decode in parallel (promise-deduped)
+          return loadCachedOutput(p);
+        }));
+        for (let i = 0; i < toDecode.length; i++) decoded.set(toDecode[i]!.laneId, results[i]!);
         // The node may have been deleted while we were decoding — drop its lanes, don't deposit a phantom.
         if (!nodesRef.current.some((n) => n.id === outputNodeId)) {
           useProjectStore.getState().removeProcessedOutputsForNode(trackId, segmentId, outputNodeId);

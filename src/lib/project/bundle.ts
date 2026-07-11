@@ -1,6 +1,8 @@
 import type { Track, Segment, ProcessedOutput, PitchCurve } from "../../types/project";
 import { laneGroupName, rowKeyLaneId } from "../audio/laneOps";
 import { normalizeNotesArray, normalizeCurve, sanitizeVocalParams, sanitizeText } from "../vocalNotes";
+import { MAX_DOWNBEAT } from "../constants";
+import { LOUDNESS_DB_RANGE } from "../vocalGeometry";
 
 /**
  * `.usp` project-bundle (de)serialization. A `.usp` is a self-contained FOLDER:
@@ -95,6 +97,10 @@ function serializeProject(
     // `expanded` is pure view state (excluded from undo + dirty). In the AUTOSAVE path strip it so a
     // collapse/expand toggle isn't seen as "unsaved content" by the content-compare. Saved bundles keep it.
     if (stripView) delete (track as { expanded?: boolean }).expanded;
+    // S59 loudness-lane band: same view-state posture as expanded, plus delete-when-falsy in SAVED
+    // bundles too (optional field — an open→close cycle must not leave `false` in the JSON, else a
+    // never-touched project and a touched-then-restored one differ byte-wise; playOriginal precedent).
+    if (stripView || !track.loudnessLaneOpen) delete (track as { loudnessLaneOpen?: boolean }).loudnessLaneOpen;
     return track;
   });
 
@@ -170,6 +176,53 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
       let content = rest.content;
       if (content.type === "audioClip") {
         content = { ...content, sourcePath: resolve(content.sourcePath) };
+        // UNTRUSTED LOAD BOUNDARY for the S59 clip fields (same posture as the notes funnel below):
+        // a corrupt stretch/tempoDetect must not reach tick math (NaN durations) or the canvas.
+        if (content.stretch !== undefined) {
+          const r = Number(content.stretch);
+          if (!Number.isFinite(r) || r <= 0 || Math.abs(r - 1) < 1e-9) delete content.stretch;
+          else content.stretch = Math.min(4, Math.max(0.25, r));
+        }
+        if (content.tempoDetect !== undefined) {
+          const td = content.tempoDetect as unknown as Record<string, unknown>;
+          const bpm = Number(td?.bpm);
+          const anchorMs = Number(td?.anchorMs);
+          const downbeat = Number(td?.downbeat);
+          const conf = Number(td?.conf);
+          if (Number.isFinite(bpm) && bpm >= 20 && bpm <= 400 && Number.isFinite(anchorMs) && anchorMs >= 0) {
+            content.tempoDetect = {
+              bpm,
+              anchorMs,
+              downbeat: Number.isFinite(downbeat) ? Math.min(MAX_DOWNBEAT, Math.max(0, Math.round(downbeat))) : 0,
+              conf: Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0,
+              ...(td?.notConstant === true ? { notConstant: true as const } : {}),
+            };
+          } else {
+            delete content.tempoDetect;
+          }
+        }
+        if (content.paramCurves !== undefined) {
+          let paramCurves: Record<string, PitchCurve> | undefined;
+          if (content.paramCurves && typeof content.paramCurves === "object") {
+            const out: Record<string, PitchCurve> = {};
+            for (const k of Object.keys(content.paramCurves).sort()) {
+              const key = sanitizeText(k, 32);
+              let nc = normalizeCurve(content.paramCurves[k], "param");
+              // the loudness curve feeds a playback GAIN (10^(dB/20)) — clamp a hostile file's
+              // ys to the lane's legal dB range so no absurd gain can reach the AudioParam
+              if (nc && key === "loudness") {
+                nc = {
+                  xs: nc.xs,
+                  ys: nc.ys.map((y) => Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, y))),
+                };
+              }
+              if (key && nc) out[key] = nc;
+            }
+            if (Object.keys(out).length > 0) paramCurves = out;
+          }
+          if (paramCurves) content.paramCurves = paramCurves;
+          else delete content.paramCurves;
+        }
       } else if (content.type === "notes") {
         // UNTRUSTED LOAD BOUNDARY (§9.8.1): a hand-edited / corrupt .usp must not slip NaN ticks, out-of-
         // range pitch, control-char lyrics, or unbounded arrays past the editor's clamps straight into the

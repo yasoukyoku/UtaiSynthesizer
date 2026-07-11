@@ -1,0 +1,62 @@
+/* S59 Tempo Slider panel — angular house style (mirrors .ctx-menu tokens). */
+
+.stretch-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: transparent;
+}
+
+.stretch-panel {
+  position: fixed;
+  z-index: var(--z-overlay);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stretch-title {
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.stretch-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-secondary);
+}
+
+.stretch-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.stretch-btn {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: var(--font-size-sm);
+  background: var(--bg-elevated, rgba(148, 163, 184, 0.08));
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.stretch-btn:hover:not(:disabled) {
+  background: var(--accent-primary-glow);
+  color: var(--accent-primary-bright);
+  border-color: var(--accent-primary);
+}
+
+.stretch-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

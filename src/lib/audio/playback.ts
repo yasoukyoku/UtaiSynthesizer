@@ -1,6 +1,10 @@
 import { readFile } from "@tauri-apps/plugin-fs";
 import { FADER_MIN_DB } from "../constants";
-import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, msToTicks, ticksToMs } from "./laneOps";
+import { laneGroupId, laneReachesSeam, laneRowKey, laneVisiblePieces, msToTicks, segStretch, ticksToMs } from "./laneOps";
+import { ensureStretched } from "./stretchCache";
+import { evalCurveAt } from "../f0eval";
+import { LOUDNESS_DB_RANGE } from "../vocalGeometry";
+import type { Segment } from "../../types/project";
 import { isLaneRowMuted, laneControlFor, segmentPlaysLanes } from "../trackLayout";
 import { useProjectStore } from "../../store/project";
 import type { Track } from "../../types/project";
@@ -107,19 +111,37 @@ export function stopPreviewTone(): void {
   } catch { /* already stopped */ }
 }
 
+/** In-flight decode dedup (S59 deposit-perf O1): the cache below stores only FINISHED AudioBuffers,
+ *  so the reconciler's warm-up and a reschedule racing ~140ms later both MISSed and decoded the same
+ *  ~85MB stem twice (0.5–2.5s each). Concurrent callers now share one decode promise. */
+const inFlightBuffers = new Map<string, Promise<AudioBuffer>>();
+
 export async function loadAudioBuffer(filePath: string): Promise<AudioBuffer> {
-  if (loadedBuffers.has(filePath)) {
-    return loadedBuffers.get(filePath)!;
+  const hit = loadedBuffers.get(filePath);
+  if (hit) return hit;
+  const inflight = inFlightBuffers.get(filePath);
+  if (inflight) return inflight;
+  let p: Promise<AudioBuffer> | undefined;
+  p = (async () => {
+    const ctx = getContext();
+    const bytes = await readFile(filePath);
+    const arrayBuffer = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    );
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+    // publish only while still the registered decode — a clearBufferCache() mid-flight must not
+    // let this orphaned result re-poison the cache with the old bytes (p is assigned before the
+    // first await resolves, so the comparison is always against the real promise)
+    if (inFlightBuffers.get(filePath) === p) loadedBuffers.set(filePath, audioBuffer);
+    return audioBuffer;
+  })();
+  inFlightBuffers.set(filePath, p);
+  try {
+    return await p;
+  } finally {
+    inFlightBuffers.delete(filePath);
   }
-  const ctx = getContext();
-  const bytes = await readFile(filePath);
-  const arrayBuffer = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength,
-  );
-  const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-  loadedBuffers.set(filePath, audioBuffer);
-  return audioBuffer;
 }
 
 export async function playAllTracks(
@@ -181,10 +203,22 @@ export async function playAllTracks(
           const rowKey = laneRowKey(out); // ROW identity — crossfade pairing + per-row mute
           const groupId = laneGroupId(out); // 组 identity — volume/pan ("recorded on the Output node")
 
-          let buf = loadedBuffers.get(out.audioPath);
+          // S59 Tempo Slider: a stretched segment plays per-(stem, r) artifacts; the recipe/window
+          // math below stays in source coordinates and only the BUFFER + its offsets change.
+          const stretchR = segStretch(seg);
+          let stemPath = out.audioPath;
+          if (stretchR !== 1) {
+            try { stemPath = await ensureStretched(out.audioPath, stretchR); } catch (e) {
+              console.error(`[playback] stretch failed for lane ${out.audioPath} ×${stretchR}:`, e);
+              if (gen !== playGeneration) return "superseded";
+              continue;
+            }
+            if (gen !== playGeneration) return "superseded";
+          }
+          let buf = loadedBuffers.get(stemPath);
           if (!buf) {
-            try { buf = await loadAudioBuffer(out.audioPath); } catch (e) {
-              console.error(`Failed to load lane audio: ${out.audioPath}`, e);
+            try { buf = await loadAudioBuffer(stemPath); } catch (e) {
+              console.error(`Failed to load lane audio: ${stemPath}`, e);
               // The failed await was still an await — without this check a superseded loop would keep
               // scheduling stale sources into the NEW generation's scheduledSources.
               if (gen !== playGeneration) return "superseded";
@@ -217,7 +251,8 @@ export async function playAllTracks(
 
             // A piece reads from its stem-ms offset (== the source offset, since the stem spans the whole
             // trimmed source): seg.content.offsetMs for a whole/first piece, a later position for a sliced one.
-            const pieceOffsetSec = piece.startMs / 1000;
+            // Stretched playback reads the ARTIFACT, whose time axis is source×r.
+            const pieceOffsetSec = (piece.startMs * stretchR) / 1000;
             if (playheadTick >= piece.startTick) {
               const secsInto = ticksToSeconds(playheadTick - piece.startTick, tempo);
               audioOffset = pieceOffsetSec + secsInto;
@@ -278,7 +313,9 @@ export async function playAllTracks(
 
             const source = ctx.createBufferSource();
             source.buffer = buf;
-            source.connect(fadeInNode).connect(fadeOutNode).connect(laneGainNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
+            const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration);
+            const laneTail = source.connect(fadeInNode).connect(fadeOutNode);
+            (envNode ? laneTail.connect(envNode) : laneTail).connect(laneGainNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
             source.onended = () => { if (gen !== playGeneration) return; endedCount++; if (schedulingDone && endedCount >= totalScheduled) onAllEnded(); };
             source.start(now + startDelay, audioOffset, playDuration);
             scheduledSources.push({
@@ -303,7 +340,17 @@ export async function playAllTracks(
       if (!audioMeta) continue;
 
       // Use WAV cache for non-WAV files to avoid browser codec delay mismatch
-      const bufPath = audioMeta.playbackPath || filePath;
+      let bufPath = audioMeta.playbackPath || filePath;
+      // S59 Tempo Slider: play the stretched artifact (source coordinates × r → artifact time)
+      const origStretchR = segStretch(seg);
+      if (origStretchR !== 1) {
+        try { bufPath = await ensureStretched(bufPath, origStretchR); } catch (e) {
+          console.error(`[playback] stretch failed for ${bufPath} ×${origStretchR}:`, e);
+          if (gen !== playGeneration) return "superseded";
+          continue;
+        }
+        if (gen !== playGeneration) return "superseded";
+      }
       let buf = loadedBuffers.get(bufPath);
       if (!buf) {
         try { buf = await loadAudioBuffer(bufPath); } catch (e) {
@@ -323,14 +370,16 @@ export async function playAllTracks(
       let startDelay: number;
       let playDuration: number;
 
+      // offsetMs is a SOURCE coordinate — in the stretched artifact it sits at offsetMs × r.
+      // secsInto/playDuration are timeline (= artifact) time and need no factor.
       if (playheadTick >= seg.startTick) {
         const ticksInto = playheadTick - seg.startTick;
         const secsInto = ticksToSeconds(ticksInto, tempo);
-        audioOffset = seg.content.offsetMs / 1000 + secsInto;
+        audioOffset = (seg.content.offsetMs * origStretchR) / 1000 + secsInto;
         startDelay = 0;
         playDuration = ticksToSeconds(seg.durationTicks, tempo) - secsInto;
       } else {
-        audioOffset = seg.content.offsetMs / 1000;
+        audioOffset = (seg.content.offsetMs * origStretchR) / 1000;
         startDelay = ticksToSeconds(seg.startTick - playheadTick, tempo);
         playDuration = ticksToSeconds(seg.durationTicks, tempo);
       }
@@ -379,7 +428,9 @@ export async function playAllTracks(
 
       const source = ctx.createBufferSource();
       source.buffer = buf;
-      source.connect(fadeInNode).connect(fadeOutNode).connect(trackGainNode).connect(panner).connect(ctx.destination);
+      const envNode = loudnessEnvNode(ctx, seg, playheadTick, tempo, now, startDelay, playDuration);
+      const origTail = source.connect(fadeInNode).connect(fadeOutNode);
+      (envNode ? origTail.connect(envNode) : origTail).connect(trackGainNode).connect(panner).connect(ctx.destination);
 
       source.onended = () => {
         // Ignore end events from a superseded generation — stopPlayback() (called when a new
@@ -494,8 +545,12 @@ export function updateLaneMute(trackId: string, rowKey: string, muted: boolean, 
 export function clearBufferCache(filePath?: string) {
   if (filePath) {
     loadedBuffers.delete(filePath);
+    // also drop the in-flight decode: a post-clear load must not join a stale decode of the old
+    // bytes (and the orphaned promise's publish is generation-guarded in loadAudioBuffer)
+    inFlightBuffers.delete(filePath);
   } else {
     loadedBuffers.clear();
+    inFlightBuffers.clear();
   }
 }
 
@@ -529,6 +584,43 @@ function dbToLinear(db: number): number {
 /** StereoPannerNode.pan is [-1, 1] — the composed track+lane pan must stay in range. */
 function clampPan(p: number): number {
   return Math.max(-1, Math.min(1, p));
+}
+
+/** S59 audio-track loudness lane (playback-domain clip gain): a dedicated per-source GainNode
+ *  driven by setValueCurveAtTime, sampled from the clip's "loudness" curve (dB on box-relative
+ *  ticks → 10^(dB/20)). Returns null when the segment has no curve — the common path gains zero
+ *  extra nodes and stays byte-identical in behaviour. NEVER applied to notes segments (their
+ *  loudness lane is render-domain), and never written onto trackGain/laneGain (the live fader
+ *  setValueAtTime updates would fight the curve). The sampling origin is derived INSIDE from
+ *  playhead + the FINAL startDelay (call AFTER the late-compensation block): the source starts
+ *  sounding at timeline tick playhead + ticks(startDelay) in every case — immediate, delayed
+ *  piece, and late-corrected schedules alike (audit: a pre-late fromTick desynced the curve by
+ *  the lateness while audioOffset WAS advanced). */
+function loudnessEnvNode(
+  ctx: AudioContext,
+  seg: Segment,
+  playheadTick: number,
+  tempo: number,
+  now: number,
+  startDelay: number,
+  playDuration: number,
+): GainNode | null {
+  const curve = seg.content.type === "audioClip" ? seg.content.paramCurves?.["loudness"] : undefined;
+  if (!curve || curve.xs.length === 0 || playDuration <= 0.001) return null;
+  const node = ctx.createGain();
+  const fromTick = playheadTick + msToTicks(startDelay * 1000, tempo);
+  // ~20 Hz envelope resolution, capped — ample for mix automation, cheap to build
+  const n = Math.max(2, Math.min(2048, Math.ceil(playDuration / 0.05)));
+  const vals = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const sec = (i / (n - 1)) * playDuration;
+    const tick = fromTick + msToTicks(sec * 1000, tempo);
+    // belt-and-suspenders clamp: no write path may hand the AudioParam an absurd/non-finite gain
+    const db = Math.max(-LOUDNESS_DB_RANGE, Math.min(LOUDNESS_DB_RANGE, evalCurveAt(curve, tick - seg.startTick)));
+    vals[i] = Math.pow(10, db / 20);
+  }
+  node.gain.setValueCurveAtTime(vals, now + startDelay, playDuration);
+  return node;
 }
 
 /** Linear crossfade FADE-OUT envelope on `node` for a source overlapping a LATER neighbour over

@@ -1,6 +1,27 @@
 {
   "untitled": "Untitled Project",
-  "menu": {
+  "tempo": {
+    "errStretchMissing": "Source audio missing — cannot time-stretch",
+    "errStretchFailed": "Time-stretch failed",
+    "stretch": "Time-stretch…",
+    "stretchTitle": "Segment tempo",
+    "targetBpm": "Target BPM",
+    "speedPct": "Speed",
+    "detectedBpm": "Detected BPM",
+    "durationPct": "Duration",
+    "current": "Current",
+    "apply": "Apply",
+    "reset": "Reset 1:1",
+    "processing": "Processing…",    "detect": "Detect tempo / grid",
+    "x2": "Grid BPM ×2",
+    "half": "Grid BPM ÷2",
+    "nudge": "Shift bar line +1 beat",
+    "clear": "Clear tempo grid",
+    "notConstant": "Tempo is not constant — the grid is advisory",
+    "errTooShort": "Segment too short for tempo detection (needs ~5 s)",
+    "errNoBeat": "No steady beat detected",
+    "errFailed": "Tempo detection failed"
+  },  "menu": {
     "file": "File",
     "edit": "Edit",
     "tools": "Tools",
@@ -111,6 +132,7 @@
     "delete": "Delete"
   },
   "tracks": {
+    "loudnessLane": "Loudness envelope lane",
     "empty": "Drop audio files or add a new track",
     "delete": "Delete Track",
     "rename": "Rename",

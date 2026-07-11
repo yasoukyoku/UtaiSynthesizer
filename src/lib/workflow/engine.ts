@@ -80,12 +80,14 @@ async function ensureRunDir(segmentId: string): Promise<string> {
   return raw.replace(/\\/g, "/");
 }
 
+/** Returns the number of lanes that reached Output nodes (0 = nothing landed — the caller
+ *  toasts). The actual track deposit is done by the live reconciler / RenderLinkWatcher. */
 export async function executeWorkflow(
   segmentId: string,
   segment: Segment,
   workflow: Workflow,
-): Promise<ProcessedOutput[]> {
-  if (!(await waitVoiceDrain(segmentId))) return [];
+): Promise<number> {
+  if (!(await waitVoiceDrain(segmentId))) return 0;
   const store = useWorkflowStore.getState();
   store.startExecution(segmentId);
   store.clearNodeStatuses(segmentId);
@@ -150,16 +152,16 @@ export async function executeWorkflow(
       store.setNodeStatus(segmentId, nodeId, "completed");
     }
 
-    const results = await collectOutputs(graph, dataMap);
+    const laneCount = countOutputLanes(graph, dataMap);
 
     store.completeExecution(segmentId);
-    if (graph.outputNodeIds.length > 0 && results.length === 0) {
+    if (graph.outputNodeIds.length > 0 && laneCount === 0) {
       // Output nodes exist but nothing reached the track — warn loudly instead of a clean "completed".
       logToBackend("warn", "Workflow completed but produced 0 outputs — output node has no connected/rendered upstream");
     } else {
-      logToBackend("info", `Workflow completed (${results.length} outputs)`);
+      logToBackend("info", `Workflow completed (${laneCount} outputs)`);
     }
-    return results;
+    return laneCount;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const cancelled = isCancelMessage(msg);
@@ -514,37 +516,31 @@ function laneIdFor(
   return `${outputNodeId}::${edge.fromNode}:${edge.fromPort}`;
 }
 
-async function collectOutputs(
+/** Count the lanes that reached Output nodes — NO decode (S59 deposit-perf O3). The old
+ *  collectOutputs invoked load_audio_file per lane just to build a return value the sole caller
+ *  read as `.length`, double-decoding every freshly-rendered stem in parallel with the live
+ *  reconciler's own deposit (S32's "deposit slower than inference" bottleneck #1). The deposit
+ *  itself is the reconciler's / RenderLinkWatcher's job via loadCachedOutput. The missing-feeder
+ *  warn is preserved verbatim. */
+function countOutputLanes(
   graph: ReturnType<typeof parseWorkflowGraph>,
   dataMap: Map<string, Map<number, string>>,
-): Promise<ProcessedOutput[]> {
-  const results: ProcessedOutput[] = [];
+): number {
+  let count = 0;
   for (const outId of graph.outputNodeIds) {
     const gn = graph.nodes.get(outId)!;
     const base = (gn.node.params as Record<string, unknown>).laneLabel as string ?? DEFAULT_OUTPUT_GROUP;
-
     for (const edge of gn.inEdges) {
-      const upstream = dataMap.get(edge.fromNode);
-      const audioPath = upstream?.get(edge.fromPort);
+      const audioPath = dataMap.get(edge.fromNode)?.get(edge.fromPort);
       if (!audioPath) {
         // Don't silently swallow a missing feeder — a dropped lane with no trace reads as "it worked".
         logToBackend("warn", `Output "${base}": upstream ${edge.fromNode} port ${edge.fromPort} produced no audio — lane skipped`);
         continue;
       }
-
-      const info = await invoke<AudioFileInfo>("load_audio_file", { path: audioPath });
-      results.push({
-        laneId: laneIdFor(outId, edge),
-        laneLabel: laneLabelFor(graph, base, gn.inEdges.length, edge),
-        group: base,
-        audioPath,
-        totalDurationMs: info.duration_ms,
-        waveformPeaks: info.peaks,
-        outputNodeId: outId,
-      });
+      count++;
     }
   }
-  return results;
+  return count;
 }
 
 export interface CachedPath {
@@ -614,10 +610,10 @@ export async function depositFromCache(trackId: string, segmentId: string, workf
     for (const outId of graph.outputNodeIds) {
       const { paths } = collectCachedPaths(segmentId, outId, workflow);
       if (paths.length === 0) continue;
-      const decoded: ProcessedOutput[] = [];
-      for (const p of paths) {
-        try { decoded.push(await loadCachedOutput(p)); } catch { /* skip a bad/missing decode */ }
-      }
+      // S59 deposit-perf O2: decode the lanes CONCURRENTLY (each is an independent load_audio_file
+      // → hound decode + peaks); the old sequential awaits serialized 4-5 multi-second decodes.
+      const decoded = (await Promise.all(paths.map((p) => loadCachedOutput(p).catch(() => null))))
+        .filter((o): o is ProcessedOutput => o !== null);
       if (runningNow()) return changed;
       if (decoded.length > 0) {
         useProjectStore.getState().mergeProcessedOutputs(trackId, segmentId, decoded);

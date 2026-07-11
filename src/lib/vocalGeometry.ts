@@ -57,6 +57,9 @@ export const rowsContentHeight = (rowH: number): number => (V_PITCH_MAX - V_PITC
 // ── ② bottom automation lane (loudness / formant) value↔y — the band is a FIXED strip [laneTop, laneTop+laneH]
 //    at the canvas bottom (NOT scrolled with the note rows). Higher value = higher on screen; neutral (0) sits
 //    at whatever y its [min,max] maps to. Pure (laneTop/laneH passed explicitly, like the rest of this module). ──
+/** Loudness-lane dB range (±): ONE constant for the vocal editor's lane (LANE_PARAMS) AND the S59
+ *  audio-track loudness band, so the two surfaces can never drift apart. */
+export const LOUDNESS_DB_RANGE = 12;
 /** Param value in [min,max] → screen Y within the lane band. Clamped so the line never leaves the band. */
 export const paramToY = (value: number, min: number, max: number, laneTop: number, laneH: number): number => {
   const t = max > min ? (value - min) / (max - min) : 0.5;

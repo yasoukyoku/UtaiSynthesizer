@@ -1,6 +1,27 @@
 {
   "untitled": "未命名项目",
-  "menu": {
+  "tempo": {
+    "errStretchMissing": "音频源文件缺失，无法变速",
+    "errStretchFailed": "片段变速失败",
+    "stretch": "变速（Tempo）…",
+    "stretchTitle": "片段变速",
+    "targetBpm": "目标 BPM",
+    "speedPct": "速度",
+    "detectedBpm": "检测 BPM",
+    "durationPct": "时长",
+    "current": "当前",
+    "apply": "应用",
+    "reset": "还原 1:1",
+    "processing": "处理中…",    "detect": "检测速度/网格",
+    "x2": "网格 BPM ×2",
+    "half": "网格 BPM ÷2",
+    "nudge": "小节线后移一拍",
+    "clear": "清除速度网格",
+    "notConstant": "检测到速度不恒定，网格仅供参考",
+    "errTooShort": "片段太短，无法检测速度（至少约 5 秒）",
+    "errNoBeat": "未检测到稳定节拍",
+    "errFailed": "速度检测失败"
+  },  "menu": {
     "file": "文件",
     "edit": "编辑",
     "tools": "工具",
@@ -111,6 +132,7 @@
     "delete": "删除"
   },
   "tracks": {
+    "loudnessLane": "响度包络泳道",
     "empty": "拖放音频文件或添加新轨道",
     "delete": "删除轨道",
     "rename": "重命名",

@@ -23,7 +23,7 @@ import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
   tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
   rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
-  paramToY, yToParam,
+  paramToY, yToParam, LOUDNESS_DB_RANGE,
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
 import { langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
@@ -47,7 +47,9 @@ const EDGE_PX = 6; // note right-edge resize hotzone (screen px)
 // (user pick); values are RELATIVE offsets, neutral 0 = "no change" at the band midline.
 type LaneParam = "loudness" | "formant";
 const LANE_PARAMS: { id: LaneParam; min: number; max: number; unit: string; labelKey: string }[] = [
-  { id: "loudness", min: -12, max: 12, unit: "dB", labelKey: "vocalEditor.lane.loudness" },
+  // loudness range = the shared LOUDNESS_DB_RANGE (vocalGeometry) — the S59 audio-track loudness
+  // band uses the SAME constant, so the two lanes' dB scales cannot drift apart.
+  { id: "loudness", min: -LOUDNESS_DB_RANGE, max: LOUDNESS_DB_RANGE, unit: "dB", labelKey: "vocalEditor.lane.loudness" },
   { id: "formant", min: -12, max: 12, unit: "st", labelKey: "vocalEditor.lane.formant" },
 ];
 const laneCfg = (p: LaneParam) => LANE_PARAMS.find((x) => x.id === p)!;
