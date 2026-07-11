@@ -6,6 +6,9 @@ export interface MenuItem {
   shortcut?: string;
   danger?: boolean;
   disabled?: boolean;
+  /** The CURRENT selection in a picker-style menu — highlighted in the accent color (still clickable;
+   *  re-picking is a harmless no-op). Never use `disabled` for "current": gray reads as "unavailable". */
+  active?: boolean;
   onClick: () => void;
 }
 
@@ -57,7 +60,7 @@ export function ContextMenu({ x, y, items, onClose }: Props) {
       {items.map((item, i) => (
         <button
           key={i}
-          className={`ctx-item ${item.danger ? "ctx-danger" : ""}`}
+          className={`ctx-item ${item.danger ? "ctx-danger" : ""} ${item.active ? "ctx-active" : ""}`}
           disabled={item.disabled}
           onClick={() => {
             item.onClick();

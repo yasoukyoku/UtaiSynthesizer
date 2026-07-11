@@ -224,7 +224,7 @@ export function TrackList({ width }: Props) {
       if (all.length === 0) return [{ label: t("tracks.noVoices"), disabled: true, onClick: () => {} }];
       return all.map((m) => ({
         label: `${m.name} · ${backendLabel(m)}`,
-        disabled: cur?.voiceModel === m.name && cur?.vocalParams?.backend === backendOf(m),
+        active: cur?.voiceModel === m.name && cur?.vocalParams?.backend === backendOf(m),
         onClick: () => pickVoiceForTrack(menu.trackId, m),
       }));
     }
@@ -233,7 +233,7 @@ export function TrackList({ width }: Props) {
       const curId = cur?.vocalParams?.langId ?? DEFAULT_LANG_ID;
       return VOCAL_LANGUAGES.map((l) => ({
         label: `${l.short} · ${t(`langs.${l.code}`)}`,
-        disabled: l.id === curId,
+        active: l.id === curId,
         onClick: () => setVocalParams(menu.trackId, { langId: l.id }),
       }));
     }
@@ -496,6 +496,22 @@ function TrackItem({
                 </div>
               )
             )}
+            {/* ② S58 language badge — the track's default G2P language as a two-letter code (vocal
+                tracks only; per-note overrides live in the editor sidebar). Sits BETWEEN the singer
+                and the track name (§user: next to M/S it read like a mixer toggle). */}
+            {track.trackType === "vocal" && (
+              <button
+                className="track-btn track-lang"
+                title={t("tracks.language")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  onOpenLangMenu(r.left, r.bottom + 2);
+                }}
+              >
+                {langById(track.vocalParams?.langId ?? DEFAULT_LANG_ID).short}
+              </button>
+            )}
             <div className="track-info">
               {editing ? (
                 <RenameInput initial={track.name} onCommit={onCommitRename} onCancel={onCancelRename} />
@@ -520,21 +536,6 @@ function TrackItem({
               <span className="track-oov-badge" title={t("tracks.oovWarning")}>
                 <svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M12 3 2 21h20L12 3zm-1 7h2v6h-2v-6zm0 7h2v2h-2v-2z" /></svg>
               </span>
-            )}
-            {/* ② S58 language badge — the track's default G2P language as a two-letter code (vocal tracks
-                only; per-note overrides live in the editor sidebar). Sits where audio tracks keep O. */}
-            {track.trackType === "vocal" && (
-              <button
-                className="track-btn track-lang"
-                title={t("tracks.language")}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const r = e.currentTarget.getBoundingClientRect();
-                  onOpenLangMenu(r.left, r.bottom + 2);
-                }}
-              >
-                {langById(track.vocalParams?.langId ?? DEFAULT_LANG_ID).short}
-              </button>
             )}
             {/* SOURCE selector — AUDIO tracks only: a vocal track has no "original" audio to fall back to,
                 so the toggle would only mislead. lit = the original plays and the sub-lanes leave the output. */}

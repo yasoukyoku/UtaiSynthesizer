@@ -34,6 +34,14 @@
   cursor: default;
 }
 
+/* ② S58: the CURRENT selection in picker-style menus (singer/language) — bright accent, angular left
+   bar. Distinct from :disabled gray, which reads as "unavailable" (§user). */
+.ctx-item.ctx-active {
+  color: var(--accent-primary-bright);
+  box-shadow: inset 2px 0 0 var(--accent-primary);
+  background: var(--accent-primary-glow);
+}
+
 .ctx-item.ctx-danger:hover:not(:disabled) {
   background: rgba(248, 113, 113, 0.1);
   color: var(--color-error);
