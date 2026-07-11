@@ -228,6 +228,7 @@ fn audition_rvc_candidate() {
         index: None,
         sample_rate,
         features_dim: dim,
+        spk_mix: None, // single-speaker test model → the sid path (①c multi-speaker unused here)
         noise_channels: 192,
         min_frames: sc["min_frames"].as_u64().unwrap_or(12) as usize,
     };
@@ -288,6 +289,7 @@ fn audition_sovits_candidate() {
         hop_size: hop,
         features_dim: dim,
         vol_embedding,
+        spk_mix: None, // single-speaker test model → the sid path (①c multi-speaker unused here)
         unit_interpolate_mode: "left".into(),
         noise_channels: 192,
         min_frames: sc["min_frames"].as_u64().unwrap_or(6) as usize,

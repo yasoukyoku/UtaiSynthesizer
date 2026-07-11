@@ -185,6 +185,7 @@ fn voice_env_wav() {
                 index: index.as_ref(),
                 sample_rate,
                 features_dim: dim,
+                spk_mix: None, // single-speaker E2E fixture → the sid path (①c multi-speaker unused here)
                 noise_channels: nch,
                 min_frames,
             };
@@ -295,6 +296,7 @@ fn voice_env_wav() {
                 hop_size,
                 features_dim: dim,
                 vol_embedding,
+                spk_mix: None, // single-speaker E2E fixture → the sid path (①c multi-speaker unused here)
                 unit_interpolate_mode,
                 noise_channels: nch,
                 min_frames,

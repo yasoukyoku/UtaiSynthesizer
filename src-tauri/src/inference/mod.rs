@@ -113,6 +113,57 @@ pub(crate) fn dominant_speaker(spk_mix: &[SpkMixEntry], speaker_id: Option<u32>)
         .unwrap_or_else(|| speaker_id.unwrap_or(0))
 }
 
+#[cfg(test)]
+mod spk_mix_tests {
+    // S56: the ①c multi-speaker blend math had NO automated coverage (verified one-off in S46/S47);
+    // these lock its invariants — the tests/{voice_pipeline,audition_render}.rs E2E tools use
+    // single-speaker models (spk_mix: None), so this is the only persistent gate on the Some path.
+    use super::{build_spk_mix_dense, dominant_speaker, SpkMixEntry};
+
+    fn e(id: u32, weight: f32) -> SpkMixEntry {
+        SpkMixEntry { id, weight }
+    }
+
+    #[test]
+    fn one_hot_equals_gather() {
+        // A single full-weight entry → a one-hot row, which through `spk_mix @ emb_g.weight` is
+        // bit-identical to `emb_g(id)` (the doc-comment's whole correctness claim).
+        assert_eq!(build_spk_mix_dense(&[e(2, 1.0)], None, 5), vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+        // any positive weight normalizes to the same one-hot.
+        assert_eq!(build_spk_mix_dense(&[e(0, 0.3)], None, 3), vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normalizes_to_sum_one() {
+        let d = build_spk_mix_dense(&[e(0, 1.0), e(1, 3.0)], None, 4);
+        assert_eq!(d, vec![0.25, 0.75, 0.0, 0.0]);
+        assert!((d.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_ids_accumulate() {
+        // Two entries on the same id add before normalization (not last-wins).
+        let d = build_spk_mix_dense(&[e(2, 1.0), e(2, 1.0), e(0, 2.0)], None, 3);
+        assert_eq!(d, vec![0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn out_of_range_and_nonpositive_dropped_then_fallback() {
+        // id ≥ n_spk and weight ≤ 0 are dropped; an all-dropped stack degrades to a one-hot on
+        // speaker_id (fallback 0), which the min() clamps into range.
+        assert_eq!(build_spk_mix_dense(&[e(99, 1.0), e(0, -1.0), e(1, 0.0)], Some(1), 3), vec![0.0, 1.0, 0.0]);
+        assert_eq!(build_spk_mix_dense(&[], None, 3), vec![1.0, 0.0, 0.0]); // empty → speaker 0
+        assert_eq!(build_spk_mix_dense(&[], Some(99), 3), vec![0.0, 0.0, 1.0]); // clamp to n_spk-1
+    }
+
+    #[test]
+    fn dominant_is_max_weight_then_fallback() {
+        assert_eq!(dominant_speaker(&[e(0, 0.2), e(5, 0.7), e(3, 0.1)], None), 5);
+        assert_eq!(dominant_speaker(&[], Some(4)), 4); // empty → speaker_id
+        assert_eq!(dominant_speaker(&[e(2, 0.0)], Some(1)), 1); // all zero-weight → fallback
+    }
+}
+
 /// Wire-contract options for run_sovits (voiceDefaults.ts mirror).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
