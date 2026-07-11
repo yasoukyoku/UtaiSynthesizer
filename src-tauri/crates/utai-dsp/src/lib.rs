@@ -15,12 +15,14 @@
 pub mod demucs;
 pub mod formant;
 pub mod mdx;
+pub mod psola;
 pub mod stft;
 pub mod tempo;
 pub mod vr;
 
 pub use demucs::{demucs_ispec, demucs_spec};
 pub use formant::formant_warp;
+pub use psola::{psola_shift, PsolaParams};
 
 use ndarray::Array3;
 
