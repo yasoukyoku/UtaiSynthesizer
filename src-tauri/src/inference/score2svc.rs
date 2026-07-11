@@ -28,6 +28,7 @@ use ndarray::Array2;
 #[cfg(test)]
 use super::engine::OnnxEngine; // only the #[ignore] gates name the engine type; the render fns use m.engine
 use super::features::{repeat_expand_2d, torch_interp_nearest};
+use super::g2p::{self, Lang, ScoreEvt};
 use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
     build_arrays_daw, chunk_at_sp, classify_lyric, run_score2cv, LyricClass, ScoreArrays,
@@ -120,7 +121,7 @@ struct NoteGroups {
     group_pitch: Vec<i64>,
 }
 
-fn compute_note_groups(arr: &ScoreArrays, score: &[(&str, i64, i64)]) -> NoteGroups {
+fn compute_note_groups(arr: &ScoreArrays, score: &[ScoreEvt]) -> NoteGroups {
     let ng = arr.note_to_phone.last().map(|&g| g as usize + 1).unwrap_or(0);
     // Per-group cv frame range (from arr): the group's start cv frame + total cv frames.
     let mut cv_start = vec![0usize; ng];
@@ -139,22 +140,28 @@ fn compute_note_groups(arr: &ScoreArrays, score: &[(&str, i64, i64)]) -> NoteGro
             cursor += d;
         }
     }
-    // Per-group DAW frame range (from the score triples). Grouped by the SAME `npitch` rule build_arrays
-    // uses — rest → 0, else → note_num (classified via the single `classify_lyric`, so a rest triple with
-    // a stray non-zero note_num still groups as a rest, matching the cv side; §9.5 editor==render).
+    // Per-group DAW frame range (from the score notes). Grouped by the SAME (npitch, RUN LANGUAGE) rule
+    // the assembly uses — rest → 0 (classified via the single `classify_lyric`'s universal tokens, so a
+    // rest with a stray non-zero note_num still groups as a rest) + `g2p::note_run_langs` (S58: the ONE
+    // shared run-language source, so cv-side and DAW-side grouping can never drift; §9.5 editor==render).
     let mut daw_start = vec![0usize; ng];
     let mut daw_count = vec![0usize; ng];
     let mut group_pitch = vec![0i64; ng];
     if ng > 0 {
+        let run_langs = g2p::note_run_langs(score);
         let mut g: i64 = -1;
-        let mut prev: Option<i64> = None;
+        let mut prev: Option<(i64, Lang)> = None;
         let mut cursor = 0usize;
         let mut seen = vec![false; ng];
-        for &(lyr, nn, fr) in score {
-            let npitch = if matches!(classify_lyric(lyr), LyricClass::Rest | LyricClass::Breath) { 0 } else { nn };
-            if prev != Some(npitch) {
+        for (k, evt) in score.iter().enumerate() {
+            let npitch = if matches!(classify_lyric(evt.lyric), LyricClass::Rest | LyricClass::Breath) {
+                0
+            } else {
+                evt.note_num
+            };
+            if prev != Some((npitch, run_langs[k])) {
                 g += 1;
-                prev = Some(npitch);
+                prev = Some((npitch, run_langs[k]));
             }
             let gi = (g as usize).min(ng - 1);
             if !seen[gi] {
@@ -162,7 +169,7 @@ fn compute_note_groups(arr: &ScoreArrays, score: &[(&str, i64, i64)]) -> NoteGro
                 group_pitch[gi] = npitch;
                 seen[gi] = true;
             }
-            let d = fr.max(0) as usize;
+            let d = evt.frames.max(0) as usize;
             daw_count[gi] += d;
             cursor += d;
         }
@@ -182,7 +189,7 @@ fn compute_note_groups(arr: &ScoreArrays, score: &[(&str, i64, i64)]) -> NoteGro
 ///    frame spans come from the score triples' native `frames` (grouped identically by note_num changes).
 pub fn build_note_hz(
     arr: &ScoreArrays,
-    score: &[(&str, i64, i64)],
+    score: &[ScoreEvt],
     transpose: i64,
     f0: Option<&VocalF0>,
 ) -> Vec<f32> {
@@ -232,7 +239,7 @@ pub fn build_note_hz(
 /// or formant lane aligns with cv/f0 exactly even where a short note inflated its cv frames. EVERY group is
 /// sampled (rests too, for a continuous envelope — unlike f0 which zeroes rest groups). Empty `env` → all
 /// `default` (the flat / no-lane path = a no-op at the render). Pure.
-fn build_note_param(arr: &ScoreArrays, score: &[(&str, i64, i64)], env: &[f32], default: f32) -> Vec<f32> {
+fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default: f32) -> Vec<f32> {
     let t_total: usize = arr.phone_dur.iter().map(|&d| d.max(0) as usize).sum();
     if env.is_empty() {
         return vec![default; t_total];
@@ -394,10 +401,10 @@ fn pad_sovits_feed(feed: &mut SovitsFeed, min: usize) -> usize {
 pub fn render_score_sovits(
     m: &SovitsModel,
     score2cv_session: &str,
-    score: &[(&str, i64, i64)],
+    score: &[ScoreEvt],
     dim: usize,
     cv_speaker_id: i64,
-    lang_id: i64,
+    dicts: &dyn g2p::DictSource,
     options: &SovitsOptions,
     flat_vol: f32,
     transpose: i64,
@@ -407,7 +414,7 @@ pub fn render_score_sovits(
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
-    let mut arr = build_arrays_daw(score)?;
+    let mut arr = build_arrays_daw(score, dicts)?;
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
     let note_hz_full = build_note_hz(&arr, score, transpose, f0);
     // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
@@ -427,7 +434,7 @@ pub fn render_score_sovits(
         if cancel() {
             return Err(UtaiError::Inference("已取消".into()));
         }
-        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
+        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         let mut feed = resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size)?;
         let real_t = pad_sovits_feed(&mut feed, m.min_frames); // M3: short trailing chunk
@@ -454,6 +461,9 @@ pub fn render_score_sovits(
         )?;
         if padded_t > real_t {
             wav.truncate((real_t * m.hop_size).min(wav.len())); // drop the pad samples
+        }
+        if chunk.hard_seam {
+            seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
@@ -517,10 +527,10 @@ fn rvc_feed_100(mut cv: Array2<f32>, note_hz: &[f32], min: usize) -> (Array2<f32
 pub fn render_score_rvc(
     m: &RvcModel,
     score2cv_session: &str,
-    score: &[(&str, i64, i64)],
+    score: &[ScoreEvt],
     dim: usize,
     cv_speaker_id: i64,
-    lang_id: i64,
+    dicts: &dyn g2p::DictSource,
     options: &RvcOptions,
     transpose: i64,
     f0: Option<&VocalF0>,
@@ -529,7 +539,7 @@ pub fn render_score_rvc(
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
-    let mut arr = build_arrays_daw(score)?;
+    let mut arr = build_arrays_daw(score, dicts)?;
     let note_hz_full = build_note_hz(&arr, score, transpose, f0);
     // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
@@ -548,7 +558,7 @@ pub fn render_score_rvc(
         if cancel() {
             return Err(UtaiError::Inference("已取消".into()));
         }
-        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, lang_id)?;
+        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
         let mut wav = vc_decode(
@@ -557,6 +567,9 @@ pub fn render_score_rvc(
         if pitchf.len() > real_t {
             // RVC net_g emits ~ p_len·(sr/100) samples; keep only the pre-pad span.
             wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
+        }
+        if chunk.hard_seam {
+            seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
         audio.extend_from_slice(&wav);
         cv_cursor += chunk.t;
@@ -574,6 +587,23 @@ pub fn render_score_rvc(
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
 
+/// Micro-fade a HARD chunk seam (a mid-voiced LANGUAGE cut, S58): linearly fade the tail of the
+/// accumulated audio and the head of the incoming chunk over ~5 ms each. Sample counts are untouched
+/// (never an overlap-shift — the stem must stay tick-aligned to the DAW timeline); the fades only mask
+/// the waveform discontinuity of two independently decoded chunks. SP seams are silence and skip this.
+fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
+    let k = (sample_rate as usize / 200).max(1); // ≈5 ms
+    let n = audio.len();
+    let ka = k.min(n);
+    for j in 0..ka {
+        audio[n - 1 - j] *= (j + 1) as f32 / (ka + 1) as f32; // 1 → ~0 toward the seam
+    }
+    let kw = k.min(wav.len());
+    for j in 0..kw {
+        wav[j] *= (j + 1) as f32 / (kw + 1) as f32; // ~0 → 1 away from the seam
+    }
+}
+
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.
 fn peak_normalize(w: &mut [f32], peak: f32) {
     let m = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
@@ -586,8 +616,17 @@ fn peak_normalize(w: &mut [f32], peak: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::score2cv::build_arrays; // Phase-1c parity entry (rest-capped)
+    use super::super::score2cv::{build_arrays, NoDicts}; // Phase-1c parity entry (rest-capped)
     use super::super::score2cv_tables::parity_ref as pr;
+
+    /// JA-defaulted events from legacy triples (the pre-S58 test fixtures).
+    fn ja_evts<'a>(score: &'a [(&'a str, i64, i64)]) -> Vec<ScoreEvt<'a>> {
+        score.iter().map(ScoreEvt::ja).collect()
+    }
+    /// DAW build over a JA triple fixture (rests uncapped + borrow-time).
+    fn daw_ja(score: &[(&str, i64, i64)]) -> ScoreArrays {
+        build_arrays_daw(&ja_evts(score), &NoDicts).unwrap()
+    }
 
     #[test]
     fn midi_frame_is_length_regulation() {
@@ -610,11 +649,12 @@ mod tests {
     fn build_note_hz_bare_transpose() {
         // A4 (69) for 4 frames, 1 vowel phone → 4 cv frames all A4. transpose+12 → A5 (880 Hz).
         let score = [("あ", 69, 4)];
-        let arr = build_arrays_daw(&score).unwrap();
-        let hz0 = build_note_hz(&arr, &score, 0, None);
+        let evts = ja_evts(&score);
+        let arr = daw_ja(&score);
+        let hz0 = build_note_hz(&arr, &evts, 0, None);
         assert_eq!(hz0.len(), 4);
         assert!(hz0.iter().all(|&h| (h - 440.0).abs() < 0.5), "A4 → 440, got {:?}", hz0);
-        let hz12 = build_note_hz(&arr, &score, 12, None);
+        let hz12 = build_note_hz(&arr, &evts, 12, None);
         assert!(hz12.iter().all(|&h| (h - 880.0).abs() < 1.0), "A4+12st → 880, got {:?}", hz12);
     }
 
@@ -622,15 +662,16 @@ mod tests {
     fn build_note_hz_option_a_samples_cents() {
         // f0 comes from the DAW cents curve, NOT the note's own pitch (note is 60, curve is A4=6900¢).
         let score = [("あ", 60, 6)];
-        let arr = build_arrays_daw(&score).unwrap();
+        let evts = ja_evts(&score);
+        let arr = daw_ja(&score);
         let cents = vec![6900.0f32; 6];
         let voiced = vec![1u8; 6];
         let f0 = VocalF0 { cents: &cents, voiced: &voiced };
-        let hz = build_note_hz(&arr, &score, 0, Some(&f0));
+        let hz = build_note_hz(&arr, &evts, 0, Some(&f0));
         assert_eq!(hz.len(), 6);
         assert!(hz.iter().all(|&h| (h - 440.0).abs() < 0.5), "6900¢ → 440Hz (ignores note 60), got {:?}", hz);
         // transpose +12st adds 1200¢ → A5 = 880 Hz.
-        let hz12 = build_note_hz(&arr, &score, 12, Some(&f0));
+        let hz12 = build_note_hz(&arr, &evts, 12, Some(&f0));
         assert!(hz12.iter().all(|&h| (h - 880.0).abs() < 1.0), "6900¢+12st → 880, got {:?}", hz12);
     }
 
@@ -640,7 +681,8 @@ mod tests {
         // is ≥ VOWEL_MIN_FRAMES so the M3 borrow-time leaves the boundaries clean (a separate test covers
         // the short-note borrow); [0..5]=note0, [5..10]=rest, [10..15]=note2.
         let score = [("あ", 60, 5), ("R", 0, 5), ("い", 62, 5)];
-        let arr = build_arrays_daw(&score).unwrap();
+        let evts = ja_evts(&score);
+        let arr = daw_ja(&score);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 15, "1+1+1 phones, 5+5(uncapped SP)+5 frames");
         let mut cents = vec![0.0f32; 15];
         let mut voiced = vec![0u8; 15];
@@ -657,7 +699,7 @@ mod tests {
             *v = 1;
         }
         let f0 = VocalF0 { cents: &cents, voiced: &voiced };
-        let hz = build_note_hz(&arr, &score, 0, Some(&f0));
+        let hz = build_note_hz(&arr, &evts, 0, Some(&f0));
         assert_eq!(hz.len(), 15);
         assert!(hz[0..5].iter().all(|&h| h > 200.0), "note0 voiced, got {:?}", &hz[0..5]);
         assert!(hz[5..10].iter().all(|&h| h == 0.0), "rest group → silent, got {:?}", &hz[5..10]);
@@ -670,14 +712,15 @@ mod tests {
         // note / rest / note, uncapped rest → 15 cv == 15 DAW frames (1:1 here). A @50fps env samples through
         // the SAME group remap as f0; EVERY group is sampled (rests too, unlike f0); empty env → default.
         let score = [("あ", 60, 5), ("R", 0, 5), ("い", 62, 5)];
-        let arr = build_arrays_daw(&score).unwrap();
+        let evts = ja_evts(&score);
+        let arr = daw_ja(&score);
         let env: Vec<f32> = (0..15).map(|i| i as f32).collect(); // one value per DAW frame
-        let out = build_note_param(&arr, &score, &env, 1.0);
+        let out = build_note_param(&arr, &evts, &env, 1.0);
         assert_eq!(out.len(), 15);
         assert!((out[0] - 0.0).abs() < 1.0, "frame 0 ≈ env[0], got {}", out[0]);
         assert!((out[14] - 14.0).abs() < 1.0, "last frame ≈ env[14], got {}", out[14]);
         assert!(out[7] > 4.0 && out[7] < 10.0, "rest group IS sampled (continuity), got {}", out[7]);
-        let flat = build_note_param(&arr, &score, &[], 0.5);
+        let flat = build_note_param(&arr, &evts, &[], 0.5);
         assert!(flat.iter().all(|&v| v == 0.5), "empty env → default everywhere (the flat/no-lane path)");
     }
 
@@ -923,16 +966,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, pr::SCORE, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, LEGATO, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, REST, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, SUSTAIN, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, REARTIC, 256, 49, 2, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, pr::SCORE, 768, 49, 2, &sopts, 0.1, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -941,7 +984,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, pr::SCORE, 768, 49, 2, &ropts, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

@@ -394,7 +394,9 @@
       "busy": "已有渲染进行中，请稍候",
       "spkMixDiffusion": "多说话人混合与扩散不兼容：扩散阶段不会应用混合（会把音色拉回单一歌手）。请关闭扩散，或改用单一歌手",
       "autoRendering": "渲染改动的人声轨…",
-      "autoRenderingCancel": "再次点击取消渲染"
+      "autoRenderingCancel": "再次点击取消渲染",
+      "oov": "歌词「{{lyric}}」无法转换为音素（OOV）——请检查歌词或音符/轨道的语言设置",
+      "phoneMissing": "内部错误：音素「{{phone}}」不在 ScoreToCV 词表中"
     }
   }
 }

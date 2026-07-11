@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::inference::{
-    rvc, score2cv, score2svc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType,
+    g2p, rvc, score2cv, score2svc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType,
 };
 use crate::models::{ModelConfig, ModelEntry};
 use crate::AppState;
@@ -1086,27 +1086,56 @@ pub async fn detect_f0(
 //  for ScoreToCV. The real score→cv path is inference::score2cv (build_arrays + ONNX); Phase 6 wires it
 //  into a render command here.)
 
-/// §9.5 single Rust classifier: classify each lyric token (rest / sustain / valid phones / OOV) so the
-/// editor's verdict == the render's — NO JS dictionary copy that could drift from `lyric_to_phones`
-/// (which `build_arrays` uses). Double-side capped (DoS): token count + per-token char length. Language
-/// is JA for now (the only shipped G2P; the §3.7 dictionary work-line is the Phase-6 前置门 for the rest).
+/// One note for `validate_lyrics` — mirrors the render's `ScoreNote` language/override semantics so the
+/// editor's verdict can never drift from what actually renders (§9.5).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LyricNote {
+    pub lyric: String,
+    /// Effective per-note language id (note override ?? track default; absent → `default_lang`).
+    #[serde(default)]
+    pub lang: Option<i64>,
+    /// Traditional-phoneme override (§3.7).
+    #[serde(default)]
+    pub phoneme_input: Option<String>,
+}
+
+/// §9.5 single Rust classifier: classify each note's lyric (rest / breath / sustain / valid phones /
+/// OOV) via the SAME `g2p::resolve` pass the render uses — language-aware (S58: per-note language,
+/// zh phrase context from the NOTE SEQUENCE, western word lookup, phoneme_input overrides) with NO JS
+/// dictionary copy. Double-side capped (DoS): note count + per-token char length (an over-long lyric
+/// classifies Unknown without ever being looked up).
 #[tauri::command]
-pub fn validate_lyrics(lyrics: Vec<String>) -> Result<Vec<score2cv::LyricClass>, String> {
+pub fn validate_lyrics(
+    state: State<'_, Arc<AppState>>,
+    notes: Vec<LyricNote>,
+    default_lang: i64,
+) -> Result<Vec<score2cv::LyricClass>, String> {
     const MAX_TOKENS: usize = 100_000;
     const MAX_LEN: usize = 256;
-    if lyrics.len() > MAX_TOKENS {
-        return Err(format!("歌词 token 过多（{} > {}）", lyrics.len(), MAX_TOKENS));
+    if notes.len() > MAX_TOKENS {
+        return Err(format!("VOCAL_TOO_MANY_NOTES: {} > {}", notes.len(), MAX_TOKENS));
     }
-    Ok(lyrics
+    if let Some(data_dir) = state.models.models_dir().parent() {
+        g2p::set_dict_dir(data_dir.join("dictionaries"));
+    }
+    let fallback = g2p::Lang::from_id(default_lang).unwrap_or(g2p::Lang::Ja);
+    // over-long lyrics are replaced by a token that is OOV in EVERY language (never truncate — a
+    // truncation could accidentally form a valid word). U+FFFD is not hanzi/kana/ascii/dict material.
+    const TOO_LONG: &str = "\u{FFFD}";
+    let evts: Vec<g2p::ScoreEvt> = notes
         .iter()
-        .map(|l| {
-            if l.chars().count() > MAX_LEN {
-                score2cv::LyricClass::Unknown // pathologically long = treat as OOV, never classify
-            } else {
-                score2cv::classify_lyric(l)
-            }
+        .map(|n| g2p::ScoreEvt {
+            lyric: if n.lyric.chars().count() > MAX_LEN { TOO_LONG } else { n.lyric.as_str() },
+            note_num: 60,
+            frames: 1,
+            lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
+            phoneme_input: n
+                .phoneme_input
+                .as_deref()
+                .filter(|p| p.chars().count() <= MAX_LEN),
         })
-        .collect())
+        .collect();
+    Ok(g2p::classify_score(&evts, &g2p::GlobalDicts))
 }
 
 /// One note of the score from the frontend. `lyric` = the note's lyric (JA kana / rest `R` / sustain
@@ -1118,6 +1147,13 @@ pub struct ScoreNote {
     pub lyric: String,
     pub note_num: i64,
     pub frames: i64,
+    /// Effective per-note language id (note override ?? track default, resolved frontend-side).
+    /// Absent (old callers) → the request-level `options.lang_id`. S58 §3.7.
+    #[serde(default)]
+    pub lang: Option<i64>,
+    /// Traditional-phoneme override (§3.7 user layer: pinyin/kana/ARPABET/MFA — never raw IPA).
+    #[serde(default)]
+    pub phoneme_input: Option<String>,
 }
 
 /// Wire-contract options for render_vocal_segment — mirrored by src\lib\vocal\vocalRender.ts (VocalRenderOptions).
@@ -1268,11 +1304,26 @@ pub async fn render_vocal_segment(
     let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
     let path = PathBuf::from(&model_path);
 
-    // own the score strings so the render can borrow them as &[(&str, i64, i64)] inside spawn_blocking.
-    let score_owned: Vec<(String, i64, i64)> =
-        score.into_iter().map(|n| (n.lyric, n.note_num, n.frames)).collect();
+    // S58: resolve each note's effective language up-front (LOUD on an out-of-enum id — never index
+    // with a raw value) and point the g2p dictionary loader at <data>/dictionaries (lazy per language;
+    // a pure-JA score never touches disk).
+    let fallback_lang = g2p::Lang::from_id(options.lang_id).unwrap_or(g2p::Lang::Ja);
+    let mut note_langs: Vec<g2p::Lang> = Vec::with_capacity(score.len());
+    for n in &score {
+        match n.lang {
+            None => note_langs.push(fallback_lang),
+            Some(id) => match g2p::Lang::from_id(id) {
+                Some(l) => note_langs.push(l),
+                None => return Err(format!("VOCAL_BAD_LANG: {}", id)),
+            },
+        }
+    }
+    if let Some(data_dir) = app.models.models_dir().parent() {
+        g2p::set_dict_dir(data_dir.join("dictionaries"));
+    }
+    // own the score notes so the render can borrow them as &[ScoreEvt] inside spawn_blocking.
+    let score_owned: Vec<ScoreNote> = score;
     let cv_speaker_id = options.cv_speaker_id;
-    let lang_id = options.lang_id;
     let transpose = options.transpose;
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
@@ -1331,8 +1382,17 @@ pub async fn render_vocal_segment(
 
             tauri::async_runtime::spawn_blocking(move || {
                 let cancel = || app.inference.voice_cancelled(run_epoch);
-                let score_ref: Vec<(&str, i64, i64)> =
-                    score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
+                let score_ref: Vec<g2p::ScoreEvt> = score_owned
+                    .iter()
+                    .zip(note_langs.iter())
+                    .map(|(n, &lang)| g2p::ScoreEvt {
+                        lyric: n.lyric.as_str(),
+                        note_num: n.note_num,
+                        frames: n.frames,
+                        lang,
+                        phoneme_input: n.phoneme_input.as_deref(),
+                    })
+                    .collect();
                 let f0 = if f0_cents.is_empty() {
                     None
                 } else {
@@ -1360,8 +1420,8 @@ pub async fn render_vocal_segment(
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_sovits(
-                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &sv, VOCAL_FLAT_VOL,
-                    transpose, f0.as_ref(), loud, formant, &cancel, &progress,
+                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
+                    VOCAL_FLAT_VOL, transpose, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })
@@ -1390,8 +1450,17 @@ pub async fn render_vocal_segment(
 
             tauri::async_runtime::spawn_blocking(move || {
                 let cancel = || app.inference.voice_cancelled(run_epoch);
-                let score_ref: Vec<(&str, i64, i64)> =
-                    score_owned.iter().map(|(l, n, f)| (l.as_str(), *n, *f)).collect();
+                let score_ref: Vec<g2p::ScoreEvt> = score_owned
+                    .iter()
+                    .zip(note_langs.iter())
+                    .map(|(n, &lang)| g2p::ScoreEvt {
+                        lyric: n.lyric.as_str(),
+                        note_num: n.note_num,
+                        frames: n.frames,
+                        lang,
+                        phoneme_input: n.phoneme_input.as_deref(),
+                    })
+                    .collect();
                 let f0 = if f0_cents.is_empty() {
                     None
                 } else {
@@ -1413,8 +1482,8 @@ pub async fn render_vocal_segment(
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_rvc(
-                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, lang_id, &rv, transpose,
-                    f0.as_ref(), loud, formant, &cancel, &progress,
+                    &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
+                    transpose, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })

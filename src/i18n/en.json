@@ -394,7 +394,9 @@
       "busy": "A render is already in progress",
       "spkMixDiffusion": "Multi-speaker blend is incompatible with diffusion: the diffusion stage ignores the blend (pulls the timbre toward a single speaker). Turn off diffusion, or use a single speaker",
       "autoRendering": "Rendering changed vocal tracks…",
-      "autoRenderingCancel": "Click again to cancel"
+      "autoRenderingCancel": "Click again to cancel",
+      "oov": "Lyric \"{{lyric}}\" cannot be mapped to phonemes (OOV) — check the lyric or the note/track language",
+      "phoneMissing": "Internal error: phoneme \"{{phone}}\" is not in the ScoreToCV vocabulary"
     }
   }
 }

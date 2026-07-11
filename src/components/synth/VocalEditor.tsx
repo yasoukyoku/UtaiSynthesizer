@@ -16,7 +16,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, VOCAL_RENDER_BUSY, VOCAL_NO_VOICE, VOCAL_EMPTY, VOCAL_SPK_MIX_DIFFUSION } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
@@ -167,14 +167,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     try {
       await renderVocalPart(track, seg, tempoRef.current, t("vocalEditor.render.laneLabel"));
     } catch (e) {
-      const msg = String(e);
-      const toast =
-        msg.includes(VOCAL_NO_VOICE) ? t("vocalEditor.render.noVoice")
-        : msg.includes(VOCAL_EMPTY) ? t("vocalEditor.render.empty")
-        : msg.includes(VOCAL_RENDER_BUSY) ? t("vocalEditor.render.busy")
-        : msg.includes(VOCAL_SPK_MIX_DIFFUSION) ? t("vocalEditor.render.spkMixDiffusion")
-        : `${t("vocalEditor.render.failed")}: ${msg}`;
-      useAppStore.getState().showToast(toast, "error");
+      // Shared error→message mapping (vocalRenderErrorMessage) — the SAME one the Play-time auto-render
+      // batch uses, so the two paths can never drift (§user: they must report identically).
+      useAppStore.getState().showToast(vocalRenderErrorMessage(e), "error");
     }
   }, [part, segmentId, t]);
 

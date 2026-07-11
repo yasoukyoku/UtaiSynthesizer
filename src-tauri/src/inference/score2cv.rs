@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use ndarray::Array2;
 
 use super::engine::{InputTensor, OnnxEngine};
+use super::g2p;
 use super::score2cv_tables as tbl;
 use crate::{Result, UtaiError};
 
@@ -27,11 +28,12 @@ fn phone_to_id_map() -> &'static HashMap<&'static str, i64> {
 }
 fn kana_map() -> &'static HashMap<&'static str, &'static str> {
     static M: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    M.get_or_init(|| tbl::KANA.iter().copied().collect())
+    // base table + the S58 coverage additions (missing yōon rows + ゔ; generated, non-colliding).
+    M.get_or_init(|| tbl::KANA.iter().chain(super::g2p_tables::KANA_EXTRA).copied().collect())
 }
 fn r2ipa_map() -> &'static HashMap<&'static str, &'static [&'static str]> {
     static M: OnceLock<HashMap<&'static str, &'static [&'static str]>> = OnceLock::new();
-    M.get_or_init(|| tbl::R2IPA.iter().copied().collect())
+    M.get_or_init(|| tbl::R2IPA.iter().chain(super::g2p_tables::R2IPA_EXTRA).copied().collect())
 }
 
 // ─── G2P: one lyric token → IPA phones / rest / sustain ─────────────────────────────────────────
@@ -156,6 +158,9 @@ fn split_dur(fr: i64, n: usize) -> Vec<i64> {
 
 /// The per-phone arrays a chunk feeds to ScoreToCV. `phon` (the IPA strings) is kept so chunking can
 /// split on the "SP" token exactly like the Python (never on the id, which an OOV fallback could alias).
+/// `lang` (S58) is the per-phone RUN language id (uniform within a note; sustains inherit the carrier,
+/// rests attach to the previous run) — chunking cuts at every lang change so each ScoreToCV call gets a
+/// single-language chunk (the model's lang_id is a per-call scalar).
 pub struct ScoreArrays {
     pub phonemes: Vec<i64>,
     pub phone_dur: Vec<i64>,
@@ -163,16 +168,33 @@ pub struct ScoreArrays {
     pub note_dur: Vec<i64>,
     pub note_to_phone: Vec<i64>,
     pub phon: Vec<&'static str>,
+    pub lang: Vec<i64>,
 }
 
 /// Port of `render_ust.build_arrays` (+ its `lyric_to_phones` front-end). `score` = (lyric, note_num,
 /// frames) per note. Rest frames are capped (first/last note → `CAP_LEAD`, mid → `CAP_MID`); a sustain
 /// (`-`/`ー`/`+`) continues the previous vowel (default `a`); notes are grouped into `note_to_phone` by
 /// consecutive equal pitch. An OOV lyric is a LOUD error (never the reference's silent SP fallback — the
-/// v1 "啊啊啊" regression). This is the Phase-1c PARITY entry (rest-capped, == render_ust); the ② vocal
-/// DAW render uses `build_arrays_daw` (rests uncapped) so the rendered stem aligns to the segment timeline.
+/// v1 "啊啊啊" regression). This is the Phase-1c PARITY entry (rest-capped, JA, == render_ust); since S58
+/// it routes through the SAME g2p resolve + assembly core as the multi-language DAW path — the 1c
+/// bit-parity tests below prove the shared core reproduces the legacy arrays exactly. The ② vocal DAW
+/// render uses `build_arrays_daw` (rests uncapped, per-note language) so the stem aligns to the timeline.
 pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
-    build_arrays_impl(score, true, false) // Phase-1c PARITY: rest-capped, no borrow-time
+    let evts: Vec<g2p::ScoreEvt> = score.iter().map(g2p::ScoreEvt::ja).collect();
+    let resolved = g2p::resolve_score(&evts, &NoDicts)?;
+    assemble_arrays(&evts, &resolved, true, false) // Phase-1c PARITY: rest-capped, no borrow-time
+}
+
+/// A `DictSource` for pure-JA paths (parity + tests): JA needs no dictionary files; any zh/word-dict
+/// request is a loud missing-dictionary error.
+pub struct NoDicts;
+impl g2p::DictSource for NoDicts {
+    fn zh(&self) -> Result<&g2p::ZhDict> {
+        Err(UtaiError::Inference("VOCAL_DICT_MISSING: zh".into()))
+    }
+    fn words(&self, lang: g2p::Lang) -> Result<&g2p::WordDict> {
+        Err(UtaiError::Inference(format!("VOCAL_DICT_MISSING: {}", lang.code())))
+    }
 }
 
 /// M3 minimum cv frames a SUNG vowel gets (via borrow-time in the DAW render) so net_g renders an audible
@@ -181,25 +203,40 @@ const VOWEL_MIN_FRAMES: i64 = 5;
 
 /// ② 自己唱 DAW render entry: identical to `build_arrays` EXCEPT rest frames are NOT capped, so the cv
 /// frame count == the DAW frame count (a rest holds its full duration) and the rendered stem stays
-/// aligned to the segment's tick timeline. A deliberate fork from the Python parity (which caps rests for
-/// a standalone song render, where absolute timing doesn't matter); the Phase-1c gate still tests the
-/// capped `build_arrays`. ⚠ `chunk_at_sp` CANNOT subdivide a single rest (it only splits AT an SP after
-/// the running count exceeds max_frames), so one very long rest becomes one big chunk — the TOTAL frame
-/// count is bounded upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
-pub fn build_arrays_daw(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
-    build_arrays_impl(score, false, true) // ② DAW: rests uncapped + short-note borrow-time (M3)
+/// aligned to the segment's tick timeline; and the score is MULTI-LANGUAGE (S58): per-note effective
+/// language + optional traditional-phoneme override, resolved by `g2p::resolve_score` (dictionaries,
+/// zh phrase context, western syllable spans/归韵). A deliberate fork from the Python parity (which caps
+/// rests for a standalone song render); the Phase-1c gate still tests the capped `build_arrays`.
+/// ⚠ `chunk_at_sp` CANNOT subdivide a single rest (it only splits AT an SP after the running count
+/// exceeds max_frames), so one very long rest becomes one big chunk — the TOTAL frame count is bounded
+/// upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
+pub fn build_arrays_daw(score: &[g2p::ScoreEvt], dicts: &dyn g2p::DictSource) -> Result<ScoreArrays> {
+    let resolved = g2p::resolve_score(score, dicts)?;
+    assemble_arrays(score, &resolved, false, true) // ② DAW: rests uncapped + short-note borrow-time (M3)
 }
 
-fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool, borrow_time: bool) -> Result<ScoreArrays> {
+/// THE single array-assembly core (S58): resolved per-note phones → the model's per-phone arrays.
+/// Frame policy (`split_dur`, rest caps, borrow-time), id mapping, and note grouping — grouping keys on
+/// (pitch, RUN LANGUAGE) so a group never spans a language cut (single-language scores group exactly as
+/// before). Both `build_arrays` (parity, capped) and `build_arrays_daw` (DAW, uncapped) feed through
+/// here — one implementation, proven by the 1c bit-parity gate.
+fn assemble_arrays(
+    score: &[g2p::ScoreEvt],
+    resolved: &[g2p::ResolvedNote],
+    cap_rests: bool,
+    borrow_time: bool,
+) -> Result<ScoreArrays> {
     let m = score.len();
     let mut phon: Vec<&'static str> = Vec::new();
     let mut pdur: Vec<i64> = Vec::new();
     let mut npitch: Vec<i64> = Vec::new();
-    let mut prev_vowel: Option<&'static str> = None;
+    let mut plang: Vec<i64> = Vec::new();
 
-    for (k, &(lyr, nn, fr)) in score.iter().enumerate() {
-        match lyric_to_phones(lyr) {
-            Lyric::Rest => {
+    for (k, (evt, res)) in score.iter().zip(resolved.iter()).enumerate() {
+        let (nn, fr) = (evt.note_num, evt.frames);
+        let lang_id = res.run_lang.id();
+        match &res.kind {
+            g2p::ResolvedKind::Rest | g2p::ResolvedKind::Breath => {
                 let cap = if !cap_rests {
                     i64::MAX // DAW render: keep the full rest so the stem aligns to the timeline
                 } else if k == 0 || k == m - 1 {
@@ -207,49 +244,23 @@ fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool, borrow_time: b
                 } else {
                     tbl::CAP_MID
                 };
-                phon.push("SP");
+                phon.push(if matches!(res.kind, g2p::ResolvedKind::Rest) { "SP" } else { "AP" });
                 pdur.push(fr.min(cap).max(1));
                 npitch.push(0);
-                prev_vowel = None;
+                plang.push(lang_id);
             }
-            Lyric::Breath => {
-                // audible inhale — same duration policy as a rest (capped for parity, uncapped for the DAW),
-                // npitch 0 (unvoiced), resets the sustain vowel; emits the `AP` phone instead of `SP`.
-                let cap = if !cap_rests {
-                    i64::MAX
-                } else if k == 0 || k == m - 1 {
-                    tbl::CAP_LEAD
-                } else {
-                    tbl::CAP_MID
-                };
-                phon.push("AP");
-                pdur.push(fr.min(cap).max(1));
-                npitch.push(0);
-                prev_vowel = None;
-            }
-            Lyric::Sustain => {
-                phon.push(prev_vowel.unwrap_or("a"));
-                pdur.push(fr.max(1));
-                npitch.push(nn);
-            }
-            Lyric::Phones(ph) => {
+            g2p::ResolvedKind::Phones(ph) => {
                 let durs = split_dur(fr, ph.len());
                 for (&p, &d) in ph.iter().zip(durs.iter()) {
                     phon.push(p);
                     pdur.push(d);
                     npitch.push(nn);
-                }
-                if let Some(&last) = ph.last() {
-                    if tbl::VOWEL_SET.contains(&last) {
-                        prev_vowel = Some(last);
-                    }
+                    plang.push(lang_id);
                 }
             }
-            Lyric::Unknown => {
-                return Err(UtaiError::Inference(format!(
-                    "歌词 “{}” 无法映射到音素（OOV）——请检查歌词或语言设置（绝不静默兜底为静音）",
-                    lyr
-                )));
+            g2p::ResolvedKind::Unknown => {
+                // unreachable via resolve_score (strict errors first) — defensive LOUD error.
+                return Err(UtaiError::Inference(format!("VOCAL_OOV: {}", evt.lyric)));
             }
         }
     }
@@ -278,19 +289,22 @@ fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool, borrow_time: b
     let mut phonemes = Vec::with_capacity(phon.len());
     for &p in &phon {
         let id = *map.get(p).ok_or_else(|| {
-            UtaiError::Inference(format!("音素 “{}” 不在 ScoreToCV 词表（210 token）中", p))
+            // CODE + phone detail (i18n'd frontend-side) — a mapped phone outside the 210-token vocab.
+            UtaiError::Inference(format!("VOCAL_PHONE_MISSING: {}", p))
         })?;
         phonemes.push(id);
     }
 
-    // note grouping: consecutive equal pitch → one note group; note_dur = Σ phone_dur within a group.
+    // note grouping: consecutive equal (pitch, run-language) → one note group; note_dur = Σ phone_dur
+    // within a group. The language term (S58) keeps a group from spanning a language cut (per-chunk
+    // lang_id must be uniform); single-language scores group exactly as the legacy pitch-only rule.
     let mut note_to_phone = Vec::with_capacity(npitch.len());
     let mut nidx: i64 = -1;
-    let mut prev: Option<i64> = None;
-    for &p in &npitch {
-        if prev != Some(p) {
+    let mut prev: Option<(i64, i64)> = None;
+    for (i, &p) in npitch.iter().enumerate() {
+        if prev != Some((p, plang[i])) {
             nidx += 1;
-            prev = Some(p);
+            prev = Some((p, plang[i]));
         }
         note_to_phone.push(nidx);
     }
@@ -301,7 +315,7 @@ fn build_arrays_impl(score: &[(&str, i64, i64)], cap_rests: bool, borrow_time: b
     }
     let note_dur: Vec<i64> = note_to_phone.iter().map(|&g| group_frames[g as usize]).collect();
 
-    Ok(ScoreArrays { phonemes, phone_dur: pdur, note_pitch: npitch, note_dur, note_to_phone, phon })
+    Ok(ScoreArrays { phonemes, phone_dur: pdur, note_pitch: npitch, note_dur, note_to_phone, phon, lang: plang })
 }
 
 // ─── SP-boundary chunking (≤ max_frames) + per-chunk rebase ──────────────────────────────────────
@@ -317,9 +331,14 @@ pub struct Chunk {
     pub note_to_phone: Vec<i64>,
     /// Output frame count = Σ phone_dur in this chunk (= cv rows).
     pub t: usize,
+    /// The chunk's (uniform) ScoreToCV language id — chunks are cut at every language change (S58).
+    pub lang_id: i64,
+    /// True when the seam BEFORE this chunk is a mid-voiced language cut (no SP at the boundary) —
+    /// the decode concat applies a micro-fade there to mask the splice (an SP seam is silence).
+    pub hard_seam: bool,
 }
 
-fn make_chunk(a: &ScoreArrays, s: usize, e: usize) -> Chunk {
+fn make_chunk(a: &ScoreArrays, s: usize, e: usize, hard_seam: bool) -> Chunk {
     let base = a.note_to_phone[s];
     Chunk {
         start: s,
@@ -330,27 +349,36 @@ fn make_chunk(a: &ScoreArrays, s: usize, e: usize) -> Chunk {
         note_dur: a.note_dur[s..e].to_vec(),
         note_to_phone: a.note_to_phone[s..e].iter().map(|x| x - base).collect(),
         t: a.phone_dur[s..e].iter().sum::<i64>() as usize,
+        lang_id: a.lang.get(s).copied().unwrap_or(2),
+        hard_seam,
     }
 }
 
 /// Cut the score into chunks at SP (rest) boundaries once the running frame count exceeds `max_frames`
-/// (deploy default 400), bounding SVC memory + O(N²). Verbatim from `render_ust.render_song`: split on
+/// (deploy default 400), bounding SVC memory + O(N²) — verbatim from `render_ust.render_song`: split on
 /// the phone STRING "SP" (never the id), the SP is included in the closing chunk, and each chunk's
-/// `note_to_phone` is rebased to start at 0.
+/// `note_to_phone` is rebased to start at 0. S58: ALSO cut at every LANGUAGE change (the model's lang_id
+/// is a per-call scalar, so a chunk must be single-language); a language cut not adjacent to an SP marks
+/// the following chunk `hard_seam` for the decode-concat micro-fade. Single-language scores cut exactly
+/// as before (the 1c chunking parity test locks it).
 pub fn chunk_at_sp(a: &ScoreArrays, max_frames: i64) -> Vec<Chunk> {
     let n = a.phonemes.len();
     let mut chunks = Vec::new();
     let (mut start, mut cf) = (0usize, 0i64);
+    let mut next_hard = false; // seam flag for the chunk that `start` begins
     for i in 0..n {
         cf += a.phone_dur[i];
-        if cf > max_frames && a.phon[i] == "SP" {
-            chunks.push(make_chunk(a, start, i + 1));
+        let lang_cut = i + 1 < n && a.lang[i + 1] != a.lang[i];
+        if lang_cut || (cf > max_frames && a.phon[i] == "SP") {
+            chunks.push(make_chunk(a, start, i + 1, next_hard));
             start = i + 1;
             cf = 0;
+            // the NEXT chunk's leading seam: hard iff this was a language cut not landing in silence.
+            next_hard = lang_cut && a.phon[i] != "SP";
         }
     }
     if start < n {
-        chunks.push(make_chunk(a, start, n));
+        chunks.push(make_chunk(a, start, n, next_hard));
     }
     chunks
 }
@@ -450,13 +478,19 @@ mod tests {
         assert!(build_arrays(&[("か", 60, 100), ("き", 62, 80)]).is_ok());
     }
 
+    /// JA-defaulted DAW build over legacy triples (the pre-S58 test fixtures).
+    fn daw_ja(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
+        let evts: Vec<g2p::ScoreEvt> = score.iter().map(g2p::ScoreEvt::ja).collect();
+        build_arrays_daw(&evts, &NoDicts)
+    }
+
     // ② vocal DAW render (S53): `build_arrays_daw` keeps the FULL rest so the stem aligns to the
     // timeline; `build_arrays` (parity) caps it (CAP_MID=70 mid / CAP_LEAD=25 first/last).
     #[test]
     fn build_arrays_daw_uncaps_rests() {
         let score = [("か", 60, 80), ("R", 0, 300), ("お", 67, 80)];
         let capped = build_arrays(&score).unwrap();
-        let daw = build_arrays_daw(&score).unwrap();
+        let daw = daw_ja(&score).unwrap();
         // find the SP phone's frame count in each.
         let sp_capped = capped.phon.iter().zip(&capped.phone_dur).find(|(p, _)| **p == "SP").map(|(_, d)| *d);
         let sp_daw = daw.phon.iter().zip(&daw.phone_dur).find(|(p, _)| **p == "SP").map(|(_, d)| *d);
@@ -468,7 +502,7 @@ mod tests {
     // (id AP_ID), npitch 0 (unvoiced), classified distinctly from a rest.
     #[test]
     fn breath_emits_ap() {
-        let arr = build_arrays_daw(&[("か", 60, 80), ("AP", 0, 60), ("お", 67, 80)]).unwrap();
+        let arr = daw_ja(&[("か", 60, 80), ("AP", 0, 60), ("お", 67, 80)]).unwrap();
         let ap = arr.phon.iter().position(|&p| p == "AP").expect("breath emits an AP phone");
         assert_eq!(arr.note_pitch[ap], 0, "breath is unvoiced (npitch 0)");
         assert_eq!(arr.phonemes[ap], tbl::AP_ID, "AP phone maps to AP_ID");
@@ -480,7 +514,7 @@ mod tests {
     #[test]
     fn borrow_time_extends_short_vowel() {
         let score = [("お", 60, 3), ("R", 0, 40)]; // a 3-frame vowel then a rest
-        let daw = build_arrays_daw(&score).unwrap();
+        let daw = daw_ja(&score).unwrap();
         assert_eq!(daw.phon[0], "o");
         assert_eq!(daw.phone_dur[0], VOWEL_MIN_FRAMES, "short vowel borrowed up to the floor");
         assert_eq!(daw.phone_dur[1], 40 - (VOWEL_MIN_FRAMES - 3), "the rest shrank by the borrowed amount");
@@ -510,10 +544,10 @@ mod tests {
         assert_eq!(tbl::PHONE_TO_ID.len(), 210, "vocab size");
         assert_eq!(phone_to_id_map()["SP"], tbl::SP_ID);
         assert_eq!(phone_to_id_map()["AP"], tbl::AP_ID);
-        // no duplicate keys collapsed the maps
+        // no duplicate keys collapsed the maps (base tables + the generated S58 EXTRA rows)
         assert_eq!(phone_to_id_map().len(), tbl::PHONE_TO_ID.len());
-        assert_eq!(kana_map().len(), tbl::KANA.len());
-        assert_eq!(r2ipa_map().len(), tbl::R2IPA.len());
+        assert_eq!(kana_map().len(), tbl::KANA.len() + super::super::g2p_tables::KANA_EXTRA.len());
+        assert_eq!(r2ipa_map().len(), tbl::R2IPA.len() + super::super::g2p_tables::R2IPA_EXTRA.len());
     }
 
     // ── Phase 1d GATE: end-to-end Rust → ORT → cv, matched ≤1e-3 to Python-ORT (score2cv_cv_ref.rs).

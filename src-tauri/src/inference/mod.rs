@@ -2,6 +2,10 @@ pub mod diffusion;
 pub mod engine;
 pub mod f0;
 pub mod features;
+pub mod g2p;
+mod g2p_tables;
+#[cfg(test)]
+mod g2p_golden_ref;
 pub mod mel;
 pub mod nsf_hifigan;
 pub mod rvc;

@@ -394,7 +394,9 @@
       "busy": "他の合成を実行中です",
       "spkMixDiffusion": "複数話者ブレンドは拡散と併用できません：拡散段はブレンドを反映せず単一話者に寄ります。拡散をオフにするか、単一話者を使用してください",
       "autoRendering": "変更した人声トラックを合成中…",
-      "autoRenderingCancel": "もう一度で中止"
+      "autoRenderingCancel": "もう一度で中止",
+      "oov": "歌詞「{{lyric}}」を音素に変換できません（OOV）——歌詞またはノート/トラックの言語設定を確認してください",
+      "phoneMissing": "内部エラー：音素「{{phone}}」は ScoreToCV の語彙にありません"
     }
   }
 }

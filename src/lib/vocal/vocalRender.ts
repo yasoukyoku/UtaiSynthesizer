@@ -12,6 +12,7 @@ import { isBreathLyric } from "../vocalNotes";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
+import i18n from "../../i18n";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { contentSig, vocalParamsSig } from "../../store/history";
 import type { Note, PitchCurve, NoteTransition, ProcessedOutput, Track, Segment } from "../../types/project";
@@ -26,6 +27,27 @@ export const VOCAL_EMPTY = "VOCAL_EMPTY";
  *  condition encoder ignores the blend (renders toward one speaker). Rust returns the CODE; the frontend
  *  maps it to an i18n toast (no hardcoded Chinese in Rust — S56 rule). */
 export const VOCAL_SPK_MIX_DIFFUSION = "SPK_MIX_DIFFUSION";
+/** Rust G2P codes (S58): `VOCAL_OOV: <lyric>` — a lyric has no phoneme mapping in its effective language
+ *  (LOUD, never a silent SP fallback); `VOCAL_PHONE_MISSING: <phone>` — a mapped phone fell outside the
+ *  210-token ScoreToCV vocab (internal invariant; should be impossible with audited dictionaries). */
+export const VOCAL_OOV = "VOCAL_OOV";
+export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
+
+/** Map a vocal-render failure to its user-facing message. THE single error→text mapping for BOTH render
+ *  paths (the sidebar's manual Render button and the Play-time auto-render batch) — never fork it. Codes
+ *  carrying a detail payload (`CODE: detail`) interpolate it into the i18n string. */
+export function vocalRenderErrorMessage(e: unknown): string {
+  const msg = String(e);
+  if (msg.includes(VOCAL_NO_VOICE)) return i18n.t("vocalEditor.render.noVoice");
+  if (msg.includes(VOCAL_EMPTY)) return i18n.t("vocalEditor.render.empty");
+  if (msg.includes(VOCAL_RENDER_BUSY)) return i18n.t("vocalEditor.render.busy");
+  if (msg.includes(VOCAL_SPK_MIX_DIFFUSION)) return i18n.t("vocalEditor.render.spkMixDiffusion");
+  const oov = msg.match(/VOCAL_OOV:\s*(.*)$/);
+  if (oov) return i18n.t("vocalEditor.render.oov", { lyric: oov[1] });
+  const ph = msg.match(/VOCAL_PHONE_MISSING:\s*(.*)$/);
+  if (ph) return i18n.t("vocalEditor.render.phoneMissing", { phone: ph[1] });
+  return `${i18n.t("vocalEditor.render.failed")}: ${msg}`;
+}
 
 /** ScoreToCV native frame rate — the triple `frames` and the f0 array share this one grid so they align. */
 const RENDER_FPS = 50;
@@ -374,9 +396,12 @@ export async function renderDirtyVocals(
     try {
       await renderVocalPart(tr, sg, tempo, laneLabel);
       rendered++;
-    } catch {
+    } catch (e) {
       if (opts?.shouldCancel?.()) return { rendered, failed, cancelled: true };
       failed++;
+      // LOUD failure (§user: Play's auto-render must report exactly like the manual Render button — never
+      // swallow). Same shared mapping, prefixed with the track name so the user knows WHICH track failed.
+      useAppStore.getState().showToast(`${tr.name}: ${vocalRenderErrorMessage(e)}`, "error");
     }
   }
   return { rendered, failed, cancelled: false };
