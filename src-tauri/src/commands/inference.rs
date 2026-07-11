@@ -345,6 +345,31 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &s
         .map_err(|e| format!("{}解析失败（{}）：{}", what, path.display(), e))
 }
 
+/// ①c guard — the SoVITS shallow/only-diffusion CONDITION encoder (sovits.rs `run_diffusion`) does NOT
+/// honor a spk_mix BLEND: it one-hots a SINGLE speaker, so a genuine multi-speaker interpolation together
+/// with a diffusion companion would silently pull the timbre back toward one speaker (only_diffusion drops
+/// the blend entirely; shallow drops it partially). The core blend on the VITS net_g is bit-exact (verified
+/// S56), and training refuses multi-speaker diffusion, so a properly-produced blend model has NO companion
+/// and this never fires — it catches the pathological "diffusion attached to a real multi-speaker blend"
+/// combo with a clear error instead of wrong audio. A single-speaker selection via spk_mix is fine (≤1
+/// distinct id → the diffusion's single speaker matches).
+fn guard_blend_vs_diffusion(
+    entry: &ModelEntry,
+    spk_mix: &[crate::inference::SpkMixEntry],
+    diffusion_present: bool,
+) -> std::result::Result<(), String> {
+    if !diffusion_present || sidecar_has_input(entry, "spk_mix") != Some(true) {
+        return Ok(());
+    }
+    let distinct: std::collections::HashSet<u32> =
+        spk_mix.iter().filter(|e| e.weight > 0.0).map(|e| e.id).collect();
+    if distinct.len() >= 2 {
+        // Stable CODE, not a hardcoded Chinese message — the frontend maps it to t(...) (i18n rule, S56).
+        return Err("SPK_MIX_DIFFUSION".to_string());
+    }
+    Ok(())
+}
+
 /// Everything the SoVITS quality path needs beyond the plain S35 pipeline: the vocoder
 /// runtime (diffusion OR enhancer), the diffusion runtime (validated against the main
 /// model + the run options), and the auto-f0 predictor session. Also enforces the original
@@ -964,6 +989,7 @@ pub async fn run_sovits(
     // ("Session ... not found" on the first piece).
     let (diffusion, vocoder, f0_predictor) =
         resolve_sovits_quality(&app, &entry, dim, hop_size, &mut options, None)?;
+    guard_blend_vs_diffusion(&entry, &options.spk_mix, diffusion.is_some())?;
 
     let cv_sid = app
         .inference
@@ -1274,10 +1300,18 @@ pub async fn render_vocal_segment(
             // resolve diffusion/vocoder AFTER load_voice; f0_predictor resolves to None (auto_f0 forced off).
             let (diffusion, vocoder, f0_predictor) =
                 resolve_sovits_quality(&app, &entry, dim, hop_size, &mut sv, None)?;
+            guard_blend_vs_diffusion(&entry, &sv.spk_mix, diffusion.is_some())?;
             let cv_sid = app.inference.ensure_aux_loaded_on(&cv_path, sv.gpu_extract).map_err(|e| e.to_string())?;
             let rmvpe_sid = app.inference.ensure_aux_loaded_on(&rmvpe_path, sv.gpu_extract).map_err(|e| e.to_string())?;
             let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
-            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, sv.gpu_extract).map_err(|e| e.to_string())?;
+            // ScoreToCV is the self-sing CONTENT workhorse (net_g already runs on the global device) and the
+            // #1 render-time cost. Unlike ContentVec — whose whole-song activations peaked ~9 GB (S35) so it
+            // stays pinned to CPU — ScoreToCV is chunked (sidecar chunk_max_frames ≤400), activations small.
+            // So load it on the GLOBAL device (on_gpu=true = FOLLOW the device preference, NOT force GPU)
+            // instead of forced-CPU: with the default Auto that probes CUDA→DirectML→CPU and FALLS BACK to
+            // CPU on a GPU-less / incompatible machine (exactly like net_g), so it's fast where a GPU exists
+            // and still runs CPU-only. TF32 blur is fine on this ear-validated path; cv/rmvpe keep the toggle.
+            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, true).map_err(|e| e.to_string())?;
             let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
             let cluster = resolve_cluster_asset(&app, &entry, &sv.spk_mix, sv.speaker_id, sv.cluster_ratio);
 
@@ -1331,7 +1365,10 @@ pub async fn render_vocal_segment(
             let cv_sid = app.inference.ensure_aux_loaded_on(&cv_path, rv.gpu_extract).map_err(|e| e.to_string())?;
             let rmvpe_sid = app.inference.ensure_aux_loaded_on(&rmvpe_path, rv.gpu_extract).map_err(|e| e.to_string())?;
             let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
-            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, rv.gpu_extract).map_err(|e| e.to_string())?;
+            // ScoreToCV on the GLOBAL device (on_gpu=true = FOLLOW the device preference; the default Auto
+            // falls back CUDA→DirectML→CPU, so no GPU-less crash) instead of forced-CPU — it's the self-sing
+            // content workhorse + #1 render cost, chunked so VRAM-bounded. See the SoVits arm for full rationale.
+            let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, true).map_err(|e| e.to_string())?;
             let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
 
             tauri::async_runtime::spawn_blocking(move || {

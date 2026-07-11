@@ -15,7 +15,16 @@
   },
   "import": {
     "done": "已导入",
-    "empty": "未找到可导入的音符"
+    "error": {
+      "empty": "未找到可导入的音符",
+      "unsupported": "不支持的文件格式（仅支持 ustx / ust / mid / midi）",
+      "readFail": "读取文件失败",
+      "parseUstx": "解析 ustx 失败",
+      "parseMidi": "解析 MIDI 失败",
+      "smpte": "不支持 SMPTE 时间码 MIDI（仅支持基于四分音符 tick 的）",
+      "ppq": "MIDI 分辨率（PPQ）无效",
+      "generic": "导入失败"
+    }
   },
   "project": {
     "discardTitle": "未保存的更改",
@@ -377,6 +386,7 @@
       "empty": "没有音符可渲染",
       "failed": "渲染失败",
       "busy": "已有渲染进行中，请稍候",
+      "spkMixDiffusion": "多说话人混合与扩散不兼容：扩散阶段不会应用混合（会把音色拉回单一歌手）。请关闭扩散，或改用单一歌手",
       "autoRendering": "渲染改动的人声轨…",
       "autoRenderingCancel": "再次点击取消渲染"
     }

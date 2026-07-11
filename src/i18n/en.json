@@ -15,7 +15,16 @@
   },
   "import": {
     "done": "Imported",
-    "empty": "No importable notes found"
+    "error": {
+      "empty": "No importable notes found",
+      "unsupported": "Unsupported file format (only ustx / ust / mid / midi)",
+      "readFail": "Failed to read file",
+      "parseUstx": "Failed to parse ustx",
+      "parseMidi": "Failed to parse MIDI",
+      "smpte": "SMPTE-timecode MIDI is not supported (quarter-note tick MIDI only)",
+      "ppq": "Invalid MIDI resolution (PPQ)",
+      "generic": "Import failed"
+    }
   },
   "project": {
     "discardTitle": "Unsaved Changes",
@@ -377,6 +386,7 @@
       "empty": "No notes to render",
       "failed": "Render failed",
       "busy": "A render is already in progress",
+      "spkMixDiffusion": "Multi-speaker blend is incompatible with diffusion: the diffusion stage ignores the blend (pulls the timbre toward a single speaker). Turn off diffusion, or use a single speaker",
       "autoRendering": "Rendering changed vocal tracks…",
       "autoRenderingCancel": "Click again to cancel"
     }

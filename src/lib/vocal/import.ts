@@ -43,6 +43,28 @@ interface ImportedNote {
 // (double-click the menu item) while one is pending is ignored.
 let busy = false;
 
+/** Map a backend import error CODE → a localized toast. Rust returns stable CODEs (never hardcoded Chinese —
+ *  the S56 i18n rule); some carry a "CODE: detail" suffix (the parse/IO error text) which we append. */
+function mapImportError(msg: string): string {
+  const codes: Record<string, string> = {
+    IMPORT_UNSUPPORTED: "unsupported",
+    IMPORT_READ_FAIL: "readFail",
+    IMPORT_PARSE_USTX: "parseUstx",
+    IMPORT_PARSE_MIDI: "parseMidi",
+    IMPORT_SMPTE: "smpte",
+    IMPORT_PPQ: "ppq",
+    IMPORT_EMPTY: "empty",
+  };
+  for (const code of Object.keys(codes)) {
+    const at = msg.indexOf(code);
+    if (at < 0) continue;
+    const detail = msg.slice(at + code.length).replace(/^\s*[:：]\s*/, "").trim();
+    const base = t(`import.error.${codes[code]}`);
+    return detail ? `${base}: ${detail}` : base;
+  }
+  return `${t("import.error.generic")}: ${msg}`;
+}
+
 /**
  * File-menu "导入 / Import": pick a .ustx/.ust/.mid/.midi, parse it in Rust, and build one NEW vocal track
  * per track that has notes. BPM / time-sig FOLLOW the file and OVERRIDE the project globally (only when the
@@ -62,7 +84,7 @@ export async function importScoreFile(): Promise<void> {
 
     const score = await invoke<ImportedScore>("import_score_file", { path: sel });
     if (!score.tracks.length) {
-      useAppStore.getState().showToast(t("import.empty"), "error");
+      useAppStore.getState().showToast(t("import.error.empty"), "error");
       return;
     }
 
@@ -106,7 +128,7 @@ export async function importScoreFile(): Promise<void> {
     flushAutosaveNow();
     useAppStore.getState().showBanner(`${t("import.done")} · ${score.tracks.length}`, "load");
   } catch (e) {
-    useAppStore.getState().showToast(e instanceof Error ? e.message : String(e), "error");
+    useAppStore.getState().showToast(mapImportError(e instanceof Error ? e.message : String(e)), "error");
   } finally {
     busy = false;
   }

@@ -22,6 +22,10 @@ export const VOCAL_RENDER_BUSY = "VOCAL_RENDER_BUSY";
  *  The manual-render caller maps these to their own toasts; the auto-render batch pre-filters both away. */
 export const VOCAL_NO_VOICE = "VOCAL_NO_VOICE";
 export const VOCAL_EMPTY = "VOCAL_EMPTY";
+/** Backend guard code: a genuine multi-speaker spk_mix BLEND was combined with a diffusion companion, whose
+ *  condition encoder ignores the blend (renders toward one speaker). Rust returns the CODE; the frontend
+ *  maps it to an i18n toast (no hardcoded Chinese in Rust — S56 rule). */
+export const VOCAL_SPK_MIX_DIFFUSION = "SPK_MIX_DIFFUSION";
 
 /** ScoreToCV native frame rate — the triple `frames` and the f0 array share this one grid so they align. */
 const RENDER_FPS = 50;

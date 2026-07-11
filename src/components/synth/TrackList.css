@@ -301,9 +301,10 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Group bar: breathing room BETWEEN the V and P fader pairs (each pair stays tight via .fader-row). */
+/* Group bar: a little breathing room BETWEEN the V and P fader pairs — enough to read as two controls,
+   not the long gap it used to be (each pair stays tight via .fader-row). */
 .lane-group-controls {
-  gap: 14px;
+  gap: 6px;
 }
 
 .track-btn {

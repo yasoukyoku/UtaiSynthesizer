@@ -154,7 +154,10 @@ export function OverviewMap() {
         // segmentPlaysLanes + laneSumSig: the source switch (playOriginal / lanes turning ready) and
         // every lane-sum input (lane peaks, row mutes, slice recipes) must rebake the preview.
         ? `${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.content.offsetMs}.${s.content.sourcePath}.${audioFiles[s.content.sourcePath]?.peaks.length ?? 0}.${segmentPlaysLanes(t, s) ? 1 : 0}.${laneSumSig(t, s)}`
-        : "")).join(",")}`)
+        // ② vocal bake: rebake the preview when the rendered stem lands/changes (peaks length + path + dur).
+        : (s.content.type === "notes" && s.processedOutputs?.length
+          ? `n${s.startTick}.${s.durationTicks}.${s.loading ? 1 : 0}.${s.processedOutputs.map((o) => `${o.audioPath}:${o.totalDurationMs}:${o.waveformPeaks?.length ?? 0}`).join("+")}`
+          : ""))).join(",")}`)
       .join(";")}`;
     const sizeChanged = !waveRef.current || waveRef.current.width !== cw || waveRef.current.height !== ch;
     if (sizeChanged || waveKeyRef.current !== waveKey) {
@@ -172,29 +175,45 @@ export function OverviewMap() {
       for (const track of tracks) {
         if (track.muted || (hasSolo && !track.solo)) continue; // not audible → excluded from the overview
         for (const seg of track.segments) {
-          if (seg.content.type !== "audioClip" || seg.loading || seg.content.totalDurationMs <= 0) continue;
-          const sx = (seg.startTick / totalTicks) * width;
-          const sw = (seg.durationTicks / totalTicks) * width;
-          // Draw the segment's SLICE of the source (offset → offset+duration), via the shared waveform
-          // cache — NOT the whole source. Otherwise a split clip draws the entire waveform in each
-          // half, garbling the minimap at the split point. (The lane-sum stem spans the whole source,
-          // so the SAME window ratios apply to both branches.)
-          const offMs = seg.content.offsetMs;
-          const totalMs = seg.content.totalDurationMs;
-          const segMs = ticksToMs(seg.durationTicks, tempo);
-          const startRatio = offMs / totalMs;
-          const endRatio = Math.min(1, (offMs + segMs) / totalMs);
-          // WHAT MIXES IS WHAT SHOWS: lanes' real audible sum when they are the source, else the
-          // original audio. Same predicate + sum + exact-sig cache id as the arrangement's main row.
-          let wave: OffscreenCanvas | null = null;
-          const sumPeaks = segmentPlaysLanes(track, seg) ? segmentLaneSumPeaks(track, seg) : null;
-          if (sumPeaks) {
-            wave = getWaveformCache(`lanesum:${track.id}:${seg.id}:${laneSumSig(track, seg)}`, sumPeaks, waveColor);
-          } else {
-            const audio = audioFiles[seg.content.sourcePath];
-            if (audio && audio.peaks.length) wave = getWaveformCache(seg.content.sourcePath, audio.peaks, waveColor);
+          if (seg.loading) continue;
+          if (seg.content.type === "audioClip") {
+            if (seg.content.totalDurationMs <= 0) continue;
+            const sx = (seg.startTick / totalTicks) * width;
+            const sw = (seg.durationTicks / totalTicks) * width;
+            // Draw the segment's SLICE of the source (offset → offset+duration), via the shared waveform
+            // cache — NOT the whole source. Otherwise a split clip draws the entire waveform in each
+            // half, garbling the minimap at the split point. (The lane-sum stem spans the whole source,
+            // so the SAME window ratios apply to both branches.)
+            const offMs = seg.content.offsetMs;
+            const totalMs = seg.content.totalDurationMs;
+            const segMs = ticksToMs(seg.durationTicks, tempo);
+            const startRatio = offMs / totalMs;
+            const endRatio = Math.min(1, (offMs + segMs) / totalMs);
+            // WHAT MIXES IS WHAT SHOWS: lanes' real audible sum when they are the source, else the
+            // original audio. Same predicate + sum + exact-sig cache id as the arrangement's main row.
+            let wave: OffscreenCanvas | null = null;
+            const sumPeaks = segmentPlaysLanes(track, seg) ? segmentLaneSumPeaks(track, seg) : null;
+            if (sumPeaks) {
+              wave = getWaveformCache(`lanesum:${track.id}:${seg.id}:${laneSumSig(track, seg)}`, sumPeaks, waveColor);
+            } else {
+              const audio = audioFiles[seg.content.sourcePath];
+              if (audio && audio.peaks.length) wave = getWaveformCache(seg.content.sourcePath, audio.peaks, waveColor);
+            }
+            if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
+          } else if (seg.content.type === "notes" && seg.processedOutputs && seg.processedOutputs.length > 0) {
+            // ② Vocal bake: the rendered stem drawn across the segment (offset 0, whole stem — mirrors the
+            // arrangement main-row / sub-lane window). Vocal hue so it reads distinct from audio clips.
+            const sx = (seg.startTick / totalTicks) * width;
+            const sw = (seg.durationTicks / totalTicks) * width;
+            const segMs = ticksToMs(seg.durationTicks, tempo);
+            const vColor = rgba(TRACK_RGB.vocal, 0.6);
+            for (const out of seg.processedOutputs) {
+              if (!out.waveformPeaks || out.waveformPeaks.length === 0 || out.totalDurationMs <= 0) continue;
+              const endRatio = Math.min(1, segMs / out.totalDurationMs);
+              const wave = getWaveformCache(out.audioPath, out.waveformPeaks, vColor);
+              if (wave) blitWaveform(wc, wave, sx, 0, sw, height, 0, endRatio, width);
+            }
           }
-          if (wave) blitWaveform(wc, wave, sx, 0, sw, height, startRatio, endRatio, width);
         }
       }
       wc.globalCompositeOperation = "source-over";

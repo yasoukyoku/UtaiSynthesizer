@@ -15,7 +15,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, VOCAL_RENDER_BUSY, VOCAL_NO_VOICE, VOCAL_EMPTY } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, VOCAL_RENDER_BUSY, VOCAL_NO_VOICE, VOCAL_EMPTY, VOCAL_SPK_MIX_DIFFUSION } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev } from "../../lib/f0eval";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
@@ -148,6 +148,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         msg.includes(VOCAL_NO_VOICE) ? t("vocalEditor.render.noVoice")
         : msg.includes(VOCAL_EMPTY) ? t("vocalEditor.render.empty")
         : msg.includes(VOCAL_RENDER_BUSY) ? t("vocalEditor.render.busy")
+        : msg.includes(VOCAL_SPK_MIX_DIFFUSION) ? t("vocalEditor.render.spkMixDiffusion")
         : `${t("vocalEditor.render.failed")}: ${msg}`;
       useAppStore.getState().showToast(toast, "error");
     }

@@ -71,15 +71,15 @@ pub async fn import_score_file(path: String) -> Result<ImportedScore, String> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败:{e}"))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("IMPORT_READ_FAIL: {e}"))?;
     let score = match ext.as_str() {
         "ust" => parse_ust(&bytes)?,
         "ustx" => parse_ustx(&bytes)?,
         "mid" | "midi" => parse_midi(&bytes)?,
-        other => return Err(format!("不支持的文件格式:.{other}(仅支持 ustx / ust / mid / midi)")),
+        other => return Err(format!("IMPORT_UNSUPPORTED: {other}")),
     };
     if score.tracks.is_empty() {
-        return Err("文件中没有可导入的音符(所有轨道均为空)".to_string());
+        return Err("IMPORT_EMPTY".to_string());
     }
     Ok(score)
 }
@@ -327,7 +327,7 @@ fn strip_bom(text: &str) -> &str {
 fn parse_ustx(bytes: &[u8]) -> Result<ImportedScore, String> {
     let raw = String::from_utf8_lossy(bytes);
     let text = strip_bom(&raw);
-    let root: UstxRoot = serde_yaml_ng::from_str(text).map_err(|e| format!("解析 ustx 失败:{e}"))?;
+    let root: UstxRoot = serde_yaml_ng::from_str(text).map_err(|e| format!("IMPORT_PARSE_USTX: {e}"))?;
 
     let bpm = root.tempos.first().and_then(|t| t.bpm).or(root.bpm);
     let time_sig = root
@@ -416,15 +416,15 @@ fn parse_midi(bytes: &[u8]) -> Result<ImportedScore, String> {
     use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
     use std::collections::HashMap;
 
-    let smf = Smf::parse(bytes).map_err(|e| format!("解析 MIDI 失败:{e}"))?;
+    let smf = Smf::parse(bytes).map_err(|e| format!("IMPORT_PARSE_MIDI: {e}"))?;
     let ppq: i64 = match smf.header.timing {
         Timing::Metrical(t) => t.as_int() as i64,
         Timing::Timecode(_, _) => {
-            return Err("不支持 SMPTE 时间码 MIDI(仅支持基于四分音符 tick 的 MIDI)".to_string())
+            return Err("IMPORT_SMPTE".to_string())
         }
     };
     if ppq <= 0 {
-        return Err("MIDI 分辨率(PPQ)无效".to_string());
+        return Err("IMPORT_PPQ".to_string());
     }
     // our = round(midi_tick * 480 / ppq). midi ticks are non-negative (absolute, accumulated from 0).
     let to_our = |mt: i64| -> i64 { (mt * TICKS_PER_BEAT + ppq / 2) / ppq };

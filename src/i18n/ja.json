@@ -15,7 +15,16 @@
   },
   "import": {
     "done": "インポート完了",
-    "empty": "インポート可能なノートが見つかりません"
+    "error": {
+      "empty": "インポート可能なノートが見つかりません",
+      "unsupported": "対応していないファイル形式です（ustx / ust / mid / midi のみ）",
+      "readFail": "ファイルの読み込みに失敗しました",
+      "parseUstx": "ustx の解析に失敗しました",
+      "parseMidi": "MIDI の解析に失敗しました",
+      "smpte": "SMPTE タイムコード MIDI は非対応です（四分音符 tick の MIDI のみ）",
+      "ppq": "MIDI 分解能（PPQ）が無効です",
+      "generic": "インポートに失敗しました"
+    }
   },
   "project": {
     "discardTitle": "未保存の変更",
@@ -377,6 +386,7 @@
       "empty": "合成する音符がありません",
       "failed": "合成に失敗しました",
       "busy": "他の合成を実行中です",
+      "spkMixDiffusion": "複数話者ブレンドは拡散と併用できません：拡散段はブレンドを反映せず単一話者に寄ります。拡散をオフにするか、単一話者を使用してください",
       "autoRendering": "変更した人声トラックを合成中…",
       "autoRenderingCancel": "もう一度で中止"
     }
