@@ -677,6 +677,28 @@ export function inGestureTransaction(): boolean {
   return txnDepth > 0;
 }
 
+/** S61 cleanup support: every audio path referenced by the UNDO/REDO snapshots (deleted segments'
+ *  sources + rendered lanes live on here until history is reset). The Settings render-cache sweep
+ *  must NOT delete these — an undo would resurrect a segment whose backing files are gone, and a
+ *  restored vocal bake would read false-clean while pointing at a deleted stem (audit S61 MAJOR). */
+export function historyReferencedAudioPaths(): string[] {
+  const out = new Set<string>();
+  const walk = (snaps: Snapshot[]) => {
+    for (const s of snaps) {
+      for (const t of s.tracks) {
+        for (const seg of t.segments) {
+          if (seg.content.type === "audioClip") out.add(seg.content.sourcePath);
+          for (const o of seg.processedOutputs ?? []) out.add(o.audioPath);
+        }
+      }
+    }
+  };
+  walk(past);
+  walk(future);
+  if (txnBefore) walk([txnBefore]);
+  return [...out];
+}
+
 export function routeUndo() {
   for (const it of [...undoInterceptors]) {
     if (it.wouldConsume()) {

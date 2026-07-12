@@ -355,6 +355,8 @@
     "clearRender": "Clear Render",
     "nodes": "Nodes",
     "catVoice": "Voice Conversion",
+    "errTransposeInput": "Transpose node: input audio not found (upstream node produced no file?)",
+    "errTransposeRange": "Transpose out of range (±24 semitones)",
     "catEffects": "Processing",
     "catSeparation": "Separation",
     "catIO": "Input / Output",

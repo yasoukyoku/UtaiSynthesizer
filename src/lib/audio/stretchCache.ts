@@ -33,6 +33,14 @@ export function stretchedArtifactPaths(): string[] {
   return [...resolved.values()];
 }
 
+/** S61 cleanup support: a stretch is currently generating. Its content-addressed output path is
+ *  minted Rust-side, so it CANNOT be added to the protected set — the cleanup must simply wait
+ *  (a mid-flight sweep could delete the just-published wav before the memo records it, poisoning
+ *  the memo with a dead path until restart; audit S61). */
+export function stretchInFlight(): boolean {
+  return pending.size > 0;
+}
+
 /** Apply a stretch factor to a segment: ARTIFACTS FIRST, THEN COMMIT — the source + every ready
  *  stem is stretched before the store write lands, so playback right after Apply never blocks on
  *  a cold stretch. Throws the Rust STRETCH_* CODE on failure (caller toasts); a stale segment

@@ -178,12 +178,14 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
     const segments = (t.segments ?? []).map((s): Segment => {
       const rest: Segment = { ...s };
       delete rest.loading;
-      // S61 MIGRATION: the dead Effects node family (persisted as pitchShift / formantShift /
+      // S61 MIGRATION: the retired Effects node family (persisted as pitchShift / formantShift /
       // audioEnhance) → the Transpose node, HERE at the single load choke point so neither the
       // editor nor the engine ever sees the legacy types. Node id/position/edges are kept (lane
-      // identity embeds node ids — re-keying would orphan deposited lanes); the only meaningful
-      // legacy param (a pitchShift entry's semitones) is carried, everything else was dead
-      // (formant/enhance were unreachable Err stubs in the old Rust path).
+      // identity embeds node ids — re-keying would orphan deposited lanes). Carried: the summed
+      // pitchShift semitones. Dropped by user decision (S61 效果器退役): formantShift (the World
+      // path did work — its capability now lives on the voice nodes' formant param) and enhance
+      // (never implemented, Err stub). Deposited lanes rendered by the old node keep playing;
+      // only a RE-render goes through the new transpose semantics.
       if (rest.workflow?.nodes.some((n) => ["pitchShift", "formantShift", "audioEnhance"].includes(n.nodeType as string))) {
         rest.workflow = {
           ...rest.workflow,
@@ -192,9 +194,15 @@ export function parseLoadedBundle(projectJson: string, dir: string): LoadedProje
             const fx = Array.isArray(n.params?.effects)
               ? (n.params.effects as Array<{ type?: string; params?: Record<string, unknown> }>)
               : [];
-            const pitch = fx.find((e) => e?.type === "pitchShift");
-            const rawSemis = Number(pitch?.params?.semitones ?? n.params?.semitones ?? 0);
-            const semitones = Number.isFinite(rawSemis) ? Math.max(-24, Math.min(24, Math.round(rawSemis))) : 0;
+            // SUM every stacked pitchShift entry (the legacy chain applied them sequentially =
+            // additive semitones; taking only the first silently changed old projects' total
+            // transposition — audit S61). Fractional values are preserved (the Rust command takes
+            // f64); formantShift/enhance entries have no transpose equivalent and drop to 0.
+            const legacySum = fx
+              .filter((e) => e?.type === "pitchShift")
+              .reduce((acc, e) => acc + (Number(e?.params?.semitones) || 0), 0);
+            const rawSemis = fx.length > 0 ? legacySum : Number(n.params?.semitones ?? 0);
+            const semitones = Number.isFinite(rawSemis) ? Math.max(-24, Math.min(24, rawSemis)) : 0;
             return { ...n, nodeType: "transpose" as const, params: { semitones } };
           }),
         };

@@ -12,6 +12,7 @@ import { logToBackend } from "../log";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
+import i18n from "../../i18n";
 
 interface AudioFileInfo {
   duration_ms: number;
@@ -441,11 +442,20 @@ async function executeNode(
         break;
       }
       const outputPath = `${cacheDir}/${nodeId}_transpose.wav`;
-      await invoke("transpose_audio", {
-        path: primaryInput,
-        semitones,
-        outputPath,
-      });
+      try {
+        await invoke("transpose_audio", {
+          path: primaryInput,
+          semitones,
+          outputPath,
+        });
+      } catch (e) {
+        // Map the stable Rust CODEs to localized node-error text (i18n rule — a raw CODE must not
+        // reach the user). Anything else keeps its detail suffix.
+        const msg = String(e);
+        if (msg.includes("TRANSPOSE_INPUT_MISSING")) throw new Error(i18n.t("workflow.errTransposeInput"));
+        if (msg.includes("TRANSPOSE_RANGE")) throw new Error(i18n.t("workflow.errTransposeRange"));
+        throw e instanceof Error ? e : new Error(msg);
+      }
       outputData.set(0, outputPath);
       break;
     }

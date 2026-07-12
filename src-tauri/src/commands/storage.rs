@@ -119,6 +119,12 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                     continue;
                 }
                 let slug = entry.file_name().to_string_lossy().to_string();
+                // `.del_*` = a torn workspace delete (rename-then-remove, see below) — invisible to
+                // workspace_path, finish removing it here instead of listing it.
+                if slug.starts_with('.') {
+                    let _ = std::fs::remove_dir_all(&p);
+                    continue;
+                }
                 let bytes = dir_size(&p);
                 training_bytes += bytes;
                 ws_audition += dir_size(&p.join("audition"));
@@ -165,9 +171,14 @@ pub async fn cleanup_render_cache(
     state: State<'_, Arc<AppState>>,
     protected: Vec<String>,
 ) -> Result<u64, String> {
-    if crate::commands::inference::voice_render_active() || crate::commands::audition::audition_active() {
+    if crate::commands::inference::voice_render_active() {
         return Err("CLEANUP_BUSY".into());
     }
+    // HOLD the audition flight flag for the whole sweep (not a mere load() check): VoiceRunGuard +
+    // audition both refuse to START while it is held, so no render can begin writing fresh run-dir
+    // files mid-sweep and get them deleted from under it (audit S61 — check-then-act window).
+    // Residual: MSST separation runs don't check this flag; the frontend gates those.
+    let _flight = crate::commands::audition::FlightGuard::acquire("CLEANUP_BUSY")?;
     let cache_dir = state.cache_dir.clone();
     tauri::async_runtime::spawn_blocking(move || Ok(sweep_cache_tree(&cache_dir, &protected)))
         .await
@@ -255,7 +266,17 @@ pub async fn delete_training_workspace(
     // locks would otherwise fail the remove. Non-destructive: sessions reload on miss.
     state.inference.engine.unload_paths_with_prefix(&ws);
     let freed = dir_size(&ws);
-    std::fs::remove_dir_all(&ws).map_err(|e| format!("delete workspace: {e}"))?;
+    // RENAME-then-remove: remove_dir_all is not atomic — an interruption (crash / locked file)
+    // could leave exactly the manifest-less-checkpoint partial state the resume guards treat as
+    // corrupt. The same-volume rename IS atomic; a torn removal leaves only an invisible `.del_*`
+    // dir (workspace_path never resolves to it) that get_storage_report finishes off later.
+    let tomb = ws.with_file_name(format!(".del_{slug}_{}", std::process::id()));
+    std::fs::rename(&ws, &tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::remove_dir_all(&tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))
+    })
+    .await
+    .map_err(|e| format!("STORAGE_JOIN: {e}"))??;
     Ok(freed)
 }
 

@@ -154,6 +154,18 @@ describe("S61 clipboard — audio segments", () => {
     expect(tracks()[0]!.segments[0]!.startTick).toBe(5000);
   });
 
+  it("F2: cut deletes ONLY what it copied — a loading clip in the selection survives", () => {
+    const t = audioTrack("A", [audioSeg("s1", 0), { ...audioSeg("s2", 2000), loading: true }]);
+    seed([t], 5000);
+    useAppStore.getState().selectSegments([
+      { trackId: "A", segmentId: "s1" },
+      { trackId: "A", segmentId: "s2" },
+    ]);
+    expect(cutSelectedSegments()).toBe(1); // only s1 copied
+    const ids = tracks()[0]!.segments.map((s) => s.id);
+    expect(ids).toEqual(["s2"]); // the mid-decode clip was NOT deleted
+  });
+
   it("H: undo removes the pasted segment cleanly (one step)", () => {
     const t = audioTrack("A", [audioSeg("s1", 0)]);
     seed([t], 3000);

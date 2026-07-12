@@ -17,7 +17,7 @@ import {
   segStretch, segmentSourceWindowMs,
 } from "../../lib/audio/laneOps";
 import { drawWaveform, beginWaveformFrame, peaksSignature } from "../../lib/waveformCache";
-import { splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { splitSegmentVocalAware, resolveTrackVoice, VOCAL_LANE_ID } from "../../lib/vocal/vocalRender";
 import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
 import { evalCurveAt } from "../../lib/f0eval";
@@ -615,10 +615,27 @@ export function Arrangement() {
       // renderedSig/windowSig embed the host track's config (vm:/vp:/rr: terms), so landing under a
       // different singer auto-fails both sigs → dirty → Play re-renders under the new track's config
       // (an identically-configured track keeps the bake clean — zero extra bookkeeping).
-      if (targetTrack && targetIdx !== drag.trackIdx && srcTrack.trackType === targetTrack.trackType) {
+      // Audit S61: vocal cross-hop is refused mid-render — the in-flight render closure captured
+      // (trackId, segmentId) and its deposit would silently no-op after a hop, wasting the whole
+      // render (the clip just keeps moving on its own track until the render settles).
+      const vocalMoveBlocked = srcTrack.trackType === "vocal" && useAppStore.getState().vocalRenderActive;
+      if (targetTrack && targetIdx !== drag.trackIdx && srcTrack.trackType === targetTrack.trackType && !vocalMoveBlocked) {
         const seg = srcTrack.segments.find((s) => s.id === drag.segId);
         if (seg) {
           const movedSeg = { ...seg, startTick: Math.max(0, drag.origStartTick + moveDelta) };
+          // Audit S61 (dual-sig): landing a baked NOTES part on a track with NO resolvable singer
+          // would play the carried stem as false-clean forever (no config ⇒ isVocalDirty is inert ⇒
+          // edits never re-render). STRIP the bake instead — same rule as paste. Moving it back to
+          // a configured track re-renders on Play (one extra render, never wrong audio).
+          if (
+            movedSeg.content.type === "notes" &&
+            movedSeg.processedOutputs?.some((o) => o.laneId === VOCAL_LANE_ID) &&
+            !resolveTrackVoice(targetTrack)
+          ) {
+            const rest = movedSeg.processedOutputs.filter((o) => o.laneId !== VOCAL_LANE_ID);
+            if (rest.length > 0) movedSeg.processedOutputs = rest;
+            else delete movedSeg.processedOutputs;
+          }
           // The 组 mixer + row mutes are TRACK-level state — carry the moved segment's entries onto the
           // target track (only when absent there: an existing entry is the target's own mix for that
           // group). Without this, deposited lanes moved cross-track silently played at the default
@@ -1174,9 +1191,15 @@ export function Arrangement() {
           setCtxMenu({ x: e.clientX, y: e.clientY, trackIdx: hit.trackIdx, segId: hit.segId, lane: { outputNodeId: hit.lane.group, clipIndex: hit.lane.clipIndex } });
         } else {
           // S61: right-clicking a segment that is ALREADY part of a multi-selection keeps the set
-          // (so 复制/剪切 act on the whole selection, the DAW convention) — any other target replaces it.
+          // (so 复制/剪切 act on the whole selection, the DAW convention) — any other target replaces
+          // it. The ANCHOR still moves to the clicked segment (without collapsing the set) so the
+          // menu's keyboard twins (Del / Ctrl+K / Ctrl+X) act on what the user just aimed at.
           const inMulti = useAppStore.getState().selectedSegments.some((x) => x.segmentId === hit.segId);
-          if (track && !(inMulti && useAppStore.getState().selectedSegments.length > 1)) selectSegment(track.id, hit.segId);
+          if (track && inMulti && useAppStore.getState().selectedSegments.length > 1) {
+            useAppStore.setState({ selectedSegment: { trackId: track.id, segmentId: hit.segId }, activeTrackId: track.id });
+          } else if (track) {
+            selectSegment(track.id, hit.segId);
+          }
           setCtxMenu({ x: e.clientX, y: e.clientY, trackIdx: hit.trackIdx, segId: hit.segId });
         }
       } else if (trackIdx >= 0 && trackIdx < tracks.length) {
@@ -1247,7 +1270,15 @@ export function Arrangement() {
       items.push({
         label: t("toolbar.delete"), shortcut: "Del",
         onClick: () => {
-          deleteSegment(track.id, ctxMenu.segId!);
+          // Audit S61: when the clicked segment is part of a kept multi-selection, delete the WHOLE
+          // selection — the advertised Del key and the 复制/剪切 items in this same menu already act
+          // on the set; a single-target delete here would silently diverge from all three.
+          const selSet = useAppStore.getState().selectedSegments;
+          if (selSet.length > 1 && selSet.some((x) => x.segmentId === ctxMenu.segId)) {
+            useProjectStore.getState().deleteSegments(selSet.map((x) => ({ trackId: x.trackId, segmentId: x.segmentId })));
+          } else {
+            deleteSegment(track.id, ctxMenu.segId!);
+          }
           clearSelection();
           if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
         },

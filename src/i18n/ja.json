@@ -355,6 +355,8 @@
     "clearRender": "レンダリングをクリア",
     "nodes": "ノード",
     "catVoice": "ボイス変換",
+    "errTransposeInput": "移調ノード：入力オーディオが見つかりません（上流ノードの出力なし？）",
+    "errTransposeRange": "移調が範囲外です（±24 半音）",
     "catEffects": "処理",
     "catSeparation": "音声分離",
     "catIO": "入出力",

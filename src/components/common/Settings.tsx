@@ -11,7 +11,9 @@ import { useWorkflowStore } from "../../store/workflow";
 import { useTrainingStore } from "../../store/training";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { applyMirror } from "../../lib/models/msst-catalog";
-import { stretchedArtifactPaths } from "../../lib/audio/stretchCache";
+import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
+import { clipboardReferencedPaths } from "../../lib/clipboard";
+import { historyReferencedAudioPaths } from "../../store/history";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -144,6 +146,11 @@ function collectProtectedPaths(): string[] {
   // Stretched artifacts the session has already resolved: the stretchCache memo would keep
   // serving a deleted path (no existence re-check) → stretched clips dead until restart.
   for (const p of stretchedArtifactPaths()) prot.add(p);
+  // UNDO/REDO snapshots + the arrangement clipboard also hold live references (audit S61 MAJOR):
+  // deleting a cut/deleted segment's stem lets a later paste/undo stamp a bake "valid" over a
+  // missing file — permanently silent false-clean. Protect everything they can resurrect.
+  for (const p of historyReferencedAudioPaths()) prot.add(p);
+  for (const p of clipboardReferencedPaths()) prot.add(p);
   return [...prot];
 }
 
@@ -347,7 +354,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const trainingBusy = useTrainingStore((s) => s.snapshot.state === "running" || s.snapshot.state === "starting");
   const midiExtracting = useAppStore((s) => Object.keys(s.midiExtracting).length > 0);
   const rangeTesting = useVoiceModelStore((s) => Object.keys(s.rangeTesting).length > 0);
-  const cacheCleanBlocked = isPlaying || vocalRenderActive || anyWorkflowRunning || midiExtracting || rangeTesting;
+  const decoding = useAudioStore((s) => s.loadingPaths.length > 0); // in-flight decode writes audio_cache
+  const cacheCleanBlocked = isPlaying || vocalRenderActive || anyWorkflowRunning || midiExtracting || rangeTesting || decoding;
 
   const refreshStorage = useCallback(async () => {
     setStorageScanning(true);
@@ -396,6 +404,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
   }, [refreshStorage, showConfirm, lang]);
 
   const handleCleanCache = useCallback(() => {
+    // Non-reactive last-moment gate: an in-flight stretch's output path is minted Rust-side and
+    // can't be protected — refuse instead of racing it (audit S61).
+    if (stretchInFlight()) {
+      setCleanMsg(L("stErrBusy"));
+      return;
+    }
     void runCleanup(
       "cache",
       () => invoke<number>("cleanup_render_cache", { protected: collectProtectedPaths() }),
@@ -519,7 +533,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       stFreed: { zh: "已释放", en: "Freed", ja: "解放済み" },
       stCache: { zh: "渲染/解码缓存", en: "Render/decode caches", ja: "レンダー/デコードキャッシュ" },
       stCacheTitle: { zh: "清理渲染/解码缓存", en: "Clean render/decode caches", ja: "レンダーキャッシュをクリーン" },
-      stCacheBody: { zh: "删除可再生的缓存（解码副本、变速产物、旧渲染输出）。当前打开工程引用的文件会保留；已保存的 .usp 工程自带渲染副本，不受影响。未保存工程的旧渲染需要重新渲染。", en: "Deletes regenerable caches (decode copies, stretch products, old render outputs). Files referenced by the open project are kept; saved .usp projects carry their own render copies. Unsaved projects' old renders will need re-rendering.", ja: "再生成可能なキャッシュ（デコードコピー、テンポ産物、古いレンダー出力）を削除します。開いているプロジェクトが参照するファイルは保持されます。保存済み .usp はレンダーコピーを内蔵しているため影響ありません。" },
+      stCacheBody: { zh: "删除可再生的缓存（解码副本、变速产物、旧渲染输出）。当前打开工程引用的文件会保留；已保存的 .usp 工程自带渲染副本，不受影响。未保存工程的旧渲染需要重新渲染。", en: "Deletes regenerable caches (decode copies, stretch products, old render outputs). Files referenced by the open project are kept; saved .usp projects carry their own render copies. Unsaved projects' old renders will need re-rendering.", ja: "再生成可能なキャッシュ（デコードコピー、テンポ産物、古いレンダー出力）を削除します。開いているプロジェクトが参照するファイルは保持されます。保存済み .usp はレンダーコピーを内蔵しているため影響ありません。未保存プロジェクトの古いレンダーは再レンダリングが必要になります。" },
       stCacheBlocked: { zh: "播放/渲染进行中，暂不可清理", en: "Unavailable while playing/rendering", ja: "再生/レンダリング中は使用不可" },
       stAudition: { zh: "试听缓存", en: "Audition caches", ja: "試聴キャッシュ" },
       stAuditionTitle: { zh: "清理试听缓存", en: "Clean audition caches", ja: "試聴キャッシュをクリーン" },

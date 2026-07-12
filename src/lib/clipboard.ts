@@ -78,6 +78,34 @@ export function clearClipboard(): void {
   clipboard = null;
 }
 
+/** S61 cleanup support: every audio path the CLIPBOARD still references (cut segments' sources,
+ *  carried rendered lanes, render-cache snapshots). The Settings render-cache sweep must NOT delete
+ *  these — a paste after cleanup would otherwise stamp a bake "valid" over a deleted stem
+ *  (permanently silent false-clean, the S57 crown violation the audit caught). */
+export function clipboardReferencedPaths(): string[] {
+  if (!clipboard) return [];
+  const out = new Set<string>();
+  const addSeg = (seg: Segment) => {
+    if (seg.content.type === "audioClip") out.add(seg.content.sourcePath);
+    for (const o of seg.processedOutputs ?? []) out.add(o.audioPath);
+  };
+  const addSnap = (snap: SegmentRenderSnapshot | null | undefined) => {
+    for (const paths of Object.values(snap?.nodeOutputs ?? {})) {
+      for (const p of paths) if (p) out.add(p);
+    }
+  };
+  if (clipboard.kind === "segments") {
+    for (const it of clipboard.items) {
+      addSeg(it.seg);
+      addSnap(it.renderState);
+    }
+  } else {
+    for (const seg of clipboard.track.segments) addSeg(seg);
+    for (const snap of Object.values(clipboard.renderStates)) addSnap(snap);
+  }
+  return [...out];
+}
+
 /** The current segment selection, primary-fallback (the exact Toolbar-delete contract). */
 function selectionTargets(): Array<{ trackId: string; segmentId: string }> {
   const app = useAppStore.getState();
@@ -88,8 +116,16 @@ function selectionTargets(): Array<{ trackId: string; segmentId: string }> {
 
 /** Copy the selected segment(s) into the clipboard. Returns how many were copied (0 = nothing). */
 export function copySelectedSegments(): number {
+  return copySelection().length;
+}
+
+/** The copy core: returns exactly WHICH selections were copied (cut deletes precisely these —
+ *  a mid-decode `loading` clip is skipped by copy and must NOT be deleted by cut, or "move via
+ *  cut/paste" silently drops it; audit S61). */
+function copySelection(): Array<{ trackId: string; segmentId: string }> {
   const st = useProjectStore.getState();
   const tempo = st.tempo;
+  const copied: Array<{ trackId: string; segmentId: string }> = [];
   const items: ClipSegItem[] = [];
   for (const sel of selectionTargets()) {
     const trackIndex = st.tracks.findIndex((t) => t.id === sel.trackId);
@@ -122,16 +158,20 @@ export function copySelectedSegments(): number {
           : null,
       laneControls,
       laneMutes,
+      // bakeClean REQUIRES a resolvable singer: with the model missing, isVocalDirty returns false
+      // ("can't render" ≠ "clean") — treating that as clean would let a stale stem paste as valid
+      // once the model is later installed with an identical trackSig (audit S61).
       ...(hasBake
-        ? { vocal: { bakeClean: !isVocalDirty(track, seg, tempo), trackSigAtCopy: vocalTrackSig(track, tempo) } }
+        ? { vocal: { bakeClean: !!resolveTrackVoice(track) && !isVocalDirty(track, seg, tempo), trackSigAtCopy: vocalTrackSig(track, tempo) } }
         : {}),
     };
     items.push(item);
+    copied.push({ trackId: track.id, segmentId: seg.id });
   }
-  if (items.length === 0) return 0;
+  if (items.length === 0) return [];
   const anchorTick = Math.min(...items.map((i) => i.seg.startTick));
   clipboard = { kind: "segments", items, anchorTick };
-  return items.length;
+  return copied;
 }
 
 /** Copy a whole track (header right-click 复制轨道). Verbatim clone incl. config/mixer/view state;
@@ -154,22 +194,26 @@ export function copyTrackToClipboard(trackId: string): boolean {
       if (snap) renderStates[seg.id] = structuredClone(snap);
     } else if (seg.processedOutputs?.some((o) => o.laneId === VOCAL_LANE_ID)) {
       const live = track.segments.find((s) => s.id === seg.id)!;
-      vocalMeta[seg.id] = { bakeClean: !isVocalDirty(track, live, tempo), trackSigAtCopy: vocalTrackSig(track, tempo) };
+      // same bakeClean rule as the segment copy: unresolvable singer ⇒ never "clean"
+      vocalMeta[seg.id] = {
+        bakeClean: !!resolveTrackVoice(track) && !isVocalDirty(track, live, tempo),
+        trackSigAtCopy: vocalTrackSig(track, tempo),
+      };
     }
   }
   clipboard = { kind: "track", track: clone, renderStates, vocalMeta };
   return true;
 }
 
-/** Cut = copy + delete the originals (one undo step — the delete). */
+/** Cut = copy + delete EXACTLY the copied originals (one undo step — the delete). A `loading`
+ *  clip in the selection is skipped by copy, so it must survive the cut too. */
 export function cutSelectedSegments(): number {
-  const targets = selectionTargets();
-  const copied = copySelectedSegments();
-  if (copied === 0) return 0;
-  useProjectStore.getState().deleteSegments(targets);
+  const copied = copySelection();
+  if (copied.length === 0) return 0;
+  useProjectStore.getState().deleteSegments(copied);
   useAppStore.getState().clearSelection();
   if (useAudioStore.getState().isPlaying) useAudioStore.getState().bumpSchedule();
-  return copied;
+  return copied.length;
 }
 
 /** Mint a paste-instance of a clipboard segment: fresh segment id, fresh note ids (duplicated note ids

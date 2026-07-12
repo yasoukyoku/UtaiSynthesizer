@@ -355,6 +355,8 @@
     "clearRender": "清除渲染",
     "nodes": "节点",
     "catVoice": "声音转换",
+    "errTransposeInput": "移调节点找不到输入音频（上游节点可能未产出文件）",
+    "errTransposeRange": "移调超出允许范围（±24 半音）",
     "catEffects": "处理",
     "catSeparation": "音频分离",
     "catIO": "输入/输出",

@@ -358,14 +358,16 @@ export function Toolbar() {
         }
         e.preventDefault();
         splitRef.current();
-      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "x" || e.key === "v")) {
+      } else if (e.ctrlKey && !e.shiftKey && !e.altKey && ["c", "x", "v"].includes(e.key.toLowerCase())) {
         // S61 arrangement clipboard. Timeline-pane ONLY: the vocal editor owns note copy/paste under
         // activePane === "vocal" (VocalEditor keydown), and the workflow pane deliberately has no
         // clipboard — same `!== "timeline"` posture as Delete above (never fire under another pane).
+        // toLowerCase: CapsLock reports "C"/"X"/"V" (the VocalEditor twin already normalizes).
         if (useAppStore.getState().activePane !== "timeline") return;
         e.preventDefault();
-        if (e.key === "c") copySelectedSegments();
-        else if (e.key === "x") cutSelectedSegments();
+        const k = e.key.toLowerCase();
+        if (k === "c") copySelectedSegments();
+        else if (k === "x") cutSelectedSegments();
         else pasteWithFeedback();
       }
     };
