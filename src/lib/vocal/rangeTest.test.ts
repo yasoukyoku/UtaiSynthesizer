@@ -10,11 +10,15 @@ import {
   classifySemitones,
   deriveRanges,
   buildSpeakerRecord,
+  clampComfort,
+  effectiveComfort,
   midiToHz,
   midiName,
+  MIN_COMFORT_SPAN,
   RANGE_MIDI_LO,
   RANGE_MIDI_HI,
   type SemitoneStat,
+  type SpeakerRangeRecord,
 } from "./rangeTest";
 
 function stat(midi: number, errCents: number, voicedRatio: number): SemitoneStat {
@@ -88,6 +92,55 @@ describe("deriveRanges (v1 criteria)", () => {
     const r = deriveRanges(stats)!;
     expect(r.comfort).toEqual(r.usable);
     expect(deriveRanges(stats.map((s) => stat(s.midi, 900, 0)))).toBeNull();
+  });
+});
+
+describe("deriveRanges noise bridging (S60d)", () => {
+  it("bridges isolated 1-wide octave-flip dropouts (the lengv2.3 field case)", () => {
+    // clean passes 36..77 except single 1180¢ points at 57 and 61 — without bridging the
+    // longest run is [36,56] (ceiling truncated by 21 st); bridged it must be [36,77]
+    const stats: SemitoneStat[] = [];
+    for (let m = 36; m <= 96; m++) {
+      if (m === 57 || m === 61) stats.push(stat(m, 1180, 1));
+      else if (m <= 77) stats.push(stat(m, 5, 1));
+      else stats.push(stat(m, 3800, 0));
+    }
+    const r = deriveRanges(stats)!;
+    expect(r.usable).toEqual([36, 77]);
+    expect(r.comfort).toEqual([36, 77]);
+  });
+
+  it("does NOT bridge a real saturation gap (>2 wide) or leading/trailing failures", () => {
+    // passes 42..70 and 76..79, real 5-wide failure at 71..75 (the 風音サヨ field case)
+    const stats: SemitoneStat[] = [];
+    for (let m = 36; m <= 96; m++) {
+      if ((m >= 42 && m <= 70) || (m >= 76 && m <= 79)) stats.push(stat(m, 5, 1));
+      else stats.push(stat(m, 1500, 1));
+    }
+    const r = deriveRanges(stats)!;
+    expect(r.usable).toEqual([42, 70]); // the island at 76-79 stays a separate (losing) run
+  });
+});
+
+describe("comfort guards (S60d)", () => {
+  it("clampComfort enforces the minimum span within usable", () => {
+    // the field disaster verbatim: both sliders at the usable floor
+    expect(clampComfort([42, 70], [42, 42])).toEqual([42, 42 + MIN_COMFORT_SPAN]);
+    // span enforced against the ceiling too
+    expect(clampComfort([42, 70], [70, 70])).toEqual([70 - MIN_COMFORT_SPAN, 70]);
+    // honest wide zones pass through (sorted + clamped only)
+    expect(clampComfort([42, 70], [60, 50])).toEqual([50, 60]);
+    // usable narrower than the minimum → the whole usable zone
+    expect(clampComfort([60, 63], [61, 61])).toEqual([60, 63]);
+  });
+
+  it("effectiveComfort mirrors the Rust read-side healing chain", () => {
+    const rec = (comfort: [number, number], auto: [number, number]): SpeakerRangeRecord => ({
+      usable: [42, 70], comfort, comfort_auto: auto, semitones: {}, tested_at: "2026-07-12",
+    });
+    expect(effectiveComfort(rec([42, 42], [42, 70]))).toEqual([42, 70]); // degenerate → auto
+    expect(effectiveComfort(rec([42, 42], [50, 52]))).toEqual([42, 70]); // auto degenerate → usable
+    expect(effectiveComfort(rec([45, 60], [42, 70]))).toEqual([45, 60]); // healthy stored value wins
   });
 });
 

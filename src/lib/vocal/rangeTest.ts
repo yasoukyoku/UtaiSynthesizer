@@ -87,12 +87,38 @@ export function classifySemitones(
 const isUsable = (s: SemitoneStat) => s.errCents < 100 && s.voicedRatio > 0.5;
 const isComfort = (s: SemitoneStat) => s.errCents < 50 && s.voicedRatio > 0.8;
 
-/** Longest contiguous true-run of `flag` over the stats (ties → the first). */
+/** Isolated measurement dropouts (rmvpe octave flips, a one-note synthesis hiccup) are 1-2
+ *  semitones wide with clean passes on BOTH sides; true out-of-range failure is contiguous
+ *  (saturation errs grow monotonically). Without bridging, one octave-flipped note truncates
+ *  the whole ceiling (S60d: lengv2.3 lost 57–77 to a single 1180¢ point at 57). */
+const BRIDGE_MAX_GAP = 2;
+
+/** Minimum comfort span (semitones) the UI lets the user commit — a degenerate zone becomes
+ *  a centering target for everything (S60d: comfort=[42,42] → whole-song -27 st renders).
+ *  Mirrors MIN_COMFORT_SPAN in src-tauri/src/inference/vocal_range.rs (read-side healing). */
+export const MIN_COMFORT_SPAN = 5;
+
+/** Pass-flags with interior fail-gaps of ≤ BRIDGE_MAX_GAP (flanked by passes) bridged. */
+function bridgedFlags(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): boolean[] {
+  const f = stats.map(flag);
+  let i = 0;
+  while (i < f.length) {
+    if (f[i]) { i++; continue; }
+    let j = i;
+    while (j < f.length && !f[j]) j++;
+    if (i > 0 && j < f.length && j - i <= BRIDGE_MAX_GAP) f.fill(true, i, j);
+    i = j;
+  }
+  return f;
+}
+
+/** Longest contiguous true-run of `flag` over the stats (ties → the first), noise-bridged. */
 function longestRun(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): [number, number] | null {
+  const flags = bridgedFlags(stats, flag);
   let best: [number, number] | null = null;
   let start = -1;
-  for (let i = 0; i <= stats.length; i++) {
-    const ok = i < stats.length && flag(stats[i]!);
+  for (let i = 0; i <= flags.length; i++) {
+    const ok = i < flags.length && flags[i]!;
     if (ok && start < 0) start = i;
     if (!ok && start >= 0) {
       if (!best || i - 1 - start > best[1] - best[0]) best = [start, i - 1];
@@ -100,6 +126,17 @@ function longestRun(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): 
     }
   }
   return best === null ? null : [stats[best[0]]!.midi, stats[best[1]]!.midi];
+}
+
+/** The comfort zone the RENDER layer will actually target — mirrors the Rust read-side
+ *  healing in vocal_range.rs::speaker_range (degenerate comfort → comfort_auto → usable).
+ *  UI display and slider seeding must show THIS, not the raw stored value. */
+export function effectiveComfort(sp: SpeakerRangeRecord): [number, number] {
+  const wide = (c: [number, number]) =>
+    c[1] - c[0] >= MIN_COMFORT_SPAN && c[0] >= sp.usable[0] && c[1] <= sp.usable[1];
+  if (wide(sp.comfort)) return sp.comfort;
+  if (wide(sp.comfort_auto)) return sp.comfort_auto;
+  return sp.usable;
 }
 
 /** usable = longest contiguous usable run; comfort = longest contiguous comfort run WITHIN it
@@ -244,7 +281,21 @@ export async function runCandidateRangeTest(
   return { usable: record.usable, comfort: record.comfort };
 }
 
-/** Persist a user-adjusted comfort range (clamped inside usable; the v1 dual-slider semantics). */
+/** Clamp a requested comfort pair into `usable` and enforce MIN_COMFORT_SPAN (expanding
+ *  around the requested low bound; a usable zone narrower than the minimum becomes the whole
+ *  usable zone). Pure — the single source for commit-time comfort sanitation (vitest). */
+export function clampComfort(usable: [number, number], comfort: [number, number]): [number, number] {
+  let lo = Math.max(usable[0], Math.min(usable[1], Math.min(comfort[0], comfort[1])));
+  let hi = Math.max(usable[0], Math.min(usable[1], Math.max(comfort[0], comfort[1])));
+  if (hi - lo < MIN_COMFORT_SPAN) {
+    hi = Math.min(usable[1], lo + MIN_COMFORT_SPAN);
+    lo = Math.max(usable[0], hi - MIN_COMFORT_SPAN);
+  }
+  return [lo, hi];
+}
+
+/** Persist a user-adjusted comfort range (clamped inside usable, minimum span enforced —
+ *  S60d: a degenerate committed zone centered whole songs onto a single MIDI note). */
 export async function setComfortRange(
   name: string,
   backend: Exclude<VoiceType, "vocoder">,
@@ -256,10 +307,8 @@ export async function setComfortRange(
     ?.vocal_range;
   const sp = existing?.speakers?.[String(speakerId)];
   if (!sp) return;
-  const lo = Math.max(sp.usable[0], Math.min(comfort[0], comfort[1]));
-  const hi = Math.min(sp.usable[1], Math.max(comfort[0], comfort[1]));
   const merged = {
-    speakers: { ...existing!.speakers, [String(speakerId)]: { ...sp, comfort: [lo, hi] as [number, number] } },
+    speakers: { ...existing!.speakers, [String(speakerId)]: { ...sp, comfort: clampComfort(sp.usable, comfort) } },
   };
   await invoke("set_model_vocal_range", { name, modelType: backend, record: merged });
   await useVoiceModelStore.getState().fetchModels();

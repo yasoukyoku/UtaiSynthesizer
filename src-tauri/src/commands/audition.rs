@@ -1283,6 +1283,7 @@ pub async fn set_candidate_vocal_range(
     if !record.is_object() {
         return Err("RANGE_BAD_RECORD".to_string());
     }
+    crate::inference::vocal_range::validate_range_record(&record)?;
     let stem = ckpt_stem(&ckpt_path)?;
     let json_path = audition_dir(&workspace, &stem).join("model.json");
     let text = std::fs::read_to_string(&json_path)

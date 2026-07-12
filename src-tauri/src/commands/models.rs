@@ -193,6 +193,7 @@ pub async fn set_model_vocal_range(
     if !record.is_object() {
         return Err("RANGE_BAD_RECORD".to_string());
     }
+    crate::inference::vocal_range::validate_range_record(&record)?;
     state
         .models
         .set_config_extra_key(&name, &mt, "vocal_range", record)

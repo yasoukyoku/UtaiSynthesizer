@@ -31,7 +31,7 @@ import {
   type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
-import { runRangeTest, setComfortRange, midiName, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { runRangeTest, setComfortRange, midiName, effectiveComfort, MIN_COMFORT_SPAN, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import { preview } from "../common/previewPlayer";
 import { ParamSlider } from "../workflow/nodes/ParamSlider";
 import { readFile } from "@tauri-apps/plugin-fs";
@@ -1050,11 +1050,12 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
   const [hi, setHi] = useState(0);
   const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
   const sp = rec?.speakers?.["0"];
+  // what the render layer will actually target (degenerate stored comfort heals to
+  // comfort_auto/usable — mirror of the Rust read side); display + slider seed use THIS
+  const shown = sp ? effectiveComfort(sp) : null;
   const commit = async () => {
     if (!sp) { setEditing(false); return; }
-    const a = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.min(lo, hi)));
-    const b = Math.max(sp.usable[0], Math.min(sp.usable[1], Math.max(lo, hi)));
-    await setComfortRange(m.name, voiceType, 0, [a, b]);
+    await setComfortRange(m.name, voiceType, 0, [lo, hi]); // clampComfort enforces span
     setEditing(false);
   };
 
@@ -1087,20 +1088,20 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
       >
         {t18({ zh: "音域", en: "Range", ja: "音域" }, lang)} {midiName(sp.usable[0])}–{midiName(sp.usable[1])}
         {" · "}
-        {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(sp.comfort[0])}–{midiName(sp.comfort[1])}
+        {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
       </span>
       {editing ? (
         <span className="rm-range-edit">
           <ParamSlider
             label={t18({ zh: "下限", en: "Low", ja: "下限" }, lang)}
             min={sp.usable[0]} max={sp.usable[1]} step={1} value={lo}
-            onChange={(v) => setLo(v)}
+            onChange={(v) => setLo(Math.max(sp.usable[0], Math.min(v, hi - MIN_COMFORT_SPAN)))}
             format={(v) => midiName(v)}
           />
           <ParamSlider
             label={t18({ zh: "上限", en: "High", ja: "上限" }, lang)}
             min={sp.usable[0]} max={sp.usable[1]} step={1} value={hi}
-            onChange={(v) => setHi(v)}
+            onChange={(v) => setHi(Math.min(sp.usable[1], Math.max(v, lo + MIN_COMFORT_SPAN)))}
             format={(v) => midiName(v)}
           />
           <button className="rm-range-btn" onClick={() => void commit()}>OK</button>
@@ -1117,7 +1118,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
           <button
             className="rm-range-btn"
             title={t18({ zh: "在可用区间内微调舒适区（MIDI 音号）", en: "Adjust the comfort zone within usable (MIDI numbers)", ja: "使用可能域の中で快適域を調整（MIDI 番号）" }, lang)}
-            onClick={() => { setLo(sp.comfort[0]); setHi(sp.comfort[1]); setEditing(true); }}
+            onClick={() => { setLo(shown![0]); setHi(shown![1]); setEditing(true); }}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>

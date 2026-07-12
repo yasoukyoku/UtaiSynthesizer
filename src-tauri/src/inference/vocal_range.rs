@@ -23,6 +23,15 @@
 
 use crate::models::ModelConfig;
 
+/// Minimum span (semitones) a comfort zone must offer to be USED as the shift target.
+/// A degenerate zone (S60d: the '哑音→把上限往下拖' spiral committed comfort=[42,42])
+/// otherwise centers EVERY part toward a single point — the observed -27/-33 st renders.
+/// Mirrored by MIN_COMFORT_SPAN in src/lib/vocal/rangeTest.ts (UI slider constraint).
+pub const MIN_COMFORT_SPAN: f32 = 5.0;
+/// Absurdity brake on any tier decision: no material legitimately needs more than ±2
+/// octaves of translation — past that a stale/garbage record is doing the deciding.
+pub const MAX_RANGE_SHIFT: i64 = 24;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
     /// MIDI bounds, inclusive.
@@ -34,6 +43,10 @@ pub struct SpeakerRange {
 /// speaker of a multi-speaker model must read as "no record" (no shift; the resource manager
 /// offers per-speaker 补做), NOT silently borrow speaker 0's range and transpose by the wrong
 /// singer's zone (audit S60). Single-speaker models resolve to id 0 exactly anyway.
+///
+/// S60d read-side healing: a comfort narrower than MIN_COMFORT_SPAN falls back to
+/// comfort_auto, then to usable — a poisoned sidecar stops causing disasters the moment
+/// this ships, without a disk migration. usable itself below the minimum ⇒ no record.
 pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRange> {
     let rec = config.extra.get("vocal_range")?;
     let speakers = rec.get("speakers")?;
@@ -45,8 +58,37 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         (lo <= hi).then_some((lo, hi))
     };
     let usable = pair("usable")?;
-    let comfort = pair("comfort")?;
+    if usable.1 - usable.0 < MIN_COMFORT_SPAN {
+        return None;
+    }
+    let comfort = [pair("comfort"), pair("comfort_auto"), Some(usable)]
+        .into_iter()
+        .flatten()
+        .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= usable.0 && c.1 <= usable.1)?;
     Some(SpeakerRange { usable, comfort })
+}
+
+/// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
+/// Rejects shapes no honest tester or clamped UI could produce (unordered bounds, comfort
+/// escaping usable). Deliberately does NOT enforce MIN_COMFORT_SPAN — a narrow auto-test
+/// result is honest data worth persisting; the read side above decides applicability.
+pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
+    let speakers = record
+        .get("speakers")
+        .and_then(|s| s.as_object())
+        .ok_or("RANGE_INVALID")?;
+    for sp in speakers.values() {
+        let pair = |key: &str| -> Option<(f64, f64)> {
+            let v = sp.get(key)?.as_array()?;
+            Some((v.first()?.as_f64()?, v.get(1)?.as_f64()?))
+        };
+        let (u_lo, u_hi) = pair("usable").ok_or("RANGE_INVALID")?;
+        let (c_lo, c_hi) = pair("comfort").ok_or("RANGE_INVALID")?;
+        if !(u_lo <= u_hi && c_lo <= c_hi && c_lo >= u_lo && c_hi <= u_hi) {
+            return Err("RANGE_INVALID".to_string());
+        }
+    }
+    Ok(())
 }
 
 // NOTE: "which speaker governs a blend" = the existing ①c `crate::inference::dominant_speaker`
@@ -54,11 +96,25 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
 
 /// v1 three-tier decision. `bounds` = the part's effective pitch range in MIDI (transpose
 /// already folded in; from the f0 curve when present, else the note pitches). Returns the
-/// integer semitone translation to render at (0 = tiers 1/2, no inverse pass).
+/// integer semitone translation to render at (0 = tiers 1/2, no inverse pass), clamped to
+/// ±MAX_RANGE_SHIFT (a clamp firing means the record is stale — retest).
 pub fn compute_range_shift(bounds: (f32, f32), range: &SpeakerRange) -> i64 {
+    let raw = compute_range_shift_raw(bounds, range);
+    if raw.abs() > MAX_RANGE_SHIFT {
+        tracing::warn!(
+            "range-extend: computed shift {raw:+} st exceeds ±{MAX_RANGE_SHIFT} — clamped (stale record? retest the model)"
+        );
+    }
+    raw.clamp(-MAX_RANGE_SHIFT, MAX_RANGE_SHIFT)
+}
+
+fn compute_range_shift_raw(bounds: (f32, f32), range: &SpeakerRange) -> i64 {
     let (min_p, max_p) = bounds;
     let (u_lo, u_hi) = range.usable;
     let (c_lo, c_hi) = range.comfort;
+    if c_hi - c_lo <= 0.0 {
+        return 0; // degenerate comfort never a target (speaker_range heals; defensive here)
+    }
     if min_p >= u_lo && max_p <= u_hi {
         return 0; // tiers 1/2 — inside usable renders untouched
     }
@@ -196,4 +252,66 @@ mod tests {
         assert_eq!(speaker_range(&config, 3), None);
     }
 
+    fn config_with(sp: serde_json::Value) -> ModelConfig {
+        let mut config: ModelConfig = serde_json::from_str("{}").unwrap();
+        config.extra = serde_json::json!({ "vocal_range": { "speakers": { "0": sp } } });
+        config
+    }
+
+    #[test]
+    fn degenerate_comfort_heals_from_auto_then_usable() {
+        // the S60d field case verbatim: slider spiral committed [42,42], auto intact
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [42, 70], "comfort": [42, 42], "comfort_auto": [42, 70]
+            })),
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.comfort, (42.0, 70.0));
+        // auto degenerate too → usable
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [42, 70], "comfort": [42, 42], "comfort_auto": [50, 52]
+            })),
+            0,
+        )
+        .unwrap();
+        assert_eq!(r.comfort, (42.0, 70.0));
+        // usable itself below the minimum span → the record is unusable for shifting
+        assert_eq!(
+            speaker_range(
+                &config_with(serde_json::json!({ "usable": [42, 45], "comfort": [42, 45] })),
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn shift_is_clamped_to_max() {
+        // material 31 st above the comfort ceiling → raw -31, brake at -24
+        assert_eq!(compute_range_shift((100.0, 110.0), &range()), -24);
+        // degenerate comfort (defensive; speaker_range normally heals first) → 0
+        let degenerate = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 52.0) };
+        assert_eq!(compute_range_shift((90.0, 100.0), &degenerate), 0);
+    }
+
+    #[test]
+    fn record_validation() {
+        let ok = serde_json::json!({ "speakers": { "0": { "usable": [42, 70], "comfort": [45, 60] } } });
+        assert!(validate_range_record(&ok).is_ok());
+        // narrow-but-honest comfort is accepted at write time (read side decides applicability)
+        let narrow = serde_json::json!({ "speakers": { "0": { "usable": [42, 70], "comfort": [50, 50] } } });
+        assert!(validate_range_record(&narrow).is_ok());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "speakers": { "0": { "usable": [70, 42], "comfort": [45, 60] } } }),
+            serde_json::json!({ "speakers": { "0": { "usable": [42, 70], "comfort": [40, 60] } } }),
+            serde_json::json!({ "speakers": { "0": { "usable": [42, 70], "comfort": [45, 75] } } }),
+            serde_json::json!({ "speakers": { "0": { "usable": [42, 70] } } }),
+        ] {
+            assert!(validate_range_record(&bad).is_err(), "accepted: {bad}");
+        }
+    }
 }
