@@ -32,6 +32,8 @@ import {
   type VoiceType,
 } from "../../store/voice-models";
 import { runRangeTest, setComfortRange, midiName, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { preview } from "../common/previewPlayer";
+import { readFile } from "@tauri-apps/plugin-fs";
 import "./MsstModelManager.css";
 
 type TopTab = "separation" | "voice" | "tools";
@@ -874,6 +876,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                 )}
                 {!isVocoder && <VoiceRangeRow m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} />}
               </div>
+              {!isVocoder && <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} />}
               {deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">
                   <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
@@ -896,6 +899,95 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         />
       )}
     </div>
+  );
+}
+
+// ─── S60-4: per-model audition (resource manager) — the training-audition bare recipe on an
+// INSTALLED model via render_model_audition (per-speaker cache in the stem family). Playback
+// through the shared preview singleton (contract: stop + assign onEnd on takeover, stop +
+// null onEnd on unmount — previewPlayer.ts header). ───
+
+function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
+  const [phase, setPhase] = useState<"idle" | "rendering" | "playing">("idle");
+  const [spk, setSpk] = useState(0);
+  const speakers = voiceSpeakerOptions(m);
+  const showToast = useAppStore((s) => s.showToast);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      // stop on unmount: the button is gone, a still-playing preview would be unstoppable
+      if (preview.onEnd) {
+        preview.onEnd = null;
+        preview.stop();
+      }
+    };
+  }, []);
+
+  const start = useCallback(async () => {
+    if (phase === "playing") {
+      preview.onEnd = null;
+      preview.stop();
+      setPhase("idle");
+      return;
+    }
+    if (phase === "rendering") return;
+    setPhase("rendering");
+    try {
+      const path = await invoke<string>("render_model_audition", {
+        name: m.name,
+        modelType: voiceType,
+        speakerId: speakers.length > 1 ? spk : null,
+      });
+      if (!aliveRef.current) return;
+      const bytes = await readFile(path);
+      const buf = await preview.decode(new Uint8Array(bytes));
+      if (!aliveRef.current) return;
+      preview.stop();
+      preview.onEnd = () => {
+        preview.onEnd = null;
+        if (aliveRef.current) setPhase("idle");
+      };
+      await preview.play(path, buf);
+      setPhase("playing");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (aliveRef.current) {
+        showToast(`${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${msg}`, "error");
+        setPhase("idle");
+      }
+    }
+  }, [phase, m.name, voiceType, spk, speakers.length, lang, showToast]);
+
+  return (
+    <span className="rm-audition">
+      {speakers.length > 1 && phase === "idle" && (
+        <select
+          className="rm-audition-spk"
+          value={spk}
+          title={t18({ zh: "试听歌手", en: "Audition speaker", ja: "試聴する話者" }, lang)}
+          onChange={(e) => setSpk(Number(e.target.value))}
+        >
+          {speakers.map((s) => (
+            <option key={s.id} value={s.id}>{s.label}</option>
+          ))}
+        </select>
+      )}
+      <button
+        className="rm-range-btn rm-audition-btn"
+        title={t18(
+          phase === "playing"
+            ? { zh: "停止", en: "Stop", ja: "停止" }
+            : { zh: "试听（同训练页口径：裸配方渲染打包干声片段）", en: "Audition (training-page recipe: bare render of the bundled dry clip)", ja: "試聴（トレーニングページと同条件：バンドル済みドライ音声を素の設定でレンダリング）" },
+          lang,
+        )}
+        onClick={() => void start()}
+      >
+        {phase === "rendering" ? "…" : phase === "playing" ? "■" : "▶"}
+      </button>
+    </span>
   );
 }
 

@@ -701,3 +701,21 @@
   text-align: center;
   padding: 0 2px;
 }
+
+/* ── S60-4: per-model audition button + speaker picker ── */
+.rm-audition {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  margin-right: var(--space-sm);
+}
+.rm-audition-btn {
+  min-width: 22px;
+  height: 20px;
+  line-height: 18px;
+}
+.rm-audition-spk {
+  max-width: 90px;
+  height: 20px;
+  font-size: var(--font-size-xs);
+}

@@ -682,6 +682,7 @@ pub fn run() {
             commands::training::reset_training_display,
             commands::training::check_training_workspace,
             commands::training::get_training_workspace_info,
+            commands::audition::render_model_audition,
             commands::audition::render_audition_voice,
             commands::audition::render_audition_vocoder,
             commands::audition::render_audition_diffusion,

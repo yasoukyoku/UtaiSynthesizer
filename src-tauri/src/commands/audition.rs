@@ -820,3 +820,176 @@ pub async fn render_audition_diffusion(
     .await
     .map_err(|e| format!("试听渲染任务失败: {}", e))?
 }
+
+/// S60-4: audition an INSTALLED voice model from the resource manager — the SAME bare recipe
+/// as the training audition (transpose 0 / rmvpe / no index/cluster/diffusion/enhancer / CPU
+/// extract) over the SAME bundled clip, so the two surfaces are directly comparable. No ckpt
+/// conversion (the model is already ONNX + a registry entry). Per-speaker cache lives in the
+/// model's STEM FAMILY (`<stem>.audition_spk{N}.wav`) — delete AND same-name re-import both
+/// invalidate it via remove_entry_files. Events: "audition-progress" with candidate_id
+/// `model:<name>` (the shared protocol; the manager UI listens the same way the training page
+/// does). Errors are stable CODEs: AUDITION_BAD_TYPE / AUDITION_MODEL_MISSING.
+#[tauri::command]
+pub async fn render_model_audition(
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    model_type: String,
+    speaker_id: Option<u32>,
+) -> Result<String, String> {
+    let app = state.inner().clone();
+    let guard = FlightGuard::acquire(AUDITION_BUSY_MSG)?;
+    ensure_trainable_idle(&app)?;
+    ensure_no_voice_render()?;
+    let backend = match model_type.as_str() {
+        "rvc" => VoiceBackendType::Rvc,
+        "sovits" => VoiceBackendType::SoVits,
+        _ => return Err("AUDITION_BAD_TYPE".to_string()),
+    };
+    let mt = match backend {
+        VoiceBackendType::Rvc => ModelType::Rvc,
+        VoiceBackendType::SoVits => ModelType::SoVits,
+    };
+    let entry = app
+        .models
+        .get_by_type(&name, &mt)
+        .ok_or_else(|| "AUDITION_MODEL_MISSING".to_string())?;
+    let spk = speaker_id.unwrap_or(0);
+    let stem = entry
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model".to_string());
+    let dir = entry
+        .path
+        .parent()
+        .ok_or_else(|| "AUDITION_MODEL_MISSING".to_string())?
+        .to_path_buf();
+    let out = dir.join(format!("{}.audition_spk{}.wav", stem, spk));
+    if out.is_file() {
+        drop(guard);
+        return Ok(out.to_string_lossy().into_owned());
+    }
+    let src = audition_source(&app)?;
+    let candidate_id = format!("model:{}", name);
+
+    let apph = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let _guard = guard;
+        let cid = candidate_id.clone();
+        with_terminal_events(&apph.clone(), &cid, || {
+            emit_phase(&apph, &candidate_id, "rendering");
+            let run_epoch = app.inference.begin_voice_run();
+            // session hygiene per S36: evict foreign GPU sessions, keep this model's family
+            {
+                let mut keep = vec![entry.path.clone()];
+                keep.push(dir.join(format!("{}.f0.onnx", stem)));
+                keep.push(dir.join(format!("{}.diffusion", stem)));
+                app.inference.engine.release_gpu_sessions_except(&keep);
+            }
+            // bare recipe → no index asset loaded (mirrors render_audition_voice)
+            app.inference
+                .load_voice(&name, &entry.path, backend.clone(), entry.sample_rate, None)
+                .map_err(|e| e.to_string())?;
+            let dim = entry.config.resolved_features_dim()?;
+            let cv_sid = app
+                .inference
+                .ensure_aux_loaded_on(&contentvec_for_dim(&app, dim)?, false)
+                .map_err(|e| e.to_string())?;
+            let rmvpe_sid = app
+                .inference
+                .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+                .map_err(|e| e.to_string())?;
+            let mel = app
+                .inference
+                .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+                .map_err(|e| e.to_string())?;
+            let handle = app.inference.voice_handle(&name).map_err(|e| e.to_string())?;
+            let has_input = |input: &str| {
+                entry
+                    .config
+                    .inputs
+                    .as_ref()
+                    .and_then(|v| v.as_array())
+                    .map(|l| l.iter().any(|v| v.as_str() == Some(input)))
+            };
+            let spk_mix = if has_input("spk_mix") == Some(true) && entry.config.n_speakers > 0 {
+                Some(entry.config.n_speakers as usize)
+            } else {
+                None
+            };
+            let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
+            let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
+            let cancel = || app.inference.voice_cancelled(run_epoch);
+            let nch = noise_channels(&entry.config);
+
+            let result = match backend {
+                VoiceBackendType::Rvc => {
+                    require_input(&entry, "rnd")?;
+                    let options = RvcOptions {
+                        index_ratio: 0.0,
+                        speaker_id: Some(spk),
+                        gpu_extract: false,
+                        ..Default::default()
+                    };
+                    let model = rvc::RvcModel {
+                        engine: &app.inference.engine,
+                        voice_session: &handle.session_id,
+                        contentvec_session: &cv_sid,
+                        rmvpe_session: &rmvpe_sid,
+                        mel_filters: mel.as_ref(),
+                        index: None, // bare recipe — retrieval off even when an index exists
+                        sample_rate: handle.sample_rate,
+                        features_dim: dim,
+                        spk_mix,
+                        noise_channels: nch,
+                        min_frames: min_frames(&entry.config, 12),
+                    };
+                    rvc::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                        .map_err(|e| e.to_string())?
+                }
+                VoiceBackendType::SoVits => {
+                    require_input(&entry, "noise")?;
+                    let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
+                    let vol_embedding = has_input("vol")
+                        .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+                    let options = SovitsOptions {
+                        cluster_ratio: 0.0,
+                        speaker_id: Some(spk),
+                        gpu_extract: false,
+                        ..Default::default()
+                    };
+                    let model = sovits::SovitsModel {
+                        engine: &app.inference.engine,
+                        voice_session: &handle.session_id,
+                        contentvec_session: &cv_sid,
+                        rmvpe_session: &rmvpe_sid,
+                        mel_filters: mel.as_ref(),
+                        cluster: None,
+                        diffusion: None, // bare recipe — the attachment stays out of the A/B
+                        vocoder: None,
+                        f0_predictor_session: None,
+                        sample_rate: handle.sample_rate,
+                        hop_size,
+                        features_dim: dim,
+                        vol_embedding,
+                        spk_mix,
+                        unit_interpolate_mode: entry
+                            .config
+                            .unit_interpolate_mode
+                            .clone()
+                            .unwrap_or_else(|| "left".to_string()),
+                        noise_channels: nch,
+                        min_frames: min_frames(&entry.config, 6),
+                    };
+                    sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                        .map_err(|e| e.to_string())?
+                }
+            };
+            write_wav_atomic(&out, &result.audio, result.sample_rate)?;
+            Ok(out.to_string_lossy().into_owned())
+        })
+    })
+    .await
+    .map_err(|e| format!("试听渲染任务失败: {}", e))?
+}

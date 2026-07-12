@@ -1312,9 +1312,21 @@ fn remove_entry_files(entry: &ModelEntry) {
     // vocoder mel filterbank (`<stem>_mel.npy` — underscore, NOT an extension:
     // `<stem>.npy` is the RVC index slot).
     if let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem()) {
-        std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem.to_string_lossy()))).ok();
-        std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem.to_string_lossy()))).ok();
-        std::fs::remove_file(dir.join(format!("{}_mel.npy", stem.to_string_lossy()))).ok();
+        let stem = stem.to_string_lossy();
+        std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem))).ok();
+        std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem))).ok();
+        std::fs::remove_file(dir.join(format!("{}_mel.npy", stem))).ok();
+        // S60-4 resource-manager audition cache (`<stem>.audition_spk{N}.wav`) — stem family,
+        // so delete AND same-name re-import (REPLACE) both invalidate it automatically.
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            let prefix = format!("{}.audition_spk", stem);
+            for f in rd.flatten() {
+                let fname = f.file_name().to_string_lossy().to_string();
+                if fname.starts_with(&prefix) && fname.ends_with(".wav") {
+                    std::fs::remove_file(f.path()).ok();
+                }
+            }
+        }
     }
     if let Some(index) = &entry.index_path {
         std::fs::remove_file(index).ok();
