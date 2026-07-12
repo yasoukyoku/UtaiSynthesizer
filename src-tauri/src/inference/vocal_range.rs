@@ -31,6 +31,11 @@ pub const MIN_COMFORT_SPAN: f32 = 5.0;
 /// Absurdity brake on any tier decision: no material legitimately needs more than ±2
 /// octaves of translation — past that a stale/garbage record is doing the deciding.
 pub const MAX_RANGE_SHIFT: i64 = 24;
+/// Real singing behaves worse at the measured ceiling than the sustained-vowel scale probe
+/// (consonants, dynamics) — whenever a shift happens anyway, land the top this far BELOW
+/// c_hi instead of hugging the boundary (S60d2: -9 st landed the song top exactly on 70
+/// and the climax still muted).
+pub const CEILING_MARGIN: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
@@ -130,7 +135,14 @@ fn compute_range_shift_raw(bounds: (f32, f32), range: &SpeakerRange) -> i64 {
         return shift;
     }
     if max_p > c_hi {
-        -((max_p - c_hi).ceil() as i64)
+        let need = -((max_p - c_hi).ceil() as i64);
+        let cushioned = -((max_p - (c_hi - CEILING_MARGIN)).ceil() as i64);
+        // take the ceiling margin only while the bottom still fits inside comfort
+        if min_p + cushioned as f32 >= c_lo {
+            cushioned
+        } else {
+            need
+        }
     } else if min_p < c_lo {
         (c_lo - min_p).ceil() as i64
     } else {
@@ -169,19 +181,57 @@ pub fn score_pitch_bounds(
     (lo <= hi).then(|| (lo + transpose as f32, hi + transpose as f32))
 }
 
-/// Chunk-level tier decision for the COVER path: bounds from the voiced f0's p02/p98
-/// percentiles (rmvpe outlier frames must not trigger a whole-piece shift), in MIDI.
-/// The silence-sliced piece is the natural phrase unit — a constant-ratio inverse's
-/// seams land in silence between pieces.
+/// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer).
+///
+/// The previous p02/p98-bounds version had two blind spots the user could HEAR: the top 2%
+/// of frames (= seconds of the climax on a full song) stayed above the ceiling by
+/// construction, and the minimal translation parked the material top exactly ON c_hi with
+/// zero headroom. Instead: brute-force the integer translation in ±MAX_RANGE_SHIFT that
+/// minimizes the sung-outside-the-zone frame mass, where
+///   - frames above (c_hi - CEILING_MARGIN) weigh 3× frames below c_lo (top overflow =
+///     saturation/mute, the audible disaster; bottom overflow = fry, degrades softer),
+///   - a small |shift| penalty (0.003/st) breaks near-ties toward the least PSOLA coloration.
+/// Isolated rmvpe spikes are inherently harmless (tiny mass never outweighs the shift
+/// penalty). A piece entirely inside USABLE renders untouched (tiers 1/2, byte-identical).
 pub fn piece_range_shift(f0_hz: &[f32], range: &SpeakerRange) -> i64 {
-    let mut voiced: Vec<f32> = f0_hz.iter().copied().filter(|&v| v > 0.0).collect();
+    let voiced: Vec<f32> = f0_hz
+        .iter()
+        .filter(|&&v| v > 0.0)
+        .map(|&hz| 69.0 + 12.0 * (hz / 440.0).log2())
+        .collect();
     if voiced.len() < 10 {
         return 0; // too little voiced material to judge — render untouched
     }
-    voiced.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let pick = |q: f64| voiced[((voiced.len() - 1) as f64 * q).round() as usize];
-    let midi = |hz: f32| 69.0 + 12.0 * (hz / 440.0).log2();
-    compute_range_shift((midi(pick(0.02)), midi(pick(0.98))), range)
+    let (u_lo, u_hi) = range.usable;
+    let (c_lo, c_hi) = range.comfort;
+    if c_hi - c_lo <= 0.0 {
+        return 0; // degenerate comfort never a target (speaker_range heals; defensive)
+    }
+    if voiced.iter().all(|&m| m >= u_lo && m <= u_hi) {
+        return 0; // tiers 1/2 — the whole piece sits in the proven zone
+    }
+    let top = c_hi - CEILING_MARGIN;
+    let n = voiced.len() as f32;
+    let mut best_cost = f32::MAX;
+    let mut best_shift = 0i64;
+    for s in -MAX_RANGE_SHIFT..=MAX_RANGE_SHIFT {
+        let sf = s as f32;
+        let mut above = 0usize;
+        let mut below = 0usize;
+        for &m in &voiced {
+            if m + sf > top {
+                above += 1;
+            } else if m + sf < c_lo {
+                below += 1;
+            }
+        }
+        let cost = (3.0 * above as f32 + below as f32) / n + 0.003 * sf.abs();
+        if cost < best_cost {
+            best_cost = cost;
+            best_shift = s;
+        }
+    }
+    best_shift
 }
 
 /// Undo a chunk's range shift in the audio domain: TD-PSOLA at constant ratio, guided by
@@ -220,12 +270,14 @@ mod tests {
 
     #[test]
     fn tier3_minimal_translation() {
-        // one note above usable → shift DOWN just enough to reach comfort's ceiling
+        // above usable, bottom too tight for the ceiling margin (60-9=51 < c_lo 52) →
+        // plain minimal translation to c_hi
         assert_eq!(compute_range_shift((60.0, 86.0), &range()), -7);
         // below usable → shift UP into comfort
         assert_eq!(compute_range_shift((40.0, 60.0), &range()), 12);
-        // fractional excess rounds AWAY from the edge (ceil)
-        assert_eq!(compute_range_shift((60.0, 84.5), &range()), -6);
+        // bottom has room (60-8=52 ≥ c_lo) → the CEILING_MARGIN cushion is taken:
+        // top lands at 77 (= c_hi 79 - 2), not hugging the boundary
+        assert_eq!(compute_range_shift((60.0, 84.5), &range()), -8);
     }
 
     #[test]
@@ -295,6 +347,40 @@ mod tests {
         // degenerate comfort (defensive; speaker_range normally heals first) → 0
         let degenerate = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 52.0) };
         assert_eq!(compute_range_shift((90.0, 100.0), &degenerate), 0);
+    }
+
+    fn hz(midi: f32) -> f32 {
+        440.0 * 2f32.powf((midi - 69.0) / 12.0)
+    }
+
+    #[test]
+    fn piece_optimizer_counts_the_climax_mass() {
+        // the S60d2 field case shape: 96% of frames at 67, 4% climax at 75 — a p98-bounds
+        // decision ignored the climax entirely; the optimizer must land it under the
+        // margined ceiling (70-2=68): 75-7=68 ⇒ exactly -7, no more (|shift| penalty)
+        let r = SpeakerRange { usable: (42.0, 70.0), comfort: (42.0, 70.0) };
+        let mut f0 = vec![hz(67.0); 960];
+        f0.extend(vec![hz(75.0); 40]);
+        assert_eq!(piece_range_shift(&f0, &r), -7);
+    }
+
+    #[test]
+    fn piece_optimizer_ignores_isolated_spikes_and_proven_zone() {
+        let r = SpeakerRange { usable: (42.0, 70.0), comfort: (42.0, 70.0) };
+        // 3 spike frames at 90 can't justify dragging 1000 frames below the floor → 0
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(90.0); 3]);
+        assert_eq!(piece_range_shift(&f0, &r), 0);
+        // entirely inside usable → untouched (tiers 1/2 preserved, byte-identical path)
+        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], &r), 0);
+    }
+
+    #[test]
+    fn piece_optimizer_shifts_low_material_up() {
+        let r = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 79.0) };
+        let f0: Vec<f32> = (0..500).map(|i| hz(30.0 + (i % 11) as f32)).collect();
+        // lowest frames at 30 must clear c_lo 52 → +22; the |shift| penalty stops there
+        assert_eq!(piece_range_shift(&f0, &r), 22);
     }
 
     #[test]
