@@ -63,10 +63,13 @@ foreach ($f in @("training\utai_train\runner.py", "training\utai_train\rvc", "tr
 $pyc = (Get-ChildItem (Join-Path $InstallDir "training") -Recurse -Directory -Filter __pycache__ -ErrorAction SilentlyContinue | Measure-Object).Count
 Check "no __pycache__ shipped" ($pyc -eq 0) "$pyc dirs"
 
-# 8. LICENSE next to nothing required, but nothing that must NOT ship:
-foreach ($bad in @("data\models", "converter\.venv", "training\.venv", "training\packs", "data\dictionaries\sources")) {
+# 8. Nothing that must NOT ship. data\models is special: the APP creates it (empty) at first run,
+# so on a used install only FILES inside it indicate accidentally-bundled payload.
+foreach ($bad in @("converter\.venv", "training\.venv", "training\packs", "data\dictionaries\sources")) {
   Check "absent: $bad" (-not (Test-Path (Join-Path $InstallDir $bad)))
 }
+$modelFiles = (Get-ChildItem (Join-Path $InstallDir "data\models") -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
+Check "no bundled model payload in data\models" ($modelFiles -eq 0) "$modelFiles files"
 
 # 9. portability: no absolute paths baked into any bundled text config the app reads at startup
 $cfg = Join-Path $InstallDir "config.json"
