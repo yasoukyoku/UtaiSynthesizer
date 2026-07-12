@@ -465,5 +465,8 @@
       "dictMissing": "Pronunciation dictionary missing ({{file}}) — check that data/dictionaries is intact",
       "moreFailures": "More vocal tracks failed to render (repeats omitted)"
     }
+  },
+  "transport": {
+    "preparing": "Loading audio…"
   }
 }

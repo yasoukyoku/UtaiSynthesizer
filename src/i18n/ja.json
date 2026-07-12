@@ -465,5 +465,8 @@
       "dictMissing": "発音辞書がありません（{{file}}）——data/dictionaries フォルダを確認してください",
       "moreFailures": "他の人声トラックも合成に失敗しました（重複通知は省略）"
     }
+  },
+  "transport": {
+    "preparing": "オーディオを読み込み中…"
   }
 }

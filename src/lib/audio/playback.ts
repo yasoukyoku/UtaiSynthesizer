@@ -144,6 +144,46 @@ export async function loadAudioBuffer(filePath: string): Promise<AudioBuffer> {
   }
 }
 
+/** S60-3: pre-warm every (stretch artifact, decoded buffer) the schedule might touch, in PARALLEL,
+ *  before the sequential scheduling loop. `ensureStretched` and `loadAudioBuffer` are both
+ *  promise-deduped, so the loop's own awaits then hit warm caches (≈instant) while the loop's
+ *  order-dependent invariants (generation checks / liveMix reads / crossfade neighbor pairing /
+ *  late compensation against one `now`) stay UNTOUCHED — this is strictly a cache warmer (the S59
+ *  落轨四刀 deliberately left the scheduling loop alone; the warmer honors that). It mirrors the
+ *  loop's source selection as a SUPERSET (a decoded-but-unscheduled buffer is harmless); failures
+ *  are swallowed here — the loop's own error handling reports them per source. */
+function prewarmScheduleSources(
+  tracks: Track[],
+  audioFiles: Record<string, AudioTrackData>,
+  gen: number,
+): Promise<unknown> {
+  const jobs: Promise<void>[] = [];
+  const warm = (path: string, r: number) => {
+    jobs.push(
+      (async () => {
+        const p = r !== 1 ? await ensureStretched(path, r) : path;
+        if (gen !== playGeneration) return;
+        if (!loadedBuffers.get(p)) await loadAudioBuffer(p);
+      })().catch(() => {}),
+    );
+  };
+  for (const track of tracks) {
+    for (const seg of track.segments) {
+      if (seg.loading) continue;
+      const r = segStretch(seg);
+      if (segmentPlaysLanes(track, seg)) {
+        for (const out of seg.processedOutputs ?? []) {
+          if (!out.loading && out.audioPath) warm(out.audioPath, r);
+        }
+      } else if (seg.content.type === "audioClip") {
+        const meta = audioFiles[seg.content.sourcePath];
+        if (meta) warm(meta.playbackPath || seg.content.sourcePath, r);
+      }
+    }
+  }
+  return Promise.all(jobs);
+}
+
 export async function playAllTracks(
   tracks: Track[],
   audioFiles: Record<string, AudioTrackData>,
@@ -153,6 +193,13 @@ export async function playAllTracks(
 ): Promise<"started" | "empty" | "superseded"> {
   stopPlayback();
   const gen = ++playGeneration;
+
+  // Parallel cache warm-up BEFORE the AudioContext timing anchor is taken: N stems decode
+  // concurrently instead of serially inside the loop (the "press Play → frozen for seconds"
+  // first-play cliff), AND `now` is captured after the heavy lifting so the late-compensation
+  // path sees near-zero lateness.
+  await prewarmScheduleSources(tracks, audioFiles, gen);
+  if (gen !== playGeneration) return "superseded";
 
   const ctx = getContext();
   const now = ctx.currentTime;

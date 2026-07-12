@@ -15,6 +15,11 @@ interface AudioState {
    *  "加载中…" indicator for both a fresh import and an opened project whose peaks are still loading. */
   loadingPaths: string[];
   isPlaying: boolean;
+  /** S60-3: play was REQUESTED but the schedule isn't sounding yet (auto-render + stretch
+   *  regeneration + buffer decode). Drives the Play button's "preparing" look — the first
+   *  play of a big project used to sit in this window for seconds with ZERO feedback,
+   *  which reads as a hang (§user: never let the app look frozen). */
+  preparing: boolean;
   /** True while the user is dragging the playhead during playback (suppresses the rAF
    *  auto-advance so the drag isn't clobbered; on release playback reschedules). */
   seeking: boolean;
@@ -25,6 +30,7 @@ interface AudioState {
 
   loadAudioFile: (filePath: string) => Promise<AudioTrackData>;
   setPlaying: (playing: boolean) => void;
+  setPreparing: (preparing: boolean) => void;
   setSeeking: (seeking: boolean) => void;
   bumpSchedule: () => void;
 }
@@ -33,6 +39,7 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   audioFiles: {},
   loadingPaths: [],
   isPlaying: false,
+  preparing: false,
   seeking: false,
   scheduleVersion: 0,
 
@@ -73,6 +80,7 @@ export const useAudioStore = create<AudioState>((set, get) => ({
   },
 
   setPlaying: (playing) => set({ isPlaying: playing }),
+  setPreparing: (preparing) => set({ preparing }),
   setSeeking: (seeking) => set({ seeking }),
   bumpSchedule: () => set((s) => ({ scheduleVersion: s.scheduleVersion + 1 })),
 }));

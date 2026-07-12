@@ -26,7 +26,7 @@ export function Toolbar() {
   const { tempo, setTempo, playheadTick, setPlayhead, timeSignature, setTimeSignature } =
     useProjectStore();
   const timeAxis = useTimeAxis();
-  const { isPlaying, setPlaying, seeking, scheduleVersion } = useAudioStore();
+  const { isPlaying, setPlaying, seeking, scheduleVersion, preparing } = useAudioStore();
   const { selectedSegment, clearSelection, snapSegments, snapPlayhead, toggleSnapSegments, toggleSnapPlayhead } = useAppStore();
   const { deleteSegments } = useProjectStore();
   const animRef = useRef<number>(0);
@@ -198,6 +198,10 @@ export function Toolbar() {
 
     if (playPendingRef.current) return;
     playPendingRef.current = true;
+    // S60-3: visible "preparing" state for the whole request→sound window (auto-render +
+    // stretch regeneration + buffer decode) — the first play of a big project sat here for
+    // seconds with zero feedback, reading as a hang (§user).
+    useAudioStore.getState().setPreparing(true);
 
     try {
       // Bake vocal tracks whose notes/params CHANGED since their last render (skip unchanged — the v1
@@ -247,6 +251,7 @@ export function Toolbar() {
       }
     } finally {
       playPendingRef.current = false;
+      useAudioStore.getState().setPreparing(false);
     }
   };
 
@@ -368,9 +373,9 @@ export function Toolbar() {
           <span className="transport-icon icon-return" />
         </button>
         <button
-          className={`transport-btn play ${isPlaying ? "playing" : ""} ${autoRendering ? "rendering" : ""}`}
+          className={`transport-btn play ${isPlaying ? "playing" : ""} ${autoRendering ? "rendering" : ""} ${preparing && !autoRendering ? "preparing" : ""}`}
           onClick={handleTogglePlay}
-          title={autoRendering ? t("vocalEditor.render.autoRenderingCancel") : undefined}
+          title={autoRendering ? t("vocalEditor.render.autoRenderingCancel") : preparing ? t("transport.preparing") : undefined}
         >
           {isPlaying
             ? <span className="transport-icon icon-pause" />

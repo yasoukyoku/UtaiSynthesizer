@@ -465,5 +465,8 @@
       "dictMissing": "缺少发音词典（{{file}}）——请检查 data/dictionaries 目录是否完整",
       "moreFailures": "还有更多人声轨渲染失败（已省略重复提示）"
     }
+  },
+  "transport": {
+    "preparing": "正在加载音频…"
   }
 }
