@@ -65,9 +65,12 @@ Write-Host "gate: cargo test --lib" -ForegroundColor Cyan
 Push-Location src-tauri; cargo test --lib; $rc = $LASTEXITCODE; Pop-Location
 if ($rc -ne 0) { Fail "cargo test" }
 
-# ── 6. build (signed) ──
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = "$env:USERPROFILE\.tauri\utaisynthesizer.key"
-if (-not (Test-Path $env:TAURI_SIGNING_PRIVATE_KEY_PATH)) { Fail "signing key missing (see memory: reference_release_signing_and_publishing)" }
+# ── 6. build (signed) ── (the CLI wants TAURI_SIGNING_PRIVATE_KEY — content works everywhere,
+# the *_PATH variant was not honored by tauri CLI 2.x in practice)
+$keyPath = "$env:USERPROFILE\.tauri\utaisynthesizer.key"
+if (-not (Test-Path $keyPath)) { Fail "signing key missing (see memory: reference_release_signing_and_publishing)" }
+$env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyPath -Raw)
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
 Write-Host "building v$confVer ..." -ForegroundColor Cyan
 npm run tauri build; if ($LASTEXITCODE -ne 0) { Fail "tauri build" }
 
@@ -96,7 +99,8 @@ Write-Host "       $latestPath" -ForegroundColor Green
 # ── 8. publish (opt-in; the release must be a REAL release — prerelease/draft never becomes `latest`) ──
 if ($Publish) {
   Write-Host "publishing v$confVer to GitHub Releases..." -ForegroundColor Cyan
-  gh release create "v$confVer" $setup $latestPath --title "UtaiSynthesizer v$confVer" --notes ($Notes ? $Notes : "UtaiSynthesizer v$confVer")
+  $relNotes = if ($Notes) { $Notes } else { "UtaiSynthesizer v$confVer" }
+  gh release create "v$confVer" $setup $latestPath --title "UtaiSynthesizer v$confVer" --notes $relNotes
   if ($LASTEXITCODE -ne 0) { Fail "gh release create" }
   Write-Host "published: https://github.com/yasoukyoku/UtaiSynthesizer/releases/tag/v$confVer" -ForegroundColor Green
 }
