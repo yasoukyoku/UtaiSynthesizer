@@ -679,6 +679,20 @@
   color: var(--text-muted);
   font-family: var(--font-mono);
   margin-top: 2px;
+  /* S60d3 chips can exceed the card width — wrap BETWEEN segments (segments are
+     atomic, see .rm-range-text below), never mid-text */
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+/* atomic row segments: the range/comfort text and caution chips never break internally;
+   pathological widths ellipsize (values repeat in the title tooltip). NO overflow rule
+   on .rm-range-edit — it would clip slider handles (S59c lesson). */
+.rm-range-text,
+.rm-range-caution {
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rm-range-testing {
   color: var(--accent-primary);

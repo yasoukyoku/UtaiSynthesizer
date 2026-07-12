@@ -1083,6 +1083,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
   return (
     <span className="rm-range-row">
       <span
+        className="rm-range-text"
         title={t18({
           zh: `可用（<100¢ 且浊音>50%）${midiName(sp.usable[0])}–${midiName(sp.usable[1])}；舒适（<50¢ 且浊音>80%）为渲染的目标区间`,
           en: `Usable (<100¢, voiced>50%) ${midiName(sp.usable[0])}–${midiName(sp.usable[1])}; comfort (<50¢, voiced>80%) is the render target zone`,
@@ -1096,11 +1097,11 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
       {caution!.artifact.length > 0 && (
         <span
           className="rm-range-caution"
-          title={t18({
+          title={`${caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")} — ${t18({
             zh: "模型在这些音高会发声但明显走音（中位误差≥200¢）——模型自身的伪影区，不是程序或算法问题；此区间谨慎使用",
-            en: "The model voices these pitches but lands ≥200¢ off — model-side artifact zones, not a program/algorithm issue; use with caution",
+            en: "the model voices these pitches but lands ≥200¢ off — model-side artifact zones, not a program/algorithm issue; use with caution",
             ja: "モデルはこの音高で発声しますが大きく音を外します（中央誤差≥200¢）——モデル自体のアーティファクト域です。プログラムの問題ではありません",
-          }, lang)}
+          }, lang)}`}
         >
           {t18({ zh: "伪影", en: "artifacts", ja: "偽影" }, lang)}{" "}
           {caution!.artifact.map(([a, b]) => `${midiName(a)}–${midiName(b)}`).join(", ")}
@@ -1109,11 +1110,11 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
       {caution!.weak.length > 0 && (
         <span
           className="rm-range-caution"
-          title={t18({
+          title={`${caution!.weak.map((n) => midiName(n)).join(", ")} — ${t18({
             zh: "可用区内部的孤立弱音（测试未达标、推导范围时被桥接跳过）——这些音上出怪声属模型自身问题，谨慎使用",
-            en: "Isolated weak notes inside the usable range (failed the probe, bridged over when deriving) — oddities at these pitches are the model's own; use with caution",
+            en: "isolated weak notes inside the usable range (failed the probe, bridged over when deriving) — oddities at these pitches are the model's own; use with caution",
             ja: "使用可能域内の孤立した弱点（測定不合格・範囲導出時にブリッジ）——この音高での異音はモデル由来です",
-          }, lang)}
+          }, lang)}`}
         >
           {t18({ zh: "弱点", en: "weak", ja: "弱点" }, lang)}{" "}
           {caution!.weak.slice(0, 3).map((n) => midiName(n)).join(", ")}
