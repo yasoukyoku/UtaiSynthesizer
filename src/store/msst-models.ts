@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type MsstCatalogEntry, type MsstPrecision } from "../lib/models/msst-catalog";
+import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type GhMirror, DEFAULT_GH_MIRROR, applyGhMirror, type MsstCatalogEntry, type MsstPrecision } from "../lib/models/msst-catalog";
 import { loadSetting, saveSetting } from "../lib/settings";
 
 export interface InstalledModel {
@@ -35,6 +35,7 @@ interface MsstModelStore {
   downloading: Record<string, DownloadState>;
   error: string | null;
   mirror: MirrorSource;
+  ghMirror: GhMirror;
 
   fetchInstalled: () => Promise<void>;
   fetchModelsDir: () => Promise<void>;
@@ -45,6 +46,7 @@ interface MsstModelStore {
   importLocal: (path: string) => Promise<void>;
   clearError: () => void;
   setMirror: (mirror: MirrorSource) => void;
+  setGhMirror: (ghMirror: GhMirror) => void;
   updateDownloadProgress: (filename: string, downloaded: number, total: number, stage?: string) => void;
   removeDownload: (filename: string) => void;
 }
@@ -55,6 +57,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   downloading: {},
   error: null,
   mirror: loadSetting<MirrorSource>("utai.mirror", DEFAULT_MIRROR),
+  ghMirror: loadSetting<GhMirror>("utai.ghMirror", DEFAULT_GH_MIRROR),
 
   fetchInstalled: async () => {
     try {
@@ -75,21 +78,24 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   },
 
   downloadEntry: async (entry, precision) => {
-    const mirror = get().mirror;
+    const { mirror, ghMirror } = get();
+    // Both rewrites chained in a fixed order — each only touches its own host family
+    // (HF → huggingface.co, GH → github.com/*.githubusercontent.com), so they never
+    // interfere with each other or with non-mirrored hosts (e.g. dl.fbaipublicfiles.com).
     // The original yaml must land BEFORE the ckpt and be named <ckpt stem>.yaml:
     // the ckpt download auto-converts on completion, and the converter reads the SIBLING
     // yaml (chunk/overlap, stem labels). The URL basename can differ from the ckpt name
     // (e.g. config_melbandroformer_inst_v2.yaml), so always rename to the ckpt stem.
     if (entry.configUrl) {
       try {
-        const cfgUrl = applyMirror(entry.configUrl, mirror);
+        const cfgUrl = applyGhMirror(applyMirror(entry.configUrl, mirror), ghMirror);
         const stem = entry.filename.replace(/\.[^.]+$/, "");
         await get().downloadUrl(cfgUrl, `${stem}.yaml`);
       } catch {
         // config download failure is non-fatal
       }
     }
-    const url = applyMirror(entry.downloadUrl, mirror);
+    const url = applyGhMirror(applyMirror(entry.downloadUrl, mirror), ghMirror);
     // precision/architecture only apply to the MODEL download (auto-convert target), never the
     // yaml sidecar. Passing the catalog architecture matters for hash-named official weights
     // (e.g. demucs 5c90dfd2-34c22ccb.th) that Rust's name detection cannot classify.
@@ -162,6 +168,8 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   clearError: () => set({ error: null }),
 
   setMirror: (mirror) => { saveSetting("utai.mirror", mirror); set({ mirror }); },
+
+  setGhMirror: (ghMirror) => { saveSetting("utai.ghMirror", ghMirror); set({ ghMirror }); },
 
   updateDownloadProgress: (filename, downloaded, total, stage) =>
     set((s) => ({

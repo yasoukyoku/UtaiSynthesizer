@@ -114,6 +114,18 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   ENVTEST_SPAWN_FAILED: { key: "backend.ENVTEST_SPAWN_FAILED" },
   ENVTEST_TIMEOUT: { key: "backend.ENVTEST_TIMEOUT" },
   ENVTEST_WAIT_FAILED: { key: "backend.ENVTEST_WAIT_FAILED" },
+  // S63 audio/score export (commands/export_audio.rs + export_score.rs). Longest-code-first matching
+  // keeps EXPORT_FFMPEG_MISSING ahead of the training-side FFMPEG_MISSING, and EXPORT_SCORE_WRITE_FAIL
+  // ahead of EXPORT_WRITE_FAIL. The score codes reuse the export.* dialog keys (one text, two funnels).
+  EXPORT_BAD_PCM: { key: "backend.EXPORT_BAD_PCM" },
+  EXPORT_ENCODE_FAIL: { key: "backend.EXPORT_ENCODE_FAIL" },
+  EXPORT_FFMPEG_MISSING: { key: "backend.EXPORT_FFMPEG_MISSING" },
+  EXPORT_FORMAT_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
+  EXPORT_NO_PCM: { key: "backend.EXPORT_NO_PCM" },
+  EXPORT_SCORE_EMPTY: { key: "export.errScoreEmpty" },
+  EXPORT_SCORE_UNSUPPORTED: { key: "backend.EXPORT_FORMAT_UNSUPPORTED" },
+  EXPORT_SCORE_WRITE_FAIL: { key: "export.errScoreWrite" },
+  EXPORT_WRITE_FAIL: { key: "backend.EXPORT_WRITE_FAIL" },
   EXTRACT_FAILED: { key: "backend.EXTRACT_FAILED" },
   EXTRACT_TASK_FAILED: { key: "backend.EXTRACT_TASK_FAILED" },
   F0_EMPTY_INPUT: { key: "backend.F0_EMPTY_INPUT" },

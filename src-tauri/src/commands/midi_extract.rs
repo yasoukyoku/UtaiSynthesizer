@@ -189,9 +189,13 @@ pub async fn extract_midi_from_audio(
 
 const GAME_ZIP_SHA256: &str = "5b7a21e64c6310efac399f5d12838fffa70565be162436b5a4a65f290721e7d8";
 const GAME_ZIP_SIZE: u64 = 179_775_226;
-const GAME_SOURCES: [&str; 2] = [
+const GAME_SOURCES: [&str; 3] = [
     "https://github.com/openvpi/GAME/releases/download/v1.0.3/GAME-1.0.3-medium-onnx.zip",
     "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/game/GAME-1.0.3-medium-onnx.zip",
+    // Static 3rd mirror: the HF fallback re-hosted on hf-mirror.com — part of the fixed
+    // rotation list, independent of the frontend HF-mirror setting (sha256 verification
+    // below makes ANY source content-safe).
+    "https://hf-mirror.com/datasets/yasoukyoku/utai-runtimes/resolve/main/game/GAME-1.0.3-medium-onnx.zip",
 ];
 
 /// Single-flight for the download (audit S60: the manager tab's `busy` is component-local
@@ -254,6 +258,9 @@ fn extract_game_zip(zip_path: &Path, aux_dir: &Path) -> Result<(), String> {
 pub async fn download_game_package(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
+    // GH-proxy prefix from the Settings "GitHub mirror" choice (frontend `ghProxy`);
+    // None/blank = direct. Prefix-style: `<prefix>/<full URL>`.
+    gh_proxy: Option<String>,
 ) -> Result<MidiExtractStatus, String> {
     if GAME_DL_ACTIVE.swap(true, Ordering::SeqCst) {
         return Err("GAME_DL_BUSY".to_string());
@@ -270,8 +277,18 @@ pub async fn download_game_package(
     // mirror rotation + sha256 verification (the hand-rolled loop this replaced had none
     // of those — audit S60 MAJOR; the S42 audit already adjudicated the black-holing case)
     let client = crate::download::client().map_err(|e| format!("GAME_DL_FAILED: {e}"))?;
+    // An explicitly chosen GH proxy goes FIRST (the user selected it because the direct
+    // route is bad), followed by the untouched static rotation; sha256 covers any source.
+    let mut urls: Vec<String> = GAME_SOURCES.iter().map(|s| s.to_string()).collect();
+    if let Some(prefix) = gh_proxy
+        .as_deref()
+        .map(|p| p.trim().trim_end_matches('/'))
+        .filter(|p| !p.is_empty())
+    {
+        urls.insert(0, format!("{prefix}/{}", GAME_SOURCES[0]));
+    }
     let req = crate::download::DownloadRequest {
-        urls: GAME_SOURCES.iter().map(|s| s.to_string()).collect(),
+        urls,
         dest: zip_path.clone(),
         sha256: Some(GAME_ZIP_SHA256.to_string()),
         expected_size: Some(GAME_ZIP_SIZE),

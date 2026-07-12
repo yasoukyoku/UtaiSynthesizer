@@ -7,7 +7,10 @@ import { useTranslation } from "react-i18next";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs } from "../../lib/project/projectFile";
 import { importScoreFile } from "../../lib/vocal/import";
+import { scoreExportableTracks } from "../../lib/vocal/exportScore";
 import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
+import { ExportAudioDialog } from "./ExportAudioDialog";
+import { ExportScoreDialog } from "./ExportScoreDialog";
 import "./Titlebar.css";
 
 export function Titlebar() {
@@ -21,6 +24,8 @@ export function Titlebar() {
   // modal-local stack while open, else the timeline) without a live subscription.
   const [editMenu, setEditMenu] = useState<{ x: number; y: number } | null>(null);
   const [fileMenu, setFileMenu] = useState<{ x: number; y: number } | null>(null);
+  const [exportAudioOpen, setExportAudioOpen] = useState(false);
+  const [exportScoreOpen, setExportScoreOpen] = useState(false);
 
   const isTraining = trainingState === "running" || trainingState === "starting";
 
@@ -30,6 +35,15 @@ export function Titlebar() {
     { label: t("menu.save"), shortcut: "Ctrl+S", disabled: trackCount === 0, onClick: () => void saveProjectFile() },
     { label: t("menu.saveAs"), shortcut: "Ctrl+Shift+S", disabled: trackCount === 0, onClick: () => void saveProjectFileAs() },
     { label: t("menu.import"), onClick: () => void importScoreFile() },
+    // S63 export entries. Enablement is read lazily on menu open (the same pattern as the clipboard
+    // items below): audio needs any track at all, score needs ≥1 vocal track with notes — via THE
+    // same predicate the dialog lists tracks with (scoreExportableTracks), so they can't disagree.
+    { label: t("menu.exportAudio"), disabled: trackCount === 0, onClick: () => setExportAudioOpen(true) },
+    {
+      label: t("menu.exportScore"),
+      disabled: scoreExportableTracks(useProjectStore.getState().tracks).length === 0,
+      onClick: () => setExportScoreOpen(true),
+    },
   ];
 
   // Clipboard entries act on the ARRANGEMENT selection (the vocal editor owns note copy/paste via its
@@ -127,6 +141,8 @@ export function Titlebar() {
       {editMenu && (
         <ContextMenu x={editMenu.x} y={editMenu.y} items={editItems} onClose={() => setEditMenu(null)} />
       )}
+      {exportAudioOpen && <ExportAudioDialog onClose={() => setExportAudioOpen(false)} />}
+      {exportScoreOpen && <ExportScoreDialog onClose={() => setExportScoreOpen(false)} />}
     </header>
   );
 }

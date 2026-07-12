@@ -188,6 +188,12 @@ function prewarmScheduleSources(
   return Promise.all(jobs);
 }
 
+// ⚠ MIXDOWN PARITY ANCHOR (S63 audio export): exportMixdown.ts re-builds this exact schedule on an
+// OfflineAudioContext (playhead=0, snapshot mix, no live machinery). The FORMULA helpers are shared
+// (dbToLinear / clampPan / loudnessEnvNode / applyFadeIn / applyFadeOut + the laneOps/trackLayout
+// predicates), but the LOOP STRUCTURE exists in both files — any change to scheduling semantics here
+// (source selection, piece math, gain chain, crossfade gating) MUST be mirrored in exportMixdown.ts,
+// or the export stops matching what the user hears.
 export async function playAllTracks(
   tracks: Track[],
   audioFiles: Record<string, AudioTrackData>,
@@ -630,14 +636,14 @@ export function durationMsToTicks(ms: number, tempo: number): number {
   return msToTicks(ms, tempo);
 }
 
-function dbToLinear(db: number): number {
+export function dbToLinear(db: number): number {
   // The fader floor means −∞/MUTE (DAW convention: bounded up, unbounded down) — see FADER_MIN_DB.
   if (db <= FADER_MIN_DB) return 0;
   return Math.pow(10, db / 20);
 }
 
 /** StereoPannerNode.pan is [-1, 1] — the composed track+lane pan must stay in range. */
-function clampPan(p: number): number {
+export function clampPan(p: number): number {
   return Math.max(-1, Math.min(1, p));
 }
 
@@ -651,8 +657,8 @@ function clampPan(p: number): number {
  *  sounding at timeline tick playhead + ticks(startDelay) in every case — immediate, delayed
  *  piece, and late-corrected schedules alike (audit: a pre-late fromTick desynced the curve by
  *  the lateness while audioOffset WAS advanced). */
-function loudnessEnvNode(
-  ctx: AudioContext,
+export function loudnessEnvNode(
+  ctx: BaseAudioContext,
   seg: Segment,
   playheadTick: number,
   tempo: number,
@@ -691,7 +697,7 @@ function loudnessEnvNode(
 /** Linear crossfade FADE-OUT envelope on `node` for a source overlapping a LATER neighbour over
  *  [fadeStartTick, fadeEndTick]. Handles the playhead landing past / inside / before the overlap. Shared by
  *  the original-audio AND sub-lane branches so they crossfade identically (one source of truth). */
-function applyFadeOut(
+export function applyFadeOut(
   node: GainNode, fadeStartTick: number, fadeEndTick: number, playheadTick: number, tempo: number, now: number,
 ) {
   const fadeLenTicks = fadeEndTick - fadeStartTick;
@@ -711,7 +717,7 @@ function applyFadeOut(
 /** Linear crossfade FADE-IN envelope on `node` for a source overlapping an EARLIER neighbour over
  *  [segStartTick, fadeEndTick]. `startDelay` is the source's scheduled start offset (a not-yet-started
  *  source ramps from its real start). Shared by the original-audio AND sub-lane branches. */
-function applyFadeIn(
+export function applyFadeIn(
   node: GainNode, segStartTick: number, fadeEndTick: number, playheadTick: number, tempo: number, now: number, startDelay: number,
 ) {
   const fadeLenTicks = fadeEndTick - segStartTick;

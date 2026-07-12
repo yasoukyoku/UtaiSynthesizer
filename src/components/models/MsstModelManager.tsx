@@ -13,6 +13,7 @@ import {
   MSST_DEFAULT_PRECISION,
   MSST_FP16_ARCHS,
   MSST_FP16_TIP,
+  ghProxyPrefix,
   t18,
   type MsstArchitecture,
   type MsstCatalogEntry,
@@ -558,7 +559,11 @@ function GameEngineTab({ lang }: { lang: string }) {
     setBusy(true);
     setDl({ stage: "download", downloaded: 0, total: 0 });
     try {
-      const st = await invoke<{ installed: boolean }>("download_game_package");
+      // ghProxy → Rust gh_proxy: the Settings GitHub-mirror prefix (null = direct);
+      // the backend puts the proxied GH URL first in its mirror rotation.
+      const st = await invoke<{ installed: boolean }>("download_game_package", {
+        ghProxy: ghProxyPrefix(useMsstModelStore.getState().ghMirror),
+      });
       setInstalled(st.installed);
       showToast(t18({ zh: "GAME 引擎已安装", en: "GAME engine installed", ja: "GAME エンジンをインストールしました" }, lang), "success");
     } catch (e) {

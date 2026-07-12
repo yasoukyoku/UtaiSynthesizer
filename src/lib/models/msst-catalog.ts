@@ -611,3 +611,54 @@ export interface MirrorSource {
 }
 
 export const DEFAULT_MIRROR: MirrorSource = { type: "huggingface", customUrl: "" };
+
+/** GitHub direct-link mirror (mainland-China acceleration) — the GH counterpart of
+ *  `MirrorSource` above. Orthogonal axes: `applyMirror` only rewrites huggingface.co
+ *  hosts, `applyGhMirror` only prefixes github.com-family hosts, so chaining them is
+ *  always safe. */
+export interface GhMirror {
+  type: "direct" | "ghfast" | "ghproxy" | "custom";
+  customUrl: string;
+}
+
+export const DEFAULT_GH_MIRROR: GhMirror = { type: "direct", customUrl: "" };
+
+/** Proxy prefix for the selected GH mirror, or null for direct / blank custom.
+ *  The presets are community-run public services — they come and go without notice;
+ *  the custom option is the user's fallback when a preset dies. */
+export function ghProxyPrefix(gh: GhMirror): string | null {
+  if (gh.type === "ghfast") return "https://ghfast.top";
+  if (gh.type === "ghproxy") return "https://gh-proxy.com";
+  if (gh.type === "custom") {
+    // localStorage shape-tolerance (audit): a corrupt persisted value without customUrl must not
+    // throw here (it would wedge the Settings test button) — same posture as applyMirror's truthiness guard.
+    const u = (gh.customUrl ?? "").trim().replace(/\/+$/, "");
+    return u || null;
+  }
+  return null; // direct
+}
+
+/** Prefix-style proxying — the standard usage of public GH accelerators is
+ *  `<prefix>/<full original URL>`. GH release assets 302 to
+ *  objects.githubusercontent.com; the proxy follows redirects itself, so only the
+ *  INITIAL URL needs rewriting. Exact-hostname match (plus subdomain fallback) so
+ *  lookalikes such as "notgithub.com" are never touched. */
+const GH_HOSTS = new Set([
+  "github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+  "codeload.github.com",
+]);
+
+export function applyGhMirror(url: string, gh: GhMirror): string {
+  const prefix = ghProxyPrefix(gh);
+  if (!prefix) return url;
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return url;
+  }
+  const isGh = GH_HOSTS.has(host) || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com");
+  return isGh ? `${prefix}/${url}` : url;
+}

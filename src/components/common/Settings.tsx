@@ -10,7 +10,7 @@ import { useAudioStore } from "../../store/audio";
 import { useWorkflowStore } from "../../store/workflow";
 import { useTrainingStore } from "../../store/training";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { applyMirror } from "../../lib/models/msst-catalog";
+import { applyMirror, applyGhMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
@@ -106,6 +106,21 @@ interface ProbeResult {
 // tested). ~236 MB file → Range-GET of the first few MB measures real throughput.
 const PROBE_ASSET = "https://huggingface.co/datasets/yasoukyoku/utai-runtimes/resolve/main/runtime-cpu-v1.tar.zst";
 
+// GH-mirror probe target — the GAME zip's GitHub release URL, same asset as Rust
+// GAME_SOURCES[0] (src-tauri/src/commands/midi_extract.rs). 179 MB real asset; the
+// probe only Range-GETs the first ~4 MB.
+const GH_PROBE_ASSET = "https://github.com/openvpi/GAME/releases/download/v1.0.3/GAME-1.0.3-medium-onnx.zip";
+
+/** Run the backend throughput probe against `url`, funneling invoke failures into a
+ *  ProbeResult row — ONE funnel shared by the HF and GH source tests. */
+async function runSrcProbe(url: string): Promise<ProbeResult> {
+  try {
+    return await invoke<ProbeResult>("test_download_source", { url });
+  } catch (e) {
+    return { reachable: false, verdict: "unreachable", mbps: 0, ttfb_ms: 0, bytes: 0, error: String(e) };
+  }
+}
+
 const fmtGB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
 /** Sub-MB friendly size (the report has KB-scale rows like logs/dictionaries). */
 const fmtSize = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
@@ -176,21 +191,30 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const handleSrcTest = useCallback(async () => {
     setSrcTesting(true);
     setSrcTest(null);
-    try {
-      // test the SELECTED source's host by pulling a few real MB through it — a
-      // ping/HEAD would pass the GFW's small-packet allowance and false-positive.
-      const url = applyMirror(PROBE_ASSET, mirror);
-      setSrcTest(await invoke<ProbeResult>("test_download_source", { url }));
-    } catch (e) {
-      setSrcTest({ reachable: false, verdict: "unreachable", mbps: 0, ttfb_ms: 0, bytes: 0, error: String(e) });
-    } finally {
-      setSrcTesting(false);
-    }
+    // test the SELECTED source's host by pulling a few real MB through it — a
+    // ping/HEAD would pass the GFW's small-packet allowance and false-positive.
+    setSrcTest(await runSrcProbe(applyMirror(PROBE_ASSET, mirror)));
+    setSrcTesting(false);
   }, [mirror]);
   // a stale verdict must not linger next to a different, untested source
   useEffect(() => {
     setSrcTest(null);
   }, [mirror.type, mirror.customUrl]);
+  // GitHub mirror — its own selection + probe state, fully independent of the HF
+  // test above so the two verdicts can never cross-talk.
+  const ghMirror = useMsstModelStore((s) => s.ghMirror);
+  const setGhMirror = useMsstModelStore((s) => s.setGhMirror);
+  const [ghSrcTest, setGhSrcTest] = useState<ProbeResult | null>(null);
+  const [ghSrcTesting, setGhSrcTesting] = useState(false);
+  const handleGhSrcTest = useCallback(async () => {
+    setGhSrcTesting(true);
+    setGhSrcTest(null);
+    setGhSrcTest(await runSrcProbe(applyGhMirror(GH_PROBE_ASSET, ghMirror)));
+    setGhSrcTesting(false);
+  }, [ghMirror]);
+  useEffect(() => {
+    setGhSrcTest(null);
+  }, [ghMirror.type, ghMirror.customUrl]);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
   const [device, setDevice] = useState("auto");
   const [saving, setSaving] = useState(false);
@@ -616,6 +640,11 @@ export function Settings({ onClose }: { onClose: () => void }) {
       srcThrottled: { zh: "疑似被限速 / 干扰（大文件可能失败）", en: "Throttled / interfered (large downloads may fail)", ja: "スロットリング / 妨害の疑い（大容量は失敗する可能性）" },
       srcUnreachable: { zh: "不通", en: "Unreachable", ja: "接続不可" },
       srcHttpErr: { zh: "源拒绝 / 无测试文件", en: "Rejected / no test file", ja: "拒否 / テストファイルなし" },
+      // GitHub-mirror sub-block (the two preset options show their domain literally —
+      // not translated; the custom option reuses srcCustom, same label ONE source).
+      ghSrcTitle: { zh: "GitHub 镜像", en: "GitHub Mirror", ja: "GitHub ミラー" },
+      ghDirect: { zh: "官方直连", en: "Direct", ja: "直接接続" },
+      ghNote: { zh: "作用于 GitHub 直链下载（分离模型、MIDI 引擎等）。加速代理为社区公共服务，随时可能失效；不可用时请填自定义前缀。", en: "Applies to direct GitHub downloads (separation models, MIDI engine, …). The preset proxies are community-run public services and may vanish; enter a custom prefix if they stop working.", ja: "GitHub 直リンクのダウンロード（分離モデル、MIDI エンジンなど）に適用されます。プリセットのプロキシはコミュニティ運営の公共サービスで、突然使えなくなることがあります。その場合はカスタムプレフィックスを入力してください。" },
     };
     return map[key]?.[lang] ?? map[key]?.en ?? key;
   };
@@ -872,6 +901,44 @@ export function Settings({ onClose }: { onClose: () => void }) {
             )}
           </div>
           <p className="settings-note">{L("srcNote")}</p>
+
+          {/* GitHub direct-link mirror — a separate axis from the HF mirror above
+              (the HF rewrite touches only huggingface.co, the GH proxy prefixes only
+              github.com-family hosts; download URLs chain both, see msst-models.ts). */}
+          <div className="settings-field" style={{ marginTop: 4 }}>
+            <label>{L("ghSrcTitle")}</label>
+            <div className="settings-source">
+              {(["direct", "ghfast", "ghproxy", "custom"] as const).map((t) => (
+                <label key={t} className={`settings-source-opt ${ghMirror.type === t ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="ghsource"
+                    checked={ghMirror.type === t}
+                    onChange={() => setGhMirror({ type: t, customUrl: ghMirror.customUrl })}
+                  />
+                  <span>{t === "direct" ? L("ghDirect") : t === "ghfast" ? "ghfast.top" : t === "ghproxy" ? "gh-proxy.com" : L("srcCustom")}</span>
+                </label>
+              ))}
+              {ghMirror.type === "custom" && (
+                <input
+                  type="text"
+                  className="settings-source-url"
+                  placeholder="https://your-gh-proxy.com"
+                  value={ghMirror.customUrl}
+                  onChange={(e) => setGhMirror({ type: "custom", customUrl: e.target.value })}
+                />
+              )}
+            </div>
+          </div>
+          <div className="settings-source-test">
+            <button className="settings-mini-btn" disabled={ghSrcTesting} onClick={handleGhSrcTest}>
+              {ghSrcTesting ? L("srcTesting") : L("srcTest")}
+            </button>
+            {ghSrcTest && (
+              <span className={`settings-source-result ${ghSrcTest.verdict}`}>{srcTestLabel(ghSrcTest)}</span>
+            )}
+          </div>
+          <p className="settings-note">{L("ghNote")}</p>
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>

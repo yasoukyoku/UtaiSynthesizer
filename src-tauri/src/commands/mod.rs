@@ -1,5 +1,7 @@
 pub mod audio;
 pub mod audition;
+pub mod export_audio;
+pub mod export_score;
 pub mod import;
 pub mod inference;
 pub mod logs;
