@@ -44,7 +44,7 @@ pub struct ImportOutcome {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelType {
     Rvc,
     SoVits,
@@ -732,6 +732,45 @@ impl ModelRegistry {
         entry.diffusion_path = Some(final_dir.clone());
         tracing::info!("attached diffusion assets for {}: {}", name, final_dir.display());
         Ok(final_dir)
+    }
+
+    /// S60-2: write ONE extra key into a model's sidecar json (raw-map update — unknown keys
+    /// are preserved verbatim, the finalize_sidecar discipline: never round-trip through the
+    /// typed struct) and refresh the in-memory entry so `list_models` exposes it without a
+    /// rescan. Type-scoped lookup (S40 red-team A5). The sidecar on disk is the single source
+    /// of truth — a REPLACE re-import deletes it, which is the intended "record lost → 补做
+    /// button" path for the vocal_range record.
+    pub fn set_config_extra_key(
+        &self,
+        name: &str,
+        model_type: &ModelType,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        self.ensure_scanned();
+        let mut entries = self.entries.write();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.name == name && &e.model_type == model_type)
+            .ok_or_else(|| crate::UtaiError::Model(format!("Model '{}' not found", name)))?;
+        let json_path = entry.path.with_extension("json");
+        let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&json_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        map.insert(key.to_string(), value.clone());
+        std::fs::write(
+            &json_path,
+            serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                .map_err(|e| crate::UtaiError::Model(format!("sidecar serialize: {e}")))?,
+        )?;
+        if let serde_json::Value::Object(extra) = &mut entry.config.extra {
+            extra.insert(key.to_string(), value);
+        } else {
+            entry.config.extra = serde_json::json!({ key: value });
+        }
+        tracing::info!("Sidecar '{}' updated: {} written", json_path.display(), key);
+        Ok(())
     }
 
     pub fn set_avatar(&self, name: &str, avatar_file: &Path) -> Result<Option<PathBuf>> {

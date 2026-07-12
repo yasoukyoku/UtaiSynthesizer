@@ -35,6 +35,12 @@
     "errLoad": "音频读取失败",
     "errFailed": "MIDI 提取失败"
   },
+  "rangeTest": {
+    "busy": "当前有渲染/试听占用，稍后再测音域",
+    "noUsable": "音域测试未找到可用音区——模型可能欠训练",
+    "done": "音域测试完成，舒适区",
+    "failed": "音域测试失败"
+  },
   "menu": {
     "file": "文件",
     "edit": "编辑",
@@ -439,7 +445,9 @@
       "vib_phase": "相位",
       "vib_startMs": "起振",
       "vib_easeInMs": "淡入",
-      "vib_easeOutMs": "淡出"
+      "vib_easeOutMs": "淡出",
+      "rangeExtend": "音域扩展",
+      "rangeExtendTip": "超出歌手舒适区的乐句先移调到舒适区渲染，再在音频域移回（需先在资源管理器测过音域；区间内渲染完全不受影响）"
     },
     "render": {
       "render": "渲染人声",

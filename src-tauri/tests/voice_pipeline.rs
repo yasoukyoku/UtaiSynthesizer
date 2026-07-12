@@ -189,7 +189,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, &|_p| {}, &|| false)
+            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &|_p| {}, &|| false)
                 .expect("rvc pipeline")
         }
         "sovits" => {
@@ -301,7 +301,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, &|_p| {}, &|| false)
+            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, None, &|_p| {}, &|| false)
                 .expect("sovits pipeline")
         }
         other => panic!("UTAI_VOICE_KIND must be rvc|sovits (got {})", other),

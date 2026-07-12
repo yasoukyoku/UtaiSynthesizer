@@ -45,6 +45,10 @@ export interface RvcOptions {
   /** ①c speaker blend — non-empty ONLY for a genuine multi-speaker RVC export (α′, ONNX
    * "spk_mix" input). Empty = use speaker_id (single-speaker / pre-①c: byte-identical). */
   spk_mix: SpkMixEntry[];
+  /** S60-2 音域扩展 (cover): out-of-comfort chunks render translated into the model's tested
+   * comfort zone and are TD-PSOLA'd back. No-op without a sidecar vocal_range record; in-range
+   * chunks are byte-identical either way. New nodes default ON; absent key (old graphs) = off. */
+  range_extend: boolean;
   /** KNN index feature blend, 0..1. */
   index_ratio: number;
   /** Voiceless-consonant/breath protection, 0..0.5 — 0.5 means OFF. */
@@ -73,6 +77,8 @@ export interface SovitsOptions {
   /** ①c speaker blend — a stack of {id, weight} rows. Non-empty ONLY for a genuine
    * multi-speaker export (ONNX "spk_mix" input). Empty = use speaker_id (byte-identical). */
   spk_mix: SpkMixEntry[];
+  /** S60-2 音域扩展 (cover) — see RvcOptions.range_extend. */
+  range_extend: boolean;
   /** Synthesis randomness, 0..1. */
   noise_scale: number;
   /** Cluster-model / feature-index blend, 0..1; 0 = off. */
@@ -118,6 +124,7 @@ export const RVC_DEFAULTS: RvcOptions = {
   f0_shift: 0,
   speaker_id: null,
   spk_mix: [],
+  range_extend: true,
   index_ratio: 0.75,
   protect: 0.33,
   noise_scale: 0.66666,
@@ -133,6 +140,7 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   f0_shift: 0,
   speaker_id: null,
   spk_mix: [],
+  range_extend: true,
   noise_scale: 0.4,
   cluster_ratio: 0,
   loudness_envelope: 1.0,

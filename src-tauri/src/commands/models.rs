@@ -168,6 +168,25 @@ pub async fn delete_model(
     state.models.delete(&name, mt.as_ref()).map_err(|e| e.to_string())
 }
 
+/// S60-2: persist a model's tested vocal range into its sidecar (the frontend-orchestrated
+/// range test writes this; the render layer reads it back via vocal_range::speaker_range).
+#[tauri::command]
+pub async fn set_model_vocal_range(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    model_type: String,
+    record: serde_json::Value,
+) -> Result<(), String> {
+    let mt = parse_voice_type(&model_type).ok_or("RANGE_BAD_TYPE")?;
+    if !record.is_object() {
+        return Err("RANGE_BAD_RECORD".to_string());
+    }
+    state
+        .models
+        .set_config_extra_key(&name, &mt, "vocal_range", record)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn check_model_exists(
     state: State<'_, Arc<AppState>>,

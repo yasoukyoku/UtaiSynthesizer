@@ -35,6 +35,12 @@
     "errLoad": "Failed to read audio",
     "errFailed": "MIDI extraction failed"
   },
+  "rangeTest": {
+    "busy": "A render is in flight — try the range test later",
+    "noUsable": "Range test found no usable zone — the model may be undertrained",
+    "done": "Range test done, comfort zone",
+    "failed": "Range test failed"
+  },
   "menu": {
     "file": "File",
     "edit": "Edit",
@@ -439,7 +445,9 @@
       "vib_phase": "Phase",
       "vib_startMs": "Onset",
       "vib_easeInMs": "Fade in",
-      "vib_easeOutMs": "Fade out"
+      "vib_easeOutMs": "Fade out",
+      "rangeExtend": "Range extend",
+      "rangeExtendTip": "Out-of-comfort phrases render transposed into the singer's comfort zone, then shift back in the audio domain (needs a range record from the Resource Manager; in-range renders are untouched)"
     },
     "render": {
       "render": "Render vocal",

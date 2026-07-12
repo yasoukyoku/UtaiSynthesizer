@@ -288,6 +288,10 @@ export interface VocalTrackParams {
    *  time, so the user can pick a convenient trigger without the breath function stealing a glyph they need
    *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
   breathToken?: string;
+  /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
+   *  TD-PSOLA'd back (needs a vocal_range record on the model — else a no-op). ABSENT = ON (the default is
+   *  stored as absence — canonical write in setVocalParams); `false` = the user turned it off. */
+  rangeExtend?: boolean;
 }
 
 export interface Workflow {

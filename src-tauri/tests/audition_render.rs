@@ -233,7 +233,7 @@ fn audition_rvc_candidate() {
         min_frames: sc["min_frames"].as_u64().unwrap_or(12) as usize,
     };
     let options = RvcOptions { index_ratio: 0.0, ..Default::default() };
-    let r = utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, &|_| {}, &|| false)
+    let r = utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
         .expect("pipeline");
     let src = load_source();
     assert_render("rvc", &engine, &kit, &src, &r.audio, r.sample_rate, sample_rate);
@@ -295,7 +295,7 @@ fn audition_sovits_candidate() {
         min_frames: sc["min_frames"].as_u64().unwrap_or(6) as usize,
     };
     let options = SovitsOptions { cluster_ratio: 0.0, ..Default::default() };
-    let r = utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, &|_| {}, &|| false)
+    let r = utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, None, &|_| {}, &|| false)
         .expect("pipeline");
     let src = load_source();
     assert_render("sovits", &engine, &kit, &src, &r.audio, r.sample_rate, sample_rate);

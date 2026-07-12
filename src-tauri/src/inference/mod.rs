@@ -18,6 +18,7 @@ pub mod score2svc;
 #[cfg(test)]
 mod score2svc_ref;
 pub mod sovits;
+pub mod vocal_range;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -37,6 +38,10 @@ pub struct RvcOptions {
     /// ①c speaker blend — empty = use speaker_id (single-speaker / pre-①c: byte-identical).
     /// Consumed by α′ (multi-speaker RVC export); see SovitsOptions::spk_mix.
     pub spk_mix: Vec<SpkMixEntry>,
+    /// S60-2 音域扩展 (cover path): out-of-comfort chunks render at a minimal translation
+    /// into the model's tested comfort zone and are TD-PSOLA'd back. Requires a sidecar
+    /// vocal_range record; in-range chunks are byte-identical either way. Default false.
+    pub range_extend: bool,
     pub index_ratio: f32,
     pub protect: f32,
     pub noise_scale: f32,
@@ -59,6 +64,7 @@ impl Default for RvcOptions {
             f0_shift: 0.0,
             speaker_id: None,
             spk_mix: Vec::new(),
+            range_extend: false,
             index_ratio: 0.75,
             protect: 0.33,
             noise_scale: 0.66666,
@@ -182,6 +188,8 @@ pub struct SovitsOptions {
     pub speaker_id: Option<u32>,
     /// ①c speaker blend — empty = use speaker_id (single-speaker / pre-①c models: byte-identical).
     pub spk_mix: Vec<SpkMixEntry>,
+    /// S60-2 音域扩展 (cover path) — see RvcOptions::range_extend. Default false.
+    pub range_extend: bool,
     pub noise_scale: f32,
     pub cluster_ratio: f32,
     pub loudness_envelope: f32,
@@ -230,6 +238,7 @@ impl Default for SovitsOptions {
             f0_shift: 0.0,
             speaker_id: None,
             spk_mix: Vec::new(),
+            range_extend: false,
             noise_scale: 0.4,
             cluster_ratio: 0.0,
             loudness_envelope: 1.0,

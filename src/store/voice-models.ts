@@ -61,6 +61,10 @@ export type VoiceType = "rvc" | "sovits" | "vocoder";
 interface VoiceModelStore {
   models: Record<VoiceType, VoiceModelEntry[]>;
   error: string | null;
+  /** S60-2 音域测试 in flight — model name → progress 0..1 (absent = idle). Single source for
+   *  the resource-manager progress row + the double-trigger guard (rangeTest.ts). */
+  rangeTesting: Record<string, number>;
+  setRangeTesting: (name: string, progress: number | null) => void;
 
   /** Refresh ALL lists (backend scan() runs inside list_models, so this picks up disk changes). */
   fetchModels: () => Promise<void>;
@@ -75,6 +79,14 @@ interface VoiceModelStore {
 export const useVoiceModelStore = create<VoiceModelStore>((set, get) => ({
   models: { rvc: [], sovits: [], vocoder: [] },
   error: null,
+  rangeTesting: {},
+  setRangeTesting: (name, progress) =>
+    set((s) => {
+      const next = { ...s.rangeTesting };
+      if (progress === null) delete next[name];
+      else next[name] = progress;
+      return { rangeTesting: next };
+    }),
 
   fetchModels: async () => {
     try {

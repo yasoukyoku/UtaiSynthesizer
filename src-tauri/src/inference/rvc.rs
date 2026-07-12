@@ -90,6 +90,8 @@ pub fn run_pipeline(
     m: &RvcModel,
     audio: &AudioBuffer,
     options: &RvcOptions,
+    // S60-2 音域扩展 (cover path) — see sovits::run_pipeline; None ⇒ byte-identical pipeline.
+    range: Option<super::vocal_range::SpeakerRange>,
     progress: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
@@ -184,6 +186,35 @@ pub fn run_pipeline(
     let mut audio_opt: Vec<f32> = Vec::new();
     let mut s_ix = 0usize;
     let mut chunk_idx: u64 = 0;
+    // S60-2 音域扩展: each silence-seek chunk gets the v1 three-tier decision on its OWN fed
+    // pitch — a shifted chunk renders at `shift` st into comfort (coarse re-binned from the
+    // shifted Hz) and its UNtrimmed output is TD-PSOLA'd back before append_trimmed, so the
+    // constant-ratio seams stay inside the trimmed-away pads/silence. shift 0 ⇒ the exact
+    // original vc_chunk call (byte-identical).
+    let ranged_chunk = |pitch_sl: &[i64],
+                        pitchf_sl: &[f32],
+                        chunk: &[f32],
+                        chunk_idx: u64|
+     -> Result<Vec<f32>> {
+        let shift = range
+            .map(|r| super::vocal_range::piece_range_shift(pitchf_sl, &r))
+            .unwrap_or(0);
+        if shift == 0 {
+            return vc_chunk(m, chunk, pitch_sl, pitchf_sl, sid, spk_mix_dense.as_deref(), options, chunk_idx);
+        }
+        let k = 2.0f32.powf(shift as f32 / 12.0);
+        let pf: Vec<f32> = pitchf_sl.iter().map(|&v| v * k).collect();
+        let pc: Vec<i64> = pf.iter().map(|&v| f0_to_coarse(v)).collect();
+        tracing::info!("range-extend(cover/rvc): chunk {chunk_idx} rendered {shift:+} st into comfort");
+        let out = vc_chunk(m, chunk, &pc, &pf, sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
+        Ok(super::vocal_range::psola_inverse_hop(
+            out,
+            &pf,
+            m.sample_rate as usize / 100,
+            m.sample_rate,
+            shift,
+        ))
+    };
     for &ot in &opt_ts {
         if cancel() {
             return Err(UtaiError::Inference("已取消".into()));
@@ -197,7 +228,7 @@ pub fn run_pipeline(
         let chunk = &audio_pad[s_ix..(t + t_pad2 + WINDOW).min(audio_pad.len())];
         let pl = s_ix / WINDOW;
         let ph = (t + t_pad2) / WINDOW;
-        let out = vc_chunk(m, chunk, &pitch[pl..ph], &pitchf[pl..ph], sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
+        let out = ranged_chunk(&pitch[pl..ph], &pitchf[pl..ph], chunk, chunk_idx)?;
         append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
         s_ix = t;
         chunk_idx += 1;
@@ -208,16 +239,7 @@ pub fn run_pipeline(
         return Err(UtaiError::Inference("已取消".into()));
     }
     let chunk = &audio_pad[s_ix..];
-    let out = vc_chunk(
-        m,
-        chunk,
-        &pitch[s_ix / WINDOW..],
-        &pitchf[s_ix / WINDOW..],
-        sid,
-        spk_mix_dense.as_deref(),
-        options,
-        chunk_idx,
-    )?;
+    let out = ranged_chunk(&pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], chunk, chunk_idx)?;
     append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
 
     // ── rms mix (original: change_rms(audio, 16000, audio_opt, tgt_sr, rate) if rate != 1) ──

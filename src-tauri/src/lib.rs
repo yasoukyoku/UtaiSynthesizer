@@ -691,6 +691,7 @@ pub fn run() {
             commands::models::delete_model,
             commands::models::check_model_exists,
             commands::models::set_model_avatar,
+            commands::models::set_model_vocal_range,
             commands::models::attach_diffusion,
             commands::audio::load_audio_file,
             commands::audio::probe_audio_duration,

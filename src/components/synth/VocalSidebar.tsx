@@ -216,6 +216,15 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
           />
         </div>
+        {/* S60-2 音域扩展: v1 recipe (shift into the singer's tested comfort zone, TD-PSOLA back).
+            A no-op until the model carries a vocal_range record (资源管理器 → 测音域). Default ON. */}
+        <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.rangeExtend")}
+            checked={vocalParams.rangeExtend !== false}
+            onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
+          />
+        </div>
       </div>
 
       {/* ⓪.3 语言 (S58 §3.7) — lives on the SINGER tab (it configures WHAT is sung, not the pitch; §user).

@@ -929,11 +929,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   setVocalParams: (trackId, updates) =>
     set((s) => ({
       dirty: true,
-      tracks: s.tracks.map((t) =>
-        t.id === trackId
-          ? { ...t, vocalParams: { ...(t.vocalParams ?? DEFAULT_VOCAL_PARAMS), ...updates } }
-          : t,
-      ),
+      tracks: s.tracks.map((t) => {
+        if (t.id !== trackId) return t;
+        const vp = { ...(t.vocalParams ?? DEFAULT_VOCAL_PARAMS), ...updates };
+        // canonical write (sig↔serialize, S48 Phase 3): rangeExtend's default (ON) is stored
+        // as ABSENCE — an explicit `true` would false-dirty the close/autosave byte-compare
+        // without an undo step (vocalParamsSig folds it either way).
+        if (vp.rangeExtend === true) delete vp.rangeExtend;
+        return { ...t, vocalParams: vp };
+      }),
     })),
 
   mergeProcessedOutputs: (trackId, segmentId, outputs) =>

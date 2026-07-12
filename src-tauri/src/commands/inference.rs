@@ -821,6 +821,17 @@ pub async fn run_rvc(
     let audio_buf =
         crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
 
+    // S60-2 音域扩展: the governing speaker's tested range (None = off / no sidecar record
+    // ⇒ the pipeline is byte-identical to before).
+    let vocal_range = if options.range_extend {
+        crate::inference::vocal_range::speaker_range(
+            &entry.config,
+            crate::inference::dominant_speaker(&options.spk_mix, options.speaker_id),
+        )
+    } else {
+        None
+    };
+
     // The pipeline is minutes of CPU+GPU work — keep it off the async runtime workers.
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
     tauri::async_runtime::spawn_blocking(move || {
@@ -838,7 +849,7 @@ pub async fn run_rvc(
             noise_channels: nch,
             min_frames: min_t,
         };
-        rvc::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+        rvc::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
             .map_err(|e| e.to_string())
     })
     .await
@@ -1016,6 +1027,16 @@ pub async fn run_sovits(
         crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
 
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
+    // S60-2 音域扩展: the governing speaker's tested range (None = off / no sidecar record
+    // ⇒ the pipeline is byte-identical to before).
+    let vocal_range = if options.range_extend {
+        crate::inference::vocal_range::speaker_range(
+            &entry.config,
+            crate::inference::dominant_speaker(&options.spk_mix, options.speaker_id),
+        )
+    } else {
+        None
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let cancel = || app.inference.voice_cancelled(run_epoch);
         let model = sovits::SovitsModel {
@@ -1037,7 +1058,7 @@ pub async fn run_sovits(
             noise_channels: nch,
             min_frames: min_t,
         };
-        sovits::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+        sovits::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
             .map_err(|e| e.to_string())
     })
     .await
@@ -1181,6 +1202,11 @@ pub struct VocalRenderOptions {
     pub lang_id: i64,
     /// Track-level transpose in semitones (applied to content note_pitch AND f0, Rust-side).
     pub transpose: i64,
+    /// S60-2 音域扩展: when true AND the model carries a vocal_range record for the resolved
+    /// speaker, out-of-comfort parts render at a minimal semitone translation into the comfort
+    /// zone and are TD-PSOLA'd back (v1 affine recipe). In-range parts render EXACTLY as before
+    /// (tier 1/2 = shift 0 = byte-identical), so enabling this never degrades in-range material.
+    pub range_extend: bool,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1198,6 +1224,7 @@ impl Default for VocalRenderOptions {
             cv_speaker_id: 49,
             lang_id: 2,
             transpose: 0,
+            range_extend: false,
             sovits: Default::default(),
             rvc: Default::default(),
         }
@@ -1331,6 +1358,43 @@ pub async fn render_vocal_segment(
     if let Some(data_dir) = app.models.models_dir().parent() {
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
+    // S60-2 音域扩展: resolve the governing speaker's tested range and the v1 three-tier
+    // shift. Disabled / no sidecar record / in-range ⇒ 0 ⇒ byte-identical render + no
+    // inverse pass. The renders sing at transpose+shift and TD-PSOLA the audio back.
+    let range_shift = if options.range_extend {
+        let speaker = match backend_type {
+            VoiceBackendType::SoVits => {
+                crate::inference::dominant_speaker(&options.sovits.spk_mix, options.sovits.speaker_id)
+            }
+            VoiceBackendType::Rvc => {
+                crate::inference::dominant_speaker(&options.rvc.spk_mix, options.rvc.speaker_id)
+            }
+        };
+        match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
+            Some(r) => {
+                let nn: Vec<i64> = score.iter().map(|n| n.note_num).collect();
+                let shift = crate::inference::vocal_range::score_pitch_bounds(
+                    &nn,
+                    &f0_cents,
+                    &f0_voiced,
+                    options.transpose,
+                )
+                .map(|b| crate::inference::vocal_range::compute_range_shift(b, &r))
+                .unwrap_or(0);
+                if shift != 0 {
+                    tracing::info!(
+                        "range-extend: rendering '{}' at {:+} st into comfort [{:.0},{:.0}] (speaker {})",
+                        voice_name, shift, r.comfort.0, r.comfort.1, speaker
+                    );
+                }
+                shift
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+
     // own the score notes so the render can borrow them as &[ScoreEvt] inside spawn_blocking.
     let score_owned: Vec<ScoreNote> = score;
     let cv_speaker_id = options.cv_speaker_id;
@@ -1431,7 +1495,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, transpose, f0.as_ref(), loud, formant, &cancel, &progress,
+                    VOCAL_FLAT_VOL, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })
@@ -1493,7 +1557,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    transpose, f0.as_ref(), loud, formant, &cancel, &progress,
+                    transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())
             })

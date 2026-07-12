@@ -392,7 +392,7 @@ pub async fn render_audition_voice(
                     speaker_id,
                     ..Default::default()
                 };
-                rvc::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+                rvc::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
                     .map_err(|e| e.to_string())?
             }
             _ => {
@@ -449,7 +449,7 @@ pub async fn render_audition_voice(
                     speaker_id,
                     ..Default::default()
                 };
-                sovits::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+                sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
                     .map_err(|e| e.to_string())?
             }
         };
@@ -809,7 +809,7 @@ pub async fn render_audition_diffusion(
             noise_channels: noise_channels(&entry.config),
             min_frames: min_frames(&entry.config, 6),
         };
-        let result = sovits::run_pipeline(&model, &audio_buf, &options, &progress, &cancel)
+        let result = sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
             .map_err(|e| e.to_string())?;
         write_wav_atomic(&out, &result.audio, result.sample_rate)?;
         // candidate diffusion sessions go; the host stays warm (normal model)

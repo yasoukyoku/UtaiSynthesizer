@@ -134,6 +134,10 @@ pub fn run_pipeline(
     m: &SovitsModel,
     audio: &AudioBuffer,
     options: &SovitsOptions,
+    // S60-2 音域扩展 (cover path): the governing speaker's tested range, resolved by the
+    // command layer iff options.range_extend && the sidecar carries a record. None ⇒ the
+    // pipeline is byte-identical to before (per-piece shift stays 0, no inverse pass).
+    range: Option<super::vocal_range::SpeakerRange>,
     progress: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
@@ -192,7 +196,7 @@ pub fn run_pipeline(
             if cancel() {
                 return Err(UtaiError::Inference("已取消".into()));
             }
-            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, &report, cancel)?;
+            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range, &report, cancel)?;
             // pad_array(_audio, per_length) — center zero-pad up (never truncates), exactly
             // like the original; a zero-filled degenerate piece becomes zeros(per_length).
             let piece = pad_array_center(trimmed, per_length);
@@ -237,6 +241,7 @@ fn infer_segment(
     native_sr: u32,
     seg_idx: u64,
     options: &SovitsOptions,
+    range: Option<super::vocal_range::SpeakerRange>,
     report: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<f32>> {
@@ -279,6 +284,18 @@ fn infer_segment(
     // get_unit_f0: f0 = f0 * 2^(tran/12) AFTER the predictor post-process; uv untouched
     let ratio = 2.0f32.powf(options.f0_shift / 12.0);
     f0.iter_mut().for_each(|v| *v *= ratio);
+    // S60-2 音域扩展 (chunk-level tier): each silence-sliced piece is a natural phrase unit —
+    // the constant-ratio inverse's seams land in the silence between pieces. Bounds from the
+    // TRANSPOSED f0 (what the model would be asked to sing); shift 0 ⇒ untouched path.
+    let range_shift = range.map(|r| super::vocal_range::piece_range_shift(&f0, &r)).unwrap_or(0);
+    let f0_for_inverse = if range_shift != 0 {
+        let k = 2.0f32.powf(range_shift as f32 / 12.0);
+        f0.iter_mut().for_each(|v| *v *= k);
+        tracing::info!("range-extend(cover/sovits): piece {seg_idx} rendered {range_shift:+} st into comfort");
+        Some(f0.clone())
+    } else {
+        None
+    };
     report(p_f0); // f0 done
 
     if cancel() {
@@ -320,6 +337,13 @@ fn infer_segment(
     let mut out = decode_features(
         m, c, f0, uv, vol, &wav_m, seg_idx, n_frames, has_diff, p_vits, options, report, cancel,
     )?;
+
+    // S60-2: shift the decoded audio back by -range_shift (TD-PSOLA guided by the exact fed
+    // f0 — one frame per hop_size output samples). Runs on the still-padded signal so the
+    // trim below is untouched; the pad regions are unvoiced (f0=0) and pass through dry.
+    if let Some(f0s) = &f0_for_inverse {
+        out = super::vocal_range::psola_inverse_hop(out, f0s, m.hop_size, m.sample_rate, range_shift);
+    }
 
     // ── loudness envelope: original applies change_rms INSIDE infer(), i.e. on the
     //    still-PADDED input/output, BEFORE slice_inference trims — mirror that order ──

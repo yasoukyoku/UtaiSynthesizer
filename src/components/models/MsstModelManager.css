@@ -669,3 +669,35 @@
   padding: var(--space-sm) var(--space-lg);
   font-size: var(--font-size-xs);
 }
+
+/* ── S60-2: per-model vocal-range row (label + adjust/retest; testing progress) ── */
+.rm-range-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+}
+.rm-range-testing {
+  color: var(--accent);
+}
+.rm-range-missing {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+.rm-range-btn {
+  padding: 0 var(--space-sm);
+  font-size: var(--font-size-xs);
+  line-height: 16px;
+  height: 16px;
+}
+.rm-range-input {
+  width: 34px;
+  height: 16px;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  text-align: center;
+  padding: 0 2px;
+}

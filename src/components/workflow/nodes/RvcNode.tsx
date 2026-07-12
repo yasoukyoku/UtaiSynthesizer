@@ -26,6 +26,7 @@ export function RvcNode(props: NodeProps) {
   const rmsMixRate = (params.rms_mix_rate as number) ?? RVC_DEFAULTS.rms_mix_rate;
   const l2Normalize = (params.l2_normalize as boolean) ?? RVC_DEFAULTS.l2_normalize;
   const gpuExtract = (params.gpu_extract as boolean) ?? RVC_DEFAULTS.gpu_extract;
+  const rangeExtend = (params.range_extend as boolean) ?? RVC_DEFAULTS.range_extend;
   const speakerId = (params.speaker_id as number | null) ?? RVC_DEFAULTS.speaker_id;
   const spkMix = (params.spk_mix as SpkMixEntry[]) ?? RVC_DEFAULTS.spk_mix;
   const hasIndex = !!selected?.index_path;
@@ -101,6 +102,19 @@ export function RvcNode(props: NodeProps) {
                 onChange={(e) => updateParams({ l2_normalize: e.target.checked })} />
             </div>
             )}
+            {/* S60-2 音域扩展 — v1 recipe on the cover path (chunk-level tier + TD-PSOLA back).
+                No-op until the model carries a vocal_range record (资源管理器 → 测音域). */}
+            <div className="sep-param-row">
+              <label title={t18({
+                zh: "超出模型舒适区的乐句先移调到舒适区推理，再在音频域移回（需先在资源管理器测过音域；区间内完全不受影响）",
+                en: "Out-of-comfort phrases infer transposed into the model's comfort zone, then shift back in the audio domain (needs a range record; in-range chunks are untouched)",
+                ja: "快適域を超えるフレーズは快適域に移調して推論し、オーディオ領域で戻します（音域測定が必要。域内には影響しません）",
+              }, lang)}>
+                {t18({ zh: "音域扩展", en: "Range extend", ja: "音域拡張" }, lang)}
+              </label>
+              <input type="checkbox" checked={rangeExtend}
+                onChange={(e) => updateParams({ range_extend: e.target.checked })} />
+            </div>
             <GpuExtractRow value={gpuExtract} lang={lang}
               onChange={(v) => updateParams({ gpu_extract: v })} />
           </div>

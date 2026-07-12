@@ -28,8 +28,10 @@ import {
   formatSampleRateKhz,
   vocoderFormatMatches,
   vocoderFormatLabel,
+  type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
+import { runRangeTest, setComfortRange, midiName, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import "./MsstModelManager.css";
 
 type TopTab = "separation" | "voice" | "tools";
@@ -325,7 +327,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
     setImporting(true);
     setErr("");
     try {
-      const outcome = await invoke<{ entry: unknown; warnings: string[] }>("import_model", {
+      const outcome = await invoke<{ entry: { name: string; path: string } | null; warnings: string[] }>("import_model", {
         name: modelName,
         path: modelPath,
         modelType: voiceType,
@@ -337,6 +339,11 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       });
       for (const w of outcome?.warnings ?? []) {
         useAppStore.getState().showToast(w, "info");
+      }
+      // S60-2: fresh import → background range test (default speaker; the record died with any
+      // REPLACEd sidecar). Fire-and-forget — failures/busy toast from rangeTest itself.
+      if ((voiceType === "rvc" || voiceType === "sovits") && outcome?.entry) {
+        void runRangeTest(outcome.entry.name, voiceType, outcome.entry.path);
       }
       onDone();
     } catch (e) {
@@ -865,6 +872,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   )}
                 </span>
                 )}
+                {!isVocoder && <VoiceRangeRow m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} />}
               </div>
               {deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">
@@ -888,6 +896,96 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         />
       )}
     </div>
+  );
+}
+
+// ─── S60-2: per-model vocal-range row (v1 session20/21 UX: auto label + comfort editor
+// clamped inside usable + Reset + retest; missing record → 补做 button) ───
+
+function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
+  const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
+  const [editing, setEditing] = useState(false);
+  const [lo, setLo] = useState(0);
+  const [hi, setHi] = useState(0);
+  const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
+  const sp = rec?.speakers?.["0"];
+
+  if (progress !== undefined) {
+    return (
+      <span className="rm-range-row rm-range-testing">
+        {t18({ zh: "音域测试中", en: "Testing range", ja: "音域テスト中" }, lang)} {Math.round(progress * 100)}%
+      </span>
+    );
+  }
+  if (!sp) {
+    // no record (never tested / lost to a re-import / app crash) → the 补做 entry point
+    return (
+      <span className="rm-range-row">
+        <span className="rm-range-missing">{t18({ zh: "无音域记录", en: "No range record", ja: "音域記録なし" }, lang)}</span>
+        <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path)}>
+          {t18({ zh: "测音域", en: "Detect range", ja: "音域を測定" }, lang)}
+        </button>
+      </span>
+    );
+  }
+  const commit = async () => {
+    await setComfortRange(m.name, voiceType, 0, [lo, hi]);
+    setEditing(false);
+  };
+  return (
+    <span className="rm-range-row">
+      <span
+        title={t18({
+          zh: `可用（<100¢ 且浊音>50%）${midiName(sp.usable[0])}–${midiName(sp.usable[1])}；舒适（<50¢ 且浊音>80%）为渲染的目标区间`,
+          en: `Usable (<100¢, voiced>50%) ${midiName(sp.usable[0])}–${midiName(sp.usable[1])}; comfort (<50¢, voiced>80%) is the render target zone`,
+          ja: `使用可能（<100¢・有声>50%）${midiName(sp.usable[0])}–${midiName(sp.usable[1])}。快適域（<50¢・有声>80%）がレンダリングの目標域です`,
+        }, lang)}
+      >
+        {t18({ zh: "音域", en: "Range", ja: "音域" }, lang)} {midiName(sp.usable[0])}–{midiName(sp.usable[1])}
+        {" · "}
+        {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(sp.comfort[0])}–{midiName(sp.comfort[1])}
+      </span>
+      {editing ? (
+        <>
+          <input
+            className="rm-range-input"
+            type="text"
+            value={lo}
+            onChange={(e) => setLo(Math.max(sp.usable[0], Math.min(sp.usable[1], parseInt(e.target.value, 10) || sp.usable[0])))}
+            title={`${midiName(lo)} (MIDI ${lo})`}
+          />
+          <span>–</span>
+          <input
+            className="rm-range-input"
+            type="text"
+            value={hi}
+            onChange={(e) => setHi(Math.max(sp.usable[0], Math.min(sp.usable[1], parseInt(e.target.value, 10) || sp.usable[1])))}
+            title={`${midiName(hi)} (MIDI ${hi})`}
+          />
+          <button className="rm-range-btn" onClick={() => void commit()}>OK</button>
+          <button
+            className="rm-range-btn"
+            title={t18({ zh: "还原为自动检测值", en: "Reset to the detected value", ja: "自動検出値に戻す" }, lang)}
+            onClick={() => { void setComfortRange(m.name, voiceType, 0, sp.comfort_auto).then(() => setEditing(false)); }}
+          >
+            {t18({ zh: "还原", en: "Reset", ja: "リセット" }, lang)}
+          </button>
+        </>
+      ) : (
+        <>
+          <button
+            className="rm-range-btn"
+            title={t18({ zh: "在可用区间内微调舒适区（MIDI 音号）", en: "Adjust the comfort zone within usable (MIDI numbers)", ja: "使用可能域の中で快適域を調整（MIDI 番号）" }, lang)}
+            onClick={() => { setLo(sp.comfort[0]); setHi(sp.comfort[1]); setEditing(true); }}
+          >
+            {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
+          </button>
+          <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path)}>
+            {t18({ zh: "重测", en: "Retest", ja: "再測定" }, lang)}
+          </button>
+        </>
+      )}
+    </span>
   );
 }
 

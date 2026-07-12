@@ -79,6 +79,8 @@ export interface VocalRenderOptions {
   cv_speaker_id: number;
   lang_id: number;
   transpose: number;
+  /** S60-2 音域扩展 (track-level): no-op without a sidecar vocal_range record. */
+  range_extend: boolean;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -351,6 +353,8 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       cv_speaker_id: vp.speakerId,
       lang_id: vp.langId,
       transpose: vp.transpose,
+      // S60-2: absent = ON (no-op until the model carries a vocal_range record)
+      range_extend: vp.rangeExtend !== false,
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },

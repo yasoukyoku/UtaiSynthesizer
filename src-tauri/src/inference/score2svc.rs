@@ -408,6 +408,7 @@ pub fn render_score_sovits(
     options: &SovitsOptions,
     flat_vol: f32,
     transpose: i64,
+    range_shift: i64,
     f0: Option<&VocalF0>,
     loudness: Option<&[f32]>,
     formant: Option<&[f32]>,
@@ -415,14 +416,17 @@ pub fn render_score_sovits(
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts)?;
+    // S60-2 音域扩展: the model RENDERS at transpose+range_shift (inside its comfort zone);
+    // apply_range_inverse below shifts the audio back. range_shift=0 ⇒ byte-identical to before.
+    let transpose_eff = transpose + range_shift;
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
-    let note_hz_full = build_note_hz(&arr, score, transpose, f0);
+    let note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
     // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
     // aligned to cv via the SAME group remap as f0 (short-note-inflation safe). None/empty ⇒ flat = no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
     // content note_pitch is transposed separately (grouping is shift-invariant).
-    transpose_note_pitch(&mut arr.note_pitch, transpose);
+    transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
@@ -479,6 +483,7 @@ pub fn render_score_sovits(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
+    audio = apply_range_inverse(audio, &note_hz_full, m.sample_rate, range_shift);
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -533,6 +538,7 @@ pub fn render_score_rvc(
     dicts: &dyn g2p::DictSource,
     options: &RvcOptions,
     transpose: i64,
+    range_shift: i64,
     f0: Option<&VocalF0>,
     loudness: Option<&[f32]>,
     formant: Option<&[f32]>,
@@ -540,11 +546,13 @@ pub fn render_score_rvc(
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts)?;
-    let note_hz_full = build_note_hz(&arr, score, transpose, f0);
+    // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
+    let transpose_eff = transpose + range_shift;
+    let note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
     // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
-    transpose_note_pitch(&mut arr.note_pitch, transpose);
+    transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
@@ -583,6 +591,7 @@ pub fn render_score_rvc(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
+    audio = apply_range_inverse(audio, &note_hz_full, m.sample_rate, range_shift);
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -602,6 +611,31 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
     for j in 0..kw {
         wav[j] *= (j + 1) as f32 / (kw + 1) as f32; // ~0 → 1 away from the seam
     }
+}
+
+/// S60-2 音域扩展: undo the range-extension shift in the AUDIO domain. The render was fed
+/// `transpose + range_shift` (content + f0 together, so the model sings inside its comfort
+/// zone); this shifts the decoded audio back by `-range_shift` semitones with TD-PSOLA,
+/// guided by the EXACT fed f0 (`note_hz_cv`, @50fps cv frames — the same uniform sample→cv
+/// map as `apply_gain_env`, resampled onto a 100 fps hop grid). Formants are preserved by
+/// PSOLA itself (the v1 "raw F0 shift only" rule). shift 0 / empty ⇒ untouched (tier 1/2:
+/// in-comfort renders NEVER pass through here — bit-parity by construction).
+fn apply_range_inverse(audio: Vec<f32>, note_hz_cv: &[f32], sample_rate: u32, range_shift: i64) -> Vec<f32> {
+    if range_shift == 0 || audio.is_empty() || note_hz_cv.is_empty() {
+        return audio;
+    }
+    let hop = (sample_rate as usize / 100).max(1);
+    let nfr = audio.len() / hop + 1;
+    let n = audio.len() as f64;
+    let tt = note_hz_cv.len();
+    let mut f0 = Vec::with_capacity(nfr);
+    for i in 0..nfr {
+        let s = (i * hop).min(audio.len() - 1);
+        let cv = ((s as f64 / n) * tt as f64).floor() as usize;
+        f0.push(note_hz_cv[cv.min(tt - 1)]);
+    }
+    let ratio = vec![2f32.powf(-(range_shift as f32) / 12.0); f0.len()];
+    utai_dsp::psola_shift(&audio, sample_rate, &f0, &ratio, utai_dsp::PsolaParams { hop })
 }
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.
@@ -966,16 +1000,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -984,7 +1018,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());
@@ -1133,7 +1167,7 @@ mod tests {
         // each case must run end-to-end and produce non-silent audio (peak > 1e-3); returns the sample
         // length (deterministic — set by the frame count, unaffected by the graph's internal randomness).
         let run_sov = |m: &sovits::SovitsModel, o: &SovitsOptions| -> u64 {
-            let a = sovits::run_pipeline(m, &buf, o, &noop, &live).unwrap().audio;
+            let a = sovits::run_pipeline(m, &buf, o, None, &noop, &live).unwrap().audio;
             let peak = a.iter().fold(0.0f32, |p, &v| p.max(v.abs()));
             assert!(peak > 1e-3, "cover render is silent (peak {peak})");
             a.len() as u64
@@ -1208,7 +1242,7 @@ mod tests {
             }
         }
         let run_rvc = |m: &rvc::RvcModel, o: &RvcOptions| -> u64 {
-            let a = rvc::run_pipeline(m, &buf, o, &noop, &live).unwrap().audio;
+            let a = rvc::run_pipeline(m, &buf, o, None, &noop, &live).unwrap().audio;
             let peak = a.iter().fold(0.0f32, |p, &v| p.max(v.abs()));
             assert!(peak > 1e-3, "cover render is silent (peak {peak})");
             a.len() as u64
