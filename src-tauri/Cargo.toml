@@ -3,9 +3,9 @@ members = ["crates/utai-dsp", "crates/utai-stretch"]
 
 [package]
 name = "utai"
-version = "2.0.0-alpha.1"
-description = "UTAI — Voice Synthesis DAW"
-authors = ["UTAI Contributors"]
+version = "0.1.0"
+description = "UtaiSynthesizer — Voice Synthesis DAW"
+authors = ["UtaiSynthesizer Contributors"]
 edition = "2021"
 rust-version = "1.77"
 
@@ -22,6 +22,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-window-state = "2"
+# S64 release: in-app update check + install from GitHub Releases (Rust-side UpdaterBuilder so the
+# endpoint list can follow the user's GH-mirror setting at runtime). No process plugin needed: on
+# Windows install() exits the app and the NSIS /UPDATE run relaunches it.
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }

@@ -8,11 +8,6 @@ import { useAudioStore } from "../../store/audio";
 import { collectDirtyVocals, renderDirtyVocals } from "../vocal/vocalRender";
 import { scoreExportableTracks } from "../vocal/exportScore";
 import { renderMixdown } from "./exportMixdown";
-import { logToBackend } from "../log";
-
-/** [exportDbg] probes write to the crash-proof file log — the S63 live crash died silently (no panic,
- *  no WER), so the last probe line IS the crash locator on a repro. Remove once export is verified. */
-const dbg = (m: string) => logToBackend("info", `[exportDbg] ${m}`);
 
 /** PCM chunk size for the IPC transfer. DELIBERATELY small (8MB): Tauri's IPC silently falls back
  *  from the custom-protocol fetch to postMessage on a rejected fetch, and that path Array.from()s
@@ -62,7 +57,6 @@ export async function runAudioExport(
   //    Same collect/render funnel as Toolbar's pre-play batch (single source; sequential, cancellable).
   const tempo0 = useProjectStore.getState().tempo;
   const dirty = collectDirtyVocals(tempo0);
-  dbg(`start: format=${params.format} sr=${params.sampleRate} dirtyVocals=${dirty.length}`);
   if (dirty.length > 0) {
     onPhase({ kind: "vocals", total: dirty.length });
     const res = await renderDirtyVocals(dirty, tempo0, i18n.t("vocalEditor.render.laneLabel"), {
@@ -78,7 +72,6 @@ export async function runAudioExport(
   //    but the same fresh-read discipline as Toolbar's post-render play costs nothing).
   const st = useProjectStore.getState();
   onPhase({ kind: "mix", frac: 0 });
-  dbg("mixdown start");
   let mix;
   try {
     mix = await renderMixdown(
@@ -97,7 +90,6 @@ export async function runAudioExport(
     }
     throw e;
   }
-  dbg(`mixdown done: ${mix.pcm.length} samples, peak=${mix.peak.toFixed(3)}`);
   if (shouldCancel()) return { cancelled: true, peak: 0, fileBytes: 0, durationSec: 0 };
 
   // 3. Ship the PCM in raw-body CHUNKS (see PCM_CHUNK_BYTES — never one giant body, and never a
@@ -105,7 +97,6 @@ export async function runAudioExport(
   onPhase({ kind: "encode" });
   try {
     const bytes = new Uint8Array(mix.pcm.buffer, mix.pcm.byteOffset, mix.pcm.byteLength);
-    dbg(`pcm transfer begin: ${bytes.byteLength} bytes, ${Math.ceil(bytes.byteLength / PCM_CHUNK_BYTES)} chunks`);
     await invoke("export_audio_pcm_begin", { totalBytes: bytes.byteLength });
     for (let off = 0; off < bytes.byteLength; off += PCM_CHUNK_BYTES) {
       // slice() copies the 8MB window into a fresh, offset-0 buffer — a subarray view's byteOffset
@@ -113,7 +104,6 @@ export async function runAudioExport(
       const chunk = bytes.slice(off, Math.min(off + PCM_CHUNK_BYTES, bytes.byteLength));
       await invoke("export_audio_pcm_chunk", chunk);
     }
-    dbg("pcm transfer done, encoding");
     const res = await invoke<EncodeResult>("export_audio_encode", {
       outPath: params.outPath,
       format: params.format,
@@ -121,10 +111,8 @@ export async function runAudioExport(
       bitDepth: params.bitDepth,
       bitrateKbps: params.bitrateKbps,
     });
-    dbg(`encode done: ${res.file_bytes} bytes at ${res.out_path}`);
     return { cancelled: false, peak: mix.peak, fileBytes: res.file_bytes, durationSec: mix.durationSec };
   } catch (e) {
-    dbg(`FAILED: ${e instanceof Error ? e.message : String(e)}`);
     // Free the Rust-side PCM stash on any failure between the hops (best-effort, idempotent).
     void invoke("export_audio_discard").catch(() => {});
     throw e;

@@ -9,7 +9,7 @@
 //!   checkpoints. NOT regenerable (retraining costs hours); deleted per-workspace, whole-dir only
 //!   (a partial delete leaves the manifest-less-checkpoint anomaly the resume guards refuse).
 //! - audition caches — `<ws>/audition/*` + `<models>/**/<stem>.audition_spk*.wav`. Regenerable.
-//! - logs — `%LOCALAPPDATA%/com.utai.app/logs` daily files (never pruned elsewhere).
+//! - logs — `%LOCALAPPDATA%/com.utaisynthesizer.app/logs` daily files (never pruned elsewhere).
 //! Models / runtime packs are USER ASSETS managed by their own UIs (resource manager, MSST
 //! manager, Settings runtime panel) — the report shows their size, cleanup never touches them.
 //!

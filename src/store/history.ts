@@ -3,15 +3,6 @@ import { useProjectStore } from "./project";
 import { useAppStore } from "./app";
 import { useAudioStore } from "./audio";
 import { useWorkflowStore } from "./workflow";
-import { logToBackend } from "../lib/log";
-
-/** TEMP diagnostic probes for the reported "undo banner shows but nothing reverts" (timeline-stack
- *  disorder after output/sub-lane ops). Logs land in the dev stdout as `[UI] [undoDbg] …` — grep the
- *  dev output. REMOVE once the phantom source is pinned. */
-const UNDO_DBG = true;
-function dbg(msg: string) {
-  if (UNDO_DBG) logToBackend("info", `[undoDbg] ${msg}`);
-}
 import i18n from "../i18n";
 import {
   clearDetachLineage,
@@ -528,14 +519,8 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (past.length === 0) return;
     const before = past.pop()!;
     const cur = snapshotCurrent();
-    if (UNDO_DBG) {
-      const beforeSig = meaningfulSig(before.tracks, before.tempo, before.timeSignature);
-      const curSig = currentSig();
-      dbg(`undo pop depth=${past.length} delta=${describeDelta(before, cur)}${beforeSig === curSig ? " *** PHANTOM (popped sig == current sig — applying changes nothing) ***" : ""}`);
-    }
     future.push(cur);
     applySnapshot(before);
-    if (UNDO_DBG) dbg(`undo applied — sig ${currentSig() === meaningfulSig(cur.tracks, cur.tempo, cur.timeSignature) ? "UNCHANGED vs pre-undo (no visible revert!)" : "changed (reverted ok)"}`);
     syncFlags();
     announce(before, cur, "undo"); // the undone op transformed before→cur
   },
@@ -545,10 +530,6 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (future.length === 0) return;
     const after = future.pop()!;
     const cur = snapshotCurrent();
-    if (UNDO_DBG) {
-      const afterSig = meaningfulSig(after.tracks, after.tempo, after.timeSignature);
-      dbg(`redo pop depth=${future.length} delta=${describeDelta(cur, after)}${afterSig === currentSig() ? " *** PHANTOM ***" : ""}`);
-    }
     past.push(cur);
     applySnapshot(after);
     syncFlags();
@@ -573,7 +554,6 @@ export const useHistoryStore = create<HistoryState>(() => ({
     if (!before) return;
     const sig = currentSig();
     if (sig === txnSigBefore) return; // gesture made no real change (a click, or returned to start)
-    if (UNDO_DBG) dbg(`txn-commit depth=${past.length + 1} delta=${describeDelta(before, snapshotCurrent())}`);
     pushPast(before);
     future = [];
     lastSig = sig;
@@ -632,7 +612,6 @@ let scopedHandler: UndoScope | null = null;
 
 export function setUndoScope(h: UndoScope | null) {
   scopedHandler = h;
-  if (UNDO_DBG) dbg(`setUndoScope(${h ? "register" : "CLEAR"}) — workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"}`);
 }
 
 /** Is the WORKFLOW pane the ACTIVE undo surface? Requires the panel to actually be OPEN
@@ -702,13 +681,11 @@ export function historyReferencedAudioPaths(): string[] {
 export function routeUndo() {
   for (const it of [...undoInterceptors]) {
     if (it.wouldConsume()) {
-      if (UNDO_DBG) dbg("routeUndo → consumed by interceptor (midi-extract cancel)");
       it.consume();
       return;
     }
   }
   const wf = workflowUndoActive();
-  if (UNDO_DBG) dbg(`routeUndo → ${wf ? (scopedHandler ? "WORKFLOW node stack" : "WORKFLOW (no scope → no-op)") : "timeline"} (activePane=${useAppStore.getState().activePane}, workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"})`);
   // In the workflow pane, Ctrl+Z acts ONLY on the node stack (or no-ops if none) — it must NEVER revert
   // the timeline arrangement (that was the phantom "回退·子轨道静音" from a stale-pane / gone-editor state).
   if (wf) scopedHandler?.undo();
@@ -717,7 +694,6 @@ export function routeUndo() {
 
 export function routeRedo() {
   const wf = workflowUndoActive();
-  if (UNDO_DBG) dbg(`routeRedo → ${wf ? (scopedHandler ? "WORKFLOW node stack" : "WORKFLOW (no scope → no-op)") : "timeline"} (activePane=${useAppStore.getState().activePane}, workflowSeg=${useAppStore.getState().workflowSegmentId ?? "null"})`);
   if (wf) scopedHandler?.redo();
   else useHistoryStore.getState().redo();
 }
@@ -751,11 +727,6 @@ export function installHistory(): () => void {
     if (next.tracks === prev.tracks && next.tempo === prev.tempo && next.timeSignature === prev.timeSignature) return;
     const sig = meaningfulSig(next.tracks, next.tempo, next.timeSignature);
     if (sig === lastSig) return; // only overlay fields changed (expand / render / workflow / loading)
-    if (UNDO_DBG) {
-      const from: Snapshot = { tracks: prev.tracks, tempo: prev.tempo, timeSignature: prev.timeSignature, selection: currentSelection(), seq: 0 };
-      const to: Snapshot = { tracks: next.tracks, tempo: next.tempo, timeSignature: next.timeSignature, selection: currentSelection(), seq: 0 };
-      dbg(`capture depth=${past.length + 1} delta=${describeDelta(from, to)}`);
-    }
     pushPast({
       tracks: prev.tracks,
       tempo: prev.tempo,

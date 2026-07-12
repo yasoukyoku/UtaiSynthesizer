@@ -44,6 +44,20 @@ fn err(msg: impl Into<String>) -> UtaiError {
     UtaiError::Download(msg.into())
 }
 
+/// THE user-agent for every outbound HTTP client (S64 audit: the "UTAI/2.0" literal had already
+/// drifted into two files and both had to be hand-edited during the rebrand).
+pub const APP_USER_AGENT: &str = concat!("UtaiSynthesizer/", env!("CARGO_PKG_VERSION"));
+
+/// THE GH-proxy prefix sanitizer (S64 audit: update.rs and midi_extract.rs each had their own,
+/// already divergent). Trims, strips trailing slashes, and requires **https** — the updater's
+/// endpoint validation hard-rejects http in RELEASE builds only (warn-only in dev), so an http
+/// prefix accepted here would poison the whole endpoint list in exactly the build nobody dev-tests;
+/// degrading it to "no proxy" keeps every consumer on the direct route instead.
+pub fn sanitize_gh_prefix(gh_proxy: Option<String>) -> Option<String> {
+    let p = gh_proxy?.trim().trim_end_matches('/').to_string();
+    (p.starts_with("https://")).then_some(p)
+}
+
 pub fn part_path(dest: &Path) -> PathBuf {
     let mut os = dest.as_os_str().to_owned();
     os.push(".part");
@@ -68,7 +82,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// the read loop stays as the second, explicit layer.
 pub fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent("UTAI/2.0")
+        .user_agent(APP_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(STALL_TIMEOUT)
         .build()

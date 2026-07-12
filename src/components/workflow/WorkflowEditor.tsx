@@ -200,11 +200,6 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   const setActivePane = useAppStore((s) => s.setActivePane);
   const activePane = useAppStore((s) => s.activePane);
   const focusEditor = useCallback(() => setActivePane("workflow"), [setActivePane]);
-  // TEMP [undoDbg]: catch the activePane=workflow-while-editor-unmounted desync (the phantom-undo root).
-  useEffect(() => {
-    logToBackend("info", `[undoDbg] WorkflowEditor MOUNT seg=${segmentId}`);
-    return () => logToBackend("info", `[undoDbg] WorkflowEditor UNMOUNT seg=${segmentId} (activePane now=${useAppStore.getState().activePane})`);
-  }, [segmentId]);
 
   useEffect(() => {
     useMsstModelStore.getState().fetchModelsDir();

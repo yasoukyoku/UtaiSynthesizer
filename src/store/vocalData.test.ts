@@ -4,8 +4,8 @@
 // field byte-identically, (D) no false-dirty (normalizeNote strips default optionals; determinism).
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
-// The store's fire-and-forget backend log (history dbg → logToBackend → invoke) + any cancel_voice must
-// not throw in a headless run; i18n (announce banner) is mocked so react-i18next/JSON never load.
+// Fire-and-forget backend invokes (e.g. cancel_voice) must not throw in a headless run;
+// i18n (announce banner) is mocked so react-i18next/JSON never load.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve() }));
 vi.mock("../i18n", () => ({ default: { t: (k: string) => k } }));
 

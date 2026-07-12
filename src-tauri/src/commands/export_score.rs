@@ -335,13 +335,13 @@ fn unmap_vibrato(v: &ExportVibrato, note_dur_ticks: i64, bpm: f64) -> Option<Ust
 fn export_ustx(path: &str, bpm: f64, time_sig: [u32; 2], tracks: &[ExportTrack]) -> Result<(), String> {
     let beat_per_bar = time_sig[0].max(1);
     let beat_unit = time_sig[1].max(1);
-    // 工程名 = 第一轨名(非空白),否则 "UTAI Export"。
+    // 工程名 = 第一轨名(非空白),否则 "UtaiSynthesizer Export"。
     let project_name = tracks
         .first()
         .map(|t| t.name.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "UTAI Export".to_string());
+        .unwrap_or_else(|| "UtaiSynthesizer Export".to_string());
     let root = UstxOutRoot {
         name: project_name,
         ustx_version: "0.6".to_string(),

@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { routeUndo, routeRedo, routeCanUndo, routeCanRedo } from "../../store/history";
@@ -13,6 +15,15 @@ import { ExportAudioDialog } from "./ExportAudioDialog";
 import { ExportScoreDialog } from "./ExportScoreDialog";
 import "./Titlebar.css";
 
+// S64 — Help/community links (the "?" titlebar control). External URLs open in the system browser
+// via plugin-shell; the project GitHub is also the update source (commands/update.rs).
+const HELP_LINKS = {
+  qq: "https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info",
+  discord: "https://discord.com/invite/p3fGh942fJ",
+  score2convec: "https://github.com/yasoukyoku/Score2ConVec",
+  repo: "https://github.com/yasoukyoku/UtaiSynthesizer",
+} as const;
+
 export function Titlebar() {
   const { t } = useTranslation();
   const { name, dirty } = useProjectStore();
@@ -24,8 +35,19 @@ export function Titlebar() {
   // modal-local stack while open, else the timeline) without a live subscription.
   const [editMenu, setEditMenu] = useState<{ x: number; y: number } | null>(null);
   const [fileMenu, setFileMenu] = useState<{ x: number; y: number } | null>(null);
+  const [helpMenu, setHelpMenu] = useState<{ x: number; y: number } | null>(null);
   const [exportAudioOpen, setExportAudioOpen] = useState(false);
   const [exportScoreOpen, setExportScoreOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => { void getVersion().then(setAppVersion).catch(() => {}); }, []);
+
+  const helpItems: MenuItem[] = [
+    { label: `UtaiSynthesizer ${appVersion ? `v${appVersion}` : ""}`.trim(), disabled: true, onClick: () => {} },
+    { label: t("help.qq"), onClick: () => void openUrl(HELP_LINKS.qq).catch(() => {}) },
+    { label: t("help.discord"), onClick: () => void openUrl(HELP_LINKS.discord).catch(() => {}) },
+    { label: t("help.score2convec"), onClick: () => void openUrl(HELP_LINKS.score2convec).catch(() => {}) },
+    { label: t("help.repo"), onClick: () => void openUrl(HELP_LINKS.repo).catch(() => {}) },
+  ];
 
   const isTraining = trainingState === "running" || trainingState === "starting";
 
@@ -87,7 +109,9 @@ export function Titlebar() {
   return (
     <header className="titlebar">
       <div className="titlebar-left">
-        <span className="titlebar-brand">UTAI</span>
+        <span className="titlebar-brand">
+          UTAI<span className="titlebar-brand-sub">SYNTHESIZER</span>
+        </span>
         <nav className="titlebar-menu">
           <button
             className="menu-item"
@@ -133,6 +157,26 @@ export function Titlebar() {
         >
           {t("titlebar.training")}
         </button>
+        <button
+          className={`titlebar-btn titlebar-help ${helpMenu ? "active" : ""}`}
+          title={t("help.title")}
+          onClick={(e) => {
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            setHelpMenu({ x: r.left, y: r.bottom });
+          }}
+        >
+          {/* Angular question mark — square caps/joins, themed stroke (house SVG style, no raw emoji). */}
+          <svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+            <path
+              d="M8 9 V8 a4 4 0 0 1 4-4 a4 4 0 0 1 4 4 v0.5 c0 1.8-1.4 2.6-2.6 3.4 c-1 0.65-1.4 1.3-1.4 2.6 v0.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="square"
+            />
+            <rect x="10.9" y="18" width="2.4" height="2.4" fill="currentColor" />
+          </svg>
+        </button>
       </div>
 
       {fileMenu && (
@@ -140,6 +184,9 @@ export function Titlebar() {
       )}
       {editMenu && (
         <ContextMenu x={editMenu.x} y={editMenu.y} items={editItems} onClose={() => setEditMenu(null)} />
+      )}
+      {helpMenu && (
+        <ContextMenu x={helpMenu.x} y={helpMenu.y} items={helpItems} onClose={() => setHelpMenu(null)} />
       )}
       {exportAudioOpen && <ExportAudioDialog onClose={() => setExportAudioOpen(false)} />}
       {exportScoreOpen && <ExportScoreDialog onClose={() => setExportScoreOpen(false)} />}

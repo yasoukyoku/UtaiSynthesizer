@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "UTAI",
-  "version": "2.0.0-alpha.1",
-  "identifier": "com.utai.app",
+  "productName": "UtaiSynthesizer",
+  "version": "0.1.0",
+  "identifier": "com.utaisynthesizer.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "UTAI",
+        "title": "UtaiSynthesizer",
         "width": 1400,
         "height": 900,
         "minWidth": 1024,
@@ -32,7 +32,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,12 +42,51 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": []
+    "resources": {
+      "../bin/ffmpeg.exe": "ffmpeg.exe",
+      "../runtime/ort/onnxruntime.dll": "runtime/ort/onnxruntime.dll",
+      "../runtime/ort/onnxruntime_providers_shared.dll": "runtime/ort/onnxruntime_providers_shared.dll",
+      "../runtime/ort/DirectML.dll": "runtime/ort/DirectML.dll",
+      "../data/dictionaries/zh_syllables.tsv": "data/dictionaries/zh_syllables.tsv",
+      "../data/dictionaries/zh_chars.tsv": "data/dictionaries/zh_chars.tsv",
+      "../data/dictionaries/zh_phrases.tsv": "data/dictionaries/zh_phrases.tsv",
+      "../data/dictionaries/en.tsv": "data/dictionaries/en.tsv",
+      "../data/dictionaries/de.tsv": "data/dictionaries/de.tsv",
+      "../data/dictionaries/fr.tsv": "data/dictionaries/fr.tsv",
+      "../data/dictionaries/es.tsv": "data/dictionaries/es.tsv",
+      "../data/dictionaries/it.tsv": "data/dictionaries/it.tsv",
+      "../converter/convert.py": "converter/convert.py",
+      "../converter/extract_index.py": "converter/extract_index.py",
+      "../converter/export_cluster.py": "converter/export_cluster.py",
+      "../converter/export_diffusion.py": "converter/export_diffusion.py",
+      "../converter/export_nsf_hifigan.py": "converter/export_nsf_hifigan.py",
+      "../converter/onnx_fp16.py": "converter/onnx_fp16.py",
+      "../converter/architectures/": "converter/architectures/",
+      "../training/utai_train/": "training/utai_train/",
+      "../training/assets/": "training/assets/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "languages": ["SimpChinese", "English", "Japanese"],
+        "displayLanguageSelector": true,
+        "compression": "lzma"
+      }
+    }
   },
   "plugins": {
     "shell": {
       "open": true
     },
-    "fs": {}
+    "fs": {},
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFRThFMkNFNTA1QzRCQTEKUldTaFMxeFF6dUxvanNDNE5sdk82L0lkRXlLS2xJSmdyZG5MWXNUS0pid1oyYVFEcmc2WEpRck0K",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

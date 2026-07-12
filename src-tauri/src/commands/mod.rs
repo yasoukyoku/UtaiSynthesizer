@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod audio;
 pub mod audition;
 pub mod export_audio;
@@ -14,4 +15,5 @@ pub mod separation;
 pub mod settings;
 pub mod storage;
 pub mod training;
+pub mod update;
 pub mod window;

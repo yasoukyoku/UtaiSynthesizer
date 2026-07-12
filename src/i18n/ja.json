@@ -115,13 +115,13 @@
     "closeBody": "閉じる前に現在のプロジェクトを保存しますか？",
     "dontSave": "保存しない",
     "recoverTitle": "プロジェクトの復元",
-    "recoverBody": "前回 UTAI が正常に終了しませんでした。未保存の作業を復元しますか？",
+    "recoverBody": "前回 UtaiSynthesizer が正常に終了しませんでした。未保存の作業を復元しますか？",
     "recover": "復元",
     "recovered": "復元しました"
   },
   "close": {
-    "title": "UTAI を閉じる",
-    "body": "トレイに最小化しますか、それとも UTAI を終了しますか？",
+    "title": "UtaiSynthesizer を閉じる",
+    "body": "トレイに最小化しますか、それとも UtaiSynthesizer を終了しますか？",
     "minimize": "トレイに最小化",
     "quit": "終了",
     "busyTitle": "進行中のタスクがあります",
@@ -136,7 +136,9 @@
     "task_cuda_download": "CUDA ランタイムのダウンロード",
     "task_pyenv_install": "トレーニング環境ランタイムのインストール",
     "task_midi-extract": "MIDI 抽出",
-    "task_game-download": "GAME エンジンのダウンロード"
+    "task_game-download": "GAME エンジンのダウンロード",
+    "task_asset-download": "モデルアセットのダウンロード",
+    "task_update-download": "アップデートのダウンロード"
   },
   "tray": {
     "show": "ウィンドウを表示",
@@ -321,6 +323,9 @@
     "importSelectedDone": "{{count}} 件をインポートしました",
     "importSelectedPartial": "インポート {{ok}}/{{total}} 完了、以下は失敗：",
     "started": "学習を開始しました",
+    "envMissingTitle": "トレーニング環境が未インストールです",
+    "envMissingBody": "学習には内蔵 Python ランタイムが必要です（GPU に合わせたパック、または汎用 CPU パック）。\n設定 → トレーニング環境 でダウンロード・インストールしてから開始してください。",
+    "envMissingGoto": "設定を開く",
     "stop": "学習を停止",
     "stopping": "停止中…（現在のステップ完了後に保存）",
     "forceStop": "強制終了",
@@ -427,7 +432,32 @@
   "common": {
     "cancel": "キャンセル",
     "confirm": "確認",
+    "ok": "OK",
     "busyRetry": "処理が実行中です。しばらくしてからもう一度お試しください"
+  },
+  "update": {
+    "title": "新しいバージョンがあります",
+    "versionLine": "新バージョン：{{to}}（現在：{{from}}）",
+    "restartNote": "アップデートは自動でダウンロード・インストールされ、アプリは終了して再起動します。未保存の変更は再起動後に復元を提案します。",
+    "later": "後で",
+    "installNow": "今すぐ更新",
+    "retry": "再試行",
+    "starting": "ダウンロード準備中…",
+    "downloading": "ダウンロード中",
+    "installing": "インストール中 — まもなく再起動します…",
+    "checkFailedTitle": "更新の確認に失敗しました",
+    "checkFailedHint": "ネットワークの問題の可能性があります。「設定 → バージョンと更新」で再試行できます。起動時の自動確認もそこでオフにできます。",
+    "quitBlocked": "アップデートをダウンロード/インストール中です — 完了後に自動で再起動します。終了する場合は先に更新をキャンセルしてください"
+  },
+  "startup": {
+    "dataDirIssue": "データフォルダの問題：設定されたフォルダが存在しなかったため自動処理しました — 詳細は 設定 → 保存場所 を確認してください"
+  },
+  "help": {
+    "title": "ヘルプとコミュニティ",
+    "qq": "QQ グループ",
+    "discord": "Discord コミュニティ",
+    "score2convec": "Score2ConVec（GitHub）",
+    "repo": "プロジェクトホーム（GitHub）"
   },
   "vocalEditor": {
     "title": "ボーカル",
@@ -713,6 +743,12 @@
     "TRAINING_THREAD_SPAWN_FAILED": "トレーニングスレッドの起動に失敗しました",
     "TRAINING_TOTAL_STEPS_ZERO": "総ステップ数は 0 より大きい必要があります",
     "TRAINING_UNKNOWN_ERROR": "不明なトレーニングエラーです",
+    "ASSET_DL_BUSY": "モデルアセットのダウンロードが既に実行中です。完了をお待ちください",
+    "ASSET_DL_FAILED": "モデルアセットのダウンロードに失敗しました",
+    "UPDATE_CHECK_FAILED": "更新の確認に失敗しました（ネットワークまたは更新元に到達できません）",
+    "UPDATE_DOWNLOAD_FAILED": "更新パッケージのダウンロードに失敗しました",
+    "UPDATE_INSTALL_FAILED": "更新インストーラーの起動に失敗しました",
+    "UPDATE_NO_PENDING": "保留中の更新がありません（先に更新を確認してください）",
     "VERIFY_TASK_FAILED": "検証タスクが失敗しました",
     "VOCAL_BACKEND_UNKNOWN": "不明なバックエンドです（sovits / rvc のみ）",
     "VOCAL_F0_FRAMES_MISMATCH": "f0 フレーム数がノートの総フレーム数と一致しません（ピッチずれ防止のためレンダリングを中止しました）",

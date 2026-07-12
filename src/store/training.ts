@@ -483,6 +483,25 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   },
 
   start: async (fresh) => {
+    // S64 release gating (the S43 decision): no REAL training interpreter (dev venv / runtime pack /
+    // manual slot) → the spawn is doomed on an end-user machine; offer the runtime download instead.
+    // Dev machines always resolve training/.venv, so this only ever fires on packaged installs.
+    try {
+      if (!(await invoke<boolean>("training_env_ready"))) {
+        const c = await useAppStore.getState().showConfirm({
+          title: i18n.t("training.envMissingTitle"),
+          body: i18n.t("training.envMissingBody"),
+          buttons: [
+            { id: "cancel", label: i18n.t("common.cancel") },
+            { id: "goto", label: i18n.t("training.envMissingGoto"), kind: "primary" },
+          ],
+        });
+        if (c === "goto" && !useAppStore.getState().settingsOpen) useAppStore.getState().toggleSettings();
+        return;
+      }
+    } catch {
+      /* ready-check unavailable → fall through; start_training's own error still surfaces loudly */
+    }
     const { config, dataset, speakerGroups } = get();
     set({ starting: true });
     try {

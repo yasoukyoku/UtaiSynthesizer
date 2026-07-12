@@ -182,14 +182,14 @@ pub fn get_log_dir() -> PathBuf {
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             return PathBuf::from(local)
-                .join("com.utai.app")
+                .join("com.utaisynthesizer.app")
                 .join("logs");
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(data) = dirs_next::data_local_dir() {
-            return data.join("com.utai.app").join("logs");
+            return data.join("com.utaisynthesizer.app").join("logs");
         }
     }
     PathBuf::from(".").join("logs")

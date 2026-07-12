@@ -632,7 +632,12 @@ export function ghProxyPrefix(gh: GhMirror): string | null {
   if (gh.type === "custom") {
     // localStorage shape-tolerance (audit): a corrupt persisted value without customUrl must not
     // throw here (it would wedge the Settings test button) — same posture as applyMirror's truthiness guard.
-    const u = (gh.customUrl ?? "").trim().replace(/\/+$/, "");
+    let u = (gh.customUrl ?? "").trim().replace(/\/+$/, "");
+    // Scheme normalization (S64 audit): downstream consumers require a well-formed https prefix —
+    // the updater's endpoint validation hard-rejects non-https in RELEASE builds, and Rust-side
+    // sanitize_gh_prefix degrades schemeless/http prefixes to "no proxy". Prepending https here
+    // keeps a bare "ghfast.top"-style entry working everywhere instead of silently doing nothing.
+    if (u && !/^https?:\/\//i.test(u)) u = "https://" + u;
     return u || null;
   }
   return null; // direct

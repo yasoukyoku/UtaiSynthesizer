@@ -115,13 +115,13 @@
     "closeBody": "Save changes to the current project before closing?",
     "dontSave": "Don't Save",
     "recoverTitle": "Recover Project",
-    "recoverBody": "UTAI didn't close normally last time. Recover your unsaved work?",
+    "recoverBody": "UtaiSynthesizer didn't close normally last time. Recover your unsaved work?",
     "recover": "Recover",
     "recovered": "Recovered"
   },
   "close": {
-    "title": "Close UTAI",
-    "body": "Minimize to the tray, or quit UTAI?",
+    "title": "Close UtaiSynthesizer",
+    "body": "Minimize to the tray, or quit UtaiSynthesizer?",
     "minimize": "Minimize to Tray",
     "quit": "Quit",
     "busyTitle": "Tasks In Progress",
@@ -136,7 +136,9 @@
     "task_cuda_download": "CUDA runtime download",
     "task_pyenv_install": "Training runtime pack install",
     "task_midi-extract": "MIDI extraction",
-    "task_game-download": "GAME engine download"
+    "task_game-download": "GAME engine download",
+    "task_asset-download": "Model asset download",
+    "task_update-download": "App update download"
   },
   "tray": {
     "show": "Show Window",
@@ -321,6 +323,9 @@
     "importSelectedDone": "Imported {{count}} checkpoints",
     "importSelectedPartial": "Imported {{ok}}/{{total}}, these failed:",
     "started": "Training started",
+    "envMissingTitle": "Training Runtime Not Installed",
+    "envMissingBody": "Training needs the embedded Python runtime (a GPU pack matching your card, or the universal CPU pack).\nDownload it in Settings → Training Runtime, then start training.",
+    "envMissingGoto": "Open Settings",
     "stop": "Stop training",
     "stopping": "Stopping… (saving after the current step)",
     "forceStop": "Force terminate",
@@ -427,7 +432,32 @@
   "common": {
     "cancel": "Cancel",
     "confirm": "Confirm",
+    "ok": "OK",
     "busyRetry": "The app is busy — try again shortly"
+  },
+  "update": {
+    "title": "Update Available",
+    "versionLine": "New version: {{to}} (current: {{from}})",
+    "restartNote": "The update downloads and installs automatically; the app will close and restart. Unsaved changes are offered for recovery after the restart.",
+    "later": "Later",
+    "installNow": "Update Now",
+    "retry": "Retry",
+    "starting": "Preparing download…",
+    "downloading": "Downloading",
+    "installing": "Installing — the app will restart shortly…",
+    "checkFailedTitle": "Update Check Failed",
+    "checkFailedHint": "Likely a network issue. Retry in Settings → Version & Updates, where you can also turn off checking on startup.",
+    "quitBlocked": "An update is downloading/installing — the app restarts automatically when done; cancel the update first if you need to quit"
+  },
+  "startup": {
+    "dataDirIssue": "Data folder problem: the configured folder was missing and has been handled — see Settings → Storage for details"
+  },
+  "help": {
+    "title": "Help & Community",
+    "qq": "QQ Group",
+    "discord": "Discord Community",
+    "score2convec": "Score2ConVec (GitHub)",
+    "repo": "Project Home (GitHub)"
   },
   "vocalEditor": {
     "title": "Vocal",
@@ -713,6 +743,12 @@
     "TRAINING_THREAD_SPAWN_FAILED": "Failed to spawn the training thread",
     "TRAINING_TOTAL_STEPS_ZERO": "Total steps must be greater than 0",
     "TRAINING_UNKNOWN_ERROR": "Unknown training error",
+    "ASSET_DL_BUSY": "A model-asset download is already running — wait for it to finish",
+    "ASSET_DL_FAILED": "Model asset download failed",
+    "UPDATE_CHECK_FAILED": "Update check failed (network or update source unreachable)",
+    "UPDATE_DOWNLOAD_FAILED": "Update download failed",
+    "UPDATE_INSTALL_FAILED": "Failed to launch the update installer",
+    "UPDATE_NO_PENDING": "No pending update (check for updates first)",
     "VERIFY_TASK_FAILED": "Verification task failed",
     "VOCAL_BACKEND_UNKNOWN": "Unknown backend (only sovits / rvc)",
     "VOCAL_F0_FRAMES_MISMATCH": "f0 frame count doesn't match the notes' total frames (render aborted to avoid pitch misalignment)",

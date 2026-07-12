@@ -136,7 +136,7 @@ pub async fn download_msst_model(
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("UTAI/2.0")
+        .user_agent(crate::download::APP_USER_AGENT)
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 

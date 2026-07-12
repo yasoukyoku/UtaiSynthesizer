@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
@@ -14,7 +15,8 @@ import { applyMirror, applyGhMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
-import { backendErrorMessage } from "../../lib/backendError";
+import { backendErrorMessage, isCancelError } from "../../lib/backendError";
+import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type UpdateInfo } from "../../lib/update";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -125,6 +127,26 @@ const fmtGB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.
 /** Sub-MB friendly size (the report has KB-scale rows like logs/dictionaries). */
 const fmtSize = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
+/** Mirror of Rust `commands::assets::{AssetPackStatus, AssetPackProgress}` (S64). */
+interface AssetPackStatus {
+  id: string;
+  fileCount: number;
+  missing: number;
+  totalBytes: number;
+  missingBytes: number;
+  downloading: boolean;
+}
+interface AssetPackProgress {
+  pack: string;
+  stage: string; // "download" | "done" | "failed" | "cancelled"
+  file: string;
+  fileIndex: number;
+  fileCount: number;
+  downloaded: number;
+  total: number;
+  error: string | null;
+}
+
 /** Mirror of Rust `commands::storage::{StorageReport, WorkspaceUsage}` (S61). */
 interface WorkspaceUsage {
   slug: string;
@@ -224,6 +246,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [cudaError, setCudaError] = useState<string | null>(null);
   const [cudaJustInstalled, setCudaJustInstalled] = useState(false);
   const [dataDir, setDataDir] = useState("");
+  // S64: configured-but-missing data dir recovered at startup (recreated empty / fell back) — the
+  // persistent surface for the startup toast (App.tsx), so the cause stays findable after 5s.
+  const [dataDirIssue, setDataDirIssue] = useState<{ configured: string; effective: string; fell_back: boolean } | null>(null);
   const [relocating, setRelocating] = useState(false);
   const [relocateMsg, setRelocateMsg] = useState<string | null>(null);
   const showConfirm = useAppStore((s) => s.showConfirm);
@@ -258,6 +283,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
     invoke<string>("get_device_preference").then(setDevice).catch(() => {});
     invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
     invoke<string>("get_data_dir").then(setDataDir).catch(() => {});
+    invoke<{ configured: string; effective: string; fell_back: boolean } | null>("get_data_dir_issue")
+      .then(setDataDirIssue)
+      .catch(() => {});
     refreshRuntime();
   }, [refreshRuntime]);
 
@@ -508,6 +536,90 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try { localStorage.setItem("lang", value); } catch { /* ignore */ }
   };
 
+  // S64 — version & update-check section state. The dialog itself (progress/install) is the app-level
+  // UpdateDialog; this section only runs the CHECK and reports its outcome inline.
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => { void getVersion().then(setAppVersion).catch(() => {}); }, []);
+  const [autoCheck, setAutoCheck] = useState(autoUpdateCheckEnabled);
+  const [updChecking, setUpdChecking] = useState(false);
+  const [updResult, setUpdResult] = useState<{ kind: "latest" } | { kind: "found"; info: UpdateInfo } | { kind: "error"; msg: string } | null>(null);
+
+  const handleAutoCheckToggle = (v: boolean) => {
+    setAutoCheck(v);
+    setAutoUpdateCheckEnabled(v);
+  };
+
+  const handleUpdateCheck = useCallback(async () => {
+    setUpdChecking(true);
+    setUpdResult(null);
+    try {
+      const info = await checkForUpdate();
+      if (info) {
+        setUpdResult({ kind: "found", info });
+        useAppStore.getState().openUpdateDialog(info);
+      } else {
+        setUpdResult({ kind: "latest" });
+      }
+    } catch (e) {
+      setUpdResult({ kind: "error", msg: backendErrorMessage(e) ?? String(e) });
+    } finally {
+      setUpdChecking(false);
+    }
+  }, []);
+
+  // S64 — model-asset packs (assets.rs): aux inference models + training bases, HF-hosted.
+  const [assetPacks, setAssetPacks] = useState<AssetPackStatus[]>([]);
+  const [assetActive, setAssetActive] = useState<string | null>(null);
+  const [assetProgress, setAssetProgress] = useState<AssetPackProgress | null>(null);
+  const [assetMsg, setAssetMsg] = useState<string | null>(null);
+  const refreshAssets = useCallback(() => {
+    invoke<AssetPackStatus[]>("asset_pack_status").then(setAssetPacks).catch(() => {});
+  }, []);
+  useEffect(() => { refreshAssets(); }, [refreshAssets]);
+  useEffect(() => {
+    // Backend events are the progress truth — a remounted panel re-attaches seamlessly (the
+    // pyenv/GAME pattern; per-pack `downloading` in asset_pack_status covers the between-events
+    // gap). ANY non-"download" stage is terminal: done, cancelled (silent, the app-wide cancel
+    // convention) or failed (localized error shown) — the backend always emits one (audit S64).
+    const un = listen<AssetPackProgress>("asset-pack-progress", (e) => {
+      if (e.payload.stage !== "download") {
+        setAssetProgress(null);
+        setAssetActive(null);
+        if (e.payload.stage === "failed" && e.payload.error) {
+          setAssetMsg(backendErrorMessage(e.payload.error) ?? e.payload.error);
+        }
+        refreshAssets();
+      } else {
+        setAssetProgress(e.payload);
+        setAssetActive(e.payload.pack);
+      }
+    });
+    return () => { un.then((f) => f()); };
+  }, [refreshAssets]);
+
+  const handleAssetDownload = useCallback(async (id: string) => {
+    setAssetMsg(null);
+    setAssetActive(id);
+    try {
+      // The chosen HF source rides along as a host-replacement base and is tried FIRST (Rust
+      // dedupes it out of the fixed huggingface.co → hf-mirror.com rotation) — the hf-mirror
+      // preset must reorder the rotation, not be silently ignored (audit S64).
+      const hfBase =
+        mirror.type === "hf-mirror"
+          ? "https://hf-mirror.com"
+          : mirror.type === "custom" && mirror.customUrl.trim()
+            ? mirror.customUrl.trim()
+            : null;
+      await invoke("download_asset_pack", { id, hfBase });
+    } catch (e) {
+      if (!isCancelError(e)) setAssetMsg(backendErrorMessage(e) ?? String(e));
+    } finally {
+      setAssetActive(null);
+      setAssetProgress(null);
+      refreshAssets();
+    }
+  }, [mirror, refreshAssets]);
+
   const handleDeviceChange = useCallback(async (value: string) => {
     setDevice(value);
     setSaving(true);
@@ -535,6 +647,22 @@ export function Settings({ onClose }: { onClose: () => void }) {
     const map: Record<string, Record<string, string>> = {
       title: { zh: "设置", en: "Settings", ja: "設定" },
       language: { zh: "界面语言", en: "Language", ja: "表示言語" },
+      verTitle: { zh: "版本与更新", en: "Version & Updates", ja: "バージョンと更新" },
+      verCurrent: { zh: "当前版本", en: "Current version", ja: "現在のバージョン" },
+      verCheckBtn: { zh: "检查更新", en: "Check for Updates", ja: "更新を確認" },
+      verChecking: { zh: "检查中…", en: "Checking…", ja: "確認中…" },
+      verLatest: { zh: "已是最新版本", en: "You're on the latest version", ja: "最新バージョンです" },
+      verFound: { zh: "发现新版本", en: "New version available", ja: "新しいバージョンがあります" },
+      verView: { zh: "查看", en: "View", ja: "表示" },
+      verAutoCheck: { zh: "启动时自动检查更新", en: "Check for updates on startup", ja: "起動時に更新を確認" },
+      assetTitle: { zh: "模型资产", en: "Model Assets", ja: "モデルアセット" },
+      assetAux: { zh: "推理核心模型包", en: "Core inference models", ja: "推論コアモデル" },
+      assetRvc: { zh: "RVC 训练底模", en: "RVC training base models", ja: "RVC 学習ベースモデル" },
+      assetSovits: { zh: "SoVITS 训练底模", en: "SoVITS training base models", ja: "SoVITS 学習ベースモデル" },
+      assetInstalled: { zh: "已安装", en: "Installed", ja: "インストール済み" },
+      assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
+      assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
+      assetNote: { zh: "推理核心包 = 人声轨合成 / 翻唱 / 音高提取的必备模型（约 1.4GB）；训练底模按需下载。已在下载中断处自动续传。", en: "The core pack holds the models required for vocal-track synthesis / covers / pitch extraction (~1.4GB); training bases are optional. Interrupted downloads resume automatically.", ja: "推論コアパックはボーカルトラック合成／カバー／ピッチ抽出に必須のモデルです（約 1.4GB）。学習ベースは必要に応じて。中断したダウンロードは自動で再開されます。" },
       hardware: { zh: "硬件", en: "Hardware", ja: "ハードウェア" },
       gpu: { zh: "显卡", en: "GPU", ja: "GPU" },
       cuda: { zh: "CUDA 可用", en: "CUDA Available", ja: "CUDA 利用可能" },
@@ -556,6 +684,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaNote: { zh: "需要 CUDA 12 Toolkit。下载 ORT CUDA DLLs (~200MB) + cuDNN (~400MB)。", en: "Requires CUDA 12 Toolkit. Downloads ORT CUDA DLLs (~200MB) + cuDNN (~400MB).", ja: "CUDA 12 Toolkit が必要です。ORT CUDA DLLs + cuDNN をダウンロードします。" },
       cudaRestart: { zh: "下载完成，重启应用后生效。", en: "Download complete. Restart to activate.", ja: "ダウンロード完了。再起動で有効になります。" },
       storage: { zh: "存储位置", en: "Storage", ja: "保存場所" },
+      stDirRecreated: { zh: "警告：配置的数据目录 {configured} 此前不存在，已重新创建（内容为空）。若数据在别处，请检查该盘/目录。", en: "Warning: the configured data folder {configured} was missing and has been recreated (empty). If your data lives elsewhere, check that drive/folder.", ja: "警告：設定されたデータフォルダ {configured} が存在しなかったため、再作成しました（空です）。データが別の場所にある場合は、そのドライブ/フォルダを確認してください。" },
+      stDirFellBack: { zh: "警告：配置的数据目录 {configured} 不可用（盘符不存在？），本次改用程序旁的默认目录。恢复该盘后重启即可回到原目录。", en: "Warning: the configured data folder {configured} is unavailable (drive missing?). Using the default folder next to the program for this session; restore the drive and restart to return to it.", ja: "警告：設定されたデータフォルダ {configured} が利用できません（ドライブ未接続？）。今回はプログラム横の既定フォルダを使用します。ドライブを戻して再起動すると元に戻ります。" },
       dataDir: { zh: "数据目录（模型 + 缓存）", en: "Data folder (models + cache)", ja: "データフォルダ（モデル + キャッシュ）" },
       relocate: { zh: "更改并迁移…", en: "Change & migrate…", ja: "変更して移行…" },
       relocating: { zh: "迁移中…", en: "Migrating…", ja: "移行中…" },
@@ -707,6 +837,31 @@ export function Settings({ onClose }: { onClose: () => void }) {
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("verTitle")}</h3>
+          <div className="settings-row">
+            <span className="settings-label">{L("verCurrent")}</span>
+            <span className="settings-value">{appVersion ? `v${appVersion}` : "…"}</span>
+            <button className="settings-mini-btn" disabled={updChecking} onClick={() => void handleUpdateCheck()}>
+              {updChecking ? L("verChecking") : L("verCheckBtn")}
+            </button>
+          </div>
+          {updResult?.kind === "latest" && <div className="settings-note">{L("verLatest")}</div>}
+          {updResult?.kind === "found" && (
+            <div className="settings-note">
+              {L("verFound")}: v{updResult.info.version}{" "}
+              <button className="settings-mini-btn" onClick={() => useAppStore.getState().openUpdateDialog(updResult.info)}>
+                {L("verView")}
+              </button>
+            </div>
+          )}
+          {updResult?.kind === "error" && <div className="settings-error">{updResult.msg}</div>}
+          <label className="training-check-row" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <input type="checkbox" checked={autoCheck} onChange={(e) => handleAutoCheckToggle(e.target.checked)} />
+            <span>{L("verAutoCheck")}</span>
+          </label>
+        </section>
+
+        <section className="settings-section" style={{ marginTop: 16 }}>
           <h3 className="settings-section-title">{L("hardware")}</h3>
 
           {hw && (
@@ -764,6 +919,11 @@ export function Settings({ onClose }: { onClose: () => void }) {
             <label>{L("dataDir")}</label>
             <span className="settings-value" style={{ maxWidth: "100%", wordBreak: "break-all", fontSize: 11 }}>{dataDir || "…"}</span>
           </div>
+          {dataDirIssue && (
+            <p className="settings-error" style={{ wordBreak: "break-all" }}>
+              {(dataDirIssue.fell_back ? L("stDirFellBack") : L("stDirRecreated")).replace("{configured}", dataDirIssue.configured)}
+            </p>
+          )}
           <div className="settings-field">
             <button className="settings-btn" onClick={handleRelocate} disabled={relocating} style={{ padding: "5px 12px", cursor: "pointer" }}>
               {relocating ? L("relocating") : L("relocate")}
@@ -939,6 +1099,55 @@ export function Settings({ onClose }: { onClose: () => void }) {
             )}
           </div>
           <p className="settings-note">{L("ghNote")}</p>
+        </section>
+
+        {/* ── S64 model-asset packs — right under the download-source config they ride on ── */}
+        <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("assetTitle")}</h3>
+          {assetPacks.map((p) => {
+            const label = p.id === "aux-inference" ? L("assetAux") : p.id === "training-rvc" ? L("assetRvc") : L("assetSovits");
+            // p.downloading = backend truth (survives a panel remount before the next chunk event).
+            const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
+            const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);
+            return (
+              <div key={p.id} className="settings-row" style={{ alignItems: "center", gap: 8 }}>
+                <span className="settings-label">{label}</span>
+                <span className={`settings-badge ${p.missing === 0 ? "ok" : "no"}`}>
+                  {p.missing === 0
+                    ? L("assetInstalled")
+                    : `${L("assetMissing")} ${p.missing}/${p.fileCount} · ${fmtSize(p.missingBytes)}`}
+                </span>
+                {p.missing > 0 && !isDl && (
+                  <button className="settings-mini-btn" disabled={anyDl} onClick={() => void handleAssetDownload(p.id)}>
+                    {L("assetDownload")}
+                  </button>
+                )}
+                {isDl && (
+                  <button
+                    className="settings-mini-btn danger"
+                    onClick={() => void invoke("cancel_asset_pack_download").catch(() => {})}
+                  >
+                    {L("rtCancelBtn")}
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          {assetProgress && (
+            <div className="settings-progress">
+              <div className="settings-progress-bar">
+                <div
+                  className="settings-progress-fill"
+                  style={{ width: `${assetProgress.total > 0 ? Math.round((assetProgress.downloaded / assetProgress.total) * 100) : 0}%` }}
+                />
+              </div>
+              <span className="settings-progress-text">
+                {`${assetProgress.fileIndex + 1}/${assetProgress.fileCount} · ${fmtSize(assetProgress.downloaded)} / ${fmtSize(assetProgress.total)}`}
+              </span>
+            </div>
+          )}
+          {assetMsg && <p className="settings-error">{assetMsg}</p>}
+          <p className="settings-note">{L("assetNote")}</p>
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>

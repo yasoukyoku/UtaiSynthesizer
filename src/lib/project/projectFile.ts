@@ -16,6 +16,7 @@ import { cancelExtractionsForTeardown } from "../vocal/midiExtract";
 import { clearClipboard } from "../clipboard";
 import { buildSaveBundle, parseLoadedBundle, type LoadedProject } from "./bundle";
 import { hasUnsavedWork, isRecoveryPending, markAutosaveBaseline } from "./autosave";
+import { healLoadedTrackAvatars } from "../workflow/modelPathHeal";
 
 const t = (k: string) => i18n.t(k);
 
@@ -166,13 +167,17 @@ export async function openProjectFile(): Promise<void> {
       title: t("project.openTitle"),
       directory: false,
       multiple: false,
-      filters: [{ name: "UTAI Project", extensions: ["usp"] }],
+      filters: [{ name: "UtaiSynthesizer Project", extensions: ["usp"] }],
     });
     if (!sel || typeof sel !== "string") return;
     // Extract the archive (to a work dir) BEFORE tearing down the current project, so a bad/missing
     // archive leaves the open project intact.
     const opened = await invoke<{ work_dir: string; project_json: string }>("open_project_archive", { uspPath: sel });
     const loaded = parseLoadedBundle(opened.project_json, opened.work_dir);
+    // S64 portability: avatar paths persist absolute — re-resolve from the singer registry so a
+    // project from a moved install / another machine shows its avatars (history resets below, so
+    // this can't create an undo step; dirty is explicitly set right after).
+    await healLoadedTrackAvatars(loaded.tracks);
     teardownForLoad();
     useProjectStore.setState({
       name: loaded.name, filePath: sel, tracks: loaded.tracks,
@@ -237,7 +242,7 @@ export async function saveProjectFileAs(): Promise<boolean> {
     const uspPath = await saveDialog({
       title: t("project.saveAsTitle"),
       defaultPath: `${name}.usp`,
-      filters: [{ name: "UTAI Project", extensions: ["usp"] }],
+      filters: [{ name: "UtaiSynthesizer Project", extensions: ["usp"] }],
     });
     if (!uspPath) return false;
     return await writeArchive(uspPath, true);
@@ -278,9 +283,10 @@ async function writeArchive(uspPath: string, rename: boolean): Promise<boolean> 
  *  DIRTY (it was never saved to a real `.usp`) so the user is nudged to save it properly; the autosave
  *  file is left in place (it's still the snapshot of this as-yet-unsaved work). Media paths in the
  *  envelope are absolute, so `parseLoadedBundle` passes them through untouched. */
-export function restoreAutosave(env: { filePath: string | null; name: string; projectJson: string }): void {
+export async function restoreAutosave(env: { filePath: string | null; name: string; projectJson: string }): Promise<void> {
   try {
     const loaded = parseLoadedBundle(env.projectJson, ""); // absolute media paths pass through untouched
+    await healLoadedTrackAvatars(loaded.tracks); // same avatar re-resolve as openProjectFile
     teardownForLoad();
     useProjectStore.setState({
       name: loaded.name,

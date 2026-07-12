@@ -39,6 +39,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // ── Generated from the S62 full-sweep manifests (4 conversion clusters) — one entry per stable
   // Rust CODE; texts live under backend.* in src/i18n/{zh,en,ja}.json (TRAINING_NO_DATA reuses the
   // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
+  ASSET_DL_BUSY: { key: "backend.ASSET_DL_BUSY", busy: true },
+  ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
   AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
   AUDIO_TOO_SHORT_HIGHPASS: { key: "backend.AUDIO_TOO_SHORT_HIGHPASS" },
   AUDITION_BACKEND_UNSUPPORTED: { key: "backend.AUDITION_BACKEND_UNSUPPORTED" },
@@ -243,6 +245,10 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_THREAD_SPAWN_FAILED: { key: "backend.TRAINING_THREAD_SPAWN_FAILED" },
   TRAINING_TOTAL_STEPS_ZERO: { key: "backend.TRAINING_TOTAL_STEPS_ZERO" },
   TRAINING_UNKNOWN_ERROR: { key: "backend.TRAINING_UNKNOWN_ERROR" },
+  UPDATE_CHECK_FAILED: { key: "backend.UPDATE_CHECK_FAILED" },
+  UPDATE_DOWNLOAD_FAILED: { key: "backend.UPDATE_DOWNLOAD_FAILED" },
+  UPDATE_INSTALL_FAILED: { key: "backend.UPDATE_INSTALL_FAILED" },
+  UPDATE_NO_PENDING: { key: "backend.UPDATE_NO_PENDING" },
   VERIFY_TASK_FAILED: { key: "backend.VERIFY_TASK_FAILED" },
   VOCAL_BACKEND_UNKNOWN: { key: "backend.VOCAL_BACKEND_UNKNOWN" },
   VOCAL_F0_FRAMES_MISMATCH: { key: "backend.VOCAL_F0_FRAMES_MISMATCH" },

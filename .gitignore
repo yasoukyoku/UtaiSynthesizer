@@ -79,3 +79,6 @@ S2H/
 
 # Tauri generated schemas (regenerated on build)
 src-tauri/gen/
+
+# S64 release: pinned ffmpeg essentials build for bundling (downloaded by scripts, not committed)
+bin/

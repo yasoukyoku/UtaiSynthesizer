@@ -22,7 +22,7 @@ let lastWrite = 0;
 let clearEpoch = 0; // bumped by clearAutosave; flush re-clears if it changed across an in-flight write
 let savedJson: string | null = null; // serialized doc as of the last REAL save / open / new (clean baseline)
 let recoveryPending = false; // true while the startup recover prompt is open — don't clobber the slot
-let flushing = false; // single-flight guard: only one write_autosave in flight at a time
+let current: Promise<void> | null = null; // the in-flight flush chain (single-flight guard + awaitable handle)
 let pendingFlush = false; // a change arrived mid-write → run one trailing flush with the latest content
 
 interface AutosaveEnvelope {
@@ -43,17 +43,17 @@ function buildEnvelope(projectJson: string): string {
   return JSON.stringify(env);
 }
 
-async function flush() {
-  if (recoveryPending) return; // a recovery decision is pending — don't overwrite the recovery slot
-  if (flushing) { pendingFlush = true; return; } // single-flight: coalesce concurrent calls into one trailing run
+/** One flush pass + any coalesced trailing rerun. The returned promise settles only when THIS
+ *  call's work (write or clear, plus the trailing rerun it absorbed) is durably done — exit-like
+ *  awaiters (S64 update install: the installer kills the process) depend on that. */
+async function doFlush(): Promise<void> {
   const s = useProjectStore.getState();
   // Empty doc, or identical to the last real save → nothing worth recovering: drop any stale file.
   const json = s.tracks.length === 0 ? null : currentProjectJson();
   if (json === null || json === savedJson) {
-    void clearAutosave();
+    await clearAutosave();
     return;
   }
-  flushing = true;
   lastWrite = Date.now(); // optimistic — self-throttle the force-flush branch while this write is in flight
   const epoch = clearEpoch;
   try {
@@ -62,10 +62,23 @@ async function flush() {
     if (clearEpoch !== epoch) void invoke("clear_autosave").catch(() => {});
   } catch {
     /* autosave is best-effort — a failed write must never disrupt editing */
-  } finally {
-    flushing = false;
-    if (pendingFlush) { pendingFlush = false; void flush(); } // trailing run with the latest content
   }
+  if (pendingFlush) {
+    pendingFlush = false;
+    await doFlush(); // trailing run with the latest content — awaited so `current` covers it
+  }
+}
+
+function flush(): Promise<void> {
+  if (recoveryPending) return Promise.resolve(); // recovery decision pending — don't clobber the slot
+  if (current) {
+    pendingFlush = true; // coalesce: the in-flight chain reruns with the latest content before settling
+    return current;
+  }
+  current = doFlush().finally(() => {
+    current = null;
+  });
+  return current;
 }
 
 function schedule() {
@@ -144,10 +157,12 @@ export function rearmAutosave(): void {
 }
 
 /** Force an IMMEDIATE autosave (bypass the debounce) — for commit-like milestones worth snapshotting at
- *  once, e.g. a finished render/separation, so a fast reload right after doesn't lose it to the 1.5s wait. */
-export function flushAutosaveNow(): void {
+ *  once, e.g. a finished render/separation, so a fast reload right after doesn't lose it to the 1.5s wait.
+ *  Returns the write's promise so exit-like callers (S64 update install: the installer kills the process)
+ *  can AWAIT the snapshot; fire-and-forget callers just ignore it. */
+export function flushAutosaveNow(): Promise<void> {
   clearTimeout(debounceTimer);
-  void flush();
+  return flush();
 }
 
 /** Read the autosave envelope left by an unclean exit (null if last session shut down cleanly). */

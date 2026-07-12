@@ -23,6 +23,15 @@
   text-shadow: 0 0 8px var(--accent-primary-glow);
 }
 
+.titlebar-brand-sub {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 3px;
+  margin-left: 5px;
+  text-shadow: none;
+}
+
 .titlebar-menu {
   display: flex;
   gap: var(--space-xs);
@@ -115,4 +124,10 @@
   color: var(--accent-primary);
   border-color: var(--accent-primary-dim);
   background: var(--accent-primary-glow);
+}
+
+/* S64 help "?" — square icon variant of .titlebar-btn (the SVG glyph replaces text). */
+.titlebar-help {
+  width: 24px;
+  padding: 0;
 }

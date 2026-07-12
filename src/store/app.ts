@@ -113,6 +113,12 @@ interface AppState {
   banner: { message: string; kind: BannerKind; seq: number } | null;
   /** A pending styled confirm dialog (replaces the native `ask` popup). null = nothing shown. */
   confirm: ConfirmRequest | null;
+  /** S64 update flow: a new version found by update_check, shown by UpdateDialog. null = closed.
+   *  Opened from the startup auto-check AND Settings' manual check — hence store-level, not local. */
+  updateDialog: { version: string; currentVersion: string; notes: string | null } | null;
+  /** True while UpdateDialog is downloading/installing — the quit flows consult it (a busy update
+   *  must not be silently abandoned by tray-quit / window-X; audit S64). */
+  updateBusy: boolean;
 
   toggleTrainingPage: () => void;
   toggleModelManager: () => void;
@@ -150,6 +156,9 @@ interface AppState {
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
   /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
+  openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
+  closeUpdateDialog: () => void;
+  setUpdateBusy: (v: boolean) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
   showBanner: (message: string, kind: BannerKind) => void;
@@ -194,6 +203,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   toasts: [],
   banner: null,
   confirm: null,
+  updateDialog: null,
+  updateBusy: false,
 
   toggleTrainingPage: () =>
     set((s) => ({ trainingPageOpen: !s.trainingPageOpen })),
@@ -296,6 +307,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
       return { midiExtracting: next };
     }),
+  openUpdateDialog: (info) => set({ updateDialog: info }),
+  closeUpdateDialog: () => set({ updateDialog: null }),
+  setUpdateBusy: (v) => set({ updateBusy: v }),
   showToast: (message, type = "error") => {
     // monotonic id — Date.now() collides when two toasts fire in the same millisecond (e.g. the
     // auto-render batch reporting several failures back-to-back), making the first timeout dismiss both.

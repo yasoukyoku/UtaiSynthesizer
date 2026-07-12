@@ -4,6 +4,7 @@ import { NodeShell } from "./NodeShell";
 import { useNodeParams } from "./useNodeParams";
 import { ParamSlider } from "./ParamSlider";
 import { useMsstModelStore } from "../../../store/msst-models";
+import { msstOnnxPath } from "../../../lib/workflow/modelPathHeal";
 import {
   MSST_CATALOG,
   type MsstCategory,
@@ -58,7 +59,7 @@ export function SeparationNode(props: NodeProps) {
 
   useEffect(() => {
     if (!modelsDir) return;
-    if (currentModel && (params.modelFile !== currentModel.filename || !params.modelPath || params.modelPath === `/${currentModel.filename.replace(/\.(ckpt|th|pth)$/, ".onnx")}`)) {
+    if (currentModel && (params.modelFile !== currentModel.filename || !params.modelPath || params.modelPath === msstOnnxPath("", currentModel.filename))) {
       updateParams({
         modelFile: currentModel.filename,
         stemLabels: stems,
@@ -78,11 +79,8 @@ export function SeparationNode(props: NodeProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stems.join("")]);
 
-  const resolveOnnxPath = useCallback((filename: string) => {
-    const onnxName = filename.replace(/\.(ckpt|th|pth)$/, ".onnx");
-    const dir = modelsDir.replace(/\\/g, "/");
-    return `${dir}/${onnxName}`;
-  }, [modelsDir]);
+  // The extension rule lives in modelPathHeal.msstOnnxPath (shared with the engine's use-time heal).
+  const resolveOnnxPath = useCallback((filename: string) => msstOnnxPath(modelsDir, filename), [modelsDir]);
 
   const handleModelChange = useCallback((filename: string) => {
     const m = models.find((x) => x.filename === filename);

@@ -138,6 +138,17 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
     })
 }
 
+/// S64 release gating (the S43 decision, frontend half in TrainingPage): TRUE when a REAL training
+/// interpreter resolves (dev venv / installed runtime pack / manual python slot). FALSE = the spawn
+/// would fall back to bare PATH `python` — doomed on end-user machines, so the start button shows
+/// the "download a training runtime first" dialog instead. Mirrors the actual resolution by CALLING
+/// pyenv::training_interpreter (never a forked re-implementation).
+#[tauri::command]
+pub fn training_env_ready(state: State<'_, Arc<AppState>>) -> bool {
+    let (py, _) = pyenv::training_interpreter(&state.app_dir, false);
+    py != std::path::Path::new("python")
+}
+
 #[tauri::command]
 pub async fn download_runtime_pack(
     app: tauri::AppHandle,

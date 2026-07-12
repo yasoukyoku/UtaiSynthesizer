@@ -274,15 +274,64 @@ fn load_config(app_dir: &std::path::Path) -> Option<AppConfig> {
     }
 }
 
+/// S64 portability: the data-dir override in config.json is an ABSOLUTE user-chosen path (the one
+/// sanctioned absolute reference) — when its target vanishes (drive unplugged, dir deleted, install
+/// copied to another machine) the old behavior was a SILENT empty library (models/dictionaries/
+/// runtimes all "gone", zero warnings). This records what happened for the settings UI + a startup
+/// toast; set at most once, at startup resolution.
+#[derive(serde::Serialize, Clone)]
+pub struct DataDirIssue {
+    /// The configured (missing) override path.
+    pub configured: String,
+    /// The directory actually used this session.
+    pub effective: String,
+    /// true = override unusable (drive gone) → default next to the program; false = recreated empty.
+    pub fell_back: bool,
+}
+
+pub static DATA_DIR_ISSUE: std::sync::OnceLock<DataDirIssue> = std::sync::OnceLock::new();
+
+/// Startup warning for the frontend (null = the data dir resolved normally).
+#[tauri::command]
+pub fn get_data_dir_issue() -> Option<DataDirIssue> {
+    DATA_DIR_ISSUE.get().cloned()
+}
+
 /// Data root for the big growable files (models + cache). User-set in config.json's `data_dir`; else
 /// `app_dir/data` — NEXT TO THE PROGRAM, never C: AppData (those files reach tens of GB). Derived at
-/// startup; changing it takes effect on restart.
+/// startup; changing it takes effect on restart. A configured-but-missing override is recreated on
+/// its drive when possible (user intent wins), else falls back to the default — either way LOUDLY
+/// (DATA_DIR_ISSUE), never a silent empty library.
 pub fn resolve_data_dir(app_dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(cfg) = load_config(app_dir) {
         if let Some(d) = cfg.data_dir {
             let d = d.trim();
             if !d.is_empty() {
-                return std::path::PathBuf::from(d);
+                let p = std::path::PathBuf::from(d);
+                if p.is_dir() {
+                    return p;
+                }
+                if std::fs::create_dir_all(&p).is_ok() {
+                    tracing::warn!("configured data_dir {} was missing — recreated (empty)", d);
+                    let _ = DATA_DIR_ISSUE.set(DataDirIssue {
+                        configured: d.to_string(),
+                        effective: p.to_string_lossy().to_string(),
+                        fell_back: false,
+                    });
+                    return p;
+                }
+                let fallback = app_dir.join("data");
+                tracing::warn!(
+                    "configured data_dir {} is unavailable — falling back to {}",
+                    d,
+                    fallback.display()
+                );
+                let _ = DATA_DIR_ISSUE.set(DataDirIssue {
+                    configured: d.to_string(),
+                    effective: fallback.to_string_lossy().to_string(),
+                    fell_back: true,
+                });
+                return fallback;
             }
         }
     }

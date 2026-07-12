@@ -279,12 +279,10 @@ pub async fn download_game_package(
     let client = crate::download::client().map_err(|e| format!("GAME_DL_FAILED: {e}"))?;
     // An explicitly chosen GH proxy goes FIRST (the user selected it because the direct
     // route is bad), followed by the untouched static rotation; sha256 covers any source.
+    // Prefix hygiene = THE shared sanitizer (download.rs — S64 audit: two local copies had
+    // already diverged on the scheme check).
     let mut urls: Vec<String> = GAME_SOURCES.iter().map(|s| s.to_string()).collect();
-    if let Some(prefix) = gh_proxy
-        .as_deref()
-        .map(|p| p.trim().trim_end_matches('/'))
-        .filter(|p| !p.is_empty())
-    {
+    if let Some(prefix) = crate::download::sanitize_gh_prefix(gh_proxy) {
         urls.insert(0, format!("{prefix}/{}", GAME_SOURCES[0]));
     }
     let req = crate::download::DownloadRequest {

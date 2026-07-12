@@ -13,6 +13,7 @@ import { backendErrorMessage, isCancelError } from "../backendError";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
+import { healVoiceModelPath, healMsstModelPath } from "./modelPathHeal";
 import i18n from "../../i18n";
 
 interface AudioFileInfo {
@@ -444,7 +445,9 @@ async function executeNode(
     case "sovits": {
       const isRvc = nodeType === "rvc";
       const voiceName = params.voiceName as string | undefined;
-      const modelPath = params.modelPath as string | undefined;
+      // S64 portability: persisted modelPath is absolute and can be stale after an install/data-dir
+      // move; re-resolve by voiceName at use time (the panel pickers only heal on MOUNT).
+      const modelPath = await healVoiceModelPath(nodeType, voiceName, params.modelPath as string | undefined);
       if (!voiceName || !modelPath) {
         throw new Error(`${isRvc ? "RVC" : "SoVITS"} node has no voice model selected — import one in the resource manager`);
       }
@@ -501,7 +504,12 @@ async function executeNode(
           ?.architecture as MsstArchitecture | undefined);
       const config = {
         audioPath: primaryInput,
-        modelPath: (params.modelPath as string) ?? (params.modelName as string) ?? "",
+        // S64 portability: recompute from the current models dir + stable modelFile (stale absolute
+        // path after an install/data-dir move; the node UI only heals on mount).
+        modelPath: await healMsstModelPath(
+          params.modelFile as string | undefined,
+          (params.modelPath as string) ?? (params.modelName as string) ?? "",
+        ),
         // Per-NODE subdir: Rust names stems by LABEL only ("vocals.wav"), so two separation nodes in one
         // run emitting a same-labeled stem would overwrite each other inside the shared run dir. Rust
         // create_dir_all's the output dir before writing.

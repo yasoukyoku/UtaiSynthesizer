@@ -17,7 +17,10 @@ import { setupTrainingListeners, useTrainingStore } from "./store/training";
 import { ToastContainer } from "./components/common/Toast";
 import { HistoryBanner } from "./components/common/HistoryBanner";
 import { ConfirmDialog } from "./components/common/ConfirmDialog";
+import { UpdateDialog } from "./components/common/UpdateDialog";
 import { RenderLinkWatcher } from "./components/workflow/RenderLinkWatcher";
+import { autoUpdateCheckEnabled, checkForUpdate } from "./lib/update";
+import { backendErrorMessage } from "./lib/backendError";
 import { listen } from "@tauri-apps/api/event";
 import { useWorkflowStore } from "./store/workflow";
 import { useMsstModelStore } from "./store/msst-models";
@@ -49,6 +52,13 @@ async function getRunningTasks(): Promise<string[]> {
  *  changes, then exit the whole app. Any cancel/dismiss aborts the quit (the app keeps running). */
 async function runExitFlow(): Promise<void> {
   if (useAppStore.getState().confirm) return; // a dialog is already open (recovery / another close) — don't stack
+  // S64: a busy update (downloading/installing) must not be silently abandoned; an IDLE update
+  // dialog just closes and the quit proceeds (the user can update after the next launch).
+  if (useAppStore.getState().updateBusy) {
+    useAppStore.getState().showToast(i18n.t("update.quitBlocked"), "info");
+    return;
+  }
+  if (useAppStore.getState().updateDialog) useAppStore.getState().closeUpdateDialog();
   setRecoveryPending(true); // freeze autosave while deciding (no mid-dialog write/clear race)
   try {
     const running = await getRunningTasks();
@@ -122,6 +132,13 @@ export function App() {
         // Don't stack on top of an already-open dialog (the startup "Recover?" prompt, or an in-flight
         // close/exit) — settling it via a new showConfirm would clobber that decision. Let it resolve first.
         if (useAppStore.getState().confirm) return;
+        // S64: same update-busy discipline as runExitFlow (a confirm opened here would paint UNDER
+        // the update overlay and be mouse-unreachable — the X would look dead).
+        if (useAppStore.getState().updateBusy) {
+          useAppStore.getState().showToast(i18n.t("update.quitBlocked"), "info");
+          return;
+        }
+        if (useAppStore.getState().updateDialog) useAppStore.getState().closeUpdateDialog();
         const choice = await useAppStore.getState().showConfirm({
           title: i18n.t("close.title"),
           body: i18n.t("close.body"),
@@ -188,9 +205,68 @@ export function App() {
         ],
       });
       setRecoveryPending(false);
-      if (choice === "recover") restoreAutosave(env);
+      if (choice === "recover") void restoreAutosave(env);
       else await clearAutosave(); // discard OR dismiss — the single recovery slot can't be deferred
     })();
+  }, []);
+
+  // S64 portability: the configured data dir was missing at startup and Rust recovered (recreated
+  // empty / fell back to the default) — surface it, or the empty model library reads as data loss.
+  // Details + the paths live persistently in Settings → Storage; the toast is the attention hook.
+  useEffect(() => {
+    void invoke<{ fell_back: boolean } | null>("get_data_dir_issue")
+      .then((issue) => {
+        if (issue) useAppStore.getState().showToast(i18n.t("startup.dataDirIssue"), "error");
+      })
+      .catch(() => {});
+  }, []);
+
+  // S64: startup update check (GitHub Releases; Settings-toggleable, default ON). Failure is a MODAL
+  // by design — a toast is too easy to miss, and anyone annoyed can turn the auto-check off (user
+  // decision). Collision guard: showConfirm auto-settles an already-open dialog as DISMISSED, and
+  // dismissing the startup "Recover?" prompt DELETES the autosave slot — so wait until no confirm
+  // dialog is open before surfacing anything, and fall back to a toast if one raced in anyway.
+  useEffect(() => {
+    if (!autoUpdateCheckEnabled()) return;
+    let disposed = false;
+    void (async () => {
+      await new Promise((r) => setTimeout(r, 3000));
+      for (let i = 0; i < 60 && !disposed && useAppStore.getState().confirm; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (disposed || useAppStore.getState().confirm) return;
+      try {
+        const info = await checkForUpdate();
+        if (disposed || !info) return;
+        // Same collision guard as the failure path (audit S64): a confirm may have opened DURING
+        // the network check (e.g. the recovery prompt) — wait it out, and if one still holds,
+        // downgrade to a toast rather than stacking a second modal.
+        for (let i = 0; i < 60 && !disposed && useAppStore.getState().confirm; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        if (disposed) return;
+        if (useAppStore.getState().confirm) {
+          useAppStore.getState().showToast(`${i18n.t("update.title")} · v${info.version}`, "info");
+          return;
+        }
+        useAppStore.getState().openUpdateDialog(info);
+      } catch (e) {
+        if (disposed) return;
+        const detail = backendErrorMessage(e) ?? String(e);
+        if (useAppStore.getState().confirm) {
+          useAppStore.getState().showToast(`${i18n.t("update.checkFailedTitle")} — ${detail}`, "error");
+          return;
+        }
+        void useAppStore.getState().showConfirm({
+          title: i18n.t("update.checkFailedTitle"),
+          body: `${detail}\n\n${i18n.t("update.checkFailedHint")}`,
+          buttons: [{ id: "ok", label: i18n.t("common.ok"), kind: "primary" }],
+        });
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -281,6 +357,7 @@ export function App() {
       <ToastContainer />
       <HistoryBanner />
       <ConfirmDialog />
+      <UpdateDialog />
       <RenderLinkWatcher />
     </div>
   );

@@ -455,6 +455,13 @@ fn dir_mtime_and_size(dir: &std::path::Path) -> (std::time::SystemTime, u64) {
     (newest, size)
 }
 
+/// Window-state flags shared by the plugin registration AND the pre-update-install flush
+/// (commands/update.rs — the updater exits via process::exit, skipping the plugin's own exit-time
+/// save; the two sites must never drift, S64 audit).
+pub fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
+    tauri_plugin_window_state::StateFlags::all() & !tauri_plugin_window_state::StateFlags::VISIBLE
+}
+
 /// App root = the directory holding `converter/`. Resolved from the EXECUTABLE's location first
 /// (stable regardless of launch context: a release exe sits next to converter/, a dev exe in
 /// src-tauri/target/debug walks up to the repo root), with the old CWD probe as fallback. The
@@ -462,6 +469,19 @@ fn dir_mtime_and_size(dir: &std::path::Path) -> (std::time::SystemTime, u64) {
 /// with whatever directory the app happened to be launched from.
 fn resolve_app_dir() -> std::path::PathBuf {
     let has_converter = |d: &std::path::Path| d.join("converter").join("convert.py").exists();
+
+    // Dev builds pin to the repo root (compile-time known). S64: bundle.resources now copies
+    // converter/convert.py NEXT TO THE DEBUG EXE on `tauri dev` — without this pin, the walk below
+    // would hit target/debug first and silently move the dev data root there (the exact
+    // "data dir drift" class the resolver exists to prevent).
+    #[cfg(debug_assertions)]
+    {
+        if let Some(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+            if has_converter(root) {
+                return root.to_path_buf();
+            }
+        }
+    }
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -529,7 +549,11 @@ pub fn run() {
         .with(logging::BufferLayer::new(Arc::clone(&log_buffer)))
         .init();
 
-    tracing::info!("UTAI v2 starting — logs: {}", log_dir.display());
+    tracing::info!(
+        "UtaiSynthesizer {} starting — logs: {}",
+        env!("CARGO_PKG_VERSION"),
+        log_dir.display()
+    );
 
     let app_dir_early = resolve_app_dir();
     setup_cuda_dll_paths(&app_dir_early);
@@ -539,14 +563,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Exclude VISIBLE from restore so the plugin doesn't show() the window EARLY (before the frontend
         // registers onCloseRequested) — that would re-open the startup close-race that visible:false closes.
         // Size/position/maximized still restore; the frontend's show() (after the listener) is the sole reveal.
         .plugin(
             tauri_plugin_window_state::Builder::new()
-                .with_state_flags(
-                    tauri_plugin_window_state::StateFlags::all() & !tauri_plugin_window_state::StateFlags::VISIBLE,
-                )
+                .with_state_flags(window_state_flags())
                 .build(),
         )
         .setup(move |app| {
@@ -630,7 +653,7 @@ pub fn run() {
             let tray_menu = tauri::menu::Menu::with_items(app, &[&show_i, &quit_i])?;
             tauri::tray::TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("UTAI")
+                .tooltip("UtaiSynthesizer")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -753,16 +776,24 @@ pub fn run() {
             commands::settings::set_device_preference,
             commands::settings::get_device_preference,
             commands::settings::get_data_dir,
+            commands::settings::get_data_dir_issue,
             commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
+            commands::assets::asset_pack_status,
+            commands::assets::download_asset_pack,
+            commands::assets::cancel_asset_pack_download,
             commands::pyenv::get_runtime_env_info,
+            commands::pyenv::training_env_ready,
             commands::pyenv::download_runtime_pack,
             commands::pyenv::install_runtime_pack_local,
             commands::pyenv::cancel_runtime_install,
             commands::pyenv::delete_runtime_pack,
             commands::pyenv::run_pack_envtest,
             commands::pyenv::test_download_source,
+            commands::update::update_check,
+            commands::update::update_install,
+            commands::update::update_cancel,
             commands::window::quit_app,
             commands::window::running_tasks,
             commands::window::set_tray_labels,
@@ -771,6 +802,6 @@ pub fn run() {
         // minimize-to-tray / quit decision → in-progress + unsaved prompts → invoke("quit_app")). No
         // Rust-side close/exit guard: the frontend confirms before quit_app, which exits unconditionally.
         .build(tauri::generate_context!())
-        .expect("Failed to build UTAI")
+        .expect("Failed to build UtaiSynthesizer")
         .run(|_app, _event| {});
 }
