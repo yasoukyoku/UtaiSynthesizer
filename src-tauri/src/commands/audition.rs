@@ -138,19 +138,19 @@ fn ensure_candidate_converted(
     backend: &str,
     ckpt_path: &str,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
     if dir.join("model.json").is_file() {
         return Ok(());
     }
     if onnx.exists() {
         sweep_candidate_dir(dir);
-        std::fs::create_dir_all(dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
     }
     emit_phase(apph, candidate_id, "converting");
     let mtype = match backend {
         "rvc" => ModelType::Rvc,
         "sovits" => ModelType::SoVits,
-        other => return Err(format!("试听不支持的后端: {}", other)),
+        other => return Err(format!("AUDITION_BACKEND_UNSUPPORTED: {}", other)),
     };
     // sovits release snapshots auto-detect weights/config.json next to the ckpt;
     // rvc savee models embed their config
@@ -191,7 +191,7 @@ fn progress_emitter(
 
 fn ensure_trainable_idle(state: &AppState) -> Result<(), String> {
     if state.training.is_active() {
-        return Err("训练进行中，无法试听候选存档".into());
+        return Err("AUDITION_TRAINING_ACTIVE".into());
     }
     Ok(())
 }
@@ -201,16 +201,17 @@ fn ensure_trainable_idle(state: &AppState) -> Result<(), String> {
 /// and the global cancel_voice would cross-kill. Mutual friendly rejection.
 fn ensure_no_voice_render() -> Result<(), String> {
     if crate::commands::inference::voice_render_active() {
-        return Err("正在进行翻唱渲染，请等待其完成后再试听".into());
+        return Err("AUDITION_RENDER_BUSY".into());
     }
     Ok(())
 }
 
-/// THE generic busy-retry message for every FlightGuard/interlock rejection (user S61: the flag's
+/// THE generic busy-retry CODE for every FlightGuard/interlock rejection (user S61: the flag's
 /// holder can be an audition, a voice render, OR a storage cleanup — naming a specific reason was
-/// factually wrong half the time, and threading the real holder through the guard isn't worth it.
-/// One shared string also makes the release i18n pass a single mapping). 存量中文=release 清账批。
-pub const BUSY_RETRY_MSG: &str = "当前状态忙，请稍后重试";
+/// factually wrong half the time, and threading the real holder through the guard isn't worth it).
+/// Stable English CODE per the i18n hard rule — the frontend maps it via backendErrorMessage
+/// (src/lib/backendError.ts) → t("common.busyRetry"); never put user-facing prose here.
+pub const BUSY_RETRY_MSG: &str = "APP_BUSY";
 
 const AUDITION_BUSY_MSG: &str = BUSY_RETRY_MSG;
 
@@ -223,7 +224,7 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "候选存档路径无效".into())
+        .ok_or_else(|| "AUDITION_BAD_CANDIDATE_PATH".into())
 }
 
 // ─── S60c: whole-clip range extension for auditions ──────────────────────────
@@ -269,7 +270,13 @@ fn audition_range_prep(
         crate::inference::f0::SOVITS_RMVPE_THRESHOLD,
     )
     .map_err(|e| e.to_string())?;
-    let shift = crate::inference::vocal_range::piece_range_shift(&f0, &r);
+    // loudness weighting on the rmvpe 100 fps grid (16 kHz, hop 160) — see piece_range_shift
+    let rms = crate::inference::vocal_range::frame_rms(
+        &wav16k,
+        crate::inference::f0::RMVPE_SR as usize / 100,
+        f0.len(),
+    );
+    let shift = crate::inference::vocal_range::piece_range_shift(&f0, Some(&rms), &r);
     if shift == 0 {
         return Ok(None);
     }
@@ -307,7 +314,7 @@ fn audition_source(state: &AppState) -> Result<PathBuf, String> {
         .join("assets")
         .join("audition_10s.wav");
     if !p.is_file() {
-        return Err(format!("缺少试听素材 {}（应随应用分发）", p.display()));
+        return Err(format!("AUDITION_CLIP_MISSING: {}", p.display()));
     }
     Ok(p)
 }
@@ -324,14 +331,14 @@ fn write_wav_atomic(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()
             sample_format: hound::SampleFormat::Int,
         };
         let mut w = hound::WavWriter::create(&tmp, spec)
-            .map_err(|e| format!("写入试听音频失败: {}", e))?;
+            .map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
         for &s in samples {
             w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                .map_err(|e| format!("写入试听音频失败: {}", e))?;
+                .map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
         }
-        w.finalize().map_err(|e| format!("写入试听音频失败: {}", e))?;
+        w.finalize().map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("写入试听音频失败: {}", e))
+    std::fs::rename(&tmp, path).map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))
 }
 
 /// Candidate sidecar → ModelConfig, with sample_rate REQUIRED (A15: the serde
@@ -340,14 +347,14 @@ fn write_wav_atomic(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()
 fn read_candidate_config(json_path: &Path) -> Result<(ModelConfig, u32), String> {
     let text = std::fs::read_to_string(json_path).map_err(|e| {
         format!(
-            "无法读取候选配置 {}：{}——转换缓存不完整，请清空结果后重新试听",
+            "AUDITION_CONFIG_READ_FAILED: {} ({})",
             json_path.display(),
             e
         )
     })?;
     let raw: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         format!(
-            "候选配置解析失败（{}）：{}——请清空结果后重新试听",
+            "AUDITION_CONFIG_PARSE_FAILED: {} ({})",
             json_path.display(),
             e
         )
@@ -358,12 +365,12 @@ fn read_candidate_config(json_path: &Path) -> Result<(ModelConfig, u32), String>
         .filter(|&v| v > 0)
         .ok_or_else(|| {
             format!(
-                "候选配置缺少 sample_rate（{}）——转换产物损坏，请清空结果后重新试听",
+                "AUDITION_CONFIG_NO_SAMPLE_RATE: {}",
                 json_path.display()
             )
         })? as u32;
     let config: ModelConfig = serde_json::from_value(raw)
-        .map_err(|e| format!("候选配置解析失败（{}）：{}", json_path.display(), e))?;
+        .map_err(|e| format!("AUDITION_CONFIG_PARSE_FAILED: {} ({})", json_path.display(), e))?;
     Ok((config, sr))
 }
 
@@ -441,11 +448,11 @@ pub async fn render_audition_voice(
         let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
         let rmvpe_sid = app
             .inference
-            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "RMVPE model")?, false)
             .map_err(|e| e.to_string())?;
         let mel = app
             .inference
-            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
             .map_err(|e| e.to_string())?;
         // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
         let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
@@ -459,7 +466,7 @@ pub async fn render_audition_voice(
             "rvc" => {
                 let dim = config.features_dim as usize;
                 if dim == 0 {
-                    return Err("候选配置缺少 features_dim".into());
+                    return Err("AUDITION_CONFIG_NO_FEATURES_DIM".into());
                 }
                 let cv_sid = app
                     .inference
@@ -506,7 +513,7 @@ pub async fn render_audition_voice(
                 let dim = config.resolved_features_dim()?;
                 let hop_size = config.hop_size.unwrap_or(512) as usize;
                 if hop_size == 0 {
-                    return Err("候选配置的 hop_size 为 0".into());
+                    return Err("AUDITION_CONFIG_HOP_ZERO".into());
                 }
                 let cv_sid = app
                     .inference
@@ -570,7 +577,7 @@ pub async fn render_audition_voice(
         })
     })
     .await
-    .map_err(|e| format!("试听渲染任务失败: {}", e))?
+    .map_err(|e| format!("AUDITION_TASK_PANICKED: {}", e))?
 }
 
 // ─── command 2: vocoder candidates (mel→vocode self-loop) ───────────────────
@@ -604,7 +611,7 @@ pub async fn render_audition_vocoder(
         let _guard = guard;
         let cid = candidate_id.clone();
         with_terminal_events(&apph.clone(), &cid, || {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
 
         // resolve the vocoder triple: candidate (converted into the audition
         // dir) or the aux default
@@ -618,7 +625,7 @@ pub async fn render_audition_vocoder(
                     if onnx.exists() {
                         sweep_candidate_dir(&dir);
                         std::fs::create_dir_all(&dir)
-                            .map_err(|e| format!("创建试听目录失败: {}", e))?;
+                            .map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
                     }
                     emit_phase(&apph, &candidate_id, "converting");
                     // config.json sits next to the ckpt in weights/ — the
@@ -638,12 +645,12 @@ pub async fn render_audition_vocoder(
                 (onnx, dir.join("vocoder.json"), dir.clone())
             }
             None => (
-                aux_path(&app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN声码器")?,
-                aux_path(&app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN声码器配置")?,
+                aux_path(&app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN vocoder")?,
+                aux_path(&app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN vocoder config")?,
                 app.models.models_dir().join("aux"),
             ),
         };
-        let sidecar: serde_json::Value = crate::commands::inference::read_json(&voc_json, "声码器配置")?;
+        let sidecar: serde_json::Value = crate::commands::inference::read_json(&voc_json, "vocoder config")?;
         let sr = sidecar.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let hop = sidecar.get("hop_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let num_mels = sidecar.get("num_mels").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -652,7 +659,7 @@ pub async fn render_audition_vocoder(
         // by the vocoder backend either, so this is belt-and-suspenders)
         if sr != 44100 || hop != 512 || num_mels != 128 {
             return Err(format!(
-                "声码器格式（{}Hz/hop {}/{} mel）不是标准格式（44100/512/128），无法试听",
+                "AUDITION_VOCODER_NONSTANDARD: {}Hz/hop {}/{} mel (need 44100/512/128)",
                 sr, hop, num_mels
             ));
         }
@@ -665,7 +672,7 @@ pub async fn render_audition_vocoder(
             .load_npy(&voc_base.join(mel_name))
             .map_err(|e| e.to_string())?;
         if filters.nrows() != num_mels {
-            return Err("声码器滤波器行数与 num_mels 不一致".into());
+            return Err(format!("VOCODER_FILTER_SHAPE_MISMATCH: {} rows vs num_mels={}", filters.nrows(), num_mels));
         }
 
         emit_phase(&apph, &candidate_id, "rendering");
@@ -680,11 +687,11 @@ pub async fn render_audition_vocoder(
             .map_err(|e| e.to_string())?;
         let rmvpe_sid = app
             .inference
-            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "RMVPE model")?, false)
             .map_err(|e| e.to_string())?;
         let rmvpe_mel = app
             .inference
-            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
             .map_err(|e| e.to_string())?;
 
         // self-loop: source → (16k → rmvpe f0) + (44.1k → nsf mel) → vocode.
@@ -699,7 +706,7 @@ pub async fn render_audition_vocoder(
             crate::inference::f0::RMVPE_SR,
         );
         if app.inference.voice_cancelled(run_epoch) {
-            return Err("已取消".into());
+            return Err("CANCELLED".into());
         }
         let f0_raw = crate::inference::f0::rmvpe_detect(
             &app.inference.engine,
@@ -713,7 +720,7 @@ pub async fn render_audition_vocoder(
         let (f0, _uv) =
             crate::inference::f0::sovits_f0_postprocess(&f0_raw, mel.ncols(), 512, 44100);
         if app.inference.voice_cancelled(run_epoch) {
-            return Err("已取消".into());
+            return Err("CANCELLED".into());
         }
         let samples = crate::inference::nsf_hifigan::vocode(
             &app.inference.engine,
@@ -731,7 +738,7 @@ pub async fn render_audition_vocoder(
         })
     })
     .await
-    .map_err(|e| format!("试听渲染任务失败: {}", e))?
+    .map_err(|e| format!("AUDITION_TASK_PANICKED: {}", e))?
 }
 
 // ─── command 3: diffusion candidates (host model + override) ────────────────
@@ -767,14 +774,14 @@ pub async fn render_audition_diffusion(
         let _guard = guard;
         let cid = candidate_id.clone();
         with_terminal_events(&apph.clone(), &cid, || {
-        std::fs::create_dir_all(&dir).map_err(|e| format!("创建试听目录失败: {}", e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
 
         // host = an INSTALLED SoVITS model (type-scoped — same-name rvc pairs
         // are the app's standard usage, red-team A5 precedent)
         let entry = app
             .models
             .get_by_type(&host_name, &ModelType::SoVits)
-            .ok_or_else(|| format!("未找到 SoVITS 模型「{}」，请先选择宿主模型", host_name))?;
+            .ok_or_else(|| format!("AUDITION_HOST_MODEL_MISSING: {}", host_name))?;
         require_input(&entry, "noise")?;
         let dim = entry.config.resolved_features_dim()?;
         let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
@@ -801,7 +808,7 @@ pub async fn render_audition_diffusion(
         // speedup that keeps dpm++ solver_steps ≥ 2 (red-team F14: a
         // k_step_max<20 candidate would otherwise refuse to render)
         let dj: serde_json::Value =
-            crate::commands::inference::read_json(&diff_dir.join("diffusion.json"), "扩散模型配置")?;
+            crate::commands::inference::read_json(&diff_dir.join("diffusion.json"), "diffusion config")?;
         let timesteps = dj.get("timesteps").and_then(|v| v.as_u64()).unwrap_or(1000) as u32;
         let k_max = {
             let k = dj.get("k_step_max").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -863,11 +870,11 @@ pub async fn render_audition_diffusion(
             .map_err(|e| e.to_string())?;
         let rmvpe_sid = app
             .inference
-            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "RMVPE model")?, false)
             .map_err(|e| e.to_string())?;
         let mel = app
             .inference
-            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
             .map_err(|e| e.to_string())?;
         let handle = app
             .inference
@@ -927,7 +934,7 @@ pub async fn render_audition_diffusion(
         })
     })
     .await
-    .map_err(|e| format!("试听渲染任务失败: {}", e))?
+    .map_err(|e| format!("AUDITION_TASK_PANICKED: {}", e))?
 }
 
 /// S60-4: audition an INSTALLED voice model from the resource manager — the SAME bare recipe
@@ -1015,11 +1022,11 @@ pub async fn render_model_audition(
                 .map_err(|e| e.to_string())?;
             let rmvpe_sid = app
                 .inference
-                .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+                .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "RMVPE model")?, false)
                 .map_err(|e| e.to_string())?;
             let mel = app
                 .inference
-                .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+                .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
                 .map_err(|e| e.to_string())?;
             let handle = app.inference.voice_handle(&name).map_err(|e| e.to_string())?;
             let has_input = |input: &str| {
@@ -1114,7 +1121,7 @@ pub async fn render_model_audition(
         })
     })
     .await
-    .map_err(|e| format!("AUDITION_FAILED: join: {e}"))?
+    .map_err(|e| format!("AUDITION_TASK_PANICKED: {e}"))?
 }
 
 // ─── S60c: candidate range test (post-training auto-test, §user) ─────────────
@@ -1165,7 +1172,7 @@ pub async fn render_candidate_scale(
             _ => config.resolved_features_dim()?,
         };
         if dim == 0 {
-            return Err("候选配置缺少 features_dim".to_string());
+            return Err("AUDITION_CONFIG_NO_FEATURES_DIM".to_string());
         }
         let s2cv_sid = app
             .inference
@@ -1177,11 +1184,11 @@ pub async fn render_candidate_scale(
             .map_err(|e| e.to_string())?;
         let rmvpe_sid = app
             .inference
-            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "音高检测模型")?, false)
+            .ensure_aux_loaded_on(&aux_path(&app, AUX_RMVPE, "RMVPE model")?, false)
             .map_err(|e| e.to_string())?;
         let mel = app
             .inference
-            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?)
+            .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
             .map_err(|e| e.to_string())?;
 
         let has_input = |name: &str| {
@@ -1235,7 +1242,7 @@ pub async fn render_candidate_scale(
             _ => {
                 let hop_size = config.hop_size.unwrap_or(512) as usize;
                 if hop_size == 0 {
-                    return Err("候选配置的 hop_size 为 0".to_string());
+                    return Err("AUDITION_CONFIG_HOP_ZERO".to_string());
                 }
                 let vol_embedding =
                     has_input("vol").unwrap_or_else(|| config.vol_embedding.unwrap_or(false));
@@ -1274,7 +1281,7 @@ pub async fn render_candidate_scale(
         Ok(result)
     })
     .await
-    .map_err(|e| format!("AUDITION_FAILED: join: {e}"))?
+    .map_err(|e| format!("AUDITION_TASK_PANICKED: {e}"))?
 }
 
 /// Persist a candidate's tested vocal range into its AUDITION sidecar (model.json) — the

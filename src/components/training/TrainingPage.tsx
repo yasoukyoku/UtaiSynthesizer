@@ -29,6 +29,7 @@ import {
   type VoiceModelEntry,
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { t18 } from "../../lib/models/msst-catalog";
@@ -428,7 +429,7 @@ function DataStep() {
       preview.stop();
       setPlayingPath(null);
       setLoadingPath(null);
-      useAppStore.getState().showToast(String(e), "error");
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
     }
   };
 
@@ -1473,7 +1474,7 @@ function RunStep() {
       await useVoiceModelStore.getState().fetchModels();
       showToast(t("training.diffAttached", { name: attachTarget }), "success");
     } catch (e) {
-      showToast(String(e), "error");
+      showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
     } finally {
       setAttaching(null);
     }
@@ -1743,7 +1744,9 @@ function RunStep() {
         delete n[id];
         return n;
       });
-      showToast(String(e), "error");
+      if (isCancelError(e)) return; // user cancelled the audition — not an error, no toast
+      // APP_BUSY: another audition/render holds the FlightGuard → info; real failures stay errors.
+      showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
     }
   };
 
@@ -2141,7 +2144,8 @@ function RunStep() {
       await useVoiceModelStore.getState().fetchModels();
       showToast(t("training.imported", { name }), "success");
     } catch (e) {
-      showToast(String(e), "error");
+      // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
+      showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
     }
   };
 
@@ -2215,10 +2219,10 @@ function RunStep() {
           });
           ok += 1;
           for (const w of outcome?.warnings ?? []) {
-            warns.push(`${names.get(c.path)}: ${w}`);
+            warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
           }
         } catch (e) {
-          failed.push(`${names.get(c.path)}: ${e}`);
+          failed.push(`${names.get(c.path)}: ${backendErrorMessage(e) ?? e}`);
         }
       }
       await useVoiceModelStore.getState().fetchModels();
@@ -2306,7 +2310,9 @@ function RunStep() {
                   </div>
                 )}
                 {state === "active" && cur?.message && (
-                  <span className="training-stage-msg">{cur.message}</span>
+                  // Stage messages are mostly file names (pass through raw); the odd status CODE
+                  // (SHARED_POOL_REUSED) localizes via the shared mapper.
+                  <span className="training-stage-msg">{backendErrorMessage(cur.message) ?? cur.message}</span>
                 )}
               </div>
             );
@@ -2550,7 +2556,7 @@ function RunStep() {
       {snapshot.state === "error" && (
         <div className="training-error-card">
           <div className="training-error-title">{t("training.doneError")}</div>
-          <div className="training-error-msg">{snapshot.error}</div>
+          <div className="training-error-msg">{backendErrorMessage(snapshot.error) ?? snapshot.error}</div>
           {snapshot.stderr_tail.length > 0 && (
             <pre className="training-error-tail">{snapshot.stderr_tail.join("\n")}</pre>
           )}

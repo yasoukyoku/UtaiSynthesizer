@@ -16,7 +16,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, vocalRenderErrorMessage } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
@@ -180,6 +180,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     try {
       await renderVocalPart(track, seg, tempoRef.current, t("vocalEditor.render.laneLabel"));
     } catch (e) {
+      if (isVocalCancelError(e)) return; // user cancelled — silent settle (payload-aware: OOV lyrics can't fake a cancel)
       // Shared error→message mapping (vocalRenderErrorMessage) — the SAME one the Play-time auto-render
       // batch uses, so the two paths can never drift (§user: they must report identically).
       useAppStore.getState().showToast(vocalRenderErrorMessage(e), "error");
@@ -826,6 +827,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ── pointer handlers ──
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    // Commit any focused-field edit session (BPM box) before this gesture mutates notes — its store
+    // writes would otherwise fold into the field's open history transaction (see Arrangement
+    // handleMouseDown for the full story; the natural blur fires only after this handler).
+    const ae = document.activeElement;
+    if (ae instanceof HTMLElement && ae !== e.currentTarget) ae.blur();
     setActivePane("vocal");
     (e.currentTarget as Element).setPointerCapture(e.pointerId);
     const { x, y } = localXY(e.clientX, e.clientY);

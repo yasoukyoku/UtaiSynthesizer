@@ -877,6 +877,14 @@ export function Arrangement() {
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (e.button !== 0) return;
+      // Commit any in-flight focused-field edit session (e.g. the BPM box: focus→beginTransaction,
+      // blur→commitTransaction) BEFORE this gesture opens its own transaction. The natural focus-shift
+      // blur is the browser's mousedown DEFAULT ACTION — it fires only AFTER this handler — so without
+      // the explicit blur the field's commit would cross-pair with this gesture's begin, and the whole
+      // drag folded into the field's undo step ("move a clip while BPM focused → the move never gets
+      // its own undo step"). Same pattern as VolumeFader onGestureStart / App Ctrl+S.
+      const ae = document.activeElement;
+      if (ae instanceof HTMLElement) ae.blur();
       const ctrl = e.ctrlKey || e.metaKey;
       const rect = canvasRef.current?.getBoundingClientRect();
       const startContentX = rect ? e.clientX - rect.left + scrollXRef.current : 0;
@@ -1388,6 +1396,10 @@ export function Arrangement() {
       // One undo step for the whole drop: the placeholder inserts below are synchronous (durations
       // pre-resolved), so they all land inside this transaction; the async decode-populate runs
       // silently afterwards (finalizeSegment uses history.runSilent) and never adds a second step.
+      // Commit a held focused-field transaction first (see handleMouseDown): an OS drag-drop never
+      // fires a mousedown, so a focused BPM box would otherwise swallow the whole drop into its step.
+      const ae = document.activeElement;
+      if (ae instanceof HTMLElement) ae.blur();
       const hist = useHistoryStore.getState();
       hist.beginTransaction();
       try {

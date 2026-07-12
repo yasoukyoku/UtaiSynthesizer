@@ -121,10 +121,7 @@ impl ModelConfig {
             return match enc {
                 "vec768l12" => Ok(768),
                 "vec256l9" => Ok(256),
-                other => Err(format!(
-                    "不支持的 speech_encoder：{}（仅支持 vec768l12 / vec256l9）",
-                    other
-                )),
+                other => Err(format!("SPEECH_ENCODER_UNSUPPORTED: {}", other)),
             };
         }
         Ok(self.features_dim as usize)
@@ -481,7 +478,7 @@ impl ModelRegistry {
             let src_f0 = src_path.with_extension("f0.onnx");
             if src_f0.exists() {
                 if let Err(e) = std::fs::copy(&src_f0, onnx_path.with_extension("f0.onnx")) {
-                    warnings.push(format!("自动音高预测器复制失败：{}——自动f0不可用", e));
+                    warnings.push(format!("WARN_AUTO_F0_COPY_FAILED: {}", e));
                 }
             }
             if let (Some(src_dir), Some(src_stem)) = (src_path.parent(), src_path.file_stem()) {
@@ -489,7 +486,7 @@ impl ModelRegistry {
                 if src_diff.join("diffusion.json").exists() {
                     let dest_diff = subdir.join(format!("{}.diffusion", stem));
                     if let Err(e) = copy_dir_flat(&src_diff, &dest_diff) {
-                        warnings.push(format!("扩散附件复制失败：{}——浅扩散不可用", e));
+                        warnings.push(format!("WARN_DIFFUSION_COPY_FAILED: {}", e));
                         std::fs::remove_dir_all(&dest_diff).ok();
                     }
                 }
@@ -546,12 +543,12 @@ impl ModelRegistry {
                 }
                 Err(e) => {
                     tracing::warn!("Avatar import failed: {}", e);
-                    warnings.push(format!("头像导入失败：{}", e));
+                    warnings.push(format!("WARN_AVATAR_IMPORT_FAILED: {}", e));
                     None
                 }
             },
             Some(src) => {
-                warnings.push(format!("头像文件不存在：{}", src.display()));
+                warnings.push(format!("WARN_AVATAR_MISSING: {}", src.display()));
                 None
             }
             None => None,
@@ -591,11 +588,11 @@ impl ModelRegistry {
     ) -> Option<PathBuf> {
         let src = diffusion_file?;
         if !matches!(model_type, ModelType::SoVits) {
-            warnings.push("扩散模型仅支持 SoVITS——已忽略".to_string());
+            warnings.push("WARN_DIFFUSION_SOVITS_ONLY".to_string());
             return None;
         }
         if !src.exists() {
-            warnings.push(format!("扩散模型文件不存在：{}", src.display()));
+            warnings.push(format!("WARN_DIFFUSION_FILE_MISSING: {}", src.display()));
             return None;
         }
         let diffusion_dir = self
@@ -608,7 +605,7 @@ impl ModelRegistry {
         {
             tracing::warn!("Diffusion conversion failed for {}: {}", src.display(), e);
             warnings.push(format!(
-                "扩散模型转换失败（{}）：{}——模型已导入，浅扩散不可用",
+                "WARN_DIFFUSION_CONVERT_FAILED: {}: {}",
                 src.file_name().unwrap_or_default().to_string_lossy(),
                 e
             ));
@@ -623,10 +620,7 @@ impl ModelRegistry {
         let main_dim = main_config.resolved_features_dim().ok().map(|d| d as u64);
         if let (Some(ed), Some(md)) = (enc_dim, main_dim) {
             if ed != md {
-                warnings.push(format!(
-                    "扩散模型的特征维度（{}）与主模型（{}）不一致——两者无法配合使用，已移除该扩散附件",
-                    ed, md
-                ));
+                warnings.push(format!("WARN_DIFFUSION_DIM_MISMATCH: {} vs {}", ed, md));
                 std::fs::remove_dir_all(&diffusion_dir).ok();
                 return None;
             }
@@ -656,12 +650,10 @@ impl ModelRegistry {
             .iter()
             .find(|e| e.name == name && matches!(e.model_type, ModelType::SoVits))
             .cloned()
-            .ok_or_else(|| {
-                crate::UtaiError::Model(format!("找不到 SoVITS 模型「{}」", name))
-            })?;
+            .ok_or_else(|| crate::UtaiError::Model(format!("MODEL_NOT_FOUND: {}", name)))?;
         if !ckpt.exists() {
             return Err(crate::UtaiError::Model(format!(
-                "扩散模型文件不存在：{}",
+                "DIFFUSION_FILE_MISSING: {}",
                 ckpt.display()
             )));
         }
@@ -690,8 +682,8 @@ impl ModelRegistry {
             if ed != md {
                 std::fs::remove_dir_all(&tmp_dir).ok();
                 return Err(crate::UtaiError::Model(format!(
-                    "扩散模型的特征维度（{}）与主模型「{}」（{}）不一致——两者无法配合使用",
-                    ed, name, md
+                    "DIFFUSION_DIM_MISMATCH: {} vs {} ({})",
+                    ed, md, name
                 )));
             }
         }
@@ -707,7 +699,7 @@ impl ModelRegistry {
         let entry = entries
             .iter_mut()
             .find(|e| e.name == name && matches!(e.model_type, ModelType::SoVits))
-            .ok_or_else(|| crate::UtaiError::Model(format!("找不到模型「{}」", name)))?;
+            .ok_or_else(|| crate::UtaiError::Model(format!("MODEL_NOT_FOUND: {}", name)))?;
         let (subdir, stem) = entry_dir_and_stem(entry)?;
         let final_dir = subdir.join(format!("{}.diffusion", stem));
         let bak = subdir.join(format!("{}.diffusion.old", stem));
@@ -717,14 +709,17 @@ impl ModelRegistry {
         let had_old = final_dir.exists();
         if had_old {
             std::fs::rename(&final_dir, &bak)
-                .map_err(|e| crate::UtaiError::Model(format!("移出旧扩散附件失败: {}", e)))?;
+                .map_err(|e| crate::UtaiError::Model(format!("DIFFUSION_SWAP_FAILED: {}", e)))?;
         }
         if let Err(e) = std::fs::rename(tmp_dir, &final_dir) {
             if had_old {
                 let _ = std::fs::rename(&bak, &final_dir); // rollback
             }
             let _ = std::fs::remove_dir_all(tmp_dir); // no half-attach residue
-            return Err(crate::UtaiError::Model(format!("扩散附件替换失败: {}", e)));
+            return Err(crate::UtaiError::Model(format!(
+                "DIFFUSION_REPLACE_FAILED: {}",
+                e
+            )));
         }
         if had_old {
             let _ = std::fs::remove_dir_all(&bak);
@@ -836,7 +831,7 @@ impl ModelRegistry {
         if let Some(idx_path) = index_file {
             if !idx_path.exists() {
                 // The user explicitly picked this file — don't silently auto-detect another one.
-                warnings.push(format!("索引文件不存在：{}", idx_path.display()));
+                warnings.push(format!("WARN_INDEX_MISSING: {}", idx_path.display()));
                 return None;
             }
             let ext = idx_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -846,7 +841,7 @@ impl ModelRegistry {
             if ext.eq_ignore_ascii_case("index") {
                 return try_index_conversion(idx_path, &npy_dest, app_dir, warnings);
             }
-            warnings.push(format!("不支持的索引文件类型：{}", idx_path.display()));
+            warnings.push(format!("WARN_INDEX_TYPE_UNSUPPORTED: {}", idx_path.display()));
             return None;
         }
 
@@ -901,7 +896,7 @@ impl ModelRegistry {
     ) -> Option<PathBuf> {
         let src = index_file?;
         if !src.exists() {
-            warnings.push(format!("聚类/检索模型文件不存在：{}", src.display()));
+            warnings.push(format!("WARN_CLUSTER_FILE_MISSING: {}", src.display()));
             return None;
         }
         let cluster_dir = self
@@ -916,12 +911,12 @@ impl ModelRegistry {
         match ext.as_str() {
             "npy" => {
                 if let Err(e) = std::fs::create_dir_all(&cluster_dir) {
-                    warnings.push(format!("聚类资产目录创建失败：{}", e));
+                    warnings.push(format!("WARN_CLUSTER_DIR_FAILED: {}", e));
                     return None;
                 }
                 let dest = cluster_dir.join(src.file_name()?);
                 if let Err(e) = std::fs::copy(src, &dest) {
-                    warnings.push(format!("聚类资产复制失败：{}", e));
+                    warnings.push(format!("WARN_CLUSTER_COPY_FAILED: {}", e));
                     return None;
                 }
                 // ①c: a multi-speaker RETRIEVAL model has ONE `<id>.index_vectors.npy` PER speaker
@@ -949,7 +944,7 @@ impl ModelRegistry {
                                     if let Some(fname) = sp.file_name() {
                                         if let Err(e) = std::fs::copy(&sp, cluster_dir.join(fname)) {
                                             warnings.push(format!(
-                                                "多说话人检索资产 {} 复制失败：{}",
+                                                "WARN_CLUSTER_MULTI_COPY_FAILED: {}: {}",
                                                 sp.display(),
                                                 e
                                             ));
@@ -965,16 +960,13 @@ impl ModelRegistry {
             "pt" | "pkl" | "pickle" => {
                 match convert::convert_cluster_assets(src, &cluster_dir, app_dir) {
                     Ok(()) => first_cluster_asset(&cluster_dir).or_else(|| {
-                        warnings.push(
-                            "聚类模型转换完成但未生成任何 .npy——模型已导入，聚类/检索不可用"
-                                .to_string(),
-                        );
+                        warnings.push("WARN_CLUSTER_EMPTY_OUTPUT".to_string());
                         None
                     }),
                     Err(e) => {
                         tracing::warn!("Cluster conversion failed for {}: {}", src.display(), e);
                         warnings.push(format!(
-                            "聚类/检索模型转换失败（{}）：{}——模型已导入，聚类增强不可用",
+                            "WARN_CLUSTER_CONVERT_FAILED: {}: {}",
                             src.file_name().unwrap_or_default().to_string_lossy(),
                             e
                         ));
@@ -984,7 +976,7 @@ impl ModelRegistry {
             }
             _ => {
                 warnings.push(format!(
-                    "不支持的聚类/检索模型类型：{}（支持 .pt / .pkl / .npy）",
+                    "WARN_CLUSTER_TYPE_UNSUPPORTED: {}",
                     src.display()
                 ));
                 None
@@ -1028,23 +1020,20 @@ impl ModelRegistry {
 fn read_vocoder_source(src_path: &Path) -> Result<(serde_json::Value, PathBuf)> {
     let src_json = src_path.with_extension("json");
     if !src_json.is_file() {
-        return Err(crate::UtaiError::Model(
-            "声码器 .onnx 导入需要配套的 .json 配置文件（与 onnx 同名同目录）——缺少梅尔频谱参数的声码器无法使用"
-                .to_string(),
-        ));
+        return Err(crate::UtaiError::Model("VOCODER_JSON_REQUIRED".to_string()));
     }
     let text = std::fs::read_to_string(&src_json)?;
     let root: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| crate::UtaiError::Model(format!("声码器配置 .json 解析失败：{}", e)))?;
+        .map_err(|e| crate::UtaiError::Model(format!("VOCODER_JSON_PARSE_FAILED: {}", e)))?;
     if root["mini_nsf"].as_bool().unwrap_or(false) {
         return Err(crate::UtaiError::Model(
-            "暂不支持 PC-NSF（mini_nsf）架构的声码器——目前仅支持经典 NSF-HiFiGAN".to_string(),
+            "VOCODER_PCNSF_UNSUPPORTED".to_string(),
         ));
     }
     for key in ["sample_rate", "hop_size", "num_mels", "n_fft", "win_size", "fmin", "fmax"] {
         if root.get(key).map(|v| v.is_null()).unwrap_or(true) {
             return Err(crate::UtaiError::Model(format!(
-                "声码器配置缺少字段「{}」——无法确认梅尔频谱格式，拒绝导入",
+                "VOCODER_CONFIG_FIELD_MISSING: {}",
                 key
             )));
         }
@@ -1060,7 +1049,7 @@ fn read_vocoder_source(src_path: &Path) -> Result<(serde_json::Value, PathBuf)> 
     let src_npy = src_dir.join(&mel_name);
     if !src_npy.is_file() {
         return Err(crate::UtaiError::Model(format!(
-            "找不到声码器滤波器文件 {}（应与 onnx/json 同目录）——三件套缺一不可",
+            "VOCODER_MEL_MISSING: {}",
             src_npy.display()
         )));
     }
@@ -1116,13 +1105,13 @@ fn finalize_sidecar(
         {
             Some(serde_json::Value::Object(map)) => map,
             _ => {
-                warnings.push("模型配置 .json 无法解析，已按默认参数重新生成".to_string());
+                warnings.push("WARN_SIDECAR_REGENERATED".to_string());
                 serde_json::Map::new()
             }
         }
     } else {
         warnings.push(format!(
-            "未找到配套的 .json 配置，已按默认参数生成（{} / {}Hz）；若与模型实际参数不符，请附带配置文件重新导入",
+            "WARN_SIDECAR_SYNTHESIZED: {} / {}Hz",
             type_subdir(model_type).to_uppercase(),
             default_sample_rate_for(model_type)
         ));
@@ -1159,10 +1148,7 @@ fn finalize_sidecar(
                 auto.insert("file".into(), serde_json::Value::from(fname));
             } else {
                 auto.insert("available".into(), serde_json::Value::from(false));
-                warnings.push(
-                    "自动音高预测器文件缺失——该模型的自动f0已禁用（重新导入 .pth 可恢复）"
-                        .to_string(),
-                );
+                warnings.push("WARN_AUTO_F0_MISSING".to_string());
             }
         }
     }
@@ -1211,7 +1197,7 @@ fn copy_npy_index(src: &Path, npy_dest: &Path, warnings: &mut Vec<String>) -> Op
         Ok(_) => Some(npy_dest.to_path_buf()),
         Err(e) => {
             tracing::warn!("Failed to copy .npy index {}: {}", src.display(), e);
-            warnings.push(format!("索引文件复制失败：{}", e));
+            warnings.push(format!("WARN_INDEX_COPY_FAILED: {}", e));
             None
         }
     }
@@ -1228,7 +1214,7 @@ fn try_index_conversion(
         Err(e) => {
             tracing::warn!("Index conversion failed for {}: {}", index_path.display(), e);
             warnings.push(format!(
-                "索引文件转换失败（{}）：{}——模型已导入，但检索增强不可用",
+                "WARN_INDEX_CONVERT_FAILED: {}: {}",
                 index_path.file_name().unwrap_or_default().to_string_lossy(),
                 e
             ));

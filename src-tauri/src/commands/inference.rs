@@ -94,14 +94,15 @@ pub(crate) const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
 pub(crate) const AUX_SCORE2CV_768: &str = "score2cv_768.onnx";
 pub(crate) const AUX_SCORE2CV_256: &str = "score2cv_256.onnx";
 
-/// models_dir/aux/<filename>, with a clear Chinese error naming the missing file + the
-/// exact directory it must be placed in.
+/// models_dir/aux/<filename>, with a stable CODE naming the missing file + the
+/// exact directory it must be placed in (the frontend maps the code to localized text;
+/// `label` is a short English token interpolated into the detail payload).
 pub(crate) fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<PathBuf, String> {
     let dir = state.models.models_dir().join("aux");
     let path = dir.join(filename);
     if !path.exists() {
         return Err(format!(
-            "缺少{} {}，请将其放入 {}",
+            "AUX_FILE_MISSING: {} {} (place into {})",
             label,
             filename,
             dir.display()
@@ -113,10 +114,10 @@ pub(crate) fn aux_path(state: &AppState, filename: &str, label: &str) -> Result<
 /// ContentVec variant routing: vec768l12 → RVC v2 / SoVITS 4.1, vec256l9 → RVC v1 / SoVITS 4.0.
 pub(crate) fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
     match dim {
-        768 => aux_path(state, AUX_CONTENTVEC_768, "内容特征模型"),
-        256 => aux_path(state, AUX_CONTENTVEC_256, "内容特征模型"),
+        768 => aux_path(state, AUX_CONTENTVEC_768, "ContentVec model"),
+        256 => aux_path(state, AUX_CONTENTVEC_256, "ContentVec model"),
         other => Err(format!(
-            "不支持的内容特征维度 {}（仅支持 256 / 768）——请检查模型配置 features_dim / speech_encoder",
+            "FEATURES_DIM_UNSUPPORTED: {} (only 256 / 768; check features_dim / speech_encoder)",
             other
         )),
     }
@@ -127,10 +128,10 @@ pub(crate) fn contentvec_for_dim(state: &AppState, dim: usize) -> Result<PathBuf
 /// audio ContentVec extractor). A missing model names the file + the aux dir it must go in.
 pub(crate) fn score2cv_for_dim(state: &AppState, dim: usize) -> Result<PathBuf, String> {
     match dim {
-        768 => aux_path(state, AUX_SCORE2CV_768, "自己唱内容模型"),
-        256 => aux_path(state, AUX_SCORE2CV_256, "自己唱内容模型"),
+        768 => aux_path(state, AUX_SCORE2CV_768, "ScoreToCV model"),
+        256 => aux_path(state, AUX_SCORE2CV_256, "ScoreToCV model"),
         other => Err(format!(
-            "不支持的自己唱内容维度 {}（仅支持 256 / 768）——请检查所选歌手模型的 features_dim",
+            "SCORE2CV_DIM_UNSUPPORTED: {} (only 256 / 768; check the voice's features_dim)",
             other
         )),
     }
@@ -188,7 +189,7 @@ fn sidecar_has_input(entry: &ModelEntry, input: &str) -> Option<bool> {
 pub(crate) fn require_input(entry: &ModelEntry, input: &str) -> Result<(), String> {
     if sidecar_has_input(entry, input) != Some(true) {
         return Err(format!(
-            "模型 '{}' 是旧版导出格式（缺少 {} 输入签名），请删除后重新导入以完成升级",
+            "MODEL_LEGACY_EXPORT: {} (missing '{}' input signature)",
             entry.name, input
         ));
     }
@@ -197,10 +198,7 @@ pub(crate) fn require_input(entry: &ModelEntry, input: &str) -> Result<(), Strin
 
 pub(crate) fn get_entry(state: &AppState, voice_name: &str) -> Result<ModelEntry, String> {
     state.models.get(voice_name).ok_or_else(|| {
-        format!(
-            "未找到模型 '{}'，请先在资源管理器中导入",
-            voice_name
-        )
+        format!("MODEL_NOT_FOUND: {}", voice_name)
     })
 }
 
@@ -341,9 +339,9 @@ pub fn get_default_vocoder_info(state: State<'_, Arc<AppState>>) -> DefaultVocod
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &str) -> Result<T, String> {
     let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("无法读取{}（{}）：{}", what, path.display(), e))?;
+        .map_err(|e| format!("FILE_READ_FAILED: {} ({}): {}", what, path.display(), e))?;
     serde_json::from_str(&content)
-        .map_err(|e| format!("{}解析失败（{}）：{}", what, path.display(), e))
+        .map_err(|e| format!("JSON_PARSE_FAILED: {} ({}): {}", what, path.display(), e))
 }
 
 /// ①c guard — the SoVITS shallow/only-diffusion CONDITION encoder (sovits.rs `run_diffusion`) does NOT
@@ -417,10 +415,10 @@ pub(crate) fn resolve_sovits_quality(
             .map(str::to_string);
         let (voc_path, voc_json, voc_base_dir, voc_what) = match picked.as_deref() {
             None => (
-                aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN声码器")?,
-                aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN声码器配置")?,
+                aux_path(app, AUX_NSF_HIFIGAN, "NSF-HiFiGAN vocoder")?,
+                aux_path(app, AUX_NSF_HIFIGAN_JSON, "NSF-HiFiGAN vocoder config")?,
                 app.models.models_dir().join("aux"),
-                "NSF-HiFiGAN 声码器".to_string(),
+                "NSF-HiFiGAN vocoder".to_string(),
             ),
             Some(name) => {
                 // type-scoped lookup (设计红队 A5): singers commonly own a
@@ -428,16 +426,11 @@ pub(crate) fn resolve_sovits_quality(
                 let ventry = app
                     .models
                     .get_by_type(name, &crate::models::ModelType::NsfHifigan)
-                    .ok_or_else(|| {
-                        format!(
-                            "声码器「{}」不存在或已被删除——请在节点里重新选择声码器（或选回默认声码器）",
-                            name
-                        )
-                    })?;
+                    .ok_or_else(|| format!("VOCODER_NOT_FOUND: {}", name))?;
                 let json = ventry.path.with_extension("json");
                 if !json.is_file() {
                     return Err(format!(
-                        "声码器「{}」缺少配置文件 {}——请在资源管理中重新导入",
+                        "VOCODER_CONFIG_MISSING: {} ({})",
                         name,
                         json.display()
                     ));
@@ -447,10 +440,10 @@ pub(crate) fn resolve_sovits_quality(
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default();
-                (ventry.path.clone(), json, base, format!("声码器「{}」", name))
+                (ventry.path.clone(), json, base, format!("vocoder '{}'", name))
             }
         };
-        let sidecar: VocoderSidecar = read_json(&voc_json, "声码器配置")?;
+        let sidecar: VocoderSidecar = read_json(&voc_json, "vocoder config")?;
         let mel_name = sidecar
             .mel_filters
             .clone()
@@ -465,13 +458,13 @@ pub(crate) fn resolve_sovits_quality(
             // place-the-file guidance for the None branch
             return Err(if picked.is_some() {
                 format!(
-                    "缺少{}的滤波器文件 {}——请在资源管理中重新导入该声码器",
+                    "VOCODER_MEL_MISSING: {} ({})",
                     voc_what,
                     voc_mel_path.display()
                 )
             } else {
                 format!(
-                    "缺少NSF-HiFiGAN滤波器 {}，请将其放入 {}",
+                    "AUX_VOCODER_MEL_MISSING: {} (place into {})",
                     mel_name,
                     voc_base_dir.display()
                 )
@@ -490,13 +483,13 @@ pub(crate) fn resolve_sovits_quality(
                 match got {
                     None => {
                         return Err(format!(
-                            "{}的配置缺少字段「{}」——无法确认梅尔频谱格式，请重新导入",
+                            "VOCODER_CONFIG_FIELD_MISSING: {} '{}'",
                             voc_what, key
                         ))
                     }
                     Some(v) if v != want => {
                         return Err(format!(
-                            "{}的梅尔频谱格式与模型不一致（{} = {}，标准格式需要 {}）——声码器只能用于频谱格式一致的模型",
+                            "VOCODER_MEL_FORMAT_MISMATCH: {} {} = {} (standard requires {})",
                             voc_what, key, v, want
                         ))
                     }
@@ -506,7 +499,7 @@ pub(crate) fn resolve_sovits_quality(
         }
         if sidecar.sample_rate != entry.sample_rate || sidecar.hop_size as usize != hop_size {
             return Err(format!(
-                "{}（{}Hz/hop {}）与模型（{}Hz/hop {}）几何不一致——浅扩散/增强器仅支持 44.1kHz/512 的 SoVITS 模型",
+                "VOCODER_GEOMETRY_MISMATCH: {} ({}Hz/hop {}) vs model ({}Hz/hop {})",
                 voc_what, sidecar.sample_rate, sidecar.hop_size, entry.sample_rate, hop_size
             ));
         }
@@ -516,7 +509,7 @@ pub(crate) fn resolve_sovits_quality(
             .map_err(|e| e.to_string())?;
         if filters.nrows() != sidecar.num_mels as usize {
             return Err(format!(
-                "声码器滤波器形状（{}×{}）与配置 num_mels={} 不一致",
+                "VOCODER_FILTER_SHAPE_MISMATCH: {}x{} vs num_mels={}",
                 filters.nrows(),
                 filters.ncols(),
                 sidecar.num_mels
@@ -547,37 +540,34 @@ pub(crate) fn resolve_sovits_quality(
         let diff_dir = match diffusion_dir_override {
             Some(dir) => dir.to_path_buf(),
             None => entry.diffusion_path.clone().ok_or_else(|| {
-                format!(
-                    "模型 '{}' 未附带扩散模型——导入时附加扩散 .pt+.yaml 可启用浅扩散",
-                    entry.name
-                )
+                format!("DIFFUSION_NOT_ATTACHED: {}", entry.name)
             })?,
         };
         let sidecar: DiffusionSidecar =
-            read_json(&diff_dir.join("diffusion.json"), "扩散模型配置")?;
+            read_json(&diff_dir.join("diffusion.json"), "diffusion config")?;
 
         if sidecar.schedule != "linear" || sidecar.timesteps == 0 {
             return Err(format!(
-                "扩散模型的 schedule（{}，timesteps={}）不受支持——请用当前版本的转换器重新导入",
+                "DIFFUSION_SCHEDULE_UNSUPPORTED: {} (timesteps={})",
                 sidecar.schedule, sidecar.timesteps
             ));
         }
         if sidecar.encoder_out_channels as usize != dim {
             return Err(format!(
-                "扩散模型的特征维度（{}）与主模型（{}）不一致，无法配合使用",
+                "DIFFUSION_DIM_MISMATCH: {} vs {}",
                 sidecar.encoder_out_channels, dim
             ));
         }
         if sidecar.sample_rate != entry.sample_rate || sidecar.block_size as usize != hop_size {
             return Err(format!(
-                "扩散模型（{}Hz/block {}）与主模型（{}Hz/hop {}）几何不一致",
+                "DIFFUSION_GEOMETRY_MISMATCH: {}Hz/block {} vs model {}Hz/hop {}",
                 sidecar.sample_rate, sidecar.block_size, entry.sample_rate, hop_size
             ));
         }
         let method = crate::inference::diffusion::SamplerMethod::parse(&options.diffusion_method)
             .ok_or_else(|| {
                 format!(
-                    "未知的扩散采样器：{}（支持 naive/ddim/pndm/dpm-solver/dpm-solver++/unipc）",
+                    "DIFFUSION_SAMPLER_UNKNOWN: {} (naive/ddim/pndm/dpm-solver/dpm-solver++/unipc)",
                     options.diffusion_method
                 )
             })?;
@@ -591,16 +581,16 @@ pub(crate) fn resolve_sovits_quality(
         if options.only_diffusion {
             if k_step_max < timesteps {
                 return Err(
-                    "该扩散模型仅支持浅扩散，无法单独推理（k_step_max < timesteps）".to_string(),
+                    "DIFFUSION_SHALLOW_ONLY: k_step_max < timesteps".to_string(),
                 );
             }
         } else {
             if options.k_step == 0 {
-                return Err("扩散步数 k_step 不能为 0".to_string());
+                return Err("DIFFUSION_KSTEP_ZERO".to_string());
             }
             if options.k_step as usize > k_step_max {
                 return Err(format!(
-                    "浅扩散 k_step（{}）超过该扩散模型的上限 k_step_max={}",
+                    "DIFFUSION_KSTEP_EXCEEDS_MAX: {} > k_step_max={}",
                     options.k_step, k_step_max
                 ));
             }
@@ -623,7 +613,7 @@ pub(crate) fn resolve_sovits_quality(
             let solver_steps = t_total / options.diffusion_speedup.max(1) as usize;
             if solver_steps < 2 {
                 return Err(format!(
-                    "扩散步数 ÷ 加速倍数 = {} 步，dpm/unipc 采样器至少需要 2 步——请降低加速倍数",
+                    "DIFFUSION_SPEEDUP_TOO_FEW_STEPS: {} (dpm/unipc need >= 2)",
                     solver_steps
                 ));
             }
@@ -632,7 +622,7 @@ pub(crate) fn resolve_sovits_quality(
             let spk = options.speaker_id.unwrap_or(0);
             if spk >= sidecar.n_spk {
                 return Err(format!(
-                    "说话人 id {} 超出扩散模型的 n_spk={}",
+                    "DIFFUSION_SPEAKER_OUT_OF_RANGE: {} >= n_spk={}",
                     spk, sidecar.n_spk
                 ));
             }
@@ -652,7 +642,7 @@ pub(crate) fn resolve_sovits_quality(
         let den_path = diff_dir.join(&den_name);
         for p in [&enc_path, &den_path] {
             if !p.exists() {
-                return Err(format!("扩散模型文件缺失：{}——请重新附加扩散模型", p.display()));
+                return Err(format!("DIFFUSION_FILE_MISSING: {}", p.display()));
             }
         }
         let enc_sid = app
@@ -668,10 +658,7 @@ pub(crate) fn resolve_sovits_quality(
 
         // No silent fallbacks (converter always writes these — absent = corrupt sidecar).
         let corrupt = |what: &str| {
-            format!(
-                "扩散附件配置缺少 {}（diffusion.json 损坏或版本过旧）——请重新附加扩散模型",
-                what
-            )
+            format!("DIFFUSION_SIDECAR_FIELD_MISSING: {}", what)
         };
         let max_beta = sidecar.max_beta.ok_or_else(|| corrupt("max_beta"))?;
         let spec_min = sidecar.spec_min.clone().filter(|v| !v.is_empty()).ok_or_else(|| corrupt("spec_min"))?;
@@ -713,10 +700,7 @@ pub(crate) fn resolve_sovits_quality(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !available {
-            return Err(format!(
-                "模型 '{}' 导出时未包含自动音高预测器（该模型可能没有 f0_decoder 权重，或导出于旧版转换器——重新导入 .pth 可生成）",
-                entry.name
-            ));
+            return Err(format!("AUTO_F0_NOT_EXPORTED: {}", entry.name));
         }
         let file = auto
             .and_then(|v| v.get("file"))
@@ -733,12 +717,7 @@ pub(crate) fn resolve_sovits_quality(
             .parent()
             .map(|p| p.join(&file))
             .filter(|p| p.exists())
-            .ok_or_else(|| {
-                format!(
-                    "自动音高预测器文件缺失：{}——请重新导入模型",
-                    file
-                )
-            })?;
+            .ok_or_else(|| format!("AUTO_F0_FILE_MISSING: {}", file))?;
         let sid = app
             .inference
             .engine
@@ -785,8 +764,8 @@ pub async fn run_rvc(
         None
     };
     let cv_path = contentvec_for_dim(&app, dim)?;
-    let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?;
-    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
+    let rmvpe_path = aux_path(&app, AUX_RMVPE, "RMVPE model")?;
+    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?;
 
     let path = PathBuf::from(&model_path);
     // Evict every GPU session this run doesn't own (leftover MSST arena / the SoVITS
@@ -854,7 +833,7 @@ pub async fn run_rvc(
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("推理任务失败: {}", e))?
+    .map_err(|e| format!("INFER_TASK_PANICKED: {}", e))?
 }
 
 /// Resolve the SoVITS cluster / feature-retrieval asset (`<stem>.cluster/` sibling npy) for the dominant
@@ -939,7 +918,7 @@ pub async fn run_sovits(
     let nch = noise_channels(&entry.config);
     let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
     if hop_size == 0 {
-        return Err(format!("模型 '{}' 配置的 hop_size 为 0，无法推理", voice_name));
+        return Err(format!("MODEL_HOP_SIZE_ZERO: {}", voice_name));
     }
     let min_t = min_frames(&entry.config, 6);
     // Feed vol IFF the exported graph HAS the input — the sidecar "inputs" array is the
@@ -962,8 +941,8 @@ pub async fn run_sovits(
         .unwrap_or_else(|| "left".to_string());
 
     let cv_path = contentvec_for_dim(&app, dim)?;
-    let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?;
-    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
+    let rmvpe_path = aux_path(&app, AUX_RMVPE, "RMVPE model")?;
+    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?;
 
     let path = PathBuf::from(&model_path);
     // Evict every GPU session this run doesn't own (leftover MSST arena / the RVC
@@ -1063,7 +1042,7 @@ pub async fn run_sovits(
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("推理任务失败: {}", e))?
+    .map_err(|e| format!("INFER_TASK_PANICKED: {}", e))?
 }
 
 // ─── detect_f0 (kept signature: audio path → f0 Hz @ 100 fps) ────────────────
@@ -1074,8 +1053,8 @@ pub async fn detect_f0(
     audio_path: String,
 ) -> Result<Vec<f32>, String> {
     let app = state.inner().clone();
-    let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?;
-    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
+    let rmvpe_path = aux_path(&app, AUX_RMVPE, "RMVPE model")?;
+    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?;
     let rmvpe_sid = app.inference.ensure_aux_loaded(&rmvpe_path).map_err(|e| e.to_string())?;
     let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
 
@@ -1099,7 +1078,7 @@ pub async fn detect_f0(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| format!("音高检测任务失败: {}", e))?
+    .map_err(|e| format!("F0_TASK_PANICKED: {}", e))?
 }
 
 // ─── ② 自己唱 vocal render (S48 Phase 6) ─────────────────────────────────────
@@ -1268,14 +1247,16 @@ pub async fn render_vocal_segment(
 
     // ── validate the request (敌意输入边界) ──
     if score.is_empty() {
-        return Err("人声段没有音符，无法渲染".into());
+        // Reuses the frontend's existing VOCAL_EMPTY code ("no renderable notes" — same state,
+        // vocalRender.ts throws it pre-flight and maps it to vocalEditor.render.empty).
+        return Err("VOCAL_EMPTY".into());
     }
     if score.len() > MAX_SCORE_NOTES {
-        return Err(format!("音符过多（{} > {}）", score.len(), MAX_SCORE_NOTES));
+        return Err(format!("VOCAL_TOO_MANY_NOTES: {} > {}", score.len(), MAX_SCORE_NOTES));
     }
     if !f0_cents.is_empty() && f0_cents.len() != f0_voiced.len() {
         return Err(format!(
-            "f0 数组长度不一致：cents {} != voiced {}",
+            "VOCAL_F0_LEN_MISMATCH: cents {} != voiced {}",
             f0_cents.len(),
             f0_voiced.len()
         ));
@@ -1283,7 +1264,7 @@ pub async fn render_vocal_segment(
     let total_frames: i64 = score.iter().map(|n| n.frames.max(0)).sum();
     if total_frames > MAX_TOTAL_FRAMES {
         return Err(format!(
-            "人声段过长（{} 帧 > 上限 {}，约 {} 分钟），请拆分为多段渲染",
+            "VOCAL_SEGMENT_TOO_LONG: {} frames > {} (~{} min)",
             total_frames,
             MAX_TOTAL_FRAMES,
             MAX_TOTAL_FRAMES / 3000
@@ -1293,7 +1274,7 @@ pub async fn render_vocal_segment(
     // SILENTLY drift the pitch (build_note_hz clamps the index rather than crash). Reject the mismatch.
     if !f0_cents.is_empty() && f0_cents.len() as i64 != total_frames {
         return Err(format!(
-            "f0 帧数与音符总帧数不一致：{} != {}（渲染中止，避免音高错位）",
+            "VOCAL_F0_FRAMES_MISMATCH: {} != {}",
             f0_cents.len(),
             total_frames
         ));
@@ -1312,7 +1293,7 @@ pub async fn render_vocal_segment(
     let backend_type = match options.backend.as_str() {
         "rvc" => VoiceBackendType::Rvc,
         "sovits" => VoiceBackendType::SoVits,
-        other => return Err(format!("未知后端 '{}'（仅 sovits / rvc）", other)),
+        other => return Err(format!("VOCAL_BACKEND_UNKNOWN: {} (sovits / rvc)", other)),
     };
 
     // ── resolve the voice + ScoreToCV facts ── (Item-1: builds a REAL SovitsModel/RvcModel and drives the
@@ -1338,8 +1319,8 @@ pub async fn render_vocal_segment(
 
     let s2cv_path = score2cv_for_dim(&app, dim)?;
     let cv_path = contentvec_for_dim(&app, dim)?; // second_encoding needs it; struct requires it regardless
-    let rmvpe_path = aux_path(&app, AUX_RMVPE, "音高检测模型")?; // unused by the decode tail; struct field
-    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "音高检测滤波器")?;
+    let rmvpe_path = aux_path(&app, AUX_RMVPE, "RMVPE model")?; // unused by the decode tail; struct field
+    let mel_path = aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?;
     let path = PathBuf::from(&model_path);
 
     // S58: resolve each note's effective language up-front (LOUD on an out-of-enum id — never index
@@ -1406,7 +1387,7 @@ pub async fn render_vocal_segment(
         VoiceBackendType::SoVits => {
             let hop_size = entry.config.hop_size.unwrap_or(512) as usize;
             if hop_size == 0 {
-                return Err(format!("模型 '{}' 配置的 hop_size 为 0，无法推理", voice_name));
+                return Err(format!("MODEL_HOP_SIZE_ZERO: {}", voice_name));
             }
             let vol_embedding = sidecar_has_input(&entry, "vol")
                 .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
@@ -1501,7 +1482,7 @@ pub async fn render_vocal_segment(
                 .map_err(|e| e.to_string())
             })
             .await
-            .map_err(|e| format!("渲染任务失败: {}", e))?
+            .map_err(|e| format!("VOCAL_TASK_PANICKED: {}", e))?
         }
         VoiceBackendType::Rvc => {
             // §P5 force-neutralize (redundant with transpose / no source wav — no-ops on the score path).
@@ -1563,7 +1544,7 @@ pub async fn render_vocal_segment(
                 .map_err(|e| e.to_string())
             })
             .await
-            .map_err(|e| format!("渲染任务失败: {}", e))?
+            .map_err(|e| format!("VOCAL_TASK_PANICKED: {}", e))?
         }
     }
 }

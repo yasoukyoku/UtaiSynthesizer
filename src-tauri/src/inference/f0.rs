@@ -35,7 +35,7 @@ pub const SOVITS_RMVPE_THRESHOLD: f32 = 0.05;
 pub fn validate_mel_filters(filters: &Array2<f32>) -> Result<()> {
     if filters.nrows() != N_MELS || filters.ncols() != FREQ_BINS {
         return Err(UtaiError::Model(format!(
-            "rmvpe_mel_filters.npy 形状异常：期望 [{}, {}]，得到 [{}, {}] —— 请重新导出/下载",
+            "RMVPE_MEL_SHAPE: expected [{}, {}], got [{}, {}]",
             N_MELS,
             FREQ_BINS,
             filters.nrows(),
@@ -56,7 +56,7 @@ pub fn rmvpe_detect(
 ) -> Result<Vec<f32>> {
     validate_mel_filters(mel_filters)?;
     if wav16k.is_empty() {
-        return Err(UtaiError::Audio("音高检测收到空音频".into()));
+        return Err(UtaiError::Audio("F0_EMPTY_INPUT".into()));
     }
     // contract: N ≥ 513 (reflect pad undefined below) — caller-side zero pad
     let zero_padded: Vec<f32>;
@@ -127,10 +127,10 @@ pub fn rmvpe_detect(
     let f0 = outputs
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("RMVPE 模型没有返回输出".into()))?;
+        .ok_or_else(|| UtaiError::Inference("RMVPE_NO_OUTPUT".into()))?;
     if f0.len() != t_frames {
         return Err(UtaiError::Inference(format!(
-            "RMVPE 输出帧数异常：期望 {}，得到 {}",
+            "RMVPE_FRAMES_MISMATCH: expected {}, got {}",
             t_frames,
             f0.len()
         )));

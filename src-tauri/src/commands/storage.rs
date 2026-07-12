@@ -174,10 +174,19 @@ pub async fn cleanup_render_cache(
     if crate::commands::inference::voice_render_active() {
         return Err("CLEANUP_BUSY".into());
     }
+    // MSST separation writes stems straight into the cache tree and does NOT check the audition
+    // flight flag — a live worker mid-write would race the sweep (S61 leftover, closed here). The
+    // frontend additionally gates on running executions, but that state desyncs when a run errors
+    // out while the backend worker keeps going — this is the authoritative check.
+    if matches!(
+        state.separation.status().state,
+        crate::separation::SeparationState::LoadingModel | crate::separation::SeparationState::Separating
+    ) {
+        return Err("CLEANUP_BUSY".into());
+    }
     // HOLD the audition flight flag for the whole sweep (not a mere load() check): VoiceRunGuard +
     // audition both refuse to START while it is held, so no render can begin writing fresh run-dir
     // files mid-sweep and get them deleted from under it (audit S61 — check-then-act window).
-    // Residual: MSST separation runs don't check this flag; the frontend gates those.
     let _flight = crate::commands::audition::FlightGuard::acquire("CLEANUP_BUSY")?;
     let cache_dir = state.cache_dir.clone();
     tauri::async_runtime::spawn_blocking(move || Ok(sweep_cache_tree(&cache_dir, &protected)))

@@ -159,6 +159,27 @@
   stroke-width: 2;
 }
 
+/* Edge affordances (classes set by WorkflowEditor displayEdges — same predicate as the delete veto).
+   A wire that CAN be cut/re-wired right now lights up under the cursor; a render-locked wire (its
+   consumer is queued/running in the live run) dims and refuses with a not-allowed cursor. */
+.workflow-canvas .react-flow__edge.wf-edge-free:hover .react-flow__edge-path {
+  stroke: var(--accent-primary-bright);
+  stroke-width: 3;
+  filter: drop-shadow(0 0 4px var(--accent-primary-glow));
+}
+.workflow-canvas .react-flow__edge.wf-edge-locked,
+.workflow-canvas .react-flow__edge.wf-edge-locked * {
+  cursor: not-allowed;
+}
+.workflow-canvas .react-flow__edge.wf-edge-locked .react-flow__edge-path {
+  opacity: 0.55;
+}
+/* Selected edge: xyflow's own .selected rule (stroke #555) outranks the base rule above now that the
+   inline default style is gone — without this override a click-selected edge reads as "locked/dim". */
+.workflow-canvas .react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--accent-primary);
+}
+
 .workflow-canvas .react-flow__controls {
   overflow: hidden;
   border: 1px solid var(--border-subtle);

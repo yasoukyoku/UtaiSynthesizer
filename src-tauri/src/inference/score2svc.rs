@@ -344,7 +344,7 @@ pub fn resample_to_sovits_grid(cv: &Array2<f32>, note_hz: &[f32], sr: u32, hop: 
     debug_assert_eq!(cv.nrows(), note_hz.len(), "cv rows must equal note_hz length (both T50)");
     let t_tgt = sovits_grid_len(cv.nrows(), sr, hop);
     if t_tgt == 0 {
-        return Err(UtaiError::Inference("score2svc: 目标帧数为 0（谱太短）".into()));
+        return Err(UtaiError::Inference("SCORE2SVC_ZERO_FRAMES".into()));
     }
     // uv on the 50 fps f0 (render_cv order), then nearest-resample the float mask. Under Option-A the real
     // voiced mask already lives in `build_note_hz` (which writes 0 Hz for every unvoiced frame), so deriving
@@ -436,7 +436,7 @@ pub fn render_score_sovits(
     let mut cv_cursor = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
         if cancel() {
-            return Err(UtaiError::Inference("已取消".into()));
+            return Err(UtaiError::Inference("CANCELLED".into()));
         }
         let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
@@ -564,7 +564,7 @@ pub fn render_score_rvc(
     let mut cv_cursor = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
         if cancel() {
-            return Err(UtaiError::Inference("已取消".into()));
+            return Err(UtaiError::Inference("CANCELLED".into()));
         }
         let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];

@@ -265,7 +265,16 @@ export function TrackList({ width }: Props) {
       }}
       onMouseLeave={() => setHoverBoundary(null)}
     >
-      <div className="track-list-scroll" style={{ transform: `translateY(${-scrollY}px)` }}>
+      {/* DEVICE-pixel snapping: scrollY is routinely fractional (raw wheel deltas + vZoom-scaled clamp
+          values), and a translateY that lands off the DEVICE pixel grid rasterizes the whole DOM text
+          column blurry in WebView2. Plain Math.round is not enough on scaled Windows displays (125% ⇒
+          integer CSS px = fractional device px), so snap to device pixels via devicePixelRatio.
+          Display-only: the store value (and the canvas, whose own drawing consumes it) stays unrounded,
+          so shared scroll math is untouched; max divergence from the canvas is < 1 device px. */}
+      <div
+        className="track-list-scroll"
+        style={{ transform: `translateY(${-(Math.round(scrollY * (window.devicePixelRatio || 1)) / (window.devicePixelRatio || 1))}px)` }}
+      >
         {tracks.length === 0 && (
           <div className="track-list-empty">
             <span className="text-muted">{t("tracks.empty")}</span>

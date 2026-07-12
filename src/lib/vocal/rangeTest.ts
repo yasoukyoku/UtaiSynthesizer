@@ -14,8 +14,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import i18n from "../../i18n";
+import { backendErrorMessage, isBusyError, isCancelError } from "../backendError";
 import { useAppStore } from "../../store/app";
-import { useVoiceModelStore, type VoiceType } from "../../store/voice-models";
+import { useVoiceModelStore, MIN_COMFORT_SPAN, type VoiceType } from "../../store/voice-models";
 import { SOVITS_DEFAULTS, RVC_DEFAULTS } from "../workflow/voiceDefaults";
 import { VOCAL_RENDER_BUSY, type ScoreTriple } from "./vocalRender";
 
@@ -93,10 +94,10 @@ const isComfort = (s: SemitoneStat) => s.errCents < 50 && s.voicedRatio > 0.8;
  *  the whole ceiling (S60d: lengv2.3 lost 57–77 to a single 1180¢ point at 57). */
 const BRIDGE_MAX_GAP = 2;
 
-/** Minimum comfort span (semitones) the UI lets the user commit — a degenerate zone becomes
- *  a centering target for everything (S60d: comfort=[42,42] → whole-song -27 st renders).
- *  Mirrors MIN_COMFORT_SPAN in src-tauri/src/inference/vocal_range.rs (read-side healing). */
-export const MIN_COMFORT_SPAN = 5;
+/** Minimum comfort span the UI lets the user commit — the constant now lives in
+ *  voice-models.ts (the range-record gate needs it and rangeTest already imports that store;
+ *  re-exported here so existing consumers keep their import path). */
+export { MIN_COMFORT_SPAN };
 
 /** Pass-flags with interior fail-gaps of ≤ BRIDGE_MAX_GAP (flanked by passes) bridged. */
 function bridgedFlags(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): boolean[] {
@@ -290,7 +291,10 @@ export async function runRangeTest(
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes(VOCAL_RENDER_BUSY)) useAppStore.getState().showToast(t("rangeTest.busy"), "info");
+    const shared = backendErrorMessage(e); // app-wide CODEs (APP_BUSY from the VoiceRunGuard, …)
+    if (isCancelError(e)) { /* user cancelled — not an error, no toast */ }
+    else if (msg.includes(VOCAL_RENDER_BUSY)) useAppStore.getState().showToast(t("rangeTest.busy"), "info");
+    else if (shared) useAppStore.getState().showToast(shared, isBusyError(e) ? "info" : "error");
     else useAppStore.getState().showToast(`${t("rangeTest.failed")}: ${msg}`, "error");
   } finally {
     unlisten();

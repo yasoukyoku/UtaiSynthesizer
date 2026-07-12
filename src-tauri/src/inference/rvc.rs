@@ -51,7 +51,7 @@ pub struct RvcIndex {
 impl RvcIndex {
     pub fn load(path: &Path) -> Result<Self> {
         let raw: Array2<f32> = ndarray_npy::read_npy(path).map_err(|e| {
-            UtaiError::Model(format!("加载检索索引失败 '{}': {}", path.display(), e))
+            UtaiError::Model(format!("INDEX_LOAD_FAILED: '{}': {}", path.display(), e))
         })?;
         tracing::info!(
             "Loaded RVC index: {} vectors x {} dim",
@@ -96,12 +96,12 @@ pub fn run_pipeline(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
     if audio.samples.is_empty() {
-        return Err(UtaiError::Audio("输入音频为空".into()));
+        return Err(UtaiError::Audio("AUDIO_EMPTY_INPUT".into()));
     }
     progress(0.03);
     if m.sample_rate % 100 != 0 {
         return Err(UtaiError::Model(format!(
-            "模型采样率 {} 不是 100 的倍数，无法对齐 100fps 帧栅格",
+            "RVC_SR_NOT_100FPS: sample_rate={}",
             m.sample_rate
         )));
     }
@@ -165,7 +165,7 @@ pub fn run_pipeline(
     f0.iter_mut().for_each(|v| *v *= ratio);
     if f0.len() < p_len {
         return Err(UtaiError::Inference(format!(
-            "f0 帧数不足：{} < p_len {}",
+            "RVC_F0_FRAMES_SHORT: {} < p_len {}",
             f0.len(),
             p_len
         )));
@@ -193,7 +193,12 @@ pub fn run_pipeline(
     // TD-PSOLA'd back before append_trimmed, so the constant-ratio seams stay inside the
     // trimmed-away pads/silence. shift 0 ⇒ the exact original vc_chunk calls (byte-identical).
     let range_shift = range
-        .map(|r| super::vocal_range::piece_range_shift(&pitchf, &r))
+        .map(|r| {
+            // loudness weighting: RMS on the same 100 fps grid pitchf was detected on — quiet
+            // phantom highs (reverb tails / harmony bleed) stop driving whole-song shifts
+            let rms = super::vocal_range::frame_rms(&audio_pad, WINDOW, pitchf.len());
+            super::vocal_range::piece_range_shift(&pitchf, Some(&rms), &r)
+        })
         .unwrap_or(0);
     if range_shift != 0 {
         tracing::info!("range-extend(cover/rvc): whole signal rendered {range_shift:+} st into comfort");
@@ -220,7 +225,7 @@ pub fn run_pipeline(
     };
     for &ot in &opt_ts {
         if cancel() {
-            return Err(UtaiError::Inference("已取消".into()));
+            return Err(UtaiError::Inference("CANCELLED".into()));
         }
         let t = ot / WINDOW * WINDOW;
         // Clamp to buffer length: Python's `audio_pad[s : t+t_pad2+window]` TRUNCATES, but Rust
@@ -239,7 +244,7 @@ pub fn run_pipeline(
     }
     // final chunk: audio_pad[t:] with the remaining pitch tail (t=None → whole signal)
     if cancel() {
-        return Err(UtaiError::Inference("已取消".into()));
+        return Err(UtaiError::Inference("CANCELLED".into()));
     }
     let chunk = &audio_pad[s_ix..];
     let out = ranged_chunk(&pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], chunk, chunk_idx)?;
@@ -272,9 +277,7 @@ pub fn run_pipeline(
 
 fn append_trimmed(dst: &mut Vec<f32>, out: &[f32], t_pad_tgt: usize) -> Result<()> {
     if out.len() <= 2 * t_pad_tgt {
-        return Err(UtaiError::Inference(
-            "音频片段过短：模型输出不足以裁掉前后填充".into(),
-        ));
+        return Err(UtaiError::Inference("RVC_CHUNK_TOO_SHORT".into()));
     }
     dst.extend_from_slice(&out[t_pad_tgt..out.len() - t_pad_tgt]);
     Ok(())
@@ -342,7 +345,7 @@ pub(crate) fn vc_decode(
     let p_len = p_len.min(pitch.len());
     if p_len < m.min_frames {
         return Err(UtaiError::Inference(format!(
-            "音频片段过短：帧数 {} 小于模型最小帧数 {}",
+            "RVC_MIN_FRAMES: {} < {}",
             p_len, m.min_frames
         )));
     }
@@ -429,7 +432,7 @@ pub(crate) fn vc_decode(
     outputs
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("RVC 模型没有返回输出".into()))
+        .ok_or_else(|| UtaiError::Inference("RVC_NO_OUTPUT".into()))
 }
 
 /// Deterministic per-chunk RNG: user seed splitmixed with the chunk index.

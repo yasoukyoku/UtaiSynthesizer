@@ -59,7 +59,7 @@ pub fn ensure_ascii_path(p: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(err(format!(
-            "运行时安装路径含非 ASCII 字符：{}。内嵌 Python + torch 在含中文/日文等字符的路径下会出现 DLL 加载失败——请先在 设置→存储位置 把数据目录迁移到纯英文路径（例如 D:\\UtaiData）后重试。",
+            "RUNTIME_PATH_NON_ASCII: {}",
             p.display()
         )))
     }
@@ -206,9 +206,7 @@ pub fn converter_python(app_dir: &Path) -> PathBuf {
 pub fn converter_python_checked(app_dir: &Path) -> Result<PathBuf> {
     let py = converter_python(app_dir);
     if py == Path::new("python") {
-        return Err(err(
-            "模型转换需要 Python 运行时，但尚未安装任何运行时包。请到 设置 → 训练环境 安装「CPU 运行时」包（约 0.4GB 下载），或安装适合你显卡的运行时包后重试。",
-        ));
+        return Err(err("RUNTIME_PACK_REQUIRED"));
     }
     Ok(py)
 }
@@ -291,7 +289,7 @@ pub struct CatalogEntry {
 pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
     id: "runtime-cpu-v1",
     variant: "cpu",
-    label: "CPU 运行时（模型转换基座 + CPU 训练）",
+    label: "CPU runtime (model conversion base + CPU training)",
     // Real numbers from the published pack (S42): 236 MB download / 1.18 GB on disk.
     download_bytes: 236_000_000,
     disk_bytes: 1_180_000_000,
@@ -307,7 +305,7 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
 }, CatalogEntry {
     id: "runtime-nv-cu130-v1",
     variant: "nv-cu130",
-    label: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）",
+    label: "NVIDIA runtime (cu130; RTX 20-50 training + model conversion)",
     // Real numbers from the Phase B build: 1.84 GB download / 3.59 GB on disk (single
     // part — under the 1.9 GiB split cap).
     download_bytes: 1_838_043_109,
@@ -323,7 +321,7 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
 }, CatalogEntry {
     id: "runtime-amd-v1",
     variant: "amd",
-    label: "AMD 运行时（TheRock ROCm；RDNA3/4 训练 + 模型转换，实验性）",
+    label: "AMD runtime (TheRock ROCm; RDNA3/4 training + model conversion, experimental)",
     // Real numbers from the S44 build: 1.172 GB download / 4.50 GB on disk (single
     // part, under the 1.9 GiB split cap). Validated end-to-end on the dev machine's
     // Radeon 780M (gfx1103): flat-PBS-layout torch-rocm import + full envtest 20/20
@@ -341,7 +339,7 @@ pub const CATALOG: &[CatalogEntry] = &[CatalogEntry {
 }, CatalogEntry {
     id: "runtime-xpu-v1",
     variant: "xpu",
-    label: "Intel 运行时（XPU；Arc 训练 + 模型转换，实验性）",
+    label: "Intel runtime (XPU; Arc training + model conversion, experimental)",
     // Real numbers from the S45 build: 1.356 GB download / 5.27 GB on disk (single part,
     // under the 1.9 GiB split cap). Bulkier than cpu/nv because the Intel SYCL/oneMKL
     // runtime + triton-xpu (359 MB) ship as separate wheels. Built + verified on the dev
@@ -407,7 +405,7 @@ pub async fn fetch_manifest(
     candidates: &[String],
 ) -> Result<(PackManifest, Vec<String>)> {
     if candidates.is_empty() {
-        return Err(err("该运行时包尚未发布下载源——请使用「从本地文件安装」。"));
+        return Err(err("PACK_NO_DOWNLOAD_SOURCE"));
     }
     let mut last: Option<String> = None;
     for url in candidates {
@@ -424,15 +422,15 @@ pub async fn fetch_manifest(
                         }
                         return Ok((man, bases));
                     }
-                    Err(e) => last = Some(format!("manifest 解析失败 ({url}): {e}")),
+                    Err(e) => last = Some(format!("MANIFEST_PARSE_FAILED: {e} ({url})")),
                 },
-                Err(e) => last = Some(format!("manifest 读取失败 ({url}): {e}")),
+                Err(e) => last = Some(format!("MANIFEST_READ_FAILED: {e} ({url})")),
             },
-            Ok(resp) => last = Some(format!("HTTP {} ({url})", resp.status())),
-            Err(e) => last = Some(format!("请求失败 ({url}): {e}")),
+            Ok(resp) => last = Some(format!("MANIFEST_REQUEST_FAILED: HTTP {} ({url})", resp.status())),
+            Err(e) => last = Some(format!("MANIFEST_REQUEST_FAILED: {e} ({url})")),
         }
     }
-    Err(err(last.unwrap_or_else(|| "manifest 获取失败".into())))
+    Err(err(last.unwrap_or_else(|| "MANIFEST_FETCH_FAILED".into())))
 }
 
 // ─── install ────────────────────────────────────────────────────────────────
@@ -448,7 +446,7 @@ impl InstallGuard {
     pub fn acquire() -> Result<(Self, Arc<AtomicBool>)> {
         let mut slot = ACTIVE_INSTALL.lock();
         if slot.is_some() {
-            return Err(err("已有运行时包在下载/安装中——请等它完成或先取消。"));
+            return Err(err("INSTALL_BUSY"));
         }
         let flag = Arc::new(AtomicBool::new(false));
         *slot = Some(Arc::clone(&flag));
@@ -489,7 +487,7 @@ pub struct EnvtestGuard;
 impl EnvtestGuard {
     pub fn acquire() -> Result<Self> {
         if ENVTEST_BUSY.swap(true, Ordering::SeqCst) {
-            return Err(err("已有环境自检在运行中"));
+            return Err(err("ENVTEST_BUSY"));
         }
         Ok(EnvtestGuard)
     }
@@ -510,17 +508,17 @@ pub fn envtest_active() -> bool {
 /// paths from a real directory listing and extract_and_commit re-validates the id).
 pub fn validate_manifest(man: &PackManifest) -> Result<()> {
     if !is_safe_component(&man.id) {
-        return Err(err(format!("清单 id 含非法字符: {:?}", man.id)));
+        return Err(err(format!("MANIFEST_BAD_ID: {:?}", man.id)));
     }
     if man.parts.is_empty() {
-        return Err(err("清单不含任何分卷"));
+        return Err(err("MANIFEST_NO_PARTS"));
     }
     for p in &man.parts {
         if !is_safe_component(&p.name) {
-            return Err(err(format!("清单分卷名含非法字符: {:?}", p.name)));
+            return Err(err(format!("MANIFEST_BAD_PART_NAME: {:?}", p.name)));
         }
         if p.sha256.len() != 64 || !p.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(err(format!("分卷 {} 的 sha256 格式非法", p.name)));
+            return Err(err(format!("MANIFEST_BAD_SHA256: {}", p.name)));
         }
     }
     Ok(())
@@ -528,7 +526,7 @@ pub fn validate_manifest(man: &PackManifest) -> Result<()> {
 
 /// Ensured + ASCII-checked runtime root (install-time entry point).
 pub fn install_root() -> Result<PathBuf> {
-    let root = runtime_root().ok_or_else(|| err("运行时根目录未初始化"))?;
+    let root = runtime_root().ok_or_else(|| err("RUNTIME_ROOT_UNINIT"))?;
     ensure_ascii_path(root)?;
     std::fs::create_dir_all(root)?;
     Ok(root.clone())
@@ -539,16 +537,16 @@ pub fn verify_parts(manifest: &PackManifest, dir: &Path) -> Result<()> {
     for part in &manifest.parts {
         let p = dir.join(&part.name);
         let meta = std::fs::metadata(&p)
-            .map_err(|e| err(format!("分卷缺失 {}: {e}", part.name)))?;
+            .map_err(|e| err(format!("PART_MISSING: {}: {e}", part.name)))?;
         if meta.len() != part.size {
             return Err(err(format!(
-                "分卷大小不符 {}（期望 {}，实际 {}）",
+                "PART_SIZE_MISMATCH: {} (expected {}, got {})",
                 part.name, part.size, meta.len()
             )));
         }
         let got = crate::download::sha256_file(&p)?;
         if !got.eq_ignore_ascii_case(&part.sha256) {
-            return Err(err(format!("分卷校验失败 {}（sha256 不匹配）", part.name)));
+            return Err(err(format!("PART_SHA256_MISMATCH: {}", part.name)));
         }
     }
     Ok(())
@@ -576,8 +574,9 @@ fn rename_with_retry(from: &Path, to: &Path, what: &str) -> Result<()> {
         match std::fs::rename(from, to) {
             Ok(()) => {
                 if attempt > 0 {
-                    // Logs stay English/standard — `what` is the Chinese label for
-                    // USER-FACING error strings only; the paths carry the context here.
+                    // `what` is a short English phase token (PACK_MOVE_OUT / INSTALL_COMMIT /
+                    // PACK_ROLLBACK / INSTALL_RECOVERY) carried as the CODE's detail payload;
+                    // the paths carry the context here.
                     tracing::info!("rename succeeded on retry {attempt}: {} -> {}", from.display(), to.display());
                 }
                 return Ok(());
@@ -585,7 +584,7 @@ fn rename_with_retry(from: &Path, to: &Path, what: &str) -> Result<()> {
             Err(e) => {
                 let retriable = matches!(e.raw_os_error(), Some(5) | Some(32));
                 if !retriable {
-                    return Err(err(format!("{what}失败（rename {} → {}）: {e}", from.display(), to.display())));
+                    return Err(err(format!("RENAME_FAILED: {what} ({} -> {}): {e}", from.display(), to.display())));
                 }
                 tracing::warn!("rename denied (attempt {attempt}) {} -> {}: {e} — retrying in {delay_ms}ms", from.display(), to.display());
                 last = Some(e);
@@ -595,7 +594,7 @@ fn rename_with_retry(from: &Path, to: &Path, what: &str) -> Result<()> {
         }
     }
     Err(err(format!(
-        "{what}失败（rename {} → {}）: {}。多次重试仍被拒绝——通常是杀毒软件/搜索索引正在扫描新文件：稍候片刻重试，或把数据目录加入杀软排除列表。",
+        "RENAME_RETRY_EXHAUSTED: {what} ({} -> {}): {}",
         from.display(),
         to.display(),
         last.map(|e| e.to_string()).unwrap_or_default()
@@ -631,37 +630,37 @@ pub fn extract_and_commit(
     let root = install_root()?;
     let reader = crate::download::MultiFileReader::new(parts.to_vec());
     let decoder = zstd::stream::read::Decoder::new(reader)
-        .map_err(|e| err(format!("zstd 解码器初始化失败: {e}")))?;
+        .map_err(|e| err(format!("ZSTD_INIT_FAILED: {e}")))?;
     let mut archive = tar::Archive::new(decoder);
     let mut entries = archive
         .entries()
-        .map_err(|e| err(format!("tar 读取失败: {e}")))?;
+        .map_err(|e| err(format!("TAR_READ_FAILED: {e}")))?;
 
     // ── entry 0: pack.json → memory (determines the target dir) ──
     let mut first = entries
         .next()
-        .ok_or_else(|| err("包为空"))?
-        .map_err(|e| err(format!("tar 条目损坏: {e}")))?;
+        .ok_or_else(|| err("PACK_EMPTY"))?
+        .map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {e}")))?;
     let first_path = first
         .path()
-        .map_err(|e| err(format!("tar 条目路径非法: {e}")))?
+        .map_err(|e| err(format!("TAR_ENTRY_BAD_PATH: {e}")))?
         .into_owned();
     if first_path != Path::new("pack.json") {
         return Err(err(format!(
-            "包格式不符：第一个条目是 {:?}，应为 pack.json（请用最新 build_pack.py 重新构建）",
+            "PACK_FORMAT_INVALID: first entry is {:?}, expected pack.json (rebuild with the latest build_pack.py)",
             first_path
         )));
     }
     let mut meta_text = String::new();
     first
         .read_to_string(&mut meta_text)
-        .map_err(|e| err(format!("pack.json 读取失败: {e}")))?;
+        .map_err(|e| err(format!("PACK_JSON_READ_FAILED: {e}")))?;
     let meta: PackMeta = serde_json::from_str(&meta_text)
-        .map_err(|e| err(format!("pack.json 解析失败: {e}")))?;
+        .map_err(|e| err(format!("PACK_JSON_PARSE_FAILED: {e}")))?;
     // The id becomes a directory under the runtimes root — an id like "..\\evil"
     // or "包名" would escape the root / break the ASCII invariant.
     if !is_safe_component(&meta.id) {
-        return Err(err(format!("pack.json 的 id 含非法字符: {:?}", meta.id)));
+        return Err(err(format!("PACK_JSON_BAD_ID: {:?}", meta.id)));
     }
 
     let final_dir = root.join(&meta.id);
@@ -682,7 +681,7 @@ pub fn extract_and_commit(
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         ));
-        rename_with_retry(&final_dir, &moved, "旧包移出")?;
+        rename_with_retry(&final_dir, &moved, "PACK_MOVE_OUT")?;
         old_backup = Some(moved);
     } else if final_dir.exists() {
         // Torn earlier attempt. Prefer a clean slate; extracting over identical
@@ -698,13 +697,13 @@ pub fn extract_and_commit(
         let mut count: u64 = 0;
         for entry in entries {
             if cancel.load(Ordering::SeqCst) {
-                return Err(err("安装已取消"));
+                return Err(err("INSTALL_CANCELLED"));
             }
-            let mut entry = entry.map_err(|e| err(format!("tar 条目损坏: {e}")))?;
+            let mut entry = entry.map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {e}")))?;
             // unpack_in refuses paths escaping dest (tar 路径穿越防护).
             entry
                 .unpack_in(&dest)
-                .map_err(|e| err(format!("解压失败: {e}")))?;
+                .map_err(|e| err(format!("EXTRACT_FAILED: {e}")))?;
             count += 1;
             if count % 100 == 0 {
                 progress(count);
@@ -713,13 +712,13 @@ pub fn extract_and_commit(
         progress(count);
 
         if !pack_python(&final_dir).exists() {
-            return Err(err("包内缺少 python/python.exe（不是有效的运行时包）"));
+            return Err(err("PACK_NO_PYTHON: python/python.exe missing from the archive"));
         }
 
         // ── the commit: one fresh file, same-dir rename ──
         let tmp = final_dir.join("pack.json.tmp");
         std::fs::write(&tmp, meta_text.as_bytes())?;
-        rename_with_retry(&tmp, &marker, "安装提交")?;
+        rename_with_retry(&tmp, &marker, "INSTALL_COMMIT")?;
         Ok(meta)
     })();
 
@@ -740,7 +739,7 @@ pub fn extract_and_commit(
             // Reinstall case: roll the previous pack back IN-SESSION — waiting for
             // the next startup's sweep would leave the user packless until restart.
             if let Some(old) = &old_backup {
-                match rename_with_retry(old, &final_dir, "旧包回滚") {
+                match rename_with_retry(old, &final_dir, "PACK_ROLLBACK") {
                     Ok(()) => tracing::warn!("reinstall failed — previous pack rolled back"),
                     Err(e) => tracing::error!("old-pack rollback failed ({e}) — startup sweep will restore it"),
                 }
@@ -757,11 +756,11 @@ pub fn extract_and_commit(
 pub fn resolve_local_parts(picked: &Path) -> Result<(Vec<PathBuf>, Option<PackManifest>)> {
     let dir = picked
         .parent()
-        .ok_or_else(|| err("无法解析所选文件所在目录"))?;
+        .ok_or_else(|| err("LOCAL_FILE_BAD_DIR"))?;
     let fname = picked
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| err("无法解析所选文件名"))?;
+        .ok_or_else(|| err("LOCAL_FILE_BAD_NAME"))?;
 
     // Split-volume naming: <stem>.tar.zst.partNN (builder convention).
     let (stem, parts) = if let Some(idx) = fname.find(".tar.zst.part") {
@@ -777,21 +776,21 @@ pub fn resolve_local_parts(picked: &Path) -> Result<(Vec<PathBuf>, Option<PackMa
             }
         }
         if vols.is_empty() {
-            return Err(err("未找到任何分卷文件"));
+            return Err(err("LOCAL_PARTS_NOT_FOUND"));
         }
         vols.sort_by_key(|(n, _)| *n);
         // Volumes must be contiguous from 1 — a missing middle volume would
         // otherwise silently produce a corrupt stream.
         for (i, (n, _)) in vols.iter().enumerate() {
             if *n != (i as u32) + 1 {
-                return Err(err(format!("分卷不连续：缺少 {prefix}{:02}", i + 1)));
+                return Err(err(format!("LOCAL_PARTS_GAP: missing {prefix}{:02}", i + 1)));
             }
         }
         (stem.to_string(), vols.into_iter().map(|(_, p)| p).collect())
     } else if fname.ends_with(".tar.zst") {
         (fname.to_string(), vec![picked.to_path_buf()])
     } else {
-        return Err(err("请选择 .tar.zst 运行时包（或它的 .part01 分卷）"));
+        return Err(err("LOCAL_FILE_BAD_TYPE"));
     };
 
     let manifest_name = format!("{}.manifest.json", stem.trim_end_matches(".tar.zst"));
@@ -808,19 +807,19 @@ pub fn delete_pack(id: &str) -> Result<()> {
     // Interlocks first: deleting under a live install/self-test tears files out
     // from under a running python.exe.
     if install_active() {
-        return Err(err("有运行时包正在下载/安装——请等它完成或先取消，再删除。"));
+        return Err(err("DELETE_WHILE_INSTALLING"));
     }
     if envtest_active() {
-        return Err(err("环境自检正在运行——请等它结束再删除。"));
+        return Err(err("DELETE_WHILE_ENVTEST"));
     }
-    let root = runtime_root().ok_or_else(|| err("运行时根目录未初始化"))?;
+    let root = runtime_root().ok_or_else(|| err("RUNTIME_ROOT_UNINIT"))?;
     if !is_safe_component(id) {
-        return Err(err(format!("非法的包 id: {id:?}")));
+        return Err(err(format!("PACK_BAD_ID: {id:?}")));
     }
     let dir = root.join(id);
     let marker = dir.join("pack.json");
     if !marker.exists() {
-        return Err(err(format!("运行时包不存在: {id}")));
+        return Err(err(format!("PACK_NOT_FOUND: {id}")));
     }
     // Marker-FIRST delete — the mirror image of the install commit: removing ONE
     // closed file is never blocked by scanner handles elsewhere in the tree, and
@@ -843,7 +842,7 @@ pub fn delete_pack(id: &str) -> Result<()> {
     }
     if let Some(e) = last {
         return Err(err(format!(
-            "删除失败（无法移除 {}）: {e}。若刚运行过转换/自检，请稍候几秒重试。",
+            "PACK_DELETE_FAILED: {}: {e}",
             marker.display()
         )));
     }
@@ -886,7 +885,7 @@ pub fn sweep_staging() {
                 if let Some((id, _ts)) = rest.rsplit_once('-') {
                     let final_dir = root.join(id);
                     if !final_dir.exists() && path.join("pack.json").exists() {
-                        match rename_with_retry(&path, &final_dir, "断装恢复") {
+                        match rename_with_retry(&path, &final_dir, "INSTALL_RECOVERY") {
                             Ok(()) => {
                                 tracing::warn!("recovered pack {id} from interrupted reinstall");
                             }

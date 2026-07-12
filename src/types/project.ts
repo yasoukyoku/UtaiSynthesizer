@@ -289,8 +289,9 @@ export interface VocalTrackParams {
    *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
   breathToken?: string;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
-   *  TD-PSOLA'd back (needs a vocal_range record on the model — else a no-op). ABSENT = ON (the default is
-   *  stored as absence — canonical write in setVocalParams); `false` = the user turned it off. */
+   *  TD-PSOLA'd back (needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
+   *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in
+   *  setVocalParams); `true` = the user turned it on. */
   rangeExtend?: boolean;
 }
 

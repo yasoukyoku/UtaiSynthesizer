@@ -1,8 +1,11 @@
 //! Tauri commands for the embedded Python runtime packs (S42 Phase A).
 //! Thin orchestration over crate::pyenv + crate::download; all UI progress flows
 //! through ONE event channel:
-//!   `pyenv-progress`  { id, phase, progress, message }   phase: manifest|download|
-//!                                                        verify|extract|envtest|done|error
+//!   `pyenv-progress`  { id, phase, progress, message, code, params }
+//!                     phase: manifest|download|verify|extract|envtest|done|error;
+//!                     `code` is the stable CODE the Settings panel localizes from
+//!                     (params = positional payload); `message` is the English
+//!                     log/fallback text.
 //!   `pyenv-envtest`   { id, event }                      raw envtest JSONL objects
 
 use std::path::PathBuf;
@@ -19,10 +22,23 @@ struct PyenvProgress {
     id: String,
     phase: String,
     progress: f32,
+    /// English log/fallback text — the frontend renders from `code`+`params` when present.
     message: String,
+    /// Stable stage/outcome/error CODE for frontend localization (None on legacy emits).
+    code: Option<String>,
+    /// Positional payload for the localized template (e.g. [name, doneMB, totalMB]).
+    params: Vec<String>,
 }
 
-fn emit_progress(app: &tauri::AppHandle, id: &str, phase: &str, progress: f32, message: impl Into<String>) {
+fn emit_progress(
+    app: &tauri::AppHandle,
+    id: &str,
+    phase: &str,
+    progress: f32,
+    code: Option<&str>,
+    params: Vec<String>,
+    message: impl Into<String>,
+) {
     let _ = app.emit(
         "pyenv-progress",
         PyenvProgress {
@@ -30,8 +46,28 @@ fn emit_progress(app: &tauri::AppHandle, id: &str, phase: &str, progress: f32, m
             phase: phase.to_string(),
             progress,
             message: message.into(),
+            code: code.map(str::to_string),
+            params,
         },
     );
+}
+
+/// First SCREAMING_SNAKE token in an error message ("Runtime pack error: CODE: detail"
+/// → CODE) — error emits carry it so the frontend localizes without string-matching.
+fn leading_code(msg: &str) -> Option<&str> {
+    msg.split(|c: char| c == ':' || c == '(' || c == ')' || c.is_whitespace()).find(|t| {
+        t.len() >= 4
+            && t.contains('_')
+            && t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    })
+}
+
+/// Terminal "done" outcome of an install: `code`+`params` feed the frontend i18n
+/// template; `message` stays the English log/fallback text.
+struct DoneMsg {
+    code: &'static str,
+    params: Vec<String>,
+    message: String,
 }
 
 #[derive(serde::Serialize)]
@@ -111,7 +147,7 @@ pub async fn download_runtime_pack(
     let entry = pyenv::CATALOG
         .iter()
         .find(|e| e.id == id)
-        .ok_or_else(|| format!("未知运行时包: {id}"))?;
+        .ok_or_else(|| format!("PACK_UNKNOWN: {id}"))?;
     let (guard, cancel) = pyenv::InstallGuard::acquire().map_err(|e| e.to_string())?;
     let _task = state.begin_task("pyenv_install"); // close-flow in-progress listing
     let result = do_download_and_install(&app, &state, entry, &cancel).await;
@@ -120,13 +156,13 @@ pub async fn download_runtime_pack(
     // installing=true and wedge the rebuilt busy state (audit S42-r2).
     drop(guard);
     match &result {
-        Ok(msg) => {
+        Ok(done) => {
             tracing::info!("runtime pack installed: {id}");
-            emit_progress(&app, &id, "done", 1.0, msg.clone());
+            emit_progress(&app, &id, "done", 1.0, Some(done.code), done.params.clone(), done.message.clone());
         }
         Err(e) => {
             tracing::error!("runtime pack install failed ({id}): {e}");
-            emit_progress(&app, &id, "error", 0.0, e.clone());
+            emit_progress(&app, &id, "error", 0.0, leading_code(e), vec![], e.clone());
         }
     }
     result.map(|_| ())
@@ -137,18 +173,18 @@ async fn do_download_and_install(
     state: &Arc<AppState>,
     entry: &pyenv::CatalogEntry,
     cancel: &Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> Result<DoneMsg, String> {
     let id = entry.id;
     let root = pyenv::install_root().map_err(|e| e.to_string())?;
     let client = crate::download::client().map_err(|e| e.to_string())?;
 
-    emit_progress(app, id, "manifest", 0.0, "获取包清单...");
+    emit_progress(app, id, "manifest", 0.0, Some("STAGE_FETCH_MANIFEST"), vec![], "Fetching pack manifest...");
     let candidates = pyenv::manifest_url_candidates(entry);
     let (manifest, bases) = pyenv::fetch_manifest(&client, &candidates)
         .await
         .map_err(|e| e.to_string())?;
     if manifest.id != id {
-        return Err(format!("清单 id 不匹配（{} ≠ {id}）", manifest.id));
+        return Err(format!("MANIFEST_ID_MISMATCH: {} != {id}", manifest.id));
     }
     // Remote json feeds filesystem paths below — validate before ANY join.
     pyenv::validate_manifest(&manifest).map_err(|e| e.to_string())?;
@@ -182,16 +218,16 @@ async fn do_download_and_install(
             }
             last_emitted = abs;
             let overall = abs as f32 / total_bytes.max(1) as f32;
+            let mb_done = format!("{:.1}", abs as f64 / 1.0e6);
+            let mb_total = format!("{:.1}", total_bytes as f64 / 1.0e6);
             emit_progress(
                 &app2,
                 id,
                 "download",
                 overall * 0.85,
-                format!(
-                    "下载 {name}  {:.1} / {:.1} MB",
-                    abs as f64 / 1.0e6,
-                    total_bytes as f64 / 1.0e6
-                ),
+                Some("STAGE_DOWNLOADING"),
+                vec![name.clone(), mb_done.clone(), mb_total.clone()],
+                format!("Downloading {name}  {mb_done} / {mb_total} MB"),
             );
         })
         .await
@@ -207,7 +243,7 @@ async fn do_download_and_install(
 }
 
 /// Shared tail of both install flows: extract+commit (blocking task), then the
-/// automatic post-install self-test. Returns the terminal "done" MESSAGE — the
+/// automatic post-install self-test. Returns the terminal "done" outcome — the
 /// caller emits it after dropping the InstallGuard (never before: the frontend's
 /// done-handler refresh must observe installing=false).
 async fn install_parts(
@@ -216,8 +252,8 @@ async fn install_parts(
     id: &str,
     parts: Vec<PathBuf>,
     cancel: &Arc<AtomicBool>,
-) -> Result<String, String> {
-    emit_progress(app, id, "extract", 0.86, "解压运行时包...");
+) -> Result<DoneMsg, String> {
+    emit_progress(app, id, "extract", 0.86, Some("STAGE_EXTRACTING"), vec![], "Extracting runtime pack...");
     let app2 = app.clone();
     let id2 = id.to_string();
     let cancel2 = Arc::clone(cancel);
@@ -228,12 +264,14 @@ async fn install_parts(
                 &id2,
                 "extract",
                 0.86,
-                format!("解压运行时包... {entries} 个文件"),
+                Some("STAGE_EXTRACTING"),
+                vec![entries.to_string()],
+                format!("Extracting runtime pack... {entries} files"),
             );
         })
     })
     .await
-    .map_err(|e| format!("解压任务失败: {e}"))?
+    .map_err(|e| format!("EXTRACT_TASK_FAILED: {e}"))?
     .map_err(|e| e.to_string())?;
 
     // Post-install self-test: pack correctness is only claimed once envtest says so —
@@ -242,14 +280,26 @@ async fn install_parts(
     if cancel.load(Ordering::SeqCst) {
         // Cancel landed after the commit: the pack IS installed — say so honestly
         // instead of running a self-test the user asked to stop waiting for.
-        return Ok("已安装（取消跳过了自检——可在列表中手动自检）。".to_string());
+        return Ok(DoneMsg {
+            code: "INSTALLED_ENVTEST_SKIPPED",
+            params: vec![],
+            message: "Installed (cancel skipped the self-test — run it manually from the pack list).".to_string(),
+        });
     }
-    emit_progress(app, id, "envtest", 0.95, "运行环境自检...");
+    emit_progress(app, id, "envtest", 0.95, Some("STAGE_ENVTEST"), vec![], "Running environment self-test...");
     if let Err(e) = run_envtest_inner(app, state, &meta.id, Some(cancel)).await {
         tracing::warn!("post-install envtest failed for {}: {e}", meta.id);
-        return Ok(format!("已安装，但自检未通过：{e}"));
+        return Ok(DoneMsg {
+            code: "INSTALLED_ENVTEST_FAILED",
+            params: vec![e.clone()],
+            message: format!("Installed, but the self-test failed: {e}"),
+        });
     }
-    Ok("安装完成，自检通过。".to_string())
+    Ok(DoneMsg {
+        code: "INSTALL_DONE",
+        params: vec![],
+        message: "Install complete; self-test passed.".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -268,12 +318,12 @@ pub async fn install_runtime_pack_local(
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "local".to_string());
         if let Some(man) = &manifest {
-            emit_progress(&app, &display_id, "verify", 0.3, "校验分卷 sha256...");
+            emit_progress(&app, &display_id, "verify", 0.3, Some("STAGE_VERIFY"), vec![], "Verifying part sha256...");
             let man2 = man.clone();
             let dir = picked.parent().map(|p| p.to_path_buf()).unwrap_or_default();
             tokio::task::spawn_blocking(move || pyenv::verify_parts(&man2, &dir))
                 .await
-                .map_err(|e| format!("校验任务失败: {e}"))?
+                .map_err(|e| format!("VERIFY_TASK_FAILED: {e}"))?
                 .map_err(|e| e.to_string())?;
         } else {
             emit_progress(
@@ -281,25 +331,27 @@ pub async fn install_runtime_pack_local(
                 &display_id,
                 "verify",
                 0.3,
-                "未找到 manifest——跳过校验（仅建议用于本地构建的包）",
+                Some("STAGE_VERIFY_SKIPPED"),
+                vec![],
+                "No manifest found next to the archive — skipping verification (only recommended for locally built packs)",
             );
         }
         let msg = install_parts(&app, &state, &display_id, parts, &cancel).await?;
-        Ok::<(String, String), String>((display_id, msg))
+        Ok::<(String, DoneMsg), String>((display_id, msg))
     }
     .await;
     // Terminal events strictly AFTER the guard drop — see download_runtime_pack.
     drop(guard);
     match &result {
-        Ok((display_id, msg)) => {
+        Ok((display_id, done)) => {
             tracing::info!("runtime pack installed from local archive: {path}");
-            emit_progress(&app, display_id, "done", 1.0, msg.clone());
+            emit_progress(&app, display_id, "done", 1.0, Some(done.code), done.params.clone(), done.message.clone());
         }
         Err(e) => {
             // Parity with the download flow — a local-install failure must reach the
             // log file (S42: the first field failure left NO trace in utai.log).
             tracing::error!("local runtime pack install failed ({path}): {e}");
-            emit_progress(&app, "local", "error", 0.0, e.clone());
+            emit_progress(&app, "local", "error", 0.0, leading_code(e), vec![], e.clone());
         }
     }
     result.map(|_| ())
@@ -316,7 +368,7 @@ pub async fn delete_runtime_pack(id: String) -> Result<(), String> {
     // run it off the IPC pool; the frontend shows a 删除中… state meanwhile.
     tokio::task::spawn_blocking(move || pyenv::delete_pack(&id))
         .await
-        .map_err(|e| format!("删除任务失败: {e}"))?
+        .map_err(|e| format!("DELETE_TASK_FAILED: {e}"))?
         .map_err(|e| e.to_string())
 }
 
@@ -358,16 +410,16 @@ async fn run_envtest_inner(
     use tokio::io::AsyncBufReadExt;
 
     let _busy = pyenv::EnvtestGuard::acquire().map_err(|e| e.to_string())?;
-    let pack = pyenv::find_pack(id).ok_or_else(|| format!("运行时包不存在: {id}"))?;
+    let pack = pyenv::find_pack(id).ok_or_else(|| format!("PACK_NOT_FOUND: {id}"))?;
     let pack_dir = PathBuf::from(&pack.path);
     let python = pyenv::pack_python(&pack_dir);
     if !python.exists() {
-        return Err(format!("包内缺少 python.exe: {}", python.display()));
+        return Err(format!("PACK_NO_PYTHON: {}", python.display()));
     }
     let training_dir = state.app_dir.join("training");
     if !training_dir.join("utai_train").join("envtest.py").exists() {
         return Err(format!(
-            "找不到自检脚本（{}）——应用目录不完整？",
+            "ENVTEST_SCRIPT_MISSING: {}",
             training_dir.join("utai_train").join("envtest.py").display()
         ));
     }
@@ -379,7 +431,7 @@ async fn run_envtest_inner(
     match std::fs::remove_file(&report_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("无法清除旧自检报告（{}）: {e}", report_path.display())),
+        Err(e) => return Err(format!("ENVTEST_REPORT_CLEAR_FAILED: {}: {e}", report_path.display())),
     }
     let device = envtest_device_for_variant(&pack.meta.variant);
 
@@ -401,7 +453,7 @@ async fn run_envtest_inner(
     }
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("启动自检失败 ({}): {e}", python.display()))?;
+        .map_err(|e| format!("ENVTEST_SPAWN_FAILED: {}: {e}", python.display()))?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -441,18 +493,18 @@ async fn run_envtest_inner(
         if let Some(c) = cancel {
             if c.load(Ordering::SeqCst) {
                 let _ = child.kill().await;
-                return Err("自检已取消（包已安装，可稍后在列表中手动自检）".into());
+                return Err("ENVTEST_CANCELLED".into());
             }
         }
         // Child::wait is documented cancel-safe — timing out the future and
         // re-awaiting it later loses nothing.
         match tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await {
-            Ok(res) => break res.map_err(|e| format!("自检进程等待失败: {e}"))?,
+            Ok(res) => break res.map_err(|e| format!("ENVTEST_WAIT_FAILED: {e}"))?,
             Err(_) => {
                 if tokio::time::Instant::now() >= deadline {
                     let _ = child.kill().await;
                     return Err(format!(
-                        "自检超时（>{} 分钟）已终止——检查杀毒软件是否拦截了内嵌 python.exe",
+                        "ENVTEST_TIMEOUT: killed after {} min",
                         ENVTEST_TIMEOUT.as_secs() / 60
                     ));
                 }
@@ -472,7 +524,7 @@ async fn run_envtest_inner(
                 // Belt-and-suspenders with the stale-report deletion above: a pass
                 // report must AGREE with the exit code (envtest exits 0 iff no fails).
                 return Err(format!(
-                    "自检报告与进程退出码矛盾（overall=pass, code {:?}）——按失败处理。stderr 尾部：\n{}",
+                    "ENVTEST_REPORT_CONTRADICTION: overall=pass but exit code {:?}. stderr tail:\n{}",
                     status.code(),
                     stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n")
                 ));
@@ -481,7 +533,7 @@ async fn run_envtest_inner(
                 Ok(rep)
             } else {
                 Err(format!(
-                    "自检未通过（详情见包内 envtest.json / 设置面板）：{}",
+                    "ENVTEST_FAILED: {}",
                     rep.get("failed_names")
                         .and_then(|v| v.as_array())
                         .map(|a| a
@@ -494,7 +546,7 @@ async fn run_envtest_inner(
             }
         }
         None => Err(format!(
-            "自检异常退出（code {:?}）且未产出报告。stderr 尾部：\n{}",
+            "ENVTEST_CRASHED: exit code {:?}, no report. stderr tail:\n{}",
             status.code(),
             stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n")
         )),

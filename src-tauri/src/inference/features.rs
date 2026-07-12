@@ -33,7 +33,7 @@ pub fn contentvec_extract(
     let n = wav16k.len();
     if n < CONTENTVEC_MIN_SAMPLES {
         return Err(UtaiError::Inference(format!(
-            "音频片段过短，无法提取内容特征（{} 采样点 < {}）",
+            "CONTENTVEC_INPUT_TOO_SHORT: {} samples < {}",
             n, CONTENTVEC_MIN_SAMPLES
         )));
     }
@@ -46,10 +46,10 @@ pub fn contentvec_extract(
     let feats = outputs
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("ContentVec 模型没有返回输出".into()))?;
+        .ok_or_else(|| UtaiError::Inference("CONTENTVEC_NO_OUTPUT".into()))?;
     if feats.len() != t * dim {
         return Err(UtaiError::Inference(format!(
-            "ContentVec 输出尺寸异常：期望 {}x{}={}，得到 {}",
+            "CONTENTVEC_SHAPE: expected {}x{}={}, got {}",
             t,
             dim,
             t * dim,
@@ -57,7 +57,7 @@ pub fn contentvec_extract(
         )));
     }
     Array2::from_shape_vec((t, dim), feats)
-        .map_err(|e| UtaiError::Inference(format!("ContentVec 输出重排失败: {}", e)))
+        .map_err(|e| UtaiError::Inference(format!("CONTENTVEC_RESHAPE_FAILED: {}", e)))
 }
 
 // ─── Resampling (scipy-exact resample_poly from utai-dsp) ────────────────────
@@ -159,7 +159,7 @@ fn filtfilt(b: &[f64], a: &[f64], zi: &[f64], x: &[f64]) -> Result<Vec<f64>> {
     let edge = FILTFILT_EDGE;
     if n <= edge {
         return Err(UtaiError::Audio(format!(
-            "音频太短，无法进行高通滤波（{} 采样点 ≤ {}）",
+            "AUDIO_TOO_SHORT_HIGHPASS: {} samples <= {}",
             n, edge
         )));
     }
@@ -299,7 +299,7 @@ pub fn repeat_expand_2d(content: &Array2<f32>, target_len: usize, mode: &str) ->
     let src_len = content.nrows();
     let dim = content.ncols();
     if src_len == 0 {
-        return Err(UtaiError::Inference("repeat_expand_2d：空特征".into()));
+        return Err(UtaiError::Inference("INTERNAL_EMPTY_FEATURES".into()));
     }
     let mut out = Array2::<f32>::zeros((target_len, dim));
     if mode == "left" {
@@ -326,7 +326,7 @@ pub fn repeat_expand_2d(content: &Array2<f32>, target_len: usize, mode: &str) ->
         }
     } else {
         return Err(UtaiError::Inference(format!(
-            "不支持的 unit_interpolate_mode：{}（当前支持 left / nearest）",
+            "INTERP_MODE_UNSUPPORTED: {} (supported: left / nearest)",
             mode
         )));
     }

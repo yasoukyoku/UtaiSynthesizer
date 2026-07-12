@@ -8,6 +8,10 @@ export interface ExecutionState {
   progress?: number;
   error?: string;
   cancelled?: boolean;
+  /** Dispatch-time snapshot of the node ids this run will EXECUTE (non-IO; for a single-node run, the
+   *  chain up to the target). The reconciler's pending placeholders key on membership — a lane whose
+   *  feeder is not in the running snapshot will never be fed by it, so it must not show "loading". */
+  participants?: string[];
 }
 
 /** A segment's portable render state (S61 copy/paste): the output CACHE always, node badges +
@@ -36,7 +40,7 @@ interface WorkflowStore {
   singleNodeRunner: ((nodeId: string) => void) | null;
 
   registerSingleNodeRunner: (fn: ((nodeId: string) => void) | null) => void;
-  startExecution: (segmentId: string) => void;
+  startExecution: (segmentId: string, participants: string[]) => void;
   updateProgress: (segmentId: string, nodeId: string, progress: number) => void;
   completeExecution: (segmentId: string) => void;
   failExecution: (segmentId: string, error: string) => void;
@@ -84,11 +88,11 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
   singleNodeRunner: null,
 
   registerSingleNodeRunner: (fn) => set({ singleNodeRunner: fn }),
-  startExecution: (segmentId) =>
+  startExecution: (segmentId, participants) =>
     set((s) => ({
       executions: {
         ...s.executions,
-        [segmentId]: { status: "running", progress: 0 },
+        [segmentId]: { status: "running", progress: 0, participants },
       },
     })),
 
@@ -96,7 +100,8 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     set((s) => ({
       executions: {
         ...s.executions,
-        [segmentId]: { status: "running", currentNodeId: nodeId, progress },
+        // Preserve the dispatch snapshot — progress ticks rebuild the entry wholesale.
+        [segmentId]: { status: "running", currentNodeId: nodeId, progress, participants: s.executions[segmentId]?.participants },
       },
     })),
 
@@ -116,13 +121,18 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
       },
     })),
 
+  /** Flag the run cancelled but KEEP status "running" — the backend hasn't actually stopped yet. The
+   *  engine loop polls isCancelled(), fires the Rust cancel flags, and SETTLES the execution
+   *  (failExecution) only when the in-flight invoke really returns. The old behavior flipped to a
+   *  settled status here, so the UI read "stopped" seconds before the backend obeyed: the Run button
+   *  reverted, badges vanished, and the still-working node looked frozen (S62b user report). UIs show
+   *  the interim as "cancelling" via status==="running" && cancelled. */
   cancelExecution: (segmentId) =>
-    set((s) => ({
-      executions: {
-        ...s.executions,
-        [segmentId]: { ...s.executions[segmentId]!, status: "error", error: "Cancelled", cancelled: true },
-      },
-    })),
+    set((s) => {
+      const cur = s.executions[segmentId];
+      if (!cur) return {};
+      return { executions: { ...s.executions, [segmentId]: { ...cur, cancelled: true } } };
+    }),
 
   isCancelled: (segmentId) => {
     const exec = get().executions[segmentId];
@@ -153,12 +163,16 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => ({
     // (harmless, and what the reconciler reads to re-deposit). New inner Records so later per-node writes
     // to either id don't alias; the path arrays inside are read-only and may stay shared.
     const settled = exec !== undefined && exec.status !== "running";
+    // Strip the dispatch-time participant roster: it describes ONE run of ONE segment id and is only
+    // consulted while status==="running" (never true for a snapshot), so carrying it to a paste/split
+    // copy would just be a stale roster waiting to confuse a future reader.
+    const { participants: _roster, ...execRest } = exec ?? {};
     const snap: SegmentRenderSnapshot = {
       ...(outs ? { nodeOutputs: { ...outs } } : {}),
       ...(settled && statuses ? { nodeStatuses: { ...statuses } } : {}),
       ...(settled && progress ? { nodeProgress: { ...progress } } : {}),
       ...(settled && errors ? { nodeErrors: { ...errors } } : {}),
-      ...(settled ? { execution: { ...exec } } : {}),
+      ...(settled ? { execution: execRest as ExecutionState } : {}),
     };
     return Object.keys(snap).length > 0 ? snap : null;
   },

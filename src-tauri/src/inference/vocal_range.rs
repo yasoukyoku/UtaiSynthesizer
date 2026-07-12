@@ -36,6 +36,20 @@ pub const MAX_RANGE_SHIFT: i64 = 24;
 /// c_hi instead of hugging the boundary (S60d2: -9 st landed the song top exactly on 70
 /// and the climax still muted).
 pub const CEILING_MARGIN: f32 = 2.0;
+/// Frames an out-of-usable violation must SUSTAIN to count as musical content (≈250 ms on the
+/// 100 fps f0 grid). rmvpe reads breaths/sibilance an octave UP for a few frames at a time;
+/// those phantom islands (a) defeated the all-inside-usable byte-identical short-circuit with a
+/// single frame and (b) accumulated enough 3×-weighted mass that rescuing THEM dragged
+/// whole-song shifts of -6/-9 st on a healthy record + in-range song (S62b field case,
+/// lengv2.3 — the shift magnitude tracked the octave-doubled spikes, not the melody). A real
+/// climax is seconds long and sails through. Shorter runs are DELETED from the analysis.
+pub const MIN_VIOLATION_RUN: usize = 25;
+/// Weight of a frame inside PROVEN usable but above the margined comfort ceiling. Tier-2
+/// semantics ("inside usable renders untouched") mean these must never trigger a shift on
+/// their own — but when a shift happens anyway they still nudge the optimizer to land the
+/// material under the margin. Mirror band below comfort weighs less (fry degrades softer).
+const BOUNDARY_WEIGHT_TOP: f32 = 0.3;
+const BOUNDARY_WEIGHT_BOTTOM: f32 = 0.1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
@@ -181,25 +195,97 @@ pub fn score_pitch_bounds(
     (lo <= hi).then(|| (lo + transpose as f32, hi + transpose as f32))
 }
 
-/// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer).
+/// Per-frame RMS of `x` on a hop grid (frame i = samples [i·hop, (i+1)·hop)) — the loudness
+/// track for the shift decision's energy weighting. Frames past the end read 0.
+pub fn frame_rms(x: &[f32], hop: usize, frames: usize) -> Vec<f32> {
+    let hop = hop.max(1);
+    (0..frames)
+        .map(|i| {
+            let lo = (i * hop).min(x.len());
+            let hi = ((i + 1) * hop).min(x.len());
+            if hi <= lo {
+                return 0.0;
+            }
+            let s: f32 = x[lo..hi].iter().map(|v| v * v).sum();
+            (s / (hi - lo) as f32).sqrt()
+        })
+        .collect()
+}
+
+/// Median-of-5 over the voiced MIDI sequence (edge windows clamp) — kills the classic 1-2
+/// frame rmvpe octave flips before any range judgement sees them.
+fn median5(seq: &[f32]) -> Vec<f32> {
+    let n = seq.len();
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(n);
+            let mut w: Vec<f32> = seq[lo..hi].to_vec();
+            w.sort_by(|a, b| a.total_cmp(b));
+            w[w.len() / 2]
+        })
+        .collect()
+}
+
+/// Phantom-island mask: a run of consecutive out-of-USABLE frames shorter than
+/// MIN_VIOLATION_RUN is detector noise (octave-read breaths, fry blips), not singing — it must
+/// neither defeat the byte-identical short-circuit nor add rescue mass to the optimizer.
+/// In-usable frames are always kept; sustained violations (a real climax) are always kept.
+fn phantom_kept_mask(seq: &[f32], u_lo: f32, u_hi: f32) -> Vec<bool> {
+    let mut kept = vec![true; seq.len()];
+    let mut i = 0;
+    while i < seq.len() {
+        let out = seq[i] < u_lo || seq[i] > u_hi;
+        let mut j = i;
+        while j < seq.len() && ((seq[j] < u_lo || seq[j] > u_hi) == out) {
+            j += 1;
+        }
+        if out && j - i < MIN_VIOLATION_RUN {
+            kept[i..j].fill(false);
+        }
+        i = j;
+    }
+    kept
+}
+
+/// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer;
+/// S62b — spike hygiene + usable-aware weighting).
 ///
 /// The previous p02/p98-bounds version had two blind spots the user could HEAR: the top 2%
 /// of frames (= seconds of the climax on a full song) stayed above the ceiling by
 /// construction, and the minimal translation parked the material top exactly ON c_hi with
 /// zero headroom. Instead: brute-force the integer translation in ±MAX_RANGE_SHIFT that
 /// minimizes the sung-outside-the-zone frame mass, where
-///   - frames above (c_hi - CEILING_MARGIN) weigh 3× frames below c_lo (top overflow =
-///     saturation/mute, the audible disaster; bottom overflow = fry, degrades softer),
+///   - frames above USABLE weigh 3× frames below (top overflow = saturation/mute, the audible
+///     disaster; bottom overflow = fry, degrades softer),
+///   - frames still inside usable but past the margined comfort boundary weigh only
+///     BOUNDARY_WEIGHT_* — the model provably sings them (tier-2), so they can never justify
+///     recoloring the whole render by themselves, yet still steer WHERE a real shift lands
+///     (S62b: counting proven 76-77 frames as full violations recolored in-range songs),
 ///   - a small |shift| penalty (0.003/st) breaks near-ties toward the least PSOLA coloration.
-/// Isolated rmvpe spikes are inherently harmless (tiny mass never outweighs the shift
-/// penalty). A piece entirely inside USABLE renders untouched (tiers 1/2, byte-identical).
-pub fn piece_range_shift(f0_hz: &[f32], range: &SpeakerRange) -> i64 {
-    let voiced: Vec<f32> = f0_hz
-        .iter()
-        .filter(|&&v| v > 0.0)
-        .map(|&hz| 69.0 + 12.0 * (hz / 440.0).log2())
-        .collect();
-    if voiced.len() < 10 {
+/// rmvpe spike hygiene BEFORE any judgement (S62b): median-5, then phantom violation islands
+/// (< MIN_VIOLATION_RUN) are deleted — a handful of octave-doubled breath frames used to both
+/// defeat the all-inside-usable short-circuit and out-mass the shift penalty (3×0.6% of a full
+/// song beats 0.003×6), so the whole song chased the spikes down -6/-9 st.
+///
+/// LOUDNESS weighting (S62c): `energy` = optional per-frame RMS on the same grid (frame_rms).
+/// A separated stem reads high for SECONDS on reverb tails / harmony bleed / breathy passages —
+/// sustained enough to pass the run filter — but those frames are far below the lead's level.
+/// Violation mass is therefore weighted by loudness (normalized to the piece's p95, floored),
+/// so what drives a whole-render recolor is what a listener would actually HEAR out-of-range;
+/// two different models both "muffled with extension ON" over in-range songs was this (§user).
+/// A piece entirely inside USABLE (after hygiene) renders untouched (tiers 1/2, byte-identical).
+pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerRange) -> i64 {
+    let mut midis: Vec<f32> = Vec::with_capacity(f0_hz.len());
+    let mut weights: Vec<f32> = Vec::with_capacity(f0_hz.len());
+    for (i, &v) in f0_hz.iter().enumerate() {
+        if v <= 0.0 {
+            continue;
+        }
+        midis.push(69.0 + 12.0 * (v / 440.0).log2());
+        weights.push(energy.and_then(|e| e.get(i)).copied().unwrap_or(1.0));
+    }
+    if midis.len() < 10 {
         return 0; // too little voiced material to judge — render untouched
     }
     let (u_lo, u_hi) = range.usable;
@@ -207,36 +293,106 @@ pub fn piece_range_shift(f0_hz: &[f32], range: &SpeakerRange) -> i64 {
     if c_hi - c_lo <= 0.0 {
         return 0; // degenerate comfort never a target (speaker_range heals; defensive)
     }
-    if voiced.iter().all(|&m| m >= u_lo && m <= u_hi) {
+    // normalize loudness to the piece's p95 (robust "lead level"), floor so nothing zeroes out
+    if energy.is_some() {
+        let mut sorted = weights.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let p95 = sorted[(sorted.len() as f32 * 0.95) as usize % sorted.len()].max(1e-6);
+        for w in &mut weights {
+            *w = (*w / p95).clamp(0.02, 1.0);
+        }
+    }
+    let filtered = median5(&midis);
+    let kept = phantom_kept_mask(&filtered, u_lo, u_hi);
+    let dropped = kept.iter().filter(|&&k| !k).count();
+    let voiced: Vec<(f32, f32)> = filtered
+        .iter()
+        .zip(&weights)
+        .zip(&kept)
+        .filter(|(_, &k)| k)
+        .map(|((&m, &w), _)| (m, w))
+        .collect();
+    if voiced.len() < 10 {
+        return 0;
+    }
+    if voiced.iter().all(|&(m, _)| m >= u_lo && m <= u_hi) {
+        if dropped > 0 {
+            tracing::info!(
+                "range-extend: {dropped} phantom out-of-range frame(s) ignored (detector noise) — piece is in-range, rendering untouched"
+            );
+        }
         return 0; // tiers 1/2 — the whole piece sits in the proven zone
     }
     let top = c_hi - CEILING_MARGIN;
-    let n = voiced.len() as f32;
+    let n: f32 = voiced.iter().map(|&(_, w)| w).sum();
+    let frame_mass = |sf: f32| -> f32 {
+        let mut mass = 0f32;
+        for &(m, w) in &voiced {
+            let p = m + sf;
+            if p > u_hi {
+                mass += 3.0 * w;
+            } else if p > top {
+                mass += BOUNDARY_WEIGHT_TOP * w;
+            } else if p < u_lo {
+                mass += w;
+            } else if p < c_lo {
+                mass += BOUNDARY_WEIGHT_BOTTOM * w;
+            }
+        }
+        mass / n
+    };
     let mut best_cost = f32::MAX;
     let mut best_shift = 0i64;
     for s in -MAX_RANGE_SHIFT..=MAX_RANGE_SHIFT {
         let sf = s as f32;
-        let mut above = 0usize;
-        let mut below = 0usize;
-        for &m in &voiced {
-            if m + sf > top {
-                above += 1;
-            } else if m + sf < c_lo {
-                below += 1;
-            }
-        }
-        let cost = (3.0 * above as f32 + below as f32) / n + 0.003 * sf.abs();
+        let cost = frame_mass(sf) + 0.003 * sf.abs();
         if cost < best_cost {
             best_cost = cost;
             best_shift = s;
         }
     }
+    if best_shift != 0 {
+        // One-line decision audit: enough to reconstruct WHY from a user log (S62b lesson —
+        // the -6/-9 mystery took a session; with this it is one grep).
+        let above0: f32 = voiced.iter().filter(|&&(m, _)| m > u_hi).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
+        let below0: f32 = voiced.iter().filter(|&&(m, _)| m < u_lo).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
+        tracing::info!(
+            "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below; cost {:.4} -> {best_cost:.4})",
+            voiced.len(),
+            frame_mass(0.0)
+        );
+    }
     best_shift
+}
+
+/// Voiced-aware median-5 over a PSOLA guide track (zeros = unvoiced, preserved verbatim; a
+/// window with fewer than 3 voiced samples keeps the original value). An octave-misread
+/// breath/sibilant frame halves the analysis-mark spacing for exactly that frame and POPS in
+/// the inverse (S62c 破音 — model conditioning sees the same spike with extension OFF, so the
+/// pop was an extension-ON-only artifact). Legitimate sustained octave jumps (>2 frames) pass
+/// through; smooth parametric guides (vocal score path) are a near-identity under a median.
+fn sanitize_guide(f0: &[f32]) -> Vec<f32> {
+    let n = f0.len();
+    let mut out = f0.to_vec();
+    for i in 0..n {
+        if f0[i] <= 0.0 {
+            continue;
+        }
+        let lo = i.saturating_sub(2);
+        let hi = (i + 3).min(n);
+        let mut w: Vec<f32> = f0[lo..hi].iter().copied().filter(|&v| v > 0.0).collect();
+        if w.len() < 3 {
+            continue;
+        }
+        w.sort_by(|a, b| a.total_cmp(b));
+        out[i] = w[w.len() / 2];
+    }
+    out
 }
 
 /// Undo a chunk's range shift in the audio domain: TD-PSOLA at constant ratio, guided by
 /// the FED f0 (`f0_hz`, one frame per `hop` output samples — the SoVITS hop grid or RVC's
-/// sr/100). shift 0 ⇒ untouched.
+/// sr/100), spike-sanitized first (see sanitize_guide). shift 0 ⇒ untouched.
 pub fn psola_inverse_hop(
     audio: Vec<f32>,
     f0_hz: &[f32],
@@ -247,8 +403,9 @@ pub fn psola_inverse_hop(
     if shift == 0 || audio.is_empty() || f0_hz.is_empty() {
         return audio;
     }
-    let ratio = vec![2f32.powf(-(shift as f32) / 12.0); f0_hz.len()];
-    utai_dsp::psola_shift(&audio, sample_rate, f0_hz, &ratio, utai_dsp::PsolaParams { hop })
+    let guide = sanitize_guide(f0_hz);
+    let ratio = vec![2f32.powf(-(shift as f32) / 12.0); guide.len()];
+    utai_dsp::psola_shift(&audio, sample_rate, &guide, &ratio, utai_dsp::PsolaParams { hop })
 }
 
 #[cfg(test)]
@@ -361,7 +518,7 @@ mod tests {
         let r = SpeakerRange { usable: (42.0, 70.0), comfort: (42.0, 70.0) };
         let mut f0 = vec![hz(67.0); 960];
         f0.extend(vec![hz(75.0); 40]);
-        assert_eq!(piece_range_shift(&f0, &r), -7);
+        assert_eq!(piece_range_shift(&f0, None, &r), -7);
     }
 
     #[test]
@@ -370,17 +527,92 @@ mod tests {
         // 3 spike frames at 90 can't justify dragging 1000 frames below the floor → 0
         let mut f0 = vec![hz(60.0); 1000];
         f0.extend(vec![hz(90.0); 3]);
-        assert_eq!(piece_range_shift(&f0, &r), 0);
+        assert_eq!(piece_range_shift(&f0, None, &r), 0);
         // entirely inside usable → untouched (tiers 1/2 preserved, byte-identical path)
-        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], &r), 0);
+        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], None, &r), 0);
+    }
+
+    #[test]
+    fn piece_optimizer_ignores_phantom_octave_bursts() {
+        // S62b field case shape (lengv2.3, HEALTHY record [36,77]): melody well in range,
+        // sustained boundary chorus at 76.5 (PROVEN usable), plus scattered short bursts of
+        // octave-doubled breath frames at 81. The whole song must render UNTOUCHED — the old
+        // code let one phantom frame defeat the tier-2 short-circuit and then chased the
+        // burst mass down -6 st, recoloring the entire render.
+        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let mut f0: Vec<f32> = Vec::new();
+        for i in 0..20000 {
+            f0.push(hz(55.0 + (i % 17) as f32)); // 55..71 melody mass
+        }
+        f0.extend(vec![hz(76.5); 800]); // boundary chorus — inside usable
+        for _ in 0..5 {
+            f0.extend(vec![hz(81.0); 10]); // phantom octave burst (~100 ms)
+            f0.extend(vec![hz(65.0); 200]);
+        }
+        assert_eq!(piece_range_shift(&f0, None, &r), 0);
+        // the minimal version: a SINGLE spike frame must not defeat the short-circuit either
+        let mut f1 = vec![hz(60.0); 5000];
+        f1.push(hz(84.0));
+        assert_eq!(piece_range_shift(&f1, None, &r), 0);
+    }
+
+    #[test]
+    fn piece_optimizer_still_rescues_sustained_true_high() {
+        // A genuinely out-of-range SUSTAINED section (4 s continuous at 80 > u_hi 77) still
+        // triggers the rescue — spike hygiene must not neuter the feature. 80 + s ≤ top (75)
+        // ⇒ exactly -5 (the |shift| penalty stops there).
+        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(80.0); 400]);
+        assert_eq!(piece_range_shift(&f0, None, &r), -5);
     }
 
     #[test]
     fn piece_optimizer_shifts_low_material_up() {
         let r = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 79.0) };
-        let f0: Vec<f32> = (0..500).map(|i| hz(30.0 + (i % 11) as f32)).collect();
+        // 50-frame plateaus stepping 30..40 — real f0 is smooth at the 100 fps grid, so the
+        // material must be median-filter-stable (a per-frame sawtooth is not a voice).
+        let f0: Vec<f32> = (0..550).map(|i| hz(30.0 + ((i / 50) % 11) as f32)).collect();
         // lowest frames at 30 must clear c_lo 52 → +22; the |shift| penalty stops there
-        assert_eq!(piece_range_shift(&f0, &r), 22);
+        assert_eq!(piece_range_shift(&f0, None, &r), 22);
+    }
+
+    #[test]
+    fn piece_optimizer_discounts_quiet_phantom_sustains() {
+        // S62c field case: a separated stem's reverb tail / harmony bleed reads high for
+        // SECONDS (defeats the run filter) but sits far below the lead's level — loudness
+        // weighting must keep the piece untouched…
+        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let mut f0 = vec![hz(60.0); 5000];
+        let mut en = vec![0.3f32; 5000];
+        f0.extend(vec![hz(81.0); 200]); // 2 s sustained phantom above usable
+        en.extend(vec![0.01f32; 200]); // …at tail energy (~-30 dB vs lead)
+        assert_eq!(piece_range_shift(&f0, Some(&en), &r), 0);
+        // …while a LOUD sustained true-high still rescues (same shape as the None test).
+        let mut f1 = vec![hz(60.0); 1000];
+        let mut e1 = vec![0.25f32; 1000];
+        f1.extend(vec![hz(80.0); 400]);
+        e1.extend(vec![0.35f32; 400]);
+        assert_eq!(piece_range_shift(&f1, Some(&e1), &r), -5);
+    }
+
+    #[test]
+    fn guide_sanitizer_snaps_isolated_octave_spikes() {
+        // 220 Hz steady voice with a 2-frame octave misread and interleaved unvoiced gaps:
+        // the spike snaps to the local median, zeros stay zero (unvoiced passes through dry).
+        let mut g = vec![220.0f32; 20];
+        g[7] = 440.0;
+        g[8] = 440.0;
+        g[3] = 0.0;
+        let s = sanitize_guide(&g);
+        assert_eq!(s[7], 220.0);
+        assert_eq!(s[8], 220.0);
+        assert_eq!(s[3], 0.0);
+        // a SUSTAINED legitimate octave jump (>2 frames) must survive
+        let mut j = vec![220.0f32; 10];
+        j.extend(vec![440.0f32; 10]);
+        let s = sanitize_guide(&j);
+        assert_eq!(s[15], 440.0);
     }
 
     #[test]

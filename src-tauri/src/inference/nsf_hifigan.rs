@@ -48,7 +48,7 @@ pub fn vocode(
     let (num_mels, t) = (mel.nrows(), mel.ncols());
     if f0.len() < t {
         return Err(UtaiError::Inference(format!(
-            "声码器 f0 帧数不足：{} < mel 帧数 {}",
+            "VOCODER_F0_FRAMES_SHORT: {} < mel frames {}",
             f0.len(),
             t
         )));
@@ -76,7 +76,7 @@ pub fn vocode(
     outputs
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("NSF-HiFiGAN 声码器没有返回输出".into()))
+        .ok_or_else(|| UtaiError::Inference("VOCODER_NO_OUTPUT".into()))
 }
 
 /// `Enhancer.enhance` (modules/enhancer.py:25-77), silence_front=0 specialization (the svc
@@ -120,7 +120,7 @@ pub fn enhance(
     // f0 → enhancer hop grid via np.interp with endpoint clamp (enhancer.py:56-61); raw
     // f0 including 0 Hz unvoiced values is interpolated directly (original behavior).
     if f0.is_empty() {
-        return Err(UtaiError::Inference("增强器输入 f0 为空".into()));
+        return Err(UtaiError::Inference("ENHANCER_F0_EMPTY".into()));
     }
     let f0_scaled: Vec<f64> = f0.iter().map(|&v| v as f64 * real_factor).collect();
     let time_org: Vec<f64> = (0..f0.len())

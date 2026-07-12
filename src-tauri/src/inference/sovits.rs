@@ -142,7 +142,7 @@ pub fn run_pipeline(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SynthesisResult> {
     if audio.samples.is_empty() {
-        return Err(UtaiError::Audio("输入音频为空".into()));
+        return Err(UtaiError::Audio("AUDIO_EMPTY_INPUT".into()));
     }
     progress(0.02);
 
@@ -169,7 +169,13 @@ pub fn run_pipeline(
             )?;
             let k = 2.0f32.powf(options.f0_shift / 12.0);
             let transposed: Vec<f32> = f0.iter().map(|v| v * k).collect();
-            let s = super::vocal_range::piece_range_shift(&transposed, r);
+            // loudness weighting on the rmvpe 100 fps grid (16 kHz, hop 160) — see piece_range_shift
+            let rms = super::vocal_range::frame_rms(
+                &wav16k,
+                super::f0::RMVPE_SR as usize / 100,
+                transposed.len(),
+            );
+            let s = super::vocal_range::piece_range_shift(&transposed, Some(&rms), r);
             if s != 0 {
                 tracing::info!("range-extend(cover/sovits): whole signal rendered {s:+} st into comfort");
             }
@@ -225,7 +231,7 @@ pub fn run_pipeline(
             let report = |f: f32| progress(band_lo + (band_hi - band_lo) * f.clamp(0.0, 1.0));
 
             if cancel() {
-                return Err(UtaiError::Inference("已取消".into()));
+                return Err(UtaiError::Inference("CANCELLED".into()));
             }
             let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range_shift, &report, cancel)?;
             // pad_array(_audio, per_length) — center zero-pad up (never truncates), exactly
@@ -332,7 +338,7 @@ fn infer_segment(
     report(p_f0); // f0 done
 
     if cancel() {
-        return Err(UtaiError::Inference("已取消".into()));
+        return Err(UtaiError::Inference("CANCELLED".into()));
     }
 
     // ── content features: ContentVec (50 fps) → repeat_expand to the hop grid.
@@ -356,7 +362,7 @@ fn infer_segment(
         let v = extract_volume(&wav_m, m.hop_size);
         if v.len() != n_frames {
             return Err(UtaiError::Inference(format!(
-                "vol 帧数异常：{} != {}",
+                "SOVITS_VOL_FRAMES_MISMATCH: {} != {}",
                 v.len(),
                 n_frames
             )));
@@ -488,10 +494,10 @@ pub(crate) fn decode_features(
         let f0_pred = outs
             .into_iter()
             .next()
-            .ok_or_else(|| UtaiError::Inference("自动音高预测器没有返回输出".into()))?;
+            .ok_or_else(|| UtaiError::Inference("AUTO_F0_NO_OUTPUT".into()))?;
         if f0_pred.len() != n_frames {
             return Err(UtaiError::Inference(format!(
-                "自动音高预测帧数异常：{} != {}",
+                "AUTO_F0_FRAMES_MISMATCH: {} != {}",
                 f0_pred.len(),
                 n_frames
             )));
@@ -568,7 +574,7 @@ pub(crate) fn decode_features(
         let out = outputs
             .into_iter()
             .next()
-            .ok_or_else(|| UtaiError::Inference("SoVITS 模型没有返回输出".into()))?;
+            .ok_or_else(|| UtaiError::Inference("SOVITS_NO_OUTPUT".into()))?;
         Some(out)
     };
     report(p_vits);
@@ -578,7 +584,7 @@ pub(crate) fn decode_features(
     let mut out: Vec<f32> = match (&m.diffusion, &m.vocoder) {
         (Some(diff), Some(voc)) => {
             if cancel() {
-                return Err(UtaiError::Inference("已取消".into()));
+                return Err(UtaiError::Inference("CANCELLED".into()));
             }
             // vol for the DIFFUSION condition (line 308): vol_embedding → the source-wav vol
             // (reused); else extracted from `audio` = VITS output (shallow) / source (only).
@@ -612,7 +618,7 @@ pub(crate) fn decode_features(
             )?
         }
         _ => vits_out.ok_or_else(|| {
-            UtaiError::Inference("内部错误：既无 VITS 输出也无扩散配置".into())
+            UtaiError::Inference("INTERNAL_NO_OUTPUT_PATH".into())
         })?,
     };
 
@@ -620,7 +626,7 @@ pub(crate) fn decode_features(
     //    layer already force-disabled it under any diffusion mode (original mutual exclusion).
     if options.nsf_enhance && !has_diff {
         let voc = m.vocoder.as_ref().ok_or_else(|| {
-            UtaiError::Inference("内部错误：增强器开启但声码器未装载".into())
+            UtaiError::Inference("INTERNAL_ENHANCER_NO_VOCODER".into())
         })?;
         out = nsf_hifigan::enhance(
             m.engine,
@@ -736,10 +742,10 @@ fn run_diffusion(
         .run(&diff.encoder_session, enc_inputs)?
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("扩散条件编码器没有返回输出".into()))?;
+        .ok_or_else(|| UtaiError::Inference("DIFFUSION_ENCODER_NO_OUTPUT".into()))?;
     if cond.len() != diff.n_hidden * n_frames {
         return Err(UtaiError::Inference(format!(
-            "扩散条件形状异常：{} != {}×{}",
+            "DIFFUSION_COND_SHAPE: {} != {}x{}",
             cond.len(),
             diff.n_hidden,
             n_frames
@@ -749,7 +755,7 @@ fn run_diffusion(
     // ── denoiser closure: one ε(x, t, cond) eval per call, cancellable per step ──
     let denoise = |x: &Array4<f32>, step_t: f32| -> Result<Array4<f32>> {
         if cancel() {
-            return Err(UtaiError::Inference("已取消".into()));
+            return Err(UtaiError::Inference("CANCELLED".into()));
         }
         let outs = m.engine.run(
             &diff.denoiser_session,
@@ -780,9 +786,9 @@ fn run_diffusion(
         let eps = outs
             .into_iter()
             .next()
-            .ok_or_else(|| UtaiError::Inference("扩散去噪网络没有返回输出".into()))?;
+            .ok_or_else(|| UtaiError::Inference("DIFFUSION_DENOISER_NO_OUTPUT".into()))?;
         Array4::from_shape_vec((1, 1, num_mels, n_frames), eps)
-            .map_err(|e| UtaiError::Inference(format!("扩散去噪输出形状异常：{}", e)))
+            .map_err(|e| UtaiError::Inference(format!("DIFFUSION_DENOISER_SHAPE: {}", e)))
     };
 
     // ── sampler (host-side; the solvers rebuild their schedule over betas[..t]) ──
@@ -806,7 +812,7 @@ fn run_diffusion(
             let mel_gt = super::mel::nsf_mel(vits, &voc.mel_filters);
             if mel_gt.ncols() != n_frames || mel_gt.nrows() != num_mels {
                 return Err(UtaiError::Inference(format!(
-                    "浅扩散 mel 形状异常：[{},{}] != [{},{}]",
+                    "DIFFUSION_MEL_SHAPE: [{},{}] != [{},{}]",
                     mel_gt.nrows(),
                     mel_gt.ncols(),
                     num_mels,

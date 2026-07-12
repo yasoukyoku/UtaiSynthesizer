@@ -86,8 +86,10 @@ function teardownForLoad() {
   useAudioStore.setState({ audioFiles: {}, loadingPaths: [] }); // decoded peaks/duration + in-flight markers
   // Cancel any in-flight render before discarding the document: its segment is about to vanish, so the
   // editor's Stop button becomes unreachable and the detached engine loop + global Rust separation would
-  // keep running and phantom-list in the quit/busy warning. Flipping running→error un-sticks that warning;
-  // fire the global separation cancel best-effort (the whole project + its single render is being replaced).
+  // keep running and phantom-list in the quit/busy warning. cancelExecution only FLAGS the run (S62b:
+  // the entry stays "running" until the engine loop obeys the cancel and settles it — typically within
+  // seconds; the quit/busy warning stays honest for exactly that window). Fire the global separation
+  // cancel best-effort (the whole project + its single render is being replaced).
   const wf = useWorkflowStore.getState();
   let hadRunning = false;
   for (const [id, e] of Object.entries(wf.executions)) {
@@ -101,6 +103,21 @@ function teardownForLoad() {
   // minutes (results dropped by the epoch guard anyway) AND leave the undo interceptor armed to eat
   // the NEW document's first Ctrl+Z. Cancels + clears job state + unregisters, no toast.
   cancelExtractionsForTeardown();
+  // The workflow store's per-segment SESSION render state (executions / node cache / badges /
+  // renderLinks) belongs to the OLD document. Keeping it was inert while the settle watcher only keyed
+  // on loading lanes (saves strip those), but hasUndepositedCache (S62) compares the surviving cache
+  // against freshly LOADED deposits — same segment ids (re-open the same .usp) would silently
+  // re-deposit a render the user just DISCARDED. Keep only the entries cancelled above: the detached
+  // engine loops poll isCancelled() to abort, and their cache is wiped here so the empty-cache
+  // pre-gate keeps them inert.
+  useWorkflowStore.setState((s) => ({
+    executions: Object.fromEntries(Object.entries(s.executions).filter(([, e]) => e.cancelled === true)),
+    nodeOutputs: {},
+    nodeStatuses: {},
+    nodeProgress: {},
+    nodeErrors: {},
+    renderLinks: {},
+  }));
   // Close the docked node editor before the document is replaced: its segment is about to vanish (a
   // phantom panel would otherwise stay mounted), and a stale activePane:'workflow' would suppress
   // timeline Delete/Ctrl+K and misroute Ctrl+Z to the dead node stack. closeWorkflow() clears

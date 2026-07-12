@@ -55,7 +55,7 @@ pub fn mel_spectrogram(
     // torch.stft rejects win_length > n_fft too; window is zero-padded to n_fft below.
     assert!(
         win_size <= n_fft && hop <= win_size && hop > 0,
-        "mel_spectrogram 几何参数非法: n_fft={} win={} hop={}",
+        "mel_spectrogram: invalid geometry n_fft={} win={} hop={}",
         n_fft,
         win_size,
         hop
@@ -63,7 +63,7 @@ pub fn mel_spectrogram(
     assert_eq!(
         filters.ncols(),
         freq_bins,
-        "mel 滤波器形状与 n_fft 不匹配：期望 [n_mels, {}]，得到 [{}, {}]",
+        "mel filter shape does not match n_fft: expected [n_mels, {}], got [{}, {}]",
         freq_bins,
         filters.nrows(),
         filters.ncols()
@@ -90,7 +90,7 @@ pub fn mel_spectrogram(
     let padded_len = padded.len();
     assert!(
         padded_len >= n_fft,
-        "填充后长度 {} 仍小于 n_fft {}（win_size < n_fft 的短输入）",
+        "padded length {} is still shorter than n_fft {} (short input with win_size < n_fft)",
         padded_len,
         n_fft
     );

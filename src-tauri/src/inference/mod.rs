@@ -389,7 +389,7 @@ impl InferenceManager {
             return Ok(arr.clone());
         }
         let arr: ndarray::Array2<f32> = ndarray_npy::read_npy(path).map_err(|e| {
-            crate::UtaiError::Model(format!("加载 npy 失败 '{}': {}", path.display(), e))
+            crate::UtaiError::Model(format!("NPY_LOAD_FAILED: {} — {}", path.display(), e))
         })?;
         let arr = Arc::new(arr);
         self.npy_cache
@@ -450,7 +450,7 @@ impl InferenceManager {
     pub fn voice_handle(&self, name: &str) -> Result<VoiceHandle> {
         let voices = self.loaded_voices.read();
         let voice = voices.get(name).ok_or_else(|| {
-            crate::UtaiError::Inference(format!("模型 '{}' 尚未加载", name))
+            crate::UtaiError::Inference(format!("MODEL_NOT_LOADED: '{}'", name))
         })?;
         Ok(VoiceHandle {
             session_id: voice.session_id.clone(),

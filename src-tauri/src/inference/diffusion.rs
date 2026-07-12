@@ -86,10 +86,10 @@ impl DiffusionSchedule {
         spec_max: &[f32],
         k_step_max: usize,
     ) -> Self {
-        assert!(timesteps >= 2, "diffusion timesteps 必须 ≥ 2");
+        assert!(timesteps >= 2, "diffusion timesteps must be >= 2");
         assert!(
             !spec_min.is_empty() && spec_min.len() == spec_max.len(),
-            "spec_min/spec_max 长度必须一致且非空"
+            "spec_min/spec_max must be non-empty and equal length"
         );
         let betas = np_linspace(1e-4, max_beta, timesteps);
         let mut alphas_cumprod = Vec::with_capacity(timesteps);
@@ -282,12 +282,12 @@ where
     F: FnMut(&Array4<f32>, f32) -> Result<Array4<f32>>,
 {
     if k_step == 0 {
-        return Err(inference_err("浅扩散 k_step 必须 ≥ 1".into()));
+        return Err(inference_err("DIFFUSION_KSTEP_MIN".into()));
     }
     if k_step > sched.k_step_max {
-        // 原版 unit2mel.py:141 的 raise，中文化（contract §3.4）
+        // 原版 unit2mel.py:141 的 raise（contract §3.4）
         return Err(inference_err(format!(
-            "浅扩散 k_step={} 超过该扩散模型的上限 k_step_max={}",
+            "DIFFUSION_KSTEP_EXCEEDS_MAX: k_step={} > k_step_max={}",
             k_step, sched.k_step_max
         )));
     }
@@ -313,10 +313,8 @@ where
     F: FnMut(&Array4<f32>, f32) -> Result<Array4<f32>>,
 {
     if sched.k_step_max != sched.timesteps {
-        // 原版 unit2mel.py:144 的 raise，中文化（contract §3.4）
-        return Err(inference_err(
-            "该扩散模型仅支持浅扩散，无法单独推理".into(),
-        ));
+        // 原版 unit2mel.py:144 的 raise（contract §3.4）
+        return Err(inference_err("DIFFUSION_SHALLOW_ONLY".into()));
     }
     let x = noise.randn(ndarray::Ix4(1, 1, out_dims, n_frames));
     let t = sched.k_step_max;
@@ -342,7 +340,7 @@ where
 {
     if t == 0 || t > sched.timesteps {
         return Err(inference_err(format!(
-            "扩散步数 t={} 超出调度范围 1..={}",
+            "DIFFUSION_T_OUT_OF_RANGE: t={} not in 1..={}",
             t, sched.timesteps
         )));
     }
@@ -363,7 +361,7 @@ where
             if steps < 2 {
                 // 原版 sample() 的 assert steps >= order（order=2）
                 return Err(inference_err(format!(
-                    "扩散步数/加速倍数至少需要 2 个采样步（k_step/speedup ≥ 2），当前 {}/{} = {}",
+                    "DIFFUSION_SPEEDUP_TOO_FEW_STEPS: {}/{} = {}",
                     t, speedup, steps
                 )));
             }
@@ -901,7 +899,7 @@ where
     let mut x_t = x_t_base.clone();
     if !d1s.is_empty() {
         if order != 2 {
-            return Err(inference_err(format!("unipc: 不支持的 order={order}")));
+            return Err(inference_err(format!("INTERNAL_UNIPC_ORDER: order={order}")));
         }
         let rhos_p = [0.5f64];
         for (k, d) in d1s.iter().enumerate() {
@@ -963,7 +961,7 @@ fn gauss_solve(rows: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
             }
         }
         if a[piv][col].abs() < 1e-300 {
-            return Err(inference_err("unipc: Vandermonde 矩阵奇异".into()));
+            return Err(inference_err("INTERNAL_UNIPC_SINGULAR: Vandermonde matrix is singular".into()));
         }
         a.swap(col, piv);
         rhs.swap(col, piv);

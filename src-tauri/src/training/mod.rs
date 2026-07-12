@@ -476,7 +476,7 @@ impl TrainingManager {
     /// untouched and the run stays resumable. Refused while a run is live.
     pub fn reset_display(&self) -> Result<()> {
         if self.is_active() {
-            return Err(UtaiError::Training("训练进行中，无法清空结果".into()));
+            return Err(UtaiError::Training("TRAINING_ACTIVE".into()));
         }
         *self.inner.snapshot.lock() = TrainingSnapshot {
             state: "idle".into(),
@@ -517,7 +517,7 @@ impl TrainingManager {
         if let Some(mut child) = self.inner.child.lock().take() {
             child
                 .kill()
-                .map_err(|e| UtaiError::Training(format!("终止训练进程失败: {}", e)))?;
+                .map_err(|e| UtaiError::Training(format!("TRAINING_KILL_FAILED: {}", e)))?;
             tracing::warn!("training force-killed");
         }
         Ok(())
@@ -535,7 +535,7 @@ impl TrainingManager {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(UtaiError::Training("已有训练在进行中".into()));
+            return Err(UtaiError::Training("TRAINING_ALREADY_RUNNING".into()));
         }
         let launched = self.try_start(app, data_dir, req);
         if launched.is_err() {
@@ -558,71 +558,77 @@ impl TrainingManager {
         match req.backend.as_str() {
             "rvc" => {
                 if !matches!(req.version.as_str(), "v1" | "v2") {
-                    return Err(UtaiError::Training(format!("非法 RVC 版本 {}", req.version)));
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_RVC_VERSION: {}",
+                        req.version
+                    )));
                 }
                 if !matches!(req.sample_rate.as_str(), "32k" | "40k" | "48k") {
-                    return Err(UtaiError::Training(format!("非法采样率 {}", req.sample_rate)));
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_SAMPLE_RATE: {}",
+                        req.sample_rate
+                    )));
                 }
             }
             "sovits" | "sovits_diff" => {
                 if !matches!(req.version.as_str(), "4.1" | "4.0") {
                     return Err(UtaiError::Training(format!(
-                        "非法 SoVITS 版本 {}",
+                        "TRAINING_BAD_SOVITS_VERSION: {}",
                         req.version
                     )));
                 }
                 if req.sample_rate != "44k" {
                     return Err(UtaiError::Training(format!(
-                        "SoVITS 训练固定 44.1kHz（收到 {}）",
+                        "TRAINING_SR_FIXED_44K: {}",
                         req.sample_rate
                     )));
                 }
                 if req.save_every_steps == 0 {
-                    return Err(UtaiError::Training("存档间隔必须大于 0".into()));
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
                 }
                 if req.backend == "sovits_diff" && req.total_steps == 0 {
-                    return Err(UtaiError::Training("总步数必须大于 0".into()));
+                    return Err(UtaiError::Training("TRAINING_TOTAL_STEPS_ZERO".into()));
                 }
             }
             "vocoder" => {
                 // version is a manifest marker (一期单格式类), not a user choice
                 if req.version != "nsf_hifigan" {
                     return Err(UtaiError::Training(format!(
-                        "非法声码器格式 {}（一期仅支持经典 NSF-HiFiGAN）",
+                        "TRAINING_BAD_VOCODER_FORMAT: {}",
                         req.version
                     )));
                 }
                 if req.sample_rate != "44k" {
                     return Err(UtaiError::Training(format!(
-                        "声码器微调固定 44.1kHz（收到 {}）",
+                        "TRAINING_SR_FIXED_44K: {}",
                         req.sample_rate
                     )));
                 }
                 if req.save_every_steps == 0 {
-                    return Err(UtaiError::Training("存档间隔必须大于 0".into()));
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
                 }
                 if req.total_steps == 0 {
-                    return Err(UtaiError::Training("总步数必须大于 0".into()));
+                    return Err(UtaiError::Training("TRAINING_TOTAL_STEPS_ZERO".into()));
                 }
                 if req.crop_mel_frames == 0 {
-                    return Err(UtaiError::Training("裁剪帧数必须大于 0".into()));
+                    return Err(UtaiError::Training("TRAINING_CROP_FRAMES_ZERO".into()));
                 }
             }
             other => {
                 return Err(UtaiError::Training(format!(
-                    "训练后端「{}」尚未实现（当前支持 RVC / SoVITS / 浅扩散 / 声码器微调）",
+                    "TRAINING_BACKEND_UNSUPPORTED: {}",
                     other
                 )));
             }
         }
         if req.aug_copies > 3 {
             return Err(UtaiError::Training(format!(
-                "数据增强份数最多 3（收到 {}）",
+                "TRAINING_AUG_COPIES_MAX: {}",
                 req.aug_copies
             )));
         }
         if req.model_name.trim().is_empty() {
-            return Err(UtaiError::Training("模型名不能为空".into()));
+            return Err(UtaiError::Training("TRAINING_NAME_EMPTY".into()));
         }
 
         // ①c multi-speaker co-training (>1 group): the dataset lives in the
@@ -634,15 +640,13 @@ impl TrainingManager {
             // ①c: multi-speaker co-train = SoVITS (α) + RVC (α′). Shallow-diffusion / vocoder
             // stay single-speaker (their loaders assume one speaker).
             if req.backend != "sovits" && req.backend != "rvc" {
-                return Err(UtaiError::Training(
-                    "多歌手共训暂仅支持 SoVITS 与 RVC".into(),
-                ));
+                return Err(UtaiError::Training("TRAINING_MULTI_BACKEND".into()));
             }
             // RVC emb_g is a FIXED 109-row table (spk_embed_dim in the config templates) — cap
             // the co-train count so a huge set fails loud here, not as an out-of-range train id.
             if req.backend == "rvc" && req.speakers.len() > 109 {
                 return Err(UtaiError::Training(format!(
-                    "RVC 多歌手共训最多 109 个歌手（当前 {}）",
+                    "TRAINING_SPEAKER_LIMIT: {}",
                     req.speakers.len()
                 )));
             }
@@ -650,22 +654,28 @@ impl TrainingManager {
             for sp in &req.speakers {
                 let name = sp.name.trim();
                 if name.is_empty() {
-                    return Err(UtaiError::Training("每个歌手都必须有名字".into()));
+                    return Err(UtaiError::Training("TRAINING_SPEAKER_NAME_EMPTY".into()));
                 }
                 if !seen.insert(name.to_string()) {
                     // duplicate display names would collapse the release config's
                     // spk dict (train.py) -> a missing sidecar speaker
                     return Err(UtaiError::Training(format!(
-                        "歌手名字重复：{}（多歌手共训要求名字唯一）",
+                        "TRAINING_SPEAKER_NAME_DUP: {}",
                         name
                     )));
                 }
                 if sp.files.is_empty() {
-                    return Err(UtaiError::Training(format!("歌手「{}」没有数据文件", name)));
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SPEAKER_NO_DATA: {}",
+                        name
+                    )));
                 }
                 for f in &sp.files {
                     if !Path::new(f).is_file() {
-                        return Err(UtaiError::Training(format!("数据文件不存在: {}", f)));
+                        return Err(UtaiError::Training(format!(
+                            "TRAINING_DATA_FILE_MISSING: {}",
+                            f
+                        )));
                     }
                 }
             }
@@ -684,15 +694,18 @@ impl TrainingManager {
             };
             if !pool_ok {
                 return Err(UtaiError::Training(if req.backend == "sovits_diff" {
-                    "该模型没有可复用的主训练工作区数据——请先导入训练数据".into()
+                    "TRAINING_NO_SHARED_POOL".into()
                 } else {
-                    "请先导入训练数据".to_string()
+                    "TRAINING_NO_DATA".to_string()
                 }));
             }
         }
         for f in &req.dataset_files {
             if !Path::new(f).is_file() {
-                return Err(UtaiError::Training(format!("数据文件不存在: {}", f)));
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_DATA_FILE_MISSING: {}",
+                    f
+                )));
             }
         }
 
@@ -738,16 +751,16 @@ impl TrainingManager {
                 );
                 pretrain_g = pretrain_dir.join(format!("f0G{}.pth", req.sample_rate));
                 pretrain_d = pretrain_dir.join(format!("f0D{}.pth", req.sample_rate));
-                required.push(("预训练底模 G", pretrain_g.clone()));
-                required.push(("预训练底模 D", pretrain_d.clone()));
+                required.push(("pretrained base G", pretrain_g.clone()));
+                required.push(("pretrained base D", pretrain_d.clone()));
             }
             "sovits" => {
                 let pretrain_dir = sovits_train_dir
                     .join(if req.version == "4.0" { "vec256" } else { "vec768" });
                 pretrain_g = pretrain_dir.join("G_0.pth");
                 pretrain_d = pretrain_dir.join("D_0.pth");
-                required.push(("预训练底模 G", pretrain_g.clone()));
-                required.push(("预训练底模 D", pretrain_d.clone()));
+                required.push(("pretrained base G", pretrain_g.clone()));
+                required.push(("pretrained base D", pretrain_d.clone()));
             }
             "vocoder" => {
                 // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
@@ -762,9 +775,11 @@ impl TrainingManager {
                     .join("vocoder")
                     .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
                 required.push((
-                    "声码器微调底模（从 github.com/openvpi/SingingVocoders releases \
-                     v0.0.2 下载 nsf_hifigan_44.1k_hop512_128bin_2024.02.zip 并解压其中的 \
-                     .ckpt；权重许可 CC BY-NC-SA 4.0，微调产物同样继承该许可）",
+                    "vocoder finetune base ckpt (download \
+                     nsf_hifigan_44.1k_hop512_128bin_2024.02.zip from \
+                     github.com/openvpi/SingingVocoders releases v0.0.2 and extract the \
+                     .ckpt; weights are CC BY-NC-SA 4.0 — finetuned outputs inherit the \
+                     license)",
                     vocoder_pretrain.clone(),
                 ));
             }
@@ -776,9 +791,9 @@ impl TrainingManager {
                 // in the params UI; the vec768 base ships as a dev asset and is
                 // hard-required so its absence can never silently degrade.
                 nsf_hifigan_model = sovits_train_dir.join("nsf_hifigan").join("model");
-                required.push(("NSF-HiFiGAN 声码器 (model)", nsf_hifigan_model.clone()));
+                required.push(("NSF-HiFiGAN vocoder (model)", nsf_hifigan_model.clone()));
                 required.push((
-                    "NSF-HiFiGAN 配置 (config.json)",
+                    "NSF-HiFiGAN config (config.json)",
                     sovits_train_dir.join("nsf_hifigan").join("config.json"),
                 ));
                 let base = sovits_train_dir
@@ -795,7 +810,7 @@ impl TrainingManager {
                     }
                 } else {
                     diffusion_pretrain = base.clone();
-                    required.push(("扩散底模 (model_0.pt)", base));
+                    required.push(("diffusion base model (model_0.pt)", base));
                 }
             }
             // the whitelist match above already rejected unknown backends —
@@ -803,27 +818,30 @@ impl TrainingManager {
             // another backend's asset resolution (设计红队 A17)
             other => {
                 return Err(UtaiError::Training(format!(
-                    "训练后端「{}」缺少资产解析分支（内部错误）",
+                    "TRAINING_INTERNAL_ASSET_BRANCH: {}",
                     other
                 )));
             }
         }
         let ffmpeg = crate::audio::find_ffmpeg()
-            .ok_or_else(|| UtaiError::Training("找不到 ffmpeg.exe（训练预处理需要）".into()))?;
+            .ok_or_else(|| UtaiError::Training("FFMPEG_MISSING".into()))?;
         if req.backend != "vocoder" {
             // the vocoder pipeline extracts neither features nor f0-by-model
             // (parselmouth is in-process) — requiring these would be a lie
-            required.push(("ContentVec 特征提取器", contentvec.clone()));
-            required.push(("RMVPE 音高模型 (rmvpe.pt)", rmvpe_pt.clone()));
+            required.push(("ContentVec feature extractor", contentvec.clone()));
+            required.push(("RMVPE pitch model (rmvpe.pt)", rmvpe_pt.clone()));
         } else if req.aug_copies > 0 {
             // ...except the S41 aug quality gate, which is rmvpe-blooded by
             // design (see the lineage comment above) — only when augmenting
-            required.push(("RMVPE 音高模型 (rmvpe.pt，数据增强质检用)", rmvpe_pt.clone()));
+            required.push((
+                "RMVPE pitch model (rmvpe.pt, augmentation quality gate)",
+                rmvpe_pt.clone(),
+            ));
         }
         for (label, p) in &required {
             if !p.is_file() {
                 return Err(UtaiError::Training(format!(
-                    "缺少{}: {}（请将文件放置到该路径）",
+                    "TRAINING_ASSET_MISSING: {} -> {}",
                     label,
                     p.display()
                 )));
@@ -854,13 +872,13 @@ impl TrainingManager {
                 // "clear diffusion progress", never "sacrifice a foreign
                 // workspace" — the user meant a different model name
                 return Err(UtaiError::Training(format!(
-                    "同名训练工作区属于另一后端（{}）：浅扩散必须使用 SoVITS 工作区，请换一个模型名",
+                    "WORKSPACE_BACKEND_MISMATCH: {}",
                     old_family
                 )));
             }
             if !req.fresh {
                 return Err(UtaiError::Training(format!(
-                    "同名训练工作区属于另一后端（原 {}，现 {}）：请换一个模型名，或选择重训（将清空原工作区）",
+                    "WORKSPACE_BACKEND_MISMATCH: {} -> {}",
                     old_family, family
                 )));
             }
@@ -874,10 +892,7 @@ impl TrainingManager {
             && workspace.exists()
             && old_manifest.is_none()
         {
-            return Err(UtaiError::Training(
-                "同名训练工作区缺少 run_manifest.json（状态异常，无法确认归属）：请选择重训（将清空该工作区）或换一个模型名"
-                    .into(),
-            ));
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
 
         let has_main = has_main_progress(&workspace);
@@ -887,10 +902,7 @@ impl TrainingManager {
         // the tolerant checkpoint loader — silently degrading to near-scratch
         // while claiming「续训」. Refuse loudly; retrain wipes it.
         if !req.fresh && workspace.exists() && old_manifest.is_none() && has_main {
-            return Err(UtaiError::Training(
-                "同名训练工作区缺少 run_manifest.json（状态异常，无法校验续训参数）：请选择重训（将清空该工作区）或换一个模型名"
-                    .into(),
-            ));
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
         // vocoder twin: a manifest-less workspace holding lightning checkpoints
         // would let get_latest_checkpoint_path resume into it AND silently skip
@@ -902,10 +914,7 @@ impl TrainingManager {
             && old_manifest.is_none()
             && max_vocoder_ckpt_step(&workspace).is_some()
         {
-            return Err(UtaiError::Training(
-                "同名训练工作区缺少 run_manifest.json（状态异常，无法确认归属）：请选择重训（将清空该工作区）或换一个模型名"
-                    .into(),
-            ));
+            return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
         // the diff「重训」only clears diffusion/ when a live main model shares
         // the workspace — everything else is a full wipe
@@ -934,12 +943,12 @@ impl TrainingManager {
                             // 重训(仅扩散) cannot unlock the version here — it is
                             // pinned by the main model; don't suggest it
                             format!(
-                                "扩散模型必须与工作区主模型同版本（工作区为 {}/{}，现选 {}/{}）：请改回对应版本再训练",
+                                "DIFF_VERSION_MISMATCH: {}/{} -> {}/{}",
                                 old_ver, old_sr, req.version, req.sample_rate
                             )
                         } else {
                             format!(
-                                "续训参数与原工作区不一致（原 {}/{}，现 {}/{}）：续训必须沿用原版本与采样率，或选择重训",
+                                "RESUME_PARAMS_MISMATCH: {}/{} -> {}/{}",
                                 old_ver, old_sr, req.version, req.sample_rate
                             )
                         },
@@ -949,9 +958,9 @@ impl TrainingManager {
                     if let Some(old_vol) = old["vol_embedding"].as_bool() {
                         if old_vol != req.vol_embedding {
                             return Err(UtaiError::Training(format!(
-                                "续训参数与原工作区不一致（响度嵌入 原{} 现{}）：该开关决定模型结构，续训必须沿用，或选择重训",
-                                if old_vol { "开" } else { "关" },
-                                if req.vol_embedding { "开" } else { "关" }
+                                "RESUME_VOL_EMBEDDING_MISMATCH: {} -> {}",
+                                if old_vol { "on" } else { "off" },
+                                if req.vol_embedding { "on" } else { "off" }
                             )));
                         }
                     }
@@ -970,7 +979,7 @@ impl TrainingManager {
                     };
                     if old_n != cur_n {
                         return Err(UtaiError::Training(format!(
-                            "歌手数量与原工作区不一致（原 {} 现 {}）：多歌手共训必须沿用，或选择重训",
+                            "RESUME_SPEAKER_COUNT_MISMATCH: {} -> {}",
                             old_n, cur_n
                         )));
                     }
@@ -989,7 +998,7 @@ impl TrainingManager {
                             .collect();
                         if old_slugs != cur_slugs {
                             return Err(UtaiError::Training(
-                                "歌手集合或顺序与原工作区不一致：多歌手共训必须沿用同样的歌手与顺序，或选择重训".into(),
+                                "RESUME_SPEAKER_SET_MISMATCH".into(),
                             ));
                         }
                     }
@@ -1004,10 +1013,13 @@ impl TrainingManager {
                         max_diffusion_step(&workspace),
                     ) {
                         if max_step > 0 && old_k != req.k_step_max as u64 {
-                            let show = |k: u64| if k == 0 { "全扩散".to_string() } else { k.to_string() };
+                            let show = |k: u64| {
+                                if k == 0 { "full-diffusion".to_string() } else { k.to_string() }
+                            };
                             return Err(UtaiError::Training(format!(
-                                "扩散深度 (k_step_max) 与已有扩散进度不一致（原 {} 现 {}）：续训必须沿用，或选择重训（仅清空扩散进度）",
-                                show(old_k), show(req.k_step_max as u64)
+                                "RESUME_KSTEP_MISMATCH: {} -> {}",
+                                show(old_k),
+                                show(req.k_step_max as u64)
                             )));
                         }
                     }
@@ -1023,14 +1035,14 @@ impl TrainingManager {
                 let diff_dir = workspace.join("diffusion");
                 if diff_dir.exists() {
                     std::fs::remove_dir_all(&diff_dir).map_err(|e| {
-                        UtaiError::Training(format!("清空扩散训练进度失败: {}", e))
+                        UtaiError::Training(format!("DIFF_WIPE_FAILED: {}", e))
                     })?;
                 }
             } else {
                 // main retrain / diff-only workspace (a full wipe here is what
                 // unlocks a version change) / manifest-less anomaly
                 std::fs::remove_dir_all(&workspace)
-                    .map_err(|e| UtaiError::Training(format!("清空旧训练工作区失败: {}", e)))?;
+                    .map_err(|e| UtaiError::Training(format!("WORKSPACE_WIPE_FAILED: {}", e)))?;
                 old_manifest = None;
             }
         }
@@ -1043,7 +1055,7 @@ impl TrainingManager {
             if let Some(max_step) = max_diffusion_step(&workspace) {
                 if max_step > 0 && max_step >= req.total_steps as u64 {
                     return Err(UtaiError::Training(format!(
-                        "扩散模型已训练至 {} 步，不小于目标总步数 {}：请增大总步数再续训，或选择重训",
+                        "RESUME_TARGET_REACHED_DIFF: {} >= {}",
                         max_step, req.total_steps
                     )));
                 }
@@ -1056,7 +1068,7 @@ impl TrainingManager {
                 let real = max_global / 2;
                 if real > 0 && real >= req.total_steps as u64 {
                     return Err(UtaiError::Training(format!(
-                        "声码器已训练至 {} 步，不小于目标总步数 {}：请增大总步数再续训，或选择重训",
+                        "RESUME_TARGET_REACHED_VOCODER: {} >= {}",
                         real, req.total_steps
                     )));
                 }
@@ -1214,7 +1226,7 @@ impl TrainingManager {
                 *inner.child.lock() = None;
                 inner.running.store(false, Ordering::SeqCst);
             })
-            .map_err(|e| UtaiError::Training(format!("启动训练线程失败: {}", e)))?;
+            .map_err(|e| UtaiError::Training(format!("TRAINING_THREAD_SPAWN_FAILED: {}", e)))?;
         Ok(())
     }
 }
@@ -1328,7 +1340,11 @@ fn run_worker(
                     .to_ascii_lowercase();
                 let dst = sub.join(format!("{:03}.{}", i, ext));
                 std::fs::copy(src, &dst).map_err(|e| {
-                    UtaiError::Training(format!("导入数据 {} 失败: {}", src.display(), e))
+                    UtaiError::Training(format!(
+                        "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                        src.display(),
+                        e
+                    ))
                 })?;
                 done += 1;
                 let stage = StageInfo {
@@ -1358,7 +1374,7 @@ fn run_worker(
                 done: Some(1),
                 total: Some(1),
                 progress: Some(1.0),
-                message: Some("复用共享切片池（未重新导入）".into()),
+                message: Some("SHARED_POOL_REUSED".into()),
             };
             inner.snapshot.lock().stage = Some(stage.clone());
             let _ = app.emit("training-stage", &stage);
@@ -1387,8 +1403,13 @@ fn run_worker(
                 .unwrap_or("wav")
                 .to_ascii_lowercase();
             let dst = dataset_dir.join(format!("{:03}.{}", i, ext));
-            std::fs::copy(src, &dst)
-                .map_err(|e| UtaiError::Training(format!("导入数据 {} 失败: {}", src.display(), e)))?;
+            std::fs::copy(src, &dst).map_err(|e| {
+                UtaiError::Training(format!(
+                    "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                    src.display(),
+                    e
+                ))
+            })?;
             let stage = StageInfo {
                 stage: "import".into(),
                 done: Some((i + 1) as u64),
@@ -1509,7 +1530,7 @@ fn run_worker(
         .spawn()
         .map_err(|e| {
             UtaiError::Training(format!(
-                "启动训练 Python 失败 ({}): {}（训练环境未配置？）",
+                "TRAINING_PYTHON_SPAWN_FAILED: {}: {}",
                 python.display(),
                 e
             ))
@@ -1634,7 +1655,10 @@ fn run_worker(
                 }
                 Some("error") => {
                     got_error = Some(
-                        msg["message"].as_str().unwrap_or("未知训练错误").to_string(),
+                        msg["message"]
+                            .as_str()
+                            .unwrap_or("TRAINING_UNKNOWN_ERROR")
+                            .to_string(),
                     );
                 }
                 _ => tracing::debug!(target: "utai", "[train-proto?] {}", line),
@@ -1672,8 +1696,7 @@ fn run_worker(
         return Ok(());
     }
     Err(UtaiError::Training(format!(
-        "训练进程异常退出 (exit code {:?})。常见原因：显存/内存不足(OOM)、被杀毒软件终止、训练环境损坏。\
-         详细日志见训练工作区 train.log；最近输出已附在状态面板。",
+        "TRAINING_PROCESS_CRASHED: exit code {:?}",
         code
     )))
 }

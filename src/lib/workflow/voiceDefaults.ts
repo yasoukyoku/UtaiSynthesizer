@@ -48,9 +48,10 @@ export interface RvcOptions {
   /** S60-2 音域扩展 (cover): out-of-comfort chunks render translated into the model's tested
    * comfort zone and are TD-PSOLA'd back. No-op without a sidecar vocal_range record; in-range
    * chunks are byte-identical either way. DEFAULTS carry false (= the Rust serde default, so an
-   * old graph's absent key stays OFF — audit S60: buildVoiceOptions fills absent keys from
-   * DEFAULTS, so a `true` here would silently flip every pre-S60 node ON). NEW nodes get an
-   * explicit `range_extend: true` written into their params at creation (WorkflowEditor). */
+   * absent key stays OFF — audit S60: buildVoiceOptions fills absent keys from DEFAULTS, so a
+   * `true` here would silently flip every keyless node ON). S62c: OFF is also the CREATION
+   * default (extension is opt-in per node — the whole-render recolor tradeoff must never be on
+   * by default); a pre-S62 node's explicitly-written `true` keeps rendering extended. */
   range_extend: boolean;
   /** KNN index feature blend, 0..1. */
   index_ratio: number;

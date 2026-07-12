@@ -9,6 +9,7 @@ import { useAppStore } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
+import { backendErrorMessage, isCancelError } from "../backendError";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
@@ -38,18 +39,18 @@ async function waitVoiceDrain(segmentId: string): Promise<boolean> {
   if ((voiceInvokesInFlight.get(segmentId) ?? 0) === 0) return true;
   const toast = useAppStore.getState().showToast;
   if (voiceDrainWaiters.has(segmentId)) {
-    toast("已有一次渲染在排队等待上一次停止——本次点击已忽略", "info");
+    toast(i18n.t("workflow.drainQueued"), "info");
     return false;
   }
   voiceDrainWaiters.add(segmentId);
-  toast("上一次渲染停止中——完成后将自动开始本次渲染", "info");
+  toast(i18n.t("workflow.drainWaiting"), "info");
   try {
     // Generous cap: a CPU-mode extractor pass over a 30 s piece is the longest single
     // uninterruptible step. A hang past this is a real bug, not a slow drain.
     const deadline = Date.now() + 120_000;
     while ((voiceInvokesInFlight.get(segmentId) ?? 0) > 0) {
       if (Date.now() > deadline) {
-        toast("上一次渲染停止超时——请查看日志", "error");
+        toast(i18n.t("workflow.drainTimeout"), "error");
         return false;
       }
       await new Promise((r) => setTimeout(r, 200));
@@ -60,10 +61,86 @@ async function waitVoiceDrain(segmentId: string): Promise<boolean> {
   }
 }
 
-/** Rust cancel rejections arrive as strings like "Inference error: 已取消" — the backend
- *  counterpart of the frontend "Cancelled" sentinel. Both settle a run silently. */
+/** Cancel sentinel — delegated to THE single check in backendError.ts (shared with every toast
+ *  funnel). Runs BEFORE any error-code localization, or a user cancel would surface as a red error. */
 function isCancelMessage(msg: string): boolean {
-  return msg === "Cancelled" || msg.includes("已取消");
+  return isCancelError(msg);
+}
+
+/** PRE-FLIGHT separation-busy gate. The Rust SeparationManager is a GLOBAL single slot — dispatching a
+ *  run whose separation node would hit its "already in progress" guard used to START the run anyway and
+ *  fail it seconds later with a red error, flipping this segment's button back to Run while the OTHER
+ *  (earlier) backend job kept going — the UI read as "backend stopped" when it hadn't. So: if the run
+ *  would actually EXECUTE a separation node (for a single-node run, dense-cached upstreams are reused
+ *  and never invoke the backend) and a live separation is in flight, REJECT before startExecution with
+ *  a toast — no execution state is ever created, nothing to un-wind. The Rust guard stays as the
+ *  authoritative backstop for the query→dispatch race (its SEPARATION_BUSY code maps to the same text
+ *  in executeNode). */
+async function rejectIfSeparationBusy(
+  segmentId: string,
+  workflow: Workflow,
+  targetNodeId: string | null,
+): Promise<boolean> {
+  let needsSeparation = false;
+  try {
+    const graph = parseWorkflowGraph(workflow);
+    const cache = useWorkflowStore.getState().nodeOutputs[segmentId] ?? {};
+    // Single-node runs only ever execute the target's ANCESTOR chain (see ancestorSetOf).
+    const scope = targetNodeId !== null ? ancestorSetOf(graph, targetNodeId) : null;
+    for (const nodeId of graph.sorted) {
+      if (scope && !scope.has(nodeId)) continue;
+      const gn = graph.nodes.get(nodeId)!;
+      if (gn.node.nodeType === "msstSeparation") {
+        // Mirrors executeSingleNode's reuse rule: a dense-cached non-target node is skipped, never run.
+        const cached = cache[nodeId];
+        const reused = targetNodeId !== null && nodeId !== targetNodeId
+          && !!cached && cached.length > 0 && isDenseCache(cached);
+        if (!reused) { needsSeparation = true; break; }
+      }
+      if (targetNodeId !== null && nodeId === targetNodeId) break;
+    }
+  } catch {
+    return false; // broken graph — let the normal run path surface its own error
+  }
+  if (!needsSeparation) return false;
+  const status = await invoke<{ state: string | Record<string, string> }>("get_separation_status")
+    .catch(() => null);
+  const busy = status !== null && typeof status.state === "string"
+    && (status.state === "Separating" || status.state === "LoadingModel");
+  if (busy) useAppStore.getState().showToast(i18n.t("workflow.separationBusy"), "error");
+  return busy;
+}
+
+/** Gate a run BEFORE the caller mutates anything (deposit invalidation, store state). The two run entry
+ *  points (WorkflowEditor handleExecute / handleRunSingleNode) MUST await this FIRST — previously the
+ *  busy/drain checks lived inside executeWorkflow, i.e. AFTER handleExecute had already stripped the
+ *  segment's deposited lanes, so a rejected run cost the track its lanes for nothing (and the drain-drop
+ *  path returned 0, stacking a misleading "no outputs" error toast on top). Returns false (after
+ *  toasting) when the run must not start; nothing has been touched. */
+export async function preflightRun(
+  segmentId: string,
+  workflow: Workflow,
+  targetNodeId: string | null,
+): Promise<boolean> {
+  const running = () => useWorkflowStore.getState().executions[segmentId]?.status === "running";
+  // Same-segment double-run guard: the per-node Run button stays reachable during a live run (the main
+  // Run button flips to Stop, but node buttons don't) — dispatching would clobber the live execution
+  // entry and orphan its UI state.
+  if (running()) {
+    useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
+    return false;
+  }
+  if (!(await waitVoiceDrain(segmentId))) return false;
+  if (running()) { // a run may have started while we drained
+    useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
+    return false;
+  }
+  if (await rejectIfSeparationBusy(segmentId, workflow, targetNodeId)) return false;
+  if (running()) { // …or while we queried the separation status (the path to startExecution is sync from here)
+    useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
+    return false;
+  }
+  return true;
 }
 
 /** Per-RUN output directory under the segment's cache dir. Node output paths were previously
@@ -88,9 +165,20 @@ export async function executeWorkflow(
   segment: Segment,
   workflow: Workflow,
 ): Promise<number> {
-  if (!(await waitVoiceDrain(segmentId))) return 0;
   const store = useWorkflowStore.getState();
-  store.startExecution(segmentId);
+  // Dispatch-time participant snapshot (every non-IO node — a full run executes them all): written in
+  // the SAME store update that flips the run to "running", so the reconciler's very first pass already
+  // knows which feeders belong to this run (its pending placeholders key on membership). A parse failure
+  // lands [] here and throws properly inside the try below.
+  let participants: string[] = [];
+  try {
+    const g = parseWorkflowGraph(workflow);
+    participants = g.sorted.filter((id) => {
+      const t = g.nodes.get(id)!.node.nodeType;
+      return t !== "input" && t !== "output";
+    });
+  } catch { /* reported by the parse inside the try below */ }
+  store.startExecution(segmentId, participants);
   store.clearNodeStatuses(segmentId);
   // A full run recomputes every node. Drop any warm/rehydrated cache first so the live reconciler shows
   // loading placeholders and deposits each lane FRESH as its node finishes — never an early decode of a
@@ -99,9 +187,20 @@ export async function executeWorkflow(
 
   try {
     logToBackend("info", `Workflow started (${workflow.nodes.length} nodes)`);
-    await useMsstModelStore.getState().fetchInstalled();
-
     const graph = parseWorkflowGraph(workflow);
+
+    // Mark all non-IO nodes as waiting BEFORE the first await: the reconciler's pending placeholders
+    // key on per-feeder participation (waiting/running), so the marks must land in the same tick the
+    // run starts — marking them after fetchInstalled/ensureRunDir left an await-sized window in which
+    // connected lanes showed no placeholder at all.
+    for (const nodeId of graph.sorted) {
+      const gn = graph.nodes.get(nodeId)!;
+      if (gn.node.nodeType !== "input" && gn.node.nodeType !== "output") {
+        store.setNodeStatus(segmentId, nodeId, "waiting");
+      }
+    }
+
+    await useMsstModelStore.getState().fetchInstalled();
     const cacheDir = await ensureRunDir(segmentId);
 
     const dataMap = new Map<string, Map<number, string>>();
@@ -117,14 +216,6 @@ export async function executeWorkflow(
     const playbackWav = useAudioStore.getState().audioFiles[segment.content.sourcePath]?.playbackPath;
     inputData.set(0, playbackWav || segment.content.sourcePath);
     dataMap.set(graph.inputNodeId, inputData);
-
-    // Mark all non-IO nodes as waiting
-    for (const nodeId of graph.sorted) {
-      const gn = graph.nodes.get(nodeId)!;
-      if (gn.node.nodeType !== "input" && gn.node.nodeType !== "output") {
-        store.setNodeStatus(segmentId, nodeId, "waiting");
-      }
-    }
 
     const totalNodes = graph.sorted.length;
 
@@ -167,15 +258,20 @@ export async function executeWorkflow(
     const msg = err instanceof Error ? err.message : String(err);
     const cancelled = isCancelMessage(msg);
     logToBackend(cancelled ? "warn" : "error", cancelled ? "Workflow cancelled" : `Workflow failed: ${msg}`);
+    // THE single localization point for node/run error DISPLAY (cancel checked first — a localized
+    // cancel would dodge the swallow checks downstream): known Rust CODEs (APP_BUSY, SEPARATION_BUSY,
+    // TRANSPOSE_*, MSST_MODEL_NOT_CONVERTED, …) become t(...) text; unknown messages pass through raw.
+    // A cancel settles as the bare frontend sentinel (not the raw "Inference error: CANCELLED" wire text).
+    const display = cancelled ? "Cancelled" : (backendErrorMessage(msg) ?? msg);
     const store = useWorkflowStore.getState();
     // A real failure marks the offending node red; a user cancel marks nothing. Either way clear the
     // running/waiting badges so nodes don't stay stuck blue/yellow after the run settles.
     if (!cancelled && store.executions[segmentId]?.currentNodeId) {
       store.setNodeStatus(segmentId, store.executions[segmentId]!.currentNodeId!, "error");
-      store.setNodeError(segmentId, store.executions[segmentId]!.currentNodeId!, msg);
+      store.setNodeError(segmentId, store.executions[segmentId]!.currentNodeId!, display);
     }
     store.clearPendingStatuses(segmentId);
-    store.failExecution(segmentId, msg);
+    store.failExecution(segmentId, display);
     throw err;
   }
 }
@@ -189,20 +285,55 @@ function isDenseCache(arr: string[]): boolean {
   return true;
 }
 
+/** The target node + its transitive UPSTREAM — the only nodes a single-node run may touch. A plain
+ *  walk of graph.sorted "up to the target" also visits UNRELATED parallel branches that happen to sort
+ *  earlier (topological order ≠ ancestry), so clicking "run this node" used to silently re-render
+ *  never-rendered nodes elsewhere on the canvas (old bug, user-caught S62b). */
+function ancestorSetOf(
+  graph: ReturnType<typeof parseWorkflowGraph>,
+  targetNodeId: string,
+): Set<string> {
+  const anc = new Set<string>([targetNodeId]);
+  const stack = [targetNodeId];
+  while (stack.length > 0) {
+    const gn = graph.nodes.get(stack.pop()!);
+    for (const e of gn?.inEdges ?? []) {
+      if (!anc.has(e.fromNode)) {
+        anc.add(e.fromNode);
+        stack.push(e.fromNode);
+      }
+    }
+  }
+  return anc;
+}
+
 export async function executeSingleNode(
   segmentId: string,
   segment: Segment,
   workflow: Workflow,
   targetNodeId: string,
 ): Promise<void> {
-  if (!(await waitVoiceDrain(segmentId))) return;
   const store = useWorkflowStore.getState();
   // NOTE: we deliberately DON'T clear the target's cache here. The stale-in-place-overwrite hazard is
   // handled AFTER a successful run by handleRunSingleNode (clearBufferCache + removeProcessedOutputsForNode
   // for lanes this node feeds → the reconciler re-decodes fresh); and during the run the old deposit stays
   // present so the reconciler KEEPs it (no early decode of a to-be-overwritten file). Clearing up front
   // instead LOST the last-good cache pointer if the re-run FAILED, breaking reconnect-from-cache.
-  store.startExecution(segmentId);
+  // Participant snapshot = the target + its ANCESTOR chain, non-IO (cache-reused upstreams included —
+  // harmless: their lanes resolve from the cache branch before the pending branch is consulted).
+  // NOT "everything up to the target in topo order": that includes unrelated parallel branches.
+  const participants: string[] = [];
+  try {
+    const g = parseWorkflowGraph(workflow);
+    const scope = ancestorSetOf(g, targetNodeId);
+    for (const id of g.sorted) {
+      if (!scope.has(id)) continue;
+      const t = g.nodes.get(id)!.node.nodeType;
+      if (t !== "input" && t !== "output") participants.push(id);
+      if (id === targetNodeId) break;
+    }
+  } catch { /* reported by the parse inside the try below */ }
+  store.startExecution(segmentId, participants);
 
   try {
     const graph = parseWorkflowGraph(workflow);
@@ -226,7 +357,13 @@ export async function executeSingleNode(
     inputData.set(0, playbackWav || segment.content.sourcePath);
     dataMap.set(graph.inputNodeId, inputData);
 
+    // Only the target's ANCESTOR chain may run. graph.sorted is a WHOLE-graph topological order, so
+    // "walk until the target" also visits unrelated parallel branches that happen to sort earlier —
+    // clicking "run this node" used to silently render never-rendered nodes elsewhere on the canvas.
+    const scope = ancestorSetOf(graph, targetNodeId);
+
     for (const nodeId of graph.sorted) {
+      if (!scope.has(nodeId)) continue;
       const gn = graph.nodes.get(nodeId)!;
       if (gn.node.nodeType === "input" || gn.node.nodeType === "output") continue;
 
@@ -265,12 +402,15 @@ export async function executeSingleNode(
     store.completeExecution(segmentId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!isCancelMessage(msg)) {
+    const cancelled = isCancelMessage(msg);
+    // Same single localization point as executeWorkflow's catch (cancel checked first).
+    const display = cancelled ? "Cancelled" : (backendErrorMessage(msg) ?? msg);
+    if (!cancelled) {
       store.setNodeStatus(segmentId, targetNodeId, "error");
-      store.setNodeError(segmentId, targetNodeId, msg);
+      store.setNodeError(segmentId, targetNodeId, display);
     }
     store.clearPendingStatuses(segmentId);
-    store.failExecution(segmentId, msg);
+    store.failExecution(segmentId, display);
   }
 }
 
@@ -384,6 +524,8 @@ async function executeNode(
           ?? (arch !== undefined ? MSST_DEFAULT_PRECISION[arch] : undefined)
           ?? "fp32", // arch "unknown"/unresolvable → fp32 (Rust auto-uses fp16 if it's the only file)
       };
+      // Rejection CODEs (SEPARATION_BUSY backstop / MSST_MODEL_NOT_CONVERTED) are localized once at
+      // the run-catch (executeWorkflow / executeSingleNode) — the single mapping point.
       await invoke("run_msst_separation", { config });
       let status = await invoke<{ state: string | Record<string, string>; stems?: { label: string; path: string }[]; progress?: number }>("get_separation_status");
       // No-PROGRESS (stall) timeout instead of a fixed wall clock: a slow GPU / CPU fallback / TTA
@@ -410,6 +552,9 @@ async function executeNode(
           useWorkflowStore.getState().setNodeProgress(segmentId, nodeId, p);
         }
         if (Date.now() - lastProgressAt > STALL_TIMEOUT) {
+          // Abandon the backend job too: leaving it running permanently armed the SEPARATION_BUSY guard
+          // (frontend showed "stopped" while the worker kept going — the state-desync the user hit).
+          await invoke("cancel_separation").catch(() => {});
           throw new Error("MSST separation stalled: no progress for 180s (possible crash or out-of-memory)");
         }
       }
@@ -442,20 +587,12 @@ async function executeNode(
         break;
       }
       const outputPath = `${cacheDir}/${nodeId}_transpose.wav`;
-      try {
-        await invoke("transpose_audio", {
-          path: primaryInput,
-          semitones,
-          outputPath,
-        });
-      } catch (e) {
-        // Map the stable Rust CODEs to localized node-error text (i18n rule — a raw CODE must not
-        // reach the user). Anything else keeps its detail suffix.
-        const msg = String(e);
-        if (msg.includes("TRANSPOSE_INPUT_MISSING")) throw new Error(i18n.t("workflow.errTransposeInput"));
-        if (msg.includes("TRANSPOSE_RANGE")) throw new Error(i18n.t("workflow.errTransposeRange"));
-        throw e instanceof Error ? e : new Error(msg);
-      }
+      // TRANSPOSE_* CODEs are localized once at the run-catch (the single mapping point).
+      await invoke("transpose_audio", {
+        path: primaryInput,
+        semitones,
+        outputPath,
+      });
       outputData.set(0, outputPath);
       break;
     }
@@ -546,6 +683,21 @@ function countOutputLanes(
   return count;
 }
 
+/** Decode-failure memo for the SETTLE deposit path: a cached path that repeatedly fails to decode
+ *  (file deleted/corrupt — e.g. swept externally) must stop re-arming hasUndepositedCache, or one dead
+ *  file turns every watcher tick into a failing multi-second load_audio_file invoke forever
+ *  (review-caught). Keyed segment|path; paths are RUN-UNIQUE so entries never need invalidation — a
+ *  re-render mints new paths. A couple of retries are kept for transient Windows file locks. */
+const cacheDecodeFailures = new Map<string, number>();
+const DECODE_GIVE_UP = 3;
+function noteDecodeFailure(segmentId: string, audioPath: string): void {
+  const k = `${segmentId}|${audioPath}`;
+  cacheDecodeFailures.set(k, (cacheDecodeFailures.get(k) ?? 0) + 1);
+}
+function decodeGivenUp(segmentId: string, audioPath: string): boolean {
+  return (cacheDecodeFailures.get(`${segmentId}|${audioPath}`) ?? 0) >= DECODE_GIVE_UP;
+}
+
 export interface CachedPath {
   laneId: string;
   laneLabel: string;
@@ -610,16 +762,32 @@ export async function depositFromCache(trackId: string, segmentId: string, workf
   let changed = false;
   if (graph) {
     const outSet = new Set(graph.outputNodeIds);
+    // Lanes already deposited at the SAME path need no re-decode (paths are run-unique — same path ⇒
+    // same content); skipping them keeps a settle deposit that refreshes ONE re-rendered lane from
+    // re-decoding every sibling stem. Loading placeholders are NOT "deposited" (they must resolve).
+    const segBefore = useProjectStore.getState().tracks.find((t) => t.id === trackId)?.segments.find((s) => s.id === segmentId);
+    const alreadyAt = new Map((segBefore?.processedOutputs ?? []).filter((o) => !o.loading).map((o) => [o.laneId, o.audioPath] as const));
     for (const outId of graph.outputNodeIds) {
       const { paths } = collectCachedPaths(segmentId, outId, workflow);
-      if (paths.length === 0) continue;
+      const fresh = paths.filter((p) => alreadyAt.get(p.laneId) !== p.audioPath && !decodeGivenUp(segmentId, p.audioPath));
+      if (fresh.length === 0) continue;
       // S59 deposit-perf O2: decode the lanes CONCURRENTLY (each is an independent load_audio_file
       // → hound decode + peaks); the old sequential awaits serialized 4-5 multi-second decodes.
-      const decoded = (await Promise.all(paths.map((p) => loadCachedOutput(p).catch(() => null))))
-        .filter((o): o is ProcessedOutput => o !== null);
+      const decoded = (await Promise.all(fresh.map((p) => loadCachedOutput(p).catch(() => {
+        noteDecodeFailure(segmentId, p.audioPath); // dead/corrupt cache file — stop re-arming the watcher after a few tries
+        return null;
+      })))).filter((o): o is ProcessedOutput => o !== null);
       if (runningNow()) return changed;
       if (decoded.length > 0) {
-        useProjectStore.getState().mergeProcessedOutputs(trackId, segmentId, decoded);
+        // The store merge REPLACES by outputNodeId — it must receive the node's COMPLETE lane set:
+        // re-attach the lanes the fresh-filter skipped (already deposited at the same cached path), or
+        // the merge would silently delete this node's healthy sibling lanes — and the settle watcher
+        // would then oscillate forever re-depositing the alternating halves (review-caught HIGH).
+        const kept = (segBefore?.processedOutputs ?? []).filter(
+          (o) => o.outputNodeId === outId && !o.loading
+            && paths.some((p) => p.laneId === o.laneId && p.audioPath === o.audioPath),
+        );
+        useProjectStore.getState().mergeProcessedOutputs(trackId, segmentId, [...kept, ...decoded]);
         changed = true;
       }
     }
@@ -666,8 +834,9 @@ export async function loadCachedOutput(p: CachedPath): Promise<ProcessedOutput> 
 /** All inbound-edge lane IDs for ONE Output node — STRUCTURE only, no cache/audio. Lets the auto-deposit
  *  reconciler know which lanes the node SHOULD carry, so it removes a lane only when its producing edge
  *  is gone — NOT merely because this session's render cache is cold (which would wipe persisted lanes on
- *  reopening a saved segment). */
-export function outputLanes(workflow: Workflow, outputNodeId: string): { laneId: string; laneLabel: string; group: string }[] {
+ *  reopening a saved segment). `fromNode` = the lane's direct feeder, so the reconciler can ask whether
+ *  that branch actually participates in the active run (per-feeder pending placeholders). */
+export function outputLanes(workflow: Workflow, outputNodeId: string): { laneId: string; laneLabel: string; group: string; fromNode: string }[] {
   const graph = parseWorkflowGraph(workflow);
   const gn = graph.nodes.get(outputNodeId);
   if (!gn) return [];
@@ -676,7 +845,40 @@ export function outputLanes(workflow: Workflow, outputNodeId: string): { laneId:
     laneId: laneIdFor(outputNodeId, edge),
     laneLabel: laneLabelFor(graph, base, gn.inEdges.length, edge),
     group: base,
+    fromNode: edge.fromNode,
   }));
+}
+
+/** True iff this segment's render CACHE holds, for some structural Output lane, an audio path that the
+ *  track does not carry yet (lane missing, or deposited at a DIFFERENT path — paths are run-unique, so a
+ *  path difference IS a newer render). This is the settle watcher's "something landed that never
+ *  deposited" signal: a re-render of an already-deposited lane keeps the OLD lane in place (the
+ *  reconciler's KEEP branch — non-loading), so the watcher cannot rely on loading placeholders alone;
+ *  without this check, closing the editor mid-re-render silently stranded the finished render in the
+ *  cache (the track kept playing the previous version until the editor was reopened). Pure + cheap:
+ *  reads graph structure and the cache map, decodes nothing. */
+export function hasUndepositedCache(
+  segmentId: string,
+  workflow: Workflow | undefined,
+  outs: ProcessedOutput[] | undefined,
+): boolean {
+  if (!workflow) return false;
+  // Cheap pre-gate: no session render cache ⇒ nothing can be undeposited (skips the graph parse for
+  // the many cold segments the settle watcher iterates over).
+  const cache = useWorkflowStore.getState().nodeOutputs[segmentId];
+  if (!cache || Object.keys(cache).length === 0) return false;
+  let graph: ReturnType<typeof parseWorkflowGraph>;
+  try { graph = parseWorkflowGraph(workflow); } catch { return false; }
+  const deposited = new Map((outs ?? []).filter((o) => !o.loading).map((o) => [o.laneId, o.audioPath] as const));
+  for (const outId of graph.outputNodeIds) {
+    const { paths } = collectCachedPaths(segmentId, outId, workflow);
+    for (const p of paths) {
+      // A path whose decode has permanently failed (dead cache file) counts as deposited — otherwise
+      // the settle watcher re-arms forever on a file that will never load (see cacheDecodeFailures).
+      if (deposited.get(p.laneId) !== p.audioPath && !decodeGivenUp(segmentId, p.audioPath)) return true;
+    }
+  }
+  return false;
 }
 
 /** All Output-group names in use across the project (every segment's persisted Output nodes), plus any

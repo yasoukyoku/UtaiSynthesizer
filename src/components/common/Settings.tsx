@@ -14,6 +14,7 @@ import { applyMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
+import { backendErrorMessage } from "../../lib/backendError";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -79,8 +80,16 @@ interface PyenvProgress {
   id: string;
   phase: string;
   progress: number;
+  /** English log/fallback text — render from `code`+`params` when present. */
   message: string;
+  /** Stable stage/outcome/error CODE (STAGE_* / INSTALL_DONE / …) for localization. */
+  code?: string | null;
+  /** Positional payload for the localized template (e.g. [name, doneMB, totalMB]). */
+  params?: string[];
 }
+
+/** Localize a backend rejection via the app-wide CODE map, falling back to the raw text. */
+const backendErrText = (e: unknown): string => backendErrorMessage(e) ?? String(e);
 
 /** Mirror of Rust `download::ProbeResult` — download-source throughput probe. */
 interface ProbeResult {
@@ -198,7 +207,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [rtBusy, setRtBusy] = useState(false);
   const [rtProgress, setRtProgress] = useState<PyenvProgress | null>(null);
   const [rtError, setRtError] = useState<string | null>(null);
-  const [rtNotice, setRtNotice] = useState<string | null>(null);
+  // Terminal "done" payload — kept whole so the render maps code+params to L() text
+  // and the success (green) state keys on the stable INSTALL_DONE code.
+  const [rtNotice, setRtNotice] = useState<PyenvProgress | null>(null);
   const [envtesting, setEnvtesting] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
 
@@ -231,10 +242,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setRtProgress(e.payload);
       if (e.payload.phase === "done" || e.payload.phase === "error") {
         setRtBusy(false);
-        if (e.payload.phase === "error") setRtError(e.payload.message);
-        // The done message can carry a REAL verdict（"已安装，但自检未通过：…"）—
+        if (e.payload.phase === "error") setRtError(backendErrText(e.payload.message));
+        // The done payload can carry a REAL verdict (INSTALLED_ENVTEST_FAILED: …) —
         // it must survive the progress bar disappearing, not vanish with it.
-        if (e.payload.phase === "done") setRtNotice(e.payload.message);
+        if (e.payload.phase === "done") setRtNotice(e.payload);
         refreshRuntime();
       }
     });
@@ -259,7 +270,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("download_runtime_pack", { id });
     } catch (e) {
-      setRtError(String(e));
+      setRtError(backendErrText(e));
     } finally {
       setRtBusy(false);
       refreshRuntime();
@@ -280,7 +291,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("install_runtime_pack_local", { path: file });
     } catch (e) {
-      setRtError(String(e));
+      setRtError(backendErrText(e));
     } finally {
       setRtBusy(false);
       refreshRuntime();
@@ -294,7 +305,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("run_pack_envtest", { id });
     } catch (e) {
-      setRtError(String(e));
+      setRtError(backendErrText(e));
     } finally {
       setEnvtesting(null);
       refreshRuntime();
@@ -319,7 +330,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("delete_runtime_pack", { id });
     } catch (e) {
-      setRtError(String(e));
+      setRtError(backendErrText(e));
     } finally {
       setDeleting(null);
       refreshRuntime();
@@ -374,7 +385,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
     if (msg.includes("TRAINING_ACTIVE")) return L("stErrTraining");
     if (msg.includes("CLEANUP_BUSY")) return L("stErrBusy");
     if (msg.includes("WORKSPACE_MISSING")) return L("stErrWsMissing");
-    return msg;
+    // Any other storage code (WORKSPACE_DELETE_FAILED / STORAGE_JOIN / …) → the app-wide map,
+    // raw-string fallback.
+    return backendErrorMessage(msg) ?? msg;
   };
 
   const runCleanup = useCallback(async (key: string, fn: () => Promise<number>, confirm?: { title: string; body: string }) => {
@@ -580,6 +593,17 @@ export function Settings({ onClose }: { onClose: () => void }) {
       rtPackLabel_nv_cu130: { zh: "NVIDIA 运行时（cu130；RTX 20-50 训练 + 模型转换）", en: "NVIDIA runtime (cu130; RTX 20-50 training + conversion)", ja: "NVIDIA ランタイム（cu130；RTX 20-50 トレーニング + 変換）" },
       rtPackLabel_amd: { zh: "AMD 运行时（ROCm；RDNA3/4 训练 + 模型转换）", en: "AMD runtime (ROCm; RDNA3/4 training + conversion)", ja: "AMD ランタイム（ROCm；RDNA3/4 トレーニング + 変換）" },
       rtPackLabel_xpu: { zh: "Intel 运行时（XPU；Arc 训练 + 模型转换）", en: "Intel runtime (XPU; Arc training + conversion)", ja: "Intel ランタイム（XPU；Arc トレーニング + 変換）" },
+      // pyenv-progress channel (code+params → text; zh reproduces the pre-i18n wording)
+      pgFetchManifest: { zh: "获取包清单...", en: "Fetching pack manifest...", ja: "パックマニフェストを取得中..." },
+      pgDownloading: { zh: "下载", en: "Downloading", ja: "ダウンロード中" },
+      pgExtracting: { zh: "解压运行时包...", en: "Extracting runtime pack...", ja: "ランタイムパックを展開中..." },
+      pgFiles: { zh: "个文件", en: "files", ja: "ファイル" },
+      pgEnvtest: { zh: "运行环境自检...", en: "Running environment self-test...", ja: "環境セルフテストを実行中..." },
+      pgVerify: { zh: "校验分卷 sha256...", en: "Verifying part sha256...", ja: "分割ファイルの sha256 を検証中..." },
+      pgVerifySkipped: { zh: "未找到 manifest——跳过校验（仅建议用于本地构建的包）", en: "No manifest found — verification skipped (only recommended for locally built packs)", ja: "manifest が見つかりません——検証をスキップします（ローカルビルドのパックのみ推奨）" },
+      pgInstallDone: { zh: "安装完成，自检通过。", en: "Install complete; self-test passed.", ja: "インストール完了、セルフテスト合格。" },
+      pgInstalledSkipped: { zh: "已安装（取消跳过了自检——可在列表中手动自检）。", en: "Installed (cancel skipped the self-test — run it manually from the pack list).", ja: "インストール済み（キャンセルによりセルフテストをスキップ——リストから手動で実行できます）。" },
+      pgInstalledFailed: { zh: "已安装，但自检未通过：", en: "Installed, but the self-test failed: ", ja: "インストール済みですが、セルフテスト不合格：" },
       srcTitle: { zh: "下载源 / 网络", en: "Download Source / Network", ja: "ダウンロードソース / ネットワーク" },
       srcHF: { zh: "HuggingFace（默认）", en: "HuggingFace (default)", ja: "HuggingFace（既定）" },
       srcMirror: { zh: "HF Mirror (hf-mirror.com) — 中国大陆加速", en: "HF Mirror (hf-mirror.com) — China mainland", ja: "HF Mirror (hf-mirror.com) — 中国本土" },
@@ -611,7 +635,27 @@ export function Settings({ onClose }: { onClose: () => void }) {
     if (r.verdict === "slow") return L("srcSlow") + speed;
     if (r.verdict === "throttled") return L("srcThrottled") + speed;
     if (r.verdict === "http_error") return L("srcHttpErr") + (r.http_status ? ` (${r.http_status})` : "");
-    return L("srcUnreachable") + (r.error ? ` — ${r.error}` : "");
+    // PROBE_* codes localize via the app-wide backend-error map (raw fallback).
+    return L("srcUnreachable") + (r.error ? ` — ${backendErrText(r.error)}` : "");
+  };
+
+  /** pyenv-progress line: localized from the stable code+params; raw message fallback
+   *  (older/legacy emits carry no code). */
+  const progressText = (p: PyenvProgress): string => {
+    const P = p.params ?? [];
+    switch (p.code) {
+      case "STAGE_FETCH_MANIFEST": return L("pgFetchManifest");
+      case "STAGE_DOWNLOADING": return `${L("pgDownloading")} ${P[0] ?? ""}  ${P[1] ?? "?"} / ${P[2] ?? "?"} MB`;
+      case "STAGE_EXTRACTING": return P[0] ? `${L("pgExtracting")} ${P[0]} ${L("pgFiles")}` : L("pgExtracting");
+      case "STAGE_ENVTEST": return L("pgEnvtest");
+      case "STAGE_VERIFY": return L("pgVerify");
+      case "STAGE_VERIFY_SKIPPED": return L("pgVerifySkipped");
+      case "INSTALL_DONE": return L("pgInstallDone");
+      case "INSTALLED_ENVTEST_SKIPPED": return L("pgInstalledSkipped");
+      // params[0] = the inner envtest error (itself CODE-bearing) — localize it too.
+      case "INSTALLED_ENVTEST_FAILED": return L("pgInstalledFailed") + (P[0] ? backendErrText(P[0]) : "");
+      default: return p.message;
+    }
   };
 
   return (
@@ -645,9 +689,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
                   : hw.gpu_name.split(", ").map((name) => ({ name, vendor: "" }))
                 ).map((g, i) => (
                   <span key={i} className="settings-value" style={{ maxWidth: "100%", display: "flex", gap: 6, alignItems: "center" }}>
-                    {g.name}
+                    {/* The NAME is the shrink absorber (min-width:0 + ellipsis); the badge is pinned
+                        (flexShrink:0). A bare text node was an unshrinkable nowrap flex item, so a long
+                        GPU name pushed the badge past the container's overflow:hidden — its right border
+                        was clipped invisible (S59c rightmost-child-clipping class of bug). */}
+                    <span style={{ minWidth: 0, flex: "0 1 auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</span>
                     {g.vendor && g.vendor !== "other" && (
-                      <span className="settings-badge ok" style={{ textTransform: "uppercase" }}>{g.vendor}</span>
+                      <span className="settings-badge ok" style={{ textTransform: "uppercase", flexShrink: 0 }}>{g.vendor}</span>
                     )}
                   </span>
                 ))}
@@ -951,15 +999,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
                       style={{ width: `${Math.round(Math.min(1, Math.max(0, rtProgress.progress)) * 100)}%` }}
                     />
                   </div>
-                  <span className="settings-progress-text">{rtProgress.message}</span>
+                  <span className="settings-progress-text">{progressText(rtProgress)}</span>
                 </div>
               )}
               {rtNotice && !rtBusy && (
                 <p
                   className="settings-note"
-                  style={rtNotice.includes("自检通过") || rtNotice.toLowerCase().includes("pass") ? { color: "#4ade80" } : undefined}
+                  style={rtNotice.code === "INSTALL_DONE" ? { color: "#4ade80" } : undefined}
                 >
-                  {rtNotice}
+                  {progressText(rtNotice)}
                 </p>
               )}
               {rtError && <p className="settings-error">{rtError}</p>}

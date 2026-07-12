@@ -14,6 +14,7 @@ import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import i18n from "../../i18n";
+import { backendErrorMessage, isCancelError } from "../backendError";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { contentSig, vocalParamsSig } from "../../store/history";
 import type { Note, PitchCurve, NoteTransition, ProcessedOutput, Track, Segment } from "../../types/project";
@@ -51,7 +52,20 @@ export function vocalRenderErrorMessage(e: unknown): string {
   if (msg.includes(VOCAL_EMPTY)) return i18n.t("vocalEditor.render.empty");
   if (msg.includes(VOCAL_RENDER_BUSY)) return i18n.t("vocalEditor.render.busy");
   if (msg.includes(VOCAL_SPK_MIX_DIFFUSION)) return i18n.t("vocalEditor.render.spkMixDiffusion");
+  // App-wide backend CODEs (APP_BUSY from the VoiceRunGuard etc.) — the shared mapper, consulted AFTER
+  // the payload regexes above so a lyric containing a code string can't hijack the match.
+  const shared = backendErrorMessage(e);
+  if (shared) return shared;
   return `${i18n.t("vocalEditor.render.failed")}: ${msg}`;
+}
+
+/** Cancel check for the vocal-render funnels. Payload-carrying codes (VOCAL_OOV / VOCAL_DICT_MISSING /
+ *  VOCAL_PHONE_MISSING) embed the user's LYRIC verbatim — a lyric that happens to contain a
+ *  cancel-sentinel substring ("已取消" / "CANCELLED") must not silently swallow the real error (same
+ *  ordering rationale as vocalRenderErrorMessage's payload-first rule). */
+export function isVocalCancelError(e: unknown): boolean {
+  if (/VOCAL_(OOV|DICT_MISSING|PHONE_MISSING):/.test(String(e))) return false;
+  return isCancelError(e);
 }
 
 /** ScoreToCV native frame rate — the triple `frames` and the f0 array share this one grid so they align. */
@@ -306,7 +320,7 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  per-semitone scan doesn't feed the render); gated off when the track opted out. */
 function rangeRecordSig(track: Track): string {
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-  if (vp.rangeExtend === false || !track.voiceModel) return "";
+  if (vp.rangeExtend !== true || !track.voiceModel) return ""; // S62c: extension is opt-in (absent = OFF)
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   const rec = (entry?.config as { vocal_range?: { speakers?: Record<string, { usable?: unknown; comfort?: unknown }> } } | undefined)
     ?.vocal_range;
@@ -390,7 +404,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       lang_id: vp.langId,
       transpose: vp.transpose,
       // S60-2: absent = ON (no-op until the model carries a vocal_range record)
-      range_extend: vp.rangeExtend !== false,
+      range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },
@@ -474,6 +488,10 @@ export async function renderDirtyVocals(
       rendered++;
     } catch (e) {
       if (opts?.shouldCancel?.()) return { rendered, failed, cancelled: true };
+      // Backend-side cancel rejection (CANCELLED / legacy 已取消): same silent settle as shouldCancel —
+      // a user cancel must never toast as a per-track failure. Payload-aware check: a VOCAL_OOV lyric
+      // containing a sentinel substring is a REAL error, not a cancel.
+      if (isVocalCancelError(e)) return { rendered, failed, cancelled: true };
       // VOCAL_EMPTY = a degenerate no-renderable-content segment (every note rounds to 0 frames):
       // nothing to bake AND it can never converge — treat like the emptied-segment case above (the
       // manual Render button still reports it loudly), instead of re-toasting on every Play (audit).

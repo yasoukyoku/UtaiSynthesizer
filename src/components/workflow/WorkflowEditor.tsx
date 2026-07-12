@@ -35,7 +35,7 @@ import { useAppStore } from "../../store/app";
 import { setUndoScope, useHistoryStore } from "../../store/history";
 import { DEFAULT_OUTPUT_GROUP } from "../../lib/constants";
 import i18n from "../../i18n";
-import { executeWorkflow, executeSingleNode, collectCachedPaths, loadCachedOutput, outputLanes, rehydrateRenderState, planDetachGroup, type CachedPath } from "../../lib/workflow/engine";
+import { executeWorkflow, executeSingleNode, preflightRun, collectCachedPaths, loadCachedOutput, outputLanes, rehydrateRenderState, planDetachGroup, type CachedPath } from "../../lib/workflow/engine";
 import { nodeHistoryFor } from "../../lib/workflow/nodeHistory";
 import { logToBackend } from "../../lib/log";
 import { clearBufferCache, loadAudioBuffer } from "../../lib/audio/playback";
@@ -192,6 +192,9 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   const renderLocked = linkedSource !== undefined;
   // The reconciler (below) re-runs when this segment's render cache changes (a node just finished).
   const nodeOutputsForSegment = useWorkflowStore((s) => s.nodeOutputs[segmentId]);
+  // Node status map (a handful of writes per run, no per-frame churn): re-fires the edge render-lock
+  // classes (displayEdges below) as nodes enter/leave the queued/running set.
+  const segNodeStatuses = useWorkflowStore((s) => s.nodeStatuses[segmentId]);
   // Focus-based Ctrl+Z / edit-key ownership (the panel is co-visible with the tracks now): clicking or
   // focusing anywhere in the editor claims the "workflow" pane; the track area reclaims "timeline".
   const setActivePane = useAppStore((s) => s.setActivePane);
@@ -364,11 +367,29 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     return () => clearTimeout(saveTimer.current);
   }, [nodes, edges, segmentId]);
 
+  // A node is "busy" while it is running or queued in the active run. Deleting it mid-render would
+  // only drop the UI while the backend job keeps going — so we block deletion of busy nodes.
+  const isNodeBusy = useCallback((nodeId: string) => {
+    // Only guard during a LIVE run. Once it settles (completed / error / cancelled) the node frees
+    // up — otherwise a stale "waiting" left behind by a cancel or partial failure would make the
+    // downstream nodes permanently un-deletable until a full re-run.
+    if (useWorkflowStore.getState().executions[segmentId]?.status !== "running") return false;
+    // Output nodes are NEVER busy: deleting one mid-run only drops its deposit intent (the backend job
+    // runs on the upstream nodes + the dispatch-time graph snapshot), so they stay freely deletable —
+    // even while showing the blue "depositing" pulse. Only the upstream RENDER path locks.
+    if (nodesRef.current.find((n) => n.id === nodeId)?.type === "audioOutput") return false;
+    const st = useWorkflowStore.getState().nodeStatuses[segmentId]?.[nodeId];
+    return st === "running" || st === "waiting";
+  }, [segmentId]);
+
   const onConnect = useCallback(
     (connection: Connection) => {
+      // Symmetric with the delete lock: while a node is queued/running, its INPUTS are frozen — wiring a
+      // new edge into it mid-run would show a graph the in-flight job (dispatch snapshot) isn't using.
+      if (connection.target && isNodeBusy(connection.target)) return;
       setEdges((eds) => addEdge({ ...connection, animated: true }, eds));
     },
-    [setEdges],
+    [setEdges, isNodeBusy],
   );
 
   const onAddNode = useCallback(
@@ -377,10 +398,9 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
       if (type === "audioOutput") defaultParams.laneLabel = DEFAULT_OUTPUT_GROUP;
-      // S60-2: NEW voice nodes opt into range extension EXPLICITLY (the persisted key rides the
-      // graph into .usp). DEFAULTS/serde both carry false so an OLD graph's absent key stays OFF
-      // — never silently change a pre-S60 node's render (audit S60 MAJOR).
-      if (type === "rvc" || type === "sovits") defaultParams.range_extend = true;
+      // S62c: range extension is OPT-IN per node (user decision — the whole-render recolor
+      // tradeoff must never be on by default). Absent key = OFF via DEFAULTS/serde false; a
+      // pre-S62 node's explicitly-written `range_extend: true` keeps rendering extended.
       const newNode: Node = {
         id,
         type,
@@ -407,10 +427,9 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       const id = `${type}-${crypto.randomUUID().slice(0, 8)}`;
       const defaultParams: Record<string, unknown> = { ...(extraParams ?? {}) };
       if (type === "audioOutput") defaultParams.laneLabel = DEFAULT_OUTPUT_GROUP;
-      // S60-2: NEW voice nodes opt into range extension EXPLICITLY (the persisted key rides the
-      // graph into .usp). DEFAULTS/serde both carry false so an OLD graph's absent key stays OFF
-      // — never silently change a pre-S60 node's render (audit S60 MAJOR).
-      if (type === "rvc" || type === "sovits") defaultParams.range_extend = true;
+      // S62c: range extension is OPT-IN per node (user decision — the whole-render recolor
+      // tradeoff must never be on by default). Absent key = OFF via DEFAULTS/serde false; a
+      // pre-S62 node's explicitly-written `range_extend: true` keeps rendering extended.
       const newNode: Node = {
         id,
         type,
@@ -424,27 +443,27 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   );
 
 
-  // A node is "busy" while it is running or queued in the active run. Deleting it mid-render would
-  // only drop the UI while the backend job keeps going — so we block deletion of busy nodes.
-  const isNodeBusy = useCallback((nodeId: string) => {
-    // Only guard during a LIVE run. Once it settles (completed / error / cancelled) the node frees
-    // up — otherwise a stale "waiting" left behind by a cancel or partial failure would make the
-    // downstream nodes permanently un-deletable until a full re-run.
-    if (useWorkflowStore.getState().executions[segmentId]?.status !== "running") return false;
-    // Output nodes are NEVER busy: deleting one mid-run only drops its deposit intent (the backend job
-    // runs on the upstream nodes + the dispatch-time graph snapshot), so they stay freely deletable —
-    // even while showing the blue "depositing" pulse. Only the upstream RENDER path locks.
-    if (nodesRef.current.find((n) => n.id === nodeId)?.type === "audioOutput") return false;
-    const st = useWorkflowStore.getState().nodeStatuses[segmentId]?.[nodeId];
-    return st === "running" || st === "waiting";
-  }, [segmentId]);
-
   const closeMenus = useCallback(() => { setNodeCtx(null); setEdgeCtx(null); }, []);
 
-  // An edge whose TARGET is an Output node is never a render-path edge — deleting it only changes what
-  // gets deposited, never the in-flight backend job — so it stays freely deletable even mid-run.
-  const isOutputEdge = useCallback((edge: { target: string }) =>
-    nodesRef.current.find((n) => n.id === edge.target)?.type === "audioOutput", []);
+  // An edge is render-locked ONLY when its CONSUMER (target) is queued/running in the live run — that
+  // input is what the run is (about to be) computing with, so cutting it would misrepresent the run.
+  // An edge OUT of a busy node into an idle/new node affects nothing that is running (the backend job
+  // works on the dispatch-time snapshot) and stays freely deletable — the old predicate locked on
+  // EITHER endpoint, which froze exactly the "rendering node → my freshly added node" wire the user
+  // wants to cut. Edges INTO an Output node are never locked (isNodeBusy is false for audioOutput by
+  // construction: deposit intent is not a render path).
+  const isEdgeRenderLocked = useCallback((edge: { target: string }) => isNodeBusy(edge.target), [isNodeBusy]);
+
+  // Edge affordance classes: a deletable wire lights up on hover (CSS .wf-edge-free:hover), a
+  // render-locked one gets a not-allowed cursor + dim. className is display-only (reactFlowToWorkflow
+  // never reads it). The lock VALUE is read through isEdgeRenderLocked — the same predicate the delete
+  // veto uses — so the visual and the behavior can never drift; segNodeStatuses/executionState are
+  // subscribed purely to re-fire this memo when the busy set changes.
+  const displayEdges = useMemo(
+    () => edges.map((e) => ({ ...e, className: isEdgeRenderLocked(e) ? "wf-edge-locked" : "wf-edge-free" })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- segNodeStatuses/executionState?.status are re-fire triggers (values read via getState inside the predicate)
+    [edges, segNodeStatuses, executionState?.status, isEdgeRenderLocked],
+  );
 
   const onNodeContextMenu: NodeMouseHandler = useCallback((event, node) => {
     event.preventDefault();
@@ -456,10 +475,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
 
   const onEdgeContextMenu: EdgeMouseHandler = useCallback((event, edge) => {
     event.preventDefault();
-    if (!isOutputEdge(edge) && (isNodeBusy(edge.source) || isNodeBusy(edge.target))) return; // lock render-path edges only; edges INTO an Output stay deletable
+    if (isEdgeRenderLocked(edge)) return; // only edges feeding a queued/running node are locked
     setNodeCtx(null);
     setEdgeCtx({ x: event.clientX, y: event.clientY, edgeId: edge.id });
-  }, [isNodeBusy, isOutputEdge]);
+  }, [isEdgeRenderLocked]);
 
   const handleDeleteNode = useCallback((nodeId: string) => {
     setNodes((nds) => nds.filter((n) => n.id !== nodeId));
@@ -476,17 +495,15 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   // (deletable:false) so ReactFlow filters them out before this runs; we only guard busy ones.
   const onBeforeDelete = useCallback(
     async ({ nodes: delNodes, edges: delEdges }: { nodes: Node[]; edges: Edge[] }) => {
-      // A node is locked while running/queued. An EDGE is locked if EITHER endpoint is — this covers
-      // both "delete the busy node (xyflow auto-adds its edges to delEdges)" AND "user right-clicks /
-      // selects just that edge". Locking the wires of the about-to-render path stops the graph being
-      // changed out from under the in-flight backend job (which runs on the dispatch-time snapshot).
+      // A node is locked while running/queued. An EDGE is locked only when its TARGET is (see
+      // isEdgeRenderLocked) — source-side edges into idle nodes stay deletable even mid-run.
       const allowedNodes = delNodes.filter((n) => !isNodeBusy(n.id));
       const deletedIds = new Set(allowedNodes.map((n) => n.id));
       // An edge MUST be removed if EITHER endpoint is being removed — never leave a dangling edge
       // (a deleted-source edge poisons parseWorkflowGraph → "contains a cycle" and bricks the graph).
-      // Otherwise it's the user deleting just the edge: allowed only if neither endpoint is busy.
+      // Otherwise it's the user deleting just the edge: allowed unless it feeds a queued/running node.
       const allowedEdges = delEdges.filter(
-        (e) => deletedIds.has(e.source) || deletedIds.has(e.target) || isOutputEdge(e) || (!isNodeBusy(e.source) && !isNodeBusy(e.target)),
+        (e) => deletedIds.has(e.source) || deletedIds.has(e.target) || !isEdgeRenderLocked(e),
       );
       if (allowedNodes.length === delNodes.length && allowedEdges.length === delEdges.length) {
         return { nodes: delNodes, edges: delEdges };
@@ -494,7 +511,7 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       if (allowedNodes.length === 0 && allowedEdges.length === 0) return false;
       return { nodes: allowedNodes, edges: allowedEdges };
     },
-    [isNodeBusy, isOutputEdge],
+    [isNodeBusy, isEdgeRenderLocked],
   );
 
   const nodeCtxItems: MenuItem[] = nodeCtx ? [
@@ -521,10 +538,15 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     if (!segment || !trackId) return;
     if (useWorkflowStore.getState().renderLinks[segmentId]) return; // linked half: its render is the source's
     const wf = reactFlowToWorkflow(nodes, edges);
-    // Barrier floor captured at DISPATCH so edits made DURING the async render stay undoable down to —
-    // but not past — this point.
-    const dispatchPastLen = hist.past.length;
     try {
+      // Busy gate FIRST — before the deposit invalidation below. When the run is rejected (voice drain
+      // drop, separation busy, double-run) NOTHING may have been touched yet: gating inside
+      // executeWorkflow (the old shape) ran AFTER the lanes were stripped, so a rejected run cost the
+      // track its deposits for nothing.
+      if (!(await preflightRun(segmentId, wf, null))) return;
+      // Barrier floor captured at DISPATCH so edits made DURING the async render stay undoable down to —
+      // but not past — this point (read after the gate, so drain-wait edits count as pre-dispatch).
+      const dispatchPastLen = hist.past.length;
       // The RECONCILER (running live during + after the run) owns the track lanes: at run start it places
       // loading placeholders for the connected Output lanes, then deposits each lane the moment its branch
       // finishes (executeWorkflow caches per node → the reconcile effect fires), and cleans the
@@ -563,8 +585,13 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
   }, [segmentId, segment, nodes, edges, hist]);
 
   const handleCancel = useCallback(() => {
-    useWorkflowStore.getState().cancelExecution(segmentId);
-    useWorkflowStore.getState().clearPendingStatuses(segmentId); // 立即清掉蓝/黄框（后端随后停止）
+    const wf = useWorkflowStore.getState();
+    if (wf.executions[segmentId]?.cancelled) return; // already cancelling — the backend stop is in flight
+    // Flag only — the execution SETTLES (and the badges clear) when the backend actually stops
+    // (engine catch → failExecution → clearPendingStatuses). Settling here made the UI claim
+    // "stopped" seconds early and the still-working node looked frozen (S62b); the button shows
+    // "Cancelling…" for the interim instead.
+    wf.cancelExecution(segmentId);
     invoke("cancel_separation").catch(() => {});
     // Voice invokes (run_rvc/run_sovits) are direct awaits — no polling loop ever re-checks
     // isCancelled mid-run, so the Rust-side flag is the only way to abort a long
@@ -602,9 +629,14 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
     // deposited lane they feed (including lanes of OTHER Output nodes fed by a re-run upstream, which a
     // clicked-node-only invalidation used to leave stale). Nodes reused from a dense cache keep their
     // old paths → their lanes are untouched.
-    executeSingleNode(segmentId, seg.seg, wf, nodeId).catch((err) => {
-      console.error("Single node execution failed:", err);
-    });
+    void (async () => {
+      // Same busy gate as the main Run (double-run guard matters most here: node Run buttons stay
+      // clickable while a full run is live — dispatching would clobber the live execution entry).
+      if (!(await preflightRun(segmentId, wf, nodeId))) return;
+      await executeSingleNode(segmentId, seg.seg, wf, nodeId).catch((err) => {
+        console.error("Single node execution failed:", err);
+      });
+    })();
   }, [segmentId]);
 
   // --- Output AUTO-DEPOSIT reconciler ----------------------------------------
@@ -655,12 +687,19 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
       // linked halves entirely. Reading the source's status lets the reconciler run NORMALLY on a linked
       // half: add placeholders for newly-connected lanes, keep the connected ones, prune the deleted ones.
       const wfNow = useWorkflowStore.getState();
-      const runActive = wfNow.executions[wfNow.renderLinks[segmentId] ?? segmentId]?.status === "running";
+      const activeExec = wfNow.executions[wfNow.renderLinks[segmentId] ?? segmentId];
+      const runActive = activeExec?.status === "running";
+      // The run's dispatch-time node roster (split halves share node ids with their source, so the
+      // source's roster answers for a linked half too). Placeholders key on MEMBERSHIP, not on the bare
+      // "some run is active": a lane whose feeder is NOT part of the running job will never be fed by it
+      // — showing "loading" for it (the old behavior) promised audio that the settle-prune then silently
+      // deleted, leaving a confusing empty lane.
+      const participants = new Set(activeExec?.participants ?? []);
 
       // Build the DESIRED on-track set for this node + the list of lanes needing a (re)decode.
       const target: ProcessedOutput[] = [];
       const toDecode: CachedPath[] = [];
-      for (const { laneId, laneLabel, group } of lanes) {
+      for (const { laneId, laneLabel, group, fromNode } of lanes) {
         const c = cached.get(laneId);
         const dep = deposited.get(laneId);
         if (c && (!dep || dep.audioPath !== c.audioPath)) {
@@ -670,12 +709,12 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
           // unchanged, or cold-cache persisted → KEEP (refresh the display label/group if changed — use
           // the STRUCTURAL label so a rename propagates even with a cold cache where c is undefined)
           target.push(laneLabel !== dep.laneLabel || group !== dep.group ? { ...dep, laneLabel, group } : dep);
-        } else if (runActive) {
-          // connected but its source hasn't rendered YET during a live run → loading placeholder so the
-          // user sees the lane "coming" (covers connecting a stem mid-run).
+        } else if (runActive && participants.has(fromNode)) {
+          // connected and its feeder IS part of the live run but hasn't rendered YET → loading
+          // placeholder so the user sees the lane "coming" (covers connecting a stem mid-run).
           target.push({ laneId, laneLabel, group, audioPath: `__pending_${laneId}`, totalDurationMs: 0, loading: true, outputNodeId });
         }
-        // else: uncached + idle → no lane (deposits once its source renders)
+        // else: uncached + idle (or fed by a node outside the active run) → no lane
       }
       const anyLoading = target.some((o) => o.loading);
       const sig = (arr: ProcessedOutput[]) =>
@@ -937,6 +976,13 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
             <span className="wf-run-btn running" title="Rendering — the source half owns this render; stop it there">
               Rendering…
             </span>
+          ) : isRunning && effExec?.cancelled ? (
+            // Cancel acknowledged, backend still winding down (the run settles when its in-flight
+            // invoke returns) — an explicit interim so the node doesn't read as frozen. Literal text
+            // to match the adjacent Run/Stop buttons (also literal).
+            <span className="wf-run-btn running" title="Stopping — waiting for the backend to finish its current step">
+              Cancelling…
+            </span>
           ) : isRunning ? (
             <button className="wf-run-btn running" onClick={handleCancel}>
               Stop
@@ -953,7 +999,7 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
         <div className="workflow-canvas">
           <ReactFlow
             nodes={nodes}
-            edges={edges}
+            edges={displayEdges}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
@@ -969,10 +1015,10 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
             nodeTypes={nodeTypes}
             fitView
             deleteKeyCode={activePane === "workflow" ? "Delete" : null}
-            defaultEdgeOptions={{
-              style: { stroke: "var(--accent-primary)", strokeWidth: 2 },
-              animated: true,
-            }}
+            // Edge stroke lives in WorkflowEditor.css (the single source): the old inline default style
+            // overrode the stylesheet for freshly-connected edges only (a new edge changed color after
+            // save/reload) — and an inline stroke also beats the :hover affordance.
+            defaultEdgeOptions={{ animated: true }}
             proOptions={{ hideAttribution: true }}
           >
             <Background

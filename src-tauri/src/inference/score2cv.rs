@@ -412,11 +412,11 @@ pub fn run_score2cv(
     let cv = outputs
         .into_iter()
         .next()
-        .ok_or_else(|| UtaiError::Inference("ScoreToCV 模型没有返回输出".into()))?;
+        .ok_or_else(|| UtaiError::Inference("SCORE2CV_NO_OUTPUT".into()))?;
     let t = chunk.t;
     if cv.len() != t * dim {
         return Err(UtaiError::Inference(format!(
-            "ScoreToCV 输出尺寸异常：期望 {}x{}={}，得到 {}",
+            "SCORE2CV_SHAPE: expected {}x{}={}, got {}",
             t,
             dim,
             t * dim,

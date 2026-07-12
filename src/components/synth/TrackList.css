@@ -5,7 +5,10 @@
 }
 
 .track-list-scroll {
-  will-change: transform;
+  /* NO will-change here (S62): permanently promoting the column to a compositor layer made Chromium
+     rasterize the text ONCE and then merely translate/resample that raster on every scroll — the
+     "header text turns blurry after scrolling" bug. Without the promotion the layer de-composites at
+     rest and the text re-rasterizes crisply on the pixel grid. */
   position: relative;
 }
 

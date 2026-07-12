@@ -6,7 +6,7 @@ import { useNodeParams } from "./useNodeParams";
 import { ParamSlider, formatRatio } from "./ParamSlider";
 import { VoiceModelPicker, SpeakerSelect, SpeakerBlend, useVoiceModelSelection, GpuExtractRow, VocoderSelect, VOICE_STRINGS } from "./VoiceModelPicker";
 import { SOVITS_DEFAULTS, DIFFUSION_METHODS, type SpkMixEntry } from "../../../lib/workflow/voiceDefaults";
-import { voiceHasDiffusion, voiceHasAutoF0, voiceHasRangeRecord, voiceHasSpkMix } from "../../../store/voice-models";
+import { voiceHasDiffusion, voiceHasAutoF0, voiceHasRangeRecord, voiceHasSpkMix, governingSpeakerId } from "../../../store/voice-models";
 import type { VoiceModelEntry } from "../../../store/voice-models";
 import { t18 } from "../../../lib/models/msst-catalog";
 
@@ -235,9 +235,10 @@ export function SoVitsNode(props: NodeProps) {
             </div>
             )}
 
-            {/* S60-2 音域扩展 — v1 recipe on the cover path. S60c: shown ONLY for a model with a
-                tested vocal_range record (an untested model's toggle is a confusing no-op §user). */}
-            {voiceHasRangeRecord(selected) && (
+            {/* S60-2 音域扩展 — v1 recipe on the cover path. S60c/S62c: shown ONLY when the
+                GOVERNING speaker (blend-aware) has a usable tested vocal_range record — an
+                untested model/speaker's toggle is a confusing no-op (§user, twice). */}
+            {voiceHasRangeRecord(selected, governingSpeakerId(speakerId, spkMix)) && (
             <div className="sep-param-row">
               <label title={t18({
                 zh: "超出模型舒适区的乐句先移调到舒适区推理，再在音频域移回（需先在资源管理器测过音域；区间内完全不受影响）",

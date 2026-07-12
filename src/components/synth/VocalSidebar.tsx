@@ -217,13 +217,14 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           />
         </div>
         {/* S60-2 音域扩展: v1 recipe (shift into the singer's tested comfort zone, TD-PSOLA back).
-            S60c: shown ONLY when the current singer carries a tested vocal_range record —
-            an untested model's toggle is a confusing no-op (§user). Default ON. */}
-        {voiceHasRangeRecord(selectedVoice) && (
+            S60c/S62c: shown ONLY when the track's SELECTED SPEAKER carries a usable tested
+            vocal_range record — an untested model/speaker's toggle is a confusing no-op
+            (§user, twice). Default OFF (S62c user decision — recolor tradeoff is opt-in). */}
+        {voiceHasRangeRecord(selectedVoice, vocalParams.speakerId ?? 0) && (
         <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.rangeExtend")}
-            checked={vocalParams.rangeExtend !== false}
+            checked={vocalParams.rangeExtend === true}
             onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
           />
         </div>

@@ -20,6 +20,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import i18n from "../../i18n";
+import { backendErrorMessage, isCancelError } from "../backendError";
 import type { Note, ProcessedOutput, Segment } from "../../types/project";
 import { blankTrack } from "../trackFactory";
 import { useProjectStore } from "../../store/project";
@@ -144,6 +145,10 @@ export function midiExtractErrorMessage(e: unknown): string {
   if (msg.includes("MIDI_EXTRACT_NOT_INSTALLED")) return t("midiExtract.errNotInstalled");
   if (msg.includes("MIDI_EXTRACT_TOO_SHORT")) return t("midiExtract.errTooShort");
   if (msg.includes("MIDI_EXTRACT_LOAD_FAILED")) return t("midiExtract.errLoad");
+  if (isCancelError(msg)) return t("midiExtract.cancelled"); // e.g. GAME_DL_FAILED: DOWNLOAD_CANCELLED
+  // App-wide codes riding inside wrappers (GAME_DL_FAILED: DOWNLOAD_* from the model downloader).
+  const shared = backendErrorMessage(msg);
+  if (shared) return `${t("midiExtract.errFailed")}: ${shared}`;
   return `${t("midiExtract.errFailed")}: ${msg}`;
 }
 

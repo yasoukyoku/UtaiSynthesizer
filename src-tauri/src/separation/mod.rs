@@ -125,9 +125,10 @@ impl SeparationManager {
     pub fn start(&self, config: SeparationConfig, engine: &OnnxEngine) -> Result<()> {
         let mut active = self.active.lock();
         if active.is_some() {
-            return Err(UtaiError::Audio(
-                "Separation already in progress".to_string(),
-            ));
+            // Stable CODE (i18n rule): the frontend pre-flights via get_separation_status before
+            // dispatching a run, so this is the TOCTOU backstop — engine.ts maps it to a localized
+            // toast/node error.
+            return Err(UtaiError::Audio("SEPARATION_BUSY".to_string()));
         }
 
         let mut model_path = PathBuf::from(&config.model_path);
@@ -157,8 +158,9 @@ impl SeparationManager {
         if has_onnx_config {
             self.start_native(&mut active, config, engine, &model_path)
         } else {
+            // CODE + detail suffix (i18n rule) — engine.ts localizes the text and appends the path.
             Err(UtaiError::Audio(format!(
-                "该模型尚未转换为 ONNX（缺 .onnx 或配套 .json）：{}。请先在模型管理中完成转换后再分离。",
+                "MSST_MODEL_NOT_CONVERTED: {}",
                 model_path.display()
             )))
         }

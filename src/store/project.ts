@@ -30,11 +30,13 @@ import { useAudioStore } from "./audio";
 
 /** Cancel any in-flight render for the given segment ids — used when a segment/track is DELETED, the only
  *  op besides the Stop button that should cancel a render (split/move/rename/etc. must NOT). The still-
- *  running engine loop polls isCancelled and then stops the (single, global) Rust separation; flipping the
- *  execution off 'running' also un-sticks the quit/busy warning that scans for running executions. The JS
- *  execution flip is per segment id; the cancel_voice invoke below is app-GLOBAL (same semantics as
- *  cancel_separation) — a concurrent voice render of ANOTHER segment would also abort. Accepted trade-off:
- *  voice invokes carry no job id, and the deleted segment's run must not keep burning GPU minutes. */
+ *  running engine loop polls isCancelled and then stops the (single, global) Rust separation; the
+ *  execution SETTLES (leaves 'running', un-sticking the quit/busy warning) when that loop obeys the
+ *  cancel — cancelExecution itself only flags it (S62b: an instant flip made the UI claim "stopped"
+ *  while the backend was still working). The JS flag is per segment id; the cancel_voice invoke below
+ *  is app-GLOBAL (same semantics as cancel_separation) — a concurrent voice render of ANOTHER segment
+ *  would also abort. Accepted trade-off: voice invokes carry no job id, and the deleted segment's run
+ *  must not keep burning GPU minutes. */
 function cancelRunningRenders(segmentIds: string[]) {
   const wf = useWorkflowStore.getState();
   let hadRunning = false;
@@ -932,10 +934,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       tracks: s.tracks.map((t) => {
         if (t.id !== trackId) return t;
         const vp = { ...(t.vocalParams ?? DEFAULT_VOCAL_PARAMS), ...updates };
-        // canonical write (sig↔serialize, S48 Phase 3): rangeExtend's default (ON) is stored
-        // as ABSENCE — an explicit `true` would false-dirty the close/autosave byte-compare
-        // without an undo step (vocalParamsSig folds it either way).
-        if (vp.rangeExtend === true) delete vp.rangeExtend;
+        // canonical write (sig↔serialize, S48 Phase 3): rangeExtend's default (OFF since S62c —
+        // extension is opt-in) is stored as ABSENCE — an explicit `false` would false-dirty the
+        // close/autosave byte-compare without an undo step (vocalParamsSig folds it either way).
+        if (vp.rangeExtend === false) delete vp.rangeExtend;
         return { ...t, vocalParams: vp };
       }),
     })),

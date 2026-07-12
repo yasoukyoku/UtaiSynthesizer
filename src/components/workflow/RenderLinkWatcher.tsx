@@ -3,7 +3,7 @@ import { useProjectStore } from "../../store/project";
 import { useWorkflowStore } from "../../store/workflow";
 import { useAudioStore } from "../../store/audio";
 import { useAppStore } from "../../store/app";
-import { depositFromCache } from "../../lib/workflow/engine";
+import { depositFromCache, hasUndepositedCache } from "../../lib/workflow/engine";
 import type { Workflow } from "../../types/project";
 
 /** Segments currently being headless-deposited (async decode) — guards against re-firing the deposit every
@@ -108,16 +108,23 @@ export function RenderLinkWatcher() {
     }
 
     // SETTLE pass for NON-linked segments (see the component doc): any settled execution whose segment
-    // still carries a loading lane, is not the open editor's segment, and is not a pending link target
-    // (handled above) gets a headless settle-deposit. depositFromCache's settle-only contract holds —
-    // the execution has settled — so cached branches land and dead placeholders are pruned. Repeat
-    // effect runs are cheap: once the lanes are settled the `.some(loading)` guard skips the segment,
-    // and headlessDeposit's in-flight set dedupes the decode window. Playback bumps via headlessDeposit
-    // itself (the deposit is async — bumping here would fire before any lane actually changed).
+    // still carries a loading lane OR whose render cache holds paths the track hasn't deposited, is not
+    // the open editor's segment, and is not a pending link target (handled above) gets a headless
+    // settle-deposit. The loading-lane check alone was NOT enough: a re-render of an already-deposited
+    // lane keeps the OLD lane in place (the reconciler's KEEP branch — non-loading), so closing the
+    // editor mid-re-render stranded the finished render in the cache while the track kept playing the
+    // previous version until the editor was reopened (the user's "new audio never lands" bug); the
+    // hasUndepositedCache path-inequality check (run-unique paths = the re-render signal) closes it.
+    // depositFromCache's settle-only contract holds — the execution has settled — so cached branches
+    // land and dead placeholders are pruned. Repeat effect runs are cheap: once deposited, both guards
+    // go quiet, and headlessDeposit's in-flight set dedupes the decode window. Playback bumps via
+    // headlessDeposit itself (the deposit is async — bumping here would fire before any lane changed).
     for (const [segId, exec] of Object.entries(executions)) {
       if (exec.status === "running" || segId === workflowSegmentId || renderLinks[segId]) continue;
       const loc = locate(segId);
-      if (!loc || !loc.seg.processedOutputs?.some((o) => o.loading)) continue;
+      if (!loc) continue;
+      const outs = loc.seg.processedOutputs;
+      if (!outs?.some((o) => o.loading) && !hasUndepositedCache(segId, loc.seg.workflow, outs)) continue;
       headlessDeposit(loc.trackId, segId, loc.seg.workflow);
     }
 

@@ -20,6 +20,7 @@ import {
   type MsstPrecision,
 } from "../../lib/models/msst-catalog";
 import { useDraggable } from "../../lib/useDraggable";
+import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
 import {
   useVoiceModelStore,
@@ -348,7 +349,8 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
         vocoderConfigPath: vocoderConfigPath || null,
       });
       for (const w of outcome?.warnings ?? []) {
-        useAppStore.getState().showToast(w, "info");
+        // Import warnings arrive as "WARN_X: detail" CODE strings — localize known ones.
+        useAppStore.getState().showToast(backendErrorMessage(w) ?? w, "info");
       }
       // S60-2: fresh import → background range test (default speaker; the record died with any
       // REPLACEd sidecar). Fire-and-forget — failures/busy toast from rangeTest itself.
@@ -358,7 +360,7 @@ function ImportDialog({ lang, voiceType, onClose, onDone }: ImportDialogProps) {
       onDone();
     } catch (e) {
       const msg = String(e);
-      setErr(auditionBusyMessage(msg, lang) ?? msg);
+      setErr(backendErrorMessage(msg) ?? msg);
     }
     setImporting(false);
   }, [modelPath, modelName, voiceType, indexPath, diffusionPath, diffusionConfigPath, avatarPath, vocoderConfigPath, onDone, lang]);
@@ -562,10 +564,11 @@ function GameEngineTab({ lang }: { lang: string }) {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes("GAME_DL_BUSY")) return; // another flight is running — its events drive the UI
+      if (isCancelError(msg)) return; // user cancelled the download — silent settle
       const base = msg.includes("GAME_DL_EXTRACT")
         ? t18({ zh: "解压安装失败", en: "Extraction failed", ja: "展開に失敗しました" }, lang)
         : t18({ zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" }, lang);
-      showToast(`${base}: ${msg}`, "error");
+      showToast(`${base}: ${backendErrorMessage(msg) ?? msg}`, "error");
     } finally {
       setBusy(false);
       setDl(null);
@@ -726,7 +729,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
 
   return (
     <div className="rm-voice-tab">
-      {voiceError && <div className="msst-error" onClick={clearError}>{auditionBusyMessage(voiceError, lang) ?? voiceError}</div>}
+      {voiceError && <div className="msst-error" onClick={clearError}>{backendErrorMessage(voiceError) ?? voiceError}</div>}
       <div className="msst-filter">
         <button className={voiceType === "rvc" ? "active" : ""} onClick={() => setVoiceType("rvc")}>RVC</button>
         <button className={voiceType === "sovits" ? "active" : ""} onClick={() => setVoiceType("sovits")}>SoVITS</button>
@@ -940,21 +943,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
 // through the shared preview singleton (contract: stop + assign onEnd on takeover, stop +
 // null onEnd on unmount — previewPlayer.ts header). ───
 
-/** Localize the shared render/training busy guards (pre-existing S41 Chinese guard strings +
- *  the S60 MODEL_BUSY_AUDITION code) — en/ja users must not see raw backend Chinese (audit). */
-function auditionBusyMessage(msg: string, lang: string): string | null {
-  const busy =
-    msg.includes("MODEL_BUSY_AUDITION") ||
-    msg.includes("试听渲染") ||
-    msg.includes("训练进行中") ||
-    msg.includes("翻唱渲染");
-  if (!busy) return null;
-  return t18({
-    zh: "有渲染/训练/试听任务占用，请稍后再试",
-    en: "A render/training/audition task is busy — try again later",
-    ja: "レンダリング/トレーニング/試聴タスクが実行中です。後でもう一度お試しください",
-  }, lang);
-}
+// The S41-era auditionBusyMessage (Chinese substring matchers for the busy guards) is GONE: the S62
+// sweep converted every Rust emitter to stable CODEs, so busy classification + localization now live
+// entirely in the app-wide mapper (backendErrorMessage / isBusyError — the single source).
 
 function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string }) {
   // shared audition state (audit S60): the preview player is a singleton — per-row local
@@ -1002,8 +993,12 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
       useVoiceModelStore.getState().setAuditionState({ name: m.name, phase: "playing", path });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      const busy = auditionBusyMessage(msg, lang);
-      showToast(busy ?? `${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${msg}`, busy ? "info" : "error");
+      const mapped = backendErrorMessage(msg);
+      const busy = isBusyError(msg);
+      showToast(
+        busy && mapped ? mapped : `${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${mapped ?? msg}`,
+        busy ? "info" : "error",
+      );
       if (useVoiceModelStore.getState().auditionState?.name === m.name) {
         useVoiceModelStore.getState().setAuditionState(null);
       }

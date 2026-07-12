@@ -164,11 +164,38 @@ export function voiceFeatureDim(m: VoiceModelEntry): number | null {
  * embedding row → silent garbage). RVC sidecars carry no map → single-speaker → no dropdown.
  * Options are sorted by id and labelled with the real speaker name.
  */
-/** S60c: the model carries at least one tested speaker range — gates the range-extend UI
- * (an untested model's toggle would be a confusing no-op; test it in the resource manager). */
-export function voiceHasRangeRecord(m: VoiceModelEntry | undefined | null): boolean {
-  const rec = (m?.config as { vocal_range?: { speakers?: Record<string, unknown> } } | undefined)?.vocal_range;
-  return !!rec?.speakers && Object.keys(rec.speakers).length > 0;
+/** Minimum comfort/usable span (semitones) a range record must offer to be applicable — a
+ *  degenerate zone becomes a centering target for everything (S60d: comfort=[42,42] →
+ *  whole-song -27 st renders). THE single TS source (rangeTest.ts re-exports it); mirrors
+ *  MIN_COMFORT_SPAN in src-tauri/src/inference/vocal_range.rs (read-side healing). */
+export const MIN_COMFORT_SPAN = 5;
+
+/** S60c/S62c: the model carries a USABLE tested range for the GOVERNING speaker — gates the
+ * range-extend UI. Per-SPEAKER (S62c user-caught: the old any-speaker check showed the toggle
+ * for untested speakers of a partially-tested model — Rust speaker_range never borrows another
+ * speaker's record, so that toggle was the exact confusing no-op the gate exists to prevent)
+ * and span-checked (mirrors the Rust read-side healing: usable narrower than MIN_COMFORT_SPAN
+ * reads as "no record"). */
+export function voiceHasRangeRecord(m: VoiceModelEntry | undefined | null, speakerId?: number | null): boolean {
+  const rec = (m?.config as { vocal_range?: { speakers?: Record<string, { usable?: unknown }> } } | undefined)?.vocal_range;
+  const sp = rec?.speakers?.[String(speakerId ?? 0)];
+  const u = sp?.usable;
+  if (!Array.isArray(u) || u.length < 2) return false;
+  const lo = Number(u[0]);
+  const hi = Number(u[1]);
+  return Number.isFinite(lo) && Number.isFinite(hi) && hi - lo >= MIN_COMFORT_SPAN;
+}
+
+/** The speaker whose range record governs a render: the max-weight blend entry when a genuine
+ *  spk_mix blend is set, else the plain speaker selection (mirrors Rust dominant_speaker). */
+export function governingSpeakerId(
+  speakerId: number | null | undefined,
+  spkMix: { id: number; weight: number }[] | undefined,
+): number {
+  if (spkMix && spkMix.length > 0) {
+    return spkMix.reduce((a, b) => (b.weight > a.weight ? b : a)).id;
+  }
+  return speakerId ?? 0;
 }
 
 export function voiceSpeakerOptions(m: VoiceModelEntry): { id: number; label: string }[] {

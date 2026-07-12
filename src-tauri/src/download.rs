@@ -78,7 +78,8 @@ pub fn client() -> Result<reqwest::Client> {
 /// Download `req` with resume + mirrors + verification. `progress(done, total)` is
 /// called with ABSOLUTE byte counts (total None until any server reports one).
 /// `cancel` is cooperative (checked between chunks); a cancelled download keeps its
-/// .part for a later resume and returns an error mentioning 取消.
+/// .part for a later resume and returns a DOWNLOAD_CANCELLED error (contains the
+/// "CANCELLED" sentinel — frontend isCancelError treats it as a user cancel).
 pub async fn download(
     client: &reqwest::Client,
     req: &DownloadRequest,
@@ -86,7 +87,7 @@ pub async fn download(
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<()> {
     if req.urls.is_empty() {
-        return Err(err("没有可用的下载源（URL 列表为空）"));
+        return Err(err("DOWNLOAD_NO_SOURCE: empty URL list"));
     }
     if let Some(parent) = req.dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -117,7 +118,7 @@ pub async fn download(
     'attempts: for round in 0..MIRROR_ROUNDS {
         for url in &req.urls {
             if cancel.load(Ordering::SeqCst) {
-                return Err(err("下载已取消（进度已保留，可续传）"));
+                return Err(err("DOWNLOAD_CANCELLED"));
             }
             match stream_one(client, url, &part, req, cancel, &mut progress).await {
                 Ok(()) => {
@@ -145,7 +146,7 @@ pub async fn download(
             // A corrupt part can never resume into a correct file — discard it.
             let _ = std::fs::remove_file(&part);
             return Err(err(format!(
-                "sha256 校验失败（期望 {want}，实际 {got}）——已删除损坏的下载缓存，请重试"
+                "DOWNLOAD_SHA256_MISMATCH: expected {want}, got {got}"
             )));
         }
     }
@@ -183,7 +184,7 @@ async fn stream_one(
     let resp = request
         .send()
         .await
-        .map_err(|e| err(format!("请求失败: {e}")))?;
+        .map_err(|e| err(format!("DOWNLOAD_REQUEST_FAILED: {e}")))?;
 
     let status = resp.status();
     let total: Option<u64> = match status.as_u16() {
@@ -214,7 +215,7 @@ async fn stream_one(
                 }
             }
             let _ = std::fs::remove_file(part);
-            return Err(err(format!("HTTP 416（续传范围无效，已清除缓存重试）: {url}")));
+            return Err(err(format!("DOWNLOAD_RANGE_INVALID: HTTP 416, cache cleared: {url}")));
         }
         _ => {
             return Err(err(format!("HTTP {status}: {url}")));
@@ -234,12 +235,12 @@ async fn stream_one(
     loop {
         if cancel.load(Ordering::SeqCst) {
             file.flush().await?;
-            return Err(err("下载已取消（进度已保留，可续传）"));
+            return Err(err("DOWNLOAD_CANCELLED"));
         }
         let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
-            Err(_) => return Err(err(format!("下载停滞超过 {}s: {url}", STALL_TIMEOUT.as_secs()))),
+            Err(_) => return Err(err(format!("DOWNLOAD_STALLED: no data for {}s: {url}", STALL_TIMEOUT.as_secs()))),
             Ok(None) => break,
-            Ok(Some(Err(e))) => return Err(err(format!("下载流中断: {e}"))),
+            Ok(Some(Err(e))) => return Err(err(format!("DOWNLOAD_STREAM_INTERRUPTED: {e}"))),
             Ok(Some(Ok(c))) => c,
         };
         file.write_all(&chunk).await?;
@@ -251,12 +252,12 @@ async fn stream_one(
     // Short body = treat as a failed attempt so the next mirror/round resumes it.
     if let Some(t) = total {
         if done < t {
-            return Err(err(format!("下载不完整（{done}/{t} 字节）: {url}")));
+            return Err(err(format!("DOWNLOAD_INCOMPLETE: {done}/{t} bytes: {url}")));
         }
         if done > t {
             // Over-long can never be right — poison, discard.
             let _ = std::fs::remove_file(part);
-            return Err(err(format!("下载超长（{done}/{t} 字节，已清除缓存）: {url}")));
+            return Err(err(format!("DOWNLOAD_OVERSIZE: {done}/{t} bytes, cache cleared: {url}")));
         }
     }
     Ok(())
@@ -313,12 +314,12 @@ pub async fn probe(url: &str) -> ProbeResult {
         .header(reqwest::header::RANGE, format!("bytes=0-{}", WANT - 1))
         .send();
     let resp = match tokio::time::timeout(TOTAL_DEADLINE, send_fut).await {
-        Err(_) => return unreachable("连接 / 响应超时（可能被网络干扰或源不可达）".to_string()),
+        Err(_) => return unreachable("PROBE_TIMEOUT".to_string()),
         Ok(Err(e)) => {
             let msg = if e.is_timeout() {
-                "连接超时（可能被网络干扰或源不可达）".to_string()
+                "PROBE_CONNECT_TIMEOUT".to_string()
             } else if e.is_connect() {
-                "无法建立连接（DNS / 网络 / 被阻断）".to_string()
+                "PROBE_CONNECT_FAILED".to_string()
             } else {
                 format!("{e}")
             };
@@ -335,7 +336,7 @@ pub async fn probe(url: &str) -> ProbeResult {
             ttfb_ms: t0.elapsed().as_millis() as u64,
             bytes: 0,
             http_status: Some(status.as_u16()),
-            error: Some(format!("HTTP {} —— 源上没有测试文件或拒绝访问", status.as_u16())),
+            error: Some(format!("PROBE_HTTP_ERROR: {}", status.as_u16())),
         };
     }
     let ttfb = t0.elapsed();

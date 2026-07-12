@@ -11,6 +11,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import i18n from "../i18n";
+import { backendErrorMessage, isBusyError } from "../lib/backendError";
 import { useAppStore } from "./app";
 
 export interface DatasetFile {
@@ -583,7 +584,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       useAppStore.getState().showToast(i18n.t("training.started"), "info");
       await get().refresh();
     } catch (e) {
-      useAppStore.getState().showToast(String(e), "error");
+      // Localize known backend CODEs (APP_BUSY: an audition/render holds the FlightGuard); the raw
+      // error still rethrows unchanged for any caller that inspects it.
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
       throw e;
     } finally {
       set({ starting: false });
@@ -614,7 +617,8 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       set({ snapshot: IDLE_SNAPSHOT, history: [], snapshotAt: Date.now() });
       return true;
     } catch (e) {
-      useAppStore.getState().showToast(String(e), "error");
+      // APP_BUSY: an audition/render holds the FlightGuard → info, real failures stay errors.
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
       return false;
     }
   },
@@ -672,7 +676,9 @@ export async function setupTrainingListeners() {
       } else if (e.payload.state === "stopped") {
         app.showToast(t("training.doneStopped"), "info");
       } else if (e.payload.state === "error") {
-        app.showToast(`${t("training.doneError")}: ${e.payload.error ?? ""}`, "error");
+        // snapshot.error carries the run_worker's stable CODE strings — localize known ones.
+        const err = e.payload.error ?? "";
+        app.showToast(`${t("training.doneError")}: ${backendErrorMessage(err) ?? err}`, "error");
       }
       // the final force-emitted step may have landed Rust-side only — resync once
       void useTrainingStore.getState().refresh();

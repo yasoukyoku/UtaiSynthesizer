@@ -136,7 +136,7 @@ pub async fn attach_diffusion(
     state
         .models
         .get(&name)
-        .ok_or_else(|| format!("找不到模型「{}」", name))
+        .ok_or_else(|| format!("MODEL_NOT_FOUND: {}", name))
 }
 
 #[tauri::command]
