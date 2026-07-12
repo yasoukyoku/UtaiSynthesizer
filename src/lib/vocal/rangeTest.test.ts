@@ -9,6 +9,7 @@ import {
   buildScaleScore,
   classifySemitones,
   deriveRanges,
+  deriveCautionZones,
   buildSpeakerRecord,
   clampComfort,
   effectiveComfort,
@@ -141,6 +142,37 @@ describe("comfort guards (S60d)", () => {
     expect(effectiveComfort(rec([42, 42], [42, 70]))).toEqual([42, 70]); // degenerate → auto
     expect(effectiveComfort(rec([42, 42], [50, 52]))).toEqual([42, 70]); // auto degenerate → usable
     expect(effectiveComfort(rec([45, 60], [42, 70]))).toEqual([45, 60]); // healthy stored value wins
+  });
+});
+
+describe("deriveCautionZones (S60d3 model-quirk chips)", () => {
+  it("finds 'sings confidently wrong' artifact runs near usable (風音サヨ shape)", () => {
+    // usable [42,70]; 71-73 voiced but 1223-2410¢ off; 74 at 187¢ (below the 200¢ bar);
+    // 80-82 the saturation ramp start (327-535¢, voiced); everything past 82 out of window
+    const semis: Record<string, [number, number]> = {};
+    for (let m = 36; m <= 96; m++) {
+      if (m >= 42 && m <= 70) semis[m] = [5, 1];
+      else if (m >= 71 && m <= 73) semis[m] = [1223 + (m - 71) * 590, 1];
+      else if (m === 74) semis[m] = [187, 0.75];
+      else if (m >= 75 && m <= 79) semis[m] = [9999, 0];
+      else semis[m] = [327 + (m - 80) * 100, 1];
+    }
+    const z = deriveCautionZones(semis, [42, 70]);
+    expect(z.artifact).toEqual([[71, 73], [80, 82]]); // window caps at usable[1]+12 = 82
+    expect(z.weak).toEqual([]);
+  });
+
+  it("finds in-usable bridged weak notes (lengv2.3 shape) and ignores single outside points", () => {
+    const semis: Record<string, [number, number]> = {};
+    for (let m = 36; m <= 96; m++) {
+      if (m === 57 || m === 61) semis[m] = [1180, 1]; // octave-flip points INSIDE usable
+      else if (m <= 77) semis[m] = [5, 1];
+      else if (m === 80) semis[m] = [3655, 0.75]; // isolated (81+ unvoiced) → no ≥2 run
+      else semis[m] = [9999, 0];
+    }
+    const z = deriveCautionZones(semis, [36, 77]);
+    expect(z.weak).toEqual([57, 61]);
+    expect(z.artifact).toEqual([]);
   });
 });
 

@@ -165,6 +165,53 @@ export function buildSpeakerRecord(stats: SemitoneStat[]): SpeakerRangeRecord | 
   };
 }
 
+export interface CautionZones {
+  /** Contiguous runs (≥2 st, within an octave of usable) where the model SINGS but lands
+   *  ≥200¢ off pitch — "confidently wrong" model artifacts (S60d: 風音サヨ 71–75 at
+   *  1223–2410¢ with full voicing). Labeled so a weird render reads as a model quirk,
+   *  not a program/algorithm bug. */
+  artifact: [number, number][];
+  /** Isolated weak notes INSIDE usable (failed the probe but bridged over when deriving
+   *  the range) — the exact "谨慎使用" notes. */
+  weak: number[];
+}
+
+/** Model-quirk annotation derived from the STORED per-semitone scan — no new measurement.
+ *  Takes the sidecar's raw `semitones` map (midi → [errCents, voicedRatio]). */
+export function deriveCautionZones(
+  semitones: Record<string, [number, number]>,
+  usable: [number, number],
+): CautionZones {
+  const stats: SemitoneStat[] = Object.entries(semitones)
+    .map(([k, v]) => ({ midi: Number(k), errCents: v[0], voicedRatio: v[1] }))
+    .sort((a, b) => a.midi - b.midi);
+  const weak = stats
+    .filter((s) => s.midi > usable[0] && s.midi < usable[1] && !isUsable(s))
+    .map((s) => s.midi);
+  // voiced but far off pitch, outside usable yet within an octave of it (past that
+  // everything fails anyway — the label stays musically relevant)
+  const singsWrong = (s: SemitoneStat) =>
+    s.voicedRatio > 0.5 &&
+    s.errCents >= 200 &&
+    s.errCents < 9999 &&
+    (s.midi < usable[0] || s.midi > usable[1]) &&
+    s.midi >= usable[0] - 12 &&
+    s.midi <= usable[1] + 12;
+  const artifact: [number, number][] = [];
+  let run: [number, number] | null = null;
+  for (const s of stats) {
+    if (!singsWrong(s)) continue;
+    if (run && s.midi === run[1] + 1) {
+      run[1] = s.midi;
+    } else {
+      if (run && run[1] > run[0]) artifact.push(run);
+      run = [s.midi, s.midi];
+    }
+  }
+  if (run && run[1] > run[0]) artifact.push(run);
+  return { artifact, weak };
+}
+
 /** MIDI → note name (C4 = 60) for the range labels. */
 export function midiName(midi: number): string {
   const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];

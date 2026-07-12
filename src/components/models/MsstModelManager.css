@@ -687,6 +687,12 @@
   color: var(--text-muted);
   opacity: 0.7;
 }
+/* model-quirk chips (artifact zones / in-range weak notes) — same warn family as
+   .rm-voice-item-warn; informational, not an error */
+.rm-range-caution {
+  color: var(--accent-warning, #c88a2b);
+  cursor: help;
+}
 .rm-range-btn {
   padding: 0 var(--space-sm);
   font-size: var(--font-size-xs);
