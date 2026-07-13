@@ -5370,7 +5370,7 @@ dependencies = [
 
 [[package]]
 name = "utai"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "encoding_rs",
  "futures-util",

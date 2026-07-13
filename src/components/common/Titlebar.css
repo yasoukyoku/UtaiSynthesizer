@@ -125,10 +125,3 @@
   border-color: var(--accent-primary-dim);
   background: var(--accent-primary-glow);
 }
-
-/* S64 help "?" — icon variant of .menu-item, tail of the app menus (S64b: next to the training
-   button it read as training-specific help). Flex centers the SVG on the text baseline row. */
-.titlebar-help {
-  display: flex;
-  align-items: center;
-}
