@@ -1359,7 +1359,7 @@ NVIDIA ユーザー向けの推論高速化ランタイムです（約 1.6 GB、
 
 質問・アイデア・作品の披露、いつでも歓迎です。ここで会いましょう：
 
-- **QQ グループ**：グループ番号 `1058227212`、[ここから参加](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
+- **QQ グループ**：[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
 - **Discord**：<https://discord.com/invite/p3fGh942fJ>
 - **GitHub リポジトリ**：<https://github.com/yasoukyoku/UtaiSynthesizer> —— バグ報告は [Issue](https://github.com/yasoukyoku/UtaiSynthesizer/issues) へ。バージョン番号・再現手順・ログを添えてください（第 13 章参照）
 - **最新版のダウンロード**：<https://github.com/yasoukyoku/UtaiSynthesizer/releases>
