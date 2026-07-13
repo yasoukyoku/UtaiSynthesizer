@@ -7,7 +7,7 @@
 // the Rust render layer (inference/vocal_range.rs) for the three-tier shift.
 //
 // v1 criteria (session20, verbatim): usable = median |err| < 100¢ AND voiced > 50%;
-// comfort = median |err| < 50¢ AND voiced > 80%. Sweep = every semitone C2..C8 (MIDI 36-96),
+// comfort = median |err| < 50¢ AND voiced > 80%. Sweep = every semitone C2..C7 (MIDI 36-96),
 // 1/16 @ 120 bpm (= 6 frames @ 50 fps) 「あ」 notes with equal rests between. Ranges are the
 // longest CONTIGUOUS runs (comfort within usable). v1's numbers are per-model — never reuse.
 

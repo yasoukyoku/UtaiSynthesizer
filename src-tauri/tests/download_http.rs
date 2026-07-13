@@ -140,7 +140,11 @@ fn downloader_full_resume_sha_and_mirrors() {
         expected_size: Some(payload.len() as u64),
     })
     .unwrap_err();
-    assert!(err.to_string().contains("sha256"), "unexpected error: {err}");
+    // The backend emits the stable CODE (S62 i18n discipline) — assert on it, not on prose.
+    assert!(
+        err.to_string().contains("DOWNLOAD_SHA256_MISMATCH"),
+        "unexpected error: {err}"
+    );
     assert!(!dest3.exists(), "dest must not exist after sha failure");
     assert!(
         !utai_lib::download::part_path(&dest3).exists(),

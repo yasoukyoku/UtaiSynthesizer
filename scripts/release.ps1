@@ -61,8 +61,11 @@ Write-Host "gate: tsc" -ForegroundColor Cyan
 npx tsc -b; if ($LASTEXITCODE -ne 0) { Fail "tsc" }
 Write-Host "gate: vitest" -ForegroundColor Cyan
 npx vitest run; if ($LASTEXITCODE -ne 0) { Fail "vitest" }
-Write-Host "gate: cargo test --lib" -ForegroundColor Cyan
-Push-Location src-tauri; cargo test --lib; $rc = $LASTEXITCODE; Pop-Location
+# Full suite (unit + tests/), not --lib: the integration tests (downloader E2E, parity
+# gates, ...) are exactly where cross-module regressions hide — --lib let a red
+# download_http.rs slip through four releases (caught 2026-07-13).
+Write-Host "gate: cargo test" -ForegroundColor Cyan
+Push-Location src-tauri; cargo test; $rc = $LASTEXITCODE; Pop-Location
 if ($rc -ne 0) { Fail "cargo test" }
 
 # ── 6. build (signed) ── (the CLI wants TAURI_SIGNING_PRIVATE_KEY — content works everywhere,

@@ -1,0 +1,23 @@
+name: "\U0001F4A1 Feature request / 功能建议"
+description: New idea or improvement / 想要的新功能或改进
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve? / 想解决什么问题?
+      description: 描述场景,而不只是方案 / Describe the scenario, not only the solution
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 期望的行为
+      placeholder: 例如:希望钢琴卷帘里能……
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives / 现在如何绕过
+      description: 目前你是怎么凑合的?(可选) / How do you work around it today? (optional)

@@ -27,7 +27,7 @@ function stat(midi: number, errCents: number, voicedRatio: number): SemitoneStat
 }
 
 describe("buildScaleScore", () => {
-  it("covers C2..C8 with contiguous frames and aligned 100fps spans", () => {
+  it("covers C2..C7 with contiguous frames and aligned 100fps spans", () => {
     const { triples, spans } = buildScaleScore();
     expect(spans.length).toBe(RANGE_MIDI_HI - RANGE_MIDI_LO + 1);
     // triples tile the timeline: Σframes*2 == the last span end + trailing rest

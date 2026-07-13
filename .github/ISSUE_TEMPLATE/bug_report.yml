@@ -1,0 +1,59 @@
+name: "\U0001F41B Bug report / 缺陷反馈"
+description: Something broke / 功能异常、崩溃、渲染错误等
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈!请尽量填写以下信息,方便我们复现。/ Thanks for the report — the more detail, the faster the fix.
+        提交前请先看看是否已有相同 issue。/ Please search existing issues first.
+  - type: input
+    id: version
+    attributes:
+      label: App version / 版本
+      description: 设置 → 版本与更新 → 当前版本 (Settings → Version & Updates)
+      placeholder: "0.1.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install type / 安装方式
+      options:
+        - Installer (setup.exe)
+        - Portable copy / 拷贝的安装目录
+        - Built from source / 源码构建
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU / 显卡
+      description: 设置 → 硬件 里显示的显卡与 CUDA/DirectML 可用性 (Settings → Hardware)
+      placeholder: "NVIDIA RTX 3060, CUDA 可用"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: 一步一步描述怎么触发 / Step-by-step description
+      placeholder: |
+        1. 导入音频 …
+        2. 双击片段打开工作流 …
+        3. 点 Run …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual / 预期与实际
+      placeholder: 预期分离出人声;实际报错「…」
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / 日志
+      description: |
+        顶栏「日志」页可直接查看;日志文件在 `%LOCALAPPDATA%\com.utaisynthesizer.app\logs`。
+        Paste the relevant lines from the in-app Log page or the log files.
+      render: text

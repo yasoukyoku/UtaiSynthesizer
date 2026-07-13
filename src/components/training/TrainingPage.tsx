@@ -1559,7 +1559,7 @@ function RunStep() {
   }, [finished]);
 
   // ── S60c: post-training auto range test (§user) — every rvc/sovits checkpoint gets the
-  // C2–C8 scale test (~1-2 s each) so ① its audition pre-shifts a low-range singer into
+  // C2–C7 scale test (~1-2 s each) so ① its audition pre-shifts a low-range singer into
   // comfort (the bundled clip skews high — an untested low singer sounds "training failed")
   // and ② the row shows the singer's range. Once per finished run (ref-guarded), sequential
   // (the Rust audition FlightGuard is single-flight anyway); failures skip silently — the
