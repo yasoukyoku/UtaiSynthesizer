@@ -82,3 +82,6 @@ src-tauri/gen/
 
 # S64 release: pinned ffmpeg essentials build for bundling (downloaded by scripts, not committed)
 bin/
+
+# machine-local runtime config (device preference / data dir / cuda mem limit)
+/config.json
