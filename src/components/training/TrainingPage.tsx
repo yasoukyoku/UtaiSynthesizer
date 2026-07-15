@@ -910,8 +910,8 @@ function NumberField({
 function ParamsStep() {
   const { t } = useTranslation();
   const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
-  const [gpus, setGpus] = useState<string[]>([]);
-  const [cudaOk, setCudaOk] = useState(true);
+  const [gpus, setGpus] = useState<{ label: string; value: string }[]>([]);
+  const [gpuOk, setGpuOk] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   // diff inherits 数据增强份数 from the host workspace manifest — show the
   // REAL inherited value (store diffWsInfo, fetched by the root effect)
@@ -921,19 +921,25 @@ function ParamsStep() {
   useEffect(() => {
     void (async () => {
       try {
-        const hw = await invoke<{ gpu_name: string; cuda_available: boolean }>(
+        // S67: the dropdown consumes training_gpus (accelerator-native identities:
+        // NVIDIA UUID / vendor index) — NEVER the display string's WMI positions,
+        // which silently CPU'd multi-adapter boxes via a wrong visibility mask.
+        // "No trainable GPU" now means no NVIDIA/AMD/Intel adapter at all, instead
+        // of the old cuda_available (an INFERENCE-runtime probe that wrongly forced
+        // AMD/Intel — and NVIDIA-without-CUDA-download — boxes to CPU training).
+        const hw = await invoke<{ training_gpus: { label: string; value: string }[] }>(
           "get_hardware_info",
         );
-        setGpus(
-          hw.gpu_name
-            .split(",")
-            .map((g) => g.trim())
-            .filter(Boolean),
-        );
-        setCudaOk(hw.cuda_available);
-        if (!hw.cuda_available) {
+        const list = hw.training_gpus ?? [];
+        setGpus(list);
+        setGpuOk(list.length > 0);
+        const cur = useTrainingStore.getState().config.gpu;
+        if (list.length === 0) {
           // keep the PAYLOAD truthful, not just the checkbox display
           useTrainingStore.getState().updateConfig({ forceCpu: true });
+        } else if (!list.some((g) => g.value === cur)) {
+          // heal "" (fresh session) and stale identities: first entry = primary GPU
+          useTrainingStore.getState().updateConfig({ gpu: list[0]!.value });
         }
       } catch {
         setGpus([]);
@@ -950,13 +956,13 @@ function ParamsStep() {
       <label>{t("training.gpu")}</label>
       <Dropdown
         value={config.gpu}
-        options={gpus.map((g, i) => ({ value: i, label: g }))}
+        options={gpus.map((g) => ({ value: g.value, label: g.label }))}
         onChange={(v) => updateConfig({ gpu: v })}
       />
     </div>
   );
 
-  const forceCpuRow = cudaOk && (
+  const forceCpuRow = gpuOk && (
     <label className="training-check-row">
       <input
         type="checkbox"
@@ -1481,9 +1487,14 @@ function RunStep() {
     backendSupportsMultiSpeaker(snapshot.backend) && (snapshot.speakers?.length ?? 0) > 1
       ? snapshot.speakers!.map((name, i) => ({ id: i, name: name.trim() || `#${i}` }))
       : [];
-  const auditionBusy = Object.values(auditionState).some(
-    (s) => s === "converting" || s === "rendering",
-  );
+  // S67: the auto range battery holds this for its WHOLE duration — the old code's
+  // stuck-busy accidentally blocked clicks between candidates, and un-sticking it
+  // (terminal events) opened interleave windows (a user 试听 in a gap stole the
+  // FlightGuard from the probe AND the probe's busy-skip then wiped the user's row).
+  const [rangeTesting, setRangeTesting] = useState(false);
+  const auditionBusy =
+    rangeTesting ||
+    Object.values(auditionState).some((s) => s === "converting" || s === "rendering");
 
   // stale-resolution fence (审查修复 FE-3/FE-5/AUD-HOST-SWITCH-STALE): every
   // context change that invalidates in-flight results bumps the epoch; a
@@ -1543,34 +1554,83 @@ function RunStep() {
   // and ② the row shows the singer's range. Once per finished run (ref-guarded), sequential
   // (the Rust audition FlightGuard is single-flight anyway); failures skip silently — the
   // audition still works without a record.
+  // S67: the dep is the STRING key, not the snapshot.ckpts array — every status
+  // refresh rebuilds the snapshot arrays, and an identity-keyed rerun used to
+  // alive=false this loop right after candidate #1 (the runKey ref then blocked a
+  // restart, so candidates 2+ never got a range record).
+  const rangeRunKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
   useEffect(() => {
     if (!finished || snapshot.ckpts.length === 0) return;
     if (snapshot.backend !== "rvc" && snapshot.backend !== "sovits") return;
-    const runKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
-    if (candRangeRunRef.current === runKey) return;
-    candRangeRunRef.current = runKey;
+    if (candRangeRunRef.current === rangeRunKey) return;
+    candRangeRunRef.current = rangeRunKey;
+    const ckpts = snapshot.ckpts;
     let alive = true;
     void (async () => {
-      for (const c of snapshot.ckpts) {
-        if (!alive) return;
-        try {
-          const r = await runCandidateRangeTest(
-            snapshot.workspace,
-            snapshot.backend as "rvc" | "sovits",
-            c.path,
-            c.path,
-          );
-          if (alive && r) setCandRanges((s) => ({ ...s, [c.path]: r }));
-        } catch {
-          /* busy (user auditioning) or a broken ckpt — skip; retest happens on the next run */
+      // hold auditionBusy for the WHOLE battery — the inter-candidate gaps must not
+      // invite clicks (a user render would steal the probe's FlightGuard, and a
+      // busy-skipped probe wiping the user's busy row was review finding S67-1)
+      setRangeTesting(true);
+      try {
+        for (const c of ckpts) {
+          if (!alive) return;
+          // persisted-record short-circuit: a candidate tested in a previous mount
+          // keeps its sidecar record — restore the label instead of re-running the
+          // whole battery (and re-freezing the buttons) on every page open
+          try {
+            const rec = await invoke<{
+              speakers?: Record<string, { usable: [number, number]; comfort: [number, number] }>;
+            } | null>("get_candidate_vocal_range", {
+              workspace: snapshot.workspace,
+              ckptPath: c.path,
+            });
+            const sp = rec?.speakers?.["0"];
+            if (sp) {
+              if (alive) {
+                setCandRanges((s) => ({ ...s, [c.path]: { usable: sp.usable, comfort: sp.comfort } }));
+              }
+              continue;
+            }
+          } catch {
+            /* unreadable sidecar — fall through to a fresh test */
+          }
+          let busySkip = false;
+          try {
+            const r = await runCandidateRangeTest(
+              snapshot.workspace,
+              snapshot.backend as "rvc" | "sovits",
+              c.path,
+              c.path,
+            );
+            if (alive && r) setCandRanges((s) => ({ ...s, [c.path]: r }));
+          } catch (e) {
+            // busy (a voice render elsewhere holds the guard) or a broken ckpt — skip;
+            // an untested candidate has no sidecar record, so the next mount retests it
+            busySkip = isBusyError(e);
+          } finally {
+            // belt-and-braces vs a dropped terminal event (S67): the probe render must
+            // never leave its row stranded busy — but a BUSY rejection means the probe
+            // never emitted anything, so a busy phase on that row belongs to a REAL
+            // audition and must survive
+            if (!busySkip) {
+              setAuditionState((s) => {
+                if (s[c.path] !== "converting" && s[c.path] !== "rendering") return s;
+                const n = { ...s };
+                delete n[c.path];
+                return n;
+              });
+            }
+          }
         }
+      } finally {
+        setRangeTesting(false);
       }
     })();
     return () => {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [finished, snapshot.ckpts, snapshot.backend, snapshot.workspace]);
+  }, [finished, rangeRunKey, snapshot.backend]);
 
   // archive policies prune files the snapshot still lists (diff periodics,
   // red-team F16) — grey those rows instead of offering dead buttons
@@ -1607,9 +1667,17 @@ function RunStep() {
           // terminal events are the busy-state ground truth (审查修复 FE-1):
           // the invoke resolution may belong to a dead component instance
           if (wav) setAuditionWavs((s) => ({ ...s, [candidate_id]: wav }));
-          setAuditionState((s) =>
-            s[candidate_id] === "playing" ? s : { ...s, [candidate_id]: "ready" },
-          );
+          setAuditionState((s) => {
+            if (s[candidate_id] === "playing") return s;
+            // S67: a wav-less done is the range-test scale finishing — that row has
+            // nothing to play, so it returns to idle instead of a cache-less ▶
+            if (!wav) {
+              const n = { ...s };
+              delete n[candidate_id];
+              return n;
+            }
+            return { ...s, [candidate_id]: "ready" };
+          });
         } else if (phase === "error") {
           setAuditionState((s) => {
             const n = { ...s };

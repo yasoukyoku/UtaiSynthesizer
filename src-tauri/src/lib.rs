@@ -588,7 +588,11 @@ pub fn run() {
     let log_dir = logging::get_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "utai.log");
+    // S67: the offset is captured once and drives BOTH the per-line timestamps and
+    // the daily file roll (LocalDailyFile — tracing-appender's own rolling::daily is
+    // hardwired to UTC dates/boundaries). UTC is the honest fallback.
+    let tz_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let file_appender = logging::LocalDailyFile::new(log_dir.clone(), "utai.log", tz_offset);
     let (non_blocking, _file_guard) = tracing_appender::non_blocking(file_appender);
 
     let log_buffer = Arc::new(logging::LogBuffer::new(2000));
@@ -606,24 +610,40 @@ pub fn run() {
     let file_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "warn,utai=debug".into());
 
+    // S67: file/stdout timestamps in LOCAL time with the UTC offset printed on every
+    // line — users could never match the log PANEL's local times against the file's
+    // old UTC-Z lines. Fixed 6-digit micros keep the old line width. NOTE: the
+    // panel's own timestamps (logging.rs BufferLayer, GetLocalTime + lexicographic
+    // `since`) are untouched. File names/roll boundaries follow the same offset via
+    // LocalDailyFile above.
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
+        tz_offset,
+        time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6][offset_hour sign:mandatory]:[offset_minute]"
+        ),
+    );
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
+                .with_timer(timer.clone())
                 .with_filter(env_filter),
         )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
                 .with_ansi(false)
+                .with_timer(timer)
                 .with_filter(file_filter),
         )
         .with(logging::BufferLayer::new(Arc::clone(&log_buffer)))
         .init();
 
     tracing::info!(
-        "UtaiSynthesizer {} starting — logs: {}",
+        "UtaiSynthesizer {} starting — logs: {} (timestamps local, UTC{})",
         env!("CARGO_PKG_VERSION"),
-        log_dir.display()
+        log_dir.display(),
+        tz_offset
     );
 
     let app_dir_early = resolve_app_dir();
@@ -833,6 +853,7 @@ pub fn run() {
             commands::audition::render_model_audition,
             commands::audition::render_candidate_scale,
             commands::audition::set_candidate_vocal_range,
+            commands::audition::get_candidate_vocal_range,
             commands::audition::render_audition_voice,
             commands::audition::render_audition_vocoder,
             commands::audition::render_audition_diffusion,
@@ -874,6 +895,7 @@ pub fn run() {
             commands::logs::get_logs_since,
             commands::logs::log_message,
             commands::logs::get_log_file_path,
+            commands::logs::open_log_dir,
             commands::settings::get_hardware_info,
             commands::settings::set_device_preference,
             commands::settings::get_device_preference,

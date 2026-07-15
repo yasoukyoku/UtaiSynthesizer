@@ -20,6 +20,10 @@ pub struct HardwareInfo {
     /// Largest NVIDIA card's total VRAM in MB (nvidia-smi truth — NOT the lying WMI
     /// AdapterRAM), None = undetermined / no NVIDIA. Feeds the GPU-特征提取 gate (S66).
     pub nvidia_vram_mb: Option<u64>,
+    /// The TRAINING device dropdown's list — values live in the accelerator's OWN
+    /// namespace (NVIDIA UUID / vendor-relative index), never a WMI position. Empty
+    /// = no trainable GPU on this box (the UI forces CPU). See training_gpu_list.
+    pub training_gpus: Vec<TrainingGpu>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -27,6 +31,16 @@ pub struct GpuAdapter {
     pub name: String,
     /// "nvidia" | "amd" | "intel" | "other"
     pub vendor: String,
+}
+
+/// One trainable GPU as the training-device dropdown offers it. `value` is what
+/// run.json "gpu" carries into device.py's visibility env var.
+#[derive(serde::Serialize, Clone)]
+pub struct TrainingGpu {
+    pub label: String,
+    /// NVIDIA: the nvidia-smi UUID ("GPU-…" — CUDA_VISIBLE_DEVICES accepts it, exact
+    /// identity, immune to enumeration-order drift). Fallbacks: vendor-relative index.
+    pub value: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -83,8 +97,77 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         } else {
             None
         },
+        training_gpus: training_gpu_list(&gpus),
         gpus,
     })
+}
+
+/// GPU list for the TRAINING device dropdown — values in the ACCELERATOR'S OWN ordinal
+/// space, not WMI's. S67 (community bug): the dropdown used to store the raw
+/// Win32_VideoController index, which device.py fed to CUDA_VISIBLE_DEVICES verbatim; on
+/// an iGPU+NVIDIA box the NVIDIA card sits at WMI index 1 but CUDA ordinal 0, so
+/// SELECTING the correct card masked every GPU and torch silently trained on CPU.
+/// NVIDIA boxes get nvidia-smi UUIDs (exact identity); the fallbacks (nvidia-smi absent,
+/// AMD/HIP, Intel/ZE_AFFINITY_MASK) keep vendor-relative indices — exact for the
+/// dominant single-card case, and the sidecar's require_wanted_accelerator guard turns
+/// any remaining mismatch into a loud TRAIN_GPU_UNAVAILABLE instead of silent CPU.
+fn training_gpu_list(gpus: &[GpuAdapter]) -> Vec<TrainingGpu> {
+    let vendor_indexed = |vendor: &str| -> Vec<TrainingGpu> {
+        gpus.iter()
+            .filter(|g| g.vendor == vendor)
+            .enumerate()
+            .map(|(i, g)| TrainingGpu { label: g.name.clone(), value: i.to_string() })
+            .collect()
+    };
+    if gpus.iter().any(|g| g.vendor == "nvidia") {
+        let smi = nvidia_gpu_uuids();
+        if !smi.is_empty() {
+            return smi;
+        }
+        return vendor_indexed("nvidia");
+    }
+    if gpus.iter().any(|g| g.vendor == "amd") {
+        return vendor_indexed("amd");
+    }
+    if gpus.iter().any(|g| g.vendor == "intel") {
+        return vendor_indexed("intel");
+    }
+    Vec::new()
+}
+
+/// NVIDIA cards as (name, UUID) via nvidia-smi — the only enumeration whose identity
+/// CUDA itself understands. Empty on any failure (no smi / no driver): callers fall
+/// back to vendor-relative indices.
+#[cfg(windows)]
+fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
+    use std::os::windows::process::CommandExt;
+    let out = match std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,uuid", "--format=csv,noheader"])
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| {
+            // "NVIDIA GeForce RTX 3080 Ti, GPU-8a2c…" — rsplit so a comma INSIDE the
+            // name can't shear the row; a non-UUID tail drops the row instead of
+            // feeding CUDA a garbage mask
+            let (name, uuid) = l.rsplit_once(',')?;
+            let uuid = uuid.trim();
+            if !uuid.starts_with("GPU-") {
+                return None;
+            }
+            Some(TrainingGpu { label: name.trim().to_string(), value: uuid.to_string() })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
+    Vec::new()
 }
 
 /// Default runtime-pack variant for this machine. NVIDIA wins over everything (the

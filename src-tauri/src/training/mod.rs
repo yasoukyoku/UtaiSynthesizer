@@ -258,8 +258,14 @@ pub struct StartTrainingRequest {
     pub cache_gpu: bool,
     #[serde(default = "d_true")]
     pub fp16: bool,
+    /// Device identity in the ACCELERATOR'S own namespace, straight from
+    /// get_hardware_info.training_gpus: an NVIDIA UUID ("GPU-…", what
+    /// CUDA_VISIBLE_DEVICES actually accepts) or a vendor-relative index.
+    /// "" = auto (leave visibility unset → torch's own default device). S67:
+    /// this was a raw WMI adapter index — on an iGPU+NVIDIA box, SELECTING the
+    /// NVIDIA card masked every GPU and training fell back to CPU silently.
     #[serde(default)]
-    pub gpu: u32,
+    pub gpu: String,
     #[serde(default)]
     pub force_cpu: bool,
     #[serde(default)]
@@ -1532,8 +1538,10 @@ fn run_worker(
         "freeze_mpd": req.freeze_mpd,
         "seed": SEED,
         // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
-        // visible) — CPU mode must be the explicit sentinel "-1"
-        "gpu": if req.force_cpu { "-1".to_string() } else { req.gpu.to_string() },
+        // visible) — CPU mode must be the explicit sentinel "-1". Otherwise the
+        // value is the accelerator-native identity (NVIDIA UUID / vendor index)
+        // from training_gpus; "" = auto (setup_visibility leaves it unset).
+        "gpu": if req.force_cpu { "-1".to_string() } else { req.gpu.clone() },
         // device.py's shim reads this BEFORE torch import (visibility) and to pick
         // autocast/scaler. Sourced from the resolved interpreter: dev venv → the box's
         // GPU (cuda) or force_cpu; installed pack → its variant (nv-cu130/amd->cuda,

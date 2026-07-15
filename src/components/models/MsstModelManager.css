@@ -1,9 +1,8 @@
 .msst-model-manager {
   position: fixed;
-  width: 440px;
-  height: 72vh;
+  /* size is state-driven (useFloatingPanel inline style, S67 resizable panels) */
+  min-width: 380px;
   min-height: 320px;
-  max-height: 86vh;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);

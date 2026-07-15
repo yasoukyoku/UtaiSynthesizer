@@ -20,7 +20,8 @@ import {
   type MsstCategory,
   type MsstPrecision,
 } from "../../lib/models/msst-catalog";
-import { useDraggable } from "../../lib/useDraggable";
+import { useFloatingPanel } from "../../lib/useFloatingPanel";
+import { PanelResizeHandles } from "../common/PanelResizeHandles";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
 import {
@@ -50,7 +51,12 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
     clearError, deleteModel, downloadEntry, convertPrecision,
   } = useMsstModelStore();
 
-  const { pos, startDrag } = useDraggable(() => ({ x: 100, y: 96 }));
+  const { style: panelStyle, startDrag, startResize } = useFloatingPanel({
+    storageKey: "utai.msstManagerRect",
+    initial: () => ({ x: 100, y: 96, w: 440, h: Math.round(window.innerHeight * 0.72) }),
+    minW: 380,
+    minH: 320,
+  });
 
   const [topTab, setTopTab] = useState<TopTab>("separation");
   const [category, setCategory] = useState<MsstCategory>("vocals");
@@ -86,11 +92,12 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
   const handleDelete = useCallback(async (filename: string) => { await deleteModel(filename); setConfirmDelete(null); }, [deleteModel]);
 
   return (
-    <aside className="msst-model-manager" style={{ left: pos.x, top: pos.y }}>
+    <aside className="msst-model-manager" style={panelStyle}>
       <div className="panel-header" onMouseDown={startDrag}>
         <span className="panel-title">{lang === "zh" ? "资源管理" : lang === "ja" ? "リソース管理" : "Resource Manager"}</span>
         <button className="panel-close" onClick={onClose}>X</button>
       </div>
+      <PanelResizeHandles start={startResize} />
 
       {error && <div className="msst-error" onClick={clearError}>{backendErrorMessage(error) ?? error}</div>}
 

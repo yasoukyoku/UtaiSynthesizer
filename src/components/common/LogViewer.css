@@ -1,9 +1,9 @@
 .log-viewer {
   position: fixed;
-  width: 480px;
-  height: 60vh;
+  /* size is state-driven (useFloatingPanel inline style, S67 resizable panels);
+     these are only the no-JS fallbacks matching the hook's minima */
+  min-width: 360px;
   min-height: 240px;
-  max-height: 82vh;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
@@ -79,7 +79,8 @@
   overflow-y: auto;
   overflow-x: hidden;
   font-family: var(--font-mono);
-  font-size: 11px;
+  /* base only — the panel drives the real size inline (A-/A+, persisted, S67) */
+  font-size: 12px;
   line-height: 1.5;
   padding: var(--space-xs) 0;
 }
@@ -98,13 +99,15 @@
 .log-time {
   color: var(--text-muted);
   flex-shrink: 0;
-  width: 80px;
+  /* ch scales with the A-/A+ font size — a fixed 80px overflowed onto the level
+     column at larger sizes (12-char mono timestamp) */
+  width: 12.5ch;
   white-space: nowrap;
 }
 
 .log-lvl {
   flex-shrink: 0;
-  width: 10px;
+  width: 1.4ch;
   text-align: center;
   font-weight: 700;
 }
@@ -166,8 +169,21 @@
 }
 
 .log-dir {
-  max-width: 280px;
+  flex: 1;
+  margin-left: var(--space-md);
+  text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* svg icon buttons (zoom A± / open-folder) — inherit .log-copy-btn sizing, center the glyph */
+.log-icon-btn {
+  display: inline-flex;
+  align-items: center;
+}
+
+.log-open-btn {
+  flex-shrink: 0;
+  margin-left: var(--space-sm);
 }

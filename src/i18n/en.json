@@ -428,6 +428,9 @@
     "search": "Search...",
     "copy": "COPY",
     "copyTitle": "Copy all",
+    "fontSmaller": "Smaller text",
+    "fontLarger": "Larger text",
+    "openDir": "Open log folder",
     "empty": "No log entries"
   },
   "titlebar": {
@@ -753,6 +756,7 @@
     "TRAINING_BAD_VOCODER_FORMAT": "Invalid vocoder format (only classic NSF-HiFiGAN is supported)",
     "TRAINING_CROP_FRAMES_ZERO": "Crop frame count must be greater than 0",
     "TRAINING_DATA_FILE_MISSING": "Data file not found",
+    "TRAINING_GPU_UNAVAILABLE": "Training could not access the selected GPU — the run was aborted instead of silently training on CPU. Check the GPU driver and try again; if this machine's GPU does not support accelerated training, enable \"Force CPU training\" in the parameters step to proceed",
     "TRAINING_IMPORT_COPY_FAILED": "Failed to import a data file",
     "TRAINING_INTERNAL_ASSET_BRANCH": "Training backend is missing its asset-resolution branch (internal error)",
     "TRAINING_KILL_FAILED": "Failed to kill the training process",

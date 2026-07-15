@@ -197,7 +197,10 @@ export interface TrainingFormConfig {
   keepOnlyLatest: boolean;
   cacheGpu: boolean;
   fp16: boolean;
-  gpu: number;
+  /** Accelerator-native device identity from get_hardware_info.training_gpus
+   *  (NVIDIA UUID / vendor-relative index; "" = auto). S67: was a raw WMI list
+   *  index, which silently CPU'd multi-adapter boxes via a bad visibility mask. */
+  gpu: string;
   forceCpu: boolean;
   /** S41 PSOLA 数据增强份数 (0-3, 0=off) — rvc card (per-card fields so
    *  switching cards never clobbers; diff has NO field: it inherits the
@@ -282,7 +285,7 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   keepOnlyLatest: true,
   cacheGpu: false,
   fp16: true,
-  gpu: 0,
+  gpu: "",
   forceCpu: false,
   augCopies: 0,
   sovitsVersion: "4.1",

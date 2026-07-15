@@ -18,7 +18,8 @@ import { historyReferencedAudioPaths } from "../../store/history";
 import { backendErrorMessage, isCancelError } from "../../lib/backendError";
 import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type UpdateInfo } from "../../lib/update";
 import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
-import { useDraggable } from "../../lib/useDraggable";
+import { useFloatingPanel } from "../../lib/useFloatingPanel";
+import { PanelResizeHandles } from "./PanelResizeHandles";
 import "./Settings.css";
 
 interface GpuAdapter {
@@ -207,7 +208,12 @@ function collectProtectedPaths(): string[] {
 export function Settings({ onClose }: { onClose: () => void }) {
   const { i18n } = useTranslation();
   const lang = i18n.language;
-  const { pos, startDrag } = useDraggable(() => ({ x: 72, y: 84 }));
+  const { style: panelStyle, startDrag, startResize } = useFloatingPanel({
+    storageKey: "utai.settingsRect",
+    initial: () => ({ x: 72, y: 84, w: 340, h: Math.round(window.innerHeight * 0.7) }),
+    minW: 300,
+    minH: 280,
+  });
   // Download-source preference — the store is shared with the resource manager
   // (which consumes `mirror` for model downloads); the CONFIG UI now lives here.
   const mirror = useMsstModelStore((s) => s.mirror);
@@ -955,11 +961,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <aside className="settings-panel" style={{ left: pos.x, top: pos.y }}>
+    <aside className="settings-panel" style={panelStyle}>
       <div className="panel-header" onMouseDown={startDrag}>
         <span className="panel-title">{L("title")}</span>
         <button className="panel-close" onClick={onClose}>X</button>
       </div>
+      <PanelResizeHandles start={startResize} />
 
       <div className="settings-content">
         <section className="settings-section">

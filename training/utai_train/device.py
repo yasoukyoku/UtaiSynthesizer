@@ -66,6 +66,34 @@ def setup_visibility(cfg):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu
 
 
+def require_wanted_accelerator(cfg):
+    """LOUD guard against silent GPU→CPU degradation (S67, community bug). The user
+    picked a GPU (gpu != "-1") and the resolved runtime targets an accelerator
+    backend, so torch MUST actually see one: a masked/mismatched CUDA_VISIBLE_DEVICES
+    (the old WMI-index-as-CUDA-ordinal bug) or a broken driver used to fall through
+    resolve_backend's cpu fallback without a word — hours of slow training with zero
+    hint. Raises with a stable CODE the frontend maps to i18n (TRAIN_GPU_UNAVAILABLE);
+    the runner turns it into a protocol error, failing the run up front instead.
+    Explicit CPU ("-1" / backend "cpu") keeps the silent-cpu semantics — it's correct
+    there. Called by runner.py AFTER setup_visibility, so importing torch here is safe.
+    """
+    backend = cfg.get("device_backend", "cuda")
+    gpu = str(cfg.get("gpu", ""))
+    if backend == "cpu" or gpu == "-1":
+        return
+    import torch
+
+    if backend == "cuda" and torch.cuda.is_available():
+        return
+    if backend == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return
+    count = torch.cuda.device_count() if backend == "cuda" else 0
+    raise RuntimeError(
+        "TRAINING_GPU_UNAVAILABLE: backend=%s selected_gpu=%r CUDA_VISIBLE_DEVICES=%r torch_devices=%d"
+        % (backend, gpu, os.environ.get("CUDA_VISIBLE_DEVICES"), count)
+    )
+
+
 def resolve_backend(cfg):
     """The EFFECTIVE backend after checking real availability. Default "cuda" keeps
     pre-Phase-B run.json compatible. Falls back to cpu when the wanted accelerator

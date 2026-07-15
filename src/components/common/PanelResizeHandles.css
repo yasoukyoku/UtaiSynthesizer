@@ -1,0 +1,76 @@
+/* Self-drawn resize hit zones for the floating panels (useFloatingPanel). The zones
+ * sit INSIDE the panel edges (the panels clip overflow), stacked above content; the
+ * corners overlap the edges and win by source order. Invisible by design — the
+ * directional cursor is the affordance (square retro style: no grips, no dots). */
+.panel-resize {
+  position: absolute;
+  z-index: 30;
+}
+
+.panel-resize-n {
+  top: 0;
+  left: 10px;
+  right: 10px;
+  height: 4px;
+  cursor: ns-resize;
+}
+
+.panel-resize-s {
+  bottom: 0;
+  left: 10px;
+  right: 10px;
+  /* 3px: the log footer's buttons sit close to the bottom edge — the zone must not
+     swallow their lower click pixels */
+  height: 3px;
+  cursor: ns-resize;
+}
+
+.panel-resize-e {
+  right: 0;
+  top: 10px;
+  bottom: 10px;
+  /* 3px, not 5: the panels' scroll bodies put their scrollbar flush at this edge —
+     a wider zone steals scrollbar drags (review S67) */
+  width: 3px;
+  cursor: ew-resize;
+}
+
+.panel-resize-w {
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 5px;
+  cursor: ew-resize;
+}
+
+.panel-resize-ne {
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  cursor: nesw-resize;
+}
+
+.panel-resize-nw {
+  top: 0;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  cursor: nwse-resize;
+}
+
+.panel-resize-se {
+  bottom: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  cursor: nwse-resize;
+}
+
+.panel-resize-sw {
+  bottom: 0;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  cursor: nesw-resize;
+}

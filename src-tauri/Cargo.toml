@@ -41,8 +41,13 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# "time" enables fmt's OffsetTime timer — S67: file/stdout log lines carry the LOCAL
+# time with an explicit UTC offset (users could never match the panel's local times
+# against the old UTC-Z file lines). `time` itself is already in the tree via
+# tracing-appender; local-offset's Windows path is pure WinAPI (no soundness cfg).
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 tracing-appender = "0.2"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 parking_lot = "0.12"
 rustfft = "6.2"
 rayon = "1.10"

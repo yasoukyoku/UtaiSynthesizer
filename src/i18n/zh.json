@@ -428,6 +428,9 @@
     "search": "搜索...",
     "copy": "复制",
     "copyTitle": "复制全部",
+    "fontSmaller": "缩小字体",
+    "fontLarger": "放大字体",
+    "openDir": "打开日志文件夹",
     "empty": "暂无日志"
   },
   "titlebar": {
@@ -753,6 +756,7 @@
     "TRAINING_BAD_VOCODER_FORMAT": "非法声码器格式（一期仅支持经典 NSF-HiFiGAN）",
     "TRAINING_CROP_FRAMES_ZERO": "裁剪帧数必须大于 0",
     "TRAINING_DATA_FILE_MISSING": "数据文件不存在",
+    "TRAINING_GPU_UNAVAILABLE": "训练无法访问所选显卡——已中止运行,而不是静默改用 CPU 慢速训练。请检查显卡驱动后重试;若此机器的显卡不支持训练加速,请在参数页勾选「强制 CPU 训练」继续",
     "TRAINING_IMPORT_COPY_FAILED": "导入数据失败",
     "TRAINING_INTERNAL_ASSET_BRANCH": "训练后端缺少资产解析分支（内部错误）",
     "TRAINING_KILL_FAILED": "终止训练进程失败",

@@ -36,6 +36,19 @@ def main():
     stop = StopFlag(cfg["stop_file"])
     rc = 0
     try:
+        # S67 loud-degradation guard: the user asked for a GPU — a masked visibility
+        # env / broken driver must FAIL the run with a mappable CODE, never silently
+        # train on CPU. Also states the effective device once so the log always
+        # answers "what did this run actually train on".
+        from .device import require_wanted_accelerator, resolve_backend
+
+        require_wanted_accelerator(cfg)
+        print(
+            "[device] backend=%s gpu=%r -> effective=%s"
+            % (cfg.get("device_backend", "cuda"), cfg.get("gpu"), resolve_backend(cfg)),
+            file=sys.stderr,
+            flush=True,
+        )
         backend = cfg.get("backend")
         if backend == "rvc":
             from .rvc import pipeline

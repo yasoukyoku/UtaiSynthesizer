@@ -1,9 +1,8 @@
 .settings-panel {
   position: fixed;
-  width: 340px;
-  height: 70vh;
+  /* size is state-driven (useFloatingPanel inline style, S67 resizable panels) */
+  min-width: 300px;
   min-height: 280px;
-  max-height: 84vh;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);

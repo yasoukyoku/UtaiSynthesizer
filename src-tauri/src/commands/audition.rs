@@ -95,11 +95,15 @@ fn emit_phase(app: &tauri::AppHandle, candidate_id: &str, phase: &str) {
 /// Terminal-event wrapper for the render bodies (审查修复 FE-1): every exit —
 /// Ok or Err — emits a terminal phase so the frontend can never be stranded
 /// in a busy state by a dropped resolution (page remounts, stale closures).
-fn with_terminal_events(
+/// `wav_of` extracts the done-payload wav; a render whose product is NOT an
+/// audition clip (the S60c range-test scale) passes `|_| None` so the frontend
+/// never caches a probe wav as a playable audition.
+fn with_terminal_events_as<T>(
     app: &tauri::AppHandle,
     candidate_id: &str,
-    body: impl FnOnce() -> Result<String, String>,
-) -> Result<String, String> {
+    wav_of: impl Fn(&T) -> Option<String>,
+    body: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let r = body();
     let _ = app.emit(
         "audition-progress",
@@ -107,10 +111,18 @@ fn with_terminal_events(
             candidate_id: candidate_id.to_string(),
             phase: if r.is_ok() { "done" } else { "error" }.to_string(),
             progress: None,
-            wav: r.as_ref().ok().cloned(),
+            wav: r.as_ref().ok().and_then(&wav_of),
         },
     );
     r
+}
+
+fn with_terminal_events(
+    app: &tauri::AppHandle,
+    candidate_id: &str,
+    body: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    with_terminal_events_as(app, candidate_id, |wav: &String| Some(wav.clone()), body)
 }
 
 /// Failed/interrupted conversions must not leave a complete-looking cache
@@ -1162,6 +1174,12 @@ pub async fn render_candidate_scale(
     let apph = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<crate::inference::RenderedAudio, String> {
         let _guard = guard;
+        let cid = candidate_id.clone();
+        // S67: this was the ONLY audition command without the terminal wrapper — its
+        // converting/rendering phases stranded the row busy forever once the scale
+        // finished (the post-training auto range test = the stuck 渲染中 + dead buttons).
+        // wav_of = None: the scale probe must never enter the audition wav cache.
+        with_terminal_events_as(&apph.clone(), &cid, |_| None, || {
         let onnx = dir.join("model.onnx");
         ensure_candidate_converted(&app, &apph, &candidate_id, &dir, &onnx, &backend, &ckpt_path)?;
         let (config, sample_rate) = read_candidate_config(&dir.join("model.json"))?;
@@ -1287,6 +1305,7 @@ pub async fn render_candidate_scale(
         };
         app.inference.engine.unload_paths_with_prefix(&dir);
         crate::commands::inference::commit_rendered_audio(result, output_path)
+        })
     })
     .await
     .map_err(|e| format!("AUDITION_TASK_PANICKED: {e}"))?
@@ -1312,11 +1331,35 @@ pub async fn set_candidate_vocal_range(
     let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text)
         .map_err(|e| format!("RANGE_CANDIDATE_MISSING: unparseable sidecar: {e}"))?;
     map.insert("vocal_range".to_string(), record);
+    // tmp+rename (S67 review): the row un-busies before this write lands, so a user
+    // audition's strict read_candidate_config could otherwise catch a half-written json
+    let tmp = json_path.with_extension("json.tmp");
     std::fs::write(
-        &json_path,
+        &tmp,
         serde_json::to_string_pretty(&serde_json::Value::Object(map))
             .map_err(|e| format!("RANGE_CANDIDATE_MISSING: serialize: {e}"))?,
     )
     .map_err(|e| format!("RANGE_CANDIDATE_MISSING: write: {e}"))?;
+    std::fs::rename(&tmp, &json_path).map_err(|e| format!("RANGE_CANDIDATE_MISSING: write: {e}"))?;
     Ok(())
+}
+
+/// Read back a candidate's tested vocal range from its audition sidecar. `None` =
+/// no sidecar yet / no record stored — never an error (S67: the post-training auto
+/// battery short-circuits on an existing record instead of re-measuring every
+/// candidate on every page mount, and the row label restores from disk).
+#[tauri::command]
+pub async fn get_candidate_vocal_range(
+    workspace: String,
+    ckpt_path: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let stem = ckpt_stem(&ckpt_path)?;
+    let json_path = audition_dir(&workspace, &stem).join("model.json");
+    let Ok(text) = std::fs::read_to_string(&json_path) else {
+        return Ok(None);
+    };
+    let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) else {
+        return Ok(None);
+    };
+    Ok(map.get("vocal_range").cloned())
 }

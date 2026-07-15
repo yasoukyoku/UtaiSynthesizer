@@ -18,6 +18,88 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// Daily-rolling log file writer whose file-name DATE and roll boundary follow the
+/// LOCAL offset (S67 follow-up, §user): tracing-appender 0.2's rolling::daily is
+/// hardwired to UTC, so a UTC+8/+9 user's evening lines landed in "yesterday's"
+/// file and the day flipped at 08:00/09:00 local — we know the offset, so we roll
+/// ourselves. Same naming scheme as rolling::daily (`<prefix>.<YYYY-MM-DD>`) and
+/// append mode (an app restart on the same day continues the file). The offset is
+/// captured once at startup — consistent with the per-line OffsetTime timestamps.
+/// Wrapped in tracing_appender::non_blocking, so the per-write date check runs on
+/// the logging worker thread (one now_utc() call per batched write). Open failures
+/// degrade to discarding file output — never a panic in the log path.
+pub struct LocalDailyFile {
+    dir: PathBuf,
+    prefix: &'static str,
+    offset: time::UtcOffset,
+    date: time::Date,
+    file: Option<std::fs::File>,
+    open_warned: bool,
+}
+
+impl LocalDailyFile {
+    pub fn new(dir: PathBuf, prefix: &'static str, offset: time::UtcOffset) -> Self {
+        let date = Self::today(offset);
+        let mut this = Self { dir, prefix, offset, date, file: None, open_warned: false };
+        this.file = this.open(date);
+        this
+    }
+
+    fn today(offset: time::UtcOffset) -> time::Date {
+        time::OffsetDateTime::now_utc().to_offset(offset).date()
+    }
+
+    fn open(&mut self, date: time::Date) -> Option<std::fs::File> {
+        let name = format!(
+            "{}.{:04}-{:02}-{:02}",
+            self.prefix,
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        );
+        match std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(&name)) {
+            Ok(f) => {
+                self.open_warned = false;
+                Some(f)
+            }
+            Err(e) => {
+                // stderr only, once per failure episode — this IS the log sink
+                if !self.open_warned {
+                    self.open_warned = true;
+                    eprintln!("log file open failed ({}): {}", name, e);
+                }
+                None
+            }
+        }
+    }
+
+    fn roll_if_needed(&mut self) {
+        let today = Self::today(self.offset);
+        if today != self.date || self.file.is_none() {
+            self.date = today;
+            self.file = self.open(today);
+        }
+    }
+}
+
+impl std::io::Write for LocalDailyFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.roll_if_needed();
+        match self.file.as_mut() {
+            Some(f) => f.write(buf),
+            // no sink — swallow so the non_blocking worker never wedges on errors
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
 pub struct LogBuffer {
     entries: Mutex<VecDeque<LogEntry>>,
     capacity: usize,
@@ -193,4 +275,40 @@ pub fn get_log_dir() -> PathBuf {
         }
     }
     PathBuf::from(".").join("logs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Pins the LocalDailyFile contract: rolling::daily's naming scheme
+    /// (`<prefix>.<YYYY-MM-DD>`) with the DATE taken in the given offset, append mode.
+    #[test]
+    fn local_daily_file_names_by_offset_date_and_appends() {
+        let dir = std::env::temp_dir().join(format!("utai_localdaily_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+        let date = time::OffsetDateTime::now_utc().to_offset(offset).date();
+        let name = format!(
+            "utai.log.{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        );
+
+        let mut w = LocalDailyFile::new(dir.clone(), "utai.log", offset);
+        w.write_all(b"one\n").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        // restart on the same day must APPEND, not truncate
+        let mut w2 = LocalDailyFile::new(dir.clone(), "utai.log", offset);
+        w2.write_all(b"two\n").unwrap();
+        w2.flush().unwrap();
+        drop(w2);
+
+        let text = std::fs::read_to_string(dir.join(&name)).expect("local-date file exists");
+        assert_eq!(text, "one\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

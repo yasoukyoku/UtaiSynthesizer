@@ -428,6 +428,9 @@
     "search": "検索...",
     "copy": "コピー",
     "copyTitle": "すべてコピー",
+    "fontSmaller": "文字を小さく",
+    "fontLarger": "文字を大きく",
+    "openDir": "ログフォルダを開く",
     "empty": "ログがありません"
   },
   "titlebar": {
@@ -753,6 +756,7 @@
     "TRAINING_BAD_VOCODER_FORMAT": "不正なボコーダー形式です（現在はクラシック NSF-HiFiGAN のみ対応）",
     "TRAINING_CROP_FRAMES_ZERO": "クロップフレーム数は 0 より大きい必要があります",
     "TRAINING_DATA_FILE_MISSING": "データファイルが見つかりません",
+    "TRAINING_GPU_UNAVAILABLE": "選択した GPU にアクセスできなかったため、CPU への自動切り替えは行わず学習を中止しました。GPU ドライバを確認して再試行してください。この GPU が学習アクセラレーションに対応していない場合は、パラメータの「CPU 学習を強制」を有効にして続行できます",
     "TRAINING_IMPORT_COPY_FAILED": "データのインポートに失敗しました",
     "TRAINING_INTERNAL_ASSET_BRANCH": "トレーニングバックエンドにアセット解決の分岐がありません（内部エラー）",
     "TRAINING_KILL_FAILED": "トレーニングプロセスの強制終了に失敗しました",

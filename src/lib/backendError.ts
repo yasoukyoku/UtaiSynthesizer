@@ -244,6 +244,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_BAD_VOCODER_FORMAT: { key: "backend.TRAINING_BAD_VOCODER_FORMAT" },
   TRAINING_CROP_FRAMES_ZERO: { key: "backend.TRAINING_CROP_FRAMES_ZERO" },
   TRAINING_DATA_FILE_MISSING: { key: "backend.TRAINING_DATA_FILE_MISSING" },
+  // S67 loud-degradation guard (device.py require_wanted_accelerator → protocol error).
+  TRAINING_GPU_UNAVAILABLE: { key: "backend.TRAINING_GPU_UNAVAILABLE" },
   TRAINING_IMPORT_COPY_FAILED: { key: "backend.TRAINING_IMPORT_COPY_FAILED" },
   TRAINING_INTERNAL_ASSET_BRANCH: { key: "backend.TRAINING_INTERNAL_ASSET_BRANCH" },
   TRAINING_KILL_FAILED: { key: "backend.TRAINING_KILL_FAILED" },
