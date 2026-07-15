@@ -563,18 +563,32 @@ fn commit(mut builder: ort::session::builder::SessionBuilder, path: &Path) -> Re
 /// real MSST run on 1.24.4 (examples/ort_cuda_test's 40-run probe is a ZERO-INPUT crash/stability check
 /// over real frame SHAPES, NOT a fidelity check), so they wait until that crash is root-caused. Both
 /// call sites stay in lockstep.
+/// S66: user-configurable CUDA arena cap in MB (Settings → CUDA runtime; 0 = unlimited =
+/// the shipped default = pre-S66 behavior byte-for-byte). Set from config at startup and by
+/// set_cuda_mem_limit (which also evicts GPU sessions so rebuilds pick the new value up).
+/// OPT-IN by design: a hard cap turns "slow" into "allocation failed" on undersized values —
+/// the Settings note says so — and per the S23 HARD RULE the option is A/B-verified against
+/// the real MSST model before each release that touches it.
+pub static CUDA_MEM_LIMIT_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn cuda_ep(device_id: Option<i32>) -> ort::ep::CUDA {
     // SameAsRequested: grow the CUDA arena only by what each allocation needs, instead of the
     // default power-of-two doubling. Measured (S31 perf investigation): with the default strategy
     // the arena for the BSRoformer T=801 attention workload balloons to 11.9 of 12 GiB, WDDM
     // starts paging VRAM over PCIe, and per-chunk inference intermittently drops from ~890 ms to
     // 2.6-3.7 s (bit-identical outputs — pure residency thrash; the user-facing "5-minute song").
-    // Numerics are unaffected by allocator strategy. NOT adding gpu_mem_limit: a hard cap turns
-    // "slow" into "allocation failed" on smaller cards. (S23 HARD RULE: any new EP option must be
-    // A/B-run on the real model against this exact ort/ORT pair before shipping — done for this one.)
+    // Numerics are unaffected by allocator strategy. gpu_mem_limit stays OFF unless the user
+    // explicitly sets one (CUDA_MEM_LIMIT_MB above): a hard cap turns "slow" into "allocation
+    // failed" on smaller cards. (S23 HARD RULE: any new EP option must be A/B-run on the real
+    // model against this exact ort/ORT pair before shipping — done for SameAsRequested; the
+    // user-set limit is A/B-verified per release.)
     let mut ep = ort::ep::CUDA::default()
         .with_tf32(true)
         .with_arena_extend_strategy(ort::ep::ArenaExtendStrategy::SameAsRequested);
+    let limit_mb = CUDA_MEM_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed);
+    if limit_mb > 0 {
+        ep = ep.with_memory_limit((limit_mb as usize).saturating_mul(1024 * 1024));
+    }
     if let Some(id) = device_id {
         ep = ep.with_device_id(id);
     }

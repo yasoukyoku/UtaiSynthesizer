@@ -257,6 +257,24 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [cudaProgress, setCudaProgress] = useState<CudaProgress | null>(null);
   const [cudaError, setCudaError] = useState<string | null>(null);
   const [cudaJustInstalled, setCudaJustInstalled] = useState(false);
+  // S66: CUDA arena cap (MB; 0/blank = unlimited). Text-state so typing stays free; the
+  // commit round-trips through Rust (persist + GPU-session eviction) and re-reads the truth.
+  const [cudaMemLimitText, setCudaMemLimitText] = useState("");
+  useEffect(() => {
+    invoke<number>("get_cuda_mem_limit")
+      .then((mb) => setCudaMemLimitText(mb > 0 ? String(mb) : ""))
+      .catch(() => {});
+  }, []);
+  const commitCudaMemLimit = useCallback(async () => {
+    const mb = Math.max(0, parseInt(cudaMemLimitText || "0", 10) || 0);
+    try {
+      await invoke("set_cuda_mem_limit", { mb });
+      setCudaMemLimitText(mb > 0 ? String(mb) : "");
+    } catch {
+      /* leave the text; the next successful commit heals it */
+    }
+  }, [cudaMemLimitText]);
+
   // S66: on-disk layout for the panel (copyable paths = users can check/share the runtime
   // by hand) + per-lane presence + the exact filenames the local-install picker expects.
   const [cudaPaths, setCudaPaths] = useState<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] } | null>(null);
@@ -794,6 +812,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaPgDone: { zh: "CUDA 运行时就绪，重启应用后生效", en: "CUDA runtime ready — restart to activate", ja: "CUDA ランタイム準備完了 — 再起動で有効になります" },
       cudaCancelDl: { zh: "取消下载", en: "Cancel download", ja: "ダウンロード中止" },
       cudaPgLocalPartial: { zh: "已安装所选文件，但仍缺组件", en: "Selected files installed — parts still missing", ja: "選択ファイルを導入しましたが、まだ不足があります" },
+      cudaMemLimit: { zh: "显存上限（CUDA）", en: "VRAM limit (CUDA)", ja: "VRAM 上限（CUDA）" },
+      cudaMemLimitNote: { zh: "0 或留空 = 不限制（默认）。限制的是 CUDA 显存池上限：设得过低会让大任务直接报「分配失败」而不是变慢——低显存爆显存时再按需设置（例如 6144）。仅对 CUDA 生效。", en: "0 / blank = unlimited (default). Caps the CUDA memory arena: set too low, big jobs fail with an allocation error instead of slowing down — only set it (e.g. 6144) if you actually hit VRAM exhaustion. CUDA only.", ja: "0 または空欄 = 無制限（既定）。CUDA メモリアリーナの上限です。低すぎると大きなジョブは遅くなる代わりに「割り当て失敗」になります — VRAM 不足が実際に起きる場合のみ設定してください（例: 6144）。CUDA のみ有効。" },
       cudaPgCancelled: { zh: "已取消（进度已保留，可续传）", en: "Cancelled (progress kept — resumable)", ja: "キャンセルしました（進捗は保持、再開可能）" },
       cudaPgFailed: { zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" },
       cudaMissing: { zh: "缺失组件", en: "Missing parts", ja: "不足コンポーネント" },
@@ -1347,6 +1367,31 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
           {cudaJustInstalled && (
             <p className="settings-note" style={{ color: "#4ade80" }}>{L("cudaRestart")}</p>
+          )}
+
+          {/* S66: CUDA arena cap — visible ⟺ effective (user decision): only when the CUDA
+              runtime is actually installed AND an NVIDIA GPU is present. 0 = unlimited. */}
+          {cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (
+            <div className="settings-field" style={{ marginTop: 6 }}>
+              <label>{L("cudaMemLimit")}</label>
+              <input
+                type="text"
+                className="settings-source-url"
+                style={{ width: 90 }}
+                inputMode="numeric"
+                value={cudaMemLimitText}
+                placeholder="0"
+                onChange={(e) => setCudaMemLimitText(e.target.value.replace(/[^0-9]/g, ""))}
+                onBlur={() => void commitCudaMemLimit()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                }}
+              />
+              <span className="settings-value">MB</span>
+            </div>
+          )}
+          {cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (
+            <p className="settings-note">{L("cudaMemLimitNote")}</p>
           )}
 
           {/* S66: local-file install + on-disk layout — copyable paths so users can inspect the

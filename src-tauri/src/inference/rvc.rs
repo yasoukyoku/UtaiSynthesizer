@@ -152,7 +152,10 @@ pub fn run_pipeline(
     let audio_pad = reflect_pad_np(&audio_f, t_pad, t_pad);
     let p_len = audio_pad.len() / WINDOW;
 
-    let mut f0 = super::f0::rmvpe_detect(
+    // S66: chunk-bounded (60 s windows + 2 s discarded overlap) — this whole-song pass was the
+    // last unbounded GPU feed under gpu_extract (a 4-min song OOM'd 12 GB cards); ≤64 s songs
+    // take the original single forward bit-for-bit (rmvpe_detect_chunked short-input path).
+    let mut f0 = super::f0::rmvpe_detect_chunked(
         m.engine,
         m.rmvpe_session,
         m.mel_filters,

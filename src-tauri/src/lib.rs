@@ -883,6 +883,8 @@ pub fn run() {
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
             commands::settings::cancel_cuda_download,
+            commands::settings::get_cuda_mem_limit,
+            commands::settings::set_cuda_mem_limit,
             commands::settings::install_cuda_runtime_local,
             commands::settings::cuda_runtime_paths,
             commands::settings::fetch_mirror_list,

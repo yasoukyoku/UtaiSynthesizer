@@ -34,6 +34,11 @@ pub struct AppConfig {
     /// to the program, NOT C: AppData — those files reach tens of GB). See `resolve_data_dir`.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// S66: user-set CUDA arena cap in MB (0 = unlimited = default). Shown only in the
+    /// Settings CUDA section when a CUDA runtime is installed (user decision: the control
+    /// is visible ⟺ it is effective; DirectML has no equivalent API).
+    #[serde(default)]
+    pub cuda_mem_limit_mb: u64,
 }
 
 impl Default for AppConfig {
@@ -41,6 +46,7 @@ impl Default for AppConfig {
         Self {
             device: DeviceConfig::Auto,
             data_dir: None,
+            cuda_mem_limit_mb: 0,
         }
     }
 }
@@ -215,6 +221,31 @@ pub fn set_device_preference(
 }
 
 #[tauri::command]
+pub fn get_cuda_mem_limit(state: State<'_, Arc<AppState>>) -> u64 {
+    let _ = &state; // config is the source of truth, but the live static is what sessions read
+    crate::inference::engine::CUDA_MEM_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// S66: set the CUDA arena cap (MB; 0 = unlimited). Applies to sessions built from now on —
+/// live GPU sessions are evicted so the next run rebuilds them under the new cap (reload-on-
+/// miss restores them transparently). Persisted in config.json.
+#[tauri::command]
+pub fn set_cuda_mem_limit(state: State<'_, Arc<AppState>>, mb: u64) -> Result<(), String> {
+    crate::inference::engine::CUDA_MEM_LIMIT_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+    state.inference.engine.release_gpu_sessions_except(&[]);
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.cuda_mem_limit_mb = mb;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!(
+        "CUDA memory limit set to {} (GPU sessions evicted; rebuilt under the new cap on next use)",
+        if mb == 0 { "unlimited".to_string() } else { format!("{mb} MB") }
+    );
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_device_preference(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let current = state.inference.engine.device();
     Ok(match current {
@@ -242,6 +273,11 @@ pub fn load_and_apply_config(state: &AppState) {
             build
         );
         state.inference.engine.set_device(cfg.device);
+        if cfg.cuda_mem_limit_mb > 0 {
+            crate::inference::engine::CUDA_MEM_LIMIT_MB
+                .store(cfg.cuda_mem_limit_mb, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("CUDA memory limit: {} MB (config.json)", cfg.cuda_mem_limit_mb);
+        }
     } else {
         tracing::info!(
             "device preference: Auto (default; config.json is only written once changed in Settings); ORT build loaded: {}; per-run EP is logged as \"ONNX device=...\"",
