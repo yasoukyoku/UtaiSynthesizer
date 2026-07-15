@@ -201,6 +201,25 @@ impl g2p::DictSource for NoDicts {
 /// vowel rather than a 1-frame smear. ~100 ms @50fps; kept small so a normal note is never inflated.
 const VOWEL_MIN_FRAMES: i64 = 5;
 
+/// The phone a zh MELISMA hold re-emits (a pitch-changed sustain needs its own per-phone entry —
+/// pitch is per-phone). Re-emitting a glide-carrying final re-articulates the glide ("xiang -" →
+/// iɑŋ iɑŋ ≈ singing "yang" again), so strip a leading glide vowel (i/u/y) when the remainder is
+/// itself a 210-vocab token with a vocalic head (uɑŋ→ɑŋ, iaʊ→aʊ, ua→a); anything else (glide-free
+/// finals, or remainders like the bare nasals of in/iŋ/yn) holds the full carrier unchanged.
+fn zh_hold_phone(carrier: &'static str) -> &'static str {
+    let mut chars = carrier.chars();
+    if let Some(first) = chars.next() {
+        if matches!(first, 'i' | 'u' | 'y') {
+            let rest: &'static str = &carrier[first.len_utf8()..];
+            let vocalic_head = rest.chars().next().is_some_and(|c| !matches!(c, 'n' | 'ŋ' | 'ɻ'));
+            if !rest.is_empty() && vocalic_head && phone_to_id_map().contains_key(rest) {
+                return rest;
+            }
+        }
+    }
+    carrier
+}
+
 /// ② 自己唱 DAW render entry: identical to `build_arrays` EXCEPT rest frames are NOT capped, so the cv
 /// frame count == the DAW frame count (a rest holds its full duration) and the rendered stem stays
 /// aligned to the segment's tick timeline; and the score is MULTI-LANGUAGE (S58): per-note effective
@@ -250,6 +269,36 @@ fn assemble_arrays(
                 plang.push(lang_id);
             }
             g2p::ResolvedKind::Phones(ph) => {
+                // S66 zh sustain fix (user bug: [wang][-] sang "wang wang"): the zh carrier is the
+                // ATOMIC final token ("uɑŋ") — re-emitting it as a fresh phone entry makes ScoreToCV
+                // re-articulate the glide+coda, i.e. sing the syllable again (the model's trained
+                // hold convention is ja-style repeated bare VOWELS, and opencpop-style zh data holds
+                // a note as ONE long final, never a repeated one). So:
+                //   same pitch  → EXTEND the previous entry's duration (a true hold, no new phone;
+                //                 also covers chained holds — the previous entry may already be a
+                //                 hold nucleus);
+                //   pitch change (melisma) → a new entry MUST exist (pitch is per-phone), so emit
+                //                 the carrier final's vocalic tail (glide stripped when the残り is
+                //                 itself a vocab token: uɑŋ→ɑŋ, iaʊ→aʊ), else the full final.
+                // ja sustains keep the legacy repeated-vowel path bit-for-bit (Phase-1c parity gate).
+                if res.is_sustain && res.run_lang == g2p::Lang::Zh {
+                    let prev_sung = phon.last().is_some_and(|&p| !matches!(p, "SP" | "AP"));
+                    if prev_sung && npitch.last() == Some(&nn) {
+                        *pdur.last_mut().unwrap() += fr;
+                        continue;
+                    }
+                    if prev_sung {
+                        if let Some(&carrier) = ph.last() {
+                            let hold = zh_hold_phone(carrier);
+                            phon.push(hold);
+                            pdur.push(fr.max(1));
+                            npitch.push(nn);
+                            plang.push(lang_id);
+                            continue;
+                        }
+                    }
+                    // sustain after silence (orphan): fall through to the normal emit ("a" default)
+                }
                 let durs = split_dur(fr, ph.len());
                 for (&p, &d) in ph.iter().zip(durs.iter()) {
                     phon.push(p);
@@ -521,6 +570,80 @@ mod tests {
         assert_eq!(daw.phone_dur[0] + daw.phone_dur[1], 3 + 40, "total frames (timeline) preserved");
         // parity build: no borrow (the vowel keeps its 3 frames).
         assert_eq!(build_arrays(&score).unwrap().phone_dur[0], 3, "parity build does not borrow-time");
+    }
+
+    // ── S66 zh sustain fix (user bug: [wang][-] sang "wang wang") ──
+    // Every per-phone entry is a fresh articulation to ScoreToCV, so a zh hold re-emitting the
+    // carrier final re-onsets it (ɑŋ after wang ≈ singing the syllable again). Same-pitch hold
+    // → EXTEND the carrier entry; pitch-change (melisma) hold → glide-stripped vocalic tail.
+    struct ZhOnly(g2p::ZhDict);
+    impl g2p::DictSource for ZhOnly {
+        fn zh(&self) -> Result<&g2p::ZhDict> {
+            Ok(&self.0)
+        }
+        fn words(&self, _lang: g2p::Lang) -> Result<&g2p::WordDict> {
+            Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into()))
+        }
+    }
+    fn zh_dicts() -> ZhOnly {
+        ZhOnly(g2p::ZhDict::from_tsv("wang\tw ang\nxiang\tx iang\n", "", ""))
+    }
+    fn zh_evt(lyric: &'static str, note_num: i64, frames: i64) -> g2p::ScoreEvt<'static> {
+        g2p::ScoreEvt { lyric, note_num, frames, lang: g2p::Lang::Zh, phoneme_input: None }
+    }
+
+    #[test]
+    fn zh_same_pitch_sustain_extends_the_final() {
+        let d = zh_dicts();
+        let a = build_arrays_daw(&[zh_evt("wang", 60, 20), zh_evt("-", 60, 30)], &d).unwrap();
+        assert_eq!(a.phon, vec!["w", "ɑŋ"], "the hold adds NO phone entry (no re-articulation)");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 50, "total frames (timeline) preserved");
+        assert!(*a.phone_dur.last().unwrap() >= 30, "the hold's frames extended the final");
+        // chained same-pitch holds keep extending
+        let b = build_arrays_daw(
+            &[zh_evt("wang", 60, 20), zh_evt("-", 60, 30), zh_evt("-", 60, 10)],
+            &d,
+        )
+        .unwrap();
+        assert_eq!(b.phon, vec!["w", "ɑŋ"]);
+        assert_eq!(b.phone_dur.iter().sum::<i64>(), 60);
+    }
+
+    #[test]
+    fn zh_melisma_sustain_emits_glide_stripped_tail() {
+        let d = zh_dicts();
+        // xiang = [ɕ, iɑŋ]; the pitch-changed hold re-emits the glide-stripped tail ɑŋ (NOT iɑŋ,
+        // which would re-articulate the glide ≈ "yang" again), at the NEW pitch.
+        let a = build_arrays_daw(&[zh_evt("xiang", 60, 20), zh_evt("-", 62, 30)], &d).unwrap();
+        assert_eq!(a.phon, vec!["ɕ", "iɑŋ", "ɑŋ"]);
+        assert_eq!(a.note_pitch, vec![60, 60, 62]);
+        // …and a FURTHER same-pitch hold extends that melisma entry instead of re-emitting.
+        let b = build_arrays_daw(
+            &[zh_evt("xiang", 60, 20), zh_evt("-", 62, 30), zh_evt("-", 62, 10)],
+            &d,
+        )
+        .unwrap();
+        assert_eq!(b.phon, vec!["ɕ", "iɑŋ", "ɑŋ"]);
+        assert_eq!(b.phone_dur.iter().sum::<i64>(), 60);
+    }
+
+    #[test]
+    fn zh_hold_phone_glide_strip_table() {
+        assert_eq!(zh_hold_phone("uɑŋ"), "ɑŋ");
+        assert_eq!(zh_hold_phone("iaʊ"), "aʊ");
+        assert_eq!(zh_hold_phone("ua"), "a");
+        assert_eq!(zh_hold_phone("in"), "in", "bare-nasal remainder → keep the full final");
+        assert_eq!(zh_hold_phone("iŋ"), "iŋ");
+        assert_eq!(zh_hold_phone("ɑŋ"), "ɑŋ", "glide-free finals hold unchanged");
+        assert_eq!(zh_hold_phone("i"), "i");
+    }
+
+    #[test]
+    fn ja_sustain_keeps_legacy_repeated_vowel() {
+        // ja is the model's TRAINED hold convention (repeated bare vowel) and the Phase-1c parity
+        // anchor — the zh fix must not leak into it.
+        let a = daw_ja(&[("か", 60, 80), ("ー", 60, 40)]).unwrap();
+        assert_eq!(a.phon, vec!["k", "a", "a"], "ja hold still re-emits the carrier vowel entry");
     }
 
     // §9.5 single Rust classifier: `classify_lyric` (exposed via the validate_lyrics command) MUST agree
