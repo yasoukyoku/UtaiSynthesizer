@@ -72,7 +72,7 @@
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",
-        "languages": ["SimpChinese", "English", "Japanese"],
+        "languages": ["English", "SimpChinese", "Japanese"],
         "displayLanguageSelector": true,
         "compression": "lzma"
       }
