@@ -62,6 +62,9 @@ pub async fn import_model(
     if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("MODEL_BUSY_AUDITION".to_string());
     }
+    // S66: import runs the torch→ONNX conversion synchronously — take the app-wide convert
+    // slot (single-flight + heavy-job interlock; also lists "convert" in the close-flow).
+    let _convert = state.acquire_convert_slot()?;
     // A same-name re-import REPLACES the model on disk — drop any live inference session first,
     // or it would keep serving the stale ONNX (and leak the old RvcIndex RAM).
     state.inference.unload_voice(&name);
@@ -110,6 +113,8 @@ pub async fn attach_diffusion(
     ckpt_path: String,
     config_path: Option<String>,
 ) -> Result<ModelEntry, String> {
+    // S66: the attachment converts (encoder/denoiser export) — same convert slot as import.
+    let _convert = state.acquire_convert_slot()?;
     let cfg = config_path.map(PathBuf::from);
     let tmp = state
         .models
@@ -168,6 +173,10 @@ pub async fn delete_model(
     // start_training/reset_training_display (S41-INT-4 check-then-act).
     if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("MODEL_BUSY_AUDITION".to_string());
+    }
+    // S66: a running conversion (import/attach) may be writing this model's files right now.
+    if state.task_active("convert") {
+        return Err("CONVERT_BUSY".into());
     }
     // Unload BEFORE removing files: a loaded session would keep serving the deleted model (and
     // on Windows can hold the .onnx file open, blocking removal).

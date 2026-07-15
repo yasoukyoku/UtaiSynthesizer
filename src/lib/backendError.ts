@@ -43,6 +43,21 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
   CUDA_DOWNLOAD_BUSY: { key: "backend.CUDA_DOWNLOAD_BUSY", busy: true },
   CUDA_GPU_REQUIRED: { key: "backend.CUDA_GPU_REQUIRED" },
+  // S66 poisoned-proxy guard (download.rs): a GH proxy answered a download with an HTML page.
+  DOWNLOAD_HTML_RESPONSE: { key: "backend.DOWNLOAD_HTML_RESPONSE" },
+  // S66 CUDA local-file install (settings.rs install_cuda_runtime_local).
+  CUDA_LOCAL_NO_FILES: { key: "backend.CUDA_LOCAL_NO_FILES" },
+  CUDA_LOCAL_UNRECOGNIZED: { key: "backend.CUDA_LOCAL_UNRECOGNIZED" },
+  CUDA_LOCAL_BAD_FILE: { key: "backend.CUDA_LOCAL_BAD_FILE" },
+  // S66 conversion single-flight + heavy-job interlock (lib.rs acquire_convert_slot).
+  CONVERT_BUSY: { key: "backend.CONVERT_BUSY", busy: true },
+  CONVERT_RENDER_BUSY: { key: "backend.CONVERT_RENDER_BUSY", busy: true },
+  // S66 MSST conversion errors (msst_models.rs, formerly prose strings).
+  MSST_ARCH_UNKNOWN: { key: "backend.MSST_ARCH_UNKNOWN" },
+  MSST_CONVERT_FAILED: { key: "backend.MSST_CONVERT_FAILED" },
+  MSST_FILE_NOT_FOUND: { key: "backend.MSST_FILE_NOT_FOUND" },
+  // S66/O5: the render commands write the wav Rust-side; disk write failure is its own code.
+  RENDER_WRITE_FAILED: { key: "backend.RENDER_WRITE_FAILED" },
   AUDIO_EMPTY_INPUT: { key: "backend.AUDIO_EMPTY_INPUT" },
   AUDIO_TOO_SHORT_HIGHPASS: { key: "backend.AUDIO_TOO_SHORT_HIGHPASS" },
   AUDITION_BACKEND_UNSUPPORTED: { key: "backend.AUDITION_BACKEND_UNSUPPORTED" },

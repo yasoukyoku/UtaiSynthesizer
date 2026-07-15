@@ -4,7 +4,7 @@
 // from Rust so the endpoint order can follow the user's GH-mirror setting).
 import { invoke } from "@tauri-apps/api/core";
 import { loadSetting, saveSetting } from "./settings";
-import { ghProxyPrefix } from "./models/msst-catalog";
+import { ghRouteOrder } from "./models/msst-catalog";
 import { useMsstModelStore } from "../store/msst-models";
 import { flushAutosaveNow } from "./project/autosave";
 
@@ -34,11 +34,12 @@ export function setAutoUpdateCheckEnabled(v: boolean): void {
 }
 
 /** Ask GitHub Releases for a newer version. Returns null when up to date; throws
- *  "UPDATE_CHECK_FAILED: …" (backendError-mapped) on network/endpoint failure. The user's GH mirror
- *  (Settings 下载源) is passed through so both the check and the later download ride it. */
+ *  "UPDATE_CHECK_FAILED: …" (backendError-mapped) on network/endpoint failure. The user's full
+ *  GH route order (chosen proxy → direct → other presets, S66) is passed through so both the
+ *  check and the later download walk the whole failover chain. */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
-  const prefix = ghProxyPrefix(useMsstModelStore.getState().ghMirror);
-  return await invoke<UpdateInfo | null>("update_check", { ghProxy: prefix });
+  const { ghMirror, ghPresets } = useMsstModelStore.getState();
+  return await invoke<UpdateInfo | null>("update_check", { ghRoutes: ghRouteOrder(ghMirror, ghPresets) });
 }
 
 /** Download + install the update found by checkForUpdate. On success the process EXITS (the NSIS

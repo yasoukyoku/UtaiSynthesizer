@@ -258,9 +258,10 @@ fn extract_game_zip(zip_path: &Path, aux_dir: &Path) -> Result<(), String> {
 pub async fn download_game_package(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    // GH-proxy prefix from the Settings "GitHub mirror" choice (frontend `ghProxy`);
-    // None/blank = direct. Prefix-style: `<prefix>/<full URL>`.
-    gh_proxy: Option<String>,
+    // Ordered GH route list from the frontend (ghRouteOrder, S66): "" marks the DIRECT
+    // position, everything else is a proxy prefix (`<prefix>/<full URL>` style).
+    // None/empty = direct only.
+    gh_routes: Option<Vec<String>>,
 ) -> Result<MidiExtractStatus, String> {
     if GAME_DL_ACTIVE.swap(true, Ordering::SeqCst) {
         return Err("GAME_DL_BUSY".to_string());
@@ -277,13 +278,32 @@ pub async fn download_game_package(
     // mirror rotation + sha256 verification (the hand-rolled loop this replaced had none
     // of those — audit S60 MAJOR; the S42 audit already adjudicated the black-holing case)
     let client = crate::download::client().map_err(|e| format!("GAME_DL_FAILED: {e}"))?;
-    // An explicitly chosen GH proxy goes FIRST (the user selected it because the direct
-    // route is bad), followed by the untouched static rotation; sha256 covers any source.
-    // Prefix hygiene = THE shared sanitizer (download.rs — S64 audit: two local copies had
-    // already diverged on the scheme check).
-    let mut urls: Vec<String> = GAME_SOURCES.iter().map(|s| s.to_string()).collect();
-    if let Some(prefix) = crate::download::sanitize_gh_prefix(gh_proxy) {
-        urls.insert(0, format!("{prefix}/{}", GAME_SOURCES[0]));
+    // S66 route order: proxies BEFORE the "" marker ride ahead of the direct GH URL (the
+    // user picked them because the direct route is bad); then the untouched static rotation
+    // (direct GH → HF → hf-mirror); proxies AFTER the marker close the list as last resorts.
+    // sha256 covers any source. Prefix hygiene = THE shared sanitizer (download.rs).
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    let mut past_direct = false;
+    for r in gh_routes.unwrap_or_default() {
+        if r.is_empty() {
+            past_direct = true;
+        } else if let Some(prefix) = crate::download::sanitize_gh_prefix(Some(r)) {
+            let u = format!("{prefix}/{}", GAME_SOURCES[0]);
+            if past_direct { tail.push(u) } else { head.push(u) }
+        }
+    }
+    // Set-style dedup (review S66: Vec::dedup only strips CONSECUTIVE duplicates — the chosen
+    // proxy re-appearing in the preset tail would double the dead-proxy stall time).
+    let mut urls: Vec<String> = Vec::new();
+    for u in head
+        .into_iter()
+        .chain(GAME_SOURCES.iter().map(|s| s.to_string()))
+        .chain(tail)
+    {
+        if !urls.contains(&u) {
+            urls.push(u);
+        }
     }
     let req = crate::download::DownloadRequest {
         urls,

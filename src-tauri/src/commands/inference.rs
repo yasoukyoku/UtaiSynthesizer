@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::inference::{
-    g2p, rvc, score2cv, score2svc, sovits, RvcOptions, SovitsOptions, SynthesisResult, VoiceBackendType,
+    g2p, rvc, score2cv, score2svc, sovits, RenderedAudio, RvcOptions, SovitsOptions, SynthesisResult,
+    VoiceBackendType,
 };
 use crate::models::{ModelConfig, ModelEntry};
 use crate::AppState;
@@ -34,6 +35,28 @@ impl Drop for VoiceRunGuard {
     fn drop(&mut self) {
         VOICE_RENDER_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Write a finished pipeline result to `output_path` (16-bit like the old save_temp_audio round
+/// trip — byte-identical quantization — but atomic) and return the path-bearing IPC payload
+/// (S66 / O5: only the path crosses IPC; the ~100 MB `SynthesisResult` JSON double-trip is gone).
+/// Call from inside the render's spawn_blocking task — file IO must never ride the async workers.
+pub(crate) fn commit_rendered_audio(
+    result: SynthesisResult,
+    output_path: String,
+) -> Result<RenderedAudio, String> {
+    let out = PathBuf::from(&output_path);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("RENDER_WRITE_FAILED: {}", e))?;
+    }
+    let sample_rate = result.sample_rate;
+    let buf = crate::audio::AudioBuffer {
+        samples: result.audio,
+        sample_rate,
+        channels: 1,
+    };
+    crate::audio::save_wav_atomic(&out, &buf).map_err(|e| format!("RENDER_WRITE_FAILED: {}", e))?;
+    Ok(RenderedAudio { path: output_path, sample_rate })
 }
 
 /// Per-node inference progress, emitted as the `voice-progress` event. The frontend workflow
@@ -741,8 +764,9 @@ pub async fn run_rvc(
     model_path: String,
     audio_path: String,
     node_id: String,
+    output_path: String,
     options: RvcOptions,
-) -> Result<SynthesisResult, String> {
+) -> Result<RenderedAudio, String> {
     let app = state.inner().clone();
     let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
     // Arm the cancel epoch BEFORE the multi-second load phase (a cancel during loading
@@ -829,8 +853,9 @@ pub async fn run_rvc(
             noise_channels: nch,
             min_frames: min_t,
         };
-        rvc::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
-            .map_err(|e| e.to_string())
+        let result = rvc::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
+            .map_err(|e| e.to_string())?;
+        commit_rendered_audio(result, output_path)
     })
     .await
     .map_err(|e| format!("INFER_TASK_PANICKED: {}", e))?
@@ -904,8 +929,9 @@ pub async fn run_sovits(
     model_path: String,
     audio_path: String,
     node_id: String,
+    output_path: String,
     options: SovitsOptions,
-) -> Result<SynthesisResult, String> {
+) -> Result<RenderedAudio, String> {
     let mut options = options;
     let app = state.inner().clone();
     let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
@@ -1038,8 +1064,9 @@ pub async fn run_sovits(
             noise_channels: nch,
             min_frames: min_t,
         };
-        sovits::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
-            .map_err(|e| e.to_string())
+        let result = sovits::run_pipeline(&model, &audio_buf, &options, vocal_range, &progress, &cancel)
+            .map_err(|e| e.to_string())?;
+        commit_rendered_audio(result, output_path)
     })
     .await
     .map_err(|e| format!("INFER_TASK_PANICKED: {}", e))?
@@ -1225,8 +1252,8 @@ const MAX_TOTAL_FRAMES: i64 = 600_000;
 /// but swaps ScoreToCV in for the audio ContentVec extractor and takes a DAW score + Option-A f0 (§10.1)
 /// instead of an input wav. `score` = the per-note triples (built frontend-side incl. gap rests); when
 /// `f0_cents`/`f0_voiced` are non-empty they are the whole-segment 50fps layered pitch (else bare
-/// noteonly). Returns raw samples like run_sovits (the frontend deposits them as a processedOutputs
-/// overlay). `node_id` = the segment id (progress routing).
+/// noteonly). Writes the wav to `output_path` Rust-side and returns the path (S66/O5 — the frontend
+/// deposits it as a processedOutputs overlay). `node_id` = the segment id (progress routing).
 #[tauri::command]
 pub async fn render_vocal_segment(
     app_handle: tauri::AppHandle,
@@ -1239,8 +1266,9 @@ pub async fn render_vocal_segment(
     f0_voiced: Vec<u8>,
     loudness_env: Vec<f32>,
     formant_env: Vec<f32>,
+    output_path: String,
     options: VocalRenderOptions,
-) -> Result<SynthesisResult, String> {
+) -> Result<RenderedAudio, String> {
     let app = state.inner().clone();
     let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
     let run_epoch = app.inference.begin_voice_run();
@@ -1475,11 +1503,12 @@ pub async fn render_vocal_segment(
                 };
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
-                score2svc::render_score_sovits(
+                let result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
                     VOCAL_FLAT_VOL, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                commit_rendered_audio(result, output_path)
             })
             .await
             .map_err(|e| format!("VOCAL_TASK_PANICKED: {}", e))?
@@ -1537,11 +1566,12 @@ pub async fn render_vocal_segment(
                 };
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
-                score2svc::render_score_rvc(
+                let result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
                     transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                commit_rendered_audio(result, output_path)
             })
             .await
             .map_err(|e| format!("VOCAL_TASK_PANICKED: {}", e))?

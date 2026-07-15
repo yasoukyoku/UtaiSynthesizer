@@ -149,6 +149,15 @@ pub fn training_env_ready(state: State<'_, Arc<AppState>>) -> bool {
     py != std::path::Path::new("python")
 }
 
+/// S66 startup component check, converter twin of training_env_ready: TRUE when a REAL
+/// converter interpreter resolves (dev venv / installed pack / manual slot) — FALSE = any
+/// model import/conversion would die with RUNTIME_PACK_REQUIRED, so the startup dialog
+/// offers the runtime download up front. Mirrors resolution by CALLING pyenv::converter_python.
+#[tauri::command]
+pub fn converter_env_ready(state: State<'_, Arc<AppState>>) -> bool {
+    pyenv::converter_python(&state.app_dir) != std::path::Path::new("python")
+}
+
 #[tauri::command]
 pub async fn download_runtime_pack(
     app: tauri::AppHandle,

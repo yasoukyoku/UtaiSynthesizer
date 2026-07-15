@@ -612,23 +612,69 @@ export interface MirrorSource {
 
 export const DEFAULT_MIRROR: MirrorSource = { type: "huggingface", customUrl: "" };
 
+/** The HF host-replacement BASE for Rust commands that take an `hf_base` (asset packs):
+ *  the chosen mirror host, or null for the official default. SINGLE SOURCE — Settings'
+ *  download button and the S66 one-click dialogs must derive it identically. */
+export function hfBaseForMirror(mirror: MirrorSource): string | null {
+  if (mirror.type === "hf-mirror") return "https://hf-mirror.com";
+  if (mirror.type === "custom" && mirror.customUrl.trim()) return mirror.customUrl.trim();
+  return null;
+}
+
 /** GitHub direct-link mirror (mainland-China acceleration) — the GH counterpart of
  *  `MirrorSource` above. Orthogonal axes: `applyMirror` only rewrites huggingface.co
  *  hosts, `applyGhMirror` only prefixes github.com-family hosts, so chaining them is
- *  always safe. */
+ *  always safe. S66: presets are DATA (a list), not enum members — public prefixes rot
+ *  in 6-18 months, so the live list is refreshed remotely (mirrors.json on the
+ *  utai-runtimes HF dataset → store.refreshGhPresets) and these are the offline fallback. */
 export interface GhMirror {
-  type: "direct" | "ghfast" | "ghproxy" | "custom";
+  type: "direct" | "preset" | "custom";
+  /** Chosen entry in the preset list (type "preset"); unknown ids fall back to the first preset. */
+  presetId?: string;
   customUrl: string;
 }
 
+export interface GhPreset {
+  id: string;
+  prefix: string;
+}
+
+/** 2026-07 live-verified (raw + release-asset 302 follow + Range 206): gh-proxy.com,
+ *  ghproxy.net, gh.llkk.cc all functional; ghfast.top kept last (blocked reports from
+ *  mainland testers). */
+export const BUILTIN_GH_PRESETS: GhPreset[] = [
+  { id: "gh-proxy.com", prefix: "https://gh-proxy.com" },
+  { id: "ghproxy.net", prefix: "https://ghproxy.net" },
+  { id: "gh.llkk.cc", prefix: "https://gh.llkk.cc" },
+  { id: "ghfast.top", prefix: "https://ghfast.top" },
+];
+
 export const DEFAULT_GH_MIRROR: GhMirror = { type: "direct", customUrl: "" };
+
+/** Migrate a persisted pre-S66 value ({type:"ghfast"|"ghproxy"}) onto the preset shape —
+ *  localStorage survives updates, so the old enum members must keep meaning forever.
+ *  Shape-tolerant to CORRUPT persisted values incl. null/non-object (review S66: this runs at
+ *  store-module init — a throw here white-screens the whole app). */
+export function migrateGhMirror(gh: unknown): GhMirror {
+  if (!gh || typeof gh !== "object") return { ...DEFAULT_GH_MIRROR };
+  const g = gh as { type?: unknown; presetId?: unknown; customUrl?: unknown };
+  const customUrl = typeof g.customUrl === "string" ? g.customUrl : "";
+  const presetId = typeof g.presetId === "string" ? g.presetId : undefined;
+  if (g.type === "ghfast") return { type: "preset", presetId: "ghfast.top", customUrl };
+  if (g.type === "ghproxy") return { type: "preset", presetId: "gh-proxy.com", customUrl };
+  if (g.type === "direct" || g.type === "preset" || g.type === "custom") {
+    return { type: g.type, presetId, customUrl };
+  }
+  return { ...DEFAULT_GH_MIRROR };
+}
 
 /** Proxy prefix for the selected GH mirror, or null for direct / blank custom.
  *  The presets are community-run public services — they come and go without notice;
  *  the custom option is the user's fallback when a preset dies. */
-export function ghProxyPrefix(gh: GhMirror): string | null {
-  if (gh.type === "ghfast") return "https://ghfast.top";
-  if (gh.type === "ghproxy") return "https://gh-proxy.com";
+export function ghProxyPrefix(gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRESETS): string | null {
+  if (gh.type === "preset") {
+    return presets.find((p) => p.id === gh.presetId)?.prefix ?? presets[0]?.prefix ?? null;
+  }
   if (gh.type === "custom") {
     // localStorage shape-tolerance (audit): a corrupt persisted value without customUrl must not
     // throw here (it would wedge the Settings test button) — same posture as applyMirror's truthiness guard.
@@ -655,15 +701,62 @@ const GH_HOSTS = new Set([
   "codeload.github.com",
 ]);
 
-export function applyGhMirror(url: string, gh: GhMirror): string {
-  const prefix = ghProxyPrefix(gh);
-  if (!prefix) return url;
+function isGhUrl(url: string): boolean {
   let host: string;
   try {
     host = new URL(url).hostname;
   } catch {
-    return url;
+    return false;
   }
-  const isGh = GH_HOSTS.has(host) || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com");
-  return isGh ? `${prefix}/${url}` : url;
+  return GH_HOSTS.has(host) || host.endsWith(".github.com") || host.endsWith(".githubusercontent.com");
+}
+
+export function applyGhMirror(url: string, gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRESETS): string {
+  const prefix = ghProxyPrefix(gh, presets);
+  if (!prefix || !isGhUrl(url)) return url;
+  return `${prefix}/${url}`;
+}
+
+/** Ordered GH ROUTE list for Rust-side consumers that build their own URLs (updater /
+ *  GAME): proxy prefixes with an "" marker at the DIRECT position — the chosen proxy
+ *  (if any) rides before direct, the remaining presets after. Rust maps "" to the
+ *  unprefixed URL and prefixes the rest. Full-chain fallback is safe HERE because both
+ *  consumers verify content (GAME sha256 / updater minisign). */
+export function ghRouteOrder(gh: GhMirror, presets: GhPreset[] = BUILTIN_GH_PRESETS): string[] {
+  const out: string[] = [];
+  const chosen = ghProxyPrefix(gh, presets);
+  if (chosen) out.push(chosen);
+  out.push("");
+  for (const p of presets) {
+    if (!out.includes(p.prefix)) out.push(p.prefix);
+  }
+  return out;
+}
+
+/** S66 failover candidates for a GH-hosted url: the chosen prefix first, then the direct
+ *  url — and, ONLY when `presetFallbacks` is true, every other preset as a tail.
+ *
+ *  presetFallbacks MUST stay false for UN-HASHED downloads (MSST models — review S66):
+ *  without a sha256 commit gate, silently routing a direct-mode user's bytes through
+ *  community proxies would let a rogue proxy's wrong bytes commit as the model file.
+ *  Hashed / signature-verified consumers take the full chain via ghRouteOrder instead.
+ *  Non-GH urls pass through as a single candidate. */
+export function ghMirrorCandidates(
+  url: string,
+  gh: GhMirror,
+  presets: GhPreset[] = BUILTIN_GH_PRESETS,
+  presetFallbacks = false,
+): string[] {
+  if (!isGhUrl(url)) return [url];
+  const out: string[] = [];
+  const push = (u: string) => {
+    if (!out.includes(u)) out.push(u);
+  };
+  const chosen = ghProxyPrefix(gh, presets);
+  if (chosen) push(`${chosen}/${url}`);
+  push(url);
+  if (presetFallbacks) {
+    for (const p of presets) push(`${p.prefix}/${url}`);
+  }
+  return out;
 }

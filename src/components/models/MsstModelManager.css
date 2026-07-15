@@ -351,6 +351,16 @@
   border-color: var(--accent-primary);
 }
 
+/* S66: conversions are single-flight app-wide — other convert buttons gray out while one runs */
+.msst-convert-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.msst-convert-btn:disabled:hover {
+  border-color: var(--border-subtle);
+}
+
 /* Download-time precision choice (roformer entries only) */
 .model-card-precision {
   display: flex;

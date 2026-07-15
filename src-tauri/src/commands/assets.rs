@@ -93,6 +93,17 @@ const PACKS: &[AssetPack] = &[
     AssetPack { id: "training-sovits", files: SOVITS_TRAIN_FILES },
 ];
 
+/// Which asset pack distributes the file at `rel` (forward-slash path under `<data>/models/`),
+/// None = not pack-distributed (e.g. the CC BY-NC-SA vocoder base = user self-download).
+/// S66: the "missing base model → one-click download" dialog maps files to packs through
+/// THIS table so the mapping can never drift from what download_asset_pack actually fetches.
+pub(crate) fn pack_for_rel(rel: &str) -> Option<&'static str> {
+    PACKS
+        .iter()
+        .find(|p| p.files.iter().any(|f| f.rel == rel))
+        .map(|p| p.id)
+}
+
 // ─── state ───────────────────────────────────────────────────────────────────
 
 /// Single-flight for the whole subsystem (one pack downloads at a time — the UI queues intent, and

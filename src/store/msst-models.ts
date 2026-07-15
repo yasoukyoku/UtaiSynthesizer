@@ -1,8 +1,35 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { type MirrorSource, DEFAULT_MIRROR, applyMirror, type GhMirror, DEFAULT_GH_MIRROR, applyGhMirror, type MsstCatalogEntry, type MsstPrecision } from "../lib/models/msst-catalog";
+import {
+  type MirrorSource, DEFAULT_MIRROR, applyMirror,
+  type GhMirror, type GhPreset, DEFAULT_GH_MIRROR, BUILTIN_GH_PRESETS,
+  migrateGhMirror, ghMirrorCandidates,
+  type MsstCatalogEntry, type MsstPrecision,
+} from "../lib/models/msst-catalog";
 import { loadSetting, saveSetting } from "../lib/settings";
+
+/** Cached remote mirror list (mirrors.json on the utai-runtimes HF dataset). Public GH
+ *  proxies rot in 6-18 months — the remote list lets shipped builds pick up fresh ones. */
+interface GhPresetCache {
+  ts: number;
+  presets: GhPreset[];
+}
+const GH_PRESET_CACHE_KEY = "utai.ghPresetsRemote";
+const GH_PRESET_TTL_MS = 24 * 3600 * 1000;
+
+function validPresets(v: unknown): GhPreset[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: GhPreset[] = [];
+  for (const e of v) {
+    const id = (e as { id?: unknown })?.id;
+    const prefix = (e as { prefix?: unknown })?.prefix;
+    if (typeof id === "string" && typeof prefix === "string" && /^https:\/\//.test(prefix)) {
+      out.push({ id, prefix: prefix.replace(/\/+$/, "") });
+    }
+  }
+  return out.length > 0 ? out : null;
+}
 
 export interface InstalledModel {
   filename: string;
@@ -36,11 +63,14 @@ interface MsstModelStore {
   error: string | null;
   mirror: MirrorSource;
   ghMirror: GhMirror;
+  /** Live GH-proxy preset list: remote mirrors.json when available, builtin fallback. */
+  ghPresets: GhPreset[];
 
   fetchInstalled: () => Promise<void>;
   fetchModelsDir: () => Promise<void>;
+  refreshGhPresets: (force?: boolean) => Promise<void>;
   downloadEntry: (entry: MsstCatalogEntry, precision?: MsstPrecision) => Promise<void>;
-  downloadUrl: (url: string, filename: string, precision?: MsstPrecision, architecture?: string) => Promise<void>;
+  downloadUrl: (urls: string[], filename: string, precision?: MsstPrecision, architecture?: string) => Promise<void>;
   convertPrecision: (filename: string, precision?: MsstPrecision, architecture?: string) => Promise<void>;
   deleteModel: (filename: string) => Promise<void>;
   importLocal: (path: string) => Promise<void>;
@@ -57,7 +87,26 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   downloading: {},
   error: null,
   mirror: loadSetting<MirrorSource>("utai.mirror", DEFAULT_MIRROR),
-  ghMirror: loadSetting<GhMirror>("utai.ghMirror", DEFAULT_GH_MIRROR),
+  // migrate persisted pre-S66 enum values ({type:"ghfast"|"ghproxy"}) — localStorage outlives updates.
+  ghMirror: migrateGhMirror(loadSetting<GhMirror>("utai.ghMirror", DEFAULT_GH_MIRROR)),
+  ghPresets: loadSetting<GhPresetCache | null>(GH_PRESET_CACHE_KEY, null)?.presets?.length
+    ? (validPresets(loadSetting<GhPresetCache | null>(GH_PRESET_CACHE_KEY, null)?.presets) ?? BUILTIN_GH_PRESETS)
+    : BUILTIN_GH_PRESETS,
+
+  refreshGhPresets: async (force) => {
+    const cache = loadSetting<GhPresetCache | null>(GH_PRESET_CACHE_KEY, null);
+    if (!force && cache && Date.now() - cache.ts < GH_PRESET_TTL_MS) return; // fresh enough
+    try {
+      const remote = await invoke<{ gh_prefixes?: unknown }>("fetch_mirror_list");
+      const presets = validPresets(remote?.gh_prefixes);
+      if (presets) {
+        saveSetting(GH_PRESET_CACHE_KEY, { ts: Date.now(), presets } satisfies GhPresetCache);
+        set({ ghPresets: presets });
+      }
+    } catch {
+      // network-less / HF unreachable — builtin (or cached) list stays in effect
+    }
+  },
 
   fetchInstalled: async () => {
     try {
@@ -78,31 +127,33 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
   },
 
   downloadEntry: async (entry, precision) => {
-    const { mirror, ghMirror } = get();
-    // Both rewrites chained in a fixed order — each only touches its own host family
-    // (HF → huggingface.co, GH → github.com/*.githubusercontent.com), so they never
-    // interfere with each other or with non-mirrored hosts (e.g. dl.fbaipublicfiles.com).
+    const { mirror, ghMirror, ghPresets } = get();
+    // HF rewrite first (host swap), then the GH axis expands into failover candidates
+    // (chosen proxy → direct ONLY — MSST files carry no sha256, so the preset-proxy tail
+    // stays OFF per the review-S66 poisoning rule; see ghMirrorCandidates) — each axis
+    // only touches its own host family, so they never interfere with each other or with
+    // non-mirrored hosts (e.g. dl.fbaipublicfiles.com).
     // The original yaml must land BEFORE the ckpt and be named <ckpt stem>.yaml:
     // the ckpt download auto-converts on completion, and the converter reads the SIBLING
     // yaml (chunk/overlap, stem labels). The URL basename can differ from the ckpt name
     // (e.g. config_melbandroformer_inst_v2.yaml), so always rename to the ckpt stem.
     if (entry.configUrl) {
       try {
-        const cfgUrl = applyGhMirror(applyMirror(entry.configUrl, mirror), ghMirror);
+        const cfgUrls = ghMirrorCandidates(applyMirror(entry.configUrl, mirror), ghMirror, ghPresets);
         const stem = entry.filename.replace(/\.[^.]+$/, "");
-        await get().downloadUrl(cfgUrl, `${stem}.yaml`);
+        await get().downloadUrl(cfgUrls, `${stem}.yaml`);
       } catch {
         // config download failure is non-fatal
       }
     }
-    const url = applyGhMirror(applyMirror(entry.downloadUrl, mirror), ghMirror);
+    const urls = ghMirrorCandidates(applyMirror(entry.downloadUrl, mirror), ghMirror, ghPresets);
     // precision/architecture only apply to the MODEL download (auto-convert target), never the
     // yaml sidecar. Passing the catalog architecture matters for hash-named official weights
     // (e.g. demucs 5c90dfd2-34c22ccb.th) that Rust's name detection cannot classify.
-    await get().downloadUrl(url, entry.filename, precision, entry.architecture);
+    await get().downloadUrl(urls, entry.filename, precision, entry.architecture);
   },
 
-  downloadUrl: async (url, filename, precision, architecture) => {
+  downloadUrl: async (urls, filename, precision, architecture) => {
     set((s) => ({
       downloading: {
         ...s.downloading,
@@ -112,7 +163,7 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
     }));
 
     try {
-      await invoke("download_msst_model", { url, filename, precision, architecture });
+      await invoke("download_msst_model", { urls, filename, precision, architecture });
       set((s) => {
         const { [filename]: _, ...rest } = s.downloading;
         return { downloading: rest };

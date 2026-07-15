@@ -248,7 +248,10 @@ export async function runRangeTest(
   });
   try {
     const { triples, spans } = buildScaleScore();
-    const result = await invoke<{ audio: number[]; sample_rate: number }>("render_vocal_segment", {
+    // S66/O5: the render writes the probe wav Rust-side — compute the path up front.
+    const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
+    const wavPath = `${dir}/scale_${Date.now().toString(36)}.wav`;
+    await invoke<{ path: string; sample_rate: number }>("render_vocal_segment", {
       voiceName: name,
       modelPath,
       nodeId,
@@ -257,6 +260,7 @@ export async function runRangeTest(
       f0Voiced: [],
       loudnessEnv: [],
       formantEnv: [],
+      outputPath: wavPath,
       options: {
         backend,
         cv_speaker_id: 49,
@@ -268,9 +272,6 @@ export async function runRangeTest(
       },
     });
     useVoiceModelStore.getState().setRangeTesting(name, 0.88);
-    const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
-    const wavPath = `${dir}/scale_${Date.now().toString(36)}.wav`;
-    await invoke("save_temp_audio", { samples: result.audio, sampleRate: result.sample_rate, outputPath: wavPath });
     const f0 = await invoke<number[]>("detect_f0", { audioPath: wavPath });
     useVoiceModelStore.getState().setRangeTesting(name, 0.96);
 
@@ -315,16 +316,17 @@ export async function runCandidateRangeTest(
   candidateId: string,
 ): Promise<{ usable: [number, number]; comfort: [number, number] } | null> {
   const { triples, spans } = buildScaleScore();
-  const result = await invoke<{ audio: number[]; sample_rate: number }>("render_candidate_scale", {
+  // S66/O5: the render writes the probe wav Rust-side — compute the path up front.
+  const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
+  const wavPath = `${dir}/cand_${Date.now().toString(36)}.wav`;
+  await invoke<{ path: string; sample_rate: number }>("render_candidate_scale", {
     backend,
     ckptPath,
     workspace,
     candidateId,
     score: triples,
+    outputPath: wavPath,
   });
-  const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
-  const wavPath = `${dir}/cand_${Date.now().toString(36)}.wav`;
-  await invoke("save_temp_audio", { samples: result.audio, sampleRate: result.sample_rate, outputPath: wavPath });
   const f0 = await invoke<number[]>("detect_f0", { audioPath: wavPath });
   const record = buildSpeakerRecord(classifySemitones(f0, spans));
   if (!record) return null; // nothing usable — an undertrained checkpoint; audition stays unshifted

@@ -18,8 +18,10 @@ import { ToastContainer } from "./components/common/Toast";
 import { HistoryBanner } from "./components/common/HistoryBanner";
 import { ConfirmDialog } from "./components/common/ConfirmDialog";
 import { UpdateDialog } from "./components/common/UpdateDialog";
+import { MissingModelsDialog } from "./components/common/MissingModelsDialog";
 import { RenderLinkWatcher } from "./components/workflow/RenderLinkWatcher";
 import { autoUpdateCheckEnabled, checkForUpdate } from "./lib/update";
+import { runStartupComponentCheck, startupComponentCheckEnabled } from "./lib/startupCheck";
 import { backendErrorMessage } from "./lib/backendError";
 import { listen } from "@tauri-apps/api/event";
 import { useWorkflowStore } from "./store/workflow";
@@ -269,6 +271,34 @@ export function App() {
     };
   }, []);
 
+  // S66: startup missing-component check (converter runtime + core inference models →
+  // one-click download). Runs AFTER the update-check window with the same collision
+  // discipline: never stack on an open confirm OR the update dialog; the check itself
+  // is silent when everything is installed (the common case).
+  useEffect(() => {
+    if (!startupComponentCheckEnabled()) return;
+    let disposed = false;
+    void (async () => {
+      await new Promise((r) => setTimeout(r, 6000));
+      for (
+        let i = 0;
+        i < 120 && !disposed && (useAppStore.getState().confirm || useAppStore.getState().updateDialog);
+        i++
+      ) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (disposed || useAppStore.getState().confirm || useAppStore.getState().updateDialog) return;
+      try {
+        await runStartupComponentCheck();
+      } catch {
+        /* never block startup on this check */
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
   useEffect(() => {
     const block = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && e.key === "C") {
@@ -358,6 +388,7 @@ export function App() {
       <HistoryBanner />
       <ConfirmDialog />
       <UpdateDialog />
+      <MissingModelsDialog />
       <RenderLinkWatcher />
     </div>
   );

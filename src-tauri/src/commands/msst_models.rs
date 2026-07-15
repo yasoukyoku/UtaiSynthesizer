@@ -109,7 +109,9 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
 pub async fn download_msst_model(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-    url: String,
+    // S66: full mirror-failover candidate list (frontend ghMirrorCandidates — chosen proxy →
+    // direct → other presets), consumed in order by the unified engine.
+    urls: Vec<String>,
     filename: String,
     // Download-time precision choice ("fp32" | "fp16", None = fp32). fp16 exports through an
     // fp32 intermediate then deletes it — the other precision can be back-converted later.
@@ -130,70 +132,55 @@ pub async fn download_msst_model(
         return Ok(dest.to_string_lossy().to_string());
     }
 
-    let tmp = dir.join(format!("{}.part", filename));
-    if tmp.exists() {
-        let _ = tokio::fs::remove_file(&tmp).await;
+    // S66: migrated onto the unified engine (the header note in download.rs named this file as
+    // the last legacy holdout) — .part Range-resume across THIS invoke's mirror rotation,
+    // stall watchdog, HTML-poison sniff. No sha256: third-party catalog files carry no digests,
+    // so a stale .part from an EARLIER invoke is deleted up front (review S66: blind-resuming
+    // un-hashed bytes of unknown origin could commit a corrupt model that no re-download would
+    // ever repair — the dest-exists short-circuit above would trust it forever). Within one
+    // invoke the sources are the same content, so mid-rotation resume stays safe.
+    let part = crate::download::part_path(&dest);
+    if part.exists() {
+        let _ = std::fs::remove_file(&part);
     }
-
-    let client = reqwest::Client::builder()
-        .user_agent(crate::download::APP_USER_AGENT)
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Download request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}: {}", response.status(), url));
-    }
-
-    let total = response.content_length().unwrap_or(0);
-
-    let mut file =
-        tokio::fs::File::create(&tmp)
-            .await
-            .map_err(|e| format!("Failed to create file: {}", e))?;
-
-    let mut stream = response.bytes_stream();
-    let mut downloaded: u64 = 0;
+    let client = crate::download::client().map_err(|e| e.to_string())?;
+    let app_emit = app.clone();
+    let fname = filename.clone();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false)); // no cancel UI (parity with the old flow)
     let mut last_emit: u64 = 0;
+    crate::download::download(
+        &client,
+        &crate::download::DownloadRequest {
+            urls,
+            dest: dest.clone(),
+            sha256: None,
+            expected_size: None,
+        },
+        &cancel,
+        move |done, total| {
+            // done < last_emit = a restart-from-zero (server ignored Range) — reset the
+            // high-water mark or the bar freezes at the stale value (review S66).
+            if done < last_emit {
+                last_emit = 0;
+            }
+            if done.saturating_sub(last_emit) > 1_000_000 || Some(done) == total {
+                last_emit = done;
+                let _ = app_emit.emit(
+                    "msst-download-progress",
+                    DownloadProgress {
+                        filename: fname.clone(),
+                        downloaded: done,
+                        total: total.unwrap_or(0),
+                        stage: "download".into(),
+                    },
+                );
+            }
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    use futures_util::StreamExt;
-    use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download stream error: {}", e))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("File write error: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        if downloaded - last_emit > 1_000_000 || downloaded == total {
-            let _ = app.emit(
-                "msst-download-progress",
-                DownloadProgress {
-                    filename: filename.clone(),
-                    downloaded,
-                    total,
-                    stage: "download".into(),
-                },
-            );
-            last_emit = downloaded;
-        }
-    }
-
-    file.flush()
-        .await
-        .map_err(|e| format!("File flush error: {}", e))?;
-    drop(file);
-
-    tokio::fs::rename(&tmp, &dest)
-        .await
-        .map_err(|e| format!("Failed to rename temp file: {}", e))?;
-
-    tracing::info!("Downloaded MSST model: {} ({} bytes)", filename, downloaded);
+    tracing::info!("Downloaded MSST model: {}", filename);
 
     // Auto-convert to ONNX — model files only. Sidecar downloads (the catalog's configUrl yaml
     // lands next to the ckpt) match arch names too and used to get "converted" (traceback WARN).
@@ -208,22 +195,38 @@ pub async fn download_msst_model(
     let is_mdx_net_onnx = arch == "mdx_net"
         && dest.extension().and_then(|e| e.to_str()) == Some("onnx");
     if arch != "unknown" && (is_model_file || is_mdx_net_onnx) {
-        let _ = app.emit(
-            "msst-download-progress",
-            DownloadProgress {
-                filename: filename.clone(),
-                downloaded: 0,
-                total: 0,
-                stage: "converting".into(),
-            },
-        );
-
-        match run_converter(&dest, &arch, &app_dir, precision.as_deref()).await {
-            Ok(onnx_path) => {
-                tracing::info!("Converted {} -> {}", filename, onnx_path);
+        // S66: the auto-convert honors the convert slot. Busy → SKIP the conversion but keep the
+        // finished download (the run-preflight / convert button covers it later) — a busy peer
+        // must never fail a completed multi-GB download. The "converting" stage event is emitted
+        // ONLY after the slot is held (review S66: an emit on the busy-skip path races the invoke
+        // resolution — a late event re-adds the frontend's downloading record with no terminal
+        // event to ever clear it, permanently graying every convert button).
+        match state.acquire_convert_slot() {
+            Ok(_task) => {
+                let _ = app.emit(
+                    "msst-download-progress",
+                    DownloadProgress {
+                        filename: filename.clone(),
+                        downloaded: 0,
+                        total: 0,
+                        stage: "converting".into(),
+                    },
+                );
+                match run_converter(&dest, &arch, &app_dir, precision.as_deref()).await {
+                    Ok(onnx_path) => {
+                        tracing::info!("Converted {} -> {}", filename, onnx_path);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Auto-conversion failed for {}: {} (model unusable until converted — retry via the convert button)", filename, e);
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("Auto-conversion failed for {}: {} (model unusable until converted — retry via the convert button)", filename, e);
+            Err(code) => {
+                tracing::warn!(
+                    "Auto-conversion for {} skipped: another heavy job is running ({}) — convert via the model manager button later",
+                    filename,
+                    code
+                );
             }
         }
     }
@@ -242,11 +245,12 @@ pub async fn convert_msst_model(
     // Catalog-provided architecture (hash-named official weights defeat name detection).
     architecture: Option<String>,
 ) -> Result<String, String> {
-    let _task = state.begin_task("convert"); // listed in the close-flow's in-progress warning
+    // S66: single-flight + heavy-job interlock (also registers the close-flow "convert" entry).
+    let _task = state.acquire_convert_slot()?;
     let dir = &state.msst_models_dir;
     let path = dir.join(&filename);
     if !path.exists() {
-        return Err(format!("Model file not found: {}", filename));
+        return Err(format!("MSST_FILE_NOT_FOUND: {}", filename));
     }
 
     if precision.as_deref() == Some("fp16") {
@@ -254,18 +258,18 @@ pub async fn convert_msst_model(
         if fp32_onnx.exists() {
             return run_fp16_converter(&fp32_onnx, &state.app_dir)
                 .await
-                .map_err(|e| format!("fp16 conversion failed: {}", e));
+                .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e));
         }
     }
 
     let arch = resolve_architecture(architecture.as_deref(), &filename);
     if arch == "unknown" {
-        return Err("Cannot detect architecture from filename".into());
+        return Err(format!("MSST_ARCH_UNKNOWN: {}", filename));
     }
 
     let onnx_path = run_converter(&path, &arch, &state.app_dir, precision.as_deref())
         .await
-        .map_err(|e| format!("Conversion failed: {}", e))?;
+        .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e))?;
 
     Ok(onnx_path)
 }
@@ -275,6 +279,11 @@ pub fn delete_msst_model(
     state: State<'_, Arc<AppState>>,
     filename: String,
 ) -> Result<(), String> {
+    // S66: a running conversion is writing .onnx/.json beside this file — deleting mid-export
+    // would race the converter (half files, converter crash on a vanished input).
+    if state.task_active("convert") {
+        return Err("CONVERT_BUSY".into());
+    }
     let dir = &state.msst_models_dir;
     let path = dir.join(&filename);
     if path.exists() {

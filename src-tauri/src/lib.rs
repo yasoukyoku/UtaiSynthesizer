@@ -102,6 +102,49 @@ impl AppState {
             id: id.to_string(),
         }
     }
+
+    /// Single-flight + heavy-job interlock for MODEL CONVERSION (S66 user rule): a torch-export
+    /// python eats gigabytes of RAM, so conversions never run in parallel with each other NOR
+    /// start while another resource-heavy job runs. The exclusion is deliberately one-way for
+    /// separation/renders (those may START while a conversion runs); training and the audition
+    /// family are excluded BOTH ways (see start_training / audition's ensure_no_convert).
+    ///
+    /// Atomicity (review S66): convert-vs-convert is compare-and-register under ONE
+    /// active_tasks lock (a check-then-begin_task pair leaves a both-pass window — begin_task
+    /// is a refcount, NOT a mutex, the S64c rule). The cross-checks run register-then-verify:
+    /// the slot is visible BEFORE we verify training/audition/render idle, and those peers
+    /// check task_active("convert") before committing — one side always sees the other.
+    pub fn acquire_convert_slot(&self) -> std::result::Result<TaskGuard, String> {
+        let guard = {
+            let mut tasks = self.active_tasks.lock();
+            if tasks.contains_key("convert") {
+                return Err("CONVERT_BUSY".into());
+            }
+            *tasks.entry("convert".to_string()).or_insert(0) += 1;
+            TaskGuard {
+                tasks: Arc::clone(&self.active_tasks),
+                id: "convert".to_string(),
+            }
+        };
+        // Register-then-verify: dropping `guard` on a violation unregisters the slot.
+        if commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+            // Generic on purpose: the flag's holder may be an audition, an export or a cleanup.
+            return Err(commands::audition::BUSY_RETRY_MSG.into());
+        }
+        if commands::inference::voice_render_active() {
+            return Err("CONVERT_RENDER_BUSY".into());
+        }
+        if self.training.is_active() {
+            return Err("TRAINING_ACTIVE".into());
+        }
+        if matches!(
+            self.separation.status().state,
+            separation::SeparationState::LoadingModel | separation::SeparationState::Separating
+        ) {
+            return Err("SEPARATION_BUSY".into());
+        }
+        Ok(guard)
+    }
 }
 
 /// RAII guard from `AppState::begin_task` — decrements the task's refcount when dropped (removing the id at
@@ -804,7 +847,6 @@ pub fn run() {
             commands::audio::load_audio_file,
             commands::audio::probe_audio_duration,
             commands::audio::transpose_audio,
-            commands::audio::save_temp_audio,
             commands::audio::ensure_cache_dir,
             commands::audio::save_binary_file,
             commands::audio::analyze_segment_tempo,
@@ -840,11 +882,17 @@ pub fn run() {
             commands::settings::migrate_data_dir,
             commands::settings::is_cuda_runtime_ready,
             commands::settings::download_cuda_runtime,
+            commands::settings::cancel_cuda_download,
+            commands::settings::install_cuda_runtime_local,
+            commands::settings::cuda_runtime_paths,
+            commands::settings::fetch_mirror_list,
             commands::assets::asset_pack_status,
             commands::assets::download_asset_pack,
             commands::assets::cancel_asset_pack_download,
             commands::pyenv::get_runtime_env_info,
             commands::pyenv::training_env_ready,
+            commands::pyenv::converter_env_ready,
+            commands::training::training_required_assets,
             commands::pyenv::download_runtime_pack,
             commands::pyenv::install_runtime_pack_local,
             commands::pyenv::cancel_runtime_install,

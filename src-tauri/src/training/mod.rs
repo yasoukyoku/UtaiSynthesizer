@@ -68,6 +68,168 @@ pub struct SpeakerGroup {
     pub files: Vec<String>,
 }
 
+/// Every disk asset one training run needs, resolved from (backend, version, sample_rate,
+/// aug_copies) — THE single source shared by try_start's up-front verification and the S66
+/// `training_required_assets` pre-flight command (the frontend's "missing base model"
+/// dialog), so the two can never drift. Pure path math except the 4.0 diffusion-base
+/// probe, whose OPTIONALITY is existence-defined (present = used, absent = from-scratch).
+pub struct ResolvedTrainingAssets {
+    /// (label, path) in the exact order try_start verifies them; labels are the stable
+    /// English tokens that ride in the TRAINING_ASSET_MISSING detail payload.
+    pub required: Vec<(String, PathBuf)>,
+    pub contentvec: PathBuf,
+    pub rmvpe_pt: PathBuf,
+    pub pretrain_g: PathBuf,
+    pub pretrain_d: PathBuf,
+    pub nsf_hifigan_model: PathBuf,
+    pub diffusion_pretrain: PathBuf,
+    pub vocoder_pretrain: PathBuf,
+}
+
+pub fn resolve_training_assets(
+    data_dir: &Path,
+    backend: &str,
+    version: &str,
+    sample_rate: &str,
+    aug_copies: u32,
+) -> Result<ResolvedTrainingAssets> {
+    let aux_dir = data_dir.join("models").join(crate::models::AUX_DIR_NAME);
+    let sovits_train_dir = data_dir.join("models").join("training").join("sovits");
+    // one-ContentVec-space principle: the training extractor must be the same
+    // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 = 256l9,
+    // rvc v2 / sovits(_diff) 4.1 = 768l12
+    let use_256 = version == "v1" || version == "4.0";
+    let contentvec = aux_dir.join(if use_256 {
+        "contentvec_256l9.onnx"
+    } else {
+        "contentvec_768l12.onnx"
+    });
+    // rmvpe is TWO different lineages: aux/rmvpe.pt = RVC's raw-state-dict E2E;
+    // so-vits vendors the yxlllc/RMVPE fork (E2E0, +unet.tf.* layers, wrapped
+    // as {'model': sd}) — the files are NOT interchangeable.
+    // vocoder also gets the SOVITS lineage: its own f0 products are
+    // parselmouth-blooded and measurably blind to PSOLA glitches, so the
+    // S41 aug quality gate re-analyzes the audio with the sovits RMVPE
+    // (gate_aug_semantic part 4 keeps the blind spot on record)
+    let rmvpe_pt = if backend_family(backend) == "sovits" || backend == "vocoder" {
+        sovits_train_dir.join("rmvpe.pt")
+    } else {
+        aux_dir.join("rmvpe.pt")
+    };
+    // per-backend required files beyond contentvec+rmvpe
+    let mut required: Vec<(String, PathBuf)> = Vec::new();
+    let mut pretrain_g = PathBuf::new();
+    let mut pretrain_d = PathBuf::new();
+    let mut nsf_hifigan_model = PathBuf::new();
+    let mut diffusion_pretrain = PathBuf::new();
+    let mut vocoder_pretrain = PathBuf::new();
+    match backend {
+        "rvc" => {
+            let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
+                if version == "v1" {
+                    "pretrained"
+                } else {
+                    "pretrained_v2"
+                },
+            );
+            pretrain_g = pretrain_dir.join(format!("f0G{}.pth", sample_rate));
+            pretrain_d = pretrain_dir.join(format!("f0D{}.pth", sample_rate));
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "sovits" => {
+            let pretrain_dir =
+                sovits_train_dir.join(if version == "4.0" { "vec256" } else { "vec768" });
+            pretrain_g = pretrain_dir.join("G_0.pth");
+            pretrain_d = pretrain_dir.join("D_0.pth");
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "vocoder" => {
+            // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
+            // 2024.02 community base checkpoint (lightning format, G+D).
+            // CC BY-NC-SA weights — never bundled, the user downloads it;
+            // the label doubles as the download guidance in the missing-
+            // file error. ContentVec/RMVPE/configs/mute are NOT used by
+            // this pipeline (设计红队 A17: required 收敛进各臂).
+            vocoder_pretrain = data_dir
+                .join("models")
+                .join("training")
+                .join("vocoder")
+                .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
+            required.push((
+                "vocoder finetune base ckpt (download \
+                 nsf_hifigan_44.1k_hop512_128bin_2024.02.zip from \
+                 github.com/openvpi/SingingVocoders releases v0.0.2 and extract the \
+                 .ckpt; weights are CC BY-NC-SA 4.0 — finetuned outputs inherit the \
+                 license)"
+                    .into(),
+                vocoder_pretrain.clone(),
+            ));
+        }
+        "sovits_diff" => {
+            // sovits_diff: the mel recipe IS the vocoder's (torch ckpt, not
+            // the aux onnx) + the diffusion base model. The vec256 ecosystem
+            // has NO public diffusion base (the one community HF repo went
+            // private, 2026-07) — 4.0 trains from scratch, loudly surfaced
+            // in the params UI; the vec768 base ships as a dev asset and is
+            // hard-required so its absence can never silently degrade.
+            nsf_hifigan_model = sovits_train_dir.join("nsf_hifigan").join("model");
+            required.push(("NSF-HiFiGAN vocoder (model)".into(), nsf_hifigan_model.clone()));
+            required.push((
+                "NSF-HiFiGAN config (config.json)".into(),
+                sovits_train_dir.join("nsf_hifigan").join("config.json"),
+            ));
+            let base = sovits_train_dir
+                .join("diffusion")
+                .join(if version == "4.0" { "vec256" } else { "vec768" })
+                .join("model_0.pt");
+            if version == "4.0" {
+                if base.is_file() {
+                    diffusion_pretrain = base;
+                } else {
+                    tracing::warn!("no vec256 diffusion base model — training from scratch");
+                }
+            } else {
+                diffusion_pretrain = base.clone();
+                required.push(("diffusion base model (model_0.pt)".into(), base));
+            }
+        }
+        // the whitelist match above already rejected unknown backends —
+        // this arm exists so a future backend CANNOT silently inherit
+        // another backend's asset resolution (设计红队 A17)
+        other => {
+            return Err(UtaiError::Training(format!(
+                "TRAINING_INTERNAL_ASSET_BRANCH: {}",
+                other
+            )));
+        }
+    }
+    if backend != "vocoder" {
+        // the vocoder pipeline extracts neither features nor f0-by-model
+        // (parselmouth is in-process) — requiring these would be a lie
+        required.push(("ContentVec feature extractor".into(), contentvec.clone()));
+        required.push(("RMVPE pitch model (rmvpe.pt)".into(), rmvpe_pt.clone()));
+    } else if aug_copies > 0 {
+        // ...except the S41 aug quality gate, which is rmvpe-blooded by
+        // design (see the lineage comment above) — only when augmenting
+        required.push((
+            "RMVPE pitch model (rmvpe.pt, augmentation quality gate)".into(),
+            rmvpe_pt.clone(),
+        ));
+    }
+    Ok(ResolvedTrainingAssets {
+        required,
+        contentvec,
+        rmvpe_pt,
+        pretrain_g,
+        pretrain_d,
+        nsf_hifigan_model,
+        diffusion_pretrain,
+        vocoder_pretrain,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
@@ -710,135 +872,19 @@ impl TrainingManager {
         }
 
         // ---- resolve + verify every asset up front (loud, specific errors) ----
-        let aux_dir = data_dir.join("models").join(crate::models::AUX_DIR_NAME);
-        let sovits_train_dir = data_dir.join("models").join("training").join("sovits");
-        // one-ContentVec-space principle: the training extractor must be the same
-        // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 = 256l9,
-        // rvc v2 / sovits(_diff) 4.1 = 768l12
-        let use_256 = req.version == "v1" || req.version == "4.0";
-        let contentvec = aux_dir.join(if use_256 {
-            "contentvec_256l9.onnx"
-        } else {
-            "contentvec_768l12.onnx"
-        });
-        // rmvpe is TWO different lineages: aux/rmvpe.pt = RVC's raw-state-dict E2E;
-        // so-vits vendors the yxlllc/RMVPE fork (E2E0, +unet.tf.* layers, wrapped
-        // as {'model': sd}) — the files are NOT interchangeable.
-        // vocoder also gets the SOVITS lineage: its own f0 products are
-        // parselmouth-blooded and measurably blind to PSOLA glitches, so the
-        // S41 aug quality gate re-analyzes the audio with the sovits RMVPE
-        // (gate_aug_semantic part 4 keeps the blind spot on record)
-        let rmvpe_pt = if backend_family(&req.backend) == "sovits" || req.backend == "vocoder" {
-            sovits_train_dir.join("rmvpe.pt")
-        } else {
-            aux_dir.join("rmvpe.pt")
-        };
-        // per-backend required files beyond contentvec+rmvpe
-        let mut required: Vec<(&str, PathBuf)> = Vec::new();
-        let mut pretrain_g = PathBuf::new();
-        let mut pretrain_d = PathBuf::new();
-        let mut nsf_hifigan_model = PathBuf::new();
-        let mut diffusion_pretrain = PathBuf::new();
-        let mut vocoder_pretrain = PathBuf::new();
-        match req.backend.as_str() {
-            "rvc" => {
-                let pretrain_dir = data_dir.join("models").join("training").join("rvc").join(
-                    if req.version == "v1" {
-                        "pretrained"
-                    } else {
-                        "pretrained_v2"
-                    },
-                );
-                pretrain_g = pretrain_dir.join(format!("f0G{}.pth", req.sample_rate));
-                pretrain_d = pretrain_dir.join(format!("f0D{}.pth", req.sample_rate));
-                required.push(("pretrained base G", pretrain_g.clone()));
-                required.push(("pretrained base D", pretrain_d.clone()));
-            }
-            "sovits" => {
-                let pretrain_dir = sovits_train_dir
-                    .join(if req.version == "4.0" { "vec256" } else { "vec768" });
-                pretrain_g = pretrain_dir.join("G_0.pth");
-                pretrain_d = pretrain_dir.join("D_0.pth");
-                required.push(("pretrained base G", pretrain_g.clone()));
-                required.push(("pretrained base D", pretrain_d.clone()));
-            }
-            "vocoder" => {
-                // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
-                // 2024.02 community base checkpoint (lightning format, G+D).
-                // CC BY-NC-SA weights — never bundled, the user downloads it;
-                // the label doubles as the download guidance in the missing-
-                // file error. ContentVec/RMVPE/configs/mute are NOT used by
-                // this pipeline (设计红队 A17: required 收敛进各臂).
-                vocoder_pretrain = data_dir
-                    .join("models")
-                    .join("training")
-                    .join("vocoder")
-                    .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
-                required.push((
-                    "vocoder finetune base ckpt (download \
-                     nsf_hifigan_44.1k_hop512_128bin_2024.02.zip from \
-                     github.com/openvpi/SingingVocoders releases v0.0.2 and extract the \
-                     .ckpt; weights are CC BY-NC-SA 4.0 — finetuned outputs inherit the \
-                     license)",
-                    vocoder_pretrain.clone(),
-                ));
-            }
-            "sovits_diff" => {
-                // sovits_diff: the mel recipe IS the vocoder's (torch ckpt, not
-                // the aux onnx) + the diffusion base model. The vec256 ecosystem
-                // has NO public diffusion base (the one community HF repo went
-                // private, 2026-07) — 4.0 trains from scratch, loudly surfaced
-                // in the params UI; the vec768 base ships as a dev asset and is
-                // hard-required so its absence can never silently degrade.
-                nsf_hifigan_model = sovits_train_dir.join("nsf_hifigan").join("model");
-                required.push(("NSF-HiFiGAN vocoder (model)", nsf_hifigan_model.clone()));
-                required.push((
-                    "NSF-HiFiGAN config (config.json)",
-                    sovits_train_dir.join("nsf_hifigan").join("config.json"),
-                ));
-                let base = sovits_train_dir
-                    .join("diffusion")
-                    .join(if req.version == "4.0" { "vec256" } else { "vec768" })
-                    .join("model_0.pt");
-                if req.version == "4.0" {
-                    if base.is_file() {
-                        diffusion_pretrain = base;
-                    } else {
-                        tracing::warn!(
-                            "no vec256 diffusion base model — training from scratch"
-                        );
-                    }
-                } else {
-                    diffusion_pretrain = base.clone();
-                    required.push(("diffusion base model (model_0.pt)", base));
-                }
-            }
-            // the whitelist match above already rejected unknown backends —
-            // this arm exists so a future backend CANNOT silently inherit
-            // another backend's asset resolution (设计红队 A17)
-            other => {
-                return Err(UtaiError::Training(format!(
-                    "TRAINING_INTERNAL_ASSET_BRANCH: {}",
-                    other
-                )));
-            }
-        }
+        // Resolution lives in resolve_training_assets — the SINGLE SOURCE shared with the
+        // S66 training_required_assets pre-flight command, so the "missing base model"
+        // dialog can never drift from what start() actually demands.
+        let assets = resolve_training_assets(
+            &data_dir,
+            &req.backend,
+            &req.version,
+            &req.sample_rate,
+            req.aug_copies,
+        )?;
         let ffmpeg = crate::audio::find_ffmpeg()
             .ok_or_else(|| UtaiError::Training("FFMPEG_MISSING".into()))?;
-        if req.backend != "vocoder" {
-            // the vocoder pipeline extracts neither features nor f0-by-model
-            // (parselmouth is in-process) — requiring these would be a lie
-            required.push(("ContentVec feature extractor", contentvec.clone()));
-            required.push(("RMVPE pitch model (rmvpe.pt)", rmvpe_pt.clone()));
-        } else if req.aug_copies > 0 {
-            // ...except the S41 aug quality gate, which is rmvpe-blooded by
-            // design (see the lineage comment above) — only when augmenting
-            required.push((
-                "RMVPE pitch model (rmvpe.pt, augmentation quality gate)",
-                rmvpe_pt.clone(),
-            ));
-        }
-        for (label, p) in &required {
+        for (label, p) in &assets.required {
             if !p.is_file() {
                 return Err(UtaiError::Training(format!(
                     "TRAINING_ASSET_MISSING: {} -> {}",
@@ -847,6 +893,16 @@ impl TrainingManager {
                 )));
             }
         }
+        let ResolvedTrainingAssets {
+            contentvec,
+            rmvpe_pt,
+            pretrain_g,
+            pretrain_d,
+            nsf_hifigan_model,
+            diffusion_pretrain,
+            vocoder_pretrain,
+            ..
+        } = assets;
 
         let slug = slugify(&req.model_name);
         let workspace = data_dir.join("training").join(&slug);
@@ -1434,7 +1490,7 @@ fn run_worker(
     // gating dialog — see pending_cleanups).
     if !req.force_cpu && device_backend == "cpu" {
         tracing::warn!(
-            "训练运行时是 CPU 版：本次将用 CPU 训练（很慢）。如需 GPU，请到 设置 → 训练环境 安装对应显卡的运行时包。"
+            "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
         );
     }
 

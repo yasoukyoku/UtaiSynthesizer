@@ -10,9 +10,21 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import i18n from "../i18n";
 import { backendErrorMessage, isBusyError } from "../lib/backendError";
+import { hfBaseForMirror } from "../lib/models/msst-catalog";
 import { useAppStore } from "./app";
+import { useMsstModelStore } from "./msst-models";
+
+/** Mirror of Rust `commands::training::RequiredAssetStatus` (S66 pre-start asset check). */
+interface RequiredAssetStatus {
+  label: string;
+  path: string;
+  exists: boolean;
+  pack: string | null;
+  selfUrl: string | null;
+}
 
 export interface DatasetFile {
   path: string;
@@ -501,6 +513,73 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       }
     } catch {
       /* ready-check unavailable → fall through; start_training's own error still surfaces loudly */
+    }
+    // S66 base-model gating: resolve the run's required assets through the SAME Rust source
+    // try_start verifies against (training_required_assets ↔ resolve_training_assets) and turn
+    // "missing base model" from a toast into a dialog with a one-click pack download. The param
+    // derivation mirrors the request builder below (backend → version/sample_rate/aug fields).
+    try {
+      const cfg = get().config;
+      const assetParams =
+        cfg.backend === "rvc"
+          ? { backend: "rvc", version: cfg.version, sampleRate: cfg.sampleRate, augCopies: cfg.augCopies }
+          : cfg.backend === "vocoder"
+            ? { backend: "vocoder", version: "nsf_hifigan", sampleRate: "44k", augCopies: cfg.vocAugCopies }
+            : cfg.backend === "sovits_diff"
+              ? { backend: "sovits_diff", version: cfg.diffVersion, sampleRate: "44k", augCopies: 0 }
+              : { backend: "sovits", version: cfg.sovitsVersion, sampleRate: "44k", augCopies: cfg.sovitsAugCopies };
+      const assets = await invoke<RequiredAssetStatus[]>("training_required_assets", assetParams);
+      const missing = assets.filter((a) => !a.exists);
+      if (missing.length > 0) {
+        // Split by acquisition channel (review S66): the one-click pack download must list ONLY
+        // the files it will actually fetch — the license-bound vocoder ckpt gets its own dialog.
+        const packItems = missing.filter((a) => a.pack);
+        const selfItem = missing.find((a) => a.selfUrl) ?? null;
+        if (packItems.length > 0) {
+          const packs = [...new Set(packItems.map((a) => a.pack as string))];
+          const files = packItems.map((a) => `· ${a.path}`).join("\n");
+          const c = await useAppStore.getState().showConfirm({
+            title: i18n.t("training.assetsMissingTitle"),
+            body: `${i18n.t("training.assetsMissingBody")}\n${files}`,
+            buttons: [
+              { id: "cancel", label: i18n.t("common.cancel") },
+              { id: "dl", label: i18n.t("training.assetsMissingDl"), kind: "primary" },
+            ],
+          });
+          if (c === "dl") {
+            if (!useAppStore.getState().settingsOpen) useAppStore.getState().toggleSettings();
+            const hfBase = hfBaseForMirror(useMsstModelStore.getState().mirror);
+            // pack downloads are single-flight Rust-side — chain them; progress/errors surface
+            // in the Settings "Model Assets" section the dialog just opened.
+            void (async () => {
+              for (const p of packs) {
+                try {
+                  await invoke("download_asset_pack", { id: p, hfBase });
+                } catch {
+                  /* shown by the Settings asset section (busy/cancel/fail all covered there) */
+                }
+              }
+            })();
+          }
+        }
+        if (selfItem?.selfUrl) {
+          // License-bound asset (vocoder base, CC BY-NC-SA): we may not distribute it — dialog
+          // explains, offers the release page, and shows the exact landing path.
+          const c = await useAppStore.getState().showConfirm({
+            title: i18n.t("training.vocoderBaseTitle"),
+            body: i18n.t("training.vocoderBaseBody", { path: selfItem.path }),
+            buttons: [
+              { id: "cancel", label: i18n.t("common.cancel") },
+              { id: "open", label: i18n.t("training.vocoderBaseOpen"), kind: "primary" },
+            ],
+          });
+          if (c === "open") void openUrl(selfItem.selfUrl).catch(() => {});
+        }
+        if (packItems.length > 0 || selfItem) return;
+        // missing but neither pack nor self-url (unexpected) → fall through; try_start errors loudly.
+      }
+    } catch {
+      /* pre-flight unavailable → fall through; start_training's own gate still rejects loudly */
     }
     const { config, dataset, speakerGroups } = get();
     set({ starting: true });

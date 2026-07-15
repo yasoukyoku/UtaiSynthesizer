@@ -266,6 +266,17 @@ pub struct SynthesisResult {
     pub sample_rate: u32,
 }
 
+/// Command-boundary result for the voice render commands (S66 / O5): the pipeline's samples
+/// are written to disk Rust-side and only the PATH crosses IPC. The old `SynthesisResult`
+/// JSON response was ~100 MB for a 3-minute render and crossed IPC twice (response +
+/// save_temp_audio write-back) — Tauri's postMessage fallback JSON-stringifies such payloads
+/// into a renderer-OOM (the S63b crash class).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenderedAudio {
+    pub path: String,
+    pub sample_rate: u32,
+}
+
 #[derive(Clone, Debug)]
 pub enum VoiceBackendType {
     Rvc,

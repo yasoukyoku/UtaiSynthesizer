@@ -201,6 +201,19 @@ async fn stream_one(
         .map_err(|e| err(format!("DOWNLOAD_REQUEST_FAILED: {e}")))?;
 
     let status = resp.status();
+    // S66 poisoned-proxy guard: some dead/rogue GH proxies answer EVERY url with
+    // "200 + their own HTML page" (ghproxy.site, live-verified). All engine consumers
+    // download binaries/JSON — an HTML content-type is always a wrong answer, and for
+    // un-hashed requests (MSST models) it would otherwise commit as the real file.
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().starts_with("text/html"))
+        .unwrap_or(false);
+    if is_html && status.is_success() {
+        return Err(err(format!("DOWNLOAD_HTML_RESPONSE: proxy served an HTML page: {url}")));
+    }
     let total: Option<u64> = match status.as_u16() {
         206 => {
             // Content-Range: bytes <start>-<end>/<total>
@@ -257,6 +270,21 @@ async fn stream_one(
             Ok(Some(Err(e))) => return Err(err(format!("DOWNLOAD_STREAM_INTERRUPTED: {e}"))),
             Ok(Some(Ok(c))) => c,
         };
+        // First-bytes twin of the content-type guard above (a rogue proxy can lie in the
+        // header). Only the very first bytes of a from-zero transfer are sniffed — resumed
+        // ranges can legally contain anything.
+        if done == 0 {
+            let head: Vec<u8> = chunk
+                .iter()
+                .copied()
+                .skip_while(|b| b.is_ascii_whitespace() || *b == 0xEF || *b == 0xBB || *b == 0xBF)
+                .take(9)
+                .collect();
+            let head = head.to_ascii_lowercase();
+            if head.starts_with(b"<!doctype") || head.starts_with(b"<html") {
+                return Err(err(format!("DOWNLOAD_HTML_RESPONSE: proxy served an HTML page: {url}")));
+            }
+        }
         file.write_all(&chunk).await?;
         done += chunk.len() as u64;
         progress(done, total);

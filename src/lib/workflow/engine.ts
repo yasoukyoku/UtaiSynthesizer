@@ -5,7 +5,7 @@ import type { Workflow } from "../../types/project";
 import { parseWorkflowGraph } from "./graph";
 import { useProjectStore } from "../../store/project";
 import { useWorkflowStore } from "../../store/workflow";
-import { useAppStore } from "../../store/app";
+import { useAppStore, type MissingModelItem } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
@@ -112,6 +112,82 @@ async function rejectIfSeparationBusy(
   return busy;
 }
 
+/** S66 — pre-run model availability scan (the "don't make users guess" rule): every model a run
+ *  参与节点 references is checked BEFORE dispatch, and problems surface as ONE dialog with per-item
+ *  one-click actions instead of a mid-run MSST_MODEL_NOT_CONVERTED / AUX_FILE_MISSING error toast.
+ *  Scope follows the run's real execution domain (Run All = whole graph, single node = its
+ *  ancestor set — the S62b rule). Best-effort: an IPC failure never blocks the run (the Rust
+ *  pipeline still errors loudly). */
+export async function collectMissingModels(
+  workflow: Workflow,
+  targetNodeId: string | null,
+): Promise<MissingModelItem[]> {
+  let scope: Set<string> | null = null;
+  if (targetNodeId !== null) {
+    try {
+      scope = ancestorSetOf(parseWorkflowGraph(workflow), targetNodeId);
+    } catch {
+      scope = null; // unparseable graph → scan everything; the run itself will report the parse error
+    }
+  }
+  const nodes = workflow.nodes.filter((n) => scope === null || scope.has(n.id));
+  const items: MissingModelItem[] = [];
+  const seen = new Set<string>();
+
+  const msstNodes = nodes.filter((n) => n.nodeType === "msstSeparation");
+  if (msstNodes.length > 0) {
+    let installed: Array<{ filename: string; architecture: string; has_onnx: boolean; has_fp16: boolean }> = [];
+    try {
+      // straight from Rust — the store copy may never have been fetched this session
+      installed = await invoke("list_msst_models");
+    } catch {
+      return items; // can't scan → don't block
+    }
+    for (const n of msstNodes) {
+      const modelFile = (n.params.modelFile as string) ?? "";
+      if (!modelFile || seen.has(modelFile)) continue;
+      seen.add(modelFile);
+      const entry = installed.find((m) => m.filename === modelFile);
+      if (!entry) {
+        items.push({ kind: "msstMissing", label: modelFile });
+        continue;
+      }
+      if (!entry.has_onnx && !entry.has_fp16) {
+        // mirror the executeNode effective-precision derivation (catalog arch wins over detection;
+        // Rust's "unknown" detection verdict is not a usable hint)
+        const detected =
+          entry.architecture !== "unknown" ? (entry.architecture as MsstArchitecture) : undefined;
+        const arch = MSST_CATALOG.find((e) => e.filename === modelFile)?.architecture ?? detected;
+        const precision =
+          (n.params.precision as "fp32" | "fp16" | undefined) ??
+          (arch !== undefined ? MSST_DEFAULT_PRECISION[arch] : undefined);
+        items.push({
+          kind: "msstConvert",
+          label: modelFile,
+          filename: modelFile,
+          precision,
+          architecture: arch,
+        });
+      }
+    }
+  }
+
+  if (nodes.some((n) => n.nodeType === "rvc" || n.nodeType === "sovits")) {
+    try {
+      const packs = await invoke<Array<{ id: string; missing: number; downloading: boolean }>>(
+        "asset_pack_status",
+      );
+      const aux = packs.find((p) => p.id === "aux-inference");
+      if ((aux?.missing ?? 0) > 0 && !(aux?.downloading ?? false)) {
+        items.push({ kind: "auxPack", label: "aux-inference" });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  return items;
+}
+
 /** Gate a run BEFORE the caller mutates anything (deposit invalidation, store state). The two run entry
  *  points (WorkflowEditor handleExecute / handleRunSingleNode) MUST await this FIRST — previously the
  *  busy/drain checks lived inside executeWorkflow, i.e. AFTER handleExecute had already stripped the
@@ -128,6 +204,17 @@ export async function preflightRun(
   // Run button flips to Stop, but node buttons don't) — dispatching would clobber the live execution
   // entry and orphan its UI state.
   if (running()) {
+    useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
+    return false;
+  }
+  // S66: unconverted/missing models → the one-click dialog instead of a mid-run error. Read-only
+  // scan, so it rides before the drain; the running() rechecks below still cover its awaits.
+  const missing = await collectMissingModels(workflow, targetNodeId);
+  if (missing.length > 0) {
+    useAppStore.getState().openMissingModels(missing);
+    return false;
+  }
+  if (running()) { // a run may have started while the scan's IPC was in flight
     useAppStore.getState().showToast(i18n.t("workflow.runBusy"), "info");
     return false;
   }
@@ -462,19 +549,21 @@ async function executeNode(
           }
         },
       );
-      let result: { audio: number[]; sample_rate: number };
       voiceInvokesInFlight.set(segmentId, (voiceInvokesInFlight.get(segmentId) ?? 0) + 1);
       try {
         // Options are EXACTLY the snake_case contract keys (voiceDefaults.ts, THE single source of
         // truth): node params store them verbatim, defaults fill anything unset. No other invoke
         // args — the legacy `shallowDiffusion` arg is gone (feature deferred by user decision).
-        result = await invoke<{ audio: number[]; sample_rate: number }>(
+        // S66/O5: Rust writes the wav to outputPath and returns just the path — the old
+        // ~100MB samples JSON (response + save_temp_audio write-back) is gone.
+        await invoke<{ path: string; sample_rate: number }>(
           isRvc ? "run_rvc" : "run_sovits",
           {
             voiceName,
             modelPath,
             audioPath: primaryInput,
             nodeId,
+            outputPath,
             options: buildVoiceOptions(isRvc ? RVC_DEFAULTS : SOVITS_DEFAULTS, params),
           },
         );
@@ -482,11 +571,6 @@ async function executeNode(
         unlisten();
         voiceInvokesInFlight.set(segmentId, Math.max(0, (voiceInvokesInFlight.get(segmentId) ?? 1) - 1));
       }
-      await invoke("save_temp_audio", {
-        samples: result.audio,
-        sampleRate: result.sample_rate,
-        outputPath,
-      });
       outputData.set(0, outputPath);
       break;
     }

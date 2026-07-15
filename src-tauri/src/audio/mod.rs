@@ -478,6 +478,16 @@ pub fn save_wav(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     Ok(())
 }
 
+/// tmp+rename twin of `save_wav` (16-bit) — a killed process can never leave a truncated
+/// wav that a cache short-circuit (or a stale-path consumer) would trust. Same quantization
+/// as save_wav, so callers migrating from a save_wav round trip stay byte-identical.
+pub fn save_wav_atomic(path: &Path, buffer: &AudioBuffer) -> Result<()> {
+    let tmp = path.with_extension("wav.tmp");
+    save_wav(&tmp, buffer)?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| crate::UtaiError::Audio(format!("Atomic wav rename failed: {}", e)))
+}
+
 /// 32-bit float writer for INTERLEAVED buffers — full precision, no clamping (preserve
 /// inter-sample overshoot for downstream gain), same philosophy as the separation stems'
 /// planar twin (separation/pipeline.rs save_wav, which is numerics-locked and takes

@@ -11,12 +11,13 @@ import { useAudioStore } from "../../store/audio";
 import { useWorkflowStore } from "../../store/workflow";
 import { useTrainingStore } from "../../store/training";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { applyMirror, applyGhMirror } from "../../lib/models/msst-catalog";
+import { applyMirror, applyGhMirror, hfBaseForMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
 import { backendErrorMessage, isCancelError } from "../../lib/backendError";
 import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type UpdateInfo } from "../../lib/update";
+import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
 import { useDraggable } from "../../lib/useDraggable";
 import "./Settings.css";
 
@@ -226,20 +227,28 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setSrcTest(null);
   }, [mirror.type, mirror.customUrl]);
   // GitHub mirror — its own selection + probe state, fully independent of the HF
-  // test above so the two verdicts can never cross-talk.
+  // test above so the two verdicts can never cross-talk. S66: presets are data
+  // (remote-refreshable); the selected id falls back to the list head when the
+  // remote list dropped it (mirrors ghProxyPrefix's resolution).
   const ghMirror = useMsstModelStore((s) => s.ghMirror);
   const setGhMirror = useMsstModelStore((s) => s.setGhMirror);
+  const ghPresets = useMsstModelStore((s) => s.ghPresets);
+  const refreshGhPresets = useMsstModelStore((s) => s.refreshGhPresets);
+  useEffect(() => { void refreshGhPresets(); }, [refreshGhPresets]);
+  const ghEffectivePresetId = ghPresets.find((p) => p.id === ghMirror.presetId)?.id ?? ghPresets[0]?.id;
   const [ghSrcTest, setGhSrcTest] = useState<ProbeResult | null>(null);
   const [ghSrcTesting, setGhSrcTesting] = useState(false);
   const handleGhSrcTest = useCallback(async () => {
     setGhSrcTesting(true);
     setGhSrcTest(null);
-    setGhSrcTest(await runSrcProbe(applyGhMirror(GH_PROBE_ASSET, ghMirror)));
+    setGhSrcTest(await runSrcProbe(applyGhMirror(GH_PROBE_ASSET, ghMirror, ghPresets)));
     setGhSrcTesting(false);
-  }, [ghMirror]);
+  }, [ghMirror, ghPresets]);
   useEffect(() => {
     setGhSrcTest(null);
-  }, [ghMirror.type, ghMirror.customUrl]);
+    // ghEffectivePresetId included (review S66): a remote preset-list refresh can change which
+    // proxy the SAME persisted choice resolves to — the old verdict would describe a different host.
+  }, [ghMirror.type, ghMirror.presetId, ghMirror.customUrl, ghEffectivePresetId]);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
   const [device, setDevice] = useState("auto");
   const [saving, setSaving] = useState(false);
@@ -248,6 +257,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [cudaProgress, setCudaProgress] = useState<CudaProgress | null>(null);
   const [cudaError, setCudaError] = useState<string | null>(null);
   const [cudaJustInstalled, setCudaJustInstalled] = useState(false);
+  // S66: on-disk layout for the panel (copyable paths = users can check/share the runtime
+  // by hand) + per-lane presence + the exact filenames the local-install picker expects.
+  const [cudaPaths, setCudaPaths] = useState<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] } | null>(null);
+  const refreshCudaPaths = useCallback(() => {
+    invoke<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] }>("cuda_runtime_paths")
+      .then(setCudaPaths)
+      .catch(() => {});
+  }, []);
   const [dataDir, setDataDir] = useState("");
   // S64: configured-but-missing data dir recovered at startup (recreated empty / fell back) — the
   // persistent surface for the startup toast (App.tsx), so the cause stays findable after 5s.
@@ -296,7 +313,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
       .then(setDataDirIssue)
       .catch(() => {});
     refreshRuntime();
-  }, [refreshRuntime]);
+    refreshCudaPaths();
+  }, [refreshRuntime, refreshCudaPaths]);
 
   useEffect(() => {
     const unlisten = listen<PyenvProgress>("pyenv-progress", (e) => {
@@ -537,9 +555,25 @@ export function Settings({ onClose }: { onClose: () => void }) {
         // also verifies the full provider dependency set, and an optimistic true that reverts on the
         // next restart reads as "CUDA disappeared" (S64b beta report). The hardware badge re-queries
         // too: the in-session setup_cuda_dll_paths re-run can flip cuda_available without a restart.
-        invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
+        // The green "restart to activate" note keys on the SAME real verdict (review S66: a partial
+        // local install must not read as ready).
+        invoke<boolean>("is_cuda_runtime_ready")
+          .then((r) => {
+            setCudaReady(r);
+            setCudaJustInstalled(r);
+          })
+          .catch(() => {});
         invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
-        setCudaJustInstalled(true);
+        invoke<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] }>("cuda_runtime_paths")
+          .then(setCudaPaths)
+          .catch(() => {});
+      } else if (e.payload.stage === "error") {
+        // Terminal failure/cancel (review S66): without this, a late buffered progress event
+        // re-latched cudaDownloading=true forever after a cancel.
+        setCudaDownloading(false);
+        invoke<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] }>("cuda_runtime_paths")
+          .then(setCudaPaths)
+          .catch(() => {});
       } else {
         // Any non-terminal event re-latches a remounted panel onto the running download.
         setCudaDownloading(true);
@@ -564,6 +598,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const handleAutoCheckToggle = (v: boolean) => {
     setAutoCheck(v);
     setAutoUpdateCheckEnabled(v);
+  };
+
+  // S66: startup missing-component check toggle (the dialog's "不再提醒" writes the same key).
+  const [startupCompCheck, setStartupCompCheck] = useState(startupComponentCheckEnabled);
+  const handleStartupCompToggle = (v: boolean) => {
+    setStartupCompCheck(v);
+    setStartupComponentCheckEnabled(v);
   };
 
   const handleUpdateCheck = useCallback(async () => {
@@ -621,13 +662,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       // The chosen HF source rides along as a host-replacement base and is tried FIRST (Rust
       // dedupes it out of the fixed huggingface.co → hf-mirror.com rotation) — the hf-mirror
       // preset must reorder the rotation, not be silently ignored (audit S64).
-      const hfBase =
-        mirror.type === "hf-mirror"
-          ? "https://hf-mirror.com"
-          : mirror.type === "custom" && mirror.customUrl.trim()
-            ? mirror.customUrl.trim()
-            : null;
-      await invoke("download_asset_pack", { id, hfBase });
+      await invoke("download_asset_pack", { id, hfBase: hfBaseForMirror(mirror) });
     } catch (e) {
       if (!isCancelError(e)) setAssetMsg(backendErrorMessage(e) ?? String(e));
     } finally {
@@ -657,6 +692,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
       CUDA_DL_SKIP: L("cudaPgSkip"),
       CUDA_DL_FINALIZING: L("cudaPgFinalizing"),
       CUDA_DL_DONE: L("cudaPgDone"),
+      CUDA_DL_LOCAL_PARTIAL: L("cudaPgLocalPartial"),
+      CUDA_DL_CANCELLED: L("cudaPgCancelled"),
+      CUDA_DL_FAILED: L("cudaPgFailed"),
     };
     const base = p.code ? map[p.code] : undefined;
     if (!base) return p.message;
@@ -668,13 +706,45 @@ export function Settings({ onClose }: { onClose: () => void }) {
     setCudaError(null);
     setCudaProgress({ stage: "start", progress: 0, message: "Starting..." });
     try {
-      await invoke("download_cuda_runtime");
+      // preferCnMirrors: the HF-source choice doubles as the "I'm in mainland China" signal —
+      // it reorders the CUDA rotation (Chinese PyPI mirrors / hf-mirror first). S66.
+      await invoke("download_cuda_runtime", { preferCnMirrors: mirror.type === "hf-mirror" });
     } catch (e) {
+      if (isCancelError(e)) {
+        // user cancelled — resumable, not an error (every .part is kept)
+        setCudaDownloading(false);
+        setCudaProgress(null);
+        return;
+      }
       // CUDA_GPU_REQUIRED etc. → localized via the shared mapper (raw fallback for oddballs).
       setCudaError(backendErrorMessage(e) ?? String(e));
       setCudaDownloading(false);
     }
-  }, []);
+  }, [mirror.type]);
+
+  // S66 install-from-local-file: the user picks the wheels/nupkg listed in the note below
+  // (exact filenames from cuda_runtime_paths.expectedFiles) — mutual-aid friendly.
+  const handleCudaLocalInstall = useCallback(async () => {
+    const picked = await open({
+      multiple: true,
+      filters: [{ name: "CUDA runtime files", extensions: ["whl", "nupkg", "zip"] }],
+    });
+    if (!picked) return;
+    const paths = Array.isArray(picked) ? picked : [picked];
+    setCudaError(null);
+    setCudaDownloading(true);
+    setCudaProgress({ stage: "local", progress: 0, message: "Installing from local files..." });
+    try {
+      await invoke("install_cuda_runtime_local", { paths });
+    } catch (e) {
+      setCudaError(backendErrorMessage(e) ?? String(e));
+    } finally {
+      setCudaDownloading(false);
+      invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
+      invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
+      refreshCudaPaths();
+    }
+  }, [refreshCudaPaths]);
 
   const L = (key: string) => {
     const map: Record<string, Record<string, string>> = {
@@ -696,6 +766,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
       assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
       assetNote: { zh: "推理核心包 = 人声轨合成 / 翻唱 / 音高提取的必备模型（约 1.4GB）；训练底模按需下载。已在下载中断处自动续传。", en: "The core pack holds the models required for vocal-track synthesis / covers / pitch extraction (~1.4GB); training bases are optional. Interrupted downloads resume automatically.", ja: "推論コアパックはボーカルトラック合成／カバー／ピッチ抽出に必須のモデルです（約 1.4GB）。学習ベースは必要に応じて。中断したダウンロードは自動で再開されます。" },
+      assetStartupCheck: { zh: "启动时检查必要组件（缺失时弹窗提示）", en: "Check required components on startup (dialog when missing)", ja: "起動時に必須コンポーネントを確認（不足時にダイアログ）" },
       hardware: { zh: "硬件", en: "Hardware", ja: "ハードウェア" },
       gpu: { zh: "显卡", en: "GPU", ja: "GPU" },
       cuda: { zh: "CUDA 可用", en: "CUDA Available", ja: "CUDA 利用可能" },
@@ -721,6 +792,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaPgSkip: { zh: "已存在，跳过", en: "Already present — skipped", ja: "既に存在するためスキップ" },
       cudaPgFinalizing: { zh: "收尾中…", en: "Finalizing…", ja: "仕上げ中…" },
       cudaPgDone: { zh: "CUDA 运行时就绪，重启应用后生效", en: "CUDA runtime ready — restart to activate", ja: "CUDA ランタイム準備完了 — 再起動で有効になります" },
+      cudaCancelDl: { zh: "取消下载", en: "Cancel download", ja: "ダウンロード中止" },
+      cudaPgLocalPartial: { zh: "已安装所选文件，但仍缺组件", en: "Selected files installed — parts still missing", ja: "選択ファイルを導入しましたが、まだ不足があります" },
+      cudaPgCancelled: { zh: "已取消（进度已保留，可续传）", en: "Cancelled (progress kept — resumable)", ja: "キャンセルしました（進捗は保持、再開可能）" },
+      cudaPgFailed: { zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" },
+      cudaMissing: { zh: "缺失组件", en: "Missing parts", ja: "不足コンポーネント" },
+      cudaLocalNote: { zh: "「从本地文件安装」接受以下官方文件（可由他人代为下载后拷贝）：", en: "“Install from local file” accepts these official files (a friend can download them for you):", ja: "「ローカルからインストール」は以下の公式ファイルを受け付けます（他の人にダウンロードしてもらってもOK）：" },
+      cudaDllDir: { zh: "CUDA 运行库目录", en: "CUDA DLL folder", ja: "CUDA DLL フォルダ" },
+      cudaOrtDir: { zh: "ORT CUDA 目录", en: "ORT CUDA folder", ja: "ORT CUDA フォルダ" },
       storage: { zh: "存储位置", en: "Storage", ja: "保存場所" },
       stDirRecreated: { zh: "警告：配置的数据目录 {configured} 此前不存在，已重新创建（内容为空）。若数据在别处，请检查该盘/目录。", en: "Warning: the configured data folder {configured} was missing and has been recreated (empty). If your data lives elsewhere, check that drive/folder.", ja: "警告：設定されたデータフォルダ {configured} が存在しなかったため、再作成しました（空です）。データが別の場所にある場合は、そのドライブ/フォルダを確認してください。" },
       stDirFellBack: { zh: "警告：配置的数据目录 {configured} 不可用（盘符不存在？），本次改用程序旁的默认目录。恢复该盘后重启即可回到原目录。", en: "Warning: the configured data folder {configured} is unavailable (drive missing?). Using the default folder next to the program for this session; restore the drive and restart to return to it.", ja: "警告：設定されたデータフォルダ {configured} が利用できません（ドライブ未接続？）。今回はプログラム横の既定フォルダを使用します。ドライブを戻して再起動すると元に戻ります。" },
@@ -1106,17 +1185,40 @@ export function Settings({ onClose }: { onClose: () => void }) {
           <div className="settings-field" style={{ marginTop: 4 }}>
             <label>{L("ghSrcTitle")}</label>
             <div className="settings-source">
-              {(["direct", "ghfast", "ghproxy", "custom"] as const).map((t) => (
-                <label key={t} className={`settings-source-opt ${ghMirror.type === t ? "active" : ""}`}>
-                  <input
-                    type="radio"
-                    name="ghsource"
-                    checked={ghMirror.type === t}
-                    onChange={() => setGhMirror({ type: t, customUrl: ghMirror.customUrl })}
-                  />
-                  <span>{t === "direct" ? L("ghDirect") : t === "ghfast" ? "ghfast.top" : t === "ghproxy" ? "gh-proxy.com" : L("srcCustom")}</span>
-                </label>
-              ))}
+              {/* S66: presets are DATA (remote-refreshable mirrors.json > builtin fallback) —
+                  public proxies rot in 6-18 months, so the list must never be an enum again. */}
+              <label className={`settings-source-opt ${ghMirror.type === "direct" ? "active" : ""}`}>
+                <input
+                  type="radio"
+                  name="ghsource"
+                  checked={ghMirror.type === "direct"}
+                  onChange={() => setGhMirror({ type: "direct", customUrl: ghMirror.customUrl })}
+                />
+                <span>{L("ghDirect")}</span>
+              </label>
+              {ghPresets.map((p) => {
+                const active = ghMirror.type === "preset" && ghEffectivePresetId === p.id;
+                return (
+                  <label key={p.id} className={`settings-source-opt ${active ? "active" : ""}`}>
+                    <input
+                      type="radio"
+                      name="ghsource"
+                      checked={active}
+                      onChange={() => setGhMirror({ type: "preset", presetId: p.id, customUrl: ghMirror.customUrl })}
+                    />
+                    <span>{p.id}</span>
+                  </label>
+                );
+              })}
+              <label className={`settings-source-opt ${ghMirror.type === "custom" ? "active" : ""}`}>
+                <input
+                  type="radio"
+                  name="ghsource"
+                  checked={ghMirror.type === "custom"}
+                  onChange={() => setGhMirror({ type: "custom", customUrl: ghMirror.customUrl })}
+                />
+                <span>{L("srcCustom")}</span>
+              </label>
               {ghMirror.type === "custom" && (
                 <input
                   type="text"
@@ -1186,6 +1288,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
           )}
           {assetMsg && <p className="settings-error">{assetMsg}</p>}
           <p className="settings-note">{L("assetNote")}</p>
+          <label className="training-check-row" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <input
+              type="checkbox"
+              checked={startupCompCheck}
+              onChange={(e) => handleStartupCompToggle(e.target.checked)}
+            />
+            <span>{L("assetStartupCheck")}</span>
+          </label>
         </section>
 
         <section className="settings-section" style={{ marginTop: 16 }}>
@@ -1218,6 +1328,16 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 />
               </div>
               <span className="settings-progress-text">{cudaProgressText(cudaProgress)}</span>
+              {/* local-file installs are a fast synchronous extraction — cancel_cuda_download
+                  only reaches the NETWORK flow's flag (review S66: a no-op button lies). */}
+              {cudaProgress.stage !== "local" && (
+                <button
+                  className="settings-mini-btn"
+                  onClick={() => { void invoke("cancel_cuda_download"); }}
+                >
+                  {L("cudaCancelDl")}
+                </button>
+              )}
             </div>
           )}
 
@@ -1227,6 +1347,32 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
           {cudaJustInstalled && (
             <p className="settings-note" style={{ color: "#4ade80" }}>{L("cudaRestart")}</p>
+          )}
+
+          {/* S66: local-file install + on-disk layout — copyable paths so users can inspect the
+              runtime or install files a friend downloaded for them (mainland mutual-aid). */}
+          {!cudaDownloading && (
+            <button className="settings-mini-btn" style={{ marginTop: 6 }} onClick={handleCudaLocalInstall}>
+              {L("rtLocalInstall")}
+            </button>
+          )}
+          {cudaPaths && (
+            <>
+              {cudaPaths.missing.length > 0 && !cudaDownloading && (
+                <p className="settings-note">
+                  {L("cudaMissing")}: {cudaPaths.missing.join(" · ")}
+                </p>
+              )}
+              <p className="settings-note" style={{ userSelect: "text" }}>
+                {L("cudaLocalNote")} {cudaPaths.expectedFiles.join(" · ")}
+              </p>
+              <div className="settings-field" style={{ flexDirection: "column", alignItems: "flex-start", gap: 2 }}>
+                <label>{L("cudaDllDir")}</label>
+                <span className="settings-value selectable" style={{ maxWidth: "100%", wordBreak: "break-all", whiteSpace: "normal", fontSize: 11 }}>{cudaPaths.dllDir}</span>
+                <label style={{ marginTop: 2 }}>{L("cudaOrtDir")}</label>
+                <span className="settings-value selectable" style={{ maxWidth: "100%", wordBreak: "break-all", whiteSpace: "normal", fontSize: 11 }}>{cudaPaths.ortDir}</span>
+              </div>
+            </>
           )}
         </section>
 

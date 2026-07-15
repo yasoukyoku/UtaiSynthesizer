@@ -7,7 +7,7 @@ import { useHistoryStore } from "../../store/history";
 import { useWorkflowStore } from "../../store/workflow";
 import { useTranslation } from "react-i18next";
 import * as playback from "../../lib/audio/playback";
-import { collectDirtyVocals, renderDirtyVocals, splitSegmentVocalAware } from "../../lib/vocal/vocalRender";
+import { collectDirtyVocals, renderDirtyVocals, splitSegmentVocalAware, preflightVocalModels } from "../../lib/vocal/vocalRender";
 import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback } from "../../lib/clipboard";
 import { formatBarBeat, type TimeAxis } from "../../lib/timeAxis";
 import { contentEndTick } from "../../lib/trackLayout";
@@ -212,6 +212,9 @@ export function Toolbar() {
       const dirty = collectDirtyVocals(tempo);
       const workflowBusy = Object.values(useWorkflowStore.getState().executions).some((e) => e?.status === "running");
       if (dirty.length > 0 && !workflowBusy) {
+        // S66: missing core models → the one-click dialog; don't start playback either (the
+        // stale/missing bakes would mislead — the user asked to hear the CURRENT notes).
+        if (!(await preflightVocalModels())) return;
         autoRenderAbortRef.current = false;
         autoRenderingRef.current = true;
         setAutoRendering(true);

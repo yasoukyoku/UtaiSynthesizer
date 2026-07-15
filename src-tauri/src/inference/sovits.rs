@@ -661,7 +661,7 @@ pub(crate) fn apply_cluster_blend(c: &mut Array2<f32>, cluster: Option<&ClusterA
             }
             None => {
                 tracing::warn!(
-                    "cluster_ratio={} 但该模型没有可用的聚类/检索资产——跳过（与原版缺文件时的行为一致）",
+                    "cluster_ratio={} but the model has no usable cluster/retrieval asset — skipping (matches the original's missing-file behavior)",
                     cluster_ratio
                 );
             }

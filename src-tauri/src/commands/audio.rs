@@ -258,22 +258,6 @@ pub async fn transpose_audio(
 }
 
 #[tauri::command]
-pub async fn save_temp_audio(
-    samples: Vec<f32>,
-    sample_rate: u32,
-    output_path: String,
-) -> Result<String, String> {
-    let buf = crate::audio::AudioBuffer {
-        samples,
-        sample_rate,
-        channels: 1,
-    };
-    crate::audio::save_wav(&PathBuf::from(&output_path), &buf)
-        .map_err(|e| e.to_string())?;
-    Ok(output_path)
-}
-
-#[tauri::command]
 pub async fn ensure_cache_dir(
     state: State<'_, Arc<AppState>>,
     segment_id: String,

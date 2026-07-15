@@ -35,6 +35,27 @@ export const VOCAL_SPK_MIX_DIFFUSION = "SPK_MIX_DIFFUSION";
 export const VOCAL_OOV = "VOCAL_OOV";
 export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
 
+/** S66 pre-render model check for the vocal track: the core aux pack (ScoreToCV / ContentVec /
+ *  RMVPE / vocoder onnx) must be present or the render dies mid-flight with AUX_FILE_MISSING —
+ *  instead, open the one-click MissingModelsDialog and return false so the caller aborts. Shared
+ *  by the sidebar Render button and the Play-time auto-render batch (never fork). Best-effort:
+ *  an IPC failure never blocks the render (Rust still errors loudly). */
+export async function preflightVocalModels(): Promise<boolean> {
+  try {
+    const packs = await invoke<Array<{ id: string; missing: number; downloading: boolean }>>(
+      "asset_pack_status",
+    );
+    const aux = packs.find((p) => p.id === "aux-inference");
+    if ((aux?.missing ?? 0) > 0 && !(aux?.downloading ?? false)) {
+      useAppStore.getState().openMissingModels([{ kind: "auxPack", label: "aux-inference" }]);
+      return false;
+    }
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
 /** Map a vocal-render failure to its user-facing message. THE single error→text mapping for BOTH render
  *  paths (the sidebar's manual Render button and the Play-time auto-render batch) — never fork it. Codes
  *  carrying a detail payload (`CODE: detail`) interpolate it into the i18n string. */
@@ -258,7 +279,9 @@ export async function renderVocalSegment(req: {
       segmentId: `${segmentId}/v${Date.now().toString(36)}${(vocalRunSeq++).toString(36)}`,
     });
     const outputPath = `${raw.replace(/\\/g, "/")}/vocal.wav`;
-    const result = await invoke<{ audio: number[]; sample_rate: number }>("render_vocal_segment", {
+    // S66/O5: Rust writes the wav to outputPath and returns just the path (the old samples-JSON
+    // response + save_temp_audio write-back peaked at ~200MB of IPC per render).
+    await invoke<{ path: string; sample_rate: number }>("render_vocal_segment", {
       voiceName: req.voiceName,
       modelPath: req.modelPath,
       nodeId: segmentId,
@@ -267,9 +290,9 @@ export async function renderVocalSegment(req: {
       f0Voiced: req.f0Voiced,
       loudnessEnv: req.loudnessEnv,
       formantEnv: req.formantEnv,
+      outputPath,
       options: req.options,
     });
-    await invoke("save_temp_audio", { samples: result.audio, sampleRate: result.sample_rate, outputPath });
     const info = await invoke<AudioFileInfo>("load_audio_file", { path: outputPath });
     if (seg()) {
       deposit([{ laneId: VOCAL_LANE_ID, laneLabel, group: laneLabel, audioPath: outputPath, totalDurationMs: info.duration_ms, waveformPeaks: info.peaks, outputNodeId: VOCAL_LANE_ID, renderedSig: req.renderedSig }]);

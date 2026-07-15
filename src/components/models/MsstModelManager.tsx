@@ -13,7 +13,7 @@ import {
   MSST_DEFAULT_PRECISION,
   MSST_FP16_ARCHS,
   MSST_FP16_TIP,
-  ghProxyPrefix,
+  ghRouteOrder,
   t18,
   type MsstArchitecture,
   type MsstCatalogEntry,
@@ -92,7 +92,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
         <button className="panel-close" onClick={onClose}>X</button>
       </div>
 
-      {error && <div className="msst-error" onClick={clearError}>{error}</div>}
+      {error && <div className="msst-error" onClick={clearError}>{backendErrorMessage(error) ?? error}</div>}
 
       <div className="rm-top-tabs">
         <button className={topTab === "separation" ? "active" : ""} onClick={() => setTopTab("separation")}>
@@ -200,6 +200,9 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
               <div className="msst-installed-list">
                 {installed.map((m) => {
                   const isConverting = downloading[m.filename]?.stage === "converting";
+                  // S66: conversions are single-flight app-wide (Rust convert slot is the
+                  // authority) — gray every other convert button while one runs.
+                  const anyConverting = Object.values(downloading).some((d) => d.stage === "converting");
                   // Catalog arch wins: hash-named official weights (demucs .th) defeat Rust's
                   // filename detection, which reports "unknown" for them.
                   const arch = (MSST_CATALOG.find((e) => e.filename === m.filename)?.architecture
@@ -215,10 +218,11 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                         {isConverting ? (
                           <span className="msst-converting">...</span>
                         ) : !m.has_onnx && !m.has_fp16 ? (
-                          <button className="msst-convert-btn" onClick={() => convertPrecision(m.filename, undefined, archHint)}>Convert</button>
+                          <button className="msst-convert-btn" disabled={anyConverting} onClick={() => convertPrecision(m.filename, undefined, archHint)}>Convert</button>
                         ) : fp16Capable && !m.has_fp16 ? (
                           <button
                             className="msst-convert-btn"
+                            disabled={anyConverting}
                             title={t18(MSST_FP16_TIP, lang)}
                             onClick={() => convertPrecision(m.filename, "fp16", archHint)}
                           >
@@ -227,6 +231,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                         ) : fp16Capable && !m.has_onnx ? (
                           <button
                             className="msst-convert-btn"
+                            disabled={anyConverting}
                             title={t18({ zh: "从 ckpt 完整导出 fp32（较慢）", en: "Full fp32 export from the ckpt (slower)", ja: "ckpt から fp32 を完全エクスポート（時間がかかります）" }, lang)}
                             onClick={() => convertPrecision(m.filename, "fp32", archHint)}
                           >
@@ -559,10 +564,11 @@ function GameEngineTab({ lang }: { lang: string }) {
     setBusy(true);
     setDl({ stage: "download", downloaded: 0, total: 0 });
     try {
-      // ghProxy → Rust gh_proxy: the Settings GitHub-mirror prefix (null = direct);
-      // the backend puts the proxied GH URL first in its mirror rotation.
+      // ghRoutes → Rust gh_routes: the full ordered GH failover chain (chosen proxy →
+      // direct → other presets, S66); the backend interleaves it with its static rotation.
+      const { ghMirror, ghPresets } = useMsstModelStore.getState();
       const st = await invoke<{ installed: boolean }>("download_game_package", {
-        ghProxy: ghProxyPrefix(useMsstModelStore.getState().ghMirror),
+        ghRoutes: ghRouteOrder(ghMirror, ghPresets),
       });
       setInstalled(st.installed);
       showToast(t18({ zh: "GAME 引擎已安装", en: "GAME engine installed", ja: "GAME エンジンをインストールしました" }, lang), "success");

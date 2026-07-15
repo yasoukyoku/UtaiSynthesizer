@@ -404,7 +404,7 @@ pub fn knn_blend(
     let dim = features.ncols();
     if index.len() == 0 || dim != index.dim() {
         tracing::warn!(
-            "检索索引维度不匹配（特征 {}，索引 {}）——跳过检索",
+            "retrieval index dim mismatch (features {}, index {}) — skipping retrieval",
             dim,
             index.dim()
         );
@@ -473,7 +473,7 @@ pub fn nearest_cluster_centers(features: &Array2<f32>, centers: &KnnIndex) -> Ar
     let mut out = Array2::<f32>::zeros((t, dim));
     if centers.len() == 0 || dim != centers.dim() {
         tracing::warn!(
-            "聚类中心维度不匹配（特征 {}，中心 {}）——跳过聚类",
+            "cluster center dim mismatch (features {}, centers {}) — skipping cluster blend",
             dim,
             centers.dim()
         );

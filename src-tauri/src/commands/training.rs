@@ -29,6 +29,11 @@ pub async fn start_training(
     // this guard is the authoritative gate.
     let _audition_lock =
         crate::commands::audition::FlightGuard::acquire(crate::commands::audition::BUSY_RETRY_MSG)?;
+    // S66: training ↔ conversion are excluded BOTH ways (each forks a multi-GB torch python;
+    // the convert side checks training.is_active() in acquire_convert_slot).
+    if state.task_active("convert") {
+        return Err("CONVERT_BUSY".into());
+    }
     let data_dir = data_root(&state);
     let audition_dir =
         crate::training::workspace_path(&data_dir, &request.model_name).join("audition");
@@ -53,6 +58,60 @@ pub async fn start_training(
     // would evict the whole fleet for nothing.
     state.inference.engine.release_gpu_sessions_except(&[]);
     Ok(())
+}
+
+/// One row of the S66 pre-start asset check (mirrors resolve_training_assets — the single
+/// source try_start verifies against, so this pre-flight can never drift from the real gate).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequiredAssetStatus {
+    pub label: String,
+    pub path: String,
+    pub exists: bool,
+    /// Asset-pack id covering this file (drives the one-click download button); None = not
+    /// pack-distributed.
+    pub pack: Option<String>,
+    /// Manual-download page for license-bound assets (the CC BY-NC-SA vocoder base ckpt).
+    pub self_url: Option<String>,
+}
+
+#[tauri::command]
+pub fn training_required_assets(
+    state: State<'_, Arc<AppState>>,
+    backend: String,
+    version: String,
+    sample_rate: String,
+    aug_copies: u32,
+) -> Result<Vec<RequiredAssetStatus>, String> {
+    let data_dir = data_root(&state);
+    let assets =
+        crate::training::resolve_training_assets(&data_dir, &backend, &version, &sample_rate, aug_copies)
+            .map_err(|e| e.to_string())?;
+    let models_dir = data_dir.join("models");
+    Ok(assets
+        .required
+        .into_iter()
+        .map(|(label, p)| {
+            let rel = p
+                .strip_prefix(&models_dir)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"));
+            let pack = rel
+                .as_deref()
+                .and_then(crate::commands::assets::pack_for_rel)
+                .map(|s| s.to_string());
+            let self_url = (pack.is_none()
+                && rel.as_deref().is_some_and(|r| r.starts_with("training/vocoder/")))
+            .then(|| "https://github.com/openvpi/SingingVocoders/releases/tag/v0.0.2".to_string());
+            RequiredAssetStatus {
+                label,
+                path: p.to_string_lossy().to_string(),
+                exists: p.is_file(),
+                pack,
+                self_url,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]

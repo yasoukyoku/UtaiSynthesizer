@@ -9,16 +9,17 @@
 //   spawns the NSIS setup with /P /R (passive UI, relaunch after install) and exits this process —
 //   update_install never returns on success.
 //
-// GH mirror (audit-hardened, S64):
-//   - the prefix comes through download::sanitize_gh_prefix — **https only**, because the plugin's
+// GH mirror (audit-hardened S64; generalized to an ordered ROUTE LIST S66):
+//   - the frontend sends ghRouteOrder(): proxy prefixes with an "" marker at the DIRECT position
+//     (chosen proxy before direct, remaining presets after) — public proxies die without notice,
+//     so every consumer gets the FULL failover chain, not one mirror + one retry.
+//   - every prefix passes download::sanitize_gh_prefix — **https only**, because the plugin's
 //     endpoint validation hard-rejects http in RELEASE builds (warn-only in dev: the one shape of
-//     breakage `tauri dev` can never reproduce). An http prefix degrades to the direct route.
-//   - check endpoints = [<prefix>/<direct-json>, <direct-json>] tried in order (2XX wins).
-//   - the announced download_url (a github.com release asset) is rewritten through the same prefix,
-//     and the ORIGINAL url is kept: if the mirror download fails, ONE direct-route retry runs before
-//     giving up (public proxies die without notice — a dead mirror must never make an update
-//     uninstallable while the direct route works). minisign verifies file CONTENT, so any source is
-//     tamper-safe.
+//     breakage `tauri dev` can never reproduce). An invalid prefix degrades to the direct route.
+//   - check endpoints = the same ordered chain (2XX wins); the announced download_url (a github.com
+//     release asset) becomes candidate[0] with the REST kept as install-time fallbacks — a dead
+//     mirror must never make an update uninstallable while any route works. minisign verifies file
+//     CONTENT, so any source is tamper-safe.
 //
 // Errors are stable CODEs (i18n via src/lib/backendError.ts): UPDATE_CHECK_FAILED / UPDATE_NO_PENDING /
 // UPDATE_DOWNLOAD_FAILED / UPDATE_INSTALL_FAILED; cancels carry the CANCELLED sentinel (swallowed
@@ -44,10 +45,10 @@ const UPDATE_ENDPOINT: &str =
 /// which would kill legitimately slow transfers of a ~100MB installer).
 const DOWNLOAD_STALL: Duration = Duration::from_secs(60);
 
-/// Update handle between check and install, plus the DIRECT download URL kept when the announced
-/// one was rewritten through the GH mirror (the install's fallback route). install() takes it out
-/// and RESTORES it on failure so a retry needs no re-check.
-static PENDING_UPDATE: Mutex<Option<(tauri_plugin_updater::Update, Option<tauri::Url>)>> =
+/// Update handle between check and install, plus the REMAINING download-route candidates
+/// (ordered; consumed head-first when a route fails). install() takes the pair out and
+/// RESTORES it on failure so a retry needs no re-check.
+static PENDING_UPDATE: Mutex<Option<(tauri_plugin_updater::Update, Vec<tauri::Url>)>> =
     Mutex::new(None);
 
 /// Cooperative cancel for the in-flight download (update_cancel flips it; the watchdog loop drops
@@ -84,61 +85,105 @@ fn is_github_family(url: &tauri::Url) -> bool {
     }
 }
 
+/// Expand an ordered route list ("" = direct, else proxy prefix) over `base`, sanitizing each
+/// prefix and deduping — the SINGLE builder for both the check endpoints and the download
+/// candidates, so their orders can never drift.
+fn expand_routes(routes: &Option<Vec<String>>, base: &str) -> Vec<tauri::Url> {
+    let mut out: Vec<tauri::Url> = Vec::new();
+    let mut push = |u: Option<tauri::Url>| {
+        if let Some(u) = u {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    };
+    let direct = tauri::Url::parse(base).ok();
+    let mut had_direct = false;
+    if let Some(rs) = routes {
+        for r in rs {
+            if r.is_empty() {
+                had_direct = true;
+                push(direct.clone());
+            } else if let Some(p) = crate::download::sanitize_gh_prefix(Some(r.clone())) {
+                push(tauri::Url::parse(&format!("{p}/{base}")).ok());
+            }
+        }
+    }
+    if !had_direct {
+        push(direct);
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn update_check(
     app: tauri::AppHandle,
-    gh_proxy: Option<String>,
+    gh_routes: Option<Vec<String>>,
 ) -> Result<Option<UpdateInfo>, String> {
-    let proxy = crate::download::sanitize_gh_prefix(gh_proxy);
-    let mut endpoints: Vec<tauri::Url> = Vec::new();
-    if let Some(p) = &proxy {
-        // Mirror first, direct second — endpoints are tried in order until one answers 2XX.
-        if let Ok(u) = tauri::Url::parse(&format!("{p}/{UPDATE_ENDPOINT}")) {
-            endpoints.push(u);
+    let endpoints = expand_routes(&gh_routes, UPDATE_ENDPOINT);
+    if endpoints.is_empty() {
+        return Err("UPDATE_CHECK_FAILED: no valid endpoint".into());
+    }
+
+    // ONE endpoint per check() call (review S66): the plugin's own endpoint list only falls
+    // through on transport/non-2XX errors — a poisoned proxy answering 200 + an HTML page
+    // (ghproxy.site, live-verified) parse-fails and ABORTS the whole check, masking every
+    // later (healthy) route. Looping ourselves restores "first WORKING route wins".
+    let mut check_result: std::result::Result<Option<tauri_plugin_updater::Update>, String> =
+        Err("UPDATE_CHECK_FAILED: no endpoint reachable".into());
+    for ep in endpoints {
+        let updater = app
+            .updater_builder()
+            .endpoints(vec![ep.clone()])
+            .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?;
+        match updater.check().await {
+            Ok(r) => {
+                check_result = Ok(r);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("update check failed via {ep}: {e}");
+                check_result = Err(format!("UPDATE_CHECK_FAILED: {e}"));
+            }
         }
     }
-    endpoints.push(tauri::Url::parse(UPDATE_ENDPOINT).map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?);
 
-    let updater = app
-        .updater_builder()
-        .endpoints(endpoints)
-        .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?;
-
-    match updater.check().await {
+    match check_result {
         Ok(Some(mut update)) => {
-            // Rewrite the download through the mirror, KEEPING the direct URL as install-time
-            // fallback (the check may well have succeeded via the direct endpoint because the
-            // mirror is dead — an unconditional rewrite would then fail every install).
-            let mut direct: Option<tauri::Url> = None;
-            if let Some(p) = &proxy {
-                if is_github_family(&update.download_url) {
-                    if let Ok(u) = tauri::Url::parse(&format!("{p}/{}", update.download_url)) {
-                        direct = Some(std::mem::replace(&mut update.download_url, u));
-                    }
+            // Expand the announced download_url over the SAME ordered route chain: candidate[0]
+            // becomes the active URL, the rest are install-time fallbacks (a dead mirror must
+            // never make an update uninstallable while any route works).
+            let mut fallbacks: Vec<tauri::Url> = Vec::new();
+            if is_github_family(&update.download_url) {
+                let mut candidates = expand_routes(&gh_routes, update.download_url.as_str());
+                if !candidates.is_empty() {
+                    update.download_url = candidates.remove(0);
+                    fallbacks = candidates;
                 }
             }
             tracing::info!(
-                "update available: {} -> {} (download {})",
+                "update available: {} -> {} (download {}, {} fallback route(s))",
                 update.current_version,
                 update.version,
-                update.download_url
+                update.download_url,
+                fallbacks.len()
             );
             let info = UpdateInfo {
                 version: update.version.clone(),
                 current_version: update.current_version.clone(),
                 notes: update.body.clone(),
             };
-            *PENDING_UPDATE.lock().unwrap() = Some((update, direct));
+            *PENDING_UPDATE.lock().unwrap() = Some((update, fallbacks));
             Ok(Some(info))
         }
         Ok(None) => {
             *PENDING_UPDATE.lock().unwrap() = None;
             Ok(None)
         }
-        Err(e) => Err(format!("UPDATE_CHECK_FAILED: {e}")),
+        Err(e) => Err(e), // already UPDATE_CHECK_FAILED-prefixed by the loop above
     }
 }
 
@@ -189,7 +234,7 @@ pub async fn update_install(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let (mut update, mut direct) = PENDING_UPDATE
+    let (mut update, mut fallbacks) = PENDING_UPDATE
         .lock()
         .unwrap()
         .take()
@@ -197,38 +242,40 @@ pub async fn update_install(
     let _task = state.begin_task("update-download"); // close-flow in-progress listing
     UPDATE_CANCEL.store(false, Ordering::SeqCst);
 
-    let bytes = match run_download(&app, &update).await {
-        Ok(b) => b,
-        Err(e) if e.contains("CANCELLED") => {
-            *PENDING_UPDATE.lock().unwrap() = Some((update, direct));
-            return Err(e);
-        }
-        Err(e) => {
-            // Mirror route failed → ONE direct-route retry (the check's own fallback posture).
-            match direct.take().filter(|d| *d != update.download_url) {
-                Some(d) => {
-                    tracing::warn!("update download failed via mirror ({e}); retrying direct: {d}");
-                    update.download_url = d;
-                    match run_download(&app, &update).await {
-                        Ok(b) => b,
-                        Err(e2) => {
-                            // Restore with the direct URL in place — later retries stay direct.
-                            *PENDING_UPDATE.lock().unwrap() = Some((update, None));
-                            return Err(e2);
-                        }
-                    }
-                }
-                None => {
-                    *PENDING_UPDATE.lock().unwrap() = Some((update, None));
+    // Snapshot the FULL chain up front: when every route fails, restore the whole thing —
+    // pinning later retries to the last (deliberately least-preferred) route would be a
+    // regression vs the old direct-restore behavior (review S66).
+    let orig_url = update.download_url.clone();
+    let orig_fallbacks = fallbacks.clone();
+
+    // Walk the route chain head-first: a failed route is consumed (later retries resume from
+    // the next one), a cancel restores everything untouched.
+    let bytes = loop {
+        match run_download(&app, &update).await {
+            Ok(b) => break b,
+            Err(e) if e.contains("CANCELLED") => {
+                *PENDING_UPDATE.lock().unwrap() = Some((update, fallbacks));
+                return Err(e);
+            }
+            Err(e) => {
+                if fallbacks.is_empty() {
+                    update.download_url = orig_url;
+                    *PENDING_UPDATE.lock().unwrap() = Some((update, orig_fallbacks));
                     return Err(e);
                 }
+                let next = fallbacks.remove(0);
+                tracing::warn!(
+                    "update download failed via {} ({e}); trying next route: {next}",
+                    update.download_url
+                );
+                update.download_url = next;
             }
         }
     };
 
     // A cancel that raced the download's completion still wins — install is the point of no return.
     if UPDATE_CANCEL.load(Ordering::SeqCst) {
-        *PENDING_UPDATE.lock().unwrap() = Some((update, direct));
+        *PENDING_UPDATE.lock().unwrap() = Some((update, fallbacks));
         return Err("UPDATE_DOWNLOAD_CANCELLED".to_string());
     }
 
@@ -237,7 +284,7 @@ pub async fn update_install(
     // runs, so flush it here (same flags as the plugin registration; shared helper, NO-dup).
     let _ = tauri_plugin_window_state::AppHandleExt::save_window_state(&app, crate::window_state_flags());
     if let Err(e) = update.install(bytes) {
-        *PENDING_UPDATE.lock().unwrap() = Some((update, direct));
+        *PENDING_UPDATE.lock().unwrap() = Some((update, fallbacks));
         return Err(format!("UPDATE_INSTALL_FAILED: {e}"));
     }
     // Unreachable on Windows (install() exits the process); kept for non-Windows correctness.

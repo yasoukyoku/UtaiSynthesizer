@@ -146,6 +146,13 @@ fn ensure_candidate_converted(
         sweep_candidate_dir(dir);
         std::fs::create_dir_all(dir).map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
     }
+    // S66 (review): this forks its own torch-export python — never in parallel with the
+    // app-wide convert slot. We already hold AUDITION_IN_FLIGHT and the slot holder checks
+    // that flag symmetrically, so the two flags close the check-then-act window both ways.
+    // Cache hits above stay unblocked (no conversion happens).
+    if app.task_active("convert") {
+        return Err("CONVERT_BUSY".to_string());
+    }
     emit_phase(apph, candidate_id, "converting");
     let mtype = match backend {
         "rvc" => ModelType::Rvc,
@@ -321,24 +328,16 @@ fn audition_source(state: &AppState) -> Result<PathBuf, String> {
 
 /// 16-bit PCM like every other app-written wav; tmp+rename so a killed render
 /// can never leave a truncated file the cache short-circuit would trust (A19).
+/// Thin wrapper over the shared `audio::save_wav_atomic` (S66 single source),
+/// keeping the audition-scoped error CODE.
 fn write_wav_atomic(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), String> {
-    let tmp = path.with_extension("wav.tmp");
-    {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut w = hound::WavWriter::create(&tmp, spec)
-            .map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
-        for &s in samples {
-            w.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
-                .map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
-        }
-        w.finalize().map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))?;
-    }
-    std::fs::rename(&tmp, path).map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))
+    let buf = crate::audio::AudioBuffer {
+        samples: samples.to_vec(),
+        sample_rate,
+        channels: 1,
+    };
+    crate::audio::save_wav_atomic(path, &buf)
+        .map_err(|e| format!("AUDITION_WAV_WRITE_FAILED: {}", e))
 }
 
 /// Candidate sidecar → ModelConfig, with sample_rate REQUIRED (A15: the serde
@@ -627,6 +626,10 @@ pub async fn render_audition_vocoder(
                         std::fs::create_dir_all(&dir)
                             .map_err(|e| format!("AUDITION_DIR_CREATE_FAILED: {}", e))?;
                     }
+                    // S66 (review): same convert-slot exclusion as ensure_candidate_converted.
+                    if app.task_active("convert") {
+                        return Err("CONVERT_BUSY".to_string());
+                    }
                     emit_phase(&apph, &candidate_id, "converting");
                     // config.json sits next to the ckpt in weights/ — the
                     // exporter auto-detects it
@@ -792,6 +795,10 @@ pub async fn render_audition_diffusion(
         // selfcheck) — it is the completion marker
         let diff_dir = dir.join("diffusion");
         if !diff_dir.join("diffusion.json").is_file() {
+            // S66 (review): same convert-slot exclusion as ensure_candidate_converted.
+            if app.task_active("convert") {
+                return Err("CONVERT_BUSY".to_string());
+            }
             emit_phase(&apph, &candidate_id, "converting");
             crate::models::convert::convert_diffusion_assets(
                 Path::new(&ckpt_path),
@@ -1140,7 +1147,8 @@ pub async fn render_candidate_scale(
     workspace: String,
     candidate_id: String,
     score: Vec<crate::commands::inference::ScoreNote>,
-) -> Result<crate::inference::SynthesisResult, String> {
+    output_path: String,
+) -> Result<crate::inference::RenderedAudio, String> {
     let app = state.inner().clone();
     let guard = FlightGuard::acquire(AUDITION_BUSY_MSG)?;
     ensure_trainable_idle(&app)?;
@@ -1152,7 +1160,7 @@ pub async fn render_candidate_scale(
     let dir = audition_dir(&workspace, &stem);
 
     let apph = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<crate::inference::SynthesisResult, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<crate::inference::RenderedAudio, String> {
         let _guard = guard;
         let onnx = dir.join("model.onnx");
         ensure_candidate_converted(&app, &apph, &candidate_id, &dir, &onnx, &backend, &ckpt_path)?;
@@ -1278,7 +1286,7 @@ pub async fn render_candidate_scale(
             }
         };
         app.inference.engine.unload_paths_with_prefix(&dir);
-        Ok(result)
+        crate::commands::inference::commit_rendered_audio(result, output_path)
     })
     .await
     .map_err(|e| format!("AUDITION_TASK_PANICKED: {e}"))?

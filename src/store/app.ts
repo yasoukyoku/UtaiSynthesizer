@@ -48,6 +48,18 @@ interface ConfirmRequest {
   seq: number;
 }
 
+/** S66 pre-run model check: one actionable problem found by the workflow/vocal preflight.
+ *  - msstConvert: installed MSST ckpt with no ONNX — one-click conversion (filename/precision/architecture)
+ *  - msstMissing: node references a model file that is not installed — guide to the model manager
+ *  - auxPack:     the core inference asset pack (aux-inference) has missing files — one-click download */
+export interface MissingModelItem {
+  kind: "msstConvert" | "msstMissing" | "auxPack";
+  label: string;
+  filename?: string;
+  precision?: "fp32" | "fp16";
+  architecture?: string;
+}
+
 interface AppState {
   trainingPageOpen: boolean;
   modelManagerOpen: boolean;
@@ -119,6 +131,9 @@ interface AppState {
   /** True while UpdateDialog is downloading/installing — the quit flows consult it (a busy update
    *  must not be silently abandoned by tray-quit / window-X; audit S64). */
   updateBusy: boolean;
+  /** S66 pre-run model check: unconverted/missing models found by the workflow/vocal preflight,
+   *  shown by MissingModelsDialog with per-item one-click actions. null = closed. */
+  missingModels: MissingModelItem[] | null;
 
   toggleTrainingPage: () => void;
   toggleModelManager: () => void;
@@ -158,6 +173,8 @@ interface AppState {
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
   closeUpdateDialog: () => void;
+  openMissingModels: (items: MissingModelItem[]) => void;
+  closeMissingModels: () => void;
   setUpdateBusy: (v: boolean) => void;
   showToast: (message: string, type?: "error" | "info" | "success") => void;
   dismissToast: (id: number) => void;
@@ -204,6 +221,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   banner: null,
   confirm: null,
   updateDialog: null,
+  missingModels: null,
   updateBusy: false,
 
   toggleTrainingPage: () =>
@@ -309,6 +327,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }),
   openUpdateDialog: (info) => set({ updateDialog: info }),
   closeUpdateDialog: () => set({ updateDialog: null }),
+  openMissingModels: (items) => set({ missingModels: items }),
+  closeMissingModels: () => set({ missingModels: null }),
   setUpdateBusy: (v) => set({ updateBusy: v }),
   showToast: (message, type = "error") => {
     // monotonic id — Date.now() collides when two toasts fire in the same millisecond (e.g. the

@@ -16,7 +16,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels } from "../../lib/vocal/vocalRender";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
@@ -177,6 +177,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const track = useProjectStore.getState().tracks.find((tr) => tr.id === part.trackId);
     const seg = track?.segments.find((s) => s.id === segmentId);
     if (!track || !seg) return;
+    // S66: missing core models → the one-click dialog instead of a mid-render AUX_FILE_MISSING.
+    if (!(await preflightVocalModels())) return;
     try {
       await renderVocalPart(track, seg, tempoRef.current, t("vocalEditor.render.laneLabel"));
     } catch (e) {

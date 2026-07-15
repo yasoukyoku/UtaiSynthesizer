@@ -1014,9 +1014,9 @@ Downloads auto-resume, switch automatically between HuggingFace and its mirror, 
 Two independent mirror settings that every in-app download honors:
 
 1. **Download source (HuggingFace)**: "HuggingFace (default)" / "HF Mirror (hf-mirror.com) — China mainland" / "Custom". Applies to voice model and separation model downloads and the model asset packs.
-2. **"GitHub Mirror"**: "Direct" / ghfast.top / gh-proxy.com / a "Custom" prefix. Applies to GitHub-hosted downloads (some separation models, the GAME engine, app updates).
+2. **"GitHub Mirror"**: "Direct" / several preset proxies (gh-proxy.com, ghproxy.net, gh.llkk.cc, ghfast.top, …) / a "Custom" prefix. Applies to GitHub-hosted downloads (some separation models, the GAME engine, app updates). The preset list refreshes itself over the network (public proxies die regularly; new working ones appear in the list automatically), and even if the chosen proxy fails mid-download, the transfer automatically retries over the direct route and other lines (large model downloads resume from where they stopped; app-update downloads don't resume but fail over the same way) — no manual intervention needed.
 
-> Tip: **mainland China users** should switch the download source to "HF Mirror" and pick a working GitHub proxy — download speeds typically improve by an order of magnitude. The preset proxies are community-run public services and may die; when one does, choose "Custom" and enter another prefix.
+> Tip: **mainland China users** should switch the download source to "HF Mirror" and pick a working GitHub proxy — download speeds typically improve by an order of magnitude. The preset proxies are community-run public services and may die; if all of them do, choose "Custom" and enter a prefix you found yourself (a self-hosted Cloudflare Workers proxy needs a custom domain — workers.dev is unreachable from the mainland). Choosing "HF Mirror" as the download source also makes the CUDA runtime download prefer the Chinese PyPI mirrors (TUNA / Aliyun / Tencent) automatically.
 
 Each group has a "Test connection" button: it downloads a few real MB to measure speed and returns one of "Good", "Slow", "Throttled / interfered (large downloads may fail)", "Unreachable", "Rejected / no test file" plus the measured speed.
 
