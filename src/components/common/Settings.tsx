@@ -275,8 +275,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
     }
   }, [cudaMemLimitText]);
 
-  // S66: on-disk layout for the panel (copyable paths = users can check/share the runtime
-  // by hand) + per-lane presence + the exact filenames the local-install picker expects.
+  // S66: on-disk layout for the panel (copyable paths for inspection/support) + per-lane
+  // presence + the exact filenames the local-install picker expects.
   const [cudaPaths, setCudaPaths] = useState<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] } | null>(null);
   const refreshCudaPaths = useCallback(() => {
     invoke<{ ortDir: string; dllDir: string; missing: string[]; expectedFiles: string[] }>("cuda_runtime_paths")
@@ -741,7 +741,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
   }, [mirror.type]);
 
   // S66 install-from-local-file: the user picks the wheels/nupkg listed in the note below
-  // (exact filenames from cuda_runtime_paths.expectedFiles) — mutual-aid friendly.
+  // (exact filenames from cuda_runtime_paths.expectedFiles) — the offline escape hatch.
   const handleCudaLocalInstall = useCallback(async () => {
     const picked = await open({
       multiple: true,
@@ -817,7 +817,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaPgCancelled: { zh: "已取消（进度已保留，可续传）", en: "Cancelled (progress kept — resumable)", ja: "キャンセルしました（進捗は保持、再開可能）" },
       cudaPgFailed: { zh: "下载失败", en: "Download failed", ja: "ダウンロードに失敗しました" },
       cudaMissing: { zh: "缺失组件", en: "Missing parts", ja: "不足コンポーネント" },
-      cudaLocalNote: { zh: "「从本地文件安装」接受以下官方文件（可由他人代为下载后拷贝）：", en: "“Install from local file” accepts these official files (a friend can download them for you):", ja: "「ローカルからインストール」は以下の公式ファイルを受け付けます（他の人にダウンロードしてもらってもOK）：" },
+      cudaLocalNote: { zh: "「从本地文件安装」接受以下官方文件：", en: "“Install from local file” accepts these official files:", ja: "「ローカルからインストール」は以下の公式ファイルを受け付けます：" },
       cudaDllDir: { zh: "CUDA 运行库目录", en: "CUDA DLL folder", ja: "CUDA DLL フォルダ" },
       cudaOrtDir: { zh: "ORT CUDA 目录", en: "ORT CUDA folder", ja: "ORT CUDA フォルダ" },
       storage: { zh: "存储位置", en: "Storage", ja: "保存場所" },
@@ -1374,28 +1374,31 @@ export function Settings({ onClose }: { onClose: () => void }) {
           {cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (
             <div className="settings-field" style={{ marginTop: 6 }}>
               <label>{L("cudaMemLimit")}</label>
-              <input
-                type="text"
-                className="settings-source-url"
-                style={{ width: 90 }}
-                inputMode="numeric"
-                value={cudaMemLimitText}
-                placeholder="0"
-                onChange={(e) => setCudaMemLimitText(e.target.value.replace(/[^0-9]/g, ""))}
-                onBlur={() => void commitCudaMemLimit()}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                }}
-              />
-              <span className="settings-value">MB</span>
+              {/* .settings-field is a COLUMN — the input and its unit need their own row,
+                  or "MB" wraps below the box with a stray gap (user-reported). */}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="text"
+                  className="settings-source-url"
+                  style={{ width: 90, flex: "none" }}
+                  inputMode="numeric"
+                  value={cudaMemLimitText}
+                  placeholder="0"
+                  onChange={(e) => setCudaMemLimitText(e.target.value.replace(/[^0-9]/g, ""))}
+                  onBlur={() => void commitCudaMemLimit()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  }}
+                />
+                <span className="settings-value" style={{ maxWidth: "none" }}>MB</span>
+              </div>
             </div>
           )}
           {cudaReady && hw?.gpus?.some((g) => g.vendor === "nvidia") && (
             <p className="settings-note">{L("cudaMemLimitNote")}</p>
           )}
 
-          {/* S66: local-file install + on-disk layout — copyable paths so users can inspect the
-              runtime or install files a friend downloaded for them (mainland mutual-aid). */}
+          {/* S66: local-file install + on-disk layout (copyable paths for inspection/support). */}
           {!cudaDownloading && (
             <button className="settings-mini-btn" style={{ marginTop: 6 }} onClick={handleCudaLocalInstall}>
               {L("rtLocalInstall")}

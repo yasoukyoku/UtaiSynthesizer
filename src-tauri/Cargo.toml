@@ -8,6 +8,9 @@ description = "UtaiSynthesizer — Voice Synthesis DAW"
 authors = ["UtaiSynthesizer Contributors"]
 edition = "2021"
 rust-version = "1.77"
+# AGPL is a hard requirement, not a choice: the app vendors so-vits-svc (AGPL-3.0) training
+# code — the whole work must carry the same license (community-reported, S66).
+license = "AGPL-3.0-only"
 
 [lib]
 name = "utai_lib"

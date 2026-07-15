@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 build = "build.rs"
+# The wrapper crate is AGPL like the rest of the app; the VENDORED Signalsmith sources keep
+# their own MIT terms (LICENSE.txt files retained in vendor/).
+license = "AGPL-3.0-only"
 # FFI wrapper around the vendored Signalsmith Stretch C++ library (MIT — see
 # vendor/signalsmith-stretch/LICENSE.txt and vendor/signalsmith-stretch/dsp/LICENSE.txt).
 # Hand-written extern "C" shim compiled with `cc`: no bindgen (needs libclang, absent on the

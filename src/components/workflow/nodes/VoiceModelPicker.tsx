@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../../../store/app";
 import {
   useVoiceModelStore,
@@ -22,6 +23,7 @@ export const VOICE_STRINGS = {
   off: { zh: "关", en: "Off", ja: "オフ" },
   gpuExtract: { zh: "GPU特征提取", en: "GPU extraction", ja: "GPU特徴抽出" },
   gpuExtractTip: { zh: "特征/音高提取（ContentVec+RMVPE）改在 GPU 上跑：更快但占显存；默认 CPU 更稳更省显存", en: "Run ContentVec+RMVPE extraction on the GPU: faster but uses VRAM; the CPU default is safer", ja: "特徴/ピッチ抽出（ContentVec+RMVPE）を GPU で実行：高速だが VRAM を消費。既定の CPU が安全" },
+  gpuExtractLowVram: { zh: "显卡显存不足 12GB，已禁用——GPU 特征提取实测峰值约 9.4GB，低显存卡会爆显存（CPU 提取不受影响）", en: "Disabled: needs a ≥12GB GPU — GPU extraction peaks at ~9.4GB in practice and would exhaust smaller cards (CPU extraction is unaffected)", ja: "無効：12GB 以上の GPU が必要です — GPU 抽出は実測ピーク約 9.4GB で、それ未満のカードでは VRAM が枯渇します（CPU 抽出は影響なし）" },
   diffBadgeTip: { zh: "已附带扩散模型（可用浅扩散）", en: "Diffusion attachment present (shallow diffusion available)", ja: "拡散モデルあり（浅い拡散が利用可能）" },
   blendTitle: { zh: "声线混合", en: "Voice blend", ja: "声質ブレンド" },
   blendTip: { zh: "混合多个歌手的音色生成新声线：各歌手权重会自动归一化为占比；未添加时使用默认歌手", en: "Blend multiple speakers' timbres into a new voice — weights are auto-normalized to a share; the default speaker is used when empty", ja: "複数話者の声質を混ぜて新しい声を作る — 各重みは自動で比率に正規化。未追加時は既定の話者を使用" },
@@ -30,18 +32,52 @@ export const VOICE_STRINGS = {
   blendWeight: { zh: "占比", en: "Weight", ja: "比重" },
 } satisfies Record<string, I18nText>;
 
+/** S66 GPU-extraction VRAM gate: the feature's measured steady peak is ~9.4 GB (user, two
+ *  runs), so enabling it needs a ≥12 GB card. nvidia-smi truth, cached module-level (one
+ *  subprocess per session, not per node mount); undetermined / non-NVIDIA fails OPEN (the
+ *  variant_supported convention — DirectML cards can't be queried reliably). */
+const GPU_EXTRACT_MIN_VRAM_MB = 12_000;
+let vramProbe: Promise<number | null> | null = null;
+function nvidiaVramMb(): Promise<number | null> {
+  vramProbe ??= invoke<{ nvidia_vram_mb: number | null }>("get_hardware_info")
+    .then((h) => h.nvidia_vram_mb)
+    .catch(() => null);
+  return vramProbe;
+}
+
 /** The aux-extractor device toggle row — identical on BOTH voice nodes. */
 export function GpuExtractRow({ value, lang, onChange }: {
   value: boolean;
   lang: string;
   onChange: (v: boolean) => void;
 }) {
+  const [vram, setVram] = useState<number | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void nvidiaVramMb().then((v) => {
+      if (alive) setVram(v);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  // Gate only the ENABLE direction: a pre-existing true (older project / user insisting)
+  // stays visible and can always be turned OFF.
+  const lowVram = vram !== null && vram < GPU_EXTRACT_MIN_VRAM_MB;
+  const blocked = lowVram && !value;
+  const tip = blocked ? t18(VOICE_STRINGS.gpuExtractLowVram, lang) : t18(VOICE_STRINGS.gpuExtractTip, lang);
   return (
-    <div className="sep-param-row">
-      <label title={t18(VOICE_STRINGS.gpuExtractTip, lang)}>
+    <div className="sep-param-row" style={blocked ? { opacity: 0.55 } : undefined}>
+      <label title={tip}>
         {t18(VOICE_STRINGS.gpuExtract, lang)}
       </label>
-      <input type="checkbox" checked={value} onChange={(e) => onChange(e.target.checked)} />
+      <input
+        type="checkbox"
+        checked={value}
+        disabled={blocked}
+        title={tip}
+        onChange={(e) => onChange(e.target.checked)}
+      />
     </div>
   );
 }

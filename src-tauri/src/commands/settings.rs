@@ -17,6 +17,9 @@ pub struct HardwareInfo {
     /// Which runtime-pack variant this machine should default to
     /// ("nv-cu130" | "amd" | "xpu" | "cpu") — the user can always override.
     pub recommended_variant: String,
+    /// Largest NVIDIA card's total VRAM in MB (nvidia-smi truth — NOT the lying WMI
+    /// AdapterRAM), None = undetermined / no NVIDIA. Feeds the GPU-特征提取 gate (S66).
+    pub nvidia_vram_mb: Option<u64>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -75,6 +78,11 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         directml_available: cfg!(windows),
         current_device: current_str,
         recommended_variant: recommend_variant(&gpus).to_string(),
+        nvidia_vram_mb: if gpus.iter().any(|g| g.vendor == "nvidia") {
+            nvidia_total_vram_mb()
+        } else {
+            None
+        },
         gpus,
     })
 }
@@ -173,6 +181,30 @@ pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
 
 #[cfg(not(windows))]
 pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
+    None
+}
+
+/// Total VRAM of the largest NVIDIA card in MB (nvidia-smi memory.total), None = undetermined
+/// (no nvidia-smi / no NVIDIA card). S66: feeds the GPU-特征提取 gate — the feature's measured
+/// steady peak is ~9.4 GB (user, two runs), so cards under 12 GB can't enable it. Undetermined
+/// fails OPEN (the variant_supported convention: never hide a capability on a probe failure).
+#[cfg(windows)]
+pub(crate) fn nvidia_total_vram_mb() -> Option<u64> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().filter_map(|l| l.trim().parse::<u64>().ok()).max()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn nvidia_total_vram_mb() -> Option<u64> {
     None
 }
 
@@ -805,8 +837,11 @@ fn place_ort_gpu(app_dir: &std::path::Path, nupkg: &std::path::Path) -> crate::R
 }
 
 /// Human labels of CUDA runtime lanes that are missing OR unusable (wrong-major ORT build) —
-/// shared by cuda_runtime_paths (panel) and the local-install completion report so the two
-/// can never disagree with is_cuda_runtime_ready's verdict direction.
+/// shared by cuda_runtime_paths (panel) and the local-install completion report. A lane counts
+/// PRESENT when its guard DLL is resolvable the SAME way the loader resolves it (runtime/cuda
+/// OR PATH OR CUDA_PATH — dll_on_path_or_dir, exactly like cuda_provider_deps_resolvable):
+/// checking only runtime/cuda showed "missing: cuBLAS" right beside the "Ready" badge on a
+/// machine whose DLLs come from an installed Toolkit (CDP 目检-caught contradiction).
 fn cuda_missing_lanes(app_dir: &std::path::Path) -> Vec<String> {
     let ort_dir = app_dir.join("runtime").join("ort").join("cuda");
     let dll_dir = app_dir.join("runtime").join("cuda");
@@ -816,7 +851,7 @@ fn cuda_missing_lanes(app_dir: &std::path::Path) -> Vec<String> {
         missing.push("CUDA ORT".to_string());
     }
     for w in &CUDA_WHEELS {
-        if !dll_dir.join(w.guard).exists() {
+        if !dll_on_path_or_dir(w.guard, &dll_dir) {
             missing.push(w.label.to_string());
         }
     }
@@ -996,8 +1031,8 @@ async fn do_download_cuda_runtime(
 // (callers pass a starts_with / contains closure for the path match).
 
 /// S66 install-from-local-file for the CUDA runtime: the user picks the 4 NVIDIA wheels
-/// and/or the ORT GPU nupkg (exact filenames shown in Settings — mutual-aid friendly:
-/// one user downloads once, shares the files). Each file is classified by name and placed
+/// and/or the ORT GPU nupkg (exact filenames shown in Settings — an offline escape hatch
+/// when none of the download routes work). Each file is classified by name and placed
 /// through the SAME staging/atomic lanes as the network download. Returns the labels of
 /// the lanes installed; unrecognized files fail loudly (never silently skipped).
 #[tauri::command]
@@ -1091,7 +1126,7 @@ pub async fn install_cuda_runtime_local(
 }
 
 /// S66: the exact on-disk CUDA runtime layout for the Settings panel (copyable paths =
-/// mutual-aid friendly) + per-lane presence so a half install is visible at a glance.
+/// inspection/support-friendly) + per-lane presence so a half install is visible at a glance.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CudaRuntimePaths {
