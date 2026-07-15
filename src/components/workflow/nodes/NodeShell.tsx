@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { useWorkflowStore, type NodeStatus } from "../../../store/workflow";
 import { useAppStore } from "../../../store/app";
 import { t18 } from "../../../lib/models/msst-catalog";
+import { NodeOutputPreview } from "./NodeOutputPreview";
 import "./NodeShell.css";
 
 interface Props {
@@ -69,6 +70,10 @@ export function NodeShell({ nodeId, label, icon, color, inputs = 1, outputs = 1,
         </div>
       )}
       {children && <div className="wf-node-body">{children}</div>}
+      {/* S66 output audition: hidden while running (the paths are being replaced). */}
+      {nodeId && status !== "running" && (
+        <NodeOutputPreview statusSeg={statusSeg} nodeId={nodeId} outputLabels={outputLabels} />
+      )}
       {Array.from({ length: inputs }).map((_, i) => (
         <Handle
           key={`in-${i}`}

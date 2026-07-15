@@ -139,19 +139,45 @@
   box-shadow: 0 0 0 1px var(--accent-primary), 0 0 16px rgba(57, 197, 187, 0.15);
 }
 
+/* S66 手感: bigger square ports (xyflow's base sheet rounds them 100% — force the house
+   angular look), a 24px INVISIBLE hit zone (::after participates in the handle's pointer
+   hit-testing, so grabbing a wire no longer needs pixel-precision), and hover/connect glow.
+   Geometry stays constant on hover (only glow/color change) so ports never jump under the
+   cursor; the ReactFlow `connectionRadius` prop covers the drop-end snapping. */
 .workflow-canvas .react-flow__handle {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
+  border-radius: 1px;
   background: var(--accent-primary);
   border: 2px solid var(--bg-surface);
 }
 
+.workflow-canvas .react-flow__handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+}
+
+.workflow-canvas .react-flow__handle:hover,
+.workflow-canvas .react-flow__handle.connectingfrom,
+.workflow-canvas .react-flow__handle.connectingto,
+.workflow-canvas .react-flow__handle.react-flow__handle-connecting,
+.workflow-canvas .react-flow__handle.react-flow__handle-valid {
+  background: var(--accent-primary-bright, var(--accent-primary));
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 7px var(--accent-primary);
+}
+
 .workflow-canvas .react-flow__handle-left {
-  left: -4px;
+  left: -5px;
 }
 
 .workflow-canvas .react-flow__handle-right {
-  right: -4px;
+  right: -5px;
 }
 
 .workflow-canvas .react-flow__edge-path {

@@ -34,6 +34,7 @@ import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { t18 } from "../../lib/models/msst-catalog";
 import { preview } from "../common/previewPlayer";
+import { Scrubber } from "../common/Scrubber";
 import { LossChart, type LossChartHandle } from "./LossChart";
 import "./TrainingPage.css";
 
@@ -283,31 +284,8 @@ export function TrainingPage() {
 // audition rows share it; singleton = data-step preview and audition playback
 // preempt each other, which is the intended behavior)
 
-/** Thin div scrubber (house style: square 4×12 head, no solid dot). Click/drag to
- *  seek; parent drives `value` via rAF. */
-function Scrubber({ value, onSeek }: { value: number; onSeek: (frac: number) => void }) {
-  const trackRef = useRef<HTMLDivElement>(null);
-  const seekAt = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    onSeek((clientX - r.left) / Math.max(1, r.width));
-  };
-  const onDown = (e: React.PointerEvent) => {
-    e.stopPropagation();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    seekAt(e.clientX);
-  };
-  const onMove = (e: React.PointerEvent) => {
-    if (e.buttons & 1) seekAt(e.clientX);
-  };
-  return (
-    <div className="training-scrubber" ref={trackRef} onPointerDown={onDown} onPointerMove={onMove}>
-      <div className="training-scrubber-fill" style={{ width: `${Math.round(value * 100)}%` }} />
-      <div className="training-scrubber-head" style={{ left: `${Math.round(value * 100)}%` }} />
-    </div>
-  );
-}
+// Scrubber extracted to components/common/Scrubber.tsx (S66) — the workflow node output
+// preview shares it. The data-list margin moved to .training-scrubber-slot (caller-owned).
 
 function DataStep() {
   const { t } = useTranslation();
@@ -494,6 +472,7 @@ function DataStep() {
         </div>
         {isActive && activeDur > 0 && (
           <Scrubber
+            className="training-scrubber-slot"
             value={pos / activeDur}
             onSeek={(frac) => {
               preview.seek(frac);

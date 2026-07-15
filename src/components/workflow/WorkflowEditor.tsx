@@ -1009,6 +1009,9 @@ export function WorkflowEditor({ segmentId, onClose, style }: Props) {
             onInit={setRfInstance}
             nodeTypes={nodeTypes}
             fitView
+            // S66 手感: a dragged wire END snaps to the nearest port within this radius —
+            // the pickup end is covered by the handles' 24px ::after hit zone (CSS).
+            connectionRadius={24}
             deleteKeyCode={activePane === "workflow" ? "Delete" : null}
             // Edge stroke lives in WorkflowEditor.css (the single source): the old inline default style
             // overrode the stylesheet for freshly-connected edges only (a new edge changed color after

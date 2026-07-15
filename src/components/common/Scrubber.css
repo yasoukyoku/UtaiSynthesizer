@@ -1,0 +1,39 @@
+/* Preview scrubber — thin track + square head (house style: no solid dot). Moved from
+   TrainingPage.css (S66); layout margins belong to the CALLER (className), not here. */
+.ui-scrubber {
+  position: relative;
+  height: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+}
+
+.ui-scrubber::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--border-default);
+}
+
+.ui-scrubber-fill {
+  position: absolute;
+  left: 0;
+  height: 2px;
+  background: var(--accent-primary-dim);
+  pointer-events: none;
+}
+
+.ui-scrubber-head {
+  position: absolute;
+  width: 4px;
+  height: 12px;
+  background: var(--accent-primary);
+  transform: translateX(-2px);
+  pointer-events: none;
+}
+
+.ui-scrubber:hover .ui-scrubber-head {
+  box-shadow: 0 0 5px var(--accent-primary);
+}

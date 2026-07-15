@@ -446,3 +446,64 @@
   background: var(--node-color, var(--accent-primary));
   transition: width 0.2s linear;
 }
+
+/* ── S66 node output audition (one compact row per output port) ── */
+
+.wf-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 6px 4px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.wf-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 16px;
+}
+
+.wf-preview-btn {
+  flex-shrink: 0;
+  width: 20px;
+  height: 15px;
+  padding: 0;
+  font-size: 8px;
+  line-height: 1;
+  background: none;
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-primary);
+}
+
+.wf-preview-btn:hover {
+  border-color: var(--accent-primary);
+}
+
+.wf-preview-btn.on {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 4px var(--accent-primary);
+}
+
+.wf-preview-label {
+  flex-shrink: 0;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.wf-preview-scrub {
+  flex: 1;
+  min-width: 0;
+}
+
+.wf-preview-time {
+  flex-shrink: 0;
+  min-width: 0;
+  font-size: 9px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}

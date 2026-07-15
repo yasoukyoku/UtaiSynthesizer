@@ -261,44 +261,10 @@
   }
 }
 
-/* Preview scrubber — thin track + square head (house style: no solid dot). */
-.training-scrubber {
-  position: relative;
-  height: 12px;
+/* Preview scrubber component moved to components/common/Scrubber.{tsx,css} (S66, .ui-scrubber*);
+   only the data-list slot margin stays here (layout is caller-owned). */
+.training-scrubber-slot {
   margin: 0 2px 2px 30px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-}
-
-.training-scrubber::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: var(--border-default);
-}
-
-.training-scrubber-fill {
-  position: absolute;
-  left: 0;
-  height: 2px;
-  background: var(--accent-primary-dim);
-  pointer-events: none;
-}
-
-.training-scrubber-head {
-  position: absolute;
-  width: 4px;
-  height: 12px;
-  background: var(--accent-primary);
-  transform: translateX(-2px);
-  pointer-events: none;
-}
-
-.training-scrubber:hover .training-scrubber-head {
-  box-shadow: 0 0 5px var(--accent-primary);
 }
 
 .training-file-name {
