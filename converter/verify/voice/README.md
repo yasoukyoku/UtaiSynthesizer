@@ -279,3 +279,16 @@ n_fft/2+按 length 取尾（原版 onnxexport 对称裁 768 = 与训练错位 25
 gate 证逐字节等价;chika spk 名从 kmeans_10000.pt 键取证 ②torch≥2 跑原版参照需 istft
 view_as_complex 垫片+抢占 root logger（原版 utils import 时设 DEBUG=numba 洪水）③torch.istft
 `length` 语义=前裁 n_fft/2 后直接取 length（尾部是真 OLA 内容,不是补零——踩过）。
+**关卡 2 E2E(4.0-v2,2026-07-17)**:e2e_sovits_v2_ref.py(驱动原版 v2 SynthesizerTrn 单段语义,
+ContentVec/RMVPE onnx 注入+torch≥2 istft 垫片+ZeroNoise 双随机点清零)vs Rust 全链
+(tests/voice_pipeline.rs,{"noise_scale":0,"debug_zero_noise":true},单 piece 连续演唱段 5.5s)。
+**波形 SNR = 16.35 dB——对本架构该度量已失效**,灵敏度标定证明:64 次谐波正弦库对 f0 输入
+呈灾难性相位敏感,ref-vs-ref 加 ±0.1%(1.7 音分,不可闻)f0 wobble = **−1.9 dB**,加 0.002%
+(0.03 音分)恒移 = 5.05 dB。**改用相位盲 mel 域标定判据**:ref↔Rust log-mel MAE **0.180** /
+log-mel SNR **25.3 dB**,落在 ref↔ref 不可闻微扰自差区间 [0.174-0.271 / 23.9-27.0 dB] **之内**
+⇒ Rust 管线与上游差异 ≤ 不可闻 f0 微扰等价类,管线忠实。频带剖面:250-1000Hz(基频/内容)
+−33.4dB 完好,高带=谐波相位度量伪象。★方法论沉淀:**谐波合成器类架构的 E2E 用「已知不可闻
+扰动的自差标定」定判据,不硬卡波形 SNR**(S36 CUDA/TF32 先例的推广)。
+Rust 侧冒烟:CPU 20s 音频 6.1s / CUDA 4.0s(aux CPU、语音 CUDA),无 NaN,peak 0.92。
+复现件:TESTING\SoVITS-4.0_v2\{e2e_clip_44k,chika_ref_det,chika_rust_det,chika_rust_e2e}.wav
++ scratchpad 探针(f0_sens/mel_calib,方法在本节)。

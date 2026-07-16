@@ -181,6 +181,20 @@ pub(crate) fn noise_channels(config: &ModelConfig) -> usize {
         .unwrap_or(192)
 }
 
+/// 4.0-v2 (VISinger2): bin count of the model's explicit `phase` input, from the sidecar
+/// "phase" block (converter writes {"phase_input": [1, n_fft/2+1, "T"]}). None for every
+/// 4.0/4.1 export (no such block) → the phase tensor is not fed.
+pub(crate) fn phase_bins(config: &ModelConfig) -> Option<usize> {
+    config
+        .extra
+        .get("phase")
+        .and_then(|v| v.get("phase_input"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+}
+
 /// Sidecar "min_frames": the minimum T the exported graph accepts (final contract:
 /// RVC 12 / SoVITS 6). Tolerant field — lives in ModelConfig.extra.
 pub(crate) fn min_frames(config: &ModelConfig, default: usize) -> usize {
@@ -951,6 +965,10 @@ pub async fn run_sovits(
     // authority (final contract); vol_embedding bool is the fallback for older sidecars.
     let vol_embedding = sidecar_has_input(&entry, "vol")
         .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+    // 4.0-v2 (VISinger2): explicit `phase` input + NO `uv` input on the main graph —
+    // both facts come from the sidecar (phase block / inputs array), never a version string.
+    let v2_phase_bins = phase_bins(&entry.config);
+    let feed_uv = sidecar_has_input(&entry, "uv").unwrap_or(true);
     // ①c: a genuine multi-speaker export renames the scalar `sid` input to a dense `spk_mix`
     // [1, n_spk] blend (n_spk = emb_g table width = config.n_speakers). Feed the blend IFF the
     // graph actually carries that input; None → the sid path (single-speaker / pre-①c export).
@@ -1059,6 +1077,8 @@ pub async fn run_sovits(
             hop_size,
             features_dim: dim,
             vol_embedding,
+            phase_bins: v2_phase_bins,
+            feed_uv,
             spk_mix,
             unit_interpolate_mode,
             noise_channels: nch,
@@ -1419,6 +1439,8 @@ pub async fn render_vocal_segment(
             }
             let vol_embedding = sidecar_has_input(&entry, "vol")
                 .unwrap_or_else(|| entry.config.vol_embedding.unwrap_or(false));
+            let v2_phase_bins = phase_bins(&entry.config);
+            let feed_uv = sidecar_has_input(&entry, "uv").unwrap_or(true);
             let unit_interpolate_mode = entry
                 .config
                 .unit_interpolate_mode
@@ -1496,6 +1518,8 @@ pub async fn render_vocal_segment(
                     hop_size,
                     features_dim: dim,
                     vol_embedding,
+                    phase_bins: v2_phase_bins,
+                    feed_uv,
                     spk_mix,
                     unit_interpolate_mode,
                     noise_channels: nch,

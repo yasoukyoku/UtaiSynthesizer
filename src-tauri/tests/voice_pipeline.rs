@@ -282,6 +282,20 @@ fn voice_env_wav() {
                     .load_model_with(&PathBuf::from(p), false)
                     .expect("load f0 predictor")
             });
+            // 4.0-v2 (VISinger2): explicit `phase` input + no `uv` on the main graph —
+            // sidecar-driven exactly like commands\inference.rs.
+            let phase_bins = sc
+                .get("phase")
+                .and_then(|v| v.get("phase_input"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let feed_uv = sc
+                .get("inputs")
+                .and_then(|v| v.as_array())
+                .map(|l| l.iter().any(|v| v.as_str() == Some("uv")))
+                .unwrap_or(true);
             let m = utai_lib::inference::sovits::SovitsModel {
                 engine: &engine,
                 voice_session: &voice_sid,
@@ -296,6 +310,8 @@ fn voice_env_wav() {
                 hop_size,
                 features_dim: dim,
                 vol_embedding,
+                phase_bins,
+                feed_uv,
                 spk_mix: None, // single-speaker E2E fixture → the sid path (①c multi-speaker unused here)
                 unit_interpolate_mode,
                 noise_channels: nch,

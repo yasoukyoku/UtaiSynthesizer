@@ -116,6 +116,15 @@ pub struct SovitsModel<'a> {
     /// Whether the exported graph HAS a vol input — decided by the sidecar "inputs"
     /// array (fallback: vol_embedding bool). The vol tensor is only fed when true.
     pub vol_embedding: bool,
+    /// 4.0-v2 (VISinger2): `Some(n_bins)` iff the graph HAS a "phase" input (sidecar
+    /// "phase" block, n_bins = n_fft/2+1 = 1025) — the export made Generator_Noise's
+    /// random phase explicit; a per-piece seeded uniform·2·3.14−3.14 tensor is fed
+    /// (`seg_phase`). `None` = 4.0/4.1 graph (no such input).
+    pub phase_bins: Option<usize>,
+    /// Whether the exported graph HAS a `uv` input — sidecar "inputs" array, legacy
+    /// default true. 4.0/4.1 main graphs take uv; the 4.0-v2 main graph does NOT
+    /// (its uv consumer lives only in the `.f0.onnx` companion).
+    pub feed_uv: bool,
     /// ①c: `Some(n_spk)` iff the graph HAS a "spk_mix" input (genuine multi-speaker export,
     /// n_spk = emb_g table width) — then a dense [1, n_spk] blend is fed in place of scalar `sid`.
     /// `None` = single-speaker / pre-①c export → the `sid` i64 path (byte-identical).
@@ -566,21 +575,37 @@ pub(crate) fn decode_features(
                     shape: vec![1, t],
                 },
             ),
-            (
+        ];
+        // 4.0/4.1 graphs take uv; the 4.0-v2 main graph has no such input (its uv
+        // consumer lives only in the .f0.onnx companion, fed above).
+        if m.feed_uv {
+            inputs.push((
                 "uv",
                 InputTensor::F32 {
                     data: uv.clone(),
                     shape: vec![1, t],
                 },
-            ),
-            (
-                "noise",
+            ));
+        }
+        inputs.push((
+            "noise",
+            InputTensor::F32 {
+                data: noise,
+                shape: vec![1, m.noise_channels as i64, t],
+            },
+        ));
+        // 4.0-v2: Generator_Noise's random phase, an explicit graph input since the
+        // export (upstream keeps torch.rand in-graph = non-reproducible).
+        if let Some(bins) = m.phase_bins {
+            let phase = seg_phase(bins, n_frames, options.seed, seg_idx, options.debug_zero_noise);
+            inputs.push((
+                "phase",
                 InputTensor::F32 {
-                    data: noise,
-                    shape: vec![1, m.noise_channels as i64, t],
+                    data: phase,
+                    shape: vec![1, bins as i64, t],
                 },
-            ),
-        ];
+            ));
+        }
         if let Some(mix) = &spk_mix_dense {
             inputs.push((
                 "spk_mix",
@@ -711,6 +736,30 @@ pub(crate) fn apply_cluster_blend(c: &mut Array2<f32>, cluster: Option<&ClusterA
 /// keeps it independent from (but as reproducible as) the VITS z-noise stream of the
 /// same piece.
 const DIFF_RNG_DOMAIN: u64 = 0xD1FF_05ED_5EED_0001;
+
+/// Domain-separation constant for the 4.0-v2 `phase` input stream (independent from
+/// the z-noise draw of the same piece, same reproducibility).
+const PHASE_RNG_DOMAIN: u64 = 0x9A5E_0FA5_ED00_0002;
+
+/// The 4.0-v2 net_g explicit `phase` input: uniform·2·3.14 − 3.14 (the original's literal
+/// 3.14 — models.py:616), `bins·n_frames` values row-major (`[1, bins, T]`), drawn from the
+/// per-piece seg_rng in its own domain. `zero` (debug_zero_noise, Rust-only test flag) →
+/// zeros = the deterministic gate-build phase.
+pub(crate) fn seg_phase(
+    bins: usize,
+    n_frames: usize,
+    seed: u64,
+    seg_idx: u64,
+    zero: bool,
+) -> Vec<f32> {
+    if zero {
+        return vec![0.0; bins * n_frames];
+    }
+    let mut rng = seg_rng(seed ^ PHASE_RNG_DOMAIN, seg_idx);
+    (0..bins * n_frames)
+        .map(|_| rng.gen::<f32>() * (2.0 * 3.14) - 3.14)
+        .collect()
+}
 
 /// The per-piece diffusion pass (GaussianDiffusion.forward infer branch, unit2mel.py:131-166
 /// condition build): encoder.onnx → cond; shallow = norm_spec(gt mel)+q_sample(k_step-1),

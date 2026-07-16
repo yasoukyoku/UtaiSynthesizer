@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::commands::inference::{
-    aux_path, contentvec_for_dim, min_frames, noise_channels, require_input,
+    aux_path, contentvec_for_dim, min_frames, noise_channels, phase_bins, require_input,
     resolve_sovits_quality, AUX_NSF_HIFIGAN, AUX_NSF_HIFIGAN_JSON, AUX_NSF_HIFIGAN_MEL, AUX_RMVPE,
     AUX_RMVPE_MEL,
 };
@@ -560,6 +560,8 @@ pub async fn render_audition_voice(
                     hop_size,
                     features_dim: dim,
                     vol_embedding,
+                    phase_bins: phase_bins(&config),
+                    feed_uv: has_input("uv").unwrap_or(true),
                     spk_mix,
                     unit_interpolate_mode: config
                         .unit_interpolate_mode
@@ -935,6 +937,8 @@ pub async fn render_audition_diffusion(
             hop_size,
             features_dim: dim,
             vol_embedding,
+            phase_bins: phase_bins(&entry.config),
+            feed_uv: host_has_input("uv").unwrap_or(true),
             spk_mix,
             unit_interpolate_mode: entry
                 .config
@@ -1121,6 +1125,8 @@ pub async fn render_model_audition(
                         hop_size,
                         features_dim: dim,
                         vol_embedding,
+                        phase_bins: phase_bins(&entry.config),
+                        feed_uv: has_input("uv").unwrap_or(true),
                         spk_mix,
                         unit_interpolate_mode: entry
                             .config
@@ -1287,6 +1293,8 @@ pub async fn render_candidate_scale(
                     hop_size,
                     features_dim: dim,
                     vol_embedding,
+                    phase_bins: phase_bins(&config),
+                    feed_uv: has_input("uv").unwrap_or(true),
                     spk_mix,
                     unit_interpolate_mode: config
                         .unit_interpolate_mode

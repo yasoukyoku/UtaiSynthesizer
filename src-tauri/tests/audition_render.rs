@@ -289,6 +289,8 @@ fn audition_sovits_candidate() {
         hop_size: hop,
         features_dim: dim,
         vol_embedding,
+        phase_bins: None, // 4.x training candidate — no v2 phase input
+        feed_uv: true,
         spk_mix: None, // single-speaker test model → the sid path (①c multi-speaker unused here)
         unit_interpolate_mode: "left".into(),
         noise_channels: 192,
