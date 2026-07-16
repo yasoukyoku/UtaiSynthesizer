@@ -291,6 +291,13 @@ fn voice_env_wav() {
                 .and_then(|a| a.get(1))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
+            let f0d_cond_channels = sc
+                .get("f0d_cond")
+                .and_then(|v| v.get("input"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             let feed_uv = sc
                 .get("inputs")
                 .and_then(|v| v.as_array())
@@ -311,6 +318,7 @@ fn voice_env_wav() {
                 features_dim: dim,
                 vol_embedding,
                 phase_bins,
+                f0d_cond_channels,
                 feed_uv,
                 spk_mix: None, // single-speaker E2E fixture → the sid path (①c multi-speaker unused here)
                 unit_interpolate_mode,

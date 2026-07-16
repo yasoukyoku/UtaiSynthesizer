@@ -85,6 +85,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   AUTO_F0_FILE_MISSING: { key: "backend.AUTO_F0_FILE_MISSING" },
   AUTO_F0_FRAMES_MISMATCH: { key: "backend.AUTO_F0_FRAMES_MISMATCH" },
   AUTO_F0_NOT_EXPORTED: { key: "backend.AUTO_F0_NOT_EXPORTED" },
+  AUTO_F0_NO_F0D_OUTPUT: { key: "backend.AUTO_F0_NO_F0D_OUTPUT" },
+  AUTO_F0_F0D_SHAPE: { key: "backend.AUTO_F0_F0D_SHAPE" },
   AUTO_F0_NO_OUTPUT: { key: "backend.AUTO_F0_NO_OUTPUT" },
   AUX_FILE_MISSING: { key: "backend.AUX_FILE_MISSING" },
   AUX_VOCODER_MEL_MISSING: { key: "backend.AUX_VOCODER_MEL_MISSING" },

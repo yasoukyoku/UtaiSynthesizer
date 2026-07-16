@@ -121,6 +121,12 @@ pub struct SovitsModel<'a> {
     /// random phase explicit; a per-piece seeded uniform·2·3.14−3.14 tensor is fed
     /// (`seg_phase`). `None` = 4.0/4.1 graph (no such input).
     pub phase_bins: Option<usize>,
+    /// 4.0-v2 (VISinger2): `Some(channels)` iff the graph HAS a "f0d_cond" input
+    /// (sidecar "f0d_cond" block, channels = prior_hidden = 192) — the upstream
+    /// auto-f0 detach-alias side effect made explicit (export deviation 7). Zeros
+    /// in manual mode (bit-exact no-op); the `.f0.onnx` companion's second output
+    /// in auto-f0 mode. `None` = 4.0/4.1 graph.
+    pub f0d_cond_channels: Option<usize>,
     /// Whether the exported graph HAS a `uv` input — sidecar "inputs" array, legacy
     /// default true. 4.0/4.1 main graphs take uv; the 4.0-v2 main graph does NOT
     /// (its uv consumer lives only in the `.f0.onnx` companion).
@@ -487,6 +493,9 @@ pub(crate) fn decode_features(
     //    and its output REPLACES f0 everywhere downstream — enc_p (coarse in-graph), the NSF
     //    source, the diffusion condition, the vocoder and the enhancer (infer_tool.py:297:
     //    the returned f0 IS the predicted one). uv stays the source-detected mask. ──
+    // deviation 7 (4.0-v2): the companion's second output, fed to the main graph's
+    // f0d_cond input in auto-f0 mode; None → zeros (manual mode, bit-exact no-op).
+    let mut f0d_cond: Option<Vec<f32>> = None;
     if let Some(f0p_sid) = &m.f0_predictor_session {
         let mut p_inputs = vec![
             (
@@ -537,9 +546,8 @@ pub(crate) fn decode_features(
                 },
             ));
         }
-        let outs = m.engine.run(f0p_sid, p_inputs)?;
+        let mut outs = m.engine.run(f0p_sid, p_inputs)?.into_iter();
         let f0_pred = outs
-            .into_iter()
             .next()
             .ok_or_else(|| UtaiError::Inference("AUTO_F0_NO_OUTPUT".into()))?;
         if f0_pred.len() != n_frames {
@@ -548,6 +556,21 @@ pub(crate) fn decode_features(
                 f0_pred.len(),
                 n_frames
             )));
+        }
+        // deviation 7: a v2 companion carries the side-effect term as output #2
+        if let Some(ch) = m.f0d_cond_channels {
+            let d = outs
+                .next()
+                .ok_or_else(|| UtaiError::Inference("AUTO_F0_NO_F0D_OUTPUT".into()))?;
+            if d.len() != ch * n_frames {
+                return Err(UtaiError::Inference(format!(
+                    "AUTO_F0_F0D_SHAPE: {} != {}x{}",
+                    d.len(),
+                    ch,
+                    n_frames
+                )));
+            }
+            f0d_cond = Some(d);
         }
         f0 = f0_pred;
     }
@@ -603,6 +626,20 @@ pub(crate) fn decode_features(
                 InputTensor::F32 {
                     data: phase,
                     shape: vec![1, bins as i64, t],
+                },
+            ));
+        }
+        // 4.0-v2 deviation 7: auto-f0 side-effect term (companion output #2);
+        // manual mode feeds zeros — x + 0 keeps the manual path bit-exact.
+        if let Some(ch) = m.f0d_cond_channels {
+            let data = f0d_cond
+                .clone()
+                .unwrap_or_else(|| vec![0.0; ch * n_frames]);
+            inputs.push((
+                "f0d_cond",
+                InputTensor::F32 {
+                    data,
+                    shape: vec![1, ch as i64, t],
                 },
             ));
         }

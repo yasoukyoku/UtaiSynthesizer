@@ -992,7 +992,8 @@ mod tests {
                 engine, voice_session: voice, contentvec_session: cv, rmvpe_session: rmvpe,
                 mel_filters: mel, cluster: None, diffusion: None, vocoder: None,
                 f0_predictor_session: None, sample_rate: 44100, hop_size: 512, features_dim: dim,
-                vol_embedding: vol, phase_bins: None, feed_uv: true, spk_mix: None,
+                vol_embedding: vol, phase_bins: None, f0d_cond_channels: None,
+                feed_uv: true, spk_mix: None,
                 unit_interpolate_mode: "left".into(),
                 noise_channels: 192, min_frames: 6,
             }
@@ -1159,6 +1160,7 @@ mod tests {
                 features_dim: dim,
                 vol_embedding: vol,
                 phase_bins: None,
+                f0d_cond_channels: None,
                 feed_uv: true,
                 spk_mix: None,
                 unit_interpolate_mode: "left".into(),

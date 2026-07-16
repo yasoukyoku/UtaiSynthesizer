@@ -601,6 +601,8 @@
     "AUTO_F0_FRAMES_MISMATCH": "自动音高预测帧数异常",
     "AUTO_F0_NOT_EXPORTED": "模型导出时未包含自动音高预测器（可能没有 f0_decoder 权重，或导出于旧版转换器——重新导入 .pth 可生成）",
     "AUTO_F0_NO_OUTPUT": "自动音高预测器没有返回输出",
+    "AUTO_F0_NO_F0D_OUTPUT": "自动音高预测器缺少 f0d_cond 输出(模型导出件过旧,请重新导入模型)",
+    "AUTO_F0_F0D_SHAPE": "自动音高预测器的 f0d_cond 输出形状不符",
     "AUX_FILE_MISSING": "缺少辅助文件，请将其放入指定目录",
     "AUX_VOCODER_MEL_MISSING": "缺少NSF-HiFiGAN滤波器，请将其放入指定目录",
     "CONTENTVEC_INPUT_TOO_SHORT": "音频片段过短，无法提取内容特征",

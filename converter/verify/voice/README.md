@@ -279,16 +279,38 @@ n_fft/2+按 length 取尾（原版 onnxexport 对称裁 768 = 与训练错位 25
 gate 证逐字节等价;chika spk 名从 kmeans_10000.pt 键取证 ②torch≥2 跑原版参照需 istft
 view_as_complex 垫片+抢占 root logger（原版 utils import 时设 DEBUG=numba 洪水）③torch.istft
 `length` 语义=前裁 n_fft/2 后直接取 length（尾部是真 OLA 内容,不是补零——踩过）。
-**关卡 2 E2E(4.0-v2,2026-07-17)**:e2e_sovits_v2_ref.py(驱动原版 v2 SynthesizerTrn 单段语义,
-ContentVec/RMVPE onnx 注入+torch≥2 istft 垫片+ZeroNoise 双随机点清零)vs Rust 全链
-(tests/voice_pipeline.rs,{"noise_scale":0,"debug_zero_noise":true},单 piece 连续演唱段 5.5s)。
-**波形 SNR = 16.35 dB——对本架构该度量已失效**,灵敏度标定证明:64 次谐波正弦库对 f0 输入
-呈灾难性相位敏感,ref-vs-ref 加 ±0.1%(1.7 音分,不可闻)f0 wobble = **−1.9 dB**,加 0.002%
-(0.03 音分)恒移 = 5.05 dB。**改用相位盲 mel 域标定判据**:ref↔Rust log-mel MAE **0.180** /
-log-mel SNR **25.3 dB**,落在 ref↔ref 不可闻微扰自差区间 [0.174-0.271 / 23.9-27.0 dB] **之内**
-⇒ Rust 管线与上游差异 ≤ 不可闻 f0 微扰等价类,管线忠实。频带剖面:250-1000Hz(基频/内容)
-−33.4dB 完好,高带=谐波相位度量伪象。★方法论沉淀:**谐波合成器类架构的 E2E 用「已知不可闻
-扰动的自差标定」定判据,不硬卡波形 SNR**(S36 CUDA/TF32 先例的推广)。
-Rust 侧冒烟:CPU 20s 音频 6.1s / CUDA 4.0s(aux CPU、语音 CUDA),无 NaN,peak 0.92。
-复现件:TESTING\SoVITS-4.0_v2\{e2e_clip_44k,chika_ref_det,chika_rust_det,chika_rust_e2e}.wav
-+ scratchpad 探针(f0_sens/mel_calib,方法在本节)。
+**关卡 2 E2E(4.0-v2,2026-07-17,批2.5 修正版)**:e2e_sovits_v2_ref.py(驱动原版 v2
+SynthesizerTrn 单段语义,ContentVec/RMVPE onnx 注入+torch≥2 istft 垫片+z_p 噪声清零+
+**相位钉显式零张量**)vs Rust 全链(tests/voice_pipeline.rs,{"noise_scale":0,
+"debug_zero_noise":true},单 piece 连续演唱段 5.5s):
+**波形 SNR = 46.49 dB(PASS >40 线),corr 0.999989,全频带 −38.3~−54.8 dB**。
+Rust 侧冒烟:CPU 20s 音频 6.1s / CUDA 4.0s(aux CPU、语音 CUDA),无 NaN。
+复现件:TESTING\SoVITS-4.0_v2\{e2e_clip_44k,chika_ref_det,chika_rust_det,chika_rust_e2e}.wav。
+
+★★ 翻案实录(对抗审查 C4/C5/C6,自证陷阱案例,长期教训):首轮 E2E 读数 16.35 dB,
+当时用「f0 灵敏度标定」解释为「64 次谐波架构对 f0 灾难性相位敏感→波形 SNR 度量失效→改
+mel 域自差带判据(MAE 0.180 ∈ [0.174,0.271])」并沉淀成方法论——**结论错误**。真因是
+harness 确定档相位常数错位:ref 的 ZeroNoise 把 torch.rand 钉 0 → phase = 0·2·3.14−3.14
+= **−3.14 rad**,而 Rust debug_zero_noise 喂 **0 rad**,噪声支路极性整体翻转;修正后同一
+对比直接 46.49 dB。**教训:①「两侧确定档」必须逐常数核对(rand→0 不等于 参数→0);
+②灵敏度标定回答的是「f0 不同」的问题,而 E2E 两侧 f0 逐点相同——用无关实验解释异常读数
+= 自证陷阱;③mel 自差带这种宽松判据能把 30 dB 级真实差异(本例=极性翻转)判成「忠实」,
+不得作为一线判据**。f0 灵敏度实验数据本身仍真实(ref 自差 ±0.1% f0 wobble=−1.9dB、
+0.002%=5.05dB),仅适用于「两侧 f0 确实不同」的场景解读,如 tier (g) auto 链的绝对上限校准。
+**批2.5 增补(2026-07-17,对抗审查 7 项 confirmed 全处置)**:
+- **偏差⑦(审查 C0,major)**:上游 F0Decoder.forward 开头 `x = torch.detach(x); x +=
+  f0_prenet(norm_f0)` —— detach 与调用方共享 storage,`+=` 写穿别名,把 infer() 的
+  decoder_input 永久改写(训练 forward 恒先调 f0_decoder ⇒ 该项=训练分布);4.x 不受影响
+  (其 F0Decoder 先 `x = x + cond(g)` 生成新张量切断别名)。两图分解无法携带隐藏副作用 →
+  显式化:主图新增 `f0d_cond[1,prior_hidden,T]` 输入(manual 喂零=IEEE 位恒等,gate a/b2/c
+  复跑逐位不变),companion 第二输出给出该项。
+- tier (f) 扩双输出:f0d_cond torch-vs-orig **逐位 0.0**,ORT 4.8e-7。
+- **tier (g) 新增(全链 auto-f0)**:ours-vs-fp64 **2.735e-3**,上游 fp32 自漂 3.984e-3 →
+  支配判据过;绝对上限按上游自漂同数量级校准为 5e-3(auto 链中 ulp 级 pred_f0 差经谐波库
+  放大=真 f0 敏感现象的作用点,manual 链仍 2.5e-6)。
+- C1:f0_decoder 改条件构造(has_f0_decoder,同 has_posterior)——剥离件干净降级为
+  auto_f0 unavailable 而非裸 strict-load 崩溃。C2:prior_n_heads 改权重推导优先+WARNING
+  (config lies lose to weights 全字段一致)。C3:win_size != n_fft 响亮拒绝
+  (ConviSTFT pinv 基左对齐 vs istft 居中垫窗仅在相等时一致;win∈[hop+n_fft/2, n_fft)
+  区间上游可训练且此前会静默转换出噪声支路错误模型)。
+- 全 tier 复跑 GATE PASSED;sidecar 新增 "f0d_cond" 块 + auto_f0.outputs。

@@ -41,11 +41,14 @@ deliberately not copied; expansion stays Rust-side like every other export):
            phase[1,n_fft//2+1,T] f32 — Generator_Noise's random phase,
            caller-supplied uniform*2*3.14-3.14 (upstream uses literal 3.14,
            kept verbatim); zeros = deterministic noise branch,
-           sid[1] i64 — or spk_mix[1,n_spk] f32 for genuine multi-speaker
+           sid[1] i64 — or spk_mix[1,n_spk] f32 for genuine multi-speaker,
+           f0d_cond[1,prior_hidden,T] f32 — the auto-f0 side-effect term
+           (deviation 7); zeros in manual mode (bit-exact no-op)
   output : audio[1,1,T*hop_size]
 The main graph has NO uv input (v2's infer() only reads uv inside the
 predict_f0 branch, which lives in the standalone <stem>.f0.onnx companion:
-c/f0/uv/sid[|spk_mix] -> f0_pred[1,T] Hz, same mechanism as sovits_v4).
+c/f0/uv/sid[|spk_mix] -> f0_pred[1,T] Hz + f0d_cond[1,prior_hidden,T],
+same mechanism as sovits_v4 plus the deviation-7 second output).
 
 DOCUMENTED DEVIATIONS (each numerically gated by gate1_sovits_v2.py):
  1. Random phase + z_p noise become explicit graph inputs (upstream onnxexport
@@ -80,6 +83,20 @@ DOCUMENTED DEVIATIONS (each numerically gated by gate1_sovits_v2.py):
     torch-vs-ORT cumsum rounding diverges). Gated against an fp64 reference
     of the original formulation (ours must be strictly closer than the
     original's own fp32).
+ 7. The upstream F0Decoder.forward opens with `x = torch.detach(x); x +=
+    f0_prenet(norm_f0)` — detach() ALIASES the caller's storage, so the +=
+    writes through and permanently mutates infer()'s decoder_input. Under
+    predict_f0=True everything downstream (aam mel_decoder, PriorDecoder)
+    therefore consumes text_encoder_out + f0_decoder.f0_prenet(norm_f0) —
+    and the training forward() always applies it (f0_decoder runs first), so
+    the term IS the training distribution. A two-graph decomposition cannot
+    carry a hidden side effect, so it is made EXPLICIT: the main graph takes
+    a `f0d_cond` [1, prior_hidden, T] input added to the text-encoder output
+    (manual mode feeds zeros — IEEE x+0 keeps the manual path bit-exact),
+    and the .f0.onnx companion emits it as a second output next to f0_pred.
+    (4.x is unaffected: its F0Decoder builds a fresh tensor via `x = x +
+    cond(spk_emb)` before the +=, cutting the alias — the 4.x companion
+    decomposition is exact as-is.) Gated by the full-chain auto-f0 tier.
 
 Unsupported (clean Chinese ValueError): checkpoints whose weights disagree
 with the fixed VISinger2 template geometry in ways weights cannot express
@@ -770,6 +787,7 @@ class SynthesizerTrnV2(nn.Module):
                  hop_length,
                  window_size=4,          # ours: from weights (emb_rel_k); v2 hardcodes 4
                  has_posterior=True,     # ours: tolerate stripped checkpoints
+                 has_f0_decoder=True,    # ours: ditto (upstream load_checkpoint is non-strict)
                  **kwargs):
         super().__init__()
         self.hidden_channels = hidden_channels
@@ -798,16 +816,17 @@ class SynthesizerTrnV2(nn.Module):
             n_speakers=n_speakers,
             spk_channels=spk_channels)
 
-        self.f0_decoder = F0DecoderV2(
-            1,
-            prior_hidden_channels,
-            prior_filter_channels,
-            prior_n_heads,
-            prior_n_layers,
-            prior_kernel_size,
-            prior_p_dropout,
-            n_speakers=n_speakers,
-            spk_channels=spk_channels)
+        if has_f0_decoder:
+            self.f0_decoder = F0DecoderV2(
+                1,
+                prior_hidden_channels,
+                prior_filter_channels,
+                prior_n_heads,
+                prior_n_layers,
+                prior_kernel_size,
+                prior_p_dropout,
+                n_speakers=n_speakers,
+                spk_channels=spk_channels)
 
         self.mel_decoder = MelDecoderV2(
             acoustic_dim,
@@ -861,7 +880,7 @@ class SynthesizerTrnV2(nn.Module):
 
         self.acoustic_dim = acoustic_dim
 
-    def forward(self, c, f0, noise, phase, sid):
+    def forward(self, c, f0, noise, phase, sid, f0d_cond):
         """
         c: [1, T, c_dim] f32 — vec256l9 features ALREADY expanded to the f0
            frame count (repeat_expand stays Rust-side)
@@ -873,6 +892,10 @@ class SynthesizerTrnV2(nn.Module):
            uniform*2*3.14-3.14; zeros = deterministic noise branch
         sid: [1] i64 — speaker id (or spk_mix [1, n_spk] f32 when
            export_spk_mix; a one-hot row == the emb_spk gather bit-for-bit)
+        f0d_cond: [1, prior_hidden, T] f32 — DEVIATION 7: the auto-f0 side
+           effect (upstream F0Decoder mutates the caller's decoder_input via
+           a detach alias). Manual mode feeds ZEROS (x + 0 is bit-exact);
+           auto mode feeds the companion's second output.
         returns audio [1, 1, T * hop_length]
         """
         # models.py infer() :1005-1010 — g from the speaker table
@@ -887,6 +910,9 @@ class SynthesizerTrnV2(nn.Module):
 
         # Encoder
         decoder_input, x_mask = self.text_encoder(c, c_lengths)
+        # DEVIATION 7: upstream predict_f0=True leaves decoder_input mutated to
+        # text_encoder_out + f0_decoder.f0_prenet(norm_f0) — made explicit here.
+        decoder_input = decoder_input + f0d_cond
         y_lengths = c_lengths
 
         LF0 = 2595. * torch.log10(1. + f0 / 700.)
@@ -956,8 +982,11 @@ class F0PredictorWrapperV2(nn.Module):
     inputs : c[1,T,c_dim] f32 (expanded, same layout as the main graph),
              f0[1,T] f32 (source F0 in Hz, AFTER transpose/key shift),
              uv[1,T] f32, sid[1] i64 (or spk_mix[1,n_spk] f32)
-    output : f0_pred[1,T] f32 (Hz) — feed as the main graph's `f0` input
-             (uv is not a main-graph input for v2; it exists only here).
+    outputs: f0_pred[1,T] f32 (Hz) — feed as the main graph's `f0` input
+             (uv is not a main-graph input for v2; it exists only here);
+             f0d_cond[1,prior_hidden,T] f32 — DEVIATION 7: the term the
+             upstream F0Decoder writes into the caller's decoder_input
+             through its detach alias; feed as the main graph's `f0d_cond`.
     DEVIATION 5 (header): normalize_f0 runs with random_scale=False — v2's
     infer() omits the flag and inherits the train-time random scale jitter,
     which the 4.0/4.1 branches fixed; gated with factor pinned to 1."""
@@ -992,7 +1021,11 @@ class F0PredictorWrapperV2(nn.Module):
         pred_lf0, predict_bn_mask = self.f0_decoder(decoder_input, norm_f0,
                                                     y_lengths, spk_emb=g)
         pred_f0 = 700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)
-        return pred_f0.squeeze(1)
+        # DEVIATION 7: the alias side effect, emitted explicitly (upstream:
+        # F0Decoder's `x = detach(x); x += f0_prenet(norm_f0)` writes through
+        # into the caller's decoder_input — the training distribution term).
+        f0d_cond = self.f0_decoder.f0_prenet(norm_f0)
+        return pred_f0.squeeze(1), f0d_cond
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1118,14 @@ def build_from_checkpoint(checkpoint, config=None):
         sd[f"dec.resblocks.{j}.{conv_key}.0.weight_v"].shape[2] for j in range(num_kernels)]
 
     # --- config-supplied (weights cannot express these; template defaults) ---
-    n_heads = model_cfg.get("prior_n_heads", prior_hidden // emb_rel_k.shape[2])
+    # n_heads: the weight derivation is EXACT (emb_rel_k.shape[2] == k_channels
+    # == hidden // n_heads) — config lies lose to weights like every field above
+    # (a wrong prior_n_heads would otherwise die as a raw strict-load size
+    # mismatch instead of the policy WARNING).
+    n_heads = prior_hidden // emb_rel_k.shape[2]
+    if model_cfg.get("prior_n_heads") not in (None, n_heads):
+        print(f"WARNING: config 的 prior_n_heads={model_cfg.get('prior_n_heads')} "
+              f"与权重推得的 {n_heads} 不符，以权重为准", file=sys.stderr)
     upsample_rates = model_cfg.get("upsample_rates")
     if upsample_rates is None:
         # template geometry [8,8,4,2]; kernel = 2 * stride holds for it
@@ -1109,6 +1149,15 @@ def build_from_checkpoint(checkpoint, config=None):
         [[1, 3, 5]] * num_kernels if resblock == "1" else [[1, 3]] * num_kernels)
     sample_rate = data_cfg.get("sampling_rate", 44100)
     win_size = data_cfg.get("win_size", n_fft)
+    # ConviSTFT's pinv basis is LEFT-aligned in the n_fft frame while
+    # torch.istft centre-pads a shorter window — they only agree at
+    # win_size == n_fft (the official template geometry). A win_size!=n_fft
+    # model IS trainable upstream, so refuse loudly instead of silently
+    # breaking the deviation-4 alignment promise.
+    if win_size != n_fft:
+        raise ValueError(
+            f"config 的 data.win_size={win_size} != n_fft={n_fft} — 噪声支路的"
+            f" ConviSTFT 仅在两者相等时与训练公式对齐，超出 4.0-v2 官方结构（排期项）")
     if config is None:
         print("WARNING: sampling_rate 按 44100 假设", file=sys.stderr)
     if data_cfg.get("n_fft") not in (None, n_fft):
@@ -1173,6 +1222,7 @@ def build_from_checkpoint(checkpoint, config=None):
         hop_size,
         window_size=window_size,
         has_posterior=has_posterior,
+        has_f0_decoder=has_f0_decoder,
     )
 
     state_dict_f32 = {
@@ -1198,6 +1248,8 @@ def build_from_checkpoint(checkpoint, config=None):
         "speakers": {str(k): int(v) for k, v in spk.items()},
         # z_p noise rides on hidden_channels (192), same shape family as 4.x
         "inter_channels": int(hidden_channels),
+        # f0d_cond (deviation 7) rides on prior_hidden (192)
+        "prior_hidden": int(prior_hidden),
         "n_fft": int(n_fft),
         # traced attention rel-pos branch is valid for T >= window_size + 2
         "min_frames": int(window_size) + 2,

@@ -5,9 +5,12 @@ semantics vs Rust).
 Reproduces the ORIGINAL 4.0-v2 single-segment path (infer_tool.slice_inference around
 ONE non-silent segment + Svc.infer/get_unit_f0), transcribed faithfully, driving the
 ORIGINAL torch models.SynthesizerTrn (real .pth weights, reconstructed template
-config.json). Determinism: torch.rand / randn / randn_like monkeypatched to zeros —
-kills z_p noise AND Generator_Noise's random phase == the Rust run with
-{"noise_scale": 0.0, "debug_zero_noise": true}.
+config.json). Determinism: torch.randn / randn_like monkeypatched to zeros (kills z_p noise)
+and Generator_Noise's phase pinned to an EXPLICIT zero tensor == the Rust run
+with {"noise_scale": 0.0, "debug_zero_noise": true} (seg_phase zeros).
+★ Pinning phase via ZeroNoise's rand→0 would yield phase = 0·2·3.14−3.14 =
+−3.14 rad — the polarity-flipped noise branch that produced the phantom
+16.35 dB reading in the first S68 E2E round (review finding C5).
 
 DOCUMENTED substitutions (same convention as e2e_sovits_ref.py — each certified
 against the true ORIGINAL elsewhere):
@@ -78,13 +81,15 @@ def istft_torch2(spec_real_imag, n_fft, hop, win, window, length):
 
 def _patch_noise_forward():
     """Replace Generator_Noise.forward with the verbatim body, istft shimmed for
-    torch>=2. torch.rand is separately zeroed by ZeroNoise (phase = 0)."""
+    torch>=2 and the phase pinned to ZEROS — matching Rust's debug_zero_noise
+    semantics exactly (NOT ZeroNoise's rand→0, which gives −3.14 rad and flips
+    the noise-branch polarity; review C4/C5)."""
     def forward(self, x, mask):
         istft_x = x
         istft_x = self.istft_pre(istft_x)
         istft_x = self.net(istft_x) * mask
         amp = self.istft_amplitude(istft_x).unsqueeze(-1)
-        phase = (torch.rand(amp.shape) * 2 * 3.14 - 3.14).to(amp)
+        phase = torch.zeros_like(amp)  # det harness pin (upstream: rand*2*3.14-3.14)
         real = amp * torch.cos(phase)
         imag = amp * torch.sin(phase)
         spec = torch.cat([real, imag], 3)

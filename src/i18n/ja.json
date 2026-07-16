@@ -601,6 +601,8 @@
     "AUTO_F0_FRAMES_MISMATCH": "自動ピッチ予測のフレーム数が不正です",
     "AUTO_F0_NOT_EXPORTED": "モデルに自動ピッチ予測器が含まれていません（f0_decoder 重みがないか旧コンバーターでのエクスポートです。.pth を再インポートすると生成されます）",
     "AUTO_F0_NO_OUTPUT": "自動ピッチ予測器が出力を返しませんでした",
+    "AUTO_F0_NO_F0D_OUTPUT": "自動ピッチ予測器に f0d_cond 出力がありません(古いモデル書き出しです。モデルを再インポートしてください)",
+    "AUTO_F0_F0D_SHAPE": "自動ピッチ予測器の f0d_cond 出力の形状が一致しません",
     "AUX_FILE_MISSING": "補助ファイルが見つかりません。指定のフォルダに配置してください",
     "AUX_VOCODER_MEL_MISSING": "NSF-HiFiGAN フィルタバンクが見つかりません。指定のフォルダに配置してください",
     "CONTENTVEC_INPUT_TOO_SHORT": "音声チャンクが短すぎて内容特徴を抽出できません",

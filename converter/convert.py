@@ -546,6 +546,7 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
 
     ssl_dim = meta["features_dim"]
     inter_channels = meta["inter_channels"]
+    prior_hidden = meta["prior_hidden"]
     hop_size = meta["hop_size"]
     n_fft = meta["n_fft"]
     phase_bins = n_fft // 2 + 1
@@ -559,6 +560,9 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
     f0[:, 40:60] = 0.0
     noise = torch.randn(1, inter_channels, seq_len) * SOVITS_NOISE_SCALE
     phase = torch.rand(1, phase_bins, seq_len) * 2 * 3.14 - 3.14
+    # deviation 7: trace with a NON-zero f0d_cond so the add cannot be folded
+    # away; runtime manual mode feeds zeros (bit-exact no-op).
+    f0d_cond = torch.randn(1, prior_hidden, seq_len) * 0.1
     if export_spk_mix:
         spk = torch.rand(1, n_spk)
         spk = spk / spk.sum(dim=1, keepdim=True)
@@ -567,15 +571,16 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
         spk = torch.zeros(1, dtype=torch.int64)
         spk_name = "sid"
 
-    input_names = ["c", "f0", "noise", "phase", spk_name]
+    input_names = ["c", "f0", "noise", "phase", spk_name, "f0d_cond"]
     dynamic_axes = {
         "c": {1: "seq_len"},
         "f0": {1: "seq_len"},
         "noise": {2: "seq_len"},
         "phase": {2: "seq_len"},
+        "f0d_cond": {2: "seq_len"},
         "audio": {2: "audio_len"},
     }
-    inputs = (c, f0, noise, phase, spk)
+    inputs = (c, f0, noise, phase, spk, f0d_cond)
 
     torch.onnx.export(
         model,
@@ -610,6 +615,7 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
                       * SOVITS_NOISE_SCALE).astype(np.float32),
             "phase": (np.random.rand(1, phase_bins, t) * 2 * 3.14 - 3.14
                       ).astype(np.float32),
+            "f0d_cond": np.zeros((1, prior_hidden, t), dtype=np.float32),
         }
         if export_spk_mix:
             m = np.random.rand(1, n_spk).astype(np.float32)
@@ -640,6 +646,7 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
             "f0": {1: "seq_len"},
             "uv": {1: "seq_len"},
             "f0_pred": {1: "seq_len"},
+            "f0d_cond": {2: "seq_len"},
         }
         uv = (f0 > 0).float()
         f0_inputs = (c, f0, uv, spk)
@@ -648,7 +655,9 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
             f0_inputs,
             str(auto_f0_path),
             input_names=f0_input_names,
-            output_names=["f0_pred"],
+            # deviation 7: f0d_cond = the alias side-effect term, fed back as
+            # the main graph's f0d_cond input in auto-f0 mode
+            output_names=["f0_pred", "f0d_cond"],
             dynamic_axes=f0_dynamic_axes,
             opset_version=17,
             do_constant_folding=True,
@@ -671,14 +680,17 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
                 feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
             else:
                 feeds["sid"] = np.zeros(1, dtype=np.int64)
-            f0_pred = f0_sess.run(None, feeds)[0]
-            if f0_pred.shape != (1, t) or not np.isfinite(f0_pred).all():
+            outs = f0_sess.run(None, feeds)
+            f0_pred, f0d = outs[0], outs[1]
+            if (f0_pred.shape != (1, t) or not np.isfinite(f0_pred).all()
+                    or f0d.shape != (1, prior_hidden, t) or not np.isfinite(f0d).all()):
                 raise ValueError(
-                    f"auto-f0 ORT sanity run failed at T={t}: shape "
-                    f"{f0_pred.shape} (expected (1, {t})), "
-                    f"finite={np.isfinite(f0_pred).all()}"
+                    f"auto-f0 ORT sanity run failed at T={t}: f0_pred {f0_pred.shape} "
+                    f"(expected (1, {t})), f0d_cond {f0d.shape} "
+                    f"(expected (1, {prior_hidden}, {t}))"
                 )
-            print(f"ORT sanity run passed: T={t} -> f0_pred (1, {t})")
+            print(f"ORT sanity run passed: T={t} -> f0_pred (1, {t}) + "
+                  f"f0d_cond (1, {prior_hidden}, {t})")
 
     config_path = output_path.with_suffix(".json")
     config_data = {
@@ -702,11 +714,17 @@ def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
         "phase": {
             "phase_input": [1, phase_bins, "T"],
         },
+        # v2-only (deviation 7): the auto-f0 alias side-effect term — zeros in
+        # manual mode, the companion's 2nd output in auto mode.
+        "f0d_cond": {
+            "input": [1, prior_hidden, "T"],
+        },
         "inputs": input_names,
         "min_frames": meta["min_frames"],
         "auto_f0": (
             {"available": True, "file": auto_f0_path.name,
-             "inputs": f0_input_names}
+             "inputs": f0_input_names,
+             "outputs": ["f0_pred", "f0d_cond"]}
             if auto_f0_path is not None else {"available": False}
         ),
     }

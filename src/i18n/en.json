@@ -601,6 +601,8 @@
     "AUTO_F0_FRAMES_MISMATCH": "Automatic pitch prediction frame count mismatch",
     "AUTO_F0_NOT_EXPORTED": "The model was exported without an auto-pitch predictor (it may lack f0_decoder weights, or was exported by an old converter — re-import the .pth to generate one)",
     "AUTO_F0_NO_OUTPUT": "The automatic pitch predictor returned no output",
+    "AUTO_F0_NO_F0D_OUTPUT": "The automatic pitch predictor lacks the f0d_cond output (outdated model export — re-import the model)",
+    "AUTO_F0_F0D_SHAPE": "The automatic pitch predictor's f0d_cond output has an unexpected shape",
     "AUX_FILE_MISSING": "Auxiliary file missing — place it into the indicated directory",
     "AUX_VOCODER_MEL_MISSING": "NSF-HiFiGAN mel filterbank missing — place it into the indicated directory",
     "CONTENTVEC_INPUT_TOO_SHORT": "Audio chunk too short to extract content features",

@@ -28,8 +28,14 @@ Tiers:
         < 5e-4 (rel-attn generic path documented min_frames=6).
   (f)   auto-f0: ours F0PredictorWrapperV2 torch vs the original predict_f0
         branch (normalize_f0 factor pinned to 1 — documented deviation 5)
-        must be EXACTLY 0.0; <stem>.f0.onnx ORT vs torch < 1.2e-3 Hz-relative
-        on voiced frames (lf0-domain sensitivity, same bar as gate_autof0).
+        must be EXACTLY 0.0 for BOTH outputs (f0_pred + the deviation-7
+        f0d_cond side-effect term); <stem>.f0.onnx ORT vs torch < 1.2e-3
+        Hz-relative (lf0-domain sensitivity, same bar as gate_autof0).
+  (g)   FULL-CHAIN auto-f0 (deviation 7): companion → main graph (ours,
+        decomposed) vs upstream infer(predict_f0=True) whose F0Decoder
+        mutates decoder_input through its detach alias — fp64 dominance
+        criteria like tier (a). This is the tier that would have caught the
+        dropped side-effect term (review C0).
 
 Run: converter/.venv/Scripts/python.exe converter/verify/voice/gate1_sovits_v2.py
 Readings are recorded in converter/verify/voice/README.md (4.0-v2 section).
@@ -243,6 +249,7 @@ def tier_real_weights(ckpt_path, label):
     ours, meta = build_from_checkpoint(ckpt, cfg)
 
     sid = torch.zeros(1, dtype=torch.int64)
+    zeros_f0d = torch.zeros(1, 192, c.shape[1])
     with torch.no_grad(), Patched(z, phase):
         def run_orig():
             # infer(c[1,256,T], g=sid[1,1]…): infer squeezes 2-D g itself
@@ -256,7 +263,7 @@ def tier_real_weights(ckpt_path, label):
 
     with torch.no_grad():
         def run_ours():
-            return ours(c, f0, z * NOICE_SCALE, phase, sid)
+            return ours(c, f0, z * NOICE_SCALE, phase, sid, zeros_f0d)
         o_our, cap_our = capture(
             {"text_encoder": ours.text_encoder,
              "mel_decoder": ours.mel_decoder,
@@ -309,9 +316,10 @@ def tier_refusals(ours_chika):
     ours_nocfg, meta_nocfg = build_from_checkpoint(ckpt, None)
     c, f0, uv, z, phase = fixed_inputs()
     sid = torch.zeros(1, dtype=torch.int64)
+    zeros_f0d = torch.zeros(1, 192, c.shape[1])
     with torch.no_grad():
-        a1 = ours_chika(c, f0, z * NOICE_SCALE, phase, sid)
-        a2 = ours_nocfg(c, f0, z * NOICE_SCALE, phase, sid)
+        a1 = ours_chika(c, f0, z * NOICE_SCALE, phase, sid, zeros_f0d)
+        a2 = ours_nocfg(c, f0, z * NOICE_SCALE, phase, sid, zeros_f0d)
     check("no-config build bitwise == config build", max_abs(a1, a2), 0, exact=True)
     assert meta_nocfg["speakers"] == {}, meta_nocfg["speakers"]
 
@@ -348,12 +356,15 @@ def tier_onnx(ours_chika):
     for t, tol in ((T, 1e-4), (137, 5e-4), (64, 5e-4), (23, 5e-4), (7, 5e-4), (6, 5e-4)):
         c, f0, uv, z, phase = fixed_inputs(t=t, seed=1000 + t)
         sid = torch.zeros(1, dtype=torch.int64)
+        # non-zero f0d_cond so the sweep also exercises the deviation-7 add
+        g = torch.Generator().manual_seed(2000 + t)
+        f0d = torch.randn(1, 192, t, generator=g) * 0.1
         with torch.no_grad():
-            ref = ours_chika(c, f0, z * NOICE_SCALE, phase, sid)
+            ref = ours_chika(c, f0, z * NOICE_SCALE, phase, sid, f0d)
         out = sess.run(None, {
             "c": c.numpy(), "f0": f0.numpy(),
             "noise": (z * NOICE_SCALE).numpy(), "phase": phase.numpy(),
-            "sid": sid.numpy(),
+            "sid": sid.numpy(), "f0d_cond": f0d.numpy(),
         })[0]
         d = float(np.abs(ref.numpy() - out).max())
         check(f"onnx T={t} max|Δ|", d, tol)
@@ -383,12 +394,16 @@ def tier_autof0(ours_chika):
                                       spk_emb=orig.emb_spk(sid).unsqueeze(-1))
         ref_f0 = 700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)
         ref_f0 = ref_f0.squeeze(1)
+        # deviation-7 ground truth: the exact tensor the upstream F0Decoder
+        # writes into the caller's decoder_input through its detach alias
+        ref_f0d = orig.f0_decoder.f0_prenet(norm_f0)
 
         wrapper = F0PredictorWrapperV2(ours_chika)
         wrapper.eval()
-        our_f0 = wrapper(c, f0, uv, sid)
+        our_f0, our_f0d = wrapper(c, f0, uv, sid)
 
     check("autof0 torch-vs-orig", max_abs(ref_f0, our_f0), 0, exact=True)
+    check("autof0 f0d_cond torch-vs-orig", max_abs(ref_f0d, our_f0d), 0, exact=True)
 
     import onnxruntime as ort
     if not ONNX_F0.exists():
@@ -397,11 +412,66 @@ def tier_autof0(ours_chika):
         return
     sess = ort.InferenceSession(ONNX_F0.read_bytes(),
                                 providers=["CPUExecutionProvider"])
-    out = sess.run(None, {"c": c.numpy(), "f0": f0.numpy(), "uv": uv.numpy(),
-                          "sid": sid.numpy()})[0]
+    outs = sess.run(None, {"c": c.numpy(), "f0": f0.numpy(), "uv": uv.numpy(),
+                           "sid": sid.numpy()})
     ref = our_f0.numpy()
-    rel = float((np.abs(ref - out) / np.maximum(np.abs(ref), 1.0)).max())
+    rel = float((np.abs(ref - outs[0]) / np.maximum(np.abs(ref), 1.0)).max())
     check("autof0 onnx Hz-relative", rel, 1.2e-3)
+    check("autof0 onnx f0d_cond max|Δ|", float(np.abs(our_f0d.numpy() - outs[1]).max()),
+          1e-4)
+
+
+class PinnedNormalize:
+    """Force the upstream's inference-time normalize_f0 to random_scale=False
+    (deviation 5 — v2's infer() omits the flag and inherits train-time jitter)."""
+
+    def __enter__(self):
+        self._orig = orig_utils.normalize_f0
+        orig_fn = self._orig
+
+        def pinned(f0, x_mask, uv, random_scale=True):
+            return orig_fn(f0, x_mask, uv, random_scale=False)
+
+        orig_utils.normalize_f0 = pinned
+        return self
+
+    def __exit__(self, *exc):
+        orig_utils.normalize_f0 = self._orig
+        return False
+
+
+def tier_autof0_chain(ours_chika):
+    print("\n=== tier (g): FULL-CHAIN auto-f0 (deviation 7) ===")
+    c, f0, uv, z, phase = fixed_inputs(seed=9876)
+    sid = torch.zeros(1, dtype=torch.int64)
+
+    def run_upstream(net, cc, ff, uvv, zz, ph):
+        with torch.no_grad(), Patched(zz, ph), PinnedNormalize():
+            return net.infer(cc.transpose(1, 2), g=sid.unsqueeze(0), f0=ff,
+                             uv=uvv, predict_f0=True,
+                             noice_scale=NOICE_SCALE)[0]
+
+    o_up32 = run_upstream(load_original(CHIKA), c, f0, uv, z, phase)
+    o_up64 = run_upstream(load_original(CHIKA).double(), c.double(), f0.double(),
+                          uv.double(), z.double(), phase.double()).float()
+
+    with torch.no_grad():
+        wrapper = F0PredictorWrapperV2(ours_chika)
+        wrapper.eval()
+        pred_f0, f0d = wrapper(c, f0, uv, sid)
+        o_ours = ours_chika(c, pred_f0, z * NOICE_SCALE, phase, sid, f0d)
+
+    d_our_64 = max_abs(o_ours, o_up64)
+    d_up_64 = max_abs(o_up32, o_up64)
+    print(f"       auto audio max|Δ|: ours-vs-fp64 {d_our_64:.3e} | "
+          f"origfp32-vs-fp64 {d_up_64:.3e} | ref max {float(o_up64.abs().max()):.3f}")
+    # The auto chain amplifies fp noise: ulp-level pred_f0 differences feed the
+    # 64-harmonic bank (genuine f0-phase sensitivity). The upstream's OWN fp32
+    # sits ~4e-3 from the fp64 truth here (vs ~2.4e-4 on the manual chain), so
+    # the absolute cap is calibrated to that same order; DOMINANCE (ours
+    # strictly closer to fp64 than upstream's own fp32) is the primary test.
+    check("auto-chain audio ours-vs-fp64 absolute", d_our_64, 5e-3)
+    check("auto-chain dominance (ours ≤ orig fp32 drift)", d_our_64 - d_up_64, 1e-12)
 
 
 def main():
@@ -414,6 +484,7 @@ def main():
     tier_refusals(ours_chika)
     tier_onnx(ours_chika)
     tier_autof0(ours_chika)
+    tier_autof0_chain(ours_chika)
 
     print()
     if FAILS:
