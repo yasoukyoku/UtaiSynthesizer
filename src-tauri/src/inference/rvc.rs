@@ -152,6 +152,17 @@ pub fn run_pipeline(
     let audio_pad = reflect_pad_np(&audio_f, t_pad, t_pad);
     let p_len = audio_pad.len() / WINDOW;
 
+    // Stage logging (S67b): a community 16 GB machine died mid-pipeline with NOTHING in the
+    // log between "Aux model cached" and process death — every stage transition below leaves
+    // a breadcrumb so the next silent crash points at its stage. INFO = per-run milestones,
+    // DEBUG = per-chunk (a song is ~1 line per ~40 s of input; the file layer records both).
+    let t_run = std::time::Instant::now();
+    tracing::info!(
+        "RVC pipeline: {:.1}s @16k, {} chunk(s); f0 (RMVPE, chunked) starting",
+        audio_f.len() as f32 / SR as f32,
+        opt_ts.len() + 1
+    );
+
     // S66: chunk-bounded (60 s windows + 2 s discarded overlap) — this whole-song pass was the
     // last unbounded GPU feed under gpu_extract (a 4-min song OOM'd 12 GB cards); ≤64 s songs
     // take the original single forward bit-for-bit (rmvpe_detect_chunked short-input path).
@@ -176,6 +187,7 @@ pub fn run_pipeline(
     let pitchf: Vec<f32> = f0[..p_len].to_vec();
     let pitch: Vec<i64> = pitchf.iter().map(|&v| f0_to_coarse(v)).collect();
     progress(0.2); // f0 (the one whole-signal RMVPE pass) done
+    tracing::info!("RVC pipeline: f0 done ({} frames); converting chunks", p_len);
 
     // ── chunk loop (original lines 371-441) ──
     // f0 (0.2) → chunks span [0.2, 0.95] → tail + post (0.95 → 1.0)
@@ -239,10 +251,18 @@ pub fn run_pipeline(
         let chunk = &audio_pad[s_ix..(t + t_pad2 + WINDOW).min(audio_pad.len())];
         let pl = s_ix / WINDOW;
         let ph = (t + t_pad2) / WINDOW;
+        let t_chunk = std::time::Instant::now();
         let out = ranged_chunk(&pitch[pl..ph], &pitchf[pl..ph], chunk, chunk_idx)?;
         append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
         s_ix = t;
         chunk_idx += 1;
+        tracing::debug!(
+            "RVC chunk {}/{} done ({:.1}s in, {:.0} ms)",
+            chunk_idx,
+            opt_ts.len() + 1,
+            chunk.len() as f32 / SR as f32,
+            t_chunk.elapsed().as_secs_f64() * 1000.0
+        );
         progress(0.2 + 0.75 * (chunk_idx as f32 / total_chunks));
     }
     // final chunk: audio_pad[t:] with the remaining pitch tail (t=None → whole signal)
@@ -250,8 +270,16 @@ pub fn run_pipeline(
         return Err(UtaiError::Inference("CANCELLED".into()));
     }
     let chunk = &audio_pad[s_ix..];
+    let t_chunk = std::time::Instant::now();
     let out = ranged_chunk(&pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], chunk, chunk_idx)?;
     append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
+    tracing::debug!(
+        "RVC chunk {}/{} done (final, {:.1}s in, {:.0} ms)",
+        chunk_idx + 1,
+        opt_ts.len() + 1,
+        chunk.len() as f32 / SR as f32,
+        t_chunk.elapsed().as_secs_f64() * 1000.0
+    );
 
     // ── rms mix (original: change_rms(audio, 16000, audio_opt, tgt_sr, rate) if rate != 1) ──
     if options.rms_mix_rate != 1.0 {
@@ -270,6 +298,12 @@ pub fn run_pipeline(
         audio_opt = utai_dsp::formant_warp(&audio_opt, |_| 2.0_f32.powf(options.formant / 12.0));
     }
     // NO int16 quantization (original's audio_max/max_int16 normalize skipped — we stay f32).
+    tracing::info!(
+        "RVC pipeline done in {:.1}s ({:.1}s audio out @{}Hz)",
+        t_run.elapsed().as_secs_f32(),
+        audio_opt.len() as f32 / final_sr.max(1) as f32,
+        final_sr
+    );
     progress(1.0);
 
     Ok(SynthesisResult {

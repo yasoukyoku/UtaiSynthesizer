@@ -71,6 +71,131 @@ struct LoadedSession {
     /// Human label of the EP actually backing this session ("CUDA (GPU)", "DirectML (GPU)", "CPU").
     /// Logged at inference time so the user can confirm what really ran (and catch silent fallbacks).
     actual_device: String,
+    /// Unique per BUILD of this entry (a fresh value every time the session is (re)built,
+    /// never reused across rebuilds of the same key). The DML recycle revalidates against it
+    /// under the write lock so a stale decision can never tear down a freshly rebuilt session.
+    build_id: u64,
+    /// S67b: DML shape-cache accounting — `Some` iff this session runs on DirectML.
+    dml: Option<DmlShapeAccounting>,
+}
+
+/// S67b: the DirectML EP re-initializes its compiled operators + pools for every DISTINCT
+/// input shape and keeps ALL of them alive for the session's lifetime (measured on the real
+/// RVC net_g, tests\voice_mem_profile.rs: same shape re-run = 0 growth; each new shape =
+/// +32 MB…+3.1 GB process commit in erratic allocation-bucket jumps; session drop returns
+/// everything). Voice chunks are silence-seek cut, so every chunk is a NEW shape — a 4-min
+/// song walked commit up to ~6.9 GB and a 16 GB community machine died mid-song (WDDM charges
+/// GPU allocations against process commit, and on small-VRAM cards the pools spill RESIDENT
+/// into system RAM). The engine therefore attributes pool growth to the session that caused
+/// it — the commit delta across each of the session's OWN new-shape runs, excluding its first
+/// shape (the unavoidable "ticket" any session must pay to run at all) — and recycles the
+/// session (drop + reload-on-miss rebuild; sessions hold no cross-run state, so numerics are
+/// unaffected — net_g is graph-stochastic run-to-run anyway) once that attributed growth
+/// passes [`dml_extra_commit_cap_mb`]. Per-run deltas rather than a frozen process-global
+/// baseline (S67b review): with several DML sessions alive (SoVITS quality path holds 4),
+/// absolute baselines go stale the moment any peer recycles and the budget stops meaning
+/// anything. Consequences of the delta scheme: static-shape sessions (MSST fixed chunks)
+/// accumulate nothing after their first shape — the batched separation path's remainder
+/// group (one extra shape) adds only its own small delta, never a recycle; same-shape loops
+/// (diffusion denoiser ~100 runs/piece) measure nothing at all. App-side allocations can
+/// pollute a delta only while that specific new-shape run is in flight — bounded noise,
+/// worst case an early recycle.
+struct DmlShapeAccounting {
+    /// Hashes of every distinct input-shape signature COMPLETED since this session was
+    /// built. Inserted only after a SUCCESSFUL run — a FAILED run instead drops the whole
+    /// session incarnation (see run_typed's error arm): a failed compile leaves unknown
+    /// pool/device state, and growth bookkeeping alone can never free headroom for the
+    /// retry (post-run recycling keeps growth <= cap at every run start; review round 2).
+    shapes: Mutex<std::collections::HashSet<u64>>,
+    /// Σ process-commit deltas (MB) across this session's own new-shape runs, excluding the
+    /// first shape. This is the reclaimable pool memory a recycle would return.
+    pool_growth_mb: AtomicU64,
+}
+
+/// Process commit charge (private bytes) in MB — the number WDDM/D3D12 allocations count
+/// against (and what exhausts a 16 GB machine long before working set does).
+#[cfg(windows)]
+fn process_commit_mb() -> u64 {
+    #[repr(C)]
+    struct Pmcex {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_non_paged: usize,
+        quota_non_paged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+        private_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32GetProcessMemoryInfo(h: isize, p: *mut Pmcex, cb: u32) -> i32;
+        fn GetCurrentProcess() -> isize;
+    }
+    unsafe {
+        let mut c: Pmcex = std::mem::zeroed();
+        c.cb = std::mem::size_of::<Pmcex>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            (c.private_usage / (1024 * 1024)) as u64
+        } else {
+            0
+        }
+    }
+}
+#[cfg(not(windows))]
+fn process_commit_mb() -> u64 {
+    0
+}
+
+/// DML pool budget BEYOND the first-shape ticket before a session is recycled:
+/// total physical RAM / 8, clamped to [1024, 4096] MB (16 GB machine → 2 GB budget).
+/// `UTAI_DML_COMMIT_CAP_MB` overrides (support/testing valve; 0 falls back to the formula).
+fn dml_extra_commit_cap_mb() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if let Ok(raw) = std::env::var("UTAI_DML_COMMIT_CAP_MB") {
+            match raw.trim().parse::<u64>() {
+                Ok(mb) if mb > 0 => return mb,
+                Ok(_) => {} // 0 = use the formula (documented)
+                // cmd.exe preserves trailing spaces in `set X=…` values — a silently dead
+                // support valve costs a whole diagnosis round; say why it was ignored.
+                Err(_) => tracing::warn!(
+                    "UTAI_DML_COMMIT_CAP_MB={raw:?} is not a whole MB number — using the default budget"
+                ),
+            }
+        }
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            struct MemStatusEx {
+                length: u32,
+                memory_load: u32,
+                total_phys: u64,
+                avail_phys: u64,
+                total_page: u64,
+                avail_page: u64,
+                total_virtual: u64,
+                avail_virtual: u64,
+                avail_extended: u64,
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GlobalMemoryStatusEx(p: *mut MemStatusEx) -> i32;
+            }
+            let total_mb = unsafe {
+                let mut m: MemStatusEx = std::mem::zeroed();
+                m.length = std::mem::size_of::<MemStatusEx>() as u32;
+                if GlobalMemoryStatusEx(&mut m) != 0 { m.total_phys / (1024 * 1024) } else { 0 }
+            };
+            if total_mb > 0 {
+                return (total_mb / 8).clamp(1024, 4096);
+            }
+        }
+        2048
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -94,6 +219,16 @@ pub enum InputTensor {
     I64 { data: Vec<i64>, shape: Vec<i64> },
     /// Boolean tensor — the ScoreToCV `phone_mask` input (all-true at deploy, B=1). Added S48 Phase 1c.
     Bool { data: Vec<bool>, shape: Vec<i64> },
+}
+
+impl InputTensor {
+    fn shape(&self) -> &[i64] {
+        match self {
+            InputTensor::F32 { shape, .. }
+            | InputTensor::I64 { shape, .. }
+            | InputTensor::Bool { shape, .. } => shape,
+        }
+    }
 }
 
 /// Typed output tensor with shape (S60). GAME's graphs return bool tensors (boundaries/
@@ -248,6 +383,10 @@ impl OnnxEngine {
                     None => break,
                 }
             }
+            let dml = actual_device.starts_with("DirectML").then(|| DmlShapeAccounting {
+                shapes: Mutex::new(std::collections::HashSet::new()),
+                pool_growth_mb: AtomicU64::new(0),
+            });
             sessions.insert(
                 key.clone(),
                 LoadedSession {
@@ -255,6 +394,9 @@ impl OnnxEngine {
                     path: path.clone(),
                     last_used: AtomicU64::new(tick),
                     actual_device,
+                    // The clock ticks on every load call, so this is unique per (re)build.
+                    build_id: tick,
+                    dml,
                 },
             );
             tracing::info!(
@@ -438,26 +580,34 @@ impl OnnxEngine {
         *self.last_activity.lock() = Instant::now();
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _in_flight = InFlightGuard(self); // declared before `sessions` so its Drop runs lock-free
+        // S67b: input-shape signature for the DML shape-cache accounting (names + dims; the
+        // pipelines build their input lists in a fixed order, so the hash is stable per shape).
+        let shape_sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for (name, t) in &inputs {
+                name.hash(&mut h);
+                t.shape().hash(&mut h);
+            }
+            h.finish()
+        };
+        // S67b: recycle an over-budget DML session BEFORE it compiles yet another shape
+        // (see DmlShapeAccounting). Dropping it here lets the reload-on-miss below rebuild
+        // it fresh — same path, same device, no cross-run state, ~1 s.
+        self.maybe_recycle_dml_session(session_id, Some(shape_sig));
         // Reload-on-miss: the shared LRU cache may have evicted a session a consumer still holds.
         // Rebuild it from the remembered path (same key, same device) instead of hard-failing.
-        if !self.sessions.read().contains_key(session_id) {
-            let spec = self.paths.read().get(session_id).cloned();
-            if let Some(spec) = spec {
-                // A device switch mid-job orphans the old-device key: load_model would rebuild under
-                // the CURRENT device's key, never this one. Fail with a clear message instead of the
-                // cryptic "Session not found". (Forced-device sessions — aux on CPU — are immune:
-                // their effective device never depends on the global preference.)
-                let effective = spec.device.clone().unwrap_or_else(|| self.device.read().clone());
-                if Self::make_key(&spec.path, &effective) != session_id {
-                    return Err(UtaiError::Inference(
-                        "Device preference changed while a job was running — re-run the job".to_string(),
-                    ));
-                }
-                tracing::info!("ONNX session evicted — reloading: {}", spec.path.display());
-                self.load_model_opts(&spec.path, spec.mem_pattern, spec.device)?;
-            }
+        self.reload_if_missing(session_id)?;
+        let mut sessions = self.sessions.read();
+        if !sessions.contains_key(session_id) {
+            // A concurrent DML recycle (another thread's post-run check on this session id)
+            // can remove the entry between the reload check above and this read (S67b
+            // review). One in-place rebuild resolves it — and can't re-race: a freshly
+            // rebuilt session has pool_growth 0, which no concurrent check can recycle.
+            drop(sessions);
+            self.reload_if_missing(session_id)?;
+            sessions = self.sessions.read();
         }
-        let sessions = self.sessions.read();
         let loaded = sessions.get(session_id).ok_or_else(|| {
             UtaiError::Inference(format!("Session '{}' not found", session_id))
         })?;
@@ -467,6 +617,14 @@ impl OnnxEngine {
             .store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
 
         let mut session = loaded.session.lock();
+        // S67b: delta accounting for a NEW shape — measured around the run under the session
+        // Mutex (concurrent same-sig runs serialize here, so a shape is measured once). The
+        // sig is only recorded on SUCCESS: a failed compile must stay "new" so its retry
+        // passes the pre-run budget check (see DmlShapeAccounting.shapes).
+        let dml_new_shape: Option<u64> = match &loaded.dml {
+            Some(dml) if !dml.shapes.lock().contains(&shape_sig) => Some(process_commit_mb()),
+            _ => None,
+        };
 
         let mut input_values: Vec<(Cow<str>, SessionInputValue)> = Vec::new();
 
@@ -491,28 +649,162 @@ impl OnnxEngine {
             input_values.push((Cow::Borrowed(name), value));
         }
 
-        let outputs = session.run(input_values)
-            .map_err(|e| UtaiError::Inference(format!("Inference failed: {}", e)))?;
+        // Run + output extraction live in an immediately-called closure: NLL (Problem Case
+        // #3) otherwise keeps `session` borrowed through BOTH match arms of run's Result,
+        // and the failed-run arm below needs the guards released.
+        let failed_dml_build = loaded.dml.as_ref().map(|_| loaded.build_id);
+        let run_outcome: Result<Vec<OutputTensor>> = (|| {
+            let outputs = session
+                .run(input_values)
+                .map_err(|e| UtaiError::Inference(format!("Inference failed: {}", e)))?;
+            let mut result = Vec::with_capacity(outputs.len());
+            for i in 0..outputs.len() {
+                let out = &outputs[i];
+                let typed = if let Ok((shape, data)) = out.try_extract_tensor::<f32>() {
+                    OutputTensor::F32 { shape: shape.to_vec(), data: data.to_vec() }
+                } else if let Ok((shape, data)) = out.try_extract_tensor::<bool>() {
+                    OutputTensor::Bool { shape: shape.to_vec(), data: data.to_vec() }
+                } else if let Ok((shape, data)) = out.try_extract_tensor::<i64>() {
+                    OutputTensor::I64 { shape: shape.to_vec(), data: data.to_vec() }
+                } else {
+                    return Err(UtaiError::Inference(format!(
+                        "Output {}: unsupported tensor dtype (expected f32/bool/i64)",
+                        i
+                    )));
+                };
+                result.push(typed);
+            }
+            Ok(result)
+        })();
 
-        let mut result = Vec::with_capacity(outputs.len());
-        for i in 0..outputs.len() {
-            let out = &outputs[i];
-            let typed = if let Ok((shape, data)) = out.try_extract_tensor::<f32>() {
-                OutputTensor::F32 { shape: shape.to_vec(), data: data.to_vec() }
-            } else if let Ok((shape, data)) = out.try_extract_tensor::<bool>() {
-                OutputTensor::Bool { shape: shape.to_vec(), data: data.to_vec() }
-            } else if let Ok((shape, data)) = out.try_extract_tensor::<i64>() {
-                OutputTensor::I64 { shape: shape.to_vec(), data: data.to_vec() }
-            } else {
-                return Err(UtaiError::Inference(format!(
-                    "Output {}: unsupported tensor dtype (expected f32/bool/i64)",
-                    i
-                )));
-            };
-            result.push(typed);
+        let result = match run_outcome {
+            Ok(result) => result,
+            Err(e) => {
+                // S67b (review round 2): a FAILED run on a DirectML session leaves unknown
+                // allocator/device state — a half-committed pool from a failed compile, or
+                // a wedged device (DXGI device-removed kills the session permanently).
+                // Growth bookkeeping can never rescue this (every successful run restores
+                // growth <= cap, so the retry's pre-run budget check structurally never
+                // fires) — instead drop THIS session incarnation outright so the retry
+                // rebuilds fresh with the session's whole footprint (ticket + pools)
+                // returned as headroom. Non-DML sessions keep the plain error path.
+                drop(session);
+                drop(sessions);
+                if let Some(build_id) = failed_dml_build {
+                    if self.drop_session_incarnation(session_id, build_id) {
+                        tracing::info!(
+                            "Dropped DirectML session after a failed run (fresh rebuild on retry): {}",
+                            session_id
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
+
+        // S67b: the run succeeded — record the shape and attribute its pool delta (first
+        // shape excluded: it's the unavoidable ticket, not reclaimable growth).
+        if let (Some(dml), Some(commit_before)) = (&loaded.dml, dml_new_shape) {
+            let mut shapes = dml.shapes.lock();
+            shapes.insert(shape_sig);
+            if shapes.len() > 1 {
+                let delta = process_commit_mb().saturating_sub(commit_before);
+                dml.pool_growth_mb.fetch_add(delta, Ordering::Relaxed);
+            }
         }
 
+        drop(session);
+        drop(sessions);
+        // S67b post-run: reclaim a just-blown budget promptly so multi-GB pools don't linger
+        // across the rest of the job (see DmlShapeAccounting).
+        self.maybe_recycle_dml_session(session_id, None);
         Ok(result)
+    }
+
+    /// Reload-on-miss body shared by `run_typed`'s two lookup attempts: rebuild an evicted /
+    /// recycled session from its remembered spec — or fail clearly when a mid-job device
+    /// switch orphaned the key (load_model would rebuild under the CURRENT device's key,
+    /// never this one; forced-device sessions — aux on CPU — are immune by construction).
+    fn reload_if_missing(&self, session_id: &str) -> Result<()> {
+        if self.sessions.read().contains_key(session_id) {
+            return Ok(());
+        }
+        let spec = self.paths.read().get(session_id).cloned();
+        if let Some(spec) = spec {
+            let effective = spec.device.clone().unwrap_or_else(|| self.device.read().clone());
+            if Self::make_key(&spec.path, &effective) != session_id {
+                return Err(UtaiError::Inference(
+                    "Device preference changed while a job was running — re-run the job".to_string(),
+                ));
+            }
+            tracing::info!("ONNX session evicted — reloading: {}", spec.path.display());
+            self.load_model_opts(&spec.path, spec.mem_pattern, spec.device)?;
+        }
+        Ok(())
+    }
+
+    /// S67b: DML shape-cache budget enforcement (rationale on [`DmlShapeAccounting`]).
+    /// Called with `new_sig = Some(sig)` BEFORE a run — recycles only when `sig` is a shape
+    /// this session has NOT compiled yet (known shapes add no memory, so same-shape loops
+    /// like the diffusion denoiser never trip it) — and with `new_sig = None` AFTER a run
+    /// (recycles immediately when the just-compiled shape blew the budget so multi-GB pools
+    /// don't linger). The budget compares the session's OWN attributed pool growth
+    /// (`pool_growth_mb`, Σ new-shape run deltas minus the first shape) against
+    /// [`dml_extra_commit_cap_mb`]. Recycling only drops the session from the cache: the
+    /// reload spec survives, so the next `run()` rebuilds it fresh via reload-on-miss
+    /// (~1 s; no cross-run state, numerics unaffected).
+    fn maybe_recycle_dml_session(&self, session_id: &str, new_sig: Option<u64>) {
+        let (build_id, n_shapes, growth_mb, cap_mb, path) = {
+            let sessions = self.sessions.read();
+            let Some(loaded) = sessions.get(session_id) else { return };
+            let Some(dml) = &loaded.dml else { return };
+            if let Some(sig) = new_sig {
+                if dml.shapes.lock().contains(&sig) {
+                    return; // already-compiled shape — running it again costs nothing
+                }
+            }
+            let growth = dml.pool_growth_mb.load(Ordering::Relaxed);
+            let cap = dml_extra_commit_cap_mb();
+            if growth <= cap {
+                return;
+            }
+            let facts = (
+                loaded.build_id,
+                dml.shapes.lock().len(),
+                growth,
+                cap,
+                loaded.path.display().to_string(),
+            );
+            facts
+        };
+        if self.drop_session_incarnation(session_id, build_id) {
+            tracing::info!(
+                "Recycled DirectML session: {} distinct input shape(s) grew ~{} MB of pools (budget {} MB) — {} rebuilds on next use to reclaim it",
+                n_shapes,
+                growth_mb,
+                cap_mb,
+                path
+            );
+        }
+    }
+
+    /// Remove ONE session incarnation from the cache, revalidated by `build_id` under the
+    /// write lock — a concurrent thread may have recycled AND rebuilt the entry since the
+    /// caller decided, and a stale decision must never tear down a fresh session (S67b
+    /// review, TOCTOU). The removed entry (an ort Session owning potentially multi-GB DML
+    /// pools) is dropped AFTER the write guard releases: a GB-scale D3D12 teardown under
+    /// the global sessions lock would stall every concurrent inference (S67b review).
+    /// Returns whether this incarnation was actually removed. Callers must hold NO engine
+    /// locks. The reload spec in `paths` survives, so the next `run()` rebuilds on demand.
+    fn drop_session_incarnation(&self, session_id: &str, build_id: u64) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.write();
+            match sessions.get(session_id) {
+                Some(l) if l.build_id == build_id => sessions.remove(session_id),
+                _ => None,
+            }
+        };
+        removed.is_some() // `removed` drops here, outside the lock
     }
 }
 

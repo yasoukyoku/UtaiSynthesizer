@@ -151,6 +151,17 @@ pub fn run_pipeline(
     let native_sr = mono.sample_rate;
     let total_in = mono.samples.len();
 
+    // Stage logging (S67b, same rationale as rvc.rs): breadcrumbs so a silent mid-pipeline
+    // death points at its stage instead of a blank log. Emitted BEFORE the range probe below
+    // — that whole-signal RMVPE pass is itself a memory-heavy stage that must not die
+    // uncovered (S67b review).
+    let t_run = std::time::Instant::now();
+    tracing::info!(
+        "SoVITS pipeline: {:.1}s input{}",
+        total_in as f32 / native_sr.max(1) as f32,
+        if range.is_some() { "; range probe (whole-signal RMVPE) first" } else { "" }
+    );
+
     // S60c 音域扩展: ONE tier decision for the WHOLE signal (v1 whole-render semantics). A
     // per-piece shift gave each silence-chunk its own formant coloration and the SEAMS between
     // colorations were the dominant audible artifact (§user实测) — a uniform shift keeps the
@@ -160,7 +171,11 @@ pub fn run_pipeline(
     let range_shift: i64 = match &range {
         Some(r) if m.f0_predictor_session.is_none() => {
             let wav16k = resample(&mono.samples, native_sr, super::f0::RMVPE_SR);
-            let f0 = super::f0::rmvpe_detect(
+            // S67b: chunk-bounded like the RVC f0 stage (S66) — this was the last whole-song
+            // single-forward RMVPE feed (the 12 GB-spike class f0.rs documents). ≤64 s inputs
+            // are byte-identical; longer ones differ ≤1.4 cents at window seams (S66 parity
+            // gate), which cannot move a semitone-level range-tier decision.
+            let f0 = super::f0::rmvpe_detect_chunked(
                 m.engine,
                 m.rmvpe_session,
                 m.mel_filters,
@@ -206,6 +221,8 @@ pub fn run_pipeline(
         .map(|s| ((s.end - s.start) + per_size - 1) / per_size)
         .sum();
 
+    tracing::info!("SoVITS pipeline: {} piece(s) to convert", total_windows);
+
     let mut audio_out: Vec<f32> = Vec::with_capacity(out_len(total_in) + per_size);
     let mut seg_idx: u64 = 0;
     let mut done_windows: usize = 0;
@@ -233,6 +250,7 @@ pub fn run_pipeline(
             if cancel() {
                 return Err(UtaiError::Inference("CANCELLED".into()));
             }
+            let t_piece = std::time::Instant::now();
             let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range_shift, &report, cancel)?;
             // pad_array(_audio, per_length) — center zero-pad up (never truncates), exactly
             // like the original; a zero-filled degenerate piece becomes zeros(per_length).
@@ -241,6 +259,13 @@ pub fn run_pipeline(
 
             seg_idx += 1;
             done_windows += 1;
+            tracing::debug!(
+                "SoVITS piece {}/{} done ({:.1}s in, {:.0} ms)",
+                done_windows,
+                total_windows,
+                (w_end - w) as f32 / native_sr.max(1) as f32,
+                t_piece.elapsed().as_secs_f64() * 1000.0
+            );
             w = w_end;
         }
     }
@@ -254,6 +279,12 @@ pub fn run_pipeline(
     if options.formant.abs() > 1e-6 {
         audio_out = utai_dsp::formant_warp(&audio_out, |_| 2.0_f32.powf(options.formant / 12.0));
     }
+    tracing::info!(
+        "SoVITS pipeline done in {:.1}s ({:.1}s audio out @{}Hz)",
+        t_run.elapsed().as_secs_f32(),
+        audio_out.len() as f32 / m.sample_rate.max(1) as f32,
+        m.sample_rate
+    );
     progress(1.0);
 
     Ok(SynthesisResult {

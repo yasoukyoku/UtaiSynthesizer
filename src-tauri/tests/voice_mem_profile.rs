@@ -1,0 +1,343 @@
+//! Memory-profile harness for the RVC cover pipeline (S67b: community report —
+//! 16 GB machine, DirectML build, aux on CPU, 264.5 s song → silent crash at 20%
+//! progress = right after the whole-song RMVPE pass, during the first chunk's
+//! ContentVec/net_g). This test reproduces the workload shape and prints a
+//! per-stage peak-commit/working-set profile, so the actual memory hog is
+//! MEASURED, not theorized (feedback_silent_regressions: instrument, don't guess).
+//!
+//! Not a gate — diagnostic only, `--ignored`. Run (PowerShell, from src-tauri):
+//!   $env:UTAI_MEM_INPUT="D:\MyDev\TESTING\ikanaiteyo\vocal.wav"   # tiled to UTAI_MEM_SECONDS
+//!   $env:UTAI_MEM_SECONDS="264.5"
+//!   $env:UTAI_MEM_DEVICE="directml"   # net_g EP: directml | auto | cpu (aux ALWAYS forced CPU)
+//!   cargo test --test voice_mem_profile rvc_mem_profile -- --ignored --nocapture
+//! Continuous 20 ms samples land in UTAI_MEM_CSV (default scratch csv next to the input).
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use utai_lib::inference::engine::{DeviceConfig, OnnxEngine};
+use utai_lib::inference::RvcOptions;
+
+fn app_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+/// Same init as voice_pipeline.rs (the S66 rule: bare harnesses must init ORT or they
+/// hang forever at 0 CPU on the invisible modal DLL dialog).
+fn init_ort() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=info")),
+        )
+        .try_init();
+    utai_lib::suppress_windows_dll_error_dialogs();
+    utai_lib::setup_cuda_dll_paths(&app_root());
+    // UTAI_MEM_ORT_DLL: load a SPECIFIC ORT build (e.g. runtime\ort\onnxruntime.dll = the
+    // DirectML build the release ships) — dev boxes with CUDA otherwise auto-pick the CUDA
+    // build, which has no DirectML provider (same trick as f0.rs's ignored parity test).
+    if let Ok(dll) = std::env::var("UTAI_MEM_ORT_DLL") {
+        if let Ok(b) = ort::init_from(&dll) {
+            let _ = b.commit();
+        }
+        eprintln!("[mem] ORT loaded from {dll}");
+    } else {
+        utai_lib::init_ort_runtime(&app_root());
+    }
+}
+
+// ── process memory via K32GetProcessMemoryInfo (kernel32; no new crate) ──
+#[repr(C)]
+#[allow(non_snake_case)]
+struct ProcessMemoryCountersEx {
+    cb: u32,
+    PageFaultCount: u32,
+    PeakWorkingSetSize: usize,
+    WorkingSetSize: usize,
+    QuotaPeakPagedPoolUsage: usize,
+    QuotaPagedPoolUsage: usize,
+    QuotaPeakNonPagedPoolUsage: usize,
+    QuotaNonPagedPoolUsage: usize,
+    PagefileUsage: usize,
+    PeakPagefileUsage: usize,
+    PrivateUsage: usize,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn K32GetProcessMemoryInfo(h: isize, p: *mut ProcessMemoryCountersEx, cb: u32) -> i32;
+    fn GetCurrentProcess() -> isize;
+}
+
+/// (private/commit bytes, working set bytes) of this process, or (0,0) on failure.
+fn mem_now() -> (usize, usize) {
+    unsafe {
+        let mut c: ProcessMemoryCountersEx = std::mem::zeroed();
+        c.cb = std::mem::size_of::<ProcessMemoryCountersEx>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+            (c.PrivateUsage, c.WorkingSetSize)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+const MB: f64 = 1024.0 * 1024.0;
+
+/// Rolling-peak sampler: a 20 ms thread tracks the max commit/WS since the last `mark`,
+/// and appends every sample to a CSV for post-hoc timeline inspection.
+struct Sampler {
+    peak_private: AtomicUsize,
+    peak_ws: AtomicUsize,
+    stop: AtomicBool,
+}
+
+impl Sampler {
+    fn mark(&self, t0: Instant, label: &str) {
+        let (p, w) = mem_now();
+        let pk_p = self.peak_private.swap(p, Ordering::Relaxed);
+        let pk_w = self.peak_ws.swap(w, Ordering::Relaxed);
+        eprintln!(
+            "[mem] t={:8.2}s {:<28} now: commit={:7.1}MB ws={:7.1}MB | peak since last mark: commit={:7.1}MB ws={:7.1}MB",
+            t0.elapsed().as_secs_f64(),
+            label,
+            p as f64 / MB,
+            w as f64 / MB,
+            pk_p.max(p) as f64 / MB,
+            pk_w.max(w) as f64 / MB,
+        );
+    }
+}
+
+/// Mechanism probe for the DML commit growth seen in rvc_mem_profile: run net_g repeatedly
+/// through ONE DirectML session — 3× the SAME shape, then a series of NEW shapes, then unload.
+/// If commit only grows on new shapes, the growth is the DML EP's per-shape operator
+/// re-initialization (dynamic shapes → one compiled-kernel/pool set per distinct T);
+/// if it grows every run it's a genuine allocator leak. Run:
+///   $env:UTAI_MEM_ORT_DLL="D:\MyDev\Utai_v2-dev\runtime\ort\onnxruntime.dll"
+///   cargo test --test voice_mem_profile dml_shape_growth_probe -- --ignored --nocapture
+#[test]
+#[ignore]
+fn dml_shape_growth_probe() {
+    init_ort();
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::DirectMl { device_id: 0 });
+
+    let rvc_dir = app_root().join("data").join("models").join("rvc");
+    let model = rvc_dir.join("lengv2.3.onnx");
+    let voice_sid = engine.load_model_with(&model, false).expect("load voice model");
+
+    let t0 = Instant::now();
+    let sampler = Arc::new(Sampler {
+        peak_private: AtomicUsize::new(0),
+        peak_ws: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
+    });
+    {
+        // The "peak since last mark" column is only a real interval peak with the sampler
+        // thread running (without it the column silently degrades to two point samples).
+        let s = sampler.clone();
+        std::thread::spawn(move || {
+            while !s.stop.load(Ordering::Relaxed) {
+                let (p, w) = mem_now();
+                s.peak_private.fetch_max(p, Ordering::Relaxed);
+                s.peak_ws.fetch_max(w, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+    }
+    sampler.mark(t0, "net_g loaded (DML)");
+
+    let run_t = |t: usize, tag: &str| {
+        use utai_lib::inference::engine::InputTensor;
+        // deterministic pseudo-audio inputs; contents are irrelevant to allocator behavior
+        let phone: Vec<f32> = (0..t * 768).map(|i| ((i % 997) as f32) / 997.0 - 0.5).collect();
+        let pitch: Vec<i64> = (0..t).map(|i| 60 + (i % 40) as i64).collect();
+        let pitchf: Vec<f32> = (0..t).map(|i| 220.0 + (i % 40) as f32).collect();
+        let rnd: Vec<f32> = (0..192 * t).map(|i| ((i % 613) as f32) / 613.0 - 0.5).collect();
+        let inputs = vec![
+            ("phone", InputTensor::F32 { data: phone, shape: vec![1, t as i64, 768] }),
+            ("phone_lengths", InputTensor::I64 { data: vec![t as i64], shape: vec![1] }),
+            ("pitch", InputTensor::I64 { data: pitch, shape: vec![1, t as i64] }),
+            ("pitchf", InputTensor::F32 { data: pitchf, shape: vec![1, t as i64] }),
+            ("sid", InputTensor::I64 { data: vec![0], shape: vec![1] }),
+            ("rnd", InputTensor::F32 { data: rnd, shape: vec![1, 192, t as i64] }),
+        ];
+        let out = engine.run(&voice_sid, inputs).expect("net_g run");
+        assert!(!out.is_empty());
+        sampler.mark(t0, tag);
+    };
+
+    // Same shape 3× — growth here would mean a per-RUN leak.
+    for i in 0..3 {
+        run_t(4000, &format!("T=4000 run#{}", i + 1));
+    }
+    // New shapes — growth here = per-SHAPE kernel/pool accumulation.
+    for t in [4100usize, 4200, 4300, 4400, 4500] {
+        run_t(t, &format!("T={t} (new shape)"));
+    }
+    // Same first shape again — a shape CACHE would stay flat here.
+    run_t(4000, "T=4000 again");
+
+    engine.unload_model(&voice_sid);
+    sampler.mark(t0, "session unloaded");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    sampler.mark(t0, "after settle");
+    sampler.stop.store(true, Ordering::Relaxed);
+}
+
+#[test]
+#[ignore]
+fn rvc_mem_profile() {
+    let input = PathBuf::from(
+        std::env::var("UTAI_MEM_INPUT")
+            .unwrap_or_else(|_| "D:\\MyDev\\TESTING\\ikanaiteyo\\vocal.wav".to_string()),
+    );
+    let seconds: f64 = std::env::var("UTAI_MEM_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(264.5);
+    let device = std::env::var("UTAI_MEM_DEVICE").unwrap_or_else(|_| "directml".to_string());
+    let csv_path = std::env::var("UTAI_MEM_CSV")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| input.with_file_name("rvc_mem_profile.csv"));
+
+    init_ort();
+    let engine = OnnxEngine::new();
+    match device.as_str() {
+        "cpu" => engine.set_device(DeviceConfig::Cpu),
+        "auto" => engine.set_device(DeviceConfig::Auto),
+        "directml" => engine.set_device(DeviceConfig::DirectMl { device_id: 0 }),
+        other => panic!("UTAI_MEM_DEVICE must be directml|auto|cpu (got {other})"),
+    }
+
+    let t0 = Instant::now();
+    let sampler = Arc::new(Sampler {
+        peak_private: AtomicUsize::new(0),
+        peak_ws: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
+    });
+    let csv = Arc::new(parking_lot::Mutex::new(String::from("t_s,commit_mb,ws_mb\n")));
+    {
+        let s = sampler.clone();
+        let csv = csv.clone();
+        std::thread::spawn(move || {
+            while !s.stop.load(Ordering::Relaxed) {
+                let (p, w) = mem_now();
+                s.peak_private.fetch_max(p, Ordering::Relaxed);
+                s.peak_ws.fetch_max(w, Ordering::Relaxed);
+                csv.lock().push_str(&format!(
+                    "{:.3},{:.1},{:.1}\n",
+                    t0.elapsed().as_secs_f64(),
+                    p as f64 / MB,
+                    w as f64 / MB
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+    }
+    sampler.mark(t0, "start");
+
+    // ── input: tile the real vocal to the target duration (user: 264.5 s separated vocal) ──
+    let src = utai_lib::audio::load_audio(&input).expect("load input wav");
+    let frames_target = (seconds * src.sample_rate as f64) as usize;
+    let ch = src.channels.max(1) as usize;
+    let mut samples = Vec::with_capacity(frames_target * ch);
+    while samples.len() < frames_target * ch {
+        let take = (frames_target * ch - samples.len()).min(src.samples.len());
+        samples.extend_from_slice(&src.samples[..take]);
+    }
+    let audio = utai_lib::audio::AudioBuffer {
+        samples,
+        sample_rate: src.sample_rate,
+        channels: src.channels,
+    };
+    eprintln!(
+        "[mem] input: {:.1}s x{}ch @{}Hz (tiled from {})",
+        seconds,
+        ch,
+        audio.sample_rate,
+        input.display()
+    );
+    sampler.mark(t0, "input tiled");
+
+    // ── models: mirror run_rvc (aux forced CPU = gpu_extract off, like the reporter) ──
+    let aux = app_root().join("data").join("models").join(utai_lib::models::AUX_DIR_NAME);
+    let rvc_dir = app_root().join("data").join("models").join("rvc");
+    let model = rvc_dir.join("lengv2.3.onnx");
+    let sc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(model.with_extension("json")).expect("sidecar"),
+    )
+    .expect("sidecar json");
+    let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
+    let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
+    let nch = sc["noise"]["rnd_input"][1].as_u64().unwrap_or(192) as usize;
+    let min_frames = sc["min_frames"].as_u64().unwrap_or(12) as usize;
+
+    let voice_sid = engine.load_model_with(&model, false).expect("load voice model");
+    sampler.mark(t0, "net_g loaded");
+    let cv_sid = engine
+        .load_model_on(
+            &aux.join(if dim == 768 { "contentvec_768l12.onnx" } else { "contentvec_256l9.onnx" }),
+            false,
+            DeviceConfig::Cpu,
+        )
+        .expect("load contentvec");
+    sampler.mark(t0, "contentvec loaded (CPU)");
+    let rmvpe_sid = engine
+        .load_model_on(&aux.join("rmvpe_e2e.onnx"), false, DeviceConfig::Cpu)
+        .expect("load rmvpe");
+    sampler.mark(t0, "rmvpe loaded (CPU)");
+    let mel: ndarray::Array2<f32> =
+        ndarray_npy::read_npy(aux.join("rmvpe_mel_filters.npy")).expect("mel filters");
+    let index =
+        utai_lib::inference::rvc::RvcIndex::load(&rvc_dir.join("lengv2.3.npy")).expect("index");
+    sampler.mark(t0, "index loaded");
+
+    let m = utai_lib::inference::rvc::RvcModel {
+        engine: &engine,
+        voice_session: &voice_sid,
+        contentvec_session: &cv_sid,
+        rmvpe_session: &rmvpe_sid,
+        mel_filters: &mel,
+        index: Some(&index),
+        sample_rate,
+        features_dim: dim,
+        spk_mix: None,
+        noise_channels: nch,
+        min_frames,
+    };
+    let options = RvcOptions::default(); // index_ratio 0.75 etc. — the shipped defaults
+
+    // Stage marks ride the pipeline's own progress values: 0.03 = input prepped,
+    // 0.2 = whole-song RMVPE done, then one call per completed chunk.
+    let s2 = sampler.clone();
+    let progress = move |p: f32| {
+        let label = if p <= 0.031 {
+            "p=0.03 resample+filtfilt".to_string()
+        } else if (p - 0.2).abs() < 1e-4 {
+            "p=0.20 f0 (RMVPE) done".to_string()
+        } else if p >= 1.0 {
+            "p=1.00 pipeline done".to_string()
+        } else {
+            format!("p={p:.3} chunk done")
+        };
+        s2.mark(t0, &label);
+    };
+    let result =
+        utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &progress, &|| false)
+            .expect("rvc pipeline");
+
+    sampler.mark(t0, "returned");
+    sampler.stop.store(true, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    std::fs::write(&csv_path, csv.lock().as_str()).expect("write csv");
+    eprintln!(
+        "[mem] out: n={} sr={} | csv: {}",
+        result.audio.len(),
+        result.sample_rate,
+        csv_path.display()
+    );
+}
