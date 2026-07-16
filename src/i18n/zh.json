@@ -442,7 +442,8 @@
     "cancel": "取消",
     "confirm": "确认",
     "ok": "知道了",
-    "busyRetry": "当前状态忙，请稍后重试"
+    "busyRetry": "当前状态忙，请稍后重试",
+    "errorModalTitle": "操作无法继续"
   },
   "update": {
     "title": "发现新版本",

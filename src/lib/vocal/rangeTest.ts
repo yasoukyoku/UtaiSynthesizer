@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import i18n from "../../i18n";
 import { backendErrorMessage, isBusyError, isCancelError } from "../backendError";
+import { maybeShowErrorModal } from "../errorDisplay";
 import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, MIN_COMFORT_SPAN, type VoiceType } from "../../store/voice-models";
 import { SOVITS_DEFAULTS, RVC_DEFAULTS } from "../workflow/voiceDefaults";
@@ -295,6 +296,8 @@ export async function runRangeTest(
     const shared = backendErrorMessage(e); // app-wide CODEs (APP_BUSY from the VoiceRunGuard, …)
     if (isCancelError(e)) { /* user cancelled — not an error, no toast */ }
     else if (msg.includes(VOCAL_RENDER_BUSY)) useAppStore.getState().showToast(t("rangeTest.busy"), "info");
+    // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead of a toast.
+    else if (shared && maybeShowErrorModal(e, shared)) { /* modal shown */ }
     else if (shared) useAppStore.getState().showToast(shared, isBusyError(e) ? "info" : "error");
     else useAppStore.getState().showToast(`${t("rangeTest.failed")}: ${msg}`, "error");
   } finally {

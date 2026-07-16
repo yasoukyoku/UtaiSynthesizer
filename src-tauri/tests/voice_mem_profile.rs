@@ -205,6 +205,54 @@ fn dml_shape_growth_probe() {
     sampler.stop.store(true, Ordering::Relaxed);
 }
 
+/// S67c probe: first-shape TICKET SIZE as a function of chunk length T. Each T gets a
+/// FRESH session (load → first run → unload; unload returns everything, so consecutive
+/// measurements don't pollute each other) and the commit delta across the first run IS
+/// that T's ticket. Answers "how much does the upstream ≤4GB tier (x_max 41→32) or an
+/// even shorter chunk actually shave off?" — pool sizes jump in allocation buckets
+/// (S67b: +32MB…+3.1GB steps), so the curve must be measured, not assumed linear.
+///   $env:UTAI_MEM_ORT_DLL="D:\MyDev\Utai_v2-dev\runtime\ort\onnxruntime.dll"
+///   cargo test --test voice_mem_profile ticket_size_by_t -- --ignored --nocapture
+#[test]
+#[ignore]
+fn ticket_size_by_t() {
+    init_ort();
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::DirectMl { device_id: 0 });
+    let model = app_root().join("data").join("models").join("rvc").join("lengv2.3.onnx");
+
+    let t0 = Instant::now();
+    let sampler = Arc::new(Sampler {
+        peak_private: AtomicUsize::new(0),
+        peak_ws: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
+    });
+    spawn_peak_thread(&sampler, t0, None);
+
+    // T = net_g frame count at 100 fps. Chunk seconds ≈ x_max + 2*x_pad:
+    //   upstream fp32/5G tier (ours): 41+2 = 43 s → T≈4300
+    //   upstream ≤4GB tier:           32+2 = 34 s → T≈3400
+    //   hypothetical shorter tiers:   ~19 s → T≈1900, ~10 s → T≈1000
+    for t in [4300usize, 3400, 1900, 1000] {
+        let sid = engine.load_model_with(&model, false).expect("load net_g");
+        let before = {
+            let (p, _) = mem_now();
+            p
+        };
+        run_netg_shape(&engine, &sid, t);
+        let (after, _) = mem_now();
+        eprintln!(
+            "[ticket] T={t:5} (~{:.0}s chunk): first-run ticket = {:.0} MB",
+            t as f64 / 100.0,
+            (after.saturating_sub(before)) as f64 / MB
+        );
+        engine.unload_model(&sid);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        sampler.mark(t0, &format!("T={t} unloaded"));
+    }
+    sampler.stop.store(true, Ordering::Relaxed);
+}
+
 /// S67c probe (community follow-up): the 6-node workflow — 3 MSST separations, each DML
 /// session released before the next loads — STILL crashes a 16 GB DirectML machine at the
 /// FIRST RVC chunk (growth accounting can't fire there: first-shape ticket is excluded),

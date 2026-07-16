@@ -23,6 +23,7 @@ import {
 import { useFloatingPanel } from "../../lib/useFloatingPanel";
 import { PanelResizeHandles } from "../common/PanelResizeHandles";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
 import {
   useVoiceModelStore,
@@ -1013,10 +1014,13 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
       const msg = e instanceof Error ? e.message : String(e);
       const mapped = backendErrorMessage(msg);
       const busy = isBusyError(msg);
-      showToast(
-        busy && mapped ? mapped : `${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${mapped ?? msg}`,
-        busy ? "info" : "error",
-      );
+      // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead.
+      if (!(mapped && maybeShowErrorModal(msg, mapped))) {
+        showToast(
+          busy && mapped ? mapped : `${t18({ zh: "试听失败", en: "Audition failed", ja: "試聴に失敗しました" }, lang)}: ${mapped ?? msg}`,
+          busy ? "info" : "error",
+        );
+      }
       if (useVoiceModelStore.getState().auditionState?.name === m.name) {
         useVoiceModelStore.getState().setAuditionState(null);
       }

@@ -291,7 +291,33 @@ struct LoadedVoice {
     session_id: String,
     sample_rate: u32,
     index: Option<Arc<rvc::RvcIndex>>,
+    /// S67c: EP label this voice's session was built on, plus whether the Auto-device CPU
+    /// commit fallback picked it. Re-evaluated on every load_voice cache hit so a fallback
+    /// never sticks once memory frees up (and a GPU session drops to CPU when it can no
+    /// longer afford the smallest DirectML chunk tier).
+    actual_device: String,
+    cpu_fallback: bool,
 }
+
+/// S67c Auto-device CPU fallback band (MB of system available commit). Below FLOOR a
+/// DirectML voice session cannot afford even the smallest chunk tier's worst-case chunk
+/// (rvc::CHUNK_TIERS smallest need = 3000 MB) — under device=Auto the voice silently loads
+/// on CPU instead: Auto's contract is "whatever runs", and the S67 lesson is that SILENT
+/// degradation is only acceptable when the user asked for automatic device choice —
+/// explicit DirectML keeps the loud INFERENCE_LOW_MEMORY path.
+///
+/// MEASUREMENT-FRAME RULE (review round 2): every DML→CPU decision is taken in the
+/// "no voice pools resident" frame — the fresh-build check below runs before the session's
+/// first run allocates anything. The cache-hit path deliberately does NOT demote a resident
+/// DML session: its own multi-GB pools depress `avail`, so a raw floor test there rebuilds
+/// the voice on EVERY run of exactly the machines this exists for (unload → avail recovers
+/// → rebuild on DML → repeat), re-paying the blind first-shape compile each time. Mid-run
+/// exhaustion of a resident session is governed by the engine's pre-shape floor + growth
+/// recycle instead. CEILING only gates the opposite direction (CPU-fallback voice returns
+/// to the GPU) — that check runs with no DML pools resident by construction (the voice IS
+/// on CPU), so the frames match and the band provides real hysteresis.
+const VOICE_CPU_FALLBACK_FLOOR_MB: u64 = 3000;
+const VOICE_CPU_FALLBACK_CEILING_MB: u64 = 3500;
 
 /// Cheap cloneable view of a loaded voice for the pipelines.
 pub struct VoiceHandle {
@@ -427,12 +453,61 @@ impl InferenceManager {
         index_path: Option<&PathBuf>,
     ) -> Result<()> {
         if self.is_voice_loaded(name) {
-            return Ok(());
+            // S67c: on a cache hit, only the CPU→GPU direction is re-evaluated (a fallback
+            // CPU voice returns to the GPU once commit recovers). The DML→CPU direction is
+            // deliberately NOT taken here — see the measurement-frame rule on
+            // VOICE_CPU_FALLBACK_FLOOR_MB (a resident DML session's own pools depress
+            // `avail` and a raw floor test would rebuild every run). Auto only; any other
+            // preference keeps the hit-path early return byte-identical.
+            let rebuild = {
+                let voices = self.loaded_voices.read();
+                match voices.get(name) {
+                    Some(v)
+                        if v.cpu_fallback
+                            && matches!(self.engine.device(), engine::DeviceConfig::Auto) =>
+                    {
+                        let (_, avail) = engine::system_memory_mb();
+                        avail >= VOICE_CPU_FALLBACK_CEILING_MB
+                    }
+                    _ => false,
+                }
+            };
+            if !rebuild {
+                return Ok(());
+            }
         }
         self.unload_voice(name);
         // mem_pattern OFF: voice models run per-chunk with varying T (RVC) / whole-segment T
         // (SoVITS) — dynamic shapes where ORT's memory pattern over-reserves VRAM.
-        let session_id = self.engine.load_model_with(model_path, false)?;
+        let mut session_id = self.engine.load_model_with(model_path, false)?;
+        let mut actual_device = self.engine.resolved_device(&session_id).unwrap_or_default();
+        let mut cpu_fallback = false;
+        // S67c Auto→CPU fallback (rationale on VOICE_CPU_FALLBACK_FLOOR_MB): the probe
+        // build above pays only graph build (~1-2 s, no first-shape ticket — pools are
+        // allocated on the first RUN), so swapping it for a CPU session here is cheap and
+        // only ever happens on memory-starved machines.
+        if matches!(self.engine.device(), engine::DeviceConfig::Auto)
+            && actual_device.contains("DirectML")
+        {
+            let (_, avail) = engine::system_memory_mb();
+            if avail > 0 && avail < VOICE_CPU_FALLBACK_FLOOR_MB {
+                tracing::warn!(
+                    "voice '{}': system available commit {} MB is below the smallest DirectML \
+                     chunk tier ({} MB) — loading this voice on CPU instead (device=Auto \
+                     fallback; it returns to the GPU once memory frees up)",
+                    name, avail, VOICE_CPU_FALLBACK_FLOOR_MB
+                );
+                self.engine.unload_model(&session_id);
+                session_id =
+                    self.engine
+                        .load_model_on(model_path, false, engine::DeviceConfig::Cpu)?;
+                actual_device = self
+                    .engine
+                    .resolved_device(&session_id)
+                    .unwrap_or_else(|| "CPU".to_string());
+                cpu_fallback = true;
+            }
+        }
 
         let index = match (&backend_type, index_path) {
             (VoiceBackendType::Rvc, Some(path)) if path.exists() => {
@@ -453,6 +528,8 @@ impl InferenceManager {
             session_id,
             sample_rate,
             index,
+            actual_device,
+            cpu_fallback,
         };
         self.loaded_voices.write().insert(name.to_string(), voice);
         Ok(())

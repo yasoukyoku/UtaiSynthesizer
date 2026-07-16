@@ -30,6 +30,7 @@ import {
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { t18 } from "../../lib/models/msst-catalog";
@@ -1792,8 +1793,11 @@ function RunStep() {
         return n;
       });
       if (isCancelError(e)) return; // user cancelled the audition — not an error, no toast
+      // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead.
+      const display = backendErrorMessage(e) ?? String(e);
+      if (maybeShowErrorModal(e, display)) return;
       // APP_BUSY: another audition/render holds the FlightGuard → info; real failures stay errors.
-      showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+      showToast(display, isBusyError(e) ? "info" : "error");
     }
   };
 

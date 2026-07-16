@@ -15,6 +15,8 @@ import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import i18n from "../../i18n";
 import { backendErrorMessage, isCancelError } from "../backendError";
+import { maybeShowErrorModal } from "../errorDisplay";
+import { logToBackend } from "../log";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { contentSig, vocalParamsSig } from "../../store/history";
 import type { Note, PitchCurve, NoteTransition, ProcessedOutput, Track, Segment } from "../../types/project";
@@ -520,11 +522,19 @@ export async function renderDirtyVocals(
       // manual Render button still reports it loudly), instead of re-toasting on every Play (audit).
       if (String(e).includes(VOCAL_EMPTY)) continue;
       failed++;
+      // S67c: vocal failures now reach the backend log (they were toast-only — invisible
+      // in crash forensics); fatal modal-class errors open the alert dialog once and stop
+      // repeating per track (the guidance is machine-wide, not per-segment).
+      logToBackend("error", `Vocal auto-render failed (${tr.name}): ${String(e)}`);
+      const display = `${tr.name}: ${vocalRenderErrorMessage(e)}`;
+      if (maybeShowErrorModal(e, display)) {
+        return { rendered, failed, cancelled: false };
+      }
       // LOUD failure (§user: Play's auto-render must report exactly like the manual Render button — never
       // swallow). Same shared mapping, prefixed with the track name so the user knows WHICH track failed;
       // capped so a project-wide failure (e.g. missing dictionary) doesn't storm one toast per segment.
       if (failed <= MAX_FAILURE_TOASTS) {
-        useAppStore.getState().showToast(`${tr.name}: ${vocalRenderErrorMessage(e)}`, "error");
+        useAppStore.getState().showToast(display, "error");
       } else if (failed === MAX_FAILURE_TOASTS + 1) {
         useAppStore.getState().showToast(i18n.t("vocalEditor.render.moreFailures"), "error");
       }

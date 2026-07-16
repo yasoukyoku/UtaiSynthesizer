@@ -37,9 +37,78 @@ const SR: usize = 16000;
 const WINDOW: usize = 160;
 // fp32 config values (config.py: x_pad/x_query/x_center/x_max = 1/6/38/41 when not half)
 const X_PAD: usize = 1;
-const X_QUERY: usize = 6;
-const X_CENTER: usize = 38;
-const X_MAX: usize = 41;
+
+/// S67c: silence-seek chunking tier. Upstream RVC itself selects these by device memory
+/// (config.py device_config: 3/10/60/65 fp16, 1/6/38/41 fp32 — our former constants —
+/// and 1/5/30/32 for ≤4 GB cards), so picking a smaller tier on a memory-starved
+/// DirectML box ADOPTS the upstream mechanism rather than inventing numbers. x_pad stays
+/// 1 in every tier (matching both upstream low tiers), so the seam mechanics (t_pad
+/// reflect-pad + t_pad_tgt trim) are byte-identical across tiers — a tier only moves
+/// WHERE the silence-seek cuts land, the same difference two upstream users with
+/// different cards always had. Different cuts ⇒ different outputs, but net_g is
+/// graph-stochastic run-to-run anyway (S54) — there is no fixed-output contract to break.
+struct ChunkTier {
+    x_query: usize,
+    x_center: usize,
+    x_max: usize,
+    /// Minimum system-wide available commit (MB) to afford this tier on DirectML.
+    /// Calibrated against the tier's WORST-CASE chunk, not x_max: consecutive opt_ts cuts
+    /// can land t_query early and t_query late, so a mid-song chunk reaches
+    /// x_center + 2·x_query (+ 2 s pads) — review round 2 caught the original x_max-based
+    /// table under-providing by 20-40%. Formula: measured lengv2.3 ticket curve
+    /// (ticket_size_by_t, ~98 MB/s linear: 43 s→4206 MB, 34 s→3361, 19 s→1704, 10 s→820)
+    /// extrapolated to worst_t = x_center + 2·x_query + 2, × 1.3 model-variance headroom
+    /// + 1 GB cushion. This table is a first line, not an absolute no-OOM guarantee —
+    /// mid-run exhaustion is layered off to the S67b growth-recycle loop, the engine's
+    /// pre-shape floor, and the Auto CPU fallback.
+    need_mb: u64,
+}
+
+const CHUNK_TIERS: &[ChunkTier] = &[
+    ChunkTier { x_query: 6, x_center: 38, x_max: 41, need_mb: 7800 }, // upstream fp32/5G (default); worst 52 s
+    ChunkTier { x_query: 5, x_center: 30, x_max: 32, need_mb: 6500 }, // upstream ≤4GB tier; worst 42 s
+    ChunkTier { x_query: 4, x_center: 17, x_max: 19, need_mb: 4550 }, // S67c sub-tier; worst 27 s
+    ChunkTier { x_query: 2, x_center: 9, x_max: 10, need_mb: 3000 },  // S67c smallest; worst 15 s
+];
+
+/// Pick the chunking tier for this run. Non-DirectML devices always get tier 0 — the
+/// former hardcoded constants, byte-identical behavior (CUDA's BFC arena reuses across
+/// shapes, S31; CPU pays no shape ticket at all). On DirectML the first tier whose
+/// `need_mb` fits the CURRENT system available commit wins; if even the smallest doesn't
+/// fit, the smallest is used anyway — the engine's INFERENCE_LOW_MEMORY floor (and the
+/// Auto-device CPU fallback in load_voice) guard the truly hopeless cases.
+fn pick_chunk_tier(engine: &OnnxEngine, voice_session: &str) -> &'static ChunkTier {
+    // A concurrently evicted session resolves to None (reload-on-miss rebuilds it inside
+    // run_typed, AFTER this pick) — fall back to the global preference so an explicit
+    // DirectML choice never silently loses the tiering (review round 2). Auto stays
+    // conservative-false: the window is one eviction race wide, and guessing DML on a
+    // CUDA box would needlessly shorten its chunks.
+    let is_dml = engine
+        .resolved_device(voice_session)
+        .map(|d| d.contains("DirectML"))
+        .unwrap_or_else(|| {
+            matches!(engine.device(), super::engine::DeviceConfig::DirectMl { .. })
+        });
+    if !is_dml {
+        return &CHUNK_TIERS[0];
+    }
+    let (_, avail) = super::engine::system_memory_mb();
+    if avail == 0 {
+        return &CHUNK_TIERS[0]; // measurement failed — keep the default tier
+    }
+    let tier = CHUNK_TIERS
+        .iter()
+        .find(|t| avail >= t.need_mb)
+        .unwrap_or(CHUNK_TIERS.last().expect("tiers non-empty"));
+    if tier.x_max != CHUNK_TIERS[0].x_max {
+        tracing::info!(
+            "RVC chunk tier lowered to x_max={} s (system available commit {} MB; DirectML \
+             first-shape pool scales with chunk length — upstream low-memory tiering)",
+            tier.x_max, avail
+        );
+    }
+    tier
+}
 
 /// RVC retrieval index loaded from .npy [N, dim] — raw vectors + precomputed |v|²
 /// (the old cosine-normalized copy is gone: faiss semantics are squared-L2, and dropping
@@ -111,12 +180,13 @@ pub fn run_pipeline(
     let wav16k = resample(&mono.samples, mono.sample_rate, SR as u32);
     let audio_f = highpass_48hz_16k(&wav16k)?;
 
+    let tier = pick_chunk_tier(m.engine, m.voice_session);
     let t_pad = SR * X_PAD;
     let t_pad_tgt = m.sample_rate as usize * X_PAD;
     let t_pad2 = t_pad * 2;
-    let t_query = SR * X_QUERY;
-    let t_center = SR * X_CENTER;
-    let t_max = SR * X_MAX;
+    let t_query = SR * tier.x_query;
+    let t_center = SR * tier.x_center;
+    let t_max = SR * tier.x_max;
 
     // ── opt_ts: silence-seek cut points (original lines 319-333) ──
     // audio_pad = pad(audio, window//2, 'reflect'); audio_sum[j] = Σ_{i<160}|audio_pad[j+i]|

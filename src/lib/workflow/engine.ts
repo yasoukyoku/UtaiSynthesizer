@@ -10,6 +10,7 @@ import { useMsstModelStore } from "../../store/msst-models";
 import { useAudioStore } from "../../store/audio";
 import { logToBackend } from "../log";
 import { backendErrorMessage, isCancelError } from "../backendError";
+import { maybeShowErrorModal } from "../errorDisplay";
 import { DEFAULT_OUTPUT_GROUP } from "../constants";
 import { MSST_CATALOG, MSST_DEFAULT_PRECISION, type MsstArchitecture } from "../models/msst-catalog";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, buildVoiceOptions } from "./voiceDefaults";
@@ -358,6 +359,9 @@ export async function executeWorkflow(
       store.setNodeStatus(segmentId, store.executions[segmentId]!.currentNodeId!, "error");
       store.setNodeError(segmentId, store.executions[segmentId]!.currentNodeId!, display);
     }
+    // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY …) additionally open the alert
+    // dialog — the node tooltip is invisible until hovered and can't carry the guidance text.
+    if (!cancelled) maybeShowErrorModal(msg, display);
     store.clearPendingStatuses(segmentId);
     store.failExecution(segmentId, display);
     throw err;
@@ -491,11 +495,15 @@ export async function executeSingleNode(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const cancelled = isCancelMessage(msg);
+    // S67c: single-node failures now reach the backend log too (they used to be
+    // tooltip-only — invisible in crash forensics), mirroring executeWorkflow's catch.
+    logToBackend(cancelled ? "warn" : "error", cancelled ? "Single-node run cancelled" : `Single-node run failed: ${msg}`);
     // Same single localization point as executeWorkflow's catch (cancel checked first).
     const display = cancelled ? "Cancelled" : (backendErrorMessage(msg) ?? msg);
     if (!cancelled) {
       store.setNodeStatus(segmentId, targetNodeId, "error");
       store.setNodeError(segmentId, targetNodeId, display);
+      maybeShowErrorModal(msg, display);
     }
     store.clearPendingStatuses(segmentId);
     store.failExecution(segmentId, display);

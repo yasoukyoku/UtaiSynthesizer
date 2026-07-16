@@ -17,6 +17,8 @@ import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vo
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels } from "../../lib/vocal/vocalRender";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
@@ -185,7 +187,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (isVocalCancelError(e)) return; // user cancelled — silent settle (payload-aware: OOV lyrics can't fake a cancel)
       // Shared error→message mapping (vocalRenderErrorMessage) — the SAME one the Play-time auto-render
       // batch uses, so the two paths can never drift (§user: they must report identically).
-      useAppStore.getState().showToast(vocalRenderErrorMessage(e), "error");
+      logToBackend("error", `Vocal render failed: ${String(e)}`);
+      const display = vocalRenderErrorMessage(e);
+      if (!maybeShowErrorModal(e, display)) {
+        useAppStore.getState().showToast(display, "error");
+      }
     }
   }, [part, segmentId, t]);
 

@@ -442,7 +442,8 @@
     "cancel": "Cancel",
     "confirm": "Confirm",
     "ok": "OK",
-    "busyRetry": "The app is busy — try again shortly"
+    "busyRetry": "The app is busy — try again shortly",
+    "errorModalTitle": "Operation could not continue"
   },
   "update": {
     "title": "Update Available",

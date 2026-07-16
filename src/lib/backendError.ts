@@ -23,6 +23,11 @@ import i18n from "../i18n";
 interface CodeEntry {
   key: string;
   busy?: boolean;
+  /** S67c: fatal "the run stopped and the user must act" errors — funnels show these in the
+   *  self-drawn modal dialog instead of a toast/tooltip (long guidance text gets cut off
+   *  there). Reserve for errors whose remedy is user action outside the app (free memory,
+   *  switch device); do NOT modal-ify ordinary failures. */
+  modal?: boolean;
 }
 
 const CODE_KEYS: Record<string, CodeEntry> = {
@@ -155,7 +160,7 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   INDEX_LOAD_FAILED: { key: "backend.INDEX_LOAD_FAILED" },
   // S67c loud guard: DML new-shape compile refused below the system-commit floor —
   // replaces the OS silently killing the process mid-allocation on low-memory machines.
-  INFERENCE_LOW_MEMORY: { key: "backend.INFERENCE_LOW_MEMORY" },
+  INFERENCE_LOW_MEMORY: { key: "backend.INFERENCE_LOW_MEMORY", modal: true },
   INFER_TASK_PANICKED: { key: "backend.INFER_TASK_PANICKED" },
   INSTALL_BUSY: { key: "backend.INSTALL_BUSY", busy: true },
   INSTALL_CANCELLED: { key: "backend.INSTALL_CANCELLED" },
@@ -344,6 +349,12 @@ export function backendErrorMessage(e: unknown): string | null {
 /** True iff the error is a transient busy/interlock rejection (show as INFO, not error). */
 export function isBusyError(e: unknown): boolean {
   return findCode(String(e))?.entry.busy === true;
+}
+
+/** S67c: true iff the error should surface in the modal error dialog (see CodeEntry.modal).
+ *  Callers still localize via backendErrorMessage; this only picks the display vessel. */
+export function isModalError(e: unknown): boolean {
+  return findCode(String(e))?.entry.modal === true;
 }
 
 /** THE cancel-sentinel check (single source — the workflow engine and every toast funnel share it).

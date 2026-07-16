@@ -196,6 +196,27 @@ pub fn memory_stamp() -> String {
     format!("commit={} MB, sys avail={} MB", process_commit_mb(), avail)
 }
 
+/// S67c: does an inference error message look like memory exhaustion? CPU sessions fail
+/// with bad_alloc-family messages when commit runs out (malloc is incremental, so unlike
+/// a WDDM ticket the OS usually doesn't get to kill the process first), and DML sometimes
+/// surfaces E_OUTOFMEMORY instead of dying. Rewriting these to the INFERENCE_LOW_MEMORY
+/// code routes them into the same trilingual modal as the pre-run floor. Never matches
+/// the cancel sentinel. CAVEAT (review round 2): CUDA VRAM/arena failures ("failed to
+/// allocate", incl. the S66 user-set arena cap's documented failure mode) also match —
+/// those are NOT system-memory exhaustion and the caller must gate this by EP (CUDA
+/// sessions pass their error through unchanged).
+fn is_alloc_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("bad_alloc")
+        || m.contains("bad allocation")
+        || m.contains("out of memory")
+        || m.contains("outofmemory")
+        || m.contains("not enough memory")
+        || m.contains("allocation failed")
+        || m.contains("failed to allocate")
+        || m.contains("0x8007000e") // E_OUTOFMEMORY
+}
+
 /// DML pool budget BEYOND the first-shape ticket before a session is recycled:
 /// total physical RAM / 8, clamped to [1024, 4096] MB (16 GB machine → 2 GB budget).
 /// `UTAI_DML_COMMIT_CAP_MB` overrides (support/testing valve; 0 falls back to the formula).
@@ -713,11 +734,13 @@ impl OnnxEngine {
                     loaded.path.display(), commit, avail
                 );
                 if min > 0 && avail > 0 && avail < min {
-                    return Err(UtaiError::Inference(format!(
+                    let msg = format!(
                         "INFERENCE_LOW_MEMORY: system available commit {avail} MB is below the \
                          {min} MB floor needed to compile a new GPU shape for {}",
                         loaded.path.display()
-                    )));
+                    );
+                    tracing::error!("{msg}");
+                    return Err(UtaiError::Inference(msg));
                 }
                 Some(commit)
             }
@@ -751,6 +774,11 @@ impl OnnxEngine {
         // #3) otherwise keeps `session` borrowed through BOTH match arms of run's Result,
         // and the failed-run arm below needs the guards released.
         let failed_dml_build = loaded.dml.as_ref().map(|_| loaded.build_id);
+        // S67c: the INFERENCE_LOW_MEMORY rewrite below must not claim "system memory is
+        // low" for CUDA VRAM/arena failures (S66 user-set arena cap fails with exactly
+        // "allocation failed" while system RAM is plentiful) — copied out here because the
+        // `loaded` borrow is gone by the error arm.
+        let failed_is_cuda = loaded.actual_device.starts_with("CUDA");
         let run_outcome: Result<Vec<OutputTensor>> = (|| {
             let outputs = session
                 .run(input_values)
@@ -778,6 +806,10 @@ impl OnnxEngine {
         let result = match run_outcome {
             Ok(result) => result,
             Err(e) => {
+                // Stamped BEFORE the failed session tears down below — the forensic
+                // numbers must describe memory at failure time, not post-reclaim
+                // (S67c review round 2).
+                let stamp_at_failure = memory_stamp();
                 // S67b (review round 2): a FAILED run on a DirectML session leaves unknown
                 // allocator/device state — a half-committed pool from a failed compile, or
                 // a wedged device (DXGI device-removed kills the session permanently).
@@ -796,6 +828,20 @@ impl OnnxEngine {
                         );
                     }
                 }
+                // S67c: allocation-exhaustion failures (CPU bad_alloc family / DML
+                // E_OUTOFMEMORY that surfaced as an error instead of an OS kill) get the
+                // INFERENCE_LOW_MEMORY code so the frontend's trilingual modal catches
+                // them; and EVERY inference failure leaves an English forensic line in
+                // the file log (command errors otherwise go straight to the UI and the
+                // backend log stays empty at the exact moment we need it). CUDA sessions
+                // pass through unchanged — their allocation failures are VRAM/arena-cap
+                // conditions, not system-memory exhaustion (see is_alloc_failure).
+                let e = if !failed_is_cuda && is_alloc_failure(&e.to_string()) {
+                    UtaiError::Inference(format!("INFERENCE_LOW_MEMORY: {e} ({stamp_at_failure})"))
+                } else {
+                    e
+                };
+                tracing::error!("Inference run failed ({}): {} [{stamp_at_failure}]", session_id, e);
                 return Err(e);
             }
         };
