@@ -84,6 +84,21 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
     } else {
         gpus.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
     };
+    // S67c: one hardware-inventory line per process, on the first query (the frontend
+    // startup check always issues one). Community crash logs never said what GPU/RAM the
+    // box had — this closes that blind spot. NOTE: WMI adapter order is NOT the DirectML
+    // device order (S67 CUDA-ordinal lesson) — this line is an inventory, not a record of
+    // which adapter DML picked.
+    {
+        static HW_LOGGED: std::sync::Once = std::sync::Once::new();
+        HW_LOGGED.call_once(|| {
+            let (total_mb, avail_mb) = crate::inference::engine::system_memory_mb();
+            tracing::info!(
+                "Hardware: GPUs [{}]; physical RAM {} MB (available commit {} MB)",
+                gpu_name, total_mb, avail_mb
+            );
+        });
+    }
     Ok(HardwareInfo {
         gpu_name,
         // Vendor-guarded (S64c audit): the self-downloaded runtime/cuda DLLs satisfy the PATH probe

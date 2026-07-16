@@ -272,7 +272,11 @@ impl SeparationManager {
         });
 
         *active = Some(ActiveJob::NativeHandle { handle, cancel: cancel_job });
-        tracing::info!("Native MSST separation started: {}", model_path.display());
+        tracing::info!(
+            "Native MSST separation started: {} ({})",
+            model_path.display(),
+            crate::inference::engine::memory_stamp()
+        );
         Ok(())
     }
 

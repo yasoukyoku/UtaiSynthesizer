@@ -666,6 +666,7 @@
     "FFMPEG_MISSING": "ffmpeg.exe not found (required for training preprocessing)",
     "FILE_READ_FAILED": "Failed to read file",
     "INDEX_LOAD_FAILED": "Failed to load the retrieval index",
+    "INFERENCE_LOW_MEMORY": "System memory is too low — GPU inference was stopped to avoid a crash. Close other memory-heavy applications and retry, switch the inference device to CPU in Settings, or use fewer separation nodes in the workflow.",
     "INFER_TASK_PANICKED": "Inference task failed",
     "INSTALL_BUSY": "A runtime pack is already downloading/installing — wait for it to finish or cancel it first.",
     "INSTALL_CANCELLED": "Install cancelled",

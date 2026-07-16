@@ -158,9 +158,10 @@ pub fn run_pipeline(
     // DEBUG = per-chunk (a song is ~1 line per ~40 s of input; the file layer records both).
     let t_run = std::time::Instant::now();
     tracing::info!(
-        "RVC pipeline: {:.1}s @16k, {} chunk(s); f0 (RMVPE, chunked) starting",
+        "RVC pipeline: {:.1}s @16k, {} chunk(s); f0 (RMVPE, chunked) starting ({})",
         audio_f.len() as f32 / SR as f32,
-        opt_ts.len() + 1
+        opt_ts.len() + 1,
+        super::engine::memory_stamp()
     );
 
     // S66: chunk-bounded (60 s windows + 2 s discarded overlap) — this whole-song pass was the
@@ -187,7 +188,11 @@ pub fn run_pipeline(
     let pitchf: Vec<f32> = f0[..p_len].to_vec();
     let pitch: Vec<i64> = pitchf.iter().map(|&v| f0_to_coarse(v)).collect();
     progress(0.2); // f0 (the one whole-signal RMVPE pass) done
-    tracing::info!("RVC pipeline: f0 done ({} frames); converting chunks", p_len);
+    tracing::info!(
+        "RVC pipeline: f0 done ({} frames); converting chunks ({})",
+        p_len,
+        super::engine::memory_stamp()
+    );
 
     // ── chunk loop (original lines 371-441) ──
     // f0 (0.2) → chunks span [0.2, 0.95] → tail + post (0.95 → 1.0)
@@ -257,11 +262,12 @@ pub fn run_pipeline(
         s_ix = t;
         chunk_idx += 1;
         tracing::debug!(
-            "RVC chunk {}/{} done ({:.1}s in, {:.0} ms)",
+            "RVC chunk {}/{} done ({:.1}s in, {:.0} ms, {})",
             chunk_idx,
             opt_ts.len() + 1,
             chunk.len() as f32 / SR as f32,
-            t_chunk.elapsed().as_secs_f64() * 1000.0
+            t_chunk.elapsed().as_secs_f64() * 1000.0,
+            super::engine::memory_stamp()
         );
         progress(0.2 + 0.75 * (chunk_idx as f32 / total_chunks));
     }
@@ -274,11 +280,12 @@ pub fn run_pipeline(
     let out = ranged_chunk(&pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], chunk, chunk_idx)?;
     append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
     tracing::debug!(
-        "RVC chunk {}/{} done (final, {:.1}s in, {:.0} ms)",
+        "RVC chunk {}/{} done (final, {:.1}s in, {:.0} ms, {})",
         chunk_idx + 1,
         opt_ts.len() + 1,
         chunk.len() as f32 / SR as f32,
-        t_chunk.elapsed().as_secs_f64() * 1000.0
+        t_chunk.elapsed().as_secs_f64() * 1000.0,
+        super::engine::memory_stamp()
     );
 
     // ── rms mix (original: change_rms(audio, 16000, audio_opt, tgt_sr, rate) if rate != 1) ──
@@ -299,10 +306,11 @@ pub fn run_pipeline(
     }
     // NO int16 quantization (original's audio_max/max_int16 normalize skipped — we stay f32).
     tracing::info!(
-        "RVC pipeline done in {:.1}s ({:.1}s audio out @{}Hz)",
+        "RVC pipeline done in {:.1}s ({:.1}s audio out @{}Hz; {})",
         t_run.elapsed().as_secs_f32(),
         audio_opt.len() as f32 / final_sr.max(1) as f32,
-        final_sr
+        final_sr,
+        super::engine::memory_stamp()
     );
     progress(1.0);
 

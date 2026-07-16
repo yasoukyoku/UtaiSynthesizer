@@ -574,7 +574,11 @@ impl NativePipeline {
         }).collect();
         // Residual for num_stems==1 is derived in separate() against the un-normalized mix.
         tracing::debug!("[perf] finalize: {:.1} ms", t_fin.elapsed().as_secs_f64() * 1e3);
-        tracing::info!("[perf] separate_spectral TOTAL: {:.1} ms", t_total.elapsed().as_secs_f64() * 1e3);
+        tracing::info!(
+            "[perf] separate_spectral TOTAL: {:.1} ms ({})",
+            t_total.elapsed().as_secs_f64() * 1e3,
+            crate::inference::engine::memory_stamp()
+        );
         Ok(stems)
     }
 
@@ -1069,8 +1073,9 @@ impl NativePipeline {
             },
         ];
         tracing::info!(
-            "[perf] separate_vr TOTAL: {:.1} ms ({} frames)",
-            t_total.elapsed().as_secs_f64() * 1e3, n_frame
+            "[perf] separate_vr TOTAL: {:.1} ms ({} frames; {})",
+            t_total.elapsed().as_secs_f64() * 1e3, n_frame,
+            crate::inference::engine::memory_stamp()
         );
         Ok(stems)
     }

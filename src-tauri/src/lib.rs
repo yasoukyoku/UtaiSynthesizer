@@ -592,7 +592,24 @@ pub fn run() {
     // the daily file roll (LocalDailyFile — tracing-appender's own rolling::daily is
     // hardwired to UTC dates/boundaries). UTC is the honest fallback.
     let tz_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    let file_appender = logging::LocalDailyFile::new(log_dir.clone(), "utai.log", tz_offset);
+    let mut file_appender = logging::LocalDailyFile::new(log_dir.clone(), "utai.log", tz_offset);
+    // S67c: process-start divider, FILE ONLY. Same-day launches APPEND to one file, so a
+    // crashed process's last line and the next launch's first line were visually
+    // indistinguishable (the 07-16 community log interleaves six runs across three app
+    // versions). A raw write here — BEFORE the non_blocking wrap and registry init — is
+    // single-threaded (ownership then moves into NonBlocking: later direct access cannot
+    // even compile), lands ahead of the banner, skips the lossy channel, and is
+    // structurally invisible to the UI panel (BufferLayer only sees tracing events, and
+    // the panel pipeline must never change — S67).
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            file_appender,
+            "\n======================== process start: UtaiSynthesizer {} (pid {}) ========================",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
+    }
     let (non_blocking, _file_guard) = tracing_appender::non_blocking(file_appender);
 
     let log_buffer = Arc::new(logging::LogBuffer::new(2000));
@@ -640,8 +657,9 @@ pub fn run() {
         .init();
 
     tracing::info!(
-        "UtaiSynthesizer {} starting — logs: {} (timestamps local, UTC{})",
+        "UtaiSynthesizer {} starting (pid {}) — logs: {} (timestamps local, UTC{})",
         env!("CARGO_PKG_VERSION"),
+        std::process::id(),
         log_dir.display(),
         tz_offset
     );

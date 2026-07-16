@@ -666,6 +666,7 @@
     "FFMPEG_MISSING": "找不到 ffmpeg.exe（训练预处理需要）",
     "FILE_READ_FAILED": "无法读取文件",
     "INDEX_LOAD_FAILED": "加载检索索引失败",
+    "INFERENCE_LOW_MEMORY": "系统内存不足，已停止 GPU 推理以避免闪退。请关闭其他占用内存的程序后重试，或在设置中把推理设备切换为 CPU，或减少工作流中的分离节点。",
     "INFER_TASK_PANICKED": "推理任务失败",
     "INSTALL_BUSY": "已有运行时包在下载/安装中——请等它完成或先取消。",
     "INSTALL_CANCELLED": "安装已取消",

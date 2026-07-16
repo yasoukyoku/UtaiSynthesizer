@@ -153,6 +153,9 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   FFMPEG_MISSING: { key: "backend.FFMPEG_MISSING" },
   FILE_READ_FAILED: { key: "backend.FILE_READ_FAILED" },
   INDEX_LOAD_FAILED: { key: "backend.INDEX_LOAD_FAILED" },
+  // S67c loud guard: DML new-shape compile refused below the system-commit floor —
+  // replaces the OS silently killing the process mid-allocation on low-memory machines.
+  INFERENCE_LOW_MEMORY: { key: "backend.INFERENCE_LOW_MEMORY" },
   INFER_TASK_PANICKED: { key: "backend.INFER_TASK_PANICKED" },
   INSTALL_BUSY: { key: "backend.INSTALL_BUSY", busy: true },
   INSTALL_CANCELLED: { key: "backend.INSTALL_CANCELLED" },

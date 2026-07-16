@@ -150,6 +150,52 @@ fn process_commit_mb() -> u64 {
     0
 }
 
+/// System-wide memory snapshot via GlobalMemoryStatusEx: (total physical MB, available
+/// COMMIT MB). Available commit = the system commit limit (RAM + current pagefile) minus
+/// total committed — the pool a DML first-shape ticket must fit inside. WDDM charges GPU
+/// allocations against commit, and when this pool runs dry Windows kills the process with
+/// no panic and no log line (the community "silent crash at 20%"). (0, 0) on failure.
+#[cfg(windows)]
+pub(crate) fn system_memory_mb() -> (u64, u64) {
+    #[repr(C)]
+    struct MemStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(p: *mut MemStatusEx) -> i32;
+    }
+    unsafe {
+        let mut m: MemStatusEx = std::mem::zeroed();
+        m.length = std::mem::size_of::<MemStatusEx>() as u32;
+        if GlobalMemoryStatusEx(&mut m) != 0 {
+            (m.total_phys / (1024 * 1024), m.avail_page / (1024 * 1024))
+        } else {
+            (0, 0)
+        }
+    }
+}
+#[cfg(not(windows))]
+pub(crate) fn system_memory_mb() -> (u64, u64) {
+    (0, 0)
+}
+
+/// One-line memory snapshot for stage logs: "commit=1234 MB, sys avail=5678 MB". S67c
+/// forensic thread — stage INFO/DEBUG lines carry these numbers so a community crash log
+/// reads as a commit-exhaustion timeline without a debugger on the machine.
+pub fn memory_stamp() -> String {
+    let (_, avail) = system_memory_mb();
+    format!("commit={} MB, sys avail={} MB", process_commit_mb(), avail)
+}
+
 /// DML pool budget BEYOND the first-shape ticket before a session is recycled:
 /// total physical RAM / 8, clamped to [1024, 4096] MB (16 GB machine → 2 GB budget).
 /// `UTAI_DML_COMMIT_CAP_MB` overrides (support/testing valve; 0 falls back to the formula).
@@ -167,34 +213,34 @@ fn dml_extra_commit_cap_mb() -> u64 {
                 ),
             }
         }
-        #[cfg(windows)]
-        {
-            #[repr(C)]
-            struct MemStatusEx {
-                length: u32,
-                memory_load: u32,
-                total_phys: u64,
-                avail_phys: u64,
-                total_page: u64,
-                avail_page: u64,
-                total_virtual: u64,
-                avail_virtual: u64,
-                avail_extended: u64,
-            }
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn GlobalMemoryStatusEx(p: *mut MemStatusEx) -> i32;
-            }
-            let total_mb = unsafe {
-                let mut m: MemStatusEx = std::mem::zeroed();
-                m.length = std::mem::size_of::<MemStatusEx>() as u32;
-                if GlobalMemoryStatusEx(&mut m) != 0 { m.total_phys / (1024 * 1024) } else { 0 }
-            };
-            if total_mb > 0 {
-                return (total_mb / 8).clamp(1024, 4096);
-            }
+        let (total_mb, _) = system_memory_mb();
+        if total_mb > 0 {
+            return (total_mb / 8).clamp(1024, 4096);
         }
         2048
+    })
+}
+
+/// S67c: minimum system-wide available commit (MB) required before a DirectML session may
+/// compile a NEW input shape. The first-shape "ticket" of a big voice model is 1.7-3.4 GB
+/// of commit paid blind inside session.run — on a machine already near the commit limit the
+/// OS kills the process mid-allocation with zero diagnostics. This floor converts that
+/// silent death into a loud, actionable INFERENCE_LOW_MEMORY error. Deliberately CONSERVATIVE
+/// (well below any real ticket): a false positive here would block a run that could have
+/// succeeded — never trade a working feature for a guard (feedback_v2_feature_parity).
+/// `UTAI_INFER_MIN_AVAIL_MB` overrides (0 disables the check).
+fn dml_min_avail_commit_mb() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        if let Ok(raw) = std::env::var("UTAI_INFER_MIN_AVAIL_MB") {
+            match raw.trim().parse::<u64>() {
+                Ok(mb) => return mb, // 0 = disabled (documented)
+                Err(_) => tracing::warn!(
+                    "UTAI_INFER_MIN_AVAIL_MB={raw:?} is not a whole MB number — using the default floor"
+                ),
+            }
+        }
+        1024
     })
 }
 
@@ -258,16 +304,14 @@ impl OnnxEngine {
         // Cached sessions were built for the previous execution provider — drop them so
         // they rebuild for the new device on next load (and free the old EP's memory).
         if changed {
-            let n = {
-                let mut s = self.sessions.write();
-                let n = s.len();
-                s.clear();
-                n
-            };
+            // Taken out of the map under the lock, torn down AFTER it releases — a GB-scale
+            // D3D12/EP teardown under the global sessions lock stalls every concurrent
+            // inference (S67b; same discipline as drop_session_incarnation).
+            let taken = std::mem::take(&mut *self.sessions.write());
             // `paths` is KEPT: keys embed the device, so old-device entries are unreachable by new
             // loads, and run() needs the surviving entry to report a mid-job device change clearly.
-            if n > 0 {
-                tracing::info!("Cleared {} cached ONNX session(s) after device change", n);
+            if !taken.is_empty() {
+                tracing::info!("Cleared {} cached ONNX session(s) after device change", taken.len());
             }
         }
     }
@@ -353,6 +397,9 @@ impl OnnxEngine {
         tracing::info!("Building ONNX session: {} (device={:?})", path.display(), device);
         let (session, actual_device) = build_session(path, &device, mem_pattern)?;
 
+        // Declared before the guard so LRU-evicted sessions tear down AFTER the write lock
+        // releases (drop order is reverse declaration order).
+        let mut evicted: Vec<LoadedSession> = Vec::new();
         let mut sessions = self.sessions.write();
         // Another thread may have built the same model while we were compiling.
         if !sessions.contains_key(&key) {
@@ -374,7 +421,7 @@ impl OnnxEngine {
                     .map(|(k, _)| k.clone());
                 match evict {
                     Some(k) => {
-                        sessions.remove(&k);
+                        evicted.extend(sessions.remove(&k));
                         tracing::info!(
                             "Evicted least-recently-used ONNX session (per-class cache cap {})",
                             MAX_CACHED_SESSIONS
@@ -409,9 +456,29 @@ impl OnnxEngine {
     }
 
     pub fn unload_model(&self, id: &str) {
-        if self.sessions.write().remove(id).is_some() {
+        // The write guard is a temporary — released at the end of this statement, so the
+        // removed session (bound to a local) tears down AFTER the lock, like everywhere else.
+        let removed = self.sessions.write().remove(id);
+        if removed.is_some() {
             tracing::info!("Unloaded ONNX session");
         }
+    }
+
+    /// Take every session matching `evict` out of the cache under the write lock and hand
+    /// them back for teardown AFTER the guard releases — a GB-scale D3D12/EP teardown under
+    /// the global sessions lock would stall every concurrent inference (S67b introduced the
+    /// discipline in drop_session_incarnation; S67c extends it to every eviction path).
+    fn take_sessions_where(
+        &self,
+        mut evict: impl FnMut(&str, &LoadedSession) -> bool,
+    ) -> Vec<LoadedSession> {
+        let mut sessions = self.sessions.write();
+        let keys: Vec<String> = sessions
+            .iter()
+            .filter(|(k, v)| evict(k, v))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.iter().filter_map(|k| sessions.remove(k)).collect()
     }
 
     /// Free every cached session EXCEPT the one for `keep_path`. Call before loading a
@@ -422,14 +489,18 @@ impl OnnxEngine {
     /// run()'s reload-on-miss — the `paths` map survives — so voice/vocoder models just pay
     /// a few seconds' reload on their next use.
     pub fn release_others(&self, keep_path: &Path) -> usize {
-        let mut sessions = self.sessions.write();
-        let before = sessions.len();
-        sessions.retain(|_, s| s.path == keep_path);
-        let n = before - sessions.len();
+        let removed = self.take_sessions_where(|_, s| s.path != keep_path);
+        let n = removed.len();
         if n > 0 {
+            // Commit before/after the teardown: on a healthy driver the pools return in
+            // full right here (measured, msst_then_rvc_probe) — a community log where the
+            // "after" number barely moves is the direct diagnosis of a driver that defers
+            // or withholds DML pool release (the prime suspect for the 16 GB crashes).
+            let c0 = process_commit_mb();
+            drop(removed); // teardown outside the sessions lock
             tracing::info!(
-                "Released {} other cached ONNX session(s) before loading {} (GPU memory headroom)",
-                n, keep_path.display()
+                "Released {} other cached ONNX session(s) before loading {} (GPU memory headroom; commit {}→{} MB)",
+                n, keep_path.display(), c0, process_commit_mb()
             );
         }
         n
@@ -448,21 +519,25 @@ impl OnnxEngine {
     /// next run (live-measured +1.4 GB) — every run's VRAM must equal its OWN
     /// footprint. Reload specs survive (reload-on-miss).
     pub fn release_gpu_sessions_except(&self, keep: &[PathBuf]) -> usize {
-        let paths = self.paths.read();
-        let mut sessions = self.sessions.write();
-        let before = sessions.len();
-        sessions.retain(|key, _| {
-            let Some(spec) = paths.get(key) else { return true };
-            if matches!(spec.device, Some(DeviceConfig::Cpu)) {
-                return true; // forced-CPU sessions hold no VRAM
-            }
-            keep.iter().any(|k| spec.path.starts_with(k))
-        });
-        let n = before - sessions.len();
+        let removed = {
+            let paths = self.paths.read();
+            self.take_sessions_where(|key, _| {
+                let Some(spec) = paths.get(key) else { return false };
+                if matches!(spec.device, Some(DeviceConfig::Cpu)) {
+                    return false; // forced-CPU sessions hold no VRAM
+                }
+                !keep.iter().any(|k| spec.path.starts_with(k))
+            })
+        };
+        let n = removed.len();
         if n > 0 {
+            // Same commit-return trace as release_others — this is the hop right before the
+            // voice model pays its first-shape ticket, exactly where the community machines die.
+            let c0 = process_commit_mb();
+            drop(removed); // teardown outside the sessions lock
             tracing::info!(
-                "Released {} GPU session(s) not needed by this voice run (VRAM headroom)",
-                n
+                "Released {} GPU session(s) not needed by this voice run (VRAM headroom; commit {}→{} MB)",
+                n, c0, process_commit_mb()
             );
         }
         n
@@ -486,18 +561,17 @@ impl OnnxEngine {
         if keys.is_empty() {
             return 0;
         }
-        {
+        let removed: Vec<LoadedSession> = {
             let mut sessions = self.sessions.write();
-            for k in &keys {
-                sessions.remove(k);
-            }
-        }
+            keys.iter().filter_map(|k| sessions.remove(k)).collect()
+        };
         {
             let mut paths = self.paths.write();
             for k in &keys {
                 paths.remove(k);
             }
         }
+        drop(removed); // teardown outside the sessions lock
         tracing::info!(
             "Unloaded {} session spec(s) under {} (files replaced)",
             keys.len(),
@@ -508,12 +582,9 @@ impl OnnxEngine {
 
     /// Drop all cached sessions (frees their memory). Safe to call between runs.
     pub fn clear_sessions(&self) {
-        let n = {
-            let mut s = self.sessions.write();
-            let n = s.len();
-            s.clear();
-            n
-        };
+        let taken = std::mem::take(&mut *self.sessions.write());
+        let n = taken.len();
+        drop(taken); // teardown outside the sessions lock
         if n > 0 {
             tracing::info!("Cleared {} cached ONNX session(s)", n);
         }
@@ -532,15 +603,20 @@ impl OnnxEngine {
         if self.in_flight.load(Ordering::Relaxed) > 0 || self.last_activity.lock().elapsed() < idle {
             return 0;
         }
-        let mut sessions = self.sessions.write();
-        if self.in_flight.load(Ordering::Relaxed) > 0 || self.last_activity.lock().elapsed() < idle {
-            return 0;
-        }
-        let n = sessions.len();
+        let taken = {
+            let mut sessions = self.sessions.write();
+            if self.in_flight.load(Ordering::Relaxed) > 0
+                || self.last_activity.lock().elapsed() < idle
+            {
+                return 0;
+            }
+            std::mem::take(&mut *sessions) // keep `paths` so run() can reload-on-miss
+        };
+        let n = taken.len();
         if n == 0 {
             return 0;
         }
-        sessions.clear(); // keep `paths` so run() can reload-on-miss
+        drop(taken); // teardown outside the sessions lock
         tracing::info!("Idle — released {} cached ONNX session(s) to free GPU memory", n);
         n
     }
@@ -622,7 +698,29 @@ impl OnnxEngine {
         // sig is only recorded on SUCCESS: a failed compile must stay "new" so its retry
         // passes the pre-run budget check (see DmlShapeAccounting.shapes).
         let dml_new_shape: Option<u64> = match &loaded.dml {
-            Some(dml) if !dml.shapes.lock().contains(&shape_sig) => Some(process_commit_mb()),
+            Some(dml) if !dml.shapes.lock().contains(&shape_sig) => {
+                // S67c: a new DML shape is about to pay a pool/compile allocation — worst
+                // case the multi-GB first-shape ticket, charged blind inside session.run.
+                // On a machine at the commit limit the OS kills the process with zero
+                // diagnostics; refuse LOUDLY below a conservative floor instead, and leave
+                // a commit/headroom trace either way (the next community log then shows
+                // the whole march toward exhaustion — instrument, don't theorize).
+                let commit = process_commit_mb();
+                let (_, avail) = system_memory_mb();
+                let min = dml_min_avail_commit_mb();
+                tracing::debug!(
+                    "DML new shape for {}: process commit={} MB, system available commit={} MB",
+                    loaded.path.display(), commit, avail
+                );
+                if min > 0 && avail > 0 && avail < min {
+                    return Err(UtaiError::Inference(format!(
+                        "INFERENCE_LOW_MEMORY: system available commit {avail} MB is below the \
+                         {min} MB floor needed to compile a new GPU shape for {}",
+                        loaded.path.display()
+                    )));
+                }
+                Some(commit)
+            }
             _ => None,
         };
 

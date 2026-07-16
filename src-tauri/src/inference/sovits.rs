@@ -157,9 +157,10 @@ pub fn run_pipeline(
     // uncovered (S67b review).
     let t_run = std::time::Instant::now();
     tracing::info!(
-        "SoVITS pipeline: {:.1}s input{}",
+        "SoVITS pipeline: {:.1}s input{} ({})",
         total_in as f32 / native_sr.max(1) as f32,
-        if range.is_some() { "; range probe (whole-signal RMVPE) first" } else { "" }
+        if range.is_some() { "; range probe (whole-signal RMVPE) first" } else { "" },
+        super::engine::memory_stamp()
     );
 
     // S60c 音域扩展: ONE tier decision for the WHOLE signal (v1 whole-render semantics). A
@@ -221,7 +222,11 @@ pub fn run_pipeline(
         .map(|s| ((s.end - s.start) + per_size - 1) / per_size)
         .sum();
 
-    tracing::info!("SoVITS pipeline: {} piece(s) to convert", total_windows);
+    tracing::info!(
+        "SoVITS pipeline: {} piece(s) to convert ({})",
+        total_windows,
+        super::engine::memory_stamp()
+    );
 
     let mut audio_out: Vec<f32> = Vec::with_capacity(out_len(total_in) + per_size);
     let mut seg_idx: u64 = 0;
@@ -260,11 +265,12 @@ pub fn run_pipeline(
             seg_idx += 1;
             done_windows += 1;
             tracing::debug!(
-                "SoVITS piece {}/{} done ({:.1}s in, {:.0} ms)",
+                "SoVITS piece {}/{} done ({:.1}s in, {:.0} ms, {})",
                 done_windows,
                 total_windows,
                 (w_end - w) as f32 / native_sr.max(1) as f32,
-                t_piece.elapsed().as_secs_f64() * 1000.0
+                t_piece.elapsed().as_secs_f64() * 1000.0,
+                super::engine::memory_stamp()
             );
             w = w_end;
         }
@@ -280,10 +286,11 @@ pub fn run_pipeline(
         audio_out = utai_dsp::formant_warp(&audio_out, |_| 2.0_f32.powf(options.formant / 12.0));
     }
     tracing::info!(
-        "SoVITS pipeline done in {:.1}s ({:.1}s audio out @{}Hz)",
+        "SoVITS pipeline done in {:.1}s ({:.1}s audio out @{}Hz; {})",
         t_run.elapsed().as_secs_f32(),
         audio_out.len() as f32 / m.sample_rate.max(1) as f32,
-        m.sample_rate
+        m.sample_rate,
+        super::engine::memory_stamp()
     );
     progress(1.0);
 
