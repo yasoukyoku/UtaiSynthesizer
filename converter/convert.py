@@ -52,6 +52,11 @@ from architectures.sovits_v4 import (
     set_deterministic as sovits_set_deterministic,
     F0PredictorWrapper,
 )
+from architectures.sovits_v4v2 import (
+    build_from_checkpoint as build_sovits_v4v2,
+    is_v2_state_dict,
+    F0PredictorWrapperV2,
+)
 from architectures.bs_roformer import (
     load_from_checkpoint as load_bs_roformer,
     detect_config,
@@ -278,6 +283,14 @@ def convert_sovits(input_path: Path, output_path: Path,
     falls back to weight-shape inference with warnings."""
     checkpoint = torch.load(str(input_path), map_location="cpu", weights_only=False)
 
+    # 4.0-v2 (VISinger2) checkpoints share the .pth container + the "sovits"
+    # import type but are a COMPLETELY different graph ("模型完全不通用") —
+    # route by state-dict namespace (disjoint: text_encoder/dec_harm/dec_noise
+    # vs enc_p/emb_g). The user imports through the same SoVITS entry.
+    if is_v2_state_dict(checkpoint.get("model") or {}):
+        return convert_sovits_v2(input_path, output_path, checkpoint,
+                                 config_json, deterministic)
+
     config, config_src = load_sovits_config(input_path, config_json)
     if config_src is not None:
         print(f"Using config: {config_src}")
@@ -496,6 +509,217 @@ def convert_sovits(input_path: Path, output_path: Path,
     print(f"Sample rate: {meta['sample_rate']}, SSL dim: {ssl_dim} "
           f"({meta['speech_encoder']}), Hop: {hop_size}, "
           f"Speakers: {meta['n_speakers']}, vol_embedding: {vol_embedding}, "
+          f"auto_f0: {auto_f0_path.name if auto_f0_path is not None else False}")
+
+
+SOVITS_V2_EXPORT_T = 200  # window_size 4 → generic rel-pos path, same as sovits
+
+
+def convert_sovits_v2(input_path: Path, output_path: Path, checkpoint,
+                      config_json: Path = None, deterministic: bool = False):
+    """Convert a SoVITS 4.0-v2 (VISinger2) .pth model to ONNX. Reached from
+    convert_sovits via state-dict detection — same CLI surface.
+
+    Export signature (see architectures/sovits_v4v2.py header for the full
+    contract + documented deviations):
+      c[1,T,256] f32 (ALREADY expanded — expansion stays Rust-side),
+      f0[1,T] f32 (Hz), noise[1,inter,T] f32 (caller N(0,1) * noice_scale,
+      original default 0.4), phase[1,n_fft//2+1,T] f32 (caller
+      uniform*2*3.14-3.14 — Generator_Noise's random phase made explicit),
+      sid[1] i64 [or spk_mix[1,n_spk] f32]  ->  audio[1,1,T*hop].
+    The main graph has NO uv input (v2 only reads uv in the predict_f0 branch
+    = the <stem>.f0.onnx companion) and NO vol input (no vol_embedding in the
+    v2 architecture). `deterministic` is a no-op: with noise+phase explicit
+    there is no in-graph randomness left (det build == shipping build)."""
+    config, config_src = load_sovits_config(input_path, config_json)
+    if config_src is not None:
+        print(f"Using config: {config_src}")
+
+    model, meta = build_sovits_v4v2(checkpoint, config)
+
+    # ①c gating — identical convention to convert_sovits: the REAL trained
+    # speaker count from the config spk map, NOT emb_spk's table size (200
+    # even for single-speaker models).
+    export_spk_mix = len(meta.get("speakers") or {}) > 1
+    n_spk = meta["n_speakers"]
+    model.export_spk_mix = export_spk_mix
+
+    ssl_dim = meta["features_dim"]
+    inter_channels = meta["inter_channels"]
+    hop_size = meta["hop_size"]
+    n_fft = meta["n_fft"]
+    phase_bins = n_fft // 2 + 1
+
+    seq_len = SOVITS_V2_EXPORT_T
+    torch.manual_seed(20260717)
+    c = torch.randn(1, seq_len, ssl_dim)
+    # Plausible f0 contour with an unvoiced stretch (f0=0 exercises the
+    # remove_above_nyquist / sin-bank zero-pitch path).
+    f0 = 150.0 + 250.0 * torch.rand(1, seq_len)
+    f0[:, 40:60] = 0.0
+    noise = torch.randn(1, inter_channels, seq_len) * SOVITS_NOISE_SCALE
+    phase = torch.rand(1, phase_bins, seq_len) * 2 * 3.14 - 3.14
+    if export_spk_mix:
+        spk = torch.rand(1, n_spk)
+        spk = spk / spk.sum(dim=1, keepdim=True)
+        spk_name = "spk_mix"
+    else:
+        spk = torch.zeros(1, dtype=torch.int64)
+        spk_name = "sid"
+
+    input_names = ["c", "f0", "noise", "phase", spk_name]
+    dynamic_axes = {
+        "c": {1: "seq_len"},
+        "f0": {1: "seq_len"},
+        "noise": {2: "seq_len"},
+        "phase": {2: "seq_len"},
+        "audio": {2: "audio_len"},
+    }
+    inputs = (c, f0, noise, phase, spk)
+
+    torch.onnx.export(
+        model,
+        inputs,
+        str(output_path),
+        input_names=input_names,
+        output_names=["audio"],
+        dynamic_axes=dynamic_axes,
+        opset_version=17,
+        do_constant_folding=True,
+        dynamo=False,
+    )
+
+    import onnx
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+    print(f"ONNX check passed: {output_path}", file=sys.stderr)
+
+    # ORT sanity at the export T AND at a different T — the second run proves
+    # the trace stayed dynamic in seq_len (the VISinger2 decoder slices with
+    # traced sizes; a baked constant would fail loudly here).
+    import numpy as np
+    import onnxruntime as ort
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP paths
+    for t in (seq_len, 137):
+        f0_np = (150.0 + 250.0 * np.random.rand(1, t)).astype(np.float32)
+        f0_np[:, t // 5:t // 5 + 10] = 0.0
+        feeds = {
+            "c": np.random.randn(1, t, ssl_dim).astype(np.float32),
+            "f0": f0_np,
+            "noise": (np.random.randn(1, inter_channels, t)
+                      * SOVITS_NOISE_SCALE).astype(np.float32),
+            "phase": (np.random.rand(1, phase_bins, t) * 2 * 3.14 - 3.14
+                      ).astype(np.float32),
+        }
+        if export_spk_mix:
+            m = np.random.rand(1, n_spk).astype(np.float32)
+            feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
+        else:
+            feeds["sid"] = np.zeros(1, dtype=np.int64)
+        audio = sess.run(None, feeds)[0]
+        if audio.shape != (1, 1, t * hop_size) or not np.isfinite(audio).all():
+            raise ValueError(
+                f"ORT sanity run failed at T={t}: shape {audio.shape} "
+                f"(expected (1, 1, {t * hop_size})), finite={np.isfinite(audio).all()}"
+            )
+        print(f"ORT sanity run passed: T={t} -> audio (1, 1, {t * hop_size})")
+
+    # ── auto-f0 companion graph (<stem>.f0.onnx) ────────────────────────────
+    # Same mechanism as convert_sovits; the wrapper shares the synthesizer's
+    # nn.Parameters and contains no randomness. Gated by gate1_sovits_v2.py
+    # against models.py infer(predict_f0=True) (normalize_f0 factor pinned).
+    auto_f0_path = None
+    f0_input_names = None
+    if meta["has_f0_decoder"]:
+        auto_f0_path = output_path.with_name(output_path.stem + ".f0.onnx")
+        predictor = F0PredictorWrapperV2(model)
+        predictor.eval()
+        f0_input_names = ["c", "f0", "uv", spk_name]
+        f0_dynamic_axes = {
+            "c": {1: "seq_len"},
+            "f0": {1: "seq_len"},
+            "uv": {1: "seq_len"},
+            "f0_pred": {1: "seq_len"},
+        }
+        uv = (f0 > 0).float()
+        f0_inputs = (c, f0, uv, spk)
+        torch.onnx.export(
+            predictor,
+            f0_inputs,
+            str(auto_f0_path),
+            input_names=f0_input_names,
+            output_names=["f0_pred"],
+            dynamic_axes=f0_dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+            dynamo=False,
+        )
+        onnx.checker.check_model(onnx.load(str(auto_f0_path)))
+        print(f"ONNX check passed: {auto_f0_path}", file=sys.stderr)
+
+        f0_sess = ort.InferenceSession(auto_f0_path.read_bytes())
+        for t in (seq_len, 137):
+            f0_np = (150.0 + 250.0 * np.random.rand(1, t)).astype(np.float32)
+            f0_np[:, t // 5:t // 5 + 10] = 0.0
+            feeds = {
+                "c": np.random.randn(1, t, ssl_dim).astype(np.float32),
+                "f0": f0_np,
+                "uv": (f0_np > 0).astype(np.float32),
+            }
+            if export_spk_mix:
+                m = np.random.rand(1, n_spk).astype(np.float32)
+                feeds["spk_mix"] = m / m.sum(axis=1, keepdims=True)
+            else:
+                feeds["sid"] = np.zeros(1, dtype=np.int64)
+            f0_pred = f0_sess.run(None, feeds)[0]
+            if f0_pred.shape != (1, t) or not np.isfinite(f0_pred).all():
+                raise ValueError(
+                    f"auto-f0 ORT sanity run failed at T={t}: shape "
+                    f"{f0_pred.shape} (expected (1, {t})), "
+                    f"finite={np.isfinite(f0_pred).all()}"
+                )
+            print(f"ORT sanity run passed: T={t} -> f0_pred (1, {t})")
+
+    config_path = output_path.with_suffix(".json")
+    config_data = {
+        "type": "sovits",
+        "version": meta["version"],          # "4.0-v2" — the UI badge verbatim
+        "features_dim": ssl_dim,
+        "speech_encoder": meta["speech_encoder"],
+        "sample_rate": meta["sample_rate"],
+        "hop_size": hop_size,
+        "vol_embedding": False,
+        "unit_interpolate_mode": meta["unit_interpolate_mode"],
+        "n_speakers": meta["n_speakers"],
+        "speakers": meta["speakers"],
+        "noise": {
+            # noise must be N(0,1) * noice_scale, shaped [1, inter_channels, T].
+            "noise_input": [1, inter_channels, "T"],
+            "default_scale": SOVITS_NOISE_SCALE,
+        },
+        # v2-only: Generator_Noise's random phase, uniform*2*3.14-3.14
+        # (upstream's literal 3.14), shaped [1, n_fft//2+1, T]; zeros = det.
+        "phase": {
+            "phase_input": [1, phase_bins, "T"],
+        },
+        "inputs": input_names,
+        "min_frames": meta["min_frames"],
+        "auto_f0": (
+            {"available": True, "file": auto_f0_path.name,
+             "inputs": f0_input_names}
+            if auto_f0_path is not None else {"available": False}
+        ),
+    }
+    if export_spk_mix:
+        config_data["spk_mix"] = {"available": True, "n_spk": n_spk}
+    config_path.write_text(json.dumps(config_data, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+
+    print(f"Converted SoVITS {meta['version']}: {input_path} -> {output_path}")
+    print(f"Config saved: {config_path}")
+    print(f"Sample rate: {meta['sample_rate']}, SSL dim: {ssl_dim} "
+          f"({meta['speech_encoder']}), Hop: {hop_size}, "
+          f"Speakers: {meta['n_speakers']}, "
           f"auto_f0: {auto_f0_path.name if auto_f0_path is not None else False}")
 
 
