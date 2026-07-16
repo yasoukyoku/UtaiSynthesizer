@@ -800,7 +800,9 @@ function TargetStep() {
               value={diffModelPicked ? config.modelName : ""}
               options={sovitsModels.map((m) => ({
                 value: m.name,
-                label: `${m.name} · ${voiceFeatureDim(m) === 256 ? "4.0" : "4.1"}`,
+                // real sidecar version verbatim when present ("4.0-v2" must not
+                // masquerade as "4.0" — 标牌清楚); dim mapping = legacy fallback
+                label: `${m.name} · ${voiceVersionBadge(m) ?? (voiceFeatureDim(m) === 256 ? "4.0" : "4.1")}`,
               }))}
               onChange={(v) => pickDiffModel(v)}
             />
