@@ -62,7 +62,7 @@ def ensure_fixture():
 
 
 def build_cfg(backend, workspace):
-    aux = os.path.join(APP, "data", "models", "aux")
+    aux = os.path.join(APP, "data", "models", "auxiliary")
     tr = os.path.join(APP, "data", "models", "training")
     cfg = {
         "backend": backend,
@@ -94,7 +94,7 @@ def build_cfg(backend, workspace):
         cfg["assets"]["configs_dir"] = os.path.join(
             APP, "training", "assets", "configs", "rvc"
         )
-        cfg["assets"]["rmvpe_pt"] = os.path.join(APP, "data", "models", "aux", "rmvpe.pt")
+        cfg["assets"]["rmvpe_pt"] = os.path.join(APP, "data", "models", "auxiliary", "rmvpe.pt")
         cfg["assets"]["mute_dir"] = os.path.join(APP, "training", "assets", "mute")
         cfg.update({
             "version": "v2", "sample_rate": "48k", "total_epoch": 1,

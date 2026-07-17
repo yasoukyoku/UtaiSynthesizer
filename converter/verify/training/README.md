@@ -198,6 +198,82 @@ mel>75/kl>9 显示夹取（TB 记原始值），对拍脚本无 clamp。
 
 ---
 
+# SoVITS 4.0-v2 训练关卡（S68 批4，gate0_sovits_v2_* / gate1_sovits_v2_*）
+
+原版参照：`D:\MyDev\TESTING\SoVITS-4.0_v2\src\so-vits-svc`（官方 4.0-v2 分支
+@cf5a8fb 逐字节快照，代码零改动）。vendored 树 = `training/utai_train/sovits_v2/`
+（models/data_utils/utils/modules 均 verbatim + 登记偏差；编排层最大化复用
+sovits 包单源件：slicer2/augment/cache/cluster/flist split/base 播种）。
+
+## 关卡0 —— 预处理对拍（A/C/S 三层，2026-07-17 全 PASS）
+
+```bat
+# ① 原版侧（RVC runtime；resample/flist/hubert_f0(dio) + ContentVec/aam-mel oracle）：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_v2_orig.py
+# ② 我方侧（training venv；loudnorm ON + trim top_db=20 + f0=dio 对齐上游）：
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_v2_run_ours.py
+# ③ C1（RVC runtime，resample 代码轴）+ 对拍：
+D:\MyDev\RVC\RVC20240604Nvidia\runtime\python.exe converter\verify\training\gate0_sovits_v2_c_resample.py
+training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_v2_compare.py
+```
+
+读数（33 切片，2026-07-17）：
+- **C1 resample 代码轴（同 librosa 0.9.1，top_db=20+loudnorm）：33/33 逐位 0**
+- **C2 ContentVec（oracle 16k 输入 → 我方 onnx vs 真 fairseq）：cos 1.00000000 / max 1.29e-4**
+- **C3 dio（同 44k 输入，我方 vendored vs 上游 .f0.npy）：坏帧 0 / 翻转 0（逐位）**
+- **C4 aam mel（同输入，librosa 0.9.1↔0.11 轴）：max 5.36e-7（帧数一致）**
+- A 层：44k wav min SNR 58.3 dB / soft cos ≥0.997868 / f0 双浊帧 2.2%·uv 翻转
+  1.2%（dio 对 -58dB 输入扰动的边界抖动 = 纯输入轴，代码轴由 C3 逐位定审）/
+  aam mel SNR ≥36.3 dB
+- S 层：filelist（val=2 / train+val=全部 ≥0.3s 合格片 / 无重叠）、检索矩阵
+  [4860,256] f32、config 语义对拍（spk/model/data 全等，train 白名单外全等）
+
+### 关卡0 钉死的数值轴（v2 新增，勿再踩）
+- **aam mel 的 stft pad_mode：上游 requirements 自己就平台分裂**——
+  requirements.txt 钉 librosa 0.8.1（stft 默认 'reflect'），requirements_win.txt
+  钉 0.9.2（0.9.0 起默认改 'constant'）⇒ 上游 Win/Linux 用户训练出的边缘帧 mel
+  本就不同。我方钉 **constant = Windows/0.9.x 血统**（与本项目「原版时代参照
+  环境」= RVC runtime librosa 0.9.1 一致，C4 实测 constant 对 oracle 5.4e-7、
+  reflect 边缘帧差 1.09）。差异仅边缘帧。
+- 上游 flist 对绝对 Windows 路径逐文件打中文警告 → cp932 控制台直接
+  UnicodeEncodeError（S40 坑单同族），orig 脚本必须先 reconfigure utf-8。
+- 上游 preprocess_hubert_f0/resample 用 multiprocessing Process/Pool →
+  runpy __main__ 无法 spawn unpickle → 串行内联补丁（4.1 关卡0 同款）。
+- 上游 test split（每歌手尾 2 片）我方并入 train（house 分裂策略；test.txt
+  训练根本不消费）——S 层按 ≥0.3s 合格片数对账。
+
+## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 上游原生 cpurun）
+
+```bat
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_prepare.py
+# 双侧同 torch 2.5.1（隔离代码轴）；上游 CUDA 被藏 → main() 自然落原生 cpurun：
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_run_orig.py
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_run_ours.py > D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours_steps.jsonl
+training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_compare.py
+```
+
+- 参照 = **上游原生 cpurun**（v2 比 4.1 好移植的关键：CPU 路径无 DDP/dist/
+  mp.spawn，零 CUDA shim）——skip_optimizer=True / epoch·step 强制 1/0 起；
+  我方 train.py 的 `skip_optimizer` gate 旗镜像该语义（产品路径 = 上游 GPU
+  run() 的 skip_optimizer=False，继承底模 optimizer 态）。
+- orig 侧 harness 补丁（零数值，登记在脚本头）：root logger 抢占 / torch.stft
+  return_complex=False→True+view_as_real / torch.istft 实数输入→view_as_complex
+  / DataLoader num_workers 双侧钉 0 / data_utils.load_wav 同数学 shim。
+- **RNG 流对拍点**：上游在 global_step=0 必然命中 eval_interval 边界 →
+  evaluate() 消耗 torch RNG（z_p randn + 相位 rand）——我方 fresh 步号从 0 起、
+  step-0 evaluate 照跑（仅跳过 G_0/D_0 覆写与 release 导出，存盘不耗 RNG）。
+- **上游懒生成 `.mel.npy` vs 我方 `.aam80.npy`**：prepare 把 .aam80.npy 复制成
+  同目录 .mel.npy 让上游命中缓存 → 两侧消费逐字节相同的 mel（mel 生成轴由
+  关卡0 C4 单独定审）。
+- 对拍九分量（v2 TB tag ↔ 我方 losses 键）：loss/total↔g_total、mel、adv、fm、
+  mel_ddsp、spec_ddsp、mel_am、kl_div、lf0；max_rel ≤ 1e-3 过线；对齐步数
+  <10 直接 FAIL（防空交集假 PASS）。
+- **读数（2026-07-17）：14/14 step 对齐 × 9 分量全过，max_rel = 4.93e-5
+  （loss/lf0 @ step13 —— 小量纲分量的相对放大，S38 的 lf0 2.4e-4 同现象；
+  其余分量更低；结构性移植错误 = O(0.1~1)，判定=轨迹一致）。**
+
+---
+
 # 浅扩散 train_diff 关卡（S39 起，gate0_diff_* / gate1_diff_*）
 
 原版参照：`D:\MyDev\so-vits-svc\so-vits-svc`（4.1-Stable @ 730930d，代码零改动）。

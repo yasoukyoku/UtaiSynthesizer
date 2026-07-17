@@ -240,6 +240,8 @@
     "backendSovits41Desc": "Quality · volume embedding · vec768 · 44.1k",
     "backendSovits40": "SoVITS 4.0",
     "backendSovits40Desc": "4.0-ecosystem compatible · vec256 · 44.1k",
+    "backendSovits40v2": "SoVITS 4.0-v2",
+    "backendSovits40v2Desc": "VISinger2 architecture · vec256 · 44.1k · experimental",
     "backendDiff": "Shallow diffusion",
     "backendDiffDesc": "SoVITS companion model · same name as the main model reuses its preprocessing caches · 44.1k",
     "backendVocoder": "Vocoder fine-tune",

@@ -35,7 +35,7 @@ def main():
     preprocess_trainset(DATASET, 48000, EXP, 3.7, ffmpeg, reporter, stop)
     extract_f0(
         EXP,
-        os.path.join(REPO, "data", "models", "aux", "rmvpe.pt"),
+        os.path.join(REPO, "data", "models", "auxiliary", "rmvpe.pt"),
         "cuda",
         True,  # original passes a truthy string -> always half on NVIDIA
         ffmpeg,
@@ -45,7 +45,7 @@ def main():
     extract_features(
         EXP,
         "v2",
-        os.path.join(REPO, "data", "models", "aux", "contentvec_768l12.onnx"),
+        os.path.join(REPO, "data", "models", "auxiliary", "contentvec_768l12.onnx"),
         reporter,
         stop,
     )

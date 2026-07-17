@@ -58,6 +58,10 @@ def main():
             from .sovits import pipeline
 
             pipeline.run(cfg, reporter, stop)
+        elif backend == "sovits_v2":
+            from .sovits_v2 import pipeline
+
+            pipeline.run(cfg, reporter, stop)
         elif backend == "sovits_diff":
             from .sovits import diff_pipeline
 

@@ -240,6 +240,8 @@
     "backendSovits41Desc": "质量 · 响度嵌入 · vec768 · 44.1k",
     "backendSovits40": "SoVITS 4.0",
     "backendSovits40Desc": "兼容 4.0 老生态 · vec256 · 44.1k",
+    "backendSovits40v2": "SoVITS 4.0-v2",
+    "backendSovits40v2Desc": "VISinger2 架构 · vec256 · 44.1k · 实验性",
     "backendDiff": "浅扩散",
     "backendDiffDesc": "SoVITS 附加模型 · 与主模型同名可复用预处理缓存 · 44.1k",
     "backendVocoder": "声码器微调",

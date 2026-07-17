@@ -169,7 +169,9 @@ fn ensure_candidate_converted(
     emit_phase(apph, candidate_id, "converting");
     let mtype = match backend {
         "rvc" => ModelType::Rvc,
-        "sovits" => ModelType::SoVits,
+        // sovits_v2 rides the same converter entry — convert.py routes by
+        // state_dict namespace and emits the 4.0-v2 sidecar automatically (S68)
+        "sovits" | "sovits_v2" => ModelType::SoVits,
         other => return Err(format!("AUDITION_BACKEND_UNSUPPORTED: {}", other)),
     };
     // sovits release snapshots auto-detect weights/config.json next to the ckpt;

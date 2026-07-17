@@ -9,6 +9,9 @@ fn parse_voice_type(model_type: &str) -> Option<ModelType> {
     match model_type {
         "rvc" => Some(ModelType::Rvc),
         "sovits" => Some(ModelType::SoVits),
+        // S68: training-page imports pass snapshot.backend verbatim; a 4.0-v2
+        // training product is a SoVITS resource (converter auto-detects v2)
+        "sovits_v2" => Some(ModelType::SoVits),
         // S40: the vocoder RESOURCE class (fine-tuned / imported NSF-HiFiGAN
         // vocoders under models/nsf_hifigan/); the aux default vocoder stays
         // aux-resolved and outside the registry

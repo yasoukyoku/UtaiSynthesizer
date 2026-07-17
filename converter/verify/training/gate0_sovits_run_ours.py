@@ -58,7 +58,7 @@ def main():
     extract_all(
         d44k,
         hps,
-        os.path.join(REPO, "data", "models", "aux", "contentvec_768l12.onnx"),
+        os.path.join(REPO, "data", "models", "auxiliary", "contentvec_768l12.onnx"),
         os.path.join(REPO, "data", "models", "training", "sovits", "rmvpe.pt"),
         "cpu",
         reporter,

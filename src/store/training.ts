@@ -115,11 +115,12 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
   );
 }
 
-/** ①c: which backends take a SINGER LIST (multi-speaker co-train) — SoVITS (α) + RVC (α′).
+/** ①c: which backends take a SINGER LIST (multi-speaker co-train) — SoVITS (α) + RVC (α′)
+ *  + SoVITS 4.0-v2 (S68, natively multi-speaker upstream).
  *  THE single source for the DataStep singer-list gating so the store + page never drift.
  *  Shallow-diffusion / vocoder stay flat-dataset (their loaders assume one speaker). */
 export function backendSupportsMultiSpeaker(backend: string): boolean {
-  return backend === "sovits" || backend === "rvc";
+  return backend === "sovits" || backend === "rvc" || backend === "sovits_v2";
 }
 
 /** THE single predicate for "step 2 (data) is satisfied" — shared by the root
@@ -187,7 +188,10 @@ export interface TrainingSnapshot {
 
 export interface TrainingFormConfig {
   modelName: string;
-  backend: "rvc" | "sovits" | "sovits_diff" | "vocoder";
+  /** sovits_v2 = SoVITS 4.0-v2 (VISinger2, S68) — its own backend/workspace
+   *  family; it SHARES the sovits* form fields below (same 44.1k step-cadenced
+   *  shape; v2-less switches — volEmbedding/fp16/allInMem — are hidden). */
+  backend: "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder";
   version: "v1" | "v2";
   sampleRate: "32k" | "40k" | "48k";
   totalEpoch: number;
@@ -530,7 +534,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
             ? { backend: "vocoder", version: "nsf_hifigan", sampleRate: "44k", augCopies: cfg.vocAugCopies }
             : cfg.backend === "sovits_diff"
               ? { backend: "sovits_diff", version: cfg.diffVersion, sampleRate: "44k", augCopies: 0 }
-              : { backend: "sovits", version: cfg.sovitsVersion, sampleRate: "44k", augCopies: cfg.sovitsAugCopies };
+              : cfg.backend === "sovits_v2"
+                ? { backend: "sovits_v2", version: "4.0-v2", sampleRate: "44k", augCopies: cfg.sovitsAugCopies }
+                : { backend: "sovits", version: cfg.sovitsVersion, sampleRate: "44k", augCopies: cfg.sovitsAugCopies };
       const assets = await invoke<RequiredAssetStatus[]>("training_required_assets", assetParams);
       const missing = assets.filter((a) => !a.exists);
       if (missing.length > 0) {
@@ -661,6 +667,23 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
                 interval_force_save: config.diffForceSaveSteps,
                 cache_all_data: config.diffCacheAllData,
                 fp16: config.diffFp16,
+              }
+          : config.backend === "sovits_v2"
+            ? {
+                ...base,
+                // S68 VISinger2: fixed version marker; shares the sovits* form
+                // fields. No vol_embedding/all_in_mem (v2 has neither); fp16
+                // structurally off (pure fp32 upstream — Rust normalizes too)
+                version: "4.0-v2",
+                sample_rate: "44k",
+                total_epoch: config.sovitsTotalEpoch,
+                batch_size: config.sovitsBatchSize,
+                save_every_steps: config.sovitsSaveEverySteps,
+                keep_ckpts: config.sovitsKeepCkpts,
+                fp16: false,
+                loudnorm: config.sovitsLoudnorm,
+                kmeans: config.sovitsKmeans,
+                aug_copies: config.sovitsAugCopies,
               }
             : {
               ...base,

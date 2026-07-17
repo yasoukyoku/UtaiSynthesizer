@@ -786,6 +786,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       assetAux: { zh: "推理核心模型包", en: "Core inference models", ja: "推論コアモデル" },
       assetRvc: { zh: "RVC 训练底模", en: "RVC training base models", ja: "RVC 学習ベースモデル" },
       assetSovits: { zh: "SoVITS 训练底模", en: "SoVITS training base models", ja: "SoVITS 学習ベースモデル" },
+      assetSovitsV2: { zh: "SoVITS 4.0-v2 训练底模", en: "SoVITS 4.0-v2 training base models", ja: "SoVITS 4.0-v2 学習ベースモデル" },
       assetInstalled: { zh: "已安装", en: "Installed", ja: "インストール済み" },
       assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
       assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
@@ -1272,7 +1273,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
         <section className="settings-section" style={{ marginTop: 16 }}>
           <h3 className="settings-section-title">{L("assetTitle")}</h3>
           {assetPacks.map((p) => {
-            const label = p.id === "aux-inference" ? L("assetAux") : p.id === "training-rvc" ? L("assetRvc") : L("assetSovits");
+            const label =
+              p.id === "aux-inference"
+                ? L("assetAux")
+                : p.id === "training-rvc"
+                  ? L("assetRvc")
+                  : p.id === "training-sovits-v2"
+                    ? L("assetSovitsV2")
+                    : L("assetSovits");
             // p.downloading = backend truth (survives a panel remount before the next chunk event).
             const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
             const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);

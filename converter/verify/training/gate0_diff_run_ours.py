@@ -42,7 +42,7 @@ def main():
     extract_all(
         D44K_ROOT,
         hps,
-        os.path.join(UTAI, "data", "models", "aux", "contentvec_768l12.onnx"),
+        os.path.join(UTAI, "data", "models", "auxiliary", "contentvec_768l12.onnx"),
         os.path.join(UTAI, "data", "models", "training", "sovits", "rmvpe.pt"),
         "cpu",
         _Reporter(),

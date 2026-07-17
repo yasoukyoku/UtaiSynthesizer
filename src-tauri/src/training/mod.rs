@@ -96,9 +96,9 @@ pub fn resolve_training_assets(
     let aux_dir = data_dir.join("models").join(crate::models::AUX_DIR_NAME);
     let sovits_train_dir = data_dir.join("models").join("training").join("sovits");
     // one-ContentVec-space principle: the training extractor must be the same
-    // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 = 256l9,
+    // aux graph inference uses — rvc v1 / sovits(_diff) 4.0 / sovits_v2 = 256l9,
     // rvc v2 / sovits(_diff) 4.1 = 768l12
-    let use_256 = version == "v1" || version == "4.0";
+    let use_256 = version == "v1" || version == "4.0" || version == "4.0-v2";
     let contentvec = aux_dir.join(if use_256 {
         "contentvec_256l9.onnx"
     } else {
@@ -111,7 +111,8 @@ pub fn resolve_training_assets(
     // parselmouth-blooded and measurably blind to PSOLA glitches, so the
     // S41 aug quality gate re-analyzes the audio with the sovits RMVPE
     // (gate_aug_semantic part 4 keeps the blind spot on record)
-    let rmvpe_pt = if backend_family(backend) == "sovits" || backend == "vocoder" {
+    // sovits_v2 is its own workspace family but the same yxlllc rmvpe lineage
+    let rmvpe_pt = if matches!(backend_family(backend), "sovits" | "sovits_v2") || backend == "vocoder" {
         sovits_train_dir.join("rmvpe.pt")
     } else {
         aux_dir.join("rmvpe.pt")
@@ -140,6 +141,16 @@ pub fn resolve_training_assets(
         "sovits" => {
             let pretrain_dir =
                 sovits_train_dir.join(if version == "4.0" { "vec256" } else { "vec768" });
+            pretrain_g = pretrain_dir.join("G_0.pth");
+            pretrain_d = pretrain_dir.join("D_0.pth");
+            required.push(("pretrained base G".into(), pretrain_g.clone()));
+            required.push(("pretrained base D".into(), pretrain_d.clone()));
+        }
+        "sovits_v2" => {
+            // 4.0-v2 (VISinger2): the official base pair from the 4.0-v2
+            // branch, its own asset dir (the ckpt layout is NOT interchangeable
+            // with the 4.x vec256/vec768 bases)
+            let pretrain_dir = data_dir.join("models").join("training").join("sovits_v2");
             pretrain_g = pretrain_dir.join("G_0.pth");
             pretrain_d = pretrain_dir.join("D_0.pth");
             required.push(("pretrained base G".into(), pretrain_g.clone()));
@@ -233,9 +244,9 @@ pub fn resolve_training_assets(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
-    pub backend: String, // "rvc" | "sovits" | "sovits_diff" | "vocoder"
-    /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0" — vocoder: fixed
-    /// "nsf_hifigan" (a manifest marker, not a user choice — 一期单格式类)
+    pub backend: String, // "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder"
+    /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0" — sovits_v2: fixed
+    /// "4.0-v2" — vocoder: fixed "nsf_hifigan" (manifest markers, 一期单格式类)
     pub version: String,
     /// rvc: "32k" | "40k" | "48k" — sovits/vocoder: fixed "44k"
     pub sample_rate: String,
@@ -758,6 +769,25 @@ impl TrainingManager {
                     return Err(UtaiError::Training("TRAINING_TOTAL_STEPS_ZERO".into()));
                 }
             }
+            "sovits_v2" => {
+                // S68: VISinger2 backend — its own family/workspace, one fixed
+                // version string ("4.0-v2" is what the exported sidecar carries)
+                if req.version != "4.0-v2" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_BAD_SOVITS_VERSION: {}",
+                        req.version
+                    )));
+                }
+                if req.sample_rate != "44k" {
+                    return Err(UtaiError::Training(format!(
+                        "TRAINING_SR_FIXED_44K: {}",
+                        req.sample_rate
+                    )));
+                }
+                if req.save_every_steps == 0 {
+                    return Err(UtaiError::Training("TRAINING_SAVE_INTERVAL_ZERO".into()));
+                }
+            }
             "vocoder" => {
                 // version is a manifest marker (一期单格式类), not a user choice
                 if req.version != "nsf_hifigan" {
@@ -805,14 +835,23 @@ impl TrainingManager {
         // 1 group) falls through to the byte-identical legacy path.
         let is_multi = req.speakers.len() > 1;
         if is_multi {
-            // ①c: multi-speaker co-train = SoVITS (α) + RVC (α′). Shallow-diffusion / vocoder
+            // ①c: multi-speaker co-train = SoVITS (α) + RVC (α′) + SoVITS 4.0-v2
+            // (S68, natively multi-speaker upstream). Shallow-diffusion / vocoder
             // stay single-speaker (their loaders assume one speaker).
-            if req.backend != "sovits" && req.backend != "rvc" {
+            if !matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") {
                 return Err(UtaiError::Training("TRAINING_MULTI_BACKEND".into()));
             }
             // RVC emb_g is a FIXED 109-row table (spk_embed_dim in the config templates) — cap
             // the co-train count so a huge set fails loud here, not as an out-of-range train id.
             if req.backend == "rvc" && req.speakers.len() > 109 {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_SPEAKER_LIMIT: {}",
+                    req.speakers.len()
+                )));
+            }
+            // sovits_v2 keeps the base model's 200-row emb_spk table (n_speakers
+            // stays the template 200, upstream v2 semantics) — same loud cap.
+            if req.backend == "sovits_v2" && req.speakers.len() > 200 {
                 return Err(UtaiError::Training(format!(
                     "TRAINING_SPEAKER_LIMIT: {}",
                     req.speakers.len()
@@ -1029,10 +1068,11 @@ impl TrainingManager {
                 }
                 // ①c: n_speakers + the ordered speaker set are baked into the emb_g
                 // rows — resuming with a different count / order / set would silently
-                // mis-assign every speaker's timbre. Immutable for BOTH SoVITS (α) and
-                // RVC (α′). (Old single-speaker manifests have no n_speakers key -> 1,
-                // which matches a single-speaker resume = no false rejection.)
-                if matches!(req.backend.as_str(), "sovits" | "rvc") {
+                // mis-assign every speaker's timbre. Immutable for SoVITS (α), RVC
+                // (α′) and SoVITS 4.0-v2 (S68 emb_spk). (Old single-speaker manifests
+                // have no n_speakers key -> 1, which matches a single-speaker resume
+                // = no false rejection.)
+                if matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") {
                     let old_n = old["n_speakers"].as_u64().unwrap_or(1);
                     let cur_n = if req.speakers.len() > 1 {
                         req.speakers.len() as u64
@@ -1155,9 +1195,9 @@ impl TrainingManager {
             manifest["loudnorm"] = serde_json::json!(req.loudnorm);
         }
         // ①c: freeze the speaker count + ordered slug set (resume-immutable, guarded above)
-        // for BOTH SoVITS (α) and RVC (α′). Only written for a genuine co-training (>1) so a
-        // single-speaker manifest stays byte-identical to pre-①c.
-        if matches!(req.backend.as_str(), "sovits" | "rvc") && req.speakers.len() > 1 {
+        // for SoVITS (α), RVC (α′) and SoVITS 4.0-v2 (S68). Only written for a genuine
+        // co-training (>1) so a single-speaker manifest stays byte-identical to pre-①c.
+        if matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") && req.speakers.len() > 1 {
             let assigned = assign_speaker_slugs(&req.speakers);
             let slugs: Vec<String> = assigned.iter().map(|(_, s)| s.clone()).collect();
             let names: Vec<String> = assigned.iter().map(|(n, _)| n.clone()).collect();
@@ -1515,7 +1555,9 @@ fn run_worker(
         "save_every_weights": req.save_every_weights,
         "keep_only_latest": req.keep_only_latest,
         "cache_gpu": req.cache_gpu,
-        "fp16": req.fp16,
+        // sovits_v2 is pure fp32 (upstream VISinger2 has no amp) — the switch
+        // is hidden in the UI and normalized off here, belt and suspenders
+        "fp16": if req.backend == "sovits_v2" { false } else { req.fp16 },
         "spk_id": req.spk_id,
         // sovits-only knobs (the rvc pipeline ignores them); vol_embedding /
         // loudnorm are the EFFECTIVE values (manifest-inherited for diff runs)

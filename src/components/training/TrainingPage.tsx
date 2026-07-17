@@ -47,6 +47,7 @@ const STAGE_ORDERS: Record<string, string[]> = {
   // (the aug quality gate must finish before the filelists are written)
   rvc: ["import", "slice", "augment", "f0", "feature", "aug_check", "index", "filelist", "train_prep"],
   sovits: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
+  sovits_v2: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
   sovits_diff: ["import", "slice", "augment", "extract", "aug_check", "filelist", "diff_prep", "train_prep"],
   vocoder: ["import", "slice", "augment", "process", "aug_check", "filelist", "train_prep"],
 };
@@ -749,6 +750,13 @@ function TargetStep() {
       desc: t("training.backendSovits40Desc"),
     },
     {
+      key: "sovits40v2",
+      active: config.backend === "sovits_v2",
+      pick: () => updateConfig({ backend: "sovits_v2" as const }),
+      name: t("training.backendSovits40v2"),
+      desc: t("training.backendSovits40v2Desc"),
+    },
+    {
       key: "sovits_diff",
       active: config.backend === "sovits_diff",
       pick: () => updateConfig({ backend: "sovits_diff" as const }),
@@ -950,7 +958,10 @@ function ParamsStep() {
     })();
   }, []);
 
-  const sovits = config.backend === "sovits";
+  // sovits-family: 4.1/4.0 and 4.0-v2 share the same param form; v2-only
+  // differences (no vol_embedding / fp16 / all_in_mem) are gated inline below
+  const sovits = config.backend === "sovits" || config.backend === "sovits_v2";
+  const sovitsV2 = config.backend === "sovits_v2";
   const diff = config.backend === "sovits_diff";
   const voc = config.backend === "vocoder";
 
@@ -1319,7 +1330,7 @@ function ParamsStep() {
           </div>
         ) : (
           <div className="training-form-grid">
-            {config.sovitsVersion === "4.1" && (
+            {!sovitsV2 && config.sovitsVersion === "4.1" && (
               <label className="training-check-row">
                 <input
                   type="checkbox"
@@ -1345,22 +1356,28 @@ function ParamsStep() {
               />
               {t("training.loudnorm")}
             </label>
-            <label className="training-check-row">
-              <input
-                type="checkbox"
-                checked={config.sovitsFp16}
-                onChange={(e) => updateConfig({ sovitsFp16: e.target.checked })}
-              />
-              {t("training.fp16")}
-            </label>
-            <label className="training-check-row">
-              <input
-                type="checkbox"
-                checked={config.sovitsAllInMem}
-                onChange={(e) => updateConfig({ sovitsAllInMem: e.target.checked })}
-              />
-              {t("training.allInMem")}
-            </label>
+            {/* v2 (VISinger2) is pure fp32 upstream and its loader has no
+                all-in-mem mode — hidden per the "不能选的隐藏" rule */}
+            {!sovitsV2 && (
+              <label className="training-check-row">
+                <input
+                  type="checkbox"
+                  checked={config.sovitsFp16}
+                  onChange={(e) => updateConfig({ sovitsFp16: e.target.checked })}
+                />
+                {t("training.fp16")}
+              </label>
+            )}
+            {!sovitsV2 && (
+              <label className="training-check-row">
+                <input
+                  type="checkbox"
+                  checked={config.sovitsAllInMem}
+                  onChange={(e) => updateConfig({ sovitsAllInMem: e.target.checked })}
+                />
+                {t("training.allInMem")}
+              </label>
+            )}
             <div className="training-form-row">
               <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
               <NumberField
@@ -1564,7 +1581,7 @@ function RunStep() {
   const rangeRunKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
   useEffect(() => {
     if (!finished || snapshot.ckpts.length === 0) return;
-    if (snapshot.backend !== "rvc" && snapshot.backend !== "sovits") return;
+    if (!["rvc", "sovits", "sovits_v2"].includes(snapshot.backend)) return;
     if (candRangeRunRef.current === rangeRunKey) return;
     candRangeRunRef.current = rangeRunKey;
     const ckpts = snapshot.ckpts;
@@ -1601,7 +1618,7 @@ function RunStep() {
           try {
             const r = await runCandidateRangeTest(
               snapshot.workspace,
-              snapshot.backend as "rvc" | "sovits",
+              snapshot.backend as "rvc" | "sovits" | "sovits_v2",
               c.path,
               c.path,
             );
@@ -1947,7 +1964,9 @@ function RunStep() {
         ? config.version
         : config.backend === "vocoder"
           ? "nsf_hifigan"
-          : config.sovitsVersion;
+          : config.backend === "sovits_v2"
+            ? "4.0-v2"
+            : config.sovitsVersion;
     const selectedSr = config.backend === "rvc" ? config.sampleRate : "44k";
     // the wipe would also destroy any diffusion training progress living in
     // this workspace — the user must see that before choosing 重训
@@ -2320,7 +2339,8 @@ function RunStep() {
             </>
           ) : (
             <>
-              {config.modelName || "—"} · SoVITS {config.sovitsVersion} · 44.1k ·{" "}
+              {config.modelName || "—"} · SoVITS{" "}
+              {config.backend === "sovits_v2" ? "4.0-v2" : config.sovitsVersion} · 44.1k ·{" "}
               {t("training.totalEpoch")} {config.sovitsTotalEpoch} · batch{" "}
               {config.sovitsBatchSize}
             </>

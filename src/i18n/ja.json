@@ -240,6 +240,8 @@
     "backendSovits41Desc": "高品質 · 音量埋め込み · vec768 · 44.1k",
     "backendSovits40": "SoVITS 4.0",
     "backendSovits40Desc": "4.0 エコシステム互換 · vec256 · 44.1k",
+    "backendSovits40v2": "SoVITS 4.0-v2",
+    "backendSovits40v2Desc": "VISinger2 アーキテクチャ · vec256 · 44.1k · 実験的",
     "backendDiff": "浅い拡散",
     "backendDiffDesc": "SoVITS 追加モデル · メインモデルと同名なら前処理キャッシュを再利用 · 44.1k",
     "backendVocoder": "ボコーダー微調整",

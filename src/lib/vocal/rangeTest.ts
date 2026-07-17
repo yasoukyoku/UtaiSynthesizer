@@ -314,7 +314,7 @@ export async function runRangeTest(
  *  Throws on failure (caller decides whether to toast or skip silently). */
 export async function runCandidateRangeTest(
   workspace: string,
-  backend: "rvc" | "sovits",
+  backend: "rvc" | "sovits" | "sovits_v2",
   ckptPath: string,
   candidateId: string,
 ): Promise<{ usable: [number, number]; comfort: [number, number] } | null> {

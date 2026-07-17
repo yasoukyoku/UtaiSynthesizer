@@ -68,11 +68,15 @@ def resolve_speakers(cfg):
     }]
 
 
-def _split_speaker(dataset_44k_dir, spk_slug, seed):
+def _split_speaker(dataset_44k_dir, spk_slug, seed, min_dur=0.3):
     """One speaker's slice pool -> (train, val) with the exact pre-①c seeded
     split + S41 aug protocol. Extracted verbatim from build_filelists so the
     single-speaker path stays byte-identical while multi-speaker reuses it per
-    speaker (id ordering / val-per-speaker owned by the caller)."""
+    speaker (id ordering / val-per-speaker owned by the caller).
+    min_dur: 0.3 = the upstream floor (default, byte-identical for 4.x);
+    sovits_v2 passes 0.35 — its SingDataset drops mel<30-frame items
+    (~0.337s) at LOAD time, so a [0.300, 0.337) slice passing the 0.3 floor
+    could leave an all-None (empty) batch that crashes the collate."""
     spk_dir = os.path.join(dataset_44k_dir, spk_slug)
     wavs = []
     augs = []
@@ -82,7 +86,7 @@ def _split_speaker(dataset_44k_dir, spk_slug, seed):
         if file_name.startswith("."):
             continue
         file_path = _p(os.path.join(spk_dir, file_name))
-        if _wav_duration(file_path) < 0.3:
+        if _wav_duration(file_path) < min_dur:
             logger.info("Skip too short audio: %s", file_path)
             continue
         (augs if is_aug_name(file_name) else wavs).append(file_path)
@@ -110,7 +114,7 @@ def _split_speaker(dataset_44k_dir, spk_slug, seed):
     return train, val
 
 
-def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None):
+def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None, min_dur=0.3):
     """Slice collection + seeded train/val split + filelist write — the shared
     half of build_flist_and_config (the diffusion pipeline rebuilds filelists
     every run but must NOT rewrite an existing main config.json, so this half
@@ -132,7 +136,7 @@ def build_filelists(exp_dir, spk, dataset_44k_dir, seed, reporter, speakers=None
     all_train = []
     all_val = []
     for sp in speakers:
-        train, val = _split_speaker(dataset_44k_dir, sp["slug"], seed)
+        train, val = _split_speaker(dataset_44k_dir, sp["slug"], seed, min_dur=min_dur)
         all_train += train
         all_val += val
 

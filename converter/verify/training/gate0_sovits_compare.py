@@ -36,7 +36,7 @@ ORIG_44K = os.path.join(ORIG, "dataset44k", "gate")
 ORACLE = os.path.join(ORIG, "oracle")
 OURS = os.path.join(TESTING, "sovits_ours")
 OURS_44K = os.path.join(OURS, "dataset_44k", "gate")
-AUX = os.path.join(REPO, "data", "models", "aux")
+AUX = os.path.join(REPO, "data", "models", "auxiliary")
 
 failures = []
 

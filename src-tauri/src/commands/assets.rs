@@ -87,10 +87,20 @@ const SOVITS_TRAIN_FILES: &[AssetFile] = &[
     AssetFile { rel: "training/sovits/diffusion/vec768/model_0.pt", size: 220_890_164, sha256: "d8b7cc5a94a57f7e5772c3f5f48fd458684235b8d98f38e0feff134fafad93dd" },
 ];
 
+// S68: SoVITS 4.0-v2 (VISinger2) base pair — its own pack (~1GB; the ckpts are
+// not interchangeable with the 4.x vec256/vec768 bases, and 4.x-only users
+// shouldn't pay the download). rmvpe.pt rides the training-sovits pack (same
+// yxlllc lineage file, resolve_training_assets points v2 at it).
+const SOVITS_V2_TRAIN_FILES: &[AssetFile] = &[
+    AssetFile { rel: "training/sovits_v2/G_0.pth", size: 424_574_162, sha256: "8bb021019d65aef34755ac4006d27d9eda4244faabd63d546fa069902e668f27" },
+    AssetFile { rel: "training/sovits_v2/D_0.pth", size: 561_070_439, sha256: "028b7db89f184327cfa1c8ee701887e1cb513b9eaa21b4b573bbbd6f10ad38de" },
+];
+
 const PACKS: &[AssetPack] = &[
     AssetPack { id: "aux-inference", files: AUX_FILES },
     AssetPack { id: "training-rvc", files: RVC_TRAIN_FILES },
     AssetPack { id: "training-sovits", files: SOVITS_TRAIN_FILES },
+    AssetPack { id: "training-sovits-v2", files: SOVITS_V2_TRAIN_FILES },
 ];
 
 /// Which asset pack distributes the file at `rel` (forward-slash path under `<data>/models/`),

@@ -40,9 +40,11 @@ def _decode(path, ffmpeg):
         return load_audio(path, TARGET_SR, ffmpeg), TARGET_SR
 
 
-def _resample_chain(slice_wav, sr, loudnorm):
-    """resample.py process() per-file math, verbatim order."""
-    wav, _ = librosa.effects.trim(slice_wav, top_db=40)
+def _resample_chain(slice_wav, sr, loudnorm, trim_top_db=40):
+    """resample.py process() per-file math, verbatim order. trim_top_db: 40 =
+    the 4.x resample.py value (default, byte-identical to pre-v2 callers);
+    the 4.0-v2 branch's resample.py uses 20 (its pipeline passes it)."""
+    wav, _ = librosa.effects.trim(slice_wav, top_db=trim_top_db)
     if wav.size == 0:
         return None
     peak = np.abs(wav).max()
@@ -58,7 +60,7 @@ def _resample_chain(slice_wav, sr, loudnorm):
     return (wav * np.iinfo(np.int16).max).astype(np.int16)
 
 
-def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, stop):
+def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, stop, trim_top_db=40):
     """dataset_dir (imported originals) -> out_spk_dir/<idx0>_<idx1>.wav @44100 i16.
     Existing *.wav in out_spk_dir are rebuilt every run (slicing is deterministic;
     stale slices from a previous dataset would pollute the filelists) — companion
@@ -83,7 +85,7 @@ def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, sto
             wav, sr = _decode(path, ffmpeg)
             slicer = Slicer(sr=sr)  # openpvi defaults: -40dB/5000ms/300ms/20ms/5000ms
             for idx1, chunk in enumerate(slicer.slice(wav)):
-                out = _resample_chain(chunk, sr, loudnorm)
+                out = _resample_chain(chunk, sr, loudnorm, trim_top_db)
                 if out is None:
                     continue
                 wavfile.write(
