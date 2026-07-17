@@ -391,9 +391,11 @@
 
 /* -------- target step -------- */
 .training-backend-cards {
-  display: flex;
-  flex-wrap: wrap; /* 4+ cards (S39 浅扩散, later 声码器) flow onto extra rows
-                      instead of clipping at the panel edge */
+  display: grid;
+  /* S68: 6 cards — a fixed 3-column grid fills the 860px step column
+     edge-to-edge as a clean 3+3 block (the old flex-wrap sized cards by
+     their text, leaving ragged part-empty rows once the count grew) */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-lg);
   margin-bottom: var(--space-lg);
 }
@@ -404,8 +406,6 @@
   gap: var(--space-sm);
   align-items: flex-start;
   padding: var(--space-xl);
-  min-width: 220px;
-  max-width: 320px;
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   cursor: pointer;
