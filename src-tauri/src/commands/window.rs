@@ -14,6 +14,8 @@ use crate::AppState;
 #[tauri::command]
 pub fn quit_app(app: AppHandle, state: State<'_, Arc<AppState>>) {
     let _ = state.training.force_stop();
+    // Deliberate exit: drop the unclean-exit sentinel + flush the log worker (S68b).
+    crate::crashlog::mark_clean_exit();
     app.exit(0);
 }
 

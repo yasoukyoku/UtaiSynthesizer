@@ -840,6 +840,13 @@
   font-size: var(--font-size-sm);
 }
 
+/* S68b: shown in the GPU row when no trainable GPU was detected — the run WILL use
+   CPU; this replaced the old "hide all device UI" silent-CPU behavior */
+.training-cpu-note {
+  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+}
+
 /* ─── S41 audition rows (试听多选保留) ─────────────────────────────────── */
 .training-ckpt-row.missing {
   opacity: 0.45;

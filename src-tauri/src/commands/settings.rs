@@ -10,9 +10,17 @@ pub struct HardwareInfo {
     pub cuda_available: bool,
     pub directml_available: bool,
     pub current_device: String,
+    /// The configured GPU ordinal of the current device preference (0 for cpu/auto).
+    /// S68b: feeds the Settings "preferred GPU" picker.
+    pub current_device_id: u32,
+    /// Which ORT build this PROCESS loaded ("CUDA" | "DirectML" | dev/system labels).
+    /// S68b: lets the UI say "restart required" when the preference implies the OTHER
+    /// build — the community user read the current-build fact as a hardware verdict.
+    pub ort_build: String,
     /// Per-adapter vendor classification (S42, for runtime-pack recommendation).
-    /// Vendor comes from PNPDeviceID's VEN_xxxx — NEVER from WMI AdapterRAM (a lying
-    /// uint32: this dev box reports the 3080 Ti as 4 GB) and never from name heuristics.
+    /// S68b: DXGI-first (gpu.rs), WMI fallback. Vendor comes from the PCI vendor id —
+    /// NEVER from WMI AdapterRAM (a lying uint32: this dev box reports the 3080 Ti as
+    /// 4 GB) and never from name heuristics.
     pub gpus: Vec<GpuAdapter>,
     /// Which runtime-pack variant this machine should default to
     /// ("nv-cu130" | "amd" | "xpu" | "cpu") — the user can always override.
@@ -77,8 +85,19 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         DeviceConfig::Cuda { .. } => "cuda".to_string(),
         DeviceConfig::Auto => "auto".to_string(),
     };
+    let current_device_id = match &current {
+        DeviceConfig::DirectMl { device_id } | DeviceConfig::Cuda { device_id } => *device_id,
+        _ => 0,
+    };
 
     let gpus = query_gpu_adapters();
+    // S68b: nvidia-smi is queried ONCE here and its result is both the training list
+    // (UUID identity) and independent NVIDIA evidence. On the community box the WMI
+    // probe failed entirely ("Unknown GPU") and every vendor-gated capability collapsed
+    // with it — while nvidia-smi (and CUDA itself) worked the whole time. Probes must
+    // corroborate, never gate each other.
+    let smi_gpus = nvidia_gpu_uuids();
+    let has_nvidia = gpus.iter().any(|g| g.vendor == "nvidia") || !smi_gpus.is_empty();
     let gpu_name = if gpus.is_empty() {
         "Unknown GPU".to_string()
     } else {
@@ -86,16 +105,20 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
     };
     // S67c: one hardware-inventory line per process, on the first query (the frontend
     // startup check always issues one). Community crash logs never said what GPU/RAM the
-    // box had — this closes that blind spot. NOTE: WMI adapter order is NOT the DirectML
-    // device order (S67 CUDA-ordinal lesson) — this line is an inventory, not a record of
-    // which adapter DML picked.
+    // box had — this closes that blind spot. S68b: the DXGI form's indices ARE the
+    // DirectML device_id space (gpu.rs ordering contract) and carry dedicated VRAM;
+    // NVIDIA driver version closes the other crash-forensics blind spot.
     {
         static HW_LOGGED: std::sync::Once = std::sync::Once::new();
         HW_LOGGED.call_once(|| {
             let (total_mb, avail_mb) = crate::inference::engine::system_memory_mb();
+            let inventory = crate::gpu::inventory_line().unwrap_or_else(|| gpu_name.clone());
+            let driver = nvidia_driver_version()
+                .map(|v| format!("; NVIDIA driver {v}"))
+                .unwrap_or_default();
             tracing::info!(
-                "Hardware: GPUs [{}]; physical RAM {} MB (available commit {} MB)",
-                gpu_name, total_mb, avail_mb
+                "Hardware: GPUs [{}]{}; physical RAM {} MB (available commit {} MB)",
+                inventory, driver, total_mb, avail_mb
             );
         });
     }
@@ -103,16 +126,14 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         gpu_name,
         // Vendor-guarded (S64c audit): the self-downloaded runtime/cuda DLLs satisfy the PATH probe
         // even on a box whose NVIDIA card is gone (migrated data dir) — the badge must track the GPU.
-        cuda_available: gpus.iter().any(|g| g.vendor == "nvidia") && is_cuda_available(),
+        cuda_available: has_nvidia && is_cuda_available(),
         directml_available: cfg!(windows),
         current_device: current_str,
-        recommended_variant: recommend_variant(&gpus).to_string(),
-        nvidia_vram_mb: if gpus.iter().any(|g| g.vendor == "nvidia") {
-            nvidia_total_vram_mb()
-        } else {
-            None
-        },
-        training_gpus: training_gpu_list(&gpus),
+        current_device_id,
+        ort_build: crate::ORT_LOADED_BUILD.get().cloned().unwrap_or_else(|| "?".to_string()),
+        recommended_variant: recommend_variant(&gpus, has_nvidia).to_string(),
+        nvidia_vram_mb: if has_nvidia { nvidia_total_vram_mb() } else { None },
+        training_gpus: training_gpu_list(&gpus, smi_gpus),
         gpus,
     })
 }
@@ -126,7 +147,15 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
 /// AMD/HIP, Intel/ZE_AFFINITY_MASK) keep vendor-relative indices — exact for the
 /// dominant single-card case, and the sidecar's require_wanted_accelerator guard turns
 /// any remaining mismatch into a loud TRAIN_GPU_UNAVAILABLE instead of silent CPU.
-fn training_gpu_list(gpus: &[GpuAdapter]) -> Vec<TrainingGpu> {
+///
+/// S68b: nvidia-smi's result comes IN (queried once by get_hardware_info) and wins
+/// UNCONDITIONALLY — the old code only consulted it after WMI had already classified an
+/// adapter as NVIDIA, so the community box whose WMI probe failed outright never asked
+/// the perfectly-working nvidia-smi and silently forced CPU training on an RTX 3080.
+fn training_gpu_list(gpus: &[GpuAdapter], smi: Vec<TrainingGpu>) -> Vec<TrainingGpu> {
+    if !smi.is_empty() {
+        return smi;
+    }
     let vendor_indexed = |vendor: &str| -> Vec<TrainingGpu> {
         gpus.iter()
             .filter(|g| g.vendor == vendor)
@@ -135,10 +164,6 @@ fn training_gpu_list(gpus: &[GpuAdapter]) -> Vec<TrainingGpu> {
             .collect()
     };
     if gpus.iter().any(|g| g.vendor == "nvidia") {
-        let smi = nvidia_gpu_uuids();
-        if !smi.is_empty() {
-            return smi;
-        }
         return vendor_indexed("nvidia");
     }
     if gpus.iter().any(|g| g.vendor == "amd") {
@@ -189,8 +214,10 @@ fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
 /// only fully-supported training path); AMD over Intel. iGPU-vs-dGPU is deliberately
 /// NOT guessed — the pick is only a DEFAULT and the UI lets the user override
 /// (Pinokio's silent wrong-variant installs are the anti-pattern we're avoiding).
-fn recommend_variant(gpus: &[GpuAdapter]) -> &'static str {
-    if gpus.iter().any(|g| g.vendor == "nvidia") {
+/// `has_nvidia` = adapter-vendor OR nvidia-smi evidence (S68b — one dead probe must
+/// not funnel an RTX box into the CPU pack).
+fn recommend_variant(gpus: &[GpuAdapter], has_nvidia: bool) -> &'static str {
+    if has_nvidia {
         "nv-cu130"
     } else if gpus.iter().any(|g| g.vendor == "amd") {
         "amd"
@@ -201,10 +228,26 @@ fn recommend_variant(gpus: &[GpuAdapter]) -> &'static str {
     }
 }
 
-/// Enumerate video adapters with PCI vendor ids via WMI. One query serves both the
-/// display string and the vendor classification (single source — replaces the old
-/// name-only `detect_gpu_name`).
+/// Enumerate video adapters with PCI vendor ids. S68b: DXGI first (subprocess-free,
+/// healthy wherever a display stack exists — the very thing DirectML runs on), WMI as
+/// the fallback for exotic DXGI failures. Software adapters (Basic Render Driver) are
+/// excluded for parity with the old WMI inventory (they are not Win32_VideoControllers).
 pub(crate) fn query_gpu_adapters() -> Vec<GpuAdapter> {
+    let dxgi: Vec<GpuAdapter> = crate::gpu::dxgi_adapters()
+        .into_iter()
+        .filter(|a| !a.software)
+        .map(|a| GpuAdapter { name: a.name, vendor: a.vendor.to_string() })
+        .collect();
+    if !dxgi.is_empty() {
+        return dxgi;
+    }
+    query_gpu_adapters_wmi()
+}
+
+/// The pre-S68b WMI/PowerShell probe, kept verbatim as the fallback. Known field failure
+/// (community RTX 3080 box): the whole probe returns empty — powershell.exe unresolvable
+/// or a broken WMI repository; the exit status lands as empty stdout → JSON parse fails.
+fn query_gpu_adapters_wmi() -> Vec<GpuAdapter> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -306,6 +349,29 @@ pub(crate) fn nvidia_total_vram_mb() -> Option<u64> {
     None
 }
 
+/// NVIDIA driver version via nvidia-smi ("566.14"), None = undetermined. S68b forensics:
+/// the 20%-crash line of inquiry landed on the driver layer and no community log ever
+/// recorded the driver version — logged once in the hardware-inventory line.
+#[cfg(windows)]
+fn nvidia_driver_version() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=driver_version", "--format=csv,noheader"])
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().next().map(|l| l.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+fn nvidia_driver_version() -> Option<String> {
+    None
+}
+
 /// Whether THIS machine's hardware can run a given runtime-pack VARIANT — the gate for
 /// which download entries the settings UI offers (only expose packs the user can actually
 /// use; a fresh box always sees CPU). Vendor comes from PNPDeviceID. The NVIDIA pack
@@ -315,11 +381,14 @@ pub(crate) fn nvidia_total_vram_mb() -> Option<u64> {
 /// is the true capability gate, and robust RDNA/Arc arch detection needs tooling we don't
 /// bundle). An UNDETERMINED NVIDIA compute cap (nvidia-smi absent) fails OPEN so a valid
 /// RTX user is never hidden. NB: LOCAL-FILE install is deliberately NOT gated by this.
+/// S68b: a SUCCESSFUL nvidia-smi compute-cap read is itself NVIDIA evidence — it must be
+/// able to rescue a dead adapter probe (the community box's WMI failure used to hide the
+/// NVIDIA pack even though nvidia-smi answered perfectly).
 pub(crate) fn variant_supported(variant: &str, gpus: &[GpuAdapter], nv_cc: Option<f32>) -> bool {
     let has = |v: &str| gpus.iter().any(|g| g.vendor == v);
     match variant {
         "cpu" => true,
-        "nv-cu130" => has("nvidia") && nv_cc.map_or(true, |cc| cc >= 7.5),
+        "nv-cu130" => (has("nvidia") || nv_cc.is_some()) && nv_cc.map_or(true, |cc| cc >= 7.5),
         "amd" => has("amd"),
         "xpu" => has("intel"),
         _ => false,
@@ -330,10 +399,16 @@ pub(crate) fn variant_supported(variant: &str, gpus: &[GpuAdapter], nv_cc: Optio
 pub fn set_device_preference(
     state: State<'_, Arc<AppState>>,
     device: String,
+    device_id: Option<u32>,
 ) -> Result<(), String> {
+    // S68b: the preferred-GPU picker feeds device_id (DML = DXGI EnumAdapters1 ordinal,
+    // CUDA = CUDA runtime ordinal — DIFFERENT spaces, see gpu.rs). Omitted → 0, the
+    // pre-picker behavior byte-for-byte. Auto deliberately carries no id: its DML leg
+    // resolves via DXCore high-performance selection and must stay untouched.
+    let id = device_id.unwrap_or(0);
     let config = match device.as_str() {
-        "cuda" => DeviceConfig::Cuda { device_id: 0 },
-        "directml" => DeviceConfig::DirectMl { device_id: 0 },
+        "cuda" => DeviceConfig::Cuda { device_id: id },
+        "directml" => DeviceConfig::DirectMl { device_id: id },
         "cpu" => DeviceConfig::Cpu,
         _ => DeviceConfig::Auto,
     };
@@ -348,6 +423,51 @@ pub fn set_device_preference(
     }
 
     Ok(())
+}
+
+/// One GPU choice for the inference preferred-GPU picker. `id` lives in the EP's OWN
+/// ordinal space (see gpu.rs); `selectable=false` = a software adapter that occupies an
+/// index slot (ORT throws if picked) — shown greyed, never compacted away.
+#[derive(serde::Serialize)]
+pub struct InferenceGpuChoice {
+    pub id: u32,
+    pub label: String,
+    pub selectable: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct InferenceGpuLists {
+    pub directml: Vec<InferenceGpuChoice>,
+    pub cuda: Vec<InferenceGpuChoice>,
+}
+
+/// S68b: the Settings preferred-GPU picker's option lists. DirectML entries are DXGI
+/// EnumAdapters1 ordinals (== the ORT DML device_id space); CUDA entries are CUDA
+/// runtime ordinals labeled via cudart→nvidia-smi PCI matching. Device names are
+/// hardware identifiers — deliberately not localized.
+#[tauri::command]
+pub fn list_inference_gpus() -> InferenceGpuLists {
+    let directml = crate::gpu::dxgi_adapters()
+        .into_iter()
+        .map(|a| InferenceGpuChoice {
+            id: a.index,
+            label: if a.dedicated_mb >= 256 {
+                format!("GPU {}: {} ({} MB)", a.index, a.name, a.dedicated_mb)
+            } else {
+                format!("GPU {}: {}", a.index, a.name)
+            },
+            selectable: !a.software,
+        })
+        .collect();
+    let cuda = crate::gpu::cuda_devices()
+        .into_iter()
+        .map(|d| InferenceGpuChoice {
+            id: d.index,
+            label: format!("CUDA {}: {}", d.index, d.name),
+            selectable: true,
+        })
+        .collect();
+    InferenceGpuLists { directml, cuda }
 }
 
 #[tauri::command]

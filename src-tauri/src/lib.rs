@@ -5,7 +5,9 @@
 
 pub mod audio;
 pub mod commands;
+pub mod crashlog;
 pub mod download;
+pub mod gpu;
 pub mod inference;
 pub mod logging;
 pub mod models;
@@ -592,7 +594,8 @@ pub fn run() {
     // the daily file roll (LocalDailyFile — tracing-appender's own rolling::daily is
     // hardwired to UTC dates/boundaries). UTC is the honest fallback.
     let tz_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    let mut file_appender = logging::LocalDailyFile::new(log_dir.clone(), "utai.log", tz_offset);
+    let mut file_appender =
+        logging::LocalDailyFile::new(log_dir.clone(), logging::LOG_PREFIX, tz_offset);
     // S67c: process-start divider, FILE ONLY. Same-day launches APPEND to one file, so a
     // crashed process's last line and the next launch's first line were visually
     // indistinguishable (the 07-16 community log interleaves six runs across three app
@@ -610,7 +613,10 @@ pub fn run() {
             std::process::id()
         );
     }
-    let (non_blocking, _file_guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, file_guard) = tracing_appender::non_blocking(file_appender);
+    // S68b: park the worker guard where quit paths can drop it (= drain the lossy
+    // channel). app.exit(0) never runs Drop, so held-in-run() it was dead code.
+    *crashlog::LOG_GUARD.lock() = Some(file_guard);
 
     let log_buffer = Arc::new(logging::LogBuffer::new(2000));
 
@@ -629,16 +635,12 @@ pub fn run() {
 
     // S67: file/stdout timestamps in LOCAL time with the UTC offset printed on every
     // line — users could never match the log PANEL's local times against the file's
-    // old UTC-Z lines. Fixed 6-digit micros keep the old line width. NOTE: the
-    // panel's own timestamps (logging.rs BufferLayer, GetLocalTime + lexicographic
-    // `since`) are untouched. File names/roll boundaries follow the same offset via
-    // LocalDailyFile above.
-    let timer = tracing_subscriber::fmt::time::OffsetTime::new(
-        tz_offset,
-        time::macros::format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6][offset_hour sign:mandatory]:[offset_minute]"
-        ),
-    );
+    // old UTC-Z lines. Fixed 6-digit micros keep the old line width. S68b: the format
+    // string moved to logging::LINE_TIME_FORMAT (shared with the panic hook's raw
+    // append). NOTE: the panel's own timestamps (logging.rs BufferLayer, GetLocalTime +
+    // lexicographic `since`) are untouched. File names/roll boundaries follow the same
+    // offset via LocalDailyFile above.
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(tz_offset, logging::LINE_TIME_FORMAT);
 
     tracing_subscriber::registry()
         .with(
@@ -656,13 +658,29 @@ pub fn run() {
         .with(logging::BufferLayer::new(Arc::clone(&log_buffer)))
         .init();
 
+    // UtcOffset's Display prints "+08:00:00" (seconds included) — format hh:mm ourselves
+    // so the banner matches the per-line "(UTC+08:00)" style.
+    let offset_label = format!(
+        "{}{:02}:{:02}",
+        if tz_offset.is_negative() { '-' } else { '+' },
+        tz_offset.whole_hours().abs(),
+        tz_offset.minutes_past_hour().abs()
+    );
     tracing::info!(
         "UtaiSynthesizer {} starting (pid {}) — logs: {} (timestamps local, UTC{})",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         log_dir.display(),
-        tz_offset
+        offset_label
     );
+
+    // S68b crash forensics: panics reach the log file even under panic=abort (release
+    // has no hook otherwise — a Rust panic died stderr-only, indistinguishable from an
+    // OS kill), and an unclean previous exit triggers a Windows-Event-Log autopsy
+    // (Application Error 1000 / display-reset 4101 disambiguate the silent-death
+    // classes our own log structurally cannot).
+    crashlog::install_panic_hook(log_dir.clone(), tz_offset);
+    crashlog::spawn_autopsy(crashlog::rotate_session_sentinel(&log_dir));
 
     let app_dir_early = resolve_app_dir();
     setup_cuda_dll_paths(&app_dir_early);
@@ -915,6 +933,7 @@ pub fn run() {
             commands::logs::get_log_file_path,
             commands::logs::open_log_dir,
             commands::settings::get_hardware_info,
+            commands::settings::list_inference_gpus,
             commands::settings::set_device_preference,
             commands::settings::get_device_preference,
             commands::settings::get_data_dir,

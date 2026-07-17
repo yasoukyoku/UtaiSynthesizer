@@ -18,6 +18,25 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// The app's log-file prefix — `<prefix>.<YYYY-MM-DD>` files under get_log_dir().
+pub const LOG_PREFIX: &str = "utai.log";
+
+/// Per-line timestamp format — ONE source shared by the two fmt layers (lib.rs
+/// OffsetTime) and the panic hook's raw append (crashlog.rs), so a PANIC line looks
+/// like every other line. S68b (§user): the offset moved into a "(UTC+08:00)"
+/// parenthetical — the bare RFC3339 "+08:00" suffix read as "add 8 hours".
+pub const LINE_TIME_FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
+    time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6] (UTC[offset_hour sign:mandatory]:[offset_minute])"
+    );
+
+/// `<prefix>.<YYYY-MM-DD>` — THE file-name scheme (S67). Single source shared by
+/// LocalDailyFile and the panic hook's raw append (crashlog.rs), which must hit the
+/// same file the logging worker writes.
+pub fn log_file_name(prefix: &str, date: time::Date) -> String {
+    format!("{}.{:04}-{:02}-{:02}", prefix, date.year(), u8::from(date.month()), date.day())
+}
+
 /// Daily-rolling log file writer whose file-name DATE and roll boundary follow the
 /// LOCAL offset (S67 follow-up, §user): tracing-appender 0.2's rolling::daily is
 /// hardwired to UTC, so a UTC+8/+9 user's evening lines landed in "yesterday's"
@@ -50,13 +69,7 @@ impl LocalDailyFile {
     }
 
     fn open(&mut self, date: time::Date) -> Option<std::fs::File> {
-        let name = format!(
-            "{}.{:04}-{:02}-{:02}",
-            self.prefix,
-            date.year(),
-            u8::from(date.month()),
-            date.day()
-        );
+        let name = log_file_name(self.prefix, date);
         match std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(&name)) {
             Ok(f) => {
                 self.open_warned = false;

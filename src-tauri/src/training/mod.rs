@@ -60,6 +60,35 @@ pub(crate) fn backend_family(backend: &str) -> &str {
     }
 }
 
+/// S68b loud-degradation preflight (community RTX 3080 report: GPU box + CPU-only
+/// runtime pack silently trained on CPU; the only warn was log-file-only AND gated
+/// behind !force_cpu, so nobody ever saw it). Refuses with TRAINING_RUNTIME_CPU_ONLY
+/// — trilingual message names both ways out (install the matching GPU pack / check
+/// 强制 CPU 训练). Fires ONLY when a GPU runtime pack is actually offerable on this
+/// box (variant_supported): Pascal/cc<7.5 NVIDIA, TheRock-unsupported AMD and non-Arc
+/// Intel machines have no in-app pack to install, so they keep training on CPU exactly
+/// as before (review round 1: the unconditional refusal sent those users chasing a
+/// download the Settings UI deliberately hides). The nvidia-smi/DXGI probes only run
+/// on the rare cpu-pack path — zero cost for every GPU-pack install.
+fn refuse_cpu_only_runtime(app_dir: &Path, force_cpu: bool) -> Result<()> {
+    if force_cpu {
+        return Ok(());
+    }
+    let (_python, device_backend) = crate::pyenv::training_interpreter(app_dir, false);
+    if device_backend != "cpu" {
+        return Ok(());
+    }
+    let gpus = crate::commands::settings::query_gpu_adapters();
+    let nv_cc = crate::commands::settings::nvidia_max_compute_cap();
+    let offerable = ["nv-cu130", "amd", "xpu"]
+        .iter()
+        .any(|v| crate::commands::settings::variant_supported(v, &gpus, nv_cc));
+    if offerable {
+        return Err(UtaiError::Training("TRAINING_RUNTIME_CPU_ONLY".into()));
+    }
+    Ok(())
+}
+
 /// ①c one co-trained speaker: a display name + its own audio files. The id
 /// (emb_g row / config.spk value) is the group's index in the request order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -828,6 +857,10 @@ impl TrainingManager {
         if req.model_name.trim().is_empty() {
             return Err(UtaiError::Training("TRAINING_NAME_EMPTY".into()));
         }
+        // S68b loud-degradation guard, at PREFLIGHT: refuse before the workspace wipe /
+        // dataset import (review: the run_worker placement cost a wiped workspace plus a
+        // multi-minute import before erroring on a fully-decidable condition).
+        refuse_cpu_only_runtime(&self.app_dir, req.force_cpu)?;
 
         // ①c multi-speaker co-training (>1 group): the dataset lives in the
         // per-speaker `speakers` files, NOT dataset_files, so validate those and
@@ -1528,12 +1561,10 @@ fn run_worker(
     // installed runtime pack (the pack VARIANT fixes the backend) → manual slot →
     // bare python. device_backend feeds device.py's shim via run.json below.
     let (python, device_backend) = crate::pyenv::training_interpreter(app_dir, req.force_cpu);
-    // Silent GPU→CPU downgrade guard (S43 review): the user didn't force CPU (so they
-    // asked for their GPU) yet the resolved backend is "cpu" — the ONLY way that happens
-    // is a CPU-only runtime pack installed on a GPU box (the dev venv and every GPU pack
-    // yield "cuda"). Silent slow-training is the user's #1 pain, so say it loudly (the
-    // fuller "gate the GPU option / prompt to install the GPU pack" is the release
-    // gating dialog — see pending_cleanups).
+    // The refusal for this condition lives in try_start's preflight (S68b,
+    // refuse_cpu_only_runtime — fires BEFORE the workspace wipe / dataset import).
+    // Here it can still be reached by the deliberately-skipped cases (no offerable GPU
+    // pack for this box, e.g. Pascal): keep the visibility warn for those runs.
     if !req.force_cpu && device_backend == "cpu" {
         tracing::warn!(
             "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."

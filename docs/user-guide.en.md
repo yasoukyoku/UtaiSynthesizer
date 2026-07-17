@@ -114,7 +114,9 @@ The app accelerates AI inference with your GPU. "Settings" → "Hardware" shows 
 
 **NVIDIA users should install the CUDA runtime**: in "Settings" → "CUDA Runtime", click "Download CUDA Runtime" (about 1.6 GB). It is fully self-contained — you do not need to install the CUDA Toolkit yourself; the app downloads every runtime library automatically. **Restart the app** after the download to activate it.
 
-> Caution: changing "Inference Device" requires an app restart (the UI says so too: "Restart the app after changing device."). Also, a self-installed CUDA Toolkit 13 is not a substitute for this download (version mismatch) — use the in-app download.
+**Multi-GPU machines can choose which card to use**: switch "Inference Device" to "CUDA" or "DirectML" and a "Preferred GPU" dropdown appears below, listing this machine's GPUs (greyed entries in the DirectML list are virtual system adapters and cannot be selected). "Auto" has no dropdown — it picks a high-performance GPU by itself.
+
+> Caution: changing "Inference Device" requires an app restart (the UI says so too: "Restart the app after changing device.", and a red hint shows which runtime this session actually loaded when they mismatch); changing only "Preferred GPU" applies without a restart. Also, a self-installed CUDA Toolkit 13 is not a substitute for this download (version mismatch) — use the in-app download.
 
 ### 2.5 The data folder
 
@@ -968,7 +970,7 @@ Three downloadable packs: "Core inference models" (required, ~1.4 GB, see 2.3), 
 
 ### 9.4 "Hardware" and the inference device
 
-The GPU list, the "CUDA Available" / "DirectML Available" badges, and the "Inference Device" dropdown (Auto / CUDA / DirectML / CPU). Details in 2.4. Changes save immediately and take effect after a restart.
+The GPU list, the "CUDA Available" / "DirectML Available" badges, the "Inference Device" dropdown (Auto / CUDA / DirectML / CPU), and the "Preferred GPU" dropdown on multi-GPU machines. Details in 2.4. Changes save immediately; switching the device takes effect after a restart (changing only the preferred GPU does not need one).
 
 ### 9.5 "CUDA Runtime"
 
@@ -1348,7 +1350,7 @@ Yes. An update replaces only the program itself; the data folder (models/caches/
 Two places:
 
 1. In the app: the title bar's "Log" button opens the log viewer — filter by "Error" "Warning" etc., search, and click "COPY" to copy the current filtered lines.
-2. On disk: the `%LOCALAPPDATA%\com.utaisynthesizer.app\logs` folder, with daily-rolling `utai.log` files (they survive crashes — built for post-mortems).
+2. On disk: the `%LOCALAPPDATA%\com.utaisynthesizer.app\logs` folder, with daily-rolling `utai.log` files (they survive crashes — built for post-mortems). The small `session.<pid>.alive` file there is a running marker: if the previous session didn't exit cleanly (crash, forced kill, or shutting Windows down with the app open), the next start automatically reads the Windows Event Log and writes "crash autopsy" diagnosis lines into the log — that's a feature, not a fault.
 
 When reporting a bug, include: the app version (first row of the "Help & Community" menu), reproduction steps, and the relevant log copied from the log viewer or the log file. Where to send it is in the next chapter.
 

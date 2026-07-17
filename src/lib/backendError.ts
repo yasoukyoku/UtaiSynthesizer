@@ -256,6 +256,9 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_DATA_FILE_MISSING: { key: "backend.TRAINING_DATA_FILE_MISSING" },
   // S67 loud-degradation guard (device.py require_wanted_accelerator → protocol error).
   TRAINING_GPU_UNAVAILABLE: { key: "backend.TRAINING_GPU_UNAVAILABLE" },
+  // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
+  // CPU runtime pack installed — refuse instead of the old log-file-only warn.
+  TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },
   TRAINING_IMPORT_COPY_FAILED: { key: "backend.TRAINING_IMPORT_COPY_FAILED" },
   TRAINING_INTERNAL_ASSET_BRANCH: { key: "backend.TRAINING_INTERNAL_ASSET_BRANCH" },
   TRAINING_KILL_FAILED: { key: "backend.TRAINING_KILL_FAILED" },

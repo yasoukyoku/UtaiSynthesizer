@@ -47,7 +47,8 @@ tracing = "0.1"
 # tracing-appender; local-offset's Windows path is pure WinAPI (no soundness cfg).
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 tracing-appender = "0.2"
-time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+# "parsing" (S68b): crashlog.rs parses Windows Event Log TimeCreated (RFC3339) stamps.
+time = { version = "0.3", features = ["formatting", "local-offset", "macros", "parsing"] }
 parking_lot = "0.12"
 rustfft = "6.2"
 rayon = "1.10"
@@ -74,7 +75,14 @@ utai-stretch = { path = "crates/utai-stretch" }
 # Versions pinned to what Tauri 2 already resolves (Cargo.lock) so the COM interface types match.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
-windows = "0.61"
+# Dxgi features (S68b): gpu.rs adapter enumeration (EnumAdapters1 = the ORT DML device_id
+# space) + QueryVideoMemoryInfo VRAM forensics. Win32_Foundation was already unified in
+# via webview2-com; declared explicitly because gpu.rs uses LUID/BOOL types directly.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

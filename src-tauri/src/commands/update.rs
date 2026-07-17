@@ -283,7 +283,12 @@ pub async fn update_install(
     // install() exits via std::process::exit — the window-state plugin's own exit-time save never
     // runs, so flush it here (same flags as the plugin registration; shared helper, NO-dup).
     let _ = tauri_plugin_window_state::AppHandleExt::save_window_state(&app, crate::window_state_flags());
+    // Deliberate exit ahead (S68b): drop the unclean-exit sentinel so the post-update
+    // start doesn't run a crash autopsy. Sentinel only — the log worker must stay
+    // alive in case install() fails and the session continues.
+    crate::crashlog::remove_sentinel();
     if let Err(e) = update.install(bytes) {
+        crate::crashlog::restore_sentinel();
         *PENDING_UPDATE.lock().unwrap() = Some((update, fallbacks));
         return Err(format!("UPDATE_INSTALL_FAILED: {e}"));
     }

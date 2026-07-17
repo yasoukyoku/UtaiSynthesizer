@@ -32,8 +32,27 @@ interface HardwareInfo {
   cuda_available: boolean;
   directml_available: boolean;
   current_device: string;
+  /** S68b: configured GPU ordinal of the current preference (0 for cpu/auto). */
+  current_device_id: number;
+  /** S68b: which ORT build THIS process loaded ("CUDA" | "DirectML" | dev labels) —
+   *  drives the "restart required" hint when the preference implies the other build. */
+  ort_build: string;
   gpus: GpuAdapter[];
   recommended_variant: string;
+}
+
+/** S68b preferred-GPU picker option (settings.rs list_inference_gpus). `id` is in the
+ *  EP's own ordinal space: DML = DXGI EnumAdapters1 index, CUDA = CUDA runtime ordinal.
+ *  selectable=false = software adapter holding an index slot (greyed, never removed). */
+interface InferenceGpuChoice {
+  id: number;
+  label: string;
+  selectable: boolean;
+}
+
+interface InferenceGpuLists {
+  directml: InferenceGpuChoice[];
+  cuda: InferenceGpuChoice[];
 }
 
 interface CudaProgress {
@@ -257,6 +276,9 @@ export function Settings({ onClose }: { onClose: () => void }) {
   }, [ghMirror.type, ghMirror.presetId, ghMirror.customUrl, ghEffectivePresetId]);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
   const [device, setDevice] = useState("auto");
+  // S68b preferred-GPU picker: the configured ordinal + the per-EP option lists.
+  const [deviceId, setDeviceId] = useState(0);
+  const [gpuLists, setGpuLists] = useState<InferenceGpuLists | null>(null);
   const [saving, setSaving] = useState(false);
   const [cudaReady, setCudaReady] = useState(false);
   const [cudaDownloading, setCudaDownloading] = useState(false);
@@ -323,8 +345,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
   }, []);
 
   useEffect(() => {
-    invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
+    invoke<HardwareInfo>("get_hardware_info")
+      .then((h) => {
+        setHw(h);
+        setDeviceId(h.current_device_id ?? 0);
+      })
+      .catch(() => {});
     invoke<string>("get_device_preference").then(setDevice).catch(() => {});
+    invoke<InferenceGpuLists>("list_inference_gpus").then(setGpuLists).catch(() => {});
     invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
     // Re-latch onto an in-flight CUDA download after a panel remount (S64c audit: `cudaDownloading`
     // is component-local; the backend refcount is the truth, and the busy interlock rejects a
@@ -698,14 +726,33 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
   const handleDeviceChange = useCallback(async (value: string) => {
     setDevice(value);
+    // Switching the MODE resets the ordinal to 0 — the two pickers live in different
+    // id spaces (DML = DXGI index, CUDA = CUDA ordinal), so an id can't carry across.
+    setDeviceId(0);
     setSaving(true);
     try {
-      await invoke("set_device_preference", { device: value });
+      await invoke("set_device_preference", { device: value, deviceId: 0 });
     } catch (e) {
       console.error("Failed to save device preference:", e);
     }
     setSaving(false);
   }, []);
+
+  // S68b: preferred-GPU pick for the explicit CUDA/DirectML modes. Applies live (the
+  // engine evicts cached sessions on any device change; same ORT build either way).
+  const handleGpuPick = useCallback(
+    async (id: number) => {
+      setDeviceId(id);
+      setSaving(true);
+      try {
+        await invoke("set_device_preference", { device, deviceId: id });
+      } catch (e) {
+        console.error("Failed to save GPU preference:", e);
+      }
+      setSaving(false);
+    },
+    [device],
+  );
 
   // S64c structured progress → localized line (code + proper-noun label; raw message = fallback,
   // the pyenv pgDownloading/pgExtracting pattern).
@@ -801,6 +848,17 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaOpt: { zh: "CUDA (NVIDIA GPU)", en: "CUDA (NVIDIA GPU)", ja: "CUDA (NVIDIA GPU)" },
       dmlOpt: { zh: "DirectML (通用 GPU)", en: "DirectML (Any GPU)", ja: "DirectML (汎用 GPU)" },
       cpuOpt: { zh: "CPU", en: "CPU", ja: "CPU" },
+      gpuPick: { zh: "首选 GPU", en: "Preferred GPU", ja: "優先 GPU" },
+      gpuGone: {
+        zh: "GPU {id}（未检测到——请重新选择）",
+        en: "GPU {id} (not detected — pick again)",
+        ja: "GPU {id}（未検出——選び直してください）",
+      },
+      buildMismatch: {
+        zh: "当前进程加载的是 {build} 运行时——此选择需要重启应用后才会生效",
+        en: "This session loaded the {build} runtime — restart the app for this choice to take effect",
+        ja: "現在のプロセスは {build} ランタイムを読み込んでいます——この選択はアプリ再起動後に有効になります",
+      },
       saved: { zh: "已保存", en: "Saved", ja: "保存済み" },
       note: { zh: "切换设备后需要重启应用才能生效。", en: "Restart the app after changing device.", ja: "デバイス変更後、アプリを再起動してください。" },
       yes: { zh: "是", en: "Yes", ja: "はい" },
@@ -1054,6 +1112,51 @@ export function Settings({ onClose }: { onClose: () => void }) {
             </select>
             {saving && <span className="settings-saving">...</span>}
           </div>
+
+          {/* S68b preferred-GPU picker — explicit CUDA/DirectML modes only. Auto keeps
+              its own adapter selection (DXCore high-performance for DML) and must not
+              be steered by an ordinal; a software adapter keeps its index slot but is
+              greyed out (ORT refuses it — never compact the DXGI id space). */}
+          {(device === "cuda" || device === "directml") &&
+            (() => {
+              const opts = device === "cuda" ? gpuLists?.cuda : gpuLists?.directml;
+              if (!opts || opts.length === 0) return null;
+              // A configured id can outlive its adapter (card removed / driver change
+              // shrank the index space) — surface it instead of a blank select; the
+              // engine still targets the stale ordinal until the user re-picks.
+              const stale = !opts.some((o) => o.id === deviceId);
+              return (
+                <div className="settings-field">
+                  <label>{L("gpuPick")}</label>
+                  <select
+                    value={String(deviceId)}
+                    onChange={(e) => handleGpuPick(Number(e.target.value))}
+                  >
+                    {stale && (
+                      <option value={String(deviceId)} disabled>
+                        {L("gpuGone").replace("{id}", String(deviceId))}
+                      </option>
+                    )}
+                    {opts.map((o) => (
+                      <option key={o.id} value={String(o.id)} disabled={!o.selectable}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })()}
+
+          {/* S68b: the community user read "CUDA可用 否" (a fact about THIS process's
+              loaded build) as a hardware verdict and locked themselves onto DirectML.
+              Say explicitly when the preference needs a restart to actually apply. */}
+          {hw &&
+            ((device === "cuda" && hw.ort_build === "DirectML") ||
+              (device === "directml" && hw.ort_build === "CUDA")) && (
+              <p className="settings-error">
+                {L("buildMismatch").replace("{build}", hw.ort_build)}
+              </p>
+            )}
 
           <p className="settings-note">{L("note")}</p>
         </section>

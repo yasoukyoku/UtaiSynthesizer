@@ -188,12 +188,28 @@ pub(crate) fn system_memory_mb() -> (u64, u64) {
     (0, 0)
 }
 
-/// One-line memory snapshot for stage logs: "commit=1234 MB, sys avail=5678 MB". S67c
-/// forensic thread — stage INFO/DEBUG lines carry these numbers so a community crash log
-/// reads as a commit-exhaustion timeline without a debugger on the machine.
+/// gpu::vram_stamp with an explicit placeholder — forensic format strings must never
+/// render a dangling "; " / "→" fragment on the DXGI-degraded boxes these very lines
+/// exist to diagnose (adversarial review, S68b).
+fn vram_or_na() -> String {
+    let v = crate::gpu::vram_stamp();
+    if v.is_empty() {
+        "vram n/a".to_string()
+    } else {
+        v
+    }
+}
+
+/// One-line memory snapshot for stage logs: "commit=1234 MB, sys avail=5678 MB; vram
+/// GPU0 2151/7222 MB". S67c forensic thread — stage INFO/DEBUG lines carry these numbers
+/// so a community crash log reads as an exhaustion timeline without a debugger on the
+/// machine. S68b adds the per-adapter LOCAL video-memory usage/budget: the commit curve
+/// alone exonerated system memory on the 20%-crash box, leaving the GPU side as the one
+/// unwatched state (QueryVideoMemoryInfo is a few COM calls — negligible next to the
+/// per-chunk work these lines annotate).
 pub fn memory_stamp() -> String {
     let (_, avail) = system_memory_mb();
-    format!("commit={} MB, sys avail={} MB", process_commit_mb(), avail)
+    format!("commit={} MB, sys avail={} MB; {}", process_commit_mb(), avail, vram_or_na())
 }
 
 /// S67c: does an inference error message look like memory exhaustion? CPU sessions fail
@@ -518,10 +534,11 @@ impl OnnxEngine {
             // "after" number barely moves is the direct diagnosis of a driver that defers
             // or withholds DML pool release (the prime suspect for the 16 GB crashes).
             let c0 = process_commit_mb();
+            let v0 = vram_or_na();
             drop(removed); // teardown outside the sessions lock
             tracing::info!(
-                "Released {} other cached ONNX session(s) before loading {} (GPU memory headroom; commit {}→{} MB)",
-                n, keep_path.display(), c0, process_commit_mb()
+                "Released {} other cached ONNX session(s) before loading {} (GPU memory headroom; commit {}→{} MB; {} → {})",
+                n, keep_path.display(), c0, process_commit_mb(), v0, vram_or_na()
             );
         }
         n
@@ -555,10 +572,11 @@ impl OnnxEngine {
             // Same commit-return trace as release_others — this is the hop right before the
             // voice model pays its first-shape ticket, exactly where the community machines die.
             let c0 = process_commit_mb();
+            let v0 = vram_or_na();
             drop(removed); // teardown outside the sessions lock
             tracing::info!(
-                "Released {} GPU session(s) not needed by this voice run (VRAM headroom; commit {}→{} MB)",
-                n, c0, process_commit_mb()
+                "Released {} GPU session(s) not needed by this voice run (VRAM headroom; commit {}→{} MB; {} → {})",
+                n, c0, process_commit_mb(), v0, vram_or_na()
             );
         }
         n
@@ -729,9 +747,13 @@ impl OnnxEngine {
                 let commit = process_commit_mb();
                 let (_, avail) = system_memory_mb();
                 let min = dml_min_avail_commit_mb();
+                // S68b: the commit curve alone exonerated system memory on the community
+                // 20%-crash box (releases returned in full, 23 GB avail at death) — the
+                // GPU side was the one unwatched state. QueryVideoMemoryInfo per adapter
+                // rides along on every new-shape boundary from now on.
                 tracing::debug!(
-                    "DML new shape for {}: process commit={} MB, system available commit={} MB",
-                    loaded.path.display(), commit, avail
+                    "DML new shape for {}: process commit={} MB, system available commit={} MB; {}",
+                    loaded.path.display(), commit, avail, vram_or_na()
                 );
                 if min > 0 && avail > 0 && avail < min {
                     let msg = format!(
@@ -1066,7 +1088,12 @@ fn build_session(path: &PathBuf, device: &DeviceConfig, mem_pattern: bool) -> Re
                         device_id, e
                     ))
                 })?;
-            tracing::info!("ONNX device=DirectML (GPU {})", device_id);
+            // S68b: name the adapter — device_id is a raw DXGI EnumAdapters1 ordinal, and
+            // "GPU 0" alone told a community log nothing about WHICH card DML compiled on.
+            let adapter = crate::gpu::adapter_name(*device_id)
+                .map(|n| format!(": {n}"))
+                .unwrap_or_default();
+            tracing::info!("ONNX device=DirectML (GPU {}{})", device_id, adapter);
             format!("DirectML (GPU {})", device_id)
         }
         DeviceConfig::Cuda { device_id } => {

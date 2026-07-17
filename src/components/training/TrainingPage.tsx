@@ -965,15 +965,26 @@ function ParamsStep() {
   const diff = config.backend === "sovits_diff";
   const voc = config.backend === "vocoder";
 
-  const gpuRow = gpus.length > 0 && !config.forceCpu && (
+  // S68b: an empty GPU list used to hide ALL device UI (dropdown AND the force-CPU
+  // checkbox) while silently forcing CPU — a community RTX 3080 box with a dead GPU
+  // probe trained on CPU with zero visual hint. The CPU fact now shows on the form.
+  const gpuRow = !gpuOk ? (
     <div className="training-form-row">
       <label>{t("training.gpu")}</label>
-      <Dropdown
-        value={config.gpu}
-        options={gpus.map((g) => ({ value: g.value, label: g.label }))}
-        onChange={(v) => updateConfig({ gpu: v })}
-      />
+      <span className="training-cpu-note">{t("training.noGpuCpuNote")}</span>
     </div>
+  ) : (
+    gpus.length > 0 &&
+    !config.forceCpu && (
+      <div className="training-form-row">
+        <label>{t("training.gpu")}</label>
+        <Dropdown
+          value={config.gpu}
+          options={gpus.map((g) => ({ value: g.value, label: g.label }))}
+          onChange={(v) => updateConfig({ gpu: v })}
+        />
+      </div>
+    )
   );
 
   const forceCpuRow = gpuOk && (
