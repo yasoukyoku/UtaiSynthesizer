@@ -32,6 +32,12 @@ pub struct OnnxEngine {
     /// still points at must NOT hard-fail with "Session not found".
     paths: RwLock<HashMap<String, LoadSpec>>,
     device: RwLock<DeviceConfig>,
+    /// S68b: Auto-mode preferred GPU as a DXGI adapter index (None = today's fully
+    /// automatic selection: CUDA default device / DML2's DXCore high-performance pick).
+    /// Auto stays in charge of WHICH EP runs; this only steers WHICH CARD each GPU EP
+    /// binds — the CUDA probe maps the DXGI index to a CUDA ordinal by LUID, the DML
+    /// probe uses the index directly (both in gpu.rs).
+    auto_gpu: RwLock<Option<u32>>,
     clock: AtomicU64,
     /// Wall-clock of the last inference, for idle-release: a background sweeper frees the cached sessions
     /// (and the resident ORT CUDA arena) after a stretch of inactivity. A new run refreshes this + reloads
@@ -328,6 +334,7 @@ impl OnnxEngine {
             sessions: RwLock::new(HashMap::new()),
             paths: RwLock::new(HashMap::new()),
             device: RwLock::new(DeviceConfig::default()),
+            auto_gpu: RwLock::new(None),
             clock: AtomicU64::new(0),
             last_activity: Mutex::new(Instant::now()),
             in_flight: AtomicUsize::new(0),
@@ -357,14 +364,43 @@ impl OnnxEngine {
         self.device.read().clone()
     }
 
+    /// S68b: set the Auto-mode preferred GPU (DXGI index; None = automatic). Same
+    /// eviction discipline as set_device — cached sessions were built against the
+    /// previous adapter and must rebuild (teardown outside the lock).
+    pub fn set_auto_gpu(&self, gpu: Option<u32>) {
+        let changed = *self.auto_gpu.read() != gpu;
+        if !changed {
+            return;
+        }
+        tracing::info!("Auto-mode preferred GPU set to: {:?} (DXGI index)", gpu);
+        *self.auto_gpu.write() = gpu;
+        let taken = std::mem::take(&mut *self.sessions.write());
+        if !taken.is_empty() {
+            tracing::info!("Cleared {} cached ONNX session(s) after preferred-GPU change", taken.len());
+        }
+    }
+
+    pub fn auto_gpu(&self) -> Option<u32> {
+        *self.auto_gpu.read()
+    }
+
     /// EP label actually backing a loaded session — for inference-time "what hardware ran" logging.
     pub fn resolved_device(&self, session_id: &str) -> Option<String> {
         self.sessions.read().get(session_id).map(|s| s.actual_device.clone())
     }
 
-    fn make_key(path: &Path, device: &DeviceConfig) -> String {
+    /// S68b: the Auto-mode preferred GPU is part of the cache identity — Auto sessions
+    /// bound to different adapters must never share a key. This is the set_device
+    /// pattern: a build that races set_auto_gpu's eviction lands under an unreachable
+    /// stale key (its holder finishes coherently on the ORIGINAL card), and a mid-job
+    /// pick change trips reload_if_missing's loud key-mismatch guard instead of
+    /// silently flipping cards/EPs mid-chunk-plan (adversarial review, round 2).
+    fn make_key(path: &Path, device: &DeviceConfig, auto_gpu: Option<u32>) -> String {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        format!("{}|{:?}", canon.display(), device)
+        match device {
+            DeviceConfig::Auto => format!("{}|Auto(gpu={:?})", canon.display(), auto_gpu),
+            other => format!("{}|{:?}", canon.display(), other),
+        }
     }
 
     /// Load (or reuse) a session for `path` under the current device.
@@ -411,7 +447,10 @@ impl OnnxEngine {
         let device = device_override
             .clone()
             .unwrap_or_else(|| self.device.read().clone());
-        let key = Self::make_key(path, &device);
+        // ONE auto_gpu snapshot for both the key and the build — key and session must
+        // agree on the adapter even if set_auto_gpu lands between them (see make_key).
+        let auto_gpu = self.auto_gpu();
+        let key = Self::make_key(path, &device, auto_gpu);
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         // Remember the full spec under this key so an evicted session rebuilds identically.
         self.paths.write().insert(
@@ -432,7 +471,7 @@ impl OnnxEngine {
 
         // Miss → build outside the write lock (commit_from_file is the slow part).
         tracing::info!("Building ONNX session: {} (device={:?})", path.display(), device);
-        let (session, actual_device) = build_session(path, &device, mem_pattern)?;
+        let (session, actual_device) = build_session(path, &device, mem_pattern, auto_gpu)?;
 
         // Declared before the guard so LRU-evicted sessions tear down AFTER the write lock
         // releases (drop order is reverse declaration order).
@@ -898,7 +937,7 @@ impl OnnxEngine {
         let spec = self.paths.read().get(session_id).cloned();
         if let Some(spec) = spec {
             let effective = spec.device.clone().unwrap_or_else(|| self.device.read().clone());
-            if Self::make_key(&spec.path, &effective) != session_id {
+            if Self::make_key(&spec.path, &effective, self.auto_gpu()) != session_id {
                 return Err(UtaiError::Inference(
                     "Device preference changed while a job was running — re-run the job".to_string(),
                 ));
@@ -1053,11 +1092,16 @@ fn cuda_ep(device_id: Option<i32>) -> ort::ep::CUDA {
     ep
 }
 
-fn build_session(path: &PathBuf, device: &DeviceConfig, mem_pattern: bool) -> Result<(Session, String)> {
+fn build_session(
+    path: &PathBuf,
+    device: &DeviceConfig,
+    mem_pattern: bool,
+    auto_gpu: Option<u32>,
+) -> Result<(Session, String)> {
     // Auto resolves at runtime by probing each EP — handled separately so we can LOG the device
     // that actually ran (the old all-EPs-at-once registration could not report which one ORT picked).
     if matches!(device, DeviceConfig::Auto) {
-        return build_session_auto(path, mem_pattern);
+        return build_session_auto(path, mem_pattern, auto_gpu);
     }
 
     let mut builder = base_builder(mem_pattern)?;
@@ -1124,32 +1168,91 @@ fn build_session(path: &PathBuf, device: &DeviceConfig, mem_pattern: bool) -> Re
 /// registration fast instead of silently dropping to CPU — that explicit failure is exactly what
 /// lets us report the true device. The chosen EP still gets ORT's per-op CPU fallback for any
 /// node it can't run.
-fn build_session_auto(path: &Path, mem_pattern: bool) -> Result<(Session, String)> {
-    let cuda = base_builder(mem_pattern)
-        .and_then(|b| {
-            b.with_execution_providers([cuda_ep(None).build().error_on_failure()])
-                .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))
-        })
-        .and_then(|b| commit(b, path));
-    match cuda {
-        Ok(s) => {
-            tracing::info!("ONNX device=Auto → using CUDA (GPU)");
-            return Ok((s, "CUDA (GPU, Auto)".to_string()));
+///
+/// S68b `auto_gpu` (preferred GPU, DXGI index; §user): Auto keeps choosing the EP ROUTE,
+/// the preference only steers WHICH CARD each GPU EP binds. None = the pre-S68b behavior
+/// byte-for-byte (CUDA default device; DML2/DXCore high-performance pick). Some(idx):
+/// the CUDA probe maps idx→CUDA ordinal by LUID (skipped outright for a non-NVIDIA
+/// pick), and the DML probe uses idx as its raw EnumAdapters1 device_id.
+fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> Result<(Session, String)> {
+    let preferred_vendor = auto_gpu.and_then(crate::gpu::adapter_vendor);
+    // A stored pick that no longer resolves to a usable adapter (card removed, driver
+    // reshuffled the DXGI index space, corrupted config) falls back to fully-automatic
+    // selection — LOUDLY. Letting it reach the EPs instead would make ORT throw and
+    // land Auto on CPU with debug-only breadcrumbs (review round 2 major).
+    if auto_gpu.is_some() && preferred_vendor.is_none() {
+        tracing::warn!(
+            "Auto-mode preferred GPU {} not found in the current adapter list — falling back to automatic selection (re-pick in Settings)",
+            auto_gpu.unwrap_or_default()
+        );
+    }
+    let skip_cuda = matches!(preferred_vendor, Some(v) if v != "nvidia");
+    if skip_cuda {
+        tracing::debug!(
+            "ONNX device=Auto: preferred GPU {} is non-NVIDIA — skipping the CUDA probe",
+            auto_gpu.unwrap_or_default()
+        );
+    } else {
+        // Preferred NVIDIA card → its CUDA ordinal via LUID; unmapped (cudart absent /
+        // no preference) → ORT's default device, exactly the pre-S68b probe.
+        let cuda_id = auto_gpu.and_then(crate::gpu::cuda_ordinal_for_dxgi).map(|i| i as i32);
+        // WARN when a stored NVIDIA pick silently degrades to the default device — on a
+        // multi-N box that can be a DIFFERENT card than picked, and the success log is
+        // otherwise indistinguishable from no-preference (review round 2). Gated on the
+        // CUDA build being loaded: on the DirectML build this probe fails right after
+        // anyway and the pick is still honored by the DML leg.
+        if let Some(idx) = auto_gpu {
+            if cuda_id.is_none()
+                && preferred_vendor == Some("nvidia")
+                && crate::ORT_LOADED_BUILD.get().map(|s| s == "CUDA").unwrap_or(false)
+            {
+                tracing::warn!(
+                    "Auto-mode preferred GPU {idx} couldn't be mapped to a CUDA ordinal — probing ORT's default CUDA device"
+                );
+            }
         }
-        // Probe failures are debug-level noise (like ffmpeg internals) — only the resolved device
-        // below is INFO. Keeps the default log clean; switch the panel to DEBUG to see why a GPU failed.
-        Err(e) => tracing::debug!("ONNX device=Auto: CUDA unavailable ({e}); trying DirectML"),
+        let cuda = base_builder(mem_pattern)
+            .and_then(|b| {
+                b.with_execution_providers([cuda_ep(cuda_id).build().error_on_failure()])
+                    .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))
+            })
+            .and_then(|b| commit(b, path));
+        match cuda {
+            Ok(s) => {
+                tracing::info!("ONNX device=Auto → using CUDA (GPU{})", cuda_id.map(|i| format!(" {i}")).unwrap_or_default());
+                return Ok((s, "CUDA (GPU, Auto)".to_string()));
+            }
+            // Probe failures are debug-level noise (like ffmpeg internals) — only the resolved device
+            // below is INFO. Keeps the default log clean; switch the panel to DEBUG to see why a GPU failed.
+            Err(e) => tracing::debug!("ONNX device=Auto: CUDA unavailable ({e}); trying DirectML"),
+        }
     }
 
+    let mut dml_ep = ort::ep::DirectML::default();
+    if let Some(idx) = auto_gpu {
+        // Only honor a pick that still resolves to a usable adapter (see the WARN at the
+        // top): a stale/OOB/software index makes ORT's EnumAdapters1(device_id) throw,
+        // error_on_failure fails the whole DML probe, and Auto lands on CPU — the
+        // silent-CPU class this project treats as its #1 pain (review round 2 major).
+        if preferred_vendor.is_some() {
+            dml_ep = dml_ep.with_device_id(idx as i32);
+        }
+    }
     let dml = base_builder(mem_pattern)
         .and_then(|b| {
-            b.with_execution_providers([ort::ep::DirectML::default().build().error_on_failure()])
+            b.with_execution_providers([dml_ep.build().error_on_failure()])
                 .map_err(|e| UtaiError::Inference(format!("DirectML EP: {}", e)))
         })
         .and_then(|b| commit(b, path));
     match dml {
         Ok(s) => {
-            tracing::info!("ONNX device=Auto → using DirectML (GPU)");
+            let which = auto_gpu
+                .map(|i| {
+                    let name = crate::gpu::adapter_name(i).map(|n| format!(": {n}")).unwrap_or_default();
+                    format!(" (GPU {i}{name})")
+                })
+                .unwrap_or_default();
+            tracing::info!("ONNX device=Auto → using DirectML (GPU){}", which);
             return Ok((s, "DirectML (GPU, Auto)".to_string()));
         }
         Err(e) => tracing::debug!("ONNX device=Auto: DirectML unavailable ({e}); falling back to CPU"),

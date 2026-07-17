@@ -32,6 +32,10 @@ pub struct DxgiAdapterInfo {
     /// DXGI_ADAPTER_FLAG_SOFTWARE or the Basic Render Driver (VEN 0x1414 DEV 0x8c) —
     /// ORT's DML EP refuses these; the picker greys them out but keeps the index slot.
     pub software: bool,
+    /// AdapterLuid as raw little-endian bytes (LowPart then HighPart) — the EXACT
+    /// cross-API identity: cudaDeviceGetLuid returns the same 8 bytes, which is how an
+    /// Auto-mode preferred DXGI adapter maps to a CUDA ordinal without name guessing.
+    pub luid: [u8; 8],
 }
 
 pub fn vendor_from_pci_id(vendor_id: u32) -> &'static str {
@@ -74,12 +78,16 @@ pub fn dxgi_adapters() -> Vec<DxgiAdapterInfo> {
         // Same rule as ORT's IsSoftwareAdapter (dml_provider_factory.cc).
         let software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
             || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c);
+        let mut luid = [0u8; 8];
+        luid[..4].copy_from_slice(&desc.AdapterLuid.LowPart.to_le_bytes());
+        luid[4..].copy_from_slice(&desc.AdapterLuid.HighPart.to_le_bytes());
         out.push(DxgiAdapterInfo {
             index,
             name,
             vendor: vendor_from_pci_id(desc.VendorId),
             dedicated_mb: (desc.DedicatedVideoMemory / (1024 * 1024)) as u64,
             software,
+            luid,
         });
     }
     out
@@ -218,35 +226,53 @@ pub fn cuda_devices() -> Vec<CudaDeviceInfo> {
     Vec::new()
 }
 
-/// PCI bus ids per CUDA ordinal via cudart (LoadLibrary — cudart64_12.dll reaches PATH
-/// through setup_cuda_dll_paths whenever the CUDA runtime is installed). None = cudart
-/// not loadable / calls failed.
+/// Proc address from a named DLL via plain kernel32 FFI. cudart64_12.dll reaches PATH
+/// through setup_cuda_dll_paths whenever the CUDA runtime is installed; nvcuda.dll
+/// (the CUDA DRIVER API) lives in System32 whenever an NVIDIA driver is installed.
 #[cfg(windows)]
-fn cudart_pci_bus_ids() -> Option<Vec<String>> {
+unsafe fn dll_proc(dll: &[u8], name: &[u8]) -> Option<isize> {
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryA(name: *const u8) -> isize;
         fn GetProcAddress(module: isize, name: *const u8) -> isize;
     }
-    type GetCount = unsafe extern "C" fn(*mut i32) -> i32;
-    type GetPciBusId = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
+    let module = LoadLibraryA(dll.as_ptr());
+    if module == 0 {
+        return None;
+    }
+    let f = GetProcAddress(module, name.as_ptr());
+    if f == 0 {
+        None
+    } else {
+        Some(f)
+    }
+}
 
+#[cfg(windows)]
+unsafe fn cudart_proc(name: &[u8]) -> Option<isize> {
+    dll_proc(b"cudart64_12.dll\0", name)
+}
+
+#[cfg(windows)]
+fn cudart_device_count() -> Option<i32> {
+    type GetCount = unsafe extern "C" fn(*mut i32) -> i32;
     unsafe {
-        let module = LoadLibraryA(b"cudart64_12.dll\0".as_ptr());
-        if module == 0 {
-            return None;
-        }
-        let count_fn = GetProcAddress(module, b"cudaGetDeviceCount\0".as_ptr());
-        let pci_fn = GetProcAddress(module, b"cudaDeviceGetPCIBusId\0".as_ptr());
-        if count_fn == 0 || pci_fn == 0 {
-            return None;
-        }
-        let count_fn: GetCount = std::mem::transmute(count_fn);
-        let pci_fn: GetPciBusId = std::mem::transmute(pci_fn);
+        let count_fn: GetCount = std::mem::transmute(cudart_proc(b"cudaGetDeviceCount\0")?);
         let mut count: i32 = 0;
         if count_fn(&mut count) != 0 || count <= 0 {
             return None;
         }
+        Some(count)
+    }
+}
+
+/// PCI bus ids per CUDA ordinal via cudart. None = cudart not loadable / calls failed.
+#[cfg(windows)]
+fn cudart_pci_bus_ids() -> Option<Vec<String>> {
+    type GetPciBusId = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
+    unsafe {
+        let pci_fn: GetPciBusId = std::mem::transmute(cudart_proc(b"cudaDeviceGetPCIBusId\0")?);
+        let count = cudart_device_count()?;
         let mut out = Vec::with_capacity(count as usize);
         for dev in 0..count {
             let mut buf = [0u8; 64];
@@ -258,6 +284,79 @@ fn cudart_pci_bus_ids() -> Option<Vec<String>> {
         }
         Some(out)
     }
+}
+
+/// CUDA ordinal for a DXGI adapter. Two exact hops, ZERO enumeration-order assumptions:
+/// the DRIVER API (nvcuda.dll) links LUID ↔ PCI bus id on one device handle
+/// (cuDeviceGetLuid + cuDeviceGetPCIBusId), and the RUNTIME ordinal links to the same
+/// PCI id via cudaDeviceGetPCIBusId. NB: cudart exports NO LUID query — probed on the
+/// dev box, `cudaDeviceGetLuid` isn't in cudart64_12.dll at all (docs notwithstanding);
+/// only the driver API carries it. None = non-CUDA adapter / drivers unavailable — the
+/// Auto probe then falls back to ORT's default device (pre-S68b behavior).
+#[cfg(windows)]
+pub fn cuda_ordinal_for_dxgi(dxgi_index: u32) -> Option<u32> {
+    let target = dxgi_adapters().into_iter().find(|a| a.index == dxgi_index)?.luid;
+    let pci = driver_pci_for_luid(target)?;
+    cudart_pci_bus_ids()?.into_iter().position(|p| p == pci).map(|i| i as u32)
+}
+
+/// PCI bus id of the CUDA device whose LUID matches, via the CUDA driver API.
+#[cfg(windows)]
+fn driver_pci_for_luid(target: [u8; 8]) -> Option<String> {
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuCount = unsafe extern "C" fn(*mut i32) -> i32;
+    type CuGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuLuid = unsafe extern "C" fn(*mut u8, *mut u32, i32) -> i32;
+    type CuPci = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
+    const NVCUDA: &[u8] = b"nvcuda.dll\0";
+    unsafe {
+        let init: CuInit = std::mem::transmute(dll_proc(NVCUDA, b"cuInit\0")?);
+        let count_fn: CuCount = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetCount\0")?);
+        let get_fn: CuGet = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGet\0")?);
+        let luid_fn: CuLuid = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetLuid\0")?);
+        let pci_fn: CuPci = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetPCIBusId\0")?);
+        if init(0) != 0 {
+            return None; // idempotent; ORT's CUDA EP calls it too
+        }
+        let mut count: i32 = 0;
+        if count_fn(&mut count) != 0 || count <= 0 {
+            return None;
+        }
+        for i in 0..count {
+            let mut dev: i32 = 0;
+            if get_fn(&mut dev, i) != 0 {
+                continue;
+            }
+            let mut luid = [0u8; 8];
+            let mut node_mask: u32 = 0;
+            if luid_fn(luid.as_mut_ptr(), &mut node_mask, dev) != 0 || luid != target {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            if pci_fn(buf.as_mut_ptr(), buf.len() as i32, dev) != 0 {
+                return None;
+            }
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            return Some(normalize_pci_bus_id(&String::from_utf8_lossy(&buf[..len])));
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn cuda_ordinal_for_dxgi(_dxgi_index: u32) -> Option<u32> {
+    None
+}
+
+/// Vendor of a USABLE (present, non-software) DXGI adapter by index. None ⇒ the pick
+/// can't be honored (stale index / software adapter): the startup ORT-build pick then
+/// treats it as no-preference, and build_session_auto falls back to the default
+/// adapter with a WARN instead of letting ORT throw and land Auto on CPU.
+pub fn adapter_vendor(index: u32) -> Option<&'static str> {
+    dxgi_adapters()
+        .into_iter()
+        .find(|a| a.index == index && !a.software)
+        .map(|a| a.vendor)
 }
 
 /// (pci_bus_id, name) rows from nvidia-smi. Empty on any failure.
@@ -329,5 +428,25 @@ mod tests {
         let stamp = vram_stamp();
         assert!(stamp.starts_with("vram GPU"), "unexpected stamp: {stamp:?}");
         assert!(stamp.contains("/"), "no usage/budget pair: {stamp:?}");
+    }
+
+    // The Auto-mode preferred-GPU bridge: DXGI LUID ↔ cudaDeviceGetLuid must agree on
+    // the dev box (single NVIDIA card = CUDA ordinal 0), and a non-NVIDIA adapter must
+    // never map. Skips (with a note) when cudart isn't resolvable in the bare test PATH.
+    #[cfg(windows)]
+    #[test]
+    fn cuda_ordinal_maps_by_luid() {
+        if cudart_device_count().is_none() {
+            eprintln!("cudart64_12.dll not resolvable in test PATH — LUID mapping not exercised");
+            return;
+        }
+        let adapters = dxgi_adapters();
+        let nvidia = adapters.iter().find(|a| a.vendor == "nvidia");
+        if let Some(a) = nvidia {
+            assert_eq!(cuda_ordinal_for_dxgi(a.index), Some(0), "single-N box maps to ordinal 0");
+        }
+        for a in adapters.iter().filter(|a| a.vendor != "nvidia") {
+            assert_eq!(cuda_ordinal_for_dxgi(a.index), None, "non-NVIDIA adapter must not map: {}", a.name);
+        }
     }
 }

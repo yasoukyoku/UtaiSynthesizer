@@ -34,6 +34,8 @@ interface HardwareInfo {
   current_device: string;
   /** S68b: configured GPU ordinal of the current preference (0 for cpu/auto). */
   current_device_id: number;
+  /** S68b (§user): Auto-mode preferred GPU (DXGI index; null = fully automatic). */
+  auto_gpu: number | null;
   /** S68b: which ORT build THIS process loaded ("CUDA" | "DirectML" | dev labels) —
    *  drives the "restart required" hint when the preference implies the other build. */
   ort_build: string;
@@ -48,6 +50,8 @@ interface InferenceGpuChoice {
   id: number;
   label: string;
   selectable: boolean;
+  /** "nvidia" | "amd" | "intel" | "other" — drives the Auto-mode restart hint. */
+  vendor: string;
 }
 
 interface InferenceGpuLists {
@@ -278,6 +282,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [device, setDevice] = useState("auto");
   // S68b preferred-GPU picker: the configured ordinal + the per-EP option lists.
   const [deviceId, setDeviceId] = useState(0);
+  // Auto-mode preferred GPU (DXGI index; null = fully automatic). Separate from
+  // deviceId: Auto's pick is nullable and lives in the DXGI space regardless of
+  // which EP the probe lands on.
+  const [autoGpu, setAutoGpu] = useState<number | null>(null);
   const [gpuLists, setGpuLists] = useState<InferenceGpuLists | null>(null);
   const [saving, setSaving] = useState(false);
   const [cudaReady, setCudaReady] = useState(false);
@@ -349,6 +357,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       .then((h) => {
         setHw(h);
         setDeviceId(h.current_device_id ?? 0);
+        setAutoGpu(h.auto_gpu ?? null);
       })
       .catch(() => {});
     invoke<string>("get_device_preference").then(setDevice).catch(() => {});
@@ -726,12 +735,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
   const handleDeviceChange = useCallback(async (value: string) => {
     setDevice(value);
-    // Switching the MODE resets the ordinal to 0 — the two pickers live in different
-    // id spaces (DML = DXGI index, CUDA = CUDA ordinal), so an id can't carry across.
+    // Switching the MODE resets the pick — the pickers live in different id spaces
+    // (DML = DXGI index, CUDA = CUDA ordinal, Auto = nullable DXGI index), so a
+    // value can't carry across. Auto/CPU send null (= no Auto preference).
     setDeviceId(0);
+    setAutoGpu(null);
+    const explicit = value === "cuda" || value === "directml";
     setSaving(true);
     try {
-      await invoke("set_device_preference", { device: value, deviceId: 0 });
+      await invoke("set_device_preference", { device: value, deviceId: explicit ? 0 : null });
     } catch (e) {
       console.error("Failed to save device preference:", e);
     }
@@ -753,6 +765,19 @@ export function Settings({ onClose }: { onClose: () => void }) {
     },
     [device],
   );
+
+  // Auto-mode preferred GPU (§user): null = fully automatic. Applies live too; only a
+  // vendor change that needs the OTHER ORT build requires a restart (hint below).
+  const handleAutoGpuPick = useCallback(async (id: number | null) => {
+    setAutoGpu(id);
+    setSaving(true);
+    try {
+      await invoke("set_device_preference", { device: "auto", deviceId: id });
+    } catch (e) {
+      console.error("Failed to save auto GPU preference:", e);
+    }
+    setSaving(false);
+  }, []);
 
   // S64c structured progress → localized line (code + proper-noun label; raw message = fallback,
   // the pyenv pgDownloading/pgExtracting pattern).
@@ -849,6 +874,11 @@ export function Settings({ onClose }: { onClose: () => void }) {
       dmlOpt: { zh: "DirectML (通用 GPU)", en: "DirectML (Any GPU)", ja: "DirectML (汎用 GPU)" },
       cpuOpt: { zh: "CPU", en: "CPU", ja: "CPU" },
       gpuPick: { zh: "首选 GPU", en: "Preferred GPU", ja: "優先 GPU" },
+      gpuAutoPick: {
+        zh: "自动选择（高性能优先）",
+        en: "Automatic (high-performance first)",
+        ja: "自動選択（高性能優先）",
+      },
       gpuGone: {
         zh: "GPU {id}（未检测到——请重新选择）",
         en: "GPU {id} (not detected — pick again)",
@@ -1113,14 +1143,46 @@ export function Settings({ onClose }: { onClose: () => void }) {
             {saving && <span className="settings-saving">...</span>}
           </div>
 
-          {/* S68b preferred-GPU picker — explicit CUDA/DirectML modes only. Auto keeps
-              its own adapter selection (DXCore high-performance for DML) and must not
-              be steered by an ordinal; a software adapter keeps its index slot but is
-              greyed out (ORT refuses it — never compact the DXGI id space). */}
-          {(device === "cuda" || device === "directml") &&
+          {/* S68b preferred-GPU picker. Explicit modes: id in the EP's own space (DML =
+              DXGI index, CUDA = CUDA ordinal). Auto (§user): a nullable DXGI-adapter
+              pick — Auto still chooses the EP route, the pick only steers which card
+              the GPU legs bind ("自动选择" = the pre-pick DXCore behavior). Software
+              adapters keep their index slot but are greyed out (ORT refuses them —
+              never compact the DXGI id space). */}
+          {(device === "cuda" || device === "directml" || device === "auto") &&
             (() => {
               const opts = device === "cuda" ? gpuLists?.cuda : gpuLists?.directml;
               if (!opts || opts.length === 0) return null;
+              if (device === "auto") {
+                const stale = autoGpu !== null && !opts.some((o) => o.id === autoGpu);
+                // Hide the row on single-GPU boxes (nothing to prefer) — but NEVER while
+                // a stale pick is stored: the row is the only affordance to clear it
+                // (review round 2: hiding it left a dangling pick steering the backend).
+                if (opts.filter((o) => o.selectable).length < 2 && !stale) return null;
+                return (
+                  <div className="settings-field">
+                    <label>{L("gpuPick")}</label>
+                    <select
+                      value={autoGpu === null ? "" : String(autoGpu)}
+                      onChange={(e) =>
+                        handleAutoGpuPick(e.target.value === "" ? null : Number(e.target.value))
+                      }
+                    >
+                      <option value="">{L("gpuAutoPick")}</option>
+                      {stale && (
+                        <option value={String(autoGpu)} disabled>
+                          {L("gpuGone").replace("{id}", String(autoGpu))}
+                        </option>
+                      )}
+                      {opts.map((o) => (
+                        <option key={o.id} value={String(o.id)} disabled={!o.selectable}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              }
               // A configured id can outlive its adapter (card removed / driver change
               // shrank the index space) — surface it instead of a blank select; the
               // engine still targets the stale ordinal until the user re-picks.
@@ -1149,14 +1211,30 @@ export function Settings({ onClose }: { onClose: () => void }) {
 
           {/* S68b: the community user read "CUDA可用 否" (a fact about THIS process's
               loaded build) as a hardware verdict and locked themselves onto DirectML.
-              Say explicitly when the preference needs a restart to actually apply. */}
+              Say explicitly when the preference needs a restart to actually apply.
+              Auto legs: a non-NVIDIA pick can't run on the CUDA build (no DML EP — it
+              would land on CPU until restart); an NVIDIA pick on the DML build runs on
+              the right card but only reaches CUDA after a restart. */}
           {hw &&
-            ((device === "cuda" && hw.ort_build === "DirectML") ||
-              (device === "directml" && hw.ort_build === "CUDA")) && (
-              <p className="settings-error">
-                {L("buildMismatch").replace("{build}", hw.ort_build)}
-              </p>
-            )}
+            (() => {
+              const autoVendor =
+                device === "auto" && autoGpu !== null
+                  ? gpuLists?.directml.find((o) => o.id === autoGpu)?.vendor
+                  : undefined;
+              const mismatch =
+                (device === "cuda" && hw.ort_build === "DirectML") ||
+                (device === "directml" && hw.ort_build === "CUDA") ||
+                (autoVendor !== undefined &&
+                  ((autoVendor !== "nvidia" && hw.ort_build === "CUDA") ||
+                    (autoVendor === "nvidia" &&
+                      hw.ort_build === "DirectML" &&
+                      hw.cuda_available)));
+              return mismatch ? (
+                <p className="settings-error">
+                  {L("buildMismatch").replace("{build}", hw.ort_build)}
+                </p>
+              ) : null;
+            })()}
 
           <p className="settings-note">{L("note")}</p>
         </section>

@@ -13,6 +13,8 @@ pub struct HardwareInfo {
     /// The configured GPU ordinal of the current device preference (0 for cpu/auto).
     /// S68b: feeds the Settings "preferred GPU" picker.
     pub current_device_id: u32,
+    /// S68b (§user): Auto-mode preferred GPU (DXGI index; None = fully automatic).
+    pub auto_gpu: Option<u32>,
     /// Which ORT build this PROCESS loaded ("CUDA" | "DirectML" | dev/system labels).
     /// S68b: lets the UI say "restart required" when the preference implies the OTHER
     /// build — the community user read the current-build fact as a hardware verdict.
@@ -64,6 +66,12 @@ pub struct AppConfig {
     /// is visible ⟺ it is effective; DirectML has no equivalent API).
     #[serde(default)]
     pub cuda_mem_limit_mb: u64,
+    /// S68b: Auto-mode preferred GPU as a DXGI adapter index (None = fully automatic —
+    /// the pre-S68b behavior). Kept OUTSIDE DeviceConfig so legacy `"device": "auto"`
+    /// strings keep deserializing (externally-tagged unit variant); skipped when None
+    /// so an untouched picker never even changes config.json's bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_gpu: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -72,6 +80,7 @@ impl Default for AppConfig {
             device: DeviceConfig::Auto,
             data_dir: None,
             cuda_mem_limit_mb: 0,
+            auto_gpu: None,
         }
     }
 }
@@ -130,6 +139,7 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         directml_available: cfg!(windows),
         current_device: current_str,
         current_device_id,
+        auto_gpu: state.inference.engine.auto_gpu(),
         ort_build: crate::ORT_LOADED_BUILD.get().cloned().unwrap_or_else(|| "?".to_string()),
         recommended_variant: recommend_variant(&gpus, has_nvidia).to_string(),
         nvidia_vram_mb: if has_nvidia { nvidia_total_vram_mb() } else { None },
@@ -401,10 +411,11 @@ pub fn set_device_preference(
     device: String,
     device_id: Option<u32>,
 ) -> Result<(), String> {
-    // S68b: the preferred-GPU picker feeds device_id (DML = DXGI EnumAdapters1 ordinal,
-    // CUDA = CUDA runtime ordinal — DIFFERENT spaces, see gpu.rs). Omitted → 0, the
-    // pre-picker behavior byte-for-byte. Auto deliberately carries no id: its DML leg
-    // resolves via DXCore high-performance selection and must stay untouched.
+    // S68b: the preferred-GPU picker feeds device_id. Explicit modes: DML = DXGI
+    // EnumAdapters1 ordinal, CUDA = CUDA runtime ordinal (DIFFERENT spaces, see gpu.rs);
+    // omitted → 0, the pre-picker behavior byte-for-byte. Auto (§user): device_id is the
+    // preferred DXGI adapter for BOTH GPU legs (CUDA maps it to an ordinal by LUID);
+    // None = fully automatic (DXCore high-performance pick) = pre-S68b behavior.
     let id = device_id.unwrap_or(0);
     let config = match device.as_str() {
         "cuda" => DeviceConfig::Cuda { device_id: id },
@@ -412,12 +423,15 @@ pub fn set_device_preference(
         "cpu" => DeviceConfig::Cpu,
         _ => DeviceConfig::Auto,
     };
+    let auto_gpu = if device == "auto" { device_id } else { None };
 
     state.inference.engine.set_device(config.clone());
+    state.inference.engine.set_auto_gpu(auto_gpu);
 
     // Persist — load-then-update so we never clobber the rest of the config (esp. data_dir).
     let mut cfg = load_config(&state.app_dir).unwrap_or_default();
     cfg.device = config;
+    cfg.auto_gpu = auto_gpu;
     if let Err(e) = save_config(&state.app_dir, &cfg) {
         tracing::warn!("Failed to save config: {}", e);
     }
@@ -427,12 +441,14 @@ pub fn set_device_preference(
 
 /// One GPU choice for the inference preferred-GPU picker. `id` lives in the EP's OWN
 /// ordinal space (see gpu.rs); `selectable=false` = a software adapter that occupies an
-/// index slot (ORT throws if picked) — shown greyed, never compacted away.
+/// index slot (ORT throws if picked) — shown greyed, never compacted away. `vendor`
+/// drives the Auto-mode restart hint (a non-NVIDIA pick can't run on the CUDA build).
 #[derive(serde::Serialize)]
 pub struct InferenceGpuChoice {
     pub id: u32,
     pub label: String,
     pub selectable: bool,
+    pub vendor: String,
 }
 
 #[derive(serde::Serialize)]
@@ -457,6 +473,7 @@ pub fn list_inference_gpus() -> InferenceGpuLists {
                 format!("GPU {}: {}", a.index, a.name)
             },
             selectable: !a.software,
+            vendor: a.vendor.to_string(),
         })
         .collect();
     let cuda = crate::gpu::cuda_devices()
@@ -465,6 +482,7 @@ pub fn list_inference_gpus() -> InferenceGpuLists {
             id: d.index,
             label: format!("CUDA {}: {}", d.index, d.name),
             selectable: true,
+            vendor: "nvidia".to_string(),
         })
         .collect();
     InferenceGpuLists { directml, cuda }
@@ -523,6 +541,7 @@ pub fn load_and_apply_config(state: &AppState) {
             build
         );
         state.inference.engine.set_device(cfg.device);
+        state.inference.engine.set_auto_gpu(cfg.auto_gpu);
         if cfg.cuda_mem_limit_mb > 0 {
             crate::inference::engine::CUDA_MEM_LIMIT_MB
                 .store(cfg.cuda_mem_limit_mb, std::sync::atomic::Ordering::Relaxed);

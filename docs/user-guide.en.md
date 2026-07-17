@@ -114,9 +114,9 @@ The app accelerates AI inference with your GPU. "Settings" → "Hardware" shows 
 
 **NVIDIA users should install the CUDA runtime**: in "Settings" → "CUDA Runtime", click "Download CUDA Runtime" (about 1.6 GB). It is fully self-contained — you do not need to install the CUDA Toolkit yourself; the app downloads every runtime library automatically. **Restart the app** after the download to activate it.
 
-**Multi-GPU machines can choose which card to use**: switch "Inference Device" to "CUDA" or "DirectML" and a "Preferred GPU" dropdown appears below, listing this machine's GPUs (greyed entries in the DirectML list are virtual system adapters and cannot be selected). "Auto" has no dropdown — it picks a high-performance GPU by itself.
+**Multi-GPU machines can choose which card to use**: a "Preferred GPU" dropdown appears below "Inference Device", listing this machine's GPUs (greyed entries are virtual system adapters and cannot be selected). Under "Auto" it defaults to "Automatic (high-performance first)" but can be set to a specific card — "Auto" still decides between CUDA and DirectML; "Preferred GPU" only decides which card.
 
-> Caution: changing "Inference Device" requires an app restart (the UI says so too: "Restart the app after changing device.", and a red hint shows which runtime this session actually loaded when they mismatch); changing only "Preferred GPU" applies without a restart. Also, a self-installed CUDA Toolkit 13 is not a substitute for this download (version mismatch) — use the in-app download.
+> Caution: changing "Inference Device" requires an app restart (the UI says so too: "Restart the app after changing device.", and a red hint shows which runtime this session actually loaded when a restart is needed); changing only "Preferred GPU" usually applies immediately (a few combinations, like picking the iGPU under "Auto", need the restart the red hint asks for). Also, a self-installed CUDA Toolkit 13 is not a substitute for this download (version mismatch) — use the in-app download.
 
 ### 2.5 The data folder
 

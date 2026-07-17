@@ -216,7 +216,16 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
         // Auto needs the provider's FULL dependency set resolvable, not just cudart (S64c audit: a
         // PARTIAL wheel install would otherwise pick the CUDA build — which has no DirectML provider —
         // and silently drop a DirectML-capable NVIDIA box to CPU every session).
-        _ => cuda_dll.exists() && crate::commands::settings::cuda_provider_deps_resolvable(app_dir),
+        // S68b: an Auto-mode preferred NON-NVIDIA GPU must load the DirectML build for the
+        // same reason — the CUDA build can't honor the pick and Auto would land on CPU.
+        _ => {
+            let picked_non_nvidia = read_auto_gpu(app_dir)
+                .and_then(crate::gpu::adapter_vendor)
+                .is_some_and(|v| v != "nvidia");
+            !picked_non_nvidia
+                && cuda_dll.exists()
+                && crate::commands::settings::cuda_provider_deps_resolvable(app_dir)
+        }
     };
 
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -337,6 +346,15 @@ fn read_device_preference(app_dir: &std::path::Path) -> Option<String> {
         return Some(s.to_string());
     }
     device.as_object().and_then(|o| o.keys().next().cloned())
+}
+
+/// S68b: the Auto-mode preferred GPU (config.json `auto_gpu`), read pre-tauri like
+/// read_device_preference — the ORT build pick needs it before AppState exists.
+fn read_auto_gpu(app_dir: &std::path::Path) -> Option<u32> {
+    let cfg_path = app_dir.join("config.json");
+    let content = std::fs::read_to_string(&cfg_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    val.get("auto_gpu")?.as_u64().map(|v| v as u32)
 }
 
 /// Add CUDA runtime DLL directories to PATH so ORT CUDA EP can find cuDNN/cublas.
