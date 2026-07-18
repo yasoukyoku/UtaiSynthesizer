@@ -11,18 +11,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "UtaiSynthesizer",
-        "width": 1400,
-        "height": 900,
-        "minWidth": 1024,
-        "minHeight": 700,
-        "decorations": true,
-        "resizable": true,
-        "visible": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null,
       "assetProtocol": {
@@ -69,6 +58,7 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
+        "installerHooks": "./installer/hooks.nsh",
         "installerIcon": "icons/icon.ico",
         "headerImage": "installer/header.bmp",
         "sidebarImage": "installer/sidebar.bmp",

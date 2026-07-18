@@ -272,7 +272,41 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// S68e fullportable: RELEASE builds root the logs next to the exe (`<install>\logs`)
+/// so the whole install is one carry-able folder; the legacy identifier dir stays as
+/// the fallback when the exe dir is unwritable (folder moved under a protected path,
+/// read-only media). Dev builds keep the legacy location on purpose — the dev app
+/// root is the REPO, and a repo-local logs/ would pollute the working tree. Resolved
+/// ONCE per process (the probe writes a marker file; 8 call sites — crash sentinels,
+/// log panel, storage stats, open-folder — must all agree anyway).
 pub fn get_log_dir() -> PathBuf {
+    static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LOG_DIR
+        .get_or_init(|| {
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            if let Some(dir) = portable_log_dir() {
+                return dir;
+            }
+            legacy_log_dir()
+        })
+        .clone()
+}
+
+/// `<exe dir>\logs` when creatable AND writable (probed with a marker write — a
+/// merely-creatable dir on read-only media would lose every log line silently).
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn portable_log_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let probe = dir.join(".writable");
+    std::fs::write(&probe, b"").ok()?;
+    let _ = std::fs::remove_file(&probe);
+    Some(dir)
+}
+
+/// The pre-S68e log home (`%LOCALAPPDATA%\com.utaisynthesizer.app\logs`) — still the
+/// dev-build location, the unwritable-root fallback, and the migration SOURCE.
+pub fn legacy_log_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -288,6 +322,56 @@ pub fn get_log_dir() -> PathBuf {
         }
     }
     PathBuf::from(".").join("logs")
+}
+
+/// S68e one-time move of the legacy log home into the merged location — log files AND
+/// crash sentinels (`session.<pid>.alive`), so the crash-autopsy chain stays unbroken
+/// across the update. Same-name targets are left alone (re-runs are no-ops); rename
+/// first, copy+delete as the cross-volume fallback; everything best-effort and SILENT
+/// (runs before tracing exists). No-op when the locations coincide (dev builds).
+pub fn migrate_legacy_logs(new_dir: &PathBuf) {
+    let old = legacy_log_dir();
+    if old == *new_dir || !old.is_dir() {
+        return;
+    }
+    // DEFER the whole migration while any OTHER live session still logs into the
+    // legacy home (a pre-update copy running elsewhere) — review S68e: moving its
+    // OPEN daily file cross-volume sends the file delete-pending (every line it
+    // writes after our copy snapshot silently dies), and moving its live
+    // session.<pid>.alive sentinel fires a FALSE crash autopsy on our next boot.
+    // Retried automatically on every boot; once that session ends, files move.
+    if let Ok(rd) = std::fs::read_dir(&old) {
+        let me = std::process::id();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(pid) = name
+                .strip_prefix("session.")
+                .and_then(|s| s.strip_suffix(".alive"))
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if pid != me && crate::crashlog::pid_alive(pid) {
+                    return;
+                }
+            }
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(&old) else { return };
+    for e in rd.flatten() {
+        let from = e.path();
+        if !from.is_file() {
+            continue;
+        }
+        let to = new_dir.join(e.file_name());
+        if to.exists() {
+            continue;
+        }
+        if std::fs::rename(&from, &to).is_err() {
+            if std::fs::copy(&from, &to).is_ok() {
+                let _ = std::fs::remove_file(&from);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(&old); // only succeeds once fully emptied
 }
 
 #[cfg(test)]

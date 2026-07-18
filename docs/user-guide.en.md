@@ -137,7 +137,7 @@ The download can be cancelled; the install phase cannot, and quitting the app is
 
 ### 2.7 Moving the install (portable)
 
-The app is fully portable: cut the **entire install folder** (default `C:\Users\<you>\AppData\Local\UtaiSynthesizer`) to any location — another drive, say — and double-click the `UtaiSynthesizer.exe` inside; models, the data directory and settings all travel with it.
+The app is fully portable: cut the **entire install folder** (default `C:\Users\<you>\AppData\Local\UtaiSynthesizer`) to any location — another drive, say — and double-click the `UtaiSynthesizer.exe` inside; models, the data directory and settings all travel with it. (Since v0.8.0 the logs and the UI cache also live inside the install folder — `logs\` and `webview\`; after a move, the only things left in system directories are a few-KB window-position memory file and any leftovers from pre-0.8.0 versions, which you can delete manually.)
 
 Since v0.7.0, updates after a move also happen **in place**: the in-app updater installs straight into the folder the running copy lives in, and once the app has started at the new location once, manually downloaded installers recognize it too (the app re-points the Windows-recorded install location at itself).
 
@@ -1361,7 +1361,7 @@ Yes. An update replaces only the program itself; the data folder (models/caches/
 Two places:
 
 1. In the app: the title bar's "Log" button opens the log viewer — filter by "Error" "Warning" etc., search, and click "COPY" to copy the current filtered lines.
-2. On disk: the `%LOCALAPPDATA%\com.utaisynthesizer.app\logs` folder, with daily-rolling `utai.log` files (they survive crashes — built for post-mortems). The small `session.<pid>.alive` file there is a running marker: if the previous session didn't exit cleanly (crash, forced kill, or shutting Windows down with the app open), the next start automatically reads the Windows Event Log and writes "crash autopsy" diagnosis lines into the log — that's a feature, not a fault.
+2. On disk: the **`logs` folder inside the install directory** (default `%LOCALAPPDATA%\UtaiSynthesizer\logs`; the "Open log folder" button on the "Log" page jumps straight there. Before v0.8.0 it was `%LOCALAPPDATA%\com.utaisynthesizer.app\logs` — old logs move over automatically on upgrade), with daily-rolling `utai.log` files (they survive crashes — built for post-mortems). The small `session.<pid>.alive` file there is a running marker: if the previous session didn't exit cleanly (crash, forced kill, or shutting Windows down with the app open), the next start automatically reads the Windows Event Log and writes "crash autopsy" diagnosis lines into the log — that's a feature, not a fault.
 
 When reporting a bug, include: the app version (first row of the "Help & Community" menu), reproduction steps, and the relevant log copied from the log viewer or the log file. Where to send it is in the next chapter.
 
@@ -1382,7 +1382,7 @@ When reporting a bug, attaching these four things makes everything much faster:
 
 1. The app version (first row of the "Help & Community" menu).
 2. Step-by-step reproduction (starting state, what you clicked, what you expected, what actually happened).
-3. The relevant log lines from the "Log" viewer's "COPY", or that day's log file from `%LOCALAPPDATA%\com.utaisynthesizer.app\logs`.
+3. The relevant log lines from the "Log" viewer's "COPY", or that day's log file from the install directory's `logs` folder ("Log" page → "Open log folder").
 4. A screenshot for anything visual.
 
 Have fun, and sing your heart out.

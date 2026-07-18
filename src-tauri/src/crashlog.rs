@@ -39,7 +39,9 @@ fn now_epoch() -> u64 {
 /// Is the pid a live process? OpenProcess + STILL_ACTIVE — a reused pid can read as
 /// "alive" (skips one autopsy, rare and harmless); a dead pid never reads alive.
 #[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
+/// pub(crate): S68e's legacy-log migration defers while a foreign session's sentinel
+/// pid is alive (logging.rs) — same liveness question as the sentinel rotation here.
+pub(crate) fn pid_alive(pid: u32) -> bool {
     #[link(name = "kernel32")]
     extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
@@ -61,7 +63,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(windows))]
-fn pid_alive(_pid: u32) -> bool {
+pub(crate) fn pid_alive(_pid: u32) -> bool {
     false
 }
 

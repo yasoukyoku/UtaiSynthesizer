@@ -54,6 +54,6 @@ body:
     attributes:
       label: Logs / 日志
       description: |
-        顶栏「日志」页可直接查看;日志文件在 `%LOCALAPPDATA%\com.utaisynthesizer.app\logs`。
-        Paste the relevant lines from the in-app Log page or the log files.
+        顶栏「日志」页可直接查看;日志文件在安装目录下的 `logs` 文件夹(「日志」页→「打开日志文件夹」;v0.8.0 之前在 `%LOCALAPPDATA%\com.utaisynthesizer.app\logs`)。
+        Paste the relevant lines from the in-app Log page or the log files (the install dir's `logs` folder — "Log" page → "Open log folder"; before v0.8.0: `%LOCALAPPDATA%\com.utaisynthesizer.app\logs`).
       render: text

@@ -601,6 +601,80 @@ fn resolve_app_dir() -> std::path::PathBuf {
     exe_dir.unwrap_or(cwd)
 }
 
+/// S68e: `<exe dir>\webview` as the WebView2 user data folder (WebView2 itself appends
+/// an `EBWebView` subdir inside it — the legacy default did the same under the
+/// identifier dir). ONE-TIME migration: when the merged dir doesn't exist yet and the
+/// legacy profile does, copy it over (pid-suffixed staging dir + rename — two racing
+/// first-boot instances each stage privately and the loser just cleans up; the profile
+/// holds localStorage — UI language + toggles — that must survive the move; ~170 MB, a
+/// one-off few seconds). EVERY failure returns None = the webview stays on the LEGACY
+/// default profile (nothing lost, retried next boot) — the merged dir is only created
+/// once the migration (or a fresh install with no legacy profile) succeeds, and it is
+/// writability-probed before use: a read-only dir handed to WebView2 fails environment
+/// creation, which would otherwise take the whole window (and boot) down (review S68e).
+#[cfg(not(debug_assertions))]
+fn webview_data_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.join("webview");
+    if !dir.exists() {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let legacy = std::path::PathBuf::from(local)
+                .join("com.utaisynthesizer.app")
+                .join("EBWebView");
+            if legacy.is_dir() {
+                // Disk preflight (S68d posture): stay on the legacy profile rather
+                // than half-copy on a tight volume; retried once space frees up.
+                let needed =
+                    commands::settings::migrate_tree_needed(&legacy, &dir.join("EBWebView"), false);
+                if let Some(free) = util::free_bytes_at(dir.parent()?) {
+                    if free < needed.saturating_mul(2) {
+                        tracing::warn!(
+                            "webview profile migration deferred: {} MB needed, {} MB free",
+                            needed / 1_000_000,
+                            free / 1_000_000
+                        );
+                        return None;
+                    }
+                }
+                let staging = dir.with_extension(format!("staging{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&staging);
+                let copied =
+                    commands::settings::copy_dir_all(&legacy, &staging.join("EBWebView"), false);
+                match copied {
+                    Ok(()) => {
+                        if std::fs::rename(&staging, &dir).is_err() {
+                            let _ = std::fs::remove_dir_all(&staging);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "webview profile migration failed ({e}) — staying on the legacy profile (retried next boot)"
+                        );
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return None;
+                    }
+                }
+                if !dir.exists() {
+                    // Lost the staging race AND the winner hasn't landed either —
+                    // stay on the legacy profile this boot.
+                    return None;
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let probe = dir.join(".writable");
+    std::fs::write(&probe, b"").ok()?;
+    let _ = std::fs::remove_file(&probe);
+    Some(dir)
+}
+
+/// Dev builds keep the tauri default profile (identifier dir) — the dev app root is
+/// the repo, and a repo-local webview/ would pollute the working tree.
+#[cfg(debug_assertions)]
+fn webview_data_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Observed: Auto loading the CUDA build hung on a missing cudart/cublas without this —
@@ -608,6 +682,10 @@ pub fn run() {
     suppress_windows_dll_error_dialogs();
     let log_dir = logging::get_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
+    // S68e: move the legacy identifier-dir logs (incl. crash sentinels) into the
+    // merged home BEFORE the appender opens today's file — a same-day upgrade then
+    // keeps appending to the migrated file instead of forking a second one.
+    logging::migrate_legacy_logs(&log_dir);
 
     // S67: the offset is captured once and drives BOTH the per-line timestamps and
     // the daily file roll (LocalDailyFile — tracing-appender's own rolling::daily is
@@ -835,6 +913,49 @@ pub fn run() {
                 });
             }
             app.manage(state);
+
+            // S68e fullportable: the main window is created IN CODE (tauri.conf.json no
+            // longer declares windows[]) so the WebView2 profile — localStorage: UI
+            // language + toggles; previously %LOCALAPPDATA%\com.utaisynthesizer.app\
+            // EBWebView — can live inside the install folder (<exe>\webview). The S64
+            // startup close-race contract is preserved VERBATIM and needs all three
+            // legs: visible(false) here + the frontend's show()-after-close-listener +
+            // the window-state plugin registered with !VISIBLE flags (see
+            // project_v2_tray_close_flow) — do not touch any of them in isolation.
+            // Property values transcribed 1:1 from the removed conf entry.
+            {
+                let build_main = |data_dir: Option<std::path::PathBuf>| {
+                    let wb =
+                        tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                            .title("UtaiSynthesizer")
+                            .inner_size(1400.0, 900.0)
+                            .min_inner_size(1024.0, 700.0)
+                            .resizable(true)
+                            .decorations(true)
+                            .visible(false);
+                    let wb = match data_dir {
+                        Some(dir) => wb.data_directory(dir),
+                        None => wb,
+                    };
+                    wb.build()
+                };
+                match webview_data_dir() {
+                    Some(dir) => {
+                        if let Err(e) = build_main(Some(dir)) {
+                            // Last resort (review S68e): a poisoned merged profile dir
+                            // must never keep the app from booting — fall back to the
+                            // default profile location and try once more.
+                            tracing::warn!(
+                                "window build with merged webview profile failed ({e}) — retrying with the default profile"
+                            );
+                            build_main(None)?;
+                        }
+                    }
+                    None => {
+                        build_main(None)?;
+                    }
+                }
+            }
 
             // System tray — minimize-to-tray + a Show/Quit menu. Menu/click events route to the FRONTEND,
             // which owns the close-flow (in-progress-work + unsaved-changes prompts). Labels follow the UI

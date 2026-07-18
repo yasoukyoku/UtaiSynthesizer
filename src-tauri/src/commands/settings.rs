@@ -678,7 +678,8 @@ fn skips_dot_top(subtree: &str) -> bool {
 }
 
 /// Recursively copy a directory's contents into `dst` (creating it). Cross-drive safe (copy, not rename).
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> std::io::Result<()> {
+/// pub(crate): also the S68e webview-profile migration's copier (lib.rs) — ONE walker.
+pub(crate) fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> std::io::Result<()> {
     if !src.exists() {
         return Ok(());
     }
@@ -709,7 +710,8 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool
 /// `fs::metadata` follows file symlinks, so linked content is counted the way the copy
 /// will actually copy it); crediting only the same-path target file keeps unrelated
 /// pre-existing target content from shrinking the estimate (both review S68d).
-fn migrate_tree_needed(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> u64 {
+/// pub(crate): also sizes the S68e webview-profile migration (lib.rs).
+pub(crate) fn migrate_tree_needed(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> u64 {
     let mut needed = 0u64;
     let Ok(rd) = std::fs::read_dir(src) else { return 0 };
     for entry in rd.flatten() {
@@ -944,8 +946,9 @@ pub fn migrate_pending_restart() -> bool {
 /// session instead would collide with live handles — ONNX session mmaps, asset-protocol reads).
 ///
 /// Deletion is scoped to MIGRATED_SUBTREES — NEVER the root itself unless it ends up empty: the
-/// legacy-AppData root also houses `logs\` (this very session's log worker is writing there) and
-/// the window-state file. A subtree whose delta-sync had ANY failure is kept whole (data beats
+/// legacy-AppData root can also house `logs\` (dev builds always; release builds until the S68e
+/// log migration has moved them — possibly THIS session's still-writing worker) and other
+/// identifier-dir state. A subtree whose delta-sync had ANY failure is kept whole (data beats
 /// disk space); bundled dictionaries under the default root are kept too. Per-entry single
 /// attempt: a PROCESSED entry leaves the queue even if some subtrees were kept (WARNed with
 /// paths) — retrying forever would re-run the delta-sync every boot and could resurrect files the
