@@ -52,6 +52,13 @@ import onnx
 from onnx import TensorProto
 from onnxconverter_common import float16
 
+# Conversion-recipe generation, stamped as a `<stem>.fp16.recipe` sidecar next to every
+# successful fp16 output. The UI's "重转 fp16" cure button shows ONLY for marker-less /
+# stale-marker files, so one successful reconvert stops the prompt forever (§user S68c).
+# 2 = norm-stats fp32 protection + round-trip collapse + dead-cast prune.
+# MUST mirror src-tauri/src/commands/msst_models.rs FP16_RECIPE.
+FP16_RECIPE = 2
+
 
 def default_fp16_path(in_path) -> Path:
     """`<stem>.fp16.onnx` sibling of `<stem>.onnx` (the file-naming contract)."""
@@ -342,6 +349,8 @@ def convert_onnx_to_fp16(in_path, out_path) -> Path:
     tmp_path = out_path.with_name(out_path.name + ".tmp")
     onnx.save(fp16_model, str(tmp_path))
     os.replace(tmp_path, out_path)
+    # Recipe stamp AFTER the model is in place — marker present ⇒ model is current-recipe.
+    out_path.with_suffix(".recipe").write_text(str(FP16_RECIPE), encoding="ascii")
 
     in_size = os.path.getsize(in_path)
     out_size = os.path.getsize(out_path)

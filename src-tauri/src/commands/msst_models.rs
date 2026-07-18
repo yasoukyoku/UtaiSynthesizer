@@ -6,6 +6,10 @@ use tauri::{Emitter, State};
 
 use crate::AppState;
 
+/// The fp16 conversion-recipe generation this build considers current.
+/// MUST mirror converter/onnx_fp16.py FP16_RECIPE (the stamp's single writer).
+const FP16_RECIPE: &str = "2";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsstModelFile {
     pub filename: String,
@@ -16,6 +20,11 @@ pub struct MsstModelFile {
     /// The `<stem>.fp16.onnx` variant exists. Either precision alone is runnable — the node's
     /// precision selector only appears when BOTH do.
     pub has_fp16: bool,
+    /// S68c: the fp16 file carries a current-recipe stamp (`<stem>.fp16.recipe` sidecar, written
+    /// by onnx_fp16.py on success). false ⇒ converted by an older build (roformers: can go
+    /// all-NaN on silent chunks on GPU EPs) ⇒ the manager shows the "重转 fp16" cure button;
+    /// one successful reconvert stamps it and the prompt stops (§user).
+    pub fp16_recipe_ok: bool,
     /// The model's TRUE output order from its json (converter reads it from ckpt kwargs/yaml).
     /// The frontend MUST label output ports from this, not from hand-written catalog lists:
     /// htdemucs_6s really outputs [drums,bass,other,vocals,guitar,piano] while its model card
@@ -86,7 +95,12 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
 
         let fp32_onnx = path.with_extension("onnx");
         let has_onnx = if ext == "onnx" { true } else { fp32_onnx.exists() };
-        let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
+        let fp16_path = crate::separation::fp16_sibling(&fp32_onnx);
+        let has_fp16 = fp16_path.exists();
+        let fp16_recipe_ok = has_fp16
+            && std::fs::read_to_string(fp16_path.with_extension("recipe"))
+                .map(|s| s.trim() == FP16_RECIPE)
+                .unwrap_or(false);
         let (stem_names, residual_name, num_overlap) = read_json_fields(&fp32_onnx);
 
         models.push(MsstModelFile {
@@ -95,6 +109,7 @@ pub fn list_msst_models(state: State<'_, Arc<AppState>>) -> Result<Vec<MsstModel
             architecture,
             has_onnx,
             has_fp16,
+            fp16_recipe_ok,
             stem_names,
             residual_name,
             num_overlap,
@@ -299,7 +314,7 @@ pub fn delete_msst_model(
     let stem = PathBuf::from(&filename);
     let stem_name = stem.file_stem().unwrap_or_default().to_string_lossy();
 
-    for ext in &["json", "yaml", "yml", "onnx", "fp16.onnx"] {
+    for ext in &["json", "yaml", "yml", "onnx", "fp16.onnx", "fp16.recipe"] {
         let related = dir.join(format!("{}.{}", stem_name, ext));
         if related.exists() {
             std::fs::remove_file(&related).ok();
@@ -343,7 +358,12 @@ pub fn import_local_msst_model(
     let architecture = detect_architecture_from_name(&filename);
     let fp32_onnx = dest.with_extension("onnx");
     let has_onnx = fp32_onnx.exists();
-    let has_fp16 = crate::separation::fp16_sibling(&fp32_onnx).exists();
+    let fp16_path = crate::separation::fp16_sibling(&fp32_onnx);
+    let has_fp16 = fp16_path.exists();
+    let fp16_recipe_ok = has_fp16
+        && std::fs::read_to_string(fp16_path.with_extension("recipe"))
+            .map(|s| s.trim() == FP16_RECIPE)
+            .unwrap_or(false);
     let (stem_names, residual_name, num_overlap) = read_json_fields(&fp32_onnx);
 
     tracing::info!("Imported MSST model: {}", filename);
@@ -353,6 +373,7 @@ pub fn import_local_msst_model(
         architecture,
         has_onnx,
         has_fp16,
+        fp16_recipe_ok,
         stem_names,
         residual_name,
         num_overlap,

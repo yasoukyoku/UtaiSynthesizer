@@ -242,7 +242,7 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                                 LARGEST victim group of the pre-protection fp16 recipe — they must get
                                 the cure here too. "重转 fp16" without an fp32 on disk goes through the
                                 full ckpt export (slower) and lands back in fp16-only shape. */}
-                            {m.has_fp16 && (
+                            {m.has_fp16 && !m.fp16_recipe_ok && (
                               <button
                                 className="msst-convert-btn"
                                 disabled={anyConverting}
@@ -261,11 +261,12 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                               {t18({ zh: "补转 fp32", en: "Convert to fp32", ja: "fp32に変換" }, lang)}
                             </button>
                           </>
-                        ) : fp16Capable ? (
-                          // S68c: both variants installed → offer a REFRESH of the fp16 (cheap, from
-                          // the fp32 on disk). Older builds converted roformer fp16 without the fp32
-                          // norm-stats protection — those files can NaN on true-fp16 GPU kernels;
-                          // this is the existing user's one-click cure.
+                        ) : fp16Capable && !m.fp16_recipe_ok ? (
+                          // S68c: both variants installed but the fp16 lacks the current-recipe stamp
+                          // (`<stem>.fp16.recipe`) → offer a REFRESH (cheap, from the fp32 on disk).
+                          // Older builds converted roformer fp16 without the fp32 norm-stats
+                          // protection — those files can NaN on true-fp16 GPU kernels. A successful
+                          // reconvert stamps the recipe and this button disappears (§user).
                           <button
                             className="msst-convert-btn"
                             disabled={anyConverting}
