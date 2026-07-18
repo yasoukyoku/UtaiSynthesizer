@@ -115,6 +115,44 @@ fn expand_routes(routes: &Option<Vec<String>>, base: &str) -> Vec<tauri::Url> {
     out
 }
 
+/// S68d fullportable: aim the NSIS run at the DIRECTORY THIS COPY RUNS FROM.
+/// `/D=` pre-sets $INSTDIR before .onInit, whose default+registry-restore block only
+/// runs while $INSTDIR is still the placeholder — so a moved install updates itself
+/// IN PLACE instead of resurrecting at the stale registry location (the "update always
+/// lands back on C:" report). Mechanics, all verified against the generated
+/// installer.nsi + plugin 2.10.1 source:
+///   - the plugin appends custom installer_args LAST and joins the whole parameter
+///     list space-separated UNQUOTED — exactly NSIS's /D contract (must be last, must
+///     not be quoted, takes the rest of the line; spaces + CJK survive via the
+///     UTF-16 ShellExecuteW path);
+///   - the template's /ARGS relaunch value stops at the next `/`-token, so /D never
+///     leaks into the restarted app's argv;
+///   - after the install, the NSIS Section rewrites MANUPRODUCTKEY + the uninstall
+///     entry from the new $INSTDIR — one in-app update permanently repairs the
+///     registry (correct quoting + fresh DisplayVersion) better than we could.
+/// Gated on uninstall.exe sitting next to the exe: only installer-produced copies
+/// self-target (a bare `cargo build --release` run must not turn target\release into
+/// an install location). Empty vec = stock behavior.
+fn portable_install_dir_args() -> Vec<std::ffi::OsString> {
+    #[cfg(windows)]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if dir.join("uninstall.exe").exists() {
+                    // current_exe() yields a plain Win32 path; strip a verbatim prefix
+                    // defensively — the NSIS stub doesn't understand \\?\.
+                    let shown = dir.to_string_lossy();
+                    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+                    let mut arg = std::ffi::OsString::from("/D=");
+                    arg.push(shown);
+                    return vec![arg];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 #[tauri::command]
 pub async fn update_check(
     app: tauri::AppHandle,
@@ -124,6 +162,8 @@ pub async fn update_check(
     if endpoints.is_empty() {
         return Err("UPDATE_CHECK_FAILED: no valid endpoint".into());
     }
+    // Snapshotted into the Update handle at check() time — install() can't add args.
+    let installer_args = portable_install_dir_args();
 
     // ONE endpoint per check() call (review S66): the plugin's own endpoint list only falls
     // through on transport/non-2XX errors — a poisoned proxy answering 200 + an HTML page
@@ -137,6 +177,7 @@ pub async fn update_check(
             .endpoints(vec![ep.clone()])
             .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?
             .timeout(Duration::from_secs(30))
+            .installer_args(installer_args.clone())
             .build()
             .map_err(|e| format!("UPDATE_CHECK_FAILED: {e}"))?;
         match updater.check().await {

@@ -135,6 +135,17 @@ About 3 seconds after startup the app checks for a new version automatically (tu
 
 The download can be cancelled; the install phase cannot, and quitting the app is not allowed during it.
 
+### 2.7 Moving the install (portable)
+
+The app is fully portable: cut the **entire install folder** (default `C:\Users\<you>\AppData\Local\UtaiSynthesizer`) to any location — another drive, say — and double-click the `UtaiSynthesizer.exe` inside; models, the data directory and settings all travel with it.
+
+Since v0.7.0, updates after a move also happen **in place**: the in-app updater installs straight into the folder the running copy lives in, and once the app has started at the new location once, manually downloaded installers recognize it too (the app re-points the Windows-recorded install location at itself).
+
+Two caveats:
+
+- If the old location still holds files after the move (i.e. it was actually a copy, not a cut), just delete the old folder in Explorer; **do not run the old folder's `uninstall.exe`** — it would also remove the new location's uninstall entry. After deleting the old folder, **start the app once more** so it re-points the install records at the new location (while the old copy still exists, the app deliberately leaves the records alone).
+- Avoid keeping two copies in active use: during an update the installer closes the app by process name. (The app never touches the registry records of a copy that is still alive elsewhere.)
+
 ---
 
 ## 3. Main Window Tour

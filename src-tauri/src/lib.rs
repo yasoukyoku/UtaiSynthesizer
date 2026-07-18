@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod inference;
 pub mod logging;
 pub mod models;
+pub mod portable;
 pub mod pyenv;
 pub mod separation;
 pub mod training;
@@ -699,6 +700,15 @@ pub fn run() {
     // classes our own log structurally cannot).
     crashlog::install_panic_hook(log_dir.clone(), tz_offset);
     crashlog::spawn_autopsy(crashlog::rotate_session_sentinel(&log_dir));
+
+    // S68d fullportable: if this installed copy was MOVED, point the installer's
+    // registry memory (and the Add/Remove entry) at where it actually lives — manual
+    // installer runs then land here instead of resurrecting on C:. Heavily guarded
+    // (dead-location proof etc.) — see portable.rs; warn-only. On a BACKGROUND thread:
+    // the dead-location probe stats the recorded dir, and a stale record pointing at
+    // an offline network share would otherwise stall boot for the SMB connect timeout
+    // (review S68d). Nothing at boot depends on these registry values.
+    std::thread::spawn(portable::heal_install_registry);
 
     let app_dir_early = resolve_app_dir();
     setup_cuda_dll_paths(&app_dir_early);
