@@ -734,6 +734,10 @@ pub fn run() {
                     }
                 }
             }
+            // S68c: a completed data-dir migration leaves the OLD tree marked for reclaim — finish
+            // it now, on the first boot that runs on the NEW root (this process holds zero handles
+            // into the old tree at this point; the worker delta-syncs stragglers before deleting).
+            commands::settings::spawn_pending_data_dir_delete(app_dir_early.clone(), data_dir.clone());
             let cache_dir = data_dir.join("cache");
             let models_dir = data_dir.join("models");
             let _ = std::fs::create_dir_all(&cache_dir);
@@ -981,7 +985,10 @@ pub fn run() {
             commands::update::update_check,
             commands::update::update_install,
             commands::update::update_cancel,
+            commands::settings::bundled_integrity_report,
+            commands::settings::migrate_pending_restart,
             commands::window::quit_app,
+            commands::window::restart_app,
             commands::window::running_tasks,
             commands::window::set_tray_labels,
         ])

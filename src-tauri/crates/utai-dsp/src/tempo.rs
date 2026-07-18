@@ -111,7 +111,7 @@ pub fn analyze_tempo(mono: &[f32], sr: u32, beats_per_bar: u32) -> Result<TempoA
     // fit the grid on beats that carry real onset energy, fall back to all if too few survive.
     let strong_thr = {
         let mut s = track.strengths.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s.sort_by(|a, b| a.total_cmp(b));
         let top_half_mean =
             s[s.len() / 2..].iter().map(|v| *v as f64).sum::<f64>() / (s.len() - s.len() / 2) as f64;
         (0.3 * top_half_mean) as f32
@@ -162,7 +162,7 @@ pub fn analyze_tempo(mono: &[f32], sr: u32, beats_per_bar: u32) -> Result<TempoA
         .map(|m| bpm * m)
         .filter(|b| (BPM_MIN..=BPM_MAX).contains(b))
         .collect();
-    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    candidates.sort_by(|a, b| a.total_cmp(b));
 
     Ok(TempoAnalysis {
         bpm,
@@ -200,6 +200,12 @@ fn onset_envelope(mono: &[f32], sr: u32) -> (Vec<f32>, Vec<Vec<f32>>) {
     }
 
     // power_to_db(ref=max, amin=1e-10, top_db=80) — librosa semantics.
+    //
+    // ★ S68c: these f32::max clamps are ALSO this module's de-facto NaN/Inf sanitizer — Rust
+    // f32::max returns the non-NaN operand, so NaN power → 1e-10, Inf ref → NaN dB → -80. Every
+    // float sort downstream (strengths/candidates/peaks/ibis/…) relies on the values staying
+    // finite from here on. Do NOT rewrite these as hand-rolled `if a > b` comparisons or
+    // partial_cmp — that silently re-arms NaN panics across the whole file.
     let mut ref_max = 1e-10f32;
     for band in &mel {
         for &v in band {
@@ -341,7 +347,7 @@ fn estimate_bpm(env: &[f32], frame_rate: f64) -> Option<(Vec<(f64, f64)>, f32, b
             peaks.push((l, weighted[l]));
         }
     }
-    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
     let (best_lag, best_val) = *peaks.first()?;
     if !(best_val > 0.0) {
         return None;
@@ -364,7 +370,7 @@ fn estimate_bpm(env: &[f32], frame_rate: f64) -> Option<(Vec<(f64, f64)>, f32, b
         cands.push(best_bpm * m);
     }
     cands.retain(|b| (BPM_MIN..=BPM_MAX).contains(b));
-    cands.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    cands.sort_by(|a, b| a.total_cmp(b));
     cands.dedup_by(|a, b| ((*a - *b) / *b).abs() < 0.015);
     if cands.is_empty() {
         return Some((vec![(best_bpm, 1.0)], s_rel, false));
@@ -403,7 +409,7 @@ fn estimate_bpm(env: &[f32], frame_rate: f64) -> Option<(Vec<(f64, f64)>, f32, b
         .zip(&pulses)
         .map(|(&c, &(mx, vr))| (refine(c), (mx / sum_max + vr / sum_var) * prior_weight(c)))
         .collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut tie = false;
     if sorted.len() > 1 && sorted[0].1 > 0.0 {
         if (sorted[0].1 - sorted[1].1) / sorted[0].1 < 0.10 {
@@ -548,7 +554,7 @@ fn ellis_dp(env_norm: &[f32], frame_rate: f64, bpm: f64) -> BeatTrack {
         return BeatTrack { frames: Vec::new(), strengths: Vec::new(), support: 0.0 };
     }
     let mut vals: Vec<f32> = peaks.iter().map(|&t| cumscore[t]).collect();
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.sort_by(|a, b| a.total_cmp(b));
     let med = vals[vals.len() / 2];
     let end = *peaks.iter().rev().find(|&&t| cumscore[t] >= 0.5 * med).unwrap_or(peaks.last().unwrap());
 
@@ -591,7 +597,7 @@ fn fit_grid(beats_sec: &[f64]) -> Option<GridFit> {
         return None;
     }
     let mut ibis: Vec<f64> = beats_sec.windows(2).map(|w| w[1] - w[0]).collect();
-    ibis.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ibis.sort_by(|a, b| a.total_cmp(b));
     let t_med = ibis[ibis.len() / 2];
     if !(t_med > 1e-4) {
         return None;
@@ -784,7 +790,11 @@ fn fold_downbeat(
         scores[k % l] += 1.0 * e_low[k] + 0.5 * onset[k] + 1.0 * sdiff[k];
     }
     let mut order: Vec<usize> = (0..l).collect();
-    order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+    // total_cmp everywhere in this file (S68c review): unwrap_or(Equal) makes the comparator
+    // NON-TRANSITIVE when NaN slips in, and Rust 1.81+ sorts may PANIC on a broken total order —
+    // the exact abort class this hardening removes. For finite data total_cmp is order-identical
+    // (±0.0 tie order aside, which no downstream consumer can observe).
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
     let (s1, s2) = (scores[order[0]], scores[order[1]]);
     let margin = ((s1 - s2) / (s1.abs() + s2.abs() + 1e-9)).clamp(0.0, 1.0);
     (order[0] as u32, margin)

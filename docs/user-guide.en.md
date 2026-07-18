@@ -122,7 +122,7 @@ The app accelerates AI inference with your GPU. "Settings" → "Hardware" shows 
 
 Models, caches, dictionaries and training data all live in one "data folder", which defaults to **the `data` folder next to the program** (deliberately not on the C: drive's user profile, because this folder grows to tens of GB).
 
-To move it to another drive: "Settings" → "Storage" → "Change & migrate…", pick the new folder, wait for the copy to finish, and restart the app. Old data stays in the original location; delete it manually once you have confirmed the new location works.
+To move it to another drive: "Settings" → "Storage" → "Change & migrate…", pick the new folder, and once the copy finishes and passes an integrity check you'll be prompted to restart (one-click "Restart now"). The old folder is cleaned up automatically on the launch after that restart — no need to hunt it down and delete it yourself.
 
 (Installations upgraded from very early versions with data still in the system AppData folder keep working; Settings will suggest migrating off the C: drive.)
 
@@ -978,7 +978,7 @@ The inference-acceleration runtime for NVIDIA users (~1.6 GB, fully self-contain
 
 ### 9.6 "Storage"
 
-Shows the "Data folder (models + cache)" path; "Change & migrate…" moves models/cache/dictionaries/runtimes/training wholesale to a new location ("Migrating…" while it runs — possibly a while), effective after restart; old data stays for you to delete manually once confirmed. Migration is unavailable while training runs.
+Shows the "Data folder (models + cache)" path; "Change & migrate…" moves models/cache/dictionaries/runtimes/training wholesale to a new location ("Migrating…" while it runs — possibly a while), verifies the copy file-by-file, then prompts for a restart; effective after that restart. The old folder is reclaimed automatically on the next launch (anything written to it between migrating and restarting is carried over first — nothing is lost). If verification fails, no settings change and your data stays where it was. Migration is unavailable while training runs, and only one migration is allowed per session — after it completes the button reads "Awaiting restart…" until you restart.
 
 > Caution: if the configured folder is missing at startup (say, an external drive is unplugged), the app falls back automatically and shows a notice, with details displayed in this section. Also, keep the data folder path free of **non-ASCII characters** (e.g. Chinese paths) — the embedded Python training environment cannot load under such paths, and the UI shows a red warning.
 

@@ -30,7 +30,8 @@ fn data_root(state: &AppState) -> PathBuf {
 }
 
 /// Recursive directory size; unreadable entries count as 0 (never fails the whole report).
-fn dir_size(path: &Path) -> u64 {
+/// pub(crate): also used by settings' data-dir reclaim to report freed bytes.
+pub(crate) fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     let Ok(rd) = std::fs::read_dir(path) else { return 0 };
     for entry in rd.flatten() {

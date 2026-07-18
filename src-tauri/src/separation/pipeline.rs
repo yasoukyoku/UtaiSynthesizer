@@ -1480,6 +1480,12 @@ pub fn save_wav(path: &Path, stem: &StemAudio, sample_rate: u32) -> Result<()> {
     // 32-bit float (not 16-bit int) so the separated stems keep FULL precision — the model works in
     // f32 and the source may be 24/32-bit; quantizing to 16-bit here would add audible noise to a result
     // the user may process further. No clamping: preserve any inter-sample overshoot for downstream gain.
+    //
+    // S68c: non-finite samples ARE scrubbed to 0.0 (finite values pass through bit-exact — this is
+    // NOT the clamping ruled out above). fp16 models on true-fp16 GPU kernels (DirectML) can emit
+    // NaN/Inf, nothing upstream checks, and a poisoned stem wav nuked the voice pipeline behind it
+    // (the 0.5.0 20% abort). Scrubbing at THE stem-write funnel keeps every consumer clean —
+    // playback, chained MSST nodes, RVC/SoVITS.
     let spec = hound::WavSpec {
         channels: stem.channels as u16,
         sample_rate,
@@ -1490,18 +1496,34 @@ pub fn save_wav(path: &Path, stem: &StemAudio, sample_rate: u32) -> Result<()> {
     let mut writer = hound::WavWriter::create(path, spec)
         .map_err(|e| UtaiError::Audio(format!("Failed to create WAV: {}", e)))?;
 
+    let mut bad = 0usize;
+    let mut scrub = |s: f32| {
+        if s.is_finite() {
+            s
+        } else {
+            bad += 1;
+            0.0
+        }
+    };
     if stem.channels == 2 {
         for i in 0..stem.left.len() {
-            writer.write_sample(stem.left[i])
+            writer.write_sample(scrub(stem.left[i]))
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
-            writer.write_sample(stem.right[i])
+            writer.write_sample(scrub(stem.right[i]))
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
         }
     } else {
         for &s in &stem.left {
-            writer.write_sample(s)
+            writer.write_sample(scrub(s))
                 .map_err(|e| UtaiError::Audio(format!("WAV write: {}", e)))?;
         }
+    }
+    if bad > 0 {
+        tracing::warn!(
+            "separation stem {} contained {} non-finite sample(s) (NaN/Inf) — zeroed on write (fp16 GPU numeric fault upstream?)",
+            path.display(),
+            bad
+        );
     }
 
     writer.finalize().map_err(|e| UtaiError::Audio(format!("WAV finalize: {}", e)))?;

@@ -294,8 +294,9 @@ struct LoadedVoice {
     /// S67c: EP label this voice's session was built on, plus whether the Auto-device CPU
     /// commit fallback picked it. Re-evaluated on every load_voice cache hit so a fallback
     /// never sticks once memory frees up (and a GPU session drops to CPU when it can no
-    /// longer afford the smallest DirectML chunk tier).
-    actual_device: String,
+    /// longer afford the smallest DirectML chunk tier). The label is kept for debugging
+    /// (underscored: only `cpu_fallback` is consulted at runtime — S68c warning sweep).
+    _actual_device: String,
     cpu_fallback: bool,
 }
 
@@ -528,7 +529,7 @@ impl InferenceManager {
             session_id,
             sample_rate,
             index,
-            actual_device,
+            _actual_device: actual_device,
             cpu_fallback,
         };
         self.loaded_voices.write().insert(name.to_string(), voice);

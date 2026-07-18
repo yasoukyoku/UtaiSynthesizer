@@ -277,8 +277,9 @@ pub fn np_interp(x: &[f64], xp: &[f64], fp: &[f64]) -> Vec<f64> {
             } else if xi >= xp[xp.len() - 1] {
                 fp[fp.len() - 1]
             } else {
-                // last j with xp[j] <= xi
-                let j = match xp.binary_search_by(|v| v.partial_cmp(&xi).unwrap()) {
+                // last j with xp[j] <= xi (total_cmp: xp is a finite time grid by construction,
+                // but a partial_cmp unwrap here is a latent NaN panic — S68c hardening)
+                let j = match xp.binary_search_by(|v| v.total_cmp(&xi)) {
                     Ok(j) => return fp[j],
                     Err(ins) => ins - 1,
                 };
@@ -364,6 +365,17 @@ pub struct KnnIndex {
 
 impl KnnIndex {
     pub fn new(vectors: Array2<f32>) -> Self {
+        // S68c forensics: a user-supplied index (.npy straight out of faiss reconstruct_n) can
+        // carry NaN/Inf — those rows get an infinite d² in knn_blend (never selected), but log
+        // them loudly so a poisoned index is diagnosable from a crash report's log alone.
+        let bad = vectors.iter().filter(|v| !v.is_finite()).count();
+        if bad > 0 {
+            tracing::warn!(
+                "retrieval index contains {} non-finite value(s) across {} vectors — affected vectors will never be selected",
+                bad,
+                vectors.nrows()
+            );
+        }
         let norms = vectors
             .rows()
             .into_iter()
@@ -413,7 +425,7 @@ pub fn knn_blend(
     let k = KNN_TOP_K.min(index.len());
 
     let block_starts: Vec<usize> = (0..t).step_by(KNN_BLOCK).collect();
-    let blocks: Vec<Array2<f32>> = block_starts
+    let blocks: Vec<(Array2<f32>, usize)> = block_starts
         .par_iter()
         .map(|&start| {
             let end = (start + KNN_BLOCK).min(t);
@@ -421,11 +433,13 @@ pub fn knn_blend(
             // sims[b][j] = q_b · v_j
             let sims = q.dot(&index.vectors.t());
             let mut out = Array2::<f32>::zeros((end - start, dim));
+            let mut poisoned_rows = 0usize;
             let mut cand: Vec<(f32, usize)> = Vec::with_capacity(index.len());
             for (bi, q_row) in q.rows().into_iter().enumerate() {
                 let qn: f32 = q_row.iter().map(|&v| v * v).sum();
                 let q_norm = qn.sqrt().max(1e-12);
                 cand.clear();
+                let mut row_poisoned = false;
                 for j in 0..index.len() {
                     let d2 = if cosine_metric {
                         // squared L2 of the unit-normalized pair: 2 − 2·cos(q, v)
@@ -434,9 +448,25 @@ pub fn knn_blend(
                     } else {
                         qn - 2.0 * sims[[bi, j]] + index.norms[j]
                     };
+                    // S68c (the shipped 20% crash): NaN here (poisoned features from a NaN stem,
+                    // or a poisoned index row) made partial_cmp().unwrap() panic — release
+                    // panic=abort took the whole app down. Upstream faiss/numpy silently
+                    // tolerates NaN; we map non-finite distances to +INF so those candidates
+                    // simply never win. NOT total_cmp alone: x86 arithmetic NaN has the sign
+                    // bit SET, and total_cmp orders -NaN FIRST — it would hand every top-k slot
+                    // to the poison.
+                    let d2 = if d2.is_finite() {
+                        d2
+                    } else {
+                        row_poisoned = true;
+                        f32::INFINITY
+                    };
                     cand.push((d2, j));
                 }
-                cand.select_nth_unstable_by(k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                if row_poisoned {
+                    poisoned_rows += 1;
+                }
+                cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
                 // weights over the k nearest (f32, matching the original numpy dtype chain)
                 let mut wsum = 0.0f32;
                 let mut w = [0.0f32; KNN_TOP_K];
@@ -445,8 +475,23 @@ pub fn knn_blend(
                     w[wi] = inv * inv;
                     wsum += w[wi];
                 }
+                // All k winners at +INF (every distance poisoned for this frame) ⇒ wsum = 0 and
+                // the blend would be 0/0 = NaN. Skip retrieval for the frame instead — the
+                // original feature passes through untouched (strictly better than upstream's
+                // garbage-out, and byte-identical whenever nothing is poisoned).
+                if !(wsum > 0.0 && wsum.is_finite()) {
+                    for (c, &orig) in q_row.iter().enumerate() {
+                        out[[bi, c]] = orig;
+                    }
+                    continue;
+                }
                 let mut retrieved = vec![0.0f32; dim];
-                for (wi, &(_, j)) in cand[..k].iter().enumerate() {
+                for (wi, &(d2, j)) in cand[..k].iter().enumerate() {
+                    // Poisoned candidate (mapped to +INF above): weight is 0, but its VECTOR may
+                    // hold NaN and NaN·0 = NaN — it must not touch the sum at all.
+                    if d2 == f32::INFINITY {
+                        continue;
+                    }
                     let wn = w[wi] / wsum;
                     let v = index.vectors.row(j);
                     for (r, &vv) in retrieved.iter_mut().zip(v.iter()) {
@@ -457,11 +502,19 @@ pub fn knn_blend(
                     out[[bi, c]] = ratio * ret + (1.0 - ratio) * orig;
                 }
             }
-            out
+            (out, poisoned_rows)
         })
         .collect();
 
-    let views: Vec<_> = blocks.iter().map(|b| b.view()).collect();
+    let poisoned: usize = blocks.iter().map(|(_, p)| p).sum();
+    if poisoned > 0 {
+        tracing::warn!(
+            "retrieval: {} of {} query frames had non-finite KNN distances (poisoned features or index) — affected candidates excluded",
+            poisoned,
+            t
+        );
+    }
+    let views: Vec<_> = blocks.iter().map(|(b, _)| b.view()).collect();
     ndarray::concatenate(Axis(0), &views).expect("knn block concat")
 }
 
@@ -579,6 +632,50 @@ mod tests {
         assert_close(b100.as_slice().unwrap(), KNN_BLEND_100, 1e-4, "knn 1.0");
         // exact-match row must come back as the index vector itself (eps clamp, no NaN)
         assert!(b100.iter().all(|v| v.is_finite()), "NaN in knn output");
+    }
+
+    // S68c regression tests for the shipped 20% crash: NaN anywhere in the distance math used to
+    // panic partial_cmp().unwrap() (release panic=abort → the whole app died). Poison must now be
+    // (a) crash-free, (b) EXCLUDED from selection when finite candidates exist, (c) pass-through
+    // (original features, no NaN output) when a frame's every distance is poisoned.
+    #[test]
+    fn knn_blend_survives_poisoned_features_and_index() {
+        // index: v0/v1 finite, v2 poisoned (NaN component → NaN norm → NaN d² for every query)
+        let index = KnnIndex::new(
+            Array2::from_shape_vec(
+                (3, 2),
+                vec![1.0, 0.0, 0.0, 1.0, f32::NAN, 5.0],
+            )
+            .unwrap(),
+        );
+        // q0 finite (near v0), q1 fully poisoned (NaN feature → every d² NaN)
+        let q = Array2::from_shape_vec((2, 2), vec![0.9, 0.1, f32::NAN, 2.0]).unwrap();
+        for cosine in [false, true] {
+            let out = knn_blend(&q, &index, 1.0, cosine);
+            // q0: poisoned v2 never selected → blend of finite v0/v1 only → finite output
+            assert!(
+                out.row(0).iter().all(|v| v.is_finite()),
+                "poisoned index row leaked into a finite query (cosine={cosine}): {:?}",
+                out.row(0)
+            );
+            // q1: all distances poisoned → retrieval skipped, ORIGINAL features pass through
+            assert!(out[[1, 0]].is_nan() && out[[1, 1]] == 2.0, "poisoned frame must pass through unchanged (cosine={cosine})");
+        }
+        // ratio blend on the finite row still matches the finite-only reference: with v2 excluded
+        // this must equal a 2-vector index bit-for-bit
+        let clean = KnnIndex::new(Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap());
+        let q0 = Array2::from_shape_vec((1, 2), vec![0.9, 0.1]).unwrap();
+        let with_poison = knn_blend(&q0, &index, 0.75, false);
+        let without = knn_blend(&q0, &clean, 0.75, false);
+        assert_close(with_poison.as_slice().unwrap(), without.as_slice().unwrap(), 0.0, "poison exclusion parity");
+    }
+
+    #[test]
+    fn sanitize_non_finite_zeroes_only_poison() {
+        let mut s = vec![0.5, f32::NAN, -1.0, f32::INFINITY, f32::NEG_INFINITY, 0.0];
+        let n = crate::audio::sanitize_non_finite(&mut s);
+        assert_eq!(n, 3);
+        assert_eq!(s, vec![0.5, 0.0, -1.0, 0.0, 0.0, 0.0]);
     }
 
     // cosine-metric mode (RVC L2归一化, S36 semantics): neighbor CHOICE ignores vector

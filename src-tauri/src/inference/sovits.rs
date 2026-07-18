@@ -162,7 +162,13 @@ pub fn run_pipeline(
     progress(0.02);
 
     // ── mono-ize once at native sr; the whole pipeline downstream is native-sr samples ──
-    let mono = crate::audio::resample::to_mono(audio);
+    let mut mono = crate::audio::resample::to_mono(audio);
+    // S68c: scrub NaN/Inf up front (same rationale as rvc.rs — resample/filtfilt smear a single
+    // poisoned sample buffer-wide, then ContentVec features go all-NaN into cluster/KNN blends).
+    let bad = crate::audio::sanitize_non_finite(&mut mono.samples);
+    if bad > 0 {
+        tracing::warn!("SoVITS input contained {} non-finite sample(s) (NaN/Inf) — zeroed before feature extraction", bad);
+    }
     let native_sr = mono.sample_rate;
     let total_in = mono.samples.len();
 

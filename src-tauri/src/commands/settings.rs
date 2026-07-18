@@ -72,6 +72,15 @@ pub struct AppConfig {
     /// so an untouched picker never even changes config.json's bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_gpu: Option<u32>,
+    /// S68c: OLD data roots of completed (verified) migrations, awaiting reclaim at startup —
+    /// deleting in-session would collide with live handles (ONNX session mmaps, asset-protocol
+    /// avatar reads). A LIST (§user round 2): entries are independent — one old root on an
+    /// unplugged removable drive stays queued (retried every boot) without blocking anything,
+    /// and a later migration APPENDS instead of overwriting (no orphaned roots). Entries are
+    /// removed one-by-one as their reclaim completes. Skipped when empty so users who never
+    /// migrate keep byte-identical config.json.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_delete_dirs: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -81,6 +90,7 @@ impl Default for AppConfig {
             data_dir: None,
             cuda_mem_limit_mb: 0,
             auto_gpu: None,
+            pending_delete_dirs: Vec::new(),
         }
     }
 }
@@ -658,18 +668,30 @@ pub fn get_data_dir(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     Ok(effective_data_root(&state).to_string_lossy().to_string())
 }
 
+/// The subtrees a data-dir migration moves — the single source of truth shared by the copy, the
+/// post-copy verification, and the next-startup delta-sync + old-tree reclaim. `runtimes` skips
+/// top-level dot-entries (`.staging` = torn/resumable installs, transient by design).
+const MIGRATED_SUBTREES: [&str; 5] = ["models", "cache", "dictionaries", "runtimes", "training"];
+
+fn skips_dot_top(subtree: &str) -> bool {
+    subtree == "runtimes"
+}
+
 /// Recursively copy a directory's contents into `dst` (creating it). Cross-drive safe (copy, not rename).
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> std::io::Result<()> {
     if !src.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            copy_dir_all(&from, &to)?;
+            copy_dir_all(&from, &to, false)?;
         } else {
             std::fs::copy(&from, &to)?;
         }
@@ -677,9 +699,111 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
-/// One-click migrate: copy the CURRENT models + cache into `new_dir`, then persist it as the data dir.
-/// Takes effect on restart. Old data is LEFT in place (rollback = revert the setting / don't restart);
-/// the user deletes the old copy manually once the new location is confirmed working.
+/// Post-copy integrity check: every file under `src` (same skip rules as the copy) must exist under
+/// `dst` with the same byte length. Metadata-only (no re-read of tens of GB) — `fs::copy` already
+/// fails loudly on content errors; this catches whole-file misses (skipped entries, torn traversal).
+/// Returns the number of files checked.
+fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> Result<u64, String> {
+    if !src.exists() {
+        return Ok(0);
+    }
+    let mut checked = 0u64;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
+        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            checked += verify_dir_copy(&from, &to, false)?;
+        } else {
+            let src_len = entry.metadata().map_err(|e| format!("stat {}: {e}", from.display()))?.len();
+            let dst_len = std::fs::metadata(&to)
+                .map_err(|_| format!("missing after copy: {}", to.display()))?
+                .len();
+            if src_len != dst_len {
+                return Err(format!("size mismatch after copy: {} ({} vs {} bytes)", to.display(), src_len, dst_len));
+            }
+            checked += 1;
+        }
+    }
+    Ok(checked)
+}
+
+/// Startup delta-sync old→new before reclaiming the old tree: anything written to the OLD root
+/// between the migration copy and the restart (model downloads, render cache, training artifacts)
+/// would otherwise be deleted with it. `fs::copy` preserves mtimes on Windows, so "src newer than
+/// dst" only matches genuinely newer writes. Copies via tmp+rename so concurrent readers of the
+/// NEW tree (model scan, cache sweep) never observe a half-copied file. Returns (copied, failed);
+/// the caller REFUSES to delete a subtree whose sync had failures — a straggler that could not be
+/// carried over must never be deleted with the tree (S68c review major). An unreadable source
+/// entry counts as failed for the same reason: we can't prove it's already in the new tree.
+fn sync_dir_delta(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> (u64, u64) {
+    let mut copied = 0u64;
+    let mut failed = 0u64;
+    let Ok(rd) = std::fs::read_dir(src) else { return (0, 0) };
+    for entry in rd.flatten() {
+        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            let (c, f) = sync_dir_delta(&from, &to, false);
+            copied += c;
+            failed += f;
+            continue;
+        }
+        let needs_copy = match (entry.metadata(), std::fs::metadata(&to)) {
+            (Ok(s), Ok(d)) => {
+                s.len() != d.len()
+                    || matches!((s.modified(), d.modified()), (Ok(sm), Ok(dm)) if sm > dm)
+            }
+            (Ok(_), Err(_)) => true,
+            (Err(_), _) => {
+                tracing::warn!("data-dir reclaim: cannot stat {} — treating as unsynced", from.display());
+                failed += 1;
+                continue;
+            }
+        };
+        if !needs_copy {
+            continue;
+        }
+        let tmp = to.with_extension(format!(
+            "{}.syncing",
+            to.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
+        ));
+        let ok = std::fs::create_dir_all(to.parent().unwrap_or(dst)).is_ok()
+            && std::fs::copy(&from, &tmp).is_ok()
+            && std::fs::rename(&tmp, &to).is_ok();
+        if ok {
+            tracing::info!("data-dir reclaim: synced straggler {}", to.display());
+            copied += 1;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("data-dir reclaim: failed to sync {}", from.display());
+            failed += 1;
+        }
+    }
+    (copied, failed)
+}
+
+/// One-click migrate: copy the CURRENT data subtrees (MIGRATED_SUBTREES — models/cache/
+/// dictionaries/runtimes/training; see each subtree's rationale below) into `new_dir`, VERIFY the
+/// copy (every file present with the same size), then persist it as the data dir. Takes effect on
+/// restart. S68c: the OLD tree is marked (`pending_delete_dir`) and reclaimed automatically on the
+/// next startup — most users never found the old copy to delete it, leaving C: full. Nothing is
+/// deleted before a verified replica exists AND the app actually boots on the new root
+/// (spawn_pending_data_dir_delete); an unverified copy aborts here with config untouched.
+///
+/// Subtree notes (why each is in MIGRATED_SUBTREES):
+/// - dictionaries (② S58): stage1 G2P dictionaries — leaving them behind would fake-OOV every
+///   zh/en/de/fr/es/it lyric after a migration (audit MAJOR).
+/// - runtimes (S42): lib.rs roots pyenv on the resolved data dir — leaving packs behind would make
+///   every installed pack "vanish" after migration; `.staging` (torn/resumable installs) skipped.
+/// - training (S61 recon gap): workspaces resolve off the SAME data dir — not copying them silently
+///   stranded every checkpoint + dataset while 续训/共享池 resolved against the NEW (empty) tree.
 #[tauri::command]
 pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) -> Result<(), String> {
     let new = std::path::PathBuf::from(new_dir.trim());
@@ -687,63 +811,300 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
         return Err("Empty target directory".into());
     }
     // S61: a live training run writes checkpoints/features mid-copy — the migrated tree would be
-    // torn (and the workspace copy below is exactly what a running trainer mutates).
+    // torn (and the workspace copy is exactly what a running trainer mutates).
     if state.training.is_active() {
         return Err("TRAINING_ACTIVE".into());
     }
+    // §user S68c round 2: ONE migration per session, keyed on a PROCESS-LOCAL flag — not on the
+    // pending-reclaim queue. Restarting genuinely unlocks it (new process), while an old root
+    // stuck on an unplugged drive keeps its queue entry WITHOUT locking migration forever. The
+    // Settings button disables itself via migrate_pending_restart; this is the backend backstop.
+    if MIGRATED_THIS_SESSION.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MIGRATE_RESTART_REQUIRED".into());
+    }
     let data_root = effective_data_root(&state).to_path_buf();
     let target = new.clone();
+    let src_root = data_root.clone();
     // The copy reaches tens of GB — run it off the event loop so the UI stays responsive.
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         std::fs::create_dir_all(&target).map_err(|e| format!("Create target: {e}"))?;
         // Refuse a target nested inside the data root (or vice versa) — copying a tree into itself
         // recurses forever.
         let canon_target = std::fs::canonicalize(&target).map_err(|e| format!("Resolve target: {e}"))?;
-        let canon_root = std::fs::canonicalize(&data_root).unwrap_or_else(|_| data_root.clone());
+        let canon_root = std::fs::canonicalize(&src_root).unwrap_or_else(|_| src_root.clone());
         if canon_target.starts_with(&canon_root) || canon_root.starts_with(&canon_target) {
             return Err("Target directory overlaps the current data directory".into());
         }
-        copy_dir_all(&data_root.join("models"), &target.join("models")).map_err(|e| format!("Copy models: {e}"))?;
-        copy_dir_all(&data_root.join("cache"), &target.join("cache")).map_err(|e| format!("Copy cache: {e}"))?;
-        // ② S58: the stage1 G2P dictionaries live under <data_root>/dictionaries — leaving them behind
-        // would fake-OOV every zh/en/de/fr/es/it lyric after a migration (audit MAJOR).
-        let dicts_src = data_root.join("dictionaries");
-        if dicts_src.exists() {
-            copy_dir_all(&dicts_src, &target.join("dictionaries")).map_err(|e| format!("Copy dictionaries: {e}"))?;
+        for name in MIGRATED_SUBTREES {
+            copy_dir_all(&src_root.join(name), &target.join(name), skips_dot_top(name))
+                .map_err(|e| format!("Copy {name}: {e}"))?;
         }
-        // Runtime packs (S42) live under <data_root>/runtimes and must MOVE WITH the
-        // data dir — lib.rs roots pyenv on the resolved data dir, so leaving them
-        // behind would make every installed pack "vanish" after migration (and strand
-        // gigabytes on the old drive with no UI to reclaim them). `.staging` (torn
-        // installs / resumable part files) is transient — skip it.
-        let runtimes_src = data_root.join("runtimes");
-        if runtimes_src.exists() {
-            let runtimes_dst = target.join("runtimes");
-            std::fs::create_dir_all(&runtimes_dst).map_err(|e| format!("Create runtimes: {e}"))?;
-            for entry in std::fs::read_dir(&runtimes_src).map_err(|e| format!("Read runtimes: {e}"))?.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with('.') {
-                    continue;
-                }
-                copy_dir_all(&entry.path(), &runtimes_dst.join(&name))
-                    .map_err(|e| format!("Copy runtimes/{}: {e}", name.to_string_lossy()))?;
-            }
+        // S68c: the old tree gets auto-deleted after this — a silent copy gap must therefore fail
+        // the migration LOUDLY here (config untouched, old root stays authoritative) instead of
+        // surfacing later as lost data.
+        let mut checked = 0u64;
+        for name in MIGRATED_SUBTREES {
+            checked += verify_dir_copy(&src_root.join(name), &target.join(name), skips_dot_top(name))
+                .map_err(|e| format!("MIGRATE_VERIFY_FAILED: {e}"))?;
         }
-        // S61 (recon gap): training WORKSPACES live under <data_root>/training and resolve off the
-        // SAME data dir (commands/training.rs data_root) — not copying them silently stranded every
-        // checkpoint + dataset on the old drive while 续训/共享池 resolved against the NEW (empty)
-        // tree after restart. GBs, but losing training progress is worse than a longer copy.
-        copy_dir_all(&data_root.join("training"), &target.join("training"))
-            .map_err(|e| format!("Copy training: {e}"))?;
+        tracing::info!("data-dir migration verified: {} files intact under {}", checked, target.display());
         Ok(())
     })
     .await
     .map_err(|e| format!("Copy task failed: {e}"))??;
-    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
-    cfg.data_dir = Some(new.to_string_lossy().to_string());
-    save_config(&state.app_dir, &cfg).map_err(|e| format!("Save config: {e}"))?;
-    tracing::info!("Migrated data dir → {} (restart to apply)", new.display());
+    {
+        let _g = CONFIG_LOCK.lock();
+        let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+        cfg.data_dir = Some(new.to_string_lossy().to_string());
+        let old_s = data_root.to_string_lossy().to_string();
+        if !cfg.pending_delete_dirs.iter().any(|p| p == &old_s) {
+            cfg.pending_delete_dirs.push(old_s);
+        }
+        save_config(&state.app_dir, &cfg).map_err(|e| format!("Save config: {e}"))?;
+    }
+    MIGRATED_THIS_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!(
+        "Migrated data dir → {} (restart to apply; old tree {} queued for reclaim at next startup)",
+        new.display(),
+        data_root.display()
+    );
     Ok(())
+}
+
+/// §user S68c: has a migration completed in THIS process (⇒ button locks until the restart)?
+/// Process-local on purpose — a queued-but-unreachable old root (unplugged drive) must NOT keep
+/// migration locked across sessions.
+static MIGRATED_THIS_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes load-modify-save transactions on config.json between the migrate command (queue
+/// APPEND) and the reclaim worker (queue REMOVE) — unsynchronized last-writer-wins would drop
+/// whichever entry the other side just wrote.
+static CONFIG_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[tauri::command]
+pub fn migrate_pending_restart() -> bool {
+    MIGRATED_THIS_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// S68c: finish data-dir migrations on the first startup that runs on the NEW root — for each
+/// queued old root: delta-sync stragglers old→new (writes that landed old-side between the
+/// migration copy and the restart), then reclaim it. Runs on a background thread: an old tree can
+/// be tens of GB and NOTHING in the new session references it (deleting it in the migrating
+/// session instead would collide with live handles — ONNX session mmaps, asset-protocol reads).
+///
+/// Deletion is scoped to MIGRATED_SUBTREES — NEVER the root itself unless it ends up empty: the
+/// legacy-AppData root also houses `logs\` (this very session's log worker is writing there) and
+/// the window-state file. A subtree whose delta-sync had ANY failure is kept whole (data beats
+/// disk space); bundled dictionaries under the default root are kept too. Per-entry single
+/// attempt: a PROCESSED entry leaves the queue even if some subtrees were kept (WARNed with
+/// paths) — retrying forever would re-run the delta-sync every boot and could resurrect files the
+/// user deleted from the new tree since. An entry stays queued (retried next boot) only while it
+/// is genuinely UNREACHABLE: its drive unmounted, or a global postpone (resolver fell back off
+/// the target / autosave recovery pending / a sibling live instance exists).
+pub fn spawn_pending_data_dir_delete(app_dir: std::path::PathBuf, active_data_dir: std::path::PathBuf) {
+    let Some(cfg) = load_config(&app_dir) else { return };
+    let entries = cfg.pending_delete_dirs.clone();
+    if entries.is_empty() {
+        return;
+    }
+    // A sibling live instance (no single-instance guard exists; double-launch is a supported
+    // reality — see crashlog) may still be ROOTED ON an old tree: the classic shape is
+    // "migrated, chose Restart Later, then launched a second copy". Deleting under its feet
+    // would orphan everything it keeps writing old-side. Postpone; the queue survives.
+    if crate::crashlog::other_instance_alive() {
+        tracing::warn!("data-dir reclaim postponed: another live instance detected");
+        return;
+    }
+    // Only reclaim when this session actually ROOTS on the configured migration target. If the
+    // resolver fell back (new drive unplugged → default dir), deleting old trees would orphan
+    // the user's data behind an empty fallback — keep the queue and retry on a later boot.
+    let configured = cfg.data_dir.as_deref().map(std::path::PathBuf::from);
+    let active_is_target = configured
+        .map(|c| {
+            let ca = std::fs::canonicalize(&active_data_dir).unwrap_or_else(|_| active_data_dir.clone());
+            let cc = std::fs::canonicalize(&c).unwrap_or(c);
+            ca == cc
+        })
+        .unwrap_or(false);
+    if !active_is_target {
+        tracing::warn!(
+            "data-dir reclaim postponed: active root {} is not the configured migration target",
+            active_data_dir.display()
+        );
+        return;
+    }
+    // Same philosophy as the usp_work startup sweep (lib.rs): a pending autosave recovery may
+    // reference media by ABSOLUTE paths under an OLD root (project opened before the restart).
+    // Reclaiming now would break the recovery — postpone to a boot with no recovery pending
+    // (the queue survives; delta-sync will still carry stragglers over then).
+    if app_dir.join("autosave.json").exists() {
+        tracing::warn!("data-dir reclaim postponed: autosave recovery pending");
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut done: Vec<String> = Vec::new();
+        for old in &entries {
+            if reclaim_one_root(&app_dir, &active_data_dir, old) {
+                done.push(old.clone());
+            }
+        }
+        if done.is_empty() {
+            return;
+        }
+        // Remove ONLY the processed entries, under the config write lock — a migration running
+        // concurrently in this session appends its own entry, and an unsynchronized
+        // load-modify-save here would drop it.
+        let _g = CONFIG_LOCK.lock();
+        let mut cfg = load_config(&app_dir).unwrap_or_default();
+        cfg.pending_delete_dirs.retain(|p| !done.contains(p));
+        if let Err(e) = save_config(&app_dir, &cfg) {
+            tracing::warn!("data-dir reclaim: failed to update queue: {e}");
+        }
+    });
+}
+
+/// Reclaim a single queued old root (sync stragglers → delete MIGRATED_SUBTREES → rmdir-if-empty).
+/// Returns true when the entry is PROCESSED (drop from queue), false to keep it queued for a
+/// later boot (drive unmounted).
+fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path, old: &str) -> bool {
+    let old_p = std::path::PathBuf::from(old);
+    if !old_p.exists() {
+        // "Already deleted" vs "its DRIVE isn't mounted": an old root on a removable/USB or
+        // network drive reads as missing while unplugged — dropping the entry then would strand
+        // its subtrees forever once the drive returns. Keep it queued while even the path's root
+        // component is absent; only a present drive with a missing tree counts as gone.
+        if let Some(drive) = old_p.ancestors().filter(|p| !p.as_os_str().is_empty()).last() {
+            if !drive.exists() {
+                tracing::warn!(
+                    "data-dir reclaim postponed: drive {} of old tree {} is not mounted",
+                    drive.display(),
+                    old
+                );
+                return false;
+            }
+        }
+        tracing::info!("data-dir reclaim: old tree {} already gone", old);
+        return true;
+    }
+    // Self-protection: never touch a tree that IS (or contains / is contained by) the active
+    // root — a hand-edited config could alias them.
+    let canon_old = std::fs::canonicalize(&old_p).unwrap_or_else(|_| old_p.clone());
+    let canon_active = std::fs::canonicalize(active_data_dir).unwrap_or_else(|_| active_data_dir.to_path_buf());
+    if canon_old.starts_with(&canon_active) || canon_active.starts_with(&canon_old) {
+        tracing::warn!("data-dir reclaim skipped: {} overlaps the active data dir", old);
+        return true;
+    }
+    // The NSIS-bundled dictionaries live at <install>\data\dictionaries — INSIDE the default
+    // data root. When migrating away from the default root, deleting that subtree would strip
+    // a bundled resource and make bundled_integrity_report cry "installation incomplete" on
+    // every launch (S68c review major). ~18 MB — keep it; every other subtree is user data.
+    let old_is_default_root = canon_old
+        == std::fs::canonicalize(app_dir.join("data")).unwrap_or_else(|_| app_dir.join("data"));
+    let mut synced = 0u64;
+    let mut freed = 0u64;
+    let mut kept: Vec<String> = Vec::new();
+    for name in MIGRATED_SUBTREES {
+        let sub = old_p.join(name);
+        let (c, sync_failed) = sync_dir_delta(&sub, &active_data_dir.join(name), skips_dot_top(name));
+        synced += c;
+        if !sub.exists() {
+            continue;
+        }
+        if name == "dictionaries" && old_is_default_root {
+            tracing::info!("data-dir reclaim: keeping {} (bundled install resource)", sub.display());
+            continue;
+        }
+        // A straggler that could not be carried over must never be deleted with its tree —
+        // keep the whole subtree and say so (space stays used; data survives).
+        if sync_failed > 0 {
+            kept.push(format!("{} ({sync_failed} unsynced file(s))", sub.display()));
+            continue;
+        }
+        let size = crate::commands::storage::dir_size(&sub);
+        match std::fs::remove_dir_all(&sub) {
+            Ok(()) => freed += size,
+            Err(e) => {
+                kept.push(format!("{} (locked: {e})", sub.display()));
+            }
+        }
+    }
+    // Remove the old root only when nothing else lives there (a plain data dir); the
+    // legacy-AppData root keeps logs/window-state and stays.
+    if std::fs::read_dir(&old_p).map(|mut d| d.next().is_none()).unwrap_or(false) {
+        let _ = std::fs::remove_dir(&old_p);
+    }
+    if kept.is_empty() {
+        tracing::info!(
+            "data-dir reclaim: freed {} MB from {} ({} straggler file(s) synced first)",
+            freed / (1024 * 1024),
+            old,
+            synced
+        );
+    } else {
+        tracing::warn!(
+            "data-dir reclaim: freed {} MB from {} ({} straggler(s) synced); KEPT (delete manually once confirmed): {}",
+            freed / (1024 * 1024),
+            old,
+            synced,
+            kept.join("; ")
+        );
+    }
+    true
+}
+
+/// S68c (§user): install-completeness report for the NSIS-bundled files, run by the startup
+/// component check (which already fires on the first launch after every update). The expected set
+/// is parsed out of tauri.conf.json's OWN `bundle.resources` map (compiled in via include_str!) —
+/// zero drift with what the installer actually ships. Repair path for these files is a reinstall
+/// (they are not in any downloadable pack); the dialog says so instead of pretending to self-heal.
+#[derive(serde::Serialize)]
+pub struct BundledIntegrity {
+    /// Install-relative resource paths that are absent or empty (files: len==0; dirs: no entries).
+    pub missing: Vec<String>,
+    /// Release build had to load ORT from OUTSIDE the bundled layout (system PATH / stray DLL) —
+    /// the bundled onnxruntime.dll is present-but-unloadable or gone. Always false in dev builds.
+    pub ort_fallback: bool,
+}
+
+#[tauri::command]
+pub fn bundled_integrity_report(state: State<'_, Arc<AppState>>) -> BundledIntegrity {
+    // Dev builds run from the repo, not an installed tree — the bundled layout doesn't exist.
+    if cfg!(debug_assertions) {
+        return BundledIntegrity { missing: Vec::new(), ort_fallback: false };
+    }
+    let mut missing = Vec::new();
+    static CONF: &str = include_str!("../../tauri.conf.json");
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(CONF) {
+        if let Some(res) = v.pointer("/bundle/resources").and_then(|r| r.as_object()) {
+            for target in res.values().filter_map(|t| t.as_str()) {
+                let p = state.app_dir.join(target.trim_end_matches('/'));
+                let ok = if target.ends_with('/') {
+                    std::fs::read_dir(&p).map(|mut d| d.next().is_some()).unwrap_or(false)
+                } else {
+                    std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+                };
+                if !ok {
+                    missing.push(target.to_string());
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        tracing::warn!("bundled-file integrity: {} resource(s) missing/empty: {}", missing.len(), missing.join(", "));
+    }
+    // "CUDA"/"DirectML" are the two bundled-layout outcomes init_ort_runtime records; anything
+    // else in a release build means the bundled ORT could not be used.
+    let ort_fallback = !matches!(
+        crate::ORT_LOADED_BUILD.get().map(|s| s.as_str()),
+        Some("CUDA") | Some("DirectML")
+    );
+    if ort_fallback {
+        tracing::warn!(
+            "bundled-file integrity: ORT loaded from a fallback source ({:?}) — bundled runtime unusable?",
+            crate::ORT_LOADED_BUILD.get()
+        );
+    }
+    BundledIntegrity { missing, ort_fallback }
 }
 
 /// Whether CUDA is ACTUALLY usable, not just "files downloaded". Verifies that the CUDA ORT build is

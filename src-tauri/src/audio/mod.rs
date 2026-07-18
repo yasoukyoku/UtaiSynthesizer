@@ -454,6 +454,23 @@ pub fn load_audio_at_rate(path: &Path, target_sr: u32) -> Result<AudioBuffer> {
     ffmpeg_decode_to_wav(&ffmpeg, path, Some(target_sr))
 }
 
+/// Replace non-finite samples (NaN/Inf) in place with 0.0, returning how many were replaced.
+/// S68c: a single poisoned sample otherwise nukes an entire voice-conversion take — the RVC/SoVITS
+/// 48 Hz high-pass is a bidirectional IIR (filtfilt), which smears one NaN across the whole buffer
+/// in both directions, and ContentVec then emits all-NaN features (the shipped 20% crash).
+/// Sources seen in the wild: fp16 MSST stems computed on DirectML (true-fp16 kernels can overflow;
+/// the CPU EP hides this by computing in fp32), and NaN-bearing float WAVs.
+pub fn sanitize_non_finite(samples: &mut [f32]) -> usize {
+    let mut replaced = 0usize;
+    for s in samples.iter_mut() {
+        if !s.is_finite() {
+            *s = 0.0;
+            replaced += 1;
+        }
+    }
+    replaced
+}
+
 pub fn save_wav(path: &Path, buffer: &AudioBuffer) -> Result<()> {
     let spec = hound::WavSpec {
         channels: buffer.channels,

@@ -19,6 +19,19 @@ pub fn quit_app(app: AppHandle, state: State<'_, Arc<AppState>>) {
     app.exit(0);
 }
 
+/// Quit and relaunch (S68c — the data-dir migration dialog's "restart now"). The frontend runs the
+/// SAME close-flow gates as quit (in-progress work + unsaved changes) before calling this. Mirrors
+/// quit_app's cleanup, plus an explicit window-state save: `AppHandle::restart()` leaves via
+/// std::process::exit, so the window-state plugin's own exit-time save never runs (same reasoning
+/// as the updater's pre-install save in update.rs).
+#[tauri::command]
+pub fn restart_app(app: AppHandle, state: State<'_, Arc<AppState>>) {
+    let _ = state.training.force_stop();
+    let _ = tauri_plugin_window_state::AppHandleExt::save_window_state(&app, crate::window_state_flags());
+    crate::crashlog::mark_clean_exit();
+    app.restart();
+}
+
 /// The Rust-visible long tasks currently running, as stable string ids the frontend maps to localized
 /// labels (`close.task_<id>`) and LISTS in the quit warning. The frontend adds what only IT can see
 /// (workflow node executions, MSST downloads). When a new long task gains a queryable running flag, push

@@ -471,7 +471,12 @@
     "compHint": "Download them now with one click (progress shows in the Settings panel), or later under Settings → Model Assets / Training Runtime.",
     "compNever": "Don't remind me again",
     "compLater": "Later",
-    "compDl": "Download now"
+    "compDl": "Download now",
+    "integrityTitle": "Installation incomplete",
+    "integrityBody": "The following files that ship with the program are missing or damaged (an interrupted update, disk trouble, or an antivirus false positive can cause this):",
+    "integrityOrt": "The inference engine (onnxruntime) could not be loaded from the program folder — running on a system fallback with no performance/compatibility guarantees",
+    "integrityHint": "These files can't be re-downloaded individually in-app; re-running the installer repairs them (installing over the top keeps your models and data). Latest installer: Settings → Check for updates, or the release page.",
+    "integrityMute": "Don't remind me for this version"
   },
   "missingModels": {
     "title": "Missing / unconverted models",
@@ -697,6 +702,8 @@
     "MANIFEST_PARSE_FAILED": "Failed to parse the manifest",
     "MANIFEST_READ_FAILED": "Failed to read the manifest",
     "MANIFEST_REQUEST_FAILED": "Manifest request failed",
+    "MIGRATE_RESTART_REQUIRED": "A migration already completed this session — restart the app before starting another one",
+    "MIGRATE_VERIFY_FAILED": "Post-migration integrity check failed — nothing was changed, your data is still in the original location. Check the target drive's free space and retry",
     "MODEL_HOP_SIZE_ZERO": "The model config's hop_size is 0 — cannot run inference",
     "MODEL_LEGACY_EXPORT": "The model is a legacy export (missing the new input signature) — delete it and re-import to upgrade",
     "MODEL_NOT_FOUND": "Model not found — import it in the resource manager first",

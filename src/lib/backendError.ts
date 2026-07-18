@@ -187,6 +187,10 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   MANIFEST_PARSE_FAILED: { key: "backend.MANIFEST_PARSE_FAILED" },
   MANIFEST_READ_FAILED: { key: "backend.MANIFEST_READ_FAILED" },
   MANIFEST_REQUEST_FAILED: { key: "backend.MANIFEST_REQUEST_FAILED" },
+  // S68c data-dir migration: one migration per session — restart before migrating again.
+  MIGRATE_RESTART_REQUIRED: { key: "backend.MIGRATE_RESTART_REQUIRED", busy: true },
+  // S68c data-dir migration: post-copy integrity check failed — config untouched, old dir stays live.
+  MIGRATE_VERIFY_FAILED: { key: "backend.MIGRATE_VERIFY_FAILED" },
   MODEL_HOP_SIZE_ZERO: { key: "backend.MODEL_HOP_SIZE_ZERO" },
   MODEL_LEGACY_EXPORT: { key: "backend.MODEL_LEGACY_EXPORT" },
   MODEL_NOT_FOUND: { key: "backend.MODEL_NOT_FOUND" },

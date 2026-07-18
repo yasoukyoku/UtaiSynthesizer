@@ -101,6 +101,30 @@ pub fn rotate_session_sentinel(log_dir: &Path) -> Vec<PrevSession> {
     dead
 }
 
+/// Is another live instance of this app running? (Any `session.<pid>.alive` sentinel whose pid
+/// is alive and isn't us — same per-pid machinery as the autopsy.) The data-dir reclaim consults
+/// this so it never deletes a tree a sibling instance may still be rooted on (S68c review major).
+pub fn other_instance_alive() -> bool {
+    let log_dir = crate::logging::get_log_dir();
+    let me = std::process::id();
+    if let Ok(rd) = std::fs::read_dir(&log_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name
+                .strip_prefix("session.")
+                .and_then(|s| s.strip_suffix(".alive"))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid != me && pid_alive(pid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Remove OUR sentinel — the exit ahead is deliberate. Used by quit_app and by the
 /// updater right before install (its NSIS run exits the process without Drop).
 pub fn remove_sentinel() {

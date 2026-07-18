@@ -19,6 +19,7 @@ import { backendErrorMessage, isCancelError } from "../../lib/backendError";
 import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type UpdateInfo } from "../../lib/update";
 import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
 import { useFloatingPanel } from "../../lib/useFloatingPanel";
+import { runExitFlow } from "../../lib/exitFlow";
 import { PanelResizeHandles } from "./PanelResizeHandles";
 import "./Settings.css";
 
@@ -325,6 +326,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [dataDirIssue, setDataDirIssue] = useState<{ configured: string; effective: string; fell_back: boolean } | null>(null);
   const [relocating, setRelocating] = useState(false);
   const [relocateMsg, setRelocateMsg] = useState<string | null>(null);
+  // §user S68c: one migration per session — after a successful migrate the button locks into a
+  // "restart first" state (backed by the Rust-side MIGRATE_RESTART_REQUIRED backstop, so a
+  // Settings remount can't re-enable it).
+  const [migratePending, setMigratePending] = useState(false);
   const showConfirm = useAppStore((s) => s.showConfirm);
   const [rt, setRt] = useState<RuntimeEnvInfo | null>(null);
   const [rtBusy, setRtBusy] = useState(false);
@@ -370,6 +375,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       .then((ts) => { if (ts.includes("cuda_download")) setCudaDownloading(true); })
       .catch(() => {});
     invoke<string>("get_data_dir").then(setDataDir).catch(() => {});
+    invoke<boolean>("migrate_pending_restart").then(setMigratePending).catch(() => {});
     invoke<{ configured: string; effective: string; fell_back: boolean } | null>("get_data_dir_issue")
       .then(setDataDirIssue)
       .catch(() => {});
@@ -486,12 +492,27 @@ export function Settings({ onClose }: { onClose: () => void }) {
       await invoke("migrate_data_dir", { newDir: dir });
       setDataDir(dir);
       setRelocateMsg("migrated");
+      setMigratePending(true); // lock the button until the restart (one migration per session)
+      setRelocating(false); // done — don't show "migrating…" under the restart dialog
+      // S68c: the copy is verified and the old tree is auto-reclaimed on the next startup — but
+      // NOTHING switches to the new location until a restart, and anything the user does in the
+      // meantime still lands old-side (delta-synced at that next startup). Prompt the restart NOW
+      // so "migrated but my models are gone" never gets filed as a bug.
+      const choice = await showConfirm({
+        title: L("relocatedTitle"),
+        body: L("relocatedBody"),
+        buttons: [
+          { id: "later", label: L("restartLater") },
+          { id: "restart", label: L("restartNow"), kind: "primary" },
+        ],
+      });
+      if (choice === "restart") await runExitFlow("restart");
     } catch (e) {
-      setRelocateMsg(String(e).includes("TRAINING_ACTIVE") ? "error: training" : `error: ${e}`);
+      setRelocateMsg(String(e).includes("TRAINING_ACTIVE") ? "error: training" : `error: ${backendErrText(e)}`);
     } finally {
       setRelocating(false);
     }
-  }, []);
+  }, [showConfirm, lang]);
 
   // ── S61 storage usage + cleanup ──
   const [storage, setStorage] = useState<StorageReport | null>(null);
@@ -921,7 +942,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
       dataDir: { zh: "数据目录（模型 + 缓存）", en: "Data folder (models + cache)", ja: "データフォルダ（モデル + キャッシュ）" },
       relocate: { zh: "更改并迁移…", en: "Change & migrate…", ja: "変更して移行…" },
       relocating: { zh: "迁移中…", en: "Migrating…", ja: "移行中…" },
-      relocated: { zh: "已迁移，重启后生效（旧数据保留，确认无误后可手动删除）", en: "Migrated — restart to apply (old data kept; delete it manually once confirmed)", ja: "移行完了 — 再起動で有効（旧データは保持）" },
+      relocated: { zh: "已迁移并通过完整性核验，重启后生效（旧目录将在下次启动时自动清理）", en: "Migrated & integrity-verified — restart to apply (the old folder is cleaned up automatically on the next launch)", ja: "移行と整合性チェックが完了 — 再起動で有効（旧フォルダは次回起動時に自動削除されます）" },
+      relocatedTitle: { zh: "迁移完成", en: "Migration complete", ja: "移行完了" },
+      relocatedBody: { zh: "数据已复制到新位置并通过完整性核验。\n\n需要重启应用才能在新位置上运行；旧目录会在重启后的下次启动时自动清理。\n\n注意：重启前的所有操作（下载模型、渲染等）仍会写入旧位置（启动清理时会自动补搬），建议现在就重启。", en: "Your data has been copied to the new location and integrity-verified.\n\nA restart is required to run from the new location; the old folder is cleaned up automatically on the launch after the restart.\n\nNote: anything you do before restarting (model downloads, renders…) still writes to the OLD location (it gets carried over during that cleanup) — restarting now is recommended.", ja: "データを新しい場所へコピーし、整合性チェックも完了しました。\n\n新しい場所で動作させるには再起動が必要です。旧フォルダは再起動後の次回起動時に自動削除されます。\n\n注意：再起動までの操作（モデルのダウンロードやレンダリングなど）は旧フォルダに書き込まれます（削除時に自動で引き継がれます）。今すぐの再起動をおすすめします。" },
+      restartNow: { zh: "立即重启", en: "Restart now", ja: "今すぐ再起動" },
+      restartLater: { zh: "稍后重启", en: "Restart later", ja: "後で再起動" },
+      relocatePendingBtn: { zh: "等待重启…", en: "Awaiting restart…", ja: "再起動待ち…" },
+      relocatePendingNote: { zh: "本次会话已完成一次迁移，重启后才能再次迁移（旧目录也将在重启后的下次启动时自动清理）。", en: "A migration already completed this session — restart before migrating again (the old folder is also cleaned up on the launch after the restart).", ja: "このセッションで既に移行が完了しています。再度移行するには再起動が必要です（旧フォルダも再起動後の次回起動時に自動削除されます）。" },
       dataDirNote: { zh: "默认在程序目录旁，避免占用 C 盘。模型/缓存会很大，可换到其他盘。", en: "Defaults next to the program (off C:). Models/cache grow large — point this at another drive.", ja: "既定はプログラム横（Cドライブ外）。" },
       stTitle: { zh: "存储占用与清理", en: "Storage Usage & Cleanup", ja: "ストレージ使用量とクリーンアップ" },
       stScanning: { zh: "统计中…", en: "Scanning…", ja: "集計中…" },
@@ -1251,10 +1278,21 @@ export function Settings({ onClose }: { onClose: () => void }) {
             </p>
           )}
           <div className="settings-field">
-            <button className="settings-btn" onClick={handleRelocate} disabled={relocating} style={{ padding: "5px 12px", cursor: "pointer" }}>
-              {relocating ? L("relocating") : L("relocate")}
+            <button
+              className="settings-btn"
+              onClick={handleRelocate}
+              disabled={relocating || migratePending}
+              style={{ padding: "5px 12px", cursor: migratePending ? "not-allowed" : "pointer" }}
+            >
+              {relocating ? L("relocating") : migratePending ? L("relocatePendingBtn") : L("relocate")}
             </button>
+            {migratePending && (
+              <button className="settings-btn" onClick={() => void runExitFlow("restart")} style={{ padding: "5px 12px", cursor: "pointer" }}>
+                {L("restartNow")}
+              </button>
+            )}
           </div>
+          {migratePending && <p className="settings-note">{L("relocatePendingNote")}</p>}
           {relocateMsg === "migrated" && <p className="settings-note">{L("relocated")}</p>}
           {relocateMsg === "error: training" && <p className="settings-note" style={{ color: "#f87171" }}>{L("stErrTraining")}</p>}
           {relocateMsg?.startsWith("error:") && relocateMsg !== "error: training" && <p className="settings-note" style={{ color: "#f87171" }}>{relocateMsg}</p>}

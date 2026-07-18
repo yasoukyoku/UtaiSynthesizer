@@ -176,7 +176,14 @@ pub fn run_pipeline(
     }
 
     // ── input: mono → 16 kHz → 48 Hz high-pass (filtfilt) ──
-    let mono = crate::audio::resample::to_mono(audio);
+    let mut mono = crate::audio::resample::to_mono(audio);
+    // S68c: scrub NaN/Inf BEFORE the FIR resample + filtfilt high-pass — both smear a single
+    // poisoned sample across the buffer, and all-NaN features then crashed the KNN retrieval
+    // (the 0.5.0 20% abort). Covers stems already poisoned on disk by older builds, too.
+    let bad = crate::audio::sanitize_non_finite(&mut mono.samples);
+    if bad > 0 {
+        tracing::warn!("RVC input contained {} non-finite sample(s) (NaN/Inf) — zeroed before feature extraction", bad);
+    }
     let wav16k = resample(&mono.samples, mono.sample_rate, SR as u32);
     let audio_f = highpass_48hz_16k(&wav16k)?;
 

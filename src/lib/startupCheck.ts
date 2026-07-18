@@ -5,6 +5,7 @@
 // download at first launch. App.tsx runs it AFTER the update-check window with the same
 // confirm-collision discipline; the toggle lives in Settings → Model Assets.
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import i18n from "../i18n";
 import { loadSetting, saveSetting } from "./settings";
 import { hfBaseForMirror } from "./models/msst-catalog";
@@ -34,6 +35,41 @@ interface CatalogItem {
   supported: boolean;
   downloadable: boolean;
   experimental: boolean;
+}
+
+interface BundledIntegrity {
+  missing: string[];
+  ort_fallback: boolean;
+}
+
+/** S68c (§user): install-completeness check for the NSIS-bundled files (ORT DLLs / ffmpeg /
+ *  dictionaries / converter scripts…). These are NOT in any downloadable pack — the honest repair
+ *  is re-running the installer (Settings → update, or the release download) — so the dialog says
+ *  that instead of pretending to self-heal. Muted per app VERSION: dismissing stops the nag until
+ *  the next update rewrites the files (when the check matters again). Exported separately and run
+ *  OUTSIDE the component-check master switch (App.tsx): that switch is a permanent opt-out of the
+ *  DOWNLOAD nagging (compNever), and inheriting it would silence integrity forever — against the
+ *  per-version design (S68c review). */
+export async function runBundledIntegrityCheck(): Promise<void> {
+  const report = await invoke<BundledIntegrity>("bundled_integrity_report").catch(
+    () => ({ missing: [], ort_fallback: false }) as BundledIntegrity,
+  );
+  if (report.missing.length === 0 && !report.ort_fallback) return;
+  const version = await getVersion().catch(() => "?");
+  if (loadSetting("utai.bundledCheckMuted", "") === version) return;
+
+  const lines = report.missing.slice(0, 8).map((p) => `· ${p}`);
+  if (report.missing.length > 8) lines.push(`· … +${report.missing.length - 8}`);
+  if (report.ort_fallback) lines.push(`· ${i18n.t("startup.integrityOrt")}`);
+  const c = await useAppStore.getState().showConfirm({
+    title: i18n.t("startup.integrityTitle"),
+    body: `${i18n.t("startup.integrityBody")}\n${lines.join("\n")}\n\n${i18n.t("startup.integrityHint")}`,
+    buttons: [
+      { id: "mute", label: i18n.t("startup.integrityMute") },
+      { id: "ok", label: i18n.t("common.ok"), kind: "primary" },
+    ],
+  });
+  if (c === "mute") saveSetting("utai.bundledCheckMuted", version);
 }
 
 /** Detect the missing must-have components (converter runtime pack + core inference models)

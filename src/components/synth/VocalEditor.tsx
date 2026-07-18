@@ -242,19 +242,30 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   // ── preview playback: scrub the segment following the single evalF0Cents so you HEAR the smooth
   //    transitions / vibrato / drawn pitchDev (placeholder tone, not the SVC voice, §9.7). ──
+  // Part-relative tick of the RUNNING pitch preview (drives the hollow ruler indicator);
+  // null = preview not playing. Ref, not state — it moves every frame.
+  const previewPosRef = useRef<number | null>(null);
   const stopPreviewPlay = useCallback(() => {
     if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; }
     playback.stopPreviewTone();
+    previewPosRef.current = null;
     setPlaying(false);
-  }, []);
+    requestRedraw(); // erase the ruler indicator
+  }, [requestRedraw]);
   const startPreviewPlay = useCallback(() => {
     if (!part) return;
     if (playRafRef.current) { cancelAnimationFrame(playRafRef.current); playRafRef.current = 0; } // clear any orphan
+    // §user S68c: start from the TRANSPORT playhead when it sits inside this part — after each
+    // edit you'd otherwise wait for the scrub to crawl from bar 1 back to the spot you're tuning.
+    // Playhead outside the part ⇒ whole-part preview from the top (the old behavior). Snapshot at
+    // press: the preview stays independent of the main transport (which is never touched).
+    const rawRel = playheadTickRef.current - startRef.current;
+    const startRel = rawRel > 0 && rawRel < durRef.current ? rawRel : 0;
     const startMs = performance.now();
     playback.playPreviewTone(centsToHz(6000), 0); // seed a sustained tone; retuned each frame
     setPlaying(true);
     const tick = () => {
-      const rel = msToTicks(performance.now() - startMs, tempoRef.current);
+      const rel = startRel + msToTicks(performance.now() - startMs, tempoRef.current);
       if (rel > durRef.current) { stopPreviewPlay(); return; } // reached the segment end
       // skip breath notes — unvoiced, they break the pitch chain (the preview tone silences over them).
       const sorted = notesRef.current.filter((n) => !isBreathLyric(n.lyric, breathTokenRef.current)).sort((a, b) => a.tick - b.tick);
@@ -264,10 +275,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
       const r = evalF0CentsAt(sorted, pitchDevRef.current, rel, opts);
       playback.setPreviewToneHz(r.voiced ? centsToHz(r.cents) : 20); // rest → near-silent low freq
+      previewPosRef.current = rel;
+      requestRedraw(); // move the ruler indicator (rAF-coalesced with any other redraw)
       playRafRef.current = requestAnimationFrame(tick);
     };
     playRafRef.current = requestAnimationFrame(tick);
-  }, [part, stopPreviewPlay]);
+  }, [part, stopPreviewPlay, requestRedraw]);
 
   // marquee edge auto-scroll (§9.4): while the cursor is held at a border during a marquee, scroll the view
   // and PIN the box's anchor to the content (its screen origin shifts opposite the scroll) so the box grows
@@ -322,7 +335,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     // center avg at the MIDDLE of the visible note area [RULER_H, noteBottom()] — not the full canvas, else
     // an open lane pushes the average pitch ~LANE_H/2 too low (into/behind the band). noteBottom()==h when closed.
     v.scrollY = Math.max(0, Math.min(Math.max(0, rowsContentHeight(v.rowH) - visH), pitchToY(avg, { ...v, scrollY: 0 }) - (RULER_H + noteBottom()) / 2));
-    v.scrollX = Math.max(0, startRef.current * v.ppt - 24);
+    // S68c: anchor the horizontal view on the FIRST NOTE, not the part's left edge. Extracted-MIDI
+    // parts (GAME) pin partStart to the source AUDIO segment's start, so a song with a long intro
+    // opened onto bars of empty grid — every note sat off-screen to the right and the piano roll
+    // "showed nothing" while rendering (same notes array) sang fine. Empty parts keep the left edge.
+    const firstTick = ns.length > 0 ? ns.reduce((a, n) => Math.min(a, n.tick), Infinity) : 0;
+    v.scrollX = Math.max(0, (startRef.current + firstTick) * v.ppt - 24);
     requestRedraw();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [segmentId]);
@@ -640,6 +658,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
           ctx.beginPath(); ctx.moveTo(gxr, RULER_H); ctx.lineTo(gxr, h); ctx.stroke();
           ctx.globalAlpha = 1;
+        }
+      }
+
+      // ── pitch-preview progress (§user S68c): HOLLOW inverted triangle in the ruler at the scrub
+      //    position — hollow vs the main playhead's FILLED cap keeps the two unmistakable; the main
+      //    playhead is deliberately untouched and still draws after (= over) this. ──
+      if (previewPosRef.current != null) {
+        const pvx = noteAreaX + tickToX(startRef.current + previewPosRef.current, v);
+        if (pvx >= noteAreaX && pvx <= w) {
+          ctx.strokeStyle = PLAYHEAD; ctx.lineWidth = 1.5; ctx.globalAlpha = 1;
+          ctx.beginPath();
+          ctx.moveTo(pvx - 4.5, RULER_H - 8.5); ctx.lineTo(pvx + 4.5, RULER_H - 8.5); ctx.lineTo(pvx, RULER_H - 1);
+          ctx.closePath(); ctx.stroke();
         }
       }
 

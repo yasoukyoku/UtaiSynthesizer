@@ -1082,7 +1082,20 @@ export function Arrangement() {
         if (tr && tr.trackType === "vocal") {
           const bar = Math.max(0, timeAxis.tickToBarBeat(canvasToTick(e.clientX)).bar - 1);
           const startTick = timeAxis.tickAtBar(bar);
-          const segId = createVocalPart(tr.id, startTick, timeAxis.ticksPerBarAt(startTick));
+          const barLen = timeAxis.ticksPerBarAt(startTick);
+          // S68c: the bar-floored one-bar window can land INSIDE an existing part (double-click a
+          // hair right of a part's edge floors back into its tail). Creating an overlapping empty
+          // part there is a trap — segments hit-test newest-first, so the doppelgänger steals every
+          // later double-click in the overlap band and opens a piano roll with zero notes while the
+          // REAL part keeps rendering. Open the overlapped notes part instead of creating one.
+          const overlapped = tr.segments.find(
+            (s) => s.content.type === "notes" && s.startTick < startTick + barLen && startTick < s.startTick + s.durationTicks,
+          );
+          if (overlapped) {
+            openVocalEditor(overlapped.id);
+            return;
+          }
+          const segId = createVocalPart(tr.id, startTick, barLen);
           openVocalEditor(segId);
         }
         return;
@@ -1090,12 +1103,32 @@ export function Arrangement() {
       // ② Route by content type — a NOTES part opens the vocal (piano-roll) editor, an audioClip opens the
       // node workflow editor (§9.6). Classify from the LIVE store by the stable segId (never a stale
       // closure / trackIdx that a concurrent split/delete could have shifted).
+      let openId = hit.segId;
       let isNotes = false;
       for (const tr of useProjectStore.getState().tracks) {
         const sg = tr.segments.find((s) => s.id === hit.segId);
-        if (sg) { isNotes = sg.content.type === "notes"; break; }
+        if (!sg) continue;
+        isNotes = sg.content.type === "notes";
+        // S68c: projects saved before the overlap guard may carry a doppelgänger — an EMPTY notes
+        // part the old bar-floored double-click created on top of a real part. It wins the
+        // newest-first hit test forever, opening a piano roll with zero notes while the real part
+        // keeps singing underneath. Route to an overlapping notes part that actually HAS notes at
+        // the click point instead (non-destructive — the empty part stays selectable/deletable).
+        if (sg.content.type === "notes" && sg.content.notes.length === 0) {
+          const tick = canvasToTick(e.clientX);
+          const better = tr.segments.find(
+            (s) =>
+              s.id !== sg.id &&
+              s.content.type === "notes" &&
+              s.content.notes.length > 0 &&
+              tick >= s.startTick &&
+              tick < s.startTick + s.durationTicks,
+          );
+          if (better) openId = better.id;
+        }
+        break;
       }
-      if (isNotes) openVocalEditor(hit.segId);
+      if (isNotes) openVocalEditor(openId);
       else openWorkflow(hit.segId);
     },
     [hitTest, hitTrackIdx, canvasToTick, timeAxis, createVocalPart, openWorkflow, openVocalEditor],
