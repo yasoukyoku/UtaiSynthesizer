@@ -431,11 +431,33 @@ async fn run_converter(
         return Err(stderr.trim().to_string());
     }
 
-    if !onnx_path.exists() {
-        return Err("Converter finished but .onnx file not found".into());
+    // Success check must match what the requested precision actually PRODUCES:
+    // `--precision fp16` deliberately deletes the fp32 intermediate (convert.py keeps only
+    // <stem>.fp16.onnx + the shared json) — blindly requiring .onnx here reported
+    // "Converter finished but .onnx file not found" on fully SUCCESSFUL conversions
+    // (the S68b YiMing bs_roformer mystery, and every fp16-default download/重转 since:
+    // the model was usable the whole time, only this check cried failure).
+    let fp16_path = crate::separation::fp16_sibling(&onnx_path);
+    match precision {
+        Some("fp16") => {
+            if !fp16_path.exists() {
+                return Err("Converter finished but .fp16.onnx file not found".into());
+            }
+            Ok(fp16_path.to_string_lossy().to_string())
+        }
+        Some("both") => {
+            if !onnx_path.exists() || !fp16_path.exists() {
+                return Err("Converter finished but .onnx/.fp16.onnx pair not found".into());
+            }
+            Ok(onnx_path.to_string_lossy().to_string())
+        }
+        _ => {
+            if !onnx_path.exists() {
+                return Err("Converter finished but .onnx file not found".into());
+            }
+            Ok(onnx_path.to_string_lossy().to_string())
+        }
     }
-
-    Ok(onnx_path.to_string_lossy().to_string())
 }
 
 /// 补转 fast path: post-hoc fp16 conversion of an existing fp32 ONNX (converter/onnx_fp16.py,
