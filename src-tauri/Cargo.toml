@@ -3,7 +3,7 @@ members = ["crates/utai-dsp", "crates/utai-stretch"]
 
 [package]
 name = "utai"
-version = "0.8.0"
+version = "0.8.1"
 description = "UtaiSynthesizer — Voice Synthesis DAW"
 authors = ["UtaiSynthesizer Contributors"]
 edition = "2021"
