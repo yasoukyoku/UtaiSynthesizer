@@ -86,6 +86,13 @@ from architectures.msst_yaml import load_msst_yaml, stem_fields, stem_fields_fro
 # --precision applies to these (rvc/sovits ignore it); fp16 is numerically
 # verified (>45 dB vs fp32) for the roformer archs + mdx23c + htdemucs ONLY —
 # refuse the rest (uvr_vr/mdx_net must pass their own CUDA-EP gate first).
+# S68c re-gate (norm-stats fp32 protection recipe, onnx_fp16.py): CUDA E2E
+# BS 72.8/67.9 dB, MelBand 68.6/63.5 dB (Δ vs old recipe ≤0.1 dB — protection
+# is numerically free on healthy kernels); mdx23c byte-identical (md5, empty
+# block list); htdemucs untouched (own S31 path). DML smoke: old recipe's
+# fp16 Clip floor is 1e-7 (weakened 1e5×) + fp16 ReduceL2 stats — NaN cascade
+# on drivers without fp32 accumulation; new recipe keeps stats + the 1e-12
+# floor in fp32.
 SEPARATION_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs",
                     "uvr_vr", "mdx_net"}
 FP16_VERIFIED_TYPES = {"bs_roformer", "mel_band_roformer", "mdx23c", "htdemucs"}

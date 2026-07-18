@@ -237,13 +237,42 @@ export function MsstModelManager({ onClose }: { onClose: () => void }) {
                             {t18({ zh: "补转 fp16", en: "Convert to fp16", ja: "fp16に変換" }, lang)}
                           </button>
                         ) : fp16Capable && !m.has_onnx ? (
+                          <>
+                            {/* S68c review: fp16-ONLY installs (the MelBand download default) are the
+                                LARGEST victim group of the pre-protection fp16 recipe — they must get
+                                the cure here too. "重转 fp16" without an fp32 on disk goes through the
+                                full ckpt export (slower) and lands back in fp16-only shape. */}
+                            {m.has_fp16 && (
+                              <button
+                                className="msst-convert-btn"
+                                disabled={anyConverting}
+                                title={t18({ zh: "用当前转换配方从 ckpt 重新生成 fp16（较慢；旧版转换的 fp16 在部分显卡上有数值问题）", en: "Regenerate fp16 from the ckpt with the current recipe (slower; older fp16 conversions can misbehave numerically on some GPUs)", ja: "現在のレシピで ckpt から fp16 を再生成（時間がかかります。旧版の fp16 は一部の GPU で数値問題があります）" }, lang)}
+                                onClick={() => convertPrecision(m.filename, "fp16", archHint)}
+                              >
+                                {t18({ zh: "重转 fp16", en: "Redo fp16", ja: "fp16再変換" }, lang)}
+                              </button>
+                            )}
+                            <button
+                              className="msst-convert-btn"
+                              disabled={anyConverting}
+                              title={t18({ zh: "从 ckpt 完整导出 fp32（较慢）", en: "Full fp32 export from the ckpt (slower)", ja: "ckpt から fp32 を完全エクスポート（時間がかかります）" }, lang)}
+                              onClick={() => convertPrecision(m.filename, "fp32", archHint)}
+                            >
+                              {t18({ zh: "补转 fp32", en: "Convert to fp32", ja: "fp32に変換" }, lang)}
+                            </button>
+                          </>
+                        ) : fp16Capable ? (
+                          // S68c: both variants installed → offer a REFRESH of the fp16 (cheap, from
+                          // the fp32 on disk). Older builds converted roformer fp16 without the fp32
+                          // norm-stats protection — those files can NaN on true-fp16 GPU kernels;
+                          // this is the existing user's one-click cure.
                           <button
                             className="msst-convert-btn"
                             disabled={anyConverting}
-                            title={t18({ zh: "从 ckpt 完整导出 fp32（较慢）", en: "Full fp32 export from the ckpt (slower)", ja: "ckpt から fp32 を完全エクスポート（時間がかかります）" }, lang)}
-                            onClick={() => convertPrecision(m.filename, "fp32", archHint)}
+                            title={t18({ zh: "用当前转换配方重新生成 fp16（旧版转换的 fp16 在部分显卡上有数值问题）", en: "Regenerate fp16 with the current recipe (older fp16 conversions can misbehave numerically on some GPUs)", ja: "現在のレシピで fp16 を再生成（旧版で変換した fp16 は一部の GPU で数値問題があります）" }, lang)}
+                            onClick={() => convertPrecision(m.filename, "fp16", archHint)}
                           >
-                            {t18({ zh: "补转 fp32", en: "Convert to fp32", ja: "fp32に変換" }, lang)}
+                            {t18({ zh: "重转 fp16", en: "Redo fp16", ja: "fp16再変換" }, lang)}
                           </button>
                         ) : null}
                         {" "}{formatSize(m.size)}

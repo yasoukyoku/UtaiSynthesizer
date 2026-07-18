@@ -108,3 +108,26 @@ uvr_lib_v5，与 TESTING\Utai\MSST 副本逐字节一致）+ `configs\vr_modelpa
 
 —— 脚本里的路径多为 S31 会话的硬编码（scratchpad / 新宝島 素材），复用时改路径即可；
 方法本身照抄。历史细节见 memory：project_v2_session31 / project_v2_separation_vocal_leak。
+
+## 关卡 3 增补 — fp16 归一化统计保护(S68c,2026-07-18)
+
+**背景**:旧 fp16 配方在真 fp16 kernel 上,roformer 的 F.normalize(ReduceL2→Clip→Expand→Div)
+会在静音/近静音 chunk 上全输出 NaN(0.5.0 RVC 20% 闪退的毒源)。三重机理:①Clip 下限 1e-12
+被 onnxconverter 钳到 1e-7=fp16 亚正规数,GPU FTZ 后=0;②Σx² 在 fp16 累加上溢/下溢;
+③库把岛内 fp32 常数经 fp16 张量中转喂 Clip(1e-12→0,图数学级 0/0)。修复=onnx_fp16.py
+_norm_stats_block_list(统计脊整体 fp32,walk 止步于 Reduce)+cast 往返坍缩+死 cast 修剪
+(悬挂死 cast 对会把 AMD 780M DML 第二跑直接挂死 887A0006——N 卡容忍 A 卡不容忍)。
+
+**新工具(verify/fp16/)**:
+- `dml_smoke.py <fp32> <fp16old> <fp16new>`:双 DML 适配器 × 5 输入档(zeros/tiny/真实STFT/
+  randn×2)非有限计数+SNR;CPU(fp32-emu)档=图数学 vs kernel 判别器。**零/微输入档必须跑**
+  ——真实歌曲素材永远测不到静音 chunk,这正是旧配方三个 gate 全绿却在用户机上炸的原因。
+- `check_fp16_graph.py`:静态验 Clip 下限(dtype+值+**是否经 fp16 张量中转**——只看常数
+  原值会被中转盲区骗过)。
+- `nan_bisect.py <model> <dev> <regime>`:中间张量分批重导出为输出,二分定位第一个非有限张量。
+- `minimal_norm_repro.py`:8 元素最小图,fp16-norm vs fp32-island 三 EP 对照。
+
+**S68c 门值(fused 图+保护配方)**:CUDA E2E BS 72.8/67.9 dB、MelBand 68.6/63.4 dB
+(vs 未保护配方 ≤0.1dB=保护零代价);MDX23C 空名单字节等同(md5);htdemucs 走原
+S31 路径逐字节不动(坍缩豁免)。**改 fp16 配方的完整关卡=本节冒烟(双卡+零输入档)
++CUDA E2E 45dB+静态中转检查+MDX23C 哈希等同+htdemucs 路径字节不动。**

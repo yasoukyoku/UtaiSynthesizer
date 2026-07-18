@@ -94,6 +94,11 @@ export const MSST_DEFAULT_PRECISION: Record<MsstArchitecture, MsstPrecision> = {
  *  melband 67.8/63.0 dB — S33 fused-attention exports, ~+9-12 dB over the old decomposed graphs
  *  whose fp16 computed rotary angles in fp16; mdx23c 71.0/75.5 dB, htdemucs 52.9-56.8 dB
  *  non-quiet stems vs fp32).
+ *  S68c re-gate (norm-stats fp32 protection recipe, onnx_fp16.py): bs 72.8/67.9 dB,
+ *  melband 68.7/63.5 dB (≤0.1 dB vs the unprotected recipe); mdx23c byte-identical;
+ *  htdemucs untouched (own S31 path, collapse-exempt). Roformer fp16 files converted by
+ *  older builds can go ALL-NaN on silent/near-silent chunks on GPU EPs (fp16 norm stats +
+ *  a Clip floor squashed to 0 en route) — the manager's 重转 fp16 button regenerates them.
  *  ONE source of truth for every fp16 choice in the UI (download precision, 补转 actions).
  *  MUST mirror converter/convert.py FP16_VERIFIED_TYPES. Gate rule: fp16 verification MUST run
  *  on the CUDA EP — the CPU EP emulates fp16 in fp32 and false-passes (htdemucs NaN case).

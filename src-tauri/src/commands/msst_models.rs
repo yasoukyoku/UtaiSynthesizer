@@ -256,9 +256,14 @@ pub async fn convert_msst_model(
     if precision.as_deref() == Some("fp16") {
         let fp32_onnx = path.with_extension("onnx");
         if fp32_onnx.exists() {
-            return run_fp16_converter(&fp32_onnx, &state.app_dir)
+            let out = run_fp16_converter(&fp32_onnx, &state.app_dir)
                 .await
-                .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e));
+                .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e))?;
+            // S68c: a RE-conversion may have replaced a file the engine still holds a cached
+            // session for — evict by stem prefix (covers .onnx + .fp16.onnx) so the next run
+            // builds from the fresh bytes instead of silently serving the old graph.
+            state.inference.engine.unload_paths_with_prefix(&path.with_extension(""));
+            return Ok(out);
         }
     }
 
@@ -270,6 +275,7 @@ pub async fn convert_msst_model(
     let onnx_path = run_converter(&path, &arch, &state.app_dir, precision.as_deref())
         .await
         .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e))?;
+    state.inference.engine.unload_paths_with_prefix(&path.with_extension(""));
 
     Ok(onnx_path)
 }
