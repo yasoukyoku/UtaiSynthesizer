@@ -24,7 +24,14 @@ def extract(input_path: Path, output_path: Path):
         print("ERROR: faiss-cpu is required. Install with: pip install faiss-cpu", file=sys.stderr)
         sys.exit(1)
 
-    index = faiss.read_index(str(input_path))
+    # S68f: NEVER hand the path to faiss.read_index — its C++ FileIOReader fopens with
+    # a narrow char* and cannot open CJK/space-laden Windows paths (io.cpp:70 "could
+    # not open ... : No such file or directory" / "Illegal byte sequence", reproduced
+    # live). Python's own open() is wide-char safe on every path; deserialize_index
+    # then parses the bytes without ever touching the filesystem.
+    with open(input_path, "rb") as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    index = faiss.deserialize_index(data)
     n = index.ntotal
     dim = index.d
 
