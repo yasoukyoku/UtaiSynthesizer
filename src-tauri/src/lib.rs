@@ -641,7 +641,14 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
                     commands::settings::copy_dir_all(&legacy, &staging.join("EBWebView"), false);
                 match copied {
                     Ok(()) => {
-                        if std::fs::rename(&staging, &dir).is_err() {
+                        if std::fs::rename(&staging, &dir).is_ok() {
+                            // Baseline for the S68e.1 reclaim veto. A FILE'S CONTENT —
+                            // not filesystem timestamps: copying/carrying the install
+                            // folder refreshes CreationTime/mtimes wholesale (review
+                            // S68e.1), which would silently reset a metadata-based
+                            // baseline and un-veto a live dev profile.
+                            stamp_webview_merge_marker(&dir);
+                        } else {
                             let _ = std::fs::remove_dir_all(&staging);
                         }
                     }
@@ -660,12 +667,89 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
                 }
             }
         }
+    } else {
+        // Any boot AFTER the migration boot: the merged profile is authoritative,
+        // the legacy copy is ~170 MB of dead weight — reclaim it (S68e.1, §user:
+        // "why is com.utaisynthesizer.app still there").
+        reclaim_legacy_webview_profile(&dir);
     }
     std::fs::create_dir_all(&dir).ok()?;
     let probe = dir.join(".writable");
     std::fs::write(&probe, b"").ok()?;
     let _ = std::fs::remove_file(&probe);
     Some(dir)
+}
+
+/// The S68e.1 reclaim-veto baseline, stamped INSIDE the merged webview dir at
+/// migration time. Epoch seconds as file CONTENT — content survives folder copies,
+/// while CreationTime/mtimes get refreshed by exactly the carry-the-folder moves this
+/// feature exists for.
+#[cfg(not(debug_assertions))]
+const WEBVIEW_MERGE_MARKER: &str = ".merged-at";
+
+#[cfg(not(debug_assertions))]
+fn stamp_webview_merge_marker(dir: &std::path::Path) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(dir.join(WEBVIEW_MERGE_MARKER), secs.to_string());
+}
+
+/// S68e.1: delete the legacy identifier-dir WebView2 profile once the MERGED profile
+/// exists (any boot after the migration boot), then drop the identifier dir itself if
+/// that emptied it. Guards, in order:
+///   1. A LIVE pre-merge instance (its sentinel sits in the legacy LOGS dir) vetoes
+///      the whole reclaim: its profile is only partially lock-protected — a
+///      remove_dir_all would tear out closed files (leveldb tables, Preferences)
+///      before the first locked one stops it, corrupting the live session.
+///   2. Baseline = the .merged-at marker's CONTENT (missing marker — 0.8.0-migrated
+///      installs — is stamped NOW and judged from the next boot on).
+///   3. Anything under the legacy profile touched AFTER the baseline = something
+///      (a dev build, an occasionally-run old copy) still uses it → keep, forever
+///      (every Chromium session bumps Local State/Preferences via atomic same-dir
+///      saves, so real use is always visible on the probes). Fail-safe = keep.
+#[cfg(not(debug_assertions))]
+fn reclaim_legacy_webview_profile(merged: &std::path::Path) {
+    let Ok(local) = std::env::var("LOCALAPPDATA") else { return };
+    let root = std::path::PathBuf::from(local).join("com.utaisynthesizer.app");
+    let legacy = root.join("EBWebView");
+    if !legacy.is_dir() {
+        return;
+    }
+    if logging::foreign_live_session_in(&root.join("logs")) {
+        return; // a pre-merge copy is running right now — its profile is live
+    }
+    let marker = merged.join(WEBVIEW_MERGE_MARKER);
+    let baseline = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    let Some(baseline) = baseline else {
+        // Pre-marker merge (0.8.0) or a wiped marker: stamp now, judge next boot.
+        stamp_webview_merge_marker(merged);
+        return;
+    };
+    // Newest signal of post-baseline use, from the dirs Chromium's atomic saves touch.
+    let touched_after = [
+        legacy.clone(),
+        legacy.join("Default"),
+        legacy.join("Default").join("Local Storage"),
+        legacy.join("Default").join("Local Storage").join("leveldb"),
+    ]
+    .iter()
+    .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    .any(|m| m > baseline);
+    if touched_after {
+        return; // someone (a dev build / an old copy in occasional use) still uses it
+    }
+    match std::fs::remove_dir_all(&legacy) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&root); // only succeeds once fully empty
+            tracing::info!("legacy webview profile reclaimed ({})", legacy.display());
+        }
+        Err(e) => tracing::warn!("legacy webview profile not reclaimed ({e}) — retried next boot"),
+    }
 }
 
 /// Dev builds keep the tauri default profile (identifier dir) — the dev app root is

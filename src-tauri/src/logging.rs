@@ -340,20 +340,8 @@ pub fn migrate_legacy_logs(new_dir: &PathBuf) {
     // writes after our copy snapshot silently dies), and moving its live
     // session.<pid>.alive sentinel fires a FALSE crash autopsy on our next boot.
     // Retried automatically on every boot; once that session ends, files move.
-    if let Ok(rd) = std::fs::read_dir(&old) {
-        let me = std::process::id();
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(pid) = name
-                .strip_prefix("session.")
-                .and_then(|s| s.strip_suffix(".alive"))
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                if pid != me && crate::crashlog::pid_alive(pid) {
-                    return;
-                }
-            }
-        }
+    if foreign_live_session_in(&old) {
+        return;
     }
     let Ok(rd) = std::fs::read_dir(&old) else { return };
     for e in rd.flatten() {
@@ -372,6 +360,31 @@ pub fn migrate_legacy_logs(new_dir: &PathBuf) {
         }
     }
     let _ = std::fs::remove_dir(&old); // only succeeds once fully emptied
+}
+
+/// TRUE when `dir` holds a `session.<pid>.alive` sentinel of a LIVE process other
+/// than ours — i.e. a pre-merge copy of the app is running right now and still uses
+/// the legacy homes. Shared by the log migration (deferring the file moves) and the
+/// S68e.1 webview-profile reclaim (a live old instance's profile is only PARTIALLY
+/// lock-protected: remove_dir_all would tear out its closed files — leveldb tables,
+/// Preferences — before hitting the first locked one, corrupting the live session).
+pub(crate) fn foreign_live_session_in(dir: &PathBuf) -> bool {
+    let me = std::process::id();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(pid) = name
+                .strip_prefix("session.")
+                .and_then(|s| s.strip_suffix(".alive"))
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if pid != me && crate::crashlog::pid_alive(pid) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
