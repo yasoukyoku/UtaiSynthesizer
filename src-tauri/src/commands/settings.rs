@@ -392,6 +392,14 @@ fn nvidia_driver_version() -> Option<String> {
     None
 }
 
+/// Driver MAJOR ("581.42" → 581). pub(crate): the nv-cu130 download gate and the
+/// envtest crash diagnosis (commands/pyenv.rs) both need it — CUDA 13 wheels require
+/// an r580+ driver, and the community RTX 4070 Laptop case proved a CUDA-12-happy
+/// driver sails through every other probe while torch-cu130 sees zero devices.
+pub(crate) fn nvidia_driver_major() -> Option<u32> {
+    nvidia_driver_version()?.split('.').next()?.parse().ok()
+}
+
 /// Whether THIS machine's hardware can run a given runtime-pack VARIANT — the gate for
 /// which download entries the settings UI offers (only expose packs the user can actually
 /// use; a fresh box always sees CPU). Vendor comes from PNPDeviceID. The NVIDIA pack

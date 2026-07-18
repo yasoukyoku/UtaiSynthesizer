@@ -16,6 +16,7 @@ import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretch
 import { clipboardReferencedPaths } from "../../lib/clipboard";
 import { historyReferencedAudioPaths } from "../../store/history";
 import { backendErrorMessage, isCancelError } from "../../lib/backendError";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type UpdateInfo } from "../../lib/update";
 import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
 import { useFloatingPanel } from "../../lib/useFloatingPanel";
@@ -388,7 +389,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
       setRtProgress(e.payload);
       if (e.payload.phase === "done" || e.payload.phase === "error") {
         setRtBusy(false);
-        if (e.payload.phase === "error") setRtError(backendErrText(e.payload.message));
+        if (e.payload.phase === "error") {
+          // S68f: modal-class codes (ENVTEST_CRASHED = a stderr-tail wall) go to the
+          // modal funnel; the inline strip only ever shows toast-sized text.
+          const disp = backendErrText(e.payload.message);
+          if (!maybeShowErrorModal(e.payload.message, disp)) setRtError(disp);
+        }
         // The done payload can carry a REAL verdict (INSTALLED_ENVTEST_FAILED: …) —
         // it must survive the progress bar disappearing, not vanish with it.
         if (e.payload.phase === "done") setRtNotice(e.payload);
@@ -416,7 +422,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
     try {
       await invoke("download_runtime_pack", { id });
     } catch (e) {
-      setRtError(backendErrText(e));
+      const disp = backendErrText(e);
+      if (!maybeShowErrorModal(e, disp)) setRtError(disp);
     } finally {
       setRtBusy(false);
       refreshRuntime();

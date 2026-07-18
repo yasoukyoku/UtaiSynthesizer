@@ -19,6 +19,7 @@ import datetime
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -158,6 +159,48 @@ def check_imports(ctx):
     if missing:
         raise RuntimeError("缺失/损坏的包: " + ", ".join(missing))
     return ", ".join("%s %s" % kv for kv in sorted(versions.items()))
+
+
+def _nvidia_driver_major():
+    """Driver major via nvidia-smi — WITHOUT touching torch.cuda. None = unreadable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if out.returncode != 0:
+            return None
+        lines = (out.stdout or "").strip().splitlines()
+        return int(lines[0].split(".")[0]) if lines else None
+    except Exception:
+        return None
+
+
+def check_cuda_driver(ctx):
+    """S68f: the driver floor is checked BEFORE anything touches torch.cuda — probing
+    the CUDA runtime on a driver older than the wheel's CUDA major can ACCESS-VIOLATE
+    inside the runtime (community RTX 4070 Laptop: cudaErrorNotSupported warning, then
+    0xC0000005 with no report ever written). CUDA 13 wheels need an r580+ driver.
+    On failure the RUN SHORT-CIRCUITS (main() skips the remaining checks) so the
+    verdict arrives as a normal report instead of a crash. Unknown driver fails open —
+    check_torch_backend's graceful is_available() probe still covers plain-unavailable."""
+    if ctx["device"] != "cuda":
+        return None  # 该档位不适用
+    import torch  # importing torch does NOT initialize CUDA
+
+    cu = torch.version.cuda or ""
+    if not cu.startswith("13"):
+        return "cuda %s（无驱动地板要求）" % (cu or "?")
+    drv = _nvidia_driver_major()
+    if drv is None:
+        return "驱动版本未能读取（nvidia-smi）—— 放行，由后续检查判定"
+    if drv < 580:
+        raise RuntimeError(
+            "NVIDIA 驱动 %d < 580 —— CUDA %s 运行时需要 r580+ 驱动。"
+            "请到 NVIDIA 官网更新显卡驱动后重新自检" % (drv, cu)
+        )
+    return "驱动 %d（≥ 580）" % drv
 
 
 def check_torch_backend(ctx):
@@ -636,6 +679,7 @@ def check_fallback_ops(ctx):
 CHECKS = [
     ("python_info", check_python_info),
     ("imports", check_imports),
+    ("cuda_driver", check_cuda_driver),
     ("torch_backend", check_torch_backend),
     ("stft_roundtrip", check_stft_roundtrip),
     ("resample", check_resample),
@@ -713,6 +757,11 @@ def main():
         item = {"name": name, "status": status, "detail": str(detail), "ms": ms}
         items.append(item)
         _emit({"type": "item", **item})
+        if name == "cuda_driver" and status == "fail":
+            # S68f: every later GPU check would touch torch.cuda — on a below-floor
+            # driver that can crash the interpreter outright (see check_cuda_driver).
+            # One decisive fail + a clean report beats a 0xC0000005 with no report.
+            break
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
     failed = [i["name"] for i in items if i["status"] == "fail"]

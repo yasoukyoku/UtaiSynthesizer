@@ -132,7 +132,9 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   ENHANCER_F0_EMPTY: { key: "backend.ENHANCER_F0_EMPTY" },
   ENVTEST_BUSY: { key: "backend.ENVTEST_BUSY", busy: true },
   ENVTEST_CANCELLED: { key: "backend.ENVTEST_CANCELLED" },
-  ENVTEST_CRASHED: { key: "backend.ENVTEST_CRASHED" },
+  // S68f modal: the crash detail is a stderr tail — far too long for the inline strip
+  // (the community screenshot showed a zh headline + a wall of raw log jammed together).
+  ENVTEST_CRASHED: { key: "backend.ENVTEST_CRASHED", modal: true },
   ENVTEST_FAILED: { key: "backend.ENVTEST_FAILED" },
   ENVTEST_REPORT_CLEAR_FAILED: { key: "backend.ENVTEST_REPORT_CLEAR_FAILED" },
   ENVTEST_REPORT_CONTRADICTION: { key: "backend.ENVTEST_REPORT_CONTRADICTION" },
@@ -223,6 +225,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   PROBE_HTTP_ERROR: { key: "backend.PROBE_HTTP_ERROR" },
   PROBE_TIMEOUT: { key: "backend.PROBE_TIMEOUT" },
   RENAME_FAILED: { key: "backend.RENAME_FAILED" },
+  // S68f: nv-cu130 download gate — CUDA 13 needs an r580+ NVIDIA driver.
+  RUNTIME_DRIVER_TOO_OLD: { key: "backend.RUNTIME_DRIVER_TOO_OLD" },
   RENAME_RETRY_EXHAUSTED: { key: "backend.RENAME_RETRY_EXHAUSTED" },
   RESUME_KSTEP_MISMATCH: { key: "backend.RESUME_KSTEP_MISMATCH" },
   RESUME_PARAMS_MISMATCH: { key: "backend.RESUME_PARAMS_MISMATCH" },

@@ -168,6 +168,18 @@ pub async fn download_runtime_pack(
         .iter()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("PACK_UNKNOWN: {id}"))?;
+    // S68f pre-download gate: cu130 = CUDA 13 runtime = NVIDIA driver r580+. The
+    // variant gate only checks vendor + compute cap, so a perfectly capable card on a
+    // pre-580 driver (community RTX 4070 Laptop: CUDA-12 inference fine, torch-cu130
+    // zero devices) installed 1.8 GB it could not use. Loud actionable CODE instead of
+    // hiding the pack (S64c CUDA_TOOLKIT_REQUIRED posture); unknown version fails open.
+    if entry.variant == "nv-cu130" {
+        if let Some(major) = crate::commands::settings::nvidia_driver_major() {
+            if major < 580 {
+                return Err(format!("RUNTIME_DRIVER_TOO_OLD: NVIDIA driver {major} < 580 (CUDA 13)"));
+            }
+        }
+    }
     let (guard, cancel) = pyenv::InstallGuard::acquire().map_err(|e| e.to_string())?;
     let _task = state.begin_task("pyenv_install"); // close-flow in-progress listing
     let result = do_download_and_install(&app, &state, entry, &cancel).await;
@@ -601,11 +613,27 @@ async fn run_envtest_inner(
                 ))
             }
         }
-        None => Err(format!(
-            "ENVTEST_CRASHED: exit code {:?}, no report. stderr tail:\n{}",
-            status.code(),
-            stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n")
-        )),
+        None => {
+            let mut msg = format!(
+                "ENVTEST_CRASHED: exit code {:?}, no report. stderr tail:\n{}",
+                status.code(),
+                stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n")
+            );
+            // S68f diagnosis: the classic no-report crash on nv-cu130 is a pre-580
+            // driver ACCESS-VIOLATing inside the CUDA 13 runtime probe — say so
+            // instead of leaving the user a bare stderr tail (packs installed before
+            // the download gate existed keep hitting this path).
+            if pack.meta.variant == "nv-cu130" {
+                if let Some(major) = crate::commands::settings::nvidia_driver_major() {
+                    if major < 580 {
+                        msg.push_str(&format!(
+                            "\n[driver check: NVIDIA {major} < 580 — CUDA 13 requires an r580+ driver; update it at nvidia.com]"
+                        ));
+                    }
+                }
+            }
+            Err(msg)
+        }
     }
 }
 
