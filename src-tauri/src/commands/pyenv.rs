@@ -215,6 +215,42 @@ async fn do_download_and_install(
     std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
 
     let total_bytes: u64 = manifest.parts.iter().map(|p| p.size).sum();
+
+    // S68d disk preflight: the parts staging dir and the final tree share the runtimes
+    // volume — peak usage = remaining download + extracted tree (the archives are only
+    // reclaimed after commit). Bytes already staged (resume: whole parts or in-flight
+    // .part files) are credited so a retry that mostly needs the extract step is never
+    // refused. Fail open when the probe or the catalog size is unavailable; the extract
+    // step re-checks its own (smaller) requirement against pack.json disk_bytes.
+    // Size source: the freshly fetched manifest when it carries disk_bytes (真源 —
+    // pack rebuilds change footprint without an app update, review S68d), the catalog
+    // constant as fallback for older manifests.
+    let disk_bytes = if manifest.disk_bytes > 0 { manifest.disk_bytes } else { entry.disk_bytes };
+    if disk_bytes > 0 {
+        if let Some(free) = crate::util::free_bytes_at(&root) {
+            let staged: u64 = manifest
+                .parts
+                .iter()
+                .map(|p| {
+                    let done = std::fs::metadata(dl_dir.join(&p.name)).map(|m| m.len()).unwrap_or(0);
+                    let inflight = std::fs::metadata(dl_dir.join(format!("{}.part", p.name)))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    done.max(inflight).min(p.size)
+                })
+                .sum();
+            let needed = total_bytes.saturating_sub(staged).saturating_add(disk_bytes);
+            if free < needed {
+                return Err(format!(
+                    "INSTALL_DISK_FULL: {} MB needed, {} MB free at {}",
+                    needed / 1_000_000,
+                    free / 1_000_000,
+                    root.display()
+                ));
+            }
+        }
+    }
+
     let mut done_before: u64 = 0;
     for part in &manifest.parts {
         let urls: Vec<String> = bases.iter().map(|b| format!("{b}/{}", part.name)).collect();

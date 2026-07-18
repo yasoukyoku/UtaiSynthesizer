@@ -82,6 +82,13 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # S68d: GetDiskFreeSpaceExW — disk-space preflight for GB-scale writes (runtime
+    # packs / data-dir migration), so ENOSPC fails loud+early instead of mid-extract.
+    "Win32_Storage_FileSystem",
+    # S68d fullportable: registry self-heal after a moved install (portable.rs).
+    # Win32_Security gates RegCreateKeyExW's SECURITY_ATTRIBUTES parameter.
+    "Win32_System_Registry",
+    "Win32_Security",
 ] }
 
 [features]

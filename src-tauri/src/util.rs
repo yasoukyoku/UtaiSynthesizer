@@ -56,6 +56,34 @@ pub fn python_command(python: &Path) -> std::process::Command {
     cmd
 }
 
+/// Free bytes available to THIS process on the volume holding `p` (S68d). Uses
+/// `GetDiskFreeSpaceExW`'s `lpFreeBytesAvailableToCaller` — quota-aware, and the path is
+/// resolved by the filesystem itself, so junctions/mount points report the true host
+/// volume (a drive-letter lookup would not). `None` = probe failed (path gone, exotic
+/// volume) — callers MUST fail open: this feeds preflight checks, never correctness.
+#[cfg(windows)]
+pub fn free_bytes_at(p: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut avail: u64 = 0;
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut avail),
+            None,
+            None,
+        )
+    }
+    .ok()
+    .map(|()| avail)
+}
+
+#[cfg(not(windows))]
+pub fn free_bytes_at(_p: &Path) -> Option<u64> {
+    None
+}
+
 /// Extract every `.dll` entry whose archive path satisfies `matches` from `zip_path` into `dest_dir`
 /// (flattened to its basename). Single source for the CUDA-runtime downloader's nupkg + wheel DLL
 /// extraction — previously `extract_nupkg_dlls` / `extract_wheel_dlls`, byte-identical except for

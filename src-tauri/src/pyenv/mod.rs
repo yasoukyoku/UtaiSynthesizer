@@ -35,6 +35,28 @@ fn err(msg: impl Into<String>) -> UtaiError {
     UtaiError::Pyenv(msg.into())
 }
 
+/// Render `e` with its full `source()` chain — "outer: cause: root (os error N)".
+/// tar's TarError Display prints ONLY its own desc; the real io cause (os error
+/// 5/87/112…) lives exclusively in `source()`, so a plain `{e}` drops it — S68d: the
+/// E:\ EXTRACT_FAILED field report ended at the file path and left the actual OS
+/// failure a guess. A link whose text is already present is skipped (some wrappers
+/// duplicate their cause's Display). Appended text is io-error prose — it can never
+/// contain another SCREAMING_SNAKE code or the CANCELLED sentinel, so the frontend's
+/// substring code matcher keeps working (backendError.ts).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut acc = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        let s = src.to_string();
+        if !acc.contains(&s) {
+            acc.push_str(": ");
+            acc.push_str(&s);
+        }
+        cur = src.source();
+    }
+    acc
+}
+
 // ─── runtime root ───────────────────────────────────────────────────────────
 
 static RUNTIME_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -567,6 +589,65 @@ fn long_path(p: &Path) -> PathBuf {
 /// sane retry window (live-failed S42 even with 10 s of backoff; that's why the
 /// install commit protocol is a marker FILE, not a directory rename — see
 /// extract_and_commit).
+/// `remove_dir_all` with one assisted retry: strip READONLY attributes throughout
+/// (files planted by user tooling/backup restores may carry them; a read-only file
+/// fails both the in-tree delete and tar's overwrite path — `remove_file` before
+/// re-create — with os error 5), pause briefly for transient handle races (AV
+/// inspection), then try once more. Call sites stay best-effort — see the torn-dir
+/// comment in extract_and_commit.
+fn remove_dir_all_robust(dir: &Path) -> std::io::Result<()> {
+    fn clear_readonly(dir: &Path) {
+        // The ROOT dir's own attribute matters too (review S68d): std deletes children
+        // first and the root last, so a readonly root alone defeats both attempts.
+        if let Ok(md) = std::fs::metadata(dir) {
+            let mut perm = md.permissions();
+            if perm.readonly() {
+                perm.set_readonly(false);
+                let _ = std::fs::set_permissions(dir, perm);
+            }
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                let mut perm = md.permissions();
+                if perm.readonly() {
+                    perm.set_readonly(false);
+                    let _ = std::fs::set_permissions(&e.path(), perm);
+                }
+                if md.is_dir() {
+                    clear_readonly(&e.path());
+                }
+            }
+        }
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            clear_readonly(dir);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::remove_dir_all(dir)
+        }
+    }
+}
+
+/// Best-effort recursive byte count (metadata only) — credits a torn install tree
+/// that the extract is about to clear in the disk-space preflight.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                if md.is_dir() {
+                    total = total.saturating_add(dir_size(&e.path()));
+                } else {
+                    total = total.saturating_add(md.len());
+                }
+            }
+        }
+    }
+    total
+}
+
 fn rename_with_retry(from: &Path, to: &Path, what: &str) -> Result<()> {
     let mut delay_ms = 250u64;
     let mut last: Option<std::io::Error> = None;
@@ -632,18 +713,27 @@ pub fn extract_and_commit(
     let decoder = zstd::stream::read::Decoder::new(reader)
         .map_err(|e| err(format!("ZSTD_INIT_FAILED: {e}")))?;
     let mut archive = tar::Archive::new(decoder);
+    // S68d ROOT-CAUSE FIX (the E:\ EXTRACT_FAILED report): the pack builder's staging
+    // trees carry mtime=0, so every archived file says "1970" — and restoring that via
+    // SetFileTime is REJECTED by FAT32/exFAT volumes (timestamp epoch 1980) with
+    // os error 87, killing the very FIRST file of every extract on such drives. NTFS
+    // (epoch 1601) accepts it, which is why dev machines never saw this. The archived
+    // mtimes are worthless anyway — don't write them at all; extracted files carry the
+    // extraction time on every filesystem. (build_pack.py now also clamps mtimes for
+    // future packs, but THIS line is what rescues the four already-published ones.)
+    archive.set_preserve_mtime(false);
     let mut entries = archive
         .entries()
-        .map_err(|e| err(format!("TAR_READ_FAILED: {e}")))?;
+        .map_err(|e| err(format!("TAR_READ_FAILED: {}", error_chain(&e))))?;
 
     // ── entry 0: pack.json → memory (determines the target dir) ──
     let mut first = entries
         .next()
         .ok_or_else(|| err("PACK_EMPTY"))?
-        .map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {e}")))?;
+        .map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {}", error_chain(&e))))?;
     let first_path = first
         .path()
-        .map_err(|e| err(format!("TAR_ENTRY_BAD_PATH: {e}")))?
+        .map_err(|e| err(format!("TAR_ENTRY_BAD_PATH: {}", error_chain(&e))))?
         .into_owned();
     if first_path != Path::new("pack.json") {
         return Err(err(format!(
@@ -665,7 +755,32 @@ pub fn extract_and_commit(
 
     let final_dir = root.join(&meta.id);
     let marker = final_dir.join("pack.json");
+
+    // S68d disk preflight — BEFORE anything touches an existing install, so a refusal
+    // leaves the working pack in place. Needed = the extracted tree size (pack.json
+    // disk_bytes, real numbers from the builders). A TORN remnant (dir without marker)
+    // is about to be cleared, so its bytes count as available again; a reinstall's old
+    // tree is only moved ASIDE and stays occupied until commit, so it earns no credit.
+    // disk_bytes==0 (older builder, serde default) or a failed probe skips the check —
+    // fail open: a residual ENOSPC still surfaces with its os error via error_chain.
+    if meta.disk_bytes > 0 {
+        if let Some(free) = crate::util::free_bytes_at(&root) {
+            let torn_credit =
+                if !marker.exists() && final_dir.exists() { dir_size(&final_dir) } else { 0 };
+            let avail = free.saturating_add(torn_credit);
+            if avail < meta.disk_bytes {
+                return Err(err(format!(
+                    "INSTALL_DISK_FULL: {} MB needed, {} MB free at {}",
+                    meta.disk_bytes / 1_000_000,
+                    avail / 1_000_000,
+                    root.display()
+                )));
+            }
+        }
+    }
+
     let mut old_backup: Option<PathBuf> = None;
+    let mut preclean_err: Option<String> = None;
     if marker.exists() {
         // Reinstall over an INSTALLED same-id pack: move the old tree ASIDE, never
         // destroy it up front — a failed install must roll the working pack back
@@ -685,8 +800,14 @@ pub fn extract_and_commit(
         old_backup = Some(moved);
     } else if final_dir.exists() {
         // Torn earlier attempt. Prefer a clean slate; extracting over identical
-        // content is the fallback when something still holds a subdir.
-        if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+        // content is the fallback when something still holds a subdir. Failing LOUD
+        // here would re-create the S42 pain (Defender's scan queue pins fresh-file
+        // handles for minutes right after a failed extract, while file CREATES keep
+        // working) — so the fallback stays, but the failure is REMEMBERED: if the
+        // extract-over then fails too, both causes surface in one message instead of
+        // an unexplainable unpack error (S68d).
+        if let Err(e) = remove_dir_all_robust(&final_dir) {
+            preclean_err = Some(e.to_string());
             tracing::warn!("torn install dir not fully cleared ({e}) — extracting over it");
         }
     }
@@ -699,11 +820,18 @@ pub fn extract_and_commit(
             if cancel.load(Ordering::SeqCst) {
                 return Err(err("INSTALL_CANCELLED"));
             }
-            let mut entry = entry.map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {e}")))?;
+            let mut entry = entry.map_err(|e| err(format!("TAR_ENTRY_CORRUPT: {}", error_chain(&e))))?;
             // unpack_in refuses paths escaping dest (tar 路径穿越防护).
-            entry
-                .unpack_in(&dest)
-                .map_err(|e| err(format!("EXTRACT_FAILED: {e}")))?;
+            entry.unpack_in(&dest).map_err(|e| {
+                let mut msg = format!("EXTRACT_FAILED: {}", error_chain(&e));
+                if let Some(pc) = &preclean_err {
+                    // Both causes in one line: an extract-over failure is usually a
+                    // symptom of whatever blocked the pre-clean (locked/readonly
+                    // remnant) — alone, the unpack error is a riddle.
+                    msg.push_str(&format!(" [pre-clean incomplete: {pc}]"));
+                }
+                err(msg)
+            })?;
             count += 1;
             if count % 100 == 0 {
                 progress(count);
@@ -717,7 +845,8 @@ pub fn extract_and_commit(
 
         // ── the commit: one fresh file, same-dir rename ──
         let tmp = final_dir.join("pack.json.tmp");
-        std::fs::write(&tmp, meta_text.as_bytes())?;
+        std::fs::write(&tmp, meta_text.as_bytes())
+            .map_err(|e| err(format!("INSTALL_COMMIT_WRITE_FAILED: {}: {e}", tmp.display())))?;
         rename_with_retry(&tmp, &marker, "INSTALL_COMMIT")?;
         Ok(meta)
     })();

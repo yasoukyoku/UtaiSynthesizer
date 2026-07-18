@@ -693,10 +693,40 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool
         if from.is_dir() {
             copy_dir_all(&from, &to, false)?;
         } else {
-            std::fs::copy(&from, &to)?;
+            // S68d: a mid-copy failure in a tens-of-GB migration must name the file —
+            // io::Error's Display alone gives "os error 112" with no idea where.
+            std::fs::copy(&from, &to).map_err(|e| {
+                std::io::Error::new(e.kind(), format!("{} -> {}: {e}", from.display(), to.display()))
+            })?;
         }
     }
     Ok(())
+}
+
+/// S68d disk-preflight walker: bytes the migration still NEEDS at the target for one
+/// subtree — Σ over SOURCE files of (src len − existing same-relpath target len). The
+/// traversal predicates MIRROR copy_dir_all exactly (`is_dir()` follows junctions and
+/// `fs::metadata` follows file symlinks, so linked content is counted the way the copy
+/// will actually copy it); crediting only the same-path target file keeps unrelated
+/// pre-existing target content from shrinking the estimate (both review S68d).
+fn migrate_tree_needed(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> u64 {
+    let mut needed = 0u64;
+    let Ok(rd) = std::fs::read_dir(src) else { return 0 };
+    for entry in rd.flatten() {
+        if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            needed = needed.saturating_add(migrate_tree_needed(&from, &to, false));
+        } else {
+            let src_len = std::fs::metadata(&from).map(|m| m.len()).unwrap_or(0);
+            let dst_len = std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0);
+            needed = needed.saturating_add(src_len.saturating_sub(dst_len));
+        }
+    }
+    needed
 }
 
 /// Post-copy integrity check: every file under `src` (same skip rules as the copy) must exist under
@@ -834,6 +864,27 @@ pub async fn migrate_data_dir(state: State<'_, Arc<AppState>>, new_dir: String) 
         let canon_root = std::fs::canonicalize(&src_root).unwrap_or_else(|_| src_root.clone());
         if canon_target.starts_with(&canon_root) || canon_root.starts_with(&canon_target) {
             return Err("Target directory overlaps the current data directory".into());
+        }
+        // S68d disk preflight: refuse up front with real numbers instead of dying
+        // mid-copy after half an hour. Per-file same-path credit (a retried migration
+        // re-needs nothing for files already copied); probe failure = fail open.
+        let mut needed: u64 = 0;
+        for name in MIGRATED_SUBTREES {
+            needed = needed.saturating_add(migrate_tree_needed(
+                &src_root.join(name),
+                &target.join(name),
+                skips_dot_top(name),
+            ));
+        }
+        if let Some(free) = crate::util::free_bytes_at(&canon_target) {
+            if free < needed {
+                return Err(format!(
+                    "MIGRATE_DISK_FULL: {} MB needed, {} MB free at {}",
+                    needed / 1_000_000,
+                    free / 1_000_000,
+                    target.display()
+                ));
+            }
         }
         for name in MIGRATED_SUBTREES {
             copy_dir_all(&src_root.join(name), &target.join(name), skips_dot_top(name))
@@ -1515,6 +1566,48 @@ async fn do_download_cuda_runtime(
     // (a mainland user resuming the 655 MB cuDNN wheel loses nothing on a mid-transfer
     // block), mirror rotation, per-chunk stall watchdog, sha256-before-commit, cancel.
     let client = crate::download::client()?;
+
+    // S68d disk preflight (estimate): each missing wheel counted twice (the compressed
+    // archive + its extracted DLLs coexist at that lane's peak) MINUS its resumable
+    // in-flight .part — kept across cancels by design, so without the credit a nearly
+    // complete retry double-counts those bytes and is spuriously refused (review S68d).
+    // The ORT nupkg stage always runs: archive + extracted payload coexist until the
+    // archive is deleted, so both are counted. Fail open on a failed probe — the
+    // per-lane download errors still carry their own causes.
+    {
+        // Extracted ORT CUDA payload estimate — ~291 MB measured on the shipped
+        // 1.24.4 set (providers_cuda.dll alone is 275 MB); rounded up.
+        const ORT_GPU_EXTRACTED_EST: u64 = 300_000_000;
+        let cuda_dir = app_dir.join("runtime").join("cuda");
+        let missing: u64 = CUDA_WHEELS
+            .iter()
+            .filter(|w| !cuda_dir.join(w.guard).exists())
+            .map(|w| {
+                let mut part = app_dir
+                    .join("runtime")
+                    .join(format!("{}.whl.zip", w.guard))
+                    .into_os_string();
+                part.push(".part");
+                let staged = std::fs::metadata(std::path::PathBuf::from(part))
+                    .map(|m| m.len().min(w.size))
+                    .unwrap_or(0);
+                w.size.saturating_mul(2).saturating_sub(staged)
+            })
+            .sum();
+        let needed = missing
+            .saturating_add(ORT_GPU_NUPKG_SIZE)
+            .saturating_add(ORT_GPU_EXTRACTED_EST);
+        if let Some(free) = crate::util::free_bytes_at(app_dir) {
+            if free < needed {
+                return Err(crate::UtaiError::Download(format!(
+                    "INSTALL_DISK_FULL: {} MB needed, {} MB free at {}",
+                    needed / 1_000_000,
+                    free / 1_000_000,
+                    app_dir.display()
+                )));
+            }
+        }
+    }
 
     // ── Stage 1: CUDA ORT DLLs (NuGet canonical; our HF mirror + hf-mirror as fallbacks) ──
     // 1.24.4 MUST match the ORT API version the `ort` crate (2.0-rc.12) targets — API 24 — AND the

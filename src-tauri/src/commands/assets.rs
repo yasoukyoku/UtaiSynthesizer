@@ -226,6 +226,38 @@ pub async fn download_asset_pack(
     let mut done_before: u64 = 0;
 
     let result: Result<(), String> = async {
+        // S68d disk preflight: refuse before the first byte, with real numbers — a
+        // 3.6 GB pack dying on ENOSPC mid-way used to surface as a bare engine error.
+        // Missing files only; in-flight .part bytes are credited (resume). Runs INSIDE
+        // the result funnel so the terminal failed event still fires. Fail open when
+        // the probe fails.
+        {
+            let mut needed: u64 = 0;
+            for f in pack.files.iter() {
+                let dest = dest_path(&models_dir, f.rel);
+                if dest.exists() {
+                    continue;
+                }
+                let mut part = dest.into_os_string();
+                part.push(".part");
+                let inflight = std::fs::metadata(std::path::PathBuf::from(part))
+                    .map(|m| m.len().min(f.size))
+                    .unwrap_or(0);
+                needed = needed.saturating_add(f.size - inflight);
+            }
+            if needed > 0 {
+                if let Some(free) = crate::util::free_bytes_at(&models_dir) {
+                    if free < needed {
+                        return Err(format!(
+                            "INSTALL_DISK_FULL: {} MB needed, {} MB free at {}",
+                            needed / 1_000_000,
+                            free / 1_000_000,
+                            models_dir.display()
+                        ));
+                    }
+                }
+            }
+        }
         for (i, f) in pack.files.iter().enumerate() {
             let dest = dest_path(&models_dir, f.rel);
             if dest.exists() {

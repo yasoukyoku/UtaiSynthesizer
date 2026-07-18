@@ -166,6 +166,10 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   INFER_TASK_PANICKED: { key: "backend.INFER_TASK_PANICKED" },
   INSTALL_BUSY: { key: "backend.INSTALL_BUSY", busy: true },
   INSTALL_CANCELLED: { key: "backend.INSTALL_CANCELLED" },
+  // S68d: pack-install commit marker write failed — path + io cause ride in the detail.
+  INSTALL_COMMIT_WRITE_FAILED: { key: "backend.INSTALL_COMMIT_WRITE_FAILED" },
+  // S68d disk preflight: refused before download/extract — "N MB needed, M MB free" in the detail.
+  INSTALL_DISK_FULL: { key: "backend.INSTALL_DISK_FULL" },
   INTERNAL_EMPTY_FEATURES: { key: "backend.INTERNAL_EMPTY_FEATURES" },
   INTERNAL_ENHANCER_NO_VOCODER: { key: "backend.INTERNAL_ENHANCER_NO_VOCODER" },
   INTERNAL_NO_OUTPUT_PATH: { key: "backend.INTERNAL_NO_OUTPUT_PATH" },
@@ -187,6 +191,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   MANIFEST_PARSE_FAILED: { key: "backend.MANIFEST_PARSE_FAILED" },
   MANIFEST_READ_FAILED: { key: "backend.MANIFEST_READ_FAILED" },
   MANIFEST_REQUEST_FAILED: { key: "backend.MANIFEST_REQUEST_FAILED" },
+  // S68d disk preflight: migration refused before any copy — needed/free MB in the detail.
+  MIGRATE_DISK_FULL: { key: "backend.MIGRATE_DISK_FULL" },
   // S68c data-dir migration: one migration per session — restart before migrating again.
   MIGRATE_RESTART_REQUIRED: { key: "backend.MIGRATE_RESTART_REQUIRED", busy: true },
   // S68c data-dir migration: post-copy integrity check failed — config untouched, old dir stays live.
@@ -194,6 +200,8 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   MODEL_HOP_SIZE_ZERO: { key: "backend.MODEL_HOP_SIZE_ZERO" },
   MODEL_LEGACY_EXPORT: { key: "backend.MODEL_LEGACY_EXPORT" },
   MODEL_NOT_FOUND: { key: "backend.MODEL_NOT_FOUND" },
+  // S68d: separation-model delete was a prose error before (i18n rule violation).
+  MSST_DELETE_FAILED: { key: "backend.MSST_DELETE_FAILED" },
   NPY_LOAD_FAILED: { key: "backend.NPY_LOAD_FAILED" },
   MODEL_NOT_LOADED: { key: "backend.MODEL_NOT_LOADED" },
   PACK_BAD_ID: { key: "backend.PACK_BAD_ID" },

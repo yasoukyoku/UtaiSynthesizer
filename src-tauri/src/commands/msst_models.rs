@@ -308,7 +308,7 @@ pub fn delete_msst_model(
     let dir = &state.msst_models_dir;
     let path = dir.join(&filename);
     if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("Delete failed: {}", e))?;
+        std::fs::remove_file(&path).map_err(|e| format!("MSST_DELETE_FAILED: {e}"))?;
     }
 
     let stem = PathBuf::from(&filename);

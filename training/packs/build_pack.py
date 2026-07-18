@@ -221,12 +221,24 @@ def build(variant: str, version: int, workdir: Path):
     tar_zst = dist / f"{pack_id}.tar.zst"
     log("compressing (zstd -19, this takes a few minutes) ...")
     cctx = zstandard.ZstdCompressor(level=19, threads=-1)
+
+    # S68d: staged trees carry mtime=0 (1970) — below the FAT32/exFAT timestamp epoch
+    # (1980), so restoring such an mtime on extract fails with os error 87 on those
+    # volumes. The app-side extractor no longer writes mtimes at all, but normalize
+    # here too so the archives are sane for ANY consumer (7-zip, tar, scripts).
+    FAT_EPOCH = 315532800  # 1980-01-01T00:00:00Z
+
+    def _clamp_mtime(ti):
+        if ti.mtime < FAT_EPOCH:
+            ti.mtime = FAT_EPOCH
+        return ti
+
     with open(tar_zst, "wb") as raw:
         with cctx.stream_writer(raw) as zw:
             with tarfile.open(fileobj=zw, mode="w|") as tf:
                 # deterministic order; archive root holds pack.json + python/
                 for p in sorted(stage.rglob("*")):
-                    tf.add(p, arcname=str(p.relative_to(stage)), recursive=False)
+                    tf.add(p, arcname=str(p.relative_to(stage)), recursive=False, filter=_clamp_mtime)
     size = tar_zst.stat().st_size
     log(f"archive = {size/1e6:.1f} MB")
 
