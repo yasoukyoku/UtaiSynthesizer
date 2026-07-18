@@ -34,6 +34,12 @@ if (Test-Path $ff) {
   foreach ($e in @("libmp3lame", "libvorbis", "libopus", " aac", " flac")) {
     Check "ffmpeg encoder$e" ($enc -match [regex]::Escape($e))
   }
+  # S68c: libsoxr must be COMPILED IN (banner flag) — audio/mod.rs prefers
+  # aresample=soxr:precision=28 for model-rate resampling; the gyan ESSENTIALS build
+  # we bundled through 0.5.0 lacked it, so the quality path was dead for every user
+  # (silent swresample fallback + a WARN per decode). Bundle = BtbN win64-gpl.
+  $ver = & $ff -version 2>$null | Out-String
+  Check "ffmpeg libsoxr" ($ver -match "--enable-libsoxr")
 }
 
 # 4. ORT DirectML runtime — incl. DirectML.dll itself (the ORT DirectML build delay-loads it and the
