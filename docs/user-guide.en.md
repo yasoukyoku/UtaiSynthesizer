@@ -137,7 +137,7 @@ The download can be cancelled; the install phase cannot, and quitting the app is
 
 ### 2.7 Moving the install (portable)
 
-The app is fully portable: cut the **entire install folder** (default `C:\Users\<you>\AppData\Local\UtaiSynthesizer`) to any location — another drive, say — and double-click the `UtaiSynthesizer.exe` inside; models, the data directory and settings all travel with it. (Since v0.8.0 the logs and the UI cache also live inside the install folder — `logs\` and `webview\`; after a move, the only things left in system directories are a few-KB window-position memory file and any leftovers from pre-0.8.0 versions, which you can delete manually.)
+The app is fully portable: cut the **entire install folder** (default `C:\Users\<you>\AppData\Local\UtaiSynthesizer`) to any location — another drive, say — and double-click the `UtaiSynthesizer.exe` inside; models, the data directory and settings all travel with it. (Since v0.8.0 the logs and the UI cache also live inside the install folder — `logs\` and `webview\`; caches left in system directories by pre-0.8.0 versions are cleaned up automatically after the upgrade, leaving only a few-KB window-position memory file behind.)
 
 Since v0.7.0, updates after a move also happen **in place**: the in-app updater installs straight into the folder the running copy lives in, and once the app has started at the new location once, manually downloaded installers recognize it too (the app re-points the Windows-recorded install location at itself).
 
