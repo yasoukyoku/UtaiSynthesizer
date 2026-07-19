@@ -327,6 +327,16 @@ fn e1_cross_probe() {
         let total: i64 = sj.triples.iter().map(|t| t.frames).sum();
         assert_eq!(sj.f0_cents.len() as i64, total, "{seg}: f0 length vs Σframes");
         assert!(sj.triples.iter().all(|t| t.lang == 2), "{seg}: JA-only song expected");
+        // K 臂(S71 第四刀):Phase A 旋钮模型预测 θ 的 Option-A f0(e1KarmDump.test.ts 产)。
+        // 与 D 臂唯一差异 = 调教参数(同 triples 同渲染入口);缺文件则跳过 K。
+        let sk: Option<ScoreJson> = std::fs::read_to_string(work.join(format!("{seg}_score_K.json")))
+            .ok()
+            .map(|s| serde_json::from_str(&s).unwrap());
+        if let Some(k) = &sk {
+            let ktotal: i64 = k.triples.iter().map(|t| t.frames).sum();
+            assert_eq!(ktotal, total, "{seg}: K 臂 Σframes 必须与 D 一致(θ 不动谱面)");
+            assert_eq!(k.f0_cents.len() as i64, total, "{seg}: K f0 length vs Σframes");
+        }
         let evts: Vec<ScoreEvt> = sj
             .triples
             .iter()
@@ -339,6 +349,7 @@ fn e1_cross_probe() {
             })
             .collect();
         let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
+        let vf0_k = sk.as_ref().map(|k| VocalF0 { cents: &k.f0_cents, voiced: &k.f0_voiced });
 
         let src = crate::audio::load_audio(&work.join(format!("{seg}_src48k.wav"))).unwrap();
         assert_eq!(src.channels, 1, "{seg}: src must be mono");
@@ -458,6 +469,18 @@ fn e1_cross_probe() {
                 save(arm("B_natCV_paramF0"), &r);
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
             }
+            if let Some(vk) = &vf0_k {
+                if enabled(&arms_filter, "K") && !exists(&arm("K_s2cv_knobF0")) {
+                    let t0 = Instant::now();
+                    let r = render_score_sovits(
+                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol, 0, 0,
+                        Some(vk), None, None, &no_cancel, &noop,
+                    )
+                    .unwrap();
+                    save(arm("K_s2cv_knobF0"), &r);
+                    eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+                }
+            }
             if enabled(&arms_filter, "C") && !exists(&arm("C_s2cv_natF0")) {
                 let t0 = Instant::now();
                 let r = e1_render_sovits(
@@ -521,6 +544,18 @@ fn e1_cross_probe() {
                     .unwrap();
                 save(arm("B_natCV_paramF0"), &r);
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+            }
+            if let Some(vk) = &vf0_k {
+                if enabled(&arms_filter, "K") && !exists(&arm("K_s2cv_knobF0")) {
+                    let t0 = Instant::now();
+                    let r = render_score_rvc(
+                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0, 0, Some(vk),
+                        None, None, &no_cancel, &noop,
+                    )
+                    .unwrap();
+                    save(arm("K_s2cv_knobF0"), &r);
+                    eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+                }
             }
             if enabled(&arms_filter, "C") && !exists(&arm("C_s2cv_natF0")) {
                 let t0 = Instant::now();
