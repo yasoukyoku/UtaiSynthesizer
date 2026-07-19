@@ -13,15 +13,22 @@
 //! regulated `note_pitch` (each phone's MIDI repeated `phone_dur[i]` frames) — a pure function of the
 //! score, identical to `ScoreToF0.encode`'s `midi_frame`, so NO f0 model is needed.
 //!
-//! Then cv/f0/uv are resampled 50 fps → the SVC grid (SoVITS 44100/512 ≈ 86 fps `nearest`; RVC 2×
-//! nearest → 100 fps) and fed to the exported net_g (SoVITS `c/f0/uv/noise/sid[,vol]`; RVC
-//! `phone/phone_lengths/pitch/pitchf/sid/rnd`). uv = (f0 < 30) is the only voiced switch.
+//! Then cv/f0/uv are resampled 50 fps → the SVC grid and fed to the exported net_g (SoVITS
+//! `c/f0/uv/noise/sid[,vol]`; RVC `phone/phone_lengths/pitch/pitchf/sid/rnd`). S69 R0a: the SoVITS
+//! feed is shaped by the SAME cover-path code the model was trained against — cv via the model's
+//! `unit_interpolate_mode`, f0/uv via `sovits_f0_postprocess` (uv = (f0 > 0), **1 = voiced**, rests
+//! gap-interpolated so f0 is never 0). RVC stays 2× nearest → 100 fps with raw 0-Hz rests (that IS
+//! the cover convention there — RMVPE emits exact 0 on unvoiced and RVC takes no uv).
 //!
 //! GROUND TRUTH / GATE: the net_g wav is NOT bit-exact vs Python (ONNX-vs-PyTorch + the S35 export moved
 //! net_g's randn to an explicit seeded `noise` input), so the parity gate is on the deterministic net_g
 //! INPUT tensors (`score2svc_ref.rs`, dumped by `_onnx_derisk/dump_score2svc_ref.py`): midi_frame /
-//! note_hz @50fps + f0_rs / uv_rs / cv_rs @86fps, all reproduced bit-for-bit. Audible wav + the §3.4
-//! legato-vs-SP behavior are confirmed by ear (Tier-2 render tests).
+//! note_hz @50fps + cv_rs @86fps bit-for-bit. ⚠ S69: f0_rs/uv_rs are NO LONGER pinned to that dump —
+//! the dump reproduced `render_derisk`'s conventions (uv=(f0<30) i.e. INVERTED, raw 0-Hz rests), which
+//! were a semantic CONTRACT BUG vs the trained net_g. The gate now anchors f0/uv to the official
+//! cover-path shaping (`sovits_f0_postprocess`, itself pinned to original so-vits by gen_refs.py
+//! vectors) + cross-checks the old dump on frames where the conventions overlap (voiced frames).
+//! Audible wav + the §3.4 legato-vs-SP behavior are confirmed by ear (Tier-2 render tests).
 
 use ndarray::Array2;
 
@@ -329,38 +336,46 @@ pub fn sovits_grid_len(t50: usize, sr: u32, hop: usize) -> usize {
 pub struct SovitsFeed {
     /// cv resampled to the hop grid, `[t_tgt, dim]`.
     pub cv: Array2<f32>,
-    /// f0 (Hz) per hop frame, clipped to `[0, 1100]`, length `t_tgt`.
+    /// f0 (Hz) per hop frame, length `t_tgt` — gap-interpolated like the cover path (never 0 unless
+    /// the whole chunk is rests), NOT clamped (the cover path has no clamp either).
     pub f0: Vec<f32>,
-    /// voiced mask (0.0/1.0) per hop frame, length `t_tgt`.
+    /// voiced mask (0.0/1.0) per hop frame, length `t_tgt`. **1.0 = voiced** — the official so-vits
+    /// convention (`sovits_f0_postprocess`), same as the cover path feeds net_g's `uv` input.
     pub uv: Vec<f32>,
     pub t_tgt: usize,
 }
 
-/// Resample a chunk's `(cv @50fps, note_hz @50fps)` to the SoVITS hop grid, mirroring
-/// `render_derisk.render_cv` EXACTLY: uv=(note_hz<30) is taken on the 50 fps f0 FIRST, then cv/f0/uv
-/// are `F.interpolate('nearest')`-resampled to `t_tgt = round(T·sr/hop/50)`, f0 clipped to [0,1100],
-/// uv re-thresholded `>0.5`. cv nearest == `repeat_expand_2d(_, _, "nearest")` (torch-parity tested).
-pub fn resample_to_sovits_grid(cv: &Array2<f32>, note_hz: &[f32], sr: u32, hop: usize) -> Result<SovitsFeed> {
+/// Resample a chunk's `(cv @50fps, note_hz @50fps)` to the SoVITS hop grid the way the COVER path
+/// shapes net_g inputs (S69 R0a — 自己唱 must feed the contract the model was TRAINED on):
+///   * cv: `repeat_expand_2d` with the MODEL's `unit_interpolate_mode` (`expand_mode`; mirrors
+///     sovits.rs's cover-path choice — only_diffusion is command-layer-disallowed for the score
+///     path, so the main model's mode is always the right one here).
+///   * f0/uv: `sovits_f0_postprocess` — the bit-exact `RMVPEF0Predictor.post_process` port the
+///     cover path uses: nearest-resize to `t_tgt`, uv = (f0 > 0) (**1 = voiced**), then np.interp
+///     across unvoiced gaps so the f0 stream is never 0 (training preprocessing does the same —
+///     net_g never saw f0=0). Voicing still rides `build_note_hz`'s 0-Hz sentinel (Option-A mask →
+///     0 Hz), and any nonzero pitch now counts as voiced (the old `<30 Hz` threshold is gone, so an
+///     extreme down-transpose below MIDI 24 stays voiced). An all-rest chunk degenerates to
+///     all-zero f0 + all-zero uv — identical to the cover path's all-zero short-circuit.
+/// ⚠ HISTORY: until S69 this mirrored the research repo's `render_derisk.render_cv` — uv=(f0<30)
+/// (INVERTED, 1-was-unvoiced), raw 0-Hz rests, a [0,1100] clamp, and hardcoded 'nearest' cv. Every
+/// sung frame wore the net_g's "unvoiced" embedding and rests fed an out-of-distribution f0=0 —
+/// a contract bug the Tier-1 gate couldn't see (it pinned tensors against the same-convention
+/// Python dump: bit-exact, semantically wrong).
+pub fn resample_to_sovits_grid(
+    cv: &Array2<f32>,
+    note_hz: &[f32],
+    sr: u32,
+    hop: usize,
+    expand_mode: &str,
+) -> Result<SovitsFeed> {
     debug_assert_eq!(cv.nrows(), note_hz.len(), "cv rows must equal note_hz length (both T50)");
     let t_tgt = sovits_grid_len(cv.nrows(), sr, hop);
     if t_tgt == 0 {
         return Err(UtaiError::Inference("SCORE2SVC_ZERO_FRAMES".into()));
     }
-    // uv on the 50 fps f0 (render_cv order), then nearest-resample the float mask. Under Option-A the real
-    // voiced mask already lives in `build_note_hz` (which writes 0 Hz for every unvoiced frame), so deriving
-    // uv=(note_hz<30) here round-trips it EXACTLY via the 0-Hz sentinel — no real sung pitch is <30 Hz
-    // (MIDI 24 ≈ 32.7 Hz). ⚠ An extreme downward transpose past MIDI 24 would sit below 30 Hz and be marked
-    // unvoiced; threading the mask through instead of re-deriving is the clean fix if that ever bites.
-    let uv50: Vec<f32> = note_hz.iter().map(|&f| if f < 30.0 { 1.0 } else { 0.0 }).collect();
-    let cv_rs = repeat_expand_2d(cv, t_tgt, "nearest")?;
-    let f0_rs: Vec<f32> = torch_interp_nearest(note_hz, t_tgt)
-        .into_iter()
-        .map(|f| f.clamp(0.0, 1100.0))
-        .collect();
-    let uv_rs: Vec<f32> = torch_interp_nearest(&uv50, t_tgt)
-        .into_iter()
-        .map(|v| if v > 0.5 { 1.0 } else { 0.0 })
-        .collect();
+    let cv_rs = repeat_expand_2d(cv, t_tgt, expand_mode)?;
+    let (f0_rs, uv_rs) = super::f0::sovits_f0_postprocess(note_hz, t_tgt, hop, sr);
     Ok(SovitsFeed { cv: cv_rs, f0: f0_rs, uv: uv_rs, t_tgt })
 }
 
@@ -440,7 +455,10 @@ pub fn render_score_sovits(
         }
         let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
-        let mut feed = resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size)?;
+        // S69: cv expand uses the model's sidecar mode, same as the cover path (only_diffusion is
+        // disallowed for the score path, so the diffusion-yaml override branch never applies).
+        let mut feed =
+            resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size, &m.unit_interpolate_mode)?;
         let real_t = pad_sovits_feed(&mut feed, m.min_frames); // M3: short trailing chunk
         apply_cluster_blend(&mut feed.cv, m.cluster, options.cluster_ratio); // SHARED retrieval blend
         // vol_embedding (SoVITS 4.1): feed net_g a per-frame loudness = flat_vol · lane multiplier (this
@@ -874,7 +892,10 @@ mod tests {
 
                 let midi = midi_frame_50(&chunk.note_pitch, &chunk.phone_dur);
                 let note_hz = note_hz_50(&midi);
-                let feed = resample_to_sovits_grid(&cv, &note_hz, SOVITS_SR, SOVITS_HOP).unwrap();
+                // "nearest": the Python dump was rendered in nearest mode — keeping the cv_rs
+                // reference anchored. Production passes the model sidecar's unit_interpolate_mode;
+                // the 'left' variant is pinned by features.rs's own upstream (ast-exec) vectors.
+                let feed = resample_to_sovits_grid(&cv, &note_hz, SOVITS_SR, SOVITS_HOP, "nearest").unwrap();
 
                 // midi_frame: bit-exact (i64 length-regulation)
                 assert_eq!(midi.as_slice(), r.midi_frame, "{} c{}: midi_frame", model, ci);
@@ -883,15 +904,46 @@ mod tests {
                 // note_hz @50fps: tight tolerance (transcendental pow, f64→f32; a real bug is Hz-scale)
                 let nh_worst = worst_abs(&note_hz, r.note_hz);
                 assert!(nh_worst <= 1e-2, "{} c{}: note_hz worst {:.3e} Hz > 1e-2", model, ci, nh_worst);
-                // f0_rs @86fps: same tolerance (resample is exact index pick of note_hz)
-                let f0_worst = worst_abs(&feed.f0, r.f0_rs);
+                // f0_rs/uv_rs @86fps (S69 R0a): the dump predates the cover-parity fix — its uv was
+                // INVERTED (render_derisk uv=(f0<30)) and its rests raw 0 Hz, i.e. the dumped f0_rs/
+                // uv_rs encode the CONTRACT BUG. Two-way anchor instead:
+                //  1. expected tensors from `sovits_f0_postprocess` computed ON THE REFERENCE note_hz
+                //     (never through the production path) — that port is pinned to ORIGINAL so-vits
+                //     python by its own gen_refs.py vectors (f0.rs tests);
+                //  2. cross-anchor vs the old dump where the conventions overlap: every frame the dump
+                //     had f0>0 (voiced) must keep the SAME f0 (resize unchanged; this score sits far
+                //     below the old 1100 Hz clamp) and read uv=1; every dumped-0 frame must read uv=0.
+                let (f0_exp, uv_exp) =
+                    super::super::f0::sovits_f0_postprocess(r.note_hz, r.t_tgt, SOVITS_HOP, SOVITS_SR);
+                let f0_worst = worst_abs(&feed.f0, &f0_exp);
                 assert!(f0_worst <= 1e-2, "{} c{}: f0_rs worst {:.3e} Hz > 1e-2", model, ci, f0_worst);
-                // uv_rs @86fps: bit-exact (0.0/1.0)
                 assert_eq!(feed.uv.len(), r.uv_rs.len(), "{} c{}: uv len", model, ci);
                 assert!(
-                    feed.uv.iter().zip(r.uv_rs).all(|(a, b)| a == b),
-                    "{} c{}: uv_rs mismatch", model, ci
+                    feed.uv.iter().zip(&uv_exp).all(|(a, b)| a == b),
+                    "{} c{}: uv_rs vs postprocess expectation", model, ci
                 );
+                for i in 0..r.t_tgt {
+                    let dump_voiced = r.f0_rs[i] > 0.0;
+                    assert_eq!(
+                        feed.uv[i],
+                        if dump_voiced { 1.0 } else { 0.0 },
+                        "{} c{}: uv frame {} vs old-dump voicing", model, ci, i
+                    );
+                    if dump_voiced {
+                        assert!(
+                            (feed.f0[i] - r.f0_rs[i]).abs() <= 1e-2,
+                            "{} c{}: voiced f0 frame {} drifted: {} vs dump {}",
+                            model, ci, i, feed.f0[i], r.f0_rs[i]
+                        );
+                    } else {
+                        // a rest frame must now be gap-interpolated non-zero — unless the whole
+                        // chunk is rests (then postprocess degenerates to zeros, like cover).
+                        assert!(
+                            feed.f0[i] > 0.0 || f0_exp.iter().all(|&v| v == 0.0),
+                            "{} c{}: rest frame {} still 0 Hz (gap interpolation missing)", model, ci, i
+                        );
+                    }
+                }
                 // cv_rs @86fps: sampled ≤1e-3 + global stats (mirrors the 1d cv gate)
                 assert_eq!(cv.nrows(), r.t, "{} c{}: cv T50", model, ci);
                 assert_eq!(feed.cv.nrows(), r.t_tgt, "{} c{}: cv_rs rows", model, ci);
@@ -907,7 +959,7 @@ mod tests {
                 assert!((sum - cvr.sum).abs() <= 0.1 + cvr.sum.abs() * 1e-4, "{} c{}: cv_rs sum", model, ci);
                 assert!((sumsq - cvr.sumsq).abs() <= 0.1 + cvr.sumsq * 1e-4, "{} c{}: cv_rs sumsq", model, ci);
 
-                let voiced = feed.uv.iter().filter(|&&u| u < 0.5).count();
+                let voiced = feed.uv.iter().filter(|&&u| u > 0.5).count(); // S69: 1 = voiced
                 eprintln!(
                     "[P2/Tier1] {} c{}: T={} t_tgt={} voiced={}/{} note_hz≤{:.1e} f0≤{:.1e} cv≤{:.1e} PASS",
                     model, ci, r.t, r.t_tgt, voiced, r.t_tgt, nh_worst, f0_worst, worst
@@ -994,7 +1046,9 @@ mod tests {
                 f0_predictor_session: None, sample_rate: 44100, hop_size: 512, features_dim: dim,
                 vol_embedding: vol, phase_bins: None, f0d_cond_channels: None,
                 feed_uv: true, spk_mix: None,
-                unit_interpolate_mode: "left".into(),
+                // "nearest" = the pre-S69 hardcode → the ear A/B against archived baselines stays
+                // single-variable (f0/uv semantics only). Production reads the voice sidecar's mode.
+                unit_interpolate_mode: "nearest".into(),
                 noise_channels: 192, min_frames: 6,
             }
         }

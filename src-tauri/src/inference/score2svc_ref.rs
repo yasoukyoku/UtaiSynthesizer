@@ -3,6 +3,10 @@
 //! Ground truth = render_ust.render_song 'noteonly' + render_derisk.render_cv (the net_g INPUT tensors:
 //! bare-noteonly f0, uv=(f0<30), cv/f0/uv resampled 50fps -> 44100/512fps 'nearest', f0 clipped [0,1100]).
 //! midi_frame / note_hz are @50fps; f0_rs / uv_rs / cv*_rs are @ the SoVITS 86.13fps grid.
+//! ⚠ S69 R0a: render_derisk's f0_rs/uv_rs conventions (inverted uv, raw 0-Hz rests, 1100 clamp) were a
+//! CONTRACT BUG vs the trained net_g — those two arrays are now CROSS-ANCHOR data only (voiced-frame
+//! overlap checks), NOT ground truth; do not regenerate expecting the production feed to match them.
+//! midi_frame / note_hz / cv*_rs remain authoritative bit-exact references.
 #![allow(dead_code)]
 
 pub struct CvS {
