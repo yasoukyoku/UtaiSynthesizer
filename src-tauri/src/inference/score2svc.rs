@@ -763,6 +763,13 @@ fn peak_normalize(w: &mut [f32], peak: f32) {
     }
 }
 
+// E1 交叉判别实验 harness(S70,diagnostic #[ignore])— 挂为子模块以复用本文件私有整形函数
+// (zero_voiceless_frames / build_vol_env / pad_sovits_feed / seam_fade / peak_normalize),
+// 生产代码零触碰。详见 score2svc_e1.rs 头注。
+#[cfg(test)]
+#[path = "score2svc_e1.rs"]
+mod e1_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
