@@ -1,0 +1,141 @@
+//! GAME 离线批量打谱 harness(SVC2SVS 旋钮线第二刀)— 诊断工具,不是 gate。
+//!
+//! 目的:对 MBS2H 最终训练集的 utterance wav 批量跑生产 GAME 管线(midi_extract::extract_notes,
+//! 零复制铁律:绝不在 Python 重写 GAME),音符 JSON 落盘给 SVC2SVS 的 build_labels.py 消费。
+//! 官方管线非确定(D3PM×ORT 线程归约)→ 标注**跑一次固定落盘**,已存在输出直接跳过(断点续跑,
+//! 重打需先删旧 JSON)。CPU 钉死(S60 口径,~7.5× 实时,零显存竞争);权重 CC BY-NC-SA,
+//! 产物只进本地训练数据,不进任何分发物。
+//!
+//! 任务单(SVC2SVS pitch/dataprep/build_game_tasks.py 生成):
+//!   JSON 数组 [{"id": "...", "wav": "<绝对路径>", "out": "<绝对路径>.json"}, ...]
+//! 运行(可多进程分片并行,shard 按 idx % n):
+//!   $env:UTAI_GAME_TASKS='D:\MyDev\SVC2SVS\labels\game_tasks.json'
+//!   $env:UTAI_GAME_SHARD='0/4'   # 可选,缺省 0/1=全量
+//!   cargo test --release --test game_batch -- --ignored --nocapture
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use utai_lib::inference::midi_extract;
+
+fn app_root() -> PathBuf {
+    // tests run from src-tauri; the models dir is the dev-checkout data/models (game_parity 同款)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+}
+
+#[derive(serde::Deserialize)]
+struct Task {
+    id: String,
+    wav: String,
+    out: String,
+}
+
+#[test]
+#[ignore]
+fn game_batch_label() {
+    let tasks_path = match std::env::var("UTAI_GAME_TASKS") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            eprintln!("skip: UTAI_GAME_TASKS not set");
+            return;
+        }
+    };
+    let shard = std::env::var("UTAI_GAME_SHARD").unwrap_or_else(|_| "0/1".into());
+    let (si, sn) = shard
+        .split_once('/')
+        .map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()))
+        .expect("UTAI_GAME_SHARD 形如 0/4");
+    assert!(si < sn, "shard index 必须 < shard count");
+
+    // ORT 初始化 = game_parity 同款(aux 走 CPU;测试进程无 GPU 全局设备设置)
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=warn")),
+        )
+        .try_init();
+    utai_lib::suppress_windows_dll_error_dialogs();
+    utai_lib::init_ort_runtime(&app_root());
+
+    let models_dir = app_root().join("data").join("models");
+    assert!(
+        midi_extract::game_installed(&models_dir),
+        "GAME 未安装于 {models_dir:?}(应用内先下载)"
+    );
+
+    let tasks: Vec<Task> =
+        serde_json::from_str(&std::fs::read_to_string(&tasks_path).unwrap()).unwrap();
+    let mine: Vec<&Task> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % sn == si)
+        .map(|(_, t)| t)
+        .collect();
+    eprintln!("[game_batch] shard {shard}: {}/{} tasks", mine.len(), tasks.len());
+
+    let engine = utai_lib::inference::engine::OnnxEngine::new();
+    // 全局设备钉死 CPU(S60 口径):否则 midi_extract 的「先试全局设备」政策会让每个任务
+    // 白付一次 GPU 会话构建+运行期失败+CPU 重建(pilot 实测 8s/任务的病灶),且零显存竞争。
+    engine.set_device(utai_lib::inference::engine::DeviceConfig::Cpu);
+    let t0 = std::time::Instant::now();
+    let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (k, t) in mine.iter().enumerate() {
+        let out = Path::new(&t.out);
+        if out.exists() {
+            skipped += 1;
+            continue;
+        }
+        let r = (|| -> Result<usize, String> {
+            let buf = utai_lib::audio::load_audio_at_rate(Path::new(&t.wav), 44100)
+                .map_err(|e| format!("load: {e}"))?;
+            let mut mono = utai_lib::audio::resample::to_mono(&buf).samples;
+            utai_lib::audio::sanitize_non_finite(&mut mono);
+            let notes =
+                midi_extract::extract_notes(&engine, &models_dir, &mono, 0, &|| false, &mut |_| {})?;
+            let dump: Vec<serde_json::Value> = notes
+                .iter()
+                .map(|n| {
+                    serde_json::json!({"onset": n.onset_sec, "offset": n.offset_sec, "pitch": n.pitch})
+                })
+                .collect();
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            // 原子写:先 tmp 再 rename(断点续跑靠「文件存在=完整」,半截文件会毒化下游)
+            let tmp = out.with_extension("json.tmp");
+            let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            f.write_all(
+                serde_json::to_string(&serde_json::json!({
+                    "id": t.id, "sr": 44100, "n_samples": mono.len(), "notes": dump
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            drop(f);
+            std::fs::rename(&tmp, out).map_err(|e| e.to_string())?;
+            Ok(notes.len())
+        })();
+        match r {
+            Ok(n_notes) => {
+                done += 1;
+                if done % 50 == 0 {
+                    let el = t0.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[game_batch] {k}/{} done={done} skip={skipped} fail={failed} ({:.1}s, {:.2}s/任务) last={} notes={n_notes}",
+                        mine.len(), el, el / done as f64, t.id
+                    );
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("[game_batch] FAIL {}: {e}", t.id);
+            }
+        }
+    }
+    midi_extract::unload_sessions(&engine, &models_dir);
+    eprintln!(
+        "[game_batch] shard {shard} finished: done={done} skip={skipped} fail={failed} in {:.0}s",
+        t0.elapsed().as_secs_f64()
+    );
+    assert_eq!(failed, 0, "有 {failed} 个任务失败(见上方 FAIL 行)");
+}
