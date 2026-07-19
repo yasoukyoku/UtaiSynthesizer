@@ -68,6 +68,14 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
     if matches!(s0, "っ" | "cl" | "q") {
         return Lyric::Phones(vec!["ʔ"]);
     }
+    // ── UTAI EXTENSION (S69, beyond render_ust.py): UTAU-convention foreign-sound kana (外来拗音).
+    // Community report: すぃ/すぇ fell through the lossy first-char fallback below and sang as す.
+    // Checked BEFORE the kana chain; fires ONLY for 「base+small-vowel」/the explicit vowel-onset
+    // rows — strings no generated table contains, so parity inputs (3279 golden vectors) never
+    // reach it and the upstream mapping stays byte-identical.
+    if let Some(v) = foreign_kana_phones(s0) {
+        return Lyric::Phones(v);
+    }
     // kana → romaji: whole string, else first 2 chars, else first char (if/elif chain — one branch).
     let kana = kana_map();
     let s: String = if let Some(&r) = kana.get(s0) {
@@ -109,6 +117,46 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
         }
     }
     Lyric::Unknown
+}
+
+/// Small-vowel kana → the vowel IPA it substitutes (外来拗音 second element).
+const SMALL_VOWEL_IPA: &[(char, &'static str)] = &[('ぁ', "a"), ('ぃ', "i"), ('ぅ', "ɯ"), ('ぇ', "e"), ('ぉ', "o")];
+
+/// Vowel-onset foreign rows the generic vowel-swap can't derive (う/い have no consonant onset):
+/// the UTAU convention reads them as w-/y-glide syllables. ゔ行 is NOT here — base ゔ ([v ɯ], S58
+/// KANA_EXTRA) goes through the generic rule like any consonant kana.
+const FOREIGN_KANA_EXPLICIT: &[(&str, &[&'static str])] =
+    &[("うぃ", &["w", "i"]), ("うぇ", &["w", "e"]), ("うぉ", &["w", "o"]), ("いぇ", &["j", "e"])];
+
+/// UTAI EXTENSION (S69): resolve a UTAU-convention foreign-sound kana (外来拗音) lyric, or None to
+/// fall through to the legacy chain. Generic rule: 「base kana + small vowel ぁぃぅぇぉ」 = the
+/// base's onset + the small vowel — the base resolves through the UNTOUCHED generated tables
+/// (kana→romaji→IPA), then the final vowel is swapped (all-IPA level, so palatalized onsets come
+/// out right for free: しぇ→[ɕ e], ちぇ→[tɕ e], てぃ→[t i], ふぁ→[ɸ a], つぁ→[ts a], すぃ→[s i],
+/// ゔぇ→[v e]…). Bases whose IPA doesn't end in a plain vowel (ん…) return None. NB the romaji
+/// spelling "si" stays Kunrei-shiki ɕi as upstream defined it — kana すぃ is the true /si/, that
+/// distinction is exactly the UTAU convention. Small-ya combos (てゅ) and katakana forms are out of
+/// scope here (katakana is folded to hiragana upstream in g2p::fold_katakana, so スィ arrives as すぃ).
+fn foreign_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
+    if let Some(&(_, seq)) = FOREIGN_KANA_EXPLICIT.iter().find(|&&(k, _)| k == s0) {
+        return Some(seq.to_vec());
+    }
+    let chars: Vec<char> = s0.chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    let last = *chars.last().unwrap();
+    let &(_, small_ipa) = SMALL_VOWEL_IPA.iter().find(|&&(c, _)| c == last)?;
+    let base: String = chars[..chars.len() - 1].iter().collect();
+    let romaji = kana_map().get(base.as_str())?;
+    let seq = r2ipa_map().get(*romaji)?;
+    let (&tail, head) = seq.split_last()?;
+    if !tbl::VOWEL_SET.contains(&tail) {
+        return None; // no plain-vowel tail to swap (ん etc.) — legacy chain decides
+    }
+    let mut v: Vec<&'static str> = head.to_vec();
+    v.push(small_ipa);
+    Some(v)
 }
 
 /// Public classification of ONE lyric token for the frontend (§9.5 single Rust classifier: the editor's
@@ -188,6 +236,74 @@ pub fn is_voiceless_phone(p: &str) -> bool {
         p.chars().next(),
         Some('p' | 't' | 'k' | 'c' | 'q' | 'ʈ' | 'ʔ' | 'f' | 's' | 'ʃ' | 'ɕ' | 'ç' | 'x' | 'h' | 'ʂ' | 'ɸ' | 'θ')
     )
+}
+
+#[cfg(test)]
+mod foreign_kana_tests {
+    use super::*;
+
+    fn phones(lyr: &str) -> Vec<&'static str> {
+        match classify_lyric(lyr) {
+            LyricClass::Phones { phones } => phones,
+            other => panic!("{lyr} should sing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_kana_generic_swap_and_explicit_rows() {
+        // the community-reported pair first (used to sing as す via the lossy first-char fallback):
+        assert_eq!(phones("すぃ"), vec!["s", "i"]);
+        assert_eq!(phones("すぇ"), vec!["s", "e"]);
+        for (k, want) in [
+            ("てぃ", vec!["t", "i"]), ("とぅ", vec!["t", "ɯ"]),
+            ("でぃ", vec!["d", "i"]), ("どぅ", vec!["d", "ɯ"]),
+            ("ふぁ", vec!["ɸ", "a"]), ("ふぃ", vec!["ɸ", "i"]), ("ふぇ", vec!["ɸ", "e"]), ("ふぉ", vec!["ɸ", "o"]),
+            ("つぁ", vec!["ts", "a"]), ("つぉ", vec!["ts", "o"]),
+            ("しぇ", vec!["ɕ", "e"]), ("ちぇ", vec!["tɕ", "e"]), ("じぇ", vec!["dʑ", "e"]),
+            ("ずぃ", vec!["z", "i"]),
+            ("ゔぁ", vec!["v", "a"]), ("ゔぃ", vec!["v", "i"]), ("ゔぇ", vec!["v", "e"]), ("ゔぉ", vec!["v", "o"]),
+            ("うぃ", vec!["w", "i"]), ("うぇ", vec!["w", "e"]), ("うぉ", vec!["w", "o"]), ("いぇ", vec!["j", "e"]),
+        ] {
+            assert_eq!(phones(k), want, "{k}");
+        }
+        // katakana arrives folded (g2p::fold_katakana upstream): ティ → てぃ.
+        assert_eq!(phones(&super::super::g2p::fold_katakana("ティ")), vec!["t", "i"]);
+    }
+
+    #[test]
+    fn foreign_kana_never_emits_out_of_vocab_and_legacy_unchanged() {
+        // vocabulary-safety sweep: EVERY base×small combo the generic rule accepts must emit only
+        // 210-vocab tokens — an out-of-vocab phone would LOUD-error at build_arrays, so this pins
+        // the failure to compile-time-adjacent instead of a user's render.
+        let ids = phone_to_id_map();
+        let smalls = ['ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ'];
+        let mut combos = 0usize;
+        for (base, _) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            for sv in smalls {
+                let s = format!("{base}{sv}");
+                if let Some(v) = foreign_kana_phones(&s) {
+                    combos += 1;
+                    for p in v {
+                        assert!(ids.contains_key(p), "{s} emitted out-of-vocab phone {p}");
+                    }
+                }
+            }
+        }
+        assert!(combos > 300, "sweep actually exercised the rule (got {combos})");
+        // legacy behavior untouched (parity anchors):
+        assert_eq!(phones("す"), vec!["s", "ɯ"]);
+        assert_eq!(phones("し"), vec!["ɕ", "i"]);
+        assert_eq!(phones("きゃ"), vec!["c", "a"]);
+        assert_eq!(phones("ぃ"), vec!["i"], "a lone small vowel still sings as its plain vowel");
+        assert!(matches!(classify_lyric("ー"), LyricClass::Sustain));
+    }
+
+    #[test]
+    fn foreign_kana_sustain_carrier_integration() {
+        // すぃ + ー: the sustain must carry the SWAPPED vowel (i), not the base's ɯ.
+        let arr = build_arrays(&[("すぃ", 60, 80), ("ー", 60, 80)]).unwrap();
+        assert_eq!(arr.phon, vec!["s", "i", "i"], "sustain re-emits the foreign vowel");
+    }
 }
 
 #[cfg(test)]
