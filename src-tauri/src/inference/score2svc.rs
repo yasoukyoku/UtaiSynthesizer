@@ -18,7 +18,9 @@
 //! feed is shaped by the SAME cover-path code the model was trained against — cv via the model's
 //! `unit_interpolate_mode`, f0/uv via `sovits_f0_postprocess` (uv = (f0 > 0), **1 = voiced**, rests
 //! gap-interpolated so f0 is never 0). RVC stays 2× nearest → 100 fps with raw 0-Hz rests (that IS
-//! the cover convention there — RMVPE emits exact 0 on unvoiced and RVC takes no uv).
+//! the cover convention there — RMVPE emits exact 0 on unvoiced and RVC takes no uv). S69 R0b adds
+//! the pre-grid f0 shaping for BOTH backends — voiceless-phone frames → 0 Hz + seeded micro-texture
+//! (`zero_voiceless_frames`/`apply_f0_texture`) — and a phrase-ADSR vol for vol_embedding models.
 //!
 //! GROUND TRUTH / GATE: the net_g wav is NOT bit-exact vs Python (ONNX-vs-PyTorch + the S35 export moved
 //! net_g's randn to an explicit seeded `noise` input), so the parity gate is on the deterministic net_g
@@ -31,6 +33,9 @@
 //! Audible wav + the §3.4 legato-vs-SP behavior are confirmed by ear (Tier-2 render tests).
 
 use ndarray::Array2;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rand_distr::StandardNormal;
 
 #[cfg(test)]
 use super::engine::OnnxEngine; // only the #[ignore] gates name the engine type; the render fns use m.engine
@@ -38,7 +43,8 @@ use super::features::{repeat_expand_2d, torch_interp_nearest};
 use super::g2p::{self, Lang, ScoreEvt};
 use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
-    build_arrays_daw, chunk_at_sp, classify_lyric, run_score2cv, LyricClass, ScoreArrays,
+    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv, LyricClass,
+    ScoreArrays,
 };
 use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
 use super::{build_spk_mix_dense, RvcOptions, SovitsOptions, SynthesisResult};
@@ -272,6 +278,131 @@ fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default:
     out
 }
 
+// ─── S69 R0b: cover-parity f0 shaping + phrase dynamics (自己唱 texture layer) ────────────────────
+
+/// R0b①: zero f0 on frames whose phone is voiceless (obstruents + JA devoiced vowels, see
+/// `is_voiceless_phone`) — in the cover path RMVPE emits exact 0 there, so the trained contract is
+/// "voiceless frames carry no pitch". Downstream this makes SoVITS mark them uv=0 (+ gap-interp f0)
+/// and RVC's protect blend fire (pitchf=0). Until S69 the score path sang straight through /s/ /k/
+/// with full voicing — the prime suspect for the community "清浊不分" (k→g-ish) reports.
+fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
+    let n = note_hz.len();
+    let mut cursor = 0usize;
+    for (i, &d) in arr.phone_dur.iter().enumerate() {
+        let d = d.max(0) as usize;
+        if is_voiceless_phone(arr.phon[i]) {
+            for f in &mut note_hz[cursor.min(n)..(cursor + d).min(n)] {
+                *f = 0.0;
+            }
+        }
+        cursor += d;
+    }
+}
+
+/// R0b② depths/cutoffs — v1 ear-tuning constants. Saitou 2005's "fine fluctuation" component:
+/// real sustained singing wobbles ~±10¢ slowly plus a few cents fast even with zero vibrato; a
+/// mathematically constant f0 hands NSF a perfectly periodic source = the held-note "electric
+/// buzz". RMS depths in cents; one-pole cutoffs in Hz on the 50 fps grid.
+const F0_TEXTURE_DRIFT_CENTS: f32 = 9.0;
+const F0_TEXTURE_JITTER_CENTS: f32 = 2.5;
+/// Domain-separation for the texture RNG so the same user seed never reuses the net_g/diffusion
+/// noise streams (same discipline as sovits.rs seg_rng / diffusion.rs NoiseSource).
+const F0_TEXTURE_SEED_DOMAIN: u64 = 0x5f0_7e57;
+
+/// R0b②: deterministic procedural f0 micro-texture, cents domain, voiced frames only. Two seeded
+/// one-pole-low-passed noise layers (slow drift + fast jitter), each RMS-normalized over the WHOLE
+/// score so the depth constants mean what they say, summed and applied as `f0 · 2^(¢/1200)`.
+/// Indexed by absolute 50 fps frame → continuous across notes and chunk seams; same `(seed, T)` →
+/// bit-identical texture (renders stay reproducible; the seed knob re-rolls it like net_g noise).
+/// NOT drawn on the overlay: §10.1 covers the EDITABLE curve — this is render texture (±10¢,
+/// invisible at overlay scale), the same class as net_g's seeded noise input.
+fn apply_f0_texture(note_hz: &mut [f32], seed: u64) {
+    let n = note_hz.len();
+    if n == 0 {
+        return;
+    }
+    let mut rng = StdRng::seed_from_u64(seed ^ F0_TEXTURE_SEED_DOMAIN);
+    let layer = |cutoff_hz: f32, depth: f32, rng: &mut StdRng| -> Vec<f32> {
+        let a = 1.0 - (-2.0 * std::f32::consts::PI * cutoff_hz / CV_FPS as f32).exp();
+        let mut y = 0.0f32;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x: f32 = rng.sample(StandardNormal);
+            y += a * (x - y);
+            out.push(y);
+        }
+        let rms = (out.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+        if rms > 1e-12 {
+            let k = depth / rms;
+            for v in &mut out {
+                *v *= k;
+            }
+        }
+        out
+    };
+    let drift = layer(1.5, F0_TEXTURE_DRIFT_CENTS, &mut rng);
+    let jitter = layer(12.0, F0_TEXTURE_JITTER_CENTS, &mut rng);
+    for (i, f) in note_hz.iter_mut().enumerate() {
+        if *f > 0.0 {
+            *f *= 2f32.powf((drift[i] + jitter[i]) / 1200.0);
+        }
+    }
+}
+
+/// R0b③ phrase-dynamics constants (v1 ear-tuning). Attack/release live only at PHRASE edges
+/// (after/before a rest or breath) — consecutive notes inside a phrase stay legato-flat: real
+/// phrasing dips at breaths, not at every note boundary, and か+ー sustains are ONE note group so
+/// they can never re-swell mid-hold.
+const VOL_ATTACK_FRAMES: usize = 4; // 80 ms @50fps
+const VOL_RELEASE_FRAMES: usize = 5; // 100 ms
+const VOL_EDGE_LEVEL: f32 = 0.55;
+const VOL_REST_LEVEL: f32 = 0.35;
+
+/// R0b③: per-cv-frame vol multiplier (unity = nominal) for vol_embedding models — replaces the
+/// "perfectly flat dynamics" story the constant placeholder told net_g (no real Volume_Extractor
+/// stream is constant). Built on the note groups' CV spans (short-note-inflation safe, same remap
+/// family as f0/lanes); the caller multiplies with `flat_vol` and the loudness lane. POST-DECODE
+/// gain (the no-vol-port 4.0/RVC path) is deliberately NOT shaped by this — the decoder's output
+/// already carries its own dynamics; shaping there would double-apply.
+fn build_vol_env(arr: &ScoreArrays, score: &[ScoreEvt]) -> Vec<f32> {
+    let t_total: usize = arr.phone_dur.iter().map(|&d| d.max(0) as usize).sum();
+    let g = compute_note_groups(arr, score);
+    let mut env = vec![1.0f32; t_total];
+    for gi in 0..g.ng {
+        let (s, c) = (g.cv_start[gi], g.cv_count[gi]);
+        let e = (s + c).min(t_total);
+        if s >= e {
+            continue;
+        }
+        if g.group_pitch[gi] <= 0 {
+            for v in &mut env[s..e] {
+                *v = VOL_REST_LEVEL;
+            }
+            continue;
+        }
+        let phrase_start = gi == 0 || g.group_pitch[gi - 1] <= 0;
+        let phrase_end = gi + 1 == g.ng || g.group_pitch[gi + 1] <= 0;
+        let len = e - s;
+        if phrase_start {
+            let a = VOL_ATTACK_FRAMES.min(len / 2).max(1);
+            for k in 0..a {
+                let t = (k + 1) as f32 / (a + 1) as f32;
+                env[s + k] = VOL_EDGE_LEVEL + (1.0 - VOL_EDGE_LEVEL) * t;
+            }
+        }
+        if phrase_end {
+            let r = VOL_RELEASE_FRAMES.min(len / 2).max(1);
+            for k in 0..r {
+                let t = (k + 1) as f32 / (r + 1) as f32;
+                let idx = e - 1 - k;
+                let v = VOL_EDGE_LEVEL + (1.0 - VOL_EDGE_LEVEL) * t;
+                env[idx] = env[idx].min(v);
+            }
+        }
+    }
+    env
+}
+
 /// Apply a per-cv-frame absolute-gain envelope (loudness multiplier, length = t_total) to the concatenated
 /// mono audio IN PLACE: sample `s` maps to cv frame `floor(s/len · t_total)`, scaled by `gain_cv[cv]`.
 /// Uniform map (each cv frame ≈ equal audio samples). Applied BEFORE `peak_normalize` so it shapes RELATIVE
@@ -435,11 +566,20 @@ pub fn render_score_sovits(
     // apply_range_inverse below shifts the audio back. range_shift=0 ⇒ byte-identical to before.
     let transpose_eff = transpose + range_shift;
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
-    let note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
+    let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
+    // S69 R0b: make the parametric f0 statistically resemble a REAL vocal f0 before it meets the
+    // SVC grid — ① voiceless frames → 0 Hz (cover parity: RMVPE emits 0 there; SoVITS then gets
+    // uv=0 + gap-interp) ② seeded micro-texture on voiced frames (constant-f0 NSF excitation =
+    // held-note buzz). Also improves the apply_range_inverse PSOLA guide (unvoiced islands stay dry).
+    zero_voiceless_frames(&mut note_hz_full, &arr);
+    apply_f0_texture(&mut note_hz_full, options.seed);
     // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
     // aligned to cv via the SAME group remap as f0 (short-note-inflation safe). None/empty ⇒ flat = no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
+    // R0b③: phrase ADSR for vol_embedding models, once at the 50fps cv grid (transpose-independent:
+    // note groups read note_to_phone/score, never arr.note_pitch).
+    let vol_env_cv = if m.vol_embedding { Some(build_vol_env(&arr, score)) } else { None };
     // content note_pitch is transposed separately (grouping is shift-invariant).
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
@@ -461,19 +601,20 @@ pub fn render_score_sovits(
             resample_to_sovits_grid(&cv, note_hz, m.sample_rate, m.hop_size, &m.unit_interpolate_mode)?;
         let real_t = pad_sovits_feed(&mut feed, m.min_frames); // M3: short trailing chunk
         apply_cluster_blend(&mut feed.cv, m.cluster, options.cluster_ratio); // SHARED retrieval blend
-        // vol_embedding (SoVITS 4.1): feed net_g a per-frame loudness = flat_vol · lane multiplier (this
-        // chunk's cv slice resampled to the hop grid). No lane ⇒ the original flat placeholder (parity).
-        let vol = if m.vol_embedding {
-            Some(match &loud_cv {
-                Some(lc) => {
-                    let seg = &lc[cv_cursor..(cv_cursor + chunk.t).min(lc.len())];
-                    torch_interp_nearest(seg, feed.t_tgt).into_iter().map(|mult| flat_vol * mult).collect()
-                }
-                None => vec![flat_vol; feed.t_tgt],
-            })
-        } else {
-            None
-        };
+        // vol_embedding (SoVITS 4.1): per-frame loudness = flat_vol · phrase ADSR (R0b③) · loudness
+        // lane, combined on the 50fps cv grid then one nearest resample to the hop grid (the same
+        // resample the lane-only path always used). The pre-S69 constant placeholder told net_g
+        // "perfectly flat dynamics" — a stream no real Volume_Extractor ever produces.
+        let vol = vol_env_cv.as_ref().map(|env| {
+            let end = (cv_cursor + chunk.t).min(env.len());
+            let combined: Vec<f32> = (cv_cursor..end)
+                .map(|i| {
+                    let lane = loud_cv.as_ref().and_then(|lc| lc.get(i).copied()).unwrap_or(1.0);
+                    env[i] * lane
+                })
+                .collect();
+            torch_interp_nearest(&combined, feed.t_tgt).into_iter().map(|v| flat_vol * v).collect()
+        });
         let padded_t = feed.t_tgt;
         // score has no source wav → wav_m is `&[]` (only read by only_diffusion + no-vol, which the
         // command layer disallows for the score path).
@@ -566,7 +707,11 @@ pub fn render_score_rvc(
     let mut arr = build_arrays_daw(score, dicts)?;
     // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
     let transpose_eff = transpose + range_shift;
-    let note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
+    let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
+    // S69 R0b (same as the SoVITS render): ① voiceless frames → pitchf 0 — RVC's cover convention
+    // (RMVPE zeros) — which finally lets the protect blend fire on consonants; ② seeded micro-texture.
+    zero_voiceless_frames(&mut note_hz_full, &arr);
+    apply_f0_texture(&mut note_hz_full, options.seed);
     // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
@@ -791,6 +936,68 @@ mod tests {
     fn apply_formant_env_empty_is_identity() {
         let audio = vec![0.1f32; 5000];
         assert_eq!(apply_formant_env(audio.clone(), &[]), audio, "empty formant env → unchanged (no warp)");
+    }
+
+    // ── S69 R0b: f0 shaping + phrase vol ──
+
+    #[test]
+    fn zero_voiceless_frames_zeroes_k_keeps_g() {
+        // か = [k(4fr), a(36fr)]: the voiceless k frames go 0 Hz, the vowel keeps pitch.
+        let score = [("か", 69, 40)];
+        let arr = daw_ja(&score);
+        let mut hz = build_note_hz(&arr, &ja_evts(&score), 0, None);
+        assert!(hz.iter().all(|&h| h > 0.0), "pre: whole note voiced");
+        zero_voiceless_frames(&mut hz, &arr);
+        let k = arr.phone_dur[0] as usize;
+        assert!(hz[..k].iter().all(|&h| h == 0.0), "k frames zeroed");
+        assert!(hz[k..].iter().all(|&h| h > 0.0), "vowel frames keep pitch");
+        // が = [ɡ, a] — voiced consonant stays pitched (清浊 distinction is the whole point).
+        let score_g = [("が", 69, 40)];
+        let arr_g = daw_ja(&score_g);
+        let mut hz_g = build_note_hz(&arr_g, &ja_evts(&score_g), 0, None);
+        zero_voiceless_frames(&mut hz_g, &arr_g);
+        assert!(hz_g.iter().all(|&h| h > 0.0), "ɡ (voiced) untouched");
+    }
+
+    #[test]
+    fn f0_texture_deterministic_voiced_only_bounded() {
+        let mut a = vec![440.0f32; 200];
+        a[10] = 0.0;
+        let mut b = a.clone();
+        apply_f0_texture(&mut a, 7);
+        apply_f0_texture(&mut b, 7);
+        assert_eq!(a, b, "same seed → bit-identical texture");
+        assert_eq!(a[10], 0.0, "unvoiced frame untouched");
+        assert!(a.iter().any(|&v| (v - 440.0).abs() > 0.01), "texture actually moves voiced frames");
+        for &v in &a {
+            if v > 0.0 {
+                let cents = 1200.0 * (v / 440.0).log2();
+                assert!(cents.abs() < 60.0, "texture bounded (got {cents:.1}¢)");
+            }
+        }
+        let mut c = vec![440.0f32; 200];
+        apply_f0_texture(&mut c, 8);
+        assert_ne!(a, c, "different seed → different texture");
+    }
+
+    #[test]
+    fn vol_env_phrase_shape_and_sustain_no_reswell() {
+        // note(20) / rest(10) / note(20): attack+release at phrase edges, rest floor between.
+        let score = [("あ", 60, 20), ("R", 0, 10), ("い", 62, 20)];
+        let arr = daw_ja(&score);
+        let env = build_vol_env(&arr, &ja_evts(&score));
+        assert_eq!(env.len(), 50);
+        assert!(env[0] < env[3] && env[3] < 1.0, "phrase attack rises: {} {}", env[0], env[3]);
+        assert_eq!(env[10], 1.0, "mid-note sustain flat");
+        assert!(env[19] < env[15], "phrase release falls into the rest");
+        assert!(env[20..30].iter().all(|&v| v == VOL_REST_LEVEL), "rest floor");
+        assert!(env[30] < 1.0 && env[38] == 1.0, "second phrase re-attacks then sustains");
+        // か+ー same pitch = ONE note group → no re-swell at the sustain join.
+        let sus = [("か", 60, 30), ("ー", 60, 30)];
+        let arr_s = daw_ja(&sus);
+        let env_s = build_vol_env(&arr_s, &ja_evts(&sus));
+        assert_eq!(env_s.len(), 60);
+        assert!(env_s[25..35].iter().all(|&v| v == 1.0), "sustain join stays flat (no ADSR re-trigger)");
     }
 
     // Note-model contrast (user Q, 2026-07-09): `ー` sustain (prolongation) vs a repeated `か` token

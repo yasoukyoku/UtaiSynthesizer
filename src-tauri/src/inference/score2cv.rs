@@ -171,6 +171,52 @@ pub struct ScoreArrays {
     pub lang: Vec<i64>,
 }
 
+/// S69 R0b①: whether a vocab phone token is VOICELESS (no vocal-fold vibration) — voiceless
+/// obstruents (incl. aspirated/tense/long/unreleased/labialized/palatalized variants and
+/// affricates) plus the JA devoiced vowels (i̥/ɨ̥/ɯ̥, ring-below U+0325). Used by the score render
+/// to zero f0 on these frames so the SVC feed matches the COVER path, where RMVPE emits exact 0
+/// there (SoVITS: uv=0 + gap-interpolated f0; RVC: pitchf=0 → the protect blend finally fires).
+/// Rule-based on the leading IPA base symbol: across this vocab every voiceless segment starts
+/// with a voiceless stop/fricative letter (affricates start with their stop half), and no voiced
+/// token starts with one — the exhaustiveness test below walks ALL 210 tokens so a future vocab
+/// regen can't silently slip an unclassified/misclassified token through.
+pub fn is_voiceless_phone(p: &str) -> bool {
+    if p.contains('\u{0325}') {
+        return true; // devoiced vowels i̥ ɨ̥ ɯ̥
+    }
+    matches!(
+        p.chars().next(),
+        Some('p' | 't' | 'k' | 'c' | 'q' | 'ʈ' | 'ʔ' | 'f' | 's' | 'ʃ' | 'ɕ' | 'ç' | 'x' | 'h' | 'ʂ' | 'ɸ' | 'θ')
+    )
+}
+
+#[cfg(test)]
+mod voiceless_tests {
+    use super::is_voiceless_phone;
+    use super::super::score2cv_tables::PHONE_TO_ID;
+
+    #[test]
+    fn voiceless_classification_is_exhaustive_and_stable() {
+        // Spot anchors (both polarities, every rule family).
+        for p in ["k", "s", "t", "ʔ", "tɕ", "tʃː", "pʰ", "t͈", "k̚", "ɸʷ", "sʲ", "t̪s̪", "i̥", "ɯ̥", "h"] {
+            assert!(is_voiceless_phone(p), "{p} must be voiceless");
+        }
+        for p in ["b", "d", "ɡ", "z", "ʒ", "dʑ", "dʒː", "m", "ɴ", "ɾ", "w", "j", "a", "ɯ", "əɻ", "ɦ", "ʁ", "β", "n̪", "m̩"] {
+            assert!(!is_voiceless_phone(p), "{p} must NOT be voiceless");
+        }
+        // Specials never classify voiceless (their frames are already rest/breath-zeroed upstream).
+        for p in ["SP", "AP", "PAD", "BOS", "EOS"] {
+            assert!(!is_voiceless_phone(p), "{p} special");
+        }
+        // Exhaustive walk: the count is pinned so a vocab regen that adds/renames tokens forces a
+        // REVIEW of this classifier instead of silently misrouting frames (72 = hand-audited count
+        // over the S69 vocab: 27 base obstruents + 3 devoiced vowels + 5 palatalized + 9 long +
+        // 6 dental + 2 aspirated-fricative + 7 tense + 3 unreleased + 7 labialized + t͈ʲ + tɕː/tʲː).
+        let n = PHONE_TO_ID.iter().filter(|(p, _)| is_voiceless_phone(p)).count();
+        assert_eq!(n, 72, "voiceless token count drifted — vocab regen? re-audit the classifier");
+    }
+}
+
 /// Port of `render_ust.build_arrays` (+ its `lyric_to_phones` front-end). `score` = (lyric, note_num,
 /// frames) per note. Rest frames are capped (first/last note → `CAP_LEAD`, mid → `CAP_MID`); a sustain
 /// (`-`/`ー`/`+`) continues the previous vowel (default `a`); notes are grouped into `note_to_phone` by
