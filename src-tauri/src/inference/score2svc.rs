@@ -19,8 +19,8 @@
 //! `unit_interpolate_mode`, f0/uv via `sovits_f0_postprocess` (uv = (f0 > 0), **1 = voiced**, rests
 //! gap-interpolated so f0 is never 0). RVC stays 2× nearest → 100 fps with raw 0-Hz rests (that IS
 //! the cover convention there — RMVPE emits exact 0 on unvoiced and RVC takes no uv). S69 R0b adds
-//! the pre-grid f0 shaping for BOTH backends — voiceless-phone frames → 0 Hz + seeded micro-texture
-//! (`zero_voiceless_frames`/`apply_f0_texture`) — and a phrase-ADSR vol for vol_embedding models.
+//! voiceless-phone frames → 0 Hz for BOTH backends (`zero_voiceless_frames`) and a phrase-ADSR vol
+//! for vol_embedding models. (An R0b procedural f0 micro-texture was ear-vetoed and removed.)
 //!
 //! GROUND TRUTH / GATE: the net_g wav is NOT bit-exact vs Python (ONNX-vs-PyTorch + the S35 export moved
 //! net_g's randn to an explicit seeded `noise` input), so the parity gate is on the deterministic net_g
@@ -33,9 +33,6 @@
 //! Audible wav + the §3.4 legato-vs-SP behavior are confirmed by ear (Tier-2 render tests).
 
 use ndarray::Array2;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::StandardNormal;
 
 #[cfg(test)]
 use super::engine::OnnxEngine; // only the #[ignore] gates name the engine type; the render fns use m.engine
@@ -299,55 +296,13 @@ fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
     }
 }
 
-/// R0b② depths/cutoffs — v1 ear-tuning constants. Saitou 2005's "fine fluctuation" component:
-/// real sustained singing wobbles ~±10¢ slowly plus a few cents fast even with zero vibrato; a
-/// mathematically constant f0 hands NSF a perfectly periodic source = the held-note "electric
-/// buzz". RMS depths in cents; one-pole cutoffs in Hz on the 50 fps grid.
-const F0_TEXTURE_DRIFT_CENTS: f32 = 9.0;
-const F0_TEXTURE_JITTER_CENTS: f32 = 2.5;
-/// Domain-separation for the texture RNG so the same user seed never reuses the net_g/diffusion
-/// noise streams (same discipline as sovits.rs seg_rng / diffusion.rs NoiseSource).
-const F0_TEXTURE_SEED_DOMAIN: u64 = 0x5f0_7e57;
-
-/// R0b②: deterministic procedural f0 micro-texture, cents domain, voiced frames only. Two seeded
-/// one-pole-low-passed noise layers (slow drift + fast jitter), each RMS-normalized over the WHOLE
-/// score so the depth constants mean what they say, summed and applied as `f0 · 2^(¢/1200)`.
-/// Indexed by absolute 50 fps frame → continuous across notes and chunk seams; same `(seed, T)` →
-/// bit-identical texture (renders stay reproducible; the seed knob re-rolls it like net_g noise).
-/// NOT drawn on the overlay: §10.1 covers the EDITABLE curve — this is render texture (±10¢,
-/// invisible at overlay scale), the same class as net_g's seeded noise input.
-fn apply_f0_texture(note_hz: &mut [f32], seed: u64) {
-    let n = note_hz.len();
-    if n == 0 {
-        return;
-    }
-    let mut rng = StdRng::seed_from_u64(seed ^ F0_TEXTURE_SEED_DOMAIN);
-    let layer = |cutoff_hz: f32, depth: f32, rng: &mut StdRng| -> Vec<f32> {
-        let a = 1.0 - (-2.0 * std::f32::consts::PI * cutoff_hz / CV_FPS as f32).exp();
-        let mut y = 0.0f32;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let x: f32 = rng.sample(StandardNormal);
-            y += a * (x - y);
-            out.push(y);
-        }
-        let rms = (out.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
-        if rms > 1e-12 {
-            let k = depth / rms;
-            for v in &mut out {
-                *v *= k;
-            }
-        }
-        out
-    };
-    let drift = layer(1.5, F0_TEXTURE_DRIFT_CENTS, &mut rng);
-    let jitter = layer(12.0, F0_TEXTURE_JITTER_CENTS, &mut rng);
-    for (i, f) in note_hz.iter_mut().enumerate() {
-        if *f > 0.0 {
-            *f *= 2f32.powf((drift[i] + jitter[i]) / 1200.0);
-        }
-    }
-}
+// R0b② (procedural f0 micro-texture) LIVED HERE and was REMOVED same-day by user ear verdict
+// (commit c0c4f0d → reverted): two seeded LPF-noise layers on voiced frames sounded like
+// MECHANICAL wobble (buzz stayed, plus faint glide artifacts around silences via the textured
+// gap-interp endpoints). Lesson locked into the S69 research memory: real micro-motion is
+// STRUCTURED (breath/effort/vibrato-coupled), not filtered white noise — it must come from
+// real-audio-derived condition curves (variance/f0) or a learned predictor, never from
+// procedural randomness. Do NOT re-add a "cheap jitter" here.
 
 /// R0b③ phrase-dynamics constants (v1 ear-tuning). Attack/release live only at PHRASE edges
 /// (after/before a rest or breath) — consecutive notes inside a phrase stay legato-flat: real
@@ -567,12 +522,11 @@ pub fn render_score_sovits(
     let transpose_eff = transpose + range_shift;
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
     let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
-    // S69 R0b: make the parametric f0 statistically resemble a REAL vocal f0 before it meets the
-    // SVC grid — ① voiceless frames → 0 Hz (cover parity: RMVPE emits 0 there; SoVITS then gets
-    // uv=0 + gap-interp) ② seeded micro-texture on voiced frames (constant-f0 NSF excitation =
-    // held-note buzz). Also improves the apply_range_inverse PSOLA guide (unvoiced islands stay dry).
+    // S69 R0b①: voiceless frames → 0 Hz (cover parity: RMVPE emits 0 there; SoVITS then gets
+    // uv=0 + gap-interp). Also improves the apply_range_inverse PSOLA guide (unvoiced stays dry).
+    // (R0b②'s procedural micro-texture was ear-vetoed and removed — see the note above
+    // build_vol_env; micro-motion waits for the conditioned-S2CV line.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
-    apply_f0_texture(&mut note_hz_full, options.seed);
     // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
     // aligned to cv via the SAME group remap as f0 (short-note-inflation safe). None/empty ⇒ flat = no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
@@ -708,10 +662,9 @@ pub fn render_score_rvc(
     // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
     let transpose_eff = transpose + range_shift;
     let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
-    // S69 R0b (same as the SoVITS render): ① voiceless frames → pitchf 0 — RVC's cover convention
-    // (RMVPE zeros) — which finally lets the protect blend fire on consonants; ② seeded micro-texture.
+    // S69 R0b① (same as the SoVITS render): voiceless frames → pitchf 0 — RVC's cover convention
+    // (RMVPE zeros) — which finally lets the protect blend fire on consonants. (② removed, ear-veto.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
-    apply_f0_texture(&mut note_hz_full, options.seed);
     // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
@@ -957,27 +910,6 @@ mod tests {
         let mut hz_g = build_note_hz(&arr_g, &ja_evts(&score_g), 0, None);
         zero_voiceless_frames(&mut hz_g, &arr_g);
         assert!(hz_g.iter().all(|&h| h > 0.0), "ɡ (voiced) untouched");
-    }
-
-    #[test]
-    fn f0_texture_deterministic_voiced_only_bounded() {
-        let mut a = vec![440.0f32; 200];
-        a[10] = 0.0;
-        let mut b = a.clone();
-        apply_f0_texture(&mut a, 7);
-        apply_f0_texture(&mut b, 7);
-        assert_eq!(a, b, "same seed → bit-identical texture");
-        assert_eq!(a[10], 0.0, "unvoiced frame untouched");
-        assert!(a.iter().any(|&v| (v - 440.0).abs() > 0.01), "texture actually moves voiced frames");
-        for &v in &a {
-            if v > 0.0 {
-                let cents = 1200.0 * (v / 440.0).log2();
-                assert!(cents.abs() < 60.0, "texture bounded (got {cents:.1}¢)");
-            }
-        }
-        let mut c = vec![440.0f32; 200];
-        apply_f0_texture(&mut c, 8);
-        assert_ne!(a, c, "different seed → different texture");
     }
 
     #[test]
