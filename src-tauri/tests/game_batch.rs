@@ -73,9 +73,17 @@ fn game_batch_label() {
     eprintln!("[game_batch] shard {shard}: {}/{} tasks", mine.len(), tasks.len());
 
     let engine = utai_lib::inference::engine::OnnxEngine::new();
-    // 全局设备钉死 CPU(S60 口径):否则 midi_extract 的「先试全局设备」政策会让每个任务
-    // 白付一次 GPU 会话构建+运行期失败+CPU 重建(pilot 实测 8s/任务的病灶),且零显存竞争。
-    engine.set_device(utai_lib::inference::engine::DeviceConfig::Cpu);
+    // 默认钉 CPU:S71 实测本机 CUDA 跑 GAME 在 cudnn frontend 构图即炸(encoder conv,
+    // CUDNN_FE failure 11)→「先试全局设备」政策会让每任务白付 GPU 会话构建+失败+重建。
+    // UTAI_GAME_DEVICE=cuda:<id> 供 GPU 试探(⚠extract_notes 对 GPU 运行期失败会静默退
+    // CPU 重试——判断 GPU 是否真通要看 stderr 有无「retrying once on CPU」告警+速度)。
+    let dev = std::env::var("UTAI_GAME_DEVICE").unwrap_or_else(|_| "cpu".into());
+    let cfg = match dev.strip_prefix("cuda:") {
+        Some(id) => utai_lib::inference::engine::DeviceConfig::Cuda { device_id: id.parse().expect("UTAI_GAME_DEVICE 形如 cuda:0") },
+        None => utai_lib::inference::engine::DeviceConfig::Cpu,
+    };
+    eprintln!("[game_batch] device = {dev}");
+    engine.set_device(cfg);
     let t0 = std::time::Instant::now();
     let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     for (k, t) in mine.iter().enumerate() {
