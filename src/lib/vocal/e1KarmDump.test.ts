@@ -4,6 +4,9 @@
 // {seg}_score_K.json 给 Rust e1 harness 的 K 臂消费(与 D 臂唯一差异=调教参数;零复制铁律)。
 // 默认 SKIP(UTAI_E1K_DUMP=1 才跑)。运行:
 //   $env:UTAI_E1K_DUMP='1'; npx vitest run src/lib/vocal/e1KarmDump.test.ts
+// S71+1 第二轮多变体:UTAI_E1K_SRC=theta 目录(默认 SVC2SVS labels/karm)、
+// UTAI_E1K_TAG=输出后缀(默认 K → {seg}_score_{TAG}.json;如 KA / KAB72,与 Rust 侧
+// UTAI_E1K_TAG 配对使用)。
 import { describe, it, expect, vi } from "vitest";
 type NodeFs = {
   readFileSync(p: string, enc: string): string;
@@ -25,7 +28,8 @@ import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note } from "../../types/project";
 
 const WORK_DIR = "D:\\MyDev\\TESTING\\e1_cross_probe";
-const KARM_DIR = "D:\\MyDev\\SVC2SVS\\labels\\karm";
+const KARM_DIR = process.env.UTAI_E1K_SRC ?? "D:\\MyDev\\SVC2SVS\\labels\\karm";
+const KTAG = process.env.UTAI_E1K_TAG ?? "K";
 const SEGMENTS = ["verse", "chorus"];
 
 describe.skipIf(!process.env.UTAI_E1K_DUMP)("E1 K-arm param-f0 dump (diagnostic, not a gate)", () => {
@@ -70,11 +74,11 @@ describe.skipIf(!process.env.UTAI_E1K_DUMP)("E1 K-arm param-f0 dump (diagnostic,
         );
       }
       fs.writeFileSync(
-        join(WORK_DIR, `${name}_score_K.json`),
+        join(WORK_DIR, `${name}_score_${KTAG}.json`),
         JSON.stringify({ name, tempo, ckpt: theta.ckpt, triples, f0Cents, f0Voiced }),
       );
       // eslint-disable-next-line no-console
-      console.log(`[e1k] ${name}: ${notes.length} notes -> ${sum} frames dumped (ckpt ${theta.ckpt})`);
+      console.log(`[e1k] ${name} -> ${name}_score_${KTAG}.json (${notes.length} notes, ckpt ${theta.ckpt})`);
     }
   });
 });

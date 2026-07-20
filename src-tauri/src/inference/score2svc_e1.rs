@@ -329,7 +329,10 @@ fn e1_cross_probe() {
         assert!(sj.triples.iter().all(|t| t.lang == 2), "{seg}: JA-only song expected");
         // K 臂(S71 第四刀):Phase A 旋钮模型预测 θ 的 Option-A f0(e1KarmDump.test.ts 产)。
         // 与 D 臂唯一差异 = 调教参数(同 triples 同渲染入口);缺文件则跳过 K。
-        let sk: Option<ScoreJson> = std::fs::read_to_string(work.join(format!("{seg}_score_K.json")))
+        // S71+1 第二轮多变体:UTAI_E1K_TAG(默认 "K")选源 {seg}_score_{TAG}.json 并命名
+        // 输出臂 {TAG}_s2cv_knobF0(如 KA=run-A / KAB72=run-AB spk72);arms 过滤仍用 "K"。
+        let ktag = std::env::var("UTAI_E1K_TAG").unwrap_or_else(|_| "K".into());
+        let sk: Option<ScoreJson> = std::fs::read_to_string(work.join(format!("{seg}_score_{ktag}.json")))
             .ok()
             .map(|s| serde_json::from_str(&s).unwrap());
         if let Some(k) = &sk {
@@ -350,6 +353,36 @@ fn e1_cross_probe() {
             .collect();
         let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
         let vf0_k = sk.as_ref().map(|k| VocalF0 { cents: &k.f0_cents, voiced: &k.f0_voiced });
+
+        // S72 K′ 物料:dump score2cv 模型输入数组(G2P 后 per-phone int64,python v2 推理用;
+        // 单一源=生产 build_arrays_daw,python 侧零 G2P 复刻)。只 dump 不渲染。
+        if std::env::var("UTAI_E1_DUMP_V2IN").is_ok() {
+            let evts_dump: Vec<ScoreEvt> = sj
+                .triples
+                .iter()
+                .map(|t| ScoreEvt {
+                    lyric: &t.lyric,
+                    note_num: t.note_num,
+                    frames: t.frames,
+                    lang: Lang::Ja,
+                    phoneme_input: None,
+                })
+                .collect();
+            let a = build_arrays_daw(&evts_dump, &NoDicts).unwrap();
+            let j = serde_json::json!({
+                "phonemes": a.phonemes, "phone_dur": a.phone_dur, "note_pitch": a.note_pitch,
+                "note_dur": a.note_dur, "note_to_phone": a.note_to_phone,
+            });
+            std::fs::write(work.join(format!("{seg}_v2in.json")), serde_json::to_string(&j).unwrap())
+                .unwrap();
+            eprintln!("[e1] {seg}: v2in dumped ({} phones)", a.phonemes.len());
+            continue;
+        }
+        // S72 K′(V2)臂:UTAI_E1_V2CV=cv npy 目录(python v2 推理产 {seg}_{TAG}_cv{dim}.npy)
+        // + UTAI_E1_V2TAG(臂名)+ UTAI_E1_V2F0=knob|param|nat(net_g 的 f0 流;arms 过滤用 "V")
+        let v2dir = std::env::var("UTAI_E1_V2CV").ok();
+        let v2tag = std::env::var("UTAI_E1_V2TAG").unwrap_or_else(|_| "V2".into());
+        let v2f0 = std::env::var("UTAI_E1_V2F0").unwrap_or_else(|_| "knob".into());
 
         let src = crate::audio::load_audio(&work.join(format!("{seg}_src48k.wav"))).unwrap();
         assert_eq!(src.channels, 1, "{seg}: src must be mono");
@@ -470,14 +503,15 @@ fn e1_cross_probe() {
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
             }
             if let Some(vk) = &vf0_k {
-                if enabled(&arms_filter, "K") && !exists(&arm("K_s2cv_knobF0")) {
+                let karm = format!("{ktag}_s2cv_knobF0");
+                if enabled(&arms_filter, "K") && !exists(&arm(&karm)) {
                     let t0 = Instant::now();
                     let r = render_score_sovits(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol, 0, 0,
                         Some(vk), None, None, &no_cancel, &noop,
                     )
                     .unwrap();
-                    save(arm("K_s2cv_knobF0"), &r);
+                    save(arm(&karm), &r);
                     eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
                 }
             }
@@ -489,6 +523,23 @@ fn e1_cross_probe() {
                 .unwrap();
                 save(arm("C_s2cv_natF0"), &r);
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+            }
+            if let Some(dir) = &v2dir {
+                let p = PathBuf::from(dir).join(format!("{seg}_{v2tag}_cv{dim}.npy"));
+                let v2arm = format!("{v2tag}_v2cv");
+                if p.exists() && enabled(&arms_filter, "V") && !exists(&arm(&v2arm)) {
+                    let cv: Array2<f32> = ndarray_npy::read_npy(&p).unwrap();
+                    let f0src = match v2f0.as_str() {
+                        "nat" => F0Src::Natural(&nat_f0),
+                        "param" => F0Src::Param(&vf0),
+                        _ => F0Src::Param(vf0_k.as_ref().expect("V2F0=knob 需 {seg}_score_{TAG}.json 在场")),
+                    };
+                    let t0 = Instant::now();
+                    let r = e1_render_sovits(&m, &evts, dim, &CvSrc::Natural(&cv), &f0src, &sopts, flat_vol)
+                        .unwrap();
+                    save(arm(&v2arm), &r);
+                    eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+                }
             }
             engine.unload_model(&voice_sid);
         }
@@ -546,14 +597,15 @@ fn e1_cross_probe() {
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
             }
             if let Some(vk) = &vf0_k {
-                if enabled(&arms_filter, "K") && !exists(&arm("K_s2cv_knobF0")) {
+                let karm = format!("{ktag}_s2cv_knobF0");
+                if enabled(&arms_filter, "K") && !exists(&arm(&karm)) {
                     let t0 = Instant::now();
                     let r = render_score_rvc(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0, 0, Some(vk),
                         None, None, &no_cancel, &noop,
                     )
                     .unwrap();
-                    save(arm("K_s2cv_knobF0"), &r);
+                    save(arm(&karm), &r);
                     eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
                 }
             }
@@ -565,6 +617,22 @@ fn e1_cross_probe() {
                 .unwrap();
                 save(arm("C_s2cv_natF0"), &r);
                 eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+            }
+            if let Some(dir) = &v2dir {
+                let p = PathBuf::from(dir).join(format!("{seg}_{v2tag}_cv{dim}.npy"));
+                let v2arm = format!("{v2tag}_v2cv");
+                if p.exists() && enabled(&arms_filter, "V") && !exists(&arm(&v2arm)) {
+                    let cv: Array2<f32> = ndarray_npy::read_npy(&p).unwrap();
+                    let f0src = match v2f0.as_str() {
+                        "nat" => F0Src::Natural(&nat_f0_rvc),
+                        "param" => F0Src::Param(&vf0),
+                        _ => F0Src::Param(vf0_k.as_ref().expect("V2F0=knob 需 {seg}_score_{TAG}.json 在场")),
+                    };
+                    let t0 = Instant::now();
+                    let r = e1_render_rvc(&m, &evts, dim, &CvSrc::Natural(&cv), &f0src, &ropts).unwrap();
+                    save(arm(&v2arm), &r);
+                    eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
+                }
             }
             engine.unload_model(&voice_sid);
         }
