@@ -248,10 +248,11 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     rvc: sanitizeOpts(p.rvc, RVC_DEFAULTS),
     breathToken: typeof p.breathToken === "string" && p.breathToken.trim() ? p.breathToken : "AP",
     ...(p.rangeExtend === true ? { rangeExtend: true } : {}),
-    // S73b 自动音高:follow 只存 false(absent≡true=默认常开);缩放 0–4 concrete(默认 1)。
+    // S73b/c 自动音高:follow 只存 false(absent≡true=默认常开);表现力 0–4 默认 2、
+    // 颤音 0–2 默认 1(S73c 用户拍板:双乘后 4×4 太恐怖)。
     ...(p.autoTuneFollow === false ? { autoTuneFollow: false } : {}),
-    autoTuneExpr: clampNum(p.autoTuneExpr ?? NaN, 0, 4, 1),
-    autoTuneVib: clampNum(p.autoTuneVib ?? NaN, 0, 4, 1),
+    autoTuneExpr: clampNum(p.autoTuneExpr ?? NaN, 0, 4, 2),
+    autoTuneVib: clampNum(p.autoTuneVib ?? NaN, 0, 2, 1),
   };
 }
 

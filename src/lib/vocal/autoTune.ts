@@ -16,9 +16,8 @@
 // (export_karm --phase random / KA3R 耳测同款语义;模型本身不预测 phase)。
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Note, NoteTransition, PitchCurve, VocalTrackParams } from "../../types/project";
+import type { Note, NoteTransition, VocalTrackParams } from "../../types/project";
 import { ticksToMs } from "../audio/laneOps";
-import { evalCurveAt } from "../f0eval";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore, inGestureTransaction } from "../../store/history";
 
@@ -35,10 +34,10 @@ export interface AutotuneTheta {
   };
 }
 
-/** fresh=侧栏按钮(强制重调教,phase 归 0=take 0)/ retake=换一版相位(仅机器音符)/
- *  refresh=常开 watcher 的静默跟随(fresh 资格 + 各音符现有相位保留——否则每次编辑都会
- *  把 Retake 的相位洗掉)。 */
-export type AutoTuneMode = "fresh" | "retake" | "refresh";
+/** refresh=常开 watcher 的静默跟随(各音符现有相位保留——否则每次编辑都会把 Retake 的
+ *  相位洗掉;新音符无相位 → 0)/ retake=换一版相位(仅机器音符)。S73c 起无手动按钮:
+ *  「最开始也自动化」(用户拍板),follow 开关即模式切换。 */
+export type AutoTuneMode = "refresh" | "retake";
 
 /** S73b 双缩放:expr=整体表现力(过冲+起收滑幅+颤音都乘),vib=颤音单独再乘(总颤音深度
  *  = θ.depth × expr × vib)。持久在 VocalTrackParams(常开语义:改 k → 重调教 → 重渲染)。 */
@@ -47,9 +46,9 @@ export interface AutoTuneScales {
   vib: number;
 }
 
-/** vocalParams → 缩放(单一读取点;absent = 默认 1)。 */
+/** vocalParams → 缩放(单一读取点;absent 默认 = expr 2 / vib 1,S73c 用户拍板)。 */
 export function autoTuneScalesOf(p: VocalTrackParams | undefined): AutoTuneScales {
-  return { expr: p?.autoTuneExpr ?? 1, vib: p?.autoTuneVib ?? 1 };
+  return { expr: p?.autoTuneExpr ?? 2, vib: p?.autoTuneVib ?? 1 };
 }
 
 export interface AutoTuneResult {
@@ -61,44 +60,18 @@ export interface AutoTuneResult {
   stale?: boolean;
 }
 
-/** pitchDev 信号阈值:音符范围内 |dev|≥此值(cents)即视为「用户在此调教过」。 */
-export const TUNED_DEV_EPS_CENTS = 2;
+/** 音高线「手绘段染色」阈值:|dev|≥此值(cents)的采样点画成用户色(VocalEditor 消费)。 */
+export const DEV_TINT_EPS_CENTS = 0.5;
 
 const round2 = (v: number): number => Math.round(v * 100) / 100;
 
-/** 线性折线 pitchDev 在 [t0,t1](segment 相对 tick)内是否有 ≥eps 的信号——折线的最大
- *  绝对值只会出现在区间内控制点或区间端点的插值处,两类都查即充分。 */
-export function curveHasSignal(
-  c: PitchCurve | undefined,
-  t0: number,
-  t1: number,
-  eps: number,
-): boolean {
-  if (!c || c.xs.length === 0) return false;
-  if (Math.abs(evalCurveAt(c, t0)) >= eps || Math.abs(evalCurveAt(c, t1)) >= eps) return true;
-  // 二分定位首个 x≥t0(S73b:烤入曲线数万点 × 编辑器着色逐音符判定,线性起扫会热)
-  let lo = 0;
-  let hi = c.xs.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if ((c.xs[mid] ?? Infinity) < t0) lo = mid + 1;
-    else hi = mid;
-  }
-  for (let i = lo; i < c.xs.length; i++) {
-    const x = c.xs[i];
-    const y = c.ys[i];
-    if (x === undefined || y === undefined) break;
-    if (x > t1) break;
-    if (Math.abs(y) >= eps) return true;
-  }
-  return false;
-}
-
-/** 用户调教判定(自动过程的绕行谓词)。
- *  ★顺序要紧(S73 审查):pitchDev 覆盖必须先于 autoTuned 短路——机器调教过的音符上用户又
- *  手绘了 dev,dev 是相对当时机器基线画的,机器再改基线=抽走手绘修正的地基 → 也算用户地盘。 */
-export function isUserTuned(n: Note, pitchDev: PitchCurve | undefined): boolean {
-  if (curveHasSignal(pitchDev, n.tick, n.tick + n.duration, TUNED_DEV_EPS_CENTS)) return true;
+/** 用户调教判定(θ 维度的绕行谓词)。
+ *  ★S73c 语义改版(用户拍板=SV 同构):pitchDev【不再】参与 θ 资格——手绘 deviation 是
+ *  独立的用户叠加层,机器永不写它(层隔离),基线 θ 在它下面照常再生成(SV1 Sing 模式
+ *  在既有 Pitch Deviation 之下重生成基线=同款手感)。「手绘段不吃自动调教」由层隔离
+ *  天然成立,不需要把整个音符划出机器地盘。θ 维度的用户地盘 = 手设 vibrato/transition
+ *  (含 ustx 烤入的显式 ZERO_TRANSITION=导入调教)。 */
+export function isUserTuned(n: Note): boolean {
   if (n.autoTuned) return false;
   return !!(n.vibrato || n.transition);
 }
@@ -168,18 +141,12 @@ export async function applyAutoTune(
     return { applied: 0, skipped: 0 };
   }
   const notes = seg.content.notes; // 写入漏斗保证 (tick,id) 有序 = 命令的升序契约
-  const pitchDev = seg.content.pitchDev;
   const scope = selectedIds.length > 0 ? new Set(selectedIds) : null;
   const targetIdx: number[] = [];
   let skipped = 0;
   notes.forEach((n, i) => {
     if (scope && !scope.has(n.id)) return;
-    // ★资格必须整体过 isUserTuned(S73b 审查 HIGH):`machine || …` 的短路会架空谓词里
-    //   「pitchDev 覆盖优先」规则——机器调教之上手绘了 dev 的音符,机器不得再动基线。
-    const eligible =
-      mode === "retake"
-        ? n.autoTuned === true && !isUserTuned(n, pitchDev)
-        : !isUserTuned(n, pitchDev);
+    const eligible = mode === "retake" ? n.autoTuned === true : !isUserTuned(n);
     if (eligible) targetIdx.push(i);
     else skipped++;
   });
@@ -204,12 +171,7 @@ export async function applyAutoTune(
     const n = notes[i];
     const th = theta[i];
     if (!n || !th) continue;
-    const phase =
-      mode === "retake"
-        ? Math.random() - 0.5
-        : mode === "refresh"
-          ? (n.vibrato?.phase ?? 0)
-          : 0;
+    const phase = mode === "retake" ? Math.random() - 0.5 : (n.vibrato?.phase ?? 0);
     update[n.id] = thetaToFields(th, scales, phase);
   }
   // ★手势事务窗守卫(S73b 审查):txnDepth>0 期间落地 silent 写会被 commitTransaction 的

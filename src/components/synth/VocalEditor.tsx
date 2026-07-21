@@ -20,7 +20,7 @@ import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflight
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
-import { isUserTuned } from "../../lib/vocal/autoTune";
+import { isUserTuned, DEV_TINT_EPS_CENTS } from "../../lib/vocal/autoTune";
 import { TUNED_MARKER } from "../../lib/trackColors";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
@@ -166,14 +166,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
   const oovRef = useRef<Set<string>>(new Set());
   oovRef.current = new Set(oovIds ?? []);
-  // S73b 调教所有权着色:谓词只在 (notes, pitchDev) 变化时重算(烤入曲线可达数万点,
-  // curveHasSignal 逐音符区间扫绝不能进 rAF 每帧);变化本身已触发既有 redraw effect。
+  // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
+  // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
   const userTunedIds = useMemo(() => {
     const s = new Set<string>();
-    const dev = part?.pitchDev;
-    for (const n of part?.notes ?? []) if (isUserTuned(n, dev)) s.add(n.id);
+    for (const n of part?.notes ?? []) if (isUserTuned(n)) s.add(n.id);
     return s;
-  }, [part?.notes, part?.pitchDev]);
+  }, [part?.notes]);
   const userTunedRef = useRef(userTunedIds);
   userTunedRef.current = userTunedIds;
   const startRef = useRef(part?.start ?? 0);
@@ -522,17 +521,32 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
         const dr0 = dragRef.current; // live pitch-paint → preview the drawn curve on the line
         const dev = dr0?.kind === "pitch-paint" && dr0.paint ? paintedDev(sorted, dr0.paint, pitchDevRef.current, opts) : pitchDevRef.current;
-        ctx.strokeStyle = col("--accent-tertiary") || "#ff6b9d";
+        // S73c 手绘段染色(SV 同构):|dev|≥阈值的采样段用用户金,其余用常规粉——「被手动
+        // 调教过的音高线段」一眼可辨;基线 θ 在其下照常再生成(层隔离,见 autoTune.ts)。
+        // 颜色切换处从上一采样点接笔,线不断。evalCurveAt=二分,画线循环内零压力。
+        const baseColor = col("--accent-tertiary") || "#ff6b9d";
         ctx.lineWidth = toolRef.current === "pitch" ? 2 : 1.5;
         ctx.globalAlpha = toolRef.current === "pitch" ? 0.95 : 0.7;
+        ctx.strokeStyle = baseColor;
         ctx.beginPath();
         let pen = false; // whether a voiced sub-path is open
+        let curTint = false;
+        let prevPt: { x: number; y: number } | null = null;
         for (let px = noteAreaX; px <= w; px += 2) {
           const rel = xToNoteTick(px - KEY_COL_W, start, v);
           const r = evalF0CentsAt(sorted, dev, rel, opts);
-          if (!r.voiced) { pen = false; continue; } // rest → break the line
+          if (!r.voiced) { pen = false; prevPt = null; continue; } // rest → break the line
           const y = centsToY(r.cents, v);
-          if (!pen) { ctx.moveTo(px, y); pen = true; } else ctx.lineTo(px, y);
+          const tint = Math.abs(evalCurveAt(dev, rel)) >= DEV_TINT_EPS_CENTS;
+          if (tint !== curTint) {
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.strokeStyle = tint ? TUNED_MARKER : baseColor;
+            curTint = tint;
+            if (pen && prevPt) { ctx.moveTo(prevPt.x, prevPt.y); ctx.lineTo(px, y); pen = true; }
+            else { ctx.moveTo(px, y); pen = true; }
+          } else if (!pen) { ctx.moveTo(px, y); pen = true; } else { ctx.lineTo(px, y); }
+          prevPt = { x: px, y };
         }
         ctx.stroke(); ctx.globalAlpha = 1;
       }

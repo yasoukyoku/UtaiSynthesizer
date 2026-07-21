@@ -115,8 +115,8 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
   it("preserves vocalParams + all note/curve fields through save→load", () => {
     const { projectJson } = buildSaveBundle("P", [rich], 120, [4, 4]);
     const loaded = parseLoadedBundle(projectJson, "C:/proj.usp");
-    // S73b:sanitize 载入时补 concrete 的 autoTuneExpr/Vib(默认 1)——夹具没写它们,期望值补齐
-    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 1, autoTuneVib: 1 });
+    // S73b/c:sanitize 载入时补 concrete 的 autoTuneExpr(默认 2)/Vib(默认 1)——夹具没写它们,期望值补齐
+    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1 });
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
   });
 

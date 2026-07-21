@@ -79,9 +79,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   // SynthV-style tabs: "singer" = voice + tone/quality; "pitch" = pitch tuning. Splits the (previously long)
   // single scroll into two focused panels; the Render action is a pinned footer visible on both.
   const [tab, setTab] = useState<"singer" | "pitch">("singer");
-  // ── S73b 自动调教:双缩放(颤音/表现力)持久在 vocalParams(常开语义:改 k → watcher 静默
-  //    重调教 → 重渲染,一步 undo=Slider 手势事务);按钮 = 强制重调教(fresh,相位归 0)/
-  //    Retake(换相位)。常开跟随本体在 AutoTuneWatcher;按钮成功后复燃它(模型就位信号)。 ──
+  // ── S73b/c 自动调教:双缩放(颤音/表现力)持久在 vocalParams(常开语义:改 k → watcher 静默
+  //    重调教 → 重渲染,一步 undo=Slider 手势事务);Retake = 对机器音符换一版相位(区块唯一
+  //    按钮)。常开跟随本体在 AutoTuneWatcher;Retake 成功后复燃它(模型就位信号)。 ──
   const [tuning, setTuning] = useState<AutoTuneMode | null>(null);
   const tuningRef = useRef(false);
   const runAutoTune = async (mode: AutoTuneMode) => {
@@ -370,13 +370,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           <span>{t("vocalEditor.sidebar.autotune")}</span>
           {hasSel && selected.length > 1 && <span className="vsb-count">×{selected.length}</span>}
         </div>
-        <button
-          className="snap-toggle vsb-btn vsb-btn-accent"
-          disabled={tuning !== null || notes.length === 0}
-          onClick={() => void runAutoTune("fresh")}
-        >
-          {tuning === "fresh" ? t("vocalEditor.sidebar.autotuneRunning") : t("vocalEditor.sidebar.autotuneRun")}
-        </button>
         <div title={t("vocalEditor.sidebar.autotuneFollowTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.autotuneFollow")}
@@ -388,19 +381,19 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           label={t("vocalEditor.sidebar.autotuneVib")}
           tip={t("vocalEditor.sidebar.autotuneVibTip")}
           value={vocalParams.autoTuneVib ?? 1}
-          cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
+          cfg={{ min: 0, max: 2, step: 0.01, unit: "×", bipolar: false }}
           onChange={(v) => setVocalParams(trackId, { autoTuneVib: v })}
         />
         <Slider
           label={t("vocalEditor.sidebar.autotuneExpr")}
           tip={t("vocalEditor.sidebar.autotuneExprTip")}
-          value={vocalParams.autoTuneExpr ?? 1}
+          value={vocalParams.autoTuneExpr ?? 2}
           cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
           onChange={(v) => setVocalParams(trackId, { autoTuneExpr: v })}
         />
         <div className="vsb-hint">{t("vocalEditor.sidebar.autotuneHint")}</div>
         <button
-          className="snap-toggle vsb-btn"
+          className="snap-toggle vsb-btn vsb-btn-accent"
           disabled={tuning !== null || notes.length === 0}
           title={t("vocalEditor.sidebar.autotuneRetakeTip")}
           onClick={() => void runAutoTune("retake")}
