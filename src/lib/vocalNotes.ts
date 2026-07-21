@@ -253,6 +253,7 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     ...(p.autoTuneFollow === false ? { autoTuneFollow: false } : {}),
     autoTuneExpr: clampNum(p.autoTuneExpr ?? NaN, 0, 4, 2),
     autoTuneVib: clampNum(p.autoTuneVib ?? NaN, 0, 2, 1),
+    autoTuneTake: clampInt(p.autoTuneTake ?? NaN, 0, 99, 0),
   };
 }
 

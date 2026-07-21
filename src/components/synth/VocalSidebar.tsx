@@ -11,7 +11,7 @@
 // Sliders reuse VolumeFader (the one gesture-bracketed fader — TrackList uses the same begin/commitTransaction
 // pattern); a drag = ONE undo step. effTransition is imported (not re-derived) so the shown effective value ==
 // what f0eval evaluates. All strings go through i18n.
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
@@ -19,10 +19,6 @@ import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
-import { applyAutoTune, autoTuneScalesOf, type AutoTuneMode } from "../../lib/vocal/autoTune";
-import { resetAutoTuneWatcher } from "./AutoTuneWatcher";
-import { preflightAuxPack } from "../../lib/vocal/vocalRender";
-import { backendErrorMessage } from "../../lib/backendError";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
@@ -79,32 +75,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   // SynthV-style tabs: "singer" = voice + tone/quality; "pitch" = pitch tuning. Splits the (previously long)
   // single scroll into two focused panels; the Render action is a pinned footer visible on both.
   const [tab, setTab] = useState<"singer" | "pitch">("singer");
-  // ── S73b/c 自动调教:双缩放(颤音/表现力)持久在 vocalParams(常开语义:改 k → watcher 静默
-  //    重调教 → 重渲染,一步 undo=Slider 手势事务);Retake = 对机器音符换一版相位(区块唯一
-  //    按钮)。常开跟随本体在 AutoTuneWatcher;Retake 成功后复燃它(模型就位信号)。 ──
-  const [tuning, setTuning] = useState<AutoTuneMode | null>(null);
-  const tuningRef = useRef(false);
-  const runAutoTune = async (mode: AutoTuneMode) => {
-    if (tuningRef.current) return;
-    tuningRef.current = true;
-    setTuning(mode);
-    try {
-      // 模型没下载 → 一键下载对话框(独立 aux-autotune pack;渲染的 aux-inference 预检不受牵连)
-      if (!(await preflightAuxPack("aux-autotune"))) return;
-      const res = await applyAutoTune(trackId, segmentId, selectedIds, autoTuneScalesOf(vocalParams), mode);
-      resetAutoTuneWatcher(); // 跑通=模型在位,常开跟随若因缺模型熄火则复燃
-      if (res.stale) {
-        useAppStore.getState().showToast(t("vocalEditor.sidebar.autotuneStale"), "info");
-      } else if (res.applied === 0) {
-        useAppStore.getState().showToast(t("vocalEditor.sidebar.autotuneNoTargets"), "info");
-      }
-    } catch (e) {
-      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), "error");
-    } finally {
-      tuningRef.current = false;
-      setTuning(null);
-    }
-  };
+  // ── S73b/c/d 自动调教:全部旋钮持久在 vocalParams,改动 → AutoTuneWatcher 静默重调教 →
+  //    重渲染(一步 undo=Slider 手势事务)。S73d 起区块零按钮零异步:Retake 抽奖被确定性
+  //    Take 旋钮替代;失败 UX(冷却自愈+缺模型对话框)全在 watcher。 ──
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const toggleModelManager = useAppStore((s) => s.toggleModelManager);
@@ -132,18 +105,41 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
 
   // ── batch helpers: build a per-id update map → ONE applyNoteEdits (one undo step; the drag transaction
   //    coalesces the per-frame calls). Each note keeps its OTHER overrides (merge onto its own current).
-  //    ★S73 所有权:手动改 transition/vibrato = 用户接管调教 → 剥 autoTuned 标记(此后自动调教/
-  //    Retake 绕行这个音符;SynthV「用户设过值则自动过程跳过」同构)。 ──
+  //    ★S73 所有权:手动改 transition/vibrato = 用户接管调教 → 剥 autoTuned 标记(此后自动调教
+  //    绕行这个音符;SynthV「用户设过值则自动过程跳过」同构)。
+  //    ★S73d 多选=DELTA 编辑:滑杆位移作为增量加到【每个音符自己的当前值】上(各自钳位)——
+  //    旧「锚值写给所有人」会把短音符塞进长音符的绝对值(轻推一下,某音符音高线爆炸,§user)。
+  //    每帧 delta = 新值 − 锚当前值,写入后锚同步前进 → 逐帧增量在全员上等量累积;单选时
+  //    锚+delta ≡ 绝对设值,行为不变。 ──
   const editTransition = (key: keyof Required<NoteTransition>, value: number | undefined) => {
     const update: Record<string, Partial<Note>> = {};
-    for (const n of selected) update[n.id] = { transition: { ...(n.transition ?? {}), [key]: value }, autoTuned: undefined };
+    if (value === undefined) {
+      // 重置回继承:保持绝对语义(全员剥该字段)
+      for (const n of selected) update[n.id] = { transition: { ...(n.transition ?? {}), [key]: undefined }, autoTuned: undefined };
+    } else {
+      const delta = value - effTransition(anchor!, trackTransition)[key];
+      for (const n of selected) {
+        const cur = effTransition(n, trackTransition)[key];
+        update[n.id] = { transition: { ...(n.transition ?? {}), [key]: cur + delta }, autoTuned: undefined };
+      }
+    }
     applyNoteEdits(trackId, segmentId, { update });
   };
   const editVibratoField = (key: keyof VibratoSpec, value: number) => {
     const update: Record<string, Partial<Note>> = {};
     // Only retune notes that ALREADY vibrate — a slider tweak must NOT silently seed a full audible vibrato on
     // a selected note that had none (use "Add vibrato" for that). The anchor has one (that's why we render).
-    for (const n of selected) if (n.vibrato) update[n.id] = { vibrato: { ...n.vibrato, [key]: value }, autoTuned: undefined };
+    const anchorCur = anchor?.vibrato?.[key];
+    const delta = anchorCur !== undefined ? value - anchorCur : 0;
+    for (const n of selected) {
+      if (!n.vibrato) continue;
+      let next = n.vibrato[key] + delta;
+      // ★depth 特判(S73d 复核 CONFIRMED):多选 delta 把浅颤音压过 0 → normalizeNote 连整个
+      //   vibrato 容器(freq/phase/…)一起剥成 absent,后续帧 `!n.vibrato` 跳过=拖回也救不回。
+      //   垫 0.01¢ 保容器;只有滑杆本身拖到 0(全员归零=删除语义)才放行剥除。
+      if (key === "depthCents" && value > 0) next = Math.max(0.01, next);
+      update[n.id] = { vibrato: { ...n.vibrato, [key]: next }, autoTuned: undefined };
+    }
     applyNoteEdits(trackId, segmentId, { update });
   };
   const setVibrato = (spec: VibratoSpec | undefined) => {
@@ -362,9 +358,10 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
       </>
       ) : (
       <>
-      {/* ⓪ 自动调教 (S73/S73b 旋钮线 Phase A): 模型预测 per-note θ → transition/vibrato。所有权规则见
-          lib/vocal/autoTune.ts(用户调教绕行;着色=VocalEditor 音符左缘竖条)。常开跟随=AutoTuneWatcher;
-          双缩放持久在 vocalParams(改 k → watcher 静默重调教,相位保留)。选中 = 范围;无选择 = 整段。 */}
+      {/* ⓪ 自动调教 (S73→S73d 定稿): 模型预测 per-note θ → transition/vibrato,常开跟随=AutoTuneWatcher,
+          作用域=全部未调教/机器调教音符(所有权见 lib/vocal/autoTune.ts;着色=金竖条+音高线染金)。
+          全部旋钮持久在 vocalParams,改动 → watcher 静默重调教 → 重渲染;相位=phaseForTake(take,id)
+          纯函数,Take 旋钮即「换一版」。 */}
       <div className="vsb-section">
         <div className="vsb-head">
           <span>{t("vocalEditor.sidebar.autotune")}</span>
@@ -377,12 +374,14 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(c) => setVocalParams(trackId, { autoTuneFollow: c })}
           />
         </div>
+        {/* Rigidness(S73d 用户拍板,SV 术语):UI 反向百分比 ↔ 数据 autoTuneVib(vib = 1 − r/100):
+            +100% = vib 0 拉平 / 0% = vib 1 默认 / −100% = vib 2 最大摆动。 */}
         <Slider
-          label={t("vocalEditor.sidebar.autotuneVib")}
-          tip={t("vocalEditor.sidebar.autotuneVibTip")}
-          value={vocalParams.autoTuneVib ?? 1}
-          cfg={{ min: 0, max: 2, step: 0.01, unit: "×", bipolar: false }}
-          onChange={(v) => setVocalParams(trackId, { autoTuneVib: v })}
+          label={t("vocalEditor.sidebar.autotuneRigid")}
+          tip={t("vocalEditor.sidebar.autotuneRigidTip")}
+          value={Math.round((1 - (vocalParams.autoTuneVib ?? 1)) * 100)}
+          cfg={{ min: -100, max: 100, step: 1, unit: "%", bipolar: true }}
+          onChange={(r) => setVocalParams(trackId, { autoTuneVib: 1 - r / 100 })}
         />
         <Slider
           label={t("vocalEditor.sidebar.autotuneExpr")}
@@ -391,15 +390,15 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
           onChange={(v) => setVocalParams(trackId, { autoTuneExpr: v })}
         />
+        {/* Take(S73d):确定性「换一版」旋钮,替代 Retake 抽奖——同号=同唱法,可转回可存盘。 */}
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneTake")}
+          tip={t("vocalEditor.sidebar.autotuneTakeTip")}
+          value={vocalParams.autoTuneTake ?? 0}
+          cfg={{ min: 0, max: 99, step: 1, unit: "", bipolar: false }}
+          onChange={(v) => setVocalParams(trackId, { autoTuneTake: Math.round(v) })}
+        />
         <div className="vsb-hint">{t("vocalEditor.sidebar.autotuneHint")}</div>
-        <button
-          className="snap-toggle vsb-btn vsb-btn-accent"
-          disabled={tuning !== null || notes.length === 0}
-          title={t("vocalEditor.sidebar.autotuneRetakeTip")}
-          onClick={() => void runAutoTune("retake")}
-        >
-          {tuning === "retake" ? t("vocalEditor.sidebar.autotuneRunning") : t("vocalEditor.sidebar.autotuneRetake")}
-        </button>
       </div>
 
       {/* ① selected-note transition override (glide / portamento between notes) */}

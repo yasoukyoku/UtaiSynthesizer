@@ -11,9 +11,9 @@
 //   - 机器调教 = autoTuned===true(auto-tune 自己写的),可自由改写/retake/重缩放。
 //   - 侧栏手动改 transition/vibrato → 剥 autoTuned(所有权移交用户;VocalSidebar 负责)。
 //
-// Expressiveness k = 确定性缩放(vibrato depth + 滑音过冲 depthL/R ×k)——Phase A 的 det
-// 近似;Phase B(CVAE retake)落地后升级为真采样温度。Retake = 逐音符随机 vibrato 相位
-// (export_karm --phase random / KA3R 耳测同款语义;模型本身不预测 phase)。
+// 旋钮(S73d 定稿):Expressiveness=整体缩放(过冲+起收+颤音)/Rigidness(UI)↔vib=颤音维/
+// Take=确定性唱法版本(相位=phaseForTake(take,noteId) 纯函数,替代随机 Retake 抽奖;
+// 模型本身不预测 phase)。Phase B(CVAE)落地后 Expressiveness 升级为真采样温度。
 
 import { invoke } from "@tauri-apps/api/core";
 import type { Note, NoteTransition, VocalTrackParams } from "../../types/project";
@@ -34,21 +34,33 @@ export interface AutotuneTheta {
   };
 }
 
-/** refresh=常开 watcher 的静默跟随(各音符现有相位保留——否则每次编辑都会把 Retake 的
- *  相位洗掉;新音符无相位 → 0)/ retake=换一版相位(仅机器音符)。S73c 起无手动按钮:
- *  「最开始也自动化」(用户拍板),follow 开关即模式切换。 */
-export type AutoTuneMode = "refresh" | "retake";
-
-/** S73b 双缩放:expr=整体表现力(过冲+起收滑幅+颤音都乘),vib=颤音单独再乘(总颤音深度
- *  = θ.depth × expr × vib)。持久在 VocalTrackParams(常开语义:改 k → 重调教 → 重渲染)。 */
+/** S73b/c/d 自动调教旋钮(持久在 VocalTrackParams;常开语义:改任一 → watcher 重调教 → 重渲染):
+ *  expr=整体表现力(过冲+起收滑幅+颤音都乘);vib=颤音维度缩放(UI 以 Rigidness 反向百分比
+ *  展示:+100%=vib 0 拉平 / 0%=vib 1 默认 / −100%=vib 2);take=唱法版本号(S73d,替代
+ *  Retake 按钮的「抽奖」):相位 = 纯函数 phaseForTake(take, noteId)——确定可复现、可转回、
+ *  存盘还原、新音符自动入座同一 take。 */
 export interface AutoTuneScales {
   expr: number;
   vib: number;
+  take: number;
 }
 
-/** vocalParams → 缩放(单一读取点;absent 默认 = expr 2 / vib 1,S73c 用户拍板)。 */
+/** vocalParams → 旋钮(单一读取点;absent 默认 = expr 2 / vib 1 / take 0)。 */
 export function autoTuneScalesOf(p: VocalTrackParams | undefined): AutoTuneScales {
-  return { expr: p?.autoTuneExpr ?? 2, vib: p?.autoTuneVib ?? 1 };
+  return { expr: p?.autoTuneExpr ?? 2, vib: p?.autoTuneVib ?? 1, take: p?.autoTuneTake ?? 0 };
+}
+
+/** Take → 逐音符颤音相位(确定性;SynthV AI-Retakes 的可复现版):take 0 = 基准相位 0
+ *  (KA3 耳测口径);take ≥1 = FNV-1a(`take:noteId`) 均匀散布到 [-0.5, 0.5)。 */
+export function phaseForTake(take: number, noteId: string): number {
+  if (take === 0) return 0;
+  const s = `${take}:${noteId}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) / 4294967296 - 0.5;
 }
 
 export interface AutoTuneResult {
@@ -76,15 +88,14 @@ export function isUserTuned(n: Note): boolean {
   return !!(n.vibrato || n.transition);
 }
 
-/** θ → Note 字段(scales=表现力/颤音双缩放;phase 由 mode 决定)。expr 乘 过冲+起收滑幅+颤音
- *  (=「音符实不实」一并归表现力管,用户 S73b 拍板);vib 只再乘颤音。 */
+/** θ → Note 字段(scales=旋钮;phase=phaseForTake 已由调用方算好传入)。expr 乘 过冲+起收
+ *  滑幅+颤音(=「音符实不实」一并归表现力管,用户 S73b 拍板);vib 只再乘颤音。 */
 function thetaToFields(th: AutotuneTheta, scales: AutoTuneScales, phase: number): Partial<Note> {
   const tr = th.transition;
   const k = scales.expr;
-  // 缩放到 0 时垫 0.01¢(听阈外)保住 vibrato 容器:k 拖到端点再拖回,Retake 相位不被洗掉
-  // (S73b 审查;θ.depth==0 的音符仍然干净地无 vibrato)。
-  const scaled = th.vibrato.depthCents * k * scales.vib;
-  const vibDepth = th.vibrato.depthCents > 0 ? Math.max(0.01, scaled) : 0;
+  // S73d:相位=纯函数 phaseForTake(take, noteId) → 不再需要「保住容器防相位丢失」的
+  // 0.01¢ 垫底 hack;缩放到 0 就干净地无 vibrato,转回时相位从 take 重建。
+  const vibDepth = th.vibrato.depthCents * k * scales.vib;
   return {
     transition: {
       offsetMs: round2(tr.offsetMs),
@@ -94,8 +105,6 @@ function thetaToFields(th: AutotuneTheta, scales: AutoTuneScales, phase: number)
       depthRightCents: round2(tr.depthRightCents * k),
       openEdgeCents: round2(tr.openEdgeCents * k),
     },
-    // depth>0 一律保留(哪怕亚 cent):Expressiveness 拖低再拖高的往返若把 vibrato 省略掉,
-    // Retake 相位会静默丢失归 0(S73 审查)。depth==0(k=0)由 normalizeNote 归一为 absent。
     vibrato:
       vibDepth > 0
         ? {
@@ -122,16 +131,14 @@ async function fetchTheta(notes: readonly Note[], tempo: number): Promise<Autotu
 }
 
 /**
- * 自动调教入口。selectedIds 空 = 整段。一次 applyNoteEdits = 一步 undo;
- * silent=true(常开 watcher)→ 走 history.runSilent:不进撤销栈、不砍 redo、基线同步——
- * 快照里 vocalParams(k)与 θ 一起恢复,undo 触发的重跑经 no-op 守卫收敛为零写入。
+ * 自动调教入口(S73d 起 watcher 专用,唯一模式=refresh 跟随)。一次 applyNoteEdits = 一步 undo;
+ * silent=true → 走 history.runSilent:不进撤销栈、不砍 redo、基线同步——快照里 vocalParams
+ * (旋钮)与 θ 一起恢复,undo 触发的重跑经 no-op 守卫收敛为零写入。
  */
 export async function applyAutoTune(
   trackId: string,
   segmentId: string,
-  selectedIds: readonly string[],
   scales: AutoTuneScales,
-  mode: AutoTuneMode,
   opts: { silent?: boolean } = {},
 ): Promise<AutoTuneResult> {
   const store = useProjectStore.getState();
@@ -141,13 +148,10 @@ export async function applyAutoTune(
     return { applied: 0, skipped: 0 };
   }
   const notes = seg.content.notes; // 写入漏斗保证 (tick,id) 有序 = 命令的升序契约
-  const scope = selectedIds.length > 0 ? new Set(selectedIds) : null;
   const targetIdx: number[] = [];
   let skipped = 0;
   notes.forEach((n, i) => {
-    if (scope && !scope.has(n.id)) return;
-    const eligible = mode === "retake" ? n.autoTuned === true : !isUserTuned(n);
-    if (eligible) targetIdx.push(i);
+    if (!isUserTuned(n)) targetIdx.push(i);
     else skipped++;
   });
   if (targetIdx.length === 0) return { applied: 0, skipped };
@@ -171,8 +175,7 @@ export async function applyAutoTune(
     const n = notes[i];
     const th = theta[i];
     if (!n || !th) continue;
-    const phase = mode === "retake" ? Math.random() - 0.5 : (n.vibrato?.phase ?? 0);
-    update[n.id] = thetaToFields(th, scales, phase);
+    update[n.id] = thetaToFields(th, scales, phaseForTake(scales.take, n.id));
   }
   // ★手势事务窗守卫(S73b 审查):txnDepth>0 期间落地 silent 写会被 commitTransaction 的
   //   sig 对比捕获——零变化手势变「纯机器 θ 的幻影撤销步」且 future=[](砍 redo)。

@@ -304,8 +304,12 @@ export interface VocalTrackParams {
   /** S73b/c 表现力(0–4,默认 2):自动调教 θ 的整体缩放——滑音过冲 depthL/R + 起收滑幅 openEdge +
    *  颤音深度都乘它。进 vocalParamsSig(改它=重调教+重渲染,常开语义下正确)。 */
   autoTuneExpr?: number;
-  /** S73b/c 颤音(0–2,默认 1):单独再乘在颤音深度上(总深度 = θ.depth × expr × vib)。 */
+  /** S73b/c 颤音维缩放(0–2,默认 1;UI 以 Rigidness 反向百分比展示:+100%=0 拉平/−100%=2)。
+   *  总颤音深度 = θ.depth × expr × vib。 */
   autoTuneVib?: number;
+  /** S73d 唱法版本 Take(整数 0–99,默认 0):逐音符颤音相位 = phaseForTake(take, noteId)——
+   *  确定可复现的「换一版」,替代 Retake 按钮抽奖;0 = 基准相位(KA3 耳测口径)。 */
+  autoTuneTake?: number;
 }
 
 export interface Workflow {

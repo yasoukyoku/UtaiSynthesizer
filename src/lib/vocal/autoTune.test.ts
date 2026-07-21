@@ -5,7 +5,7 @@ import { describe, it, expect, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve() }));
 vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 
-import { isUserTuned, autoTuneScalesOf } from "./autoTune";
+import { isUserTuned, autoTuneScalesOf, phaseForTake } from "./autoTune";
 import type { Note } from "../../types/project";
 
 const note = (extra: Partial<Note> = {}): Note => ({
@@ -33,13 +33,30 @@ describe("isUserTuned — θ 维度的自动调教绕行谓词(S73c:不看 pitch
   });
 });
 
-describe("autoTuneScalesOf — 缩放单一读取点", () => {
-  it("absent 默认 = expr 2 / vib 1(S73c 拍板)", () => {
-    expect(autoTuneScalesOf(undefined)).toEqual({ expr: 2, vib: 1 });
+describe("autoTuneScalesOf — 旋钮单一读取点", () => {
+  it("absent 默认 = expr 2 / vib 1 / take 0(S73c/d 拍板)", () => {
+    expect(autoTuneScalesOf(undefined)).toEqual({ expr: 2, vib: 1, take: 0 });
   });
   it("显式值透传", () => {
     expect(
-      autoTuneScalesOf({ autoTuneExpr: 0.5, autoTuneVib: 1.5 } as never),
-    ).toEqual({ expr: 0.5, vib: 1.5 });
+      autoTuneScalesOf({ autoTuneExpr: 0.5, autoTuneVib: 1.5, autoTuneTake: 7 } as never),
+    ).toEqual({ expr: 0.5, vib: 1.5, take: 7 });
+  });
+});
+
+describe("phaseForTake — 确定性唱法版本(S73d,替代 Retake 抽奖)", () => {
+  it("take 0 = 基准相位 0(KA3 耳测口径)", () => {
+    expect(phaseForTake(0, "any-id")).toBe(0);
+  });
+  it("同 (take, id) 恒同相位;换 take/换 id 相位不同;域 [-0.5, 0.5)", () => {
+    const a = phaseForTake(3, "n1");
+    expect(phaseForTake(3, "n1")).toBe(a);
+    expect(phaseForTake(4, "n1")).not.toBe(a);
+    expect(phaseForTake(3, "n2")).not.toBe(a);
+    for (let t = 1; t <= 20; t++) {
+      const p = phaseForTake(t, "note-uuid-xyz");
+      expect(p).toBeGreaterThanOrEqual(-0.5);
+      expect(p).toBeLessThan(0.5);
+    }
   });
 });

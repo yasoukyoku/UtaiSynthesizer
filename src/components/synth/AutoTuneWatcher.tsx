@@ -1,7 +1,8 @@
 // S73b/c — 自动音高常开 watcher(SynthV Sing 模式同构,用户拍板「未调教段使用自动音高+长开启;
 // 最开始也自动化」)。App 常驻挂载(RenderLinkWatcher 先例)。订阅 tracks/tempo,debounce 后扫
 // 所有 vocal notes 段:follow 开着的轨,对可调教音符(资格=applyAutoTune,θ 维度的用户调教
-// 绕行;pitchDev=用户独立叠加层,机器永不写,S73c 起不参与 θ 资格)静默补 θ(相位保留)。
+// 绕行;pitchDev=用户独立叠加层,机器永不写,S73c 起不参与 θ 资格)静默补 θ(相位=
+// phaseForTake(take, noteId) 确定性纯函数,S73d——同 take 幂等,编辑不洗相位)。
 // 打开存量工程/导入内容也直接补调教(S73c 用户拍板;dirty=真实内容变化,undo 不受染指)。
 //
 // 收敛与 undo 语义(设计核心,别破坏;S73b 审查修复全在此):
@@ -31,15 +32,11 @@ const FAIL_COOLDOWN_MS = 60_000;
 
 let pausedUntil = 0;
 let failNoticeShown = false;
-/** Retake 成功(模型确认在位)后立刻解除冷却。 */
-export function resetAutoTuneWatcher(): void {
-  pausedUntil = 0;
-}
 
 export function AutoTuneWatcher() {
   const tracks = useProjectStore((s) => s.tracks);
   const tempo = useProjectStore((s) => s.tempo);
-  /** segId → 上次处理完的 `${contentSig}|${tempo}|${expr}|${vib}`。 */
+  /** segId → 上次处理完的 `${contentSig}|${tempo}|${expr}|${vib}|${take}`。 */
   const doneRef = useRef(new Map<string, string>());
   const busyRef = useRef(false);
   const pendingRef = useRef(false);
@@ -83,11 +80,11 @@ export function AutoTuneWatcher() {
             if (seg.content.type !== "notes") continue;
             liveIds.add(seg.id);
             if (seg.content.notes.length === 0) continue;
-            const sig = `${contentSig(seg.content)}|${st.tempo}|${scales.expr}|${scales.vib}`;
+            const sig = `${contentSig(seg.content)}|${st.tempo}|${scales.expr}|${scales.vib}|${scales.take}`;
             if (!follow || doneRef.current.get(seg.id) === sig) continue;
             let res;
             try {
-              res = await applyAutoTune(t.id, seg.id, [], scales, "refresh", { silent: true });
+              res = await applyAutoTune(t.id, seg.id, scales, { silent: true });
             } catch (e) {
               pausedUntil = Date.now() + FAIL_COOLDOWN_MS;
               console.warn("[autotune] follow paused after backend failure:", e);
@@ -113,7 +110,7 @@ export function AutoTuneWatcher() {
               const freshScales = autoTuneScalesOf(freshTrack?.vocalParams);
               doneRef.current.set(
                 seg.id,
-                `${contentSig(fresh.content)}|${now.tempo}|${freshScales.expr}|${freshScales.vib}`,
+                `${contentSig(fresh.content)}|${now.tempo}|${freshScales.expr}|${freshScales.vib}|${freshScales.take}`,
               );
             }
           }

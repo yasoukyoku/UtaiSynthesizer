@@ -155,7 +155,7 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   if (!p) return "";
   const t = p.transition;
   const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents},${t.openEdgeCents}` : "";
-  const at = forRender ? "" : `|at:${p.autoTuneFollow === false ? 0 : 1},${p.autoTuneExpr ?? 2},${p.autoTuneVib ?? 1}`;
+  const at = forRender ? "" : `|at:${p.autoTuneFollow === false ? 0 : 1},${p.autoTuneExpr ?? 2},${p.autoTuneVib ?? 1},${p.autoTuneTake ?? 0}`;
   return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}`;
 }
 
