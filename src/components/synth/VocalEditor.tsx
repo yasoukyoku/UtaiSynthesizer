@@ -1448,7 +1448,8 @@ function noteSig(n: Note): string {
   const vib = v ? `${v.depthCents},${v.freqHz},${v.phase},${v.startMs},${v.easeInMs},${v.easeOutMs}` : "";
   return (
     `${n.tick}.${n.duration}.${n.pitch}.${n.lyric}.${n.phoneme ?? ""}.${n.velocity}` +
-    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}`
+    `.${n.detune ?? 0}.${n.tie ? 1 : 0}.${n.pitchAuto === false ? 0 : 1}.${n.autoTuned ? 1 : 0}` +
+    `.${n.lang ?? ""}.${n.phonemeInput ?? ""}.${tr}.${vib}`
   );
 }
 

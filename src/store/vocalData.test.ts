@@ -480,3 +480,42 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     expect(useProjectStore.getState().tracks[0]!.vocalParams?.transition?.durLeftMs).toBeUndefined(); // seeded had no params
   });
 });
+
+
+describe("S73 — autoTuned 调教所有权标记(假脏铁律全套)", () => {
+  it("autoTuned:true 进 sig(可撤销)、false/absent 归一为 absent(无假脏)", () => {
+    // absent → 设 false = 归一后逐字节同 → applyNoteEdits 的 JSON no-op 守卫吞掉整步
+    // (applyNoteEdits = 侧栏/autoTune 的真实写入路径)
+    useProjectStore.getState().applyNoteEdits(T, S, { update: { n1: { autoTuned: false } } });
+    expect(notes()[0]!.autoTuned).toBeUndefined();
+    expect(useHistoryStore.getState().canUndo).toBe(false);
+    expect(useProjectStore.getState().dirty).toBe(false);
+
+    // 设 true = 一步 undo + dirty
+    useProjectStore.getState().applyNoteEdits(T, S, { update: { n1: { autoTuned: true } } });
+    expect(notes()[0]!.autoTuned).toBe(true);
+    expect(useHistoryStore.getState().canUndo).toBe(true);
+    expect(useProjectStore.getState().dirty).toBe(true);
+
+    useHistoryStore.getState().undo();
+    expect(notes()[0]!.autoTuned).toBeUndefined();
+    expect(useProjectStore.getState().dirty).toBe(false);
+  });
+
+  it("autoTuned 随 .usp 往返字节一致", () => {
+    useProjectStore.getState().updateVocalNote(T, S, "n1", { autoTuned: true, vibrato: { depthCents: 80, freqHz: 5.5, phase: 0, startMs: 0, easeInMs: 80, easeOutMs: 120 } });
+    const a = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    const parsed = parseLoadedBundle(a, "C:/proj.usp");
+    expect((parsed.tracks[0]!.segments[0]!.content as NotesContent).notes[0]!.autoTuned).toBe(true);
+    expect(buildAutosaveJson("P", parsed.tracks, 120, [4, 4])).toBe(a); // 幂等 = sig↔serialize 恒一致
+  });
+
+  it("手动 vibrato/transition 编辑剥 autoTuned(所有权移交,侧栏语义的 store 层镜像)", () => {
+    useProjectStore.getState().updateVocalNote(T, S, "n1", { autoTuned: true, transition: { durLeftMs: 120 } });
+    expect(notes()[0]!.autoTuned).toBe(true);
+    // 侧栏手动编辑 = update 带 autoTuned: undefined
+    useProjectStore.getState().applyNoteEdits(T, S, { update: { n1: { transition: { durLeftMs: 150 }, autoTuned: undefined } } });
+    expect(notes()[0]!.transition?.durLeftMs).toBe(150);
+    expect(notes()[0]!.autoTuned).toBeUndefined();
+  });
+});

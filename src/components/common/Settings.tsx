@@ -884,6 +884,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       verAutoCheck: { zh: "启动时自动检查更新", en: "Check for updates on startup", ja: "起動時に更新を確認" },
       assetTitle: { zh: "模型资产", en: "Model Assets", ja: "モデルアセット" },
       assetAux: { zh: "推理核心模型包", en: "Core inference models", ja: "推論コアモデル" },
+      assetAutotune: { zh: "自动调教模型包", en: "Auto pitch tuning model", ja: "自動調声モデル" },
       assetRvc: { zh: "RVC 训练底模", en: "RVC training base models", ja: "RVC 学習ベースモデル" },
       assetSovits: { zh: "SoVITS 训练底模", en: "SoVITS training base models", ja: "SoVITS 学習ベースモデル" },
       assetSovitsV2: { zh: "SoVITS 4.0-v2 训练底模", en: "SoVITS 4.0-v2 training base models", ja: "SoVITS 4.0-v2 学習ベースモデル" },
@@ -1502,11 +1503,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
             const label =
               p.id === "aux-inference"
                 ? L("assetAux")
-                : p.id === "training-rvc"
-                  ? L("assetRvc")
-                  : p.id === "training-sovits-v2"
-                    ? L("assetSovitsV2")
-                    : L("assetSovits");
+                : p.id === "aux-autotune"
+                  ? L("assetAutotune")
+                  : p.id === "training-rvc"
+                    ? L("assetRvc")
+                    : p.id === "training-sovits-v2"
+                      ? L("assetSovitsV2")
+                      : L("assetSovits");
             // p.downloading = backend truth (survives a panel remount before the next chunk event).
             const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
             const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);

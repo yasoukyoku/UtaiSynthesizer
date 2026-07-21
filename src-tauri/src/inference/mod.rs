@@ -1,3 +1,4 @@
+pub mod autotune;
 pub mod diffusion;
 pub mod engine;
 pub mod f0;

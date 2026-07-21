@@ -101,10 +101,14 @@ export function MissingModelsDialog() {
                 </div>
               );
             }
-            // auxPack
+            // auxPack — label 即 pack id(aux-inference / aux-autotune,S73 泛化;
+            // 显示文案按 pack 选,下载走同一 download_asset_pack 漏斗)
+            const packId = it.label || "aux-inference";
             return (
               <div key={i} className="mm-row">
-                <span className="mm-label">{t("startup.compAux")}</span>
+                <span className="mm-label">
+                  {packId === "aux-autotune" ? t("missingModels.autotunePack") : t("startup.compAux")}
+                </span>
                 {auxStarted ? (
                   <span className="mm-status">{t("missingModels.downloadStarted")}</span>
                 ) : (
@@ -113,7 +117,7 @@ export function MissingModelsDialog() {
                     onClick={() => {
                       setAuxStarted(true);
                       void invoke("download_asset_pack", {
-                        id: "aux-inference",
+                        id: packId,
                         hfBase: hfBaseForMirror(mirror),
                       }).catch(() => {
                         /* busy/cancel/fail surface in Settings → Model Assets */

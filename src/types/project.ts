@@ -210,6 +210,11 @@ export interface Note {
   pitchAuto?: boolean;
   /** Explicit tie / sustain to the previous note (承前元音 legato). Stored ONLY when true. */
   tie?: boolean;
+  /** ② S73 调教所有权标记:true = 此音符的 transition/vibrato 是「自动调教」写入的(机器调教,
+   *  后续 auto-tune/Retake/Expressiveness 可自由改写)。用户在侧栏手动改 transition/vibrato 时
+   *  剥除(所有权移交用户,自动过程从此绕行——SynthV SV1「用户设过值则跳过」同构)。
+   *  Stored ONLY when true。 */
+  autoTuned?: boolean;
   /** Per-note language override (zh/ja/en/de/fr/es/it). Absent = follow the track default (§3.7 ACE-style). */
   lang?: string;
   /** User override at the TRADITIONAL-phoneme layer (拼音/假名/ARPABET — NOT raw IPA); stage2 converts it

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use crate::inference::{
-    g2p, rvc, score2cv, score2svc, sovits, RenderedAudio, RvcOptions, SovitsOptions, SynthesisResult,
-    VoiceBackendType,
+    autotune, g2p, rvc, score2cv, score2svc, sovits, RenderedAudio, RvcOptions, SovitsOptions,
+    SynthesisResult, VoiceBackendType,
 };
 use crate::models::{ModelConfig, ModelEntry};
 use crate::AppState;
@@ -116,6 +116,9 @@ pub(crate) const AUX_NSF_HIFIGAN_MEL: &str = "nsf_hifigan_mel.npy";
 // as phantom user voices). 768 = SoVITS4.1/RVCv2, 256 = SoVITS4.0 (picked by the VOICE's features_dim).
 pub(crate) const AUX_SCORE2CV_768: &str = "score2cv_768.onnx";
 pub(crate) const AUX_SCORE2CV_256: &str = "score2cv_256.onnx";
+// ② 自动音高调教(旋钮线 Phase A,S73):note 特征 → per-note θ(transition/vibrato)。
+// 几 MB 小 Transformer,同 aux-by-path 纪律;CPU 即可(inference/autotune.rs)。
+pub(crate) const AUX_AUTOTUNE: &str = "autotune_a1.onnx";
 
 /// models_dir/auxiliary/<filename>, with a stable CODE naming the missing file + the
 /// exact directory it must be placed in (the frontend maps the code to localized text;
@@ -1291,6 +1294,116 @@ const MAX_TOTAL_FRAMES: i64 = 600_000;
 /// `f0_cents`/`f0_voiced` are non-empty they are the whole-segment 50fps layered pitch (else bare
 /// noteonly). Writes the wav to `output_path` Rust-side and returns the path (S66/O5 — the frontend
 /// deposits it as a processedOutputs overlay). `node_id` = the segment id (progress routing).
+// ─── ② 自动音高调教(旋钮线 Phase A,S73) ───────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutotuneNoteIn {
+    pub start_ms: f64,
+    pub dur_ms: f64,
+    /// float MIDI = 书写音高 + detune/100(训练侧 GAME 含-cents 口径同构)。
+    pub pitch: f64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutotuneTransitionOut {
+    pub offset_ms: f64,
+    pub dur_left_ms: f64,
+    pub dur_right_ms: f64,
+    pub depth_left_cents: f64,
+    pub depth_right_cents: f64,
+    pub open_edge_cents: f64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutotuneVibratoOut {
+    pub depth_cents: f64,
+    pub freq_hz: f64,
+    pub phase: f64,
+    pub start_ms: f64,
+    pub ease_in_ms: f64,
+    pub ease_out_ms: f64,
+}
+
+#[derive(serde::Serialize)]
+pub struct AutotuneThetaOut {
+    pub transition: AutotuneTransitionOut,
+    pub vibrato: AutotuneVibratoOut,
+}
+
+pub(crate) const MAX_AUTOTUNE_NOTES: usize = 100_000;
+
+/// ② 自动音高调教:音符序列(ms 域,升序)→ per-note θ。整段音符都要传(模型吃乐句
+/// 上下文);θ 的应用范围/所有权(用户调教 vs 机器调教)、Expressiveness 缩放、retake
+/// 随机 phase 都是 TS 侧的事(src/lib/vocal/autoTune.ts)。
+#[tauri::command]
+pub async fn run_autotune(
+    state: State<'_, Arc<AppState>>,
+    notes: Vec<AutotuneNoteIn>,
+) -> Result<Vec<AutotuneThetaOut>, String> {
+    if notes.is_empty() {
+        return Err("AUTOTUNE_EMPTY".into());
+    }
+    if notes.len() > MAX_AUTOTUNE_NOTES {
+        return Err(format!(
+            "AUTOTUNE_TOO_MANY_NOTES: {} > {}",
+            notes.len(),
+            MAX_AUTOTUNE_NOTES
+        ));
+    }
+    let mut prev_start = f64::NEG_INFINITY;
+    for n in &notes {
+        if !(n.start_ms.is_finite() && n.dur_ms.is_finite() && n.pitch.is_finite())
+            || n.dur_ms <= 0.0
+        {
+            return Err("AUTOTUNE_BAD_NOTE".into());
+        }
+        if n.start_ms < prev_start {
+            return Err("AUTOTUNE_UNSORTED".into());
+        }
+        prev_start = n.start_ms;
+    }
+    let path = aux_path(&state, AUX_AUTOTUNE, "Autotune model")?;
+    let app = state.inner().clone();
+    let sid = app
+        .inference
+        .ensure_aux_loaded(&path)
+        .map_err(|e| e.to_string())?;
+    let ins: Vec<autotune::NoteIn> = notes
+        .iter()
+        .map(|n| autotune::NoteIn { start_ms: n.start_ms, dur_ms: n.dur_ms, pitch: n.pitch })
+        .collect();
+    let thetas = tauri::async_runtime::spawn_blocking(move || {
+        autotune::run_autotune_model(&app.inference.engine, &sid, &ins)
+    })
+    .await
+    .map_err(|e| format!("AUTOTUNE_JOIN: {e}"))?
+    .map_err(|e| e.to_string())?;
+    Ok(thetas
+        .into_iter()
+        .map(|t| AutotuneThetaOut {
+            transition: AutotuneTransitionOut {
+                offset_ms: t.transition[0],
+                dur_left_ms: t.transition[1],
+                dur_right_ms: t.transition[2],
+                depth_left_cents: t.transition[3],
+                depth_right_cents: t.transition[4],
+                open_edge_cents: t.transition[5],
+            },
+            vibrato: AutotuneVibratoOut {
+                depth_cents: t.vibrato[0],
+                freq_hz: t.vibrato[1],
+                phase: t.vibrato[2],
+                start_ms: t.vibrato[3],
+                ease_in_ms: t.vibrato[4],
+                ease_out_ms: t.vibrato[5],
+            },
+        })
+        .collect())
+}
+
 #[tauri::command]
 pub async fn render_vocal_segment(
     app_handle: tauri::AppHandle,

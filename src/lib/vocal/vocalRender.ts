@@ -43,13 +43,20 @@ export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
  *  by the sidebar Render button and the Play-time auto-render batch (never fork). Best-effort:
  *  an IPC failure never blocks the render (Rust still errors loudly). */
 export async function preflightVocalModels(): Promise<boolean> {
+  return preflightAuxPack("aux-inference");
+}
+
+/** Generic pack preflight (S73): the auto-tune button checks its OWN pack ("aux-autotune") through the
+ *  same funnel — never fold optional-feature files into aux-inference (that would hard-block Play for
+ *  every upgraded user until they download the new file; offline = deadlock. S73 审查 HIGH). */
+export async function preflightAuxPack(packId: string): Promise<boolean> {
   try {
     const packs = await invoke<Array<{ id: string; missing: number; downloading: boolean }>>(
       "asset_pack_status",
     );
-    const aux = packs.find((p) => p.id === "aux-inference");
-    if ((aux?.missing ?? 0) > 0 && !(aux?.downloading ?? false)) {
-      useAppStore.getState().openMissingModels([{ kind: "auxPack", label: "aux-inference" }]);
+    const pack = packs.find((p) => p.id === packId);
+    if ((pack?.missing ?? 0) > 0 && !(pack?.downloading ?? false)) {
+      useAppStore.getState().openMissingModels([{ kind: "auxPack", label: packId }]);
       return false;
     }
   } catch {

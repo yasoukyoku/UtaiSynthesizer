@@ -105,6 +105,7 @@ export function normalizeNote(n: Note): Note {
   }
   if (n.pitchAuto === false) out.pitchAuto = false; // absent/true (default) → absent
   if (n.tie) out.tie = true; // false → absent (Phase-6 mirror enforces tie ≡ sustain-lyric)
+  if (n.autoTuned === true) out.autoTuned = true; // S73 机器调教所有权;false → absent
   // S58: lang is WHITELISTED to the 7 codes (anything else → absent = follow the track default) so a
   // corrupt/hand-edited .usp can never smuggle an arbitrary string into the render's lang resolution.
   if (n.lang && isVocalLangCode(n.lang)) out.lang = n.lang;

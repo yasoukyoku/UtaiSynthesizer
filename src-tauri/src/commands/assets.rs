@@ -96,8 +96,20 @@ const SOVITS_V2_TRAIN_FILES: &[AssetFile] = &[
     AssetFile { rel: "training/sovits_v2/D_0.pth", size: 561_070_439, sha256: "028b7db89f184327cfa1c8ee701887e1cb513b9eaa21b4b573bbbd6f10ad38de" },
 ];
 
+// S73 自动音高调教(旋钮线 Phase A/runA3;SVC2SVS pitch/export_onnx.py 产,自训无许可负担)。
+// ★独立 pack,绝不并入 aux-inference:渲染预检(preflightVocalModels)按 aux-inference 的
+// missing 计数硬挡 Play——往老 pack 加新文件会让所有升级用户的存量工程被缺模型对话框卡死
+// (断网即死锁,S73 审查 HIGH)。可选功能的模型 = 自己的 pack,用到时才提示下载。
+// ★换版本必须换文件名(下载按存在性跳过)——下一版叫 autotune_a2.onnx。
+// ★发版前置:两文件先 `hf upload` 到 datasets/yasoukyoku/utai-runtimes models/auxiliary/,否则下载 404。
+const AUTOTUNE_FILES: &[AssetFile] = &[
+    AssetFile { rel: "auxiliary/autotune_a1.onnx", size: 5_945_317, sha256: "e726cdf32e5ff08ee7c1ec65f3c7e0508df000f0aa8719a9f51ff72eb832ce05" },
+    AssetFile { rel: "auxiliary/autotune_a1.json", size: 892, sha256: "f807abfc94eaa8836034fad0046608b647af3286bce452d9778caedc2f96c49e" },
+];
+
 const PACKS: &[AssetPack] = &[
     AssetPack { id: "aux-inference", files: AUX_FILES },
+    AssetPack { id: "aux-autotune", files: AUTOTUNE_FILES },
     AssetPack { id: "training-rvc", files: RVC_TRAIN_FILES },
     AssetPack { id: "training-sovits", files: SOVITS_TRAIN_FILES },
     AssetPack { id: "training-sovits-v2", files: SOVITS_V2_TRAIN_FILES },
