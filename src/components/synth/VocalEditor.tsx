@@ -4,7 +4,7 @@
 // undo is Route-A timeline-native (vocal fields are already in meaningfulSig; the editor just claims the
 // pane so Ctrl+Z/Delete route correctly). Tools: Arrow / Pen / Delete functional this phase; Pitch shows
 // the baseline f0 line (full pitch editing = Phase 5). One-position-one-note truncation runs at commit.
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactElement } from "react";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
@@ -32,6 +32,7 @@ import {
 import type { Note } from "../../types/project";
 import { langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
 import { VocalSidebar } from "./VocalSidebar";
+import { HScrollbarView } from "./HScrollbar";
 import "./VocalEditor.css";
 
 type Tool = "arrow" | "pen" | "pitch" | "delete";
@@ -246,10 +247,26 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const playRafRef = useRef(0);
   const edgeRafRef = useRef(0); // marquee edge auto-scroll rAF
   const edgeScrollRef = useRef<() => void>(() => {});
+  // S73e 底部滚动条:脱-React 画布的 scrollX 活在 viewRef,不触发 React 渲染——滚动条做成
+  // 自我强刷的微型子组件(两个 div),经此 ref 在每次重绘后同步,主组件零重渲染。
+  const scrollbarSyncRef = useRef<() => void>(() => {});
   const requestRedraw = useCallback(() => {
     if (rafRef.current) return;
-    rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; drawRef.current(); });
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      drawRef.current();
+      scrollbarSyncRef.current();
+    });
   }, []);
+
+  // S73e:底部滚动条的受控写入口(与 marquee edge auto-scroll 的 maxSX 同一几何)。
+  const scrollTo = useCallback((x: number) => {
+    const v = viewRef.current;
+    const { w } = sizeRef.current;
+    const maxSX = Math.max(0, (startRef.current + durRef.current) * v.ppt + 400 - Math.max(1, w - KEY_COL_W));
+    v.scrollX = Math.max(0, Math.min(maxSX, x));
+    requestRedraw();
+  }, [requestRedraw]);
 
   // ── preview playback: scrub the segment following the single evalF0Cents so you HEAR the smooth
   //    transitions / vibrato / drawn pitchDev (placeholder tone, not the SVC voice, §9.7). ──
@@ -1416,7 +1433,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             </button>
           ))}
         </div>
-        <div className={`vocal-canvas-wrap${tool === "delete" ? " delete-mode" : ""}`} ref={wrapRef}>
+        <div className={`vocal-canvas-wrap${tool === "delete" ? " delete-mode" : ""}`}>
+          <div className="vocal-canvas-area" ref={wrapRef}>
           <canvas
             ref={canvasRef}
             className="vocal-canvas"
@@ -1450,6 +1468,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               }}
             />
           )}
+          </div>
+          {/* S73e 底部拖动条(§user:长歌只能 shift+滚轮一点点挪):与 DAW 共用 HScrollbarView 单一实现 */}
+          <EditorHScrollbar
+            viewRef={viewRef}
+            sizeRef={sizeRef}
+            startRef={startRef}
+            durRef={durRef}
+            syncRef={scrollbarSyncRef}
+            onScroll={scrollTo}
+          />
         </div>
         <VocalSidebar
           trackId={part.trackId}
@@ -1465,6 +1493,25 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       </div>
     </div>
   );
+}
+
+// ── S73e 底部滚动条:自我强刷的微型子组件(两个 div)——脱-React 画布的 scrollX 活在 viewRef,
+//    经 syncRef 在每次重绘后 force 自己,主 VocalEditor 零重渲染;几何与 edge auto-scroll 的
+//    maxSX 同源(内容宽 = (start+dur)·ppt + 400 余量)。 ──
+function EditorHScrollbar({ viewRef, sizeRef, startRef, durRef, syncRef, onScroll }: {
+  viewRef: React.MutableRefObject<VocalView>;
+  sizeRef: React.MutableRefObject<{ w: number; h: number; dpr: number }>;
+  startRef: React.MutableRefObject<number>;
+  durRef: React.MutableRefObject<number>;
+  syncRef: React.MutableRefObject<() => void>;
+  onScroll: (x: number) => void;
+}) {
+  const [, force] = useReducer((x: number) => x + 1, 0);
+  syncRef.current = force;
+  const v = viewRef.current;
+  const viewW = Math.max(1, sizeRef.current.w - KEY_COL_W);
+  const totalW = Math.max(viewW, (startRef.current + durRef.current) * v.ppt + 400);
+  return <HScrollbarView scrollX={v.scrollX} totalWidth={totalW} viewWidth={viewW} onChange={onScroll} />;
 }
 
 // ── module helpers ──

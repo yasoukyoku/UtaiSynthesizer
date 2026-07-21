@@ -123,6 +123,16 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  /* S73e:纵向列容器 = 画布区(flex:1)+ 底部拖动条 */
+  display: flex;
+  flex-direction: column;
+}
+.vocal-canvas-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .vocal-canvas {

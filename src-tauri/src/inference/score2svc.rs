@@ -40,9 +40,10 @@ use super::features::{repeat_expand_2d, torch_interp_nearest};
 use super::g2p::{self, Lang, ScoreEvt};
 use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
-    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv, LyricClass,
-    ScoreArrays,
+    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv, Chunk,
+    LyricClass, ScoreArrays,
 };
+use super::score2cv_tables as tbl;
 use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
 use super::{build_spk_mix_dense, RvcOptions, SovitsOptions, SynthesisResult};
 use crate::{Result, UtaiError};
@@ -579,6 +580,9 @@ pub fn render_score_sovits(
         if padded_t > real_t {
             wav.truncate((real_t * m.hop_size).min(wav.len())); // drop the pad samples
         }
+        // S73e: 真休止(SP)窗零化——cover slicer 铺零的输出域等价物(AP 呼吸不动;详见 gate 头注)
+        let sp_wins = chunk_sp_windows(chunk, wav.len());
+        apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -692,6 +696,9 @@ pub fn render_score_rvc(
             // RVC net_g emits ~ p_len·(sr/100) samples; keep only the pre-pad span.
             wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
         }
+        // S73e: 真休止(SP)窗零化(RVC 症状最轻但同样受益;AP 呼吸不动)
+        let sp_wins = chunk_sp_windows(chunk, wav.len());
+        apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -710,6 +717,59 @@ pub fn render_score_rvc(
     audio = apply_range_inverse(audio, &note_hz_full, m.sample_rate, range_shift);
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
+}
+
+// ─── S73e 休止零化(rest gate)────────────────────────────────────────────────────────────────────
+//
+// cover slicer「静音段不进模型/输出直接铺零」(sovits.rs:256-261)的 score 域等价物,输出域最小刀。
+// 根因链(S73e 三路审计):cover 官方口径下 net_g 从不渲染长静音;score 路径整段休止喂入且无
+// gate;v2 主图无 uv/vol(无声只剩 cv 一道闸门),SP-token cv(=训练语料休止帧的房间底噪 cv,
+// 非数字零)压不住插值 f0 驱动的谐波源 → 长空拍定音高电流(chunk 尾=f0 边缘外推常数,渐强=
+// 超长 SP 串 OOD 生成漂移)/短空拍滑音底噪(chunk 中部 np.interp 滑坡)。4.0/4.1 有 uv=0 兜底
+// 故轻,RVC 裸 0+coarse=1+protect 最轻——实测排序吻合。
+// 本 gate 按【谱面真值】对 SP(真休止)窗口内的输出乘衰减包络:窗缘与音符样本连续(keep=1),
+// REST_GATE_FADE_MS 内渐落至 0(保住 net_g 的自然 release 尾),窗心全零;短窗成浅谷不至 0。
+// ★AP(呼吸)绝不 gate(audible intake);清辅音帧(f0=0 但在音符内)不在 SP 窗,不受影响。
+// feed 级 slicer 对齐(长休止内部不渲染+边距+chunk 整改=根治 OOD 与算力)=后续结构优化轮。
+const REST_GATE_FADE_MS: f32 = 40.0;
+
+fn rest_gate_fade_samples(sample_rate: u32) -> usize {
+    ((REST_GATE_FADE_MS / 1000.0) * sample_rate as f32).round().max(1.0) as usize
+}
+
+/// 该 chunk 内 SP 音素的输出样本窗(50fps 帧域 → 按比例映射到 chunk 输出;chunk 内网格均匀,
+/// 比例映射即精确,逐 chunk 应用避免全局取整漂移)。
+fn chunk_sp_windows(chunk: &Chunk, out_len: usize) -> Vec<(usize, usize)> {
+    let t = chunk.t.max(1);
+    let mut wins = Vec::new();
+    let mut cursor: i64 = 0;
+    for (i, &pid) in chunk.phonemes.iter().enumerate() {
+        let d = chunk.phone_dur.get(i).copied().unwrap_or(0).max(0);
+        if pid == tbl::SP_ID && d > 0 {
+            let s = (cursor as f64 / t as f64 * out_len as f64).round() as usize;
+            let e = (((cursor + d) as f64) / t as f64 * out_len as f64).round() as usize;
+            let e = e.min(out_len);
+            if e > s {
+                wins.push((s, e));
+            }
+        }
+        cursor += d;
+    }
+    wins
+}
+
+/// 窗内逐样本乘 keep = max(0, 1 − 距窗缘样本数/fade):窗缘 keep=1(与音符样本连续),
+/// fade 内渐落,深处全零;窗宽 < 2·fade 时为浅谷(不到 0,自然)。
+fn apply_rest_gate(audio: &mut [f32], windows: &[(usize, usize)], fade: usize) {
+    let fade = fade.max(1) as f32;
+    for &(s, e) in windows {
+        let e = e.min(audio.len());
+        for i in s..e {
+            let edge = (i - s).min(e - 1 - i) as f32;
+            let keep = (1.0 - edge / fade).max(0.0);
+            audio[i] *= keep;
+        }
+    }
 }
 
 /// Micro-fade a HARD chunk seam (a mid-voiced LANGUAGE cut, S58): linearly fade the tail of the
@@ -783,6 +843,43 @@ mod tests {
     /// DAW build over a JA triple fixture (rests uncapped + borrow-time).
     fn daw_ja(score: &[(&str, i64, i64)]) -> ScoreArrays {
         build_arrays_daw(&ja_evts(score), &NoDicts).unwrap()
+    }
+
+    #[test]
+    fn rest_gate_envelope_shape() {
+        // S73e:长窗——窗缘 keep=1 与音符样本连续、fade 内线性渐落、窗心全零;窗外不动
+        let mut a = vec![1.0f32; 1000];
+        apply_rest_gate(&mut a, &[(100, 900)], 100);
+        assert_eq!(a[99], 1.0); // 窗外
+        assert_eq!(a[100], 1.0); // 窗缘连续
+        assert!((a[150] - 0.5).abs() < 1e-6); // fade 半程
+        assert_eq!(a[500], 0.0); // 窗心全零
+        assert_eq!(a[899], 1.0); // 右缘连续
+        assert_eq!(a[900], 1.0); // 窗外
+        // 短窗(< 2·fade)= 浅谷,不至 0(自然过渡)
+        let mut b = vec![1.0f32; 300];
+        apply_rest_gate(&mut b, &[(100, 160)], 100);
+        let mid = b[130];
+        assert!(mid > 0.0 && mid < 1.0, "短窗应为浅谷,得 {mid}");
+    }
+
+    #[test]
+    fn sp_windows_gate_rests_only_never_breath() {
+        // SP(真休止)按 50fps 帧比例映射到输出样本;AP(呼吸)绝不 gate
+        let chunk = Chunk {
+            start: 0,
+            end: 4,
+            phonemes: vec![10, tbl::SP_ID, tbl::AP_ID, 11],
+            note_pitch: vec![60, 0, 0, 62],
+            phone_dur: vec![50, 100, 30, 20],
+            note_dur: vec![50, 100, 30, 20],
+            note_to_phone: vec![0, 1, 2, 3],
+            t: 200,
+            lang_id: 2,
+            hard_seam: false,
+        };
+        let wins = chunk_sp_windows(&chunk, 2000); // 10 samples/50fps-frame
+        assert_eq!(wins, vec![(500, 1500)]);
     }
 
     #[test]

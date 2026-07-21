@@ -2,16 +2,18 @@ import { useRef, useCallback, useEffect } from "react";
 import { useAppStore } from "../../store/app";
 import "./HScrollbar.css";
 
-interface Props {
+interface ViewProps {
+  /** Current scroll (px). Controlled — the caller owns the value. */
+  scrollX: number;
   totalWidth: number;
   viewWidth: number;
   onChange: (x: number) => void;
 }
 
-export function HScrollbar({ totalWidth, viewWidth, onChange }: Props) {
-  // Self-subscribe scrollX so horizontal scroll re-renders ONLY this tiny component
-  // (two styled divs), not the whole DawView subtree.
-  const scrollX = useAppStore((s) => s.scrollX);
+/** S73e: the CONTROLLED scrollbar view (two styled divs + drag/click logic). Shared by the DAW
+ *  (store-backed wrapper below) and the vocal editor (off-React viewRef-backed) — ONE drag/geometry
+ *  implementation, two scroll sources (NO-Dup). */
+export function HScrollbarView({ scrollX, totalWidth, viewWidth, onChange }: ViewProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const isDragging = useRef(false);
   const justDragged = useRef(false);
@@ -22,9 +24,11 @@ export function HScrollbar({ totalWidth, viewWidth, onChange }: Props) {
   const onChangeRef = useRef(onChange);
   const totalWidthRef = useRef(totalWidth);
   const maxScrollRef = useRef(0);
+  const scrollXRef = useRef(scrollX);
   onChangeRef.current = onChange;
   totalWidthRef.current = totalWidth;
   maxScrollRef.current = Math.max(0, totalWidth - viewWidth);
+  scrollXRef.current = scrollX;
 
   const maxScroll = maxScrollRef.current;
   const thumbRatio = Math.min(1, viewWidth / Math.max(1, totalWidth));
@@ -47,7 +51,7 @@ export function HScrollbar({ totalWidth, viewWidth, onChange }: Props) {
     e.preventDefault();
     isDragging.current = true;
     dragStartMouseX.current = e.clientX;
-    dragStartScrollX.current = useAppStore.getState().scrollX;
+    dragStartScrollX.current = scrollXRef.current;
   }, []);
 
   useEffect(() => {
@@ -88,4 +92,11 @@ export function HScrollbar({ totalWidth, viewWidth, onChange }: Props) {
       />
     </div>
   );
+}
+
+/** The DAW arrangement scrollbar — self-subscribes app scrollX so horizontal scroll re-renders ONLY
+ *  this tiny component, not the whole DawView subtree (original S1 behavior, unchanged). */
+export function HScrollbar(props: Omit<ViewProps, "scrollX">) {
+  const scrollX = useAppStore((s) => s.scrollX);
+  return <HScrollbarView scrollX={scrollX} {...props} />;
 }
