@@ -298,6 +298,14 @@ export interface VocalTrackParams {
    *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in
    *  setVocalParams); `true` = the user turned it on. */
   rangeExtend?: boolean;
+  /** S73b 自动音高常开(SynthV Sing 模式同构):true/absent = AutoTuneWatcher 对未调教/机器调教音符
+   *  持续跟随(松手级提交后 debounce 静默刷新);false = 手动模式(只有侧栏按钮触发)。 */
+  autoTuneFollow?: boolean;
+  /** S73b 表现力(0–4,默认 1):自动调教 θ 的整体缩放——滑音过冲 depthL/R + 起收滑幅 openEdge +
+   *  颤音深度都乘它。进 vocalParamsSig(改它=重调教+重渲染,常开语义下正确)。 */
+  autoTuneExpr?: number;
+  /** S73b 颤音(0–4,默认 1):单独再乘在颤音深度上(总深度 = θ.depth × expr × vib)。 */
+  autoTuneVib?: number;
 }
 
 export interface Workflow {

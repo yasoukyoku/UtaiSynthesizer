@@ -21,6 +21,7 @@ import { ConfirmDialog } from "./components/common/ConfirmDialog";
 import { UpdateDialog } from "./components/common/UpdateDialog";
 import { MissingModelsDialog } from "./components/common/MissingModelsDialog";
 import { RenderLinkWatcher } from "./components/workflow/RenderLinkWatcher";
+import { AutoTuneWatcher } from "./components/synth/AutoTuneWatcher";
 import { autoUpdateCheckEnabled, checkForUpdate } from "./lib/update";
 import { runStartupComponentCheck, runBundledIntegrityCheck, startupComponentCheckEnabled } from "./lib/startupCheck";
 import { backendErrorMessage } from "./lib/backendError";
@@ -324,6 +325,7 @@ export function App() {
       <UpdateDialog />
       <MissingModelsDialog />
       <RenderLinkWatcher />
+      <AutoTuneWatcher />
     </div>
   );
 }

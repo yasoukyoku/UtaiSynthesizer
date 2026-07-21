@@ -16,10 +16,11 @@
 // (export_karm --phase random / KA3R 耳测同款语义;模型本身不预测 phase)。
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Note, NoteTransition, PitchCurve } from "../../types/project";
+import type { Note, NoteTransition, PitchCurve, VocalTrackParams } from "../../types/project";
 import { ticksToMs } from "../audio/laneOps";
 import { evalCurveAt } from "../f0eval";
 import { useProjectStore } from "../../store/project";
+import { useHistoryStore, inGestureTransaction } from "../../store/history";
 
 /** Rust run_autotune 的 θ 行(全 6+6 字段,单位 ms/cents/Hz;phase 恒 0,retake 在 TS 侧注入)。 */
 export interface AutotuneTheta {
@@ -34,7 +35,22 @@ export interface AutotuneTheta {
   };
 }
 
-export type AutoTuneMode = "fresh" | "retake" | "rescale";
+/** fresh=侧栏按钮(强制重调教,phase 归 0=take 0)/ retake=换一版相位(仅机器音符)/
+ *  refresh=常开 watcher 的静默跟随(fresh 资格 + 各音符现有相位保留——否则每次编辑都会
+ *  把 Retake 的相位洗掉)。 */
+export type AutoTuneMode = "fresh" | "retake" | "refresh";
+
+/** S73b 双缩放:expr=整体表现力(过冲+起收滑幅+颤音都乘),vib=颤音单独再乘(总颤音深度
+ *  = θ.depth × expr × vib)。持久在 VocalTrackParams(常开语义:改 k → 重调教 → 重渲染)。 */
+export interface AutoTuneScales {
+  expr: number;
+  vib: number;
+}
+
+/** vocalParams → 缩放(单一读取点;absent = 默认 1)。 */
+export function autoTuneScalesOf(p: VocalTrackParams | undefined): AutoTuneScales {
+  return { expr: p?.autoTuneExpr ?? 1, vib: p?.autoTuneVib ?? 1 };
+}
 
 export interface AutoTuneResult {
   /** 本次写入 θ 的音符数。 */
@@ -60,11 +76,18 @@ export function curveHasSignal(
 ): boolean {
   if (!c || c.xs.length === 0) return false;
   if (Math.abs(evalCurveAt(c, t0)) >= eps || Math.abs(evalCurveAt(c, t1)) >= eps) return true;
-  for (let i = 0; i < c.xs.length; i++) {
+  // 二分定位首个 x≥t0(S73b:烤入曲线数万点 × 编辑器着色逐音符判定,线性起扫会热)
+  let lo = 0;
+  let hi = c.xs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((c.xs[mid] ?? Infinity) < t0) lo = mid + 1;
+    else hi = mid;
+  }
+  for (let i = lo; i < c.xs.length; i++) {
     const x = c.xs[i];
     const y = c.ys[i];
     if (x === undefined || y === undefined) break;
-    if (x < t0) continue;
     if (x > t1) break;
     if (Math.abs(y) >= eps) return true;
   }
@@ -80,10 +103,15 @@ export function isUserTuned(n: Note, pitchDev: PitchCurve | undefined): boolean 
   return !!(n.vibrato || n.transition);
 }
 
-/** θ → Note 字段(k=Expressiveness 缩放;phase 由 mode 决定)。 */
-function thetaToFields(th: AutotuneTheta, k: number, phase: number): Partial<Note> {
+/** θ → Note 字段(scales=表现力/颤音双缩放;phase 由 mode 决定)。expr 乘 过冲+起收滑幅+颤音
+ *  (=「音符实不实」一并归表现力管,用户 S73b 拍板);vib 只再乘颤音。 */
+function thetaToFields(th: AutotuneTheta, scales: AutoTuneScales, phase: number): Partial<Note> {
   const tr = th.transition;
-  const vibDepth = th.vibrato.depthCents * k;
+  const k = scales.expr;
+  // 缩放到 0 时垫 0.01¢(听阈外)保住 vibrato 容器:k 拖到端点再拖回,Retake 相位不被洗掉
+  // (S73b 审查;θ.depth==0 的音符仍然干净地无 vibrato)。
+  const scaled = th.vibrato.depthCents * k * scales.vib;
+  const vibDepth = th.vibrato.depthCents > 0 ? Math.max(0.01, scaled) : 0;
   return {
     transition: {
       offsetMs: round2(tr.offsetMs),
@@ -91,7 +119,7 @@ function thetaToFields(th: AutotuneTheta, k: number, phase: number): Partial<Not
       durRightMs: round2(tr.durRightMs),
       depthLeftCents: round2(tr.depthLeftCents * k),
       depthRightCents: round2(tr.depthRightCents * k),
-      openEdgeCents: round2(tr.openEdgeCents),
+      openEdgeCents: round2(tr.openEdgeCents * k),
     },
     // depth>0 一律保留(哪怕亚 cent):Expressiveness 拖低再拖高的往返若把 vibrato 省略掉,
     // Retake 相位会静默丢失归 0(S73 审查)。depth==0(k=0)由 normalizeNote 归一为 absent。
@@ -121,15 +149,17 @@ async function fetchTheta(notes: readonly Note[], tempo: number): Promise<Autotu
 }
 
 /**
- * 自动调教入口(fresh=自动调教按钮 / retake=换一版相位 / rescale=Expressiveness 重缩放,
- * 保留各音符现有相位)。selectedIds 空 = 整段。一次 applyNoteEdits = 一步 undo。
+ * 自动调教入口。selectedIds 空 = 整段。一次 applyNoteEdits = 一步 undo;
+ * silent=true(常开 watcher)→ 走 history.runSilent:不进撤销栈、不砍 redo、基线同步——
+ * 快照里 vocalParams(k)与 θ 一起恢复,undo 触发的重跑经 no-op 守卫收敛为零写入。
  */
 export async function applyAutoTune(
   trackId: string,
   segmentId: string,
   selectedIds: readonly string[],
-  k: number,
+  scales: AutoTuneScales,
   mode: AutoTuneMode,
+  opts: { silent?: boolean } = {},
 ): Promise<AutoTuneResult> {
   const store = useProjectStore.getState();
   const track = store.tracks.find((t) => t.id === trackId);
@@ -144,8 +174,12 @@ export async function applyAutoTune(
   let skipped = 0;
   notes.forEach((n, i) => {
     if (scope && !scope.has(n.id)) return;
-    const machine = n.autoTuned === true;
-    const eligible = mode === "fresh" ? machine || !isUserTuned(n, pitchDev) : machine;
+    // ★资格必须整体过 isUserTuned(S73b 审查 HIGH):`machine || …` 的短路会架空谓词里
+    //   「pitchDev 覆盖优先」规则——机器调教之上手绘了 dev 的音符,机器不得再动基线。
+    const eligible =
+      mode === "retake"
+        ? n.autoTuned === true && !isUserTuned(n, pitchDev)
+        : !isUserTuned(n, pitchDev);
     if (eligible) targetIdx.push(i);
     else skipped++;
   });
@@ -173,12 +207,21 @@ export async function applyAutoTune(
     const phase =
       mode === "retake"
         ? Math.random() - 0.5
-        : mode === "rescale"
+        : mode === "refresh"
           ? (n.vibrato?.phase ?? 0)
           : 0;
-    update[n.id] = thetaToFields(th, k, phase);
+    update[n.id] = thetaToFields(th, scales, phase);
+  }
+  // ★手势事务窗守卫(S73b 审查):txnDepth>0 期间落地 silent 写会被 commitTransaction 的
+  //   sig 对比捕获——零变化手势变「纯机器 θ 的幻影撤销步」且 future=[](砍 redo)。
+  //   await 期间手势可能才开始,所以在写入点(而非只在 watcher 入口)复查;按 stale 语义
+  //   返回让 watcher 不入账、稍后重试。
+  if (opts.silent && inGestureTransaction()) {
+    return { applied: 0, skipped, stale: true };
   }
   // await 之后重新取 store(应用点用最新引用;update 按 id 命中,消失的音符自然 no-op)
-  useProjectStore.getState().applyNoteEdits(trackId, segmentId, { update });
+  const write = () => useProjectStore.getState().applyNoteEdits(trackId, segmentId, { update });
+  if (opts.silent) useHistoryStore.getState().runSilent(write);
+  else write();
   return { applied: targetIdx.length, skipped };
 }

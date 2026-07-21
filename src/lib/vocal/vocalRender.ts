@@ -335,7 +335,9 @@ export function vocalRenderSig(track: Track, seg: Segment, tempo: number): strin
  *  track/tempo terms are byte-equal between copy-source and paste-destination". Kept HERE so it can never
  *  drift from vocalRenderSig (same string, single construction). */
 export function vocalTrackSig(track: Track, tempo: number): string {
-  return `vp:${vocalParamsSig(track.vocalParams)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
+  // forRender=true:autoTune 三元组不进渲染 sig(它们经 θ→contentSig 间接生效;直接进会让
+  // 切 follow 开关/拖缩放凭空判废整段 bake——S73b 审查假脏)。
+  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
 }
 
 /** Resolve a track's configured singer to its installed model entry (undefined = no vocalParams, no

@@ -550,8 +550,6 @@
       "vibrato": "颤音",
       "addVibrato": "添加颤音",
       "removeVibrato": "移除颤音",
-      "trackTransition": "轨道默认过渡",
-      "resetTrack": "恢复默认值",
       "resetInherit": "重置为轨道默认",
       "tr_offsetMs": "偏移",
       "tr_durLeftMs": "滑入",
@@ -572,11 +570,16 @@
       "autotuneRunning": "调教中…",
       "autotuneRetake": "Retake 换一版",
       "autotuneRetakeTip": "对机器调教的音符重抽一版颤音相位（同一乐句换个唱法）",
+      "autotuneFollow": "自动跟随",
+      "autotuneFollowTip": "编辑后自动为未调教的音符补上调教（你手调过的一律不动）；关掉则只有上面的按钮会触发",
+      "autotuneVib": "颤音",
+      "autotuneVibTip": "单独缩放自动调教的颤音深度",
       "autotuneExpr": "表现力",
-      "autotuneExprTip": "缩放自动调教的颤音深度与滑音过冲；拖完立即对机器调教的音符重新应用",
-      "autotuneNoTargets": "范围内没有可自动调教的音符——手动调教过的音符会被保留",
+      "autotuneExprTip": "整体缩放自动调教：滑音过冲、起收滑幅、颤音一起变",
+      "autotuneNoTargets": "范围内没有可自动调教的音符",
       "autotuneStale": "调教期间内容有改动，本次结果已放弃——请再点一次",
-      "autotuneHint": "作用于选中音符（未选择＝整段）；只调未调教的音符，你手调的参数与手绘/导入的音高线一律保留"
+      "autotunePaused": "自动跟随已暂停（调教模型未就绪）——下载模型后点一次「自动调教」即可恢复",
+      "autotuneHint": "作用于选中音符（未选择＝整段）"
     },
     "render": {
       "render": "渲染人声",

@@ -167,6 +167,23 @@
   font-size: 11px;
   border-radius: 0;
 }
+/* S73b 主动作变体(自动调教):accent 描边+微底色——灰底 vsb-btn 像禁用态(§user)。 */
+.vsb-btn-accent.snap-toggle {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  font-weight: 600;
+}
+.vsb-btn-accent.snap-toggle:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
+}
+.vsb-btn-accent.snap-toggle:disabled {
+  opacity: 0.4;
+  color: var(--text-muted);
+  border-color: var(--border-default);
+  background: transparent;
+}
+
 .vsb-btn-danger.snap-toggle {
   color: var(--color-error);
   border-color: color-mix(in srgb, var(--color-error) 45%, var(--border-default));

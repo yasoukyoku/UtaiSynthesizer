@@ -115,8 +115,15 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
   it("preserves vocalParams + all note/curve fields through save→load", () => {
     const { projectJson } = buildSaveBundle("P", [rich], 120, [4, 4]);
     const loaded = parseLoadedBundle(projectJson, "C:/proj.usp");
-    expect(loaded.tracks[0]!.vocalParams).toEqual(rich.vocalParams);
+    // S73b:sanitize 载入时补 concrete 的 autoTuneExpr/Vib(默认 1)——夹具没写它们,期望值补齐
+    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 1, autoTuneVib: 1 });
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
+  });
+
+  it("S73:rangeExtend=true 存读不再被 sanitize 丢弃(存量 bug 修复)", () => {
+    const t = { ...rich, vocalParams: { ...rich.vocalParams!, rangeExtend: true as const } };
+    const loaded = parseLoadedBundle(buildAutosaveJson("P", [t], 120, [4, 4]), "C:/proj.usp");
+    expect(loaded.tracks[0]!.vocalParams?.rangeExtend).toBe(true);
   });
 
   it("load→serialize is byte-identical (autosave form)", () => {
@@ -508,6 +515,20 @@ describe("S73 — autoTuned 调教所有权标记(假脏铁律全套)", () => {
     const parsed = parseLoadedBundle(a, "C:/proj.usp");
     expect((parsed.tracks[0]!.segments[0]!.content as NotesContent).notes[0]!.autoTuned).toBe(true);
     expect(buildAutosaveJson("P", parsed.tracks, 120, [4, 4])).toBe(a); // 幂等 = sig↔serialize 恒一致
+  });
+
+  it("S73b:autoTuneFollow 关→开往返 = 折回 absence(serialize 字节回到基线,无假脏)", () => {
+    const base = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: false });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.autoTuneFollow).toBe(false);
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: true });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.autoTuneFollow).toBeUndefined();
+    // vocalParams 现在存在(seed 时没有)→ 序列化会多出该对象;与「同参数直接构造」对齐即无假脏
+    const now = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    expect(now).not.toBe(base); // vocalParams 从无到有=真变化
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: false });
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: true });
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(now); // 往返=字节不动
   });
 
   it("手动 vibrato/transition 编辑剥 autoTuned(所有权移交,侧栏语义的 store 层镜像)", () => {

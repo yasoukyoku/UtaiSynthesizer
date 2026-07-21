@@ -20,6 +20,8 @@ import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflight
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
+import { isUserTuned } from "../../lib/vocal/autoTune";
+import { TUNED_MARKER } from "../../lib/trackColors";
 import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
@@ -164,6 +166,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
   const oovRef = useRef<Set<string>>(new Set());
   oovRef.current = new Set(oovIds ?? []);
+  // S73b 调教所有权着色:谓词只在 (notes, pitchDev) 变化时重算(烤入曲线可达数万点,
+  // curveHasSignal 逐音符区间扫绝不能进 rAF 每帧);变化本身已触发既有 redraw effect。
+  const userTunedIds = useMemo(() => {
+    const s = new Set<string>();
+    const dev = part?.pitchDev;
+    for (const n of part?.notes ?? []) if (isUserTuned(n, dev)) s.add(n.id);
+    return s;
+  }, [part?.notes, part?.pitchDev]);
+  const userTunedRef = useRef(userTunedIds);
+  userTunedRef.current = userTunedIds;
   const startRef = useRef(part?.start ?? 0);
   startRef.current = part?.start ?? 0;
   const durRef = useRef(part?.dur ?? 0);
@@ -483,6 +495,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
             : "rgba(0,0,0,0.4)";
         ctx.lineWidth = selected ? 1.5 : 1;
         ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
+        // S73b 调教所有权:用户调教的音符左缘竖条(金;SV1 Manual 标记同构)——机器调教/未调教不标。
+        // 只在真实左缘可见时画(裁剪态不画,免得贴屏幕边出现假标记)。
+        if (x0 >= noteAreaX && userTunedRef.current.has(n.id)) {
+          ctx.fillStyle = TUNED_MARKER;
+          ctx.fillRect(Math.round(x0) + 1, y + 2, 3, Math.max(2, v.rowH - 4));
+        }
         // lyric
         if (x1 - cx0 > 14 && v.rowH >= 11) {
           ctx.fillStyle = "#0a0f18";

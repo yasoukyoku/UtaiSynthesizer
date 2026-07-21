@@ -55,7 +55,7 @@ let tempoScaleBase: { tempo: number; tracks: Track[]; playheadTick: number } | n
 // ─── ② Vocal-note editing (S48 Phase 3) — data-layer store actions (no editor UI yet) ─────────────
 
 /** Seed for a track's first vocal-param write (partial updates merge onto this). */
-export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: "AP" };
+export const DEFAULT_VOCAL_PARAMS: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: { ...DEFAULT_TRANSITION }, breathToken: "AP", autoTuneExpr: 1, autoTuneVib: 1 };
 
 // `normalizeNote` / `normalizeNotesArray` / `normalizeCurve` — the canonical write-hygiene funnel — now
 // live in `../lib/vocalNotes` (the SINGLE source shared by the store, the .usp loader, and the editor;
@@ -938,6 +938,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         // extension is opt-in) is stored as ABSENCE — an explicit `false` would false-dirty the
         // close/autosave byte-compare without an undo step (vocalParamsSig folds it either way).
         if (vp.rangeExtend === false) delete vp.rangeExtend;
+        // S73b autoTuneFollow 极性相反(默认=开):true 折为 ABSENCE(sanitize/sig 双侧同折,
+        // 否则 关→开 往返后 serialize 带 concrete true = close/autosave 字节假脏,审查)。
+        if (vp.autoTuneFollow === true) delete vp.autoTuneFollow;
         return { ...t, vocalParams: vp };
       }),
     })),

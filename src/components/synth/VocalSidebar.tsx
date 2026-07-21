@@ -19,8 +19,8 @@ import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
-import { DEFAULT_TRANSITION } from "../../lib/vocalNotes";
-import { applyAutoTune, type AutoTuneMode } from "../../lib/vocal/autoTune";
+import { applyAutoTune, autoTuneScalesOf, type AutoTuneMode } from "../../lib/vocal/autoTune";
+import { resetAutoTuneWatcher } from "./AutoTuneWatcher";
 import { preflightAuxPack } from "../../lib/vocal/vocalRender";
 import { backendErrorMessage } from "../../lib/backendError";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
@@ -79,30 +79,23 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   // SynthV-style tabs: "singer" = voice + tone/quality; "pitch" = pitch tuning. Splits the (previously long)
   // single scroll into two focused panels; the Render action is a pinned footer visible on both.
   const [tab, setTab] = useState<"singer" | "pitch">("singer");
-  // ── S73 自动调教:expr = Expressiveness 缩放(工具态,非文档内容——不进 sig/persist,进了会
-  //    对渲染脏检测造假脏);tuning = 在途模式(UI 态);tuningRef = 同步防重入(state 异步不够);
-  //    pendingRescale = 在途时的 Expressiveness 拖动不许被吞,收尾后补一发(S73 审查)。 ──
-  const [expr, setExpr] = useState(1);
+  // ── S73b 自动调教:双缩放(颤音/表现力)持久在 vocalParams(常开语义:改 k → watcher 静默
+  //    重调教 → 重渲染,一步 undo=Slider 手势事务);按钮 = 强制重调教(fresh,相位归 0)/
+  //    Retake(换相位)。常开跟随本体在 AutoTuneWatcher;按钮成功后复燃它(模型就位信号)。 ──
   const [tuning, setTuning] = useState<AutoTuneMode | null>(null);
   const tuningRef = useRef(false);
-  const exprRef = useRef(expr);
-  exprRef.current = expr;
-  const pendingRescale = useRef(false);
   const runAutoTune = async (mode: AutoTuneMode) => {
-    if (tuningRef.current) {
-      if (mode === "rescale") pendingRescale.current = true; // 拖动不白拖,尾随补应用
-      return;
-    }
+    if (tuningRef.current) return;
     tuningRef.current = true;
     setTuning(mode);
     try {
       // 模型没下载 → 一键下载对话框(独立 aux-autotune pack;渲染的 aux-inference 预检不受牵连)
       if (!(await preflightAuxPack("aux-autotune"))) return;
-      const res = await applyAutoTune(trackId, segmentId, selectedIds, exprRef.current, mode);
+      const res = await applyAutoTune(trackId, segmentId, selectedIds, autoTuneScalesOf(vocalParams), mode);
+      resetAutoTuneWatcher(); // 跑通=模型在位,常开跟随若因缺模型熄火则复燃
       if (res.stale) {
         useAppStore.getState().showToast(t("vocalEditor.sidebar.autotuneStale"), "info");
-      } else if (mode !== "rescale" && res.applied === 0) {
-        // rescale(拖 Expressiveness)在无机器调教音符时静默 no-op;显式按钮才提示「没有目标」。
+      } else if (res.applied === 0) {
         useAppStore.getState().showToast(t("vocalEditor.sidebar.autotuneNoTargets"), "info");
       }
     } catch (e) {
@@ -110,10 +103,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
     } finally {
       tuningRef.current = false;
       setTuning(null);
-      if (pendingRescale.current) {
-        pendingRescale.current = false;
-        void runAutoTune("rescale");
-      }
     }
   };
   const applyNoteEdits = useProjectStore((s) => s.applyNoteEdits);
@@ -373,22 +362,43 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
       </>
       ) : (
       <>
-      {/* ⓪ 自动调教 (S73 旋钮线 Phase A): 模型预测 per-note θ → transition/vibrato。所有权规则见
-          lib/vocal/autoTune.ts——用户调教过的音符(手调参数/手绘·导入 pitchDev 覆盖)自动绕行;
-          Retake = 换一版颤音相位(仅机器调教的音符);Expressiveness = 颤音深度+滑音过冲 ×k,
-          拖完对机器调教的音符重新应用(相位保留)。选中音符 = 作用范围;无选择 = 整段。 */}
+      {/* ⓪ 自动调教 (S73/S73b 旋钮线 Phase A): 模型预测 per-note θ → transition/vibrato。所有权规则见
+          lib/vocal/autoTune.ts(用户调教绕行;着色=VocalEditor 音符左缘竖条)。常开跟随=AutoTuneWatcher;
+          双缩放持久在 vocalParams(改 k → watcher 静默重调教,相位保留)。选中 = 范围;无选择 = 整段。 */}
       <div className="vsb-section">
         <div className="vsb-head">
           <span>{t("vocalEditor.sidebar.autotune")}</span>
           {hasSel && selected.length > 1 && <span className="vsb-count">×{selected.length}</span>}
         </div>
         <button
-          className="snap-toggle vsb-btn"
+          className="snap-toggle vsb-btn vsb-btn-accent"
           disabled={tuning !== null || notes.length === 0}
           onClick={() => void runAutoTune("fresh")}
         >
           {tuning === "fresh" ? t("vocalEditor.sidebar.autotuneRunning") : t("vocalEditor.sidebar.autotuneRun")}
         </button>
+        <div title={t("vocalEditor.sidebar.autotuneFollowTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.autotuneFollow")}
+            checked={vocalParams.autoTuneFollow !== false}
+            onChange={(c) => setVocalParams(trackId, { autoTuneFollow: c })}
+          />
+        </div>
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneVib")}
+          tip={t("vocalEditor.sidebar.autotuneVibTip")}
+          value={vocalParams.autoTuneVib ?? 1}
+          cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
+          onChange={(v) => setVocalParams(trackId, { autoTuneVib: v })}
+        />
+        <Slider
+          label={t("vocalEditor.sidebar.autotuneExpr")}
+          tip={t("vocalEditor.sidebar.autotuneExprTip")}
+          value={vocalParams.autoTuneExpr ?? 1}
+          cfg={{ min: 0, max: 4, step: 0.01, unit: "×", bipolar: false }}
+          onChange={(v) => setVocalParams(trackId, { autoTuneExpr: v })}
+        />
+        <div className="vsb-hint">{t("vocalEditor.sidebar.autotuneHint")}</div>
         <button
           className="snap-toggle vsb-btn"
           disabled={tuning !== null || notes.length === 0}
@@ -397,28 +407,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
         >
           {tuning === "retake" ? t("vocalEditor.sidebar.autotuneRunning") : t("vocalEditor.sidebar.autotuneRetake")}
         </button>
-        <div className="vsb-row">
-          <div className="vsb-row-top">
-            <label className="vsb-label" title={t("vocalEditor.sidebar.autotuneExprTip")}>
-              {t("vocalEditor.sidebar.autotuneExpr")}
-            </label>
-            <span className="vsb-val">{expr.toFixed(2)}×</span>
-          </div>
-          <div className="vsb-row-bot">
-            <VolumeFader
-              value={expr}
-              min={0}
-              max={2}
-              step={0.01}
-              width={200}
-              fillFrom="left"
-              onChange={setExpr}
-              onGestureEnd={() => void runAutoTune("rescale")}
-              format={(v) => `${v.toFixed(2)}×`}
-            />
-          </div>
-        </div>
-        <div className="vsb-hint">{t("vocalEditor.sidebar.autotuneHint")}</div>
       </div>
 
       {/* ① selected-note transition override (glide / portamento between notes) */}
@@ -475,24 +463,9 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
         )}
       </div>
 
-      {/* ③ track default transition (the concrete base every note inherits). Each field has its OWN ↺ back to
-          the factory default (DEFAULT_TRANSITION) — a single reset-all would force re-dragging the fields you
-          wanted to keep (§user). ↺ lights only when the field differs from the factory default. */}
-      <div className="vsb-section">
-        <div className="vsb-head"><span>{t("vocalEditor.sidebar.trackTransition")}</span></div>
-        {TRANSITION_FIELDS.map((f) => (
-          <Slider
-            key={f.key}
-            label={t(`vocalEditor.sidebar.tr_${f.key}`)}
-            value={trackTransition[f.key]}
-            cfg={f}
-            overridden={trackTransition[f.key] !== DEFAULT_TRANSITION[f.key]}
-            onReset={() => setVocalParams(trackId, { transition: { ...trackTransition, [f.key]: DEFAULT_TRANSITION[f.key] } })}
-            resetTitle={t("vocalEditor.sidebar.resetTrack")}
-            onChange={(v) => setVocalParams(trackId, { transition: { ...trackTransition, [f.key]: v } })}
-          />
-        ))}
-      </div>
+      {/* S73b:「轨道默认过渡」区块已删(用户拍板)——常开自动音高后所有音符都持有显式 θ,
+          轨道默认没有 UI 消费面;数据层(VocalTrackParams.transition/DEFAULT_TRANSITION)保留
+          作为 eval 兜底与存量工程兼容。 */}
       </>
       )}
       </div>
@@ -511,8 +484,10 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
 }
 
 // ── one labeled fader row (VolumeFader = the gesture-bracketed fader; a drag = one undo step) ──
-function Slider({ label, value, cfg, overridden, onReset, resetTitle, onChange }: {
+function Slider({ label, tip, value, cfg, overridden, onReset, resetTitle, onChange }: {
   label: string;
+  /** 说明性 tip——经 VolumeFader 的单一 title 源合成显示(外包 div 会被遮蔽,S73b 审查)。 */
+  tip?: string;
   value: number;
   cfg: { min: number; max: number; step: number; unit: string; bipolar: boolean };
   overridden?: boolean;
@@ -524,7 +499,7 @@ function Slider({ label, value, cfg, overridden, onReset, resetTitle, onChange }
   return (
     <div className="vsb-row">
       <div className="vsb-row-top">
-        <label className={`vsb-label${overridden ? " ovr" : ""}`} title={overridden ? resetTitle : undefined}>{label}</label>
+        <label className={`vsb-label${overridden ? " ovr" : ""}`} title={overridden ? resetTitle : tip}>{label}</label>
         <span className="vsb-val">{fmt(value, cfg.step)}{cfg.unit}</span>
       </div>
       <div className="vsb-row-bot">
@@ -539,6 +514,7 @@ function Slider({ label, value, cfg, overridden, onReset, resetTitle, onChange }
           onGestureStart={() => useHistoryStore.getState().beginTransaction()}
           onGestureEnd={() => useHistoryStore.getState().commitTransaction()}
           format={(v) => `${fmt(v, cfg.step)}${cfg.unit}`}
+          tip={tip}
         />
         {showReset && (
           <button className="vsb-reset" disabled={!overridden} title={resetTitle} onClick={onReset}>↺</button>

@@ -58,3 +58,6 @@ export const SELECTION_GLOW_RGB = "255,214,102";
  *  it rides (§user: 真串色了). White-on-halo reads on every hue. */
 export const ENVELOPE_LINE = "#e8edf5";
 export const ENVELOPE_HALO = "rgba(10, 14, 24, 0.85)";
+/** S73b 调教所有权标记(VocalEditor 音符左缘竖条):用户调教=金——与 note 青/选中紫/OOV 红
+ *  都不冲突;机器调教(autoTuned)不标。SV1「Manual 音符角标」的本家版。 */
+export const TUNED_MARKER = "#e6c25a";

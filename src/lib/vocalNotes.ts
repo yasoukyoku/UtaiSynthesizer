@@ -247,6 +247,11 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     sovits: sanitizeOpts(p.sovits, SOVITS_DEFAULTS),
     rvc: sanitizeOpts(p.rvc, RVC_DEFAULTS),
     breathToken: typeof p.breathToken === "string" && p.breathToken.trim() ? p.breathToken : "AP",
+    ...(p.rangeExtend === true ? { rangeExtend: true } : {}),
+    // S73b 自动音高:follow 只存 false(absent≡true=默认常开);缩放 0–4 concrete(默认 1)。
+    ...(p.autoTuneFollow === false ? { autoTuneFollow: false } : {}),
+    autoTuneExpr: clampNum(p.autoTuneExpr ?? NaN, 0, 4, 1),
+    autoTuneVib: clampNum(p.autoTuneVib ?? NaN, 0, 4, 1),
   };
 }
 

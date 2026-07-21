@@ -550,8 +550,6 @@
       "vibrato": "Vibrato",
       "addVibrato": "Add vibrato",
       "removeVibrato": "Remove vibrato",
-      "trackTransition": "Track default transition",
-      "resetTrack": "Reset to default",
       "resetInherit": "Reset to track default",
       "tr_offsetMs": "Offset",
       "tr_durLeftMs": "Arrive",
@@ -572,11 +570,16 @@
       "autotuneRunning": "Tuning…",
       "autotuneRetake": "Retake",
       "autotuneRetakeTip": "Re-roll the vibrato phase of machine-tuned notes (same phrase, another delivery)",
+      "autotuneFollow": "Auto follow",
+      "autotuneFollowTip": "After edits, untuned notes are re-tuned automatically (your manual tuning is never touched); off = only the button above applies",
+      "autotuneVib": "Vibrato",
+      "autotuneVibTip": "Scales only the auto-tuned vibrato depth",
       "autotuneExpr": "Expressiveness",
-      "autotuneExprTip": "Scales the auto-tuned vibrato depth and glide overshoot; re-applies to machine-tuned notes when released",
-      "autotuneNoTargets": "No auto-tunable notes in the selection — manually tuned notes are preserved",
+      "autotuneExprTip": "Scales the whole auto-tune: glide overshoot, edge scoops and vibrato together",
+      "autotuneNoTargets": "No auto-tunable notes in range",
       "autotuneStale": "Content changed while tuning — the result was discarded, please try again",
-      "autotuneHint": "Applies to selected notes (none selected = whole segment); only untuned notes are touched — your manual tuning and drawn/imported pitch lines are preserved"
+      "autotunePaused": "Auto follow paused (tuning model not ready) — download it, then press Auto-tune once to resume",
+      "autotuneHint": "Applies to selected notes (none selected = whole segment)"
     },
     "render": {
       "render": "Render vocal",

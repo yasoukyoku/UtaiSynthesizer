@@ -550,8 +550,6 @@
       "vibrato": "ビブラート",
       "addVibrato": "ビブラート追加",
       "removeVibrato": "ビブラート削除",
-      "trackTransition": "トラック既定の遷移",
-      "resetTrack": "既定値に戻す",
       "resetInherit": "トラック既定に戻す",
       "tr_offsetMs": "オフセット",
       "tr_durLeftMs": "入り",
@@ -572,11 +570,16 @@
       "autotuneRunning": "調声中…",
       "autotuneRetake": "リテイク",
       "autotuneRetakeTip": "機械調声のノートのビブラート位相を引き直します（同じフレーズを別の歌い方で）",
+      "autotuneFollow": "自動追従",
+      "autotuneFollowTip": "編集後、未調声のノートに自動で調声を補います（手動調声は一切変更しません）。オフにすると上のボタンのみで実行",
+      "autotuneVib": "ビブラート",
+      "autotuneVibTip": "自動調声のビブラート深さのみを倍率調整",
       "autotuneExpr": "表現力",
-      "autotuneExprTip": "自動調声のビブラート深さとポルタメントのオーバーシュートを倍率で調整。ドラッグ後、機械調声のノートに即再適用",
-      "autotuneNoTargets": "選択範囲に自動調声できるノートがありません——手動調声したノートは保持されます",
+      "autotuneExprTip": "自動調声全体を倍率調整：オーバーシュート・出入りのスライド幅・ビブラートが一緒に変わります",
+      "autotuneNoTargets": "範囲内に自動調声できるノートがありません",
       "autotuneStale": "調声中に内容が変更されたため結果を破棄しました——もう一度お試しください",
-      "autotuneHint": "選択ノートに作用（未選択＝セグメント全体）。未調声のノートのみ調声し、手動調整と手描き／インポートのピッチラインは保持されます"
+      "autotunePaused": "自動追従を一時停止しました（調声モデル未準備）——モデルのダウンロード後に「自動調声」を一度押すと再開します",
+      "autotuneHint": "選択ノートに作用（未選択＝セグメント全体）"
     },
     "render": {
       "render": "人声を合成",

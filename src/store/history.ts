@@ -148,11 +148,15 @@ function sigOpts(o?: Record<string, unknown>): string {
     .map((k) => `${k}=${JSON.stringify(o[k])}`)
     .join(",");
 }
-export function vocalParamsSig(p?: VocalTrackParams): string {
+/** forRender=true(vocalRender 脏检测)时省略 |at: 段:autoTuneFollow/expr/vib 本身不进渲染
+ *  音频——它们经 watcher 改写 θ(在 contentSig 里)间接生效;进渲染 sig 会让「切开关/拖缩放」
+ *  凭空判废整段 bake(S73b 审查假脏)。undo/meaningfulSig 视角(默认)保留 at: 段。 */
+export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string {
   if (!p) return "";
   const t = p.transition;
   const tr = t ? `${t.offsetMs},${t.durLeftMs},${t.durRightMs},${t.depthLeftCents},${t.depthRightCents},${t.openEdgeCents}` : "";
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}`;
+  const at = forRender ? "" : `|at:${p.autoTuneFollow === false ? 0 : 1},${p.autoTuneExpr ?? 1},${p.autoTuneVib ?? 1}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

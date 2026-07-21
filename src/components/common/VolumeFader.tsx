@@ -17,6 +17,9 @@ interface Props {
   fillFrom?: "left" | "center";
   /** Tooltip formatter. Default renders dB ("+1.5 dB"); pass `formatPan` for a pan fader. */
   format?: (v: number) => string;
+  /** S73b: 说明性 tip,与数值合成进同一个 root title(外包 div 的 title 会被这里的 title 遮蔽,
+   *  所以说明必须从这个单一 title 源走)。 */
+  tip?: string;
 }
 
 /** Pan tooltip text ("L50" / "C" / "R50") for a −1..1 fader — the ONE pan display convention. */
@@ -31,7 +34,7 @@ export function formatDb(v: number, min: number): string {
   return v <= min ? "-∞ dB" : `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
 }
 
-export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestureEnd, width = 48, step = 0.5, fillFrom = "left", format }: Props) {
+export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestureEnd, width = 48, step = 0.5, fillFrom = "left", format, tip }: Props) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
   // Everything the document listeners need lives in refs so calcValue/the listener effect are STABLE
@@ -118,7 +121,7 @@ export function VolumeFader({ value, min, max, onChange, onGestureStart, onGestu
       onClick={(e) => e.stopPropagation()}
       // Default dB formatter: the fader BOTTOM reads −∞ (mute — see FADER_MIN_DB); a custom `format`
       // (the pan fader) is never affected.
-      title={format ? format(value) : formatDb(value, min)}
+      title={`${tip ? `${tip} — ` : ""}${format ? format(value) : formatDb(value, min)}`}
     >
       <div className="vol-track" />
       <div className="vol-zero" style={{ left: `${zeroRatio * 100}%` }} />
