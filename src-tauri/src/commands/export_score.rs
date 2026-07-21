@@ -24,6 +24,9 @@ pub struct ExportNote {
     pub velocity: i32, // 0-127,仅 midi NoteOn 使用;ust/ustx 忽略
     #[serde(default)]
     pub vibrato: Option<ExportVibrato>, // 仅 ustx 写出
+    /// S73: Note.detune(cents)→ ustx `tuning`(import 的 tuning→detune 之逆;仅 ustx)。
+    #[serde(default)]
+    pub detune: Option<f32>,
 }
 
 /// 与 import.rs 的 ImportedVibrato 同形(camelCase 直连 TS 侧 VibratoSpec,无需再 shaping)。
@@ -42,6 +45,18 @@ pub struct ExportVibrato {
 pub struct ExportTrack {
     pub name: String,
     pub notes: Vec<ExportNote>,
+    /// S73: 该轨各 notes 段 pitchDev 展平到【绝对 tick】后的合并折线(TS 侧 seg.startTick + x;
+    /// 段间不重叠,升序)。仅 ustx 写出(→ part 级 pitd 曲线,rebase 到 part 相对);ust/midi 无通道。
+    /// 这是「烤入导入 → 再导出」不丢调教的关键闭环(S73 审查:旧路径一次导出即全丢)。
+    #[serde(default)]
+    pub pitch_dev: Option<ExportCurve>,
+}
+
+/// 稀疏折线(TS PitchCurve 同构)。
+#[derive(Deserialize, Debug, Clone)]
+pub struct ExportCurve {
+    pub xs: Vec<i64>,
+    pub ys: Vec<i64>,
 }
 
 /// 我们的工程分辨率 —— 与 import.rs 的同名常量同值(那边是模块私有,这里镜像一份)。
@@ -62,13 +77,13 @@ pub async fn export_score_files(
     // 无音符轨剔除。前端编辑漏斗已保证单段内不重叠,但多段拼接可能重叠 —— 防御,不是热路径。
     let tracks: Vec<ExportTrack> = tracks
         .into_iter()
-        .map(|t| ExportTrack { name: t.name, notes: sanitize_notes(t.notes) })
+        .map(|t| ExportTrack { name: t.name, notes: sanitize_notes(t.notes), pitch_dev: t.pitch_dev })
         .filter(|t| !t.notes.is_empty())
         .collect();
     if tracks.is_empty() {
         return Err("EXPORT_SCORE_EMPTY".to_string());
     }
-    // bpm 防御性归一(镜像 import.rs map_vibrato 的兜底):非法值不该出现,但写盘侧绝不放 NaN 进文件。
+    // bpm 防御性归一(import.rs 同款 is_finite 兜底):非法值不该出现,但写盘侧绝不放 NaN 进文件。
     let bpm = if tempo.is_finite() && tempo > 0.0 { tempo } else { 120.0 };
     // 写盘/zip 是重活 → spawn_blocking(仓库惯例,见 storage.rs / midi_extract.rs)。
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
@@ -273,6 +288,16 @@ struct UstxOutVoicePart {
     track_no: usize,
     position: i64, // part 在工程里的绝对 tick 偏移 = 首音符绝对 tick
     notes: Vec<UstxOutNote>,
+    /// S73: pitchDev → OU pitd 曲线(part 相对 tick / 整数 cents;空则不序列化)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    curves: Vec<UstxOutCurve>,
+}
+
+#[derive(serde::Serialize)]
+struct UstxOutCurve {
+    xs: Vec<i64>,
+    ys: Vec<i64>,
+    abbr: String,
 }
 
 #[derive(serde::Serialize)]
@@ -283,6 +308,9 @@ struct UstxOutNote {
     lyric: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     vibrato: Option<UstxOutVibrato>,
+    /// S73: detune(cents)→ OU tuning(读侧 AdjustedTone = tone + tuning/100)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tuning: Option<f32>,
 }
 
 /// OpenUTAU vibrato(字段语义见 import.rs UstxVibrato 注释)。`in` 是 Rust 关键字 → serde rename。
@@ -300,10 +328,10 @@ struct UstxOutVibrato {
     vol_link: f32,
 }
 
-/// map_vibrato(import.rs)的精确逆:note_ms = duration/480*60000/bpm;vib_ms = note_ms − start_ms;
-/// vib_ms ≤ 0 或 freq_hz ≤ 0 → 不写 vibrato。length = vib_ms/note_ms*100 clamp 到 (0,100];
-/// period = 1000/freq_hz;in/out = ease/vib_ms*100;shift = phase*100。在无 clamp 触发的正常域内,
-/// 与 map_vibrato 往返各字段恒等(浮点近似,测试卡 <0.05)。
+/// VibratoSpec → OpenUTAU vibrato 的单向导出(S56 map_vibrato 的逆;那个入向映射 S73 已删——
+/// 读回走 ou_pitch 烤制,本函数保留=给 OU 用户原生旋钮):note_ms = duration/480*60000/bpm;
+/// vib_ms = note_ms − start_ms;vib_ms ≤ 0 或 freq_hz ≤ 0 → 不写。length = vib_ms/note_ms*100;
+/// period = 1000/freq_hz;in/out = ease/vib_ms*100;shift = phase 包卷后 ×100。
 fn unmap_vibrato(v: &ExportVibrato, note_dur_ticks: i64, bpm: f64) -> Option<UstxOutVibrato> {
     if !(v.freq_hz > 0.0) {
         return None;
@@ -372,8 +400,22 @@ fn export_ustx(path: &str, bpm: f64, time_sig: [u32; 2], tracks: &[ExportTrack])
                             tone: n.pitch,
                             lyric: n.lyric.clone(),
                             vibrato: n.vibrato.as_ref().and_then(|v| unmap_vibrato(v, n.duration, bpm)),
+                            tuning: n.detune.filter(|d| d.is_finite() && *d != 0.0),
                         })
                         .collect(),
+                    // pitchDev(绝对 tick)→ pitd(part 相对;整数 cents 原样)
+                    curves: t
+                        .pitch_dev
+                        .as_ref()
+                        .filter(|c| !c.xs.is_empty() && c.xs.len() == c.ys.len())
+                        .map(|c| {
+                            vec![UstxOutCurve {
+                                xs: c.xs.iter().map(|x| x - part_pos).collect(),
+                                ys: c.ys.clone(),
+                                abbr: "pitd".to_string(),
+                            }]
+                        })
+                        .unwrap_or_default(),
                 }
             })
             .collect(),
@@ -464,11 +506,42 @@ mod tests {
     use crate::commands::import::ImportedScore;
 
     fn n(tick: i64, duration: i64, pitch: i32, lyric: &str) -> ExportNote {
-        ExportNote { tick, duration, pitch, lyric: lyric.to_string(), velocity: 100, vibrato: None }
+        ExportNote { tick, duration, pitch, lyric: lyric.to_string(), velocity: 100, vibrato: None, detune: None }
     }
 
     fn track(name: &str, notes: Vec<ExportNote>) -> ExportTrack {
-        ExportTrack { name: name.to_string(), notes }
+        ExportTrack { name: name.to_string(), notes, pitch_dev: None }
+    }
+
+    #[test]
+    fn ustx_pitch_dev_exports_as_pitd_and_survives_roundtrip() {
+        // S73:pitchDev(绝对 tick)→ pitd(part 相对)→ 读回烤制 ≈ 原曲线;detune → tuning → detune
+        let mut n0 = n(1200, 480, 60, "あ");
+        n0.detune = Some(25.0);
+        let mut t = track("T", vec![n0, n(1680, 480, 60, "い")]);
+        t.pitch_dev = Some(ExportCurve {
+            xs: vec![1200, 1400, 1600, 1900],
+            ys: vec![0, 55, 0, -30],
+        });
+        let path = tmp("rt_pitd.ustx");
+        export("ustx", &path, 120.0, [4, 4], vec![t]).unwrap();
+        let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_string();
+        assert!(text.contains("abbr: pitd"), "pitd 曲线须序列化");
+        assert!(text.contains("tuning: 25"), "detune 须写成 tuning");
+        let s = import_back(&path);
+        let tr = &s.tracks[0];
+        assert_eq!(tr.notes[0].detune, Some(25.0)); // tuning → detune 往返
+        let dev = tr.pitch_dev.as_ref().expect("pitd part 读回必烤");
+        // 峰值 55¢@abs 1400 → segment 相对 200(base=1200);同音高两音符无滑音贡献,dev≈pitd
+        let near = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (180..=220).contains(&x))
+            .map(|(_, &y)| y)
+            .max()
+            .unwrap_or(0);
+        assert!((50..=57).contains(&near), "pitd 峰值≈55¢ 往返,得 {near}");
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -572,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn ustx_roundtrip_bpm_timesig_offset_and_vibrato_inverse() {
+    fn ustx_roundtrip_bpm_timesig_offset_and_vibrato_bakes() {
         let vib = ExportVibrato {
             depth_cents: 50.0,
             freq_hz: 5.0,
@@ -597,15 +670,28 @@ mod tests {
         assert_eq!(t.notes.len(), 2);
         assert_eq!((t.notes[0].tick, t.notes[0].duration, t.notes[0].pitch, t.notes[0].lyric.as_str()), (0, 480, 65, "よ"));
         assert_eq!((t.notes[1].tick, t.notes[1].duration, t.notes[1].pitch, t.notes[1].lyric.as_str()), (480, 240, 67, "い"));
-        // unmap_vibrato ∘ map_vibrato = id(浮点近似):各字段误差 < 0.05。
-        let v = t.notes[0].vibrato.as_ref().expect("vibrato survives the round-trip");
-        assert!((v.depth_cents - vib.depth_cents).abs() < 0.05);
-        assert!((v.freq_hz - vib.freq_hz).abs() < 0.05);
-        assert!((v.phase - vib.phase).abs() < 0.05);
-        assert!((v.start_ms - vib.start_ms).abs() < 0.05);
-        assert!((v.ease_in_ms - vib.ease_in_ms).abs() < 0.05);
-        assert!((v.ease_out_ms - vib.ease_out_ms).abs() < 0.05);
-        assert!(t.notes[1].vibrato.is_none()); // 没喂 vibrato 的音符不产出 vibrato
+        // S73:带 vibrato 的 ustx 读回 = 已调教 part → 烤入 pitchDev(听感语义经曲线保真;
+        // ImportedNote 级的 map_vibrato 逆映射已删)。振音区(start_ms 192 ≈ 240t 起)应见 ≈50¢ 摆动。
+        let dev = t.pitch_dev.as_ref().expect("vibrato part bakes on re-import");
+        let max_abs = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (250..480).contains(&x))
+            .map(|(_, &y)| y.abs())
+            .max()
+            .unwrap_or(0);
+        assert!((40..=60).contains(&max_abs), "烤入颤音深度≈50¢,得 {max_abs}");
+        // note[1](无 vibrato,空 pitch data=平)中段应平
+        let mid1: i64 = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (560..640).contains(&x))
+            .map(|(_, &y)| y.abs())
+            .max()
+            .unwrap_or(0);
+        assert!(mid1 <= 2, "无 vibrato 音符中段应平,得 {mid1}");
     }
 
     #[test]

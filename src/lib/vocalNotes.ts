@@ -29,6 +29,9 @@ const HUGE = 1e9;
 /** Track-level DEFAULT note transition — every field concrete (a note's partial NoteTransition overrides
  *  per field). This is why every note glides smoothly by default (SynthV, §10.3). */
 export const DEFAULT_TRANSITION = { offsetMs: 0, durLeftMs: 100, durRightMs: 70, depthLeftCents: 15, depthRightCents: 15, openEdgeCents: 200 } as const;
+/** 纯阶梯覆盖(全 0 = 无滑音/无起收):S73 ustx 烤入 part 的音符显式置它——OU 的全部音高
+ *  动态已在 pitchDev 曲线里,任何默认滑音再叠加=双重。显式 0 ≠ 继承(normalizeTransition 保留)。 */
+export const ZERO_TRANSITION = { offsetMs: 0, durLeftMs: 0, durRightMs: 0, depthLeftCents: 0, depthRightCents: 0, openEdgeCents: 0 } as const;
 const TRANSITION_KEYS = ["offsetMs", "durLeftMs", "durRightMs", "depthLeftCents", "depthRightCents", "openEdgeCents"] as const;
 const TRANSITION_BOUNDS: Record<(typeof TRANSITION_KEYS)[number], readonly [number, number]> = {
   offsetMs: [-2000, 2000], durLeftMs: [0, 2000], durRightMs: [0, 2000], depthLeftCents: [-1200, 1200], depthRightCents: [-1200, 1200], openEdgeCents: [0, 1200],

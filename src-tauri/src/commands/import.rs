@@ -4,9 +4,16 @@
 // project state, so it can never regress the editor.
 //
 // SCOPE (user-confirmed): NOTES (tick/duration/pitch/lyric) + BPM + first time-signature + the part's
-// start OFFSET + (ustx only) VIBRATO mapped to our VibratoSpec. We deliberately do NOT import ustx
-// pitch-bend / pitch-point curves — our pitch model (SynthV transitions) differs. One file at a time; a
-// multi-track file yields ONE ImportedTrack per track that has notes (empty tracks skipped).
+// start OFFSET + (ustx only) tuning→detune, and PITCH (S73 线2, user-confirmed「手绘调教性质」):
+//   - a part with ANY real tuning (nonzero pitch-point y / vibrato / pitd) is BAKED: the full OpenUTAU
+//     pitch curve (platform + vibrato-overwrite + point deltas + pitd; commands/ou_pitch.rs) minus our
+//     written-pitch step is imported as the segment's additive pitchDev (hand-drawn layer, exact, no θ
+//     fitting), notes get ZERO transitions (or our defaults would double the glides) and NO VibratoSpec
+//     (or the mapped vibrato would double the baked one). Baked notes count as USER-tuned → auto-tune 绕行.
+//   - a COMPLETELY untuned part (all point y==0 default glides, no vibrato, no pitd) keeps our own
+//     SynthV-style defaults instead (智能跳过, user-confirmed) — vibrato mapping stays for parity with
+//     the old behavior (vacuously: untuned parts have none).
+// One file at a time; a multi-track file yields ONE ImportedTrack per part that has notes.
 //
 // RESOLUTION: our app is 480 ticks/quarter (TICKS_PER_BEAT). ust and ustx are ALSO 480 → 1:1, no scaling.
 // MIDI PPQ comes from the header division and is scaled: our = round(midi_tick * 480 / ppq). Note pitch IS
@@ -26,6 +33,18 @@ pub struct ImportedTrack {
     pub name: String,
     pub start_tick: i64,
     pub notes: Vec<ImportedNote>,
+    /// S73: OU 音高曲线烤入(segment 相对 tick / 整数 cents 折线);None = 未调教 part(智能跳过)
+    /// 或非 ustx 来源。Some 时前端必须:①setSegmentPitchDev ②给音符置零 transition ③不映射 vibrato。
+    pub pitch_dev: Option<ImportedCurve>,
+    /// S73: part 有调教但超出可烤上限被放弃(前端须 toast 提示;绝不与「未调教」混同)。
+    pub pitch_dev_dropped: bool,
+}
+
+/// 稀疏折线(与 TS PitchCurve 同构;xs 严格递增)。
+#[derive(Serialize, Debug, Clone)]
+pub struct ImportedCurve {
+    pub xs: Vec<i64>,
+    pub ys: Vec<i64>,
 }
 
 /// One imported note. Ticks/durations are ALREADY in our 480-ppq space. `pitch` is the MIDI note number.
@@ -35,21 +54,12 @@ pub struct ImportedNote {
     pub duration: i64,
     pub pitch: i32,
     pub lyric: String,
-    pub vibrato: Option<ImportedVibrato>,
+    /// ustx `tuning`(cents)→ 我们的 detune(无损旋钮映射;烤制基线同样含它,不双重)。
+    pub detune: Option<f32>,
 }
-
-/// ustx vibrato mapped to our VibratoSpec (src/types/project.ts). camelCase so the object maps 1:1 onto
-/// VibratoSpec on the TS side (no extra shaping).
-#[derive(Serialize, Debug, Clone, Copy)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportedVibrato {
-    pub depth_cents: f32,
-    pub freq_hz: f32,
-    pub phase: f32,
-    pub start_ms: f32,
-    pub ease_in_ms: f32,
-    pub ease_out_ms: f32,
-}
+// S73 注:S56 的 ImportedVibrato/map_vibrato(ustx vibrato→VibratoSpec 有损映射)已删——
+// 新语义下带 vibrato 的 part 必然「已调教」→ 整体烤入 pitchDev(含 drift/渐变全语义,
+// 严格更保真),映射路径永不可达=死代码。
 
 /// The whole parse result. `bpm` / `time_sig` are the file's FIRST tempo / meter (our app has no tempo
 /// map — a single global scalar). `None` = the file carried no bpm/meter → the frontend leaves the editor
@@ -186,7 +196,7 @@ fn parse_ust(bytes: &[u8]) -> Result<ImportedScore, String> {
             duration: len.max(1),
             pitch: sec.notenum.unwrap_or(60).clamp(0, 127),
             lyric,
-            vibrato: None, // ust carries no vibrato spec we import
+            detune: None,
         });
         cursor += len;
     }
@@ -195,7 +205,7 @@ fn parse_ust(bytes: &[u8]) -> Result<ImportedScore, String> {
         Vec::new()
     } else {
         // ust carries no track name → empty; the frontend names it by the file (per-file, one track).
-        vec![ImportedTrack { name: String::new(), start_tick: start_tick.unwrap_or(0), notes }]
+        vec![ImportedTrack { name: String::new(), start_tick: start_tick.unwrap_or(0), notes, pitch_dev: None, pitch_dev_dropped: false }]
     };
     Ok(ImportedScore { tracks, bpm: tempo, time_sig: None }) // ust has NO time signature
 }
@@ -255,6 +265,19 @@ struct UstxVoicePart {
     position: i64, // part offset in project ticks
     #[serde(default)]
     notes: Vec<UstxNote>,
+    #[serde(default)]
+    curves: Vec<UstxCurve>, // S73: part 级表达曲线;只消费 abbr=="pitd"
+}
+
+/// part 级曲线(UCurve 序列化形态:平行数组,xs=part 相对 tick,ys=整数;pitd 的 ys=cents)。
+#[derive(serde::Deserialize)]
+struct UstxCurve {
+    #[serde(default)]
+    xs: Vec<i64>,
+    #[serde(default)]
+    ys: Vec<i64>,
+    #[serde(default)]
+    abbr: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -269,6 +292,34 @@ struct UstxNote {
     lyric: String,
     #[serde(default)]
     vibrato: Option<UstxVibrato>,
+    #[serde(default)]
+    pitch: Option<UstxPitch>, // S73: note 级音高控制点
+    #[serde(default)]
+    tuning: Option<f32>, // cents(UNote.AdjustedTone = tone + tuning/100)
+}
+
+/// note 级 pitch 块(UPitch:data 控制点 + snap_first)。
+#[derive(serde::Deserialize)]
+struct UstxPitch {
+    #[serde(default)]
+    data: Vec<UstxPitchPoint>,
+    #[serde(default = "default_true")]
+    snap_first: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 音高控制点:x=相对音符起点 ms(可负,伸进前音符);y=0.1 半音;shape∈{io,l,i,o,sp}。
+#[derive(serde::Deserialize)]
+struct UstxPitchPoint {
+    #[serde(default)]
+    x: f32,
+    #[serde(default)]
+    y: f32,
+    #[serde(default)]
+    shape: Option<String>,
 }
 
 /// OpenUTAU vibrato. `length` = % of the note covered (from the note END); `period` = ms/cycle; `depth` =
@@ -288,36 +339,8 @@ struct UstxVibrato {
     out: f32,
     #[serde(default)]
     shift: f32,
-}
-
-/// Map an OpenUTAU vibrato onto our VibratoSpec. Only when `length > 0` (else the note has no vibrato).
-/// The vibrato covers the last `length%` of the note → its duration_ms = noteDurationMs*(length/100),
-/// startMs = noteDurationMs − vibDurMs. Everything is clamped to the same sane ranges the TS normalizeNote
-/// enforces (belt & braces — the TS side re-clamps anyway).
-fn map_vibrato(v: &UstxVibrato, note_dur_ticks: i64, bpm: f64) -> Option<ImportedVibrato> {
-    if !(v.length > 0.0) || !(v.period > 0.0) {
-        return None;
-    }
-    let bpm = if bpm.is_finite() && bpm > 0.0 { bpm } else { 120.0 };
-    // ms = ticks / 480 * 60000 / bpm
-    let note_ms = (note_dur_ticks as f64) / TICKS_PER_BEAT as f64 * 60_000.0 / bpm;
-    let vib_ms = note_ms * (v.length as f64 / 100.0);
-    if !(vib_ms > 0.0) {
-        return None;
-    }
-    let freq = 1000.0 / v.period as f64;
-    let start = (note_ms - vib_ms).max(0.0);
-    let ease_in = vib_ms * (v.fade_in as f64 / 100.0);
-    let ease_out = vib_ms * (v.out as f64 / 100.0);
-    let phase = (v.shift as f64 / 100.0).clamp(-1.0, 1.0);
-    Some(ImportedVibrato {
-        depth_cents: (v.depth as f64).clamp(0.0, 2400.0) as f32,
-        freq_hz: freq.clamp(0.1, 40.0) as f32,
-        phase: phase as f32,
-        start_ms: start.clamp(0.0, 60_000.0) as f32,
-        ease_in_ms: ease_in.clamp(0.0, 10_000.0) as f32,
-        ease_out_ms: ease_out.clamp(0.0, 10_000.0) as f32,
-    })
+    #[serde(default)]
+    drift: f32, // S73: 烤制路径消费(ou_pitch::OuVibrato.drift;VibratoSpec 映射已删)
 }
 
 /// Strip a leading UTF-8 BOM (OpenUTAU writes one) so the YAML parser sees a clean document.
@@ -358,21 +381,111 @@ fn parse_ustx(bytes: &[u8]) -> Result<ImportedScore, String> {
             .filter(|s| !s.trim().is_empty())
             .or_else(|| vp.name.clone().filter(|s| !s.trim().is_empty()))
             .unwrap_or_default(); // no track/part name → empty; the frontend names it by the file (+ index).
-        let notes: Vec<ImportedNote> = abs
+        // ── S73 全量音高线导入:OU 音符视图 → 未调教检测 → 烤制 pitchDev ──
+        // 重叠归一(审查):同 part 重叠音符裁到后继起点(镜像编辑器 resolveOverlaps 的
+        // 一位一音符语义,min 1 防零)——烤制平台基线与前端 findNoteAt 归属才一致。
+        // tuning 钳位单点(±1200 = TS DETUNE_CAP 镜像):烤制基线与 detune 必须同一个值,
+        // 各自钳会在病理大 tuning 下基线错位。
+        let clipped: Vec<(i64, i64, &UstxNote)> = abs
             .iter()
-            .map(|(t, n)| {
+            .enumerate()
+            .map(|(i, (t, n))| {
+                let mut dur = n.duration.max(1);
+                if let Some((next_t, _)) = abs.get(i + 1) {
+                    if *next_t > *t {
+                        dur = dur.min(next_t - t).max(1);
+                    } else {
+                        dur = 1; // 同 tick 重叠:保 1 tick(resolveOverlaps minTicks=1 同款)
+                    }
+                }
+                (*t, dur, *n)
+            })
+            .collect();
+        let tuning_of = |n: &UstxNote| -> f64 {
+            n.tuning
+                .map(|v| v as f64)
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(-1200.0, 1200.0))
+                .unwrap_or(0.0)
+        };
+        let ou_notes: Vec<super::ou_pitch::OuNote> = clipped
+            .iter()
+            .map(|(t, dur, n)| super::ou_pitch::OuNote {
+                abs_tick: *t,
+                duration: *dur,
+                tone: n.tone.clamp(0, 127),
+                tuning_cents: tuning_of(n),
+                pitch_points: n
+                    .pitch
+                    .as_ref()
+                    .map(|p| {
+                        p.data
+                            .iter()
+                            .filter(|pp| pp.x.is_finite() && pp.y.is_finite())
+                            .map(|pp| super::ou_pitch::OuPitchPoint {
+                                x_ms: pp.x as f64,
+                                y_tenths: pp.y as f64,
+                                shape: super::ou_pitch::OuShape::parse(pp.shape.as_deref()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                snap_first: n.pitch.as_ref().map(|p| p.snap_first).unwrap_or(true),
+                vibrato: n.vibrato.as_ref().map(|v| super::ou_pitch::OuVibrato {
+                    length: v.length as f64,
+                    period: v.period as f64,
+                    depth: v.depth as f64,
+                    fade_in: v.fade_in as f64,
+                    fade_out: v.out as f64,
+                    shift: v.shift as f64,
+                    drift: v.drift as f64,
+                }),
+            })
+            .collect();
+        let pitd = vp
+            .curves
+            .iter()
+            .find(|c| c.abbr == "pitd" && !c.xs.is_empty() && c.xs.len() == c.ys.len())
+            .map(|c| {
+                // 防御:binary_search 前提=xs 升序;OU 恒有序,乱序文件排一遍不冤枉
+                let mut pairs: Vec<(i64, i64)> =
+                    c.xs.iter().copied().zip(c.ys.iter().copied()).collect();
+                pairs.sort_by_key(|&(x, _)| x);
+                pairs.dedup_by_key(|p| p.0);
+                super::ou_pitch::OuPitd {
+                    xs: pairs.iter().map(|&(x, _)| x).collect(),
+                    ys: pairs.iter().map(|&(_, y)| y).collect(),
+                }
+            });
+        let (pitch_dev, pitch_dev_dropped) =
+            if super::ou_pitch::part_is_untuned(&ou_notes, pitd.as_ref()) {
+                (None, false) // 完全未调教(默认零点滑音)→ 智能跳过,走我们的 SynthV 默认
+            } else {
+                match super::ou_pitch::bake_pitch_dev(&ou_notes, pitd.as_ref(), vp.position, base, file_bpm) {
+                    super::ou_pitch::BakeOutcome::Baked { xs, ys } => (Some(ImportedCurve { xs, ys }), false),
+                    super::ou_pitch::BakeOutcome::NoDiff => (None, false),
+                    // 超上限:调教未导入,必须让前端提示(静默丢=与「未调教」不可区分,审查)
+                    super::ou_pitch::BakeOutcome::Overflow => (None, true),
+                }
+            };
+        let notes: Vec<ImportedNote> = clipped
+            .iter()
+            .map(|(t, dur, n)| {
                 let lyric = n.lyric.trim();
                 let lyric = if lyric.is_empty() { "あ".to_string() } else { lyric.to_string() };
                 ImportedNote {
                     tick: t - base,
-                    duration: n.duration.max(1),
+                    duration: *dur,
                     pitch: n.tone.clamp(0, 127),
                     lyric,
-                    vibrato: n.vibrato.as_ref().and_then(|v| map_vibrato(v, n.duration, file_bpm)),
+                    detune: {
+                        let tn = tuning_of(n);
+                        if tn != 0.0 { Some(tn as f32) } else { None }
+                    },
                 }
             })
             .collect();
-        tracks.push(ImportedTrack { name, start_tick: base, notes });
+        tracks.push(ImportedTrack { name, start_tick: base, notes, pitch_dev, pitch_dev_dropped });
     }
 
     Ok(ImportedScore { tracks, bpm, time_sig })
@@ -500,13 +613,13 @@ fn parse_midi(bytes: &[u8]) -> Result<ImportedScore, String> {
                     duration: (oe - os).max(1),
                     pitch: (*pitch).clamp(0, 127),
                     lyric: lyric.clone(),
-                    vibrato: None, // midi carries no vibrato spec
+                    detune: None,
                 }
             })
             .collect();
         // no MIDI TrackName → empty; the frontend names nameless tracks by the file (+ index if several).
         let name = track_name.filter(|s| !s.trim().is_empty()).unwrap_or_default();
-        tracks.push(ImportedTrack { name, start_tick: base_our, notes });
+        tracks.push(ImportedTrack { name, start_tick: base_our, notes, pitch_dev: None, pitch_dev_dropped: false });
     }
 
     Ok(ImportedScore { tracks, bpm: file_bpm, time_sig: file_ts })
@@ -571,7 +684,7 @@ Length=480
         assert_eq!(t.notes[2].tick, 720);
         assert_eq!(t.notes[2].duration, 480);
         assert_eq!(t.notes[2].pitch, 64);
-        assert!(t.notes.iter().all(|n| n.vibrato.is_none()));
+        assert!(t.pitch_dev.is_none()); // ust 无音高曲线通道
     }
 
     #[test]
@@ -589,9 +702,9 @@ Length=480
     }
 
     #[test]
-    fn ustx_position_and_tempo_preference_and_vibrato() {
+    fn ustx_position_and_tempo_preference_and_vibrato_bakes() {
         // tempos[0] (156) must win over the legacy top-level bpm (120). time_signatures[0] wins too.
-        // A note with vibrato length>0 maps to a VibratoSpec; length==0 → None.
+        // S73:带 vibrato 的 part = 已调教 → 整体烤入 pitchDev(不再映射 VibratoSpec)。
         let ustx = "\
 ustx_version: \"0.6\"
 resolution: 480
@@ -635,18 +748,103 @@ voice_parts:
         assert_eq!(t.notes[0].tick, 0);
         assert_eq!(t.notes[0].pitch, 65);
         assert_eq!(t.notes[1].tick, 480); // 680 - 200
-        // Vibrato mapping for note[0]: bpm 156, duration 480 ticks.
-        let v = t.notes[0].vibrato.as_ref().expect("vibrato present for length>0");
-        let note_ms = 480.0 / 480.0 * 60_000.0 / 156.0; // = 384.615...
-        let vib_ms = note_ms * 0.5;
-        assert!((v.depth_cents - 50.0).abs() < 1e-3);
-        assert!((v.freq_hz - 1000.0 / 200.0).abs() < 1e-3); // 5 Hz
-        assert!((v.start_ms - (note_ms - vib_ms) as f32).abs() < 1e-2);
-        assert!((v.ease_in_ms - (vib_ms * 0.10) as f32).abs() < 1e-2);
-        assert!((v.ease_out_ms - (vib_ms * 0.20) as f32).abs() < 1e-2);
-        assert_eq!(v.phase, 0.0);
-        // note[1] has length==0 → no vibrato.
-        assert!(t.notes[1].vibrato.is_none());
+        // vibrato(length 50, depth 50)= 调教痕迹 → 烤入曲线:后半段应出现 ±≈50¢ 摆动
+        let dev = t.pitch_dev.as_ref().expect("vibrato part must bake");
+        assert!(dev.xs.windows(2).all(|w| w[0] < w[1]), "xs 严格递增");
+        let max_abs = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (240..480).contains(&x)) // note0 后半 = 振音区
+            .map(|(_, &y)| y.abs())
+            .max()
+            .unwrap_or(0);
+        assert!((40..=60).contains(&max_abs), "烤入的颤音深度≈50¢,得 {max_abs}");
+    }
+
+    #[test]
+    fn ustx_untuned_part_skips_bake_and_tuning_maps_to_detune() {
+        // 完全未调教(默认零 y 点 + 无可闻 vibrato + 无 pitd)→ 智能跳过;tuning → detune 无损映射
+        let ustx = "\
+bpm: 120
+voice_parts:
+- name: P
+  position: 0
+  notes:
+  - position: 0
+    duration: 480
+    tone: 60
+    lyric: あ
+    tuning: 25
+    pitch:
+      data:
+      - {x: -40, y: 0, shape: io}
+      - {x: 40, y: 0, shape: io}
+      snap_first: true
+  - position: 480
+    duration: 480
+    tone: 64
+    lyric: い
+    pitch:
+      data:
+      - {x: -40, y: 0, shape: io}
+      - {x: 40, y: 0, shape: io}
+      snap_first: true
+";
+        let s = parse_ustx(ustx.as_bytes()).unwrap();
+        let t = &s.tracks[0];
+        assert!(t.pitch_dev.is_none(), "默认滑音形状不算调教");
+        assert_eq!(t.notes[0].detune, Some(25.0));
+        assert_eq!(t.notes[1].detune, None);
+    }
+
+    #[test]
+    fn ustx_hand_tuned_points_and_pitd_bake() {
+        // 手拖过的点(y≠0)+ pitd 手绘 → 烤入;曲线在 pitd 峰值处 ≈ 60¢(+点的贡献远处为 0)
+        let ustx = "\
+bpm: 120
+voice_parts:
+- name: P
+  position: 0
+  notes:
+  - position: 0
+    duration: 960
+    tone: 60
+    lyric: あ
+    pitch:
+      data:
+      - {x: 0, y: 0, shape: io}
+      - {x: 50, y: -8, shape: io}
+      - {x: 120, y: 0, shape: io}
+      snap_first: false
+  curves:
+  - xs: [600, 700, 800]
+    ys: [0, 60, 0]
+    abbr: pitd
+";
+        let s = parse_ustx(ustx.as_bytes()).unwrap();
+        let t = &s.tracks[0];
+        let dev = t.pitch_dev.as_ref().expect("nonzero point y / pitd must bake");
+        // pitd 峰值(t=700,远离音高点影响区 ≤120ms≈96t)
+        let near_peak = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (680..=720).contains(&x))
+            .map(|(_, &y)| y)
+            .max()
+            .unwrap_or(0);
+        assert!((55..=62).contains(&near_peak), "pitd 峰值≈60¢,得 {near_peak}");
+        // 音高点区:y=-8 tenths = −80¢ 谷(x=50ms@120bpm=40t 附近)
+        let near_dip = dev
+            .xs
+            .iter()
+            .zip(dev.ys.iter())
+            .filter(|(&x, _)| (20..=70).contains(&x))
+            .map(|(_, &y)| y)
+            .min()
+            .unwrap_or(0);
+        assert!((-85..=-60).contains(&near_dip), "点谷≈−80¢,得 {near_dip}");
     }
 
     #[test]
@@ -778,10 +976,10 @@ voice_parts:
             assert!(!score.tracks.is_empty(), "{label}: no tracks");
             for (i, t) in score.tracks.iter().enumerate() {
                 let last_end = t.notes.iter().map(|n| n.tick + n.duration).max().unwrap_or(0);
-                let vib = t.notes.iter().filter(|n| n.vibrato.is_some()).count();
+                let dev_pts = t.pitch_dev.as_ref().map(|c| c.xs.len()).unwrap_or(0);
                 eprintln!(
-                    "[import]   track[{i}] name={:?} start_tick={} notes={} first_tick={} last_end={} vibrato_notes={}",
-                    t.name, t.start_tick, t.notes.len(), t.notes.first().map(|n| n.tick).unwrap_or(-1), last_end, vib,
+                    "[import]   track[{i}] name={:?} start_tick={} notes={} first_tick={} last_end={} baked_dev_pts={}",
+                    t.name, t.start_tick, t.notes.len(), t.notes.first().map(|n| n.tick).unwrap_or(-1), last_end, dev_pts,
                 );
                 assert!(!t.notes.is_empty(), "{label} track[{i}]: no notes");
                 // Rebase invariant: the first note (tick order) is at tick 0.

@@ -4,6 +4,7 @@ pub mod audition;
 pub mod export_audio;
 pub mod export_score;
 pub mod import;
+pub mod ou_pitch;
 pub mod inference;
 pub mod logs;
 pub mod midi_extract;

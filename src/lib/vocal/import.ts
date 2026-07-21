@@ -9,7 +9,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "../../i18n";
-import type { Note, VibratoSpec } from "../../types/project";
+import type { Note } from "../../types/project";
+import { ZERO_TRANSITION } from "../vocalNotes";
 import { blankTrack } from "../trackFactory";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
@@ -19,8 +20,7 @@ import { TICKS_PER_BEAT, SCORE_EXTENSIONS } from "../constants";
 
 const t = (k: string) => i18n.t(k);
 
-// ── Rust contract (see ImportedScore in import.rs). Outer fields are snake_case (serde default);
-//    ImportedVibrato is camelCase → maps 1:1 onto VibratoSpec. ──
+// ── Rust contract (see ImportedScore in import.rs). Fields are snake_case (serde default). ──
 interface ImportedScore {
   tracks: ImportedTrack[];
   bpm: number | null;
@@ -30,13 +30,19 @@ interface ImportedTrack {
   name: string;
   start_tick: number;
   notes: ImportedNote[];
+  /** S73 烤入的 OU 音高曲线(segment 相对 tick / 整数 cents)。非空 = BAKED part:音符要置零
+   *  transition(否则我们的默认滑音与曲线里的 OU 滑音双重叠加)。null = 未调教(智能跳过)/非 ustx。 */
+  pitch_dev: { xs: number[]; ys: number[] } | null;
+  /** part 有调教但超出可烤上限被放弃 → 须提示用户(绝不静默当未调教)。 */
+  pitch_dev_dropped: boolean;
 }
 interface ImportedNote {
   tick: number;
   duration: number;
   pitch: number;
   lyric: string;
-  vibrato: VibratoSpec | null; // camelCase from Rust == VibratoSpec shape exactly
+  /** ustx tuning(cents)→ Note.detune(无损旋钮映射)。 */
+  detune: number | null;
 }
 
 // Single in-flight guard: the import opens a native dialog + mutates the document; a second invocation
@@ -118,6 +124,10 @@ export async function importScoreFile(): Promise<void> {
         const durationTicks = lastEnd > 0 ? lastEnd : TICKS_PER_BEAT;
         const segId = store.createVocalPart(trackId, it.start_tick, durationTicks);
 
+        // S73:BAKED part(带烤入曲线)的音符显式置零 transition = 纯阶梯——OU 的滑音/颤音/手绘
+        // 全在 pitchDev 曲线里,我们的默认滑音再叠加=双重;零 transition 也让这些音符被
+        // 自动调教的所有权谓词识别为「用户调教过」(导入的调教=用户资产,autoTune 绕行)。
+        const baked = !!it.pitch_dev && it.pitch_dev.xs.length > 0;
         const notes: Note[] = it.notes.map((n) => ({
           id: crypto.randomUUID(),
           tick: n.tick,
@@ -125,9 +135,14 @@ export async function importScoreFile(): Promise<void> {
           pitch: n.pitch,
           lyric: n.lyric,
           velocity: 100,
-          ...(n.vibrato ? { vibrato: n.vibrato } : {}),
+          ...(n.detune != null && n.detune !== 0 ? { detune: n.detune } : {}),
+          ...(baked ? { transition: { ...ZERO_TRANSITION } } : {}),
         }));
         store.applyNoteEdits(trackId, segId, { add: notes });
+        if (baked && it.pitch_dev) {
+          // 走 normalizeCurve 漏斗(整数 cents/排序/去重);同一事务 = 同一步 undo
+          store.setSegmentPitchDev(trackId, segId, { xs: it.pitch_dev.xs, ys: it.pitch_dev.ys });
+        }
       }
     } finally {
       history.commitTransaction();
@@ -136,6 +151,10 @@ export async function importScoreFile(): Promise<void> {
     // Import is a milestone — snapshot to disk NOW so a fast reload doesn't lose it to the autosave debounce.
     flushAutosaveNow();
     useAppStore.getState().showBanner(`${t("import.done")} · ${score.tracks.length}`, "load");
+    // S73:某 part 的调教超出可烤上限被放弃 → 响亮告知(音符已导入,音高线没有)。
+    if (score.tracks.some((tk) => tk.pitch_dev_dropped)) {
+      useAppStore.getState().showToast(t("import.pitchDropped"), "error");
+    }
   } catch (e) {
     useAppStore.getState().showToast(mapImportError(e instanceof Error ? e.message : String(e)), "error");
   } finally {

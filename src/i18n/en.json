@@ -91,6 +91,7 @@
   },
   "import": {
     "done": "Imported",
+    "pitchDropped": "One track's pitch tuning exceeded the import limit and was imported untuned (notes are intact)",
     "error": {
       "empty": "No importable notes found",
       "unsupported": "Unsupported file format (only ustx / ust / mid / midi)",

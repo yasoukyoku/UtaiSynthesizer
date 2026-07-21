@@ -33,8 +33,16 @@ export function evalCurveAt(c: PitchCurve | undefined, x: number): number {
   const n = xs.length;
   if (x <= xs[0]!) return ys[0]!;
   if (x >= xs[n - 1]!) return ys[n - 1]!;
-  let i = 0;
-  while (i < n - 1 && xs[i + 1]! <= x) i++;
+  // 二分找 i:xs[i] ≤ x < xs[i+1](xs 严格递增 = normalizeCurve 漏斗/Rust 烤制双保证)。
+  // S73:导入烤入的曲线可达数万点,线性扫描在 overlay/渲染热路径上不可接受(审查实测 88×)。
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid]! <= x) lo = mid;
+    else hi = mid;
+  }
+  const i = lo;
   const span = xs[i + 1]! - xs[i]!;
   const t = span > 0 ? (x - xs[i]!) / span : 0;
   return ys[i]! + (ys[i + 1]! - ys[i]!) * t;
