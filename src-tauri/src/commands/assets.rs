@@ -35,6 +35,14 @@ struct AssetFile {
 struct AssetPack {
     id: &'static str,
     files: &'static [AssetFile],
+    /// SPDX-ish license id when the pack's weights carry terms of their own (S75: the
+    /// NSF-HiFiGAN finetune base is CC BY-NC-SA 4.0). `None` = nothing extra to surface.
+    /// Data, not copy — the UI decides how to render it; nothing here is user-facing prose.
+    license: Option<&'static str>,
+    /// The ORIGINAL upstream release page. We mirror those weights, we do not own them:
+    /// the attribution link must stay reachable from the UI, and it doubles as the offline
+    /// escape hatch when neither HF host answers.
+    upstream: Option<&'static str>,
 }
 
 // ─── catalog (sizes + sha256 computed from the dev-machine originals at upload time, S64) ───
@@ -107,16 +115,57 @@ const AUTOTUNE_FILES: &[AssetFile] = &[
     AssetFile { rel: "auxiliary/autotune_a1.json", size: 892, sha256: "f807abfc94eaa8836034fad0046608b647af3286bce452d9778caedc2f96c49e" },
 ];
 
-const PACKS: &[AssetPack] = &[
-    AssetPack { id: "aux-inference", files: AUX_FILES },
-    AssetPack { id: "aux-autotune", files: AUTOTUNE_FILES },
-    AssetPack { id: "training-rvc", files: RVC_TRAIN_FILES },
-    AssetPack { id: "training-sovits", files: SOVITS_TRAIN_FILES },
-    AssetPack { id: "training-sovits-v2", files: SOVITS_V2_TRAIN_FILES },
+// S75 声码器微调底模。★这是 app 里唯一带自有许可条款的资产包 —— 见 license/upstream 字段。
+//
+// 立场（用户 2026-07-23 定案，与 GAME 引擎同构 [[reference_game_engine]]）：权重 CC BY-NC-SA 4.0
+// **绝不进 installer bundle**，我们只做「镜像 + 下载器」。CC BY-NC-SA 允许再分发，义务是署名 /
+// 非商用 / 相同方式共享 —— 三条我们都履行：NOTICE 双语随权重同包下载（不是可选项，别为了省
+// 7KB 把它们摘出去），UI 打许可徽章 + 上游链接，微调产物继承 NC 的提示留在参数页。
+//
+// 血统实证（S75 现场核验，别再重推）：上游 release 只有一个 zip
+// github.com/openvpi/SingingVocoders/releases/download/v0.0.2/nsf_hifigan_44.1k_hop512_128bin_2024.02.zip
+// (377,707,972 B)，内含这三个文件，**内部 ckpt 文件名与我们期望的一字不差**（曾怀疑是 `..._train.ckpt`
+// —— 读 zip 中央目录证伪了）。dev 机这三份与 release 内容 **CRC32 + 大小逐字节同一**
+// (ckpt crc32=0x3ec4e407 / zh NOTICE 0xb3004cf3 / NOTICE 0x34c73950)，故直接以它们为镜像原件。
+//
+// ⚠️ 这份 ckpt ≠ 推理用的「默认声码器」(auxiliary/nsf_hifigan.onnx)：后者 56.8MB、**只有
+// generator**、且是 2022.12 代；微调要的是 2024.02 代的 lightning 训练档（generator.* 457 键 +
+// discriminator.* 299 键）。两者格式类相同但不可互换 —— 别再想着「复用已分发的那个」。
+const VOCODER_TRAIN_FILES: &[AssetFile] = &[
+    AssetFile { rel: "training/vocoder/nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt", size: 405_661_921, sha256: "5f4b4eb097b6e8126ada72651e32986908903b2780b478e3dfd05a5615f57fe2" },
+    AssetFile { rel: "training/vocoder/NOTICE.txt", size: 3_725, sha256: "31005a94c1e591d3a09dd0702bc21082b2aaa2f36d3689fe248a651cdd83ebf6" },
+    AssetFile { rel: "training/vocoder/NOTICE.zh-CN.txt", size: 3_653, sha256: "f62af3088f53d928db85092959b7b4dfe822ee1f63f3abb7c0f65e49a0c5b2b7" },
 ];
 
+const PACKS: &[AssetPack] = &[
+    AssetPack { id: "aux-inference", files: AUX_FILES, license: None, upstream: None },
+    AssetPack { id: "aux-autotune", files: AUTOTUNE_FILES, license: None, upstream: None },
+    AssetPack { id: "training-rvc", files: RVC_TRAIN_FILES, license: None, upstream: None },
+    AssetPack { id: "training-sovits", files: SOVITS_TRAIN_FILES, license: None, upstream: None },
+    AssetPack { id: "training-sovits-v2", files: SOVITS_V2_TRAIN_FILES, license: None, upstream: None },
+    AssetPack {
+        id: "training-vocoder",
+        files: VOCODER_TRAIN_FILES,
+        license: Some("CC BY-NC-SA 4.0"),
+        upstream: Some("https://github.com/openvpi/SingingVocoders/releases/tag/v0.0.2"),
+    },
+];
+
+/// License + upstream of the pack distributing `rel` — the missing-asset dialog needs both so a
+/// license-bound download can never be offered as if it were just another silent fetch.
+/// Same table as `pack_for_rel` on purpose: one catalog, no second mapping to drift.
+pub(crate) fn pack_terms_for_rel(rel: &str) -> (Option<&'static str>, Option<&'static str>) {
+    PACKS
+        .iter()
+        .find(|p| p.files.iter().any(|f| f.rel == rel))
+        .map(|p| (p.license, p.upstream))
+        .unwrap_or((None, None))
+}
+
 /// Which asset pack distributes the file at `rel` (forward-slash path under `<data>/models/`),
-/// None = not pack-distributed (e.g. the CC BY-NC-SA vocoder base = user self-download).
+/// None = no catalog entry for this rel. As of S75 every asset `resolve_training_assets` can
+/// demand is pack-distributed — the CC BY-NC-SA vocoder base was the last self-download holdout
+/// and now rides `training-vocoder`, so a None here means a typo'd rel, not a manual asset.
 /// S66: the "missing base model → one-click download" dialog maps files to packs through
 /// THIS table so the mapping can never drift from what download_asset_pack actually fetches.
 pub(crate) fn pack_for_rel(rel: &str) -> Option<&'static str> {
@@ -160,6 +209,10 @@ pub struct AssetPackStatus {
     pub total_bytes: u64,
     pub missing_bytes: u64,
     pub downloading: bool,
+    /// S75: license id when the pack's weights carry their own terms (rendered as a badge +
+    /// upstream link). None for everything we can hand out without conditions.
+    pub license: Option<String>,
+    pub upstream: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -193,6 +246,8 @@ pub fn asset_pack_status(state: State<'_, Arc<AppState>>) -> Vec<AssetPackStatus
                 total_bytes: p.files.iter().map(|f| f.size).sum(),
                 missing_bytes: missing.iter().map(|f| f.size).sum(),
                 downloading: active.as_deref() == Some(p.id),
+                license: p.license.map(str::to_string),
+                upstream: p.upstream.map(str::to_string),
             }
         })
         .collect()
@@ -419,5 +474,79 @@ pub async fn download_asset_pack(
 pub fn cancel_asset_pack_download() {
     if let Some(c) = ASSET_DL_CANCEL.lock().as_ref() {
         c.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `rel` in two packs makes `pack_for_rel` answer arbitrarily and lets `delete_asset_pack`
+    /// of one pack silently gut another. Nothing else enforces uniqueness — the catalog is a
+    /// hand-written table.
+    #[test]
+    fn catalog_rels_are_unique_across_packs() {
+        let mut seen = std::collections::HashSet::new();
+        for p in PACKS {
+            for f in p.files {
+                assert!(seen.insert(f.rel), "duplicate rel across packs: {}", f.rel);
+            }
+        }
+    }
+
+    /// A typo'd or truncated hash is invisible until a user has downloaded the whole file and
+    /// watched it fail verification — for the vocoder base that is 405 MB of wasted transfer.
+    #[test]
+    fn catalog_hashes_are_well_formed() {
+        for p in PACKS {
+            for f in p.files {
+                assert_eq!(f.sha256.len(), 64, "sha256 not 64 chars: {}", f.rel);
+                assert!(
+                    f.sha256.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "sha256 not lowercase hex: {}",
+                    f.rel
+                );
+                assert!(f.size > 0, "zero size: {}", f.rel);
+                assert!(!f.rel.starts_with('/') && !f.rel.contains(".."), "unsafe rel: {}", f.rel);
+            }
+        }
+    }
+
+    /// Mirroring someone else's weights is only lawful WITH the attribution link. Declaring a
+    /// license and dropping the upstream would leave the UI showing terms it can't point anywhere.
+    #[test]
+    fn licensed_packs_carry_their_upstream() {
+        for p in PACKS {
+            if p.license.is_some() {
+                assert!(p.upstream.is_some(), "licensed pack without upstream: {}", p.id);
+            }
+        }
+    }
+
+    /// S75 compliance pin: the vocoder base is CC BY-NC-SA and its NOTICE files must ship WITH the
+    /// weights (attribution travels with the artifact — dropping them to "save 7 KB" breaks the
+    /// license, and nothing at runtime would notice).
+    #[test]
+    fn vocoder_pack_is_licensed_and_ships_its_notices() {
+        let p = PACKS.iter().find(|p| p.id == "training-vocoder").expect("training-vocoder pack");
+        assert_eq!(p.license, Some("CC BY-NC-SA 4.0"));
+        assert!(p.upstream.is_some_and(|u| u.contains("SingingVocoders")));
+        for want in ["training/vocoder/NOTICE.txt", "training/vocoder/NOTICE.zh-CN.txt"] {
+            assert!(p.files.iter().any(|f| f.rel == want), "missing {want}");
+        }
+    }
+
+    /// `pack_for_rel` and `pack_terms_for_rel` read the same table on purpose — pin that they
+    /// stay one lookup, so a file can never be offered for download without its terms.
+    #[test]
+    fn pack_lookup_and_terms_agree() {
+        for p in PACKS {
+            for f in p.files {
+                assert_eq!(pack_for_rel(f.rel), Some(p.id), "{}", f.rel);
+                assert_eq!(pack_terms_for_rel(f.rel), (p.license, p.upstream), "{}", f.rel);
+            }
+        }
+        assert_eq!(pack_for_rel("nope/not/here"), None);
+        assert_eq!(pack_terms_for_rel("nope/not/here"), (None, None));
     }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { useTranslation } from "react-i18next";
@@ -186,6 +187,9 @@ interface AssetPackStatus {
   totalBytes: number;
   missingBytes: number;
   downloading: boolean;
+  /** S75: license id when the pack's weights carry their own terms; null = unconditional. */
+  license: string | null;
+  upstream: string | null;
 }
 interface AssetPackProgress {
   pack: string;
@@ -991,6 +995,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
       assetRvc: { zh: "RVC 训练底模", en: "RVC training base models", ja: "RVC 学習ベースモデル" },
       assetSovits: { zh: "SoVITS 训练底模", en: "SoVITS training base models", ja: "SoVITS 学習ベースモデル" },
       assetSovitsV2: { zh: "SoVITS 4.0-v2 训练底模", en: "SoVITS 4.0-v2 training base models", ja: "SoVITS 4.0-v2 学習ベースモデル" },
+      assetVocoder: { zh: "声码器微调底模", en: "Vocoder finetune base model", ja: "ボコーダー微調整ベースモデル" },
+      assetLicenseTip: { zh: "该权重按此许可分发，不随软件本体打包；点击打开上游发布页与署名信息。", en: "These weights are distributed under this license and are not bundled with the app; click to open the upstream release page and attribution.", ja: "この重みは当該ライセンスで配布され、アプリ本体には同梱されません。クリックで配布元のリリースページと帰属表示を開きます。" },
+      // Keep these SHORT: the line ellipsizes at ~204px in the 340px default panel (measured).
+      assetLicenseHint: { zh: "不随软件本体分发 · 点击查看署名", en: "Not bundled · click for attribution", ja: "本体には非同梱 · クリックで帰属表示" },
       assetInstalled: { zh: "已安装", en: "Installed", ja: "インストール済み" },
       assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
       assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
@@ -1671,12 +1679,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     ? L("assetRvc")
                     : p.id === "training-sovits-v2"
                       ? L("assetSovitsV2")
-                      : L("assetSovits");
+                      : p.id === "training-vocoder"
+                        ? L("assetVocoder")
+                        : L("assetSovits");
             // p.downloading = backend truth (survives a panel remount before the next chunk event).
             const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
             const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);
             return (
-              <div key={p.id} className="settings-row settings-asset-row">
+              <div key={p.id} className="settings-asset-pack">
+              <div className="settings-row settings-asset-row">
                 <span className="settings-label">{label}</span>
                 <div className="settings-asset-actions">
                 <span className={`settings-badge ${p.missing === 0 ? "ok" : "no"}`}>
@@ -1712,6 +1723,24 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 )}
                 </div>
                 </div>
+              </div>
+              {/* S75: a pack whose weights carry their own terms says so, and the whole line IS the
+                  attribution link — we mirror those weights, we don't own them. It gets its OWN row
+                  rather than a fourth chip inside the row above: that row's actions group is
+                  `flex: 0 0 auto`, so anything added there is paid for out of the label, which has
+                  no ellipsis (the review measured the label collapsing to ~9px, per-character
+                  wrapping in zh/ja and overflowing into a horizontal scrollbar in en). */}
+              {p.license && (
+                <button
+                  className="settings-asset-license"
+                  title={L("assetLicenseTip")}
+                  disabled={!p.upstream}
+                  onClick={() => { if (p.upstream) void openUrl(p.upstream).catch(() => {}); }}
+                >
+                  <span className="settings-badge license">{p.license}</span>
+                  <span className="settings-asset-license-text">{L("assetLicenseHint")}</span>
+                </button>
+              )}
               </div>
             );
           })}

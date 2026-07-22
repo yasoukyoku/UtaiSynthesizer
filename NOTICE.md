@@ -35,14 +35,26 @@ It contains code ported from, or written with reference to, the following projec
 - **ContentVec** (auspicious3000, MIT) and **RMVPE** — feature-extraction / pitch models exported
   to ONNX for the in-app downloader.
 
-## Model weights (downloaded by the user, NOT bundled)
+## Model weights (downloaded on demand, NEVER bundled)
 
-- **NSF-HiFiGAN** vocoder weights (OpenVPI) — CC BY-NC-SA 4.0. Never bundled; the original
-  NOTICE.txt / NOTICE.zh-CN.txt accompany the files wherever the app uses them.
-- **GAME** vocal-to-MIDI weights — CC BY-NC-SA. Never bundled; downloaded from the original
-  release with the license shown at download time.
+No model weights ship inside the installer. The app downloads them on demand, and weights that
+carry terms of their own are shown with those terms before the download starts.
+
+- **NSF-HiFiGAN** vocoder weights (OpenVPI) — CC BY-NC-SA 4.0. Two distinct artifacts: the
+  inference vocoder (an ONNX export derived from those weights, part of the core inference pack)
+  and the fine-tuning base checkpoint (its own `training-vocoder` pack). The original
+  NOTICE.txt / NOTICE.zh-CN.txt are downloaded together with the weights and stay beside them on
+  disk. A vocoder fine-tuned from the base inherits the same license (non-commercial).
+- **GAME** vocal-to-MIDI weights — CC BY-NC-SA. Primary source is the upstream release; the
+  license is shown at download time.
 - Separation / voice model weights fetched through the in-app downloaders keep their upstream
-  licenses; the app stores them locally for the user and does not redistribute them.
+  licenses and come from their original distribution points.
+
+Where this project mirrors third-party weights for availability (currently the CC BY-NC-SA sets
+above, hosted at `huggingface.co/datasets/yasoukyoku/utai-runtimes`), it does so as those licenses
+permit — attribution preserved, same terms, non-commercial — and the mirroring conveys no
+additional rights. The app's own source license (see LICENSE) covers the application code only,
+never the third-party weights it fetches.
 
 ## Bundled runtime redistributables
 

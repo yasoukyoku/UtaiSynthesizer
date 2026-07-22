@@ -71,7 +71,12 @@ pub struct RequiredAssetStatus {
     /// Asset-pack id covering this file (drives the one-click download button); None = not
     /// pack-distributed.
     pub pack: Option<String>,
-    /// Manual-download page for license-bound assets (the CC BY-NC-SA vocoder base ckpt).
+    /// S75: license id when this file's pack carries its own terms (CC BY-NC-SA for the vocoder
+    /// base). Present ⇒ the download dialog MUST say so before fetching — we mirror those
+    /// weights, we don't own them.
+    pub license: Option<String>,
+    /// Upstream release page. Was "you must download this yourself" (pre-S75); now it is the
+    /// attribution link + the offline escape hatch when no HF host answers.
     pub self_url: Option<String>,
 }
 
@@ -100,15 +105,21 @@ pub fn training_required_assets(
                 .as_deref()
                 .and_then(crate::commands::assets::pack_for_rel)
                 .map(|s| s.to_string());
-            let self_url = (pack.is_none()
-                && rel.as_deref().is_some_and(|r| r.starts_with("training/vocoder/")))
-            .then(|| "https://github.com/openvpi/SingingVocoders/releases/tag/v0.0.2".to_string());
+            // S75: license + upstream come from the SAME catalog entry as `pack` (assets.rs), so a
+            // license-bound file can never be offered for one-click download without its terms.
+            // Pre-S75 this was a hardcoded "training/vocoder/ ⇒ self-download URL" special case
+            // living here, one table away from the catalog it described.
+            let (license, upstream) = rel
+                .as_deref()
+                .map(crate::commands::assets::pack_terms_for_rel)
+                .unwrap_or((None, None));
             RequiredAssetStatus {
                 label,
                 path: p.to_string_lossy().to_string(),
                 exists: p.is_file(),
                 pack,
-                self_url,
+                license: license.map(str::to_string),
+                self_url: upstream.map(str::to_string),
             }
         })
         .collect())

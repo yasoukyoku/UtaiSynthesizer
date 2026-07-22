@@ -188,22 +188,20 @@ pub fn resolve_training_assets(
         "vocoder" => {
             // NSF-HiFiGAN finetune (S40): the ONLY asset is the classic
             // 2024.02 community base checkpoint (lightning format, G+D).
-            // CC BY-NC-SA weights — never bundled, the user downloads it;
-            // the label doubles as the download guidance in the missing-
-            // file error. ContentVec/RMVPE/configs/mute are NOT used by
-            // this pipeline (设计红队 A17: required 收敛进各臂).
+            // CC BY-NC-SA weights — never bundled, but S75 made them
+            // pack-distributed (`training-vocoder`, mirrored + license-badged;
+            // the label no longer has to carry download instructions).
+            // ⚠️ NOT interchangeable with the aux default vocoder onnx: that
+            // one is generator-only and a whole release older (2022.12).
+            // ContentVec/RMVPE/configs/mute are NOT used by this pipeline
+            // (设计红队 A17: required 收敛进各臂).
             vocoder_pretrain = data_dir
                 .join("models")
                 .join("training")
                 .join("vocoder")
                 .join("nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt");
             required.push((
-                "vocoder finetune base ckpt (download \
-                 nsf_hifigan_44.1k_hop512_128bin_2024.02.zip from \
-                 github.com/openvpi/SingingVocoders releases v0.0.2 and extract the \
-                 .ckpt; weights are CC BY-NC-SA 4.0 — finetuned outputs inherit the \
-                 license)"
-                    .into(),
+                "vocoder finetune base ckpt (NSF-HiFiGAN 2024.02, CC BY-NC-SA 4.0)".into(),
                 vocoder_pretrain.clone(),
             ));
         }

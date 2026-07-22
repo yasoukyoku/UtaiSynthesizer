@@ -92,6 +92,9 @@
   font-weight: 600;
   padding: 1px 6px;
   border: 1px solid;
+  /* a badge is a chip: it never wraps and never absorbs a flex shortage (global.css .ver-badge
+     has said so all along; the asset rows learned it the hard way in S75) */
+  white-space: nowrap;
 }
 
 .settings-badge.ok {
@@ -100,6 +103,56 @@
 }
 
 .settings-badge.no {
+  color: var(--text-muted);
+  border-color: var(--border-subtle);
+}
+
+/* S75 — license line. The one pack whose weights carry their own terms (CC BY-NC-SA vocoder base)
+   states them on a row of ITS OWN, under the pack row. It deliberately does NOT live inside that
+   row: `.settings-asset-actions` is `flex: 0 0 auto`, so a fourth chip there is paid for out of
+   `.settings-asset-row > .settings-label`, which has no ellipsis and collapses to per-character
+   wrapping (adversarial review measured ~9px labels in zh/ja and en overflowing into a horizontal
+   scrollbar at the default 340px panel width). The whole line is the attribution link — the credit
+   stays one click from the thing it applies to. */
+.settings-asset-pack {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.settings-asset-license {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+}
+.settings-asset-license:disabled {
+  cursor: default;
+}
+.settings-asset-license-text {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings-asset-license:hover:not(:disabled) .settings-asset-license-text {
+  color: var(--text-secondary);
+}
+.settings-badge.license {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary-dim);
+  flex-shrink: 0;
+}
+.settings-asset-license:hover:not(:disabled) .settings-badge.license {
+  background: var(--accent-primary-glow);
+}
+.settings-asset-license:disabled .settings-badge.license {
   color: var(--text-muted);
   border-color: var(--border-subtle);
 }

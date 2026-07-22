@@ -14,7 +14,7 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import i18n from "../i18n";
 import { backendErrorMessage, isBusyError } from "../lib/backendError";
 import { hfBaseForMirror } from "../lib/models/msst-catalog";
-import { useAppStore } from "./app";
+import { useAppStore, type ConfirmButton } from "./app";
 import { useMsstModelStore } from "./msst-models";
 
 /** Mirror of Rust `commands::training::RequiredAssetStatus` (S66 pre-start asset check). */
@@ -23,6 +23,9 @@ interface RequiredAssetStatus {
   path: string;
   exists: boolean;
   pack: string | null;
+  /** S75: license id when this file's pack carries its own terms (CC BY-NC-SA vocoder base). */
+  license: string | null;
+  /** Upstream release page (attribution link + offline escape hatch). */
   selfUrl: string | null;
 }
 
@@ -540,21 +543,33 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       const assets = await invoke<RequiredAssetStatus[]>("training_required_assets", assetParams);
       const missing = assets.filter((a) => !a.exists);
       if (missing.length > 0) {
-        // Split by acquisition channel (review S66): the one-click pack download must list ONLY
-        // the files it will actually fetch — the license-bound vocoder ckpt gets its own dialog.
+        // S75: ONE dialog. The S66 split existed because the license-bound vocoder ckpt was the one
+        // asset the download button could NOT fetch — now it is mirrored like everything else, so
+        // the split has nothing left to separate. What survives from that review is the real
+        // obligation: state the terms BEFORE fetching (license line + upstream link below).
         const packItems = missing.filter((a) => a.pack);
-        const selfItem = missing.find((a) => a.selfUrl) ?? null;
         if (packItems.length > 0) {
           const packs = [...new Set(packItems.map((a) => a.pack as string))];
           const files = packItems.map((a) => `· ${a.path}`).join("\n");
+          // A licensed pack also carries its NOTICE files (attribution travels WITH the weights),
+          // so the download may write MORE files than this list — never fewer.
+          const licenses = [
+            ...new Set(packItems.map((a) => a.license).filter((l): l is string => !!l)),
+          ];
+          const upstream = packItems.find((a) => a.selfUrl)?.selfUrl ?? null;
+          const buttons: ConfirmButton[] = [{ id: "cancel", label: i18n.t("common.cancel") }];
+          if (upstream) buttons.push({ id: "open", label: i18n.t("training.assetsUpstream") });
+          buttons.push({ id: "dl", label: i18n.t("training.assetsMissingDl"), kind: "primary" });
           const c = await useAppStore.getState().showConfirm({
             title: i18n.t("training.assetsMissingTitle"),
-            body: `${i18n.t("training.assetsMissingBody")}\n${files}`,
-            buttons: [
-              { id: "cancel", label: i18n.t("common.cancel") },
-              { id: "dl", label: i18n.t("training.assetsMissingDl"), kind: "primary" },
-            ],
+            body:
+              `${i18n.t("training.assetsMissingBody")}\n${files}` +
+              (licenses.length > 0
+                ? `\n\n${i18n.t("training.assetsLicenseNote", { license: licenses.join(" / ") })}`
+                : ""),
+            buttons,
           });
+          if (c === "open" && upstream) void openUrl(upstream).catch(() => {});
           if (c === "dl") {
             if (!useAppStore.getState().settingsOpen) useAppStore.getState().toggleSettings();
             const hfBase = hfBaseForMirror(useMsstModelStore.getState().mirror);
@@ -570,22 +585,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               }
             })();
           }
+          return;
         }
-        if (selfItem?.selfUrl) {
-          // License-bound asset (vocoder base, CC BY-NC-SA): we may not distribute it — dialog
-          // explains, offers the release page, and shows the exact landing path.
-          const c = await useAppStore.getState().showConfirm({
-            title: i18n.t("training.vocoderBaseTitle"),
-            body: i18n.t("training.vocoderBaseBody", { path: selfItem.path }),
-            buttons: [
-              { id: "cancel", label: i18n.t("common.cancel") },
-              { id: "open", label: i18n.t("training.vocoderBaseOpen"), kind: "primary" },
-            ],
-          });
-          if (c === "open") void openUrl(selfItem.selfUrl).catch(() => {});
-        }
-        if (packItems.length > 0 || selfItem) return;
-        // missing but neither pack nor self-url (unexpected) → fall through; try_start errors loudly.
+        // missing but not pack-distributed (unexpected) → fall through; try_start errors loudly.
       }
     } catch {
       /* pre-flight unavailable → fall through; start_training's own gate still rejects loudly */

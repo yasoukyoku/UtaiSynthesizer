@@ -101,7 +101,7 @@ Vocal-track synthesis, AI covers and pitch extraction all depend on a set of sha
 
 > Caution: without this pack, rendering vocals or running a cover workflow fails with errors like "Auxiliary file missing — place it into the indicated directory". An interrupted download is fine — clicking "Download" again resumes from where it stopped, and already-downloaded files are never fetched twice.
 
-The same section also offers two more packs, "RVC training base models" and "SoVITS training base models" — you only need those if you plan to train your own models (see [Chapter 8](#8-training)).
+The same section also offers several on-demand packs: "Auto pitch tuning model" (for automatic pitch tuning) plus four training-base packs — "RVC training base models", "SoVITS training base models", "SoVITS 4.0-v2 training base models" and "Vocoder finetune base model". You only need them if you use the matching feature (training: see [Chapter 8](#8-training)).
 
 ### 2.4 GPUs and the inference device
 
@@ -858,9 +858,9 @@ Click the "Training" button at the title bar's right to enter the full-screen tr
 ### 8.1 Prerequisites
 
 1. **A training runtime**: training runs in an embedded Python environment, so first download a runtime pack under "Settings" → "Training Runtime (embedded Python)" — pick by GPU: NVIDIA (RTX 20 series and up) / AMD (experimental) / Intel (experimental), or the universal CPU pack. Clicking "Start training" without one shows the "Training Runtime Not Installed" dialog — click "Open Settings" and install as instructed. Details in 9.8.
-2. **Training base models**: under "Settings" → "Model Assets", download "RVC training base models" or "SoVITS training base models" (whichever family you train). Starting a run with bases missing errors and names the missing file.
+2. **Training base models**: under "Settings" → "Model Assets", download the matching pack — "RVC training base models", "SoVITS training base models", "SoVITS 4.0-v2 training base models" or "Vocoder finetune base model" (whichever family you train). If bases are missing, "Start training" first opens a dialog listing the missing files with a "Download now" button; no manual hunting.
 
-> Caution: the vocoder fine-tune's base model must be downloaded manually for license reasons (CC BY-NC-SA 4.0); the error message provides the URL and target path. Fine-tuned results inherit the same license (non-commercial).
+> Caution: the vocoder fine-tune's base weights are licensed CC BY-NC-SA 4.0 and are **not bundled with the app** — they form their own asset pack, its row carries a license badge (click it for the upstream release page and attribution), and they download only after you confirm, together with their NOTICE attribution files. A vocoder fine-tuned from them inherits the same license (non-commercial).
 
 ### 8.2 The five training targets: which one?
 
@@ -977,7 +977,9 @@ A few reliability behaviors, so you know they are normal:
 
 ### 9.3 "Model Assets"
 
-Three downloadable packs: "Core inference models" (required, ~1.4 GB, see 2.3), "RVC training base models", "SoVITS training base models" (for training, as needed). Each row shows "Installed" or "Missing n/m · size"; "Download" starts, "Cancel" stops (resumable). Only one pack downloads at a time.
+Six downloadable packs: "Core inference models" (required, ~1.4 GB, see 2.3), "Auto pitch tuning model" (for automatic pitch tuning), "RVC training base models", "SoVITS training base models", "SoVITS 4.0-v2 training base models" and "Vocoder finetune base model" (the last four for training, as needed). Each row shows "Installed" or "Missing n/m · size"; "Download" starts, "Cancel" stops (resumable); a pack that is installed — even half-downloaded — also gets a "Delete" button to reclaim the space. Only one pack downloads at a time.
+
+A pack whose weights carry terms of their own also shows a **license badge** on its row — currently only "Vocoder finetune base model" (CC BY-NC-SA 4.0). Such weights are not bundled with the app; the app fetches them on your confirmation and writes their NOTICE attribution files alongside. Click the badge to open the upstream release page with the original source and attribution.
 
 ### 9.4 "Hardware" and the inference device
 
