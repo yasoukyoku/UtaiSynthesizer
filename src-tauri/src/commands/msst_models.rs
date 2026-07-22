@@ -232,7 +232,16 @@ pub async fn download_msst_model(
                         tracing::info!("Converted {} -> {}", filename, onnx_path);
                     }
                     Err(e) => {
-                        tracing::warn!("Auto-conversion failed for {}: {} (model unusable until converted — retry via the convert button)", filename, e);
+                        // Keep the CAUSE (S74b review): run_converter only logs on its non-zero-exit
+                        // branch — its other early returns (no runtime pack, script missing, spawn
+                        // failure, "finished but no .onnx") log nothing, so dropping `e` here left
+                        // those failures with no root cause anywhere on disk. A duplicated stderr
+                        // tail on the one branch that does log is the cheaper of the two mistakes.
+                        tracing::warn!(
+                            "Auto-conversion failed for {}: {} (model unusable until converted — retry via the convert button)",
+                            filename,
+                            e
+                        );
                     }
                 }
             }
@@ -273,7 +282,7 @@ pub async fn convert_msst_model(
         if fp32_onnx.exists() {
             let out = run_fp16_converter(&fp32_onnx, &state.app_dir)
                 .await
-                .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e))?;
+                .map_err(pass_convert_error)?;
             // S68c: a RE-conversion may have replaced a file the engine still holds a cached
             // session for — evict by stem prefix (covers .onnx + .fp16.onnx) so the next run
             // builds from the fresh bytes instead of silently serving the old graph.
@@ -289,7 +298,7 @@ pub async fn convert_msst_model(
 
     let onnx_path = run_converter(&path, &arch, &state.app_dir, precision.as_deref())
         .await
-        .map_err(|e| format!("MSST_CONVERT_FAILED: {}", e))?;
+        .map_err(pass_convert_error)?;
     state.inference.engine.unload_paths_with_prefix(&path.with_extension(""));
 
     Ok(onnx_path)
@@ -382,6 +391,41 @@ pub fn import_local_msst_model(
 
 // ─── Converter ───────────────────────────────────────────────
 
+/// S74: minimum system-wide available commit (MB) required before STARTING a heavy model
+/// export (bs_roformer / mel_band_roformer). The legacy TorchScript ONNX exporter
+/// materializes the whole graph + folded constants in host RAM — a community 16 GB box OOM'd
+/// inside torch.onnx.export (`MemoryError: bad allocation`), with the benign com.microsoft
+/// warning flood burying it. Refusing to start under severe memory pressure beats OOM-ing
+/// mid-export (or letting the OS commit-kill the whole app). Deliberately CONSERVATIVE (well
+/// below the real peak) — a false positive would block a convert that might have squeezed
+/// through; the caught-OOM rewrite below is the real safety net. `UTAI_CONVERT_MIN_AVAIL_MB`
+/// overrides (0 disables).
+fn convert_min_avail_commit_mb() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        if let Ok(raw) = std::env::var("UTAI_CONVERT_MIN_AVAIL_MB") {
+            match raw.trim().parse::<u64>() {
+                Ok(mb) => return mb, // 0 = disabled (documented)
+                Err(_) => tracing::warn!(
+                    "UTAI_CONVERT_MIN_AVAIL_MB={raw:?} is not a whole MB number — using the default floor"
+                ),
+            }
+        }
+        2048
+    })
+}
+
+/// Wrap a converter error as MSST_CONVERT_FAILED for the frontend — EXCEPT the already-coded
+/// CONVERT_LOW_MEMORY (a host-RAM OOM), which must reach the frontend BARE so its own clean
+/// modal shows, not "conversion failed (CONVERT_LOW_MEMORY)" (findCode is longest-code-first).
+fn pass_convert_error(e: String) -> String {
+    if e.starts_with("CONVERT_LOW_MEMORY") {
+        e
+    } else {
+        format!("MSST_CONVERT_FAILED: {}", e)
+    }
+}
+
 async fn run_converter(
     model_path: &Path,
     arch: &str,
@@ -419,6 +463,21 @@ async fn run_converter(
         }
     }
 
+    // S74: refuse to START a heavy TorchScript export under severe memory pressure rather than
+    // OOM mid-export (see convert_min_avail_commit_mb). Light archs (mdx_net) skip this.
+    if matches!(arch, "bs_roformer" | "mel_band_roformer") {
+        let min = convert_min_avail_commit_mb();
+        if min > 0 {
+            let (_, avail) = crate::inference::engine::system_memory_mb();
+            if avail > 0 && avail < min {
+                tracing::error!(
+                    "CONVERT_LOW_MEMORY: available commit {avail} MB is below the {min} MB floor to export {arch}"
+                );
+                return Err("CONVERT_LOW_MEMORY".to_string());
+            }
+        }
+    }
+
     tracing::info!("Converting {} (arch={})...", model_path.display(), arch);
 
     let output = cmd
@@ -428,7 +487,18 @@ async fn run_converter(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
+        let trimmed = stderr.trim();
+        // S74: log the FULL stderr to the file for BOTH the auto-convert AND the manual
+        // convert-button path (the manual path left no on-disk trace before — the real
+        // terminating error lived only in the frontend string, buried under the benign
+        // com.microsoft shape-inference warning flood). The real error is at the TAIL.
+        tracing::warn!("Converter failed (arch={arch}): {trimmed}");
+        // A host-RAM exhaustion inside torch.onnx.export (MemoryError: bad allocation) → a
+        // clean actionable CODE instead of dumping the whole warning wall on the user.
+        if crate::inference::engine::is_alloc_failure(trimmed) {
+            return Err("CONVERT_LOW_MEMORY".to_string());
+        }
+        return Err(trimmed.to_string());
     }
 
     // Success check must match what the requested precision actually PRODUCES:
@@ -483,7 +553,12 @@ async fn run_fp16_converter(fp32_onnx: &Path, app_dir: &Path) -> Result<String, 
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(stderr.trim().to_string());
+        let trimmed = stderr.trim();
+        tracing::warn!("fp16 converter failed: {trimmed}");
+        if crate::inference::engine::is_alloc_failure(trimmed) {
+            return Err("CONVERT_LOW_MEMORY".to_string());
+        }
+        return Err(trimmed.to_string());
     }
     if !out_path.exists() {
         return Err("fp16 converter finished but output file not found".into());

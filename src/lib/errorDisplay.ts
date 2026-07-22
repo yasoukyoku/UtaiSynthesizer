@@ -19,6 +19,9 @@ export function maybeShowErrorModal(raw: unknown, display: string): boolean {
   void useAppStore.getState().showConfirm({
     title: i18n.t("common.errorModalTitle"),
     body: display,
+    // S74: error modals get a scrollable body (long stderr tails / low-memory guidance),
+    // selectable text, and a Copy button — so the real error is reachable and copyable.
+    scrollable: true,
     buttons: [{ id: "ok", label: i18n.t("common.ok"), kind: "primary" }],
   });
   return true;

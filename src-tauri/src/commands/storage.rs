@@ -73,6 +73,11 @@ pub struct StorageReport {
     pub models_bytes: u64,
     pub msst_bytes: u64,
     pub runtimes_bytes: u64,
+    /// S74b: the CUDA inference runtime (~1.6 GB across `<app>/runtime/ort/cuda` + `<app>/runtime/
+    /// cuda`). It lives next to the PROGRAM, not under the data root, so every earlier version of
+    /// this report omitted the single biggest optional download in the app — the storage page
+    /// could not account for it and a user reclaiming space had no idea it existed.
+    pub cuda_runtime_bytes: u64,
     pub dictionaries_bytes: u64,
     pub logs_bytes: u64,
     /// Audition caches (workspace audition dirs + model-side audition wavs) — a subset of
@@ -108,6 +113,11 @@ fn model_audition_bytes(dir: &Path) -> u64 {
 #[tauri::command]
 pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<StorageReport, String> {
     let root = data_root(&state);
+    // The CUDA runtime sits under the APP dir (program-adjacent), not the data root.
+    let cuda_dirs = [
+        state.app_dir.join("runtime").join("ort").join("cuda"),
+        state.app_dir.join("runtime").join("cuda"),
+    ];
     tauri::async_runtime::spawn_blocking(move || {
         let models_dir = root.join("models");
         let training_dir = root.join("training");
@@ -152,6 +162,7 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
             models_bytes: dir_size(&models_dir),
             msst_bytes: dir_size(&models_dir.join("msst")),
             runtimes_bytes: dir_size(&root.join("runtimes")),
+            cuda_runtime_bytes: cuda_dirs.iter().map(|d| dir_size(d)).sum(),
             dictionaries_bytes: dir_size(&root.join("dictionaries")),
             logs_bytes: dir_size(&crate::logging::get_log_dir()),
             audition_bytes: ws_audition + model_audition_bytes(&models_dir),

@@ -202,6 +202,62 @@ pub fn asset_pack_status(state: State<'_, Arc<AppState>>) -> Vec<AssetPackStatus
 /// `hf_base` = the user's custom HF host replacement (Settings 下载源; applyMirror semantics —
 /// replaces the `https://huggingface.co` prefix). Tried first when set; huggingface.co and
 /// hf-mirror.com always follow, sha256 verifying whatever answers.
+/// S74b: reclaim an asset pack's files. Until now these packs could only ever be downloaded —
+/// a user who stops using an architecture ("I'm never training RVC again") had no way to get the
+/// gigabytes back, and the storage page could only watch them sit there.
+///
+/// Deletes exactly the files the CATALOG lists for the pack (never a directory sweep): the models
+/// tree also holds the user's OWN models, and a recursive delete there would be unrecoverable.
+/// Empty parent directories left behind are harmless and are what the next download re-fills.
+///
+/// Guards: the shared fail-closed idle pre-flight, plus a refusal while an asset download is in
+/// flight (deleting the files it is writing produces a half-pack that passes no check).
+/// The caller confirms first — including for `aux-inference`, whose removal disables voice
+/// conversion until it is downloaded again (the dialog says so; refusing outright would just be
+/// another "the app won't let me" dead end).
+#[tauri::command]
+pub async fn delete_asset_pack(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<u64, String> {
+    crate::commands::window::ensure_idle_for_package_delete(&state)?;
+    if ASSET_DL_ACTIVE.load(Ordering::SeqCst) {
+        return Err("ASSET_DL_BUSY".to_string());
+    }
+    let pack = PACKS
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("ASSET_PACK_UNKNOWN: {id}"))?;
+    let models_dir = state.models.models_dir().to_path_buf();
+    let rels: Vec<&'static str> = pack.files.iter().map(|f| f.rel).collect();
+    tokio::task::spawn_blocking(move || {
+        let mut freed = 0u64;
+        for rel in rels {
+            let p = dest_path(&models_dir, rel);
+            // S74b: the downloader keeps `<dest>.part` across cancellations on purpose (resume), so
+            // a partially-downloaded pack's bytes live mostly in .part files — and the UI offers
+            // Delete for exactly that state. Reclaiming only the finished files would leave the
+            // gigabytes the user is trying to free.
+            for target in [crate::download::part_path(&p), p.clone()] {
+                let size = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
+                match std::fs::remove_file(&target) {
+                    Ok(()) => freed += size,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Report the FIRST hard failure instead of silently leaving a half-deleted pack.
+                    Err(e) => {
+                        tracing::warn!("asset delete failed at {}: {e}", target.display());
+                        return Err(format!("ASSET_DELETE_FAILED: {}: {e}", target.display()));
+                    }
+                }
+            }
+        }
+        tracing::info!("Deleted asset pack {} ({} bytes reclaimed)", id, freed);
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| format!("DELETE_TASK_FAILED: {e}"))?
+}
+
 #[tauri::command]
 pub async fn download_asset_pack(
     state: State<'_, Arc<AppState>>,

@@ -8,6 +8,8 @@ import {
   type MsstCatalogEntry, type MsstPrecision,
 } from "../lib/models/msst-catalog";
 import { loadSetting, saveSetting } from "../lib/settings";
+import { backendErrorMessage } from "../lib/backendError";
+import { maybeShowErrorModal } from "../lib/errorDisplay";
 
 /** Cached remote mirror list (mirrors.json on the utai-runtimes HF dataset). Public GH
  *  proxies rot in 6-18 months — the remote list lets shipped builds pick up fresh ones. */
@@ -195,7 +197,12 @@ export const useMsstModelStore = create<MsstModelStore>((set, get) => ({
       await invoke("convert_msst_model", { filename, precision, architecture });
       await get().fetchInstalled();
     } catch (e) {
-      set({ error: String(e) });
+      // S74: converter failures are blocking → the scrollable/copyable modal funnel (the raw
+      // stderr is already logged backend-side by run_converter). CONVERT_LOW_MEMORY /
+      // MSST_CONVERT_FAILED are modal:true; fall back to the inline banner only if a dialog
+      // is already open (maybeShowErrorModal declines rather than clobber it).
+      const display = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, display)) set({ error: String(e) });
     }
     get().removeDownload(filename);
   },

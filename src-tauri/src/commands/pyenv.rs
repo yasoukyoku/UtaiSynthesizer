@@ -107,11 +107,25 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let root_ascii_ok = root.is_ascii() && !root.is_empty();
-    let packs = pyenv::list_packs();
+    let mut packs = pyenv::list_packs();
     // Hardware facts for the per-variant support gate — queried ONCE per refresh (each
     // is a subprocess: WMI for vendors, nvidia-smi for the NVIDIA compute cap).
     let gpus = crate::commands::settings::query_gpu_adapters();
-    let nv_cc = crate::commands::settings::nvidia_max_compute_cap();
+    let nv_cc10 = crate::commands::settings::nvidia_compute_caps_cc10();
+    // S74b: the SAME predicate decides both "offer this download" and "is the installed one
+    // usable here" — one sentence, two consumers, no second rule to drift.
+    let sig = crate::commands::settings::machine_sig();
+    for p in &mut packs {
+        p.supported = crate::commands::settings::variant_supported(&p.meta.variant, &gpus, &nv_cc10);
+        // Only an EXPLICIT disagreement is staleness — a report written before the stamp existed
+        // carries no claim about its machine, so it keeps its verdict (see PackStatus).
+        p.envtest_stale = p
+            .envtest
+            .as_ref()
+            .and_then(|e| e.get("machine"))
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m != sig);
+    }
     let catalog = pyenv::CATALOG
         .iter()
         .map(|e| CatalogItem {
@@ -125,7 +139,7 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
             // By ID, not variant: during a v1→v2 upgrade both coexist and the v2
             // catalog row must stay visible/downloadable while v1 is installed.
             installed: packs.iter().any(|p| p.meta.id == e.id),
-            supported: crate::commands::settings::variant_supported(&e.variant, &gpus, nv_cc),
+            supported: crate::commands::settings::variant_supported(&e.variant, &gpus, &nv_cc10),
         })
         .collect();
     Ok(RuntimeEnvInfo {
@@ -431,7 +445,15 @@ pub fn cancel_runtime_install() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn delete_runtime_pack(id: String) -> Result<(), String> {
+pub async fn delete_runtime_pack(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    // S74b: a runtime pack IS the interpreter that training and model conversion run on — pulling
+    // it out mid-job breaks the child process in a way that surfaces nowhere near the cause.
+    // Fail-closed pre-flight (see ensure_idle_for_package_delete); the frontend refuses earlier
+    // with a nicer message, this is the TOCTOU backstop.
+    crate::commands::window::ensure_idle_for_package_delete(&state)?;
     // remove_dir_all over a ~1 GB / 10k-file tree takes seconds (more under AV) —
     // run it off the IPC pool; the frontend shows a 删除中… state meanwhile.
     tokio::task::spawn_blocking(move || pyenv::delete_pack(&id))
@@ -458,6 +480,59 @@ fn envtest_device_for_variant(variant: &str) -> &'static str {
         "xpu" => "xpu",
         _ => "cpu",
     }
+}
+
+/// Per-failed-check detail cap — a check's detail carries a source location, and an error
+/// toast must not become a wall of text (the Settings panel renders the full breakdown).
+const ENVTEST_DETAIL_MAX: usize = 160;
+
+/// How many failed checks carry their detail into the error string. Failures CASCADE (a dead
+/// torch backend fails every on-device check after it), and the FIRST one is the root cause —
+/// the rest are named by count so the headline stays readable.
+const ENVTEST_DETAILED_ITEMS: usize = 3;
+
+/// "check: root cause | check2: root cause2" over a failed report's items (S74).
+/// The message used to carry the failed check NAMES only ("torch_backend") — the community
+/// Iris Xe reporter had no way to tell WHY, which is exactly the guessing game the error-UX
+/// rules forbid. Details are the checks' own raw/technical strings (stable CODEs where the
+/// check emits one, e.g. XPU_NO_DEVICE), truncated. Falls back to `failed_names` for a report
+/// that has no items array (defensive — every schema-1 report has one).
+fn failed_items_summary(rep: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut extra = 0usize;
+    if let Some(items) = rep.get("items").and_then(|v| v.as_array()) {
+        for it in items {
+            if it.get("status").and_then(|v| v.as_str()) != Some("fail") {
+                continue;
+            }
+            let name = it.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            if parts.len() >= ENVTEST_DETAILED_ITEMS {
+                extra += 1;
+                continue;
+            }
+            let detail = it.get("detail").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if detail.is_empty() {
+                parts.push(name.to_string());
+            } else {
+                // char-wise (details are UTF-8 and may be non-ASCII) — never split a code point.
+                let short: String = detail.chars().take(ENVTEST_DETAIL_MAX).collect();
+                let ellipsis = if detail.chars().count() > ENVTEST_DETAIL_MAX { "…" } else { "" };
+                parts.push(format!("{name}: {short}{ellipsis}"));
+            }
+        }
+    }
+    if extra > 0 {
+        parts.push(format!("+{extra}"));
+    }
+    if parts.is_empty() {
+        return rep
+            .get("failed_names")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".into());
+    }
+    parts.join(" | ")
 }
 
 #[tauri::command]
@@ -582,9 +657,25 @@ async fn run_envtest_inner(
     let _ = stdout_task.await;
     let stderr_tail = stderr_task.await.unwrap_or_default();
 
-    let report: Option<serde_json::Value> = std::fs::read_to_string(&report_path)
+    let mut report: Option<serde_json::Value> = std::fs::read_to_string(&report_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
+    // S74b: stamp WHICH MACHINE produced this verdict, so a report that outlives the hardware it
+    // describes can be shown as "re-run me" instead of masquerading as a current pass/fail. Written
+    // here rather than in envtest.py because the hardware inventory lives on this side (and the cpu
+    // tier has no GPU context at all inside python).
+    if let Some(rep) = report.as_mut().and_then(|r| r.as_object_mut()) {
+        rep.insert(
+            "machine".to_string(),
+            serde_json::Value::String(crate::commands::settings::machine_sig()),
+        );
+        if let Ok(text) = serde_json::to_string_pretty(&report) {
+            if let Err(e) = std::fs::write(&report_path, text) {
+                // Non-fatal: the verdict below is unaffected; only staleness detection degrades.
+                tracing::warn!("could not stamp the machine signature into {}: {e}", report_path.display());
+            }
+        }
+    }
     match report {
         Some(rep) => {
             let overall = rep.get("overall").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -600,17 +691,27 @@ async fn run_envtest_inner(
             if overall == "pass" {
                 Ok(rep)
             } else {
-                Err(format!(
-                    "ENVTEST_FAILED: {}",
-                    rep.get("failed_names")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a
-                            .iter()
-                            .filter_map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_else(|| "unknown".into())
-                ))
+                // S74b: log the RAW verdict, uncapped, one line per failed check — in LOG format,
+                // not the localized text the panel shows (a trilingual sentence is worthless in a
+                // bug report). Both entry points reach here (manual self-test and the post-install
+                // run), so this is the single place that guarantees it lands on disk.
+                //
+                // It matters more than it looks: with the S74b gates, a pack that is offered,
+                // installed AND still fails its self-test usually means something let an
+                // unsupported pack through (residue, a hand-dropped folder, a machine swap) — the
+                // log is the only thing that can tell us WHICH, and the per-check detail carries
+                // the stable CODE (XPU_NO_DEVICE, RUNTIME_DRIVER_TOO_OLD, …) that names it.
+                for it in rep.get("items").and_then(|v| v.as_array()).into_iter().flatten() {
+                    if it.get("status").and_then(|v| v.as_str()) == Some("fail") {
+                        tracing::warn!(
+                            "envtest FAILED [{}] check={} detail={}",
+                            id,
+                            it.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                            it.get("detail").and_then(|v| v.as_str()).unwrap_or("")
+                        );
+                    }
+                }
+                Err(format!("ENVTEST_FAILED: {}", failed_items_summary(&rep)))
             }
         }
         None => {
@@ -646,4 +747,79 @@ async fn run_envtest_inner(
 #[tauri::command]
 pub async fn test_download_source(url: String) -> crate::download::ProbeResult {
     crate::download::probe(&url).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The xpu-tier report shape captured from a REAL headless run
+    /// (`python -m utai_train.envtest --device xpu` on a non-XPU box, S74): a dead torch
+    /// backend plus the three on-device checks that cascade off it.
+    fn xpu_report() -> serde_json::Value {
+        json!({
+            "overall": "fail",
+            "items": [
+                {"name": "python_info", "status": "pass", "detail": "CPython 3.10.20"},
+                {"name": "torch_backend", "status": "fail",
+                 "detail": "RuntimeError: XPU_NO_DEVICE: torch.xpu.is_available()=False (torch 2.11.0+cpu) @ File \"envtest.py\", line 228, in check_torch_backend"},
+                {"name": "tiny_gan", "status": "fail",
+                 "detail": "AssertionError: Torch not compiled with XPU enabled"},
+                {"name": "gpu_stft_vs_cpu", "status": "fail",
+                 "detail": "AssertionError: Torch not compiled with XPU enabled"},
+                {"name": "gpu_amp_step", "status": "fail",
+                 "detail": "AssertionError: Torch not compiled with XPU enabled"},
+            ],
+            "failed_names": ["torch_backend", "tiny_gan", "gpu_stft_vs_cpu", "gpu_amp_step"],
+        })
+    }
+
+    #[test]
+    fn summary_carries_root_cause_code_not_just_check_names() {
+        let s = failed_items_summary(&xpu_report());
+        // THE regression this guards: the message used to be "torch_backend, tiny_gan, …".
+        assert!(s.contains("XPU_NO_DEVICE"), "{s}");
+        assert!(s.starts_with("torch_backend: "), "{s}");
+        // Cascaded failures are capped by count, not spelled out.
+        assert!(s.ends_with("+1"), "{s}");
+        // 3 detailed items + the "+1" tail = 3 joins; a detail's own location separator is
+        // "@", never " | ", so the join stays unambiguous (guards that contract too).
+        assert_eq!(s.matches(" | ").count(), 3, "{s}");
+    }
+
+    #[test]
+    fn summary_truncates_on_char_boundaries() {
+        let long: String = "错".repeat(400); // multibyte: a byte-wise cut would panic
+        let rep = json!({"items": [{"name": "x", "status": "fail", "detail": long}]});
+        let s = failed_items_summary(&rep);
+        assert!(s.starts_with("x: 错"), "{s}");
+        assert!(s.ends_with('…'), "{s}");
+        assert_eq!(s.chars().filter(|c| *c == '错').count(), ENVTEST_DETAIL_MAX);
+    }
+
+    #[test]
+    fn summary_falls_back_to_names_then_unknown() {
+        // No items array (report older than schema 1's items, or hand-edited).
+        let rep = json!({"failed_names": ["imports", "faiss_search"]});
+        assert_eq!(failed_items_summary(&rep), "imports, faiss_search");
+        // Nothing usable at all — never emit an empty message.
+        assert_eq!(failed_items_summary(&json!({})), "unknown");
+        assert_eq!(failed_items_summary(&json!({"failed_names": []})), "unknown");
+        // Detail-less items still name their check.
+        let rep = json!({"items": [{"name": "faiss_search", "status": "fail", "detail": "  "}]});
+        assert_eq!(failed_items_summary(&rep), "faiss_search");
+    }
+
+    #[test]
+    fn summary_ignores_pass_warn_skip_items() {
+        let rep = json!({"items": [
+            {"name": "a", "status": "pass", "detail": "ok"},
+            {"name": "b", "status": "warn", "detail": "slow"},
+            {"name": "c", "status": "skip", "detail": "n/a"},
+        ]});
+        // No failures in the items → falls through to the names path → "unknown"
+        // (this function is only ever called on an overall=fail report).
+        assert_eq!(failed_items_summary(&rep), "unknown");
+    }
 }

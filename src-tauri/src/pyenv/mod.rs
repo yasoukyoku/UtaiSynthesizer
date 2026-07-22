@@ -134,6 +134,19 @@ pub struct PackStatus {
     /// Parsed envtest.json (None = self-test never ran). The frontend reads
     /// `overall` ("pass"/"fail") for the badge.
     pub envtest: Option<serde_json::Value>,
+    /// S74b: can THIS machine actually run this installed pack (settings::variant_supported)?
+    /// Filled by get_runtime_env_info, which is where the hardware facts live — list_packs reads
+    /// only on-disk facts and leaves it `true`. An installed-but-unsupported pack is NOT hidden:
+    /// it keeps its card, its self-test button (a driver fix must be re-testable) and its delete
+    /// button, and says WHY it can't be used. Hiding it would strip exactly the affordances the
+    /// user needs, which is how a package becomes invisible dead weight.
+    pub supported: bool,
+    /// S74b: the self-test report was produced on DIFFERENT hardware than this machine has now
+    /// (its `machine` stamp disagrees). The badge then says "re-run the self-test" instead of
+    /// showing a verdict that no longer describes anything. Reports predating the stamp are NOT
+    /// called stale — absence of evidence is not evidence of a swap, and flagging every existing
+    /// install once would be noise. Filled by get_runtime_env_info.
+    pub envtest_stale: bool,
 }
 
 pub fn pack_python(pack_dir: &Path) -> PathBuf {
@@ -171,6 +184,8 @@ pub fn list_packs() -> Vec<PackStatus> {
             meta,
             path: dir.to_string_lossy().to_string(),
             envtest,
+            supported: true, // hardware-independent here; get_runtime_env_info decides
+            envtest_stale: false, // ditto
         });
     }
     packs.sort_by(|a, b| a.meta.id.cmp(&b.meta.id));

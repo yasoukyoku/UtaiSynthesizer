@@ -110,6 +110,43 @@ export function App() {
     };
   }, []);
 
+  // S74b: a saved explicit inference device that this machine can no longer honour was demoted to
+  // Auto during startup (GPU swapped, machine changed, or our supported window narrowed in an
+  // update). Non-blocking — the user's stored intent was invalidated by the environment, not
+  // refused. Asked once here rather than pushed from Rust: the backend decides it during setup,
+  // before any frontend listener exists, so an event would be lost.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ preference_demoted?: boolean }>("get_hardware_info")
+      .then((h) => {
+        if (!cancelled && h.preference_demoted) {
+          useAppStore.getState().showToast(i18n.t("common.devicePreferenceDemoted"), "info");
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // S74: the inference engine transparently fell back CUDA → DirectML after a CUDA run failure
+  // (an in-window card that still can't run CUDA, or a leaked/old install) — inform the user
+  // (non-blocking; the failure itself is WARN-logged backend-side for debugging).
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void listen("auto-cuda-fallback", () => {
+      useAppStore.getState().showToast(i18n.t("common.autoCudaFallback"), "info");
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Keep the tray menu labels in the UI language (the tray is built with English fallback labels).
   useEffect(() => {
     const update = () =>

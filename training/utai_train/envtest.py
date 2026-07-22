@@ -157,7 +157,10 @@ def check_imports(ctx):
             missing.append("%s (%s)" % (mod, type(e).__name__))
     ctx["versions"] = versions
     if missing:
-        raise RuntimeError("缺失/损坏的包: " + ", ".join(missing))
+        # Stable CODE (S74b): the panel renders this detail to the user, so every check whose
+        # failure the user must ACT on carries a code the frontend localizes. Remedy = reinstall
+        # the runtime pack. The detail after the code stays raw/technical by convention.
+        raise RuntimeError("ENVTEST_PACKAGES_BROKEN: " + ", ".join(missing))
     return ", ".join("%s %s" % kv for kv in sorted(versions.items()))
 
 
@@ -191,16 +194,15 @@ def check_cuda_driver(ctx):
 
     cu = torch.version.cuda or ""
     if not cu.startswith("13"):
-        return "cuda %s（无驱动地板要求）" % (cu or "?")
+        return "cuda %s (no driver floor required)" % (cu or "?")
     drv = _nvidia_driver_major()
     if drv is None:
-        return "驱动版本未能读取（nvidia-smi）—— 放行，由后续检查判定"
+        return "driver version unreadable (nvidia-smi) - not gating; later checks decide"
     if drv < 580:
-        raise RuntimeError(
-            "NVIDIA 驱动 %d < 580 —— CUDA %s 运行时需要 r580+ 驱动。"
-            "请到 NVIDIA 官网更新显卡驱动后重新自检" % (drv, cu)
-        )
-    return "驱动 %d（≥ 580）" % drv
+        # Reuses the CODE the nv-cu130 DOWNLOAD gate already emits (backend.RUNTIME_DRIVER_TOO_OLD,
+        # trilingual) — same condition, same remedy, one localized sentence for both.
+        raise RuntimeError("RUNTIME_DRIVER_TOO_OLD: driver %d < 580, cuda %s" % (drv, cu))
+    return "driver %d (>= 580)" % drv
 
 
 def check_torch_backend(ctx):
@@ -211,14 +213,23 @@ def check_torch_backend(ctx):
     if dev == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "torch.cuda.is_available()=False —— 驱动过旧或不匹配？"
-                "（cu130 需 NVIDIA 驱动 ≥ 580.88）"
+                "ENVTEST_TORCH_NO_CUDA: torch.cuda.is_available()=False (torch %s, cuda %s)"
+                % (torch.__version__, torch.version.cuda)
             )
         info += "; cuda %s; %s" % (torch.version.cuda, torch.cuda.get_device_name(0))
     elif dev == "xpu":
+        # S74 (community report): a pre-Arc Intel box (Iris Xe) installed the xpu pack and got a
+        # self-test failure naming only the CHECK ("torch_backend") — a guessing game. Raise a
+        # STABLE ENGLISH CODE (i18n hard rule: the localized explanation lives in the frontend's
+        # backend.XPU_NO_DEVICE, the detail here stays raw/technical) so the UI can say WHICH
+        # Intel GPUs torch-XPU actually supports and that DirectML still covers inference.
         xpu = getattr(torch, "xpu", None)
-        if xpu is None or not xpu.is_available():
-            raise RuntimeError("torch.xpu 不可用 —— Intel 显卡驱动未装或不被支持")
+        if xpu is None:
+            raise RuntimeError("XPU_NO_DEVICE: no torch.xpu namespace in torch %s" % torch.__version__)
+        if not xpu.is_available():
+            raise RuntimeError(
+                "XPU_NO_DEVICE: torch.xpu.is_available()=False (torch %s)" % torch.__version__
+            )
         info += "; xpu %s" % xpu.get_device_name(0)
     return info
 
@@ -236,9 +247,9 @@ def check_stft_roundtrip(ctx):
     y = torch.istft(spec, 2048, hop_length=512, window=win, center=True, length=x.shape[-1])
     err = (y - x).abs().max().item()
     if not (err < 1e-4):
-        raise RuntimeError("重建误差过大: max_abs=%.3e (阈 1e-4)" % err)
+        raise RuntimeError("reconstruction error too large: max_abs=%.3e (limit 1e-4)" % err)
     if spec.abs().sum().item() <= 0:
-        raise RuntimeError("stft 输出全零")
+        raise RuntimeError("stft output is all zeros")
     return "max_abs=%.2e, spec %s" % (err, tuple(spec.shape))
 
 
@@ -252,14 +263,14 @@ def check_resample(ctx):
     x = torch.from_numpy(_tone(44100, 220.0, 1.0)).unsqueeze(0)
     y = torchaudio.transforms.Resample(44100, 16000)(x)
     if y.shape[-1] != 16000:
-        raise RuntimeError("输出长度 %d ≠ 16000" % y.shape[-1])
+        raise RuntimeError("output length %d != 16000" % y.shape[-1])
     if not torch.isfinite(y).all():
-        raise RuntimeError("输出含 NaN/Inf")
+        raise RuntimeError("output contains NaN/Inf")
     rms_in = float(x.pow(2).mean().sqrt())
     rms_out = float(y.pow(2).mean().sqrt())
     ratio = rms_out / max(rms_in, 1e-9)
     if not (0.7 < ratio < 1.4):
-        raise RuntimeError("能量比异常 %.3f（重采样器数值损坏？）" % ratio)
+        raise RuntimeError("energy ratio out of range %.3f (resampler numerically broken?)" % ratio)
     del np
     return "len 16000, rms ratio %.3f" % ratio
 
@@ -273,12 +284,12 @@ def check_librosa_mel(ctx):
 
     basis = librosa.filters.mel(sr=44100, n_fft=2048, n_mels=128)
     if basis.shape != (128, 1025):
-        raise RuntimeError("mel 基形状异常 %s" % (basis.shape,))
+        raise RuntimeError("mel basis has unexpected shape %s" % (basis.shape,))
     if not np.isfinite(basis).all() or basis.min() < 0:
-        raise RuntimeError("mel 基含非法值")
+        raise RuntimeError("mel basis contains invalid values")
     zero_rows = int((basis.sum(axis=1) <= 0).sum())
     if zero_rows:
-        raise RuntimeError("%d 个空 mel 滤波器" % zero_rows)
+        raise RuntimeError("%d empty mel filters" % zero_rows)
     return "mel basis (128,1025), 0 empty filters"
 
 
@@ -300,7 +311,7 @@ def check_numba_jit(ctx):
     got = _acc(x)
     want = float(x.sum() * 0.5)
     if abs(got - want) > 1e-6:
-        raise RuntimeError("JIT 结果错误 %.6f != %.6f" % (got, want))
+        raise RuntimeError("JIT result wrong: %.6f != %.6f" % (got, want))
     return "njit compile+run OK (%.1f)" % got
 
 
@@ -314,10 +325,10 @@ def check_soundfile_roundtrip(ctx):
     sf.write(path, data, 44100, subtype="FLOAT")
     back, sr = sf.read(path, dtype="float32")
     if sr != 44100 or back.shape[0] != data.shape[0]:
-        raise RuntimeError("读回形状/采样率不符")
+        raise RuntimeError("read-back shape/samplerate mismatch")
     if not np.array_equal(back, data):
-        raise RuntimeError("float32 wav 读写不是逐位一致")
-    return "float32 逐位一致 (%d samples)" % data.shape[0]
+        raise RuntimeError("float32 wav round-trip is not bit-exact")
+    return "float32 bit-exact (%d samples)" % data.shape[0]
 
 
 def check_parselmouth(ctx):
@@ -331,10 +342,10 @@ def check_parselmouth(ctx):
     f0 = pitch.selected_array["frequency"]
     voiced = f0[f0 > 0]
     if voiced.size < 10:
-        raise RuntimeError("几乎没有浊音帧被检出 (%d)" % voiced.size)
+        raise RuntimeError("almost no voiced frames detected (%d)" % voiced.size)
     med = float(np.median(voiced))
     if not (212.0 < med < 228.0):
-        raise RuntimeError("f0 中位数 %.2f Hz 偏离 220 Hz" % med)
+        raise RuntimeError("f0 median %.2f Hz deviates from 220 Hz" % med)
     ver = getattr(parselmouth, "PRAAT_VERSION", "?")
     return "praat %s, f0 median %.2f Hz (%d voiced)" % (ver, med, voiced.size)
 
@@ -347,10 +358,10 @@ def check_pyworld(ctx):
     f0, _t = pw.harvest(x, 44100, f0_floor=80.0, f0_ceil=800.0)
     voiced = f0[f0 > 0]
     if voiced.size < f0.size // 2:
-        raise RuntimeError("harvest 浊音帧过少 (%d/%d)" % (voiced.size, f0.size))
+        raise RuntimeError("harvest found too few voiced frames (%d/%d)" % (voiced.size, f0.size))
     med = float(np.median(voiced))
     if not (210.0 < med < 230.0):
-        raise RuntimeError("harvest f0 中位数 %.2f Hz 偏离 220 Hz" % med)
+        raise RuntimeError("harvest f0 median %.2f Hz deviates from 220 Hz" % med)
     return "f0 median %.2f Hz (%d/%d voiced)" % (med, voiced.size, f0.size)
 
 
@@ -378,7 +389,7 @@ def check_onnxruntime(ctx):
     b = np.ones((2, 3), dtype=np.float32)
     (c,) = sess.run(None, {"a": a, "b": b})
     if not np.array_equal(c, a + b):
-        raise RuntimeError("Add 结果错误")
+        raise RuntimeError("Add produced a wrong result")
     return "ort %s CPU EP OK" % ort.__version__
 
 
@@ -392,9 +403,9 @@ def check_faiss(ctx):
     idx.add(base)
     d, i = idx.search(base[:5], 1)
     if not (i[:, 0] == np.arange(5)).all():
-        raise RuntimeError("自身最近邻检索错位: %s" % i[:, 0].tolist())
+        raise RuntimeError("self nearest-neighbour search misaligned: %s" % i[:, 0].tolist())
     if float(d.max()) > 1e-4:
-        raise RuntimeError("自身距离非零: %.3e" % float(d.max()))
+        raise RuntimeError("self distance is non-zero: %.3e" % float(d.max()))
     return "IndexFlatL2 self-NN 5/5"
 
 
@@ -407,10 +418,10 @@ def check_sklearn_kmeans(ctx):
     km = MiniBatchKMeans(n_clusters=2, random_state=0, n_init=3, batch_size=64).fit(pts)
     centers = km.cluster_centers_
     if not np.isfinite(centers).all():
-        raise RuntimeError("聚类中心含 NaN/Inf")
+        raise RuntimeError("cluster centers contain NaN/Inf")
     spread = float(np.abs(centers).mean())
     if not (2.0 < spread < 6.0):
-        raise RuntimeError("聚类中心异常（|mean|=%.2f，期望 ~4）" % spread)
+        raise RuntimeError("cluster centers out of range (|mean|=%.2f, expected ~4)" % spread)
     return "2 centers, |mean| %.2f" % spread
 
 
@@ -457,7 +468,7 @@ def check_lightning(ctx):
     import math
 
     if probe.seen_loss is None or not math.isfinite(probe.seen_loss):
-        raise RuntimeError("Trainer.fit 未执行 training_step 或 loss 非有限")
+        raise RuntimeError("Trainer.fit did not run training_step, or loss was non-finite")
     return "lightning %s Trainer.fit 1 step OK (loss %.4f)" % (
         lightning.__version__, probe.seen_loss)
 
@@ -505,7 +516,7 @@ def check_tiny_gan(ctx):
         loss_d.backward()
         for p in d.parameters():
             if p.grad is not None and not torch.isfinite(p.grad).all():
-                raise RuntimeError("D 梯度含 NaN/Inf (step %d)" % _step)
+                raise RuntimeError("D gradients contain NaN/Inf (step %d)" % _step)
         opt_d.step()
         # G step (L1 dominates so the learning check is deterministic-ish)
         opt_g.zero_grad(set_to_none=True)
@@ -516,19 +527,19 @@ def check_tiny_gan(ctx):
             if p.grad is None:
                 continue
             if not torch.isfinite(p.grad).all():
-                raise RuntimeError("G 梯度含 NaN/Inf (step %d)" % _step)
+                raise RuntimeError("G gradients contain NaN/Inf (step %d)" % _step)
             if float(p.grad.abs().sum()) > 0:
                 grad_seen = True
         opt_g.step()
         if not (torch.isfinite(loss_d) and torch.isfinite(loss_g)):
-            raise RuntimeError("loss 出现 NaN/Inf (step %d)" % _step)
+            raise RuntimeError("loss became NaN/Inf (step %d)" % _step)
         l1_hist.append(float(l1.detach()))
     first = sum(l1_hist[:3]) / 3.0
     last = sum(l1_hist[-3:]) / 3.0
     if not grad_seen:
-        raise RuntimeError("G 从未收到非零梯度")
+        raise RuntimeError("G never received a non-zero gradient")
     if not (last < first * 0.8):
-        raise RuntimeError("L1 未收敛（首 %.4f → 尾 %.4f，期望降 >20%%）" % (first, last))
+        raise RuntimeError("L1 did not converge (first %.4f -> last %.4f, expected >20%% drop)" % (first, last))
     return "L1 %.4f → %.4f (30 steps, %s)" % (first, last, dev)
 
 
@@ -548,7 +559,7 @@ def check_dataloader_spawn(ctx):
         batches += 1
     expected = float(sum(range(64)))
     if batches != 4 or abs(total - expected) > 1e-3:
-        raise RuntimeError("spawn worker 数据错误 (batches=%d, sum=%.1f≠%.1f)" % (batches, total, expected))
+        raise RuntimeError("spawn worker produced wrong data (batches=%d, sum=%.1f != %.1f)" % (batches, total, expected))
     return "1 spawn worker, 4 batches, sum OK (executable=%s)" % os.path.basename(sys.executable)
 
 
@@ -569,7 +580,7 @@ def check_gpu_stft_vs_cpu(ctx):
     err = (sd.cpu() - ref).abs().max().item()
     scale = ref.abs().max().item()
     if not (err < 1e-3 * max(scale, 1.0)):
-        raise RuntimeError("GPU stft 偏离 CPU 参考: max_abs=%.3e (scale %.2f)" % (err, scale))
+        raise RuntimeError("GPU stft deviates from the CPU reference: max_abs=%.3e (scale %.2f)" % (err, scale))
     # §4.5(a) reconstruction half: run istft ON DEVICE and compare to the CPU roundtrip
     # elementwise — exercises the inverse-FFT kernel (the other half of every vocoder
     # path), not just the forward transform. fp32 device↔cpu error is ~1e-6; 1e-3 loud.
@@ -577,7 +588,7 @@ def check_gpu_stft_vs_cpu(ctx):
     yd = torch.istft(sd, 2048, hop_length=512, window=wd, center=True, length=x.shape[-1])
     err_i = (yd.cpu() - y_ref).abs().max().item()
     if not (err_i < 1e-3):
-        raise RuntimeError("GPU istft 偏离 CPU 参考: max_abs=%.3e (阈 1e-3)" % err_i)
+        raise RuntimeError("GPU istft deviates from the CPU reference: max_abs=%.3e (limit 1e-3)" % err_i)
     return "stft %.2e / istft %.2e vs CPU (scale %.2f)" % (err, err_i, scale)
 
 
@@ -601,14 +612,14 @@ def check_gpu_amp_step(ctx):
         scaler.step(opt)
         scaler.update()
         if not torch.isfinite(loss):
-            raise RuntimeError("amp loss 非有限")
+            raise RuntimeError("amp loss is non-finite")
         # A weight MUST move: catches a silently no-op autocast/scaler (grads all
         # zeroed / step skipped on a spurious inf) that a loss-finite check alone
         # would pass green (§4.5 anti-self-deception).
         delta = float((model.weight.detach() - w0).abs().max())
         if not (delta > 0):
-            raise RuntimeError("amp 一步后权重未更新（autocast/scaler 静默空转？）")
-        return "fp16 autocast + GradScaler 一步 OK (Δw %.2e)" % delta
+            raise RuntimeError("no weight moved after one amp step (autocast/scaler silently doing nothing?)")
+        return "fp16 autocast + GradScaler step OK (dw %.2e)" % delta
     if dev == "xpu":
         # bf16 WITHOUT GradScaler — Arc A 系无 fp64，scaler 必崩（设计 §4.1）。
         model = torch.nn.Conv1d(4, 4, 3, padding=1).to(dev)
@@ -620,11 +631,11 @@ def check_gpu_amp_step(ctx):
         loss.backward()
         opt.step()
         if not torch.isfinite(loss):
-            raise RuntimeError("bf16 loss 非有限")
+            raise RuntimeError("bf16 loss is non-finite")
         delta = float((model.weight.detach() - w0).abs().max())
         if not (delta > 0):
-            raise RuntimeError("bf16 一步后权重未更新（autocast 静默空转？）")
-        return "bf16 autocast (no scaler) 一步 OK (Δw %.2e)" % delta
+            raise RuntimeError("no weight moved after one bf16 step (autocast silently doing nothing?)")
+        return "bf16 autocast (no scaler) step OK (dw %.2e)" % delta
     return None
 
 
@@ -646,15 +657,15 @@ def check_fallback_selftest(ctx):
             stacklevel=1,
         )
     if "aten::_fft_r2c" not in local:
-        raise RuntimeError("fallback 捕获失败：未从告警提取算子（got %s）" % sorted(local))
+        raise RuntimeError("fallback capture failed: no operator extracted from the warning (got %s)" % sorted(local))
     if "aten::_fft_r2c" not in _classify_hot(local):
-        raise RuntimeError("fallback 分类失败：_fft_r2c 未被判为热点算子")
+        raise RuntimeError("fallback classification failed: _fft_r2c was not flagged as a hot operator")
     noise = set()
     with _capture_fallbacks(noise):
         warnings.warn("some unrelated deprecation notice", DeprecationWarning, stacklevel=1)
     if noise:
-        raise RuntimeError("误捕获无关告警：%s" % sorted(noise))
-    return "capture+classify OK（合成 aten::_fft_r2c → hot；噪声不误捕）"
+        raise RuntimeError("unrelated warning wrongly captured: %s" % sorted(noise))
+    return "capture+classify OK (synthetic aten::_fft_r2c -> hot; noise not captured)"
 
 
 def check_fallback_ops(ctx):
@@ -668,12 +679,12 @@ def check_fallback_ops(ctx):
         return None  # no xpu fallback path on the cpu tier
     ops = sorted(_FALLBACK_OPS)
     if not ops:
-        return "无 CPU 回退算子（全部算子在设备上原生执行）"
+        return "no CPU fallbacks (every operator ran natively on the device)"
     hot = sorted(_classify_hot(_FALLBACK_OPS))
     if hot:
-        return _Warn("热点算子回退 CPU（严重拖慢训练，尤其声码器 ConvTranspose）："
-                     "%s ｜ 全部回退：%s" % (", ".join(hot), ", ".join(ops)))
-    return _Warn("算子回退 CPU（非热点，影响有限）：%s" % ", ".join(ops))
+        return _Warn("ENVTEST_OP_FALLBACK_HOT: %s | all fallbacks: %s"
+                     % (", ".join(hot), ", ".join(ops)))
+    return _Warn("ENVTEST_OP_FALLBACK_COLD: %s" % ", ".join(ops))
 
 
 CHECKS = [
@@ -746,13 +757,24 @@ def main():
                 detail = detail.detail
             elif detail is None:
                 status = "skip"
-                detail = "（该档位不适用）"
+                detail = "not applicable to this tier"
             else:
                 status = "pass"
         except Exception as e:
             status = "fail"
+            # The detail is what the UI shows the user (S74: the Settings pack list renders every
+            # failed check's detail). Message + SOURCE LOCATION — the old form appended
+            # traceback[-1], which IS "Type: message" verbatim, so every failure read as the same
+            # sentence twice.
             tb = traceback.format_exc().strip().splitlines()
-            detail = "%s: %s | %s" % (type(e).__name__, e, tb[-1] if tb else "")
+            loc = ""
+            for ln in tb:
+                s = ln.strip()
+                if s.startswith("File "):
+                    loc = s
+            # "@" (not "|") separates the location: the Rust side joins MULTIPLE failed checks
+            # with " | ", and a detail carrying the same separator makes the summary unreadable.
+            detail = "%s: %s" % (type(e).__name__, e) + (" @ %s" % loc if loc else "")
         ms = int((time.monotonic() - t0) * 1000)
         item = {"name": name, "status": status, "detail": str(detail), "ms": ms}
         items.append(item)

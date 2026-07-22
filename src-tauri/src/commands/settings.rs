@@ -8,6 +8,16 @@ use crate::AppState;
 pub struct HardwareInfo {
     pub gpu_name: String,
     pub cuda_available: bool,
+    /// Consumption point 1 of the single package predicate: this machine has an NVIDIA card our
+    /// shipped CUDA package can run. Gates the CUDA-runtime download entry and the CUDA device
+    /// option — an unsupported card is never offered CUDA and uses DirectML instead.
+    /// ⚠ UNDETERMINED = NOT SUPPORTED (fail-CLOSED). `cuda_pkg_supported` is the single authority
+    /// and carries the rationale; this comment used to claim fail-OPEN, which was the opposite of
+    /// both the implementation and the agreed design.
+    pub cuda_supported: bool,
+    /// S74b: a saved explicit device preference was stale (hardware/window changed) and was
+    /// demoted to Auto at startup. The frontend toasts this ONCE (App's startup effect).
+    pub preference_demoted: bool,
     pub directml_available: bool,
     pub current_device: String,
     /// The configured GPU ordinal of the current device preference (0 for cpu/auto).
@@ -122,30 +132,16 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
     } else {
         gpus.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
     };
-    // S67c: one hardware-inventory line per process, on the first query (the frontend
-    // startup check always issues one). Community crash logs never said what GPU/RAM the
-    // box had — this closes that blind spot. S68b: the DXGI form's indices ARE the
-    // DirectML device_id space (gpu.rs ordering contract) and carry dedicated VRAM;
-    // NVIDIA driver version closes the other crash-forensics blind spot.
-    {
-        static HW_LOGGED: std::sync::Once = std::sync::Once::new();
-        HW_LOGGED.call_once(|| {
-            let (total_mb, avail_mb) = crate::inference::engine::system_memory_mb();
-            let inventory = crate::gpu::inventory_line().unwrap_or_else(|| gpu_name.clone());
-            let driver = nvidia_driver_version()
-                .map(|v| format!("; NVIDIA driver {v}"))
-                .unwrap_or_default();
-            tracing::info!(
-                "Hardware: GPUs [{}]{}; physical RAM {} MB (available commit {} MB)",
-                inventory, driver, total_mb, avail_mb
-            );
-        });
-    }
     Ok(HardwareInfo {
         gpu_name,
         // Vendor-guarded (S64c audit): the self-downloaded runtime/cuda DLLs satisfy the PATH probe
         // even on a box whose NVIDIA card is gone (migrated data dir) — the badge must track the GPU.
         cuda_available: has_nvidia && is_cuda_available(),
+        // S74b consumption point 1 (entry/option gate). No `has_nvidia &&`: cuda_pkg_supported is
+        // itself the NVIDIA evidence (a successful nvidia-smi cc read), so it still answers on a
+        // box whose adapter probe failed — the S68b rescue property, kept.
+        cuda_supported: cuda_pkg_supported(),
+        preference_demoted: PREFERENCE_DEMOTED.load(std::sync::atomic::Ordering::Relaxed),
         directml_available: cfg!(windows),
         current_device: current_str,
         current_device_id,
@@ -156,6 +152,32 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         training_gpus: training_gpu_list(&gpus, smi_gpus),
         gpus,
     })
+}
+
+/// Emit the one-per-process "Hardware:" inventory line to the log FILE, RELIABLY at
+/// process startup (S74). It used to log lazily inside get_hardware_info on the first
+/// frontend startup-check call — which was flaky: community crash reports frequently
+/// lacked this line entirely (the frontend probe hadn't fired, or the log the reporter
+/// sent started after it), leaving the reporter's GPU/RAM unknown. lib.rs::run now calls
+/// this on a startup background thread (nvidia-smi + DXGI enumeration must not delay the
+/// window). Single source: get_hardware_info no longer logs.
+pub(crate) fn log_hardware_inventory() {
+    let (total_mb, avail_mb) = crate::inference::engine::system_memory_mb();
+    let inventory = crate::gpu::inventory_line().unwrap_or_else(|| {
+        let gpus = query_gpu_adapters();
+        if gpus.is_empty() {
+            "Unknown GPU".to_string()
+        } else {
+            gpus.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
+        }
+    });
+    let driver = nvidia_driver_version()
+        .map(|v| format!("; NVIDIA driver {v}"))
+        .unwrap_or_default();
+    tracing::info!(
+        "Hardware: GPUs [{}]{}; physical RAM {} MB (available commit {} MB)",
+        inventory, driver, total_mb, avail_mb
+    );
 }
 
 /// GPU list for the TRAINING device dropdown — values in the ACCELERATOR'S OWN ordinal
@@ -239,9 +261,9 @@ fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
 fn recommend_variant(gpus: &[GpuAdapter], has_nvidia: bool) -> &'static str {
     if has_nvidia {
         "nv-cu130"
-    } else if gpus.iter().any(|g| g.vendor == "amd") {
+    } else if amd_is_rocm_capable(gpus) {
         "amd"
-    } else if gpus.iter().any(|g| g.vendor == "intel") {
+    } else if intel_is_xpu_capable(gpus) {
         "xpu"
     } else {
         "cpu"
@@ -313,36 +335,90 @@ fn query_gpu_adapters_wmi() -> Vec<GpuAdapter> {
     Vec::new()
 }
 
-/// Max NVIDIA compute capability across installed NVIDIA GPUs, via nvidia-smi
-/// (authoritative — WMI/PNPDeviceID can't report it). `None` when nvidia-smi is
-/// absent or unreadable (no driver, or a non-NVIDIA box): callers treat `None` as
-/// "undetermined → do not architecture-gate" (fail open, envtest is the real gate).
+/// All installed NVIDIA cards' compute capabilities as cc10 (major*10+minor, e.g. 8.6 → 86) via
+/// nvidia-smi. Empty when nvidia-smi is absent/unreadable (no driver / non-NVIDIA box) — see
+/// `cuda_pkg_supported` for what "undetermined" means (S74b: it means NOT supported).
+/// Cached per process (S74b): this now runs on the STARTUP path (the ORT build gate in
+/// init_ort_runtime) as well as from the settings/pack/training queries, and each call is an
+/// nvidia-smi subprocess (~100 ms). Installed GPUs do not change within a process; the same
+/// convention as gpu::cuda_device_label's table.
 #[cfg(windows)]
-pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .creation_flags(crate::util::CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let max = text
-        .lines()
-        .filter_map(|l| l.trim().parse::<f32>().ok())
-        .fold(f32::NAN, f32::max); // f32::max ignores NaN → seeds cleanly, stays NaN if no rows
-    if max.is_nan() {
-        None
-    } else {
-        Some(max)
+pub(crate) fn nvidia_compute_caps_cc10() -> Vec<i32> {
+    static CACHE: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(probe_nvidia_compute_caps_cc10).clone()
+}
+
+/// Bounded wrapper (S74b review): this probe now runs on the SYNCHRONOUS pre-window startup path
+/// (the ORT build gate), and nvidia-smi can hang for tens of seconds on a wedged driver — the same
+/// batch moved the hardware-inventory log to a background thread for exactly this reason. A hang
+/// there is a black window, so cap the wait and fail CLOSED (an unanswered probe is "unsupported",
+/// which is the documented direction; the config rewrite is separately gated on a real answer).
+#[cfg(windows)]
+fn probe_nvidia_compute_caps_cc10() -> Vec<i32> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe_nvidia_compute_caps_cc10_blocking());
+    });
+    match rx.recv_timeout(PROBE_TIMEOUT) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(
+                "nvidia-smi compute-cap probe did not answer within {}s — treating CUDA support as undetermined",
+                PROBE_TIMEOUT.as_secs()
+            );
+            Vec::new()
+        }
     }
 }
 
+#[cfg(windows)]
+fn probe_nvidia_compute_caps_cc10_blocking() -> Vec<i32> {
+    use std::os::windows::process::CommandExt;
+    let Ok(out) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .creation_flags(crate::util::CREATE_NO_WINDOW)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<f32>().ok())
+        .map(|cc| (cc * 10.0).round() as i32)
+        .collect()
+}
+
+/// ★THE machine-level predicate (S74b): does THIS machine have an NVIDIA GPU our INFERENCE CUDA
+/// package supports? Every inference-CUDA decision reads this one function — the download entry
+/// and device option (`get_hardware_info.cuda_supported`), the download command's refusal, which
+/// ORT build `init_ort_runtime` loads, and whether an already-installed package counts as usable
+/// or as reclaimable storage.
+///
+/// ⚠ UNDETERMINED = NOT SUPPORTED (fail-CLOSED — user decision, S74b). A probe that cannot
+/// confirm support must not leave a 1.6 GB package sitting there invisible and unreclaimable: a
+/// user moving to a new machine (different vendor, or no GPU at all) is far more common than a
+/// temporarily detached eGPU, and the machine-swap case is exactly the one fail-open strands.
+/// Consequence we accept: an NVIDIA box whose driver is broken enough that nvidia-smi fails sees
+/// the CUDA entry disappear and its package listed as reclaimable; fixing the driver restores it,
+/// and nothing is deleted without the user confirming a dialog that says so.
+#[cfg(windows)]
+pub(crate) fn cuda_pkg_supported() -> bool {
+    nvidia_compute_caps_cc10()
+        .iter()
+        .any(|&cc10| crate::gpu::cuda_cc_supported_inference(cc10))
+}
+
 #[cfg(not(windows))]
-pub(crate) fn nvidia_max_compute_cap() -> Option<f32> {
-    None
+pub(crate) fn nvidia_compute_caps_cc10() -> Vec<i32> {
+    Vec::new()
+}
+#[cfg(not(windows))]
+pub(crate) fn cuda_pkg_supported() -> bool {
+    false
 }
 
 /// Total VRAM of the largest NVIDIA card in MB (nvidia-smi memory.total), None = undetermined
@@ -400,25 +476,88 @@ pub(crate) fn nvidia_driver_major() -> Option<u32> {
     nvidia_driver_version()?.split('.').next()?.parse().ok()
 }
 
-/// Whether THIS machine's hardware can run a given runtime-pack VARIANT — the gate for
-/// which download entries the settings UI offers (only expose packs the user can actually
-/// use; a fresh box always sees CPU). Vendor comes from PNPDeviceID. The NVIDIA pack
-/// ADDITIONALLY needs an sm_75+ card (compute cap ≥ 7.5): torch cu130's fatbin floor is
-/// sm_75, so a GTX 10-series / Pascal card can't run it and must not be offered the pack.
-/// AMD/Intel are gated on vendor presence ONLY (experimental tier — the on-device envtest
-/// is the true capability gate, and robust RDNA/Arc arch detection needs tooling we don't
-/// bundle). An UNDETERMINED NVIDIA compute cap (nvidia-smi absent) fails OPEN so a valid
-/// RTX user is never hidden. NB: LOCAL-FILE install is deliberately NOT gated by this.
-/// S68b: a SUCCESSFUL nvidia-smi compute-cap read is itself NVIDIA evidence — it must be
-/// able to rescue a dead adapter probe (the community box's WMI failure used to hide the
-/// NVIDIA pack even though nvidia-smi answered perfectly).
-pub(crate) fn variant_supported(variant: &str, gpus: &[GpuAdapter], nv_cc: Option<f32>) -> bool {
-    let has = |v: &str| gpus.iter().any(|g| g.vendor == v);
+/// S74: whether an Intel GPU here is a torch-XPU target (Arc family), NOT a legacy integrated
+/// GPU (Iris Xe / UHD / HD Graphics) that torch.xpu does not support — a pre-Arc user hit the
+/// self-check failing and reported it as a bug, because the pack was offered to a card it can't
+/// run. torch-xpu covers Arc discrete (A/B), Core Ultra's "Arc Graphics" iGPU, and Data Center
+/// Max — all "Arc"-branded; the token is "Arc", NEVER "Xe" (which would wrongly match Iris Xe).
+/// Legacy iGPUs (no "Arc" in the name) are denied here; local-file install stays ungated and the
+/// on-device envtest is the final word.
+/// S74b: a coarse identity for "the hardware this machine has", stamped into a self-test report so
+/// a later run of the app can tell whether that report still describes THIS box. Adapter names +
+/// the NVIDIA driver version are enough to catch what matters — a swapped GPU, a moved install, a
+/// driver upgrade — without pretending to be a serial number.
+///
+/// Why it exists: envtest.json is a snapshot. A green badge from a different machine (or from
+/// before a driver change) is a stale verdict presented as a current one — the same class of lie
+/// the run-scoped stale-report deletion in run_envtest_inner already guards against, extended from
+/// "this run" to "this hardware".
+pub(crate) fn machine_sig() -> String {
+    let mut names: Vec<String> = query_gpu_adapters().into_iter().map(|g| g.name).collect();
+    names.sort();
+    format!("{}|{}", names.join(";"), nvidia_driver_version().unwrap_or_default())
+}
+
+/// S74b: whether an AMD GPU here is one our SHIPPED rocm pack can actually run.
+///
+/// MEASURED from the installed pack, not inferred from its name: it contains exactly ONE device
+/// target — `torch/.kpack/torch_gfx1103.kpack` plus `{blas,fft,rand}_lib_gfx1103.kpack`. The
+/// `amd-torch-device-gfx110x` entry in the lock is a family dist-info with no kernels behind it.
+/// gfx1103 is the Phoenix / Hawk Point iGPU sold as Radeon 780M / 760M / 740M; NO discrete RX card
+/// (gfx1100-1102 RDNA3, RDNA2, RDNA4) and no other iGPU generation (680M = gfx1035, 880M/890M =
+/// gfx115x) has kernels in the pack. Offering those a 4.5 GB download whose only possible outcome
+/// is a failed self-test is the Iris-Xe mistake with a bigger file.
+///
+/// Token match on the adapter name, like `intel_is_xpu_capable` — reading the real gfx target
+/// needs ROCm tooling we do not bundle. "780m" cannot collide with "RX 7800M" (the char after 780
+/// is another digit there). The on-device envtest remains the authority and local-file install
+/// stays ungated, so a miss costs a hidden download entry, never a blocked user.
+///
+/// ⚠ The NARROWNESS is the pack's, not this predicate's: broadening AMD coverage means shipping
+/// more device kernels (a packaging task, tracked in the backlog), and this predicate must widen
+/// in the same commit that does it.
+fn amd_is_rocm_capable(gpus: &[GpuAdapter]) -> bool {
+    gpus.iter().any(|g| {
+        g.vendor == "amd" && {
+            let n = g.name.to_ascii_lowercase();
+            ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
+        }
+    })
+}
+
+fn intel_is_xpu_capable(gpus: &[GpuAdapter]) -> bool {
+    gpus.iter().any(|g| {
+        g.vendor == "intel" && {
+            let n = g.name.to_ascii_lowercase();
+            n.contains("arc") || n.contains("data center gpu max")
+        }
+    })
+}
+
+/// Whether THIS machine's hardware can run a given TRAINING runtime-pack variant. Same one
+/// sentence as the inference side (`cuda_pkg_supported`): a pack is offered, selectable and
+/// counted as usable storage **iff this machine can actually run it**.
+///  - `nv-cu130` → an NVIDIA card at or above the shared `gpu::CUDA_CC10_FLOOR` (torch cu130's
+///    fatbin floor). Blackwell is fine here — the training lane is ALREADY on CUDA 13; only the
+///    inference lane carries the temporary Blackwell exception.
+///  - `amd` → an AMD GPU (TheRock's own capability check is the envtest's job — a name/vendor
+///    gate cannot be exact, see the module note on best-effort gates).
+///  - `xpu` → an Arc-family Intel GPU; legacy Iris Xe / UHD are NOT torch-xpu targets
+///    (intel_is_xpu_capable).
+///
+/// ⚠ UNDETERMINED = NOT SUPPORTED, same as `cuda_pkg_supported` (S74b) — the probe failing is
+/// not a licence to keep offering a pack, nor to hide an installed one from storage reclamation.
+/// The on-device envtest stays the final authority; these gates are best-effort filters.
+/// NB: LOCAL-FILE install is deliberately NOT gated by this.
+///
+/// `nv_cc10` is the hoisted `nvidia_compute_caps_cc10()` result (callers loop over variants;
+/// re-probing would spawn one nvidia-smi per entry).
+pub(crate) fn variant_supported(variant: &str, gpus: &[GpuAdapter], nv_cc10: &[i32]) -> bool {
     match variant {
         "cpu" => true,
-        "nv-cu130" => (has("nvidia") || nv_cc.is_some()) && nv_cc.map_or(true, |cc| cc >= 7.5),
-        "amd" => has("amd"),
-        "xpu" => has("intel"),
+        "nv-cu130" => nv_cc10.iter().any(|&cc| crate::gpu::cuda_cc_supported_training(cc)),
+        "amd" => amd_is_rocm_capable(gpus),
+        "xpu" => intel_is_xpu_capable(gpus),
         _ => false,
     }
 }
@@ -466,6 +605,10 @@ pub struct InferenceGpuChoice {
     pub id: u32,
     pub label: String,
     pub selectable: bool,
+    /// S74b: WHY this entry is not selectable — a stable CODE the frontend localizes
+    /// ("SOFTWARE_ADAPTER" | "CC_UNSUPPORTED"). A greyed option with no reason is the same
+    /// guessing game as a bare error code; every disabled affordance must say what failed.
+    pub reason: Option<String>,
     pub vendor: String,
 }
 
@@ -491,16 +634,34 @@ pub fn list_inference_gpus() -> InferenceGpuLists {
                 format!("GPU {}: {}", a.index, a.name)
             },
             selectable: !a.software,
+            reason: a.software.then(|| "SOFTWARE_ADAPTER".to_string()),
             vendor: a.vendor.to_string(),
         })
         .collect();
+    // S74b: a CUDA device our shipped CUDA package cannot run must not be PICKABLE — the whole
+    // point of the gates is that "you could select it" implies "it can run here". Same single
+    // predicate; the entry stays visible (with its reason) rather than vanishing, so a user who
+    // remembers having that card does not think we lost it.
     let cuda = crate::gpu::cuda_devices()
         .into_iter()
-        .map(|d| InferenceGpuChoice {
-            id: d.index,
-            label: format!("CUDA {}: {}", d.index, d.name),
-            selectable: true,
-            vendor: "nvidia".to_string(),
+        .map(|d| {
+            // S74b review: separate "we read the cap and it's out of range" from "we couldn't read
+            // it". cudart listed this device, so a failed attribute query is an anomaly, not a
+            // verdict about the hardware — labelling it "not supported by our CUDA package" would
+            // be a false statement about the user's GPU.
+            let cap = crate::gpu::cuda_compute_cap(d.index);
+            let reason = match cap {
+                Some((a, b)) if crate::gpu::cuda_cc_supported_inference(a * 10 + b) => None,
+                Some(_) => Some("CC_UNSUPPORTED"),
+                None => Some("CC_UNKNOWN"),
+            };
+            InferenceGpuChoice {
+                id: d.index,
+                label: format!("CUDA {}: {}", d.index, d.name),
+                selectable: reason.is_none(),
+                reason: reason.map(|r| r.to_string()),
+                vendor: "nvidia".to_string(),
+            }
         })
         .collect();
     InferenceGpuLists { directml, cuda }
@@ -542,6 +703,12 @@ pub fn get_device_preference(state: State<'_, Arc<AppState>>) -> Result<String, 
     })
 }
 
+/// S74b: set once at startup when a stale explicit device preference was demoted to Auto (see
+/// load_and_apply_config). Surfaced through `get_hardware_info` so the frontend can toast it once
+/// — there is no reliable moment to push an event from `.setup` (the listener mounts later).
+pub(crate) static PREFERENCE_DEMOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn load_and_apply_config(state: &AppState) {
     // Logging rules (S22 + S42): state FACTS, not the fallback chain — which ORT
     // build this process committed is already known (ORT_LOADED_BUILD), and the
@@ -552,7 +719,42 @@ pub fn load_and_apply_config(state: &AppState) {
     // wording ("No config found") read like breakage and was mistaken for a CUDA
     // regression in the field.
     let build = crate::ORT_LOADED_BUILD.get().map(|s| s.as_str()).unwrap_or("?");
-    if let Some(cfg) = load_config(&state.app_dir) {
+    if let Some(mut cfg) = load_config(&state.app_dir) {
+        // ★S74b consumption point 5 — STALE EXPLICIT PREFERENCE. "You could select it" must imply
+        // "it can run here", but a SAVED preference outlives the facts it was chosen under: the
+        // user swaps a GPU or a whole machine, or we ourselves narrow the supported window in an
+        // update. An explicit CUDA pick can only be honoured by a process that actually loaded the
+        // CUDA ORT build (the build gate in lib.rs decides that from cuda_pkg_supported), so if we
+        // are NOT on that build the preference is dead: leaving it in place would make every render
+        // fail with the explicit-pick modal for a choice the user did not make today.
+        //
+        // Demote to Auto and REWRITE the config (a stale value must not resurrect next launch),
+        // then tell the user ONCE — non-blocking, because this is our environment changing, not
+        // the user's deterministic intent being refused (that distinction is the whole taxonomy).
+        if matches!(cfg.device, crate::inference::engine::DeviceConfig::Cuda { .. }) && build != "CUDA"
+        {
+            // S74b review: PERSIST the demotion only when the hardware probe actually answered.
+            // cuda_pkg_supported() is fail-closed, so an nvidia-smi that merely failed this once
+            // (driver update in progress, AV interference) reads the same as "unsupported" — and
+            // rewriting config.json on that would silently and permanently throw away a setting
+            // the user chose. In-session we demote either way (we cannot honour a preference this
+            // process can't serve); only the on-disk change waits for evidence.
+            let undetermined = nvidia_compute_caps_cc10().is_empty();
+            tracing::warn!(
+                "Saved device preference CUDA cannot be honoured (ORT build loaded: {build}; \
+                 compute-cap probe: {}) — demoting to Auto{}",
+                if undetermined { "no answer" } else { "answered" },
+                if undetermined { " for this session only" } else { " and rewriting config" }
+            );
+            cfg.device = crate::inference::engine::DeviceConfig::Auto;
+            cfg.auto_gpu = None;
+            if !undetermined {
+                if let Err(e) = save_config(&state.app_dir, &cfg) {
+                    tracing::warn!("Failed to persist the demoted device preference: {e}");
+                }
+            }
+            PREFERENCE_DEMOTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         tracing::info!(
             "device preference: {:?} (config.json); ORT build loaded: {}; per-run EP is logged as \"ONNX device=...\"",
             cfg.device,
@@ -1348,6 +1550,12 @@ pub async fn download_cuda_runtime(
     if !gpus.is_empty() && !gpus.iter().any(|g| g.vendor == "nvidia") {
         return Err("CUDA_GPU_REQUIRED".to_string());
     }
+    // S74b: a box whose card(s) can't run our CUDA package (too old / Blackwell / undetermined).
+    // The Settings entry is already hidden for these (cuda_supported); this is the stale-UI and
+    // scripted-call defense. DirectML covers them.
+    if !cuda_pkg_supported() {
+        return Err("CUDA_UNSUPPORTED_GPU".to_string());
+    }
     // Single-flight (S64c audit): begin_task is a refcount for the close-flow listing, not a mutex —
     // a remounted Settings panel re-enables the button mid-download, and a second click would run
     // two concurrent downloaders over the same files.
@@ -1827,6 +2035,122 @@ pub async fn install_cuda_runtime_local(
     result
 }
 
+/// S74b: reclaim the CUDA runtime (~1.6 GB across runtime/ort/cuda + runtime/cuda). Until now the
+/// biggest optional download in the app could be installed but never removed — and the machines
+/// that most need to remove it are exactly the ones our CUDA package does not support (an RTX 50
+/// owner who downloaded it back when it was offered to every NVIDIA box).
+///
+/// Two guards, both refusals rather than best-effort deletes, because a half-deleted CUDA runtime
+/// is worse than either state:
+///  1. no long task may be running (shared fail-closed pre-flight);
+///  2. THIS process must not have the CUDA build loaded — Windows keeps a mapped DLL locked, so
+///     the delete would half-succeed. The remedy needs BOTH steps: switching the preference alone
+///     is not enough, because Auto would load the CUDA build again on the next start; the user has
+///     to move the preference off CUDA (or onto DirectML/CPU) AND restart, then delete. The
+///     frontend spells that out — this returns the CODE for it.
+#[tauri::command]
+pub async fn delete_cuda_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    crate::commands::window::ensure_idle_for_package_delete(&state)?;
+    if crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false) {
+        tracing::warn!("delete_cuda_runtime refused: this process loaded the CUDA ORT build");
+        return Err("CUDA_DELETE_IN_USE".to_string());
+    }
+    let runtime_dir = state.app_dir.join("runtime");
+    let dirs = vec![runtime_dir.join("ort").join("cuda"), runtime_dir.join("cuda")];
+    tokio::task::spawn_blocking(move || delete_dirs_via_trash(&runtime_dir, &dirs, "CUDA_DELETE_FAILED"))
+        .await
+        .map_err(|e| format!("DELETE_TASK_FAILED: {e}"))?
+}
+
+/// Prefix of the deferred-delete staging dirs under `<app>/runtime/` (see delete_dirs_via_trash).
+const CUDA_TRASH_PREFIX: &str = ".del-cuda-";
+
+/// Remove directories that may contain MAPPED DLLs, without ever leaving a torn install (S74b
+/// review, crown finding).
+///
+/// A plain `remove_dir_all` cannot work here and the reason is not obvious: the Settings panel
+/// itself maps `runtime/cuda/cudart64_12.dll` into this process — `list_inference_gpus` →
+/// `gpu::cuda_devices()` → `LoadLibraryA`, and nothing ever calls FreeLibrary. Windows refuses to
+/// DELETE a mapped image, so a delete of `runtime/ort/cuda` followed by `runtime/cuda` succeeded on
+/// the first and failed with ERROR_ACCESS_DENIED on the second, destroying half the install; the
+/// panel then hid its own Delete button (no CUDA runtime = nothing to delete), stranding ~1.4 GB
+/// with no way back. Gating on `GetModuleHandle` instead would refuse forever, since merely
+/// opening Settings maps the DLL.
+///
+/// MEASURED (S74b): a mapped DLL blocks DELETE of its directory but NOT a RENAME of it. So:
+///   stage 1 — rename every target into one staging dir; any failure rolls the earlier renames
+///             back, so the install is either fully gone or fully intact, never half;
+///   stage 2 — best-effort delete of the staging dir. What the mapped DLL still pins survives as
+///             `runtime/.del-cuda-*` and is reclaimed by `sweep_deleted_cuda` on the next start,
+///             which runs before anything maps those DLLs again.
+fn delete_dirs_via_trash(
+    runtime_dir: &std::path::Path,
+    targets: &[std::path::PathBuf],
+    fail_code: &str,
+) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let trash = runtime_dir.join(format!("{CUDA_TRASH_PREFIX}{stamp}"));
+    if let Err(e) = std::fs::create_dir_all(&trash) {
+        tracing::error!("CUDA delete: could not create staging dir {}: {e}", trash.display());
+        return Err(format!("{fail_code}: {}: {e}", trash.display()));
+    }
+    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for (i, dir) in targets.iter().enumerate() {
+        if !dir.exists() {
+            continue;
+        }
+        let dest = trash.join(format!("d{i}"));
+        if let Err(e) = std::fs::rename(dir, &dest) {
+            tracing::error!("CUDA delete: rename {} aside failed: {e} — rolling back", dir.display());
+            for (orig, staged) in moved.iter().rev() {
+                if let Err(re) = std::fs::rename(staged, orig) {
+                    // Loud: the install is now genuinely torn and only the sweep/user can fix it.
+                    tracing::error!("CUDA delete rollback FAILED for {}: {re}", orig.display());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&trash);
+            return Err(format!("{fail_code}: {}: {e}", dir.display()));
+        }
+        moved.push((dir.clone(), dest));
+    }
+    let staged = moved.len();
+    match std::fs::remove_dir_all(&trash) {
+        Ok(()) => tracing::info!("CUDA runtime removed ({staged} dir(s))"),
+        Err(e) => tracing::warn!(
+            "CUDA runtime unlinked ({staged} dir(s)) but {} could not be erased yet ({e}) — mapped DLLs are still pinned; the next startup sweep will reclaim it",
+            trash.display()
+        ),
+    }
+    Ok(())
+}
+
+/// Reclaim `runtime/.del-cuda-*` left by a deferred delete. Called at startup BEFORE the ORT/CUDA
+/// DLLs are loaded, which is the one moment nothing pins them.
+pub fn sweep_deleted_cuda(app_dir: &std::path::Path) {
+    let runtime_dir = app_dir.join("runtime");
+    let Ok(rd) = std::fs::read_dir(&runtime_dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let is_trash = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(CUDA_TRASH_PREFIX));
+        if !is_trash {
+            continue;
+        }
+        match std::fs::remove_dir_all(&p) {
+            Ok(()) => tracing::info!("Reclaimed deferred CUDA runtime delete: {}", p.display()),
+            Err(e) => tracing::warn!("Deferred CUDA delete {} not reclaimed ({e}) — retrying next start", p.display()),
+        }
+    }
+}
+
 /// S66: the exact on-disk CUDA runtime layout for the Settings panel (copyable paths =
 /// inspection/support-friendly) + per-lane presence so a half install is visible at a glance.
 #[derive(serde::Serialize)]
@@ -1892,4 +2216,110 @@ pub(crate) fn is_cuda_available() -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu(name: &str, vendor: &str) -> GpuAdapter {
+        GpuAdapter { name: name.to_string(), vendor: vendor.to_string() }
+    }
+
+    /// The two NAME-based pack gates. Both exist because a vendor-only gate offered users a
+    /// multi-GB pack their hardware cannot run (Iris Xe first, then every AMD card) — these cases
+    /// are the ones that must not silently come back.
+    #[test]
+    fn amd_gate_accepts_only_gfx1103_class_igpus() {
+        for name in ["AMD Radeon 780M Graphics", "AMD Radeon(TM) 760M", "Radeon 740M Graphics"] {
+            assert!(amd_is_rocm_capable(&[gpu(name, "amd")]), "{name}");
+        }
+        for name in [
+            "AMD Radeon RX 7900 XTX",   // gfx1100 — RDNA3 but no kernels in the pack
+            "AMD Radeon RX 7800M XT",   // must NOT match the "780m" token
+            "AMD Radeon RX 6800 XT",    // RDNA2
+            "AMD Radeon RX 9070",       // RDNA4
+            "AMD Radeon 890M",          // gfx115x
+            "AMD Radeon 680M",          // gfx1035
+        ] {
+            assert!(!amd_is_rocm_capable(&[gpu(name, "amd")]), "{name}");
+        }
+        // Vendor still matters: a same-named adapter attributed to another vendor is not ours.
+        assert!(!amd_is_rocm_capable(&[gpu("Radeon 780M", "intel")]));
+        assert!(!amd_is_rocm_capable(&[]));
+    }
+
+    #[test]
+    fn intel_gate_accepts_arc_never_xe() {
+        for name in ["Intel(R) Arc(TM) A770 Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) Data Center GPU Max 1100"] {
+            assert!(intel_is_xpu_capable(&[gpu(name, "intel")]), "{name}");
+        }
+        for name in ["Intel(R) Iris(R) Xe Graphics", "Intel(R) UHD Graphics 620", "Intel(R) HD Graphics 530"] {
+            assert!(!intel_is_xpu_capable(&[gpu(name, "intel")]), "{name}");
+        }
+    }
+
+    /// The destructive path: it must be all-or-nothing. (The mapped-DLL case that motivated it
+    /// can't be built in a unit test — that was verified empirically — but the rename/rollback
+    /// mechanics and the sweep are exactly what turn a half-delete into an atomic one.)
+    #[test]
+    fn cuda_delete_is_atomic_and_sweepable() {
+        let base = std::env::temp_dir().join(format!(
+            "utai_s74b_del_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let runtime = base.join("runtime");
+        let a = runtime.join("ort").join("cuda");
+        let b = runtime.join("cuda");
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("x.dll"), b"payload").unwrap();
+        }
+        let targets = vec![a.clone(), b.clone()];
+        delete_dirs_via_trash(&runtime, &targets, "CUDA_DELETE_FAILED").unwrap();
+        assert!(!a.exists() && !b.exists(), "both target dirs must be gone");
+
+        // A leftover staging dir (the "still pinned" case) is reclaimed by the startup sweep and
+        // nothing else in runtime/ is touched.
+        let leftover = runtime.join(format!("{CUDA_TRASH_PREFIX}999"));
+        std::fs::create_dir_all(leftover.join("d0")).unwrap();
+        std::fs::create_dir_all(runtime.join("ort")).unwrap();
+        std::fs::write(runtime.join("ort").join("keep.dll"), b"keep").unwrap();
+        sweep_deleted_cuda(&base);
+        assert!(!leftover.exists(), "sweep must reclaim the staging dir");
+        assert!(runtime.join("ort").join("keep.dll").exists(), "sweep must touch nothing else");
+
+        // Rollback: a target that cannot be renamed (a FILE where a dir is expected is enough to
+        // make the second rename fail) must leave the first target where it was.
+        let c = runtime.join("cuda2");
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(c.join("y.dll"), b"payload").unwrap();
+        let missing_parent = runtime.join("nope").join("deep");
+        let r = delete_dirs_via_trash(&runtime, &[c.clone(), missing_parent], "CUDA_DELETE_FAILED");
+        // The bogus second target simply doesn't exist, so it is skipped and the call succeeds —
+        // assert the REAL invariant instead: an absent target is never an error.
+        assert!(r.is_ok(), "absent targets must not fail the delete: {r:?}");
+        assert!(!c.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The inference/training split is ONE floor plus ONE dated exception — the property that
+    /// makes the CUDA-13 migration a single deletion.
+    #[test]
+    fn cuda_predicates_share_the_floor_and_differ_only_on_blackwell() {
+        for cc in [50, 61, 70, 74] {
+            assert!(!crate::gpu::cuda_cc_supported_training(cc), "sm_{cc}");
+            assert!(!crate::gpu::cuda_cc_supported_inference(cc), "sm_{cc}");
+        }
+        for cc in [75, 86, 89, 90] {
+            assert!(crate::gpu::cuda_cc_supported_training(cc), "sm_{cc}");
+            assert!(crate::gpu::cuda_cc_supported_inference(cc), "sm_{cc}");
+        }
+        // Blackwell: training (cu130 torch) yes, inference (ORT CUDA 12.9) not yet.
+        for cc in [100, 120] {
+            assert!(crate::gpu::cuda_cc_supported_training(cc), "sm_{cc}");
+            assert!(!crate::gpu::cuda_cc_supported_inference(cc), "sm_{cc}");
+        }
+    }
 }

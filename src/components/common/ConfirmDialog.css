@@ -50,6 +50,19 @@
   white-space: pre-line;
 }
 
+/* S74: error modals (maybeShowErrorModal) — a long stderr tail / low-memory guidance must
+   scroll inside the dialog instead of pushing the OK button off-screen, and long unbroken
+   tokens (paths) must wrap. Selection is re-enabled via the global `.selectable` whitelist. */
+.confirm-dialog.error-modal {
+  max-width: 640px;
+}
+
+.confirm-body.scrollable {
+  max-height: 50vh;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+
 .confirm-input-row {
   margin-bottom: 18px;
 }

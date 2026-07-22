@@ -46,8 +46,24 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
   ASSET_DL_BUSY: { key: "backend.ASSET_DL_BUSY", busy: true },
   ASSET_DL_FAILED: { key: "backend.ASSET_DL_FAILED" },
+  // S74b asset-pack reclamation.
+  ASSET_DELETE_FAILED: { key: "backend.ASSET_DELETE_FAILED" },
+  ASSET_PACK_UNKNOWN: { key: "backend.ASSET_PACK_UNKNOWN" },
+  // S74b CUDA-runtime reclamation. IN_USE is a modal: its remedy is a two-step procedure
+  // (change the device preference, restart) that must not be truncated into a toast.
+  CUDA_DELETE_FAILED: { key: "backend.CUDA_DELETE_FAILED" },
+  CUDA_DELETE_IN_USE: { key: "backend.CUDA_DELETE_IN_USE", modal: true },
   CUDA_DOWNLOAD_BUSY: { key: "backend.CUDA_DOWNLOAD_BUSY", busy: true },
   CUDA_GPU_REQUIRED: { key: "backend.CUDA_GPU_REQUIRED" },
+  // S74 modal: the GPU's compute capability is outside the window our shipped CUDA build can run
+  // (too-old, or too-new Blackwell/RTX 50 whose sm_120 ships only broken PTX) — actionable
+  // "use DirectML" guidance. Emitted by the inference engine (explicit CUDA + run-time
+  // classification) and the CUDA-runtime download refusal.
+  CUDA_UNSUPPORTED_GPU: { key: "backend.CUDA_UNSUPPORTED_GPU", modal: true },
+  // S74b: the ORT build is fixed at startup — an explicit DirectML pick cannot be honoured by a
+  // process that loaded the CUDA build (registering the DML EP there access-violates), so the
+  // engine refuses instead of probing. Blocking (explicit pick) → modal.
+  DML_NEEDS_RESTART: { key: "backend.DML_NEEDS_RESTART", modal: true },
   // S66 poisoned-proxy guard (download.rs): a GH proxy answered a download with an HTML page.
   DOWNLOAD_HTML_RESPONSE: { key: "backend.DOWNLOAD_HTML_RESPONSE" },
   // S66 CUDA local-file install (settings.rs install_cuda_runtime_local).
@@ -57,9 +73,15 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // S66 conversion single-flight + heavy-job interlock (lib.rs acquire_convert_slot).
   CONVERT_BUSY: { key: "backend.CONVERT_BUSY", busy: true },
   CONVERT_RENDER_BUSY: { key: "backend.CONVERT_RENDER_BUSY", busy: true },
+  // S74 modal: a host-RAM OOM inside torch.onnx.export (MemoryError: bad allocation), mapped
+  // to a clean actionable line. Modal (not the inline strip) so it reads clearly on its own.
+  CONVERT_LOW_MEMORY: { key: "backend.CONVERT_LOW_MEMORY", modal: true },
   // S66 MSST conversion errors (msst_models.rs, formerly prose strings).
   MSST_ARCH_UNKNOWN: { key: "backend.MSST_ARCH_UNKNOWN" },
-  MSST_CONVERT_FAILED: { key: "backend.MSST_CONVERT_FAILED" },
+  // S74 modal: converter failures carry a long stderr TAIL (the benign com.microsoft
+  // shape-inference warning flood + the real terminating error) — far too long for the inline
+  // strip; route to the scrollable/copyable modal so the real error at the bottom is reachable.
+  MSST_CONVERT_FAILED: { key: "backend.MSST_CONVERT_FAILED", modal: true },
   MSST_FILE_NOT_FOUND: { key: "backend.MSST_FILE_NOT_FOUND" },
   // S66/O5: the render commands write the wav Rust-side; disk write failure is its own code.
   RENDER_WRITE_FAILED: { key: "backend.RENDER_WRITE_FAILED" },
@@ -102,6 +124,9 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   CONTENTVEC_RESHAPE_FAILED: { key: "backend.CONTENTVEC_RESHAPE_FAILED" },
   CONTENTVEC_SHAPE: { key: "backend.CONTENTVEC_SHAPE" },
   DELETE_TASK_FAILED: { key: "backend.DELETE_TASK_FAILED" },
+  // S74b: destructive package removals are refused while any long task runs (fail-closed
+  // pre-flight in window.rs). Transient by nature → busy, not an error.
+  DELETE_WHILE_BUSY: { key: "backend.DELETE_WHILE_BUSY", busy: true },
   DELETE_WHILE_ENVTEST: { key: "backend.DELETE_WHILE_ENVTEST", busy: true },
   DELETE_WHILE_INSTALLING: { key: "backend.DELETE_WHILE_INSTALLING", busy: true },
   DIFFUSION_COND_SHAPE: { key: "backend.DIFFUSION_COND_SHAPE" },
@@ -143,6 +168,15 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // (the community screenshot showed a zh headline + a wall of raw log jammed together).
   ENVTEST_CRASHED: { key: "backend.ENVTEST_CRASHED", modal: true },
   ENVTEST_FAILED: { key: "backend.ENVTEST_FAILED" },
+  // S74b: self-test checks whose failure the user must ACT on carry a stable CODE, so the Settings
+  // pack list shows a localized remedy instead of the check's raw diagnostic (which stays as the
+  // technical annex). The driver-floor check deliberately reuses RUNTIME_DRIVER_TOO_OLD.
+  ENVTEST_PACKAGES_BROKEN: { key: "backend.ENVTEST_PACKAGES_BROKEN" },
+  ENVTEST_TORCH_NO_CUDA: { key: "backend.ENVTEST_TORCH_NO_CUDA" },
+  // Self-test WARNs (they do not fail the pack): an Intel-GPU op that silently ran on the CPU.
+  // A hot op (conv/stft/fft) is the difference between usable and useless training throughput.
+  ENVTEST_OP_FALLBACK_HOT: { key: "backend.ENVTEST_OP_FALLBACK_HOT" },
+  ENVTEST_OP_FALLBACK_COLD: { key: "backend.ENVTEST_OP_FALLBACK_COLD" },
   ENVTEST_REPORT_CLEAR_FAILED: { key: "backend.ENVTEST_REPORT_CLEAR_FAILED" },
   ENVTEST_REPORT_CONTRADICTION: { key: "backend.ENVTEST_REPORT_CONTRADICTION" },
   ENVTEST_SCRIPT_MISSING: { key: "backend.ENVTEST_SCRIPT_MISSING" },
@@ -349,6 +383,10 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   WORKSPACE_MANIFEST_MISSING: { key: "backend.WORKSPACE_MANIFEST_MISSING" },
   WORKSPACE_DELETE_FAILED: { key: "backend.WORKSPACE_DELETE_FAILED" },
   WORKSPACE_WIPE_FAILED: { key: "backend.WORKSPACE_WIPE_FAILED" },
+  // S74: emitted by the runtime-pack self-test (utai_train/envtest.py check_torch_backend, xpu
+  // tier) — torch-XPU found no Arc-family GPU. Surfaces per-check in the Settings pack list, so
+  // a pre-Arc Intel user learns WHY instead of reading a bare check name.
+  XPU_NO_DEVICE: { key: "backend.XPU_NO_DEVICE" },
   ZSTD_INIT_FAILED: { key: "backend.ZSTD_INIT_FAILED" },
 };
 

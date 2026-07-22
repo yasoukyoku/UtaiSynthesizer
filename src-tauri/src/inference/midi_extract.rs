@@ -12,8 +12,12 @@
 //! Parity gate: `cargo test --test game_parity -- --ignored` vs the python-ORT oracle
 //! (TESTING/utai-v2-testing/game_oracle/, oracle_notes.json includes chunk boundaries).
 //!
-//! Sessions run on CPU (like the aux extractors): the medium model transcribes ~7.5×
-//! realtime on CPU, so the GPU/VRAM is never touched.
+//! Device: sessions follow the GLOBAL device preference (S60c) and fall back to CPU once,
+//! loudly, on a run-time failure — see extract_notes. (The original "CPU only, the GPU is
+//! never touched" note here was stale from S60-1 and misled the S74 bug hunt; CPU is only
+//! the batch harness's default, and ~7.5× realtime is the CPU figure.)
+//! GAME's encoder convs are the app's only user of cuDNN's FRONTEND graph API, which lazily
+//! loads engine libraries the ort crate does not preload — see lib.rs CUDNN_FRONTEND_EXTRA_DLLS.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

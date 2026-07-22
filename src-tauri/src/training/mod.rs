@@ -79,10 +79,10 @@ fn refuse_cpu_only_runtime(app_dir: &Path, force_cpu: bool) -> Result<()> {
         return Ok(());
     }
     let gpus = crate::commands::settings::query_gpu_adapters();
-    let nv_cc = crate::commands::settings::nvidia_max_compute_cap();
+    let nv_cc10 = crate::commands::settings::nvidia_compute_caps_cc10();
     let offerable = ["nv-cu130", "amd", "xpu"]
         .iter()
-        .any(|v| crate::commands::settings::variant_supported(v, &gpus, nv_cc));
+        .any(|v| crate::commands::settings::variant_supported(v, &gpus, &nv_cc10));
     if offerable {
         return Err(UtaiError::Training("TRAINING_RUNTIME_CPU_ONLY".into()));
     }

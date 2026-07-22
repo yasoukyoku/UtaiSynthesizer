@@ -188,6 +188,64 @@ pub fn suppress_windows_dll_error_dialogs() {
     }
 }
 
+/// cuDNN 9 libraries the `ort` crate's `ep::cuda::preload_dylibs` does NOT preload (its list is
+/// cudnn64 / graph / ops / heuristic / adv / cnn / engines_precompiled / engines_runtime_compiled).
+/// cuDNN loads these LAZILY BY BASENAME — i.e. through the process DLL search path — and only on
+/// the FRONTEND graph API. That is exactly why GAME's encoder convs died with
+/// `CUDNN_FE failure 11: CUDNN_BACKEND_API_FAILED` on CUDA while every voice model (classic cuDNN
+/// API) kept working: `Could not locate cudnn_engines_tensor_ir64_9.dll`.
+///
+/// The search path is NOT a guarantee. S74 A/B (headless `game_batch` with UTAI_GAME_DEVICE=cuda:0):
+/// PATH-prepend alone → GAME on CUDA works; AddDllDirectory alone → the miss above. So today the
+/// PATH prepend in setup_cuda_dll_paths is the SINGLE point of failure (the AddDllDirectory
+/// registration next to it is inert unless something puts the process in user-dirs mode), and PATH
+/// is not ours to rely on — it can be at the 32 KB cap, and any component calling
+/// SetDefaultDllDirectories removes it from the search order process-wide.
+/// Loading them BY ABSOLUTE PATH here is immune to all of that: first-load-by-basename wins, so
+/// cuDNN's later lazy load resolves to the module we already mapped.
+#[cfg(windows)]
+const CUDNN_FRONTEND_EXTRA_DLLS: [&str; 2] =
+    ["cudnn_engines_tensor_ir64_9.dll", "cudnn_ext64_9.dll"];
+
+/// Map the cuDNN frontend libraries the ort crate misses (see CUDNN_FRONTEND_EXTRA_DLLS).
+/// A miss is LOUD: an absent file means runtime/cuda is incomplete, which the community's
+/// crash logs must state plainly instead of surfacing later as an opaque cuDNN backend error.
+#[cfg(windows)]
+fn preload_cudnn_frontend_libs(cudnn_dir: &std::path::Path) {
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut std::ffi::c_void;
+    }
+    for name in CUDNN_FRONTEND_EXTRA_DLLS {
+        let path = cudnn_dir.join(name);
+        if !path.exists() {
+            tracing::warn!(
+                "runtime/cuda is missing {name} — CUDA convs that use the cuDNN FRONTEND graph API \
+                 (MIDI extraction) will fail; re-download the CUDA runtime in Settings"
+            );
+            continue;
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: NUL-terminated UTF-16 path to an existing file; the returned handle is
+        // deliberately leaked (the module must stay mapped for the process lifetime).
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if handle.is_null() {
+            tracing::warn!(
+                "cuDNN frontend preload failed for {} (LoadLibrary error {})",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn preload_cudnn_frontend_libs(_cudnn_dir: &std::path::Path) {}
+
 /// Which ORT BUILD init_ort_runtime actually committed ("CUDA" / "DirectML" / a
 /// dev-cache/system path). Recorded so later startup lines can state the FACT of
 /// what loaded instead of re-announcing the Auto chain — the S22 logging rule
@@ -211,8 +269,20 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
     // Auto/unset → load the CUDA build when this machine actually has CUDA (Toolkit cudart present) AND
     // the CUDA build is downloaded — the whole point of Auto: light up CUDA without a manual pick. The
     // CUDA build MUST be the version matching the ort crate's API (1.24.x / API 24); a mismatch deadlocks.
+    // ★S74b CONSUMPTION POINT 2 — the ORT BUILD gate. This is the decision that makes every
+    // downstream fallback either possible or impossible, because the CUDA build ships CUDA+CPU
+    // EPs ONLY: once it is loaded, "fall back to DirectML" cannot happen in this process, and
+    // Auto's next tier is CPU. So a machine our CUDA PACKAGE does not support must never load
+    // the CUDA build — otherwise hiding the entry (point 1) merely converts a loud failure into
+    // a silent CPU session, which is the exact regression class this project treats as its worst.
+    // `cuda_pkg_supported()` is the SAME predicate the entry/option gate uses (single source),
+    // and it is fail-CLOSED, so an unconfirmable box lands on DirectML — which always works.
+    let cuda_pkg_supported = crate::commands::settings::cuda_pkg_supported();
     let prefer_cuda = match read_device_preference(app_dir).as_deref() {
-        Some("cuda") => true,
+        // An explicit "cuda" preference is only honoured while the machine still supports it —
+        // hardware and our own window both change under a saved config (see the stale-preference
+        // demotion in run(), which rewrites the preference and tells the user).
+        Some("cuda") => cuda_pkg_supported,
         Some("directml") | Some("cpu") => false,
         // Auto needs the provider's FULL dependency set resolvable, not just cudart (S64c audit: a
         // PARTIAL wheel install would otherwise pick the CUDA build — which has no DirectML provider —
@@ -223,11 +293,20 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
             let picked_non_nvidia = read_auto_gpu(app_dir)
                 .and_then(crate::gpu::adapter_vendor)
                 .is_some_and(|v| v != "nvidia");
-            !picked_non_nvidia
+            cuda_pkg_supported
+                && !picked_non_nvidia
                 && cuda_dll.exists()
                 && crate::commands::settings::cuda_provider_deps_resolvable(app_dir)
         }
     };
+    if !cuda_pkg_supported && cuda_dll.exists() {
+        // Loud, and exactly the line a community log needs: the package is installed but this
+        // machine can't use it (too old / Blackwell / undetectable NVIDIA). Storage reclamation
+        // lists it for deletion; inference proceeds on DirectML.
+        tracing::info!(
+            "CUDA package present but unsupported on this machine — loading the DirectML build"
+        );
+    }
 
     let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
 
@@ -245,6 +324,7 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
             if let Err(e) = ort::ep::cuda::preload_dylibs(None, Some(&cudnn_dir)) {
                 tracing::warn!("cuDNN preload (runtime/cuda) incomplete: {e}");
             }
+            preload_cudnn_frontend_libs(&cudnn_dir);
             // CUDA core libs from OUR dir — only where the self-contained download placed them
             // (a pre-S64c runtime/cuda holds only cuDNN; attempting would just warn-spam dev boxes).
             if cudnn_dir.join("cudart64_12.dll").exists() {
@@ -257,7 +337,9 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
                     tracing::warn!("CUDA preload (CUDA_PATH) incomplete: {e}");
                 }
             }
-            search_paths.push(cuda_dll);
+            // clone: `cuda_dll` stays available as the identity the build classifier compares
+            // against below (that tag now gates the DirectML EP, so it must be exact).
+            search_paths.push(cuda_dll.clone());
             tracing::info!("CUDA available — preloaded CUDA dylibs + loading CUDA ORT build");
         } else {
             tracing::warn!("CUDA preferred but runtime/ort/cuda/ missing — using DirectML build");
@@ -300,7 +382,12 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
                     builder.commit();
                     quiet_ort_logging();
                     // Classify what ACTUALLY loaded (fact, not intent) for later log lines.
-                    let build = if path.components().any(|c| c.as_os_str() == "cuda") {
+                    // S74b: compare against the KNOWN paths first. This tag is no longer cosmetic —
+                    // it decides whether the DirectML EP may be probed at all (build_session_auto /
+                    // the explicit DML guard), so the old "does any path component happen to be
+                    // named cuda" heuristic would mis-tag an app installed under e.g. D:\AI\cuda\
+                    // and silently strip that machine of GPU inference.
+                    let build = if *path == cuda_dll {
                         "CUDA".to_string()
                     } else if *path == runtime_dir.join(dll_name) {
                         "DirectML".to_string()
@@ -415,11 +502,16 @@ pub fn setup_cuda_dll_paths(app_dir: &std::path::Path) {
                 .collect();
             let new_path = format!("{};{}", additions.join(";"), current_path);
             std::env::set_var("PATH", &new_path);
-            // S60c: ALSO register via AddDllDirectory — cudnn 9's FRONTEND path lazily loads
-            // its engine DLLs (cudnn_engines_tensor_ir64_9.dll etc.) with LOAD_LIBRARY_SEARCH_*
-            // semantics that IGNORE PATH once the process is in default-dirs mode; the PATH
-            // prepend alone left GAME's convs failing CUDNN_FE on CUDA while the classic-API
-            // convs (voice models) kept working.
+            // ALSO register via AddDllDirectory, for the case where something has put the process
+            // in user-dirs mode (SetDefaultDllDirectories) — there PATH is gone from the search
+            // order and only these registrations resolve a lazily-loaded DLL.
+            // ⚠ CORRECTION (S74, A/B-measured — the S60c note here had the causality backwards):
+            // in the NORMAL mode this app runs in, AddDllDirectory is INERT and the PATH prepend
+            // above is what works. Headless game_batch on CUDA: AddDllDirectory alone → cuDNN
+            // can't find cudnn_engines_tensor_ir64_9.dll → CUDNN_FE failure 11; PATH alone → OK.
+            // So neither of these two is a dependable resolver for cuDNN's lazy frontend loads —
+            // that is why lib.rs preloads those libraries BY ABSOLUTE PATH
+            // (CUDNN_FRONTEND_EXTRA_DLLS); keep both registrations as the belt around it.
             extern "system" {
                 fn AddDllDirectory(new_directory: *const u16) -> *mut std::ffi::c_void;
             }
@@ -759,6 +851,18 @@ fn webview_data_dir() -> Option<std::path::PathBuf> {
     None
 }
 
+/// S74: global app handle, set once in .setup, so lower layers (the inference engine's Auto-CUDA
+/// fallback) can fire a fire-and-forget frontend event without threading an AppHandle through.
+pub static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Emit a frontend event via the global handle if the app is up (no-op pre-setup / headless tests).
+pub fn app_emit(event: &str, payload: impl serde::Serialize + Clone) {
+    if let Some(h) = APP_HANDLE.get() {
+        use tauri::Emitter;
+        let _ = h.emit(event, payload);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Observed: Auto loading the CUDA build hung on a missing cudart/cublas without this —
@@ -873,8 +977,17 @@ pub fn run() {
     std::thread::spawn(portable::heal_install_registry);
 
     let app_dir_early = resolve_app_dir();
+    // S74b: reclaim a deferred CUDA-runtime delete BEFORE anything maps those DLLs — this is the
+    // only moment in the process where nothing pins them (see delete_dirs_via_trash).
+    commands::settings::sweep_deleted_cuda(&app_dir_early);
     setup_cuda_dll_paths(&app_dir_early);
     init_ort_runtime(&app_dir_early);
+
+    // S74: log the "Hardware:" inventory line RELIABLY at process start, instead of lazily
+    // on the first frontend get_hardware_info call (crash logs frequently lacked it — the
+    // reporter's GPU/RAM was a blind spot). Background thread: nvidia-smi + DXGI enumeration
+    // must not delay the window. Single source — get_hardware_info no longer logs it.
+    std::thread::spawn(commands::settings::log_hardware_inventory);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -890,6 +1003,8 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // S74: global handle for fire-and-forget frontend events (the Auto-CUDA fallback toast).
+            let _ = APP_HANDLE.set(app.handle().clone());
             // Big growable files (models + cache) live under the DATA ROOT — default app_dir/data (next
             // to the program, NOT C: AppData; these reach tens of GB). Resolved from config BEFORE
             // deriving the dirs (so a user-set drive takes effect); changing it requires a restart.
@@ -1184,9 +1299,11 @@ pub fn run() {
             commands::settings::set_cuda_mem_limit,
             commands::settings::install_cuda_runtime_local,
             commands::settings::cuda_runtime_paths,
+            commands::settings::delete_cuda_runtime,
             commands::settings::fetch_mirror_list,
             commands::assets::asset_pack_status,
             commands::assets::download_asset_pack,
+            commands::assets::delete_asset_pack,
             commands::assets::cancel_asset_pack_download,
             commands::pyenv::get_runtime_env_info,
             commands::pyenv::training_env_ready,

@@ -237,7 +237,7 @@ fn parse_ust_ground_truth(path: &PathBuf) -> Vec<(f64, f64, i32)> {
     let mut num = 60i32;
     let mut length = 0.0f64;
     let mut in_note = false;
-    let mut flush = |lyric: &str, num: i32, length: f64, cur_tick: &mut f64, tempo: f64, notes: &mut Vec<(f64, f64, i32)>| {
+    let flush = |lyric: &str, num: i32, length: f64, cur_tick: &mut f64, tempo: f64, notes: &mut Vec<(f64, f64, i32)>| {
         let sec_per_tick = 60.0 / tempo / 480.0;
         let on = *cur_tick * sec_per_tick;
         let off = (*cur_tick + length) * sec_per_tick;

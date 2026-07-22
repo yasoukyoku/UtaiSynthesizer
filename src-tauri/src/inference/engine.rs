@@ -227,7 +227,7 @@ pub fn memory_stamp() -> String {
 /// allocate", incl. the S66 user-set arena cap's documented failure mode) also match —
 /// those are NOT system-memory exhaustion and the caller must gate this by EP (CUDA
 /// sessions pass their error through unchanged).
-fn is_alloc_failure(msg: &str) -> bool {
+pub(crate) fn is_alloc_failure(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("bad_alloc")
         || m.contains("bad allocation")
@@ -238,6 +238,64 @@ fn is_alloc_failure(msg: &str) -> bool {
         || m.contains("failed to allocate")
         || m.contains("0x8007000e") // E_OUTOFMEMORY
 }
+
+/// S74: a CUDA RUN failure meaning the GPU can't run the shipped CUDA build's kernels — no
+/// compiled kernel image for its arch (too-old, or too-new Blackwell/RTX 50 whose sm_120 ships
+/// only broken PTX in the ORT 1.24 CUDA-12 build — ORT #26177/#26245), or a cuDNN execution
+/// failure of the same family. Mapped to CUDA_UNSUPPORTED_GPU so the frontend shows an
+/// actionable "switch to DirectML" modal instead of raw ORT text. The proactive cc-window gate
+/// (build_session_auto + the download offer) pre-empts the KNOWN cases before a session is built;
+/// this is the residual safety net (in-window card that still fails / a leaked or old-version
+/// CUDA install). CUDA-only — the caller gates on failed_is_cuda.
+fn is_cuda_kernel_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("nokernelimagefordevice")
+        || m.contains("no kernel image")
+        || m.contains("invalidptx")
+        || m.contains("ptx jit compilation failed")
+    // S74b: CUDNN_STATUS_EXECUTION_FAILED was here and is now deliberately NOT — cuDNN returns it
+    // for workspace/VRAM allocation failures and transient device errors too, so one out-of-memory
+    // moment would have (a) told the user "this GPU can't run our CUDA build", which is false, and
+    // (b) poisoned Auto-CUDA for the rest of the process over something that would work on retry.
+    // The four tokens above are unambiguous architecture failures. A genuine cuDNN execution
+    // failure now surfaces as an ordinary inference error, which is what it is.
+}
+
+/// S74: process-wide "Auto must not pick CUDA" flag, set the first time an AUTO-selected CUDA
+/// session dies with a kernel-image / cuDNN-exec failure (an in-window card that still can't run
+/// CUDA, or a leaked/old CUDA install the cc-window gate missed). build_session_auto then routes
+/// Auto straight to DirectML for the rest of the process so the render isn't blocked. Never reset
+/// this session (a machine that fails CUDA once keeps failing it) — a restart re-probes.
+static AUTO_CUDA_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// S74b: Auto degraded away from CUDA on a machine where CUDA was EXPECTED to work — i.e. the
+/// CUDA ORT build is the one we loaded, which only happens when `cuda_pkg_supported()` said this
+/// machine can run the CUDA package. Non-blocking toast per the error-UX taxonomy (Auto carries
+/// no deterministic user intent, so it must never block), and the log keeps EVERY occurrence.
+///
+/// ONCE PER PROCESS: one render builds many sessions (encoder, segmenter, RVC, ContentVec, RMVPE,
+/// separation …) and a per-session toast would be a wall of identical notifications, which is
+/// noise rather than information.
+///
+/// Deliberately silent on the DirectML build: "no CUDA package installed → Auto uses DirectML" is
+/// the normal, correct outcome, not a degradation, and must not be reported as one.
+/// Returns whether THIS call was the first degradation of the process — callers use it to log the
+/// explanation at WARN once and at debug afterwards. (Verified during S74b: a per-session WARN here
+/// meant ~10 identical lines per render, drowning the log the line exists to serve.)
+fn notify_cuda_degraded_once() -> bool {
+    static NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on_cuda_build = crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false);
+    if on_cuda_build && !NOTIFIED.swap(true, Ordering::Relaxed) {
+        crate::app_emit("auto-cuda-fallback", ());
+        return true;
+    }
+    false
+}
+
+/// S74 debug-only verification hook (see run_typed): one-shot, so only the FIRST Auto-CUDA run is
+/// forced to fail when UTAI_SIMULATE_CUDA_FAIL is set — the retry then genuinely runs on DirectML.
+#[cfg(debug_assertions)]
+static SIMULATED_CUDA_FAIL_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// DML pool budget BEYOND the first-shape ticket before a session is recycled:
 /// total physical RAM / 8, clamped to [1024, 4096] MB (16 GB machine → 2 GB budget).
@@ -303,6 +361,7 @@ impl Default for DeviceConfig {
     }
 }
 
+#[derive(Clone)]
 pub enum InputTensor {
     F32 { data: Vec<f32>, shape: Vec<i64> },
     I64 { data: Vec<i64>, shape: Vec<i64> },
@@ -770,6 +829,12 @@ impl OnnxEngine {
             .last_used
             .store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
 
+        // S74: clone inputs ONLY for an AUTO-selected CUDA session, so that if it dies with a
+        // kernel-image / cuDNN-exec failure we can transparently retry on DirectML (error arm
+        // below). The clone is dropped after a successful run; explicit-CUDA / DML / CPU never clone.
+        let retry_inputs: Option<Vec<(&str, InputTensor)>> =
+            (loaded.actual_device == "CUDA (GPU, Auto)").then(|| inputs.clone());
+
         let mut session = loaded.session.lock();
         // S67b: delta accounting for a NEW shape — measured around the run under the session
         // Mutex (concurrent same-sig runs serialize here, so a shape is measured once). The
@@ -840,7 +905,26 @@ impl OnnxEngine {
         // "allocation failed" while system RAM is plentiful) — copied out here because the
         // `loaded` borrow is gone by the error arm.
         let failed_is_cuda = loaded.actual_device.starts_with("CUDA");
+        // S74b: this incarnation's id, so the Auto-CUDA retry below can tear the dead session down
+        // through drop_session_incarnation (revalidated + dropped OUTSIDE the write lock) instead
+        // of a raw remove. Same reason failed_dml_build exists — copied out before the borrow ends.
+        let failed_build_id = loaded.build_id;
+        // S74 verification hook (debug builds only, env-gated): force the FIRST Auto-CUDA run to
+        // fail like a kernel-image error, so the transparent DirectML retry can be exercised on a
+        // machine where CUDA actually works. Inert in release / unless UTAI_SIMULATE_CUDA_FAIL is set.
+        #[cfg(debug_assertions)]
+        let simulate_cuda_fail = retry_inputs.is_some()
+            && std::env::var_os("UTAI_SIMULATE_CUDA_FAIL").is_some()
+            && !SIMULATED_CUDA_FAIL_DONE.swap(true, Ordering::Relaxed);
+        #[cfg(not(debug_assertions))]
+        let simulate_cuda_fail = false;
+
         let run_outcome: Result<Vec<OutputTensor>> = (|| {
+            if simulate_cuda_fail {
+                return Err(UtaiError::Inference(
+                    "Inference failed: CUDA error cudaErrorNoKernelImageForDevice (simulated)".into(),
+                ));
+            }
             let outputs = session
                 .run(input_values)
                 .map_err(|e| UtaiError::Inference(format!("Inference failed: {}", e)))?;
@@ -889,6 +973,31 @@ impl OnnxEngine {
                         );
                     }
                 }
+                // S74b: an AUTO-selected CUDA session that died with a kernel-image / cuDNN-exec
+                // failure → degrade to the next tier and re-run transparently instead of failing
+                // the render (Auto carries no deterministic user intent — taxonomy says
+                // non-blocking). Poison CUDA for Auto this process (build_session_auto then skips
+                // it), drop the dead session, WARN-log + toast ONCE, then re-run: the rebuild picks
+                // whatever Auto can still reach, which on the CUDA ORT build is CPU (that build has
+                // no DirectML EP). Bounded: the rebuilt session is not Auto-CUDA, so the recursion's
+                // retry_inputs is None and there is no second retry. EXPLICIT CUDA never clones
+                // retry_inputs → it falls through to the CUDA_UNSUPPORTED_GPU modal below
+                // (deliberate: a deliberate pick fails loudly).
+                if let Some(ri) =
+                    retry_inputs.filter(|_| failed_is_cuda && is_cuda_kernel_failure(&e.to_string()))
+                {
+                    AUTO_CUDA_POISONED.store(true, Ordering::Relaxed);
+                    tracing::warn!(
+                        "Auto CUDA run failed ({e}) — CUDA disabled for Auto this process; rebuilding on the next available device"
+                    );
+                    // NOT a raw sessions.write().remove(): that drops a potentially multi-GB session
+                    // WHILE holding the global write lock (stalling every concurrent run) and skips
+                    // the build_id revalidation that stops a stale decision from tearing down a
+                    // freshly rebuilt session (S67b TOCTOU). Single source for both.
+                    self.drop_session_incarnation(session_id, failed_build_id);
+                    notify_cuda_degraded_once();
+                    return self.run_typed(session_id, ri);
+                }
                 // S67c: allocation-exhaustion failures (CPU bad_alloc family / DML
                 // E_OUTOFMEMORY that surfaced as an error instead of an OS kill) get the
                 // INFERENCE_LOW_MEMORY code so the frontend's trilingual modal catches
@@ -897,7 +1006,13 @@ impl OnnxEngine {
                 // backend log stays empty at the exact moment we need it). CUDA sessions
                 // pass through unchanged — their allocation failures are VRAM/arena-cap
                 // conditions, not system-memory exhaustion (see is_alloc_failure).
-                let e = if !failed_is_cuda && is_alloc_failure(&e.to_string()) {
+                let e = if failed_is_cuda && is_cuda_kernel_failure(&e.to_string()) {
+                    // S74: a CUDA run failure meaning the GPU can't run our CUDA build's kernels
+                    // (no kernel image / broken Blackwell PTX-JIT / cuDNN exec failure) → an
+                    // actionable "switch to DirectML" modal, not raw ORT text. The cc-window gate
+                    // pre-empts the known cases; this catches in-window-but-fails + leaked installs.
+                    UtaiError::Inference(format!("CUDA_UNSUPPORTED_GPU: {e}"))
+                } else if !failed_is_cuda && is_alloc_failure(&e.to_string()) {
                     UtaiError::Inference(format!("INFERENCE_LOW_MEMORY: {e} ({stamp_at_failure})"))
                 } else {
                     e
@@ -1119,6 +1234,15 @@ fn build_session(
         // user would just see "inference is slow" with no clue. Auto keeps the silent CPU
         // fallback by design.
         DeviceConfig::DirectMl { device_id } => {
+            // S74b: the CUDA ORT build ships CUDA + CPU EPs only — registering the DirectML EP on
+            // it does NOT fail cleanly, it ACCESS-VIOLATES the process (headless-verified S74).
+            // The ORT build is fixed at startup, so a user who switches the preference to DirectML
+            // in this session is asking for something this process cannot do; Settings already
+            // shows the "restart required" hint, and this is the guard that keeps a render started
+            // BEFORE that restart from taking the whole app down. Same predicate as build_session_auto.
+            if crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false) {
+                return Err(UtaiError::Inference("DML_NEEDS_RESTART".to_string()));
+            }
             builder = builder
                 .with_execution_providers([ort::ep::DirectML::default()
                     .with_device_id(*device_id as i32)
@@ -1141,6 +1265,21 @@ fn build_session(
             format!("DirectML (GPU {})", device_id)
         }
         DeviceConfig::Cuda { device_id } => {
+            // S74: an explicitly-chosen CUDA device whose compute capability is outside the window
+            // our shipped CUDA build can run → a clear CUDA_UNSUPPORTED_GPU modal (switch to
+            // DirectML) instead of a raw kernel-launch failure. Auto silently uses DirectML for
+            // such a card; an explicit pick is deliberate, so we tell the user (anti-silent rule).
+            if let Some((maj, min)) = crate::gpu::cuda_compute_cap(*device_id) {
+                if !crate::gpu::cuda_cc_supported_inference(maj * 10 + min) {
+                    // Detail stays RAW/TECHNICAL (backendError.ts convention): the remedy text
+                    // lives in backend.CUDA_UNSUPPORTED_GPU in all three languages, and appending
+                    // an English sentence here would print the same advice twice — once localized,
+                    // once not (i18n hard rule: no user-facing prose in Rust).
+                    return Err(UtaiError::Inference(format!(
+                        "CUDA_UNSUPPORTED_GPU: sm_{maj}{min}"
+                    )));
+                }
+            }
             builder = builder
                 .with_execution_providers([cuda_ep(Some(*device_id as i32))
                     .build()
@@ -1153,7 +1292,7 @@ fn build_session(
                         device_id, e
                     ))
                 })?;
-            tracing::info!("ONNX device=CUDA (GPU {})", device_id);
+            tracing::info!("ONNX device=CUDA (GPU {}{})", device_id, crate::gpu::cuda_device_label(*device_id));
             format!("CUDA (GPU {})", device_id)
         }
         DeviceConfig::Auto => unreachable!("Auto handled above"),
@@ -1186,11 +1325,11 @@ fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> 
             auto_gpu.unwrap_or_default()
         );
     }
-    let skip_cuda = matches!(preferred_vendor, Some(v) if v != "nvidia");
+    let skip_cuda = matches!(preferred_vendor, Some(v) if v != "nvidia")
+        || AUTO_CUDA_POISONED.load(Ordering::Relaxed);
     if skip_cuda {
         tracing::debug!(
-            "ONNX device=Auto: preferred GPU {} is non-NVIDIA — skipping the CUDA probe",
-            auto_gpu.unwrap_or_default()
+            "ONNX device=Auto: skipping the CUDA probe (non-NVIDIA preferred GPU, or CUDA poisoned after a run failure this session)"
         );
     } else {
         // Preferred NVIDIA card → its CUDA ordinal via LUID; unmapped (cudart absent /
@@ -1211,39 +1350,88 @@ fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> 
                 );
             }
         }
-        let cuda = base_builder(mem_pattern)
-            .and_then(|b| {
-                b.with_execution_providers([cuda_ep(cuda_id).build().error_on_failure()])
-                    .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))
-            })
-            .and_then(|b| commit(b, path));
-        match cuda {
-            Ok(s) => {
-                tracing::info!("ONNX device=Auto → using CUDA (GPU{})", cuda_id.map(|i| format!(" {i}")).unwrap_or_default());
-                return Ok((s, "CUDA (GPU, Auto)".to_string()));
+        // S74b: PER-DEVICE check — the machine-level gate (lib.rs consumption point 2) only
+        // guarantees that SOME card here is supported, so a mixed box (e.g. an RTX 50 next to an
+        // older supported card) can still resolve Auto onto the unsupported ordinal. Committing a
+        // CUDA session there would die at the first kernel launch. Same single-source predicate.
+        // NB: this does NOT log a destination — the resolved device is logged once, below, by
+        // whichever leg actually commits (the old line here claimed "using DirectML" on a build
+        // that has no DirectML EP, i.e. it announced a device the code could not reach).
+        let cuda_cc10 = crate::gpu::cuda_compute_cap(cuda_id.unwrap_or(0) as u32).map(|(a, b)| a * 10 + b);
+        if cuda_cc10.map_or(false, |c| !crate::gpu::cuda_cc_supported_inference(c)) {
+            tracing::warn!(
+                "ONNX device=Auto: CUDA device {} is sm_{} — not supported by the installed CUDA package; not using CUDA",
+                cuda_id.unwrap_or(0),
+                cuda_cc10.unwrap_or(0)
+            );
+            notify_cuda_degraded_once();
+        } else {
+            let cuda = base_builder(mem_pattern)
+                .and_then(|b| {
+                    b.with_execution_providers([cuda_ep(cuda_id).build().error_on_failure()])
+                        .map_err(|e| UtaiError::Inference(format!("CUDA EP: {}", e)))
+                })
+                .and_then(|b| commit(b, path));
+            match cuda {
+                Ok(s) => {
+                    let ord = cuda_id.unwrap_or(0) as u32;
+                    tracing::info!("ONNX device=Auto → using CUDA (GPU {}{})", ord, crate::gpu::cuda_device_label(ord));
+                    return Ok((s, "CUDA (GPU, Auto)".to_string()));
+                }
+                Err(e) => {
+                    // S74b: the LEVEL depends on whether CUDA was expected to work here. On the
+                    // DirectML build this is a routine probe miss (debug). On the CUDA build we
+                    // deliberately loaded the CUDA package for this machine, so a failed CUDA
+                    // session is a real event AND the third way Auto can lose CUDA — the earlier
+                    // code left it at debug with no toast, which meant a cuDNN/driver/VRAM problem
+                    // dropped the user to CPU in complete silence (the exact class R4 forbids;
+                    // the other two paths, the cc gate and the run-time kernel failure, notified).
+                    if notify_cuda_degraded_once() {
+                        tracing::warn!("ONNX device=Auto: CUDA session failed on the CUDA build ({e}) — degrading");
+                    } else {
+                        tracing::debug!("ONNX device=Auto: CUDA unavailable ({e})");
+                    }
+                }
             }
-            // Probe failures are debug-level noise (like ffmpeg internals) — only the resolved device
-            // below is INFO. Keeps the default log clean; switch the panel to DEBUG to see why a GPU failed.
-            Err(e) => tracing::debug!("ONNX device=Auto: CUDA unavailable ({e}); trying DirectML"),
         }
     }
 
-    let mut dml_ep = ort::ep::DirectML::default();
-    if let Some(idx) = auto_gpu {
-        // Only honor a pick that still resolves to a usable adapter (see the WARN at the
-        // top): a stale/OOB/software index makes ORT's EnumAdapters1(device_id) throw,
-        // error_on_failure fails the whole DML probe, and Auto lands on CPU — the
-        // silent-CPU class this project treats as its #1 pain (review round 2 major).
-        if preferred_vendor.is_some() {
-            dml_ep = dml_ep.with_device_id(idx as i32);
+    // S74: the CUDA ORT build ships CUDA + CPU EPs only — attempting the DirectML EP on it
+    // ACCESS-VIOLATES (DirectML.dll isn't in runtime/ort/cuda) instead of failing cleanly.
+    // Normally CUDA is committed above and this is never reached; but when CUDA is SKIPPED on the
+    // CUDA build (poisoned after a run failure, or a compute-cap-unsupported card) the Auto
+    // fallback must be CPU, not a DML probe that crashes the process. The DirectML build (where
+    // DML actually lives) takes the real probe below.
+    let try_dml = crate::ORT_LOADED_BUILD.get().map(|b| b != "CUDA").unwrap_or(true);
+    let dml = if try_dml {
+        let mut dml_ep = ort::ep::DirectML::default();
+        if let Some(idx) = auto_gpu {
+            // Only honor a pick that still resolves to a usable adapter (see the WARN at the
+            // top): a stale/OOB/software index makes ORT's EnumAdapters1(device_id) throw,
+            // error_on_failure fails the whole DML probe, and Auto lands on CPU — the
+            // silent-CPU class this project treats as its #1 pain (review round 2 major).
+            if preferred_vendor.is_some() {
+                dml_ep = dml_ep.with_device_id(idx as i32);
+            }
         }
-    }
-    let dml = base_builder(mem_pattern)
-        .and_then(|b| {
-            b.with_execution_providers([dml_ep.build().error_on_failure()])
-                .map_err(|e| UtaiError::Inference(format!("DirectML EP: {}", e)))
-        })
-        .and_then(|b| commit(b, path));
+        base_builder(mem_pattern)
+            .and_then(|b| {
+                b.with_execution_providers([dml_ep.build().error_on_failure()])
+                    .map_err(|e| UtaiError::Inference(format!("DirectML EP: {}", e)))
+            })
+            .and_then(|b| commit(b, path))
+    } else {
+        // Reached only when CUDA was skipped/failed above on the CUDA build: DirectML is not in
+        // this process at all, so the next tier is CPU. WARN, not debug — the user is about to run
+        // everything on the CPU. (notify_cuda_degraded_once is idempotent per process, so the
+        // sites above having already fired it costs nothing.)
+        if notify_cuda_degraded_once() {
+            tracing::warn!("ONNX device=Auto: no DirectML EP in the CUDA build — falling back to CPU");
+        } else {
+            tracing::debug!("ONNX device=Auto: no DirectML EP in the CUDA build — using CPU");
+        }
+        Err(UtaiError::Inference("DirectML EP not available in the CUDA build".into()))
+    };
     match dml {
         Ok(s) => {
             let which = auto_gpu

@@ -18,6 +18,7 @@
 //   - a visible per-lane "extracting" indicator the whole time (never look frozen).
 
 import { invoke } from "@tauri-apps/api/core";
+import { logToBackend } from "../log";
 import { listen } from "@tauri-apps/api/event";
 import i18n from "../../i18n";
 import { backendErrorMessage, isCancelError } from "../backendError";
@@ -319,6 +320,9 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (!msg.includes("MIDI_EXTRACT_CANCELLED")) {
+      // S74: GAME extraction is a blocking inference op — leave a copyable log trace.
+      // This catch is OUTSIDE the per-stem loop, so it fires once per invocation (flood-safe).
+      logToBackend("error", `MIDI extract failed: ${msg}`);
       useAppStore.getState().showToast(midiExtractErrorMessage(e), "error");
     } // cancellation already toasted by the interceptor
   } finally {

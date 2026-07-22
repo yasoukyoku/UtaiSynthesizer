@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppStore } from "../../store/app";
+import i18n from "../../i18n";
 import "./ConfirmDialog.css";
 
 /**
@@ -69,14 +70,18 @@ export function ConfirmDialog() {
   return (
     <div className="confirm-overlay" onMouseDown={() => confirm.resolve("")}>
       <div
-        className="confirm-dialog"
+        className={confirm.scrollable ? "confirm-dialog error-modal" : "confirm-dialog"}
         key={confirm.seq}
         role="dialog"
         aria-modal="true"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="confirm-title">{confirm.title}</div>
-        {confirm.body && <div className="confirm-body">{confirm.body}</div>}
+        {confirm.body && (
+          <div className={confirm.scrollable ? "confirm-body scrollable selectable" : "confirm-body"}>
+            {confirm.body}
+          </div>
+        )}
         {confirm.input && (
           <div className="confirm-input-row">
             <input
@@ -95,6 +100,14 @@ export function ConfirmDialog() {
           </div>
         )}
         <div className="confirm-buttons">
+          {confirm.scrollable && (
+            <button
+              className="confirm-btn"
+              onClick={() => { void navigator.clipboard.writeText(confirm.body); }}
+            >
+              {i18n.t("common.copy")}
+            </button>
+          )}
           {confirm.buttons.map((b) => (
             <button
               key={b.id}

@@ -21,6 +21,16 @@ fn app_root() -> PathBuf {
 /// ORT switch (S12) — without this init any ORT touch hangs FOREVER at 0 CPU behind an
 /// invisible modal DLL dialog (S32 found this exact landmine via a full `cargo test`).
 fn init_ort() {
+    // S74: without a subscriber every engine INFO/WARN (chosen EP, the Auto-CUDA fallback
+    // warning UTAI_SIMULATE_CUDA_FAIL exists to exercise) goes nowhere — a "verification" run
+    // that can't show the path it claims to test proves nothing. `RUST_LOG=utai_lib=info` +
+    // `-- --nocapture` to see them.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("utai_lib=warn")),
+        )
+        .try_init();
     utai_lib::suppress_windows_dll_error_dialogs();
     // PATH must carry runtime/cuda BEFORE ORT builds a CUDA session: the cudnn 9
     // shim resolves its sub-DLLs via PATH at graph-build time — without this the

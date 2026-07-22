@@ -32,6 +32,9 @@ interface GpuAdapter {
 interface HardwareInfo {
   gpu_name: string;
   cuda_available: boolean;
+  cuda_supported: boolean;
+  /** S74b: a stale explicit device preference was demoted to Auto at startup (App toasts it once). */
+  preference_demoted: boolean;
   directml_available: boolean;
   current_device: string;
   /** S68b: configured GPU ordinal of the current preference (0 for cpu/auto). */
@@ -52,6 +55,9 @@ interface InferenceGpuChoice {
   id: number;
   label: string;
   selectable: boolean;
+  /** S74b: stable CODE for WHY it isn't selectable ("SOFTWARE_ADAPTER" | "CC_UNSUPPORTED"),
+   *  localized into the option label — a greyed row with no reason is a guessing game. */
+  reason?: string | null;
   /** "nvidia" | "amd" | "intel" | "other" — drives the Auto-mode restart hint. */
   vendor: string;
 }
@@ -70,7 +76,17 @@ interface CudaProgress {
   label?: string | null;
 }
 
-/** Mirror of Rust `pyenv::PackStatus` (meta flattened) — list_runtime_packs entry. */
+/** One check in the self-test report (utai_train/envtest.py item shape). `detail` is the
+ *  check's raw/technical string — a stable CODE (XPU_NO_DEVICE …) where the check emits one,
+ *  so it goes through backendErrText for localization. */
+interface EnvtestItem {
+  name: string;
+  status: string;
+  detail?: string;
+}
+
+/** Mirror of Rust `pyenv::PackStatus` (meta flattened) — list_runtime_packs entry.
+ *  `envtest` is the whole parsed envtest.json (Rust ships it as an opaque Value). */
 interface RuntimePack {
   id: string;
   variant: string;
@@ -79,7 +95,12 @@ interface RuntimePack {
   torch: string;
   disk_bytes: number;
   path: string;
-  envtest?: { overall?: string } | null;
+  envtest?: { overall?: string; items?: EnvtestItem[] } | null;
+  /** S74b: can THIS machine run it? Unsupported packs stay listed (self-test + delete remain
+   *  reachable) but show a third badge state and the reason. */
+  supported: boolean;
+  /** S74b: the self-test report came from different hardware — show "re-run" instead of a verdict. */
+  envtest_stale: boolean;
 }
 
 interface RuntimeCatalogItem {
@@ -191,6 +212,8 @@ interface StorageReport {
   models_bytes: number;
   msst_bytes: number;
   runtimes_bytes: number;
+  /** S74b: the CUDA inference runtime (program-adjacent, so it was missing from this report). */
+  cuda_runtime_bytes: number;
   dictionaries_bytes: number;
   logs_bytes: number;
   audition_bytes: number;
@@ -292,6 +315,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const [saving, setSaving] = useState(false);
   const [cudaReady, setCudaReady] = useState(false);
   const [cudaDownloading, setCudaDownloading] = useState(false);
+  const [cudaDeleting, setCudaDeleting] = useState(false);
   const [cudaProgress, setCudaProgress] = useState<CudaProgress | null>(null);
   const [cudaError, setCudaError] = useState<string | null>(null);
   const [cudaJustInstalled, setCudaJustInstalled] = useState(false);
@@ -744,6 +768,34 @@ export function Settings({ onClose }: { onClose: () => void }) {
     return () => { un.then((f) => f()); };
   }, [refreshAssets]);
 
+  const [assetDeleting, setAssetDeleting] = useState<string | null>(null);
+  // S74b: reclaim an asset pack. aux-inference is deletable like the rest — but its dialog says
+  // what breaks, because refusing outright would just be another dead end (the user may genuinely
+  // be freeing space on a box they only train on).
+  const handleAssetDelete = useCallback(async (id: string, label: string) => {
+    const choice = await showConfirm({
+      title: L("assetDeleteTitle").replace("{pack}", label),
+      body: id === "aux-inference" ? L("assetDeleteBodyRequired") : L("assetDeleteBody"),
+      buttons: [
+        { id: "cancel", label: L("rtCancelBtn") },
+        { id: "del", label: L("rtDelete"), kind: "danger" },
+      ],
+    });
+    if (choice !== "del") return;
+    setAssetMsg(null);
+    setAssetDeleting(id);
+    try {
+      await invoke("delete_asset_pack", { id });
+    } catch (e) {
+      setAssetMsg(backendErrorMessage(e) ?? String(e));
+    } finally {
+      setAssetDeleting(null);
+      refreshAssets();
+      void refreshStorage();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshAssets, showConfirm, lang]);
+
   const handleAssetDownload = useCallback(async (id: string) => {
     setAssetMsg(null);
     setAssetActive(id);
@@ -849,6 +901,21 @@ export function Settings({ onClose }: { onClose: () => void }) {
   // S66 install-from-local-file: the user picks the wheels/nupkg listed in the note below
   // (exact filenames from cuda_runtime_paths.expectedFiles) — the offline escape hatch.
   const handleCudaLocalInstall = useCallback(async () => {
+    // S74b: local install stays UNGATED on purpose (it is the offline escape hatch, and a machine
+    // whose probe merely failed must keep a way in). But installing ~1.6 GB that this machine
+    // cannot use should be a decision, not a surprise — so say it plainly first and let the user
+    // choose. Informed consent, not a block.
+    if (hw && !hw.cuda_supported) {
+      const go = await showConfirm({
+        title: L("cudaLocalUnsupportedTitle"),
+        body: L("cudaLocalUnsupportedBody"),
+        buttons: [
+          { id: "cancel", label: L("rtCancelBtn") },
+          { id: "go", label: L("cudaLocalInstallAnyway"), kind: "primary" },
+        ],
+      });
+      if (go !== "go") return;
+    }
     const picked = await open({
       multiple: true,
       filters: [{ name: "CUDA runtime files", extensions: ["whl", "nupkg", "zip"] }],
@@ -867,8 +934,44 @@ export function Settings({ onClose }: { onClose: () => void }) {
       invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
       invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
       refreshCudaPaths();
+      void refreshStorage();
     }
-  }, [refreshCudaPaths]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshCudaPaths, showConfirm, hw, lang]);
+
+  // S74b: reclaim the CUDA runtime. The backend refuses while a task runs, and refuses outright
+  // when THIS process has the CUDA build mapped (Windows file locks) — both come back as
+  // localized CODEs, so this handler only has to confirm and report.
+  const handleCudaDelete = useCallback(async () => {
+    const choice = await showConfirm({
+      title: L("cudaDeleteTitle"),
+      body: L("cudaDeleteBody"),
+      buttons: [
+        { id: "cancel", label: L("rtCancelBtn") },
+        { id: "del", label: L("cudaDelete"), kind: "danger" },
+      ],
+    });
+    if (choice !== "del") return;
+    setCudaError(null);
+    setCudaDeleting(true);
+    try {
+      await invoke("delete_cuda_runtime");
+    } catch (e) {
+      const disp = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, disp)) setCudaError(disp);
+    } finally {
+      setCudaDeleting(false);
+      invoke<boolean>("is_cuda_runtime_ready").then(setCudaReady).catch(() => {});
+      invoke<HardwareInfo>("get_hardware_info").then(setHw).catch(() => {});
+      refreshCudaPaths();
+      // cuda_runtime_bytes just changed — the storage panel would otherwise keep showing the
+      // ~1.6 GB row and an inflated total until the next manual scan.
+      void refreshStorage();
+    }
+    // `lang` IS a dependency: L closes over it, so omitting it froze these dialogs in whatever
+    // language was active at first render (every other handler here lists it).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshCudaPaths, showConfirm, lang]);
 
   const L = (key: string) => {
     const map: Record<string, Record<string, string>> = {
@@ -926,7 +1029,44 @@ export function Settings({ onClose }: { onClose: () => void }) {
       cudaInstalled: { zh: "已就绪", en: "Ready", ja: "準備完了" },
       cudaNotInstalled: { zh: "未安装", en: "Not Installed", ja: "未インストール" },
       cudaDownload: { zh: "下载 CUDA 运行时", en: "Download CUDA Runtime", ja: "CUDAランタイムをダウンロード" },
+      // Shown on EVERY machine without a supported NVIDIA card — including AMD/Intel/CPU-only
+      // boxes — so the wording must not claim "compute capability" (S74b: it did, and that is
+      // simply untrue for a non-NVIDIA machine).
+      cudaUnsupportedNote: { zh: "当前显卡不支持我们的 CUDA 运行时包，使用默认的 DirectML 即可（任何显卡可用）。", en: "This machine's GPU isn't supported by our CUDA runtime package — the default DirectML works on any GPU.", ja: "この PC の GPU は当社の CUDA ランタイムパッケージに非対応です——既定の DirectML はどの GPU でも動作します。" },
+      gpuUnsupportedCc: { zh: "不可用：我们的 CUDA 包不支持这张卡", en: "unavailable: not supported by our CUDA package", ja: "使用不可：当社の CUDA パッケージ非対応" },
+      selfTestCheckFailed: { zh: "该项未通过（技术详情）", en: "check did not pass (technical details)", ja: "このチェックに不合格（技術詳細）" },
+      selfTestCheckWarn: { zh: "该项有警告，但不影响通过（技术详情）", en: "check reported a warning but still passed (technical details)", ja: "このチェックは警告付きで合格（技術詳細）" },
+      rtUnsupported: { zh: "当前设备不支持", en: "Not supported here", ja: "この PC では非対応" },
+      rtTestStale: { zh: "需重新自检", en: "Re-run self-test", ja: "再セルフテストが必要" },
+      rtStaleNote: { zh: "这份自检报告来自不同的硬件配置（显卡或驱动已变更），当前结果仅供参考——请重新自检。", en: "This self-test report was produced on a different hardware configuration (GPU or driver changed) — re-run the self-test for a current verdict.", ja: "このセルフテストレポートは異なるハードウェア構成（GPU またはドライバーが変更）で作成されました。現在の結果を得るにはセルフテストを再実行してください。" },
+      rtWhyNv: { zh: "需要算力 sm_75 及以上的 NVIDIA 显卡（GTX 16 / RTX 20 系及更新）。此包在本机不会被使用；修好驱动后可重新自检，或直接删除。", en: "Needs an NVIDIA GPU of compute capability sm_75 or newer (GTX 16 / RTX 20 series and up). This pack won't be used on this machine — re-run the self-test after fixing a driver, or delete it.", ja: "compute capability sm_75 以上の NVIDIA GPU が必要です（GTX 16 / RTX 20 シリーズ以降）。この PC では使用されません。ドライバー修正後にセルフテストを再実行するか、削除してください。" },
+      // MEASURED, not inferred (S74b): the installed pack ships exactly ONE device target —
+      // torch/.kpack/torch_gfx1103.kpack plus {blas,fft,rand}_lib_gfx1103.kpack. The
+      // `amd-torch-device-gfx110x` entry in the lock is only a family dist-info; no gfx1100/1101/
+      // 1102 kernels are present. So this pack runs on gfx1103 iGPUs and nothing else — saying
+      // "needs an AMD GPU" (or even "RDNA3") would send RX 7000 owners after a 4.5 GB dead end.
+      rtWhyAmd: { zh: "需要 Radeon 780M/760M/740M 这类核显（gfx1103）——本包只带了 gfx1103 的计算内核，其它 AMD 显卡（含 RX 7000/6000/9000 系独显）都不被它支持。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs a Radeon 780M/760M/740M-class iGPU (gfx1103) — this pack ships compute kernels for gfx1103 only, so no other AMD GPU (including RX 7000/6000/9000 discrete cards) can run it. It won't be used on this machine — re-run the self-test or delete it.", ja: "Radeon 780M/760M/740M クラスの内蔵 GPU（gfx1103）が必要です——このパックは gfx1103 の計算カーネルのみを同梱しているため、他の AMD GPU（RX 7000/6000/9000 シリーズの単体 GPU を含む）では動作しません。この PC では使用されません。セルフテストを再実行するか削除してください。" },
+      rtWhyXpu: { zh: "需要 Arc 系列 Intel 显卡（Iris Xe / UHD / HD Graphics 不被 torch-XPU 支持）。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs an Arc-family Intel GPU (Iris Xe / UHD / HD Graphics are not torch-XPU targets). This pack won't be used on this machine — re-run the self-test or delete it.", ja: "Arc シリーズの Intel GPU が必要です（Iris Xe / UHD / HD Graphics は torch-XPU 非対応）。この PC では使用されません。セルフテストを再実行するか削除してください。" },
+      rtWhyGeneric: { zh: "当前设备不支持此包，它不会被使用；可重新自检或直接删除。", en: "This machine doesn't support this pack, so it won't be used — re-run the self-test or delete it.", ja: "この PC はこのパックに非対応のため使用されません。セルフテストを再実行するか削除してください。" },
+      gpuSoftwareAdapter: { zh: "不可用：软件适配器", en: "unavailable: software adapter", ja: "使用不可：ソフトウェアアダプター" },
+      gpuUnknownCc: { zh: "不可用：读不到该设备的算力", en: "unavailable: couldn't read this device's compute capability", ja: "使用不可：この GPU の計算能力を取得できません" },
       cudaDownloading: { zh: "下载中...", en: "Downloading...", ja: "ダウンロード中..." },
+      cudaDelete: { zh: "删除", en: "Delete", ja: "削除" },
+      cudaLocalInstallAnyway: { zh: "仍要安装", en: "Install anyway", ja: "それでもインストール" },
+      cudaLocalUnsupportedTitle: { zh: "当前显卡不支持 CUDA 包", en: "This GPU isn't supported by the CUDA package", ja: "この GPU は CUDA パッケージ非対応です" },
+      cudaLocalUnsupportedBody: {
+        zh: "检测结果显示本机显卡无法运行我们的 CUDA 运行时，安装后推理仍会使用 DirectML，这约 1.6GB 文件不会被用到。\n如果你确认检测有误（例如外接显卡未连接、驱动异常导致检测失败），可以继续安装。",
+        en: "This machine's GPU can't run our CUDA runtime as far as we can tell, so inference will keep using DirectML and these ~1.6 GB will sit unused.\nIf you believe the detection is wrong (an eGPU that isn't connected, or a driver problem that broke the probe), you can install anyway.",
+        ja: "検出結果では、この PC の GPU は当社の CUDA ランタイムを実行できません。推論は DirectML のままで、この約 1.6GB は使用されません。\n検出が誤っていると判断できる場合（未接続の外付け GPU、ドライバー異常で検出失敗など）は、続行できます。",
+      },
+      rtLocalNote: { zh: "本地安装不受硬件门限制；若该包不适用于当前显卡，安装后会标为「当前设备不支持」并可随时删除。", en: "Local install isn't hardware-gated — if the pack doesn't fit this machine it will be marked \"Not supported here\" and can be deleted at any time.", ja: "ローカルインストールはハードウェア判定の対象外です。この PC に適合しないパックは「この PC では非対応」と表示され、いつでも削除できます。" },
+      cudaDeleting: { zh: "删除中...", en: "Deleting...", ja: "削除中..." },
+      cudaDeleteTitle: { zh: "删除 CUDA 运行时？", en: "Delete the CUDA runtime?", ja: "CUDA ランタイムを削除しますか？" },
+      cudaDeleteBody: {
+        zh: "将删除约 1.6GB 的 CUDA 运行库（runtime/ort/cuda 与 runtime/cuda）。删除后推理会使用 DirectML（任何显卡可用）；需要时可以随时重新下载。",
+        en: "This removes ~1.6 GB of CUDA runtime libraries (runtime/ort/cuda and runtime/cuda). Inference then uses DirectML (works on any GPU); you can download it again at any time.",
+        ja: "約 1.6GB の CUDA ランタイム（runtime/ort/cuda と runtime/cuda）を削除します。削除後の推論は DirectML（どの GPU でも動作）を使用します。必要になればいつでも再ダウンロードできます。",
+      },
       cudaNote: { zh: "无需安装 CUDA Toolkit——自动下载全部运行库（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN，共约 1.6GB）。需要 NVIDIA 显卡和较新的驱动。", en: "No CUDA Toolkit needed — downloads the full runtime (ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN, ~1.6GB total). Requires an NVIDIA GPU with a recent driver.", ja: "CUDA Toolkit のインストールは不要 — ランタイム一式（ORT CUDA + cudart/cuBLAS/cuFFT/cuDNN、合計約 1.6GB）を自動ダウンロードします。NVIDIA GPU と新しめのドライバーが必要です。" },
       cudaRestart: { zh: "下载完成，重启应用后生效。", en: "Download complete. Restart to activate.", ja: "ダウンロード完了。再起動で有効になります。" },
       cudaPgDownloading: { zh: "下载中", en: "Downloading", ja: "ダウンロード中" },
@@ -984,6 +1124,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
       stModelsNote: { zh: "在「资源管理器」与 MSST 模型管理中管理", en: "Managed in the resource manager & MSST manager", ja: "リソースマネージャと MSST 管理で管理" },
       stMsst: { zh: "其中分离模型", en: "incl. separation models", ja: "うち分離モデル" },
       stRuntimes: { zh: "训练环境包", en: "Training runtime packs", ja: "トレーニングランタイム" },
+      stCudaRuntime: { zh: "CUDA 推理运行时", en: "CUDA inference runtime", ja: "CUDA 推論ランタイム" },
+      assetDeleteTitle: { zh: "删除「{pack}」？", en: "Delete \"{pack}\"?", ja: "「{pack}」を削除しますか？" },
+      assetDeleteBody: { zh: "将删除该资产包下载的全部文件（不会碰你自己导入的模型）。需要时可以随时重新下载。", en: "This removes every file this asset pack downloaded (your own imported models are untouched). You can download it again at any time.", ja: "このアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。必要になればいつでも再ダウンロードできます。" },
+      assetDeleteBodyRequired: { zh: "⚠ 这是推理必需的模型包：删除后「翻唱」和「自己唱」都将无法使用，直到重新下载（约 1.4GB）。\n将删除该资产包下载的全部文件（不会碰你自己导入的模型）。", en: "⚠ This pack is REQUIRED for inference: after deleting it, voice conversion and singing synthesis stop working until you download it again (~1.4 GB).\nThis removes every file this asset pack downloaded (your own imported models are untouched).", ja: "⚠ これは推論に必須のモデルパックです。削除すると、再ダウンロード（約 1.4GB）するまで「歌声変換」と「歌唱合成」が使用できなくなります。\nこのアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。" },
       stRuntimesNote: { zh: "在下方「训练环境」面板管理", en: "Managed in the Training Runtime panel below", ja: "下の「トレーニング環境」パネルで管理" },
       stDicts: { zh: "发音词典（必需）", en: "G2P dictionaries (required)", ja: "発音辞書（必須）" },
       stTotal: { zh: "合计", en: "Total", ja: "合計" },
@@ -1063,6 +1207,18 @@ export function Settings({ onClose }: { onClose: () => void }) {
     if (r.verdict === "http_error") return L("srcHttpErr") + (r.http_status ? ` (${r.http_status})` : "");
     // PROBE_* codes localize via the app-wide backend-error map (raw fallback).
     return L("srcUnreachable") + (r.error ? ` — ${backendErrText(r.error)}` : "");
+  };
+
+  /** S74b: a disabled GPU option carries WHY it is disabled, localized from the backend's
+   *  stable reason CODE. Device names themselves stay unlocalized (hardware identifiers). */
+  const gpuOptionLabel = (o: InferenceGpuChoice): string => {
+    if (o.selectable) return o.label;
+    const why =
+      o.reason === "CC_UNSUPPORTED" ? L("gpuUnsupportedCc")
+      : o.reason === "CC_UNKNOWN" ? L("gpuUnknownCc")
+      : o.reason === "SOFTWARE_ADAPTER" ? L("gpuSoftwareAdapter")
+      : null;
+    return why ? `${o.label} — ${why}` : o.label;
   };
 
   /** pyenv-progress line: localized from the stable code+params; raw message fallback
@@ -1171,7 +1327,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
             <label>{L("epLabel")}</label>
             <select value={device} onChange={(e) => handleDeviceChange(e.target.value)}>
               <option value="auto">{L("auto")}</option>
-              <option value="cuda" disabled={!hw?.cuda_available}>{L("cudaOpt")}</option>
+              <option value="cuda" disabled={!hw?.cuda_available || !hw?.cuda_supported}>{L("cudaOpt")}</option>
               <option value="directml" disabled={!hw?.directml_available}>{L("dmlOpt")}</option>
               <option value="cpu">{L("cpuOpt")}</option>
             </select>
@@ -1211,7 +1367,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                       )}
                       {opts.map((o) => (
                         <option key={o.id} value={String(o.id)} disabled={!o.selectable}>
-                          {o.label}
+                          {gpuOptionLabel(o)}
                         </option>
                       ))}
                     </select>
@@ -1236,7 +1392,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     )}
                     {opts.map((o) => (
                       <option key={o.id} value={String(o.id)} disabled={!o.selectable}>
-                        {o.label}
+                        {gpuOptionLabel(o)}
                       </option>
                     ))}
                   </select>
@@ -1380,6 +1536,12 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 <span className="settings-value">{fmtSize(storage.runtimes_bytes)}</span>
               </div>
               <p className="settings-note" style={{ margin: "0 0 4px" }}>{L("stRuntimesNote")}</p>
+              {storage.cuda_runtime_bytes > 0 && (
+                <div className="settings-row">
+                  <span className="settings-label">{L("stCudaRuntime")}</span>
+                  <span className="settings-value">{fmtSize(storage.cuda_runtime_bytes)}</span>
+                </div>
+              )}
               <div className="settings-row">
                 <span className="settings-label">{L("stDicts")}</span>
                 <span className="settings-value">{fmtSize(storage.dictionaries_bytes)}</span>
@@ -1387,7 +1549,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
               <div className="settings-row" style={{ borderTop: "1px solid var(--border-subtle)", paddingTop: 4, marginTop: 2 }}>
                 <span className="settings-label">{L("stTotal")}</span>
                 <span className="settings-value">
-                  {fmtSize(storage.cache_bytes + storage.models_bytes + storage.runtimes_bytes + storage.dictionaries_bytes + storage.training_bytes + storage.logs_bytes)}
+                  {fmtSize(storage.cache_bytes + storage.models_bytes + storage.runtimes_bytes + storage.cuda_runtime_bytes + storage.dictionaries_bytes + storage.training_bytes + storage.logs_bytes)}
                 </span>
               </div>
             </div>
@@ -1526,6 +1688,18 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     {L("assetDownload")}
                   </button>
                 )}
+                {/* S74b: anything present is also reclaimable. "I'm never training RVC again"
+                    used to have no answer — the files just stayed. Partial packs count too
+                    (a half-downloaded pack is the most useless kind of gigabyte). */}
+                {p.missing < p.fileCount && !isDl && (
+                  <button
+                    className="settings-mini-btn danger"
+                    disabled={anyDl || assetDeleting !== null}
+                    onClick={() => void handleAssetDelete(p.id, label)}
+                  >
+                    {assetDeleting === p.id ? L("rtDeleting") : L("rtDelete")}
+                  </button>
+                )}
                 {isDl && (
                   <button
                     className="settings-mini-btn danger"
@@ -1572,9 +1746,31 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 {cudaReady ? L("cudaInstalled") : L("cudaNotInstalled")}
               </span>
             </div>
+            {/* S74b: the app's biggest optional download (~1.6 GB) had no way back out. It is
+                reclaimable whenever it is installed — most of all on the machines our CUDA package
+                does NOT support, which is exactly where it sits unused. */}
+            {cudaReady && !cudaDownloading && (
+              <div className="settings-pack-actions">
+                <button
+                  className="settings-mini-btn danger"
+                  disabled={cudaDeleting}
+                  onClick={handleCudaDelete}
+                >
+                  {cudaDeleting ? L("cudaDeleting") : L("cudaDelete")}
+                </button>
+              </div>
+            )}
           </div>
 
-          {!cudaReady && !cudaDownloading && (
+          {/* S74b: the "this machine can't use CUDA" explanation is NOT nested in the
+              not-installed branch. A user who downloaded the package back when it was offered to
+              every NVIDIA box (≤0.8.3) has cudaReady === true, so nesting it there left exactly
+              that user with a silently disabled CUDA option and no reason for it — the same
+              guessing game the gates exist to remove. The package they already have is listed in
+              Storage → Cleanup, where it can be reclaimed. */}
+          {hw && !hw.cuda_supported && <p className="settings-note">{L("cudaUnsupportedNote")}</p>}
+
+          {!cudaReady && !cudaDownloading && hw?.cuda_supported && (
             <>
               <button className="settings-download-btn" onClick={handleCudaDownload}>
                 {L("cudaDownload")}
@@ -1682,15 +1878,71 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 <div className="settings-hw-info">
                   {rt.packs.map((p) => (
                     <div key={p.id} className="settings-pack">
+                      {/* S74b: THREE states, not two. An installed pack this machine cannot run
+                          is neither "passed" nor "failed" — its self-test verdict (whenever it was
+                          taken, on whatever hardware) says nothing about today. Show that plainly
+                          and keep the card, so 自检 stays clickable after a driver fix and 删除
+                          stays reachable. The download entry for it is hidden (offer gate); the
+                          thing already on disk never is. */}
                       <div className="settings-row">
                         <span className="settings-label">{p.variant}</span>
-                        <span className={`settings-badge ${p.envtest?.overall === "pass" ? "ok" : "no"}`}>
-                          {p.envtest ? (p.envtest.overall === "pass" ? L("rtTestPass") : L("rtTestFail")) : L("rtTestNone")}
+                        <span className={`settings-badge ${!p.supported || p.envtest_stale ? "no" : p.envtest?.overall === "pass" ? "ok" : "no"}`}>
+                          {!p.supported
+                            ? L("rtUnsupported")
+                            : p.envtest_stale
+                              ? L("rtTestStale")
+                              : p.envtest
+                                ? (p.envtest.overall === "pass" ? L("rtTestPass") : L("rtTestFail"))
+                                : L("rtTestNone")}
                         </span>
                       </div>
+                      {p.supported && p.envtest_stale && (
+                        <span className="settings-note selectable" style={{ textAlign: "left", maxWidth: "100%" }}>
+                          {L("rtStaleNote")}
+                        </span>
+                      )}
+                      {!p.supported && (
+                        <span className="settings-error" style={{ textAlign: "left", maxWidth: "100%", wordBreak: "break-word" }}>
+                          {L(
+                            p.variant === "nv-cu130" ? "rtWhyNv"
+                            : p.variant === "amd" ? "rtWhyAmd"
+                            : p.variant === "xpu" ? "rtWhyXpu"
+                            : "rtWhyGeneric",
+                          )}
+                        </span>
+                      )}
                       <span className="settings-value" style={{ textAlign: "left", maxWidth: "100%" }}>
                         {p.id} · torch {p.torch || "?"} · py {p.python || "?"} · {fmtGB(p.disk_bytes)}
                       </span>
+                      {/* S74: the badge alone ("自检未通过") was a guessing game — a community Iris Xe
+                          user had no way to learn WHICH check failed or why. Render every failed check
+                          (red) and every WARN (amber-ish note: a hot op silently falling back to CPU
+                          must not hide behind a green badge) with its root-cause detail, localized when
+                          the check emits a stable CODE. */}
+                      {(p.envtest?.items ?? [])
+                        .filter((it) => it.status === "fail" || it.status === "warn")
+                        .map((it) => {
+                          // Checks whose failure the user must act on emit a stable CODE → a
+                          // localized remedy. Everything else is an integrity diagnostic whose
+                          // remedy is uniform (reinstall the pack): show a localized sentence and
+                          // present the check's raw text AS technical detail rather than letting a
+                          // Chinese diagnostic pose as the user-facing message in an en/ja UI.
+                          // A WARN deliberately does NOT flip `overall` (envtest.py: "warns do NOT
+                          // flip overall"), so labelling it "did not pass" stated two contradictory
+                          // verdicts on one card. Separate wording per status.
+                          const generic = it.status === "warn" ? L("selfTestCheckWarn") : L("selfTestCheckFailed");
+                          const localized = it.detail ? backendErrorMessage(it.detail) : null;
+                          const text = localized ?? (it.detail ? `${generic}: ${it.detail}` : generic);
+                          return (
+                            <span
+                              key={it.name}
+                              className={it.status === "fail" ? "settings-error" : "settings-note selectable"}
+                              style={{ textAlign: "left", maxWidth: "100%", wordBreak: "break-word" }}
+                            >
+                              {it.name} — {text}
+                            </span>
+                          );
+                        })}
                       <div className="settings-pack-actions">
                         <button
                           className="settings-mini-btn"
@@ -1736,12 +1988,16 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 <button className="settings-mini-btn" disabled={rtBusy || envtesting !== null || deleting !== null} onClick={handleRtLocalInstall}>
                   {L("rtLocalInstall")}
                 </button>
+                {/* S74b: the escape hatch stays open, but its consequence is stated up front —
+                    the variant only becomes knowable after the archive is parsed, so a pre-emptive
+                    dialog isn't possible here; the pack card carries the verdict afterwards. */}
                 {rtBusy && (
                   <button className="settings-mini-btn danger" onClick={() => { invoke("cancel_runtime_install").catch(() => {}); }}>
                     {L("rtCancel")}
                   </button>
                 )}
               </div>
+              <p className="settings-note">{L("rtLocalNote")}</p>
 
               {rtBusy && rtProgress && (
                 <div className="settings-progress">

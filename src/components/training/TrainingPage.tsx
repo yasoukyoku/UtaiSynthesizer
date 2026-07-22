@@ -12,6 +12,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { exists, readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/app";
+import { logToBackend } from "../../lib/log";
 import {
   diffPoolReady,
   trainingDataOk,
@@ -1823,6 +1824,8 @@ function RunStep() {
         return n;
       });
       if (isCancelError(e)) return; // user cancelled the audition — not an error, no toast
+      // S74: audition runs render_audition_* (blocking inference) — leave a copyable log trace.
+      logToBackend(isBusyError(e) ? "warn" : "error", `Training audition failed (${id}): ${e instanceof Error ? e.message : String(e)}`);
       // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead.
       const display = backendErrorMessage(e) ?? String(e);
       if (maybeShowErrorModal(e, display)) return;

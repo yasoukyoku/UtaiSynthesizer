@@ -24,6 +24,7 @@ import { useFloatingPanel } from "../../lib/useFloatingPanel";
 import { PanelResizeHandles } from "../common/PanelResizeHandles";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { logToBackend } from "../../lib/log";
 import { VOICE_STRINGS } from "../workflow/nodes/VoiceModelPicker";
 import {
   useVoiceModelStore,
@@ -1044,6 +1045,8 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
       const msg = e instanceof Error ? e.message : String(e);
       const mapped = backendErrorMessage(msg);
       const busy = isBusyError(msg);
+      // S74: audition runs render_model_audition (blocking inference) — leave a copyable log trace.
+      logToBackend(busy ? "warn" : "error", `Model audition failed (${m.name}): ${msg}`);
       // S67c: fatal modal-class errors (INFERENCE_LOW_MEMORY) open the alert dialog instead.
       if (!(mapped && maybeShowErrorModal(msg, mapped))) {
         showToast(

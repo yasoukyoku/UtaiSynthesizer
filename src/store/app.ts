@@ -44,6 +44,9 @@ interface ConfirmRequest {
   body: string;
   buttons: ConfirmButton[];
   input?: ConfirmInput;
+  /** S74: error modals (maybeShowErrorModal) — long body scrolls, text is selectable, and a
+   *  Copy button appears. Ordinary confirms/prompts leave it unset (compact, non-scrolling). */
+  scrollable?: boolean;
   resolve: (id: string) => void;
   seq: number;
 }
@@ -181,7 +184,7 @@ interface AppState {
   showBanner: (message: string, kind: BannerKind) => void;
   /** Show a styled confirm dialog; resolves with the chosen button id, or "" if dismissed (Esc/backdrop).
    *  With `input` set, the primary button/Enter resolves the trimmed input VALUE instead (see ConfirmInput). */
-  showConfirm: (opts: { title: string; body: string; buttons: ConfirmButton[]; input?: ConfirmInput }) => Promise<string>;
+  showConfirm: (opts: { title: string; body: string; buttons: ConfirmButton[]; input?: ConfirmInput; scrollable?: boolean }) => Promise<string>;
 }
 
 export type BannerKind = "undo" | "redo" | "save" | "load" | "info";
@@ -357,6 +360,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           body: opts.body,
           buttons: opts.buttons,
           input: opts.input,
+          scrollable: opts.scrollable,
           seq: prevSeq + 1,
           resolve: (id: string) => {
             set({ confirm: null });

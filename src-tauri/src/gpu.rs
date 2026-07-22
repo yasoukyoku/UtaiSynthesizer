@@ -226,6 +226,95 @@ pub fn cuda_devices() -> Vec<CudaDeviceInfo> {
     Vec::new()
 }
 
+/// Compute capability (major, minor) for a CUDA RUNTIME ordinal (the ORT CUDA EP's
+/// device space — same ordinal cudaSetDevice uses), via cudart cudaDeviceGetAttribute.
+/// None = cudart unloadable / the call failed. ⚠ Callers consume `None` as NOT SUPPORTED
+/// (fail-CLOSED — the S74b package rule), except `cuda_device_label`, which only formats a log
+/// suffix. Do not reintroduce a `map_or(true, …)` here: that is the fail-open this predicate was
+/// changed away from.
+#[cfg(windows)]
+pub fn cuda_compute_cap(ordinal: u32) -> Option<(i32, i32)> {
+    type GetAttr = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+    // cudart ABI: cudaDevAttrComputeCapabilityMajor = 75, ...Minor = 76 (stable enum values).
+    unsafe {
+        let f: GetAttr = std::mem::transmute(cudart_proc(b"cudaDeviceGetAttribute\0")?);
+        let (mut major, mut minor) = (0i32, 0i32);
+        if f(&mut major, 75, ordinal as i32) != 0 {
+            return None;
+        }
+        if f(&mut minor, 76, ordinal as i32) != 0 {
+            return None;
+        }
+        Some((major, minor))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn cuda_compute_cap(_ordinal: u32) -> Option<(i32, i32)> {
+    None
+}
+
+/// Compute-capability FLOOR shared by BOTH CUDA lanes — `cc10` = major*10+minor (sm_8.6 → 86,
+/// sm_12.0 → 120). sm_75 (Turing) is not "what CUDA 12.9 happens to contain": it is the
+/// CUDA-13 target configuration both sides are deliberately aligned on (the nv-cu130 TRAINING
+/// wheels already use it). Running training and inference on two different CUDA configurations
+/// is the thing this constant exists to prevent — do not derive a second floor anywhere.
+pub const CUDA_CC10_FLOOR: i32 = 75;
+
+/// ★TEMPORARY, INFERENCE ONLY. Microsoft ships no CUDA-13 ONNX Runtime yet, and the CUDA-12.9
+/// build we are stuck on has only broken PTX for Blackwell (sm_100 / sm_120 — ORT #26177,
+/// #26245), so RTX 50 cards must be kept off the INFERENCE CUDA lane and use DirectML. Training
+/// is already on cu130 PyTorch and has no such limit.
+///
+/// ⚠ This is step ⑨ of the CUDA-13 migration checklist: when inference moves to an ORT with a
+/// CUDA-13 build, DELETE this constant and its single use in `cuda_cc_supported_inference`.
+/// Both lanes are then literally the same predicate and RTX 50 is released everywhere at once.
+/// Do NOT delete it earlier because "the two sides should be aligned" — they are aligned on the
+/// FLOOR; this line is the one honest, dated exception.
+const INFERENCE_ORT_HAS_NO_BLACKWELL_YET: bool = true;
+
+/// Can the nv-cu130 TRAINING pack run on this compute capability?
+pub fn cuda_cc_supported_training(cc10: i32) -> bool {
+    cc10 >= CUDA_CC10_FLOOR
+}
+
+/// Can the shipped INFERENCE CUDA package (ORT CUDA build + runtime/cuda DLLs) run on this
+/// compute capability? = the shared floor, minus the temporary Blackwell exception above.
+/// THE single predicate behind every inference-CUDA decision: whether the download entry and
+/// the device option are shown at all, whether `init_ort_runtime` loads the CUDA ORT build, and
+/// whether an already-installed package counts as usable or as reclaimable storage.
+pub fn cuda_cc_supported_inference(cc10: i32) -> bool {
+    cuda_cc_supported_training(cc10) && !(INFERENCE_ORT_HAS_NO_BLACKWELL_YET && cc10 >= 100)
+}
+
+/// Cached ": <name>, sm_XY" suffix for logging WHICH CUDA device an ORT session bound to
+/// (S74: CUDA build previously logged only the ordinal number — a community CUDA-fail log
+/// told us nothing about the card). Empty when the ordinal is unknown / cudart+smi
+/// unavailable. cuda_devices() shells nvidia-smi, so the whole ordinal→(name,cc) table is
+/// built ONCE per process (session builds can be frequent). Only ever called after a CUDA
+/// session commits, so cudart is loaded by then.
+pub fn cuda_device_label(ordinal: u32) -> String {
+    static CACHE: std::sync::OnceLock<Vec<(u32, String, Option<(i32, i32)>)>> =
+        std::sync::OnceLock::new();
+    let table = CACHE.get_or_init(|| {
+        cuda_devices()
+            .into_iter()
+            .map(|d| {
+                let cc = cuda_compute_cap(d.index);
+                (d.index, d.name, cc)
+            })
+            .collect()
+    });
+    table
+        .iter()
+        .find(|(i, _, _)| *i == ordinal)
+        .map(|(_, name, cc)| {
+            let sm = cc.map(|(a, b)| format!(", sm_{a}{b}")).unwrap_or_default();
+            format!(": {name}{sm}")
+        })
+        .unwrap_or_default()
+}
+
 /// Proc address from a named DLL via plain kernel32 FFI. cudart64_12.dll reaches PATH
 /// through setup_cuda_dll_paths whenever the CUDA runtime is installed; nvcuda.dll
 /// (the CUDA DRIVER API) lives in System32 whenever an NVIDIA driver is installed.

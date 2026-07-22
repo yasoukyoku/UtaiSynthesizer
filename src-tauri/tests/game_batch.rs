@@ -54,6 +54,29 @@ fn game_batch_label() {
         )
         .try_init();
     utai_lib::suppress_windows_dll_error_dialogs();
+    // S74: MUST precede init_ort_runtime and MUST be here even though the default tier is CPU —
+    // UTAI_GAME_DEVICE=cuda:N makes this harness a GPU harness, and without the app's CUDA DLL
+    // directories the cudnn 9 shim can't resolve its engine sub-DLLs (CUDNN_BACKEND_API_FAILED at
+    // the first Conv). Diagnosing GAME-on-CUDA in a loader context the app never uses is the S39
+    // trap; every other GPU-capable harness already calls this.
+    // UTAI_GAME_DLL_MODE=nopath — S74 regression hook for the cuDNN-frontend fix. It SKIPS
+    // setup_cuda_dll_paths (so runtime/cuda is NOT on PATH) and only registers the dir via
+    // AddDllDirectory, which is inert unless the process is in user-dirs mode. That is the
+    // loader context in which cuDNN could not find cudnn_engines_tensor_ir64_9.dll and GAME's
+    // first Conv died with CUDNN_FE failure 11; with lib.rs's absolute-path preload of the
+    // libraries the ort crate misses, `nopath` must now transcribe on CUDA exactly like `full`.
+    // Delete this hook only together with that preload.
+    if std::env::var("UTAI_GAME_DLL_MODE").as_deref() == Ok("nopath") {
+        extern "system" {
+            fn AddDllDirectory(new_directory: *const u16) -> *mut std::ffi::c_void;
+        }
+        let d = app_root().join("runtime").join("cuda");
+        let wide: Vec<u16> = d.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { AddDllDirectory(wide.as_ptr()) };
+        eprintln!("[game_batch] DLL mode = nopath (AddDllDirectory only)");
+    } else {
+        utai_lib::setup_cuda_dll_paths(&app_root());
+    }
     utai_lib::init_ort_runtime(&app_root());
 
     let models_dir = app_root().join("data").join("models");

@@ -38,6 +38,12 @@ pub fn restart_app(app: AppHandle, state: State<'_, Arc<AppState>>) {
 /// its id HERE (and add a `close.task_<id>` label in the locales).
 #[tauri::command]
 pub fn running_tasks(state: State<'_, Arc<AppState>>) -> Vec<String> {
+    running_tasks_of(&state)
+}
+
+/// Same list, callable from plain Rust (the delete pre-flight below) — one source, so a task that
+/// starts blocking the quit flow automatically starts blocking destructive package removals too.
+pub fn running_tasks_of(state: &AppState) -> Vec<String> {
     let mut tasks: Vec<String> = state.active_tasks.lock().keys().cloned().collect();
     if state.training.is_active() {
         tasks.push("training".to_string());
@@ -48,7 +54,41 @@ pub fn running_tasks(state: State<'_, Arc<AppState>>) -> Vec<String> {
     ) {
         tasks.push("separation".to_string());
     }
+    // S74b: voice conversion / vocal rendering and the audition family register NO entry in
+    // active_tasks (run_rvc, run_sovits, render_vocal_segment, run_autotune have no begin_task), so
+    // a list built only from active_tasks silently omitted the very jobs that hold the inference
+    // model files open — the delete pre-flight below would have called a machine "idle" mid-render.
+    // These two flags are the same ones acquire_convert_slot (lib.rs) checks; keep the three in
+    // step. Both are also genuine quit-warning material, which is why they live here.
+    if crate::commands::inference::voice_render_active() {
+        tasks.push("render".to_string());
+    }
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        tasks.push("audition".to_string());
+    }
     tasks
+}
+
+/// S74b PRE-FLIGHT for every destructive package removal (runtime packs, asset packs, the CUDA
+/// runtime): deleting files out from under a running job breaks it in ways that surface far from
+/// the cause — a training run whose interpreter vanishes, an inference session whose DLLs are
+/// unmapped mid-render.
+///
+/// Deliberately FAIL-CLOSED and coarse: ANY running task blocks ANY package delete. A per-package
+/// "which family could be using this" matrix would be an enumeration, and an enumeration that
+/// misses a newly added task id fails OPEN — silently allowing exactly the delete that corrupts a
+/// run (the S61 cleanup-protection-set lesson: enumerate every holder, or don't enumerate).
+/// The cost of being coarse is only that the user waits for a job to finish.
+///
+/// Returns the running task ids so the caller can name them; the frontend localizes them through
+/// the SAME `close.task_<id>` keys the quit warning uses (no second vocabulary).
+pub fn ensure_idle_for_package_delete(state: &AppState) -> Result<(), String> {
+    let tasks = running_tasks_of(state);
+    if tasks.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("DELETE_WHILE_BUSY: {}", tasks.join(",")))
+    }
 }
 
 /// Update the tray menu labels so the menu follows the UI language (called by the frontend on mount and
