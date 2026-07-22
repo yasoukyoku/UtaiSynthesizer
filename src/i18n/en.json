@@ -227,7 +227,7 @@
     "step4": "Run",
     "dataHint": "Import clean vocal recordings. If separation/denoising is needed, process them on the track area first, export, then import here.",
     "addFiles": "Add audio files",
-    "multiSpeakerHint": "One singer by default. Click \"+ Add singer\" to add more — the trained model can then blend these voices by ratio in the cover node.",
+    "multiSpeakerHint": "One singer by default. Click \"+ Add singer\" to add more — the trained model can then blend these voices by ratio in the voice-conversion node.",
     "speakerName": "Singer name",
     "addSpeaker": "+ Add singer",
     "removeSpeaker": "Remove this singer",
@@ -473,7 +473,7 @@
     "compTitle": "Required components missing",
     "compBody": "The following required components are not installed yet:",
     "compRuntime": "Converter runtime (required to import / convert voice models; ships a CPU PyTorch)",
-    "compAux": "Core inference models (required for vocal synthesis / covers / pitch extraction, ~1.4GB)",
+    "compAux": "Core inference models (required for vocal rendering / voice conversion / pitch extraction, ~1.4GB)",
     "compHint": "Download them now with one click (progress shows in the Settings panel), or later under Settings → Model Assets / Training Runtime.",
     "compNever": "Don't remind me again",
     "compLater": "Later",
@@ -579,8 +579,7 @@
       "autotuneExprTip": "Scales the whole auto-tune: glide overshoot, edge scoops and vibrato together",
       "autotuneTake": "Take",
       "autotuneTakeTip": "Switch the delivery (vibrato phase): the same number is always the same take, dial back anytime. 0 = baseline",
-      "autotunePaused": "Auto follow paused (tuning model not ready) — it resumes automatically once the model is downloaded",
-      "autotuneHint": "Auto-tune keeps following your edits; manually tuned notes and drawn pitch lines are preserved"
+      "autotunePaused": "Auto follow paused (tuning model not ready) — it resumes automatically once the model is downloaded"
     },
     "render": {
       "render": "Render vocal",
@@ -780,7 +779,7 @@
     "RVC_MIN_FRAMES": "Audio chunk too short: frame count is below the model's minimum",
     "RVC_NO_OUTPUT": "The RVC model returned no output",
     "RVC_SR_NOT_100FPS": "The model sample rate is not a multiple of 100, so it cannot be aligned to the 100 fps frame grid",
-    "SCORE2CV_DIM_UNSUPPORTED": "Unsupported self-sing content dimension (only 256 / 768) — check the selected singer model's features_dim",
+    "SCORE2CV_DIM_UNSUPPORTED": "Unsupported vocal-rendering content dimension (only 256 / 768) — check the selected singer model's features_dim",
     "SCORE2CV_NO_OUTPUT": "The ScoreToCV model returned no output",
     "SCORE2CV_SHAPE": "ScoreToCV output size mismatch",
     "SCORE2SVC_ZERO_FRAMES": "Target frame count is 0 (the score is too short)",

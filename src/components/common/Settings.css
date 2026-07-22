@@ -104,6 +104,35 @@
   border-color: var(--border-subtle);
 }
 
+/* S74b — model-asset rows. They gained a Delete button, and the row's `space-between` then
+   scattered the status badge into the middle of the row, so nothing lined up any more. Keep the
+   label elastic and group badge+buttons at the right; the badge keeps its natural chip width
+   (a min-width there would leave the text hugging one edge of the border), and the alignment
+   instead comes from a minimum width on the BUTTON column — that fixes the badge's right edge at
+   a constant offset from the row edge, with a real gap so the two don't touch. */
+.settings-asset-row {
+  justify-content: flex-start;
+  gap: 8px;
+}
+.settings-asset-row > .settings-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.settings-asset-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.settings-asset-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 58px; /* fits 删除 / Delete / 削除 — the common one-button case aligns */
+}
+
 .settings-field {
   display: flex;
   flex-direction: column;

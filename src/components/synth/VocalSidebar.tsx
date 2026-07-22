@@ -398,7 +398,6 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           cfg={{ min: 0, max: 99, step: 1, unit: "", bipolar: false }}
           onChange={(v) => setVocalParams(trackId, { autoTuneTake: Math.round(v) })}
         />
-        <div className="vsb-hint">{t("vocalEditor.sidebar.autotuneHint")}</div>
       </div>
 
       {/* ① selected-note transition override (glide / portamento between notes) */}

@@ -994,7 +994,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       assetInstalled: { zh: "已安装", en: "Installed", ja: "インストール済み" },
       assetMissing: { zh: "缺失", en: "Missing", ja: "不足" },
       assetDownload: { zh: "下载", en: "Download", ja: "ダウンロード" },
-      assetNote: { zh: "推理核心包 = 人声轨合成 / 翻唱 / 音高提取的必备模型（约 1.4GB）；训练底模按需下载。已在下载中断处自动续传。", en: "The core pack holds the models required for vocal-track synthesis / covers / pitch extraction (~1.4GB); training bases are optional. Interrupted downloads resume automatically.", ja: "推論コアパックはボーカルトラック合成／カバー／ピッチ抽出に必須のモデルです（約 1.4GB）。学習ベースは必要に応じて。中断したダウンロードは自動で再開されます。" },
+      assetNote: { zh: "推理核心包 = 人声渲染 / 音色替换 / 音高提取的必备模型（约 1.4GB）；训练底模按需下载。已在下载中断处自动续传。", en: "The core pack holds the models required for vocal rendering / voice conversion / pitch extraction (~1.4GB); training bases are optional. Interrupted downloads resume automatically.", ja: "推論コアパックはボーカルレンダリング／音声変換／ピッチ抽出に必須のモデルです（約 1.4GB）。学習ベースは必要に応じて。中断したダウンロードは自動で再開されます。" },
       assetStartupCheck: { zh: "启动时检查必要组件（缺失时弹窗提示）", en: "Check required components on startup (dialog when missing)", ja: "起動時に必須コンポーネントを確認（不足時にダイアログ）" },
       hardware: { zh: "硬件", en: "Hardware", ja: "ハードウェア" },
       gpu: { zh: "显卡", en: "GPU", ja: "GPU" },
@@ -1127,7 +1127,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       stCudaRuntime: { zh: "CUDA 推理运行时", en: "CUDA inference runtime", ja: "CUDA 推論ランタイム" },
       assetDeleteTitle: { zh: "删除「{pack}」？", en: "Delete \"{pack}\"?", ja: "「{pack}」を削除しますか？" },
       assetDeleteBody: { zh: "将删除该资产包下载的全部文件（不会碰你自己导入的模型）。需要时可以随时重新下载。", en: "This removes every file this asset pack downloaded (your own imported models are untouched). You can download it again at any time.", ja: "このアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。必要になればいつでも再ダウンロードできます。" },
-      assetDeleteBodyRequired: { zh: "⚠ 这是推理必需的模型包：删除后「翻唱」和「自己唱」都将无法使用，直到重新下载（约 1.4GB）。\n将删除该资产包下载的全部文件（不会碰你自己导入的模型）。", en: "⚠ This pack is REQUIRED for inference: after deleting it, voice conversion and singing synthesis stop working until you download it again (~1.4 GB).\nThis removes every file this asset pack downloaded (your own imported models are untouched).", ja: "⚠ これは推論に必須のモデルパックです。削除すると、再ダウンロード（約 1.4GB）するまで「歌声変換」と「歌唱合成」が使用できなくなります。\nこのアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。" },
+      assetDeleteBodyRequired: { zh: "⚠ 这是推理必需的模型包：删除后「音色替换」和「人声渲染」都将无法使用，直到重新下载（约 1.4GB）。\n将删除该资产包下载的全部文件（不会碰你自己导入的模型）。", en: "⚠ This pack is REQUIRED for inference: after deleting it, voice conversion and vocal rendering stop working until you download it again (~1.4 GB).\nThis removes every file this asset pack downloaded (your own imported models are untouched).", ja: "⚠ これは推論に必須のモデルパックです。削除すると、再ダウンロード（約 1.4GB）するまで「音声変換」と「ボーカルレンダリング」が使用できなくなります。\nこのアセットパックがダウンロードした全ファイルを削除します（自分で取り込んだモデルには触れません）。" },
       stRuntimesNote: { zh: "在下方「训练环境」面板管理", en: "Managed in the Training Runtime panel below", ja: "下の「トレーニング環境」パネルで管理" },
       stDicts: { zh: "发音词典（必需）", en: "G2P dictionaries (required)", ja: "発音辞書（必須）" },
       stTotal: { zh: "合计", en: "Total", ja: "合計" },
@@ -1676,13 +1676,15 @@ export function Settings({ onClose }: { onClose: () => void }) {
             const isDl = assetActive === p.id || assetProgress?.pack === p.id || p.downloading;
             const anyDl = assetActive !== null || assetPacks.some((x) => x.downloading);
             return (
-              <div key={p.id} className="settings-row" style={{ alignItems: "center", gap: 8 }}>
+              <div key={p.id} className="settings-row settings-asset-row">
                 <span className="settings-label">{label}</span>
+                <div className="settings-asset-actions">
                 <span className={`settings-badge ${p.missing === 0 ? "ok" : "no"}`}>
                   {p.missing === 0
                     ? L("assetInstalled")
                     : `${L("assetMissing")} ${p.missing}/${p.fileCount} · ${fmtSize(p.missingBytes)}`}
                 </span>
+                <div className="settings-asset-buttons">
                 {p.missing > 0 && !isDl && (
                   <button className="settings-mini-btn" disabled={anyDl} onClick={() => void handleAssetDownload(p.id)}>
                     {L("assetDownload")}
@@ -1708,6 +1710,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     {L("rtCancelBtn")}
                   </button>
                 )}
+                </div>
+                </div>
               </div>
             );
           })}
