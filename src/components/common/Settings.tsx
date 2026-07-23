@@ -202,6 +202,23 @@ interface AssetPackProgress {
 }
 
 /** Mirror of Rust `commands::storage::{StorageReport, WorkspaceUsage}` (S61). */
+/** Mirror of Rust `tproject::DeleteReport` — what a destructive action actually did. */
+interface DeleteReport {
+  freedBytes: number;
+  deleted: string[];
+  kept: { rel: string; reason: string }[];
+  /** rename done, background removal blocked — the archives are already unreachable. */
+  deferred: boolean;
+}
+
+interface SlotUsage {
+  family: string;
+  bytes: number;
+  snapshots: number;
+  cleanableBytes: number;
+  diffSteps: number;
+}
+
 interface WorkspaceUsage {
   /** S76: project id = the directory under <data>/training. */
   slug: string;
@@ -214,6 +231,8 @@ interface WorkspaceUsage {
    *  user has to decide. Shown inline: a project that exists on disk must never be invisible
    *  in the app. */
   needs_attention?: string | null;
+  dataset_bytes: number;
+  slots: SlotUsage[];
 }
 interface StorageReport {
   data_dir: string;
@@ -591,31 +610,59 @@ export function Settings({ onClose }: { onClose: () => void }) {
     return backendErrorMessage(msg) ?? msg;
   };
 
-  const runCleanup = useCallback(async (key: string, fn: () => Promise<number>, confirm?: { title: string; body: string }) => {
-    if (confirm) {
-      const choice = await showConfirm({
-        title: confirm.title,
-        body: confirm.body,
-        buttons: [
-          { id: "cancel", label: L("rtCancelBtn") },
-          { id: "clean", label: L("stCleanBtn"), kind: "danger" },
-        ],
-      });
-      if (choice !== "clean") return;
-    }
-    setCleanBusy(key);
-    setCleanMsg(null);
-    try {
-      const freed = await fn();
-      setCleanMsg(`${L("stFreed")} ${fmtSize(freed)}`);
-      await refreshStorage();
-    } catch (e) {
-      setCleanMsg(cleanupErrText(e));
-    } finally {
-      setCleanBusy(null);
-    }
+  /** THE single cleanup/delete funnel. `fn` may return a plain byte count (the four original
+   *  cache sweeps) or a structured report — the training-archive actions need the second form
+   *  because「已释放 0 B」is their CORRECT outcome on a migrated project (everything predates
+   *  the export ledger and is protected), and a bare zero reads as a broken button.
+   *
+   *  `confirmLabel` exists because the danger button used to be hardcoded to「清理」— fine for
+   *  a cache sweep, wrong on「删除整个训练项目」. */
+  const runCleanup = useCallback(
+    async (
+      key: string,
+      fn: () => Promise<number | DeleteReport>,
+      confirm?: { title: string; body: string; confirmLabel?: string },
+    ) => {
+      if (confirm) {
+        const choice = await showConfirm({
+          title: confirm.title,
+          body: confirm.body,
+          scrollable: true,
+          buttons: [
+            { id: "cancel", label: L("rtCancelBtn") },
+            { id: "clean", label: confirm.confirmLabel ?? L("stCleanBtn"), kind: "danger" },
+          ],
+        });
+        if (choice !== "clean") return;
+      }
+      setCleanBusy(key);
+      setCleanMsg(null);
+      setMsgOwner(key.split(":")[0] ?? null);
+      try {
+        const out = await fn();
+        if (typeof out === "number") {
+          setCleanMsg(`${L("stFreed")} ${fmtSize(out)}`);
+        } else {
+          // "kept N" is not filler: it is the difference between「什么都没删」and「按规则保留了
+          // N 项」, and on a migrated project it is the whole answer.
+          const parts = [
+            out.deferred ? L("stDeferred") : `${L("stFreed")} ${fmtSize(out.freedBytes)}`,
+          ];
+          if (out.kept.length > 0) {
+            parts.push(L("stKeptNote").replace("{count}", String(out.kept.length)));
+          }
+          setCleanMsg(parts.join(" · "));
+        }
+        await refreshStorage();
+      } catch (e) {
+        setCleanMsg(cleanupErrText(e));
+      } finally {
+        setCleanBusy(null);
+      }
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshStorage, showConfirm, lang]);
+    [refreshStorage, showConfirm, lang],
+  );
 
   const handleCleanCache = useCallback(() => {
     // Non-reactive last-moment gate: an in-flight stretch's output path is minted Rust-side and
@@ -643,6 +690,69 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const handleCleanLogs = useCallback(() => {
     void runCleanup("logs", () => invoke<number>("cleanup_logs"));
   }, [runCleanup]);
+
+  /** Expanded projects, keyed by id — NOT by index: the report re-sorts by size after every
+   *  deletion, so an index would silently expand a different project next render. */
+  const [expandedWs, setExpandedWs] = useState<Set<string>>(new Set());
+  /** Which project row owns the current result message (its key's project part). */
+  const [msgOwner, setMsgOwner] = useState<string | null>(null);
+  const toggleWs = (slug: string) =>
+    setExpandedWs((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(slug)) next.add(slug);
+      return next;
+    });
+
+  /** Architecture ids are shown raw — they are the same proper nouns the project row has always
+   *  displayed (`rvc+sovits`), and inventing a translated vocabulary here would be a second
+   *  source for names the training page already writes as-is. */
+  const famLabel = (f: string) => f;
+
+  const handleCleanSnapshots = useCallback((ws: WorkspaceUsage, slot: SlotUsage) => {
+    void runCleanup(
+      `${ws.slug}:snap:${slot.family}`,
+      () =>
+        invoke<DeleteReport>("training_cleanup_snapshots", {
+          projectId: ws.slug,
+          family: slot.family,
+        }),
+      {
+        title: L("stSnapTitle"),
+        body: L("stSnapBody")
+          .replace("{family}", famLabel(slot.family))
+          .replace("{size}", fmtSize(slot.cleanableBytes)),
+        confirmLabel: L("stSnapClean"),
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCleanup, lang]);
+
+  const handleDeleteSlot = useCallback((ws: WorkspaceUsage, slot: SlotUsage) => {
+    // Shallow diffusion lives INSIDE the sovits slot and the word "sovits" says nothing about
+    // it — the retrain path already warns with a real step count; say the same thing here.
+    const diffNote =
+      slot.diffSteps > 0
+        ? `
+${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
+        : "";
+    void runCleanup(
+      `${ws.slug}:${slot.family}`,
+      () =>
+        invoke<DeleteReport>("training_delete_slot", {
+          projectId: ws.slug,
+          family: slot.family,
+        }),
+      {
+        title: L("stSlotTitle"),
+        body:
+          L("stSlotBody")
+            .replace("{family}", famLabel(slot.family))
+            .replace("{size}", fmtSize(slot.bytes)) + diffNote,
+        confirmLabel: L("stSlotDelete"),
+      },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runCleanup, lang]);
 
   const handleDeleteWorkspace = useCallback((ws: WorkspaceUsage) => {
     void runCleanup(
@@ -673,7 +783,19 @@ export function Settings({ onClose }: { onClose: () => void }) {
       },
       {
         title: L("stWsTitle"),
-        body: `${ws.name}${ws.family ? ` · ${ws.family}` : ""} · ${fmtSize(ws.bytes)}\n${L("stWsBody")}${ws.has_pool ? `\n${L("stWsPoolNote")}` : ""}`,
+        // Itemised on purpose: a project can hold four architectures, and a body that only
+        // says「该模型的…」hides three of them behind one button.
+        body: [
+          `${ws.name} · ${fmtSize(ws.bytes)}`,
+          L("stWsBody"),
+          ...ws.slots.map((sl) => `· ${famLabel(sl.family)} — ${fmtSize(sl.bytes)}`),
+          ws.dataset_bytes > 0
+            ? `· ${L("stWsDatasetNote").replace("{size}", fmtSize(ws.dataset_bytes))}`
+            : "",
+        ]
+          .filter((l) => l !== "")
+          .join("\n"),
+        confirmLabel: L("stWsDelete"),
       },
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1138,11 +1260,29 @@ export function Settings({ onClose }: { onClose: () => void }) {
       stAuditionTitle: { zh: "清理试听缓存", en: "Clean audition caches", ja: "試聴キャッシュをクリーン" },
       stAuditionBody: { zh: "删除模型试听音频与训练候选试听目录（重新试听会自动重建）。", en: "Deletes model audition wavs + training candidate audition dirs (re-auditioning rebuilds them).", ja: "モデル試聴音声とトレーニング候補の試聴フォルダを削除します（再試聴で再生成されます）。" },
       stLogs: { zh: "日志", en: "Logs", ja: "ログ" },
-      stTraining: { zh: "训练工作区", en: "Training workspaces", ja: "トレーニングワークスペース" },
-      stWsDelete: { zh: "删除", en: "Delete", ja: "削除" },
-      stWsTitle: { zh: "删除训练工作区", en: "Delete training workspace", ja: "ワークスペースを削除" },
-      stWsBody: { zh: "将删除该模型的数据集副本、预处理特征与全部训练 checkpoint——不可恢复，续训将不再可用（已导入到资源管理器的成品模型不受影响）。", en: "Deletes this model's dataset copies, preprocessed features and ALL training checkpoints — irreversible; resume-training becomes unavailable (models already imported into the resource manager are unaffected).", ja: "このモデルのデータセットコピー・前処理特徴・全チェックポイントを削除します。元に戻せず、続きからのトレーニングは不可になります（リソースマネージャに取り込んだモデルは影響ありません）。" },
-      stWsPoolNote: { zh: "注意：该工作区带有可复用数据池——删除后，浅扩散训练将需要重新导入数据。", en: "Note: this workspace holds a reusable dataset pool — after deletion, shallow-diffusion training will require importing data again.", ja: "注意：このワークスペースには再利用可能なデータプールがあります。削除後、浅い拡散トレーニングはデータの再インポートが必要になります。" },
+      stTraining: { zh: "训练项目", en: "Training projects", ja: "トレーニングプロジェクト" },
+      stWsDelete: { zh: "删除项目", en: "Delete project", ja: "プロジェクトを削除" },
+      stWsTitle: { zh: "删除整个训练项目", en: "Delete the whole training project", ja: "トレーニングプロジェクト全体を削除" },
+      // ★ Three actions, three bodies. One project can now hold up to four architecture slots
+      // plus the shared dataset, so the old single「该模型的…」text under-stated the blast
+      // radius of the project-level button by three architectures' worth of training.
+      stWsBody: { zh: "将删除这个训练项目的全部内容——共享数据集、预处理特征与所有架构的训练存档。不可恢复，续训将不再可用。已导入资源管理器的成品模型是独立副本，不受影响。", en: "Deletes EVERYTHING in this training project — the shared dataset, preprocessed features and every architecture's archives. Irreversible; resume-training becomes unavailable. Models already imported into the resource manager are independent copies and are unaffected.", ja: "このトレーニングプロジェクトの内容をすべて削除します——共有データセット、前処理特徴、全アーキテクチャのアーカイブ。元に戻せず、続きからのトレーニングは不可になります。リソースマネージャに取り込み済みのモデルは独立したコピーのため影響ありません。" },
+      stWsDatasetNote: { zh: "其中共享数据集 {size}——删除后所有架构的下次训练都需要重新导入数据。", en: "Includes the shared dataset ({size}) — every architecture will need its data imported again.", ja: "共有データセット {size} を含みます。削除後は全アーキテクチャで再インポートが必要になります。" },
+      stSlotDelete: { zh: "删除存档", en: "Delete archives", ja: "アーカイブ削除" },
+      stSlotTitle: { zh: "删除该架构的训练存档", en: "Delete this architecture's archives", ja: "このアーキテクチャのアーカイブを削除" },
+      stSlotBody: { zh: "将删除 {family} 的全部训练存档与预处理缓存({size})。共享数据集与其它架构不受影响;已导入的成品模型也不受影响。", en: "Deletes all {family} archives and preprocessing caches ({size}). The shared dataset and the other architectures are untouched, and so are models already imported.", ja: "{family} の全アーカイブと前処理キャッシュ（{size}）を削除します。共有データセットと他アーキテクチャ、取り込み済みモデルには影響しません。" },
+      // Same warning the retrain path already gives — shallow diffusion lives inside the
+      // sovits slot, and the word "sovits" says nothing about it.
+      stSlotDiffNote: { zh: "注意:该架构里还有浅扩散训练进度({steps} 步),将一并删除。", en: "Note: this slot also holds shallow-diffusion progress ({steps} steps), which goes with it.", ja: "注意：このスロットには浅い拡散の進捗（{steps} ステップ）も含まれ、一緒に削除されます。" },
+      stSnapClean: { zh: "清理快照", en: "Clean snapshots", ja: "スナップショット整理" },
+      stSnapTitle: { zh: "清理未导入的快照", en: "Clean un-imported snapshots", ja: "未取り込みスナップショットを整理" },
+      stSnapBody: { zh: "删除 {family} 里没人再需要的周期快照(约 {size})。已导入的、最佳、最终导出、可续训存档与底模都会保留;迁移前就存在的存档也一律保留。", en: "Deletes {family}'s periodic snapshots that nothing needs any more (about {size}). Imported ones, best, the final export, resumable checkpoints and the pretrained base are all kept — as is everything that predates the export ledger.", ja: "{family} のうち不要になった定期スナップショット（約 {size}）を削除します。取り込み済み・ベスト・最終エクスポート・続行可能なチェックポイント・ベースモデルは保持され、台帳より前から存在するものもすべて保持されます。" },
+      stKeptNote: { zh: "保留 {count} 项", en: "kept {count}", ja: "{count} 件を保持" },
+      stDeferred: { zh: "已移除,占用的空间将在下次启动时回收", en: "Removed; the space is reclaimed on next launch", ja: "削除済み。容量は次回起動時に回収されます" },
+      stDeleting: { zh: "删除中…", en: "Deleting…", ja: "削除中…" },
+      stExpand: { zh: "分项", en: "Details", ja: "内訳" },
+      stDataset: { zh: "共享数据集", en: "Shared dataset", ja: "共有データセット" },
+      stSnapCount: { zh: "{n} 个快照", en: "{n} snapshots", ja: "{n} スナップショット" },
       stWsPool: { zh: "共享池", en: "pool", ja: "プール" },
       stWsNone: { zh: "（无训练项目）", en: "(no training projects)", ja: "（トレーニングプロジェクトなし）" },
       stWsAttention: { zh: "需人工处理", en: "needs attention", ja: "要確認" },
@@ -1540,21 +1680,89 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 <p className="settings-note" style={{ margin: "2px 0 0" }}>{L("stWsNone")}</p>
               )}
               {storage.workspaces.map((ws) => (
-                <div className="settings-row settings-ws-row" key={ws.slug}>
-                  <span className="settings-value settings-ws-name" title={`${ws.name} (${ws.slug})`}>
-                    {ws.name}
-                    {ws.family ? ` · ${ws.family}` : ""}
-                    {ws.has_pool ? ` · ${L("stWsPool")}` : ""}
-                    {ws.needs_attention ? ` · ${L("stWsAttention")}` : ""}
-                  </span>
-                  <span className="settings-value">{fmtSize(ws.bytes)}</span>
-                  <button
-                    className="settings-mini-btn danger"
-                    disabled={cleanBusy !== null || trainingBusy}
-                    onClick={() => handleDeleteWorkspace(ws)}
-                  >
-                    {cleanBusy === ws.slug ? L("stCleaning") : L("stWsDelete")}
-                  </button>
+                // Column skeleton (main row + detail rows) — the same shape the licensed asset
+                // pack uses. ⚠ The expander is the BUTTON'S TEXT PREFIX, never a separate
+                // element: `.settings-storage .settings-row > :first-child` grants the flexible,
+                // ellipsised column BY POSITION, so an arrow element would take it and turn the
+                // project name into an unshrinkable block — the measured S75 failure (per-character
+                // wrapping in zh/ja, en overflowing into a horizontal scrollbar at 340px).
+                <div className="settings-asset-pack" key={ws.slug}>
+                  <div className="settings-row">
+                    <span className="settings-value" title={`${ws.name} (${ws.slug})`}>
+                      {ws.name}
+                      {ws.family ? ` · ${ws.family}` : ""}
+                      {ws.has_pool ? ` · ${L("stWsPool")}` : ""}
+                      {ws.needs_attention ? ` · ${L("stWsAttention")}` : ""}
+                    </span>
+                    <span className="settings-value">{fmtSize(ws.bytes)}</span>
+                    {/* Only the expander lives on the main row. Measured at the 340px default
+                        width: a second non-shrinking button here left the project NAME just
+                        73px in en / 79px in ja (control rows get 204-257px) — no wrapping, but
+                        nothing readable either. Collapsed is the common state, so the name
+                        gets the width; the destructive action moves next to the itemised
+                        breakdown, which is also where a user can see what it would take. */}
+                    <button className="settings-mini-btn" onClick={() => toggleWs(ws.slug)}>
+                      {expandedWs.has(ws.slug) ? "▾ " : "▸ "}
+                      {L("stExpand")}
+                    </button>
+                  </div>
+                  {expandedWs.has(ws.slug) && (
+                    <>
+                      {ws.dataset_bytes > 0 && (
+                        <div className="settings-row settings-ws-sub">
+                          <span className="settings-value">{L("stDataset")}</span>
+                          <span className="settings-value">{fmtSize(ws.dataset_bytes)}</span>
+                        </div>
+                      )}
+                      {ws.slots.map((sl) => (
+                        <div className="settings-row settings-ws-sub" key={sl.family}>
+                          <span
+                            className="settings-value"
+                            title={L("stSnapCount").replace("{n}", String(sl.snapshots))}
+                          >
+                            {sl.family}
+                          </span>
+                          <span className="settings-value">{fmtSize(sl.bytes)}</span>
+                          {sl.cleanableBytes > 0 && (
+                            <button
+                              className="settings-mini-btn"
+                              disabled={cleanBusy !== null || trainingBusy}
+                              onClick={() => handleCleanSnapshots(ws, sl)}
+                            >
+                              {cleanBusy === `${ws.slug}:snap:${sl.family}`
+                                ? L("stCleaning")
+                                : L("stSnapClean")}
+                            </button>
+                          )}
+                          <button
+                            className="settings-mini-btn danger"
+                            disabled={cleanBusy !== null || trainingBusy}
+                            onClick={() => handleDeleteSlot(ws, sl)}
+                          >
+                            {cleanBusy === `${ws.slug}:${sl.family}`
+                              ? L("stDeleting")
+                              : L("stSlotDelete")}
+                          </button>
+                        </div>
+                      ))}
+                      <div className="settings-row settings-ws-sub">
+                        <span className="settings-value" />
+                        <button
+                          className="settings-mini-btn danger"
+                          disabled={cleanBusy !== null || trainingBusy}
+                          onClick={() => handleDeleteWorkspace(ws)}
+                        >
+                          {cleanBusy === ws.slug ? L("stDeleting") : L("stWsDelete")}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  {/* The result belongs NEXT TO the button that produced it: the section-level
+                      message sits below every project row, which after expansion is screens
+                      away — a failure nobody scrolls to is a failure nobody sees. */}
+                  {cleanMsg != null && cleanBusy === null && msgOwner === ws.slug && (
+                    <p className="settings-note settings-ws-msg">{cleanMsg}</p>
+                  )}
                 </div>
               ))}
               <div className="settings-row">

@@ -406,3 +406,16 @@
 .settings-storage .settings-mini-btn {
   flex-shrink: 0;
 }
+
+/* S76 batch 3b — training project detail rows. Deliberately NOT the training page's archive
+   row shape: that one budgets 56px + 72px + 72px of fixed columns at 11px in a full-width
+   page, which in this 340px panel (10px type, see .settings-row) would leave the name almost
+   nothing. Here a detail row is name (flexible, ellipsised by the .settings-storage
+   :first-child rule) + size + buttons, and the per-slot snapshot count lives in the title. */
+.settings-storage .settings-ws-sub {
+  padding-left: 10px;
+  opacity: 0.85;
+}
+.settings-ws-msg {
+  margin: 2px 0 0 10px;
+}

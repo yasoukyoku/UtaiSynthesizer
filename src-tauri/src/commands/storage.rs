@@ -54,6 +54,23 @@ fn norm_key(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+/// One architecture slot's share of a project. Everything the confirm dialogs need to say
+/// what a given button is about to destroy — a body that under-states its blast radius is the
+/// exact failure「绝不静默」exists to prevent.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotUsage {
+    pub family: String,
+    pub bytes: u64,
+    /// Periodic snapshots under `weights/` (the cleanup's candidate pool, before protections).
+    pub snapshots: u32,
+    /// How much「清理未导入的快照」would actually free right now.
+    pub cleanable_bytes: u64,
+    /// Shallow-diffusion progress living inside the sovits slot — deleting that slot takes it
+    /// too, and the word "sovits" says nothing about diffusion.
+    pub diff_steps: u64,
+}
+
 #[derive(serde::Serialize)]
 pub struct WorkspaceUsage {
     /// Project id = the directory name under `<data>/training`.
@@ -66,6 +83,9 @@ pub struct WorkspaceUsage {
     pub bytes: u64,
     /// A reusable shared dataset pool exists (every slot of this project trains off it).
     pub has_pool: bool,
+    /// The project's shared `dataset/` — deleting the PROJECT takes it, deleting a slot never does.
+    pub dataset_bytes: u64,
+    pub slots: Vec<SlotUsage>,
     /// Set when the layout migration could not classify this directory — nothing was moved
     /// and nothing was deleted, but the user has to decide what it is. Never hide such a
     /// project: "盘上还在、app 里没了" is the one outcome this refactor must not produce.
@@ -125,6 +145,11 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
         state.app_dir.join("runtime").join("ort").join("cuda"),
         state.app_dir.join("runtime").join("cuda"),
     ];
+    // Snapshot the registry names here: `cleanable_bytes` must answer「点这个按钮会释放多少」
+    // with the SAME protection set the command itself will apply, and one of its rules is
+    // "the stem is still an installed model" (a ledger row can be missing — S61: enumerate
+    // every holder). Taken on this thread; the blocking closure below owns AppState-free data.
+    let installed: Vec<String> = state.models.list().into_iter().map(|m| m.name).collect();
     tauri::async_runtime::spawn_blocking(move || {
         let models_dir = root.join("models");
         let training_dir = root.join("training");
@@ -166,12 +191,41 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| id.clone());
                 let mut fams: Vec<String> = Vec::new();
+                let mut slots: Vec<SlotUsage> = Vec::new();
                 for f in crate::training::tproject::FAMILIES {
                     let fd = p.join(f);
-                    if fd.is_dir() {
-                        ws_audition += dir_size(&fd.join("audition"));
-                        fams.push(f.to_string());
+                    if !fd.is_dir() {
+                        continue;
                     }
+                    ws_audition += dir_size(&fd.join("audition"));
+                    fams.push(f.to_string());
+                    let recs = crate::training::tproject::scan_project_ckpts(&root, &id, Some(f));
+                    let plan = crate::training::tproject::plan_cleanup(
+                        &recs,
+                        meta.as_ref().map(|m| m.export_ledger_since_ms).unwrap_or(0),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0),
+                        &|stem: &str| installed.iter().any(|n| n == stem || stem.starts_with(n.as_str())),
+                    );
+                    slots.push(SlotUsage {
+                        family: f.to_string(),
+                        bytes: dir_size(&fd),
+                        snapshots: recs
+                            .iter()
+                            .filter(|r| {
+                                matches!(r.kind, crate::training::tproject::CkptKind::Release)
+                            })
+                            .count() as u32,
+                        cleanable_bytes: plan.freeable_bytes,
+                        diff_steps: recs
+                            .iter()
+                            .filter(|r| r.rel.contains("/diffusion/"))
+                            .filter_map(|r| r.step)
+                            .max()
+                            .unwrap_or(0),
+                    });
                 }
                 // pre-S76 shape (not folded yet — flagged, or migration postponed)
                 ws_audition += dir_size(&p.join("audition"));
@@ -182,6 +236,8 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                     family: fams.join("+"),
                     bytes,
                     has_pool,
+                    dataset_bytes: dir_size(&p.join(crate::training::tproject::DATASET_DIR)),
+                    slots,
                     needs_attention: meta.as_ref().and_then(|m| m.needs_attention.clone()),
                 });
             }
