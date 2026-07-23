@@ -21,6 +21,7 @@ import {
   useTrainingStore,
   type CkptInfo,
   type DatasetFile,
+  type TrainingGpu,
   type WorkspaceInfo,
 } from "../../store/training";
 import {
@@ -922,7 +923,9 @@ function NumberField({
 function ParamsStep() {
   const { t } = useTranslation();
   const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
-  const [gpus, setGpus] = useState<{ label: string; value: string }[]>([]);
+  const [gpus, setGpus] = useState<TrainingGpu[]>([]);
+  /** S75: "usable GPU" = at least one SELECTABLE entry. A list of nothing but greyed-out cards
+   *  must land on the force-CPU path, not on a dropdown where every choice is dead. */
   const [gpuOk, setGpuOk] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   // diff inherits 数据增强份数 from the host workspace manifest — show the
@@ -939,19 +942,32 @@ function ParamsStep() {
         // "No trainable GPU" now means no NVIDIA/AMD/Intel adapter at all, instead
         // of the old cuda_available (an INFERENCE-runtime probe that wrongly forced
         // AMD/Intel — and NVIDIA-without-CUDA-download — boxes to CPU training).
-        const hw = await invoke<{ training_gpus: { label: string; value: string }[] }>(
-          "get_hardware_info",
-        );
+        // S75: entries now carry selectable/reason (the S74b shape). Unsupported or
+        // pack-less cards are LISTED with their reason but cannot be chosen — before, every
+        // adapter of the winning vendor was offered unconditionally, so picking a card our
+        // runtime cannot drive trained on the CPU with no visible hint.
+        const hw = await invoke<{ training_gpus: TrainingGpu[] }>("get_hardware_info");
         const list = hw.training_gpus ?? [];
         setGpus(list);
-        setGpuOk(list.length > 0);
+        const usable = list.filter((g) => g.selectable);
+        setGpuOk(usable.length > 0);
         const cur = useTrainingStore.getState().config.gpu;
         if (list.length === 0) {
-          // keep the PAYLOAD truthful, not just the checkbox display
+          // NO adapter at all: nothing to pick, ever. Keep the PAYLOAD truthful, not just the
+          // checkbox display. (Pre-S75 behaviour, unchanged — and deliberately the ONLY case
+          // that force-checks CPU for the user.)
           useTrainingStore.getState().updateConfig({ forceCpu: true });
-        } else if (!list.some((g) => g.value === cur)) {
-          // heal "" (fresh session) and stale identities: first entry = primary GPU
-          useTrainingStore.getState().updateConfig({ gpu: list[0]!.value });
+        } else if (usable.length === 0) {
+          // Adapters exist but none is usable (no pack installed / card unsupported). We must
+          // NOT auto-check force-CPU here: `refuse_cpu_only_runtime` returns Ok immediately when
+          // force_cpu is set, so doing so would silently disarm the S68b guard that exists for
+          // exactly this machine ("GPU present, only the CPU pack installed") and hand the user
+          // a multi-hour CPU run with no warning. Leave the flag alone, show the reasons, and
+          // let the backend refuse loudly (S75 review).
+        } else if (!usable.some((g) => g.id === cur)) {
+          // heal "" (fresh session), stale identities, AND an id that is still listed but no
+          // longer selectable (pack deleted since the last run) — first USABLE entry wins
+          useTrainingStore.getState().updateConfig({ gpu: usable[0]!.id });
         }
       } catch {
         setGpus([]);
@@ -969,26 +985,50 @@ function ParamsStep() {
   // S68b: an empty GPU list used to hide ALL device UI (dropdown AND the force-CPU
   // checkbox) while silently forcing CPU — a community RTX 3080 box with a dead GPU
   // probe trained on CPU with zero visual hint. The CPU fact now shows on the form.
-  const gpuRow = !gpuOk ? (
-    <div className="training-form-row">
-      <label>{t("training.gpu")}</label>
-      <span className="training-cpu-note">{t("training.noGpuCpuNote")}</span>
-    </div>
-  ) : (
-    gpus.length > 0 &&
-    !config.forceCpu && (
+  // S75 — three states, not two. The middle one is new and is the one that used to lie:
+  //   no adapter at all      → "no trainable GPU" (true)
+  //   adapters, none usable  → the LIST, each with its reason. Saying "no trainable GPU" here
+  //                            would be false (the card is there; a pack is missing), and the
+  //                            only actionable CODE we have would never reach the screen.
+  //   at least one usable    → the picker
+  const gpuOption = (g: TrainingGpu) => {
+    const why = g.selectable ? null : (backendErrorMessage(g.reason) ?? g.reason ?? "");
+    return {
+      value: g.id,
+      label: why ? `${g.label} — ${why}` : g.label,
+      title: why ? `${g.label}\n${why}` : g.label,
+      disabled: !g.selectable,
+    };
+  };
+  const gpuRow =
+    gpus.length === 0 ? (
       <div className="training-form-row">
         <label>{t("training.gpu")}</label>
-        <Dropdown
-          value={config.gpu}
-          options={gpus.map((g) => ({ value: g.value, label: g.label }))}
-          onChange={(v) => updateConfig({ gpu: v })}
-        />
+        <span className="training-cpu-note">{t("training.noGpuCpuNote")}</span>
       </div>
-    )
-  );
+    ) : !config.forceCpu ? (
+      <>
+        <div className="training-form-row">
+          <label>{t("training.gpu")}</label>
+          <Dropdown
+            value={config.gpu}
+            options={gpus.map(gpuOption)}
+            onChange={(v) => updateConfig({ gpu: v })}
+          />
+        </div>
+        {!gpuOk && (
+          <div className="training-form-row">
+            <label />
+            <span className="training-cpu-note">{t("training.noUsableGpuNote")}</span>
+          </div>
+        )}
+      </>
+    ) : null;
 
-  const forceCpuRow = gpuOk && (
+  // S75: gated on "adapters exist", not "a usable one exists". When every card is greyed out,
+  // opting into CPU is the user's only way forward — hiding the checkbox there (the old `gpuOk`
+  // gate) left them with a dead picker and no exit.
+  const forceCpuRow = gpus.length > 0 && (
     <label className="training-check-row">
       <input
         type="checkbox"

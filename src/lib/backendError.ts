@@ -312,7 +312,15 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_CROP_FRAMES_ZERO: { key: "backend.TRAINING_CROP_FRAMES_ZERO" },
   TRAINING_DATA_FILE_MISSING: { key: "backend.TRAINING_DATA_FILE_MISSING" },
   // S67 loud-degradation guard (device.py require_wanted_accelerator → protocol error).
+  // S75 training-device gate: why an enumerated GPU cannot be picked (shown IN the dropdown row),
+  // plus the start-time refusals when the choice no longer resolves.
+  TRAINING_GPU_CC_UNKNOWN: { key: "backend.TRAINING_GPU_CC_UNKNOWN" },
+  TRAINING_GPU_NO_RUNTIME: { key: "backend.TRAINING_GPU_NO_RUNTIME" },
+  TRAINING_GPU_PACK_MISSING: { key: "backend.TRAINING_GPU_PACK_MISSING" },
   TRAINING_GPU_UNAVAILABLE: { key: "backend.TRAINING_GPU_UNAVAILABLE" },
+  TRAINING_GPU_UNKNOWN: { key: "backend.TRAINING_GPU_UNKNOWN" },
+  TRAINING_GPU_UNSUPPORTED: { key: "backend.TRAINING_GPU_UNSUPPORTED" },
+  TRAINING_RUNTIME_VARIANT_MISSING: { key: "backend.TRAINING_RUNTIME_VARIANT_MISSING" },
   // S68b loud-degradation guard (training/mod.rs try_start): GPU present but only the
   // CPU runtime pack installed — refuse instead of the old log-file-only warn.
   TRAINING_RUNTIME_CPU_ONLY: { key: "backend.TRAINING_RUNTIME_CPU_ONLY" },

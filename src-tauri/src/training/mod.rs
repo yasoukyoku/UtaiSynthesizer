@@ -299,9 +299,14 @@ pub struct StartTrainingRequest {
     /// Device identity in the ACCELERATOR'S own namespace, straight from
     /// get_hardware_info.training_gpus: an NVIDIA UUID ("GPU-…", what
     /// CUDA_VISIBLE_DEVICES actually accepts) or a vendor-relative index.
-    /// "" = auto (leave visibility unset → torch's own default device). S67:
-    /// this was a raw WMI adapter index — on an iGPU+NVIDIA box, SELECTING the
-    /// NVIDIA card masked every GPU and training fell back to CPU silently.
+    /// The UI id of the picked device (`TrainingGpu.id`, e.g. `nvidia:GPU-8a2c…` / `amd:0`);
+    /// "" = auto (leave visibility unset → torch's own default device).
+    /// ⚠ S75: this is an IDENTITY, not the device mask. try_start resolves it against a freshly
+    /// built device list and takes the mask from THAT entry — the mask alone is only unique
+    /// within a vendor, so a mask-keyed payload silently resolved to the wrong card on a
+    /// multi-vendor box. S67 (the ancestor of that bug): it was once a raw WMI adapter index, and
+    /// on an iGPU+NVIDIA box SELECTING the NVIDIA card masked every GPU and training fell back to
+    /// CPU silently.
     #[serde(default)]
     pub gpu: String,
     #[serde(default)]
@@ -860,6 +865,46 @@ impl TrainingManager {
         // multi-minute import before erroring on a fully-decidable condition).
         refuse_cpu_only_runtime(&self.app_dir, req.force_cpu)?;
 
+        // ★S75 device resolution — HERE, for the same reason as the guard above. The chosen GPU
+        // decides which runtime drives the run, so a choice that no longer resolves is decidable
+        // the moment the button is pressed; deciding it in run_worker would burn the workspace
+        // and the whole dataset copy first. `req.gpu` is the UI id, re-derived against a freshly
+        // built list (never trusted): id → entry → (variant, mask).
+        let (gpu_mask, want_variant) = if req.force_cpu {
+            ("-1".to_string(), None)
+        } else if req.gpu.is_empty() {
+            (String::new(), None)
+        } else {
+            let g = crate::commands::settings::training_gpu_by_id(&self.app_dir, &req.gpu)
+                .ok_or_else(|| {
+                    UtaiError::Training(format!("TRAINING_GPU_UNKNOWN: {}", req.gpu))
+                })?;
+            if !g.selectable {
+                return Err(UtaiError::Training(
+                    g.reason.unwrap_or_else(|| "TRAINING_GPU_UNSUPPORTED".to_string()),
+                ));
+            }
+            (g.value, g.variant)
+        };
+        let (python, device_backend) = crate::pyenv::training_interpreter_for(
+            &self.app_dir,
+            req.force_cpu,
+            want_variant.as_deref(),
+        )
+        .ok_or_else(|| {
+            // Only reachable if the pack vanished between the UI listing it and this call — fail
+            // CLOSED rather than fall back to whatever else happens to be installed.
+            UtaiError::Training(format!(
+                "TRAINING_RUNTIME_VARIANT_MISSING: {}",
+                want_variant.clone().unwrap_or_default()
+            ))
+        })?;
+        if !req.force_cpu && device_backend == "cpu" {
+            tracing::warn!(
+                "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
+            );
+        }
+
         // ①c multi-speaker co-training (>1 group): the dataset lives in the
         // per-speaker `speakers` files, NOT dataset_files, so validate those and
         // skip the single-speaker empty-dataset gate below. Single-speaker (0 or
@@ -1334,6 +1379,9 @@ impl TrainingManager {
             loudnorm: eff_loudnorm,
             interval_force_save,
             aug_copies: eff_aug_copies,
+            python,
+            device_backend,
+            gpu_mask,
         };
         let inner = Arc::clone(&self.inner);
         let app_dir = self.app_dir.clone();
@@ -1421,6 +1469,15 @@ struct RunCtx {
     interval_force_save: u32,
     /// S41 effective augmentation copies (manifest-inherited for sovits_diff)
     aug_copies: u32,
+    /// S75: device resolution, decided at PREFLIGHT and carried here. It is NOT re-derived in
+    /// run_worker — that placement is exactly what the S68b review moved out (a refusal on a
+    /// fully-decidable condition must not cost a wiped workspace plus a multi-minute import).
+    python: PathBuf,
+    device_backend: String,
+    /// run.json "gpu": the accelerator-native mask (UUID / vendor index), "-1" for forced CPU,
+    /// "" when no device was chosen. Resolved from the picked entry's `value` — NOT from the
+    /// request, whose `gpu` field carries the UI id.
+    gpu_mask: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1555,19 +1612,11 @@ fn run_worker(
         }
     }
 
-    // resolve the training interpreter + its device backend up front: dev venv →
-    // installed runtime pack (the pack VARIANT fixes the backend) → manual slot →
-    // bare python. device_backend feeds device.py's shim via run.json below.
-    let (python, device_backend) = crate::pyenv::training_interpreter(app_dir, req.force_cpu);
-    // The refusal for this condition lives in try_start's preflight (S68b,
-    // refuse_cpu_only_runtime — fires BEFORE the workspace wipe / dataset import).
-    // Here it can still be reached by the deliberately-skipped cases (no offerable GPU
-    // pack for this box, e.g. Pascal): keep the visibility warn for those runs.
-    if !req.force_cpu && device_backend == "cpu" {
-        tracing::warn!(
-            "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
-        );
-    }
+    // Device resolution happened at PREFLIGHT (S75) — interpreter, backend and the run.json mask
+    // all ride in on ctx. Nothing device-related is decided here, on purpose: this point is past
+    // the workspace wipe and the dataset import.
+    let (python, device_backend, gpu_mask) =
+        (&ctx.python, ctx.device_backend.as_str(), ctx.gpu_mask.as_str());
 
     // ---- run config for the sidecar ----
     let mut run_config = serde_json::json!({
@@ -1610,9 +1659,11 @@ fn run_worker(
         "seed": SEED,
         // Windows cannot hold an EMPTY env var (empty = deleted = all GPUs
         // visible) — CPU mode must be the explicit sentinel "-1". Otherwise the
-        // value is the accelerator-native identity (NVIDIA UUID / vendor index)
-        // from training_gpus; "" = auto (setup_visibility leaves it unset).
-        "gpu": if req.force_cpu { "-1".to_string() } else { req.gpu.clone() },
+        // The accelerator-native MASK (NVIDIA UUID / vendor-relative index), "-1" = forced CPU,
+        // "" = auto (setup_visibility leaves it unset). S75: resolved at preflight from the
+        // picked entry's `value` — NEVER `req.gpu`, which now carries the UI id (`vendor:n`).
+        // Feeding an id to CUDA_VISIBLE_DEVICES would mask every device.
+        "gpu": gpu_mask,
         // device.py's shim reads this BEFORE torch import (visibility) and to pick
         // autocast/scaler. Sourced from the resolved interpreter: dev venv → the box's
         // GPU (cuda) or force_cpu; installed pack → its variant (nv-cu130/amd->cuda,

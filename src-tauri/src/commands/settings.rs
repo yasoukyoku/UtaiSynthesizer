@@ -57,10 +57,41 @@ pub struct GpuAdapter {
 /// run.json "gpu" carries into device.py's visibility env var.
 #[derive(serde::Serialize, Clone)]
 pub struct TrainingGpu {
+    /// ★S75 review: the UI identity, and the ONLY thing the start request carries. `<vendor>:<n>`
+    /// (NVIDIA with smi: `nvidia:<uuid>`) — globally unique.
+    ///
+    /// It exists because `value` STOPPED being unique the moment this list became multi-vendor:
+    /// AMD's first card and Intel's first card are both vendor-relative index "0", so a lookup
+    /// (or a React key, or the dropdown's selectedIdx) keyed on `value` silently resolves to
+    /// whichever vendor happens to come first — the exact shape of the S67 wrong-device-mask bug.
+    /// UI identity and device mask are two different things; conflating them was the bug.
+    pub id: String,
     pub label: String,
     /// NVIDIA: the nvidia-smi UUID ("GPU-…" — CUDA_VISIBLE_DEVICES accepts it, exact
     /// identity, immune to enumeration-order drift). Fallbacks: vendor-relative index.
+    /// ⚠ This string is fed VERBATIM to device.py's visibility env var — its format is a
+    /// python-side contract. S75 added the fields below rather than encoding anything extra here.
     pub value: String,
+    /// S75: the training runtime variant that would drive this GPU ("nv-cu130"/"amd"/"xpu");
+    /// None = this vendor has no training runtime at all. The frontend never sends this back —
+    /// try_start re-derives the whole entry from `id` against a freshly built list, so a stale
+    /// or hand-edited payload gets a refusal instead of someone else's runtime.
+    pub variant: Option<String>,
+    /// S75 (the S74b shape, ported from `list_inference_gpus`): "you can select it" must imply
+    /// "it can train here". Unselectable entries stay VISIBLE with their reason — a user who
+    /// knows they own that card must not think we lost it.
+    pub selectable: bool,
+    /// Stable CODE for why not (frontend maps via backendError.ts).
+    pub reason: Option<String>,
+}
+
+/// One NVIDIA card as nvidia-smi sees it — identity AND capability from a SINGLE query, so the
+/// per-GPU compute cap can never be mis-paired. (Zipping two separate smi calls would: the uuid
+/// query drops rows whose tail is not a UUID, and the cap query does not.)
+struct NvSmiGpu {
+    name: String,
+    uuid: String,
+    cc10: Option<i32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -149,7 +180,11 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         ort_build: crate::ORT_LOADED_BUILD.get().cloned().unwrap_or_else(|| "?".to_string()),
         recommended_variant: recommend_variant(&gpus, has_nvidia).to_string(),
         nvidia_vram_mb: if has_nvidia { nvidia_total_vram_mb() } else { None },
-        training_gpus: training_gpu_list(&gpus, smi_gpus),
+        training_gpus: training_gpu_list(
+            &gpus,
+            smi_gpus,
+            &crate::pyenv::available_training_variants(&state.app_dir),
+        ),
         gpus,
     })
 }
@@ -194,37 +229,152 @@ pub(crate) fn log_hardware_inventory() {
 /// UNCONDITIONALLY — the old code only consulted it after WMI had already classified an
 /// adapter as NVIDIA, so the community box whose WMI probe failed outright never asked
 /// the perfectly-working nvidia-smi and silently forced CPU training on an RTX 3080.
-fn training_gpu_list(gpus: &[GpuAdapter], smi: Vec<TrainingGpu>) -> Vec<TrainingGpu> {
-    if !smi.is_empty() {
-        return smi;
-    }
-    let vendor_indexed = |vendor: &str| -> Vec<TrainingGpu> {
-        gpus.iter()
-            .filter(|g| g.vendor == vendor)
-            .enumerate()
-            .map(|(i, g)| TrainingGpu { label: g.name.clone(), value: i.to_string() })
-            .collect()
+/// ★S75 rewrite — the vendor EARLY-RETURN chain is gone. It used to return the first vendor that
+/// matched (nvidia > amd > intel), which meant:
+///   - On a mixed box (the dev machine: RTX 3080 Ti + Radeon 780M) the AMD card could NEVER be
+///     picked — even with the amd pack installed and the 780M being the ONE gfx target that pack
+///     supports. Confirmed live by the user, 2026-07-23.
+///   - On an AMD-only box the list was pure vendor matching with no capability check, so an
+///     RX 7900 (which our pack cannot drive) was offered, resolved to the CPU pack, and trained
+///     on the CPU — `require_wanted_accelerator` deliberately lets device_backend="cpu" through
+///     as legitimate explicit-CPU, so the only trace was one tracing::warn.
+///   - Same for an NVIDIA card below `CUDA_CC10_FLOOR`: offered, never checked.
+/// The old doc claimed the sidecar guard turned "any remaining mismatch" into a loud failure.
+/// That is true only when the resolved backend is an ACCELERATOR; it never covered the CPU-pack
+/// case, because it assumed the dropdown only ever offered cards some installed pack could drive.
+/// That assumption is what this function now actually enforces.
+///
+/// Every adapter of every vendor is listed. Selectability = the single criterion:
+///   a variant exists for the vendor ∧ this machine's hardware qualifies for it
+///   (`variant_supported`, the S74b predicate — unchanged, reused) ∧ that variant is installed
+///   (`pyenv::available_training_variants`).
+/// Unselectable entries stay VISIBLE with a reason CODE (S74b: a card the user knows they own
+/// must not silently vanish), and `TRAINING_GPU_PACK_MISSING` is the actionable one.
+fn training_gpu_list(
+    gpus: &[GpuAdapter],
+    smi: Vec<NvSmiGpu>,
+    available: &[&'static str],
+) -> Vec<TrainingGpu> {
+    let nv_cc10 = nvidia_compute_caps_cc10();
+    let judge = |variant: &'static str, hw_ok: bool, cc_unknown: bool| -> (bool, Option<String>) {
+        if cc_unknown {
+            return (false, Some("TRAINING_GPU_CC_UNKNOWN".to_string()));
+        }
+        if !hw_ok {
+            return (false, Some("TRAINING_GPU_UNSUPPORTED".to_string()));
+        }
+        if !available.contains(&variant) {
+            return (false, Some("TRAINING_GPU_PACK_MISSING".to_string()));
+        }
+        (true, None)
     };
-    if gpus.iter().any(|g| g.vendor == "nvidia") {
-        return vendor_indexed("nvidia");
+
+    let mut out: Vec<TrainingGpu> = Vec::new();
+
+    // NVIDIA — nvidia-smi identity wins UNCONDITIONALLY when it answers (S68b: the community box
+    // whose WMI probe failed outright still had a perfectly working smi). Per-card cap from the
+    // same query; when smi is silent, fall back to adapters + the machine-level cap set.
+    if !smi.is_empty() {
+        for g in smi {
+            let cc_unknown = g.cc10.is_none();
+            let hw_ok = g.cc10.is_some_and(crate::gpu::cuda_cc_supported_training);
+            let (selectable, reason) = judge("nv-cu130", hw_ok, cc_unknown);
+            out.push(TrainingGpu {
+                id: format!("nvidia:{}", g.uuid),
+                label: g.name,
+                value: g.uuid,
+                variant: Some("nv-cu130".to_string()),
+                selectable,
+                reason,
+            });
+        }
+    } else {
+        let hw_ok = nv_cc10.iter().copied().any(crate::gpu::cuda_cc_supported_training);
+        let cc_unknown = nv_cc10.is_empty();
+        for (i, g) in gpus.iter().filter(|g| g.vendor == "nvidia").enumerate() {
+            let (selectable, reason) = judge("nv-cu130", hw_ok, cc_unknown);
+            out.push(TrainingGpu {
+                id: format!("nvidia:{i}"),
+                label: g.name.clone(),
+                value: i.to_string(),
+                variant: Some("nv-cu130".to_string()),
+                selectable,
+                reason,
+            });
+        }
     }
-    if gpus.iter().any(|g| g.vendor == "amd") {
-        return vendor_indexed("amd");
+
+    // AMD / Intel — vendor-relative index (HIP / ZE_AFFINITY_MASK ordinals). The index must be
+    // counted WITHIN the vendor, exactly as before; it is what device.py masks with.
+    for (vendor, variant, capable) in [
+        ("amd", "amd", &amd_adapter_is_rocm_capable as &dyn Fn(&GpuAdapter) -> bool),
+        ("intel", "xpu", &intel_adapter_is_xpu_capable as &dyn Fn(&GpuAdapter) -> bool),
+    ] {
+        for (i, g) in gpus.iter().filter(|g| g.vendor == vendor).enumerate() {
+            let (selectable, reason) = judge(variant, capable(g), false);
+            out.push(TrainingGpu {
+                id: format!("{vendor}:{i}"),
+                label: g.name.clone(),
+                value: i.to_string(),
+                variant: Some(variant.to_string()),
+                selectable,
+                reason,
+            });
+        }
     }
-    if gpus.iter().any(|g| g.vendor == "intel") {
-        return vendor_indexed("intel");
+
+    // Anything else (Basic Render / virtual adapters): listed, never selectable — there is no
+    // training runtime for it at all, which is a different fact from "unsupported card".
+    for (i, g) in gpus
+        .iter()
+        .filter(|g| !matches!(g.vendor.as_str(), "nvidia" | "amd" | "intel"))
+        .enumerate()
+    {
+        out.push(TrainingGpu {
+            id: format!("other:{i}"),
+            label: g.name.clone(),
+            value: String::new(),
+            variant: None,
+            selectable: false,
+            reason: Some("TRAINING_GPU_NO_RUNTIME".to_string()),
+        });
     }
-    Vec::new()
+    debug_assert!(
+        {
+            let mut ids: Vec<&str> = out.iter().map(|g| g.id.as_str()).collect();
+            ids.sort_unstable();
+            let n = ids.len();
+            ids.dedup();
+            ids.len() == n
+        },
+        "TrainingGpu.id must be unique — it is the lookup key try_start resolves against"
+    );
+    out
+}
+
+/// Re-derive the entry the request names, from the SAME list the UI was built from — never from
+/// the payload. try_start calls this at PREFLIGHT: a stale or hand-edited `id` gets a loud
+/// refusal, not someone else's runtime.
+///
+/// Keyed on `id`, not `value`: `value` is only unique within a vendor (S75 review — AMD's and
+/// Intel's first cards are both "0"), so a value-keyed lookup resolved to whichever vendor was
+/// pushed first.
+pub(crate) fn training_gpu_by_id(app_dir: &std::path::Path, id: &str) -> Option<TrainingGpu> {
+    let gpus = query_gpu_adapters();
+    let available = crate::pyenv::available_training_variants(app_dir);
+    training_gpu_list(&gpus, nvidia_gpu_uuids(), &available).into_iter().find(|g| g.id == id)
 }
 
 /// NVIDIA cards as (name, UUID) via nvidia-smi — the only enumeration whose identity
 /// CUDA itself understands. Empty on any failure (no smi / no driver): callers fall
 /// back to vendor-relative indices.
 #[cfg(windows)]
-fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
+fn nvidia_gpu_uuids() -> Vec<NvSmiGpu> {
     use std::os::windows::process::CommandExt;
     let out = match std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,uuid", "--format=csv,noheader"])
+        // S75: compute_cap rides ALONG (same query, same row) — the training gate needs the cap
+        // PER CARD, and the machine-level `nvidia_compute_caps_cc10()` cannot say which card.
+        .args(["--query-gpu=name,uuid,compute_cap", "--format=csv,noheader"])
         .creation_flags(crate::util::CREATE_NO_WINDOW)
         .output()
     {
@@ -234,21 +384,28 @@ fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
         .filter_map(|l| {
-            // "NVIDIA GeForce RTX 3080 Ti, GPU-8a2c…" — rsplit so a comma INSIDE the
-            // name can't shear the row; a non-UUID tail drops the row instead of
-            // feeding CUDA a garbage mask
-            let (name, uuid) = l.rsplit_once(',')?;
+            // "NVIDIA GeForce RTX 3080 Ti, GPU-8a2c…, 8.6" — rsplit from the RIGHT so a comma
+            // INSIDE the name can't shear the row; a non-UUID uuid field drops the row instead
+            // of feeding CUDA a garbage mask.
+            let (head, cap) = l.rsplit_once(',')?;
+            let (name, uuid) = head.rsplit_once(',')?;
             let uuid = uuid.trim();
             if !uuid.starts_with("GPU-") {
                 return None;
             }
-            Some(TrainingGpu { label: name.trim().to_string(), value: uuid.to_string() })
+            Some(NvSmiGpu {
+                name: name.trim().to_string(),
+                uuid: uuid.to_string(),
+                // Unparseable cap = unknown, NOT unsupported — it becomes its own reason CODE
+                // (S74b: "we read it and it's out of range" ≠ "we couldn't read it").
+                cc10: cap.trim().parse::<f32>().ok().map(|c| (c * 10.0).round() as i32),
+            })
         })
         .collect()
 }
 
 #[cfg(not(windows))]
-fn nvidia_gpu_uuids() -> Vec<TrainingGpu> {
+fn nvidia_gpu_uuids() -> Vec<NvSmiGpu> {
     Vec::new()
 }
 
@@ -516,22 +673,29 @@ pub(crate) fn machine_sig() -> String {
 /// ⚠ The NARROWNESS is the pack's, not this predicate's: broadening AMD coverage means shipping
 /// more device kernels (a packaging task, tracked in the backlog), and this predicate must widen
 /// in the same commit that does it.
+/// S75: split per-ADAPTER so the training-device gate can answer "can THIS card train" while the
+/// machine-level wrappers below keep answering "is this pack worth offering". One predicate, two
+/// granularities — the pack gate and the device gate can never disagree about the same card.
+fn amd_adapter_is_rocm_capable(g: &GpuAdapter) -> bool {
+    g.vendor == "amd" && {
+        let n = g.name.to_ascii_lowercase();
+        ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
+    }
+}
+
 fn amd_is_rocm_capable(gpus: &[GpuAdapter]) -> bool {
-    gpus.iter().any(|g| {
-        g.vendor == "amd" && {
-            let n = g.name.to_ascii_lowercase();
-            ["780m", "760m", "740m"].iter().any(|t| n.contains(t))
-        }
-    })
+    gpus.iter().any(amd_adapter_is_rocm_capable)
+}
+
+fn intel_adapter_is_xpu_capable(g: &GpuAdapter) -> bool {
+    g.vendor == "intel" && {
+        let n = g.name.to_ascii_lowercase();
+        n.contains("arc") || n.contains("data center gpu max")
+    }
 }
 
 fn intel_is_xpu_capable(gpus: &[GpuAdapter]) -> bool {
-    gpus.iter().any(|g| {
-        g.vendor == "intel" && {
-            let n = g.name.to_ascii_lowercase();
-            n.contains("arc") || n.contains("data center gpu max")
-        }
-    })
+    gpus.iter().any(intel_adapter_is_xpu_capable)
 }
 
 /// Whether THIS machine's hardware can run a given TRAINING runtime-pack variant. Same one
@@ -2224,6 +2388,148 @@ mod tests {
 
     fn gpu(name: &str, vendor: &str) -> GpuAdapter {
         GpuAdapter { name: name.to_string(), vendor: vendor.to_string() }
+    }
+
+    fn nv(name: &str, uuid: &str, cc10: Option<i32>) -> NvSmiGpu {
+        NvSmiGpu { name: name.to_string(), uuid: uuid.to_string(), cc10 }
+    }
+
+    fn find<'a>(list: &'a [TrainingGpu], label: &str) -> &'a TrainingGpu {
+        list.iter().find(|g| g.label == label).unwrap_or_else(|| panic!("{label} not listed"))
+    }
+
+    /// ★The S75 regression pin. The vendor EARLY-RETURN chain used to return the first matching
+    /// vendor, so on this exact machine (the dev box) the 780M — the ONE gfx target the amd pack
+    /// supports — could never be selected, with the pack installed. Confirmed live by the user
+    /// before the fix. Both cards must now be listed AND both selectable.
+    #[test]
+    fn mixed_vendor_box_lists_both_cards() {
+        let gpus = [gpu("NVIDIA GeForce RTX 3080 Ti", "nvidia"), gpu("AMD Radeon 780M Graphics", "amd")];
+        let smi = vec![nv("NVIDIA GeForce RTX 3080 Ti", "GPU-abc", Some(86))];
+        let list = training_gpu_list(&gpus, smi, &["nv-cu130", "amd"]);
+        assert_eq!(list.len(), 2, "both vendors must be listed, not just the first match");
+        let n = find(&list, "NVIDIA GeForce RTX 3080 Ti");
+        assert!(n.selectable && n.value == "GPU-abc" && n.variant.as_deref() == Some("nv-cu130"));
+        let a = find(&list, "AMD Radeon 780M Graphics");
+        assert!(a.selectable, "780M + installed amd pack must be pickable");
+        // vendor-RELATIVE index: the AMD card is index 0 among AMD adapters, not 1 overall —
+        // device.py masks with it, so an absolute index would select the wrong device.
+        assert_eq!(a.value, "0");
+        assert_eq!(a.variant.as_deref(), Some("amd"));
+    }
+
+    /// ★The regression the FIRST cut of this rewrite introduced (caught by the S75 adversarial
+    /// review). `value` is a VENDOR-RELATIVE index, so AMD's first card and Intel's first card
+    /// are both "0". Keying the start-time lookup on it resolved to whichever vendor was pushed
+    /// first — pick the Arc, train on the Radeon (or get refused with the Radeon's reason).
+    /// `id` is the identity; `value` stays the device mask. They are not the same thing.
+    #[test]
+    fn ids_are_unique_across_vendors_even_when_masks_collide() {
+        let gpus = [
+            gpu("AMD Radeon 780M Graphics", "amd"),
+            gpu("Intel Arc A770", "intel"),
+            gpu("Microsoft Basic Render Driver", "other"),
+        ];
+        let list = training_gpu_list(&gpus, vec![], &["amd", "xpu"]);
+        let ids: std::collections::HashSet<&str> = list.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids.len(), list.len(), "ids must be unique");
+
+        let amd = find(&list, "AMD Radeon 780M Graphics");
+        let arc = find(&list, "Intel Arc A770");
+        // the MASKS collide on purpose — that is the accelerator's own ordinal space
+        assert_eq!(amd.value, "0");
+        assert_eq!(arc.value, "0");
+        // …which is exactly why the identity must not be the mask
+        assert_ne!(amd.id, arc.id);
+        assert!(amd.selectable && arc.selectable, "both packs installed → both pickable");
+        assert_eq!(amd.variant.as_deref(), Some("amd"));
+        assert_eq!(arc.variant.as_deref(), Some("xpu"));
+    }
+
+    /// Machine-specific DIAGNOSTIC (ignored by default — it probes the real box, so it can only
+    /// ever be "what does this machine see", never an assertion). Run it when a user reports a
+    /// card that is missing from, or greyed out in, the training device picker:
+    ///   cargo test --lib training_device_gate_on_this_machine -- --ignored --nocapture
+    /// It prints the same three inputs the gate reads (adapters / nvidia-smi / available
+    /// variants) next to the verdict, so a wrong verdict points straight at which input lied.
+    #[test]
+    #[ignore]
+    fn training_device_gate_on_this_machine() {
+        let app_dir = std::env::current_dir().unwrap().parent().unwrap().to_path_buf();
+        // ⚠ WITHOUT this the probe LIES: `list_packs` reads a OnceLock that only lib.rs's setup
+        // fills, so a bare test process sees zero installed packs and every GPU comes back
+        // TRAINING_GPU_PACK_MISSING. (Cost me one wrong conclusion — S75.)
+        crate::pyenv::init_runtime_root(&app_dir.join("data"));
+        println!("runtime_root = {:?}", crate::pyenv::runtime_root());
+        let gpus = query_gpu_adapters();
+        let smi = nvidia_gpu_uuids();
+        let available = crate::pyenv::available_training_variants(&app_dir);
+        println!("app_dir   = {}", app_dir.display());
+        println!("adapters  = {:?}", gpus.iter().map(|g| (&g.name, &g.vendor)).collect::<Vec<_>>());
+        println!("smi       = {:?}", smi.iter().map(|g| (&g.name, g.cc10)).collect::<Vec<_>>());
+        println!("available = {available:?}");
+        println!("nv_cc10   = {:?}", nvidia_compute_caps_cc10());
+        for g in training_gpu_list(&gpus, smi, &available) {
+            println!(
+                "  [{}] id={} value={:?} variant={:?} selectable={} reason={:?}",
+                g.label, g.id, g.value, g.variant, g.selectable, g.reason
+            );
+        }
+    }
+
+    /// The silent-CPU hole: an AMD card our pack cannot drive used to be offered, resolve to the
+    /// CPU pack, and train on the CPU with one tracing::warn as the only trace.
+    #[test]
+    fn unsupported_card_is_listed_but_not_selectable() {
+        let gpus = [gpu("AMD Radeon RX 7900 XTX", "amd")];
+        let list = training_gpu_list(&gpus, vec![], &["amd", "cpu"]);
+        assert_eq!(list.len(), 1, "it stays VISIBLE — a card the user owns must not vanish");
+        assert!(!list[0].selectable);
+        assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_UNSUPPORTED"));
+    }
+
+    /// Supported hardware whose pack simply is not installed gets the ACTIONABLE reason —
+    /// distinct from "your card cannot do this", which no download would fix.
+    #[test]
+    fn supported_card_without_its_pack_says_pack_missing() {
+        let gpus = [gpu("AMD Radeon 780M Graphics", "amd")];
+        let list = training_gpu_list(&gpus, vec![], &["cpu"]);
+        assert!(!list[0].selectable);
+        assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_PACK_MISSING"));
+    }
+
+    /// Below the shared CUDA_CC10_FLOOR = unsupported; an unreadable cap is its OWN verdict
+    /// (S74b: "we read it and it's out of range" ≠ "we couldn't read it"), never a claim about
+    /// the user's hardware. Both are fail-closed.
+    #[test]
+    fn nvidia_cap_decides_per_card() {
+        let gpus = [gpu("NVIDIA GeForce GTX 1080", "nvidia")];
+        let old = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", Some(61))], &["nv-cu130"]);
+        assert!(!old[0].selectable);
+        assert_eq!(old[0].reason.as_deref(), Some("TRAINING_GPU_UNSUPPORTED"));
+
+        let unknown = training_gpu_list(&gpus, vec![nv("GTX 1080", "GPU-old", None)], &["nv-cu130"]);
+        assert!(!unknown[0].selectable);
+        assert_eq!(unknown[0].reason.as_deref(), Some("TRAINING_GPU_CC_UNKNOWN"));
+
+        // and the floor itself is the shared constant, not a second copy
+        let ok = training_gpu_list(
+            &gpus,
+            vec![nv("RTX 2060", "GPU-new", Some(crate::gpu::CUDA_CC10_FLOOR))],
+            &["nv-cu130"],
+        );
+        assert!(ok[0].selectable);
+    }
+
+    /// A device with no training runtime at all (Basic Render / virtual adapters) is a different
+    /// fact from an unsupported card, and must never carry a pickable value.
+    #[test]
+    fn vendorless_adapter_has_no_runtime_and_no_value() {
+        let list = training_gpu_list(&[gpu("Microsoft Basic Render Driver", "other")], vec![], &["cpu"]);
+        assert!(!list[0].selectable);
+        assert_eq!(list[0].reason.as_deref(), Some("TRAINING_GPU_NO_RUNTIME"));
+        assert!(list[0].value.is_empty(), "an empty value can never be masked into device.py");
+        assert!(list[0].variant.is_none());
     }
 
     /// The two NAME-based pack gates. Both exist because a vendor-only gate offered users a

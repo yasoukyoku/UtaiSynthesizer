@@ -82,3 +82,13 @@
   color: var(--accent-primary);
   box-shadow: inset 2px 0 0 var(--accent-primary);
 }
+
+/* S75 — shown but not choosable. NOT the 0.3 dim the locked step tabs use: those carry no text
+   the user has to READ, while a disabled option here states WHY it is disabled (review measured
+   0.3-on-muted at ~1.3:1 contrast — the reason was there and unreadable). `not-allowed` + the
+   muted colour already say "disabled"; legibility wins over the extra dimming. */
+.ut-dropdown-option.disabled {
+  color: var(--text-muted);
+  opacity: 0.75;
+  cursor: not-allowed;
+}

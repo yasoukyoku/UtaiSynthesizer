@@ -29,6 +29,21 @@ interface RequiredAssetStatus {
   selfUrl: string | null;
 }
 
+/** Mirror of Rust `commands::settings::TrainingGpu` (S75 added id/variant/selectable/reason). */
+export interface TrainingGpu {
+  /** UI identity and the ONLY thing `config.gpu` / the start payload carries (`vendor:n`).
+   *  `value` is unique only WITHIN a vendor, so it cannot serve as a key here. */
+  id: string;
+  label: string;
+  /** Accelerator-native device mask. Resolved server-side from `id`; never sent by the UI. */
+  value: string;
+  /** Runtime variant that drives it ("nv-cu130"/"amd"/"xpu"); null = no training runtime. */
+  variant: string | null;
+  selectable: boolean;
+  /** Stable CODE (backendError.ts) explaining an unselectable entry. */
+  reason: string | null;
+}
+
 export interface DatasetFile {
   path: string;
   name: string;
@@ -204,9 +219,10 @@ export interface TrainingFormConfig {
   keepOnlyLatest: boolean;
   cacheGpu: boolean;
   fp16: boolean;
-  /** Accelerator-native device identity from get_hardware_info.training_gpus
-   *  (NVIDIA UUID / vendor-relative index; "" = auto). S67: was a raw WMI list
-   *  index, which silently CPU'd multi-adapter boxes via a bad visibility mask. */
+  /** `TrainingGpu.id` of the picked device ("" = auto). S75: an IDENTITY, not the device mask —
+   *  Rust resolves it to the mask server-side. It used to be the mask itself, which is unique
+   *  only within a vendor, so on a multi-vendor box it named two different cards. S67 (the same
+   *  bug one generation earlier): a raw WMI list index that silently CPU'd multi-adapter boxes. */
   gpu: string;
   forceCpu: boolean;
   /** S41 PSOLA 数据增强份数 (0-3, 0=off) — rvc card (per-card fields so

@@ -10,6 +10,13 @@ import "./Dropdown.css";
 export interface DropdownOption<T extends string | number> {
   value: T;
   label: string;
+  /** S75: shown but not choosable — the entry must stay VISIBLE (a user who knows they own that
+   *  device must not think we lost it) while "you can select it" keeps implying "it works". */
+  disabled?: boolean;
+  /** Native tooltip. Option rows are nowrap + ellipsis and the panel is only as wide as the
+   *  trigger, so a label carrying a REASON gets truncated — and reasons put the actionable half
+   *  ("install it under Settings → …") at the end, which is exactly what gets cut (S75 review). */
+  title?: string;
 }
 
 export function Dropdown<T extends string | number>({
@@ -48,9 +55,19 @@ export function Dropdown<T extends string | number>({
 
   const commit = (idx: number) => {
     const opt = options[idx];
+    if (opt?.disabled) return; // stays open — a dead click must not read as "accepted"
     if (opt) onChange(opt.value);
     setOpen(false);
   };
+
+  /** Arrow keys SKIP disabled entries — landing on one and pressing Enter would read as broken. */
+  const moveHover = (step: 1 | -1) =>
+    setHover((h) => {
+      for (let i = h + step; i >= 0 && i < options.length; i += step) {
+        if (!options[i]?.disabled) return i;
+      }
+      return h;
+    });
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (!open) {
@@ -65,10 +82,10 @@ export function Dropdown<T extends string | number>({
       setOpen(false);
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
-      setHover((h) => Math.min(options.length - 1, h + 1));
+      moveHover(1);
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setHover((h) => Math.max(0, h - 1));
+      moveHover(-1);
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       commit(hover);
@@ -97,10 +114,12 @@ export function Dropdown<T extends string | number>({
               key={String(o.value)}
               role="option"
               aria-selected={i === selectedIdx}
+              aria-disabled={o.disabled || undefined}
+              title={o.title ?? o.label}
               className={`ut-dropdown-option ${i === selectedIdx ? "selected" : ""} ${
                 i === hover ? "hover" : ""
-              }`}
-              onPointerEnter={() => setHover(i)}
+              } ${o.disabled ? "disabled" : ""}`}
+              onPointerEnter={() => !o.disabled && setHover(i)}
               onPointerDown={(e) => {
                 // pointerdown (not click): commit before the outside-click
                 // closer sees the event, and before focus shifts

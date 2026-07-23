@@ -248,6 +248,96 @@ pub fn converter_python_checked(app_dir: &Path) -> Result<PathBuf> {
     Ok(py)
 }
 
+/// Training runtime variants, GPU-first — the resolution order AND the set of variants that
+/// can drive a training run. Single source: `training_interpreter`'s priority scan, the
+/// device gate's vendor→variant map, and `available_training_variants` all read this.
+pub(crate) const TRAINING_VARIANTS: [&str; 4] = ["nv-cu130", "amd", "xpu", "cpu"];
+
+fn dev_training_venv(app_dir: &Path) -> PathBuf {
+    app_dir.join("training").join(".venv").join("Scripts").join("python.exe")
+}
+
+/// ★S75 THE single criterion behind "can this GPU be picked for training": which training
+/// runtime variants can this installation ACTUALLY run right now. Three consumption points and
+/// no fourth — the device list's gate (`settings::training_gpu_list`), the resolution
+/// (`training_interpreter_for`), and try_start's fail-closed re-validation.
+///
+/// The dev venv counts as nv-cu130 + cpu, and ONLY those: it is a torch+cu121 environment, so it
+/// drives NVIDIA and CPU and nothing else. Saying so here is what stops a dev box from offering
+/// its AMD iGPU — before S75 the venv branch reported device_backend="cuda" for ANY chosen GPU,
+/// so picking the iGPU trained on the NVIDIA card (or on nothing) without a word.
+///
+/// ⚠ This MUST cover every tier `training_interpreter` resolves to, or the two disagree and the
+/// difference is a silent CPU demotion (S75 review): the manual python slot is such a tier — it
+/// used to report `default_gpu()` = "cuda", i.e. NVIDIA + CPU, so it counts the same as the venv.
+/// The bare-`python` last resort is deliberately NOT counted: `training_env_ready` already
+/// refuses that machine, and claiming a variant for an interpreter we know nothing about is
+/// exactly the fail-open this whole gate exists to remove.
+pub fn available_training_variants(app_dir: &Path) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut add = |v: &'static str| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    if dev_training_venv(app_dir).exists() || crate::util::manual_python_slot(app_dir).exists() {
+        add("nv-cu130");
+        add("cpu");
+    }
+    for p in list_packs() {
+        if !pack_python(Path::new(&p.path)).exists() {
+            continue;
+        }
+        if let Some(v) = TRAINING_VARIANTS.iter().find(|v| **v == p.meta.variant) {
+            add(v);
+        }
+    }
+    out
+}
+
+/// Resolve the interpreter for a SPECIFIC wanted variant (S75). `want: None` = no preference =
+/// byte-identical to `training_interpreter`.
+///
+/// `None` return = this install cannot run that variant, so the caller must fail LOUDLY. That is
+/// the whole point: the pre-S75 resolver scanned a fixed priority order and ignored which GPU the
+/// user had picked, so an AMD box that still held an nv-cu130 pack resolved to it and reported
+/// device_backend="cuda" — and a box holding only the CPU pack reported "cpu", which
+/// `require_wanted_accelerator` deliberately lets through as legitimate explicit-CPU. Result:
+/// the dropdown named a GPU and the run trained on the CPU, with one tracing::warn as the only
+/// trace. Resolution must follow the choice, or the choice is a lie.
+pub fn training_interpreter_for(
+    app_dir: &Path,
+    force_cpu: bool,
+    want: Option<&str>,
+) -> Option<(PathBuf, String)> {
+    let Some(want) = want else {
+        return Some(training_interpreter(app_dir, force_cpu));
+    };
+    let backend =
+        if force_cpu { "cpu".to_string() } else { variant_backend(want).to_string() };
+    // Same tier order as `training_interpreter`, filtered to what can serve `want` — and the same
+    // NVIDIA+CPU-only claim for the two non-pack tiers that `available_training_variants` makes.
+    let venv = dev_training_venv(app_dir);
+    if venv.exists() && matches!(want, "nv-cu130" | "cpu") {
+        return Some((venv, backend));
+    }
+    if let Some(p) = list_packs()
+        .into_iter()
+        .filter(|p| p.meta.variant == want)
+        .max_by_key(|p| p.meta.version)
+    {
+        let py = pack_python(Path::new(&p.path));
+        if py.exists() {
+            return Some((py, backend));
+        }
+    }
+    let manual = crate::util::manual_python_slot(app_dir);
+    if manual.exists() && matches!(want, "nv-cu130" | "cpu") {
+        return Some((manual, backend));
+    }
+    None
+}
+
 /// nv-cu130 and amd(torch-hip) both drive the `torch.cuda.*` namespace, so both map
 /// to the "cuda" backend for device.py's shim; xpu and cpu map to themselves.
 fn variant_backend(variant: &str) -> &'static str {
@@ -267,19 +357,14 @@ fn variant_backend(variant: &str) -> &'static str {
 pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> (PathBuf, String) {
     let default_gpu = || if force_cpu { "cpu" } else { "cuda" }.to_string();
 
-    let venv = app_dir
-        .join("training")
-        .join(".venv")
-        .join("Scripts")
-        .join("python.exe");
+    let venv = dev_training_venv(app_dir);
     if venv.exists() {
         return (venv, default_gpu());
     }
     // Same GPU-first order as the converter role; here the variant also fixes the
     // backend, so an NVIDIA box holding only nv-cu130 trains on GPU (device=cuda).
-    const TRAINING_PRIORITY: [&str; 4] = ["nv-cu130", "amd", "xpu", "cpu"];
     let packs = list_packs();
-    for variant in TRAINING_PRIORITY {
+    for variant in TRAINING_VARIANTS {
         if let Some(p) = packs
             .iter()
             .filter(|p| p.meta.variant == variant)
