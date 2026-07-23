@@ -1058,6 +1058,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       rtWhyGeneric: { zh: "当前设备不支持此包，它不会被使用；可重新自检或直接删除。", en: "This machine doesn't support this pack, so it won't be used — re-run the self-test or delete it.", ja: "この PC はこのパックに非対応のため使用されません。セルフテストを再実行するか削除してください。" },
       gpuSoftwareAdapter: { zh: "不可用：软件适配器", en: "unavailable: software adapter", ja: "使用不可：ソフトウェアアダプター" },
       gpuUnknownCc: { zh: "不可用：读不到该设备的算力", en: "unavailable: couldn't read this device's compute capability", ja: "使用不可：この GPU の計算能力を取得できません" },
+      gpuDuplicateAdapter: { zh: "同一块显卡的重复条目（系统枚举了两次，选上面那条）", en: "duplicate entry for the same GPU (enumerated twice by the system — use the other one)", ja: "同一 GPU の重複エントリ（システムが二重に列挙。もう一方を選んでください）" },
       cudaDownloading: { zh: "下载中...", en: "Downloading...", ja: "ダウンロード中..." },
       cudaDelete: { zh: "删除", en: "Delete", ja: "削除" },
       cudaLocalInstallAnyway: { zh: "仍要安装", en: "Install anyway", ja: "それでもインストール" },
@@ -1225,6 +1226,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
       o.reason === "CC_UNSUPPORTED" ? L("gpuUnsupportedCc")
       : o.reason === "CC_UNKNOWN" ? L("gpuUnknownCc")
       : o.reason === "SOFTWARE_ADAPTER" ? L("gpuSoftwareAdapter")
+      : o.reason === "DUPLICATE_ADAPTER" ? L("gpuDuplicateAdapter")
       : null;
     return why ? `${o.label} — ${why}` : o.label;
   };
@@ -1353,7 +1355,13 @@ export function Settings({ onClose }: { onClose: () => void }) {
               const opts = device === "cuda" ? gpuLists?.cuda : gpuLists?.directml;
               if (!opts || opts.length === 0) return null;
               if (device === "auto") {
-                const stale = autoGpu !== null && !opts.some((o) => o.id === autoGpu);
+                // S75: "stale" is not only "that id is gone" — a pick that is still LISTED but
+                // has become unselectable (S75 marks duplicate NVIDIA adapters that way) steers
+                // the backend just as dangling. Without this, a single-GPU box whose only other
+                // entry is the shadow drops to <2 selectable, hides the row, and leaves the
+                // stored pick pointing at the shadow with no affordance to clear it.
+                const picked = autoGpu === null ? null : opts.find((o) => o.id === autoGpu);
+                const stale = autoGpu !== null && !picked?.selectable;
                 // Hide the row on single-GPU boxes (nothing to prefer) — but NEVER while
                 // a stale pick is stored: the row is the only affordance to clear it
                 // (review round 2: hiding it left a dangling pick steering the backend).

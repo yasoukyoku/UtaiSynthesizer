@@ -389,27 +389,38 @@ pub fn cuda_ordinal_for_dxgi(dxgi_index: u32) -> Option<u32> {
     cudart_pci_bus_ids()?.into_iter().position(|p| p == pci).map(|i| i as u32)
 }
 
-/// PCI bus id of the CUDA device whose LUID matches, via the CUDA driver API.
+/// ★S75 — (driver device handle, LUID) for every CUDA device the DRIVER API can see. Empty =
+/// no nvcuda / no devices / probe failed.
+///
+/// This is the authoritative PHYSICAL enumeration of NVIDIA GPUs. DXGI is not: on the dev box it
+/// lists the same 3080 Ti TWICE, as two adapter instances with different LUIDs but byte-identical
+/// `DXGI_ADAPTER_DESC3` identity (VendorId/DeviceId/SubSysId/Revision) and identical VRAM — and
+/// `DXGI_ADAPTER_FLAG3_REMOTE` is NOT set on the shadow, so no DESC3 field distinguishes it from
+/// a genuine second identical card. The CUDA driver's LUID table does: the real adapter's LUID is
+/// in it, the shadow's is not.
 #[cfg(windows)]
-fn driver_pci_for_luid(target: [u8; 8]) -> Option<String> {
+fn driver_devices_with_luid() -> Vec<(i32, [u8; 8])> {
     type CuInit = unsafe extern "C" fn(u32) -> i32;
     type CuCount = unsafe extern "C" fn(*mut i32) -> i32;
     type CuGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
     type CuLuid = unsafe extern "C" fn(*mut u8, *mut u32, i32) -> i32;
-    type CuPci = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
     const NVCUDA: &[u8] = b"nvcuda.dll\0";
+    let mut out = Vec::new();
     unsafe {
-        let init: CuInit = std::mem::transmute(dll_proc(NVCUDA, b"cuInit\0")?);
-        let count_fn: CuCount = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetCount\0")?);
-        let get_fn: CuGet = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGet\0")?);
-        let luid_fn: CuLuid = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetLuid\0")?);
-        let pci_fn: CuPci = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetPCIBusId\0")?);
+        let Some(init) = dll_proc(NVCUDA, b"cuInit\0") else { return out };
+        let Some(count_p) = dll_proc(NVCUDA, b"cuDeviceGetCount\0") else { return out };
+        let Some(get_p) = dll_proc(NVCUDA, b"cuDeviceGet\0") else { return out };
+        let Some(luid_p) = dll_proc(NVCUDA, b"cuDeviceGetLuid\0") else { return out };
+        let init: CuInit = std::mem::transmute(init);
+        let count_fn: CuCount = std::mem::transmute(count_p);
+        let get_fn: CuGet = std::mem::transmute(get_p);
+        let luid_fn: CuLuid = std::mem::transmute(luid_p);
         if init(0) != 0 {
-            return None; // idempotent; ORT's CUDA EP calls it too
+            return out; // idempotent; ORT's CUDA EP calls it too
         }
         let mut count: i32 = 0;
         if count_fn(&mut count) != 0 || count <= 0 {
-            return None;
+            return out;
         }
         for i in 0..count {
             let mut dev: i32 = 0;
@@ -418,18 +429,41 @@ fn driver_pci_for_luid(target: [u8; 8]) -> Option<String> {
             }
             let mut luid = [0u8; 8];
             let mut node_mask: u32 = 0;
-            if luid_fn(luid.as_mut_ptr(), &mut node_mask, dev) != 0 || luid != target {
-                continue;
+            if luid_fn(luid.as_mut_ptr(), &mut node_mask, dev) == 0 {
+                out.push((dev, luid));
             }
-            let mut buf = [0u8; 64];
-            if pci_fn(buf.as_mut_ptr(), buf.len() as i32, dev) != 0 {
-                return None;
-            }
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            return Some(normalize_pci_bus_id(&String::from_utf8_lossy(&buf[..len])));
         }
     }
-    None
+    out
+}
+
+/// LUIDs of the physically present, CUDA-visible NVIDIA GPUs. Empty = the probe could not answer
+/// (no drivers / no devices) — callers MUST treat empty as "unknown", never as "none exist".
+#[cfg(windows)]
+pub fn cuda_visible_luids() -> Vec<[u8; 8]> {
+    driver_devices_with_luid().into_iter().map(|(_, luid)| luid).collect()
+}
+
+#[cfg(not(windows))]
+pub fn cuda_visible_luids() -> Vec<[u8; 8]> {
+    Vec::new()
+}
+
+/// PCI bus id of the CUDA device whose LUID matches, via the CUDA driver API.
+#[cfg(windows)]
+fn driver_pci_for_luid(target: [u8; 8]) -> Option<String> {
+    type CuPci = unsafe extern "C" fn(*mut u8, i32, i32) -> i32;
+    const NVCUDA: &[u8] = b"nvcuda.dll\0";
+    let dev = driver_devices_with_luid().into_iter().find(|(_, l)| *l == target)?.0;
+    unsafe {
+        let pci_fn: CuPci = std::mem::transmute(dll_proc(NVCUDA, b"cuDeviceGetPCIBusId\0")?);
+        let mut buf = [0u8; 64];
+        if pci_fn(buf.as_mut_ptr(), buf.len() as i32, dev) != 0 {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(normalize_pci_bus_id(&String::from_utf8_lossy(&buf[..len])))
+    }
 }
 
 #[cfg(not(windows))]
@@ -486,6 +520,57 @@ fn normalize_pci_bus_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Machine-specific DIAGNOSTIC (ignored — it probes the real box). Run it when a user reports
+    /// a duplicated / missing / mislabelled entry in the preferred-GPU picker:
+    ///   cargo test --lib dxgi_enumeration_on_this_machine -- --ignored --nocapture
+    /// Prints the RAW DXGI rows (LUID included — that is what tells a genuine second adapter
+    /// apart from the same GPU enumerated twice) beside the CUDA ordinal space they do NOT share.
+    #[test]
+    #[ignore]
+    fn dxgi_enumeration_on_this_machine() {
+        println!("--- dxgi_adapters() (the DirectML device_id space) ---");
+        for a in dxgi_adapters() {
+            println!(
+                "  idx={} vendor={} software={} vram={}MB luid={:02x?} name={}",
+                a.index, a.vendor, a.software, a.dedicated_mb, a.luid, a.name
+            );
+        }
+        #[cfg(windows)]
+        {
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory1, IDXGIAdapter4, IDXGIFactory1,
+            };
+            println!("--- GetDesc3 (flags + PCI identity: what tells a shadow adapter apart) ---");
+            if let Ok(f) = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() } {
+                for index in 0..64u32 {
+                    let Ok(a) = (unsafe { f.EnumAdapters1(index) }) else { break };
+                    let Ok(a4) = a.cast::<IDXGIAdapter4>() else { continue };
+                    let Ok(d) = (unsafe { a4.GetDesc3() }) else { continue };
+                    let len = d.Description.iter().position(|&c| c == 0).unwrap_or(0);
+                    println!(
+                        "  idx={} flags3=0x{:x} ven=0x{:04x} dev=0x{:04x} sub=0x{:08x} rev={} name={}",
+                        index,
+                        d.Flags.0,
+                        d.VendorId,
+                        d.DeviceId,
+                        d.SubSysId,
+                        d.Revision,
+                        String::from_utf16_lossy(&d.Description[..len])
+                    );
+                }
+            }
+        }
+        println!("--- LUID bridge: which DXGI adapter is a REAL cuda device ---");
+        for a in dxgi_adapters().into_iter().filter(|a| a.vendor == "nvidia") {
+            println!("  dxgi idx={} -> cuda_ordinal={:?}", a.index, cuda_ordinal_for_dxgi(a.index));
+        }
+        println!("--- cuda_devices() (a DIFFERENT ordinal space) ---");
+        for d in cuda_devices() {
+            println!("  idx={} cap={:?} name={}", d.index, cuda_compute_cap(d.index), d.name);
+        }
+    }
 
     #[test]
     fn pci_bus_id_normalization_bridges_smi_and_cudart() {

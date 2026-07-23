@@ -788,18 +788,42 @@ pub struct InferenceGpuLists {
 /// hardware identifiers — deliberately not localized.
 #[tauri::command]
 pub fn list_inference_gpus() -> InferenceGpuLists {
+    // ★S75 (user report): DXGI can list ONE physical GPU twice. On the reporter's box a single
+    // RTX 3080 Ti enumerates at index 0 AND index 2 — different LUIDs, byte-identical DESC3
+    // identity and VRAM, `DXGI_ADAPTER_FLAG3_REMOTE` NOT set on either. So no DESC3 field tells
+    // the shadow apart from a genuine second identical card, and a name/VRAM dedupe would break
+    // real dual-GPU rigs. The CUDA driver's LUID table does tell them apart, exactly: the real
+    // adapter's LUID is in it, the shadow's is not (verified on that box — idx0 → cuda ordinal 0,
+    // idx2 → none).
+    //
+    // Fail-OPEN by design, unlike the rest of these gates: an EMPTY LUID table means the probe
+    // could not answer (no CUDA drivers), not "no GPUs exist" — demoting every NVIDIA adapter
+    // there would take a working card away from someone whose driver merely lacks CUDA.
+    let cuda_luids = crate::gpu::cuda_visible_luids();
     let directml = crate::gpu::dxgi_adapters()
         .into_iter()
-        .map(|a| InferenceGpuChoice {
-            id: a.index,
-            label: if a.dedicated_mb >= 256 {
-                format!("GPU {}: {} ({} MB)", a.index, a.name, a.dedicated_mb)
+        .map(|a| {
+            let shadow = a.vendor == "nvidia"
+                && !cuda_luids.is_empty()
+                && !cuda_luids.contains(&a.luid);
+            let reason = if a.software {
+                Some("SOFTWARE_ADAPTER")
+            } else if shadow {
+                Some("DUPLICATE_ADAPTER")
             } else {
-                format!("GPU {}: {}", a.index, a.name)
-            },
-            selectable: !a.software,
-            reason: a.software.then(|| "SOFTWARE_ADAPTER".to_string()),
-            vendor: a.vendor.to_string(),
+                None
+            };
+            InferenceGpuChoice {
+                id: a.index,
+                label: if a.dedicated_mb >= 256 {
+                    format!("GPU {}: {} ({} MB)", a.index, a.name, a.dedicated_mb)
+                } else {
+                    format!("GPU {}: {}", a.index, a.name)
+                },
+                selectable: reason.is_none(),
+                reason: reason.map(str::to_string),
+                vendor: a.vendor.to_string(),
+            }
         })
         .collect();
     // S74b: a CUDA device our shipped CUDA package cannot run must not be PICKABLE — the whole
@@ -2474,6 +2498,17 @@ mod tests {
                 "  [{}] id={} value={:?} variant={:?} selectable={} reason={:?}",
                 g.label, g.id, g.value, g.variant, g.selectable, g.reason
             );
+        }
+        // The INFERENCE picker is a different list in a different ordinal space — dump it too,
+        // so "which list is the user looking at" is never a guess in a bug report.
+        let inf = list_inference_gpus();
+        println!("--- list_inference_gpus().directml (the preferred-GPU picker) ---");
+        for o in inf.directml {
+            println!("  id={} selectable={} reason={:?} {}", o.id, o.selectable, o.reason, o.label);
+        }
+        println!("--- list_inference_gpus().cuda ---");
+        for o in inf.cuda {
+            println!("  id={} selectable={} reason={:?} {}", o.id, o.selectable, o.reason, o.label);
         }
     }
 
