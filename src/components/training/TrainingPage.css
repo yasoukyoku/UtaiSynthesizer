@@ -869,3 +869,65 @@
   justify-content: flex-end;
   margin-top: 6px;
 }
+
+/* S76 batch 2 — the project's on-disk checkpoint inventory. Square, no radius, no native
+   controls (repo UI rule); shapes and tokens reuse the candidate rows directly above it so the
+   two lists read as one thing. */
+.training-archive {
+  border-top: 1px solid var(--border-subtle);
+  margin-top: var(--space-md);
+}
+
+.training-archive-toggle {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  padding: var(--space-sm) 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.training-archive-toggle:hover {
+  color: var(--text-primary);
+}
+
+.training-archive-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-lg);
+  padding: var(--space-xs) 0;
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--font-size-xs);
+}
+
+.training-archive-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.training-archive-tag {
+  min-width: 56px;
+  text-align: center;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  padding: 0 var(--space-sm);
+}
+
+.training-archive-tag.imported {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.training-archive-step,
+.training-archive-size {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  min-width: 72px;
+  text-align: right;
+}

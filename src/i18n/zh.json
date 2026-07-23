@@ -392,6 +392,18 @@
     "retrain": "重训",
     "needData": "请先导入训练数据",
     "needName": "请先填写模型名称",
+    "archiveTitle": "本架构的训练存档（{{count}}）",
+    "ckptLatest": "最新",
+    "ckptStep": "{{step}} 步",
+    "ckptImported": "已导入",
+    "ckptKind": {
+      "base": "底模",
+      "resumable": "可续训",
+      "release": "快照",
+      "best": "最佳",
+      "orphan": "半份存档",
+      "pending": "刚落盘"
+    },
     "probeFailed": "读不到该模型名的训练工作区状态（{{err}}）——为免误清空已有进度，本次未启动训练；请重启应用后重试",
     "dropHint": "拖放到此处以添加为训练数据",
     "pausePreview": "暂停",

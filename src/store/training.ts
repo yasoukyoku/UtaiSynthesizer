@@ -61,6 +61,8 @@ export interface SpeakerGroupDraft {
 }
 
 let spkSeq = 0;
+/** Generation counter for the checkpoint scan — see refreshProjectCkpts. */
+let ckptScanSeq = 0;
 let flashSeq = 0;
 
 export interface StageInfo {
@@ -87,6 +89,64 @@ export interface CkptInfo {
   step: number;
   epoch: number;
   metric?: number | null;
+}
+
+/** Mirror of Rust `tproject::CkptRecord` (list_project_ckpts) — what is actually ON DISK.
+ *  Distinct from CkptInfo, which is what the RUNNING sidecar emitted into memory: the event
+ *  source vanishes when the app closes or「清空结果」is pressed, the scan does not. */
+export interface CkptRecord {
+  /** Path relative to the project dir — the ledger key (survives a data-dir move). */
+  rel: string;
+  path: string;
+  family: string;
+  /** base = the seeded pretrained (not the user's work); release/best = generator-only
+   *  snapshots you import; resumable = training can continue from it. */
+  kind: "base" | "resumable" | "release" | "best" | "orphan" | "pending";
+  /** Real training step. null = RVC's「只保留最新」sentinel name, which is not a step. */
+  step: number | null;
+  bytes: number;
+  mtimeMs: number;
+  imported: boolean;
+  /** Files that belong to the same archive (a GAN pair's D); `bytes` already includes them. */
+  companions: string[];
+}
+
+/** Same file, seen from the two sources. Paths come from Rust on one side and from the
+ *  sidecar on the other, so compare them case- and separator-insensitively (Windows). */
+function ckptKey(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+/** THE single reconciliation of「运行中刚落的存档」with「磁盘上真实存在的存档」.
+ *
+ *  The disk scan wins wherever both know a file (it carries size / kind / imported), and a
+ *  ckpt the sidecar just announced but the scan has not seen yet is still shown — otherwise a
+ *  checkpoint would blink out of the list for the seconds between the event and the next
+ *  scan. Pure + tested so the two sources can never drift into duplicate or flickering rows. */
+export function mergeCkptSources(
+  eventCkpts: CkptInfo[],
+  scanned: CkptRecord[],
+  family: string,
+): CkptRecord[] {
+  const seen = new Set(scanned.map((r) => ckptKey(r.path)));
+  const extra: CkptRecord[] = eventCkpts
+    .filter((c) => !seen.has(ckptKey(c.path)))
+    .map((c) => ({
+      rel: c.path.replace(/\\/g, "/").split("/").slice(-2).join("/"),
+      path: c.path,
+      family,
+      // Do NOT infer a kind here. The event only says periodic/best/final/stop, and the same
+      // file can be a release snapshot (rvc/sovits weights) or a resume point (diffusion
+      // model_<step>.pt) depending on family — guessing made a diffusion ckpt read「快照」for
+      // the few seconds before the scan caught up, then flip to「可续训」.
+      kind: "pending" as const,
+      step: c.step,
+      bytes: 0,
+      mtimeMs: Number.MAX_SAFE_INTEGER, // just written ⇒ newest
+      imported: false,
+      companions: [],
+    }));
+  return [...extra, ...scanned].sort((a, b) => b.mtimeMs - a.mtimeMs || a.rel.localeCompare(b.rel));
 }
 
 export interface StepPoint {
@@ -136,6 +196,14 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
     // 免导入直训 there would let the user skip the data page straight into a refusal.
     info.n_speakers <= 1
   );
+}
+
+/** Which architecture SLOT a backend trains into — mirrors Rust `training::backend_family`.
+ *  Shallow diffusion is not a family of its own: it lives in the sovits slot because it shares
+ *  the main model's preprocessing caches, which is the entire reason it exists. THE single
+ *  frontend source for this mapping; do not re-derive it per call site. */
+export function backendFamily(backend: string): string {
+  return backend === "sovits_diff" ? "sovits" : backend;
 }
 
 /** ①c: which backends take a SINGER LIST (multi-speaker co-train) — SoVITS (α) + RVC (α′)
@@ -394,6 +462,12 @@ interface TrainingStoreState {
    *  never leaves already-imported files stranded/invisible. */
   migrateOnBackendSwitch: (prev: string, next: string) => void;
   refresh: () => Promise<void>;
+  /** S76: the project's on-disk checkpoint inventory (survives app restarts and「清空结果」). */
+  projectCkpts: CkptRecord[];
+  /** Resolve the project from the MODEL NAME (never from the run snapshot — that is empty
+   *  exactly when this list matters) and rescan. THE only way to refresh the inventory, so
+   *  no call site can forget the family filter or race a stale response in. */
+  refreshProjectCkpts: (modelName: string, backend: string) => Promise<void>;
   /** `wipeConfirmed` = the user answered a destructive「重训」dialog for THIS run. The backend
    *  refuses a `fresh` start that would destroy checkpoints / an imported dataset without it. */
   start: (fresh: boolean, wipeConfirmed: boolean) => Promise<void>;
@@ -510,6 +584,34 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       }
       return {};
     }),
+
+  projectCkpts: [],
+
+  refreshProjectCkpts: async (modelName, backend) => {
+    const seq = ++ckptScanSeq;
+    const name = modelName.trim();
+    if (!name) {
+      if (seq === ckptScanSeq) set({ projectCkpts: [] });
+      return;
+    }
+    try {
+      const projectId = await invoke<string | null>("find_training_project", { name });
+      if (!projectId) {
+        if (seq === ckptScanSeq) set({ projectCkpts: [] });
+        return;
+      }
+      const rows = await invoke<CkptRecord[]>("list_project_ckpts", {
+        projectId,
+        family: backendFamily(backend),
+      });
+      // Drop a response that a newer scan has already superseded — the name field changes on
+      // every keystroke, so out-of-order replies are the normal case, not the exotic one.
+      if (seq === ckptScanSeq) set({ projectCkpts: rows });
+    } catch (e) {
+      console.error("project ckpt scan failed", e);
+      if (seq === ckptScanSeq) set({ projectCkpts: [] });
+    }
+  },
 
   refresh: async () => {
     try {

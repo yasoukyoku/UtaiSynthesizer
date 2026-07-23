@@ -354,6 +354,251 @@ pub fn resolve_or_create(data_dir: &Path, name: &str) -> Result<ProjectMeta> {
     Ok(meta)
 }
 
+// ─────────────────────────── checkpoint inventory ───────────────────────────
+
+/// What a checkpoint file IS — the four shapes the four families actually produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CkptKind {
+    /// The seeded pretrained base (step 0). Present in every workspace from the moment it is
+    /// created, so it must never read as「用户练出来的东西」.
+    Base,
+    /// Training can continue from here.
+    Resumable,
+    /// A release snapshot under `weights/` — what you audition and import. **Generator only**
+    /// (`sovits/train.py` writes just the generator), so it can never resume a GAN.
+    Release,
+    /// The best release snapshot by validation metric.
+    Best,
+    /// Half of a torn GAN save — a `G_<n>.pth` whose `D_<n>.pth` never landed, or the mirror.
+    /// Hundreds of MB that cannot be resumed from: listed so it stays visible and reclaimable,
+    /// never offered as a resume point.
+    Orphan,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CkptRecord {
+    /// Relative to the PROJECT directory — a data-dir move must not orphan the ledger that
+    /// protects these files from the cleanup.
+    pub rel: String,
+    /// Absolute path: what audition / import / attach already take.
+    pub path: String,
+    pub family: String,
+    pub kind: CkptKind,
+    /// Real training step. `None` for the RVC「只保留最新」sentinel — see below.
+    pub step: Option<u64>,
+    pub bytes: u64,
+    pub mtime_ms: u64,
+    /// Already exported into the model registry (from `project.json`'s ledger).
+    pub imported: bool,
+    /// Files belonging to the SAME archive that must be deleted with it — the `D_<n>.pth` of a
+    /// GAN pair. `bytes` already includes them.
+    pub companions: Vec<String>,
+}
+
+fn stat_of(p: &Path) -> (u64, u64) {
+    let Ok(md) = std::fs::metadata(p) else { return (0, 0) };
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    (md.len(), mtime)
+}
+
+/// Every checkpoint a project holds, newest first.
+///
+/// This is the answer to「关掉 app 或点过『清空结果』之后,盘上到底还有什么」— until now the
+/// candidate list was emitted by the python sidecar into memory and nothing ever scanned the
+/// disk, so those files existed with no way left to reach them.
+///
+/// Two shape traps, both live on this dev machine and both pinned by tests:
+/// * **RVC's default `keep_only_latest`** writes a fixed sentinel name `G_2333333.pth` /
+///   `D_2333333.pth` (`rvc/train.py`) — 2333333 is a placeholder, NOT a step. Reporting it as
+///   one would show「2333333 步」and, worse, make it sort above every real checkpoint. Upstream
+///   resumes by **mtime** for exactly this reason (`rvc/train_utils.py`), which is why the
+///   ordering here is mtime-first too.
+/// * **the vocoder's `model_ckpt_steps_<N>.ckpt` counts in lightning GLOBAL steps**, and its
+///   manual-optimisation GAN steps the D and G optimizers separately ⇒ N = 2 × 实际步. The
+///   `weights/vocoder_<real>.ckpt` snapshots next to them carry the halved number already —
+///   on this machine root {1000,2000,3000,3644} sits beside weights {500,1000,1500,1822}.
+pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<CkptRecord> {
+    let proj = project_dir(data_dir, id);
+    let exported: Vec<String> = read_meta(data_dir, id)
+        .map(|m| m.exported.into_iter().map(|e| e.from_ckpt_rel).collect())
+        .unwrap_or_default();
+    let mut out: Vec<CkptRecord> = Vec::new();
+
+    for family in FAMILIES {
+        if only.is_some_and(|f| f != family) {
+            continue;
+        }
+        let slot = proj.join(family);
+        if !slot.is_dir() {
+            continue;
+        }
+        let relof = |abs: &Path| {
+            abs.strip_prefix(&proj)
+                .unwrap_or(abs)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        let mut push = |abs: PathBuf,
+                        companion: Option<PathBuf>,
+                        kind: CkptKind,
+                        step: Option<u64>| {
+            let rel = relof(&abs);
+            let (mut bytes, mtime_ms) = stat_of(&abs);
+            let companions: Vec<String> = companion
+                .into_iter()
+                .map(|c| {
+                    bytes += stat_of(&c).0;
+                    relof(&c)
+                })
+                .collect();
+            out.push(CkptRecord {
+                imported: exported.contains(&rel),
+                rel,
+                path: abs.to_string_lossy().into_owned(),
+                family: family.to_string(),
+                kind,
+                step,
+                bytes,
+                mtime_ms,
+                companions,
+            });
+        };
+
+        // ── slot root: the resumable pairs ────────────────────────────────────────────
+        let entries: Vec<String> = std::fs::read_dir(&slot)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for n in &entries {
+            if let Some(num) = n.strip_prefix("G_").and_then(|s| s.strip_suffix(".pth")) {
+                let step = if num == "2333333" { None } else { num.parse::<u64>().ok() };
+                // A GAN resumes only from a G+D PAIR — a lone half would silently restart the
+                // discriminator. But it is still hundreds of MB on disk, and the two halves are
+                // written by SEPARATE calls (a kill between them leaves one behind; upstream's
+                // `clean_checkpoints` also prunes the two sides independently), so dropping it
+                // from the inventory would recreate the exact problem this inventory exists to
+                // end: a file nothing in the UI can see or reclaim.
+                let paired = entries.iter().any(|d| d == &format!("D_{num}.pth"));
+                let kind = match (paired, step) {
+                    (false, _) => CkptKind::Orphan,
+                    (true, Some(0)) => CkptKind::Base,
+                    (true, _) => CkptKind::Resumable,
+                };
+                // The pair is ONE archive. D is the same order of magnitude and can be LARGER
+                // than G (on this machine an RVC D is 857 MB against G's 452 MB), so counting
+                // only G would understate a project by nearly half — and leave batch 3 deleting
+                // one side of every pair.
+                let companion = paired.then(|| slot.join(format!("D_{num}.pth")));
+                push(slot.join(n), companion, kind, step);
+            } else if let Some(num) = n.strip_prefix("D_").and_then(|s| s.strip_suffix(".pth")) {
+                // the mirror orphan: a D whose G is gone
+                if !entries.iter().any(|g| g == &format!("G_{num}.pth")) {
+                    push(slot.join(n), None, CkptKind::Orphan, num.parse::<u64>().ok());
+                }
+            } else if let Some(num) = n
+                .strip_prefix("model_ckpt_steps_")
+                .and_then(|s| s.strip_suffix(".ckpt"))
+            {
+                // GLOBAL lightning steps — halve for the real one (see the doc comment).
+                let step = num.parse::<u64>().ok().map(|v| v / 2);
+                push(slot.join(n), None, CkptKind::Resumable, step);
+            }
+        }
+
+        // ── diffusion progress (lives inside the sovits slot) ─────────────────────────
+        if let Ok(rd) = std::fs::read_dir(slot.join("diffusion")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt"))
+                else {
+                    continue;
+                };
+                if num == "best" {
+                    // `model_best.pt` is a BEST SNAPSHOT, never a resume point: the solver
+                    // writes it with `optimizer=None` so it carries no optimizer state, and
+                    // upstream's resume scan reads a non-numeric name as step 0. Offering it
+                    // would rewind thousands of steps AND zero the AdamW momentum.
+                    push(e.path(), None, CkptKind::Best, None);
+                    continue;
+                }
+                // anything that is not `model_<digits>.pt` is not ours — do not guess
+                let Some(step) = num.parse::<u64>().ok() else { continue };
+                let kind = if step == 0 { CkptKind::Base } else { CkptKind::Resumable };
+                push(e.path(), None, kind, Some(step));
+            }
+        }
+
+        // ── release snapshots ─────────────────────────────────────────────────────────
+        if let Ok(rd) = std::fs::read_dir(slot.join("weights")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if !(n.ends_with(".pth") || n.ends_with(".ckpt")) {
+                    continue;
+                }
+                let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
+                let kind = if stem.ends_with("_best") { CkptKind::Best } else { CkptKind::Release };
+                // Exactly two real shapes: `<slug>_e<epoch>_s<step>` (rvc/sovits/sovits_v2
+                // periodic) and `vocoder_<real step>` (vocoder — already halved on this side).
+                //
+                // ⚠ There was a blind `rsplit_once('_')` fallback here. `<slug>` is
+                // `<≤24 ascii>_<8 hex>` and the naturally-finished export is a plain
+                // `weights/<slug>.pth`, so whenever that hash happened to be all decimal
+                // digits (~2% of names) the fallback reported the HASH as the training step.
+                // No step is the honest answer; the UI renders it as "—".
+                let step = stem
+                    .rsplit_once("_s")
+                    .and_then(|(_, s)| s.parse::<u64>().ok())
+                    .or_else(|| stem.strip_prefix("vocoder_").and_then(|s| s.parse::<u64>().ok()));
+                push(e.path(), None, kind, step);
+            }
+        }
+    }
+    // Newest first — and mtime, not the step number, is the ordering upstream itself trusts
+    // (the RVC sentinel makes step ordering meaningless).
+    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms).then_with(|| a.rel.cmp(&b.rel)));
+    out
+}
+
+/// Record that a checkpoint became an installed model. The ledger is what keeps「清理未导入的
+/// 快照」(batch 3) from deleting the snapshots a user deliberately kept, so it stores paths
+/// RELATIVE to the project — an absolute path would stop matching the moment the data
+/// directory moves, and the cleanup would then see zero matches and delete everything.
+pub fn record_export(
+    data_dir: &Path,
+    id: &str,
+    name: &str,
+    model_type: &str,
+    from_ckpt: &str,
+) -> Result<()> {
+    let Some(mut meta) = read_meta(data_dir, id) else {
+        return Err(UtaiError::Training("PROJECT_META_UNREADABLE".into()));
+    };
+    let proj = project_dir(data_dir, id);
+    let rel = Path::new(from_ckpt)
+        .strip_prefix(&proj)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| from_ckpt.to_string());
+    meta.exported.retain(|e| !(e.from_ckpt_rel == rel && e.name == name));
+    meta.exported.push(ExportedModel {
+        name: name.to_string(),
+        model_type: model_type.to_string(),
+        from_ckpt_rel: rel,
+        at_ms: now_ms(),
+    });
+    meta.updated_ms = now_ms();
+    write_meta(data_dir, &meta)
+}
+
 // ─────────────────────────── legacy layout migration ───────────────────────────
 
 /// Which family does a legacy workspace hold?
@@ -441,15 +686,26 @@ pub struct MigrationReport {
 /// instances racing over the same renames would produce exactly the half-in-half-out tree the
 /// resume guards treat as corrupt, so the whole pass stands down when a sibling is alive.
 pub fn migrate_legacy_layout(data_dir: &Path) -> MigrationReport {
-    let mut report = MigrationReport::default();
-    let root = training_root(data_dir);
-    if !root.is_dir() {
-        return report;
+    if !training_root(data_dir).is_dir() {
+        return MigrationReport::default();
     }
     if crate::crashlog::other_instance_alive() {
         tracing::warn!("training layout migration postponed: another live instance detected");
-        return report;
+        return MigrationReport::default();
     }
+    migrate_all(data_dir)
+}
+
+/// The pass itself, without the sibling-instance stand-down.
+///
+/// Split out because `other_instance_alive` asks a MACHINE-wide question (it scans the log dir
+/// for live `session.<pid>.alive` sentinels) while a test owns a private temp data dir no
+/// sibling could possibly be touching. Fused, every migration test failed whenever a dev build
+/// happened to be running — proof that the guard works, but not something a unit test may
+/// depend on.
+fn migrate_all(data_dir: &Path) -> MigrationReport {
+    let mut report = MigrationReport::default();
+    let root = training_root(data_dir);
 
     // Torn runs first: a leftover staging directory must be reconciled before the same id is
     // considered again (its legacy path is currently empty or missing).
@@ -749,7 +1005,7 @@ mod tests {
     fn migrate_folds_into_family_slot_and_lifts_dataset() {
         let data = tmp_root("basic");
         legacy_rvc(&data, "test_1a2b3c4d");
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.migrated, vec!["test_1a2b3c4d".to_string()]);
 
         let p = project_dir(&data, "test_1a2b3c4d");
@@ -769,7 +1025,7 @@ mod tests {
         assert!(m.needs_attention.is_none());
 
         // idempotent
-        let rep2 = migrate_legacy_layout(&data);
+        let rep2 = migrate_all(&data);
         assert!(rep2.migrated.is_empty() && rep2.flagged.is_empty() && rep2.failed.is_empty());
         assert!(p.join("rvc").join("G_2333333.pth").is_file());
         assert!(!p.join("rvc").join("rvc").exists(), "must never nest a second slot");
@@ -784,7 +1040,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         // holds work (so it is not an empty shell) but nothing says which family
         std::fs::write(ws.join("G_100.pth"), b"g").unwrap();
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.flagged, vec!["weird_00000000".to_string()]);
         assert!(ws.join("G_100.pth").is_file(), "content must stay put");
         let m = read_meta(&data, "weird_00000000").unwrap();
@@ -796,7 +1052,7 @@ mod tests {
     fn migrate_adopts_empty_shell_without_flagging() {
         let data = tmp_root("shell");
         std::fs::create_dir_all(training_root(&data).join("ghost_deadbeef")).unwrap();
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.migrated, vec!["ghost_deadbeef".to_string()]);
         assert!(read_meta(&data, "ghost_deadbeef").unwrap().needs_attention.is_none());
         let _ = std::fs::remove_dir_all(data);
@@ -835,7 +1091,7 @@ mod tests {
         assert!(!staging_path(&data, "torn_11223344").exists());
 
         // and the retry still works
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.migrated, vec!["torn_11223344".to_string()]);
         let _ = std::fs::remove_dir_all(data);
     }
@@ -853,7 +1109,7 @@ mod tests {
         std::fs::rename(&staging, ws.join("rvc")).unwrap();
         std::fs::write(marker_path(&data, "fwd_55667788"), b"{}").unwrap();
 
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.migrated, vec!["fwd_55667788".to_string()]);
         assert!(ws.join("rvc").join("G_2333333.pth").is_file());
         assert!(!ws.join("rvc").join("rvc").exists());
@@ -897,7 +1153,7 @@ mod tests {
         let ws = training_root(&data).join("v2ish_00001111");
         std::fs::create_dir_all(ws.join("dataset_44k")).unwrap();
         std::fs::write(ws.join("G_800.pth"), b"g").unwrap();
-        let rep = migrate_legacy_layout(&data);
+        let rep = migrate_all(&data);
         assert_eq!(rep.flagged, vec!["v2ish_00001111".to_string()]);
         assert_eq!(
             read_meta(&data, "v2ish_00001111").unwrap().needs_attention.as_deref(),
@@ -909,7 +1165,7 @@ mod tests {
         std::fs::create_dir_all(ws2.join("diffusion")).unwrap();
         std::fs::create_dir_all(ws2.join("dataset_44k")).unwrap();
         std::fs::write(ws2.join("G_800.pth"), b"g").unwrap();
-        assert!(migrate_legacy_layout(&data).migrated.contains(&"diffish_22223333".to_string()));
+        assert!(migrate_all(&data).migrated.contains(&"diffish_22223333".to_string()));
         assert!(ws2.join("sovits").join("G_800.pth").is_file());
         let _ = std::fs::remove_dir_all(data);
     }
@@ -923,11 +1179,25 @@ mod tests {
         let data = tmp_root("pending");
         let ws = legacy_rvc(&data, &crate::training::slugify("歌姫テスト"));
         assert!(unmigrated_legacy_dir(&data, "歌姫テスト").is_some());
-        // resolve_or_create migrates it on demand rather than forking
-        let m = resolve_or_create(&data, "歌姫テスト").unwrap();
-        assert_eq!(m.id, crate::training::slugify("歌姫テスト"));
-        assert!(ws.join("rvc").join("G_2333333.pth").is_file());
-        assert_eq!(list_projects(&data).len(), 1, "must never mint a second project");
+        // Either outcome is correct — what must NEVER happen is a second project. With no
+        // sibling instance the on-demand retry folds the workspace in; with one alive (a dev
+        // build running while the suite does, say) it refuses loudly instead of racing it.
+        // Asserting both keeps the invariant under test independent of machine state.
+        match resolve_or_create(&data, "歌姫テスト") {
+            Ok(m) => {
+                assert_eq!(m.id, crate::training::slugify("歌姫テスト"));
+                assert!(ws.join("rvc").join("G_2333333.pth").is_file());
+            }
+            Err(e) => assert!(
+                e.to_string().contains("TRAINING_LAYOUT_MIGRATION_PENDING"),
+                "the only acceptable refusal is the pending-migration one, got {e}"
+            ),
+        }
+        assert_eq!(
+            std::fs::read_dir(training_root(&data)).unwrap().flatten().count(),
+            1,
+            "must never mint a second project directory"
+        );
         let _ = std::fs::remove_dir_all(data);
     }
 
@@ -980,13 +1250,13 @@ mod tests {
         let ws = training_root(&data).join("weird_00000000");
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("G_100.pth"), b"g").unwrap();
-        assert_eq!(migrate_legacy_layout(&data).flagged, vec!["weird_00000000".to_string()]);
+        assert_eq!(migrate_all(&data).flagged, vec!["weird_00000000".to_string()]);
         assert!(resolve_or_create(&data, "weird_00000000").is_err());
 
         // the user moves the content into the slot themselves and restarts
         std::fs::create_dir_all(ws.join("rvc")).unwrap();
         std::fs::rename(ws.join("G_100.pth"), ws.join("rvc").join("G_100.pth")).unwrap();
-        migrate_legacy_layout(&data);
+        migrate_all(&data);
         assert!(read_meta(&data, "weird_00000000").unwrap().needs_attention.is_none());
         assert!(resolve_or_create(&data, "weird_00000000").is_ok());
         let _ = std::fs::remove_dir_all(data);
@@ -1010,7 +1280,7 @@ mod tests {
         std::fs::write(p2.join(".dataset.old_999").join("000.wav"), b"only").unwrap();
         write_meta(&data, &ProjectMeta { id: "lost_22220000".into(), name: "l".into(), ..Default::default() }).unwrap();
 
-        migrate_legacy_layout(&data);
+        migrate_all(&data);
 
         assert!(!p1.join(".dataset.old_999").exists(), "redundant copy reclaimed");
         assert_eq!(std::fs::read(p1.join("dataset").join("000.wav")).unwrap(), b"live");
@@ -1021,6 +1291,117 @@ mod tests {
             "the only copy must be put back, never deleted"
         );
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// The two shape traps, built exactly as the four families really write them (the
+    /// numbers are copied off this dev machine's own workspaces).
+    #[test]
+    fn scan_handles_the_rvc_sentinel_and_the_vocoder_double_count() {
+        let data = tmp_root("scan");
+        let id = "scan_12345678";
+        let p = project_dir(&data, id);
+        write_meta(&data, &ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() }).unwrap();
+
+        // rvc: the「只保留最新」sentinel pair + release snapshots
+        let rvc = p.join("rvc");
+        std::fs::create_dir_all(rvc.join("weights")).unwrap();
+        std::fs::write(rvc.join("G_2333333.pth"), b"g").unwrap();
+        std::fs::write(rvc.join("D_2333333.pth"), b"d").unwrap();
+        std::fs::write(rvc.join("weights").join("m_e6_s1580.pth"), b"w").unwrap();
+        std::fs::write(rvc.join("weights").join("m_best.pth"), b"w").unwrap();
+        // a torn save: G without its D must NOT be offered as a resume point
+        std::fs::write(rvc.join("G_777.pth"), b"g").unwrap();
+        // the naturally-finished export: `<slug>.pth` where slug = <base>_<8 hex>. A hash of
+        // all decimal digits must NOT be read as a training step.
+        std::fs::write(rvc.join("weights").join("mymodel_12345678.pth"), b"w").unwrap();
+
+        // sovits: seeded base pair + a real pair + diffusion
+        let sov = p.join("sovits");
+        std::fs::create_dir_all(sov.join("diffusion")).unwrap();
+        for n in ["G_0.pth", "D_0.pth", "G_15473.pth", "D_15473.pth"] {
+            std::fs::write(sov.join(n), b"x").unwrap();
+        }
+        std::fs::write(sov.join("diffusion").join("model_0.pt"), b"x").unwrap();
+        std::fs::write(sov.join("diffusion").join("model_392.pt"), b"x").unwrap();
+        std::fs::write(sov.join("diffusion").join("model_best.pt"), b"x").unwrap();
+
+        // vocoder: root counts GLOBAL steps (2x), weights carry the real number
+        let voc = p.join("vocoder");
+        std::fs::create_dir_all(voc.join("weights")).unwrap();
+        std::fs::write(voc.join("model_ckpt_steps_3644.ckpt"), b"x").unwrap();
+        std::fs::write(voc.join("weights").join("vocoder_1822.ckpt"), b"x").unwrap();
+
+        let all = scan_project_ckpts(&data, id, None);
+        let by = |rel: &str| all.iter().find(|r| r.rel == rel).unwrap_or_else(|| panic!("missing {rel}"));
+
+        // ★ the sentinel is a NAME, not a step — reporting 2333333 would also sort it above
+        // every real checkpoint
+        assert_eq!(by("rvc/G_2333333.pth").step, None);
+        assert_eq!(by("rvc/G_2333333.pth").kind, CkptKind::Resumable);
+        // ★ 3644 global = 1822 real, matching the weights snapshot beside it
+        assert_eq!(by("vocoder/model_ckpt_steps_3644.ckpt").step, Some(1822));
+        assert_eq!(by("vocoder/weights/vocoder_1822.ckpt").step, Some(1822));
+        // ★ a lone G is a torn save: visible (hundreds of MB) but never a resume point
+        assert_eq!(by("rvc/G_777.pth").kind, CkptKind::Orphan);
+        // ★ the pair is ONE archive and its size counts BOTH halves (D can be larger than G)
+        assert_eq!(by("rvc/G_2333333.pth").companions, vec!["rvc/D_2333333.pth".to_string()]);
+        assert_eq!(by("rvc/G_2333333.pth").bytes, 2, "G(1) + D(1)");
+        assert!(all.iter().all(|r| r.rel != "rvc/D_2333333.pth"), "the D rides on its G row");
+        // ★ model_best.pt has no optimizer state — it is a best SNAPSHOT, not a resume point
+        assert_eq!(by("sovits/diffusion/model_best.pt").kind, CkptKind::Best);
+        assert_eq!(by("sovits/diffusion/model_best.pt").step, None);
+        // ★ a plain `weights/<slug>.pth` carries no step — never mistake the slug hash for one
+        assert_eq!(by("rvc/weights/mymodel_12345678.pth").step, None);
+        // seeded bases are not the user's work
+        assert_eq!(by("sovits/G_0.pth").kind, CkptKind::Base);
+        assert_eq!(by("sovits/diffusion/model_0.pt").kind, CkptKind::Base);
+        assert_eq!(by("sovits/G_15473.pth").step, Some(15473));
+        assert_eq!(by("sovits/diffusion/model_392.pt").kind, CkptKind::Resumable);
+        // release snapshots are never resumable, and best is called out
+        assert_eq!(by("rvc/weights/m_e6_s1580.pth").kind, CkptKind::Release);
+        assert_eq!(by("rvc/weights/m_e6_s1580.pth").step, Some(1580));
+        assert_eq!(by("rvc/weights/m_best.pth").kind, CkptKind::Best);
+        // family filter
+        assert!(scan_project_ckpts(&data, id, Some("vocoder")).iter().all(|r| r.family == "vocoder"));
+
+        // ledger: an absolute path is stored RELATIVE, so a data-dir move keeps matching
+        assert!(!by("rvc/weights/m_best.pth").imported);
+        record_export(&data, id, "MyModel", "rvc", &rvc.join("weights").join("m_best.pth").to_string_lossy()).unwrap();
+        let all2 = scan_project_ckpts(&data, id, None);
+        assert!(all2.iter().find(|r| r.rel == "rvc/weights/m_best.pth").unwrap().imported);
+        assert_eq!(read_meta(&data, id).unwrap().exported[0].from_ckpt_rel, "rvc/weights/m_best.pth");
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Diagnostic against THIS machine's real training data — the synthetic fixtures above
+    /// cannot cover naming the four toolchains actually produce (CJK model names, slugs that
+    /// themselves contain `_s<digits>`, pre-S39 workspaces). Run it after touching the scanner:
+    ///   cargo test --lib scan_this_machine -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scan_this_machine() {
+        let data = PathBuf::from("D:/MyDev/Utai_v2-dev/data");
+        for m in list_projects(&data) {
+            let recs = scan_project_ckpts(&data, &m.id, None);
+            println!("
+=== {} ({}) — {} ckpt(s)", m.id, m.name, recs.len());
+            for r in recs.iter().take(60) {
+                println!(
+                    "  {:<10} {:>10} {:>9}MB  imported={}  {}",
+                    format!("{:?}", r.kind),
+                    r.step.map(|s| s.to_string()).unwrap_or_else(|| "latest".into()),
+                    r.bytes / 1_000_000,
+                    r.imported,
+                    r.rel
+                );
+            }
+            // every record must round-trip to a file that exists, or the list is lying
+            for r in &recs {
+                assert!(Path::new(&r.path).is_file(), "phantom record: {}", r.path);
+                assert!(!r.rel.contains('\\'), "rel must be forward-slashed: {}", r.rel);
+            }
+        }
     }
 
     #[test]

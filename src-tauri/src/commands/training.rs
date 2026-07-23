@@ -188,6 +188,59 @@ pub async fn check_training_workspace(
     Ok(ws.join("config.json").exists() || ws.join("weights").exists())
 }
 
+/// Which training project a model name resolves to, WITHOUT creating one. The archive list
+/// must work while idle — that is its whole point (an app restart or「清空结果」leaves the
+/// snapshot empty while the files are very much still on disk) — and `snapshot.project_id`
+/// describes THIS RUN, so it is empty exactly then.
+#[tauri::command]
+pub async fn find_training_project(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<Option<String>, String> {
+    Ok(crate::training::tproject::find_by_name(&data_root(&state), &name).map(|m| m.id))
+}
+
+/// Every checkpoint this project holds on DISK, newest first — the answer to「关掉 app 或点过
+/// 『清空结果』之后还剩什么」. Until S76 the candidate list was emitted by the sidecar into
+/// memory and nothing ever scanned the disk, so those files kept existing with no way left to
+/// reach them. Also the data source for batch 3's snapshot cleanup and batch 5's resume point.
+/// Only stats files (never opens them) and runs off-thread — a `weights/` with dozens of
+/// multi-GB snapshots must not stall the UI.
+#[tauri::command]
+pub async fn list_project_ckpts(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    family: Option<String>,
+) -> Result<Vec<crate::training::tproject::CkptRecord>, String> {
+    let data_dir = data_root(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, family.as_deref())
+    })
+    .await
+    .map_err(|e| format!("TRAINING_SCAN_JOIN: {e}"))
+}
+
+/// Note that a checkpoint became an installed model. Feeds the protection set behind
+/// 「清理未导入的快照」— without it every snapshot a user kept on purpose would read as
+/// unimported and be deleted.
+#[tauri::command]
+pub async fn record_project_export(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    name: String,
+    model_type: String,
+    from_ckpt: String,
+) -> Result<(), String> {
+    crate::training::tproject::record_export(
+        &data_root(&state),
+        &project_id,
+        &name,
+        &model_type,
+        &from_ckpt,
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Structured workspace facts (S39): the main-model retrain dialog must warn
 /// when the wipe would also destroy diffusion training progress, and the
 /// 浅扩散 card phrases its own dialog by resume-vs-cache-reuse.

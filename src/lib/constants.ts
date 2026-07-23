@@ -53,3 +53,13 @@ export const FADER_MIN_DB = -24;
  *  (the old +6 couldn't push a quiet stem). ONE constant for the faders (TrackList) — the gain math
  *  (dbToLinear) has no upper clamp, so this is purely the UI travel limit. */
 export const FADER_MAX_DB = 24;
+
+/** Byte size for display. SINGLE source — was a module-level const inside Settings.tsx until the
+ *  training page needed the same rendering for its checkpoint inventory (S76 batch 2). Rounds
+ *  coarsely on purpose: these are storage figures the user compares, not measurements. */
+export const fmtSize = (b: number) =>
+  b >= 1e9
+    ? `${(b / 1e9).toFixed(1)} GB`
+    : b >= 1e6
+      ? `${(b / 1e6).toFixed(1)} MB`
+      : `${Math.max(0, Math.round(b / 1e3))} KB`;

@@ -392,6 +392,18 @@
     "retrain": "Retrain",
     "needData": "Import training data first",
     "needName": "Enter a model name first",
+    "archiveTitle": "Archives in this slot ({{count}})",
+    "ckptLatest": "latest",
+    "ckptStep": "step {{step}}",
+    "ckptImported": "imported",
+    "ckptKind": {
+      "base": "base",
+      "resumable": "resumable",
+      "release": "snapshot",
+      "best": "best",
+      "orphan": "torn half",
+      "pending": "just saved"
+    },
     "probeFailed": "Could not read the training-workspace state for this model name ({{err}}) — training was NOT started, so existing progress cannot be wiped by mistake. Restart the app and try again",
     "dropHint": "Drop here to add as training data",
     "pausePreview": "Pause",

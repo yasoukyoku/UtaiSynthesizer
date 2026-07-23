@@ -23,6 +23,8 @@ import {
   type DatasetFile,
   type TrainingGpu,
   type WorkspaceInfo,
+  backendFamily,
+  mergeCkptSources,
 } from "../../store/training";
 import {
   useVoiceModelStore,
@@ -30,7 +32,7 @@ import {
   voiceVersionBadge,
   type VoiceModelEntry,
 } from "../../store/voice-models";
-import { AUDIO_EXT_RE, AUDIO_EXTENSIONS } from "../../lib/constants";
+import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
@@ -1533,6 +1535,10 @@ function RunStep() {
     try {
       await invoke("attach_diffusion", { name: attachTarget, ckptPath: ckpt.path });
       await useVoiceModelStore.getState().fetchModels();
+      // Attach IS the export path for shallow diffusion — its checkpoints never go through
+      // import_model. Without this the whole sovits_diff family reads as never-imported, and
+      // batch 3's「清理未导入的快照」would consider every one of them fair game.
+      await recordExport(attachTarget, ckpt.path);
       showToast(t("training.diffAttached", { name: attachTarget }), "success");
     } catch (e) {
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
@@ -1554,6 +1560,70 @@ function RunStep() {
   const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
   const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
   const [importingAll, setImportingAll] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const projectCkpts = useTrainingStore((s) => s.projectCkpts);
+  // Re-scan whenever the run's identity or state changes: a finished run just wrote new
+  // archives, and「清空结果」clears the in-memory candidates while the files stay on disk.
+  // Resolve from the MODEL NAME, never from the snapshot: an app restart or「清空结果」leaves
+  // the snapshot idle and its project_id empty — which is exactly when this inventory is the
+  // only way left to reach the files on disk.
+  useEffect(() => {
+    void useTrainingStore
+      .getState()
+      .refreshProjectCkpts(config.modelName, config.backend);
+  }, [config.modelName, config.backend, snapshot.state, snapshot.ckpts.length]);
+  // The scan is the truth, but it is only as fresh as its last run — a ckpt the sidecar just
+  // announced would blink out of the list for the moment between the event and the re-scan
+  // above, which reads exactly like a checkpoint that failed to save.
+  const archiveRows = mergeCkptSources(
+    snapshot.ckpts,
+    projectCkpts,
+    backendFamily(config.backend),
+  );
+
+  /** The project's on-disk inventory — rendered in EVERY run state, deliberately.
+   *
+   *  It first lived inside the finished-run summary card, which meant it was invisible after
+   *  an app restart or「清空结果」— precisely the two situations it exists for (the sidecar's
+   *  in-memory candidate list is empty then while the files are still on disk). Its identity
+   *  comes from the model name, not from the run snapshot, for the same reason. */
+  const archiveBlock = archiveRows.length > 0 && (
+      <div className="training-archive">
+        <button
+          className="training-archive-toggle"
+          onClick={() => setArchiveOpen((v) => !v)}
+        >
+          {archiveOpen ? "▾" : "▸"} {t("training.archiveTitle", { count: archiveRows.length })}
+        </button>
+        {archiveOpen && (
+          <div className="training-archive-list">
+            {archiveRows.map((r) => (
+              <div className="training-archive-row" key={r.rel}>
+                <span className="training-archive-name" title={r.path}>{r.rel}</span>
+                <span className="training-archive-tag">{t(`training.ckptKind.${r.kind}`)}</span>
+                <span className="training-archive-step">
+                  {r.step != null
+                    ? t("training.ckptStep", { step: r.step })
+                    : // A missing step means two different things and only ONE of them is
+                      // "最新": RVC's「只保留最新」writes the sentinel name G_2333333.pth,
+                      // whereas `<slug>.pth` / `<slug>_best.pth` simply carry no step in
+                      // their name. Labelling the latter「最新」would be a plain lie — and
+                      // on _best actively misleading, since best ≠ newest.
+                      r.kind === "resumable"
+                      ? t("training.ckptLatest")
+                      : "—"}
+                </span>
+                <span className="training-archive-size">{fmtSize(r.bytes)}</span>
+                {r.imported && (
+                  <span className="training-archive-tag imported">{t("training.ckptImported")}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+
   // ①c: audition a chosen speaker of a multi-speaker rvc/sovits run. Names come from the RUN's
   // frozen speaker list (snapshot.speakers, index = emb_g id = the converter's speaker-map id) —
   // NOT the editable DataStep state, so it survives a DataStep edit and reflects what was trained.
@@ -2275,6 +2345,24 @@ function RunStep() {
     return indexPath;
   };
 
+  /** Note an export in the project ledger — the protection set behind「清理未导入的快照」.
+   *  Never fatal: a model that imported fine must not report failure because the bookkeeping
+   *  did (the cleanup is conservative when the ledger is thin, never destructive). */
+  const recordExport = async (name: string, fromCkpt: string) => {
+    if (!snapshot.project_id) return;
+    try {
+      await invoke("record_project_export", {
+        projectId: snapshot.project_id,
+        name,
+        modelType: snapshot.backend,
+        fromCkpt,
+      });
+      await useTrainingStore.getState().refreshProjectCkpts(config.modelName, config.backend);
+    } catch (e) {
+      console.error("record_project_export failed", e);
+    }
+  };
+
   const importCkpt = async (ckpt: CkptInfo) => {
     const name = await showConfirm({
       title: t("training.import"),
@@ -2298,6 +2386,7 @@ function RunStep() {
         indexPath,
       });
       await useVoiceModelStore.getState().fetchModels();
+      await recordExport(name, ckpt.path);
       showToast(t("training.imported", { name }), "success");
     } catch (e) {
       // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
@@ -2374,6 +2463,10 @@ function RunStep() {
             indexPath,
           });
           ok += 1;
+          // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
+          // been swapped to the audition-converted onnx above. Recording the onnx would leave
+          // the real snapshot looking un-imported, and batch 3's cleanup would delete it.
+          await recordExport(names.get(c.path) ?? "", c.path);
           for (const w of outcome?.warnings ?? []) {
             warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
           }
@@ -2437,6 +2530,7 @@ function RunStep() {
         >
           {t("training.start")}
         </button>
+        {archiveBlock}
       </div>
     );
   }
@@ -2708,6 +2802,8 @@ function RunStep() {
           )}
         </div>
       )}
+
+      {archiveBlock}
 
       {/* error */}
       {snapshot.state === "error" && (

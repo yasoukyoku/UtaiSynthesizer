@@ -5,6 +5,7 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { useTranslation } from "react-i18next";
+import { fmtSize } from "../../lib/constants";
 import { useAppStore } from "../../store/app";
 import { useMsstModelStore } from "../../store/msst-models";
 import { useProjectStore } from "../../store/project";
@@ -176,8 +177,6 @@ async function runSrcProbe(url: string): Promise<ProbeResult> {
 }
 
 const fmtGB = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
-/** Sub-MB friendly size (the report has KB-scale rows like logs/dictionaries). */
-const fmtSize = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(0, Math.round(b / 1e3))} KB`);
 
 /** Mirror of Rust `commands::assets::{AssetPackStatus, AssetPackProgress}` (S64). */
 interface AssetPackStatus {

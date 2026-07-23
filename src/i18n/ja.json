@@ -392,6 +392,18 @@
     "retrain": "やり直し",
     "needData": "先に学習データを取り込んでください",
     "needName": "先にモデル名を入力してください",
+    "archiveTitle": "このアーキテクチャのアーカイブ（{{count}}）",
+    "ckptLatest": "最新",
+    "ckptStep": "{{step}} ステップ",
+    "ckptImported": "取り込み済み",
+    "ckptKind": {
+      "base": "ベース",
+      "resumable": "続行可",
+      "release": "スナップショット",
+      "best": "ベスト",
+      "orphan": "不完全",
+      "pending": "保存直後"
+    },
     "probeFailed": "このモデル名のトレーニングワークスペース状態を取得できませんでした（{{err}}）。既存の進捗を誤って消さないため、トレーニングを開始しませんでした。アプリを再起動してからお試しください",
     "dropHint": "ここにドロップして学習データに追加",
     "pausePreview": "一時停止",
