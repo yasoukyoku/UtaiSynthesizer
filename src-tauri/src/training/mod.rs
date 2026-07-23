@@ -316,6 +316,18 @@ pub struct StartTrainingRequest {
     /// true = 重训 (wipe the workspace), false = 续训 (resume from latest ckpt)
     #[serde(default)]
     pub fresh: bool,
+    /// The user answered a destructive-wipe dialog with「重训」for THIS run. Fail-closed
+    /// (`#[serde(default)]` = false): a caller that forgets the field gets a loud refusal,
+    /// never a silent wipe.
+    ///
+    /// Why this exists: `fresh` alone could not tell「用户按了重训」from「前端探测挂了,于是
+    /// 默认当作全新」. onStart seeds `let fresh = true` and only narrows it inside the three
+    /// dialog branches, each gated on a probe whose failure is swallowed by `catch` — so a
+    /// broken/renamed probe command made every start a no-dialog `remove_dir_all` of a
+    /// workspace holding hours of training. The frontend now refuses to start on a probe
+    /// failure; this is the backstop that makes the same mistake impossible to reintroduce.
+    #[serde(default)]
+    pub wipe_confirmed: bool,
     /// S41 PSOLA data augmentation: pitch-shifted copies per slice (0-3, 0 =
     /// off). Applies to rvc / sovits / vocoder; sovits_diff IGNORES the
     /// request value and inherits the workspace manifest's (shared dataset_44k
@@ -502,6 +514,20 @@ pub fn has_dataset_pool(ws: &Path) -> bool {
         && std::fs::read_dir(ws.join("dataset"))
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
+}
+
+/// Does this workspace hold anything a wipe would destroy? = any family's checkpoints, any
+/// diffusion progress, or an imported dataset pool (which cost a multi-minute import). An
+/// empty leftover directory — try_start's `create_dir_all` runs before the run can fail —
+/// holds nothing and stays freely wipeable.
+///
+/// Single source for the fail-closed wipe-consent guard; keep it a superset of every artifact
+/// class the resume paths can read back (add a family ⇒ add its ckpt shape here).
+pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
+    has_main_progress(ws)
+        || max_vocoder_ckpt_step(ws).is_some()
+        || max_diffusion_step(ws).unwrap_or(0) > 0
+        || has_dataset_pool(ws)
 }
 
 pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
@@ -1205,6 +1231,22 @@ impl TrainingManager {
             }
         }
 
+        // fail-closed wipe consent: a 重训 that would destroy real work (checkpoints of any
+        // family, diffusion progress, or an imported dataset pool that cost the user a
+        // multi-minute import) may only proceed when the frontend states the user actually
+        // answered the destructive dialog. An empty leftover directory (a prior start that
+        // died after create_dir_all) holds nothing and stays freely wipeable.
+        if req.fresh && workspace.exists() && !req.wipe_confirmed {
+            if workspace_holds_work(&workspace) {
+                tracing::error!(
+                    "refusing unconfirmed wipe of {} — the caller sent fresh=true without \
+                     wipe_confirmed; a UI probe most likely failed silently",
+                    workspace.display()
+                );
+                return Err(UtaiError::Training("TRAINING_WIPE_NOT_CONFIRMED".into()));
+            }
+        }
+
         if req.fresh && workspace.exists() {
             if diff_partial_wipe {
                 // diffusion retrain inside a live main-model workspace: clear
@@ -1885,4 +1927,55 @@ fn run_worker(
         "TRAINING_PROCESS_CRASHED: exit code {:?}",
         code
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_ws(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("utai_ws_test_{}_{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The wipe-consent guard's judgement, artifact class by artifact class. Each `true` case is
+    /// hours of work an unconfirmed `fresh` start would have deleted; the `false` case is the
+    /// leftover directory try_start itself creates, which must stay freely wipeable (else a
+    /// crashed first run would lock the user out of ever retrying that model name).
+    #[test]
+    fn workspace_holds_work_covers_every_artifact_class() {
+        let empty = tmp_ws("empty");
+        assert!(!workspace_holds_work(&empty), "empty leftover dir holds nothing");
+
+        let main = tmp_ws("main");
+        std::fs::write(main.join("G_2333333.pth"), b"x").unwrap();
+        assert!(workspace_holds_work(&main), "rvc/sovits main checkpoint");
+
+        let voc = tmp_ws("voc");
+        std::fs::write(voc.join("model_ckpt_steps_4000.ckpt"), b"x").unwrap();
+        assert!(workspace_holds_work(&voc), "vocoder lightning checkpoint");
+
+        let diff = tmp_ws("diff");
+        std::fs::create_dir_all(diff.join("diffusion")).unwrap();
+        std::fs::write(diff.join("diffusion").join("model_5000.pt"), b"x").unwrap();
+        assert!(workspace_holds_work(&diff), "diffusion progress");
+
+        // model_0.pt = the seeded base only (step 0) — no user progress yet.
+        let base_only = tmp_ws("base");
+        std::fs::create_dir_all(base_only.join("diffusion")).unwrap();
+        std::fs::write(base_only.join("diffusion").join("model_0.pt"), b"x").unwrap();
+        assert!(!workspace_holds_work(&base_only), "seeded diffusion base is not progress");
+
+        // an imported dataset pool alone is worth protecting: re-importing costs minutes.
+        let pool = tmp_ws("pool");
+        std::fs::create_dir_all(pool.join("dataset")).unwrap();
+        std::fs::write(pool.join("dataset").join("000.wav"), b"x").unwrap();
+        std::fs::write(pool.join("dataset.fingerprint"), b"abc").unwrap();
+        assert!(workspace_holds_work(&pool), "imported dataset pool");
+
+        for d in [empty, main, voc, diff, base_only, pool] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }

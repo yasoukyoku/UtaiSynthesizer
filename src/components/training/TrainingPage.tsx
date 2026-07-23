@@ -1941,18 +1941,21 @@ function RunStep() {
       // reuse); the dialog fires whenever one exists so the user always gets
       // the 重训-only-diffusion escape hatch (a half-baked diff-first
       // workspace version-locks the manifest — retrain is the way out)
-      let info: WorkspaceInfo | null = null;
+      // A failed probe must NOT read as「没有工作区」: that would skip the foreign-family
+      // check and the resume/retrain dialog. Refuse loudly instead (see the main branch).
+      let info: WorkspaceInfo;
       try {
         info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
-      } catch {
-        info = null;
+      } catch (e) {
+        showToast(t("training.probeFailed", { err: String(e) }), "error");
+        return;
       }
-      if (info?.exists && info.family && info.family !== "sovits") {
+      if (info.exists && info.family && info.family !== "sovits") {
         showToast(t("training.diffWorkspaceForeign", { family: info.family }), "error");
         return;
       }
       let fresh = false;
-      if (info?.exists) {
+      if (info.exists) {
         const hasProgress = info.diff_steps > 0;
         // 重训 only spares the workspace when a main model lives in it — a
         // diff-only workspace gets fully wiped (that is what unlocks a version
@@ -1979,19 +1982,27 @@ function RunStep() {
         if (choice !== "resume" && choice !== "retrain") return;
         fresh = choice === "retrain";
       }
-      await start(fresh).catch(() => undefined);
+      // fresh here can only come from the「重训(仅扩散)」button above = an answered dialog
+      await start(fresh, fresh).catch(() => undefined);
       return;
     }
 
+    // ⚠ `fresh` seeds to true (= WIPE) and is only narrowed inside the dialog branches below,
+    // every one of which hangs off a probe. So a swallowed probe failure used to mean「没弹任何
+    // 对话框就把几小时的进度整目录删了」. Every probe below is therefore fail-closed: it either
+    // answers, or we refuse to start. `wipeConfirmed` carries「用户真的按了重训」to the backend,
+    // which refuses an unconfirmed wipe of a workspace that holds work.
     let fresh = true;
+    let wipeConfirmed = false;
     let modelExists = false;
     try {
       modelExists = await invoke<boolean>("check_model_exists", {
         name,
         modelType: config.backend,
       });
-    } catch {
-      modelExists = false;
+    } catch (e) {
+      showToast(t("training.probeFailed", { err: String(e) }), "error");
+      return;
     }
     let info: WorkspaceInfo | null = null;
     try {
@@ -2005,8 +2016,9 @@ function RunStep() {
       // 续训 the Rust manifest guard still backstops)
       try {
         wsExists = await invoke<boolean>("check_training_workspace", { name });
-      } catch {
-        /* keep false */
+      } catch (e) {
+        showToast(t("training.probeFailed", { err: String(e) }), "error");
+        return;
       }
     }
 
@@ -2089,6 +2101,7 @@ function RunStep() {
         });
         if (choice !== "retrain") return;
         fresh = true;
+        wipeConfirmed = true;
       } else {
         // everything matches → the classic resume/retrain choice
         const choice = await showConfirm({
@@ -2102,6 +2115,7 @@ function RunStep() {
         });
         if (choice !== "resume" && choice !== "retrain") return;
         fresh = choice === "retrain";
+        wipeConfirmed = fresh;
       }
     } else if (wsExists) {
       // info unreadable (manifest missing/corrupt): classic resume/retrain — the Rust guard is the
@@ -2117,6 +2131,7 @@ function RunStep() {
       });
       if (choice !== "resume" && choice !== "retrain") return;
       fresh = choice === "retrain";
+      wipeConfirmed = fresh;
     } else if (modelExists) {
       // installed model, NO workspace: there is nothing to resume —「续训」
       // would silently train from scratch; say what actually happens (and
@@ -2145,9 +2160,11 @@ function RunStep() {
         ],
       });
       if (choice !== "go") return;
+      // installed model but NO workspace: nothing on disk to wipe, so this stays unconfirmed
+      // (the backend guard is a no-op when the workspace holds nothing).
       fresh = true;
     }
-    await start(fresh).catch(() => undefined);
+    await start(fresh, wipeConfirmed).catch(() => undefined);
   };
 
   const onStop = async () => {

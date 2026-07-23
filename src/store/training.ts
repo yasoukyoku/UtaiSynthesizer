@@ -384,7 +384,9 @@ interface TrainingStoreState {
    *  never leaves already-imported files stranded/invisible. */
   migrateOnBackendSwitch: (prev: string, next: string) => void;
   refresh: () => Promise<void>;
-  start: (fresh: boolean) => Promise<void>;
+  /** `wipeConfirmed` = the user answered a destructive「重训」dialog for THIS run. The backend
+   *  refuses a `fresh` start that would destroy checkpoints / an imported dataset without it. */
+  start: (fresh: boolean, wipeConfirmed: boolean) => Promise<void>;
   stop: () => Promise<void>;
   forceStop: () => Promise<void>;
   /** Clear the finished run's display state (snapshot + curve) back to idle.
@@ -520,7 +522,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     }
   },
 
-  start: async (fresh) => {
+  start: async (fresh, wipeConfirmed) => {
     // S64 release gating (the S43 decision): no REAL training interpreter (dev venv / runtime pack /
     // manual slot) → the spawn is doomed on an end-user machine; offer the runtime download instead.
     // Dev machines always resolve training/.venv, so this only ever fires on packaged installs.
@@ -638,6 +640,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         force_cpu: config.forceCpu,
         spk_id: 0,
         fresh,
+        wipe_confirmed: wipeConfirmed,
       };
       const request =
         config.backend === "rvc"

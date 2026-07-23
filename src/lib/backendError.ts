@@ -342,6 +342,10 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_THREAD_SPAWN_FAILED: { key: "backend.TRAINING_THREAD_SPAWN_FAILED" },
   TRAINING_TOTAL_STEPS_ZERO: { key: "backend.TRAINING_TOTAL_STEPS_ZERO" },
   TRAINING_UNKNOWN_ERROR: { key: "backend.TRAINING_UNKNOWN_ERROR" },
+  // fail-closed wipe consent (training/mod.rs): fresh=true without wipe_confirmed on a
+  // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
+  // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.
+  TRAINING_WIPE_NOT_CONFIRMED: { key: "backend.TRAINING_WIPE_NOT_CONFIRMED", modal: true },
   UPDATE_CHECK_FAILED: { key: "backend.UPDATE_CHECK_FAILED" },
   UPDATE_DOWNLOAD_FAILED: { key: "backend.UPDATE_DOWNLOAD_FAILED" },
   UPDATE_INSTALL_FAILED: { key: "backend.UPDATE_INSTALL_FAILED" },
