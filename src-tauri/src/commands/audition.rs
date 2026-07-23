@@ -241,6 +241,38 @@ fn audition_dir(workspace: &str, stem: &str) -> PathBuf {
     Path::new(workspace).join("audition").join(stem)
 }
 
+/// Fail-closed containment check for the `workspace` string every audition command takes from
+/// the frontend. It has always been passed through verbatim (it comes from the training
+/// snapshot, which the backend itself produced), but S76 turns it into a two-segment
+/// `<project>/<family>` path derived on the UI side — and a derivation bug would have this
+/// code rendering and deleting files anywhere on disk. `delete_training_workspace` has
+/// refused anything path-like since S61 for exactly this reason; the audition family had no
+/// equivalent.
+fn check_in_training_root(workspace: &str, state: &AppState) -> Result<(), String> {
+    // data root = parent of the models dir (same derivation as commands::training)
+    let data_dir = state
+        .models
+        .models_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| state.app_dir.join("data"));
+    let root = crate::training::tproject::training_root(&data_dir);
+    let ws = Path::new(workspace);
+    // Compare BOTH sides in the same form. Canonicalizing only the side that exists would put
+    // a Windows `\?\` verbatim prefix on one and not the other, and `starts_with` would then
+    // be false for every perfectly legitimate path — turning a missing workspace into a bogus
+    // "escaped the root" refusal.
+    let inside = match (std::fs::canonicalize(ws), std::fs::canonicalize(&root)) {
+        (Ok(w), Ok(r)) => w.starts_with(&r),
+        _ => ws.starts_with(&root),
+    };
+    if inside {
+        Ok(())
+    } else {
+        Err("AUDITION_WORKSPACE_OUTSIDE_ROOT".into())
+    }
+}
+
 fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
     Path::new(ckpt_path)
         .file_stem()
@@ -409,6 +441,7 @@ pub async fn render_audition_voice(
     ensure_trainable_idle(&app)?;
     ensure_no_voice_render()?;
     let stem = ckpt_stem(&ckpt_path)?;
+    check_in_training_root(&workspace, &app)?;
     let dir = audition_dir(&workspace, &stem);
     // ①c: cache the rendered clip PER speaker (the onnx is shared across speakers — only the fed
     // speaker differs). A single-speaker candidate (speaker_id None) keeps "audition.wav" =
@@ -615,6 +648,7 @@ pub async fn render_audition_vocoder(
         Some(p) => ckpt_stem(p)?,
         None => "_default".to_string(),
     };
+    check_in_training_root(&workspace, &app)?;
     let dir = audition_dir(&workspace, &stem);
     let out = dir.join("audition.wav");
     if out.is_file() {
@@ -778,6 +812,7 @@ pub async fn render_audition_diffusion(
     ensure_trainable_idle(&app)?;
     ensure_no_voice_render()?;
     let stem = ckpt_stem(&ckpt_path)?;
+    check_in_training_root(&workspace, &app)?;
     let dir = audition_dir(&workspace, &stem);
     // cache is host-specific: switching the host must re-render
     let out = dir.join(format!(
@@ -1181,6 +1216,7 @@ pub async fn render_candidate_scale(
         return Err("RANGE_EMPTY_SCORE".to_string());
     }
     let stem = ckpt_stem(&ckpt_path)?;
+    check_in_training_root(&workspace, &app)?;
     let dir = audition_dir(&workspace, &stem);
 
     let apph = app_handle.clone();
@@ -1331,6 +1367,7 @@ pub async fn render_candidate_scale(
 /// corrupt sidecar must abort, never be rewritten from empty — the set_config_extra_key rule).
 #[tauri::command]
 pub async fn set_candidate_vocal_range(
+    state: State<'_, Arc<AppState>>,
     workspace: String,
     ckpt_path: String,
     record: serde_json::Value,
@@ -1340,6 +1377,7 @@ pub async fn set_candidate_vocal_range(
     }
     crate::inference::vocal_range::validate_range_record(&record)?;
     let stem = ckpt_stem(&ckpt_path)?;
+    check_in_training_root(&workspace, state.inner())?;
     let json_path = audition_dir(&workspace, &stem).join("model.json");
     let text = std::fs::read_to_string(&json_path)
         .map_err(|e| format!("RANGE_CANDIDATE_MISSING: {e}"))?;
@@ -1365,10 +1403,12 @@ pub async fn set_candidate_vocal_range(
 /// candidate on every page mount, and the row label restores from disk).
 #[tauri::command]
 pub async fn get_candidate_vocal_range(
+    state: State<'_, Arc<AppState>>,
     workspace: String,
     ckpt_path: String,
 ) -> Result<Option<serde_json::Value>, String> {
     let stem = ckpt_stem(&ckpt_path)?;
+    check_in_training_root(&workspace, state.inner())?;
     let json_path = audition_dir(&workspace, &stem).join("model.json");
     let Ok(text) = std::fs::read_to_string(&json_path) else {
         return Ok(None);

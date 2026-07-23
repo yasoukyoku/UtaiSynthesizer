@@ -56,14 +56,21 @@ fn norm_key(p: &Path) -> String {
 
 #[derive(serde::Serialize)]
 pub struct WorkspaceUsage {
+    /// Project id = the directory name under `<data>/training`.
     pub slug: String,
-    /// Original model name (from run.json) — the slug is ASCII-lossy for CJK names.
+    /// Display name from project.json — the id is ASCII-lossy for CJK names.
     pub name: String,
-    /// Training family from run_manifest.json ("rvc"/"sovits"/"vocoder"); "" when unreadable.
+    /// Which architecture slots this project actually holds, joined with `+`
+    /// ("rvc" / "sovits+vocoder" / ""). One project can now hold several.
     pub family: String,
     pub bytes: u64,
-    /// A reusable shared dataset pool exists (the diff 免导入直训 mode reads this workspace).
+    /// A reusable shared dataset pool exists (every slot of this project trains off it).
     pub has_pool: bool,
+    /// Set when the layout migration could not classify this directory — nothing was moved
+    /// and nothing was deleted, but the user has to decide what it is. Never hide such a
+    /// project: "盘上还在、app 里没了" is the one outcome this refactor must not produce.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_attention: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -130,29 +137,53 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                 if !p.is_dir() {
                     continue;
                 }
-                let slug = entry.file_name().to_string_lossy().to_string();
-                // `.del_*` = a torn workspace delete (rename-then-remove, see below) — invisible to
-                // workspace_path, finish removing it here instead of listing it.
-                if slug.starts_with('.') {
-                    let _ = std::fs::remove_dir_all(&p);
+                let id = entry.file_name().to_string_lossy().to_string();
+                // `.del_*` = a torn delete (rename-then-remove, see below) — invisible to the
+                // layout, finish removing it here instead of listing it. The prefix is checked
+                // EXACTLY: the migration stages a legacy tree under `.mig_<id>` in this very
+                // directory, and the old「任何点开头目录」判据 would have eaten it mid-migration.
+                if id.starts_with(".del_") {
+                    let _ = crate::util::remove_dir_all_robust(&p);
+                    continue;
+                }
+                if id.starts_with('.') {
+                    // `.mig_<id>` = a torn layout migration's staging tree. It is REAL user
+                    // data (the whole legacy workspace lives in it until the next boot folds
+                    // it back or forward), so it must not vanish from the totals — but it has
+                    // no project row of its own to sit on.
+                    training_bytes += dir_size(&p);
                     continue;
                 }
                 let bytes = dir_size(&p);
                 training_bytes += bytes;
+                // S76: one row per PROJECT. Display name comes from project.json (the only
+                // place it survives a workspace whose run.json was never written), families
+                // are whichever slots exist, and the reusable pool is the project's dataset.
+                let meta = crate::training::tproject::read_meta(&root, &id);
+                let name = meta
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                let mut fams: Vec<String> = Vec::new();
+                for f in crate::training::tproject::FAMILIES {
+                    let fd = p.join(f);
+                    if fd.is_dir() {
+                        ws_audition += dir_size(&fd.join("audition"));
+                        fams.push(f.to_string());
+                    }
+                }
+                // pre-S76 shape (not folded yet — flagged, or migration postponed)
                 ws_audition += dir_size(&p.join("audition"));
-                // Original name from run.json (the manifest stores no name; the slug is lossy).
-                let name = std::fs::read_to_string(p.join("run.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v.get("model_name").and_then(|n| n.as_str()).map(String::from))
-                    .unwrap_or_else(|| slug.clone());
-                let family = std::fs::read_to_string(p.join("run_manifest.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(String::from))
-                    .unwrap_or_default();
-                let has_pool = crate::training::has_dataset_pool(&p);
-                workspaces.push(WorkspaceUsage { slug, name, family, bytes, has_pool });
+                let has_pool = crate::training::tproject::has_dataset(&root, &id);
+                workspaces.push(WorkspaceUsage {
+                    slug: id,
+                    name,
+                    family: fams.join("+"),
+                    bytes,
+                    has_pool,
+                    needs_attention: meta.as_ref().and_then(|m| m.needs_attention.clone()),
+                });
             }
         }
         workspaces.sort_by(|a, b| b.bytes.cmp(&a.bytes));
@@ -294,6 +325,15 @@ pub async fn delete_training_workspace(
     // dir (workspace_path never resolves to it) that get_storage_report finishes off later.
     let tomb = ws.with_file_name(format!(".del_{slug}_{}", std::process::id()));
     std::fs::rename(&ws, &tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))?;
+    // A torn layout migration parks the rest of this project under `.mig_<id>` with a marker
+    // file beside it. Leaving them behind would make「删除」a no-op the next boot undoes: the
+    // migration would fold the staging tree back into the id we just deleted.
+    let root = ws.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let staging = root.join(format!(".mig_{slug}"));
+    if staging.is_dir() {
+        let _ = crate::util::remove_dir_all_robust(&staging);
+    }
+    let _ = std::fs::remove_file(root.join(format!(".migrating_{slug}.json")));
     tauri::async_runtime::spawn_blocking(move || {
         std::fs::remove_dir_all(&tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))
     })
@@ -320,11 +360,20 @@ pub async fn cleanup_audition_caches(state: State<'_, Arc<AppState>>) -> Result<
         let mut freed = 0u64;
         if let Ok(rd) = std::fs::read_dir(root.join("training")) {
             for entry in rd.flatten() {
-                let aud = entry.path().join("audition");
-                if aud.is_dir() {
-                    let len = dir_size(&aud);
-                    if std::fs::remove_dir_all(&aud).is_ok() {
-                        freed += len;
+                // S76: audition caches sit one level deeper — `<project>/<family>/audition`.
+                // Missing this would have made「清理试听缓存」silently free zero bytes forever.
+                // family slots, plus the pre-S76 shape for anything migration has not folded
+                // yet (a flagged or postponed directory still holds its audition cache).
+                for rel in crate::training::tproject::FAMILIES
+                    .iter()
+                    .map(|f| entry.path().join(f).join("audition"))
+                    .chain(std::iter::once(entry.path().join("audition")))
+                {
+                    if rel.is_dir() {
+                        let len = dir_size(&rel);
+                        if crate::util::remove_dir_all_robust(&rel).is_ok() {
+                            freed += len;
+                        }
                     }
                 }
             }

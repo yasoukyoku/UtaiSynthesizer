@@ -681,55 +681,6 @@ fn long_path(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Rename with exponential-backoff retry on ACCESS_DENIED(5) / SHARING_VIOLATION(32).
-/// Used for SINGLE-FILE renames (the pack.json commit marker) where a hold, if any,
-/// is on that one fresh file and clears fast. NOT a fix for renaming big freshly-
-/// extracted DIRECTORY trees — Defender's async inspection of thousands of new PE
-/// files holds handles below such trees continuously for minutes, far beyond any
-/// sane retry window (live-failed S42 even with 10 s of backoff; that's why the
-/// install commit protocol is a marker FILE, not a directory rename — see
-/// extract_and_commit).
-/// `remove_dir_all` with one assisted retry: strip READONLY attributes throughout
-/// (files planted by user tooling/backup restores may carry them; a read-only file
-/// fails both the in-tree delete and tar's overwrite path — `remove_file` before
-/// re-create — with os error 5), pause briefly for transient handle races (AV
-/// inspection), then try once more. Call sites stay best-effort — see the torn-dir
-/// comment in extract_and_commit.
-fn remove_dir_all_robust(dir: &Path) -> std::io::Result<()> {
-    fn clear_readonly(dir: &Path) {
-        // The ROOT dir's own attribute matters too (review S68d): std deletes children
-        // first and the root last, so a readonly root alone defeats both attempts.
-        if let Ok(md) = std::fs::metadata(dir) {
-            let mut perm = md.permissions();
-            if perm.readonly() {
-                perm.set_readonly(false);
-                let _ = std::fs::set_permissions(dir, perm);
-            }
-        }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            if let Ok(md) = e.metadata() {
-                let mut perm = md.permissions();
-                if perm.readonly() {
-                    perm.set_readonly(false);
-                    let _ = std::fs::set_permissions(&e.path(), perm);
-                }
-                if md.is_dir() {
-                    clear_readonly(&e.path());
-                }
-            }
-        }
-    }
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            clear_readonly(dir);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            std::fs::remove_dir_all(dir)
-        }
-    }
-}
-
 /// Best-effort recursive byte count (metadata only) — credits a torn install tree
 /// that the extract is about to clear in the disk-space preflight.
 fn dir_size(dir: &Path) -> u64 {
@@ -746,40 +697,6 @@ fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
-}
-
-fn rename_with_retry(from: &Path, to: &Path, what: &str) -> Result<()> {
-    let mut delay_ms = 250u64;
-    let mut last: Option<std::io::Error> = None;
-    for attempt in 0..8 {
-        match std::fs::rename(from, to) {
-            Ok(()) => {
-                if attempt > 0 {
-                    // `what` is a short English phase token (PACK_MOVE_OUT / INSTALL_COMMIT /
-                    // PACK_ROLLBACK / INSTALL_RECOVERY) carried as the CODE's detail payload;
-                    // the paths carry the context here.
-                    tracing::info!("rename succeeded on retry {attempt}: {} -> {}", from.display(), to.display());
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                let retriable = matches!(e.raw_os_error(), Some(5) | Some(32));
-                if !retriable {
-                    return Err(err(format!("RENAME_FAILED: {what} ({} -> {}): {e}", from.display(), to.display())));
-                }
-                tracing::warn!("rename denied (attempt {attempt}) {} -> {}: {e} — retrying in {delay_ms}ms", from.display(), to.display());
-                last = Some(e);
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                delay_ms = (delay_ms * 2).min(2000);
-            }
-        }
-    }
-    Err(err(format!(
-        "RENAME_RETRY_EXHAUSTED: {what} ({} -> {}): {}",
-        from.display(),
-        to.display(),
-        last.map(|e| e.to_string()).unwrap_or_default()
-    )))
 }
 
 /// Extract a (possibly multi-part) `.tar.zst` pack archive DIRECTLY into its final
@@ -896,7 +813,7 @@ pub fn extract_and_commit(
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         ));
-        rename_with_retry(&final_dir, &moved, "PACK_MOVE_OUT")?;
+        crate::util::rename_with_retry(&final_dir, &moved, "PACK_MOVE_OUT").map_err(err)?;
         old_backup = Some(moved);
     } else if final_dir.exists() {
         // Torn earlier attempt. Prefer a clean slate; extracting over identical
@@ -906,7 +823,7 @@ pub fn extract_and_commit(
         // working) — so the fallback stays, but the failure is REMEMBERED: if the
         // extract-over then fails too, both causes surface in one message instead of
         // an unexplainable unpack error (S68d).
-        if let Err(e) = remove_dir_all_robust(&final_dir) {
+        if let Err(e) = crate::util::remove_dir_all_robust(&final_dir) {
             preclean_err = Some(e.to_string());
             tracing::warn!("torn install dir not fully cleared ({e}) — extracting over it");
         }
@@ -947,7 +864,7 @@ pub fn extract_and_commit(
         let tmp = final_dir.join("pack.json.tmp");
         std::fs::write(&tmp, meta_text.as_bytes())
             .map_err(|e| err(format!("INSTALL_COMMIT_WRITE_FAILED: {}: {e}", tmp.display())))?;
-        rename_with_retry(&tmp, &marker, "INSTALL_COMMIT")?;
+        crate::util::rename_with_retry(&tmp, &marker, "INSTALL_COMMIT").map_err(err)?;
         Ok(meta)
     })();
 
@@ -968,7 +885,7 @@ pub fn extract_and_commit(
             // Reinstall case: roll the previous pack back IN-SESSION — waiting for
             // the next startup's sweep would leave the user packless until restart.
             if let Some(old) = &old_backup {
-                match rename_with_retry(old, &final_dir, "PACK_ROLLBACK") {
+                match crate::util::rename_with_retry(old, &final_dir, "PACK_ROLLBACK") {
                     Ok(()) => tracing::warn!("reinstall failed — previous pack rolled back"),
                     Err(e) => tracing::error!("old-pack rollback failed ({e}) — startup sweep will restore it"),
                 }
@@ -1114,7 +1031,7 @@ pub fn sweep_staging() {
                 if let Some((id, _ts)) = rest.rsplit_once('-') {
                     let final_dir = root.join(id);
                     if !final_dir.exists() && path.join("pack.json").exists() {
-                        match rename_with_retry(&path, &final_dir, "INSTALL_RECOVERY") {
+                        match crate::util::rename_with_retry(&path, &final_dir, "INSTALL_RECOVERY") {
                             Ok(()) => {
                                 tracing::warn!("recovered pack {id} from interrupted reinstall");
                             }

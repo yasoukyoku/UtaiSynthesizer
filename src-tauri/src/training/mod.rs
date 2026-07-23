@@ -22,6 +22,8 @@ use tauri::Emitter;
 
 use crate::{Result, UtaiError};
 
+pub mod tproject;
+
 const STDERR_RING_CAP: usize = 200;
 const HISTORY_CAP: usize = 40_000;
 const SEED: u32 = 1234;
@@ -425,6 +427,14 @@ pub struct TrainingSnapshot {
     pub backend: String,
     pub model_name: String,
     pub model_slug: String,
+    /// S76: which training PROJECT this run belongs to. Filled at start; empty while idle.
+    /// Batch 2's export ledger and batch 4's explicit routing both key on it, so it is
+    /// carried from the very first batch rather than bolted on later.
+    #[serde(default)]
+    pub project_id: String,
+    /// The FAMILY SLOT directory of this run (`<data>/training/<project>/<family>`) — the
+    /// exact equivalent of the pre-S76 workspace root, which is why every consumer that
+    /// joins `audition/` or reads `weights/` off it keeps working unchanged.
     pub workspace: String,
     pub total_epochs: u32,
     pub stage: Option<StageInfo>,
@@ -461,10 +471,18 @@ pub struct TrainingManager {
     inner: Arc<Inner>,
 }
 
-/// Workspace directory for a model name (the frontend's "does a resumable
-/// workspace exist?" check needs the same mapping start() uses).
-pub fn workspace_path(data_dir: &Path, model_name: &str) -> PathBuf {
-    data_dir.join("training").join(slugify(model_name))
+/// The family SLOT directory for a (model name, backend) pair — the frontend's "does a
+/// resumable workspace exist?" probes need the same mapping `try_start` uses.
+///
+/// S76: identity moved from「模型名 → 目录」to「模型名 → 项目 → 架构槽」, so the backend is
+/// now part of the question. When no project exists yet the returned path is deliberately one
+/// that cannot exist, so every `.exists()` probe answers false instead of erroring.
+pub fn slot_path(data_dir: &Path, model_name: &str, backend: &str) -> PathBuf {
+    let family = backend_family(backend);
+    match tproject::find_by_name(data_dir, model_name) {
+        Some(p) => tproject::family_dir(data_dir, &p.id, family),
+        None => tproject::family_dir(data_dir, &slugify(model_name), family),
+    }
 }
 
 /// Structured workspace facts for the frontend confirm dialogs: the main
@@ -504,12 +522,12 @@ pub struct WorkspaceInfo {
     pub diff_k_step_max: u64,
 }
 
-/// A reusable shared slice pool: raw dataset files from a prior import plus
-/// the fingerprint marker (written when a run ENTERS preprocessing — partial
-/// caches are fine, the diff pipeline re-runs the shared preprocess chain and
-/// fills whatever is missing; what matters is that dataset/ holds a real
-/// prior import, not that it finished).
-pub fn has_dataset_pool(ws: &Path) -> bool {
+/// LEGACY-SHAPE predicate: a pre-S76 workspace where `dataset/` and `dataset.fingerprint`
+/// were siblings of the checkpoints. Still meaningful for exactly two callers — the
+/// wipe-consent guard and the migration's empty-shell test, both of which look at directories
+/// that may still have the old shape. The live "is there a reusable pool?" question is now
+/// [`tproject::has_dataset`], asked of the PROJECT.
+pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
     ws.join("dataset.fingerprint").is_file()
         && std::fs::read_dir(ws.join("dataset"))
             .map(|mut d| d.next().is_some())
@@ -527,11 +545,25 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
     has_main_progress(ws)
         || max_vocoder_ckpt_step(ws).is_some()
         || max_diffusion_step(ws).unwrap_or(0) > 0
+        // Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR
+        // part of a training run, and a slot that has it but no checkpoint yet is the normal
+        // state of「刚开始练」. `dataset.fingerprint` is the one artifact every family writes
+        // (python does it on ENTERING preprocessing — `utai_train/cache.py`), which makes it
+        // the single portable judge. Without this the wipe-consent guard would let a
+        // half-trained slot be erased with no dialog, and the shared-dataset guard would not
+        // recognise a sibling slot as "using this data".
+        || ws.join("dataset.fingerprint").is_file()
+        // pre-S76 shape only (dataset/ used to be a sibling of the checkpoints); still true
+        // for a directory the migration has not folded yet.
         || has_dataset_pool(ws)
 }
 
-pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
-    let ws = workspace_path(data_dir, name);
+pub fn workspace_info(data_dir: &Path, name: &str, backend: &str) -> WorkspaceInfo {
+    let project = tproject::find_by_name(data_dir, name);
+    let ws = match &project {
+        Some(p) => tproject::family_dir(data_dir, &p.id, backend_family(backend)),
+        None => tproject::family_dir(data_dir, &slugify(name), backend_family(backend)),
+    };
     let manifest = std::fs::read_to_string(ws.join("run_manifest.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -571,7 +603,12 @@ pub fn workspace_info(data_dir: &Path, name: &str) -> WorkspaceInfo {
         has_main_progress: has_main_progress(&ws),
         diff_steps: max_diffusion_step(&ws).unwrap_or(0),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
-        has_dataset: has_dataset_pool(&ws),
+        // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
+        // sibling of this slot's checkpoints any more.
+        has_dataset: project
+            .as_ref()
+            .map(|p| tproject::has_dataset(data_dir, &p.id))
+            .unwrap_or(false),
         vol_embedding: manifest["vol_embedding"].as_bool(),
         n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
         speakers,
@@ -631,7 +668,7 @@ fn max_diffusion_step(workspace: &Path) -> Option<u64> {
 /// ASCII-safe workspace slug for a (possibly CJK) display name: the original
 /// RVC/SoVITS toolchains choke on non-ANSI experiment paths, so the workspace
 /// stays ASCII and the unicode name lives only in our registry / final artifacts.
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut base: String = name
         .chars()
@@ -989,24 +1026,35 @@ impl TrainingManager {
                 }
             }
         } else if req.dataset_files.is_empty() {
-            // 共享池模式（S41 用户裁定）：浅扩散与主训练共享 dataset/dataset_44k
-            // 切片池——宿主工作区已有完整导入时无须重新导入数据。其余后端一律
-            // 拒绝（这是防「空数据逃课」的权威闸门，前端禁用只是第一道线）。
-            let pool_ok = req.backend == "sovits_diff" && {
-                let ws = workspace_path(&data_dir, &req.model_name);
-                let family = std::fs::read_to_string(ws.join("run_manifest.json"))
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .map(|m| m["backend"].as_str().unwrap_or("").to_string())
-                    .unwrap_or_default();
-                family == "sovits" && has_dataset_pool(&ws)
-            };
+            // 复用项目数据集(S76 拓宽)。dataset/ 现在住在项目层、由全部架构槽共享,所以
+            // 「不带数据启动」的正当性判据从「浅扩散 + 宿主是 sovits」拓宽成「这个项目已经
+            // 有导入好的数据」——这正是工作区化最核心的那件事:一份数据喂多个架构。
+            // 防「空数据逃课」的权威闸门仍在:项目里一个音频都没有就一律拒绝(前端禁用只是
+            // 第一道线)。CODE 按后端分流保持不变,浅扩散那条对话框链的文案依赖它。
+            let existing = tproject::find_by_name(&data_dir, &req.model_name);
+            let pool_ok = existing
+                .as_ref()
+                .map(|p| tproject::has_dataset(&data_dir, &p.id))
+                .unwrap_or(false);
             if !pool_ok {
                 return Err(UtaiError::Training(if req.backend == "sovits_diff" {
                     "TRAINING_NO_SHARED_POOL".into()
                 } else {
                     "TRAINING_NO_DATA".to_string()
                 }));
+            }
+            // Reuse carries no speaker groups, so it can only consume a FLAT dataset. Handing
+            // a per-speaker (multi-singer) dataset to a run that believes it is single-speaker
+            // would either crash the slicer or — worse, if it silently skipped the
+            // subdirectories — fingerprint the empty set and freeze the caches forever.
+            // Refuse here; re-importing with the speaker groups is the way through until the
+            // data page learns to reuse a multi-speaker project (batch 5).
+            let ds = tproject::dataset_dir(&data_dir, &existing.as_ref().unwrap().id);
+            let has_subdirs = std::fs::read_dir(&ds)
+                .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
+                .unwrap_or(false);
+            if has_subdirs {
+                return Err(UtaiError::Training("PROJECT_DATASET_SHAPE".into()));
             }
         }
         for f in &req.dataset_files {
@@ -1051,10 +1099,57 @@ impl TrainingManager {
             ..
         } = assets;
 
+        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, the `config.spk` key. It has
+        // NOTHING to do with the directory layout any more (S76) and must keep deriving from
+        // the run's model name, or every existing checkpoint would change its file name and
+        // `best_state.json`'s carried-over metric would suppress the next best write.
         let slug = slugify(&req.model_name);
-        let workspace = data_dir.join("training").join(&slug);
-        let manifest_path = workspace.join("run_manifest.json");
+        // Directory identity. The wizard still asks for a model name (the project UI lands in
+        // a later batch), so the project is resolved BY NAME and created on first use — which
+        // reproduces the pre-S76 mapping exactly, including for a migrated workspace whose
+        // display name could not be recovered (find_by_name falls back to the legacy slug).
+        let project = tproject::resolve_or_create(&data_dir, &req.model_name)?;
         let family = backend_family(&req.backend).to_string();
+        let workspace = tproject::family_dir(&data_dir, &project.id, &family);
+        let manifest_path = workspace.join("run_manifest.json");
+
+        // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
+        // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
+        // slot, so their next「续训」would rmtree hours of preprocessing AND continue on data
+        // the user never meant to switch to — silently, since the fingerprint mismatch reads
+        // as a legitimate change. Refuse while any OTHER slot holds work; the run's own slot
+        // may still swap its data (that is the pre-S76 behaviour, unchanged).
+        // The placement matters: `training/mod.rs`'s own history says a refusal on a fully
+        // decidable condition must never cost a wiped slot plus a multi-minute import.
+        let dataset_dir = tproject::dataset_dir(&data_dir, &project.id);
+        let planned = dataset_plan(&req);
+        if !planned.is_empty() {
+            let replacing = !current_dataset_listing(&dataset_dir).is_empty()
+                && !dataset_matches(&dataset_dir, &planned);
+            if replacing {
+                if let Some(other) = tproject::FAMILIES.iter().find(|f| {
+                    **f != family
+                        && workspace_holds_work(&tproject::family_dir(&data_dir, &project.id, f))
+                }) {
+                    return Err(UtaiError::Training(format!(
+                        "PROJECT_DATASET_IN_USE: {}",
+                        other
+                    )));
+                }
+                // A source that lives INSIDE the dataset we are about to replace would be
+                // deleted by the swap and then fail to copy. Unreachable from today's UI
+                // (the data page only offers外部文件), which is exactly why it is worth
+                // nailing shut before batch 5 makes the project's own files selectable.
+                let inside = req
+                    .dataset_files
+                    .iter()
+                    .chain(req.speakers.iter().flat_map(|s| s.files.iter()))
+                    .any(|f| Path::new(f).starts_with(&dataset_dir));
+                if inside {
+                    return Err(UtaiError::Training("TRAINING_DATASET_SELF_SOURCE".into()));
+                }
+            }
+        }
 
         // READ the manifest BEFORE any deletion: the family guard must hold on
         // the fresh path too — a diffusion「重训」must never partial-wipe a
@@ -1259,9 +1354,15 @@ impl TrainingManager {
                     })?;
                 }
             } else {
-                // main retrain / diff-only workspace (a full wipe here is what
-                // unlocks a version change) / manifest-less anomaly
-                std::fs::remove_dir_all(&workspace)
+                // main retrain / diff-only slot (a full wipe here is what unlocks a version
+                // change) / manifest-less anomaly.
+                //
+                // S76: `workspace` is now the FAMILY slot, so the project's shared `dataset/`
+                // is outside it and survives structurally — a retrain clears this
+                // architecture's progress and keeps the data, exactly as 拍板 1 says. Robust
+                // removal because a READONLY attribute (backup/网盘 restores carry them) used
+                // to fail the whole start with WORKSPACE_WIPE_FAILED.
+                crate::util::remove_dir_all_robust(&workspace)
                     .map_err(|e| UtaiError::Training(format!("WORKSPACE_WIPE_FAILED: {}", e)))?;
                 old_manifest = None;
             }
@@ -1391,6 +1492,7 @@ impl TrainingManager {
                 backend: req.backend.clone(),
                 model_name: req.model_name.clone(),
                 model_slug: slug.clone(),
+                project_id: project.id.clone(),
                 workspace: workspace.to_string_lossy().into_owned(),
                 total_epochs: req.total_epoch,
                 // ①c: freeze the run's speaker names (id order) for the audition picker; empty
@@ -1424,6 +1526,7 @@ impl TrainingManager {
             python,
             device_backend,
             gpu_mask,
+            project_id: project.id.clone(),
         };
         let inner = Arc::clone(&self.inner);
         let app_dir = self.app_dir.clone();
@@ -1520,6 +1623,209 @@ struct RunCtx {
     /// "" when no device was chosen. Resolved from the picked entry's `value` — NOT from the
     /// request, whose `gpu` field carries the UI id.
     gpu_mask: String,
+    /// S76: the resolved project. The dataset lives at the PROJECT level now, so the worker
+    /// needs an identity the family slot path cannot give it. Decided in try_start (one
+    /// resolution per run) — never re-derived here.
+    project_id: String,
+}
+
+/// Content identity of one dataset file: byte size plus a digest of its first and last 64 KiB.
+///
+/// Deliberately the SAME shape as `utai_train/cache.py`'s `dataset_fingerprint` — the python
+/// side decides whether the extraction caches are still valid by exactly this measure, so
+/// judging by anything weaker here would let Rust say「没变」about a change python would (or
+/// would not) notice. Reading 128 KiB per file is nothing next to the copy it may skip.
+fn file_probe(path: &Path) -> (u64, String) {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (0, String::new());
+    };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut h = Sha256::new();
+    h.update(size.to_le_bytes());
+    let mut head = vec![0u8; 65536.min(size as usize)];
+    if f.read_exact(&mut head).is_ok() {
+        h.update(&head);
+    }
+    if size > 131072 {
+        let mut tail = vec![0u8; 65536];
+        if f.seek(SeekFrom::End(-65536)).is_ok() && f.read_exact(&mut tail).is_ok() {
+            h.update(&tail);
+        }
+    }
+    (size, format!("{:x}", h.finalize()))
+}
+
+/// One file of a dataset, keyed by where it lands and what it contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatasetItem {
+    /// Where it lands under `dataset/`: `{:03}.<lowercased ext>`, prefixed by the speaker slug
+    /// for a co-trained run.
+    rel: String,
+    size: u64,
+    digest: String,
+}
+
+/// Exactly what this request will import, in the order the import loops write it.
+fn dataset_plan(req: &StartTrainingRequest) -> Vec<DatasetItem> {
+    let ext_of = |p: &str| {
+        Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("wav")
+            .to_ascii_lowercase()
+    };
+    let mut out = Vec::new();
+    let mut push = |src: &str, rel: String| {
+        let (size, digest) = file_probe(Path::new(src));
+        out.push(DatasetItem { rel, size, digest });
+    };
+    if req.speakers.len() > 1 {
+        for (gi, (_name, slug)) in assign_speaker_slugs(&req.speakers).iter().enumerate() {
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                push(f, format!("{}/{:03}.{}", slug, i, ext_of(f)));
+            }
+        }
+    } else {
+        let mut files = req.dataset_files.clone();
+        files.sort();
+        for (i, f) in files.iter().enumerate() {
+            push(f, format!("{:03}.{}", i, ext_of(f)));
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// Is the project's shared `dataset/` ALREADY, byte for byte, what this plan would produce?
+///
+/// Judged by CONTENT, not by `(名字, 字节数)`: loudness normalisation and denoising rewrite a
+/// wav in place without changing its length, and the first version of this compared only name
+/// and size — so an edited dataset compared equal, the import was skipped, and python's
+/// fingerprint (reading those same untouched copies) matched too, reusing every stale feature
+/// cache. The run trained on the pre-edit audio and reported success.
+///
+/// Being exact here is what lets ONE judgement answer both questions safely:
+/// * false ⇒ this start really is replacing the project's shared dataset, so the sibling-slot
+///   guard must fire;
+/// * true ⇒ nothing to copy and nothing to protect.
+///
+/// It must therefore work with no bookkeeping of any kind — a migrated project carries no
+/// record of which sources produced its dataset, and a ledger-based judgement would have told
+/// every existing user that their data was "changing" and blocked the entire point of the
+/// refactor (一份数据喂多个架构) forever.
+fn dataset_matches(dataset_dir: &Path, plan: &[DatasetItem]) -> bool {
+    !plan.is_empty() && current_dataset_listing(dataset_dir) == plan
+}
+
+/// The same shape, read off disk (flat files plus one level of speaker subdirectories — the
+/// only two shapes the import ever writes).
+fn current_dataset_listing(dataset_dir: &Path) -> Vec<DatasetItem> {
+    let mut out = Vec::new();
+    let mut probe = |rel: String, p: &Path| {
+        let (size, digest) = file_probe(p);
+        out.push(DatasetItem { rel, size, digest });
+    };
+    let Ok(rd) = std::fs::read_dir(dataset_dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        match e.metadata() {
+            Ok(md) if md.is_file() => probe(name, &e.path()),
+            Ok(md) if md.is_dir() => {
+                if let Ok(sub) = std::fs::read_dir(e.path()) {
+                    for se in sub.flatten() {
+                        if se.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                            probe(
+                                format!("{}/{}", name, se.file_name().to_string_lossy()),
+                                &se.path(),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
+/// Replaces the project's shared dataset without ever losing it.
+///
+/// The old dataset is moved aside by a same-volume rename (atomic), the caller fills a fresh
+/// one, and `commit()` drops the aside copy. Anything else — an early `return` on 强制停止
+/// mid-import, a `?` on a failed copy, a panic — runs `Drop`, which puts the old dataset
+/// back. Without that, force-stopping during the import of a REPLACEMENT dataset would leave
+/// the project with an empty `dataset/` and an orphaned `.dataset.old_<pid>` that nothing
+/// reclaims (it is inside the project dir, so it would also be counted in the project's size
+/// forever). The pre-S76 code simply `remove_dir_all`'d first, which had no recovery at all.
+struct DatasetSwap {
+    dataset: PathBuf,
+    aside: Option<PathBuf>,
+    /// There was nothing to replace — this import is creating `dataset/` for the first time.
+    /// An abandoned FIRST import must leave no dataset at all, or the half-copied prefix would
+    /// pass `tproject::has_dataset` and a later run could quietly train on it.
+    created_fresh: bool,
+    committed: bool,
+}
+
+impl DatasetSwap {
+    /// No-op when there is nothing to replace (first import into a fresh project).
+    fn begin(dataset_dir: &Path) -> Result<Self> {
+        let mut swap = DatasetSwap {
+            dataset: dataset_dir.to_path_buf(),
+            aside: None,
+            created_fresh: !dataset_dir.exists(),
+            committed: false,
+        };
+        if !dataset_dir.exists() {
+            return Ok(swap);
+        }
+        let aside = dataset_dir.with_file_name(format!(".dataset.old_{}", std::process::id()));
+        let _ = crate::util::remove_dir_all_robust(&aside);
+        crate::util::rename_with_retry(dataset_dir, &aside, "TRAINING_DATASET_SWAP")
+            .map_err(UtaiError::Training)?;
+        swap.aside = Some(aside);
+        Ok(swap)
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DatasetSwap {
+    fn drop(&mut self) {
+        let Some(aside) = self.aside.take() else {
+            if !self.committed && self.created_fresh {
+                tracing::warn!(
+                    "first dataset import did not complete — removing the partial {}",
+                    self.dataset.display()
+                );
+                let _ = crate::util::remove_dir_all_robust(&self.dataset);
+            }
+            return;
+        };
+        if self.committed {
+            let _ = crate::util::remove_dir_all_robust(&aside);
+            return;
+        }
+        tracing::warn!(
+            "dataset import did not complete — restoring the previous dataset from {}",
+            aside.display()
+        );
+        let _ = crate::util::remove_dir_all_robust(&self.dataset);
+        if let Err(e) = crate::util::rename_with_retry(&aside, &self.dataset, "TRAINING_DATASET_RESTORE") {
+            // Loud: the data is still on disk under `.dataset.old_*`, but the project now
+            // looks empty and only a human can tell which is which.
+            tracing::error!("could not restore the previous dataset ({e}) — it is kept at {}", aside.display());
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1527,15 +1833,29 @@ fn run_worker(
     inner: &Arc<Inner>,
     app: &tauri::AppHandle,
     app_dir: &Path,
-    _data_dir: &Path,
+    data_dir: &Path,
     workspace: &Path,
     stop_file: &Path,
     req: &StartTrainingRequest,
     ctx: &RunCtx,
     slug: &str,
 ) -> Result<()> {
-    // ---- stage: import the dataset into the ASCII workspace ----
-    let dataset_dir = workspace.join("dataset");
+    // ---- stage: import the dataset into the PROJECT (shared by every family slot) ----
+    let dataset_dir = tproject::dataset_dir(data_dir, &ctx.project_id);
+    // The import used to be `remove_dir_all(dataset) + copy everything`, which was safe only
+    // while a dataset belonged to exactly one workspace. It is now the project's shared layer,
+    // so that shape would mean「训 RVC 顺手删掉 SoVITS 赖以续训的数据」 — and worse, once the
+    // data page can list the project's own files as sources, it would delete its own copy
+    // sources and then fail the copy. So: predict the exact resulting listing, and if the
+    // dataset on disk already IS that listing, touch nothing at all.
+    let plan = dataset_plan(req);
+    let dataset_unchanged = dataset_matches(&dataset_dir, &plan);
+    if dataset_unchanged {
+        tracing::info!(
+            "dataset import skipped: {} already holds exactly this selection",
+            dataset_dir.display()
+        );
+    }
     // ①c: >1 speaker group = per-speaker subdir import; else the pre-①c flat
     // (or shared-pool) path, verbatim. run_speakers is filled only for multi
     // and becomes run.json "speakers" so the sovits/rvc pipeline co-trains them.
@@ -1548,9 +1868,11 @@ fn run_worker(
         // loader derives the emb_g id from the dir name, so these slugs MUST
         // match the manifest — assign_speaker_slugs is deterministic on the
         // same request.
-        if dataset_dir.exists() {
-            std::fs::remove_dir_all(&dataset_dir)?;
-        }
+        let mut swap = if dataset_unchanged {
+            None
+        } else {
+            Some(DatasetSwap::begin(&dataset_dir)?)
+        };
         std::fs::create_dir_all(&dataset_dir)?;
         let assigned = assign_speaker_slugs(&req.speakers);
         let total: usize = req.speakers.iter().map(|s| s.files.len()).sum();
@@ -1571,13 +1893,17 @@ fn run_worker(
                     .unwrap_or("wav")
                     .to_ascii_lowercase();
                 let dst = sub.join(format!("{:03}.{}", i, ext));
-                std::fs::copy(src, &dst).map_err(|e| {
-                    UtaiError::Training(format!(
-                        "TRAINING_IMPORT_COPY_FAILED: {}: {}",
-                        src.display(),
-                        e
-                    ))
-                })?;
+                // dataset_unchanged ⇒ dst already holds this exact file; the loop still runs
+                // because run_speakers (→ run.json) is built from it.
+                if !dataset_unchanged {
+                    std::fs::copy(src, &dst).map_err(|e| {
+                        UtaiError::Training(format!(
+                            "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                            src.display(),
+                            e
+                        ))
+                    })?;
+                }
                 done += 1;
                 let stage = StageInfo {
                     stage: "import".into(),
@@ -1595,7 +1921,11 @@ fn run_worker(
                 "dataset_dir": sub,
             }));
         }
+        if let Some(s) = swap.as_mut() {
+            s.commit();
+        }
     } else {
+        let mut swap: Option<DatasetSwap> = None;
         if req.dataset_files.is_empty() {
             // shared-pool reuse (only sovits_diff reaches here — start() validated
             // the pool): dataset/ and dataset.fingerprint stay UNTOUCHED, so the
@@ -1610,10 +1940,8 @@ fn run_worker(
             };
             inner.snapshot.lock().stage = Some(stage.clone());
             let _ = app.emit("training-stage", &stage);
-        } else {
-            if dataset_dir.exists() {
-                std::fs::remove_dir_all(&dataset_dir)?;
-            }
+        } else if !dataset_unchanged {
+            swap = Some(DatasetSwap::begin(&dataset_dir)?);
             std::fs::create_dir_all(&dataset_dir)?;
         }
         // deterministic import order: the workspace copies are named 000..N in
@@ -1635,13 +1963,15 @@ fn run_worker(
                 .unwrap_or("wav")
                 .to_ascii_lowercase();
             let dst = dataset_dir.join(format!("{:03}.{}", i, ext));
-            std::fs::copy(src, &dst).map_err(|e| {
-                UtaiError::Training(format!(
-                    "TRAINING_IMPORT_COPY_FAILED: {}: {}",
-                    src.display(),
-                    e
-                ))
-            })?;
+            if !dataset_unchanged {
+                std::fs::copy(src, &dst).map_err(|e| {
+                    UtaiError::Training(format!(
+                        "TRAINING_IMPORT_COPY_FAILED: {}: {}",
+                        src.display(),
+                        e
+                    ))
+                })?;
+            }
             let stage = StageInfo {
                 stage: "import".into(),
                 done: Some((i + 1) as u64),
@@ -1651,6 +1981,9 @@ fn run_worker(
             };
             inner.snapshot.lock().stage = Some(stage.clone());
             let _ = app.emit("training-stage", &stage);
+        }
+        if let Some(s) = swap.as_mut() {
+            s.commit();
         }
     }
 
@@ -1967,6 +2300,14 @@ mod tests {
         std::fs::write(base_only.join("diffusion").join("model_0.pt"), b"x").unwrap();
         assert!(!workspace_holds_work(&base_only), "seeded diffusion base is not progress");
 
+        // preprocessing alone is HOURS of work — a slot with a fingerprint but no checkpoint
+        // yet is just「刚开始练」, and it is also what makes a sibling slot count as "using"
+        // the shared dataset.
+        let pre = tmp_ws("pre");
+        std::fs::write(pre.join("dataset.fingerprint"), b"abc").unwrap();
+        assert!(workspace_holds_work(&pre), "preprocessing counts as work");
+        let _ = std::fs::remove_dir_all(pre);
+
         // an imported dataset pool alone is worth protecting: re-importing costs minutes.
         let pool = tmp_ws("pool");
         std::fs::create_dir_all(pool.join("dataset")).unwrap();
@@ -1977,5 +2318,175 @@ mod tests {
         for d in [empty, main, voc, diff, base_only, pool] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    fn src_file(dir: &Path, name: &str, bytes: usize) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn req_from(v: serde_json::Value) -> StartTrainingRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// THE load-bearing property of the shared project dataset: "已经是这份数据就一个字节都不动"
+    /// must be judged by CONTENT, and must need no bookkeeping.
+    ///
+    /// Two failures this pins down, both found by review:
+    /// * comparing `(产物名, 字节数)` cannot see an in-place edit — loudness normalisation and
+    ///   denoising rewrite a wav without changing its length. The import was skipped, python's
+    ///   fingerprint read the same untouched copies and matched too, every stale feature cache
+    ///   was reused, and the run trained on the pre-edit audio while reporting success.
+    /// * judging by a written-at-import ledger instead would have been exact but useless: a
+    ///   MIGRATED project has no such record, so every existing user would have been told
+    ///   their data was "changing" and blocked from the entire point of this refactor
+    ///   (一份数据喂多个架构).
+    #[test]
+    fn dataset_match_is_judged_by_content_and_needs_no_bookkeeping() {
+        let src = tmp_ws("plan_src");
+        let proj = tmp_ws("plan_proj");
+        let ds = proj.join("dataset");
+        // deliberately out of order and mixed-case extensions — the import sorts paths and
+        // lowercases extensions, and the plan must do the identical thing
+        let b = src_file(&src, "b.WAV", 10);
+        let a = src_file(&src, "a.flac", 20);
+        let mk = |files: Vec<String>| {
+            req_from(serde_json::json!({
+                "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": files, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let req = mk(vec![b.clone(), a.clone()]);
+        let plan = dataset_plan(&req);
+        assert_eq!(
+            plan.iter().map(|i| i.rel.as_str()).collect::<Vec<_>>(),
+            vec!["000.flac", "001.wav"],
+            "names are positional in SORTED source order, extensions lowercased"
+        );
+        assert!(!dataset_matches(&ds, &plan), "nothing imported yet");
+
+        // import exactly as run_worker does — no ledger is written anywhere
+        std::fs::create_dir_all(&ds).unwrap();
+        for item in &plan {
+            let srcp = if item.rel.ends_with(".flac") { &a } else { &b };
+            std::fs::copy(srcp, ds.join(&item.rel)).unwrap();
+        }
+        assert!(
+            dataset_matches(&ds, &dataset_plan(&req)),
+            "a migrated project has no bookkeeping either — content alone must answer this"
+        );
+
+        // ★ in-place edit, byte length unchanged → MUST read as changed
+        std::fs::write(&a, vec![b'y'; 20]).unwrap();
+        assert!(
+            !dataset_matches(&ds, &dataset_plan(&req)),
+            "an edited source with the same size must never be judged unchanged"
+        );
+        std::fs::write(&a, vec![b'x'; 20]).unwrap();
+        assert!(dataset_matches(&ds, &dataset_plan(&req)), "restoring content restores the match");
+
+        // a different selection is a mismatch, and so is a dataset someone deleted files from
+        assert!(!dataset_matches(&ds, &dataset_plan(&mk(vec![a.clone()]))));
+        std::fs::remove_file(ds.join("000.flac")).unwrap();
+        assert!(!dataset_matches(&ds, &dataset_plan(&req)));
+
+        // multi-speaker: per-speaker subdirectory keyed by the frozen slug
+        let m = req_from(serde_json::json!({
+            "model_name": "t", "backend": "sovits", "version": "4.1", "sample_rate": "44k",
+            "dataset_files": [],
+            "speakers": [
+                {"name": "歌姫", "files": [a.clone()]},
+                {"name": "second", "files": [b.clone(), a.clone()]},
+            ],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let mplan = dataset_plan(&m);
+        let slugs: Vec<String> =
+            assign_speaker_slugs(&m.speakers).into_iter().map(|(_, s)| s).collect();
+        assert!(mplan.iter().all(|i| slugs.iter().any(|s| i.rel.starts_with(&format!("{s}/")))));
+        let mds = tmp_ws("plan_multi").join("dataset");
+        for item in &mplan {
+            let dst = mds.join(&item.rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            let srcp = if item.rel.ends_with(".flac") { &a } else { &b };
+            std::fs::copy(srcp, &dst).unwrap();
+        }
+        assert!(dataset_matches(&mds, &mplan));
+
+        for d in [src, proj, mds] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// 强制停止 during the import of a REPLACEMENT dataset must not cost the user the dataset
+    /// they already had. (The pre-S76 code `remove_dir_all`'d first, so an abort there was
+    /// unrecoverable; the swap exists precisely to make the failure path restore.)
+    #[test]
+    fn dataset_swap_restores_on_failure_and_reclaims_on_commit() {
+        let proj = tmp_ws("swap");
+        let ds = proj.join("dataset");
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("000.wav"), b"original").unwrap();
+
+        // abandoned (abort / error / panic): the old dataset comes back untouched
+        {
+            let _swap = DatasetSwap::begin(&ds).unwrap();
+            std::fs::create_dir_all(&ds).unwrap();
+            std::fs::write(ds.join("000.wav"), b"half-written replacement").unwrap();
+        }
+        assert_eq!(std::fs::read(ds.join("000.wav")).unwrap(), b"original");
+        // and nothing is left lying around inside the project
+        assert!(
+            std::fs::read_dir(&proj).unwrap().flatten().all(|e| {
+                !e.file_name().to_string_lossy().starts_with(".dataset.old")
+            }),
+            "an orphaned aside copy would be counted in the project size forever"
+        );
+
+        // committed: the replacement stands and the old copy is reclaimed
+        {
+            let mut swap = DatasetSwap::begin(&ds).unwrap();
+            std::fs::create_dir_all(&ds).unwrap();
+            std::fs::write(ds.join("000.wav"), b"new").unwrap();
+            swap.commit();
+        }
+        assert_eq!(std::fs::read(ds.join("000.wav")).unwrap(), b"new");
+        assert!(std::fs::read_dir(&proj).unwrap().flatten().all(|e| {
+            !e.file_name().to_string_lossy().starts_with(".dataset.old")
+        }));
+
+        // a first import (nothing to replace) is a no-op that still commits cleanly
+        let fresh = tmp_ws("swap_fresh");
+        let mut s = DatasetSwap::begin(&fresh.join("dataset")).unwrap();
+        s.commit();
+
+        for d in [proj, fresh] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Identity is now「模型名 → 项目 → 架构槽」, and sovits_diff deliberately resolves to the
+    /// sovits slot — shallow diffusion shares the main model's preprocessing caches, which is
+    /// the entire reason it exists.
+    #[test]
+    fn slot_path_maps_backend_to_family_and_never_escapes_the_project() {
+        let data = std::env::temp_dir().join(format!("utai_slot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let p = tproject::resolve_or_create(&data, "歌姫テスト").unwrap();
+        for (backend, family) in [
+            ("rvc", "rvc"),
+            ("sovits", "sovits"),
+            ("sovits_diff", "sovits"),
+            ("sovits_v2", "sovits_v2"),
+            ("vocoder", "vocoder"),
+        ] {
+            let got = slot_path(&data, "歌姫テスト", backend);
+            assert_eq!(got, tproject::project_dir(&data, &p.id).join(family));
+        }
+        // an unknown name resolves to a path that cannot exist, so `.exists()` probes answer
+        // false instead of erroring — and it must still land under the training root
+        assert!(slot_path(&data, "nobody", "rvc").starts_with(data.join("training")));
+        let _ = std::fs::remove_dir_all(data);
     }
 }

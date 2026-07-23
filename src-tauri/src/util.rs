@@ -108,3 +108,95 @@ pub fn extract_zip_dlls(zip_path: &Path, dest_dir: &Path, matches: impl Fn(&str)
     }
     Ok(())
 }
+
+/// Rename with exponential-backoff retry on ACCESS_DENIED(5) / SHARING_VIOLATION(32).
+///
+/// Returns the failure as a `CODE: detail` string so each domain can wrap it in its own
+/// `UtaiError` variant; the CODEs (`RENAME_FAILED` / `RENAME_RETRY_EXHAUSTED`) are already in
+/// the frontend's trilingual map.
+///
+/// Originally written for SINGLE-FILE renames (the pack.json commit marker), where a hold, if
+/// any, is on that one fresh file and clears fast. It is explicitly NOT a fix for renaming a
+/// big FRESHLY-EXTRACTED directory tree — Defender's async inspection of thousands of new PE
+/// files holds handles below such trees continuously for minutes, far beyond any sane retry
+/// window (live-failed S42 even with 10 s of backoff; that is why the install commit protocol
+/// is a marker FILE, not a directory rename — see `extract_and_commit`).
+///
+/// The S76 training-layout migration DOES rename directory trees through it, and that is a
+/// different situation, not a relapse: those trees are cold (written minutes-to-months ago,
+/// long past any AV inspection queue) and the migration runs at startup before this process
+/// opens anything under them. The retry is there for the remaining real holders — an Explorer
+/// window, a backup agent — and a failure is answered by a rollback, not by pressing on.
+pub fn rename_with_retry(from: &Path, to: &Path, what: &str) -> std::result::Result<(), String> {
+    let mut delay_ms = 250u64;
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..8 {
+        match std::fs::rename(from, to) {
+            Ok(()) => {
+                if attempt > 0 {
+                    // `what` is a short English phase token (PACK_MOVE_OUT / INSTALL_COMMIT /
+                    // PACK_ROLLBACK / INSTALL_RECOVERY / TRAINING_MIGRATE_*) carried as the
+                    // CODE's detail payload; the paths carry the context here.
+                    tracing::info!("rename succeeded on retry {attempt}: {} -> {}", from.display(), to.display());
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                let retriable = matches!(e.raw_os_error(), Some(5) | Some(32));
+                if !retriable {
+                    return Err(format!("RENAME_FAILED: {what} ({} -> {}): {e}", from.display(), to.display()));
+                }
+                tracing::warn!("rename denied (attempt {attempt}) {} -> {}: {e} — retrying in {delay_ms}ms", from.display(), to.display());
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(2000);
+            }
+        }
+    }
+    Err(format!(
+        "RENAME_RETRY_EXHAUSTED: {what} ({} -> {}): {}",
+        from.display(),
+        to.display(),
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
+/// `remove_dir_all` with one assisted retry: strip READONLY attributes throughout (files
+/// planted by user tooling/backup restores may carry them; a read-only file fails both the
+/// in-tree delete and tar's overwrite path — `remove_file` before re-create — with os error
+/// 5), pause briefly for transient handle races (AV inspection), then try once more. Call
+/// sites stay best-effort — see the torn-dir comment in `pyenv::extract_and_commit`.
+pub fn remove_dir_all_robust(dir: &Path) -> std::io::Result<()> {
+    fn clear_readonly(dir: &Path) {
+        // The ROOT dir's own attribute matters too (review S68d): std deletes children
+        // first and the root last, so a readonly root alone defeats both attempts.
+        if let Ok(md) = std::fs::metadata(dir) {
+            let mut perm = md.permissions();
+            if perm.readonly() {
+                perm.set_readonly(false);
+                let _ = std::fs::set_permissions(dir, perm);
+            }
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            if let Ok(md) = e.metadata() {
+                let mut perm = md.permissions();
+                if perm.readonly() {
+                    perm.set_readonly(false);
+                    let _ = std::fs::set_permissions(&e.path(), perm);
+                }
+                if md.is_dir() {
+                    clear_readonly(&e.path());
+                }
+            }
+        }
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            clear_readonly(dir);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::remove_dir_all(dir)
+        }
+    }
+}

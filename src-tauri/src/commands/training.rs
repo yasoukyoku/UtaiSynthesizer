@@ -36,7 +36,7 @@ pub async fn start_training(
     }
     let data_dir = data_root(&state);
     let audition_dir =
-        crate::training::workspace_path(&data_dir, &request.model_name).join("audition");
+        crate::training::slot_path(&data_dir, &request.model_name, &request.backend).join("audition");
     // BEFORE manager.start(): drop every audition session (file locks) so the
     // fresh-wipe path inside try_start cannot trip over them. Non-destructive —
     // an evicted session reloads on miss.
@@ -172,15 +172,19 @@ pub async fn get_training_history(
     Ok(state.training.history())
 }
 
-/// Whether a training WORKSPACE for this name exists (checkpoints the registry
-/// doesn't know about yet) — the retrain-wipes-everything confirm must fire for
-/// these too, not only for imported models.
+/// Whether a training SLOT for this (name, backend) exists (checkpoints the registry doesn't
+/// know about yet) — the retrain-wipes-everything confirm must fire for these too, not only
+/// for imported models.
+///
+/// S76: takes the backend because identity is now「项目 → 架构槽」; one project can hold four
+/// slots, and answering for the wrong one would offer 续训 where there is nothing to resume.
 #[tauri::command]
 pub async fn check_training_workspace(
     state: State<'_, Arc<AppState>>,
     name: String,
+    backend: String,
 ) -> Result<bool, String> {
-    let ws = crate::training::workspace_path(&data_root(&state), &name);
+    let ws = crate::training::slot_path(&data_root(&state), &name, &backend);
     Ok(ws.join("config.json").exists() || ws.join("weights").exists())
 }
 
@@ -191,6 +195,7 @@ pub async fn check_training_workspace(
 pub async fn get_training_workspace_info(
     state: State<'_, Arc<AppState>>,
     name: String,
+    backend: String,
 ) -> Result<crate::training::WorkspaceInfo, String> {
-    Ok(crate::training::workspace_info(&data_root(&state), &name))
+    Ok(crate::training::workspace_info(&data_root(&state), &name, &backend))
 }

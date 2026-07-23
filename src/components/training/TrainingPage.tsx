@@ -87,7 +87,10 @@ export function TrainingPage() {
     let cancelled = false;
     void (async () => {
       try {
-        const info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+        const info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
+          name,
+          backend: "sovits_diff",
+        });
         if (!cancelled) useTrainingStore.getState().setDiffWsInfo(info);
       } catch {
         if (!cancelled) useTrainingStore.getState().setDiffWsInfo(null);
@@ -702,6 +705,7 @@ function TargetStep() {
       try {
         info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
           name: name.trim(),
+          backend,
         });
       } catch {
         info = null;
@@ -1945,7 +1949,10 @@ function RunStep() {
       // check and the resume/retrain dialog. Refuse loudly instead (see the main branch).
       let info: WorkspaceInfo;
       try {
-        info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+        info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
+          name,
+          backend: config.backend,
+        });
       } catch (e) {
         showToast(t("training.probeFailed", { err: String(e) }), "error");
         return;
@@ -2006,7 +2013,10 @@ function RunStep() {
     }
     let info: WorkspaceInfo | null = null;
     try {
-      info = await invoke<WorkspaceInfo>("get_training_workspace_info", { name });
+      info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
+        name,
+        backend: config.backend,
+      });
     } catch {
       info = null;
     }
@@ -2015,7 +2025,10 @@ function RunStep() {
       // legacy fallback: unknown version → the generic dialog below (whose
       // 续训 the Rust manifest guard still backstops)
       try {
-        wsExists = await invoke<boolean>("check_training_workspace", { name });
+        wsExists = await invoke<boolean>("check_training_workspace", {
+          name,
+          backend: config.backend,
+        });
       } catch (e) {
         showToast(t("training.probeFailed", { err: String(e) }), "error");
         return;

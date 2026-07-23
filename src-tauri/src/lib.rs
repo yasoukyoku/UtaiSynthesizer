@@ -1021,6 +1021,12 @@ pub fn run() {
                     }
                 }
             }
+            // S76: fold every pre-project training workspace into the project layout. MUST run
+            // before the reclaim below (which can copy legacy-shaped trees in from an old root)
+            // and before anything opens a handle under <data>/training — at this point in setup
+            // nothing has, and no training can have been started. Never fails the boot: an
+            // undecidable directory is flagged, a torn one is rolled back and retried next boot.
+            training::tproject::migrate_legacy_layout(&data_dir);
             // S68c: a completed data-dir migration leaves the OLD tree marked for reclaim — finish
             // it now, on the first boot that runs on the NEW root (this process holds zero handles
             // into the old tree at this point; the worker delta-syncs stragglers before deleting).

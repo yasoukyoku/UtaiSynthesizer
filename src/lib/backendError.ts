@@ -342,6 +342,20 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_THREAD_SPAWN_FAILED: { key: "backend.TRAINING_THREAD_SPAWN_FAILED" },
   TRAINING_TOTAL_STEPS_ZERO: { key: "backend.TRAINING_TOTAL_STEPS_ZERO" },
   TRAINING_UNKNOWN_ERROR: { key: "backend.TRAINING_UNKNOWN_ERROR" },
+  // S76 shared project dataset: `dataset/` now belongs to the PROJECT, so replacing it would
+  // re-fingerprint every sibling architecture slot and make their progress unresumable.
+  PROJECT_DATASET_IN_USE: { key: "backend.PROJECT_DATASET_IN_USE", modal: true },
+  // S76 project layout: identity/metadata failures on the start path, and the two states the
+  // startup migration can legitimately leave behind (undecidable directory / not folded yet).
+  // All fail-closed — reaching the user means their existing training progress was NOT touched.
+  PROJECT_META_WRITE_FAILED: { key: "backend.PROJECT_META_WRITE_FAILED", modal: true },
+  PROJECT_META_ENCODE_FAILED: { key: "backend.PROJECT_META_ENCODE_FAILED" },
+  PROJECT_META_UNREADABLE: { key: "backend.PROJECT_META_UNREADABLE", modal: true },
+  PROJECT_NEEDS_ATTENTION: { key: "backend.PROJECT_NEEDS_ATTENTION", modal: true },
+  TRAINING_LAYOUT_MIGRATION_PENDING: { key: "backend.TRAINING_LAYOUT_MIGRATION_PENDING", modal: true },
+  AUDITION_WORKSPACE_OUTSIDE_ROOT: { key: "backend.AUDITION_WORKSPACE_OUTSIDE_ROOT" },
+  PROJECT_DATASET_SHAPE: { key: "backend.PROJECT_DATASET_SHAPE" },
+  TRAINING_DATASET_SELF_SOURCE: { key: "backend.TRAINING_DATASET_SELF_SOURCE" },
   // fail-closed wipe consent (training/mod.rs): fresh=true without wipe_confirmed on a
   // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
   // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.

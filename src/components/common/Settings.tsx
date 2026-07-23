@@ -204,11 +204,17 @@ interface AssetPackProgress {
 
 /** Mirror of Rust `commands::storage::{StorageReport, WorkspaceUsage}` (S61). */
 interface WorkspaceUsage {
+  /** S76: project id = the directory under <data>/training. */
   slug: string;
   name: string;
+  /** Architecture slots this project holds, joined with "+" ("rvc" / "sovits+vocoder"). */
   family: string;
   bytes: number;
   has_pool: boolean;
+  /** S76 layout migration could not classify this directory — content untouched, but the
+   *  user has to decide. Shown inline: a project that exists on disk must never be invisible
+   *  in the app. */
+  needs_attention?: string | null;
 }
 interface StorageReport {
   data_dir: string;
@@ -649,7 +655,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         const ts = useTrainingStore.getState();
         const curName = ts.config.modelName.trim();
         if (curName) {
-          invoke("get_training_workspace_info", { name: curName })
+          invoke("get_training_workspace_info", { name: curName, backend: "sovits_diff" })
             .then((info) => ts.setDiffWsInfo(info as never))
             .catch(() => {});
         }
@@ -1128,7 +1134,8 @@ export function Settings({ onClose }: { onClose: () => void }) {
       stWsBody: { zh: "将删除该模型的数据集副本、预处理特征与全部训练 checkpoint——不可恢复，续训将不再可用（已导入到资源管理器的成品模型不受影响）。", en: "Deletes this model's dataset copies, preprocessed features and ALL training checkpoints — irreversible; resume-training becomes unavailable (models already imported into the resource manager are unaffected).", ja: "このモデルのデータセットコピー・前処理特徴・全チェックポイントを削除します。元に戻せず、続きからのトレーニングは不可になります（リソースマネージャに取り込んだモデルは影響ありません）。" },
       stWsPoolNote: { zh: "注意：该工作区带有可复用数据池——删除后，浅扩散训练将需要重新导入数据。", en: "Note: this workspace holds a reusable dataset pool — after deletion, shallow-diffusion training will require importing data again.", ja: "注意：このワークスペースには再利用可能なデータプールがあります。削除後、浅い拡散トレーニングはデータの再インポートが必要になります。" },
       stWsPool: { zh: "共享池", en: "pool", ja: "プール" },
-      stWsNone: { zh: "（无训练工作区）", en: "(no workspaces)", ja: "（ワークスペースなし）" },
+      stWsNone: { zh: "（无训练项目）", en: "(no training projects)", ja: "（トレーニングプロジェクトなし）" },
+      stWsAttention: { zh: "需人工处理", en: "needs attention", ja: "要確認" },
       stModels: { zh: "模型资源", en: "Model assets", ja: "モデルアセット" },
       stModelsNote: { zh: "在「资源管理器」与 MSST 模型管理中管理", en: "Managed in the resource manager & MSST manager", ja: "リソースマネージャと MSST 管理で管理" },
       stMsst: { zh: "其中分离模型", en: "incl. separation models", ja: "うち分離モデル" },
@@ -1528,6 +1535,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                     {ws.name}
                     {ws.family ? ` · ${ws.family}` : ""}
                     {ws.has_pool ? ` · ${L("stWsPool")}` : ""}
+                    {ws.needs_attention ? ` · ${L("stWsAttention")}` : ""}
                   </span>
                   <span className="settings-value">{fmtSize(ws.bytes)}</span>
                   <button

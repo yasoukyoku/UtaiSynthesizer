@@ -16,10 +16,25 @@ logger = logging.getLogger(__name__)
 
 
 def dataset_fingerprint(dataset_dir):
-    """Content identity of the imported dataset (name + size + head/tail sample)."""
+    """Content identity of the imported dataset (name + size + head/tail sample).
+
+    The directory must hold FILES only. Since S76 the dataset lives at the project level and
+    is shared by every architecture slot, so a flat-dataset backend (vocoder, sovits_diff)
+    can be pointed at a multi-speaker project whose dataset is one subdirectory per speaker.
+    That combination must fail LOUDLY here: skipping subdirectories instead would fingerprint
+    the empty set — a constant — so `invalidate_extract_caches` would conclude "data never
+    changes", keep stale caches forever, and the slicer would then produce zero slices. The
+    Rust side refuses the combination first (PROJECT_DATASET_SHAPE); this is the assertion
+    behind it.
+    """
     h = hashlib.blake2b(digest_size=16)
     for name in sorted(os.listdir(dataset_dir)):
         p = os.path.join(dataset_dir, name)
+        if os.path.isdir(p):
+            raise RuntimeError(
+                "DATASET_SHAPE_UNEXPECTED: %s contains a subdirectory (%s); this backend "
+                "expects a flat dataset" % (dataset_dir, name)
+            )
         st = os.stat(p)
         h.update(name.encode("utf-8"))
         h.update(str(st.st_size).encode())

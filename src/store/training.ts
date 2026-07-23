@@ -129,7 +129,12 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
     backend === "sovits_diff" &&
     !!info?.exists &&
     info.family === "sovits" &&
-    info.has_dataset
+    info.has_dataset &&
+    // S76: shallow diffusion refuses multi-speaker workspaces (Rust side), and since the
+    // dataset became a PROJECT-level shared layer a multi-singer project's dataset is stored
+    // per singer — which this run, carrying no singer groups, cannot consume. Advertising
+    // 免导入直训 there would let the user skip the data page straight into a refusal.
+    info.n_speakers <= 1
   );
 }
 
@@ -190,6 +195,10 @@ export interface TrainingSnapshot {
   backend: string;
   model_name: string;
   model_slug: string;
+  /** S76: the training PROJECT this run belongs to ("" while idle). */
+  project_id: string;
+  /** The run's family SLOT dir (`<data>/training/<project>/<family>`) — the pre-S76
+   *  workspace root, so audition/weights paths keep their shape. */
   workspace: string;
   total_epochs: number;
   stage?: StageInfo | null;
@@ -288,6 +297,7 @@ const IDLE_SNAPSHOT: TrainingSnapshot = {
   backend: "",
   model_name: "",
   model_slug: "",
+  project_id: "",
   workspace: "",
   total_epochs: 0,
   ckpts: [],

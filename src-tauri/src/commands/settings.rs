@@ -1169,7 +1169,27 @@ fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: b
 /// the caller REFUSES to delete a subtree whose sync had failures — a straggler that could not be
 /// carried over must never be deleted with the tree (S68c review major). An unreadable source
 /// entry counts as failed for the same reason: we can't prove it's already in the new tree.
-fn sync_dir_delta(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bool) -> (u64, u64) {
+/// `layout_aware` (S76, used for the `training` subtree ONLY): refuse to MERGE two top-level
+/// directories that are in different layouts.
+///
+/// Both roots can hold a `training/<id>/` — but one may be a pre-S76 workspace (checkpoints
+/// at its root) while the other is a migrated PROJECT (checkpoints one level down, in a
+/// family slot). Merging those per-file plants `G_*.pth` / `config.json` / `run_manifest.json`
+/// back at the project root next to the slot that already holds them — precisely the
+/// "checkpoints without a manifest" shape the resume guards treat as corruption, and
+/// unrecoverable because the migration marker is long gone.
+///
+/// ⚠ Skipping such a directory counts as a FAILURE, not as "nothing to do". `reclaim_one_root`
+/// deletes the old subtree exactly when nothing failed to sync, so a silent skip would delete
+/// the old `training/` along with everything it still held that the new root does not — the
+/// concrete loss being every checkpoint written between "migrated the data dir" and "actually
+/// restarted", which lands in the OLD root. Same-layout pairs merge per file as before.
+fn sync_dir_delta(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip_dot_top: bool,
+    layout_aware: bool,
+) -> (u64, u64) {
     let mut copied = 0u64;
     let mut failed = 0u64;
     let Ok(rd) = std::fs::read_dir(src) else { return (0, 0) };
@@ -1180,7 +1200,20 @@ fn sync_dir_delta(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: bo
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            let (c, f) = sync_dir_delta(&from, &to, false);
+            if layout_aware && to.exists() {
+                let meta = crate::training::tproject::PROJECT_META;
+                if from.join(meta).is_file() != to.join(meta).is_file() {
+                    tracing::warn!(
+                        "data-dir reclaim: {} and {} are in different training layouts — keeping \
+                         the old tree instead of merging (move it by hand once you have checked it)",
+                        from.display(),
+                        to.display()
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+            let (c, f) = sync_dir_delta(&from, &to, false, false);
             copied += c;
             failed += f;
             continue;
@@ -1455,9 +1488,24 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     let mut synced = 0u64;
     let mut freed = 0u64;
     let mut kept: Vec<String> = Vec::new();
+    // The old root's training/ is in whatever layout it had when it was last active, while
+    // the ACTIVE root has just been folded into the project layout — and per-file merging
+    // across the two shapes is the one thing that produces an unrecoverable tree. Fold the old
+    // root first (pure renames, idempotent, rolls itself back on failure): once both sides are
+    // project-shaped, the ordinary per-file delta-sync is correct again and the subtree can be
+    // reclaimed as it always was. Skipping it instead would leave the single biggest subtree
+    // permanently un-merged AND un-deleted, with the queue entry consumed either way.
+    crate::training::tproject::migrate_legacy_layout(&old_p);
     for name in MIGRATED_SUBTREES {
         let sub = old_p.join(name);
-        let (c, sync_failed) = sync_dir_delta(&sub, &active_data_dir.join(name), skips_dot_top(name));
+        if name == "training" {
+            crate::training::tproject::RECLAIM_TOUCHING_TRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let (c, sync_failed) =
+            sync_dir_delta(&sub, &active_data_dir.join(name), skips_dot_top(name), name == "training");
+        if name == "training" {
+            crate::training::tproject::RECLAIM_TOUCHING_TRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         synced += c;
         if !sub.exists() {
             continue;
