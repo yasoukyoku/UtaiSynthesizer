@@ -709,6 +709,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const famLabel = (f: string) => f;
 
   const handleCleanSnapshots = useCallback((ws: WorkspaceUsage, slot: SlotUsage) => {
+    // Nothing to free (every snapshot is imported / best / final / predates the ledger — the
+    // normal state of a migrated project): don't pop a confirm for a no-op, just say why. The
+    // real deletion always re-derives the set server-side, so this is only about the dialog.
+    if (slot.cleanableBytes === 0) {
+      setMsgOwner(ws.slug);
+      setCleanMsg(L("stSnapNothing").replace("{n}", String(slot.snapshots)));
+      return;
+    }
     void runCleanup(
       `${ws.slug}:snap:${slot.family}`,
       () =>
@@ -1283,6 +1291,7 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
       stExpand: { zh: "分项", en: "Details", ja: "内訳" },
       stDataset: { zh: "共享数据集", en: "Shared dataset", ja: "共有データセット" },
       stSnapCount: { zh: "{n} 个快照", en: "{n} snapshots", ja: "{n} スナップショット" },
+      stSnapNothing: { zh: "本架构的 {n} 个快照当前都在保护范围内(已导入 / 最佳 / 最终导出 / 迁移前),暂无可清理项。", en: "All {n} of this architecture's snapshots are currently protected (imported / best / final / pre-migration) — nothing to clean.", ja: "このアーキテクチャの {n} 個のスナップショットは現在すべて保護対象です（取り込み済み / ベスト / 最終 / 移行前）。整理できる項目はありません。" },
       stWsPool: { zh: "共享池", en: "pool", ja: "プール" },
       stWsNone: { zh: "（无训练项目）", en: "(no training projects)", ja: "（トレーニングプロジェクトなし）" },
       stWsAttention: { zh: "需人工处理", en: "needs attention", ja: "要確認" },
@@ -1723,7 +1732,12 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
                             {sl.family}
                           </span>
                           <span className="settings-value">{fmtSize(sl.bytes)}</span>
-                          {sl.cleanableBytes > 0 && (
+                          {/* Shown whenever the slot HAS periodic snapshots — not only when
+                              something is deletable right now. On a migrated project everything
+                              predates the ledger so cleanableBytes is 0, and gating on that made
+                              the whole action vanish (the user could not find it). If there is
+                              nothing to free, the click says so instead of deleting. */}
+                          {sl.snapshots > 0 && (
                             <button
                               className="settings-mini-btn"
                               disabled={cleanBusy !== null || trainingBusy}
