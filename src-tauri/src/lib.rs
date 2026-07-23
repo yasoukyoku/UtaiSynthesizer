@@ -1027,6 +1027,10 @@ pub fn run() {
             // nothing has, and no training can have been started. Never fails the boot: an
             // undecidable directory is flagged, a torn one is rolled back and retried next boot.
             training::tproject::migrate_legacy_layout(&data_dir);
+            // Reclaim delete staging dirs a previous session could not finish removing (locked
+            // file, crash, forced quit). Same window as the migration: nothing holds a handle
+            // under <data>/training yet.
+            training::tproject::sweep_tombstones(&data_dir);
             // S68c: a completed data-dir migration leaves the OLD tree marked for reclaim — finish
             // it now, on the first boot that runs on the NEW root (this process holds zero handles
             // into the old tree at this point; the worker delta-syncs stragglers before deleting).
@@ -1246,6 +1250,9 @@ pub fn run() {
             commands::training::check_training_workspace,
             commands::training::get_training_workspace_info,
             commands::training::find_training_project,
+            commands::training::training_cleanup_snapshots,
+            commands::training::training_delete_slot,
+            commands::training::training_delete_project,
             commands::training::list_project_ckpts,
             commands::training::record_project_export,
             commands::audition::render_model_audition,

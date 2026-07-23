@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::State;
 
@@ -80,16 +80,17 @@ pub async fn import_model(
         }
     }
 
+    let src = PathBuf::from(&path);
     let idx = index_path.map(PathBuf::from);
     let diff = diffusion_path.map(PathBuf::from);
     let diff_cfg = diffusion_config_path.map(PathBuf::from);
     let avatar = avatar_path.map(PathBuf::from);
     let voc_cfg = vocoder_config_path.map(PathBuf::from);
-    state
+    let outcome = state
         .models
         .import_file(
             &name,
-            &PathBuf::from(path),
+            &src,
             mt,
             &state.app_dir,
             idx.as_deref(),
@@ -101,7 +102,46 @@ pub async fn import_model(
         .map_err(|e| {
             tracing::error!("Model import failed: {}", e);
             e.to_string()
-        })
+        });
+    // S76: note the export in the source project's ledger — THE single place this happens.
+    //
+    // It used to be a second RPC issued by the training page, which missed two paths entirely:
+    // the resource manager's file picker (a user can browse straight into
+    // `<data>/training/<proj>/<family>/weights/*.pth`) and any interruption between the import
+    // and the follow-up call. Both left「已安装模型 + 账本无此行」— and the snapshot cleanup
+    // reads a missing row as「没人要」, i.e. it fails OPEN on the one thing it must not.
+    if let Ok(entry) = &outcome {
+        record_training_export(&state, &src, &entry.entry.name, &model_type);
+    }
+    outcome
+}
+
+/// Best-effort ledger write for a model imported straight out of a training slot. Never fails
+/// the import: the model IS installed either way, and the cleanup is conservative when the
+/// ledger is thin (it also protects anything a registry lookup can still reach).
+fn record_training_export(state: &AppState, src: &Path, name: &str, model_type: &str) {
+    let data_dir = state
+        .models
+        .models_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| state.app_dir.join("data"));
+    let root = crate::training::tproject::training_root(&data_dir);
+    let Ok(rel) = src.strip_prefix(&root) else { return };
+    // `<project_id>/<family>/...` — the first component identifies the project.
+    let Some(project_id) = rel.components().next().map(|c| c.as_os_str().to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    if let Err(e) = crate::training::tproject::record_export(
+        &data_dir,
+        &project_id,
+        name,
+        model_type,
+        &src.to_string_lossy(),
+    ) {
+        tracing::warn!("export ledger not updated for {}: {e}", src.display());
+    }
 }
 
 /// Attach a TRAINED shallow-diffusion checkpoint (model_<step>.pt with its
@@ -141,6 +181,11 @@ pub async fn attach_diffusion(
             tracing::error!("Diffusion attach (commit) failed: {}", e);
             e.to_string()
         })?;
+    // S76: attach IS the export path for shallow diffusion — its checkpoints never go through
+    // import_model, so without this the whole sovits_diff family reads as never-imported.
+    // `sovits` (not `sovits_diff`) is deliberate: the ledger's model_type names a REGISTRY
+    // type, and the thing that got installed is a SoVITS model's attachment.
+    record_training_export(&state, &PathBuf::from(&ckpt_path), &name, "sovits");
     state
         .models
         .get(&name)

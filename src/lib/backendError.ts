@@ -349,6 +349,16 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   // startup migration can legitimately leave behind (undecidable directory / not folded yet).
   // All fail-closed — reaching the user means their existing training progress was NOT touched.
   PROJECT_META_WRITE_FAILED: { key: "backend.PROJECT_META_WRITE_FAILED", modal: true },
+  // S76 batch 3 — destructive training-archive actions. Every one of these is a REFUSAL that
+  // left the files intact, so they read as guidance, not as failure. (DELETE_WHILE_BUSY is
+  // NOT here — it already exists above, shared with the asset-pack delete: one CODE, one text.)
+  PROJECT_LEDGER_UNSTAMPED: { key: "backend.PROJECT_LEDGER_UNSTAMPED", modal: true },
+  PROJECT_LEDGER_STALE: { key: "backend.PROJECT_LEDGER_STALE", modal: true },
+  DELETE_OTHER_INSTANCE: { key: "backend.DELETE_OTHER_INSTANCE", modal: true },
+  DELETE_RECLAIM_IN_PROGRESS: { key: "backend.DELETE_RECLAIM_IN_PROGRESS", busy: true },
+  TRAINING_DELETE_FAILED: { key: "backend.TRAINING_DELETE_FAILED" },
+  TRAINING_BAD_FAMILY: { key: "backend.TRAINING_BAD_FAMILY" },
+  TRAINING_DELETE_JOIN: { key: "backend.TRAINING_DELETE_JOIN" },
   PROJECT_META_ENCODE_FAILED: { key: "backend.PROJECT_META_ENCODE_FAILED" },
   PROJECT_META_UNREADABLE: { key: "backend.PROJECT_META_UNREADABLE", modal: true },
   PROJECT_NEEDS_ATTENTION: { key: "backend.PROJECT_NEEDS_ATTENTION", modal: true },

@@ -648,7 +648,14 @@ export function Settings({ onClose }: { onClose: () => void }) {
     void runCleanup(
       ws.slug,
       async () => {
-        const freed = await invoke<number>("delete_training_workspace", { slug: ws.slug });
+        // S76: one project can hold up to four architecture slots plus the shared dataset —
+        // this deletes ALL of it. The structured report also lets a torn delete (rename done,
+        // background removal blocked) report「已移除,下次启动回收」instead of「删除失败」.
+        const rep = await invoke<{ freedBytes: number; deferred: boolean }>(
+          "training_delete_project",
+          { projectId: ws.slug },
+        );
+        const freed = rep.freedBytes;
         // Keep the training page coherent: the diff card's cached workspace facts (免导入直训 /
         // 续训 hints) must reflect the deletion immediately — re-probe the CURRENT name.
         const ts = useTrainingStore.getState();
@@ -657,6 +664,10 @@ export function Settings({ onClose }: { onClose: () => void }) {
           invoke("get_training_workspace_info", { name: curName, backend: "sovits_diff" })
             .then((info) => ts.setDiffWsInfo(info as never))
             .catch(() => {});
+          // …and the training page's archive list, which has no other reason to re-scan: none
+          // of its effect dependencies change when a deletion happens over here, so without
+          // this the deleted rows keep listing (and stay clickable for import).
+          void ts.refreshProjectCkpts(curName, ts.config.backend);
         }
         return freed;
       },

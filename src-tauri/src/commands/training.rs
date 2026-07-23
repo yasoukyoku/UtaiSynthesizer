@@ -188,6 +188,103 @@ pub async fn check_training_workspace(
     Ok(ws.join("config.json").exists() || ws.join("weights").exists())
 }
 
+/// Every destructive training-archive action passes through here first.
+///
+/// One gate, three consumers — the S74b discipline. `ensure_idle_for_package_delete` already
+/// enumerates every in-process holder (convert / training / separation / voice render /
+/// audition); copying `TRAINING_ACTIVE + FlightGuard` from the old workspace delete would have
+/// missed `convert`, and an `import_model` converting a multi-GB `.pth` out of the very slot
+/// being deleted holds only that slot.
+///
+/// The other two are cross-process and cannot be expressed as locks at all: a sibling instance
+/// (double-launch is supported here) may be training out of this tree, and the data-dir reclaim
+/// thread copies files back by relpath — it would resurrect exactly what was just deleted.
+fn ensure_safe_to_delete(state: &AppState) -> Result<(), String> {
+    crate::commands::window::ensure_idle_for_package_delete(state)?;
+    if crate::crashlog::other_instance_alive() {
+        return Err("DELETE_OTHER_INSTANCE".into());
+    }
+    if crate::training::tproject::RECLAIM_TOUCHING_TRAINING.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("DELETE_RECLAIM_IN_PROGRESS".into());
+    }
+    Ok(())
+}
+
+/// Drop every ORT session and reload-spec rooted under a path we are about to delete. The
+/// prefix is derived HERE from the data root — never taken from the frontend — because the
+/// match is a raw path prefix and a `\?\`-prefixed or differently-cased string would miss,
+/// leaving a Windows handle to fail the delete and a stale spec to reload afterwards.
+fn unload_under(state: &AppState, p: &std::path::Path) {
+    state.inference.engine.unload_paths_with_prefix(p);
+}
+
+/// Remove the periodic snapshots under `weights/` that nothing needs any more.
+///
+/// `family` mirrors list_project_ckpts so the button acts on exactly the list the user is
+/// looking at. Returns a full account — what went, what stayed and why — because「已释放 0 B」
+/// is the CORRECT outcome for a migrated project and would otherwise read as a broken button.
+#[tauri::command]
+pub async fn training_cleanup_snapshots(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    family: Option<String>,
+) -> Result<crate::training::tproject::DeleteReport, String> {
+    ensure_safe_to_delete(&state)?;
+    let data_dir = data_root(&state);
+    // A snapshot whose stem is an installed model must survive even when the ledger has no row
+    // for it (imports predating S76, a torn ledger write) — enumerate every holder, S61.
+    let installed: std::collections::HashSet<String> =
+        state.models.list().into_iter().map(|m| m.name).collect();
+    unload_under(&state, &crate::training::tproject::project_dir(&data_dir, &project_id));
+    tauri::async_runtime::spawn_blocking(move || {
+        let stems = installed;
+        crate::training::tproject::cleanup_snapshots(
+            &data_dir,
+            &project_id,
+            family.as_deref(),
+            &|stem: &str| stems.iter().any(|n| n == stem || stem.starts_with(n.as_str())),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
+}
+
+/// Delete ONE architecture slot. The project's shared dataset and its sibling slots stay.
+#[tauri::command]
+pub async fn training_delete_slot(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    family: String,
+) -> Result<crate::training::tproject::DeleteReport, String> {
+    ensure_safe_to_delete(&state)?;
+    let data_dir = data_root(&state);
+    unload_under(&state, &crate::training::tproject::family_dir(&data_dir, &project_id, &family));
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::training::tproject::delete_slot(&data_dir, &project_id, &family)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
+}
+
+/// Delete a whole training project, including its shared dataset. Models already exported into
+/// the registry are independent copies and are NOT affected.
+#[tauri::command]
+pub async fn training_delete_project(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+) -> Result<crate::training::tproject::DeleteReport, String> {
+    ensure_safe_to_delete(&state)?;
+    let data_dir = data_root(&state);
+    unload_under(&state, &crate::training::tproject::project_dir(&data_dir, &project_id));
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::training::tproject::delete_project(&data_dir, &project_id).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
+}
+
 /// Which training project a model name resolves to, WITHOUT creating one. The archive list
 /// must work while idle — that is its whole point (an app restart or「清空结果」leaves the
 /// snapshot empty while the files are very much still on disk) — and `snapshot.project_id`

@@ -370,6 +370,10 @@ pub enum CkptKind {
     Release,
     /// The best release snapshot by validation metric.
     Best,
+    /// The naturally-finished export: a plain `weights/<slug>.pth` with no step in its name.
+    /// One per slot, and the artifact a user is most likely to actually want — kept out of
+    /// `Release` so the snapshot cleanup can never treat it as one of the periodic ones.
+    Final,
     /// Half of a torn GAN save — a `G_<n>.pth` whose `D_<n>.pth` never landed, or the mirror.
     /// Hundreds of MB that cannot be resumed from: listed so it stays visible and reclaimable,
     /// never offered as a resume point.
@@ -472,10 +476,14 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
         };
 
         // ── slot root: the resumable pairs ────────────────────────────────────────────
+        // `.` entries are never archives — a delete stages files into `.del_*` and the layout
+        // migration parks trees in `.mig_*`. Reading them back as checkpoints would put a
+        // half-deleted file in the list AND feed it into the next cleanup round.
         let entries: Vec<String> = std::fs::read_dir(&slot)
             .map(|rd| {
                 rd.flatten()
                     .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| !n.starts_with('.'))
                     .collect()
             })
             .unwrap_or_default();
@@ -519,6 +527,9 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
         if let Ok(rd) = std::fs::read_dir(slot.join("diffusion")) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with('.') {
+                    continue;
+                }
                 let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt"))
                 else {
                     continue;
@@ -542,11 +553,10 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
         if let Ok(rd) = std::fs::read_dir(slot.join("weights")) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().into_owned();
-                if !(n.ends_with(".pth") || n.ends_with(".ckpt")) {
+                if n.starts_with('.') || !(n.ends_with(".pth") || n.ends_with(".ckpt")) {
                     continue;
                 }
                 let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
-                let kind = if stem.ends_with("_best") { CkptKind::Best } else { CkptKind::Release };
                 // Exactly two real shapes: `<slug>_e<epoch>_s<step>` (rvc/sovits/sovits_v2
                 // periodic) and `vocoder_<real step>` (vocoder — already halved on this side).
                 //
@@ -559,6 +569,17 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
                     .rsplit_once("_s")
                     .and_then(|(_, s)| s.parse::<u64>().ok())
                     .or_else(|| stem.strip_prefix("vocoder_").and_then(|s| s.parse::<u64>().ok()));
+                let kind = if stem.ends_with("_best") {
+                    CkptKind::Best
+                } else if step.is_none() {
+                    // no step in the name and not `_best` ⇒ the plain `<slug>.pth` the run
+                    // writes when it finishes naturally. Distinguishing it matters: as a
+                    // `Release` it would sit in the cleanup's candidate set, and it is the one
+                    // file in `weights/` a user is most likely to actually want.
+                    CkptKind::Final
+                } else {
+                    CkptKind::Release
+                };
                 push(e.path(), None, kind, step);
             }
         }
@@ -567,6 +588,267 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
     // (the RVC sentinel makes step ordering meaningless).
     out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms).then_with(|| a.rel.cmp(&b.rel)));
     out
+}
+
+/// Why a checkpoint was NOT deleted. Stable CODEs — the frontend localises them through the
+/// shared mapper, and「为什么没删」must be as visible as「删了什么」.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum KeptReason {
+    /// In the project's export ledger.
+    Exported,
+    /// A model with this stem is installed in the registry right now — the ledger may simply
+    /// never have recorded it (imports predating S76, a torn ledger write).
+    StillInstalled,
+    /// Older than the project's ledger baseline. A MIGRATED project cannot know which
+    /// snapshots the user already imported, so everything predating the ledger is untouchable.
+    PreLedger,
+    /// Written seconds ago — the run may not have finished announcing it yet.
+    JustWritten,
+    /// Best / final / base / resumable — never a cleanup target in the first place.
+    NotASnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlan {
+    /// Files to remove, each with its companions (a GAN pair goes atomically or not at all).
+    pub delete: Vec<CkptRecord>,
+    pub kept: Vec<(String, KeptReason)>,
+    pub freeable_bytes: u64,
+}
+
+/// Decide what「清理未导入的快照」may remove. Pure given the inputs, so the judgement can be
+/// tested without a registry or a filesystem full of multi-GB files.
+///
+/// Only two kinds are ever candidates: periodic `Release` snapshots under `weights/` (which
+/// NOTHING prunes automatically — that is the whole reason this exists) and `Orphan` halves of
+/// a torn GAN save. Base / Resumable / Best / Final are structurally excluded: resumability and
+/// the best/final artefacts are the things a user would be most upset to lose, and none of them
+/// grows without bound.
+///
+/// ⚠ Two rules were in the first draft and are deliberately ABSENT:
+/// * "protect everything in the current run's candidate list" — `snapshot.ckpts` accumulates
+///   and is not cleared on completion, so that set is EXACTLY the set the user wants to delete
+///   right after a run. It made the feature release 0 bytes in its main scenario. Not deleting
+///   a file that is being written is already guaranteed by the idle gate.
+/// * "protect anything from the last N hours" — same problem at a coarser grain. What remains
+///   is a seconds-scale guard against a save landing between the scan and the delete.
+pub fn plan_cleanup(
+    records: &[CkptRecord],
+    ledger_since_ms: u64,
+    now_ms_: u64,
+    installed_stem: &dyn Fn(&str) -> bool,
+) -> CleanupPlan {
+    const JUST_WRITTEN_MS: u64 = 60_000;
+    let mut plan = CleanupPlan { delete: Vec::new(), kept: Vec::new(), freeable_bytes: 0 };
+    for r in records {
+        let stem = Path::new(&r.rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let reason = if !matches!(r.kind, CkptKind::Release | CkptKind::Orphan) {
+            Some(KeptReason::NotASnapshot)
+        } else if r.imported {
+            Some(KeptReason::Exported)
+        } else if installed_stem(&stem) {
+            Some(KeptReason::StillInstalled)
+        } else if ledger_since_ms > 0 && r.mtime_ms < ledger_since_ms {
+            Some(KeptReason::PreLedger)
+        } else if now_ms_.saturating_sub(r.mtime_ms) < JUST_WRITTEN_MS {
+            Some(KeptReason::JustWritten)
+        } else {
+            None
+        };
+        match reason {
+            Some(why) => plan.kept.push((r.rel.clone(), why)),
+            None => {
+                plan.freeable_bytes += r.bytes;
+                plan.delete.push(r.clone());
+            }
+        }
+    }
+    plan
+}
+
+/// What a delete actually did. A bare `freed: u64` cannot express this command's most common
+/// correct outcome — on a MIGRATED project every snapshot predates the ledger, so「一个都不删」
+/// is right, and rendering that as「已释放 0 B」reads as a broken button.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReport {
+    pub freed_bytes: u64,
+    pub deleted: Vec<String>,
+    pub kept: Vec<KeptEntry>,
+    /// The rename succeeded but the background removal did not finish — the space comes back
+    /// on the next launch. NOT a failure: the archives are already unreachable.
+    pub deferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeptEntry {
+    pub rel: String,
+    pub reason: KeptReason,
+}
+
+/// Remove the periodic snapshots nothing needs any more, for one family or the whole project.
+///
+/// `family` mirrors `list_project_ckpts`: the training page shows ONE architecture's archives,
+/// so its cleanup button must act on exactly that set — deleting slots the user was never
+/// shown is the same class of surprise this refactor exists to remove.
+pub fn cleanup_snapshots(
+    data_dir: &Path,
+    id: &str,
+    family: Option<&str>,
+    installed_stem: &dyn Fn(&str) -> bool,
+) -> Result<DeleteReport> {
+    // Fail-closed on the metadata: `scan_project_ckpts` degrades an unreadable project.json to
+    // an EMPTY ledger, which would turn every protection off at once — and the "ledger says
+    // things were exported but none of them are on disk" tripwire cannot fire either, because
+    // an empty ledger has nothing to mismatch. Read it here and refuse instead.
+    let Some(meta) = read_meta(data_dir, id) else {
+        return Err(UtaiError::Training("PROJECT_META_UNREADABLE".into()));
+    };
+    if meta.export_ledger_since_ms == 0 {
+        // Every project this app creates or migrates stamps it. A zero means the file was
+        // written by something else, or by a version that did not have the concept — either
+        // way the「早于记账基线的一律保护」rule silently evaporates.
+        return Err(UtaiError::Training("PROJECT_LEDGER_UNSTAMPED".into()));
+    }
+    let records = scan_project_ckpts(data_dir, id, family);
+    // Tripwire: the ledger names exports that are nowhere on disk. Something moved or deleted
+    // files behind our back, so every judgement below is suspect — report, do not delete.
+    if !meta.exported.is_empty() && !meta.exported.iter().any(|e| records.iter().any(|r| r.rel == e.from_ckpt_rel)) {
+        return Err(UtaiError::Training("PROJECT_LEDGER_STALE".into()));
+    }
+    let plan = plan_cleanup(&records, meta.export_ledger_since_ms, now_ms(), installed_stem);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let proj = project_dir(data_dir, id);
+    for r in &plan.delete {
+        paths.push(PathBuf::from(&r.path));
+        paths.extend(r.companions.iter().map(|c| proj.join(c)));
+    }
+    let tomb = tombstone(data_dir, id, &paths)?;
+    let deferred = match &tomb {
+        Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
+        None => false,
+    };
+    Ok(DeleteReport {
+        freed_bytes: plan.freeable_bytes,
+        deleted: plan.delete.iter().map(|r| r.rel.clone()).collect(),
+        kept: plan.kept.into_iter().map(|(rel, reason)| KeptEntry { rel, reason }).collect(),
+        deferred,
+    })
+}
+
+/// Delete ONE architecture slot — its checkpoints, caches and audition renders. The project's
+/// shared `dataset/` and every sibling slot are untouched.
+pub fn delete_slot(data_dir: &Path, id: &str, family: &str) -> Result<DeleteReport> {
+    if !FAMILIES.contains(&family) {
+        return Err(UtaiError::Training(format!("TRAINING_BAD_FAMILY: {family}")));
+    }
+    let slot = family_dir(data_dir, id, family);
+    if !slot.is_dir() {
+        return Err(UtaiError::Training("WORKSPACE_MISSING".into()));
+    }
+    let freed = crate::commands::storage::dir_size(&slot);
+    let tomb = tombstone(data_dir, id, &[slot])?;
+    let deferred = match &tomb {
+        Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
+        None => false,
+    };
+    Ok(DeleteReport { freed_bytes: freed, deleted: vec![family.to_string()], kept: Vec::new(), deferred })
+}
+
+/// Delete a whole project: every slot AND the shared dataset. Models already exported into the
+/// registry are copies and are not affected.
+pub fn delete_project(data_dir: &Path, id: &str) -> Result<DeleteReport> {
+    let dir = project_dir(data_dir, id);
+    if !dir.is_dir() {
+        return Err(UtaiError::Training("WORKSPACE_MISSING".into()));
+    }
+    let freed = crate::commands::storage::dir_size(&dir);
+    let tomb = tombstone(data_dir, id, &[dir])?;
+    // A torn layout migration parks the rest of this project beside it; leaving those behind
+    // would let the next boot fold them back into the id we just deleted.
+    let root = training_root(data_dir);
+    let _ = crate::util::remove_dir_all_robust(&root.join(format!("{STAGING_PREFIX}{id}")));
+    let _ = std::fs::remove_file(root.join(format!("{MARKER_PREFIX}{id}.json")));
+    let deferred = match &tomb {
+        Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
+        None => false,
+    };
+    Ok(DeleteReport { freed_bytes: freed, deleted: vec![id.to_string()], kept: Vec::new(), deferred })
+}
+
+/// Prefix for a delete-in-progress staging directory at the training root.
+const TOMB_PREFIX: &str = ".del_";
+
+/// Move `paths` into a fresh tombstone DIRECTORY at the training root and return it.
+///
+/// Three properties, each paid for by a specific failure:
+/// * **a directory, at the ROOT** — the only reaper is `get_storage_report`'s depth-1 scan,
+///   which skips non-directories and never recurses, so a tombstone FILE or one parked inside
+///   a project would never be reclaimed and would keep counting toward the project's size;
+/// * **rename, not delete** — same volume, so it is atomic, and a locked file fails the rename
+///   instead of leaving a half-erased archive;
+/// * **the whole unit at once** — a GAN pair must vanish together. `_seed_base_checkpoints`
+///   checks `G_*` and `D_*` INDEPENDENTLY, so a crash between deleting one and the other makes
+///   the next run seed a fresh 0-step counterpart for the surviving half: a silently corrupt
+///   resume rather than a missing one.
+fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Option<PathBuf>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let tomb = training_root(data_dir).join(format!(
+        "{TOMB_PREFIX}{id}_{}_{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&tomb)
+        .map_err(|e| UtaiError::Training(format!("TRAINING_DELETE_FAILED: {e}")))?;
+    for (i, p) in paths.iter().enumerate() {
+        if !p.exists() {
+            continue;
+        }
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // prefix with an index: two families can hold identically-named files
+        crate::util::rename_with_retry(p, &tomb.join(format!("{i:04}_{name}")), "TRAINING_DELETE")
+            .map_err(UtaiError::Training)?;
+    }
+    Ok(Some(tomb))
+}
+
+/// Reclaim tombstones left by a previous session. Called at startup, next to the layout
+/// migration — the same reasoning applies (nothing holds a handle under `<data>/training` yet).
+///
+/// Skips a tombstone whose pid is still ALIVE: with double-launch supported, the other instance
+/// may be mid-delete, and racing it turns its successful delete into a reported failure.
+pub fn sweep_tombstones(data_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(training_root(data_dir)) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(TOMB_PREFIX) else { continue };
+        if !e.path().is_dir() {
+            continue;
+        }
+        // `.del_<id>_<pid>_<ms>` — the pid is the second-to-last field.
+        let alive = rest
+            .rsplit('_')
+            .nth(1)
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_some_and(|pid| pid != std::process::id() && crate::crashlog::pid_alive(pid));
+        if alive {
+            tracing::info!("tombstone {name} belongs to a live sibling instance — leaving it");
+            continue;
+        }
+        match crate::util::remove_dir_all_robust(&e.path()) {
+            Ok(()) => tracing::info!("reclaimed training tombstone {name}"),
+            // Loud, not silent: this is disk the user asked us to free.
+            Err(err) => tracing::warn!("training tombstone {name} not reclaimed: {err}"),
+        }
+    }
 }
 
 /// Record that a checkpoint became an installed model. The ledger is what keeps「清理未导入的
@@ -1402,6 +1684,86 @@ mod tests {
                 assert!(!r.rel.contains('\\'), "rel must be forward-slashed: {}", r.rel);
             }
         }
+    }
+
+    fn ck(rel: &str, kind: CkptKind, mtime_ms: u64, imported: bool) -> CkptRecord {
+        CkptRecord {
+            rel: rel.into(),
+            path: format!("D:/x/{rel}"),
+            family: "rvc".into(),
+            kind,
+            step: None,
+            bytes: 100,
+            mtime_ms,
+            imported,
+            companions: Vec::new(),
+        }
+    }
+
+    /// The most expensive judgement in the whole refactor: getting it wrong deletes hours of a
+    /// user's work. Every protection is pinned, and so are the two rules that were REMOVED.
+    #[test]
+    fn cleanup_protects_everything_that_anyone_could_still_want() {
+        let none = |_: &str| false;
+        let now = 10_000_000u64;
+        let ledger = 5_000_000u64;
+        let recs = vec![
+            // structurally excluded — a cleanup must never touch these
+            ck("rvc/G_500.pth", CkptKind::Resumable, 9_000_000, false),
+            ck("rvc/G_0.pth", CkptKind::Base, 9_000_000, false),
+            ck("rvc/weights/m_best.pth", CkptKind::Best, 9_000_000, false),
+            ck("rvc/weights/m.pth", CkptKind::Final, 9_000_000, false),
+            // the actual candidates
+            ck("rvc/weights/m_e1_s100.pth", CkptKind::Release, 9_000_000, false),
+            ck("rvc/weights/m_e2_s200.pth", CkptKind::Release, 9_000_000, true), // in the ledger
+            ck("rvc/weights/old_e3_s300.pth", CkptKind::Release, 4_000_000, false), // pre-ledger
+            ck("rvc/weights/m_e9_s900.pth", CkptKind::Release, now - 1_000, false), // seconds old
+            ck("rvc/G_777.pth", CkptKind::Orphan, 9_000_000, false),
+        ];
+        let plan = plan_cleanup(&recs, ledger, now, &none);
+        let deleted: Vec<&str> = plan.delete.iter().map(|r| r.rel.as_str()).collect();
+        assert_eq!(deleted, vec!["rvc/weights/m_e1_s100.pth", "rvc/G_777.pth"]);
+        let why = |rel: &str| plan.kept.iter().find(|(r, _)| r == rel).map(|(_, w)| *w);
+        assert_eq!(why("rvc/G_500.pth"), Some(KeptReason::NotASnapshot), "resumability is sacred");
+        assert_eq!(why("rvc/weights/m_best.pth"), Some(KeptReason::NotASnapshot));
+        assert_eq!(
+            why("rvc/weights/m.pth"),
+            Some(KeptReason::NotASnapshot),
+            "the naturally-finished export is not a periodic snapshot"
+        );
+        assert_eq!(why("rvc/weights/m_e2_s200.pth"), Some(KeptReason::Exported));
+        assert_eq!(
+            why("rvc/weights/old_e3_s300.pth"),
+            Some(KeptReason::PreLedger),
+            "a MIGRATED project cannot know what was imported — everything older is untouchable"
+        );
+        assert_eq!(why("rvc/weights/m_e9_s900.pth"), Some(KeptReason::JustWritten));
+        assert_eq!(plan.freeable_bytes, 200);
+
+        // ★ a snapshot whose stem is an installed model survives even with NO ledger row —
+        // the ledger can be thin (imports predating S76, a torn write), the registry cannot lie
+        let installed = |stem: &str| stem == "m_e1_s100";
+        let plan2 = plan_cleanup(&recs, ledger, now, &installed);
+        assert_eq!(
+            plan2.kept.iter().find(|(r, _)| r == "rvc/weights/m_e1_s100.pth").map(|(_, w)| *w),
+            Some(KeptReason::StillInstalled)
+        );
+    }
+
+    /// ★ The two rules that were in the first draft and had to go. `snapshot.ckpts` accumulates
+    /// and is not cleared on completion, so "protect the current run's candidates" protected
+    /// EXACTLY the set a user wants to delete right after training — the feature would have
+    /// released 0 bytes in its main scenario while looking like it worked.
+    #[test]
+    fn cleanup_actually_deletes_in_its_main_scenario() {
+        let now = 10_000_000u64;
+        // just finished a run: 19 periodic snapshots, all from this run, none imported
+        let recs: Vec<CkptRecord> = (1..=19)
+            .map(|i| ck(&format!("rvc/weights/m_e{i}_s{}.pth", i * 100), CkptKind::Release, now - 600_000, false))
+            .collect();
+        let plan = plan_cleanup(&recs, 1_000, now, &|_| false);
+        assert_eq!(plan.delete.len(), 19, "this is the whole point of the feature");
+        assert_eq!(plan.freeable_bytes, 1900);
     }
 
     #[test]
