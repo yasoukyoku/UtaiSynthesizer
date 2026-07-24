@@ -41,9 +41,9 @@ import {
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtDur, fmtSize } from "../../lib/constants";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
-import { t18 } from "../../lib/models/msst-catalog";
 import { preview } from "../common/previewPlayer";
 import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
 import { LossChart, type LossChartHandle } from "./LossChart";
@@ -79,10 +79,15 @@ export function TrainingPage() {
   // S76 batch 4: keyed by PROJECT, not by the typed model name. Picking a host that belongs to
   // another project routes there first (ProjectDetail.startDiff), so the current project always
   // IS the host's project — and a rename can no longer make this probe address nothing.
+  // S78: fetched for EVERY backend, not just diffusion — the parameters page needs the slot's
+  // frozen values to render the resume-locked fields read-only (`resume_lock`). `diffWsInfo`
+  // keeps its name and its diff-only meaning (免导入直训 asks it about the SHARED slice pool);
+  // `slotInfo` is the same probe for whichever backend is selected.
   useEffect(() => {
     const pid = route.projectId;
-    if (config.backend !== "sovits_diff" || !pid) {
+    if (!pid) {
       useTrainingStore.getState().setDiffWsInfo(null);
+      useTrainingStore.getState().setSlotInfo(null);
       return;
     }
     let cancelled = false;
@@ -90,11 +95,17 @@ export function TrainingPage() {
       try {
         const info = await invoke<WorkspaceInfo>("get_training_slot_info", {
           projectId: pid,
-          backend: "sovits_diff",
+          backend: config.backend,
         });
-        if (!cancelled) useTrainingStore.getState().setDiffWsInfo(info);
+        if (cancelled) return;
+        useTrainingStore.getState().setSlotInfo(info);
+        useTrainingStore
+          .getState()
+          .setDiffWsInfo(config.backend === "sovits_diff" ? info : null);
       } catch {
-        if (!cancelled) useTrainingStore.getState().setDiffWsInfo(null);
+        if (cancelled) return;
+        useTrainingStore.getState().setSlotInfo(null);
+        useTrainingStore.getState().setDiffWsInfo(null);
       }
     })();
     return () => {
@@ -725,7 +736,7 @@ function NumberField({
 
 function ParamsStep() {
   const { t } = useTranslation();
-  const { config, updateConfig, goSeg, diffWsInfo } = useTrainingStore();
+  const { config, updateConfig, goSeg, diffWsInfo, slotInfo } = useTrainingStore();
   const [gpus, setGpus] = useState<TrainingGpu[]>([]);
   /** S75: "usable GPU" = at least one SELECTABLE entry. A list of nothing but greyed-out cards
    *  must land on the force-CPU path, not on a dropdown where every choice is dead. */
@@ -784,6 +795,18 @@ function ParamsStep() {
   const sovitsV2 = config.backend === "sovits_v2";
   const diff = config.backend === "sovits_diff";
   const voc = config.backend === "vocoder";
+
+  // 续训锁:这些值已经写进了槽里现有的产物(图形状、线上输入、emb_g 行、缓存的 ContentVec
+  // 空间),续训改不了 —— 后端会拒。所以这里**原地只读显示**,而不是让人改完、到开始训练时
+  // 才被拒绝。表在 `lib/resumeLock.ts`,与 Rust 的 `resume_lock.rs` 有跨语言对拍 gate。
+  const guarded = resumeWouldBeGuarded(config.backend, slotInfo);
+  const locked = guarded ? lockedFieldIds(config.backend, "locked") : new Set<string>();
+  /** 锁定项的只读渲染:值 + 悬停解释。要改只能在开始训练时选「重训」。 */
+  const fixed = (v: string) => (
+    <span className="training-fixed-value" title={t("training.resumeLockedTip")}>
+      {v} · {t("training.resumeLocked")}
+    </span>
+  );
 
   // S68b: an empty GPU list used to hide ALL device UI (dropdown AND the force-CPU
   // checkbox) while silently forcing CPU — a community RTX 3080 box with a dead GPU
@@ -885,16 +908,24 @@ function ParamsStep() {
             </div>
             <div className="training-form-row">
               <label>{t("training.kStepMax")}</label>
-              <Dropdown
-                value={config.diffKStepMax}
-                options={[
-                  { value: 0, label: t("training.kStepFull") },
-                  { value: 100, label: "100" },
-                  { value: 200, label: "200" },
-                  { value: 300, label: "300" },
-                ]}
-                onChange={(v) => updateConfig({ diffKStepMax: v })}
-              />
+              {locked.has("kStepMax") ? (
+                fixed(
+                  config.diffKStepMax === 0
+                    ? t("training.kStepFull")
+                    : String(config.diffKStepMax),
+                )
+              ) : (
+                <Dropdown
+                  value={config.diffKStepMax}
+                  options={[
+                    { value: 0, label: t("training.kStepFull") },
+                    { value: 100, label: "100" },
+                    { value: 200, label: "200" },
+                    { value: 300, label: "300" },
+                  ]}
+                  onChange={(v) => updateConfig({ diffKStepMax: v })}
+                />
+              )}
             </div>
             {gpuRow}
           </div>
@@ -947,26 +978,34 @@ function ParamsStep() {
         <div className="training-form-grid">
           <div className="training-form-row">
             <label>{t("training.version")}</label>
-            <Dropdown
-              value={config.version}
-              options={[
-                { value: "v2", label: "v2" },
-                { value: "v1", label: "v1" },
-              ]}
-              onChange={(v) => updateConfig({ version: v })}
-            />
+            {locked.has("version") ? (
+              fixed(config.version)
+            ) : (
+              <Dropdown
+                value={config.version}
+                options={[
+                  { value: "v2", label: "v2" },
+                  { value: "v1", label: "v1" },
+                ]}
+                onChange={(v) => updateConfig({ version: v })}
+              />
+            )}
           </div>
           <div className="training-form-row">
             <label>{t("training.sampleRate")}</label>
-            <Dropdown
-              value={config.sampleRate}
-              options={[
-                { value: "48k", label: "48k" },
-                { value: "40k", label: "40k" },
-                { value: "32k", label: "32k" },
-              ]}
-              onChange={(v) => updateConfig({ sampleRate: v })}
-            />
+            {locked.has("sampleRate") ? (
+              fixed(config.sampleRate)
+            ) : (
+              <Dropdown
+                value={config.sampleRate}
+                options={[
+                  { value: "48k", label: "48k" },
+                  { value: "40k", label: "40k" },
+                  { value: "32k", label: "32k" },
+                ]}
+                onChange={(v) => updateConfig({ sampleRate: v })}
+              />
+            )}
           </div>
           <div className="training-form-row">
             <label>{t("training.totalEpoch")}</label>
@@ -1039,6 +1078,7 @@ function ParamsStep() {
             : sovits
               ? t("training.sovitsFixedNote")
               : t("training.fixedNote")}
+        {locked.size > 0 && <div>{t("training.resumeLockedNote")}</div>}
       </div>
 
       <button
@@ -1186,14 +1226,21 @@ function ParamsStep() {
         ) : (
           <div className="training-form-grid">
             {!sovitsV2 && config.sovitsVersion === "4.1" && (
-              <label className="training-check-row">
-                <input
-                  type="checkbox"
-                  checked={config.sovitsVolEmbedding}
-                  onChange={(e) => updateConfig({ sovitsVolEmbedding: e.target.checked })}
-                />
-                {t("training.volEmbedding")}
-              </label>
+              locked.has("volEmbedding") ? (
+                <div className="training-form-row">
+                  <label>{t("training.volEmbedding")}</label>
+                  {fixed(t(config.sovitsVolEmbedding ? "training.on" : "training.off"))}
+                </div>
+              ) : (
+                <label className="training-check-row">
+                  <input
+                    type="checkbox"
+                    checked={config.sovitsVolEmbedding}
+                    onChange={(e) => updateConfig({ sovitsVolEmbedding: e.target.checked })}
+                  />
+                  {t("training.volEmbedding")}
+                </label>
+              )
             )}
             <label className="training-check-row">
               <input
@@ -1258,8 +1305,7 @@ function ParamsStep() {
 /* ---------------------------------- step 4: run ---------------------------------- */
 
 function RunStep() {
-  const { t, i18n } = useTranslation();
-  const rlang = i18n.language;
+  const { t } = useTranslation();
   const showConfirm = useAppStore((s) => s.showConfirm);
   const showToast = useAppStore((s) => s.showToast);
   const {
@@ -1915,9 +1961,8 @@ function RunStep() {
     }
     const wsExists = info.exists;
 
-    // vocoder's "version" is the fixed manifest marker — hitting the sovits
-    // fallback here would compare "nsf_hifigan" vs "4.1" and lock every
-    // vocoder workspace into the retrain-only mismatch dialog (红队 A16)
+    // vocoder's "version" is the fixed manifest marker — hitting the sovits fallback here would
+    // compare "nsf_hifigan" vs "4.1" (红队 A16). Still needed by the diffusion host check below.
     const selectedVersion =
       config.backend === "rvc"
         ? config.version
@@ -1926,90 +1971,33 @@ function RunStep() {
           : config.backend === "sovits_v2"
             ? "4.0-v2"
             : config.sovitsVersion;
-    const selectedSr = config.backend === "rvc" ? config.sampleRate : "44k";
     // the wipe would also destroy any diffusion training progress living in
     // this workspace — the user must see that before choosing 重训
     const diffWarn =
       info.diff_steps > 0 ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps }) : "";
 
     if (wsExists) {
-      // ①c: item-by-item diff of the new form vs the stored workspace. Resume needs EVERY
-      // resume-guarded param to match (the Rust guard rejects otherwise) — surface the mismatches
-      // HERE so the user can调回一致 and resume, instead of a red error toast at start time. (Was
-      // just the 2-field version/sr check; now generalized to every guarded param.) vol_embedding
-      // mirrors start()'s expression; speakers compares the RUN's names (info.speakers, from
-      // run.json) BY ORDER = emb_g id — the exact thing the slug guard checks, shown as names.
-      const onOff = (b: boolean) =>
-        t18({ zh: b ? "开" : "关", en: b ? "On" : "Off", ja: b ? "オン" : "オフ" }, rlang);
-      const singleSpk = t18({ zh: "单歌手", en: "single speaker", ja: "単一話者" }, rlang);
-      const diffRows: { label: string; oldv: string; newv: string }[] = [];
-      if (info.version && info.version !== selectedVersion)
-        diffRows.push({ label: t18({ zh: "版本", en: "Version", ja: "バージョン" }, rlang), oldv: info.version, newv: selectedVersion });
-      if (info.sample_rate && info.sample_rate !== selectedSr)
-        diffRows.push({ label: t18({ zh: "采样率", en: "Sample rate", ja: "サンプルレート" }, rlang), oldv: info.sample_rate, newv: selectedSr });
-      if (config.backend === "sovits" && info.vol_embedding != null) {
-        const curVol = config.sovitsVersion === "4.1" ? config.sovitsVolEmbedding : false;
-        if (info.vol_embedding !== curVol)
-          diffRows.push({ label: t18({ zh: "响度嵌入", en: "Vol embedding", ja: "音量埋め込み" }, rlang), oldv: onOff(info.vol_embedding), newv: onOff(curVol) });
-      }
-      if (backendSupportsMultiSpeaker(config.backend)) {
-        const oldNames = info.speakers ?? [];
-        // S78: the singer set is what is ON DISK now — the staging form is gone.
-        const disk = useTrainingStore.getState().projectDataset?.groups ?? [];
-        const curNames = disk.length > 1 ? disk.map((g) => g.name || g.slug) : [];
-        const same = oldNames.length === curNames.length && oldNames.every((n, i) => n === curNames[i]);
-        if (!same)
-          diffRows.push({
-            label: t18({ zh: "歌手（含顺序）", en: "Speakers (order)", ja: "話者（順序）" }, rlang),
-            oldv: oldNames.length ? oldNames.join("、") : singleSpk,
-            newv: curNames.length ? curNames.join("、") : singleSpk,
-          });
-      }
-      // (扩散深度 k_step_max resume-diff belongs to the sovits_diff variant handled in its own
-      // earlier branch — config.backend is already narrowed to rvc/sovits/vocoder here.)
-
-      if (diffRows.length > 0) {
-        // any mismatch → resume impossible (guard would reject). Show WHAT differs (old → new) so
-        // the user can fix the form and resume; else retrain (wipe). Retrain-only here, exactly as
-        // the old version/sr branch did — but now itemized for every guarded param.
-        const list = diffRows.map((r) => `· ${r.label}：${r.oldv} → ${r.newv}`).join("\n");
-        const choice = await showConfirm({
-          title: t18({ zh: "配置与原工作区不一致", en: "Config differs from workspace", ja: "設定が元と不一致" }, rlang),
-          body:
-            t18(
-              {
-                zh: `「${name}」续训要求新配置与原工作区完全一致。以下不同——调回一致即可正常续训，或重训（清空重来）：`,
-                en: `Resuming "${name}" needs the config to match the workspace exactly. These differ — set them back to resume, or retrain (wipe):`,
-                ja: `「${name}」の続行には設定が元と完全一致が必要です。以下が相違——一致させれば続行可、または再学習（消去）：`,
-              },
-              rlang,
-            ) +
-            "\n\n" +
-            list +
-            diffWarn,
-          buttons: [
-            { id: "retrain", label: t("training.retrain"), kind: "danger" },
-            { id: "cancel", label: t("training.cancel") },
-          ],
-        });
-        if (choice !== "retrain") return;
-        fresh = true;
-        wipeConfirmed = true;
-      } else {
-        // everything matches → the classic resume/retrain choice
-        const choice = await showConfirm({
-          title: t("training.confirmExistTitle"),
-          body: t("training.confirmExistBody", { name }) + diffWarn,
-          buttons: [
-            { id: "resume", label: t("training.resume"), kind: "primary" },
-            { id: "retrain", label: t("training.retrain"), kind: "danger" },
-            { id: "cancel", label: t("training.cancel") },
-          ],
-        });
-        if (choice !== "resume" && choice !== "retrain") return;
-        fresh = choice === "retrain";
-        wipeConfirmed = fresh;
-      }
+      // S78: the resume-guarded params can no longer DIFFER — the parameters page renders them
+      // read-only from the slot's own values (`resume_lock` + `lib/resumeLock.ts`), and the
+      // speaker set comes from the project's on-disk directories rather than a form. So this is
+      // back to the plain resume/retrain choice.
+      //
+      // What used to be here was an itemized「配置与原工作区不一致」dialog: six inline t18
+      // literals (outside the i18n JSON, so the parity gate never saw them) re-deriving the
+      // guard's rule a third time. Keeping a copy that can only ever disagree with the source is
+      // how a dialog ends up promising 续训 for a start the backend refuses.
+      const choice = await showConfirm({
+        title: t("training.confirmExistTitle"),
+        body: t("training.confirmExistBody", { name }) + diffWarn,
+        buttons: [
+          { id: "resume", label: t("training.resume"), kind: "primary" },
+          { id: "retrain", label: t("training.retrain"), kind: "danger" },
+          { id: "cancel", label: t("training.cancel") },
+        ],
+      });
+      if (choice !== "resume" && choice !== "retrain") return;
+      fresh = choice === "retrain";
+      wipeConfirmed = fresh;
       // (The old `else if (wsExists)` branch — "the slot exists but its facts are unreadable" —
       // is gone with the fail-open probe that produced it. `get_training_slot_info` either
       // answers or the start is refused above; an unreadable MANIFEST still lands in the branch

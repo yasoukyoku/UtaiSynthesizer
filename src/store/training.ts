@@ -628,6 +628,10 @@ interface TrainingStoreState {
    *  stale form would train project B out of project A's audio and REPLACE B's dataset with it. */
   enterProject: (projectId: string, seg?: TrainingSeg) => void;
   setDiffWsInfo: (info: WorkspaceInfo | null) => void;
+  /** The CURRENT backend's slot facts (`get_training_slot_info`). Drives the parameters page's
+   *  read-only rendering of the resume-locked fields; null = no project / never ran / read failed. */
+  slotInfo: WorkspaceInfo | null;
+  setSlotInfo: (info: WorkspaceInfo | null) => void;
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
   /** ①c: which singer card a file-drag is currently over (highlight target);
    *  null = none. Set by the drag handler, read by the DataStep cards. */
@@ -672,6 +676,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   route: { seg: "projects", projectId: "" },
   starting: false,
   diffWsInfo: null,
+  slotInfo: null,
   poolFlat: false,
   poolCount: 0,
   projectDataset: null,
@@ -746,6 +751,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         // so leaving the previous project's pick behind means「导入数据」opens the wrong shape.
         config: { ...s.config, modelName: isLiveRun ? live.model_name : "", backend },
         diffWsInfo: null,
+        slotInfo: null,
         // Unknown until the new project's detail loads and re-derives it — leaving the old
         // project's value would let a run skip the data page on a project that has none.
         poolFlat: false,
@@ -763,6 +769,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         : {},
     ),
   setDiffWsInfo: (info) => set({ diffWsInfo: info }),
+  setSlotInfo: (info) => set({ slotInfo: info }),
   updateConfig: (u) => set((s) => ({ config: { ...s.config, ...u } })),
 
   setDragOverSpeakerId: (id) => set({ dragOverSpeakerId: id }),

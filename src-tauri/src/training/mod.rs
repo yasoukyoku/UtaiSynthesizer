@@ -23,6 +23,7 @@ use tauri::Emitter;
 use crate::{Result, UtaiError};
 
 pub mod dsmanifest;
+pub mod resume_lock;
 pub mod tproject;
 
 const STDERR_RING_CAP: usize = 200;
@@ -1437,130 +1438,22 @@ impl TrainingManager {
             req.fresh && req.backend == "sovits_diff" && workspace.exists()
                 && old_manifest.is_some() && has_main;
 
-        // resume-parameter guard: version/sample_rate (and for the sovits main
-        // model the vol_embedding switch — it changes the model architecture AND
-        // the wire inputs) are baked into the workspace artifacts; for a diff
-        // run the version additionally pins the ContentVec space of the cached
-        // .soft.pt files and of the main model the attachment will pair with.
-        // It runs for resumes AND for the diff partial wipe — the partial wipe
-        // keeps the manifest, so a mismatched version could never train
-        // afterwards anyway; deleting first would destroy hours of diffusion
-        // progress and THEN refuse (review F0).
-        if !req.fresh || diff_partial_wipe {
-            if let Some(old) = old_manifest.as_ref() {
-                let old_ver = old["version"].as_str().unwrap_or("");
-                let old_sr = old["sample_rate"].as_str().unwrap_or("");
-                if (!old_ver.is_empty() && old_ver != req.version)
-                    || (!old_sr.is_empty() && old_sr != req.sample_rate)
-                {
-                    return Err(UtaiError::Training(
-                        if req.backend == "sovits_diff" && has_main {
-                            // 重训(仅扩散) cannot unlock the version here — it is
-                            // pinned by the main model; don't suggest it
-                            format!(
-                                "DIFF_VERSION_MISMATCH: {}/{} -> {}/{}",
-                                old_ver, old_sr, req.version, req.sample_rate
-                            )
-                        } else {
-                            format!(
-                                "RESUME_PARAMS_MISMATCH: {}/{} -> {}/{}",
-                                old_ver, old_sr, req.version, req.sample_rate
-                            )
-                        },
-                    ));
-                }
-                if req.backend == "sovits" {
-                    if let Some(old_vol) = old["vol_embedding"].as_bool() {
-                        if old_vol != req.vol_embedding {
-                            return Err(UtaiError::Training(format!(
-                                "RESUME_VOL_EMBEDDING_MISMATCH: {} -> {}",
-                                if old_vol { "on" } else { "off" },
-                                if req.vol_embedding { "on" } else { "off" }
-                            )));
-                        }
-                    }
-                }
-                // ①c: n_speakers + the ordered speaker set are baked into the emb_g
-                // rows — resuming with a different count / order / set would silently
-                // mis-assign every speaker's timbre. Immutable for SoVITS (α), RVC
-                // (α′) and SoVITS 4.0-v2 (S68 emb_spk). (Old single-speaker manifests
-                // have no n_speakers key -> 1, which matches a single-speaker resume
-                // = no false rejection.)
-                if matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") {
-                    let old_n = old["n_speakers"].as_u64().unwrap_or(1);
-                    let cur_n = if req.speakers.len() > 1 {
-                        req.speakers.len() as u64
-                    } else {
-                        1
-                    };
-                    if old_n != cur_n {
-                        return Err(UtaiError::Training(format!(
-                            "RESUME_SPEAKER_COUNT_MISMATCH: {} -> {}",
-                            old_n, cur_n
-                        )));
-                    }
-                    if cur_n > 1 {
-                        // Compare DISPLAY NAMES by position, not recomputed slugs. The slug is a
-                        // `DefaultHasher` derivative: judging identity by it means a toolchain
-                        // bump reports every existing co-trained project as "different speakers"
-                        // and refuses a resume that is in fact unchanged. The name is what the
-                        // user actually typed and what the frozen record stores.
-                        let frozen = frozen_speakers(&data_dir, &project.id, &family);
-                        let named = frozen.len() == cur_n as usize
-                            && frozen.iter().all(|s| !s.name.is_empty());
-                        let same = if named {
-                            frozen
-                                .iter()
-                                .zip(req.speakers.iter())
-                                .all(|(f, s)| f.name == s.name)
-                        } else {
-                            // No name survives anywhere (pre-`speaker_names` AND a diff run
-                            // rewrote run.json without the key). Fall back to the slug
-                            // comparison this guard always did — same toolchain exposure, but
-                            // it is the only identity left.
-                            let old_slugs: Vec<String> = old["speakers"]
-                                .as_array()
-                                .map(|a| {
-                                    a.iter()
-                                        .filter_map(|v| v.as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            old_slugs
-                                == assign_speaker_slugs(&req.speakers)
-                                    .into_iter()
-                                    .map(|(_, s)| s)
-                                    .collect::<Vec<_>>()
-                        };
-                        if !same {
-                            return Err(UtaiError::Training(
-                                "RESUME_SPEAKER_SET_MISMATCH".into(),
-                            ));
-                        }
-                    }
-                }
-                // k_step_max pins the diffusion TRAINING distribution (t ~
-                // [0,k)) and the exported sidecar contract — resuming across a
-                // flip would silently blend two objectives (review F6). The
-                // fresh partial-wipe path resets the progress, so it may change.
-                if req.backend == "sovits_diff" && !req.fresh {
-                    if let (Some(old_k), Some(max_step)) = (
-                        old["diff_k_step_max"].as_u64(),
-                        max_diffusion_step(&workspace),
-                    ) {
-                        if max_step > 0 && old_k != req.k_step_max as u64 {
-                            let show = |k: u64| {
-                                if k == 0 { "full-diffusion".to_string() } else { k.to_string() }
-                            };
-                            return Err(UtaiError::Training(format!(
-                                "RESUME_KSTEP_MISMATCH: {} -> {}",
-                                show(old_k),
-                                show(req.k_step_max as u64)
-                            )));
-                        }
-                    }
-                }
-            }
+        // ---- resume-parameter guard ----
+        // The rule itself lives in `resume_lock` — ONE table plus ONE enforcement, driven
+        // against each other by a unit test, because three other places (the run step's
+        // pre-start dialog, the project page's form restore, the parameters page's read-only
+        // rendering) have to agree with it and used to do so from memory.
+        if let Some(code) = resume_lock::check_resume_locks(
+            &req,
+            &resume_lock::ResumeState {
+                manifest: old_manifest.as_ref(),
+                has_main,
+                max_diffusion_step: max_diffusion_step(&workspace),
+                frozen_speakers: &frozen_speakers(&data_dir, &project.id, &family),
+            },
+            !req.fresh || diff_partial_wipe,
+        ) {
+            return Err(UtaiError::Training(code));
         }
 
         // fail-closed wipe consent: a 重训 that would destroy real work (checkpoints of any
