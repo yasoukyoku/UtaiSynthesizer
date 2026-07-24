@@ -627,7 +627,12 @@ pub async fn import_project_dataset(
                     // a NEW singer changes the speaker set — refuse while any slot's emb_g rows
                     // depend on it
                     if let Some(fam) = frozen_structure_family(&data_dir, &project_id) {
-                        return Err(format!("DATASET_SPEAKERS_FROZEN: {fam}"));
+                        // The family id goes to the LOG, not into the message: the text already
+                        // explains what to do, and a bare「(rvc)」tacked onto the end of a
+                        // paragraph reads as noise (the error funnel appends any payload
+                        // verbatim in parentheses — it is for names and paths, not internal ids).
+                        tracing::info!("refusing new speaker in {project_id}: {fam} froze the set");
+                        return Err("DATASET_SPEAKERS_FROZEN".into());
                     }
                     let base = crate::training::slugify(n);
                     let mut s = base.clone();
@@ -684,7 +689,8 @@ pub async fn delete_project_dataset_files(
     let plan = crate::training::dsmanifest::plan_delete(&facts, &rels);
     if !plan.emptied_speakers.is_empty() {
         if let Some(fam) = frozen.as_deref() {
-            return Err(format!("DATASET_SPEAKERS_FROZEN: {fam}"));
+            tracing::info!("refusing to empty a speaker in {project_id}: {fam} froze the set");
+            return Err("DATASET_SPEAKERS_FROZEN".into());
         }
     }
     crate::training::dsmanifest::delete_files(&data_dir, &project_id, &rels, frozen.is_none())

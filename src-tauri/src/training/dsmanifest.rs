@@ -560,18 +560,25 @@ pub fn resolve_speakers(
         };
     }
 
-    // `dataset.json` wins outright: it is written BY the import that created these directories,
-    // so it describes this exact dataset — where a slot manifest describes what that slot was
-    // last trained on, which may predate a data replacement.
-    if same_set(annotated) {
-        return DatasetView {
-            groups: annotated.to_vec(),
-            order_known: true,
-        };
-    }
-
+    // ★ A slot's FROZEN record wins over the annotation. The frozen order is not an opinion: it
+    // is the emb_g row order the model was actually trained with, and a resume refuses anything
+    // else. The annotation's order is merely the order files happened to be imported in — which
+    // for a project that already trained can differ (append to teto first and its list reads
+    // [teto, sayo]), and publishing THAT as the emb_g order is precisely the mistake that makes
+    // a manual rebuild swap every singer's voice.
+    //
+    // Staleness is handled by `same_set`, not by precedence: a frozen record from before a data
+    // replacement describes speakers that are no longer on disk, so it is not usable at all.
     let usable: Vec<&Vec<DsSpeaker>> = frozen.iter().filter(|c| same_set(c)).collect();
     let Some(first) = usable.first() else {
+        // Nothing has trained on this shape yet ⇒ the annotation IS the order: it is what the
+        // data page shows, what a first run will declare, and therefore what gets frozen.
+        if same_set(annotated) {
+            return DatasetView {
+                groups: annotated.to_vec(),
+                order_known: true,
+            };
+        }
         return fallback();
     };
     let slugs_of = |c: &Vec<DsSpeaker>| -> Vec<String> { c.iter().map(|s| s.slug.clone()).collect() };
@@ -612,15 +619,42 @@ mod tests {
         assert!(v.order_known);
     }
 
+    /// ★ The frozen order OUTRANKS the annotation, and the reason is not a preference.
+    ///
+    /// The annotation's order is「文件是按什么顺序导进来的」— append to B first and its list
+    /// reads [B, A]. The frozen order is the emb_g row order the model was TRAINED with, and a
+    /// resume refuses anything else. Publishing the import order as the emb_g order is exactly
+    /// how a manual rebuild ends up swapping every singer's voice.
+    ///
+    /// (Caught on real data: a project trained as [sayo, teto] whose annotation only had `sayo`
+    /// in it — one more append to `teto` and the annotation would have become "complete" and
+    /// started overriding the truth.)
     #[test]
-    fn annotation_wins_and_carries_the_order() {
+    fn a_trained_order_outranks_the_import_order() {
         let disk = vec!["b_2".to_string(), "a_1".to_string()];
         let ann = vec![sp("a_1", "亚里沙"), sp("b_2", "Bella")];
-        // a slot that disagrees must NOT override the annotation
         let frozen = vec![vec![sp("b_2", "Bella"), sp("a_1", "亚里沙")]];
         let v = resolve_speakers(&disk, &ann, &frozen);
         assert!(v.order_known);
+        assert_eq!(
+            v.groups,
+            vec![sp("b_2", "Bella"), sp("a_1", "亚里沙")],
+            "the trained slot decides; the annotation only records how files arrived"
+        );
+    }
+
+    /// …but with nothing trained on this shape, the annotation IS the order: it is what the data
+    /// page shows, what the first run declares, and therefore what gets frozen.
+    #[test]
+    fn the_annotation_is_the_order_until_something_trains_on_it() {
+        let disk = vec!["b_2".to_string(), "a_1".to_string()];
+        let ann = vec![sp("a_1", "亚里沙"), sp("b_2", "Bella")];
+        let v = resolve_speakers(&disk, &ann, &[]);
+        assert!(v.order_known);
         assert_eq!(v.groups, ann);
+        // a frozen record that describes OTHER speakers is stale, not authoritative
+        let stale = vec![vec![sp("x_9", "X"), sp("y_8", "Y")]];
+        assert_eq!(resolve_speakers(&disk, &ann, &stale).groups, ann);
     }
 
     #[test]
