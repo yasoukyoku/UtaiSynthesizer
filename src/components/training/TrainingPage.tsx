@@ -38,14 +38,14 @@ import {
   voiceVersionBadge,
   type VoiceModelEntry,
 } from "../../store/voice-models";
-import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
+import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtDur, fmtSize } from "../../lib/constants";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { t18 } from "../../lib/models/msst-catalog";
 import { preview } from "../common/previewPlayer";
-import { Scrubber } from "../common/Scrubber";
+import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
 import { LossChart, type LossChartHandle } from "./LossChart";
 import "./TrainingPage.css";
 
@@ -61,16 +61,6 @@ const STAGE_ORDERS: Record<string, string[]> = {
   sovits_diff: ["import", "slice", "augment", "extract", "aug_check", "filelist", "diff_prep", "train_prep"],
   vocoder: ["import", "slice", "augment", "process", "aug_check", "filelist", "train_prep"],
 };
-
-function fmtDur(totalSecs: number): string {
-  const s = Math.max(0, Math.floor(totalSecs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
-    : `${m}:${String(sec).padStart(2, "0")}`;
-}
 
 export function TrainingPage() {
   const { t } = useTranslation();
@@ -428,44 +418,16 @@ function DataStep() {
   // ①c: SoVITS (α) + RVC (α′) data is a SINGER LIST (default 1 singer = single-speaker);
   // diff/vocoder keep the flat file list.
   const singerList = backendSupportsMultiSpeaker(config.backend);
-  const [playingPath, setPlayingPath] = useState<string | null>(null);
-  const [loadingPath, setLoadingPath] = useState<string | null>(null);
-  const [paused, setPaused] = useState(false);
-  const [pos, setPos] = useState(0); // seconds into the active file
-  const rafRef = useRef<number | null>(null);
-  const playTokenRef = useRef(0); // guards a superseded decode from starting playback
-
-  const stopTicker = () => {
-    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-  };
-  const runTicker = () => {
-    stopTicker();
-    const tick = () => {
-      setPos(preview.position);
-      rafRef.current = requestAnimationFrame(tick);
-    };
-    rafRef.current = requestAnimationFrame(tick);
-  };
-  // reset local preview state — preview.stop() does NOT fire onEnd, so callers
-  // that stop playback explicitly (remove-file / remove-singer) must reset here
-  // or playingPath + the rAF ticker leak (and a same-path file in another group
-  // would show a false "playing" indicator)
-  const resetPreviewState = () => {
-    stopTicker();
-    setPlayingPath(null);
-    setPaused(false);
-    setPos(0);
-  };
-
-  useEffect(() => {
-    preview.onEnd = resetPreviewState;
-    return () => {
-      preview.onEnd = null;
-      stopTicker();
-      preview.stop();
-    };
-  }, []);
+  // Preview + row rendering are shared with the project detail page (PreviewFileRow). The
+  // predicate is the same guard this step always had: a long file's decode outlives the gesture,
+  // and the file may live in the flat list OR any singer group by then.
+  const p = useFilePreview((path) => {
+    const st = useTrainingStore.getState();
+    return (
+      st.dataset.some((f) => f.path === path) ||
+      st.speakerGroups.some((g) => g.files.some((f) => f.path === path))
+    );
+  });
 
   const pickFiles = async () => {
     const picked = await open({
@@ -477,60 +439,7 @@ function DataStep() {
     await addFiles(Array.isArray(picked) ? picked : [picked]);
   };
 
-  const togglePlay = async (path: string) => {
-    if (playingPath === path) {
-      if (paused) {
-        preview.resume();
-        setPaused(false);
-        runTicker();
-      } else {
-        preview.pause();
-        setPaused(true);
-        stopTicker();
-      }
-      return;
-    }
-    preview.stop();
-    stopTicker();
-    const token = ++playTokenRef.current;
-    setPlayingPath(path);
-    setLoadingPath(path);
-    setPaused(false);
-    setPos(0);
-    try {
-      // Read the ORIGINAL file directly (fs scope allows **) and decode on the
-      // player's own context. This deliberately skips load_audio_file — that
-      // command fully re-decodes + extracts waveform peaks (unused here) + writes
-      // a cache-WAV copy, which for a 35-min file is the multi-second stall; a
-      // preview only needs the decoded samples.
-      const bytes = await readFile(path);
-      const buffer = await preview.decode(bytes);
-      // superseded by a newer play gesture (or the file was removed) while decoding
-      if (token !== playTokenRef.current) return;
-      // ①c: the file may live in the flat dataset OR a speaker group
-      const st = useTrainingStore.getState();
-      const stillPresent =
-        st.dataset.some((f) => f.path === path) ||
-        st.speakerGroups.some((g) => g.files.some((f) => f.path === path));
-      if (!stillPresent) {
-        setPlayingPath(null);
-        setLoadingPath(null);
-        return;
-      }
-      await preview.play(path, buffer);
-      setLoadingPath(null);
-      runTicker();
-    } catch (e) {
-      if (token !== playTokenRef.current) return;
-      preview.stop();
-      setPlayingPath(null);
-      setLoadingPath(null);
-      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
-    }
-  };
-
   const totalMs = dataset.reduce((acc, f) => acc + (f.durationMs ?? 0), 0);
-  const activeDur = preview.duration || 0;
 
   const pickSpeakerFiles = async (id: string) => {
     const picked = await open({
@@ -542,65 +451,19 @@ function DataStep() {
     await addSpeakerFiles(id, Array.isArray(picked) ? picked : [picked]);
   };
 
-  // one file row (play / scrub / remove) — shared by the flat list AND each
-  // speaker group so the preview logic stays single-source. onRemove differs
-  // (removeFile vs removeSpeakerFile) but the play/scrub state is by path.
-  const renderFileRow = (f: DatasetFile, onRemove: () => void) => {
-    const isActive = playingPath === f.path;
-    const isLoading = loadingPath === f.path;
-    const isPlaying = isActive && !paused && !isLoading;
-    return (
-      <div key={f.path} className="training-file-row" title={f.path}>
-        <div className="training-file-main">
-          <button
-            className={`training-file-play ${isPlaying ? "on" : ""} ${isLoading ? "loading" : ""}`}
-            onClick={() => void togglePlay(f.path)}
-            disabled={isLoading}
-            title={
-              isLoading
-                ? t("training.loadingPreview")
-                : isPlaying
-                  ? t("training.pausePreview")
-                  : t("training.preview")
-            }
-          >
-            {isLoading ? "◌" : isPlaying ? "❚❚" : "▶"}
-          </button>
-          <span className="training-file-name">{f.name}</span>
-          <span className="training-file-dur">
-            {isActive && activeDur > 0
-              ? `${fmtDur(pos)} / ${fmtDur(activeDur)}`
-              : f.durationMs != null
-                ? fmtDur(f.durationMs / 1000)
-                : "--:--"}
-          </span>
-          <button
-            className="training-file-remove"
-            onClick={() => {
-              if (isActive) {
-                preview.stop();
-                resetPreviewState();
-              }
-              onRemove();
-            }}
-            title={t("training.remove")}
-          >
-            X
-          </button>
-        </div>
-        {isActive && activeDur > 0 && (
-          <Scrubber
-            className="training-scrubber-slot"
-            value={pos / activeDur}
-            onSeek={(frac) => {
-              preview.seek(frac);
-              setPos(preview.position);
-            }}
-          />
-        )}
-      </div>
-    );
-  };
+  // one file row (play / scrub / remove) — shared by the flat list AND each speaker group so
+  // the preview logic stays single-source. onRemove differs (removeFile vs removeSpeakerFile)
+  // but the play/scrub state is by path.
+  const renderFileRow = (f: DatasetFile, onRemove: () => void) => (
+    <PreviewFileRow
+      key={f.path}
+      p={p}
+      path={f.path}
+      name={f.name}
+      meta={f.durationMs != null ? fmtDur(f.durationMs / 1000) : undefined}
+      onRemove={onRemove}
+    />
+  );
 
   return (
     <div className="training-data-step">
@@ -652,9 +515,9 @@ function DataStep() {
                       onClick={() => {
                         // stop an in-progress preview of a file in THIS singer
                         // before the row (and its scrubber) unmounts
-                        if (playingPath && g.files.some((f) => f.path === playingPath)) {
-                          preview.stop();
-                          resetPreviewState();
+                        const active = p.playingPath;
+                        if (active && g.files.some((f) => f.path === active)) {
+                          p.stopIfPlaying(active);
                         }
                         removeSpeaker(g.id);
                       }}

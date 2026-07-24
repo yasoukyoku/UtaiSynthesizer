@@ -349,9 +349,18 @@
   padding: var(--space-sm) var(--space-md);
 }
 
+/* 小标题兼提示锚点:「序号=emb_g、错一位全错位」是规则不是状态,常驻显示只会变噪音,
+   所以挂在 title 上。cursor 是它唯一的可发现性线索。 */
 .tproj-ds-sub {
   color: var(--text-secondary);
   font-size: var(--font-size-xs);
+  cursor: help;
+}
+
+/* 文件列表的展开钮用的是 `.training-btn small`(有框),这里只管它在列式容器里别被拉满 */
+.tproj-ds-toggle {
+  align-self: flex-start;
+  margin-top: var(--space-md);
 }
 
 .tproj-ds-spk-row {

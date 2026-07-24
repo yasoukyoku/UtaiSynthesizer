@@ -63,3 +63,15 @@ export const fmtSize = (b: number) =>
     : b >= 1e6
       ? `${(b / 1e6).toFixed(1)} MB`
       : `${Math.max(0, Math.round(b / 1e3))} KB`;
+
+/** Duration for display, `m:ss` (or `h:mm:ss` past an hour). SINGLE source — lived inside
+ *  TrainingPage until the shared preview row (S76 批 5a) needed the identical readout. */
+export function fmtDur(totalSecs: number): string {
+  const s = Math.max(0, Math.floor(totalSecs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+    : `${m}:${String(sec).padStart(2, "0")}`;
+}

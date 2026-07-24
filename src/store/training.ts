@@ -233,6 +233,8 @@ export interface DatasetGroupRow {
 export interface DatasetSummary {
   files: number;
   bytes: number;
+  /** Absolute path of `<project>/dataset` — join with a row's `rel` to read the audio. */
+  datasetDir: string;
   /** Sorted slugs. `poolFlat` keys on its emptiness — the ordered, named view is `groups`. */
   speakers: string[];
   entries: DatasetFileRow[];

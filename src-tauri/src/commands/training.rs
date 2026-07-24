@@ -490,6 +490,10 @@ pub struct DatasetGroupRow {
 pub struct DatasetSummary {
     pub files: u32,
     pub bytes: u64,
+    /// Absolute path of `<project>/dataset`. The UI joins it with a row's `rel` to preview the
+    /// audio — the frontend must never rebuild this from the data root, which it does not know
+    /// (and which the user can move).
+    pub dataset_dir: String,
     /// Per-speaker subdirectory names (multi-singer projects). Empty = flat, single speaker.
     /// SORTED — kept as-is because `poolFlat` keys on its emptiness; the ordered, named view is
     /// `groups`.
@@ -631,6 +635,7 @@ pub async fn get_training_project(
         dataset: DatasetSummary {
             files: facts.files,
             bytes: crate::commands::storage::dir_size(&dataset_dir),
+            dataset_dir: dataset_dir.to_string_lossy().into_owned(),
             speakers: facts.speaker_slugs,
             entries,
             groups,

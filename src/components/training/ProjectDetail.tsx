@@ -32,6 +32,7 @@ import {
 } from "../../store/training";
 import { backendErrorMessage } from "../../lib/backendError";
 import { fmtSize } from "../../lib/constants";
+import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
 import "./TrainingProjects.css";
 
 /** The four architecture slots, in the order the old card grid used. `sovits_diff` is NOT one of
@@ -64,6 +65,10 @@ export function ProjectDetail() {
   /** The file list is collapsed by default: a real dataset is hundreds of rows, and the counts
    *  above already answer「有没有数据」. It is the「当初导入的到底是什么」question that needs it. */
   const [showFiles, setShowFiles] = useState(false);
+  /** 试听 for the files the project already holds — same player and same row as the data step.
+   *  No presence predicate: these rows come from the disk listing, and nothing on this page can
+   *  remove a file while a decode is in flight (deleting arrives with the data page in 批 5b). */
+  const filePreview = useFilePreview();
 
   const load = useCallback(async () => {
     if (!projectId) return;
@@ -362,7 +367,12 @@ export function ProjectDetail() {
                 is worse here than an honest「顺序未记录」. */}
             {detail.dataset.groups.length > 0 && (
               <div className="tproj-ds-block">
-                <div className="tproj-ds-sub">{t("training.projectDatasetStructure")}</div>
+                {/* The「错一位整批错位」rule is a RULE, not a state — it reads as noise pinned
+                    under the table, so it lives on hover. What stays on screen is the one thing
+                    that IS a state: whether the order is known at all. */}
+                <div className="tproj-ds-sub" title={t("training.projectDatasetOrderNote")}>
+                  {t("training.projectDatasetStructure")}
+                </div>
                 {detail.dataset.groups.map((g, i) => (
                   <div key={g.slug} className="tproj-ds-spk-row">
                     {detail.dataset.orderKnown && (
@@ -376,18 +386,17 @@ export function ProjectDetail() {
                     </span>
                   </div>
                 ))}
-                <div className="tproj-ds-note">
-                  {detail.dataset.orderKnown
-                    ? t("training.projectDatasetOrderNote")
-                    : t("training.projectDatasetOrderUnknown")}
-                </div>
+                {!detail.dataset.orderKnown && (
+                  <div className="tproj-ds-note">
+                    {t("training.projectDatasetOrderUnknown")}
+                  </div>
+                )}
               </div>
             )}
 
             {/* ── 文件列表 ─────────────────────────────────────────────── */}
             <button
-              /* same affordance as the params page's 高级 disclosure — single source */
-              className="training-advanced-toggle"
+              className="training-btn small tproj-ds-toggle"
               onClick={() => setShowFiles((v) => !v)}
               aria-expanded={showFiles}
             >
@@ -403,19 +412,22 @@ export function ProjectDetail() {
                       ? detail.dataset.groups.find((g) => g.slug === slug)
                       : undefined;
                     return (
-                      <div key={e.rel} className="training-file-row" title={e.rel}>
-                        <div className="training-file-main">
-                          {slug && (
+                      <PreviewFileRow
+                        key={e.rel}
+                        p={filePreview}
+                        // `rel` is forward-slashed by contract; Windows takes it as-is
+                        path={`${detail.dataset.datasetDir}/${e.rel}`}
+                        title={e.rel}
+                        lead={
+                          slug ? (
                             <span className="tproj-ds-file-spk">{owner?.name || slug}</span>
-                          )}
-                          {/* No original name = imported before the annotation existed. Showing
-                              the on-disk name is the honest fallback; inventing one is not. */}
-                          <span className="training-file-name tproj-ds-file">
-                            {e.name || e.rel}
-                          </span>
-                          <span className="training-file-dur">{fmtSize(e.bytes)}</span>
-                        </div>
-                      </div>
+                          ) : undefined
+                        }
+                        // No original name = imported before the annotation existed. Showing the
+                        // on-disk name is the honest fallback; inventing one is not.
+                        name={e.name || e.rel}
+                        meta={fmtSize(e.bytes)}
+                      />
                     );
                   })}
                 </div>
@@ -481,7 +493,12 @@ export function ProjectDetail() {
                     (RESUME_SPEAKER_SET_MISMATCH), so it belongs on the card that offers 继续训练. */}
                 {slot && slot.info.speakers.length > 1 && (
                   <div className="tproj-slot-spk">
-                    <span className="tproj-ds-sub">{t("training.slotSpeakers")}</span>
+                    <span
+                      className="tproj-ds-sub"
+                      title={t("training.projectDatasetOrderNote")}
+                    >
+                      {t("training.slotSpeakers")}
+                    </span>
                     {slot.info.speakers.map((n, i) => (
                       <span key={`${i}:${n}`} className="tproj-slot-spk-item">
                         <span className="training-spk-idx">{i}</span>
