@@ -616,11 +616,15 @@ interface TrainingStoreState {
   /** How many files that on-disk dataset holds (0 = none). Same source and lifetime as
    *  `poolFlat`; the data page needs the COUNT to say what picking files would replace. */
   poolCount: number;
+  /** The project's on-disk dataset as last read — the DATA the two derived flags above summarise.
+   *  Held so the data page can list it without a fetch of its own (two fetches of the same thing
+   *  is how two screens end up disagreeing about whether a project has data). */
+  projectDataset: DatasetSummary | null;
 
   setRoute: (r: TrainingRoute) => void;
-  /** ONE writer for both fields — they answer the same question and a separate setter each is
-   *  how they drift apart. `speakers` is the number of per-singer subdirectories. */
-  setPool: (files: number, speakers: number) => void;
+  /** ONE writer for all three — they answer the same question, and a setter each is exactly how
+   *  they drift apart. `null` = unknown (no project / the read failed). */
+  setProjectDataset: (d: DatasetSummary | null) => void;
   /** Move within the CURRENT project. Refuses when there is none — every segment past the
    *  landing is about a project, and a `projectId: ""` route would silently address
    *  `<training>/` itself. */
@@ -694,9 +698,15 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   diffWsInfo: null,
   poolFlat: false,
   poolCount: 0,
+  projectDataset: null,
 
   setRoute: (r) => set({ route: r }),
-  setPool: (files, speakers) => set({ poolCount: files, poolFlat: files > 0 && speakers === 0 }),
+  setProjectDataset: (d) =>
+    set({
+      projectDataset: d,
+      poolCount: d?.files ?? 0,
+      poolFlat: !!d && d.files > 0 && d.speakers.length === 0,
+    }),
   enterProject: (projectId, seg = "detail") => {
     // Invalidate everything that is mid-flight FOR THE OLD PROJECT: an in-progress file probe
     // (`addFiles`) and an in-progress archive scan (`refreshProjectCkpts`) would otherwise land
@@ -724,6 +734,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         // project's value would let a run skip the data page on a project that has none.
         poolFlat: false,
         poolCount: 0,
+        projectDataset: null,
         projectCkpts: [],
       };
     });

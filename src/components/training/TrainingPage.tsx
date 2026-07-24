@@ -20,6 +20,7 @@ import {
   useTrainingStore,
   type CkptInfo,
   type DatasetFile,
+  type ProjectDetail as ProjectDetailData,
   type TrainingGpu,
   type WorkspaceInfo,
   backendFamily,
@@ -109,21 +110,16 @@ export function TrainingPage() {
   useEffect(() => {
     const pid = route.projectId;
     if (!pid) {
-      useTrainingStore.getState().setPool(0, 0);
+      useTrainingStore.getState().setProjectDataset(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
-        const d = await invoke<{ dataset: { files: number; speakers: string[] } }>(
-          "get_training_project",
-          { projectId: pid },
-        );
-        if (!cancelled) {
-          useTrainingStore.getState().setPool(d.dataset.files, d.dataset.speakers.length);
-        }
+        const d = await invoke<ProjectDetailData>("get_training_project", { projectId: pid });
+        if (!cancelled) useTrainingStore.getState().setProjectDataset(d.dataset);
       } catch {
-        if (!cancelled) useTrainingStore.getState().setPool(0, 0);
+        if (!cancelled) useTrainingStore.getState().setProjectDataset(null);
       }
     })();
     return () => {

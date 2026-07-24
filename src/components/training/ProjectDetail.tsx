@@ -141,7 +141,7 @@ export function ProjectDetail() {
       // The page-root effect derives `poolFlat` on route change only, so a dataset edited HERE
       // would leave it stale for the rest of the session — and it is what decides whether the
       // run may skip the data page. Refresh it from the same response.
-      useTrainingStore.getState().setPool(d.dataset.files, d.dataset.speakers.length);
+      useTrainingStore.getState().setProjectDataset(d.dataset);
       setError(null);
     } catch (e) {
       setError(backendErrorMessage(e) ?? String(e));

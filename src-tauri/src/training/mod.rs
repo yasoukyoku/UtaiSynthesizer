@@ -772,6 +772,43 @@ pub(crate) fn slugify(name: &str) -> String {
     format!("{}_{:08x}", base, h.finish() as u32)
 }
 
+/// The `(display name, slug)` this run must use for each co-trained speaker.
+///
+/// Fresh run ⇒ derive from the names. RESUME of a slot that already froze a speaker set ⇒ REUSE
+/// the frozen slugs, matched to the current names BY POSITION (the emb_g row order is what the
+/// resume guard demands be identical anyway).
+///
+/// Why reuse rather than re-derive: `slugify` hash-suffixes with `DefaultHasher` (SipHash-1-3),
+/// which std explicitly does not promise to keep stable across Rust releases — and the slug is
+/// the `dataset/<slug>/` directory name, the `dataset_44k/<slug>/` slice directory and the
+/// `config.spk` key. Re-deriving on every start means one toolchain bump turns every existing
+/// multi-speaker project unresumable AND orphans its data directories. (Frozen values are only
+/// adopted when the COUNT matches; anything else is a genuine structure change and falls through
+/// to the resume guard, which refuses it with a specific CODE.)
+fn effective_speaker_slugs(
+    data_dir: &Path,
+    project_id: &str,
+    family: &str,
+    req: &StartTrainingRequest,
+) -> Vec<(String, String)> {
+    if req.speakers.len() <= 1 {
+        return Vec::new();
+    }
+    let fresh = assign_speaker_slugs(&req.speakers);
+    if req.fresh {
+        return fresh;
+    }
+    let frozen = frozen_speakers(data_dir, project_id, family);
+    if frozen.len() != req.speakers.len() {
+        return fresh;
+    }
+    req.speakers
+        .iter()
+        .zip(frozen.iter())
+        .map(|(sp, fz)| (sp.name.clone(), fz.slug.clone()))
+        .collect()
+}
+
 /// ①c deterministic ASCII slug per co-trained speaker — the slug is the
 /// dataset_44k subdir name AND the config.spk key AND (by list order) the
 /// emb_g id, so it MUST be stable across resume (frozen in the manifest) and
@@ -1110,17 +1147,72 @@ impl TrainingManager {
                         name
                     )));
                 }
-                if sp.files.is_empty() {
-                    return Err(UtaiError::Training(format!(
-                        "TRAINING_SPEAKER_NO_DATA: {}",
-                        name
-                    )));
-                }
                 for f in &sp.files {
                     if !Path::new(f).is_file() {
                         return Err(UtaiError::Training(format!(
                             "TRAINING_DATA_FILE_MISSING: {}",
                             f
+                        )));
+                    }
+                }
+            }
+            // ── S78: 结构声明式复用 ──────────────────────────────────────────
+            // Every group empty = 「就用这个项目盘上已有的这套歌手结构」, the multi-speaker twin
+            // of the flat reuse path. Expressing it as「把磁盘上那些文件的路径原样传回来」would
+            // also work today (an exactly-matching plan is a no-op) but only by coincidence: one
+            // removed file renumbers the rest, one renamed singer changes a slug, and the request
+            // silently becomes a full REPLACE of the shared dataset instead.
+            //
+            // The declaration is checked against the disk here, loudly, because nothing later
+            // will: the import loop has nothing to copy and python would just train on whatever
+            // subdirectories happen to exist.
+            let declared_only = req.speakers.iter().all(|s| s.files.is_empty());
+            let partial = !declared_only && req.speakers.iter().any(|s| s.files.is_empty());
+            if partial {
+                // half a declaration is not a declaration — the empty ones would silently get an
+                // emb_g row with no audio
+                let who = req
+                    .speakers
+                    .iter()
+                    .find(|s| s.files.is_empty())
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                return Err(UtaiError::Training(format!("TRAINING_SPEAKER_NO_DATA: {who}")));
+            }
+            if declared_only {
+                let existing = existing_project.as_ref();
+                let ds = match existing {
+                    Some(p) => tproject::dataset_dir(&data_dir, &p.id),
+                    None => return Err(UtaiError::Training("TRAINING_NO_DATA".into())),
+                };
+                let on_disk: std::collections::BTreeSet<String> = std::fs::read_dir(&ds)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().is_dir())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let declared: std::collections::BTreeSet<String> = effective_speaker_slugs(
+                    &data_dir,
+                    &existing.unwrap().id,
+                    backend_family(&req.backend),
+                    &req,
+                )
+                .into_iter()
+                .map(|(_, s)| s)
+                .collect();
+                if on_disk.is_empty() || on_disk != declared {
+                    return Err(UtaiError::Training("PROJECT_DATASET_SHAPE".into()));
+                }
+                // a speaker directory with no audio would train an emb_g row on nothing
+                for slug in &declared {
+                    let empty = std::fs::read_dir(ds.join(slug))
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true);
+                    if empty {
+                        return Err(UtaiError::Training(format!(
+                            "TRAINING_SPEAKER_NO_DATA: {slug}"
                         )));
                     }
                 }
@@ -1240,7 +1332,14 @@ impl TrainingManager {
         // The placement matters: `training/mod.rs`'s own history says a refusal on a fully
         // decidable condition must never cost a wiped slot plus a multi-minute import.
         let dataset_dir = tproject::dataset_dir(&data_dir, &project.id);
-        let planned = dataset_plan(&req);
+        // ①c/S78: the run's EFFECTIVE speaker slugs, decided once here and carried in `RunCtx`.
+        // A RESUME reuses what the slot froze instead of re-deriving from the names — `slugify`
+        // hash-suffixes with `DefaultHasher`, which std does not promise to keep stable across
+        // Rust releases, and every one of those slugs is a directory name on disk plus a
+        // `config.spk` key. Re-deriving would mean a toolchain bump silently renames every
+        // co-trained speaker's data directory out from under a half-trained model.
+        let eff_speakers = effective_speaker_slugs(&data_dir, &project.id, &family, &req);
+        let planned = dataset_plan(&req, &eff_speakers);
         if !planned.is_empty() {
             let replacing = !current_dataset_listing(&dataset_dir).is_empty()
                 && !dataset_matches(&dataset_dir, &planned);
@@ -1401,19 +1500,39 @@ impl TrainingManager {
                         )));
                     }
                     if cur_n > 1 {
-                        let old_slugs: Vec<String> = old["speakers"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let cur_slugs: Vec<String> = assign_speaker_slugs(&req.speakers)
-                            .into_iter()
-                            .map(|(_, s)| s)
-                            .collect();
-                        if old_slugs != cur_slugs {
+                        // Compare DISPLAY NAMES by position, not recomputed slugs. The slug is a
+                        // `DefaultHasher` derivative: judging identity by it means a toolchain
+                        // bump reports every existing co-trained project as "different speakers"
+                        // and refuses a resume that is in fact unchanged. The name is what the
+                        // user actually typed and what the frozen record stores.
+                        let frozen = frozen_speakers(&data_dir, &project.id, &family);
+                        let named = frozen.len() == cur_n as usize
+                            && frozen.iter().all(|s| !s.name.is_empty());
+                        let same = if named {
+                            frozen
+                                .iter()
+                                .zip(req.speakers.iter())
+                                .all(|(f, s)| f.name == s.name)
+                        } else {
+                            // No name survives anywhere (pre-`speaker_names` AND a diff run
+                            // rewrote run.json without the key). Fall back to the slug
+                            // comparison this guard always did — same toolchain exposure, but
+                            // it is the only identity left.
+                            let old_slugs: Vec<String> = old["speakers"]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            old_slugs
+                                == assign_speaker_slugs(&req.speakers)
+                                    .into_iter()
+                                    .map(|(_, s)| s)
+                                    .collect::<Vec<_>>()
+                        };
+                        if !same {
                             return Err(UtaiError::Training(
                                 "RESUME_SPEAKER_SET_MISMATCH".into(),
                             ));
@@ -1535,9 +1654,9 @@ impl TrainingManager {
         // for SoVITS (α), RVC (α′) and SoVITS 4.0-v2 (S68). Only written for a genuine
         // co-training (>1) so a single-speaker manifest stays byte-identical to pre-①c.
         if matches!(req.backend.as_str(), "sovits" | "rvc" | "sovits_v2") && req.speakers.len() > 1 {
-            let assigned = assign_speaker_slugs(&req.speakers);
-            let slugs: Vec<String> = assigned.iter().map(|(_, s)| s.clone()).collect();
-            let names: Vec<String> = assigned.iter().map(|(n, _)| n.clone()).collect();
+            // the EFFECTIVE list — a resume re-freezes exactly the slugs it inherited
+            let slugs: Vec<String> = eff_speakers.iter().map(|(_, s)| s.clone()).collect();
+            let names: Vec<String> = eff_speakers.iter().map(|(n, _)| n.clone()).collect();
             manifest["n_speakers"] = serde_json::json!(slugs.len());
             manifest["speakers"] = serde_json::json!(slugs);
             // ①c: display NAMES too. The manifest is merge-preserved across a later sovits_diff run
@@ -1645,6 +1764,7 @@ impl TrainingManager {
             device_backend,
             gpu_mask,
             project_id: project.id.clone(),
+            speakers: eff_speakers,
         };
         let inner = Arc::clone(&self.inner);
         let app_dir = self.app_dir.clone();
@@ -1745,6 +1865,15 @@ struct RunCtx {
     /// needs an identity the family slot path cannot give it. Decided in try_start (one
     /// resolution per run) — never re-derived here.
     project_id: String,
+    /// ①c/S78: `(display name, slug)` per co-trained speaker, in emb_g row order. Empty for a
+    /// single-speaker run.
+    ///
+    /// Resolved ONCE in try_start and carried, for the same reason the device is: the worker used
+    /// to call `assign_speaker_slugs` again and the two agreed only because the function was a
+    /// pure function of the request. It no longer is — a RESUME reuses the slugs frozen in the
+    /// manifest instead of re-deriving them from the names — so a second derivation here would be
+    /// a second answer.
+    speakers: Vec<(String, String)>,
 }
 
 /// Content identity of one dataset file: byte size plus a digest of its first and last 64 KiB.
@@ -1805,14 +1934,17 @@ pub(crate) fn dataset_rel(slug: Option<&str>, i: usize, src: &str) -> String {
 }
 
 /// Exactly what this request will import, in the order the import loops write it.
-fn dataset_plan(req: &StartTrainingRequest) -> Vec<DatasetItem> {
+///
+/// `slugs` must be the run's EFFECTIVE `(name, slug)` list (see `RunCtx::speakers`) — passing a
+/// freshly derived one would predict directory names a resume is not going to use.
+fn dataset_plan(req: &StartTrainingRequest, slugs: &[(String, String)]) -> Vec<DatasetItem> {
     let mut out = Vec::new();
     let mut push = |src: &str, rel: String| {
         let (size, digest) = file_probe(Path::new(src));
         out.push(DatasetItem { rel, size, digest });
     };
     if req.speakers.len() > 1 {
-        for (gi, (_name, slug)) in assign_speaker_slugs(&req.speakers).iter().enumerate() {
+        for (gi, (_name, slug)) in slugs.iter().enumerate() {
             let mut files = req.speakers[gi].files.clone();
             files.sort();
             for (i, f) in files.iter().enumerate() {
@@ -1978,8 +2110,15 @@ fn run_worker(
     // data page can list the project's own files as sources, it would delete its own copy
     // sources and then fail the copy. So: predict the exact resulting listing, and if the
     // dataset on disk already IS that listing, touch nothing at all.
-    let plan = dataset_plan(req);
+    let plan = dataset_plan(req, &ctx.speakers);
     let dataset_unchanged = dataset_matches(&dataset_dir, &plan);
+    // ★ An EMPTY plan means this run imports nothing — either the flat reuse path, or (S78) a
+    // multi-speaker run that declares its structure and consumes the data already on disk.
+    // `dataset_matches` returns false for an empty plan (by design: "nothing" must never compare
+    // equal to a real dataset), so keying the swap on `dataset_unchanged` alone would move the
+    // whole dataset aside, copy nothing into the fresh one, and commit — deleting the very data
+    // the run was going to train on.
+    let importing = !plan.is_empty();
     if dataset_unchanged {
         tracing::info!(
             "dataset import skipped: {} already holds exactly this selection",
@@ -2004,13 +2143,13 @@ fn run_worker(
         // loader derives the emb_g id from the dir name, so these slugs MUST
         // match the manifest — assign_speaker_slugs is deterministic on the
         // same request.
-        let mut swap = if dataset_unchanged {
+        let mut swap = if dataset_unchanged || !importing {
             None
         } else {
             Some(DatasetSwap::begin(&dataset_dir)?)
         };
         std::fs::create_dir_all(&dataset_dir)?;
-        let assigned = assign_speaker_slugs(&req.speakers);
+        let assigned = ctx.speakers.clone();
         let total: usize = req.speakers.iter().map(|s| s.files.len()).sum();
         let mut done = 0usize;
         for (gi, (name, slug)) in assigned.iter().enumerate() {
@@ -2461,7 +2600,7 @@ mod tests {
             "total_epoch": 1, "batch_size": 1,
         }));
         let ds = tproject::dataset_dir(&data, id);
-        let plan = dataset_plan(&req);
+        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
         let assigned = assign_speaker_slugs(&req.speakers);
 
         // ---- import, byte for byte as run_worker does ----
@@ -2484,7 +2623,7 @@ mod tests {
         }
         // what was written IS what was planned — the reuse path depends on this exact equality
         assert!(
-            dataset_matches(&ds, &dataset_plan(&req)),
+            dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
             "the import must land on the names the plan predicted"
         );
 
@@ -2517,6 +2656,106 @@ mod tests {
         assert_eq!(facts.groups[1].files, 2);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★ The slug debt, closed: a RESUME must reuse the slugs the slot froze, never re-derive
+    /// them from the names.
+    ///
+    /// `slugify` hash-suffixes with `DefaultHasher`, which std does not promise to keep stable
+    /// across Rust releases — and that slug is `dataset/<slug>/`, `dataset_44k/<slug>/` and the
+    /// `config.spk` key. Re-deriving on every start means one toolchain bump renames every
+    /// co-trained speaker's data directory out from under a half-trained model. The test proves
+    /// reuse by freezing slugs that `slugify` would NEVER produce.
+    #[test]
+    fn a_resume_reuses_the_frozen_speaker_slugs_instead_of_re_deriving_them() {
+        let data = tmp_ws("effslug");
+        let id = "proj_s";
+        let ws = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let req = |fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": [],
+                "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+                "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+
+        // no manifest yet ⇒ derive
+        let fresh_slugs = effective_speaker_slugs(&data, id, "rvc", &req(false));
+        assert_eq!(fresh_slugs, assign_speaker_slugs(&req(false).speakers));
+
+        // slugs a toolchain change (or an older build) could have produced — nothing `slugify`
+        // would output for these names today
+        std::fs::write(
+            ws.join("run_manifest.json"),
+            serde_json::to_string(&serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_deadbeef", "teto_cafebabe"],
+                "speaker_names": ["sayo", "teto"],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let resumed = effective_speaker_slugs(&data, id, "rvc", &req(false));
+        assert_eq!(
+            resumed,
+            vec![
+                ("sayo".to_string(), "sayo_deadbeef".to_string()),
+                ("teto".to_string(), "teto_cafebabe".to_string()),
+            ],
+            "a resume must keep training into the directories that already exist"
+        );
+        assert_ne!(resumed, fresh_slugs, "…which are NOT what slugify derives today");
+
+        // 重训 wipes the slot, so it is free to mint new ones
+        assert_eq!(
+            effective_speaker_slugs(&data, id, "rvc", &req(true)),
+            fresh_slugs
+        );
+
+        // a genuine structure change (count differs) falls through to freshly derived slugs —
+        // the resume guard is what refuses it, with a specific CODE
+        let three = req_from(serde_json::json!({
+            "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "a", "files": []}, {"name": "b", "files": []}, {"name": "c", "files": []}],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        assert_eq!(
+            effective_speaker_slugs(&data, id, "rvc", &three),
+            assign_speaker_slugs(&three.speakers)
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★ Why `run_worker` needs an `importing` flag separate from `dataset_unchanged`.
+    ///
+    /// A structure declaration (every group's files empty) plans NOTHING, and `dataset_matches`
+    /// answers false for an empty plan by design — "nothing" must never compare equal to a real
+    /// dataset. Keying the dataset swap on `dataset_unchanged` alone would therefore move the
+    /// whole dataset aside, copy nothing in, and commit: the data the run was about to train on,
+    /// deleted. This test states that shape so the flag cannot be "simplified" away.
+    #[test]
+    fn a_structure_declaration_plans_no_import_and_must_not_look_like_a_replacement() {
+        let proj = tmp_ws("decl");
+        let ds = proj.join("dataset");
+        std::fs::create_dir_all(ds.join("sayo_x")).unwrap();
+        std::fs::write(ds.join("sayo_x").join("000.wav"), b"x").unwrap();
+        let req = req_from(serde_json::json!({
+            "model_name": "t", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
+        assert!(plan.is_empty(), "a declaration imports nothing");
+        assert!(
+            !dataset_matches(&ds, &plan),
+            "…and an empty plan never 'matches' — hence the separate importing flag"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
     }
 
     /// Both carriers of「第 i 号歌手是谁」, and the two semantics `slot_info` must keep.
@@ -2694,7 +2933,7 @@ mod tests {
             }))
         };
         let req = mk(vec![b.clone(), a.clone()]);
-        let plan = dataset_plan(&req);
+        let plan = dataset_plan(&req, &assign_speaker_slugs(&req.speakers));
         assert_eq!(
             plan.iter().map(|i| i.rel.as_str()).collect::<Vec<_>>(),
             vec!["000.flac", "001.wav"],
@@ -2709,23 +2948,23 @@ mod tests {
             std::fs::copy(srcp, ds.join(&item.rel)).unwrap();
         }
         assert!(
-            dataset_matches(&ds, &dataset_plan(&req)),
+            dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
             "a migrated project has no bookkeeping either — content alone must answer this"
         );
 
         // ★ in-place edit, byte length unchanged → MUST read as changed
         std::fs::write(&a, vec![b'y'; 20]).unwrap();
         assert!(
-            !dataset_matches(&ds, &dataset_plan(&req)),
+            !dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))),
             "an edited source with the same size must never be judged unchanged"
         );
         std::fs::write(&a, vec![b'x'; 20]).unwrap();
-        assert!(dataset_matches(&ds, &dataset_plan(&req)), "restoring content restores the match");
+        assert!(dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))), "restoring content restores the match");
 
         // a different selection is a mismatch, and so is a dataset someone deleted files from
-        assert!(!dataset_matches(&ds, &dataset_plan(&mk(vec![a.clone()]))));
+        assert!(!dataset_matches(&ds, &dataset_plan(&mk(vec![a.clone()]), &[])));
         std::fs::remove_file(ds.join("000.flac")).unwrap();
-        assert!(!dataset_matches(&ds, &dataset_plan(&req)));
+        assert!(!dataset_matches(&ds, &dataset_plan(&req, &assign_speaker_slugs(&req.speakers))));
 
         // multi-speaker: per-speaker subdirectory keyed by the frozen slug
         let m = req_from(serde_json::json!({
@@ -2737,7 +2976,7 @@ mod tests {
             ],
             "total_epoch": 1, "batch_size": 1,
         }));
-        let mplan = dataset_plan(&m);
+        let mplan = dataset_plan(&m, &assign_speaker_slugs(&m.speakers));
         let slugs: Vec<String> =
             assign_speaker_slugs(&m.speakers).into_iter().map(|(_, s)| s).collect();
         assert!(mplan.iter().all(|i| slugs.iter().any(|s| i.rel.starts_with(&format!("{s}/")))));
