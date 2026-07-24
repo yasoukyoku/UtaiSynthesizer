@@ -109,7 +109,7 @@ export function TrainingPage() {
   useEffect(() => {
     const pid = route.projectId;
     if (!pid) {
-      useTrainingStore.getState().setPoolFlat(false);
+      useTrainingStore.getState().setPool(0, 0);
       return;
     }
     let cancelled = false;
@@ -120,12 +120,10 @@ export function TrainingPage() {
           { projectId: pid },
         );
         if (!cancelled) {
-          useTrainingStore
-            .getState()
-            .setPoolFlat(d.dataset.files > 0 && d.dataset.speakers.length === 0);
+          useTrainingStore.getState().setPool(d.dataset.files, d.dataset.speakers.length);
         }
       } catch {
-        if (!cancelled) useTrainingStore.getState().setPoolFlat(false);
+        if (!cancelled) useTrainingStore.getState().setPool(0, 0);
       }
     })();
     return () => {
@@ -413,6 +411,7 @@ function DataStep() {
     config,
     diffWsInfo,
     poolFlat,
+    poolCount,
   } = useTrainingStore();
   const pool = poolReusable(config.backend, poolFlat, diffWsInfo);
   // ①c: SoVITS (α) + RVC (α′) data is a SINGER LIST (default 1 singer = single-speaker);
@@ -468,6 +467,15 @@ function DataStep() {
   return (
     <div className="training-data-step">
       <div className="training-hint">{t("training.dataHint")}</div>
+      {/* ★ This page REPLACES the project's dataset wholesale (that is what the run-time import
+          does). Since 批 5b the project page can add and remove individual files, so a user who
+          just curated a set there must not lose it by picking one file here. Says the count out
+          loud rather than relying on them remembering which page does what. */}
+      {poolCount > 0 && (
+        <div className="training-fixed-note">
+          {t("training.datasetReplaceWarn", { count: poolCount })}
+        </div>
+      )}
 
       {singerList ? (
         <div className="training-spk-stack">

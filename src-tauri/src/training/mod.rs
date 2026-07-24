@@ -1792,7 +1792,7 @@ struct DatasetItem {
 /// `dataset_matches` compares the two, and the annotation keys on them. Four readings of one
 /// rule; if any of them ever spelled it differently the reuse path would silently turn into a
 /// full replace (and the original file names would attach to nothing).
-fn dataset_rel(slug: Option<&str>, i: usize, src: &str) -> String {
+pub(crate) fn dataset_rel(slug: Option<&str>, i: usize, src: &str) -> String {
     let ext = Path::new(src)
         .extension()
         .and_then(|e| e.to_str())

@@ -1256,6 +1256,8 @@ pub fn run() {
             commands::training::update_training_project,
             commands::training::forget_training_project,
             commands::training::get_training_project,
+            commands::training::import_project_dataset,
+            commands::training::delete_project_dataset_files,
             commands::training::get_training_slot_info,
             commands::audition::render_model_audition,
             commands::audition::render_candidate_scale,

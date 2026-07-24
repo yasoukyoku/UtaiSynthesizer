@@ -536,6 +536,138 @@ fn ledger_model_type(s: &str) -> Option<crate::models::ModelType> {
     crate::commands::models::parse_voice_type(s)
 }
 
+/// Guard for every command that WRITES `<project>/dataset/`.
+///
+/// Same three conditions as `ensure_safe_to_delete` — a run slicing the dataset while files
+/// appear or vanish under it, a second instance doing the same, or the reclaim thread copying
+/// into the tree — with dataset-shaped CODEs so the text can say what was actually refused.
+fn ensure_safe_dataset_write(state: &AppState) -> Result<(), String> {
+    crate::commands::window::ensure_idle_for_dataset_write(state)?;
+    if crate::crashlog::other_instance_alive() {
+        return Err("DATASET_OTHER_INSTANCE".into());
+    }
+    if crate::training::tproject::RECLAIM_TOUCHING_TRAINING.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("DATASET_RECLAIM_IN_PROGRESS".into());
+    }
+    Ok(())
+}
+
+/// The first architecture slot that has FROZEN a speaker set, if any.
+///
+/// While one exists the speaker structure is immutable: `n_speakers` and the ordered slug list
+/// are baked into that slot's emb_g rows, and changing either makes it unresumable
+/// (`RESUME_SPEAKER_COUNT_MISMATCH` / `RESUME_SPEAKER_SET_MISMATCH`). Adding or removing FILES
+/// stays allowed — it only costs a re-extraction, which the UI says out loud.
+fn frozen_structure_family(data_dir: &std::path::Path, project_id: &str) -> Option<String> {
+    crate::training::tproject::FAMILIES
+        .iter()
+        .find(|f| !crate::training::frozen_speakers(data_dir, project_id, f).is_empty())
+        .map(|f| f.to_string())
+}
+
+/// Import audio INTO the project's shared dataset, independent of any training run.
+///
+/// Appends — the run-time import replaces wholesale, this one adds. `speaker` is a display name
+/// (a co-trained singer); `None` targets the flat dataset. Mixing the two shapes is refused:
+/// python's fingerprint hard-fails on a subdirectory for a flat backend, and a stray flat file in
+/// a multi-singer dataset belongs to no emb_g row.
+#[tauri::command]
+pub async fn import_project_dataset(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    files: Vec<String>,
+    speaker: Option<String>,
+) -> Result<(), String> {
+    checked_project_id(&project_id)?;
+    ensure_safe_dataset_write(&state)?;
+    let data_dir = data_root(&state);
+    if crate::training::tproject::read_meta(&data_dir, &project_id).is_none() {
+        return Err("PROJECT_META_UNREADABLE".into());
+    }
+    if files.is_empty() {
+        return Err("TRAINING_NO_DATA".into());
+    }
+    for f in &files {
+        if !std::path::Path::new(f).is_file() {
+            return Err(format!("TRAINING_DATA_FILE_MISSING: {f}"));
+        }
+    }
+    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &[]);
+    let has_flat = facts.entries.iter().any(|e| !e.rel.contains('/'));
+    let name = speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let slug = match name {
+        Some(n) => {
+            if has_flat {
+                return Err("PROJECT_DATASET_SHAPE".into());
+            }
+            match facts.groups.iter().find(|g| g.speaker.name == n) {
+                // an existing singer: the slug is already frozen on disk, never re-derive it
+                Some(g) => Some(g.speaker.slug.clone()),
+                None => {
+                    // a NEW singer changes the speaker set — refuse while any slot's emb_g rows
+                    // depend on it
+                    if let Some(fam) = frozen_structure_family(&data_dir, &project_id) {
+                        return Err(format!("DATASET_SPEAKERS_FROZEN: {fam}"));
+                    }
+                    let base = crate::training::slugify(n);
+                    let mut s = base.clone();
+                    let mut k = 2;
+                    while facts.speaker_slugs.iter().any(|e| *e == s) {
+                        s = format!("{base}_{k}");
+                        k += 1;
+                    }
+                    Some(s)
+                }
+            }
+        }
+        None => {
+            if !facts.speaker_slugs.is_empty() {
+                return Err("PROJECT_DATASET_SHAPE".into());
+            }
+            None
+        }
+    };
+    crate::training::dsmanifest::append_files(
+        &data_dir,
+        &project_id,
+        slug.as_deref(),
+        name,
+        &files,
+        &|p| crate::audio::probe_duration_ms(p).ok(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Remove files from the project's shared dataset. `rels` are `DatasetFileRow.rel` values.
+///
+/// Emptying a singer entirely changes the speaker SET, so it is refused while any slot has frozen
+/// one; removing files from a singer that keeps at least one is fine. Numbering is NOT compacted
+/// afterwards — see the mutation rules in `dsmanifest`.
+#[tauri::command]
+pub async fn delete_project_dataset_files(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    rels: Vec<String>,
+) -> Result<(), String> {
+    checked_project_id(&project_id)?;
+    ensure_safe_dataset_write(&state)?;
+    let data_dir = data_root(&state);
+    if rels.is_empty() {
+        return Ok(());
+    }
+    let frozen = frozen_structure_family(&data_dir, &project_id);
+    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &[]);
+    let plan = crate::training::dsmanifest::plan_delete(&facts, &rels);
+    if !plan.emptied_speakers.is_empty() {
+        if let Some(fam) = frozen.as_deref() {
+            return Err(format!("DATASET_SPEAKERS_FROZEN: {fam}"));
+        }
+    }
+    crate::training::dsmanifest::delete_files(&data_dir, &project_id, &rels, frozen.is_none())
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn get_training_project(
     state: State<'_, Arc<AppState>>,

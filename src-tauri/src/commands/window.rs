@@ -83,11 +83,24 @@ pub fn running_tasks_of(state: &AppState) -> Vec<String> {
 /// Returns the running task ids so the caller can name them; the frontend localizes them through
 /// the SAME `close.task_<id>` keys the quit warning uses (no second vocabulary).
 pub fn ensure_idle_for_package_delete(state: &AppState) -> Result<(), String> {
+    ensure_idle(state, "DELETE_WHILE_BUSY")
+}
+
+/// The SAME idleness question, for a caller that WRITES the project's shared dataset (S76 批 5b:
+/// importing files into it, deleting files from it). It needs the identical guarantee — a run
+/// slicing `dataset/` while files appear or vanish under it produces a filelist that does not
+/// match what was extracted — but a different CODE, because the delete texts tell the user we
+/// refused to delete something.
+pub fn ensure_idle_for_dataset_write(state: &AppState) -> Result<(), String> {
+    ensure_idle(state, "DATASET_WHILE_BUSY")
+}
+
+fn ensure_idle(state: &AppState, code: &str) -> Result<(), String> {
     let tasks = running_tasks_of(state);
     if tasks.is_empty() {
         Ok(())
     } else {
-        Err(format!("DELETE_WHILE_BUSY: {}", tasks.join(",")))
+        Err(format!("{}: {}", code, tasks.join(",")))
     }
 }
 

@@ -370,6 +370,20 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   AUDITION_WORKSPACE_OUTSIDE_ROOT: { key: "backend.AUDITION_WORKSPACE_OUTSIDE_ROOT" },
   PROJECT_DATASET_SHAPE: { key: "backend.PROJECT_DATASET_SHAPE" },
   TRAINING_DATASET_SELF_SOURCE: { key: "backend.TRAINING_DATASET_SELF_SOURCE" },
+  // S76 batch 5b — managing the project's shared dataset outside a run. The three interlocks are
+  // the DELETE_* trio's twins (same conditions, different sentence: nothing is being deleted when
+  // an IMPORT is refused). DATASET_SPEAKERS_FROZEN is the one that carries the design: a slot's
+  // emb_g rows pin the speaker SET, so the structure may only change while no slot has frozen it.
+  DATASET_WHILE_BUSY: { key: "backend.DATASET_WHILE_BUSY", busy: true },
+  DATASET_OTHER_INSTANCE: { key: "backend.DATASET_OTHER_INSTANCE", modal: true },
+  DATASET_RECLAIM_IN_PROGRESS: { key: "backend.DATASET_RECLAIM_IN_PROGRESS", busy: true },
+  DATASET_SPEAKERS_FROZEN: { key: "backend.DATASET_SPEAKERS_FROZEN", modal: true },
+  DATASET_COPY_FAILED: { key: "backend.DATASET_COPY_FAILED" },
+  DATASET_DELETE_FAILED: { key: "backend.DATASET_DELETE_FAILED" },
+  DATASET_WRITE_FAILED: { key: "backend.DATASET_WRITE_FAILED" },
+  DATASET_REL_INVALID: { key: "backend.DATASET_REL_INVALID" },
+  DATASET_META_WRITE_FAILED: { key: "backend.DATASET_META_WRITE_FAILED" },
+  DATASET_META_ENCODE_FAILED: { key: "backend.DATASET_META_ENCODE_FAILED" },
   // S76 batch 4 — explicit project CRUD. The name rules are inline validation the create/rename
   // dialogs surface as-is; they are not failures of anything already on disk.
   PROJECT_NAME_EMPTY: { key: "backend.PROJECT_NAME_EMPTY" },

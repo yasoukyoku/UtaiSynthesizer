@@ -423,3 +423,11 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* 数据集节标题右侧的两颗按钮(＋添加 / 重新导入) */
+.tproj-ds-head-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex: 0 0 auto;
+}

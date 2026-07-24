@@ -235,6 +235,214 @@ pub fn read_facts(data_dir: &Path, id: &str, frozen: &[Vec<DsSpeaker>]) -> Datas
     }
 }
 
+// ───────────────────────── mutation (S76 批 5b) ─────────────────────────
+//
+// The dataset used to be written by exactly one thing (`run_worker`'s import stage), which is why
+// `has_dataset` can assume a non-empty directory is a complete one. Managing data outside a run
+// needs two more writers, and both obey the same three rules:
+//
+//  1. **Never renumber.** Deleting `001.wav` leaves a hole. Renaming the survivors would rewrite
+//     files the user did not touch, and nothing downstream needs dense numbering — both python
+//     preprocessors enumerate `sorted(os.listdir(...))` and derive their own indices. Holes also
+//     make deletion crash-safe for free: there is no multi-file rename to interrupt.
+//  2. **Nothing partial is ever visible inside `dataset/`.** Copies land on a `.part` name in the
+//     same directory and are renamed into place, so a crash mid-copy cannot leave a truncated wav
+//     that `has_dataset` would accept and a run would then slice.
+//  3. **The annotation follows the disk, never leads it.** It is rewritten AFTER the files move;
+//     a crash in between leaves a stale entry, which `read_facts` drops on the next read.
+
+/// Highest positional index already used in a directory, +1. Names that are not `<digits>.<ext>`
+/// are ignored (they cannot collide with what we mint).
+fn next_index(existing_names: &[String]) -> usize {
+    existing_names
+        .iter()
+        .filter_map(|n| {
+            let stem = n.split('.').next()?;
+            (!stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit()))
+                .then(|| stem.parse::<usize>().ok())
+                .flatten()
+        })
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0)
+}
+
+/// Where each source will land, in the order given. Pure so the naming can be tested without
+/// touching a disk.
+pub fn plan_append(
+    existing_names: &[String],
+    slug: Option<&str>,
+    srcs: &[String],
+) -> Vec<(String, String)> {
+    let start = next_index(existing_names);
+    srcs.iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), super::dataset_rel(slug, start + i, s)))
+        .collect()
+}
+
+/// Copy files into the project's dataset, appending. `slug` selects a speaker subdirectory
+/// (created when new); `None` is the flat dataset.
+///
+/// `probe_ms` is injected so the command can pay for duration probing (an ffmpeg spawn per
+/// non-wav file) while tests stay instant.
+pub fn append_files(
+    data_dir: &Path,
+    id: &str,
+    slug: Option<&str>,
+    speaker_name: Option<&str>,
+    srcs: &[String],
+    probe_ms: &dyn Fn(&Path) -> Option<f64>,
+) -> Result<()> {
+    let root = super::tproject::dataset_dir(data_dir, id);
+    let dir = match slug {
+        Some(s) => root.join(s),
+        None => root.clone(),
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| UtaiError::Training(format!("DATASET_WRITE_FAILED: {e}")))?;
+    let existing: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let plan = plan_append(&existing, slug, srcs);
+
+    let mut added: Vec<DsFile> = Vec::new();
+    for (src, rel) in &plan {
+        let src_path = Path::new(src);
+        let dst = root.join(rel);
+        // rule 2: land on a sibling `.part`, then rename into place (same directory ⇒ atomic)
+        let part = dst.with_extension(format!(
+            "{}.part",
+            dst.extension().and_then(|e| e.to_str()).unwrap_or("bin")
+        ));
+        std::fs::copy(src_path, &part).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            UtaiError::Training(format!("DATASET_COPY_FAILED: {}: {e}", src_path.display()))
+        })?;
+        std::fs::rename(&part, &dst).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            UtaiError::Training(format!("DATASET_COPY_FAILED: {}: {e}", dst.display()))
+        })?;
+        added.push(DsFile {
+            rel: rel.clone(),
+            name: src_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+            duration_ms: probe_ms(&dst),
+        });
+    }
+
+    // rule 3: annotation last
+    let mut m = read(data_dir, id);
+    m.v = MANIFEST_VERSION;
+    m.files.retain(|f| !added.iter().any(|a| a.rel == f.rel));
+    m.files.extend(added);
+    if let (Some(s), Some(name)) = (slug, speaker_name) {
+        if !m.speakers.iter().any(|sp| sp.slug == s) {
+            m.speakers.push(DsSpeaker {
+                slug: s.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+    write(data_dir, id, &m)
+}
+
+/// What a delete would do — computed BEFORE anything is removed so a refusal costs nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletePlan {
+    /// Speaker directories that would be left with no files at all.
+    pub emptied_speakers: Vec<String>,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+pub fn plan_delete(facts: &DatasetFacts, rels: &[String]) -> DeletePlan {
+    let going: std::collections::HashSet<&str> = rels.iter().map(|s| s.as_str()).collect();
+    let mut emptied = Vec::new();
+    for g in &facts.groups {
+        let prefix = format!("{}/", g.speaker.slug);
+        let survives = facts
+            .entries
+            .iter()
+            .any(|e| e.rel.starts_with(&prefix) && !going.contains(e.rel.as_str()));
+        if !survives && g.files > 0 {
+            emptied.push(g.speaker.slug.clone());
+        }
+    }
+    let hit: Vec<&DsFile> = facts
+        .entries
+        .iter()
+        .filter(|e| going.contains(e.rel.as_str()))
+        .collect();
+    DeletePlan {
+        emptied_speakers: emptied,
+        files: hit.len(),
+        bytes: hit.iter().map(|e| e.bytes).sum(),
+    }
+}
+
+/// Remove files from the dataset. `rels` must be entries the caller just listed.
+///
+/// `drop_speaker_dirs` empties are removed only when the caller has established that no slot has
+/// frozen this speaker set — an emptied-but-present directory would still read as a speaker, and
+/// a removed one changes the speaker SET, which is resume-locked.
+pub fn delete_files(
+    data_dir: &Path,
+    id: &str,
+    rels: &[String],
+    drop_empty_speaker_dirs: bool,
+) -> Result<()> {
+    let root = super::tproject::dataset_dir(data_dir, id);
+    for rel in rels {
+        // Path-escape guard: these strings come from the frontend. Only the two shapes the import
+        // writes are acceptable — one segment, or `<slug>/<name>`.
+        let parts: Vec<&str> = rel.split('/').collect();
+        if parts.len() > 2
+            || parts.iter().any(|p| {
+                p.is_empty() || *p == "." || *p == ".." || p.contains('\\') || p.contains(':')
+            })
+        {
+            return Err(UtaiError::Training(format!("DATASET_REL_INVALID: {rel}")));
+        }
+        let p = root.join(rel);
+        if !p.is_file() {
+            // already gone (a stale list, a second click) — not an error, the goal is reached
+            continue;
+        }
+        std::fs::remove_file(&p)
+            .map_err(|e| UtaiError::Training(format!("DATASET_DELETE_FAILED: {rel}: {e}")))?;
+    }
+    if drop_empty_speaker_dirs {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir()
+                    && std::fs::read_dir(&p)
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_dir(&p);
+                }
+            }
+        }
+    }
+    let mut m = read(data_dir, id);
+    let gone: std::collections::HashSet<&str> = rels.iter().map(|s| s.as_str()).collect();
+    m.files.retain(|f| !gone.contains(f.rel.as_str()));
+    // a speaker whose directory is gone is no longer part of this dataset
+    m.speakers
+        .retain(|sp| root.join(&sp.slug).is_dir() || m.files.iter().any(|f| f.rel.starts_with(&format!("{}/", sp.slug))));
+    write(data_dir, id, &m)
+}
+
 /// The dataset as the UI should show it, after reconciling the annotation against the disk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatasetView {
@@ -478,6 +686,158 @@ mod tests {
         assert_eq!(bare.files, 3);
         assert!(bare.entries.iter().all(|e| e.name.is_empty()));
         assert!(!bare.order_known, "nothing on disk records the order any more");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ★ The rule the whole delete story rests on: numbering is APPEND-ONLY and holes are
+    /// permanent. Compacting would rename files the user never touched (and both python
+    /// preprocessors index by `sorted(listdir)` position anyway, so nothing gains from density).
+    #[test]
+    fn numbering_is_append_only_and_holes_are_permanent() {
+        assert_eq!(next_index(&[]), 0);
+        assert_eq!(next_index(&["000.wav".into(), "001.flac".into()]), 2);
+        // the hole left by deleting 001 does NOT get refilled
+        assert_eq!(next_index(&["000.wav".into(), "002.flac".into()]), 3);
+        // junk names cannot collide with what we mint, so they are ignored
+        assert_eq!(next_index(&["notes.txt".into(), "007.wav".into(), ".part".into()]), 8);
+        // 4 digits is fine — `{:03}` is a minimum width, not a cap
+        assert_eq!(next_index(&["1000.wav".into()]), 1001);
+
+        let plan = plan_append(
+            &["000.wav".into(), "002.wav".into()],
+            Some("spk_1"),
+            &["D:/a/one.FLAC".into(), "D:/a/two.wav".into()],
+        );
+        assert_eq!(
+            plan.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>(),
+            vec!["spk_1/003.flac", "spk_1/004.wav"]
+        );
+    }
+
+    #[test]
+    fn append_copies_lands_atomically_and_records_the_original_names() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsappend_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let a = src.join("原始 A.wav");
+        let b = src.join("B.flac");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bb").unwrap();
+        let id = "p_app";
+        let never = |_: &Path| None;
+
+        append_files(
+            &tmp,
+            id,
+            None,
+            None,
+            &[a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()],
+            &never,
+        )
+        .unwrap();
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(
+            facts.entries.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
+            vec!["000.wav", "001.flac"]
+        );
+        assert_eq!(facts.entries[0].name, "原始 A.wav");
+        assert_eq!(facts.entries[1].bytes, 2);
+        // rule 2: no `.part` may survive a successful copy
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        assert!(
+            std::fs::read_dir(&ds)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".part")),
+            "a partial copy must never remain inside dataset/"
+        );
+
+        // appending again continues the numbering instead of clobbering
+        append_files(&tmp, id, None, None, &[a.to_string_lossy().into_owned()], &never).unwrap();
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(facts.files, 3);
+        assert_eq!(facts.entries[2].rel, "002.wav");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn delete_leaves_holes_refuses_path_escapes_and_prunes_emptied_speakers() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsdel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_del";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        std::fs::create_dir_all(ds.join("a_1")).unwrap();
+        std::fs::create_dir_all(ds.join("b_2")).unwrap();
+        for (p, n) in [("a_1/000.wav", 4), ("a_1/001.wav", 4), ("b_2/000.wav", 3)] {
+            std::fs::write(ds.join(p), vec![b'x'; n]).unwrap();
+        }
+        record_import(
+            &tmp,
+            id,
+            vec![sp("a_1", "A"), sp("b_2", "B")],
+            vec![
+                DsFile { rel: "a_1/000.wav".into(), name: "one.wav".into(), bytes: 4, duration_ms: None },
+                DsFile { rel: "a_1/001.wav".into(), name: "two.wav".into(), bytes: 4, duration_ms: None },
+                DsFile { rel: "b_2/000.wav".into(), name: "three.wav".into(), bytes: 3, duration_ms: None },
+            ],
+        );
+
+        // the plan must see that deleting b_2's only file empties that singer
+        let facts = read_facts(&tmp, id, &[]);
+        let plan = plan_delete(&facts, &["b_2/000.wav".into()]);
+        assert_eq!(plan.emptied_speakers, vec!["b_2"]);
+        assert_eq!((plan.files, plan.bytes), (1, 3));
+        // and that deleting ONE of a_1's two does not
+        let plan = plan_delete(&facts, &["a_1/000.wav".into()]);
+        assert!(plan.emptied_speakers.is_empty());
+
+        // path escapes are refused before anything is touched
+        for bad in ["../project.json", "a_1/../../x", "a_1/sub/deep.wav", "C:/etc/passwd"] {
+            assert!(
+                delete_files(&tmp, id, &[bad.into()], false).is_err(),
+                "must refuse {bad}"
+            );
+        }
+        assert!(ds.join("a_1/000.wav").is_file(), "a refused delete touches nothing");
+
+        // delete the FIRST of a_1 — the survivor keeps its name (hole at 000)
+        delete_files(&tmp, id, &["a_1/000.wav".into()], true).unwrap();
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(
+            facts.entries.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(),
+            vec!["a_1/001.wav", "b_2/000.wav"],
+            "no renumbering — 001 stays 001"
+        );
+        assert_eq!(facts.entries[0].name, "two.wav", "the annotation follows the survivor");
+
+        // emptying b_2 with pruning allowed removes the directory, so it stops being a speaker
+        delete_files(&tmp, id, &["b_2/000.wav".into()], true).unwrap();
+        let facts = read_facts(&tmp, id, &[]);
+        assert!(!ds.join("b_2").exists(), "an emptied singer directory is removed");
+        assert_eq!(facts.speaker_slugs, vec!["a_1"]);
+        assert_eq!(facts.groups.len(), 1);
+        // deleting something already gone is a no-op, not an error
+        delete_files(&tmp, id, &["b_2/000.wav".into()], true).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The frozen-structure case: an emptied singer must NOT have its directory removed, because
+    /// the caller refuses that delete outright — but if it ever got here, leaving the directory
+    /// keeps the speaker SET intact, which is the resume-locked thing.
+    #[test]
+    fn pruning_can_be_withheld_so_a_frozen_speaker_set_survives() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsfrozen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_frozen";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        std::fs::create_dir_all(ds.join("a_1")).unwrap();
+        std::fs::write(ds.join("a_1/000.wav"), b"x").unwrap();
+        delete_files(&tmp, id, &["a_1/000.wav".into()], false).unwrap();
+        assert!(ds.join("a_1").is_dir(), "directory kept ⇒ the speaker set is unchanged");
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(facts.speaker_slugs, vec!["a_1"]);
+        assert_eq!(facts.files, 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

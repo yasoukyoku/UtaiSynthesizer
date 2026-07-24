@@ -15,9 +15,10 @@
  *     会让 weights/ 里那一堆改名、best_state.json 的携带指标压掉下一次 best 写入。所以已经
  *     跑过的槽只读显示旧名,只有全新的槽才让用户起名(默认=项目名)。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../../store/app";
 import {
   useTrainingStore,
@@ -31,7 +32,8 @@ import {
   type WorkspaceInfo,
 } from "../../store/training";
 import { backendErrorMessage } from "../../lib/backendError";
-import { fmtSize } from "../../lib/constants";
+import { maybeShowErrorModal } from "../../lib/errorDisplay";
+import { AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
 import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
 import "./TrainingProjects.css";
 
@@ -56,6 +58,7 @@ const FAMILY_TEXT: Record<Family, { label: string; desc: string }> = {
 export function ProjectDetail() {
   const { t } = useTranslation();
   const showConfirm = useAppStore((s) => s.showConfirm);
+  const showToast = useAppStore((s) => s.showToast);
   const projectId = useTrainingStore((s) => s.route.projectId);
   const setRoute = useTrainingStore((s) => s.setRoute);
   const updateConfig = useTrainingStore((s) => s.updateConfig);
@@ -66,22 +69,87 @@ export function ProjectDetail() {
    *  above already answer「有没有数据」. It is the「当初导入的到底是什么」question that needs it. */
   const [showFiles, setShowFiles] = useState(false);
   /** 试听 for the files the project already holds — same player and same row as the data step.
-   *  No presence predicate: these rows come from the disk listing, and nothing on this page can
-   *  remove a file while a decode is in flight (deleting arrives with the data page in 批 5b). */
-  const filePreview = useFilePreview();
+   *  The predicate re-reads the CURRENT listing: a decode outlives its gesture, and by the time
+   *  it resolves the row may have been deleted (批 5b). */
+  const detailRef = useRef<ProjectDetailData | null>(null);
+  detailRef.current = detail;
+  const filePreview = useFilePreview((path) => {
+    const d = detailRef.current;
+    if (!d) return false;
+    const prefix = `${d.dataset.datasetDir}/`;
+    return d.dataset.entries.some((e) => prefix + e.rel === path);
+  });
+  const [busy, setBusy] = useState(false);
+
+  /** Does anything in this project depend on the current data? Deleting or adding then costs a
+   *  full re-extraction on the next run — worth one confirmation. With nothing trained yet it is
+   *  free, and a dialog per file would just be in the way. */
+  const dataHasDependents = (d: ProjectDetailData) =>
+    d.slots.some((s) => s.hasResumePoint || s.info.has_main_progress || s.ckptCount > 0);
+
+  const addFilesTo = async (speaker?: string) => {
+    const picked = await open({
+      multiple: true,
+      filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
+      title: t("training.addFiles"),
+    });
+    if (!picked) return;
+    const files = Array.isArray(picked) ? picked : [picked];
+    setBusy(true);
+    try {
+      await invoke("import_project_dataset", { projectId, files, speaker: speaker ?? null });
+      await load();
+    } catch (e) {
+      const msg = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeFile = async (rel: string, label: string) => {
+    if (!detail) return;
+    if (dataHasDependents(detail)) {
+      const ok = await showConfirm({
+        title: t("training.datasetRemoveTitle"),
+        body: t("training.datasetRemoveBody", { name: label }),
+        buttons: [
+          { id: "__cancel", label: t("training.cancel") },
+          { id: "go", label: t("training.remove"), kind: "danger" },
+        ],
+      });
+      if (ok !== "go") return;
+    }
+    filePreview.stopIfPlaying(`${detail.dataset.datasetDir}/${rel}`);
+    setBusy(true);
+    try {
+      await invoke("delete_project_dataset_files", { projectId, rels: [rel] });
+      await load();
+    } catch (e) {
+      const msg = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const load = useCallback(async () => {
     if (!projectId) return;
     try {
-      setDetail(await invoke<ProjectDetailData>("get_training_project", { projectId }));
+      const d = await invoke<ProjectDetailData>("get_training_project", { projectId });
+      setDetail(d);
+      // The page-root effect derives `poolFlat` on route change only, so a dataset edited HERE
+      // would leave it stale for the rest of the session — and it is what decides whether the
+      // run may skip the data page. Refresh it from the same response.
+      useTrainingStore.getState().setPool(d.dataset.files, d.dataset.speakers.length);
       setError(null);
     } catch (e) {
       setError(backendErrorMessage(e) ?? String(e));
     }
-    // NB `poolFlat` (does the project hold a reusable flat dataset) is derived by a
-    // TrainingPage-root effect keyed on route.projectId — NOT here — so it stays correct on the
-    // paths where ProjectDetail never mounts (training-in-progress lands straight on the run
-    // segment via setRoute).
+    // NB the TrainingPage-root effect derives the same thing on every route change — that is what
+    // keeps it correct on the paths where ProjectDetail never mounts (training-in-progress lands
+    // straight on the run segment via setRoute). This call is the ADDITIONAL refresh for the case
+    // that effect cannot see: the dataset being edited on this very page.
   }, [projectId]);
 
   useEffect(() => {
@@ -333,15 +401,29 @@ export function ProjectDetail() {
           {/* 「重新导入」而不是「管理」:数据段是一张**新导入**的暂存表,不是这个项目已有数据
               的编辑器 —— 导完会整体替换项目的共享数据集(Rust 侧还会因此拦住已有进度的兄弟槽)。
               把它叫「管理数据」会让人以为打开就能看到那 N 个文件,而那张表是空的。 */}
-          <button
-            className="training-btn small"
-            disabled={!!detail.needsAttention}
-            onClick={() => setRoute({ seg: "data", projectId })}
-          >
-            {detail.dataset.files > 0
-              ? t("training.projectReimportData")
-              : t("training.projectImportData")}
-          </button>
+          <div className="tproj-ds-head-actions">
+            {/* 追加 lands straight in `dataset/` — no run required, nothing replaced. The wizard's
+                data page still exists for「重新导入」(it replaces the whole set), which is a
+                different act and keeps its own button. */}
+            {detail.dataset.groups.length === 0 && (
+              <button
+                className="training-btn small"
+                disabled={!!detail.needsAttention || busy}
+                onClick={() => void addFilesTo()}
+              >
+                ＋ {t("training.addFiles")}
+              </button>
+            )}
+            <button
+              className="training-btn small"
+              disabled={!!detail.needsAttention || busy}
+              onClick={() => setRoute({ seg: "data", projectId })}
+            >
+              {detail.dataset.files > 0
+                ? t("training.projectReimportData")
+                : t("training.projectImportData")}
+            </button>
+          </div>
         </div>
         {detail.dataset.files > 0 ? (
           <>
@@ -384,6 +466,18 @@ export function ProjectDetail() {
                     <span className="training-file-dur">
                       {t("training.projectDatasetFiles", { count: g.files })} · {fmtSize(g.bytes)}
                     </span>
+                    {/* Adding to an EXISTING singer never changes the speaker set, so it is
+                        allowed even after that set is frozen — the cost is a re-extraction,
+                        which the row below says out loud. Creating a singer is not offered
+                        here; that is a data-page act (批 5b 后续). */}
+                    <button
+                      className="training-btn small"
+                      disabled={!!detail.needsAttention || busy}
+                      onClick={() => void addFilesTo(g.name || g.slug)}
+                      title={t("training.addFiles")}
+                    >
+                      ＋
+                    </button>
                   </div>
                 ))}
                 {!detail.dataset.orderKnown && (
@@ -427,6 +521,7 @@ export function ProjectDetail() {
                         // on-disk name is the honest fallback; inventing one is not.
                         name={e.name || e.rel}
                         meta={fmtSize(e.bytes)}
+                        onRemove={busy ? undefined : () => void removeFile(e.rel, e.name || e.rel)}
                       />
                     );
                   })}
