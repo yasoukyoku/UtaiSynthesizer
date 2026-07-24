@@ -2096,6 +2096,57 @@ mod tests {
         }
     }
 
+    /// Diagnostic twin of `scan_this_machine` for the batch-4 LISTING, against this machine's
+    /// real projects. The synthetic fixtures cannot exercise CJK display names, a 40 GB walk,
+    /// or the cache surviving a second call. Run after touching the listing or the cache:
+    ///   cargo test --lib list_this_machine -- --ignored --nocapture
+    ///
+    /// It writes `<app_dir>/training-projects.json` — deliberately, that is half of what it
+    /// verifies (the file must NOT appear under `<data>/training`, where `migrate_data_dir`
+    /// would verify it by byte length and abort on a concurrent rewrite).
+    #[test]
+    #[ignore]
+    fn list_this_machine() {
+        let app = PathBuf::from("D:/MyDev/Utai_v2-dev");
+        let data = app.join("data");
+        let t0 = std::time::Instant::now();
+        let rows = list_project_summaries(&app, &data, true);
+        println!("\n{} project(s), measured in {:?}", rows.len(), t0.elapsed());
+        for r in &rows {
+            println!(
+                "  {:<26} {:>9}MB  data={:>7}MB  [{}]{}{}  {}",
+                r.id,
+                r.sizes.total_bytes / 1_000_000,
+                r.sizes.dataset_bytes / 1_000_000,
+                r.families.join("+"),
+                if r.missing { " MISSING" } else { "" },
+                r.needs_attention.as_deref().map(|s| format!(" ⚠{s}")).unwrap_or_default(),
+                r.name
+            );
+        }
+        // the cache belongs beside config.json, NEVER inside a migrated subtree
+        assert!(app.join(PROJECTS_INDEX).is_file());
+        assert!(!training_root(&data).join(PROJECTS_INDEX).exists());
+        assert!(!training_root(&data).join("projects.json").exists());
+        // every non-missing row must describe a directory that is really there, and the sizes
+        // must be a cache HIT the second time (same figures, no re-walk)
+        for r in &rows {
+            if r.missing {
+                continue;
+            }
+            assert!(project_dir(&data, &r.id).is_dir(), "phantom project: {}", r.id);
+            assert!(r.sizes.computed_ms > 0, "unmeasured after refresh: {}", r.id);
+        }
+        let t1 = std::time::Instant::now();
+        let cached = list_project_summaries(&app, &data, false);
+        println!("cached listing in {:?}", t1.elapsed());
+        assert_eq!(cached.len(), rows.len());
+        for (a, b) in cached.iter().zip(rows.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.sizes.total_bytes, b.sizes.total_bytes, "cache disagrees for {}", a.id);
+        }
+    }
+
     fn ck(rel: &str, kind: CkptKind, mtime_ms: u64, imported: bool) -> CkptRecord {
         CkptRecord {
             rel: rel.into(),

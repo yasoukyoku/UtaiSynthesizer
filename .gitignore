@@ -85,3 +85,10 @@ bin/
 
 # machine-local runtime config (device preference / data dir / cuda mem limit)
 /config.json
+
+# S76 batch 4: training-project listing cache (sizes + last-known names). Machine-local and
+# rebuildable, and it sits beside config.json rather than in <data>/training on purpose —
+# `training` is a MIGRATED_SUBTREE and `migrate_data_dir` verifies that tree file-by-file by
+# byte length, so a file we rewrite on every listing would abort a data-dir migration.
+# In dev the app dir IS the repo (same reason logging.rs keeps dev logs out of the tree).
+/training-projects.json
