@@ -23,7 +23,6 @@ import { useAppStore } from "../../store/app";
 import {
   useTrainingStore,
   trainingDataOk,
-  poolReusable,
   type ProjectDetail as ProjectDetailData,
   type SlotDetail,
   type TrainingBackend,
@@ -141,7 +140,7 @@ export function ProjectDetail() {
       // The page-root effect derives `poolFlat` on route change only, so a dataset edited HERE
       // would leave it stale for the rest of the session — and it is what decides whether the
       // run may skip the data page. Refresh it from the same response.
-      useTrainingStore.getState().setProjectDataset(d.dataset);
+      useTrainingStore.getState().setProjectInfo(d);
       setError(null);
     } catch (e) {
       setError(backendErrorMessage(e) ?? String(e));
@@ -172,12 +171,7 @@ export function ProjectDetail() {
    *  data it already holds (the「上方写着有数据、点训练却让我再导入」symptom). */
   const nextSegFor = (backend: TrainingBackend): TrainingSeg => {
     const st = useTrainingStore.getState();
-    const ready = trainingDataOk(
-      backend,
-      st.dataset,
-      st.speakerGroups,
-      poolReusable(backend, st.poolFlat, st.diffWsInfo),
-    );
+    const ready = trainingDataOk(backend, st.projectDataset, st.diffWsInfo);
     return ready ? "params" : "data";
   };
 

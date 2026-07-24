@@ -19,13 +19,12 @@ import {
   setupTrainingListeners,
   useTrainingStore,
   type CkptInfo,
-  type DatasetFile,
+  type DatasetFileRow,
   type ProjectDetail as ProjectDetailData,
   type TrainingGpu,
   type WorkspaceInfo,
   backendFamily,
   mergeCkptSources,
-  poolReusable,
   segTab,
   asTrainingBackend,
   IDLE_SNAPSHOT,
@@ -66,7 +65,7 @@ const STAGE_ORDERS: Record<string, string[]> = {
 export function TrainingPage() {
   const { t } = useTranslation();
   const closePage = useAppStore((s) => s.toggleTrainingPage);
-  const { route, setRoute, goSeg, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo, poolFlat } =
+  const { route, setRoute, goSeg, snapshot, refresh, config, diffWsInfo, projectDataset } =
     useTrainingStore();
   const [dropActive, setDropActive] = useState(false);
 
@@ -110,16 +109,16 @@ export function TrainingPage() {
   useEffect(() => {
     const pid = route.projectId;
     if (!pid) {
-      useTrainingStore.getState().setProjectDataset(null);
+      useTrainingStore.getState().setProjectInfo(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
         const d = await invoke<ProjectDetailData>("get_training_project", { projectId: pid });
-        if (!cancelled) useTrainingStore.getState().setProjectDataset(d.dataset);
+        if (!cancelled) useTrainingStore.getState().setProjectInfo(d);
       } catch {
-        if (!cancelled) useTrainingStore.getState().setProjectDataset(null);
+        if (!cancelled) useTrainingStore.getState().setProjectInfo(null);
       }
     })();
     return () => {
@@ -193,7 +192,9 @@ export function TrainingPage() {
         // are CSS px, so divide by DPR.
         const hitTestSpeaker = (position?: { x: number; y: number }): string | null => {
           const st = useTrainingStore.getState();
-          if (!backendSupportsMultiSpeaker(st.config.backend) || st.speakerGroups.length <= 1) {
+          // S78: the singers are the project's on-disk directories; a card's identity is its slug.
+          const groups = st.projectDataset?.groups ?? [];
+          if (!backendSupportsMultiSpeaker(st.config.backend) || groups.length <= 1) {
             return null;
           }
           if (position) {
@@ -208,7 +209,7 @@ export function TrainingPage() {
               }
             }
           }
-          return st.speakerGroups[0]?.id ?? null; // fallback: the first singer
+          return groups[0]?.slug ?? null; // fallback: the first singer
         };
         const setHover = (id: string | null) => {
           const st = useTrainingStore.getState();
@@ -250,13 +251,19 @@ export function TrainingPage() {
           // route somewhere arbitrary. (`goSeg` refuses a project-less jump too; this keeps the
           // files from being staged into a form nothing will read.)
           if (!st.route.projectId) return;
-          if (backendSupportsMultiSpeaker(st.config.backend)) {
-            const gid = target ?? st.speakerGroups[0]?.id;
-            if (gid) void st.addSpeakerFiles(gid, audio);
-          } else {
-            void st.addFiles(audio);
-          }
+          // S78: a drop IMPORTS — the files land in `<project>/dataset/` immediately. The target
+          // is a singer directory when the project has singers, else the flat dataset. Failures
+          // surface here because there is no form left to leave the files sitting in.
+          const groups = st.projectDataset?.groups ?? [];
+          const slug = backendSupportsMultiSpeaker(st.config.backend)
+            ? (target ?? groups[0]?.slug ?? null)
+            : null;
+          const owner = groups.find((g) => g.slug === slug);
           st.goSeg("data");
+          void st.importIntoProject(audio, owner ? owner.name || owner.slug : null).catch((e) => {
+            const msg = backendErrorMessage(e) ?? String(e);
+            if (!maybeShowErrorModal(e, msg)) useAppStore.getState().showToast(msg, "error");
+          });
         }
       })
       .then((u) => {
@@ -269,30 +276,14 @@ export function TrainingPage() {
     };
   }, []);
 
-  // ①c: when the training object changes, move the imported file list between
-  // the flat dataset (rvc/vocoder/diff) and the first singer (sovits) so a
-  // switch never leaves already-imported files stranded/invisible.
-  const prevBackendRef = useRef(config.backend);
-  useEffect(() => {
-    const prev = prevBackendRef.current;
-    if (prev !== config.backend) {
-      prevBackendRef.current = config.backend;
-      useTrainingStore.getState().migrateOnBackendSwitch(prev, config.backend);
-    }
-  }, [config.backend]);
-
-  // S76 batch 4 段序:1=项目(列表/详情) 2=数据 3=参数 4=运行。第 1 段之外的每一段都是
-  // 「某个项目的」——没有项目就一步也走不下去,所以 2/3/4 全部以 projectId 为前置。
-  // 「数据满足了吗」= 内存里刚导入的暂存数据,**或**项目盘上已有的可复用数据集(poolReusable)。
-  // 后者修的是「老项目上方写着有数据、点训练却让我再导入」:后端本来就会复用项目已有数据。
-  const pool = poolReusable(config.backend, poolFlat, diffWsInfo);
+  // 「数据满足了吗」= 项目**盘上**有没有这个架构能吃的数据(S78:导入即落盘,不再有暂存表)。
   const hasProject = route.projectId !== "";
   // 一次运行的身份 = 项目 + 架构槽 + 本次训练名。名字只在详情页点某张槽卡片时才产生
   //(askRunName,已跑过的槽直接沿用冻结的旧名),换项目会清掉它。没有它就不该往参数/运行段走:
   // 那两段的每个动作最终都要把这个名字发给后端当产物身份,而中间没有任何一处能填它。
   const runNameSet = config.modelName.trim() !== "";
   const step3Ok =
-    hasProject && runNameSet && trainingDataOk(config.backend, dataset, speakerGroups, pool);
+    hasProject && runNameSet && trainingDataOk(config.backend, projectDataset, diffWsInfo);
   // 运行段属于「这个项目的这次运行」。以前的判据是「有任何非 idle 的 snapshot」——那时没有项目
   // 概念,所以够用;现在它有两个洞:①没选项目时也为真,tab 亮着但一点就被防逃课弹回;
   // ②在项目 B 上会亮出项目 A 的运行结果。运行中的 run 由 project_id 认领(批 1 起每次运行都带)。
@@ -372,7 +363,7 @@ export function TrainingPage() {
       {dropActive &&
         !(
           backendSupportsMultiSpeaker(config.backend) &&
-          speakerGroups.length > 1 &&
+          (projectDataset?.groups.length ?? 0) > 1 &&
           route.seg === "data"
         ) && <div className="training-drop-overlay">{t("training.dropHint")}</div>}
     </div>
@@ -388,216 +379,262 @@ export function TrainingPage() {
 // Scrubber extracted to components/common/Scrubber.tsx (S66) — the workflow node output
 // preview shares it. The data-list margin moved to .training-scrubber-slot (caller-owned).
 
+/**
+ * 第 2 段 · 数据 —— 项目数据集的编辑器(S78 批 5)。
+ *
+ * 以前这里是一张**新导入的暂存表**:选好文件,等训练开始时才整体写进 `<project>/dataset/`。
+ * 于是「项目上方写着有数据、点进来却是空表」,而且在这里选一个文件会**整体替换**已经攒好的
+ * 一整份数据。现在导入是它自己的动作:文件立刻落盘,这一页显示的就是磁盘上的真实内容。
+ *
+ * 三条不变量:
+ *  1. 唯一真源是磁盘。每次增删都以 `refreshProjectDataset()` 收尾,界面从不自己打补丁。
+ *  2. 歌手的**顺序就是 emb_g 行号**(0 起,与 config.spk、推理歌手下拉同一套编号)。
+ *  3. 歌手集合被任一架构冻结后,增删歌手会被后端硬拒(`DATASET_SPEAKERS_FROZEN`);
+ *     给已有歌手增删文件不受限,只是下次续训要重做特征提取。
+ */
 function DataStep() {
   const { t } = useTranslation();
   const {
-    dataset,
-    speakerGroups,
-    addFiles,
-    removeFile,
-    addSpeaker,
-    removeSpeaker,
-    setSpeakerName,
-    addSpeakerFiles,
-    removeSpeakerFile,
-    dragOverSpeakerId,
-    flashSpeaker,
-    clearFlashSpeaker,
     goSeg,
     config,
     diffWsInfo,
-    poolFlat,
-    poolCount,
+    projectDataset,
+    importIntoProject,
+    deleteFromProject,
+    dragOverSpeakerId,
+    flashSpeaker,
+    clearFlashSpeaker,
   } = useTrainingStore();
-  const pool = poolReusable(config.backend, poolFlat, diffWsInfo);
-  // ①c: SoVITS (α) + RVC (α′) data is a SINGER LIST (default 1 singer = single-speaker);
-  // diff/vocoder keep the flat file list.
+  const showConfirm = useAppStore((s) => s.showConfirm);
+  const showToast = useAppStore((s) => s.showToast);
+  const [busy, setBusy] = useState(false);
+
+  const ds = projectDataset;
+  const groups = ds?.groups ?? [];
+  const flat = ds?.entries.filter((e) => !e.rel.includes("/")) ?? [];
+  // ①c: SoVITS (α) + RVC (α′) + v2 take a SINGER LIST; diff/vocoder are flat-only.
   const singerList = backendSupportsMultiSpeaker(config.backend);
-  // Preview + row rendering are shared with the project detail page (PreviewFileRow). The
-  // predicate is the same guard this step always had: a long file's decode outlives the gesture,
-  // and the file may live in the flat list OR any singer group by then.
+  const dataOk = trainingDataOk(config.backend, ds, diffWsInfo);
+
+  // The preview reads files by absolute path; the presence check re-reads the CURRENT listing
+  // because a long decode outlives its gesture and the row may be deleted by then.
+  const dsRef = useRef(ds);
+  dsRef.current = ds;
   const p = useFilePreview((path) => {
-    const st = useTrainingStore.getState();
-    return (
-      st.dataset.some((f) => f.path === path) ||
-      st.speakerGroups.some((g) => g.files.some((f) => f.path === path))
-    );
+    const d = dsRef.current;
+    return !!d && d.entries.some((e) => `${d.datasetDir}/${e.rel}` === path);
   });
 
-  const pickFiles = async () => {
+  const run = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (e) {
+      const msg = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pickAudio = async () => {
     const picked = await open({
       multiple: true,
       filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
       title: t("training.addFiles"),
     });
-    if (!picked) return;
-    await addFiles(Array.isArray(picked) ? picked : [picked]);
+    if (!picked) return null;
+    return Array.isArray(picked) ? picked : [picked];
   };
 
-  const totalMs = dataset.reduce((acc, f) => acc + (f.durationMs ?? 0), 0);
+  const addTo = async (speaker: string | null) => {
+    const files = await pickAudio();
+    if (!files) return;
+    await run(() => importIntoProject(files, speaker));
+  };
 
-  const pickSpeakerFiles = async (id: string) => {
-    const picked = await open({
-      multiple: true,
-      filters: [{ name: "Audio", extensions: AUDIO_EXTENSIONS }],
-      title: t("training.addFiles"),
+  /** A new singer only exists once it has audio — an empty directory is a speaker with no data,
+   *  which the start guard refuses anyway. So the name prompt is followed straight by the file
+   *  picker, and nothing is created if the user backs out of either. */
+  const addSinger = async () => {
+    const taken = new Set(groups.map((g) => (g.name || g.slug).trim()));
+    const name = await showConfirm({
+      title: t("training.addSpeaker"),
+      body: t("training.addSpeakerBody"),
+      buttons: [
+        { id: "__cancel", label: t("training.cancel") },
+        { id: "ok", label: t("training.next"), kind: "primary" },
+      ],
+      input: {
+        initial: "",
+        invalid: (v) =>
+          !v.trim()
+            ? t("backend.TRAINING_SPEAKER_NAME_EMPTY")
+            : taken.has(v.trim())
+              ? t("backend.TRAINING_SPEAKER_NAME_DUP")
+              : null,
+      },
     });
-    if (!picked) return;
-    await addSpeakerFiles(id, Array.isArray(picked) ? picked : [picked]);
+    if (!name || name === "__cancel") return;
+    const files = await pickAudio();
+    if (!files) return;
+    await run(() => importIntoProject(files, name.trim()));
   };
 
-  // one file row (play / scrub / remove) — shared by the flat list AND each speaker group so
-  // the preview logic stays single-source. onRemove differs (removeFile vs removeSpeakerFile)
-  // but the play/scrub state is by path.
-  const renderFileRow = (f: DatasetFile, onRemove: () => void) => (
+  /** Deleting is confirmed only when it COSTS something: with a trained slot in the project the
+   *  next run has to redo slicing + feature extraction. With nothing trained it is free, and a
+   *  dialog per file would just be in the way. */
+  const removeFile = async (rel: string, label: string) => {
+    if (useTrainingStore.getState().projectHasProgress) {
+      const ok = await showConfirm({
+        title: t("training.datasetRemoveTitle"),
+        body: t("training.datasetRemoveBody", { name: label }),
+        buttons: [
+          { id: "__cancel", label: t("training.cancel") },
+          { id: "go", label: t("training.remove"), kind: "danger" },
+        ],
+      });
+      if (ok !== "go") return;
+    }
+    if (ds) p.stopIfPlaying(`${ds.datasetDir}/${rel}`);
+    await run(() => deleteFromProject([rel]));
+  };
+
+  const removeSinger = async (slug: string, label: string, files: number) => {
+    const ok = await showConfirm({
+      title: t("training.removeSpeaker"),
+      body: t("training.datasetRemoveSpeakerBody", { name: label, count: files }),
+      buttons: [
+        { id: "__cancel", label: t("training.cancel") },
+        { id: "go", label: t("training.remove"), kind: "danger" },
+      ],
+    });
+    if (ok !== "go") return;
+    const rels = (ds?.entries ?? [])
+      .filter((e) => e.rel.startsWith(`${slug}/`))
+      .map((e) => e.rel);
+    if (ds) rels.forEach((r) => p.stopIfPlaying(`${ds.datasetDir}/${r}`));
+    await run(() => deleteFromProject(rels));
+  };
+
+  const row = (e: DatasetFileRow, lead?: React.ReactNode) => (
     <PreviewFileRow
-      key={f.path}
+      key={e.rel}
       p={p}
-      path={f.path}
-      name={f.name}
-      meta={f.durationMs != null ? fmtDur(f.durationMs / 1000) : undefined}
-      onRemove={onRemove}
+      path={`${ds!.datasetDir}/${e.rel}`}
+      title={e.rel}
+      lead={lead}
+      // No original name = imported before the annotation existed; showing the on-disk name is
+      // the honest fallback.
+      name={e.name || e.rel}
+      meta={e.durationMs != null ? fmtDur(e.durationMs / 1000) : fmtSize(e.bytes)}
+      onRemove={busy ? undefined : () => void removeFile(e.rel, e.name || e.rel)}
     />
   );
+
+  const total = (entries: DatasetFileRow[]) => {
+    const ms = entries.reduce((a, e) => a + (e.durationMs ?? 0), 0);
+    return (
+      <span className="training-data-total">
+        {t("training.files", { count: entries.length })}
+        {ms > 0 && <> · {t("training.totalDur", { dur: fmtDur(ms / 1000) })}</>}
+      </span>
+    );
+  };
 
   return (
     <div className="training-data-step">
       <div className="training-hint">{t("training.dataHint")}</div>
-      {/* ★ This page REPLACES the project's dataset wholesale (that is what the run-time import
-          does). Since 批 5b the project page can add and remove individual files, so a user who
-          just curated a set there must not lose it by picking one file here. Says the count out
-          loud rather than relying on them remembering which page does what. */}
-      {poolCount > 0 && (
-        <div className="training-fixed-note">
-          {t("training.datasetReplaceWarn", { count: poolCount })}
-        </div>
-      )}
 
-      {singerList ? (
+      {singerList && groups.length > 0 ? (
+        // ── 多歌手:每位歌手一张卡,顺序 = emb_g 行号 ──────────────────────────
         <div className="training-spk-stack">
-          {speakerGroups.map((g, i) => {
-            const gMs = g.files.reduce((a, f) => a + (f.durationMs ?? 0), 0);
-            // with a single singer this is just the flat list (no card chrome /
-            // name / remove); the name + remove appear once there are ≥2 singers
-            const multiSinger = speakerGroups.length > 1;
+          {groups.map((g, i) => {
+            const mine = (ds?.entries ?? []).filter((e) => e.rel.startsWith(`${g.slug}/`));
             return (
               <div
-                key={g.id}
-                // data-spk-id = the drag hit-test anchor (only meaningful with
-                // ≥2 singers; a lone singer takes any drop)
-                data-spk-id={multiSinger ? g.id : undefined}
-                className={
-                  multiSinger
-                    ? `training-spk-group${dragOverSpeakerId === g.id ? " drop-target" : ""}`
-                    : undefined
-                }
+                key={g.slug}
+                // the drag hit-test anchor — the slug is the identity now, not a draft id
+                data-spk-id={g.slug}
+                className={`training-spk-group${dragOverSpeakerId === g.slug ? " drop-target" : ""}`}
               >
-                {multiSinger && flashSpeaker?.id === g.id && (
-                  // one-shot pulse confirming files landed on THIS singer; the
-                  // nonce key remounts it so repeat adds re-trigger the animation
+                {flashSpeaker?.id === g.slug && (
                   <span
                     key={flashSpeaker.nonce}
                     className="training-spk-flash"
                     onAnimationEnd={() => clearFlashSpeaker(flashSpeaker.nonce)}
                   />
                 )}
-                {multiSinger && (
-                  <div className="training-spk-header">
-                    <span className="training-spk-idx">{i + 1}</span>
-                    <input
-                      className="training-spk-name"
-                      value={g.name}
-                      placeholder={t("training.speakerName")}
-                      onChange={(e) => setSpeakerName(g.id, e.target.value)}
-                    />
-                    <span className="training-spk-count">
-                      {t("training.files", { count: g.files.length })}
-                      {gMs > 0 && <> · {fmtDur(gMs / 1000)}</>}
-                    </span>
-                    <button
-                      className="training-file-remove"
-                      onClick={() => {
-                        // stop an in-progress preview of a file in THIS singer
-                        // before the row (and its scrubber) unmounts
-                        const active = p.playingPath;
-                        if (active && g.files.some((f) => f.path === active)) {
-                          p.stopIfPlaying(active);
-                        }
-                        removeSpeaker(g.id);
-                      }}
-                      title={t("training.removeSpeaker")}
-                    >
-                      X
-                    </button>
-                  </div>
-                )}
+                <div className="training-spk-header">
+                  {/* 0-based: this IS the emb_g row, the number a manual rebuild must reproduce */}
+                  <span className="training-spk-idx" title={t("training.projectDatasetOrderNote")}>
+                    {ds?.orderKnown ? i : "?"}
+                  </span>
+                  <span className="training-spk-name tproj-ds-spk-name" title={g.slug}>
+                    {g.name || g.slug}
+                  </span>
+                  <span className="training-spk-count">
+                    {t("training.files", { count: g.files })} · {fmtSize(g.bytes)}
+                  </span>
+                  <button
+                    className="training-file-remove"
+                    disabled={busy}
+                    onClick={() => void removeSinger(g.slug, g.name || g.slug, g.files)}
+                    title={t("training.removeSpeaker")}
+                  >
+                    X
+                  </button>
+                </div>
                 <div className="training-data-actions">
                   <button
                     className="training-btn"
-                    onClick={() => void pickSpeakerFiles(g.id)}
+                    disabled={busy}
+                    onClick={() => void addTo(g.name || g.slug)}
                   >
                     {t("training.addFiles")}
                   </button>
-                  {!multiSinger && (
-                    <span className="training-data-total">
-                      {t("training.files", { count: g.files.length })}
-                      {gMs > 0 && (
-                        <> · {t("training.totalDur", { dur: fmtDur(gMs / 1000) })}</>
-                      )}
-                    </span>
-                  )}
                 </div>
-                {g.files.length > 0 ? (
-                  <div
-                    className={
-                      multiSinger
-                        ? "training-file-list training-spk-files"
-                        : "training-file-list"
-                    }
-                  >
-                    {g.files.map((f) =>
-                      renderFileRow(f, () => removeSpeakerFile(g.id, f.path)),
-                    )}
-                  </div>
-                ) : (
-                  !multiSinger && (
-                    <div className="training-empty">{t("training.empty")}</div>
-                  )
-                )}
+                <div className="training-file-list training-spk-files">
+                  {mine.map((e) => row(e))}
+                </div>
               </div>
             );
           })}
-          <button className="training-btn training-spk-add" onClick={addSpeaker}>
+          <button className="training-btn training-spk-add" disabled={busy} onClick={() => void addSinger()}>
             {t("training.addSpeaker")}
           </button>
           <div className="training-hint training-spk-hint">
-            {t("training.multiSpeakerHint")}
+            {ds?.orderKnown
+              ? t("training.multiSpeakerHint")
+              : t("training.projectDatasetOrderUnknown")}
           </div>
         </div>
       ) : (
+        // ── 平铺(单歌手 / 浅扩散 / 声码器)───────────────────────────────────
         <>
           <div className="training-data-actions">
-            <button className="training-btn" onClick={() => void pickFiles()}>
+            <button className="training-btn" disabled={busy} onClick={() => void addTo(null)}>
               {t("training.addFiles")}
             </button>
-            <span className="training-data-total">
-              {t("training.files", { count: dataset.length })}
-              {totalMs > 0 && (
-                <> · {t("training.totalDur", { dur: fmtDur(totalMs / 1000) })}</>
-              )}
-            </span>
+            {total(flat)}
+            {singerList && flat.length > 0 && (
+              // Turning a flat project into a co-training one: the existing audio stays where it
+              // is, the new singer gets its own directory. Refused by the backend once a slot has
+              // frozen the (single-speaker) structure, with a CODE that says why.
+              <button className="training-btn" disabled={busy} onClick={() => void addSinger()}>
+                {t("training.addSpeaker")}
+              </button>
+            )}
           </div>
-          {dataset.length === 0 ? (
+          {flat.length === 0 ? (
             <div className="training-empty">
               {t("training.empty")}
-              {config.backend === "sovits_diff" && pool && (
+              {config.backend === "sovits_diff" && dataOk && (
                 <div className="training-fixed-note">{t("training.diffPoolHint")}</div>
               )}
             </div>
           ) : (
-            <div className="training-file-list">
-              {dataset.map((f) => renderFileRow(f, () => removeFile(f.path)))}
-            </div>
+            <div className="training-file-list">{flat.map((e) => row(e))}</div>
           )}
         </>
       )}
@@ -613,7 +650,7 @@ function DataStep() {
         ) : (
           <button
             className="training-btn primary"
-            disabled={!trainingDataOk(config.backend, dataset, speakerGroups, pool)}
+            disabled={!dataOk || busy}
             onClick={() => goSeg("params")}
           >
             {t("training.next")}
@@ -623,6 +660,7 @@ function DataStep() {
     </div>
   );
 }
+
 
 /* ---------------------------------- step 3: params ---------------------------------- */
 
@@ -1228,8 +1266,6 @@ function RunStep() {
     snapshot: liveSnapshot,
     snapshotAt,
     history,
-    dataset,
-    speakerGroups,
     config,
     starting,
     start,
@@ -1239,7 +1275,6 @@ function RunStep() {
     goSeg,
     route,
     diffWsInfo,
-    poolFlat,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
@@ -1777,12 +1812,7 @@ function RunStep() {
     // pool (flat on-disk dataset, or a diff host's shared pool) — Rust re-verifies
     // authoritatively. ①c: multi-speaker needs ≥2 named non-empty groups (trainingDataOk).
     if (
-      !trainingDataOk(
-        config.backend,
-        dataset,
-        speakerGroups,
-        poolReusable(config.backend, poolFlat, diffWsInfo),
-      )
+      !trainingDataOk(config.backend, useTrainingStore.getState().projectDataset, diffWsInfo)
     ) {
       showToast(t("training.needData"), "error");
       return;
@@ -1924,7 +1954,9 @@ function RunStep() {
       }
       if (backendSupportsMultiSpeaker(config.backend)) {
         const oldNames = info.speakers ?? [];
-        const curNames = speakerGroups.length > 1 ? speakerGroups.map((g) => g.name.trim()) : [];
+        // S78: the singer set is what is ON DISK now — the staging form is gone.
+        const disk = useTrainingStore.getState().projectDataset?.groups ?? [];
+        const curNames = disk.length > 1 ? disk.map((g) => g.name || g.slug) : [];
         const same = oldNames.length === curNames.length && oldNames.every((n, i) => n === curNames[i]);
         if (!same)
           diffRows.push({

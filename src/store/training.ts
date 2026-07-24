@@ -60,13 +60,13 @@ export interface SpeakerGroupDraft {
   files: DatasetFile[];
 }
 
-let spkSeq = 0;
 /** Generation counter for the checkpoint scan — see refreshProjectCkpts. */
 let ckptScanSeq = 0;
 /** Bumped by `enterProject`. Anything that stages data ASYNCHRONOUSLY has to check it after
  *  its await: probing a few hundred files takes long enough for the user to have moved to
  *  another project, and the result would land in THAT project's form. */
 let projectEpoch = 0;
+/** Nonce for the「文件落到这位歌手」pulse — the same singer must be able to re-flash. */
 let flashSeq = 0;
 
 export interface StageInfo {
@@ -385,47 +385,28 @@ export function backendSupportsMultiSpeaker(backend: string): boolean {
  *  ①c: SoVITS/RVC data is a SINGER LIST (default 1 singer = single-speaker, the
  *  degenerate case of N). Every singer needs files; with ≥2 singers each also
  *  needs a (unique) name. Other backends keep the flat-dataset / shared-pool rule. */
+/** THE single predicate for「数据这一步满足了吗」 — the wizard gating (`step3Ok`), the data
+ *  page's Next button, and「点某个架构该跳到哪一段」all ask this one, so they cannot disagree.
+ *
+ *  S78: it asks the DISK, not a staging form. Importing became its own act (files land in
+ *  `<project>/dataset/` immediately), so「有没有数据」is a property of the project — which is
+ *  also what makes an existing project trainable without re-importing anything.
+ */
 export function trainingDataOk(
   backend: string,
-  dataset: DatasetFile[],
-  speakerGroups: SpeakerGroupDraft[],
-  /** The project's on-disk pool is reusable for this run without a fresh import — see
-   *  `poolReusable`. For diff this was always the only escape hatch; S76 batch 4 extended it to
-   *  every backend so an EXISTING flat project trains without re-importing the data it already
-   *  holds (the symptom being「上方写着有数据、点训练却让我再导入」). */
-  poolReady: boolean,
+  ds: DatasetSummary | null,
+  /** Shallow diffusion asks a different question: it needs the SoVITS slot's cached slices, not
+   *  merely raw audio (`diffPoolReady`). */
+  diffInfo: WorkspaceInfo | null,
 ): boolean {
-  if (backendSupportsMultiSpeaker(backend)) {
-    const allHaveFiles =
-      speakerGroups.length > 0 && speakerGroups.every((g) => g.files.length > 0);
-    // single-speaker (or no groups yet): the one group's files, OR a reusable flat pool.
-    // ≥2 singers is a FRESH multi-speaker setup — the pool does not apply (a flat pool cannot
-    // satisfy a multi-singer run, and a multi-singer pool needs its groups reconstructed).
-    if (speakerGroups.length <= 1) return allHaveFiles || poolReady;
-    const names = speakerGroups.map((g) => g.name.trim());
-    const allNamed = names.every((n) => n !== "");
-    const uniqueNames = new Set(names).size === names.length;
-    return allHaveFiles && allNamed && uniqueNames;
-  }
-  return dataset.length > 0 || poolReady;
+  if (backend === "sovits_diff") return diffPoolReady(backend, diffInfo);
+  if (!ds || ds.files === 0) return false;
+  // A flat dataset feeds any backend. A per-singer one only feeds the co-training backends —
+  // python's fingerprint hard-fails on a subdirectory for the flat ones, so offering to start
+  // would just move the refusal later and further from the cause.
+  return ds.speakers.length === 0 || backendSupportsMultiSpeaker(backend);
 }
 
-/** Probe duration + derive the display name for a batch of picked paths.
- *  Single source for the flat dataset add AND the per-speaker add. */
-async function probeFiles(paths: string[]): Promise<DatasetFile[]> {
-  return Promise.all(
-    paths.map(async (path) => {
-      let durationMs: number | null = null;
-      try {
-        durationMs = await invoke<number>("probe_audio_duration", { path });
-      } catch {
-        durationMs = null;
-      }
-      const name = path.replace(/\\/g, "/").split("/").pop() ?? path;
-      return { path, name, durationMs };
-    }),
-  );
-}
 
 export interface TrainingSnapshot {
   state: "idle" | "starting" | "running" | "completed" | "stopped" | "error";
@@ -597,9 +578,6 @@ interface TrainingStoreState {
   /** Wall-clock ms when `snapshot` was received — RunStep's elapsed ticker extrapolates from it. */
   snapshotAt: number;
   history: StepPoint[];
-  dataset: DatasetFile[];
-  /** ①c: the SoVITS card's singer list (always ≥1; 1 = single-speaker). */
-  speakerGroups: SpeakerGroupDraft[];
   config: TrainingFormConfig;
   route: TrainingRoute;
   starting: boolean;
@@ -622,9 +600,21 @@ interface TrainingStoreState {
   projectDataset: DatasetSummary | null;
 
   setRoute: (r: TrainingRoute) => void;
-  /** ONE writer for all three — they answer the same question, and a setter each is exactly how
+  /** Does any architecture slot of the CURRENT project hold work? Deleting or adding data then
+   *  costs a full re-extraction on the next run — the one thing worth a confirmation. */
+  projectHasProgress: boolean;
+
+  /** ONE writer for every field derived from the project read — a setter each is exactly how
    *  they drift apart. `null` = unknown (no project / the read failed). */
-  setProjectDataset: (d: DatasetSummary | null) => void;
+  setProjectInfo: (d: ProjectDetail | null) => void;
+  /** Re-read the CURRENT project's dataset from disk. Every mutation ends with this; the disk is
+   *  the authority, so the UI never patches its own copy. */
+  refreshProjectDataset: () => Promise<void>;
+  /** Copy audio INTO the project's dataset (append). `speaker` = a co-trained singer's display
+   *  name, null = the flat dataset. Throws the backend CODE for the caller to display. */
+  importIntoProject: (files: string[], speaker?: string | null) => Promise<void>;
+  /** Remove files from the project's dataset by their `rel`. Throws the backend CODE. */
+  deleteFromProject: (rels: string[]) => Promise<void>;
   /** Move within the CURRENT project. Refuses when there is none — every segment past the
    *  landing is about a project, and a `projectId: ""` route would silently address
    *  `<training>/` itself. */
@@ -639,13 +629,6 @@ interface TrainingStoreState {
   enterProject: (projectId: string, seg?: TrainingSeg) => void;
   setDiffWsInfo: (info: WorkspaceInfo | null) => void;
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
-  addFiles: (paths: string[]) => Promise<void>;
-  removeFile: (path: string) => void;
-  addSpeaker: () => void;
-  removeSpeaker: (id: string) => void;
-  setSpeakerName: (id: string, name: string) => void;
-  addSpeakerFiles: (id: string, paths: string[]) => Promise<void>;
-  removeSpeakerFile: (id: string, path: string) => void;
   /** ①c: which singer card a file-drag is currently over (highlight target);
    *  null = none. Set by the drag handler, read by the DataStep cards. */
   dragOverSpeakerId: string | null;
@@ -657,10 +640,6 @@ interface TrainingStoreState {
   /** clear the pulse, but only if `nonce` still matches — so a stale animationend
    *  from one singer cannot wipe a pulse just started on another. */
   clearFlashSpeaker: (nonce: number) => void;
-  /** ①c: move the imported file list between the flat dataset (rvc/vocoder/diff)
-   *  and the first singer (sovits) when the training object changes, so a switch
-   *  never leaves already-imported files stranded/invisible. */
-  migrateOnBackendSwitch: (prev: string, next: string) => void;
   refresh: () => Promise<void>;
   /** S76: the project's on-disk checkpoint inventory (survives app restarts and「清空结果」). */
   projectCkpts: CkptRecord[];
@@ -687,9 +666,6 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   snapshot: IDLE_SNAPSHOT,
   snapshotAt: Date.now(),
   history: [],
-  dataset: [],
-  // ①c: always ≥1 singer (default 1 = single-speaker). removeSpeaker keeps ≥1.
-  speakerGroups: [{ id: `spk${++spkSeq}`, name: "", files: [] }],
   dragOverSpeakerId: null,
   flashSpeaker: null,
   config: { ...DEFAULT_CONFIG },
@@ -699,14 +675,56 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   poolFlat: false,
   poolCount: 0,
   projectDataset: null,
+  projectHasProgress: false,
 
   setRoute: (r) => set({ route: r }),
-  setProjectDataset: (d) =>
+  setProjectInfo: (d) =>
     set({
-      projectDataset: d,
-      poolCount: d?.files ?? 0,
-      poolFlat: !!d && d.files > 0 && d.speakers.length === 0,
-    }),
+      projectDataset: d?.dataset ?? null,
+      poolCount: d?.dataset.files ?? 0,
+      poolFlat: !!d && d.dataset.files > 0 && d.dataset.speakers.length === 0,
+      projectHasProgress:
+        d?.slots.some((s) => s.hasResumePoint || s.info.has_main_progress || s.ckptCount > 0) ??
+        false,
+    }) ,
+
+  refreshProjectDataset: async () => {
+    const pid = get().route.projectId;
+    if (!pid) {
+      get().setProjectInfo(null);
+      return;
+    }
+    const epoch = projectEpoch;
+    try {
+      const d = await invoke<ProjectDetail>("get_training_project", { projectId: pid });
+      // the user may have left for another project while this was in flight — landing now would
+      // describe project A while the page is on B (same rule as `addFiles`)
+      if (epoch !== projectEpoch) return;
+      get().setProjectInfo(d);
+    } catch {
+      if (epoch === projectEpoch) get().setProjectInfo(null);
+    }
+  },
+
+  importIntoProject: async (files, speaker = null) => {
+    const pid = get().route.projectId;
+    if (!pid || files.length === 0) return;
+    await invoke("import_project_dataset", { projectId: pid, files, speaker });
+    await get().refreshProjectDataset();
+    // one-shot「落到这位歌手了」pulse, resolved AFTER the refresh so a brand-new singer (whose
+    // card did not exist when the import started) flashes too
+    if (speaker) {
+      const g = get().projectDataset?.groups.find((x) => (x.name || x.slug) === speaker);
+      if (g) set({ flashSpeaker: { id: g.slug, nonce: ++flashSeq } });
+    }
+  },
+
+  deleteFromProject: async (rels) => {
+    const pid = get().route.projectId;
+    if (!pid || rels.length === 0) return;
+    await invoke("delete_project_dataset_files", { projectId: pid, rels });
+    await get().refreshProjectDataset();
+  },
   enterProject: (projectId, seg = "detail") => {
     // Invalidate everything that is mid-flight FOR THE OLD PROJECT: an in-progress file probe
     // (`addFiles`) and an in-progress archive scan (`refreshProjectCkpts`) would otherwise land
@@ -724,8 +742,6 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         route: { seg: projectId ? seg : "projects", projectId },
         // Everything below belongs to the project we are LEAVING. Keeping any of it is how a run
         // ends up describing one project while writing into another.
-        dataset: [],
-        speakerGroups: [{ id: `spk${++spkSeq}`, name: "", files: [] }],
         // `backend` too: the data segment renders a singer list or a flat list depending on it,
         // so leaving the previous project's pick behind means「导入数据」opens the wrong shape.
         config: { ...s.config, modelName: isLiveRun ? live.model_name : "", backend },
@@ -735,6 +751,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         poolFlat: false,
         poolCount: 0,
         projectDataset: null,
+        projectHasProgress: false,
         projectCkpts: [],
       };
     });
@@ -748,104 +765,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   setDiffWsInfo: (info) => set({ diffWsInfo: info }),
   updateConfig: (u) => set((s) => ({ config: { ...s.config, ...u } })),
 
-  addFiles: async (paths) => {
-    const epoch = projectEpoch;
-    const existing = new Set(get().dataset.map((f) => f.path));
-    const fresh = paths.filter((p) => !existing.has(p));
-    if (!fresh.length) return;
-    const probed = await probeFiles(fresh);
-    // The probe is one `invoke` PER FILE — long enough for the user to have switched projects.
-    // Landing these now would file the previous project's audio under the new one, and
-    // `start()` would then send it with the new project's id. (`addSpeakerFiles` was already
-    // safe by accident: `enterProject` mints a fresh singer id, so its own guard misses.)
-    if (epoch !== projectEpoch) return;
-    set((s) => ({ dataset: [...s.dataset, ...probed] }));
-  },
-  removeFile: (path) =>
-    set((s) => ({ dataset: s.dataset.filter((f) => f.path !== path) })),
-
-  addSpeaker: () =>
-    set((s) => ({
-      speakerGroups: [
-        ...s.speakerGroups,
-        { id: `spk${++spkSeq}`, name: "", files: [] },
-      ],
-    })),
-  removeSpeaker: (id) =>
-    set((s) =>
-      // keep ≥1 singer (the single-speaker degenerate case) — the last group
-      // is not removable
-      s.speakerGroups.length > 1
-        ? { speakerGroups: s.speakerGroups.filter((g) => g.id !== id) }
-        : {},
-    ),
-  setSpeakerName: (id, name) =>
-    set((s) => ({
-      speakerGroups: s.speakerGroups.map((g) =>
-        g.id === id ? { ...g, name } : g,
-      ),
-    })),
-  addSpeakerFiles: async (id, paths) => {
-    const epoch = projectEpoch;
-    const grp = get().speakerGroups.find((g) => g.id === id);
-    if (!grp) return;
-    const existing = new Set(grp.files.map((f) => f.path));
-    const fresh = paths.filter((p) => !existing.has(p));
-    if (!fresh.length) return;
-    const probed = await probeFiles(fresh);
-    // the group may have been removed during the async probe — bail rather than
-    // discard the files (and leave a flash pointing at a dead id). The epoch check is the
-    // same rule for the project having changed underneath (see `addFiles`).
-    if (epoch !== projectEpoch) return;
-    if (!get().speakerGroups.some((g) => g.id === id)) return;
-    set((s) => {
-      const speakerGroups = s.speakerGroups.map((g) =>
-        g.id === id ? { ...g, files: [...g.files, ...probed] } : g,
-      );
-      return {
-        speakerGroups,
-        // pulse the target card — only with ≥2 singers (a lone singer has no
-        // card to pulse; setting it would leave an uncleared flash that fires
-        // late when a second singer is added)
-        flashSpeaker:
-          speakerGroups.length > 1 ? { id, nonce: ++flashSeq } : s.flashSpeaker,
-      };
-    });
-  },
-  removeSpeakerFile: (id, path) =>
-    set((s) => ({
-      speakerGroups: s.speakerGroups.map((g) =>
-        g.id === id
-          ? { ...g, files: g.files.filter((f) => f.path !== path) }
-          : g,
-      ),
-    })),
   setDragOverSpeakerId: (id) => set({ dragOverSpeakerId: id }),
   clearFlashSpeaker: (nonce) =>
     set((s) => (s.flashSpeaker?.nonce === nonce ? { flashSpeaker: null } : {})),
-  migrateOnBackendSwitch: (prev, next) =>
-    set((s) => {
-      // ①c: SoVITS (α) + RVC (α′) both use the singer list; diff/vocoder use the flat dataset.
-      const wasMulti = backendSupportsMultiSpeaker(prev);
-      const isMulti = backendSupportsMultiSpeaker(next);
-      if (isMulti === wasMulti) return {}; // both singer-list / both flat: same list, no migration
-      // only ever migrate a LONE singer (never clobber a real multi-singer setup)
-      const g0 = s.speakerGroups[0];
-      if (!g0 || s.speakerGroups.length !== 1) return {};
-      if (isMulti) {
-        // flat dataset -> the (empty default) first singer
-        if (s.dataset.length > 0 && g0.files.length === 0) {
-          return { dataset: [], speakerGroups: [{ ...g0, files: s.dataset }] };
-        }
-      } else if (s.dataset.length === 0 && g0.files.length > 0) {
-        // leaving a singer-list backend with a lone singer -> the (empty) flat dataset
-        return { dataset: g0.files, speakerGroups: [{ ...g0, files: [] }] };
-      }
-      return {};
-    }),
-
   projectCkpts: [],
-
   refreshProjectCkpts: async (projectId, backend) => {
     const seq = ++ckptScanSeq;
     if (!projectId) {
@@ -975,7 +898,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     } catch {
       /* pre-flight unavailable → fall through; start_training's own gate still rejects loudly */
     }
-    const { config, dataset, speakerGroups, route } = get();
+    const { config, route } = get();
     set({ starting: true });
     try {
       // ①c: SoVITS (α) + RVC (α′) data is the singer list. 1 singer = single-speaker: send its
@@ -983,12 +906,14 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       // singers: send `speakers` (matching Rust StartTrainingRequest.speakers:
       // Vec<SpeakerGroup{name,files}>) + empty dataset_files. diff/vocoder keep the flat `dataset`.
       const isMulti = backendSupportsMultiSpeaker(config.backend);
-      const multi = isMulti && speakerGroups.length > 1;
-      const datasetFiles = multi
-        ? []
-        : isMulti
-          ? (speakerGroups[0]?.files ?? []).map((f) => f.path)
-          : dataset.map((f) => f.path);
+      // S78: the data lives on disk BEFORE a run starts — importing is its own act now, so a
+      // start never carries files. A per-singer project instead DECLARES its structure (every
+      // group's `files` empty), which the backend validates against the directories that are
+      // actually there and then consumes without copying anything. Names come from the disk
+      // listing so the slug they derive to is the slug the data is already under.
+      const diskGroups = get().projectDataset?.groups ?? [];
+      const multi = isMulti && diskGroups.length > 1;
+      const datasetFiles: string[] = [];
       const base = {
         model_name: config.modelName.trim(),
         // S76 batch 4: WHICH project, explicitly. `model_name` is now「本次训练名」— editable
@@ -999,9 +924,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         dataset_files: datasetFiles,
         ...(multi
           ? {
-              speakers: speakerGroups.map((g) => ({
-                name: g.name.trim(),
-                files: g.files.map((f) => f.path),
+              speakers: diskGroups.map((g) => ({
+                name: g.name || g.slug,
+                files: [] as string[],
               })),
             }
           : {}),

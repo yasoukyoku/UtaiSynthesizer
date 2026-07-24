@@ -295,6 +295,8 @@
     "multiSpeakerHint": "One singer by default. Click \"+ Add singer\" to add more — the trained model can then blend these voices by ratio in the voice-conversion node.",
     "speakerName": "Singer name",
     "addSpeaker": "+ Add singer",
+    "addSpeakerBody": "Name this singer. The name decides its voice slot in the model, and rebuilding this data set later means retyping it EXACTLY — so pick one you will recognise.\nNext you will choose its audio: a singer with no audio does not exist.",
+    "datasetRemoveSpeakerBody": "The {{count}} audio file(s) of \"{{name}}\" will be deleted from this project's data set (the originals on your computer are untouched).\nThe number and order of singers decide the model's voice slots, so removing one makes an architecture already trained on the current layout impossible to continue.",
     "removeSpeaker": "Remove this singer",
     "files": "{{count}} file(s)",
     "totalDur": "total {{dur}}",
