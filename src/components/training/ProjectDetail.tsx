@@ -239,6 +239,8 @@ export function ProjectDetail() {
     const slot = slots.get(family);
     const runName = await askRunName(slot);
     if (runName === null) return;
+    // 继续训练 / 首次开始:the slot's frozen values stand, so the params page locks them.
+    useTrainingStore.getState().setRetrainIntent(false);
     updateConfig({
       backend: family,
       modelName: runName,
@@ -276,6 +278,9 @@ export function ProjectDetail() {
     });
     if (choice !== "go" && !versions.includes(choice as "4.1" | "4.0")) return;
     const pin = versions.includes(choice as "4.1" | "4.0") ? (choice as "4.1" | "4.0") : undefined;
+    // ★ 再训一个 = 这个架构会被清空,所以续训锁全部解除 —— 换采样率/换版本重练正是这颗按钮
+    // 的用途。真正的擦除同意仍然只有一处(运行段那个对话框,后端的 wipe_confirmed 只认它)。
+    useTrainingStore.getState().setRetrainIntent(true);
     updateConfig({
       backend: family,
       modelName: slot?.modelName || detail?.name || "",
@@ -315,6 +320,7 @@ export function ProjectDetail() {
     } catch {
       /* the data segment is the safe default */
     }
+    useTrainingStore.getState().setRetrainIntent(false);
     updateConfig({
       backend: "sovits_diff",
       modelName: runName,

@@ -632,6 +632,14 @@ interface TrainingStoreState {
    *  read-only rendering of the resume-locked fields; null = no project / never ran / read failed. */
   slotInfo: WorkspaceInfo | null;
   setSlotInfo: (info: WorkspaceInfo | null) => void;
+  /** The user arrived here via「再训一个」, i.e. they already chose to WIPE this architecture.
+   *  A 重训 unlocks every resume-locked field (that is the only way to change one), but the
+   *  choice is made on the project page and the parameters page is downstream of it — without
+   *  carrying the intent, 再训一个 would land on a form whose version / sample rate / diffusion
+   *  depth are all greyed out, which is precisely what that button exists to let you change.
+   *  Cleared by `enterProject` and by every non-retrain entry into a slot. */
+  retrainIntent: boolean;
+  setRetrainIntent: (v: boolean) => void;
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
   /** ①c: which singer card a file-drag is currently over (highlight target);
    *  null = none. Set by the drag handler, read by the DataStep cards. */
@@ -677,6 +685,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   starting: false,
   diffWsInfo: null,
   slotInfo: null,
+  retrainIntent: false,
   poolFlat: false,
   poolCount: 0,
   projectDataset: null,
@@ -752,6 +761,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         config: { ...s.config, modelName: isLiveRun ? live.model_name : "", backend },
         diffWsInfo: null,
         slotInfo: null,
+        retrainIntent: false,
         // Unknown until the new project's detail loads and re-derives it — leaving the old
         // project's value would let a run skip the data page on a project that has none.
         poolFlat: false,
@@ -770,6 +780,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     ),
   setDiffWsInfo: (info) => set({ diffWsInfo: info }),
   setSlotInfo: (info) => set({ slotInfo: info }),
+  setRetrainIntent: (v) => set({ retrainIntent: v }),
   updateConfig: (u) => set((s) => ({ config: { ...s.config, ...u } })),
 
   setDragOverSpeakerId: (id) => set({ dragOverSpeakerId: id }),

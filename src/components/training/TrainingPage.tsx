@@ -736,7 +736,7 @@ function NumberField({
 
 function ParamsStep() {
   const { t } = useTranslation();
-  const { config, updateConfig, goSeg, diffWsInfo, slotInfo } = useTrainingStore();
+  const { config, updateConfig, goSeg, diffWsInfo, slotInfo, retrainIntent } = useTrainingStore();
   const [gpus, setGpus] = useState<TrainingGpu[]>([]);
   /** S75: "usable GPU" = at least one SELECTABLE entry. A list of nothing but greyed-out cards
    *  must land on the force-CPU path, not on a dropdown where every choice is dead. */
@@ -799,7 +799,8 @@ function ParamsStep() {
   // 续训锁:这些值已经写进了槽里现有的产物(图形状、线上输入、emb_g 行、缓存的 ContentVec
   // 空间),续训改不了 —— 后端会拒。所以这里**原地只读显示**,而不是让人改完、到开始训练时
   // 才被拒绝。表在 `lib/resumeLock.ts`,与 Rust 的 `resume_lock.rs` 有跨语言对拍 gate。
-  const guarded = resumeWouldBeGuarded(config.backend, slotInfo);
+  // 「再训一个」会清空这个架构 ⇒ 什么都没被烧进去了,锁自然解除(与后端 `!fresh` 同义)。
+  const guarded = !retrainIntent && resumeWouldBeGuarded(config.backend, slotInfo);
   const locked = guarded ? lockedFieldIds(config.backend, "locked") : new Set<string>();
   /** 锁定项的只读渲染:值 + 悬停解释。要改只能在开始训练时选「重训」。 */
   const fixed = (v: string) => (
@@ -1986,14 +1987,25 @@ function RunStep() {
       // literals (outside the i18n JSON, so the parity gate never saw them) re-deriving the
       // guard's rule a third time. Keeping a copy that can only ever disagree with the source is
       // how a dialog ends up promising 续训 for a start the backend refuses.
+      // Arriving via「再训一个」means the user already chose to wipe (and the parameters page
+      // unlocked the resume-locked fields on that basis) — so lead with 重训 rather than making
+      // them re-decide against a primary-styled 续训 that may now be refused. Both options stay:
+      // this dialog is the authoritative wipe consent, and changing one's mind must be possible.
+      const wantsRetrain = useTrainingStore.getState().retrainIntent;
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
         body: t("training.confirmExistBody", { name }) + diffWarn,
-        buttons: [
-          { id: "resume", label: t("training.resume"), kind: "primary" },
-          { id: "retrain", label: t("training.retrain"), kind: "danger" },
-          { id: "cancel", label: t("training.cancel") },
-        ],
+        buttons: wantsRetrain
+          ? [
+              { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
+              { id: "resume", label: t("training.resume") },
+              { id: "cancel", label: t("training.cancel") },
+            ]
+          : [
+              { id: "resume", label: t("training.resume"), kind: "primary" as const },
+              { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
+              { id: "cancel", label: t("training.cancel") },
+            ],
       });
       if (choice !== "resume" && choice !== "retrain") return;
       fresh = choice === "retrain";
