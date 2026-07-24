@@ -88,12 +88,46 @@ fn manifest_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
     super::tproject::project_dir(data_dir, id).join(DATASET_MANIFEST)
 }
 
+/// What was actually on disk — the difference matters to WRITERS, never to readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestState {
+    Missing,
+    /// Present but unparseable. It has been renamed to `dataset.json.bad` so a human can still
+    /// salvage the names from it; the caller proceeds with a fresh manifest.
+    Salvaged,
+    Ok,
+}
+
 /// Never fails: an unreadable manifest is the same as no manifest (see the module doc).
 pub fn read(data_dir: &Path, id: &str) -> DsManifest {
-    std::fs::read_to_string(manifest_path(data_dir, id))
-        .ok()
-        .and_then(|s| serde_json::from_str::<DsManifest>(&s).ok())
-        .unwrap_or_default()
+    read_state(data_dir, id).0
+}
+
+/// Read, and say what was there.
+///
+/// ★ A CORRUPT manifest is moved aside rather than silently overwritten. Both writers do
+/// read-modify-write, so without this a single unparseable byte would make the next add-or-delete
+/// destroy every original file name the project had recorded — the exact silent-loss shape this
+/// module's own contract forbids. Readers keep degrading quietly (they call `read`); only the
+/// write path pays the cost of being careful.
+pub fn read_state(data_dir: &Path, id: &str) -> (DsManifest, ManifestState) {
+    let p = manifest_path(data_dir, id);
+    let Ok(raw) = std::fs::read_to_string(&p) else {
+        return (DsManifest::default(), ManifestState::Missing);
+    };
+    match serde_json::from_str::<DsManifest>(&raw) {
+        Ok(m) => (m, ManifestState::Ok),
+        Err(e) => {
+            let bad = p.with_extension("json.bad");
+            let _ = std::fs::rename(&p, &bad);
+            tracing::warn!(
+                "unreadable {} for project {id} ({e}) — kept as {} and starting a fresh one",
+                DATASET_MANIFEST,
+                bad.display()
+            );
+            (DsManifest::default(), ManifestState::Salvaged)
+        }
+    }
 }
 
 /// Atomic write (tmp + rename in the same directory), same shape as `write_meta` — a torn
@@ -339,8 +373,9 @@ pub fn append_files(
         });
     }
 
-    // rule 3: annotation last
-    let mut m = read(data_dir, id);
+    // rule 3: annotation last. `read_state` moves a corrupt manifest aside first, so the
+    // read-modify-write below can never be the thing that destroys recorded names.
+    let mut m = read_state(data_dir, id).0;
     m.v = MANIFEST_VERSION;
     m.files.retain(|f| !added.iter().any(|a| a.rel == f.rel));
     m.files.extend(added);
@@ -434,12 +469,19 @@ pub fn delete_files(
             }
         }
     }
-    let mut m = read(data_dir, id);
+    let (mut m, state) = read_state(data_dir, id);
     let gone: std::collections::HashSet<&str> = rels.iter().map(|s| s.as_str()).collect();
     m.files.retain(|f| !gone.contains(f.rel.as_str()));
     // a speaker whose directory is gone is no longer part of this dataset
     m.speakers
         .retain(|sp| root.join(&sp.slug).is_dir() || m.files.iter().any(|f| f.rel.starts_with(&format!("{}/", sp.slug))));
+    // Nothing was ever recorded and nothing survives to record ⇒ do not mint an empty file. A
+    // project whose data predates the annotation would otherwise grow a `{"v":0,...}` shell on
+    // its first delete, which claims「有清单」while knowing nothing.
+    if m.files.is_empty() && m.speakers.is_empty() && state != ManifestState::Ok {
+        return Ok(());
+    }
+    m.v = MANIFEST_VERSION;
     write(data_dir, id, &m)
 }
 
@@ -912,6 +954,57 @@ mod tests {
                 m.id
             );
         }
+    }
+
+    /// ★ Regression: the first delete on a LEGACY project (no annotation) wrote
+    /// `{"v":0,"speakers":[],"files":[]}` — a shell that claims「有清单」while knowing nothing.
+    /// Caught on the real machine after the user deleted one file from `sayo-RVC_3646751c`.
+    #[test]
+    fn a_delete_on_an_unannotated_project_mints_no_empty_shell() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsshell_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_shell";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("000.wav"), b"x").unwrap();
+        std::fs::write(ds.join("001.wav"), b"y").unwrap();
+        delete_files(&tmp, id, &["000.wav".into()], true).unwrap();
+        assert!(
+            !super::super::tproject::project_dir(&tmp, id).join(DATASET_MANIFEST).exists(),
+            "no annotation existed and none could be written — do not leave a shell"
+        );
+        // the delete itself still happened, and the survivor keeps its number
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(facts.entries.iter().map(|e| e.rel.as_str()).collect::<Vec<_>>(), vec!["001.wav"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ★ A corrupt annotation must never be destroyed by the next write — both writers
+    /// read-modify-write, so a single bad byte would otherwise erase every recorded name.
+    #[test]
+    fn a_corrupt_manifest_is_moved_aside_not_overwritten() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsbad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_bad";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        std::fs::create_dir_all(&ds).unwrap();
+        std::fs::write(ds.join("000.wav"), b"x").unwrap();
+        let mpath = super::super::tproject::project_dir(&tmp, id).join(DATASET_MANIFEST);
+        std::fs::write(&mpath, "{ \"files\": [ truncated").unwrap();
+
+        let (m, state) = read_state(&tmp, id);
+        assert_eq!(state, ManifestState::Salvaged);
+        assert!(m.files.is_empty(), "the caller starts fresh");
+        let bad = mpath.with_extension("json.bad");
+        assert!(bad.is_file(), "the unreadable content is kept for salvage");
+        assert!(
+            std::fs::read_to_string(&bad).unwrap().contains("truncated"),
+            "kept VERBATIM — the point is that a human can still read the names out of it"
+        );
+        assert!(!mpath.exists(), "and it is out of the way");
+        // readers still degrade quietly
+        assert!(read(&tmp, id).files.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
