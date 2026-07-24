@@ -255,7 +255,6 @@
     "projectImportData": "导入数据",
     "projectRetry": "重试",
     "diffAttachLater": "练完后在运行段选择要附着的 SoVITS 模型。",
-    "projectLeaveStaged": "已经选好但还没开始训练的 {{count}} 个音频会被丢弃(磁盘上的文件不受影响)。",
     "projectReimportData": "重新导入数据",
     "pickSlot": "回项目选择训练架构",
     "slotRetrainVersion": "重训为 {{version}}",

@@ -255,7 +255,6 @@
     "projectImportData": "Import data",
     "projectRetry": "Retry",
     "diffAttachLater": "Pick the SoVITS model to attach to in the run step, once training finishes.",
-    "projectLeaveStaged": "The {{count}} audio file(s) picked but not yet trained on will be dropped (nothing on disk is touched).",
     "projectReimportData": "Re-import data",
     "pickSlot": "Back to the project to pick an architecture",
     "slotRetrainVersion": "Retrain as {{version}}",

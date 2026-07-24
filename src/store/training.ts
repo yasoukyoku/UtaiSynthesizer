@@ -266,6 +266,22 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
   );
 }
 
+/** THE predicate for「这个项目盘上已经有可复用的数据集,本次运行不必再导入」.
+ *
+ *  For shallow diffusion it stays the sovits-host-specific `diffPoolReady`. For every other
+ *  backend it is `poolFlat` — the project has an on-disk dataset AND that dataset is flat
+ *  (single-speaker). The asymmetry mirrors the backend exactly: `try_start` reuses an empty
+ *  `dataset_files` for a flat pool, but refuses a multi-speaker one for a run carrying no
+ *  speaker groups (`PROJECT_DATASET_SHAPE`) — reconstructing the singer groups from disk so a
+ *  multi-speaker project can resume without re-importing is batch 5's job. */
+export function poolReusable(
+  backend: string,
+  poolFlat: boolean,
+  diffInfo: WorkspaceInfo | null,
+): boolean {
+  return backend === "sovits_diff" ? diffPoolReady(backend, diffInfo) : poolFlat;
+}
+
 /** Where the training page is, EXPLICITLY (S76 batch 4).
  *
  *  It used to be a bare `wizard: 1|2|3|4`, which could not express「哪个项目」at all — the
@@ -340,21 +356,25 @@ export function trainingDataOk(
   backend: string,
   dataset: DatasetFile[],
   speakerGroups: SpeakerGroupDraft[],
-  diffPool: boolean,
+  /** The project's on-disk pool is reusable for this run without a fresh import — see
+   *  `poolReusable`. For diff this was always the only escape hatch; S76 batch 4 extended it to
+   *  every backend so an EXISTING flat project trains without re-importing the data it already
+   *  holds (the symptom being「上方写着有数据、点训练却让我再导入」). */
+  poolReady: boolean,
 ): boolean {
   if (backendSupportsMultiSpeaker(backend)) {
     const allHaveFiles =
       speakerGroups.length > 0 && speakerGroups.every((g) => g.files.length > 0);
-    if (speakerGroups.length <= 1) return allHaveFiles;
-    // ≥2 singers: each needs a name, and names must be UNIQUE (the Rust side
-    // hard-rejects duplicates — gate here so Next/Start never advertise a state
-    // that would only fail with an error toast)
+    // single-speaker (or no groups yet): the one group's files, OR a reusable flat pool.
+    // ≥2 singers is a FRESH multi-speaker setup — the pool does not apply (a flat pool cannot
+    // satisfy a multi-singer run, and a multi-singer pool needs its groups reconstructed).
+    if (speakerGroups.length <= 1) return allHaveFiles || poolReady;
     const names = speakerGroups.map((g) => g.name.trim());
     const allNamed = names.every((n) => n !== "");
     const uniqueNames = new Set(names).size === names.length;
     return allHaveFiles && allNamed && uniqueNames;
   }
-  return dataset.length > 0 || diffPool;
+  return dataset.length > 0 || poolReady;
 }
 
 /** Probe duration + derive the display name for a batch of picked paths.
@@ -554,8 +574,14 @@ interface TrainingStoreState {
    *  no pick) — fetched by the TrainingPage root effect, consumed everywhere
    *  via diffPoolReady() */
   diffWsInfo: WorkspaceInfo | null;
+  /** The CURRENT project holds a flat (single-speaker) on-disk dataset a run may reuse without
+   *  importing (S76 batch 4). Set by ProjectDetail from `get_training_project`, cleared on
+   *  `enterProject`; consumed everywhere via `poolReusable`. Kept in the store (not local to
+   *  ProjectDetail) because `step3Ok` in TrainingPage needs it after ProjectDetail unmounts. */
+  poolFlat: boolean;
 
   setRoute: (r: TrainingRoute) => void;
+  setPoolFlat: (v: boolean) => void;
   /** Move within the CURRENT project. Refuses when there is none — every segment past the
    *  landing is about a project, and a `projectId: ""` route would silently address
    *  `<training>/` itself. */
@@ -627,8 +653,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   route: { seg: "projects", projectId: "" },
   starting: false,
   diffWsInfo: null,
+  poolFlat: false,
 
   setRoute: (r) => set({ route: r }),
+  setPoolFlat: (v) => set({ poolFlat: v }),
   enterProject: (projectId, seg = "detail") => {
     // Invalidate everything that is mid-flight FOR THE OLD PROJECT: an in-progress file probe
     // (`addFiles`) and an in-progress archive scan (`refreshProjectCkpts`) would otherwise land
@@ -652,6 +680,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         // so leaving the previous project's pick behind means「导入数据」opens the wrong shape.
         config: { ...s.config, modelName: isLiveRun ? live.model_name : "", backend },
         diffWsInfo: null,
+        // Unknown until the new project's detail loads and re-derives it — leaving the old
+        // project's value would let a run skip the data page on a project that has none.
+        poolFlat: false,
         projectCkpts: [],
       };
     });

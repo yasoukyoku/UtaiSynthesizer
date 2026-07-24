@@ -255,7 +255,6 @@
     "projectImportData": "データを読み込む",
     "projectRetry": "再試行",
     "diffAttachLater": "学習後、実行ステップで付ける SoVITS モデルを選びます。",
-    "projectLeaveStaged": "選択済みで未学習の音声 {{count}} 件が破棄されます（ディスク上のファイルには影響しません）。",
     "projectReimportData": "データを再読み込み",
     "pickSlot": "プロジェクトに戻ってアーキテクチャを選ぶ",
     "slotRetrainVersion": "{{version}} で再学習",

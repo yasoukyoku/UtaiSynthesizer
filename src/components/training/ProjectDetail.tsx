@@ -22,7 +22,7 @@ import { useAppStore } from "../../store/app";
 import {
   useTrainingStore,
   trainingDataOk,
-  diffPoolReady,
+  poolReusable,
   type ProjectDetail as ProjectDetailData,
   type SlotDetail,
   type TrainingBackend,
@@ -70,6 +70,10 @@ export function ProjectDetail() {
     } catch (e) {
       setError(backendErrorMessage(e) ?? String(e));
     }
+    // NB `poolFlat` (does the project hold a reusable flat dataset) is derived by a
+    // TrainingPage-root effect keyed on route.projectId — NOT here — so it stays correct on the
+    // paths where ProjectDetail never mounts (training-in-progress lands straight on the run
+    // segment via setRoute).
   }, [projectId]);
 
   useEffect(() => {
@@ -82,23 +86,21 @@ export function ProjectDetail() {
     return by;
   }, [detail]);
 
-  /** Where a run of this backend goes next.
+  /** Where a run of this backend goes next: straight to the parameters when the data
+   *  requirement is already met, otherwise the data page.
    *
-   *  Asked of the SAME predicate the step tabs and the data page's Next button use, for the
-   *  backend we are about to switch to. Anything else dead-ends: the project may hold data on
-   *  disk while the in-memory form (which is what those gates read, and which is empty on every
-   *  fresh app start) does not — jumping to the parameters then would bounce straight back here
-   *  via the 防逃课 invariant, with nothing on screen to explain why.
-   *
-   *  Wiring「这个项目盘上已经有数据」into that predicate is batch 5's job (it rewires the data
-   *  segment); until then the data page is simply where such a run starts. */
+   *  Asked of the SAME predicate the step tabs and the data page's Next button use, so the two
+   *  can never disagree — jumping to params on a state those gates read as unsatisfied would
+   *  bounce straight back here via the 防逃课 invariant, with nothing on screen to explain why.
+   *  The `poolReusable` term is what lets an EXISTING flat project train without re-importing the
+   *  data it already holds (the「上方写着有数据、点训练却让我再导入」symptom). */
   const nextSegFor = (backend: TrainingBackend): TrainingSeg => {
     const st = useTrainingStore.getState();
     const ready = trainingDataOk(
       backend,
       st.dataset,
       st.speakerGroups,
-      diffPoolReady(backend, st.diffWsInfo),
+      poolReusable(backend, st.poolFlat, st.diffWsInfo),
     );
     return ready ? "params" : "data";
   };
@@ -263,31 +265,13 @@ export function ProjectDetail() {
    *  so a project that stops loading (deleted from Settings → 存储占用, `project.json` locked, a
    *  data drive that went away) locked the whole training page until the app was restarted.
    *  A retry belongs here too: the transient cases fix themselves. */
-  /** Leaving a project drops its staged (in-memory) import — say so first when there is one.
-   *  The files are only staged: nothing on disk is lost, but re-picking a few hundred of them
-   *  is not something to spend on a mis-click. */
-  const leaveProject = async () => {
-    const st = useTrainingStore.getState();
-    const staged =
-      st.dataset.length + st.speakerGroups.reduce((n, g) => n + g.files.length, 0);
-    if (staged > 0) {
-      const ok = await showConfirm({
-        title: t("training.projectBack"),
-        body: t("training.projectLeaveStaged", { count: staged }),
-        buttons: [
-          { id: "cancel", label: t("training.cancel") },
-          { id: "go", label: t("training.projectBack"), kind: "danger" },
-        ],
-      });
-      if (ok !== "go") return;
-    }
-    st.enterProject("");
-  };
-
   const shell = (body: React.ReactNode) => (
     <div className="tproj-detail">
       <div className="tproj-detail-head">
-        <button className="tproj-back" onClick={() => void leaveProject()}>
+        <button
+          className="tproj-back"
+          onClick={() => useTrainingStore.getState().enterProject("")}
+        >
           ← {t("training.projectBack")}
         </button>
         <span className="tproj-detail-name">{detail?.name ?? projectId}</span>

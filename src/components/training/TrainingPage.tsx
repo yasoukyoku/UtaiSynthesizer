@@ -14,7 +14,6 @@ import { exists, readFile } from "@tauri-apps/plugin-fs";
 import { useAppStore } from "../../store/app";
 import { logToBackend } from "../../lib/log";
 import {
-  diffPoolReady,
   trainingDataOk,
   backendSupportsMultiSpeaker,
   setupTrainingListeners,
@@ -25,6 +24,7 @@ import {
   type WorkspaceInfo,
   backendFamily,
   mergeCkptSources,
+  poolReusable,
   segTab,
   asTrainingBackend,
   IDLE_SNAPSHOT,
@@ -75,7 +75,7 @@ function fmtDur(totalSecs: number): string {
 export function TrainingPage() {
   const { t } = useTranslation();
   const closePage = useAppStore((s) => s.toggleTrainingPage);
-  const { route, setRoute, goSeg, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo } =
+  const { route, setRoute, goSeg, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo, poolFlat } =
     useTrainingStore();
   const [dropActive, setDropActive] = useState(false);
 
@@ -111,6 +111,37 @@ export function TrainingPage() {
       cancelled = true;
     };
   }, [config.backend, route.projectId]);
+
+  // Does the CURRENT project hold a reusable flat (single-speaker) dataset? Derived HERE, keyed
+  // on route.projectId, so it stays correct on every path — including「训练中直落运行段」, which
+  // switches project via setRoute and never mounts ProjectDetail. Consumed via poolReusable so
+  // an existing flat project trains without being sent back to re-import.
+  useEffect(() => {
+    const pid = route.projectId;
+    if (!pid) {
+      useTrainingStore.getState().setPoolFlat(false);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const d = await invoke<{ dataset: { files: number; speakers: string[] } }>(
+          "get_training_project",
+          { projectId: pid },
+        );
+        if (!cancelled) {
+          useTrainingStore
+            .getState()
+            .setPoolFlat(d.dataset.files > 0 && d.dataset.speakers.length === 0);
+        }
+      } catch {
+        if (!cancelled) useTrainingStore.getState().setPoolFlat(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [route.projectId]);
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
 
@@ -268,14 +299,16 @@ export function TrainingPage() {
 
   // S76 batch 4 段序:1=项目(列表/详情) 2=数据 3=参数 4=运行。第 1 段之外的每一段都是
   // 「某个项目的」——没有项目就一步也走不下去,所以 2/3/4 全部以 projectId 为前置。
-  const diffPool = diffPoolReady(config.backend, diffWsInfo);
+  // 「数据满足了吗」= 内存里刚导入的暂存数据,**或**项目盘上已有的可复用数据集(poolReusable)。
+  // 后者修的是「老项目上方写着有数据、点训练却让我再导入」:后端本来就会复用项目已有数据。
+  const pool = poolReusable(config.backend, poolFlat, diffWsInfo);
   const hasProject = route.projectId !== "";
   // 一次运行的身份 = 项目 + 架构槽 + 本次训练名。名字只在详情页点某张槽卡片时才产生
   //(askRunName,已跑过的槽直接沿用冻结的旧名),换项目会清掉它。没有它就不该往参数/运行段走:
   // 那两段的每个动作最终都要把这个名字发给后端当产物身份,而中间没有任何一处能填它。
   const runNameSet = config.modelName.trim() !== "";
   const step3Ok =
-    hasProject && runNameSet && trainingDataOk(config.backend, dataset, speakerGroups, diffPool);
+    hasProject && runNameSet && trainingDataOk(config.backend, dataset, speakerGroups, pool);
   // 运行段属于「这个项目的这次运行」。以前的判据是「有任何非 idle 的 snapshot」——那时没有项目
   // 概念,所以够用;现在它有两个洞:①没选项目时也为真,tab 亮着但一点就被防逃课弹回;
   // ②在项目 B 上会亮出项目 A 的运行结果。运行中的 run 由 project_id 认领(批 1 起每次运行都带)。
@@ -389,8 +422,9 @@ function DataStep() {
     goSeg,
     config,
     diffWsInfo,
+    poolFlat,
   } = useTrainingStore();
-  const diffPool = diffPoolReady(config.backend, diffWsInfo);
+  const pool = poolReusable(config.backend, poolFlat, diffWsInfo);
   // ①c: SoVITS (α) + RVC (α′) data is a SINGER LIST (default 1 singer = single-speaker);
   // diff/vocoder keep the flat file list.
   const singerList = backendSupportsMultiSpeaker(config.backend);
@@ -689,7 +723,7 @@ function DataStep() {
           {dataset.length === 0 ? (
             <div className="training-empty">
               {t("training.empty")}
-              {diffPool && (
+              {config.backend === "sovits_diff" && pool && (
                 <div className="training-fixed-note">{t("training.diffPoolHint")}</div>
               )}
             </div>
@@ -712,7 +746,7 @@ function DataStep() {
         ) : (
           <button
             className="training-btn primary"
-            disabled={!trainingDataOk(config.backend, dataset, speakerGroups, diffPool)}
+            disabled={!trainingDataOk(config.backend, dataset, speakerGroups, pool)}
             onClick={() => goSeg("params")}
           >
             {t("training.next")}
@@ -1338,6 +1372,7 @@ function RunStep() {
     goSeg,
     route,
     diffWsInfo,
+    poolFlat,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
@@ -1871,15 +1906,15 @@ function RunStep() {
   const bestCkpt = snapshot.ckpts.find((c) => c.kind === "best");
 
   const onStart = async () => {
-    // S41 共享池模式: diff may start with no fresh import when the host
-    // workspace has a reusable pool (Rust re-verifies authoritatively).
-    // ①c: multi-speaker needs ≥2 named non-empty groups (trainingDataOk).
+    // 免导入直训: a run may start with no fresh import when the project holds a reusable
+    // pool (flat on-disk dataset, or a diff host's shared pool) — Rust re-verifies
+    // authoritatively. ①c: multi-speaker needs ≥2 named non-empty groups (trainingDataOk).
     if (
       !trainingDataOk(
         config.backend,
         dataset,
         speakerGroups,
-        diffPoolReady(config.backend, diffWsInfo),
+        poolReusable(config.backend, poolFlat, diffWsInfo),
       )
     ) {
       showToast(t("training.needData"), "error");
