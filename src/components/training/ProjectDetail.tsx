@@ -61,6 +61,9 @@ export function ProjectDetail() {
 
   const [detail, setDetail] = useState<ProjectDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** The file list is collapsed by default: a real dataset is hundreds of rows, and the counts
+   *  above already answer「有没有数据」. It is the「当初导入的到底是什么」question that needs it. */
+  const [showFiles, setShowFiles] = useState(false);
 
   const load = useCallback(async () => {
     if (!projectId) return;
@@ -336,19 +339,96 @@ export function ProjectDetail() {
           </button>
         </div>
         {detail.dataset.files > 0 ? (
-          <div className="tproj-dataset">
-            <span>{t("training.projectDatasetFiles", { count: detail.dataset.files })}</span>
-            <span className="tproj-dot">·</span>
-            <span>{fmtSize(detail.dataset.bytes)}</span>
-            {detail.dataset.speakers.length > 0 && (
+          <>
+            <div className="tproj-dataset">
+              <span>{t("training.projectDatasetFiles", { count: detail.dataset.files })}</span>
+              <span className="tproj-dot">·</span>
+              <span>{fmtSize(detail.dataset.bytes)}</span>
+              {detail.dataset.speakers.length > 0 && (
+                <>
+                  <span className="tproj-dot">·</span>
+                  <span>
+                    {t("training.projectDatasetSpeakers", { count: detail.dataset.speakers.length })}
+                  </span>
+                </>
+              )}
+            </div>
+
+            {/* ── 歌手结构 ─────────────────────────────────────────────────
+                The row number IS the emb_g row id, and reproducing it is the whole point:
+                rebuilding a multi-singer dataset in a different order re-assigns every
+                singer's timbre, silently. So the number is printed ONLY when something on
+                disk actually recorded the order (`orderKnown`) — a plausible-looking guess
+                is worse here than an honest「顺序未记录」. */}
+            {detail.dataset.groups.length > 0 && (
+              <div className="tproj-ds-block">
+                <div className="tproj-ds-sub">{t("training.projectDatasetStructure")}</div>
+                {detail.dataset.groups.map((g, i) => (
+                  <div key={g.slug} className="tproj-ds-spk-row">
+                    {detail.dataset.orderKnown && (
+                      <span className="training-spk-idx">{i}</span>
+                    )}
+                    <span className="tproj-ds-spk-name" title={g.slug}>
+                      {g.name || g.slug}
+                    </span>
+                    <span className="training-file-dur">
+                      {t("training.projectDatasetFiles", { count: g.files })} · {fmtSize(g.bytes)}
+                    </span>
+                  </div>
+                ))}
+                <div className="tproj-ds-note">
+                  {detail.dataset.orderKnown
+                    ? t("training.projectDatasetOrderNote")
+                    : t("training.projectDatasetOrderUnknown")}
+                </div>
+              </div>
+            )}
+
+            {/* ── 文件列表 ─────────────────────────────────────────────── */}
+            <button
+              /* same affordance as the params page's 高级 disclosure — single source */
+              className="training-advanced-toggle"
+              onClick={() => setShowFiles((v) => !v)}
+              aria-expanded={showFiles}
+            >
+              {showFiles ? "▼" : "▶"} {t("training.projectDatasetFileList")}
+            </button>
+            {showFiles && (
               <>
-                <span className="tproj-dot">·</span>
-                <span>
-                  {t("training.projectDatasetSpeakers", { count: detail.dataset.speakers.length })}
-                </span>
+                <div className="training-file-list tproj-ds-files">
+                  {detail.dataset.entries.map((e) => {
+                    const cut = e.rel.indexOf("/");
+                    const slug = cut > 0 ? e.rel.slice(0, cut) : "";
+                    const owner = slug
+                      ? detail.dataset.groups.find((g) => g.slug === slug)
+                      : undefined;
+                    return (
+                      <div key={e.rel} className="training-file-row" title={e.rel}>
+                        <div className="training-file-main">
+                          {slug && (
+                            <span className="tproj-ds-file-spk">{owner?.name || slug}</span>
+                          )}
+                          {/* No original name = imported before the annotation existed. Showing
+                              the on-disk name is the honest fallback; inventing one is not. */}
+                          <span className="training-file-name tproj-ds-file">
+                            {e.name || e.rel}
+                          </span>
+                          <span className="training-file-dur">{fmtSize(e.bytes)}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {detail.dataset.entries.some((e) => !e.name) && (
+                  <div className="tproj-ds-note">
+                    {t("training.projectDatasetNamesMissing", {
+                      count: detail.dataset.entries.filter((e) => !e.name).length,
+                    })}
+                  </div>
+                )}
               </>
             )}
-          </div>
+          </>
         ) : (
           <div className="tproj-dataset empty">{t("training.projectDatasetEmpty")}</div>
         )}
@@ -392,6 +472,22 @@ export function ProjectDetail() {
                 {slot?.modelName && (
                   <div className="tproj-slot-run">
                     {t("training.runNameFrozen", { name: slot.modelName })}
+                  </div>
+                )}
+                {/* ★ The emb_g order this SLOT froze — per-slot by nature, because each slot
+                    trained its own rows. This is the authoritative answer to「这个模型的 0 号
+                    歌手是谁」, and it has been available in `info.speakers` since ①c with
+                    nothing reading it. Continuing this run demands the exact same order
+                    (RESUME_SPEAKER_SET_MISMATCH), so it belongs on the card that offers 继续训练. */}
+                {slot && slot.info.speakers.length > 1 && (
+                  <div className="tproj-slot-spk">
+                    <span className="tproj-ds-sub">{t("training.slotSpeakers")}</span>
+                    {slot.info.speakers.map((n, i) => (
+                      <span key={`${i}:${n}`} className="tproj-slot-spk-item">
+                        <span className="training-spk-idx">{i}</span>
+                        <span className="tproj-slot-spk-name">{n}</span>
+                      </span>
+                    ))}
                   </div>
                 )}
                 <div className="tproj-slot-actions">

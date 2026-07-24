@@ -337,3 +337,80 @@
   color: var(--color-warning);
   flex: 0 0 auto;
 }
+
+/* ── 数据集详情(S76 批 5a):歌手结构 + 文件列表 ────────────────────────────
+   文件列表的行壳、名字省略号、时长/大小的等宽小字全部复用 TrainingPage.css 的
+   `.training-file-*`(数据段那份就是它),编号徽章复用 `.training-spk-idx`,
+   展开按钮复用 `.training-advanced-toggle` —— 这里只画它们没有的东西。 */
+
+.tproj-ds-block {
+  margin-top: var(--space-md);
+  border: 1px solid var(--border-subtle);
+  padding: var(--space-sm) var(--space-md);
+}
+
+.tproj-ds-sub {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.tproj-ds-spk-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) 0;
+}
+
+.tproj-ds-spk-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tproj-ds-note {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  margin-top: var(--space-sm);
+  line-height: 1.5;
+}
+
+/* 多歌手时每行前面的归属标记 —— 上限宽度,长歌手名不能把文件名挤没 */
+.tproj-ds-file-spk {
+  flex: 0 0 auto;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.tproj-ds-files {
+  margin-bottom: var(--space-sm);
+}
+
+/* 槽卡片上的 emb_g 顺序:换行的 chip 流,别把卡片撑变形 */
+.tproj-slot-spk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.tproj-slot-spk-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.tproj-slot-spk-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

@@ -459,13 +459,51 @@ pub struct ExportedModelStatus {
     pub installed: bool,
 }
 
+/// One file of the project's shared dataset, as the UI lists it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetFileRow {
+    /// Path under `dataset/`, forward-slashed (`000.wav` / `<slug>/000.wav`).
+    pub rel: String,
+    /// The name the file had when it was imported. Empty = unrecorded (imported before batch 5,
+    /// or the annotation was lost) — the UI shows `rel` instead of inventing one.
+    pub name: String,
+    pub bytes: u64,
+    pub duration_ms: Option<f64>,
+}
+
+/// One co-trained speaker of the project's dataset. The POSITION is the emb_g row id whenever
+/// [`DatasetSummary::order_known`] is true.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetGroupRow {
+    pub slug: String,
+    /// Display name, recovered from `dataset.json` or a slot manifest. Empty = unrecoverable
+    /// (`slugify` is one-way), and the UI must then show the slug rather than guess.
+    pub name: String,
+    pub files: u32,
+    pub bytes: u64,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetSummary {
     pub files: u32,
     pub bytes: u64,
     /// Per-speaker subdirectory names (multi-singer projects). Empty = flat, single speaker.
+    /// SORTED — kept as-is because `poolFlat` keys on its emptiness; the ordered, named view is
+    /// `groups`.
     pub speakers: Vec<String>,
+    /// Every file on disk, sorted by `rel`. This is what makes「时间长了忘了当初导入的是什么」
+    /// answerable at all: the copies are named positionally, so without the annotation layer the
+    /// list would read `000.wav, 001.wav, …`.
+    pub entries: Vec<DatasetFileRow>,
+    /// Speakers in emb_g order when it is knowable, alphabetical otherwise.
+    pub groups: Vec<DatasetGroupRow>,
+    /// Is `groups`' order the real emb_g order? False for a multi-speaker dataset that has never
+    /// been trained and predates the annotation — the UI must NOT print row numbers then, since
+    /// reproducing a wrong order is what mis-assigns every singer's timbre on a rebuild.
+    pub order_known: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -525,24 +563,35 @@ pub async fn get_training_project(
         .collect();
 
     let dataset_dir = crate::training::tproject::dataset_dir(&data_dir, &project_id);
-    let mut files = 0u32;
-    let mut speakers: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dataset_dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                speakers.push(e.file_name().to_string_lossy().into_owned());
-            } else {
-                files += 1;
-            }
-        }
-    }
-    // A multi-singer dataset keeps its audio one level down, so the flat count would read 0.
-    for s in &speakers {
-        files += std::fs::read_dir(dataset_dir.join(s))
-            .map(|rd| rd.flatten().filter(|e| e.path().is_file()).count() as u32)
-            .unwrap_or(0);
-    }
-    speakers.sort();
+    // Every architecture slot that froze a speaker order — each is a per-SLOT truth, so they are
+    // all handed over and `resolve_speakers` decides what the project-level answer may claim.
+    let frozen: Vec<Vec<crate::training::dsmanifest::DsSpeaker>> =
+        crate::training::tproject::FAMILIES
+            .iter()
+            .map(|f| crate::training::frozen_speakers(&data_dir, &project_id, f))
+            .filter(|v| !v.is_empty())
+            .collect();
+    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &frozen);
+    let entries: Vec<DatasetFileRow> = facts
+        .entries
+        .iter()
+        .map(|e| DatasetFileRow {
+            rel: e.rel.clone(),
+            name: e.name.clone(),
+            bytes: e.bytes,
+            duration_ms: e.duration_ms,
+        })
+        .collect();
+    let groups: Vec<DatasetGroupRow> = facts
+        .groups
+        .iter()
+        .map(|g| DatasetGroupRow {
+            slug: g.speaker.slug.clone(),
+            name: g.speaker.name.clone(),
+            files: g.files,
+            bytes: g.bytes,
+        })
+        .collect();
 
     let slots = crate::training::tproject::FAMILIES
         .iter()
@@ -580,9 +629,12 @@ pub async fn get_training_project(
         updated_ms: meta.updated_ms,
         needs_attention: meta.needs_attention,
         dataset: DatasetSummary {
-            files,
+            files: facts.files,
             bytes: crate::commands::storage::dir_size(&dataset_dir),
-            speakers,
+            speakers: facts.speaker_slugs,
+            entries,
+            groups,
+            order_known: facts.order_known,
         },
         slots,
         exported,

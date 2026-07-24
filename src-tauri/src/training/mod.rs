@@ -22,6 +22,7 @@ use tauri::Emitter;
 
 use crate::{Result, UtaiError};
 
+pub mod dsmanifest;
 pub mod tproject;
 
 const STDERR_RING_CAP: usize = 200;
@@ -526,8 +527,11 @@ pub struct WorkspaceInfo {
     pub vol_embedding: Option<bool>,
     /// ①c: manifest n_speakers (multi-speaker co-train); 1 when absent (single-speaker).
     pub n_speakers: u64,
-    /// ①c: ordered speaker DISPLAY names (from the prior run.json, index = emb_g id = DataStep
-    /// order); empty for single-speaker. The manifest stores only slugs, so names come from run.json.
+    /// ①c: ordered speaker DISPLAY names, index = emb_g row id = the order the data page listed
+    /// them in; empty for single-speaker. Read from the MANIFEST's `speaker_names`, which is
+    /// merge-preserved — `run.json` is only the pre-fix fallback, and a later `sovits_diff` run
+    /// rewrites that file WITHOUT a speakers key. (The manifest's `speakers` array is the
+    /// matching slug list, same order.)
     pub speakers: Vec<String>,
     /// ①c: manifest diff_k_step_max (sovits_diff); 0 when absent.
     pub diff_k_step_max: u64,
@@ -585,32 +589,21 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_default();
     let field = |k: &str| manifest[k].as_str().unwrap_or("").to_string();
-    // ①c: display speaker names (ordered = emb_g id) from the manifest's `speaker_names` — the
-    // manifest is merge-preserved across a sovits_diff run (unlike run.json, which the diff run
-    // overwrites without a speakers key). Empty for single-speaker. (Falls back to run.json for a
-    // pre-fix multi-speaker workspace that predates speaker_names — cheap, keeps old runs correct.)
-    let speakers: Vec<String> = manifest["speaker_names"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<String>>()
-        })
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string(ws.join("run.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| {
-                    v.get("speakers").and_then(|s| s.as_array()).map(|arr| {
-                        arr.iter()
-                            .filter_map(|e| e.get("name").and_then(|n| n.as_str()).map(String::from))
-                            .collect()
-                    })
-                })
-                .filter(|v: &Vec<String>| !v.is_empty())
-        })
-        .unwrap_or_default();
+    // ①c: display speaker names, ordered = emb_g id. The carriers and their precedence live in
+    // ONE place (`frozen_speakers`) so this and the project's dataset view can never disagree
+    // about who row i is. Empty for single-speaker — and also when NO carrier holds a name, so
+    // the pre-existing "nothing to compare" semantics of the resume dialog are preserved
+    // (a vec of blanks would read as a speaker mismatch).
+    let speakers: Vec<String> = {
+        let mut v: Vec<String> = frozen_speakers(data_dir, project_id, backend)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        if v.iter().all(|n| n.is_empty()) {
+            v.clear();
+        }
+        v
+    };
     WorkspaceInfo {
         exists: ws.exists(),
         family: field("backend"),
@@ -627,6 +620,89 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         speakers,
         diff_k_step_max: manifest["diff_k_step_max"].as_u64().unwrap_or(0),
     }
+}
+
+/// The `(slug, display name)` pairs ONE slot froze, in emb_g row order. Empty when this slot
+/// never co-trained speakers.
+///
+/// SINGLE SOURCE for「这个槽的第 i 号歌手是谁」 — `slot_info` reports the names half of it.
+/// `slugify` is one-way, so without this a `dataset/<slug>/` directory can never be shown as
+/// the singer it holds, and the order is exactly what a manual rebuild must reproduce.
+///
+/// Two carriers, in this order:
+/// * `run_manifest.json` — `speakers` (slugs) + `speaker_names`. Durable: merge-preserved
+///   across a later `sovits_diff` run.
+/// * `run.json` — `speakers[]` with `slug` AND `name` per entry. Older workspaces predate
+///   `speaker_names` and this is the only place their names survive (verified against this
+///   machine's real 2-singer projects). Matched BY SLUG, never by position: a `sovits_diff`
+///   run rewrites `run.json` without the key at all, and a mismatched pair would print one
+///   singer's name against another's emb_g row — the exact confusion this is meant to end.
+pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<dsmanifest::DsSpeaker> {
+    let ws = tproject::family_dir(data_dir, project_id, backend_family(family));
+    let read_json = |p: PathBuf| -> Option<serde_json::Value> {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
+    // `run.json` pairs, whether or not the manifest needs them.
+    let run_pairs: Vec<(String, String)> = read_json(ws.join("run.json"))
+        .and_then(|v| {
+            v.get("speakers").and_then(|s| s.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("slug")?.as_str()?.to_string(),
+                            e.get("name")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let Some(manifest) = read_json(ws.join("run_manifest.json")) else {
+        return run_pairs
+            .into_iter()
+            .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
+            .collect();
+    };
+    let str_array = |k: &str| -> Vec<String> {
+        manifest[k]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let slugs = str_array("speakers");
+    if slugs.is_empty() {
+        // single-speaker (no key) — or a manifest that lost it; `run.json` only ever carries
+        // the array for a genuine co-training, so this stays empty for single-speaker runs.
+        return run_pairs
+            .into_iter()
+            .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
+            .collect();
+    }
+    let names = str_array("speaker_names");
+    slugs
+        .into_iter()
+        .enumerate()
+        .map(|(i, slug)| {
+            let name = names
+                .get(i)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .or_else(|| {
+                    run_pairs
+                        .iter()
+                        .find(|(s, _)| *s == slug)
+                        .map(|(_, n)| n.clone())
+                })
+                .unwrap_or_default();
+            dsmanifest::DsSpeaker { slug, name }
+        })
+        .collect()
 }
 
 fn has_main_progress(workspace: &Path) -> bool {
@@ -1709,15 +1785,27 @@ struct DatasetItem {
     digest: String,
 }
 
+/// THE naming rule for a dataset copy: `<slug>/`-prefixed when co-training, then the file's
+/// position in the sorted selection and the source's lowercased extension.
+///
+/// Single source on purpose — `dataset_plan` PREDICTS these names, the import loops WRITE them,
+/// `dataset_matches` compares the two, and the annotation keys on them. Four readings of one
+/// rule; if any of them ever spelled it differently the reuse path would silently turn into a
+/// full replace (and the original file names would attach to nothing).
+fn dataset_rel(slug: Option<&str>, i: usize, src: &str) -> String {
+    let ext = Path::new(src)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_ascii_lowercase();
+    match slug {
+        Some(s) => format!("{}/{:03}.{}", s, i, ext),
+        None => format!("{:03}.{}", i, ext),
+    }
+}
+
 /// Exactly what this request will import, in the order the import loops write it.
 fn dataset_plan(req: &StartTrainingRequest) -> Vec<DatasetItem> {
-    let ext_of = |p: &str| {
-        Path::new(p)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("wav")
-            .to_ascii_lowercase()
-    };
     let mut out = Vec::new();
     let mut push = |src: &str, rel: String| {
         let (size, digest) = file_probe(Path::new(src));
@@ -1728,14 +1816,14 @@ fn dataset_plan(req: &StartTrainingRequest) -> Vec<DatasetItem> {
             let mut files = req.speakers[gi].files.clone();
             files.sort();
             for (i, f) in files.iter().enumerate() {
-                push(f, format!("{}/{:03}.{}", slug, i, ext_of(f)));
+                push(f, dataset_rel(Some(slug), i, f));
             }
         }
     } else {
         let mut files = req.dataset_files.clone();
         files.sort();
         for (i, f) in files.iter().enumerate() {
-            push(f, format!("{:03}.{}", i, ext_of(f)));
+            push(f, dataset_rel(None, i, f));
         }
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -1903,6 +1991,12 @@ fn run_worker(
     // and becomes run.json "speakers" so the sovits/rvc pipeline co-trains them.
     let is_multi = req.speakers.len() > 1;
     let mut run_speakers: Vec<serde_json::Value> = Vec::new();
+    // What this import puts on disk, for `<project>/dataset.json` — the only carrier of the
+    // ORIGINAL file names and of the speaker display names once the copies are renamed to
+    // `000.wav`. Collected in the copy loops so it describes what actually landed, and written
+    // (best effort) after the swap commits; see `dsmanifest`.
+    let mut ds_files: Vec<dsmanifest::DsFile> = Vec::new();
+    let mut ds_speakers: Vec<dsmanifest::DsSpeaker> = Vec::new();
     if is_multi {
         // import EACH speaker's files into dataset/<slug>/ (000..N per speaker,
         // sorted — same deterministic-order + fingerprint rationale as the flat
@@ -1929,12 +2023,9 @@ fn run_worker(
                     return abort_finish(inner, app);
                 }
                 let src = Path::new(f);
-                let ext = src
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("wav")
-                    .to_ascii_lowercase();
-                let dst = sub.join(format!("{:03}.{}", i, ext));
+                let rel = dataset_rel(Some(slug), i, f);
+                // `rel` already carries the slug — join on the DATASET root, not on `sub`
+                let dst = dataset_dir.join(&rel);
                 // dataset_unchanged ⇒ dst already holds this exact file; the loop still runs
                 // because run_speakers (→ run.json) is built from it.
                 if !dataset_unchanged {
@@ -1946,6 +2037,15 @@ fn run_worker(
                         ))
                     })?;
                 }
+                ds_files.push(dsmanifest::DsFile {
+                    rel: rel.clone(),
+                    name: src
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                    duration_ms: None,
+                });
                 done += 1;
                 let stage = StageInfo {
                     stage: "import".into(),
@@ -1962,6 +2062,11 @@ fn run_worker(
                 "slug": slug,
                 "dataset_dir": sub,
             }));
+            // list order = emb_g row id, same as `assign_speaker_slugs` promises
+            ds_speakers.push(dsmanifest::DsSpeaker {
+                slug: slug.clone(),
+                name: name.clone(),
+            });
         }
         if let Some(s) = swap.as_mut() {
             s.commit();
@@ -1999,12 +2104,8 @@ fn run_worker(
                 return abort_finish(inner, app);
             }
             let src = Path::new(f);
-            let ext = src
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("wav")
-                .to_ascii_lowercase();
-            let dst = dataset_dir.join(format!("{:03}.{}", i, ext));
+            let rel = dataset_rel(None, i, f);
+            let dst = dataset_dir.join(&rel);
             if !dataset_unchanged {
                 std::fs::copy(src, &dst).map_err(|e| {
                     UtaiError::Training(format!(
@@ -2014,6 +2115,15 @@ fn run_worker(
                     ))
                 })?;
             }
+            ds_files.push(dsmanifest::DsFile {
+                rel,
+                name: src
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                duration_ms: None,
+            });
             let stage = StageInfo {
                 stage: "import".into(),
                 done: Some((i + 1) as u64),
@@ -2027,6 +2137,15 @@ fn run_worker(
         if let Some(s) = swap.as_mut() {
             s.commit();
         }
+    }
+
+    // ---- annotate what was just imported (original names + speaker order) ----
+    // Guarded by「这次 run 自带选择」: on the reuse path the plan is empty and we know nothing
+    // about the source names, so writing here would REPLACE a good annotation with unknowns.
+    // An aborted import never reaches this line — `DatasetSwap`'s Drop has put the previous
+    // dataset back by then, and its previous annotation still describes it exactly.
+    if !plan.is_empty() {
+        dsmanifest::record_import(data_dir, &ctx.project_id, ds_speakers, ds_files);
     }
 
     // Device resolution happened at PREFLIGHT (S75) — interpreter, backend and the run.json mask
@@ -2312,6 +2431,181 @@ mod tests {
         let d = std::env::temp_dir().join(format!("utai_ws_test_{}_{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The naming rule has FOUR readers (plan / import / match / annotation). This closes the
+    /// loop end to end without a training process: plan a selection, write it exactly where
+    /// `run_worker` writes it, annotate it exactly as `run_worker` annotates it, and require
+    /// that the dataset view then names every single file.
+    ///
+    /// A drift between any two of those readers is invisible at compile time and shows up as
+    /// either「导入完还说数据变了」(a silent full re-import) or a file list of bare `000.wav`.
+    #[test]
+    fn planned_names_imported_names_and_annotated_names_are_one_rule() {
+        let src = tmp_ws("rel_src");
+        let data = tmp_ws("rel_data");
+        let id = "proj_rel";
+        let b = src_file(&src, "b.WAV", 10);
+        let a = src_file(&src, "a.flac", 20);
+        assert_eq!(dataset_rel(None, 0, &a), "000.flac");
+        assert_eq!(dataset_rel(None, 7, "x/y.MP3"), "007.mp3");
+        assert_eq!(dataset_rel(Some("spk_1"), 2, "no_extension"), "spk_1/002.wav");
+
+        let req = req_from(serde_json::json!({
+            "model_name": "t", "backend": "sovits", "version": "4.1", "sample_rate": "44k",
+            "dataset_files": [],
+            "speakers": [
+                {"name": "歌姫", "files": [b.clone()]},
+                {"name": "second", "files": [a.clone(), b.clone()]},
+            ],
+            "total_epoch": 1, "batch_size": 1,
+        }));
+        let ds = tproject::dataset_dir(&data, id);
+        let plan = dataset_plan(&req);
+        let assigned = assign_speaker_slugs(&req.speakers);
+
+        // ---- import, byte for byte as run_worker does ----
+        let mut annotated: Vec<dsmanifest::DsFile> = Vec::new();
+        for (gi, (_n, slug)) in assigned.iter().enumerate() {
+            std::fs::create_dir_all(ds.join(slug)).unwrap();
+            let mut files = req.speakers[gi].files.clone();
+            files.sort();
+            for (i, f) in files.iter().enumerate() {
+                let rel = dataset_rel(Some(slug), i, f);
+                let dst = ds.join(&rel);
+                std::fs::copy(f, &dst).unwrap();
+                annotated.push(dsmanifest::DsFile {
+                    rel,
+                    name: Path::new(f).file_name().unwrap().to_string_lossy().into_owned(),
+                    bytes: std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+                    duration_ms: None,
+                });
+            }
+        }
+        // what was written IS what was planned — the reuse path depends on this exact equality
+        assert!(
+            dataset_matches(&ds, &dataset_plan(&req)),
+            "the import must land on the names the plan predicted"
+        );
+
+        dsmanifest::record_import(
+            &data,
+            id,
+            assigned
+                .iter()
+                .map(|(n, s)| dsmanifest::DsSpeaker { slug: s.clone(), name: n.clone() })
+                .collect(),
+            annotated,
+        );
+
+        // ---- and the view names every file, in emb_g order ----
+        let frozen: Vec<Vec<dsmanifest::DsSpeaker>> = Vec::new();
+        let facts = dsmanifest::read_facts(&data, id, &frozen);
+        assert_eq!(facts.files, 3);
+        assert!(
+            facts.entries.iter().all(|e| !e.name.is_empty()),
+            "every imported file must carry its original name: {:?}",
+            facts.entries
+        );
+        assert!(facts.order_known);
+        assert_eq!(
+            facts.groups.iter().map(|g| g.speaker.name.as_str()).collect::<Vec<_>>(),
+            vec!["歌姫", "second"],
+            "emb_g order is the REQUEST order, not the alphabetical slug order"
+        );
+        assert_eq!(facts.groups[0].files, 1);
+        assert_eq!(facts.groups[1].files, 2);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Both carriers of「第 i 号歌手是谁」, and the two semantics `slot_info` must keep.
+    ///
+    /// REGRESSION GUARD: `slot_info().speakers` used to fall back from the manifest to
+    /// `run.json` on its own. That logic now lives in `frozen_speakers` (shared with the
+    /// dataset view), and the one behaviour that must survive the move is the LAST case —
+    /// no name anywhere yields an EMPTY vec, not a vec of blanks. The resume dialog compares
+    /// that vec positionally against the form, so blanks would read as a speaker mismatch and
+    /// refuse a perfectly valid 续训.
+    #[test]
+    fn frozen_speakers_reads_both_carriers_and_stays_empty_when_no_name_survives() {
+        let data = tmp_ws("frozen");
+        let id = "proj_1";
+        let ws = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let write = |name: &str, v: serde_json::Value| {
+            std::fs::write(ws.join(name), serde_json::to_string(&v).unwrap()).unwrap()
+        };
+
+        // 1. the durable pair
+        write(
+            "run_manifest.json",
+            serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_a", "teto_b"],
+                "speaker_names": ["sayo", "teto"],
+            }),
+        );
+        let f = frozen_speakers(&data, id, "rvc");
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].slug.as_str(), f[0].name.as_str()), ("sayo_a", "sayo"));
+        assert_eq!((f[1].slug.as_str(), f[1].name.as_str()), ("teto_b", "teto"));
+        assert_eq!(slot_info(&data, id, "rvc").speakers, vec!["sayo", "teto"]);
+
+        // 2. pre-`speaker_names` workspace: names live only in run.json, matched BY SLUG —
+        //    and note run.json lists them in the OTHER order, which must not reorder anything
+        write(
+            "run_manifest.json",
+            serde_json::json!({
+                "backend": "rvc",
+                "n_speakers": 2,
+                "speakers": ["sayo_a", "teto_b"],
+            }),
+        );
+        write(
+            "run.json",
+            serde_json::json!({
+                "speakers": [
+                    {"slug": "teto_b", "name": "teto"},
+                    {"slug": "sayo_a", "name": "sayo"},
+                ]
+            }),
+        );
+        let f = frozen_speakers(&data, id, "rvc");
+        assert_eq!(
+            f.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>(),
+            vec!["sayo_a", "teto_b"],
+            "the MANIFEST owns the emb_g order; run.json only supplies names"
+        );
+        assert_eq!(f[0].name, "sayo");
+        assert_eq!(f[1].name, "teto");
+        assert_eq!(slot_info(&data, id, "rvc").speakers, vec!["sayo", "teto"]);
+
+        // 3. a later sovits_diff run rewrote run.json without the key: order survives, names do
+        //    not — and `slot_info` must then report NOTHING rather than two blanks
+        write("run.json", serde_json::json!({"backend": "sovits_diff"}));
+        let f = frozen_speakers(&data, id, "rvc");
+        assert_eq!(f.len(), 2, "the order is still recoverable");
+        assert!(f.iter().all(|s| s.name.is_empty()));
+        assert!(
+            slot_info(&data, id, "rvc").speakers.is_empty(),
+            "all-blank must collapse to empty — a blank vec of the right length would read as \
+             a speaker mismatch in the resume dialog"
+        );
+
+        // 4. single-speaker: neither carrier has a speakers array
+        let ws2 = tproject::family_dir(&data, id, "sovits");
+        std::fs::create_dir_all(&ws2).unwrap();
+        std::fs::write(
+            ws2.join("run_manifest.json"),
+            serde_json::to_string(&serde_json::json!({"backend": "sovits", "version": "4.1"}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(frozen_speakers(&data, id, "sovits").is_empty());
+        assert!(slot_info(&data, id, "sovits").speakers.is_empty());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// The wipe-consent guard's judgement, artifact class by artifact class. Each `true` case is

@@ -210,6 +210,37 @@ export interface ExportedModelStatus {
   installed: boolean;
 }
 
+/** Mirror of Rust `commands::training::DatasetFileRow`. */
+export interface DatasetFileRow {
+  /** Path under `dataset/` — `000.wav` or `<slug>/000.wav`. */
+  rel: string;
+  /** Name at import time. "" = unrecorded (imported before batch 5) ⇒ show `rel`, never guess. */
+  name: string;
+  bytes: number;
+  durationMs: number | null;
+}
+
+/** Mirror of Rust `commands::training::DatasetGroupRow`. */
+export interface DatasetGroupRow {
+  slug: string;
+  /** "" = unrecoverable (`slugify` is one-way) ⇒ show the slug. */
+  name: string;
+  files: number;
+  bytes: number;
+}
+
+/** Mirror of Rust `commands::training::DatasetSummary`. */
+export interface DatasetSummary {
+  files: number;
+  bytes: number;
+  /** Sorted slugs. `poolFlat` keys on its emptiness — the ordered, named view is `groups`. */
+  speakers: string[];
+  entries: DatasetFileRow[];
+  groups: DatasetGroupRow[];
+  /** False ⇒ the emb_g row numbers are NOT knowable; the UI must not print any. */
+  orderKnown: boolean;
+}
+
 /** Mirror of Rust `commands::training::ProjectDetail`. */
 export interface ProjectDetail {
   id: string;
@@ -218,7 +249,7 @@ export interface ProjectDetail {
   createdMs: number;
   updatedMs: number;
   needsAttention: string | null;
-  dataset: { files: number; bytes: number; speakers: string[] };
+  dataset: DatasetSummary;
   slots: SlotDetail[];
   exported: ExportedModelStatus[];
 }

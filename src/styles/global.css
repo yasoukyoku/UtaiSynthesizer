@@ -38,6 +38,10 @@ input, textarea, [contenteditable="true"], .selectable, .selectable *,
    artifact was built under, and the checkpoint paths in the export ledger. */
 .tproj-name, .tproj-detail-name, .tproj-note, .tproj-slot-run,
 .tproj-export-name, .tproj-export-src,
+/* S76 batch 5a — the dataset's own strings: the original file names and the singer names an
+   emb_g row belongs to. Reproducing a multi-singer layout by hand means retyping these EXACTLY
+   (the slug is a hash of the name), so they have to be copyable. */
+.tproj-ds-file, .tproj-ds-spk-name, .tproj-slot-spk-name,
 .wf-error {
   -webkit-user-select: text;
   user-select: text;
