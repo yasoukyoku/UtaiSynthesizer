@@ -1,0 +1,339 @@
+/* 训练项目 landing + 详情(S76 批 4)。
+ *
+ * 只写这两页**新增**的形状。列表/卡片壳、搜索框、筛选 chip、按钮全部复用既有类
+ * (`.msst-model-list` / `.msst-model-card-wrap` / `.msst-model-card` / `.log-search` /
+ * `.msst-filter` / `.training-btn`),这里不重画。
+ *
+ * ⚠ 别用 `--font-size-md`:theme.css 里**没有**这个 token(只有 xs/sm/base/lg/xl/2xl)。
+ * TrainingPage.css 里现存三处引用它的声明是无效声明,字号其实是继承来的 13px。
+ */
+
+/* landing 页要比 `.training-step-body` 的 860px 更宽才放得下卡片墙 —— 那个宽度是给
+   3 列参数网格设计的。撑开靠 margin 负值会引发横向滚动条,所以直接改这一段的盒子。 */
+.tproj-page,
+.tproj-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  min-height: 0;
+}
+
+.tproj-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+.tproj-toolbar .log-search {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* ★ 覆盖上游类的规则一律多带一层祖先选择器,靠**特异性**赢,不靠顺序。
+   这不是洁癖:实测构建产物里 `.tproj-sort` 在 59493 字节处、`.msst-filter` 在 80712 处
+   —— 上游在后。同特异性时后者胜,于是单类写法的覆盖**一条都不生效**(排序 chip 会带着
+   整条筛选栏的 padding 与下边框)。CSS 的先后取决于模块图的导入顺序,加一个 import 就会变。 */
+.tproj-page .tproj-sort {
+  /* `.msst-filter` 自带 padding + 下边框(它在资源管理器里是整条筛选栏);在工具条里它只是
+     一组 chip,所以去掉那两样,保留 chip 本身的样式。 */
+  padding: 0;
+  border-bottom: none;
+  flex: 0 0 auto;
+}
+
+.tproj-page .tproj-list {
+  /* `.msst-model-list` 是 flex:1 的纵向滚动列表;这里它在 step body 里,给个下限即可 */
+  padding: 0;
+  gap: var(--space-sm);
+}
+
+.tproj-page .tproj-card {
+  /* `.msst-model-card` 在上游是 div;这里是可点的 button,补上按钮该有的形状 */
+  text-align: left;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  min-width: 0;
+}
+
+.tproj-page .tproj-gone {
+  opacity: 0.75;
+}
+
+.tproj-page .tproj-card:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+/* global.css 的 `button:hover`(0,1,1)比 `.tproj-card`(0,1,0)更特定,所以不加这条的话,
+   连**不可进入**的卡片(已不在磁盘 / 待迁移)悬停时也会亮起来 —— 一个点不动的东西看起来可点。 */
+.tproj-page .tproj-card:disabled,
+.tproj-page .tproj-card:disabled:hover {
+  cursor: default;
+  background: none;
+  border-color: transparent;
+}
+
+.tproj-name {
+  font-size: var(--font-size-lg);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tproj-size {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  margin-left: var(--space-md);
+}
+
+.tproj-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+.tproj-fam {
+  font-family: var(--font-mono);
+  padding: 0 var(--space-sm);
+  border: 1px solid var(--border-subtle);
+  color: var(--accent-primary);
+}
+
+.tproj-fam.empty {
+  color: var(--text-muted);
+  border-color: transparent;
+  padding-left: 0;
+}
+
+.tproj-dot {
+  color: var(--text-muted);
+}
+
+.tproj-note {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+.tproj-flag {
+  font-size: var(--font-size-xs);
+  color: var(--color-warning);
+}
+
+/* 磁盘上已经没有的项目:留着、说清楚、可移除记录 —— 但不可进入 */
+.tproj-gone .tproj-name {
+  color: var(--text-muted);
+  text-decoration: line-through;
+}
+
+/* ── 详情页 ────────────────────────────────────────────────────────────── */
+
+.tproj-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-md);
+}
+
+.tproj-back {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  padding: 0;
+}
+
+.tproj-back:hover {
+  color: var(--accent-primary);
+}
+
+.tproj-detail-name {
+  font-size: var(--font-size-lg);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tproj-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.tproj-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: var(--space-xs);
+}
+
+.tproj-section-title {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tproj-dataset {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+.tproj-dataset.empty {
+  color: var(--text-muted);
+}
+
+.tproj-slots {
+  display: grid;
+  /* 与 `.training-backend-cards` 同款:固定列数把 step 栏填满,不跟着内容抖 */
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-md);
+}
+
+.tproj-slot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.tproj-slot.started {
+  border-color: var(--accent-primary-dim);
+}
+
+.tproj-slot-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.tproj-slot-name {
+  color: var(--text-primary);
+}
+
+.tproj-slot-ver {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--accent-primary);
+}
+
+.tproj-slot-desc,
+.tproj-slot-facts,
+.tproj-slot-run,
+.tproj-slot-note {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+.tproj-slot-desc,
+.tproj-slot-run {
+  color: var(--text-muted);
+}
+
+.tproj-slot-facts {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.tproj-slot-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: auto;
+  padding-top: var(--space-sm);
+}
+
+.tproj-slot-host {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-sm);
+}
+
+.tproj-slot-host label {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+/* `.ut-dropdown` 默认 flex:1 —— 在非 flex 容器里会塌成内容宽度,这里给它一个真实下限
+   (既有先例:TrainingPage.css 的 `.training-attach-row .ut-dropdown`) */
+.tproj-slot-host .ut-dropdown {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.tproj-exported {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-subtle);
+}
+
+.tproj-export-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--font-size-xs);
+}
+
+.tproj-export-row:last-child {
+  border-bottom: none;
+}
+
+.tproj-export-row.gone {
+  opacity: 0.6;
+}
+
+.tproj-export-name {
+  color: var(--text-primary);
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tproj-export-type {
+  font-family: var(--font-mono);
+  color: var(--accent-primary);
+  flex: 0 0 auto;
+}
+
+.tproj-export-src {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  text-align: right;
+}
+
+.tproj-export-gone {
+  color: var(--color-warning);
+  flex: 0 0 auto;
+}

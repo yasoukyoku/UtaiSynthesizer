@@ -137,6 +137,12 @@
   box-sizing: border-box;
 }
 
+/* 第 1 段(项目列表/详情)要宽一些:860px 是给 3 列参数网格量的,卡片墙与架构槽两列在
+   那个宽度里会挤成一条。只放宽这一段,其余三段的既有排版一个像素都不动。 */
+.training-step-body.wide {
+  max-width: 1180px;
+}
+
 .training-hint {
   color: var(--text-muted);
   font-size: var(--font-size-xs);

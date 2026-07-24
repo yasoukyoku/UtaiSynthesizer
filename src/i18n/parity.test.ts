@@ -73,6 +73,20 @@ describe("i18n 三语平行", () => {
     expect(bad).toEqual([]);
   });
 
+  it("没有写成单花括号的占位符", () => {
+    // 本仓有**两套**插值语法并存:i18n JSON 走 i18next 的 {{name}},而 Settings.tsx 的内联
+    // L() 表走单花括号 {name} + 手工 replace。写混了两边都不报错 —— i18next 会把 {name}
+    // 原样显示给用户,replace 则永远匹配不上。这条只管 JSON 这一侧。
+    const single = /(?<!\{)\{\s*[A-Za-z0-9_]+\s*\}(?!\})/;
+    const bad: string[] = [];
+    for (const [lang, m] of LANGS) {
+      for (const [key, v] of m) {
+        if (single.test(v)) bad.push(`${lang}:${key} = ${v}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+
   it("没有空文案", () => {
     const bad: string[] = [];
     for (const [lang, m] of LANGS) {

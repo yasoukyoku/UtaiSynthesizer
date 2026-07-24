@@ -1212,9 +1212,47 @@ pub fn list_project_summaries(app_dir: &Path, data_dir: &Path, measure: bool) ->
         });
     }
 
+    // A directory with NO `project.json` is a pre-S76 workspace the migration has not folded
+    // yet — it stands down entirely while a sibling instance is alive, and an individual tree
+    // can fail its renames because something holds a handle. It retries every boot, but until
+    // then「盘上还在、app 里没了」is exactly the outcome this refactor must never produce, so it
+    // gets a row: visible, explained, and not enterable (`needs_attention` bars every training
+    // entry point, and `resolve_or_create` refuses it anyway).
+    let mut pending: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(training_root(data_dir)) {
+        for e in rd.flatten() {
+            let id = e.file_name().to_string_lossy().into_owned();
+            if id.starts_with('.') || !e.path().is_dir() {
+                continue;
+            }
+            if !e.path().join(PROJECT_META).is_file() {
+                pending.push(id);
+            }
+        }
+    }
+    pending.sort();
+    let pending_ids: std::collections::HashSet<String> = pending.iter().cloned().collect();
+    for id in pending {
+        out.push(ProjectSummary {
+            name: id.clone(),
+            id,
+            note: String::new(),
+            created_ms: 0,
+            updated_ms: 0,
+            needs_attention: Some("TRAINING_LAYOUT_MIGRATION_PENDING".into()),
+            families: Vec::new(),
+            has_dataset: false,
+            sizes: ProjectSizes::default(),
+            missing: false,
+        });
+    }
+
     let present: std::collections::HashSet<&str> = on_disk.iter().map(|m| m.id.as_str()).collect();
     for (id, entry) in ix.projects.iter_mut() {
-        if present.contains(id.as_str()) {
+        // `pending_ids` counts as present: the directory IS there (it just has not been folded
+        // into the new layout yet), and listing it twice — once as「待迁移」and once as
+        // 「已不在磁盘上」— would be worse than either row alone.
+        if present.contains(id.as_str()) || pending_ids.contains(id) {
             continue;
         }
         if entry.missing_since_ms == 0 {
@@ -2342,6 +2380,40 @@ mod tests {
             assert!(v.get(k).is_some(), "missing wire key {k}: {v}");
         }
         assert!(v.get("sizes").is_none(), "ProjectSizes must be FLATTENED, not nested");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A pre-S76 workspace the migration has not folded yet has no `project.json`, so nothing
+    /// else in the listing path would see it. It must still be a row:「盘上还在、app 里没了」is
+    /// the one outcome this whole refactor exists to prevent.
+    #[test]
+    fn an_unmigrated_workspace_is_listed_as_pending_not_dropped() {
+        let data = tmp_root("pendinglist");
+        let app = app_root(&data);
+        legacy_rvc(&data, "old_1a2b3c4d"); // no project.json
+        create_project(&data, "P", "").unwrap();
+        // decoys the listing must ignore: a tombstone, and the cache file itself in case someone
+        // ever puts it back into the training root. (A `.mig_<id>` staging tree is deliberately
+        // NOT one of them — that is a torn migration, which `migrate_one` reconciles; the
+        // migration tests own that case.)
+        std::fs::create_dir_all(training_root(&data).join(".del_x_1_2")).unwrap();
+        std::fs::write(training_root(&data).join(PROJECTS_INDEX), b"{}").unwrap();
+
+        let rows = list_project_summaries(&app, &data, true);
+        assert_eq!(rows.len(), 2, "the legacy workspace + the real project, nothing else: {rows:?}");
+        let old = rows.iter().find(|r| r.id == "old_1a2b3c4d").unwrap();
+        assert_eq!(old.needs_attention.as_deref(), Some("TRAINING_LAYOUT_MIGRATION_PENDING"));
+        assert!(!old.missing, "it IS on disk — just not folded yet");
+        assert!(old.families.is_empty());
+
+        // …and once it migrates it becomes an ordinary row, with no leftover ghost beside it
+        migrate_all(&data);
+        let after = list_project_summaries(&app, &data, true);
+        assert_eq!(after.len(), 2);
+        let now = after.iter().find(|r| r.id == "old_1a2b3c4d").unwrap();
+        assert!(now.needs_attention.is_none() && !now.missing);
+        assert_eq!(now.name, "歌姫テスト", "display name recovered by the migration");
+        assert_eq!(now.families, vec!["rvc".to_string()]);
         let _ = std::fs::remove_dir_all(data);
     }
 

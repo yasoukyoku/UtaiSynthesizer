@@ -35,8 +35,29 @@ pub async fn start_training(
         return Err("CONVERT_BUSY".into());
     }
     let data_dir = data_root(&state);
-    let audition_dir =
-        crate::training::slot_path(&data_dir, &request.model_name, &request.backend).join("audition");
+    // ★ The SAME directory `try_start` will train into — resolved from `project_id`, exactly as
+    // it resolves it. This used to go through `slot_path(model_name, …)`, which was right only
+    // while the model name WAS the directory identity. Batch 4 made it「本次训练名」: editable,
+    // free to differ from the project name, and frozen per slot. A miss here is silent and
+    // expensive: the unload below would release no session (so a `fresh` wipe meets live
+    // Windows file handles), the cleanup below would remove nothing (so the PREVIOUS run's
+    // audition renders survive under identical `weights/<slug>_best` names and the next
+    // 「试听」plays the old voice), and a run name that happens to match ANOTHER project's name
+    // would resolve there and delete that project's audition cache instead.
+    //
+    // An empty `project_id` is still the documented legacy shape (resolve by name), so it keeps
+    // the old derivation — which is correct for exactly that case.
+    let audition_dir = if request.project_id.trim().is_empty() {
+        crate::training::slot_path(&data_dir, &request.model_name, &request.backend)
+    } else {
+        checked_project_id(&request.project_id)?;
+        crate::training::tproject::family_dir(
+            &data_dir,
+            &request.project_id,
+            crate::training::backend_family(&request.backend),
+        )
+    }
+    .join("audition");
     // BEFORE manager.start(): drop every audition session (file locks) so the
     // fresh-wipe path inside try_start cannot trip over them. Non-destructive —
     // an evicted session reloads on miss.
@@ -172,21 +193,14 @@ pub async fn get_training_history(
     Ok(state.training.history())
 }
 
-/// Whether a training SLOT for this (name, backend) exists (checkpoints the registry doesn't
-/// know about yet) — the retrain-wipes-everything confirm must fire for these too, not only
-/// for imported models.
-///
-/// S76: takes the backend because identity is now「项目 → 架构槽」; one project can hold four
-/// slots, and answering for the wrong one would offer 续训 where there is nothing to resume.
-#[tauri::command]
-pub async fn check_training_workspace(
-    state: State<'_, Arc<AppState>>,
-    name: String,
-    backend: String,
-) -> Result<bool, String> {
-    let ws = crate::training::slot_path(&data_root(&state), &name, &backend);
-    Ok(ws.join("config.json").exists() || ws.join("weights").exists())
-}
+// `check_training_workspace` lived here until S76 batch 4. It existed as the CRUDE half of a
+// deliberate pair: `onStart` asked `get_training_workspace_info` first and fell back here when
+// that answer never arrived — the caller seeds `fresh = true` (= wipe) and only narrows it
+// inside dialogs that hang off the probe, so a probe that fails with nothing behind it means
+// 「没弹任何对话框就删了」. That pairing stopped meaning anything once both commands became
+// `checked_project_id` + a path join off the same project id: they now fail and succeed
+// together, so the fallback was answering exactly when it could not. The primary probe is
+// fail-CLOSED instead, which is what the whole guard chain was after.
 
 /// Every destructive training-archive action passes through here first.
 ///
@@ -312,17 +326,13 @@ pub async fn training_delete_project(
     .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
 }
 
-/// Which training project a model name resolves to, WITHOUT creating one. The archive list
-/// must work while idle — that is its whole point (an app restart or「清空结果」leaves the
-/// snapshot empty while the files are very much still on disk) — and `snapshot.project_id`
-/// describes THIS RUN, so it is empty exactly then.
-#[tauri::command]
-pub async fn find_training_project(
-    state: State<'_, Arc<AppState>>,
-    name: String,
-) -> Result<Option<String>, String> {
-    Ok(crate::training::tproject::find_by_name(&data_root(&state), &name).map(|m| m.id))
-}
+// `find_training_project(name)` lived here from batch 2 until batch 4. It answered「这个模型名
+// 属于哪个项目」for the archive list, which had no other way to identify a project while the
+// snapshot was idle. Batch 4 gave the page an explicit `route.projectId`, and its last caller —
+// the shallow-diffusion card's cross-project host picker — was removed with that picker (it
+// rewrote the host slot's frozen run name). Name→project resolution still exists Rust-side
+// (`tproject::find_by_name`) for `slot_path` and `resolve_or_create`; what is gone is the
+// ability to ask it from the UI, which is the right direction: names are user-editable now.
 
 /// Every checkpoint this project holds on DISK, newest first — the answer to「关掉 app 或点过
 /// 『清空结果』之后还剩什么」. Until S76 the candidate list was emitted by the sidecar into
@@ -345,27 +355,15 @@ pub async fn list_project_ckpts(
     .map_err(|e| format!("TRAINING_SCAN_JOIN: {e}"))
 }
 
-/// Note that a checkpoint became an installed model. Feeds the protection set behind
-/// 「清理未导入的快照」— without it every snapshot a user kept on purpose would read as
-/// unimported and be deleted.
-#[tauri::command]
-pub async fn record_project_export(
-    state: State<'_, Arc<AppState>>,
-    project_id: String,
-    name: String,
-    model_type: String,
-    from_ckpt: String,
-) -> Result<(), String> {
-    checked_project_id(&project_id)?;
-    crate::training::tproject::record_export(
-        &data_root(&state),
-        &project_id,
-        &name,
-        &model_type,
-        &from_ckpt,
-    )
-    .map_err(|e| e.to_string())
-}
+// `record_project_export` lived here until S76 batch 4. Batch 3 pushed the bookkeeping down
+// into `import_model` / `attach_diffusion` (`commands::models::record_training_export`) so that
+// the resource manager's file picker — which can browse straight into a training slot's
+// `weights/` — would be covered too. This command then survived as a SECOND writer that the
+// training page still called, and the two disagreed: Rust recorded the registry type, the page
+// recorded `snapshot.backend`, and the later write won, so a shallow-diffusion attach ended up
+// filed under `sovits_diff` — a value the registry's own type table does not contain. The page
+// now only re-reads the list; `import_model` takes a `source_ckpt` for the one case that made
+// the frontend write look necessary (importing the audition cache's converted copy).
 
 // ───────────────────────── project pages (S76 batch 4) ─────────────────────────
 
@@ -635,14 +633,6 @@ pub async fn get_training_slot_info(
     Ok(crate::training::slot_info(&data_root(&state), &project_id, &backend))
 }
 
-/// Structured workspace facts (S39): the main-model retrain dialog must warn
-/// when the wipe would also destroy diffusion training progress, and the
-/// 浅扩散 card phrases its own dialog by resume-vs-cache-reuse.
-#[tauri::command]
-pub async fn get_training_workspace_info(
-    state: State<'_, Arc<AppState>>,
-    name: String,
-    backend: String,
-) -> Result<crate::training::WorkspaceInfo, String> {
-    Ok(crate::training::workspace_info(&data_root(&state), &name, &backend))
-}
+// `get_training_workspace_info(name, backend)` lived here until S76 batch 4 — see the note in
+// `training::mod` where its implementation was. `get_training_slot_info` is the same answer
+// keyed by the project id, which is the only identity that survives a rename.

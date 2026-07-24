@@ -569,25 +569,12 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
         || has_dataset_pool(ws)
 }
 
-/// Name-keyed bridge kept for the callers that still speak display names (the shallow-diffusion
-/// host picker resolves an INSTALLED MODEL's name, which need not be a project of ours).
-///
-/// S76 batch 4: everything that knows which project it means calls [`slot_info`] directly —
-/// names are user-editable and no longer an identity.
-pub fn workspace_info(data_dir: &Path, name: &str, backend: &str) -> WorkspaceInfo {
-    match tproject::find_by_name(data_dir, name) {
-        Some(p) => slot_info(data_dir, &p.id, backend),
-        None => {
-            // No project answers to this name. Probe the legacy slug path anyway so an
-            // UNMIGRATED pre-S76 workspace still reports `exists` — but never advertise a
-            // shared dataset pool for it: that pool was a sibling of the checkpoints back then,
-            // and `resolve_or_create` refuses to train into an unmigrated tree regardless.
-            let mut info = slot_info(data_dir, &slugify(name), backend);
-            info.has_dataset = false;
-            info
-        }
-    }
-}
+// `workspace_info(name, backend)` lived here until S76 batch 4. Every consumer now knows WHICH
+// PROJECT it means and calls `slot_info` — display names became user-editable in that batch, so
+// resolving a workspace from one could only ever go stale. Its one extra behaviour (probing the
+// legacy slug path so an UNMIGRATED pre-S76 workspace still reported `exists`) moved to where it
+// belongs: `list_project_summaries` lists such directories as「待迁移」rows, which is visible
+// instead of merely non-empty.
 
 /// Structured facts about ONE architecture slot of ONE project — the id-keyed form, which is
 /// the only one that stays correct across a rename.

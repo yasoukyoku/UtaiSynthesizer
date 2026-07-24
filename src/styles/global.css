@@ -33,6 +33,11 @@ input, textarea, [contenteditable="true"], .selectable, .selectable *,
 .msst-installed-name, .msst-installed-header .mono,
 .rm-voice-item-name, .rm-import-error, .msst-error,
 .progress-header .mono, .stat-value,
+/* S76 batch 4 — the training project pages. These carry the strings a user actually needs to
+   copy into a bug report or a file explorer: project names (often CJK), the「本次训练名」an
+   artifact was built under, and the checkpoint paths in the export ledger. */
+.tproj-name, .tproj-detail-name, .tproj-note, .tproj-slot-run,
+.tproj-export-name, .tproj-export-src,
 .wf-error {
   -webkit-user-select: text;
   user-select: text;

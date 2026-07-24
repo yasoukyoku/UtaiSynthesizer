@@ -25,7 +25,13 @@ import {
   type WorkspaceInfo,
   backendFamily,
   mergeCkptSources,
+  segTab,
+  asTrainingBackend,
+  IDLE_SNAPSHOT,
+  type TrainingSeg,
 } from "../../store/training";
+import { ProjectsStep } from "./ProjectsStep";
+import { ProjectDetail } from "./ProjectDetail";
 import {
   useVoiceModelStore,
   voiceFeatureDim,
@@ -69,7 +75,7 @@ function fmtDur(totalSecs: number): string {
 export function TrainingPage() {
   const { t } = useTranslation();
   const closePage = useAppStore((s) => s.toggleTrainingPage);
-  const { wizard, setWizard, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo } =
+  const { route, setRoute, goSeg, dataset, speakerGroups, snapshot, refresh, config, diffWsInfo } =
     useTrainingStore();
   const [dropActive, setDropActive] = useState(false);
 
@@ -78,19 +84,22 @@ export function TrainingPage() {
     void refresh();
   }, [refresh]);
 
-  // single fetch site for the diff host's workspace info (S41 共享池模式):
-  // DataStep/ParamsStep/RunStep all consume the store copy via diffPoolReady
+  // single fetch site for the diff host's slot info (S41 共享池模式):
+  // DataStep/ParamsStep/RunStep all consume the store copy via diffPoolReady.
+  // S76 batch 4: keyed by PROJECT, not by the typed model name. Picking a host that belongs to
+  // another project routes there first (ProjectDetail.startDiff), so the current project always
+  // IS the host's project — and a rename can no longer make this probe address nothing.
   useEffect(() => {
-    const name = config.modelName.trim();
-    if (config.backend !== "sovits_diff" || !name) {
+    const pid = route.projectId;
+    if (config.backend !== "sovits_diff" || !pid) {
       useTrainingStore.getState().setDiffWsInfo(null);
       return;
     }
     let cancelled = false;
     void (async () => {
       try {
-        const info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
-          name,
+        const info = await invoke<WorkspaceInfo>("get_training_slot_info", {
+          projectId: pid,
           backend: "sovits_diff",
         });
         if (!cancelled) useTrainingStore.getState().setDiffWsInfo(info);
@@ -101,9 +110,44 @@ export function TrainingPage() {
     return () => {
       cancelled = true;
     };
-  }, [config.backend, config.modelName]);
+  }, [config.backend, route.projectId]);
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
+
+  // 训练中打开训练页 = 直接落到运行段。
+  //
+  // 以前这件事「能用」纯属巧合:向导恰好停在第 4 段,所以刷新一次就回到第 1 段,训练还在跑却
+  // 找不到它。做成显式路由之后要小心两点:
+  //  · 挂载首帧的 snapshot 是 IDLE_SNAPSHOT(refresh() 是异步的),这一帧判「没在跑」是错的,
+  //    所以只在真的看到 starting/running 时才落;
+  //  · 只落一次(ref 守卫)。否则用户在训练中主动切到别的段,会被反复拽回来。
+  const landedRef = useRef(false);
+  /** Where the page was WHEN IT OPENED. `route` survives closing the page (module-level store),
+   *  so "did the user open this page while parked on some other project?" can only be asked of
+   *  the mount-time value — asking it of the live one made the answer change under us. */
+  const openedAtRef = useRef(route.projectId);
+  useEffect(() => {
+    if (landedRef.current || !running || !snapshot.project_id) return;
+    // Never yank a user who was deliberately looking at ANOTHER project when they opened the
+    // page. Besides the jump itself, this effect rewrites `config`, so from another project it
+    // would re-label that project's half-filled form with this run's name and backend.
+    //
+    // ★ Anchored on the MOUNT-time route, and latched either way. Keyed on the live
+    // `route.projectId` (which is a dependency of this effect) it re-armed on every navigation:
+    // the very next thing such a user does is press「← 全部项目」, which sets it to "" — the
+    // guard then read as「no project selected」and threw them into the running project's run
+    // segment instead of the list, with `updateConfig` undoing the clear `enterProject` had
+    // just performed.
+    landedRef.current = true;
+    if (openedAtRef.current !== "" && openedAtRef.current !== snapshot.project_id) return;
+    // 让整页与这次运行一致:存档列表、参数回显、试听都读 config
+    const backend = asTrainingBackend(snapshot.backend);
+    useTrainingStore.getState().updateConfig({
+      ...(backend ? { backend } : {}),
+      modelName: snapshot.model_name,
+    });
+    setRoute({ seg: "run", projectId: snapshot.project_id });
+  }, [running, snapshot.project_id, snapshot.backend, snapshot.model_name, setRoute]);
 
   // OS drag-drop: the webview event is global, so the Arrangement timeline (which
   // stays mounted under this page) short-circuits while this page is open and we
@@ -158,8 +202,13 @@ export function TrainingPage() {
         if (p.type === "enter") {
           // don't invite a drop we'll refuse: adding to the dataset only affects
           // the NEXT run, so while one is live we accept nothing (matches the
-          // Arrangement convention: no affordance for a drop that won't import)
-          dragAccept = !liveNow() && p.paths.some((pp) => AUDIO_EXT_RE.test(pp));
+          // Arrangement convention: no affordance for a drop that won't import).
+          // S76 batch 4: the project list is the same case — a drop there has no
+          // project to import INTO, so it must not light up either.
+          dragAccept =
+            !liveNow() &&
+            !!useTrainingStore.getState().route.projectId &&
+            p.paths.some((pp) => AUDIO_EXT_RE.test(pp));
           setDropActive(dragAccept);
           setHover(dragAccept ? hitTestSpeaker(p.position) : null);
         } else if (p.type === "over") {
@@ -181,13 +230,18 @@ export function TrainingPage() {
           // ①c: SoVITS/RVC data is the singer list — a drop lands on the card under
           // the cursor (or the first singer if not over a card, so files are
           // never lost); diff/vocoder use the flat dataset.
+          // S76 batch 4: a drop is「往某个项目里导数据」. On the landing there is no project to
+          // import INTO, so an audio drop there has no destination — ignore it rather than
+          // route somewhere arbitrary. (`goSeg` refuses a project-less jump too; this keeps the
+          // files from being staged into a form nothing will read.)
+          if (!st.route.projectId) return;
           if (backendSupportsMultiSpeaker(st.config.backend)) {
             const gid = target ?? st.speakerGroups[0]?.id;
             if (gid) void st.addSpeakerFiles(gid, audio);
           } else {
             void st.addFiles(audio);
           }
-          st.setWizard(2); // the data page (step 2 since the S41 order swap)
+          st.goSeg("data");
         }
       })
       .then((u) => {
@@ -212,27 +266,47 @@ export function TrainingPage() {
     }
   }, [config.backend]);
 
-  // S41 order: 1=训练对象 2=数据 3=参数 4=运行 (the object decides whether
-  // data is even needed, so it comes first; diff with a reusable shared pool
-  // skips step 2). Steps 1/2 are always reachable — every ACTION is guarded
-  // downstream (step gating here, start button, Rust validation).
+  // S76 batch 4 段序:1=项目(列表/详情) 2=数据 3=参数 4=运行。第 1 段之外的每一段都是
+  // 「某个项目的」——没有项目就一步也走不下去,所以 2/3/4 全部以 projectId 为前置。
   const diffPool = diffPoolReady(config.backend, diffWsInfo);
-  const step3Ok = trainingDataOk(config.backend, dataset, speakerGroups, diffPool);
-  const step4Ok = step3Ok || running || snapshot.state !== "idle";
-  const stepOk = [true, true, step3Ok, step4Ok];
+  const hasProject = route.projectId !== "";
+  // 一次运行的身份 = 项目 + 架构槽 + 本次训练名。名字只在详情页点某张槽卡片时才产生
+  //(askRunName,已跑过的槽直接沿用冻结的旧名),换项目会清掉它。没有它就不该往参数/运行段走:
+  // 那两段的每个动作最终都要把这个名字发给后端当产物身份,而中间没有任何一处能填它。
+  const runNameSet = config.modelName.trim() !== "";
+  const step3Ok =
+    hasProject && runNameSet && trainingDataOk(config.backend, dataset, speakerGroups, diffPool);
+  // 运行段属于「这个项目的这次运行」。以前的判据是「有任何非 idle 的 snapshot」——那时没有项目
+  // 概念,所以够用;现在它有两个洞:①没选项目时也为真,tab 亮着但一点就被防逃课弹回;
+  // ②在项目 B 上会亮出项目 A 的运行结果。运行中的 run 由 project_id 认领(批 1 起每次运行都带)。
+  const runIsHere = hasProject && snapshot.state !== "idle" && snapshot.project_id === route.projectId;
+  const step4Ok = step3Ok || runIsHere;
+  const stepOk = [true, hasProject, step3Ok, step4Ok];
+  const tab = segTab(route.seg);
 
-  // 防逃课 invariant (S41 user report): whatever path INVALIDATES the current
-  // step (清空结果 with no data, backend switched away from diff, ...) bounces
-  // back to step 1 instead of stranding the user on a locked stage.
+  // 防逃课 invariant (S41 用户实测报的):任何让当前段失效的路径(清空结果后没有数据、
+  // 后端从浅扩散切走……)都要把用户弹回去,而不是留在一个点不动的段上。
+  //
+  // 落点是**项目详情**,不是项目列表:失效的是「这个项目的下一步」,把人一路踢回卡片墙
+  // 等于说「你刚才干的事整个作废了」。没有项目才回列表(那是唯一说得通的落点)。
   useEffect(() => {
-    if ((wizard === 3 && !step3Ok) || (wizard === 4 && !step4Ok)) setWizard(1);
-  }, [wizard, step3Ok, step4Ok, setWizard]);
+    if (!hasProject) {
+      if (route.seg !== "projects") setRoute({ seg: "projects", projectId: "" });
+      return;
+    }
+    if ((route.seg === "params" && !step3Ok) || (route.seg === "run" && !step4Ok)) {
+      goSeg("detail");
+    }
+  }, [route.seg, hasProject, step3Ok, step4Ok, goSeg, setRoute]);
   const steps = [
     t("training.step1"),
     t("training.step2"),
     t("training.step3"),
     t("training.step4"),
   ];
+  /** Tab 1 覆盖两个段:有项目就回它的详情,没有就是列表本身。 */
+  const tabSeg = (n: 1 | 2 | 3 | 4): TrainingSeg =>
+    n === 1 ? (hasProject ? "detail" : "projects") : n === 2 ? "data" : n === 3 ? "params" : "run";
 
   return (
     <div className="training-page">
@@ -256,9 +330,9 @@ export function TrainingPage() {
           return (
             <button
               key={n}
-              className={`training-step-tab ${wizard === n ? "active" : ""}`}
+              className={`training-step-tab ${tab === n ? "active" : ""}`}
               disabled={!enabled}
-              onClick={() => setWizard(n)}
+              onClick={() => setRoute({ seg: tabSeg(n), projectId: route.projectId })}
             >
               <span className="training-step-num">{n}</span>
               {label}
@@ -266,23 +340,24 @@ export function TrainingPage() {
           );
         })}
       </nav>
-      <div className="training-step-body">
-        {/* S41 order swap (user ruling): the training object decides whether
-            data is even needed, so it comes FIRST — diff with a reusable pool
-            skips the data page entirely (TargetStep's next jumps to 3) */}
-        {wizard === 1 && <TargetStep />}
-        {wizard === 2 && <DataStep />}
-        {wizard === 3 && <ParamsStep />}
-        {wizard === 4 && <RunStep />}
+      <div className={`training-step-body ${tab === 1 ? "wide" : ""}`}>
+        {/* 第 1 段有两个面:项目卡片墙,和选中项目的详情(架构槽在这里选)。 */}
+        {route.seg === "projects" && <ProjectsStep />}
+        {route.seg === "detail" && <ProjectDetail />}
+        {route.seg === "data" && <DataStep />}
+        {route.seg === "params" && <ParamsStep />}
+        {route.seg === "run" && <RunStep />}
       </div>
-      {/* ①c: on the DATA step (2) with ≥2 singers the per-card highlight IS the
+      {/* ①c: on the DATA segment with ≥2 singers the per-card highlight IS the
           drop affordance, so suppress the full-screen overlay there; on other
-          steps the cards aren't mounted, so keep the overlay (an off-step drop
-          routes to singer #1 by design) */}
+          segments the cards aren't mounted, so keep the overlay (an off-segment
+          drop routes to singer #1 by design) */}
       {dropActive &&
-        !(backendSupportsMultiSpeaker(config.backend) && speakerGroups.length > 1 && wizard === 2) && (
-          <div className="training-drop-overlay">{t("training.dropHint")}</div>
-        )}
+        !(
+          backendSupportsMultiSpeaker(config.backend) &&
+          speakerGroups.length > 1 &&
+          route.seg === "data"
+        ) && <div className="training-drop-overlay">{t("training.dropHint")}</div>}
     </div>
   );
 }
@@ -311,7 +386,7 @@ function DataStep() {
     dragOverSpeakerId,
     flashSpeaker,
     clearFlashSpeaker,
-    setWizard,
+    goSeg,
     config,
     diffWsInfo,
   } = useTrainingStore();
@@ -627,239 +702,22 @@ function DataStep() {
       )}
 
       <div className="training-step-nav">
-        <button
-          className="training-btn primary"
-          disabled={!trainingDataOk(config.backend, dataset, speakerGroups, diffPool)}
-          onClick={() => setWizard(3)}
-        >
-          {t("training.next")}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/* ------------------- step 1 (since the S41 order swap): target ------------------- */
-
-function TargetStep() {
-  const { t } = useTranslation();
-  const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
-  const [exists, setExists] = useState(false);
-  const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
-  // the diffusion companion is BOUND to a SoVITS model — the diff card picks
-  // one from the installed registry instead of free-typing a name (its
-  // version/dim derive from the pick; a same-named training workspace reuses
-  // its preprocessing caches)
-  const sovitsModels = useVoiceModelStore((s) => s.models.sovits);
-  useEffect(() => {
-    void useVoiceModelStore.getState().fetchModels();
-  }, []);
-  const isDiffCard = config.backend === "sovits_diff";
-  const diffModelPicked =
-    isDiffCard && sovitsModels.some((m) => m.name === config.modelName);
-
-  const pickDiffModel = (name: string) => {
-    const m = sovitsModels.find((x) => x.name === name);
-    if (!m) return;
-    updateConfig({
-      modelName: m.name,
-      diffVersion: voiceFeatureDim(m) === 256 ? ("4.0" as const) : ("4.1" as const),
-    });
-    void checkName(m.name);
-  };
-
-  // keep the derived version in lock-step with the picked model on EVERY path
-  // (card switch with a pre-filled matching name, registry refresh, dropdown)
-  useEffect(() => {
-    if (!isDiffCard) return;
-    const m = sovitsModels.find((x) => x.name === config.modelName);
-    if (!m) return;
-    const v = voiceFeatureDim(m) === 256 ? ("4.0" as const) : ("4.1" as const);
-    if (v !== config.diffVersion) updateConfig({ diffVersion: v });
-  }, [isDiffCard, config.modelName, config.diffVersion, sovitsModels, updateConfig]);
-  // the name the current hints were computed FOR — typing a different name
-  // must hide them instead of showing stale facts until blur (review F19)
-  const [checkedName, setCheckedName] = useState("");
-  // card switches re-check with the new backend — a slower older invoke must
-  // not overwrite the newer answer
-  const checkSeq = useRef(0);
-
-  // re-check on mount: the page may be reopened with a name already filled in
-  useEffect(() => {
-    void checkName(config.modelName);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const checkName = async (name: string) => {
-    const mySeq = ++checkSeq.current;
-    if (!name.trim()) {
-      setExists(false);
-      setWsInfo(null);
-      setCheckedName("");
-      return;
-    }
-    const backend = useTrainingStore.getState().config.backend;
-    if (backend === "sovits_diff") {
-      // the diff card's same-name semantics are INVERTED: a same-named sovits
-      // workspace is the good case (its preprocessing caches get reused) —
-      // check_model_exists doesn't apply (the product is an attachment)
-      let info: WorkspaceInfo | null = null;
-      try {
-        info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
-          name: name.trim(),
-          backend,
-        });
-      } catch {
-        info = null;
-      }
-      if (mySeq === checkSeq.current) {
-        setWsInfo(info);
-        setExists(false);
-        setCheckedName(name.trim());
-      }
-      return;
-    }
-    let found = false;
-    try {
-      found = await invoke<boolean>("check_model_exists", {
-        name: name.trim(),
-        modelType: backend,
-      });
-    } catch {
-      found = false;
-    }
-    if (mySeq === checkSeq.current) {
-      setExists(found);
-      setWsInfo(null);
-      setCheckedName(name.trim());
-    }
-  };
-
-  const cards = [
-    {
-      key: "rvc",
-      active: config.backend === "rvc",
-      pick: () => updateConfig({ backend: "rvc" as const }),
-      name: t("training.backendRvc"),
-      desc: t("training.backendRvcDesc"),
-    },
-    {
-      key: "sovits41",
-      active: config.backend === "sovits" && config.sovitsVersion === "4.1",
-      pick: () => updateConfig({ backend: "sovits" as const, sovitsVersion: "4.1" as const }),
-      name: t("training.backendSovits41"),
-      desc: t("training.backendSovits41Desc"),
-    },
-    {
-      key: "sovits40",
-      active: config.backend === "sovits" && config.sovitsVersion === "4.0",
-      pick: () => updateConfig({ backend: "sovits" as const, sovitsVersion: "4.0" as const }),
-      name: t("training.backendSovits40"),
-      desc: t("training.backendSovits40Desc"),
-    },
-    {
-      key: "sovits40v2",
-      active: config.backend === "sovits_v2",
-      pick: () => updateConfig({ backend: "sovits_v2" as const }),
-      name: t("training.backendSovits40v2"),
-      desc: t("training.backendSovits40v2Desc"),
-    },
-    {
-      key: "sovits_diff",
-      active: config.backend === "sovits_diff",
-      pick: () => updateConfig({ backend: "sovits_diff" as const }),
-      name: t("training.backendDiff"),
-      desc: t("training.backendDiffDesc"),
-    },
-    {
-      key: "vocoder",
-      active: config.backend === "vocoder",
-      pick: () => updateConfig({ backend: "vocoder" as const }),
-      name: t("training.backendVocoder"),
-      desc: t("training.backendVocoderDesc"),
-    },
-  ];
-
-  const diffHint =
-    config.backend === "sovits_diff" &&
-    wsInfo?.exists &&
-    checkedName === config.modelName.trim()
-      ? wsInfo.family && wsInfo.family !== "sovits"
-        ? { kind: "warn" as const, text: t("training.diffWorkspaceForeign", { family: wsInfo.family }) }
-        : wsInfo.diff_steps > 0
-          ? { kind: "info" as const, text: t("training.diffWorkspaceProgress", { steps: wsInfo.diff_steps }) }
-          : { kind: "info" as const, text: t("training.diffWorkspaceReuse") }
-      : null;
-
-  return (
-    <div className="training-target-step">
-      <div className="training-backend-cards">
-        {cards.map((c) => (
-          <button
-            key={c.key}
-            className={`training-backend-card ${c.active ? "active" : ""}`}
-            onClick={() => {
-              c.pick();
-              void checkName(config.modelName);
-            }}
-          >
-            <span className="training-backend-name">{c.name}</span>
-            <span className="training-backend-desc">{c.desc}</span>
+        {/* 数据属于**项目**,训练属于**架构槽**。从项目详情的「导入数据」进来是没有槽的
+            ——参数/运行段的每个动作都要一个「本次训练名」,而这里没有任何地方能填。所以这条
+            路的下一步是回项目去选架构,而不是一颗点不动的「下一步」。 */}
+        {config.modelName.trim() === "" ? (
+          <button className="training-btn primary" onClick={() => goSeg("detail")}>
+            {t("training.pickSlot")}
           </button>
-        ))}
-      </div>
-      {isDiffCard ? (
-        sovitsModels.length > 0 ? (
-          <div className="training-form-row">
-            <label>{t("training.diffPickModel")}</label>
-            <Dropdown
-              value={diffModelPicked ? config.modelName : ""}
-              options={sovitsModels.map((m) => ({
-                value: m.name,
-                // real sidecar version verbatim when present ("4.0-v2" must not
-                // masquerade as "4.0" — 标牌清楚); dim mapping = legacy fallback
-                label: `${m.name} · ${voiceVersionBadge(m) ?? (voiceFeatureDim(m) === 256 ? "4.0" : "4.1")}`,
-              }))}
-              onChange={(v) => pickDiffModel(v)}
-            />
-          </div>
         ) : (
-          <div className="training-name-exists">{t("training.diffNoModels")}</div>
-        )
-      ) : (
-        <div className="training-form-row">
-          <label>{t("training.modelName")}</label>
-          <input
-            type="text"
-            value={config.modelName}
-            placeholder={t("training.modelNamePlaceholder")}
-            onChange={(e) => updateConfig({ modelName: e.target.value })}
-            onBlur={(e) => void checkName(e.target.value)}
-          />
-        </div>
-      )}
-      {exists && !isDiffCard && (
-        <div className="training-name-exists">{t("training.nameExists")}</div>
-      )}
-      {diffHint && (
-        <div className={diffHint.kind === "warn" ? "training-name-exists" : "training-hint"}>
-          {diffHint.text}
-        </div>
-      )}
-
-      <div className="training-step-nav">
-        <button
-          className="training-btn primary"
-          disabled={!config.modelName.trim() || (isDiffCard && !diffModelPicked)}
-          onClick={() =>
-            // diff with a reusable shared pool skips the data page (S41 order
-            // swap rationale); the data tab stays clickable for a manual
-            // dataset update
-            setWizard(diffPoolReady(config.backend, diffWsInfo) ? 3 : 2)
-          }
-        >
-          {t("training.next")}
-        </button>
+          <button
+            className="training-btn primary"
+            disabled={!trainingDataOk(config.backend, dataset, speakerGroups, diffPool)}
+            onClick={() => goSeg("params")}
+          >
+            {t("training.next")}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -928,7 +786,7 @@ function NumberField({
 
 function ParamsStep() {
   const { t } = useTranslation();
-  const { config, updateConfig, setWizard, diffWsInfo } = useTrainingStore();
+  const { config, updateConfig, goSeg, diffWsInfo } = useTrainingStore();
   const [gpus, setGpus] = useState<TrainingGpu[]>([]);
   /** S75: "usable GPU" = at least one SELECTABLE entry. A list of nothing but greyed-out cards
    *  must land on the force-CPU path, not on a dropdown where every choice is dead. */
@@ -1450,7 +1308,7 @@ function ParamsStep() {
         ))}
 
       <div className="training-step-nav">
-        <button className="training-btn primary" onClick={() => setWizard(4)}>
+        <button className="training-btn primary" onClick={() => goSeg("run")}>
           {t("training.next")}
         </button>
       </div>
@@ -1466,7 +1324,7 @@ function RunStep() {
   const showConfirm = useAppStore((s) => s.showConfirm);
   const showToast = useAppStore((s) => s.showToast);
   const {
-    snapshot,
+    snapshot: liveSnapshot,
     snapshotAt,
     history,
     dataset,
@@ -1477,11 +1335,27 @@ function RunStep() {
     stop,
     forceStop,
     resetRun,
-    setWizard,
+    goSeg,
+    route,
     diffWsInfo,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
+
+  /** ★ THE run this segment is about — the store holds exactly ONE snapshot, and after S76 the
+   *  page can be pointed at a project that snapshot does not belong to.
+   *
+   *  Without this substitution, opening project B's run segment while project A's finished run
+   *  is still in memory rendered A's completion card, A's loss curve, A's候选 checkpoints and
+   *  their 试听/导入 buttons — all filed under B. `mergeCkptSources` made it concrete: A's
+   *  in-memory ckpts merge into B's disk scan with `mtimeMs = MAX_SAFE_INTEGER`, i.e. pinned to
+   *  the TOP of B's archive list. Substituting the idle snapshot gives B exactly what it should
+   *  have: the pre-start view.
+   *
+   *  Liveness stays keyed on the LIVE snapshot (`anyRunning`): a run in another project still
+   *  blocks starting one here, and pretending otherwise would just move the refusal to Rust. */
+  const snapshot = liveSnapshot.project_id === route.projectId ? liveSnapshot : IDLE_SNAPSHOT;
+  const anyRunning = liveSnapshot.state === "starting" || liveSnapshot.state === "running";
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
   const finished = snapshot.state === "completed" || snapshot.state === "stopped";
@@ -1536,9 +1410,9 @@ function RunStep() {
       await invoke("attach_diffusion", { name: attachTarget, ckptPath: ckpt.path });
       await useVoiceModelStore.getState().fetchModels();
       // Attach IS the export path for shallow diffusion — its checkpoints never go through
-      // import_model. Without this the whole sovits_diff family reads as never-imported, and
-      // batch 3's「清理未导入的快照」would consider every one of them fair game.
-      await recordExport(attachTarget, ckpt.path);
+      // import_model, so `attach_diffusion` writes the ledger row itself (Rust side, batch 3);
+      // this only re-reads the list so its「已导入」marks are current.
+      await refreshArchive();
       showToast(t("training.diffAttached", { name: attachTarget }), "success");
     } catch (e) {
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
@@ -1564,21 +1438,28 @@ function RunStep() {
   const projectCkpts = useTrainingStore((s) => s.projectCkpts);
   // Re-scan whenever the run's identity or state changes: a finished run just wrote new
   // archives, and「清空结果」clears the in-memory candidates while the files stay on disk.
-  // Resolve from the MODEL NAME, never from the snapshot: an app restart or「清空结果」leaves
+  // Keyed on the ROUTE's project, never on the snapshot: an app restart or「清空结果」leaves
   // the snapshot idle and its project_id empty — which is exactly when this inventory is the
-  // only way left to reach the files on disk.
+  // only way left to reach the files on disk. (Pre-batch-4 it resolved the project from the
+  // typed model name, which is now an editable per-run label rather than an identity.)
+  //
+  // The FAMILY follows whatever this segment is showing: a displayed run owns the question
+  // (`snapshot.backend`), and only a segment with no run to show falls back to the form's
+  // current pick. Keying it on `config.backend` alone let the two diverge — leave a finished
+  // SoVITS run, click the RVC slot in the detail page, come back to the run segment (still
+  // lit, because the run is this project's) and the candidates above were SoVITS while the
+  // archive list below was RVC, with `mergeCkptSources` filing the former under the latter.
+  const archiveBackend = snapshot.state === "idle" ? config.backend : snapshot.backend;
   useEffect(() => {
-    void useTrainingStore
-      .getState()
-      .refreshProjectCkpts(config.modelName, config.backend);
-  }, [config.modelName, config.backend, snapshot.state, snapshot.ckpts.length]);
+    void useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
+  }, [route.projectId, archiveBackend, snapshot.state, snapshot.ckpts.length]);
   // The scan is the truth, but it is only as fresh as its last run — a ckpt the sidecar just
   // announced would blink out of the list for the moment between the event and the re-scan
   // above, which reads exactly like a checkpoint that failed to save.
   const archiveRows = mergeCkptSources(
     snapshot.ckpts,
     projectCkpts,
-    backendFamily(config.backend),
+    backendFamily(archiveBackend),
   );
 
   /** The project's on-disk inventory — rendered in EVERY run state, deliberately.
@@ -2019,8 +1900,8 @@ function RunStep() {
       // check and the resume/retrain dialog. Refuse loudly instead (see the main branch).
       let info: WorkspaceInfo;
       try {
-        info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
-          name,
+        info = await invoke<WorkspaceInfo>("get_training_slot_info", {
+          projectId: route.projectId,
           backend: config.backend,
         });
       } catch (e) {
@@ -2081,29 +1962,26 @@ function RunStep() {
       showToast(t("training.probeFailed", { err: String(e) }), "error");
       return;
     }
-    let info: WorkspaceInfo | null = null;
+    // ⚠ FAIL-CLOSED, like every other probe on this path. `fresh` is seeded to true = WIPE and
+    // is only narrowed inside the dialogs below, each of which hangs off this answer — so
+    // swallowing a failure here means「没弹任何对话框就把几小时的进度整目录删了」.
+    //
+    // Until batch 4 this one probe was deliberately fail-OPEN, degrading to a cruder
+    // `check_training_workspace(name, backend)`. That fallback made sense while the two
+    // commands asked DIFFERENT questions of different code paths; once both became
+    // `checked_project_id` + a path join off the same project id, they fail and succeed
+    // together — the fallback was answering exactly when it could not.
+    let info: WorkspaceInfo;
     try {
-      info = await invoke<WorkspaceInfo>("get_training_workspace_info", {
-        name,
+      info = await invoke<WorkspaceInfo>("get_training_slot_info", {
+        projectId: route.projectId,
         backend: config.backend,
       });
-    } catch {
-      info = null;
+    } catch (e) {
+      showToast(t("training.probeFailed", { err: String(e) }), "error");
+      return;
     }
-    let wsExists = info?.exists ?? false;
-    if (!info) {
-      // legacy fallback: unknown version → the generic dialog below (whose
-      // 续训 the Rust manifest guard still backstops)
-      try {
-        wsExists = await invoke<boolean>("check_training_workspace", {
-          name,
-          backend: config.backend,
-        });
-      } catch (e) {
-        showToast(t("training.probeFailed", { err: String(e) }), "error");
-        return;
-      }
-    }
+    const wsExists = info.exists;
 
     // vocoder's "version" is the fixed manifest marker — hitting the sovits
     // fallback here would compare "nsf_hifigan" vs "4.1" and lock every
@@ -2120,11 +1998,9 @@ function RunStep() {
     // the wipe would also destroy any diffusion training progress living in
     // this workspace — the user must see that before choosing 重训
     const diffWarn =
-      info && info.diff_steps > 0
-        ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps })
-        : "";
+      info.diff_steps > 0 ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps }) : "";
 
-    if (wsExists && info) {
+    if (wsExists) {
       // ①c: item-by-item diff of the new form vs the stored workspace. Resume needs EVERY
       // resume-guarded param to match (the Rust guard rejects otherwise) — surface the mismatches
       // HERE so the user can调回一致 and resume, instead of a red error toast at start time. (Was
@@ -2200,21 +2076,10 @@ function RunStep() {
         fresh = choice === "retrain";
         wipeConfirmed = fresh;
       }
-    } else if (wsExists) {
-      // info unreadable (manifest missing/corrupt): classic resume/retrain — the Rust guard is the
-      // authoritative backstop for any param mismatch we couldn't diff here.
-      const choice = await showConfirm({
-        title: t("training.confirmExistTitle"),
-        body: t("training.confirmExistBody", { name }) + diffWarn,
-        buttons: [
-          { id: "resume", label: t("training.resume"), kind: "primary" },
-          { id: "retrain", label: t("training.retrain"), kind: "danger" },
-          { id: "cancel", label: t("training.cancel") },
-        ],
-      });
-      if (choice !== "resume" && choice !== "retrain") return;
-      fresh = choice === "retrain";
-      wipeConfirmed = fresh;
+      // (The old `else if (wsExists)` branch — "the slot exists but its facts are unreadable" —
+      // is gone with the fail-open probe that produced it. `get_training_slot_info` either
+      // answers or the start is refused above; an unreadable MANIFEST still lands in the branch
+      // above with empty version/sample_rate fields, which is what `diffRows` skips on.)
     } else if (modelExists) {
       // installed model, NO workspace: there is nothing to resume —「续训」
       // would silently train from scratch; say what actually happens (and
@@ -2270,10 +2135,10 @@ function RunStep() {
     if (choice !== "clear") return;
     // anti-escape (user report, S41 live test): after a page refresh the
     // dataset list is gone (in-memory) while the snapshot survives (backend);
-    // clearing from that state used to leave the wizard parked on step 4 with
-    // zero data. 清空 semantically ends the round — jump back to step 1
-    // (only on an ACCEPTED clear; a refused one keeps the results visible).
-    if (await resetRun()) setWizard(1);
+    // clearing from that state used to leave the wizard parked on the run
+    // segment with zero data. 清空 semantically ends the round — go back to the
+    // project (only on an ACCEPTED clear; a refused one keeps the results visible).
+    if (await resetRun()) goSeg("detail");
   };
 
   const onForceStop = async () => {
@@ -2345,22 +2210,17 @@ function RunStep() {
     return indexPath;
   };
 
-  /** Note an export in the project ledger — the protection set behind「清理未导入的快照」.
-   *  Never fatal: a model that imported fine must not report failure because the bookkeeping
-   *  did (the cleanup is conservative when the ledger is thin, never destructive). */
-  const recordExport = async (name: string, fromCkpt: string) => {
-    if (!snapshot.project_id) return;
-    try {
-      await invoke("record_project_export", {
-        projectId: snapshot.project_id,
-        name,
-        modelType: snapshot.backend,
-        fromCkpt,
-      });
-      await useTrainingStore.getState().refreshProjectCkpts(config.modelName, config.backend);
-    } catch (e) {
-      console.error("record_project_export failed", e);
-    }
+  /** Re-read the archive list after an export, so its「已导入」marks are current.
+   *
+   *  S76 batch 4: this used to ALSO write the ledger row itself — a second write beside the
+   *  one Rust already does inside `import_model` / `attach_diffusion` (`record_training_export`,
+   *  THE single source since batch 3). Two writers was not merely redundant: they disagreed
+   *  about `model_type` and the later one won, so a shallow-diffusion attach ended up recorded
+   *  as `sovits_diff` — a value the registry's own type table does not know. And the frontend
+   *  half was skipped entirely whenever `snapshot.project_id` was empty, i.e. after a reload
+   *  or「清空结果」, which is exactly when exporting from the archive list happens. */
+  const refreshArchive = async () => {
+    await useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
   };
 
   const importCkpt = async (ckpt: CkptInfo) => {
@@ -2386,7 +2246,7 @@ function RunStep() {
         indexPath,
       });
       await useVoiceModelStore.getState().fetchModels();
-      await recordExport(name, ckpt.path);
+      await refreshArchive();
       showToast(t("training.imported", { name }), "success");
     } catch (e) {
       // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
@@ -2461,12 +2321,12 @@ function RunStep() {
             path,
             modelType: snapshot.backend,
             indexPath,
+            // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
+            // been swapped to the audition-converted onnx above. Recording the onnx would leave
+            // the real snapshot looking un-imported, and batch 3's cleanup would delete it.
+            sourceCkpt: path === c.path ? null : c.path,
           });
           ok += 1;
-          // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
-          // been swapped to the audition-converted onnx above. Recording the onnx would leave
-          // the real snapshot looking un-imported, and batch 3's cleanup would delete it.
-          await recordExport(names.get(c.path) ?? "", c.path);
           for (const w of outcome?.warnings ?? []) {
             warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
           }
@@ -2475,6 +2335,7 @@ function RunStep() {
         }
       }
       await useVoiceModelStore.getState().fetchModels();
+      await refreshArchive();
       if (failed.length > 0) {
         showToast(
           `${t("training.importSelectedPartial", { ok, total: chosen.length })}\n${[...failed, ...warns].join("\n")}`,
@@ -2523,9 +2384,13 @@ function RunStep() {
             </>
           )}
         </div>
+        {/* `anyRunning` = the LIVE snapshot, not this segment's view of it: a run in ANOTHER
+            project still holds the single training slot, and Rust would refuse with
+            TRAINING_ALREADY_RUNNING. Disabling here is the friendly first line. */}
         <button
           className="training-btn primary training-start-btn"
-          disabled={starting}
+          disabled={starting || anyRunning}
+          title={anyRunning ? t("training.active") : undefined}
           onClick={() => void onStart()}
         >
           {t("training.start")}

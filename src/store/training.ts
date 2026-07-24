@@ -63,6 +63,10 @@ export interface SpeakerGroupDraft {
 let spkSeq = 0;
 /** Generation counter for the checkpoint scan — see refreshProjectCkpts. */
 let ckptScanSeq = 0;
+/** Bumped by `enterProject`. Anything that stages data ASYNCHRONOUSLY has to check it after
+ *  its await: probing a few hundred files takes long enough for the user to have moved to
+ *  another project, and the result would land in THAT project's form. */
+let projectEpoch = 0;
 let flashSeq = 0;
 
 export interface StageInfo {
@@ -101,7 +105,11 @@ export interface CkptRecord {
   family: string;
   /** base = the seeded pretrained (not the user's work); release/best = generator-only
    *  snapshots you import; resumable = training can continue from it. */
-  kind: "base" | "resumable" | "release" | "best" | "orphan" | "pending";
+  /** Mirrors Rust `CkptKind` (six variants) plus the frontend-only `pending`. `final` was
+   *  missing from this union AND from `training.ckptKind.*`, so the naturally-finished
+   *  `weights/<slug>.pth` — the one artifact a user is most likely to want — rendered its raw
+   *  i18n key in the archive list. */
+  kind: "base" | "resumable" | "release" | "best" | "final" | "orphan" | "pending";
   /** Real training step. null = RVC's「只保留最新」sentinel name, which is not a step. */
   step: number | null;
   bytes: number;
@@ -155,7 +163,67 @@ export interface StepPoint {
   losses: Record<string, number>;
 }
 
-/** Mirror of Rust `training::WorkspaceInfo` (get_training_workspace_info). */
+/** Mirror of Rust `tproject::ProjectSummary` (list_training_projects). `ProjectSizes` is
+ *  FLATTENED into it server-side, so the size fields sit at the top level (pinned by a Rust
+ *  test — `invoke` is stringly typed and nothing here could catch a rename). */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  note: string;
+  createdMs: number;
+  updatedMs: number;
+  /** Migration could not classify the directory: contents preserved, training refused. */
+  needsAttention: string | null;
+  /** Architecture slots present on disk. */
+  families: string[];
+  hasDataset: boolean;
+  totalBytes: number;
+  datasetBytes: number;
+  familyBytes: Record<string, number>;
+  /** 0 = never measured — show「—」, not a confident「0 B」. */
+  computedMs: number;
+  /** Remembered by the cache, absent from disk. Listed, greyed, and barred from training. */
+  missing: boolean;
+}
+
+/** Mirror of Rust `commands::training::SlotDetail`. */
+export interface SlotDetail {
+  family: string;
+  /** The「本次训练名」this slot's artifacts carry. "" = never ran, so the next run may choose. */
+  modelName: string;
+  info: WorkspaceInfo;
+  bytes: number;
+  /** null WITH hasResumePoint = RVC's「只保留最新」sentinel, whose name carries no step. */
+  resumeStep: number | null;
+  hasResumePoint: boolean;
+  ckptCount: number;
+  ckptBytes: number;
+}
+
+/** Mirror of Rust `commands::training::ExportedModelStatus`. */
+export interface ExportedModelStatus {
+  name: string;
+  modelType: string;
+  fromCkptRel: string;
+  atMs: number;
+  /** Live registry check — false = deleted in the resource manager since. */
+  installed: boolean;
+}
+
+/** Mirror of Rust `commands::training::ProjectDetail`. */
+export interface ProjectDetail {
+  id: string;
+  name: string;
+  note: string;
+  createdMs: number;
+  updatedMs: number;
+  needsAttention: string | null;
+  dataset: { files: number; bytes: number; speakers: string[] };
+  slots: SlotDetail[];
+  exported: ExportedModelStatus[];
+}
+
+/** Mirror of Rust `training::WorkspaceInfo` (get_training_slot_info). */
 export interface WorkspaceInfo {
   exists: boolean;
   /** manifest family ("rvc"/"sovits"); "" when absent */
@@ -196,6 +264,55 @@ export function diffPoolReady(backend: string, info: WorkspaceInfo | null): bool
     // 免导入直训 there would let the user skip the data page straight into a refusal.
     info.n_speakers <= 1
   );
+}
+
+/** Where the training page is, EXPLICITLY (S76 batch 4).
+ *
+ *  It used to be a bare `wizard: 1|2|3|4`, which could not express「哪个项目」at all — the
+ *  project was inferred from the editable model name at four independent call sites — and could
+ *  not express「训练中,直接进运行段」either: that worked only because the wizard happened to be
+ *  parked on 4, so a page refresh dropped the user back to step 1 mid-run.
+ *
+ *  `projectId` is "" only on the landing. Every other segment is ABOUT a project. */
+export type TrainingSeg = "projects" | "detail" | "data" | "params" | "run";
+
+export interface TrainingRoute {
+  seg: TrainingSeg;
+  projectId: string;
+}
+
+/** Which of the four step tabs a segment belongs to. The landing and a project's detail are
+ *  both「1 · 项目」— picking a project is a move WITHIN that step, not a step of its own. */
+export function segTab(seg: TrainingSeg): 1 | 2 | 3 | 4 {
+  switch (seg) {
+    case "projects":
+    case "detail":
+      return 1;
+    case "data":
+      return 2;
+    case "params":
+      return 3;
+    case "run":
+      return 4;
+  }
+}
+
+/** The five things this app can train. THE single source for the union — the form config, the
+ *  slot cards and the「把运行中的 snapshot 回填进 config」路径 all speak it. */
+export type TrainingBackend = "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder";
+
+const TRAINING_BACKENDS: readonly TrainingBackend[] = [
+  "rvc",
+  "sovits",
+  "sovits_v2",
+  "sovits_diff",
+  "vocoder",
+];
+
+/** `TrainingSnapshot.backend` is a plain string from Rust. Widening it into the form config
+ *  without checking would let an unknown value drive every backend-keyed branch on the page. */
+export function asTrainingBackend(s: string): TrainingBackend | null {
+  return (TRAINING_BACKENDS as readonly string[]).includes(s) ? (s as TrainingBackend) : null;
 }
 
 /** Which architecture SLOT a backend trains into — mirrors Rust `training::backend_family`.
@@ -286,7 +403,7 @@ export interface TrainingFormConfig {
   /** sovits_v2 = SoVITS 4.0-v2 (VISinger2, S68) — its own backend/workspace
    *  family; it SHARES the sovits* form fields below (same 44.1k step-cadenced
    *  shape; v2-less switches — volEmbedding/fp16/allInMem — are hidden). */
-  backend: "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder";
+  backend: TrainingBackend;
   version: "v1" | "v2";
   sampleRate: "32k" | "40k" | "48k";
   totalEpoch: number;
@@ -360,7 +477,9 @@ export interface TrainingFormConfig {
   vocAugCopies: number;
 }
 
-const IDLE_SNAPSHOT: TrainingSnapshot = {
+/** Exported so the run segment can substitute it when the one live snapshot belongs to a
+ *  DIFFERENT project than the page is currently pointed at (S76 batch 4). */
+export const IDLE_SNAPSHOT: TrainingSnapshot = {
   state: "idle",
   backend: "",
   model_name: "",
@@ -429,14 +548,26 @@ interface TrainingStoreState {
   /** ①c: the SoVITS card's singer list (always ≥1; 1 = single-speaker). */
   speakerGroups: SpeakerGroupDraft[];
   config: TrainingFormConfig;
-  wizard: 1 | 2 | 3 | 4;
+  route: TrainingRoute;
   starting: boolean;
   /** workspace info for the CURRENT diff host pick (null when backend≠diff or
    *  no pick) — fetched by the TrainingPage root effect, consumed everywhere
    *  via diffPoolReady() */
   diffWsInfo: WorkspaceInfo | null;
 
-  setWizard: (w: 1 | 2 | 3 | 4) => void;
+  setRoute: (r: TrainingRoute) => void;
+  /** Move within the CURRENT project. Refuses when there is none — every segment past the
+   *  landing is about a project, and a `projectId: ""` route would silently address
+   *  `<training>/` itself. */
+  goSeg: (seg: TrainingSeg) => void;
+  /** THE way to enter (or leave) a project.
+   *
+   *  Switching projects must also drop every piece of per-RUN state, because all of it
+   *  describes the project you are leaving: the staged dataset, the「本次训练名」, the
+   *  shared-pool probe, the archive list. A plain `setRoute` leaves them behind, and they are
+   *  not cosmetic — `start()` sends `route.projectId` together with `config`/`dataset`, so a
+   *  stale form would train project B out of project A's audio and REPLACE B's dataset with it. */
+  enterProject: (projectId: string, seg?: TrainingSeg) => void;
   setDiffWsInfo: (info: WorkspaceInfo | null) => void;
   updateConfig: (u: Partial<TrainingFormConfig>) => void;
   addFiles: (paths: string[]) => Promise<void>;
@@ -464,10 +595,13 @@ interface TrainingStoreState {
   refresh: () => Promise<void>;
   /** S76: the project's on-disk checkpoint inventory (survives app restarts and「清空结果」). */
   projectCkpts: CkptRecord[];
-  /** Resolve the project from the MODEL NAME (never from the run snapshot — that is empty
-   *  exactly when this list matters) and rescan. THE only way to refresh the inventory, so
-   *  no call site can forget the family filter or race a stale response in. */
-  refreshProjectCkpts: (modelName: string, backend: string) => Promise<void>;
+  /** Rescan one project's on-disk archives. THE only way to refresh the inventory, so no call
+   *  site can forget the family filter or race a stale response in.
+   *
+   *  S76 batch 4: takes the project ID. It used to resolve the project from the model NAME,
+   *  because before the project pages existed the name was the only identity there was — and
+   *  that name is now user-editable, so it would go stale the moment somebody renamed a run. */
+  refreshProjectCkpts: (projectId: string, backend: string) => Promise<void>;
   /** `wipeConfirmed` = the user answered a destructive「重训」dialog for THIS run. The backend
    *  refuses a `fresh` start that would destroy checkpoints / an imported dataset without it. */
   start: (fresh: boolean, wipeConfirmed: boolean) => Promise<void>;
@@ -490,19 +624,58 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
   dragOverSpeakerId: null,
   flashSpeaker: null,
   config: { ...DEFAULT_CONFIG },
-  wizard: 1,
+  route: { seg: "projects", projectId: "" },
   starting: false,
   diffWsInfo: null,
 
-  setWizard: (w) => set({ wizard: w }),
+  setRoute: (r) => set({ route: r }),
+  enterProject: (projectId, seg = "detail") => {
+    // Invalidate everything that is mid-flight FOR THE OLD PROJECT: an in-progress file probe
+    // (`addFiles`) and an in-progress archive scan (`refreshProjectCkpts`) would otherwise land
+    // after this clear and repopulate the new project's form with the old project's contents.
+    projectEpoch++;
+    ckptScanSeq++;
+    set((s) => {
+      // Re-entering the project the LIVE run belongs to is not a fresh start: that run already
+      // fixed the identity, and blanking it would leave its own run segment describing「—」.
+      const live = s.snapshot;
+      const isLiveRun =
+        !!projectId && live.project_id === projectId && live.state !== "idle";
+      const backend = (isLiveRun && asTrainingBackend(live.backend)) || DEFAULT_CONFIG.backend;
+      return {
+        route: { seg: projectId ? seg : "projects", projectId },
+        // Everything below belongs to the project we are LEAVING. Keeping any of it is how a run
+        // ends up describing one project while writing into another.
+        dataset: [],
+        speakerGroups: [{ id: `spk${++spkSeq}`, name: "", files: [] }],
+        // `backend` too: the data segment renders a singer list or a flat list depending on it,
+        // so leaving the previous project's pick behind means「导入数据」opens the wrong shape.
+        config: { ...s.config, modelName: isLiveRun ? live.model_name : "", backend },
+        diffWsInfo: null,
+        projectCkpts: [],
+      };
+    });
+  },
+  goSeg: (seg) =>
+    set((s) =>
+      seg === "projects" || s.route.projectId
+        ? { route: { seg, projectId: seg === "projects" ? "" : s.route.projectId } }
+        : {},
+    ),
   setDiffWsInfo: (info) => set({ diffWsInfo: info }),
   updateConfig: (u) => set((s) => ({ config: { ...s.config, ...u } })),
 
   addFiles: async (paths) => {
+    const epoch = projectEpoch;
     const existing = new Set(get().dataset.map((f) => f.path));
     const fresh = paths.filter((p) => !existing.has(p));
     if (!fresh.length) return;
     const probed = await probeFiles(fresh);
+    // The probe is one `invoke` PER FILE — long enough for the user to have switched projects.
+    // Landing these now would file the previous project's audio under the new one, and
+    // `start()` would then send it with the new project's id. (`addSpeakerFiles` was already
+    // safe by accident: `enterProject` mints a fresh singer id, so its own guard misses.)
+    if (epoch !== projectEpoch) return;
     set((s) => ({ dataset: [...s.dataset, ...probed] }));
   },
   removeFile: (path) =>
@@ -530,6 +703,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       ),
     })),
   addSpeakerFiles: async (id, paths) => {
+    const epoch = projectEpoch;
     const grp = get().speakerGroups.find((g) => g.id === id);
     if (!grp) return;
     const existing = new Set(grp.files.map((f) => f.path));
@@ -537,7 +711,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     if (!fresh.length) return;
     const probed = await probeFiles(fresh);
     // the group may have been removed during the async probe — bail rather than
-    // discard the files (and leave a flash pointing at a dead id)
+    // discard the files (and leave a flash pointing at a dead id). The epoch check is the
+    // same rule for the project having changed underneath (see `addFiles`).
+    if (epoch !== projectEpoch) return;
     if (!get().speakerGroups.some((g) => g.id === id)) return;
     set((s) => {
       const speakerGroups = s.speakerGroups.map((g) =>
@@ -587,25 +763,19 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
 
   projectCkpts: [],
 
-  refreshProjectCkpts: async (modelName, backend) => {
+  refreshProjectCkpts: async (projectId, backend) => {
     const seq = ++ckptScanSeq;
-    const name = modelName.trim();
-    if (!name) {
+    if (!projectId) {
       if (seq === ckptScanSeq) set({ projectCkpts: [] });
       return;
     }
     try {
-      const projectId = await invoke<string | null>("find_training_project", { name });
-      if (!projectId) {
-        if (seq === ckptScanSeq) set({ projectCkpts: [] });
-        return;
-      }
       const rows = await invoke<CkptRecord[]>("list_project_ckpts", {
         projectId,
         family: backendFamily(backend),
       });
-      // Drop a response that a newer scan has already superseded — the name field changes on
-      // every keystroke, so out-of-order replies are the normal case, not the exotic one.
+      // Drop a response a newer scan has already superseded — switching architecture cards
+      // re-fires this, so out-of-order replies are the normal case, not the exotic one.
       if (seq === ckptScanSeq) set({ projectCkpts: rows });
     } catch (e) {
       console.error("project ckpt scan failed", e);
@@ -722,7 +892,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     } catch {
       /* pre-flight unavailable → fall through; start_training's own gate still rejects loudly */
     }
-    const { config, dataset, speakerGroups } = get();
+    const { config, dataset, speakerGroups, route } = get();
     set({ starting: true });
     try {
       // ①c: SoVITS (α) + RVC (α′) data is the singer list. 1 singer = single-speaker: send its
@@ -738,6 +908,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
           : dataset.map((f) => f.path);
       const base = {
         model_name: config.modelName.trim(),
+        // S76 batch 4: WHICH project, explicitly. `model_name` is now「本次训练名」— editable
+        // and only the ARTIFACT identity — so letting the backend re-derive the directory from
+        // it would fork a second project the first time somebody renames a run.
+        project_id: route.projectId,
         backend: config.backend,
         dataset_files: datasetFiles,
         ...(multi
@@ -837,7 +1011,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
               aug_copies: config.sovitsAugCopies,
             };
       await invoke("start_training", { request });
-      set({ wizard: 4, history: [] });
+      // Only on success, and before the refresh — a rejected start must leave the user on the
+      // page they pressed the button from, with their form intact.
+      set({ route: { seg: "run", projectId: route.projectId }, history: [] });
       useAppStore.getState().showToast(i18n.t("training.started"), "info");
       await get().refresh();
     } catch (e) {

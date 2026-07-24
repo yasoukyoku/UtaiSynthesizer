@@ -48,6 +48,13 @@ pub async fn list_models(
 
 /// Returns the created entry PLUS non-fatal warnings (failed index conversion, synthesized
 /// sidecar config, avatar problems) — the frontend must surface these, not just "success".
+///
+/// `source_ckpt` (S76 batch 4) = the training CHECKPOINT this import really came from, when
+/// `path` is not it. The training page's batch import hands us the audition cache's
+/// already-converted `<slot>/audition/<stem>/model.onnx` to skip a 10-30s reconversion —
+/// recording THAT in the export ledger would leave the real snapshot looking un-imported (so
+/// batch 3's「清理未导入的快照」could delete it) and would file the row against a path that
+/// 「清理试听缓存」removes.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn import_model(
@@ -60,6 +67,7 @@ pub async fn import_model(
     diffusion_config_path: Option<String>,
     avatar_path: Option<String>,
     vocoder_config_path: Option<String>,
+    source_ckpt: Option<String>,
 ) -> Result<ImportOutcome, String> {
     let mt = parse_voice_type(&model_type)
         .ok_or_else(|| format!("Unsupported model type: {}", model_type))?;
@@ -115,7 +123,8 @@ pub async fn import_model(
     // and the follow-up call. Both left「已安装模型 + 账本无此行」— and the snapshot cleanup
     // reads a missing row as「没人要」, i.e. it fails OPEN on the one thing it must not.
     if let Ok(entry) = &outcome {
-        record_training_export(&state, &src, &entry.entry.name, &model_type);
+        let ledger_src = source_ckpt.as_deref().map(PathBuf::from).unwrap_or_else(|| src.clone());
+        record_training_export(&state, &ledger_src, &entry.entry.name, &model_type);
     }
     outcome
 }

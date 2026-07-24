@@ -774,18 +774,23 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
           { projectId: ws.slug },
         );
         const freed = rep.freedBytes;
-        // Keep the training page coherent: the diff card's cached workspace facts (免导入直训 /
-        // 续训 hints) must reflect the deletion immediately — re-probe the CURRENT name.
+        // Keep the training page coherent. It is a different panel with no reason to re-fetch
+        // on its own — none of its effect dependencies change when a deletion happens over
+        // here — so a delete would otherwise leave it showing archives that no longer exist
+        // (still clickable for import) and a「免导入直训」hint for a dataset we just removed.
+        //
+        // S76 batch 4: keyed on the training page's CURRENT PROJECT, not on the typed model
+        // name. Deleting project A while the page sits on project B must not wipe B's view;
+        // deleting the project the page IS on must.
         const ts = useTrainingStore.getState();
-        const curName = ts.config.modelName.trim();
-        if (curName) {
-          invoke("get_training_workspace_info", { name: curName, backend: "sovits_diff" })
-            .then((info) => ts.setDiffWsInfo(info as never))
-            .catch(() => {});
-          // …and the training page's archive list, which has no other reason to re-scan: none
-          // of its effect dependencies change when a deletion happens over here, so without
-          // this the deleted rows keep listing (and stay clickable for import).
-          void ts.refreshProjectCkpts(curName, ts.config.backend);
+        if (ts.route.projectId === ws.slug) {
+          // Send it back to the project list. Leaving the route on a project that no longer
+          // exists is not merely stale: its detail page can only answer
+          // PROJECT_META_UNREADABLE, and `route` outlives closing the training page (it is
+          // module-level store state), so the page would come back to the same dead project
+          // every time. `enterProject("")` also drops the staged dataset / run name, which
+          // described the project we just deleted.
+          ts.enterProject("");
         }
         return freed;
       },
