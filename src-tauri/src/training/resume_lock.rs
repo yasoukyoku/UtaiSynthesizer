@@ -94,9 +94,10 @@ pub fn resume_locked_fields(backend: &str) -> Vec<LockedField> {
         // folded into the dataset fingerprint; a diff run inherits it rather than choosing.
         v.push(costly("loudnorm"));
     }
-    if backend != "sovits_diff" {
-        v.push(costly("augCopies"));
-    }
+    // Every backend. For a diffusion run it is honoured only when the sovits slot holds no main
+    // model (diff-first); when it IS inherited the request field is simply ignored, and "allowed"
+    // remains the truthful answer either way.
+    v.push(costly("augCopies"));
     // Every backend: adding or removing audio re-fingerprints the shared dataset.
     v.push(costly("dataset"));
     v

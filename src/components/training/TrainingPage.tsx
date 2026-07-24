@@ -744,6 +744,8 @@ function ParamsStep() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   // diff inherits 数据增强份数 from the host workspace manifest — show the
   // REAL inherited value (store diffWsInfo, fetched by the root effect)
+  // 有没有主模型共用这个槽的切片池 —— 判据与后端 `eff_aug_copies` 同源(has_main_progress)
+  const diffHasHost = config.backend === "sovits_diff" && !!diffWsInfo?.has_main_progress;
   const diffAugInherit =
     config.backend === "sovits_diff" && diffWsInfo?.exists ? diffWsInfo.aug_copies : null;
 
@@ -1103,14 +1105,26 @@ function ParamsStep() {
             </div>
             <div className="training-form-row">
               <label title={t("training.augCopiesTip")}>{t("training.augCopies")}</label>
-              {/* inherited from the workspace manifest (shared dataset_44k
-                  slice pool) — not a diff-run choice, like loudnorm */}
-              <span className="training-fixed-value">
-                {t("training.augFollowWorkspace")}
-                {diffAugInherit !== null
-                  ? ` · ${t("training.augInheritCount", { count: diffAugInherit })}`
-                  : ""}
-              </span>
+              {/* Shallow diffusion trains on the SoVITS slot's own slice pool and re-fingerprints
+                  it, so with a main model in that slot the count is INHERITED — choosing another
+                  one would rebuild the shared slices and silently change the data the main model
+                  resumes on (same posture as loudnorm). With no main model there (diff-first)
+                  nothing is sharing the pool, so it is an ordinary choice. */}
+              {diffHasHost ? (
+                <span className="training-fixed-value">
+                  {t("training.augFollowWorkspace")}
+                  {diffAugInherit !== null
+                    ? ` · ${t("training.augInheritCount", { count: diffAugInherit })}`
+                    : ""}
+                </span>
+              ) : (
+                <NumberField
+                  value={config.diffAugCopies}
+                  min={0}
+                  max={3}
+                  onChange={(v) => updateConfig({ diffAugCopies: v })}
+                />
+              )}
             </div>
             <label className="training-check-row">
               <input

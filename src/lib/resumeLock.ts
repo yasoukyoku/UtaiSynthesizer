@@ -27,7 +27,7 @@ export function resumeLockedFields(backend: string): { id: string; tier: LockTie
   }
   if (backend === "sovits_diff") out.push({ id: "kStepMax", tier: "locked" });
   if (backend === "sovits") out.push({ id: "loudnorm", tier: "costly" });
-  if (backend !== "sovits_diff") out.push({ id: "augCopies", tier: "costly" });
+  out.push({ id: "augCopies", tier: "costly" });
   out.push({ id: "dataset", tier: "costly" });
   return out;
 }

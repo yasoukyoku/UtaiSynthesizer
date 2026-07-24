@@ -492,6 +492,10 @@ export interface TrainingFormConfig {
   diffKStepMax: number;
   /** amp fp16 (upstream amp_dtype; default fp32) */
   diffFp16: boolean;
+  /** S78: augmentation copies for a DIFF-FIRST slot (no main model sharing the slice pool).
+   *  With a main model present the run inherits the manifest's value and this is ignored —
+   *  Rust decides, the form just carries a number. */
+  diffAugCopies: number;
   diffCacheAllData: boolean;
   // ---- 声码器微调 vocoder (S40; separate fields — card switches must not
   // clobber). Steps are REAL optimizer rounds (the lightning GAN counts D+G
@@ -560,6 +564,7 @@ const DEFAULT_CONFIG: TrainingFormConfig = {
   diffForceSaveSteps: 10000,
   diffKStepMax: 0,
   diffFp16: false,
+  diffAugCopies: 0,
   diffCacheAllData: true,
   vocTotalSteps: 2000,
   vocSaveEverySteps: 500,
@@ -1000,6 +1005,8 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
                 interval_force_save: config.diffForceSaveSteps,
                 cache_all_data: config.diffCacheAllData,
                 fp16: config.diffFp16,
+                // honoured only when the sovits slot holds no main model (see `eff_aug_copies`)
+                aug_copies: config.diffAugCopies,
               }
           : config.backend === "sovits_v2"
             ? {

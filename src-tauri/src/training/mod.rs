@@ -1600,11 +1600,26 @@ impl TrainingManager {
         // key = pre-S41 or diff-first workspace = 0). The diff pipeline runs
         // the same augment stage with this value so a cache-wipe rebuild
         // regenerates the aug slices the manifest promises.
-        let eff_aug_copies = if req.backend == "sovits_diff" {
+        // A diffusion run trains on the SoVITS slot's own slice pool (`dataset_44k` under this
+        // very workspace — that shared cache is the entire reason shallow diffusion lives in the
+        // sovits family), and it re-fingerprints that pool. So choosing its own augmentation
+        // count would rebuild the shared slices to a different recipe and silently change the
+        // data the MAIN model resumes on ⇒ it inherits instead.
+        //
+        // S78: unless there is no main model in the slot (diff-first). Then nothing is sharing
+        // the pool and the run's own value stands — otherwise a diff-first project could only
+        // ever train at aug=0, for the sake of a main model that does not exist.
+        let eff_aug_copies = if req.backend == "sovits_diff" && has_main {
             manifest["aug_copies"].as_u64().unwrap_or(0) as u32
         } else {
             req.aug_copies
         };
+        // …and record it, so the NEXT diff run inherits what this one actually preprocessed with
+        // rather than re-fingerprinting the pool back to 0. (A later main run overwrites it with
+        // its own value, which is correct: from then on the main model owns the pool.)
+        if req.backend == "sovits_diff" && !has_main {
+            manifest["aug_copies"] = serde_json::json!(eff_aug_copies);
+        }
         std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
         // milestone cadence normalized onto the save grid (see field docs)
         let interval_val = req.save_every_steps.max(1);

@@ -59,9 +59,10 @@ function rustTable(src: string, backend: string): { id: string; tier: LockTier }
       out.push({ id: m[2]!, tier: m[1] === "locked" ? "locked" : "costly" });
     }
   }
-  // the unconditional trailing row
+  // the unconditional trailing rows
+  expect(body).toMatch(/v\.push\(costly\("augCopies"\)\);/);
   expect(body).toMatch(/v\.push\(costly\("dataset"\)\);/);
-  out.push({ id: "dataset", tier: "costly" });
+  out.push({ id: "augCopies", tier: "costly" }, { id: "dataset", tier: "costly" });
   return out;
 }
 
