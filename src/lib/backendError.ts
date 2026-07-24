@@ -30,7 +30,11 @@ interface CodeEntry {
   modal?: boolean;
 }
 
-const CODE_KEYS: Record<string, CodeEntry> = {
+/** Exported for the i18n parity gate ONLY (`src/i18n/parity.test.ts`), which asserts that this
+ *  table and the `backend.*` texts stay bidirectionally closed: a CODE with no text shows the
+ *  user a bare CODE string, a text with no CODE is a dead key. Runtime callers use the
+ *  `backendErrorMessage` / `isBusyError` / `isModalError` helpers below — never this map. */
+export const CODE_KEYS: Record<string, CodeEntry> = {
   // FlightGuard / interlock busy rejections (audition.rs BUSY_RETRY_MSG — 10 commands inherit it).
   APP_BUSY: { key: "common.busyRetry", busy: true },
   // Model import/delete refused while an audition holds the model open (models.rs).
@@ -366,6 +370,17 @@ const CODE_KEYS: Record<string, CodeEntry> = {
   AUDITION_WORKSPACE_OUTSIDE_ROOT: { key: "backend.AUDITION_WORKSPACE_OUTSIDE_ROOT" },
   PROJECT_DATASET_SHAPE: { key: "backend.PROJECT_DATASET_SHAPE" },
   TRAINING_DATASET_SELF_SOURCE: { key: "backend.TRAINING_DATASET_SELF_SOURCE" },
+  // S76 batch 4 — explicit project CRUD. The name rules are inline validation the create/rename
+  // dialogs surface as-is; they are not failures of anything already on disk.
+  PROJECT_NAME_EMPTY: { key: "backend.PROJECT_NAME_EMPTY" },
+  PROJECT_NAME_TOO_LONG: { key: "backend.PROJECT_NAME_TOO_LONG" },
+  PROJECT_NAME_INVALID: { key: "backend.PROJECT_NAME_INVALID" },
+  PROJECT_NOTE_TOO_LONG: { key: "backend.PROJECT_NOTE_TOO_LONG" },
+  PROJECT_NAME_EXISTS: { key: "backend.PROJECT_NAME_EXISTS" },
+  // Both of these mean a bug on our side reached the backend rather than a user mistake, so
+  // they are modal: silently swallowing them would leave the user staring at a dead button.
+  PROJECT_ID_EXHAUSTED: { key: "backend.PROJECT_ID_EXHAUSTED", modal: true },
+  PROJECT_ID_INVALID: { key: "backend.PROJECT_ID_INVALID", modal: true },
   // fail-closed wipe consent (training/mod.rs): fresh=true without wipe_confirmed on a
   // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
   // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.

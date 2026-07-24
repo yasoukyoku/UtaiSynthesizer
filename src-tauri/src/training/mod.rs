@@ -273,6 +273,17 @@ pub fn resolve_training_assets(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartTrainingRequest {
     pub model_name: String,
+    /// S76 batch 4: WHICH PROJECT this run trains into. Empty = resolve by `model_name`, the
+    /// pre-batch-4 behaviour.
+    ///
+    /// It has to be explicit. `model_name` became「本次训练名」— editable, defaulting to the
+    /// project name but free to differ — and it is also the artifact identity
+    /// (`slugify(model_name)` = `hps.name` / `weights/<slug>*`). Resolving the DIRECTORY from
+    /// it too would mean that renaming a run forks a second project: the old checkpoints keep
+    /// existing with nothing able to reach them, and `find_by_name` then picks between two
+    /// same-named projects by directory order.
+    #[serde(default)]
+    pub project_id: String,
     pub backend: String, // "rvc" | "sovits" | "sovits_v2" | "sovits_diff" | "vocoder"
     /// rvc: "v1" | "v2" — sovits/sovits_diff: "4.1" | "4.0" — sovits_v2: fixed
     /// "4.0-v2" — vocoder: fixed "nsf_hifigan" (manifest markers, 一期单格式类)
@@ -558,12 +569,30 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
         || has_dataset_pool(ws)
 }
 
+/// Name-keyed bridge kept for the callers that still speak display names (the shallow-diffusion
+/// host picker resolves an INSTALLED MODEL's name, which need not be a project of ours).
+///
+/// S76 batch 4: everything that knows which project it means calls [`slot_info`] directly —
+/// names are user-editable and no longer an identity.
 pub fn workspace_info(data_dir: &Path, name: &str, backend: &str) -> WorkspaceInfo {
-    let project = tproject::find_by_name(data_dir, name);
-    let ws = match &project {
-        Some(p) => tproject::family_dir(data_dir, &p.id, backend_family(backend)),
-        None => tproject::family_dir(data_dir, &slugify(name), backend_family(backend)),
-    };
+    match tproject::find_by_name(data_dir, name) {
+        Some(p) => slot_info(data_dir, &p.id, backend),
+        None => {
+            // No project answers to this name. Probe the legacy slug path anyway so an
+            // UNMIGRATED pre-S76 workspace still reports `exists` — but never advertise a
+            // shared dataset pool for it: that pool was a sibling of the checkpoints back then,
+            // and `resolve_or_create` refuses to train into an unmigrated tree regardless.
+            let mut info = slot_info(data_dir, &slugify(name), backend);
+            info.has_dataset = false;
+            info
+        }
+    }
+}
+
+/// Structured facts about ONE architecture slot of ONE project — the id-keyed form, which is
+/// the only one that stays correct across a rename.
+pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceInfo {
+    let ws = tproject::family_dir(data_dir, project_id, backend_family(backend));
     let manifest = std::fs::read_to_string(ws.join("run_manifest.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -605,10 +634,7 @@ pub fn workspace_info(data_dir: &Path, name: &str, backend: &str) -> WorkspaceIn
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
-        has_dataset: project
-            .as_ref()
-            .map(|p| tproject::has_dataset(data_dir, &p.id))
-            .unwrap_or(false),
+        has_dataset: tproject::has_dataset(data_dir, project_id),
         vol_embedding: manifest["vol_embedding"].as_bool(),
         n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
         speakers,
@@ -968,6 +994,17 @@ impl TrainingManager {
             );
         }
 
+        // READ-ONLY view of the target project, for the pre-flight checks below. Deliberately
+        // not `resolve_or_create`: creation stays after every check that can still refuse, so a
+        // rejected start never leaves an empty project behind. Keyed by id when the caller gave
+        // one — otherwise「复用项目数据集」would look up the editable 本次训练名 and answer
+        // TRAINING_NO_DATA for a project whose `dataset/` is right there.
+        let existing_project: Option<tproject::ProjectMeta> = if req.project_id.trim().is_empty() {
+            tproject::find_by_name(&data_dir, &req.model_name)
+        } else {
+            tproject::read_meta(&data_dir, &req.project_id)
+        };
+
         // ①c multi-speaker co-training (>1 group): the dataset lives in the
         // per-speaker `speakers` files, NOT dataset_files, so validate those and
         // skip the single-speaker empty-dataset gate below. Single-speaker (0 or
@@ -1031,9 +1068,8 @@ impl TrainingManager {
             // 有导入好的数据」——这正是工作区化最核心的那件事:一份数据喂多个架构。
             // 防「空数据逃课」的权威闸门仍在:项目里一个音频都没有就一律拒绝(前端禁用只是
             // 第一道线)。CODE 按后端分流保持不变,浅扩散那条对话框链的文案依赖它。
-            let existing = tproject::find_by_name(&data_dir, &req.model_name);
+            let existing = existing_project.as_ref();
             let pool_ok = existing
-                .as_ref()
                 .map(|p| tproject::has_dataset(&data_dir, &p.id))
                 .unwrap_or(false);
             if !pool_ok {
@@ -1049,7 +1085,8 @@ impl TrainingManager {
             // subdirectories — fingerprint the empty set and freeze the caches forever.
             // Refuse here; re-importing with the speaker groups is the way through until the
             // data page learns to reuse a multi-speaker project (batch 5).
-            let ds = tproject::dataset_dir(&data_dir, &existing.as_ref().unwrap().id);
+            // `pool_ok` above already proved `existing` is Some.
+            let ds = tproject::dataset_dir(&data_dir, &existing.unwrap().id);
             let has_subdirs = std::fs::read_dir(&ds)
                 .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
                 .unwrap_or(false);
@@ -1104,11 +1141,29 @@ impl TrainingManager {
         // the run's model name, or every existing checkpoint would change its file name and
         // `best_state.json`'s carried-over metric would suppress the next best write.
         let slug = slugify(&req.model_name);
-        // Directory identity. The wizard still asks for a model name (the project UI lands in
-        // a later batch), so the project is resolved BY NAME and created on first use — which
-        // reproduces the pre-S76 mapping exactly, including for a migrated workspace whose
-        // display name could not be recovered (find_by_name falls back to the legacy slug).
-        let project = tproject::resolve_or_create(&data_dir, &req.model_name)?;
+        // Directory identity — separate from the artifact identity above, and NOT derived from
+        // the model name whenever the caller knows better (see `StartTrainingRequest.project_id`).
+        // An id that names nothing is a hard refusal: silently falling back to name resolution
+        // would create a SECOND project under the display name and train into it, which is the
+        // exact fork this field exists to prevent.
+        let project = if req.project_id.trim().is_empty() {
+            // Pre-batch-4 path: resolve by name, create on first use. Reproduces the pre-S76
+            // mapping exactly, including for a migrated workspace whose display name could not
+            // be recovered (find_by_name falls back to the legacy slug).
+            tproject::resolve_or_create(&data_dir, &req.model_name)?
+        } else {
+            // Same lookup the pre-flight above already did — reused rather than repeated so the
+            // two can never disagree about which project this run is for.
+            let m = existing_project
+                .ok_or_else(|| UtaiError::Training("PROJECT_META_UNREADABLE".into()))?;
+            // Same refusal `resolve_or_create` makes: an undecidable directory still holds its
+            // content wherever migration found it, possibly at the project root where our
+            // `dataset/` would land on top of it.
+            if let Some(reason) = m.needs_attention.clone() {
+                return Err(UtaiError::Training(format!("PROJECT_NEEDS_ATTENTION: {reason}")));
+            }
+            m
+        };
         let family = backend_family(&req.backend).to_string();
         let workspace = tproject::family_dir(&data_dir, &project.id, &family);
         let manifest_path = workspace.join("run_manifest.json");

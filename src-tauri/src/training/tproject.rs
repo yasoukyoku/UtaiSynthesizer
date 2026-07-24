@@ -354,6 +354,137 @@ pub fn resolve_or_create(data_dir: &Path, name: &str) -> Result<ProjectMeta> {
     Ok(meta)
 }
 
+// ─────────────────────────── explicit CRUD (batch 4) ───────────────────────────
+
+/// A display name is user TEXT, never a path — the directory is [`new_project_id`]'s
+/// ASCII+hash slug — so the only limits are the ones that keep it usable: non-empty after
+/// trimming, no control characters (they corrupt every list they are rendered into and can
+/// forge line breaks inside a confirm dialog), and short enough for a card to show.
+const MAX_PROJECT_NAME_CHARS: usize = 80;
+
+fn clean_project_name(name: &str) -> Result<String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err(UtaiError::Training("PROJECT_NAME_EMPTY".into()));
+    }
+    if n.chars().count() > MAX_PROJECT_NAME_CHARS {
+        return Err(UtaiError::Training("PROJECT_NAME_TOO_LONG".into()));
+    }
+    if n.chars().any(char::is_control) {
+        return Err(UtaiError::Training("PROJECT_NAME_INVALID".into()));
+    }
+    Ok(n.to_string())
+}
+
+/// Same note treatment: free text, but bounded and control-free for the same reasons.
+const MAX_PROJECT_NOTE_CHARS: usize = 500;
+
+fn clean_project_note(note: &str) -> Result<String> {
+    let n = note.trim();
+    if n.chars().count() > MAX_PROJECT_NOTE_CHARS {
+        return Err(UtaiError::Training("PROJECT_NOTE_TOO_LONG".into()));
+    }
+    // newlines are legitimate in a note; other control characters are not
+    if n.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
+        return Err(UtaiError::Training("PROJECT_NAME_INVALID".into()));
+    }
+    Ok(n.to_string())
+}
+
+/// Create a project because the USER asked for one — as opposed to [`resolve_or_create`],
+/// which mints one implicitly from a training run's model name.
+///
+/// Names must stay unique: `find_by_name` resolves a duplicate by directory order, and every
+/// consumer that still speaks names (the diffusion host picker, the legacy start path) would
+/// then address a project at random.
+pub fn create_project(data_dir: &Path, name: &str, note: &str) -> Result<ProjectMeta> {
+    let name = clean_project_name(name)?;
+    let note = clean_project_note(note)?;
+    if find_by_name(data_dir, &name).is_some() {
+        return Err(UtaiError::Training("PROJECT_NAME_EXISTS".into()));
+    }
+    // A pre-S76 workspace answering to this name is NOT a free name: creating beside it forks
+    // the user's work in two exactly as `resolve_or_create` describes. Migration retries every
+    // boot, so this is a wait, not a dead end.
+    if unmigrated_legacy_dir(data_dir, &name).is_some() {
+        return Err(UtaiError::Training(
+            "TRAINING_LAYOUT_MIGRATION_PENDING: unmigrated workspace with this name".into(),
+        ));
+    }
+    let now = now_ms();
+    // `new_project_id` is a pure function of the name, so the id it proposes can already be
+    // taken — most plausibly by THIS project after a rename (create "A", rename to "B", create
+    // "A" again). That case is safe to place beside; an occupied id whose `project.json` we
+    // cannot read is NOT (it may be the user's damaged project, and a second directory would
+    // make the first unreachable from the UI forever).
+    let mut id = new_project_id(&name);
+    let mut attempt = 1u32;
+    while project_dir(data_dir, &id).exists() {
+        if read_meta(data_dir, &id).is_none() {
+            return Err(UtaiError::Training("PROJECT_META_UNREADABLE".into()));
+        }
+        attempt += 1;
+        if attempt > 64 {
+            return Err(UtaiError::Training("PROJECT_ID_EXHAUSTED".into()));
+        }
+        // Vary the HASH INPUT, never the shape: the id must keep its `<ascii>_<8 hex>` form so
+        // it can never become a Windows reserved device name.
+        id = new_project_id(&format!("{name}#{attempt}"));
+    }
+    let meta = ProjectMeta {
+        id,
+        name,
+        note,
+        created_ms: now,
+        updated_ms: now,
+        // Nothing exists yet, so there is nothing to protect — but stamping it keeps every
+        // project on the same rule (`cleanup_snapshots` refuses an unstamped ledger outright).
+        export_ledger_since_ms: now,
+        ..Default::default()
+    };
+    write_meta(data_dir, &meta)?;
+    Ok(meta)
+}
+
+/// Rename / re-annotate. The DIRECTORY never moves: id and display name are separate
+/// identities on purpose (module docs, invariant 3), so a rename cannot orphan a checkpoint,
+/// break a resume, or invalidate the export ledger's relative paths.
+///
+/// It also cannot change any artifact's file name — those carry `slugify(本次训练名)`, which
+/// lives in the slot's own `run.json` (see [`slot_model_name`]) and is frozen there.
+pub fn update_project(data_dir: &Path, id: &str, name: &str, note: &str) -> Result<ProjectMeta> {
+    let name = clean_project_name(name)?;
+    let note = clean_project_note(note)?;
+    let Some(mut meta) = read_meta(data_dir, id) else {
+        return Err(UtaiError::Training("PROJECT_META_UNREADABLE".into()));
+    };
+    if let Some(other) = find_by_name(data_dir, &name) {
+        if other.id != id {
+            return Err(UtaiError::Training("PROJECT_NAME_EXISTS".into()));
+        }
+    }
+    meta.name = name;
+    meta.note = note;
+    meta.updated_ms = now_ms();
+    write_meta(data_dir, &meta)?;
+    Ok(meta)
+}
+
+/// The「本次训练名」a slot's artifacts were built under: `hps.name`, the `weights/<slug>*`
+/// prefix, the `config.spk` key. Returns the NAME (the slug derives from it via `slugify`).
+///
+/// It only ever lived in the slot's own `run.json`, which is written AFTER a successful data
+/// import — so `None` means this slot never completed a run, and a slot that never ran holds
+/// no slug-bearing artifact for a different name to orphan. That is what makes「存量项目的
+/// model_slug 冻结」a READ rather than a migration: there is nothing to back-fill.
+pub fn slot_model_name(data_dir: &Path, id: &str, family: &str) -> Option<String> {
+    std::fs::read_to_string(family_dir(data_dir, id, family).join("run.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["model_name"].as_str().map(String::from))
+        .filter(|s| !s.is_empty())
+}
+
 // ─────────────────────────── checkpoint inventory ───────────────────────────
 
 /// What a checkpoint file IS — the four shapes the four families actually produce.
@@ -775,6 +906,9 @@ pub fn delete_project(data_dir: &Path, id: &str) -> Result<DeleteReport> {
     let root = training_root(data_dir);
     let _ = crate::util::remove_dir_all_robust(&root.join(format!("{STAGING_PREFIX}{id}")));
     let _ = std::fs::remove_file(root.join(format!("{MARKER_PREFIX}{id}.json")));
+    // (The listing cache's row is dropped by the COMMAND — `forget_project` — because the cache
+    // lives beside `config.json`, not in the data dir, and this function only knows the latter.
+    // Leaving it would resurrect the project as a MISSING ghost right after a deliberate delete.)
     let deferred = match &tomb {
         Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
         None => false,
@@ -879,6 +1013,244 @@ pub fn record_export(
     });
     meta.updated_ms = now_ms();
     write_meta(data_dir, &meta)
+}
+
+// ─────────────────────── the listing + its size cache (batch 4) ───────────────────────
+
+/// `<app_dir>/training-projects.json` — a CACHE, never an authority.
+///
+/// The truth about a project is its own `project.json`, and the truth about which projects
+/// exist is the directory listing (module docs, invariant 1). This file exists for exactly two
+/// things the listing UI cannot get cheaply or at all:
+///
+/// * **sizes** — a per-project `dir_size` walk over tens of GB is not something to run on every
+///   page open;
+/// * **absence** — a project that DISAPPEARED (folder deleted outside the app, a data root
+///   swapped underneath us) leaves nothing on disk to list, and「盘上还在、app 里没了」has an
+///   equally bad mirror image:「app 里没了,用户也不知道为什么」. Remembering the id lets the row
+///   survive as a visible, explainable, dismissible state.
+///
+/// ## Why it is NOT `<data>/training/projects.json` (the S75 design said it would be)
+///
+/// `training` is one of `MIGRATED_SUBTREES` (`commands::settings`), and `migrate_data_dir`
+/// copies each subtree and then VERIFIES it file-by-file **by byte length** — with
+/// `skips_dot_top("training") == false`, so no name is exempt. A cache rewritten between the
+/// copy and the verify fails that comparison, and a `.tmp` that appears in that window reads as
+/// "missing after copy": either way the user's entire data-directory migration aborts with
+/// `MIGRATE_VERIFY_FAILED`. (The startup reclaim's delta-sync would also copy the OLD root's
+/// stale cache over the new one — `layout_aware` only guards directories.) Nothing about a
+/// derived, rebuildable cache is worth that, so it lives beside `config.json` instead, outside
+/// every subtree the data-dir machinery touches.
+///
+/// It records WHICH data root it describes: switching data dirs invalidates every figure in it
+/// at once, and silently showing another root's sizes would be worse than showing none.
+/// Torn or hand-mangled content is rebuilt wholesale rather than reported — a broken cache must
+/// never break a listing. Concurrent writers (double-launch is supported here) race harmlessly:
+/// the write is atomic and a lost update costs one re-measure.
+pub const PROJECTS_INDEX: &str = "training-projects.json";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSizes {
+    pub total_bytes: u64,
+    pub dataset_bytes: u64,
+    /// family → bytes, only for slots that exist. BTreeMap so the file stays diff-stable.
+    #[serde(default)]
+    pub family_bytes: std::collections::BTreeMap<String, u64>,
+    /// 0 = never measured. The UI shows「—」rather than a confident, wrong「0 B」.
+    pub computed_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct IndexEntry {
+    /// Last known display name — the only way a MISSING project can still be named.
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    sizes: ProjectSizes,
+    /// When this id was first seen in the index but not on disk. 0 = present.
+    #[serde(default)]
+    missing_since_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SizeIndex {
+    #[serde(default)]
+    version: u32,
+    /// The data root these figures describe.
+    #[serde(default)]
+    data_dir: String,
+    #[serde(default)]
+    projects: std::collections::BTreeMap<String, IndexEntry>,
+}
+
+const INDEX_VERSION: u32 = 1;
+
+fn index_path(app_dir: &Path) -> PathBuf {
+    app_dir.join(PROJECTS_INDEX)
+}
+
+fn fresh_index(data_dir: &Path) -> SizeIndex {
+    SizeIndex {
+        version: INDEX_VERSION,
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    }
+}
+
+fn read_index(app_dir: &Path, data_dir: &Path) -> SizeIndex {
+    let parsed: Option<SizeIndex> = std::fs::read_to_string(index_path(app_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    match parsed {
+        // A future version's file is not ours to interpret, and another root's figures are not
+        // ours to show — start over rather than read either with today's meaning.
+        Some(ix)
+            if ix.version == INDEX_VERSION && Path::new(&ix.data_dir) == data_dir =>
+        {
+            ix
+        }
+        _ => fresh_index(data_dir),
+    }
+}
+
+/// Best effort by design: a cache that cannot be written must not fail the listing that
+/// produced it (every write of real user data fails loudly on its own).
+///
+/// The temp name carries the pid because double-launch is supported: a shared fixed `.tmp`
+/// would let two instances write the same file and rename each other's half-written bytes into
+/// place. (`write_meta`'s fixed `project.json.tmp` is per-PROJECT and therefore far narrower;
+/// this one is a single global file every listing touches.)
+fn write_index(app_dir: &Path, ix: &SizeIndex) {
+    let tmp = app_dir.join(format!("{PROJECTS_INDEX}.{}.tmp", std::process::id()));
+    let Ok(body) = serde_json::to_vec_pretty(ix) else { return };
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, index_path(app_dir)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Walk one project. `dir_size` is the single source for「一个目录有多大」in this app
+/// (`commands::storage`), so the storage report and this listing can never disagree on the
+/// arithmetic — only on when they last looked.
+fn measure_project(data_dir: &Path, id: &str) -> ProjectSizes {
+    use crate::commands::storage::dir_size;
+    let proj = project_dir(data_dir, id);
+    let mut family_bytes = std::collections::BTreeMap::new();
+    for f in FAMILIES {
+        let fd = proj.join(f);
+        if fd.is_dir() {
+            family_bytes.insert(f.to_string(), dir_size(&fd));
+        }
+    }
+    ProjectSizes {
+        total_bytes: dir_size(&proj),
+        dataset_bytes: dir_size(&proj.join(DATASET_DIR)),
+        family_bytes,
+        computed_ms: now_ms(),
+    }
+}
+
+/// One row of the project landing page.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSummary {
+    pub id: String,
+    pub name: String,
+    pub note: String,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    /// Migration could not classify this directory: nothing was moved, nothing was deleted,
+    /// and training into it is refused (`resolve_or_create`).
+    pub needs_attention: Option<String>,
+    /// Architecture slots that exist on disk, in [`FAMILIES`] order.
+    pub families: Vec<String>,
+    pub has_dataset: bool,
+    #[serde(flatten)]
+    pub sizes: ProjectSizes,
+    /// Remembered by the index, absent from disk. Listed, never silently dropped, and barred
+    /// from every training entry point.
+    pub missing: bool,
+}
+
+/// Every project, for the landing page.
+///
+/// `measure` = walk the disk for sizes (seconds over tens of GB) and refresh the cache; `false`
+/// answers instantly from the cache. ONE code path either way, so a cached row and a fresh row
+/// can never be assembled differently.
+pub fn list_project_summaries(app_dir: &Path, data_dir: &Path, measure: bool) -> Vec<ProjectSummary> {
+    let on_disk = list_projects(data_dir);
+    let mut ix = read_index(app_dir, data_dir);
+    let before = ix.clone();
+    let now = now_ms();
+    let mut out: Vec<ProjectSummary> = Vec::new();
+
+    for m in &on_disk {
+        let entry = ix.projects.entry(m.id.clone()).or_default();
+        entry.name = m.name.clone();
+        entry.missing_since_ms = 0;
+        if measure || entry.sizes.computed_ms == 0 {
+            entry.sizes = measure_project(data_dir, &m.id);
+        }
+        let proj = project_dir(data_dir, &m.id);
+        out.push(ProjectSummary {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            note: m.note.clone(),
+            created_ms: m.created_ms,
+            updated_ms: m.updated_ms,
+            needs_attention: m.needs_attention.clone(),
+            families: FAMILIES
+                .iter()
+                .filter(|f| proj.join(f).is_dir())
+                .map(|f| f.to_string())
+                .collect(),
+            has_dataset: has_dataset(data_dir, &m.id),
+            sizes: entry.sizes.clone(),
+            missing: false,
+        });
+    }
+
+    let present: std::collections::HashSet<&str> = on_disk.iter().map(|m| m.id.as_str()).collect();
+    for (id, entry) in ix.projects.iter_mut() {
+        if present.contains(id.as_str()) {
+            continue;
+        }
+        if entry.missing_since_ms == 0 {
+            entry.missing_since_ms = now;
+        }
+        out.push(ProjectSummary {
+            id: id.clone(),
+            name: if entry.name.is_empty() { id.clone() } else { entry.name.clone() },
+            note: String::new(),
+            created_ms: 0,
+            updated_ms: entry.missing_since_ms,
+            needs_attention: None,
+            families: Vec::new(),
+            has_dataset: false,
+            // Stale by definition — keep the last known figures so the row can still say how
+            // much disk this project WAS using, with computed_ms telling the user how old that is.
+            sizes: entry.sizes.clone(),
+            missing: true,
+        });
+    }
+
+    if ix != before {
+        write_index(app_dir, &ix);
+    }
+    // Newest activity first; id breaks ties so the order never wobbles between calls.
+    out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// Drop a project's cache row: what「移除记录」does to a MISSING project, and what a real
+/// deletion must do so the row cannot come back as a ghost.
+pub fn forget_project(app_dir: &Path, data_dir: &Path, id: &str) {
+    let mut ix = read_index(app_dir, data_dir);
+    if ix.projects.remove(id).is_some() {
+        write_index(app_dir, &ix);
+    }
 }
 
 // ─────────────────────────── legacy layout migration ───────────────────────────
@@ -1779,6 +2151,212 @@ mod tests {
         .unwrap();
         assert!(find_by_name(&data, "anything else").is_none());
         assert_eq!(find_by_name(&data, id).unwrap().id, id);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    // ───────────────────── batch 4: explicit CRUD + the listing cache ─────────────────────
+
+    fn app_root(data: &Path) -> PathBuf {
+        let a = data.join("app");
+        std::fs::create_dir_all(&a).unwrap();
+        a
+    }
+
+    #[test]
+    fn create_project_validates_and_refuses_duplicate_names() {
+        let data = tmp_root("create");
+        let m = create_project(&data, "  歌姫テスト  ", " a note ").unwrap();
+        assert_eq!(m.name, "歌姫テスト", "trimmed");
+        assert_eq!(m.note, "a note");
+        assert!(m.export_ledger_since_ms > 0, "every project is stamped or cleanup refuses it");
+        assert!(read_meta(&data, &m.id).is_some());
+
+        for bad in ["", "   ", "a\nb", "a\u{0}b"] {
+            assert!(create_project(&data, bad, "").is_err(), "must refuse {bad:?}");
+        }
+        assert!(create_project(&data, &"x".repeat(81), "").is_err(), "length cap");
+        assert!(create_project(&data, "ok", &"n".repeat(501)).is_err(), "note cap");
+        // A name that already resolves is refused — `find_by_name` picks duplicates by
+        // directory order, so a second one would make BOTH unaddressable.
+        assert!(create_project(&data, "歌姫テスト", "").is_err());
+        assert!(create_project(&data, " 歌姫テスト", "").is_err(), "after trimming, too");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// create "A" → rename to "B" → create "A" again. The deterministic id for "A" is now taken
+    /// by a project that answers to "B", so a naive `new_project_id` would collide with it.
+    #[test]
+    fn create_project_places_beside_a_renamed_project_that_owns_its_id() {
+        let data = tmp_root("collide");
+        let first = create_project(&data, "A", "").unwrap();
+        update_project(&data, &first.id, "B", "").unwrap();
+        assert_eq!(read_meta(&data, &first.id).unwrap().name, "B");
+        assert_eq!(first.id, new_project_id("A"), "precondition: id derives from the name");
+
+        let second = create_project(&data, "A", "").unwrap();
+        assert_ne!(second.id, first.id, "must not reuse the occupied directory");
+        // the shape must survive uniquifying — `<ascii>_<8 hex>` is what keeps a project id from
+        // ever being a Windows reserved device name
+        let (base, hex) = second.id.rsplit_once('_').unwrap();
+        assert!(!base.is_empty() && hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(read_meta(&data, &first.id).unwrap().name, "B", "untouched");
+        assert_eq!(read_meta(&data, &second.id).unwrap().name, "A");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// The opposite case: the directory is there but its `project.json` is unreadable. That may
+    /// be the user's damaged project, and a second directory beside it would leave the real one
+    /// reachable from nowhere — refuse instead (same posture as `resolve_or_create`).
+    #[test]
+    fn create_project_refuses_when_an_unreadable_project_holds_the_id() {
+        let data = tmp_root("damaged");
+        let id = new_project_id("A");
+        std::fs::create_dir_all(project_dir(&data, &id)).unwrap();
+        std::fs::write(project_dir(&data, &id).join(PROJECT_META), b"{ truncated").unwrap();
+        let e = create_project(&data, "A", "").unwrap_err().to_string();
+        assert!(e.contains("PROJECT_META_UNREADABLE"), "got {e}");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn rename_keeps_the_directory_and_every_artifact_path() {
+        let data = tmp_root("rename");
+        let m = create_project(&data, "before", "").unwrap();
+        let ckpt = family_dir(&data, &m.id, "rvc").join("weights").join("x_e1_s10.pth");
+        std::fs::create_dir_all(ckpt.parent().unwrap()).unwrap();
+        std::fs::write(&ckpt, b"w").unwrap();
+
+        update_project(&data, &m.id, "after", "note").unwrap();
+        assert!(ckpt.is_file(), "a rename must never move a checkpoint");
+        assert_eq!(read_meta(&data, &m.id).unwrap().name, "after");
+        assert_eq!(find_by_name(&data, "after").unwrap().id, m.id);
+        assert!(find_by_name(&data, "before").is_none());
+        // renaming onto an existing name is refused; renaming to its OWN name is fine
+        let other = create_project(&data, "taken", "").unwrap();
+        assert!(update_project(&data, &m.id, "taken", "").is_err());
+        assert!(update_project(&data, &m.id, "after", "still fine").is_ok());
+        assert!(update_project(&data, "no_such_id", "x", "").is_err());
+        assert_eq!(read_meta(&data, &other.id).unwrap().name, "taken");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn slot_model_name_comes_from_the_slots_own_run_json() {
+        let data = tmp_root("slotname");
+        let m = create_project(&data, "proj", "").unwrap();
+        let rvc = family_dir(&data, &m.id, "rvc");
+        std::fs::create_dir_all(&rvc).unwrap();
+        // a slot that never completed an import has no run.json — and therefore no artifact
+        // carrying a slug, which is why nothing needs back-filling
+        assert_eq!(slot_model_name(&data, &m.id, "rvc"), None);
+        std::fs::write(rvc.join("run.json"), r#"{"model_name":"旧的名字"}"#).unwrap();
+        assert_eq!(slot_model_name(&data, &m.id, "rvc").as_deref(), Some("旧的名字"));
+        // empty / missing / malformed all read as「没有」rather than as an empty name
+        std::fs::write(rvc.join("run.json"), r#"{"model_name":""}"#).unwrap();
+        assert_eq!(slot_model_name(&data, &m.id, "rvc"), None);
+        std::fs::write(rvc.join("run.json"), b"{{{").unwrap();
+        assert_eq!(slot_model_name(&data, &m.id, "rvc"), None);
+        assert_eq!(slot_model_name(&data, &m.id, "sovits"), None);
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn listing_caches_sizes_and_remembers_a_vanished_project() {
+        let data = tmp_root("listing");
+        let app = app_root(&data);
+        let m = create_project(&data, "P", "").unwrap();
+        std::fs::create_dir_all(family_dir(&data, &m.id, "rvc")).unwrap();
+        std::fs::write(family_dir(&data, &m.id, "rvc").join("G_1.pth"), vec![7u8; 500]).unwrap();
+        std::fs::create_dir_all(dataset_dir(&data, &m.id)).unwrap();
+        std::fs::write(dataset_dir(&data, &m.id).join("000.wav"), vec![1u8; 300]).unwrap();
+
+        let rows = list_project_summaries(&app, &data, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].families, vec!["rvc".to_string()]);
+        assert!(rows[0].has_dataset);
+        assert_eq!(rows[0].sizes.dataset_bytes, 300);
+        assert_eq!(rows[0].sizes.family_bytes.get("rvc"), Some(&500));
+        assert!(rows[0].sizes.total_bytes >= 800);
+        assert!(rows[0].sizes.computed_ms > 0 && !rows[0].missing);
+
+        // the cache lives OUTSIDE the data dir: `training` is a MIGRATED_SUBTREE and
+        // `migrate_data_dir` verifies it file-by-file by byte length, so a file we rewrite on
+        // every listing would abort the user's whole data-dir migration.
+        assert!(app.join(PROJECTS_INDEX).is_file());
+        assert!(!training_root(&data).join(PROJECTS_INDEX).exists());
+        assert!(!training_root(&data).join("projects.json").exists());
+
+        // a cached listing does not re-walk, but still answers with the stored figures
+        std::fs::write(family_dir(&data, &m.id, "rvc").join("G_2.pth"), vec![7u8; 1000]).unwrap();
+        let cached = list_project_summaries(&app, &data, false);
+        assert_eq!(cached[0].sizes.family_bytes.get("rvc"), Some(&500), "cache, not a re-walk");
+        let fresh = list_project_summaries(&app, &data, true);
+        assert_eq!(fresh[0].sizes.family_bytes.get("rvc"), Some(&1500));
+
+        // the directory disappears behind our back → the row survives, named, and barred
+        crate::util::remove_dir_all_robust(&project_dir(&data, &m.id)).unwrap();
+        let gone = list_project_summaries(&app, &data, false);
+        assert_eq!(gone.len(), 1);
+        assert!(gone[0].missing && gone[0].name == "P" && gone[0].families.is_empty());
+        assert_eq!(
+            gone[0].sizes.total_bytes, fresh[0].sizes.total_bytes,
+            "last known size still tells the user how much disk this WAS using"
+        );
+        // …and「移除记录」makes it go away for good
+        forget_project(&app, &data, &m.id);
+        assert!(list_project_summaries(&app, &data, false).is_empty());
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn listing_cache_is_discarded_when_the_data_root_changes() {
+        let data_a = tmp_root("rootA");
+        let data_b = tmp_root("rootB");
+        let app = app_root(&data_a);
+        let m = create_project(&data_a, "only-in-A", "").unwrap();
+        assert_eq!(list_project_summaries(&app, &data_a, true).len(), 1);
+        // Same app, different data root: A's projects must NOT show up as B's ghosts.
+        assert!(list_project_summaries(&app, &data_b, true).is_empty());
+        // and switching back rebuilds from disk rather than from the discarded rows
+        let back = list_project_summaries(&app, &data_a, true);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, m.id);
+        let _ = std::fs::remove_dir_all(data_a);
+        let _ = std::fs::remove_dir_all(data_b);
+    }
+
+    /// The wire shape the TS mirror is written against. Nothing on the frontend can catch a
+    /// rename here — `invoke` is stringly typed — so pin it: the flattened `ProjectSizes` must
+    /// land as top-level camelCase keys, not nested under `sizes`.
+    #[test]
+    fn project_summary_serializes_flat_and_camel_cased() {
+        let data = tmp_root("wire");
+        let app = app_root(&data);
+        create_project(&data, "P", "n").unwrap();
+        let rows = list_project_summaries(&app, &data, true);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        for k in [
+            "id", "name", "note", "createdMs", "updatedMs", "needsAttention", "families",
+            "hasDataset", "missing", "totalBytes", "datasetBytes", "familyBytes", "computedMs",
+        ] {
+            assert!(v.get(k).is_some(), "missing wire key {k}: {v}");
+        }
+        assert!(v.get("sizes").is_none(), "ProjectSizes must be FLATTENED, not nested");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A corrupt or future-version cache must degrade to「重新量一次」, never to a broken page.
+    #[test]
+    fn a_broken_cache_rebuilds_instead_of_failing_the_listing() {
+        let data = tmp_root("badcache");
+        let app = app_root(&data);
+        create_project(&data, "P", "").unwrap();
+        std::fs::write(app.join(PROJECTS_INDEX), b"{ not json").unwrap();
+        assert_eq!(list_project_summaries(&app, &data, false).len(), 1);
+        std::fs::write(app.join(PROJECTS_INDEX), br#"{"version":999,"projects":{"x":{}}}"#).unwrap();
+        let rows = list_project_summaries(&app, &data, false);
+        assert_eq!(rows.len(), 1, "a future version's rows are not ours to interpret");
+        assert!(!rows[0].missing);
         let _ = std::fs::remove_dir_all(data);
     }
 }

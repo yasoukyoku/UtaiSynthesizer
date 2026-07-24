@@ -347,56 +347,15 @@ fn sweep_cache_tree(cache_dir: &Path, protected: &[String]) -> u64 {
     freed
 }
 
-/// Delete ONE training workspace, whole-dir (never leave manifest-less checkpoints — the resume
-/// guards read that as a corrupt state — nor an empty dir, which fakes `exists` in the reuse
-/// dialogs). Kills 续训 + the diff shared pool for that model, BY DESIGN: every dependent flow
-/// re-probes workspace_info/has_dataset_pool live and degrades to "import data first".
-#[tauri::command]
-pub async fn delete_training_workspace(
-    state: State<'_, Arc<AppState>>,
-    slug: String,
-) -> Result<u64, String> {
-    if state.training.is_active() {
-        return Err("TRAINING_ACTIVE".into());
-    }
-    // Block a concurrent audition (its conversion writes into <ws>/audition + holds ORT sessions)
-    // for the whole delete — same interlock start_training takes.
-    let _audition_lock = crate::commands::audition::FlightGuard::acquire("CLEANUP_BUSY")?;
-    // The slug must be a plain directory name produced by slugify (ASCII + `_` + hex) — refuse
-    // anything path-like so a hostile/buggy caller can't escape the training root.
-    if slug.is_empty() || !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return Err("WORKSPACE_MISSING".into());
-    }
-    let ws = data_root(&state).join("training").join(&slug);
-    if !ws.is_dir() {
-        return Err("WORKSPACE_MISSING".into());
-    }
-    // Drop any ORT sessions loaded from this workspace (audition candidate onnx) — Windows file
-    // locks would otherwise fail the remove. Non-destructive: sessions reload on miss.
-    state.inference.engine.unload_paths_with_prefix(&ws);
-    let freed = dir_size(&ws);
-    // RENAME-then-remove: remove_dir_all is not atomic — an interruption (crash / locked file)
-    // could leave exactly the manifest-less-checkpoint partial state the resume guards treat as
-    // corrupt. The same-volume rename IS atomic; a torn removal leaves only an invisible `.del_*`
-    // dir (workspace_path never resolves to it) that get_storage_report finishes off later.
-    let tomb = ws.with_file_name(format!(".del_{slug}_{}", std::process::id()));
-    std::fs::rename(&ws, &tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))?;
-    // A torn layout migration parks the rest of this project under `.mig_<id>` with a marker
-    // file beside it. Leaving them behind would make「删除」a no-op the next boot undoes: the
-    // migration would fold the staging tree back into the id we just deleted.
-    let root = ws.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let staging = root.join(format!(".mig_{slug}"));
-    if staging.is_dir() {
-        let _ = crate::util::remove_dir_all_robust(&staging);
-    }
-    let _ = std::fs::remove_file(root.join(format!(".migrating_{slug}.json")));
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::remove_dir_all(&tomb).map_err(|e| format!("WORKSPACE_DELETE_FAILED: {e}"))
-    })
-    .await
-    .map_err(|e| format!("STORAGE_JOIN: {e}"))??;
-    Ok(freed)
-}
+// `delete_training_workspace` lived here until S76 batch 4. Batch 3b replaced it with
+// `training_delete_project` / `training_delete_slot`, which know about the project layout
+// (slot-granular, shared `dataset/`, GAN pairs kept together, structured report) and are
+// guarded a full tier harder: `ensure_idle_for_package_delete` enumerates every in-process
+// holder (convert included — this one missed it), plus the two cross-process cases a lock
+// cannot express (`other_instance_alive`, `RECLAIM_TOUCHING_TRAINING`). It survived batch 3
+// registered but with ZERO callers: a destructive command reachable by name over IPC and by
+// nothing else. Its one good idea — refuse a path-like id — is now `checked_project_id` in
+// `commands::training`, applied to every id-taking command instead of just this one.
 
 /// Delete all audition caches: every workspace's `audition/` dir + every model-side
 /// `<stem>.audition_spk*.wav`. Pure caches — re-auditioning regenerates them.

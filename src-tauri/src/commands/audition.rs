@@ -245,9 +245,9 @@ fn audition_dir(workspace: &str, stem: &str) -> PathBuf {
 /// the frontend. It has always been passed through verbatim (it comes from the training
 /// snapshot, which the backend itself produced), but S76 turns it into a two-segment
 /// `<project>/<family>` path derived on the UI side — and a derivation bug would have this
-/// code rendering and deleting files anywhere on disk. `delete_training_workspace` has
-/// refused anything path-like since S61 for exactly this reason; the audition family had no
-/// equivalent.
+/// code rendering and deleting files anywhere on disk. The training-archive commands refuse
+/// anything path-like for exactly this reason (`commands::training::checked_project_id`, the
+/// rule S61's `delete_training_workspace` established); the audition family had no equivalent.
 fn check_in_training_root(workspace: &str, state: &AppState) -> Result<(), String> {
     // data root = parent of the models dir (same derivation as commands::training)
     let data_dir = state

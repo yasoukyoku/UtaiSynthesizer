@@ -5,7 +5,11 @@ use tauri::State;
 use crate::models::{ImportOutcome, ModelEntry, ModelType};
 use crate::AppState;
 
-fn parse_voice_type(model_type: &str) -> Option<ModelType> {
+/// THE mapping from the frontend's model-type vocabulary to a registry type. `pub(crate)` so
+/// the training project page can resolve its export ledger's rows against the live registry
+/// through the same table the import/delete path validates with — a second copy would drift
+/// the moment a backend is added.
+pub(crate) fn parse_voice_type(model_type: &str) -> Option<ModelType> {
     match model_type {
         "rvc" => Some(ModelType::Rvc),
         "sovits" => Some(ModelType::SoVits),
