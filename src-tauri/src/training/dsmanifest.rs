@@ -192,6 +192,21 @@ pub struct DatasetFacts {
     pub order_known: bool,
 }
 
+/// The group a UI label refers to — matched by DISPLAY NAME first, then by slug.
+///
+/// ★ The slug fallback is not defensive padding: when no carrier records the names, the view
+/// shows the slug and the UI therefore sends back the slug. Matching on the name alone made
+/// adding files to an EXISTING singer look like creating a NEW one, which the frozen-structure
+/// guard then refused ("我并没有更改歌手结构,只是改了数据量" — user, S78).
+pub fn find_group<'a>(facts: &'a DatasetFacts, label: &str) -> Option<&'a GroupFacts> {
+    let l = label.trim();
+    facts
+        .groups
+        .iter()
+        .find(|g| !g.speaker.name.is_empty() && g.speaker.name == l)
+        .or_else(|| facts.groups.iter().find(|g| g.speaker.slug == l))
+}
+
 /// Read `dataset/` and reconcile it with `dataset.json`.
 ///
 /// `frozen` is each architecture slot's frozen `(slug, name)` list (see
@@ -954,6 +969,50 @@ mod tests {
                 m.id
             );
         }
+    }
+
+    /// ★ Regression (user, S78): on a LEGACY multi-speaker project — names recoverable only from
+    /// a slot's frozen record, never from an annotation —「给已有歌手加文件」was refused with
+    /// `DATASET_SPEAKERS_FROZEN`, i.e. treated as CREATING a singer.
+    ///
+    /// Two causes, both fixed: the writers read the dataset with an EMPTY frozen list (so their
+    /// groups had blank names while the UI's had real ones), and the lookup matched on the name
+    /// only (so a view that shows the slug — because nothing records the name — could never be
+    /// matched by what it sent back).
+    #[test]
+    fn an_existing_singer_is_found_by_its_name_or_by_its_slug() {
+        let tmp = std::env::temp_dir().join(format!("utai_dsfind_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_find";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        for s in ["sayo_d769c729", "teto_41198cd4"] {
+            std::fs::create_dir_all(ds.join(s)).unwrap();
+            std::fs::write(ds.join(s).join("000.wav"), b"x").unwrap();
+        }
+
+        // (a) no annotation, no frozen record: the view shows SLUGS, so the UI sends a slug back
+        let bare = read_facts(&tmp, id, &[]);
+        assert!(bare.groups.iter().all(|g| g.speaker.name.is_empty()));
+        assert!(find_group(&bare, "sayo").is_none(), "there is no such name to find");
+        assert_eq!(
+            find_group(&bare, "sayo_d769c729").map(|g| g.speaker.slug.as_str()),
+            Some("sayo_d769c729"),
+            "…but the slug the view showed must resolve"
+        );
+
+        // (b) the real case: a slot froze the names — the WRITERS must read it the same way the
+        // detail page does, or the name it displayed resolves to nothing
+        let frozen = vec![vec![sp("sayo_d769c729", "sayo"), sp("teto_41198cd4", "teto")]];
+        let seen = read_facts(&tmp, id, &frozen);
+        assert_eq!(seen.groups[0].speaker.name, "sayo");
+        assert_eq!(
+            find_group(&seen, "sayo").map(|g| g.speaker.slug.as_str()),
+            Some("sayo_d769c729"),
+            "adding files to an existing singer must not read as creating one"
+        );
+        assert_eq!(find_group(&seen, "  teto  ").map(|g| g.speaker.slug.as_str()), Some("teto_41198cd4"));
+        assert!(find_group(&seen, "somebody else").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// ★ Regression: the first delete on a LEGACY project (no annotation) wrote

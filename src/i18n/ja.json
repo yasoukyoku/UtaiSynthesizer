@@ -256,7 +256,7 @@
     "projectRetry": "再試行",
     "diffAttachLater": "学習後、実行ステップで付ける SoVITS モデルを選びます。",
     "projectReimportData": "データを再読み込み",
-    "pickSlot": "プロジェクトに戻ってアーキテクチャを選ぶ",
+    "pickSlot": "プロジェクトに戻る",
     "slotRetrainVersion": "{{version}} で再学習",
     "projectDatasetFiles": "{{count}} ファイル",
     "projectDatasetSpeakers": "{{count}} 名の歌手",

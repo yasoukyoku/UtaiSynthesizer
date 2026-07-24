@@ -256,7 +256,7 @@
     "projectRetry": "重试",
     "diffAttachLater": "练完后在运行段选择要附着的 SoVITS 模型。",
     "projectReimportData": "重新导入数据",
-    "pickSlot": "回项目选择训练架构",
+    "pickSlot": "返回项目",
     "slotRetrainVersion": "重训为 {{version}}",
     "projectDatasetFiles": "{{count}} 个文件",
     "projectDatasetSpeakers": "{{count}} 位歌手",

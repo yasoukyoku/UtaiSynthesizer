@@ -553,6 +553,21 @@ fn ensure_safe_dataset_write(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Every architecture slot that froze a speaker order. ONE source for the three consumers
+/// (`get_training_project`, and both dataset writers): they must see the SAME view of who the
+/// project's singers are, or a name the UI got from one will not resolve in the other — which
+/// is exactly how「给已有歌手加文件」came out as「新增歌手」and hit the frozen-structure guard.
+fn frozen_lists(
+    data_dir: &std::path::Path,
+    project_id: &str,
+) -> Vec<Vec<crate::training::dsmanifest::DsSpeaker>> {
+    crate::training::tproject::FAMILIES
+        .iter()
+        .map(|f| crate::training::frozen_speakers(data_dir, project_id, f))
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// The first architecture slot that has FROZEN a speaker set, if any.
 ///
 /// While one exists the speaker structure is immutable: `n_speakers` and the ordered slug list
@@ -593,7 +608,11 @@ pub async fn import_project_dataset(
             return Err(format!("TRAINING_DATA_FILE_MISSING: {f}"));
         }
     }
-    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &[]);
+    let facts = crate::training::dsmanifest::read_facts(
+        &data_dir,
+        &project_id,
+        &frozen_lists(&data_dir, &project_id),
+    );
     let has_flat = facts.entries.iter().any(|e| !e.rel.contains('/'));
     let name = speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let slug = match name {
@@ -601,7 +620,7 @@ pub async fn import_project_dataset(
             if has_flat {
                 return Err("PROJECT_DATASET_SHAPE".into());
             }
-            match facts.groups.iter().find(|g| g.speaker.name == n) {
+            match crate::training::dsmanifest::find_group(&facts, n) {
                 // an existing singer: the slug is already frozen on disk, never re-derive it
                 Some(g) => Some(g.speaker.slug.clone()),
                 None => {
@@ -657,7 +676,11 @@ pub async fn delete_project_dataset_files(
         return Ok(());
     }
     let frozen = frozen_structure_family(&data_dir, &project_id);
-    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &[]);
+    let facts = crate::training::dsmanifest::read_facts(
+        &data_dir,
+        &project_id,
+        &frozen_lists(&data_dir, &project_id),
+    );
     let plan = crate::training::dsmanifest::plan_delete(&facts, &rels);
     if !plan.emptied_speakers.is_empty() {
         if let Some(fam) = frozen.as_deref() {
@@ -701,13 +724,11 @@ pub async fn get_training_project(
     let dataset_dir = crate::training::tproject::dataset_dir(&data_dir, &project_id);
     // Every architecture slot that froze a speaker order — each is a per-SLOT truth, so they are
     // all handed over and `resolve_speakers` decides what the project-level answer may claim.
-    let frozen: Vec<Vec<crate::training::dsmanifest::DsSpeaker>> =
-        crate::training::tproject::FAMILIES
-            .iter()
-            .map(|f| crate::training::frozen_speakers(&data_dir, &project_id, f))
-            .filter(|v| !v.is_empty())
-            .collect();
-    let facts = crate::training::dsmanifest::read_facts(&data_dir, &project_id, &frozen);
+    let facts = crate::training::dsmanifest::read_facts(
+        &data_dir,
+        &project_id,
+        &frozen_lists(&data_dir, &project_id),
+    );
     let entries: Vec<DatasetFileRow> = facts
         .entries
         .iter()

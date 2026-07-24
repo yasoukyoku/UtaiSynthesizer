@@ -256,7 +256,7 @@
     "projectRetry": "Retry",
     "diffAttachLater": "Pick the SoVITS model to attach to in the run step, once training finishes.",
     "projectReimportData": "Re-import data",
-    "pickSlot": "Back to the project to pick an architecture",
+    "pickSlot": "Back to the project",
     "slotRetrainVersion": "Retrain as {{version}}",
     "projectDatasetFiles": "{{count}} file(s)",
     "projectDatasetSpeakers": "{{count}} singer(s)",
