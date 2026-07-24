@@ -581,6 +581,61 @@ fn frozen_structure_family(data_dir: &std::path::Path, project_id: &str) -> Opti
         .map(|f| f.to_string())
 }
 
+/// Everything an EXPORT needs to know about a slot, resolved from disk instead of from a live
+/// run's snapshot.
+///
+/// The run summary derives all three from `TrainingSnapshot` — which exists only while (or just
+/// after) a run is displayed. That is why a finished shallow-diffusion checkpoint became
+/// unreachable the moment anything else was trained: the summary that carried its attach button
+/// was replaced, and nothing else could name the artifacts. Reading them off the slot makes the
+/// project's archive actionable at any time, including after a restart.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlotExportContext {
+    /// The「本次训练名」this slot's artifacts carry — the default name an import suggests.
+    /// Empty when the slot never completed a run (no `run.json`), in which case the caller
+    /// falls back to the project name.
+    pub model_name: String,
+    /// Absolute path of the family slot (the old「workspace」).
+    pub workspace: String,
+    /// The retrieval/cluster companion an import should carry, if one exists on disk. Same
+    /// probe order the run summary uses as its no-summary fallback: RVC keeps its historical
+    /// `total_fea.npy`, SoVITS looks for the cluster assets (built BEFORE training, so they
+    /// exist even for an early stop). Vocoders have none — probing would only find another
+    /// backend's leftovers.
+    pub index_path: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_slot_export_context(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    backend: String,
+) -> Result<SlotExportContext, String> {
+    checked_project_id(&project_id)?;
+    let data_dir = data_root(&state);
+    let family = crate::training::backend_family(&backend);
+    let ws = crate::training::tproject::family_dir(&data_dir, &project_id, family);
+    let index_path = if backend == "vocoder" {
+        None
+    } else if backend == "rvc" {
+        let p = ws.join("total_fea.npy");
+        p.is_file().then(|| p.to_string_lossy().into_owned())
+    } else {
+        ["cluster/kmeans_10000.pt", "cluster/0.index_vectors.npy"]
+            .iter()
+            .map(|rel| ws.join(rel))
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    Ok(SlotExportContext {
+        model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, family)
+            .unwrap_or_default(),
+        workspace: ws.to_string_lossy().into_owned(),
+        index_path,
+    })
+}
+
 /// Import audio INTO the project's shared dataset, independent of any training run.
 ///
 /// Appends — the run-time import replaces wholesale, this one adds. `speaker` is a display name

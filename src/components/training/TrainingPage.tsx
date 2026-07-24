@@ -1454,6 +1454,45 @@ function RunStep() {
   // The scan is the truth, but it is only as fresh as its last run — a ckpt the sidecar just
   // announced would blink out of the list for the moment between the event and the re-scan
   // above, which reads exactly like a checkpoint that failed to save.
+  /** Export context for the slot this segment is showing, read from DISK.
+   *
+   *  The三 things an export needs — the artifact name, the workspace, the index companion —
+   *  used to come only from `TrainingSnapshot`, i.e. only while a run was displayed. That is
+   *  exactly why a finished diffusion checkpoint went unreachable once anything else was
+   *  trained. A live run still wins (its summary knows the真 index it produced); this is what
+   *  answers when there is none. */
+  const [slotCtx, setSlotCtx] = useState<{
+    modelName: string;
+    workspace: string;
+    indexPath: string | null;
+  } | null>(null);
+  useEffect(() => {
+    const pid = route.projectId;
+    if (!pid) {
+      setSlotCtx(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const c = await invoke<{ modelName: string; workspace: string; indexPath: string | null }>(
+          "get_slot_export_context",
+          { projectId: pid, backend: archiveBackend },
+        );
+        if (!cancelled) setSlotCtx(c);
+      } catch {
+        if (!cancelled) setSlotCtx(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [route.projectId, archiveBackend, snapshot.state]);
+
+  /** 产物身份:有 run 用 run 的,没有就用槽里冻结的(再没有就用项目名)。 */
+  const exportName = snapshot.model_name || slotCtx?.modelName || config.modelName;
+  const exportWorkspace = snapshot.workspace || slotCtx?.workspace || "";
+
   const archiveRows = mergeCkptSources(
     snapshot.ckpts,
     projectCkpts,
@@ -2125,10 +2164,10 @@ function RunStep() {
     const tag =
       ckpt.kind === "best"
         ? "best"
-        : snapshot.backend === "rvc"
+        : archiveBackend === "rvc"
           ? `e${ckpt.epoch}`
           : `s${ckpt.step}`;
-    return ckpt.kind === "final" ? snapshot.model_name : `${snapshot.model_name}_${tag}`;
+    return ckpt.kind === "final" ? exportName : `${exportName}_${tag}`;
   };
 
   // fallbacks for runs without a summary (e.g. force-stopped): rvc keeps its
@@ -2137,16 +2176,18 @@ function RunStep() {
   // single-import prompt and the S41 batch import (single source).
   const resolveIndexPath = async (): Promise<string | undefined> => {
     const summaryIndex = (snapshot.summary as { index?: string } | null)?.index;
-    let indexPath = summaryIndex;
-    if (!indexPath && snapshot.backend !== "vocoder") {
+    // the run's own summary first; then what the slot has on disk (S78 — the cold-archive
+    // path); the two probes below stay as the last resort for a run with neither
+    let indexPath = summaryIndex ?? slotCtx?.indexPath ?? undefined;
+    if (!indexPath && archiveBackend !== "vocoder") {
       // vocoders have no index/cluster companion — probing would only find
       // another backend's leftovers (红队 A16 fallback-site sweep)
-      if (snapshot.backend === "rvc") {
-        indexPath = `${snapshot.workspace}\\total_fea.npy`;
+      if (archiveBackend === "rvc") {
+        indexPath = `${exportWorkspace}\\total_fea.npy`;
       } else {
         for (const cand of [
-          `${snapshot.workspace}\\cluster\\kmeans_10000.pt`,
-          `${snapshot.workspace}\\cluster\\0.index_vectors.npy`,
+          `${exportWorkspace}\\cluster\\kmeans_10000.pt`,
+          `${exportWorkspace}\\cluster\\0.index_vectors.npy`,
         ]) {
           if (await exists(cand)) {
             indexPath = cand;
@@ -2190,7 +2231,8 @@ function RunStep() {
       await invoke("import_model", {
         name,
         path: ckpt.path,
-        modelType: snapshot.backend,
+        // the family this segment is acting on — `snapshot.backend` is "" with no run displayed
+        modelType: archiveBackend,
         indexPath,
       });
       await useVoiceModelStore.getState().fetchModels();
