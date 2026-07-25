@@ -1904,16 +1904,21 @@ fn current_dataset_listing(dataset_dir: &Path) -> Vec<DatasetItem> {
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
+        // a `.part` is append_files' stage-then-rename crash remnant, not a dataset file — skip it
+        // so a leftover never makes dataset_matches judge a ready dataset "changed" (审查 S78).
+        if name.ends_with(".part") {
+            continue;
+        }
         match e.metadata() {
             Ok(md) if md.is_file() => probe(name, &e.path()),
             Ok(md) if md.is_dir() => {
                 if let Ok(sub) = std::fs::read_dir(e.path()) {
                     for se in sub.flatten() {
-                        if se.metadata().map(|m| m.is_file()).unwrap_or(false) {
-                            probe(
-                                format!("{}/{}", name, se.file_name().to_string_lossy()),
-                                &se.path(),
-                            );
+                        let sname = se.file_name().to_string_lossy().into_owned();
+                        if !sname.ends_with(".part")
+                            && se.metadata().map(|m| m.is_file()).unwrap_or(false)
+                        {
+                            probe(format!("{}/{}", name, sname), &se.path());
                         }
                     }
                 }
@@ -2191,7 +2196,12 @@ fn run_worker(
     // about the source names, so writing here would REPLACE a good annotation with unknowns.
     // An aborted import never reaches this line — `DatasetSwap`'s Drop has put the previous
     // dataset back by then, and its previous annotation still describes it exactly.
-    if !plan.is_empty() {
+    //
+    // Also skip when dataset_unchanged (审查 S78): the disk is byte-identical to what the
+    // annotation already describes, and ds_files here carry duration_ms:None (run_worker never
+    // probes), so rewriting would only wipe the durations a data-page import recorded. `unchanged`
+    // implies a prior import already wrote the annotation, so nothing is lost by leaving it.
+    if !plan.is_empty() && !dataset_unchanged {
         dsmanifest::record_import(data_dir, &ctx.project_id, ds_speakers, ds_files);
     }
 

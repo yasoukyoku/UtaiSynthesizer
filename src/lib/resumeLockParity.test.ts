@@ -13,7 +13,7 @@
  * every_costly_field_does_not`), so pinning the mirror to the table pins it to the guard.
  */
 import { describe, expect, it } from "vitest";
-import { resumeLockedFields, type LockTier } from "./resumeLock";
+import { resumeLockedFields, resumeWouldBeGuarded, type LockTier } from "./resumeLock";
 
 // 前端 tsconfig 无 @types/node —— 同 ipcParity:用「变量说明符的动态 import」拿 fs
 // (TS 对非字面量说明符不做模块解析,运行时由 node 原生解析)。
@@ -99,5 +99,60 @@ describe("续训锁 Rust ↔ TS 对拍", () => {
       "sampleRate",
       "version",
     ]);
+  });
+});
+
+describe("resumeWouldBeGuarded —— 镜像后端 check_resume_locks(审查 S78)", () => {
+  type SlotLike = {
+    exists: boolean;
+    has_main_progress: boolean;
+    diff_steps: number;
+    version: string;
+    sample_rate: string;
+  };
+  const slot = (over: Partial<SlotLike>): SlotLike => ({
+    exists: true,
+    has_main_progress: false,
+    diff_steps: 0,
+    version: "",
+    sample_rate: "",
+    ...over,
+  });
+
+  it("空槽 / 不存在的槽不锁", () => {
+    expect(resumeWouldBeGuarded("rvc", null)).toBe(false);
+    expect(
+      resumeWouldBeGuarded("rvc", slot({ exists: false, version: "v2", sample_rate: "40k" })),
+    ).toBe(false);
+  });
+
+  it("★预处理阶段停训(manifest 有版本、无 checkpoint)仍锁 —— 否则 UI 让改、后端拒", () => {
+    // 后端守卫看 manifest 的 version/sample_rate,而 manifest 早于 worker 写入;
+    // has_main_progress=false 的窗口若不锁,用户改了 sampleRate 选续训就会被 RESUME_PARAMS_MISMATCH 拒。
+    expect(
+      resumeWouldBeGuarded("rvc", slot({ has_main_progress: false, version: "v2", sample_rate: "40k" })),
+    ).toBe(true);
+    expect(
+      resumeWouldBeGuarded("sovits", slot({ has_main_progress: false, version: "4.1", sample_rate: "44k" })),
+    ).toBe(true);
+  });
+
+  it("已有 checkpoint 的槽当然锁", () => {
+    expect(
+      resumeWouldBeGuarded("rvc", slot({ has_main_progress: true, version: "v2", sample_rate: "40k" })),
+    ).toBe(true);
+  });
+
+  it("有目录但 manifest 无版本(pre-S37 / 只建了 dataset)不锁 —— 与后端 fail-open 一致", () => {
+    expect(resumeWouldBeGuarded("rvc", slot({ exists: true }))).toBe(false);
+  });
+
+  it("sovits_diff 用 diff_steps 而非 manifest 版本(版本由主模型钉)", () => {
+    expect(
+      resumeWouldBeGuarded("sovits_diff", slot({ diff_steps: 0, version: "4.1", sample_rate: "44k" })),
+    ).toBe(false);
+    expect(
+      resumeWouldBeGuarded("sovits_diff", slot({ diff_steps: 12, version: "4.1", sample_rate: "44k" })),
+    ).toBe(true);
   });
 });

@@ -333,7 +333,7 @@
     "saveEverySteps": "Save interval (steps)",
     "keepCkpts": "Checkpoints to keep (G/D)",
     "resumeLocked": "locked for resume",
-    "resumeLockedTip": "This value is baked into the artifacts this architecture already produced, so a resume cannot change it. To change it, choose 重训 (retrain) at start — that clears this architecture's progress.",
+    "resumeLockedTip": "This value is baked into the artifacts this architecture already produced, so a resume cannot change it. To change it, choose Retrain at start — that clears this architecture's progress.",
     "resumeLockedNote": "Fields marked \"locked for resume\" cannot change: they are baked into the existing model, and changing one makes it impossible to continue. To change them, pick retrain at start.",
     "on": "On",
     "off": "Off",

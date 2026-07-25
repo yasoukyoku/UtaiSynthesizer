@@ -226,7 +226,9 @@ pub fn read_facts(data_dir: &Path, id: &str, frozen: &[Vec<DsSpeaker>]) -> Datas
             let name = e.file_name().to_string_lossy().into_owned();
             if e.path().is_dir() {
                 speaker_slugs.push(name);
-            } else {
+            } else if !name.ends_with(".part") {
+                // a `.part` is a crash remnant of append_files' stage-then-rename — never a
+                // dataset file; listing it would show a blank-name ghost row and inflate the count.
                 on_disk.push((name, e.metadata().map(|m| m.len()).unwrap_or(0)));
             }
         }
@@ -234,11 +236,12 @@ pub fn read_facts(data_dir: &Path, id: &str, frozen: &[Vec<DsSpeaker>]) -> Datas
     for s in &speaker_slugs {
         if let Ok(rd) = std::fs::read_dir(dataset_dir.join(s)) {
             for e in rd.flatten() {
-                if e.path().is_file() {
+                let fname = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_file() && !fname.ends_with(".part") {
+                    // forward-slashed on every platform: `rel` is compared against
+                    // `dataset_plan`'s strings and shown in the UI. `.part` skipped (see above).
                     on_disk.push((
-                        // forward-slashed on every platform: `rel` is compared against
-                        // `dataset_plan`'s strings and shown in the UI.
-                        format!("{}/{}", s, e.file_name().to_string_lossy()),
+                        format!("{}/{}", s, fname),
                         e.metadata().map(|m| m.len()).unwrap_or(0),
                     ));
                 }
@@ -330,6 +333,33 @@ pub fn plan_append(
         .collect()
 }
 
+/// Delete stray `<n>.<ext>.part` files anywhere in `dataset/` (flat + one level of speaker
+/// dirs). During `append_files` a `.part` exists only in the microseconds between copy and
+/// rename; only a hard kill in that gap leaves one behind. The readers already skip `.part`, so
+/// it is invisible — this keeps the exact-match region physically clean. Safe to run at the top
+/// of any mutation because the command layer serialises dataset writes (no concurrent append is
+/// mid-stage), so any `.part` present then is a crash remnant, never a live staging file.
+fn sweep_stale_parts(dataset_dir: &Path) {
+    fn sweep_dir(dir: &Path) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".part") && e.path().is_file() {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+    sweep_dir(dataset_dir);
+    if let Ok(rd) = std::fs::read_dir(dataset_dir) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                sweep_dir(&e.path());
+            }
+        }
+    }
+}
+
 /// Copy files into the project's dataset, appending. `slug` selects a speaker subdirectory
 /// (created when new); `None` is the flat dataset.
 ///
@@ -350,6 +380,9 @@ pub fn append_files(
     };
     std::fs::create_dir_all(&dir)
         .map_err(|e| UtaiError::Training(format!("DATASET_WRITE_FAILED: {e}")))?;
+    // Clear any crash-remnant `.part` before staging, so it can't linger in the exact-match region
+    // and next_index never mistakes one for a used slot.
+    sweep_stale_parts(&root);
     let existing: Vec<String> = std::fs::read_dir(&dir)
         .map(|rd| {
             rd.flatten()
@@ -451,6 +484,8 @@ pub fn delete_files(
     drop_empty_speaker_dirs: bool,
 ) -> Result<()> {
     let root = super::tproject::dataset_dir(data_dir, id);
+    // A crash-remnant `.part` would keep a speaker dir from reading empty below; clear them first.
+    sweep_stale_parts(&root);
     for rel in rels {
         // Path-escape guard: these strings come from the frontend. Only the two shapes the import
         // writes are acceptable — one segment, or `<slug>/<name>`.
@@ -849,6 +884,57 @@ mod tests {
         let facts = read_facts(&tmp, id, &[]);
         assert_eq!(facts.files, 3);
         assert_eq!(facts.entries[2].rel, "002.wav");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A hard kill between append_files' copy and rename leaves a `<n>.<ext>.part` inside
+    /// dataset/. It must be invisible to the readers (no ghost row, no inflated count, no false
+    /// "dataset changed") and swept off disk by the next mutation (审查 S78).
+    #[test]
+    fn a_crash_remnant_part_is_invisible_and_swept_on_the_next_import() {
+        let tmp = std::env::temp_dir().join(format!("utai_dspart_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let id = "p_part";
+        let ds = super::super::tproject::dataset_dir(&tmp, id);
+        std::fs::create_dir_all(ds.join("a_1")).unwrap();
+        // one real file at each level + a crash-remnant `.part` beside each (copy done, rename
+        // never ran) — exactly the residue append_files' stage-then-rename leaves on a hard kill.
+        std::fs::write(ds.join("000.wav"), b"real").unwrap();
+        std::fs::write(ds.join("001.wav.part"), b"remnant").unwrap();
+        std::fs::write(ds.join("a_1/000.wav"), b"real").unwrap();
+        std::fs::write(ds.join("a_1/003.flac.part"), b"remnant").unwrap();
+
+        // readers must not surface the `.part`: no ghost row, count excludes it, group count right
+        let facts = read_facts(&tmp, id, &[]);
+        assert_eq!(facts.files, 2, "the two `.part` remnants must not be counted");
+        assert!(
+            facts.entries.iter().all(|e| !e.rel.contains(".part")),
+            "a `.part` must never appear as a dataset entry"
+        );
+        let a1 = facts.groups.iter().find(|g| g.speaker.slug == "a_1").unwrap();
+        assert_eq!(a1.files, 1, "the speaker's `.part` must not inflate its file count");
+
+        // the next import sweeps the crash remnants off disk (both levels)
+        let srcdir = tmp.join("src");
+        std::fs::create_dir_all(&srcdir).unwrap();
+        let s = srcdir.join("new.wav");
+        std::fs::write(&s, b"n").unwrap();
+        let never = |_: &Path| None;
+        append_files(&tmp, id, None, None, &[s.to_string_lossy().into_owned()], &never).unwrap();
+
+        let mut leftover = Vec::new();
+        for lvl in [ds.clone(), ds.join("a_1")] {
+            for e in std::fs::read_dir(&lvl).unwrap().flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.ends_with(".part") {
+                    leftover.push(n);
+                }
+            }
+        }
+        assert!(leftover.is_empty(), "stale `.part` must be swept on import, found: {leftover:?}");
+        // the swept remnant did not steal a slot: the new file lands at 001, after the real 000
+        let facts = read_facts(&tmp, id, &[]);
+        assert!(facts.entries.iter().any(|e| e.rel == "001.wav"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -36,16 +36,30 @@ export function resumeLockedFields(backend: string): { id: string; tier: LockTie
  * Is a start on this slot going to be a RESUME, i.e. are the locked fields actually pinned?
  *
  * A slot with nothing in it pins nothing, and 重训 unpins everything — but the params page is
- * upstream of that choice, so it shows the fields as locked whenever the slot HAS progress and
- * says out loud that 重训 is the way to change them. That matches the backend exactly: the
- * guard runs on `!fresh`.
+ * upstream of that choice, so it shows the fields as locked whenever a resume WOULD be refused
+ * and says out loud that 重训 is the way to change them.
+ *
+ * This must mirror the backend guard `check_resume_locks`, which fires the moment a VERSIONED
+ * `run_manifest.json` exists — that manifest is written BEFORE the worker begins preprocessing
+ * (mod.rs), so a run stopped mid-preprocess (no `G_*.pth` checkpoint yet) still pins
+ * version/sampleRate/… on resume. Keying on a checkpoint (`has_main_progress`) would leave those
+ * fields editable in that window while the backend refuses the resume — the exact "UI lets you
+ * edit it, resume refuses it" trap this module exists to prevent (审查 S78).
+ *
+ * `sovits_diff` is the exception: its version is pinned by the MAIN model (not this manifest), so
+ * the diffusion-specific progress signal (`diff_steps`) is the right gate there.
  */
 export function resumeWouldBeGuarded(
   backend: string,
-  info: { exists: boolean; has_main_progress: boolean; diff_steps: number } | null,
+  info:
+    | { exists: boolean; has_main_progress: boolean; diff_steps: number; version: string; sample_rate: string }
+    | null,
 ): boolean {
   if (!info || !info.exists) return false;
-  return backend === "sovits_diff" ? info.diff_steps > 0 : info.has_main_progress;
+  if (backend === "sovits_diff") return info.diff_steps > 0;
+  // Mirrors check_resume_locks: a non-empty version OR sample_rate in the manifest = a resume is
+  // guarded. They are always written together, so either being set means "a run has started here".
+  return info.version !== "" || info.sample_rate !== "";
 }
 
 /** Which params-page controls a locked field owns. Empty = the field is not editable there

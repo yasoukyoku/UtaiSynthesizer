@@ -1102,17 +1102,42 @@ fn import_vocoder_filterbank(src_path: &Path, onnx_path: &Path, stem: &str) -> R
     Ok(())
 }
 
-/// Remove a half-materialized import's files (审查 HIGH): a partial trio left
-/// on disk would resurrect on the next scan() as a selectable ghost entry —
-/// for vocoders that would even bypass the exporter's ORT self-check verdict.
+/// Remove a half-materialized import's files (审查 HIGH): a partial family left on disk would
+/// resurrect on the next scan() as a selectable ghost entry — for vocoders that would even
+/// bypass the exporter's ORT self-check verdict, and for SoVITS a stray `<stem>.f0.onnx` whose
+/// base `.onnx` we just deleted becomes a phantom auto-f0 model that crashes on run (审查 S78:
+/// the old list only swept .onnx/.json/_mel.npy and left .f0.onnx/.cluster/.diffusion behind).
+/// Delegates to remove_stem_family so "delete every stem artifact" has ONE source of truth.
 fn sweep_partial_import(subdir: &Path, stem: &str) {
-    for name in [
-        format!("{}.onnx", stem),
-        format!("{}.json", stem),
-        format!("{}_mel.npy", stem),
-    ] {
-        std::fs::remove_file(subdir.join(name)).ok();
+    remove_stem_family(subdir, stem);
+}
+
+/// Delete every artifact keyed PURELY on a model's file stem: the onnx main graph, its sidecar
+/// json, the RVC index npy, the SoVITS auto-f0 predictor (`<stem>.f0.onnx`), the cluster and
+/// shallow-diffusion attachment dirs, the vocoder mel filterbank (`<stem>_mel.npy`), the
+/// per-host audition caches, and the avatar variants. ONE source of truth for "which files
+/// belong to a stem" — shared by full delete (remove_entry_files), the re-import REPLACE path,
+/// and the failed-import sweep, so none can drift and leave a resurrecting ghost.
+fn remove_stem_family(dir: &Path, stem: &str) {
+    std::fs::remove_file(dir.join(format!("{}.onnx", stem))).ok();
+    std::fs::remove_file(dir.join(format!("{}.json", stem))).ok();
+    std::fs::remove_file(dir.join(format!("{}.npy", stem))).ok();
+    // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
+    std::fs::remove_file(dir.join(format!("{}.f0.onnx", stem))).ok();
+    std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem))).ok();
+    std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem))).ok();
+    std::fs::remove_file(dir.join(format!("{}_mel.npy", stem))).ok();
+    // S60-4 audition caches (`<stem>.audition_spk{N}.wav`) — one per speaker, unknown count.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let prefix = format!("{}.audition_spk", stem);
+        for f in rd.flatten() {
+            let fname = f.file_name().to_string_lossy().to_string();
+            if fname.starts_with(&prefix) && fname.ends_with(".wav") {
+                std::fs::remove_file(f.path()).ok();
+            }
+        }
     }
+    remove_stem_avatars(dir, stem);
 }
 
 /// Load (or synthesize) the sidecar json next to `onnx_path`, fill required keys (`type`,
@@ -1323,44 +1348,22 @@ fn remove_stem_avatars(dir: &Path, stem: &str) {
     }
 }
 
-/// Remove every on-disk artifact keyed on the entry's stem (onnx + sidecar json + index npy +
-/// f0-predictor onnx + diffusion dir + avatar). Shared by delete and the re-import REPLACE
+/// Remove every on-disk artifact belonging to a model: the full stem family (see
+/// remove_stem_family) plus the RESOLVED index/avatar, which can be non-stem paths (e.g. a
+/// cluster asset chosen as the retrieval index). Shared by delete and the re-import REPLACE
 /// path — one source of truth for "which files belong to a model".
 fn remove_entry_files(entry: &ModelEntry) {
-    std::fs::remove_file(&entry.path).ok();
-    std::fs::remove_file(entry.path.with_extension("json")).ok();
-    std::fs::remove_file(entry.path.with_extension("npy")).ok();
-    // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
-    std::fs::remove_file(entry.path.with_extension("f0.onnx")).ok();
-    // SoVITS cluster/retrieval asset dir (see resolve_cluster_assets) + the S36
-    // shallow-diffusion attachment dir (see resolve_diffusion_assets) + the S40
-    // vocoder mel filterbank (`<stem>_mel.npy` — underscore, NOT an extension:
-    // `<stem>.npy` is the RVC index slot).
+    // entry.path is always the `<stem>.onnx` (every ModelEntry is ModelFormat::Onnx), so the
+    // stem family covers the main graph + json + index npy + f0 predictor + cluster/diffusion
+    // dirs + mel + audition caches + avatars.
     if let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem()) {
-        let stem = stem.to_string_lossy();
-        std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem))).ok();
-        std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem))).ok();
-        std::fs::remove_file(dir.join(format!("{}_mel.npy", stem))).ok();
-        // S60-4 resource-manager audition cache (`<stem>.audition_spk{N}.wav`) — stem family,
-        // so delete AND same-name re-import (REPLACE) both invalidate it automatically.
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            let prefix = format!("{}.audition_spk", stem);
-            for f in rd.flatten() {
-                let fname = f.file_name().to_string_lossy().to_string();
-                if fname.starts_with(&prefix) && fname.ends_with(".wav") {
-                    std::fs::remove_file(f.path()).ok();
-                }
-            }
-        }
+        remove_stem_family(dir, &stem.to_string_lossy());
     }
     if let Some(index) = &entry.index_path {
         std::fs::remove_file(index).ok();
     }
     if let Some(avatar) = &entry.avatar_path {
         std::fs::remove_file(avatar).ok();
-    }
-    if let (Some(dir), Some(stem)) = (entry.path.parent(), entry.path.file_stem()) {
-        remove_stem_avatars(dir, &stem.to_string_lossy());
     }
 }
 
@@ -1449,6 +1452,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("utai_registry_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 审查 S78: a failed SoVITS conversion leaves `<stem>.onnx` + `<stem>.f0.onnx` on disk. The
+    /// old sweep deleted only the main graph, so the orphaned f0 predictor resurrected on the next
+    /// scan() as a selectable phantom model (its base `.onnx` gone, the `.f0` skip no longer
+    /// fires) and crashed on run. sweep_partial_import must take the whole stem family.
+    #[test]
+    fn sweep_partial_import_takes_the_f0_companion_so_no_ghost_survives() {
+        let models_dir = temp_models_dir();
+        let sovits_dir = models_dir.join("sovits");
+        std::fs::create_dir_all(&sovits_dir).unwrap();
+        let stem = "歌姫テスト"; // CJK stem — the exact case that first surfaced the sweep
+        std::fs::write(sovits_dir.join(format!("{}.onnx", stem)), b"main").unwrap();
+        std::fs::write(sovits_dir.join(format!("{}.f0.onnx", stem)), b"f0").unwrap();
+
+        sweep_partial_import(&sovits_dir, stem);
+
+        assert!(!sovits_dir.join(format!("{}.onnx", stem)).exists());
+        assert!(
+            !sovits_dir.join(format!("{}.f0.onnx", stem)).exists(),
+            "the f0 companion must be swept too — otherwise scan() resurrects it as a ghost"
+        );
+        // a fresh registry scan finds no phantom model of any kind
+        let reg = ModelRegistry::new(models_dir.clone());
+        assert!(
+            reg.list().is_empty(),
+            "a swept failed import must leave nothing for scan() to list"
+        );
+        let _ = std::fs::remove_dir_all(&models_dir);
     }
 
     /// #1/#2/#5/#9: CJK display name keys every artifact on ONE sanitized stem; the sidecar json
