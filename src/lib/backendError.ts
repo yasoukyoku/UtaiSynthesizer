@@ -247,6 +247,12 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   MODEL_HOP_SIZE_ZERO: { key: "backend.MODEL_HOP_SIZE_ZERO" },
   MODEL_LEGACY_EXPORT: { key: "backend.MODEL_LEGACY_EXPORT" },
   MODEL_NOT_FOUND: { key: "backend.MODEL_NOT_FOUND" },
+  // S78 batch 7: model export / re-import as a portable .zip package (resource manager). Matched
+  // longest-first, so EXPORT_MODEL_NOT_FOUND wins over MODEL_NOT_FOUND on an export failure.
+  EXPORT_MODEL_NOT_FOUND: { key: "backend.EXPORT_MODEL_NOT_FOUND" },
+  EXPORT_FAILED: { key: "backend.EXPORT_FAILED" },
+  PACKAGE_INVALID: { key: "backend.PACKAGE_INVALID" },
+  PACKAGE_EXTRACT_FAILED: { key: "backend.PACKAGE_EXTRACT_FAILED" },
   // S68d: separation-model delete was a prose error before (i18n rule violation).
   MSST_DELETE_FAILED: { key: "backend.MSST_DELETE_FAILED" },
   NPY_LOAD_FAILED: { key: "backend.NPY_LOAD_FAILED" },

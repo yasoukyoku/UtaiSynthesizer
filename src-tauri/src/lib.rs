@@ -1270,6 +1270,8 @@ pub fn run() {
             commands::audition::audition_active,
             commands::models::list_models,
             commands::models::import_model,
+            commands::models::export_model,
+            commands::models::import_model_package,
             commands::models::delete_model,
             commands::models::check_model_exists,
             commands::models::set_model_avatar,

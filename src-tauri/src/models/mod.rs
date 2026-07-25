@@ -44,6 +44,15 @@ pub struct ImportOutcome {
     pub warnings: Vec<String>,
 }
 
+/// Result of an export: the written package path + the archive member names bundled (for a
+/// "exported N files" toast). All-or-nothing — a missing family file is a hard error, never a
+/// silent partial package that would re-import as a broken model.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportOutcome {
+    pub file: String,
+    pub included: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelType {
     Rvc,
@@ -597,6 +606,122 @@ impl ModelRegistry {
         Ok(ImportOutcome { entry, warnings })
     }
 
+    /// Re-import a model from an EXTRACTED `.zip` package (produced by [`write_model_package`]) —
+    /// the lossless counterpart of export. `pkg_dir` is the temp dir the archive was extracted to;
+    /// `pkg_stem` the stem its family files carry (from the manifest). EVERY portable family member
+    /// is copied verbatim under a fresh local stem (a filename prefix swap `pkg_stem`→`target_stem`),
+    /// so the SoVITS `.cluster/` (incl. kmeans `.centers.npy`) and the avatar — which the ordinary
+    /// direct-`.onnx` import does NOT auto-travel — come across intact. Same REPLACE-on-same-name
+    /// semantics as `import_file`; the caller drops live sessions first.
+    pub fn import_package(
+        &self,
+        name: &str,
+        model_type: ModelType,
+        pkg_dir: &Path,
+        pkg_stem: &str,
+    ) -> Result<ImportOutcome> {
+        self.ensure_scanned();
+        let mut warnings: Vec<String> = Vec::new();
+
+        let subdir = self.models_dir.join(type_subdir(&model_type));
+        std::fs::create_dir_all(&subdir)?;
+
+        // The main graph is mandatory — a package without it is not a model.
+        let src_onnx = pkg_dir.join(format!("{}.onnx", pkg_stem));
+        if !src_onnx.is_file() {
+            return Err(crate::UtaiError::Model(
+                "PACKAGE_INVALID: package has no main .onnx".to_string(),
+            ));
+        }
+
+        // Same-name same-type re-import = REPLACE (removes old files first → the base stem is free
+        // again and unique_stem keeps the filename stable), mirroring import_file.
+        let old_entry = {
+            let mut entries = self.entries.write();
+            entries
+                .iter()
+                .position(|e| {
+                    e.name == name
+                        && std::mem::discriminant(&e.model_type)
+                            == std::mem::discriminant(&model_type)
+                })
+                .map(|pos| entries.remove(pos))
+        };
+        if let Some(old) = old_entry {
+            remove_entry_files(&old);
+            tracing::info!("Package re-import: replaced existing model '{}'", name);
+        }
+
+        let target_stem = unique_stem(&subdir, &sanitize_file_stem(name));
+
+        // Copy the whole portable family, re-keying each filename from pkg_stem to target_stem
+        // (every family filename starts with the stem — the prefix swap covers files AND the two
+        // asset dirs). Guarded: a partial materialization on IO failure would resurrect as a ghost
+        // on the next scan(), so sweep it, exactly like import_file's direct-.onnx branch.
+        let fam = collect_stem_family(pkg_dir, pkg_stem);
+        let materialized: Result<()> = (|| {
+            for p in &fam.portable {
+                let fname = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .ok_or_else(|| crate::UtaiError::Model("PACKAGE_INVALID: bad member name".into()))?;
+                let suffix = fname.strip_prefix(pkg_stem).ok_or_else(|| {
+                    crate::UtaiError::Model("PACKAGE_INVALID: family member not keyed on stem".into())
+                })?;
+                let dest = subdir.join(format!("{}{}", target_stem, suffix));
+                if p.is_dir() {
+                    copy_dir_flat(p, &dest)?;
+                } else {
+                    std::fs::copy(p, &dest)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = materialized {
+            sweep_partial_import(&subdir, &target_stem);
+            return Err(e);
+        }
+
+        // Rewrite name/type/sample_rate into the copied sidecar + normalize auto_f0.file to the
+        // on-disk companion (finalize_sidecar); unknown keys — incl. mel_filters — survive.
+        let onnx_path = subdir.join(format!("{}.onnx", target_stem));
+        let _config = match finalize_sidecar(&onnx_path, name, &model_type, &mut warnings) {
+            Ok(c) => c,
+            Err(e) => {
+                sweep_partial_import(&subdir, &target_stem);
+                return Err(e);
+            }
+        };
+
+        // Vocoder: the mel filterbank was re-keyed to `<target_stem>_mel.npy`, so the sidecar's
+        // `mel_filters` (an "unknown" key finalize preserves verbatim) must name the new file, or
+        // the vocoder loads with a dangling filterbank reference on the collision-renamed path.
+        if matches!(model_type, ModelType::NsfHifigan) {
+            let json_path = subdir.join(format!("{}.json", target_stem));
+            if let Ok(text) = std::fs::read_to_string(&json_path) {
+                if let Ok(serde_json::Value::Object(mut map)) =
+                    serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    map.insert(
+                        "mel_filters".into(),
+                        serde_json::Value::from(format!("{}_mel.npy", target_stem)),
+                    );
+                    if let Ok(s) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+                        let _ = std::fs::write(&json_path, s);
+                    }
+                }
+            }
+        }
+
+        // Rebuild from disk truth (scan is THE disk→entry reconstructor — the package is exactly
+        // the on-disk layout it reads), then surface the fresh entry.
+        self.scan()?;
+        let entry = self.get_by_type(name, &model_type).ok_or_else(|| {
+            crate::UtaiError::Model("PACKAGE_INVALID: model did not materialize".to_string())
+        })?;
+        Ok(ImportOutcome { entry, warnings })
+    }
+
     /// SoVITS shallow-diffusion attachment (S36): the user-picked diffusion `.pt` (+ optional
     /// `.yaml`) is converted (converter/export_diffusion.py) into `<subdir>/<stem>.diffusion/`
     /// (encoder.onnx + denoiser.onnx + diffusion.json). Failures are WARNINGS (model still
@@ -1112,32 +1237,203 @@ fn sweep_partial_import(subdir: &Path, stem: &str) {
     remove_stem_family(subdir, stem);
 }
 
-/// Delete every artifact keyed PURELY on a model's file stem: the onnx main graph, its sidecar
-/// json, the RVC index npy, the SoVITS auto-f0 predictor (`<stem>.f0.onnx`), the cluster and
-/// shallow-diffusion attachment dirs, the vocoder mel filterbank (`<stem>_mel.npy`), the
-/// per-host audition caches, and the avatar variants. ONE source of truth for "which files
-/// belong to a stem" — shared by full delete (remove_entry_files), the re-import REPLACE path,
-/// and the failed-import sweep, so none can drift and leave a resurrecting ghost.
-fn remove_stem_family(dir: &Path, stem: &str) {
-    std::fs::remove_file(dir.join(format!("{}.onnx", stem))).ok();
-    std::fs::remove_file(dir.join(format!("{}.json", stem))).ok();
-    std::fs::remove_file(dir.join(format!("{}.npy", stem))).ok();
+/// Every on-disk artifact keyed on a model's file stem, split by whether it TRAVELS with the
+/// model. `portable` = the files that make the model usable elsewhere (main onnx, sidecar json,
+/// RVC index npy, SoVITS auto-f0 predictor `<stem>.f0.onnx`, the cluster + shallow-diffusion
+/// attachment DIRS, the vocoder mel filterbank `<stem>_mel.npy`, avatar variants). `caches` =
+/// per-host regenerable byproducts (the S60-4 audition wavs) — deleted WITH the model but never
+/// shipped on export. Only EXISTING paths are listed.
+pub(crate) struct StemFamily {
+    pub portable: Vec<PathBuf>,
+    pub caches: Vec<PathBuf>,
+}
+
+/// THE single enumeration of "which files belong to a model stem" — consumed by full delete
+/// (remove_stem_family), the failed-import sweep, model EXPORT (zips `portable`), and package
+/// IMPORT (copies `portable` under a new stem). A future artifact added here updates every
+/// consumer atomically, so none can drift into shipping-but-not-deleting (or the reverse).
+///
+/// Every family filename STARTS with `stem` (`<stem>.onnx`, `<stem>_mel.npy`, `<stem>.avatar.png`,
+/// the `<stem>.cluster`/`<stem>.diffusion` dirs, …), which is what lets package-import re-key a
+/// whole family by a filename prefix swap. Exact-path construction (not a prefix glob) keeps a
+/// sibling model whose stem is a PREFIX of this one (`abc` vs `abcd`) out of the list; the audition
+/// glob is dot-anchored (`<stem>.audition_spk`) for the same reason.
+pub(crate) fn collect_stem_family(dir: &Path, stem: &str) -> StemFamily {
+    let mut portable: Vec<PathBuf> = Vec::new();
+    let mut caches: Vec<PathBuf> = Vec::new();
+    let push_if = |v: &mut Vec<PathBuf>, p: PathBuf| {
+        if p.exists() {
+            v.push(p);
+        }
+    };
+    push_if(&mut portable, dir.join(format!("{}.onnx", stem)));
+    push_if(&mut portable, dir.join(format!("{}.json", stem)));
+    push_if(&mut portable, dir.join(format!("{}.npy", stem)));
     // SoVITS auto-f0 predictor graph (converter writes `<stem>.f0.onnx`, S36).
-    std::fs::remove_file(dir.join(format!("{}.f0.onnx", stem))).ok();
-    std::fs::remove_dir_all(dir.join(format!("{}.cluster", stem))).ok();
-    std::fs::remove_dir_all(dir.join(format!("{}.diffusion", stem))).ok();
-    std::fs::remove_file(dir.join(format!("{}_mel.npy", stem))).ok();
+    push_if(&mut portable, dir.join(format!("{}.f0.onnx", stem)));
+    push_if(&mut portable, dir.join(format!("{}.cluster", stem)));
+    push_if(&mut portable, dir.join(format!("{}.diffusion", stem)));
+    push_if(&mut portable, dir.join(format!("{}_mel.npy", stem)));
+    for ext in AVATAR_EXTS {
+        push_if(&mut portable, dir.join(format!("{}.avatar.{}", stem, ext)));
+    }
     // S60-4 audition caches (`<stem>.audition_spk{N}.wav`) — one per speaker, unknown count.
     if let Ok(rd) = std::fs::read_dir(dir) {
         let prefix = format!("{}.audition_spk", stem);
         for f in rd.flatten() {
             let fname = f.file_name().to_string_lossy().to_string();
             if fname.starts_with(&prefix) && fname.ends_with(".wav") {
-                std::fs::remove_file(f.path()).ok();
+                caches.push(f.path());
             }
         }
     }
-    remove_stem_avatars(dir, stem);
+    StemFamily { portable, caches }
+}
+
+/// Remove one family member: the two asset dirs (`.cluster/`/`.diffusion/`) via remove_dir_all,
+/// every file via remove_file — behaviorally identical to the historical hardcoded list (which
+/// remove_dir_all'd exactly those two paths and remove_file'd the rest; a non-existent path was a
+/// swallowed no-op, and `collect_stem_family` only ever yields existing paths).
+fn remove_family_path(p: &Path) {
+    if p.is_dir() {
+        let _ = std::fs::remove_dir_all(p);
+    } else {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Delete every artifact belonging to a model stem (portable files/dirs + per-host caches). ONE
+/// source of truth via [`collect_stem_family`] — shared by full delete (remove_entry_files), the
+/// re-import REPLACE path, and the failed-import sweep, so none can drift and leave a resurrecting
+/// ghost (审查 S78: an old partial list left `.f0.onnx` behind → phantom auto-f0 model on rescan).
+fn remove_stem_family(dir: &Path, stem: &str) {
+    let fam = collect_stem_family(dir, stem);
+    for p in fam.portable.iter().chain(fam.caches.iter()) {
+        remove_family_path(p);
+    }
+}
+
+/// The package-manifest archive path — self-describes the archive so import knows the registry
+/// type + display name + original stem without guessing from contents. Deliberately in a SUBFOLDER:
+/// a model's own files sit at the archive ROOT as `<stem>.json` etc., and a sanitized stem can never
+/// contain a path separator, so a nested manifest path can never collide with a family member (a
+/// model literally named "utaimodel" would otherwise emit a root `utaimodel.json` == the manifest,
+/// which the zip writer rejects as a duplicate → export failure).
+pub(crate) const PACKAGE_MANIFEST: &str = "utai-package/manifest.json";
+/// The manifest's `format` tag — import rejects a zip whose manifest doesn't carry it.
+pub(crate) const PACKAGE_FORMAT: &str = "utai-model-package";
+
+/// Write a model's full portable stem family into a single `.zip` at `dest` (atomic temp+rename,
+/// streaming so a 100s-MB onnx never loads into RAM). `model_type_str` is the FRONTEND vocabulary
+/// ("rvc"/"sovits"/"vocoder") recorded verbatim in the manifest so package-import's
+/// `parse_voice_type` round-trips it. The two asset dirs (`.cluster/`/`.diffusion/`) are walked
+/// flat into `<dir>/<file>` archive members; per-host audition caches are excluded (StemFamily
+/// splits them out). ANY missing/unreadable family file aborts — never ship a partial package.
+pub(crate) fn write_model_package(
+    entry: &ModelEntry,
+    model_type_str: &str,
+    dest: &Path,
+) -> std::result::Result<ExportOutcome, String> {
+    use std::io::Write;
+
+    let dir = entry
+        .path
+        .parent()
+        .ok_or_else(|| "EXPORT_FAILED: model path has no parent".to_string())?;
+    let stem = entry
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "EXPORT_FAILED: model path has no stem".to_string())?;
+
+    let fam = collect_stem_family(dir, &stem);
+    // (abs source, archive member name) — files under their basename; the two asset dirs walked
+    // one level deep into `<dirname>/<filename>` (copy_dir_flat's contract — attachments are flat).
+    let mut members: Vec<(PathBuf, String)> = Vec::new();
+    for p in &fam.portable {
+        let base = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| "EXPORT_FAILED: family member has no name".to_string())?;
+        if p.is_dir() {
+            let rd = std::fs::read_dir(p)
+                .map_err(|e| format!("EXPORT_FAILED: read {}: {e}", p.display()))?;
+            for f in rd.flatten() {
+                let fp = f.path();
+                if fp.is_file() {
+                    let fname = f.file_name().to_string_lossy().to_string();
+                    members.push((fp, format!("{}/{}", base, fname)));
+                }
+            }
+        } else {
+            members.push((p.clone(), base));
+        }
+    }
+    // A model with no main graph is not exportable (should never happen for a live registry entry).
+    // Test the EXACT main-onnx basename `<stem>.onnx`, not a `.onnx`-but-not-`.f0.onnx` heuristic:
+    // a model legitimately NAMED "song.f0" (scan() supports it, mod.rs) has main graph "song.f0.onnx",
+    // which the heuristic would misread as the auto-f0 companion and false-reject the export.
+    let main_onnx = format!("{}.onnx", stem);
+    if !members.iter().any(|(_, a)| a == &main_onnx) {
+        return Err("EXPORT_FAILED: model has no main .onnx on disk".to_string());
+    }
+
+    let manifest = serde_json::json!({
+        "format": PACKAGE_FORMAT,
+        "version": 1,
+        "app": "UtaiSynthesizer",
+        "name": entry.name,
+        "model_type": model_type_str,
+        "stem": stem,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("EXPORT_FAILED: manifest: {e}"))?;
+
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp_path = PathBuf::from(tmp);
+    // Write the whole archive inside a closure so ANY failure (create/zip/read/finish), not just a
+    // rename failure, removes the partial `<dest>.zip.tmp` instead of stranding it beside the user's
+    // chosen save location. The dest .zip itself only ever appears via the atomic rename after
+    // zip.finish() succeeds, so a failed export never leaves a corrupt .zip.
+    let write_archive = || -> std::result::Result<(), String> {
+        let file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("EXPORT_FAILED: create {}: {e}", tmp_path.display()))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file(PACKAGE_MANIFEST, opts)
+            .map_err(|e| format!("EXPORT_FAILED: zip manifest: {e}"))?;
+        zip.write_all(&manifest_bytes)
+            .map_err(|e| format!("EXPORT_FAILED: write manifest: {e}"))?;
+
+        for (src, arc) in &members {
+            zip.start_file(arc.replace('\\', "/"), opts)
+                .map_err(|e| format!("EXPORT_FAILED: zip {arc}: {e}"))?;
+            let mut f = std::fs::File::open(src)
+                .map_err(|e| format!("EXPORT_FAILED: open {}: {e}", src.display()))?;
+            std::io::copy(&mut f, &mut zip)
+                .map_err(|e| format!("EXPORT_FAILED: write {arc}: {e}"))?;
+        }
+        zip.finish()
+            .map_err(|e| format!("EXPORT_FAILED: finalize archive: {e}"))?;
+        Ok(())
+    };
+    if let Err(e) = write_archive() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&tmp_path, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path); // don't strand a .zip.tmp if the rename fails
+        format!("EXPORT_FAILED: finalize {}: {e}", dest.display())
+    })?;
+    tracing::info!("Exported model '{}' -> {}", entry.name, dest.display());
+    Ok(ExportOutcome {
+        file: dest.to_string_lossy().to_string(),
+        included: members.into_iter().map(|(_, a)| a).collect(),
+    })
 }
 
 /// Load (or synthesize) the sidecar json next to `onnx_path`, fill required keys (`type`,
@@ -1556,6 +1852,231 @@ mod tests {
         assert!(reg3.get("A/B").is_some());
         assert!(reg3.get("A\\B").is_some());
 
+        std::fs::remove_dir_all(&models_dir).ok();
+    }
+
+    /// Minimal zip extract for the round-trip tests (mirrors commands::models::extract_package,
+    /// which lives in the command layer and isn't reachable here).
+    fn extract_zip_for_test(zip_path: &Path, dest: &Path) -> PathBuf {
+        std::fs::create_dir_all(dest).unwrap();
+        let file = std::fs::File::open(zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            if name.ends_with('/') {
+                continue;
+            }
+            let rel = entry.enclosed_name().unwrap().to_path_buf();
+            let outpath = dest.join(rel);
+            if let Some(p) = outpath.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            let mut out = std::fs::File::create(&outpath).unwrap();
+            std::io::copy(&mut entry, &mut out).unwrap();
+        }
+        dest.to_path_buf()
+    }
+
+    /// THE single stem-family enumeration: portable artifacts vs per-host caches, EXISTING paths
+    /// only, and prefix-safe (a sibling model whose stem is a prefix must not be swept in).
+    #[test]
+    fn collect_stem_family_partitions_portable_and_caches() {
+        let dir = temp_models_dir();
+        let stem = "たろう";
+        for suffix in [".onnx", ".json", ".npy", ".f0.onnx", "_mel.npy", ".avatar.png"] {
+            std::fs::write(dir.join(format!("{}{}", stem, suffix)), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join(format!("{}.cluster", stem))).unwrap();
+        std::fs::create_dir_all(dir.join(format!("{}.diffusion", stem))).unwrap();
+        std::fs::write(dir.join(format!("{}.audition_spk0.wav", stem)), b"x").unwrap();
+        std::fs::write(dir.join(format!("{}.audition_spk1.wav", stem)), b"x").unwrap();
+        // a sibling whose stem has THIS stem as a prefix — must not be captured
+        std::fs::write(dir.join(format!("{}z.onnx", stem)), b"x").unwrap();
+
+        let fam = collect_stem_family(&dir, stem);
+        let names: std::collections::HashSet<String> = fam
+            .portable
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(fam.portable.len(), 8, "onnx+json+npy+f0+cluster+diffusion+mel+avatar");
+        assert!(names.contains(&format!("{}.cluster", stem)));
+        assert!(names.contains(&format!("{}.diffusion", stem)));
+        assert!(!names.contains(&format!("{}z.onnx", stem)), "prefix sibling must not be captured");
+        assert_eq!(fam.caches.len(), 2, "the two audition wavs go to caches, never portable");
+        assert!(fam.caches.iter().all(|p| p.to_string_lossy().contains("audition_spk")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Export → package-import is LOSSLESS for a SoVITS model — the crux the feature exists for.
+    /// The ordinary direct-`.onnx` import drops `.cluster/` kmeans centers + the avatar; the
+    /// package path must carry BOTH. Also proves audition caches never ship, an arbitrary sidecar
+    /// key survives, and a CJK name round-trips.
+    #[test]
+    fn export_import_package_roundtrip_is_lossless() {
+        let models_dir = temp_models_dir();
+        let sovits_dir = models_dir.join("sovits");
+        std::fs::create_dir_all(&sovits_dir).unwrap();
+        let name = "歌姫・テスト v2";
+        let stem = name; // sanitize keeps CJK / spaces intact here
+        std::fs::write(sovits_dir.join(format!("{}.onnx", stem)), b"main-graph-bytes").unwrap();
+        std::fs::write(
+            sovits_dir.join(format!("{}.json", stem)),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": name, "type": "sovits", "sample_rate": 44100,
+                "speech_encoder": "vec768l12",
+                "spk_mix": { "available": true, "n_spk": 2 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // cluster holds BOTH a retrieval index AND kmeans centers — the exact lossy pair
+        let cluster = sovits_dir.join(format!("{}.cluster", stem));
+        std::fs::create_dir_all(&cluster).unwrap();
+        std::fs::write(cluster.join("0.index_vectors.npy"), b"retrieval").unwrap();
+        std::fs::write(cluster.join("0.centers.npy"), b"kmeans").unwrap();
+        std::fs::write(sovits_dir.join(format!("{}.avatar.png", stem)), b"face").unwrap();
+        // a per-host cache that must NOT be exported
+        std::fs::write(sovits_dir.join(format!("{}.audition_spk0.wav", stem)), b"aud").unwrap();
+
+        let reg = ModelRegistry::new(models_dir.clone());
+        let entry = reg.get_by_type(name, &ModelType::SoVits).expect("scan should find it");
+        assert!(entry.index_path.as_ref().unwrap().to_string_lossy().contains(".cluster"));
+
+        // EXPORT
+        let zip_path = models_dir.join("pkg.zip");
+        let out = write_model_package(&entry, "sovits", &zip_path).unwrap();
+        assert!(zip_path.exists());
+        assert!(!out.included.iter().any(|a| a.contains("audition_spk")), "audition caches must not ship");
+        assert!(out.included.iter().any(|a| a.ends_with("0.index_vectors.npy")));
+        assert!(out.included.iter().any(|a| a.ends_with("0.centers.npy")), "kmeans centers must ship");
+        assert!(out.included.iter().any(|a| a.ends_with(".avatar.png")));
+
+        // EXTRACT the real zip bytes
+        let pkg_dir = extract_zip_for_test(&zip_path, &models_dir.join("extracted"));
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pkg_dir.join("utai-package").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["stem"], stem);
+        assert_eq!(manifest["model_type"], "sovits");
+        assert_eq!(manifest["format"], "utai-model-package");
+
+        // IMPORT into a FRESH registry (another install)
+        let dest_models = temp_models_dir();
+        let reg2 = ModelRegistry::new(dest_models.clone());
+        let imported = reg2
+            .import_package(name, ModelType::SoVits, &pkg_dir, manifest["stem"].as_str().unwrap())
+            .unwrap();
+        let e = imported.entry;
+        let s2 = e.path.file_stem().unwrap().to_string_lossy().to_string();
+        let d = dest_models.join("sovits");
+        assert!(e.path.exists());
+        assert!(d.join(format!("{}.json", s2)).exists());
+        // BOTH cluster assets survived re-import — what a bare .onnx re-import would have dropped.
+        assert!(d.join(format!("{}.cluster", s2)).join("0.index_vectors.npy").exists());
+        assert!(
+            d.join(format!("{}.cluster", s2)).join("0.centers.npy").exists(),
+            "kmeans centers must survive re-import (the whole point)"
+        );
+        assert!(d.join(format!("{}.avatar.png", s2)).exists());
+        assert_eq!(e.avatar_path.as_deref(), Some(d.join(format!("{}.avatar.png", s2)).as_path()));
+        assert_eq!(e.config.name.as_deref(), Some(name));
+        assert_eq!(
+            e.config.extra.get("spk_mix").and_then(|v| v.get("n_spk")).and_then(|v| v.as_u64()),
+            Some(2),
+            "an arbitrary sidecar key must round-trip"
+        );
+        let reg3 = ModelRegistry::new(dest_models.clone());
+        assert_eq!(reg3.list_by_type(&ModelType::SoVits).len(), 1);
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&dest_models).ok();
+    }
+
+    /// Vocoder round-trip: the mel filterbank `_mel.npy` travels and the sidecar's `mel_filters`
+    /// names the (re-keyed) file — a dangling reference would make the imported vocoder unusable.
+    #[test]
+    fn export_import_package_vocoder_carries_mel_filterbank() {
+        let models_dir = temp_models_dir();
+        let voc_dir = models_dir.join("nsf_hifigan");
+        std::fs::create_dir_all(&voc_dir).unwrap();
+        let name = "こえ";
+        std::fs::write(voc_dir.join(format!("{}.onnx", name)), b"voc").unwrap();
+        std::fs::write(
+            voc_dir.join(format!("{}.json", name)),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": name, "type": "nsf_hifigan", "sample_rate": 44100, "hop_size": 512,
+                "num_mels": 128, "n_fft": 2048, "win_size": 2048, "fmin": 40, "fmax": 16000,
+                "mel_filters": format!("{}_mel.npy", name),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(voc_dir.join(format!("{}_mel.npy", name)), b"melbank").unwrap();
+
+        let reg = ModelRegistry::new(models_dir.clone());
+        let entry = reg.get_by_type(name, &ModelType::NsfHifigan).unwrap();
+        let zip_path = models_dir.join("voc.zip");
+        write_model_package(&entry, "vocoder", &zip_path).unwrap();
+
+        let pkg = extract_zip_for_test(&zip_path, &models_dir.join("ex"));
+        let dest = temp_models_dir();
+        let reg2 = ModelRegistry::new(dest.clone());
+        let imp = reg2.import_package(name, ModelType::NsfHifigan, &pkg, name).unwrap();
+        let s2 = imp.entry.path.file_stem().unwrap().to_string_lossy().to_string();
+        let d = dest.join("nsf_hifigan");
+        assert!(d.join(format!("{}_mel.npy", s2)).exists(), "mel filterbank must travel");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join(format!("{}.json", s2))).unwrap()).unwrap();
+        assert_eq!(
+            json["mel_filters"], format!("{}_mel.npy", s2),
+            "mel_filters must name the re-keyed filterbank"
+        );
+
+        std::fs::remove_dir_all(&models_dir).ok();
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// Adversarial-review fixes: (A) a model legitimately NAMED "song.f0" (main graph song.f0.onnx)
+    /// must export — the old `.onnx && !.f0.onnx` guard false-rejected it; (G) a model named
+    /// "utaimodel" (sidecar utaimodel.json) must export — a root manifest of that name would have
+    /// been a duplicate-entry failure, so the manifest lives in a subfolder. Both round-trip.
+    #[test]
+    fn export_handles_f0_named_and_manifest_colliding_names() {
+        let models_dir = temp_models_dir();
+        let rvc_dir = models_dir.join("rvc");
+        std::fs::create_dir_all(&rvc_dir).unwrap();
+        for n in ["song.f0", "utaimodel"] {
+            std::fs::write(rvc_dir.join(format!("{}.onnx", n)), b"g").unwrap();
+            std::fs::write(
+                rvc_dir.join(format!("{}.json", n)),
+                serde_json::to_vec(&serde_json::json!({"name": n, "type": "rvc", "sample_rate": 40000})).unwrap(),
+            )
+            .unwrap();
+        }
+        let reg = ModelRegistry::new(models_dir.clone());
+        for n in ["song.f0", "utaimodel"] {
+            let entry = reg
+                .get_by_type(n, &ModelType::Rvc)
+                .unwrap_or_else(|| panic!("scan should list {n}"));
+            let safe = n.replace('.', "_");
+            let zip = models_dir.join(format!("{}.zip", safe));
+            let out = write_model_package(&entry, "rvc", &zip)
+                .unwrap_or_else(|e| panic!("export {n} must not fail: {e}"));
+            assert!(
+                out.included.iter().any(|a| a == &format!("{}.onnx", n)),
+                "{n}: main onnx must be bundled"
+            );
+            let pkg = extract_zip_for_test(&zip, &models_dir.join(format!("ex_{}", safe)));
+            let dest = temp_models_dir();
+            let reg2 = ModelRegistry::new(dest.clone());
+            let imp = reg2.import_package(n, ModelType::Rvc, &pkg, n).unwrap();
+            assert_eq!(imp.entry.name, n);
+            assert!(imp.entry.path.exists());
+            std::fs::remove_dir_all(&dest).ok();
+        }
         std::fs::remove_dir_all(&models_dir).ok();
     }
 

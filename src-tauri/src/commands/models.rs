@@ -281,3 +281,173 @@ pub async fn check_model_exists(
         None => Ok(false),
     }
 }
+
+/// S78 batch 7: bundle one installed voice model's full portable stem family into a single `.zip`
+/// at `dest_path` (user-picked save dialog) so it can be carried to another install and re-imported
+/// losslessly via `import_model_package`. Read-only w.r.t. the model, but guarded against a live
+/// audition/conversion that could be writing the family under us (same guard class as delete).
+/// The zip write runs off the async executor (spawn_blocking) — models are 10s–100s of MB.
+#[tauri::command]
+pub async fn export_model(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    model_type: String,
+    dest_path: String,
+) -> Result<crate::models::ExportOutcome, String> {
+    let mt = parse_voice_type(&model_type)
+        .ok_or_else(|| "EXPORT_FAILED: unsupported model type".to_string())?;
+    // An in-flight audition writes `<stem>.audition_spk{N}.wav` beside the model; a conversion may
+    // be rewriting the family — either would make the zip a moving target.
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MODEL_BUSY_AUDITION".to_string());
+    }
+    // Hold the app-wide convert slot for the WHOLE export (returns CONVERT_BUSY if a conversion is
+    // running). This is the SAME interlock import/attach/import_package take, so a concurrent
+    // same-model delete or REPLACE (both check task_active("convert")) can't remove a family member
+    // between collect_stem_family and the per-file open, which would spuriously fail the export
+    // (审查 S78: export was read-only but LOCKLESS — one-directional interlock gap). TaskGuard is
+    // Send, so it is held across the spawn_blocking await below.
+    let _convert = state.acquire_convert_slot()?;
+    let entry = state
+        .models
+        .get_by_type(&name, &mt)
+        .ok_or_else(|| "EXPORT_MODEL_NOT_FOUND".to_string())?;
+    let dest = PathBuf::from(&dest_path);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::models::write_model_package(&entry, &model_type, &dest)
+    })
+    .await
+    .map_err(|e| format!("EXPORT_FAILED: task join: {e}"))?
+}
+
+/// S78 batch 7: re-import a `.zip` model package produced by `export_model` — the lossless
+/// counterpart. Extracts (zip-slip guarded) to a temp dir under the cache, reads the manifest for
+/// the display name / registry type / stem, then materializes the whole family under a fresh local
+/// stem (registry `import_package`). Same interlocks as `import_model` (convert slot + audition
+/// guard + drop live sessions before a same-name REPLACE). NOT a training-slot source, so it writes
+/// no export ledger row.
+#[tauri::command]
+pub async fn import_model_package(
+    state: State<'_, Arc<AppState>>,
+    package_path: String,
+) -> Result<ImportOutcome, String> {
+    if crate::commands::audition::AUDITION_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("MODEL_BUSY_AUDITION".to_string());
+    }
+    let _convert = state.acquire_convert_slot()?;
+
+    let (work, name, mt_str, stem) = extract_package(&state.cache_dir, &package_path)?;
+    let mt = match parse_voice_type(&mt_str) {
+        Some(m) => m,
+        None => {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err("PACKAGE_INVALID: unsupported model type".to_string());
+        }
+    };
+
+    // A same-name re-import REPLACES on disk — drop any live inference session first (it would keep
+    // serving the stale ONNX and, for vocoders cached by path, hold a Windows file lock).
+    state.inference.unload_voice(&name);
+    if matches!(mt, ModelType::NsfHifigan) {
+        if let Some(old) = state.models.get_by_type(&name, &mt) {
+            state.inference.unload_model_file(&old.path);
+        }
+    }
+
+    let outcome = state
+        .models
+        .import_package(&name, mt, &work, &stem)
+        .map_err(|e| {
+            tracing::error!("Package import failed: {}", e);
+            e.to_string()
+        });
+    let _ = std::fs::remove_dir_all(&work); // the temp extraction is regenerable
+    outcome
+}
+
+/// Extract a `.zip` model package to a fresh temp dir under the cache and read its manifest.
+/// Returns (extracted_dir, display_name, model_type_str, pkg_stem). Zip-slip guarded via
+/// `enclosed_name()` (the `.usp` opener's discipline). The caller owns cleanup of the returned dir.
+fn extract_package(
+    cache_dir: &Path,
+    package_path: &str,
+) -> Result<(PathBuf, String, String, String), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(package_path)
+        .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: open {package_path}: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("PACKAGE_INVALID: not a zip: {e}"))?;
+
+    // Unique staging dir per invocation so a repeat/concurrent import can't collide.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let work = cache_dir.join("model_import").join(format!("pkg_{nonce}"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)
+        .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: create work dir: {e}"))?;
+
+    let mut extract = || -> Result<String, String> {
+        let mut manifest_text = String::new();
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: entry {i}: {e}"))?;
+            let name = entry.name().to_string();
+            if name == crate::models::PACKAGE_MANIFEST {
+                entry
+                    .read_to_string(&mut manifest_text)
+                    .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: read manifest: {e}"))?;
+                continue;
+            }
+            if name.ends_with('/') {
+                continue; // directory marker
+            }
+            // enclosed_name() rejects zip-slip (`..` traversal) — only extract contained paths.
+            let rel = match entry.enclosed_name() {
+                Some(p) => p.to_path_buf(),
+                None => return Err(format!("PACKAGE_INVALID: unsafe archive entry: {name}")),
+            };
+            let outpath = work.join(rel);
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: create {}: {e}", parent.display()))?;
+            }
+            let mut out = std::fs::File::create(&outpath)
+                .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: create {}: {e}", outpath.display()))?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|e| format!("PACKAGE_EXTRACT_FAILED: extract {}: {e}", outpath.display()))?;
+        }
+        Ok(manifest_text)
+    };
+    let manifest_text = match extract() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(e);
+        }
+    };
+
+    let fail = |work: &Path, msg: &str| -> String {
+        let _ = std::fs::remove_dir_all(work);
+        msg.to_string()
+    };
+    if manifest_text.is_empty() {
+        return Err(fail(&work, "PACKAGE_INVALID: no utaimodel.json manifest"));
+    }
+    let manifest: serde_json::Value = match serde_json::from_str(&manifest_text) {
+        Ok(v) => v,
+        Err(e) => return Err(fail(&work, &format!("PACKAGE_INVALID: manifest JSON: {e}"))),
+    };
+    if manifest.get("format").and_then(|v| v.as_str()) != Some(crate::models::PACKAGE_FORMAT) {
+        return Err(fail(&work, "PACKAGE_INVALID: not a Utai model package"));
+    }
+    let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mt_str = manifest.get("model_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let stem = manifest.get("stem").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if name.is_empty() || mt_str.is_empty() || stem.is_empty() {
+        return Err(fail(&work, "PACKAGE_INVALID: manifest missing name/model_type/stem"));
+    }
+    Ok((work, name, mt_str, stem))
+}

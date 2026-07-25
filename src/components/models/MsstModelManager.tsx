@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
@@ -777,6 +777,37 @@ function VoiceModelsTab({ lang }: { lang: string }) {
     setDeleteConfirm(null);
   }, [deleteModel, voiceType, lang]);
 
+  // S78 batch 7: import a `.zip` model package (the Export counterpart). Rust figures the registry
+  // type from the manifest, so afterwards we jump to that tab so the imported model is visible.
+  const handleImportPackage = useCallback(async () => {
+    const file = await open({
+      title: t18({ zh: "导入模型包 (.zip)", en: "Import model package (.zip)", ja: "モデルパッケージを取り込み (.zip)" }, lang),
+      filters: [{ name: "Utai Model / Zip", extensions: ["zip"] }],
+    });
+    if (!file || typeof file !== "string") return;
+    try {
+      const outcome = await invoke<{ entry: VoiceModelEntry; warnings: string[] }>(
+        "import_model_package",
+        { packagePath: file },
+      );
+      await fetchModels();
+      const vt = MODEL_TYPE_TO_VOICE[outcome.entry.model_type];
+      if (vt) setVoiceType(vt);
+      useAppStore.getState().showToast(
+        t18({ zh: `已导入 · ${outcome.entry.name}`, en: `Imported · ${outcome.entry.name}`, ja: `取り込み完了 · ${outcome.entry.name}` }, lang),
+        "success",
+      );
+      // Non-fatal import warnings ride the same mapper the ImportDialog uses.
+      (outcome.warnings ?? []).forEach((w) =>
+        useAppStore.getState().showToast(backendErrorMessage(w) ?? w, "info"),
+      );
+    } catch (e) {
+      // Busy/interlock rejections (CONVERT_BUSY / MODEL_BUSY_AUDITION) are transient → info, not error
+      // (the app-wide isBusyError funnel discipline; matches VoiceAuditionButton).
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+    }
+  }, [lang, fetchModels]);
+
   return (
     <div className="rm-voice-tab">
       {voiceError && <div className="msst-error" onClick={clearError}>{backendErrorMessage(voiceError) ?? voiceError}</div>}
@@ -787,6 +818,17 @@ function VoiceModelsTab({ lang }: { lang: string }) {
           {t18({ zh: "声码器", en: "Vocoder", ja: "ボコーダー" }, lang)}
         </button>
         <div className="rm-filter-spacer" />
+        <button
+          className="rm-import-top-btn"
+          onClick={handleImportPackage}
+          title={t18({
+            zh: "从 .zip 模型包导入（本软件「导出」生成的包，含索引/聚类/扩散/头像）",
+            en: "Import from a .zip model package (produced by Export — includes index / cluster / diffusion / avatar)",
+            ja: "「書き出し」で作成した .zip モデルパッケージから取り込み（インデックス/クラスタ/拡散/アバターを含む）",
+          }, lang)}
+        >
+          {t18({ zh: "导入模型包", en: "Import Package", ja: "パッケージ取り込み" }, lang)}
+        </button>
         <button className="primary rm-import-top-btn" onClick={() => setShowImport(true)}>
           + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
         </button>
@@ -963,6 +1005,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                 {!isVocoder && <VoiceRangeRow m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} />}
               </div>
               {!isVocoder && <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} />}
+              <VoiceExportButton m={m} voiceType={voiceType} lang={lang} />
               {deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">
                   <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
@@ -985,6 +1028,82 @@ function VoiceModelsTab({ lang }: { lang: string }) {
         />
       )}
     </div>
+  );
+}
+
+// Rust `ModelType` enum variant name (list_models payload) → the frontend voice-tab vocabulary.
+// Used to jump to the imported model's tab after a package import.
+const MODEL_TYPE_TO_VOICE: Record<string, VoiceType | undefined> = {
+  Rvc: "rvc",
+  SoVits: "sovits",
+  NsfHifigan: "vocoder",
+};
+
+/// Windows-safe default filename for the export save dialog (keeps CJK, strips illegal chars +
+/// trailing dots/spaces) — mirrors Rust sanitize_file_stem's intent so the suggested name never
+/// contains a character the OS save dialog rejects. Empty → "model".
+function sanitizeExportName(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = name.replace(/[<>:"/\\|?* -]/g, "").replace(/[. ]+$/, "").trim();
+  return cleaned || "model";
+}
+
+// S78 batch 7: export ONE installed voice model as a portable `.zip` package (re-importable via
+// "Import Package"). Per-row so each has its own busy state; guards against a live test/audition
+// (Rust re-checks) before opening the native save dialog.
+function VoiceExportButton({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: VoiceType; lang: string }) {
+  const [busy, setBusy] = useState(false);
+  const onExport = useCallback(async () => {
+    if (busy) return;
+    const vm = useVoiceModelStore.getState();
+    if (vm.rangeTesting[m.name] !== undefined || vm.auditionState?.name === m.name) {
+      useAppStore.getState().showToast(
+        t18({ zh: "该模型正在测试/试听中，稍后再导出", en: "This model is being tested/auditioned — export later", ja: "このモデルはテスト/試聴中です。後で書き出してください" }, lang),
+        "info",
+      );
+      return;
+    }
+    const dest = await save({
+      title: t18({ zh: "导出模型为 .zip", en: "Export model as .zip", ja: "モデルを .zip に書き出し" }, lang),
+      defaultPath: `${sanitizeExportName(m.name)}.zip`,
+      filters: [{ name: "Zip", extensions: ["zip"] }],
+    });
+    if (!dest || typeof dest !== "string") return;
+    setBusy(true);
+    try {
+      await invoke("export_model", { name: m.name, modelType: voiceType, destPath: dest });
+      useAppStore.getState().showToast(
+        t18({ zh: `已导出 · ${m.name}`, en: `Exported · ${m.name}`, ja: `書き出し完了 · ${m.name}` }, lang),
+        "success",
+      );
+    } catch (e) {
+      useAppStore.getState().showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, m.name, voiceType, lang]);
+
+  return (
+    <button
+      className="model-export-btn"
+      disabled={busy}
+      onClick={onExport}
+      title={voiceType === "vocoder"
+        ? t18({
+            zh: "导出为 .zip 模型包，可在其它设备导入",
+            en: "Export as a .zip package to import on another device",
+            ja: "他のデバイスで取り込める .zip パッケージに書き出し",
+          }, lang)
+        : t18({
+            zh: "导出为 .zip 模型包，可在其它设备导入（含索引/聚类/扩散/头像）",
+            en: "Export as a .zip package to import on another device (includes index / cluster / diffusion / avatar)",
+            ja: "他のデバイスで取り込める .zip パッケージに書き出し（インデックス/クラスタ/拡散/アバターを含む）",
+          }, lang)}
+    >
+      {busy
+        ? t18({ zh: "导出中…", en: "Exporting…", ja: "書き出し中…" }, lang)
+        : t18({ zh: "导出", en: "Export", ja: "書き出し" }, lang)}
+    </button>
   );
 }
 
