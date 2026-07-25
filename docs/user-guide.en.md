@@ -859,108 +859,158 @@ Using the extraction feature without it installed shows "GAME engine not install
 
 ## 8. Training
 
-This chapter covers training your own voice models inside the app: install the two prerequisites, meet the five training targets, then follow the four-step wizard through a training run.
+This chapter covers training your own voice models inside the app: no Python to install, no command line — import dry vocals and you can train an RVC / SoVITS voice model, a shallow-diffusion module or a fine-tuned vocoder, then audition and import the result with one click.
 
-![Training page, step 1: the five training-target cards](images/training.png)
+![Training page: project detail — the shared data set, the per-architecture training slots, exported models](images/training.png)
 
-Click the "Training" button at the title bar's right to enter the full-screen training page (titled "Model Training"; click the button again or the back button at the top right to return to the arrangement). Training runs entirely in the background — closing the training page mid-run, even minimizing the window to the tray, never interrupts it.
+Click the "Training" button at the title bar's right to enter the full-screen training page (titled "Model Training"); click the X at the top right (it reads "Back to arrangement" on hover) or the "Training" button again to return to the arrangement. **Training runs entirely in the background** — closing the training page mid-run, even minimizing the window to the tray, never interrupts it.
 
 ### 8.1 Prerequisites
 
+Before you start, have two things ready (miss either and the app stops you at "Start training" and offers the download — no manual hunting):
+
 1. **A training runtime**: training runs in an embedded Python environment, so first download a runtime pack under "Settings" → "Training Runtime (embedded Python)" — pick by GPU: NVIDIA (RTX 20 series and up) / AMD (experimental) / Intel (experimental), or the universal CPU pack. Clicking "Start training" without one shows the "Training Runtime Not Installed" dialog — click "Open Settings" and install as instructed. Details in 9.8.
-2. **Training base models**: under "Settings" → "Model Assets", download the matching pack — "RVC training base models", "SoVITS training base models", "SoVITS 4.0-v2 training base models" or "Vocoder finetune base model" (whichever family you train). If bases are missing, "Start training" first opens a dialog listing the missing files with a "Download now" button; no manual hunting.
+2. **Training base models**: under "Settings" → "Model Assets", download the matching pack — "RVC training base models", "SoVITS training base models", "SoVITS 4.0-v2 training base models" or "Vocoder finetune base model" (whichever family you train). If bases are missing, "Start training" first opens a dialog listing the missing files with a "Download now" button.
 
 > Caution: the vocoder fine-tune's base weights are licensed CC BY-NC-SA 4.0 and are **not bundled with the app** — they form their own asset pack, its row carries a license badge (click it for the upstream release page and attribution), and they download only after you confirm, together with their NOTICE attribution files. A vocoder fine-tuned from them inherits the same license (non-commercial).
 
-### 8.2 The five training targets: which one?
+### 8.2 What a project is (read this first)
 
-Step one, "Target", shows five cards:
+The training page is **project-based**. One sentence gets you going:
+
+> **One project = one data set + one training slot per architecture.**
+
+That is: you first create a "project" (say, one per singer), import dry vocals into its data set, then pick one or more architectures to train inside it — RVC, SoVITS, a vocoder… they all **share the one data set**, each keeping its progress in its own "slot". The name can be changed later, and the checkpoints you train and the models you export all hang under this project. So when you come back weeks later to resume, one glance tells you what data you used and which architectures you trained.
+
+Across the top are four step tabs: "Project", "Data", "Parameters", "Run". The first tab has two faces — outside a project it is the **project list**, inside one it is that project's **detail page**; the other three light up progressively once a project is picked and this run's name is set.
+
+**The typical flow**: project list → (create / open a project) → (import data on the detail page, click "Start training" on an architecture slot) → Data → Parameters → Run → audition and import to library once done.
+
+### 8.3 The project list
+
+Outside any project, the "Project" tab shows a wall of cards for every training project.
+
+- **New project**: click "New project" at the top right and name it (CJK is fine, e.g. `歌姫テスト`; up to 80 characters, and not a duplicate of an existing project). It opens straight into the detail page.
+- **Search / sort**: the search box filters by name or note; "Recent / Name / Size" on the right switches the sort.
+- **Each card** shows the project name, size on disk ("—" until it has been measured), the architectures it already holds (e.g. `rvc`, `sovits`), and "Data X" or "No data imported", with the note below if there is one. Click a card to enter its detail.
+- **Rename**: hover a card and a `✎` slides out on the right; click it to rename. Renaming **changes the display name only** — the directory on disk, existing checkpoint file names and already-exported models are all unaffected.
+- A project whose **directory is no longer on disk** (an external drive unplugged, say) is greyed out and cannot be entered; its slide-out button becomes `✕` "Remove entry", which only drops the row from the list and **deletes no files**.
+- An old project the upgrade **could not classify** by architecture is listed but not yet enterable (its contents are kept untouched, flagged "Needs attention"); the next launch usually folds it in automatically.
+
+> Deleting a project (or an architecture's whole archive) is not here — it lives in "Settings" → "Storage usage & cleanup", which gives each project its own row and three actions of different radius (clean snapshots / delete archives / delete project), each with a size preview and confirmation. See 9.7.
+
+### 8.4 The project detail page
+
+Inside a project, the detail page has three blocks, top to bottom:
+
+**Data set** — shows "N file(s) · size · N singer(s)".
+- A multi-singer project shows "Singers" below, listing each singer's **id + name + file count**. The id is the singer's number in the model (emb_g, from 0); it is printed only when the order was actually recorded on disk, otherwise "Order not recorded" appears.
+- Click "Data files" to expand the full file list — each row can ▶ preview and remove.
+- To **add files** straight into the data set, use `＋ Add audio files` next to the data-set title (when the set has no singers) or a singer row's `＋` (multi-singer); the files land immediately. To swap the whole set, click "Import data / Re-import data" for the data page (see 8.5).
+
+**Architectures** — one slot card per architecture (see 8.6). A slot that has begun training shows its resume state, an "Archives X" entry (into the archive center, see 8.9) and this run's name; a multi-singer slot also shows the "Singer order" it froze.
+
+**Exported models** — the models exported from this project (name / type / source checkpoint). One already deleted from the resource manager is greyed "Deleted" but still listed (an export is history, not current state).
+
+### 8.5 Managing the data
+
+Click "Import data" on the detail page (or an architecture slot's start, if there is no data yet) to reach the data page.
+
+**Data requirements**: import **clean dry vocals** (no accompaniment, no reverb). The page's own words: "Import clean vocal recordings. If separation/denoising is needed, process them on the track area first, export, then import here." — you can wash your material with this app's own separation/denoise workflows, export, and feed it to training. There is no hard duration limit; the cleaner, the better.
+
+- **Add**: click "Add audio files" (the same 9 formats as audio import) or just **drag files anywhere onto the training page** (a "Drop here to add as training data" hint appears). **Imports land on disk immediately** — the files are written into the project data set at once, and this page shows exactly what is on disk (no more "staged until training starts" table).
+- Each file row can ▶ preview (draggable progress bar) and remove. Slicing, silence removal, pitch/feature extraction and the rest of preprocessing run automatically at training time — not your problem.
+- **Deleting**: once the project has trained anything, deleting a file asks once first (changing the data means each sibling slot redoes slicing and feature extraction on its next resume — slow, but no progress is lost); with nothing trained yet it just deletes.
+
+**Multi-singer co-training (RVC and every SoVITS architecture, including 4.0-v2; shallow diffusion and the vocoder are singer-less)**: click "+ Add singer" to add a singer card — name the singer first (the name decides its voice slot in the model, and rebuilding this data set later means retyping it EXACTLY), then choose its audio. Each singer gets a card whose header **id is the emb_g row** (from 0). A multi-singer model can blend these voices by ratio via "Voice blend" in the cover nodes. Dragged files land on the singer card under the cursor.
+
+> Key point: **the number and order of singers decide the model's voice slots — one out of place and every voice is mapped to the wrong id**. So: ① once any architecture has trained on the current singer structure, that structure is **frozen** — adding or removing a **singer** is then refused (it would make that model impossible to resume), but adding or removing **files** for an existing singer is unrestricted (the cost is a re-extraction on the next resume). ② Multi-singer data never trained and with no import record is listed by name, flagged "Order not recorded"; whatever order you set on the first run becomes its order from then on.
+
+With enough data, click "Next" for the parameters page; if you arrived straight from the detail page's "Import data" (no architecture chosen yet), the button here is "Back to the project" — go back and click an architecture slot to continue.
+
+### 8.6 The six training targets: which one?
+
+Under "Architectures" on the project detail page, each architecture is a slot card. Clicking a card's "Start training / Continue training" selects it and prompts for a "Name for this training run" (defaults to the project name, editable; later resumes keep using it). There are six targets:
 
 | Target | What it is | When to pick it |
 | --- | --- | --- |
-| **RVC** | A fast timbre-conversion model | You want a usable voice model quickly; inference speed first |
-| **SoVITS 4.1** | The quality-tier voice model (loudness embedding, 768-dim features) | The default choice for quality |
-| **SoVITS 4.0** | The 4.0-ecosystem-compatible version (256-dim features) | When you need interop with the 4.0 ecosystem |
-| **"Shallow diffusion"** | Not a standalone model — a quality-enhancing module trained for an **installed SoVITS model** | Your SoVITS main model is done and you want more quality |
-| **"Vocoder fine-tune"** | Fine-tunes a singer-specific NSF-HiFiGAN vocoder, improving SoVITS diffusion/enhancer output | Advanced SoVITS play; useless for RVC |
+| **RVC** | A fast timbre-conversion model (single speaker · v2/48k recommended) | You want a usable voice quickly; inference speed first |
+| **SoVITS 4.1** | The quality-tier voice model (vec768, volume embedding) | The default choice for quality |
+| **SoVITS 4.0** | The 4.0-ecosystem-compatible version (vec256) | When you need interop with the 4.0 ecosystem |
+| **SoVITS 4.0-v2** | The VISinger2 architecture (vec256 · experimental) | To try the newer architecture |
+| **Shallow diffusion** | Not a standalone model — a quality-enhancing module trained for a SoVITS model | Your SoVITS main model is done and you want more quality |
+| **Vocoder fine-tune** | Fine-tune a singer's own NSF-HiFiGAN vocoder | Advanced SoVITS play; useless for RVC |
 
-The first three take a "Model name" under the card (a duplicate warns "A model with this name already exists" — importing under the same name after training replaces the old model). "Shallow diffusion" instead picks its host from the "Target SoVITS model" dropdown, version following automatically (with no SoVITS model installed you cannot proceed — import or train a main model first).
+A few things to know:
 
-> Tip: shallow diffusion **shares its data pool** with the same-named main training — if the same-named workspace already holds complete imported data, you can import nothing and jump straight to the parameters page. SoVITS 4.0 has no public diffusion base model, so it trains from scratch; raising the total steps is recommended (the page says so).
+- **SoVITS 4.1 and 4.0 share one "SoVITS" slot**: while the slot is empty the card offers two buttons, "Train 4.1" and "Train 4.0"; once trained the version is fixed (a resume cannot change it), and switching versions means "Retrain".
+- **Shallow diffusion is the 5th card, but its progress lives inside the SoVITS slot** (`.../diffusion/`). Its version follows this project's SoVITS slot automatically (vec768 = 4.1 / vec256 = 4.0); only when the project has no SoVITS yet do you pick 4.1/4.0 (attached to 4.0 there is no public diffusion base model, so it trains from scratch — raise the total steps). Once trained, **pick an installed SoVITS model in the run step to "attach" it to** (see 8.9), not limited to this project.
+- **Vocoder fine-tune** produces a vocoder shared by all of that singer's SoVITS models, improving shallow-diffusion / enhancer quality.
+- **Continue training / Retrain**: on a slot already started, the primary button is "Continue training" (resume from the latest checkpoint); "Retrain" beside it wipes this architecture and starts over (the data set, the other architectures and anything already exported are unaffected; the real wipe is confirmed once more at "Start training"). SoVITS's "Retrain" lets you pick "Retrain as 4.1 / 4.0".
 
-### 8.3 Step 2: Data
+### 8.7 Parameters
 
-**Data requirements**: import **clean dry vocals** (vocal recordings with no accompaniment, no reverb). The page itself says: "Import clean vocal recordings. If separation/denoising is needed, process them on the track area first, export, then import here." — in other words, you can wash your material with this very app's separation/denoise workflows, export, and feed it to training. There is no hard duration limit; the page live-counts files and total duration. The cleaner the data, the better the result.
-
-Steps:
-
-1. Click "Add audio files" (the same 9 formats as audio import), or just **drag files anywhere onto the training page** (a "Drop here to add as training data" hint appears).
-2. Each file row offers ▶ preview (with a draggable progress bar) and X to remove. Duplicate files dedupe automatically.
-3. Once every singer has at least one file, "Next" unlocks.
-
-> Caution: files are copied into the training workspace only when you click "Start training" — do not move or delete the originals before that.
-
-**Multi-singer co-training** (RVC and SoVITS only): click "+ Add singer" to add singer cards, each with its own "Singer name" and file list. A multi-singer model can blend those voices by ratio via "Voice blend" in the cover nodes. Dragged files land on the singer card under the cursor. With multiple singers, every singer needs files and a unique non-empty name. RVC caps at 109 singers.
-
-Slicing, silence removal, pitch/feature extraction and the rest of preprocessing are fully automatic — not your problem.
-
-### 8.4 Step 3: Parameters
-
-Each target has its own form (they never interfere). The common items:
+Each architecture has its own form; they never interfere. The common items:
 
 - **RVC**: "Version" (v2/v1), "Sample rate" (48k/40k/32k), "Total epochs" (default 200), "Batch size" (default 6), "GPU".
-- **SoVITS**: "Total epochs" (default 1000), "Batch size" (default 6), "Save interval (steps)" (default 800), "Checkpoints to keep (G/D)" (default 3).
-- **Shallow diffusion**: "Total steps" (default 100000), "Batch size" (default 48), "Save interval (steps)", "Diffusion depth (k_step_max)" (full diffusion/100/200/300).
-- **Vocoder**: "Total steps" (default 2000 — the official guidance says ~2000 steps completes a small-dataset fine-tune), "Batch size" (default 8; hint: ~6–8 for 12GB VRAM, ~10 for 16GB), "Save interval (steps)".
+- **SoVITS (4.1 / 4.0 / 4.0-v2)**: "Total epochs" (default 1000), "Batch size" (default 6), "Save interval (steps)" (default 800), "Checkpoints to keep (G/D)" (default 3), "GPU".
+- **Shallow diffusion**: "Total steps" (default 100000), "Batch size" (default 48), "Save interval (steps)", "Diffusion depth (k_step_max)" (full diffusion / 100 / 200 / 300). The version row is fixed to "follows the selected model".
+- **Vocoder**: "Total steps" (default 2000 — official guidance is ~2000 steps for a small dataset), "Batch size" (default 8; hint: ~6–8 for 12GB VRAM, ~10 for 16GB), "Save interval (steps)".
 
-The "Fixed" line under the form lists the non-negotiable presets (f0 = RMVPE, features = ContentVec, and so on).
+The "Fixed" line under the form lists the non-negotiable presets (f0 = RMVPE, features = ContentVec, the sample rate, when the retrieval/cluster assets are built, and so on).
 
 **"Advanced"** (click to expand) — the items worth knowing:
 
-- "Augmentation copies" (0–3, default 0=off, experimental): generates N pitch-shifted copies of every slice within ±3 semitones (PSOLA, timbre preserved), with automatic quality checks that drop bad copies; data inflates to about (1+N)× — budget by total steps, not epochs. Shallow diffusion's copy count follows the main training's setting and cannot be changed independently.
+- "Augmentation copies" (0–3, default 0=off, experimental): generates N PSOLA pitch-shifted copies of every slice within ±3 semitones (formant-preserving, timbre unchanged), with a per-slice quality gate that drops bad copies; data inflates to about (1+N)× — budget by **total steps**, not epochs. When shallow diffusion is attached to an existing main model, the count follows the main training and cannot be changed on its own.
 - "Half precision (fp16)": saves VRAM and speeds things up (RVC default on, SoVITS default off).
-- "Loudness normalize (peak to 0dB — upstream default, lossy)": default **off**, deliberately different from upstream — turn it on manually if you want the upstream behavior.
+- "Loudness normalize (peak to 0dB — upstream default, lossy)": default **off**, deliberately different from upstream — turn it on manually for the upstream behavior.
 - "Volume embedding (inference loudness follows the input)": SoVITS 4.1 only, default on.
 - "Train kmeans cluster centers instead of retrieval": SoVITS's alternative timbre asset.
 - "Keep only the latest big checkpoint (saves disk)" and "Export a small model at each save": RVC's disk-management items, both default on.
 - "Freeze the MPD discriminator (official tip for short fine-tunes)" and "Crop frames": vocoder-fine-tune only (crop hint: 32 ≈ 16GB VRAM, 48 ≈ 24GB).
 - "Force CPU training (very slow)": the last resort with no usable GPU.
 
-### 8.5 Step 4: Run
+> **Resume locks**: if this architecture has already trained, the fields that cannot change once set (RVC's "Version" and "Sample rate", SoVITS 4.1's "Volume embedding", shallow diffusion's "Diffusion depth") are shown **read-only in place**, tagged "locked for resume" — they are baked into the existing model, and changing one would make it impossible to continue. To change them, pick "Retrain" at "Start training" (which clears this architecture); arriving via "Retrain" from the detail page unlocks them automatically.
 
-Click "Start training". Dialogs you might see:
+The "GPU" dropdown lists the cards usable for training; unusable ones are listed with the reason (missing runtime pack, etc.) and become selectable once the pack is installed. When none is usable you can tick "Force CPU training" to continue.
 
-- A resumable same-named workspace exists with identical parameters → choose "Resume" (continue from last progress) or "Retrain" (wipe the workspace, start over).
-- The workspace exists but parameters differ → an item-by-item diff dialog; only "Retrain" or cancel are offered (to resume, change the form back).
-- A same-named model is installed but has no workspace → an overwrite warning: importing under the same name after training will replace the existing model.
-- Shallow diffusion has its own "Retrain (diffusion only)": wipes only the diffusion progress, keeping the main model's checkpoints and caches.
+### 8.8 Run
+
+Click "Start training". Depending on the situation a dialog may appear first:
+
+- **A prerequisite is missing**: no runtime → the "Training Runtime Not Installed" dialog (install it, 9.8); missing base models → a list of the missing files plus "Download now".
+- **A resumable same-named workspace** → choose "Resume" (continue from last progress) or "Retrain" (wipe and start over). Arriving via "Retrain" leads with the "Retrain" button.
+- **A same-named model is installed but has no workspace** → it explains "training starts from scratch; importing under the same name afterwards replaces the existing model" (and calls out a version mismatch if the registry knows one).
+- **Shallow diffusion**: when a same-named workspace exists a dedicated dialog appears — "Resume" continues from the existing diffusion steps, "Retrain (diffusion only)" clears only the diffusion progress and keeps the main-model checkpoints and preprocessing caches.
 
 Once through, "Training started" appears. Starting a run frees the VRAM held by inference (training needs it) and clears the previous run's audition cache; while training runs you cannot drop new files onto the data page (new data only affects the next run).
 
 **What you'll see during training**:
 
-1. **The preprocessing checklist**: a stage list with ✓ ticks, progress bars and the current file name — "Importing data" → "Slicing & silence removal" → ("Data augmentation" → "Augmentation QC") → "Pitch extraction" / "Feature extraction" → "Building retrieval/cluster assets" → "Writing filelist" → "Loading model" (stages differ slightly per target). Fully automatic — just watch it walk. When shallow diffusion reuses the shared pool, the import stage ticks instantly.
-2. **The training monitor**: "step" current/total, epochs (step-based diffusion/vocoder runs show no epochs), "elapsed", "ETA", and the current best checkpoint's metric — RVC/SoVITS show "best(mel)" (a mel-loss estimate), diffusion/vocoder show "Best (val)" (true validation loss). Below is the **loss curve** chart: click legend chips to show/hide curves; a green dashed line marks the best point; "Export curve PNG" saves an image ("Loss curve saved"). Close the training page and come back — the curve rebuilds fully from the backend history.
+1. **The preprocessing checklist**: a stage list with ✓ ticks, progress bars and the current file name — "Importing data" → "Slicing & silence removal" → ("Data augmentation" → "Augmentation QC") → "Pitch extraction" / "Feature extraction" → "Building retrieval/cluster assets" → "Writing filelist" → "Loading model" (stages differ slightly per architecture). Fully automatic. When shallow diffusion reuses the shared pool, the import stage ticks instantly.
+2. **The training monitor**: "step" current/total, epochs (step-based diffusion/vocoder runs show none), "elapsed", "ETA", and the current best checkpoint's metric — RVC/SoVITS show "best(mel)" (a mel-loss estimate), diffusion/vocoder show "Best (val)" (true validation loss). Below is the **loss curve** chart; "Export curve PNG" saves an image ("Loss curve saved"). Close the training page and come back — the curve rebuilds fully from the backend history.
 
 **If training dies abnormally** (out of VRAM, killed by antivirus, broken environment, …), the page shows a red "Training terminated abnormally" card: a localized explanation, the trainer's last ~30 lines of output, and a pointer to the workspace's `train.log` ("See train.log in the training workspace for details"). Fix the cause and "Start training" again — the workspace can usually resume.
 
-**Stopping**: "Stop training" is graceful — it finishes the current step, saves, then winds down (RVC/SoVITS additionally write a "stop-save" checkpoint, so the stopping point itself is keepable); if you can't wait, "Force terminate" (double confirmation; current progress is not saved, the last checkpoint survives). A stopped run can "Resume" as long as its workspace exists.
+**Stopping**: "Stop training" is graceful — it finishes the current step, saves, then winds down (RVC/SoVITS additionally write a "stop-save" checkpoint, so the stopping point is keepable); if you can't wait, "Force terminate" (double confirmation; current progress is not saved, the last checkpoint survives). A stopped run can resume as long as its workspace exists.
 
 **Tray protection**: clicking the window X while training shows the "Close UtaiSynthesizer" dialog — choose "Minimize to Tray" to keep training in the background (restore via left-click on the tray icon or "Show Window"); insisting on "Quit" raises the "Tasks In Progress" dialog listing "Model training" and friends, and only "Quit Anyway" really quits (training progress falls back to the last checkpoint).
 
-### 8.6 After training finishes
+### 8.9 After training, auditioning, and the archive center
 
-On completion (or stop) a summary card and the **checkpoint list** appear; each row has:
+When a run completes (or stops), the run page shows a summary card and **this run's checkpoint list**; each row has:
 
-- **A keep checkbox**: all checked by default.
+- **A keep checkbox**: all checked by default ("Select all / Deselect all" is below).
 - A type tag: "periodic" "best" "final" "stop-save".
 - **The automatic range-test result**: every RVC/SoVITS checkpoint automatically runs the C2–C7 scale test (about 1–2 s each), and the row directly shows the comfort zone in note names (e.g. F#2–A#4) — incidentally a direct read on how far each checkpoint has converged.
-- **"Audition"**: renders the built-in 10-second dry clip through the real inference chain (first click passes through "Converting…" and "Rendering…"). Multi-singer runs get an "Audition speaker" dropdown. Vocoder runs get an extra "Built-in default vocoder (reference)" row for A/B comparison.
-- **"Import to library"**: single-row import with a rename box (pre-filled suggestions: the final checkpoint uses the model name, the best gets a `_best` suffix, periodic ones get an epoch/step suffix); retrieval indexes/cluster assets pack up and travel automatically. Or check several rows and click "Import selected (N)" for a batch (a confirmation previews the naming; existing same-named models get replaced — use the per-row button when you want custom names). Imported models are immediately available in the resource manager / vocal tracks / workflows.
-- Rows pruned off disk by the checkpoint-retention policy grey out as "Pruned by the archive policy" and can no longer be auditioned/imported.
-- Shallow-diffusion rows **"attach"** instead: first pick the host SoVITS model in the "Attach to model" dropdown (only installed models with matching feature dimensions are listed; the same-named one is pre-selected; auditioning a diffusion checkpoint also requires the attach target first), audition until satisfied, then click "Attach" — it becomes the host model's diffusion attachment (success message: "Diffusion model attached to "××"").
+- **"Audition"**: renders the built-in 10-second dry clip through the real inference chain (first click passes through "Converting…" and "Rendering…"). Multi-singer runs get an "Audition speaker" dropdown; vocoder runs get an extra "Built-in default vocoder (reference)" row for A/B comparison.
+- **"Import to library"**: single-row import with a rename box (pre-filled suggestions: the final checkpoint uses the model name, the best gets a `_best` suffix, periodic ones an epoch/step suffix); retrieval indexes/cluster assets pack up and travel automatically. Or check several rows and click "Import selected (N)" for a batch (a confirmation previews the naming; existing same-named models are replaced — use the per-row button for custom names). Imported models are immediately available in the resource manager / vocal tracks / workflows.
+- **Shallow-diffusion rows "attach" instead**: pick the host SoVITS model in the "Attach to model" dropdown (only installed models with matching feature dimensions are listed; the same-named one is pre-selected; auditioning a diffusion checkpoint also needs the attach target first), audition until satisfied, then click "Attach" — it becomes the host model's diffusion attachment (success: "Diffusion model attached to "××"").
+- Rows pruned off disk by the retention policy grey out as "Pruned by the archive policy" and can no longer be auditioned/imported.
 
 After listening and importing, "Clear results" clears this page's display (the workspace and checkpoint files survive and resuming is unaffected, but this list with its audition/import buttons will not come back — finish importing before clearing).
+
+**The archive center** — you need not wait for a run to just finish: at any time, clicking an architecture slot's "Archives X" on the project detail page opens that architecture's **standalone archive page**, listing **every archive it has on disk**. Each row offers the action its **file type** supports: a deployable finished checkpoint (snapshot / best / final) can be auditioned and "Import to library"; a diffusion checkpoint can be auditioned and "attached" to an installed SoVITS; base models, resumable checkpoints and the like are display-only. The archive kind tags are "base", "resumable", "snapshot", "best", "Final", "torn half" and "just saved". A multi-singer model can pick a singer to audition here too. — It is precisely this page that keeps a shallow-diffusion checkpoint reachable after the summary page is dismissed, so it never becomes a dead end.
 
 ---
 
