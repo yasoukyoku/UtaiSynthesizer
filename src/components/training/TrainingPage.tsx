@@ -1465,6 +1465,20 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   const [auditionWavs, setAuditionWavs] = useState<Record<string, string>>({});
   const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
   const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
+  // 批 6: ONE predicate for「这个候选会被批量导入」= 在盘上 AND keep-勾选(默认勾)。行内勾选框、
+  // 导入过滤、批量按钮的计数/启用全读它,不再四处内联 `!missingCkpts[c.path] && (…?? true)`。
+  const ckptChosen = (c: (typeof snapshot.ckpts)[number]) =>
+    !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true);
+  const importableCkpts = snapshot.ckpts.filter((c) => !missingCkpts[c.path]);
+  const allCkptsChosen = importableCkpts.length > 0 && importableCkpts.every(ckptChosen);
+  const toggleAllCkpts = () => {
+    const next = !allCkptsChosen;
+    setSelectedCkpts((s) => {
+      const m = { ...s };
+      for (const c of importableCkpts) m[c.path] = next;
+      return m;
+    });
+  };
   const [importingAll, setImportingAll] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(archiveOnly);
   const projectCkpts = useTrainingStore((s) => s.projectCkpts);
@@ -2291,9 +2305,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
    *  can share its step/epoch with a periodic — REPLACE would silently eat
    *  one). Prefers the audition-converted onnx when present (instant copy). */
   const importSelected = async () => {
-    const chosen = snapshot.ckpts.filter(
-      (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
-    );
+    const chosen = snapshot.ckpts.filter(ckptChosen);
     if (chosen.length === 0 || importingAll) return;
     const names = new Map<string, string>();
     const used = new Set<string>();
@@ -2761,7 +2773,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
                       type="checkbox"
                       className="training-ckpt-check"
                       disabled={gone}
-                      checked={!gone && (selectedCkpts[c.path] ?? true)}
+                      checked={ckptChosen(c)}
                       onChange={(e) =>
                         setSelectedCkpts((s) => ({ ...s, [c.path]: e.target.checked }))
                       }
@@ -2835,25 +2847,28 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
             })}
           </div>
           {/* S41 batch keep — default all-checked (user spec) */}
-          {!isDiff && snapshot.ckpts.some((c) => !missingCkpts[c.path]) && (
+          {!isDiff && importableCkpts.length > 0 && (
             <div className="training-audition-bar">
+              <button
+                className="training-btn small"
+                disabled={importingAll || auditionBusy}
+                onClick={toggleAllCkpts}
+              >
+                {allCkptsChosen ? t("training.deselectAllCkpts") : t("training.selectAllCkpts")}
+              </button>
               <button
                 className="training-btn primary small"
                 disabled={
                   importingAll ||
                   auditionBusy ||
-                  snapshot.ckpts.filter(
-                    (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
-                  ).length === 0
+                  snapshot.ckpts.filter(ckptChosen).length === 0
                 }
                 onClick={() => void importSelected()}
               >
                 {importingAll
                   ? t("training.importingSelected")
                   : t("training.importSelected", {
-                      count: snapshot.ckpts.filter(
-                        (c) => !missingCkpts[c.path] && (selectedCkpts[c.path] ?? true),
-                      ).length,
+                      count: snapshot.ckpts.filter(ckptChosen).length,
                     })}
               </button>
             </div>

@@ -388,6 +388,8 @@
     "importSelectedTitle": "Import selected checkpoints",
     "importSelectedBody": "The selected checkpoints will be imported with these names (existing same-name models are replaced; use the per-row Import button to customize a name):",
     "importSelected": "Import selected ({{count}})",
+    "selectAllCkpts": "Select all",
+    "deselectAllCkpts": "Deselect all",
     "importingSelected": "Importing…",
     "importSelectedDone": "Imported {{count}} checkpoints",
     "importSelectedPartial": "Imported {{ok}}/{{total}}, these failed:",

@@ -388,6 +388,8 @@
     "importSelectedTitle": "選択した保存を一括インポート",
     "importSelectedBody": "以下の名前でインポートします（同名が存在する場合は置き換え。名前を変更する場合は各行の「インポート」を使用）：",
     "importSelected": "選択をインポート ({{count}})",
+    "selectAllCkpts": "すべて選択",
+    "deselectAllCkpts": "すべて解除",
     "importingSelected": "インポート中…",
     "importSelectedDone": "{{count}} 件をインポートしました",
     "importSelectedPartial": "インポート {{ok}}/{{total}} 完了、以下は失敗：",

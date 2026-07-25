@@ -388,6 +388,8 @@
     "importSelectedTitle": "批量导入所选存档",
     "importSelectedBody": "将按以下命名导入所选存档（同名已存在时会替换；需自定义名称请用单行的「导入」按钮）：",
     "importSelected": "导入所选 ({{count}})",
+    "selectAllCkpts": "全选",
+    "deselectAllCkpts": "全不选",
     "importingSelected": "导入中…",
     "importSelectedDone": "已导入 {{count}} 个存档",
     "importSelectedPartial": "导入完成 {{ok}}/{{total}}，以下失败：",
