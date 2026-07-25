@@ -251,6 +251,7 @@
     "projectMissing": "Directory is no longer on disk",
     "projectLoading": "Loading…",
     "projectBack": "All projects",
+    "archiveBack": "Back to project",
     "projectDataset": "Data set",
     "projectImportData": "Import data",
     "projectRetry": "Retry",

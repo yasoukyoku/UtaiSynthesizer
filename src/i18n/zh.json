@@ -251,6 +251,7 @@
     "projectMissing": "目录已不在磁盘上",
     "projectLoading": "读取中…",
     "projectBack": "全部项目",
+    "archiveBack": "返回项目",
     "projectDataset": "数据集",
     "projectImportData": "导入数据",
     "projectRetry": "重试",

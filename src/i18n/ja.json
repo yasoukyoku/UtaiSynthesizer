@@ -251,6 +251,7 @@
     "projectMissing": "フォルダがディスク上にありません",
     "projectLoading": "読み込み中…",
     "projectBack": "すべてのプロジェクト",
+    "archiveBack": "プロジェクトに戻る",
     "projectDataset": "データセット",
     "projectImportData": "データを読み込む",
     "projectRetry": "再試行",

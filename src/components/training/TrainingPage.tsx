@@ -2526,7 +2526,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
               useTrainingStore.getState().setRoute({ seg: "detail", projectId: route.projectId })
             }
           >
-            ← {t("training.projectBack")}
+            ← {t("training.archiveBack")}
           </button>
           <span className="tproj-detail-name">
             {t(`training.${FAMILY_LABEL_KEY[backendFamily(archiveBackend)] ?? "backendRvc"}`)} ·{" "}
