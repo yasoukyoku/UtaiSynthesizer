@@ -872,7 +872,8 @@
 }
 .training-audition-bar {
   display: flex;
-  justify-content: flex-end;
+  /* 全选/全不选(次要)推到最左、导入所选(主)留最右,拉开距离防误触(用户 2026-07-25) */
+  justify-content: space-between;
   margin-top: 6px;
 }
 
