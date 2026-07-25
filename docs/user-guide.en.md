@@ -803,6 +803,10 @@ About **model names**: Chinese/Japanese and similar characters are fully preserv
 
 Models imported here are immediately selectable in the vocal-track sidebar and in workflow nodes.
 
+**Export a model / Import a package** (moving a model to another machine): every voice-model row has an **Export** button — it bundles the model into a single `.zip` package holding its whole file set (ONNX weights + config + retrieval/cluster + diffusion attachment + avatar — the same set that 7.4's "Delete model" removes, minus this machine's audition cache). Copy that `.zip` to another computer, pick it with the **Import Package** button at the top of the "Voice Models" tab, and the model is **restored exactly** — **including the SoVITS retrieval/cluster bank and the avatar** (which a plain "+ Import Model" of a bare `.onnx` does NOT carry over, so use the package for moving or sharing a model). After importing you jump to the matching sub-tab.
+
+> Note: this is unrelated to "Import/Export score or audio" (Chapter 10), and it is a different thing from the whole resumable training "workspace" — a model package holds only one ready-to-infer finished model. A model cannot be exported while it is being tested/auditioned (you'll be told to retry later).
+
 ### 7.3 Vocoder import and auditioning
 
 **The "Vocoder" sub-tab**: imports standalone NSF-HiFiGAN vocoders for SoVITS shallow diffusion / the enhancer to use (RVC has no external vocoder interface). "Vocoder checkpoint" accepts .ckpt/.pt/.onnx — the extensionless `model` file common in community zips works too; "Vocoder config (config.json)" can be left blank for auto-detection. Pinned at the list's top is a "Default vocoder" row (built-in, undeletable; when missing it shows a red "Missing" notice pointing at Settings → Model Assets). Vocoders that do not match the standard format are tagged "Format mismatch" and never appear in the nodes' vocoder dropdowns.
