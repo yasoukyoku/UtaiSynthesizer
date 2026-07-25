@@ -22,6 +22,7 @@ all in one app, with no Python required at inference time.
 
 - **Piano-roll vocal synthesis** — UTAU-style free note placement, direct lyric typing with
   phrase distribution, SynthV-style pitch transitions / vibrato / hand-drawn pitch deviation,
+  **always-on auto pitch tuning** (auto-follow; a hand-edit takes over),
   loudness & formant parameter lanes, breath notes, and dictionary-backed lyrics in
   **7 languages** (zh / en / ja / de / fr / es / it) with three-level OOV warnings.
 - **AI cover workflow** — every audio clip carries a node graph: source separation
@@ -29,8 +30,9 @@ all in one app, with no Python required at inference time.
   natively in Rust) → RVC / So-VITS-SVC 4.0 & 4.1 voice conversion (shallow diffusion,
   NSF-HiFiGAN enhancer/vocoders, multi-speaker blending) → spectral transpose → back onto
   the track as non-destructive sub-lanes.
-- **On-device training** — RVC, SoVITS 4.1/4.0, shallow diffusion, and vocoder fine-tuning
-  on embedded portable Python runtimes (NVIDIA / AMD / Intel / CPU packs, downloaded in-app;
+- **On-device training** — RVC, SoVITS 4.1/4.0/4.0-v2, shallow diffusion, and vocoder fine-tuning,
+  **managing datasets, multi-speaker structure and archives as projects**, on embedded portable
+  Python runtimes (NVIDIA / AMD / Intel / CPU packs, downloaded in-app;
   self-contained CUDA runtime — no CUDA Toolkit install needed).
 - **DAW fundamentals** — multi-track timeline, drag-drop import with smart placement,
   crossfades, clip/track clipboard, BPM & beat-grid detection, pitch-preserving time-stretch
@@ -40,7 +42,8 @@ all in one app, with no Python required at inference time.
   and shifted back with TD-PSOLA).
 - **Vocal-to-MIDI** — transcribe a separated vocal stem into editable notes (GAME engine).
 - Exports: audio (wav / flac / mp3 / ogg / opus / m4a) with what-you-hear offline mixdown
-  parity, and scores (ust / ustx / midi). Imports: ustx / ust / midi and 9 audio formats.
+  parity, scores (ust / ustx / midi), and **voice-model packages (.zip — move a model to another
+  machine and re-import it losslessly)**. Imports: ustx / ust / midi, 9 audio formats, and model packages.
 - Trilingual UI (简体中文 / English / 日本語), sha256-verified downloads with CN-friendly
   mirror options, minisign-signed auto-updates.
 
