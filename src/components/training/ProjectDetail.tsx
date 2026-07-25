@@ -235,6 +235,13 @@ export function ProjectDetail() {
     return {};
   };
 
+  /** Open this architecture's 存档中心. Sets the family the archive page speaks for (it reads
+   *  `config.backend`), then routes — no name prompt, no run, just the product inventory. */
+  const openArchive = (family: Family) => {
+    updateConfig({ backend: family });
+    setRoute({ seg: "archive", projectId });
+  };
+
   const startFamily = async (family: Family, sovitsVersion?: "4.1" | "4.0") => {
     const slot = slots.get(family);
     const runName = await askRunName(slot);
@@ -570,7 +577,17 @@ export function ProjectDetail() {
                           : t("training.slotNoResume")}
                       </span>
                       <span className="tproj-dot">·</span>
-                      <span>{t("training.slotArchive", { size: fmtSize(slot?.ckptBytes ?? 0) })}</span>
+                      {/* 「存档 X GB」→ the 存档中心: audition / import / attach any checkpoint,
+                          at any time, without walking the wizard to step 4. The diffusion
+                          checkpoints under this sovits slot show up here too (one list). */}
+                      <button
+                        className="tproj-archive-link"
+                        disabled={blocked}
+                        onClick={() => openArchive(f)}
+                        title={t("training.archiveOpen")}
+                      >
+                        {t("training.slotArchive", { size: fmtSize(slot?.ckptBytes ?? 0) })}
+                      </button>
                     </>
                   ) : (
                     <span>{t("training.slotNotStarted")}</span>

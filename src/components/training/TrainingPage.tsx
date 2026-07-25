@@ -18,7 +18,7 @@ import {
   backendSupportsMultiSpeaker,
   setupTrainingListeners,
   useTrainingStore,
-  type CkptInfo,
+  type CkptRecord,
   type DatasetFileRow,
   type ProjectDetail as ProjectDetailData,
   type TrainingGpu,
@@ -60,6 +60,14 @@ const STAGE_ORDERS: Record<string, string[]> = {
   sovits_v2: ["import", "slice", "augment", "extract", "aug_check", "filelist", "index", "train_prep"],
   sovits_diff: ["import", "slice", "augment", "extract", "aug_check", "filelist", "diff_prep", "train_prep"],
   vocoder: ["import", "slice", "augment", "process", "aug_check", "filelist", "train_prep"],
+};
+
+/** family → its i18n label key, for the archive page header (RunStep sees only a backend id). */
+const FAMILY_LABEL_KEY: Record<string, string> = {
+  rvc: "backendRvc",
+  sovits: "familySovits",
+  sovits_v2: "backendSovits40v2",
+  vocoder: "backendVocoder",
 };
 
 export function TrainingPage() {
@@ -366,6 +374,9 @@ export function TrainingPage() {
         {route.seg === "data" && <DataStep />}
         {route.seg === "params" && <ParamsStep />}
         {route.seg === "run" && <RunStep />}
+        {/* 存档中心:从项目详情的槽卡片进来,复用 RunStep 的产物逻辑(试听/导入/挂接),
+            只是隐去运行段的开始/进度/结算外壳。零重复——字面同一个组件。 */}
+        {route.seg === "archive" && <RunStep archiveOnly />}
       </div>
       {/* ①c: on the DATA segment with ≥2 singers the per-card highlight IS the
           drop affordance, so suppress the full-screen overlay there; on other
@@ -1319,7 +1330,9 @@ function ParamsStep() {
 
 /* ---------------------------------- step 4: run ---------------------------------- */
 
-function RunStep() {
+/** `archiveOnly` = the standalone 存档中心 reached from a project's model card: same product
+ *  logic (audition / import / attach), none of the run chrome (start / progress / summary). */
+function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   const { t } = useTranslation();
   const showConfirm = useAppStore((s) => s.showConfirm);
   const showToast = useAppStore((s) => s.showToast);
@@ -1357,10 +1370,19 @@ function RunStep() {
 
   const running = snapshot.state === "starting" || snapshot.state === "running";
   const finished = snapshot.state === "completed" || snapshot.state === "stopped";
-  const isDiff = snapshot.backend === "sovits_diff";
+  // Which architecture this segment is ACTING on. A displayed run owns the question; with no
+  // run to show (idle after「清空结果」/ a restart) it is the form's current pick. S78: the
+  // audition/import/attach machine keys on THIS, not on `snapshot.backend`, so it keeps working
+  // when there is no live run — during/after a run the two are identical (snapshot.state is not
+  // idle then), so run behaviour is unchanged.
+  // The standalone 存档中心 always speaks for the family its card chose (`config.backend`), even
+  // if some OTHER project's run is live — otherwise its list would follow that run.
+  const archiveBackend =
+    archiveOnly || snapshot.state === "idle" ? config.backend : snapshot.backend;
+  const isDiff = archiveBackend === "sovits_diff";
   // vocoder shares the "best = true validation loss" semantics with diff
   // (labels only; its checkpoints go through importCkpt, not the attach flow)
-  const isVocoderRun = snapshot.backend === "vocoder";
+  const isVocoderRun = archiveBackend === "vocoder";
 
   // ---- diffusion attach flow (S39): a trained diffusion ckpt is not a
   // standalone model — it converts into `<stem>.diffusion/` of an INSTALLED
@@ -1372,17 +1394,25 @@ function RunStep() {
   const [attachTarget, setAttachTarget] = useState("");
   const [attaching, setAttaching] = useState<string | null>(null);
   const summaryDim = (snapshot.summary as { encoder_dim?: number } | null)?.encoder_dim;
-  const attachCandidates = isDiff
+  // Attach is possible for a diffusion RUN (isDiff) AND for the sovits-family 存档中心, whose
+  // list can hold diffusion checkpoints from a prior run. Gating on isDiff alone left the archive
+  // page with ZERO candidates — the exact death-lock this whole change exists to remove (an
+  // archive diffusion row would show「无可挂接的模型」and never attach). Only sovits slots ever
+  // hold diffusion, so the family test is the right widening.
+  const canAttachHere = isDiff || backendFamily(archiveBackend) === "sovits";
+  const attachCandidates = canAttachHere
     ? sovitsModels.filter((m: VoiceModelEntry) => {
-        if (!summaryDim) return true; // dim unknown (e.g. force-stopped run) — Rust re-validates
+        if (!summaryDim) return true; // dim unknown (cold archive / force-stopped) — Rust re-validates
         const dim = voiceFeatureDim(m);
         return dim === null || dim === summaryDim;
       })
     : [];
 
   useEffect(() => {
-    if (isDiff && finished) void useVoiceModelStore.getState().fetchModels();
-  }, [isDiff, finished]);
+    // refresh the installed-model list when attach becomes relevant: a finished diff run, OR the
+    // archive page opening (so its host dropdown is current)
+    if ((isDiff && finished) || archiveOnly) void useVoiceModelStore.getState().fetchModels();
+  }, [isDiff, finished, archiveOnly]);
 
   // a NEW run invalidates any previously chosen target — without this reset a
   // still-valid selection from the last run survives and the default-target
@@ -1392,16 +1422,19 @@ function RunStep() {
     setAttachTarget("");
   }, [snapshot.model_name, snapshot.workspace]);
 
-  // default the target to the same-named model (the intended pairing)
+  // default the target to the same-named model (the intended pairing). Runs for the archive page
+  // too (canAttachHere), so a diffusion row there lands on a sensible default host.
   useEffect(() => {
-    if (!isDiff) return;
+    if (!canAttachHere) return;
     if (attachTarget && attachCandidates.some((m) => m.name === attachTarget)) return;
+    // same-name pairing is the just-finished-diff-run nicety (snapshot.model_name is set then);
+    // the archive page has no run name, so it lands on the first candidate — fine.
     const sameName = attachCandidates.find((m) => m.name === snapshot.model_name);
     setAttachTarget(sameName?.name ?? attachCandidates[0]?.name ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDiff, sovitsModels, summaryDim, snapshot.model_name]);
+  }, [canAttachHere, sovitsModels, summaryDim, snapshot.model_name]);
 
-  const attachCkpt = async (ckpt: CkptInfo) => {
+  const attachCkpt = async (ckpt: { path: string }) => {
     if (!attachTarget || attaching) return;
     setAttaching(ckpt.path);
     try {
@@ -1432,7 +1465,7 @@ function RunStep() {
   const [selectedCkpts, setSelectedCkpts] = useState<Record<string, boolean>>({});
   const [missingCkpts, setMissingCkpts] = useState<Record<string, boolean>>({});
   const [importingAll, setImportingAll] = useState(false);
-  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(archiveOnly);
   const projectCkpts = useTrainingStore((s) => s.projectCkpts);
   // Re-scan whenever the run's identity or state changes: a finished run just wrote new
   // archives, and「清空结果」clears the in-memory candidates while the files stay on disk.
@@ -1441,13 +1474,12 @@ function RunStep() {
   // only way left to reach the files on disk. (Pre-batch-4 it resolved the project from the
   // typed model name, which is now an editable per-run label rather than an identity.)
   //
-  // The FAMILY follows whatever this segment is showing: a displayed run owns the question
-  // (`snapshot.backend`), and only a segment with no run to show falls back to the form's
-  // current pick. Keying it on `config.backend` alone let the two diverge — leave a finished
-  // SoVITS run, click the RVC slot in the detail page, come back to the run segment (still
-  // lit, because the run is this project's) and the candidates above were SoVITS while the
-  // archive list below was RVC, with `mergeCkptSources` filing the former under the latter.
-  const archiveBackend = snapshot.state === "idle" ? config.backend : snapshot.backend;
+  // `archiveBackend` (defined at the top of RunStep) is THE family this segment acts on — a
+  // displayed run owns it, else the form's pick. Keying anything here on `config.backend` alone
+  // let the two diverge: leave a finished SoVITS run, click the RVC slot in the detail page,
+  // come back to the run segment (still lit, because the run is this project's) and the
+  // candidates were SoVITS while the archive list was RVC, `mergeCkptSources` filing one under
+  // the other.
   useEffect(() => {
     void useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
   }, [route.projectId, archiveBackend, snapshot.state, snapshot.ckpts.length]);
@@ -1489,22 +1521,44 @@ function RunStep() {
     };
   }, [route.projectId, archiveBackend, snapshot.state]);
 
-  /** 产物身份:有 run 用 run 的,没有就用槽里冻结的(再没有就用项目名)。 */
-  const exportName = snapshot.model_name || slotCtx?.modelName || config.modelName;
-  const exportWorkspace = snapshot.workspace || slotCtx?.workspace || "";
+  /** 产物身份:有 run(且这一段就在看它)用 run 的,否则用槽里冻结的(再没有就用项目名)。
+   *  archiveOnly 一律走槽——那时的 live snapshot 可能是别的项目的运行。 */
+  const useLiveIdentity = !archiveOnly;
+  const exportName =
+    (useLiveIdentity ? snapshot.model_name : "") || slotCtx?.modelName || config.modelName;
+  const exportWorkspace = (useLiveIdentity ? snapshot.workspace : "") || slotCtx?.workspace || "";
 
   const archiveRows = mergeCkptSources(
-    snapshot.ckpts,
+    // the standalone archive must not fold in a DIFFERENT run's in-memory candidates
+    archiveOnly ? [] : snapshot.ckpts,
     projectCkpts,
     backendFamily(archiveBackend),
   );
 
-  /** The project's on-disk inventory — rendered in EVERY run state, deliberately.
+  // ── what a given archive row can DO (S78) ─────────────────────────────────────────────────
+  // The action follows the FILE, not the run. A single sovits slot can hold both a main model
+  // (import) and shallow-diffusion checkpoints (attach), so a per-run `isDiff` flag cannot
+  // decide it — the diffusion ones live under `.../diffusion/`.
+  const rowIsDiffusion = (rel: string) => rel.replace(/\\/g, "/").includes("/diffusion/");
+  /** Deployable model → import. Release/best/final weights, but NOT the diffusion ones. */
+  const rowConvertible = (r: CkptRecord) =>
+    !rowIsDiffusion(r.rel) && (r.kind === "release" || r.kind === "best" || r.kind === "final");
+  /** Shallow-diffusion product → attach to an installed SoVITS host. */
+  const rowAttachable = (r: CkptRecord) => rowIsDiffusion(r.rel) && r.kind !== "base";
+  /** Auditionable = anything that renders through the inference chain. Raw resume state (G_/D_
+   *  pairs, model_ckpt_steps) is not a deployable model — it has no audition. */
+  const rowAuditionable = (r: CkptRecord) => rowConvertible(r) || rowAttachable(r);
+  const anyAttachable = archiveRows.some(rowAttachable);
+
+  /** The project's on-disk inventory, made ACTIONABLE (S78) — rendered in EVERY run state,
+   *  deliberately.
    *
-   *  It first lived inside the finished-run summary card, which meant it was invisible after
-   *  an app restart or「清空结果」— precisely the two situations it exists for (the sidecar's
-   *  in-memory candidate list is empty then while the files are still on disk). Its identity
-   *  comes from the model name, not from the run snapshot, for the same reason. */
+   *  It first lived inside the finished-run summary card, which meant it was invisible after an
+   *  app restart or「清空结果」— exactly the two situations it exists for (the sidecar's in-memory
+   *  candidate list is empty then while the files are on disk). That is why a finished shallow-
+   *  diffusion checkpoint became a dead end the moment anything else was trained: its attach
+   *  button lived only on the summary card. Here every row carries the action its FILE supports,
+   *  at any time. */
   const archiveBlock = archiveRows.length > 0 && (
       <div className="training-archive">
         <button
@@ -1514,30 +1568,100 @@ function RunStep() {
           {archiveOpen ? "▾" : "▸"} {t("training.archiveTitle", { count: archiveRows.length })}
         </button>
         {archiveOpen && (
-          <div className="training-archive-list">
-            {archiveRows.map((r) => (
-              <div className="training-archive-row" key={r.rel}>
-                <span className="training-archive-name" title={r.path}>{r.rel}</span>
-                <span className="training-archive-tag">{t(`training.ckptKind.${r.kind}`)}</span>
-                <span className="training-archive-step">
-                  {r.step != null
-                    ? t("training.ckptStep", { step: r.step })
-                    : // A missing step means two different things and only ONE of them is
-                      // "最新": RVC's「只保留最新」writes the sentinel name G_2333333.pth,
-                      // whereas `<slug>.pth` / `<slug>_best.pth` simply carry no step in
-                      // their name. Labelling the latter「最新」would be a plain lie — and
-                      // on _best actively misleading, since best ≠ newest.
-                      r.kind === "resumable"
-                      ? t("training.ckptLatest")
-                      : "—"}
-                </span>
-                <span className="training-archive-size">{fmtSize(r.bytes)}</span>
-                {r.imported && (
-                  <span className="training-archive-tag imported">{t("training.ckptImported")}</span>
-                )}
-              </div>
-            ))}
-          </div>
+          <>
+            {/* diffusion rows attach to an INSTALLED SoVITS model (dim-matched) — one shared
+                host selector for the whole list, same as the summary card's */}
+            {anyAttachable &&
+              (attachCandidates.length > 0 ? (
+                <div className="training-attach-row">
+                  <label>{t("training.attachTarget")}</label>
+                  <Dropdown
+                    value={attachTarget}
+                    options={attachCandidates.map((m) => ({ value: m.name, label: m.name }))}
+                    onChange={(v) => setAttachTarget(v)}
+                  />
+                </div>
+              ) : (
+                <div className="training-hint">{t("training.noAttachTarget")}</div>
+              ))}
+            <div className="training-archive-list">
+              {archiveRows.map((r) => {
+                const gone = missingCkpts[r.path] === true;
+                const phase = auditionState[r.path];
+                const diffusion = rowIsDiffusion(r.rel);
+                const canAudition = rowAuditionable(r);
+                const canImport = rowConvertible(r);
+                const canAttach = rowAttachable(r);
+                return (
+                  <div
+                    className={`training-archive-row${gone ? " missing" : ""}`}
+                    key={r.rel}
+                    title={gone ? t("training.ckptMissing") : r.path}
+                  >
+                    <span className="training-archive-name" title={r.path}>{r.rel}</span>
+                    <span className="training-archive-tag">{t(`training.ckptKind.${r.kind}`)}</span>
+                    <span className="training-archive-step">
+                      {r.step != null
+                        ? t("training.ckptStep", { step: r.step })
+                        : // A missing step means two different things and only ONE is「最新」:
+                          // RVC's「只保留最新」writes the sentinel G_2333333.pth, whereas
+                          // `<slug>.pth` / `_best.pth` just carry no step. Labelling the latter
+                          //「最新」would be a lie — and on _best actively misleading.
+                          r.kind === "resumable"
+                          ? t("training.ckptLatest")
+                          : "—"}
+                    </span>
+                    <span className="training-archive-size">{fmtSize(r.bytes)}</span>
+                    {r.imported && (
+                      <span className="training-archive-tag imported">{t("training.ckptImported")}</span>
+                    )}
+                    {gone ? (
+                      <span className="training-ckpt-missing">{t("training.ckptMissing")}</span>
+                    ) : (
+                      <span className="training-archive-actions">
+                        {canAudition && (
+                          <button
+                            className="training-btn small"
+                            disabled={
+                              (auditionBusy && phase !== "converting" && phase !== "rendering") ||
+                              (diffusion && !attachTarget) ||
+                              importingAll
+                            }
+                            onClick={() =>
+                              void auditionCandidate(
+                                r,
+                                diffusion ? "diffusion" : archiveBackend === "vocoder" ? "vocoder" : "voice",
+                              )
+                            }
+                          >
+                            {auditionLabel(r.path)}
+                          </button>
+                        )}
+                        {canAttach && attachCandidates.length > 0 && (
+                          <button
+                            className="training-btn small"
+                            disabled={!attachTarget || attaching != null}
+                            onClick={() => void attachCkpt(r)}
+                          >
+                            {attaching === r.path ? t("training.attaching") : t("training.attach")}
+                          </button>
+                        )}
+                        {canImport && (
+                          <button
+                            className="training-btn small"
+                            disabled={importingAll}
+                            onClick={() => void importCkpt(r)}
+                          >
+                            {t("training.import")}
+                          </button>
+                        )}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </div>
     );
@@ -1578,14 +1702,17 @@ function RunStep() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshot.model_name, snapshot.workspace, running]);
 
-  // the diff audition cache is host-specific — switching the host must
-  // invalidate every rendered result INCLUDING one still in flight
+  // the diffusion audition cache is host-specific — switching the host must invalidate every
+  // rendered result INCLUDING one still in flight. Gated on「列表里有可挂接行」(`anyAttachable`),
+  // not the per-run `isDiff`: in the 存档中心 isDiff is false but diffusion rows are auditionable,
+  // and a host change there must still clear their stale renders. (Over-clearing a main-model
+  // row's cache is harmless — it just re-renders on the next play.)
   useEffect(() => {
-    if (!isDiff) return;
+    if (!anyAttachable) return;
     auditionEpochRef.current += 1;
     setAuditionState({});
     setAuditionWavs({});
-  }, [attachTarget, isDiff]);
+  }, [attachTarget, anyAttachable]);
 
   // remount reconciliation (审查修复 FE-1/AUD-DONE-DROPPED): transient
   // converting/rendering phases die with the page — if Rust says nothing is
@@ -1783,7 +1910,10 @@ function RunStep() {
   };
 
   /** c === null → the built-in default vocoder A/B reference row. */
-  const auditionCandidate = async (c: CkptInfo | null) => {
+  // S78: the render command is decided PER ROW, not per run — a unified archive list can hold a
+  // main model (voice) and a shallow-diffusion checkpoint (diffusion) in the same sovits slot.
+  // `null` candidate = the vocoder A/B reference row.
+  const auditionCandidate = async (c: { path: string } | null, mode: "voice" | "diffusion" | "vocoder") => {
     const id = c ? c.path : "__default__";
     const phase = auditionState[id];
     // pause only when this row REALLY owns the playback — a stale 'playing'
@@ -1812,7 +1942,7 @@ function RunStep() {
       return;
     }
     if (phase === "converting" || phase === "rendering" || auditionBusy || importingAll) return;
-    if (isDiff && !attachTarget) {
+    if (mode === "diffusion" && !attachTarget) {
       showToast(t("training.auditionNeedHost"), "error");
       return;
     }
@@ -1822,24 +1952,29 @@ function RunStep() {
     setAuditionState((s) => ({ ...s, [id]: "converting" }));
     try {
       let wav: string;
-      if (isVocoderRun || c === null) {
+      // S78: the workspace comes from the slot-resolved context (`exportWorkspace`), not the live
+      // snapshot — so a row auditions the same whether it is a just-finished candidate or a cold
+      // archive entry (with a run displayed the two are equal). The render command is `mode`,
+      // decided by the CALLER per row.
+      if (mode === "vocoder" || c === null) {
         wav = await invoke<string>("render_audition_vocoder", {
           ckptPath: c?.path ?? null,
-          workspace: snapshot.workspace,
+          workspace: exportWorkspace,
           candidateId: id,
         });
-      } else if (isDiff) {
+      } else if (mode === "diffusion") {
         wav = await invoke<string>("render_audition_diffusion", {
           hostName: attachTarget,
           ckptPath: c.path,
-          workspace: snapshot.workspace,
+          workspace: exportWorkspace,
           candidateId: id,
         });
       } else {
         wav = await invoke<string>("render_audition_voice", {
-          backend: snapshot.backend,
+          // main-model render: the FAMILY, never sovits_diff (a stray main row in a diff-run view)
+          backend: backendFamily(archiveBackend),
           ckptPath: c.path,
-          workspace: snapshot.workspace,
+          workspace: exportWorkspace,
           candidateId: id,
           // ①c: null for single-speaker (→ speaker 0, byte-identical); the chosen speaker otherwise
           speakerId: auditionSpeakers.length > 0 ? auditionSpeaker : null,
@@ -2160,13 +2295,19 @@ function RunStep() {
   // sovits/vocoder periodics are step-cadenced (several per epoch) — an
   // epoch-keyed suggestion would collide and silently replace the previous
   // import (rvc keeps its historical epoch tag)
-  const suggestedName = (ckpt: CkptInfo) => {
+  const suggestedName = (ckpt: { kind: string; epoch?: number; step: number | null; rel?: string }) => {
+    // an archive row (CkptRecord) carries no epoch — recover it from the release filename.
+    // Anchor to the FULL `_e<epoch>_s<step>` tail, never a bare `_e<digits>_`: the model slug
+    // ends in an 8-hex hash, and a hash of the form `e1234567` would otherwise be read as the
+    // epoch (the Rust step-parser documents this exact ~2% hazard). Fall back to the step tag.
+    const epoch =
+      ckpt.epoch ?? (ckpt.rel ? Number(/_e(\d+)_s\d+\./.exec(ckpt.rel)?.[1]) : NaN);
     const tag =
       ckpt.kind === "best"
         ? "best"
-        : archiveBackend === "rvc"
-          ? `e${ckpt.epoch}`
-          : `s${ckpt.step}`;
+        : archiveBackend === "rvc" && Number.isFinite(epoch)
+          ? `e${epoch}`
+          : `s${ckpt.step ?? 0}`;
     return ckpt.kind === "final" ? exportName : `${exportName}_${tag}`;
   };
 
@@ -2175,9 +2316,14 @@ function RunStep() {
   // (built before training, so they exist even for early stops). Shared by the
   // single-import prompt and the S41 batch import (single source).
   const resolveIndexPath = async (): Promise<string | undefined> => {
-    const summaryIndex = (snapshot.summary as { index?: string } | null)?.index;
-    // the run's own summary first; then what the slot has on disk (S78 — the cold-archive
-    // path); the two probes below stay as the last resort for a run with neither
+    // ★ The live run's summary index is ONLY trustworthy when this segment is that run
+    // (`useLiveIdentity`). In the standalone 存档中心 the snapshot may be a DIFFERENT family's
+    // finished run of the same project, and its `summary.index` (e.g. a SoVITS cluster .npy)
+    // would then be silently attached to an RVC import. The same `useLiveIdentity` gate that
+    // decouples name/workspace must gate the index too — the correct one is `slotCtx.indexPath`.
+    const summaryIndex = useLiveIdentity
+      ? (snapshot.summary as { index?: string } | null)?.index
+      : undefined;
     let indexPath = summaryIndex ?? slotCtx?.indexPath ?? undefined;
     if (!indexPath && archiveBackend !== "vocoder") {
       // vocoders have no index/cluster companion — probing would only find
@@ -2212,7 +2358,7 @@ function RunStep() {
     await useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
   };
 
-  const importCkpt = async (ckpt: CkptInfo) => {
+  const importCkpt = async (ckpt: { kind: string; epoch?: number; step: number | null; rel?: string; path: string }) => {
     const name = await showConfirm({
       title: t("training.import"),
       body: t("training.importName"),
@@ -2232,7 +2378,7 @@ function RunStep() {
         name,
         path: ckpt.path,
         // the family this segment is acting on — `snapshot.backend` is "" with no run displayed
-        modelType: archiveBackend,
+        modelType: backendFamily(archiveBackend),
         indexPath,
       });
       await useVoiceModelStore.getState().fetchModels();
@@ -2309,7 +2455,8 @@ function RunStep() {
           const outcome = await invoke<{ warnings?: string[] }>("import_model", {
             name: names.get(c.path),
             path,
-            modelType: snapshot.backend,
+            // family (identity for every backend the batch bar shows — it is !isDiff gated)
+            modelType: backendFamily(archiveBackend),
             indexPath,
             // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
             // been swapped to the audition-converted onnx above. Recording the onnx would leave
@@ -2343,6 +2490,33 @@ function RunStep() {
       setImportingAll(false);
     }
   };
+
+  /* -------- 存档中心(独立页,从项目详情的槽卡片进入)-------- */
+  if (archiveOnly) {
+    return (
+      <div className="tproj-detail">
+        <div className="tproj-detail-head">
+          <button
+            className="tproj-back"
+            onClick={() =>
+              useTrainingStore.getState().setRoute({ seg: "detail", projectId: route.projectId })
+            }
+          >
+            ← {t("training.projectBack")}
+          </button>
+          <span className="tproj-detail-name">
+            {t(`training.${FAMILY_LABEL_KEY[backendFamily(archiveBackend)] ?? "backendRvc"}`)} ·{" "}
+            {t("training.archivePageTitle")}
+          </span>
+        </div>
+        {archiveRows.length > 0 ? (
+          archiveBlock
+        ) : (
+          <div className="training-empty">{t("training.archiveEmpty")}</div>
+        )}
+      </div>
+    );
+  }
 
   /* -------- idle -------- */
   if (snapshot.state === "idle") {
@@ -2541,7 +2715,7 @@ function RunStep() {
                 <button
                   className="training-btn small"
                   disabled={(auditionBusy && !auditionState["__default__"]) || importingAll}
-                  onClick={() => void auditionCandidate(null)}
+                  onClick={() => void auditionCandidate(null, "vocoder")}
                 >
                   {auditionLabel("__default__")}
                 </button>
@@ -2601,7 +2775,12 @@ function RunStep() {
                           // writing one concurrently would be a TOCTOU (FE-2)
                           importingAll
                         }
-                        onClick={() => void auditionCandidate(c)}
+                        onClick={() =>
+                          void auditionCandidate(
+                            c,
+                            isVocoderRun ? "vocoder" : isDiff ? "diffusion" : "voice",
+                          )
+                        }
                       >
                         {auditionLabel(c.path)}
                       </button>

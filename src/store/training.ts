@@ -323,7 +323,7 @@ export function poolReusable(
  *  parked on 4, so a page refresh dropped the user back to step 1 mid-run.
  *
  *  `projectId` is "" only on the landing. Every other segment is ABOUT a project. */
-export type TrainingSeg = "projects" | "detail" | "data" | "params" | "run";
+export type TrainingSeg = "projects" | "detail" | "data" | "params" | "run" | "archive";
 
 export interface TrainingRoute {
   seg: TrainingSeg;
@@ -342,6 +342,9 @@ export function segTab(seg: TrainingSeg): 1 | 2 | 3 | 4 {
     case "params":
       return 3;
     case "run":
+    case "archive":
+      // the archive is reached from a project's model card, not from the step rail; it rides
+      // under 4 (运行/产物) so the tab highlight has somewhere sensible to sit.
       return 4;
   }
 }
