@@ -201,7 +201,7 @@ def convert_rvc(input_path: Path, output_path: Path, deterministic: bool = False
     # export time instead of at runtime in Rust).
     import numpy as np
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     for t in (seq_len, 137):
         feeds = {
             "phone": np.random.randn(1, t, features_dim).astype(np.float32),
@@ -851,7 +851,7 @@ def convert_bs_roformer(input_path: Path, output_path: Path, config_yaml: Path =
     print(f"ONNX check passed: {output_path}")
 
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     ort_out = sess.run(None, {"stft_repr": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
@@ -918,7 +918,7 @@ def convert_mel_band_roformer(input_path: Path, output_path: Path,
     print(f"ONNX check passed: {output_path}")
 
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     ort_out = sess.run(None, {"stft_repr": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
@@ -1001,7 +1001,7 @@ def convert_mdx23c(input_path: Path, output_path: Path, config_yaml: Path = None
     print(f"ONNX check passed: {output_path}")
 
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     ort_out = sess.run(None, {"stft_repr": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
@@ -1076,7 +1076,7 @@ def convert_htdemucs(input_path: Path, output_path: Path, config_yaml: Path = No
     print(f"ONNX check passed: {output_path}")
 
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     ort_out = sess.run(None, {"cac_spec": dummy_spec.numpy(), "mix": dummy_mix.numpy()})
     diff_f = abs(freq_out.numpy() - ort_out[0]).max()
     diff_t = abs(time_out.numpy() - ort_out[1]).max()
@@ -1155,7 +1155,7 @@ def convert_uvr_vr(input_path: Path, output_path: Path):
     print(f"ONNX check passed: {output_path}")
 
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     ort_out = sess.run(None, {"mag": dummy.numpy()})
     diff = abs(test_out.numpy() - ort_out[0]).max()
     print(f"ORT verification: max diff = {diff:.6e}")
@@ -1245,7 +1245,7 @@ def convert_mdx_net(input_path: Path, output_path: Path):
 
     import numpy as np
     import onnxruntime as ort
-    sess = ort.InferenceSession(str(output_path))
+    sess = ort.InferenceSession(output_path.read_bytes())  # bytes: ACP-safe (Windows can't open non-ASCII/CJK paths via CreateSession)
     smoke = sess.run(None, {"input": np.zeros((1, 4, dim_f, dim_t), dtype=np.float32)})[0]
     if smoke.shape != (1, 4, dim_f, dim_t) or not np.isfinite(smoke).all():
         raise ValueError(f"ORT smoke run failed: output shape {smoke.shape}")
