@@ -890,6 +890,8 @@ Across the top are four step tabs: "Project", "Data", "Parameters", "Run". The f
 
 Outside any project, the "Project" tab shows a wall of cards for every training project.
 
+![Training page · project list: search, sort, new project; each card shows architecture badges and data-set / disk size](images/training-projects.png)
+
 - **New project**: click "New project" at the top right and name it (CJK is fine, e.g. `歌姫テスト`; up to 80 characters, and not a duplicate of an existing project). It opens straight into the detail page.
 - **Search / sort**: the search box filters by name or note; "Recent / Name / Size" on the right switches the sort.
 - **Each card** shows the project name, size on disk ("—" until it has been measured), the architectures it already holds (e.g. `rvc`, `sovits`), and "Data X" or "No data imported", with the note below if there is one. Click a card to enter its detail.
@@ -1009,6 +1011,8 @@ When a run completes (or stops), the run page shows a summary card and **this ru
 - Rows pruned off disk by the retention policy grey out as "Pruned by the archive policy" and can no longer be auditioned/imported.
 
 After listening and importing, "Clear results" clears this page's display (the workspace and checkpoint files survive and resuming is unaffected, but this list with its audition/import buttons will not come back — finish importing before clearing).
+
+![The training archive center: every archive an architecture has on disk, with audition / import / attach actions by file type](images/training-archive.png)
 
 **The archive center** — you need not wait for a run to just finish: at any time, clicking an architecture slot's "Archives X" on the project detail page opens that architecture's **standalone archive page**, listing **every archive it has on disk**. Each row offers the action its **file type** supports: a deployable finished checkpoint (snapshot / best / final) can be auditioned and "Import to library"; a diffusion checkpoint can be auditioned and "attached" to an installed SoVITS; base models, resumable checkpoints and the like are display-only. The archive kind tags are "base", "resumable", "snapshot", "best", "Final", "torn half" and "just saved". A multi-singer model can pick a singer to audition here too. — It is precisely this page that keeps a shallow-diffusion checkpoint reachable after the summary page is dismissed, so it never becomes a dead end.
 
