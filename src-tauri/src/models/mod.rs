@@ -510,7 +510,19 @@ impl ModelRegistry {
             // (NsfHifigan never reaches here: its torch-ckpt sources were
             // converted into the temp dir during pre-flight, making
             // effective_src an .onnx — the branch above handles it.)
-            convert::convert_pth_to_onnx(src_path, &onnx_path, &model_type, app_dir)?;
+            //
+            // The converter writes `onnx_path` (the FINAL models-dir path) and only THEN runs its
+            // ORT self-check; a failure there — or any post-export step — leaves a complete-looking
+            // `<stem>.onnx` with no sidecar, which the next `scan()` resurrects as a broken ghost
+            // entry. Sweep the partial on failure, exactly as the direct-.onnx branch above does.
+            if let Err(e) = convert::convert_pth_to_onnx(src_path, &onnx_path, &model_type, app_dir)
+            {
+                sweep_partial_import(&subdir, &stem);
+                if let Some(tmp) = &vocoder_tmp {
+                    std::fs::remove_dir_all(tmp).ok();
+                }
+                return Err(e);
+            }
         }
 
         let config = match finalize_sidecar(&onnx_path, name, &model_type, &mut warnings) {

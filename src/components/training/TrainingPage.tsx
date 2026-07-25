@@ -1349,6 +1349,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     goSeg,
     route,
     diffWsInfo,
+    slotInfo,
   } = useTrainingStore();
   const chartRef = useRef<LossChartHandle>(null);
   const [, forceTick] = useState(0);
@@ -1556,9 +1557,14 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // NOT the editable DataStep state, so it survives a DataStep edit and reflects what was trained.
   // Empty for single-speaker / diff / vocoder → the render falls back to speaker 0 (unchanged).
   const [auditionSpeaker, setAuditionSpeaker] = useState(0);
+  // In the 存档中心 there is no run, so the singer names come from the slot's FROZEN list
+  // (`slotInfo.speakers`, index = emb_g id — the same order the model was trained with); during
+  // or right after a run they come from the run snapshot. Without this the archive could only
+  // ever preview emb_g 0 of a multi-speaker model, silently.
+  const auditionSpeakerNames = archiveOnly ? (slotInfo?.speakers ?? []) : (snapshot.speakers ?? []);
   const auditionSpeakers =
-    backendSupportsMultiSpeaker(snapshot.backend) && (snapshot.speakers?.length ?? 0) > 1
-      ? snapshot.speakers!.map((name, i) => ({ id: i, name: name.trim() || `#${i}` }))
+    backendSupportsMultiSpeaker(archiveBackend) && auditionSpeakerNames.length > 1
+      ? auditionSpeakerNames.map((name, i) => ({ id: i, name: name.trim() || `#${i}` }))
       : [];
   // S67: the auto range battery holds this for its WHOLE duration — the old code's
   // stuck-busy accidentally blocked clicks between candidates, and un-sticking it
@@ -1636,6 +1642,11 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // restart, so candidates 2+ never got a range record).
   const rangeRunKey = `${snapshot.workspace}|${snapshot.ckpts.map((c) => c.path).join(",")}`;
   useEffect(() => {
+    // ★ NOT in the 存档中心: this is a just-FINISHED-RUN feature (auto-test THIS run's candidates
+    // for their vocal range). archiveOnly shares RunStep's hooks, and `snapshot` there may be a
+    // same-project leftover run of a DIFFERENT family — firing the battery would grey every
+    // archive 试听 button (auditionBusy) and burn GPU on candidates the archive never displays.
+    if (archiveOnly) return;
     if (!finished || snapshot.ckpts.length === 0) return;
     if (!["rvc", "sovits", "sovits_v2"].includes(snapshot.backend)) return;
     if (candRangeRunRef.current === rangeRunKey) return;
@@ -2410,6 +2421,18 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
               ) : (
                 <div className="training-hint">{t("training.noAttachTarget")}</div>
               ))}
+            {/* multi-speaker: which singer to preview. Only in the standalone 存档中心 — during a
+                run the summary card carries this selector (same `auditionSpeaker` state). */}
+            {archiveOnly && auditionSpeakers.length > 0 && (
+              <div className="training-attach-row">
+                <label title={t("training.auditionSpeakerTip")}>{t("training.auditionSpeaker")}</label>
+                <Dropdown
+                  value={String(auditionSpeaker)}
+                  options={auditionSpeakers.map((s) => ({ value: String(s.id), label: s.name }))}
+                  onChange={(v) => changeAuditionSpeaker(parseInt(v, 10))}
+                />
+              </div>
+            )}
             <div className="training-archive-list">
               {archiveRows.map((r) => {
                 const gone = missingCkpts[r.path] === true;
