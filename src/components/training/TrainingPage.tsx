@@ -1550,121 +1550,6 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   const rowAuditionable = (r: CkptRecord) => rowConvertible(r) || rowAttachable(r);
   const anyAttachable = archiveRows.some(rowAttachable);
 
-  /** The project's on-disk inventory, made ACTIONABLE (S78) — rendered in EVERY run state,
-   *  deliberately.
-   *
-   *  It first lived inside the finished-run summary card, which meant it was invisible after an
-   *  app restart or「清空结果」— exactly the two situations it exists for (the sidecar's in-memory
-   *  candidate list is empty then while the files are on disk). That is why a finished shallow-
-   *  diffusion checkpoint became a dead end the moment anything else was trained: its attach
-   *  button lived only on the summary card. Here every row carries the action its FILE supports,
-   *  at any time. */
-  const archiveBlock = archiveRows.length > 0 && (
-      <div className="training-archive">
-        <button
-          className="training-archive-toggle"
-          onClick={() => setArchiveOpen((v) => !v)}
-        >
-          {archiveOpen ? "▾" : "▸"} {t("training.archiveTitle", { count: archiveRows.length })}
-        </button>
-        {archiveOpen && (
-          <>
-            {/* diffusion rows attach to an INSTALLED SoVITS model (dim-matched) — one shared
-                host selector for the whole list, same as the summary card's */}
-            {anyAttachable &&
-              (attachCandidates.length > 0 ? (
-                <div className="training-attach-row">
-                  <label>{t("training.attachTarget")}</label>
-                  <Dropdown
-                    value={attachTarget}
-                    options={attachCandidates.map((m) => ({ value: m.name, label: m.name }))}
-                    onChange={(v) => setAttachTarget(v)}
-                  />
-                </div>
-              ) : (
-                <div className="training-hint">{t("training.noAttachTarget")}</div>
-              ))}
-            <div className="training-archive-list">
-              {archiveRows.map((r) => {
-                const gone = missingCkpts[r.path] === true;
-                const phase = auditionState[r.path];
-                const diffusion = rowIsDiffusion(r.rel);
-                const canAudition = rowAuditionable(r);
-                const canImport = rowConvertible(r);
-                const canAttach = rowAttachable(r);
-                return (
-                  <div
-                    className={`training-archive-row${gone ? " missing" : ""}`}
-                    key={r.rel}
-                    title={gone ? t("training.ckptMissing") : r.path}
-                  >
-                    <span className="training-archive-name" title={r.path}>{r.rel}</span>
-                    <span className="training-archive-tag">{t(`training.ckptKind.${r.kind}`)}</span>
-                    <span className="training-archive-step">
-                      {r.step != null
-                        ? t("training.ckptStep", { step: r.step })
-                        : // A missing step means two different things and only ONE is「最新」:
-                          // RVC's「只保留最新」writes the sentinel G_2333333.pth, whereas
-                          // `<slug>.pth` / `_best.pth` just carry no step. Labelling the latter
-                          //「最新」would be a lie — and on _best actively misleading.
-                          r.kind === "resumable"
-                          ? t("training.ckptLatest")
-                          : "—"}
-                    </span>
-                    <span className="training-archive-size">{fmtSize(r.bytes)}</span>
-                    {r.imported && (
-                      <span className="training-archive-tag imported">{t("training.ckptImported")}</span>
-                    )}
-                    {gone ? (
-                      <span className="training-ckpt-missing">{t("training.ckptMissing")}</span>
-                    ) : (
-                      <span className="training-archive-actions">
-                        {canAudition && (
-                          <button
-                            className="training-btn small"
-                            disabled={
-                              (auditionBusy && phase !== "converting" && phase !== "rendering") ||
-                              (diffusion && !attachTarget) ||
-                              importingAll
-                            }
-                            onClick={() =>
-                              void auditionCandidate(
-                                r,
-                                diffusion ? "diffusion" : archiveBackend === "vocoder" ? "vocoder" : "voice",
-                              )
-                            }
-                          >
-                            {auditionLabel(r.path)}
-                          </button>
-                        )}
-                        {canAttach && attachCandidates.length > 0 && (
-                          <button
-                            className="training-btn small"
-                            disabled={!attachTarget || attaching != null}
-                            onClick={() => void attachCkpt(r)}
-                          >
-                            {attaching === r.path ? t("training.attaching") : t("training.attach")}
-                          </button>
-                        )}
-                        {canImport && (
-                          <button
-                            className="training-btn small"
-                            disabled={importingAll}
-                            onClick={() => void importCkpt(r)}
-                          >
-                            {t("training.import")}
-                          </button>
-                        )}
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
-      </div>
-    );
 
   // ①c: audition a chosen speaker of a multi-speaker rvc/sovits run. Names come from the RUN's
   // frozen speaker list (snapshot.speakers, index = emb_g id = the converter's speaker-map id) —
@@ -2490,6 +2375,122 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       setImportingAll(false);
     }
   };
+
+  /** The project's on-disk inventory, made ACTIONABLE (S78) — rendered in EVERY run state,
+   *  deliberately.
+   *
+   *  It first lived inside the finished-run summary card, which meant it was invisible after an
+   *  app restart or「清空结果」— exactly the two situations it exists for (the sidecar's in-memory
+   *  candidate list is empty then while the files are on disk). That is why a finished shallow-
+   *  diffusion checkpoint became a dead end the moment anything else was trained: its attach
+   *  button lived only on the summary card. Here every row carries the action its FILE supports,
+   *  at any time. */
+  const archiveBlock = archiveRows.length > 0 && (
+      <div className="training-archive">
+        <button
+          className="training-archive-toggle"
+          onClick={() => setArchiveOpen((v) => !v)}
+        >
+          {archiveOpen ? "▾" : "▸"} {t("training.archiveTitle", { count: archiveRows.length })}
+        </button>
+        {archiveOpen && (
+          <>
+            {/* diffusion rows attach to an INSTALLED SoVITS model (dim-matched) — one shared
+                host selector for the whole list, same as the summary card's */}
+            {anyAttachable &&
+              (attachCandidates.length > 0 ? (
+                <div className="training-attach-row">
+                  <label>{t("training.attachTarget")}</label>
+                  <Dropdown
+                    value={attachTarget}
+                    options={attachCandidates.map((m) => ({ value: m.name, label: m.name }))}
+                    onChange={(v) => setAttachTarget(v)}
+                  />
+                </div>
+              ) : (
+                <div className="training-hint">{t("training.noAttachTarget")}</div>
+              ))}
+            <div className="training-archive-list">
+              {archiveRows.map((r) => {
+                const gone = missingCkpts[r.path] === true;
+                const phase = auditionState[r.path];
+                const diffusion = rowIsDiffusion(r.rel);
+                const canAudition = rowAuditionable(r);
+                const canImport = rowConvertible(r);
+                const canAttach = rowAttachable(r);
+                return (
+                  <div
+                    className={`training-archive-row${gone ? " missing" : ""}`}
+                    key={r.rel}
+                    title={gone ? t("training.ckptMissing") : r.path}
+                  >
+                    <span className="training-archive-name" title={r.path}>{r.rel}</span>
+                    <span className="training-archive-tag">{t(`training.ckptKind.${r.kind}`)}</span>
+                    <span className="training-archive-step">
+                      {r.step != null
+                        ? t("training.ckptStep", { step: r.step })
+                        : // A missing step means two different things and only ONE is「最新」:
+                          // RVC's「只保留最新」writes the sentinel G_2333333.pth, whereas
+                          // `<slug>.pth` / `_best.pth` just carry no step. Labelling the latter
+                          //「最新」would be a lie — and on _best actively misleading.
+                          r.kind === "resumable"
+                          ? t("training.ckptLatest")
+                          : "—"}
+                    </span>
+                    <span className="training-archive-size">{fmtSize(r.bytes)}</span>
+                    {r.imported && (
+                      <span className="training-archive-tag imported">{t("training.ckptImported")}</span>
+                    )}
+                    {gone ? (
+                      <span className="training-ckpt-missing">{t("training.ckptMissing")}</span>
+                    ) : (
+                      <span className="training-archive-actions">
+                        {canAudition && (
+                          <button
+                            className="training-btn small"
+                            disabled={
+                              (auditionBusy && phase !== "converting" && phase !== "rendering") ||
+                              (diffusion && !attachTarget) ||
+                              importingAll
+                            }
+                            onClick={() =>
+                              void auditionCandidate(
+                                r,
+                                diffusion ? "diffusion" : archiveBackend === "vocoder" ? "vocoder" : "voice",
+                              )
+                            }
+                          >
+                            {auditionLabel(r.path)}
+                          </button>
+                        )}
+                        {canAttach && attachCandidates.length > 0 && (
+                          <button
+                            className="training-btn small"
+                            disabled={!attachTarget || attaching != null}
+                            onClick={() => void attachCkpt(r)}
+                          >
+                            {attaching === r.path ? t("training.attaching") : t("training.attach")}
+                          </button>
+                        )}
+                        {canImport && (
+                          <button
+                            className="training-btn small"
+                            disabled={importingAll}
+                            onClick={() => void importCkpt(r)}
+                          >
+                            {t("training.import")}
+                          </button>
+                        )}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+    );
 
   /* -------- 存档中心(独立页,从项目详情的槽卡片进入)-------- */
   if (archiveOnly) {
