@@ -484,11 +484,19 @@ When a note's lyric cannot be found in its effective language's dictionary (Out-
 
 ### 5.7 Pitch: transitions, vibrato, edge glides, freehand drawing
 
-The pink pitch line always shows **the pitch that will actually be sung** (note pitch + transitions + hand-drawn deviation + vibrato). By default every pair of adjacent notes already glides together naturally — you only fine-tune where you want extra nuance.
+The pink pitch line always shows **the pitch that will actually be sung** (note pitch + transitions + hand-drawn deviation + vibrato). By default the app **auto-tunes** — it gives every note natural glides, edge scoops and vibrato, so you only fine-tune where you want extra nuance, or hand a whole part over to it.
 
 ![The piano roll's "Tuning" sidebar tab: note-transition and vibrato sliders](images/vocal-editor-tuning.png)
 
-Open the sidebar's second tab, "Tuning" — three sections:
+Open the sidebar's second tab, "Tuning" — three sections, top to bottom: **Auto-tune**, **Note transition**, **Vibrato**.
+
+**"Auto-tune"** (first download the ~6 MB "Auto-tune model pack" in Settings → Model Assets):
+- **"Auto-follow"**: on by default. A small model **automatically tunes every note you haven't hand-tuned** (glides, edge scoops, vibrato) — it never touches parameters you set by hand or a pitch line you drew. So you can let it shape a whole part first, then refine a few notes.
+- **"Rigidity"** (−100% … +100%): flatten or exaggerate the auto vibrato's wobble — +100% = perfectly flat, 0% = default, −100% = maximum wobble.
+- **"Expressiveness"** (0 … 4×, default 2×): overall scale of the auto-tuning — slur overshoot, edge scoops and vibrato all grow or shrink together.
+- **"Take"** (0 … 99): another take of the singing (a different vibrato phase). The same number always gives the same take and you can dial back to it; 0 is the baseline — if you don't like the current feel, try another number.
+- **Touch it and it's yours**: the moment you hand-edit a note's "Note transition" or "Vibrato" (or draw it with the "Pitch" tool), that note counts as **your own tuning** and auto-follow leaves it alone — the same logic as SynthV's "where you set a value, the automatic pass stays out". Notes you've taken over are marked with a **gold** bar and gold pitch line in the piano roll, so you can tell hand-tuned from auto at a glance.
+- While the model is still downloading it shows "Auto-follow paused (tuning model not ready)", and resumes on its own once the download finishes.
 
 **"Note transition"** (applies to the currently selected notes):
 - "Offset": the transition center's offset from the note boundary (±500 ms).
@@ -501,8 +509,6 @@ Open the sidebar's second tab, "Tuning" — three sections:
 - Select notes and click "Add vibrato" to get the default vibrato (depth 100 cents, rate 5.5 Hz).
 - Six sliders: "Depth" "Rate" "Phase" "Onset" "Fade in" "Fade out".
 - "Remove vibrato" clears it. The sliders affect only selected notes that **already have** vibrato.
-
-**"Track default transition"**: the baseline every note inherits, each item with a "Reset to default" arrow.
 
 All time parameters are absolute milliseconds — they do not change with BPM, and they travel with the notes when notes move. With a multi-selection, the sliders show the first note's values and edits apply to all (the UI shows a ×N count); the whole multi-edit is one undo step. A vibrato with depth 0 is the same as no vibrato.
 
@@ -1049,9 +1055,9 @@ This chapter covers importing scores, and exporting audio and scores — includi
 
 "File" → "Import Score", then pick a .ustx / .ust / .mid / .midi file. Importing is **additive** — it only creates new vocal tracks and never overwrites your existing content.
 
-**Kept**: notes (position/duration/pitch/lyric), the file's first BPM and time signature (if present, they override the project's globals), each track's start position, and ustx **vibrato** (mapped onto this app's vibrato model). Each non-empty track of a multi-track file becomes its own vocal track. .ust files auto-detect Shift-JIS / UTF-8; lyrics R/r/empty are treated as rests.
+**Kept**: notes (position/duration/pitch/lyric), the file's first BPM and time signature (if present, they override the project's globals), each track's start position, and ustx **pitch tuning** (see below). Each non-empty track of a multi-track file becomes its own vocal track. .ust files auto-detect Shift-JIS / UTF-8; lyrics R/r/empty are treated as rests.
 
-**Not kept**: ustx pitch curves/control points (the two pitch models differ — deliberately not imported).
+**Pitch tuning (ustx)**: if a part was **tuned** in OpenUTAU (a hand-drawn pitch line, vibrato, or a pitd curve), its full pitch shaping is **baked exactly** into this vocal track's tuning layer — preserved precisely, and those notes are marked "user-tuned" so auto-tune leaves them alone. A part with **no pitch tuning at all** keeps this app's own SynthV-style defaults instead (a smart skip, so two pitch layers never stack). If a tuned part's curve is too large to bake, it is dropped with a warning, never silently treated as "untuned".
 
 **Track naming**: the file's own track names win; unnamed tracks (all .ust files) are named after the file, and multiple unnamed tracks in one file are numbered "name 1, name 2, …".
 
@@ -1094,9 +1100,9 @@ Export errors decoded:
 - "Format": .ustx (default) / .ust / MIDI.
 - "Vocal tracks": one checkbox per exportable vocal track (with its note count), all checked by default.
 
-**Kept**: notes (absolute-time position/duration/pitch/lyric), BPM, time signature, and for ustx also vibrato — the exact mirror of what import reads. Render-side knobs (transpose etc.) are **not** baked into the pitches.
+**Kept**: notes (absolute-time position/duration/pitch/lyric), BPM, time signature; ustx additionally writes your **pitch tuning** as an OpenUTAU `pitd` pitch-deviation curve (with vibrato as OU's native vibrato), so an export→re-import brings your tuning back exactly — the mirror of what import reads. Render-side knobs (transpose etc.) are **not** baked into the pitches.
 
-**Format-inherent limits**: .ust has no time-signature field; lyrics R/r/empty read back as rests in every UTAU dialect. MIDI's BPM and time-signature denominator have precision/form limits; empty lyrics re-import as the placeholder "あ". ustx writes no pitch curves (deliberate).
+**Format-inherent limits**: .ust has no time-signature field; lyrics R/r/empty read back as rests in every UTAU dialect. MIDI's BPM and time-signature denominator have precision/form limits; empty lyrics re-import as the placeholder "あ". **Only ustx can carry pitch tuning** (as a part-level pitd curve); .ust / MIDI have no channel for it, so exporting to them keeps the notes' own pitch but drops the tuning curve.
 
 **Multi-track .ust**: .ust is a single-track format — selecting multiple tracks saves a zip (the dialog notes "Multiple tracks are packed into a zip (one .ust per track)"), one file per track inside, with duplicate/illegal track names sanitized and numbered.
 
