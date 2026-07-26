@@ -801,10 +801,15 @@
   height: 20px;
   line-height: 18px;
 }
-.rm-audition-spk {
-  max-width: 90px;
+/* S82d: THE speaker selector (one per model row, range-row start; the audition button
+   follows it via lifted state). 16px chip matching the .rm-range-btn row rhythm — a
+   full-height select dwarfed the xs lines and read as crowding (§user, twice). */
+.rm-range-spk {
+  height: 16px;
+  line-height: 14px;
+  padding: 0 4px;
   font-size: var(--font-size-xs);
-  padding: 1px 4px;
+  max-width: 140px;
 }
 
 /* S60c: comfort editor = dual sliders with note-name readouts (F#2, not raw MIDI) */

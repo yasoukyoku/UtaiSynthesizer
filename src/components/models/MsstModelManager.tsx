@@ -926,8 +926,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
           const isVocoder = voiceType === "vocoder";
           const ver = isVocoder ? null : voiceVersionBadge(m);
           const speakerOpts = isVocoder ? [] : voiceSpeakerOptions(m);
-          const speakerCount = speakerOpts.length;
-          const spk = voiceSpk[m.name] ?? 0;
+          // a re-import can shrink the speaker list — a stale stored id falls back to 0
+          const stored = voiceSpk[m.name] ?? 0;
+          const spk = speakerOpts.some((s) => s.id === stored) ? stored : 0;
           const vocFormatOk = isVocoder ? vocoderFormatMatches(m) : true;
           return (
             <div key={m.name} className="rm-voice-item">
@@ -1005,25 +1006,17 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                   {typeof m.config?.features_dim === "number" && (
                     <span>{m.config.features_dim} {t18({ zh: "维", en: "dim", ja: "次元" }, lang)}</span>
                   )}
-                  {speakerCount > 1 && (
-                    <select
-                      className="sep-model-select rm-audition-spk"
-                      value={spk}
-                      title={t18({
-                        zh: "当前歌手——试听与音域记录都指它（多歌手模型的每位歌手各有自己的音域记录）",
-                        en: "Active speaker — both audition and the range record point at it (each singer of a multi-speaker model has its own range record)",
-                        ja: "現在の話者——試聴と音域記録の両方が対象とします（多話者モデルは話者ごとに音域記録を持ちます）",
-                      }, lang)}
-                      onChange={(e) => setVoiceSpk((s) => ({ ...s, [m.name]: Number(e.target.value) }))}
-                    >
-                      {speakerOpts.map((s) => (
-                        <option key={s.id} value={s.id}>{s.label}</option>
-                      ))}
-                    </select>
-                  )}
                 </span>
                 )}
-                {!isVocoder && <VoiceRangeRow m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} spk={spk} />}
+                {!isVocoder && (
+                  <VoiceRangeRow
+                    m={m}
+                    voiceType={voiceType as "rvc" | "sovits"}
+                    lang={lang}
+                    spk={spk}
+                    onSpk={(id) => setVoiceSpk((s) => ({ ...s, [m.name]: id }))}
+                  />
+                )}
               </div>
               {!isVocoder && <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} spk={spk} />}
               <VoiceExportButton m={m} voiceType={voiceType} lang={lang} />
@@ -1289,7 +1282,7 @@ function RangeBatchRow({ lang }: { lang: string }) {
 // ─── S60-2: per-model vocal-range row (v1 session20/21 UX: auto label + comfort editor
 // clamped inside usable + Reset + retest; missing record → 补做 button) ───
 
-function VoiceRangeRow({ m, voiceType, lang, spk }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string; spk: number }) {
+function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string; spk: number; onSpk: (id: number) => void }) {
   const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
   const [editing, setEditing] = useState(false);
   const [lo, setLo] = useState(0);
@@ -1300,11 +1293,31 @@ function VoiceRangeRow({ m, voiceType, lang, spk }: { m: VoiceModelEntry; voiceT
   // hidden forever with no way to fix it. Co-trained speakers genuinely differ in range (that
   // is the point of co-training), and borrowing speaker 0's ceiling for another singer is
   // actively wrong, not merely imprecise.
-  // S82d: `spk` now comes from the model row's SINGLE speaker selector (shared with the
-  // audition button — two per-row selects pointing at different singers were semantic drift,
-  // and the row was visibly overcrowded, §user). Switching speaker closes an open comfort
-  // edit: the lo/hi sliders were seeded from the previous singer's record.
+  // S82d: ONE speaker selector per model, state lifted to the tab (the audition button
+  // follows it — two per-row selects pointing at different singers were semantic drift, and
+  // the row was visibly overcrowded, §user). It renders HERE at the range row's start (the
+  // row reads as a sentence: singer ▾ comfort … — and this row has slack + wraps), as a
+  // 16px chip matching the row rhythm (a full-height select dwarfed the xs lines = the
+  // crowding, §user round 2). Switching speaker closes an open comfort edit: the lo/hi
+  // sliders were seeded from the previous singer's record.
   useEffect(() => setEditing(false), [spk]);
+  const speakers = voiceSpeakerOptions(m);
+  const speakerPicker = speakers.length > 1 && (
+    <select
+      className="sep-model-select rm-range-spk"
+      value={spk}
+      title={t18({
+        zh: "当前歌手——试听与音域记录都指它（多歌手模型的每位歌手各有自己的音域记录）",
+        en: "Active speaker — both audition and the range record point at it (each singer of a multi-speaker model has its own range record)",
+        ja: "現在の話者——試聴と音域記録の両方が対象とします（多話者モデルは話者ごとに音域記録を持ちます）",
+      }, lang)}
+      onChange={(e) => onSpk(Number(e.target.value))}
+    >
+      {speakers.map((s) => (
+        <option key={s.id} value={s.id}>{s.label}</option>
+      ))}
+    </select>
+  );
   const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
   const sp = rec?.speakers?.[String(spk)];
   // what the render layer will actually target (degenerate stored comfort heals to
@@ -1332,6 +1345,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk }: { m: VoiceModelEntry; voiceT
     // no record (never tested / lost to a re-import / app crash) → the 补做 entry point
     return (
       <span className="rm-range-row">
+        {speakerPicker}
         <span className="rm-range-missing">{t18({ zh: "无音域记录", en: "No range record", ja: "音域記録なし" }, lang)}</span>
         <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path, spk)}>
           {t18({ zh: "测音域", en: "Detect range", ja: "音域を測定" }, lang)}
@@ -1342,6 +1356,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk }: { m: VoiceModelEntry; voiceT
   return (
     <>
     <span className="rm-range-row">
+      {speakerPicker}
       <span
         className="rm-range-text"
         title={t18({
