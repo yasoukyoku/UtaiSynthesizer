@@ -678,11 +678,14 @@ async function executeNode(
     }
 
     case "transpose": {
-      // Fidelity transpose (spectral, Signalsmith) — built for instrumentals. 0 = exact
-      // passthrough: forward the input path untouched so an inert node costs nothing and
-      // downstream lanes keep byte-identical audio.
+      // Fidelity transpose (spectral, Signalsmith) — built for instrumentals. All-neutral =
+      // exact passthrough: forward the input path untouched so an inert node costs nothing and
+      // downstream lanes keep byte-identical audio. preserveFormants alone (0 st, 0 offset)
+      // is also inert — there is nothing to preserve against.
       const semitones = typeof params.semitones === "number" ? params.semitones : 0;
-      if (semitones === 0) {
+      const formantOffset = typeof params.formantOffset === "number" ? params.formantOffset : 0;
+      const preserveFormants = params.preserveFormants === true;
+      if (semitones === 0 && formantOffset === 0) {
         outputData.set(0, primaryInput);
         break;
       }
@@ -691,6 +694,8 @@ async function executeNode(
       await invoke("transpose_audio", {
         path: primaryInput,
         semitones,
+        formantOffset,
+        preserveFormants,
         outputPath,
       });
       outputData.set(0, outputPath);

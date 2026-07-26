@@ -213,19 +213,33 @@ fn trim_codec_silence(mut buf: crate::audio::AudioBuffer) -> crate::audio::Audio
 
 /// Fidelity pitch-shift (transpose) of a whole file — the workflow Transpose node's engine.
 /// Spectral-domain via Signalsmith Stretch (time_factor = 1.0 → sample-exact same length),
-/// formant/tonality-aware, polyphonic-safe (built for instrumentals; the vocal path transposes
-/// model-side instead). Writes a 32-bit float WAV to `output_path` (a run-unique workflow cache
-/// path — path change IS the re-render signal, so no content-addressing here). Errors are stable
-/// CODEs per the i18n rule: TRANSPOSE_RANGE / TRANSPOSE_INPUT_MISSING / STRETCH_ENGINE_FAILED.
+/// tonality-aware, polyphonic-safe (built for instrumentals; the vocal path transposes
+/// model-side instead). S82 formant controls (engine-native): `preserve_formants` pins the
+/// spectral envelope to the SOURCE instead of letting it follow the transpose, and
+/// `formant_offset` shifts it on top (a pure timbre control at 0 semitones). Both neutral ⇒
+/// the exact pre-S82 engine path (no formant machinery at all). Writes a 32-bit float WAV to
+/// `output_path` (a run-unique workflow cache path — path change IS the re-render signal, so
+/// no content-addressing here). Errors are stable CODEs per the i18n rule: TRANSPOSE_RANGE /
+/// TRANSPOSE_FORMANT_RANGE / TRANSPOSE_INPUT_MISSING / STRETCH_ENGINE_FAILED.
 #[tauri::command]
 pub async fn transpose_audio(
     path: String,
     semitones: f64,
+    formant_offset: f64,
+    preserve_formants: bool,
     output_path: String,
 ) -> Result<StretchResult, String> {
     if !(semitones.is_finite() && (-24.0..=24.0).contains(&semitones)) {
         return Err("TRANSPOSE_RANGE".to_string());
     }
+    if !(formant_offset.is_finite() && (-24.0..=24.0).contains(&formant_offset)) {
+        return Err("TRANSPOSE_FORMANT_RANGE".to_string());
+    }
+    // Formant target relative to the SOURCE spectrum: follow the transpose (classic behavior)
+    // unless preserved, then apply the offset. target == semitones ⇒ the engine's native
+    // follow path — skip the formant machinery entirely (bit-path of the pre-S82 node).
+    let formant_target = if preserve_formants { formant_offset } else { semitones + formant_offset };
+    let formant = ((formant_target - semitones).abs() > 1e-9).then_some(formant_target);
     tauri::async_runtime::spawn_blocking(move || {
         let input = PathBuf::from(&path);
         let buf = crate::audio::load_audio(&input).map_err(|e| format!("TRANSPOSE_INPUT_MISSING: {e}"))?;
@@ -235,7 +249,7 @@ pub async fn transpose_audio(
             buf.sample_rate,
             1.0,
             semitones,
-            None,
+            formant,
         )?;
         let out_buf = crate::audio::AudioBuffer {
             samples: shifted,

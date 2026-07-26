@@ -45,6 +45,7 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // Transpose node (utai-stretch wrapper) codes.
   TRANSPOSE_INPUT_MISSING: { key: "workflow.errTransposeInput" },
   TRANSPOSE_RANGE: { key: "workflow.errTransposeRange" },
+  TRANSPOSE_FORMANT_RANGE: { key: "workflow.errTransposeFormantRange" },
   // ── Generated from the S62 full-sweep manifests (4 conversion clusters) — one entry per stable
   // Rust CODE; texts live under backend.* in src/i18n/{zh,en,ja}.json (TRAINING_NO_DATA reuses the
   // pre-existing training.needData key). Keep alphabetical; busy flags mark interlock rejections. ──
