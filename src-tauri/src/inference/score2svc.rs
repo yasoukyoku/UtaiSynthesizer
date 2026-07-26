@@ -805,14 +805,15 @@ fn apply_range_inverse(
     if range_shift == 0 || audio.is_empty() {
         return Ok(audio);
     }
-    // note_hz is the FED (already range-shifted) parametric pitch — its voiced median is the
-    // formant-analysis base (S82 anti-pop; see vocal_range::formant_base_hint).
+    // note_hz is the FED (already range-shifted) parametric pitch on the 50 fps cv grid — it
+    // drives the inverse's streaming formant base (S82b anti-pop; vocal_range folds it into
+    // a sticky schedule).
     super::vocal_range::apply_inverse(
         audio,
         sample_rate,
         range_shift,
         kappa,
-        super::vocal_range::formant_base_hint(note_hz),
+        Some((note_hz, (sample_rate as usize / 50).max(1))),
     )
     .map_err(UtaiError::Inference)
 }

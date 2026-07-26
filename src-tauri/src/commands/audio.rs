@@ -245,8 +245,11 @@ pub async fn transpose_audio(
     // semitones ⇒ the engine's native follow path — skip the formant machinery entirely
     // (bit-path of the pre-S82 node).
     let formant_target = formant_follow.clamp(0.0, 1.0) * semitones + formant_offset;
-    let formant = ((formant_target - semitones).abs() > 1e-9)
-        .then_some(utai_stretch::FormantPin { semitones: formant_target, base_hz: None });
+    let formant = ((formant_target - semitones).abs() > 1e-9).then_some(utai_stretch::FormantPin {
+        semitones: formant_target,
+        base_hz: &[], // instrumental content has no single known f0 — engine auto-detect
+        base_step: 0,
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let input = PathBuf::from(&path);
         let buf = crate::audio::load_audio(&input).map_err(|e| format!("TRANSPOSE_INPUT_MISSING: {e}"))?;

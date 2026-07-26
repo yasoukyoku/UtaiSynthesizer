@@ -553,27 +553,56 @@ pub fn piece_range_shift(
 /// entirely (zero extra cost).
 pub const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
 
-/// Median of the voiced (> 20 Hz) values of a fed-f0 track — the formant-analysis base hint
-/// for apply_inverse. The engine's per-block pitch auto-detector chases noise on voiceless
-/// consonants and the resulting correction jitter is audible as pops (S82, ear-confirmed);
-/// we KNOW what f0 the model was fed, so hand the engine that instead. None (< 10 voiced
-/// frames) falls back to the auto-detector. Callers pass the SHIFTED track — the inverse's
-/// input is the render at the shifted pitch.
-pub fn formant_base_hint(f0_hz: &[f32]) -> Option<f32> {
-    let mut voiced: Vec<f32> = f0_hz.iter().copied().filter(|&v| v > 20.0).collect();
-    if voiced.len() < 10 {
+/// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b streaming base): per
+/// window the voiced (> 20 Hz) median, quantized to the nearest semitone — the engine wants
+/// a ROUGH fundamental, and quantizing merges neighboring windows into runs so the shim's
+/// per-run process slicing stays coarse. Unvoiced windows carry the previous value (a
+/// mid-stream 0 would re-enable the engine's noise-chasing auto-detector — the exact jitter
+/// this schedule exists to kill, S82 ear-confirmed); leading unvoiced windows backfill from
+/// the first voiced one. All-unvoiced ⇒ None (auto-detect). Callers pass the SHIFTED track —
+/// the inverse's input is the render at the shifted pitch. Returns (track, step_samples).
+pub fn formant_base_track(
+    f0_hz: &[f32],
+    hop_samples: usize,
+    sample_rate: u32,
+) -> Option<(Vec<f32>, usize)> {
+    if f0_hz.is_empty() || hop_samples == 0 {
         return None;
     }
-    voiced.sort_by(|a, b| a.total_cmp(b));
-    Some(voiced[voiced.len() / 2])
+    let step_frames =
+        ((sample_rate as f32 * 0.1 / hop_samples as f32).round() as usize).max(1);
+    let quantize = |hz: f32| 440.0f32 * 2.0f32.powf((12.0 * (hz / 440.0).log2()).round() / 12.0);
+    let mut track: Vec<f32> = Vec::with_capacity(f0_hz.len() / step_frames + 1);
+    for win in f0_hz.chunks(step_frames) {
+        let mut voiced: Vec<f32> = win.iter().copied().filter(|&v| v > 20.0).collect();
+        if voiced.len() < (win.len() / 4).max(2) {
+            track.push(0.0); // filled below
+            continue;
+        }
+        voiced.sort_by(|a, b| a.total_cmp(b));
+        track.push(quantize(voiced[voiced.len() / 2]));
+    }
+    // sticky forward-fill, then backfill the leading unvoiced stretch
+    let first_voiced = track.iter().position(|&v| v > 0.0)?;
+    let head = track[first_voiced];
+    for v in track[..first_voiced].iter_mut() {
+        *v = head;
+    }
+    for i in first_voiced + 1..track.len() {
+        if track[i] <= 0.0 {
+            track[i] = track[i - 1];
+        }
+    }
+    Some((track, hop_samples * step_frames))
 }
 
 /// THE single execution point of the inverse shift — shared by the score, cover and audition
 /// paths so engine policy can never drift between them. Shifts `audio` back by `-shift`
-/// semitones through the Signalsmith engine (time_factor 1.0 = pure transpose, no f0 guide
-/// needed); `kappa` sets the formant policy (see DEFAULT_FORMANT_KAPPA);
-/// `formant_base_hz` = the fed f0's median (formant_base_hint) so the formant analysis never
-/// runs on its noise-chasing auto-detector when we know the truth. Output length == input
+/// semitones through the Signalsmith engine (time_factor 1.0 = pure transpose); `kappa` sets
+/// the formant policy (see DEFAULT_FORMANT_KAPPA); `fed_f0` = (the SHIFTED f0 the model was
+/// fed, its hop in output samples) — folded into a sticky base schedule
+/// (formant_base_track) so the formant analysis follows the audio's local fundamental
+/// instead of its noise-chasing auto-detector (S82/S82b anti-pop). Output length == input
 /// length exactly (every caller's trim/pad arithmetic depends on that).
 ///
 /// A stretch failure is LOUD: there is no second engine to fall back to, and returning the
@@ -584,7 +613,7 @@ pub fn apply_inverse(
     sample_rate: u32,
     shift: i64,
     kappa: f32,
-    formant_base_hz: Option<f32>,
+    fed_f0: Option<(&[f32], usize)>,
 ) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -593,17 +622,21 @@ pub fn apply_inverse(
     // otherwise reads as "no difference").
     static ENGINE_LOG: std::sync::Once = std::sync::Once::new();
     ENGINE_LOG.call_once(|| {
-        tracing::info!("range-extend: inverse engine = signalsmith-stretch 1.3.2 (native formant control)");
+        tracing::info!("range-extend: inverse engine = signalsmith-stretch 1.3.2 (native formant control, streaming base)");
     });
     let k = kappa.clamp(0.0, 1.0);
     let semis = -(shift as f64); // semitones the AUDIO moves = inverse of the model-side shift
+    let schedule =
+        fed_f0.and_then(|(f0, hop)| formant_base_track(f0, hop, sample_rate));
     // κ=1 is the plain transpose: skip the formant machinery entirely (zero extra cost).
     let formant = ((1.0 - k) > 1e-3).then(|| utai_stretch::FormantPin {
         semitones: f64::from(k) * semis,
-        base_hz: formant_base_hz.filter(|b| b.is_finite() && *b > 0.0).map(f64::from),
+        base_hz: schedule.as_ref().map_or(&[][..], |(t, _)| t.as_slice()),
+        base_step: schedule.as_ref().map_or(0, |(_, s)| *s),
     });
     tracing::debug!(
-        "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base {formant_base_hz:?} Hz"
+        "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base schedule {} pts",
+        schedule.as_ref().map_or(0, |(t, _)| t.len())
     );
     let n = audio.len();
     let mut y = utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, semis, formant)?;
@@ -1007,25 +1040,38 @@ mod tests {
         let untouched =
             apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA, None).expect("shift 0");
         assert_eq!(untouched, x);
-        for (shift, kappa, base) in
-            [(-3i64, 0.0f32, None), (5, 0.0, Some(220.0f32)), (-7, 1.0, None)]
-        {
-            let y = apply_inverse(x.clone(), sr, shift, kappa, base).expect("inverse");
+        let fed: Vec<f32> = vec![220.0; 101];
+        for (shift, kappa, fed_f0) in [
+            (-3i64, 0.0f32, None),
+            (5, 0.0, Some((fed.as_slice(), sr as usize / 100))),
+            (-7, 1.0, None),
+        ] {
+            let y = apply_inverse(x.clone(), sr, shift, kappa, fed_f0).expect("inverse");
             assert_eq!(y.len(), x.len(), "shift={shift} kappa={kappa}");
             assert!(y.iter().all(|v| v.is_finite()));
         }
     }
 
     #[test]
-    fn the_base_hint_is_a_voiced_median_or_nothing() {
-        // zeros (rests/unvoiced) never pollute the hint; too few voiced frames = no hint
-        // (auto-detect fallback), never a garbage scalar.
-        let mut f0 = vec![0.0f32; 50];
-        f0.extend(vec![220.0; 30]);
-        f0.extend(vec![440.0; 10]);
-        assert_eq!(formant_base_hint(&f0), Some(220.0));
-        assert_eq!(formant_base_hint(&vec![0.0f32; 100]), None);
-        assert_eq!(formant_base_hint(&[220.0; 5]), None);
+    fn the_base_schedule_is_sticky_quantized_and_voiced_only() {
+        // 100 fps hop at 48 kHz ⇒ 10 frames per 100 ms window. Layout: 1 s unvoiced lead,
+        // 1 s of 220 Hz, 1 s unvoiced (must CARRY 220 — a mid-stream 0 would re-enable the
+        // auto-detector), 1 s of 465 Hz (quantizes to the 466.16 Hz semitone).
+        let hop = 480usize;
+        let mut f0 = vec![0.0f32; 100];
+        f0.extend(vec![220.0; 100]);
+        f0.extend(vec![0.0; 100]);
+        f0.extend(vec![465.0; 100]);
+        let (track, step) = formant_base_track(&f0, hop, 48000).expect("schedule");
+        assert_eq!(step, 4800); // 10 frames × 480 samples
+        assert_eq!(track.len(), 40);
+        assert!(track.iter().all(|&v| v > 0.0), "no mid-stream zeros: {track:?}");
+        assert!((track[0] - 220.0).abs() < 1.0, "leading unvoiced backfills: {}", track[0]);
+        assert!((track[15] - 220.0).abs() < 1.0);
+        assert!((track[25] - 220.0).abs() < 1.0, "unvoiced stretch carries: {}", track[25]);
+        assert!((track[35] - 466.16).abs() < 1.0, "quantized to semitone: {}", track[35]);
+        // all-unvoiced ⇒ None (auto-detect), never a garbage schedule
+        assert!(formant_base_track(&vec![0.0f32; 400], hop, 48000).is_none());
     }
 
     #[test]

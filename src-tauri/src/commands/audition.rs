@@ -320,8 +320,8 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
     }
 }
 
-/// Compute the whole-clip shift for the render + inverse pair, plus the SHIFTED f0's median
-/// as the inverse's formant-analysis base (S82 anti-pop).
+/// Compute the whole-clip shift for the render + inverse pair, plus the SHIFTED f0 track
+/// (100 fps) that drives the inverse's streaming formant base (S82b anti-pop).
 /// None = no record / already in range → render untouched.
 fn audition_range_prep(
     app: &AppState,
@@ -329,7 +329,7 @@ fn audition_range_prep(
     mel: &ndarray::Array2<f32>,
     src: &crate::audio::AudioBuffer,
     range: Option<crate::inference::vocal_range::SpeakerRange>,
-) -> Result<Option<(i64, Option<f32>)>, String> {
+) -> Result<Option<(i64, Vec<f32>)>, String> {
     let Some(r) = range else { return Ok(None) };
     let mono = crate::audio::resample::to_mono(src);
     let wav16k = crate::inference::features::resample(
@@ -357,23 +357,24 @@ fn audition_range_prep(
     }
     tracing::info!("audition range-extend: clip rendered {shift:+} st into comfort");
     let k = 2.0f32.powf(shift as f32 / 12.0);
-    let base = crate::inference::vocal_range::formant_base_hint(&f0).map(|b| b * k);
-    Ok(Some((shift, base)))
+    // shifted, zeros preserved (rests stay unvoiced for the schedule's stickiness logic)
+    let fed: Vec<f32> = f0.iter().map(|v| v * k).collect();
+    Ok(Some((shift, fed)))
 }
 
 /// Apply the inverse of `audition_range_prep`'s shift to a finished render.
 fn audition_range_invert(
     result: crate::inference::SynthesisResult,
-    prep: &Option<(i64, Option<f32>)>,
+    prep: &Option<(i64, Vec<f32>)>,
 ) -> Result<crate::inference::SynthesisResult, String> {
     match prep {
-        Some((shift, base)) => Ok(crate::inference::SynthesisResult {
+        Some((shift, fed)) => Ok(crate::inference::SynthesisResult {
             audio: crate::inference::vocal_range::apply_inverse(
                 result.audio,
                 result.sample_rate,
                 *shift,
                 crate::inference::vocal_range::DEFAULT_FORMANT_KAPPA,
-                *base,
+                Some((fed.as_slice(), (result.sample_rate as usize / 100).max(1))),
             )?,
             sample_rate: result.sample_rate,
         }),
@@ -523,7 +524,7 @@ pub async fn render_audition_voice(
             .map_err(|e| e.to_string())?;
         // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
         let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-        let range_f0_shift = range_prep.map(|(s, _)| s as f32).unwrap_or(0.0);
+        let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
         let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
         let cancel = || app.inference.voice_cancelled(run_epoch);
 
@@ -1128,7 +1129,7 @@ pub async fn render_model_audition(
             let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
             // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
             let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-            let range_f0_shift = range_prep.map(|(s, _)| s as f32).unwrap_or(0.0);
+            let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
             let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
             let cancel = || app.inference.voice_cancelled(run_epoch);
             let nch = noise_channels(&entry.config);
