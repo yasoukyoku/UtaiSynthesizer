@@ -313,7 +313,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
                 }
             }
             format!(
-                "_s82_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s83_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }
@@ -1330,6 +1330,7 @@ pub async fn render_candidate_scale(
                 };
                 crate::inference::score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
+                    crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
                     0, 0, None, None, None, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?
@@ -1369,7 +1370,9 @@ pub async fn render_candidate_scale(
                 };
                 crate::inference::score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
-                    crate::commands::inference::VOCAL_FLAT_VOL, 0, 0, None, None, None,
+                    crate::commands::inference::VOCAL_FLAT_VOL,
+                    crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
+                    0, 0, None, None, None,
                     &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?

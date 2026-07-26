@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
-import { isBreathLyric } from "../vocalNotes";
+import { isBreathLyric, DEFAULT_CONSONANT_EMPHASIS_DB } from "../vocalNotes";
 import { DEFAULT_LANG_ID, effLangId } from "./languages";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
@@ -125,6 +125,8 @@ export interface VocalRenderOptions {
   transpose: number;
   /** S60-2 音域扩展 (track-level): no-op without a sidecar vocal_range record. */
   range_extend: boolean;
+  /** S83 knife 6b: voiceless-onset emphasis (dB; 0 = off; SynthV "consonant strength" analogue). */
+  consonant_emphasis_db: number;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -354,8 +356,10 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  and the user hears nothing", which reads as a failed fix (S81 audit).
  *  ★ Any change to the decision functions in src-tauri/src/inference/vocal_range.rs (or to the
  *  inverse engine) MUST bump this AND the matching literal in
- *  commands/audition.rs::audition_cache_tag. s82 = Signalsmith 1.3.2 native-formant inverse. */
-export const RANGE_ALGO_VERSION = "s82";
+ *  commands/audition.rs::audition_cache_tag. s82 = Signalsmith 1.3.2 native-formant inverse;
+ *  s83 = quiet-damage capped at 1.0 (a loudness-tilted scale no longer freezes the optimizer
+ *  at 0 while an unsingable climax stays broken — the chika_v2 case). */
+export const RANGE_ALGO_VERSION = "s83";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
@@ -460,6 +464,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       transpose: vp.transpose,
       // S60-2: absent = ON (no-op until the model carries a vocal_range record)
       range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
+      consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },
