@@ -290,11 +290,33 @@ pub fn is_nucleus_phone(p: &str) -> bool {
 // Σ event frames (borrowing is zero-sum, in-note allocation never exceeds fr — the old `max(1)` inflation
 // that pushed every later note off the timeline is gone; a coda/onset that can't get its minimum is
 // DROPPED, never inflated).
-const ONSET_TARGET_FRAMES: i64 = 4; // ≈80 ms — the training single-onset median (4-5 fr), tempo-invariant
-const CODA_MAX_FRAMES: i64 = 4;
 const CODA_MIN_FRAMES: i64 = 2; // a 1-frame phone is categorically OOD (0 occurrences in training npz)
 const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
 const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
+/// Fallback targets for a consonant missing from the measured priors (defensive — the generator
+/// covers every non-nucleus token; ≈ the global consonant medians).
+const ONSET_TARGET_FALLBACK: i64 = 4;
+const CODA_TARGET_FALLBACK: i64 = 4;
+
+/// S83 second knife: per-consonant duration TARGETS from the training distribution (see the
+/// generated score2cv_dur_priors.rs header). One flat 4-frame target for every consonant parked
+/// each token OFF its own distribution center (stops t/d sit at 3 frames, fricatives s/ɕ at 7) —
+/// the "every consonant the same 程度" flattening the user heard vs SynthV's phoneme panel. The
+/// allocator borrows/caps per token so ScoreToCV sees each consonant at the duration it trained on.
+fn dur_prior(p: &str) -> Option<(i64, i64)> {
+    static M: OnceLock<HashMap<&'static str, (i64, i64)>> = OnceLock::new();
+    M.get_or_init(|| {
+        super::score2cv_dur_priors::PHONE_DUR_PRIORS.iter().map(|&(t, o, c)| (t, (o, c))).collect()
+    })
+    .get(p)
+    .copied()
+}
+fn onset_target_frames(p: &str) -> i64 {
+    dur_prior(p).map(|(o, _)| o).unwrap_or(ONSET_TARGET_FALLBACK)
+}
+fn coda_target_frames(p: &str) -> i64 {
+    dur_prior(p).map(|(_, c)| c).unwrap_or(CODA_TARGET_FALLBACK)
+}
 
 /// In-note allocation for one note's phones (`fr` ≥ 1 frames inside the note window): medial + coda get
 /// bounded shares, the nucleus takes the remainder, onset positions are left 0 (the caller fills them by
@@ -321,25 +343,21 @@ fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) 
         *d = c;
         used += c;
     }
-    // coda: ≤4 each, ≥2 each (else DROPPED, first-first — the word-final release is the perceptually
-    // load-bearing cue), total ≤ 2/5 of the note (training: vowel share median 44-47%).
+    // coda: per-token measured target each (S83 second knife: t/d≈3, n≈4, s/ɕ≈6-7 — one flat cap
+    // flattened the 程度), ≥2 each (else DROPPED — never a 1-frame phone), total ≤ 2/5 of the note
+    // (training: vowel share median 44-47%). LAST-first: the word-final release is the perceptually
+    // load-bearing cue — when the budget starves, inner codas drop before it.
     if n_coda > 0 {
-        let mut budget = (CODA_MAX_FRAMES * n_coda as i64).min(fr - nuc_floor - used).min(fr * 2 / 5);
-        let keep = ((budget / CODA_MIN_FRAMES).max(0) as usize).min(n_coda);
-        if keep > 0 {
-            budget = budget.min(CODA_MAX_FRAMES * keep as i64);
-            let base = budget / keep as i64;
-            let mut extra = budget - base * keep as i64;
-            for d in durs.iter_mut().skip(n - keep).rev() {
-                let mut give = base.min(CODA_MAX_FRAMES);
-                if extra > 0 {
-                    let a = (CODA_MAX_FRAMES - give).min(extra);
-                    give += a;
-                    extra -= a;
-                }
-                *d = give;
-                used += give;
+        let want: i64 = ph[nuc + 1..].iter().map(|p| coda_target_frames(p)).sum();
+        let mut budget = want.min(fr - nuc_floor - used).min(fr * 2 / 5);
+        for i in (nuc + 1..n).rev() {
+            let give = coda_target_frames(ph[i]).min(budget);
+            if give < CODA_MIN_FRAMES {
+                continue; // dropped; the remaining budget stays for the codas before it
             }
+            durs[i] = give;
+            budget -= give;
+            used += give;
         }
     }
     durs[nuc] = fr - used; // nucleus takes the whole remainder (≥ nuc_floor by construction)
@@ -445,6 +463,26 @@ mod voiceless_tests {
 mod nucleus_tests {
     use super::is_nucleus_phone;
     use super::super::score2cv_tables::PHONE_TO_ID;
+
+    #[test]
+    fn duration_priors_cover_every_consonant_and_stay_in_window() {
+        use super::super::score2cv_dur_priors::PHONE_DUR_PRIORS;
+        let prior: std::collections::HashMap<&str, (i64, i64)> =
+            PHONE_DUR_PRIORS.iter().map(|&(t, o, c)| (t, (o, c))).collect();
+        assert_eq!(prior.len(), PHONE_DUR_PRIORS.len(), "no duplicate tokens in the priors table");
+        let mut consonants = 0usize;
+        for &(p, _) in PHONE_TO_ID {
+            let special = matches!(p, "SP" | "AP" | "PAD" | "BOS" | "EOS");
+            if !special && !is_nucleus_phone(p) {
+                consonants += 1;
+                let (o, c) = *prior.get(p).unwrap_or_else(|| panic!("consonant {p} missing a duration prior"));
+                assert!((2..=7).contains(&o) && (2..=7).contains(&c), "{p} prior out of window: {o}/{c}");
+            } else {
+                assert!(!prior.contains_key(p), "{p} (nucleus/special) must not carry a prior");
+            }
+        }
+        assert_eq!(consonants, PHONE_DUR_PRIORS.len(), "table covers exactly the consonant set");
+    }
 
     #[test]
     fn nucleus_classification_is_exhaustive_and_stable() {
@@ -616,15 +654,17 @@ fn assemble_arrays(
                             Some(_) => (pdur.last().copied().unwrap_or(0) - SUNG_KEEP_MIN).max(0),
                             None => 0, // score start: no lender — the onset falls back in-note below
                         };
-                        let mut left = (ONSET_TARGET_FRAMES * onset_end as i64).min(avail);
+                        let want: i64 = ph[..onset_end].iter().map(|p| onset_target_frames(p)).sum();
+                        let mut left = want.min(avail);
                         if left > 0 {
                             *pdur.last_mut().unwrap() -= left;
                         }
                         // distribute LAST-first (the consonant adjacent to the vowel carries the
-                        // syllable identity — a starved cluster sheds its outermost member first).
-                        for d in durs.iter_mut().take(onset_end).rev() {
-                            let give = left.min(ONSET_TARGET_FRAMES);
-                            *d = give;
+                        // syllable identity — a starved cluster sheds its outermost member first),
+                        // each capped at its own measured target (S83 second knife).
+                        for i in (0..onset_end).rev() {
+                            let give = left.min(onset_target_frames(ph[i]));
+                            durs[i] = give;
                             left -= give;
                         }
                         // in-note supplement for underfed onsets (score start / drained lender):
@@ -953,11 +993,13 @@ mod tests {
     fn preroll_puts_every_vowel_on_the_beat() {
         let daw = daw_ja(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
         assert_eq!(daw.phon, vec!["a", "t", "a", "ɕ", "i"]);
-        assert_eq!(daw.phone_dur, vec![3, 4, 3, 4, 6], "た/し onsets borrowed 4 from the previous vowel");
+        // Per-token priors (S83 second knife): the stop t targets 3 frames, the fricative ɕ 7
+        // (capped by the lender's spare 5) — 塞音短/擦音长, no flat 4-frame 程度.
+        assert_eq!(daw.phone_dur, vec![4, 3, 2, 5, 6], "onsets borrowed at their own measured targets");
         assert_eq!(daw.phone_dur.iter().sum::<i64>(), 7 + 7 + 6, "frame-conserving (timeline unmoved)");
         // vowel onsets (cumulative) land exactly on the beats 0 / 7 / 14:
-        assert_eq!(3 + 4, 7, "た's vowel starts on beat 7");
-        assert_eq!(3 + 4 + 3 + 4, 14, "し's vowel starts on beat 14");
+        assert_eq!(4 + 3, 7, "た's vowel starts on beat 7");
+        assert_eq!(4 + 3 + 2 + 5, 14, "し's vowel starts on beat 14");
         // evt mapping (the phoneme lane's note attribution):
         assert_eq!(daw.evt, vec![0, 1, 1, 2, 2]);
         // parity build untouched: split_dur shape, consonant INSIDE the note window.
@@ -1009,9 +1051,10 @@ mod tests {
         let score = [en_evt("R", 0, 10), en_evt("mine", 69, 50), en_evt("R", 0, 10)];
         let arr = build_arrays_daw(&score, &d).unwrap();
         assert_eq!(arr.phon, vec!["SP", "m", "aɪ", "n", "SP"]);
-        // m pre-rolls 4 from the leading rest; coda n is BOUNDED at 4; the vowel gets the remainder
-        // (46 frames = 92% — the old split_dur gave it 4 and the [n] hum 42).
-        assert_eq!(arr.phone_dur, vec![6, 4, 46, 4, 10]);
+        // m pre-rolls at its measured 5-frame target from the leading rest; coda n is bounded at
+        // its 4-frame target; the vowel gets the remainder (46 frames = 92% — the old split_dur
+        // gave it 4 and the [n] hum 42).
+        assert_eq!(arr.phone_dur, vec![5, 5, 46, 4, 10]);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 70, "frame-conserving");
     }
 
@@ -1020,7 +1063,9 @@ mod tests {
         let d = en_dicts();
         let arr = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 50)], &d).unwrap();
         assert_eq!(arr.phon, vec!["SP", "f", "aɪ", "n", "d"]);
-        assert_eq!(arr.phone_dur, vec![6, 4, 42, 4, 4], "n+d bounded at 4 each; the 760ms [d] is gone");
+        // f (fricative) targets 6, coda n targets 4, the stop d 3 — the 760ms flat [d] is gone AND
+        // the consonants are no longer one flat size.
+        assert_eq!(arr.phone_dur, vec![4, 6, 43, 4, 3], "codas at their own measured targets");
         // a 3-frame note can't fit any coda at the 2-frame minimum → both drop, the nucleus survives.
         let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d).unwrap();
         assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");
