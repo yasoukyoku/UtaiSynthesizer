@@ -1,11 +1,17 @@
 // wrapper.cpp — minimal extern "C" shim over Signalsmith Stretch (vendored, MIT).
 //
-// One-shot offline exact-length stretch, mirroring the upstream CLI's canonical recipe
-// (vendor cmd/main.cpp): seek() a pre-roll of inputLatency samples, process() the whole body,
-// flush() an outputLatency tail, then fold the leading latency block back (reversed & negated)
-// and skip it — the output then aligns sample-exactly with round(inputSamples * timeFactor).
+// One-shot offline exact-length stretch via the upstream one-call recipe: stretch.exact()
+// (the 1.3.x canonical path — vendor cmd/main.cpp uses it; it runs the outputSeek pre-roll,
+// process and flush internally and aligns the output sample-exactly start-to-start and
+// end-to-end with round(inputSamples * timeFactor)).
 //
-// Interleaved f32 in/out; channels are deinterleaved here because the templated process()
+// exact() refuses inputs shorter than its seek length (outputSeekLength(playbackRate), on the
+// order of 130 ms at 44.1k) by zeroing the output. Those degenerate clips are handled here by
+// zero-padding the input FRONT up to the seek length and trimming the correspondingly stretched
+// head off the output — the tail stays end-aligned, so a tiny clip still comes back as audio
+// instead of silence (the transpose node can be fed arbitrarily short segments).
+//
+// Interleaved f32 in/out; channels are deinterleaved here because the templated exact()
 // indexes buffers[channel][sample].
 
 #include "signalsmith-stretch/signalsmith-stretch.h"
@@ -19,13 +25,20 @@ extern "C" {
 // Returns 0 on success, non-zero on failure. `output` must hold out_samples * channels floats,
 // where out_samples = (int)llround(in_samples * time_factor) as computed by the Rust caller.
 // `transpose_semitones` = 0 keeps the original pitch (pure time-stretch); non-zero pitch-shifts
-// in the spectral domain (formant/tonality-aware — the upstream-recommended ~8 kHz tonality
-// limit keeps highs/air natural on full mixes).
+// in the spectral domain (the upstream-recommended ~8 kHz tonality limit keeps highs/air
+// natural on full mixes).
+// `formant_semitones` + `formant_active`: when active != 0 the formant envelope is pinned
+// relative to the INPUT spectrum (compensatePitch cancels the transpose's formant drag) and
+// then shifted by formant_semitones — 0 keeps formants exactly where the source had them.
+// When active == 0 the formant machinery is bypassed entirely and formants follow the
+// transpose (the pre-formant-control behavior, zero extra cost).
 int utai_stretch_exact(const float* input, int in_samples, int channels, float sample_rate,
-                       double time_factor, double transpose_semitones, float* output,
+                       double time_factor, double transpose_semitones,
+                       double formant_semitones, int formant_active, float* output,
                        int out_samples) {
     if (!input || !output || in_samples <= 0 || out_samples <= 0 || channels <= 0 ||
-        sample_rate <= 0.0f || !(time_factor > 0.0) || !std::isfinite(transpose_semitones)) {
+        sample_rate <= 0.0f || !(time_factor > 0.0) || !std::isfinite(transpose_semitones) ||
+        !std::isfinite(formant_semitones)) {
         return 1;
     }
     try {
@@ -34,47 +47,53 @@ int utai_stretch_exact(const float* input, int in_samples, int channels, float s
         if (transpose_semitones != 0.0) {
             stretch.setTransposeSemitones((float)transpose_semitones, 8000.0f / sample_rate);
         }
+        if (formant_active != 0) {
+            stretch.setFormantSemitones((float)formant_semitones, /*compensatePitch=*/true);
+        }
 
-        const int in_lat = stretch.inputLatency();
-        const int out_lat = stretch.outputLatency();
+        // Front-pad short clips so exact() never hits its too-short bail-out (see file header).
+        // The seek length depends on the playback rate exact() derives from the TOTAL sizes, and
+        // for tiny inputs out_samples = round(in*tf) deviates measurably from tf (64 × 1.4 → 90
+        // is a 1.40625 ratio) — so iterate the pad against the actual padded totals until the
+        // requirement is met (converges in a step or two; +2 covers float→int truncation).
+        int pad_in = 0;
+        for (int guard = 0; guard < 8; ++guard) {
+            const int cur_in = in_samples + pad_in;
+            const int cur_out =
+                std::max((int)std::llround((double)cur_in * time_factor), out_samples);
+            const double pr = (double)cur_in / (double)cur_out;
+            const int need = (int)stretch.outputSeekLength((float)pr) + 2;
+            if (cur_in >= need) break;
+            pad_in = need - in_samples;
+        }
+        const int total_in = in_samples + pad_in;
+        const int total_out =
+            std::max((int)std::llround((double)total_in * time_factor), out_samples);
+        const int pad_out = total_out - out_samples;
 
         std::vector<std::vector<float>> in_ch((size_t)channels), out_ch((size_t)channels);
         for (int c = 0; c < channels; ++c) {
-            in_ch[(size_t)c].assign((size_t)(in_samples + in_lat), 0.0f);
-            out_ch[(size_t)c].assign((size_t)(out_samples + out_lat), 0.0f);
+            in_ch[(size_t)c].assign((size_t)total_in, 0.0f);
+            out_ch[(size_t)c].assign((size_t)total_out, 0.0f);
             for (int i = 0; i < in_samples; ++i) {
-                in_ch[(size_t)c][(size_t)i] = input[(size_t)i * channels + c];
+                in_ch[(size_t)c][(size_t)(pad_in + i)] = input[(size_t)i * channels + c];
             }
         }
-        std::vector<float*> in_ptrs((size_t)channels), in_body((size_t)channels),
-            out_ptrs((size_t)channels), out_tail((size_t)channels);
+        std::vector<float*> in_ptrs((size_t)channels), out_ptrs((size_t)channels);
         for (int c = 0; c < channels; ++c) {
             in_ptrs[(size_t)c] = in_ch[(size_t)c].data();
-            in_body[(size_t)c] = in_ch[(size_t)c].data() + in_lat;
             out_ptrs[(size_t)c] = out_ch[(size_t)c].data();
-            out_tail[(size_t)c] = out_ch[(size_t)c].data() + out_samples;
         }
 
-        // stay slightly ahead in the input (upstream cmd/main.cpp lines 77-84)
-        stretch.seek(in_ptrs.data(), in_lat, 1.0 / time_factor);
-        stretch.process(in_body.data(), in_samples, out_ptrs.data(), out_samples);
-        stretch.flush(out_tail.data(), out_lat);
-
-        // fold the leading latency block back into the start (reversed in time and negated),
-        // then the exact-length output begins at out_lat. BOUND the fold to the valid region:
-        // an input shorter than the engine latency yields out_samples < out_lat, and an
-        // unbounded loop would write past out_ch's (out_samples + out_lat) end (heap overflow,
-        // audit-caught). For normal-length inputs fold == out_lat → behavior unchanged.
-        const int fold = std::min(out_lat, out_samples);
-        for (int c = 0; c < channels; ++c) {
-            float* ch = out_ch[(size_t)c].data();
-            for (int i = 0; i < fold; ++i) {
-                ch[out_lat + i] -= ch[out_lat - 1 - i];
-            }
+        if (!stretch.exact(in_ptrs.data(), total_in, out_ptrs.data(), total_out)) {
+            return 3; // input still shorter than the seek length — unreachable after padding
         }
+
+        // The padded silence occupies output [0, pad_out); the caller's exact-length result is
+        // the end-aligned tail.
         for (int i = 0; i < out_samples; ++i) {
             for (int c = 0; c < channels; ++c) {
-                output[(size_t)i * channels + c] = out_ch[(size_t)c][(size_t)(out_lat + i)];
+                output[(size_t)i * channels + c] = out_ch[(size_t)c][(size_t)(pad_out + i)];
             }
         }
         return 0;

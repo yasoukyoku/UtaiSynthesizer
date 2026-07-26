@@ -235,6 +235,7 @@ pub async fn transpose_audio(
             buf.sample_rate,
             1.0,
             semitones,
+            None,
         )?;
         let out_buf = crate::audio::AudioBuffer {
             samples: shifted,
@@ -377,7 +378,10 @@ pub async fn stretch_segment_audio(
         drop(bytes);
 
         let _ = std::fs::create_dir_all(&cache_dir);
-        let key = format!("{content_hash}_r{time_factor:.6}");
+        // "s2" = stretch-engine generation (Signalsmith 1.3.2); bump it whenever the vendored
+        // engine changes output, or old-engine artifacts keep being served from the cache.
+        // The `{:.6}` factor format is a contract with stretchCache.ts's canonStretch rounding.
+        let key = format!("{content_hash}_s2r{time_factor:.6}");
         let wav_path = cache_dir.join(format!("{key}.wav"));
         let sidecar = cache_dir.join(format!("{key}.json"));
 
@@ -397,6 +401,7 @@ pub async fn stretch_segment_audio(
             buf.sample_rate,
             time_factor,
             0.0,
+            None,
         )?;
         let out_buf = crate::audio::AudioBuffer {
             samples: stretched,

@@ -14,4 +14,6 @@ fn main() {
         .compile("utai_stretch_cpp");
     println!("cargo:rerun-if-changed=src/wrapper.cpp");
     println!("cargo:rerun-if-changed=vendor/signalsmith-stretch/signalsmith-stretch.h");
+    println!("cargo:rerun-if-changed=vendor/signalsmith-stretch/signalsmith-linear/stft.h");
+    println!("cargo:rerun-if-changed=vendor/signalsmith-stretch/signalsmith-linear/fft.h");
 }

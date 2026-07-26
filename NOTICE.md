@@ -22,9 +22,9 @@ It contains code ported from, or written with reference to, the following projec
   Vendored vocoder fine-tuning port (`training/utai_train/vocoder/`), including
   `modules/loss/stft_loss.py` (Copyright 2019 Tomoki Hayashi, MIT).
 
-- **Signalsmith Stretch** and **signalsmith-dsp** (Signalsmith Audio) — MIT
-  vendored at `src-tauri/crates/utai-stretch/vendor/signalsmith-stretch/` (LICENSE.txt included
-  in-tree). Time-stretch / pitch-shift engine.
+- **Signalsmith Stretch** (v1.3.2) and **signalsmith-linear** (0.3.1) (Signalsmith Audio) — MIT
+  vendored at `src-tauri/crates/utai-stretch/vendor/signalsmith-stretch/` (LICENSE.txt files and
+  VENDOR.md provenance included in-tree). Time-stretch / pitch-shift / formant engine.
 
 ## Implementation references (no code vendored)
 

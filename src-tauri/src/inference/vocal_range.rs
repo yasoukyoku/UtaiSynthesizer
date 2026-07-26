@@ -656,7 +656,7 @@ pub fn apply_inverse(
             let n = audio.len();
             // time_factor 1.0 ⇒ the shim's exact-length recipe returns n samples, sample-aligned
             // (seek pre-roll + flush tail + latency fold). resize is a contract guard, not a fix.
-            match utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, -(shift as f64)) {
+            match utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, -(shift as f64), None) {
                 Ok(mut y) => {
                     if y.len() != n {
                         tracing::warn!("range-extend: stretch returned {} samples for {n} — padded/truncated to contract", y.len());
