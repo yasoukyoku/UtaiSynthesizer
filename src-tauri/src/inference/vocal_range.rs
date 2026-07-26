@@ -380,7 +380,9 @@ pub fn score_frame_hz(
 ///     BOUNDARY_WEIGHT_* — the model provably sings them (tier-2), so they can never justify
 ///     recoloring the whole render by themselves, yet still steer WHERE a real shift lands
 ///     (S62b: counting proven 76-77 frames as full violations recolored in-range songs),
-///   - a small |shift| penalty (0.003/st) breaks near-ties toward the least PSOLA coloration.
+///   - the shift cost (SHIFT_FIXED_COST + SHIFT_PER_ST·|s|, S81-B) prices what a non-zero
+///     shift really does — 100% of the audio passes through the inverse resynthesis — and
+///     breaks near-ties toward the smallest coloration.
 /// rmvpe spike hygiene BEFORE any judgement (S62b): median-5, then phantom violation islands
 /// (< MIN_VIOLATION_RUN) are deleted — a handful of octave-doubled breath frames used to both
 /// defeat the all-inside-usable short-circuit and out-mass the shift penalty (3×0.6% of a full
@@ -540,183 +542,57 @@ pub fn piece_range_shift(
     best_shift
 }
 
-/// Voiced-aware median-5 over a PSOLA guide track (zeros = unvoiced, preserved verbatim; a
-/// window with fewer than 3 voiced samples keeps the original value). An octave-misread
-/// breath/sibilant frame halves the analysis-mark spacing for exactly that frame and POPS in
-/// the inverse (S62c 破音 — model conditioning sees the same spike with extension OFF, so the
-/// pop was an extension-ON-only artifact). Legitimate sustained octave jumps (>2 frames) pass
-/// through; smooth parametric guides (vocal score path) are a near-identity under a median.
-fn sanitize_guide(f0: &[f32]) -> Vec<f32> {
-    let n = f0.len();
-    let mut out = f0.to_vec();
-    for i in 0..n {
-        if f0[i] <= 0.0 {
-            continue;
-        }
-        let lo = i.saturating_sub(2);
-        let hi = (i + 3).min(n);
-        let mut w: Vec<f32> = f0[lo..hi].iter().copied().filter(|&v| v > 0.0).collect();
-        if w.len() < 3 {
-            continue;
-        }
-        w.sort_by(|a, b| a.total_cmp(b));
-        out[i] = w[w.len() / 2];
-    }
-    out
-}
-
-/// Which engine performs the inverse shift. DIAGNOSTIC switch (env `UTAI_RANGE_INVERSE`):
-/// absent/`psola` = the shipped TD-PSOLA (byte-identical to before), `stretch` = the already
-/// vendored Signalsmith phase vocoder (`utai_stretch`, time_factor 1.0 = pure transpose).
-///
-/// Why it exists: a bench A/B of the production `psola_shift` on voice-like material measured
-/// the SAME ~5-9 dB harmonic-to-noise loss at ratio 1.000 (no shift at all) as at +7 st, i.e.
-/// the cost is a flat tax on passing through the resynthesis rather than a cost of shifting —
-/// which is what makes "extension ON recolors passages that were fine" structural. Signalsmith
-/// measured -2.3 dB HNR / -0.15 dB RMS on the same input. This switch exists so that gets
-/// confirmed BY EAR on real material before anything architectural is decided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InverseEngine {
-    Psola,
-    Stretch,
-}
-
-/// Resolved once per process and LOGGED either way — during an A/B the log must be able to
-/// prove which engine actually ran, otherwise a stale render cache reads as "no difference".
-pub fn inverse_engine() -> InverseEngine {
-    static ENGINE: std::sync::OnceLock<InverseEngine> = std::sync::OnceLock::new();
-    *ENGINE.get_or_init(|| match std::env::var("UTAI_RANGE_INVERSE").as_deref() {
-        Ok("psola") => {
-            tracing::info!("range-extend: inverse engine = TD-PSOLA (UTAI_RANGE_INVERSE=psola — fallback)");
-            InverseEngine::Psola
-        }
-        Ok(other) if !other.is_empty() && other != "stretch" => {
-            tracing::warn!("range-extend: unknown UTAI_RANGE_INVERSE=\"{other}\" — using the default engine");
-            InverseEngine::Stretch
-        }
-        _ => {
-            tracing::info!("range-extend: inverse engine = SIGNALSMITH STRETCH (default)");
-            InverseEngine::Stretch
-        }
-    })
-}
-
-/// κ — how much of the pitch shift the FORMANTS are allowed to follow:
-///   κ=0  formants stay where the model put them (TD-PSOLA's built-in policy) — dark/covered;
-///   κ=1  formants move with the pitch (a plain resample, and the stretch engine's built-in
-///        policy) — bright/chipmunk.
-/// The vendored Signalsmith build predates upstream's formant control (only setTransposeFactor
-/// exists in signalsmith-stretch.h), so the gap is closed with utai_dsp::formant_warp — a
-/// cepstral envelope warp that leaves pitch alone. Absent ⇒ each engine's NATIVE κ ⇒ no extra
-/// pass at all (bit-identical to not having this knob).
-///
-/// Caveat worth knowing before trusting a κ≠native render: formant_warp's cepstral lifter
-/// (LIFTER_Q=48 ≈ 918 Hz) can only separate envelope from harmonics while f0 stays below that
-/// — high soprano frames are past it and will warp some fine structure along with the envelope.
-/// Default κ = 0: keep the model's formants where it sang them. That is the configuration the
-/// user A/B'd on real songs and accepted ("干净了…共振腔相对来讲保持的甚至还挺好"); κ=1 is
-/// audibly a chipmunk. Overridable with UTAI_RANGE_FORMANT_K for further tuning.
-const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
-
-fn formant_kappa() -> Option<f32> {
-    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        let k = match std::env::var("UTAI_RANGE_FORMANT_K").ok().and_then(|v| v.parse::<f32>().ok()) {
-            Some(v) => v.clamp(0.0, 1.0),
-            None => DEFAULT_FORMANT_KAPPA,
-        };
-        tracing::info!("range-extend: formant kappa = {k:.2} (0 = keep the model's formants, 1 = let them follow the pitch)");
-        Some(k)
-    })
-}
+/// κ — how much of the inverse's pitch move the FORMANTS follow:
+///   κ=0  formants stay where the model put them — the source timbre, dark/covered on big
+///        down-shifts (engine-native `setFormantSemitones` with pitch compensation);
+///   κ=1  formants move with the pitch (the plain spectral transpose) — bright/chipmunk.
+/// Default 0 is the configuration the user A/B'd on real songs and accepted
+/// ("干净了…共振腔相对来讲保持的甚至还挺好"); κ=1 is audibly a chipmunk. Since the 1.3.2
+/// vendor upgrade the whole policy runs INSIDE Signalsmith — no external formant_warp pass,
+/// no 918 Hz lifter ceiling, no overshoot guard — and κ=1 skips the formant machinery
+/// entirely (zero extra cost).
+pub const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
 
 /// THE single execution point of the inverse shift — shared by the score, cover and audition
-/// paths so engine policy can never drift between them. Shifts `audio` by `-shift` semitones;
-/// `guide` is the caller's already-sanitized f0 track on the `hop` grid (PSOLA needs it, the
-/// stretch engine does not). Output length == input length exactly (every caller's trim/pad
-/// arithmetic depends on that).
+/// paths so engine policy can never drift between them. Shifts `audio` back by `-shift`
+/// semitones through the Signalsmith engine (time_factor 1.0 = pure transpose, no f0 guide
+/// needed); `kappa` sets the formant policy (see DEFAULT_FORMANT_KAPPA). Output length ==
+/// input length exactly (every caller's trim/pad arithmetic depends on that).
+///
+/// A stretch failure is LOUD: there is no second engine to fall back to, and returning the
+/// un-inverted render would be a silently wrong-pitched result. The Err carries the engine's
+/// stable CODE (STRETCH_*) for the frontend error funnel.
 pub fn apply_inverse(
     audio: Vec<f32>,
-    guide: &[f32],
-    hop: usize,
     sample_rate: u32,
     shift: i64,
-) -> Vec<f32> {
+    kappa: f32,
+) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
-        return audio;
+        return Ok(audio);
     }
-    let psola = |a: &[f32]| {
-        let ratio = vec![2f32.powf(-(shift as f32) / 12.0); guide.len()];
-        utai_dsp::psola_shift(a, sample_rate, guide, &ratio, utai_dsp::PsolaParams { hop })
-    };
-    let engine = inverse_engine();
-    let shifted = match engine {
-        InverseEngine::Psola => psola(&audio),
-        InverseEngine::Stretch => {
-            let n = audio.len();
-            // time_factor 1.0 ⇒ the shim's exact-length recipe returns n samples, sample-aligned
-            // (seek pre-roll + flush tail + latency fold). resize is a contract guard, not a fix.
-            match utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, -(shift as f64), None) {
-                Ok(mut y) => {
-                    if y.len() != n {
-                        tracing::warn!("range-extend: stretch returned {} samples for {n} — padded/truncated to contract", y.len());
-                        y.resize(n, 0.0);
-                    }
-                    y
-                }
-                Err(e) => {
-                    tracing::warn!("range-extend: stretch engine failed ({e}) — this render falls back to TD-PSOLA");
-                    psola(&audio)
-                }
-            }
-        }
-    };
-
-    // Formant policy. Each engine lands the formants at its own κ; warp only the DIFFERENCE,
-    // so asking for an engine's native κ costs nothing (no STFT round trip at all).
-    let native_k = match engine {
-        InverseEngine::Psola => 0.0f32,  // PSOLA preserves the envelope by construction
-        InverseEngine::Stretch => 1.0f32, // spectral transpose moves the envelope with the pitch
-    };
-    match formant_kappa() {
-        Some(k) if (k - native_k).abs() > 1e-3 => {
-            let semi = (k - native_k) * -(shift as f32); // -shift = semitones the AUDIO moved up
-            let before = shifted.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let mut warped = utai_dsp::formant_warp(&shifted, |_| 2.0f32.powf(semi / 12.0));
-            // A formant warp moves the spectral ENVELOPE; it has no business changing how loud
-            // the signal is. Its cepstral reconstruction nonetheless overshoots on transients
-            // (measured +3.9 dB of peak at unchanged RMS), which on the default path would clip
-            // outright. Scale back to the level we handed it — never up, so a warp that happens
-            // to reduce the peak is left alone.
-            let after = warped.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            if after > before && before > 0.0 {
-                let g = before / after;
-                for v in warped.iter_mut() {
-                    *v *= g;
-                }
-                tracing::debug!("range-extend: formant warp overshoot {after:.3} -> {before:.3} (scaled {g:.3})");
-            }
-            warped
-        }
-        _ => shifted,
+    // One-time engine anchor so an A/B can prove what actually ran (a stale render cache
+    // otherwise reads as "no difference").
+    static ENGINE_LOG: std::sync::Once = std::sync::Once::new();
+    ENGINE_LOG.call_once(|| {
+        tracing::info!("range-extend: inverse engine = signalsmith-stretch 1.3.2 (native formant control)");
+    });
+    let k = kappa.clamp(0.0, 1.0);
+    let semis = -(shift as f64); // semitones the AUDIO moves = inverse of the model-side shift
+    // κ=1 is the plain transpose: skip the formant machinery entirely (zero extra cost).
+    let formant = ((1.0 - k) > 1e-3).then(|| f64::from(k) * semis);
+    tracing::debug!("range-extend: inverse {semis:+.0} st, formant kappa {k:.2}");
+    let n = audio.len();
+    let mut y = utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, semis, formant)?;
+    if y.len() != n {
+        // exact-length contract guard, not a fix
+        tracing::warn!(
+            "range-extend: stretch returned {} samples for {n} — padded/truncated to contract",
+            y.len()
+        );
+        y.resize(n, 0.0);
     }
-}
-
-/// Undo a chunk's range shift in the audio domain: constant-ratio inverse guided by the FED f0
-/// (`f0_hz`, one frame per `hop` output samples — the SoVITS hop grid or RVC's sr/100),
-/// spike-sanitized first (see sanitize_guide). shift 0 ⇒ untouched.
-pub fn psola_inverse_hop(
-    audio: Vec<f32>,
-    f0_hz: &[f32],
-    hop: usize,
-    sample_rate: u32,
-    shift: i64,
-) -> Vec<f32> {
-    if shift == 0 || audio.is_empty() || f0_hz.is_empty() {
-        return audio;
-    }
-    let guide = sanitize_guide(f0_hz);
-    apply_inverse(audio, &guide, hop, sample_rate, shift)
+    Ok(y)
 }
 
 #[cfg(test)]
@@ -1094,35 +970,10 @@ mod tests {
     }
 
     #[test]
-    fn guide_sanitizer_snaps_isolated_octave_spikes() {
-        // 220 Hz steady voice with a 2-frame octave misread and interleaved unvoiced gaps:
-        // the spike snaps to the local median, zeros stay zero (unvoiced passes through dry).
-        let mut g = vec![220.0f32; 20];
-        g[7] = 440.0;
-        g[8] = 440.0;
-        g[3] = 0.0;
-        let s = sanitize_guide(&g);
-        assert_eq!(s[7], 220.0);
-        assert_eq!(s[8], 220.0);
-        assert_eq!(s[3], 0.0);
-        // a SUSTAINED legitimate octave jump (>2 frames) must survive
-        let mut j = vec![220.0f32; 10];
-        j.extend(vec![440.0f32; 10]);
-        let s = sanitize_guide(&j);
-        assert_eq!(s[15], 440.0);
-    }
-
-    #[test]
-    fn the_psola_fallback_is_byte_identical_to_the_direct_call() {
-        // TD-PSOLA is no longer the default (measured on real material: it loses ~9.8 dB of
-        // harmonic-to-noise ratio at +7 st where Signalsmith loses 1.9, and the user confirmed
-        // by ear across two backends). It stays reachable as a fallback, and while it does, it
-        // must remain the exact pre-dispatch call — same guide, same constant ratio vector.
-        if inverse_engine() != InverseEngine::Psola {
-            return; // default (stretch) in this process — nothing to compare against
-        }
+    fn the_inverse_honours_the_exact_length_contract() {
+        // Every caller's trim/pad arithmetic depends on len(out) == len(in); shift 0 must be
+        // the untouched passthrough (tier 1/2 bit-parity).
         let sr = 44100u32;
-        let hop = 441usize;
         let n = sr as usize; // 1 s
         let mut x = vec![0.0f32; n];
         for (i, v) in x.iter_mut().enumerate() {
@@ -1130,12 +981,13 @@ mod tests {
             *v = (0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin())
                 + (0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
         }
-        let guide = vec![220.0f32; n / hop + 1];
-        let via_dispatch = apply_inverse(x.clone(), &guide, hop, sr, -3);
-        let ratio = vec![2f32.powf(3.0 / 12.0); guide.len()];
-        let direct = utai_dsp::psola_shift(&x, sr, &guide, &ratio, utai_dsp::PsolaParams { hop });
-        assert_eq!(via_dispatch, direct);
-        assert_eq!(via_dispatch.len(), x.len());
+        let untouched = apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA).expect("shift 0");
+        assert_eq!(untouched, x);
+        for (shift, kappa) in [(-3i64, 0.0f32), (5, 0.0), (-7, 1.0)] {
+            let y = apply_inverse(x.clone(), sr, shift, kappa).expect("inverse");
+            assert_eq!(y.len(), x.len(), "shift={shift} kappa={kappa}");
+            assert!(y.iter().all(|v| v.is_finite()));
+        }
     }
 
     #[test]

@@ -287,8 +287,9 @@ pub fn run_pipeline(
     // semantics — a per-chunk shift gave each chunk its own formant coloration and the seams
     // between colorations were the dominant audible artifact, §user实测). Every chunk renders
     // at the same shift (coarse re-binned from the shifted Hz) and its UNtrimmed output is
-    // TD-PSOLA'd back before append_trimmed, so the constant-ratio seams stay inside the
-    // trimmed-away pads/silence. shift 0 ⇒ the exact original vc_chunk calls (byte-identical).
+    // shifted back (Signalsmith) before append_trimmed, so the constant-shift seams stay
+    // inside the trimmed-away pads/silence. shift 0 ⇒ the exact original vc_chunk calls
+    // (byte-identical).
     let range_shift = range
         .map(|r| {
             // loudness weighting: RMS on the same 100 fps grid pitchf was detected on — quiet
@@ -312,13 +313,13 @@ pub fn run_pipeline(
         let pf: Vec<f32> = pitchf_sl.iter().map(|&v| v * k).collect();
         let pc: Vec<i64> = pf.iter().map(|&v| f0_to_coarse(v)).collect();
         let out = vc_chunk(m, chunk, &pc, &pf, sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
-        Ok(super::vocal_range::psola_inverse_hop(
+        super::vocal_range::apply_inverse(
             out,
-            &pf,
-            m.sample_rate as usize / 100,
             m.sample_rate,
             range_shift,
-        ))
+            super::vocal_range::DEFAULT_FORMANT_KAPPA,
+        )
+        .map_err(UtaiError::Inference)
     };
     for &ot in &opt_ts {
         if cancel() {

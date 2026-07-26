@@ -147,9 +147,8 @@ fn voice_env_wav() {
     let audio = utai_lib::audio::load_audio(&input).expect("load input wav");
 
     // S81 音域扩展 A/B: UTAI_VOICE_RANGE=1 resolves the sidecar's tested range exactly like the
-    // command layer does, so the harness can render the SAME input with extension off / on and
-    // (via UTAI_RANGE_INVERSE) with either inverse engine. Absent ⇒ None ⇒ byte-identical to
-    // every earlier gate run of this harness.
+    // command layer does, so the harness can render the SAME input with extension off / on.
+    // Absent ⇒ None ⇒ byte-identical to every earlier gate run of this harness.
     // Explicit truthy values only — an EMPTY var must read as OFF, so a driver script can flip
     // the A/B by re-assigning rather than unsetting (removing a process env var is awkward and,
     // under some shells, blocked outright).

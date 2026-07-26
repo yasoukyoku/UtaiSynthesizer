@@ -307,6 +307,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   SPEECH_ENCODER_UNSUPPORTED: { key: "backend.SPEECH_ENCODER_UNSUPPORTED" },
   SPK_MIX_DIFFUSION: { key: "vocalEditor.render.spkMixDiffusion" },
   STORAGE_JOIN: { key: "backend.STORAGE_JOIN" },
+  // S82: the range-extension inverse (Signalsmith) has no fallback engine — a failure aborts
+  // the render loudly instead of returning wrong-pitched audio.
+  STRETCH_ENGINE_FAILED: { key: "backend.STRETCH_ENGINE_FAILED" },
   TAR_ENTRY_BAD_PATH: { key: "backend.TAR_ENTRY_BAD_PATH" },
   TAR_ENTRY_CORRUPT: { key: "backend.TAR_ENTRY_CORRUPT" },
   TAR_READ_FAILED: { key: "backend.TAR_READ_FAILED" },

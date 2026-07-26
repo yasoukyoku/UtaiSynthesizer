@@ -243,7 +243,7 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
           />
         </div>
-        {/* S60-2 音域扩展: v1 recipe (shift into the singer's tested comfort zone, TD-PSOLA back).
+        {/* S60-2 音域扩展: shift into the singer's tested comfort zone, Signalsmith inverse back.
             S60c/S62c: shown ONLY when the track's SELECTED SPEAKER carries a usable tested
             vocal_range record — an untested model/speaker's toggle is a confusing no-op
             (§user, twice). Default OFF (S62c user decision — recolor tradeoff is opt-in). */}

@@ -46,7 +46,7 @@ export interface RvcOptions {
    * "spk_mix" input). Empty = use speaker_id (single-speaker / pre-①c: byte-identical). */
   spk_mix: SpkMixEntry[];
   /** S60-2 音域扩展 (cover): out-of-comfort chunks render translated into the model's tested
-   * comfort zone and are TD-PSOLA'd back. No-op without a sidecar vocal_range record; in-range
+   * comfort zone and are shifted back (Signalsmith inverse). No-op without a sidecar vocal_range record; in-range
    * chunks are byte-identical either way. DEFAULTS carry false (= the Rust serde default, so an
    * absent key stays OFF — audit S60: buildVoiceOptions fills absent keys from DEFAULTS, so a
    * `true` here would silently flip every keyless node ON). S62c: OFF is also the CREATION

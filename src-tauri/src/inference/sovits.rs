@@ -382,18 +382,13 @@ fn infer_segment(
     // get_unit_f0: f0 = f0 * 2^(tran/12) AFTER the predictor post-process; uv untouched
     let ratio = 2.0f32.powf(options.f0_shift / 12.0);
     f0.iter_mut().for_each(|v| *v *= ratio);
-    // S60-2/S60c 音域扩展: apply the run_pipeline-decided whole-signal shift. The inverse
-    // guide must be f0×uv: sovits_f0_postprocess interpolates unvoiced frames NON-ZERO (uv
-    // carries the mask), so a raw clone would present psola_shift one giant voiced island and
-    // wet-process fricatives/breaths (the RVC path's pitchf keeps real zeros). shift 0 ⇒
-    // byte-identical untouched path.
-    let f0_for_inverse = if range_shift != 0 {
+    // S60-2/S60c 音域扩展: apply the run_pipeline-decided whole-signal shift to the FED f0 so
+    // the model sings inside its comfort zone; the decoded audio is shifted back after decode.
+    // shift 0 ⇒ byte-identical untouched path.
+    if range_shift != 0 {
         let k = 2.0f32.powf(range_shift as f32 / 12.0);
         f0.iter_mut().for_each(|v| *v *= k);
-        Some(f0.iter().zip(uv.iter()).map(|(f, u)| f * u).collect::<Vec<f32>>())
-    } else {
-        None
-    };
+    }
     report(p_f0); // f0 done
 
     if cancel() {
@@ -436,12 +431,17 @@ fn infer_segment(
         m, c, f0, uv, vol, &wav_m, seg_idx, n_frames, has_diff, p_vits, options, report, cancel,
     )?;
 
-    // S60-2: shift the decoded audio back by -range_shift (TD-PSOLA guided by fed-f0 × uv —
-    // one frame per hop_size output samples; unvoiced frames are true zeros so fricatives/
-    // breaths pass through dry). Runs on the still-padded signal so the trim below is
-    // untouched; the pad regions carry uv=0 (edge-filled f0 is masked out) → dry, then trimmed.
-    if let Some(f0s) = &f0_for_inverse {
-        out = super::vocal_range::psola_inverse_hop(out, f0s, m.hop_size, m.sample_rate, range_shift);
+    // S60-2: shift the decoded audio back by -range_shift (Signalsmith spectral transpose —
+    // the single execution point vocal_range::apply_inverse, no f0 guide needed). Runs on the
+    // still-padded signal so the trim below is untouched.
+    if range_shift != 0 {
+        out = super::vocal_range::apply_inverse(
+            out,
+            m.sample_rate,
+            range_shift,
+            super::vocal_range::DEFAULT_FORMANT_KAPPA,
+        )
+        .map_err(UtaiError::Inference)?;
     }
 
     // ── loudness envelope: original applies change_rms INSIDE infer(), i.e. on the

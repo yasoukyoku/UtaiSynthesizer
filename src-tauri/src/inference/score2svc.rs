@@ -524,7 +524,7 @@ pub fn render_score_sovits(
     // f0 uses RAW note_pitch (grouping/voicing); transpose folds into the OUTPUT Hz.
     let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
     // S69 R0b①: voiceless frames → 0 Hz (cover parity: RMVPE emits 0 there; SoVITS then gets
-    // uv=0 + gap-interp). Also improves the apply_range_inverse PSOLA guide (unvoiced stays dry).
+    // uv=0 + gap-interp).
     // (R0b②'s procedural micro-texture was ear-vetoed and removed — see the note above
     // build_vol_env; micro-motion waits for the conditioned-S2CV line.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
@@ -600,7 +600,7 @@ pub fn render_score_sovits(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
-    audio = apply_range_inverse(audio, &note_hz_full, m.sample_rate, range_shift);
+    audio = apply_range_inverse(audio, m.sample_rate, range_shift)?;
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -714,7 +714,7 @@ pub fn render_score_rvc(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
-    audio = apply_range_inverse(audio, &note_hz_full, m.sample_rate, range_shift);
+    audio = apply_range_inverse(audio, m.sample_rate, range_shift)?;
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -791,30 +791,21 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
 
 /// S60-2 音域扩展: undo the range-extension shift in the AUDIO domain. The render was fed
 /// `transpose + range_shift` (content + f0 together, so the model sings inside its comfort
-/// zone); this shifts the decoded audio back by `-range_shift` semitones with TD-PSOLA,
-/// guided by the EXACT fed f0 (`note_hz_cv`, @50fps cv frames — the same uniform sample→cv
-/// map as `apply_gain_env`, resampled onto a 100 fps hop grid). Formants are preserved by
-/// PSOLA itself (the v1 "raw F0 shift only" rule). shift 0 / empty ⇒ untouched (tier 1/2:
-/// in-comfort renders NEVER pass through here — bit-parity by construction).
-fn apply_range_inverse(audio: Vec<f32>, note_hz_cv: &[f32], sample_rate: u32, range_shift: i64) -> Vec<f32> {
-    if range_shift == 0 || audio.is_empty() || note_hz_cv.is_empty() {
-        return audio;
+/// zone); this shifts the decoded audio back by `-range_shift` semitones through the single
+/// execution point vocal_range::apply_inverse (Signalsmith — no f0 guide needed). shift 0 /
+/// empty ⇒ untouched (tier 1/2: in-comfort renders NEVER pass through here — bit-parity by
+/// construction).
+fn apply_range_inverse(audio: Vec<f32>, sample_rate: u32, range_shift: i64) -> crate::Result<Vec<f32>> {
+    if range_shift == 0 || audio.is_empty() {
+        return Ok(audio);
     }
-    let hop = (sample_rate as usize / 100).max(1);
-    let nfr = audio.len() / hop + 1;
-    let n = audio.len() as f64;
-    let tt = note_hz_cv.len();
-    let mut f0 = Vec::with_capacity(nfr);
-    for i in 0..nfr {
-        let s = (i * hop).min(audio.len() - 1);
-        let cv = ((s as f64 / n) * tt as f64).floor() as usize;
-        f0.push(note_hz_cv[cv.min(tt - 1)]);
-    }
-    // Engine dispatch lives in ONE place for all four paths (score/cover/audition) — see
-    // vocal_range::apply_inverse. With the default engine this is the same psola_shift call
-    // with the same ratio vector as before (byte-identical); the guide is NOT re-sanitized
-    // here (a parametric score curve has no rmvpe octave spikes to remove).
-    super::vocal_range::apply_inverse(audio, &f0, hop, sample_rate, range_shift)
+    super::vocal_range::apply_inverse(
+        audio,
+        sample_rate,
+        range_shift,
+        super::vocal_range::DEFAULT_FORMANT_KAPPA,
+    )
+    .map_err(UtaiError::Inference)
 }
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.

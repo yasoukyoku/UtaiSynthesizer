@@ -872,6 +872,7 @@
     "SOVITS_VOL_FRAMES_MISMATCH": "vol 帧数异常",
     "SPEECH_ENCODER_UNSUPPORTED": "不支持的 speech_encoder（仅支持 vec768l12 / vec256l9）",
     "STORAGE_JOIN": "存储任务失败",
+    "STRETCH_ENGINE_FAILED": "音频引擎(变速/变调)处理失败——请重试;若持续出现请重启应用",
     "TAR_ENTRY_BAD_PATH": "tar 条目路径非法",
     "TAR_ENTRY_CORRUPT": "tar 条目损坏",
     "TAR_READ_FAILED": "tar 读取失败",

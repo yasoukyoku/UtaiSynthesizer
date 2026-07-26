@@ -872,6 +872,7 @@
     "SOVITS_VOL_FRAMES_MISMATCH": "音量フレーム数が不正です",
     "SPEECH_ENCODER_UNSUPPORTED": "未対応の speech_encoder です（vec768l12 / vec256l9 のみ対応）",
     "STORAGE_JOIN": "ストレージタスクが失敗しました",
+    "STRETCH_ENGINE_FAILED": "オーディオエンジン(タイムストレッチ/ピッチ)の処理に失敗しました——再試行してください。解決しない場合はアプリを再起動してください",
     "TAR_ENTRY_BAD_PATH": "tar エントリのパスが不正です",
     "TAR_ENTRY_CORRUPT": "tar エントリが破損しています",
     "TAR_READ_FAILED": "tar の読み込みに失敗しました",

@@ -348,12 +348,14 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
   return useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
 }
 
-/** Version of the range-extension DECISION algorithm. Bumping it invalidates every bake that
- *  was rendered under the old decision — without it, changing how the shift is decided produces
- *  "I changed it and the user hears nothing", which reads as a failed fix (S81 audit).
- *  ★ Any change to the decision functions in src-tauri/src/inference/vocal_range.rs MUST bump
- *  this AND the matching literal in commands/audition.rs::audition_cache_tag. */
-export const RANGE_ALGO_VERSION = "s81a";
+/** Version of the range-extension DECISION algorithm (engine changes count too — anything that
+ *  makes the same decision sound different). Bumping it invalidates every bake that was
+ *  rendered under the old version — without it, changing the algorithm produces "I changed it
+ *  and the user hears nothing", which reads as a failed fix (S81 audit).
+ *  ★ Any change to the decision functions in src-tauri/src/inference/vocal_range.rs (or to the
+ *  inverse engine) MUST bump this AND the matching literal in
+ *  commands/audition.rs::audition_cache_tag. s82 = Signalsmith 1.3.2 native-formant inverse. */
+export const RANGE_ALGO_VERSION = "s82";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

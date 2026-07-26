@@ -40,8 +40,9 @@ pub struct RvcOptions {
     /// Consumed by α′ (multi-speaker RVC export); see SovitsOptions::spk_mix.
     pub spk_mix: Vec<SpkMixEntry>,
     /// S60-2 音域扩展 (cover path): out-of-comfort chunks render at a minimal translation
-    /// into the model's tested comfort zone and are TD-PSOLA'd back. Requires a sidecar
-    /// vocal_range record; in-range chunks are byte-identical either way. Default false.
+    /// into the model's tested comfort zone and are shifted back (Signalsmith inverse).
+    /// Requires a sidecar vocal_range record; in-range chunks are byte-identical either way.
+    /// Default false.
     pub range_extend: bool,
     pub index_ratio: f32,
     pub protect: f32,

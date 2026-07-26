@@ -872,6 +872,7 @@
     "SOVITS_VOL_FRAMES_MISMATCH": "Volume frame count mismatch",
     "SPEECH_ENCODER_UNSUPPORTED": "Unsupported speech_encoder (only vec768l12 / vec256l9)",
     "STORAGE_JOIN": "Storage task failed",
+    "STRETCH_ENGINE_FAILED": "The audio engine (time-stretch / pitch) failed to process this render — try again; if it persists, restart the app",
     "TAR_ENTRY_BAD_PATH": "Illegal tar entry path",
     "TAR_ENTRY_CORRUPT": "Corrupt tar entry",
     "TAR_READ_FAILED": "Failed to read the tar archive",

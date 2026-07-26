@@ -286,15 +286,17 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
 // audition and reads as "training failed" (§user实测). When the model/candidate carries a
 // vocal_range record, ONE tier decision runs over the ENTIRE clip (uniform shift = uniform
 // formant character — the clip is deliberately a single chunk, §user), the shift folds into
-// options.f0_shift for the render, and the WHOLE output is TD-PSOLA'd back.
+// options.f0_shift for the render, and the WHOLE output is shifted back (Signalsmith,
+// vocal_range::apply_inverse — the same single execution point as the score/cover paths).
 
 /// Cache-name suffix carrying the range record (a re-test/adjusted comfort must MISS the old
 /// cache). No record keeps the pre-S60c names byte-identical (existing caches stay valid).
 ///
 /// ★ The leading version literal must be bumped together with RANGE_ALGO_VERSION in
 /// src/lib/vocal/vocalRender.ts whenever the DECISION functions in inference/vocal_range.rs
-/// change — otherwise a fixed decision keeps serving audio rendered under the old one and reads
-/// as "the fix did nothing" (S81 audit).
+/// change — otherwise a fixed decision keeps serving audio rendered under the old one and
+/// reads as "the fix did nothing" (S81 audit). ENGINE changes count too: s82 = the Signalsmith
+/// 1.3.2 native-formant inverse replacing the 1.1.1 + external-warp one.
 fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
     match range {
         None => String::new(),
@@ -311,14 +313,14 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
                 }
             }
             format!(
-                "_s81a_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s82_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }
     }
 }
 
-/// Compute the whole-clip shift + the (shifted, zero-preserving) rmvpe guide for the inverse.
+/// Compute the whole-clip shift for the render + inverse pair.
 /// None = no record / already in range → render untouched.
 fn audition_range_prep(
     app: &AppState,
@@ -326,7 +328,7 @@ fn audition_range_prep(
     mel: &ndarray::Array2<f32>,
     src: &crate::audio::AudioBuffer,
     range: Option<crate::inference::vocal_range::SpeakerRange>,
-) -> Result<Option<(i64, Vec<f32>)>, String> {
+) -> Result<Option<i64>, String> {
     let Some(r) = range else { return Ok(None) };
     let mono = crate::audio::resample::to_mono(src);
     let wav16k = crate::inference::features::resample(
@@ -353,29 +355,25 @@ fn audition_range_prep(
         return Ok(None);
     }
     tracing::info!("audition range-extend: clip rendered {shift:+} st into comfort");
-    let k = 2.0f32.powf(shift as f32 / 12.0);
-    // raw rmvpe zeros preserved → unvoiced passes through the inverse dry
-    let guide: Vec<f32> = f0.iter().map(|v| v * k).collect();
-    Ok(Some((shift, guide)))
+    Ok(Some(shift))
 }
 
 /// Apply the inverse of `audition_range_prep`'s shift to a finished render.
 fn audition_range_invert(
     result: crate::inference::SynthesisResult,
-    prep: &Option<(i64, Vec<f32>)>,
-) -> crate::inference::SynthesisResult {
+    prep: &Option<i64>,
+) -> Result<crate::inference::SynthesisResult, String> {
     match prep {
-        Some((shift, guide)) if result.sample_rate % 100 == 0 => crate::inference::SynthesisResult {
-            audio: crate::inference::vocal_range::psola_inverse_hop(
+        Some(shift) => Ok(crate::inference::SynthesisResult {
+            audio: crate::inference::vocal_range::apply_inverse(
                 result.audio,
-                guide,
-                (result.sample_rate / 100) as usize,
                 result.sample_rate,
                 *shift,
-            ),
+                crate::inference::vocal_range::DEFAULT_FORMANT_KAPPA,
+            )?,
             sample_rate: result.sample_rate,
-        },
-        _ => result,
+        }),
+        None => Ok(result),
     }
 }
 
@@ -521,7 +519,7 @@ pub async fn render_audition_voice(
             .map_err(|e| e.to_string())?;
         // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
         let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-        let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
+        let range_f0_shift = range_prep.map(|s| s as f32).unwrap_or(0.0);
         let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
         let cancel = || app.inference.voice_cancelled(run_epoch);
 
@@ -636,7 +634,7 @@ pub async fn render_audition_voice(
                     .map_err(|e| e.to_string())?
             }
         };
-        let result = audition_range_invert(result, &range_prep);
+        let result = audition_range_invert(result, &range_prep)?;
         write_wav_atomic(&out, &result.audio, result.sample_rate)?;
         // free the candidate's VRAM + Windows file locks (the dir must stay
         // deletable by 清空结果 / the next training run)
@@ -1126,7 +1124,7 @@ pub async fn render_model_audition(
             let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
             // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
             let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-            let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
+            let range_f0_shift = range_prep.map(|s| s as f32).unwrap_or(0.0);
             let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
             let cancel = || app.inference.voice_cancelled(run_epoch);
             let nch = noise_channels(&entry.config);
@@ -1199,7 +1197,7 @@ pub async fn render_model_audition(
                         .map_err(|e| e.to_string())?
                 }
             };
-            let result = audition_range_invert(result, &range_prep);
+            let result = audition_range_invert(result, &range_prep)?;
             write_wav_atomic(&out, &result.audio, result.sample_rate)?;
             Ok(out.to_string_lossy().into_owned())
         })

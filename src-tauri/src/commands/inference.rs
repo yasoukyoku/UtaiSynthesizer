@@ -1355,7 +1355,7 @@ pub struct VocalRenderOptions {
     pub transpose: i64,
     /// S60-2 音域扩展: when true AND the model carries a vocal_range record for the resolved
     /// speaker, out-of-comfort parts render at a minimal semitone translation into the comfort
-    /// zone and are TD-PSOLA'd back (v1 affine recipe). In-range parts render EXACTLY as before
+    /// zone and are shifted back (Signalsmith inverse). In-range parts render EXACTLY as before
     /// (tier 1/2 = shift 0 = byte-identical), so enabling this never degrades in-range material.
     pub range_extend: bool,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
@@ -1631,7 +1631,8 @@ pub async fn render_vocal_segment(
     }
     // S60-2 音域扩展: resolve the governing speaker's tested range and the v1 three-tier
     // shift. Disabled / no sidecar record / in-range ⇒ 0 ⇒ byte-identical render + no
-    // inverse pass. The renders sing at transpose+shift and TD-PSOLA the audio back.
+    // inverse pass. The renders sing at transpose+shift; the audio is shifted back
+    // (vocal_range::apply_inverse).
     let range_shift = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {

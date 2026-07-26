@@ -39,7 +39,7 @@ all in one app, with no Python required at inference time.
   (Signalsmith), loudness envelopes, minimap, full undo/redo.
 - **Vocal-range tooling** — automatic range testing of voice models, comfort-zone tuning, and
   opt-in range extension (out-of-range phrases are synthesized inside the model's comfort zone
-  and shifted back with TD-PSOLA).
+  and shifted back with the Signalsmith engine).
 - **Vocal-to-MIDI** — transcribe a separated vocal stem into editable notes (GAME engine).
 - Exports: audio (wav / flac / mp3 / ogg / opus / m4a) with what-you-hear offline mixdown
   parity, scores (ust / ustx / midi), and **voice-model packages (.zip — move a model to another
