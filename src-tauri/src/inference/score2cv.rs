@@ -1013,14 +1013,15 @@ mod tests {
     fn preroll_puts_every_vowel_on_the_beat() {
         let daw = daw_ja(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
         assert_eq!(daw.phon, vec!["a", "t", "a", "ɕ", "i"]);
-        // Bucketed priors (knife 3): on a SHORT note (≤7fr) the stop t compresses to its measured
-        // 2 frames and the fricative ɕ is held to the lender-half cap 4 — the previous vowels keep
-        // 5/3 frames (the training short-bucket vowel median is 3): fast runs stay intelligible.
-        assert_eq!(daw.phone_dur, vec![5, 2, 3, 4, 6], "short-bucket targets + lender-half cap");
+        // Bucketed priors (knife 3) + voiceless-onset p75 (knife 4): on a SHORT note (≤7fr) the
+        // stop t sits at its measured p75 = 3 frames (clarity lift — the p50 was 2) and the
+        // fricative ɕ is held to the lender-half cap 4 — the previous vowels keep 4/3 frames
+        // (the training short-bucket vowel median is 3): fast runs stay intelligible AND crisp.
+        assert_eq!(daw.phone_dur, vec![4, 3, 3, 4, 6], "short-bucket p75 targets + lender-half cap");
         assert_eq!(daw.phone_dur.iter().sum::<i64>(), 7 + 7 + 6, "frame-conserving (timeline unmoved)");
         // vowel onsets (cumulative) land exactly on the beats 0 / 7 / 14:
-        assert_eq!(5 + 2, 7, "た's vowel starts on beat 7");
-        assert_eq!(5 + 2 + 3 + 4, 14, "し's vowel starts on beat 14");
+        assert_eq!(4 + 3, 7, "た's vowel starts on beat 7");
+        assert_eq!(4 + 3 + 3 + 4, 14, "し's vowel starts on beat 14");
         // evt mapping (the phoneme lane's note attribution):
         assert_eq!(daw.evt, vec![0, 1, 1, 2, 2]);
         // parity build untouched: split_dur shape, consonant INSIDE the note window.
@@ -1084,9 +1085,9 @@ mod tests {
         let d = en_dicts();
         let arr = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 50)], &d).unwrap();
         assert_eq!(arr.phon, vec!["SP", "f", "aɪ", "n", "d"]);
-        // f (fricative) targets 6, coda n targets 4, the stop d 3 — the 760ms flat [d] is gone AND
-        // the consonants are no longer one flat size.
-        assert_eq!(arr.phone_dur, vec![4, 6, 43, 4, 3], "codas at their own measured targets");
+        // f (voiceless fricative, long-bucket p75) targets 7, coda n targets 4, the stop d 3 —
+        // the 760ms flat [d] is gone AND the consonants are no longer one flat size.
+        assert_eq!(arr.phone_dur, vec![3, 7, 43, 4, 3], "codas at their own measured targets");
         // a 3-frame note can't fit any coda at the 2-frame minimum → both drop, the nucleus survives.
         let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d).unwrap();
         assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");

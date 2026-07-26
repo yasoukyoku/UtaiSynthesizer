@@ -5,138 +5,140 @@
 //   onset = before the group's first nucleus (pre-roll borrow target),
 //   coda  = after its last nucleus (in-note tail cap).
 // The training data COMPRESSES consonants on short notes (t 4->2, fricatives 8->3-5) — the
-// UTAU preutterance auto-scaling, measured instead of invented. Median per cell, clamped to
+// UTAU preutterance auto-scaling, measured instead of invented. Median per cell — EXCEPT
+// onset VOICELESS cells, which use p75 (S83 knife 4: fast-run clarity; voiced p75==p50 so
+// only voiceless onsets lift, codas stay median to avoid word-final thud). Clamped to
 // [2, 7]; sparse cells fall back (neighbour bucket -> pooled -> other position -> global).
 
 /// (token, onset_target[short,mid,long], coda_target[short,mid,long])
 pub const PHONE_DUR_PRIORS: &[(&str, [i64; 3], [i64; 3])] = &[
     ("b", [3, 3, 3], [3, 3, 4]), // onset n=5278, coda n=902
     ("bʲ", [2, 3, 3], [2, 4, 3]), // onset n=16, coda n=36
-    ("bː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("c", [5, 5, 5], [5, 5, 5]), // onset n=37, coda n=89
-    ("cʰ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("c͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("bː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("c", [6, 6, 6], [5, 5, 5]), // onset n=37, coda n=89
+    ("cʰ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("c͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("d", [3, 3, 3], [2, 3, 3]), // onset n=7759, coda n=4825
-    ("dz", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("dz", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("dʑ", [5, 5, 5], [4, 4, 4]), // onset n=76, coda n=231
     ("dʒ", [4, 4, 6], [7, 7, 7]), // onset n=531, coda n=129
     ("dʒː", [6, 6, 6], [6, 6, 6]), // onset n=8, coda n=9
-    ("dʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("dː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("dʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("dː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("d̪", [3, 4, 5], [3, 3, 3]), // onset n=1728, coda n=92
-    ("f", [4, 4, 6], [4, 4, 6]), // onset n=6748, coda n=1067
-    ("fʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("fː", [3, 3, 3], [7, 7, 4]), // onset n=4, coda n=7
-    ("h", [3, 3, 4], [4, 4, 5]), // onset n=3414, coda n=370
+    ("f", [6, 6, 7], [4, 4, 6]), // onset n=6748, coda n=1067
+    ("fʲ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("fː", [7, 7, 7], [7, 7, 4]), // onset n=4, coda n=7
+    ("h", [3, 3, 6], [4, 4, 5]), // onset n=3414, coda n=370
     ("hː", [7, 7, 7], [7, 7, 7]), // onset n=0, coda n=3
     ("j", [3, 4, 5], [4, 4, 4]), // onset n=4868, coda n=938
-    ("k", [3, 4, 5], [4, 4, 5]), // onset n=12307, coda n=5207
-    ("kʰ", [5, 5, 6], [6, 6, 6]), // onset n=3190, coda n=196
-    ("kʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("k", [4, 5, 6], [4, 4, 5]), // onset n=12307, coda n=5207
+    ("kʰ", [6, 6, 7], [6, 6, 6]), // onset n=3190, coda n=196
+    ("kʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("kː", [4, 6, 7], [5, 5, 6]), // onset n=17, coda n=3
-    ("k̚", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("k͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("k͈ʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("k̚", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("k͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("k͈ʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("l", [3, 3, 4], [3, 3, 3]), // onset n=13332, coda n=9243
-    ("lʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("lʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("lː", [4, 4, 7], [5, 6, 6]), // onset n=198, coda n=74
     ("m", [3, 4, 5], [3, 4, 5]), // onset n=13383, coda n=6540
     ("mʲ", [3, 3, 3], [3, 3, 3]), // onset n=17, coda n=50
     ("mː", [7, 7, 7], [3, 7, 7]), // onset n=16, coda n=10
     ("n", [3, 3, 5], [3, 3, 4]), // onset n=12711, coda n=20064
-    ("nʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("nʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("nː", [7, 7, 7], [4, 4, 5]), // onset n=15, coda n=8
-    ("n̪", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("n̪ː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("p", [3, 3, 4], [4, 4, 4]), // onset n=9684, coda n=2456
+    ("n̪", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("n̪ː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("p", [3, 4, 6], [4, 4, 4]), // onset n=9684, coda n=2456
     ("pf", [7, 7, 7], [7, 7, 7]), // onset n=5, coda n=12
-    ("pʰ", [4, 4, 6], [5, 6, 6]), // onset n=1312, coda n=180
-    ("pʲ", [4, 4, 5], [6, 4, 5]), // onset n=9, coda n=37
-    ("pʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("pʰ", [5, 5, 7], [5, 6, 6]), // onset n=1312, coda n=180
+    ("pʲ", [4, 4, 6], [6, 4, 5]), // onset n=9, coda n=37
+    ("pʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("pː", [4, 7, 3], [7, 7, 7]), // onset n=4, coda n=9
-    ("p̚", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("p͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("p̚", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("p͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("r", [4, 4, 6], [4, 4, 7]), // onset n=1344, coda n=1117
-    ("rʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("rʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("rː", [6, 6, 6], [4, 4, 4]), // onset n=18, coda n=4
-    ("s", [3, 6, 7], [3, 5, 6]), // onset n=9770, coda n=10336
-    ("sʰ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("sʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("sʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("sː", [5, 5, 5], [7, 7, 7]), // onset n=7, coda n=6
-    ("s̪", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("s̪ː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("s͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t", [2, 3, 4], [4, 3, 3]), // onset n=16602, coda n=13552
-    ("ts", [3, 4, 6], [5, 5, 6]), // onset n=4890, coda n=1103
-    ("tsʰ", [6, 6, 7], [6, 6, 6]), // onset n=1731, coda n=118
-    ("tsʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tɕ", [3, 4, 6], [5, 5, 5]), // onset n=6146, coda n=782
-    ("tɕʰ", [6, 6, 7], [7, 7, 7]), // onset n=4158, coda n=195
-    ("tɕʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tɕː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tɕ͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("s", [4, 7, 7], [3, 5, 6]), // onset n=9770, coda n=10336
+    ("sʰ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("sʲ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("sʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("sː", [5, 5, 7], [7, 7, 7]), // onset n=7, coda n=6
+    ("s̪", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("s̪ː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("s͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t", [3, 4, 5], [4, 3, 3]), // onset n=16602, coda n=13552
+    ("ts", [4, 5, 7], [5, 5, 6]), // onset n=4890, coda n=1103
+    ("tsʰ", [7, 7, 7], [6, 6, 6]), // onset n=1731, coda n=118
+    ("tsʲ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tɕ", [4, 5, 7], [5, 5, 5]), // onset n=6146, coda n=782
+    ("tɕʰ", [7, 7, 7], [7, 7, 7]), // onset n=4158, coda n=195
+    ("tɕʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tɕː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tɕ͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("tʃ", [7, 7, 7], [7, 7, 7]), // onset n=378, coda n=227
     ("tʃː", [7, 7, 7], [7, 7, 7]), // onset n=4, coda n=5
-    ("tʰ", [4, 4, 6], [5, 5, 5]), // onset n=4001, coda n=345
-    ("tʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tʲː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("tː", [6, 6, 6], [6, 6, 6]), // onset n=67, coda n=24
-    ("t̚", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t̪", [3, 5, 5], [3, 3, 6]), // onset n=2484, coda n=304
-    ("t̪s̪", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t̪s̪ː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t̪ː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("t͈ʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("tʰ", [5, 5, 7], [5, 5, 5]), // onset n=4001, coda n=345
+    ("tʲ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tʲː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("tː", [7, 7, 7], [6, 6, 6]), // onset n=67, coda n=24
+    ("t̚", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t̪", [3, 6, 7], [3, 3, 6]), // onset n=2484, coda n=304
+    ("t̪s̪", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t̪s̪ː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t̪ː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("t͈ʲ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("v", [3, 3, 3], [3, 3, 3]), // onset n=3475, coda n=1985
-    ("vʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("vʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("w", [3, 3, 4], [3, 3, 3]), // onset n=5263, coda n=1165
-    ("x", [2, 4, 6], [4, 4, 5]), // onset n=6548, coda n=1300
+    ("x", [3, 5, 7], [4, 4, 5]), // onset n=6548, coda n=1300
     ("z", [3, 3, 4], [5, 5, 6]), // onset n=1613, coda n=3453
-    ("zʲ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("z̪", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ç", [4, 4, 4], [3, 6, 7]), // onset n=315, coda n=2204
+    ("zʲ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("z̪", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ç", [6, 6, 6], [3, 6, 7]), // onset n=315, coda n=2204
     ("ð", [3, 5, 6], [3, 3, 4]), // onset n=3424, coda n=478
     ("ŋ", [7, 7, 7], [6, 6, 7]), // onset n=142, coda n=2165
-    ("ɕ", [6, 6, 7], [6, 6, 7]), // onset n=6788, coda n=1140
-    ("ɕʰ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɕː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɕ͈", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɕ", [7, 7, 7], [6, 6, 7]), // onset n=6788, coda n=1140
+    ("ɕʰ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɕː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɕ͈", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("ɟ", [3, 3, 3], [3, 3, 3]), // onset n=32, coda n=56
     ("ɟʝ", [3, 5, 6], [3, 5, 6]), // onset n=550, coda n=2
     ("ɡ", [3, 3, 4], [3, 3, 4]), // onset n=2973, coda n=1047
     ("ɣ", [4, 4, 4], [5, 6, 6]), // onset n=55, coda n=77
     ("ɥ", [7, 7, 7], [7, 7, 7]), // onset n=140, coda n=10
-    ("ɦ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɫ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɭ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɰ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɰ̃", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɦ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɫ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɭ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɰ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɰ̃", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("ɲ", [7, 7, 7], [4, 4, 4]), // onset n=154, coda n=128
-    ("ɲː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɲː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("ɴ", [7, 7, 7], [2, 2, 6]), // onset n=133, coda n=752
-    ("ɴː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ɸ", [4, 4, 4], [5, 5, 5]), // onset n=80, coda n=147
-    ("ɸʷ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɴː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ɸ", [5, 6, 6], [5, 5, 5]), // onset n=80, coda n=147
+    ("ɸʷ", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
     ("ɹ", [4, 4, 7], [3, 3, 7]), // onset n=2357, coda n=3351
     ("ɻ", [3, 3, 4], [4, 4, 4]), // onset n=2637, coda n=647
     ("ɾ", [2, 2, 3], [2, 2, 3]), // onset n=1611, coda n=4295
     ("ɾʲ", [2, 2, 2], [2, 2, 2]), // onset n=14, coda n=57
     ("ʁ", [3, 3, 7], [3, 3, 7]), // onset n=2332, coda n=3378
-    ("ʂ", [6, 6, 7], [7, 7, 7]), // onset n=7937, coda n=631
-    ("ʂː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ʃ", [5, 5, 7], [7, 7, 7]), // onset n=1539, coda n=272
-    ("ʈʂ", [3, 4, 6], [4, 4, 5]), // onset n=5122, coda n=369
-    ("ʈʂʰ", [5, 5, 7], [7, 7, 7]), // onset n=2748, coda n=177
+    ("ʂ", [7, 7, 7], [7, 7, 7]), // onset n=7937, coda n=631
+    ("ʂː", [3, 5, 7], [3, 3, 5]), // onset n=0, coda n=0
+    ("ʃ", [6, 6, 7], [7, 7, 7]), // onset n=1539, coda n=272
+    ("ʈʂ", [4, 5, 7], [4, 4, 5]), // onset n=5122, coda n=369
+    ("ʈʂʰ", [6, 6, 7], [7, 7, 7]), // onset n=2748, coda n=177
     ("ʎ", [7, 7, 7], [7, 7, 7]), // onset n=196, coda n=45
-    ("ʐ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ʐː", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
-    ("ʑ", [3, 4, 5], [3, 3, 5]), // onset n=0, coda n=0
+    ("ʐ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ʐː", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
+    ("ʑ", [3, 3, 4], [3, 3, 5]), // onset n=0, coda n=0
     ("ʒ", [7, 7, 7], [7, 7, 7]), // onset n=713, coda n=190
-    ("ʔ", [6, 7, 7], [6, 6, 6]), // onset n=89, coda n=307
+    ("ʔ", [7, 7, 7], [6, 6, 6]), // onset n=89, coda n=307
     ("ʝ", [7, 7, 7], [7, 7, 7]), // onset n=97, coda n=27
     ("β", [6, 6, 6], [5, 5, 5]), // onset n=122, coda n=109
-    ("θ", [6, 6, 6], [7, 7, 7]), // onset n=344, coda n=345
+    ("θ", [7, 7, 7], [7, 7, 7]), // onset n=344, coda n=345
 ];
