@@ -41,6 +41,12 @@ pub fn stretch_interleaved(
         return Ok(Vec::new());
     }
     let out_samples = ((in_samples as f64) * time_factor).round().max(1.0) as usize;
+    // i32 FFI boundary: a colossal input × factor (hours of audio at 4×) would wrap `as i32`
+    // into a small positive count and come back rc=0 with mostly-zero audio (S82 review) —
+    // refuse loudly instead. Same CODE as the factor validation: it IS a ratio/size problem.
+    if in_samples > i32::MAX as usize || out_samples > i32::MAX as usize {
+        return Err("STRETCH_RATIO_RANGE".into());
+    }
     let mut output = vec![0.0f32; out_samples * channels];
     let rc = unsafe {
         utai_stretch_exact(
