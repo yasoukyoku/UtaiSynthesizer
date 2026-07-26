@@ -553,14 +553,17 @@ pub fn piece_range_shift(
 /// entirely (zero extra cost).
 pub const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
 
-/// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b streaming base): per
-/// window the voiced (> 20 Hz) median, quantized to the nearest semitone — the engine wants
-/// a ROUGH fundamental, and quantizing merges neighboring windows into runs so the shim's
-/// per-run process slicing stays coarse. Unvoiced windows carry the previous value (a
-/// mid-stream 0 would re-enable the engine's noise-chasing auto-detector — the exact jitter
-/// this schedule exists to kill, S82 ear-confirmed); leading unvoiced windows backfill from
-/// the first voiced one. All-unvoiced ⇒ None (auto-detect). Callers pass the SHIFTED track —
-/// the inverse's input is the render at the shifted pitch. Returns (track, step_samples).
+/// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
+/// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
+/// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
+/// per-window values make the shim slice at every ~100 ms boundary (negligible cost — the
+/// engine re-reads the base every internal block anyway) while the analysis width follows
+/// the melody continuously instead of in semitone stairs. Unvoiced windows carry the
+/// previous value (a mid-stream 0 would re-enable the engine's noise-chasing auto-detector —
+/// the exact jitter this schedule exists to kill, S82 ear-confirmed); leading unvoiced
+/// windows backfill from the first voiced one. All-unvoiced ⇒ None (auto-detect). Callers
+/// pass the SHIFTED track — the inverse's input is the render at the shifted pitch.
+/// Returns (track, step_samples).
 pub fn formant_base_track(
     f0_hz: &[f32],
     hop_samples: usize,
@@ -571,7 +574,6 @@ pub fn formant_base_track(
     }
     let step_frames =
         ((sample_rate as f32 * 0.1 / hop_samples as f32).round() as usize).max(1);
-    let quantize = |hz: f32| 440.0f32 * 2.0f32.powf((12.0 * (hz / 440.0).log2()).round() / 12.0);
     let mut track: Vec<f32> = Vec::with_capacity(f0_hz.len() / step_frames + 1);
     for win in f0_hz.chunks(step_frames) {
         let mut voiced: Vec<f32> = win.iter().copied().filter(|&v| v > 20.0).collect();
@@ -580,7 +582,7 @@ pub fn formant_base_track(
             continue;
         }
         voiced.sort_by(|a, b| a.total_cmp(b));
-        track.push(quantize(voiced[voiced.len() / 2]));
+        track.push(voiced[voiced.len() / 2]);
     }
     // sticky forward-fill, then backfill the leading unvoiced stretch
     let first_voiced = track.iter().position(|&v| v > 0.0)?;
@@ -1053,10 +1055,10 @@ mod tests {
     }
 
     #[test]
-    fn the_base_schedule_is_sticky_quantized_and_voiced_only() {
+    fn the_base_schedule_is_sticky_smooth_and_voiced_only() {
         // 100 fps hop at 48 kHz ⇒ 10 frames per 100 ms window. Layout: 1 s unvoiced lead,
         // 1 s of 220 Hz, 1 s unvoiced (must CARRY 220 — a mid-stream 0 would re-enable the
-        // auto-detector), 1 s of 465 Hz (quantizes to the 466.16 Hz semitone).
+        // auto-detector), 1 s of 465 Hz (passes through UNquantized — S82c user A/B).
         let hop = 480usize;
         let mut f0 = vec![0.0f32; 100];
         f0.extend(vec![220.0; 100]);
@@ -1066,10 +1068,10 @@ mod tests {
         assert_eq!(step, 4800); // 10 frames × 480 samples
         assert_eq!(track.len(), 40);
         assert!(track.iter().all(|&v| v > 0.0), "no mid-stream zeros: {track:?}");
-        assert!((track[0] - 220.0).abs() < 1.0, "leading unvoiced backfills: {}", track[0]);
-        assert!((track[15] - 220.0).abs() < 1.0);
-        assert!((track[25] - 220.0).abs() < 1.0, "unvoiced stretch carries: {}", track[25]);
-        assert!((track[35] - 466.16).abs() < 1.0, "quantized to semitone: {}", track[35]);
+        assert!((track[0] - 220.0).abs() < 0.01, "leading unvoiced backfills: {}", track[0]);
+        assert!((track[15] - 220.0).abs() < 0.01);
+        assert!((track[25] - 220.0).abs() < 0.01, "unvoiced stretch carries: {}", track[25]);
+        assert!((track[35] - 465.0).abs() < 0.01, "smooth (no quantize): {}", track[35]);
         // all-unvoiced ⇒ None (auto-detect), never a garbage schedule
         assert!(formant_base_track(&vec![0.0f32; 400], hop, 48000).is_none());
     }
