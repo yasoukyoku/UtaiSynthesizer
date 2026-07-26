@@ -77,7 +77,7 @@ export function NodePalette({ onAddNode, onDropNode }: Props) {
 
       <div className="palette-category">
         <div className="palette-category-title">{t("workflow.catEffects")}</div>
-        <PaletteItem type="transpose" label={t18({ zh: "移调", en: "Transpose", ja: "移調" }, lang)} icon="T" color="#fbbf24" onAdd={onAddNode} onDrag={startDrag} />
+        <PaletteItem type="transpose" label="Signalsmith" icon="S" color="#fbbf24" onAdd={onAddNode} onDrag={startDrag} />
       </div>
 
       <div className="palette-category">

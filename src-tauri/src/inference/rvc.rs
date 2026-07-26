@@ -313,11 +313,14 @@ pub fn run_pipeline(
         let pf: Vec<f32> = pitchf_sl.iter().map(|&v| v * k).collect();
         let pc: Vec<i64> = pf.iter().map(|&v| f0_to_coarse(v)).collect();
         let out = vc_chunk(m, chunk, &pc, &pf, sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
+        // per-chunk fed-f0 median = a LOCAL formant base (chunks span seconds, far tighter
+        // than a whole-song median — S82 anti-pop)
         super::vocal_range::apply_inverse(
             out,
             m.sample_rate,
             range_shift,
             options.range_formant_follow,
+            super::vocal_range::formant_base_hint(&pf),
         )
         .map_err(UtaiError::Inference)
     };

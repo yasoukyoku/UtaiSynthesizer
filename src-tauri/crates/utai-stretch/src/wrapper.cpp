@@ -32,13 +32,16 @@ extern "C" {
 // then shifted by formant_semitones — 0 keeps formants exactly where the source had them.
 // When active == 0 the formant machinery is bypassed entirely and formants follow the
 // transpose (the pre-formant-control behavior, zero extra cost).
+// `formant_base_hz` (only read when active): > 0 pins the formant analysis to a KNOWN
+// fundamental instead of the engine's per-block auto-detector — the detector chases noise on
+// voiceless consonants and the per-block correction jitter is audible as pops (S82). 0 = auto.
 int utai_stretch_exact(const float* input, int in_samples, int channels, float sample_rate,
                        double time_factor, double transpose_semitones,
-                       double formant_semitones, int formant_active, float* output,
-                       int out_samples) {
+                       double formant_semitones, int formant_active, double formant_base_hz,
+                       float* output, int out_samples) {
     if (!input || !output || in_samples <= 0 || out_samples <= 0 || channels <= 0 ||
         sample_rate <= 0.0f || !(time_factor > 0.0) || !std::isfinite(transpose_semitones) ||
-        !std::isfinite(formant_semitones)) {
+        !std::isfinite(formant_semitones) || !std::isfinite(formant_base_hz)) {
         return 1;
     }
     try {
@@ -49,6 +52,11 @@ int utai_stretch_exact(const float* input, int in_samples, int channels, float s
         }
         if (formant_active != 0) {
             stretch.setFormantSemitones((float)formant_semitones, /*compensatePitch=*/true);
+            if (formant_base_hz > 0.0) {
+                // setFormantBase expects frequency normalized to the SAMPLE RATE
+                // (stft.h freqToBin(f) = f * fftSamples), same axis as the tonality limit.
+                stretch.setFormantBase((float)(formant_base_hz / sample_rate));
+            }
         }
 
         // Front-pad short clips so exact() never hits its too-short bail-out (see file header).

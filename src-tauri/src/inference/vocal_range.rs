@@ -553,11 +553,28 @@ pub fn piece_range_shift(
 /// entirely (zero extra cost).
 pub const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
 
+/// Median of the voiced (> 20 Hz) values of a fed-f0 track — the formant-analysis base hint
+/// for apply_inverse. The engine's per-block pitch auto-detector chases noise on voiceless
+/// consonants and the resulting correction jitter is audible as pops (S82, ear-confirmed);
+/// we KNOW what f0 the model was fed, so hand the engine that instead. None (< 10 voiced
+/// frames) falls back to the auto-detector. Callers pass the SHIFTED track — the inverse's
+/// input is the render at the shifted pitch.
+pub fn formant_base_hint(f0_hz: &[f32]) -> Option<f32> {
+    let mut voiced: Vec<f32> = f0_hz.iter().copied().filter(|&v| v > 20.0).collect();
+    if voiced.len() < 10 {
+        return None;
+    }
+    voiced.sort_by(|a, b| a.total_cmp(b));
+    Some(voiced[voiced.len() / 2])
+}
+
 /// THE single execution point of the inverse shift — shared by the score, cover and audition
 /// paths so engine policy can never drift between them. Shifts `audio` back by `-shift`
 /// semitones through the Signalsmith engine (time_factor 1.0 = pure transpose, no f0 guide
-/// needed); `kappa` sets the formant policy (see DEFAULT_FORMANT_KAPPA). Output length ==
-/// input length exactly (every caller's trim/pad arithmetic depends on that).
+/// needed); `kappa` sets the formant policy (see DEFAULT_FORMANT_KAPPA);
+/// `formant_base_hz` = the fed f0's median (formant_base_hint) so the formant analysis never
+/// runs on its noise-chasing auto-detector when we know the truth. Output length == input
+/// length exactly (every caller's trim/pad arithmetic depends on that).
 ///
 /// A stretch failure is LOUD: there is no second engine to fall back to, and returning the
 /// un-inverted render would be a silently wrong-pitched result. The Err carries the engine's
@@ -567,6 +584,7 @@ pub fn apply_inverse(
     sample_rate: u32,
     shift: i64,
     kappa: f32,
+    formant_base_hz: Option<f32>,
 ) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -580,8 +598,13 @@ pub fn apply_inverse(
     let k = kappa.clamp(0.0, 1.0);
     let semis = -(shift as f64); // semitones the AUDIO moves = inverse of the model-side shift
     // κ=1 is the plain transpose: skip the formant machinery entirely (zero extra cost).
-    let formant = ((1.0 - k) > 1e-3).then(|| f64::from(k) * semis);
-    tracing::debug!("range-extend: inverse {semis:+.0} st, formant kappa {k:.2}");
+    let formant = ((1.0 - k) > 1e-3).then(|| utai_stretch::FormantPin {
+        semitones: f64::from(k) * semis,
+        base_hz: formant_base_hz.filter(|b| b.is_finite() && *b > 0.0).map(f64::from),
+    });
+    tracing::debug!(
+        "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base {formant_base_hz:?} Hz"
+    );
     let n = audio.len();
     let mut y = utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, semis, formant)?;
     if y.len() != n {
@@ -981,13 +1004,28 @@ mod tests {
             *v = (0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin())
                 + (0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
         }
-        let untouched = apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA).expect("shift 0");
+        let untouched =
+            apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA, None).expect("shift 0");
         assert_eq!(untouched, x);
-        for (shift, kappa) in [(-3i64, 0.0f32), (5, 0.0), (-7, 1.0)] {
-            let y = apply_inverse(x.clone(), sr, shift, kappa).expect("inverse");
+        for (shift, kappa, base) in
+            [(-3i64, 0.0f32, None), (5, 0.0, Some(220.0f32)), (-7, 1.0, None)]
+        {
+            let y = apply_inverse(x.clone(), sr, shift, kappa, base).expect("inverse");
             assert_eq!(y.len(), x.len(), "shift={shift} kappa={kappa}");
             assert!(y.iter().all(|v| v.is_finite()));
         }
+    }
+
+    #[test]
+    fn the_base_hint_is_a_voiced_median_or_nothing() {
+        // zeros (rests/unvoiced) never pollute the hint; too few voiced frames = no hint
+        // (auto-detect fallback), never a garbage scalar.
+        let mut f0 = vec![0.0f32; 50];
+        f0.extend(vec![220.0; 30]);
+        f0.extend(vec![440.0; 10]);
+        assert_eq!(formant_base_hint(&f0), Some(220.0));
+        assert_eq!(formant_base_hint(&vec![0.0f32; 100]), None);
+        assert_eq!(formant_base_hint(&[220.0; 5]), None);
     }
 
     #[test]

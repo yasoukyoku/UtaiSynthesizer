@@ -384,11 +384,15 @@ fn infer_segment(
     f0.iter_mut().for_each(|v| *v *= ratio);
     // S60-2/S60c 音域扩展: apply the run_pipeline-decided whole-signal shift to the FED f0 so
     // the model sings inside its comfort zone; the decoded audio is shifted back after decode.
-    // shift 0 ⇒ byte-identical untouched path.
-    if range_shift != 0 {
+    // shift 0 ⇒ byte-identical untouched path. The (shifted) fed f0's median doubles as the
+    // inverse's formant-analysis base (computed here — decode_features consumes f0 by value).
+    let range_base = if range_shift != 0 {
         let k = 2.0f32.powf(range_shift as f32 / 12.0);
         f0.iter_mut().for_each(|v| *v *= k);
-    }
+        super::vocal_range::formant_base_hint(&f0)
+    } else {
+        None
+    };
     report(p_f0); // f0 done
 
     if cancel() {
@@ -440,6 +444,7 @@ fn infer_segment(
             m.sample_rate,
             range_shift,
             options.range_formant_follow,
+            range_base,
         )
         .map_err(UtaiError::Inference)?;
     }

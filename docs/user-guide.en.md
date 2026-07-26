@@ -635,7 +635,7 @@ Say you dragged in a full song and want to swap the vocals to your own model, wi
 4. Add an **RVC** or **SoVITS** node from "Voice Conversion" and pick your voice model.
 5. Wire the separation node's **Vocals** output port into the voice node's input.
 6. Wire the voice node's output into the "Output to track" node.
-7. Add a "Transpose" node ("Processing" category), set "Semitones" to −2; wire the separation node's **Instrumental** port into the transpose node, and the transpose node into a **second** "Output to track" node (create a new one — that way vocals and accompaniment land as separate groups whose volumes you can balance independently).
+7. Add a "Signalsmith" node ("Processing" category — spectral transpose with formant controls), set "Semitones" to −2; wire the separation node's **Instrumental** port into the Signalsmith node, and the Signalsmith node into a **second** "Output to track" node (create a new one — that way vocals and accompaniment land as separate groups whose volumes you can balance independently).
 8. Click **Run** at the panel's top. Each node shows queue/progress/OK status, and finished branches land on the track as sub-lanes automatically.
 9. Back in the arrangement view, listen: A/B against the original with the track header's `O` toggle, and balance vocals vs accompaniment with the group bars' `V` faders.
 

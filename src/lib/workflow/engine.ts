@@ -678,13 +678,18 @@ async function executeNode(
     }
 
     case "transpose": {
-      // Fidelity transpose (spectral, Signalsmith) — built for instrumentals. All-neutral =
-      // exact passthrough: forward the input path untouched so an inert node costs nothing and
-      // downstream lanes keep byte-identical audio. preserveFormants alone (0 st, 0 offset)
-      // is also inert — there is nothing to preserve against.
+      // The Signalsmith node (spectral transpose + formant controls) — built for
+      // instrumentals. All-neutral = exact passthrough: forward the input path untouched so
+      // an inert node costs nothing and downstream lanes keep byte-identical audio. A
+      // non-default follow alone (0 st, 0 offset) is also inert — with no transpose there is
+      // nothing for formants to follow or resist.
       const semitones = typeof params.semitones === "number" ? params.semitones : 0;
       const formantOffset = typeof params.formantOffset === "number" ? params.formantOffset : 0;
-      const preserveFormants = params.preserveFormants === true;
+      // formantFollow: 1 = classic full-spectrum shift (pre-S82 default); a same-session
+      // preserveFormants=true save reads as follow 0 (the checkbox this slider replaced).
+      const formantFollow = typeof params.formantFollow === "number"
+        ? params.formantFollow
+        : params.preserveFormants === true ? 0 : 1;
       if (semitones === 0 && formantOffset === 0) {
         outputData.set(0, primaryInput);
         break;
@@ -694,8 +699,8 @@ async function executeNode(
       await invoke("transpose_audio", {
         path: primaryInput,
         semitones,
+        formantFollow,
         formantOffset,
-        preserveFormants,
         outputPath,
       });
       outputData.set(0, outputPath);

@@ -6,21 +6,33 @@
 //! Tempo Slider's range. The Tempo Slider feeds it whole sources/stems; output length is exactly
 //! round(input_len × factor) per channel (the upstream `exact()` recipe).
 
+/// Engine-native formant control for one stretch call. `semitones` places the formant
+/// envelope relative to the INPUT spectrum (0 = keep the source timbre under any transpose).
+/// `base_hz` optionally feeds the engine the KNOWN fundamental instead of its per-block
+/// auto-detector: the detector chases noise on voiceless consonants and the resulting
+/// per-block correction jitter is audible as pops (S82, ear-confirmed on real renders) —
+/// pass the fed f0's median whenever the caller knows it (the vocal inverse does; the
+/// instrumental Signalsmith node does not and leaves the detector on).
+#[derive(Debug, Clone, Copy)]
+pub struct FormantPin {
+    pub semitones: f64,
+    pub base_hz: Option<f64>,
+}
+
 /// `time_factor` = output duration / input duration (>1 = slower/longer).
 /// `transpose_semitones` = spectral-domain pitch shift (0 = pitch unchanged); tonality-aware
 /// (~8 kHz limit inside the shim) so full mixes keep natural highs.
-/// `formant` = `None` → formants follow the transpose (the classic full-spectrum shift);
-/// `Some(st)` → the formant envelope is pinned to the INPUT spectrum (engine-native
-/// `setFormantSemitones` with pitch compensation) and then shifted by `st` semitones — so
-/// `Some(0.0)` keeps the source timbre under any transpose. Consumers: the Transpose node
-/// (both knobs) and the range-extension inverse (κ policy); the Tempo Slider passes `None`.
+/// `formant` = `None` → formants follow the transpose (the classic full-spectrum shift, zero
+/// extra cost); `Some(pin)` → engine-native `setFormantSemitones` with pitch compensation
+/// (see FormantPin). Consumers: the Signalsmith node (follow/offset knobs) and the
+/// range-extension inverse (κ policy); the Tempo Slider passes `None`.
 pub fn stretch_interleaved(
     input: &[f32],
     channels: usize,
     sample_rate: u32,
     time_factor: f64,
     transpose_semitones: f64,
-    formant: Option<f64>,
+    formant: Option<FormantPin>,
 ) -> Result<Vec<f32>, String> {
     if channels == 0 || input.len() % channels != 0 {
         return Err("STRETCH_BAD_INPUT".into());
@@ -31,9 +43,14 @@ pub fn stretch_interleaved(
     if !transpose_semitones.is_finite() {
         return Err("TRANSPOSE_RANGE".into());
     }
-    if let Some(f) = formant {
-        if !f.is_finite() {
+    if let Some(pin) = formant {
+        if !pin.semitones.is_finite() {
             return Err("TRANSPOSE_FORMANT_RANGE".into());
+        }
+        if let Some(b) = pin.base_hz {
+            if !(b.is_finite() && b > 0.0) {
+                return Err("TRANSPOSE_FORMANT_RANGE".into());
+            }
         }
     }
     let in_samples = input.len() / channels;
@@ -56,8 +73,9 @@ pub fn stretch_interleaved(
             sample_rate as f32,
             time_factor,
             transpose_semitones,
-            formant.unwrap_or(0.0),
+            formant.map_or(0.0, |p| p.semitones),
             i32::from(formant.is_some()),
+            formant.and_then(|p| p.base_hz).unwrap_or(0.0),
             output.as_mut_ptr(),
             out_samples as i32,
         )
@@ -78,6 +96,7 @@ extern "C" {
         transpose_semitones: f64,
         formant_semitones: f64,
         formant_active: i32,
+        formant_base_hz: f64,
         output: *mut f32,
         out_samples: i32,
     ) -> i32;
@@ -216,10 +235,14 @@ mod tests {
             x.push(s);
         }
         let follow = stretch_interleaved(&x, 2, SR, 1.0, 12.0, None).expect("follow");
-        let pres = stretch_interleaved(&x, 2, SR, 1.0, 12.0, Some(0.0)).expect("preserve");
-        // both must still transpose the fundamental up an octave
+        let pin = |base_hz: Option<f64>| FormantPin { semitones: 0.0, base_hz };
+        let pres = stretch_interleaved(&x, 2, SR, 1.0, 12.0, Some(pin(None))).expect("preserve");
+        // known-f0 hint (the S82 anti-pop path) must not break the formant contract
+        let pres_base =
+            stretch_interleaved(&x, 2, SR, 1.0, 12.0, Some(pin(Some(f0 as f64)))).expect("base");
+        // all must still transpose the fundamental up an octave
         let expected = (SR as f32 / (f0 * 2.0)).round() as usize;
-        for (name, y) in [("follow", &follow), ("preserved", &pres)] {
+        for (name, y) in [("follow", &follow), ("preserved", &pres), ("preserved+base", &pres_base)] {
             let mono = mono_left(y);
             let p = est_period(mid(&mono), expected.saturating_sub(15).max(8), expected + 15);
             assert!(
@@ -229,15 +252,17 @@ mod tests {
         }
         let c_orig = centroid(mid(&mono_left(&x)), SR);
         let c_follow = centroid(mid(&mono_left(&follow)), SR);
-        let c_pres = centroid(mid(&mono_left(&pres)), SR);
         assert!(
             c_follow > c_orig * 1.2,
             "transpose alone should brighten: orig {c_orig} follow {c_follow}"
         );
-        assert!(
-            (c_pres - c_orig).abs() < (c_follow - c_orig).abs() * 0.8,
-            "formant preservation did not hold the envelope: orig {c_orig} follow {c_follow} preserved {c_pres}"
-        );
+        for (name, y) in [("preserved", &pres), ("preserved+base", &pres_base)] {
+            let c_pres = centroid(mid(&mono_left(y)), SR);
+            assert!(
+                (c_pres - c_orig).abs() < (c_follow - c_orig).abs() * 0.8,
+                "{name} did not hold the envelope: orig {c_orig} follow {c_follow} got {c_pres}"
+            );
+        }
     }
 
     #[test]
@@ -270,6 +295,9 @@ mod tests {
         assert!(stretch_interleaved(&[0.0; 8], 2, SR, f64::NAN, 0.0, None).is_err());
         assert!(stretch_interleaved(&[0.0; 8], 2, SR, 0.0, 0.0, None).is_err());
         assert!(stretch_interleaved(&[0.0; 8], 2, SR, 1.0, f64::NAN, None).is_err());
-        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 1.0, 0.0, Some(f64::NAN)).is_err());
+        let bad_semi = FormantPin { semitones: f64::NAN, base_hz: None };
+        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 1.0, 0.0, Some(bad_semi)).is_err());
+        let bad_base = FormantPin { semitones: 0.0, base_hz: Some(-5.0) };
+        assert!(stretch_interleaved(&[0.0; 8], 2, SR, 1.0, 0.0, Some(bad_base)).is_err());
     }
 }
