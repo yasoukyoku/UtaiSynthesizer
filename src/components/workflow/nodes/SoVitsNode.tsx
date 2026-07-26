@@ -47,6 +47,7 @@ export function SoVitsNode(props: NodeProps) {
   const autoF0 = (params.auto_f0 as boolean) ?? SOVITS_DEFAULTS.auto_f0;
   const gpuExtract = (params.gpu_extract as boolean) ?? SOVITS_DEFAULTS.gpu_extract;
   const rangeExtend = (params.range_extend as boolean) ?? SOVITS_DEFAULTS.range_extend;
+  const rangeFormantFollow = (params.range_formant_follow as number) ?? SOVITS_DEFAULTS.range_formant_follow;
   const vocoderName = (params.vocoder_name as string | null) ?? SOVITS_DEFAULTS.vocoder_name;
   // Cluster/index asset presence comes from the SAME ModelEntry field RVC's index uses (Rust
   // scan() picks up any sibling .npy regardless of model type).
@@ -250,6 +251,16 @@ export function SoVitsNode(props: NodeProps) {
               <input type="checkbox" checked={rangeExtend}
                 onChange={(e) => updateParams({ range_extend: e.target.checked })} />
             </div>
+            )}
+            {/* S82 κ — formant-follow of the shift-back inverse; only affects shifted phrases */}
+            {voiceHasRangeRecord(selected, governingSpeakerId(speakerId, spkMix)) && rangeExtend && (
+            <ParamSlider
+              label={t18({ zh: "共振峰跟随", en: "Formant follow", ja: "フォルマント追従" }, lang)}
+              title={t18({ zh: "音域扩展乐句移回原调时，共振峰跟随音高的比例：0＝保持模型音色（默认），1＝完全跟随（卡通感）", en: "How much formants follow the pitch on the range-extension shift-back: 0 = keep the model's timbre (default), 1 = follow fully (cartoonish)", ja: "音域拡張の戻し時にフォルマントが音高へ追従する割合：0＝モデルの音色を保持（既定）、1＝完全追従（カートゥーン的）" }, lang)}
+              min={0} max={1} step={0.01} value={rangeFormantFollow}
+              format={(v) => v.toFixed(2)}
+              onChange={(v) => updateParams({ range_formant_follow: v })}
+            />
             )}
             <GpuExtractRow value={gpuExtract} lang={lang}
               onChange={(v) => updateParams({ gpu_extract: v })} />

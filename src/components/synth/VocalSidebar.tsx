@@ -247,7 +247,7 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             S60c/S62c: shown ONLY when the track's SELECTED SPEAKER carries a usable tested
             vocal_range record — an untested model/speaker's toggle is a confusing no-op
             (§user, twice). Default OFF (S62c user decision — recolor tradeoff is opt-in). */}
-        {voiceHasRangeRecord(selectedVoice, vocalTrackSpeakerId(vocalParams)) && (
+        {voiceHasRangeRecord(selectedVoice, vocalTrackSpeakerId(vocalParams)) && (<>
         <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.rangeExtend")}
@@ -255,7 +255,24 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
           />
         </div>
+        {/* S82 κ — formant-follow of the shift-back inverse. Stored in BOTH backend option bags
+            (one per-track knob; switching backend must not change the formant policy). Hidden
+            while the extension is off — it only affects actually-shifted phrases. */}
+        {vocalParams.rangeExtend === true && (
+          <Slider
+            label={t("vocalEditor.sidebar.rangeFormant")}
+            tip={t("vocalEditor.sidebar.rangeFormantTip")}
+            value={(vocalParams.backend === "rvc"
+              ? vocalParams.rvc?.range_formant_follow
+              : vocalParams.sovits?.range_formant_follow) ?? 0}
+            cfg={{ min: 0, max: 1, step: 0.01, unit: "", bipolar: false }}
+            onChange={(v) => setVocalParams(trackId, {
+              sovits: { ...(vocalParams.sovits ?? {}), range_formant_follow: v },
+              rvc: { ...(vocalParams.rvc ?? {}), range_formant_follow: v },
+            })}
+          />
         )}
+        </>)}
       </div>
 
       {/* ⓪.3 语言 (S58 §3.7) — lives on the SINGER tab (it configures WHAT is sung, not the pitch; §user).

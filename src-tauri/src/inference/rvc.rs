@@ -317,7 +317,7 @@ pub fn run_pipeline(
             out,
             m.sample_rate,
             range_shift,
-            super::vocal_range::DEFAULT_FORMANT_KAPPA,
+            options.range_formant_follow,
         )
         .map_err(UtaiError::Inference)
     };

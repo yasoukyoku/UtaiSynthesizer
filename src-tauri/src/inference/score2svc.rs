@@ -600,7 +600,7 @@ pub fn render_score_sovits(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
-    audio = apply_range_inverse(audio, m.sample_rate, range_shift)?;
+    audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow)?;
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -714,7 +714,7 @@ pub fn render_score_rvc(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
-    audio = apply_range_inverse(audio, m.sample_rate, range_shift)?;
+    audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow)?;
     peak_normalize(&mut audio, 0.92);
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
@@ -795,17 +795,12 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
 /// execution point vocal_range::apply_inverse (Signalsmith — no f0 guide needed). shift 0 /
 /// empty ⇒ untouched (tier 1/2: in-comfort renders NEVER pass through here — bit-parity by
 /// construction).
-fn apply_range_inverse(audio: Vec<f32>, sample_rate: u32, range_shift: i64) -> crate::Result<Vec<f32>> {
+fn apply_range_inverse(audio: Vec<f32>, sample_rate: u32, range_shift: i64, kappa: f32) -> crate::Result<Vec<f32>> {
     if range_shift == 0 || audio.is_empty() {
         return Ok(audio);
     }
-    super::vocal_range::apply_inverse(
-        audio,
-        sample_rate,
-        range_shift,
-        super::vocal_range::DEFAULT_FORMANT_KAPPA,
-    )
-    .map_err(UtaiError::Inference)
+    super::vocal_range::apply_inverse(audio, sample_rate, range_shift, kappa)
+        .map_err(UtaiError::Inference)
 }
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.

@@ -44,6 +44,11 @@ pub struct RvcOptions {
     /// Requires a sidecar vocal_range record; in-range chunks are byte-identical either way.
     /// Default false.
     pub range_extend: bool,
+    /// S82 κ — formant-follow ratio of the range-extension inverse, 0..=1. 0 (default) keeps
+    /// the model's formants where it sang them (engine-native compensation — the user-validated
+    /// policy); 1 lets them follow the pitch (plain transpose, chipmunk). Read only when
+    /// range_extend fires a non-zero shift.
+    pub range_formant_follow: f32,
     pub index_ratio: f32,
     pub protect: f32,
     pub noise_scale: f32,
@@ -67,6 +72,7 @@ impl Default for RvcOptions {
             speaker_id: None,
             spk_mix: Vec::new(),
             range_extend: false,
+            range_formant_follow: 0.0,
             index_ratio: 0.75,
             protect: 0.33,
             noise_scale: 0.66666,
@@ -220,6 +226,8 @@ pub struct SovitsOptions {
     pub spk_mix: Vec<SpkMixEntry>,
     /// S60-2 音域扩展 (cover path) — see RvcOptions::range_extend. Default false.
     pub range_extend: bool,
+    /// S82 κ — see RvcOptions::range_formant_follow. Default 0.
+    pub range_formant_follow: f32,
     pub noise_scale: f32,
     pub cluster_ratio: f32,
     pub loudness_envelope: f32,
@@ -269,6 +277,7 @@ impl Default for SovitsOptions {
             speaker_id: None,
             spk_mix: Vec::new(),
             range_extend: false,
+            range_formant_follow: 0.0,
             noise_scale: 0.4,
             cluster_ratio: 0.0,
             loudness_envelope: 1.0,

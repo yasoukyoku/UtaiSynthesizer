@@ -53,6 +53,10 @@ export interface RvcOptions {
    * default (extension is opt-in per node — the whole-render recolor tradeoff must never be on
    * by default); a pre-S62 node's explicitly-written `true` keeps rendering extended. */
   range_extend: boolean;
+  /** S82 κ — range-extension formant-follow ratio 0..1: 0 (default) keeps the model's formants
+   * as sung (the user-validated policy), 1 lets them follow the pitch (chipmunk). Only audible
+   * when range_extend actually fires a shift. */
+  range_formant_follow: number;
   /** KNN index feature blend, 0..1. */
   index_ratio: number;
   /** Voiceless-consonant/breath protection, 0..0.5 — 0.5 means OFF. */
@@ -83,6 +87,8 @@ export interface SovitsOptions {
   spk_mix: SpkMixEntry[];
   /** S60-2 音域扩展 (cover) — see RvcOptions.range_extend. */
   range_extend: boolean;
+  /** S82 κ — see RvcOptions.range_formant_follow. */
+  range_formant_follow: number;
   /** Synthesis randomness, 0..1. */
   noise_scale: number;
   /** Cluster-model / feature-index blend, 0..1; 0 = off. */
@@ -129,6 +135,7 @@ export const RVC_DEFAULTS: RvcOptions = {
   speaker_id: null,
   spk_mix: [],
   range_extend: false,
+  range_formant_follow: 0,
   index_ratio: 0.75,
   protect: 0.33,
   noise_scale: 0.66666,
@@ -145,6 +152,7 @@ export const SOVITS_DEFAULTS: SovitsOptions = {
   speaker_id: null,
   spk_mix: [],
   range_extend: false,
+  range_formant_follow: 0,
   noise_scale: 0.4,
   cluster_ratio: 0,
   loudness_envelope: 1.0,
