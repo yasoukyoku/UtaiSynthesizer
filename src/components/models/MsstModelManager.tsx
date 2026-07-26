@@ -941,12 +941,15 @@ function VoiceModelsTab({ lang }: { lang: string }) {
               <div className="rm-voice-item-info">
                 <span className="rm-voice-item-name">{m.name}</span>
                 {isVocoder ? (
+                  <>
+                  {/* S82d r6: vocoder meta is DELIBERATELY two lines — identity badges first,
+                      the format string on its own full-width line (§user: ellipsizing it hid
+                      the info, and squeezing it into one line wrapped chaotically). Matches
+                      the voice rows' three-line rhythm (name / badges / range). */}
                   <span className="rm-voice-item-meta">
                     <span className="ver-badge" title={t18({ zh: "经典 NSF-HiFiGAN 架构", en: "Classic NSF-HiFiGAN architecture", ja: "クラシック NSF-HiFiGAN アーキテクチャ" }, lang)}>
                       NSF-HiFiGAN
                     </span>
-                    {/* the meta line's one shrinkable segment — full text in the tooltip */}
-                    <span className="rm-meta-shrink" title={vocoderFormatLabel(m)}>{vocoderFormatLabel(m)}</span>
                     {vocFormatOk ? (
                       <span className="msst-onnx-ok" title={t18({
                         zh: "标准格式：可用于所有 SoVITS 模型的浅扩散/增强器",
@@ -965,6 +968,10 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                       </span>
                     )}
                   </span>
+                  <span className="rm-voice-item-meta">
+                    <span className="rm-meta-shrink" title={vocoderFormatLabel(m)}>{vocoderFormatLabel(m)}</span>
+                  </span>
+                  </>
                 ) : (
                 <span className="rm-voice-item-meta">
                   {ver && <span className="ver-badge">{ver}</span>}
