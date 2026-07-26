@@ -502,10 +502,14 @@
   white-space: pre-line;
 }
 
+/* S82d r3: aligned action columns (§user). The old space-between spread the slack between
+   EVERY child, so audition/export/delete drifted with each row's content width; now the info
+   column eats all slack (flex: 1) and the actions right-pack at constant offsets. The lg gap
+   doubles as the mis-tap guard between buttons. */
 .rm-voice-item {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: var(--space-lg);
   padding: var(--space-md) 0;
   border-bottom: 1px solid var(--border-subtle);
 }
@@ -515,6 +519,14 @@
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1;
+}
+
+/* steady column widths across label variants (导出/Export/書き出し, 删除/Delete) */
+.rm-voice-item .model-export-btn,
+.rm-voice-item .model-delete-btn {
+  min-width: 52px;
+  text-align: center;
 }
 
 .rm-voice-item-name {
@@ -794,7 +806,8 @@
   display: flex;
   align-items: center;
   gap: var(--space-xs);
-  margin-right: var(--space-sm);
+  /* spacing to neighbours comes from .rm-voice-item's gap — an extra margin here would
+     unbalance the aligned action columns (S82d r3) */
 }
 .rm-audition-btn {
   min-width: 22px;
