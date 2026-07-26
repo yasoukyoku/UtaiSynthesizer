@@ -599,7 +599,8 @@
     "close": "关闭",
     "lane": {
       "loudness": "响度",
-      "formant": "共振腔"
+      "formant": "共振腔",
+      "phoneme": "音素"
     },
     "sidebar": {
       "tabSinger": "歌手",

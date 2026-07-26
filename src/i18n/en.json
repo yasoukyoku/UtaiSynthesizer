@@ -599,7 +599,8 @@
     "close": "Close",
     "lane": {
       "loudness": "Loudness",
-      "formant": "Formant"
+      "formant": "Formant",
+      "phoneme": "Phonemes"
     },
     "sidebar": {
       "tabSinger": "Singer",

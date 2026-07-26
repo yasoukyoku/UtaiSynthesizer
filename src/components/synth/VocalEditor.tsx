@@ -5,6 +5,7 @@
 // pane so Ctrl+Z/Delete route correctly). Tools: Arrow / Pen / Delete functional this phase; Pitch shows
 // the baseline f0 line (full pitch editing = Phase 5). One-position-one-note truncation runs at commit.
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactElement } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { useAudioStore } from "../../store/audio";
@@ -16,7 +17,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, buildScoreTriples } from "../../lib/vocal/vocalRender";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
@@ -58,6 +59,14 @@ const LANE_PARAMS: { id: LaneParam; min: number; max: number; unit: string; labe
   { id: "formant", min: -12, max: 12, unit: "st", labelKey: "vocalEditor.lane.formant" },
 ];
 const laneCfg = (p: LaneParam) => LANE_PARAMS.find((x) => x.id === p)!;
+
+/** S83: the lane band shows either a NUMERIC param (LaneParam, editable points) or the READ-ONLY
+ *  phoneme-timing view — the render allocator's own output (preview_vocal_phonemes), so the user can SEE
+ *  the real per-phone frames incl. pre-beat onset consonants instead of guessing. */
+type LaneView = LaneParam | "phoneme";
+
+/** One emitted phone from the Rust DAW assembly (wire shape of `preview_vocal_phonemes`). */
+interface PhonemeSpan { phone: string; frames: number; evt: number; voiceless: boolean; nucleus: boolean }
 // S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
 // track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
 const defaultLyricFor = (langId: number | undefined) => langById(langId ?? DEFAULT_LANG_ID).defaultLyric;
@@ -123,7 +132,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const [tool, setTool] = useState<Tool>("arrow");
   const [gridDiv, setGridDiv] = useState(2); // 1/8 default
   const [laneOpen, setLaneOpen] = useState(false); // ② bottom automation lane — collapsed by default (§user)
-  const [laneParam, setLaneParam] = useState<LaneParam>("loudness");
+  const [laneParam, setLaneParam] = useState<LaneView>("loudness");
   const [maximized, setMaximized] = useState(false);
   const [playing, setPlaying] = useState(false);
   // GLOBAL render flag (one vocal render at a time) — reactive so every editor's button disables together.
@@ -384,6 +393,59 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (v.scrollY > max) { v.scrollY = max; requestRedraw(); }
   }, [laneOpen, requestRedraw]);
 
+  // ── S83 phoneme-timing lane data: dry-run the RENDER's own allocator (preview_vocal_phonemes →
+  //    build_arrays_daw — the single source; never a JS re-computation) whenever the phoneme lane is
+  //    visible and its inputs changed. Debounced + sig-guarded; a superseded response is dropped (seq
+  //    token, bumped at SCHEDULE time so an in-flight older invoke can never land over a newer edit).
+  //    A failed preview (OOV / missing dictionary) clears the lane — the note area already paints OOV
+  //    red via oovWatch — and closing the lane then RESETS the failed sig, so an explicit reopen is a
+  //    retry signal (dictionary installed later must not stay blank forever — S83 review #12). Deps are
+  //    the narrow refs the payload actually reads (notes/vocalParams/tempo), not `part` — unrelated
+  //    store churn (a fader drag on another track) must not re-stringify every note (review #9). ──
+  const phonemeLaneRef = useRef<{ spans: PhonemeSpan[]; tripleNoteIds: (string | null)[]; ticksPerFrame: number; sig: string } | null>(null);
+  const phonemeSigRef = useRef("");
+  const phonemeSeqRef = useRef(0);
+  const phonemePrevOnRef = useRef(false);
+  const phonemeLaneOn = laneOpen && laneParam === "phoneme";
+  const phonemeNotes = part?.notes;
+  const phonemeVp = part?.vocalParams;
+  useEffect(() => {
+    const wasOn = phonemePrevOnRef.current;
+    phonemePrevOnRef.current = phonemeLaneOn;
+    if (!phonemeLaneOn || !phonemeNotes || !phonemeVp) {
+      // lane off with nothing cached = the last attempt failed/cleared → unpin so reopen retries.
+      if (!phonemeLaneRef.current) phonemeSigRef.current = "";
+      return;
+    }
+    const sig = JSON.stringify([
+      phonemeNotes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? ""]),
+      phonemeVp.langId, phonemeVp.breathToken ?? "AP", tempo,
+    ]);
+    // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
+    // reference lines already follow the NEW notes). Mid-edit staleness while the lane stays open is
+    // left visible (blanking every keystroke would flicker); the debounce below replaces it shortly.
+    if (!wasOn && phonemeLaneRef.current && phonemeLaneRef.current.sig !== sig) {
+      phonemeLaneRef.current = null;
+      requestRedraw();
+    }
+    if (sig === phonemeSigRef.current) return;
+    const seq = ++phonemeSeqRef.current;
+    const timer = window.setTimeout(async () => {
+      phonemeSigRef.current = sig; // set at fire time so a persistent backend error can't hot-loop
+      const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(phonemeNotes, tempo, phonemeVp.breathToken ?? "AP", phonemeVp.langId);
+      try {
+        const spans = await invoke<PhonemeSpan[]>("preview_vocal_phonemes", { score: triples, defaultLang: phonemeVp.langId });
+        if (seq !== phonemeSeqRef.current) return; // superseded by a newer request
+        phonemeLaneRef.current = { spans, tripleNoteIds, ticksPerFrame, sig };
+      } catch {
+        if (seq !== phonemeSeqRef.current) return;
+        phonemeLaneRef.current = null;
+      }
+      requestRedraw();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [phonemeLaneOn, phonemeNotes, phonemeVp, tempo, requestRedraw]);
+
   // ② Drive a redraw when the global transport playhead moves (playback / seek), OFF-React (a reactive
   // selector would re-render the whole editor 60×/s). Mirrors TimelineRuler's imperative subscribe — the
   // draw closure reads playheadTickRef.current, so it just needs re-invoking each time the tick changes.
@@ -641,7 +703,6 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       //    note area (its opaque bg covers the note rows/pitch-line that painted into this region). Shows ONE
       //    param at a time (selector in the header); the curve is a RELATIVE offset, neutral 0 at the midline. ──
       if (laneOpenRef.current) {
-        const cfg = laneCfg(laneParamRef.current);
         const laneTop = h - LANE_H;
         ctx.fillStyle = col("--bg-panel") || "#1a2236";
         ctx.fillRect(0, laneTop, w, LANE_H);
@@ -655,6 +716,78 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           ctx.strokeStyle = `rgba(226,232,244,${a})`; ctx.lineWidth = g.level === "bar" ? 1.4 : 1;
           ctx.beginPath(); ctx.moveTo(Math.round(gx) + 0.5, laneTop + 1); ctx.lineTo(Math.round(gx) + 0.5, h); ctx.stroke();
         }
+        if (laneParamRef.current === "phoneme") {
+        // ── S83 READ-ONLY phoneme-timing view: blocks at the render allocator's true cv-frame
+        //    positions — a pre-rolled onset consonant visibly starts BEFORE its note's onset line.
+        //    Nucleus = accent fill; voiced consonant = violet (note-selected hue); voiceless = dim;
+        //    SP invisible; AP faint (an audible breath). Text = the vocab IPA token itself. ──
+        const pd = phonemeLaneRef.current;
+        const bandY = laneTop + 14;
+        const bandH = LANE_H - 20;
+        if (pd) {
+          // note-onset reference lines first (under the blocks): the beat each vowel should sit on.
+          ctx.strokeStyle = "rgba(226,232,244,0.4)"; ctx.lineWidth = 1;
+          for (const n of notesRef.current) {
+            const nx = noteAreaX + noteTickToX(n.tick, start, v);
+            if (nx < noteAreaX || nx > w) continue;
+            ctx.beginPath(); ctx.moveTo(Math.round(nx) + 0.5, laneTop + 1); ctx.lineTo(Math.round(nx) + 0.5, h); ctx.stroke();
+          }
+          ctx.font = "9px Consolas, monospace"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          let f = 0;
+          for (const s of pd.spans) {
+            const t0 = f * pd.ticksPerFrame;
+            const t1 = (f + s.frames) * pd.ticksPerFrame;
+            f += s.frames;
+            const x0 = noteAreaX + noteTickToX(t0, start, v);
+            const x1 = noteAreaX + noteTickToX(t1, start, v);
+            if (x1 < noteAreaX || x0 > w) continue;
+            const bx0 = Math.max(x0, noteAreaX);
+            const bw = Math.max(1, Math.min(x1, w) - bx0 - 1);
+            if (s.phone === "SP") continue; // a true rest draws nothing (the grid shows through)
+            if (s.phone === "AP") {
+              ctx.fillStyle = "rgba(226,232,244,0.06)";
+              ctx.fillRect(bx0, bandY, bw, bandH);
+            } else {
+              ctx.fillStyle = s.nucleus ? (col("--accent-primary") || "#39c5bb") : (col("--note-selected") || "#8b5cf6");
+              ctx.globalAlpha = s.nucleus ? 0.3 : s.voiceless ? 0.12 : 0.24;
+              ctx.fillRect(bx0, bandY, bw, bandH);
+              ctx.globalAlpha = 1;
+              ctx.strokeStyle = "rgba(226,232,244,0.25)"; ctx.lineWidth = 1;
+              ctx.strokeRect(Math.round(bx0) + 0.5, Math.round(bandY) + 0.5, Math.max(1, Math.round(bw) - 1), bandH - 1);
+            }
+            if (x1 - x0 >= 14) {
+              ctx.fillStyle = s.nucleus ? (col("--text-primary") || "#e2e8f4") : (col("--text-muted") || "#8896b4");
+              ctx.fillText(s.phone, (Math.max(x0, noteAreaX) + Math.min(x1, w)) / 2, bandY + bandH / 2);
+            }
+          }
+          // hover readout (top-right of the band): the phone under the cursor + its true length + the
+          // source note's lyric — evt → tripleNoteIds → note (the attribution chain the wire carries).
+          const mp2 = mouseRef.current;
+          if (mp2 && mp2.y >= laneTop && mp2.x >= KEY_COL_W) {
+            let hf = 0;
+            for (const s of pd.spans) {
+              const hx0 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
+              hf += s.frames;
+              const hx1 = noteAreaX + noteTickToX(hf * pd.ticksPerFrame, start, v);
+              if (mp2.x < hx0 || mp2.x >= hx1) continue;
+              const noteId = pd.tripleNoteIds[s.evt];
+              const lyric = noteId ? notesRef.current.find((n) => n.id === noteId)?.lyric : undefined;
+              ctx.fillStyle = col("--text-primary") || "#e2e8f4";
+              ctx.font = "10px Consolas, monospace"; ctx.textAlign = "right"; ctx.textBaseline = "top";
+              ctx.fillText(`${lyric ? `${lyric} · ` : ""}${s.phone} · ${s.frames * 20}ms`, w - 6, laneTop + 3);
+              break;
+            }
+          }
+        }
+        // left scale column: bg + border like the numeric lanes; "IPA" as the unit tag.
+        ctx.fillStyle = col("--bg-deep") || "#080b14"; ctx.fillRect(0, laneTop, KEY_COL_W, LANE_H);
+        ctx.strokeStyle = col("--border-default") || "#2a3a5c";
+        ctx.beginPath(); ctx.moveTo(KEY_COL_W + 0.5, laneTop); ctx.lineTo(KEY_COL_W + 0.5, h); ctx.stroke();
+        ctx.fillStyle = col("--text-muted") || "#556b94"; ctx.font = "9px system-ui, sans-serif";
+        ctx.textAlign = "left"; ctx.textBaseline = "top";
+        ctx.fillText("IPA", 4, laneTop + 3);
+        } else {
+        const cfg = laneCfg(laneParamRef.current);
         // neutral (0) midline
         const midY = paramToY(0, cfg.min, cfg.max, laneTop, LANE_H);
         ctx.strokeStyle = "rgba(226,232,244,0.22)"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
@@ -694,6 +827,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         ctx.fillText(`${cfg.min}`, KEY_COL_W - 4, h - 9);
         ctx.textAlign = "left"; ctx.textBaseline = "top";
         ctx.fillText(cfg.unit, 4, laneTop + 3);
+        }
       }
 
       // ── mouse-position guide (ALL tools): a vertical line at the snapped tick under the cursor, drawn
@@ -781,6 +915,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
   useEffect(() => { requestRedraw(); }, [oovIds, requestRedraw]);
+  // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
+  // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
+  // invalidation path. S83 review #7.)
 
   // Attach the live preview-notes closure to the drag state (draw reads it).
   const withPreview = (d: DragState): DragState & { previewNotes: () => Note[] } => {
@@ -834,6 +971,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // selected lane's stored curve; the caller has already confirmed the cursor is in the lane band.
   const LANE_PT_HIT = 8;
   const laneParamPointAt = (clientX: number, clientY: number): number => {
+    if (laneParamRef.current === "phoneme") return -1; // S83: the phoneme view has no points
     const cfg = laneCfg(laneParamRef.current);
     const curve = paramCurvesRef.current?.[cfg.id];
     if (!curve || curve.xs.length === 0) return -1;
@@ -944,6 +1082,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     // a lane gesture never touches notes. Click on empty → insert a point + drag it; click ON a point → drag it;
     // right-click a point → delete (onContextMenu). Commits ONCE on pointerup (one undo step).
     if (laneOpenRef.current && y >= noteBottom() && x >= KEY_COL_W) {
+      if (laneParamRef.current === "phoneme") return; // S83: read-only view — no gestures in the band
       const cfg = laneCfg(laneParamRef.current);
       const laneTop = noteBottom();
       const stored = paramCurvesRef.current?.[cfg.id];
@@ -1067,7 +1206,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (cv) {
         if (p.y < RULER_H && p.x >= KEY_COL_W) cv.style.cursor = "col-resize"; // ② ruler = seek the playhead
         else if (laneOpenRef.current && p.y >= noteBottom() && p.x >= KEY_COL_W)
-          cv.style.cursor = laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
+          cv.style.cursor = laneParamRef.current === "phoneme" ? "default" // S83 read-only view
+            : laneParamPointAt(e.clientX, e.clientY) >= 0 ? "grab" : "crosshair"; // ② over a point vs insert
         else if (toolRef.current === "delete") cv.style.cursor = "";
         else { const hov = noteAt(e.clientX, e.clientY); cv.style.cursor = hov && (toolRef.current === "pen" || hov.onEdge) ? "ew-resize" : ""; }
       }
@@ -1182,7 +1322,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const { x, y } = localXY(e.clientX, e.clientY);
     if (y < noteBottom() || x < KEY_COL_W) return;
     const idx = laneParamPointAt(e.clientX, e.clientY);
-    if (idx < 0) return;
+    if (idx < 0 || laneParamRef.current === "phoneme") return; // (phoneme view always misses anyway)
     const cfg = laneCfg(laneParamRef.current);
     const stored = paramCurvesRef.current?.[cfg.id];
     if (!stored) return;
@@ -1402,6 +1542,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
               }}
             >{t(lp.labelKey)}</button>
           ))}
+          {/* S83: the read-only phoneme-timing view (same self-toggle contract as the numeric lanes) */}
+          <button
+            className={`snap-toggle vocal-grid-btn${laneOpen && laneParam === "phoneme" ? " active" : ""}`}
+            onClick={() => {
+              if (laneOpen && laneParam === "phoneme") setLaneOpen(false);
+              else { setLaneParam("phoneme"); setLaneOpen(true); }
+            }}
+          >{t("vocalEditor.lane.phoneme")}</button>
         </div>
         <div className="vocal-editor-header-spacer" />
         <label className="vocal-grid-label">{t("vocalEditor.grid")}</label>
