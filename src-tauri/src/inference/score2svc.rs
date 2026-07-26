@@ -314,13 +314,27 @@ fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default:
 /// "voiceless frames carry no pitch". Downstream this makes SoVITS mark them uv=0 (+ gap-interp f0)
 /// and RVC's protect blend fire (pitchf=0). Until S69 the score path sang straight through /s/ /k/
 /// with full voicing — the prime suspect for the community "清浊不分" (k→g-ish) reports.
+///
+/// S83 knife 5 refinement: zero only the MEASURED fraction of the window, CENTERED — full-window
+/// zeroing was the R0b① over-correction. RMVPE actually zeroes 17-48% of a short-note voiceless
+/// window (the track drags in from the previous vowel and pre-voices into the next); zeroing 100%
+/// collapsed fast runs' voiced duty cycle into audible "briefly mute" syllables (さ/こ/け). The
+/// per-token per-bucket fraction comes from the same generated priors table (training-measured);
+/// the bucket keys on the phone's note-GROUP length (arr.note_dur — the training stat's exact
+/// frame of reference). Devoiced vowels / unmapped tokens keep the full-window zero (fallback).
 fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
     let n = note_hz.len();
     let mut cursor = 0usize;
     for (i, &d) in arr.phone_dur.iter().enumerate() {
         let d = d.max(0) as usize;
         if is_voiceless_phone(arr.phon[i]) {
-            for f in &mut note_hz[cursor.min(n)..(cursor + d).min(n)] {
+            let permille = super::score2cv::voiceless_zero_permille(
+                arr.phon[i],
+                arr.note_dur.get(i).copied().unwrap_or(d as i64),
+            );
+            let z = ((d as f64 * permille as f64 / 1000.0).round() as usize).min(d);
+            let start = cursor + (d - z) / 2;
+            for f in &mut note_hz[start.min(n)..(start + z).min(n)] {
                 *f = 0.0;
             }
         }
@@ -988,6 +1002,40 @@ mod tests {
         assert_eq!(wins, vec![(500, 1500)]);
     }
 
+    // S83 knife 5: voiceless windows zero only their MEASURED (bucketed) fraction, centered —
+    // edges keep the dragged-in/pre-voicing f0 exactly like RMVPE on real singing.
+    #[test]
+    fn zero_voiceless_is_partial_and_centered() {
+        let arr = |phon: Vec<&'static str>, dur: Vec<i64>, nd: i64| ScoreArrays {
+            phonemes: vec![0; phon.len()],
+            phone_dur: dur.clone(),
+            note_pitch: vec![60; phon.len()],
+            note_dur: vec![nd; phon.len()],
+            note_to_phone: vec![0; phon.len()],
+            phon,
+            lang: vec![2; dur.len()],
+            evt: vec![0; dur.len()],
+        };
+        // s in a mid-length group (10 fr): zero‰=575 → 4-frame window zeroes round(2.3)=2, centered.
+        let a = arr(vec!["s", "a"], vec![4, 6], 10);
+        let mut hz = vec![300.0f32; 10];
+        zero_voiceless_frames(&mut hz, &a);
+        assert_eq!(hz[0], 300.0, "leading edge keeps the dragged-in f0");
+        assert_eq!((hz[1], hz[2]), (0.0, 0.0), "window center zeroed");
+        assert_eq!(hz[3], 300.0, "vowel-adjacent edge keeps the pre-voicing f0");
+        assert!(hz[4..].iter().all(|&v| v == 300.0), "the vowel is untouched");
+        // devoiced vowel (not in the consonant table) → fallback 1000 = full-window zero.
+        let b = arr(vec!["i̥"], vec![4], 4);
+        let mut hz2 = vec![300.0f32; 4];
+        zero_voiceless_frames(&mut hz2, &b);
+        assert!(hz2.iter().all(|&v| v == 0.0), "a true devoiced vowel still zeroes fully");
+        // voiced phone: never touched.
+        let c = arr(vec!["m", "a"], vec![3, 3], 6);
+        let mut hz3 = vec![300.0f32; 6];
+        zero_voiceless_frames(&mut hz3, &c);
+        assert!(hz3.iter().all(|&v| v == 300.0));
+    }
+
     #[test]
     fn midi_frame_is_length_regulation() {
         // 3 phones, durs [2,1,3] → repeat each note_pitch by its dur.
@@ -1114,14 +1162,22 @@ mod tests {
 
     #[test]
     fn zero_voiceless_frames_zeroes_k_keeps_g() {
-        // か = [k(4fr), a(36fr)]: the voiceless k frames go 0 Hz, the vowel keeps pitch.
+        // か = [k, a]: the voiceless k window zeroes its MEASURED central fraction (S83 knife 5 —
+        // no longer the full window: RMVPE keeps edge f0 on real singing), the vowel keeps pitch.
         let score = [("か", 69, 40)];
         let arr = daw_ja(&score);
         let mut hz = build_note_hz(&arr, &ja_evts(&score), 0, None);
         assert!(hz.iter().all(|&h| h > 0.0), "pre: whole note voiced");
         zero_voiceless_frames(&mut hz, &arr);
         let k = arr.phone_dur[0] as usize;
-        assert!(hz[..k].iter().all(|&h| h == 0.0), "k frames zeroed");
+        let permille = super::super::score2cv::voiceless_zero_permille("k", arr.note_dur[0]);
+        let z = (k as f64 * permille as f64 / 1000.0).round() as usize;
+        assert!(z >= 1 && z < k, "k zeroes a nonzero PARTIAL core (got z={z} of {k})");
+        let zeroed = hz[..k].iter().filter(|&&h| h == 0.0).count();
+        assert_eq!(zeroed, z, "k zeroes exactly the measured fraction");
+        // centering rounds LEFT, so with z<k the vowel-adjacent edge is ALWAYS preserved (the
+        // pre-voicing frame — the perceptually load-bearing end; a 2-frame window zeroes its head).
+        assert!(hz[k - 1] > 0.0, "vowel-adjacent edge keeps the pre-voicing f0");
         assert!(hz[k..].iter().all(|&h| h > 0.0), "vowel frames keep pitch");
         // が = [ɡ, a] — voiced consonant stays pitched (清浊 distinction is the whole point).
         let score_g = [("が", 69, 40)];

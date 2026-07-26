@@ -305,10 +305,13 @@ const CODA_TARGET_FALLBACK: i64 = 4;
 /// where the training data compresses consonants (t 4→2, fricatives 8→3-5: the UTAU preutterance
 /// auto-scaling, measured instead of invented). Bucket by the note's own frame count — in a
 /// continuous run the beat interval IS the sung group length the training annotation measures.
-fn dur_prior(p: &str) -> Option<([i64; 3], [i64; 3])> {
-    static M: OnceLock<HashMap<&'static str, ([i64; 3], [i64; 3])>> = OnceLock::new();
+fn dur_prior(p: &str) -> Option<([i64; 3], [i64; 3], [i64; 3])> {
+    static M: OnceLock<HashMap<&'static str, ([i64; 3], [i64; 3], [i64; 3])>> = OnceLock::new();
     M.get_or_init(|| {
-        super::score2cv_dur_priors::PHONE_DUR_PRIORS.iter().map(|&(t, o, c)| (t, (o, c))).collect()
+        super::score2cv_dur_priors::PHONE_DUR_PRIORS
+            .iter()
+            .map(|&(t, o, c, z)| (t, (o, c, z)))
+            .collect()
     })
     .get(p)
     .copied()
@@ -323,10 +326,21 @@ fn dur_bucket(fr: i64) -> usize {
     }
 }
 fn onset_target_frames(p: &str, fr: i64) -> i64 {
-    dur_prior(p).map(|(o, _)| o[dur_bucket(fr)]).unwrap_or(ONSET_TARGET_FALLBACK)
+    dur_prior(p).map(|(o, _, _)| o[dur_bucket(fr)]).unwrap_or(ONSET_TARGET_FALLBACK)
 }
 fn coda_target_frames(p: &str, fr: i64) -> i64 {
-    dur_prior(p).map(|(_, c)| c[dur_bucket(fr)]).unwrap_or(CODA_TARGET_FALLBACK)
+    dur_prior(p).map(|(_, c, _)| c[dur_bucket(fr)]).unwrap_or(CODA_TARGET_FALLBACK)
+}
+
+/// S83 knife 5: measured f0==0 fraction (permille) inside a voiceless phone's window, bucketed by
+/// its note GROUP length. Real singing zeroes only 17-48% of a SHORT-note voiceless window (the
+/// RMVPE track drags in from the previous vowel and pre-voices into the next), while the render
+/// zeroed 100% (the S69 R0b① over-correction) — on fast runs that collapsed the voiced duty cycle
+/// into the audible "briefly mute" さ/こ/け the user pinpointed. Fallback 1000 = full-window zero:
+/// exactly right for the devoiced vowels i̥/ɨ̥/ɯ̥ (true whispers, not in the consonant table) and
+/// the conservative legacy behavior for anything else unmapped.
+pub fn voiceless_zero_permille(p: &str, group_frames: i64) -> i64 {
+    dur_prior(p).map(|(_, _, z)| z[dur_bucket(group_frames)]).unwrap_or(1000)
 }
 
 /// In-note allocation for one note's phones (`fr` ≥ 1 frames inside the note window): medial + coda get
@@ -477,18 +491,25 @@ mod nucleus_tests {
 
     #[test]
     fn duration_priors_cover_every_consonant_and_stay_in_window() {
+        use super::is_voiceless_phone;
         use super::super::score2cv_dur_priors::PHONE_DUR_PRIORS;
-        let prior: std::collections::HashMap<&str, ([i64; 3], [i64; 3])> =
-            PHONE_DUR_PRIORS.iter().map(|&(t, o, c)| (t, (o, c))).collect();
+        let prior: std::collections::HashMap<&str, ([i64; 3], [i64; 3], [i64; 3])> =
+            PHONE_DUR_PRIORS.iter().map(|&(t, o, c, z)| (t, (o, c, z))).collect();
         assert_eq!(prior.len(), PHONE_DUR_PRIORS.len(), "no duplicate tokens in the priors table");
         let mut consonants = 0usize;
         for &(p, _) in PHONE_TO_ID {
             let special = matches!(p, "SP" | "AP" | "PAD" | "BOS" | "EOS");
             if !special && !is_nucleus_phone(p) {
                 consonants += 1;
-                let (o, c) = *prior.get(p).unwrap_or_else(|| panic!("consonant {p} missing a duration prior"));
+                let (o, c, z) =
+                    *prior.get(p).unwrap_or_else(|| panic!("consonant {p} missing a duration prior"));
                 for v in o.iter().chain(c.iter()) {
                     assert!((2..=7).contains(v), "{p} prior out of window: {o:?}/{c:?}");
+                }
+                if is_voiceless_phone(p) {
+                    assert!(z.iter().all(|v| (1..=1000).contains(v)), "{p} zero-permille out of range: {z:?}");
+                } else {
+                    assert_eq!(z, [0, 0, 0], "{p} is voiced — its zero column must be 0 (never consulted)");
                 }
             } else {
                 assert!(!prior.contains_key(p), "{p} (nucleus/special) must not carry a prior");
