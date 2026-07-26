@@ -510,7 +510,9 @@
   display: flex;
   align-items: center;
   gap: var(--space-lg);
-  padding: var(--space-md) 0;
+  /* horizontal inset (r4): un-hug both edges so the visual weight sits centered instead of
+     leaning hard left (§user) */
+  padding: var(--space-md) var(--space-md);
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -525,7 +527,7 @@
 /* steady column widths across label variants (导出/Export/書き出し, 删除/Delete) */
 .rm-voice-item .model-export-btn,
 .rm-voice-item .model-delete-btn {
-  min-width: 52px;
+  min-width: 44px;
   text-align: center;
 }
 
