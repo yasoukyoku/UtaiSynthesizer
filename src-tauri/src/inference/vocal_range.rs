@@ -43,7 +43,18 @@ pub const CEILING_MARGIN: f32 = 2.0;
 /// whole-song shifts of -6/-9 st on a healthy record + in-range song (S62b field case,
 /// lengv2.3 — the shift magnitude tracked the octave-doubled spikes, not the melody). A real
 /// climax is seconds long and sails through. Shorter runs are DELETED from the analysis.
-pub const MIN_VIOLATION_RUN: usize = 25;
+pub const MIN_VIOLATION_MS: f32 = 250.0;
+/// Largest ORIGINAL-index step a violation run may take and still count as ONE sustained run,
+/// in milliseconds. Bridges rmvpe's blips inside a held note; a real breath/consonant gap
+/// (100-300 ms) must break the run. See phantom_kept_mask.
+pub const GAP_TOL_MS: f32 = 30.0;
+
+/// Both thresholds are expressed in TIME, not frames: the cover path judges on a 100 fps grid
+/// and the score path on the DAW's 50 fps grid, so a frame-count constant would silently mean
+/// 250 ms on one and 500 ms on the other.
+fn frames_for(ms: f32, fps: f32) -> usize {
+    ((ms * fps / 1000.0).round() as usize).max(1)
+}
 /// Weight of a frame inside PROVEN usable but above the margined comfort ceiling. Tier-2
 /// semantics ("inside usable renders untouched") mean these must never trigger a shift on
 /// their own — but when a shift happens anyway they still nudge the optimizer to land the
@@ -51,11 +62,115 @@ pub const MIN_VIOLATION_RUN: usize = 25;
 const BOUNDARY_WEIGHT_TOP: f32 = 0.3;
 const BOUNDARY_WEIGHT_BOTTOM: f32 = 0.1;
 
+/// Lowest / highest MIDI note the range test scans (mirrors RANGE_MIDI_LO/HI in rangeTest.ts).
+pub const DAMAGE_LO_MIDI: usize = 36;
+pub const DAMAGE_SLOTS: usize = 61; // 36..=96
+/// Damage is quantized into a u8 so SpeakerRange stays `Copy` (it is passed BY VALUE all the
+/// way into sovits/rvc run_pipeline; a Vec here would cascade through every signature).
+const DAMAGE_MAX: f32 = 3.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
     /// MIDI bounds, inclusive.
     pub usable: (f32, f32),
     pub comfort: (f32, f32),
+    /// S81 (E): per-semitone damage derived from the record's RAW scan, MIDI 36..=96,
+    /// quantized 0..DAMAGE_MAX. `None` = the record predates the scan (or carries none) — the
+    /// decision then falls back to the pre-S81 four-step usable/comfort ladder verbatim.
+    ///
+    /// Why this exists: `usable` is a "can produce a pitch at all" verdict (err<100 cents,
+    /// voiced>50%) yet BOTH paths were treating it as an untouchable ceiling, so a model whose
+    /// record says [36,77] never moved material anywhere inside 41 semitones — including the
+    /// top few that measurably sing badly. A continuous curve lets the optimizer prefer the
+    /// genuinely good part of the range instead of "anything not literally rejected".
+    pub damage: Option<[u8; DAMAGE_SLOTS]>,
+}
+
+impl SpeakerRange {
+    /// Bounds-only record (no raw scan) — the pre-S81 shape.
+    pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
+        Self { usable, comfort, damage: None }
+    }
+
+    /// Damage at a (possibly fractional) MIDI pitch, linearly interpolated between slots.
+    /// Outside the scanned window there is NO evidence, so it reads as fully damaged — the
+    /// optimizer must never treat "never tested" as "fine".
+    fn damage_at(&self, midi: f32) -> Option<f32> {
+        let d = self.damage.as_ref()?;
+        let lo = DAMAGE_LO_MIDI as f32;
+        let hi = lo + (DAMAGE_SLOTS - 1) as f32;
+        if !(lo..=hi).contains(&midi) {
+            return Some(DAMAGE_MAX);
+        }
+        let x = midi - lo;
+        let i = x.floor() as usize;
+        let f = x - i as f32;
+        let a = d[i] as f32 * (DAMAGE_MAX / 255.0);
+        let b = d[(i + 1).min(DAMAGE_SLOTS - 1)] as f32 * (DAMAGE_MAX / 255.0);
+        Some(a + (b - a) * f)
+    }
+}
+
+/// What a shift COSTS, independent of how much material it rescues.
+///
+/// The pre-S81 penalty was `0.003/st` and nothing else, which is not a cost model — rescuing 4%
+/// of the frames scored 3×0.04 = 0.12 against a 9-semitone penalty of 0.027, so the optimizer
+/// happily recoloured 100% of the audio to save 4% of it. The missing term is that a non-zero
+/// shift puts EVERY sample through the inverse transform, whatever the shift size:
+///   - SHIFT_FIXED_COST — the toll for passing the whole render through resynthesis at all
+///     (measured on real material: the shipped engine costs several dB of harmonic-to-noise
+///     ratio on 100% of the signal the moment the shift is non-zero);
+///   - SHIFT_PER_ST — the marginal formant displacement, which under a formant-preserving
+///     inverse is exactly |s| semitones of mismatch against the pitch the listener hears.
+///
+/// The magnitudes are NOT free parameters: they are the centre of the feasible region left by
+/// three optimizer tests whose expected answers the user adjudicated BY EAR (phantom bursts
+/// must not move / the S60d2 climax must still reach -7 / low material must still reach +22).
+/// Stated as an invariant: a whole-render recolour needs at least ~2% of the loudness-weighted
+/// material to be genuinely damaged before it pays for itself.
+const SHIFT_FIXED_COST: f32 = 0.06;
+const SHIFT_PER_ST: f32 = 0.005;
+
+fn shift_cost(s: i64) -> f32 {
+    if s == 0 {
+        0.0
+    } else {
+        SHIFT_FIXED_COST + SHIFT_PER_ST * s.abs() as f32
+    }
+}
+
+/// Per-semitone damage from one raw scan entry `[err_cents, voiced_ratio]`.
+///
+/// PERCEPTUAL, not linear-in-the-metric: a scan's cents error wanders 1-37 cents across a
+/// model's whole healthy range, and none of that is audible. Charging `err/100` for it would
+/// make the optimizer chase measurement noise and recolor songs that were fine. So each term
+/// stays at zero until it means something, then ramps to full damage at the point the old
+/// binary criterion used to reject:
+///   - pitch:   free below 25 cents, full damage at 100 (the old `usable` cutoff);
+///   - voicing: free above 0.95, full damage at 0.50 (ditto).
+/// A rejected semitone (err 9999) saturates on the pitch term alone.
+///
+/// S81 F1 closes the blind spot the f0 pair could never see: both of those are derived from f0,
+/// and f0 is an explicit conditioning INPUT to net_g, so a semitone whose TIMBRE has collapsed
+/// still reports perfect pitch and full voicing (akiko MIDI 80 measured -7.7 dB with 88.7% of
+/// its energy below 1.5*f0 while the record stored err=2 cents / voiced=1.00). `timbre` carries
+/// `(rms_db, low_ratio)` when the scan has them — a 2-tuple record from before S81 passes None
+/// and scores exactly as it did.
+///   - low_ratio: free below 0.55 (a healthy vowel spreads across harmonics), full damage at
+///     0.95 (a bare fundamental). THE term that catches "sings the note, has no voice left".
+///   - rms_db: free down to -6 dB relative to the scale's loudest note, full damage at -18.
+///     Graded, never a gate — a model is simply quieter at the edges of its range.
+fn damage_from_scan(err_cents: f64, voiced: f64, timbre: Option<(f64, f64)>) -> f32 {
+    let pitch = (((err_cents - 25.0) / 75.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
+    let voicing = (((0.95 - voiced) / 0.45).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
+    let (thin, quiet) = match timbre {
+        Some((rms_db, low_ratio)) => (
+            (((low_ratio - 0.55) / 0.40).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
+            (((-6.0 - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
+        ),
+        None => (0.0, 0.0),
+    };
+    (pitch + voicing + thin + quiet).min(DAMAGE_MAX)
 }
 
 /// Parse the sidecar `vocal_range` record for one speaker id. EXACT id only — an untested
@@ -84,7 +199,38 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         .into_iter()
         .flatten()
         .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= usable.0 && c.1 <= usable.1)?;
-    Some(SpeakerRange { usable, comfort })
+    // S81 (E): fold the raw per-semitone scan into a damage curve. Absent/garbage scan ⇒ None
+    // ⇒ every consumer falls back to the pre-S81 ladder (old records keep working untouched).
+    let damage = sp.get("semitones").and_then(|m| m.as_object()).and_then(|m| {
+        let mut d = [255u8; DAMAGE_SLOTS]; // untested slot = fully damaged, never "fine"
+        let mut seen = 0usize;
+        for (k, v) in m {
+            let Ok(midi) = k.parse::<i64>() else { continue };
+            let slot = midi - DAMAGE_LO_MIDI as i64;
+            if !(0..DAMAGE_SLOTS as i64).contains(&slot) {
+                continue;
+            }
+            let Some(a) = v.as_array() else { continue };
+            let (Some(err), Some(voiced)) = (
+                a.first().and_then(|x| x.as_f64()),
+                a.get(1).and_then(|x| x.as_f64()),
+            ) else {
+                continue;
+            };
+            // 4-tuple = S81 scan (err, voiced, rms_db, low_ratio); 2-tuple = pre-S81, scored
+            // exactly as before. Partial/garbage tuples fall back to the f0-only pair.
+            let timbre = match (a.get(2).and_then(|x| x.as_f64()), a.get(3).and_then(|x| x.as_f64())) {
+                (Some(rms_db), Some(low_ratio)) => Some((rms_db, low_ratio)),
+                _ => None,
+            };
+            d[slot as usize] = (damage_from_scan(err, voiced, timbre) / DAMAGE_MAX * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            seen += 1;
+        }
+        (seen >= 2).then_some(d)
+    });
+    Some(SpeakerRange { usable, comfort, damage })
 }
 
 /// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
@@ -113,87 +259,6 @@ pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
 // NOTE: "which speaker governs a blend" = the existing ①c `crate::inference::dominant_speaker`
 // (max-weight entry, else speaker_id) — reused, NOT re-implemented here (NO-dup).
 
-/// v1 three-tier decision. `bounds` = the part's effective pitch range in MIDI (transpose
-/// already folded in; from the f0 curve when present, else the note pitches). Returns the
-/// integer semitone translation to render at (0 = tiers 1/2, no inverse pass), clamped to
-/// ±MAX_RANGE_SHIFT (a clamp firing means the record is stale — retest).
-pub fn compute_range_shift(bounds: (f32, f32), range: &SpeakerRange) -> i64 {
-    let raw = compute_range_shift_raw(bounds, range);
-    if raw.abs() > MAX_RANGE_SHIFT {
-        tracing::warn!(
-            "range-extend: computed shift {raw:+} st exceeds ±{MAX_RANGE_SHIFT} — clamped (stale record? retest the model)"
-        );
-    }
-    raw.clamp(-MAX_RANGE_SHIFT, MAX_RANGE_SHIFT)
-}
-
-fn compute_range_shift_raw(bounds: (f32, f32), range: &SpeakerRange) -> i64 {
-    let (min_p, max_p) = bounds;
-    let (u_lo, u_hi) = range.usable;
-    let (c_lo, c_hi) = range.comfort;
-    if c_hi - c_lo <= 0.0 {
-        return 0; // degenerate comfort never a target (speaker_range heals; defensive here)
-    }
-    if min_p >= u_lo && max_p <= u_hi {
-        return 0; // tiers 1/2 — inside usable renders untouched
-    }
-    if max_p - min_p > c_hi - c_lo {
-        // wider than the comfort zone: best-effort centering (compression not ported)
-        let shift = (((c_lo + c_hi) - (min_p + max_p)) / 2.0).round() as i64;
-        tracing::warn!(
-            "range-extend: part spans {:.1} st > comfort span {:.1} st — centering by {} st (edges stay outside)",
-            max_p - min_p,
-            c_hi - c_lo,
-            shift
-        );
-        return shift;
-    }
-    if max_p > c_hi {
-        let need = -((max_p - c_hi).ceil() as i64);
-        let cushioned = -((max_p - (c_hi - CEILING_MARGIN)).ceil() as i64);
-        // take the ceiling margin only while the bottom still fits inside comfort
-        if min_p + cushioned as f32 >= c_lo {
-            cushioned
-        } else {
-            need
-        }
-    } else if min_p < c_lo {
-        (c_lo - min_p).ceil() as i64
-    } else {
-        0 // inside comfort but outside usable is impossible (comfort ⊆ usable); defensive
-    }
-}
-
-/// Effective pitch bounds of a score render in MIDI: voiced f0-curve extremes when the DAW
-/// supplies Option-A f0 (cents/100), else the note pitches (`note_nums`, rests ≤ 0);
-/// `transpose` folded in. None when nothing voiced (all-rest part → no shift).
-pub fn score_pitch_bounds(
-    note_nums: &[i64],
-    f0_cents: &[f32],
-    f0_voiced: &[u8],
-    transpose: i64,
-) -> Option<(f32, f32)> {
-    let mut lo = f32::MAX;
-    let mut hi = f32::MIN;
-    if !f0_cents.is_empty() {
-        for (i, &c) in f0_cents.iter().enumerate() {
-            if f0_voiced.get(i).copied().unwrap_or(0) == 0 {
-                continue;
-            }
-            let m = c / 100.0;
-            lo = lo.min(m);
-            hi = hi.max(m);
-        }
-    } else {
-        for &n in note_nums {
-            if n > 0 {
-                lo = lo.min(n as f32);
-                hi = hi.max(n as f32);
-            }
-        }
-    }
-    (lo <= hi).then(|| (lo + transpose as f32, hi + transpose as f32))
-}
 
 /// Per-frame RMS of `x` on a hop grid (frame i = samples [i·hop, (i+1)·hop)) — the loudness
 /// track for the shift decision's energy weighting. Frames past the end read 0.
@@ -227,25 +292,78 @@ fn median5(seq: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Phantom-island mask: a run of consecutive out-of-USABLE frames shorter than
-/// MIN_VIOLATION_RUN is detector noise (octave-read breaths, fry blips), not singing — it must
-/// neither defeat the byte-identical short-circuit nor add rescue mass to the optimizer.
-/// In-usable frames are always kept; sustained violations (a real climax) are always kept.
-fn phantom_kept_mask(seq: &[f32], u_lo: f32, u_hi: f32) -> Vec<bool> {
+/// Phantom-island mask: a violation run shorter than MIN_VIOLATION_MS is detector noise
+/// (octave-read breaths, fry blips), not singing — it must neither defeat the byte-identical
+/// short-circuit nor add rescue mass to the optimizer. In-usable frames are always kept;
+/// sustained violations (a real climax) are always kept.
+///
+/// S81: `orig_idx[k]` is the ORIGINAL frame index of `seq[k]`. `seq` is the voiced-only
+/// compaction, so two high phrases separated by a breath sit side by side in it — before this,
+/// several 200 ms bursts with breaths between them fused into one long run and sailed through
+/// the filter (the run test was measuring "voiced frames" where it meant "elapsed time").
+/// A gap wider than `gap_tol` now breaks the run.
+fn phantom_kept_mask(
+    seq: &[f32],
+    orig_idx: &[usize],
+    u_lo: f32,
+    u_hi: f32,
+    min_run: usize,
+    gap_tol: usize,
+) -> Vec<bool> {
     let mut kept = vec![true; seq.len()];
     let mut i = 0;
     while i < seq.len() {
         let out = seq[i] < u_lo || seq[i] > u_hi;
-        let mut j = i;
-        while j < seq.len() && ((seq[j] < u_lo || seq[j] > u_hi) == out) {
+        let mut j = i + 1;
+        while j < seq.len()
+            && ((seq[j] < u_lo || seq[j] > u_hi) == out)
+            && orig_idx[j] <= orig_idx[j - 1] + gap_tol
+        {
             j += 1;
         }
-        if out && j - i < MIN_VIOLATION_RUN {
+        if out && j - i < min_run {
             kept[i..j].fill(false);
         }
         i = j;
     }
     kept
+}
+
+/// Per-DAW-frame Hz track for the SCORE path, so 「自己唱」 can be judged by the same optimizer
+/// the cover path uses instead of two bare min/max numbers (S81 A).
+///
+/// Length == Σ`frames` == the length of the Option-A f0 / loudness lanes, so the caller can hand
+/// the loudness envelope straight in as the energy weight. With a DAW f0 curve the track is that
+/// curve (unvoiced ⇒ 0); without one it is the note pitches held for their durations — which
+/// incidentally makes a long note weigh more than a grace note, exactly as it should.
+pub fn score_frame_hz(
+    note_nums: &[i64],
+    frames: &[i64],
+    f0_cents: &[f32],
+    f0_voiced: &[u8],
+    transpose: i64,
+) -> Vec<f32> {
+    let midi_to_hz = |m: f32| 440.0 * 2f32.powf((m - 69.0) / 12.0);
+    if !f0_cents.is_empty() {
+        return f0_cents
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                if f0_voiced.get(i).copied().unwrap_or(0) == 0 {
+                    0.0
+                } else {
+                    midi_to_hz(c / 100.0 + transpose as f32)
+                }
+            })
+            .collect();
+    }
+    let mut out = Vec::new();
+    for (i, &n) in note_nums.iter().enumerate() {
+        let len = frames.get(i).copied().unwrap_or(0).max(0) as usize;
+        let hz = if n > 0 { midi_to_hz(n as f32 + transpose as f32) } else { 0.0 };
+        out.extend(std::iter::repeat(hz).take(len));
+    }
+    out
 }
 
 /// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer;
@@ -275,15 +393,38 @@ fn phantom_kept_mask(seq: &[f32], u_lo: f32, u_hi: f32) -> Vec<bool> {
 /// so what drives a whole-render recolor is what a listener would actually HEAR out-of-range;
 /// two different models both "muffled with extension ON" over in-range songs was this (§user).
 /// A piece entirely inside USABLE (after hygiene) renders untouched (tiers 1/2, byte-identical).
-pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerRange) -> i64 {
+pub fn piece_range_shift(
+    f0_hz: &[f32],
+    energy: Option<&[f32]>,
+    range: &SpeakerRange,
+    fps: f32,
+) -> i64 {
+    // S81 (H): a length-mismatched energy track must fail SAFE to "unweighted", not to
+    // "every frame we couldn't measure gets FULL weight" — the latter hands silence the same
+    // authority as the lead vocal. Unreachable today (all three call sites pass exact lengths).
+    let energy = match energy {
+        Some(e) if e.len() != f0_hz.len() => {
+            tracing::warn!(
+                "range-extend: energy track {} frames != f0 {} — decision falls back to unweighted",
+                e.len(),
+                f0_hz.len()
+            );
+            None
+        }
+        other => other,
+    };
     let mut midis: Vec<f32> = Vec::with_capacity(f0_hz.len());
     let mut weights: Vec<f32> = Vec::with_capacity(f0_hz.len());
+    // S81 (D): the ORIGINAL frame index of each kept sample — phantom_kept_mask needs it to tell
+    // "one held note" from "several bursts separated by breaths" (the compaction hides gaps).
+    let mut orig_idx: Vec<usize> = Vec::with_capacity(f0_hz.len());
     for (i, &v) in f0_hz.iter().enumerate() {
         if v <= 0.0 {
             continue;
         }
         midis.push(69.0 + 12.0 * (v / 440.0).log2());
         weights.push(energy.and_then(|e| e.get(i)).copied().unwrap_or(1.0));
+        orig_idx.push(i);
     }
     if midis.len() < 10 {
         return 0; // too little voiced material to judge — render untouched
@@ -303,7 +444,14 @@ pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerR
         }
     }
     let filtered = median5(&midis);
-    let kept = phantom_kept_mask(&filtered, u_lo, u_hi);
+    let kept = phantom_kept_mask(
+        &filtered,
+        &orig_idx,
+        u_lo,
+        u_hi,
+        frames_for(MIN_VIOLATION_MS, fps),
+        frames_for(GAP_TOL_MS, fps) + 1, // a step of k skips k-1 frames
+    );
     let dropped = kept.iter().filter(|&&k| !k).count();
     let voiced: Vec<(f32, f32)> = filtered
         .iter()
@@ -315,7 +463,11 @@ pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerR
     if voiced.len() < 10 {
         return 0;
     }
-    if voiced.iter().all(|&(m, _)| m >= u_lo && m <= u_hi) {
+    // Bounds-only records keep the pre-S81 short-circuit verbatim (byte-identical). A record
+    // WITH a scan deliberately does not get it: "inside usable" is exactly the verdict S81
+    // found untrustworthy, and the cost function below already refuses to move a clean piece
+    // (a zero-damage piece cannot beat SHIFT_FIXED_COST).
+    if range.damage.is_none() && voiced.iter().all(|&(m, _)| m >= u_lo && m <= u_hi) {
         if dropped > 0 {
             tracing::info!(
                 "range-extend: {dropped} phantom out-of-range frame(s) ignored (detector noise) — piece is in-range, rendering untouched"
@@ -323,12 +475,35 @@ pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerR
         }
         return 0; // tiers 1/2 — the whole piece sits in the proven zone
     }
-    let top = c_hi - CEILING_MARGIN;
+    // S81 (C): the margin exists because the sustained-vowel probe is more forgiving than real
+    // singing, so it must be measured from the PROVEN top (u_hi). When the record already
+    // reports c_hi < u_hi the comfort criterion has charged for that gap once — subtracting the
+    // margin from c_hi as well double-counts and pushes the shift further than the evidence
+    // warrants. (comfort == usable, the common case, is unchanged.)
+    let top = c_hi.min(u_hi - CEILING_MARGIN);
     let n: f32 = voiced.iter().map(|&(_, w)| w).sum();
     let frame_mass = |sf: f32| -> f32 {
         let mut mass = 0f32;
         for &(m, w) in &voiced {
             let p = m + sf;
+            if let Some(d) = range.damage_at(p) {
+                // S81 (E): measured per-semitone evidence replaces the four-step LADDER…
+                // …but NOT the user's comfort zone. Those are different kinds of statement:
+                // `damage` is what the probe measured, `comfort` is what the user decided they
+                // want ("above X this singer sounds bad to me" — a legitimate, guard-railed
+                // action per S60d2). Letting the scan swallow the comfort term made every
+                // manual comfort adjustment a no-op on any model that had a scan, i.e. all of
+                // them — a regression introduced with the damage curve earlier this session.
+                let wish = if p > top {
+                    BOUNDARY_WEIGHT_TOP
+                } else if p < c_lo {
+                    BOUNDARY_WEIGHT_BOTTOM
+                } else {
+                    0.0
+                };
+                mass += (d + wish) * w;
+                continue;
+            }
             if p > u_hi {
                 mass += 3.0 * w;
             } else if p > top {
@@ -345,7 +520,7 @@ pub fn piece_range_shift(f0_hz: &[f32], energy: Option<&[f32]>, range: &SpeakerR
     let mut best_shift = 0i64;
     for s in -MAX_RANGE_SHIFT..=MAX_RANGE_SHIFT {
         let sf = s as f32;
-        let cost = frame_mass(sf) + 0.003 * sf.abs();
+        let cost = frame_mass(sf) + shift_cost(s);
         if cost < best_cost {
             best_cost = cost;
             best_shift = s;
@@ -390,9 +565,146 @@ fn sanitize_guide(f0: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Undo a chunk's range shift in the audio domain: TD-PSOLA at constant ratio, guided by
-/// the FED f0 (`f0_hz`, one frame per `hop` output samples — the SoVITS hop grid or RVC's
-/// sr/100), spike-sanitized first (see sanitize_guide). shift 0 ⇒ untouched.
+/// Which engine performs the inverse shift. DIAGNOSTIC switch (env `UTAI_RANGE_INVERSE`):
+/// absent/`psola` = the shipped TD-PSOLA (byte-identical to before), `stretch` = the already
+/// vendored Signalsmith phase vocoder (`utai_stretch`, time_factor 1.0 = pure transpose).
+///
+/// Why it exists: a bench A/B of the production `psola_shift` on voice-like material measured
+/// the SAME ~5-9 dB harmonic-to-noise loss at ratio 1.000 (no shift at all) as at +7 st, i.e.
+/// the cost is a flat tax on passing through the resynthesis rather than a cost of shifting —
+/// which is what makes "extension ON recolors passages that were fine" structural. Signalsmith
+/// measured -2.3 dB HNR / -0.15 dB RMS on the same input. This switch exists so that gets
+/// confirmed BY EAR on real material before anything architectural is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InverseEngine {
+    Psola,
+    Stretch,
+}
+
+/// Resolved once per process and LOGGED either way — during an A/B the log must be able to
+/// prove which engine actually ran, otherwise a stale render cache reads as "no difference".
+pub fn inverse_engine() -> InverseEngine {
+    static ENGINE: std::sync::OnceLock<InverseEngine> = std::sync::OnceLock::new();
+    *ENGINE.get_or_init(|| match std::env::var("UTAI_RANGE_INVERSE").as_deref() {
+        Ok("psola") => {
+            tracing::info!("range-extend: inverse engine = TD-PSOLA (UTAI_RANGE_INVERSE=psola — fallback)");
+            InverseEngine::Psola
+        }
+        Ok(other) if !other.is_empty() && other != "stretch" => {
+            tracing::warn!("range-extend: unknown UTAI_RANGE_INVERSE=\"{other}\" — using the default engine");
+            InverseEngine::Stretch
+        }
+        _ => {
+            tracing::info!("range-extend: inverse engine = SIGNALSMITH STRETCH (default)");
+            InverseEngine::Stretch
+        }
+    })
+}
+
+/// κ — how much of the pitch shift the FORMANTS are allowed to follow:
+///   κ=0  formants stay where the model put them (TD-PSOLA's built-in policy) — dark/covered;
+///   κ=1  formants move with the pitch (a plain resample, and the stretch engine's built-in
+///        policy) — bright/chipmunk.
+/// The vendored Signalsmith build predates upstream's formant control (only setTransposeFactor
+/// exists in signalsmith-stretch.h), so the gap is closed with utai_dsp::formant_warp — a
+/// cepstral envelope warp that leaves pitch alone. Absent ⇒ each engine's NATIVE κ ⇒ no extra
+/// pass at all (bit-identical to not having this knob).
+///
+/// Caveat worth knowing before trusting a κ≠native render: formant_warp's cepstral lifter
+/// (LIFTER_Q=48 ≈ 918 Hz) can only separate envelope from harmonics while f0 stays below that
+/// — high soprano frames are past it and will warp some fine structure along with the envelope.
+/// Default κ = 0: keep the model's formants where it sang them. That is the configuration the
+/// user A/B'd on real songs and accepted ("干净了…共振腔相对来讲保持的甚至还挺好"); κ=1 is
+/// audibly a chipmunk. Overridable with UTAI_RANGE_FORMANT_K for further tuning.
+const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
+
+fn formant_kappa() -> Option<f32> {
+    static K: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = match std::env::var("UTAI_RANGE_FORMANT_K").ok().and_then(|v| v.parse::<f32>().ok()) {
+            Some(v) => v.clamp(0.0, 1.0),
+            None => DEFAULT_FORMANT_KAPPA,
+        };
+        tracing::info!("range-extend: formant kappa = {k:.2} (0 = keep the model's formants, 1 = let them follow the pitch)");
+        Some(k)
+    })
+}
+
+/// THE single execution point of the inverse shift — shared by the score, cover and audition
+/// paths so engine policy can never drift between them. Shifts `audio` by `-shift` semitones;
+/// `guide` is the caller's already-sanitized f0 track on the `hop` grid (PSOLA needs it, the
+/// stretch engine does not). Output length == input length exactly (every caller's trim/pad
+/// arithmetic depends on that).
+pub fn apply_inverse(
+    audio: Vec<f32>,
+    guide: &[f32],
+    hop: usize,
+    sample_rate: u32,
+    shift: i64,
+) -> Vec<f32> {
+    if shift == 0 || audio.is_empty() {
+        return audio;
+    }
+    let psola = |a: &[f32]| {
+        let ratio = vec![2f32.powf(-(shift as f32) / 12.0); guide.len()];
+        utai_dsp::psola_shift(a, sample_rate, guide, &ratio, utai_dsp::PsolaParams { hop })
+    };
+    let engine = inverse_engine();
+    let shifted = match engine {
+        InverseEngine::Psola => psola(&audio),
+        InverseEngine::Stretch => {
+            let n = audio.len();
+            // time_factor 1.0 ⇒ the shim's exact-length recipe returns n samples, sample-aligned
+            // (seek pre-roll + flush tail + latency fold). resize is a contract guard, not a fix.
+            match utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, -(shift as f64)) {
+                Ok(mut y) => {
+                    if y.len() != n {
+                        tracing::warn!("range-extend: stretch returned {} samples for {n} — padded/truncated to contract", y.len());
+                        y.resize(n, 0.0);
+                    }
+                    y
+                }
+                Err(e) => {
+                    tracing::warn!("range-extend: stretch engine failed ({e}) — this render falls back to TD-PSOLA");
+                    psola(&audio)
+                }
+            }
+        }
+    };
+
+    // Formant policy. Each engine lands the formants at its own κ; warp only the DIFFERENCE,
+    // so asking for an engine's native κ costs nothing (no STFT round trip at all).
+    let native_k = match engine {
+        InverseEngine::Psola => 0.0f32,  // PSOLA preserves the envelope by construction
+        InverseEngine::Stretch => 1.0f32, // spectral transpose moves the envelope with the pitch
+    };
+    match formant_kappa() {
+        Some(k) if (k - native_k).abs() > 1e-3 => {
+            let semi = (k - native_k) * -(shift as f32); // -shift = semitones the AUDIO moved up
+            let before = shifted.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let mut warped = utai_dsp::formant_warp(&shifted, |_| 2.0f32.powf(semi / 12.0));
+            // A formant warp moves the spectral ENVELOPE; it has no business changing how loud
+            // the signal is. Its cepstral reconstruction nonetheless overshoots on transients
+            // (measured +3.9 dB of peak at unchanged RMS), which on the default path would clip
+            // outright. Scale back to the level we handed it — never up, so a warp that happens
+            // to reduce the peak is left alone.
+            let after = warped.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if after > before && before > 0.0 {
+                let g = before / after;
+                for v in warped.iter_mut() {
+                    *v *= g;
+                }
+                tracing::debug!("range-extend: formant warp overshoot {after:.3} -> {before:.3} (scaled {g:.3})");
+            }
+            warped
+        }
+        _ => shifted,
+    }
+}
+
+/// Undo a chunk's range shift in the audio domain: constant-ratio inverse guided by the FED f0
+/// (`f0_hz`, one frame per `hop` output samples — the SoVITS hop grid or RVC's sr/100),
+/// spike-sanitized first (see sanitize_guide). shift 0 ⇒ untouched.
 pub fn psola_inverse_hop(
     audio: Vec<f32>,
     f0_hz: &[f32],
@@ -404,8 +716,7 @@ pub fn psola_inverse_hop(
         return audio;
     }
     let guide = sanitize_guide(f0_hz);
-    let ratio = vec![2f32.powf(-(shift as f32) / 12.0); guide.len()];
-    utai_dsp::psola_shift(&audio, sample_rate, &guide, &ratio, utai_dsp::PsolaParams { hop })
+    apply_inverse(audio, &guide, hop, sample_rate, shift)
 }
 
 #[cfg(test)]
@@ -413,35 +724,61 @@ mod tests {
     use super::*;
 
     fn range() -> SpeakerRange {
-        SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 79.0) }
+        SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0))
+    }
+
+    /// S81 (A): the score path's bare min/max tiers are gone — both paths now run
+    /// `piece_range_shift`, so what used to be `compute_range_shift`'s contract is re-asserted
+    /// here through the optimizer, on a 50 fps track built by `score_frame_hz`.
+    fn score_track(notes: &[(i64, i64)], transpose: i64) -> Vec<f32> {
+        let nn: Vec<i64> = notes.iter().map(|n| n.0).collect();
+        let fr: Vec<i64> = notes.iter().map(|n| n.1).collect();
+        score_frame_hz(&nn, &fr, &[], &[], transpose)
     }
 
     #[test]
-    fn tier12_no_shift() {
-        // inside comfort
-        assert_eq!(compute_range_shift((55.0, 70.0), &range()), 0);
-        // outside comfort but inside usable — render as-is, skip the inverse (v1 tier 2)
-        assert_eq!(compute_range_shift((49.0, 82.0), &range()), 0);
-        assert_eq!(compute_range_shift((48.0, 84.0), &range()), 0);
+    fn score_path_leaves_in_range_material_untouched() {
+        // The tier-1/2 contract survives the unification: a part comfortably inside the
+        // record renders with no shift (and therefore no inverse pass at all).
+        let t = score_track(&[(60, 200), (67, 200), (70, 200)], 0);
+        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), 0);
     }
 
     #[test]
-    fn tier3_minimal_translation() {
-        // above usable, bottom too tight for the ceiling margin (60-9=51 < c_lo 52) →
-        // plain minimal translation to c_hi
-        assert_eq!(compute_range_shift((60.0, 86.0), &range()), -7);
-        // below usable → shift UP into comfort
-        assert_eq!(compute_range_shift((40.0, 60.0), &range()), 12);
-        // bottom has room (60-8=52 ≥ c_lo) → the CEILING_MARGIN cushion is taken:
-        // top lands at 77 (= c_hi 79 - 2), not hugging the boundary
-        assert_eq!(compute_range_shift((60.0, 84.5), &range()), -8);
+    fn score_path_rescues_a_sustained_high_part() {
+        // …while genuinely out-of-range material still moves. usable=(48,84) c=(52,79) ⇒
+        // ceiling = min(79, 84-2) = 79; a 2 s note at 88 has to come down 9.
+        let t = score_track(&[(60, 200), (88, 100)], 0);
+        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), -9);
     }
 
     #[test]
-    fn wider_than_comfort_centers() {
-        let s = compute_range_shift((30.0, 90.0), &range());
-        // centered: midpoint 60 → comfort midpoint 65.5 → +5/+6
-        assert!((5..=6).contains(&s), "got {s}");
+    fn score_path_ignores_a_single_overshooting_frame() {
+        // THE S81 (A) defect: the old min/max judged from the extremes, so one portamento
+        // overshoot frame transposed the entire part. 20 ms cannot do that any more.
+        let mut cents: Vec<f32> = vec![6000.0; 2000];
+        cents[900] = 9500.0; // one frame an octave+ above, as an overshoot reads
+        let voiced = vec![1u8; cents.len()];
+        let t = score_frame_hz(&[], &[], &cents, &voiced, 0);
+        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), 0);
+    }
+
+    #[test]
+    fn score_frame_hz_prefers_the_curve_and_honours_rests() {
+        // With a DAW curve the track IS the curve (unvoiced ⇒ 0); without one the note
+        // pitches are held for their durations, so a long note outweighs a grace note.
+        let cents = vec![6000.0f32, 6000.0, 6000.0];
+        let t = score_frame_hz(&[69], &[3], &cents, &[1, 0, 1], 0);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1], 0.0, "unvoiced frame is a hole, not a pitch");
+        let t2 = score_track(&[(69, 2), (0, 3), (81, 1)], 0);
+        assert_eq!(t2.len(), 6);
+        assert!((t2[0] - 440.0).abs() < 0.01);
+        assert_eq!(t2[2], 0.0, "rest note (num <= 0) is unvoiced");
+        assert!((t2[5] - 880.0).abs() < 0.02);
+        // transpose folds into the OUTPUT Hz
+        let t3 = score_track(&[(69, 1)], 12);
+        assert!((t3[0] - 880.0).abs() < 0.02);
     }
 
     #[test]
@@ -498,12 +835,21 @@ mod tests {
     }
 
     #[test]
-    fn shift_is_clamped_to_max() {
-        // material 31 st above the comfort ceiling → raw -31, brake at -24
-        assert_eq!(compute_range_shift((100.0, 110.0), &range()), -24);
-        // degenerate comfort (defensive; speaker_range normally heals first) → 0
-        let degenerate = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 52.0) };
-        assert_eq!(compute_range_shift((90.0, 100.0), &degenerate), 0);
+    fn shift_is_bounded_and_degenerate_comfort_never_moves() {
+        // Far above the range but still rescuable: the optimizer takes the SMALLEST shift that
+        // clears the proven ceiling (105 - 21 = 84 = u_hi) rather than the largest that fits.
+        let t = score_track(&[(105, 300)], 0);
+        let s = piece_range_shift(&t, None, &range(), 50.0);
+        assert_eq!(s, -21);
+        assert!(s.abs() <= MAX_RANGE_SHIFT, "the ±{MAX_RANGE_SHIFT} brake is structural");
+        // Beyond rescue (115 would need -31): every reachable shift leaves it out of range, so
+        // paying for a whole-render recolour buys nothing — the new cost model declines. The
+        // pre-S81 code clamped to -24 and recoloured the render for no benefit at all.
+        let hopeless = score_track(&[(115, 300)], 0);
+        assert_eq!(piece_range_shift(&hopeless, None, &range(), 50.0), 0);
+        // degenerate comfort (defensive; speaker_range normally heals first) → never a target
+        let degenerate = SpeakerRange::bounds((48.0, 84.0), (52.0, 52.0));
+        assert_eq!(piece_range_shift(&t, None, &degenerate, 50.0), 0);
     }
 
     fn hz(midi: f32) -> f32 {
@@ -515,21 +861,21 @@ mod tests {
         // the S60d2 field case shape: 96% of frames at 67, 4% climax at 75 — a p98-bounds
         // decision ignored the climax entirely; the optimizer must land it under the
         // margined ceiling (70-2=68): 75-7=68 ⇒ exactly -7, no more (|shift| penalty)
-        let r = SpeakerRange { usable: (42.0, 70.0), comfort: (42.0, 70.0) };
+        let r = SpeakerRange::bounds((42.0, 70.0), (42.0, 70.0));
         let mut f0 = vec![hz(67.0); 960];
         f0.extend(vec![hz(75.0); 40]);
-        assert_eq!(piece_range_shift(&f0, None, &r), -7);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -7);
     }
 
     #[test]
     fn piece_optimizer_ignores_isolated_spikes_and_proven_zone() {
-        let r = SpeakerRange { usable: (42.0, 70.0), comfort: (42.0, 70.0) };
+        let r = SpeakerRange::bounds((42.0, 70.0), (42.0, 70.0));
         // 3 spike frames at 90 can't justify dragging 1000 frames below the floor → 0
         let mut f0 = vec![hz(60.0); 1000];
         f0.extend(vec![hz(90.0); 3]);
-        assert_eq!(piece_range_shift(&f0, None, &r), 0);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
         // entirely inside usable → untouched (tiers 1/2 preserved, byte-identical path)
-        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], None, &r), 0);
+        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], None, &r, 100.0), 0);
     }
 
     #[test]
@@ -539,7 +885,7 @@ mod tests {
         // octave-doubled breath frames at 81. The whole song must render UNTOUCHED — the old
         // code let one phantom frame defeat the tier-2 short-circuit and then chased the
         // burst mass down -6 st, recoloring the entire render.
-        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
         let mut f0: Vec<f32> = Vec::new();
         for i in 0..20000 {
             f0.push(hz(55.0 + (i % 17) as f32)); // 55..71 melody mass
@@ -549,11 +895,11 @@ mod tests {
             f0.extend(vec![hz(81.0); 10]); // phantom octave burst (~100 ms)
             f0.extend(vec![hz(65.0); 200]);
         }
-        assert_eq!(piece_range_shift(&f0, None, &r), 0);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
         // the minimal version: a SINGLE spike frame must not defeat the short-circuit either
         let mut f1 = vec![hz(60.0); 5000];
         f1.push(hz(84.0));
-        assert_eq!(piece_range_shift(&f1, None, &r), 0);
+        assert_eq!(piece_range_shift(&f1, None, &r, 100.0), 0);
     }
 
     #[test]
@@ -561,20 +907,20 @@ mod tests {
         // A genuinely out-of-range SUSTAINED section (4 s continuous at 80 > u_hi 77) still
         // triggers the rescue — spike hygiene must not neuter the feature. 80 + s ≤ top (75)
         // ⇒ exactly -5 (the |shift| penalty stops there).
-        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
         let mut f0 = vec![hz(60.0); 1000];
         f0.extend(vec![hz(80.0); 400]);
-        assert_eq!(piece_range_shift(&f0, None, &r), -5);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -5);
     }
 
     #[test]
     fn piece_optimizer_shifts_low_material_up() {
-        let r = SpeakerRange { usable: (48.0, 84.0), comfort: (52.0, 79.0) };
+        let r = SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0));
         // 50-frame plateaus stepping 30..40 — real f0 is smooth at the 100 fps grid, so the
         // material must be median-filter-stable (a per-frame sawtooth is not a voice).
         let f0: Vec<f32> = (0..550).map(|i| hz(30.0 + ((i / 50) % 11) as f32)).collect();
         // lowest frames at 30 must clear c_lo 52 → +22; the |shift| penalty stops there
-        assert_eq!(piece_range_shift(&f0, None, &r), 22);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 22);
     }
 
     #[test]
@@ -582,18 +928,169 @@ mod tests {
         // S62c field case: a separated stem's reverb tail / harmony bleed reads high for
         // SECONDS (defeats the run filter) but sits far below the lead's level — loudness
         // weighting must keep the piece untouched…
-        let r = SpeakerRange { usable: (36.0, 77.0), comfort: (36.0, 77.0) };
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
         let mut f0 = vec![hz(60.0); 5000];
         let mut en = vec![0.3f32; 5000];
         f0.extend(vec![hz(81.0); 200]); // 2 s sustained phantom above usable
         en.extend(vec![0.01f32; 200]); // …at tail energy (~-30 dB vs lead)
-        assert_eq!(piece_range_shift(&f0, Some(&en), &r), 0);
+        assert_eq!(piece_range_shift(&f0, Some(&en), &r, 100.0), 0);
         // …while a LOUD sustained true-high still rescues (same shape as the None test).
         let mut f1 = vec![hz(60.0); 1000];
         let mut e1 = vec![0.25f32; 1000];
         f1.extend(vec![hz(80.0); 400]);
         e1.extend(vec![0.35f32; 400]);
-        assert_eq!(piece_range_shift(&f1, Some(&e1), &r), -5);
+        assert_eq!(piece_range_shift(&f1, Some(&e1), &r, 100.0), -5);
+    }
+
+    /// Build a record whose raw scan is clean up to `good_hi` and badly voiced above it.
+    fn scanned(usable: (f32, f32), good_hi: i64) -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for midi in 36..=96i64 {
+            let entry = if midi <= good_hi {
+                serde_json::json!([5.0, 1.0]) // healthy: 5 cents, fully voiced
+            } else {
+                serde_json::json!([8.0, 0.60]) // pitch still perfect, voicing collapsing
+            };
+            semis.insert(midi.to_string(), entry);
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [usable.0, usable.1],
+                "comfort": [usable.0, usable.1],
+                "semitones": serde_json::Value::Object(semis),
+            })),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn damage_from_scan_is_perceptual_not_linear() {
+        // S81 (E): a healthy semitone must cost NOTHING — a scan's 1-37 cent wander across a
+        // model's good range is inaudible, and charging for it would make the optimizer chase
+        // measurement noise and recolour songs that were fine.
+        assert_eq!(damage_from_scan(2.0, 1.00, None), 0.0);
+        assert_eq!(damage_from_scan(24.0, 0.96, None), 0.0);
+        // a rejected semitone saturates on pitch alone
+        assert_eq!(damage_from_scan(9999.0, 0.0, None), 3.0);
+        // …and a semitone that keeps perfect pitch while losing voicing is still damaged
+        assert!(damage_from_scan(6.0, 0.63, None) > 2.0);
+    }
+
+    #[test]
+    fn the_timbre_dimension_catches_what_f0_cannot() {
+        // THE case the whole F1 change exists for, using the numbers measured off the probe wav
+        // on disk: akiko MIDI 80 stores err=2 cents / voiced=1.00 — a perfect score on both f0
+        // axes — while measuring -7.7 dB with 88.7% of its energy below 1.5*f0.
+        assert_eq!(damage_from_scan(2.0, 1.00, None), 0.0, "f0-only is blind here");
+        assert!(
+            damage_from_scan(2.0, 1.00, Some((-7.7, 0.887))) > 2.0,
+            "with the audio measured, the same semitone reads as badly damaged"
+        );
+        // a healthy note is still free WITH the dimension present (akiko MIDI 74)
+        assert_eq!(damage_from_scan(5.0, 1.00, Some((0.0, 0.109))), 0.0);
+        // lengv2.3's near-pure-sine 75 (0.983) vs its healthy 74 (0.467)
+        assert!(damage_from_scan(6.0, 1.00, Some((-1.2, 0.983))) > 2.0);
+        assert_eq!(damage_from_scan(8.0, 1.00, Some((-8.0, 0.467))), 0.5, "quiet but voiced = graded, not rejected");
+    }
+
+    #[test]
+    fn damage_curve_moves_material_off_a_nominally_usable_but_bad_top() {
+        // THE S81 defect: `usable` says [36,77] so the pre-S81 tier-2 short-circuit rendered
+        // anything inside those 41 semitones untouched — including a top that the record's OWN
+        // raw scan shows singing badly. With the scan read as a damage curve, material sitting
+        // on the bad top is moved down to the good part instead.
+        let r = scanned((36.0, 77.0), 72);
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(75.0); 100]); // inside `usable`, but the scan says it is damaged
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -3, "material should land on the proven-good 72");
+    }
+
+    #[test]
+    fn a_narrowed_comfort_still_steers_a_scanned_record() {
+        // The user lowering the comfort ceiling is a judgement the scan cannot make for them
+        // ("above this it sounds bad TO ME"). When the damage curve arrived it briefly replaced
+        // the comfort term instead of adding to it, which silently turned every manual comfort
+        // adjustment into a no-op. Same scan, two comfort zones, different answers.
+        let wide = scanned((36.0, 77.0), 77);
+        let mut narrowed = wide;
+        narrowed.comfort = (36.0, 62.0); // user says: nothing above 62 on this singer
+        let f0 = vec![hz(70.0); 1500];
+        assert_eq!(piece_range_shift(&f0, None, &wide, 100.0), 0);
+        assert!(
+            piece_range_shift(&f0, None, &narrowed, 100.0) < 0,
+            "material above the user's comfort ceiling must still be pulled down"
+        );
+    }
+
+    #[test]
+    fn a_clean_piece_inside_a_scanned_range_still_renders_untouched() {
+        // The mirror, and the thing that must NOT regress: reading the scan may never start
+        // recolouring songs that sit in the genuinely healthy part of the range.
+        let r = scanned((36.0, 77.0), 77);
+        assert_eq!(piece_range_shift(&vec![hz(60.0); 1500], None, &r, 100.0), 0);
+    }
+
+    #[test]
+    fn a_tiny_violation_no_longer_buys_a_whole_render_recolour() {
+        // S81 (B): 1% of the material out of range used to out-vote a 5-semitone shift because
+        // the only cost of shifting was 0.003/st — while the REAL cost is that 100% of the
+        // audio goes through the inverse transform. Now it does not pay for itself.
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
+        let mut f0 = vec![hz(60.0); 3000];
+        f0.extend(vec![hz(80.0); 30]); // 300 ms — long enough to survive the phantom filter
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
+    }
+
+    #[test]
+    fn ceiling_margin_is_not_charged_twice() {
+        // S81 (C): the margin models "the probe was more forgiving than real singing", so it is
+        // measured from the PROVEN top. When the record already reports comfort strictly inside
+        // usable, that gap has been charged once by the comfort criterion — landing at
+        // c_hi - MARGIN would charge it again. Ceiling = min(c_hi, u_hi - MARGIN) = 79, so a
+        // 90 top needs -11; the pre-S81 formula (c_hi - MARGIN = 77) pushed it to -13.
+        let r = SpeakerRange::bounds((48.0, 83.0), (48.0, 79.0));
+        let mut f0 = vec![hz(70.0); 1000];
+        f0.extend(vec![hz(90.0); 400]);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -11, "two semitones less push than before");
+    }
+
+    #[test]
+    fn phantom_islands_separated_by_breaths_stay_phantom() {
+        // S81 (D): the run filter used to measure "consecutive VOICED frames", so five 100 ms
+        // bursts with breaths between them fused into one 50-frame run and sailed through —
+        // then out-massed the shift penalty and recolored the whole song. Each burst is
+        // individually phantom; the breaths must keep them that way.
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
+        let mut f0 = vec![hz(60.0); 2000];
+        for _ in 0..5 {
+            f0.extend(vec![hz(85.0); 10]); // 100 ms above usable
+            f0.extend(vec![0.0f32; 30]); // 300 ms breath — unvoiced
+        }
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
+    }
+
+    #[test]
+    fn a_run_split_by_a_short_dropout_stays_one_run() {
+        // …and the mirror: a genuinely sustained high note with a 2-frame rmvpe dropout in the
+        // middle must NOT be chopped into two phantoms (that would neuter the whole feature).
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(80.0); 200]);
+        f0.extend(vec![0.0f32; 2]); // dropout inside the held note
+        f0.extend(vec![hz(80.0); 200]);
+        assert_ne!(piece_range_shift(&f0, None, &r, 100.0), 0, "sustained high note must still be rescued");
+    }
+
+    #[test]
+    fn mismatched_energy_length_falls_back_to_unweighted() {
+        // S81 (H): a short energy track must read as "no energy information", never as
+        // "the frames I could not measure are as loud as the lead".
+        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(80.0); 400]);
+        let short = vec![0.3f32; 10];
+        assert_eq!(piece_range_shift(&f0, Some(&short), &r, 100.0), piece_range_shift(&f0, None, &r, 100.0));
     }
 
     #[test]
@@ -613,6 +1110,32 @@ mod tests {
         j.extend(vec![440.0f32; 10]);
         let s = sanitize_guide(&j);
         assert_eq!(s[15], 440.0);
+    }
+
+    #[test]
+    fn the_psola_fallback_is_byte_identical_to_the_direct_call() {
+        // TD-PSOLA is no longer the default (measured on real material: it loses ~9.8 dB of
+        // harmonic-to-noise ratio at +7 st where Signalsmith loses 1.9, and the user confirmed
+        // by ear across two backends). It stays reachable as a fallback, and while it does, it
+        // must remain the exact pre-dispatch call — same guide, same constant ratio vector.
+        if inverse_engine() != InverseEngine::Psola {
+            return; // default (stretch) in this process — nothing to compare against
+        }
+        let sr = 44100u32;
+        let hop = 441usize;
+        let n = sr as usize; // 1 s
+        let mut x = vec![0.0f32; n];
+        for (i, v) in x.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            *v = (0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin())
+                + (0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+        let guide = vec![220.0f32; n / hop + 1];
+        let via_dispatch = apply_inverse(x.clone(), &guide, hop, sr, -3);
+        let ratio = vec![2f32.powf(3.0 / 12.0); guide.len()];
+        let direct = utai_dsp::psola_shift(&x, sr, &guide, &ratio, utai_dsp::PsolaParams { hop });
+        assert_eq!(via_dispatch, direct);
+        assert_eq!(via_dispatch.len(), x.len());
     }
 
     #[test]

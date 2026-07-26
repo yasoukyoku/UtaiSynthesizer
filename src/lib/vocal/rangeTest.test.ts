@@ -10,6 +10,8 @@ import {
   classifySemitones,
   deriveRanges,
   deriveCautionZones,
+  collectRangeTestTargets,
+  SCAN_VERSION,
   buildSpeakerRecord,
   clampComfort,
   effectiveComfort,
@@ -37,6 +39,17 @@ describe("buildScaleScore", () => {
     for (let i = 1; i < spans.length; i++) {
       expect(spans[i]!.start100).toBeGreaterThan(spans[i - 1]!.end100 - 1);
     }
+  });
+
+  it("S81: each probe note is long enough to reach steady state", () => {
+    // The pre-S81 probe was 120 ms, and for a vol_embedding model the phrase ADSR (80 ms
+    // attack + 100 ms release) covered the WHOLE note — it peaked at 0.8875x and never sang
+    // at full level, so the hardest condition for a high note was never measured. The quality
+    // analysis reads only the BACK HALF of each span, so that half alone has to clear the
+    // envelope. This is the invariant, not the constant: shortening the note breaks it.
+    const { spans } = buildScaleScore();
+    const noteMs = (spans[0]!.end100 - spans[0]!.start100) * 10; // 100 fps → ms
+    expect(noteMs / 2).toBeGreaterThanOrEqual(180); // measured half past attack+release
   });
 });
 
@@ -173,6 +186,74 @@ describe("deriveCautionZones (S60d3 model-quirk chips)", () => {
     const z = deriveCautionZones(semis, [36, 77]);
     expect(z.weak).toEqual([57, 61]);
     expect(z.artifact).toEqual([]);
+  });
+
+  it("S81: reports notes bridged into COMFORT that fail the comfort bar", () => {
+    // The zone the render aims at is comfort, so a semitone the bridging carried into comfort
+    // while failing the comfort criterion is a note we deliberately transpose material ONTO
+    // and then label a defect. Pre-S81 only usable-grade failures were reported, so this note
+    // — good enough to be "usable", not good enough to be a target — was invisible.
+    const semis: Record<string, [number, number]> = {};
+    for (let m = 36; m <= 96; m++) {
+      if (m === 60) semis[m] = [80, 0.9]; // passes isUsable (<100¢), fails isComfort (<50¢)
+      else if (m <= 77) semis[m] = [5, 1];
+      else semis[m] = [9999, 0];
+    }
+    expect(deriveCautionZones(semis, [36, 77]).weak).toEqual([]); // usable bar alone: invisible
+    expect(deriveCautionZones(semis, [36, 77], [36, 77]).weak).toEqual([60]);
+  });
+});
+
+describe("collectRangeTestTargets (S81 batch)", () => {
+  const model = (name: string, speakers: Record<string, unknown> | null, multi = false) =>
+    ({
+      name,
+      path: `C:/${name}.onnx`,
+      config: {
+        ...(multi ? { speakers: { A: 0, B: 1 } } : {}),
+        ...(speakers ? { vocal_range: { speakers } } : {}),
+      },
+    }) as never;
+
+  const rec = (scanVersion?: number) => ({
+    usable: [36, 77],
+    comfort: [36, 77],
+    comfort_auto: [36, 77],
+    semitones: {},
+    tested_at: "2026-07-01",
+    ...(scanVersion ? { scan_version: scanVersion } : {}),
+  });
+
+  it("lists untested and pre-timbre records, and leaves current ones alone", () => {
+    const targets = collectRangeTestTargets({
+      sovits: [
+        model("never", null),
+        model("old", { "0": rec() }), // pre-S81 scan → worth re-testing, still usable
+        model("current", { "0": rec(SCAN_VERSION) }),
+      ],
+      rvc: [],
+    });
+    expect(targets.map((x) => [x.name, x.reason])).toEqual([
+      ["never", "missing"],
+      ["old", "stale"],
+    ]);
+  });
+
+  it("covers EVERY speaker of a multi-speaker model, not just 0", () => {
+    // The bug this whole feature exists next to: only speaker 0 was ever writable, so the
+    // other singers could never get a record at all.
+    const targets = collectRangeTestTargets({
+      sovits: [model("duo", { "0": rec(SCAN_VERSION) }, true)],
+      rvc: [],
+    });
+    expect(targets).toHaveLength(1);
+    expect(targets[0]!.speakerId).toBe(1);
+    expect(targets[0]!.reason).toBe("missing");
+  });
+
+  it("treats a single-speaker model as speaker 0 only", () => {
+    const targets = collectRangeTestTargets({ sovits: [model("solo", null)], rvc: [] });
+    expect(targets.map((x) => x.speakerId)).toEqual([0]);
   });
 });
 

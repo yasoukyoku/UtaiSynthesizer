@@ -17,7 +17,7 @@ import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
-import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, type VoiceModelEntry } from "../../store/voice-models";
+import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
@@ -247,7 +247,7 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             S60c/S62c: shown ONLY when the track's SELECTED SPEAKER carries a usable tested
             vocal_range record — an untested model/speaker's toggle is a confusing no-op
             (§user, twice). Default OFF (S62c user decision — recolor tradeoff is opt-in). */}
-        {voiceHasRangeRecord(selectedVoice, vocalParams.speakerId ?? 0) && (
+        {voiceHasRangeRecord(selectedVoice, vocalTrackSpeakerId(vocalParams)) && (
         <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.rangeExtend")}

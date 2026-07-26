@@ -348,21 +348,40 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
   return useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
 }
 
+/** Version of the range-extension DECISION algorithm. Bumping it invalidates every bake that
+ *  was rendered under the old decision — without it, changing how the shift is decided produces
+ *  "I changed it and the user hears nothing", which reads as a failed fix (S81 audit).
+ *  ★ Any change to the decision functions in src-tauri/src/inference/vocal_range.rs MUST bump
+ *  this AND the matching literal in commands/audition.rs::audition_cache_tag. */
+export const RANGE_ALGO_VERSION = "s81a";
+
+/** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
+ *  JSON into every dirty-check string. */
+function hash32(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
 /** S60-2 audit: the model's vocal_range record IS a render input (it decides the tier shift),
  *  so a re-test / comfort adjustment must dirty the bakes that used it — else Play keeps
- *  serving audio rendered under the OLD zone. Only the usable/comfort bounds matter (the raw
- *  per-semitone scan doesn't feed the render); gated off when the track opted out. */
+ *  serving audio rendered under the OLD zone. Covers the usable/comfort bounds, the RAW
+ *  per-semitone scan (S81: the decision layer now reads it as a continuous damage curve, so a
+ *  re-test that moves only the scan must dirty too) and the algorithm version; gated off when
+ *  the track opted out. */
 function rangeRecordSig(track: Track): string {
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
   if (vp.rangeExtend !== true || !track.voiceModel) return ""; // S62c: extension is opt-in (absent = OFF)
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
-  const rec = (entry?.config as { vocal_range?: { speakers?: Record<string, { usable?: unknown; comfort?: unknown }> } } | undefined)
-    ?.vocal_range;
+  const rec = (entry?.config as {
+    vocal_range?: { speakers?: Record<string, { usable?: unknown; comfort?: unknown; semitones?: unknown }> };
+  } | undefined)?.vocal_range;
   if (!rec?.speakers) return "";
-  return Object.entries(rec.speakers)
-    .map(([id, sp]) => `${id}=${JSON.stringify(sp?.usable)}~${JSON.stringify(sp?.comfort)}`)
+  const body = Object.entries(rec.speakers)
+    .map(([id, sp]) => `${id}=${JSON.stringify(sp?.usable)}~${JSON.stringify(sp?.comfort)}~${hash32(JSON.stringify(sp?.semitones ?? null))}`)
     .sort()
     .join(",");
+  return `v${RANGE_ALGO_VERSION}|${body}`;
 }
 
 /** Split a segment (audioClip OR notes) at `tick`, carrying + windowing a CLEAN vocal bake so the split needs

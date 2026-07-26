@@ -212,7 +212,7 @@ pub fn run_pipeline(
                 super::f0::RMVPE_SR as usize / 100,
                 transposed.len(),
             );
-            let s = super::vocal_range::piece_range_shift(&transposed, Some(&rms), r);
+            let s = super::vocal_range::piece_range_shift(&transposed, Some(&rms), r, 100.0);
             if s != 0 {
                 tracing::info!("range-extend(cover/sovits): whole signal rendered {s:+} st into comfort");
             }
@@ -853,7 +853,13 @@ fn run_diffusion(
     ];
     let spk_mix; // keep alive for the input borrow
     if diff.n_spk > 1 {
-        let spk = options.speaker_id.unwrap_or(0) as usize;
+        // S81 drift: net_g resolves its speaker through the BLEND (build_spk_mix_dense above),
+        // so reading `speaker_id` alone here made the two halves of one render disagree — VITS
+        // sang the selected singer while diffusion pulled the timbre back to speaker 0. The UI
+        // makes that the only reachable state for a real multi-speaker model (it renders the
+        // blend stack and leaves speaker_id null), and guard_blend_vs_diffusion waved it through
+        // because a 1-entry blend has "≤1 distinct id". Same single criterion as everywhere else.
+        let spk = super::dominant_speaker(&options.spk_mix, options.speaker_id) as usize;
         let mut mix = vec![0.0f32; n_frames * diff.n_spk];
         for row in 0..n_frames {
             mix[row * diff.n_spk + spk] = 1.0;

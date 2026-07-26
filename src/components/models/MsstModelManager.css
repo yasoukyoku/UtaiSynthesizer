@@ -698,6 +698,40 @@
   font-size: var(--font-size-xs);
 }
 
+/* ── S81: batch range-test row. Permanent (never a one-shot button), so it has to sit quietly
+      under the filter bar when idle and stay readable for the minutes a run can take. Square
+      corners + existing tokens only — no new control vocabulary. ── */
+.rm-range-batch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 4px var(--space-sm);
+  margin-bottom: var(--space-xs);
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 0;
+}
+.rm-range-batch-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rm-range-batch-bar {
+  width: 120px;
+  height: 4px;
+  flex: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+}
+.rm-range-batch-bar > div {
+  height: 100%;
+  background: var(--accent-primary);
+  transition: width 120ms linear;
+}
+
 /* ── S60-2: per-model vocal-range row (label + adjust/retest; testing progress) ── */
 .rm-range-row {
   display: flex;

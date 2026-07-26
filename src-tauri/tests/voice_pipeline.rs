@@ -146,6 +146,29 @@ fn voice_env_wav() {
 
     let audio = utai_lib::audio::load_audio(&input).expect("load input wav");
 
+    // S81 音域扩展 A/B: UTAI_VOICE_RANGE=1 resolves the sidecar's tested range exactly like the
+    // command layer does, so the harness can render the SAME input with extension off / on and
+    // (via UTAI_RANGE_INVERSE) with either inverse engine. Absent ⇒ None ⇒ byte-identical to
+    // every earlier gate run of this harness.
+    // Explicit truthy values only — an EMPTY var must read as OFF, so a driver script can flip
+    // the A/B by re-assigning rather than unsetting (removing a process env var is awkward and,
+    // under some shells, blocked outright).
+    let range_armed = matches!(
+        std::env::var("UTAI_VOICE_RANGE").as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    );
+    let range = if range_armed {
+        let cfg: utai_lib::models::ModelConfig =
+            serde_json::from_value(sc.clone()).expect("parse sidecar as ModelConfig");
+        let spk: u32 = std::env::var("UTAI_VOICE_SPK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let r = utai_lib::inference::vocal_range::speaker_range(&cfg, spk);
+        eprintln!("[harness] range-extend ARMED, speaker {spk}, record = {r:?}");
+        assert!(r.is_some(), "UTAI_VOICE_RANGE set but the sidecar carries no usable record for speaker {spk}");
+        r
+    } else {
+        None
+    };
+
     // Mirror the app (commands\inference.rs / InferenceManager): aux feature extractors on CPU
     // (they're the dominant VRAM consumer — full-signal fp32 activations), voice synth on the
     // global device. mem_pattern=false everywhere (dynamic shapes).
@@ -189,7 +212,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, None, &|_p| {}, &|| false)
+            utai_lib::inference::rvc::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
                 .expect("rvc pipeline")
         }
         "sovits" => {
@@ -325,7 +348,7 @@ fn voice_env_wav() {
                 noise_channels: nch,
                 min_frames,
             };
-            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, None, &|_p| {}, &|| false)
+            utai_lib::inference::sovits::run_pipeline(&m, &audio, &options, range, &|_p| {}, &|| false)
                 .expect("sovits pipeline")
         }
         other => panic!("UTAI_VOICE_KIND must be rvc|sovits (got {})", other),

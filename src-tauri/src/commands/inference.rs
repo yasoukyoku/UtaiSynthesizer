@@ -251,10 +251,23 @@ pub(crate) fn require_input(entry: &ModelEntry, input: &str) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn get_entry(state: &AppState, voice_name: &str) -> Result<ModelEntry, String> {
-    state.models.get(voice_name).ok_or_else(|| {
-        format!("MODEL_NOT_FOUND: {}", voice_name)
-    })
+/// Resolve a voice model BY NAME AND TYPE. An rvc+sovits pair sharing one singer's name is a
+/// standard workflow (ModelRegistry::get_by_type's own contract: "any consumer that knows the
+/// type must use this instead of the first-match `get`"), and every caller here does know it —
+/// run_rvc/run_sovits statically, the score render from its `backend` option. The old untyped
+/// lookup returned whichever entry the scan happened to list first, so for such a pair one of
+/// the two backends would load the other's graph and die on the very next signature check with
+/// `MODEL_LEGACY_EXPORT ... missing 'noise'/'rnd' input` — an error blaming the user's export
+/// for a lookup bug (S81 drift audit).
+pub(crate) fn get_entry(
+    state: &AppState,
+    voice_name: &str,
+    model_type: &crate::models::ModelType,
+) -> Result<ModelEntry, String> {
+    state
+        .models
+        .get_by_type(voice_name, model_type)
+        .ok_or_else(|| format!("MODEL_NOT_FOUND: {}", voice_name))
 }
 
 // ─── cancel_voice ────────────────────────────────────────────────────────────
@@ -406,7 +419,10 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf, what: &s
 /// S56), and training refuses multi-speaker diffusion, so a properly-produced blend model has NO companion
 /// and this never fires — it catches the pathological "diffusion attached to a real multi-speaker blend"
 /// combo with a clear error instead of wrong audio. A single-speaker selection via spk_mix is fine (≤1
-/// distinct id → the diffusion's single speaker matches).
+/// distinct id → the diffusion's single speaker matches) — and that is only TRUE because the diffusion
+/// stage resolves its speaker through `dominant_speaker` like everything else. It used to read
+/// `speaker_id` alone, which made this very sentence false for the one state the UI can produce
+/// (blend stack set, speaker_id null): net_g sang the blend, diffusion rendered speaker 0 (S81).
 fn guard_blend_vs_diffusion(
     entry: &ModelEntry,
     spk_mix: &[crate::inference::SpkMixEntry],
@@ -674,7 +690,9 @@ pub(crate) fn resolve_sovits_quality(
             }
         }
         if sidecar.n_spk > 1 {
-            let spk = options.speaker_id.unwrap_or(0);
+            // Must resolve exactly like the tensor build in sovits.rs does, or the bounds check
+            // validates a speaker the render never uses (S81 drift audit).
+            let spk = crate::inference::dominant_speaker(&options.spk_mix, options.speaker_id);
             if spk >= sidecar.n_spk {
                 return Err(format!(
                     "DIFFUSION_SPEAKER_OUT_OF_RANGE: {} >= n_spk={}",
@@ -804,7 +822,7 @@ pub async fn run_rvc(
     // Arm the cancel epoch BEFORE the multi-second load phase (a cancel during loading
     // must be honored at the first pipeline poll).
     let run_epoch = app.inference.begin_voice_run();
-    let entry = get_entry(&app, &voice_name)?;
+    let entry = get_entry(&app, &voice_name, &crate::models::ModelType::Rvc)?;
     require_input(&entry, "rnd")?;
 
     let dim = entry.config.features_dim as usize; // RVC sidecars carry features_dim directly
@@ -969,7 +987,7 @@ pub async fn run_sovits(
     let _voice_guard = VoiceRunGuard::acquire()?; // held to the end of the render
     // See run_rvc: arm the cancel epoch before the load phase.
     let run_epoch = app.inference.begin_voice_run();
-    let entry = get_entry(&app, &voice_name)?;
+    let entry = get_entry(&app, &voice_name, &crate::models::ModelType::SoVits)?;
     require_input(&entry, "noise")?;
 
     let dim = features_dim(&entry.config)?;
@@ -1113,6 +1131,92 @@ pub async fn run_sovits(
 }
 
 // ─── detect_f0 (kept signature: audio path → f0 Hz @ 100 fps) ────────────────
+
+/// Per-semitone VOICE-QUALITY measurement for the range test (S81 F1).
+///
+/// The range test's two criteria (f0 error, voiced ratio) are both derived from f0 — and f0 is
+/// an explicit conditioning INPUT to net_g, so as long as that path works the model reports
+/// perfect pitch and full voicing even where its TIMBRE has collapsed. Forensics on the probe
+/// wavs already on disk: akiko's stored comfort ceiling (MIDI 80) reads err=2 cents /
+/// voiced=1.00 while measuring 7.7 dB below the scale peak with 88.7% of its energy below
+/// 1.5*f0 — a bare fundamental, no harmonics. The criteria could not have caught it; nothing in
+/// the chain looked at the audio. This does.
+///
+/// Returns one `[rms_db, low_ratio]` per span:
+///   rms_db    — level RELATIVE to the loudest span in the scale (≤ 0; the scale is
+///               peak-normalised once as a whole, so cross-span comparison is meaningful);
+///   low_ratio — energy below 1.5*f0 over total energy up to 8 kHz. A healthy sung vowel spreads
+///               energy across harmonics (~0.1-0.5); a collapsed one is a near-pure sine (~0.9+).
+/// Spans are 100 fps frame windows (the same grid classifySemitones uses); only the STEADY
+/// second half of each is measured, so onsets and the phrase-envelope ramp cannot flatter it.
+#[tauri::command]
+pub async fn analyze_scale_quality(
+    audio_path: String,
+    spans: Vec<(usize, usize)>,
+    expected_hz: Vec<f32>,
+) -> Result<Vec<(f32, f32)>, String> {
+    if spans.len() != expected_hz.len() {
+        return Err("SCALE_QUALITY_SHAPE".to_string());
+    }
+    let buf = crate::audio::load_audio(&PathBuf::from(&audio_path)).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mono = crate::audio::resample::to_mono(&buf);
+        let sr = mono.sample_rate.max(1) as f32;
+        let x = &mono.samples;
+        const NFFT: usize = 2048;
+        let mut planner = rustfft::FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(NFFT);
+        let win: Vec<f32> = (0..NFFT)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / NFFT as f32).cos())
+            .collect();
+
+        let mut out: Vec<(f32, f32)> = Vec::with_capacity(spans.len());
+        for (i, &(a, b)) in spans.iter().enumerate() {
+            // steady state only: the back half of the note, past the attack and the ADSR ramp
+            let mid = a + (b.saturating_sub(a)) / 2;
+            let s0 = ((mid as f32 / 100.0) * sr) as usize;
+            let s1 = (((b as f32) / 100.0) * sr) as usize;
+            let (s0, s1) = (s0.min(x.len()), s1.min(x.len()));
+            if s1 <= s0 {
+                out.push((-120.0, 1.0)); // nothing there = treat as fully collapsed
+                continue;
+            }
+            let seg = &x[s0..s1];
+            let rms = (seg.iter().map(|v| v * v).sum::<f32>() / seg.len() as f32).sqrt();
+
+            // one centred FFT frame is enough — the note is a steady sustained vowel here
+            let mut frame = vec![rustfft::num_complex::Complex::<f32>::new(0.0, 0.0); NFFT];
+            let c0 = s0 + seg.len() / 2;
+            let start = c0.saturating_sub(NFFT / 2);
+            for k in 0..NFFT {
+                let v = x.get(start + k).copied().unwrap_or(0.0);
+                frame[k] = rustfft::num_complex::Complex::new(v * win[k], 0.0);
+            }
+            fft.process(&mut frame);
+            let bin_hz = sr / NFFT as f32;
+            let cut = (1.5 * expected_hz[i] / bin_hz).round() as usize;
+            let top = ((8000.0 / bin_hz) as usize).min(NFFT / 2);
+            let mut low = 0f32;
+            let mut total = 0f32;
+            for (k, c) in frame.iter().enumerate().take(top).skip(1) {
+                let e = c.norm_sqr();
+                total += e;
+                if k <= cut {
+                    low += e;
+                }
+            }
+            out.push((rms, if total > 0.0 { low / total } else { 1.0 }));
+        }
+        // level is only meaningful RELATIVE to this scale's own loudest note
+        let peak = out.iter().map(|&(r, _)| r).fold(0.0f32, f32::max).max(1e-9);
+        Ok(out
+            .into_iter()
+            .map(|(r, lr)| (20.0 * (r / peak).max(1e-6).log10(), lr))
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 #[tauri::command]
 pub async fn detect_f0(
@@ -1476,7 +1580,14 @@ pub async fn render_vocal_segment(
 
     // ── resolve the voice + ScoreToCV facts ── (Item-1: builds a REAL SovitsModel/RvcModel and drives the
     // SHARED quality path — decode_features/vc_decode — mirroring run_sovits/run_rvc's load flow.)
-    let entry = get_entry(&app, &voice_name)?;
+    let entry = get_entry(
+        &app,
+        &voice_name,
+        match backend_type {
+            VoiceBackendType::Rvc => &crate::models::ModelType::Rvc,
+            VoiceBackendType::SoVits => &crate::models::ModelType::SoVits,
+        },
+    )?;
     let dim = features_dim(&entry.config)?; // 768 → SoVITS4.1/RVCv2, 256 → SoVITS4.0
     let nch = noise_channels(&entry.config);
     let sample_rate = entry.sample_rate;
@@ -1532,15 +1643,25 @@ pub async fn render_vocal_segment(
         };
         match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
             Some(r) => {
+                // S81 (A): the score path used to decide from the min/max of the pitch curve and
+                // nothing else — a single overshooting portamento frame transposed the whole
+                // part, and none of the cover path's hygiene (median-5, phantom-run filter,
+                // loudness weighting, the shift cost) applied. Both paths now run THE optimizer.
+                // Grid is the DAW's 50 fps (Σframes), and `loudness_env` is the per-frame lane
+                // on that same grid, so it serves as the energy weight directly.
                 let nn: Vec<i64> = score.iter().map(|n| n.note_num).collect();
-                let shift = crate::inference::vocal_range::score_pitch_bounds(
+                let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
+                let track = crate::inference::vocal_range::score_frame_hz(
                     &nn,
+                    &fr,
                     &f0_cents,
                     &f0_voiced,
                     options.transpose,
-                )
-                .map(|b| crate::inference::vocal_range::compute_range_shift(b, &r))
-                .unwrap_or(0);
+                );
+                let energy =
+                    (loudness_env.len() == track.len()).then_some(loudness_env.as_slice());
+                let shift =
+                    crate::inference::vocal_range::piece_range_shift(&track, energy, &r, 50.0);
                 if shift != 0 {
                     tracing::info!(
                         "range-extend: rendering '{}' at {:+} st into comfort [{:.0},{:.0}] (speaker {})",

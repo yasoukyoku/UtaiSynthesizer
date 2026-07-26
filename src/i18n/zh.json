@@ -649,6 +649,7 @@
       "vib_easeOutMs": "淡出",
       "rangeExtend": "音域扩展",
       "rangeExtendTip": "超出歌手舒适区的乐句先移调到舒适区渲染，再在音频域移回（需先在资源管理器测过音域；区间内渲染完全不受影响）",
+      "rangeExtendNoRecord": "当前歌手还没有音域记录，此开关暂时不会生效。到资源管理器里对这个模型做一次音域测试即可自动启用。",
       "autotune": "自动调教",
       "autotuneFollow": "自动跟随",
       "autotuneFollowTip": "自动为未调教的音符补上调教（手调参数与手绘音高线一律不动）",

@@ -65,6 +65,16 @@ interface VoiceModelStore {
    *  the resource-manager progress row + the double-trigger guard (rangeTest.ts). */
   rangeTesting: Record<string, number>;
   setRangeTesting: (name: string, progress: number | null) => void;
+  /** S81 batch range test. Lives in the store (not the component) so switching tabs mid-run
+   *  neither loses the progress nor lets a second batch start. `failed` names every target that
+   *  did NOT end up with a new record — a summary that only ever says "done" would hide a run
+   *  where every model failed. */
+  rangeBatch: { done: number; total: number; failed: string[]; cancel: boolean; finished: boolean } | null;
+  setRangeBatch: (b: { done: number; total: number; failed: string[]; cancel: boolean; finished: boolean } | null) => void;
+  /** Advance by one target; `failedName` non-null records a failure. */
+  bumpRangeBatch: (failedName: string | null) => void;
+  cancelRangeBatch: () => void;
+  finishRangeBatch: () => void;
   /** S60-4 试听 state — ONE shared record (the preview player is a singleton, so at most one
    *  row can be rendering/playing; audit S60: per-row local state desyncs on takeover/unmount).
    *  `path` = the wav given to preview.play — ownership proof before any stop() (never kill a
@@ -93,6 +103,28 @@ export const useVoiceModelStore = create<VoiceModelStore>((set, get) => ({
       else next[name] = progress;
       return { rangeTesting: next };
     }),
+  rangeBatch: null,
+  setRangeBatch: (b) => set({ rangeBatch: b }),
+  bumpRangeBatch: (failedName) =>
+    set((s) =>
+      s.rangeBatch
+        ? {
+            rangeBatch: {
+              ...s.rangeBatch,
+              done: s.rangeBatch.done + 1,
+              failed: failedName ? [...s.rangeBatch.failed, failedName] : s.rangeBatch.failed,
+            },
+          }
+        : {},
+    ),
+  cancelRangeBatch: () => set((s) => (s.rangeBatch ? { rangeBatch: { ...s.rangeBatch, cancel: true } } : {})),
+  // Keep the finished shape around ONLY when something failed: the run's whole point is that the
+  // user can see which models still need attention after a multi-minute unattended job. A clean
+  // run clears itself so the row returns to its idle state with no dismissal chore.
+  finishRangeBatch: () =>
+    set((s) => ({
+      rangeBatch: s.rangeBatch && s.rangeBatch.failed.length ? { ...s.rangeBatch, finished: true } : null,
+    })),
   auditionState: null,
   setAuditionState: (s) => set({ auditionState: s }),
 
@@ -196,6 +228,24 @@ export function governingSpeakerId(
     return spkMix.reduce((a, b) => (b.weight > a.weight ? b : a)).id;
   }
   return speakerId ?? 0;
+}
+
+/** THE SVC speaker a VOCAL TRACK (自己唱) renders with — the mirror of the Rust selection in
+ *  commands/inference.rs (`dominant_speaker(options.<backend>.spk_mix, ....speaker_id)`).
+ *
+ *  ★ NOT `VocalTrackParams.speakerId`. That one is the **ScoreToCV** conditioning speaker
+ *  (0–76, default 49): content only, deliberately decoupled from pitch, so it has no
+ *  vocal_range record and never will. Passing it where an SVC speaker id belongs looks up
+ *  `speakers["49"]`, which cannot exist — S81 field bug: every vocal track hid its range-extend
+ *  toggle even for models whose range HAD been tested, on every model, silently. The two ids
+ *  live in the same struct one field apart, so resolve the SVC one HERE and nowhere else. */
+export function vocalTrackSpeakerId(vp: {
+  backend: "rvc" | "sovits";
+  sovits?: { speaker_id?: number | null; spk_mix?: { id: number; weight: number }[] };
+  rvc?: { speaker_id?: number | null; spk_mix?: { id: number; weight: number }[] };
+}): number {
+  const o = vp.backend === "sovits" ? vp.sovits : vp.rvc;
+  return governingSpeakerId(o?.speaker_id, o?.spk_mix);
 }
 
 export function voiceSpeakerOptions(m: VoiceModelEntry): { id: number; label: string }[] {

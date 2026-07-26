@@ -294,7 +294,7 @@ pub fn run_pipeline(
             // loudness weighting: RMS on the same 100 fps grid pitchf was detected on — quiet
             // phantom highs (reverb tails / harmony bleed) stop driving whole-song shifts
             let rms = super::vocal_range::frame_rms(&audio_pad, WINDOW, pitchf.len());
-            super::vocal_range::piece_range_shift(&pitchf, Some(&rms), &r)
+            super::vocal_range::piece_range_shift(&pitchf, Some(&rms), &r, 100.0)
         })
         .unwrap_or(0);
     if range_shift != 0 {

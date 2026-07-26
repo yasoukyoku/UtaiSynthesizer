@@ -810,8 +810,11 @@ fn apply_range_inverse(audio: Vec<f32>, note_hz_cv: &[f32], sample_rate: u32, ra
         let cv = ((s as f64 / n) * tt as f64).floor() as usize;
         f0.push(note_hz_cv[cv.min(tt - 1)]);
     }
-    let ratio = vec![2f32.powf(-(range_shift as f32) / 12.0); f0.len()];
-    utai_dsp::psola_shift(&audio, sample_rate, &f0, &ratio, utai_dsp::PsolaParams { hop })
+    // Engine dispatch lives in ONE place for all four paths (score/cover/audition) — see
+    // vocal_range::apply_inverse. With the default engine this is the same psola_shift call
+    // with the same ratio vector as before (byte-identical); the guide is NOT re-sanitized
+    // here (a parametric score curve has no rmvpe octave spikes to remove).
+    super::vocal_range::apply_inverse(audio, &f0, hop, sample_rate, range_shift)
 }
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.

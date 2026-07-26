@@ -290,13 +290,31 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
 
 /// Cache-name suffix carrying the range record (a re-test/adjusted comfort must MISS the old
 /// cache). No record keeps the pre-S60c names byte-identical (existing caches stay valid).
+///
+/// ★ The leading version literal must be bumped together with RANGE_ALGO_VERSION in
+/// src/lib/vocal/vocalRender.ts whenever the DECISION functions in inference/vocal_range.rs
+/// change — otherwise a fixed decision keeps serving audio rendered under the old one and reads
+/// as "the fix did nothing" (S81 audit).
 fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
     match range {
         None => String::new(),
-        Some(r) => format!(
-            "_ru{:.0}-{:.0}c{:.0}-{:.0}",
-            r.usable.0, r.usable.1, r.comfort.0, r.comfort.1
-        ),
+        Some(r) => {
+            // The bounds alone stopped identifying the decision once S81 made the raw
+            // per-semitone scan a render input (the damage curve): a re-test that moves the
+            // scan without moving usable/comfort would have served the OLD audio from cache.
+            // Same reason vocalRender.ts hashes the scan into rangeRecordSig — one fingerprint
+            // per side, both covering everything the decision actually reads.
+            let mut h: u32 = 5381;
+            if let Some(d) = &r.damage {
+                for b in d.iter() {
+                    h = (h.wrapping_mul(33)) ^ (*b as u32);
+                }
+            }
+            format!(
+                "_s81a_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
+            )
+        }
     }
 }
 
@@ -330,7 +348,7 @@ fn audition_range_prep(
         crate::inference::f0::RMVPE_SR as usize / 100,
         f0.len(),
     );
-    let shift = crate::inference::vocal_range::piece_range_shift(&f0, Some(&rms), &r);
+    let shift = crate::inference::vocal_range::piece_range_shift(&f0, Some(&rms), &r, 100.0);
     if shift == 0 {
         return Ok(None);
     }

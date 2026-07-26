@@ -121,6 +121,10 @@ pub(crate) fn build_spk_mix_dense(
 /// ①c: the dominant (max-weight) speaker id of a blend, else `speaker_id` (fallback 0). Used to
 /// pick the per-speaker retrieval/cluster asset when a blend is active. Ties → first max in stack
 /// order.
+/// THE single criterion for "which speaker governs this render". Every per-speaker consumer
+/// (net_g blend, the diffusion condition encoder, the vocal_range record lookup, the audition
+/// cache name) must resolve through this and nothing else — S81 found the diffusion stage
+/// reading `speaker_id` alone, so one render's two halves sang different singers.
 pub(crate) fn dominant_speaker(spk_mix: &[SpkMixEntry], speaker_id: Option<u32>) -> u32 {
     spk_mix
         .iter()
@@ -128,6 +132,30 @@ pub(crate) fn dominant_speaker(spk_mix: &[SpkMixEntry], speaker_id: Option<u32>)
         .max_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
         .map(|e| e.id)
         .unwrap_or_else(|| speaker_id.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod speaker_tests {
+    use super::*;
+
+    fn mix(rows: &[(u32, f32)]) -> Vec<SpkMixEntry> {
+        rows.iter().map(|&(id, weight)| SpkMixEntry { id, weight }).collect()
+    }
+
+    #[test]
+    fn the_ui_reachable_multi_speaker_state_resolves_to_the_blend_not_zero() {
+        // A real multi-speaker model renders the BLEND STACK in the UI and leaves speaker_id
+        // null, so this is the only state a user can produce. Reading speaker_id alone here
+        // yields 0 — which is exactly how the diffusion stage used to disagree with net_g and
+        // silently render the wrong singer (S81 drift audit).
+        assert_eq!(dominant_speaker(&mix(&[(3, 1.0)]), None), 3);
+        assert_eq!(dominant_speaker(&mix(&[(1, 0.2), (5, 0.8)]), None), 5);
+        // zero-weight rows are not a selection
+        assert_eq!(dominant_speaker(&mix(&[(4, 0.0)]), Some(2)), 2);
+        // no blend at all → the plain selection, then 0
+        assert_eq!(dominant_speaker(&[], Some(7)), 7);
+        assert_eq!(dominant_speaker(&[], None), 0);
+    }
 }
 
 #[cfg(test)]

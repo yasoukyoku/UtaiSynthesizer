@@ -1227,6 +1227,7 @@ pub fn run() {
             commands::inference::validate_lyrics,
             commands::inference::cancel_voice,
             commands::inference::detect_f0,
+            commands::inference::analyze_scale_quality,
             commands::inference::get_default_vocoder_info,
             commands::import::import_score_file,
             commands::export_score::export_score_files,

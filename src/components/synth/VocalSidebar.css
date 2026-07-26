@@ -117,6 +117,14 @@
   color: var(--text-muted);
   white-space: nowrap;
 }
+/* A stated no-op: a toggle whose precondition is missing explains itself here instead of the
+   row silently disappearing (S81). Wraps — it carries a sentence, not a value. */
+.vsb-note {
+  margin: 2px 0 4px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
 /* an overridden per-note field is accented (vs inheriting the track default) */
 .vsb-label.ovr {
   color: var(--accent-primary);

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -36,7 +36,7 @@ import {
   type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
-import { runRangeTest, setComfortRange, midiName, effectiveComfort, deriveCautionZones, MIN_COMFORT_SPAN, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { runRangeTest, runRangeTestBatch, collectRangeTestTargets, setComfortRange, midiName, effectiveComfort, deriveCautionZones, MIN_COMFORT_SPAN, SCAN_VERSION, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import { preview } from "../common/previewPlayer";
 import { ParamSlider } from "../workflow/nodes/ParamSlider";
 import { readFile } from "@tauri-apps/plugin-fs";
@@ -833,6 +833,7 @@ function VoiceModelsTab({ lang }: { lang: string }) {
           + {lang === "zh" ? "导入模型" : lang === "ja" ? "モデル取り込み" : "Import Model"}
         </button>
       </div>
+      {voiceType !== "vocoder" && <RangeBatchRow lang={lang} />}
 
       <div className="rm-voice-list">
         {models.length === 0 && voiceType !== "vocoder" && (
@@ -1044,7 +1045,7 @@ const MODEL_TYPE_TO_VOICE: Record<string, VoiceType | undefined> = {
 /// contains a character the OS save dialog rejects. Empty → "model".
 function sanitizeExportName(name: string): string {
   // eslint-disable-next-line no-control-regex
-  const cleaned = name.replace(/[<>:"/\\|?* -]/g, "").replace(/[. ]+$/, "").trim();
+  const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "").replace(/[. ]+$/, "").trim();
   return cleaned || "model";
 }
 
@@ -1209,6 +1210,74 @@ function VoiceAuditionButton({ m, voiceType, lang }: { m: VoiceModelEntry; voice
   );
 }
 
+// ─── S81: batch range test. A PERMANENT row, never a one-shot button (§user) — it is worth
+// having whenever models are imported in bulk or the criteria change again, and a run can take
+// minutes, so its state has to be visible and interruptible rather than a fire-and-forget click.
+// The work list comes from the same pure `collectRangeTestTargets` the count does, so the
+// number shown and the work performed can never disagree. ───
+
+function RangeBatchRow({ lang }: { lang: string }) {
+  const models = useVoiceModelStore((s) => s.models);
+  const batch = useVoiceModelStore((s) => s.rangeBatch);
+  const cancelBatch = useVoiceModelStore((s) => s.cancelRangeBatch);
+  const clearBatch = useVoiceModelStore((s) => s.setRangeBatch);
+  const targets = useMemo(() => collectRangeTestTargets(models), [models]);
+
+  if (batch && !batch.finished) {
+    return (
+      <div className="rm-range-batch">
+        <span className="rm-range-batch-text">
+          {t18({ zh: "重测音域", en: "Re-testing ranges", ja: "音域を再測定中" }, lang)} {batch.done}/{batch.total}
+          {batch.cancel && ` · ${t18({ zh: "正在停止", en: "stopping", ja: "停止中" }, lang)}`}
+        </span>
+        <div className="rm-range-batch-bar">
+          <div style={{ width: `${batch.total ? (batch.done / batch.total) * 100 : 0}%` }} />
+        </div>
+        <button className="rm-range-btn" disabled={batch.cancel} onClick={cancelBatch}>
+          {t18({ zh: "停止", en: "Stop", ja: "停止" }, lang)}
+        </button>
+      </div>
+    );
+  }
+  if (batch?.finished) {
+    // Only reachable when something failed — a clean run clears itself (store.finishRangeBatch).
+    return (
+      <div className="rm-range-batch">
+        <span className="rm-range-batch-text rm-range-missing">
+          {t18({ zh: "以下模型未能测出音域", en: "These models could not be measured", ja: "以下のモデルは測定できませんでした" }, lang)}
+          {`: ${batch.failed.join("、")}`}
+        </span>
+        <button className="rm-range-btn" onClick={() => clearBatch(null)}>
+          {t18({ zh: "知道了", en: "Dismiss", ja: "閉じる" }, lang)}
+        </button>
+      </div>
+    );
+  }
+  if (!targets.length) return null; // nothing to offer → no row at all
+  return (
+    <div className="rm-range-batch">
+      <span className="rm-range-batch-text">
+        {t18({
+          zh: `${targets.length} 个歌手的音域待测或建议重测`,
+          en: `${targets.length} singer(s) need a range test or a re-test`,
+          ja: `${targets.length} 名の話者が音域測定または再測定を必要としています`,
+        }, lang)}
+      </span>
+      <button
+        className="rm-range-btn"
+        title={t18({
+          zh: "逐个渲染音阶并测量，可能需要几分钟；期间可以随时停止，渲染/播放不会被长时间占用。",
+          en: "Renders and measures a scale per singer; may take minutes. Stoppable at any time, and it never holds the render lock across models.",
+          ja: "話者ごとに音階をレンダリングして測定します（数分かかる場合があります）。いつでも停止でき、レンダリングロックを跨いで保持しません。",
+        }, lang)}
+        onClick={() => void runRangeTestBatch(targets)}
+      >
+        {t18({ zh: "全部重测", en: "Test all", ja: "すべて測定" }, lang)}
+      </button>
+    </div>
+  );
+}
+
 // ─── S60-2: per-model vocal-range row (v1 session20/21 UX: auto label + comfort editor
 // clamped inside usable + Reset + retest; missing record → 补做 button) ───
 
@@ -1217,19 +1286,42 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
   const [editing, setEditing] = useState(false);
   const [lo, setLo] = useState(0);
   const [hi, setHi] = useState(0);
+  // S81: the record is keyed PER SPEAKER on every read side (Rust speaker_range, the node
+  // gates, the vocal sidebar) but only speaker 0 was ever writable here, so a multi-speaker
+  // model's other singers could never get a record — and their range-extend toggle stayed
+  // hidden forever with no way to fix it, while two comments claimed this row offered exactly
+  // that. Co-trained speakers genuinely differ in range (that is the point of co-training), and
+  // borrowing speaker 0's ceiling for another singer is actively wrong, not merely imprecise.
+  const speakers = voiceSpeakerOptions(m);
+  const [spk, setSpk] = useState(0);
   const rec = (m.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } }).vocal_range;
-  const sp = rec?.speakers?.["0"];
+  const sp = rec?.speakers?.[String(spk)];
   // what the render layer will actually target (degenerate stored comfort heals to
   // comfort_auto/usable — mirror of the Rust read side); display + slider seed use THIS
   const shown = sp ? effectiveComfort(sp) : null;
   // model-quirk chips from the stored scan: artifact zones + in-range weak notes, so a
   // weird render at those pitches reads as the MODEL's doing (§user S60d2)
-  const caution = sp ? deriveCautionZones(sp.semitones ?? {}, sp.usable) : null;
+  const caution = sp ? deriveCautionZones(sp.semitones ?? {}, sp.usable, effectiveComfort(sp)) : null;
+  // S81 F1: a record measured before the timbre dimension existed still WORKS (its damage curve
+  // just can't see timbre), so this is an invitation, never a rejection.
+  const stale = sp !== undefined && (sp.scan_version ?? 0) < SCAN_VERSION;
   const commit = async () => {
     if (!sp) { setEditing(false); return; }
-    await setComfortRange(m.name, voiceType, 0, [lo, hi]); // clampComfort enforces span
+    await setComfortRange(m.name, voiceType, spk, [lo, hi]); // clampComfort enforces span
     setEditing(false);
   };
+  const speakerPicker = speakers.length > 1 && (
+    <select
+      className="sep-model-select rm-audition-spk"
+      value={spk}
+      title={t18({ zh: "音域记录的歌手", en: "Range record speaker", ja: "音域記録の話者" }, lang)}
+      onChange={(e) => setSpk(Number(e.target.value))}
+    >
+      {speakers.map((s) => (
+        <option key={s.id} value={s.id}>{s.label}</option>
+      ))}
+    </select>
+  );
 
   if (progress !== undefined) {
     return (
@@ -1242,8 +1334,9 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
     // no record (never tested / lost to a re-import / app crash) → the 补做 entry point
     return (
       <span className="rm-range-row">
+        {speakerPicker}
         <span className="rm-range-missing">{t18({ zh: "无音域记录", en: "No range record", ja: "音域記録なし" }, lang)}</span>
-        <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path)}>
+        <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path, spk)}>
           {t18({ zh: "测音域", en: "Detect range", ja: "音域を測定" }, lang)}
         </button>
       </span>
@@ -1252,18 +1345,32 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
   return (
     <>
     <span className="rm-range-row">
+      {speakerPicker}
       <span
         className="rm-range-text"
         title={t18({
-          zh: `可用（<100¢ 且浊音>50%）${midiName(sp.usable[0])}–${midiName(sp.usable[1])}；舒适（<50¢ 且浊音>80%）为渲染的目标区间`,
-          en: `Usable (<100¢, voiced>50%) ${midiName(sp.usable[0])}–${midiName(sp.usable[1])}; comfort (<50¢, voiced>80%) is the render target zone`,
-          ja: `使用可能（<100¢・有声>50%）${midiName(sp.usable[0])}–${midiName(sp.usable[1])}。快適域（<50¢・有声>80%）がレンダリングの目標域です`,
+          zh: `舒适区 = 渲染实际瞄准的区间（音准 + 浊音 + 音色三项达标）。可用区 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} 只表示"还出得了声"，其上沿通常已经很勉强。`,
+          en: `Comfort is the zone the render actually targets (pitch + voicing + timbre all pass). Usable ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} only means "still makes a pitched sound"; its top edge is typically already strained.`,
+          ja: `快適域＝レンダリングが実際に狙う範囲（音程・有声・音色の三項目を満たす）。使用可能域 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} は「まだ声が出る」だけで、その上端はたいてい既に苦しい。`,
         }, lang)}
       >
-        {t18({ zh: "音域", en: "Range", ja: "音域" }, lang)} {midiName(sp.usable[0])}–{midiName(sp.usable[1])}
-        {" · "}
-        {t18({ zh: "舒适", en: "comfort", ja: "快適" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
+        {/* S81: the headline is COMFORT. Leading with `usable` advertised a range whose top few
+            semitones measurably sing badly — the number the user reads should be the one the
+            render aims at. Usable stays available in the tooltip. */}
+        {t18({ zh: "舒适区", en: "Comfort", ja: "快適域" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
       </span>
+      {stale && (
+        <span
+          className="rm-range-missing"
+          title={t18({
+            zh: "这条记录是在加入音色检测之前测的，仍然可用；重测一次会让舒适区更准。",
+            en: "This record predates the timbre measurement. It still works; re-testing makes the comfort zone more accurate.",
+            ja: "この記録は音色測定の追加前に取得されたものです。引き続き使用できますが、再測定すると快適域がより正確になります。",
+          }, lang)}
+        >
+          {t18({ zh: "建议重测", en: "re-test suggested", ja: "再測定推奨" }, lang)}
+        </span>
+      )}
       {editing ? (
         <span className="rm-range-edit">
           <ParamSlider
@@ -1282,7 +1389,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
           <button
             className="rm-range-btn"
             title={t18({ zh: "还原为自动检测值", en: "Reset to the detected value", ja: "自動検出値に戻す" }, lang)}
-            onClick={() => { void setComfortRange(m.name, voiceType, 0, sp.comfort_auto).then(() => setEditing(false)); }}
+            onClick={() => { void setComfortRange(m.name, voiceType, spk, sp.comfort_auto).then(() => setEditing(false)); }}
           >
             {t18({ zh: "还原", en: "Reset", ja: "リセット" }, lang)}
           </button>
@@ -1296,7 +1403,7 @@ function VoiceRangeRow({ m, voiceType, lang }: { m: VoiceModelEntry; voiceType: 
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>
-          <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path)}>
+          <button className="rm-range-btn" onClick={() => void runRangeTest(m.name, voiceType, m.path, spk)}>
             {t18({ zh: "重测", en: "Retest", ja: "再測定" }, lang)}
           </button>
         </>

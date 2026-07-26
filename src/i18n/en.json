@@ -649,6 +649,7 @@
       "vib_easeOutMs": "Fade out",
       "rangeExtend": "Range extend",
       "rangeExtendTip": "Out-of-comfort phrases render transposed into the singer's comfort zone, then shift back in the audio domain (needs a range record from the Resource Manager; in-range renders are untouched)",
+      "rangeExtendNoRecord": "This singer has no range record yet, so the switch has no effect for now. Run a range test on the model in the Resource Manager and it takes effect automatically.",
       "autotune": "Auto pitch tuning",
       "autotuneFollow": "Auto follow",
       "autotuneFollowTip": "Untuned notes are tuned automatically (manual parameters and drawn pitch lines are never touched)",
