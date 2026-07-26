@@ -64,7 +64,8 @@ enum CvSrc<'a> {
     S2cv(&'a str),
     Natural(&'a Array2<f32>),
 }
-/// f0 流来源:参数化 Option-A(生产整形:build_note_hz + zero_voiceless_frames)或
+/// f0 流来源:参数化 Option-A(生产整形:build_note_hz + zero_voiceless_frames +
+/// anchor_voiced_phone_f0——S83 起与生产同步,借帧浊声母不落 0)或
 /// 天然 RMVPE(100fps Hz,0=无声——真实 voicing,不再叠加谱面清音归零)。
 enum F0Src<'a> {
     Param(&'a VocalF0<'a>),
@@ -98,6 +99,7 @@ fn e1_render_sovits(
         F0Src::Param(f0) => {
             let mut h = build_note_hz(&arr, score, 0, Some(f0));
             zero_voiceless_frames(&mut h, &arr);
+            anchor_voiced_phone_f0(&mut h, &arr); // S83: mirror the production shaping exactly
             h
         }
         F0Src::Natural(_) => Vec::new(),
@@ -179,6 +181,7 @@ fn e1_render_rvc(
         F0Src::Param(f0) => {
             let mut h = build_note_hz(&arr, score, 0, Some(f0));
             zero_voiceless_frames(&mut h, &arr);
+            anchor_voiced_phone_f0(&mut h, &arr); // S83: mirror the production shaping exactly
             h
         }
         F0Src::Natural(_) => Vec::new(),

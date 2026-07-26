@@ -218,6 +218,32 @@ pub fn build_note_hz(
         Some(f0) => f0,
     };
 
+    // S83 conservation fast-path: the DAW assembler is frame-CONSERVING (Σ phone_dur == Σ triple frames
+    // == the f0 grid), so cv frame i IS DAW frame i — sample identity. This is not just an optimization:
+    // with onset pre-roll a note GROUP's cv span starts earlier than its triple span (borrowed frames),
+    // and the group remap below would compress the vowel's samples ~2 frames late — re-delaying the very
+    // pitch alignment the pre-roll fixes. The remap stays for non-conserving arrays only (capped rests /
+    // legacy split_dur inflation in tests / E1 harness).
+    if t_total == f0.cents.len() {
+        // The slow path's "rest group → 0 Hz" guard is preserved by masking frames OWNED by SP/AP
+        // (pitch-0) phones: the frontend's frame rounding can leave a rest triple's first frame
+        // sampling voiced=1 just inside the note it follows (S83 review #2) — identity alignment
+        // makes the phone-ownership walk exact, so gate on it, not on the voiced mask alone.
+        let mut out = vec![0.0f32; t_total];
+        let mut cursor = 0usize;
+        for (i, &d) in arr.phone_dur.iter().enumerate() {
+            let d = d.max(0) as usize;
+            if !matches!(arr.phon[i], "SP" | "AP") && arr.note_pitch[i] > 0 {
+                for f in cursor..(cursor + d).min(t_total) {
+                    if f0.voiced.get(f).copied().unwrap_or(0) != 0 {
+                        out[f] = cents_to_hz(f0.cents[f] as f64 + (transpose as f64) * 100.0);
+                    }
+                }
+            }
+            cursor += d;
+        }
+        return out;
+    }
     let g = compute_note_groups(arr, score);
     if g.ng == 0 || f0.cents.is_empty() {
         return vec![0.0; t_total];
@@ -255,6 +281,11 @@ fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default:
     if env.is_empty() {
         return vec![default; t_total];
     }
+    // S83: same conservation fast-path as build_note_hz (identity when the grids already agree) —
+    // the group remap would misplace lane samples around pre-rolled onsets.
+    if t_total == env.len() {
+        return env.to_vec();
+    }
     let g = compute_note_groups(arr, score);
     let flen = env.len();
     let mut out = vec![default; t_total];
@@ -291,6 +322,71 @@ fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
         if is_voiceless_phone(arr.phon[i]) {
             for f in &mut note_hz[cursor.min(n)..(cursor + d).min(n)] {
                 *f = 0.0;
+            }
+        }
+        cursor += d;
+    }
+}
+
+/// S83: with onset pre-roll, a phrase-INITIAL voiced consonant's frames sit BEFORE the beat — in the DAW
+/// f0 curve that region is the preceding rest (voiced=0 → 0 Hz). A voiced phone must never carry 0 Hz
+/// (cover convention: RMVPE reads a real pitch on m/n/ɡ onsets); 0 there means SoVITS uv=0 and RVC
+/// pitchf=0 → NSF noise excitation + protect = an audibly mute onset (the exact trap the S83 triage
+/// verifier flagged). Fill every zero frame of a SUNG, non-voiceless phone from the nearest nonzero f0
+/// within its contiguous SUNG RUN (forward first — the vowel's opening pitch — then backward at tails).
+/// Rests/breaths keep their zeros (rest-gate / protect semantics untouched); voiceless phones were just
+/// zeroed on purpose and are skipped. Runs after `zero_voiceless_frames` on both backends.
+fn anchor_voiced_phone_f0(note_hz: &mut [f32], arr: &ScoreArrays) {
+    let total = note_hz.len();
+    // run id per frame (usize::MAX = rest/breath frames) — fills never cross an SP/AP boundary.
+    let mut run_of = vec![usize::MAX; total];
+    let mut cursor = 0usize;
+    let mut run_id = 0usize;
+    let mut in_run = false;
+    for (i, &d) in arr.phone_dur.iter().enumerate() {
+        let d = d.max(0) as usize;
+        if matches!(arr.phon[i], "SP" | "AP") {
+            if in_run {
+                run_id += 1;
+                in_run = false;
+            }
+        } else {
+            in_run = true;
+            for r in run_of.iter_mut().skip(cursor.min(total)).take(d.min(total.saturating_sub(cursor))) {
+                *r = run_id;
+            }
+        }
+        cursor += d;
+    }
+    // two sweeps: nearest nonzero f0 before/after each frame, resetting at run boundaries.
+    let sweep = |indices: &mut dyn Iterator<Item = usize>, out: &mut [f32]| {
+        let (mut carry, mut carry_run) = (0.0f32, usize::MAX);
+        for i in indices {
+            if run_of[i] != carry_run {
+                carry = 0.0;
+                carry_run = run_of[i];
+            }
+            if note_hz[i] > 0.0 {
+                carry = note_hz[i];
+            }
+            out[i] = carry;
+        }
+    };
+    let mut prev_nz = vec![0.0f32; total];
+    let mut next_nz = vec![0.0f32; total];
+    sweep(&mut (0..total), &mut prev_nz);
+    sweep(&mut (0..total).rev(), &mut next_nz);
+    // fill pass: zeros on sung, voiced phones only.
+    let mut cursor = 0usize;
+    for (i, &d) in arr.phone_dur.iter().enumerate() {
+        let d = d.max(0) as usize;
+        let voiced_sung =
+            !matches!(arr.phon[i], "SP" | "AP") && arr.note_pitch[i] > 0 && !is_voiceless_phone(arr.phon[i]);
+        if voiced_sung {
+            for f in cursor.min(total)..(cursor + d).min(total) {
+                if note_hz[f] <= 0.0 {
+                    note_hz[f] = if next_nz[f] > 0.0 { next_nz[f] } else { prev_nz[f] };
+                }
             }
         }
         cursor += d;
@@ -528,6 +624,9 @@ pub fn render_score_sovits(
     // (R0b②'s procedural micro-texture was ear-vetoed and removed — see the note above
     // build_vol_env; micro-motion waits for the conditioned-S2CV line.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
+    // S83: pre-rolled voiced onsets (m/n/ɡ… before the beat) must carry the note's opening pitch,
+    // never the rest's 0 Hz (uv=0 would mute them) — fill from the run's nearest voiced frame.
+    anchor_voiced_phone_f0(&mut note_hz_full, &arr);
     // ② per-cv-frame loudness (multiplier, unity default) + formant (semitones, 0 default) envelopes,
     // aligned to cv via the SAME group remap as f0 (short-note-inflation safe). None/empty ⇒ flat = no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
@@ -669,6 +768,9 @@ pub fn render_score_rvc(
     // S69 R0b① (same as the SoVITS render): voiceless frames → pitchf 0 — RVC's cover convention
     // (RMVPE zeros) — which finally lets the protect blend fire on consonants. (② removed, ear-veto.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
+    // S83: pre-rolled voiced onsets must carry pitch (pitchf=0 = NSF noise excitation + protect —
+    // an audibly mute onset); fill from the run's nearest voiced frame.
+    anchor_voiced_phone_f0(&mut note_hz_full, &arr);
     // ② loudness/formant per-cv-frame envelopes (RVC has no vol port → both are post-decode). Empty ⇒ no-op.
     let loud_cv = loudness.map(|l| build_note_param(&arr, score, l, 1.0));
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
@@ -962,6 +1064,15 @@ mod tests {
         assert!(hz[0..5].iter().all(|&h| h > 200.0), "note0 voiced, got {:?}", &hz[0..5]);
         assert!(hz[5..10].iter().all(|&h| h == 0.0), "rest group → silent, got {:?}", &hz[5..10]);
         assert!(hz[10..15].iter().all(|&h| h > 200.0), "note2 voiced, got {:?}", &hz[10..15]);
+        // S83 review #2: the identity fast-path must keep the rest → 0 Hz contract even when the
+        // frontend's frame rounding leaves a voiced=1 frame just inside the SP window.
+        let mut voiced2 = voiced.clone();
+        let mut cents2 = cents.clone();
+        voiced2[5] = 1;
+        cents2[5] = 6000.0;
+        let f0b = VocalF0 { cents: &cents2, voiced: &voiced2 };
+        let hz2 = build_note_hz(&arr, &evts, 0, Some(&f0b));
+        assert_eq!(hz2[5], 0.0, "an SP-owned frame stays 0 Hz regardless of the voiced mask");
     }
 
     // ── ② M-defer: loudness/formant envelope alignment (build_note_param) + gain/formant application ──

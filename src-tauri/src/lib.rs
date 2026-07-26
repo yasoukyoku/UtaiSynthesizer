@@ -1225,6 +1225,7 @@ pub fn run() {
             commands::inference::render_vocal_segment,
             commands::inference::run_autotune,
             commands::inference::validate_lyrics,
+            commands::inference::preview_vocal_phonemes,
             commands::inference::cancel_voice,
             commands::inference::detect_f0,
             commands::inference::analyze_scale_quality,

@@ -217,6 +217,10 @@ pub struct ScoreArrays {
     pub note_to_phone: Vec<i64>,
     pub phon: Vec<&'static str>,
     pub lang: Vec<i64>,
+    /// S83: source EVENT index (into the input `score` slice) each phone was emitted from — the phoneme
+    /// lane maps phones back to notes/rests through it (a zh same-pitch hold that merely EXTENDS the
+    /// previous entry emits no phone of its own, so its frames show as the carrier stretching through).
+    pub evt: Vec<usize>,
 }
 
 /// S69 R0b①: whether a vocab phone token is VOICELESS (no vocal-fold vibration) — voiceless
@@ -236,6 +240,110 @@ pub fn is_voiceless_phone(p: &str) -> bool {
         p.chars().next(),
         Some('p' | 't' | 'k' | 'c' | 'q' | 'ʈ' | 'ʔ' | 'f' | 's' | 'ʃ' | 'ɕ' | 'ç' | 'x' | 'h' | 'ʂ' | 'ɸ' | 'θ')
     )
+}
+
+/// S83: whether a vocab phone token can carry a syllable NUCLEUS (a vowel — incl. long/nasal/devoiced
+/// variants, diphthongs, the zh atomic finals and the r-colored ɝ — or a syllabic consonant m̩/n̩/l̩/ɹ̩/ɻ̩,
+/// U+0329). The DAW frame allocator uses it to split a note's phones into onset|nucleus|coda: the note's
+/// beat-anchored remainder goes to the NUCLEUS (never to a trailing coda consonant — the pre-S83
+/// `split_dur` "last phone takes the rest" rule sang mine→[m aɪ n] as an 84% [n] hum). Rule-based on the
+/// leading IPA base symbol: across this vocab every nucleus-capable token starts with a vowel letter, no
+/// consonant token does, and the syllabic mark is decisive — the exhaustiveness test below walks ALL 210
+/// tokens so a vocab regen can't silently misroute one.
+pub fn is_nucleus_phone(p: &str) -> bool {
+    if matches!(p, "SP" | "AP" | "PAD" | "BOS" | "EOS") {
+        return false;
+    }
+    if p.contains('\u{0329}') {
+        return true; // syllabic consonants: m̩ n̩ l̩ (de/en) + the zh apical "vowels" ɹ̩ ɻ̩
+    }
+    matches!(
+        p.chars().next(),
+        Some(
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'ɯ' | 'ɛ' | 'ɔ' | 'ɪ' | 'ʊ' | 'ɐ' | 'ə' | 'ɤ' | 'æ'
+                | 'ʌ' | 'ɑ' | 'ø' | 'œ' | 'ʉ' | 'ɵ' | 'ɨ' | 'ʏ' | 'ɝ'
+        )
+    )
+}
+
+// ─── S83 DAW note allocation (syllable-structure-aware; replaces split_dur on the ② render path) ──
+//
+// WHY (S83 triage, user-verified symptoms): `split_dur` is the training-demo rule (JA CV mora shape:
+// consonants ≤4 frames AT THE NOTE START, last phone takes the remainder). Two structural faults on a
+// real DAW score: (1) EN closed syllables end in a CODA consonant → the coda takes the note remainder
+// and the vowel is crushed to ≤80 ms (mine→"me", fined→760 ms of voiced [d]); (2) onset consonants sit
+// INSIDE the note window, so every CV syllable's vowel lands 20-80 ms AFTER the beat (あ/た/し triplet
+// unevenness, fast-passage smear, systematic misalignment vs an OpenUtau reference — which pre-rolls
+// consonants via preutterance). The training data itself (92.2% of frames: m4singer + gtsinger) anchors
+// note onsets at the CONSONANT start — i.e. real singers place the consonant BEFORE the musical beat and
+// the vowel ON it. The model only ever sees duration arrays (no absolute beats), so pre-rolling the onset
+// is not just safe but strictly CLOSER to the training distribution than the old shape.
+//
+// The allocator: nucleus = LAST nucleus-capable phone (fallback: the last phone — the legacy CV shape for
+// all-consonant notes like っ). Onset = the consonant PREFIX before the FIRST nucleus-capable phone (a
+// medial glide vowel, "più"'s i, stays in-note). In-note frames: medial small shares → coda (≤4 frames
+// each, ≥2 or dropped first-first, total ≤2/5 of the note — the training vowel-share prior) → nucleus
+// takes the remainder. Onset frames are BORROWED from the tail of the previously emitted phone (rest
+// keeps ≥1 frame, sung phone keeps ≥2; target 4 frames/consonant ≈ the training median 4-5), so the
+// nucleus still starts ON the beat; with no lender (score start) the onset falls back in-note (≤2 frames
+// each from the nucleus — the legacy shape, degraded gracefully). INVARIANT: Σ emitted durations ==
+// Σ event frames (borrowing is zero-sum, in-note allocation never exceeds fr — the old `max(1)` inflation
+// that pushed every later note off the timeline is gone; a coda/onset that can't get its minimum is
+// DROPPED, never inflated).
+const ONSET_TARGET_FRAMES: i64 = 4; // ≈80 ms — the training single-onset median (4-5 fr), tempo-invariant
+const CODA_MAX_FRAMES: i64 = 4;
+const CODA_MIN_FRAMES: i64 = 2; // a 1-frame phone is categorically OOD (0 occurrences in training npz)
+const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
+const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
+
+/// In-note allocation for one note's phones (`fr` ≥ 1 frames inside the note window): medial + coda get
+/// bounded shares, the nucleus takes the remainder, onset positions are left 0 (the caller fills them by
+/// borrowing / supplement). Returns per-phone durations aligned to `ph`; entries may be 0 (dropped
+/// medial/coda / unfilled onset) — the caller skips 0-duration phones at emission. Σ(durs) ≤ fr always.
+fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) -> Vec<i64> {
+    let n = ph.len();
+    let mut durs = vec![0i64; n];
+    let n_coda = n - nuc - 1;
+    let n_medial = nuc - onset_end;
+    let nuc_floor = fr.min(2).max(1); // the nucleus never drops below min(fr,2)
+    let mut used = 0i64;
+    // medial (rare — vowel clusters / mid-syllable glides): same ≥2-or-DROP policy as codas (a 1-frame
+    // phone is categorically OOD — S83 review), 2..=4 each, never eating the nucleus floor. The break
+    // drops LATER medials first (closer to the nucleus, typically glides; earlier ones carry more of
+    // the syllable's identity).
+    for d in durs.iter_mut().take(nuc).skip(onset_end) {
+        let c = (fr / ((n_medial + n_coda) as i64 + 2))
+            .clamp(CODA_MIN_FRAMES, 4)
+            .min(fr - nuc_floor - used);
+        if c < CODA_MIN_FRAMES {
+            break;
+        }
+        *d = c;
+        used += c;
+    }
+    // coda: ≤4 each, ≥2 each (else DROPPED, first-first — the word-final release is the perceptually
+    // load-bearing cue), total ≤ 2/5 of the note (training: vowel share median 44-47%).
+    if n_coda > 0 {
+        let mut budget = (CODA_MAX_FRAMES * n_coda as i64).min(fr - nuc_floor - used).min(fr * 2 / 5);
+        let keep = ((budget / CODA_MIN_FRAMES).max(0) as usize).min(n_coda);
+        if keep > 0 {
+            budget = budget.min(CODA_MAX_FRAMES * keep as i64);
+            let base = budget / keep as i64;
+            let mut extra = budget - base * keep as i64;
+            for d in durs.iter_mut().skip(n - keep).rev() {
+                let mut give = base.min(CODA_MAX_FRAMES);
+                if extra > 0 {
+                    let a = (CODA_MAX_FRAMES - give).min(extra);
+                    give += a;
+                    extra -= a;
+                }
+                *d = give;
+                used += give;
+            }
+        }
+    }
+    durs[nuc] = fr - used; // nucleus takes the whole remainder (≥ nuc_floor by construction)
+    durs
 }
 
 #[cfg(test)]
@@ -333,6 +441,32 @@ mod voiceless_tests {
     }
 }
 
+#[cfg(test)]
+mod nucleus_tests {
+    use super::is_nucleus_phone;
+    use super::super::score2cv_tables::PHONE_TO_ID;
+
+    #[test]
+    fn nucleus_classification_is_exhaustive_and_stable() {
+        // Spot anchors (both polarities, every rule family).
+        for p in ["a", "ɯ", "aɪ", "oʊ", "ɑŋ", "uən", "yɛn", "əɻ", "ɝ", "i̥", "ɛ̃", "aː", "m̩", "n̩", "l̩", "ɹ̩", "ɻ̩"] {
+            assert!(is_nucleus_phone(p), "{p} must be nucleus-capable");
+        }
+        for p in ["m", "n", "ŋ", "t", "d", "ɹ", "ɻ", "w", "j", "ɥ", "ʔ", "ts", "ʈʂ", "nʲ", "rː", "n̪"] {
+            assert!(!is_nucleus_phone(p), "{p} must NOT be nucleus-capable");
+        }
+        for p in ["SP", "AP", "PAD", "BOS", "EOS"] {
+            assert!(!is_nucleus_phone(p), "{p} special");
+        }
+        // Exhaustive walk, count pinned (76 = hand-audited over the S69 vocab: 23 base vowels +
+        // 13 long/nasal + 3 devoiced + 6 diphthongs + 25 zh atomic finals + ɝ + 5 syllabic
+        // consonants m̩ n̩ l̩ ɹ̩ ɻ̩). A vocab regen that shifts this count must re-audit the classifier
+        // (a misrouted token would silently starve/inflate its syllable's nucleus).
+        let n = PHONE_TO_ID.iter().filter(|(p, _)| is_nucleus_phone(p)).count();
+        assert_eq!(n, 76, "nucleus token count drifted — vocab regen? re-audit the classifier");
+    }
+}
+
 /// Port of `render_ust.build_arrays` (+ its `lyric_to_phones` front-end). `score` = (lyric, note_num,
 /// frames) per note. Rest frames are capped (first/last note → `CAP_LEAD`, mid → `CAP_MID`); a sustain
 /// (`-`/`ー`/`+`) continues the previous vowel (default `a`); notes are grouped into `note_to_phone` by
@@ -344,7 +478,7 @@ mod voiceless_tests {
 pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
     let evts: Vec<g2p::ScoreEvt> = score.iter().map(g2p::ScoreEvt::ja).collect();
     let resolved = g2p::resolve_score(&evts, &NoDicts)?;
-    assemble_arrays(&evts, &resolved, true, false) // Phase-1c PARITY: rest-capped, no borrow-time
+    assemble_arrays(&evts, &resolved, true, false) // Phase-1c PARITY: rest-capped, split_dur, no pre-roll
 }
 
 /// A `DictSource` for pure-JA paths (parity + tests): JA needs no dictionary files; any zh/word-dict
@@ -393,25 +527,28 @@ fn zh_hold_phone(carrier: &'static str) -> &'static str {
 /// upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
 pub fn build_arrays_daw(score: &[g2p::ScoreEvt], dicts: &dyn g2p::DictSource) -> Result<ScoreArrays> {
     let resolved = g2p::resolve_score(score, dicts)?;
-    assemble_arrays(score, &resolved, false, true) // ② DAW: rests uncapped + short-note borrow-time (M3)
+    // ② DAW: rests uncapped + S83 syllable-aware allocation (onset pre-roll / nucleus-remainder /
+    // bounded coda) + short-note borrow-time (M3). Frame-CONSERVING: Σ phone_dur == Σ evt frames.
+    assemble_arrays(score, &resolved, false, true)
 }
 
 /// THE single array-assembly core (S58): resolved per-note phones → the model's per-phone arrays.
-/// Frame policy (`split_dur`, rest caps, borrow-time), id mapping, and note grouping — grouping keys on
-/// (pitch, RUN LANGUAGE) so a group never spans a language cut (single-language scores group exactly as
-/// before). Both `build_arrays` (parity, capped) and `build_arrays_daw` (DAW, uncapped) feed through
-/// here — one implementation, proven by the 1c bit-parity gate.
+/// Frame policy, id mapping, and note grouping — grouping keys on (pitch, RUN LANGUAGE) so a group never
+/// spans a language cut (single-language scores group exactly as before). Both `build_arrays` (parity,
+/// capped, legacy `split_dur`) and `build_arrays_daw` (DAW, uncapped, S83 syllable-aware allocation +
+/// onset pre-roll) feed through here — one implementation, proven by the 1c bit-parity gate.
 fn assemble_arrays(
     score: &[g2p::ScoreEvt],
     resolved: &[g2p::ResolvedNote],
     cap_rests: bool,
-    borrow_time: bool,
+    daw: bool,
 ) -> Result<ScoreArrays> {
     let m = score.len();
     let mut phon: Vec<&'static str> = Vec::new();
     let mut pdur: Vec<i64> = Vec::new();
     let mut npitch: Vec<i64> = Vec::new();
     let mut plang: Vec<i64> = Vec::new();
+    let mut pevt: Vec<usize> = Vec::new();
 
     for (k, (evt, res)) in score.iter().zip(resolved.iter()).enumerate() {
         let (nn, fr) = (evt.note_num, evt.frames);
@@ -429,6 +566,7 @@ fn assemble_arrays(
                 pdur.push(fr.min(cap).max(1));
                 npitch.push(0);
                 plang.push(lang_id);
+                pevt.push(k);
             }
             g2p::ResolvedKind::Phones(ph) => {
                 // S66 zh sustain fix (user bug: [wang][-] sang "wang wang"): the zh carrier is the
@@ -456,17 +594,88 @@ fn assemble_arrays(
                             pdur.push(fr.max(1));
                             npitch.push(nn);
                             plang.push(lang_id);
+                            pevt.push(k);
                             continue;
                         }
                     }
                     // sustain after silence (orphan): fall through to the normal emit ("a" default)
                 }
-                let durs = split_dur(fr, ph.len());
-                for (&p, &d) in ph.iter().zip(durs.iter()) {
-                    phon.push(p);
-                    pdur.push(d);
-                    npitch.push(nn);
-                    plang.push(lang_id);
+                if daw {
+                    // ── S83 syllable-aware allocation + onset pre-roll (see the block comment above
+                    //    allocate_in_note for the full rationale) ──
+                    let n = ph.len();
+                    let fr = fr.max(1);
+                    let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
+                    let onset_end = ph.iter().position(|p| is_nucleus_phone(p)).unwrap_or(n - 1).min(nuc);
+                    let mut durs = allocate_in_note(ph, fr, onset_end, nuc);
+                    if onset_end > 0 {
+                        // borrow the onset consonants' frames from the tail of the previous phone so
+                        // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
+                        let avail = match phon.last() {
+                            Some(&"SP") | Some(&"AP") => (pdur.last().copied().unwrap_or(0) - REST_KEEP_MIN).max(0),
+                            Some(_) => (pdur.last().copied().unwrap_or(0) - SUNG_KEEP_MIN).max(0),
+                            None => 0, // score start: no lender — the onset falls back in-note below
+                        };
+                        let mut left = (ONSET_TARGET_FRAMES * onset_end as i64).min(avail);
+                        if left > 0 {
+                            *pdur.last_mut().unwrap() -= left;
+                        }
+                        // distribute LAST-first (the consonant adjacent to the vowel carries the
+                        // syllable identity — a starved cluster sheds its outermost member first).
+                        for d in durs.iter_mut().take(onset_end).rev() {
+                            let give = left.min(ONSET_TARGET_FRAMES);
+                            *d = give;
+                            left -= give;
+                        }
+                        // in-note supplement for underfed onsets (score start / drained lender):
+                        // ALL-OR-NOTHING top-up to the 2-frame minimum out of the nucleus's spare above
+                        // its own min(fr,2) floor — a partial top-up would blend lender/nucleus frames
+                        // and the drop pass below could no longer return them to their sources, and a
+                        // 1-frame phone is categorically OOD anyway (S83 review #0).
+                        let nuc_floor = fr.min(2);
+                        for i in (0..onset_end).rev() {
+                            if durs[i] >= 2 {
+                                continue;
+                            }
+                            let need = 2 - durs[i];
+                            if (durs[nuc] - nuc_floor).max(0) >= need {
+                                durs[nuc] -= need;
+                                durs[i] += need;
+                            }
+                        }
+                        // sub-minimum onsets DROP (same policy as codas/medials); at this point their
+                        // frames are pure LENDER frames (the supplement is all-or-nothing), so hand them
+                        // back — the borrow must stay zero-sum even when it fails (conservation).
+                        let mut returned = 0i64;
+                        for d in durs.iter_mut().take(onset_end) {
+                            if *d > 0 && *d < 2 {
+                                returned += *d;
+                                *d = 0;
+                            }
+                        }
+                        if returned > 0 {
+                            *pdur.last_mut().unwrap() += returned;
+                        }
+                    }
+                    for (&p, &d) in ph.iter().zip(durs.iter()) {
+                        if d <= 0 {
+                            continue; // dropped medial/coda / sub-minimum onset — never emit a 0-frame phone
+                        }
+                        phon.push(p);
+                        pdur.push(d);
+                        npitch.push(nn);
+                        plang.push(lang_id);
+                        pevt.push(k);
+                    }
+                } else {
+                    let durs = split_dur(fr, ph.len());
+                    for (&p, &d) in ph.iter().zip(durs.iter()) {
+                        phon.push(p);
+                        pdur.push(d);
+                        npitch.push(nn);
+                        plang.push(lang_id);
+                        pevt.push(k);
+                    }
                 }
             }
             g2p::ResolvedKind::Unknown => {
@@ -482,9 +691,11 @@ fn assemble_arrays(
     // the rendered stem stays aligned to the DAW tick timeline (节奏不变). A short note with no trailing rest
     // is left as-is (extending it would eat the next note's onset; the decode pad-and-trim covers the hard
     // sub-min-frames floor). Deliberate fork from Phase-1c parity (build_arrays keeps borrow_time=false).
-    if borrow_time {
+    if daw {
+        // S83: the vowel test widened from tbl::VOWEL_SET (the 5 JA vowels) to the full nucleus
+        // classifier — an EN aɪ / zh final / syllabic n̩ deserves the same floor as a JA vowel.
         for i in 0..phon.len() {
-            if npitch[i] > 0 && tbl::VOWEL_SET.contains(&phon[i]) && pdur[i] < VOWEL_MIN_FRAMES {
+            if npitch[i] > 0 && is_nucleus_phone(phon[i]) && pdur[i] < VOWEL_MIN_FRAMES {
                 let deficit = VOWEL_MIN_FRAMES - pdur[i];
                 if i + 1 < phon.len() && matches!(phon[i + 1], "SP" | "AP") {
                     let take = deficit.min((pdur[i + 1] - 1).max(0));
@@ -526,7 +737,7 @@ fn assemble_arrays(
     }
     let note_dur: Vec<i64> = note_to_phone.iter().map(|&g| group_frames[g as usize]).collect();
 
-    Ok(ScoreArrays { phonemes, phone_dur: pdur, note_pitch: npitch, note_dur, note_to_phone, phon, lang: plang })
+    Ok(ScoreArrays { phonemes, phone_dur: pdur, note_pitch: npitch, note_dur, note_to_phone, phon, lang: plang, evt: pevt })
 }
 
 // ─── SP-boundary chunking (≤ max_frames) + per-chunk rebase ──────────────────────────────────────
@@ -732,6 +943,146 @@ mod tests {
         assert_eq!(daw.phone_dur[0] + daw.phone_dur[1], 3 + 40, "total frames (timeline) preserved");
         // parity build: no borrow (the vowel keeps its 3 frames).
         assert_eq!(build_arrays(&score).unwrap().phone_dur[0], 3, "parity build does not borrow-time");
+    }
+
+    // ── S83 syllable-aware DAW allocation + onset pre-roll ──
+
+    // The user-verified S83 triplet case (tempo-222 UST, 240t≈7fr notes): every CV syllable's vowel
+    // must start ON its beat — the onset consonant borrows frames from the PREVIOUS phone's tail.
+    #[test]
+    fn preroll_puts_every_vowel_on_the_beat() {
+        let daw = daw_ja(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
+        assert_eq!(daw.phon, vec!["a", "t", "a", "ɕ", "i"]);
+        assert_eq!(daw.phone_dur, vec![3, 4, 3, 4, 6], "た/し onsets borrowed 4 from the previous vowel");
+        assert_eq!(daw.phone_dur.iter().sum::<i64>(), 7 + 7 + 6, "frame-conserving (timeline unmoved)");
+        // vowel onsets (cumulative) land exactly on the beats 0 / 7 / 14:
+        assert_eq!(3 + 4, 7, "た's vowel starts on beat 7");
+        assert_eq!(3 + 4 + 3 + 4, 14, "し's vowel starts on beat 14");
+        // evt mapping (the phoneme lane's note attribution):
+        assert_eq!(daw.evt, vec![0, 1, 1, 2, 2]);
+        // parity build untouched: split_dur shape, consonant INSIDE the note window.
+        let parity = build_arrays(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
+        assert_eq!(parity.phone_dur, vec![7, 2, 5, 2, 4], "parity keeps the legacy split_dur shape");
+    }
+
+    // Score-start fallback: no lender → the onset falls back IN-note (≤2 frames from the nucleus).
+    #[test]
+    fn preroll_score_start_falls_back_in_note() {
+        let daw = daw_ja(&[("た", 60, 7)]).unwrap();
+        assert_eq!(daw.phon, vec!["t", "a"]);
+        assert_eq!(daw.phone_dur, vec![2, 5], "no previous phone: 2 in-note frames, nucleus keeps the rest");
+    }
+
+    // Borrowing from a REST keeps ≥1 frame of it (chunk_at_sp still cuts there).
+    #[test]
+    fn preroll_borrows_from_rest_keeping_one_frame() {
+        let daw = daw_ja(&[("あ", 60, 5), ("R", 0, 3), ("た", 62, 7)]).unwrap();
+        assert_eq!(daw.phon, vec!["a", "SP", "t", "a"]);
+        // SP had 3 and keeps ≥1 → lends only 2 of the 4 wanted; t's 2 frames clear the supplement
+        // floor, so the nucleus keeps the full note.
+        assert_eq!(daw.phone_dur, vec![5, 1, 2, 7]);
+        assert_eq!(daw.phone_dur.iter().sum::<i64>(), 5 + 3 + 7);
+    }
+
+    // EN closed syllable (the S83 "mine→me" crown case): the CODA is bounded, the NUCLEUS takes the
+    // note's remainder, and the onset pre-rolls — the exact inversion of the old split_dur shape.
+    struct EnOnly(g2p::WordDict);
+    impl g2p::DictSource for EnOnly {
+        fn zh(&self) -> Result<&g2p::ZhDict> {
+            Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into()))
+        }
+        fn words(&self, lang: g2p::Lang) -> Result<&g2p::WordDict> {
+            if lang == g2p::Lang::En { Ok(&self.0) } else { Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into())) }
+        }
+    }
+    fn en_dicts() -> EnOnly {
+        EnOnly(g2p::WordDict::from_tsv(g2p::Lang::En, "mine\tM AY1 N\nfined\tF AY1 N D\n"))
+    }
+    fn en_evt(lyric: &'static str, note_num: i64, frames: i64) -> g2p::ScoreEvt<'static> {
+        g2p::ScoreEvt { lyric, note_num, frames, lang: g2p::Lang::En, phoneme_input: None }
+    }
+
+    #[test]
+    fn en_closed_syllable_nucleus_takes_the_remainder() {
+        let d = en_dicts();
+        // R(10) mine(50) R(10) — a 1-second note at 50fps.
+        let score = [en_evt("R", 0, 10), en_evt("mine", 69, 50), en_evt("R", 0, 10)];
+        let arr = build_arrays_daw(&score, &d).unwrap();
+        assert_eq!(arr.phon, vec!["SP", "m", "aɪ", "n", "SP"]);
+        // m pre-rolls 4 from the leading rest; coda n is BOUNDED at 4; the vowel gets the remainder
+        // (46 frames = 92% — the old split_dur gave it 4 and the [n] hum 42).
+        assert_eq!(arr.phone_dur, vec![6, 4, 46, 4, 10]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 70, "frame-conserving");
+    }
+
+    #[test]
+    fn en_double_coda_bounded_and_dropped_when_starved() {
+        let d = en_dicts();
+        let arr = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 50)], &d).unwrap();
+        assert_eq!(arr.phon, vec!["SP", "f", "aɪ", "n", "d"]);
+        assert_eq!(arr.phone_dur, vec![6, 4, 42, 4, 4], "n+d bounded at 4 each; the 760ms [d] is gone");
+        // a 3-frame note can't fit any coda at the 2-frame minimum → both drop, the nucleus survives.
+        let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d).unwrap();
+        assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");
+        assert_eq!(tiny.phone_dur.iter().sum::<i64>(), 13, "still frame-conserving");
+    }
+
+    // Conservation invariant across a mixed score (the old split_dur could INFLATE Σ beyond the
+    // timeline on short multi-phone notes, pushing every later note off the grid).
+    #[test]
+    fn daw_allocation_is_frame_conserving() {
+        let d = en_dicts();
+        let score = [
+            en_evt("R", 0, 4), en_evt("mine", 69, 3), en_evt("fined", 71, 2), en_evt("R", 0, 6),
+            en_evt("mine", 60, 13), en_evt("fined", 62, 25),
+        ];
+        let arr = build_arrays_daw(&score, &d).unwrap();
+        let total: i64 = score.iter().map(|e| e.frames).sum();
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), total, "Σ phone_dur == Σ event frames, always");
+        assert!(arr.phone_dur.iter().all(|&d| d >= 1), "no 0-frame phone is ever emitted");
+    }
+
+    // S83 review #0: a borrowed onset that can't reach the 2-frame minimum (drained lender + no
+    // nucleus spare) DROPS and hands its frames BACK to the lender — conservation survives the
+    // failed pre-roll (a kept 1-frame phone would be the OOD class; a kept borrow with a dropped
+    // phone would silently shift the timeline).
+    #[test]
+    fn starved_onset_drops_and_returns_its_borrowed_frames() {
+        // geminate-shaped [ʔ,t,a] (raw-IPA override) on a 2-frame note after a 3-frame vowel: the
+        // lender spares only 1 frame, the nucleus (min(fr,2)=2) has no spare → the 1-frame [t]
+        // drops and its borrowed frame RETURNS to the lender (ʔ got nothing and drops too).
+        let tta = g2p::ScoreEvt {
+            lyric: "x", note_num: 62, frames: 2, lang: g2p::Lang::Ja, phoneme_input: Some("ʔ t a"),
+        };
+        let daw = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts).unwrap();
+        assert_eq!(daw.phon, vec!["a", "a"]);
+        assert_eq!(daw.phone_dur, vec![3, 2], "borrowed frame returned to the lender");
+    }
+
+    // S83 review #1: medial phones follow the same ≥2-or-DROP policy as codas (never a 1-frame
+    // phone); raw-IPA override [p i u] exercises the medial branch without a western dictionary.
+    #[test]
+    fn medial_vowels_get_two_frames_or_drop() {
+        let evt = |fr| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja, phoneme_input: Some("p i u"),
+        };
+        let a10 = build_arrays_daw(&[evt(10)], &NoDicts).unwrap();
+        assert_eq!(a10.phon, vec!["p", "i", "u"]);
+        assert_eq!(a10.phone_dur, vec![2, 3, 5], "medial ≥2; onset supplemented in-note at score start");
+        let a3 = build_arrays_daw(&[evt(3)], &NoDicts).unwrap();
+        assert_eq!(a3.phon, vec!["u"], "sub-minimum medial AND onset drop — never a 1-frame phone");
+        assert_eq!(a3.phone_dur, vec![3]);
+    }
+
+    // M3 widened: an EN nucleus (aɪ) below the vowel floor borrows from a following rest exactly
+    // like a JA vowel (the old tbl::VOWEL_SET check covered only the 5 JA vowels).
+    #[test]
+    fn m3_borrow_covers_en_nuclei() {
+        let d = en_dicts();
+        let arr = build_arrays_daw(&[en_evt("mine", 69, 3), en_evt("R", 0, 40)], &d).unwrap();
+        let ai = arr.phon.iter().position(|&p| p == "aɪ").unwrap();
+        assert_eq!(arr.phone_dur[ai], VOWEL_MIN_FRAMES, "short EN nucleus borrowed up to the floor");
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 43, "borrow is zero-sum");
     }
 
     // ── S66 zh sustain fix (user bug: [wang][-] sang "wang wang") ──

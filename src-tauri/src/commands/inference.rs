@@ -1320,6 +1320,81 @@ pub async fn validate_lyrics(
     .map_err(|e| format!("validate_lyrics task failed: {e}"))?
 }
 
+/// S83 phoneme-lane preview: one emitted phone of the DAW assembly, wire-shaped for the editor's
+/// read-only phoneme lane. `evt` = the index of the input score triple this phone came from (the
+/// frontend maps it back to a note id / gap rest through its parallel `tripleNoteIds`); frames are
+/// consumed cumulatively (Σ frames == Σ triple frames — the assembler is frame-conserving), so the
+/// lane's x-positions are exactly the render's, borrowed pre-beat onsets included.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhonemeSpan {
+    pub phone: String,
+    pub frames: i64,
+    pub evt: usize,
+    pub voiceless: bool,
+    pub nucleus: bool,
+}
+
+/// S83: dry-run the ② DAW assembly (`build_arrays_daw` — THE render's allocator, single source) and
+/// return the emitted phone spans. No model, no audio — just G2P + frame allocation, so the editor's
+/// phoneme lane always shows exactly what a render would sing (incl. onset pre-roll and dropped codas).
+/// Errors (OOV / missing dictionary) surface as the same stable CODEs the render uses; the lane simply
+/// clears (the note area already paints OOV red via oovWatch).
+#[tauri::command]
+pub async fn preview_vocal_phonemes(
+    state: State<'_, Arc<AppState>>,
+    score: Vec<ScoreNote>,
+    default_lang: i64,
+) -> Result<Vec<PhonemeSpan>, String> {
+    // Same 1× cap as render_vocal_segment: the payload here is byte-for-byte the SAME triples array the
+    // render caps at MAX_SCORE_NOTES — an over-cap score can never render, so previewing it has no value
+    // (the lane's contract is "show what a render would sing"). S83 review #11.
+    if score.len() > MAX_SCORE_NOTES {
+        return Err(format!("VOCAL_TOO_MANY_NOTES: {} > {}", score.len(), MAX_SCORE_NOTES));
+    }
+    let total_frames: i64 = score.iter().map(|n| n.frames.max(0)).sum();
+    if total_frames > MAX_TOTAL_FRAMES {
+        return Err(format!("VOCAL_SEGMENT_TOO_LONG: {} frames > {}", total_frames, MAX_TOTAL_FRAMES));
+    }
+    // DoS bound on the watcher-driven surface (mirrors validate_lyrics' MAX_LEN rationale). LOUD error
+    // instead of the U+FFFD swap: build_arrays_daw is strict (whole-score error), so a swap would just
+    // rename the failure — and a >256-char lyric is pathological (the editor caps at 64). Review #10.
+    const MAX_LEN: usize = 256;
+    if score.iter().any(|n| n.lyric.chars().count() > MAX_LEN) {
+        return Err("VOCAL_LYRIC_TOO_LONG".into());
+    }
+    if let Some(data_dir) = state.models.models_dir().parent() {
+        g2p::set_dict_dir(data_dir.join("dictionaries"));
+    }
+    let fallback = g2p::Lang::from_id(default_lang).unwrap_or(g2p::Lang::Ja);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut evts: Vec<g2p::ScoreEvt> = Vec::with_capacity(score.len());
+        for n in &score {
+            evts.push(g2p::ScoreEvt {
+                lyric: n.lyric.as_str(),
+                note_num: n.note_num,
+                frames: n.frames,
+                lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
+                phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LEN),
+            });
+        }
+        let arr = score2cv::build_arrays_daw(&evts, &g2p::GlobalDicts).map_err(|e| e.to_string())?;
+        Ok(arr
+            .phon
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| PhonemeSpan {
+                phone: p.to_string(),
+                frames: arr.phone_dur[i],
+                evt: arr.evt[i],
+                voiceless: score2cv::is_voiceless_phone(p),
+                nucleus: score2cv::is_nucleus_phone(p),
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("preview_vocal_phonemes task failed: {e}"))?
+}
+
 /// One note of the score from the frontend. `lyric` = the note's lyric (JA kana / rest `R` / sustain
 /// `ー`); `note_num` = the RAW note MIDI (transpose is applied Rust-side, §9.3); `frames` = the note's
 /// duration in 50fps frames (TimeAxis.tick_to_frame absolute diff — NEVER per-note round). Gap
