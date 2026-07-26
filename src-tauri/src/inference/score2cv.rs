@@ -354,18 +354,23 @@ fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) 
     let n_medial = nuc - onset_end;
     let nuc_floor = fr.min(2).max(1); // the nucleus never drops below min(fr,2)
     let mut used = 0i64;
-    // medial (rare — vowel clusters / mid-syllable glides): same ≥2-or-DROP policy as codas (a 1-frame
-    // phone is categorically OOD — S83 review), 2..=4 each, never eating the nucleus floor. The break
-    // drops LATER medials first (closer to the nucleus, typically glides; earlier ones carry more of
-    // the syllable's identity).
-    for d in durs.iter_mut().take(nuc).skip(onset_end) {
-        let c = (fr / ((n_medial + n_coda) as i64 + 2))
-            .clamp(CODA_MIN_FRAMES, 4)
-            .min(fr - nuc_floor - used);
+    // medial (between the first and last nucleus): a medial CONSONANT is really the NEXT
+    // syllable's ONSET — a multi-syllable word on ONE note flattens its syllable boundaries
+    // (refined = [ɹ ə f aɪ n d]: the f leads the second syllable) — so it gets its own measured
+    // onset target (the old flat 2..4 share made the f inaudible; S83 user-verified). A medial
+    // VOWEL (più's i) keeps the small share. Same ≥2-or-DROP policy as codas (1-frame = OOD);
+    // the break drops later medials first.
+    for i in onset_end..nuc {
+        let c = if is_nucleus_phone(ph[i]) {
+            (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4)
+        } else {
+            onset_target_frames(ph[i], fr)
+        }
+        .min(fr - nuc_floor - used);
         if c < CODA_MIN_FRAMES {
             break;
         }
-        *d = c;
+        durs[i] = c;
         used += c;
     }
     // coda: per-token measured target each (S83 second knife: t/d≈3, n≈4, s/ɕ≈6-7 — one flat cap
@@ -1160,6 +1165,22 @@ mod tests {
         let a3 = build_arrays_daw(&[evt(3)], &NoDicts).unwrap();
         assert_eq!(a3.phon, vec!["u"], "sub-minimum medial AND onset drop — never a 1-frame phone");
         assert_eq!(a3.phone_dur, vec![3]);
+    }
+
+    // S83 refined-fix: a medial CONSONANT (a later syllable's onset flattened onto one note) gets
+    // its own measured onset target — the old flat 2..4 share left refined's f inaudible.
+    #[test]
+    fn medial_syllable_onset_gets_its_measured_target() {
+        let evt = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
+            phoneme_input: Some("ɹ ə f aɪ n d"), // refined's shape as a raw-IPA override
+        };
+        let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts).unwrap();
+        assert_eq!(arr.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "n", "d"]);
+        // onset ɹ pre-rolls its long-bucket 7 from the rest; medial vowel ə keeps the small share;
+        // medial f takes its own onset target 7 (was ≤4); codas n/d at 4/3; aɪ gets the remainder.
+        assert_eq!(arr.phone_dur, vec![3, 7, 4, 7, 32, 4, 3]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 60, "frame-conserving");
     }
 
     // M3 widened: an EN nucleus (aɪ) below the vowel floor borrows from a following rest exactly

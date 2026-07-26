@@ -924,7 +924,7 @@ pub const G2P_GOLDEN: &[(&str, &str, &str, &str)] = &[
     ("en", "ratkowski", "R AH0 T K AO1 F S K IY0", "129 17 77 79 13 99 101 79 7"),
     ("en", "reach", "R IY1 CH", "129 7 92"),
     ("en", "reasonableness", "R IY1 Z N AH0 B AH2 L N AH0 S", "129 7 102 122 17 76 20 126 122 17 101"),
-    ("en", "receives", "R AH0 S IY1 V Z", "129 17 101 7 100 102"),
+    ("en", "receives", "R IH0 S IY1 V Z", "129 14 101 7 100 102"),
     ("en", "reconstruction", "R IY2 K AH0 N S T R AH1 K SH AH0 N", "129 7 79 17 122 101 77 129 20 79 103 17 122"),
     ("en", "redeposition", "R IY0 D EH2 P AH0 Z IH1 SH AH0 N", "129 7 78 12 75 17 102 14 103 17 122"),
     ("en", "reevaluating", "R IY0 IH0 V AE1 L Y UW0 EY2 T IH0 NG", "129 7 14 100 19 126 134 9 45 77 14 123"),

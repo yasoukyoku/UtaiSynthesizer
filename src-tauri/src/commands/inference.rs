@@ -1433,6 +1433,9 @@ pub struct VocalRenderOptions {
     /// zone and are shifted back (Signalsmith inverse). In-range parts render EXACTLY as before
     /// (tier 1/2 = shift 0 = byte-identical), so enabling this never degrades in-range material.
     pub range_extend: bool,
+    /// S83 knife 6b: voiceless-ONSET emphasis in dB (the SynthV "consonant strength" analogue).
+    /// 0 = off (exact no-op); clamped to [0, 12] render-side. Absent (old frontends) → the default.
+    pub consonant_emphasis_db: f32,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1451,6 +1454,7 @@ impl Default for VocalRenderOptions {
             lang_id: 2,
             transpose: 0,
             range_extend: false,
+            consonant_emphasis_db: crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             sovits: Default::default(),
             rvc: Default::default(),
         }
@@ -1756,6 +1760,12 @@ pub async fn render_vocal_segment(
     let score_owned: Vec<ScoreNote> = score;
     let cv_speaker_id = options.cv_speaker_id;
     let transpose = options.transpose;
+    // knob hygiene: non-finite → default; render treats ≤0 as an exact no-op, cap 12 dB.
+    let consonant_emphasis_db = if options.consonant_emphasis_db.is_finite() {
+        options.consonant_emphasis_db.clamp(0.0, 12.0)
+    } else {
+        crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB
+    };
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
     match backend_type {
@@ -1858,7 +1868,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 let result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    VOCAL_FLAT_VOL, consonant_emphasis_db, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?;
                 commit_rendered_audio(result, output_path)
@@ -1921,7 +1931,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 let result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    consonant_emphasis_db, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?;
                 commit_rendered_audio(result, output_path)

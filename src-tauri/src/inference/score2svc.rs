@@ -619,6 +619,7 @@ pub fn render_score_sovits(
     dicts: &dyn g2p::DictSource,
     options: &SovitsOptions,
     flat_vol: f32,
+    consonant_emphasis_db: f32,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -652,7 +653,11 @@ pub fn render_score_sovits(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
-    let emphasis_gain = 10f32.powf(VOICELESS_ONSET_EMPHASIS_DB / 20.0);
+    let emphasis_gain = if consonant_emphasis_db.is_finite() && consonant_emphasis_db > 0.0 {
+        10f32.powf(consonant_emphasis_db.min(12.0) / 20.0)
+    } else {
+        1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
+    };
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
     let p_vits = if has_diff { 0.5 } else { 0.95 };
@@ -772,6 +777,7 @@ pub fn render_score_rvc(
     cv_speaker_id: i64,
     dicts: &dyn g2p::DictSource,
     options: &RvcOptions,
+    consonant_emphasis_db: f32,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -796,7 +802,11 @@ pub fn render_score_rvc(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
-    let emphasis_gain = 10f32.powf(VOICELESS_ONSET_EMPHASIS_DB / 20.0);
+    let emphasis_gain = if consonant_emphasis_db.is_finite() && consonant_emphasis_db > 0.0 {
+        10f32.powf(consonant_emphasis_db.min(12.0) / 20.0)
+    } else {
+        1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
+    };
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
     // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
@@ -864,29 +874,38 @@ pub fn render_score_rvc(
 // vowels have no more frames to give). This is the deliberate SynthV-style engine emphasis: a
 // small trapezoid gain on voiceless ONSET phone windows only (codas excluded — boosting word-final
 // t/k would re-awaken the "词尾顿挫" the crown knife fixed). An explicit aesthetic lift, NOT a
-// distribution fact — keep it small; turn into a user knob if tastes diverge.
-const VOICELESS_ONSET_EMPHASIS_DB: f32 = 2.5;
+// distribution fact — a per-track user knob since S83 knife 6b (VocalTrackParams.consonantEmphasis,
+// the SynthV "consonant strength" analogue); this is the DEFAULT (mirrored by the frontend's
+// DEFAULT_CONSONANT_EMPHASIS_DB) and what the model-audition path uses (no per-track context).
+pub const DEFAULT_VOICELESS_ONSET_EMPHASIS_DB: f32 = 2.5;
 /// Short edge ramp for the emphasis trapezoid (~5 ms) — windows are only 40-140 ms wide.
 fn emphasis_fade_samples(sample_rate: u32) -> usize {
     (sample_rate as usize / 200).max(1)
 }
 
-/// Per-phone flag: a VOICELESS consonant sitting BEFORE its note group's first nucleus (the
-/// pre-rolled onset — the position the user hears as the syllable's "bite"). Groups without a
-/// nucleus (ʔ-only notes) flag nothing.
+/// Per-phone flag: a VOICELESS consonant that still LEADS TOWARD a nucleus within its SOURCE NOTE
+/// EVENT — i.e. every syllable-onset position, pre-rolled or medial (a multi-syllable word on one
+/// note flattens its boundaries: refined's medial f leads the second syllable and needs the same
+/// bite). Codas (voiceless AFTER the event's last nucleus) never flag — boosting word-final t/k
+/// would re-awaken the 词尾顿挫. Events without a nucleus (ʔ-only sokuon notes) flag nothing.
+/// ★The run key is `arr.evt` (the source triple), NOT `note_to_phone`: consecutive same-pitch
+/// notes merge into ONE pitch group, and anchoring on the merged group's nuclei either boosted
+/// the previous word's codas (last-nucleus anchor) or missed every later onset in a repeated-
+/// pitch run (first-nucleus anchor) — S83 review, both defects one root.
 fn voiceless_onset_flags(arr: &ScoreArrays) -> Vec<bool> {
     let n = arr.phon.len();
     let mut flags = vec![false; n];
     let mut i = 0usize;
     while i < n {
         let mut j = i;
-        while j + 1 < n && arr.note_to_phone[j + 1] == arr.note_to_phone[i] {
+        while j + 1 < n && arr.evt[j + 1] == arr.evt[i] {
             j += 1;
         }
         if arr.note_pitch[i] > 0 {
-            if let Some(first_nuc) = (i..=j).find(|&x| super::score2cv::is_nucleus_phone(arr.phon[x])) {
-                for x in i..first_nuc {
-                    flags[x] = is_voiceless_phone(arr.phon[x]);
+            if let Some(last_nuc) = (i..=j).rev().find(|&x| super::score2cv::is_nucleus_phone(arr.phon[x])) {
+                for x in i..last_nuc {
+                    flags[x] = is_voiceless_phone(arr.phon[x])
+                        && !super::score2cv::is_nucleus_phone(arr.phon[x]); // devoiced vowels are nuclei, not onsets
                 }
             }
         }
@@ -899,7 +918,7 @@ fn voiceless_onset_flags(arr: &ScoreArrays) -> Vec<bool> {
 /// `chunk_sp_windows`; `flags` is the arr-level slice for this chunk's phone range).
 fn chunk_flag_windows(chunk: &Chunk, out_len: usize, flags: &[bool]) -> Vec<(usize, usize)> {
     let t = chunk.t.max(1);
-    let mut wins = Vec::new();
+    let mut wins: Vec<(usize, usize)> = Vec::new();
     let mut cursor: i64 = 0;
     for (i, &d) in chunk.phone_dur.iter().enumerate() {
         let d = d.max(0);
@@ -908,7 +927,14 @@ fn chunk_flag_windows(chunk: &Chunk, out_len: usize, flags: &[bool]) -> Vec<(usi
             let e = ((((cursor + d) as f64) / t as f64) * out_len as f64).round() as usize;
             let e = e.min(out_len);
             if e > s {
-                wins.push((s, e));
+                // coalesce contiguous flagged phones (an onset cluster like [s t] shares its
+                // boundary sample by construction): one trapezoid per run — per-phone windows
+                // would each ramp back to unity at the junction, carving a ~10 ms gain valley
+                // inside one articulation gesture (S83 review).
+                match wins.last_mut() {
+                    Some(last) if last.1 == s => last.1 = e,
+                    _ => wins.push((s, e)),
+                }
             }
         }
         cursor += d;
@@ -1131,6 +1157,18 @@ mod tests {
         assert!(flags[k], "voiceless onset k flags");
         assert!(!flags[g], "voiced onset ɡ never flags");
         assert!(arr.phon.iter().zip(&flags).all(|(&p, &f)| !f || is_voiceless_phone(p)));
+        // S83 refined-fix: a MEDIAL voiceless consonant (later syllable's onset on one note) also
+        // flags — it leads toward a nucleus; the coda d (after the last nucleus) never does.
+        let refined = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
+            phoneme_input: Some("ɹ ə f aɪ n d"),
+        };
+        let arr2 = build_arrays_daw(&[refined], &NoDicts).unwrap();
+        let flags2 = voiceless_onset_flags(&arr2);
+        let f_i = arr2.phon.iter().position(|&p| p == "f").unwrap();
+        let d_i = arr2.phon.iter().position(|&p| p == "d").unwrap();
+        assert!(flags2[f_i], "medial f (2nd-syllable onset) flags for emphasis");
+        assert!(!flags2[d_i], "coda d never flags (word-final thud guard)");
         // trapezoid: edges ramp, plateau boosts, outside untouched.
         let mut a = vec![1.0f32; 100];
         apply_emphasis(&mut a, &[(20, 80)], 2.0, 10);
@@ -1574,16 +1612,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -1592,7 +1630,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

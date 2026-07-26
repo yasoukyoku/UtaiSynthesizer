@@ -293,6 +293,11 @@ export interface VocalTrackParams {
    *  time, so the user can pick a convenient trigger without the breath function stealing a glyph they need
    *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
   breathToken?: string;
+  /** S83 knife 6b: voiceless-ONSET emphasis in dB (the SynthV "consonant strength" analogue) — a small
+   *  output-domain trapezoid gain on voiceless onset phone windows (codas untouched). 0 = off (exact
+   *  no-op); absent = DEFAULT_CONSONANT_EMPHASIS_DB (2.5). The default folds OUT of the render sig so
+   *  pre-knob bakes stay clean. */
+  consonantEmphasis?: number;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (Signalsmith inverse; needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
    *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in

@@ -116,7 +116,8 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
     const { projectJson } = buildSaveBundle("P", [rich], 120, [4, 4]);
     const loaded = parseLoadedBundle(projectJson, "C:/proj.usp");
     // S73b/c/d:sanitize 载入时补 concrete 的 autoTuneExpr(2)/Vib(1)/Take(0)——夹具没写它们,期望值补齐
-    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0 });
+    // S83 knife 6b: sanitize always materializes consonantEmphasis (absent → the 2.5 dB default).
+    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: 2.5 });
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
   });
 

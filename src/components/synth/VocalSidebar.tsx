@@ -19,6 +19,7 @@ import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
+import { DEFAULT_CONSONANT_EMPHASIS_DB } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
@@ -230,6 +231,16 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           resetTitle={t("vocalEditor.sidebar.formantTip")}
           onReset={() => setVocalParams(trackId, { formant: 0 })}
           onChange={(v) => setVocalParams(trackId, { formant: v })}
+        />
+        {/* S83 knife 6b: consonant strength (SynthV analogue) — output-domain dB on voiceless onsets. */}
+        <Slider
+          label={t("vocalEditor.sidebar.consonant")}
+          value={vocalParams.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB}
+          cfg={{ min: 0, max: 6, step: 0.5, unit: "dB", bipolar: false }}
+          overridden={(vocalParams.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB) !== DEFAULT_CONSONANT_EMPHASIS_DB}
+          resetTitle={t("vocalEditor.sidebar.consonantTip")}
+          onReset={() => setVocalParams(trackId, { consonantEmphasis: DEFAULT_CONSONANT_EMPHASIS_DB })}
+          onChange={(v) => setVocalParams(trackId, { consonantEmphasis: v })}
         />
         {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
             custom trigger never steals a glyph the user needs as a real lyric. */}

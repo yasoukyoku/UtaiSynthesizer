@@ -609,6 +609,8 @@
       "transpose": "Transpose",
       "formant": "Formant",
       "formantTip": "Track-wide formant shift (semitones), added on top of the bottom formant lane. Higher = brighter/younger, lower = darker/fuller; 0 = no change.",
+      "consonant": "Consonant",
+      "consonantTip": "Output gain on voiceless onsets (s/k/t…): higher = crisper articulation. 0 = off; default 2.5 dB.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",
