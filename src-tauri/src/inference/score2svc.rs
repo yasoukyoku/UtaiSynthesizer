@@ -651,6 +651,8 @@ pub fn render_score_sovits(
     // content note_pitch is transposed separately (grouping is shift-invariant).
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
+    let vl_onset = voiceless_onset_flags(&arr);
+    let emphasis_gain = 10f32.powf(VOICELESS_ONSET_EMPHASIS_DB / 20.0);
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
     let p_vits = if has_diff { 0.5 } else { 0.95 };
@@ -696,6 +698,9 @@ pub fn render_score_sovits(
         // S73e: 真休止(SP)窗零化——cover slicer 铺零的输出域等价物(AP 呼吸不动;详见 gate 头注)
         let sp_wins = chunk_sp_windows(chunk, wav.len());
         apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
+        // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
+        let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
+        apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -790,6 +795,8 @@ pub fn render_score_rvc(
     let formant_cv = formant.map(|f| build_note_param(&arr, score, f, 0.0));
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
+    let vl_onset = voiceless_onset_flags(&arr);
+    let emphasis_gain = 10f32.powf(VOICELESS_ONSET_EMPHASIS_DB / 20.0);
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
     // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
@@ -815,6 +822,9 @@ pub fn render_score_rvc(
         // S73e: 真休止(SP)窗零化(RVC 症状最轻但同样受益;AP 呼吸不动)
         let sp_wins = chunk_sp_windows(chunk, wav.len());
         apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
+        // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
+        let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
+        apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -847,6 +857,79 @@ pub fn render_score_rvc(
 // REST_GATE_FADE_MS 内渐落至 0(保住 net_g 的自然 release 尾),窗心全零;短窗成浅谷不至 0。
 // ★AP(呼吸)绝不 gate(audible intake);清辅音帧(f0=0 但在音符内)不在 SP 窗,不受影响。
 // feed 级 slicer 对齐(长休止内部不渲染+边距+chunk 整改=根治 OOD 与算力)=后续结构优化轮。
+// ─── S83 knife 6: voiceless ONSET emphasis (user: fast-run fricatives still not crisp enough) ───
+//
+// The duration (p75) and zero-fraction knives put the voiceless windows AT the training
+// distribution — the remaining "not crisp" is an ENERGY ask, and duration can't buy it (fast-run
+// vowels have no more frames to give). This is the deliberate SynthV-style engine emphasis: a
+// small trapezoid gain on voiceless ONSET phone windows only (codas excluded — boosting word-final
+// t/k would re-awaken the "词尾顿挫" the crown knife fixed). An explicit aesthetic lift, NOT a
+// distribution fact — keep it small; turn into a user knob if tastes diverge.
+const VOICELESS_ONSET_EMPHASIS_DB: f32 = 2.5;
+/// Short edge ramp for the emphasis trapezoid (~5 ms) — windows are only 40-140 ms wide.
+fn emphasis_fade_samples(sample_rate: u32) -> usize {
+    (sample_rate as usize / 200).max(1)
+}
+
+/// Per-phone flag: a VOICELESS consonant sitting BEFORE its note group's first nucleus (the
+/// pre-rolled onset — the position the user hears as the syllable's "bite"). Groups without a
+/// nucleus (ʔ-only notes) flag nothing.
+fn voiceless_onset_flags(arr: &ScoreArrays) -> Vec<bool> {
+    let n = arr.phon.len();
+    let mut flags = vec![false; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && arr.note_to_phone[j + 1] == arr.note_to_phone[i] {
+            j += 1;
+        }
+        if arr.note_pitch[i] > 0 {
+            if let Some(first_nuc) = (i..=j).find(|&x| super::score2cv::is_nucleus_phone(arr.phon[x])) {
+                for x in i..first_nuc {
+                    flags[x] = is_voiceless_phone(arr.phon[x]);
+                }
+            }
+        }
+        i = j + 1;
+    }
+    flags
+}
+
+/// Chunk-relative output-sample windows of FLAGGED phones (same proportional frame→sample map as
+/// `chunk_sp_windows`; `flags` is the arr-level slice for this chunk's phone range).
+fn chunk_flag_windows(chunk: &Chunk, out_len: usize, flags: &[bool]) -> Vec<(usize, usize)> {
+    let t = chunk.t.max(1);
+    let mut wins = Vec::new();
+    let mut cursor: i64 = 0;
+    for (i, &d) in chunk.phone_dur.iter().enumerate() {
+        let d = d.max(0);
+        if d > 0 && flags.get(i).copied().unwrap_or(false) {
+            let s = (cursor as f64 / t as f64 * out_len as f64).round() as usize;
+            let e = ((((cursor + d) as f64) / t as f64) * out_len as f64).round() as usize;
+            let e = e.min(out_len);
+            if e > s {
+                wins.push((s, e));
+            }
+        }
+        cursor += d;
+    }
+    wins
+}
+
+/// Trapezoid gain over each window: edges ramp 1→gain over `fade` samples (no clicks), plateau at
+/// `gain` in between; a window shorter than 2·fade peaks proportionally (mirror of apply_rest_gate).
+fn apply_emphasis(audio: &mut [f32], windows: &[(usize, usize)], gain: f32, fade: usize) {
+    let fade = fade.max(1) as f32;
+    for &(s, e) in windows {
+        let e = e.min(audio.len());
+        for i in s..e {
+            let edge = (i - s).min(e - 1 - i) as f32;
+            let g = 1.0 + (gain - 1.0) * (edge / fade).min(1.0);
+            audio[i] *= g;
+        }
+    }
+}
+
 const REST_GATE_FADE_MS: f32 = 40.0;
 
 fn rest_gate_fade_samples(sample_rate: u32) -> usize {
@@ -1034,6 +1117,27 @@ mod tests {
         let mut hz3 = vec![300.0f32; 6];
         zero_voiceless_frames(&mut hz3, &c);
         assert!(hz3.iter().all(|&v| v == 300.0));
+    }
+
+    // S83 knife 6: only voiceless ONSET phones get the emphasis window — codas and voiced
+    // onsets stay untouched; the trapezoid plateaus at the gain with clean edge ramps.
+    #[test]
+    fn voiceless_onset_emphasis_flags_and_shape() {
+        // か(k a) + が(ɡ a) + "light"-shaped coda: only the k flags.
+        let arr = daw_ja(&[("か", 60, 20), ("が", 62, 20)]);
+        let flags = voiceless_onset_flags(&arr);
+        let k = arr.phon.iter().position(|&p| p == "k").unwrap();
+        let g = arr.phon.iter().position(|&p| p == "ɡ").unwrap();
+        assert!(flags[k], "voiceless onset k flags");
+        assert!(!flags[g], "voiced onset ɡ never flags");
+        assert!(arr.phon.iter().zip(&flags).all(|(&p, &f)| !f || is_voiceless_phone(p)));
+        // trapezoid: edges ramp, plateau boosts, outside untouched.
+        let mut a = vec![1.0f32; 100];
+        apply_emphasis(&mut a, &[(20, 80)], 2.0, 10);
+        assert_eq!(a[19], 1.0, "outside untouched");
+        assert!((a[20] - 1.0).abs() < 0.11, "edge starts near unity");
+        assert_eq!(a[40], 2.0, "plateau at gain");
+        assert!((a[79] - 1.0).abs() < 0.11, "far edge back near unity");
     }
 
     #[test]
