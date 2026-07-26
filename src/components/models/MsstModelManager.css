@@ -546,6 +546,20 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
+  /* S82d r5: badges are ATOMIC — when the info column tightens (export/delete columns), the
+     line must not wrap internally (§user: vocoder rows broke into two lines). The one
+     shrinkable segment is .rm-meta-shrink (ellipsis; full text in its title). */
+  overflow: hidden;
+}
+.rm-voice-item-meta > * {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.rm-voice-item-meta > .rm-meta-shrink {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* S40 vocoder tab: the zero-knowledge format/usage banner + the

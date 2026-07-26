@@ -945,7 +945,8 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                     <span className="ver-badge" title={t18({ zh: "经典 NSF-HiFiGAN 架构", en: "Classic NSF-HiFiGAN architecture", ja: "クラシック NSF-HiFiGAN アーキテクチャ" }, lang)}>
                       NSF-HiFiGAN
                     </span>
-                    <span>{vocoderFormatLabel(m)}</span>
+                    {/* the meta line's one shrinkable segment — full text in the tooltip */}
+                    <span className="rm-meta-shrink" title={vocoderFormatLabel(m)}>{vocoderFormatLabel(m)}</span>
                     {vocFormatOk ? (
                       <span className="msst-onnx-ok" title={t18({
                         zh: "标准格式：可用于所有 SoVITS 模型的浅扩散/增强器",
