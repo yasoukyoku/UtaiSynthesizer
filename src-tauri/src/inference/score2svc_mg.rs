@@ -26,6 +26,7 @@ use super::e1_tests::write_wav16;
 use super::super::engine::{DeviceConfig, OnnxEngine};
 use super::super::rvc;
 use super::super::score2cv::{is_nucleus_phone, NoDicts};
+use super::super::sovits;
 use std::path::Path;
 use std::time::Instant;
 
@@ -289,6 +290,148 @@ fn mg_render_rvc() {
     write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
     eprintln!(
         "[mg] rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
+        f_end - f_start,
+        r.audio.len() as f32 / r.sample_rate as f32,
+        t0.elapsed().as_secs_f64()
+    );
+}
+
+/// S85 SoVITS score 臂(sidecar 驱动配置,e1 姿势;东雪莲 4.1 / chika_v2 v2 实测目标):
+/// UTAI_MG_MODEL=sovits onnx 必填;UTAI_MG_SLICE/SHIFT/INVERSE/KAPPA 语义同 RVC 臂;
+/// cluster/diffusion/vocoder/auto-f0 全 None(score 生产默认口径;缺 cluster 资产时生产同样 skip)。
+#[test]
+#[ignore]
+fn mg_render_sovits() {
+    let sj = load_score();
+    let slice = std::env::var("UTAI_MG_SLICE").unwrap_or_default();
+    let (a, b) = if slice.is_empty() {
+        (0usize, sj.triples.len())
+    } else {
+        let (s, e) = slice.split_once("..").expect("UTAI_MG_SLICE=a..b (triple indices)");
+        (s.parse().unwrap(), e.parse().unwrap())
+    };
+    assert!(a < b && b <= sj.triples.len(), "bad slice {a}..{b}");
+    let f_start: i64 = sj.triples[..a].iter().map(|t| t.frames).sum();
+    let f_end: i64 = sj.triples[..b].iter().map(|t| t.frames).sum();
+    let triples = &sj.triples[a..b];
+    let cents = &sj.f0_cents[f_start as usize..f_end as usize];
+    let voiced = &sj.f0_voiced[f_start as usize..f_end as usize];
+    let evts = to_evts(triples);
+    let vf0 = VocalF0 { cents, voiced };
+    let (shift, inverse, kappa) = mg_shift_envs();
+    let (tp, rs) = if inverse { (0, shift) } else { (shift, 0) };
+
+    let model_path = std::path::PathBuf::from(
+        std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL (sovits onnx) required"),
+    );
+    let sc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_path.with_extension("json")).unwrap())
+            .unwrap();
+    assert_eq!(sc["type"].as_str(), Some("sovits"), "sovits arm wants a sovits sidecar");
+    let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
+    let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
+    let hop_size = sc["hop_size"].as_u64().unwrap_or(512) as usize;
+    let min_frames = sc["min_frames"].as_u64().unwrap_or(6) as usize;
+    let inputs: Vec<&str> = sc["inputs"]
+        .as_array()
+        .map(|l| l.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let stem = model_path.file_stem().unwrap().to_string_lossy().to_string();
+    let mtag = if stem.contains("东雪莲") { "dxl41".to_string() } else { stem };
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+    if let Ok(bld) = ort::init_from(&dll) {
+        let _ = bld.commit();
+    }
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::Cpu);
+    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+    let s2cv = engine
+        .load_model_with(
+            &aux.join(if dim == 768 { "score2cv_768.onnx" } else { "score2cv_256.onnx" }),
+            false,
+        )
+        .unwrap();
+    let cv = engine
+        .load_model_with(
+            &aux.join(if dim == 768 { "contentvec_768l12.onnx" } else { "contentvec_256l9.onnx" }),
+            false,
+        )
+        .unwrap();
+    let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+    let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+    let voice = engine.load_model_with(&model_path, false).unwrap();
+    let m = sovits::SovitsModel {
+        engine: &engine,
+        voice_session: &voice,
+        contentvec_session: &cv,
+        rmvpe_session: &rmvpe,
+        mel_filters: &rmvpe_mel,
+        cluster: None,
+        diffusion: None,
+        vocoder: None,
+        f0_predictor_session: None,
+        sample_rate,
+        hop_size,
+        features_dim: dim,
+        vol_embedding: inputs.contains(&"vol"),
+        phase_bins: sc["phase"]["phase_input"]
+            .as_array()
+            .and_then(|x| x.get(1))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        f0d_cond_channels: sc["f0d_cond"]["input"]
+            .as_array()
+            .and_then(|x| x.get(1))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize),
+        feed_uv: inputs.contains(&"uv"),
+        spk_mix: None,
+        unit_interpolate_mode: sc["unit_interpolate_mode"].as_str().unwrap_or("left").to_string(),
+        noise_channels: sc["noise"]["noise_input"]
+            .as_array()
+            .and_then(|x| x.get(1))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(192) as usize,
+        min_frames,
+    };
+    let emph: f32 = std::env::var("UTAI_MG_EMPH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_VOICELESS_ONSET_EMPHASIS_DB);
+    let valley: f32 = std::env::var("UTAI_MG_VALLEY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONSONANT_VALLEY_SCALE);
+    let clarity: bool = std::env::var("UTAI_MG_CLARITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true);
+    // e1 同款生产等价口径(noise_scale 0.4=这批模型 sidecar default_scale;seed 钉 0 保臂间对齐)。
+    let sopts = SovitsOptions {
+        seed: 0,
+        noise_scale: 0.4,
+        range_formant_follow: kappa,
+        speaker_id: Some(0),
+        ..Default::default()
+    };
+    let no_cancel = || false;
+    let no_prog = |_: f32| {};
+    let t0 = Instant::now();
+    let r = render_score_sovits(
+        &m, &s2cv, &evts, dim, 49, &NoDicts, &sopts,
+        crate::commands::inference::VOCAL_FLAT_VOL, emph, valley, clarity, tp, rs,
+        Some(&vf0), None, None, &no_cancel, &no_prog,
+    )
+    .unwrap();
+    let out_dir = Path::new(WORK).join("probe");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let name = format!("mg_render_{a}_{b}_{mtag}{}.wav", mg_shift_tag(shift, inverse, kappa));
+    write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
+    eprintln!(
+        "[mg] sovits rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
         f_end - f_start,
         r.audio.len() as f32 / r.sample_rate as f32,
         t0.elapsed().as_secs_f64()
