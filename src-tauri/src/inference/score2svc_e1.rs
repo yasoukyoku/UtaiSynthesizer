@@ -232,7 +232,9 @@ fn e1_render_rvc(
                 }
             }
         };
-        let mut wav = vc_decode(m, cv_p, &pitch, &pitchf, sid, None, options, ci as u64, usize::MAX)?;
+        // index_weights=None: 镜像臂保持 S84 前的均匀检索(B/C 臂=天然 cv,快段加权是
+        // score-cv 生产语义,混进来会成第三条流;D/K 臂走真生产入口自带加权)。
+        let mut wav = vc_decode(m, cv_p, &pitch, &pitchf, sid, None, options, ci as u64, usize::MAX, None)?;
         if pitchf.len() > real_t {
             wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
         }

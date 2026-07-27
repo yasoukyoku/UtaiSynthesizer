@@ -422,7 +422,8 @@ fn vc_chunk(
 ) -> Result<Vec<f32>> {
     // ContentVec @ 50 fps
     let feats = contentvec_extract(m.engine, m.contentvec_session, chunk, m.features_dim)?;
-    vc_decode(m, feats, pitch, pitchf, sid, spk_mix, options, chunk_idx, chunk.len() / WINDOW)
+    // index_weights = None: the cover path stays byte-identical to pre-S84 retrieval.
+    vc_decode(m, feats, pitch, pitchf, sid, spk_mix, options, chunk_idx, chunk.len() / WINDOW, None)
 }
 
 /// Decode one chunk's already-extracted ContentVec (50 fps) through the RVC net_g → UNtrimmed wav.
@@ -431,6 +432,13 @@ fn vc_chunk(
 /// retrieval/protect path. `windows_bound` = the caller's frame cap (cover: chunk.len()/WINDOW;
 /// score: usize::MAX = feats/pitch bound only). Byte-identical to the inlined version — proven at the
 /// source (scratchpad/verbatim_check.py) since the net_g graph is stochastic (RandomNormalLike/Uniform).
+///
+/// `index_weights` (S84 B 刀, ② score path only): per-50fps-frame retrieval weight — the S84
+/// measurement showed retrieval PULLS transitional fast-run cv toward wrong neighbours (ま's /a/
+/// F1 619 with retrieval vs 938 without, closed-vowel直拉; the ko1 dropout amplifier). Effective
+/// per-row ratio = index_ratio·w, applied as an exact post-lerp (blended = orig + ratio·(ret−orig)
+/// ⇒ orig + w·(blended−orig) = orig + w·ratio·(ret−orig)). `None` (the cover path and every
+/// pre-S84 caller) = byte-identical to the unweighted path. Rows beyond the slice default to 1.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vc_decode(
     m: &RvcModel,
@@ -442,6 +450,7 @@ pub(crate) fn vc_decode(
     options: &RvcOptions,
     chunk_idx: u64,
     windows_bound: usize,
+    index_weights: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
     // feats0 clone happens BEFORE retrieval (original line 221-222)
     let feats0 = if options.protect < 0.5 {
@@ -453,7 +462,18 @@ pub(crate) fn vc_decode(
         if let Some(index) = m.index {
             // l2_normalize = cosine NEIGHBOR METRIC only (S36 fix — normalizing the
             // blended model input itself muffled the audio; see knn_blend docs).
+            let orig = index_weights.map(|_| feats.clone());
             feats = knn_blend(&feats, &index.knn, options.index_ratio, options.l2_normalize);
+            if let (Some(w), Some(orig)) = (index_weights, orig) {
+                for (r, mut row) in feats.rows_mut().into_iter().enumerate() {
+                    let wr = w.get(r).copied().unwrap_or(1.0).clamp(0.0, 1.0);
+                    if wr < 1.0 {
+                        for (x, &ov) in row.iter_mut().zip(orig.row(r).iter()) {
+                            *x = ov + wr * (*x - ov);
+                        }
+                    }
+                }
+            }
         }
     }
     // 2x nearest upsample 50 → 100 fps (both copies, original lines 247-251)

@@ -834,6 +834,8 @@ pub fn render_score_rvc(
     let spk_mix_dense = m
         .spk_mix
         .map(|n| build_spk_mix_dense(&options.spk_mix, options.speaker_id, n));
+    // S84 B 刀: per-50fps-frame retrieval weights (fast notes retrieve wrong neighbours).
+    let idx_weights = fast_index_weights(&arr);
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
@@ -843,8 +845,11 @@ pub fn render_score_rvc(
         let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
+        // chunk 权重切片(min_frames pad 出的行由 vc_decode 的 unwrap_or(1.0) 兜=不加权)。
+        let w_chunk = &idx_weights[cv_cursor..(cv_cursor + chunk.t).min(idx_weights.len())];
         let mut wav = vc_decode(
             m, cv_p, &pitch, &pitchf, sid, spk_mix_dense.as_deref(), options, ci as u64, usize::MAX,
+            Some(w_chunk),
         )?;
         if pitchf.len() > real_t {
             // RVC net_g emits ~ p_len·(sr/100) samples; keep only the pre-pad span.
@@ -1123,6 +1128,29 @@ fn apply_valley(audio: &mut [f32], clusters: &[Vec<(usize, usize, f32)>], scale:
             }
         }
     }
+}
+
+// ─── S84 B 刀: short-phone retrieval weights (② score path only) ───
+//
+// The S84 measurement indicted RVC index retrieval on SHORT phones: transitional cv gets pulled
+// toward WRONG neighbours — ま's 4-frame /a/ measured F1 646 with retrieval vs 938 without
+// (closed-vowel直拉, cover 1070), and retrieval deepened the pre-A-knife ko1 syllable dropout
+// ~20 dB. The criterion is per-PHONE duration (a first evt-total design missed ま entirely —
+// its un-robbed note totals 6 frames while the harmed vowel itself is 4): frames of sung phones
+// with dur ≤ FAST_INDEX_MAX_PHONE_FRAMES weigh 0 (no retrieval — their cv never reaches a stable
+// target the index could match), longer phones and rests weigh 1 = unchanged (5+ frame ≈ 100 ms+
+// stable vowels are the regime retrieval demonstrably helps; the user's global A/B found
+// retrieval-off barely audible, so the cost of 0-weighting short phones is bounded while the
+// measured articulation win is real).
+const FAST_INDEX_MAX_PHONE_FRAMES: i64 = 4;
+fn fast_index_weights(arr: &ScoreArrays) -> Vec<f32> {
+    let mut w = Vec::new();
+    for i in 0..arr.phon.len() {
+        let d = arr.phone_dur[i].max(0);
+        let fast = arr.note_pitch[i] > 0 && d <= FAST_INDEX_MAX_PHONE_FRAMES;
+        w.extend(std::iter::repeat(if fast { 0.0f32 } else { 1.0 }).take(d as usize));
+    }
+    w
 }
 
 const REST_GATE_FADE_MS: f32 = 40.0;
@@ -1416,6 +1444,32 @@ mod tests {
         let ti5 = arr5.phon.iter().position(|&p| p == "t").unwrap();
         assert!((d5[si5] - 5.1).abs() < 1e-6, "chain-internal cluster head valleys (fric)");
         assert!((d5[ti5] - 11.7).abs() < 1e-6, "chain-internal cluster tail valleys (stop)");
+    }
+
+    // S84 B 刀: sung phones with dur ≤4 weigh 0 (no retrieval); longer phones and rests weigh 1.
+    #[test]
+    fn fast_index_weights_by_phone_duration() {
+        // R(10) + fast こ chain (k:2/o:3, k:2/o:2 …) + a long note (its vowel > 4 frames).
+        let arr = daw_ja(&[("R", 0, 10), ("こ", 73, 5), ("こ", 73, 4), ("こ", 73, 5), ("あ", 73, 20)]);
+        let w = fast_index_weights(&arr);
+        assert_eq!(w.len() as i64, arr.phone_dur.iter().sum::<i64>());
+        let mut cursor = 0usize;
+        for i in 0..arr.phon.len() {
+            let d = arr.phone_dur[i].max(0) as usize;
+            let expect = if arr.phon[i] == "SP" || arr.phone_dur[i] > 4 { 1.0 } else { 0.0 };
+            assert!(
+                w[cursor..cursor + d].iter().all(|&x| x == expect),
+                "phone {} (dur {}) expected weight {expect}",
+                arr.phon[i],
+                arr.phone_dur[i]
+            );
+            cursor += d;
+        }
+        // the harmed regime is present in the fixture: at least one ≤4-frame sung vowel weighs 0.
+        assert!(
+            arr.phon.iter().enumerate().any(|(i, &p)| p == "o" && arr.phone_dur[i] <= 4),
+            "fixture must contain a short vowel"
+        );
     }
 
     // S84 review: the sibling classifiers (is_voiceless/is_nucleus) are exhaustiveness-pinned;
