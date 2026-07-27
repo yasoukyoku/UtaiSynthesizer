@@ -223,6 +223,156 @@ fn mg_render_rvc() {
     );
 }
 
+/// S84 E 刀原型(用户 UTAU 类比「渲染长音素再缩短」;diagnostic,零生产改动):快段元音在
+/// S2CV 侧按放大时长渲染(articulation 轨迹完整到位),cv 行逐 phone 最近邻重采回真实时长
+/// → f0/timing/net_g/输出级(rest-gate/emphasis/valley/B 刀权重)全部生产口径,**只换 cv 源
+/// =单变量**。放大目标:唱段核 phone dur∈[1,4] → UTAI_MG_INFLATE(默认 6 帧=120ms 充分
+/// articulation)。孪生 chunk 按真 chunk 的 phone 区间构造(同相位,组不跨 SP/lang 切=组内
+/// note_dur 重算安全)。已知风险=压缩 cv 的超速过渡对 decoder 可能偏分布,实测裁决。
+#[test]
+#[ignore]
+fn mg_render_rvc_oversampled() {
+    let sj = load_score();
+    let slice = std::env::var("UTAI_MG_SLICE").unwrap_or_default();
+    let (a, b) = if slice.is_empty() {
+        (0usize, sj.triples.len())
+    } else {
+        let (s, e) = slice.split_once("..").expect("UTAI_MG_SLICE=a..b");
+        (s.parse().unwrap(), e.parse().unwrap())
+    };
+    let f_start: i64 = sj.triples[..a].iter().map(|t| t.frames).sum();
+    let f_end: i64 = sj.triples[..b].iter().map(|t| t.frames).sum();
+    let triples = &sj.triples[a..b];
+    let cents = &sj.f0_cents[f_start as usize..f_end as usize];
+    let voiced = &sj.f0_voiced[f_start as usize..f_end as usize];
+    let evts = to_evts(triples);
+    let vf0 = VocalF0 { cents, voiced };
+    let inflate: i64 = std::env::var("UTAI_MG_INFLATE").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    assert!(dll.exists());
+    if let Ok(bld) = ort::init_from(&dll) {
+        let _ = bld.commit();
+    }
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::Cpu);
+    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+    let s2cv768 = engine.load_model_with(&aux.join("score2cv_768.onnx"), false).unwrap();
+    let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
+    let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+    let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+    let teto = engine.load_model_with(&Path::new(WORK).join("tetoRVC_best.onnx"), false).unwrap();
+    let index = rvc::RvcIndex::load(&Path::new(WORK).join("tetoRVC_best.npy")).unwrap();
+    let m = rvc::RvcModel {
+        engine: &engine,
+        voice_session: &teto,
+        contentvec_session: &cv768,
+        rmvpe_session: &rmvpe,
+        mel_filters: &rmvpe_mel,
+        index: Some(&index),
+        sample_rate: 48000,
+        features_dim: 768,
+        spk_mix: None,
+        noise_channels: 192,
+        min_frames: 12,
+    };
+    let ropts = RvcOptions { seed: 0, ..Default::default() };
+
+    // ── 真时间轴(生产口径逐行)──
+    let arr = build_arrays_daw(&evts, &NoDicts).unwrap();
+    let mut note_hz_full = build_note_hz(&arr, &evts, 0, Some(&vf0));
+    zero_voiceless_frames(&mut note_hz_full, &arr);
+    anchor_voiced_phone_f0(&mut note_hz_full, &arr);
+    let chunks = chunk_at_sp(&arr, 400);
+    let vl_onset = voiceless_onset_flags(&arr);
+    let emphasis_gain = 10f32.powf(DEFAULT_VOICELESS_ONSET_EMPHASIS_DB / 20.0);
+    let valley_depths = boundary_valley_depths(&arr);
+    let idx_weights = fast_index_weights(&arr);
+
+    // ── 放大时长(核 phone ≤4 → inflate;组内重算 note_dur)──
+    let mut dur_inf = arr.phone_dur.clone();
+    let mut n_inflated = 0usize;
+    for i in 0..arr.phon.len() {
+        if arr.note_pitch[i] > 0
+            && super::super::score2cv::is_nucleus_phone(arr.phon[i])
+            && (1..=4).contains(&arr.phone_dur[i])
+        {
+            dur_inf[i] = inflate.max(arr.phone_dur[i]);
+            n_inflated += 1;
+        }
+    }
+    eprintln!("[mg] oversample: {n_inflated} nuclei inflated to {inflate} frames (S2CV side only)");
+
+    let mut audio: Vec<f32> = Vec::new();
+    let mut cv_cursor = 0usize;
+    for (ci, chunk) in chunks.iter().enumerate() {
+        // 孪生 chunk:同 phone 区间,放大时长;note_dur = 组内 dur_inf 和(组不跨 chunk 切)。
+        let rng = chunk.start..chunk.end;
+        let pd_inf: Vec<i64> = dur_inf[rng.clone()].to_vec();
+        let mut nd_inf = vec![0i64; pd_inf.len()];
+        let g = &chunk.note_to_phone;
+        for k in 0..pd_inf.len() {
+            nd_inf[k] = (0..pd_inf.len()).filter(|&j| g[j] == g[k]).map(|j| pd_inf[j]).sum();
+        }
+        let t_inf: usize = pd_inf.iter().map(|&d| d.max(0) as usize).sum();
+        let chunk_inf = Chunk {
+            start: chunk.start,
+            end: chunk.end,
+            phonemes: chunk.phonemes.clone(),
+            note_pitch: chunk.note_pitch.clone(),
+            phone_dur: pd_inf.clone(),
+            note_dur: nd_inf,
+            note_to_phone: chunk.note_to_phone.clone(),
+            t: t_inf,
+            lang_id: chunk.lang_id,
+            hard_seam: chunk.hard_seam,
+        };
+        let cv_inf = run_score2cv(m.engine, &s2cv768, &chunk_inf, 768, 49, chunk.lang_id).unwrap();
+        // 逐 phone 最近邻重采回真时长(中心对齐采样)。
+        let mut cv = Array2::<f32>::zeros((chunk.t, 768));
+        let (mut c_true, mut c_inf) = (0usize, 0usize);
+        for k in 0..pd_inf.len() {
+            let d_true = chunk.phone_dur[k].max(0) as usize;
+            let d_inf = pd_inf[k].max(0) as usize;
+            for j in 0..d_true {
+                let src = c_inf + ((j as f64 + 0.5) * d_inf as f64 / d_true as f64) as usize;
+                let src = src.min(c_inf + d_inf.saturating_sub(1)).min(cv_inf.nrows().saturating_sub(1));
+                cv.row_mut(c_true + j).assign(&cv_inf.row(src));
+            }
+            c_true += d_true;
+            c_inf += d_inf;
+        }
+        // ── 以下 = render_score_rvc 主循环逐行(cv 已换源)──
+        let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
+        let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
+        let w_chunk = &idx_weights[cv_cursor..(cv_cursor + chunk.t).min(idx_weights.len())];
+        let mut wav = vc_decode(
+            &m, cv_p, &pitch, &pitchf, 0, None, &ropts, ci as u64, usize::MAX, Some(w_chunk),
+        )
+        .unwrap();
+        if pitchf.len() > real_t {
+            wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
+        }
+        let sp_wins = chunk_sp_windows(chunk, wav.len());
+        apply_rest_gate(&mut wav, &sp_wins, rest_gate_fade_samples(m.sample_rate));
+        let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
+        apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
+        apply_valley(&mut wav, &val_cls, DEFAULT_CONSONANT_VALLEY_SCALE, emphasis_fade_samples(m.sample_rate));
+        if chunk.hard_seam {
+            seam_fade(&mut audio, &mut wav, m.sample_rate);
+        }
+        audio.extend_from_slice(&wav);
+        cv_cursor += chunk.t;
+    }
+    peak_normalize(&mut audio, 0.92);
+    let out_dir = Path::new(WORK).join("probe");
+    let name = format!("mg_render_{a}_{b}_teto_oversampled.wav");
+    write_wav16(&out_dir.join(&name), &audio, m.sample_rate);
+    eprintln!("[mg] oversampled render -> probe\\{name} ({:.2}s)", audio.len() as f32 / m.sample_rate as f32);
+}
+
 /// 目标组(用户点名):同一 UTAI_MG_SLICE 时窗的 MixDown(OpenUtau 渲染源)走**真翻唱管线**
 /// `rvc::run_pipeline` 生产默认口径(RvcOptions::default():index 0.75/protect 0.33/rms_mix 0.25
 /// =装机 cover 节点缺省;e1 A 臂同款调用面,不做 A 臂的归因偏离)——「无参换声」参照臂,
