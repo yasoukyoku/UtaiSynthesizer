@@ -382,10 +382,12 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  at 0 while an unsingable climax stays broken — the chika_v2 case);
  *  s85 = SCORE path switched to dead-only (whole-piece shift abolished — only rest-delimited
  *  phrases containing truly-dead notes render at a minimal local shift + inverse; everything
- *  else stays at written pitch; memory S85 三轮耳判). Score-decision-layer change only, so the
- *  audition tag deliberately does NOT bump (S84 lesson: it covers the COVER-pipeline audition;
- *  cover/audition decision + inverse are untouched here). */
-export const RANGE_ALGO_VERSION = "s85";
+ *  else stays at written pitch; memory S85 三轮耳判);
+ *  s85b = the S83 quiet-cap + escape-valve REVERT (cover verdicts back to the ear-proven
+ *  v0.11.0 behavior — 东雪莲/鹅妈妈 -6, not -24; the same-day s85 bakes rendered under the
+ *  escape-era verdicts must go dirty, hence the extra bump). Audition tag bumps in lockstep
+ *  this time (_s85b_): piece_range_shift verdicts ARE a cover-audition input. */
+export const RANGE_ALGO_VERSION = "s85b";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

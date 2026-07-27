@@ -318,8 +318,10 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
                     h = (h.wrapping_mul(33)) ^ (*b as u32);
                 }
             }
+            // s85b: the S83 quiet-cap/escape-valve revert changes piece_range_shift verdicts
+            // (a COVER-pipeline decision input) — legit bump per the scope note above.
             format!(
-                "_s83_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s85b_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

@@ -167,13 +167,6 @@ impl SpeakerRange {
 /// material to be genuinely damaged before it pays for itself.
 const SHIFT_FIXED_COST: f32 = 0.06;
 const SHIFT_PER_ST: f32 = 0.005;
-/// S83 escape valve: damage at/above this = "cannot sing" (the scan's DAMAGE_MAX is 3.0; ≥2.5
-/// only occurs on dead/near-dead semitones — the S83 quiet cap keeps mere quietness at ≤1.0).
-const DEAD_DAMAGE: f32 = 2.5;
-/// Loudness-weighted mass of dead frames (at shift 0) above which the FIXED toll is waived —
-/// ≈ one short broken climax (the chika_v2 case sat at ~1.2%).
-const DEAD_ESCAPE_MASS: f32 = 0.005;
-
 fn shift_cost(s: i64) -> f32 {
     if s == 0 {
         0.0
@@ -201,23 +194,23 @@ fn shift_cost(s: i64) -> f32 {
 /// and scores exactly as it did.
 ///   - low_ratio: free below 0.55 (a healthy vowel spreads across harmonics), full damage at
 ///     0.95 (a bare fundamental). THE term that catches "sings the note, has no voice left".
-///   - rms_db: free down to -6 dB relative to the scale's loudest note; the underlying /12
-///     slope (full-ramp endpoint -18, kept so the -8 dB → 0.5 anchor is unchanged) now reaches
-///     its 1.0 CAP at -10 dB and is flat below. Graded within -6..-10, then saturated.
-///     ★S83: CAPPED at 1.0 (⅓ of DAMAGE_MAX). The scale rms is normalized against a SINGLE
-///     loudest span, so a model whose scale loudness tilts hard (chika_v2: 0 dB peak at 74,
-///     -9..-19 dB across 36-62) used to get its whole healthy low/mid range branded 0.8-3.0 —
-///     the same score as "cannot phonate at all" — which poisoned every downshift's landing
-///     zone and froze the optimizer at 0 while the 83+ climax stayed audibly broken (the v2
-///     "没唱上去" the user reported). Quietness is compensable (loudness lane / mix gain);
-///     unsingability is not — they must never weigh the same.
+///   - rms_db: free down to -6 dB relative to the scale's loudest note, full damage at -18.
+///     Graded, never a gate — a model is simply quieter at the edges of its range.
+///
+/// ★S85b: the S83 quiet CAP (1.0) + escape valve are REVERTED — this function is byte-identical
+/// to v0.11.0 again. They were added for a SCORE symptom (chika_v2's broken climax at shift 0),
+/// but the score path no longer consults this optimizer at all (dead-only, memory S85), so the
+/// pair only governed COVER/audition — where they flipped 东雪莲/鹅妈妈 from the ear-proven -6
+/// into a catastrophic -24 whole-song recolour (user log A/B, 2026-07-27 23:24 vs 23:44).
+/// Known cost of the revert: the loudness-tilted-scale mis-shift the cap also fixed (a quiet
+/// low range reading as damage) is back for COVER — queued as part of cover dead-only 化.
 fn damage_from_scan(err_cents: f64, voiced: f64, timbre: Option<(f64, f64)>) -> f32 {
     let pitch = (((err_cents - 25.0) / 75.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
     let voicing = (((0.95 - voiced) / 0.45).clamp(0.0, 1.0) as f32) * DAMAGE_MAX;
     let (thin, quiet) = match timbre {
         Some((rms_db, low_ratio)) => (
             (((low_ratio - 0.55) / 0.40).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
-            ((((-6.0 - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX).min(1.0),
+            (((-6.0 - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
         ),
         None => (0.0, 0.0),
     };
@@ -692,43 +685,27 @@ pub fn piece_range_shift(
         }
         mass / n
     };
-    // S83 escape valve: perceptual damage is SALIENCE-driven, not duration-proportional — a few
-    // seconds of climax the model simply CANNOT phonate ruins the whole take, yet at ~1% of the
-    // piece's mass it can never out-bid SHIFT_FIXED_COST (the ~2% break-even; the chika_v2
-    // forensics: cost 0.1019 -> 0.1019, shift 0, the 83+ semitones rendered broken at pitch).
-    // When the DEAD mass at shift 0 (damage ≥ DEAD_DAMAGE — "cannot sing", not merely degraded)
-    // exceeds DEAD_ESCAPE_MASS, waive the FIXED toll; the per-semitone term still prices the
-    // distance so the optimizer moves only as far as the evidence warrants. The waiver applies
-    // equally to every non-zero shift, so it can only flip "0 vs non-0" — the relative order of
-    // non-zero candidates (all three ear-anchored verdicts) is structurally unchanged.
-    let dead0: f32 = voiced
-        .iter()
-        .filter(|&&(m, _)| range.damage_at(m).is_some_and(|d| d >= DEAD_DAMAGE))
-        .map(|&(_, w)| w)
-        .sum::<f32>()
-        / n;
-    let fixed = if dead0 >= DEAD_ESCAPE_MASS { 0.0 } else { SHIFT_FIXED_COST };
+    // ★S85b: the S83 escape valve (dead-mass FIXED-toll waiver) is REVERTED — the loop below is
+    // byte-identical to v0.11.0. Its motivating case (score climax broken at shift 0) is now
+    // handled by the score path's dead-only mechanism, which never consults this optimizer;
+    // here it only pushed COVER renders into ear-rejected deep recolours (东雪莲 -6 → -24).
     let mut best_cost = f32::MAX;
     let mut best_shift = 0i64;
     for s in -MAX_RANGE_SHIFT..=MAX_RANGE_SHIFT {
         let sf = s as f32;
-        let cost = frame_mass(sf)
-            + if s == 0 { 0.0 } else { fixed + SHIFT_PER_ST * s.unsigned_abs() as f32 };
+        let cost = frame_mass(sf) + shift_cost(s);
         if cost < best_cost {
             best_cost = cost;
             best_shift = s;
         }
     }
-    // One-line decision audit — ALWAYS, including "armed but chose 0" (S83: tonight's chika_v2
-    // "why didn't it move" forensics needed sidecar spelunking + hand-replay; a shift-0 line
-    // makes it one grep, honoring the S62b promise fully).
+    // One-line decision audit — ALWAYS, including "armed but chose 0" (S83 promise kept: a
+    // shift-0 line makes "why didn't it move" one grep instead of a forensics session).
     let above0: f32 = voiced.iter().filter(|&&(m, _)| m > u_hi).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
     let below0: f32 = voiced.iter().filter(|&&(m, _)| m < u_lo).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
     tracing::info!(
-        "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below, dead {:.2}%{}; cost {:.4} -> {best_cost:.4})",
+        "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below; cost {:.4} -> {best_cost:.4})",
         voiced.len(),
-        dead0 * 100.0,
-        if fixed == 0.0 { " ESCAPE" } else { "" },
         frame_mass(0.0)
     );
     best_shift
@@ -1219,46 +1196,9 @@ mod tests {
         // lengv2.3's near-pure-sine 75 (0.983) vs its healthy 74 (0.467)
         assert!(damage_from_scan(6.0, 1.00, Some((-1.2, 0.983))) > 2.0);
         assert_eq!(damage_from_scan(8.0, 1.00, Some((-8.0, 0.467))), 0.5, "quiet but voiced = graded, not rejected");
-        // ★S83 quiet cap anchors: quietness must NEVER weigh like unsingability. -19 dB used to
-        // score 3.0 (== "cannot phonate") and froze the optimizer on loudness-tilted scales
-        // (chika_v2); the cap holds it at 1.0. Kills both mutations: cap removal (→3.0) and the
-        // min-before-multiply mis-edit (→0.18-ish at -8 dB, caught by the 0.5 anchor above).
-        assert_eq!(damage_from_scan(5.0, 1.00, Some((-19.0, 0.1))), 1.0, "deep-quiet saturates at the cap");
-        assert_eq!(damage_from_scan(5.0, 1.00, Some((-10.0, 0.1))), 1.0, "cap threshold sits at -10 dB");
-    }
-
-    #[test]
-    fn dead_climax_escapes_the_fixed_toll() {
-        // S83 escape valve, the chika_v2 case in miniature: healthy through 78, DEAD above it;
-        // a ~1.2%-mass climax at 83 could never out-bid SHIFT_FIXED_COST (~2% break-even) and
-        // sang broken at pitch. With the valve, dead mass ≥ DEAD_ESCAPE_MASS waives the toll →
-        // the piece moves down; a trace amount (0.2%, below the threshold) keeps the toll and
-        // stays put (the anti-overreach half of the contract).
-        let mut semis = serde_json::Map::new();
-        for midi in 36..=96i64 {
-            let entry = if midi <= 78 {
-                serde_json::json!([5.0, 1.0])
-            } else {
-                serde_json::json!([9999.0, 0.0]) // cannot phonate at all
-            };
-            semis.insert(midi.to_string(), entry);
-        }
-        let r = speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [36.0, 81.0],
-                "comfort": [36.0, 81.0],
-                "semitones": serde_json::Value::Object(semis),
-            })),
-            0,
-        )
-        .unwrap();
-        let mut f0 = vec![hz(66.0); 5000];
-        f0.extend(vec![hz(83.0); 60]); // 600 ms of dead climax ≈ 1.2% of the mass
-        let s = piece_range_shift(&f0, None, &r, 100.0);
-        assert!((-8..=-5).contains(&s), "dead climax escapes the toll and lands healthy, got {s}");
-        let mut f0b = vec![hz(66.0); 5000];
-        f0b.extend(vec![hz(83.0); 10]); // 100 ms — phantom-filtered / below the escape mass
-        assert_eq!(piece_range_shift(&f0b, None, &r, 100.0), 0, "a trace of dead frames keeps the toll");
+        // (S85b: the S83 quiet-cap anchors + escape-valve test were removed with their
+        // mechanisms — decision layer back to v0.11.0; the broken-climax case they served is
+        // now the score dead-only plan's job, tested in the dead_only_* group below.)
     }
 
     #[test]
