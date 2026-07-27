@@ -389,8 +389,12 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  same dead-only philosophy as the score path (user verdict, memory S85 七轮): only sustained
  *  regions the model literally cannot phonate get a local minimal-landing shift + inverse
  *  (as deep as THAT region truly needs, ±24 cap), everything else renders at its own pitch,
- *  bit-identical to extension-off. Audition tag bumps in lockstep (_s85d_). */
-export const RANGE_ALGO_VERSION = "s85d";
+ *  bit-identical to extension-off;
+ *  s85e = windowed donors (cover donors render only dead-region neighbourhoods ±1.5 s instead
+ *  of K whole-song passes — the 5-6 min render regression) + level-match now scoped to the
+ *  score path only (cover has no per-render normalization; a global RMS pull was measuring
+ *  climax loudness against whole-song average). Audition tag bumps in lockstep (_s85e_). */
+export const RANGE_ALGO_VERSION = "s85e";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

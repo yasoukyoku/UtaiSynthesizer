@@ -382,9 +382,12 @@ pub fn run_pipeline(
     if options.formant.abs() > 1e-6 {
         audio_opt = utai_dsp::formant_warp(&audio_opt, |_| 2.0_f32.powf(options.formant / 12.0));
     }
-    // S85 dead-only(cover):死区局部救援——donor = 整管线自递归(f0_shift+s、range=None、
-    // 后处理链全同构;代价=每个 distinct shift 一次完整渲染,死区不存在时零开销),整段
-    // 逆变换回原音高(fed=移调 pf,S82 流式 formant base 保持),共享拼接器贴回死区窗。
+    // S85 dead-only(cover):死区局部救援——donor 只渲死区邻域切片(S85e 窗口化:每侧
+    // DONOR_PAD_SECONDS 真实上下文,同 shift 相邻切片合并;RVC 本就按 ~x_max 秒静音寻点
+    // 切块独立转换,切片边界与 base 自身的块边界同类同量,拼接只读窗内、窗深居切片 ≥pad
+    // 处)。每切片=整管线自递归(f0_shift+s、range=None、后处理链全同构)+ 切片逆变换回
+    // 原音高(fed=移调 pf 同帧段,S82 流式 formant base 保持),嵌回零底全长缓冲交给共享
+    // 拼接器。代价从「每 distinct shift 一次整曲」降为「死区占比×pad 展宽」。
     // donor 折进 [0.95, 0.99] 进度带(审查 S85d:曾 noop=长曲 UI 停 95% 读作卡死)。
     if !range_jobs.is_empty() {
         if final_sr % 100 != 0 {
@@ -396,6 +399,10 @@ pub fn run_pipeline(
         }
         let pf_out: Vec<f32> =
             pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())].to_vec();
+        let base_len = audio_opt.len();
+        let spf = base_len as f64 / out_frames.max(1) as f64;
+        let pad = (super::vocal_range::DONOR_PAD_SECONDS * final_sr as f32) as usize;
+        let in_sr = mono.sample_rate;
         let k_total = {
             let mut s: Vec<i64> = range_jobs.iter().map(|j| j.shift).collect();
             s.sort_unstable();
@@ -403,29 +410,65 @@ pub fn run_pipeline(
             s.len().max(1)
         };
         let pass = std::cell::Cell::new(0usize);
+        // donor 缓冲底=base 快照(审查 S85e):RVC 切片渲染可比跨度短 10-30ms(p_len 帧栅
+        // floor+ContentVec 行数上限),曲尾夹紧窗的缺口若垫零会把数字零拼进窗内(咔哒+
+        // 静默)——垫 base 则未覆盖样本自动回退旧契约「donor 短了保留 base」。
+        let base_snapshot = audio_opt.clone();
         super::vocal_range::apply_dead_only_windows(
             &mut audio_opt,
             final_sr,
             out_frames as i64,
             &range_jobs,
+            false, // cover 无逐渲归一——电平=模型对移调的真实响应,不全局拉平
             |s| {
-                tracing::info!("range-extend(cover/rvc, dead-only): rendering donor pass at {s:+} st");
+                let spans =
+                    super::vocal_range::donor_slice_spans(&range_jobs, s, spf, base_len, pad);
+                tracing::info!(
+                    "range-extend(cover/rvc, dead-only): donor {s:+} st — {} slice(s), {:.1}s of {:.1}s",
+                    spans.len(),
+                    spans.iter().map(|(a, b)| b - a).sum::<usize>() as f32 / final_sr as f32,
+                    base_len as f32 / final_sr as f32
+                );
                 let band = pass.get() as f32;
                 pass.set(pass.get() + 1);
-                let dp = move |p: f32| progress(0.95 + 0.04 * ((band + p.clamp(0.0, 1.0)) / k_total as f32));
-                let mut donor_opts = options.clone();
-                donor_opts.f0_shift += s as f32;
-                let donor = run_pipeline(m, audio, &donor_opts, None, &dp, cancel)?;
                 let k = 2.0f32.powf(s as f32 / 12.0);
                 let pf_shift: Vec<f32> = pf_out.iter().map(|&v| v * k).collect();
-                super::vocal_range::apply_inverse(
-                    donor.audio,
-                    donor.sample_rate,
-                    s,
-                    options.range_formant_follow,
-                    Some((&pf_shift, (donor.sample_rate as usize / 100).max(1))),
-                )
-                .map_err(UtaiError::Inference)
+                let mut buf = base_snapshot.clone();
+                let n_spans = spans.len().max(1);
+                for (i, &(a, b)) in spans.iter().enumerate() {
+                    let dp = move |p: f32| {
+                        let f = (i as f32 + p.clamp(0.0, 1.0)) / n_spans as f32;
+                        progress(0.95 + 0.04 * ((band + f) / k_total as f32))
+                    };
+                    // 输出跨度 → 输入(in_sr)跨度
+                    let ia = (a as f64 * in_sr as f64 / final_sr as f64) as usize;
+                    let ib = ((b as f64 * in_sr as f64 / final_sr as f64).ceil() as usize)
+                        .min(mono.samples.len());
+                    if ib <= ia {
+                        continue;
+                    }
+                    let slice_in = crate::audio::AudioBuffer::new_mono(
+                        mono.samples[ia..ib].to_vec(),
+                        in_sr,
+                    );
+                    let mut donor_opts = options.clone();
+                    donor_opts.f0_shift += s as f32;
+                    let donor = run_pipeline(m, &slice_in, &donor_opts, None, &dp, cancel)?;
+                    // fed f0 取同帧段(100fps;±1 帧取整偏移 ≪ 100ms sticky base 窗)
+                    let fa = ((a as f64 / spf) as usize).min(pf_shift.len());
+                    let fb = (((b as f64 / spf).ceil() as usize) + 1).min(pf_shift.len());
+                    let inv = super::vocal_range::apply_inverse(
+                        donor.audio,
+                        donor.sample_rate,
+                        s,
+                        options.range_formant_follow,
+                        Some((&pf_shift[fa..fb], (donor.sample_rate as usize / 100).max(1))),
+                    )
+                    .map_err(UtaiError::Inference)?;
+                    let n = inv.len().min(base_len - a);
+                    buf[a..a + n].copy_from_slice(&inv[..n]);
+                }
+                Ok(buf)
             },
         )?;
     }

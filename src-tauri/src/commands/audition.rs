@@ -329,7 +329,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // s85d: cover/audition switched to dead-only (whole-clip shift retired; the
             // pipelines own the policy) — a decision change, so the tag moves in lockstep.
             format!(
-                "_s85d_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s85e_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

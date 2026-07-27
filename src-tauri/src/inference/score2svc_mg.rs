@@ -785,6 +785,95 @@ fn mg_cover_range_replay() {
     }
 }
 
+/// S85e 冒烟:windowed-donor 全链行为验证(真 RVC 管线、CPU、秒域切片)。伪造「顶部截断」
+/// bounds 记录让切片内高音区成死区,range 臂与 range=None 臂对拍三条硬不变量:
+/// ①输出等长 ②差异样本占比 ∈ (0, 50%)=局部拼接而非整曲重着色 ③切片首尾各 1s 逐位不变
+/// (死区居中时窗外必须 bit-identical)。UTAI_MG_SMOKE_SPAN="a..b"(秒,默认 70..82)。
+#[test]
+#[ignore]
+fn mg_cover_deadonly_smoke() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let span = std::env::var("UTAI_MG_SMOKE_SPAN").unwrap_or_else(|_| "70..82".into());
+    let (t0s, t1s) = span.split_once("..").expect("UTAI_MG_SMOKE_SPAN=a..b seconds");
+    let (t0, t1): (f64, f64) = (t0s.parse().unwrap(), t1s.parse().unwrap());
+
+    let full = crate::audio::load_audio(Path::new(WORK).join("未命名_MixDown.wav").as_path()).unwrap();
+    let ch = full.channels.max(1) as usize;
+    let nf = full.samples.len() / ch;
+    let s0 = ((t0 * full.sample_rate as f64) as usize).min(nf) * ch;
+    let s1 = ((t1 * full.sample_rate as f64) as usize).min(nf) * ch;
+    let mono: Vec<f32> = full.samples[s0..s1]
+        .chunks_exact(ch)
+        .map(|fr| fr.iter().sum::<f32>() / ch as f32)
+        .collect();
+    let src = crate::audio::AudioBuffer { samples: mono, sample_rate: full.sample_rate, channels: 1 };
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+    if let Ok(bld) = ort::init_from(&dll) {
+        let _ = bld.commit();
+    }
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::Cpu);
+    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+    let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
+    let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+    let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+    let (model_path, index_path, _mtag) = mg_model_envs();
+    let teto = engine.load_model_with(&model_path, false).unwrap();
+    let index = rvc::RvcIndex::load(&index_path).unwrap();
+    let m = rvc::RvcModel {
+        engine: &engine,
+        voice_session: &teto,
+        contentvec_session: &cv768,
+        rmvpe_session: &rmvpe,
+        mel_filters: &rmvpe_mel,
+        index: Some(&index),
+        sample_rate: 48000,
+        features_dim: 768,
+        spk_mix: None,
+        noise_channels: 192,
+        min_frames: 12,
+    };
+    let ropts = RvcOptions::default();
+    let noop = |_: f32| {};
+    let no_cancel = || false;
+
+    // 对照:同参渲两次 base 自对拍——ORT CPU 归约序/线程分片可致运行间 fp 噪声;冒烟的
+    // 窗外判据按此选「严格逐位」或「噪声底容差」(容差=对照差异 RMS ×8,兜阶段放大)。
+    let t = Instant::now();
+    let base = rvc::run_pipeline(&m, &src, &ropts, None, &noop, &no_cancel).unwrap();
+    let t_base = t.elapsed().as_secs_f32();
+    let base2 = rvc::run_pipeline(&m, &src, &ropts, None, &noop, &no_cancel).unwrap();
+    let rms = |x: &[f32], y: &[f32]| {
+        (x.iter().zip(y).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>()
+            / x.len().max(1) as f64)
+            .sqrt()
+    };
+    let noise_floor = rms(&base.audio, &base2.audio);
+    // 顶部截断 bounds 记录(usable 顶 74/落点带 [40,70]):切片内 >D5 的持续高音成死区。
+    let fake = super::super::vocal_range::SpeakerRange::bounds((36.0, 74.0), (40.0, 70.0));
+    let t = Instant::now();
+    let ext = rvc::run_pipeline(&m, &src, &ropts, Some(fake), &noop, &no_cancel).unwrap();
+    let t_ext = t.elapsed().as_secs_f32();
+
+    assert_eq!(ext.audio.len(), base.audio.len(), "①range 臂不得改输出长度");
+    let n = base.audio.len();
+    let sr = ext.sample_rate as usize;
+    let head = rms(&base.audio[..sr], &ext.audio[..sr]);
+    let tail = rms(&base.audio[n - sr..], &ext.audio[n - sr..]);
+    let mid = rms(&base.audio, &ext.audio);
+    eprintln!(
+        "[mg] deadonly smoke: {:.1}s slice; base {t_base:.1}s vs ext {t_ext:.1}s (+{:.0}%); run-to-run noise rms {noise_floor:.2e}; head/tail/full diff rms {head:.2e}/{tail:.2e}/{mid:.2e}",
+        (t1 - t0), (t_ext / t_base - 1.0) * 100.0
+    );
+    assert!(mid > noise_floor * 8.0 + 1e-9, "②拼接必须发生(死区计划空=探针或判据退化)");
+    let tol = noise_floor * 8.0 + 1e-9;
+    assert!(head <= tol, "③切片首 1s 窗外超噪声底({head:.2e} > {tol:.2e})——窗外被污染");
+    assert!(tail <= tol, "③切片尾 1s 窗外超噪声底({tail:.2e} > {tol:.2e})——窗外被污染");
+}
+
 /// 目标组(用户点名):同一 UTAI_MG_SLICE 时窗的 MixDown(OpenUtau 渲染源)走**真翻唱管线**
 /// `rvc::run_pipeline` 生产默认口径(RvcOptions::default():index 0.75/protect 0.33/rms_mix 0.25
 /// =装机 cover 节点缺省;e1 A 臂同款调用面,不做 A 臂的归因偏离)——「无参换声」参照臂,

@@ -49,6 +49,12 @@ fn frames_for(ms: f32, fps: f32) -> usize {
     ((ms * fps / 1000.0).round() as usize).max(1)
 }
 
+/// Context each windowed donor slice keeps on BOTH sides of its dead window (S85e). Covers the
+/// pipeline warm-up at slice edges (rmvpe/ContentVec context, RVC t_pad, chunk seams) with the
+/// window interior + 10 ms crossfades sitting deep inside; past ~300 ms edge effects are gone,
+/// so 1.5 s is generous. Cost scales with it linearly — a dead 2% of a song renders as ~15%.
+pub const DONOR_PAD_SECONDS: f32 = 1.5;
+
 /// Lowest / highest MIDI note the range test scans (mirrors RANGE_MIDI_LO/HI in rangeTest.ts).
 pub const DAMAGE_LO_MIDI: usize = 36;
 pub const DAMAGE_SLOTS: usize = 61; // 36..=96
@@ -481,6 +487,43 @@ pub fn dead_group_windows(
         .collect()
 }
 
+/// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
+/// need rendered. `spf` MUST be the same samples-per-frame map the splicer uses
+/// (base.len()/total_frames) so windows land inside their slices; `pad` (samples, from
+/// [`DONOR_PAD_SECONDS`]) is the per-side context; overlapping/adjacent spans merge so no
+/// audio renders twice. The caller renders each span, inverts it, and embeds it at its span
+/// offset in a BASE-SNAPSHOT buffer (not zeros — a slice render can undershoot its span by a
+/// frame-grid remainder, and an end-clamped window would then splice digital zeros; base fill
+/// restores the pre-S85e "short donor keeps base" fallback per sample). The splicer contract
+/// (full-length donor) holds unchanged; windows sit ≥pad inside their span.
+pub fn donor_slice_spans(
+    jobs: &[DeadJob],
+    shift: i64,
+    spf: f64,
+    out_len: usize,
+    pad: usize,
+) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = jobs
+        .iter()
+        .filter(|j| j.shift == shift)
+        .map(|j| {
+            let a = (j.start.max(0) as f64 * spf) as usize;
+            let b = (j.end.max(0) as f64 * spf) as usize;
+            (a.saturating_sub(pad), (b + pad).min(out_len))
+        })
+        .filter(|(a, b)| b > a)
+        .collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some((_, e)) if a <= *e => *e = (*e).max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
 /// Active RMS (50 ms windows above -40 dBFS mean) — the dead-only donor level match. Silence /
 /// no active window ⇒ None (caller skips matching rather than amplifying noise).
 fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
@@ -503,8 +546,11 @@ fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
 /// jobs=(shift, 起帧, 止帧)@任意帧率网格,10ms 余弦交叉淡化(窗短于双淡化时收缩淡化宽度,
 /// 绝不静默丢弃)。
 ///
-/// 电平匹配(审查 S85 major):两渲各自归一/后处理时,拼接窗与邻域可现短语级响度台阶——
-/// donor 先按全曲 active-RMS 比例对齐 base(峰值病理对 RMS 不敏感),±12dB 安全笼。
+/// 电平匹配(审查 S85 major;`match_levels`):**只在两渲各自归一时开**——score 的
+/// render_score_* 每渲各自 peak_normalize(0.92),全曲 active-RMS 比例对齐消归一台阶
+/// (±12dB 安全笼)。cover 管线无逐渲归一,电平差=模型对移调的真实响应,不该被全局
+/// 拉平——且窗口化 donor 的缓冲大半为零,全曲 RMS 对比会拿「死区邻域响度」冒充全曲
+/// (高潮区必偏响 → 误衰减),所以 cover 恒 false。
 /// 帧→样本映射 = base.len()/total_frames 实测每帧样本数(端点精确;SoVITS hop 网格取整的
 /// 累积漂移被线性吸收,RVC 网格下与名义值相等)。
 pub fn apply_dead_only_windows(
@@ -512,6 +558,7 @@ pub fn apply_dead_only_windows(
     sample_rate: u32,
     total_frames: i64,
     jobs: &[DeadJob],
+    match_levels: bool,
     mut donor_render: impl FnMut(i64) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -519,7 +566,7 @@ pub fn apply_dead_only_windows(
     }
     let spf = base.len() as f64 / total_frames as f64;
     let xf = (sample_rate as usize / 100).max(2); // 10 ms
-    let base_rms = active_rms(base, sample_rate);
+    let base_rms = if match_levels { active_rms(base, sample_rate) } else { None };
     let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
     shifts.sort_unstable();
     shifts.dedup();
@@ -766,7 +813,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let mut base = vec![0.5f32; 1_008_000]; // 2100 帧 @48k
         let mut seen = Vec::new();
-        apply_dead_only_windows(&mut base, 48000, 2100, &jobs, |s| {
+        apply_dead_only_windows(&mut base, 48000, 2100, &jobs, false, |s| {
             seen.push(s);
             Ok(vec![0.5f32; 1_008_000])
         })
@@ -797,7 +844,7 @@ mod tests {
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
         let mut calls = 0usize;
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], |s| {
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |s| {
             calls += 1;
             assert_eq!(s, -6);
             Ok(donor.clone())
@@ -819,7 +866,7 @@ mod tests {
         // active-RMS 对齐 base。base 恒 0.5、donor 恒 0.25 ⇒ g=2 ⇒ 窗心 ≈0.5。
         let mut base = vec![0.5f32; 48000];
         let donor = vec![0.25f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |_| Ok(donor.clone()))
             .unwrap();
         assert!((base[(0.3 * 48000.0) as usize] - 0.5).abs() < 1e-3, "donor 缩放到 base 电平");
         assert!((base[0] - 0.5).abs() < 1e-6, "窗外不动");
@@ -830,12 +877,50 @@ mod tests {
         // 1 帧窗收缩淡化宽度仍拿到 donor 内容,绝不静默丢弃(曾静默 continue+审计谎报)。
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 11 }], |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 11 }], true, |_| Ok(donor.clone()))
             .unwrap();
         let mid = (10.5 / 50.0 * 48000.0) as usize;
         assert!(base[mid] > 0.9, "1 帧窗仍拿到 donor 内容(微淡化)");
         assert_eq!(base[0], 0.0);
         assert_eq!(base[48000 / 2], 0.0);
+    }
+
+    #[test]
+    fn dead_only_splice_skips_level_match_for_cover() {
+        // S85e:cover 无逐渲归一,match_levels=false 时 donor 电平原样(模型对移调的
+        // 真实响应)——窗口化 donor 缓冲大半为零,全曲 RMS 对比会误衰减,必须可关。
+        let mut base = vec![0.5f32; 48000];
+        let donor = vec![0.25f32; 48000];
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], false, |_| Ok(donor.clone()))
+            .unwrap();
+        assert!((base[(0.3 * 48000.0) as usize] - 0.25).abs() < 1e-6, "false ⇒ donor 电平不动");
+    }
+
+    // ── S85e 窗口化 donor 切片跨度 ──
+
+    #[test]
+    fn donor_spans_map_pad_and_clamp() {
+        // 帧窗 → 样本跨度 ±pad,曲首/曲尾夹紧;spf 与拼接器同一映射。
+        let jobs = [
+            DeadJob { shift: -6, start: 2, end: 4 },
+            DeadJob { shift: -6, start: 90, end: 100 },
+        ];
+        let spans = donor_slice_spans(&jobs, -6, 480.0, 48000, 2000);
+        assert_eq!(spans, vec![(0, 3920), (41200, 48000)], "首端 0 夹紧、尾端 len 夹紧");
+    }
+
+    #[test]
+    fn donor_spans_merge_neighbours_and_filter_shift() {
+        // 同 shift 补白后重叠的切片合并(绝不重复渲染);异 shift 不掺和。
+        let jobs = [
+            DeadJob { shift: -6, start: 10, end: 12 },
+            DeadJob { shift: -6, start: 14, end: 16 },
+            DeadJob { shift: -2, start: 40, end: 42 },
+        ];
+        let spans = donor_slice_spans(&jobs, -6, 100.0, 100_000, 500);
+        assert_eq!(spans, vec![(500, 2100)], "两窗补白重叠 → 单一合并切片");
+        let spans2 = donor_slice_spans(&jobs, -2, 100.0, 100_000, 500);
+        assert_eq!(spans2, vec![(3500, 4700)]);
     }
 
     #[test]

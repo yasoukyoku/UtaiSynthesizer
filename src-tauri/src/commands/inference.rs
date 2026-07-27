@@ -1918,7 +1918,9 @@ pub async fn render_vocal_segment(
                     let sr = result.sample_rate;
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                    // match_levels=true:render_score_* 每渲各自 peak_normalize(0.92) → 全曲
+                    // active-RMS 对齐消归一台阶(S85 major;cover 无逐渲归一走 false)。
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, true, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -1999,7 +2001,7 @@ pub async fn render_vocal_segment(
                     let sr = result.sample_rate;
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, true, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
