@@ -10,7 +10,7 @@ vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 // isVocalDirty resolves the singer via the voice-model store — mock ONE installed "V" so `entry` is found.
 vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () => ({ models: { sovits: [{ name: "V", path: "p" }] } }) } }));
 
-import { buildVocalScore, isVocalDirty, vocalRenderSig, splitSegmentVocalAware } from "./vocalRender";
+import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, splitSegmentVocalAware } from "./vocalRender";
 import { useProjectStore } from "../../store/project";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note, Track, Segment, ProcessedOutput, VocalTrackParams } from "../../types/project";
@@ -213,5 +213,19 @@ describe("buildVocalScore", () => {
     const flast = withLane.formantEnv[withLane.formantEnv.length - 1]!;
     expect(flast).toBeGreaterThan(5); // scalar 2 + lane rising toward 4 (last frame < note end → < 6)
     expect(flast).toBeLessThan(6 + 1e-6);
+  });
+});
+
+// ── S84 D 刀: a sung note whose span rounds to ZERO 50fps frames must surface in droppedNoteIds
+//    (pre-S84 it vanished silently — the 30t く/ず audit case); the timeline stays conserved
+//    (forcing a minimum frame would break Σframes == frameOf(cursor)). ──
+describe("buildScoreTriples — zero-frame note drop is loud", () => {
+  it("reports the dropped note id, emits no triple for it, conserves the frame timeline", () => {
+    // tempo 222: ticksPerFrame = 35.52. tick 20 → frame 1; tick 50 → frame 1 → zero-span note.
+    const notes = [mkNote("long", 480, 480, 60), mkNote("tiny", 20, 30, 66)];
+    const { triples, tripleNoteIds, droppedNoteIds, frameCount } = buildScoreTriples(notes, 222, "AP", 2);
+    expect(droppedNoteIds).toEqual(["tiny"]);
+    expect(tripleNoteIds).not.toContain("tiny");
+    expect(triples.reduce((s, t) => s + t.frames, 0)).toBe(frameCount);
   });
 });

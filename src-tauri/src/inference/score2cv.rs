@@ -798,7 +798,19 @@ fn assemble_arrays(
         // S83: the vowel test widened from tbl::VOWEL_SET (the 5 JA vowels) to the full nucleus
         // classifier — an EN aɪ / zh final / syllabic n̩ deserves the same floor as a JA vowel.
         for i in 0..phon.len() {
-            if npitch[i] > 0 && is_nucleus_phone(phon[i]) && pdur[i] < VOWEL_MIN_FRAMES {
+            // S84 D 刀: a nucleus-less note's SOLE VOICED phone (ん = [ɴ], the moraic nasal — it
+            // carries the note like a vowel would) gets the same floor: the S84 audit found 17
+            // lone-ɴ notes with no M3 eligibility, drained to 2-3 frames. Voiceless sole phones
+            // (っ = [ʔ]) stay excluded — stretching a glottal closure into a rest lengthens
+            // silence, not song. (A mid-run drained ɴ with no following rest still gets nothing —
+            // same as any drained vowel; only the rest-borrow path exists here.)
+            let sole_voiced_of_event = (i == 0 || pevt[i - 1] != pevt[i])
+                && (i + 1 >= pevt.len() || pevt[i + 1] != pevt[i])
+                && !is_voiceless_phone(phon[i]);
+            if npitch[i] > 0
+                && (is_nucleus_phone(phon[i]) || sole_voiced_of_event)
+                && pdur[i] < VOWEL_MIN_FRAMES
+            {
                 let deficit = VOWEL_MIN_FRAMES - pdur[i];
                 if i + 1 < phon.len() && matches!(phon[i + 1], "SP" | "AP") {
                     let take = deficit.min((pdur[i + 1] - 1).max(0));
@@ -1070,6 +1082,20 @@ mod tests {
         // parity build untouched: split_dur shape, consonant INSIDE the note window.
         let parity = build_arrays(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
         assert_eq!(parity.phone_dur, vec![7, 2, 5, 2, 4], "parity keeps the legacy split_dur shape");
+    }
+
+    // S84 D 刀: a lone moraic-ん note ([ɴ], nucleus-less, VOICED) gets the M3 rest-borrow floor
+    // like a vowel; a lone っ ([ʔ], voiceless) stays excluded (stretching a glottal closure into
+    // a rest = longer silence, not song).
+    #[test]
+    fn m3_floor_covers_lone_hatsuon_but_not_sokuon() {
+        let daw = daw_ja(&[("あ", 60, 10), ("ん", 60, 3), ("R", 0, 10)]).unwrap();
+        assert_eq!(daw.phon, vec!["a", "ɴ", "SP"]);
+        assert_eq!(daw.phone_dur, vec![10, VOWEL_MIN_FRAMES, 10 - (VOWEL_MIN_FRAMES - 3)]);
+        assert_eq!(daw.phone_dur.iter().sum::<i64>(), 23, "frame-conserving");
+        let daw2 = daw_ja(&[("あ", 60, 10), ("っ", 60, 3), ("R", 0, 10)]).unwrap();
+        assert_eq!(daw2.phon, vec!["a", "ʔ", "SP"]);
+        assert_eq!(daw2.phone_dur, vec![10, 3, 10], "voiceless sokuon never borrows the rest");
     }
 
     // S84 A 刀: fr≤5 (tempo-222 160t fast runs) caps every onset target at 2 — the measured 4-5

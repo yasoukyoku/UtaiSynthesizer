@@ -185,7 +185,19 @@ export function buildScoreTriples(
   tempo: number,
   breathToken: string,
   defaultLangId: number,
-): { triples: ScoreTriple[]; tripleNoteIds: (string | null)[]; sorted: Note[]; ticksPerFrame: number; frameCount: number } {
+): {
+  triples: ScoreTriple[];
+  tripleNoteIds: (string | null)[];
+  /** S84 D 刀: sung notes whose frame span rounded to ZERO on the 50fps grid (e.g. a 30t note at
+   *  tempo 222 ≈ 0.85 frames landing inside one frame cell) — they emit NO triple and would have
+   *  vanished SILENTLY (く/ず in the S84 audit). Surfaced so oovWatch can mark them like OOV
+   *  ("this note will not sound"). Forcing a minimum frame instead is FORBIDDEN — it would break
+   *  the absolute-diff frame conservation (Σframes == frameOf(cursor)). */
+  droppedNoteIds: string[];
+  sorted: Note[];
+  ticksPerFrame: number;
+  frameCount: number;
+} {
   const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
   const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
   const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
@@ -196,6 +208,7 @@ export function buildScoreTriples(
 
   const triples: ScoreTriple[] = [];
   const tripleNoteIds: (string | null)[] = [];
+  const droppedNoteIds: string[] = [];
   let cursor = 0; // segment-relative tick covered so far
   for (const n of sorted) {
     const start = Math.max(cursor, n.tick);
@@ -218,10 +231,14 @@ export function buildScoreTriples(
       if (n.phonemeInput) t.phoneme_input = n.phonemeInput;
       triples.push(t);
       tripleNoteIds.push(n.id);
+    } else {
+      // S84 D 刀: the note's span rounds to zero frames → it will NOT sound. Record it loudly
+      // (oovWatch marks it) instead of the pre-S84 silent vanish.
+      droppedNoteIds.push(n.id);
     }
     cursor = end;
   }
-  return { triples, tripleNoteIds, sorted, ticksPerFrame, frameCount: frameOf(cursor) };
+  return { triples, tripleNoteIds, droppedNoteIds, sorted, ticksPerFrame, frameCount: frameOf(cursor) };
 }
 
 /** Sample a segment-relative param curve at each of `frameCount` 50fps frames (`f·ticksPerFrame`), applying

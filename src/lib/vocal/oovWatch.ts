@@ -75,7 +75,7 @@ async function validatePass(): Promise<void> {
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-        const { triples, tripleNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
+        const { triples, tripleNoteIds, droppedNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
         try {
           const classes = await invoke<Array<{ kind: string }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
@@ -91,6 +91,9 @@ async function validatePass(): Promise<void> {
             const id = tripleNoteIds[i];
             if (id && c.kind === "unknown") oov.push(id);
           });
+          // S84 D 刀: notes whose span rounded to ZERO frames will not sound — mark them through
+          // the same channel (the marking's meaning is "this note cannot sing", true for both).
+          oov.push(...droppedNoteIds);
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, oov.length ? oov : null);
         } catch (e) {
