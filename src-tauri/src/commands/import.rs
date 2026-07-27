@@ -992,3 +992,40 @@ voice_parts:
         }
     }
 }
+
+// S84 鹅妈妈快段探针第 1 段(diagnostic #[ignore],NOT a gate):生产 parse_ust → notes JSON,
+// 供 vitest mgScoreDump.test.ts(生产 buildVocalScore)接力。链全景见 score2svc_mg.rs 头注。
+// Run: cargo test --lib commands::import::mg_probe::dump_mg_notes -- --ignored --nocapture
+#[cfg(test)]
+mod mg_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn dump_mg_notes() {
+        let ust = std::env::var("UTAI_MG_UST").unwrap_or_else(|_| {
+            r"D:\MyDev\TESTING\不为人所知的鹅妈妈童谣\アンノウン・マザーグース_miku_main.ust".into()
+        });
+        let out_dir = std::env::var("UTAI_MG_OUT")
+            .unwrap_or_else(|_| r"D:\MyDev\TESTING\不为人所知的鹅妈妈童谣\probe".into());
+        let bytes = std::fs::read(&ust).expect("read ust");
+        let score = parse_ust(&bytes).expect("parse ust");
+        let tr = &score.tracks[0];
+        let notes: Vec<_> = tr
+            .notes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "tick": n.tick, "duration": n.duration, "pitch": n.pitch, "lyric": n.lyric,
+                })
+            })
+            .collect();
+        let j = serde_json::json!({
+            "bpm": score.bpm, "start_tick": tr.start_tick, "n_notes": notes.len(), "notes": notes,
+        });
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let p = std::path::Path::new(&out_dir).join("mg_notes.json");
+        std::fs::write(&p, serde_json::to_string(&j).unwrap()).unwrap();
+        eprintln!("[mg] {} notes (start_tick {}) -> {}", tr.notes.len(), tr.start_tick, p.display());
+    }
+}

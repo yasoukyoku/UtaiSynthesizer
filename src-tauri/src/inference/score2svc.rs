@@ -1059,6 +1059,12 @@ fn peak_normalize(w: &mut [f32], peak: f32) {
 #[path = "score2svc_e1.rs"]
 mod e1_tests;
 
+// S84 鹅妈妈快段探针(diagnostic #[ignore])— 同 e1 姿势挂子模块复用本文件私有件
+// (build_note_hz / zero_voiceless_frames / anchor_voiced_phone_f0 / voiceless_onset_flags)。
+#[cfg(test)]
+#[path = "score2svc_mg.rs"]
+mod mg_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

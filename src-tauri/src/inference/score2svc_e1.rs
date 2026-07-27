@@ -262,8 +262,8 @@ fn sidecar_noise_channels(sc: &serde_json::Value) -> usize {
 }
 
 /// 16-bit wav 落盘(diagnostic 输出;与 tests 模块的 write_wav16 同构——那个是 tests 私有,
-/// 子模块不可见,故本地复制这 10 行)。
-fn write_wav16(path: &Path, samples: &[f32], sr: u32) {
+/// 子模块不可见,故本地复制这 10 行)。pub(super) 供兄弟诊断件 mg_tests 复用(S84)。
+pub(super) fn write_wav16(path: &Path, samples: &[f32], sr: u32) {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: sr,
