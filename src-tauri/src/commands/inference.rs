@@ -1717,11 +1717,12 @@ pub async fn render_vocal_segment(
     if let Some(data_dir) = app.models.models_dir().parent() {
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
-    // S60-2 音域扩展: resolve the governing speaker's tested range and the v1 three-tier
-    // shift. Disabled / no sidecar record / in-range ⇒ 0 ⇒ byte-identical render + no
-    // inverse pass. The renders sing at transpose+shift; the audio is shifted back
-    // (vocal_range::apply_inverse).
-    let range_shift = if options.range_extend {
+    // S60-2 → S85 音域扩展(score):整曲平移废除(三轮耳判「开了不如不开」——救 1.7% 极端音
+    // 却让其余音符各自去赌 per-(音素×落点) 渲染死区 + 随深度增长的往返税;memory S85)。
+    // dead-only:仅含「真死音」(记录 f0 判据连音高都发不出)的休止分界短语,以最小深度渲染到
+    // 最近可唱槽再逆变换回写谱位;其余音符与关扩展逐位一致(输出音高恒=写谱音高,乐谱内容是
+    // 底线)。cover/audition 维持整段优化器不变(无音符结构;S82 耳判过的工况)。
+    let range_windows: Vec<(i64, i64, i64)> = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {
                 crate::inference::dominant_speaker(&options.sovits.spk_mix, options.sovits.speaker_id)
@@ -1732,37 +1733,57 @@ pub async fn render_vocal_segment(
         };
         match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
             Some(r) => {
-                // S81 (A): the score path used to decide from the min/max of the pitch curve and
-                // nothing else — a single overshooting portamento frame transposed the whole
-                // part, and none of the cover path's hygiene (median-5, phantom-run filter,
-                // loudness weighting, the shift cost) applied. Both paths now run THE optimizer.
-                // Grid is the DAW's 50 fps (Σframes), and `loudness_env` is the per-frame lane
-                // on that same grid, so it serves as the energy weight directly.
                 let nn: Vec<i64> = score.iter().map(|n| n.note_num).collect();
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
-                let track = crate::inference::vocal_range::score_frame_hz(
-                    &nn,
-                    &fr,
-                    &f0_cents,
-                    &f0_voiced,
-                    options.transpose,
-                );
-                let energy =
-                    (loudness_env.len() == track.len()).then_some(loudness_env.as_slice());
-                let shift =
-                    crate::inference::vocal_range::piece_range_shift(&track, energy, &r, 50.0);
-                if shift != 0 {
+                let (plan, unfixable) =
+                    crate::inference::vocal_range::dead_only_plan(&nn, options.transpose, &r);
+                // 审计恒打印(S83 承诺):无死音也是一个判决;无解组必须响亮(warn+位置,
+                // 事后取证要「在哪」不只是「几个」——审查 S85)。
+                if plan.is_empty() && unfixable.is_empty() {
                     tracing::info!(
-                        "range-extend: rendering '{}' at {:+} st into comfort [{:.0},{:.0}] (speaker {})",
-                        voice_name, shift, r.comfort.0, r.comfort.1, speaker
+                        "range-extend(score/dead-only): no dead notes for '{}' (usable [{:.0},{:.0}], speaker {}) — rendering untouched",
+                        voice_name, r.usable.0, r.usable.1, speaker
                     );
+                } else {
+                    tracing::info!(
+                        "range-extend(score/dead-only): '{}' — {} dead group(s), {} unfixable (usable [{:.0},{:.0}], speaker {})",
+                        voice_name, plan.len(), unfixable.len(), r.usable.0, r.usable.1, speaker
+                    );
+                    for g in &plan {
+                        let hi = (g.start..=g.end).map(|k| nn[k]).max().unwrap_or(0);
+                        tracing::info!(
+                            "range-extend(score/dead-only):   group notes[{}..={}] (top MIDI {hi}) renders at {:+} st",
+                            g.start, g.end, g.shift
+                        );
+                    }
+                    for &(a, b) in &unfixable {
+                        let hi = (a..=b).map(|k| nn[k]).max().unwrap_or(0);
+                        tracing::warn!(
+                            "range-extend(score/dead-only):   notes[{a}..={b}] (top MIDI {hi}) has NO landing within ±24 st — rendered broken as written"
+                        );
+                    }
                 }
-                shift
+                crate::inference::vocal_range::dead_group_windows(&nn, &fr, &plan)
             }
-            None => 0,
+            None => {
+                // 「没记录所以没做」必须与「做了且无死音」可区分(审查 S85)。
+                tracing::info!(
+                    "range-extend(score/dead-only): '{}' has no usable vocal-range record for speaker {} — extension inactive",
+                    voice_name, speaker
+                );
+                Vec::new()
+            }
         }
     } else {
-        0
+        Vec::new()
+    };
+    // dead-only donor 补渲的进度量纲:base 占 1/(1+K),每个 distinct-shift donor 各占一份
+    // (审查 S85:进度条曾在 100% 停住继续渲 K 遍)。无 donor 时 =1,基线量纲逐位不变。
+    let range_passes = 1 + {
+        let mut s: Vec<i64> = range_windows.iter().map(|w| w.0).collect();
+        s.sort_unstable();
+        s.dedup();
+        s.len()
     };
 
     // own the score notes so the render can borrow them as &[ScoreEvt] inside spawn_blocking.
@@ -1884,11 +1905,31 @@ pub async fn render_vocal_segment(
                 };
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
-                let result = score2svc::render_score_sovits(
+                let base_progress = |p: f32| progress(p / range_passes as f32);
+                let mut result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
                 )
                 .map_err(|e| e.to_string())?;
+                // S85 dead-only: donor 全曲渲染在 range_shift=s(函数内部逆变换回写谱位 +
+                // peak-norm,与 base 同构 = 三轮耳判验证过的拼接口径),短语窗交叉淡化贴回;
+                // 每个 donor 占 1/(1+K) 进度区间(审查 S85)。
+                if !range_windows.is_empty() {
+                    let sr = result.sample_rate;
+                    let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
+                    let pass = std::cell::Cell::new(0usize);
+                    score2svc::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                        pass.set(pass.get() + 1);
+                        let off = pass.get() as f32;
+                        let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
+                        score2svc::render_score_sovits(
+                            &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
+                            VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                        )
+                        .map(|r| r.audio)
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
                 commit_rendered_audio(result, output_path)
             })
             .await
@@ -1947,11 +1988,29 @@ pub async fn render_vocal_segment(
                 };
                 let loud = if loudness_env.is_empty() { None } else { Some(loudness_env.as_slice()) };
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
-                let result = score2svc::render_score_rvc(
+                let base_progress = |p: f32| progress(p / range_passes as f32);
+                let mut result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
                 )
                 .map_err(|e| e.to_string())?;
+                // S85 dead-only(镜像 SoVits 臂,机理注释见彼处)。
+                if !range_windows.is_empty() {
+                    let sr = result.sample_rate;
+                    let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
+                    let pass = std::cell::Cell::new(0usize);
+                    score2svc::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                        pass.set(pass.get() + 1);
+                        let off = pass.get() as f32;
+                        let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
+                        score2svc::render_score_rvc(
+                            &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
+                            consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                        )
+                        .map(|r| r.audio)
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
                 commit_rendered_audio(result, output_path)
             })
             .await

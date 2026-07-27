@@ -69,6 +69,13 @@ pub const DAMAGE_SLOTS: usize = 61; // 36..=96
 /// way into sovits/rvc run_pipeline; a Vec here would cascade through every signature).
 const DAMAGE_MAX: f32 = 3.0;
 
+/// S85 dead-only slot flags (bit set = criterion PASSES at that slot).
+/// f0-axes ONLY, deliberately: the timbre axes misjudged real models in BOTH directions
+/// (chika_v2's fake-healthy top / 东雪莲's low_ratio-killed comfort), while err/voiced
+/// tracked the user's ear on "can it sing here at all" — see memory S85 三轮.
+const SLOT_SINGABLE: u8 = 1 << 0; // usable-grade: err < 100¢ && voiced > 0.5
+const SLOT_LANDING: u8 = 1 << 1; // landing-grade: err ≤ 50¢ && voiced ≥ 0.9
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
     /// MIDI bounds, inclusive.
@@ -84,12 +91,42 @@ pub struct SpeakerRange {
     /// top few that measurably sing badly. A continuous curve lets the optimizer prefer the
     /// genuinely good part of the range instead of "anything not literally rejected".
     pub damage: Option<[u8; DAMAGE_SLOTS]>,
+    /// S85: per-slot f0-axes flags (SLOT_*), MIDI 36..=96, for the score path's dead-only
+    /// plan. `None` = no raw scan — dead_only_plan then falls back to usable/comfort bounds.
+    /// Fixed array keeps the struct `Copy` (same reasoning as `damage`).
+    pub slot_flags: Option<[u8; DAMAGE_SLOTS]>,
 }
 
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
-        Self { usable, comfort, damage: None }
+        Self { usable, comfort, damage: None, slot_flags: None }
+    }
+
+    /// S85 dead-only: can the model produce a pitch AT ALL at this (integer) MIDI slot?
+    /// With a raw scan = the usable-grade f0 criterion per slot (窗外/未测 = false — "never
+    /// tested" must never read as "fine"); bounds-only records fall back to the usable bounds.
+    fn slot_singable(&self, midi: i64) -> bool {
+        match &self.slot_flags {
+            Some(f) => {
+                let slot = midi - DAMAGE_LO_MIDI as i64;
+                (0..DAMAGE_SLOTS as i64).contains(&slot)
+                    && f[slot as usize] & SLOT_SINGABLE != 0
+            }
+            None => (self.usable.0..=self.usable.1).contains(&(midi as f32)),
+        }
+    }
+
+    /// S85 dead-only: is this slot a trustworthy LANDING for a rescued dead note
+    /// (comfort-grade f0: err ≤ 50¢ && voiced ≥ 0.9)? Bounds-only → comfort bounds.
+    fn slot_landing_ok(&self, midi: i64) -> bool {
+        match &self.slot_flags {
+            Some(f) => {
+                let slot = midi - DAMAGE_LO_MIDI as i64;
+                (0..DAMAGE_SLOTS as i64).contains(&slot) && f[slot as usize] & SLOT_LANDING != 0
+            }
+            None => (self.comfort.0..=self.comfort.1).contains(&(midi as f32)),
+        }
     }
 
     /// Damage at a (possibly fractional) MIDI pitch, linearly interpolated between slots.
@@ -215,6 +252,8 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= usable.0 && c.1 <= usable.1)?;
     // S81 (E): fold the raw per-semitone scan into a damage curve. Absent/garbage scan ⇒ None
     // ⇒ every consumer falls back to the pre-S81 ladder (old records keep working untouched).
+    // S85: the same pass derives per-slot f0-axes flags for the score dead-only plan.
+    let mut flags = [0u8; DAMAGE_SLOTS]; // untested slot = no flags = dead & unlandable
     let damage = sp.get("semitones").and_then(|m| m.as_object()).and_then(|m| {
         let mut d = [255u8; DAMAGE_SLOTS]; // untested slot = fully damaged, never "fine"
         let mut seen = 0usize;
@@ -240,11 +279,14 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
             d[slot as usize] = (damage_from_scan(err, voiced, timbre) / DAMAGE_MAX * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
+            flags[slot as usize] = (if err < 100.0 && voiced > 0.5 { SLOT_SINGABLE } else { 0 })
+                | (if err <= 50.0 && voiced >= 0.9 { SLOT_LANDING } else { 0 });
             seen += 1;
         }
         (seen >= 2).then_some(d)
     });
-    Some(SpeakerRange { usable, comfort, damage })
+    let slot_flags = damage.is_some().then_some(flags);
+    Some(SpeakerRange { usable, comfort, damage, slot_flags })
 }
 
 /// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
@@ -378,6 +420,118 @@ pub fn score_frame_hz(
         out.extend(std::iter::repeat(hz).take(len));
     }
     out
+}
+
+/// S85 dead-only plan for the SCORE path (三轮耳判定案 — memory S85).
+///
+/// The whole-piece shift is structurally wrong for the score path: it moves EVERY note off its
+/// written pitch to rescue the few that are broken, and both the render (per-音素×落点 craters)
+/// and the shift+inverse round trip (audible tax growing with |shift|) charge for ALL of it —
+/// the user's ear verdict was "开了不如不开" at every tested depth beyond -1, while the
+/// dead-only arms passed. So: rest-delimited phrases containing at least one DEAD note (the
+/// model cannot produce a pitch there at all — f0-axes verdict, see slot_singable) get the
+/// minimal |shift| that lands every dead note on a landing-grade slot; every other note in the
+/// piece stays at its written pitch, bit-identical to extension-off. The sung OUTPUT pitch is
+/// always the written pitch (donor renders shifted, the inverse undoes it — 乐谱内容是底线).
+///
+/// Direction: dead-above-usable phrases move down, dead-below move up; a phrase dead on both
+/// sides (or dead strictly inside the range — direction ambiguous) is unfixable by translation
+/// and is skipped, as is one with no landing within ±MAX_RANGE_SHIFT (caller logs). A dragged
+/// healthy note must stay singable after the shift — rescuing の85 must not push う73 into a
+/// crater.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeadGroup {
+    /// Score triple indices, inclusive — the rest-delimited phrase.
+    pub start: usize,
+    pub end: usize,
+    /// Semitones the phrase RENDERS at (negative = down); the inverse undoes it.
+    pub shift: i64,
+}
+
+/// Returns `(plan, unfixable)` — `unfixable` carries the (start, end) triple range of every
+/// dead-containing phrase with NO landing (dead on both sides, or nothing within
+/// ±MAX_RANGE_SHIFT); the caller logs each LOUDLY so a skipped broken climax never reads as
+/// "handled" (审查 S85: positions, not just a count — cover 侧富审计的对等物).
+pub fn dead_only_plan(
+    note_nums: &[i64],
+    transpose: i64,
+    range: &SpeakerRange,
+) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
+    let eff = |n: i64| (n + transpose).clamp(1, 127); // mirror transpose_note_pitch's clamp
+    let mut out = Vec::new();
+    let mut unfixable = Vec::new();
+    let mut i = 0usize;
+    while i < note_nums.len() {
+        if note_nums[i] <= 0 {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < note_nums.len() && note_nums[j + 1] > 0 {
+            j += 1;
+        }
+        let sung: Vec<i64> = (i..=j).map(|k| eff(note_nums[k])).collect();
+        let dead: Vec<i64> = sung.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
+        if !dead.is_empty() {
+            let above = dead.iter().any(|&p| p as f32 > range.usable.1);
+            let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
+            // Candidate order: single-sided dead searches its own direction by growing |s|;
+            // INTERIOR dead (a bridged-weak slot inside usable — a legal record form the write
+            // side produces on purpose, rangeTest.ts longestRun) has no inherent direction and
+            // tries both, down first at each magnitude. Dead on BOTH sides is untranslatable.
+            let candidates: Vec<i64> = if above && below {
+                Vec::new()
+            } else if above {
+                (1..=MAX_RANGE_SHIFT).map(|m| -m).collect()
+            } else if below {
+                (1..=MAX_RANGE_SHIFT).collect()
+            } else {
+                (1..=MAX_RANGE_SHIFT).flat_map(|m| [-m, m]).collect()
+            };
+            let found = candidates.into_iter().find(|&s| {
+                dead.iter().all(|&p| range.slot_landing_ok(p + s))
+                    && sung.iter().all(|&p| range.slot_singable(p + s))
+            });
+            match found {
+                Some(shift) => out.push(DeadGroup { start: i, end: j, shift }),
+                None => unfixable.push((i, j)),
+            }
+        }
+        i = j + 1;
+    }
+    (out, unfixable)
+}
+
+/// S85: dead-group 短语窗(50fps 帧域)——短语区间的帧窗向两侧休止扩展(pre ≤4 帧吃借帧
+/// 辅音、post ≤2 帧吃释放,各以半个间隙为上限=与相邻唱段/拼接窗永不重叠)。返回
+/// (shift, 起帧, 止帧);采样换算与交叉淡化在音频域(score2svc::apply_dead_only_windows)。
+pub fn dead_group_windows(
+    note_nums: &[i64],
+    frames: &[i64],
+    plan: &[DeadGroup],
+) -> Vec<(i64, i64, i64)> {
+    let mut cum = Vec::with_capacity(frames.len() + 1);
+    let mut acc = 0i64;
+    cum.push(0);
+    for &f in frames {
+        acc += f.max(0);
+        cum.push(acc);
+    }
+    plan.iter()
+        .map(|g| {
+            let mut k = g.start;
+            while k > 0 && note_nums[k - 1] <= 0 {
+                k -= 1;
+            }
+            let gap_prev = cum[g.start] - cum[k];
+            let mut k = g.end + 1;
+            while k < note_nums.len() && note_nums[k] <= 0 {
+                k += 1;
+            }
+            let gap_next = cum[k] - cum[g.end + 1];
+            (g.shift, cum[g.start] - 4.min(gap_prev / 2), cum[g.end + 1] + 2.min(gap_next / 2))
+        })
+        .collect()
 }
 
 /// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer;
@@ -774,6 +928,107 @@ mod tests {
         let mut config: ModelConfig = serde_json::from_str("{}").unwrap();
         config.extra = serde_json::json!({ "vocal_range": { "speakers": { "0": sp } } });
         config
+    }
+
+    // ── S85 dead-only plan(三轮耳判定案的钉子;memory S85)──
+
+    /// 真实东雪莲 sidecar 的缩影:36..=79 f0 健康(err 1-3/voiced 1),80 半浊(0.67),
+    /// 81 近死(0.19),82+ 全死;comfort 被 low_ratio 门砍到 52 —— 三轮的核心教训是
+    /// f0 判据贴耳朵、comfort/timbre 判据两个方向都骗人,dead-only 必须只信前者。
+    fn dxl_like() -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=79i64 {
+            semis.insert(m.to_string(), serde_json::json!([2, 1.0]));
+        }
+        semis.insert("80".into(), serde_json::json!([1, 0.67]));
+        semis.insert("81".into(), serde_json::json!([6, 0.19]));
+        for m in 82..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0]));
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 80], "comfort": [36, 52], "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dead_only_rescues_the_climax_note_minimally() {
+        // のう(85,73) between rests: 85 dead → minimal landing 79(80 半浊不合格)⇒ -6;
+        // 前面的健康 73 短语原位不动 —— 用户耳判通过的 t23 臂逐字。
+        let nn = [0, 73, 73, 0, 85, 73, 0];
+        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        assert!(unfix.is_empty());
+        assert_eq!(plan, vec![DeadGroup { start: 4, end: 5, shift: -6 }]);
+    }
+
+    #[test]
+    fn dead_only_ignores_out_of_comfort_but_singable_material() {
+        // 三轮核心:comfort [36,52] 说 64-78 全「越界」,但 f0 判据说能唱 → 一律原位。
+        // (二轮 per-note 把整段搬走 = 用户判「灾难」的那台机器,这里钉死不再回来。)
+        let nn = [0, 64, 66, 0, 73, 78, 0];
+        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        assert!(plan.is_empty() && unfix.is_empty());
+    }
+
+    #[test]
+    fn dead_only_transpose_folds_into_the_verdict() {
+        let nn = [0, 73, 0]; // written 73 + transpose 12 = 85 → 同款 -6 救援
+        let (plan, _) = dead_only_plan(&nn, 12, &dxl_like());
+        assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
+    }
+
+    #[test]
+    fn dead_only_dragged_neighbours_must_stay_singable() {
+        // 短语 [85, 40]:-6 把 40 拖到 34(窗外=死)→ 无解,必须响亮计数而非静默跳过。
+        let nn = [0, 85, 40, 0];
+        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        assert!(plan.is_empty());
+        assert_eq!(unfix, vec![(1, 2)], "无解组带位置(审查 S85:取证要「在哪」)");
+    }
+
+    #[test]
+    fn dead_only_bounds_record_falls_back_to_bounds() {
+        // 无扫描旧记录:dead=出 usable,落点=进 comfort。88→79 = -9;40→52 = +12。
+        let r = SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0));
+        let (plan, unfix) = dead_only_plan(&[0, 88, 0], 0, &r);
+        assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -9 }]);
+        assert!(unfix.is_empty());
+        let (plan, _) = dead_only_plan(&[0, 40, 0], 0, &r);
+        assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: 12 }]);
+    }
+
+    #[test]
+    fn dead_only_interior_bridged_weak_slot_rescues_both_ways() {
+        // 写侧 longestRun 桥接会把 usable 界内的孤立弱槽留在记录里(合法形态,审查 S85):
+        // 78 死于 usable [36,80] 内部 → 无固有方向 → 双向按幅度搜索,-1 落 77 即救。
+        let mut semis = serde_json::Map::new();
+        for m in 36..=80i64 {
+            semis.insert(m.to_string(), serde_json::json!([2, 1.0]));
+        }
+        semis.insert("78".into(), serde_json::json!([9999, 0.0]));
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 80], "comfort": [36, 80],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap();
+        let (plan, unfix) = dead_only_plan(&[0, 78, 0], 0, &r);
+        assert!(unfix.is_empty());
+        assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -1 }]);
+    }
+
+    #[test]
+    fn dead_group_windows_extend_into_rests_without_overlap() {
+        // cum=[0,5,9,19,32,37,45];前间隙 9 帧→pre=4,后间隙 5 帧→post=2(半间隙封顶)。
+        let nn = [0, 0, 73, 85, 0, 73];
+        let fr = [5i64, 4, 10, 13, 5, 8];
+        let plan = [DeadGroup { start: 2, end: 3, shift: -6 }];
+        assert_eq!(dead_group_windows(&nn, &fr, &plan), vec![(-6, 5, 34)]);
     }
 
     #[test]

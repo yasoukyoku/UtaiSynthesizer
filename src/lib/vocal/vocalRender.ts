@@ -379,8 +379,13 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  inverse engine) MUST bump this AND the matching literal in
  *  commands/audition.rs::audition_cache_tag. s82 = Signalsmith 1.3.2 native-formant inverse;
  *  s83 = quiet-damage capped at 1.0 (a loudness-tilted scale no longer freezes the optimizer
- *  at 0 while an unsingable climax stays broken — the chika_v2 case). */
-export const RANGE_ALGO_VERSION = "s83";
+ *  at 0 while an unsingable climax stays broken — the chika_v2 case);
+ *  s85 = SCORE path switched to dead-only (whole-piece shift abolished — only rest-delimited
+ *  phrases containing truly-dead notes render at a minimal local shift + inverse; everything
+ *  else stays at written pitch; memory S85 三轮耳判). Score-decision-layer change only, so the
+ *  audition tag deliberately does NOT bump (S84 lesson: it covers the COVER-pipeline audition;
+ *  cover/audition decision + inverse are untouched here). */
+export const RANGE_ALGO_VERSION = "s85";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
