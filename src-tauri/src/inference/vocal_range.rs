@@ -374,15 +374,28 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
 /// 退役,只有模型「连音高都发不出」的**持续**区域被局部救援;深度由该区域自己的最小落点
 /// 决定(真需要 -24 就 -24——只染那一段,不再有整曲代价权衡)。
 ///
+/// One dead-only splice job: render a donor at `shift` and paste frames `[start, end)` back.
+/// ★命名字段而非裸元组(S85d 实机翻车纪念:两个生产者曾用不同元组顺序,拼接器把帧号 7512
+/// 当移调渲了 donor——「+7512 st」进了日志。编译器从此守约。)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeadJob {
+    /// Semitones the donor RENDERS at (negative = down); the inverse undoes it.
+    pub shift: i64,
+    /// Window start, in probe frames (inclusive).
+    pub start: i64,
+    /// Window end, in probe frames (exclusive).
+    pub end: i64,
+}
+
 /// `f0_hz` = 整段探测 f0(**未 pad 网格、含用户移调**=模型将要唱的音高,与输出时间轴对齐)。
 /// 区域在原始帧号上构建:GAP_TOL_MS 桥接高潮内的清辅音/换气微隙;浊死帧数 ≥ MIN_VIOLATION_MS
 /// 起判(S62b 幻影岛铁律:rmvpe 倍频误读绝不触发染色)。区内被拖拽的浊帧必须保持 singable。
-/// 返回 `(Vec<(起帧, 止帧exclusive, shift)>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
+/// 返回 `(Vec<DeadJob>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
 pub fn cover_dead_plan(
     f0_hz: &[f32],
     fps: f32,
     range: &SpeakerRange,
-) -> (Vec<(i64, i64, i64)>, Vec<(i64, i64)>) {
+) -> (Vec<DeadJob>, Vec<(i64, i64)>) {
     let min_run = frames_for(MIN_VIOLATION_MS, fps);
     let gap_tol = frames_for(GAP_TOL_MS, fps) + 1;
     let mut idx: Vec<usize> = Vec::new();
@@ -425,7 +438,7 @@ pub fn cover_dead_plan(
         let dead: Vec<i64> =
             pitches.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
         match minimal_rescue_shift(&dead, &pitches, range) {
-            Some(s) => out.push((a as i64, (b + 1) as i64, s)),
+            Some(s) => out.push(DeadJob { shift: s, start: a as i64, end: (b + 1) as i64 }),
             None => unfixable.push((a as i64, (b + 1) as i64)),
         }
     }
@@ -433,13 +446,13 @@ pub fn cover_dead_plan(
 }
 
 /// S85: dead-group 短语窗(50fps 帧域)——短语区间的帧窗向两侧休止扩展(pre ≤4 帧吃借帧
-/// 辅音、post ≤2 帧吃释放,各以半个间隙为上限=与相邻唱段/拼接窗永不重叠)。返回
-/// (shift, 起帧, 止帧);采样换算与交叉淡化在音频域(本文件 apply_dead_only_windows)。
+/// 辅音、post ≤2 帧吃释放,各以半个间隙为上限=与相邻唱段/拼接窗永不重叠)。
+/// 采样换算与交叉淡化在音频域(本文件 apply_dead_only_windows)。
 pub fn dead_group_windows(
     note_nums: &[i64],
     frames: &[i64],
     plan: &[DeadGroup],
-) -> Vec<(i64, i64, i64)> {
+) -> Vec<DeadJob> {
     let mut cum = Vec::with_capacity(frames.len() + 1);
     let mut acc = 0i64;
     cum.push(0);
@@ -459,7 +472,11 @@ pub fn dead_group_windows(
                 k += 1;
             }
             let gap_next = cum[k] - cum[g.end + 1];
-            (g.shift, cum[g.start] - 4.min(gap_prev / 2), cum[g.end + 1] + 2.min(gap_next / 2))
+            DeadJob {
+                shift: g.shift,
+                start: cum[g.start] - 4.min(gap_prev / 2),
+                end: cum[g.end + 1] + 2.min(gap_next / 2),
+            }
         })
         .collect()
 }
@@ -494,7 +511,7 @@ pub fn apply_dead_only_windows(
     base: &mut [f32],
     sample_rate: u32,
     total_frames: i64,
-    jobs: &[(i64, i64, i64)],
+    jobs: &[DeadJob],
     mut donor_render: impl FnMut(i64) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -503,7 +520,7 @@ pub fn apply_dead_only_windows(
     let spf = base.len() as f64 / total_frames as f64;
     let xf = (sample_rate as usize / 100).max(2); // 10 ms
     let base_rms = active_rms(base, sample_rate);
-    let mut shifts: Vec<i64> = jobs.iter().map(|j| j.0).collect();
+    let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
     shifts.sort_unstable();
     shifts.dedup();
     for s in shifts {
@@ -522,7 +539,8 @@ pub fn apply_dead_only_windows(
             }
         }
         let n = base.len().min(donor.len());
-        for &(_, fa, fb) in jobs.iter().filter(|j| j.0 == s) {
+        for j in jobs.iter().filter(|j| j.shift == s) {
+            let (fa, fb) = (j.start, j.end);
             let a = ((fa.max(0) as f64 * spf) as usize).min(n);
             let b = ((fb.max(0) as f64 * spf) as usize).min(n);
             // 窗短于双淡化 → 收缩淡化宽度;完全空窗才放弃,响亮。
@@ -700,7 +718,7 @@ mod tests {
         f0.extend(vec![hz(88.0); 100]);
         let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
         assert!(unfix.is_empty());
-        assert_eq!(jobs, vec![(2000, 2100, -9)]);
+        assert_eq!(jobs, vec![DeadJob { shift: -9, start: 2000, end: 2100 }]);
     }
 
     #[test]
@@ -710,7 +728,7 @@ mod tests {
         let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
         assert!(unfix.is_empty());
         assert_eq!(jobs.len(), 1);
-        let (a, b, s) = jobs[0];
+        let DeadJob { shift: s, start: a, end: b } = jobs[0];
         assert_eq!((a, b), (0, 3000));
         assert_eq!(s, 22, "30 → comfort 底 52 = +22,bounds 落点语义");
     }
@@ -724,8 +742,8 @@ mod tests {
         f0.extend(vec![hz(88.0); 40]);
         let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
         assert_eq!(jobs.len(), 1, "one bridged region, not two");
-        assert_eq!(jobs[0].0, 1000);
-        assert_eq!(jobs[0].1, 1082);
+        assert_eq!(jobs[0].start, 1000);
+        assert_eq!(jobs[0].end, 1082);
     }
 
     #[test]
@@ -736,6 +754,24 @@ mod tests {
         let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
         assert!(jobs.is_empty());
         assert_eq!(unfix, vec![(0, 60)], "无解区域带位置(审查 S85d:取证要「在哪」)");
+    }
+
+    #[test]
+    fn cover_plan_jobs_feed_the_splicer_with_shifts_not_frames() {
+        // S85d 实机翻车的钉子:两个生产者曾用不同元组顺序,拼接器把死区起始帧(7512)当
+        // 移调渲 donor(日志「+7512 st」,被 S82 FFI 守卫响亮拦截)。计划→拼接直连断言。
+        let mut f0 = vec![hz(60.0); 2000];
+        f0.extend(vec![hz(88.0); 100]);
+        let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
+        assert_eq!(jobs.len(), 1);
+        let mut base = vec![0.5f32; 1_008_000]; // 2100 帧 @48k
+        let mut seen = Vec::new();
+        apply_dead_only_windows(&mut base, 48000, 2100, &jobs, |s| {
+            seen.push(s);
+            Ok(vec![0.5f32; 1_008_000])
+        })
+        .unwrap();
+        assert_eq!(seen, vec![-9], "donor 闭包收到的必须是移调半音,绝不是帧号");
     }
 
     #[test]
@@ -761,7 +797,7 @@ mod tests {
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
         let mut calls = 0usize;
-        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 20)], |s| {
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], |s| {
             calls += 1;
             assert_eq!(s, -6);
             Ok(donor.clone())
@@ -783,7 +819,7 @@ mod tests {
         // active-RMS 对齐 base。base 恒 0.5、donor 恒 0.25 ⇒ g=2 ⇒ 窗心 ≈0.5。
         let mut base = vec![0.5f32; 48000];
         let donor = vec![0.25f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 20)], |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], |_| Ok(donor.clone()))
             .unwrap();
         assert!((base[(0.3 * 48000.0) as usize] - 0.5).abs() < 1e-3, "donor 缩放到 base 电平");
         assert!((base[0] - 0.5).abs() < 1e-6, "窗外不动");
@@ -794,7 +830,7 @@ mod tests {
         // 1 帧窗收缩淡化宽度仍拿到 donor 内容,绝不静默丢弃(曾静默 continue+审计谎报)。
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 11)], |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 11 }], |_| Ok(donor.clone()))
             .unwrap();
         let mid = (10.5 / 50.0 * 48000.0) as usize;
         assert!(base[mid] > 0.9, "1 帧窗仍拿到 donor 内容(微淡化)");
@@ -924,7 +960,7 @@ mod tests {
         let nn = [0, 0, 73, 85, 0, 73];
         let fr = [5i64, 4, 10, 13, 5, 8];
         let plan = [DeadGroup { start: 2, end: 3, shift: -6 }];
-        assert_eq!(dead_group_windows(&nn, &fr, &plan), vec![(-6, 5, 34)]);
+        assert_eq!(dead_group_windows(&nn, &fr, &plan), vec![DeadJob { shift: -6, start: 5, end: 34 }]);
     }
 
     #[test]

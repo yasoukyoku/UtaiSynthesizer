@@ -1722,7 +1722,7 @@ pub async fn render_vocal_segment(
     // dead-only:仅含「真死音」(记录 f0 判据连音高都发不出)的休止分界短语,以最小深度渲染到
     // 最近可唱槽再逆变换回写谱位;其余音符与关扩展逐位一致(输出音高恒=写谱音高,乐谱内容是
     // 底线)。cover/audition 维持整段优化器不变(无音符结构;S82 耳判过的工况)。
-    let range_windows: Vec<(i64, i64, i64)> = if options.range_extend {
+    let range_windows: Vec<crate::inference::vocal_range::DeadJob> = if options.range_extend {
         let speaker = match backend_type {
             VoiceBackendType::SoVits => {
                 crate::inference::dominant_speaker(&options.sovits.spk_mix, options.sovits.speaker_id)
@@ -1780,7 +1780,7 @@ pub async fn render_vocal_segment(
     // dead-only donor 补渲的进度量纲:base 占 1/(1+K),每个 distinct-shift donor 各占一份
     // (审查 S85:进度条曾在 100% 停住继续渲 K 遍)。无 donor 时 =1,基线量纲逐位不变。
     let range_passes = 1 + {
-        let mut s: Vec<i64> = range_windows.iter().map(|w| w.0).collect();
+        let mut s: Vec<i64> = range_windows.iter().map(|w| w.shift).collect();
         s.sort_unstable();
         s.dedup();
         s.len()

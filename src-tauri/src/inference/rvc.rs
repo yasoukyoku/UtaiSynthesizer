@@ -289,7 +289,7 @@ pub fn run_pipeline(
     // 死区 donor 在装配+后处理完成后以 run_pipeline 自递归渲染(与 base 全链同构)。
     let out_frames = audio_f.len() / WINDOW;
     let pad_f = t_pad / WINDOW;
-    let range_jobs: Vec<(i64, i64, i64)> = match &range {
+    let range_jobs: Vec<super::vocal_range::DeadJob> = match &range {
         Some(r) => {
             let pf_out = &pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())];
             let (jobs, unfixable) = super::vocal_range::cover_dead_plan(pf_out, 100.0, r);
@@ -304,10 +304,10 @@ pub fn run_pipeline(
                     "range-extend(cover/rvc, dead-only): {} dead region(s), {} unfixable (usable [{:.0},{:.0}])",
                     jobs.len(), unfixable.len(), r.usable.0, r.usable.1
                 );
-                for &(a, b, s) in &jobs {
+                for j in &jobs {
                     tracing::info!(
-                        "range-extend(cover/rvc, dead-only):   region {:.2}s..{:.2}s renders at {s:+} st",
-                        a as f32 / 100.0, b as f32 / 100.0
+                        "range-extend(cover/rvc, dead-only):   region {:.2}s..{:.2}s renders at {:+} st",
+                        j.start as f32 / 100.0, j.end as f32 / 100.0, j.shift
                     );
                 }
                 for &(a, b) in &unfixable {
@@ -397,7 +397,7 @@ pub fn run_pipeline(
         let pf_out: Vec<f32> =
             pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())].to_vec();
         let k_total = {
-            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.0).collect();
+            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.shift).collect();
             s.sort_unstable();
             s.dedup();
             s.len().max(1)

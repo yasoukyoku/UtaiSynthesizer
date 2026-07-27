@@ -775,8 +775,13 @@ fn mg_cover_range_replay() {
     for &(a, b) in &unfixable {
         eprintln!("[mg]   UNFIXABLE region {:.2}s..{:.2}s", a as f32 / 100.0, b as f32 / 100.0);
     }
-    for &(a, b, s) in &jobs {
-        eprintln!("[mg]   region {:.2}s..{:.2}s -> {s:+} st", a as f32 / 100.0, b as f32 / 100.0);
+    for j in &jobs {
+        eprintln!(
+            "[mg]   region {:.2}s..{:.2}s -> {:+} st",
+            j.start as f32 / 100.0,
+            j.end as f32 / 100.0,
+            j.shift
+        );
     }
 }
 

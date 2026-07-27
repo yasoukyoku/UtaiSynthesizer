@@ -188,7 +188,7 @@ pub fn run_pipeline(
     // 拼接器。探针 f0(未 pad 100fps、含用户 f0_shift=模型将唱的音高)只在 armed 时付一次
     // whole-signal rmvpe(S67b chunk-bounded)。auto_f0 REPLACES the fed f0 inside
     // decode_features → 死区 donor 既不会被唱也无逆变换引导 → 扩展禁用(原守卫保留)。
-    let (range_jobs, probe_f0): (Vec<(i64, i64, i64)>, Vec<f32>) = match &range {
+    let (range_jobs, probe_f0): (Vec<super::vocal_range::DeadJob>, Vec<f32>) = match &range {
         Some(r) if m.f0_predictor_session.is_none() => {
             let wav16k = resample(&mono.samples, native_sr, super::f0::RMVPE_SR);
             let f0 = super::f0::rmvpe_detect_chunked(
@@ -212,10 +212,10 @@ pub fn run_pipeline(
                     "range-extend(cover/sovits, dead-only): {} dead region(s), {} unfixable (usable [{:.0},{:.0}])",
                     jobs.len(), unfixable.len(), r.usable.0, r.usable.1
                 );
-                for &(a, b, s) in &jobs {
+                for j in &jobs {
                     tracing::info!(
-                        "range-extend(cover/sovits, dead-only):   region {:.2}s..{:.2}s renders at {s:+} st",
-                        a as f32 / 100.0, b as f32 / 100.0
+                        "range-extend(cover/sovits, dead-only):   region {:.2}s..{:.2}s renders at {:+} st",
+                        j.start as f32 / 100.0, j.end as f32 / 100.0, j.shift
                     );
                 }
                 for &(a, b) in &unfixable {
@@ -324,7 +324,7 @@ pub fn run_pipeline(
         // (审查 S85d:曲尾窗早开 ~1 帧)。
         let total_frames = (probe_f0.len() as i64 - 1).max(1);
         let k_total = {
-            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.0).collect();
+            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.shift).collect();
             s.sort_unstable();
             s.dedup();
             s.len().max(1)
