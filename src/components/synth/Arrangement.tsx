@@ -166,6 +166,7 @@ export function Arrangement() {
   // ② S58 OOV verdicts — a draw dep (in the useCallback dep list + the staticKey) so the async verdict
   // arriving AFTER the notes edit still re-bakes the static layer with the segment badge.
   const vocalOov = useAppStore((s) => s.vocalOov);
+  const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: dropped notes share the badge
   // S60 MIDI-extraction jobs — a draw dep (per-frame overlay + rAF-loop predicate); progress %
   // is read from the module map each frame (no store churn), only the SET membership lives here.
   const midiExtracting = useAppStore((s) => s.midiExtracting);
@@ -1681,7 +1682,7 @@ export function Arrangement() {
         // o.loading: a lane turning ready flips the main row original-waveform → lane-sum switch.
         // ② S58: the OOV badge is baked into the static layer, so its state must key the re-bake (the
         // verdict lives in the app store — async, arrives AFTER the notes edit that keyed notesSig).
-        const oovCount = vocalOov[s.id]?.length ?? 0;
+        const oovCount = (vocalOov[s.id]?.length ?? 0) + (vocalDropped[s.id]?.length ?? 0);
         // S59: the detected grid + stretch factor + loudness envelope are baked into the static
         // layer — without these terms detect/×2/÷2/nudge/clear, a stretch change, or an envelope
         // point edit would not repaint (the S50 static-cache-key lesson: every content kind needs
@@ -1849,7 +1850,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, midiExtracting, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, midiExtracting, t]);
 
   drawRef.current = draw;
 
@@ -2101,7 +2102,11 @@ function drawStaticContent(
       // per-note red marks live in the vocal editor, this flags the segment from the arrangement).
       // getState() is safe here: the COMPONENT subscribes vocalOov and keys the static re-bake on it
       // (staticKey oovCount + the draw useCallback dep), so this read is always fresh at bake time.
-      if ((useAppStore.getState().vocalOov[seg.id]?.length ?? 0) > 0) {
+      if (
+        (useAppStore.getState().vocalOov[seg.id]?.length ?? 0) +
+          (useAppStore.getState().vocalDropped[seg.id]?.length ?? 0) >
+        0
+      ) {
         const bx = sx + sw - 9;
         ctx.fillStyle = "#f87171";
         ctx.beginPath();

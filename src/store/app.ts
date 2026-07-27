@@ -118,6 +118,11 @@ interface AppState {
    *  §9.5 single Rust classifier, so this ALWAYS equals what the render would reject). Drives the red
    *  note marking (VocalEditor), the segment badge (Arrangement) and the track header warning (TrackList). */
   vocalOov: Record<string, string[]>;
+  /** S85b: notes whose span rounds to ZERO 50fps frames (S84 D 刀 dropped notes) — same red
+   *  marking as OOV (both = "will not sound") but a SEPARATE map so the track-header text can
+   *  tell the truth: these are too-short notes, not unrecognized lyrics(用户实机反馈:合并
+   *  通道让「音符过短」穿了「歌词 OOV」的文案)。 */
+  vocalDropped: Record<string, string[]>;
   /** S60 GAME MIDI extraction in flight — key = `${segmentId}:${group}` (lane group), value =
    *  the job context. Drives the lane-row "extracting" indicator (Arrangement per-frame overlay),
    *  the menu-item double-trigger guard, and the undo-cancels-extraction interceptor. Runtime-only. */
@@ -172,6 +177,8 @@ interface AppState {
   /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
    *  verdicts don't re-render subscribers). Written ONLY by the oovWatch validation watcher. */
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
+  /** S85b: publish one segment's dropped-note verdict(语义同 setVocalOov,写者同为 oovWatch)。 */
+  setVocalDropped: (segmentId: string, noteIds: string[] | null) => void;
   /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
@@ -191,6 +198,23 @@ export type BannerKind = "undo" | "redo" | "save" | "load" | "info";
 
 /** Monotonic toast id (Date.now() collides within one millisecond — see showToast). */
 let toastSeq = 0;
+
+/** S85b: shared merge/no-op semantics for the per-segment verdict maps (vocalOov / vocalDropped).
+ *  Returns the next map, or null when the verdict is identical (identical verdicts must not
+ *  re-render every canvas subscriber on each revalidation — the S58 no-op guard, single source). */
+function verdictMapUpdate(
+  map: Record<string, string[]>,
+  segmentId: string,
+  noteIds: string[] | null,
+): Record<string, string[]> | null {
+  const cur = map[segmentId];
+  if (noteIds === null && cur === undefined) return null;
+  if (noteIds !== null && cur !== undefined && cur.length === noteIds.length && cur.every((v, i) => v === noteIds[i])) return null;
+  const next = { ...map };
+  if (noteIds === null) delete next[segmentId];
+  else next[segmentId] = noteIds;
+  return next;
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   trainingPageOpen: false,
@@ -219,6 +243,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vocalRenderActive: false,
   renderingVocalTrackId: null,
   vocalOov: {},
+  vocalDropped: {},
   midiExtracting: {},
   toasts: [],
   banner: null,
@@ -308,14 +333,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   setRenderingVocalTrackId: (id) => set({ renderingVocalTrackId: id }),
   setVocalOov: (segmentId, noteIds) =>
     set((s) => {
-      const cur = s.vocalOov[segmentId];
-      // no-op guard: identical verdicts must not re-render every canvas subscriber on each revalidation
-      if (noteIds === null && cur === undefined) return {};
-      if (noteIds !== null && cur !== undefined && cur.length === noteIds.length && cur.every((v, i) => v === noteIds[i])) return {};
-      const next = { ...s.vocalOov };
-      if (noteIds === null) delete next[segmentId];
-      else next[segmentId] = noteIds;
-      return { vocalOov: next };
+      const next = verdictMapUpdate(s.vocalOov, segmentId, noteIds);
+      return next ? { vocalOov: next } : {};
+    }),
+  setVocalDropped: (segmentId, noteIds) =>
+    set((s) => {
+      const next = verdictMapUpdate(s.vocalDropped, segmentId, noteIds);
+      return next ? { vocalDropped: next } : {};
     }),
   setMidiExtracting: (key, v) =>
     set((s) => {

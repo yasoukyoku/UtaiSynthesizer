@@ -207,6 +207,7 @@ export function TrackList({ width }: Props) {
   const voiceModels = useVoiceModelStore((s) => s.models);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const vocalOov = useAppStore((s) => s.vocalOov); // ② S58 track-level OOV warning
+  const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: too-short dropped notes(独立文案)
 
   const menuItems: MenuItem[] = (() => {
     if (!menu) return [];
@@ -358,6 +359,7 @@ export function TrackList({ width }: Props) {
             }}
             onOpenLangMenu={(x, y) => setMenu({ kind: "lang", trackId: track.id, x, y })}
             hasOov={track.segments.some((sg) => (vocalOov[sg.id]?.length ?? 0) > 0)}
+            hasDropped={track.segments.some((sg) => (vocalDropped[sg.id]?.length ?? 0) > 0)}
           />
           </Fragment>
         ))}
@@ -421,6 +423,8 @@ interface TrackItemProps {
   onOpenLangMenu: (x: number, y: number) => void;
   /** ② S58: some segment on this track has OOV lyrics → header warning badge. */
   hasOov: boolean;
+  /** S85b: some note rounded to zero frames(过短被跳过)→ same badge, truthful tooltip. */
+  hasDropped: boolean;
 }
 
 function TrackItem({
@@ -447,6 +451,7 @@ function TrackItem({
   onOpenVoiceMenu,
   onOpenLangMenu,
   hasOov,
+  hasDropped,
 }: TrackItemProps) {
   const { t } = useTranslation();
   const colorVar = trackTypeCssVar(track.trackType);
@@ -552,9 +557,16 @@ function TrackItem({
               </span>
             )}
             {/* ② S58 OOV warning — some note on this track can't be sung in its language (ACE-style
-                track-level flag; the segment badge + red notes point at the exact spot). */}
-            {hasOov && (
-              <span className="track-oov-badge" title={t("tracks.oovWarning")}>
+                track-level flag; the segment badge + red notes point at the exact spot). S85b: the
+                dropped-note verdict shares the badge but keeps its OWN line of tooltip text — a
+                too-short note is not a lyric problem and must not read as one(用户实机反馈). */}
+            {(hasOov || hasDropped) && (
+              <span
+                className="track-oov-badge"
+                title={[hasOov ? t("tracks.oovWarning") : null, hasDropped ? t("tracks.droppedWarning") : null]
+                  .filter(Boolean)
+                  .join("\n")}
+              >
                 <svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M12 3 2 21h20L12 3zm-1 7h2v6h-2v-6zm0 7h2v2h-2v-2z" /></svg>
               </span>
             )}

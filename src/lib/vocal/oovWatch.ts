@@ -72,6 +72,7 @@ async function validatePass(): Promise<void> {
         if (seg.content.notes.length === 0) {
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, null);
+          app.setVocalDropped(seg.id, null);
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
@@ -91,11 +92,12 @@ async function validatePass(): Promise<void> {
             const id = tripleNoteIds[i];
             if (id && c.kind === "unknown") oov.push(id);
           });
-          // S84 D 刀: notes whose span rounded to ZERO frames will not sound — mark them through
-          // the same channel (the marking's meaning is "this note cannot sing", true for both).
-          oov.push(...droppedNoteIds);
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, oov.length ? oov : null);
+          // S84 D 刀 → S85b: notes whose span rounded to ZERO frames will not sound — same red
+          // marking (both = "this note cannot sing") but a SEPARATE map, so the track header can
+          // say "note too short" instead of falsely claiming a lyric OOV(用户实机反馈)。
+          app.setVocalDropped(seg.id, droppedNoteIds.length ? droppedNoteIds : null);
         } catch (e) {
           console.warn("[oovWatch] validate_lyrics failed:", e);
           validated.set(seg.id, stamp); // don't hot-loop on a persistent backend error
@@ -107,6 +109,7 @@ async function validatePass(): Promise<void> {
       if (!live.has(id)) {
         validated.delete(id);
         app.setVocalOov(id, null);
+        app.setVocalDropped(id, null);
       }
     }
     lastTracks = st.tracks;

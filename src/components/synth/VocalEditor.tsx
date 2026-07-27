@@ -174,8 +174,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // ② S58 OOV verdicts for THIS segment (async, from the oovWatch watcher) — ref-synced for the draw
   // closure; the dedicated redraw effect below re-invokes it when the verdict changes.
   const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
+  // S85b: dropped-to-zero-frames notes share the red marking (both = "will not sound") — union here.
+  const droppedIds = useAppStore((s) => s.vocalDropped[segmentId]);
   const oovRef = useRef<Set<string>>(new Set());
-  oovRef.current = new Set(oovIds ?? []);
+  oovRef.current = new Set([...(oovIds ?? []), ...(droppedIds ?? [])]);
   // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
   // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
   const userTunedIds = useMemo(() => {
@@ -914,7 +916,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
-  useEffect(() => { requestRedraw(); }, [oovIds, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, requestRedraw]);
   // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
   // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
   // invalidation path. S83 review #7.)

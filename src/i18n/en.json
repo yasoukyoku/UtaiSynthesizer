@@ -206,7 +206,8 @@
     "pickSinger": "Pick a singer (whole track)",
     "language": "Track default language",
     "noVoices": "No singer models available — import one in the Resource Manager first",
-    "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language"
+    "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language",
+    "droppedWarning": "Some notes are shorter than one frame (~20 ms) and cannot sound — lengthen or delete them (marked red)"
   },
   "langs": {
     "zh": "Chinese",
