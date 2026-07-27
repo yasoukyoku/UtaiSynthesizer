@@ -620,6 +620,7 @@ pub fn render_score_sovits(
     options: &SovitsOptions,
     flat_vol: f32,
     consonant_emphasis_db: f32,
+    consonant_valley_scale: f32,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -657,6 +658,13 @@ pub fn render_score_sovits(
         10f32.powf(consonant_emphasis_db.min(12.0) / 20.0)
     } else {
         1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
+    };
+    // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
+    let valley_depths = boundary_valley_depths(&arr);
+    let valley_scale = if consonant_valley_scale.is_finite() && consonant_valley_scale > 0.0 {
+        consonant_valley_scale.min(2.0)
+    } else {
+        0.0
     };
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
@@ -706,6 +714,11 @@ pub fn render_score_sovits(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
+        if valley_scale > 0.0 {
+            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
+            apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+        }
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -778,6 +791,7 @@ pub fn render_score_rvc(
     dicts: &dyn g2p::DictSource,
     options: &RvcOptions,
     consonant_emphasis_db: f32,
+    consonant_valley_scale: f32,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -807,6 +821,13 @@ pub fn render_score_rvc(
     } else {
         1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
     };
+    // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
+    let valley_depths = boundary_valley_depths(&arr);
+    let valley_scale = if consonant_valley_scale.is_finite() && consonant_valley_scale > 0.0 {
+        consonant_valley_scale.min(2.0)
+    } else {
+        0.0
+    };
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
     // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
@@ -835,6 +856,11 @@ pub fn render_score_rvc(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
+        if valley_scale > 0.0 {
+            let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
+            apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+        }
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
         }
@@ -952,6 +978,149 @@ fn apply_emphasis(audio: &mut [f32], windows: &[(usize, usize)], gain: f32, fade
             let edge = (i - s).min(e - 1 - i) as f32;
             let g = 1.0 + (gain - 1.0) * (edge / fade).min(1.0);
             audio[i] *= g;
+        }
+    }
+}
+
+// ─── S84 C 刀: chain-internal consonant VALLEY (fast-run 粘连 root-cause #4) ───
+//
+// Measured (S84, 116 fast-run boundaries, OpenUtau reference vs our render): real singing carves an
+// energy valley at EVERY syllable boundary — stops ~36 dB deep, nasals ~17, taps ~14 — while our
+// render leaves voiced-consonant boundaries nearly flat (3.3 dB group median vs 15.5) and 2-frame
+// voiceless windows barely notch. f0 stays CONTINUOUS through these closures in real singing (the
+// zero-fraction knife is honest about voicing), so the missing valley is an ENERGY fact the f0/uv
+// stream cannot express — an output-domain gain valley is the honest treatment (rest-gate 近亲).
+// Depths below are the MEASURED mix−render gap per consonant class (not the full real-singing
+// depth — the render already notches partially), so scale 1.0 statistically lands the render on the
+// reference; the offline twin of this stage (probe shapedA) was ear-validated by the user (S84).
+// Codas are excluded (same 顿挫 guard as the emphasis knife); post-rest onsets are excluded (the
+// rest itself is the valley). User knob = VocalTrackParams.consonantValley (scale ×depth, 0 = off
+// bit-exact); this DEFAULT is what no-context paths (audition) use.
+pub const DEFAULT_CONSONANT_VALLEY_SCALE: f32 = 1.0;
+/// S84 anchors: per-class (mix − render) valley-depth gap in dB. Unmeasured classes get judgment
+/// values in-family (laterals ride the nasal anchor: same "voiced continuous with mild dip" family).
+fn valley_depth_db(p: &str) -> f32 {
+    match p.chars().next() {
+        // stops + affricates (ts/tɕ/dʑ/ɟʝ start with their stop half) + glottal ʔ + palatal c/ɟ
+        // (JA きゃ/ぎゃ rows emit bare c/ɟ — S84 review caught ɟ falling to the fricative default)
+        Some('p' | 't' | 'k' | 'b' | 'd' | 'ɡ' | 'c' | 'ɟ' | 'q' | 'ʈ' | 'ʔ') => 11.7,
+        // nasals + laterals (incl. dark/retroflex ɫ/ɭ): the "voiced continuous with mild dip" family
+        Some('m' | 'n' | 'ɲ' | 'ŋ' | 'ɴ' | 'l' | 'ʎ' | 'ɫ' | 'ɭ') => 11.4,
+        Some('ɾ' | 'ɽ' | 'r') => 10.4,
+        Some('s' | 'ʃ' | 'ɕ' | 'ʂ' | 'ç' | 'x' | 'h' | 'ɸ' | 'θ' | 'f' | 'z' | 'ʒ' | 'β' | 'ð'
+            | 'v' | 'ʁ' | 'ɣ' | 'ɦ' | 'ʑ' | 'ʐ' | 'ʝ') => 5.1,
+        // approximants/glides: barely a dip in real singing (measured 1.4 for w/j; ɹ/ɻ/ɰ ride along)
+        Some('w' | 'j' | 'ɥ' | 'ɹ' | 'ɻ' | 'ɰ') => 1.4,
+        _ => 5.1, // unclassified consonant: conservative fricative-level dip (exhaustiveness-pinned: 0 today)
+    }
+}
+
+/// Per-phone valley depth (dB; 0.0 = untouched): consonant phones BEFORE the source event's last
+/// nucleus (onsets + medials — voiced AND voiceless, unlike the emphasis flags), but only when the
+/// boundary is CHAIN-INTERNAL — the emitted phone immediately before the consonant cluster belongs
+/// to a SUNG event. After SP/AP (or at score start) the rest itself is the valley and the natural
+/// release/attack must stay untouched (the offline twin skipped those too). Codas never flag
+/// (词尾顿挫 guard, same as `voiceless_onset_flags`); run key = `arr.evt` (S83 review: pitch-group
+/// anchoring misflags repeated-pitch runs).
+fn boundary_valley_depths(arr: &ScoreArrays) -> Vec<f32> {
+    let n = arr.phon.len();
+    let mut depths = vec![0.0f32; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && arr.evt[j + 1] == arr.evt[i] {
+            j += 1;
+        }
+        if arr.note_pitch[i] > 0 {
+            if let Some(last_nuc) = (i..=j).rev().find(|&x| super::score2cv::is_nucleus_phone(arr.phon[x])) {
+                for x in i..last_nuc {
+                    if super::score2cv::is_nucleus_phone(arr.phon[x]) {
+                        continue; // medial vowels (più's i) and devoiced vowels are nuclei-like, not closures
+                    }
+                    // chain-internal test on the phone right before THIS consonant's CLUSTER: walk
+                    // back over same-event non-nucleus mates (NOT over flag state — a post-rest
+                    // cluster's skipped first member must not launder its later members into
+                    // "chain-internal"). c0 > i ⇒ a medial cluster after a nucleus in the SAME
+                    // event = chain-internal by construction; c0 == i ⇒ the event-leading cluster:
+                    // look at the previous event's last emitted phone (SP/AP ⇒ the rest IS the
+                    // valley; a sung phone — vowel or a hummed ɴ — ⇒ chain-internal).
+                    let mut c0 = x;
+                    while c0 > i && !super::score2cv::is_nucleus_phone(arr.phon[c0 - 1]) {
+                        c0 -= 1;
+                    }
+                    let chain_internal = if c0 > i {
+                        true
+                    } else {
+                        c0 > 0 && !matches!(arr.phon[c0 - 1], "SP" | "AP")
+                    };
+                    if chain_internal {
+                        depths[x] = valley_depth_db(arr.phon[x]);
+                    }
+                }
+            }
+        }
+        i = j + 1;
+    }
+    depths
+}
+
+/// Chunk-relative CLUSTERS of contiguous depth>0 phones, each member keeping its OWN class depth.
+/// One cluster = one closure gesture: apply_valley ramps only at the cluster's outer edges and
+/// blends depth ACROSS internal junctions — per-phone windows would ramp a gain BUMP back to unity
+/// at the junction (the valley-polarity twin of the S83 emphasis review bug), while a single
+/// max-depth window would over-carve the shallower member (an EN [k w] cluster must not sink the
+/// 1.4 dB glide to the stop's 11.7 — S84 review, per-class calibration is the stage's contract).
+fn chunk_valley_clusters(chunk: &Chunk, out_len: usize, depths: &[f32]) -> Vec<Vec<(usize, usize, f32)>> {
+    let t = chunk.t.max(1);
+    let mut clusters: Vec<Vec<(usize, usize, f32)>> = Vec::new();
+    let mut cursor: i64 = 0;
+    for (i, &d) in chunk.phone_dur.iter().enumerate() {
+        let d = d.max(0);
+        let depth = depths.get(i).copied().unwrap_or(0.0);
+        if d > 0 && depth > 0.0 {
+            let s = (cursor as f64 / t as f64 * out_len as f64).round() as usize;
+            let e = ((((cursor + d) as f64) / t as f64) * out_len as f64).round() as usize;
+            let e = e.min(out_len);
+            if e > s {
+                match clusters.last_mut() {
+                    Some(cl) if cl.last().map(|w| w.1) == Some(s) => cl.push((s, e, depth)),
+                    _ => clusters.push(vec![(s, e, depth)]),
+                }
+            }
+        }
+        cursor += d;
+    }
+    clusters
+}
+
+/// Trapezoid ATTENUATION per CLUSTER: each sample's target depth = its owning member's class depth,
+/// linearly blended (dB domain) across internal junctions over `fade` samples centered on the
+/// junction (no step-click, no unity bump), then scaled by the cluster-outer edge ramp (0→plateau
+/// over `fade`). `scale` multiplies depth in the dB domain.
+fn apply_valley(audio: &mut [f32], clusters: &[Vec<(usize, usize, f32)>], scale: f32, fade: usize) {
+    let fade_f = fade.max(1) as f32;
+    let half = (fade.max(1) / 2).max(1);
+    for cl in clusters {
+        let Some(&(s0, ..)) = cl.first() else { continue };
+        let Some(&(.., e1, _)) = cl.last() else { continue };
+        let e1 = e1.min(audio.len());
+        for (wi, &(s, e, depth)) in cl.iter().enumerate() {
+            let e = e.min(audio.len());
+            for i in s..e {
+                let mut d = depth;
+                if wi > 0 && (i - s) < half {
+                    // leading half of the junction blend zone: prev depth → own depth
+                    let w = 0.5 + (i - s) as f32 / fade_f;
+                    d = cl[wi - 1].2 * (1.0 - w) + depth * w;
+                } else if wi + 1 < cl.len() && (e - 1 - i) < half {
+                    // trailing half: own depth → next depth
+                    let w = 0.5 + (e - 1 - i) as f32 / fade_f;
+                    d = cl[wi + 1].2 * (1.0 - w) + depth * w;
+                }
+                let edge = (i - s0).min(e1.saturating_sub(1 + i)) as f32;
+                let ramp = (edge / fade_f).min(1.0);
+                audio[i] *= 10f32.powf(-(d * scale * ramp) / 20.0);
+            }
         }
     }
 }
@@ -1182,6 +1351,160 @@ mod tests {
         assert!((a[20] - 1.0).abs() < 0.11, "edge starts near unity");
         assert_eq!(a[40], 2.0, "plateau at gain");
         assert!((a[79] - 1.0).abs() < 0.11, "far edge back near unity");
+    }
+
+    // ── S84 C 刀: chain-internal consonant valley ──
+
+    #[test]
+    fn boundary_valley_chain_classes_and_exclusions() {
+        // R か が ろ: post-rest k excluded (the rest IS the valley); chain-internal ɡ = stop
+        // depth, ɾ = tap depth — VOICED consonants valley too (that's the whole point: the
+        // measured render hole is 3.3 vs 15.5 dB precisely on voiced boundaries).
+        let arr = daw_ja(&[("R", 0, 10), ("か", 60, 10), ("が", 62, 10), ("ろ", 62, 10)]);
+        let d = boundary_valley_depths(&arr);
+        let k = arr.phon.iter().position(|&p| p == "k").unwrap();
+        let g = arr.phon.iter().position(|&p| p == "ɡ").unwrap();
+        let r = arr.phon.iter().position(|&p| p == "ɾ").unwrap();
+        assert_eq!(d[k], 0.0, "post-rest onset never valleys");
+        assert!((d[g] - 11.7).abs() < 1e-6, "chain-internal voiced stop valleys at stop depth");
+        assert!((d[r] - 10.4).abs() < 1e-6, "tap valleys at tap depth");
+        assert!(
+            arr.phon.iter().zip(&d).all(|(&p, &v)| v == 0.0 || !super::super::score2cv::is_nucleus_phone(p)),
+            "nuclei never valley"
+        );
+        // refined on one note after a sung あ: leading ɹ = approximant (tiny), medial f =
+        // fricative depth (2nd-syllable boundary), coda n/d = NEVER (词尾顿挫 guard).
+        let refined = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
+            phoneme_input: Some("ɹ ə f aɪ n d"),
+        };
+        let arr2 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), refined], &NoDicts).unwrap();
+        let d2 = boundary_valley_depths(&arr2);
+        let ri = arr2.phon.iter().position(|&p| p == "ɹ").unwrap();
+        let fi = arr2.phon.iter().position(|&p| p == "f").unwrap();
+        let ni = arr2.phon.iter().position(|&p| p == "n").unwrap();
+        let di = arr2.phon.iter().position(|&p| p == "d").unwrap();
+        assert!((d2[ri] - 1.4).abs() < 1e-6, "chain-internal ɹ = approximant depth");
+        assert!((d2[fi] - 5.1).abs() < 1e-6, "medial f = fricative depth");
+        assert_eq!(d2[ni], 0.0, "coda n never valleys");
+        assert_eq!(d2[di], 0.0, "coda d never valleys");
+        // lone ん ([ɴ], no nucleus): nothing flags — ducking a whole musical note would be wrong.
+        let arr3 = daw_ja(&[("あ", 60, 10), ("ん", 60, 10)]);
+        let d3 = boundary_valley_depths(&arr3);
+        assert!(d3.iter().all(|&v| v == 0.0), "nucleus-less ん note stays untouched: {d3:?}");
+        // post-rest CLUSTER: neither member valleys — the skipped first member must not launder
+        // the later ones into "chain-internal" (the walk-back is over same-event non-nucleus
+        // mates, not over flag state).
+        let sta = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
+            phoneme_input: Some("s t a"),
+        };
+        let arr4 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), sta], &NoDicts).unwrap();
+        let d4 = boundary_valley_depths(&arr4);
+        let si = arr4.phon.iter().position(|&p| p == "s").unwrap();
+        let ti = arr4.phon.iter().position(|&p| p == "t").unwrap();
+        assert_eq!(d4[si], 0.0, "post-rest cluster head never valleys");
+        assert_eq!(d4[ti], 0.0, "post-rest cluster TAIL never valleys either (no laundering)");
+        // …and the same cluster chain-internally (after a sung あ) valleys both members.
+        let sta2 = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
+            phoneme_input: Some("s t a"),
+        };
+        let arr5 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), sta2], &NoDicts).unwrap();
+        let d5 = boundary_valley_depths(&arr5);
+        let si5 = arr5.phon.iter().position(|&p| p == "s").unwrap();
+        let ti5 = arr5.phon.iter().position(|&p| p == "t").unwrap();
+        assert!((d5[si5] - 5.1).abs() < 1e-6, "chain-internal cluster head valleys (fric)");
+        assert!((d5[ti5] - 11.7).abs() < 1e-6, "chain-internal cluster tail valleys (stop)");
+    }
+
+    // S84 review: the sibling classifiers (is_voiceless/is_nucleus) are exhaustiveness-pinned;
+    // valley_depth_db was not, and ɟ/ɫ/ɭ/ɰ silently fell to the wildcard arm. Walk ALL 210 vocab
+    // tokens: every consonant must land in a known class value, per-class counts are pinned so a
+    // vocab regen (or a new IPA base char) forces a re-audit instead of a silent misroute.
+    #[test]
+    fn valley_depth_classification_is_exhaustive_and_stable() {
+        use super::super::score2cv_tables::PHONE_TO_ID;
+        use std::collections::HashMap;
+        // spot anchors, both polarities of the S84 review fix:
+        for (p, want) in [
+            ("ɟ", 11.7f32), ("c", 11.7), ("ts", 11.7), ("dʑ", 11.7), ("ʔ", 11.7),
+            ("ɫ", 11.4), ("ɭ", 11.4), ("l", 11.4), ("ɴ", 11.4),
+            ("ɾ", 10.4), ("r", 10.4),
+            ("s", 5.1), ("ç", 5.1), ("ʁ", 5.1),
+            ("ɰ", 1.4), ("w", 1.4), ("ɹ", 1.4),
+        ] {
+            assert!((valley_depth_db(p) - want).abs() < 1e-6, "{p} must be {want}");
+        }
+        let mut counts: HashMap<i32, usize> = HashMap::new();
+        let mut total = 0usize;
+        for (p, _) in PHONE_TO_ID.iter() {
+            if matches!(*p, "SP" | "AP" | "PAD" | "BOS" | "EOS")
+                || super::super::score2cv::is_nucleus_phone(p)
+            {
+                continue;
+            }
+            total += 1;
+            let d = valley_depth_db(p);
+            *counts.entry((d * 10.0).round() as i32).or_default() += 1;
+        }
+        assert_eq!(total, 129, "consonant token count drifted — vocab regen? re-audit the classes");
+        let n = |k: i32| counts.get(&k).copied().unwrap_or(0);
+        assert_eq!(
+            (n(117), n(114), n(104), n(51), n(14)),
+            (58, 19, 5, 40, 7),
+            "per-class counts drifted (stop/nasal-lateral/tap/fric/glide) — re-audit valley_depth_db: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn valley_clusters_keep_member_depths() {
+        // two contiguous flagged phones (an onset cluster) → ONE cluster, each member keeping its
+        // OWN class depth (S84 review: a single max-depth window over-carved mixed clusters — an
+        // EN [k w] must not sink the 1.4 dB glide to the stop's 11.7).
+        let chunk = Chunk {
+            start: 0,
+            end: 4,
+            phonemes: vec![10, 11, 12, 13],
+            note_pitch: vec![60; 4],
+            phone_dur: vec![50, 25, 25, 100],
+            note_dur: vec![50, 25, 25, 100],
+            note_to_phone: vec![0, 1, 2, 3],
+            t: 200,
+            lang_id: 2,
+            hard_seam: false,
+        };
+        let cls = chunk_valley_clusters(&chunk, 2000, &[0.0, 11.7, 10.4, 0.0]);
+        assert_eq!(cls, vec![vec![(500, 750, 11.7), (750, 1000, 10.4)]]);
+        // a gap (unflagged phone) splits clusters:
+        let cls2 = chunk_valley_clusters(&chunk, 2000, &[11.7, 0.0, 10.4, 0.0]);
+        assert_eq!(cls2, vec![vec![(0, 500, 11.7)], vec![(750, 1000, 10.4)]]);
+    }
+
+    #[test]
+    fn apply_valley_shape_scale_junction_and_outside() {
+        let mut a = vec![1.0f32; 300];
+        apply_valley(&mut a, &[vec![(20, 120, 20.0)]], 1.0, 10);
+        assert_eq!(a[19], 1.0, "outside untouched");
+        assert!((a[20] - 1.0).abs() < 0.11, "edge starts near unity");
+        assert!((a[60] - 0.1).abs() < 1e-3, "plateau at −20 dB");
+        assert!((a[119] - 1.0).abs() < 0.11, "far edge back near unity");
+        // scale halves the dB depth (not the linear gain): −10 dB plateau.
+        let mut b = vec![1.0f32; 300];
+        apply_valley(&mut b, &[vec![(20, 120, 20.0)]], 0.5, 10);
+        assert!((b[60] - 10f32.powf(-0.5)).abs() < 1e-3, "scale is in dB domain");
+        // mixed-depth cluster: each member plateaus at its OWN depth; the junction crossfades in
+        // the dB domain (≈ −15 dB at the boundary) with NO unity bump anywhere inside the cluster.
+        let mut c = vec![1.0f32; 300];
+        apply_valley(&mut c, &[vec![(20, 120, 20.0), (120, 220, 10.0)]], 1.0, 10);
+        assert!((c[60] - 0.1).abs() < 1e-3, "member 1 plateaus at its own −20 dB");
+        assert!((c[170] - 10f32.powf(-0.5)).abs() < 1e-3, "member 2 plateaus at its own −10 dB");
+        let j = c[120];
+        assert!(j > 0.1 && j < 10f32.powf(-0.5), "junction blends between the two depths, got {j}");
+        assert!(
+            c[31..210].iter().all(|&g| g < 0.75),
+            "no unity bump inside the cluster (min plateau −10 dB, outer fade zones excluded)"
+        );
     }
 
     #[test]
@@ -1618,16 +1941,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -1636,7 +1959,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

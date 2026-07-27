@@ -611,6 +611,8 @@
       "formantTip": "Track-wide formant shift (semitones), added on top of the bottom formant lane. Higher = brighter/younger, lower = darker/fuller; 0 = no change.",
       "consonant": "Consonant",
       "consonantTip": "Output gain on voiceless onsets (s/k/t…): higher = crisper articulation. 0 = off; default 2.5 dB.",
+      "consonantValley": "Articulation",
+      "consonantValleyTip": "Energy valley at syllable boundaries (voiced consonants too — r/m/n rows): real singing dips between every syllable, most audibly in fast runs. Higher = more separated syllables. 0 = off; default 1×.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",

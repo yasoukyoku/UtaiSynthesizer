@@ -34,6 +34,9 @@ export const DEFAULT_TRANSITION = { offsetMs: 0, durLeftMs: 100, durRightMs: 70,
  *  Mirrors Rust score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB — the wire default for old payloads
  *  and the model-audition path. 0 = off (exact no-op render-side). */
 export const DEFAULT_CONSONANT_EMPHASIS_DB = 2.5;
+/** S84 C 刀: default chain-internal consonant-valley scale (×measured per-class depth — the fast-run
+ *  粘连 treatment). Mirrors Rust score2svc::DEFAULT_CONSONANT_VALLEY_SCALE. 0 = off (exact no-op). */
+export const DEFAULT_CONSONANT_VALLEY = 1;
 /** 纯阶梯覆盖(全 0 = 无滑音/无起收):S73 ustx 烤入 part 的音符显式置它——OU 的全部音高
  *  动态已在 pitchDev 曲线里,任何默认滑音再叠加=双重。显式 0 ≠ 继承(normalizeTransition 保留)。 */
 export const ZERO_TRANSITION = { offsetMs: 0, durLeftMs: 0, durRightMs: 0, depthLeftCents: 0, depthRightCents: 0, openEdgeCents: 0 } as const;
@@ -261,6 +264,8 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     autoTuneTake: clampInt(p.autoTuneTake ?? NaN, 0, 99, 0),
     // S83 knife 6b: consonant strength knob (dB on voiceless onsets; 0 = off).
     consonantEmphasis: clampNum(p.consonantEmphasis ?? NaN, 0, 12, DEFAULT_CONSONANT_EMPHASIS_DB),
+    // S84 C 刀: consonant-valley scale knob (×per-class depth on chain-internal boundaries; 0 = off).
+    consonantValley: clampNum(p.consonantValley ?? NaN, 0, 2, DEFAULT_CONSONANT_VALLEY),
   };
 }
 

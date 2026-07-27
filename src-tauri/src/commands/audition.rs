@@ -297,6 +297,12 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
 /// change — otherwise a fixed decision keeps serving audio rendered under the old one and
 /// reads as "the fix did nothing" (S81 audit). ENGINE changes count too: s82 = the Signalsmith
 /// 1.3.2 native-formant inverse replacing the 1.1.1 + external-warp one.
+/// ★★ SCOPE (S84 review lesson — a wrong bump was reverted here): this tag names ONLY the
+/// COVER-pipeline audition wavs (the fixed clip through rvc/sovits::run_pipeline + the range
+/// inverse). Score-render stages (score2svc.rs — emphasis, the S84 consonant valley, …) never
+/// execute on these paths, so they must NOT bump this tag; the one score-rendered audition
+/// (render_candidate_scale) is deliberately uncached. Bump only for changes that alter the
+/// cover audition pipeline's actual output.
 fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
     match range {
         None => String::new(),
@@ -1331,6 +1337,7 @@ pub async fn render_candidate_scale(
                 crate::inference::score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
                     crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
+                    crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
                     0, 0, None, None, None, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?
@@ -1372,6 +1379,7 @@ pub async fn render_candidate_scale(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
                     crate::commands::inference::VOCAL_FLAT_VOL,
                     crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
+                    crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
                     0, 0, None, None, None,
                     &cancel, &progress,
                 )

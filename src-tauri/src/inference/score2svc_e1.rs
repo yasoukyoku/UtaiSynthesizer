@@ -66,8 +66,8 @@ enum CvSrc<'a> {
 }
 /// f0 流来源:参数化 Option-A(生产整形:build_note_hz + zero_voiceless_frames +
 /// anchor_voiced_phone_f0——S83 起与生产同步,借帧浊声母不落 0;⚠生产主循环的输出域
-/// 后处理 rest-gate/清音强调 emphasis 不在 B/C 镜像臂,且 D/K 臂 emphasis 显式置 0——
-/// 流归因纯度优先,判读时勿把这两级当流差异)或
+/// 后处理 rest-gate/清音强调 emphasis/辅音谷 valley(S84 C 刀)不在 B/C 镜像臂,且 D/K 臂
+/// emphasis 与 valley 均显式置 0——流归因纯度优先,判读时勿把这三级当流差异)或
 /// 天然 RMVPE(100fps Hz,0=无声——真实 voicing,不再叠加谱面清音归零)。
 enum F0Src<'a> {
     Param(&'a VocalF0<'a>),
@@ -492,7 +492,7 @@ fn e1_cross_probe() {
                 let t0 = Instant::now();
                 let r = render_score_sovits(
                     &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
-                    0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0, 0,
+                    0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, 0, 0,
                     Some(&vf0), None, None, &no_cancel, &noop,
                 )
                 .unwrap();
@@ -514,7 +514,7 @@ fn e1_cross_probe() {
                     let t0 = Instant::now();
                     let r = render_score_sovits(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
-                        0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0, 0,
+                        0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, 0, 0,
                         Some(vk), None, None, &no_cancel, &noop,
                     )
                     .unwrap();
@@ -589,7 +589,7 @@ fn e1_cross_probe() {
             if enabled(&arms_filter, "D") && !exists(&arm("D_s2cv_paramF0")) {
                 let t0 = Instant::now();
                 let r = render_score_rvc(
-                    &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0, 0, Some(&vf0), None,
+                    &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, 0, 0, Some(&vf0), None,
                     None, &no_cancel, &noop,
                 )
                 .unwrap();
@@ -608,7 +608,7 @@ fn e1_cross_probe() {
                 if enabled(&arms_filter, "K") && !exists(&arm(&karm)) {
                     let t0 = Instant::now();
                     let r = render_score_rvc(
-                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0, 0, Some(vk),
+                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, 0, 0, Some(vk),
                         None, None, &no_cancel, &noop,
                     )
                     .unwrap();

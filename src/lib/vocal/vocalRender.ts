@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
-import { isBreathLyric, DEFAULT_CONSONANT_EMPHASIS_DB } from "../vocalNotes";
+import { isBreathLyric, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../vocalNotes";
 import { DEFAULT_LANG_ID, effLangId } from "./languages";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
@@ -127,6 +127,8 @@ export interface VocalRenderOptions {
   range_extend: boolean;
   /** S83 knife 6b: voiceless-onset emphasis (dB; 0 = off; SynthV "consonant strength" analogue). */
   consonant_emphasis_db: number;
+  /** S84 C 刀: chain-internal consonant-valley scale (×measured per-class depth; 0 = off). */
+  consonant_valley: number;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -465,6 +467,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       // S60-2: absent = ON (no-op until the model carries a vocal_range record)
       range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
       consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
+      consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },

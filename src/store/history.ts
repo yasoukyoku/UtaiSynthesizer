@@ -12,7 +12,7 @@ import {
   nextSnapshotSeq,
   resolveDetachAncestor,
 } from "../lib/audio/laneOps";
-import { DEFAULT_CONSONANT_EMPHASIS_DB } from "../lib/vocalNotes";
+import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../lib/vocalNotes";
 import type { Track, Segment, SegmentContent, LaneControl, Note, PitchCurve, VocalTrackParams } from "../types/project";
 
 // ── HMR safety (DEV ONLY — a no-op in the production build) ──
@@ -160,7 +160,8 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   // S83 knife 6b: the consonant-emphasis knob enters the sig ONLY off-default (fold-the-default —
   // absent≡2.5 must hash identically to the pre-knob string, else every existing bake goes dirty).
   const ce = (p.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB) !== DEFAULT_CONSONANT_EMPHASIS_DB ? `|ce:${p.consonantEmphasis}` : "";
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}`;
+  const cvl = (p.consonantValley ?? DEFAULT_CONSONANT_VALLEY) !== DEFAULT_CONSONANT_VALLEY ? `|cvl:${p.consonantValley}` : "";
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

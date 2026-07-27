@@ -298,6 +298,12 @@ export interface VocalTrackParams {
    *  no-op); absent = DEFAULT_CONSONANT_EMPHASIS_DB (2.5). The default folds OUT of the render sig so
    *  pre-knob bakes stay clean. */
   consonantEmphasis?: number;
+  /** S84 C 刀: chain-internal consonant-valley scale (×measured per-class depth) — an output-domain
+   *  gain valley on syllable-boundary consonant windows (voiced AND voiceless; codas + post-rest
+   *  onsets excluded), restoring the per-syllable energy alternation real singing has (fast-run 粘连
+   *  treatment). 0 = off (exact no-op); absent = DEFAULT_CONSONANT_VALLEY (1). Folds out of the
+   *  render sig at default so pre-knob bakes stay clean. */
+  consonantValley?: number;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (Signalsmith inverse; needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
    *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in

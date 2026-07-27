@@ -191,22 +191,27 @@ fn mg_render_rvc() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| RvcOptions::default().protect);
+    let valley: f32 = std::env::var("UTAI_MG_VALLEY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONSONANT_VALLEY_SCALE);
     let ropts = RvcOptions { seed: 0, index_ratio: idx_ratio, protect, ..Default::default() };
     let no_cancel = || false;
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, 0, 0,
+        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, 0, 0,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
     let tag = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         if emph != DEFAULT_VOICELESS_ONSET_EMPHASIS_DB { format!("_e{emph}") } else { String::new() },
         if idx_ratio != 0.75 { format!("_i{idx_ratio}") } else { String::new() },
         if protect != RvcOptions::default().protect { format!("_p{protect}") } else { String::new() },
+        if valley != DEFAULT_CONSONANT_VALLEY_SCALE { format!("_v{valley}") } else { String::new() },
     );
     let name = format!("mg_render_{a}_{b}_teto{tag}.wav");
     write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
