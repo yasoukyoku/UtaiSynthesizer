@@ -15,6 +15,11 @@
 //!   $env:UTAI_MG_SLICE='a..b'; cargo test --lib inference::score2svc::mg_tests::mg_render_rvc -- --ignored --nocapture
 //! 切片坐标 = mg_lane.json 里 notes[].k(三元组下标);f0 数组按累计帧同窗切,借帧语义与整曲
 //! 渲染一致的前提 = 切片首元素是 R(SP lender),分析侧选窗时遵守。
+//!
+//! S85 音域扩展靶场(mg_render_rvc + mg_render_cover 共用,零生产改动):
+//!   UTAI_MG_SHIFT=-7(半音)UTAI_MG_INVERSE=0/1 UTAI_MG_KAPPA=κ UTAI_MG_MODEL/UTAI_MG_INDEXFILE
+//!   score 臂:raw=transpose 承载(渲染钉在移调位)/inv=range_shift 承载(生产 Signalsmith 逆变换);
+//!   cover 臂:f0_shift 承载 + 探针侧整段 apply_inverse(偏差记档于函数内注释)。
 
 use super::*;
 use super::e1_tests::write_wav16;
@@ -63,6 +68,50 @@ fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
             phoneme_input: None,
         })
         .collect()
+}
+
+/// S85 靶场共用 env:UTAI_MG_SHIFT(半音)/ UTAI_MG_INVERSE(0=raw 臂)/ UTAI_MG_KAPPA
+/// (默认生产 κ)——语义见 mg_render_rvc 内注释。
+fn mg_shift_envs() -> (i64, bool, f32) {
+    let shift = std::env::var("UTAI_MG_SHIFT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let inverse = std::env::var("UTAI_MG_INVERSE").map(|s| s != "0").unwrap_or(true);
+    let kappa = std::env::var("UTAI_MG_KAPPA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(super::super::vocal_range::DEFAULT_FORMANT_KAPPA);
+    (shift, inverse, kappa)
+}
+
+/// UTAI_MG_MODEL / UTAI_MG_INDEXFILE(默认 teto;索引默认=模型同名 .npy)→ (onnx, npy, 名标)。
+/// 探针的 RvcModel 参数钉死 768/48k/v2——换模型时从 sidecar 响亮核对,不许静默错规格。
+fn mg_model_envs() -> (std::path::PathBuf, std::path::PathBuf, String) {
+    let model = std::env::var("UTAI_MG_MODEL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| Path::new(WORK).join("tetoRVC_best.onnx"));
+    let index = std::env::var("UTAI_MG_INDEXFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| model.with_extension("npy"));
+    if let Ok(s) = std::fs::read_to_string(model.with_extension("json")) {
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["sample_rate"].as_i64(), Some(48000), "mg probe assumes 48k RVC");
+        assert_eq!(v["features_dim"].as_i64(), Some(768), "mg probe assumes 768-dim RVC");
+    }
+    let stem = model.file_stem().unwrap().to_string_lossy().to_string();
+    let mtag = if stem == "tetoRVC_best" { "teto".to_string() } else { stem };
+    (model, index, mtag)
+}
+
+/// shift 臂的文件名后缀:`_s{shift}[_raw][_k{κ}]`(κ 只在偏离生产默认时标)。
+fn mg_shift_tag(shift: i64, inverse: bool, kappa: f32) -> String {
+    if shift == 0 {
+        return String::new();
+    }
+    let ktag = if kappa != super::super::vocal_range::DEFAULT_FORMANT_KAPPA {
+        format!("_k{kappa}")
+    } else {
+        String::new()
+    };
+    format!("_s{shift}{}{ktag}", if inverse { "" } else { "_raw" })
 }
 
 #[test]
@@ -160,8 +209,9 @@ fn mg_render_rvc() {
     let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
     let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
     let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
-    let teto = engine.load_model_with(&Path::new(WORK).join("tetoRVC_best.onnx"), false).unwrap();
-    let index = rvc::RvcIndex::load(&Path::new(WORK).join("tetoRVC_best.npy")).unwrap();
+    let (model_path, index_path, mtag) = mg_model_envs();
+    let teto = engine.load_model_with(&model_path, false).unwrap();
+    let index = rvc::RvcIndex::load(&index_path).unwrap();
     let m = rvc::RvcModel {
         engine: &engine,
         voice_session: &teto,
@@ -199,26 +249,43 @@ fn mg_render_rvc() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(true);
-    let ropts = RvcOptions { seed: 0, index_ratio: idx_ratio, protect, ..Default::default() };
+    // S85 音域扩展靶场(零生产改动,只换调用参数):
+    //   UTAI_MG_SHIFT=半音(负=向下入舒适区;0=S84 原行为)。
+    //   UTAI_MG_INVERSE=0 → raw 臂:shift 走 transpose 承载(渲染钉在移调位、无逆变换,
+    //     听「模型在 shift 位唱得如何」);默认 1 → 生产等价臂:shift 走 range_shift
+    //     (render_score_rvc 内部 Signalsmith 逆变换,inverse→peak-norm 顺序=生产)。
+    //   UTAI_MG_KAPPA=κ(默认生产 DEFAULT_FORMANT_KAPPA=0;1=跳过 formant 机器)。
+    //   UTAI_MG_MODEL=onnx 路径(默认 teto;yachiyo 同规格 768/48k/v2,sidecar 已核),
+    //   UTAI_MG_INDEXFILE=npy(默认 = 模型同名 .npy)。
+    let (shift, inverse, kappa) = mg_shift_envs();
+    let (tp, rs) = if inverse { (0, shift) } else { (shift, 0) };
+    let ropts = RvcOptions {
+        seed: 0,
+        index_ratio: idx_ratio,
+        protect,
+        range_formant_follow: kappa,
+        ..Default::default()
+    };
     let no_cancel = || false;
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, clarity, 0, 0,
+        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, clarity, tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
     let tag = format!(
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         if emph != DEFAULT_VOICELESS_ONSET_EMPHASIS_DB { format!("_e{emph}") } else { String::new() },
         if idx_ratio != 0.75 { format!("_i{idx_ratio}") } else { String::new() },
         if protect != RvcOptions::default().protect { format!("_p{protect}") } else { String::new() },
         if valley != DEFAULT_CONSONANT_VALLEY_SCALE { format!("_v{valley}") } else { String::new() },
         if !clarity { "_nc" } else { "" },
+        mg_shift_tag(shift, inverse, kappa),
     );
-    let name = format!("mg_render_{a}_{b}_teto{tag}.wav");
+    let name = format!("mg_render_{a}_{b}_{mtag}{tag}.wav");
     write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
     eprintln!(
         "[mg] rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
@@ -491,8 +558,9 @@ fn mg_render_cover() {
     let cv768 = engine.load_model_with(&aux.join("contentvec_768l12.onnx"), false).unwrap();
     let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
     let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
-    let teto = engine.load_model_with(&Path::new(WORK).join("tetoRVC_best.onnx"), false).unwrap();
-    let index = rvc::RvcIndex::load(&Path::new(WORK).join("tetoRVC_best.npy")).unwrap();
+    let (model_path, index_path, mtag) = mg_model_envs();
+    let teto = engine.load_model_with(&model_path, false).unwrap();
+    let index = rvc::RvcIndex::load(&index_path).unwrap();
     let m = rvc::RvcModel {
         engine: &engine,
         voice_session: &teto,
@@ -506,19 +574,52 @@ fn mg_render_cover() {
         noise_channels: 192,
         min_frames: 12,
     };
-    let ropts = RvcOptions::default();
+    // S85 靶场:cover 的 shift 生产等价 = fed f0 ×2^(s/12)(输入音频/cv 不动)。f0_shift 在
+    // run_pipeline 里先于 coarse 量化乘到整轨(rvc.rs:256)= 生产 ranged_chunk 逐 chunk 乘的
+    // 同一数学;raw 臂(UTAI_MG_INVERSE=0)即到此为止=「模型在 shift 位唱 cover」。
+    let (shift, inverse, kappa) = mg_shift_envs();
+    let ropts = RvcOptions { f0_shift: shift as f32, ..Default::default() };
     let noop = |_: f32| {};
     let no_cancel = || false;
     let t0 = Instant::now();
     let r = rvc::run_pipeline(&m, &src, &ropts, None, &noop, &no_cancel).unwrap();
+    let mut audio = r.audio;
+    if inverse && shift != 0 {
+        // 逆变换臂(记档偏差 vs 生产,三条均判无害:①生产=逐 chunk 对未裁 pad 输出 inverse
+        //   (接缝色染留在被裁 pad 内),这里=整段单次(天然无缝,同或更干净);②fed base 网格
+        //   取自未 pad 源(生产=padded 逐 chunk 切片)——sticky ~100ms 浊音中位对平移不敏感;
+        //   ③省略 48Hz 高通(远低于人声 f0,不动中位数)。
+        // 16k 降采样走生产同款 polyphase(features::resample=rvc 管线的 16k 路径);
+        // audio::resample::resample 的 rubato FftFixedIn 在 debug 下对整曲长输入 pow 溢出(探针踩过)。
+        let mono16 =
+            super::super::features::resample(&src.samples, src.sample_rate, 16000);
+        let mut pf = super::super::f0::rmvpe_detect_chunked(
+            &engine,
+            &rmvpe,
+            &rmvpe_mel,
+            &mono16,
+            super::super::f0::RVC_RMVPE_THRESHOLD,
+        )
+        .unwrap();
+        let kr = 2.0f32.powf(shift as f32 / 12.0);
+        pf.iter_mut().for_each(|v| *v *= kr);
+        audio = super::super::vocal_range::apply_inverse(
+            audio,
+            r.sample_rate,
+            shift,
+            kappa,
+            Some((&pf, r.sample_rate as usize / 100)),
+        )
+        .unwrap();
+    }
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let name = format!("mg_cover_{a}_{b}_teto.wav");
-    write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
+    let name = format!("mg_cover_{a}_{b}_{mtag}{}.wav", mg_shift_tag(shift, inverse, kappa));
+    write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
         "[mg] cover {t_start:.3}s..{t_end:.3}s ({:.2}s in, {:.2}s out) in {:.1}s wall -> probe\\{name}",
         src.samples.len() as f32 / src.sample_rate as f32,
-        r.audio.len() as f32 / r.sample_rate as f32,
+        audio.len() as f32 / r.sample_rate as f32,
         t0.elapsed().as_secs_f64()
     );
 }
