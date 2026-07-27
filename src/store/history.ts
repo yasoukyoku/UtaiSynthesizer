@@ -161,7 +161,9 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   // absent≡2.5 must hash identically to the pre-knob string, else every existing bake goes dirty).
   const ce = (p.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB) !== DEFAULT_CONSONANT_EMPHASIS_DB ? `|ce:${p.consonantEmphasis}` : "";
   const cvl = (p.consonantValley ?? DEFAULT_CONSONANT_VALLEY) !== DEFAULT_CONSONANT_VALLEY ? `|cvl:${p.consonantValley}` : "";
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}`;
+  // S84 E 刀: only the OFF state enters the sig (absent≡true folds out — existing bakes stay clean).
+  const vcl = p.vowelClarity === false ? "|vcl:0" : "";
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

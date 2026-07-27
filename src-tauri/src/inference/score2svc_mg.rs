@@ -195,23 +195,28 @@ fn mg_render_rvc() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CONSONANT_VALLEY_SCALE);
+    let clarity: bool = std::env::var("UTAI_MG_CLARITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(true);
     let ropts = RvcOptions { seed: 0, index_ratio: idx_ratio, protect, ..Default::default() };
     let no_cancel = || false;
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, 0, 0,
+        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, clarity, 0, 0,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
     let tag = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         if emph != DEFAULT_VOICELESS_ONSET_EMPHASIS_DB { format!("_e{emph}") } else { String::new() },
         if idx_ratio != 0.75 { format!("_i{idx_ratio}") } else { String::new() },
         if protect != RvcOptions::default().protect { format!("_p{protect}") } else { String::new() },
         if valley != DEFAULT_CONSONANT_VALLEY_SCALE { format!("_v{valley}") } else { String::new() },
+        if !clarity { "_nc" } else { "" },
     );
     let name = format!("mg_render_{a}_{b}_teto{tag}.wav");
     write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
@@ -252,6 +257,13 @@ fn mg_render_rvc_oversampled() {
     // (anticipation)——中心对齐采样会把它压进真音符里,i 向拐弯提前发生。TAIL=采样时从放大
     // 跨度末尾剪掉的帧数(core=起振+稳态;边界过渡交还给下一 phone 自己的 head 帧)。0=一轮行为。
     let tail: i64 = std::env::var("UTAI_MG_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // E 刀三轮:TAIL 去尾被耳测+band 双判无效(均匀采样保持「过渡:稳态」比例不变=听感不动)。
+    // UTAI_MG_CORE="lo,hi"(如 0.30,0.70)= 只从放大跨度的稳态核窗采样(非均匀:过渡被挤出,
+    // 相邻 phone 间变成 1 帧级 cv 快跳,decoder 平滑成快过渡=真唱边界干脆感)。设 CORE 时忽略 TAIL。
+    let core: Option<(f64, f64)> = std::env::var("UTAI_MG_CORE").ok().and_then(|s| {
+        let (lo, hi) = s.split_once(',')?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dll = root.join("../runtime/ort/onnxruntime.dll");
@@ -333,20 +345,56 @@ fn mg_render_rvc_oversampled() {
             hard_seam: chunk.hard_seam,
         };
         let cv_inf = run_score2cv(m.engine, &s2cv768, &chunk_inf, 768, 49, chunk.lang_id).unwrap();
+        // E 刀三轮诊断(UTAI_MG_DUMPCV):放大元音的 cv 帧内变异——若帧间近乎相同(det 慢变),
+        // 采样窗选择=空转钮,E 收益全来自「放大时长输入改变整个元音的 cv 目标」。
+        if std::env::var("UTAI_MG_DUMPCV").is_ok() {
+            let mut c0 = 0usize;
+            for k in 0..pd_inf.len() {
+                let d = pd_inf[k].max(0) as usize;
+                let d_true0 = chunk.phone_dur[k].max(0) as usize;
+                if d > d_true0 && d >= 2 {
+                    // 帧间相邻余弦 + 首尾余弦(1.0=完全相同)
+                    let cos = |x: usize, y: usize| {
+                        let (a, b) = (cv_inf.row(c0 + x), cv_inf.row(c0 + y));
+                        let dot: f32 = a.iter().zip(b.iter()).map(|(p, q)| p * q).sum();
+                        let na: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        let nb: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+                        dot / (na * nb + 1e-9)
+                    };
+                    let adj: Vec<f32> = (0..d - 1).map(|x| cos(x, x + 1)).collect();
+                    let adj_min = adj.iter().cloned().fold(1.0f32, f32::min);
+                    eprintln!(
+                        "[mg] cv-var phone[{}]{} d_inf={} first-last cos={:.4} adj-min cos={:.4}",
+                        chunk.start + k,
+                        // phon not in Chunk — recover via arr
+                        arr.phon[chunk.start + k],
+                        d,
+                        cos(0, d - 1),
+                        adj_min
+                    );
+                }
+                c0 += d;
+            }
+        }
         // 逐 phone 最近邻重采回真时长(中心对齐采样)。
         let mut cv = Array2::<f32>::zeros((chunk.t, 768));
         let (mut c_true, mut c_inf) = (0usize, 0usize);
         for k in 0..pd_inf.len() {
             let d_true = chunk.phone_dur[k].max(0) as usize;
             let d_inf = pd_inf[k].max(0) as usize;
-            // 放大过的 phone:采样域=去尾 core(≥d_true,防上采);未放大的 phone:全域(=恒等)。
-            let d_core = if d_inf > d_true {
-                (d_inf as i64 - tail).max(d_true as i64) as usize
+            // 放大过的 phone:采样域=CORE 稳态窗(非均匀)或去尾窗;未放大:全域(=恒等)。
+            let (w_lo, w_len) = if d_inf > d_true {
+                if let Some((lo, hi)) = core {
+                    let a0 = (d_inf as f64 * lo).min(d_inf as f64 - 1.0);
+                    (a0, ((d_inf as f64 * hi) - a0).max(1.0))
+                } else {
+                    (0.0, (d_inf as i64 - tail).max(d_true as i64) as f64)
+                }
             } else {
-                d_inf
+                (0.0, d_inf as f64)
             };
             for j in 0..d_true {
-                let src = c_inf + ((j as f64 + 0.5) * d_core as f64 / d_true as f64) as usize;
+                let src = c_inf + (w_lo + (j as f64 + 0.5) * w_len / d_true as f64) as usize;
                 let src = src.min(c_inf + d_inf.saturating_sub(1)).min(cv_inf.nrows().saturating_sub(1));
                 cv.row_mut(c_true + j).assign(&cv_inf.row(src));
             }
@@ -378,7 +426,13 @@ fn mg_render_rvc_oversampled() {
     }
     peak_normalize(&mut audio, 0.92);
     let out_dir = Path::new(WORK).join("probe");
-    let ttag = if tail != 0 { format!("_t{tail}") } else { String::new() };
+    let ttag = if let Some((lo, hi)) = core {
+        format!("_c{:.0}_{:.0}", lo * 100.0, hi * 100.0)
+    } else if tail != 0 {
+        format!("_t{tail}")
+    } else {
+        String::new()
+    };
     let name = format!("mg_render_{a}_{b}_teto_oversampled{ttag}.wav");
     write_wav16(&out_dir.join(&name), &audio, m.sample_rate);
     eprintln!("[mg] oversampled render -> probe\\{name} ({:.2}s)", audio.len() as f32 / m.sample_rate as f32);

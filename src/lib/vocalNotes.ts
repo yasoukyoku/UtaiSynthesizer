@@ -266,6 +266,8 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     consonantEmphasis: clampNum(p.consonantEmphasis ?? NaN, 0, 12, DEFAULT_CONSONANT_EMPHASIS_DB),
     // S84 C 刀: consonant-valley scale knob (×per-class depth on chain-internal boundaries; 0 = off).
     consonantValley: clampNum(p.consonantValley ?? NaN, 0, 2, DEFAULT_CONSONANT_VALLEY),
+    // S84 E 刀: vowel clarity toggle — only false is stored (absent≡true, autoTuneFollow pattern).
+    ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
   };
 }
 

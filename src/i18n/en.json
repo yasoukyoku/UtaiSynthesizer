@@ -613,6 +613,8 @@
       "consonantTip": "Output gain on voiceless onsets (s/k/t…): higher = crisper articulation. 0 = off; default 2.5 dB.",
       "consonantValley": "Articulation",
       "consonantValleyTip": "Energy valley at syllable boundaries (voiced consonants too — r/m/n rows): real singing dips between every syllable, most audibly in fast runs. Higher = more separated syllables. 0 = off; default 1×.",
+      "vowelClarity": "Vowel clarity",
+      "vowelClarityTip": "Render fast-run short vowels at an inflated duration and resample back (cv-domain — no time-stretch artifacts), so 40-80 ms vowels still reach their target articulation. Default on.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",

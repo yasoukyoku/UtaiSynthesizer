@@ -129,6 +129,8 @@ export interface VocalRenderOptions {
   consonant_emphasis_db: number;
   /** S84 C 刀: chain-internal consonant-valley scale (×measured per-class depth; 0 = off). */
   consonant_valley: number;
+  /** S84 E 刀: vowel-clarity articulation oversampling (absent-in-params ≡ true). */
+  vowel_clarity: boolean;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -485,6 +487,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
       consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
       consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
+      vowel_clarity: vp.vowelClarity !== false,
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },

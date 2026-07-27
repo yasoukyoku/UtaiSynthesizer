@@ -1439,6 +1439,10 @@ pub struct VocalRenderOptions {
     /// S84 C 刀: chain-internal consonant-valley scale (×measured per-class depth; the fast-run
     /// 粘连 treatment). 0 = off (exact no-op); clamped to [0, 2]. Absent (old frontends) → default.
     pub consonant_valley: f32,
+    /// S84 E 刀: vowel-clarity articulation oversampling — short nuclei (≤4 frames) render at an
+    /// inflated S2CV duration and resample back, so fast-run vowels reach their articulation
+    /// target (「渲染长音素再缩短」, cv-domain). Absent → true (the production default).
+    pub vowel_clarity: bool,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1459,6 +1463,7 @@ impl Default for VocalRenderOptions {
             range_extend: false,
             consonant_emphasis_db: crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley: crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
+            vowel_clarity: true,
             sovits: Default::default(),
             rvc: Default::default(),
         }
@@ -1776,6 +1781,7 @@ pub async fn render_vocal_segment(
     } else {
         crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE
     };
+    let vowel_clarity = options.vowel_clarity; // S84 E 刀 toggle (bool — nothing to sanitize)
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
     match backend_type {
@@ -1825,7 +1831,9 @@ pub async fn render_vocal_segment(
             let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
             // ScoreToCV is the self-sing CONTENT workhorse (net_g already runs on the global device) and the
             // #1 render-time cost. Unlike ContentVec — whose whole-song activations peaked ~9 GB (S35) so it
-            // stays pinned to CPU — ScoreToCV is chunked (sidecar chunk_max_frames ≤400), activations small.
+            // stays pinned to CPU — ScoreToCV is chunked (sidecar chunk_max_frames ≤400 as a SOFT cut at
+            // SPs; rest-less passages exceed it, and the S84 vowel-clarity twin inflates fast-run chunks
+            // ~1.3-1.5× — still small next to ContentVec, hard-bounded by the twin's 8000-frame fallback).
             // So load it on the GLOBAL device (on_gpu=true = FOLLOW the device preference, NOT force GPU)
             // instead of forced-CPU: with the default Auto that probes CUDA→DirectML→CPU and FALLS BACK to
             // CPU on a GPU-less / incompatible machine (exactly like net_g), so it's fast where a GPU exists
@@ -1878,7 +1886,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 let result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?;
                 commit_rendered_audio(result, output_path)
@@ -1941,7 +1949,7 @@ pub async fn render_vocal_segment(
                 let formant = if formant_env.is_empty() { None } else { Some(formant_env.as_slice()) };
                 let result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    consonant_emphasis_db, consonant_valley, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
+                    consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, range_shift, f0.as_ref(), loud, formant, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?;
                 commit_rendered_audio(result, output_path)

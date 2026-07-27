@@ -858,6 +858,132 @@ fn assemble_arrays(
 // ─── SP-boundary chunking (≤ max_frames) + per-chunk rebase ──────────────────────────────────────
 
 /// One inference chunk: the per-phone arrays sliced to `[start, end)`, with `note_to_phone` rebased to 0.
+// ─── S84 E 刀: vowel-clarity articulation oversampling (「渲染长音素再缩短」, cv 域) ───
+//
+// Fast-run vowels (≤4 frames) undershoot their articulation target — S2CV's det trajectory never
+// REACHES /a/ in 40-80 ms (measured: ま's /a/ F1 646 vs cover 1070; the S84 closed-vowel
+// deviations). The UTAU-analogy fix, in the ONLY domain where it is artifact-free (cv — audio-domain
+// time-compression would ring phase/stretch artifacts): render the chunk with short nuclei INFLATED
+// to VOWEL_CLARITY_INFLATE frames (the model, seeing a longer duration input, computes a fully
+// articulated vowel), then resample the cv rows back to the true durations (uniform center-aligned
+// nearest). Measured: ま F1 646→836 (E on/off, robust), user-ear-confirmed "开口部分出来了".
+// Sampling-window refinements (tail-trim / steady-core) were measured PERCEPTUALLY INERT (band
+// metric flat, ear-confirmed) — hence deliberately absent: the benefit comes from the inflated
+// duration INPUT changing the vowel's cv target, not from which rows get picked. The residual
+// "mai" coloring (band gap vs cover, invariant to inflate amount) is the det contextual
+// undershoot — out of this knife's reach (menu ④ manual/auto timing).
+const VOWEL_CLARITY_INFLATE: i64 = 6;
+const VOWEL_CLARITY_MAX_DUR: i64 = 4;
+/// The exported ScoreToCV graph carries a FIXED 8000-row frame-axis positional encoding
+/// (RelativePositionalEncoding max_len; S84 review) — a twin that would exceed it falls back to
+/// the plain call so "renders with clarity OFF ⇒ renders with clarity ON" holds even on
+/// pathological rest-less mega-chunks (the plain path itself errors loudly past 8000).
+const VOWEL_CLARITY_MAX_T: usize = 8000;
+
+/// The inflation plan for one chunk: `None` = nothing qualifies (caller uses the plain path —
+/// bit-exact off-switch by construction); `Some(durs)` = per-phone durations with every
+/// qualifying nucleus raised to the inflate target. Scope = the S84-validated regime ONLY: the
+/// FINAL nucleus of its source event at 1..=4 frames (fast-run CV notes / EN closed syllables).
+/// MEDIAL vowels (refined's ə, più's i) are allocation-short at ANY tempo — no undershoot
+/// premise, never ear-validated — and stay untouched (S84 review; possible future extension).
+fn clarity_inflated_durs(
+    phon: &[&'static str],
+    note_pitch: &[i64],
+    phone_dur: &[i64],
+    evt: &[usize],
+) -> Option<Vec<i64>> {
+    let mut durs = phone_dur.to_vec();
+    let mut any = false;
+    for i in 0..phon.len() {
+        let final_nucleus_of_event = is_nucleus_phone(phon[i])
+            && !(i + 1..phon.len()).any(|j| evt[j] == evt[i] && is_nucleus_phone(phon[j]));
+        if note_pitch[i] > 0
+            && final_nucleus_of_event
+            && (1..=VOWEL_CLARITY_MAX_DUR).contains(&phone_dur[i])
+        {
+            durs[i] = VOWEL_CLARITY_INFLATE.max(phone_dur[i]);
+            any = true;
+        }
+    }
+    any.then_some(durs)
+}
+
+/// Uniform center-aligned nearest resample of the inflated cv rows back onto the true per-phone
+/// durations (row counts: Σpd_inf → Σpd_true).
+fn clarity_resample(cv_inf: &Array2<f32>, pd_true: &[i64], pd_inf: &[i64]) -> Array2<f32> {
+    let t_true: usize = pd_true.iter().map(|&d| d.max(0) as usize).sum();
+    let mut cv = Array2::<f32>::zeros((t_true, cv_inf.ncols()));
+    let (mut c_true, mut c_inf) = (0usize, 0usize);
+    for k in 0..pd_true.len() {
+        let d_true = pd_true[k].max(0) as usize;
+        let d_inf = pd_inf[k].max(0) as usize;
+        for j in 0..d_true {
+            let src = c_inf + ((j as f64 + 0.5) * d_inf as f64 / d_true as f64) as usize;
+            let src = src.min(c_inf + d_inf.saturating_sub(1)).min(cv_inf.nrows().saturating_sub(1));
+            cv.row_mut(c_true + j).assign(&cv_inf.row(src));
+        }
+        c_true += d_true;
+        c_inf += d_inf;
+    }
+    cv
+}
+
+/// ScoreToCV with the S84 vowel-clarity oversampling: build the inflated TWIN chunk (same phone
+/// range/pitches/grouping), run the model once on it, resample the rows back. `phon`/`evt` = the
+/// arr's slices for this chunk (Chunk carries only ids/groups). No qualifying nucleus, or a twin
+/// past the model's positional cap ⇒ the PLAIN `run_score2cv` call.
+/// note_dur is re-summed ONLY for groups that contain an inflated member — every other group
+/// keeps the sliced full-array value verbatim. That matters for pitch-0 groups: SP|AP neighbours
+/// group together and CAN span a chunk cut (S84 review — sung groups never do, (pitch,lang)
+/// keying cuts at every SP/lang change), so a blanket in-chunk re-sum would silently change
+/// breath-frame conditioning far from any inflated vowel.
+pub fn run_score2cv_vowel_clarity(
+    engine: &OnnxEngine,
+    session_id: &str,
+    chunk: &Chunk,
+    phon: &[&'static str],
+    evt: &[usize],
+    dim: usize,
+    speaker_id: i64,
+    lang_id: i64,
+) -> Result<Array2<f32>> {
+    let Some(pd_inf) = clarity_inflated_durs(phon, &chunk.note_pitch, &chunk.phone_dur, evt) else {
+        return run_score2cv(engine, session_id, chunk, dim, speaker_id, lang_id);
+    };
+    let t_inf: usize = pd_inf.iter().map(|&d| d.max(0) as usize).sum();
+    if t_inf > VOWEL_CLARITY_MAX_T {
+        return run_score2cv(engine, session_id, chunk, dim, speaker_id, lang_id);
+    }
+    let touched: std::collections::HashSet<i64> = (0..pd_inf.len())
+        .filter(|&k| pd_inf[k] != chunk.phone_dur[k])
+        .map(|k| chunk.note_to_phone[k])
+        .collect();
+    let mut nd_inf = chunk.note_dur.clone();
+    for k in 0..pd_inf.len() {
+        let g = chunk.note_to_phone[k];
+        if touched.contains(&g) {
+            nd_inf[k] = (0..pd_inf.len())
+                .filter(|&j| chunk.note_to_phone[j] == g)
+                .map(|j| pd_inf[j])
+                .sum();
+        }
+    }
+    let twin = Chunk {
+        start: chunk.start,
+        end: chunk.end,
+        phonemes: chunk.phonemes.clone(),
+        note_pitch: chunk.note_pitch.clone(),
+        phone_dur: pd_inf.clone(),
+        note_dur: nd_inf,
+        note_to_phone: chunk.note_to_phone.clone(),
+        t: t_inf,
+        lang_id: chunk.lang_id,
+        hard_seam: chunk.hard_seam,
+    };
+    let cv_inf = run_score2cv(engine, session_id, &twin, dim, speaker_id, lang_id)?;
+    Ok(clarity_resample(&cv_inf, &chunk.phone_dur, &pd_inf))
+}
+
 pub struct Chunk {
     pub start: usize,
     pub end: usize,
@@ -1082,6 +1208,42 @@ mod tests {
         // parity build untouched: split_dur shape, consonant INSIDE the note window.
         let parity = build_arrays(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
         assert_eq!(parity.phone_dur, vec![7, 2, 5, 2, 4], "parity keeps the legacy split_dur shape");
+    }
+
+    // S84 E 刀: the vowel-clarity plan inflates only the FINAL nucleus of a sung event at ≤4
+    // frames (the validated fast-run regime; medial vowels are allocation-short at any tempo and
+    // stay untouched); the resample maps rows center-aligned; nothing-qualifies → None (the
+    // off-path and no-op path are the same code).
+    #[test]
+    fn vowel_clarity_plan_and_resample() {
+        let phon: Vec<&'static str> = vec!["SP", "k", "a", "a"];
+        let pitch = vec![0i64, 60, 60, 60];
+        let evt = vec![0usize, 1, 1, 2];
+        // evt1's final nucleus (3fr) inflates; evt2's long one (12) doesn't; consonants never do.
+        let durs = vec![10i64, 2, 3, 12];
+        let plan = clarity_inflated_durs(&phon, &pitch, &durs, &evt).expect("one short nucleus qualifies");
+        assert_eq!(plan, vec![10, 2, 6, 12]);
+        // nothing qualifies → None (rest-only / long-only scores take the plain path).
+        assert!(clarity_inflated_durs(&phon, &pitch, &[10, 2, 12, 12], &evt).is_none());
+        // MEDIAL vowel exclusion (refined-shape on ONE event): the ə (short, medial) must NOT
+        // inflate — only the final nucleus aɪ qualifies (here long → whole plan is None).
+        let phon2: Vec<&'static str> = vec!["ɹ", "ə", "f", "aɪ"];
+        let evt2 = vec![0usize, 0, 0, 0];
+        assert!(
+            clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 12], &evt2).is_none(),
+            "medial ə never inflates (unvalidated slow-note scope, S84 review)"
+        );
+        // …and when the final nucleus IS short, it inflates while the medial still doesn't.
+        let plan2 = clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 4], &evt2).unwrap();
+        assert_eq!(plan2, vec![2, 3, 2, 6]);
+        // resample: a 6-row phone down to 2 rows samples centers {1.5→1, 4.5→4}; identity spans
+        // (pd_true == pd_inf) map 1:1.
+        let mut cv = Array2::<f32>::zeros((8, 1));
+        for r in 0..8 {
+            cv[[r, 0]] = r as f32;
+        }
+        let out = clarity_resample(&cv, &[2, 2], &[6, 2]);
+        assert_eq!(out.column(0).to_vec(), vec![1.0, 4.0, 6.0, 7.0]);
     }
 
     // S84 D 刀: a lone moraic-ん note ([ɴ], nucleus-less, VOICED) gets the M3 rest-borrow floor

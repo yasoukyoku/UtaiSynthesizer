@@ -532,6 +532,16 @@ describe("S73 — autoTuned 调教所有权标记(假脏铁律全套)", () => {
     expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(now); // 往返=字节不动
   });
 
+  it("S84:vowelClarity 关→开往返 = 折回 absence(S73b 同款,无字节假脏)", () => {
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: true }); // 确保 vocalParams 已存在
+    const base = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    useProjectStore.getState().setVocalParams(T, { vowelClarity: false });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.vowelClarity).toBe(false);
+    useProjectStore.getState().setVocalParams(T, { vowelClarity: true });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.vowelClarity).toBeUndefined();
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(base); // 往返=字节不动
+  });
+
   it("手动 vibrato/transition 编辑剥 autoTuned(所有权移交,侧栏语义的 store 层镜像)", () => {
     useProjectStore.getState().updateVocalNote(T, S, "n1", { autoTuned: true, transition: { durLeftMs: 120 } });
     expect(notes()[0]!.autoTuned).toBe(true);

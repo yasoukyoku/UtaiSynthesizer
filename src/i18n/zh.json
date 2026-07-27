@@ -613,6 +613,8 @@
       "consonantTip": "清辅音（s/k/t 等字头）输出增益：越高咬字越脆。0=关闭；默认 2.5 dB。",
       "consonantValley": "颗粒感",
       "consonantValleyTip": "音节边界能量谷（含浊辅音 ら/ま行等）：真唱在每个字间有能量凹陷，快段尤其明显；越高颗粒越分明。0=关闭；默认 1×。",
+      "vowelClarity": "元音清晰",
+      "vowelClarityTip": "快段短元音按放大时长渲染内容再缩回原时值（cv 域，无变速伪影）：让 40-80ms 的元音也能唱到位（如快段 a 不再发闭）。默认开启。",
       "pickVoice": "选择歌手…",
       "noVoiceModel": "未安装歌手模型",
       "goImport": "去资源管理导入",

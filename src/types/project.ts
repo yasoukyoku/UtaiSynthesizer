@@ -304,6 +304,12 @@ export interface VocalTrackParams {
    *  treatment). 0 = off (exact no-op); absent = DEFAULT_CONSONANT_VALLEY (1). Folds out of the
    *  render sig at default so pre-knob bakes stay clean. */
   consonantValley?: number;
+  /** S84 E 刀: vowel-clarity articulation oversampling — short nuclei (≤4 frames) render at an
+   *  inflated S2CV duration and their cv resamples back onto the true timeline, so fast-run vowels
+   *  reach their articulation target (「渲染长音素再缩短」, cv-domain; ma 发成闭口类的欠冲治标)。
+   *  Absent/true = ON (the production default; a REAL measured win — F1 646→836 on the S84 ま
+   *  case); stored ONLY as false (absent≡true, the autoTuneFollow fold pattern). */
+  vowelClarity?: boolean;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (Signalsmith inverse; needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
    *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in

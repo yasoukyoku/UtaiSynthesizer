@@ -253,6 +253,15 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
           onReset={() => setVocalParams(trackId, { consonantValley: DEFAULT_CONSONANT_VALLEY })}
           onChange={(v) => setVocalParams(trackId, { consonantValley: v })}
         />
+        {/* S84 E 刀: vowel-clarity articulation oversampling — fast-run short vowels render at an
+            inflated S2CV duration and resample back (cv-domain; default ON, absent≡true). */}
+        <div title={t("vocalEditor.sidebar.vowelClarityTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.vowelClarity")}
+            checked={vocalParams.vowelClarity !== false}
+            onChange={(c) => setVocalParams(trackId, { vowelClarity: c })}
+          />
+        </div>
         {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
             custom trigger never steals a glyph the user needs as a real lyric. */}
         <div className="vsb-inline">

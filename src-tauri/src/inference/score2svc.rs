@@ -40,8 +40,8 @@ use super::features::{repeat_expand_2d, torch_interp_nearest};
 use super::g2p::{self, Lang, ScoreEvt};
 use super::rvc::{f0_to_coarse, vc_decode, RvcModel};
 use super::score2cv::{
-    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv, Chunk,
-    LyricClass, ScoreArrays,
+    build_arrays_daw, chunk_at_sp, classify_lyric, is_voiceless_phone, run_score2cv,
+    run_score2cv_vowel_clarity, Chunk, LyricClass, ScoreArrays,
 };
 use super::score2cv_tables as tbl;
 use super::sovits::{apply_cluster_blend, decode_features, SovitsModel};
@@ -621,6 +621,7 @@ pub fn render_score_sovits(
     flat_vol: f32,
     consonant_emphasis_db: f32,
     consonant_valley_scale: f32,
+    vowel_clarity: bool,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -676,7 +677,15 @@ pub fn render_score_sovits(
         if cancel() {
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
-        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
+        // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
+        let cv = if vowel_clarity {
+            run_score2cv_vowel_clarity(
+                m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
+                &arr.evt[chunk.start..chunk.end], dim, cv_speaker_id, chunk.lang_id,
+            )?
+        } else {
+            run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?
+        };
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         // S69: cv expand uses the model's sidecar mode, same as the cover path (only_diffusion is
         // disallowed for the score path, so the diffusion-yaml override branch never applies).
@@ -792,6 +801,7 @@ pub fn render_score_rvc(
     options: &RvcOptions,
     consonant_emphasis_db: f32,
     consonant_valley_scale: f32,
+    vowel_clarity: bool,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -842,7 +852,15 @@ pub fn render_score_rvc(
         if cancel() {
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
-        let cv = run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?;
+        // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
+        let cv = if vowel_clarity {
+            run_score2cv_vowel_clarity(
+                m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
+                &arr.evt[chunk.start..chunk.end], dim, cv_speaker_id, chunk.lang_id,
+            )?
+        } else {
+            run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?
+        };
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
         // chunk 权重切片(min_frames pad 出的行由 vc_decode 的 unwrap_or(1.0) 兜=不加权)。
@@ -1995,16 +2013,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -2013,7 +2031,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

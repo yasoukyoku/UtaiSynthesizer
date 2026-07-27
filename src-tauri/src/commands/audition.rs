@@ -1338,6 +1338,7 @@ pub async fn render_candidate_scale(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
                     crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
                     crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
+                    true /* S84 E vowel clarity: production default */,
                     0, 0, None, None, None, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?
@@ -1380,6 +1381,7 @@ pub async fn render_candidate_scale(
                     crate::commands::inference::VOCAL_FLAT_VOL,
                     crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
                     crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
+                    true /* S84 E vowel clarity: production default */,
                     0, 0, None, None, None,
                     &cancel, &progress,
                 )
