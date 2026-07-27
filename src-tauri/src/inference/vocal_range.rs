@@ -31,6 +31,23 @@ pub const MIN_COMFORT_SPAN: f32 = 5.0;
 /// Absurdity brake on any tier decision: no material legitimately needs more than ±2
 /// octaves of translation — past that a stale/garbage record is doing the deciding.
 pub const MAX_RANGE_SHIFT: i64 = 24;
+/// ★S85c cover-decision redo (耳判证据驱动的深度分级;memory S85 五轮):
+/// the shift+inverse round trip recolours 100% of the render and its audible tax GROWS with
+/// |shift| — S82 ear-validated the -7..-11 regime on real songs, while every deeper verdict the
+/// user ever heard (-16/-23/-24, both coupled and cv-fixed mechanisms) was a disaster. So the
+/// ordinary search is BOUNDED to one octave; the full ±MAX_RANGE_SHIFT stays available ONLY
+/// when the piece is DOMINANTLY dead at shift 0 (a bass song on a female model: without a deep
+/// move there is no usable sound at all — the ear-anchored +22 verdict lives in that regime).
+/// A piece where most material is healthy can no longer trade a whole-song recolour for a few
+/// percent of climax (东雪莲/鹅妈妈: 4% above-usable used to drag the whole render to -24).
+pub const SHALLOW_SHIFT_BOUND: i64 = 12;
+/// Loudness-weighted mass share at/above which the piece counts as "does not fit this model"
+/// and the deep-search regime unlocks. Scanned records judge by the damage curve's dead level
+/// (cannot-sing class); bounds-only records by the outside-usable share.
+pub const DOMINANT_DEAD_MASS: f32 = 0.5;
+/// "Cannot sing" damage level (the scan's DAMAGE_MAX is 3.0; ≥2.5 only occurs on dead or
+/// near-dead semitones). Used ONLY to pick the search regime — it never touches the cost.
+const DEAD_DAMAGE: f32 = 2.5;
 /// Real singing behaves worse at the measured ceiling than the sustained-vowel scale probe
 /// (consonants, dynamics) — whenever a shift happens anyway, land the top this far BELOW
 /// c_hi instead of hugging the boundary (S60d2: -9 st landed the song top exactly on 70
@@ -685,13 +702,24 @@ pub fn piece_range_shift(
         }
         mass / n
     };
-    // ★S85b: the S83 escape valve (dead-mass FIXED-toll waiver) is REVERTED — the loop below is
-    // byte-identical to v0.11.0. Its motivating case (score climax broken at shift 0) is now
-    // handled by the score path's dead-only mechanism, which never consults this optimizer;
-    // here it only pushed COVER renders into ear-rejected deep recolours (东雪莲 -6 → -24).
+    // ★S85c: tiered search depth (see SHALLOW_SHIFT_BOUND). dead0 = the loudness-weighted mass
+    // the model simply cannot sing at shift 0 — scanned records read the damage curve's dead
+    // level, bounds-only records the outside-usable share. It selects the REGIME only; the cost
+    // model itself stays byte-identical to v0.11.0 (the S83 escape valve stays reverted — its
+    // motivating case is the score path's dead-only mechanism now).
+    let dead0: f32 = voiced
+        .iter()
+        .filter(|&&(m, _)| match range.damage_at(m) {
+            Some(d) => d >= DEAD_DAMAGE,
+            None => m < u_lo || m > u_hi,
+        })
+        .map(|&(_, w)| w)
+        .sum::<f32>()
+        / n;
+    let bound = if dead0 >= DOMINANT_DEAD_MASS { MAX_RANGE_SHIFT } else { SHALLOW_SHIFT_BOUND };
     let mut best_cost = f32::MAX;
     let mut best_shift = 0i64;
-    for s in -MAX_RANGE_SHIFT..=MAX_RANGE_SHIFT {
+    for s in -bound..=bound {
         let sf = s as f32;
         let cost = frame_mass(sf) + shift_cost(s);
         if cost < best_cost {
@@ -704,8 +732,9 @@ pub fn piece_range_shift(
     let above0: f32 = voiced.iter().filter(|&&(m, _)| m > u_hi).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
     let below0: f32 = voiced.iter().filter(|&&(m, _)| m < u_lo).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
     tracing::info!(
-        "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below; cost {:.4} -> {best_cost:.4})",
+        "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below, dead {:.1}% -> search ±{bound}; cost {:.4} -> {best_cost:.4})",
         voiced.len(),
+        dead0 * 100.0,
         frame_mass(0.0)
     );
     best_shift
@@ -929,6 +958,90 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    /// 真实东雪莲 sidecar 的 4 元组缩影(cover 决策夹具;S85c):err/voiced 全程健康到 79,
+    /// 但 54+ 的 low_ratio 0.5-0.96 让 thin 项把「耳朵里唱得很好的中高区」标成重损伤——
+    /// 优化器因此想用深移套利(thin 大退费),曾把整曲拖到 -24(用户耳判=灾难)。
+    fn dxl_cover_like() -> SpeakerRange {
+        let rows: &[(i64, f64, f64, f64, f64)] = &[
+            (36, 9.0, 1.0, -9.4, 0.004),
+            (48, 9.0, 1.0, -9.4, 0.017),
+            (54, 3.0, 1.0, -3.0, 0.494),
+            (60, 3.0, 1.0, -3.0, 0.183),
+            (64, 2.0, 1.0, -2.0, 0.155),
+            (68, 2.0, 1.0, -2.5, 0.097),
+            (70, 1.0, 1.0, -3.2, 0.518),
+            (72, 1.0, 1.0, -0.9, 0.538),
+            (74, 2.0, 1.0, -0.1, 0.787),
+            (76, 2.0, 1.0, -1.8, 0.902),
+            (78, 1.0, 1.0, -2.3, 0.858),
+            (79, 1.0, 1.0, -6.1, 0.957),
+            (80, 1.0, 0.67, -12.1, 0.718),
+            (81, 6.0, 0.19, -16.8, 0.316),
+        ];
+        let mut semis = serde_json::Map::new();
+        // 稠密化:相邻锚点线性外推没必要——逐槽取最近锚(粗但保持真实形态)。
+        for m in 36..=96i64 {
+            let (_, e, v, r, l) = *rows
+                .iter()
+                .min_by_key(|(mm, ..)| (mm - m).abs())
+                .unwrap();
+            let (e, v) = if m >= 84 { (9999.0, 0.0) } else { (e, v) };
+            semis.insert(m.to_string(), serde_json::json!([e, v, r, l]));
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 80], "comfort": [36, 52],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cover_small_dead_mass_stays_in_the_shallow_regime() {
+        // S85c 钉子(东雪莲/鹅妈妈之夜):96% 健康素材 + ~4% 死亡极端音的曲子,thin 套利
+        // 再诱人也只许在浅域(±12)权衡——整曲 -24 染色对这种曲子=耳判灾难,结构性不可达。
+        let mut f0 = Vec::new();
+        for _ in 0..250 {
+            for m in [64.0f32, 67.0, 71.0, 73.0, 76.0, 78.0, 73.0, 69.0] {
+                f0.extend(vec![hz(m); 10]);
+            }
+        }
+        f0.extend(vec![hz(85.0); 500]); // ~2.4% 死亡高潮(sustained,过 phantom 滤)
+        let s = piece_range_shift(&f0, None, &dxl_cover_like(), 100.0);
+        assert!(
+            (-SHALLOW_SHIFT_BOUND..=0).contains(&s),
+            "healthy-majority piece must stay in the shallow regime, got {s}"
+        );
+    }
+
+    #[test]
+    fn cover_small_dead_climax_keeps_the_fixed_toll() {
+        // S85b/S85c:S83 逃逸阀已回退——~1.2% 的死亡高潮付不起整曲染色的固定费,判 0
+        // (它的救援归 score dead-only / 将来的 cover dead-only,不再归整曲平移)。
+        let mut semis = serde_json::Map::new();
+        for midi in 36..=96i64 {
+            let entry = if midi <= 78 {
+                serde_json::json!([5.0, 1.0])
+            } else {
+                serde_json::json!([9999.0, 0.0])
+            };
+            semis.insert(midi.to_string(), entry);
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36.0, 81.0], "comfort": [36.0, 81.0],
+                "semitones": serde_json::Value::Object(semis),
+            })),
+            0,
+        )
+        .unwrap();
+        let mut f0 = vec![hz(66.0); 5000];
+        f0.extend(vec![hz(83.0); 60]);
+        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
     }
 
     #[test]

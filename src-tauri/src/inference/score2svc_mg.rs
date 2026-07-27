@@ -719,6 +719,59 @@ fn mg_render_rvc_oversampled() {
     eprintln!("[mg] oversampled render -> probe\\{name} ({:.2}s)", audio.len() as f32 / m.sample_rate as f32);
 }
 
+/// S85b 取证:cover(sovits 口径)整段判决的 headless 复算——同 MixDown、同 sidecar 记录、
+/// 生产同款 f0/rms 链(16k+SOVITS 阈值 rmvpe+frame_rms@100fps),UTAI_MG_COVER_F0SHIFT 复现
+/// 节点移调对判决的影响。用途=把「-6 vs -24」钉到输入差还是代码差(audit 行指纹对拍)。
+#[test]
+#[ignore]
+fn mg_cover_range_replay() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    let model_json = std::env::var("UTAI_MG_RANGE_JSON").unwrap_or_else(|_| {
+        r"D:\MyDev\Utai_v2-dev\data\models\sovits\Sovits4.1东雪莲主模型.json".into()
+    });
+    let f0_shift: f32 = std::env::var("UTAI_MG_COVER_F0SHIFT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let cfg: crate::models::ModelConfig =
+        serde_json::from_str(&std::fs::read_to_string(&model_json).unwrap()).unwrap();
+    let r = super::super::vocal_range::speaker_range(&cfg, 0).expect("no vocal_range record");
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    assert!(dll.exists());
+    if let Ok(bld) = ort::init_from(&dll) {
+        let _ = bld.commit();
+    }
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::Cpu);
+    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+    let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+    let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+
+    let src = crate::audio::load_audio(Path::new(WORK).join("未命名_MixDown.wav").as_path()).unwrap();
+    let mono = crate::audio::resample::to_mono(&src);
+    let wav16k =
+        super::super::features::resample(&mono.samples, mono.sample_rate, super::super::f0::RMVPE_SR);
+    let f0 = super::super::f0::rmvpe_detect_chunked(
+        &engine,
+        &rmvpe,
+        &rmvpe_mel,
+        &wav16k,
+        super::super::f0::SOVITS_RMVPE_THRESHOLD,
+    )
+    .unwrap();
+    let k = 2.0f32.powf(f0_shift / 12.0);
+    let transposed: Vec<f32> = f0.iter().map(|v| v * k).collect();
+    let rms = super::super::vocal_range::frame_rms(
+        &wav16k,
+        super::super::f0::RMVPE_SR as usize / 100,
+        transposed.len(),
+    );
+    let s = super::super::vocal_range::piece_range_shift(&transposed, Some(&rms), &r, 100.0);
+    eprintln!("[mg] cover replay: f0_shift={f0_shift} -> verdict {s:+} st (audit line above has the cost fingerprint)");
+}
+
 /// 目标组(用户点名):同一 UTAI_MG_SLICE 时窗的 MixDown(OpenUtau 渲染源)走**真翻唱管线**
 /// `rvc::run_pipeline` 生产默认口径(RvcOptions::default():index 0.75/protect 0.33/rms_mix 0.25
 /// =装机 cover 节点缺省;e1 A 臂同款调用面,不做 A 臂的归因偏离)——「无参换声」参照臂,

@@ -383,11 +383,13 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  s85 = SCORE path switched to dead-only (whole-piece shift abolished — only rest-delimited
  *  phrases containing truly-dead notes render at a minimal local shift + inverse; everything
  *  else stays at written pitch; memory S85 三轮耳判);
- *  s85b = the S83 quiet-cap + escape-valve REVERT (cover verdicts back to the ear-proven
- *  v0.11.0 behavior — 东雪莲/鹅妈妈 -6, not -24; the same-day s85 bakes rendered under the
- *  escape-era verdicts must go dirty, hence the extra bump). Audition tag bumps in lockstep
- *  this time (_s85b_): piece_range_shift verdicts ARE a cover-audition input. */
-export const RANGE_ALGO_VERSION = "s85b";
+ *  s85b = the S83 quiet-cap + escape-valve REVERT (cover decision math back to v0.11.0);
+ *  s85c = tiered search depth for the whole-piece (cover/audition) decision: ordinary pieces
+ *  search ±12 only (the S82 ear-validated regime); the full ±24 unlocks solely for
+ *  DOMINANTLY-dead pieces (bass-song-on-female-model class). A 96%-healthy piece can never
+ *  reach -24 again (the 东雪莲/鹅妈妈 regression night). Audition tag bumps in lockstep
+ *  (_s85c_). */
+export const RANGE_ALGO_VERSION = "s85c";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
