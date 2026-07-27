@@ -693,14 +693,31 @@ fn assemble_arrays(
                             Some(_) => {
                                 // UTAU-style auto-scale, structural half: a SUNG lender never loses
                                 // more than half its frames (ceil) — in a fast run the previous
-                                // vowel must stay audible (training short-bucket vowels sit at ~3
-                                // frames; the bucketed targets handle the rest of the scaling).
+                                // vowel must stay audible. ⚠this clamp alone CANNOT keep vowels at
+                                // the training ~3 frames when every target exceeds it (S84 review:
+                                // fr=4/5 pinned whole passages at exactly 2) — the fr≤5 target cap
+                                // below is what restores the measured C/V split there.
                                 let last = pdur.last().copied().unwrap_or(0);
                                 (last - SUNG_KEEP_MIN).max(0).min((last + 1) / 2)
                             }
                             None => 0, // score start: no lender — the onset falls back in-note below
                         };
-                        let want: i64 = ph[..onset_end].iter().map(|p| onset_target_frames(p, fr)).sum();
+                        // S84 A 刀: at fr ≤ 5 (the tempo-222 160t fast-run regime) the short-bucket
+                        // MEDIAN targets (t3/k4/s4 — a ≤7 bucket dominated by 6-7-frame groups)
+                        // always exceed the ceil-half clamp, so the LENDER vowel was pinned at
+                        // exactly 2 frames for whole passages — contradicting this file's own
+                        // "targets handle the scaling" intent (S84 review) AND the measured 4-5
+                        // frame population: the DOMINANT total=5 CV shape is C2/V3 (119/261) and
+                        // total=4 sits at median C2 (C1V3 37 / C2V2 23 / C3V1 30). Capping each
+                        // onset target at 2 when the borrowing note is this short lands both:
+                        // a 5-frame lender keeps a 3-frame vowel, fr=4 behavior is unchanged
+                        // (avail already clamped to 2), and fr ≥ 6 (the ear-anchored 240t triplet)
+                        // never enters this branch — bit-identical by construction.
+                        let target = |p: &'static str| {
+                            let t = onset_target_frames(p, fr);
+                            if fr <= 5 { t.min(2) } else { t }
+                        };
+                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
                         let mut left = want.min(avail);
                         if left > 0 {
                             *pdur.last_mut().unwrap() -= left;
@@ -709,7 +726,7 @@ fn assemble_arrays(
                         // syllable identity — a starved cluster sheds its outermost member first),
                         // each capped at its own measured, note-length-bucketed target.
                         for i in (0..onset_end).rev() {
-                            let give = left.min(onset_target_frames(ph[i], fr));
+                            let give = left.min(target(ph[i]));
                             durs[i] = give;
                             left -= give;
                         }
@@ -1053,6 +1070,21 @@ mod tests {
         // parity build untouched: split_dur shape, consonant INSIDE the note window.
         let parity = build_arrays(&[("あ", 69, 7), ("た", 71, 7), ("し", 73, 6)]).unwrap();
         assert_eq!(parity.phone_dur, vec![7, 2, 5, 2, 4], "parity keeps the legacy split_dur shape");
+    }
+
+    // S84 A 刀: fr≤5 (tempo-222 160t fast runs) caps every onset target at 2 — the measured 4-5
+    // frame population's C/V split (dominant total=5 shape = C2/V3 at 119/261; total=4 median C2).
+    // A full-size 5-frame lender now keeps a 3-frame vowel instead of being drained to the clamp
+    // floor 2 (the S84 "whole passage pinned at 2 frames" equilibrium); fr=4 lending is unchanged
+    // (avail was already 2); fr≥6 never enters the cap — the 240t triplet above stays bit-identical.
+    #[test]
+    fn fast_run_fr5_vowels_keep_three_frames() {
+        let daw = daw_ja(&[("R", 0, 10), ("こ", 73, 5), ("こ", 73, 4), ("こ", 73, 5), ("こ", 73, 4)]).unwrap();
+        assert_eq!(daw.phon, vec!["SP", "k", "o", "k", "o", "k", "o", "k", "o"]);
+        // k always takes exactly 2 (capped); a 5-frame note's vowel keeps 3 after lending, a
+        // 4-frame note's keeps 2, the terminal vowel keeps its full note.
+        assert_eq!(daw.phone_dur, vec![8, 2, 3, 2, 2, 2, 3, 2, 4]);
+        assert_eq!(daw.phone_dur.iter().sum::<i64>(), 10 + 5 + 4 + 5 + 4, "frame-conserving");
     }
 
     // Score-start fallback: no lender → the onset falls back IN-note (≤2 frames from the nucleus).
