@@ -115,6 +115,48 @@ fn mg_shift_tag(shift: i64, inverse: bool, kappa: f32) -> String {
     format!("_s{shift}{}{ktag}", if inverse { "" } else { "_raw" })
 }
 
+/// S85 cvfix 臂(用户提议「像 cover 一样只动 f0 不动 cv」):UTAI_MG_F0SHIFT=s →
+/// cents 整体预移 s×100、渲染 transpose/range_shift 全 0 ⇒ f0 走移调而 cv/note_pitch
+/// 钉在写谱位(build_note_hz 的 f0 用 RAW note_pitch 分组、cents 直进输出 Hz=单变量
+/// 纯净,生产入口零镜像)。与 UTAI_MG_SHIFT 互斥。返回 (f0shift, 预移 cents 或 None)。
+fn mg_f0shift_env(shift: i64, cents: &[f32]) -> (i64, Option<Vec<f32>>) {
+    let f0shift: i64 =
+        std::env::var("UTAI_MG_F0SHIFT").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    assert!(
+        shift == 0 || f0shift == 0,
+        "UTAI_MG_SHIFT and UTAI_MG_F0SHIFT are mutually exclusive"
+    );
+    if f0shift == 0 {
+        return (0, None);
+    }
+    (f0shift, Some(cents.iter().map(|&c| c + (f0shift * 100) as f32).collect()))
+}
+
+/// cvfix 臂的探针侧逆变换(⚠与生产整段臂的唯一口径偏差:生产 inverse 在 peak-norm 之前,
+/// 这里渲染已 norm 完才逆变换——电平语义微差,听感对比无碍,记档)。fed=移调后 note_hz
+/// (生产整形三连同款)。
+fn mg_cvfix_inverse(
+    audio: Vec<f32>,
+    sample_rate: u32,
+    f0shift: i64,
+    kappa: f32,
+    evts: &[ScoreEvt<'_>],
+    vf0: &VocalF0<'_>,
+) -> Vec<f32> {
+    let arr = build_arrays_daw(evts, &NoDicts).unwrap();
+    let mut hz = build_note_hz(&arr, evts, 0, Some(vf0));
+    zero_voiceless_frames(&mut hz, &arr);
+    anchor_voiced_phone_f0(&mut hz, &arr);
+    super::super::vocal_range::apply_inverse(
+        audio,
+        sample_rate,
+        f0shift,
+        kappa,
+        Some((&hz, sample_rate as usize / 50)),
+    )
+    .unwrap()
+}
+
 #[test]
 #[ignore]
 fn mg_lane_dump() {
@@ -260,6 +302,11 @@ fn mg_render_rvc() {
     //   UTAI_MG_INDEXFILE=npy(默认 = 模型同名 .npy)。
     let (shift, inverse, kappa) = mg_shift_envs();
     let (tp, rs) = if inverse { (0, shift) } else { (shift, 0) };
+    let (f0shift, cents_shifted) = mg_f0shift_env(shift, cents);
+    let vf0 = match &cents_shifted {
+        Some(c) => VocalF0 { cents: c, voiced },
+        None => vf0,
+    };
     let ropts = RvcOptions {
         seed: 0,
         index_ratio: idx_ratio,
@@ -275,10 +322,19 @@ fn mg_render_rvc() {
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
+    let mut audio = r.audio;
+    if f0shift != 0 && inverse {
+        audio = mg_cvfix_inverse(audio, r.sample_rate, f0shift, kappa, &evts, &vf0);
+    }
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
+    let ftag = if f0shift != 0 {
+        format!("_f{f0shift}{}", if inverse { "" } else { "_raw" })
+    } else {
+        String::new()
+    };
     let tag = format!(
-        "{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{ftag}",
         if emph != DEFAULT_VOICELESS_ONSET_EMPHASIS_DB { format!("_e{emph}") } else { String::new() },
         if idx_ratio != 0.75 { format!("_i{idx_ratio}") } else { String::new() },
         if protect != RvcOptions::default().protect { format!("_p{protect}") } else { String::new() },
@@ -287,11 +343,11 @@ fn mg_render_rvc() {
         mg_shift_tag(shift, inverse, kappa),
     );
     let name = format!("mg_render_{a}_{b}_{mtag}{tag}.wav");
-    write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
+    write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
         "[mg] rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
         f_end - f_start,
-        r.audio.len() as f32 / r.sample_rate as f32,
+        audio.len() as f32 / r.sample_rate as f32,
         t0.elapsed().as_secs_f64()
     );
 }
@@ -320,6 +376,11 @@ fn mg_render_sovits() {
     let vf0 = VocalF0 { cents, voiced };
     let (shift, inverse, kappa) = mg_shift_envs();
     let (tp, rs) = if inverse { (0, shift) } else { (shift, 0) };
+    let (f0shift, cents_shifted) = mg_f0shift_env(shift, cents);
+    let vf0 = match &cents_shifted {
+        Some(c) => VocalF0 { cents: c, voiced },
+        None => vf0,
+    };
 
     let model_path = std::path::PathBuf::from(
         std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL (sovits onnx) required"),
@@ -426,14 +487,24 @@ fn mg_render_sovits() {
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
+    let mut audio = r.audio;
+    if f0shift != 0 && inverse {
+        audio = mg_cvfix_inverse(audio, r.sample_rate, f0shift, kappa, &evts, &vf0);
+    }
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let name = format!("mg_render_{a}_{b}_{mtag}{}.wav", mg_shift_tag(shift, inverse, kappa));
-    write_wav16(&out_dir.join(&name), &r.audio, r.sample_rate);
+    let ftag = if f0shift != 0 {
+        format!("_f{f0shift}{}", if inverse { "" } else { "_raw" })
+    } else {
+        String::new()
+    };
+    let name =
+        format!("mg_render_{a}_{b}_{mtag}{}{ftag}.wav", mg_shift_tag(shift, inverse, kappa));
+    write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
         "[mg] sovits rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
         f_end - f_start,
-        r.audio.len() as f32 / r.sample_rate as f32,
+        audio.len() as f32 / r.sample_rate as f32,
         t0.elapsed().as_secs_f64()
     );
 }
