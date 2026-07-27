@@ -248,6 +248,10 @@ fn mg_render_rvc_oversampled() {
     let evts = to_evts(triples);
     let vf0 = VocalF0 { cents, voiced };
     let inflate: i64 = std::env::var("UTAI_MG_INFLATE").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    // S84 E 刀二轮(用户耳测「ま→mai」):放大渲染的元音尾部是 S2CV 排的「向下一音预转」
+    // (anticipation)——中心对齐采样会把它压进真音符里,i 向拐弯提前发生。TAIL=采样时从放大
+    // 跨度末尾剪掉的帧数(core=起振+稳态;边界过渡交还给下一 phone 自己的 head 帧)。0=一轮行为。
+    let tail: i64 = std::env::var("UTAI_MG_TAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dll = root.join("../runtime/ort/onnxruntime.dll");
@@ -335,8 +339,14 @@ fn mg_render_rvc_oversampled() {
         for k in 0..pd_inf.len() {
             let d_true = chunk.phone_dur[k].max(0) as usize;
             let d_inf = pd_inf[k].max(0) as usize;
+            // 放大过的 phone:采样域=去尾 core(≥d_true,防上采);未放大的 phone:全域(=恒等)。
+            let d_core = if d_inf > d_true {
+                (d_inf as i64 - tail).max(d_true as i64) as usize
+            } else {
+                d_inf
+            };
             for j in 0..d_true {
-                let src = c_inf + ((j as f64 + 0.5) * d_inf as f64 / d_true as f64) as usize;
+                let src = c_inf + ((j as f64 + 0.5) * d_core as f64 / d_true as f64) as usize;
                 let src = src.min(c_inf + d_inf.saturating_sub(1)).min(cv_inf.nrows().saturating_sub(1));
                 cv.row_mut(c_true + j).assign(&cv_inf.row(src));
             }
@@ -368,7 +378,8 @@ fn mg_render_rvc_oversampled() {
     }
     peak_normalize(&mut audio, 0.92);
     let out_dir = Path::new(WORK).join("probe");
-    let name = format!("mg_render_{a}_{b}_teto_oversampled.wav");
+    let ttag = if tail != 0 { format!("_t{tail}") } else { String::new() };
+    let name = format!("mg_render_{a}_{b}_teto_oversampled{ttag}.wav");
     write_wav16(&out_dir.join(&name), &audio, m.sample_rate);
     eprintln!("[mg] oversampled render -> probe\\{name} ({:.2}s)", audio.len() as f32 / m.sample_rate as f32);
 }
