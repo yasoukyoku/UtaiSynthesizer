@@ -31,39 +31,15 @@ pub const MIN_COMFORT_SPAN: f32 = 5.0;
 /// Absurdity brake on any tier decision: no material legitimately needs more than ±2
 /// octaves of translation — past that a stale/garbage record is doing the deciding.
 pub const MAX_RANGE_SHIFT: i64 = 24;
-/// ★S85c cover-decision redo (耳判证据驱动的深度分级;memory S85 五轮):
-/// the shift+inverse round trip recolours 100% of the render and its audible tax GROWS with
-/// |shift| — S82 ear-validated the -7..-11 regime on real songs, while every deeper verdict the
-/// user ever heard (-16/-23/-24, both coupled and cv-fixed mechanisms) was a disaster. So the
-/// ordinary search is BOUNDED to one octave; the full ±MAX_RANGE_SHIFT stays available ONLY
-/// when the piece is DOMINANTLY dead at shift 0 (a bass song on a female model: without a deep
-/// move there is no usable sound at all — the ear-anchored +22 verdict lives in that regime).
-/// A piece where most material is healthy can no longer trade a whole-song recolour for a few
-/// percent of climax (东雪莲/鹅妈妈: 4% above-usable used to drag the whole render to -24).
-pub const SHALLOW_SHIFT_BOUND: i64 = 12;
-/// Loudness-weighted mass share at/above which the piece counts as "does not fit this model"
-/// and the deep-search regime unlocks. Scanned records judge by the damage curve's dead level
-/// (cannot-sing class); bounds-only records by the outside-usable share.
-pub const DOMINANT_DEAD_MASS: f32 = 0.5;
-/// "Cannot sing" damage level (the scan's DAMAGE_MAX is 3.0; ≥2.5 only occurs on dead or
-/// near-dead semitones). Used ONLY to pick the search regime — it never touches the cost.
-const DEAD_DAMAGE: f32 = 2.5;
-/// Real singing behaves worse at the measured ceiling than the sustained-vowel scale probe
-/// (consonants, dynamics) — whenever a shift happens anyway, land the top this far BELOW
-/// c_hi instead of hugging the boundary (S60d2: -9 st landed the song top exactly on 70
-/// and the climax still muted).
-pub const CEILING_MARGIN: f32 = 2.0;
-/// Frames an out-of-usable violation must SUSTAIN to count as musical content (≈250 ms on the
-/// 100 fps f0 grid). rmvpe reads breaths/sibilance an octave UP for a few frames at a time;
-/// those phantom islands (a) defeated the all-inside-usable byte-identical short-circuit with a
-/// single frame and (b) accumulated enough 3×-weighted mass that rescuing THEM dragged
-/// whole-song shifts of -6/-9 st on a healthy record + in-range song (S62b field case,
-/// lengv2.3 — the shift magnitude tracked the octave-doubled spikes, not the melody). A real
-/// climax is seconds long and sails through. Shorter runs are DELETED from the analysis.
+/// Frames a DEAD region must SUSTAIN to count as musical content (≈250 ms on the 100 fps
+/// grid). rmvpe reads breaths/sibilance an octave UP for a few frames at a time; those
+/// phantom islands must never trigger a recolour (S62b field case, lengv2.3 — a handful of
+/// octave-doubled spikes once dragged whole-song shifts; the dead-only world keeps the same
+/// hygiene: a real climax is seconds long and sails through, shorter runs are ignored).
 pub const MIN_VIOLATION_MS: f32 = 250.0;
-/// Largest ORIGINAL-index step a violation run may take and still count as ONE sustained run,
-/// in milliseconds. Bridges rmvpe's blips inside a held note; a real breath/consonant gap
-/// (100-300 ms) must break the run. See phantom_kept_mask.
+/// Largest ORIGINAL-index step a dead run may take and still count as ONE sustained region,
+/// in milliseconds. Bridges rmvpe's blips + the voiceless consonants inside a held climax;
+/// a real breath/phrase gap (100-300 ms) must break the region.
 pub const GAP_TOL_MS: f32 = 30.0;
 
 /// Both thresholds are expressed in TIME, not frames: the cover path judges on a 100 fps grid
@@ -72,12 +48,6 @@ pub const GAP_TOL_MS: f32 = 30.0;
 fn frames_for(ms: f32, fps: f32) -> usize {
     ((ms * fps / 1000.0).round() as usize).max(1)
 }
-/// Weight of a frame inside PROVEN usable but above the margined comfort ceiling. Tier-2
-/// semantics ("inside usable renders untouched") mean these must never trigger a shift on
-/// their own — but when a shift happens anyway they still nudge the optimizer to land the
-/// material under the margin. Mirror band below comfort weighs less (fry degrades softer).
-const BOUNDARY_WEIGHT_TOP: f32 = 0.3;
-const BOUNDARY_WEIGHT_BOTTOM: f32 = 0.1;
 
 /// Lowest / highest MIDI note the range test scans (mirrors RANGE_MIDI_LO/HI in rangeTest.ts).
 pub const DAMAGE_LO_MIDI: usize = 36;
@@ -162,33 +132,6 @@ impl SpeakerRange {
         let a = d[i] as f32 * (DAMAGE_MAX / 255.0);
         let b = d[(i + 1).min(DAMAGE_SLOTS - 1)] as f32 * (DAMAGE_MAX / 255.0);
         Some(a + (b - a) * f)
-    }
-}
-
-/// What a shift COSTS, independent of how much material it rescues.
-///
-/// The pre-S81 penalty was `0.003/st` and nothing else, which is not a cost model — rescuing 4%
-/// of the frames scored 3×0.04 = 0.12 against a 9-semitone penalty of 0.027, so the optimizer
-/// happily recoloured 100% of the audio to save 4% of it. The missing term is that a non-zero
-/// shift puts EVERY sample through the inverse transform, whatever the shift size:
-///   - SHIFT_FIXED_COST — the toll for passing the whole render through resynthesis at all
-///     (measured on real material: the shipped engine costs several dB of harmonic-to-noise
-///     ratio on 100% of the signal the moment the shift is non-zero);
-///   - SHIFT_PER_ST — the marginal formant displacement, which under a formant-preserving
-///     inverse is exactly |s| semitones of mismatch against the pitch the listener hears.
-///
-/// The magnitudes are NOT free parameters: they are the centre of the feasible region left by
-/// three optimizer tests whose expected answers the user adjudicated BY EAR (phantom bursts
-/// must not move / the S60d2 climax must still reach -7 / low material must still reach +22).
-/// Stated as an invariant: a whole-render recolour needs at least ~2% of the loudness-weighted
-/// material to be genuinely damaged before it pays for itself.
-const SHIFT_FIXED_COST: f32 = 0.06;
-const SHIFT_PER_ST: f32 = 0.005;
-fn shift_cost(s: i64) -> f32 {
-    if s == 0 {
-        0.0
-    } else {
-        SHIFT_FIXED_COST + SHIFT_PER_ST * s.abs() as f32
     }
 }
 
@@ -326,23 +269,6 @@ pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
 // (max-weight entry, else speaker_id) — reused, NOT re-implemented here (NO-dup).
 
 
-/// Per-frame RMS of `x` on a hop grid (frame i = samples [i·hop, (i+1)·hop)) — the loudness
-/// track for the shift decision's energy weighting. Frames past the end read 0.
-pub fn frame_rms(x: &[f32], hop: usize, frames: usize) -> Vec<f32> {
-    let hop = hop.max(1);
-    (0..frames)
-        .map(|i| {
-            let lo = (i * hop).min(x.len());
-            let hi = ((i + 1) * hop).min(x.len());
-            if hi <= lo {
-                return 0.0;
-            }
-            let s: f32 = x[lo..hi].iter().map(|v| v * v).sum();
-            (s / (hi - lo) as f32).sqrt()
-        })
-        .collect()
-}
-
 /// Median-of-5 over the voiced MIDI sequence (edge windows clamp) — kills the classic 1-2
 /// frame rmvpe octave flips before any range judgement sees them.
 fn median5(seq: &[f32]) -> Vec<f32> {
@@ -356,80 +282,6 @@ fn median5(seq: &[f32]) -> Vec<f32> {
             w[w.len() / 2]
         })
         .collect()
-}
-
-/// Phantom-island mask: a violation run shorter than MIN_VIOLATION_MS is detector noise
-/// (octave-read breaths, fry blips), not singing — it must neither defeat the byte-identical
-/// short-circuit nor add rescue mass to the optimizer. In-usable frames are always kept;
-/// sustained violations (a real climax) are always kept.
-///
-/// S81: `orig_idx[k]` is the ORIGINAL frame index of `seq[k]`. `seq` is the voiced-only
-/// compaction, so two high phrases separated by a breath sit side by side in it — before this,
-/// several 200 ms bursts with breaths between them fused into one long run and sailed through
-/// the filter (the run test was measuring "voiced frames" where it meant "elapsed time").
-/// A gap wider than `gap_tol` now breaks the run.
-fn phantom_kept_mask(
-    seq: &[f32],
-    orig_idx: &[usize],
-    u_lo: f32,
-    u_hi: f32,
-    min_run: usize,
-    gap_tol: usize,
-) -> Vec<bool> {
-    let mut kept = vec![true; seq.len()];
-    let mut i = 0;
-    while i < seq.len() {
-        let out = seq[i] < u_lo || seq[i] > u_hi;
-        let mut j = i + 1;
-        while j < seq.len()
-            && ((seq[j] < u_lo || seq[j] > u_hi) == out)
-            && orig_idx[j] <= orig_idx[j - 1] + gap_tol
-        {
-            j += 1;
-        }
-        if out && j - i < min_run {
-            kept[i..j].fill(false);
-        }
-        i = j;
-    }
-    kept
-}
-
-/// Per-DAW-frame Hz track for the SCORE path, so 「自己唱」 can be judged by the same optimizer
-/// the cover path uses instead of two bare min/max numbers (S81 A).
-///
-/// Length == Σ`frames` == the length of the Option-A f0 / loudness lanes, so the caller can hand
-/// the loudness envelope straight in as the energy weight. With a DAW f0 curve the track is that
-/// curve (unvoiced ⇒ 0); without one it is the note pitches held for their durations — which
-/// incidentally makes a long note weigh more than a grace note, exactly as it should.
-pub fn score_frame_hz(
-    note_nums: &[i64],
-    frames: &[i64],
-    f0_cents: &[f32],
-    f0_voiced: &[u8],
-    transpose: i64,
-) -> Vec<f32> {
-    let midi_to_hz = |m: f32| 440.0 * 2f32.powf((m - 69.0) / 12.0);
-    if !f0_cents.is_empty() {
-        return f0_cents
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| {
-                if f0_voiced.get(i).copied().unwrap_or(0) == 0 {
-                    0.0
-                } else {
-                    midi_to_hz(c / 100.0 + transpose as f32)
-                }
-            })
-            .collect();
-    }
-    let mut out = Vec::new();
-    for (i, &n) in note_nums.iter().enumerate() {
-        let len = frames.get(i).copied().unwrap_or(0).max(0) as usize;
-        let hz = if n > 0 { midi_to_hz(n as f32 + transpose as f32) } else { 0.0 };
-        out.extend(std::iter::repeat(hz).take(len));
-    }
-    out
 }
 
 /// S85 dead-only plan for the SCORE path (三轮耳判定案 — memory S85).
@@ -483,26 +335,7 @@ pub fn dead_only_plan(
         let sung: Vec<i64> = (i..=j).map(|k| eff(note_nums[k])).collect();
         let dead: Vec<i64> = sung.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
         if !dead.is_empty() {
-            let above = dead.iter().any(|&p| p as f32 > range.usable.1);
-            let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
-            // Candidate order: single-sided dead searches its own direction by growing |s|;
-            // INTERIOR dead (a bridged-weak slot inside usable — a legal record form the write
-            // side produces on purpose, rangeTest.ts longestRun) has no inherent direction and
-            // tries both, down first at each magnitude. Dead on BOTH sides is untranslatable.
-            let candidates: Vec<i64> = if above && below {
-                Vec::new()
-            } else if above {
-                (1..=MAX_RANGE_SHIFT).map(|m| -m).collect()
-            } else if below {
-                (1..=MAX_RANGE_SHIFT).collect()
-            } else {
-                (1..=MAX_RANGE_SHIFT).flat_map(|m| [-m, m]).collect()
-            };
-            let found = candidates.into_iter().find(|&s| {
-                dead.iter().all(|&p| range.slot_landing_ok(p + s))
-                    && sung.iter().all(|&p| range.slot_singable(p + s))
-            });
-            match found {
+            match minimal_rescue_shift(&dead, &sung, range) {
                 Some(shift) => out.push(DeadGroup { start: i, end: j, shift }),
                 None => unfixable.push((i, j)),
             }
@@ -512,9 +345,96 @@ pub fn dead_only_plan(
     (out, unfixable)
 }
 
+/// THE single landing search for both tracks (score phrases / cover regions): the minimal |s|
+/// that lands every DEAD pitch on a landing-grade slot while every dragged pitch stays
+/// singable. Candidate order: single-sided dead searches its own direction by growing |s|;
+/// INTERIOR dead (a bridged-weak slot inside usable — a legal record form the write side
+/// produces on purpose, rangeTest.ts longestRun) has no inherent direction and tries both,
+/// down first at each magnitude. Dead on both sides is untranslatable ⇒ None.
+fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Option<i64> {
+    let above = dead.iter().any(|&p| p as f32 > range.usable.1);
+    let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
+    let candidates: Vec<i64> = if above && below {
+        Vec::new()
+    } else if above {
+        (1..=MAX_RANGE_SHIFT).map(|m| -m).collect()
+    } else if below {
+        (1..=MAX_RANGE_SHIFT).collect()
+    } else {
+        (1..=MAX_RANGE_SHIFT).flat_map(|m| [-m, m]).collect()
+    };
+    candidates.into_iter().find(|&s| {
+        dead.iter().all(|&p| range.slot_landing_ok(p + s))
+            && all.iter().all(|&p| range.slot_singable(p + s))
+    })
+}
+
+/// S85 七轮:COVER(音频轨/audition)的 dead-only 计划 — `dead_only_plan` 的帧域版,同一
+/// 死亡判据(slot_singable)与同一落点搜索(minimal_rescue_shift),两轨哲学统一:整曲平移
+/// 退役,只有模型「连音高都发不出」的**持续**区域被局部救援;深度由该区域自己的最小落点
+/// 决定(真需要 -24 就 -24——只染那一段,不再有整曲代价权衡)。
+///
+/// `f0_hz` = 整段探测 f0(**未 pad 网格、含用户移调**=模型将要唱的音高,与输出时间轴对齐)。
+/// 区域在原始帧号上构建:GAP_TOL_MS 桥接高潮内的清辅音/换气微隙;浊死帧数 ≥ MIN_VIOLATION_MS
+/// 起判(S62b 幻影岛铁律:rmvpe 倍频误读绝不触发染色)。区内被拖拽的浊帧必须保持 singable。
+/// 返回 `(Vec<(起帧, 止帧exclusive, shift)>, Vec<无解区域(起,止)>)` — caller 恒审计带位置。
+pub fn cover_dead_plan(
+    f0_hz: &[f32],
+    fps: f32,
+    range: &SpeakerRange,
+) -> (Vec<(i64, i64, i64)>, Vec<(i64, i64)>) {
+    let min_run = frames_for(MIN_VIOLATION_MS, fps);
+    let gap_tol = frames_for(GAP_TOL_MS, fps) + 1;
+    let mut idx: Vec<usize> = Vec::new();
+    let mut midi: Vec<f32> = Vec::new();
+    for (i, &v) in f0_hz.iter().enumerate() {
+        if v > 0.0 {
+            idx.push(i);
+            midi.push(69.0 + 12.0 * (v / 440.0).log2());
+        }
+    }
+    let midi = median5(&midi); // 倍频闪烁卫生,与旧决策同款
+    let is_dead = |m: f32| !range.slot_singable(m.round() as i64);
+    // 死帧原始帧号 → gap 桥接分组 → 时长门。★门量的是「浊死帧数」而非帧号跨度(审查 S85d:
+    // 跨度门会让桥接隙+夹层活帧凑数——5 个 3 帧幻影爆点跨 250ms 就能成区;S62b 铁律
+    // 「幻影岛绝不触发染色」要求死亡本身够长。桥接仍跨活帧/清音隙=真高潮里的短落坑不劈区,
+    // 由死帧数门兜假区)。
+    let mut groups: Vec<(usize, usize, usize)> = Vec::new(); // (起, 止, 浊死帧数)
+    for (&i, &m) in idx.iter().zip(midi.iter()) {
+        if !is_dead(m) {
+            continue;
+        }
+        match groups.last_mut() {
+            Some((_, e, c)) if i <= *e + gap_tol => {
+                *e = i;
+                *c += 1;
+            }
+            _ => groups.push((i, i, 1)),
+        }
+    }
+    groups.retain(|&(_, _, c)| c >= min_run);
+    let mut out = Vec::new();
+    let mut unfixable = Vec::new();
+    for &(a, b, _) in &groups {
+        let pitches: Vec<i64> = idx
+            .iter()
+            .zip(midi.iter())
+            .filter(|(&i, _)| i >= a && i <= b)
+            .map(|(_, &m)| m.round() as i64)
+            .collect();
+        let dead: Vec<i64> =
+            pitches.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
+        match minimal_rescue_shift(&dead, &pitches, range) {
+            Some(s) => out.push((a as i64, (b + 1) as i64, s)),
+            None => unfixable.push((a as i64, (b + 1) as i64)),
+        }
+    }
+    (out, unfixable)
+}
+
 /// S85: dead-group 短语窗(50fps 帧域)——短语区间的帧窗向两侧休止扩展(pre ≤4 帧吃借帧
 /// 辅音、post ≤2 帧吃释放,各以半个间隙为上限=与相邻唱段/拼接窗永不重叠)。返回
-/// (shift, 起帧, 止帧);采样换算与交叉淡化在音频域(score2svc::apply_dead_only_windows)。
+/// (shift, 起帧, 止帧);采样换算与交叉淡化在音频域(本文件 apply_dead_only_windows)。
 pub fn dead_group_windows(
     note_nums: &[i64],
     frames: &[i64],
@@ -544,200 +464,88 @@ pub fn dead_group_windows(
         .collect()
 }
 
-/// Whole-signal shift decision for the COVER/audition path (S60d2 — frame-mass optimizer;
-/// S62b — spike hygiene + usable-aware weighting).
+/// Active RMS (50 ms windows above -40 dBFS mean) — the dead-only donor level match. Silence /
+/// no active window ⇒ None (caller skips matching rather than amplifying noise).
+fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
+    let win = (sample_rate as usize / 20).max(1);
+    let mut sum = 0f64;
+    let mut n = 0usize;
+    for c in x.chunks_exact(win) {
+        let r = (c.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / win as f64).sqrt();
+        if r > 0.01 {
+            sum += r;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| (sum / n as f64) as f32)
+}
+
+/// S85 dead-only 拼接编排(**两轨单一源**:score 短语窗 / cover 死区窗共用;S85 七轮从
+/// score2svc.rs 搬家至此)。base = 无移调的完整渲染;每个 distinct shift 渲一个完整 donor
+/// (闭包内部完成「移调渲染+逆变换回原音高」,与 base 同构=耳判验证过的拼接口径);
+/// jobs=(shift, 起帧, 止帧)@任意帧率网格,10ms 余弦交叉淡化(窗短于双淡化时收缩淡化宽度,
+/// 绝不静默丢弃)。
 ///
-/// The previous p02/p98-bounds version had two blind spots the user could HEAR: the top 2%
-/// of frames (= seconds of the climax on a full song) stayed above the ceiling by
-/// construction, and the minimal translation parked the material top exactly ON c_hi with
-/// zero headroom. Instead: brute-force the integer translation in ±MAX_RANGE_SHIFT that
-/// minimizes the sung-outside-the-zone frame mass, where
-///   - frames above USABLE weigh 3× frames below (top overflow = saturation/mute, the audible
-///     disaster; bottom overflow = fry, degrades softer),
-///   - frames still inside usable but past the margined comfort boundary weigh only
-///     BOUNDARY_WEIGHT_* — the model provably sings them (tier-2), so they can never justify
-///     recoloring the whole render by themselves, yet still steer WHERE a real shift lands
-///     (S62b: counting proven 76-77 frames as full violations recolored in-range songs),
-///   - the shift cost (SHIFT_FIXED_COST + SHIFT_PER_ST·|s|, S81-B) prices what a non-zero
-///     shift really does — 100% of the audio passes through the inverse resynthesis — and
-///     breaks near-ties toward the smallest coloration.
-/// rmvpe spike hygiene BEFORE any judgement (S62b): median-5, then phantom violation islands
-/// (< MIN_VIOLATION_RUN) are deleted — a handful of octave-doubled breath frames used to both
-/// defeat the all-inside-usable short-circuit and out-mass the shift penalty (3×0.6% of a full
-/// song beats 0.003×6), so the whole song chased the spikes down -6/-9 st.
-///
-/// LOUDNESS weighting (S62c): `energy` = optional per-frame RMS on the same grid (frame_rms).
-/// A separated stem reads high for SECONDS on reverb tails / harmony bleed / breathy passages —
-/// sustained enough to pass the run filter — but those frames are far below the lead's level.
-/// Violation mass is therefore weighted by loudness (normalized to the piece's p95, floored),
-/// so what drives a whole-render recolor is what a listener would actually HEAR out-of-range;
-/// two different models both "muffled with extension ON" over in-range songs was this (§user).
-/// A piece entirely inside USABLE (after hygiene) renders untouched (tiers 1/2, byte-identical).
-pub fn piece_range_shift(
-    f0_hz: &[f32],
-    energy: Option<&[f32]>,
-    range: &SpeakerRange,
-    fps: f32,
-) -> i64 {
-    // S81 (H): a length-mismatched energy track must fail SAFE to "unweighted", not to
-    // "every frame we couldn't measure gets FULL weight" — the latter hands silence the same
-    // authority as the lead vocal. Unreachable today (all three call sites pass exact lengths).
-    let energy = match energy {
-        Some(e) if e.len() != f0_hz.len() => {
+/// 电平匹配(审查 S85 major):两渲各自归一/后处理时,拼接窗与邻域可现短语级响度台阶——
+/// donor 先按全曲 active-RMS 比例对齐 base(峰值病理对 RMS 不敏感),±12dB 安全笼。
+/// 帧→样本映射 = base.len()/total_frames 实测每帧样本数(端点精确;SoVITS hop 网格取整的
+/// 累积漂移被线性吸收,RVC 网格下与名义值相等)。
+pub fn apply_dead_only_windows(
+    base: &mut [f32],
+    sample_rate: u32,
+    total_frames: i64,
+    jobs: &[(i64, i64, i64)],
+    mut donor_render: impl FnMut(i64) -> crate::Result<Vec<f32>>,
+) -> crate::Result<()> {
+    if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
+        return Ok(());
+    }
+    let spf = base.len() as f64 / total_frames as f64;
+    let xf = (sample_rate as usize / 100).max(2); // 10 ms
+    let base_rms = active_rms(base, sample_rate);
+    let mut shifts: Vec<i64> = jobs.iter().map(|j| j.0).collect();
+    shifts.sort_unstable();
+    shifts.dedup();
+    for s in shifts {
+        let mut donor = donor_render(s)?;
+        if donor.len().abs_diff(base.len()) > spf.ceil() as usize {
             tracing::warn!(
-                "range-extend: energy track {} frames != f0 {} — decision falls back to unweighted",
-                e.len(),
-                f0_hz.len()
+                "range-extend(dead-only): donor {} samples vs base {} — windows clamped",
+                donor.len(),
+                base.len()
             );
-            None
         }
-        other => other,
-    };
-    let mut midis: Vec<f32> = Vec::with_capacity(f0_hz.len());
-    let mut weights: Vec<f32> = Vec::with_capacity(f0_hz.len());
-    // S81 (D): the ORIGINAL frame index of each kept sample — phantom_kept_mask needs it to tell
-    // "one held note" from "several bursts separated by breaths" (the compaction hides gaps).
-    let mut orig_idx: Vec<usize> = Vec::with_capacity(f0_hz.len());
-    for (i, &v) in f0_hz.iter().enumerate() {
-        if v <= 0.0 {
-            continue;
+        if let (Some(br), Some(dr)) = (base_rms, active_rms(&donor, sample_rate)) {
+            let g = (br / dr).clamp(0.25, 4.0); // ±12dB 安全笼(比值失真时别放大灾难)
+            if (g - 1.0).abs() > 1e-3 {
+                donor.iter_mut().for_each(|v| *v *= g);
+            }
         }
-        midis.push(69.0 + 12.0 * (v / 440.0).log2());
-        weights.push(energy.and_then(|e| e.get(i)).copied().unwrap_or(1.0));
-        orig_idx.push(i);
-    }
-    if midis.len() < 10 {
-        return 0; // too little voiced material to judge — render untouched
-    }
-    let (u_lo, u_hi) = range.usable;
-    let (c_lo, c_hi) = range.comfort;
-    if c_hi - c_lo <= 0.0 {
-        return 0; // degenerate comfort never a target (speaker_range heals; defensive)
-    }
-    // normalize loudness to the piece's p95 (robust "lead level"), floor so nothing zeroes out
-    if energy.is_some() {
-        let mut sorted = weights.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let p95 = sorted[(sorted.len() as f32 * 0.95) as usize % sorted.len()].max(1e-6);
-        for w in &mut weights {
-            *w = (*w / p95).clamp(0.02, 1.0);
-        }
-    }
-    let filtered = median5(&midis);
-    let kept = phantom_kept_mask(
-        &filtered,
-        &orig_idx,
-        u_lo,
-        u_hi,
-        frames_for(MIN_VIOLATION_MS, fps),
-        frames_for(GAP_TOL_MS, fps) + 1, // a step of k skips k-1 frames
-    );
-    let dropped = kept.iter().filter(|&&k| !k).count();
-    let voiced: Vec<(f32, f32)> = filtered
-        .iter()
-        .zip(&weights)
-        .zip(&kept)
-        .filter(|(_, &k)| k)
-        .map(|((&m, &w), _)| (m, w))
-        .collect();
-    if voiced.len() < 10 {
-        // armed-always-audits (S83): a near-silent piece is a verdict too.
-        tracing::info!(
-            "range-extend: too little voiced material ({} frames after hygiene) — rendering untouched",
-            voiced.len()
-        );
-        return 0;
-    }
-    // Bounds-only records keep the pre-S81 short-circuit verbatim (byte-identical). A record
-    // WITH a scan deliberately does not get it: "inside usable" is exactly the verdict S81
-    // found untrustworthy, and the cost function below already refuses to move a clean piece
-    // (a zero-damage piece cannot beat SHIFT_FIXED_COST).
-    if range.damage.is_none() && voiced.iter().all(|&(m, _)| m >= u_lo && m <= u_hi) {
-        // armed-always-audits (S83): this short-circuit used to print only when phantoms were
-        // dropped — the common bounds-only in-range render was a silent verdict.
-        tracing::info!(
-            "range-extend: piece in-range for a bounds-only record (frames={}, phantom-dropped={dropped}) — rendering untouched",
-            voiced.len()
-        );
-        return 0; // tiers 1/2 — the whole piece sits in the proven zone
-    }
-    // S81 (C): the margin exists because the sustained-vowel probe is more forgiving than real
-    // singing, so it must be measured from the PROVEN top (u_hi). When the record already
-    // reports c_hi < u_hi the comfort criterion has charged for that gap once — subtracting the
-    // margin from c_hi as well double-counts and pushes the shift further than the evidence
-    // warrants. (comfort == usable, the common case, is unchanged.)
-    let top = c_hi.min(u_hi - CEILING_MARGIN);
-    let n: f32 = voiced.iter().map(|&(_, w)| w).sum();
-    let frame_mass = |sf: f32| -> f32 {
-        let mut mass = 0f32;
-        for &(m, w) in &voiced {
-            let p = m + sf;
-            if let Some(d) = range.damage_at(p) {
-                // S81 (E): measured per-semitone evidence replaces the four-step LADDER…
-                // …but NOT the user's comfort zone. Those are different kinds of statement:
-                // `damage` is what the probe measured, `comfort` is what the user decided they
-                // want ("above X this singer sounds bad to me" — a legitimate, guard-railed
-                // action per S60d2). Letting the scan swallow the comfort term made every
-                // manual comfort adjustment a no-op on any model that had a scan, i.e. all of
-                // them — a regression introduced with the damage curve earlier this session.
-                let wish = if p > top {
-                    BOUNDARY_WEIGHT_TOP
-                } else if p < c_lo {
-                    BOUNDARY_WEIGHT_BOTTOM
-                } else {
-                    0.0
-                };
-                mass += (d + wish) * w;
+        let n = base.len().min(donor.len());
+        for &(_, fa, fb) in jobs.iter().filter(|j| j.0 == s) {
+            let a = ((fa.max(0) as f64 * spf) as usize).min(n);
+            let b = ((fb.max(0) as f64 * spf) as usize).min(n);
+            // 窗短于双淡化 → 收缩淡化宽度;完全空窗才放弃,响亮。
+            let xfw = xf.min((b.saturating_sub(a)) / 2);
+            if b <= a || xfw == 0 {
+                tracing::warn!(
+                    "range-extend(dead-only): window frames {fa}..{fb} degenerate after clamp ({a}..{b} samples) — NOT rescued"
+                );
                 continue;
             }
-            if p > u_hi {
-                mass += 3.0 * w;
-            } else if p > top {
-                mass += BOUNDARY_WEIGHT_TOP * w;
-            } else if p < u_lo {
-                mass += w;
-            } else if p < c_lo {
-                mass += BOUNDARY_WEIGHT_BOTTOM * w;
+            for k in a..b {
+                let w = if k < a + xfw {
+                    0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
+                } else if k >= b - xfw {
+                    0.5 - 0.5 * (std::f32::consts::PI * (b - k) as f32 / xfw as f32).cos()
+                } else {
+                    1.0
+                };
+                base[k] = base[k] * (1.0 - w) + donor[k] * w;
             }
         }
-        mass / n
-    };
-    // ★S85c: tiered search depth (see SHALLOW_SHIFT_BOUND). dead0 = the loudness-weighted mass
-    // the model simply cannot sing at shift 0 — scanned records read the damage curve's dead
-    // level, bounds-only records the outside-usable share. It selects the REGIME only; the cost
-    // model itself stays byte-identical to v0.11.0 (the S83 escape valve stays reverted — its
-    // motivating case is the score path's dead-only mechanism now).
-    let dead0: f32 = voiced
-        .iter()
-        .filter(|&&(m, _)| match range.damage_at(m) {
-            Some(d) => d >= DEAD_DAMAGE,
-            None => m < u_lo || m > u_hi,
-        })
-        .map(|&(_, w)| w)
-        .sum::<f32>()
-        / n;
-    let bound = if dead0 >= DOMINANT_DEAD_MASS { MAX_RANGE_SHIFT } else { SHALLOW_SHIFT_BOUND };
-    let mut best_cost = f32::MAX;
-    let mut best_shift = 0i64;
-    for s in -bound..=bound {
-        let sf = s as f32;
-        let cost = frame_mass(sf) + shift_cost(s);
-        if cost < best_cost {
-            best_cost = cost;
-            best_shift = s;
-        }
     }
-    // One-line decision audit — ALWAYS, including "armed but chose 0" (S83 promise kept: a
-    // shift-0 line makes "why didn't it move" one grep instead of a forensics session).
-    let above0: f32 = voiced.iter().filter(|&&(m, _)| m > u_hi).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
-    let below0: f32 = voiced.iter().filter(|&&(m, _)| m < u_lo).map(|&(_, w)| w).sum::<f32>() / n * 100.0;
-    tracing::info!(
-        "range-extend optimizer: shift {best_shift:+} st (frames={}, phantom-dropped={dropped}, loudness-weighted at 0: {above0:.1}% above-usable / {below0:.1}% below, dead {:.1}% -> search ±{bound}; cost {:.4} -> {best_cost:.4})",
-        voiced.len(),
-        dead0 * 100.0,
-        frame_mass(0.0)
-    );
-    best_shift
+    Ok(())
 }
 
 /// κ — how much of the inverse's pitch move the FORMANTS follow:
@@ -859,58 +667,139 @@ mod tests {
         SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0))
     }
 
-    /// S81 (A): the score path's bare min/max tiers are gone — both paths now run
-    /// `piece_range_shift`, so what used to be `compute_range_shift`'s contract is re-asserted
-    /// here through the optimizer, on a 50 fps track built by `score_frame_hz`.
-    fn score_track(notes: &[(i64, i64)], transpose: i64) -> Vec<f32> {
-        let nn: Vec<i64> = notes.iter().map(|n| n.0).collect();
-        let fr: Vec<i64> = notes.iter().map(|n| n.1).collect();
-        score_frame_hz(&nn, &fr, &[], &[], transpose)
+    // ── S85 七轮: cover_dead_plan(帧域 dead-only;旧整曲优化器的耳锚精神迁移在此)──
+
+    fn hz(m: f32) -> f32 {
+        440.0 * 2f32.powf((m - 69.0) / 12.0)
     }
 
     #[test]
-    fn score_path_leaves_in_range_material_untouched() {
-        // The tier-1/2 contract survives the unification: a part comfortably inside the
-        // record renders with no shift (and therefore no inverse pass at all).
-        let t = score_track(&[(60, 200), (67, 200), (70, 200)], 0);
-        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), 0);
+    fn cover_plan_leaves_singable_material_untouched() {
+        // 旧 tier-1/2 契约的继承者:整段都唱得动 ⇒ 零区域 ⇒ 逐位不动、无逆变换。
+        let mut f0 = vec![hz(60.0); 2000];
+        f0.extend(vec![hz(70.0); 2000]);
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(jobs.is_empty() && unfix.is_empty());
     }
 
     #[test]
-    fn score_path_rescues_a_sustained_high_part() {
-        // …while genuinely out-of-range material still moves. usable=(48,84) c=(52,79) ⇒
-        // ceiling = min(79, 84-2) = 79; a 2 s note at 88 has to come down 9.
-        let t = score_track(&[(60, 200), (88, 100)], 0);
-        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), -9);
+    fn cover_plan_ignores_phantom_islands() {
+        // S62b 耳锚精神:一两帧的倍频误读绝不触发染色(旧机器曾被它拖走 -6/-9)。
+        let mut f0 = vec![hz(60.0); 2000];
+        f0[900] = hz(95.0);
+        f0[901] = hz(95.0);
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(jobs.is_empty() && unfix.is_empty(), "2 frames << MIN_VIOLATION_MS");
     }
 
     #[test]
-    fn score_path_ignores_a_single_overshooting_frame() {
-        // THE S81 (A) defect: the old min/max judged from the extremes, so one portamento
-        // overshoot frame transposed the entire part. 20 ms cannot do that any more.
-        let mut cents: Vec<f32> = vec![6000.0; 2000];
-        cents[900] = 9500.0; // one frame an octave+ above, as an overshoot reads
-        let voiced = vec![1u8; cents.len()];
-        let t = score_frame_hz(&[], &[], &cents, &voiced, 0);
-        assert_eq!(piece_range_shift(&t, None, &range(), 50.0), 0);
+    fn cover_plan_rescues_a_sustained_dead_climax_locally() {
+        // 旧「climax 必须得救」耳锚的 dead-only 形态:88 超出 usable(48,84) 的 1 秒高潮
+        // 成为一个区域,最小落点=comfort 顶 79(bounds 记录)⇒ 该区域 -9;其余素材零触碰。
+        let mut f0 = vec![hz(60.0); 2000];
+        f0.extend(vec![hz(88.0); 100]);
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(unfix.is_empty());
+        assert_eq!(jobs, vec![(2000, 2100, -9)]);
     }
 
     #[test]
-    fn score_frame_hz_prefers_the_curve_and_honours_rests() {
-        // With a DAW curve the track IS the curve (unvoiced ⇒ 0); without one the note
-        // pitches are held for their durations, so a long note outweighs a grace note.
-        let cents = vec![6000.0f32, 6000.0, 6000.0];
-        let t = score_frame_hz(&[69], &[3], &cents, &[1, 0, 1], 0);
-        assert_eq!(t.len(), 3);
-        assert_eq!(t[1], 0.0, "unvoiced frame is a hole, not a pitch");
-        let t2 = score_track(&[(69, 2), (0, 3), (81, 1)], 0);
-        assert_eq!(t2.len(), 6);
-        assert!((t2[0] - 440.0).abs() < 0.01);
-        assert_eq!(t2[2], 0.0, "rest note (num <= 0) is unvoiced");
-        assert!((t2[5] - 880.0).abs() < 0.02);
-        // transpose folds into the OUTPUT Hz
-        let t3 = score_track(&[(69, 1)], 12);
-        assert!((t3[0] - 880.0).abs() < 0.02);
+    fn cover_plan_moves_a_dominantly_low_piece_up() {
+        // 旧「+22」耳锚精神:整段低于音域=一个大区域,深移上来是唯一出路,深度理所应当。
+        let f0 = vec![hz(30.0); 3000];
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(unfix.is_empty());
+        assert_eq!(jobs.len(), 1);
+        let (a, b, s) = jobs[0];
+        assert_eq!((a, b), (0, 3000));
+        assert_eq!(s, 22, "30 → comfort 底 52 = +22,bounds 落点语义");
+    }
+
+    #[test]
+    fn cover_plan_bridges_consonant_gaps_inside_one_climax() {
+        // 高潮里的清辅音/换气微隙(≤GAP_TOL_MS)不许把一个区域劈成两个。
+        let mut f0 = vec![hz(60.0); 1000];
+        f0.extend(vec![hz(88.0); 40]);
+        f0.extend(vec![0.0; 2]); // 20ms 无声隙
+        f0.extend(vec![hz(88.0); 40]);
+        let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
+        assert_eq!(jobs.len(), 1, "one bridged region, not two");
+        assert_eq!(jobs[0].0, 1000);
+        assert_eq!(jobs[0].1, 1082);
+    }
+
+    #[test]
+    fn cover_plan_counts_unfixable_regions_loudly() {
+        // 拖拽守卫:死亡高潮里混着够不着的低音 ⇒ 无解 ⇒ 响亮报位置而非静默跳过。
+        let mut f0 = vec![hz(88.0); 30];
+        f0.extend(vec![hz(30.0); 30]); // 同一 gap 桥接域内:高低两侧都死
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(jobs.is_empty());
+        assert_eq!(unfix, vec![(0, 60)], "无解区域带位置(审查 S85d:取证要「在哪」)");
+    }
+
+    #[test]
+    fn cover_plan_min_run_counts_dead_frames_not_span() {
+        // 审查 S85d:5 个 3 帧幻影爆点以 ≤40ms 间隙相连 = 跨度 ≥250ms 但浊死帧仅 150ms
+        // ——门量死帧数,假区必死;真高潮(死帧本身 ≥250ms)不受影响。
+        let mut f0 = vec![hz(60.0); 1000];
+        for _ in 0..5 {
+            f0.extend(vec![hz(95.0); 3]);
+            f0.extend(vec![hz(60.0); 4]); // 活帧桥接域内夹层
+        }
+        f0.extend(vec![hz(60.0); 1000]);
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(jobs.is_empty() && unfix.is_empty(), "phantom bursts must never recolour");
+    }
+
+    // ── 共享拼接器(两轨+audition 唯一执行点;审查 S85d:搬家丢测已补钉)──
+
+    #[test]
+    fn dead_only_splice_blends_only_the_windows() {
+        // 窗外逐位不动、窗心=donor、缘上 10ms 余弦 ramp 半程=0.5。
+        // base 全零 ⇒ active_rms=None ⇒ 电平匹配跳过(不许把噪声放大成信号)。
+        let mut base = vec![0.0f32; 48000];
+        let donor = vec![1.0f32; 48000];
+        let mut calls = 0usize;
+        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 20)], |s| {
+            calls += 1;
+            assert_eq!(s, -6);
+            Ok(donor.clone())
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "one donor render per DISTINCT shift");
+        let a = (10.0 / 50.0 * 48000.0) as usize;
+        assert_eq!(base[0], 0.0);
+        assert_eq!(base[a - 1], 0.0, "窗外逐位不动");
+        assert!((base[a + 480] - 1.0).abs() < 1e-6, "ramp 结束=donor");
+        assert!((base[a + 240] - 0.5).abs() < 0.01, "10ms 余弦半程");
+        assert!((base[(0.3 * 48000.0) as usize] - 1.0).abs() < 1e-6, "窗心=donor");
+        assert_eq!(base[48000 / 2], 0.0, "窗后回到 base");
+    }
+
+    #[test]
+    fn dead_only_splice_matches_donor_level_to_base() {
+        // 审查 S85 major 的钉子:base/donor 独立归一 → 拼接窗响度台阶;donor 按全曲
+        // active-RMS 对齐 base。base 恒 0.5、donor 恒 0.25 ⇒ g=2 ⇒ 窗心 ≈0.5。
+        let mut base = vec![0.5f32; 48000];
+        let donor = vec![0.25f32; 48000];
+        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 20)], |_| Ok(donor.clone()))
+            .unwrap();
+        assert!((base[(0.3 * 48000.0) as usize] - 0.5).abs() < 1e-3, "donor 缩放到 base 电平");
+        assert!((base[0] - 0.5).abs() < 1e-6, "窗外不动");
+    }
+
+    #[test]
+    fn dead_only_splice_rescues_a_single_frame_window() {
+        // 1 帧窗收缩淡化宽度仍拿到 donor 内容,绝不静默丢弃(曾静默 continue+审计谎报)。
+        let mut base = vec![0.0f32; 48000];
+        let donor = vec![1.0f32; 48000];
+        apply_dead_only_windows(&mut base, 48000, 50, &[(-6, 10, 11)], |_| Ok(donor.clone()))
+            .unwrap();
+        let mid = (10.5 / 50.0 * 48000.0) as usize;
+        assert!(base[mid] > 0.9, "1 帧窗仍拿到 donor 内容(微淡化)");
+        assert_eq!(base[0], 0.0);
+        assert_eq!(base[48000 / 2], 0.0);
     }
 
     #[test]
@@ -960,89 +849,6 @@ mod tests {
         .unwrap()
     }
 
-    /// 真实东雪莲 sidecar 的 4 元组缩影(cover 决策夹具;S85c):err/voiced 全程健康到 79,
-    /// 但 54+ 的 low_ratio 0.5-0.96 让 thin 项把「耳朵里唱得很好的中高区」标成重损伤——
-    /// 优化器因此想用深移套利(thin 大退费),曾把整曲拖到 -24(用户耳判=灾难)。
-    fn dxl_cover_like() -> SpeakerRange {
-        let rows: &[(i64, f64, f64, f64, f64)] = &[
-            (36, 9.0, 1.0, -9.4, 0.004),
-            (48, 9.0, 1.0, -9.4, 0.017),
-            (54, 3.0, 1.0, -3.0, 0.494),
-            (60, 3.0, 1.0, -3.0, 0.183),
-            (64, 2.0, 1.0, -2.0, 0.155),
-            (68, 2.0, 1.0, -2.5, 0.097),
-            (70, 1.0, 1.0, -3.2, 0.518),
-            (72, 1.0, 1.0, -0.9, 0.538),
-            (74, 2.0, 1.0, -0.1, 0.787),
-            (76, 2.0, 1.0, -1.8, 0.902),
-            (78, 1.0, 1.0, -2.3, 0.858),
-            (79, 1.0, 1.0, -6.1, 0.957),
-            (80, 1.0, 0.67, -12.1, 0.718),
-            (81, 6.0, 0.19, -16.8, 0.316),
-        ];
-        let mut semis = serde_json::Map::new();
-        // 稠密化:相邻锚点线性外推没必要——逐槽取最近锚(粗但保持真实形态)。
-        for m in 36..=96i64 {
-            let (_, e, v, r, l) = *rows
-                .iter()
-                .min_by_key(|(mm, ..)| (mm - m).abs())
-                .unwrap();
-            let (e, v) = if m >= 84 { (9999.0, 0.0) } else { (e, v) };
-            semis.insert(m.to_string(), serde_json::json!([e, v, r, l]));
-        }
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [36, 80], "comfort": [36, 52],
-                "semitones": serde_json::Value::Object(semis)
-            })),
-            0,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn cover_small_dead_mass_stays_in_the_shallow_regime() {
-        // S85c 钉子(东雪莲/鹅妈妈之夜):96% 健康素材 + ~4% 死亡极端音的曲子,thin 套利
-        // 再诱人也只许在浅域(±12)权衡——整曲 -24 染色对这种曲子=耳判灾难,结构性不可达。
-        let mut f0 = Vec::new();
-        for _ in 0..250 {
-            for m in [64.0f32, 67.0, 71.0, 73.0, 76.0, 78.0, 73.0, 69.0] {
-                f0.extend(vec![hz(m); 10]);
-            }
-        }
-        f0.extend(vec![hz(85.0); 500]); // ~2.4% 死亡高潮(sustained,过 phantom 滤)
-        let s = piece_range_shift(&f0, None, &dxl_cover_like(), 100.0);
-        assert!(
-            (-SHALLOW_SHIFT_BOUND..=0).contains(&s),
-            "healthy-majority piece must stay in the shallow regime, got {s}"
-        );
-    }
-
-    #[test]
-    fn cover_small_dead_climax_keeps_the_fixed_toll() {
-        // S85b/S85c:S83 逃逸阀已回退——~1.2% 的死亡高潮付不起整曲染色的固定费,判 0
-        // (它的救援归 score dead-only / 将来的 cover dead-only,不再归整曲平移)。
-        let mut semis = serde_json::Map::new();
-        for midi in 36..=96i64 {
-            let entry = if midi <= 78 {
-                serde_json::json!([5.0, 1.0])
-            } else {
-                serde_json::json!([9999.0, 0.0])
-            };
-            semis.insert(midi.to_string(), entry);
-        }
-        let r = speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [36.0, 81.0], "comfort": [36.0, 81.0],
-                "semitones": serde_json::Value::Object(semis),
-            })),
-            0,
-        )
-        .unwrap();
-        let mut f0 = vec![hz(66.0); 5000];
-        f0.extend(vec![hz(83.0); 60]);
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
-    }
 
     #[test]
     fn dead_only_rescues_the_climax_note_minimally() {
@@ -1151,135 +957,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shift_is_bounded_and_degenerate_comfort_never_moves() {
-        // Far above the range but still rescuable: the optimizer takes the SMALLEST shift that
-        // clears the proven ceiling (105 - 21 = 84 = u_hi) rather than the largest that fits.
-        let t = score_track(&[(105, 300)], 0);
-        let s = piece_range_shift(&t, None, &range(), 50.0);
-        assert_eq!(s, -21);
-        assert!(s.abs() <= MAX_RANGE_SHIFT, "the ±{MAX_RANGE_SHIFT} brake is structural");
-        // Beyond rescue (115 would need -31): every reachable shift leaves it out of range, so
-        // paying for a whole-render recolour buys nothing — the new cost model declines. The
-        // pre-S81 code clamped to -24 and recoloured the render for no benefit at all.
-        let hopeless = score_track(&[(115, 300)], 0);
-        assert_eq!(piece_range_shift(&hopeless, None, &range(), 50.0), 0);
-        // degenerate comfort (defensive; speaker_range normally heals first) → never a target
-        let degenerate = SpeakerRange::bounds((48.0, 84.0), (52.0, 52.0));
-        assert_eq!(piece_range_shift(&t, None, &degenerate, 50.0), 0);
-    }
 
-    fn hz(midi: f32) -> f32 {
-        440.0 * 2f32.powf((midi - 69.0) / 12.0)
-    }
-
-    #[test]
-    fn piece_optimizer_counts_the_climax_mass() {
-        // the S60d2 field case shape: 96% of frames at 67, 4% climax at 75 — a p98-bounds
-        // decision ignored the climax entirely; the optimizer must land it under the
-        // margined ceiling (70-2=68): 75-7=68 ⇒ exactly -7, no more (|shift| penalty)
-        let r = SpeakerRange::bounds((42.0, 70.0), (42.0, 70.0));
-        let mut f0 = vec![hz(67.0); 960];
-        f0.extend(vec![hz(75.0); 40]);
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -7);
-    }
-
-    #[test]
-    fn piece_optimizer_ignores_isolated_spikes_and_proven_zone() {
-        let r = SpeakerRange::bounds((42.0, 70.0), (42.0, 70.0));
-        // 3 spike frames at 90 can't justify dragging 1000 frames below the floor → 0
-        let mut f0 = vec![hz(60.0); 1000];
-        f0.extend(vec![hz(90.0); 3]);
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
-        // entirely inside usable → untouched (tiers 1/2 preserved, byte-identical path)
-        assert_eq!(piece_range_shift(&vec![hz(65.0); 500], None, &r, 100.0), 0);
-    }
-
-    #[test]
-    fn piece_optimizer_ignores_phantom_octave_bursts() {
-        // S62b field case shape (lengv2.3, HEALTHY record [36,77]): melody well in range,
-        // sustained boundary chorus at 76.5 (PROVEN usable), plus scattered short bursts of
-        // octave-doubled breath frames at 81. The whole song must render UNTOUCHED — the old
-        // code let one phantom frame defeat the tier-2 short-circuit and then chased the
-        // burst mass down -6 st, recoloring the entire render.
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0: Vec<f32> = Vec::new();
-        for i in 0..20000 {
-            f0.push(hz(55.0 + (i % 17) as f32)); // 55..71 melody mass
-        }
-        f0.extend(vec![hz(76.5); 800]); // boundary chorus — inside usable
-        for _ in 0..5 {
-            f0.extend(vec![hz(81.0); 10]); // phantom octave burst (~100 ms)
-            f0.extend(vec![hz(65.0); 200]);
-        }
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
-        // the minimal version: a SINGLE spike frame must not defeat the short-circuit either
-        let mut f1 = vec![hz(60.0); 5000];
-        f1.push(hz(84.0));
-        assert_eq!(piece_range_shift(&f1, None, &r, 100.0), 0);
-    }
-
-    #[test]
-    fn piece_optimizer_still_rescues_sustained_true_high() {
-        // A genuinely out-of-range SUSTAINED section (4 s continuous at 80 > u_hi 77) still
-        // triggers the rescue — spike hygiene must not neuter the feature. 80 + s ≤ top (75)
-        // ⇒ exactly -5 (the |shift| penalty stops there).
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 1000];
-        f0.extend(vec![hz(80.0); 400]);
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -5);
-    }
-
-    #[test]
-    fn piece_optimizer_shifts_low_material_up() {
-        let r = SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0));
-        // 50-frame plateaus stepping 30..40 — real f0 is smooth at the 100 fps grid, so the
-        // material must be median-filter-stable (a per-frame sawtooth is not a voice).
-        let f0: Vec<f32> = (0..550).map(|i| hz(30.0 + ((i / 50) % 11) as f32)).collect();
-        // lowest frames at 30 must clear c_lo 52 → +22; the |shift| penalty stops there
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 22);
-    }
-
-    #[test]
-    fn piece_optimizer_discounts_quiet_phantom_sustains() {
-        // S62c field case: a separated stem's reverb tail / harmony bleed reads high for
-        // SECONDS (defeats the run filter) but sits far below the lead's level — loudness
-        // weighting must keep the piece untouched…
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 5000];
-        let mut en = vec![0.3f32; 5000];
-        f0.extend(vec![hz(81.0); 200]); // 2 s sustained phantom above usable
-        en.extend(vec![0.01f32; 200]); // …at tail energy (~-30 dB vs lead)
-        assert_eq!(piece_range_shift(&f0, Some(&en), &r, 100.0), 0);
-        // …while a LOUD sustained true-high still rescues (same shape as the None test).
-        let mut f1 = vec![hz(60.0); 1000];
-        let mut e1 = vec![0.25f32; 1000];
-        f1.extend(vec![hz(80.0); 400]);
-        e1.extend(vec![0.35f32; 400]);
-        assert_eq!(piece_range_shift(&f1, Some(&e1), &r, 100.0), -5);
-    }
-
-    /// Build a record whose raw scan is clean up to `good_hi` and badly voiced above it.
-    fn scanned(usable: (f32, f32), good_hi: i64) -> SpeakerRange {
-        let mut semis = serde_json::Map::new();
-        for midi in 36..=96i64 {
-            let entry = if midi <= good_hi {
-                serde_json::json!([5.0, 1.0]) // healthy: 5 cents, fully voiced
-            } else {
-                serde_json::json!([8.0, 0.60]) // pitch still perfect, voicing collapsing
-            };
-            semis.insert(midi.to_string(), entry);
-        }
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [usable.0, usable.1],
-                "comfort": [usable.0, usable.1],
-                "semitones": serde_json::Value::Object(semis),
-            })),
-            0,
-        )
-        .unwrap()
-    }
 
     #[test]
     fn damage_from_scan_is_perceptual_not_linear() {
@@ -1314,104 +992,6 @@ mod tests {
         // now the score dead-only plan's job, tested in the dead_only_* group below.)
     }
 
-    #[test]
-    fn damage_curve_moves_material_off_a_nominally_usable_but_bad_top() {
-        // THE S81 defect: `usable` says [36,77] so the pre-S81 tier-2 short-circuit rendered
-        // anything inside those 41 semitones untouched — including a top that the record's OWN
-        // raw scan shows singing badly. With the scan read as a damage curve, material sitting
-        // on the bad top is moved down to the good part instead.
-        let r = scanned((36.0, 77.0), 72);
-        let mut f0 = vec![hz(60.0); 1000];
-        f0.extend(vec![hz(75.0); 100]); // inside `usable`, but the scan says it is damaged
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -3, "material should land on the proven-good 72");
-    }
-
-    #[test]
-    fn a_narrowed_comfort_still_steers_a_scanned_record() {
-        // The user lowering the comfort ceiling is a judgement the scan cannot make for them
-        // ("above this it sounds bad TO ME"). When the damage curve arrived it briefly replaced
-        // the comfort term instead of adding to it, which silently turned every manual comfort
-        // adjustment into a no-op. Same scan, two comfort zones, different answers.
-        let wide = scanned((36.0, 77.0), 77);
-        let mut narrowed = wide;
-        narrowed.comfort = (36.0, 62.0); // user says: nothing above 62 on this singer
-        let f0 = vec![hz(70.0); 1500];
-        assert_eq!(piece_range_shift(&f0, None, &wide, 100.0), 0);
-        assert!(
-            piece_range_shift(&f0, None, &narrowed, 100.0) < 0,
-            "material above the user's comfort ceiling must still be pulled down"
-        );
-    }
-
-    #[test]
-    fn a_clean_piece_inside_a_scanned_range_still_renders_untouched() {
-        // The mirror, and the thing that must NOT regress: reading the scan may never start
-        // recolouring songs that sit in the genuinely healthy part of the range.
-        let r = scanned((36.0, 77.0), 77);
-        assert_eq!(piece_range_shift(&vec![hz(60.0); 1500], None, &r, 100.0), 0);
-    }
-
-    #[test]
-    fn a_tiny_violation_no_longer_buys_a_whole_render_recolour() {
-        // S81 (B): 1% of the material out of range used to out-vote a 5-semitone shift because
-        // the only cost of shifting was 0.003/st — while the REAL cost is that 100% of the
-        // audio goes through the inverse transform. Now it does not pay for itself.
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 3000];
-        f0.extend(vec![hz(80.0); 30]); // 300 ms — long enough to survive the phantom filter
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
-    }
-
-    #[test]
-    fn ceiling_margin_is_not_charged_twice() {
-        // S81 (C): the margin models "the probe was more forgiving than real singing", so it is
-        // measured from the PROVEN top. When the record already reports comfort strictly inside
-        // usable, that gap has been charged once by the comfort criterion — landing at
-        // c_hi - MARGIN would charge it again. Ceiling = min(c_hi, u_hi - MARGIN) = 79, so a
-        // 90 top needs -11; the pre-S81 formula (c_hi - MARGIN = 77) pushed it to -13.
-        let r = SpeakerRange::bounds((48.0, 83.0), (48.0, 79.0));
-        let mut f0 = vec![hz(70.0); 1000];
-        f0.extend(vec![hz(90.0); 400]);
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), -11, "two semitones less push than before");
-    }
-
-    #[test]
-    fn phantom_islands_separated_by_breaths_stay_phantom() {
-        // S81 (D): the run filter used to measure "consecutive VOICED frames", so five 100 ms
-        // bursts with breaths between them fused into one 50-frame run and sailed through —
-        // then out-massed the shift penalty and recolored the whole song. Each burst is
-        // individually phantom; the breaths must keep them that way.
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 2000];
-        for _ in 0..5 {
-            f0.extend(vec![hz(85.0); 10]); // 100 ms above usable
-            f0.extend(vec![0.0f32; 30]); // 300 ms breath — unvoiced
-        }
-        assert_eq!(piece_range_shift(&f0, None, &r, 100.0), 0);
-    }
-
-    #[test]
-    fn a_run_split_by_a_short_dropout_stays_one_run() {
-        // …and the mirror: a genuinely sustained high note with a 2-frame rmvpe dropout in the
-        // middle must NOT be chopped into two phantoms (that would neuter the whole feature).
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 1000];
-        f0.extend(vec![hz(80.0); 200]);
-        f0.extend(vec![0.0f32; 2]); // dropout inside the held note
-        f0.extend(vec![hz(80.0); 200]);
-        assert_ne!(piece_range_shift(&f0, None, &r, 100.0), 0, "sustained high note must still be rescued");
-    }
-
-    #[test]
-    fn mismatched_energy_length_falls_back_to_unweighted() {
-        // S81 (H): a short energy track must read as "no energy information", never as
-        // "the frames I could not measure are as loud as the lead".
-        let r = SpeakerRange::bounds((36.0, 77.0), (36.0, 77.0));
-        let mut f0 = vec![hz(60.0); 1000];
-        f0.extend(vec![hz(80.0); 400]);
-        let short = vec![0.3f32; 10];
-        assert_eq!(piece_range_shift(&f0, Some(&short), &r, 100.0), piece_range_shift(&f0, None, &r, 100.0));
-    }
 
     #[test]
     fn the_inverse_honours_the_exact_length_contract() {

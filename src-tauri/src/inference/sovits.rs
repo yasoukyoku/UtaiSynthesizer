@@ -184,19 +184,13 @@ pub fn run_pipeline(
         super::engine::memory_stamp()
     );
 
-    // S60c 音域扩展: ONE tier decision for the WHOLE signal (v1 whole-render semantics). A
-    // per-piece shift gave each silence-chunk its own formant coloration and the SEAMS between
-    // colorations were the dominant audible artifact (§user实测) — a uniform shift keeps the
-    // coloration constant across the segment. Costs one extra whole-signal rmvpe pass, paid
-    // only when armed. auto_f0 REPLACES the fed f0 inside decode_features → a shift would
-    // neither be sung nor match the inverse guide → forced 0 (force-neutralize convention).
-    let range_shift: i64 = match &range {
+    // S85 dead-only(cover;memory S85 七轮): 整曲平移退役——与 rvc 臂同一套计划/判据/
+    // 拼接器。探针 f0(未 pad 100fps、含用户 f0_shift=模型将唱的音高)只在 armed 时付一次
+    // whole-signal rmvpe(S67b chunk-bounded)。auto_f0 REPLACES the fed f0 inside
+    // decode_features → 死区 donor 既不会被唱也无逆变换引导 → 扩展禁用(原守卫保留)。
+    let (range_jobs, probe_f0): (Vec<(i64, i64, i64)>, Vec<f32>) = match &range {
         Some(r) if m.f0_predictor_session.is_none() => {
             let wav16k = resample(&mono.samples, native_sr, super::f0::RMVPE_SR);
-            // S67b: chunk-bounded like the RVC f0 stage (S66) — this was the last whole-song
-            // single-forward RMVPE feed (the 12 GB-spike class f0.rs documents). ≤64 s inputs
-            // are byte-identical; longer ones differ ≤1.4 cents at window seams (S66 parity
-            // gate), which cannot move a semitone-level range-tier decision.
             let f0 = super::f0::rmvpe_detect_chunked(
                 m.engine,
                 m.rmvpe_session,
@@ -206,23 +200,38 @@ pub fn run_pipeline(
             )?;
             let k = 2.0f32.powf(options.f0_shift / 12.0);
             let transposed: Vec<f32> = f0.iter().map(|v| v * k).collect();
-            // loudness weighting on the rmvpe 100 fps grid (16 kHz, hop 160) — see piece_range_shift
-            let rms = super::vocal_range::frame_rms(
-                &wav16k,
-                super::f0::RMVPE_SR as usize / 100,
-                transposed.len(),
-            );
-            let s = super::vocal_range::piece_range_shift(&transposed, Some(&rms), r, 100.0);
-            if s != 0 {
-                tracing::info!("range-extend(cover/sovits): whole signal rendered {s:+} st into comfort");
+            let (jobs, unfixable) = super::vocal_range::cover_dead_plan(&transposed, 100.0, r);
+            // 审计恒打印(S83 承诺):无死区也是一个判决;无解区域响亮带位置。
+            if jobs.is_empty() && unfixable.is_empty() {
+                tracing::info!(
+                    "range-extend(cover/sovits, dead-only): no dead regions (usable [{:.0},{:.0}]) — rendering untouched",
+                    r.usable.0, r.usable.1
+                );
+            } else {
+                tracing::info!(
+                    "range-extend(cover/sovits, dead-only): {} dead region(s), {} unfixable (usable [{:.0},{:.0}])",
+                    jobs.len(), unfixable.len(), r.usable.0, r.usable.1
+                );
+                for &(a, b, s) in &jobs {
+                    tracing::info!(
+                        "range-extend(cover/sovits, dead-only):   region {:.2}s..{:.2}s renders at {s:+} st",
+                        a as f32 / 100.0, b as f32 / 100.0
+                    );
+                }
+                for &(a, b) in &unfixable {
+                    tracing::warn!(
+                        "range-extend(cover/sovits, dead-only):   region {:.2}s..{:.2}s has NO landing within ±24 st — rendered broken as-is",
+                        a as f32 / 100.0, b as f32 / 100.0
+                    );
+                }
             }
-            s
+            (jobs, transposed)
         }
         Some(_) => {
             tracing::info!("range-extend(cover/sovits): auto_f0 active — range extension disabled for this render");
-            0
+            (Vec::new(), Vec::new())
         }
-        None => 0,
+        None => (Vec::new(), Vec::new()),
     };
 
     // resampled (model-sr) length of a native-sr span — slice_inference's
@@ -277,7 +286,7 @@ pub fn run_pipeline(
                 return Err(UtaiError::Inference("CANCELLED".into()));
             }
             let t_piece = std::time::Instant::now();
-            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, range_shift, &report, cancel)?;
+            let trimmed = infer_segment(m, piece_in, native_sr, seg_idx, options, &report, cancel)?;
             // pad_array(_audio, per_length) — center zero-pad up (never truncates), exactly
             // like the original; a zero-filled degenerate piece becomes zeros(per_length).
             let piece = pad_array_center(trimmed, per_length);
@@ -305,6 +314,47 @@ pub fn run_pipeline(
     // 2^(semi/12); ≈1 passes through verbatim, so formant=0 is a near-lossless no-op. Self-sing neutralizes it.
     if options.formant.abs() > 1e-6 {
         audio_out = utai_dsp::formant_warp(&audio_out, |_| 2.0_f32.powf(options.formant / 12.0));
+    }
+    // S85 dead-only(cover):死区局部救援——donor = 整管线自递归(f0_shift+s、range=None、
+    // 后处理链全同构;死区不存在时零开销),整段逆变换回原音高(fed=移调探针 f0,S82 流式
+    // formant base 保持),共享拼接器贴回死区窗。donor 折进 [0.98, 0.995] 进度带
+    // (审查 S85d:曾 noop=长曲 UI 停 98% 数分钟读作卡死)。
+    if !range_jobs.is_empty() {
+        // rmvpe 返回 1+n/hop 帧(尾+1)——total 用 len-1,否则 spf 偏小、窗位随曲长线性前漂
+        // (审查 S85d:曲尾窗早开 ~1 帧)。
+        let total_frames = (probe_f0.len() as i64 - 1).max(1);
+        let k_total = {
+            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.0).collect();
+            s.sort_unstable();
+            s.dedup();
+            s.len().max(1)
+        };
+        let pass = std::cell::Cell::new(0usize);
+        super::vocal_range::apply_dead_only_windows(
+            &mut audio_out,
+            m.sample_rate,
+            total_frames,
+            &range_jobs,
+            |s| {
+                tracing::info!("range-extend(cover/sovits, dead-only): rendering donor pass at {s:+} st");
+                let band = pass.get() as f32;
+                pass.set(pass.get() + 1);
+                let dp = move |p: f32| progress(0.98 + 0.015 * ((band + p.clamp(0.0, 1.0)) / k_total as f32));
+                let mut donor_opts = options.clone();
+                donor_opts.f0_shift += s as f32;
+                let donor = run_pipeline(m, audio, &donor_opts, None, &dp, cancel)?;
+                let k = 2.0f32.powf(s as f32 / 12.0);
+                let pf_shift: Vec<f32> = probe_f0.iter().map(|&v| v * k).collect();
+                super::vocal_range::apply_inverse(
+                    donor.audio,
+                    donor.sample_rate,
+                    s,
+                    options.range_formant_follow,
+                    Some((&pf_shift, (donor.sample_rate as usize / 100).max(1))),
+                )
+                .map_err(UtaiError::Inference)
+            },
+        )?;
     }
     tracing::info!(
         "SoVITS pipeline done in {:.1}s ({:.1}s audio out @{}Hz; {})",
@@ -337,9 +387,6 @@ fn infer_segment(
     native_sr: u32,
     seg_idx: u64,
     options: &SovitsOptions,
-    // S60c: the WHOLE-SIGNAL range shift (semitones), decided once in run_pipeline — every
-    // piece renders at the same shift so the formant coloration is uniform across seams.
-    range_shift: i64,
     report: &dyn Fn(f32),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<f32>> {
@@ -382,17 +429,6 @@ fn infer_segment(
     // get_unit_f0: f0 = f0 * 2^(tran/12) AFTER the predictor post-process; uv untouched
     let ratio = 2.0f32.powf(options.f0_shift / 12.0);
     f0.iter_mut().for_each(|v| *v *= ratio);
-    // S60-2/S60c 音域扩展: apply the run_pipeline-decided whole-signal shift to the FED f0 so
-    // the model sings inside its comfort zone; the decoded audio is shifted back after decode.
-    // shift 0 ⇒ byte-identical untouched path. A copy of the (shifted) fed f0 drives the
-    // inverse's streaming formant base (kept here — decode_features consumes f0 by value).
-    let range_f0 = if range_shift != 0 {
-        let k = 2.0f32.powf(range_shift as f32 / 12.0);
-        f0.iter_mut().for_each(|v| *v *= k);
-        Some(f0.clone())
-    } else {
-        None
-    };
     report(p_f0); // f0 done
 
     if cancel() {
@@ -431,23 +467,11 @@ fn infer_segment(
     };
 
     // ── quality-path decode (shared with the ② score render — see decode_features) ──
+    // (S85: the per-piece whole-shift + inverse that lived here is retired — dead-only donors
+    // render through run_pipeline recursion and invert whole-signal in the caller.)
     let mut out = decode_features(
         m, c, f0, uv, vol, &wav_m, seg_idx, n_frames, has_diff, p_vits, options, report, cancel,
     )?;
-
-    // S60-2: shift the decoded audio back by -range_shift (Signalsmith spectral transpose —
-    // the single execution point vocal_range::apply_inverse, no f0 guide needed). Runs on the
-    // still-padded signal so the trim below is untouched.
-    if range_shift != 0 {
-        out = super::vocal_range::apply_inverse(
-            out,
-            m.sample_rate,
-            range_shift,
-            options.range_formant_follow,
-            range_f0.as_deref().map(|f0s| (f0s, m.hop_size)),
-        )
-        .map_err(UtaiError::Inference)?;
-    }
 
     // ── loudness envelope: original applies change_rms INSIDE infer(), i.e. on the
     //    still-PADDED input/output, BEFORE slice_inference trims — mirror that order ──

@@ -719,9 +719,9 @@ fn mg_render_rvc_oversampled() {
     eprintln!("[mg] oversampled render -> probe\\{name} ({:.2}s)", audio.len() as f32 / m.sample_rate as f32);
 }
 
-/// S85b 取证:cover(sovits 口径)整段判决的 headless 复算——同 MixDown、同 sidecar 记录、
-/// 生产同款 f0/rms 链(16k+SOVITS 阈值 rmvpe+frame_rms@100fps),UTAI_MG_COVER_F0SHIFT 复现
-/// 节点移调对判决的影响。用途=把「-6 vs -24」钉到输入差还是代码差(audit 行指纹对拍)。
+/// S85 取证:cover dead-only 计划的 headless 复算——同 MixDown、同 sidecar 记录、生产同款
+/// 探针链(16k+SOVITS 阈值 rmvpe@100fps),UTAI_MG_COVER_F0SHIFT 复现节点移调。打印每个
+/// 死区(秒域)与其局部 shift,与 app 审计行逐指纹对拍。
 #[test]
 #[ignore]
 fn mg_cover_range_replay() {
@@ -763,13 +763,21 @@ fn mg_cover_range_replay() {
     .unwrap();
     let k = 2.0f32.powf(f0_shift / 12.0);
     let transposed: Vec<f32> = f0.iter().map(|v| v * k).collect();
-    let rms = super::super::vocal_range::frame_rms(
-        &wav16k,
-        super::super::f0::RMVPE_SR as usize / 100,
-        transposed.len(),
+    let (jobs, unfixable) =
+        super::super::vocal_range::cover_dead_plan(&transposed, 100.0, &r);
+    eprintln!(
+        "[mg] cover dead-only replay: f0_shift={f0_shift} -> {} region(s), {} unfixable (usable [{:.0},{:.0}])",
+        jobs.len(),
+        unfixable.len(),
+        r.usable.0,
+        r.usable.1
     );
-    let s = super::super::vocal_range::piece_range_shift(&transposed, Some(&rms), &r, 100.0);
-    eprintln!("[mg] cover replay: f0_shift={f0_shift} -> verdict {s:+} st (audit line above has the cost fingerprint)");
+    for &(a, b) in &unfixable {
+        eprintln!("[mg]   UNFIXABLE region {:.2}s..{:.2}s", a as f32 / 100.0, b as f32 / 100.0);
+    }
+    for &(a, b, s) in &jobs {
+        eprintln!("[mg]   region {:.2}s..{:.2}s -> {s:+} st", a as f32 / 100.0, b as f32 / 100.0);
+    }
 }
 
 /// 目标组(用户点名):同一 UTAI_MG_SLICE 时窗的 MixDown(OpenUtau 渲染源)走**真翻唱管线**
@@ -842,8 +850,8 @@ fn mg_render_cover() {
         min_frames: 12,
     };
     // S85 靶场:cover 的 shift 生产等价 = fed f0 ×2^(s/12)(输入音频/cv 不动)。f0_shift 在
-    // run_pipeline 里先于 coarse 量化乘到整轨(rvc.rs:256)= 生产 ranged_chunk 逐 chunk 乘的
-    // 同一数学;raw 臂(UTAI_MG_INVERSE=0)即到此为止=「模型在 shift 位唱 cover」。
+    // run_pipeline 里先于 coarse 量化乘到整轨(rvc.rs:256)= S85d 生产 donor 自递归
+    // (f0_shift+=s)的同一数学;raw 臂(UTAI_MG_INVERSE=0)即到此为止=「模型在 shift 位唱」。
     let (shift, inverse, kappa) = mg_shift_envs();
     let ropts = RvcOptions { f0_shift: shift as f32, ..Default::default() };
     let noop = |_: f32| {};

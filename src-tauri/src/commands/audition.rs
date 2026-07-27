@@ -318,78 +318,27 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
                     h = (h.wrapping_mul(33)) ^ (*b as u32);
                 }
             }
-            // s85c: S85b reverted the S83 quiet-cap/escape valve, S85c tiered the search depth
-            // — both change piece_range_shift verdicts (a COVER-pipeline decision input), so
-            // the tag moves in lockstep per the scope note above.
+            // S85d 审查:cover 判决现读 slot_flags(f0 阈值位)——damage 在饱和区对阈值翻转
+            // 不敏感(重扫 voiced 0.40→0.55 同 damage 字节但 SINGABLE 翻位),flags 必须入哈希,
+            // 否则记录变化后缓存稳定供旧判决的音频。
+            if let Some(f) = &r.slot_flags {
+                for b in f.iter() {
+                    h = (h.wrapping_mul(33)) ^ (*b as u32);
+                }
+            }
+            // s85d: cover/audition switched to dead-only (whole-clip shift retired; the
+            // pipelines own the policy) — a decision change, so the tag moves in lockstep.
             format!(
-                "_s85c_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s85d_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }
     }
 }
 
-/// Compute the whole-clip shift for the render + inverse pair, plus the SHIFTED f0 track
-/// (100 fps) that drives the inverse's streaming formant base (S82b anti-pop).
-/// None = no record / already in range → render untouched.
-fn audition_range_prep(
-    app: &AppState,
-    rmvpe_sid: &str,
-    mel: &ndarray::Array2<f32>,
-    src: &crate::audio::AudioBuffer,
-    range: Option<crate::inference::vocal_range::SpeakerRange>,
-) -> Result<Option<(i64, Vec<f32>)>, String> {
-    let Some(r) = range else { return Ok(None) };
-    let mono = crate::audio::resample::to_mono(src);
-    let wav16k = crate::inference::features::resample(
-        &mono.samples,
-        mono.sample_rate,
-        crate::inference::f0::RMVPE_SR,
-    );
-    let f0 = crate::inference::f0::rmvpe_detect(
-        &app.inference.engine,
-        rmvpe_sid,
-        mel,
-        &wav16k,
-        crate::inference::f0::SOVITS_RMVPE_THRESHOLD,
-    )
-    .map_err(|e| e.to_string())?;
-    // loudness weighting on the rmvpe 100 fps grid (16 kHz, hop 160) — see piece_range_shift
-    let rms = crate::inference::vocal_range::frame_rms(
-        &wav16k,
-        crate::inference::f0::RMVPE_SR as usize / 100,
-        f0.len(),
-    );
-    let shift = crate::inference::vocal_range::piece_range_shift(&f0, Some(&rms), &r, 100.0);
-    if shift == 0 {
-        return Ok(None);
-    }
-    tracing::info!("audition range-extend: clip rendered {shift:+} st into comfort");
-    let k = 2.0f32.powf(shift as f32 / 12.0);
-    // shifted, zeros preserved (rests stay unvoiced for the schedule's stickiness logic)
-    let fed: Vec<f32> = f0.iter().map(|v| v * k).collect();
-    Ok(Some((shift, fed)))
-}
-
-/// Apply the inverse of `audition_range_prep`'s shift to a finished render.
-fn audition_range_invert(
-    result: crate::inference::SynthesisResult,
-    prep: &Option<(i64, Vec<f32>)>,
-) -> Result<crate::inference::SynthesisResult, String> {
-    match prep {
-        Some((shift, fed)) => Ok(crate::inference::SynthesisResult {
-            audio: crate::inference::vocal_range::apply_inverse(
-                result.audio,
-                result.sample_rate,
-                *shift,
-                crate::inference::vocal_range::DEFAULT_FORMANT_KAPPA,
-                Some((fed.as_slice(), (result.sample_rate as usize / 100).max(1))),
-            )?,
-            sample_rate: result.sample_rate,
-        }),
-        None => Ok(result),
-    }
-}
+// (S85 七轮: the audition-local whole-clip shift/inverse pair is retired — `range` passes
+// straight into rvc/sovits::run_pipeline, whose dead-only machinery owns the policy for every
+// cover-family render. Single execution point, zero audition-specific range code.)
 
 fn audition_source(state: &AppState) -> Result<PathBuf, String> {
     let p = state
@@ -531,9 +480,7 @@ pub async fn render_audition_voice(
             .inference
             .load_npy(&aux_path(&app, AUX_RMVPE_MEL, "RMVPE mel filterbank")?)
             .map_err(|e| e.to_string())?;
-        // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
-        let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-        let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
+        // S85 dead-only: the pipelines own the range machinery — the record passes straight in.
         let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
         let cancel = || app.inference.voice_cancelled(run_epoch);
 
@@ -580,10 +527,9 @@ pub async fn render_audition_voice(
                     index_ratio: 0.0,
                     gpu_extract: false,
                     speaker_id,
-                    f0_shift: range_f0_shift,
                     ..Default::default()
                 };
-                rvc::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                rvc::run_pipeline(&model, &audio_buf, &options, range, &progress, &cancel)
                     .map_err(|e| e.to_string())?
             }
             _ => {
@@ -641,14 +587,12 @@ pub async fn render_audition_voice(
                     cluster_ratio: 0.0,
                     gpu_extract: false,
                     speaker_id,
-                    f0_shift: range_f0_shift,
                     ..Default::default()
                 };
-                sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                sovits::run_pipeline(&model, &audio_buf, &options, range, &progress, &cancel)
                     .map_err(|e| e.to_string())?
             }
         };
-        let result = audition_range_invert(result, &range_prep)?;
         write_wav_atomic(&out, &result.audio, result.sample_rate)?;
         // free the candidate's VRAM + Windows file locks (the dir must stay
         // deletable by 清空结果 / the next training run)
@@ -1136,9 +1080,7 @@ pub async fn render_model_audition(
                 None
             };
             let audio_buf = crate::audio::load_audio(&src).map_err(|e| e.to_string())?;
-            // S60c: whole-clip range pre-shift (single chunk = uniform formant character)
-            let range_prep = audition_range_prep(&app, &rmvpe_sid, mel.as_ref(), &audio_buf, range)?;
-            let range_f0_shift = range_prep.as_ref().map(|(s, _)| *s as f32).unwrap_or(0.0);
+            // S85 dead-only: the pipelines own the range machinery — the record passes straight in.
             let progress = progress_emitter(apph.clone(), app.clone(), run_epoch, candidate_id.clone());
             let cancel = || app.inference.voice_cancelled(run_epoch);
             let nch = noise_channels(&entry.config);
@@ -1150,7 +1092,6 @@ pub async fn render_model_audition(
                         index_ratio: 0.0,
                         speaker_id: Some(spk),
                         gpu_extract: false,
-                        f0_shift: range_f0_shift,
                         ..Default::default()
                     };
                     let model = rvc::RvcModel {
@@ -1166,7 +1107,7 @@ pub async fn render_model_audition(
                         noise_channels: nch,
                         min_frames: min_frames(&entry.config, 12),
                     };
-                    rvc::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                    rvc::run_pipeline(&model, &audio_buf, &options, range, &progress, &cancel)
                         .map_err(|e| e.to_string())?
                 }
                 VoiceBackendType::SoVits => {
@@ -1178,7 +1119,6 @@ pub async fn render_model_audition(
                         cluster_ratio: 0.0,
                         speaker_id: Some(spk),
                         gpu_extract: false,
-                        f0_shift: range_f0_shift,
                         ..Default::default()
                     };
                     let model = sovits::SovitsModel {
@@ -1207,11 +1147,10 @@ pub async fn render_model_audition(
                         noise_channels: nch,
                         min_frames: min_frames(&entry.config, 6),
                     };
-                    sovits::run_pipeline(&model, &audio_buf, &options, None, &progress, &cancel)
+                    sovits::run_pipeline(&model, &audio_buf, &options, range, &progress, &cancel)
                         .map_err(|e| e.to_string())?
                 }
             };
-            let result = audition_range_invert(result, &range_prep)?;
             write_wav_atomic(&out, &result.audio, result.sample_rate)?;
             Ok(out.to_string_lossy().into_owned())
         })

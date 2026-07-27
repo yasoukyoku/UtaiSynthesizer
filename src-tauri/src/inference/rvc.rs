@@ -283,45 +283,43 @@ pub fn run_pipeline(
     let mut audio_opt: Vec<f32> = Vec::new();
     let mut s_ix = 0usize;
     let mut chunk_idx: u64 = 0;
-    // S60-2/S60c 音域扩展: ONE tier decision over the WHOLE fed pitch track (v1 whole-render
-    // semantics — a per-chunk shift gave each chunk its own formant coloration and the seams
-    // between colorations were the dominant audible artifact, §user实测). Every chunk renders
-    // at the same shift (coarse re-binned from the shifted Hz) and its UNtrimmed output is
-    // shifted back (Signalsmith) before append_trimmed, so the constant-shift seams stay
-    // inside the trimmed-away pads/silence. shift 0 ⇒ the exact original vc_chunk calls
-    // (byte-identical).
-    let range_shift = range
-        .map(|r| {
-            // loudness weighting: RMS on the same 100 fps grid pitchf was detected on — quiet
-            // phantom highs (reverb tails / harmony bleed) stop driving whole-song shifts
-            let rms = super::vocal_range::frame_rms(&audio_pad, WINDOW, pitchf.len());
-            super::vocal_range::piece_range_shift(&pitchf, Some(&rms), &r, 100.0)
-        })
-        .unwrap_or(0);
-    if range_shift != 0 {
-        tracing::info!("range-extend(cover/rvc): whole signal rendered {range_shift:+} st into comfort");
-    }
-    let ranged_chunk = |pitch_sl: &[i64],
-                        pitchf_sl: &[f32],
-                        chunk: &[f32],
-                        chunk_idx: u64|
-     -> Result<Vec<f32>> {
-        if range_shift == 0 {
-            return vc_chunk(m, chunk, pitch_sl, pitchf_sl, sid, spk_mix_dense.as_deref(), options, chunk_idx);
+    // S85 dead-only(cover;memory S85 七轮): 整曲平移退役——只有模型「连音高都发不出」的
+    // 持续区域被局部救援,深度=该区域自己的最小落点(与 score 同一套判据/搜索/拼接器)。
+    // 计划在未 pad 网格上出(与输出时间轴对齐;pitchf 已含用户 f0_shift=模型将唱的音高);
+    // 死区 donor 在装配+后处理完成后以 run_pipeline 自递归渲染(与 base 全链同构)。
+    let out_frames = audio_f.len() / WINDOW;
+    let pad_f = t_pad / WINDOW;
+    let range_jobs: Vec<(i64, i64, i64)> = match &range {
+        Some(r) => {
+            let pf_out = &pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())];
+            let (jobs, unfixable) = super::vocal_range::cover_dead_plan(pf_out, 100.0, r);
+            // 审计恒打印(S83 承诺):无死区也是一个判决;无解区域响亮带位置。
+            if jobs.is_empty() && unfixable.is_empty() {
+                tracing::info!(
+                    "range-extend(cover/rvc, dead-only): no dead regions (usable [{:.0},{:.0}]) — rendering untouched",
+                    r.usable.0, r.usable.1
+                );
+            } else {
+                tracing::info!(
+                    "range-extend(cover/rvc, dead-only): {} dead region(s), {} unfixable (usable [{:.0},{:.0}])",
+                    jobs.len(), unfixable.len(), r.usable.0, r.usable.1
+                );
+                for &(a, b, s) in &jobs {
+                    tracing::info!(
+                        "range-extend(cover/rvc, dead-only):   region {:.2}s..{:.2}s renders at {s:+} st",
+                        a as f32 / 100.0, b as f32 / 100.0
+                    );
+                }
+                for &(a, b) in &unfixable {
+                    tracing::warn!(
+                        "range-extend(cover/rvc, dead-only):   region {:.2}s..{:.2}s has NO landing within ±24 st — rendered broken as-is",
+                        a as f32 / 100.0, b as f32 / 100.0
+                    );
+                }
+            }
+            jobs
         }
-        let k = 2.0f32.powf(range_shift as f32 / 12.0);
-        let pf: Vec<f32> = pitchf_sl.iter().map(|&v| v * k).collect();
-        let pc: Vec<i64> = pf.iter().map(|&v| f0_to_coarse(v)).collect();
-        let out = vc_chunk(m, chunk, &pc, &pf, sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
-        // the chunk's fed f0 (100 fps grid) drives the streaming formant base (S82b anti-pop)
-        super::vocal_range::apply_inverse(
-            out,
-            m.sample_rate,
-            range_shift,
-            options.range_formant_follow,
-            Some((&pf, m.sample_rate as usize / 100)),
-        )
-        .map_err(UtaiError::Inference)
+        None => Vec::new(),
     };
     for &ot in &opt_ts {
         if cancel() {
@@ -337,7 +335,7 @@ pub fn run_pipeline(
         let pl = s_ix / WINDOW;
         let ph = (t + t_pad2) / WINDOW;
         let t_chunk = std::time::Instant::now();
-        let out = ranged_chunk(&pitch[pl..ph], &pitchf[pl..ph], chunk, chunk_idx)?;
+        let out = vc_chunk(m, chunk, &pitch[pl..ph], &pitchf[pl..ph], sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
         append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
         s_ix = t;
         chunk_idx += 1;
@@ -357,7 +355,7 @@ pub fn run_pipeline(
     }
     let chunk = &audio_pad[s_ix..];
     let t_chunk = std::time::Instant::now();
-    let out = ranged_chunk(&pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], chunk, chunk_idx)?;
+    let out = vc_chunk(m, chunk, &pitch[s_ix / WINDOW..], &pitchf[s_ix / WINDOW..], sid, spk_mix_dense.as_deref(), options, chunk_idx)?;
     append_trimmed(&mut audio_opt, &out, t_pad_tgt)?;
     tracing::debug!(
         "RVC chunk {}/{} done (final, {:.1}s in, {:.0} ms, {})",
@@ -383,6 +381,53 @@ pub fn run_pipeline(
     // resample. ratio = 2^(semi/12); ≈1 passes through verbatim → formant=0 is a near-lossless no-op.
     if options.formant.abs() > 1e-6 {
         audio_opt = utai_dsp::formant_warp(&audio_opt, |_| 2.0_f32.powf(options.formant / 12.0));
+    }
+    // S85 dead-only(cover):死区局部救援——donor = 整管线自递归(f0_shift+s、range=None、
+    // 后处理链全同构;代价=每个 distinct shift 一次完整渲染,死区不存在时零开销),整段
+    // 逆变换回原音高(fed=移调 pf,S82 流式 formant base 保持),共享拼接器贴回死区窗。
+    // donor 折进 [0.95, 0.99] 进度带(审查 S85d:曾 noop=长曲 UI 停 95% 读作卡死)。
+    if !range_jobs.is_empty() {
+        if final_sr % 100 != 0 {
+            // resample_sr 理论路径(现无写入者,恒 0):非 100 整除采样率下 fed hop 的整除
+            // 截断会让 formant base 时轴漂移——响亮留痕(审查 S85d)。
+            tracing::warn!(
+                "range-extend(cover/rvc, dead-only): output sr {final_sr} not %100 — formant base grid may drift"
+            );
+        }
+        let pf_out: Vec<f32> =
+            pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())].to_vec();
+        let k_total = {
+            let mut s: Vec<i64> = range_jobs.iter().map(|j| j.0).collect();
+            s.sort_unstable();
+            s.dedup();
+            s.len().max(1)
+        };
+        let pass = std::cell::Cell::new(0usize);
+        super::vocal_range::apply_dead_only_windows(
+            &mut audio_opt,
+            final_sr,
+            out_frames as i64,
+            &range_jobs,
+            |s| {
+                tracing::info!("range-extend(cover/rvc, dead-only): rendering donor pass at {s:+} st");
+                let band = pass.get() as f32;
+                pass.set(pass.get() + 1);
+                let dp = move |p: f32| progress(0.95 + 0.04 * ((band + p.clamp(0.0, 1.0)) / k_total as f32));
+                let mut donor_opts = options.clone();
+                donor_opts.f0_shift += s as f32;
+                let donor = run_pipeline(m, audio, &donor_opts, None, &dp, cancel)?;
+                let k = 2.0f32.powf(s as f32 / 12.0);
+                let pf_shift: Vec<f32> = pf_out.iter().map(|&v| v * k).collect();
+                super::vocal_range::apply_inverse(
+                    donor.audio,
+                    donor.sample_rate,
+                    s,
+                    options.range_formant_follow,
+                    Some((&pf_shift, (donor.sample_rate as usize / 100).max(1))),
+                )
+                .map_err(UtaiError::Inference)
+            },
+        )?;
     }
     // NO int16 quantization (original's audio_max/max_int16 normalize skipped — we stay f32).
     tracing::info!(

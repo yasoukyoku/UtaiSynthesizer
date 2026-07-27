@@ -1918,7 +1918,7 @@ pub async fn render_vocal_segment(
                     let sr = result.sample_rate;
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    score2svc::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
@@ -1999,7 +1999,7 @@ pub async fn render_vocal_segment(
                     let sr = result.sample_rate;
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    score2svc::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);

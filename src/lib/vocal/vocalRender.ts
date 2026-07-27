@@ -384,12 +384,13 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  phrases containing truly-dead notes render at a minimal local shift + inverse; everything
  *  else stays at written pitch; memory S85 三轮耳判);
  *  s85b = the S83 quiet-cap + escape-valve REVERT (cover decision math back to v0.11.0);
- *  s85c = tiered search depth for the whole-piece (cover/audition) decision: ordinary pieces
- *  search ±12 only (the S82 ear-validated regime); the full ±24 unlocks solely for
- *  DOMINANTLY-dead pieces (bass-song-on-female-model class). A 96%-healthy piece can never
- *  reach -24 again (the 东雪莲/鹅妈妈 regression night). Audition tag bumps in lockstep
- *  (_s85c_). */
-export const RANGE_ALGO_VERSION = "s85c";
+ *  s85c = tiered search depth (superseded within the same night);
+ *  s85d = the whole-piece shift machinery is RETIRED everywhere — cover/audition now run the
+ *  same dead-only philosophy as the score path (user verdict, memory S85 七轮): only sustained
+ *  regions the model literally cannot phonate get a local minimal-landing shift + inverse
+ *  (as deep as THAT region truly needs, ±24 cap), everything else renders at its own pitch,
+ *  bit-identical to extension-off. Audition tag bumps in lockstep (_s85d_). */
+export const RANGE_ALGO_VERSION = "s85d";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
