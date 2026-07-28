@@ -73,10 +73,11 @@ async function validatePass(): Promise<void> {
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, null);
           app.setVocalDropped(seg.id, null);
+          app.setVocalBorrowed(seg.id, null);
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-        const { triples, tripleNoteIds, droppedNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
+        const { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
         try {
           const classes = await invoke<Array<{ kind: string }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
@@ -98,6 +99,9 @@ async function validatePass(): Promise<void> {
           // marking (both = "this note cannot sing") but a SEPARATE map, so the track header can
           // say "note too short" instead of falsely claiming a lyric OOV(用户实机反馈)。
           app.setVocalDropped(seg.id, droppedNoteIds.length ? droppedNoteIds : null);
+          // S87 #3: rescued-by-borrow notes ride a SEPARATE channel — they DO sound, so the UI grades
+          // them as a non-blocking notice instead of the blocking red the two maps above wear.
+          app.setVocalBorrowed(seg.id, borrowedNoteIds.length ? borrowedNoteIds : null);
         } catch (e) {
           console.warn("[oovWatch] validate_lyrics failed:", e);
           validated.set(seg.id, stamp); // don't hot-loop on a persistent backend error
@@ -110,6 +114,7 @@ async function validatePass(): Promise<void> {
         validated.delete(id);
         app.setVocalOov(id, null);
         app.setVocalDropped(id, null);
+        app.setVocalBorrowed(id, null);
       }
     }
     lastTracks = st.tracks;

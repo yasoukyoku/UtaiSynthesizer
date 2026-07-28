@@ -335,6 +335,12 @@
   color: var(--color-error);
 }
 
+/* S87: ADVISORY variant — the track's only finding is a note the renderer rescued by borrowing a frame.
+   It sounds, so the badge must not wear the blocking red (§user: 红色现在一律=阻塞性警告). */
+.track-oov-badge.advisory {
+  color: var(--color-warning);
+}
+
 .track-info {
   flex: 1;
   min-width: 0;

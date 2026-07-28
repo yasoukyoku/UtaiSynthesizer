@@ -219,7 +219,8 @@
     "language": "Track default language",
     "noVoices": "No singer models available — import one in the Resource Manager first",
     "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language",
-    "droppedWarning": "Some notes are shorter than one frame (~20 ms) and cannot sound — lengthen or delete them (marked red)"
+    "droppedWarning": "Some notes are shorter than one frame (~20 ms) and cannot sound — lengthen or delete them (marked red)",
+    "borrowedWarning": "Some notes were shorter than one frame and borrowed one from a neighbour so they can sound (marked amber) — lengthen them if you want exact control"
   },
   "langs": {
     "zh": "Chinese",

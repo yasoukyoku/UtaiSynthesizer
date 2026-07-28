@@ -220,12 +220,233 @@ describe("buildVocalScore", () => {
 //    (pre-S84 it vanished silently — the 30t く/ず audit case); the timeline stays conserved
 //    (forcing a minimum frame would break Σframes == frameOf(cursor)). ──
 describe("buildScoreTriples — zero-frame note drop is loud", () => {
-  it("reports the dropped note id, emits no triple for it, conserves the frame timeline", () => {
-    // tempo 222: ticksPerFrame = 35.52. tick 20 → frame 1; tick 50 → frame 1 → zero-span note.
-    const notes = [mkNote("long", 480, 480, 60), mkNote("tiny", 20, 30, 66)];
-    const { triples, tripleNoteIds, droppedNoteIds, frameCount } = buildScoreTriples(notes, 222, "AP", 2);
-    expect(droppedNoteIds).toEqual(["tiny"]);
-    expect(tripleNoteIds).not.toContain("tiny");
+  it("a note that CANNOT borrow is still dropped loudly, and the frame timeline stays conserved", () => {
+    // tempo 120 → ticksPerFrame 19.2. `b` spans ticks 20..25 → frames 1..1 = ZERO, and it is boxed in by
+    // two 1-frame notes: neither can pay (a sung lender must keep ≥2), so it must still be reported.
+    const notes = [mkNote("a", 0, 20, 60), mkNote("b", 20, 5, 62), mkNote("c", 25, 20, 64)];
+    const { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, frameCount } = buildScoreTriples(notes, 120, "AP", 2);
+    expect(droppedNoteIds).toEqual(["b"]);
+    expect(borrowedNoteIds).toEqual([]);
+    for (const id of droppedNoteIds) expect(tripleNoteIds).not.toContain(id);
     expect(triples.reduce((s, t) => s + t.frames, 0)).toBe(frameCount);
+  });
+});
+
+// ── S87 #3 借帧刀 — a note whose span rounds to ZERO 50fps frames borrows ONE frame from a neighbour
+//    instead of vanishing. THE invariant: a borrow moves a SHARED frame boundary (the lender's end and the
+//    borrower's start are the same number), so Σframes == frameOf(cursor) is preserved BY CONSTRUCTION —
+//    "force a minimum frame" would break it and is why the pre-S87 code just dropped the note. ──
+describe("buildScoreTriples — S87 frame borrowing", () => {
+  const sumFrames = (t: { frames: number }[]) => t.reduce((s, x) => s + x.frames, 0);
+
+  it("★ CONSERVATION holds in every case (the one rule the knife may never break)", () => {
+    const cases: Note[][] = [
+      [mkNote("n1", 0, 480, 60)],
+      [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 510, 480, 64)], // sub-frame in the middle
+      [mkNote("a", 0, 3, 60), mkNote("b", 3, 480, 62)], // sub-frame at the very START (no previous item)
+      [mkNote("a", 0, 480, 60), mkNote("b", 480, 3, 62)], // sub-frame at the very END (no next item)
+      [mkNote("a", 0, 30, 60), mkNote("b", 30, 30, 62), mkNote("c", 60, 30, 64)], // a run of short notes
+      [mkNote("a", 0, 480, 60), mkNote("b", 900, 3, 62), mkNote("c", 1400, 480, 64)], // gaps around it
+    ];
+    let borrows = 0;
+    let drops = 0;
+    for (const notes of cases) {
+      for (const tempo of [60, 120, 222, 300]) {
+        const r = buildScoreTriples(notes, tempo, "AP", 2);
+        expect(sumFrames(r.triples)).toBe(r.frameCount);
+        // and every emitted triple must actually occupy time
+        for (const t of r.triples) expect(t.frames).toBeGreaterThan(0);
+        borrows += r.borrowedNoteIds.length;
+        drops += r.droppedNoteIds.length;
+      }
+    }
+    // …and the sweep must actually EXERCISE both outcomes, or "conservation holds" would just be a
+    // statement about a knife that never fired (a review caught this loop being 20/24 no-ops).
+    expect(borrows).toBeGreaterThan(0);
+    expect(drops).toBeGreaterThan(0);
+  });
+
+  it("borrows ONE frame BACKWARD from the previous note — downstream boundaries do not move", () => {
+    // tempo 222 (ticksPerFrame 35.52): b spans ticks 480..510 → frames 14..14 = zero.
+    const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 510, 480, 64)];
+    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 510, 480, 64)], 222, "AP", 2);
+    const r = buildScoreTriples(notes, 222, "AP", 2);
+    expect(r.borrowedNoteIds).toEqual(["b"]);
+    expect(r.droppedNoteIds).toEqual([]);
+    const tb = r.triples[r.tripleNoteIds.indexOf("b")]!;
+    expect(tb.frames).toBe(1); // it sounds now
+    // the lender paid exactly one frame…
+    const aNew = r.triples[r.tripleNoteIds.indexOf("a")]!.frames;
+    const aOld = base.triples[base.tripleNoteIds.indexOf("a")]!.frames;
+    expect(aNew).toBe(aOld - 1);
+    // …and NOTHING downstream shifted: c keeps its own frame count, and the total is unchanged
+    expect(r.triples[r.tripleNoteIds.indexOf("c")]!.frames).toBe(base.triples[base.tripleNoteIds.indexOf("c")]!.frames);
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
+    expect(r.frameCount).toBe(base.frameCount);
+  });
+
+  it("falls FORWARD when the previous item is too short to lend — and it is the FOLLOWER that pays", () => {
+    // tempo 222 (ticksPerFrame 35.52): items are R[0,1] (1 frame), a[1,1] (ZERO), R[1,14] (13), long[14,27].
+    // The LEADING rest has only 1 frame, so it may not pay (a rest must keep ≥1) → the borrow goes forward.
+    const notes = [mkNote("a", 20, 30, 66), mkNote("long", 480, 480, 60)];
+    const r = buildScoreTriples(notes, 222, "AP", 2);
+    expect(r.droppedNoteIds).toEqual([]);
+    expect(r.borrowedNoteIds).toEqual(["a"]);
+    // ★ pin WHO paid and WHERE the frame landed — without these the same assertions pass for an illegal
+    // backward borrow that deletes the leading rest (a review caught exactly that hole).
+    expect(r.triples[0]).toMatchObject({ lyric: "R", frames: 1 }); // the leading rest is UNTOUCHED
+    expect(r.tripleNoteIds.indexOf("a")).toBe(1); // …so a sits at frame index 1, not 0
+    expect(r.triples[1]!.frames).toBe(1);
+    expect(r.triples[2]!.frames).toBe(12); // the FOLLOWING rest paid: 13 → 12
+    expect(r.triples[3]!.frames).toBe(13); // and the sung note after it is untouched
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
+  });
+
+  it("★ the rest-lender floor is exactly 2 frames — 1 refuses, 2 pays", () => {
+    // tempo 120 (ticksPerFrame 19.2). PAYS: a 2-frame gap (frames 5..7) may drop to 1.
+    const pays = [mkNote("a", 0, 96, 60), mkNote("b", 134, 1, 72)];
+    const r1 = buildScoreTriples(pays, 120, "AP", 2);
+    expect(r1.borrowedNoteIds).toEqual(["b"]);
+    expect(r1.triples.filter((t) => t.lyric === "R").map((t) => t.frames)).toEqual([1]);
+    expect(sumFrames(r1.triples)).toBe(r1.frameCount);
+    // REFUSES: a 1-frame gap (frames 5..6) is already at the floor, and there is no next item → dropped.
+    const refuses = [mkNote("a", 0, 96, 60), mkNote("b", 115, 1, 72)];
+    const r2 = buildScoreTriples(refuses, 120, "AP", 2);
+    expect(r2.droppedNoteIds).toEqual(["b"]);
+    expect(r2.borrowedNoteIds).toEqual([]);
+    expect(r2.triples.filter((t) => t.lyric === "R").map((t) => t.frames)).toEqual([1]); // rest kept its frame
+    expect(sumFrames(r2.triples)).toBe(r2.frameCount);
+  });
+
+  it("borrows from a REST when one sits before it (silence is the cheapest lender)", () => {
+    // tempo 120 → ticksPerFrame 19.2. n2 spans 600..603 → frames 31..31 = zero; the gap rest before it is
+    // 6 frames (25..31), so it can pay and keep its own ≥1.
+    const notes = [mkNote("n1", 0, 480, 60), mkNote("n2", 600, 3, 62)];
+    const r = buildScoreTriples(notes, 120, "AP", 2);
+    expect(r.borrowedNoteIds).toEqual(["n2"]);
+    expect(r.droppedNoteIds).toEqual([]);
+    const restFrames = r.triples.filter((t) => t.lyric === "R").map((t) => t.frames);
+    expect(restFrames).toEqual([5]); // 6 → 5: the rest paid exactly one frame
+    expect(r.triples[r.tripleNoteIds.indexOf("n1")]!.frames).toBe(25); // the sung note before it is UNTOUCHED
+    expect(r.triples[r.tripleNoteIds.indexOf("n2")]!.frames).toBe(1);
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
+  });
+
+  it("★ the sung-lender floor is exactly 3 frames — 2 refuses, 3 pays", () => {
+    // tempo 120 (ticksPerFrame 19.2). REFUSE: both neighbours are exactly 2 frames (0..38 and 41..79).
+    const boxed = [mkNote("a", 0, 38, 60), mkNote("b", 38, 3, 62), mkNote("c", 41, 38, 64)];
+    const r1 = buildScoreTriples(boxed, 120, "AP", 2);
+    expect(r1.droppedNoteIds).toEqual(["b"]);
+    expect(r1.borrowedNoteIds).toEqual([]);
+    expect(r1.triples[r1.tripleNoteIds.indexOf("a")]!.frames).toBe(2); // lender untouched, still ≥ its floor
+    expect(sumFrames(r1.triples)).toBe(r1.frameCount);
+    // PAY: the previous note is 3 frames (0..57) — it may drop to 2, which is exactly the floor.
+    const ok = [mkNote("a", 0, 57, 60), mkNote("b", 57, 3, 62)];
+    const r2 = buildScoreTriples(ok, 120, "AP", 2);
+    expect(r2.borrowedNoteIds).toEqual(["b"]);
+    expect(r2.triples[r2.tripleNoteIds.indexOf("a")]!.frames).toBe(2);
+    expect(r2.triples[r2.tripleNoteIds.indexOf("b")]!.frames).toBe(1);
+    expect(sumFrames(r2.triples)).toBe(r2.frameCount);
+  });
+
+  it("the very FIRST item can borrow (there is no previous item at all → forward)", () => {
+    const notes = [mkNote("head", 0, 3, 60), mkNote("body", 3, 480, 62)];
+    const r = buildScoreTriples(notes, 120, "AP", 2);
+    expect(r.borrowedNoteIds).toEqual(["head"]);
+    expect(r.droppedNoteIds).toEqual([]);
+    expect(r.triples[r.tripleNoteIds.indexOf("head")]!.frames).toBe(1);
+    expect(r.triples[r.tripleNoteIds.indexOf("body")]!.frames).toBe(24); // 25 − 1, its END unmoved
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
+  });
+
+  // ★★ THE test the first cut of this knife got WRONG. The f0 line is sampled by TICK — frame `f` at
+  // exactly `f * ticksPerFrame` — so the rescued note's retimed span must CONTAIN that tick. The first
+  // version rounded the frame boundary to a whole tick (`Math.round(f * tpf)`), which lands AFTER the
+  // sample point whenever the fraction is ≥ 0.5: the borrower then does not own its own frame, findNoteAt
+  // picks a neighbour (or nothing), and the "rescued" note comes out at the wrong pitch or UNVOICED —
+  // i.e. still silent, while the UI reports it as rescued. That defect was invisible to a single-tempo
+  // test (an adversarial review found it), so this one SWEEPS tempi: it was 100% broken at 300 bpm and
+  // 0% broken at 100 and 125.
+  describe("★ a rescued note actually OWNS its borrowed frame in the f0 feed (swept over tempo)", () => {
+    const TEMPI = [60, 90, 100, 120, 125, 140, 160, 180, 200, 222, 240, 250, 280, 300];
+    const frameIndexOf = (triples: { frames: number }[], upTo: number) =>
+      triples.slice(0, upTo).reduce((s, t) => s + t.frames, 0);
+
+    // A 1-tick note is NOT reliably sub-frame (at some tempi a frame boundary falls inside it), so the
+    // pathological note is placed per tempo at the CENTRE of frame 40's cell, where both of its edges
+    // round to the same frame for every tempo in the sweep.
+    const tpf = (tempo: number) => (1000 / 50 / 60000) * tempo * 480;
+    const build = (kind: string, tempo: number): Note[] => {
+      const b0 = Math.round(40 * tpf(tempo));
+      return kind === "rest lender"
+        ? // lender = the gap REST before it (a miss here means UNVOICED — dead silence)
+          [mkNote("a", 0, 120, 60), mkNote("b", b0, 1, 72), mkNote("c", b0 + 200, 480, 64)]
+        : // lender = the sung note before it (a miss here means the LENDER's pitch)
+          [mkNote("a", 0, b0, 60), mkNote("b", b0, 1, 72), mkNote("c", b0 + 200, 480, 64)];
+    };
+
+    for (const kind of ["rest lender", "note lender"]) {
+      it(kind + ": voiced, at its OWN written pitch, at every tempo", () => {
+        for (const tempo of TEMPI) {
+          const notes = build(kind, tempo);
+          const r = buildScoreTriples(notes, tempo, "AP", 2);
+          expect(r.borrowedNoteIds, `tempo ${tempo}`).toEqual(["b"]);
+          const idx = r.tripleNoteIds.indexOf("b");
+          expect(r.triples[idx]!.frames, `tempo ${tempo}`).toBe(1);
+          const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, "AP");
+          expect(sv.f0Cents.length).toBe(sumFrames(sv.triples));
+          const f = frameIndexOf(r.triples, idx);
+          expect(sv.f0Voiced[f], `tempo ${tempo}: the rescued frame must be VOICED`).toBe(1);
+          // A grace note gets ZERO transition (no room for a portamento, and its single sample sits on
+          // its own onset where the §10.5 open-edge scoop bottoms out) ⇒ its exact written pitch.
+          expect(sv.f0Cents[f]! / 100, `tempo ${tempo}: pitch of the rescued frame`).toBeCloseTo(72, 3);
+        }
+      });
+    }
+  });
+
+  it("★ SWEEP: over 600 pseudo-random scores, EVERY borrowed frame is voiced and at its own pitch", () => {
+    // The adversarial review measured the first cut at 27.7% of borrows landing on an UNVOICED frame and
+    // 35% carrying a neighbour's pitch — a rate no single-fixture test could have shown. Deterministic LCG
+    // (no Math.random: a flaky gate is worse than no gate).
+    let seed = 20260729;
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n);
+    let borrows = 0;
+    let unvoiced = 0;
+    let wrongPitch = 0;
+    for (let i = 0; i < 600; i++) {
+      const tempo = 60 + rnd(241); // 60..300
+      const gap = rnd(2) === 0; // rest lender vs note lender
+      const head = 200 + rnd(400);
+      const b0 = head + (gap ? 100 + rnd(400) : 0);
+      const notes = [
+        mkNote("a", 0, head, 60),
+        mkNote("b", b0, 1 + rnd(3), 72),
+        mkNote("c", b0 + 200 + rnd(200), 480, 64),
+      ];
+      const r = buildScoreTriples(notes, tempo, "AP", 2);
+      expect(sumFrames(r.triples), `case ${i} tempo ${tempo}`).toBe(r.frameCount); // conservation, always
+      if (!r.borrowedNoteIds.includes("b")) continue;
+      borrows++;
+      const idx = r.tripleNoteIds.indexOf("b");
+      const f = r.triples.slice(0, idx).reduce((s, t) => s + t.frames, 0);
+      const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, "AP");
+      if (sv.f0Voiced[f] !== 1) unvoiced++;
+      else if (Math.abs(sv.f0Cents[f]! / 100 - 72) > 0.01) wrongPitch++;
+    }
+    expect(borrows).toBeGreaterThan(50); // the sweep must actually exercise the knife
+    expect({ unvoiced, wrongPitch }).toEqual({ unvoiced: 0, wrongPitch: 0 });
+  });
+
+  it("leaves a score with NO sub-frame note byte-identical (no false borrowing)", () => {
+    const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 480, 62), mkNote("c", 1200, 480, 64)];
+    const r = buildScoreTriples(notes, 120, "AP", 2);
+    expect(r.borrowedNoteIds).toEqual([]);
+    expect(r.droppedNoteIds).toEqual([]);
+    // tempo 120 ⇒ ticksPerFrame 19.2: a 480t note is 25 frames, the 240t gap is 13 (63−50, both rounded).
+    expect(r.triples.map((t) => [t.lyric, t.note_num, t.frames])).toEqual([
+      ["あ", 60, 25], ["あ", 62, 25], ["R", 0, 13], ["あ", 64, 25],
+    ]);
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
   });
 });

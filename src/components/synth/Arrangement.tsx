@@ -17,7 +17,7 @@ import {
   segStretch, segmentSourceWindowMs,
 } from "../../lib/audio/laneOps";
 import { drawWaveform, beginWaveformFrame, peaksSignature } from "../../lib/waveformCache";
-import { splitSegmentVocalAware, resolveTrackVoice, VOCAL_LANE_ID } from "../../lib/vocal/vocalRender";
+import { splitSegmentVocalAware, resolveTrackVoice, VOCAL_LANE_ID, hash32 } from "../../lib/vocal/vocalRender";
 import { copySelectedSegments, cutSelectedSegments, pasteWithFeedback, clipboardKind } from "../../lib/clipboard";
 import { paramToY, yToParam, LOUDNESS_DB_RANGE } from "../../lib/vocalGeometry";
 import { evalCurveAt } from "../../lib/f0eval";
@@ -48,6 +48,13 @@ interface Placement {
   target: "insert" | "new" | "none";
   index: number;
   tick: number;
+}
+
+/** S87 — static-layer cache term for a segment's note warnings. Keyed on the id LISTS (hashed), not on a
+ *  count: a verdict that swaps one flagged note for another keeps the count identical, and the baked marks
+ *  would stay frozen on the old notes. An unflagged segment yields "//" — cheap and stable. */
+function warnIdsSig(...lists: (string[] | undefined)[]): string {
+  return lists.map((l) => (l && l.length ? hash32(l.join(",")) : "")).join("/");
 }
 
 /** Insert index (0..tracks.length) of the track boundary within `pad` px of `contentY`, else null.
@@ -167,6 +174,7 @@ export function Arrangement() {
   // arriving AFTER the notes edit still re-bakes the static layer with the segment badge.
   const vocalOov = useAppStore((s) => s.vocalOov);
   const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: dropped notes share the badge
+  const vocalBorrowed = useAppStore((s) => s.vocalBorrowed); // S87: rescued notes — advisory, own colour
   // S60 MIDI-extraction jobs — a draw dep (per-frame overlay + rAF-loop predicate); progress %
   // is read from the module map each frame (no store churn), only the SET membership lives here.
   const midiExtracting = useAppStore((s) => s.midiExtracting);
@@ -1682,7 +1690,10 @@ export function Arrangement() {
         // o.loading: a lane turning ready flips the main row original-waveform → lane-sum switch.
         // ② S58: the OOV badge is baked into the static layer, so its state must key the re-bake (the
         // verdict lives in the app store — async, arrives AFTER the notes edit that keyed notesSig).
-        const oovCount = (vocalOov[s.id]?.length ?? 0) + (vocalDropped[s.id]?.length ?? 0);
+        // S87: the id LISTS, not just their length. A verdict that SWAPS one note for another (the user
+        // fixes one lyric and breaks another) leaves the count identical, and the baked marks would freeze
+        // on the old notes. Hashed so a segment with many flagged notes doesn't paste kilobytes per frame.
+        const oovCount = warnIdsSig(vocalOov[s.id], vocalDropped[s.id], vocalBorrowed[s.id]);
         // S59: the detected grid + stretch factor + loudness envelope are baked into the static
         // layer — without these terms detect/×2/÷2/nudge/clear, a stretch change, or an envelope
         // point edit would not repaint (the S50 static-cache-key lesson: every content kind needs
@@ -1850,7 +1861,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, midiExtracting, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, vocalBorrowed, midiExtracting, t]);
 
   drawRef.current = draw;
 
@@ -1996,14 +2007,25 @@ function drawStaticContent(
         const padTop = sy + 3;
         const usable = sh - 6;
         const nh = Math.max(1.5, Math.min(3, usable / (span + 1)));
-        ctx.fillStyle = `rgba(${c[0]},${c[1]},${c[2]},0.85)`;
+        // S87 §user「光在钢琴卷轴上找有点太难找了」: mark the flagged notes HERE too. Two out of 1217 red
+        // notes are unfindable by scrolling a piano roll — but they are obvious in the arrangement's
+        // overview. RED = blocking (will not sound: OOV lyric / too short), AMBER = advisory (rescued by a
+        // frame borrow — it sounds). Flagged notes also get a minimum height, or a 1.5px sliver of colour
+        // would be invisible at exactly the zoom level where you need it.
+        const app = useAppStore.getState();
+        const blocking = new Set([...(app.vocalOov[seg.id] ?? []), ...(app.vocalDropped[seg.id] ?? [])]);
+        const advisory = new Set(app.vocalBorrowed[seg.id] ?? []);
+        const plain = `rgba(${c[0]},${c[1]},${c[2]},0.85)`;
         for (const n of ns) {
           const nx = sx + n.tick * ppt;
           const nw = Math.max(1, n.duration * ppt);
           if (nx > sx + sw || nx + nw < sx) continue;
           const ny = padTop + (1 - (n.pitch - lo) / span) * usable;
           const cx = Math.max(sx + 1, nx);
-          ctx.fillRect(cx, ny, Math.max(1, Math.min(nw, sx + sw - 1 - cx)), nh);
+          const flag = blocking.has(n.id) ? "#f87171" : advisory.has(n.id) ? "#fbbf24" : null;
+          ctx.fillStyle = flag ?? plain;
+          const h = flag ? Math.max(3, nh) : nh;
+          ctx.fillRect(cx, ny, Math.max(flag ? 2 : 1, Math.min(nw, sx + sw - 1 - cx)), h);
         }
       }
 
@@ -2102,22 +2124,26 @@ function drawStaticContent(
       // per-note red marks live in the vocal editor, this flags the segment from the arrangement).
       // getState() is safe here: the COMPONENT subscribes vocalOov and keys the static re-bake on it
       // (staticKey oovCount + the draw useCallback dep), so this read is always fresh at bake time.
-      if (
-        (useAppStore.getState().vocalOov[seg.id]?.length ?? 0) +
-          (useAppStore.getState().vocalDropped[seg.id]?.length ?? 0) >
-        0
-      ) {
-        const bx = sx + sw - 9;
-        ctx.fillStyle = "#f87171";
-        ctx.beginPath();
-        ctx.moveTo(bx, sy + 3);
-        ctx.lineTo(bx + 6, sy + 13);
-        ctx.lineTo(bx - 6, sy + 13);
-        ctx.closePath();
-        ctx.fill();
-        ctx.fillStyle = "#0a0f18";
-        ctx.fillRect(bx - 0.5, sy + 6.5, 1.5, 4);
-        ctx.fillRect(bx - 0.5, sy + 11.2, 1.5, 1.3);
+      // S87: the badge is GRADED — red only for blocking verdicts (a note that will not sound at all);
+      // a segment whose only finding is a rescued borrow gets the same triangle in amber, so "something
+      // to look at" never reads as "something is broken" (§user: 红色现在一律=阻塞性警告).
+      {
+        const app = useAppStore.getState();
+        const blocking = (app.vocalOov[seg.id]?.length ?? 0) + (app.vocalDropped[seg.id]?.length ?? 0);
+        const advisory = app.vocalBorrowed[seg.id]?.length ?? 0;
+        if (blocking + advisory > 0) {
+          const bx = sx + sw - 9;
+          ctx.fillStyle = blocking > 0 ? "#f87171" : "#fbbf24";
+          ctx.beginPath();
+          ctx.moveTo(bx, sy + 3);
+          ctx.lineTo(bx + 6, sy + 13);
+          ctx.lineTo(bx - 6, sy + 13);
+          ctx.closePath();
+          ctx.fill();
+          ctx.fillStyle = "#0a0f18";
+          ctx.fillRect(bx - 0.5, sy + 6.5, 1.5, 4);
+          ctx.fillRect(bx - 0.5, sy + 11.2, 1.5, 1.3);
+        }
       }
 
       if (track.muted) {

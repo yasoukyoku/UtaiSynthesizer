@@ -208,6 +208,7 @@ export function TrackList({ width }: Props) {
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const vocalOov = useAppStore((s) => s.vocalOov); // ② S58 track-level OOV warning
   const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: too-short dropped notes(独立文案)
+  const vocalBorrowed = useAppStore((s) => s.vocalBorrowed); // S87: rescued notes — advisory, amber badge
 
   const menuItems: MenuItem[] = (() => {
     if (!menu) return [];
@@ -360,6 +361,7 @@ export function TrackList({ width }: Props) {
             onOpenLangMenu={(x, y) => setMenu({ kind: "lang", trackId: track.id, x, y })}
             hasOov={track.segments.some((sg) => (vocalOov[sg.id]?.length ?? 0) > 0)}
             hasDropped={track.segments.some((sg) => (vocalDropped[sg.id]?.length ?? 0) > 0)}
+            hasBorrowed={track.segments.some((sg) => (vocalBorrowed[sg.id]?.length ?? 0) > 0)}
           />
           </Fragment>
         ))}
@@ -425,6 +427,9 @@ interface TrackItemProps {
   hasOov: boolean;
   /** S85b: some note rounded to zero frames(过短被跳过)→ same badge, truthful tooltip. */
   hasDropped: boolean;
+  /** S87: some note was rescued by a frame borrow — ADVISORY (it sounds), so the badge turns amber
+   *  rather than red unless a blocking finding is also present. */
+  hasBorrowed: boolean;
 }
 
 function TrackItem({
@@ -452,6 +457,7 @@ function TrackItem({
   onOpenLangMenu,
   hasOov,
   hasDropped,
+  hasBorrowed,
 }: TrackItemProps) {
   const { t } = useTranslation();
   const colorVar = trackTypeCssVar(track.trackType);
@@ -560,10 +566,16 @@ function TrackItem({
                 track-level flag; the segment badge + red notes point at the exact spot). S85b: the
                 dropped-note verdict shares the badge but keeps its OWN line of tooltip text — a
                 too-short note is not a lyric problem and must not read as one(用户实机反馈). */}
-            {(hasOov || hasDropped) && (
+            {/* S87: …and a third line for RESCUED notes, which are ADVISORY — the badge only goes red when
+                something actually will not sound; a track whose only finding is a borrow shows amber. */}
+            {(hasOov || hasDropped || hasBorrowed) && (
               <span
-                className="track-oov-badge"
-                title={[hasOov ? t("tracks.oovWarning") : null, hasDropped ? t("tracks.droppedWarning") : null]
+                className={hasOov || hasDropped ? "track-oov-badge" : "track-oov-badge advisory"}
+                title={[
+                  hasOov ? t("tracks.oovWarning") : null,
+                  hasDropped ? t("tracks.droppedWarning") : null,
+                  hasBorrowed ? t("tracks.borrowedWarning") : null,
+                ]
                   .filter(Boolean)
                   .join("\n")}
               >

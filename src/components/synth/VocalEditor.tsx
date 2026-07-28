@@ -183,6 +183,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const droppedIds = useAppStore((s) => s.vocalDropped[segmentId]);
   const oovRef = useRef<Set<string>>(new Set());
   oovRef.current = new Set([...(oovIds ?? []), ...(droppedIds ?? [])]);
+  // S87 #3: rescued-by-borrow notes — a SEPARATE, non-blocking channel (amber), kept out of oovRef so the
+  // blocking red keeps meaning exactly "this note will not sound".
+  const borrowedIds = useAppStore((s) => s.vocalBorrowed[segmentId]);
+  const borrowedRef = useRef<Set<string>>(new Set());
+  borrowedRef.current = new Set(borrowedIds ?? []);
   // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
   // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
   const userTunedIds = useMemo(() => {
@@ -576,20 +581,28 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         // ② S58 OOV: an unsingable lyric fills RED (LOUD — never silent, §3.7 ACE-style marking). A
         // selected OOV note keeps the selection fill but takes the red stroke, so both states read.
         const oov = oovRef.current.has(n.id);
+        // S87 #3: a BORROWED note is a NON-blocking notice — it sounds; the renderer merely lent it a frame
+        // from a neighbour. Amber, never the blocking red (§user: 红色现在一律=阻塞性警告). `oov` wins if a
+        // note somehow lands in both (blocking always outranks advisory).
+        const borrowed = !oov && borrowedRef.current.has(n.id);
         const cx0 = Math.max(noteAreaX, x0);
         ctx.fillStyle = selected
           ? (col("--note-selected") || "#8b5cf6")
           : oov
             ? (col("--color-error") || "#f87171")
-            : (col("--note-fill") || "#39c5bb");
+            : borrowed
+              ? (col("--color-warning") || "#fbbf24")
+              : (col("--note-fill") || "#39c5bb");
         ctx.globalAlpha = 0.9;
         ctx.fillRect(cx0, y + 1, Math.max(2, x1 - cx0), Math.max(2, v.rowH - 2));
         ctx.globalAlpha = 1;
         ctx.strokeStyle = oov
           ? (col("--color-error") || "#f87171")
-          : selected
-            ? (col("--accent-secondary") || "#8b5cf6")
-            : "rgba(0,0,0,0.4)";
+          : borrowed
+            ? (col("--color-warning") || "#fbbf24")
+            : selected
+              ? (col("--accent-secondary") || "#8b5cf6")
+              : "rgba(0,0,0,0.4)";
         ctx.lineWidth = selected ? 1.5 : 1;
         ctx.strokeRect(Math.round(cx0) + 0.5, Math.round(y + 1) + 0.5, Math.max(2, x1 - cx0) - 1, Math.max(2, v.rowH - 2) - 1);
         // S73b 调教所有权:用户调教的音符左缘竖条(金;SV1 Manual 标记同构)——机器调教/未调教不标。
@@ -937,7 +950,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
-  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, borrowedIds, requestRedraw]);
   // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
   // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
   // invalidation path. S83 review #7.)

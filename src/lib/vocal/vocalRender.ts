@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
-import { isBreathLyric, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../vocalNotes";
+import { isBreathLyric, ZERO_TRANSITION, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../vocalNotes";
 import { DEFAULT_LANG_ID, effLangId } from "./languages";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
@@ -157,11 +157,12 @@ export function buildVocalScore(
   formantScalar = 0,
   defaultLangId: number = DEFAULT_LANG_ID,
 ): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[]; loudnessEnv: number[]; formantEnv: number[] } {
-  const { triples, sorted, ticksPerFrame, frameCount } = buildScoreTriples(notes, tempo, breathToken, defaultLangId);
+  const { triples, f0Notes, ticksPerFrame, frameCount } = buildScoreTriples(notes, tempo, breathToken, defaultLangId);
   // f0 sees the notes WITHOUT breaths (they're unvoiced): a breath's frames fall in a rest gap → voiced 0,
   // and its neighbours become phrase edges (release-drift before, onset-scoop after). frameCount is unchanged
   // (it's the triple cursor incl. breath frames), so the array length still equals Σ(triple frames).
-  const pitchNotes = sorted.filter((n) => !isBreathLyric(n.lyric, breathToken));
+  // S87 #3: `f0Notes`, not `sorted` — a borrowed frame must carry the BORROWER's pitch (see the borrow pass).
+  const pitchNotes = f0Notes.filter((n) => !isBreathLyric(n.lyric, breathToken));
   const { cents, voiced } = evalF0CentsFrames(
     pitchNotes,
     pitchDev,
@@ -201,7 +202,16 @@ export function buildScoreTriples(
    *  ("this note will not sound"). Forcing a minimum frame instead is FORBIDDEN — it would break
    *  the absolute-diff frame conservation (Σframes == frameOf(cursor)). */
   droppedNoteIds: string[];
+  /** S87 #3: sung notes that rounded to zero frames and were RESCUED by borrowing one frame from a
+   *  neighbour. A NON-blocking condition (the note sounds — it was merely nudged), as opposed to
+   *  `droppedNoteIds`, which is blocking (the note will not sound at all). Kept as a separate list so the
+   *  UI can grade the warning instead of painting both the same red (§user; mirrors the S85b OOV/dropped
+   *  split, whose whole point was that a merged channel makes the wording lie). */
+  borrowedNoteIds: string[];
   sorted: Note[];
+  /** S87 #3: `sorted`, retimed for the F0 FEED only — see the borrow pass. Identical to `sorted` (same
+   *  object identities) when nothing was borrowed. */
+  f0Notes: Note[];
   ticksPerFrame: number;
   frameCount: number;
 } {
@@ -213,9 +223,17 @@ export function buildScoreTriples(
   // and the neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the breath.
   const mapLyric = (l: string) => (isBreathLyric(l, breathToken) ? "AP" : l);
 
-  const triples: ScoreTriple[] = [];
-  const tripleNoteIds: (string | null)[] = [];
-  const droppedNoteIds: string[] = [];
+  // ── PASS 1 — tile the segment into frame-bounded items (a gap rest, then its note, …). Boundaries are
+  //    SHARED: item[k].endF === item[k+1].startF. That is the whole trick: Σframes telescopes to the last
+  //    endF BY CONSTRUCTION, so the borrow pass below — which only ever moves a shared boundary — cannot
+  //    break `Σframes == frameOf(cursor)` no matter what it decides. ──
+  interface Item {
+    note: Note | null; // null = an inserted gap rest
+    startF: number;
+    endF: number;
+    lang: number;
+  }
+  const items: Item[] = [];
   let cursor = 0; // segment-relative tick covered so far
   for (const n of sorted) {
     const start = Math.max(cursor, n.tick);
@@ -224,28 +242,103 @@ export function buildScoreTriples(
     // S58: per-note effective language (note override ?? track default). Gap rests take the default —
     // Rust's run assignment attaches them to the surrounding run anyway (a rest's lang is only read
     // when the whole score has no sung note).
-    const lang = effLangId(n.lang, defaultLangId);
-    if (start > cursor) {
-      const restFrames = frameOf(start) - frameOf(cursor);
-      if (restFrames > 0) {
-        triples.push({ lyric: "R", note_num: 0, frames: restFrames, lang: defaultLangId });
-        tripleNoteIds.push(null);
-      }
-    }
-    const noteFrames = frameOf(end) - frameOf(start);
-    if (noteFrames > 0) {
-      const t: ScoreTriple = { lyric: mapLyric(n.lyric), note_num: n.pitch, frames: noteFrames, lang };
-      if (n.phonemeInput) t.phoneme_input = n.phonemeInput;
-      triples.push(t);
-      tripleNoteIds.push(n.id);
-    } else {
-      // S84 D 刀: the note's span rounds to zero frames → it will NOT sound. Record it loudly
-      // (oovWatch marks it) instead of the pre-S84 silent vanish.
-      droppedNoteIds.push(n.id);
-    }
+    const cursorF = frameOf(cursor);
+    const startF = frameOf(start);
+    if (startF > cursorF) items.push({ note: null, startF: cursorF, endF: startF, lang: defaultLangId });
+    items.push({ note: n, startF, endF: frameOf(end), lang: effLangId(n.lang, defaultLangId) });
     cursor = end;
   }
-  return { triples, tripleNoteIds, droppedNoteIds, sorted, ticksPerFrame, frameCount: frameOf(cursor) };
+  const frameCount = frameOf(cursor);
+
+  // ── PASS 2 — S87 #3 借帧刀. A note that rounds to ZERO frames borrows exactly ONE, BACKWARD by
+  //    preference (its start moves earlier: every boundary downstream — i.e. every beat the singer is
+  //    aiming at — stays put; same direction as S83's consonant pre-borrow). Only if the item before it
+  //    cannot pay does it take from the one after (that DOES delay the follower's onset, hence second).
+  //    LENDER FLOORS (S83's范式, at note granularity): a rest must survive with ≥1 frame — it is the
+  //    phrase boundary the f0 line, the zh polyphone window and the rest-gate all key on; a sung note
+  //    must survive with ≥2, because a 1-frame sung note is the very pathology this knife exists to
+  //    remove (and §user: "小心前面本身就是极短音 → 元音被吃"). Unlendable on both sides ⇒ still dropped,
+  //    loudly. ──
+  const MIN_KEEP_REST = 1;
+  const MIN_KEEP_NOTE = 2;
+  const canLend = (it: Item) => it.endF - it.startF >= (it.note ? MIN_KEEP_NOTE : MIN_KEEP_REST) + 1;
+  const borrowedNoteIds: string[] = [];
+  const droppedNoteIds: string[] = [];
+  /** noteId → the span the F0 feed must use (see PASS 3). `grace` = this note IS the rescued one. */
+  const retimed = new Map<string, { start: number; end: number; grace: boolean }>();
+  /** ★ The EXACT tick evalF0CentsFrames samples frame `f` at — deliberately the SAME expression
+   *  (`frameStartTick + f * ticksPerFrame`, frameStartTick = 0), so the two agree bit-for-bit.
+   *  ⚠ ROUNDING this is a trap the review caught: `Math.round(f*tpf)` lands AFTER the sample point
+   *  whenever the fraction is ≥ 0.5, the borrower then does not contain its own frame, findNoteAt
+   *  picks someone else, and the "rescued" note comes out UNVOICED (rest lender) — silent, while the
+   *  UI cheerfully reports it as rescued. Tempo-dependent: never at 100/125 bpm, ALWAYS at 300. */
+  const frameTick = (f: number) => f * ticksPerFrame;
+  const spanOf = (n: Note) => retimed.get(n.id) ?? { start: n.tick, end: n.tick + n.duration, grace: false };
+  const setSpan = (n: Note, start: number, end: number, grace: boolean) =>
+    retimed.set(n.id, { start, end: Math.max(start + ticksPerFrame * 1e-3, end), grace });
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i]!;
+    if (!it.note || it.endF > it.startF) continue; // not a note, or it already sounds
+    const prev = i > 0 ? items[i - 1]! : null;
+    const next = i + 1 < items.length ? items[i + 1]! : null;
+    if (prev && canLend(prev)) {
+      prev.endF -= 1;
+      it.startF -= 1; // the SAME boundary — Σ is untouched
+      borrowedNoteIds.push(it.note.id);
+    } else if (next && canLend(next)) {
+      next.startF += 1;
+      it.endF += 1; // likewise the SAME boundary
+      borrowedNoteIds.push(it.note.id);
+    } else {
+      // S84 D 刀: nothing in reach could pay → the note will NOT sound. Record it loudly (oovWatch marks
+      // it) instead of the pre-S84 silent vanish. Forcing a minimum frame here is still FORBIDDEN.
+      droppedNoteIds.push(it.note.id);
+      continue;
+    }
+    // The rescued note's F0 span becomes EXACTLY the frames it now owns, and any adjacent NOTE is clamped
+    // to abut it — so every frame's sample point has exactly ONE owner and the array stays ordered.
+    // (The neighbour that did NOT lend is clamped too: the borrower's span now snaps to frame boundaries,
+    // which can reach a hair past its original edge, and two notes claiming one tick is how findNoteAt —
+    // last match wins — silently hands a frame to the wrong pitch.)
+    const bs = frameTick(it.startF);
+    const be = frameTick(it.endF);
+    setSpan(it.note, bs, be, true);
+    if (prev?.note) setSpan(prev.note, spanOf(prev.note).start, bs, spanOf(prev.note).grace);
+    if (next?.note) setSpan(next.note, be, spanOf(next.note).end, spanOf(next.note).grace);
+  }
+
+  // ── PASS 3 — emit the triples, and the F0 feed. The pitch line is sampled by TICK (evalF0CentsFrames),
+  //    NOT by these frame counts, so a borrowed frame would otherwise still carry the LENDER's pitch — or,
+  //    when the lender is a rest, be UNVOICED, leaving the rescued note silent anyway. That is the
+  //    note-level twin of the trap S83 hit with pre-borrowed consonants (anchor_voiced_phone_f0). Only the
+  //    notes a borrow actually touched are retimed; every other note keeps its exact sub-frame tick, so a
+  //    score with nothing to rescue feeds a byte-identical f0 array. ──
+  const triples: ScoreTriple[] = [];
+  const tripleNoteIds: (string | null)[] = [];
+  for (const it of items) {
+    const frames = it.endF - it.startF;
+    if (frames <= 0) continue; // an empty gap rest, or a note that could not borrow (already reported)
+    if (!it.note) {
+      triples.push({ lyric: "R", note_num: 0, frames, lang: defaultLangId });
+      tripleNoteIds.push(null);
+      continue;
+    }
+    const t: ScoreTriple = { lyric: mapLyric(it.note.lyric), note_num: it.note.pitch, frames, lang: it.lang };
+    if (it.note.phonemeInput) t.phoneme_input = it.note.phonemeInput;
+    triples.push(t);
+    tripleNoteIds.push(it.note.id);
+  }
+  const f0Notes = retimed.size === 0 ? sorted : sorted.map((n) => {
+    const r = retimed.get(n.id);
+    if (!r) return n;
+    // A rescued note owns ONE frame, and that frame is sampled exactly at its own onset — where the §10.5
+    // open-edge scoop is at its FLOOR. With the default transition it would sing `tone − openEdgeCents`
+    // (200 ¢ = two semitones flat) for its entire life. A grace note has no room for a portamento, so it
+    // gets its written pitch, flat. Lenders keep their own transition — they only gave up 20 ms.
+    const span = { ...n, tick: r.start, duration: r.end - r.start };
+    return r.grace ? { ...span, transition: { ...ZERO_TRANSITION } } : span;
+  });
+  return { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, sorted, f0Notes, ticksPerFrame, frameCount };
 }
 
 /** Sample a segment-relative param curve at each of `frameCount` 50fps frames (`f·ticksPerFrame`), applying
@@ -365,7 +458,7 @@ export function vocalRenderSig(track: Track, seg: Segment, tempo: number): strin
 export function vocalTrackSig(track: Track, tempo: number): string {
   // forRender=true:autoTune 三元组不进渲染 sig(它们经 θ→contentSig 间接生效;直接进会让
   // 切 follow 开关/拖缩放凭空判废整段 bake——S73b 审查假脏)。
-  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}|g2p:${G2P_ALGO_VERSION}`;
+  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}|g2p:${G2P_ALGO_VERSION}|st:${SCORE_TIMING_VERSION}`;
 }
 
 /** Resolve a track's configured singer to its installed model entry (undefined = no vocalParams, no
@@ -412,9 +505,21 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  ★ Must move in lockstep with `G2P_ALGO_VERSION` in src-tauri/src/commands/audition.rs. */
 export const G2P_ALGO_VERSION = "s86";
 
+/** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
+ *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
+ *  segment already baked keeps its OLD audio forever unless its signature moves, so the fix reads as
+ *  "I changed it and the user hears nothing" (S86 review R3).
+ *  s87 = the frame-borrow knife: a note whose span rounds to ZERO frames borrows one from a neighbour
+ *  instead of being dropped, and the f0 feed is retimed with it.
+ *  ⚠ FRONTEND-ONLY on purpose — no Rust counterpart to keep in lockstep: the allocation happens here, and
+ *  the audition cache (audition.rs) renders its own fixed probe score that this cannot touch.
+ *  (S83/S84's timing knives predate this token and shipped with "re-render old projects by hand"; new
+ *  timing work should bump this instead.) */
+export const SCORE_TIMING_VERSION = "s87";
+
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
-function hash32(s: string): string {
+export function hash32(s: string): string {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
   return h.toString(36);

@@ -141,6 +141,12 @@ interface AppState {
    *  tell the truth: these are too-short notes, not unrecognized lyrics(用户实机反馈:合并
    *  通道让「音符过短」穿了「歌词 OOV」的文案)。 */
   vocalDropped: Record<string, string[]>;
+  /** S87 #3: notes that rounded to zero frames and were RESCUED by borrowing a frame from a neighbour.
+   *  A NON-BLOCKING condition — the note sounds, it was merely nudged — so it must NOT wear the same red
+   *  as vocalOov / vocalDropped, which both mean "this note will not sound at all" (§user: 现在红色一律
+   *  是阻塞性警告). Third map for the same reason S85b split dropped out of oov: a merged channel forces
+   *  the wording to lie about at least one of its members. */
+  vocalBorrowed: Record<string, string[]>;
   /** S60 GAME MIDI extraction in flight — key = `${segmentId}:${group}` (lane group), value =
    *  the job context. Drives the lane-row "extracting" indicator (Arrangement per-frame overlay),
    *  the menu-item double-trigger guard, and the undo-cancels-extraction interceptor. Runtime-only. */
@@ -198,6 +204,8 @@ interface AppState {
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
   /** S85b: publish one segment's dropped-note verdict(语义同 setVocalOov,写者同为 oovWatch)。 */
   setVocalDropped: (segmentId: string, noteIds: string[] | null) => void;
+  /** S87: publish one segment's frame-borrow verdict(语义同上,写者同为 oovWatch)。 */
+  setVocalBorrowed: (segmentId: string, noteIds: string[] | null) => void;
   /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
@@ -264,6 +272,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   renderingVocalTrackId: null,
   vocalOov: {},
   vocalDropped: {},
+  vocalBorrowed: {},
   midiExtracting: {},
   toasts: [],
   banner: null,
@@ -366,6 +375,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const next = verdictMapUpdate(s.vocalDropped, segmentId, noteIds);
       return next ? { vocalDropped: next } : {};
+    }),
+  setVocalBorrowed: (segmentId, noteIds) =>
+    set((s) => {
+      const next = verdictMapUpdate(s.vocalBorrowed, segmentId, noteIds);
+      return next ? { vocalBorrowed: next } : {};
     }),
   setMidiExtracting: (key, v) =>
     set((s) => {
