@@ -25,6 +25,9 @@
   },
   "midiExtract": {
     "menu": "提取 MIDI（人声→音符）",
+    "optionsTitle": "提取 MIDI 选项",
+    "optionsBody": "将从这个泳道组的每个 stem 提取音符，各自新建一条人声轨。提取出的起止点来自音高跟踪，通常建议舍入到格线。",
+    "quantDropped": "{{count}} 个过短的音符（多为音高过渡的碎片）在舍入时被舍去",
     "extracting": "提取 MIDI 中…",
     "done": "MIDI 提取完成，已新建人声轨",
     "noNotes": "未提取到音符",
@@ -92,6 +95,15 @@
   "import": {
     "done": "已导入",
     "pitchDropped": "某轨的音高调教规模超出可导入上限，已按未调教导入（音符完整）",
+    "options": {
+      "title": "导入选项",
+      "body": "共 {{total}} 个音符，其中 {{off}} 个（{{pct}}%）不在 1/12 格线上。如果这份谱子的音符位置是作者手工调过的（UTAU CVVC 的先行发音补偿正是如此），请关掉舍入、原样导入。",
+      "quantize": "把音符边界舍入到最近的 1/12 格",
+      "start": "导入"
+    },
+    "quantMoved": "{{count}} 个音符已对齐到格线",
+    "quantWidened": "{{count}} 个过短的音符被拉长到一格（否则短到发不出声）",
+    "quantSkippedBaked": "{{count}} 条轨带烤入的音高线，已按原时序导入（未舍入）",
     "error": {
       "empty": "未找到可导入的音符",
       "unsupported": "不支持的文件格式（仅支持 ustx / ust / mid / midi）",
@@ -593,6 +605,7 @@
     "toolPitch": "音高 (3)",
     "toolDelete": "删除 (4)",
     "grid": "网格",
+    "snapNotesTip": "音符吸附到网格（关闭＝自由放置，格线仍作参考）",
     "maximize": "最大化",
     "restore": "还原",
     "preview": "试听",

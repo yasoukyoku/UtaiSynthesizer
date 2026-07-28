@@ -34,15 +34,12 @@ import {
 } from "../../store/history";
 import { getLoadEpoch } from "../project/projectFile";
 import { flushAutosaveNow } from "../project/autosave";
-import { TICKS_PER_BEAT } from "../constants";
 import { laneGroupId, laneVisiblePieces, msToTicks, segStretch, ticksToMs } from "../audio/laneOps";
 import { DEFAULT_LANG_ID, langById } from "./languages";
+import { loadSetting, saveSetting } from "../settings";
+import { quantizeSpans, QUANTIZE_IMPORT_KEY, type QuantSpan } from "./quantize";
 
-const t = (k: string) => i18n.t(k);
-
-/** 1/12 of a beat — the extraction quantum (40 ticks @ 480 tpq). Covers both binary (16th = 3 units)
- *  and ternary (8th-triplet = 4 units) subdivisions, so straight AND swung material lands on-grid. */
-export const EXTRACT_QUANT_TICKS = TICKS_PER_BEAT / 12;
+const t = (k: string, vars?: Record<string, unknown>) => i18n.t(k, vars ?? {}) as string;
 
 /** Mirror of the Rust ExtractedNote (serde snake_case comes through invoke verbatim). */
 interface ExtractedNote {
@@ -153,42 +150,60 @@ export function midiExtractErrorMessage(e: unknown): string {
   return `${t("midiExtract.errFailed")}: ${msg}`;
 }
 
-/** Quantize + map one stem's notes into part-relative Note[]. Boundary quantization in ABSOLUTE
- *  tick space (both edges rounded to the grid, zero-length results dropped), then rebased. */
-function buildNotes(
+/** One stem's audible notes as ABSOLUTE tick spans (+ pitch). NO rounding here — since S87 quantization is
+ *  the USER's choice (the shared `quantizeSpans`), so the raw mapping and the rounding decision are
+ *  separate steps. Honors the lane's non-destructive edits: a note whose midpoint falls in a trimmed-out
+ *  range is silent in playback and must not be transcribed. */
+function absNotes(
   raw: ExtractedNote[],
   seg: Segment,
   out: ProcessedOutput,
   tempo: number,
-  partStart: number,
-  lyric: string,
-): Note[] {
+): { span: QuantSpan; pitch: number }[] {
   if (seg.content.type !== "audioClip") return [];
   const r = segStretch(seg);
   const winStart = seg.content.offsetMs;
-  // honor the lane's non-destructive edits: notes whose midpoint falls in a trimmed-out
-  // range are silent in playback and must not be transcribed
   const pieces = laneVisiblePieces(seg, seg.laneOps?.[laneGroupId(out)], out.totalDurationMs, tempo);
   const audible = (srcMs: number) => pieces.some((p) => srcMs >= p.startMs && srcMs <= p.endMs);
-  const notes: Note[] = [];
+  const items: { span: QuantSpan; pitch: number }[] = [];
   for (const n of raw) {
     if (!audible((n.onset_ms + n.offset_ms) / 2)) continue;
     // source ms → absolute timeline ticks (played time = source distance × r past the window start)
-    const absOn = seg.startTick + msToTicks((n.onset_ms - winStart) * r, tempo);
-    const absOff = seg.startTick + msToTicks((n.offset_ms - winStart) * r, tempo);
-    const qOn = Math.round(absOn / EXTRACT_QUANT_TICKS) * EXTRACT_QUANT_TICKS;
-    const qOff = Math.round(absOff / EXTRACT_QUANT_TICKS) * EXTRACT_QUANT_TICKS;
-    if (qOff <= qOn) continue; // collapsed by quantization — shorter than half a grid cell
-    notes.push({
-      id: crypto.randomUUID(),
-      tick: qOn - partStart,
-      duration: qOff - qOn,
-      pitch: Math.min(127, Math.max(0, Math.round(n.pitch))),
-      lyric,
-      velocity: 100,
+    items.push({
+      span: {
+        start: seg.startTick + msToTicks((n.onset_ms - winStart) * r, tempo),
+        end: seg.startTick + msToTicks((n.offset_ms - winStart) * r, tempo),
+      },
+      pitch: n.pitch,
     });
   }
-  return notes;
+  return items;
+}
+
+/** S87 — round the raw spans to whole ticks WITHOUT touching the grid (the "don't quantize" branch). Keeps
+ *  the ≥1 tick floor the store would otherwise apply silently, so no note can vanish here either. */
+function wholeTicks(spans: readonly QuantSpan[]): QuantSpan[] {
+  return spans.map((s) => {
+    const start = Math.round(s.start);
+    return { start, end: Math.max(start + 1, Math.round(s.end)) };
+  });
+}
+
+/** Map absolute spans + pitches onto part-relative Note[] (rebased to `partStart`). */
+function buildNotes(
+  spans: readonly QuantSpan[],
+  items: { pitch: number }[],
+  partStart: number,
+  lyric: string,
+): Note[] {
+  return spans.map((s, i) => ({
+    id: crypto.randomUUID(),
+    tick: s.start - partStart,
+    duration: s.end - s.start,
+    pitch: Math.min(127, Math.max(0, Math.round(items[i]!.pitch))),
+    lyric,
+    velocity: 100,
+  }));
 }
 
 /** Wait for any held gesture transaction (drag/slider) to close, so the landing transaction
@@ -227,6 +242,30 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
     // status probe failing is non-fatal — the extraction call itself reports properly
   }
   if (useAppStore.getState().midiExtracting[key]) return; // double-trigger across the await
+
+  // S87 — the same grid-rounding choice the score importer offers, asked BEFORE the (minutes-long) run.
+  // Extraction onsets come from a pitch tracker, so rounding is almost always wanted — but "almost always"
+  // is not "always", and the pre-S87 code rounded unconditionally AND silently dropped every note that
+  // collapsed. One shared preference key with the importer (§user: default ON).
+  let quantize = loadSetting(QUANTIZE_IMPORT_KEY, true);
+  const choice = await useAppStore.getState().showConfirm({
+    title: t("midiExtract.optionsTitle"),
+    body: t("midiExtract.optionsBody"),
+    check: {
+      label: t("import.options.quantize"),
+      initial: quantize,
+      onChange: (v) => {
+        quantize = v;
+      },
+    },
+    buttons: [
+      { id: "cancel", label: t("common.cancel") },
+      { id: "ok", label: t("common.confirm"), kind: "primary" },
+    ],
+  });
+  if (choice !== "ok") return; // Cancel / Esc / backdrop — nothing started
+  saveSetting(QUANTIZE_IMPORT_KEY, quantize);
+  if (useAppStore.getState().midiExtracting[key]) return; // double-trigger across the dialog await
 
   const tempo = p.tempo;
   const c = seg.content;
@@ -286,20 +325,37 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
     const history = useHistoryStore.getState();
     history.beginTransaction();
     let made = 0;
+    let droppedTotal = 0;
     try {
       let insertAt = p2.tracks.findIndex((tk) => tk.id === trackId) + 1;
       for (const { o, notes: raw } of results) {
         const seg2 = p2.tracks.find((tk) => tk.id === trackId)?.segments.find((s) => s.id === segId);
         if (!seg2 || seg2.content.type !== "audioClip") break;
-        // part box aligned to the source segment, extended so quantized notes always fit
         const segEnd = seg2.startTick + seg2.durationTicks;
-        const partStart = Math.min(
-          seg2.startTick,
-          ...raw.map((n) =>
-            Math.round((seg2.startTick + msToTicks((n.onset_ms - winStart) * r, p2.tempo)) / EXTRACT_QUANT_TICKS) * EXTRACT_QUANT_TICKS,
-          ),
-        );
-        const notes = buildNotes(raw, seg2, o, p2.tempo, partStart, lyric);
+        const items = absNotes(raw, seg2, o, p2.tempo);
+        if (!items.length) continue;
+        // S87: rounding is the user's choice. A note that collapses is still DROPPED here (policy "drop":
+        // GAME emits an exactly-contiguous chain, so a micro-note is a pitch-tracker transition artifact,
+        // and widening it would push every following REAL note one cell later — cumulative drift against
+        // the source audio, which is the one thing transcription must preserve). The change vs pre-S87 is
+        // that the drop is now COUNTED and reported instead of a silent `continue`.
+        // partStart also derives from the SAME spans the notes are built from — the old form re-derived it
+        // from the UNFILTERED raw list with its own inline quantization, so the two could disagree.
+        let spans: (QuantSpan | null)[];
+        if (quantize) {
+          const q = quantizeSpans(items.map((x) => x.span), "drop");
+          spans = q.spans;
+          droppedTotal += q.dropped;
+        } else {
+          spans = wholeTicks(items.map((x) => x.span));
+        }
+        const kept = spans
+          .map((s, i) => (s ? { span: s, pitch: items[i]!.pitch } : null))
+          .filter((x): x is { span: QuantSpan; pitch: number } => x !== null);
+        if (!kept.length) continue;
+        // part box aligned to the source segment, extended so the notes always fit
+        const partStart = kept.reduce((m, k) => Math.min(m, k.span.start), seg2.startTick);
+        const notes = buildNotes(kept.map((k) => k.span), kept, partStart, lyric);
         if (!notes.length) continue;
         const lastEnd = notes.reduce((m, n) => Math.max(m, n.tick + n.duration), 0);
         const newTrackId = crypto.randomUUID();
@@ -314,6 +370,8 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
     if (made > 0) {
       flushAutosaveNow();
       useAppStore.getState().showBanner(`${t("midiExtract.done")} · ${made}`, "info");
+      // S87: the collapse drop is reported, never silent (pre-S87 it was a bare `continue`).
+      if (droppedTotal > 0) useAppStore.getState().showToast(t("midiExtract.quantDropped", { count: droppedTotal }), "info");
     } else {
       useAppStore.getState().showToast(t("midiExtract.noNotes"), "info");
     }

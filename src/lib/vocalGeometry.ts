@@ -77,6 +77,68 @@ export const snapFloor = (relTick: number, snapTicks: number): number =>
 export const snapRound = (relTick: number, snapTicks: number): number =>
   snapTicks > 0 ? Math.round(relTick / snapTicks) * snapTicks : Math.round(relTick);
 
+/**
+ * S87 — THE two grid-snap entry points for the vocal editor. Note ticks are PART-RELATIVE while the grid
+ * lines are drawn in ABSOLUTE tick space (TimeAxis), so a part whose `partStart` is not a multiple of the
+ * unit (every imported score / MIDI-extracted part — their part starts at the first note) would otherwise
+ * snap notes to lines that are NOT the ones on screen. Both convert to absolute, snap, and convert back.
+ *
+ * `on = false` (user turned snapping off) = CONTINUOUS placement: the raw tick, rounded to a whole tick
+ * (note ticks are integers by normalizeNote anyway). This is an explicit branch on purpose — `snapFloor(x, 0)`
+ * falls back to Math.ROUND, so "pass 0 to disable" would silently swap floor semantics for round.
+ *
+ * Pure, so the snap contract is unit-testable without mounting the editor.
+ */
+/** Placement (drawing a NEW note): FLOOR to the cell the cursor is inside. */
+export const snapPlaceTick = (relTick: number, partStart: number, unit: number, on: boolean): number =>
+  on ? snapFloor(partStart + relTick, unit) - partStart : Math.round(relTick);
+/** Adjustment (moving / resizing an EXISTING note, or dragging a new note's end): ROUND to the nearest line. */
+export const snapEdgeTick = (relTick: number, partStart: number, unit: number, on: boolean): number =>
+  on ? snapRound(partStart + relTick, unit) - partStart : Math.round(relTick);
+
+/**
+ * S87 — the tick delta a MOVE gesture applies to the WHOLE selection. `anchorRel` is the grabbed note's
+ * original tick and `cursorDelta` the continuous tick distance the cursor has travelled; the delta is chosen
+ * so the ANCHOR lands on a grid line, and every other selected note rides the SAME delta (spacing preserved,
+ * which snapping each note independently would destroy).
+ *
+ * ⚠ This replaces the pre-S87 form `snapRound(cursorNow) - snapRound(cursorDown)`, which snapped the CURSOR
+ * at both ends and subtracted: always a whole number of cells, so it CONSERVED any off-grid offset — an
+ * imported off-grid note could never be dragged back onto the grid (§user 死结).
+ */
+export const snapMoveDelta = (
+  anchorRel: number,
+  cursorDelta: number,
+  partStart: number,
+  unit: number,
+  on: boolean,
+): number => snapEdgeTick(anchorRel + cursorDelta, partStart, unit, on) - anchorRel;
+
+/**
+ * S87 — the new END tick of a note being resized by its right edge.
+ *  · snapping ON  = the end lands ON a grid line (absolute space), floored at `minLen`. Byte-identical to
+ *    the pre-S87 formula for an on-grid part.
+ *  · snapping OFF = the end follows the HAND: the ORIGINAL end plus the cursor's travel since the grab.
+ *    ⚠ NOT the raw cursor position. Absolute-cursor semantics without a grid means a mere CLICK inside the
+ *    6px edge hotzone (zero motion) resolves to a tick strictly inside the note and silently truncates it —
+ *    with the grid on, the 1/12 rounding used to absorb the whole hotzone and hide that. Keeping the grab
+ *    offset makes a zero-travel gesture a mathematical no-op, in every mode and at every zoom.
+ */
+export const resizeEndTick = (
+  origTick: number,
+  origDuration: number,
+  cursorRel: number,
+  grabRel: number,
+  partStart: number,
+  unit: number,
+  minLen: number,
+  on: boolean,
+): number =>
+  Math.max(
+    origTick + minLen,
+    on ? snapEdgeTick(cursorRel, partStart, unit, true) : origTick + origDuration + Math.round(cursorRel - grabRel),
+  );
+
 // ── piano-key helpers (key column + row striping + note names) ──
 const BLACK = new Set([1, 3, 6, 8, 10]);
 const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];

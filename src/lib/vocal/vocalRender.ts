@@ -100,6 +100,11 @@ export function isVocalCancelError(e: unknown): boolean {
 
 /** ScoreToCV native frame rate — the triple `frames` and the f0 array share this one grid so they align. */
 const RENDER_FPS = 50;
+/** S87 — ONE render frame expressed in ticks at `tempo`. The vocal editor uses it as the length floor when
+ *  grid snapping is OFF: a note shorter than a frame provably cannot sound (buildScoreTriples rounds its
+ *  span to zero frames and files it under droppedNoteIds), so the UI must not let one be authored by hand.
+ *  Exported from HERE because this module owns the render grid — the floor must never drift from it. */
+export const renderFrameTicks = (tempo: number): number => Math.max(1, Math.round(msToTicks(1000 / RENDER_FPS, tempo)));
 /** Stable lane identity for the single baked vocal stem (mirrors an Output-node id — one lane per segment). */
 export const VOCAL_LANE_ID = "vocal";
 

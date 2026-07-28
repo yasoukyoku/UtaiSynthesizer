@@ -25,6 +25,9 @@
   },
   "midiExtract": {
     "menu": "Extract MIDI (vocal→notes)",
+    "optionsTitle": "MIDI extraction options",
+    "optionsBody": "Notes will be extracted from every stem of this lane group, each into a new vocal track. The onsets come from a pitch tracker, so rounding them to the grid is usually what you want.",
+    "quantDropped": "{{count}} notes were too short to survive rounding (mostly pitch-transition fragments) and were discarded",
     "extracting": "Extracting MIDI…",
     "done": "MIDI extracted — new vocal track created",
     "noNotes": "No notes were extracted",
@@ -92,6 +95,15 @@
   "import": {
     "done": "Imported",
     "pitchDropped": "One track's pitch tuning exceeded the import limit and was imported untuned (notes are intact)",
+    "options": {
+      "title": "Import options",
+      "body": "{{total}} notes, {{off}} of them ({{pct}}%) sit off the 1/12 grid. If this score's note positions were shifted by hand (UTAU CVVC preutterance compensation works exactly that way), turn rounding off and import it as authored.",
+      "quantize": "Round note boundaries to the nearest 1/12 beat",
+      "start": "Import"
+    },
+    "quantMoved": "{{count}} notes aligned to the grid",
+    "quantWidened": "{{count}} too-short notes widened to one grid cell (they would have been too short to sound)",
+    "quantSkippedBaked": "{{count}} tracks carry a baked pitch curve and were imported at their authored timing (not rounded)",
     "error": {
       "empty": "No importable notes found",
       "unsupported": "Unsupported file format (only ustx / ust / mid / midi)",
@@ -593,6 +605,7 @@
     "toolPitch": "Pitch (3)",
     "toolDelete": "Delete (4)",
     "grid": "Grid",
+    "snapNotesTip": "Snap notes to the grid (off = free placement; the lines stay as a reference)",
     "maximize": "Maximize",
     "restore": "Restore",
     "preview": "Preview",

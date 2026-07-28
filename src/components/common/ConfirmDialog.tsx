@@ -10,6 +10,10 @@ import "./ConfirmDialog.css";
  * background shortcuts (Ctrl+S/Z/…) don't fire underneath. Enter triggers the `primary` button if there
  * is one (never a `danger` button — destructive actions require an explicit click).
  *
+ * CHECKBOX mode (`confirm.check` set, S87 — the import / MIDI-extract grid-rounding option): one option row
+ * renders between body and buttons. Its value is reported through `check.onChange` (the caller keeps it in
+ * its own variable); the promise still resolves the BUTTON id, so the Promise<string> contract is unchanged.
+ *
  * TEXT-INPUT mode (`confirm.input` set, e.g. the "new group" prompt): an input renders between body and
  * buttons; the primary button / Enter resolves with the TRIMMED VALUE instead of the button id, blocked
  * (with an inline error) while empty or `input.invalid(value)` returns a message. Typing still works
@@ -20,13 +24,16 @@ export function ConfirmDialog() {
   const confirm = useAppStore((s) => s.confirm);
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [checked, setChecked] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Fresh input state per dialog (seq bumps on every showConfirm).
+  // Fresh input state per dialog (seq bumps on every showConfirm). The S87 checkbox MUST join this reset —
+  // otherwise a second dialog opened while one is up (showConfirm settles the first) inherits stale state.
   useEffect(() => {
     setValue(confirm?.input?.initial ?? "");
+    setChecked(confirm?.check?.initial ?? false);
     setError(null);
-  }, [confirm?.seq, confirm?.input?.initial]);
+  }, [confirm?.seq, confirm?.input?.initial, confirm?.check?.initial]);
 
   // Attempt to commit the input value via the primary action; returns the resolution or null if blocked.
   const commitInput = () => {
@@ -98,6 +105,23 @@ export function ConfirmDialog() {
             />
             {error && <div className="confirm-input-error">{error}</div>}
           </div>
+        )}
+        {confirm.check && (
+          // S87 option row (import / MIDI-extract grid rounding). The house checkbox style is the
+          // single-source `.training-check-row` (TrainingPage.css — "do not restyle per-site"), the same
+          // one ExportScoreDialog uses. The value is reported through onChange; the promise still
+          // resolves the BUTTON id, so `showConfirm`'s Promise<string> contract is untouched.
+          <label className="training-check-row confirm-check-row">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(e) => {
+                setChecked(e.target.checked);
+                confirm.check?.onChange(e.target.checked);
+              }}
+            />
+            <span>{confirm.check.label}</span>
+          </label>
         )}
         <div className="confirm-buttons">
           {confirm.scrollable && (

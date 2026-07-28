@@ -39,11 +39,23 @@ export interface ConfirmInput {
   invalid?: (value: string) => string | null;
 }
 
+/** S87 — optional CHECKBOX row (the import / MIDI-extract "round note boundaries to the 1/12 grid" option).
+ *  The dialog owns the checkbox state and reports every change through `onChange`, so the promise still
+ *  resolves the BUTTON id and the existing `Promise<string>` contract (30+ call sites, and `input`'s
+ *  value-overloading) is untouched — the caller keeps the flag in its own variable. Not combinable with
+ *  `input` (no caller needs both; the dialog renders whichever is set). */
+export interface ConfirmCheck {
+  label: string;
+  initial: boolean;
+  onChange: (checked: boolean) => void;
+}
+
 interface ConfirmRequest {
   title: string;
   body: string;
   buttons: ConfirmButton[];
   input?: ConfirmInput;
+  check?: ConfirmCheck;
   /** S74: error modals (maybeShowErrorModal) — long body scrolls, text is selectable, and a
    *  Copy button appears. Ordinary confirms/prompts leave it unset (compact, non-scrolling). */
   scrollable?: boolean;
@@ -106,6 +118,12 @@ interface AppState {
   snapSegments: boolean;
   /** Snap the playhead (drag on ruler / arrangement) to clip edges. */
   snapPlayhead: boolean;
+  /** S87: ② vocal piano-roll GRID snapping. ON (default) = the old behavior — a drawn note lands on the
+   *  selected grid cell, a move/resize steps by 1/12 (40t). OFF = fully CONTINUOUS placement (per-tick),
+   *  for scores whose timing is AUTHORED off-grid (a UTAU CVVC .ust hand-shifts note starts as
+   *  preutterance compensation: 82.6% of Main.ust's notes sit off the 1/12 grid ON PURPOSE). The 1/12
+   *  grid LINES stay visible either way — with snapping off they are a reference, not a magnet. */
+  snapNotes: boolean;
   /** ② A vocal (score→singing) render is in flight — GLOBAL single-flight: only one at a time, since the
    *  shared ORT engine + release_gpu_sessions_except would make concurrent renders evict each other's
    *  session mid-inference. Gates the Render button everywhere + backs the throw-guard in vocalRender.ts. */
@@ -172,6 +190,7 @@ interface AppState {
   setGhostInsert: (g: { index: number; count: number } | null) => void;
   toggleSnapSegments: () => void;
   toggleSnapPlayhead: () => void;
+  toggleSnapNotes: () => void;
   setVocalRenderActive: (v: boolean) => void;
   setRenderingVocalTrackId: (id: string | null) => void;
   /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
@@ -191,7 +210,7 @@ interface AppState {
   showBanner: (message: string, kind: BannerKind) => void;
   /** Show a styled confirm dialog; resolves with the chosen button id, or "" if dismissed (Esc/backdrop).
    *  With `input` set, the primary button/Enter resolves the trimmed input VALUE instead (see ConfirmInput). */
-  showConfirm: (opts: { title: string; body: string; buttons: ConfirmButton[]; input?: ConfirmInput; scrollable?: boolean }) => Promise<string>;
+  showConfirm: (opts: { title: string; body: string; buttons: ConfirmButton[]; input?: ConfirmInput; check?: ConfirmCheck; scrollable?: boolean }) => Promise<string>;
 }
 
 export type BannerKind = "undo" | "redo" | "save" | "load" | "info";
@@ -240,6 +259,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   ghostInsert: null,
   snapSegments: loadSetting("utai.snapSegments", true),
   snapPlayhead: loadSetting("utai.snapPlayhead", true),
+  snapNotes: loadSetting("utai.snapNotes", true),
   vocalRenderActive: false,
   renderingVocalTrackId: null,
   vocalOov: {},
@@ -329,6 +349,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveSetting("utai.snapPlayhead", v);
       return { snapPlayhead: v };
     }),
+  toggleSnapNotes: () =>
+    set((s) => {
+      const v = !s.snapNotes;
+      saveSetting("utai.snapNotes", v);
+      return { snapNotes: v };
+    }),
   setVocalRenderActive: (v) => set({ vocalRenderActive: v }),
   setRenderingVocalTrackId: (id) => set({ renderingVocalTrackId: id }),
   setVocalOov: (segmentId, noteIds) =>
@@ -384,6 +410,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           body: opts.body,
           buttons: opts.buttons,
           input: opts.input,
+          check: opts.check,
           scrollable: opts.scrollable,
           seq: prevSeq + 1,
           resolve: (id: string) => {

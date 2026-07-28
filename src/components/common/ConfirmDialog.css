@@ -91,6 +91,21 @@
   color: var(--accent-tertiary);
 }
 
+/* S87 option row (showConfirm `check`). The checkbox GLYPH is the single-source .training-check-row style
+   (TrainingPage.css — "do not restyle per-site"); this only re-sizes the row for a dialog. Scoped through
+   .confirm-dialog on purpose: a bare .confirm-check-row would tie with .training-check-row on specificity,
+   so which one won would depend on CSS bundling order. */
+.confirm-dialog .confirm-check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 18px;
+  font-family: var(--font-ui);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
 .confirm-buttons {
   display: flex;
   justify-content: flex-end;

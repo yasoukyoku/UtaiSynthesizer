@@ -17,7 +17,7 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, buildScoreTriples } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, buildScoreTriples, renderFrameTicks } from "../../lib/vocal/vocalRender";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
@@ -27,7 +27,7 @@ import { PLAYHEAD } from "../../lib/canvasDraw";
 import {
   type VocalView, V_PITCH_MIN, V_PITCH_MAX, V_ROW_H_MIN, V_ROW_H_MAX,
   tickToX, xToTick, noteTickToX, xToNoteTick, pitchToY, yToPitch, centsToY, yToCents,
-  rowsContentHeight, snapFloor, snapRound, isBlackKey, pitchName, pitchToHz, centsToHz,
+  rowsContentHeight, snapPlaceTick, snapEdgeTick, snapMoveDelta, resizeEndTick, isBlackKey, pitchName, pitchToHz, centsToHz,
   paramToY, yToParam, LOUDNESS_DB_RANGE,
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
@@ -112,6 +112,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const setSegmentPitchDev = useProjectStore((s) => s.setSegmentPitchDev);
   const setSegmentParamCurve = useProjectStore((s) => s.setSegmentParamCurve);
   const setActivePane = useAppStore((s) => s.setActivePane);
+  // S87 grid snapping is a persisted APP preference (mirrors the arrangement's snapSegments/snapPlayhead,
+  // same `utai.` localStorage funnel) — NOT project state: it must never enter a project signature nor an
+  // undo step. OFF = continuous placement for scores whose timing is authored off-grid (UTAU CVVC).
+  const snapNotes = useAppStore((s) => s.snapNotes);
+  const toggleSnapNotes = useAppStore((s) => s.toggleSnapNotes);
 
   // Resolve the notes part by the STABLE segment id (a track reorder / rename must not lose it).
   const part = useMemo(() => {
@@ -229,6 +234,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   toolRef.current = tool;
   const gridDivRef = useRef(gridDiv);
   gridDivRef.current = gridDiv;
+  const snapNotesRef = useRef(snapNotes); // gestures/draw run outside React — read the live value via ref
+  snapNotesRef.current = snapNotes;
   const laneOpenRef = useRef(laneOpen);
   laneOpenRef.current = laneOpen;
   const laneParamRef = useRef(laneParam);
@@ -244,6 +251,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   axisRef.current = timeAxis;
 
   const snapTicks = () => TICKS_PER_BEAT / gridDivRef.current; // 480/div: 1/4=480,1/8=240,1/16=120,1/8T=160,1/16T=80,1/12=40
+  /** S87 — THE single gate for grid snapping in this editor: the editor's binding of the pure contract in
+   *  vocalGeometry (part start + the live toggle come from refs, because gestures/draw run outside React).
+   *  `snapPlace` FLOORs to the SELECTED grid cell (creation); `snapEdge` ROUNDs to its `unit` (a creation
+   *  drag-out uses the grid cell, move/resize use the fixed MIN_LEN_TICKS — §user: "only CREATION uses the
+   *  grid"). Snapping OFF ⇒ continuous whole ticks. ONE gate, so a gesture can never be half-snapped.
+   *  Both snap in ABSOLUTE tick space (see vocalGeometry) so notes land on the lines actually drawn.
+   *  The grid LINES themselves are drawn independently (12/beat) and stay visible either way — with
+   *  snapping off they are a reference, not a magnet (§user: 1/12 格线降级为参考). */
+  const snapPlace = (relTick: number) => snapPlaceTick(relTick, startRef.current, snapTicks(), snapNotesRef.current);
+  const snapEdge = (relTick: number, unit: number) => snapEdgeTick(relTick, startRef.current, unit, snapNotesRef.current);
 
   // ② lane geometry (live, from refs): when the bottom automation lane is OPEN it reserves LANE_H at the
   // canvas bottom, so the note-row area shrinks — EVERY visible-note-height / scroll clamp must subtract it
@@ -836,7 +853,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       //    LAST (over the key column + ruler) so it is NEVER covered — fixes "disappears at the leftmost".
       const mp = mouseRef.current;
       if (mp && !dragRef.current && mp.x >= KEY_COL_W && mp.y >= RULER_H) {
-        const gx = noteAreaX + noteTickToX(snapFloor(xToNoteTick(mp.x - KEY_COL_W, start, v), snapTicks()), start, v);
+        // Math.max(0, …) MUST mirror the pen's own clamp below — snapPlace works in ABSOLUTE space, so for a
+        // part whose start is off-grid (every imported / MIDI-extracted part) it returns a NEGATIVE relative
+        // tick inside the part's leading partial cell, and an unclamped guide would promise a position one
+        // whole cell left of where the note actually appears.
+        const gx = noteAreaX + noteTickToX(Math.max(0, snapPlace(xToNoteTick(mp.x - KEY_COL_W, start, v))), start, v);
         if (gx <= w) {
           const gxr = Math.max(KEY_COL_W, Math.round(gx)) + 0.5;
           ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
@@ -999,7 +1020,16 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       return base.map((n) => {
         const o = d.orig.get(n.id);
         if (!o) return n;
-        const newEnd = Math.max(o.tick + MIN_LEN_TICKS, snapRound(relTickAt(d.curX), MIN_LEN_TICKS)); // step by 1/12 (40t)
+        // Snapping ON: the end lands ON a 1/12 line, floored at one cell — HEAD's behavior, byte-identical.
+        // OFF: the end follows the HAND (delta from the grab point), so the grab offset is preserved and a
+        // click cannot teleport the edge to the cursor; the floor becomes ONE RENDER FRAME, which is the
+        // real limit (shorter provably cannot sound) and still well under 1/12, so an imported sub-cell
+        // CVVC note stays editable.
+        const minLen = snapNotesRef.current ? MIN_LEN_TICKS : renderFrameTicks(tempoRef.current);
+        const newEnd = resizeEndTick(
+          o.tick, o.duration, relTickAt(d.curX), d.startRel ?? 0,
+          startRef.current, MIN_LEN_TICKS, minLen, snapNotesRef.current,
+        );
         return { ...o, duration: newEnd - o.tick };
       });
     }
@@ -1011,7 +1041,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       // Adjustment drags step by 1/12 (40t), NOT the (possibly coarse) grid cell (§user: only CREATION uses
       // the grid). Each axis is INDEPENDENT (activeX/activeY set in onPointerMove) and measured from the
       // origin — so switching direction mid-drag keeps what the other axis already moved (no jump-back).
-      const rawDTick = d.activeX ? snapRound(relTickAt(d.curX), MIN_LEN_TICKS) - snapRound(d.startRel ?? 0, MIN_LEN_TICKS) : 0;
+      // S87 — ABSOLUTE snapping: the delta is chosen so the ANCHOR note (the one grabbed at pointerdown,
+      // d.anchorRelTick) lands ON a grid line; every other selected note rides the SAME delta, so spacing is
+      // preserved. The pre-S87 form snapped the CURSOR tick at both ends and subtracted — always a whole
+      // number of cells, which CONSERVES an off-grid offset: an imported off-grid note could never be dragged
+      // back onto the grid (§user 死结). Snapping OFF ⇒ a plain whole-tick continuous delta.
+      const rawDTick = d.activeX
+        ? snapMoveDelta(d.anchorRelTick, relTickAt(d.curX) - (d.startRel ?? 0), startRef.current, MIN_LEN_TICKS, snapNotesRef.current)
+        : 0;
       const rawDPitch = d.activeY ? pitchAt(d.curY) - (d.startPitch ?? 0) : 0;
       // GROUP clamp (§9.2): clamp the SHARED delta by the group's headroom so spacing is preserved and two
       // notes can't collapse onto one tick/pitch at a wall. Translate whole notes — transition/vibrato are
@@ -1175,10 +1212,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const drawNote = tl === "pen" || ((tl === "arrow") && (e.ctrlKey || e.metaKey));
     if (drawNote) {
       const snap = snapTicks();
-      const relStart = Math.max(0, snapFloor(relTickAt(e.clientX), snap));
+      const relStart = Math.max(0, snapPlace(relTickAt(e.clientX)));
       const p = clampPitch(pitchAt(e.clientY));
       // Created note honors the 60ms floor like resize/truncation do (§9.2) — a fine grid can't make an
-      // inaudible sub-floor note.
+      // inaudible sub-floor note. S87: the grid CELL stays the default/min length even with snapping OFF —
+      // continuous mode frees the note's POSITION, it must not let a click-with-jitter draw a 1-tick note.
       const newNote: Note = { id: crypto.randomUUID(), tick: relStart, duration: Math.max(1, snap), pitch: p, lyric: defaultLyricRef.current, velocity: 100 };
       playback.playPreviewTone(pitchToHz(p), 0); // sustained while drawing; stops on pointerup
       dragRef.current = withPreview({
@@ -1260,7 +1298,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         useProjectStore.getState().setPlayhead(Math.max(0, Math.round(xToTick(localXY(e.clientX, e.clientY).x - KEY_COL_W, viewRef.current))));
       } else if (d.kind === "create" && d.newNote) {
         const snap = snapTicks();
-        const end = Math.max(d.anchorRelTick + snap, snapRound(relTickAt(e.clientX), snap));
+        const end = Math.max(d.anchorRelTick + snap, snapEdge(relTickAt(e.clientX), snap)); // S87: min length = one cell in BOTH modes
         d.newNote = { ...d.newNote, duration: Math.max(snap, end - d.anchorRelTick) };
       }
     }
@@ -1312,7 +1350,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       requestRedraw();
       return;
     }
-    // move / resize
+    // move / resize — a gesture with ZERO pointer motion is a SELECTION click, never an edit. Before S87 the
+    // 1/12 rounding absorbed the whole 6px edge hotzone, so a bare click resolved to the note's own end and
+    // commitNotes' no-op guard swallowed it; with snapping OFF the raw cursor tick lands strictly INSIDE the
+    // note, so the same click would silently truncate it (+dirty +undo step). Guard the CAUSE, not the mode.
+    if (!d.moved) {
+      requestRedraw();
+      return;
+    }
     commitNotes(computePreview(d), d.activeIds);
   }, [selectNotes, part, segmentId, setSegmentPitchDev, setSegmentParamCurve, requestRedraw]);
 
@@ -1443,6 +1488,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     if (!part || clipboardRef.current.length === 0) return;
     const clip = clipboardRef.current;
     const minTick = Math.min(...clip.map((n) => n.tick));
+    // S87: Ctrl+D's offset and Ctrl+V's mouse anchor are deliberately NOT gated by the snap toggle —
+    // duplicate-in-place is a fixed one-cell STEP (not a snap), and paste-at-mouse has always been
+    // continuous. The toggle governs where a note LANDS during a pointer gesture, not command step sizes.
     const anchor = dupInPlace ? minTick + snapTicks() : Math.max(0, relTickAt((mouseRef.current?.x ?? KEY_COL_W + 20) + (canvasRef.current?.getBoundingClientRect().left ?? 0)));
     const shift = dupInPlace ? snapTicks() : anchor - minTick;
     const pasted = clip.map((n): Note => ({ ...n, id: crypto.randomUUID(), tick: Math.max(0, n.tick + shift) }));
@@ -1452,7 +1500,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const nudge = (key: string) => {
     if (!part) return;
-    const snap = snapTicks();
+    const snap = snapTicks(); // S87: a keyboard nudge is a fixed one-cell STEP in both modes (see pasteAt)
     const dTick = key === "ArrowLeft" ? -snap : key === "ArrowRight" ? snap : 0;
     const dPitch = key === "ArrowUp" ? 1 : key === "ArrowDown" ? -1 : 0;
     const sel = part.notes.filter((n) => selRef.current.has(n.id));
@@ -1554,6 +1602,21 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
           >{t("vocalEditor.lane.phoneme")}</button>
         </div>
         <div className="vocal-editor-header-spacer" />
+        {/* S87 grid-snap ON/OFF. The 1/12 lines are drawn either way — with snapping off they are a
+            REFERENCE, not a magnet, so an imported UTAU CVVC score (whose note starts are the author's
+            hand-made preutterance offsets — 82.6% off-grid in Main.ust) stays editable without being
+            pulled onto the grid. Persisted app-wide (utai.snapNotes), like the arrangement's magnets. */}
+        <button
+          className={`snap-toggle${snapNotes ? " active" : ""}`}
+          title={t("vocalEditor.snapNotesTip")}
+          aria-label={t("vocalEditor.snapNotesTip")}
+          onClick={toggleSnapNotes}
+        >
+          {/* magnet — the SAME glyph as the arrangement's clip-snap toggle (Toolbar.tsx) */}
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path fill="currentColor" d="M3 7v6a9 9 0 0 0 18 0V7h-4v6a5 5 0 0 1-10 0V7z M3 3h4v4H3z M17 3h4v4h-4z" />
+          </svg>
+        </button>
         <label className="vocal-grid-label">{t("vocalEditor.grid")}</label>
         <div className="vocal-grid-select">
           {GRID_DIVS.map((g) => (

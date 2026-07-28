@@ -17,8 +17,10 @@ import { useAppStore } from "../../store/app";
 import { useHistoryStore } from "../../store/history";
 import { flushAutosaveNow } from "../project/autosave";
 import { TICKS_PER_BEAT, SCORE_EXTENSIONS } from "../constants";
+import { loadSetting, saveSetting } from "../settings";
+import { quantizeSpans, offGridCount, QUANTIZE_IMPORT_KEY, type QuantSpan } from "./quantize";
 
-const t = (k: string) => i18n.t(k);
+const t = (k: string, vars?: Record<string, unknown>) => i18n.t(k, vars ?? {}) as string;
 
 // ── Rust contract (see ImportedScore in import.rs). Fields are snake_case (serde default). ──
 interface ImportedScore {
@@ -94,8 +96,42 @@ export async function importScoreFile(): Promise<void> {
       return;
     }
 
+    // S87 — grid rounding is the USER's call, per import. It CURES a score whose notes are shorter than one
+    // 20 ms render frame (a 30t note @ tempo 222 = 16.9 ms rounds to ZERO frames and never sounds) and it
+    // RUINS a UTAU CVVC score, whose off-grid starts ARE the alias author's preutterance compensation. The
+    // dialog shows how much of THIS file is off-grid, so the choice is informed rather than a coin flip.
+    const absSpans = (tk: ImportedTrack): QuantSpan[] =>
+      tk.notes.map((n) => ({ start: tk.start_tick + n.tick, end: tk.start_tick + n.tick + n.duration }));
+    const allSpans = score.tracks.filter((tk) => tk.notes.length).flatMap(absSpans);
+    const off = offGridCount(allSpans);
+    let quantize = loadSetting(QUANTIZE_IMPORT_KEY, true);
+    const choice = await useAppStore.getState().showConfirm({
+      title: t("import.options.title"),
+      body: t("import.options.body", {
+        total: allSpans.length,
+        off,
+        pct: allSpans.length ? Math.round((off / allSpans.length) * 100) : 0,
+      }),
+      check: {
+        label: t("import.options.quantize"),
+        initial: quantize,
+        onChange: (v) => {
+          quantize = v;
+        },
+      },
+      buttons: [
+        { id: "cancel", label: t("common.cancel") },
+        { id: "ok", label: t("import.options.start"), kind: "primary" },
+      ],
+    });
+    if (choice !== "ok") return; // Cancel / Esc / backdrop — nothing was touched yet
+    saveSetting(QUANTIZE_IMPORT_KEY, quantize);
+
     const store = useProjectStore.getState();
     const history = useHistoryStore.getState();
+    let movedTotal = 0;
+    let widenedTotal = 0;
+    let skippedBaked = 0;
 
     // ONE undo step for the whole import (tempo/meter override + every track + notes).
     history.beginTransaction();
@@ -119,19 +155,37 @@ export async function importScoreFile(): Promise<void> {
         const name = named || (namelessTotal > 1 ? `${fileBase} ${++namelessIdx}` : fileBase);
         store.addTrack(blankTrack(trackId, name, "vocal"));
 
-        // Part spans from the first note (tick 0, rebased in Rust) to the last note's end.
-        const lastEnd = it.notes.reduce((m, n) => Math.max(m, n.tick + n.duration), 0);
-        const durationTicks = lastEnd > 0 ? lastEnd : TICKS_PER_BEAT;
-        const segId = store.createVocalPart(trackId, it.start_tick, durationTicks);
-
         // S73:BAKED part(带烤入曲线)的音符显式置零 transition = 纯阶梯——OU 的滑音/颤音/手绘
         // 全在 pitchDev 曲线里,我们的默认滑音再叠加=双重;零 transition 也让这些音符被
         // 自动调教的所有权谓词识别为「用户调教过」(导入的调教=用户资产,autoTune 绕行)。
         const baked = !!it.pitch_dev && it.pitch_dev.xs.length > 0;
-        const notes: Note[] = it.notes.map((n) => ({
+        // S87 rounding, in ABSOLUTE tick space (the grid lines are absolute; a part start is wherever its
+        // first note is, so rounding relative ticks would land notes on lines that are not the drawn ones).
+        // ⚠ A BAKED part is EXEMPT: its hand-drawn pitch curve is keyed to the ORIGINAL note timing, so
+        // moving the notes out from under it would desynchronize the two. Reported, never silently skipped.
+        const doQuant = quantize && !baked;
+        if (quantize && baked) skippedBaked++;
+        let partStart = it.start_tick;
+        let placed = it.notes.map((n) => ({ tick: n.tick, duration: n.duration }));
+        if (doQuant) {
+          // "widen" — an imported note carries a LYRIC, so a collapsed one is lengthened, never dropped
+          // (see CollapsePolicy); that policy also guarantees every index survives.
+          const { spans, moved, widened } = quantizeSpans(absSpans(it), "widen");
+          partStart = spans.reduce((m, s) => Math.min(m, s!.start), Infinity);
+          placed = spans.map((s) => ({ tick: s!.start - partStart, duration: s!.end - s!.start }));
+          movedTotal += moved;
+          widenedTotal += widened;
+        }
+
+        // Part spans from the first note (rebased to tick 0) to the last note's end.
+        const lastEnd = placed.reduce((m, p) => Math.max(m, p.tick + p.duration), 0);
+        const durationTicks = lastEnd > 0 ? lastEnd : TICKS_PER_BEAT;
+        const segId = store.createVocalPart(trackId, partStart, durationTicks);
+
+        const notes: Note[] = it.notes.map((n, i) => ({
           id: crypto.randomUUID(),
-          tick: n.tick,
-          duration: n.duration,
+          tick: placed[i]!.tick,
+          duration: placed[i]!.duration,
           pitch: n.pitch,
           lyric: n.lyric,
           velocity: 100,
@@ -151,6 +205,13 @@ export async function importScoreFile(): Promise<void> {
     // Import is a milestone — snapshot to disk NOW so a fast reload doesn't lose it to the autosave debounce.
     flushAutosaveNow();
     useAppStore.getState().showBanner(`${t("import.done")} · ${score.tracks.length}`, "load");
+    // S87: say OUT LOUD what rounding did. A moved note, a note widened off a collapse, or a part exempted
+    // for its baked pitch curve must never be a silent surprise (the S84/S85 silent-drop lesson).
+    const report: string[] = [];
+    if (movedTotal > 0) report.push(t("import.quantMoved", { count: movedTotal }));
+    if (widenedTotal > 0) report.push(t("import.quantWidened", { count: widenedTotal }));
+    if (skippedBaked > 0) report.push(t("import.quantSkippedBaked", { count: skippedBaked }));
+    if (report.length) useAppStore.getState().showToast(report.join(" · "), "info");
     // S73:某 part 的调教超出可烤上限被放弃 → 响亮告知(音符已导入,音高线没有)。
     if (score.tracks.some((tk) => tk.pitch_dev_dropped)) {
       useAppStore.getState().showToast(t("import.pitchDropped"), "error");
