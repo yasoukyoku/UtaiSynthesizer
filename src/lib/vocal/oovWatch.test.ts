@@ -26,6 +26,7 @@ import { installOovWatch } from "./oovWatch";
 import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { installHistory } from "../../store/history";
+import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note, Track, Segment, SegmentContent } from "../../types/project";
 
 const TEMPO = 120; // ticksPerFrame 19.2
@@ -103,6 +104,38 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     await settle();
     expect(useAppStore.getState().vocalBorrowed).toEqual({ [SEG]: ["b"] });
     expect(useAppStore.getState().vocalOov).toEqual({}); // only the LYRIC verdict is lost to the failure
+  });
+
+  // §user control experiment: with TWO sub-frame notes, cutting BETWEEN them left the first half marked
+  // and the second half blank — "只判断了第一片" — and it never recovered.
+  it("★ marks BOTH halves when each half owns a flagged note", async () => {
+    const two = [
+      mk("a", 0, 700, 60), mk("b1", 768, 1, 72), mk("c", 1000, 480, 64),
+      mk("b2", 1600, 1, 74), mk("d", 1800, 480, 62),
+    ];
+    // ★ WITH A BAKE — the real-world shape: the user had rendered, so the split also runs
+    // stampSplitWindowSigs → replaceProcessedOutputs, i.e. extra store writes right after the split.
+    const seg: Segment = {
+      id: SEG, startTick: 0, durationTicks: 2400,
+      content: { type: "notes", notes: two } as SegmentContent,
+      processedOutputs: [{ laneId: "vocal", laneLabel: "V", group: "V", audioPath: "x.wav", totalDurationMs: 5000, waveformPeaks: [0.1], outputNodeId: "vocal" }],
+    };
+    const track: Track = {
+      id: "T", name: "V", trackType: "vocal", segments: [seg], voiceModel: "V",
+      vocalParams: { backend: "rvc", speakerId: 0, langId: 2, transpose: 0, formant: 0, transition: DEFAULT_TRANSITION, breathToken: "AP" },
+      volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {},
+    };
+    useProjectStore.setState({ name: "P", tracks: [track], tempo: TEMPO, timeSignature: [4, 4], dirty: false, filePath: null, selectedNotes: [], playheadTick: 0 });
+    installHistory();
+    uninstall = installOovWatch();
+    await settle();
+    expect(useAppStore.getState().vocalBorrowed[SEG]).toEqual(["b1", "b2"]);
+
+    const rightId = splitSegmentVocalAware("T", SEG, 1500, TEMPO)!; // between b1 and b2
+    await settle();
+    const map = useAppStore.getState().vocalBorrowed;
+    expect(map[SEG], "LEFT half keeps b1").toEqual(["b1"]);
+    expect(map[rightId], "RIGHT half must be marked too").toHaveLength(1);
   });
 
   it("clears every channel when the segment goes away", async () => {
