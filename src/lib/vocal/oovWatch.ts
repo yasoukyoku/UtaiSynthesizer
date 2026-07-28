@@ -73,21 +73,25 @@ async function validatePass(): Promise<void> {
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, null);
           app.setVocalDropped(seg.id, null);
-          app.setVocalBorrowed(seg.id, null);
+          app.setVocalShort(seg.id, null);
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-        const { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
+        const { triples, tripleNoteIds, droppedNoteIds, shortNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
         // S87: the FRAME verdicts (too-short / rescued-by-borrow) come straight out of buildScoreTriples —
         // they need no backend at all. Publish them BEFORE the `validate_lyrics` round-trip: gating them
         // behind it meant a slow classifier delayed the marks, and a FAILING one (the catch below only
         // stamps `validated`, so the segment is never retried) dropped them permanently — e.g. right after
         // a SPLIT, whose new half has no verdict yet, the marks would simply never appear.
-        // S84 D 刀 → S85b: too-short notes wear the same red as OOV (both = "this note cannot sing") but a
-        // SEPARATE map, so the track header can say "note too short" instead of falsely claiming a lyric
-        // OOV(用户实机反馈); S87 adds the amber, NON-blocking third channel for rescued notes.
+        // S84 D 刀 → S85b: a note that will NOT sound wears red (own map, so the track header can say
+        // "note too short" instead of falsely claiming a lyric OOV — 用户实机反馈). S87 adds the amber
+        // channel for notes that are merely SHORTER THAN A FRAME: those are marked by DURATION, a property
+        // of the note alone, so the mark cannot blink out when the part is split (a phase-dependent verdict
+        // did exactly that — §user). Red wins: a dropped note is never also amber.
+        const dropped = new Set(droppedNoteIds);
+        const amber = shortNoteIds.filter((id) => !dropped.has(id));
         app.setVocalDropped(seg.id, droppedNoteIds.length ? droppedNoteIds : null);
-        app.setVocalBorrowed(seg.id, borrowedNoteIds.length ? borrowedNoteIds : null);
+        app.setVocalShort(seg.id, amber.length ? amber : null);
         try {
           const classes = await invoke<Array<{ kind: string }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
@@ -117,7 +121,7 @@ async function validatePass(): Promise<void> {
         validated.delete(id);
         app.setVocalOov(id, null);
         app.setVocalDropped(id, null);
-        app.setVocalBorrowed(id, null);
+        app.setVocalShort(id, null);
       }
     }
     lastTracks = st.tracks;

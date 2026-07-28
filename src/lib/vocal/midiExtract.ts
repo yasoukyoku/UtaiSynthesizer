@@ -263,7 +263,13 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
       { id: "ok", label: t("common.confirm"), kind: "primary" },
     ],
   });
-  if (choice !== "ok") return; // Cancel / Esc / backdrop — nothing started
+  if (choice !== "ok") {
+    // Cancel / Esc / backdrop — nothing started. Reported for the same reason as in import.ts: showConfirm
+    // force-settles an already-open dialog, so a silent return would make a competing prompt look like the
+    // extraction simply never happened.
+    useAppStore.getState().showToast(t("midiExtract.cancelled"), "info");
+    return;
+  }
   saveSetting(QUANTIZE_IMPORT_KEY, quantize);
   if (useAppStore.getState().midiExtracting[key]) return; // double-trigger across the dialog await
 
@@ -367,11 +373,13 @@ export async function extractMidiForLaneGroup(trackId: string, segId: string, gr
     } finally {
       history.commitTransaction();
     }
+    // S87: the collapse drop is reported, never silent (pre-S87 it was a bare `continue`) — INCLUDING the
+    // case where it swallowed everything, which otherwise reported only "no notes were extracted" and left
+    // the user blaming the engine for what the rounding checkbox did (audit-caught).
+    if (droppedTotal > 0) useAppStore.getState().showToast(t("midiExtract.quantDropped", { count: droppedTotal }), "info");
     if (made > 0) {
       flushAutosaveNow();
       useAppStore.getState().showBanner(`${t("midiExtract.done")} · ${made}`, "info");
-      // S87: the collapse drop is reported, never silent (pre-S87 it was a bare `continue`).
-      if (droppedTotal > 0) useAppStore.getState().showToast(t("midiExtract.quantDropped", { count: droppedTotal }), "info");
     } else {
       useAppStore.getState().showToast(t("midiExtract.noNotes"), "info");
     }

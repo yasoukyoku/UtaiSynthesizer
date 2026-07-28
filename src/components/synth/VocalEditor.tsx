@@ -185,9 +185,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   oovRef.current = new Set([...(oovIds ?? []), ...(droppedIds ?? [])]);
   // S87 #3: rescued-by-borrow notes — a SEPARATE, non-blocking channel (amber), kept out of oovRef so the
   // blocking red keeps meaning exactly "this note will not sound".
-  const borrowedIds = useAppStore((s) => s.vocalBorrowed[segmentId]);
-  const borrowedRef = useRef<Set<string>>(new Set());
-  borrowedRef.current = new Set(borrowedIds ?? []);
+  const shortIds = useAppStore((s) => s.vocalShort[segmentId]);
+  const shortRef = useRef<Set<string>>(new Set());
+  shortRef.current = new Set(shortIds ?? []);
   // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
   // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
   const userTunedIds = useMemo(() => {
@@ -584,7 +584,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         // S87 #3: a BORROWED note is a NON-blocking notice — it sounds; the renderer merely lent it a frame
         // from a neighbour. Amber, never the blocking red (§user: 红色现在一律=阻塞性警告). `oov` wins if a
         // note somehow lands in both (blocking always outranks advisory).
-        const borrowed = !oov && borrowedRef.current.has(n.id);
+        const borrowed = !oov && shortRef.current.has(n.id);
         const cx0 = Math.max(noteAreaX, x0);
         ctx.fillStyle = selected
           ? (col("--note-selected") || "#8b5cf6")
@@ -866,11 +866,14 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       //    LAST (over the key column + ruler) so it is NEVER covered — fixes "disappears at the leftmost".
       const mp = mouseRef.current;
       if (mp && !dragRef.current && mp.x >= KEY_COL_W && mp.y >= RULER_H) {
-        // Math.max(0, …) MUST mirror the pen's own clamp below — snapPlace works in ABSOLUTE space, so for a
-        // part whose start is off-grid (every imported / MIDI-extracted part) it returns a NEGATIVE relative
-        // tick inside the part's leading partial cell, and an unclamped guide would promise a position one
-        // whole cell left of where the note actually appears.
-        const gx = noteAreaX + noteTickToX(Math.max(0, snapPlace(xToNoteTick(mp.x - KEY_COL_W, start, v))), start, v);
+        // The clamp mirrors the pen's own Math.max(0, …) so the guide can't promise a position one whole cell
+        // left of where the note appears — snapPlace works in ABSOLUTE space, so inside the leading partial
+        // cell of an off-grid part (every imported / MIDI-extracted part) it returns a NEGATIVE relative tick.
+        // ⚠ It applies ONLY inside the part: left of the part start the cursor is outside it entirely, and
+        // the guide must keep tracking the mouse there for all four tools (pre-S87 behavior — an unconditional
+        // clamp froze the guide on the part's left edge for every part not starting at tick 0; audit-caught).
+        const gRel = xToNoteTick(mp.x - KEY_COL_W, start, v);
+        const gx = noteAreaX + noteTickToX(gRel >= 0 ? Math.max(0, snapPlace(gRel)) : snapPlace(gRel), start, v);
         if (gx <= w) {
           const gxr = Math.max(KEY_COL_W, Math.round(gx)) + 0.5;
           ctx.strokeStyle = col("--accent-primary") || "#39c5bb";
@@ -950,7 +953,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
-  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, borrowedIds, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, shortIds, requestRedraw]);
   // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
   // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
   // invalidation path. S83 review #7.)
@@ -1039,8 +1042,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         // real limit (shorter provably cannot sound) and still well under 1/12, so an imported sub-cell
         // CVVC note stays editable.
         const minLen = snapNotesRef.current ? MIN_LEN_TICKS : renderFrameTicks(tempoRef.current);
+        // The fallback is the note's own END, NOT 0: a missing grab tick then degenerates to the pre-S87
+        // absolute-cursor rule instead of adding the whole cursor position to the length. (Both resize
+        // entry points do record startRel; this is the belt to that braces.)
         const newEnd = resizeEndTick(
-          o.tick, o.duration, relTickAt(d.curX), d.startRel ?? 0,
+          o.tick, o.duration, relTickAt(d.curX), d.startRel ?? o.tick + o.duration,
           startRef.current, MIN_LEN_TICKS, minLen, snapNotesRef.current,
         );
         return { ...o, duration: newEnd - o.tick };
@@ -1196,6 +1202,11 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         dragRef.current = withPreview({
           kind: "resize", clientX0: e.clientX, clientY0: e.clientY, curX: e.clientX, curY: e.clientY,
           activeIds: [o.id], orig: new Map([[o.id, o]]), newNote: null, anchorRelTick: o.tick, moved: false, additive: false,
+          // S87 — `startRel` is the GRAB tick: with snapping OFF the resize follows the hand (delta from
+          // here), so this path MUST record it. It was absent before S87 only because the old formula was
+          // absolute-cursor and never read it; leaving it out made a pen drag add the whole cursor tick to
+          // the note's length (runaway note + downstream notes truncated in one undo step — audit MAJOR).
+          startRel: relTickAt(e.clientX),
         });
         return;
       }

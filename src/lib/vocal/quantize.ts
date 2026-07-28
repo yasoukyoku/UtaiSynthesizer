@@ -114,10 +114,12 @@ export function quantizeSpans(
   return { spans: out, moved, widened, dropped };
 }
 
-/** How many of these spans do NOT start on a grid line — the number shown in the import options dialog so
- *  the choice is informed (a CVVC score reads ~80%+ here; a quantized ja UST reads ~2%). */
+/** How many of these notes rounding would actually MOVE — the number shown in the import options dialog so
+ *  the choice is informed (a CVVC score reads ~80%+ here; a quantized ja UST reads ~2%).
+ *  ⚠ BOTH edges: counting only starts made a DAW export whose starts are on-grid but whose lengths carry a
+ *  90% note gate report "0 (0%) off the grid" and then rewrite every duration (audit-caught). */
 export function offGridCount(spans: readonly QuantSpan[], unit: number = GRID_QUANT_TICKS): number {
   let n = 0;
-  for (const s of spans) if (s.start % unit !== 0) n++;
+  for (const s of spans) if (s.start % unit !== 0 || s.end % unit !== 0) n++;
   return n;
 }

@@ -100,11 +100,13 @@ export function isVocalCancelError(e: unknown): boolean {
 
 /** ScoreToCV native frame rate — the triple `frames` and the f0 array share this one grid so they align. */
 const RENDER_FPS = 50;
-/** S87 — ONE render frame expressed in ticks at `tempo`. The vocal editor uses it as the length floor when
- *  grid snapping is OFF: a note shorter than a frame provably cannot sound (buildScoreTriples rounds its
- *  span to zero frames and files it under droppedNoteIds), so the UI must not let one be authored by hand.
+/** S87 — ONE render frame expressed in ticks at `tempo`, rounded UP. The vocal editor uses it as the length
+ *  floor when grid snapping is OFF, and as the "this note is too short" test everywhere else.
+ *  ⚠ CEIL, not round: `frameOf(end) − frameOf(start) ≥ 1` holds for EVERY start phase only once the span is
+ *  at least a whole frame. Rounding 19.2 down to 19 left a note dragged to the editor's own floor still able
+ *  to land on zero frames at 20 of every 100 start ticks (audit-caught).
  *  Exported from HERE because this module owns the render grid — the floor must never drift from it. */
-export const renderFrameTicks = (tempo: number): number => Math.max(1, Math.round(msToTicks(1000 / RENDER_FPS, tempo)));
+export const renderFrameTicks = (tempo: number): number => Math.max(1, Math.ceil(msToTicks(1000 / RENDER_FPS, tempo)));
 /** Stable lane identity for the single baked vocal stem (mirrors an Output-node id — one lane per segment). */
 export const VOCAL_LANE_ID = "vocal";
 
@@ -208,6 +210,14 @@ export function buildScoreTriples(
    *  UI can grade the warning instead of painting both the same red (§user; mirrors the S85b OOV/dropped
    *  split, whose whole point was that a merged channel makes the wording lie). */
   borrowedNoteIds: string[];
+  /** S87 — sung notes whose DURATION is under one render frame. This is the honest "too short" fact and the
+   *  one the UI marks, because unlike `dropped`/`borrowed` it is a property of the NOTE ALONE: those two
+   *  depend on the note's PHASE against a frame grid that restarts at the segment start, so merely SPLITTING
+   *  a part re-rolls them (measured: 40 of 51 split offsets flip the verdict) — the marks would blink out
+   *  when you cut, while a lyric-OOV mark, which depends on nothing positional, survives (§user, and they
+   *  were right that the two ought to behave the same).
+   *  Nesting: dropped ⊆ short and borrowed ⊆ short (a note at least a frame long always gets a frame). */
+  shortNoteIds: string[];
   sorted: Note[];
   /** S87 #3: `sorted`, retimed for the F0 FEED only — see the borrow pass. Identical to `sorted` (same
    *  object identities) when nothing was borrowed. */
@@ -234,11 +244,13 @@ export function buildScoreTriples(
     lang: number;
   }
   const items: Item[] = [];
+  const shortNoteIds: string[] = [];
   let cursor = 0; // segment-relative tick covered so far
   for (const n of sorted) {
     const start = Math.max(cursor, n.tick);
     const end = n.tick + n.duration;
     if (end <= cursor) continue; // fully swallowed by a previous note (defensive — notes don't overlap)
+    if (n.duration < ticksPerFrame) shortNoteIds.push(n.id); // phase-INDEPENDENT "too short" fact
     // S58: per-note effective language (note override ?? track default). Gap rests take the default —
     // Rust's run assignment attaches them to the surrounding run anyway (a rest's lang is only read
     // when the whole score has no sung note).
@@ -262,6 +274,16 @@ export function buildScoreTriples(
   const MIN_KEEP_REST = 1;
   const MIN_KEEP_NOTE = 2;
   const canLend = (it: Item) => it.endF - it.startF >= (it.note ? MIN_KEEP_NOTE : MIN_KEEP_REST) + 1;
+  /** ★ The knife may only fire when it CANNOT HARM A NEIGHBOUR. A rescued note is exactly ONE frame long,
+   *  and Rust's allocator pre-rolls the NEXT sung note's onset consonant out of the phone before it
+   *  (score2cv.rs `assemble_arrays`, S83): a 1-frame lender yields `avail = (1 - SUNG_KEEP_MIN) = 0`, so the
+   *  follower either loses its consonant outright (short follower — 「た」 comes out as 「あ」) or falls back
+   *  to placing it INSIDE the note, putting its vowel ~40 ms after the beat. That is precisely the pathology
+   *  S83 was built to remove, and trading a full written note's consonant for a ~5 ms grace note is a bad
+   *  deal. So: rescue only when nothing needs to pre-roll from us — the next item is a REST (an SP lender is
+   *  fine) or there is no next item. Otherwise the note is still reported as too short, exactly as before
+   *  this knife existed. Never better than baseline is acceptable; WORSE than baseline is not. */
+  const rescueIsSafe = (next: Item | null) => !next || !next.note;
   const borrowedNoteIds: string[] = [];
   const droppedNoteIds: string[] = [];
   /** noteId → the span the F0 feed must use (see PASS 3). `grace` = this note IS the rescued one. */
@@ -281,6 +303,10 @@ export function buildScoreTriples(
     if (!it.note || it.endF > it.startF) continue; // not a note, or it already sounds
     const prev = i > 0 ? items[i - 1]! : null;
     const next = i + 1 < items.length ? items[i + 1]! : null;
+    if (!rescueIsSafe(next)) {
+      droppedNoteIds.push(it.note.id); // a sung note follows: rescuing would starve ITS onset (see above)
+      continue;
+    }
     if (prev && canLend(prev)) {
       prev.endF -= 1;
       it.startF -= 1; // the SAME boundary — Σ is untouched
@@ -338,7 +364,7 @@ export function buildScoreTriples(
     const span = { ...n, tick: r.start, duration: r.end - r.start };
     return r.grace ? { ...span, transition: { ...ZERO_TRANSITION } } : span;
   });
-  return { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, sorted, f0Notes, ticksPerFrame, frameCount };
+  return { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, shortNoteIds, sorted, f0Notes, ticksPerFrame, frameCount };
 }
 
 /** Sample a segment-relative param curve at each of `frameCount` 50fps frames (`f·ticksPerFrame`), applying

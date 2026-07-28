@@ -124,7 +124,13 @@ export async function importScoreFile(): Promise<void> {
         { id: "ok", label: t("import.options.start"), kind: "primary" },
       ],
     });
-    if (choice !== "ok") return; // Cancel / Esc / backdrop — nothing was touched yet
+    if (choice !== "ok") {
+      // Cancel / Esc / backdrop — nothing was touched yet. Say so: showConfirm force-settles an
+      // already-open dialog, so this ALSO fires when another prompt (e.g. MIDI extraction) opens while the
+      // file was still parsing — without a word the user's import would just evaporate (audit-caught).
+      useAppStore.getState().showToast(t("import.cancelled"), "info");
+      return;
+    }
     saveSetting(QUANTIZE_IMPORT_KEY, quantize);
 
     const store = useProjectStore.getState();

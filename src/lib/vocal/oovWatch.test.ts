@@ -63,7 +63,7 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     (globalThis as unknown as { window: unknown }).window = globalThis;
     vi.useFakeTimers();
     invokeFails = false;
-    useAppStore.setState({ vocalOov: {}, vocalDropped: {}, vocalBorrowed: {} });
+    useAppStore.setState({ vocalOov: {}, vocalDropped: {}, vocalShort: {} });
     SEG = `S${++seq}`;
     seed();
   });
@@ -76,13 +76,13 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
   it("publishes the rescued note, then FOLLOWS it into the right half of a split (new ids and all)", async () => {
     uninstall = installOovWatch();
     await settle();
-    expect(useAppStore.getState().vocalBorrowed).toEqual({ [SEG]: ["b"] });
+    expect(useAppStore.getState().vocalShort).toEqual({ [SEG]: ["b"] });
 
     // split BEFORE b ⇒ b moves to the new right half and is given a FRESH note id
     const newId = splitSegmentVocalAware("T", SEG, 750, TEMPO)!;
     expect(newId).toBeTruthy();
     await settle();
-    const map = useAppStore.getState().vocalBorrowed;
+    const map = useAppStore.getState().vocalShort;
     expect(Object.keys(map)).toEqual([newId]); // the left half no longer owns it…
     const rightNotes = (useProjectStore.getState().tracks[0]!.segments.find((s) => s.id === newId)!
       .content as Extract<SegmentContent, { type: "notes" }>).notes;
@@ -94,15 +94,15 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     await settle();
     const newId = splitSegmentVocalAware("T", SEG, 900, TEMPO)!; // b (768) stays left
     await settle();
-    expect(useAppStore.getState().vocalBorrowed).toEqual({ [SEG]: ["b"] });
-    expect(useAppStore.getState().vocalBorrowed[newId]).toBeUndefined();
+    expect(useAppStore.getState().vocalShort).toEqual({ [SEG]: ["b"] });
+    expect(useAppStore.getState().vocalShort[newId]).toBeUndefined();
   });
 
   it("★ publishes the FRAME verdicts even when validate_lyrics fails (they need no backend)", async () => {
     invokeFails = true;
     uninstall = installOovWatch();
     await settle();
-    expect(useAppStore.getState().vocalBorrowed).toEqual({ [SEG]: ["b"] });
+    expect(useAppStore.getState().vocalShort).toEqual({ [SEG]: ["b"] });
     expect(useAppStore.getState().vocalOov).toEqual({}); // only the LYRIC verdict is lost to the failure
   });
 
@@ -129,11 +129,11 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     installHistory();
     uninstall = installOovWatch();
     await settle();
-    expect(useAppStore.getState().vocalBorrowed[SEG]).toEqual(["b1", "b2"]);
+    expect(useAppStore.getState().vocalShort[SEG]).toEqual(["b1", "b2"]);
 
     const rightId = splitSegmentVocalAware("T", SEG, 1500, TEMPO)!; // between b1 and b2
     await settle();
-    const map = useAppStore.getState().vocalBorrowed;
+    const map = useAppStore.getState().vocalShort;
     expect(map[SEG], "LEFT half keeps b1").toEqual(["b1"]);
     expect(map[rightId], "RIGHT half must be marked too").toHaveLength(1);
   });
@@ -141,10 +141,10 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
   it("clears every channel when the segment goes away", async () => {
     uninstall = installOovWatch();
     await settle();
-    expect(useAppStore.getState().vocalBorrowed).toEqual({ [SEG]: ["b"] });
+    expect(useAppStore.getState().vocalShort).toEqual({ [SEG]: ["b"] });
     useProjectStore.getState().deleteSegment("T", SEG);
     await settle();
-    expect(useAppStore.getState().vocalBorrowed).toEqual({});
+    expect(useAppStore.getState().vocalShort).toEqual({});
     expect(useAppStore.getState().vocalDropped).toEqual({});
   });
 });

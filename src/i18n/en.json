@@ -94,6 +94,7 @@
   },
   "import": {
     "done": "Imported",
+    "cancelled": "Import cancelled",
     "pitchDropped": "One track's pitch tuning exceeded the import limit and was imported untuned (notes are intact)",
     "options": {
       "title": "Import options",
@@ -220,7 +221,7 @@
     "noVoices": "No singer models available — import one in the Resource Manager first",
     "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language",
     "droppedWarning": "Some notes are shorter than one frame (~20 ms) and cannot sound — lengthen or delete them (marked red)",
-    "borrowedWarning": "Some notes were shorter than one frame and borrowed one from a neighbour so they can sound (marked amber) — lengthen them if you want exact control"
+    "shortWarning": "Some notes are shorter than one render frame (~20 ms) — the renderer rescues the ones it can by borrowing a frame from a neighbour; the rest are skipped (marked red). Lengthen them for a predictable result"
   },
   "langs": {
     "zh": "Chinese",

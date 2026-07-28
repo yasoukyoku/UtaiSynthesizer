@@ -266,10 +266,27 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     expect(drops).toBeGreaterThan(0);
   });
 
-  it("borrows ONE frame BACKWARD from the previous note — downstream boundaries do not move", () => {
-    // tempo 222 (ticksPerFrame 35.52): b spans ticks 480..510 → frames 14..14 = zero.
+  it("★ REFUSES to rescue when a SUNG note follows — it would starve that note's onset consonant", () => {
+    // Rust pre-rolls the next note's onset out of the phone before it; a 1-frame lender yields nothing, so
+    // the follower loses its consonant (「た」 sings as 「あ」) or its vowel lands ~40 ms late. Never worse
+    // than baseline: the sub-frame note goes back to being reported as too short.
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 510, 480, 64)];
+    const r = buildScoreTriples(notes, 222, "AP", 2);
+    expect(r.borrowedNoteIds).toEqual([]);
+    expect(r.droppedNoteIds).toEqual(["b"]);
+    expect(r.shortNoteIds).toEqual(["b"]); // …but it is STILL reported as short
+    // the follower keeps every frame it had without b — nothing was taken from anyone
     const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 510, 480, 64)], 222, "AP", 2);
+    expect(r.triples[r.tripleNoteIds.indexOf("a")]!.frames).toBe(base.triples[base.tripleNoteIds.indexOf("a")]!.frames);
+    expect(r.triples[r.tripleNoteIds.indexOf("c")]!.frames).toBe(base.triples[base.tripleNoteIds.indexOf("c")]!.frames);
+    expect(sumFrames(r.triples)).toBe(r.frameCount);
+  });
+
+  it("borrows ONE frame BACKWARD from the previous note — downstream boundaries do not move", () => {
+    // tempo 222 (ticksPerFrame 35.52): b spans ticks 480..510 → frames 14..14 = zero. A REST follows it, so
+    // the rescue is safe (an SP lender serves the next note's onset just fine).
+    const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 700, 480, 64)];
+    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 700, 480, 64)], 222, "AP", 2);
     const r = buildScoreTriples(notes, 222, "AP", 2);
     expect(r.borrowedNoteIds).toEqual(["b"]);
     expect(r.droppedNoteIds).toEqual([]);
@@ -349,13 +366,14 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     expect(sumFrames(r2.triples)).toBe(r2.frameCount);
   });
 
-  it("the very FIRST item can borrow (there is no previous item at all → forward)", () => {
-    const notes = [mkNote("head", 0, 3, 60), mkNote("body", 3, 480, 62)];
+  it("the very FIRST item can borrow (there is no previous item at all → forward, into the rest)", () => {
+    const notes = [mkNote("head", 0, 3, 60), mkNote("body", 200, 480, 62)];
     const r = buildScoreTriples(notes, 120, "AP", 2);
     expect(r.borrowedNoteIds).toEqual(["head"]);
     expect(r.droppedNoteIds).toEqual([]);
     expect(r.triples[r.tripleNoteIds.indexOf("head")]!.frames).toBe(1);
-    expect(r.triples[r.tripleNoteIds.indexOf("body")]!.frames).toBe(24); // 25 − 1, its END unmoved
+    expect(r.triples.filter((t) => t.lyric === "R").map((t) => t.frames)).toEqual([9]); // the rest paid: 10 → 9
+    expect(r.triples[r.tripleNoteIds.indexOf("body")]!.frames).toBe(25); // untouched (tempo 120: 480t = 25 frames)
     expect(sumFrames(r.triples)).toBe(r.frameCount);
   });
 

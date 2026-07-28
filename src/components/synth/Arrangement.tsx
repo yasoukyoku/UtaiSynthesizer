@@ -174,7 +174,7 @@ export function Arrangement() {
   // arriving AFTER the notes edit still re-bakes the static layer with the segment badge.
   const vocalOov = useAppStore((s) => s.vocalOov);
   const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: dropped notes share the badge
-  const vocalBorrowed = useAppStore((s) => s.vocalBorrowed); // S87: rescued notes — advisory, own colour
+  const vocalShort = useAppStore((s) => s.vocalShort); // S87: rescued notes — advisory, own colour
   // S60 MIDI-extraction jobs — a draw dep (per-frame overlay + rAF-loop predicate); progress %
   // is read from the module map each frame (no store churn), only the SET membership lives here.
   const midiExtracting = useAppStore((s) => s.midiExtracting);
@@ -1693,7 +1693,7 @@ export function Arrangement() {
         // S87: the id LISTS, not just their length. A verdict that SWAPS one note for another (the user
         // fixes one lyric and breaks another) leaves the count identical, and the baked marks would freeze
         // on the old notes. Hashed so a segment with many flagged notes doesn't paste kilobytes per frame.
-        const oovCount = warnIdsSig(vocalOov[s.id], vocalDropped[s.id], vocalBorrowed[s.id]);
+        const oovCount = warnIdsSig(vocalOov[s.id], vocalDropped[s.id], vocalShort[s.id]);
         // S59: the detected grid + stretch factor + loudness envelope are baked into the static
         // layer — without these terms detect/×2/÷2/nudge/clear, a stretch change, or an envelope
         // point edit would not repaint (the S50 static-cache-key lesson: every content kind needs
@@ -1861,7 +1861,7 @@ export function Arrangement() {
       const near = Math.abs(mouseXRef.current - phx) < 10;
       drawPlayhead(ctx, { x: phx, height, line: true, glow: near, cap: "top" });
     }
-  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, vocalBorrowed, midiExtracting, t]);
+  }, [tracks, audioFiles, loadingPaths, timeSignature, timeAxis, tempo, selectedSegments, selectedLane, dragOver, vocalOov, vocalDropped, vocalShort, midiExtracting, t]);
 
   drawRef.current = draw;
 
@@ -2014,7 +2014,7 @@ function drawStaticContent(
         // would be invisible at exactly the zoom level where you need it.
         const app = useAppStore.getState();
         const blocking = new Set([...(app.vocalOov[seg.id] ?? []), ...(app.vocalDropped[seg.id] ?? [])]);
-        const advisory = new Set(app.vocalBorrowed[seg.id] ?? []);
+        const advisory = new Set(app.vocalShort[seg.id] ?? []);
         const plain = `rgba(${c[0]},${c[1]},${c[2]},0.85)`;
         for (const n of ns) {
           const nx = sx + n.tick * ppt;
@@ -2130,7 +2130,7 @@ function drawStaticContent(
       {
         const app = useAppStore.getState();
         const blocking = (app.vocalOov[seg.id]?.length ?? 0) + (app.vocalDropped[seg.id]?.length ?? 0);
-        const advisory = app.vocalBorrowed[seg.id]?.length ?? 0;
+        const advisory = app.vocalShort[seg.id]?.length ?? 0;
         if (blocking + advisory > 0) {
           const bx = sx + sw - 9;
           ctx.fillStyle = blocking > 0 ? "#f87171" : "#fbbf24";

@@ -146,7 +146,7 @@ interface AppState {
    *  as vocalOov / vocalDropped, which both mean "this note will not sound at all" (§user: 现在红色一律
    *  是阻塞性警告). Third map for the same reason S85b split dropped out of oov: a merged channel forces
    *  the wording to lie about at least one of its members. */
-  vocalBorrowed: Record<string, string[]>;
+  vocalShort: Record<string, string[]>;
   /** S60 GAME MIDI extraction in flight — key = `${segmentId}:${group}` (lane group), value =
    *  the job context. Drives the lane-row "extracting" indicator (Arrangement per-frame overlay),
    *  the menu-item double-trigger guard, and the undo-cancels-extraction interceptor. Runtime-only. */
@@ -205,7 +205,7 @@ interface AppState {
   /** S85b: publish one segment's dropped-note verdict(语义同 setVocalOov,写者同为 oovWatch)。 */
   setVocalDropped: (segmentId: string, noteIds: string[] | null) => void;
   /** S87: publish one segment's frame-borrow verdict(语义同上,写者同为 oovWatch)。 */
-  setVocalBorrowed: (segmentId: string, noteIds: string[] | null) => void;
+  setVocalShort: (segmentId: string, noteIds: string[] | null) => void;
   /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
@@ -272,7 +272,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   renderingVocalTrackId: null,
   vocalOov: {},
   vocalDropped: {},
-  vocalBorrowed: {},
+  vocalShort: {},
   midiExtracting: {},
   toasts: [],
   banner: null,
@@ -376,10 +376,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const next = verdictMapUpdate(s.vocalDropped, segmentId, noteIds);
       return next ? { vocalDropped: next } : {};
     }),
-  setVocalBorrowed: (segmentId, noteIds) =>
+  setVocalShort: (segmentId, noteIds) =>
     set((s) => {
-      const next = verdictMapUpdate(s.vocalBorrowed, segmentId, noteIds);
-      return next ? { vocalBorrowed: next } : {};
+      const next = verdictMapUpdate(s.vocalShort, segmentId, noteIds);
+      return next ? { vocalShort: next } : {};
     }),
   setMidiExtracting: (key, v) =>
     set((s) => {
