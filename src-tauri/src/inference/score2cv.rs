@@ -31,9 +31,32 @@ fn kana_map() -> &'static HashMap<&'static str, &'static str> {
     // base table + the S58 coverage additions (missing yōon rows + ゔ; generated, non-colliding).
     M.get_or_init(|| tbl::KANA.iter().chain(super::g2p_tables::KANA_EXTRA).copied().collect())
 }
+/// S86 TRAINING-ALIGNMENT DIVERGENCE — the ONLY place Utai deliberately departs from the upstream
+/// `render_ust.py` JA romaji table. Kept here (hand-written) and NOT in the generated tables, so a
+/// regeneration can never silently drop it and a reader can never mistake it for a mirrored row.
+///
+/// `に` — upstream inference emits the palatal nasal `ɲ i`, but the model was TRAINED on `n i`:
+///   * the training-side map (`MBS2H/src/preprocessing/phoneme_vocab.py::JA_ROMAJI_TO_IPA`) only has
+///     `"n"→n` and `"ny"→ɲ`, and the HTS/sinsy `.lab` files write に as the two phones `n` `i`;
+///   * raw lab counts over the 6 JA datasets: `n`=3234 vs `ny`=37 — `ny` is にゃ/にゅ/にょ only;
+///   * final-training-set frames: `n`=4338 vs `ɲ`=**92**, i.e. every に was asking the model for an
+///     embedding it had seen ~47× less often, for one of the most frequent morae in the language;
+///   * `dict_fixes.py` has a JA allophone rule (D) for ひ (`h`→`ç` before i) and deliberately NONE
+///     for に, so there is no training-side counterpart that would justify ɲ.
+/// にゃ/にゅ/にょ keep `ɲ` — those really are `ny` in the labs. This override changes JA render output
+/// and therefore intentionally breaks bit-parity with upstream; the parity fixtures do not contain に.
+const R2IPA_TRAINING_OVERRIDE: &[(&str, &[&str])] = &[("ni", &["n", "i"])];
+
 fn r2ipa_map() -> &'static HashMap<&'static str, &'static [&'static str]> {
     static M: OnceLock<HashMap<&'static str, &'static [&'static str]>> = OnceLock::new();
-    M.get_or_init(|| tbl::R2IPA.iter().chain(super::g2p_tables::R2IPA_EXTRA).copied().collect())
+    M.get_or_init(|| {
+        tbl::R2IPA
+            .iter()
+            .chain(super::g2p_tables::R2IPA_EXTRA)
+            .chain(R2IPA_TRAINING_OVERRIDE)
+            .copied()
+            .collect()
+    })
 }
 
 // ─── G2P: one lyric token → IPA phones / rest / sustain ─────────────────────────────────────────
@@ -53,6 +76,9 @@ enum Lyric {
 /// CHAR-based (`.chars()`), never byte slicing.
 fn lyric_to_phones(lyr: &str) -> Lyric {
     let s0 = lyr.trim();
+    // ⚠ Keep `rest`/`sil`/`pau` HERE: this function is the bit-parity port of upstream
+    // `render_ust.lyric_to_phones` and the golden/parity gates compare against it. The DAW's own
+    // reserved-token set (`g2p::token_class`) is deliberately narrower (S86) — do NOT sync the two.
     if matches!(s0, "R" | "r" | "" | "rest" | "sil" | "pau") {
         return Lyric::Rest;
     }
@@ -81,16 +107,21 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
     let s: String = if let Some(&r) = kana.get(s0) {
         r.to_string()
     } else {
-        let chars: Vec<char> = s0.chars().collect();
-        let two: String = chars.iter().take(2).collect();
-        let one: String = chars.iter().take(1).collect();
-        if chars.len() >= 2 && kana.contains_key(two.as_str()) {
-            kana[two.as_str()].to_string()
-        } else if kana.contains_key(one.as_str()) {
-            kana[one.as_str()].to_string()
-        } else {
-            s0.to_string()
+        // ── UTAI EXTENSION (S86, beyond render_ust.py): PARSE the whole kana string ──
+        // Upstream fell back to the first TWO (then ONE) kana and silently DROPPED the rest, so a
+        // multi-mora lyric on one note sang only its head mora — ずっと→[z ɯ], きっと→[k i],
+        // がっこう→[ɡ a] — with no OOV and no red mark. But writing 「ずっと」 or 「っと」 on one note is a
+        // LEGITIMATE way to enter lyrics (real UST files do it), so the answer is to sing all of it,
+        // not to reject it: `kana_tokenize` consumes the string mora by mora (longest-match, sokuon,
+        // moraic n, 外来拗音, ー) and returns every phone. Only a string it cannot fully consume falls
+        // through — to the romaji chain below, and ultimately to a LOUD `Unknown`.
+        // Single morae never reach here (`kana.get(s0)` above already matched), and non-kana strings
+        // fail at the first char, so romaji (`tta`, `ka`, `tchi`) and every Phase-1c parity input are
+        // untouched.
+        if let Some(v) = kana_tokenize(s0) {
+            return Lyric::Phones(v);
         }
+        s0.to_string()
     };
     let s = s.to_lowercase();
     let r2ipa = r2ipa_map();
@@ -117,6 +148,66 @@ fn lyric_to_phones(lyr: &str) -> Lyric {
         }
     }
     Lyric::Unknown
+}
+
+/// UTAI EXTENSION (S86): consume a WHOLE kana string mora by mora → the concatenated phones, so
+/// 「ずっと」/「っと」/「ずーっと」 on one note sing in full instead of being truncated to their head mora.
+///
+/// LONGEST-MATCH-FIRST is load-bearing: 「ぁぃぅぇぉ」 are themselves KANA keys, so a shortest-first scan
+/// would SILENTLY parse ふぁい as ふ+ぁ+い ([ɸ ɯ a i]) instead of ふぁ+い ([ɸ a i]) — a wrong parse that
+/// still "succeeds". Plain greedy needs no backtracking here: every multi-char unit ends in a small
+/// kana (ゃゅょ / ぁぃぅぇぉ), and a small kana can never START a mora, so a longer match never steals a
+/// character a shorter parse would have needed.
+///
+/// ALL-OR-NOTHING: any position that cannot be consumed returns None (→ the caller's romaji chain,
+/// and ultimately a LOUD `Unknown`). A partial parse is precisely the silent truncation this replaces.
+fn kana_tokenize(s: &str) -> Option<Vec<&'static str>> {
+    let chars: Vec<char> = s.chars().collect();
+    let (kana, r2ipa) = (kana_map(), r2ipa_map());
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut took = 0usize;
+        // 3 covers a 2-char base + small vowel (しゃぁ); KANA keys themselves are at most 2 chars.
+        for w in (1..=3.min(chars.len() - i)).rev() {
+            let slice: String = chars[i..i + w].iter().collect();
+            if w >= 2 {
+                if let Some(v) = foreign_kana_phones(&slice) {
+                    out.extend(v); // S69 外来拗音 keeps the precedence it has in `lyric_to_phones`
+                    took = w;
+                    break;
+                }
+            }
+            if w <= 2 {
+                if let Some(&romaji) = kana.get(slice.as_str()) {
+                    if let Some(&seq) = r2ipa.get(romaji.to_lowercase().as_str()) {
+                        out.extend_from_slice(seq);
+                        took = w;
+                        break;
+                    }
+                }
+            }
+        }
+        if took == 0 {
+            match chars[i] {
+                // sokuon: the geminate closure, same phone the 「っ」-on-its-own-note branch emits
+                'っ' => out.push("ʔ"),
+                // 長音符 contributes NO phone. Every training label lengthens a vowel by DURATION on
+                // ONE phone — 「あー」 is [a] held longer, never [a a] — so emitting a second copy would
+                // be out of distribution. The note's own frame count already carries the length.
+                'ー' if !out.is_empty() => {}
+                // Anything else ends the kana run. A non-kana TAIL is the UTAU appended-voicebank /
+                // CVVC alias convention — 「あ弱」「か強」「か_G3」「あ t」 mean "mora あ, voicebank flavour X"
+                // and must sing the mora (the repo's own .ust corpus has 26 such notes). So we keep
+                // what we consumed instead of failing; a lyric where NOTHING parsed still returns
+                // None → the romaji chain → a LOUD `Unknown`.
+                _ => break,
+            }
+            took = 1;
+        }
+        i += took;
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Small-vowel kana → the vowel IPA it substitutes (外来拗音 second element).
@@ -1512,7 +1603,40 @@ mod tests {
         // no duplicate keys collapsed the maps (base tables + the generated S58 EXTRA rows)
         assert_eq!(phone_to_id_map().len(), tbl::PHONE_TO_ID.len());
         assert_eq!(kana_map().len(), tbl::KANA.len() + super::super::g2p_tables::KANA_EXTRA.len());
+        // R2IPA = base + EXTRA (additive) + OVERRIDE (replaces, never adds) — so the length is
+        // unchanged by the override, and this assert is what stops an override row from silently
+        // becoming a NEW romaji key.
         assert_eq!(r2ipa_map().len(), tbl::R2IPA.len() + super::super::g2p_tables::R2IPA_EXTRA.len());
+    }
+
+    // ── S86: the deliberate training-alignment divergence must (a) only ever OVERRIDE an existing
+    //    upstream row and (b) actually be the value the engine resolves. ──
+    #[test]
+    fn r2ipa_training_override_replaces_and_takes_effect() {
+        let base: HashMap<&str, &[&str]> = tbl::R2IPA.iter().copied().collect();
+        for (romaji, phones) in R2IPA_TRAINING_OVERRIDE {
+            let upstream = base
+                .get(romaji)
+                .unwrap_or_else(|| panic!("override {romaji:?} adds a NEW key — it must only replace"));
+            assert_ne!(upstream, phones, "override {romaji:?} is identical to upstream — delete it");
+            assert_eq!(r2ipa_map()[romaji], *phones, "override {romaji:?} did not win the chain");
+        }
+        // に sings the well-trained alveolar n (4338 ja frames), NOT the palatal ɲ (92)
+        assert_eq!(lyric_phones_for_test("に"), vec!["n", "i"]);
+        // …while にゃ/にゅ/にょ keep ɲ — those genuinely are `ny` in the training labels
+        assert_eq!(lyric_phones_for_test("にゃ"), vec!["ɲ", "a"]);
+        assert_eq!(lyric_phones_for_test("にゅ"), vec!["ɲ", "ɯ"]);
+        assert_eq!(lyric_phones_for_test("にょ"), vec!["ɲ", "o"]);
+        // and the untouched neighbours of に in the な-row are unaffected
+        assert_eq!(lyric_phones_for_test("な"), vec!["n", "a"]);
+        assert_eq!(lyric_phones_for_test("ぬ"), vec!["n", "ɯ"]);
+    }
+
+    fn lyric_phones_for_test(lyric: &str) -> Vec<&'static str> {
+        match classify_lyric(lyric) {
+            LyricClass::Phones { phones } => phones,
+            other => panic!("{lyric:?} did not resolve to phones: {other:?}"),
+        }
     }
 
     // ── Phase 1d GATE: end-to-end Rust → ORT → cv, matched ≤1e-3 to Python-ORT (score2cv_cv_ref.rs).

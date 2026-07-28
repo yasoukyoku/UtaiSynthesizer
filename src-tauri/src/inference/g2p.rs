@@ -19,8 +19,12 @@
 //!    word-final coda is DEFERRED to the end of the span's last note (归韵 — "light --" sings l-aɪ|aɪ|aɪ-t).
 //!  * ja — byte-identical to the legacy path (`+`≡hold, carrier vowel via VOWEL_SET, geminates, っ…).
 //! Rest/breath notes are language-neutral and attach to the PREVIOUS run (a language cut then lands in
-//! silence); sustains inherit the carrier's language. `lyric_to_phones`' universal reserved tokens
-//! (R/rest/sil/pau/AP/-/ー/+) stay reserved in EVERY language.
+//! silence); sustains inherit the carrier's language. The universal reserved tokens (`R`/`r`/empty =
+//! rest, `AP` = breath, `-`/`ー` = hold, `+` = next) stay reserved in EVERY language. S86 narrowed
+//! that set: `rest`/`sil`/`pau` are NO LONGER reserved here (they are real dictionary words and were
+//! silently swallowing sung notes) — `score2cv::lyric_to_phones` still accepts them because it is the
+//! upstream parity port, and the two are deliberately out of step. `g2p::is_silent_token` is the one
+//! predicate every DAW-side consumer must use.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -263,8 +267,10 @@ impl WordDict {
     }
 
     pub fn lookup(&self, word: &str) -> Option<Vec<String>> {
-        let key = word.to_lowercase();
-        self.map.get(&key).map(|p| p.split_whitespace().map(str::to_string).collect())
+        lookup_candidates(word)
+            .iter()
+            .find_map(|k| self.map.get(k))
+            .map(|p| p.split_whitespace().map(str::to_string).collect())
     }
 
     /// Parse the canonical `word<TAB>phones` TSV. First-seen pronunciation wins (the build emits the
@@ -295,6 +301,47 @@ impl WordDict {
         }
         dict
     }
+}
+
+/// Candidate dictionary keys for one raw lyric, MOST FAITHFUL FIRST (S86 input-tolerance ladder).
+///
+/// The score stores lyrics exactly as typed — `sanitizeText` only NFC-normalizes and strips control
+/// chars — so the tolerance lives HERE, at lookup, and never rewrites what the user wrote:
+///  1. lowercase only — the spelling the user typed always gets first refusal.
+///  2. + typographic apostrophes folded to ASCII `'` (phone keyboards and lyric sites emit U+2019).
+///     ⚠ this is a RUNG, not a rewrite of the base: it.tsv ships **7 keys spelled with U+2018**, and
+///     folding the base would make them unreachable (that mistake shipped in the first S86 draft).
+///  3. + surrounding punctuation trimmed (`Love,` `(oh)` — pasted lyric sheets carry it). `'` and `-`
+///     are word-INTERNAL in these dictionaries (`'bout`, `l'`, 8164 en keys) and are never trimmed.
+///  4. + ß→ss LAST: upstream `german_mfa` uses Swiss orthography and ships ZERO ß spellings, so
+///     `weiß`/`groß`/`Straße`/`heißt` would otherwise every one be OOV — and OOV aborts the render.
+///     ⚠ Swiss orthography merges ß/ss, so this rung can land on a homograph (`Maße`→*Masse*). It is
+///     the last rung precisely so it only ever fires where the faithful spelling found nothing.
+///
+/// Faithful-first ordering means a word that genuinely needs its raw form still wins; a candidate is
+/// only consulted when every more-faithful one missed.
+fn lookup_candidates(raw: &str) -> Vec<String> {
+    let fold_quotes = |s: &str| -> String {
+        s.chars().map(|c| if matches!(c, '\u{2019}' | '\u{2018}' | '\u{02BC}' | '\u{FF07}') { '\'' } else { c }).collect()
+    };
+    let trim_punct =
+        |s: &str| -> String { s.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-').to_string() };
+
+    let base: String = raw.trim().chars().flat_map(char::to_lowercase).collect();
+    let mut out: Vec<String> = Vec::with_capacity(8);
+    // Every transform is its OWN rung, applied to a COPY — never folded into the base. it.tsv really
+    // does ship 7 keys spelled with U+2018, so rewriting the base would make them unreachable.
+    for quoted in [base.clone(), fold_quotes(&base)] {
+        for trimmed in [quoted.clone(), trim_punct(&quoted)] {
+            // ß→ss last: the spelling the user actually wrote always gets first refusal
+            for key in [trimmed.clone(), trimmed.replace('ß', "ss")] {
+                if !key.is_empty() && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn dict_is_vowel(lang: Lang, vowels: &HashSet<&'static str>, ph: &str) -> bool {
@@ -508,14 +555,44 @@ enum Tok {
     Word,
 }
 
+/// ⚠ DELIBERATELY NARROWER than `score2cv::lyric_to_phones`' rest set — do NOT "unify" them. That
+/// one is a bit-parity port of upstream `render_ust.lyric_to_phones`; THIS one is the DAW's
+/// user-facing convention, which is ours to choose.
+///
+/// S86 frees `rest`, `sil` AND `pau`. All three are real lexical material, not just jargon:
+/// `rest` is common English lyric vocabulary ("give it a rest"), and once word-splitting across
+/// notes exists `sil` and `pau` appear as FRAGMENTS of ordinary words (sil|ver, pau|se) — a reserved
+/// token that can be a piece of a word will collide by construction. They were also swallowing notes
+/// silently, and only in lowercase, since this check is case-sensitive while the dictionary lookup is
+/// not (so `Rest` sang and `rest` did not).
+///
+/// What remains hard-wired is only the UTAU/OpenUtau convention `R`/`r`/empty — the sole rest token
+/// this app ever WRITES (vocalRender.ts, rangeTest.ts, export_score.rs, import.rs). Users who want a
+/// different trigger get it the way breath already works: a per-track token the frontend maps onto
+/// the canonical one before Rust ever sees it (`VocalTrackParams.breathToken` → `AP`; `restToken` →
+/// `R`), so a convenient glyph is never stolen from real lyrics.
+/// Anything changed here must also hold for `is_silent_token`'s consumers.
 fn token_class(lyric: &str) -> Tok {
     match lyric.trim() {
-        "R" | "r" | "" | "rest" | "sil" | "pau" => Tok::Rest,
+        "R" | "r" | "" => Tok::Rest,
         "AP" | "ap" => Tok::Breath,
         "-" | "ー" => Tok::Hold,
         "+" => Tok::Next,
         _ => Tok::Word,
     }
+}
+
+/// Does this lyric produce NO sung phones (rest or breath)? THE single source for that question.
+///
+/// `score2svc::compute_note_groups` builds the DAW-side note grouping from this, so it can never key
+/// differently from the cv-side grouping `assemble_arrays` builds out of `resolve_core`. They MUST
+/// agree: a one-note disagreement shifts every later group index, and `build_vol_env` (no
+/// frame-conservation fast path, live on the vol_embedding models) then applies each note's dynamics
+/// to the wrong note for the rest of the segment. Before S86 the DAW side called
+/// `score2cv::classify_lyric`, whose rest set is deliberately WIDER (it is the upstream parity port)
+/// — narrowing `token_class` without moving this predicate would have silently reopened that desync.
+pub fn is_silent_token(lyric: &str) -> bool {
+    matches!(token_class(lyric), Tok::Rest | Tok::Breath)
 }
 
 /// Per-note run language for chunking — shared by `build_arrays`' assembly AND `compute_note_groups`
@@ -767,12 +844,15 @@ fn resolve_east_word(
 
 /// JA word → IPA phones via the legacy mora path (`score2cv::lyric_to_phones` incl. geminates/っ), with
 /// katakana folded to hiragana first (S58 coverage fix — katakana lyrics used to OOV).
+/// S86: the same faithful-first tolerance ladder the word dictionaries use (`lookup_candidates`) —
+/// ONE source, so ja can never drift from en/de/fr/es/it on what counts as "the same lyric". Required
+/// in the same round as `kana_tokenize`: `か、` used to "work" only because the old truncating fallback
+/// silently ate the 、, and the tokenizer (correctly) refuses to consume it.
 fn ja_word_phones(token: &str) -> Option<Vec<&'static str>> {
-    let folded = fold_katakana(token);
-    match classify_lyric_ja(&folded) {
+    lookup_candidates(token).iter().find_map(|cand| match classify_lyric_ja(&fold_katakana(cand)) {
         LyricClass::Phones { phones } => Some(phones),
         _ => None,
-    }
+    })
 }
 
 /// JA raw-phoneme override: each token must be a vocab IPA phone already (advanced escape hatch).
@@ -913,6 +993,7 @@ mod tests {
             "fr" => Lang::Fr,
             "es" => Lang::Es,
             "it" => Lang::It,
+            "ja" => Lang::Ja, // never in the golden vectors; the probe below uses it
             other => panic!("unexpected golden lang {other}"),
         }
     }
@@ -945,7 +1026,7 @@ mod tests {
         // B Y UW1 | T AH0 | F AH0 L; NG stays coda-only (no fixture word starts with it).
         WordDict::from_tsv(
             Lang::En,
-            "light\tL AY1 T\nbeautiful\tB Y UW1 T AH0 F AH0 L\ntree\tT R IY1\nsinger\tS IH1 NG ER0\nextra\tEH1 K S T R AH0\ntwo\tT UW1\nfun\tF AH1 N\n",
+            "light\tL AY1 T\nbeautiful\tB Y UW1 T AH0 F AH0 L\ntree\tT R IY1\nsinger\tS IH1 NG ER0\nextra\tEH1 K S T R AH0\ntwo\tT UW1\nfun\tF AH1 N\nlove\tL AH1 V\ndon't\tD OW1 N T\n",
         )
     }
     fn zh_fixture() -> ZhDict {
@@ -958,7 +1039,9 @@ mod tests {
     fn de_fixture() -> WordDict {
         // haben's n̩ is a SYLLABIC consonant (nucleus) — baum makes bare B a legal onset. NB the de
         // TRADITIONAL layer spells the diphthong "aw" (MFA notation; stage2 normalizes it to aʊ).
-        WordDict::from_tsv(Lang::De, "haben\th aː b n̩\nbaum\tb aw m\n")
+        // `weiss` mirrors the SHIPPED spelling: upstream german_mfa is Swiss-orthography and has no
+        // ß rows at all, which is exactly what the S86 lookup ladder has to bridge.
+        WordDict::from_tsv(Lang::De, "haben\th aː b n̩\nbaum\tb aw m\nweiss\tv aj s\n")
     }
     struct Fixtures {
         zh: ZhDict,
@@ -1005,6 +1088,128 @@ mod tests {
         assert_eq!(s("beautiful"), vec![vec!["B", "Y", "UW1"], vec!["T", "AH0"], vec!["F", "AH0", "L"]]);
         // single-syllable word stays whole
         assert_eq!(s("light"), vec![vec!["L", "AY1", "T"]]);
+    }
+
+    // ── S86 input tolerance: the score keeps the lyric the user typed; the LOOKUP is what bends ──
+    #[test]
+    fn lookup_ladder_is_faithful_first() {
+        // most-faithful first, and only the forms that actually differ are added
+        assert_eq!(lookup_candidates("Love,"), vec!["love,", "love"]);
+        assert_eq!(lookup_candidates("wei\u{00df}"), vec!["wei\u{00df}", "weiss"]);
+        assert_eq!(lookup_candidates("'bout"), vec!["'bout"], "leading ' is word-internal, never trimmed");
+        assert_eq!(lookup_candidates("re-do"), vec!["re-do"], "internal hyphen kept");
+        assert!(lookup_candidates("...").iter().all(|k| k == "..."), "punctuation-only stays as-is (OOV)");
+        // ★ the quote fold is a RUNG, never a rewrite of the base: it.tsv ships 7 keys spelled with
+        //   U+2018, so folding candidate #0 would make them permanently unreachable (review R4/SS-4).
+        let curly = lookup_candidates("don\u{2019}t");
+        assert_eq!(curly[0], "don\u{2019}t", "the typed spelling gets first refusal");
+        assert!(curly.contains(&"don't".to_string()), "…and the ASCII fold is still reachable");
+        let u2018 = lookup_candidates("\u{2018}ndrangheta");
+        assert_eq!(u2018[0], "\u{2018}ndrangheta", "a real it.tsv U+2018 key stays reachable");
+    }
+
+    #[test]
+    fn lookup_tolerates_typography_and_esszett() {
+        let f = fixtures();
+        let sing = |lyric: &str, lang: Lang| -> Vec<&'static str> {
+            phones_of(&resolve_score(&[evt(lyric, lang)], &f).unwrap()[0])
+        };
+        // ß: the shipped de dictionary has NO ß rows, so this is the only way `weiß` ever sings
+        assert_eq!(sing("wei\u{00df}", Lang::De), vec!["v", "aɪ", "s"]);
+        assert_eq!(sing("Wei\u{00df}", Lang::De), vec!["v", "aɪ", "s"], "capitalized German noun");
+        // typographic apostrophe (what every phone keyboard emits) == ASCII apostrophe
+        assert_eq!(sing("don\u{2019}t", Lang::En), sing("don't", Lang::En));
+        // punctuation glued on by a pasted lyric sheet
+        assert_eq!(sing("Love,", Lang::En), vec!["l", "ʌ", "v"]);
+        assert_eq!(sing("(love)", Lang::En), vec!["l", "ʌ", "v"]);
+        // …and a genuinely unknown word is still a LOUD OOV — tolerance must not invent hits
+        assert!(resolve_score(&[evt("zzzzq,", Lang::En)], &f).is_err());
+    }
+
+    // ── S86: `rest`/`sil`/`pau` are no longer stolen from the lyric vocabulary (UTAU convention = R) ──
+    #[test]
+    fn only_the_utau_r_convention_stays_reserved() {
+        let f = fixtures();
+        for r in ["R", "r", "", "  "] {
+            let got = resolve_score(&[evt(r, Lang::En)], &f).unwrap();
+            assert!(matches!(got[0].kind, ResolvedKind::Rest), "{r:?} must stay a rest token");
+        }
+        // `sil`/`pau` are freed too: once a word can be split across notes they show up as fragments
+        // (sil|ver, pau|se), so a reserved token that can be part of a word collides by construction.
+        for w in ["rest", "sil", "pau"] {
+            assert!(!is_silent_token(w), "{w:?} must be available as lyric material");
+        }
+        // ★ the DAW-side note grouping must key off the SAME predicate the cv side resolves with —
+        //   `score2cv::classify_lyric` keeps a WIDER rest set (upstream parity port) and using it in
+        //   `compute_note_groups` would desync every later group index (review R2/SS-1/GATE-3).
+        for lyric in ["R", "r", "", "AP", "ap", "  "] {
+            assert!(is_silent_token(lyric), "{lyric:?} produces no sung phones");
+        }
+        for lyric in ["rest", "sil", "pau", "light", "か"] {
+            assert!(!is_silent_token(lyric), "{lyric:?} is a WORD for the DAW side too");
+        }
+        // the real English word now sings, and case no longer decides whether it does
+        let f2 = fixtures();
+        let lower = resolve_score(&[evt("rest", Lang::En)], &f2);
+        assert!(lower.is_err(), "not in the tiny fixture dict → LOUD OOV, never silence");
+        assert!(lower.unwrap_err().to_string().contains("VOCAL_OOV: rest"));
+        // and a ja score treats it as a word too (→ OOV), instead of silently eating the note
+        assert!(resolve_score(&[evt("rest", Lang::Ja)], &f2).is_err());
+    }
+
+    // ── S86: JA multi-mora on ONE note used to be SILENTLY truncated to its head mora (no OOV, no
+    //    mark). It must fail LOUDLY instead — and punctuation must still be tolerated, or a pasted
+    //    Japanese lyric sheet would go wall-to-wall OOV the moment the truncation fallback died. ──
+    #[test]
+    fn ja_multi_mora_on_one_note_sings_in_full() {
+        let f = fixtures();
+        let ok = |lyric: &str| -> Vec<&'static str> {
+            phones_of(&resolve_score(&[evt(lyric, Lang::Ja)], &f).unwrap()[0])
+        };
+        // these ALL used to sing just their HEAD mora, silently (ずっと → [z ɯ])
+        assert_eq!(ok("ずっと"), vec!["z", "ɯ", "ʔ", "t", "o"]);
+        assert_eq!(ok("きっと"), vec!["k", "i", "ʔ", "t", "o"]);
+        assert_eq!(ok("まって"), vec!["m", "a", "ʔ", "t", "e"]);
+        assert_eq!(ok("がっこう"), vec!["ɡ", "a", "ʔ", "k", "o", "ɯ"]);
+        assert_eq!(ok("ちょっと"), vec!["tɕ", "o", "ʔ", "t", "o"]);
+        // the split the user actually writes: 「ず」「っと」 — the sokuon leads the second note
+        assert_eq!(ok("っと"), vec!["ʔ", "t", "o"]);
+        assert_eq!(ok("ずっ"), vec!["z", "ɯ", "ʔ"], "trailing sokuon is legal too");
+        // ー contributes NO phone: training lengthens a vowel by DURATION on one phone, never by a
+        // second copy of it (review JA-3). The note's own frames already carry the length.
+        assert_eq!(ok("ずーっと"), vec!["z", "ɯ", "ʔ", "t", "o"]);
+        assert_eq!(ok("あー"), vec!["a"]);
+        assert_eq!(ok("カー"), vec!["k", "a"]);
+        assert_eq!(ok("んー"), vec!["ɴ"], "holding the moraic nasal is ordinary Japanese");
+        // ★ UTAU appended-voicebank / CVVC alias suffixes: a NON-KANA tail names a voicebank flavour,
+        //   it is not part of the word. The repo's own .ust corpus has 26 such notes (review JA-1/R1).
+        assert_eq!(ok("あ弱"), vec!["a"]);
+        assert_eq!(ok("か強"), vec!["k", "a"]);
+        assert_eq!(ok("あ t"), vec!["a"], "CVVC alias tail");
+        assert_eq!(ok("か_G3"), vec!["k", "a"], "appended pitch suffix");
+        assert_eq!(ok("きゃ強"), vec!["c", "a"], "yōon + suffix");
+        // ★ longest-match-first: ぁぃぅぇぉ are standalone KANA keys, so a shortest-first scan would
+        //   silently mis-parse these as base+small-vowel-as-its-own-mora
+        assert_eq!(ok("ふぁい"), vec!["ɸ", "a", "i"], "NOT ɸ ɯ a i");
+        assert_eq!(ok("うぉん"), vec!["w", "o", "ɴ"]);
+        // Known cost of the suffix rule (unchanged from pre-S86, where the truncating fallback did the
+        // same): a kana head with a junk tail sings the head rather than erroring. Only a lyric where
+        // NOTHING parses as kana is a LOUD OOV.
+        assert_eq!(ok("かtta"), vec!["k", "a"]);
+        assert!(resolve_score(&[evt("恋", Lang::Ja)], &f).is_err(), "kanji still OOV");
+        assert!(resolve_score(&[evt("zzz", Lang::Ja)], &f).is_err(), "no kana at all → OOV");
+        assert_eq!(ok("か"), vec!["k", "a"]);
+        assert_eq!(ok("きゃ"), vec!["c", "a"]);
+        assert_eq!(ok("しょ"), vec!["ɕ", "o"]);
+        assert_eq!(ok("うぉ"), vec!["w", "o"], "S69 foreign kana still bypasses the chain");
+        assert_eq!(ok("っ"), vec!["ʔ"]);
+        assert_eq!(ok("ん"), vec!["ɴ"]);
+        assert_eq!(ok("ゔ"), vec!["v", "ɯ"], "S58 KANA_EXTRA row");
+        assert_eq!(ok("カ"), vec!["k", "a"], "katakana folding");
+        assert_eq!(ok("tta"), vec!["ʔ", "t", "a"], "romaji geminate — never touched the kana chain");
+        // punctuation tolerance must arrive in the SAME round as the truncation fix
+        assert_eq!(ok("か、"), vec!["k", "a"]);
+        assert_eq!(ok("か。"), vec!["k", "a"]);
     }
 
     // ── western span: coda deferral (归韵) on pure holds ──
@@ -1172,6 +1377,86 @@ mod tests {
         // the primary (first) — equality holds for the vast majority, membership for all.
         assert!(primary * 10 >= total * 8, "primary-pron match rate too low: {primary}/{total}");
         eprintln!("[g2p-e2e] zh syllables all exact; word lookups {total}, primary matches {primary}");
+    }
+
+    // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL
+    //    shipped dictionaries so every audit finding is grounded in behaviour, not in reading code.
+    //      UTAI_G2P_PROBE=<file>  each non-empty, non-`#` line is  <lang> TAB <note>|<note>|...
+    //    Run: UTAI_G2P_PROBE=probe.txt cargo test --lib inference::g2p::tests::g2p_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn g2p_probe() {
+        // SKIP (never fail) without the env var: `--include-ignored` is a legitimate gate mode, and a
+        // diagnostic probe must not be able to redden it.
+        let Ok(spec) = std::env::var("UTAI_G2P_PROBE") else {
+            println!("[g2p-probe] skipped — set UTAI_G2P_PROBE=<file> to run it");
+            return;
+        };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        set_dict_dir(root.join("../data/dictionaries"));
+        let g = GlobalDicts;
+        for line in std::fs::read_to_string(&spec).expect("probe file").lines() {
+            let line = line.trim_end();
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((code, notes)) = line.split_once('\t') else {
+                println!("!! malformed probe line (need a TAB): {line}");
+                continue;
+            };
+            let lang = lang_of(code.trim());
+            let lyrics: Vec<&str> = notes.split('|').collect();
+            let score: Vec<ScoreEvt> = lyrics.iter().map(|l| evt(l, lang)).collect();
+            println!("\n=== [{code}] {}", lyrics.join(" | "));
+            // stage1 + syllabification for the western languages (the whole-word head note)
+            if !matches!(lang, Lang::Ja | Lang::Zh) {
+                match g.words(lang) {
+                    Ok(d) => {
+                        let head = lyrics[0].trim();
+                        match d.lookup(head) {
+                            Some(trad) => {
+                                let sy = syllabify(d, &trad);
+                                println!("    trad: {}", trad.join(" "));
+                                println!(
+                                    "    syl : {}",
+                                    sy.iter().map(|s| s.join(" ")).collect::<Vec<_>>().join("  /  ")
+                                );
+                            }
+                            None => println!("    trad: <OOV — not in {code}.tsv>"),
+                        }
+                    }
+                    Err(e) => println!("    !! dictionary error: {e}"),
+                }
+            }
+            // RENDER path (authoritative — the editor's classify collapses `+` notes to "Sustain",
+            // which would hide the phones those notes actually sing).
+            match resolve_score(&score, &g) {
+                Ok(notes) => {
+                    for (i, nt) in notes.iter().enumerate() {
+                        let what = match &nt.kind {
+                            ResolvedKind::Rest => "REST".to_string(),
+                            ResolvedKind::Breath => "BREATH".to_string(),
+                            ResolvedKind::Unknown => "**OOV**".to_string(),
+                            ResolvedKind::Phones(p) => p.join(" "),
+                        };
+                        let tag = if nt.is_sustain { " [sustain]" } else { "" };
+                        println!("    note[{i}] {:>12} -> {what}{tag}", format!("{:?}", lyrics[i]));
+                    }
+                }
+                Err(e) => println!("    render(strict): {e}"),
+            }
+            // editor verdicts must agree with the render on WHICH notes are OOV
+            match classify_score(&score, &g) {
+                Ok(cl) => {
+                    let bad: Vec<usize> =
+                        (0..cl.len()).filter(|&i| matches!(cl[i], LyricClass::Unknown)).collect();
+                    if !bad.is_empty() {
+                        println!("    editor marks OOV at {bad:?}");
+                    }
+                }
+                Err(e) => println!("    !! classify error: {e}"),
+            }
+        }
     }
 
     // ── OOV verdicts: strict errors with the CODE; lenient marks ONLY the bad note ──

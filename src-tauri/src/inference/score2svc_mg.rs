@@ -48,10 +48,19 @@ struct TripleJson {
     frames: i64,
     #[allow(dead_code)]
     lang: i64,
+    /// S86: optional §3.7 traditional-phoneme override. With whitespace it is RAW phones, which lets
+    /// one build render both arms of an A/B (e.g. 「に」 as `n i` vs `ɲ i`) from the same binary —
+    /// a true controlled comparison instead of flipping a constant and rebuilding between takes.
+    #[serde(default, rename = "phonemeInput")]
+    phoneme_input: Option<String>,
 }
 
+/// Default = the 鹅妈妈 dump. `UTAI_MG_SCORE=<path>` points at any score JSON in the same shape
+/// (S86: purpose-built A/B scores live beside it), so a probe score never overwrites the real dump.
 fn load_score() -> ScoreJson {
-    let p = Path::new(WORK).join("probe").join("mg_score.json");
+    let p = std::env::var("UTAI_MG_SCORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| Path::new(WORK).join("probe").join("mg_score.json"));
     let s = std::fs::read_to_string(&p).unwrap_or_else(|e| {
         panic!("missing {} ({e}) — run dump_mg_notes then mgScoreDump.test.ts first", p.display())
     });
@@ -66,7 +75,7 @@ fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
             note_num: t.note_num,
             frames: t.frames,
             lang: Lang::Ja,
-            phoneme_input: None,
+            phoneme_input: t.phoneme_input.as_deref(),
         })
         .collect()
 }
@@ -342,7 +351,9 @@ fn mg_render_rvc() {
         if !clarity { "_nc" } else { "" },
         mg_shift_tag(shift, inverse, kappa),
     );
-    let name = format!("mg_render_{a}_{b}_{mtag}{tag}.wav");
+    // S86: `UTAI_MG_OUTTAG` keeps two arms of the same score from overwriting each other.
+    let outtag = std::env::var("UTAI_MG_OUTTAG").map(|t| format!("_{t}")).unwrap_or_default();
+    let name = format!("mg_render_{a}_{b}_{mtag}{tag}{outtag}.wav");
     write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
         "[mg] rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",

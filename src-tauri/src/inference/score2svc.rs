@@ -165,7 +165,10 @@ fn compute_note_groups(arr: &ScoreArrays, score: &[ScoreEvt]) -> NoteGroups {
         let mut cursor = 0usize;
         let mut seen = vec![false; ng];
         for (k, evt) in score.iter().enumerate() {
-            let npitch = if matches!(classify_lyric(evt.lyric), LyricClass::Rest | LyricClass::Breath) {
+            // S86: `g2p::is_silent_token`, NOT `classify_lyric` — the latter keeps the upstream
+            // parity port's WIDER rest set (rest/sil/pau), which would key this grouping differently
+            // from the cv-side grouping and shift every later group index.
+            let npitch = if g2p::is_silent_token(evt.lyric) {
                 0
             } else {
                 evt.note_num

@@ -360,7 +360,7 @@ export function vocalRenderSig(track: Track, seg: Segment, tempo: number): strin
 export function vocalTrackSig(track: Track, tempo: number): string {
   // forRender=true:autoTune 三元组不进渲染 sig(它们经 θ→contentSig 间接生效;直接进会让
   // 切 follow 开关/拖缩放凭空判废整段 bake——S73b 审查假脏)。
-  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}`;
+  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}|g2p:${G2P_ALGO_VERSION}`;
 }
 
 /** Resolve a track's configured singer to its installed model entry (undefined = no vocalParams, no
@@ -395,6 +395,17 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  score path only (cover has no per-render normalization; a global RMS pull was measuring
  *  climax loudness against whole-song average). Audition tag bumps in lockstep (_s85e_). */
 export const RANGE_ALGO_VERSION = "s85e";
+
+/** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
+ *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and
+ *  the fix reads as "I changed it and the user hears nothing", exactly the failure RANGE_ALGO_VERSION
+ *  exists to prevent (S81 audit; S86 review R3 caught this one missing).
+ *  s86 = 「に」 resolves to `n i` (the phones the model was trained on) instead of `ɲ i`; whole-kana
+ *  multi-mora parsing (ずっと/っと/あー sing in full instead of being truncated to the head mora);
+ *  `rest` freed from the reserved rest tokens; tolerant dictionary lookup (ß→ss, typographic
+ *  apostrophes, glued punctuation).
+ *  ★ Must move in lockstep with `G2P_ALGO_VERSION` in src-tauri/src/commands/audition.rs. */
+export const G2P_ALGO_VERSION = "s86";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

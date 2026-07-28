@@ -446,7 +446,7 @@ The editor's view is independent of the arrangement view's zoom/scroll. On openi
 | --- | --- |
 | `-` or `ー` | Sustain: continues the previous syllable's vowel |
 | `+` | Takes the previous word's next syllable (for multi-syllable Western words spanning notes) |
-| `R` / `rest` / `sil` / `pau` | Rest |
+| `R` | Rest. **Changed in v0.12:** `rest` / `sil` / `pau` are no longer rest tokens — they are ordinary lyrics now (they are real words, and word fragments like sil\|ver, pau\|se would collide). Use `R`, or set a custom rest token on the track. |
 | `AP` / `ap` | Breath (see 5.8) |
 
 Lyrics are single-line, at most 64 characters; clearing a lyric falls back to the track language's default lyric.

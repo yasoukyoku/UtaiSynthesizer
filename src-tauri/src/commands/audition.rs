@@ -303,9 +303,16 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
 /// execute on these paths, so they must NOT bump this tag; the one score-rendered audition
 /// (render_candidate_scale) is deliberately uncached. Bump only for changes that alter the
 /// cover audition pipeline's actual output.
+/// Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Auditions render through
+/// `render_score_{rvc,sovits}`, so a change in what phones a lyric resolves to changes this audio —
+/// without a tag term the cache keeps serving the OLD phones forever (S86 review R3).
+/// ★ Must move in lockstep with `G2P_ALGO_VERSION` in src/lib/vocal/vocalRender.ts.
+const G2P_ALGO_VERSION: &str = "s86";
+
 fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
     match range {
-        None => String::new(),
+        // NB: still emitted with no range record — the G2P term is unconditional by design.
+        None => format!("_{G2P_ALGO_VERSION}"),
         Some(r) => {
             // The bounds alone stopped identifying the decision once S81 made the raw
             // per-semitone scan a render input (the damage curve): a re-test that moves the
@@ -329,7 +336,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // s85d: cover/audition switched to dead-only (whole-clip shift retired; the
             // pipelines own the policy) — a decision change, so the tag moves in lockstep.
             format!(
-                "_s85e_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_{G2P_ALGO_VERSION}_s85e_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }
