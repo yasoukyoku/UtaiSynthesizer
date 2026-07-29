@@ -439,11 +439,27 @@ pub fn voiceless_zero_permille(p: &str, group_frames: i64) -> i64 {
     dur_prior(p).map(|(_, _, z)| z[dur_bucket(group_frames)]).unwrap_or(1000)
 }
 
-/// In-note allocation for one note's phones (`fr` ≥ 1 frames inside the note window): medial + coda get
-/// bounded shares, the nucleus takes the remainder, onset positions are left 0 (the caller fills them by
-/// borrowing / supplement). Returns per-phone durations aligned to `ph`; entries may be 0 (dropped
-/// medial/coda / unfilled onset) — the caller skips 0-duration phones at emission. Σ(durs) ≤ fr always.
-fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) -> Vec<i64> {
+/// How many frames this pass may hand out, and which note-length bucket the MEASURED duration priors
+/// should be read at. On the Auto arm they are the same number. On the InNote arm they diverge: the
+/// onset is reserved out of the note BEFORE this pass runs, so `spendable` shrinks while the bucket key
+/// must keep describing the note the singer actually sees.
+///
+/// ⚠ Two bare `i64`s in a row is the shape S85 shipped a bug through — hence the named fields.
+#[derive(Debug, Clone, Copy)]
+struct NoteBudget {
+    /// The note's own frame count. Bucket key for `onset_target_frames`/`coda_target_frames` ONLY.
+    note_frames: i64,
+    /// Frames this pass may actually distribute (nucleus remainder included).
+    spendable: i64,
+}
+
+/// In-note allocation for one note's phones: medial + coda get bounded shares, the nucleus takes the
+/// remainder, onset positions are left 0 (the caller funds them — by borrowing from the previous phone
+/// on the Auto arm, or by reserving out of `b.spendable` BEFORE this call on the InNote arm). Returns
+/// per-phone durations aligned to `ph`; entries may be 0 (dropped medial/coda / unfunded onset) — the
+/// caller skips 0-duration phones at emission. Σ(durs) ≤ b.spendable always.
+fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: usize) -> Vec<i64> {
+    let NoteBudget { note_frames, spendable: fr } = b;
     let n = ph.len();
     let mut durs = vec![0i64; n];
     let n_coda = n - nuc - 1;
@@ -460,7 +476,7 @@ fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) 
         let c = if is_nucleus_phone(ph[i]) {
             (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4)
         } else {
-            onset_target_frames(ph[i], fr)
+            onset_target_frames(ph[i], note_frames)
         }
         .min(fr - nuc_floor - used);
         if c < CODA_MIN_FRAMES {
@@ -474,10 +490,10 @@ fn allocate_in_note(ph: &[&'static str], fr: i64, onset_end: usize, nuc: usize) 
     // (training: vowel share median 44-47%). LAST-first: the word-final release is the perceptually
     // load-bearing cue — when the budget starves, inner codas drop before it.
     if n_coda > 0 {
-        let want: i64 = ph[nuc + 1..].iter().map(|p| coda_target_frames(p, fr)).sum();
+        let want: i64 = ph[nuc + 1..].iter().map(|p| coda_target_frames(p, note_frames)).sum();
         let mut budget = want.min(fr - nuc_floor - used).min(fr * 2 / 5);
         for i in (nuc + 1..n).rev() {
-            let give = coda_target_frames(ph[i], fr).min(budget);
+            let give = coda_target_frames(ph[i], note_frames).min(budget);
             if give < CODA_MIN_FRAMES {
                 continue; // dropped; the remaining budget stays for the codas before it
             }
@@ -675,9 +691,10 @@ pub enum ArticulationTiming {
     /// score whose author already placed the consonants ahead of the beat BY HAND — UTAU CVVC/VCCV
     /// alias scores are transition units carrying their own preutterance compensation — pre-rolling
     /// again applies the same head start TWICE.
-    /// ⚠ Known cost, by construction: with no lender, a note too short to spare frames above its
-    /// nucleus floor drops its onset entirely (the same ≥2-or-drop policy codas already use). That
-    /// is the honest reading of "no borrowing"; the phoneme lane shows it.
+    /// ⚠ Known cost, by construction: with no lender, a note too short to fund a 2-frame onset out
+    /// of its own budget drops it (the same ≥2-or-drop policy codas already use). That is the honest
+    /// reading of "no borrowing"; the phoneme lane shows it. The onset is funded FIRST and clamped to
+    /// half the note, so this only bites on genuinely tiny notes and never on a long one.
     InNote,
 }
 
@@ -826,7 +843,6 @@ fn assemble_arrays(
                     let fr = fr.max(1);
                     let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
                     let onset_end = ph.iter().position(|p| is_nucleus_phone(p)).unwrap_or(n - 1).min(nuc);
-                    let mut durs = allocate_in_note(ph, fr, onset_end, nuc);
                     // S84 A 刀: at fr ≤ 5 (the tempo-222 160t fast-run regime) the short-bucket
                     // MEDIAN targets (t3/k4/s4 — a ≤7 bucket dominated by 6-7-frame groups)
                     // always exceed the ceil-half clamp, so the LENDER vowel was pinned at
@@ -848,39 +864,68 @@ fn assemble_arrays(
                             t
                         }
                     };
+                    // ── preroll OFF: the onset is funded by THIS note, and it is funded FIRST ──
+                    //
+                    // ★ORDER IS THE WHOLE DESIGN. The medial/coda pass below is bounded only by the
+                    // nucleus's 2-frame floor, so serving the onset *after* it (the first cut of this
+                    // switch) let a multi-syllable word — or a multi-mora kana on one note, which is
+                    // ordinary UST practice — starve its WORD-INITIAL consonant to exactly zero at
+                    // perfectly normal note lengths, while word-INTERNAL consonants kept their full
+                    // measured target: `refined`@400ms sang "efined", `ずっと`@500ms lost its z.
+                    // Two adversarial-review dimensions found that independently. Funding the onset
+                    // first also makes the result MONOTONE in note length (lengthening a note can no
+                    // longer delete a consonant).
+                    //
+                    // ★The clamp is the Auto arm's own UTAU-style structural half, re-aimed at the
+                    // note instead of at a neighbour: the onset cluster may take at most half the
+                    // note and must leave ≥ SUNG_KEEP_MIN. My first cut invented a `fr*2/5` floor
+                    // instead — which integer-truncates to exactly 2 across the WHOLE short bucket
+                    // (fr ≤ 7), i.e. no protection at all where it was needed most: か@6 came out
+                    // k4/a2 and し@7 came out ɕ5/i2, the 2-frame vowel S84 measured as the collapse
+                    // region. Reusing the shipped, ear-validated half-clamp gives k3/a3 and ɕ4/i3.
+                    let mut reserved = 0i64;
+                    let mut onset_durs = vec![0i64; n];
                     if onset_end > 0 && timing == ArticulationTiming::InNote {
-                        // ── preroll OFF: the onset stays INSIDE its own note ──
-                        // Same measured targets, same LAST-first order, same ≥2-or-DROP policy as the
-                        // pre-roll arm; the ONLY difference is WHERE the frames come from — the note's
-                        // own nucleus remainder, never the previous phone. Conservation is therefore
-                        // trivial (every frame the onset gains, the nucleus loses), and the previous
-                        // note is left byte-identical, which is the whole point: an author who already
-                        // moved the consonant ahead of the beat must not have it moved again.
-                        //
-                        // ★The nucleus floor here is NOT the Auto arm's `fr.min(2)`. Over there that
-                        // number is only a last-ditch rescue floor (the nucleus normally keeps its
-                        // whole remainder because the onset came from the neighbour); here it would
-                        // become the PRIMARY constraint and a 2-consonant onset would crush the vowel
-                        // to 2 frames — e.g. [s t a] on a 10-frame note → s4/t4/a2. So the floor is
-                        // the SAME measured vowel share the coda budget already uses two branches up
-                        // (training vowel-share median 44-47% ⇒ 2/5): onsets + codas together can
-                        // never take more than 3/5 of the note. On long notes it never binds
-                        // (mine@50: floor 20 vs a 46-frame nucleus), on short ones it is what keeps
-                        // the syllable a syllable.
-                        let nuc_floor = fr.min(2).max(fr * 2 / 5);
+                        let avail = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
+                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                        let mut left = want.min(avail);
+                        reserved = left;
+                        // LAST-first, exactly as the pre-roll arm: the consonant touching the vowel
+                        // carries the syllable's identity, so a starved cluster sheds its OUTERMOST
+                        // member first.
                         for i in (0..onset_end).rev() {
-                            let spare = (durs[nuc] - nuc_floor).max(0);
-                            if spare <= 0 {
-                                break;
+                            let give = left.min(target(ph[i]));
+                            onset_durs[i] = give;
+                            left -= give;
+                        }
+                        // all-or-nothing top-up to the 2-frame minimum out of what is still
+                        // unallocated (i.e. the nucleus's future remainder), never below the
+                        // nucleus's own floor — same policy as the pre-roll arm's supplement.
+                        let nuc_floor = fr.min(2);
+                        for i in (0..onset_end).rev() {
+                            if onset_durs[i] >= CODA_MIN_FRAMES {
+                                continue;
                             }
-                            let give = target(ph[i]).min(spare);
-                            if give < CODA_MIN_FRAMES {
-                                continue; // a 1-frame phone is categorically OOD — drop, keep the budget
+                            let need = CODA_MIN_FRAMES - onset_durs[i];
+                            if fr - reserved - need >= nuc_floor {
+                                onset_durs[i] += need;
+                                reserved += need;
                             }
-                            durs[i] = give;
-                            durs[nuc] -= give;
+                        }
+                        // sub-minimum onsets DROP (a 1-frame phone is categorically OOD); their
+                        // frames simply stay in the budget the pass below distributes.
+                        for d in onset_durs.iter_mut().take(onset_end) {
+                            if *d > 0 && *d < CODA_MIN_FRAMES {
+                                reserved -= *d;
+                                *d = 0;
+                            }
                         }
                     }
+                    // Auto: reserved == 0 ⇒ `spendable == note_frames` and every onset slot is 0,
+                    // which is exactly what this call produced before the switch existed.
+                    let mut durs =
+                        allocate_in_note(ph, NoteBudget { note_frames: fr, spendable: fr - reserved }, onset_end, nuc);
+                    durs[..onset_end].copy_from_slice(&onset_durs[..onset_end]);
                     if onset_end > 0 && timing == ArticulationTiming::Auto {
                         // borrow the onset consonants' frames from the tail of the previous phone so
                         // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
@@ -1596,6 +1641,74 @@ mod tests {
         // NOT simply "the no-lender path" (an early design hypothesis this test exists to refute).
         let on = build_arrays_daw(&[sta], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(on.phone_dur, vec![2, 2, 6], "no-lender Auto tops up to the bare minimum only");
+    }
+
+    // ★★ THE regression the adversarial review caught (two dimensions, independently).
+    //
+    // First cut funded the onset LAST, out of whatever the medial/coda pass left on the nucleus. The
+    // medial pass is bounded only by the nucleus's 2-frame floor, so on any note carrying a medial —
+    // a multi-syllable word, or a multi-mora kana, both ordinary UST practice — the nucleus was
+    // already at/below the floor by the time the onset asked, and the WORD-INITIAL consonant was
+    // silently deleted while word-INTERNAL ones kept their full measured target.
+    // refined = [ɹ ə f aɪ n d] @ 20 frames (400 ms) sang "efined"; ずっと @ 25 frames lost its z.
+    // Funding the onset FIRST fixes it. Hand-derived expectation for refined@20:
+    //   onset budget = min(fr - SUNG_KEEP_MIN, ceil(fr/2)) = min(18, 10) = 10; ɹ targets 7 ⇒ ɹ = 7.
+    //   the rest (13) then runs the shared pass at the note's own bucket (fr=20 ⇒ long):
+    //   medial ə (a VOWEL — small share) = clamp(13/6, 2, 4) = 2; medial f = 7; coda budget =
+    //   min(4+3, 13-2-9, 13*2/5) = 2 ⇒ d takes 2 LAST-first, n starves and drops; nucleus = 2.
+    #[test]
+    fn in_note_timing_never_starves_the_word_initial_onset() {
+        let refined = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 20, lang: g2p::Lang::Ja,
+            phoneme_input: Some("ɹ ə f aɪ n d"),
+        };
+        let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), refined];
+        let off = build_arrays_daw(&score, &NoDicts, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "d"], "the WORD-INITIAL ɹ must survive");
+        assert_eq!(off.phone_dur, vec![10, 7, 2, 7, 2, 2]);
+        assert_eq!(off.phone_dur.iter().sum::<i64>(), 30, "frame-conserving");
+        // the rest is left untouched — that is still the point of the switch
+        assert_eq!(off.phone_dur[0], 10);
+    }
+
+    // Same root cause seen from the other side: a plain CV note in the SHORT bucket. The first cut's
+    // invented `fr*2/5` nucleus floor integer-truncates to exactly 2 for every fr ≤ 7, i.e. it was no
+    // protection at all precisely where the S84-measured 2-frame-vowel collapse lives. The Auto arm's
+    // own structural-half clamp (which shipped and was ear-validated) does the job.
+    #[test]
+    fn in_note_timing_does_not_crush_the_vowel_on_short_notes() {
+        let lead = g2p::ScoreEvt::ja(&("R", 0, 20));
+        // か = [k, a] @ 6 frames: onset budget = min(6-2, ceil(6/2)) = 3; k targets 4 ⇒ k=3, a=3.
+        let ka = g2p::ScoreEvt::ja(&("か", 60, 6));
+        let off = build_arrays_daw(&[lead.clone(), ka], &NoDicts, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off.phone_dur, vec![20, 3, 3], "the vowel keeps half the note, not 2 frames");
+        // し = [ɕ, i] @ 7: budget = min(5, 4) = 4; ɕ targets 7 (its short-bucket prior) ⇒ ɕ=4, i=3.
+        let si = g2p::ScoreEvt::ja(&("し", 60, 7));
+        let off2 = build_arrays_daw(&[lead, si], &NoDicts, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off2.phone_dur, vec![20, 4, 3], "a 7-frame prior cannot eat the whole note");
+    }
+
+    // MONOTONICITY: lengthening a note must never delete one of its phones. The first cut violated
+    // this (a longer note gave the medial pass more room, which starved the onset to zero), which is
+    // the kind of behaviour no user could ever form a mental model of.
+    #[test]
+    fn in_note_timing_is_monotone_in_note_length() {
+        let mut kept_at: Vec<(i64, usize)> = Vec::new();
+        for fr in 2..=60 {
+            let w = g2p::ScoreEvt {
+                lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja,
+                phoneme_input: Some("ɹ ə f aɪ n d"),
+            };
+            let arr = build_arrays_daw(&[w], &NoDicts, ArticulationTiming::InNote).unwrap();
+            assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "conservation at fr={fr}");
+            kept_at.push((fr, arr.phon.len()));
+        }
+        for w in kept_at.windows(2) {
+            let ((f0, n0), (f1, n1)) = (w[0], w[1]);
+            assert!(n1 >= n0, "fr {f0}→{f1} DROPPED a phone ({n0}→{n1}) — non-monotone in length");
+        }
+        // and the sweep really did cross the interesting region (it must not be all-or-nothing)
+        assert!(kept_at.first().unwrap().1 < kept_at.last().unwrap().1, "sweep never gained a phone");
     }
 
     // ★ SWEEP — the DEFINING invariant, stated so it cannot hold vacuously.

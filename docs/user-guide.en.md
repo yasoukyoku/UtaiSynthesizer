@@ -405,7 +405,7 @@ The column on the editor's left has four tool buttons (click to switch):
 
 **Grid**: the row of buttons labeled "Grid" at the editor's top: `1/4`, `1/8` (default), `1/16`, `1/8T`, `1/16T`, `1/12` — the T variants are triplet grids (1/8T = 3 per beat, 1/16T = 6 per beat), and `1/12` is the finest unit (12 per beat). The grid decides **where new notes land and how long they are**, plus the arrow keys' nudge step; moving/resizing existing notes steps by 1/12 beat regardless of the grid — you never need to switch grids just to fine-tune. Canvas lines have a clear hierarchy: bar lines are thickest, then beat lines, then subdivision lines; a snapped vertical guide follows the mouse.
 
-**Snapping (the magnet button, left of the grid buttons)**: on by default. Turn it **off** and notes are placed, moved and resized **continuously** — no grid at all. The grid lines stay on screen either way; with snapping off they are a reference, not a magnet. Turn it off when a score's timing was authored off-grid on purpose — a UTAU CVVC .ust, for example, shifts note starts by hand as preutterance compensation, and snapping would destroy exactly that. With snapping **on**, dragging a note now lands it **on** a grid line (previously the drag moved it by whole cells, so a note that was already off-grid could never get back onto it). The setting is remembered across sessions.
+**Snapping (the magnet button, left of the grid buttons)**: on by default. Turn it **off** and notes are placed, moved and resized **continuously** — no grid at all. The grid lines stay on screen either way; with snapping off they are a reference, not a magnet. Turn it off when a score's timing was authored off-grid on purpose — a UTAU CVVC .ust, for example, shifts note starts by hand as preutterance compensation, and snapping would destroy exactly that. With snapping **on**, dragging a note now lands it **on** a grid line (previously the drag moved it by whole cells, so a note that was already off-grid could never get back onto it). The setting is remembered across sessions. ⚠ When you import such a score, that same authoring intent also needs **"Automatic articulation timing" turned off** in the sidebar (see 5.10) — otherwise we move the consonants ahead of the beat a second time, on top of the head start the author already built in.
 
 **Scrolling and zooming** (note the axes differ from the arrangement view):
 
@@ -528,12 +528,13 @@ A note whose lyric is `R` (or `r`) is a **rest**: it makes no sound and carries 
 
 > When you export to `.ust` / `.ustx` / `.mid`, both triggers are written out as the standard `R` and `AP`, because those files carry no track settings — this way other UTAU-family tools (and re-importing the file here) read your rests and breaths correctly instead of trying to sing them. One asymmetry: `.ust` cannot store a rest as a note at all, so re-importing a `.ust` turns rest notes back into plain gaps. The silence is identical; only the spelling changes.
 
-### 5.9 The bottom parameter band: loudness and formant
+### 5.9 The bottom parameter band: loudness, formant and phonemes
 
-Next to the editor's title are the "Loudness" and "Formant" buttons; clicking one unfolds an 88px parameter band at the canvas bottom (one parameter shown at a time; clicking the active button closes it):
+Next to the editor's title are the "Loudness", "Formant" and "Phonemes" buttons; clicking one unfolds an 88px parameter band at the canvas bottom (one shown at a time; clicking the active button closes it):
 
 - **"Loudness"**: a ±12 dB per-frame volume curve that becomes the vocal's volume envelope at render time.
 - **"Formant"**: a ±12 semitone resonance-shift curve — positive is brighter/younger, negative is darker/fuller, pitch unchanged.
+- **"Phonemes"** (read-only): every phone this track will actually sing, drawn as a coloured block — one colour for syllable nuclei, one for voiced consonants, one for voiceless ones — the block's width being the duration it really got, and hovering showing the lyric, the phone and the millisecond figure. Each note's start also gets a reference line, so **a consonant block sitting left of that line is one that was moved ahead of the beat** (see "Automatic articulation timing" in 5.10). It runs the very allocator the render uses, so what you see here is what will be sung — including phones that were dropped (their space is simply empty). This lane cannot be edited.
 
 Editing works exactly like audio-track envelopes: press empty space to insert a point and drag, drag existing points, right-click to delete; values quantize to 0.1; each gesture is one undo step. The dashed center line is 0 (no change). The curves are render parameters — changing them makes the clip "dirty", and the next Play re-renders automatically.
 
@@ -563,6 +564,14 @@ RVC models:
 - "Consonant protect" (0–0.5).
 
 **"Range extend"**: this toggle only appears if the current singer has had its **range tested** in the resource manager (see 7.4). When on, phrases beyond the singer's comfort zone are first transposed into the comfort zone for rendering, then shifted back in the audio domain — a low-voiced singer can sing a high song, at the cost of a slight timbre change over those passages. Off by default.
+
+**"Automatic articulation timing"**: **on** by default. With it on, a syllable's opening consonant is sung *ahead* of the beat so the vowel lands on it — what real singers do, what the training data annotates, and what a UTAU voicebank's preutterance does.
+
+When to turn it off: **importing a UTAU CVVC / VCCV phoneme score**. Those notes are transition units whose author already moved the consonants ahead by hand; moving them again applies the same head start twice. With it off, every phone is allotted time inside its own note and nothing is ever borrowed from the previous one — the positions the author placed do not move at all.
+
+The cost, stated plainly: the consonant now has to come out of *this note's* own duration, so it can never take more than half of it, and on a note too short to spare even 2 frames (40 ms) that consonant is dropped. To see exactly how a note was divided, open the phoneme lane (see 5.9) — it redraws the moment you flip the switch, and you can see at a glance whether the consonant block sits left or right of the beat line.
+
+⚠ One exception: a short vowel may still extend into the **rest immediately after it** (otherwise fast-passage notes become too short to sound at all). That only eats silence; it never moves any note's start.
 
 **"Breath token"** / **"Rest token"**: see 5.8.
 
@@ -1117,7 +1126,7 @@ This chapter covers importing scores, and exporting audio and scores — includi
 
 "File" → "Import Score", then pick a .ustx / .ust / .mid / .midi file. Importing is **additive** — it only creates new vocal tracks and never overwrites your existing content.
 
-**Rounding option**: after the file is parsed, a small dialog asks whether to **round note boundaries to the nearest 1/12 beat**, and shows how many of this file's notes are off that grid so the choice is informed. It is **on by default** and is what you want for most scores — it also rescues notes so short they would not sound at all. Turn it **off** for a score whose timing was authored off-grid on purpose (a UTAU CVVC .ust: rounding would move most of its notes). A track carrying baked ustx pitch tuning is never rounded — its curve is keyed to the original note timing — and the dialog reports that. Whatever rounding changes is reported afterwards, note by note count.
+**Rounding option**: after the file is parsed, a small dialog asks whether to **round note boundaries to the nearest 1/12 beat**, and shows how many of this file's notes are off that grid so the choice is informed. It is **on by default** and is what you want for most scores — it also rescues notes so short they would not sound at all. Turn it **off** for a score whose timing was authored off-grid on purpose (a UTAU CVVC .ust: rounding would move most of its notes). A track carrying baked ustx pitch tuning is never rounded — its curve is keyed to the original note timing — and the dialog reports that. Whatever rounding changes is reported afterwards, note by note count. ⚠ Turning rounding off only *preserves* the positions the author placed; to have us actually sing *to* them you must also turn off "Automatic articulation timing" in the sidebar (see 5.10), or the consonants get a second head start anyway.
 
 **Kept**: notes (position/duration/pitch/lyric — rounded to the 1/12 grid only if you leave the option on), the file's first BPM and time signature (if present, they override the project's globals), each track's start position, and ustx **pitch tuning** (see below). Each non-empty track of a multi-track file becomes its own vocal track. .ust files auto-detect Shift-JIS / UTF-8; lyrics R/r/empty are treated as rests.
 

@@ -141,6 +141,28 @@ fn mg_f0shift_env(shift: i64, cents: &[f32]) -> (i64, Option<Vec<f32>>) {
     (f0shift, Some(cents.iter().map(|&c| c + (f0shift * 100) as f32).collect()))
 }
 
+/// S89 「自動咬字時序」 probe switch: `UTAI_MG_PREROLL=0` renders the InNote arm, so the probe can
+/// A/B the switch on real material with everything else held fixed. ONE reader — every place in this
+/// file that needs the timing must call it, or a post-processing pass would shape one arm's audio
+/// with the other arm's frame layout (review INFO).
+fn mg_timing_env() -> ArticulationTiming {
+    if std::env::var("UTAI_MG_PREROLL").map(|s| s != "0").unwrap_or(true) {
+        ArticulationTiming::Auto
+    } else {
+        ArticulationTiming::InNote
+    }
+}
+
+/// Filename marker for the non-default arm — WITHOUT it the two arms of an A/B silently overwrite
+/// each other and you compare a file against itself (review INFO). Same posture as `mg_shift_tag`:
+/// the production default leaves the name untouched.
+fn mg_preroll_tag() -> &'static str {
+    match mg_timing_env() {
+        ArticulationTiming::Auto => "",
+        ArticulationTiming::InNote => "_innote",
+    }
+}
+
 /// cvfix 臂的探针侧逆变换(⚠与生产整段臂的唯一口径偏差:生产 inverse 在 peak-norm 之前,
 /// 这里渲染已 norm 完才逆变换——电平语义微差,听感对比无碍,记档)。fed=移调后 note_hz
 /// (生产整形三连同款)。
@@ -152,7 +174,9 @@ fn mg_cvfix_inverse(
     evts: &[ScoreEvt<'_>],
     vf0: &VocalF0<'_>,
 ) -> Vec<f32> {
-    let arr = build_arrays_daw(evts, &NoDicts, ArticulationTiming::Auto).unwrap();
+    // ⚠ must match the arm the audio was RENDERED with — the inverse is fed a per-frame f0 built
+    // from this allocation, and the two arms lay the frames out differently.
+    let arr = build_arrays_daw(evts, &NoDicts, mg_timing_env()).unwrap();
     let mut hz = build_note_hz(&arr, evts, 0, Some(vf0));
     zero_voiceless_frames(&mut hz, &arr);
     anchor_voiced_phone_f0(&mut hz, &arr);
@@ -332,9 +356,7 @@ fn mg_render_rvc() {
             consonant_emphasis_db: emph,
             consonant_valley_scale: valley,
             vowel_clarity: clarity,
-            // S89: `UTAI_MG_PREROLL=0` renders the in-note arm, so the probe can A/B the switch on
-            // real material with everything else held fixed.
-            consonant_preroll: std::env::var("UTAI_MG_PREROLL").map(|s| s != "0").unwrap_or(true),
+            consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
@@ -359,7 +381,7 @@ fn mg_render_rvc() {
         if valley != DEFAULT_CONSONANT_VALLEY_SCALE { format!("_v{valley}") } else { String::new() },
         if !clarity { "_nc" } else { "" },
         mg_shift_tag(shift, inverse, kappa),
-    );
+    ) + mg_preroll_tag();
     // S86: `UTAI_MG_OUTTAG` keeps two arms of the same score from overwriting each other.
     let outtag = std::env::var("UTAI_MG_OUTTAG").map(|t| format!("_{t}")).unwrap_or_default();
     let name = format!("mg_render_{a}_{b}_{mtag}{tag}{outtag}.wav");
@@ -508,9 +530,7 @@ fn mg_render_sovits() {
             consonant_emphasis_db: emph,
             consonant_valley_scale: valley,
             vowel_clarity: clarity,
-            // S89: `UTAI_MG_PREROLL=0` renders the in-note arm, so the probe can A/B the switch on
-            // real material with everything else held fixed.
-            consonant_preroll: std::env::var("UTAI_MG_PREROLL").map(|s| s != "0").unwrap_or(true),
+            consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
@@ -527,8 +547,11 @@ fn mg_render_sovits() {
     } else {
         String::new()
     };
-    let name =
-        format!("mg_render_{a}_{b}_{mtag}{}{ftag}.wav", mg_shift_tag(shift, inverse, kappa));
+    let name = format!(
+        "mg_render_{a}_{b}_{mtag}{}{ftag}{}.wav",
+        mg_shift_tag(shift, inverse, kappa),
+        mg_preroll_tag()
+    );
     write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
         "[mg] sovits rendered triples[{a}..{b}] ({} frames): {:.2}s audio in {:.1}s wall -> probe\\{name}",
