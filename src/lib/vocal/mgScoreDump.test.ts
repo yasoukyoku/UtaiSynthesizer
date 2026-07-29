@@ -24,6 +24,7 @@ vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () 
 
 import { buildVocalScore } from "./vocalRender";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
+import { DEFAULT_LANG_ID } from "./languages";
 import type { Note } from "../../types/project";
 
 const PROBE_DIR = "D:\\MyDev\\TESTING\\不为人所知的鹅妈妈童谣\\probe";
@@ -45,9 +46,12 @@ describe.skipIf(!process.env.UTAI_MG_DUMP)("MG score dump (diagnostic, not a gat
         id: `n${i}`, tick: n.tick, duration: n.duration, pitch: n.pitch, lyric: n.lyric, velocity: 100,
       }),
     );
-    // 生产口径:默认 transition(track default)、无 vibrato、无 pitchDev、无参数泳道、JA 默认。
+    // 生产口径:默认 transition(track default)、无 vibrato、无 pitchDev、无参数泳道。
+    // S90: `langId` 也从 notes 文件读(缺省仍是 JA)—— 英文素材的探针必须能按 EN 走 G2P,
+    // 否则整条链在 ja 词典上跑,方括号/ARPABET 那一层根本走不到。
     const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
       notes, undefined, tempo, DEFAULT_TRANSITION, { breath: "AP", rest: "R" }, // 生产默认的两个标记
+      undefined, 0, meta.langId ?? DEFAULT_LANG_ID,
     );
     const sum = triples.reduce((s, t) => s + t.frames, 0);
     expect(f0Cents.length).toBe(sum); // render_vocal_segment 的硬校验同款不变量

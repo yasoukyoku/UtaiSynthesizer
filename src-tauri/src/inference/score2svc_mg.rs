@@ -25,7 +25,10 @@ use super::*;
 use super::e1_tests::write_wav16;
 use super::super::engine::{DeviceConfig, OnnxEngine};
 use super::super::rvc;
-use super::super::score2cv::{is_nucleus_phone, ArticulationTiming, NoDicts};
+// S90: the probe now resolves through the SHIPPED dictionaries (GlobalDicts), not the
+// dictionary-free JA provider — an English/Chinese score needs stage1, and JA never
+// consults a dictionary either way, so the JA arms are unchanged.
+use super::super::score2cv::{is_nucleus_phone, ArticulationTiming};
 use super::super::sovits;
 use std::path::Path;
 use std::time::Instant;
@@ -46,7 +49,9 @@ struct TripleJson {
     lyric: String,
     note_num: i64,
     frames: i64,
-    #[allow(dead_code)]
+    /// S90: HONOURED now (it used to be dumped and ignored, with every probe render forced to JA —
+    /// so an English score silently ran through the ja tables and the whole word/ARPABET layer was
+    /// unreachable from this probe). Unknown ids fall back to JA, the historical default.
     lang: i64,
     /// S86: optional §3.7 traditional-phoneme override. With whitespace it is RAW phones, which lets
     /// one build render both arms of an A/B (e.g. 「に」 as `n i` vs `ɲ i`) from the same binary —
@@ -58,6 +63,10 @@ struct TripleJson {
 /// Default = the 鹅妈妈 dump. `UTAI_MG_SCORE=<path>` points at any score JSON in the same shape
 /// (S86: purpose-built A/B scores live beside it), so a probe score never overwrites the real dump.
 fn load_score() -> ScoreJson {
+    // S90: point the G2P at the shipped dictionaries (the command layer does this from the data dir).
+    // Until this probe honoured `lang` every score ran as JA, which needs no dictionary file at all —
+    // the first English score otherwise dies with VOCAL_DICT_MISSING inside the render.
+    super::g2p::set_dict_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries"));
     let p = std::env::var("UTAI_MG_SCORE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| Path::new(WORK).join("probe").join("mg_score.json"));
@@ -74,7 +83,7 @@ fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
             lyric: &t.lyric,
             note_num: t.note_num,
             frames: t.frames,
-            lang: Lang::Ja,
+            lang: Lang::from_id(t.lang).unwrap_or(Lang::Ja),
             phoneme_input: t.phoneme_input.as_deref(),
         })
         .collect()
@@ -176,7 +185,7 @@ fn mg_cvfix_inverse(
 ) -> Vec<f32> {
     // ⚠ must match the arm the audio was RENDERED with — the inverse is fed a per-frame f0 built
     // from this allocation, and the two arms lay the frames out differently.
-    let arr = build_arrays_daw(evts, &NoDicts, mg_timing_env()).unwrap();
+    let arr = build_arrays_daw(evts, &super::g2p::GlobalDicts, mg_timing_env()).unwrap();
     let mut hz = build_note_hz(&arr, evts, 0, Some(vf0));
     zero_voiceless_frames(&mut hz, &arr);
     anchor_voiced_phone_f0(&mut hz, &arr);
@@ -200,7 +209,7 @@ fn mg_lane_dump() {
     // S89: the lane dump is THE way to inspect an allocation without rendering, so it has to be
     // able to show BOTH articulation arms (`UTAI_MG_PREROLL=0` = the in-note arm).
     let timing = mg_timing_env();
-    let arr = build_arrays_daw(&evts, &NoDicts, timing).unwrap();
+    let arr = build_arrays_daw(&evts, &super::g2p::GlobalDicts, timing).unwrap();
     let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
     // 生产 f0 整形三连(render_score_rvc 同款;transpose 0)——hz 即模型真实吃到的 f0,
     // 归零窗/借帧锚定的落点不重算、直接数。
@@ -373,7 +382,7 @@ fn mg_render_rvc() {
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts,
+        &m, &s2cv768, &evts, 768, 49, &super::g2p::GlobalDicts, &ropts,
         ScoreShaping {
             consonant_emphasis_db: emph,
             consonant_valley_scale: valley,
@@ -546,7 +555,7 @@ fn mg_render_sovits() {
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_sovits(
-        &m, &s2cv, &evts, dim, 49, &NoDicts, &sopts,
+        &m, &s2cv, &evts, dim, 49, &super::g2p::GlobalDicts, &sopts,
         crate::commands::inference::VOCAL_FLAT_VOL,
         ScoreShaping {
             consonant_emphasis_db: emph,
@@ -651,7 +660,7 @@ fn mg_render_rvc_oversampled() {
     let ropts = RvcOptions { seed: 0, ..Default::default() };
 
     // ── 真时间轴(生产口径逐行)──
-    let arr = build_arrays_daw(&evts, &NoDicts, ArticulationTiming::Auto).unwrap();
+    let arr = build_arrays_daw(&evts, &super::g2p::GlobalDicts, ArticulationTiming::Auto).unwrap();
     let mut note_hz_full = build_note_hz(&arr, &evts, 0, Some(&vf0));
     zero_voiceless_frames(&mut note_hz_full, &arr);
     anchor_voiced_phone_f0(&mut note_hz_full, &arr);
