@@ -349,7 +349,7 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     consonantValley: clampNum(p.consonantValley ?? NaN, 0, 2, DEFAULT_CONSONANT_VALLEY),
     // S84 E 刀: vowel clarity toggle — only false is stored (absent≡true, autoTuneFollow pattern).
     ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
-    // S89 「自动咬字时序」 — same fold: only false is stored (absent≡true = the S83 onset pre-roll).
+    // S89 「自动音素时序」 — same fold: only false is stored (absent≡true = the S83 onset pre-roll).
     ...(p.consonantPreroll === false ? { consonantPreroll: false } : {}),
   };
 }

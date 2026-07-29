@@ -141,7 +141,7 @@ fn mg_f0shift_env(shift: i64, cents: &[f32]) -> (i64, Option<Vec<f32>>) {
     (f0shift, Some(cents.iter().map(|&c| c + (f0shift * 100) as f32).collect()))
 }
 
-/// S89 「自動咬字時序」 probe switch: `UTAI_MG_PREROLL=0` renders the InNote arm, so the probe can
+/// S89 「自动音素时序」 probe switch: `UTAI_MG_PREROLL=0` renders the InNote arm, so the probe can
 /// A/B the switch on real material with everything else held fixed. ONE reader — every place in this
 /// file that needs the timing must call it, or a post-processing pass would shape one arm's audio
 /// with the other arm's frame layout (review INFO).
@@ -197,7 +197,10 @@ fn mg_lane_dump() {
     let evts = to_evts(&sj.triples);
     let total: i64 = sj.triples.iter().map(|t| t.frames).sum();
     assert_eq!(sj.f0_cents.len() as i64, total, "f0 length vs Σframes");
-    let arr = build_arrays_daw(&evts, &NoDicts, ArticulationTiming::Auto).unwrap();
+    // S89: the lane dump is THE way to inspect an allocation without rendering, so it has to be
+    // able to show BOTH articulation arms (`UTAI_MG_PREROLL=0` = the in-note arm).
+    let timing = mg_timing_env();
+    let arr = build_arrays_daw(&evts, &NoDicts, timing).unwrap();
     let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
     // 生产 f0 整形三连(render_score_rvc 同款;transpose 0)——hz 即模型真实吃到的 f0,
     // 归零窗/借帧锚定的落点不重算、直接数。
@@ -232,12 +235,31 @@ fn mg_lane_dump() {
             j
         })
         .collect();
-    let out = Path::new(WORK).join("probe").join("mg_lane.json");
+    // per-event totals: under the in-note arm every event's phones must sum to that event's OWN
+    // frames — the defining property of "nothing is borrowed across a note boundary". Dumped here so
+    // the check can be made on REAL material without re-deriving anything outside production code.
+    let mut per_evt = vec![0i64; sj.triples.len()];
+    for (i, &e) in arr.evt.iter().enumerate() {
+        per_evt[e] += arr.phone_dur[i];
+    }
+    let crossings: Vec<_> = (0..sj.triples.len())
+        .filter(|&k| per_evt[k] != sj.triples[k].frames)
+        .map(|k| serde_json::json!({ "k": k, "lyric": sj.triples[k].lyric, "own": sj.triples[k].frames, "got": per_evt[k] }))
+        .collect();
+    eprintln!(
+        "[mg-lane] timing={timing:?}  phones={}  events crossing their note boundary = {}/{}",
+        arr.phon.len(),
+        crossings.len(),
+        sj.triples.len()
+    );
+    let out = Path::new(WORK)
+        .join("probe")
+        .join(format!("mg_lane{}.json", mg_preroll_tag()));
     std::fs::write(
         &out,
         serde_json::to_string(&serde_json::json!({
             "tempo": sj.tempo, "total_frames": total, "notes": notes, "phones": phones,
-            "f0_hz": hz,
+            "f0_hz": hz, "timing": format!("{timing:?}"), "boundary_crossings": crossings,
         }))
         .unwrap(),
     )

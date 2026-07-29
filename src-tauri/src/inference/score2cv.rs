@@ -671,7 +671,7 @@ pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
 }
 
 /// S89: WHERE a note's onset consonants get their frames — the ② render's per-track
-/// 「自动咬字时序」 switch (`VocalTrackParams.consonantPreroll`).
+/// 「自动音素时序」 switch (`VocalTrackParams.consonantPreroll`).
 ///
 /// ⚠ This is NOT "S83 allocator vs the legacy `split_dur`". `split_dur` is the Phase-1c parity port
 /// and it is **not frame-conserving** (`split_dur(2, 5) == [1,1,1,1,1]`, Σ 5 > 2 frames). Σ phone_dur
@@ -1572,7 +1572,7 @@ mod tests {
         assert_eq!(tiny.phone_dur.iter().sum::<i64>(), 13, "still frame-conserving");
     }
 
-    // ─── S89 「自动咬字时序」 OFF (ArticulationTiming::InNote) ───
+    // ─── S89 「自动音素时序」 OFF (ArticulationTiming::InNote) ───
     //
     // Every expected number below is hand-derived from the priors table + the allocator's stated
     // rules, NOT copied from a run (S87: two of my expectations were wrong and the TEST caught the

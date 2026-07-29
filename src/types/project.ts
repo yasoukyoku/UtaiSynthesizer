@@ -315,7 +315,7 @@ export interface VocalTrackParams {
    *  Absent/true = ON (the production default; a REAL measured win — F1 646→836 on the S84 ま
    *  case); stored ONLY as false (absent≡true, the autoTuneFollow fold pattern). */
   vowelClarity?: boolean;
-  /** S89 「自动咬字时序」: onset consonants are PRE-ROLLED ahead of the beat (borrowed from the
+  /** S89 「自动音素时序」: onset consonants are PRE-ROLLED ahead of the beat (borrowed from the
    *  previous phone) so the vowel lands ON the beat — what real singing does, what the training data
    *  annotates, and what a UTAU voicebank's oto preutterance does. `false` keeps every phone INSIDE
    *  its own note: a UTAU CVVC/VCCV alias score is written in TRANSITION units whose author already

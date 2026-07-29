@@ -624,7 +624,7 @@ pub struct ScoreShaping {
     pub consonant_valley_scale: f32,
     /// S84 E 刀: vowel-clarity articulation oversampling (cv-domain).
     pub vowel_clarity: bool,
-    /// S89 「自动咬字时序」: `true` = S83 onset pre-roll (the nucleus lands on the beat);
+    /// S89 「自动音素时序」: `true` = S83 onset pre-roll (the nucleus lands on the beat);
     /// `false` = every phone stays inside its own note. See `score2cv::ArticulationTiming`.
     pub consonant_preroll: bool,
 }

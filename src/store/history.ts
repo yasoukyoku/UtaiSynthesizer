@@ -163,7 +163,7 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const cvl = (p.consonantValley ?? DEFAULT_CONSONANT_VALLEY) !== DEFAULT_CONSONANT_VALLEY ? `|cvl:${p.consonantValley}` : "";
   // S84 E 刀: only the OFF state enters the sig (absent≡true folds out — existing bakes stay clean).
   const vcl = p.vowelClarity === false ? "|vcl:0" : "";
-  // S89 「自动咬字时序」: same fold — absent≡ON hashes identically to the pre-switch string, so no
+  // S89 「自动音素时序」: same fold — absent≡ON hashes identically to the pre-switch string, so no
   // existing bake is invalidated by adding the knob (and SCORE_TIMING_VERSION stays at s88).
   const cpr = p.consonantPreroll === false ? "|cpr:0" : "";
   // S88 — the two lyric triggers enter through the CANONICALIZER, not raw. `restTokenKey`/`breathTokenKey`

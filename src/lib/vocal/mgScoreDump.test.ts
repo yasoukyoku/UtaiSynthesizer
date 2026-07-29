@@ -32,7 +32,11 @@ describe.skipIf(!process.env.UTAI_MG_DUMP)("MG score dump (diagnostic, not a gat
   it("dumps production triples + default-tuning f0 for the Mother Goose UST", async () => {
     const fs = await importFs();
     const join = (...parts: string[]) => parts.join("\\");
-    const notesPath = join(PROBE_DIR, "mg_notes.json");
+    // S89: `UTAI_MG_NOTES` / `UTAI_MG_OUT` point the dump at any notes file in the same shape, so a
+    // score exported straight out of the running app can be pushed through the SAME production
+    // buildVocalScore — verifying on real user material without re-deriving triples anywhere.
+    const notesPath = process.env.UTAI_MG_NOTES ?? join(PROBE_DIR, "mg_notes.json");
+    const outPath = process.env.UTAI_MG_OUT ?? join(PROBE_DIR, "mg_score.json");
     expect(fs.existsSync(notesPath), `missing ${notesPath} (run dump_mg_notes first)`).toBe(true);
     const meta = JSON.parse(fs.readFileSync(notesPath, "utf-8"));
     const tempo: number = meta.bpm ?? 222;
@@ -56,9 +60,6 @@ describe.skipIf(!process.env.UTAI_MG_DUMP)("MG score dump (diagnostic, not a gat
       `[mgdump] ${meta.n_notes} notes -> ${triples.length} triples, ${sum} frames ` +
       `(${(sum / 50).toFixed(2)}s @50fps), voiced ${voicedN}/${sum}, tempo ${tempo}`,
     );
-    fs.writeFileSync(
-      join(PROBE_DIR, "mg_score.json"),
-      JSON.stringify({ name: "mg", tempo, triples, f0Cents, f0Voiced }),
-    );
+    fs.writeFileSync(outPath, JSON.stringify({ name: "mg", tempo, triples, f0Cents, f0Voiced }));
   });
 });

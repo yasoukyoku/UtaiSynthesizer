@@ -1480,7 +1480,7 @@ pub struct VocalRenderOptions {
     /// inflated S2CV duration and resample back, so fast-run vowels reach their articulation
     /// target (「渲染长音素再缩短」, cv-domain). Absent → true (the production default).
     pub vowel_clarity: bool,
-    /// S89 「自动咬字时序」: onset consonants are pre-rolled before the beat (S83 crown knife) so the
+    /// S89 「自动音素时序」: onset consonants are pre-rolled before the beat (S83 crown knife) so the
     /// nucleus lands ON the beat. `false` keeps every phone inside its own note — for UTAU CVVC/VCCV
     /// alias scores, whose author already moved the consonants ahead by hand, pre-rolling would apply
     /// that head start twice. Absent (old frontends) → true (the production default).

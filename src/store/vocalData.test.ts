@@ -522,7 +522,7 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     expect(vocalParamsSig({ ...sigBase, restToken: "X" }, true)).not.toBe(vocalParamsSig({ ...sigBase, breathToken: "X" }, true));
   });
 
-  // ── S89 「自动咬字时序」 in the render signature ──
+  // ── S89 「自动音素时序」 in the render signature ──
   it("★ consonantPreroll folds OUT at its default and DOES enter the sig when turned off", () => {
     // The default (ON) must hash byte-for-byte like the pre-switch string — otherwise adding this knob
     // silently invalidates every bake that ships today. Pinned against the LITERAL for the same reason
