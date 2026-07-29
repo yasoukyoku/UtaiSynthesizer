@@ -405,7 +405,7 @@ The column on the editor's left has four tool buttons (click to switch):
 
 **Grid**: the row of buttons labeled "Grid" at the editor's top: `1/4`, `1/8` (default), `1/16`, `1/8T`, `1/16T`, `1/12` — the T variants are triplet grids (1/8T = 3 per beat, 1/16T = 6 per beat), and `1/12` is the finest unit (12 per beat). The grid decides **where new notes land and how long they are**, plus the arrow keys' nudge step; moving/resizing existing notes steps by 1/12 beat regardless of the grid — you never need to switch grids just to fine-tune. Canvas lines have a clear hierarchy: bar lines are thickest, then beat lines, then subdivision lines; a snapped vertical guide follows the mouse.
 
-**Snapping (the magnet button, left of the grid buttons)**: on by default. Turn it **off** and notes are placed, moved and resized **continuously** — no grid at all. The grid lines stay on screen either way; with snapping off they are a reference, not a magnet. Turn it off when a score's timing was authored off-grid on purpose — a UTAU CVVC .ust, for example, shifts note starts by hand as preutterance compensation, and snapping would destroy exactly that. With snapping **on**, dragging a note now lands it **on** a grid line (previously the drag moved it by whole cells, so a note that was already off-grid could never get back onto it). The setting is remembered across sessions. ⚠ When you import such a score, that same authoring intent also needs **"Automatic phoneme timing" turned off** in the sidebar (see 5.10) — otherwise we move the consonants ahead of the beat a second time, on top of the head start the author already built in.
+**Snapping (the magnet button, left of the grid buttons)**: on by default. Turn it **off** and notes are placed, moved and resized **continuously** — no grid at all. The grid lines stay on screen either way; with snapping off they are a reference, not a magnet. Turn it off when a score's timing was authored off-grid on purpose — a UTAU CVVC .ust, for example, carves each word-final consonant onto its own 45-60 tick note, and those cut points do not sit on the grid; snapping would destroy exactly that. With snapping **on**, dragging a note now lands it **on** a grid line (previously the drag moved it by whole cells, so a note that was already off-grid could never get back onto it). The setting is remembered across sessions.
 
 **Scrolling and zooming** (note the axes differ from the arrangement view):
 
@@ -490,6 +490,37 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 > (as in `[ah n]` = "an"); write `ah1` (or `ah2`) when you want ʌ. Phonetic hints and ARPAsing reclists never
 > carry stress digits, and `AH0` is 88.7% of all AH in the dictionary; mis-reading ə as ʌ also shifts where the
 > word sounds stressed, which is the more audible error. Writing `ax` gives you ə as well.
+
+> **Phoneme conventions (English UTAU scores)**: a UST written for an English UTAU voicebank usually
+> carries neither words nor bracket hints, but that bank's **sample aliases** — `-aI` / `e@n` / `y uw` /
+> `&m` / `1ng-`. The **Phoneme convention** dropdown in the sidebar's Language section tells the app
+> which convention this track is written in:
+>
+> | Convention | What an alias looks like | Who uses it |
+> | --- | --- | --- |
+> | Words (dictionary) | `love`, `[l ah v]` | the default — ordinary lyrics |
+> | ARPAsing | `- ay` `ae n` `y uw` `ow -` | OpenUtau ARPAsing banks |
+> | X-SAMPA / GrayGlish | `-aI` `e@n` `ju` `N-` | GraySlate's GrayGlish banks |
+> | VCCV English | `-&` `&m` `yo` `1ng-` | CZ's VCCV English banks |
+>
+> - **English notes only** (all three are English reclists); ja/zh notes on the same track keep their
+>   own dictionaries.
+> - **A bracket hint and a per-note phoneme override still win** — pin one note's pronunciation with
+>   `[k ae t]` exactly as before.
+> - In an alias, a leading `-` means "from silence", a trailing `-` means "into silence", and a leading
+>   `_` marks a recording variant. None of the three is a sound.
+> - An alias the convention cannot read is marked **red, loudly** (the error names the convention and
+>   the lyric) and **never falls back to the dictionary**: a third of these aliases are also real
+>   English words (`ju`, `to`, `E`, `O`), so a fallback would silently sing a different one.
+> - With an alias convention selected, whatever you type stays on **one note** — no space-splitting
+>   across the following notes (every ARPAsing alias contains a space).
+> - ⚠ Banks within one convention still differ in spelling. Our tables were derived from **three
+>   parallel scores of the same song** (ARPAsing / X-SAMPA / VCCV, 527 notes aligned one to one), with
+>   symbols the corpus never used filled in from the published charts. If a sound comes out wrong, the
+>   quickest fix is to replace that note with a bracket hint.
+> - ⚠ Some scores spell θ (think) and ð (the) with the SAME symbol (`T` in X-SAMPA, `th` in VCCV); we
+>   read it as the **voiceless** one. For the voiced one write `D` (X-SAMPA) / `dh` (VCCV), or use a
+>   bracket hint.
 
 > Caution: switching languages can make existing lyrics "unpronounceable" — see OOV in the next section.
 
@@ -588,7 +619,9 @@ RVC models:
 
 **"Automatic phoneme timing"**: **on** by default. With it on, a syllable's opening consonant is sung *ahead* of the beat so the vowel lands on it — what real singers do, what the training data annotates, and what a UTAU voicebank's preutterance does.
 
-When to turn it off: **importing a UTAU CVVC / VCCV phoneme score**. Those notes are transition units whose author already moved the consonants ahead by hand; moving them again applies the same head start twice. With it off, every phone is allotted time inside its own note and nothing is ever borrowed from the previous one — the positions the author placed do not move at all.
+When to turn it off: when you simply want every phone to stay strictly inside its own note. With it off, each phone is allotted time inside its own note and nothing is ever borrowed from the previous one — a note starts sounding exactly where it sits.
+
+⚠ **v0.12 correction**: this used to read "turn it off when importing a UTAU CVVC / VCCV phoneme score". **That was wrong** and has been corrected. UTAU keeps a note's pre-utterance in the note's own `PreUtterance` field, and the engine moves the SAMPLE, never the note's position; measured across the four reference USTs, the median start offset against every plausible grid is exactly **0**, with no ordering by consonant length. The head start is therefore applied once (by us) — **leave this ON for alias scores too**.
 
 The cost, stated plainly: the consonant now has to come out of *this note's* own duration, so it can never take more than half of it, and on a note too short to spare even 2 frames (40 ms) that consonant is dropped. To see exactly how a note was divided, open the phoneme lane (see 5.9) — it redraws the moment you flip the switch, and you can see at a glance whether the consonant block sits left or right of the beat line.
 
@@ -1147,7 +1180,7 @@ This chapter covers importing scores, and exporting audio and scores — includi
 
 "File" → "Import Score", then pick a .ustx / .ust / .mid / .midi file. Importing is **additive** — it only creates new vocal tracks and never overwrites your existing content.
 
-**Rounding option**: after the file is parsed, a small dialog asks whether to **round note boundaries to the nearest 1/12 beat**, and shows how many of this file's notes are off that grid so the choice is informed. It is **on by default** and is what you want for most scores — it also rescues notes so short they would not sound at all. Turn it **off** for a score whose timing was authored off-grid on purpose (a UTAU CVVC .ust: rounding would move most of its notes). A track carrying baked ustx pitch tuning is never rounded — its curve is keyed to the original note timing — and the dialog reports that. Whatever rounding changes is reported afterwards, note by note count. ⚠ Turning rounding off only *preserves* the positions the author placed; to have us actually sing *to* them you must also turn off "Automatic phoneme timing" in the sidebar (see 5.10), or the consonants get a second head start anyway.
+**Rounding option**: after the file is parsed, a small dialog asks whether to **round note boundaries to the nearest 1/12 beat**, and shows how many of this file's notes are off that grid so the choice is informed. It is **on by default** and is what you want for most scores — it also rescues notes so short they would not sound at all. Turn it **off** for a score whose timing was authored off-grid on purpose (a UTAU CVVC .ust: rounding would move most of its notes). A track carrying baked ustx pitch tuning is never rounded — its curve is keyed to the original note timing — and the dialog reports that. Whatever rounding changes is reported afterwards, note by note count.
 
 **Kept**: notes (position/duration/pitch/lyric — rounded to the 1/12 grid only if you leave the option on), the file's first BPM and time signature (if present, they override the project's globals), each track's start position, and ustx **pitch tuning** (see below). Each non-empty track of a multi-track file becomes its own vocal track. .ust files auto-detect Shift-JIS / UTF-8; lyrics R/r/empty are treated as rests.
 
