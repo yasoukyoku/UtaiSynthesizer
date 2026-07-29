@@ -1285,9 +1285,9 @@ pub async fn render_candidate_scale(
                 };
                 crate::inference::score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
-                    crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
-                    crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
-                    true /* S84 E vowel clarity: production default */,
+                    // no per-track context here — the production defaults ARE the audition contract
+                    // (audition_cache_tag pins them; see this file's tag constants).
+                    crate::inference::score2svc::ScoreShaping::default(),
                     0, 0, None, None, None, &cancel, &progress,
                 )
                 .map_err(|e| e.to_string())?
@@ -1328,9 +1328,8 @@ pub async fn render_candidate_scale(
                 crate::inference::score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, 49, &g2p::GlobalDicts, &options,
                     crate::commands::inference::VOCAL_FLAT_VOL,
-                    crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
-                    crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
-                    true /* S84 E vowel clarity: production default */,
+                    // no per-track context here — see the RVC arm above.
+                    crate::inference::score2svc::ScoreShaping::default(),
                     0, 0, None, None, None,
                     &cancel, &progress,
                 )

@@ -42,6 +42,17 @@ const SEGMENTS: [&str; 2] = ["verse", "chorus"];
 /// ScoreToCV 条件 speaker(生产默认 49 = kiritan,DEFAULT_VOCAL_PARAMS.speakerId)。
 const CV_SPEAKER: i64 = 49;
 
+/// EVERY E1 arm renders with all output-domain / cv-domain shaping stages OFF: an aesthetic stage
+/// would contaminate the stream attribution this probe exists to measure. `0.0` emphasis and `0.0`
+/// valley are bit-exact no-ops; clarity off is the plain `run_score2cv` call. Preroll (S89) stays at
+/// the production default — it is a TIMING fact of the arrays, not an output-domain stage, and the
+/// arms must keep comparing the same phone layout.
+const NEUTRAL_SHAPING: ScoreShaping = ScoreShaping {
+    consonant_emphasis_db: 0.0,
+    consonant_valley_scale: 0.0,
+    vowel_clarity: false,
+};
+
 #[derive(serde::Deserialize)]
 struct ScoreJson {
     name: String,
@@ -494,7 +505,7 @@ fn e1_cross_probe() {
                 let t0 = Instant::now();
                 let r = render_score_sovits(
                     &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
-                    0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, false /* S84 E: vowel clarity OFF likewise */, 0, 0,
+                    NEUTRAL_SHAPING, 0, 0,
                     Some(&vf0), None, None, &no_cancel, &noop,
                 )
                 .unwrap();
@@ -516,7 +527,7 @@ fn e1_cross_probe() {
                     let t0 = Instant::now();
                     let r = render_score_sovits(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
-                        0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, false /* S84 E: vowel clarity OFF likewise */, 0, 0,
+                        NEUTRAL_SHAPING, 0, 0,
                         Some(vk), None, None, &no_cancel, &noop,
                     )
                     .unwrap();
@@ -591,7 +602,7 @@ fn e1_cross_probe() {
             if enabled(&arms_filter, "D") && !exists(&arm("D_s2cv_paramF0")) {
                 let t0 = Instant::now();
                 let r = render_score_rvc(
-                    &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, false /* S84 E: vowel clarity OFF likewise */, 0, 0, Some(&vf0), None,
+                    &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, NEUTRAL_SHAPING, 0, 0, Some(&vf0), None,
                     None, &no_cancel, &noop,
                 )
                 .unwrap();
@@ -610,7 +621,7 @@ fn e1_cross_probe() {
                 if enabled(&arms_filter, "K") && !exists(&arm(&karm)) {
                     let t0 = Instant::now();
                     let r = render_score_rvc(
-                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, 0.0 /* S83: emphasis OFF in ALL arms — an output-domain aesthetic stage would contaminate stream attribution; 0.0 is a bit-exact no-op */, 0.0 /* S84: consonant valley OFF likewise (same purity rule) */, false /* S84 E: vowel clarity OFF likewise */, 0, 0, Some(vk),
+                        &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, NEUTRAL_SHAPING, 0, 0, Some(vk),
                         None, None, &no_cancel, &noop,
                     )
                     .unwrap();

@@ -603,6 +603,39 @@ fn pad_sovits_feed(feed: &mut SovitsFeed, min: usize) -> usize {
     orig
 }
 
+/// The ② render's SCORE-SHAPING knobs, as ONE named argument.
+///
+/// ⚠ These used to ride as positional parameters on `render_score_{sovits,rvc}` — already two
+/// adjacent `f32`s, and the next knob queued behind them is a `bool` that would have landed right
+/// next to `vowel_clarity`. S85 paid for that shape once already — a same-typed tuple silently
+/// permuted across a function boundary, was
+/// invisible to both human review and a 3-finder audit, and shipped as "+7512 st". The rule that
+/// came out of it (`[[project_v2_session85]]`): **≥2 same-typed semantic fields must be a named
+/// struct, so the contract is enforced by the compiler.** Add knobs HERE, never as new positionals.
+///
+/// Every field's DEFAULT is the production default, so `ScoreShaping::default()` is exactly what a
+/// no-track-context path (model audition) wants — and `..Default::default()` keeps a new knob from
+/// silently landing as `false`/`0.0` at the paths nobody remembered to update.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreShaping {
+    /// S83 knife 6b: voiceless-onset emphasis, dB (0 = exact no-op).
+    pub consonant_emphasis_db: f32,
+    /// S84 C 刀: chain-internal consonant-valley scale ×measured depth (0 = exact no-op).
+    pub consonant_valley_scale: f32,
+    /// S84 E 刀: vowel-clarity articulation oversampling (cv-domain).
+    pub vowel_clarity: bool,
+}
+
+impl Default for ScoreShaping {
+    fn default() -> Self {
+        ScoreShaping {
+            consonant_emphasis_db: DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
+            consonant_valley_scale: DEFAULT_CONSONANT_VALLEY_SCALE,
+            vowel_clarity: true,
+        }
+    }
+}
+
 /// Full score → SoVITS wav (自己唱). build_arrays_daw (rests uncapped → stem aligns to the timeline) →
 /// SP-chunk (≤400) → per chunk: run_score2cv → cv; f0 from `build_note_hz` (bare noteonly when `f0` is
 /// None, else the DAW's layered Option-A pitch); resample to the hop grid; cluster/retrieval blend; then
@@ -622,9 +655,7 @@ pub fn render_score_sovits(
     dicts: &dyn g2p::DictSource,
     options: &SovitsOptions,
     flat_vol: f32,
-    consonant_emphasis_db: f32,
-    consonant_valley_scale: f32,
-    vowel_clarity: bool,
+    shaping: ScoreShaping,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -658,15 +689,15 @@ pub fn render_score_sovits(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
-    let emphasis_gain = if consonant_emphasis_db.is_finite() && consonant_emphasis_db > 0.0 {
-        10f32.powf(consonant_emphasis_db.min(12.0) / 20.0)
+    let emphasis_gain = if shaping.consonant_emphasis_db.is_finite() && shaping.consonant_emphasis_db > 0.0 {
+        10f32.powf(shaping.consonant_emphasis_db.min(12.0) / 20.0)
     } else {
         1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
-    let valley_scale = if consonant_valley_scale.is_finite() && consonant_valley_scale > 0.0 {
-        consonant_valley_scale.min(2.0)
+    let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
+        shaping.consonant_valley_scale.min(2.0)
     } else {
         0.0
     };
@@ -681,7 +712,7 @@ pub fn render_score_sovits(
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
         // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
-        let cv = if vowel_clarity {
+        let cv = if shaping.vowel_clarity {
             run_score2cv_vowel_clarity(
                 m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
                 &arr.evt[chunk.start..chunk.end], dim, cv_speaker_id, chunk.lang_id,
@@ -802,9 +833,7 @@ pub fn render_score_rvc(
     cv_speaker_id: i64,
     dicts: &dyn g2p::DictSource,
     options: &RvcOptions,
-    consonant_emphasis_db: f32,
-    consonant_valley_scale: f32,
-    vowel_clarity: bool,
+    shaping: ScoreShaping,
     transpose: i64,
     range_shift: i64,
     f0: Option<&VocalF0>,
@@ -829,15 +858,15 @@ pub fn render_score_rvc(
     transpose_note_pitch(&mut arr.note_pitch, transpose_eff);
     let chunks = chunk_at_sp(&arr, 400);
     let vl_onset = voiceless_onset_flags(&arr);
-    let emphasis_gain = if consonant_emphasis_db.is_finite() && consonant_emphasis_db > 0.0 {
-        10f32.powf(consonant_emphasis_db.min(12.0) / 20.0)
+    let emphasis_gain = if shaping.consonant_emphasis_db.is_finite() && shaping.consonant_emphasis_db > 0.0 {
+        10f32.powf(shaping.consonant_emphasis_db.min(12.0) / 20.0)
     } else {
         1.0 // 0/invalid = exact no-op (×1.0 is bit-transparent)
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
-    let valley_scale = if consonant_valley_scale.is_finite() && consonant_valley_scale > 0.0 {
-        consonant_valley_scale.min(2.0)
+    let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
+        shaping.consonant_valley_scale.min(2.0)
     } else {
         0.0
     };
@@ -856,7 +885,7 @@ pub fn render_score_rvc(
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
         // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
-        let cv = if vowel_clarity {
+        let cv = if shaping.vowel_clarity {
             run_score2cv_vowel_clarity(
                 m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
                 &arr.evt[chunk.start..chunk.end], dim, cv_speaker_id, chunk.lang_id,
@@ -2014,19 +2043,29 @@ mod tests {
             }
         }
 
+        // These wavs are the ARCHIVED ear-A/B baselines: they predate the S84 valley and clarity
+        // knives, so both stay OFF here and only the emphasis knob rides at its production default.
+        // Keeping the deviation in ONE named value (instead of re-typing the same two literals +
+        // comment on every call) is what makes it obvious these are NOT production settings.
+        let baseline_shaping = ScoreShaping {
+            consonant_emphasis_db: DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
+            consonant_valley_scale: 0.0,
+            vowel_clarity: false,
+        };
+
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -2035,7 +2074,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, DEFAULT_VOICELESS_ONSET_EMPHASIS_DB, 0.0 /* S84 valley OFF: these are pre-S84 ear-anchored A/B baselines */, false /* S84 vowel clarity OFF likewise */, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

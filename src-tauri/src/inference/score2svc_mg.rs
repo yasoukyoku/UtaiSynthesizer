@@ -327,7 +327,9 @@ fn mg_render_rvc() {
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts, emph, valley, clarity, tp, rs,
+        &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts,
+        ScoreShaping { consonant_emphasis_db: emph, consonant_valley_scale: valley, vowel_clarity: clarity },
+        tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();
@@ -494,7 +496,9 @@ fn mg_render_sovits() {
     let t0 = Instant::now();
     let r = render_score_sovits(
         &m, &s2cv, &evts, dim, 49, &NoDicts, &sopts,
-        crate::commands::inference::VOCAL_FLAT_VOL, emph, valley, clarity, tp, rs,
+        crate::commands::inference::VOCAL_FLAT_VOL,
+        ScoreShaping { consonant_emphasis_db: emph, consonant_valley_scale: valley, vowel_clarity: clarity },
+        tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
     .unwrap();

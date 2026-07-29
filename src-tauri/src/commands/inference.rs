@@ -1815,19 +1815,21 @@ pub async fn render_vocal_segment(
     let score_owned: Vec<ScoreNote> = score;
     let cv_speaker_id = options.cv_speaker_id;
     let transpose = options.transpose;
-    // knob hygiene: non-finite → default; render treats ≤0 as an exact no-op, cap 12 dB.
-    let consonant_emphasis_db = if options.consonant_emphasis_db.is_finite() {
-        options.consonant_emphasis_db.clamp(0.0, 12.0)
-    } else {
-        crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB
+    // knob hygiene, all in ONE place: non-finite → default; the render treats ≤0 as an exact no-op.
+    let shaping = crate::inference::score2svc::ScoreShaping {
+        consonant_emphasis_db: if options.consonant_emphasis_db.is_finite() {
+            options.consonant_emphasis_db.clamp(0.0, 12.0) // cap 12 dB
+        } else {
+            crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB
+        },
+        // S84 C 刀 knob hygiene: same policy, scale capped [0, 2] (render skips the stage at ≤0).
+        consonant_valley_scale: if options.consonant_valley.is_finite() {
+            options.consonant_valley.clamp(0.0, 2.0)
+        } else {
+            crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE
+        },
+        vowel_clarity: options.vowel_clarity, // S84 E 刀 toggle (bool — nothing to sanitize)
     };
-    // S84 C 刀 knob hygiene: same policy, scale capped [0, 2] (render skips the stage at ≤0).
-    let consonant_valley = if options.consonant_valley.is_finite() {
-        options.consonant_valley.clamp(0.0, 2.0)
-    } else {
-        crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE
-    };
-    let vowel_clarity = options.vowel_clarity; // S84 E 刀 toggle (bool — nothing to sanitize)
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
     match backend_type {
@@ -1933,7 +1935,7 @@ pub async fn render_vocal_segment(
                 let base_progress = |p: f32| progress(p / range_passes as f32);
                 let mut result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
+                    VOCAL_FLAT_VOL, shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
                 )
                 .map_err(|e| e.to_string())?;
                 // S85 dead-only: donor 全曲渲染在 range_shift=s(函数内部逆变换回写谱位 +
@@ -1951,7 +1953,7 @@ pub async fn render_vocal_segment(
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_sovits(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                            VOCAL_FLAT_VOL, consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                            VOCAL_FLAT_VOL, shaping, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
                         )
                         .map(|r| r.audio)
                     })
@@ -2018,7 +2020,7 @@ pub async fn render_vocal_segment(
                 let base_progress = |p: f32| progress(p / range_passes as f32);
                 let mut result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
+                    shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
                 )
                 .map_err(|e| e.to_string())?;
                 // S85 dead-only(镜像 SoVits 臂,机理注释见彼处)。
@@ -2032,7 +2034,7 @@ pub async fn render_vocal_segment(
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_rvc(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                            consonant_emphasis_db, consonant_valley, vowel_clarity, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                            shaping, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
                         )
                         .map(|r| r.audio)
                     })
