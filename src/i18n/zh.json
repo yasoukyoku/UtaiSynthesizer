@@ -657,6 +657,8 @@
       "noteLang": "选中音符",
       "noteLangTip": "只对选中的音符生效；「跟随轨道」即使用上面的轨道默认语言。",
       "langFollow": "跟随轨道",
+      "phonemeHint": "英文可在歌词里写方括号音素提示，如 [dh ae dh]",
+      "phonemeHintTip": "在方括号里直接写 ARPABET 音素（OpenUtau 约定），这个音符就按它发音；read[r iy d] 这样的写法也可以，多音节的提示会像普通单词一样分配到后面的 + 音符上。ARPABET 不带重音数字时一律按「不重读」处理：裸 ah 读作 ə，要 ʌ 请写 ah1。括号里写不出音素（空的、或写成单词）会标红，不会被当歌词唱出来。",
       "noteTransition": "音符间过渡",
       "selectNoteHint": "选择音符以编辑",
       "vibrato": "颤音",

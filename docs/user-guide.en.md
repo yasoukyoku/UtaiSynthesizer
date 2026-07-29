@@ -453,6 +453,22 @@ The editor's view is independent of the arrangement view's zoom/scroll. On openi
 
 Lyrics are single-line, at most 64 characters; clearing a lyric falls back to the track language's default lyric.
 
+**Phonetic hints (square brackets)**: writing `[dh ae dh]` as the lyric pins the phonemes that note sings and
+skips the dictionary — this is the OpenUtau convention, and English UST files written for UTAU/OpenUtau use it
+heavily. The `word[hint]` form (`read[r iy d]`) is accepted too: the hint is what gets sung, the word is there
+for you to read. A multi-syllable hint spreads over the following `+` notes exactly like a dictionary word.
+
+- The brackets must be a PAIR that CLOSES the lyric. `[k aa}` (missing `]`), `[k].` (trailing punctuation)
+  and `[[k]]` are deliberately NOT guessed at — each is marked OOV in red. The full-width `［］` a CJK IME
+  produces is recognised as well.
+- **Only phonemes belong inside the brackets.** An empty `[]`, or a WORD (the `[Chorus]` / `[Verse 1]`
+  section markers that come with pasted lyric sheets), is marked red — it is never sung as a lyric.
+  Delete such a note, or turn it into a rest `R`.
+- What is inside is read in THAT NOTE's language, by the same rule as the phoneme-override layer:
+  English/German/French/Spanish/Italian = space-separated phonemes (ARPABET for English); Chinese =
+  pinyin initial+final when spaced, a whole pinyin syllable when not; Japanese = the phonemes themselves
+  when spaced, one kana / romaji mora when not. An unknown phoneme is a loud OOV as well.
+
 ### 5.5 Seven languages: track default and per-note override
 
 Seven languages are supported; the language decides how lyrics turn into phonemes:
@@ -460,7 +476,7 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 | Badge | Language | Lyric-writing hint |
 | --- | --- | --- |
 | ZH | Chinese | Write hanzi directly; heteronyms auto-disambiguate by phrase context |
-| EN | English | Write by word; span multi-syllable words across notes with `+` |
+| EN | English | Write by word; span multi-syllable words across notes with `+`; or write phonemes directly as `[dh ae dh]` (see 5.4) |
 | JA | Japanese | Hiragana/katakana; small-kana combos handled automatically (the default language) |
 | DE | German | Write by word, continue syllables with `+` |
 | FR | French | Same as above |
@@ -469,6 +485,11 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 
 - **Track default language**: a new vocal track defaults to Japanese (JA). Two ways to change it — click the two-letter badge next to the singer avatar in the track header (e.g. "JA") for a seven-language menu; or change "Track default" in the sidebar "Singer" tab's "Language" section.
 - **Per-note override**: select some notes and give them their own language in the "Selected notes" dropdown of the sidebar "Language" section; choosing "Follow track" clears the override. Mixing several languages inside one clip is fully supported.
+
+> **English stress digits**: ARPABET written WITHOUT a stress digit is treated as UNSTRESSED — a bare `ah` is ə
+> (as in `[ah n]` = "an"); write `ah1` (or `ah2`) when you want ʌ. Phonetic hints and ARPAsing reclists never
+> carry stress digits, and `AH0` is 88.7% of all AH in the dictionary; mis-reading ə as ʌ also shifts where the
+> word sounds stressed, which is the more audible error. Writing `ax` gives you ə as well.
 
 > Caution: switching languages can make existing lyrics "unpronounceable" — see OOV in the next section.
 

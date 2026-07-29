@@ -370,6 +370,19 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             </select>
           )}
         </div>
+        {/* S90: the ONE in-app place the English phoneme conventions are stated. Two things here are
+            otherwise silent: that a lyric may carry an OpenUtau phonetic hint at all, and that ARPABET
+            written WITHOUT a stress digit (which is how ARPAsing reclists and OpenUtau hints are always
+            written) is read as UNSTRESSED — so a bare `ah` sings ə. The manual (§5.4/§5.5) carries the
+            long version, including the other six languages' bracket semantics.
+            Shown whenever ENGLISH is in play — track default OR any selected note's override, since a
+            per-note `en` on a JA track is exactly when a user meets ARPABET without expecting it. */}
+        {(langById(vocalParams.langId).code === "en" ||
+          selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "en")) && (
+          <div className="vsb-hint" title={t("vocalEditor.sidebar.phonemeHintTip")}>
+            {t("vocalEditor.sidebar.phonemeHint")}
+          </div>
+        )}
       </div>
 
       {/* ⓪.5 音质 (Item-1): the singer's quality knobs — SoVITS = cluster + shallow diffusion + NSF

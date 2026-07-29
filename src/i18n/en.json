@@ -657,6 +657,8 @@
       "noteLang": "Selected notes",
       "noteLangTip": "Applies only to the selected notes; \"Follow track\" uses the track default above.",
       "langFollow": "Follow track",
+      "phonemeHint": "English lyrics may carry a phonetic hint, e.g. [dh ae dh]",
+      "phonemeHintTip": "Put ARPABET phonemes in square brackets (the OpenUtau convention) and the note sings exactly those; read[r iy d] works too, and a multi-syllable hint spreads over the following + notes like an ordinary word. ARPABET written WITHOUT a stress digit is read as unstressed: a bare ah is ə — write ah1 for ʌ. Brackets that hold no valid phonemes (empty, or a word) are marked red and never sung as a lyric.",
       "noteTransition": "Note transition",
       "selectNoteHint": "Select a note to edit",
       "vibrato": "Vibrato",
