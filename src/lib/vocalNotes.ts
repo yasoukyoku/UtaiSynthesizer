@@ -385,6 +385,12 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
     // S89 「自动音素时序」 — same fold: only false is stored (absent≡true = the S83 onset pre-roll).
     ...(p.consonantPreroll === false ? { consonantPreroll: false } : {}),
+    // S91 「音素约定」 — an UNKNOWN value from a newer build must land on the DEFAULT (words), never
+    // be carried through: an unrecognised convention would reach Rust, fall back there too, and the
+    // project would silently round-trip a setting that does nothing. Whitelist, not passthrough.
+    ...(p.phonemeSet === "arpasing" || p.phonemeSet === "xsampa" || p.phonemeSet === "vccv"
+      ? { phonemeSet: p.phonemeSet }
+      : {}),
   };
 }
 

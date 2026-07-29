@@ -945,6 +945,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (vp.vowelClarity === true) delete vp.vowelClarity;
         // S89 consonantPreroll 同款极性(默认=开):true 折为 ABSENCE。
         if (vp.consonantPreroll === true) delete vp.consonantPreroll;
+        // S91 「音素约定」:默认 = 按单词查词典,存为 ABSENCE(与 rangeExtend 同款正极性折叠)。
+        if (!vp.phonemeSet || (vp.phonemeSet as string) === "words") delete vp.phonemeSet;
         return { ...t, vocalParams: vp };
       }),
     })),

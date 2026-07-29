@@ -21,6 +21,7 @@ import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackS
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
+import type { PhonemeSetId } from "../../types/project";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
 import { VocoderSelect } from "../workflow/nodes/VoiceModelPicker";
@@ -262,10 +263,13 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(c) => setVocalParams(trackId, { vowelClarity: c })}
           />
         </div>
-        {/* S89 自动咬字时序: the S83 onset pre-roll (consonants ahead of the beat so the vowel lands ON
-            it). Turn OFF for a UTAU CVVC/VCCV alias score — its author already moved the consonants
-            ahead by hand, and pre-rolling again applies the same head start twice. Default ON,
-            absent≡true. The phoneme lane shows the difference immediately. */}
+        {/* S89 自动音素时序: the S83 onset pre-roll (consonants ahead of the beat so the vowel lands ON
+            it). Default ON, absent≡true; the phoneme lane shows the difference immediately.
+            ⚠ S91 correction: S89's advice to turn this OFF for a UTAU CVVC/VCCV score was based on a
+            wrong model of UTAU. Those files carry their pre-utterance in the note's own `PreUtterance`
+            field, which moves the SAMPLE and never the tick — measured on the four reference USTs, the
+            note starts sit on the grid with a median offset of exactly 0 and no ordering by onset
+            length. Our pre-roll is the analogue of preutterance, applied once. Leave it ON. */}
         <div title={t("vocalEditor.sidebar.consonantPrerollTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.consonantPreroll")}
@@ -379,9 +383,34 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             per-note `en` on a JA track is exactly when a user meets ARPABET without expecting it. */}
         {(langById(vocalParams.langId).code === "en" ||
           selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "en")) && (
-          <div className="vsb-hint" title={t("vocalEditor.sidebar.phonemeHintTip")}>
-            {t("vocalEditor.sidebar.phonemeHint")}
-          </div>
+          <>
+            {/* S91 「音素约定」: an English UST written for a UTAU voicebank carries sample ALIASES, not
+                words. It sits in the LANGUAGE section (not the knobs) because it is a property of how
+                this track's English lyrics are SPELLED, and it only ever affects English notes. */}
+            <div className="vsb-inline">
+              <label className="vsb-label" title={t("vocalEditor.sidebar.phonemeSetTip")}>
+                {t("vocalEditor.sidebar.phonemeSet")}
+              </label>
+              <select
+                className="sep-model-select vsb-inline-select"
+                value={vocalParams.phonemeSet ?? "words"}
+                onChange={(e) =>
+                  setVocalParams(trackId, {
+                    phonemeSet: e.target.value === "words" ? undefined : (e.target.value as PhonemeSetId),
+                  })
+                }
+              >
+                {(["words", "arpasing", "xsampa", "vccv"] as const).map((k) => (
+                  <option key={k} value={k}>{t(`vocalEditor.sidebar.phonemeSet_${k}`)}</option>
+                ))}
+              </select>
+            </div>
+            <div className="vsb-hint" title={t("vocalEditor.sidebar.phonemeHintTip")}>
+              {vocalParams.phonemeSet
+                ? t("vocalEditor.sidebar.phonemeSetHint")
+                : t("vocalEditor.sidebar.phonemeHint")}
+            </div>
+          </>
         )}
       </div>
 

@@ -28,6 +28,8 @@ export interface PhonemeLaneInputs {
   langId: number;
   /** S89 「自动咬字时序」: changes WHERE every onset consonant sits. */
   consonantPreroll: boolean;
+  /** S91 「音素约定」: changes WHICH phones every English note has at all. */
+  phonemeSet?: string;
 }
 
 /** The lane's cache key. Cheap: reads the notes' fields directly, no triple building. */
@@ -39,19 +41,30 @@ export function phonemeLaneSig(i: PhonemeLaneInputs): string {
     i.tokens.rest,
     i.tempo,
     i.consonantPreroll,
+    i.phonemeSet ?? "",
   ]);
 }
 
 /** The `preview_vocal_phonemes` payload + the parallel arrays the lane needs to map spans back to notes.
  *  Built from the SAME inputs object as the signature — that is the whole point. */
 export function phonemeLaneRequest(i: PhonemeLaneInputs): {
-  args: { score: ScoreTriple[]; defaultLang: number; consonantPreroll: boolean };
+  args: {
+    score: ScoreTriple[];
+    defaultLang: number;
+    consonantPreroll: boolean;
+    phonemeSet: string | null;
+  };
   tripleNoteIds: (string | null)[];
   ticksPerFrame: number;
 } {
   const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(i.notes, i.tempo, i.tokens, i.langId);
   return {
-    args: { score: triples, defaultLang: i.langId, consonantPreroll: i.consonantPreroll },
+    args: {
+      score: triples,
+      defaultLang: i.langId,
+      consonantPreroll: i.consonantPreroll,
+      phonemeSet: i.phonemeSet ?? null,
+    },
     tripleNoteIds,
     ticksPerFrame,
   };

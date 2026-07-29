@@ -32,6 +32,9 @@ function oovSig(track: Track, seg: Segment, tempo: number): string {
     tk.breath,
     tk.rest, // S88: re-pointing the rest token re-classifies notes (silent ⇄ sung) → verdicts must re-run
     tempo,
+    // S91: the convention decides whether `&m` is an alias or an unknown word — omit it and the red
+    // marks freeze on the previous convention's verdict while the render sings the new one.
+    vp.phonemeSet ?? "",
   ]);
 }
 
@@ -99,6 +102,7 @@ async function validatePass(): Promise<void> {
           const classes = await invoke<Array<{ kind: string }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
             defaultLang: vp.langId,
+            phonemeSet: vp.phonemeSet ?? null,
           });
           // stale guard: the segment changed while we awaited → leave it to the rescheduled pass
           const now = useProjectStore.getState();

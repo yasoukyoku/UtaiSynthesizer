@@ -156,6 +156,24 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     expect(useAppStore.getState().vocalShort[SEG], "…and silence is never 'too short'").toBeUndefined();
   });
 
+  // S91 — same hazard for 「音素约定」: switching it re-decides whether `&m` is an alias or an unknown
+  // word, so it must reach BOTH the sig (or the pass short-circuits on identical bytes and the red
+  // marks freeze on the old convention) and the `validate_lyrics` payload (or the editor judges under
+  // a different convention than the render — the drift resolve_core is shared to prevent).
+  it("★ switching the phoneme convention re-validates, and the payload carries it", async () => {
+    uninstall = installOovWatch();
+    await settle();
+    const before = invokeMock.mock.calls.length;
+    expect(before).toBeGreaterThan(0);
+    expect((invokeMock.mock.calls[before - 1]![1] as { phonemeSet?: unknown }).phonemeSet).toBe(null);
+
+    useProjectStore.getState().setVocalParams("T", { phonemeSet: "vccv" });
+    await settle();
+    expect(invokeMock.mock.calls.length, "the sig must have moved").toBeGreaterThan(before);
+    const last = invokeMock.mock.calls[invokeMock.mock.calls.length - 1]![1] as { phonemeSet?: unknown };
+    expect(last.phonemeSet).toBe("vccv");
+  });
+
   it("clears every channel when the segment goes away", async () => {
     uninstall = installOovWatch();
     await settle();

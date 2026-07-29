@@ -10,7 +10,7 @@ vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 // isVocalDirty resolves the singer via the voice-model store — mock ONE installed "V" so `entry` is found.
 vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () => ({ models: { sovits: [{ name: "V", path: "p" }] } }) } }));
 
-import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
+import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, vocalRenderOptions, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
 import { useProjectStore } from "../../store/project";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note, Track, Segment, ProcessedOutput, VocalTrackParams } from "../../types/project";
@@ -616,5 +616,41 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
     expect(vocalTrackSig(track, 120)).toBe(
       "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s90|st:s88",
     );
+  });
+});
+
+// ── S91: the track-params → wire-options mapping. It was an inline literal with ZERO coverage until
+//    now, which is the shape where a per-track switch silently never reaches Rust: the Rust struct is
+//    `#[serde(default)]`, so a forgotten field lands on the production default while the sidebar shows
+//    the user's choice — "the switch does nothing", no error anywhere. ──
+describe("vocalRenderOptions — every per-track knob must actually reach the wire", () => {
+  const vp = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: DEFAULT_TRANSITION } as const;
+  const base = () => ({ ...vp } as unknown as import("../../types/project").VocalTrackParams);
+
+  it("the DEFAULT payload, pinned", () => {
+    const o = vocalRenderOptions(base());
+    expect({ ...o, sovits: "…", rvc: "…" }).toEqual({
+      backend: "sovits", cv_speaker_id: 49, lang_id: 2, transpose: 0,
+      range_extend: false, consonant_emphasis_db: 2.5, consonant_valley: 1,
+      vowel_clarity: true, consonant_preroll: true, phoneme_set: null,
+      sovits: "…", rvc: "…",
+    });
+  });
+
+  it("★ each knob changes its own field (a dropped one is a switch that silently does nothing)", () => {
+    const cases: Array<[Partial<import("../../types/project").VocalTrackParams>, keyof ReturnType<typeof vocalRenderOptions>, unknown]> = [
+      [{ rangeExtend: true }, "range_extend", true],
+      [{ consonantEmphasis: 0 }, "consonant_emphasis_db", 0],
+      [{ consonantValley: 0 }, "consonant_valley", 0],
+      [{ vowelClarity: false }, "vowel_clarity", false],
+      [{ consonantPreroll: false }, "consonant_preroll", false],
+      [{ phonemeSet: "vccv" }, "phoneme_set", "vccv"],
+      [{ transpose: -3 }, "transpose", -3],
+      [{ langId: 1 }, "lang_id", 1],
+      [{ speakerId: 32 }, "cv_speaker_id", 32],
+    ];
+    for (const [patch, field, want] of cases) {
+      expect(vocalRenderOptions({ ...base(), ...patch })[field], `${field}`).toEqual(want);
+    }
   });
 });

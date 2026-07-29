@@ -13,7 +13,7 @@ import { useProjectStore } from "./project";
 import { useHistoryStore, installHistory, vocalParamsSig } from "./history";
 import { useAppStore } from "./app";
 import { buildSaveBundle, buildAutosaveJson, parseLoadedBundle } from "../lib/project/bundle";
-import { normalizeCurve, resolveOverlaps, sanitizeText, DEFAULT_TRANSITION } from "../lib/vocalNotes";
+import { normalizeCurve, resolveOverlaps, sanitizeText, sanitizeVocalParams, DEFAULT_TRANSITION } from "../lib/vocalNotes";
 import type { Track, Segment, SegmentContent, Note, VocalTrackParams } from "../types/project";
 
 type NotesContent = Extract<SegmentContent, { type: "notes" }>;
@@ -534,6 +534,39 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     expect(vocalParamsSig({ ...sigBase, consonantPreroll: false }, true)).toBe(pinned + "|cpr:0");
     // it is also an undoable track edit on the non-render view
     expect(vocalParamsSig({ ...sigBase, consonantPreroll: false })).not.toBe(vocalParamsSig(sigBase));
+  });
+
+  // ── S91 「音素约定」 in the render signature + the two folds that keep it honest ──
+  it("★ phonemeSet folds OUT at its default and each convention is its OWN signature", () => {
+    // Same literal discipline: the default (words = ABSENT) must hash byte-for-byte like the pre-S91
+    // string, or adding the setting re-renders every bake that ships today for nothing.
+    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0";
+    expect(vocalParamsSig(sigBase, true)).toBe(pinned);
+    // …and every convention is a genuinely different render (it changes what each English note SINGS)
+    const sigs = new Set([pinned]);
+    for (const phonemeSet of ["arpasing", "xsampa", "vccv"] as const) {
+      const s = vocalParamsSig({ ...sigBase, phonemeSet }, true);
+      expect(s, `${phonemeSet} must differ from the default`).not.toBe(pinned);
+      expect(sigs.has(s), `${phonemeSet} collides with another convention`).toBe(false);
+      sigs.add(s);
+      // it is an undoable track edit on the non-render view too
+      expect(vocalParamsSig({ ...sigBase, phonemeSet })).not.toBe(vocalParamsSig(sigBase));
+    }
+  });
+
+  it("★ an UNKNOWN convention from a newer build loads as the default, not as itself", () => {
+    // A value this build cannot honour must not survive the load: Rust would fall back to `words`
+    // anyway, so keeping the string would round-trip a setting that silently does nothing — and the
+    // sidebar would show a convention the render is not using.
+    const withBad = { ...sigBase, phonemeSet: "delta" } as unknown as VocalTrackParams;
+    expect(sanitizeVocalParams(withBad)!.phonemeSet).toBeUndefined();
+    expect(sanitizeVocalParams({ ...sigBase, phonemeSet: "vccv" })!.phonemeSet).toBe("vccv");
+    // …and the sanitizer's fold must equal the store's canonical write, or a save/load flips bytes
+    seed(vocalTrack(notesSeg([plainNote()])));
+    useProjectStore.getState().setVocalParams(T, { phonemeSet: "vccv" });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.phonemeSet).toBe("vccv");
+    useProjectStore.getState().setVocalParams(T, { phonemeSet: undefined });
+    expect("phonemeSet" in (useProjectStore.getState().tracks[0]!.vocalParams ?? {})).toBe(false);
   });
 });
 

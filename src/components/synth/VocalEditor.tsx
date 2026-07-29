@@ -462,6 +462,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       tokens: vocalTokens(phonemeVp), // both triggers: re-pointing either re-resolves phones
       langId: phonemeVp.langId,
       consonantPreroll: phonemeVp.consonantPreroll !== false,
+      phonemeSet: phonemeVp.phonemeSet, // S91: decides WHICH phones an English note has at all
     };
     const sig = phonemeLaneSig(laneInputs);
     // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
@@ -1466,7 +1467,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const commitLyric = (id: string, value: string) => {
     if (!part) { setLyricEdit(null); return; }
-    const tokens = splitLyricTokens(value.trim(), defaultLyricRef.current);
+    // S91: on an ALIAS track the typed string is ONE alias, never a phrase to distribute. ARPAsing
+    // spells every alias with a space (`ae n`, `y uw`), so whole-phrase distribution would scatter a
+    // single note's content over its neighbours — and X-SAMPA/VCCV have spaced aliases too (`E r`,
+    // `aI e@`). Import is unaffected either way (it stores one UST line per note verbatim).
+    const tokens = part.vocalParams.phonemeSet
+      ? [value.trim() || defaultLyricRef.current]
+      : splitLyricTokens(value.trim(), defaultLyricRef.current);
     const ordered = orderedNotes();
     const startIdx = ordered.findIndex((n) => n.id === id);
     if (tokens.length <= 1 || startIdx < 0) {

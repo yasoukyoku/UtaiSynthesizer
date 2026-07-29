@@ -266,6 +266,10 @@ export interface VibratoSpec {
   easeOutMs: number;
 }
 
+/** S91: the UTAU alias conventions an English track's lyrics may be written in. The wire spelling is
+ *  shared with Rust's `g2p_alias::PhonemeSet::as_str` — the two must only ever change together. */
+export type PhonemeSetId = "arpasing" | "xsampa" | "vccv";
+
 /** ② Vocal-track (自己唱) parameters (§3.1). The SVC voice/singer stays in `Track.voiceModel`; this holds
  *  the backend choice + the ScoreToCV conditioning (speaker/lang) + a track-level transpose. */
 export interface VocalTrackParams {
@@ -318,10 +322,25 @@ export interface VocalTrackParams {
   /** S89 「自动音素时序」: onset consonants are PRE-ROLLED ahead of the beat (borrowed from the
    *  previous phone) so the vowel lands ON the beat — what real singing does, what the training data
    *  annotates, and what a UTAU voicebank's oto preutterance does. `false` keeps every phone INSIDE
-   *  its own note: a UTAU CVVC/VCCV alias score is written in TRANSITION units whose author already
-   *  moved the consonants ahead BY HAND, so pre-rolling again applies the same head start twice.
+   *  its own note.
+   *  ⚠ S91 CORRECTION: S89 shipped this saying a UTAU CVVC/VCCV score's author "already moved the
+   *  consonants ahead by hand", so pre-rolling would apply the head start twice. That is FALSE, and
+   *  measurement on the four reference USTs says so: the pre-utterance lives in the file's own
+   *  `PreUtterance` field (486-489 of ~535 notes carry one, median 82-120 ms) and in UTAU semantics
+   *  that moves the SAMPLE, never the note's tick. Note starts show a median offset of exactly 0
+   *  against every plausible grid, with NO ordering by onset length (nasals are the LATEST class).
+   *  So our pre-roll is the analogue of preutterance, applied ONCE — leave it ON for alias scores too.
    *  Absent/true = ON (the production default); stored ONLY as false (the vowelClarity fold pattern). */
   consonantPreroll?: boolean;
+  /** S91 「音素约定」(queue 5c): which UTAU alias convention this track's ENGLISH lyrics are written
+   *  in. An English UST written against a voicebank carries sample ALIASES, not words — `-aI` / `e@n`
+   *  / `y uw` / `&m` / `1ng-` — and each convention spells the same sound differently.
+   *  Absent = `"words"`: ordinary spelling through the dictionary, byte-for-byte the pre-S91 behaviour.
+   *  Only ENGLISH notes are affected (the conventions ARE English reclists), and an explicit
+   *  `phonemeInput` or a `[bracket hint]` still wins over it. An alias the convention cannot read
+   *  fails LOUDLY (red note + VOCAL_ALIAS) and NEVER falls back to the dictionary — a third of these
+   *  aliases are also real English words. Rust: `inference/g2p_alias.rs`. */
+  phonemeSet?: PhonemeSetId;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
    *  shifted back (Signalsmith inverse; needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
    *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in

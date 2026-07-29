@@ -14,6 +14,9 @@ function base(): PhonemeLaneInputs {
     tokens: { breath: DEFAULT_BREATH_TOKEN, rest: DEFAULT_REST_TOKEN },
     langId: 2,
     consonantPreroll: true,
+    // explicitly present-but-undefined: the default (words), while keeping the KEY visible to the
+    // completeness check below — an optional field that is simply omitted would slip past it.
+    phonemeSet: undefined,
   };
 }
 
@@ -33,6 +36,7 @@ describe("phoneme lane — the cache key and the IPC payload come from ONE input
     tokens: (i) => ({ ...i, tokens: { ...i.tokens, rest: "休" } }),
     langId: (i) => ({ ...i, langId: 1 }),
     consonantPreroll: (i) => ({ ...i, consonantPreroll: false }),
+    phonemeSet: (i) => ({ ...i, phonemeSet: "vccv" }),
   };
 
   it("every field of PhonemeLaneInputs moves the signature", () => {
@@ -56,8 +60,10 @@ describe("phoneme lane — the cache key and the IPC payload come from ONE input
     expect(on.args.consonantPreroll).toBe(true);
     expect(on.args.defaultLang).toBe(2);
     expect(on.args.score.length).toBeGreaterThan(0);
+    expect(on.args.phonemeSet).toBe(null); // S91: absent → the words default, explicit on the wire
     const off = phonemeLaneRequest({ ...base(), consonantPreroll: false });
     expect(off.args.consonantPreroll).toBe(false);
+    expect(phonemeLaneRequest({ ...base(), phonemeSet: "xsampa" }).args.phonemeSet).toBe("xsampa");
     // the switch is a BACKEND allocation decision — the triples themselves are identical, which is
     // why the lane cannot show it without actually re-issuing the call (hence the signature).
     expect(off.args.score).toEqual(on.args.score);

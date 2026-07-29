@@ -166,6 +166,10 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   // S89 「自动音素时序」: same fold — absent≡ON hashes identically to the pre-switch string, so no
   // existing bake is invalidated by adding the knob (and SCORE_TIMING_VERSION stays at s88).
   const cpr = p.consonantPreroll === false ? "|cpr:0" : "";
+  // S91 「音素约定」: same fold — the default (words, stored as ABSENCE) hashes identically to the
+  // pre-S91 string, so adding the setting invalidates no existing bake. Switching it must re-render:
+  // it changes what every English note SINGS, which is exactly what a render sig is for.
+  const ps = p.phonemeSet ? `|ps:${p.phonemeSet}` : "";
   // S88 — the two lyric triggers enter through the CANONICALIZER, not raw. `restTokenKey`/`breathTokenKey`
   // return "" for every spelling that classifies exactly like the default (absent / blank / the canonical
   // token / a padded one), so a bake can only be declared dirty by a token that can really change a note's
@@ -177,7 +181,7 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const bt = breathTokenKey(p.breathToken);
   const rt = restTokenKey(p.restToken);
   const tok = (bt ? `|bt:${bt}` : "") + (rt ? `|rt:${rt}` : "");
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${tok}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${tok}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

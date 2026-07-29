@@ -19,7 +19,7 @@ import { maybeShowErrorModal } from "../errorDisplay";
 import { logToBackend } from "../log";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { contentSig, vocalParamsSig } from "../../store/history";
-import type { Note, PitchCurve, NoteTransition, ProcessedOutput, Track, Segment } from "../../types/project";
+import type { Note, PitchCurve, NoteTransition, ProcessedOutput, Track, Segment, VocalTrackParams } from "../../types/project";
 
 /** Thrown by the global single-flight backstop — the caller shows a "busy" message instead of "failed". */
 export const VOCAL_RENDER_BUSY = "VOCAL_RENDER_BUSY";
@@ -36,6 +36,12 @@ export const VOCAL_SPK_MIX_DIFFUSION = "SPK_MIX_DIFFUSION";
  *  210-token ScoreToCV vocab (internal invariant; should be impossible with audited dictionaries). */
 export const VOCAL_OOV = "VOCAL_OOV";
 export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
+/** S91 `VOCAL_ALIAS: <convention> <lyric>` — a lyric on a track using a UTAU alias convention is not a
+ *  legal alias in it. Its OWN code, not `VOCAL_OOV`: that message tells the user to check the lyric or
+ *  the LANGUAGE, which is the wrong advice here (the language is fine — the convention is). The
+ *  convention token comes first and is always whitespace-free, so the lyric (arbitrary user text) can
+ *  be taken as the rest of the line without a separator that a lyric could contain. */
+export const VOCAL_ALIAS = "VOCAL_ALIAS";
 
 /** S66 pre-render model check for the vocal track: the core aux pack (ScoreToCV / ContentVec /
  *  RMVPE / vocoder onnx) must be present or the render dies mid-flight with AUX_FILE_MISSING —
@@ -74,6 +80,13 @@ export function vocalRenderErrorMessage(e: unknown): string {
   // CONTAIN another code string ("VOCAL_EMPTY" as a lyric…) must not hijack the match (audit).
   const dict = msg.match(/VOCAL_DICT_MISSING:\s*(.*)$/);
   if (dict) return i18n.t("vocalEditor.render.dictMissing", { file: dict[1] });
+  const alias = msg.match(/VOCAL_ALIAS:\s*(\S+)\s([\s\S]*)$/);
+  if (alias) {
+    return i18n.t("vocalEditor.render.aliasBad", {
+      lyric: alias[2],
+      set: i18n.t(`vocalEditor.sidebar.phonemeSet_${alias[1]}`, { defaultValue: alias[1] }),
+    });
+  }
   const oov = msg.match(/VOCAL_OOV:\s*(.*)$/);
   if (oov) return i18n.t("vocalEditor.render.oov", { lyric: oov[1] });
   const ph = msg.match(/VOCAL_PHONE_MISSING:\s*(.*)$/);
@@ -94,7 +107,7 @@ export function vocalRenderErrorMessage(e: unknown): string {
  *  cancel-sentinel substring ("已取消" / "CANCELLED") must not silently swallow the real error (same
  *  ordering rationale as vocalRenderErrorMessage's payload-first rule). */
 export function isVocalCancelError(e: unknown): boolean {
-  if (/VOCAL_(OOV|DICT_MISSING|PHONE_MISSING):/.test(String(e))) return false;
+  if (/VOCAL_(OOV|DICT_MISSING|PHONE_MISSING|ALIAS):/.test(String(e))) return false;
   return isCancelError(e);
 }
 
@@ -140,6 +153,10 @@ export interface VocalRenderOptions {
   vowel_clarity: boolean;
   /** S89 「自动咬字时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
   consonant_preroll: boolean;
+  /** S91 「音素约定」: which UTAU alias convention this track's ENGLISH lyrics use. Omitted/`null` =
+   *  words through the dictionary (Rust's `#[serde(default)]` lands there, so an older caller — e.g.
+   *  the range-scan literal in rangeTest.ts — is unaffected by construction). */
+  phoneme_set?: string | null;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -694,22 +711,33 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
     f0Voiced,
     loudnessEnv,
     formantEnv,
-    options: {
-      backend: vp.backend,
-      cv_speaker_id: vp.speakerId,
-      lang_id: vp.langId,
-      transpose: vp.transpose,
-      // S60-2: absent = ON (no-op until the model carries a vocal_range record)
-      range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
-      consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
-      consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
-      vowel_clarity: vp.vowelClarity !== false,
-      consonant_preroll: vp.consonantPreroll !== false,
-      sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
-      rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
-    },
+    options: vocalRenderOptions(vp),
     renderedSig: vocalRenderSig(track, seg, tempo),
   });
+}
+
+/** THE track-params → wire-options mapping, extracted so it can be tested at all.
+ *
+ *  ⚠ Every knob here is a place a per-track setting can go MISSING silently: the Rust struct is
+ *  `#[serde(default)]`, so a field the frontend forgets lands on the production default while the
+ *  sidebar happily shows the user's choice — "the switch does nothing" with no error anywhere. It was
+ *  an inline literal until S91 and had ZERO test coverage; `vocalRender.test.ts` now pins it. */
+export function vocalRenderOptions(vp: VocalTrackParams): VocalRenderOptions {
+  return {
+    backend: vp.backend,
+    cv_speaker_id: vp.speakerId,
+    lang_id: vp.langId,
+    transpose: vp.transpose,
+    // S60-2: absent = ON (no-op until the model carries a vocal_range record)
+    range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
+    consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
+    consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
+    vowel_clarity: vp.vowelClarity !== false,
+    consonant_preroll: vp.consonantPreroll !== false,
+    phoneme_set: vp.phonemeSet ?? null,
+    sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
+    rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
+  };
 }
 
 /** True when a notes segment needs a (re-)bake: it has notes, a resolvable singer, and either no bake yet
