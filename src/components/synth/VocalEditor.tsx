@@ -17,7 +17,8 @@ import * as playback from "../../lib/audio/playback";
 import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, vocalTokens, type VocalTokens } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
-import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, buildScoreTriples, renderFrameTicks } from "../../lib/vocal/vocalRender";
+import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, renderFrameTicks } from "../../lib/vocal/vocalRender";
+import { phonemeLaneRequest, phonemeLaneSig } from "../../lib/vocal/phonemeLane";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { logToBackend } from "../../lib/log";
 import { evalF0CentsAt, paintedDev, evalCurveAt } from "../../lib/f0eval";
@@ -452,11 +453,17 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (!phonemeLaneRef.current) phonemeSigRef.current = "";
       return;
     }
-    const phonemeTokens = vocalTokens(phonemeVp); // both triggers: re-pointing either re-resolves phones
-    const sig = JSON.stringify([
-      phonemeNotes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? ""]),
-      phonemeVp.langId, phonemeTokens.breath, phonemeTokens.rest, tempo,
-    ]);
+    // ONE description of what the lane depends on — the cache key AND the IPC payload both come out
+    // of it, so an input can never reach the backend without also invalidating the cache (S88's
+    // dormant-fix hazard; see phonemeLane.ts).
+    const laneInputs = {
+      notes: phonemeNotes,
+      tempo,
+      tokens: vocalTokens(phonemeVp), // both triggers: re-pointing either re-resolves phones
+      langId: phonemeVp.langId,
+      consonantPreroll: phonemeVp.consonantPreroll !== false,
+    };
+    const sig = phonemeLaneSig(laneInputs);
     // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
     // reference lines already follow the NEW notes). Mid-edit staleness while the lane stays open is
     // left visible (blanking every keystroke would flicker); the debounce below replaces it shortly.
@@ -468,9 +475,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const seq = ++phonemeSeqRef.current;
     const timer = window.setTimeout(async () => {
       phonemeSigRef.current = sig; // set at fire time so a persistent backend error can't hot-loop
-      const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(phonemeNotes, tempo, phonemeTokens, phonemeVp.langId);
+      const { args, tripleNoteIds, ticksPerFrame } = phonemeLaneRequest(laneInputs);
       try {
-        const spans = await invoke<PhonemeSpan[]>("preview_vocal_phonemes", { score: triples, defaultLang: phonemeVp.langId });
+        const spans = await invoke<PhonemeSpan[]>("preview_vocal_phonemes", args);
         if (seq !== phonemeSeqRef.current) return; // superseded by a newer request
         phonemeLaneRef.current = { spans, tripleNoteIds, ticksPerFrame, sig };
       } catch {

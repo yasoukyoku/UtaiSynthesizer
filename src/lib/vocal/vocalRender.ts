@@ -138,6 +138,8 @@ export interface VocalRenderOptions {
   consonant_valley: number;
   /** S84 E 刀: vowel-clarity articulation oversampling (absent-in-params ≡ true). */
   vowel_clarity: boolean;
+  /** S89 「自动咬字时序」: onset consonants pre-roll ahead of the beat (absent-in-params ≡ true). */
+  consonant_preroll: boolean;
   sovits: SovitsOptions;
   rvc: RvcOptions;
 }
@@ -694,6 +696,7 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
       consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
       consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
       vowel_clarity: vp.vowelClarity !== false,
+      consonant_preroll: vp.consonantPreroll !== false,
       sovits: { ...SOVITS_DEFAULTS, ...(vp.sovits ?? {}) },
       rvc: { ...RVC_DEFAULTS, ...(vp.rvc ?? {}) },
     },

@@ -1323,8 +1323,9 @@ pub async fn validate_lyrics(
 /// S83 phoneme-lane preview: one emitted phone of the DAW assembly, wire-shaped for the editor's
 /// read-only phoneme lane. `evt` = the index of the input score triple this phone came from (the
 /// frontend maps it back to a note id / gap rest through its parallel `tripleNoteIds`); frames are
-/// consumed cumulatively (Σ frames == Σ triple frames — the assembler is frame-conserving), so the
-/// lane's x-positions are exactly the render's, borrowed pre-beat onsets included.
+/// consumed cumulatively (Σ frames == Σ triple frames — the assembler is frame-conserving, on BOTH
+/// articulation-timing arms), so the lane's x-positions are exactly the render's, borrowed pre-beat
+/// onsets included — and with the pre-roll switched off, exactly the in-note layout instead.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PhonemeSpan {
     pub phone: String,
@@ -1344,6 +1345,11 @@ pub async fn preview_vocal_phonemes(
     state: State<'_, Arc<AppState>>,
     score: Vec<ScoreNote>,
     default_lang: i64,
+    // S89: the lane is the ONLY place the articulation-timing switch is visible before a render, so
+    // it must receive the track's setting. `Option` (not a bare bool) keeps an older frontend — or any
+    // caller that simply doesn't know — on the production default instead of silently previewing the
+    // OTHER arm; a missing field on a bool would have deserialized to `false` = the wrong picture.
+    consonant_preroll: Option<bool>,
 ) -> Result<Vec<PhonemeSpan>, String> {
     // Same 1× cap as render_vocal_segment: the payload here is byte-for-byte the SAME triples array the
     // render caps at MAX_SCORE_NOTES — an over-cap score can never render, so previewing it has no value
@@ -1366,6 +1372,11 @@ pub async fn preview_vocal_phonemes(
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
     let fallback = g2p::Lang::from_id(default_lang).unwrap_or(g2p::Lang::Ja);
+    let timing = crate::inference::score2svc::ScoreShaping {
+        consonant_preroll: consonant_preroll.unwrap_or(true),
+        ..Default::default()
+    }
+    .articulation_timing(); // ONE bool→enum conversion, shared with the render
     tauri::async_runtime::spawn_blocking(move || {
         let mut evts: Vec<g2p::ScoreEvt> = Vec::with_capacity(score.len());
         for n in &score {
@@ -1377,7 +1388,8 @@ pub async fn preview_vocal_phonemes(
                 phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LEN),
             });
         }
-        let arr = score2cv::build_arrays_daw(&evts, &g2p::GlobalDicts).map_err(|e| e.to_string())?;
+        let arr =
+            score2cv::build_arrays_daw(&evts, &g2p::GlobalDicts, timing).map_err(|e| e.to_string())?;
         Ok(arr
             .phon
             .iter()
@@ -1468,6 +1480,11 @@ pub struct VocalRenderOptions {
     /// inflated S2CV duration and resample back, so fast-run vowels reach their articulation
     /// target (「渲染长音素再缩短」, cv-domain). Absent → true (the production default).
     pub vowel_clarity: bool,
+    /// S89 「自动咬字时序」: onset consonants are pre-rolled before the beat (S83 crown knife) so the
+    /// nucleus lands ON the beat. `false` keeps every phone inside its own note — for UTAU CVVC/VCCV
+    /// alias scores, whose author already moved the consonants ahead by hand, pre-rolling would apply
+    /// that head start twice. Absent (old frontends) → true (the production default).
+    pub consonant_preroll: bool,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1489,6 +1506,7 @@ impl Default for VocalRenderOptions {
             consonant_emphasis_db: crate::inference::score2svc::DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley: crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
+            consonant_preroll: true,
             sovits: Default::default(),
             rvc: Default::default(),
         }
@@ -1829,6 +1847,7 @@ pub async fn render_vocal_segment(
             crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE
         },
         vowel_clarity: options.vowel_clarity, // S84 E 刀 toggle (bool — nothing to sanitize)
+        consonant_preroll: options.consonant_preroll, // S89 toggle (bool — nothing to sanitize)
     };
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 

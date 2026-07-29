@@ -381,6 +381,11 @@ pub fn is_nucleus_phone(p: &str) -> bool {
 // Σ event frames (borrowing is zero-sum, in-note allocation never exceeds fr — the old `max(1)` inflation
 // that pushed every later note off the timeline is gone; a coda/onset that can't get its minimum is
 // DROPPED, never inflated).
+//
+// S89: the pre-roll is a per-track SWITCH (`ArticulationTiming`). Turning it off does NOT go back to
+// `split_dur` — see that enum's doc for why conservation forbids it. It only redirects where the onset's
+// frames come from: the note's own nucleus instead of the previous phone. Everything else on this page
+// (targets, buckets, ≥2-or-drop, LAST-first, nucleus-remainder, coda bounds) is shared by both arms.
 const CODA_MIN_FRAMES: i64 = 2; // a 1-frame phone is categorically OOD (0 occurrences in training npz)
 const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
 const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
@@ -646,7 +651,45 @@ mod nucleus_tests {
 pub fn build_arrays(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
     let evts: Vec<g2p::ScoreEvt> = score.iter().map(g2p::ScoreEvt::ja).collect();
     let resolved = g2p::resolve_score(&evts, &NoDicts)?;
-    assemble_arrays(&evts, &resolved, true, false) // Phase-1c PARITY: rest-capped, split_dur, no pre-roll
+    assemble_arrays(&evts, &resolved, Assembly::Parity)
+}
+
+/// S89: WHERE a note's onset consonants get their frames — the ② render's per-track
+/// 「自动咬字时序」 switch (`VocalTrackParams.consonantPreroll`).
+///
+/// ⚠ This is NOT "S83 allocator vs the legacy `split_dur`". `split_dur` is the Phase-1c parity port
+/// and it is **not frame-conserving** (`split_dur(2, 5) == [1,1,1,1,1]`, Σ 5 > 2 frames). Σ phone_dur
+/// == Σ event frames is load-bearing far downstream: `build_note_hz`/`build_note_param` take a
+/// conserving FAST PATH (`t_total == f0.cents.len()`) and fall into the group remap otherwise —
+/// which, per its own comment, samples the vowel ~2 frames LATE, i.e. it would silently re-apply the
+/// very head start this switch exists to remove. The phoneme lane's x-coordinate contract and
+/// "stem length == segment timeline" rest on the same invariant. So BOTH arms below conserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticulationTiming {
+    /// S83 crown knife: onset consonants are PRE-ROLLED before the beat by borrowing frames from the
+    /// previously emitted phone, so the NUCLEUS lands on the beat. 92.2% of training frames annotate
+    /// note onsets at the consonant start (singers place the consonant ahead of the beat), and an
+    /// OpenUtau voicebank does the same thing via its oto preutterance.
+    Auto,
+    /// Every phone stays INSIDE its own note; nothing is borrowed from the previous phone. For a
+    /// score whose author already placed the consonants ahead of the beat BY HAND — UTAU CVVC/VCCV
+    /// alias scores are transition units carrying their own preutterance compensation — pre-rolling
+    /// again applies the same head start TWICE.
+    /// ⚠ Known cost, by construction: with no lender, a note too short to spare frames above its
+    /// nucleus floor drops its onset entirely (the same ≥2-or-drop policy codas already use). That
+    /// is the honest reading of "no borrowing"; the phoneme lane shows it.
+    InNote,
+}
+
+/// Which assembly the shared core is running. Replaces the old `(cap_rests, daw)` bool pair — only
+/// two of its four combinations were ever legal, and a same-typed bool pair across a call boundary
+/// is precisely the shape S85 shipped a bug through ([[project_v2_session85]]).
+enum Assembly {
+    /// Phase-1c bit-parity port of `render_ust.build_arrays`: rests capped, `split_dur`, no pre-roll.
+    Parity,
+    /// ② DAW render: rests uncapped (stem aligns to the tick timeline), S83 syllable-aware
+    /// allocation, M3 short-vowel rest-borrow.
+    Daw(ArticulationTiming),
 }
 
 /// A `DictSource` for pure-JA paths (parity + tests): JA needs no dictionary files; any zh/word-dict
@@ -693,11 +736,15 @@ fn zh_hold_phone(carrier: &'static str) -> &'static str {
 /// ⚠ `chunk_at_sp` CANNOT subdivide a single rest (it only splits AT an SP after the running count
 /// exceeds max_frames), so one very long rest becomes one big chunk — the TOTAL frame count is bounded
 /// upstream by `render_vocal_segment`'s `MAX_TOTAL_FRAMES`, not here.
-pub fn build_arrays_daw(score: &[g2p::ScoreEvt], dicts: &dyn g2p::DictSource) -> Result<ScoreArrays> {
+pub fn build_arrays_daw(
+    score: &[g2p::ScoreEvt],
+    dicts: &dyn g2p::DictSource,
+    timing: ArticulationTiming,
+) -> Result<ScoreArrays> {
     let resolved = g2p::resolve_score(score, dicts)?;
     // ② DAW: rests uncapped + S83 syllable-aware allocation (onset pre-roll / nucleus-remainder /
     // bounded coda) + short-note borrow-time (M3). Frame-CONSERVING: Σ phone_dur == Σ evt frames.
-    assemble_arrays(score, &resolved, false, true)
+    assemble_arrays(score, &resolved, Assembly::Daw(timing))
 }
 
 /// THE single array-assembly core (S58): resolved per-note phones → the model's per-phone arrays.
@@ -708,9 +755,13 @@ pub fn build_arrays_daw(score: &[g2p::ScoreEvt], dicts: &dyn g2p::DictSource) ->
 fn assemble_arrays(
     score: &[g2p::ScoreEvt],
     resolved: &[g2p::ResolvedNote],
-    cap_rests: bool,
-    daw: bool,
+    mode: Assembly,
 ) -> Result<ScoreArrays> {
+    let cap_rests = matches!(mode, Assembly::Parity);
+    let daw_timing = match mode {
+        Assembly::Parity => None,
+        Assembly::Daw(t) => Some(t),
+    };
     let m = score.len();
     let mut phon: Vec<&'static str> = Vec::new();
     let mut pdur: Vec<i64> = Vec::new();
@@ -768,7 +819,7 @@ fn assemble_arrays(
                     }
                     // sustain after silence (orphan): fall through to the normal emit ("a" default)
                 }
-                if daw {
+                if let Some(timing) = daw_timing {
                     // ── S83 syllable-aware allocation + onset pre-roll (see the block comment above
                     //    allocate_in_note for the full rationale) ──
                     let n = ph.len();
@@ -776,7 +827,61 @@ fn assemble_arrays(
                     let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
                     let onset_end = ph.iter().position(|p| is_nucleus_phone(p)).unwrap_or(n - 1).min(nuc);
                     let mut durs = allocate_in_note(ph, fr, onset_end, nuc);
-                    if onset_end > 0 {
+                    // S84 A 刀: at fr ≤ 5 (the tempo-222 160t fast-run regime) the short-bucket
+                    // MEDIAN targets (t3/k4/s4 — a ≤7 bucket dominated by 6-7-frame groups)
+                    // always exceed the ceil-half clamp, so the LENDER vowel was pinned at
+                    // exactly 2 frames for whole passages — contradicting this file's own
+                    // "targets handle the scaling" intent (S84 review) AND the measured 4-5
+                    // frame population: the DOMINANT total=5 CV shape is C2/V3 (119/261) and
+                    // total=4 sits at median C2 (C1V3 37 / C2V2 23 / C3V1 30). Capping each
+                    // onset target at 2 when the borrowing note is this short lands both:
+                    // a 5-frame lender keeps a 3-frame vowel, fr=4 behavior is unchanged
+                    // (avail already clamped to 2), and fr ≥ 6 (the ear-anchored 240t triplet)
+                    // never enters this branch — bit-identical by construction.
+                    // ★The cap keys on the NOTE's own frame count, not on who lends, so it holds
+                    // identically on the InNote arm (same measured C/V split, same note length).
+                    let target = |p: &'static str| {
+                        let t = onset_target_frames(p, fr);
+                        if fr <= 5 {
+                            t.min(2)
+                        } else {
+                            t
+                        }
+                    };
+                    if onset_end > 0 && timing == ArticulationTiming::InNote {
+                        // ── preroll OFF: the onset stays INSIDE its own note ──
+                        // Same measured targets, same LAST-first order, same ≥2-or-DROP policy as the
+                        // pre-roll arm; the ONLY difference is WHERE the frames come from — the note's
+                        // own nucleus remainder, never the previous phone. Conservation is therefore
+                        // trivial (every frame the onset gains, the nucleus loses), and the previous
+                        // note is left byte-identical, which is the whole point: an author who already
+                        // moved the consonant ahead of the beat must not have it moved again.
+                        //
+                        // ★The nucleus floor here is NOT the Auto arm's `fr.min(2)`. Over there that
+                        // number is only a last-ditch rescue floor (the nucleus normally keeps its
+                        // whole remainder because the onset came from the neighbour); here it would
+                        // become the PRIMARY constraint and a 2-consonant onset would crush the vowel
+                        // to 2 frames — e.g. [s t a] on a 10-frame note → s4/t4/a2. So the floor is
+                        // the SAME measured vowel share the coda budget already uses two branches up
+                        // (training vowel-share median 44-47% ⇒ 2/5): onsets + codas together can
+                        // never take more than 3/5 of the note. On long notes it never binds
+                        // (mine@50: floor 20 vs a 46-frame nucleus), on short ones it is what keeps
+                        // the syllable a syllable.
+                        let nuc_floor = fr.min(2).max(fr * 2 / 5);
+                        for i in (0..onset_end).rev() {
+                            let spare = (durs[nuc] - nuc_floor).max(0);
+                            if spare <= 0 {
+                                break;
+                            }
+                            let give = target(ph[i]).min(spare);
+                            if give < CODA_MIN_FRAMES {
+                                continue; // a 1-frame phone is categorically OOD — drop, keep the budget
+                            }
+                            durs[i] = give;
+                            durs[nuc] -= give;
+                        }
+                    }
+                    if onset_end > 0 && timing == ArticulationTiming::Auto {
                         // borrow the onset consonants' frames from the tail of the previous phone so
                         // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
                         let avail = match phon.last() {
@@ -793,21 +898,8 @@ fn assemble_arrays(
                             }
                             None => 0, // score start: no lender — the onset falls back in-note below
                         };
-                        // S84 A 刀: at fr ≤ 5 (the tempo-222 160t fast-run regime) the short-bucket
-                        // MEDIAN targets (t3/k4/s4 — a ≤7 bucket dominated by 6-7-frame groups)
-                        // always exceed the ceil-half clamp, so the LENDER vowel was pinned at
-                        // exactly 2 frames for whole passages — contradicting this file's own
-                        // "targets handle the scaling" intent (S84 review) AND the measured 4-5
-                        // frame population: the DOMINANT total=5 CV shape is C2/V3 (119/261) and
-                        // total=4 sits at median C2 (C1V3 37 / C2V2 23 / C3V1 30). Capping each
-                        // onset target at 2 when the borrowing note is this short lands both:
-                        // a 5-frame lender keeps a 3-frame vowel, fr=4 behavior is unchanged
-                        // (avail already clamped to 2), and fr ≥ 6 (the ear-anchored 240t triplet)
-                        // never enters this branch — bit-identical by construction.
-                        let target = |p: &'static str| {
-                            let t = onset_target_frames(p, fr);
-                            if fr <= 5 { t.min(2) } else { t }
-                        };
+                        // (the fr≤5 target cap referenced above is hoisted into `target`, shared with
+                        // the InNote arm — same measured justification, same note-length key.)
                         let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
                         let mut left = want.min(avail);
                         if left > 0 {
@@ -885,7 +977,11 @@ fn assemble_arrays(
     // the rendered stem stays aligned to the DAW tick timeline (节奏不变). A short note with no trailing rest
     // is left as-is (extending it would eat the next note's onset; the decode pad-and-trim covers the hard
     // sub-min-frames floor). Deliberate fork from Phase-1c parity (build_arrays keeps borrow_time=false).
-    if daw {
+    // ★Runs on BOTH articulation-timing arms (S89): this is not the onset pre-roll. It never moves a
+    // consonant ahead of a beat — it only lets a starved vowel eat into the SILENCE that follows it,
+    // which is orthogonal to "the author already placed the consonants" and is what keeps a short
+    // CVVC note audible at all.
+    if daw_timing.is_some() {
         // S83: the vowel test widened from tbl::VOWEL_SET (the 5 JA vowels) to the full nucleus
         // classifier — an EN aɪ / zh final / syllabic n̩ deserves the same floor as a JA vowel.
         for i in 0..phon.len() {
@@ -1235,7 +1331,7 @@ mod tests {
     /// JA-defaulted DAW build over legacy triples (the pre-S58 test fixtures).
     fn daw_ja(score: &[(&str, i64, i64)]) -> Result<ScoreArrays> {
         let evts: Vec<g2p::ScoreEvt> = score.iter().map(g2p::ScoreEvt::ja).collect();
-        build_arrays_daw(&evts, &NoDicts)
+        build_arrays_daw(&evts, &NoDicts, ArticulationTiming::Auto)
     }
 
     // ② vocal DAW render (S53): `build_arrays_daw` keeps the FULL rest so the stem aligns to the
@@ -1408,7 +1504,7 @@ mod tests {
         let d = en_dicts();
         // R(10) mine(50) R(10) — a 1-second note at 50fps.
         let score = [en_evt("R", 0, 10), en_evt("mine", 69, 50), en_evt("R", 0, 10)];
-        let arr = build_arrays_daw(&score, &d).unwrap();
+        let arr = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "m", "aɪ", "n", "SP"]);
         // m pre-rolls at its measured 5-frame target from the leading rest; coda n is bounded at
         // its 4-frame target; the vowel gets the remainder (46 frames = 92% — the old split_dur
@@ -1420,15 +1516,135 @@ mod tests {
     #[test]
     fn en_double_coda_bounded_and_dropped_when_starved() {
         let d = en_dicts();
-        let arr = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 50)], &d).unwrap();
+        let arr = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 50)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "f", "aɪ", "n", "d"]);
         // f (voiceless fricative, long-bucket p75) targets 7, coda n targets 4, the stop d 3 —
         // the 760ms flat [d] is gone AND the consonants are no longer one flat size.
         assert_eq!(arr.phone_dur, vec![3, 7, 43, 4, 3], "codas at their own measured targets");
         // a 3-frame note can't fit any coda at the 2-frame minimum → both drop, the nucleus survives.
-        let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d).unwrap();
+        let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");
         assert_eq!(tiny.phone_dur.iter().sum::<i64>(), 13, "still frame-conserving");
+    }
+
+    // ─── S89 「自动咬字时序」 OFF (ArticulationTiming::InNote) ───
+    //
+    // Every expected number below is hand-derived from the priors table + the allocator's stated
+    // rules, NOT copied from a run (S87: two of my expectations were wrong and the TEST caught the
+    // arithmetic — that only works if the expectation is independent).
+    //
+    // mine = [m, aɪ, n] on a 50-frame note (long bucket): coda n targets 4, so allocate_in_note
+    // leaves [_, 46, 4]. InNote then funds the onset out of the NUCLEUS: m targets 5 (long bucket),
+    // the nucleus floor is max(2, 50*2/5) = 20 and 46 is well above it ⇒ m takes 5, the vowel 41.
+    // ★The leading rest keeps ALL 10 of its frames — under Auto it lends 5 of them away. That one
+    // number IS the feature: the author's note positions are left exactly where they were put.
+    #[test]
+    fn in_note_timing_funds_the_onset_from_its_own_nucleus() {
+        let d = en_dicts();
+        let score = [en_evt("R", 0, 10), en_evt("mine", 69, 50)];
+        let off = build_arrays_daw(&score, &d, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off.phon, vec!["SP", "m", "aɪ", "n"]);
+        assert_eq!(off.phone_dur, vec![10, 5, 41, 4]);
+        // the note's own phones account for exactly its own frames — nothing crossed the boundary
+        assert_eq!(off.phone_dur[1..].iter().sum::<i64>(), 50);
+        // …and the Auto arm demonstrably DOES cross it (guards against a vacuous test: if the two
+        // arms ever produced the same arrays, the assertion above would prove nothing).
+        let on = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(on.phone_dur, vec![5, 5, 46, 4], "Auto pre-rolls m out of the rest");
+        assert_ne!(on.phone_dur, off.phone_dur);
+        for arr in [&on, &off] {
+            assert_eq!(arr.phone_dur.iter().sum::<i64>(), 60, "both arms conserve frames");
+        }
+    }
+
+    // The documented COST of "no borrowing": a note with no spare above its nucleus floor drops the
+    // onset entirely, where Auto would have rescued it from the neighbour.
+    // mine on a 3-frame note: coda n can't reach 2 frames (budget = min(3, 1, 1) = 1) so it drops
+    // and the nucleus holds 3. InNote's floor is max(min(3,2), 3*2/5=1) = 2 ⇒ spare = 1, and m's
+    // target (short bucket 3, capped to 2 by the fr≤5 rule) can only be funded to 1 < 2 ⇒ DROPPED.
+    // Auto instead borrows 2 frames from the 10-frame rest and keeps m.
+    #[test]
+    fn in_note_timing_drops_an_onset_it_cannot_fund() {
+        let d = en_dicts();
+        let score = [en_evt("R", 0, 10), en_evt("mine", 69, 3)];
+        let off = build_arrays_daw(&score, &d, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off.phon, vec!["SP", "aɪ"], "no room for m INSIDE a 3-frame note");
+        assert_eq!(off.phone_dur, vec![10, 3]);
+        let on = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(on.phon, vec!["SP", "m", "aɪ"], "Auto rescues it from the rest");
+        assert_eq!(on.phone_dur, vec![8, 2, 3]);
+        assert_eq!(off.phone_dur.iter().sum::<i64>(), 13);
+        assert_eq!(on.phone_dur.iter().sum::<i64>(), 13);
+    }
+
+    // Onset CLUSTER: LAST-first (the consonant touching the vowel wins the scarce frames) and the
+    // 2/5 nucleus floor keeps the syllable a syllable.
+    // [s t a] on a 10-frame note (mid bucket): allocate_in_note leaves [_, _, 10] (no coda).
+    // floor = max(2, 10*2/5) = 4. t first: target 4, spare 6 ⇒ t=4, nucleus 6. then s: target 7 but
+    // spare is only 6-4 = 2 ⇒ s=2 (still ≥ the 2-frame OOD minimum), nucleus 4.
+    // Without that floor the same input would give s4/t4/a2 — the vowel below its own minimum share.
+    #[test]
+    fn in_note_timing_cluster_is_last_first_and_keeps_the_vowel_share() {
+        let sta = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 10, lang: g2p::Lang::Ja, phoneme_input: Some("s t a"),
+        };
+        let off = build_arrays_daw(&[sta.clone()], &NoDicts, ArticulationTiming::InNote).unwrap();
+        assert_eq!(off.phon, vec!["s", "t", "a"]);
+        assert_eq!(off.phone_dur, vec![2, 4, 4]);
+        assert_eq!(off.phone_dur.iter().sum::<i64>(), 10);
+        // Auto with NO lender (score start) is the degraded 2-frame rescue — proof that InNote is
+        // NOT simply "the no-lender path" (an early design hypothesis this test exists to refute).
+        let on = build_arrays_daw(&[sta], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(on.phone_dur, vec![2, 2, 6], "no-lender Auto tops up to the bare minimum only");
+    }
+
+    // ★ SWEEP — the DEFINING invariant, stated so it cannot hold vacuously.
+    // With rests only at the START of a score, the M3 rest-borrow (which needs a FOLLOWING rest)
+    // can never fire, so under InNote every event's emitted phones must sum to EXACTLY that event's
+    // own frames: no frame ever crosses a note boundary. The same scores under Auto must violate it
+    // often — otherwise the sweep is not exercising the pre-roll at all and proves nothing.
+    #[test]
+    fn in_note_timing_never_crosses_a_note_boundary_sweep() {
+        let d = en_dicts();
+        let mut seed: u64 = 20260729;
+        let mut rnd = |n: u64| {
+            seed = (seed.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fff_ffff;
+            (seed % n) as i64
+        };
+        let words = ["mine", "fined"];
+        let (mut auto_crossings, mut cases) = (0usize, 0usize);
+        for _ in 0..400 {
+            let mut score: Vec<g2p::ScoreEvt> = vec![en_evt("R", 0, 1 + rnd(30))];
+            for _ in 0..(2 + rnd(5)) {
+                let w = words[rnd(2) as usize];
+                score.push(en_evt(w, 55 + rnd(20), 1 + rnd(40)));
+            }
+            let total: i64 = score.iter().map(|e| e.frames).sum();
+            for timing in [ArticulationTiming::Auto, ArticulationTiming::InNote] {
+                let arr = build_arrays_daw(&score, &d, timing).unwrap();
+                assert_eq!(arr.phone_dur.iter().sum::<i64>(), total, "conservation, both arms");
+                assert!(arr.phone_dur.iter().all(|&x| x >= 1), "no 0-frame phone is ever emitted");
+                // per-event totals
+                let mut per_evt = vec![0i64; score.len()];
+                for (i, &e) in arr.evt.iter().enumerate() {
+                    per_evt[e] += arr.phone_dur[i];
+                }
+                let crossings =
+                    (0..score.len()).filter(|&k| per_evt[k] != score[k].frames).count();
+                match timing {
+                    ArticulationTiming::InNote => assert_eq!(
+                        crossings, 0,
+                        "InNote must never move a frame across a note boundary (score {score:?})"
+                    ),
+                    ArticulationTiming::Auto => auto_crossings += crossings,
+                }
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 400);
+        // self-check: the sweep really did exercise pre-rolling (a sweep that never triggers the
+        // mechanism under test is green by accident — S87 血训).
+        assert!(auto_crossings > 200, "sweep never exercised the pre-roll ({auto_crossings})");
     }
 
     // Conservation invariant across a mixed score (the old split_dur could INFLATE Σ beyond the
@@ -1440,7 +1656,7 @@ mod tests {
             en_evt("R", 0, 4), en_evt("mine", 69, 3), en_evt("fined", 71, 2), en_evt("R", 0, 6),
             en_evt("mine", 60, 13), en_evt("fined", 62, 25),
         ];
-        let arr = build_arrays_daw(&score, &d).unwrap();
+        let arr = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
         let total: i64 = score.iter().map(|e| e.frames).sum();
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), total, "Σ phone_dur == Σ event frames, always");
         assert!(arr.phone_dur.iter().all(|&d| d >= 1), "no 0-frame phone is ever emitted");
@@ -1458,7 +1674,7 @@ mod tests {
         let tta = g2p::ScoreEvt {
             lyric: "x", note_num: 62, frames: 2, lang: g2p::Lang::Ja, phoneme_input: Some("ʔ t a"),
         };
-        let daw = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts).unwrap();
+        let daw = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(daw.phon, vec!["a", "a"]);
         assert_eq!(daw.phone_dur, vec![3, 2], "borrowed frame returned to the lender");
     }
@@ -1470,10 +1686,10 @@ mod tests {
         let evt = |fr| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja, phoneme_input: Some("p i u"),
         };
-        let a10 = build_arrays_daw(&[evt(10)], &NoDicts).unwrap();
+        let a10 = build_arrays_daw(&[evt(10)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(a10.phon, vec!["p", "i", "u"]);
         assert_eq!(a10.phone_dur, vec![2, 3, 5], "medial ≥2; onset supplemented in-note at score start");
-        let a3 = build_arrays_daw(&[evt(3)], &NoDicts).unwrap();
+        let a3 = build_arrays_daw(&[evt(3)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(a3.phon, vec!["u"], "sub-minimum medial AND onset drop — never a 1-frame phone");
         assert_eq!(a3.phone_dur, vec![3]);
     }
@@ -1486,7 +1702,7 @@ mod tests {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"), // refined's shape as a raw-IPA override
         };
-        let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts).unwrap();
+        let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "n", "d"]);
         // onset ɹ pre-rolls its long-bucket 7 from the rest; medial vowel ə keeps the small share;
         // medial f takes its own onset target 7 (was ≤4); codas n/d at 4/3; aɪ gets the remainder.
@@ -1499,7 +1715,7 @@ mod tests {
     #[test]
     fn m3_borrow_covers_en_nuclei() {
         let d = en_dicts();
-        let arr = build_arrays_daw(&[en_evt("mine", 69, 3), en_evt("R", 0, 40)], &d).unwrap();
+        let arr = build_arrays_daw(&[en_evt("mine", 69, 3), en_evt("R", 0, 40)], &d, ArticulationTiming::Auto).unwrap();
         let ai = arr.phon.iter().position(|&p| p == "aɪ").unwrap();
         assert_eq!(arr.phone_dur[ai], VOWEL_MIN_FRAMES, "short EN nucleus borrowed up to the floor");
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 43, "borrow is zero-sum");
@@ -1528,7 +1744,7 @@ mod tests {
     #[test]
     fn zh_same_pitch_sustain_extends_the_final() {
         let d = zh_dicts();
-        let a = build_arrays_daw(&[zh_evt("wang", 60, 20), zh_evt("-", 60, 30)], &d).unwrap();
+        let a = build_arrays_daw(&[zh_evt("wang", 60, 20), zh_evt("-", 60, 30)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["w", "ɑŋ"], "the hold adds NO phone entry (no re-articulation)");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 50, "total frames (timeline) preserved");
         assert!(*a.phone_dur.last().unwrap() >= 30, "the hold's frames extended the final");
@@ -1536,6 +1752,7 @@ mod tests {
         let b = build_arrays_daw(
             &[zh_evt("wang", 60, 20), zh_evt("-", 60, 30), zh_evt("-", 60, 10)],
             &d,
+            ArticulationTiming::Auto,
         )
         .unwrap();
         assert_eq!(b.phon, vec!["w", "ɑŋ"]);
@@ -1547,13 +1764,14 @@ mod tests {
         let d = zh_dicts();
         // xiang = [ɕ, iɑŋ]; the pitch-changed hold re-emits the glide-stripped tail ɑŋ (NOT iɑŋ,
         // which would re-articulate the glide ≈ "yang" again), at the NEW pitch.
-        let a = build_arrays_daw(&[zh_evt("xiang", 60, 20), zh_evt("-", 62, 30)], &d).unwrap();
+        let a = build_arrays_daw(&[zh_evt("xiang", 60, 20), zh_evt("-", 62, 30)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["ɕ", "iɑŋ", "ɑŋ"]);
         assert_eq!(a.note_pitch, vec![60, 60, 62]);
         // …and a FURTHER same-pitch hold extends that melisma entry instead of re-emitting.
         let b = build_arrays_daw(
             &[zh_evt("xiang", 60, 20), zh_evt("-", 62, 30), zh_evt("-", 62, 10)],
             &d,
+            ArticulationTiming::Auto,
         )
         .unwrap();
         assert_eq!(b.phon, vec!["ɕ", "iɑŋ", "ɑŋ"]);

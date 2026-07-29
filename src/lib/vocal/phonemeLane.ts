@@ -1,0 +1,58 @@
+import type { Note } from "../../types/project";
+import type { VocalTokens } from "../vocalNotes";
+import { buildScoreTriples, type ScoreTriple } from "./vocalRender";
+
+/**
+ * EVERY input the read-only phoneme lane's preview depends on, as ONE named object.
+ *
+ * ⚠ Why this exists rather than an inline `JSON.stringify([...])` in the component: the lane caches its
+ * last result under a signature and skips the IPC when the signature is unchanged. If an input reaches
+ * `preview_vocal_phonemes` but NOT the signature, the lane keeps painting the previous answer — the
+ * switch looks broken, or worse, silently shows the other arm's layout. S88 shipped exactly that shape
+ * once (`AutoTuneWatcher`'s skip-sig omitted the two lyric tokens, so changing a token never
+ * re-tuned — "the fix was dormant at precisely the moment it mattered"), and the S89 preroll switch is
+ * the same hazard class: a mutation test proved the inline signature stayed green with the switch
+ * removed from it.
+ *
+ * The defence is structural: both the signature and the IPC payload are derived from THIS object, and
+ * `phonemeLane.test.ts` asserts that perturbing ANY field moves the signature. A future input can
+ * therefore only be added by adding a field here — which the property test immediately holds to
+ * account.
+ */
+export interface PhonemeLaneInputs {
+  notes: Note[];
+  tempo: number;
+  /** Both lyric triggers: re-pointing either one re-resolves which notes produce phones at all. */
+  tokens: VocalTokens;
+  /** Track default language (per-note overrides ride on the notes). */
+  langId: number;
+  /** S89 「自动咬字时序」: changes WHERE every onset consonant sits. */
+  consonantPreroll: boolean;
+}
+
+/** The lane's cache key. Cheap: reads the notes' fields directly, no triple building. */
+export function phonemeLaneSig(i: PhonemeLaneInputs): string {
+  return JSON.stringify([
+    i.notes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? ""]),
+    i.langId,
+    i.tokens.breath,
+    i.tokens.rest,
+    i.tempo,
+    i.consonantPreroll,
+  ]);
+}
+
+/** The `preview_vocal_phonemes` payload + the parallel arrays the lane needs to map spans back to notes.
+ *  Built from the SAME inputs object as the signature — that is the whole point. */
+export function phonemeLaneRequest(i: PhonemeLaneInputs): {
+  args: { score: ScoreTriple[]; defaultLang: number; consonantPreroll: boolean };
+  tripleNoteIds: (string | null)[];
+  ticksPerFrame: number;
+} {
+  const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(i.notes, i.tempo, i.tokens, i.langId);
+  return {
+    args: { score: triples, defaultLang: i.langId, consonantPreroll: i.consonantPreroll },
+    tripleNoteIds,
+    ticksPerFrame,
+  };
+}

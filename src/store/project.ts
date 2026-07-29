@@ -943,6 +943,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         if (vp.autoTuneFollow === true) delete vp.autoTuneFollow;
         // S84 E 刀 vowelClarity 同款极性(默认=开):true 折为 ABSENCE(审查抓的 S73b 复刻)。
         if (vp.vowelClarity === true) delete vp.vowelClarity;
+        // S89 consonantPreroll 同款极性(默认=开):true 折为 ABSENCE。
+        if (vp.consonantPreroll === true) delete vp.consonantPreroll;
         return { ...t, vocalParams: vp };
       }),
     })),

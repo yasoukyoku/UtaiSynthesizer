@@ -262,6 +262,17 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             onChange={(c) => setVocalParams(trackId, { vowelClarity: c })}
           />
         </div>
+        {/* S89 自动咬字时序: the S83 onset pre-roll (consonants ahead of the beat so the vowel lands ON
+            it). Turn OFF for a UTAU CVVC/VCCV alias score — its author already moved the consonants
+            ahead by hand, and pre-rolling again applies the same head start twice. Default ON,
+            absent≡true. The phoneme lane shows the difference immediately. */}
+        <div title={t("vocalEditor.sidebar.consonantPrerollTip")}>
+          <ToggleRow
+            label={t("vocalEditor.sidebar.consonantPreroll")}
+            checked={vocalParams.consonantPreroll !== false}
+            onChange={(c) => setVocalParams(trackId, { consonantPreroll: c })}
+          />
+        </div>
         {/* M3 breath token: the lyric that means "audible inhale" (mapped to AP at render). Editable so a
             custom trigger never steals a glyph the user needs as a real lyric. */}
         <div className="vsb-inline">

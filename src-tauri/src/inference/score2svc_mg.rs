@@ -25,7 +25,7 @@ use super::*;
 use super::e1_tests::write_wav16;
 use super::super::engine::{DeviceConfig, OnnxEngine};
 use super::super::rvc;
-use super::super::score2cv::{is_nucleus_phone, NoDicts};
+use super::super::score2cv::{is_nucleus_phone, ArticulationTiming, NoDicts};
 use super::super::sovits;
 use std::path::Path;
 use std::time::Instant;
@@ -152,7 +152,7 @@ fn mg_cvfix_inverse(
     evts: &[ScoreEvt<'_>],
     vf0: &VocalF0<'_>,
 ) -> Vec<f32> {
-    let arr = build_arrays_daw(evts, &NoDicts).unwrap();
+    let arr = build_arrays_daw(evts, &NoDicts, ArticulationTiming::Auto).unwrap();
     let mut hz = build_note_hz(&arr, evts, 0, Some(vf0));
     zero_voiceless_frames(&mut hz, &arr);
     anchor_voiced_phone_f0(&mut hz, &arr);
@@ -173,7 +173,7 @@ fn mg_lane_dump() {
     let evts = to_evts(&sj.triples);
     let total: i64 = sj.triples.iter().map(|t| t.frames).sum();
     assert_eq!(sj.f0_cents.len() as i64, total, "f0 length vs Σframes");
-    let arr = build_arrays_daw(&evts, &NoDicts).unwrap();
+    let arr = build_arrays_daw(&evts, &NoDicts, ArticulationTiming::Auto).unwrap();
     let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
     // 生产 f0 整形三连(render_score_rvc 同款;transpose 0)——hz 即模型真实吃到的 f0,
     // 归零窗/借帧锚定的落点不重算、直接数。
@@ -328,7 +328,14 @@ fn mg_render_rvc() {
     let t0 = Instant::now();
     let r = render_score_rvc(
         &m, &s2cv768, &evts, 768, 49, &NoDicts, &ropts,
-        ScoreShaping { consonant_emphasis_db: emph, consonant_valley_scale: valley, vowel_clarity: clarity },
+        ScoreShaping {
+            consonant_emphasis_db: emph,
+            consonant_valley_scale: valley,
+            vowel_clarity: clarity,
+            // S89: `UTAI_MG_PREROLL=0` renders the in-note arm, so the probe can A/B the switch on
+            // real material with everything else held fixed.
+            consonant_preroll: std::env::var("UTAI_MG_PREROLL").map(|s| s != "0").unwrap_or(true),
+        },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
@@ -497,7 +504,14 @@ fn mg_render_sovits() {
     let r = render_score_sovits(
         &m, &s2cv, &evts, dim, 49, &NoDicts, &sopts,
         crate::commands::inference::VOCAL_FLAT_VOL,
-        ScoreShaping { consonant_emphasis_db: emph, consonant_valley_scale: valley, vowel_clarity: clarity },
+        ScoreShaping {
+            consonant_emphasis_db: emph,
+            consonant_valley_scale: valley,
+            vowel_clarity: clarity,
+            // S89: `UTAI_MG_PREROLL=0` renders the in-note arm, so the probe can A/B the switch on
+            // real material with everything else held fixed.
+            consonant_preroll: std::env::var("UTAI_MG_PREROLL").map(|s| s != "0").unwrap_or(true),
+        },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
     )
@@ -592,7 +606,7 @@ fn mg_render_rvc_oversampled() {
     let ropts = RvcOptions { seed: 0, ..Default::default() };
 
     // ── 真时间轴(生产口径逐行)──
-    let arr = build_arrays_daw(&evts, &NoDicts).unwrap();
+    let arr = build_arrays_daw(&evts, &NoDicts, ArticulationTiming::Auto).unwrap();
     let mut note_hz_full = build_note_hz(&arr, &evts, 0, Some(&vf0));
     zero_voiceless_frames(&mut note_hz_full, &arr);
     anchor_voiced_phone_f0(&mut note_hz_full, &arr);

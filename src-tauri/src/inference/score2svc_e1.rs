@@ -32,7 +32,7 @@ use super::*;
 use super::super::engine::{DeviceConfig, OnnxEngine};
 use super::super::f0 as f0mod;
 use super::super::features;
-use super::super::score2cv::NoDicts;
+use super::super::score2cv::{ArticulationTiming, NoDicts};
 use super::super::{rvc, sovits};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -51,6 +51,7 @@ const NEUTRAL_SHAPING: ScoreShaping = ScoreShaping {
     consonant_emphasis_db: 0.0,
     consonant_valley_scale: 0.0,
     vowel_clarity: false,
+    consonant_preroll: true, // production default — a TIMING fact, not an output-domain stage
 };
 
 #[derive(serde::Deserialize)]
@@ -106,7 +107,7 @@ fn e1_render_sovits(
     options: &SovitsOptions,
     flat_vol: f32,
 ) -> crate::Result<SynthesisResult> {
-    let arr = build_arrays_daw(score, &NoDicts)?;
+    let arr = build_arrays_daw(score, &NoDicts, ArticulationTiming::Auto)?;
     // 参数化 f0 = 生产整形(Option-A cents→Hz + 清音帧归零);天然 f0 不在此处理(真实 voicing)。
     let param_hz_full: Vec<f32> = match f0_src {
         F0Src::Param(f0) => {
@@ -189,7 +190,7 @@ fn e1_render_rvc(
     f0_src: &F0Src,
     options: &RvcOptions,
 ) -> crate::Result<SynthesisResult> {
-    let arr = build_arrays_daw(score, &NoDicts)?;
+    let arr = build_arrays_daw(score, &NoDicts, ArticulationTiming::Auto)?;
     let param_hz_full: Vec<f32> = match f0_src {
         F0Src::Param(f0) => {
             let mut h = build_note_hz(&arr, score, 0, Some(f0));
@@ -386,7 +387,7 @@ fn e1_cross_probe() {
                     phoneme_input: None,
                 })
                 .collect();
-            let a = build_arrays_daw(&evts_dump, &NoDicts).unwrap();
+            let a = build_arrays_daw(&evts_dump, &NoDicts, ArticulationTiming::Auto).unwrap();
             let j = serde_json::json!({
                 "phonemes": a.phonemes, "phone_dur": a.phone_dur, "note_pitch": a.note_pitch,
                 "note_dur": a.note_dur, "note_to_phone": a.note_to_phone,

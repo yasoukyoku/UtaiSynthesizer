@@ -1318,10 +1318,10 @@ mod tests {
     //    via a rest = soft (the rest attaches to the previous run, so the cut lands in silence) ──
     #[test]
     fn chunking_cuts_at_language_change() {
-        use super::super::score2cv::{build_arrays_daw, chunk_at_sp};
+        use super::super::score2cv::{build_arrays_daw, chunk_at_sp, ArticulationTiming};
         let f = fixtures();
         let score = [evt("长", Lang::Zh), evt("light", Lang::En)];
-        let arr = build_arrays_daw(&score, &f).unwrap();
+        let arr = build_arrays_daw(&score, &f, ArticulationTiming::Auto).unwrap();
         let chunks = chunk_at_sp(&arr, 400);
         assert_eq!(chunks.len(), 2, "language change forces a cut even under max_frames");
         assert_eq!(chunks[0].lang_id, Lang::Zh.id());
@@ -1329,7 +1329,7 @@ mod tests {
         assert!(!chunks[0].hard_seam, "first chunk has no leading seam");
         assert!(chunks[1].hard_seam, "mid-voiced language cut → hard seam (micro-fade)");
         let score2 = [evt("长", Lang::Zh), evt("R", Lang::Zh), evt("light", Lang::En)];
-        let arr2 = build_arrays_daw(&score2, &f).unwrap();
+        let arr2 = build_arrays_daw(&score2, &f, ArticulationTiming::Auto).unwrap();
         let chunks2 = chunk_at_sp(&arr2, 400);
         assert_eq!(chunks2.len(), 2);
         assert!(!chunks2[1].hard_seam, "cut adjacent to SP is a soft seam (silence)");
@@ -1341,7 +1341,8 @@ mod tests {
     fn groups_never_span_languages() {
         let f = fixtures();
         let score = [evt("长", Lang::Zh), evt("light", Lang::En)]; // same pitch 60
-        let arr = super::super::score2cv::build_arrays_daw(&score, &f).unwrap();
+        use super::super::score2cv::ArticulationTiming;
+        let arr = super::super::score2cv::build_arrays_daw(&score, &f, ArticulationTiming::Auto).unwrap();
         assert_ne!(
             arr.note_to_phone[0],
             *arr.note_to_phone.last().unwrap(),

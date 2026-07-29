@@ -624,6 +624,21 @@ pub struct ScoreShaping {
     pub consonant_valley_scale: f32,
     /// S84 E 刀: vowel-clarity articulation oversampling (cv-domain).
     pub vowel_clarity: bool,
+    /// S89 「自动咬字时序」: `true` = S83 onset pre-roll (the nucleus lands on the beat);
+    /// `false` = every phone stays inside its own note. See `score2cv::ArticulationTiming`.
+    pub consonant_preroll: bool,
+}
+
+impl ScoreShaping {
+    /// The allocator's view of `consonant_preroll`. ONE conversion point, so the bool can never be
+    /// read as an `ArticulationTiming` with the polarity flipped at one call site out of three.
+    pub fn articulation_timing(&self) -> super::score2cv::ArticulationTiming {
+        if self.consonant_preroll {
+            super::score2cv::ArticulationTiming::Auto
+        } else {
+            super::score2cv::ArticulationTiming::InNote
+        }
+    }
 }
 
 impl Default for ScoreShaping {
@@ -632,6 +647,7 @@ impl Default for ScoreShaping {
             consonant_emphasis_db: DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley_scale: DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
+            consonant_preroll: true,
         }
     }
 }
@@ -664,7 +680,7 @@ pub fn render_score_sovits(
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
-    let mut arr = build_arrays_daw(score, dicts)?;
+    let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展: the model RENDERS at transpose+range_shift (inside its comfort zone);
     // apply_range_inverse below shifts the audio back. range_shift=0 ⇒ byte-identical to before.
     let transpose_eff = transpose + range_shift;
@@ -842,7 +858,7 @@ pub fn render_score_rvc(
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
 ) -> Result<SynthesisResult> {
-    let mut arr = build_arrays_daw(score, dicts)?;
+    let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
     let transpose_eff = transpose + range_shift;
     let mut note_hz_full = build_note_hz(&arr, score, transpose_eff, f0);
@@ -1316,7 +1332,7 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::score2cv::{build_arrays, NoDicts}; // Phase-1c parity entry (rest-capped)
+    use super::super::score2cv::{build_arrays, ArticulationTiming, NoDicts}; // Phase-1c parity entry (rest-capped)
     use super::super::score2cv_tables::parity_ref as pr;
 
     /// JA-defaulted events from legacy triples (the pre-S58 test fixtures).
@@ -1325,7 +1341,7 @@ mod tests {
     }
     /// DAW build over a JA triple fixture (rests uncapped + borrow-time).
     fn daw_ja(score: &[(&str, i64, i64)]) -> ScoreArrays {
-        build_arrays_daw(&ja_evts(score), &NoDicts).unwrap()
+        build_arrays_daw(&ja_evts(score), &NoDicts, ArticulationTiming::Auto).unwrap()
     }
 
     #[test]
@@ -1417,7 +1433,7 @@ mod tests {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
         };
-        let arr2 = build_arrays_daw(&[refined], &NoDicts).unwrap();
+        let arr2 = build_arrays_daw(&[refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let flags2 = voiceless_onset_flags(&arr2);
         let f_i = arr2.phon.iter().position(|&p| p == "f").unwrap();
         let d_i = arr2.phon.iter().position(|&p| p == "d").unwrap();
@@ -1457,7 +1473,7 @@ mod tests {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
         };
-        let arr2 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), refined], &NoDicts).unwrap();
+        let arr2 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d2 = boundary_valley_depths(&arr2);
         let ri = arr2.phon.iter().position(|&p| p == "ɹ").unwrap();
         let fi = arr2.phon.iter().position(|&p| p == "f").unwrap();
@@ -1478,7 +1494,7 @@ mod tests {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
         };
-        let arr4 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), sta], &NoDicts).unwrap();
+        let arr4 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), sta], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d4 = boundary_valley_depths(&arr4);
         let si = arr4.phon.iter().position(|&p| p == "s").unwrap();
         let ti = arr4.phon.iter().position(|&p| p == "t").unwrap();
@@ -1489,12 +1505,60 @@ mod tests {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
         };
-        let arr5 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), sta2], &NoDicts).unwrap();
+        let arr5 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), sta2], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d5 = boundary_valley_depths(&arr5);
         let si5 = arr5.phon.iter().position(|&p| p == "s").unwrap();
         let ti5 = arr5.phon.iter().position(|&p| p == "t").unwrap();
         assert!((d5[si5] - 5.1).abs() < 1e-6, "chain-internal cluster head valleys (fric)");
         assert!((d5[ti5] - 11.7).abs() < 1e-6, "chain-internal cluster tail valleys (stop)");
+    }
+
+    // S89: a VOICED onset must carry the note's pitch on BOTH articulation arms.
+    //
+    // Under Auto the S83 pre-roll parks that onset inside the PREVIOUS rest's frame span, where
+    // `build_note_hz` reads 0 Hz — SoVITS uv=0 / RVC pitchf=0 = an audibly mute onset, which is the
+    // whole reason `anchor_voiced_phone_f0` exists. Under InNote the onset never leaves its own
+    // note, so the repair should have nothing left to do. The assertion is on the OUTCOME ("no
+    // voiced-onset frame is ever 0 Hz"), NOT on "the repair is a no-op": the recon flagged that
+    // no-op-ness as something to PROVE rather than assume, and an outcome assertion stays true (and
+    // stays meaningful) whichever way that turns out.
+    ///
+    /// ⚠ This MUST run on the layered DAW f0 (`Some(&VocalF0)`), not the bare note-only mode. With
+    /// `None`, `build_note_hz` derives each phone's Hz from its own `note_pitch`, so a pre-rolled
+    /// onset is never 0 Hz and the test passes with the repair DELETED — I wrote it that way first
+    /// and the mutation probe caught it (S87 血训:「测试可能是瞎的」). The zero only exists because
+    /// the DAW f0 is a per-FRAME array whose rest region is voiced=0.
+    #[test]
+    fn voiced_onset_carries_pitch_on_both_articulation_arms() {
+        for timing in [ArticulationTiming::Auto, ArticulationTiming::InNote] {
+            let ma = g2p::ScoreEvt {
+                lyric: "x", note_num: 69, frames: 20, lang: g2p::Lang::Ja,
+                phoneme_input: Some("m a"),
+            };
+            let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), ma];
+            // the DAW's layered pitch: 10 silent frames, then 20 frames of A4 (6900 cents)
+            let cents: Vec<f32> = (0..30).map(|i| if i < 10 { 0.0 } else { 6900.0 }).collect();
+            let voiced: Vec<u8> = (0..30).map(|i| u8::from(i >= 10)).collect();
+            let vf0 = VocalF0 { cents: &cents, voiced: &voiced };
+            let arr = build_arrays_daw(&score, &NoDicts, timing).unwrap();
+            let mut hz = build_note_hz(&arr, &score, 0, Some(&vf0));
+            zero_voiceless_frames(&mut hz, &arr);
+            anchor_voiced_phone_f0(&mut hz, &arr);
+            let mi = arr.phon.iter().position(|&p| p == "m").expect("the voiced onset survives");
+            let start: i64 = arr.phone_dur[..mi].iter().sum();
+            for f in start..(start + arr.phone_dur[mi]) {
+                assert!(
+                    hz[f as usize] > 0.0,
+                    "{timing:?}: voiced onset frame {f} is 0 Hz — that is a muted consonant"
+                );
+            }
+            // and the arms really are different here (else the loop proves one thing twice)
+            if timing == ArticulationTiming::InNote {
+                assert_eq!(arr.phone_dur[0], 10, "InNote leaves the rest whole");
+            } else {
+                assert!(arr.phone_dur[0] < 10, "Auto pre-rolls out of the rest");
+            }
+        }
     }
 
     // S84 B 刀: sung phones with dur ≤4 weigh 0 (no retrieval); longer phones and rests weigh 1.
@@ -2051,6 +2115,7 @@ mod tests {
             consonant_emphasis_db: DEFAULT_VOICELESS_ONSET_EMPHASIS_DB,
             consonant_valley_scale: 0.0,
             vowel_clarity: false,
+            ..Default::default() // preroll: the baselines were rendered with it ON
         };
 
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)

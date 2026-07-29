@@ -521,6 +521,20 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     // … and the two triggers do not alias each other (a rest "X" ≠ a breath "X")
     expect(vocalParamsSig({ ...sigBase, restToken: "X" }, true)).not.toBe(vocalParamsSig({ ...sigBase, breathToken: "X" }, true));
   });
+
+  // ── S89 「自动咬字时序」 in the render signature ──
+  it("★ consonantPreroll folds OUT at its default and DOES enter the sig when turned off", () => {
+    // The default (ON) must hash byte-for-byte like the pre-switch string — otherwise adding this knob
+    // silently invalidates every bake that ships today. Pinned against the LITERAL for the same reason
+    // the rest-token case is: a mutation that appends `|cpr:1` to BOTH sides survives a self-comparison.
+    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0";
+    expect(vocalParamsSig(sigBase, true)).toBe(pinned);
+    expect(vocalParamsSig({ ...sigBase, consonantPreroll: true }, true)).toBe(pinned);
+    // …and OFF is a real re-render (the phone layout genuinely changes)
+    expect(vocalParamsSig({ ...sigBase, consonantPreroll: false }, true)).toBe(pinned + "|cpr:0");
+    // it is also an undoable track edit on the non-render view
+    expect(vocalParamsSig({ ...sigBase, consonantPreroll: false })).not.toBe(vocalParamsSig(sigBase));
+  });
 });
 
 
@@ -573,6 +587,17 @@ describe("S73 — autoTuned 调教所有权标记(假脏铁律全套)", () => {
     expect(useProjectStore.getState().tracks[0]!.vocalParams?.vowelClarity).toBe(false);
     useProjectStore.getState().setVocalParams(T, { vowelClarity: true });
     expect(useProjectStore.getState().tracks[0]!.vocalParams?.vowelClarity).toBeUndefined();
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(base); // 往返=字节不动
+  });
+
+  it("S89:consonantPreroll 关→开往返 = 折回 absence(同款极性,无字节假脏)", () => {
+    useProjectStore.getState().setVocalParams(T, { autoTuneFollow: true }); // 确保 vocalParams 已存在
+    const base = buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4]);
+    useProjectStore.getState().setVocalParams(T, { consonantPreroll: false });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.consonantPreroll).toBe(false);
+    expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).not.toBe(base); // 关掉是真改动
+    useProjectStore.getState().setVocalParams(T, { consonantPreroll: true });
+    expect(useProjectStore.getState().tracks[0]!.vocalParams?.consonantPreroll).toBeUndefined();
     expect(buildAutosaveJson("P", useProjectStore.getState().tracks, 120, [4, 4])).toBe(base); // 往返=字节不动
   });
 

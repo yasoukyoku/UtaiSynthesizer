@@ -631,6 +631,8 @@
       "consonantValleyTip": "Energy valley at syllable boundaries (voiced consonants too — r/m/n rows): real singing dips between every syllable, most audibly in fast runs. Higher = more separated syllables. 0 = off; default 1×.",
       "vowelClarity": "Vowel clarity",
       "vowelClarityTip": "Render fast-run short vowels at an inflated duration and resample back (cv-domain — no time-stretch artifacts), so 40-80 ms vowels still reach their target articulation. Default on.",
+      "consonantPreroll": "Automatic articulation timing",
+      "consonantPrerollTip": "Sing a syllable's opening consonant AHEAD of the beat so the vowel lands on it — what real singers do, what the training data annotates, and what a UTAU voicebank's preutterance does. Turn it OFF for imported UTAU CVVC / VCCV phoneme scores: those notes are transition units whose author already moved the consonants ahead by hand, so pre-rolling again applies the same head start twice. With it off, every phone stays inside its own note (a consonant that no longer fits a very short note is dropped — the phoneme lane shows this). Default on.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",
