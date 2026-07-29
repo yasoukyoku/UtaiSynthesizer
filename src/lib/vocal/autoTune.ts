@@ -18,6 +18,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Note, NoteTransition, VocalTrackParams } from "../../types/project";
 import { ticksToMs } from "../audio/laneOps";
+import { isSilentLyric, vocalTokens } from "../vocalNotes";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore, inGestureTransaction } from "../../store/history";
 
@@ -148,16 +149,28 @@ export async function applyAutoTune(
     return { applied: 0, skipped: 0 };
   }
   const notes = seg.content.notes; // 写入漏斗保证 (tick,id) 有序 = 命令的升序契约
-  const targetIdx: number[] = [];
+  // ★S88:模型只该看见【唱出来的那条线】。休止/呼吸音符不在渲染的音高链里(vocalRender 的 f0 喂入
+  //   走 isSilentLyric 过滤),把它们留在 payload 里等于告诉模型「这两个音符是连着的」,而渲染看到的
+  //   是一个乐句边界 —— 模型于是给一个本该收尾的音符预测了连奏滑音的 θ(durRight/depthRight/openEdge)。
+  //   它们自身也没有什么可调:往一个不发声的音符上写 transition/vibrato 只会搅动 contentSig,
+  //   让 bake 为一段不可能改变的音频判脏。(呼吸自 M3 起就有这个错位,休止标记把它变成了主路径。)
+  const tokens = vocalTokens(track.vocalParams);
+  const sung: Note[] = [];
   let skipped = 0;
-  notes.forEach((n, i) => {
+  for (const n of notes) {
+    if (isSilentLyric(n.lyric, tokens)) skipped++;
+    else sung.push(n);
+  }
+  if (sung.length === 0) return { applied: 0, skipped };
+  const targetIdx: number[] = []; // 下标是 `sung` 内的位置,θ 与 `sung` 同序同长
+  sung.forEach((n, i) => {
     if (!isUserTuned(n)) targetIdx.push(i);
     else skipped++;
   });
   if (targetIdx.length === 0) return { applied: 0, skipped };
 
-  const theta = await fetchTheta(notes, store.tempo);
-  if (theta.length !== notes.length) throw new Error("AUTOTUNE_SHAPE: theta/notes length");
+  const theta = await fetchTheta(sung, store.tempo);
+  if (theta.length !== sung.length) throw new Error("AUTOTUNE_SHAPE: theta/notes length");
 
   // ★await 窗口竞态守卫(S73 审查):eligibility/θ 对位都基于 await 前的快照;期间用户若
   //   手动编辑(所有权可能已移交)/增删移音符(θ 索引错位)/删段,旧补丁一律不许落盘——
@@ -172,7 +185,7 @@ export async function applyAutoTune(
 
   const update: Record<string, Partial<Note>> = {};
   for (const i of targetIdx) {
-    const n = notes[i];
+    const n = sung[i];
     const th = theta[i];
     if (!n || !th) continue;
     update[n.id] = thetaToFields(th, scales, phaseForTake(scales.take, n.id));

@@ -8,7 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../workflow/voiceDefaults";
 import { evalF0CentsFrames, evalCurveAt } from "../f0eval";
-import { isBreathLyric, ZERO_TRANSITION, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../vocalNotes";
+import { isBreathLyric, isRestLyric, isSilentLyric, vocalTokens, ZERO_TRANSITION, DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, type VocalTokens } from "../vocalNotes";
 import { DEFAULT_LANG_ID, effLangId } from "./languages";
 import { msToTicks } from "../audio/laneOps";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
@@ -154,17 +154,22 @@ export function buildVocalScore(
   pitchDev: PitchCurve | undefined,
   tempo: number,
   defaultTransition: Required<NoteTransition>,
-  breathToken: string,
+  tokens: VocalTokens,
   paramCurves?: Record<string, PitchCurve>,
   formantScalar = 0,
   defaultLangId: number = DEFAULT_LANG_ID,
 ): { triples: ScoreTriple[]; f0Cents: number[]; f0Voiced: number[]; loudnessEnv: number[]; formantEnv: number[] } {
-  const { triples, f0Notes, ticksPerFrame, frameCount } = buildScoreTriples(notes, tempo, breathToken, defaultLangId);
-  // f0 sees the notes WITHOUT breaths (they're unvoiced): a breath's frames fall in a rest gap → voiced 0,
-  // and its neighbours become phrase edges (release-drift before, onset-scoop after). frameCount is unchanged
-  // (it's the triple cursor incl. breath frames), so the array length still equals Σ(triple frames).
+  const { triples, f0Notes, ticksPerFrame, frameCount } = buildScoreTriples(notes, tempo, tokens, defaultLangId);
+  // f0 sees the notes WITHOUT the SILENT ones (breath = unvoiced inhale, rest = silence): their frames fall
+  // in a rest gap → voiced 0, and their neighbours become phrase edges (release-drift before, onset-scoop
+  // after). frameCount is unchanged (it's the triple cursor incl. those frames), so the array length still
+  // equals Σ(triple frames).
+  // ⚠ S88: a REST note used to stay in this chain — it rendered as `R` (Rust: no phones) while the f0 feed
+  // still declared it voiced at whatever pitch it was drawn on, so the line glided INTO and OUT of a
+  // silence instead of breaking there. Written as a gap the same music behaved differently; that split is
+  // what `isSilentLyric` closes.
   // S87 #3: `f0Notes`, not `sorted` — a borrowed frame must carry the BORROWER's pitch (see the borrow pass).
-  const pitchNotes = f0Notes.filter((n) => !isBreathLyric(n.lyric, breathToken));
+  const pitchNotes = f0Notes.filter((n) => !isSilentLyric(n.lyric, tokens));
   const { cents, voiced } = evalF0CentsFrames(
     pitchNotes,
     pitchDev,
@@ -186,14 +191,14 @@ export function buildVocalScore(
 }
 
 /** The score-triple construction shared by the RENDER (buildVocalScore) and the OOV VALIDATION watcher
- *  (oovWatch) — the validation payload must be STRUCTURALLY IDENTICAL to what renders (same breath
- *  mapping, same inserted gap rests — a rest breaks a zh phrase window, so its presence changes the
+ *  (oovWatch) — the validation payload must be STRUCTURALLY IDENTICAL to what renders (same breath/rest
+ *  token mapping, same inserted gap rests — a rest breaks a zh phrase window, so its presence changes the
  *  polyphone verdict) or the editor's marking could drift from the render's judgment. `tripleNoteIds`
  *  is parallel to `triples` (null = an inserted gap rest) so verdicts map back to notes. Pure. */
 export function buildScoreTriples(
   notes: readonly Note[],
   tempo: number,
-  breathToken: string,
+  tokens: VocalTokens,
   defaultLangId: number,
 ): {
   triples: ScoreTriple[];
@@ -228,10 +233,13 @@ export function buildScoreTriples(
   const ticksPerFrame = msToTicks(1000 / RENDER_FPS, tempo); // 20 ms per 50fps frame
   const frameOf = (relTick: number) => Math.round(relTick / ticksPerFrame);
   const sorted = [...notes].sort((a, b) => a.tick - b.tick || (a.id < b.id ? -1 : 1));
-  // M3 breath: a breath lyric (canonical AP/ap or the track's trigger) maps to the `AP` phone Rust
-  // recognizes. It is also UNVOICED — dropped from the pitch chain by the caller so it breaks the line
-  // and the neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the breath.
-  const mapLyric = (l: string) => (isBreathLyric(l, breathToken) ? "AP" : l);
+  // The two per-track triggers map onto the tokens Rust hard-wires, so a user's convenient glyph never has
+  // to be stolen from real lyric material: a breath lyric → the `AP` phone, a rest lyric → `R`. Both are
+  // also dropped from the pitch chain by the caller (isSilentLyric) so they break the line and the
+  // neighbours get the §10.5 release/scoop (段中尾音) instead of gliding into/out of the silence.
+  // Rest is tested first — the isSilentLyric tie-break, kept identical here so the triple and the pitch
+  // chain can never disagree about a note whose two tokens were set to the same string.
+  const mapLyric = (l: string) => (isRestLyric(l, tokens.rest) ? "R" : isBreathLyric(l, tokens.breath) ? "AP" : l);
 
   // ── PASS 1 — tile the segment into frame-bounded items (a gap rest, then its note, …). Boundaries are
   //    SHARED: item[k].endF === item[k+1].startF. That is the whole trick: Σframes telescopes to the last
@@ -242,6 +250,10 @@ export function buildScoreTriples(
     startF: number;
     endF: number;
     lang: number;
+    /** SILENCE, whether written as a gap or as a note carrying the rest token. Every rule below keys on
+     *  THIS, not on `note === null`: a written rest is a rest, and treating it as a sung note is what made
+     *  it lend like one, block a rescue like one, and get warned about like one. */
+    rest: boolean;
   }
   const items: Item[] = [];
   const shortNoteIds: string[] = [];
@@ -250,14 +262,17 @@ export function buildScoreTriples(
     const start = Math.max(cursor, n.tick);
     const end = n.tick + n.duration;
     if (end <= cursor) continue; // fully swallowed by a previous note (defensive — notes don't overlap)
-    if (n.duration < ticksPerFrame) shortNoteIds.push(n.id); // phase-INDEPENDENT "too short" fact
+    const isRest = isRestLyric(n.lyric, tokens.rest);
+    // phase-INDEPENDENT "too short" fact — but only for notes that were meant to SOUND. Warning that a
+    // rest "will not be heard" is a false alarm: not being heard is the whole point of writing one.
+    if (!isRest && n.duration < ticksPerFrame) shortNoteIds.push(n.id);
     // S58: per-note effective language (note override ?? track default). Gap rests take the default —
     // Rust's run assignment attaches them to the surrounding run anyway (a rest's lang is only read
     // when the whole score has no sung note).
     const cursorF = frameOf(cursor);
     const startF = frameOf(start);
-    if (startF > cursorF) items.push({ note: null, startF: cursorF, endF: startF, lang: defaultLangId });
-    items.push({ note: n, startF, endF: frameOf(end), lang: effLangId(n.lang, defaultLangId) });
+    if (startF > cursorF) items.push({ note: null, startF: cursorF, endF: startF, lang: defaultLangId, rest: true });
+    items.push({ note: n, startF, endF: frameOf(end), lang: effLangId(n.lang, defaultLangId), rest: isRest });
     cursor = end;
   }
   const frameCount = frameOf(cursor);
@@ -273,7 +288,7 @@ export function buildScoreTriples(
   //    loudly. ──
   const MIN_KEEP_REST = 1;
   const MIN_KEEP_NOTE = 2;
-  const canLend = (it: Item) => it.endF - it.startF >= (it.note ? MIN_KEEP_NOTE : MIN_KEEP_REST) + 1;
+  const canLend = (it: Item) => it.endF - it.startF >= (it.rest ? MIN_KEEP_REST : MIN_KEEP_NOTE) + 1;
   /** ★ The knife may only fire when it CANNOT HARM A NEIGHBOUR. A rescued note is exactly ONE frame long,
    *  and Rust's allocator pre-rolls the NEXT sung note's onset consonant out of the phone before it
    *  (score2cv.rs `assemble_arrays`, S83): a 1-frame lender yields `avail = (1 - SUNG_KEEP_MIN) = 0`, so the
@@ -282,8 +297,16 @@ export function buildScoreTriples(
    *  S83 was built to remove, and trading a full written note's consonant for a ~5 ms grace note is a bad
    *  deal. So: rescue only when nothing needs to pre-roll from us — the next item is a REST (an SP lender is
    *  fine) or there is no next item. Otherwise the note is still reported as too short, exactly as before
-   *  this knife existed. Never better than baseline is acceptable; WORSE than baseline is not. */
-  const rescueIsSafe = (next: Item | null) => !next || !next.note;
+   *  this knife existed. Never better than baseline is acceptable; WORSE than baseline is not.
+   *  ⚠ S88 review — the lender must be a rest that SURVIVES ONTO THE WIRE. Until rest NOTES existed this
+   *  was free: a gap rest is only pushed when `startF > cursorF` (PASS 1), so it always has ≥1 frame, and
+   *  `!next.note` therefore implied "an SP triple exists to pre-roll from". A WRITTEN rest has no such
+   *  floor — a sub-frame one emits nothing (PASS 3 skips frames ≤ 0) and can never acquire a frame (PASS 2
+   *  only rescues sung notes), so the phone actually following the borrower would be the next SUNG note,
+   *  which then pre-rolls its onset out of a 1-frame nucleus: `avail = 0`, consonant lost. Measured on the
+   *  first cut of this diff: 78.7% of rescues in that shape. So require a NON-EMPTY rest; anything else
+   *  (a sung note, or any item that vanishes) falls back to the baseline refusal. */
+  const rescueIsSafe = (next: Item | null) => !next || (next.rest && next.endF > next.startF);
   const borrowedNoteIds: string[] = [];
   const droppedNoteIds: string[] = [];
   /** noteId → the span the F0 feed must use (see PASS 3). `grace` = this note IS the rescued one. */
@@ -300,7 +323,8 @@ export function buildScoreTriples(
     retimed.set(n.id, { start, end: Math.max(start + ticksPerFrame * 1e-3, end), grace });
   for (let i = 0; i < items.length; i++) {
     const it = items[i]!;
-    if (!it.note || it.endF > it.startF) continue; // not a note, or it already sounds
+    // Nothing to rescue for a REST that rounded away (silence is what it asked for) — only sung notes.
+    if (!it.note || it.rest || it.endF > it.startF) continue; // not a sung note, or it already sounds
     const prev = i > 0 ? items[i - 1]! : null;
     const next = i + 1 < items.length ? items[i + 1]! : null;
     if (!rescueIsSafe(next)) {
@@ -328,9 +352,11 @@ export function buildScoreTriples(
     // last match wins — silently hands a frame to the wrong pitch.)
     const bs = frameTick(it.startF);
     const be = frameTick(it.endF);
+    // (`!rest` on both sides: a rest note is filtered out of the pitch chain, so it owns no sample point
+    //  to fight over — retiming it would only put a never-read entry in the map.)
     setSpan(it.note, bs, be, true);
-    if (prev?.note) setSpan(prev.note, spanOf(prev.note).start, bs, spanOf(prev.note).grace);
-    if (next?.note) setSpan(next.note, be, spanOf(next.note).end, spanOf(next.note).grace);
+    if (prev?.note && !prev.rest) setSpan(prev.note, spanOf(prev.note).start, bs, spanOf(prev.note).grace);
+    if (next?.note && !next.rest) setSpan(next.note, be, spanOf(next.note).end, spanOf(next.note).grace);
   }
 
   // ── PASS 3 — emit the triples, and the F0 feed. The pitch line is sampled by TICK (evalF0CentsFrames),
@@ -349,7 +375,12 @@ export function buildScoreTriples(
       tripleNoteIds.push(null);
       continue;
     }
-    const t: ScoreTriple = { lyric: mapLyric(it.note.lyric), note_num: it.note.pitch, frames, lang: it.lang };
+    // A REST note carries no pitch, so it emits the same `note_num: 0` a gap rest does — "written as a
+    // note" and "written as a gap" become the SAME payload, byte for byte. Rust already zeroes it
+    // internally (score2svc's npitch, via is_silent_token); matching here means no consumer of the wire
+    // has to remember to, which is exactly how the dead-zone planner came to read a silence as a sung
+    // note. A BREATH keeps its drawn pitch: it is a real phone whose note_num merely goes unused.
+    const t: ScoreTriple = { lyric: mapLyric(it.note.lyric), note_num: it.rest ? 0 : it.note.pitch, frames, lang: it.lang };
     if (it.note.phonemeInput) t.phoneme_input = it.note.phonemeInput;
     triples.push(t);
     tripleNoteIds.push(it.note.id);
@@ -469,7 +500,7 @@ export async function renderVocalSegment(req: {
 
 /** The full set of inputs a bake depends on, as one string: the segment content (notes + pitchDev +
  *  paramCurves, via contentSig), the track's vocal params (backend/speaker/lang/transpose/transition/
- *  sovits/rvc/breathToken, via vocalParamsSig), the singer (voiceModel), and the tempo — buildVocalScore
+ *  sovits/rvc/breath+rest tokens, via vocalParamsSig), the singer (voiceModel), and the tempo — buildVocalScore
  *  derives its 50fps grid + f0 from the tempo, so a BPM change alters the bake even with identical notes.
  *  Reuses the history helpers (single source — never fork a sig). */
 export function vocalRenderSig(track: Track, seg: Segment, tempo: number): string {
@@ -540,8 +571,16 @@ export const G2P_ALGO_VERSION = "s86";
  *  ⚠ FRONTEND-ONLY on purpose — no Rust counterpart to keep in lockstep: the allocation happens here, and
  *  the audition cache (audition.rs) renders its own fixed probe score that this cannot touch.
  *  (S83/S84's timing knives predate this token and shipped with "re-render old projects by hand"; new
- *  timing work should bump this instead.) */
-export const SCORE_TIMING_VERSION = "s87";
+ *  timing work should bump this instead.)
+ *  s88 = a note carrying a REST token is silence everywhere, not only in Rust: it leaves the f0 pitch
+ *  chain (the line breaks over it instead of gliding through), it lends frames at the rest floor, it no
+ *  longer blocks a neighbour's rescue, and it is no longer warned about for being short. Written as a
+ *  gap, the same music always behaved this way — this is the two spellings converging.
+ *  ⚠ ALSO the invalidation carrier for the Rust-side fix in the same round (commands/inference.rs: the
+ *  dead-zone planner's note list now zeroes silent tokens instead of reading their drawn pitch). That
+ *  fix only reaches the SCORE render path, whose signature is exactly this one — but it does mean the
+ *  "frontend-only" line above describes the TOKEN, not the round. */
+export const SCORE_TIMING_VERSION = "s88";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
@@ -624,10 +663,16 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   if (!entry) throw new Error(VOCAL_NO_VOICE);
   const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
-    seg.content.notes, seg.content.pitchDev, tempo, vp.transition, vp.breathToken ?? "AP",
+    seg.content.notes, seg.content.pitchDev, tempo, vp.transition, vocalTokens(vp),
     seg.content.paramCurves, vp.formant ?? 0, vp.langId,
   );
-  if (triples.length === 0) throw new Error(VOCAL_EMPTY);
+  // Nothing to sing → say so, LOUDLY. A segment whose triples are ALL rests would otherwise render
+  // successfully and deposit a bake of pure silence with no mark anywhere: a rest can never be OOV (Rust
+  // validates the canonical `R` we send) and is deliberately excluded from the short/dropped channels.
+  // That is one keystroke away now — the rest token is free text, and `a` is the default lyric of five of
+  // the seven languages — so "the whole track went quiet and nothing told me why" has to be impossible.
+  // (Pre-S88 an all-`R` segment did exactly that; the knob only made it reachable.)
+  if (!triples.some((t) => t.lyric !== "R")) throw new Error(VOCAL_EMPTY);
   await renderVocalSegment({
     trackId: track.id,
     segmentId: seg.id,

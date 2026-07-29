@@ -10,6 +10,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Track, VibratoSpec } from "../../types/project";
 import { useProjectStore } from "../../store/project";
+import { isBreathLyric, isRestLyric, vocalTokens, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../vocalNotes";
 
 export type ScoreFormat = "ust" | "ustx" | "midi";
 
@@ -50,9 +51,16 @@ export function scoreExportableTracks(tracks: Track[]): ScoreTrackChoice[] {
 }
 
 /** Flatten one track's notes to absolute ticks, sorted. (Overlap truncation across segment boundaries
- *  is Rust's defensive job — the editor invariant keeps notes disjoint WITHIN a segment only.) */
+ *  is Rust's defensive job — the editor invariant keeps notes disjoint WITHIN a segment only.)
+ *
+ *  S88 — the two per-track lyric TRIGGERS are canonicalized on the way out (rest → `R`, breath → `AP`),
+ *  exactly as the render maps them. A `.ust`/`.ustx`/`.mid` carries no track params, so a custom trigger
+ *  would arrive at the other end (or back here, into a fresh track) as an ordinary word: the rests would
+ *  be SUNG and the breaths would be OOV. Canonical tokens mean the same thing to every UTAU-family tool,
+ *  which is the entire point of exporting. The `.usp` project file keeps the user's own spelling. */
 function flattenTrack(track: Track): ExportNotePayload[] {
   const notes: ExportNotePayload[] = [];
+  const tokens = vocalTokens(track.vocalParams);
   for (const seg of track.segments) {
     if (seg.content.type !== "notes") continue;
     for (const n of seg.content.notes) {
@@ -60,7 +68,11 @@ function flattenTrack(track: Track): ExportNotePayload[] {
         tick: seg.startTick + n.tick,
         duration: n.duration,
         pitch: n.pitch,
-        lyric: n.lyric,
+        lyric: isRestLyric(n.lyric, tokens.rest)
+          ? DEFAULT_REST_TOKEN
+          : isBreathLyric(n.lyric, tokens.breath)
+            ? DEFAULT_BREATH_TOKEN
+            : n.lyric,
         velocity: n.velocity,
         ...(n.vibrato ? { vibrato: n.vibrato } : {}),
         ...(n.detune ? { detune: n.detune } : {}),

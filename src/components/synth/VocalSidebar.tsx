@@ -19,7 +19,7 @@ import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
 import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, type VoiceModelEntry } from "../../store/voice-models";
 import { effTransition } from "../../lib/f0eval";
-import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../../lib/vocalNotes";
+import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
 import { backendOf, backendLabel, pickVoiceForTrack } from "../../lib/vocal/voicePick";
 import { DIFFUSION_METHODS, RVC_DEFAULTS, SOVITS_DEFAULTS, type RvcOptions, type SovitsOptions } from "../../lib/workflow/voiceDefaults";
@@ -270,8 +270,22 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             className="vsb-text"
             type="text"
             spellCheck={false}
-            value={vocalParams.breathToken ?? "AP"}
+            value={vocalParams.breathToken ?? DEFAULT_BREATH_TOKEN}
             onChange={(e) => setVocalParams(trackId, { breathToken: e.target.value })}
+          />
+        </div>
+        {/* S88 rest token: the twin of the breath token — the lyric that means "a rest" (mapped to the
+            canonical R at render). S86 narrowed the hard-wired rest set so `rest`/`sil`/`pau` stay singable
+            words; this box is how a user picks a convenient trigger back without stealing one from every
+            language at once. */}
+        <div className="vsb-inline">
+          <label className="vsb-label" title={t("vocalEditor.sidebar.restTokenTip")}>{t("vocalEditor.sidebar.restToken")}</label>
+          <input
+            className="vsb-text"
+            type="text"
+            spellCheck={false}
+            value={vocalParams.restToken ?? DEFAULT_REST_TOKEN}
+            onChange={(e) => setVocalParams(trackId, { restToken: e.target.value })}
           />
         </div>
         {/* S60-2 音域扩展: shift into the singer's tested comfort zone, Signalsmith inverse back.

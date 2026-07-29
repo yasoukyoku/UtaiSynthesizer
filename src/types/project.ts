@@ -293,6 +293,11 @@ export interface VocalTrackParams {
    *  time, so the user can pick a convenient trigger without the breath function stealing a glyph they need
    *  as a real lyric. Absent = "AP" (the default; `ap` also works, being AP's case variant Rust-side). */
   breathToken?: string;
+  /** S88: the lyric token that means "a rest" — those notes are silent AND carry no pitch (exactly like
+   *  leaving a gap). Mapped to the canonical `R` before the score reaches Rust, so the trigger the user
+   *  picks never has to be stolen from real lyric material. Absent = "R" (the default; `r` and an empty
+   *  lyric also work, being what Rust hard-wires). The counterpart of `breathToken`. */
+  restToken?: string;
   /** S83 knife 6b: voiceless-ONSET emphasis in dB (the SynthV "consonant strength" analogue) — a small
    *  output-domain trapezoid gain on voiceless onset phone windows (codas untouched). 0 = off (exact
    *  no-op); absent = DEFAULT_CONSONANT_EMPHASIS_DB (2.5). The default folds OUT of the render sig so

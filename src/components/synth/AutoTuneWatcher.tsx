@@ -23,6 +23,8 @@ import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { contentSig, inGestureTransaction } from "../../store/history";
 import { applyAutoTune, autoTuneScalesOf } from "../../lib/vocal/autoTune";
+import { vocalTokens } from "../../lib/vocalNotes";
+import type { SegmentContent, VocalTrackParams } from "../../types/project";
 import { preflightAuxPack } from "../../lib/vocal/vocalRender";
 import i18n from "../../i18n";
 
@@ -33,10 +35,28 @@ const FAIL_COOLDOWN_MS = 60_000;
 let pausedUntil = 0;
 let failNoticeShown = false;
 
+/**
+ * THE follow key — everything that can change the θ this segment should be carrying. ONE expression,
+ * used BOTH to decide whether to re-tune AND to stamp the result: written twice they can drift, and a
+ * drift is not a small bug — a stamp that never equals the check re-runs the model on every pass forever.
+ *
+ * S88 adds the two lyric TRIGGERS. θ is predicted from note adjacency alone, and `applyAutoTune` now
+ * feeds the model only the SUNG line, so re-pointing a trigger changes which notes it sees — and thus the
+ * θ of their neighbours (a note that just became silence turns its predecessor's edge from legato into a
+ * phrase end). The tokens live on the TRACK, so `contentSig` cannot see them; without them here the fix
+ * would lie dormant at exactly the moment it matters. Confirmed against the user's own project, whose
+ * re-pointed note still carried θ shaped for the old reading.
+ */
+function followSig(content: SegmentContent, tempo: number, p: VocalTrackParams | undefined): string {
+  const s = autoTuneScalesOf(p);
+  const tk = vocalTokens(p);
+  return `${contentSig(content)}|${tempo}|${s.expr}|${s.vib}|${s.take}|${tk.breath}|${tk.rest}`;
+}
+
 export function AutoTuneWatcher() {
   const tracks = useProjectStore((s) => s.tracks);
   const tempo = useProjectStore((s) => s.tempo);
-  /** segId → 上次处理完的 `${contentSig}|${tempo}|${expr}|${vib}|${take}`。 */
+  /** segId → 上次处理完的 followSig(见上:判定与入账必须同一表达式)。 */
   const doneRef = useRef(new Map<string, string>());
   const busyRef = useRef(false);
   const pendingRef = useRef(false);
@@ -80,7 +100,7 @@ export function AutoTuneWatcher() {
             if (seg.content.type !== "notes") continue;
             liveIds.add(seg.id);
             if (seg.content.notes.length === 0) continue;
-            const sig = `${contentSig(seg.content)}|${st.tempo}|${scales.expr}|${scales.vib}|${scales.take}`;
+            const sig = followSig(seg.content, st.tempo, p);
             if (!follow || doneRef.current.get(seg.id) === sig) continue;
             let res;
             try {
@@ -107,11 +127,7 @@ export function AutoTuneWatcher() {
             const freshTrack = now.tracks.find((x) => x.id === t.id);
             const fresh = freshTrack?.segments.find((s) => s.id === seg.id);
             if (fresh && fresh.content.type === "notes") {
-              const freshScales = autoTuneScalesOf(freshTrack?.vocalParams);
-              doneRef.current.set(
-                seg.id,
-                `${contentSig(fresh.content)}|${now.tempo}|${freshScales.expr}|${freshScales.vib}|${freshScales.take}`,
-              );
+              doneRef.current.set(seg.id, followSig(fresh.content, now.tempo, freshTrack?.vocalParams));
             }
           }
         }

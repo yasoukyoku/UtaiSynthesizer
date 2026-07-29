@@ -12,7 +12,7 @@ import {
   nextSnapshotSeq,
   resolveDetachAncestor,
 } from "../lib/audio/laneOps";
-import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY } from "../lib/vocalNotes";
+import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, breathTokenKey, restTokenKey } from "../lib/vocalNotes";
 import type { Track, Segment, SegmentContent, LaneControl, Note, PitchCurve, VocalTrackParams } from "../types/project";
 
 // ── HMR safety (DEV ONLY — a no-op in the production build) ──
@@ -163,7 +163,18 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const cvl = (p.consonantValley ?? DEFAULT_CONSONANT_VALLEY) !== DEFAULT_CONSONANT_VALLEY ? `|cvl:${p.consonantValley}` : "";
   // S84 E 刀: only the OFF state enters the sig (absent≡true folds out — existing bakes stay clean).
   const vcl = p.vowelClarity === false ? "|vcl:0" : "";
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|bt:${p.breathToken ?? ""}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}`;
+  // S88 — the two lyric triggers enter through the CANONICALIZER, not raw. `restTokenKey`/`breathTokenKey`
+  // return "" for every spelling that classifies exactly like the default (absent / blank / the canonical
+  // token / a padded one), so a bake can only be declared dirty by a token that can really change a note's
+  // class. Hashing the raw string re-rendered whole tracks for nothing — and, because the loader rewrites a
+  // blank token back to the canonical one, flipped the verdict again on the next reload (S88 review).
+  // ⚠ This also folds `bt:`, which was unconditional before. That changes the sig string for every project
+  // — free THIS round only, because SCORE_TIMING_VERSION s88 already invalidates every vocal bake; doing it
+  // at any other time would have cost a global re-render on its own.
+  const bt = breathTokenKey(p.breathToken);
+  const rt = restTokenKey(p.restToken);
+  const tok = (bt ? `|bt:${bt}` : "") + (rt ? `|rt:${rt}` : "");
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}${tok}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

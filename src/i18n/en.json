@@ -647,6 +647,8 @@
       "q_protect": "Consonant protect",
       "breathToken": "Breath token",
       "breathTokenTip": "Notes with this lyric render as a breath; set it to any word you like. AP/ap are always breath.",
+      "restToken": "Rest token",
+      "restTokenTip": "Notes with this lyric render as a rest: silent, and the pitch line breaks over them — exactly like leaving a gap. R/r are always a rest. Pick something that never occurs as a real lyric: an ordinary word silences every note carrying it, and rests get no red mark.",
       "language": "Language",
       "trackLang": "Track default",
       "trackLangTip": "Lyrics on this track convert to phonemes in this language; individual notes can override it below.",

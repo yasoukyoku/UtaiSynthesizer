@@ -1413,6 +1413,31 @@ pub struct ScoreNote {
     pub phoneme_input: Option<String>,
 }
 
+/// The note-pitch list the RANGE-EXTEND dead-zone planner reads, with SILENT tokens zeroed — exactly the
+/// `npitch` rule `score2svc::compute_note_groups` uses, from the same single predicate.
+///
+/// ★ Why this cannot be `|n| n.note_num`: `vocal_range::dead_only_plan` and `dead_group_windows` detect a
+/// rest by `note_num <= 0` (that is how a phrase — the unit a rescue shift is decided over — is delimited).
+/// A gap rest always arrives as 0, but a rest or breath written as a NOTE carries whatever pitch it was
+/// drawn on, so a silence read as a sung note: it welds two phrases into ONE scan window (the shift is then
+/// chosen against notes that belong to a different phrase) and can itself be judged "dead" and drag a
+/// transposition onto material that makes no sound. Silent-token notes are the only inputs this changes;
+/// every score without one is bit-identical, which is why S88's timing-version bump is enough to invalidate
+/// the affected bakes. (S86 extracted `is_silent_token` for precisely this class of consumer drift — this
+/// call site was the last one still bypassing it.)
+fn plan_note_nums(score: &[ScoreNote]) -> Vec<i64> {
+    score
+        .iter()
+        .map(|n| {
+            if crate::inference::g2p::is_silent_token(&n.lyric) {
+                0
+            } else {
+                n.note_num
+            }
+        })
+        .collect()
+}
+
 /// Wire-contract options for render_vocal_segment — mirrored by src\lib\vocal\vocalRender.ts (VocalRenderOptions).
 /// Item-1: the score render now drives the SAME quality path as 翻唱, so the backend-specific knobs REUSE the
 /// existing `SovitsOptions`/`RvcOptions` contracts (no third source of truth). The command layer force-
@@ -1733,7 +1758,7 @@ pub async fn render_vocal_segment(
         };
         match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
             Some(r) => {
-                let nn: Vec<i64> = score.iter().map(|n| n.note_num).collect();
+                let nn = plan_note_nums(&score);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
                 let (plan, unfixable) =
                     crate::inference::vocal_range::dead_only_plan(&nn, options.transpose, &r);
@@ -2018,5 +2043,70 @@ pub async fn render_vocal_segment(
             .await
             .map_err(|e| format!("VOCAL_TASK_PANICKED: {}", e))?
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(lyric: &str, note_num: i64) -> ScoreNote {
+        ScoreNote { lyric: lyric.to_string(), note_num, frames: 10, lang: None, phoneme_input: None }
+    }
+
+    /// A rest/breath written as a NOTE keeps whatever pitch it was drawn on. The dead-zone planner
+    /// delimits phrases by `note_num <= 0`, so that pitch must not reach it (see `plan_note_nums`).
+    #[test]
+    fn plan_note_nums_zeroes_silent_tokens() {
+        let score = [
+            note("R", 71),   // a rest drawn high on the staff
+            note("か", 60),
+            note("AP", 84),  // a breath drawn even higher
+            note("き", 62),
+            note("r", 0),
+            note("", 55),    // an empty lyric is a rest too (g2p token_class)
+        ];
+        assert_eq!(plan_note_nums(&score), vec![0, 60, 0, 62, 0, 0]);
+    }
+
+    /// The words S86 deliberately freed are ORDINARY lyrics — zeroing one here would silently drop a sung
+    /// note out of its own phrase (and out of the range decision made for it).
+    #[test]
+    fn plan_note_nums_keeps_freed_words_and_sustains() {
+        let score = [note("rest", 60), note("sil", 61), note("pau", 62), note("-", 63), note("+", 64)];
+        assert_eq!(plan_note_nums(&score), vec![60, 61, 62, 63, 64]);
+    }
+
+    /// The phrase-delimiting consequence, stated as BEHAVIOUR — the planner is actually run, because
+    /// comparing `plan_note_nums` with itself would be equal by construction and green under any mutation
+    /// that changes both sides (S88 review caught exactly that).
+    ///
+    /// usable 48..79 ⇒ か(60) sings and き(85) is dead. The rest between them is DRAWN at 71, i.e. INSIDE
+    /// the usable band, so if its pitch reaches the planner it reads as a healthy sung note and welds the
+    /// two phrases into one scan window — and the rescue shift then drags the healthy か down with it.
+    #[test]
+    fn a_written_rest_delimits_phrases_like_a_gap() {
+        use crate::inference::vocal_range::{dead_only_plan, SpeakerRange};
+        let range = SpeakerRange::bounds((48.0, 79.0), (55.0, 74.0));
+        let score = [note("か", 60), note("R", 71), note("き", 85)];
+
+        let (plan, unfixable) = dead_only_plan(&plan_note_nums(&score), 0, &range);
+        assert!(unfixable.is_empty(), "the dead phrase has a landing — nothing should be unfixable");
+        assert_eq!(plan.len(), 1, "one dead phrase ⇒ one group");
+        assert_eq!(
+            (plan[0].start, plan[0].end),
+            (2, 2),
+            "only the phrase that is actually dead may be transposed"
+        );
+
+        // The pre-fix input, for contrast: the same score with the drawn pitch left in place.
+        let raw: Vec<i64> = score.iter().map(|n| n.note_num).collect();
+        let (welded, _) = dead_only_plan(&raw, 0, &range);
+        assert_ne!(plan, welded, "reading a silence's drawn pitch changes the range decision");
+        assert!(
+            welded.first().is_none_or(|g| g.start == 0),
+            "…and when it does decide, it drags the healthy phrase along (start 0)"
+        );
     }
 }

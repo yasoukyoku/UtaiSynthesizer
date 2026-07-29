@@ -10,7 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve() }));
 vi.mock("../i18n", () => ({ default: { t: (k: string) => k } }));
 
 import { useProjectStore } from "./project";
-import { useHistoryStore, installHistory } from "./history";
+import { useHistoryStore, installHistory, vocalParamsSig } from "./history";
 import { useAppStore } from "./app";
 import { buildSaveBundle, buildAutosaveJson, parseLoadedBundle } from "../lib/project/bundle";
 import { normalizeCurve, resolveOverlaps, sanitizeText, DEFAULT_TRANSITION } from "../lib/vocalNotes";
@@ -117,7 +117,8 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
     const loaded = parseLoadedBundle(projectJson, "C:/proj.usp");
     // S73b/c/d:sanitize 载入时补 concrete 的 autoTuneExpr(2)/Vib(1)/Take(0)——夹具没写它们,期望值补齐
     // S83 knife 6b / S84 C 刀: sanitize always materializes the consonant knobs (absent → defaults).
-    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: 2.5, consonantValley: 1 });
+    // S88: …and the rest token, exactly like the breath token beside it (absent → the canonical "R").
+    expect(loaded.tracks[0]!.vocalParams).toEqual({ ...rich.vocalParams, autoTuneExpr: 2, autoTuneVib: 1, autoTuneTake: 0, consonantEmphasis: 2.5, consonantValley: 1, restToken: "R" });
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
   });
 
@@ -486,6 +487,39 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     expect(useHistoryStore.getState().canUndo).toBe(true); // vocalParamsSig captures the transition
     useHistoryStore.getState().undo();
     expect(useProjectStore.getState().tracks[0]!.vocalParams?.transition?.durLeftMs).toBeUndefined(); // seeded had no params
+  });
+
+  // ── S88 lyric triggers in the render signature: PRESENT only when they can change a note's class. ──
+  const sigBase: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: DEFAULT_TRANSITION };
+
+  it("★ the default sig is pinned to a LITERAL (self-comparison cannot catch an unconditional term)", () => {
+    // Comparing vocalParamsSig(x) with vocalParamsSig(y) only pins internal consistency: a mutation that
+    // appends `|rt:R` to BOTH sides stays green while every shipped bake's signature moves (a review
+    // caught exactly that hole). A literal is the only assertion that fails for such a mutation.
+    expect(vocalParamsSig(sigBase, true)).toBe("sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0");
+  });
+
+  it("★ every trigger spelling that classifies IDENTICALLY hashes identically (no false-dirty)", () => {
+    // isRestLyric trims the token and ORs it onto the hard-wired R/r/empty set, so all of these classify
+    // exactly the notes the default does — hashing the raw string re-rendered whole tracks for nothing,
+    // and (because the loader rewrites a blank token back to "R") flipped the verdict again on reload.
+    const same = vocalParamsSig(sigBase, true);
+    for (const restToken of ["R", "r", " R ", ""]) {
+      expect(vocalParamsSig({ ...sigBase, restToken }, true), `restToken ${JSON.stringify(restToken)}`).toBe(same);
+    }
+    for (const breathToken of ["AP", "ap", " AP", ""]) {
+      expect(vocalParamsSig({ ...sigBase, breathToken }, true), `breathToken ${JSON.stringify(breathToken)}`).toBe(same);
+    }
+  });
+
+  it("★ a CUSTOM trigger DOES enter the sig (it re-classifies notes → the audio changes)", () => {
+    expect(vocalParamsSig({ ...sigBase, restToken: "休" })).not.toBe(vocalParamsSig(sigBase));
+    expect(vocalParamsSig({ ...sigBase, restToken: "休" }, true)).not.toBe(vocalParamsSig(sigBase, true));
+    expect(vocalParamsSig({ ...sigBase, breathToken: "呼" }, true)).not.toBe(vocalParamsSig(sigBase, true));
+    // two different custom tokens are two different signatures (no collision into one bucket) …
+    expect(vocalParamsSig({ ...sigBase, restToken: "休" })).not.toBe(vocalParamsSig({ ...sigBase, restToken: "止" }));
+    // … and the two triggers do not alias each other (a rest "X" ≠ a breath "X")
+    expect(vocalParamsSig({ ...sigBase, restToken: "X" }, true)).not.toBe(vocalParamsSig({ ...sigBase, breathToken: "X" }, true));
   });
 });
 

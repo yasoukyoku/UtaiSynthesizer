@@ -14,7 +14,7 @@ import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
 import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis, formatBarBeat } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
-import { resolveOverlaps, DEFAULT_TRANSITION, isBreathLyric } from "../../lib/vocalNotes";
+import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, vocalTokens, type VocalTokens } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, buildScoreTriples, renderFrameTicks } from "../../lib/vocal/vocalRender";
@@ -70,6 +70,15 @@ interface PhonemeSpan { phone: string; frames: number; evt: number; voiceless: b
 // S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
 // track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
 const defaultLyricFor = (langId: number | undefined) => langById(langId ?? DEFAULT_LANG_ID).defaultLyric;
+
+/** THE notes the pitch LINE is made of — silent ones (a rest, a breath) are not part of it, so the line
+ *  breaks over them and their neighbours become phrase edges (§10.5), matching the render's f0 feed.
+ *  Every evaluator in this file goes through here: the overlay, the preview tone AND the paint commit.
+ *  That last one is not cosmetic — `paintedDev` stores each drawn point as a DELTA from this line, so a
+ *  commit evaluated against a different note set writes a deviation the user never drew (the S88 review
+ *  measured ~325 ¢ of snap-back at a rest boundary, because the commit was the one site still unfiltered). */
+const pitchChain = (notes: readonly Note[], tokens: VocalTokens): Note[] =>
+  notes.filter((n) => !isSilentLyric(n.lyric, tokens)).sort((a, b) => a.tick - b.tick);
 const MIN_LEN_TICKS = TICKS_PER_BEAT / 12; // shortest note the UI allows = 1/12 (40t), the finest grid — so you
 // can always drag down to it WITHOUT switching grid; the 60ms singability floor is a Phase-6 render concern (§user)
 
@@ -169,10 +178,12 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   paramCurvesRef.current = part?.paramCurves;
   const transitionRef = useRef(part?.transition ?? DEFAULT_TRANSITION);
   transitionRef.current = part?.transition ?? DEFAULT_TRANSITION;
-  // M3 breath: the pitch line skips breath notes (unvoiced — they break the line so the prev note releases /
-  // the next scoops, §10.5). Dynamic: editing the token re-connects the OLD token's notes.
-  const breathTokenRef = useRef(part?.vocalParams?.breathToken ?? "AP");
-  breathTokenRef.current = part?.vocalParams?.breathToken ?? "AP";
+  // The pitch line skips SILENT notes — a breath (unvoiced) and, since S88, a rest (silent): the line
+  // breaks so the prev note releases / the next scoops, §10.5. Dynamic: editing either token re-connects
+  // the OLD token's notes. Same predicate as the render feed (isSilentLyric) — the drawn line must never
+  // claim a shape the audio does not have.
+  const tokensRef = useRef(vocalTokens(part?.vocalParams));
+  tokensRef.current = vocalTokens(part?.vocalParams);
   // S58: the track's default lang drives the default lyric of newly drawn notes (must be singable).
   const defaultLyricRef = useRef(defaultLyricFor(part?.vocalParams?.langId));
   defaultLyricRef.current = defaultLyricFor(part?.vocalParams?.langId);
@@ -328,8 +339,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const tick = () => {
       const rel = startRel + msToTicks(performance.now() - startMs, tempoRef.current);
       if (rel > durRef.current) { stopPreviewPlay(); return; } // reached the segment end
-      // skip breath notes — unvoiced, they break the pitch chain (the preview tone silences over them).
-      const sorted = notesRef.current.filter((n) => !isBreathLyric(n.lyric, breathTokenRef.current)).sort((a, b) => a.tick - b.tick);
+      // the preview tone goes near-silent over a rest/breath exactly as it does over a written gap.
+      const sorted = pitchChain(notesRef.current, tokensRef.current);
       // Build opts PER-FRAME from the live refs so a sidebar edit to the TRACK-DEFAULT transition (or tempo)
       // retunes the RUNNING preview immediately — else only the overlay updates and the audio stays stale
       // until stop+replay (review finding E).
@@ -441,9 +452,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       if (!phonemeLaneRef.current) phonemeSigRef.current = "";
       return;
     }
+    const phonemeTokens = vocalTokens(phonemeVp); // both triggers: re-pointing either re-resolves phones
     const sig = JSON.stringify([
       phonemeNotes.map((n) => [n.tick, n.duration, n.lyric, n.pitch, n.lang ?? "", n.phonemeInput ?? ""]),
-      phonemeVp.langId, phonemeVp.breathToken ?? "AP", tempo,
+      phonemeVp.langId, phonemeTokens.breath, phonemeTokens.rest, tempo,
     ]);
     // reopening onto notes edited while the lane was hidden: blank beats cross-state spans (the onset
     // reference lines already follow the NEW notes). Mid-edit staleness while the lane stays open is
@@ -456,7 +468,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
     const seq = ++phonemeSeqRef.current;
     const timer = window.setTimeout(async () => {
       phonemeSigRef.current = sig; // set at fire time so a persistent backend error can't hot-loop
-      const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(phonemeNotes, tempo, phonemeVp.breathToken ?? "AP", phonemeVp.langId);
+      const { triples, tripleNoteIds, ticksPerFrame } = buildScoreTriples(phonemeNotes, tempo, phonemeTokens, phonemeVp.langId);
       try {
         const spans = await invoke<PhonemeSpan[]>("preview_vocal_phonemes", { score: triples, defaultLang: phonemeVp.langId });
         if (seq !== phonemeSeqRef.current) return; // superseded by a newer request
@@ -625,10 +637,10 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       //    + vibrato, all summed by the single evalF0Cents). Sampled across the note area every few px; an
       //    unvoiced (rest) sample BREAKS the line (carrier-aware, §9.3). Emphasized under the Pitch tool. ──
       {
-        // the pitch LINE skips breath notes (unvoiced) — the line breaks over a breath, and its neighbours
-        // become phrase edges (prev note release-drift 段中尾音, next note onset-scoop). The note RECTANGLES
-        // above (drawNotes) still show the breath note; only the sung-pitch chain drops it.
-        const sorted = drawNotes.filter((n) => !isBreathLyric(n.lyric, breathTokenRef.current)).sort((a, b) => a.tick - b.tick);
+        // the pitch LINE skips SILENT notes — the line breaks over them and their neighbours become phrase
+        // edges (prev note release-drift 段中尾音, next note onset-scoop). The note RECTANGLES above
+        // (drawNotes) still show the note; only the sung-pitch chain drops it.
+        const sorted = pitchChain(drawNotes, tokensRef.current);
         const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
         const dr0 = dragRef.current; // live pitch-paint → preview the drawn curve on the line
         const dev = dr0?.kind === "pitch-paint" && dr0.paint ? paintedDev(sorted, dr0.paint, pitchDevRef.current, opts) : pitchDevRef.current;
@@ -949,7 +961,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   // re-run — without this the boundary line only "happens" to refresh when some other redraw fires (hover/
   // scroll), which is the reported intermittent staleness. The draw closure reads start/dur/axis via refs,
   // so re-invoking it is enough (no rebuild).
-  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.paramCurves, part?.transition, part?.vocalParams?.breathToken, timeSignature, tempo, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [part?.start, part?.dur, part?.pitchDev, part?.paramCurves, part?.transition, part?.vocalParams?.breathToken, part?.vocalParams?.restToken, timeSignature, tempo, requestRedraw]);
 
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
@@ -1355,7 +1367,9 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
       return;
     }
     if (d.kind === "pitch-paint" && d.paint && part) {
-      const sorted = [...notesRef.current].sort((a, b) => a.tick - b.tick);
+      // ★ THE SAME chain the preview drew against (see pitchChain) — it was the one evaluator still on the
+      // pre-S88 semantics, so releasing the stroke snapped the line away from what was drawn.
+      const sorted = pitchChain(notesRef.current, tokensRef.current);
       const opts = { tempo: tempoRef.current, defaultTransition: transitionRef.current };
       setSegmentPitchDev(part.trackId, segmentId, paintedDev(sorted, d.paint, pitchDevRef.current, opts)); // normalizeCurve inside
       requestRedraw();

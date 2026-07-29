@@ -43,7 +43,7 @@ describe.skipIf(!process.env.UTAI_MG_DUMP)("MG score dump (diagnostic, not a gat
     );
     // 生产口径:默认 transition(track default)、无 vibrato、无 pitchDev、无参数泳道、JA 默认。
     const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
-      notes, undefined, tempo, DEFAULT_TRANSITION, "AP",
+      notes, undefined, tempo, DEFAULT_TRANSITION, { breath: "AP", rest: "R" }, // 生产默认的两个标记
     );
     const sum = triples.reduce((s, t) => s + t.frames, 0);
     expect(f0Cents.length).toBe(sum); // render_vocal_segment 的硬校验同款不变量

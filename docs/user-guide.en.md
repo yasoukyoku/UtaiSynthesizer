@@ -448,7 +448,7 @@ The editor's view is independent of the arrangement view's zoom/scroll. On openi
 | --- | --- |
 | `-` or `ー` | Sustain: continues the previous syllable's vowel |
 | `+` | Takes the previous word's next syllable (for multi-syllable Western words spanning notes) |
-| `R` | Rest. **Changed in v0.12:** `rest` / `sil` / `pau` are no longer rest tokens — they are ordinary lyrics now (they are real words, and word fragments like sil\|ver, pau\|se would collide). Use `R`, or set a custom rest token on the track. |
+| `R` | Rest (see 5.8). **Changed in v0.12:** `rest` / `sil` / `pau` are no longer rest tokens — they are ordinary lyrics now (they are real words, and word fragments like sil\|ver, pau\|se would collide). Use `R`, or set a custom rest token on the track. |
 | `AP` / `ap` | Breath (see 5.8) |
 
 Lyrics are single-line, at most 64 characters; clearing a lyric falls back to the track language's default lyric.
@@ -516,11 +516,17 @@ All time parameters are absolute milliseconds — they do not change with BPM, a
 
 Add the **"Pitch" tool's freehand drawing** from 5.2, and that is the complete pitch-tuning toolkit.
 
-### 5.8 Breath marks (AP)
+### 5.8 Breath marks (AP) and the rest token
 
 Notes whose lyric is `AP` or `ap` render as an **inhale** rather than a sung word. Breath notes are unvoiced: the pink pitch line breaks over them, the previous note releases naturally and the next note re-attacks.
 
 The sidebar "Singer" tab has a "Breath token" text box (default `AP`) which you can change to any word you like — say, when AP happens to be a real word in some language. Even with a custom token set, `AP`/`ap` always keep working.
+
+A note whose lyric is `R` (or `r`) is a **rest**: it makes no sound and carries no pitch. Writing one is exactly the same as leaving a gap — the pitch line breaks over it and its neighbours become phrase edges — so use whichever spelling you find easier to edit. Below the breath box is a **"Rest token"** box (default `R`) that works the same way: point it at whatever marks a rest in the lyric sheet you are working from (`休`, `--`, `x` …) and notes with that lyric become rests on that track. `R`/`r` always keep working, and each track keeps its own setting.
+
+> **Choose a token that never occurs as a real lyric on that track.** The trigger beats the dictionary, so pointing it at an ordinary word silences every note carrying that word — `rest` is real English vocabulary, and `a` is the default lyric of five of the seven languages. A rest never gets the red "unknown lyric" mark (it is a rest, not a mistake), so the giveaway is the pitch line breaking over those notes. If a clip ends up with nothing but rests, rendering it refuses with "no renderable notes" rather than quietly baking silence.
+
+> When you export to `.ust` / `.ustx` / `.mid`, both triggers are written out as the standard `R` and `AP`, because those files carry no track settings — this way other UTAU-family tools (and re-importing the file here) read your rests and breaths correctly instead of trying to sing them. One asymmetry: `.ust` cannot store a rest as a note at all, so re-importing a `.ust` turns rest notes back into plain gaps. The silence is identical; only the spelling changes.
 
 ### 5.9 The bottom parameter band: loudness and formant
 
@@ -558,7 +564,7 @@ RVC models:
 
 **"Range extend"**: this toggle only appears if the current singer has had its **range tested** in the resource manager (see 7.4). When on, phrases beyond the singer's comfort zone are first transposed into the comfort zone for rendering, then shifted back in the audio domain — a low-voiced singer can sing a high song, at the cost of a slight timbre change over those passages. Off by default.
 
-**"Breath token"**: see 5.8.
+**"Breath token"** / **"Rest token"**: see 5.8.
 
 **"Language"**: the "Track default" and "Selected notes" dropdowns, see 5.5.
 

@@ -14,6 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { buildScoreTriples } from "./vocalRender";
+import { vocalTokens } from "../vocalNotes";
 import type { Segment, Track } from "../../types/project";
 
 const DEBOUNCE_MS = 300;
@@ -24,10 +25,12 @@ const DEBOUNCE_MS = 300;
 function oovSig(track: Track, seg: Segment, tempo: number): string {
   if (seg.content.type !== "notes") return "";
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
+  const tk = vocalTokens(vp);
   return JSON.stringify([
     seg.content.notes.map((n) => [n.tick, n.duration, n.lyric, n.lang ?? "", n.phonemeInput ?? ""]),
     vp.langId,
-    vp.breathToken ?? "AP",
+    tk.breath,
+    tk.rest, // S88: re-pointing the rest token re-classifies notes (silent ⇄ sung) → verdicts must re-run
     tempo,
   ]);
 }
@@ -77,7 +80,7 @@ async function validatePass(): Promise<void> {
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-        const { triples, tripleNoteIds, droppedNoteIds, shortNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vp.breathToken ?? "AP", vp.langId);
+        const { triples, tripleNoteIds, droppedNoteIds, shortNoteIds } = buildScoreTriples(seg.content.notes, st.tempo, vocalTokens(vp), vp.langId);
         // S87: the FRAME verdicts (too-short / rescued-by-borrow) come straight out of buildScoreTriples —
         // they need no backend at all. Publish them BEFORE the `validate_lyrics` round-trip: gating them
         // behind it meant a slow classifier delayed the marks, and a FAILING one (the catch below only

@@ -19,6 +19,11 @@ const mkNote = (id: string, tick: number, duration: number, pitch: number, lyric
   id, tick, duration, pitch, lyric, velocity: 100,
 });
 
+/** S88: the two lyric triggers travel as ONE named struct (never two bare strings side by side — a swap
+ *  there would be invisible to the compiler and to a test that passes the same value for both).
+ *  `TK()` = the canonical defaults, `TK("呼")` = a custom breath, `TK(undefined, "休")` = a custom rest. */
+const TK = (breath = "AP", rest = "R") => ({ breath, rest });
+
 // ── ② isVocalDirty dual-sig: a carried SPLIT-WINDOW bake is accepted (no re-render) via renderedSig OR
 //    windowSig; both live on the OVERLAY so they can't desync from the bake (the audit's bakeSplit-flag
 //    desync — silent wrong audio on split→edit→render→undo / tempo — is structurally impossible). ──
@@ -97,7 +102,7 @@ describe("buildVocalScore", () => {
 
   it("aligns Σ(triple frames) == f0 length == voiced length (build_note_hz cv↔DAW invariant)", () => {
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 960, 480, 62)]; // gap 480..960
-    const { triples, f0Cents, f0Voiced } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples, f0Cents, f0Voiced } = buildVocalScore(notes, undefined, tempo, def, TK());
     const sum = triples.reduce((s, t) => s + t.frames, 0);
     expect(f0Cents.length).toBe(sum);
     expect(f0Voiced.length).toBe(sum);
@@ -106,7 +111,7 @@ describe("buildVocalScore", () => {
 
   it("inserts a leading rest + explicit gap rests (§3.4 — never inferred from pitch==0)", () => {
     const notes = [mkNote("a", 480, 480, 60), mkNote("b", 1440, 480, 62)]; // starts at 480; gap 960..1440
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK());
     expect(triples[0]!.lyric).toBe("R"); // leading rest so stem-ms 0 == segment start
     expect(triples[0]!.note_num).toBe(0);
     expect(triples.filter((t) => t.lyric === "R").length).toBe(2); // leading + inter-note gap
@@ -115,25 +120,25 @@ describe("buildVocalScore", () => {
 
   it("abutting notes glide with NO rest between", () => {
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 480, 62)]; // abut at 480
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK());
     expect(triples.filter((t) => t.lyric === "R").length).toBe(0);
     expect(triples.map((t) => t.note_num)).toEqual([60, 62]);
   });
 
   it("passes RAW pitch (transpose is applied Rust-side, §9.3)", () => {
     const notes = [mkNote("a", 0, 480, 60)];
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK());
     expect(triples.find((t) => t.lyric !== "R")!.note_num).toBe(60);
   });
 
   it("keeps each note's lyric (JA kana), sorts by tick", () => {
     const notes = [mkNote("b", 480, 480, 62, "き"), mkNote("a", 0, 480, 60, "か")]; // unsorted input
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK());
     expect(triples.map((t) => t.lyric)).toEqual(["か", "き"]);
   });
 
   it("empty notes → empty score + empty f0", () => {
-    const { triples, f0Cents } = buildVocalScore([], undefined, tempo, def, "AP");
+    const { triples, f0Cents } = buildVocalScore([], undefined, tempo, def, TK());
     expect(triples.length).toBe(0);
     expect(f0Cents.length).toBe(0);
   });
@@ -144,7 +149,7 @@ describe("buildVocalScore", () => {
       mkNote("a", 480, 480, 60, "长"), // leading rest before it takes the DEFAULT lang
       { ...mkNote("b", 960, 480, 62, "light"), lang: "en", phonemeInput: "L AY1 T" },
     ];
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP", undefined, 0, 0 /* zh default */);
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK(), undefined, 0, 0 /* zh default */);
     expect(triples[0]!.lyric).toBe("R");
     expect(triples[0]!.lang).toBe(0); // rest → track default (Rust re-attaches it to the run)
     const sung = triples.filter((t) => t.lyric !== "R");
@@ -155,7 +160,7 @@ describe("buildVocalScore", () => {
 
   it("an INVALID note lang code falls back to the track default (whitelist mirror)", () => {
     const notes = [{ ...mkNote("a", 0, 480, 60), lang: "xx" }];
-    const { triples } = buildVocalScore(notes, undefined, tempo, def, "AP", undefined, 0, 5 /* es */);
+    const { triples } = buildVocalScore(notes, undefined, tempo, def, TK(), undefined, 0, 5 /* es */);
     expect(triples.find((t) => t.lyric !== "R")!.lang).toBe(5);
   });
 
@@ -169,7 +174,7 @@ describe("buildVocalScore", () => {
     // か—AP—き, all abutting. The AP breath is emitted as the AP phone and its frames are UNVOICED (so the
     // か releases / the き scoops rather than gliding into/out of the breath).
     const notes = [mkNote("a", 0, 480, 60, "か"), mkNote("br", 480, 240, 62, "AP"), mkNote("c", 720, 480, 64, "き")];
-    const { triples, f0Voiced } = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const { triples, f0Voiced } = buildVocalScore(notes, undefined, tempo, def, TK());
     const ap = spans(triples).find((x) => x.lyric === "AP")!;
     expect(ap).toBeTruthy(); // breath kept as the AP phone (not silence, not "か")
     for (let f = ap.s; f < ap.e; f++) expect(f0Voiced[f]).toBe(0); // breath frames unvoiced
@@ -179,24 +184,24 @@ describe("buildVocalScore", () => {
   it("custom breath token is unvoiced; renaming it re-voices the OLD token (§user dynamic)", () => {
     const notes = [mkNote("a", 0, 480, 60, "呼")];
     // breathToken "呼" → the note IS a breath → AP phone, all-unvoiced.
-    const asBreath = buildVocalScore(notes, undefined, tempo, def, "呼");
+    const asBreath = buildVocalScore(notes, undefined, tempo, def, TK("呼"));
     expect(asBreath.triples.some((t) => t.lyric === "AP")).toBe(true);
     expect(Array.from(asBreath.f0Voiced).every((v) => v === 0)).toBe(true);
     // change the token away → "呼" is a normal lyric again → sent literally + VOICED (connected pitch).
-    const asLyric = buildVocalScore(notes, undefined, tempo, def, "AP");
+    const asLyric = buildVocalScore(notes, undefined, tempo, def, TK());
     expect(asLyric.triples.some((t) => t.lyric === "呼")).toBe(true);
     expect(Array.from(asLyric.f0Voiced).some((v) => v === 1)).toBe(true);
   });
 
   // ── ② M-defer: loudness + formant per-frame envelopes (aligned to the SAME 50fps grid as f0) ──
   it("no loudness/formant lane + 0 formant scalar → EMPTY envelopes (Rust reads flat = exact-parity no-op)", () => {
-    const { loudnessEnv, formantEnv } = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, "AP");
+    const { loudnessEnv, formantEnv } = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, TK());
     expect(loudnessEnv).toEqual([]);
     expect(formantEnv).toEqual([]);
   });
 
   it("loudness lane → per-frame LINEAR multiplier (dB→10^(dB/20)), aligned to f0 length, rising with the curve", () => {
-    const { f0Cents, loudnessEnv } = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, "AP", { loudness: { xs: [0, 480], ys: [0, 6] } }, 0);
+    const { f0Cents, loudnessEnv } = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, TK(), { loudness: { xs: [0, 480], ys: [0, 6] } }, 0);
     expect(loudnessEnv.length).toBe(f0Cents.length);
     expect(loudnessEnv[0]).toBeCloseTo(1, 5); // frame 0 @ tick 0 → 0 dB → ×1 (exact)
     const last = loudnessEnv[loudnessEnv.length - 1]!;
@@ -205,10 +210,10 @@ describe("buildVocalScore", () => {
   });
 
   it("formant SCALAR (no lane) → all-scalar semitone array; scalar + lane fold ADDITIVELY (one summation site)", () => {
-    const scalarOnly = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, "AP", undefined, -3);
+    const scalarOnly = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, TK(), undefined, -3);
     expect(scalarOnly.formantEnv.length).toBe(scalarOnly.f0Cents.length);
     expect(scalarOnly.formantEnv.every((v) => v === -3)).toBe(true); // flat = scalar everywhere
-    const withLane = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, "AP", { formant: { xs: [0, 480], ys: [0, 4] } }, 2);
+    const withLane = buildVocalScore([mkNote("a", 0, 480, 60)], undefined, tempo, def, TK(), { formant: { xs: [0, 480], ys: [0, 4] } }, 2);
     expect(withLane.formantEnv[0]).toBeCloseTo(2, 5); // frame 0: scalar 2 + lane 0 (exact)
     const flast = withLane.formantEnv[withLane.formantEnv.length - 1]!;
     expect(flast).toBeGreaterThan(5); // scalar 2 + lane rising toward 4 (last frame < note end → < 6)
@@ -224,7 +229,7 @@ describe("buildScoreTriples — zero-frame note drop is loud", () => {
     // tempo 120 → ticksPerFrame 19.2. `b` spans ticks 20..25 → frames 1..1 = ZERO, and it is boxed in by
     // two 1-frame notes: neither can pay (a sung lender must keep ≥2), so it must still be reported.
     const notes = [mkNote("a", 0, 20, 60), mkNote("b", 20, 5, 62), mkNote("c", 25, 20, 64)];
-    const { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, frameCount } = buildScoreTriples(notes, 120, "AP", 2);
+    const { triples, tripleNoteIds, droppedNoteIds, borrowedNoteIds, frameCount } = buildScoreTriples(notes, 120, TK(), 2);
     expect(droppedNoteIds).toEqual(["b"]);
     expect(borrowedNoteIds).toEqual([]);
     for (const id of droppedNoteIds) expect(tripleNoteIds).not.toContain(id);
@@ -247,12 +252,22 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
       [mkNote("a", 0, 480, 60), mkNote("b", 480, 3, 62)], // sub-frame at the very END (no next item)
       [mkNote("a", 0, 30, 60), mkNote("b", 30, 30, 62), mkNote("c", 60, 30, 64)], // a run of short notes
       [mkNote("a", 0, 480, 60), mkNote("b", 900, 3, 62), mkNote("c", 1400, 480, 64)], // gaps around it
+      // S88 — rest NOTES belong in this sweep too: every rest-item branch (the lender floor, the PASS-2
+      // skip, rescueIsSafe) keys on frameOf(end)-frameOf(start), i.e. on the frame PHASE, which is exactly
+      // the class S87 measured flipping on 27.7% of tempi from a single fixture. A review found the
+      // zero-frame-rest hole below precisely because these cases were missing here.
+      [mkNote("a", 0, 480, 60), mkNote("r", 480, 480, 71, "R"), mkNote("c", 960, 480, 64)], // rest as a note
+      [mkNote("a", 0, 96, 60), mkNote("b", 96, 1, 62), mkNote("r", 97, 3, 60, "R"), mkNote("c", 100, 480, 64)], // zero-frame rest AFTER a zero-frame note
+      [mkNote("b", 0, 1, 72), mkNote("r", 1, 39, 60, "R")], // the only lender is a rest note at its floor
+      [mkNote("r", 0, 3, 60, "R"), mkNote("a", 3, 480, 60)], // a sub-frame rest at the very start
+      [mkNote("a", 0, 480, 60), mkNote("r", 480, 3, 60, "R")], // …and at the very end
+      [mkNote("r1", 0, 240, 60, "R"), mkNote("r2", 240, 240, 62, "R")], // nothing but rests
     ];
     let borrows = 0;
     let drops = 0;
     for (const notes of cases) {
       for (const tempo of [60, 120, 222, 300]) {
-        const r = buildScoreTriples(notes, tempo, "AP", 2);
+        const r = buildScoreTriples(notes, tempo, TK(), 2);
         expect(sumFrames(r.triples)).toBe(r.frameCount);
         // and every emitted triple must actually occupy time
         for (const t of r.triples) expect(t.frames).toBeGreaterThan(0);
@@ -271,12 +286,12 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     // the follower loses its consonant (「た」 sings as 「あ」) or its vowel lands ~40 ms late. Never worse
     // than baseline: the sub-frame note goes back to being reported as too short.
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 510, 480, 64)];
-    const r = buildScoreTriples(notes, 222, "AP", 2);
+    const r = buildScoreTriples(notes, 222, TK(), 2);
     expect(r.borrowedNoteIds).toEqual([]);
     expect(r.droppedNoteIds).toEqual(["b"]);
     expect(r.shortNoteIds).toEqual(["b"]); // …but it is STILL reported as short
     // the follower keeps every frame it had without b — nothing was taken from anyone
-    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 510, 480, 64)], 222, "AP", 2);
+    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 510, 480, 64)], 222, TK(), 2);
     expect(r.triples[r.tripleNoteIds.indexOf("a")]!.frames).toBe(base.triples[base.tripleNoteIds.indexOf("a")]!.frames);
     expect(r.triples[r.tripleNoteIds.indexOf("c")]!.frames).toBe(base.triples[base.tripleNoteIds.indexOf("c")]!.frames);
     expect(sumFrames(r.triples)).toBe(r.frameCount);
@@ -286,8 +301,8 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     // tempo 222 (ticksPerFrame 35.52): b spans ticks 480..510 → frames 14..14 = zero. A REST follows it, so
     // the rescue is safe (an SP lender serves the next note's onset just fine).
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 30, 62), mkNote("c", 700, 480, 64)];
-    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 700, 480, 64)], 222, "AP", 2);
-    const r = buildScoreTriples(notes, 222, "AP", 2);
+    const base = buildScoreTriples([mkNote("a", 0, 480, 60), mkNote("c", 700, 480, 64)], 222, TK(), 2);
+    const r = buildScoreTriples(notes, 222, TK(), 2);
     expect(r.borrowedNoteIds).toEqual(["b"]);
     expect(r.droppedNoteIds).toEqual([]);
     const tb = r.triples[r.tripleNoteIds.indexOf("b")]!;
@@ -306,7 +321,7 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     // tempo 222 (ticksPerFrame 35.52): items are R[0,1] (1 frame), a[1,1] (ZERO), R[1,14] (13), long[14,27].
     // The LEADING rest has only 1 frame, so it may not pay (a rest must keep ≥1) → the borrow goes forward.
     const notes = [mkNote("a", 20, 30, 66), mkNote("long", 480, 480, 60)];
-    const r = buildScoreTriples(notes, 222, "AP", 2);
+    const r = buildScoreTriples(notes, 222, TK(), 2);
     expect(r.droppedNoteIds).toEqual([]);
     expect(r.borrowedNoteIds).toEqual(["a"]);
     // ★ pin WHO paid and WHERE the frame landed — without these the same assertions pass for an illegal
@@ -322,13 +337,13 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
   it("★ the rest-lender floor is exactly 2 frames — 1 refuses, 2 pays", () => {
     // tempo 120 (ticksPerFrame 19.2). PAYS: a 2-frame gap (frames 5..7) may drop to 1.
     const pays = [mkNote("a", 0, 96, 60), mkNote("b", 134, 1, 72)];
-    const r1 = buildScoreTriples(pays, 120, "AP", 2);
+    const r1 = buildScoreTriples(pays, 120, TK(), 2);
     expect(r1.borrowedNoteIds).toEqual(["b"]);
     expect(r1.triples.filter((t) => t.lyric === "R").map((t) => t.frames)).toEqual([1]);
     expect(sumFrames(r1.triples)).toBe(r1.frameCount);
     // REFUSES: a 1-frame gap (frames 5..6) is already at the floor, and there is no next item → dropped.
     const refuses = [mkNote("a", 0, 96, 60), mkNote("b", 115, 1, 72)];
-    const r2 = buildScoreTriples(refuses, 120, "AP", 2);
+    const r2 = buildScoreTriples(refuses, 120, TK(), 2);
     expect(r2.droppedNoteIds).toEqual(["b"]);
     expect(r2.borrowedNoteIds).toEqual([]);
     expect(r2.triples.filter((t) => t.lyric === "R").map((t) => t.frames)).toEqual([1]); // rest kept its frame
@@ -339,7 +354,7 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     // tempo 120 → ticksPerFrame 19.2. n2 spans 600..603 → frames 31..31 = zero; the gap rest before it is
     // 6 frames (25..31), so it can pay and keep its own ≥1.
     const notes = [mkNote("n1", 0, 480, 60), mkNote("n2", 600, 3, 62)];
-    const r = buildScoreTriples(notes, 120, "AP", 2);
+    const r = buildScoreTriples(notes, 120, TK(), 2);
     expect(r.borrowedNoteIds).toEqual(["n2"]);
     expect(r.droppedNoteIds).toEqual([]);
     const restFrames = r.triples.filter((t) => t.lyric === "R").map((t) => t.frames);
@@ -352,14 +367,14 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
   it("★ the sung-lender floor is exactly 3 frames — 2 refuses, 3 pays", () => {
     // tempo 120 (ticksPerFrame 19.2). REFUSE: both neighbours are exactly 2 frames (0..38 and 41..79).
     const boxed = [mkNote("a", 0, 38, 60), mkNote("b", 38, 3, 62), mkNote("c", 41, 38, 64)];
-    const r1 = buildScoreTriples(boxed, 120, "AP", 2);
+    const r1 = buildScoreTriples(boxed, 120, TK(), 2);
     expect(r1.droppedNoteIds).toEqual(["b"]);
     expect(r1.borrowedNoteIds).toEqual([]);
     expect(r1.triples[r1.tripleNoteIds.indexOf("a")]!.frames).toBe(2); // lender untouched, still ≥ its floor
     expect(sumFrames(r1.triples)).toBe(r1.frameCount);
     // PAY: the previous note is 3 frames (0..57) — it may drop to 2, which is exactly the floor.
     const ok = [mkNote("a", 0, 57, 60), mkNote("b", 57, 3, 62)];
-    const r2 = buildScoreTriples(ok, 120, "AP", 2);
+    const r2 = buildScoreTriples(ok, 120, TK(), 2);
     expect(r2.borrowedNoteIds).toEqual(["b"]);
     expect(r2.triples[r2.tripleNoteIds.indexOf("a")]!.frames).toBe(2);
     expect(r2.triples[r2.tripleNoteIds.indexOf("b")]!.frames).toBe(1);
@@ -368,7 +383,7 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
 
   it("the very FIRST item can borrow (there is no previous item at all → forward, into the rest)", () => {
     const notes = [mkNote("head", 0, 3, 60), mkNote("body", 200, 480, 62)];
-    const r = buildScoreTriples(notes, 120, "AP", 2);
+    const r = buildScoreTriples(notes, 120, TK(), 2);
     expect(r.borrowedNoteIds).toEqual(["head"]);
     expect(r.droppedNoteIds).toEqual([]);
     expect(r.triples[r.tripleNoteIds.indexOf("head")]!.frames).toBe(1);
@@ -407,11 +422,11 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
       it(kind + ": voiced, at its OWN written pitch, at every tempo", () => {
         for (const tempo of TEMPI) {
           const notes = build(kind, tempo);
-          const r = buildScoreTriples(notes, tempo, "AP", 2);
+          const r = buildScoreTriples(notes, tempo, TK(), 2);
           expect(r.borrowedNoteIds, `tempo ${tempo}`).toEqual(["b"]);
           const idx = r.tripleNoteIds.indexOf("b");
           expect(r.triples[idx]!.frames, `tempo ${tempo}`).toBe(1);
-          const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, "AP");
+          const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, TK());
           expect(sv.f0Cents.length).toBe(sumFrames(sv.triples));
           const f = frameIndexOf(r.triples, idx);
           expect(sv.f0Voiced[f], `tempo ${tempo}: the rescued frame must be VOICED`).toBe(1);
@@ -442,13 +457,13 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
         mkNote("b", b0, 1 + rnd(3), 72),
         mkNote("c", b0 + 200 + rnd(200), 480, 64),
       ];
-      const r = buildScoreTriples(notes, tempo, "AP", 2);
+      const r = buildScoreTriples(notes, tempo, TK(), 2);
       expect(sumFrames(r.triples), `case ${i} tempo ${tempo}`).toBe(r.frameCount); // conservation, always
       if (!r.borrowedNoteIds.includes("b")) continue;
       borrows++;
       const idx = r.tripleNoteIds.indexOf("b");
       const f = r.triples.slice(0, idx).reduce((s, t) => s + t.frames, 0);
-      const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, "AP");
+      const sv = buildVocalScore(notes, undefined, tempo, DEFAULT_TRANSITION, TK());
       if (sv.f0Voiced[f] !== 1) unvoiced++;
       else if (Math.abs(sv.f0Cents[f]! / 100 - 72) > 0.01) wrongPitch++;
     }
@@ -456,9 +471,116 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
     expect({ unvoiced, wrongPitch }).toEqual({ unvoiced: 0, wrongPitch: 0 });
   });
 
+  // ── S88 rest token. The claim being tested is ONE sentence: a note carrying the rest trigger is the
+  //    same silence as leaving a gap. Everything below is that sentence at a different layer. ──
+  describe("the rest token — a written rest IS a gap", () => {
+    /** [start,end) frame span of each triple (local copy — the buildVocalScore block's one is out of scope). */
+    const spans = (triples: { lyric: string; frames: number }[]) => {
+      let c = 0;
+      return triples.map((t) => { const s = c; c += t.frames; return { lyric: t.lyric, s, e: c }; });
+    };
+
+    it("★ EQUIVALENCE: the same music written as a rest NOTE and as a GAP produces identical output", () => {
+      const asGap = [mkNote("a", 0, 480, 60, "か"), mkNote("c", 960, 480, 64, "き")];
+      // the rest note fills the gap exactly, and is drawn at pitch 71 — a pitch nothing may ever sing
+      const asNote = [mkNote("a", 0, 480, 60, "か"), mkNote("r", 480, 480, 71, "R"), mkNote("c", 960, 480, 64, "き")];
+      const g = buildVocalScore(asGap, undefined, 120, DEFAULT_TRANSITION, TK());
+      const n = buildVocalScore(asNote, undefined, 120, DEFAULT_TRANSITION, TK());
+      expect(n.triples).toEqual(g.triples); // payload: same lyric, same note_num 0, same frames, same lang
+      expect(n.f0Cents).toEqual(g.f0Cents);
+      expect(n.f0Voiced).toEqual(g.f0Voiced);
+      // …and specifically: the drawn pitch of the rest is nowhere in the pitch line. Before S88 the line
+      // GLIDED into and out of it (the note stayed in the chain), so か released toward 71 and き scooped
+      // out of it — audibly wrong, and impossible to see from the score.
+      expect(Array.from(n.f0Cents).some((c) => Math.abs(c / 100 - 71) < 0.5)).toBe(false);
+      expect(Array.from(n.f0Voiced).some((v) => v === 1)).toBe(true); // か / き still sing
+    });
+
+    it("a CUSTOM trigger is that same silence; pointing it elsewhere makes the word sing again", () => {
+      const notes = [mkNote("a", 0, 480, 60, "か"), mkNote("x", 480, 480, 71, "休"), mkNote("c", 960, 480, 64, "き")];
+      const asRest = buildVocalScore(notes, undefined, 120, DEFAULT_TRANSITION, TK(undefined, "休"));
+      expect(asRest.triples.map((t) => t.lyric)).toEqual(["か", "R", "き"]); // mapped to the canonical token
+      expect(asRest.triples[1]!.note_num).toBe(0);
+      const s = spans(asRest.triples).find((x) => x.lyric === "R")!;
+      for (let f = s.s; f < s.e; f++) expect(asRest.f0Voiced[f]).toBe(0);
+      // …and with the trigger pointed at the default, 休 is an ordinary lyric: sent literally, voiced.
+      const asLyric = buildVocalScore(notes, undefined, 120, DEFAULT_TRANSITION, TK());
+      expect(asLyric.triples.map((t) => t.lyric)).toEqual(["か", "休", "き"]);
+      expect(asLyric.triples[1]!.note_num).toBe(71);
+      const s2 = spans(asLyric.triples).find((x) => x.lyric === "休")!;
+      expect(asLyric.f0Voiced[s2.s]).toBe(1);
+    });
+
+    it("a sub-frame rest is NOT warned about and NOT rescued (not sounding is what it asked for)", () => {
+      // tempo 120 → ticksPerFrame 19.2; the rest spans 480..483, which rounds to zero frames.
+      const notes = [mkNote("a", 0, 480, 60, "か"), mkNote("r", 480, 3, 60, "R"), mkNote("c", 483, 480, 64, "き")];
+      const r = buildScoreTriples(notes, 120, TK(), 2);
+      expect(r.shortNoteIds).toEqual([]); // ← a rest in this list is a false alarm ("will not sound": good)
+      expect(r.droppedNoteIds).toEqual([]);
+      expect(r.borrowedNoteIds).toEqual([]);
+      expect(r.triples.reduce((s, t) => s + t.frames, 0)).toBe(r.frameCount);
+    });
+
+    it("★ a rest note LENDS at the rest floor (1), not the sung floor (2)", () => {
+      // b spans 0..1 → zero frames, and there is no previous item, so the only possible lender is the
+      // rest note after it: 2 frames, which may drop to 1. Written as a NOTE it used to be held to the
+      // sung floor of 2 and refused — the same music written as a gap paid without complaint.
+      const notes = [mkNote("b", 0, 1, 72, "か"), mkNote("r", 1, 39, 60, "R")];
+      const r = buildScoreTriples(notes, 120, TK(), 2);
+      expect(r.borrowedNoteIds).toEqual(["b"]);
+      expect(r.droppedNoteIds).toEqual([]);
+      expect(r.triples.map((t) => [t.lyric, t.frames])).toEqual([["か", 1], ["R", 1]]);
+      expect(r.triples.reduce((s, t) => s + t.frames, 0)).toBe(r.frameCount);
+    });
+
+    it("★ a rest note does not BLOCK a rescue — nothing pre-rolls a consonant out of silence", () => {
+      // The knife only fires when the next item needs nothing from the borrower (S87). A rest note is a
+      // rest: it has no onset consonant to starve, so it must not veto the rescue the way a sung note does.
+      const notes = [mkNote("a", 0, 96, 60, "か"), mkNote("b", 96, 3, 72, "き"), mkNote("r", 99, 401, 60, "R")];
+      const r = buildScoreTriples(notes, 120, TK(), 2);
+      expect(r.borrowedNoteIds).toEqual(["b"]);
+      expect(r.droppedNoteIds).toEqual([]);
+      expect(r.triples.reduce((s, t) => s + t.frames, 0)).toBe(r.frameCount);
+      // the same shape with a SUNG note in that slot must still refuse (the S87 rule is untouched)
+      const sung = [mkNote("a", 0, 96, 60, "か"), mkNote("b", 96, 3, 72, "き"), mkNote("c", 99, 401, 64, "く")];
+      expect(buildScoreTriples(sung, 120, TK(), 2).droppedNoteIds).toEqual(["b"]);
+    });
+
+    it("★ a ZERO-FRAME rest note may NOT be treated as an available lender (S88 review, real regression)", () => {
+      // tempo 120 → ticksPerFrame 19.2. き(480..484) AND the rest(484..488) both round to frame 25, i.e.
+      // BOTH are zero-frame. The rest emits no triple and can never acquire one, so the phone actually
+      // following a rescued き would be く — which then pre-rolls its onset consonant out of a 1-frame
+      // nucleus (avail = 0) and loses it. That is the S87 pathology, so the rescue must refuse and き must
+      // go back to being reported, exactly as it was before this feature existed.
+      const notes = [mkNote("a", 0, 480, 60, "か"), mkNote("b", 480, 4, 62, "き"), mkNote("r", 484, 4, 60, "R"), mkNote("c", 488, 480, 64, "く")];
+      const r = buildScoreTriples(notes, 120, TK(), 2);
+      expect(r.borrowedNoteIds).toEqual([]);
+      expect(r.droppedNoteIds).toEqual(["b"]); // reported, not silently rescued into damage
+      // the wire is untouched: か keeps all 25 frames, so く's onset still pre-rolls out of a real vowel
+      expect(r.triples.map((t) => [t.lyric, t.frames])).toEqual([["か", 25], ["く", 25]]);
+      expect(r.triples.reduce((s, t) => s + t.frames, 0)).toBe(r.frameCount);
+    });
+
+    it("★ the breath/rest tie-break is decided in the TRIPLE, not just in the boolean", () => {
+      // isSilentLyric is an OR, so asserting it alone cannot tell the two orderings apart (a review
+      // caught that). mapLyric is where the order is observable: with both triggers on the same word the
+      // note must come out as the REST token — silence, note_num 0 — not as an AP breath phone.
+      const notes = [mkNote("x", 0, 480, 71, "同")];
+      const r = buildScoreTriples(notes, 120, { breath: "同", rest: "同" }, 2);
+      expect(r.triples.map((t) => [t.lyric, t.note_num])).toEqual([["R", 0]]);
+    });
+
+    it("an ordinary lyric is untouched by the rest machinery (no false silencing)", () => {
+      const notes = [mkNote("a", 0, 480, 60, "ら"), mkNote("b", 480, 480, 62, "rest")];
+      const r = buildVocalScore(notes, undefined, 120, DEFAULT_TRANSITION, TK());
+      expect(r.triples.map((t) => t.lyric)).toEqual(["ら", "rest"]); // S86 freed `rest` — it still sings
+      expect(Array.from(r.f0Voiced).every((v) => v === 1)).toBe(true);
+    });
+  });
+
   it("leaves a score with NO sub-frame note byte-identical (no false borrowing)", () => {
     const notes = [mkNote("a", 0, 480, 60), mkNote("b", 480, 480, 62), mkNote("c", 1200, 480, 64)];
-    const r = buildScoreTriples(notes, 120, "AP", 2);
+    const r = buildScoreTriples(notes, 120, TK(), 2);
     expect(r.borrowedNoteIds).toEqual([]);
     expect(r.droppedNoteIds).toEqual([]);
     // tempo 120 ⇒ ticksPerFrame 19.2: a 480t note is 25 frames, the 240t gap is 13 (63−50, both rounded).

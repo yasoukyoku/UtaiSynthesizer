@@ -138,6 +138,24 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     expect(map[rightId], "RIGHT half must be marked too").toHaveLength(1);
   });
 
+  // S88 — the verdict inputs now include the REST token: re-pointing it flips notes between "sung" and
+  // "silent", so the sig must carry it. Delete `tk.rest` from oovSig and this is the test that fails:
+  // the recomputed sig is byte-identical, the pass short-circuits, and the stale marks never heal.
+  it("★ re-pointing the REST token re-publishes the verdicts", async () => {
+    const notes = [mk("a", 0, 700, 60), { ...mk("b", 768, 1, 72), lyric: "休" }, mk("c", 1000, 480, 64)];
+    const tracks = useProjectStore.getState().tracks;
+    useProjectStore.setState({
+      tracks: [{ ...tracks[0]!, segments: [{ id: SEG, startTick: 0, durationTicks: 2000, content: { type: "notes", notes } as SegmentContent }] }],
+    });
+    uninstall = installOovWatch();
+    await settle();
+    expect(useAppStore.getState().vocalShort, "an ordinary sub-frame lyric is amber").toEqual({ [SEG]: ["b"] });
+
+    useProjectStore.getState().setVocalParams("T", { restToken: "休" });
+    await settle();
+    expect(useAppStore.getState().vocalShort[SEG], "…and silence is never 'too short'").toBeUndefined();
+  });
+
   it("clears every channel when the segment goes away", async () => {
     uninstall = installOovWatch();
     await settle();

@@ -58,7 +58,7 @@ describe.skipIf(!process.env.UTAI_E1K_DUMP)("E1 K-arm param-f0 dump (diagnostic,
         },
       );
       const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
-        notes, undefined, tempo, DEFAULT_TRANSITION, "AP",
+        notes, undefined, tempo, DEFAULT_TRANSITION, { breath: "AP", rest: "R" }, // 生产默认的两个标记
       );
       const sum = triples.reduce((s, t) => s + t.frames, 0);
       expect(f0Cents.length).toBe(sum);

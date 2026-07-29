@@ -218,6 +218,32 @@ export function resolveOverlaps(notes: Note[], activeIds: Set<string>, minTicks:
   return out;
 }
 
+/** The canonical breath token Rust hard-wires (`AP`/`ap`, g2p.rs `token_class`) — also the default value
+ *  of the per-track trigger, so the default is a no-op over the hard-wired behaviour. */
+export const DEFAULT_BREATH_TOKEN = "AP";
+/** The canonical rest token Rust hard-wires (`R`/`r`/empty, same place). S86 deliberately NARROWED that
+ *  set — `rest`/`sil`/`pau` are ordinary singable words again — and this per-track trigger is how a user
+ *  gets a convenient rest glyph back without any common word being stolen from every language at once. */
+export const DEFAULT_REST_TOKEN = "R";
+
+/** A track's two lyric triggers, resolved. NAMED on purpose: `f(lyric, breathToken, restToken)` would put
+ *  two same-typed strings side by side through several call layers, and a swap there is invisible to the
+ *  compiler, to tests that use the same value for both, and to review (S85 血训: ≥2 same-typed semantic
+ *  fields must be a named struct). */
+export interface VocalTokens {
+  /** Lyric that renders as an audible inhale. Canonical `AP`/`ap` always work too. */
+  breath: string;
+  /** Lyric that renders as a rest. Canonical `R`/`r`/empty always work too. */
+  rest: string;
+}
+
+/** Resolve a track's params to its tokens — THE single place the two defaults live, so no call site can
+ *  drift by forgetting a `?? "AP"`. An explicitly EMPTY token stays empty (only the canonical forms then
+ *  trigger); that is exactly what clearing the sidebar box should mean. */
+export function vocalTokens(p?: VocalTrackParams): VocalTokens {
+  return { breath: p?.breathToken ?? DEFAULT_BREATH_TOKEN, rest: p?.restToken ?? DEFAULT_REST_TOKEN };
+}
+
 /**
  * M3 breath: whether a lyric token renders as an audible INHALE — the canonical `AP`/`ap` the Rust
  * classifier hard-wires, OR the track's user-chosen breath trigger (VocalTrackParams.breathToken). A breath
@@ -228,7 +254,58 @@ export function resolveOverlaps(notes: Note[], activeIds: Set<string>, minTicks:
 export function isBreathLyric(lyric: string, breathToken: string): boolean {
   const l = lyric.trim();
   const bt = breathToken.trim();
-  return l === "AP" || l === "ap" || (bt !== "" && l === bt);
+  return CANONICAL_BREATH.includes(l) || (bt !== "" && l === bt);
+}
+
+/** The breath spellings Rust hard-wires (g2p.rs `token_class`) — always live, whatever the trigger says. */
+const CANONICAL_BREATH: readonly string[] = ["AP", "ap"];
+/** Ditto for rests. An EMPTY lyric is in the set because that is what Rust classifies, not because the
+ *  editor can produce one (clearing a lyric substitutes the language's default lyric). */
+const CANONICAL_REST: readonly string[] = ["R", "r", ""];
+
+/**
+ * The part of a trigger that can actually change classification: EMPTY when the token adds nothing beyond
+ * the hard-wired set — i.e. absent, blank, or one of the canonical spellings themselves.
+ *
+ * ★ THE canonicalizer any SIGNATURE must run the token through. `isRestLyric` trims the token and ORs it
+ * onto the canonical set, so `""`, `"R"`, `"r"` and `"R "` classify byte-identically; hashing the raw
+ * string instead declares every bake on the track dirty for a change that cannot alter one sample. Worse,
+ * it does not even stay decided: `sanitizeVocalParams` rewrites a blank token back to the canonical one on
+ * load, so the project reads dirty before saving and clean after reopening (S88 review, CONFIRMED).
+ */
+export function restTokenKey(restToken: string | undefined): string {
+  const t = (restToken ?? DEFAULT_REST_TOKEN).trim();
+  return CANONICAL_REST.includes(t) ? "" : t;
+}
+/** The breath twin of `restTokenKey` — same reasoning, same wart it removes (the pre-S88 `bt:` term
+ *  hashed the raw string unconditionally, so clearing the breath box false-dirtied a whole track too). */
+export function breathTokenKey(breathToken: string | undefined): string {
+  const t = (breathToken ?? DEFAULT_BREATH_TOKEN).trim();
+  return CANONICAL_BREATH.includes(t) || t === "" ? "" : t;
+}
+
+/**
+ * Whether a lyric token means A REST — the canonical `R`/`r`/empty Rust hard-wires, OR the track's chosen
+ * trigger (VocalTrackParams.restToken). A rest note is the exact equivalent of leaving a GAP: no sung
+ * phones (Rust's `token_class` sees the canonical `R` the render maps it to) AND no pitch, so the line
+ * breaks over it and its neighbours become phrase edges. Dynamic, like the breath token.
+ */
+export function isRestLyric(lyric: string, restToken: string): boolean {
+  const l = lyric.trim();
+  const rt = restToken.trim();
+  return CANONICAL_REST.includes(l) || (rt !== "" && l === rt);
+}
+
+/** Does this lyric carry NO pitch — a rest (silent) or a breath (unvoiced inhale)? The frontend twin of
+ *  Rust `g2p::is_silent_token`, and THE single predicate for "this note is out of the pitch chain".
+ *  Consumers, all of which must agree or the drawn line lies about the audio: the render f0 feed
+ *  (vocalRender), the editor overlay + preview tone + PITCH-PAINT COMMIT (VocalEditor's `pitchChain` —
+ *  the commit stores deltas against this line, so it diverging writes a deviation nobody drew), and the
+ *  auto-tune payload (autoTune — the θ model infers phrase edges from note adjacency alone).
+ *  Rest is tested FIRST so that setting both tokens to the same string resolves to silence: a rest is
+ *  silent, a breath is audible, and the quieter reading is the safe one. */
+export function isSilentLyric(lyric: string, tokens: VocalTokens): boolean {
+  return isRestLyric(lyric, tokens.rest) || isBreathLyric(lyric, tokens.breath);
 }
 
 /**
@@ -254,7 +331,11 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     },
     sovits: sanitizeOpts(p.sovits, SOVITS_DEFAULTS),
     rvc: sanitizeOpts(p.rvc, RVC_DEFAULTS),
-    breathToken: typeof p.breathToken === "string" && p.breathToken.trim() ? p.breathToken : "AP",
+    // The two lyric triggers (§9.8.1). They are compared against note lyrics, which ALWAYS pass through
+    // sanitizeText — so a token carrying control/format code points could never match anything; sanitizing
+    // it here keeps the stored value comparable (and bounded) without changing which notes classify.
+    breathToken: sanitizeToken(p.breathToken, DEFAULT_BREATH_TOKEN),
+    restToken: sanitizeToken(p.restToken, DEFAULT_REST_TOKEN),
     ...(p.rangeExtend === true ? { rangeExtend: true } : {}),
     // S73b/c 自动音高:follow 只存 false(absent≡true=默认常开);表现力 0–4 默认 2、
     // 颤音 0–2 默认 1(S73c 用户拍板:双乘后 4×4 太恐怖)。
@@ -269,6 +350,13 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     // S84 E 刀: vowel clarity toggle — only false is stored (absent≡true, autoTuneFollow pattern).
     ...(p.vowelClarity === false ? { vowelClarity: false } : {}),
   };
+}
+
+/** A lyric trigger from an untrusted file: sanitized like a lyric, and falling back to the canonical token
+ *  when nothing printable survives (an all-blank token would otherwise mean "no trigger" silently). */
+function sanitizeToken(raw: unknown, fallback: string): string {
+  const s = typeof raw === "string" ? sanitizeText(raw) : "";
+  return s.trim() ? s : fallback;
 }
 
 /** Keep only known contract keys from a quality-override bag + drop non-finite numbers; the Rust serde
