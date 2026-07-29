@@ -194,12 +194,17 @@ const VCCV: &[(&str, &str)] = &[
     ("9", "ao"),   // [chart] O:, "bought/soft" — the AO this song never uses
     ("Q", "oy"),   // [chart] OI, "boy"
     ("x", "ah"),   // [chart] @, "about" — VCCV's explicit schwa
-    ("0", "ao"),   // [chart] "bore/bowl"; see `0l`
-    ("0l", "ow l"), // [chart] "bowl" — the ONE chart atom whose value differs from its parts
-    // (`ar`=aa r, `IR`=ay r, `0r`=ao r, `9l`=ao l, `8n`=aw n, `1ng`=ih ng, `1nk`=ih ng k all equal
-    //  their compositional parse, so they need no row. `Ar`("air"=eh r) is a chart atom we do NOT
-    //  take: the corpus's one `Ar-` row is the VC of "share" and wants A+r, which is also what the
-    //  ARPAsing and GrayGlish tracks write there.)
+    ("0", "ao"),   // [chart] "bore/bowl"
+    // NO r/l-coloured or nasal ATOMS. `ar`=aa r, `IR`=ay r, `0r`=ao r, `9l`=ao l, `8n`=aw n,
+    // `1ng`=ih ng, `1nk`=ih ng k all equal their compositional parse, so they need no row — and the
+    // two that do NOT are both deliberately left out:
+    //  * `Ar` ("air" = eh r): the corpus's one `Ar-` row is the VC of "share" and wants A+r, which
+    //    is also what the ARPAsing and GrayGlish tracks write there.
+    //  * `0l` ("bowl" = ow l): S91 review MAJOR. As a one-symbol ATOM it has nsym==1, so the
+    //    carried-vowel rule cannot fire and `hO`|`0l`|`ld` re-articulates the [oʊ] the previous note
+    //    is still holding — the exact pathology this module exists to prevent, and inconsistent with
+    //    the ATTESTED corpus row `("ow l", "oU l", "O l", "l")` for that same word. Compositionally
+    //    `0`+`l` reduces to `l`, which IS that row's answer.
     // ── consonants ──────────────────────────────────────────────────────────────────────────────
     ("nng", "ng"), // [chart] "sing"   ⚠ longest first: must beat `n`+`ng` and `nn`+`g`
     ("ng", "ng"),  // 19
@@ -587,6 +592,12 @@ mod tests {
         assert_eq!(ph(PhonemeSet::Vccv, "-dda"), "d aa"); // the flap, NOT d + d + aa
         assert_eq!(ph(PhonemeSet::Vccv, "-hhE"), "hh iy"); // NOT hh + hh + iy
         assert_eq!(ph(PhonemeSet::Vccv, "@nk"), "ng k"); // nk = ŋk, NOT n + k (the leading @ drops)
+        // ★ a SPACE inside an alias is a HARD boundary — no symbol may span it. Nothing in the
+        // reference corpus distinguishes this (review S91 found the invariant had zero coverage: a
+        // "normalise the whitespace away" refactor ships green and then silently reads `n g` as ŋ).
+        // The `-` keeps the leading symbol so the carried-vowel rule cannot mask the difference.
+        assert_eq!(ph(PhonemeSet::Vccv, "-n g"), "n g"); // NOT the `ng` digraph
+        assert_eq!(ph(PhonemeSet::Xsampa, "-t S"), "t sh"); // NOT the `tS` digraph
     }
 
     /// The carried-vowel rule, in all four shapes it has to tell apart.
@@ -602,8 +613,13 @@ mod tests {
         assert_eq!(ph(PhonemeSet::Xsampa, "br"), "b r");
         // a ONE-symbol alias is never a transition, even when it expands to several phones
         assert_eq!(ph(PhonemeSet::Arpasing, "ae"), "ae");
-        assert_eq!(ph(PhonemeSet::Vccv, "0l"), "ow l"); // a rime, not a VC
         assert_eq!(ph(PhonemeSet::Vccv, "nk"), "ng k");
+        // …and an r/l-coloured chart "atom" must NOT be one, or the rule stops firing on the very
+        // shape it exists for: `hO`|`0l`|`ld` ("hold") would re-articulate the [oʊ] note 1 still
+        // holds. Compositional `0`+`l` gives the same answer as the ATTESTED `O l` row. (Review S91.)
+        assert_eq!(ph(PhonemeSet::Vccv, "0l"), "l");
+        assert_eq!(ph(PhonemeSet::Vccv, "-0l"), "ao l", "…while from silence it keeps its vowel");
+        assert_eq!(ph(PhonemeSet::Vccv, "Ar-"), "r", "same for `Ar`: the corpus row wants A + r");
         // the phrase-onset marker means "from silence": nothing is carried in, so nothing drops
         assert_eq!(ph(PhonemeSet::Arpasing, "- ay"), "ay");
         assert_eq!(ph(PhonemeSet::Xsampa, "-e@n"), "ae n");
@@ -611,6 +627,11 @@ mod tests {
         // …while `_` (a recording variant) and a TRAILING `-` (release) do NOT suppress it
         assert_eq!(ph(PhonemeSet::Xsampa, "e@n-"), "n");
         assert_eq!(ph(PhonemeSet::Vccv, "_rE"), "r iy"); // strip ONLY the underscore — the r is a phone
+        // ⚠ `_rE` alone cannot tell `_` from `-`: its first phone is a consonant, so the drop branch
+        // is never reached either way. THIS is the input that distinguishes them (review S91: the two
+        // prefixes look alike and a "unify them" refactor was passing every test).
+        assert_eq!(ph(PhonemeSet::Xsampa, "_e@n"), "n");
+        assert_eq!(ph(PhonemeSet::Xsampa, "-e@n"), "ae n");
     }
 
     /// Case is meaning in both alias tables (S90: fold the LOOKUP KEY, never the user's phonemes).

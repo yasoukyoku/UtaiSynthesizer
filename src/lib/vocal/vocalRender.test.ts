@@ -10,7 +10,8 @@ vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 // isVocalDirty resolves the singer via the voice-model store — mock ONE installed "V" so `entry` is found.
 vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () => ({ models: { sovits: [{ name: "V", path: "p" }] } }) } }));
 
-import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, vocalRenderOptions, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
+import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, vocalRenderOptions, vocalRenderErrorMessage, isVocalCancelError, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
+import { aliasDefaultLyric } from "./languages";
 import { useProjectStore } from "../../store/project";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note, Track, Segment, ProcessedOutput, VocalTrackParams } from "../../types/project";
@@ -616,6 +617,35 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
     expect(vocalTrackSig(track, 120)).toBe(
       "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s90|st:s88",
     );
+  });
+});
+
+// ── S91: a new/emptied ENGLISH note on an alias track must start out LEGAL in that convention. The
+//    language default `a` is not an ARPABET symbol, so on an ARPAsing track the pen tool would mint
+//    notes that hard-fail the whole segment render with VOCAL_ALIAS (review S91). ──
+describe("aliasDefaultLyric — a new note is never born failing", () => {
+  it("is legal in every convention", () => {
+    expect(aliasDefaultLyric("arpasing")).toBe("aa"); // `a` is not ARPABET
+    expect(aliasDefaultLyric("xsampa")).toBe("a"); // `a` = AA in both alias tables
+    expect(aliasDefaultLyric("vccv")).toBe("a");
+    expect(aliasDefaultLyric(undefined)).toBe("a"); // words track — the language default, unchanged
+  });
+});
+
+// ── S91: the error→message mapping for the new VOCAL_ALIAS code. The function had NO test at all
+//    (review S91), and its own doc warns that a payload-carrying code must be matched BEFORE the
+//    substring checks or a lyric containing a code string hijacks the branch. ──
+describe("vocalRenderErrorMessage — VOCAL_ALIAS and the payload-first ordering", () => {
+  it("splits the convention from the lyric, and does not hijack other codes", () => {
+    // i18n is mocked to echo the key, so the assertions are about WHICH branch fires.
+    expect(vocalRenderErrorMessage(new Error("VOCAL_ALIAS: vccv &m"))).toContain("aliasBad");
+    // a lyric may contain spaces, brackets, CJK — everything after the convention token is the lyric
+    expect(vocalRenderErrorMessage(new Error("VOCAL_ALIAS: xsampa [k ae] 休"))).toContain("aliasBad");
+    // an OOV whose LYRIC happens to spell another code must still be an OOV
+    expect(vocalRenderErrorMessage(new Error("VOCAL_OOV: VOCAL_ALIAS: x y"))).toContain("oov");
+    expect(vocalRenderErrorMessage(new Error("VOCAL_OOV: zzz"))).toContain("oov");
+    // …and a VOCAL_ALIAS failure is never mistaken for a user cancel
+    expect(isVocalCancelError(new Error("VOCAL_ALIAS: vccv 已取消"))).toBe(false);
   });
 });
 

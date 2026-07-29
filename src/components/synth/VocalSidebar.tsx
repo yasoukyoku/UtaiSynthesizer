@@ -267,9 +267,10 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             it). Default ON, absent≡true; the phoneme lane shows the difference immediately.
             ⚠ S91 correction: S89's advice to turn this OFF for a UTAU CVVC/VCCV score was based on a
             wrong model of UTAU. Those files carry their pre-utterance in the note's own `PreUtterance`
-            field, which moves the SAMPLE and never the tick — measured on the four reference USTs, the
-            note starts sit on the grid with a median offset of exactly 0 and no ordering by onset
-            length. Our pre-roll is the analogue of preutterance, applied once. Leave it ON. */}
+            field (or, blank, in the bank's oto.ini), which moves the SAMPLE and never the tick —
+            and against the 1/8-beat unit they are written on, the median start offset is 0 for every
+            onset class with no ordering by consonant length. Our pre-roll is the analogue of
+            preutterance, applied once. Leave it ON. See types/project.ts for the full measurement. */}
         <div title={t("vocalEditor.sidebar.consonantPrerollTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.consonantPreroll")}
@@ -381,7 +382,12 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
             long version, including the other six languages' bracket semantics.
             Shown whenever ENGLISH is in play — track default OR any selected note's override, since a
             per-note `en` on a JA track is exactly when a user meets ARPABET without expecting it. */}
+        {/* ⚠ `|| vocalParams.phonemeSet` (review S91): the reveal is selection-driven, so a track
+            whose DEFAULT language is ja (which is what an imported English UST lands on) could set a
+            convention with an en note selected and then have the control vanish — a live setting the
+            user can neither see nor reset. A convention that is SET is always visible. */}
         {(langById(vocalParams.langId).code === "en" ||
+          !!vocalParams.phonemeSet ||
           selected.some((n) => (n.lang ?? langById(vocalParams.langId).code) === "en")) && (
           <>
             {/* S91 「音素约定」: an English UST written for a UTAU voicebank carries sample ALIASES, not

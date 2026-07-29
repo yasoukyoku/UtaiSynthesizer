@@ -678,10 +678,24 @@ enum Tok {
 /// the canonical one before Rust ever sees it (`VocalTrackParams.breathToken` → `AP`; `restToken` →
 /// `R`), so a convenient glyph is never stolen from real lyrics.
 /// Anything changed here must also hold for `is_silent_token`'s consumers.
-fn token_class(lyric: &str) -> Tok {
+/// S91: `set` because ONE reserved spelling genuinely collides with the alias conventions —
+/// lowercase **`ap`** is an ordinary VC alias (`a`+`p`, the coda of *stop* / *top* / *drop*) in both
+/// X-SAMPA and VCCV, and swallowing it as a breath renders an audible INHALE mid-word with no error
+/// and no red mark (review S91, MAJOR). On an alias track it is therefore a WORD. Nothing is lost:
+/// the canonical breath is `AP` — which the frontend always writes (`mapLyric` maps the track's
+/// `breathToken` onto it) and which is not a legal alias in either table — and a track can point its
+/// breath trigger anywhere it likes.
+///
+/// ⚠ `r` is deliberately NOT freed the same way, and the asymmetry is evidence-based rather than
+/// tidy: a bare `r` really is used as a REST by real banks (in `duvet - vocal.ust` the two `r` notes
+/// carry only Length/Lyric/NoteNum — byte-for-byte the shape of that file's 46 `R` rests, while every
+/// sung note there also carries Envelope/PBW/PBS), and a genuine standalone /ɹ/ still has `-r`, `r-`
+/// and `_r`. We have no such evidence for `ap` in any bank.
+fn token_class(lyric: &str, set: PhonemeSet) -> Tok {
     match lyric.trim() {
         "R" | "r" | "" => Tok::Rest,
-        "AP" | "ap" => Tok::Breath,
+        "AP" => Tok::Breath,
+        "ap" if set == PhonemeSet::Words => Tok::Breath,
         "-" | "ー" => Tok::Hold,
         "+" => Tok::Next,
         _ => Tok::Word,
@@ -697,8 +711,11 @@ fn token_class(lyric: &str) -> Tok {
 /// to the wrong note for the rest of the segment. Before S86 the DAW side called
 /// `score2cv::classify_lyric`, whose rest set is deliberately WIDER (it is the upstream parity port)
 /// — narrowing `token_class` without moving this predicate would have silently reopened that desync.
-pub fn is_silent_token(lyric: &str) -> bool {
-    matches!(token_class(lyric), Tok::Rest | Tok::Breath)
+/// ⚠ S91 added the `set` parameter for exactly the reason this doc comment gives: lowercase `ap` is
+/// silent on a words track and SUNG on an alias track, so the two sides of the grouping must be asked
+/// the same question. The compiler now forces every caller to say which track it is talking about.
+pub fn is_silent_token(lyric: &str, set: PhonemeSet) -> bool {
+    matches!(token_class(lyric, set), Tok::Rest | Tok::Breath)
 }
 
 /// An OpenUtau **phonetic hint**: square brackets CLOSING the lyric pin that note's phones —
@@ -752,7 +769,7 @@ pub fn note_run_langs(score: &[ScoreEvt]) -> Vec<Lang> {
     let mut out: Vec<Option<Lang>> = vec![None; n];
     let mut cur: Option<Lang> = None;
     for i in 0..n {
-        match token_class(score[i].lyric) {
+        match token_class(score[i].lyric, score[i].phoneme_set) {
             Tok::Word => {
                 cur = Some(score[i].lang);
                 out[i] = cur;
@@ -800,7 +817,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
         .map(|(i, e)| {
             if e.lang != Lang::En
                 || e.phoneme_input.is_some()
-                || token_class(e.lyric) != Tok::Word
+                || token_class(e.lyric, e.phoneme_set) != Tok::Word
                 || phoneme_hint(e.lyric).is_some()
             {
                 return None;
@@ -830,7 +847,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
 
     let n = score.len();
     let run_langs = note_run_langs(score);
-    let toks: Vec<Tok> = score.iter().map(|e| token_class(e.lyric)).collect();
+    let toks: Vec<Tok> = score.iter().map(|e| token_class(e.lyric, e.phoneme_set)).collect();
 
     // zh phrase pass: phrase context flows over a window of PLAIN single-hanzi word notes (no override,
     // no pinyin) where sustains/rests/breaths are TRANSPARENT — a hold belongs to the previous char and
@@ -1405,16 +1422,16 @@ mod tests {
         // `sil`/`pau` are freed too: once a word can be split across notes they show up as fragments
         // (sil|ver, pau|se), so a reserved token that can be part of a word collides by construction.
         for w in ["rest", "sil", "pau"] {
-            assert!(!is_silent_token(w), "{w:?} must be available as lyric material");
+            assert!(!is_silent_token(w, PhonemeSet::Words), "{w:?} must be available as lyric material");
         }
         // ★ the DAW-side note grouping must key off the SAME predicate the cv side resolves with —
         //   `score2cv::classify_lyric` keeps a WIDER rest set (upstream parity port) and using it in
         //   `compute_note_groups` would desync every later group index (review R2/SS-1/GATE-3).
         for lyric in ["R", "r", "", "AP", "ap", "  "] {
-            assert!(is_silent_token(lyric), "{lyric:?} produces no sung phones");
+            assert!(is_silent_token(lyric, PhonemeSet::Words), "{lyric:?} produces no sung phones");
         }
         for lyric in ["rest", "sil", "pau", "light", "か"] {
-            assert!(!is_silent_token(lyric), "{lyric:?} is a WORD for the DAW side too");
+            assert!(!is_silent_token(lyric, PhonemeSet::Words), "{lyric:?} is a WORD for the DAW side too");
         }
         // the real English word now sings, and case no longer decides whether it does
         let f2 = fixtures();
@@ -1600,8 +1617,8 @@ mod tests {
         // 4. ★ an all-hint lyric must stay a WORD: its "word part" is empty, and an empty lyric is the
         //    REST token — stripping the hint out of the lyric would silence the note (and desync the
         //    DAW-side grouping, which classifies the RAW lyric through `is_silent_token`).
-        assert!(!is_silent_token("[ae n]"));
-        assert_eq!(token_class("[ae n]") == Tok::Word, true);
+        assert!(!is_silent_token("[ae n]", PhonemeSet::Words));
+        assert_eq!(token_class("[ae n]", PhonemeSet::Words) == Tok::Word, true);
         // 5. a multi-syllable hint spreads over its `+` notes exactly like a dictionary word does —
         //    three nuclei that only the S90 stressless rule can see. ⚠ the CUT points come from the
         //    fixture's onset set: on the SHIPPED dictionary the same word cuts k æ | n d ə | l ɪ t,
@@ -2011,6 +2028,41 @@ mod tests {
             phones_of(&one(alias_evt("light", PhonemeSet::Words))),
             phones_of(&one(evt("light", Lang::En)))
         );
+    }
+
+    /// ★ S91 review MAJOR: lowercase `ap` is an ordinary VC alias (`a`+`p` — the coda of *stop* /
+    /// *top*), and swallowing it as a breath rendered an audible INHALE mid-word with no error and no
+    /// red mark. On an alias track it must be a WORD — and, critically, the DAW-side grouping
+    /// predicate has to agree, or the cv side sings a phone the note grouping thinks is silence and
+    /// every later group index shifts (the S86 desync this predicate was extracted to prevent).
+    #[test]
+    fn alias_frees_the_lowercase_breath_token_and_both_sides_agree() {
+        let f = fixtures();
+        // words track: unchanged, `ap` is still a breath
+        assert!(is_silent_token("ap", PhonemeSet::Words));
+        assert!(matches!(
+            resolve_score(&[alias_evt("ap", PhonemeSet::Words)], &f).unwrap()[0].kind,
+            ResolvedKind::Breath
+        ));
+        // alias track: it is the alias, and the two sides say the same thing
+        for set in [PhonemeSet::Xsampa, PhonemeSet::Vccv] {
+            assert!(!is_silent_token("ap", set), "{set:?}");
+            assert_eq!(phones_of(&resolve_score(&[alias_evt("ap", set)], &f).unwrap()[0]), vec!["p"]);
+        }
+        // …and the canonical spellings are untouched everywhere, in BOTH predicates
+        for set in [PhonemeSet::Words, PhonemeSet::Arpasing, PhonemeSet::Xsampa, PhonemeSet::Vccv] {
+            for (lyric, silent) in [("R", true), ("r", true), ("", true), ("AP", true), ("light", false)] {
+                assert_eq!(is_silent_token(lyric, set), silent, "{lyric:?} @ {set:?}");
+                let kind = &resolve_score(&[alias_evt(lyric, PhonemeSet::Words)], &f).unwrap()[0].kind;
+                assert_eq!(matches!(kind, ResolvedKind::Rest | ResolvedKind::Breath), silent);
+            }
+        }
+        // `r` stays a REST on purpose: real banks use it that way (the two `r` notes in
+        // `duvet - vocal.ust` carry only Length/Lyric/NoteNum, the shape of that file's `R` rests),
+        // and a genuine standalone /ɹ/ still has three spellings.
+        for spelling in ["-r", "r-", "_r"] {
+            assert_eq!(phones_of(&resolve_score(&[alias_evt(spelling, PhonemeSet::Vccv)], &f).unwrap()[0]), vec!["ɹ"]);
+        }
     }
 
     /// A sustain after an alias note re-emits that note's own carrier — the same rule a word note

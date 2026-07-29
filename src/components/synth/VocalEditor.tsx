@@ -32,7 +32,7 @@ import {
   paramToY, yToParam, LOUDNESS_DB_RANGE,
 } from "../../lib/vocalGeometry";
 import type { Note } from "../../types/project";
-import { langById, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
+import { langById, aliasDefaultLyric, DEFAULT_LANG_ID } from "../../lib/vocal/languages";
 import { VocalSidebar } from "./VocalSidebar";
 import { HScrollbarView } from "./HScrollbar";
 import "./VocalEditor.css";
@@ -70,7 +70,13 @@ type LaneView = LaneParam | "phoneme";
 interface PhonemeSpan { phone: string; frames: number; evt: number; voiceless: boolean; nucleus: boolean }
 // S58: the default lyric for a newly drawn note follows the TRACK's language (a ja "あ" on a zh/en
 // track would be instant OOV — audit MAJOR). langById falls back to ja for an out-of-range id.
-const defaultLyricFor = (langId: number | undefined) => langById(langId ?? DEFAULT_LANG_ID).defaultLyric;
+// S91: on an ALIAS track a new ENGLISH note must start out legal in that CONVENTION — the English
+// default `a` is not ARPABET, so on an ARPAsing track the pen tool would mint notes that hard-fail
+// the whole segment render (review S91). Non-English notes keep their language's default.
+const defaultLyricFor = (langId: number | undefined, set?: string) => {
+  const l = langById(langId ?? DEFAULT_LANG_ID);
+  return set && l.code === "en" ? aliasDefaultLyric(set) : l.defaultLyric;
+};
 
 /** THE notes the pitch LINE is made of — silent ones (a rest, a breath) are not part of it, so the line
  *  breaks over them and their neighbours become phrase edges (§10.5), matching the render's f0 feed.
@@ -186,8 +192,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const tokensRef = useRef(vocalTokens(part?.vocalParams));
   tokensRef.current = vocalTokens(part?.vocalParams);
   // S58: the track's default lang drives the default lyric of newly drawn notes (must be singable).
-  const defaultLyricRef = useRef(defaultLyricFor(part?.vocalParams?.langId));
-  defaultLyricRef.current = defaultLyricFor(part?.vocalParams?.langId);
+  const defaultLyricRef = useRef(defaultLyricFor(part?.vocalParams?.langId, part?.vocalParams?.phonemeSet));
+  defaultLyricRef.current = defaultLyricFor(part?.vocalParams?.langId, part?.vocalParams?.phonemeSet);
   // ② S58 OOV verdicts for THIS segment (async, from the oovWatch watcher) — ref-synced for the draw
   // closure; the dedicated redraw effect below re-invokes it when the verdict changes.
   const oovIds = useAppStore((s) => s.vocalOov[segmentId]);
@@ -1467,12 +1473,19 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   const commitLyric = (id: string, value: string) => {
     if (!part) { setLyricEdit(null); return; }
-    // S91: on an ALIAS track the typed string is ONE alias, never a phrase to distribute. ARPAsing
-    // spells every alias with a space (`ae n`, `y uw`), so whole-phrase distribution would scatter a
-    // single note's content over its neighbours — and X-SAMPA/VCCV have spaced aliases too (`E r`,
-    // `aI e@`). Import is unaffected either way (it stores one UST line per note verbatim).
-    const tokens = part.vocalParams.phonemeSet
-      ? [value.trim() || defaultLyricRef.current]
+    // S91: on an ALIAS track an ENGLISH note's typed string is ONE alias, never a phrase to
+    // distribute — many ARPAsing aliases contain a space (`ae n`, `y uw`), and X-SAMPA/VCCV have
+    // spaced ones too (`E r`, `aI e@`), so distributing on spaces would scatter one note's content
+    // over its neighbours. Import is unaffected either way (one UST line per note, verbatim).
+    // ⚠ Scoped to the note's EFFECTIVE language, exactly like the Rust fold (`resolve_core` bails on
+    // `lang != En`): a review found the first version keyed on the track alone, so a ja note on a
+    // mixed-language alias track silently lost its per-mora distribution. And the empty-commit
+    // fallback must be legal in this convention — the language default `a` is not ARPABET, so on an
+    // ARPAsing track it would mint a note that hard-fails the whole segment render.
+    const noteLang = orderedNotes().find((n) => n.id === id)?.lang ?? langById(part.vocalParams.langId).code;
+    const aliasNote = !!part.vocalParams.phonemeSet && noteLang === "en";
+    const tokens = aliasNote
+      ? [value.trim() || aliasDefaultLyric(part.vocalParams.phonemeSet)]
       : splitLyricTokens(value.trim(), defaultLyricRef.current);
     const ordered = orderedNotes();
     const startIdx = ordered.findIndex((n) => n.id === id);

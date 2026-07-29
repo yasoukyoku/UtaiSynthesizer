@@ -325,10 +325,15 @@ export interface VocalTrackParams {
    *  its own note.
    *  ⚠ S91 CORRECTION: S89 shipped this saying a UTAU CVVC/VCCV score's author "already moved the
    *  consonants ahead by hand", so pre-rolling would apply the head start twice. That is FALSE, and
-   *  measurement on the four reference USTs says so: the pre-utterance lives in the file's own
-   *  `PreUtterance` field (486-489 of ~535 notes carry one, median 82-120 ms) and in UTAU semantics
-   *  that moves the SAMPLE, never the note's tick. Note starts show a median offset of exactly 0
-   *  against every plausible grid, with NO ordering by onset length (nasals are the LATEST class).
+   *  measurement on the four reference USTs says so. (1) The pre-utterance lives in the file's own
+   *  `PreUtterance` field — 486-489 notes in each of the three parallel scores carry a numeric one
+   *  (median 82-120 ms); the fourth leaves it blank and inherits it from the bank's `oto.ini` —
+   *  and in UTAU semantics either form moves the SAMPLE, never the note's tick. (2) Against the
+   *  1/8-beat (60-tick) unit these files are written on, the median start offset is 0 for EVERY
+   *  onset class, and longer consonants do not start earlier (nasals are the latest) — the
+   *  fingerprint a hand-made pre-shift would leave is absent. ⚠ Do NOT restate this as "median 0
+   *  against every grid": against the app's own 1/4 grid it is ~+49 ticks, because these scores are
+   *  transcribed from an UNQUANTISED performance (review S91 caught the overstatement).
    *  So our pre-roll is the analogue of preutterance, applied ONCE — leave it ON for alias scores too.
    *  Absent/true = ON (the production default); stored ONLY as false (the vowelClarity fold pattern). */
   consonantPreroll?: boolean;

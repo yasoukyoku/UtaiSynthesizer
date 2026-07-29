@@ -98,7 +98,7 @@
     "pitchDropped": "One track's pitch tuning exceeded the import limit and was imported untuned (notes are intact)",
     "options": {
       "title": "Import options",
-      "body": "{{total}} notes, {{off}} of them ({{pct}}%) sit off the 1/12 grid. If this score's note positions were shifted by hand (UTAU CVVC preutterance compensation works exactly that way), turn rounding off and import it as authored.",
+      "body": "{{total}} notes, {{off}} of them ({{pct}}%) sit off the 1/12 grid. If this score's note positions were shifted by hand (a UTAU CVVC .ust usually is: it is transcribed from an unquantised performance, and it carves word-final consonants onto their own very short notes), turn rounding off and import it as authored.",
       "quantize": "Round note boundaries to the nearest 1/12 beat",
       "start": "Import"
     },
@@ -632,7 +632,7 @@
       "vowelClarity": "Vowel clarity",
       "vowelClarityTip": "Render fast-run short vowels at an inflated duration and resample back (cv-domain — no time-stretch artifacts), so 40-80 ms vowels still reach their target articulation. Default on.",
       "consonantPreroll": "Automatic phoneme timing",
-      "consonantPrerollTip": "Sing a syllable's opening consonant AHEAD of the beat so the vowel lands on it — what real singers do, what the training data annotates, and what a UTAU voicebank's preutterance does. Keep it ON for UTAU CVVC / VCCV alias scores too: their pre-utterance lives in each note's own PreUtterance field, and UTAU moves the SAMPLE, never the note's position (measured on the four reference USTs: the median start offset against every plausible grid is exactly 0, with no ordering by consonant length) — our pre-roll is the analogue of preutterance, applied once. With it off, the consonant comes out of this note's own duration and nothing is ever borrowed from the previous note (it can take at most half the note; on a note too short to spare even 2 frames it is dropped) — the positions the author placed do not move at all. One exception: a short vowel may still extend into the rest immediately after it, which only eats silence and never moves a note's start. The phoneme lane shows the resulting split. Default on.",
+      "consonantPrerollTip": "Sing a syllable's opening consonant AHEAD of the beat so the vowel lands on it — what real singers do, what the training data annotates, and what a UTAU voicebank's preutterance does. Keep it ON for UTAU CVVC / VCCV alias scores too: their pre-utterance lives in each note's own PreUtterance field, and UTAU moves the SAMPLE, never the note's position (measured on the four reference USTs: against the 1/8-beat unit these files are written on, the median start offset is 0 for every onset class and longer consonants do not start earlier, with no ordering by consonant length) — our pre-roll is the analogue of preutterance, applied once. With it off, the consonant comes out of this note's own duration and nothing is ever borrowed from the previous note (it can take at most half the note; on a note too short to spare even 2 frames it is dropped) — the positions the author placed do not move at all. One exception: a short vowel may still extend into the rest immediately after it, which only eats silence and never moves a note's start. The phoneme lane shows the resulting split. Default on.",
       "pickVoice": "Pick a singer…",
       "noVoiceModel": "No voice models",
       "goImport": "Import in Resource Manager",

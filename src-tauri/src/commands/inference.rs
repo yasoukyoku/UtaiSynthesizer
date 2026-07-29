@@ -1448,11 +1448,15 @@ pub struct ScoreNote {
 /// every score without one is bit-identical, which is why S88's timing-version bump is enough to invalidate
 /// the affected bakes. (S86 extracted `is_silent_token` for precisely this class of consumer drift — this
 /// call site was the last one still bypassing it.)
-fn plan_note_nums(score: &[ScoreNote]) -> Vec<i64> {
+/// S91: takes the track's convention because `is_silent_token` now depends on it (lowercase `ap` is
+/// a breath on a words track and a sung VC alias on an alias track). Passing the wrong one here would
+/// hand the range planner a pitch for a silent note, or zero for a sung one — the S88 bug this
+/// function was written to fix, in the other direction.
+fn plan_note_nums(score: &[ScoreNote], set: crate::inference::g2p_alias::PhonemeSet) -> Vec<i64> {
     score
         .iter()
         .map(|n| {
-            if crate::inference::g2p::is_silent_token(&n.lyric) {
+            if crate::inference::g2p::is_silent_token(&n.lyric, set) {
                 0
             } else {
                 n.note_num
@@ -1777,6 +1781,9 @@ pub async fn render_vocal_segment(
     if let Some(data_dir) = app.models.models_dir().parent() {
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
+    // S91: ONE place converts the wire string to the enum, and the track's single setting is fanned
+    // out over every note below (a score never mixes conventions — see `ScoreEvt::phoneme_set`).
+    let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(options.phoneme_set.as_deref());
     // S60-2 → S85 音域扩展(score):整曲平移废除(三轮耳判「开了不如不开」——救 1.7% 极端音
     // 却让其余音符各自去赌 per-(音素×落点) 渲染死区 + 随深度增长的往返税;memory S85)。
     // dead-only:仅含「真死音」(记录 f0 判据连音高都发不出)的休止分界短语,以最小深度渲染到
@@ -1793,7 +1800,7 @@ pub async fn render_vocal_segment(
         };
         match crate::inference::vocal_range::speaker_range(&entry.config, speaker) {
             Some(r) => {
-                let nn = plan_note_nums(&score);
+                let nn = plan_note_nums(&score, phoneme_set);
                 let fr: Vec<i64> = score.iter().map(|n| n.frames).collect();
                 let (plan, unfixable) =
                     crate::inference::vocal_range::dead_only_plan(&nn, options.transpose, &r);
@@ -1866,9 +1873,6 @@ pub async fn render_vocal_segment(
         vowel_clarity: options.vowel_clarity, // S84 E 刀 toggle (bool — nothing to sanitize)
         consonant_preroll: options.consonant_preroll, // S89 toggle (bool — nothing to sanitize)
     };
-    // S91: ONE place converts the wire string to the enum, and the track's single setting is fanned
-    // out over every note below (a score never mixes conventions — see `ScoreEvt::phoneme_set`).
-    let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(options.phoneme_set.as_deref());
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
     match backend_type {
@@ -2110,7 +2114,7 @@ mod tests {
             note("r", 0),
             note("", 55),    // an empty lyric is a rest too (g2p token_class)
         ];
-        assert_eq!(plan_note_nums(&score), vec![0, 60, 0, 62, 0, 0]);
+        assert_eq!(plan_note_nums(&score, crate::inference::g2p_alias::PhonemeSet::Words), vec![0, 60, 0, 62, 0, 0]);
     }
 
     /// The words S86 deliberately freed are ORDINARY lyrics — zeroing one here would silently drop a sung
@@ -2118,7 +2122,7 @@ mod tests {
     #[test]
     fn plan_note_nums_keeps_freed_words_and_sustains() {
         let score = [note("rest", 60), note("sil", 61), note("pau", 62), note("-", 63), note("+", 64)];
-        assert_eq!(plan_note_nums(&score), vec![60, 61, 62, 63, 64]);
+        assert_eq!(plan_note_nums(&score, crate::inference::g2p_alias::PhonemeSet::Words), vec![60, 61, 62, 63, 64]);
     }
 
     /// The phrase-delimiting consequence, stated as BEHAVIOUR — the planner is actually run, because
@@ -2134,7 +2138,7 @@ mod tests {
         let range = SpeakerRange::bounds((48.0, 79.0), (55.0, 74.0));
         let score = [note("か", 60), note("R", 71), note("き", 85)];
 
-        let (plan, unfixable) = dead_only_plan(&plan_note_nums(&score), 0, &range);
+        let (plan, unfixable) = dead_only_plan(&plan_note_nums(&score, crate::inference::g2p_alias::PhonemeSet::Words), 0, &range);
         assert!(unfixable.is_empty(), "the dead phrase has a landing — nothing should be unfixable");
         assert_eq!(plan.len(), 1, "one dead phrase ⇒ one group");
         assert_eq!(

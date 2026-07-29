@@ -80,7 +80,13 @@ export function vocalRenderErrorMessage(e: unknown): string {
   // CONTAIN another code string ("VOCAL_EMPTY" as a lyric…) must not hijack the match (audit).
   const dict = msg.match(/VOCAL_DICT_MISSING:\s*(.*)$/);
   if (dict) return i18n.t("vocalEditor.render.dictMissing", { file: dict[1] });
-  const alias = msg.match(/VOCAL_ALIAS:\s*(\S+)\s([\s\S]*)$/);
+  // ⚠ The convention token is whitelisted, not `\S+`: the payload after it is the user's LYRIC, and a
+  // lyric that merely CONTAINS the string "VOCAL_ALIAS:" would otherwise hijack this branch away from
+  // the code that really failed — a review reproduced exactly that with `VOCAL_OOV: VOCAL_ALIAS: x y`.
+  // Requiring a known convention narrows the hijack to a lyric literally spelled like a real alias
+  // failure; that residue is inherent to the "CODE: user-content" wire shape (the dict/oov pair has
+  // it too) and is accepted, not solved.
+  const alias = msg.match(/VOCAL_ALIAS:\s*(arpasing|xsampa|vccv|words)\s([\s\S]*)$/);
   if (alias) {
     return i18n.t("vocalEditor.render.aliasBad", {
       lyric: alias[2],

@@ -168,7 +168,7 @@ fn compute_note_groups(arr: &ScoreArrays, score: &[ScoreEvt]) -> NoteGroups {
             // S86: `g2p::is_silent_token`, NOT `classify_lyric` — the latter keeps the upstream
             // parity port's WIDER rest set (rest/sil/pau), which would key this grouping differently
             // from the cv-side grouping and shift every later group index.
-            let npitch = if g2p::is_silent_token(evt.lyric) {
+            let npitch = if g2p::is_silent_token(evt.lyric, evt.phoneme_set) {
                 0
             } else {
                 evt.note_num
