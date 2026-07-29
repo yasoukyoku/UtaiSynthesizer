@@ -32,6 +32,7 @@ use super::*;
 use super::super::engine::{DeviceConfig, OnnxEngine};
 use super::super::f0 as f0mod;
 use super::super::features;
+use super::super::g2p_alias::PhonemeSet;
 use super::super::score2cv::{ArticulationTiming, NoDicts};
 use super::super::{rvc, sovits};
 use std::path::{Path, PathBuf};
@@ -368,6 +369,7 @@ fn e1_cross_probe() {
                 frames: t.frames,
                 lang: Lang::Ja,
                 phoneme_input: None,
+                phoneme_set: PhonemeSet::Words,
             })
             .collect();
         let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
@@ -385,6 +387,7 @@ fn e1_cross_probe() {
                     frames: t.frames,
                     lang: Lang::Ja,
                     phoneme_input: None,
+                    phoneme_set: PhonemeSet::Words,
                 })
                 .collect();
             let a = build_arrays_daw(&evts_dump, &NoDicts, ArticulationTiming::Auto).unwrap();

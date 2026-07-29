@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use super::g2p_alias::{alias_phones, PhonemeSet};
 use super::g2p_tables as gt;
 use super::score2cv::{classify_lyric as classify_lyric_ja, is_nucleus_phone, LyricClass};
 use super::score2cv_tables as tbl;
@@ -97,12 +98,23 @@ pub struct ScoreEvt<'a> {
     /// Traditional-phoneme override (§3.7 user layer): with whitespace = raw traditional phones;
     /// without = a syllable/mora (zh pinyin, ja kana/romaji; a single bare phone for en/de/fr/es/it).
     pub phoneme_input: Option<&'a str>,
+    /// S91: which UTAU alias convention this note's ENGLISH lyric is written in (`Words` = ordinary
+    /// spelling, the default and the pre-S91 behaviour). Per-note like `lang`, but the command layer
+    /// fans ONE per-track setting out over every note — a score never mixes conventions.
+    pub phoneme_set: PhonemeSet,
 }
 
 impl<'a> ScoreEvt<'a> {
     /// JA-defaulted event from a legacy `(lyric, note_num, frames)` triple (parity paths + tests).
     pub fn ja(t: &(&'a str, i64, i64)) -> ScoreEvt<'a> {
-        ScoreEvt { lyric: t.0, note_num: t.1, frames: t.2, lang: Lang::Ja, phoneme_input: None }
+        ScoreEvt {
+            lyric: t.0,
+            note_num: t.1,
+            frames: t.2,
+            lang: Lang::Ja,
+            phoneme_input: None,
+            phoneme_set: PhonemeSet::Words,
+        }
     }
 }
 
@@ -199,6 +211,19 @@ fn convert_arpabet(p: &str) -> String {
         return ipa.to_string();
     }
     p.to_string()
+}
+
+/// Is this token a REAL ARPABET symbol (case-insensitive, optional CMUdict stress digit)?
+///
+/// S91: the alias conventions hand raw tokens to `stage2`, and `convert_arpabet` passes an unknown
+/// symbol through UNMAPPED so interning rejects it — correct, but the resulting error names the whole
+/// lyric. Asking here instead lets the alias layer name the offending SYMBOL. Deliberately does NOT
+/// accept `sil`/`sp`/`spn`: those mean silence to `convert_arpabet`, and a silence token hiding inside
+/// a sung alias is exactly the kind of quiet surprise S90 spent a round removing.
+pub(crate) fn arpabet_is_known(tok: &str) -> bool {
+    let up = tok.to_ascii_uppercase();
+    let base = up.strip_suffix(['0', '1', '2']).unwrap_or(&up);
+    arpabet_map().contains_key(base)
 }
 
 /// Port of `convert_mfa`: empty/spn → SP; NFC-normalize; MFA_NORMALIZE map; else passthrough.
@@ -415,7 +440,7 @@ fn dict_is_vowel(lang: Lang, vowels: &HashSet<&'static str>, ph: &str) -> bool {
 /// Case-insensitive because hints are conventionally lowercase while CMUdict is upper — but the
 /// UPPERCASE membership test is tried first without allocating, which is the only path the dictionary
 /// build (863018 tokens, all uppercase) ever takes.
-fn en_is_nucleus(ph: &str) -> bool {
+pub(crate) fn en_is_nucleus(ph: &str) -> bool {
     let base = ph.strip_suffix(['0', '1', '2']).unwrap_or(ph);
     let syms = arpabet_nucleus_syms();
     syms.contains(base)
@@ -760,9 +785,46 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     // so every branch below sees a single override notion (and the editor's classify pass, which shares
     // this function, can never disagree with the render about it). An explicit `phoneme_input` still
     // wins — it is the more specific, later user action. The lyric is left untouched; only lookup moves.
+    //
+    // S91: an ALIAS convention folds in at the same point and for the same reason — one override
+    // notion, one code path for the render and the editor. Order of precedence, most specific first:
+    //   explicit `phoneme_input` → bracket hint `[...]` → the track's alias convention → dictionary.
+    // Only ENGLISH word notes are converted: the conventions ARE English reclists, and a mixed-language
+    // track must keep its ja/zh/de/… notes on the dictionary path.
+    // A FAILED alias is recorded, never fallen back on: 31-38 % of these aliases are also real en.tsv
+    // keys (`ju`, `to`, `E`, `O`), so "try the alias, else look it up" would sing a different WORD.
+    let mut alias_failed: Vec<bool> = vec![false; score.len()];
+    let alias_owned: Vec<Option<String>> = score
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            if e.lang != Lang::En
+                || e.phoneme_input.is_some()
+                || token_class(e.lyric) != Tok::Word
+                || phoneme_hint(e.lyric).is_some()
+            {
+                return None;
+            }
+            match alias_phones(e.phoneme_set, e.lyric) {
+                Some(Ok(ph)) => Some(ph),
+                Some(Err(_sym)) => {
+                    alias_failed[i] = true;
+                    None
+                }
+                None => None, // PhonemeSet::Words — the dictionary path, unchanged
+            }
+        })
+        .collect();
     let hinted: Vec<ScoreEvt> = score
         .iter()
-        .map(|e| ScoreEvt { phoneme_input: e.phoneme_input.or_else(|| phoneme_hint(e.lyric)), ..e.clone() })
+        .enumerate()
+        .map(|(i, e)| ScoreEvt {
+            phoneme_input: e
+                .phoneme_input
+                .or_else(|| phoneme_hint(e.lyric))
+                .or_else(|| alias_owned[i].as_deref()),
+            ..e.clone()
+        })
         .collect();
     let score = &hinted[..];
 
@@ -864,6 +926,22 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                 i += 1;
             }
             Tok::Word => {
+                // S91: an alias that the track's convention cannot read fails LOUDLY with its own
+                // CODE, and is NEVER handed to the dictionary (see the fold above — a third of these
+                // aliases are also real English words, so a fallback sings a different word silently).
+                if alias_failed[i] {
+                    if strict {
+                        return Err(UtaiError::Inference(format!(
+                            "VOCAL_ALIAS: {} {}",
+                            evt.phoneme_set.as_str(),
+                            evt.lyric
+                        )));
+                    }
+                    carrier = None;
+                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false });
+                    i += 1;
+                    continue;
+                }
                 match evt.lang {
                     Lang::Ja | Lang::Zh => {
                         match resolve_east_word(evt, zh_syl[i].as_deref(), dicts)? {
@@ -1254,7 +1332,7 @@ mod tests {
         Fixtures { zh: zh_fixture(), en: en_fixture(), de: de_fixture() }
     }
     fn evt(lyric: &str, lang: Lang) -> ScoreEvt<'_> {
-        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None }
+        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set: PhonemeSet::Words }
     }
     fn phones_of(nt: &ResolvedNote) -> Vec<&'static str> {
         match &nt.kind {
@@ -1867,5 +1945,83 @@ mod tests {
         assert!(d.syllable_phones("bad").is_none(), "empty-phones row dropped → OOV, not zero phones");
         assert!(!d.phrases.contains_key("长大"), "syllable-count mismatch row dropped");
         assert!(d.phrases.contains_key("好了"));
+    }
+
+    // ─── S91 UTAU alias conventions (queue 5c) — the resolve_core integration ────────────────────
+    fn alias_evt(lyric: &str, set: PhonemeSet) -> ScoreEvt<'_> {
+        ScoreEvt { lyric, note_num: 60, frames: 20, lang: Lang::En, phoneme_input: None, phoneme_set: set }
+    }
+
+    /// ★★ THE regression this feature could most easily ship: an alias that is ALSO a real dictionary
+    /// word must sing the ALIAS, never the word. Measured on the reference scores, 31 % of the X-SAMPA
+    /// aliases and 38 % of the VCCV ones are real `en.tsv` keys, so a "try the alias, else look it up"
+    /// design would sing a DIFFERENT WORD on a third of the score, silently — the S90 `[dr]`→"drive"
+    /// pathology at scale. Every lyric below is in the fixture dictionary AND a legal alias.
+    #[test]
+    fn alias_never_falls_back_to_the_dictionary() {
+        let f = fixtures();
+        let sing = |lyric: &str, set: PhonemeSet| -> Vec<&'static str> {
+            phones_of(&resolve_score(&[alias_evt(lyric, set)], &f).unwrap()[0])
+        };
+        // the word readings, for contrast (these are what the dictionary path gives)
+        assert_eq!(sing("two", PhonemeSet::Words), vec!["t", "u"]);
+        assert_eq!(sing("love", PhonemeSet::Words), vec!["l", "ʌ", "v"]);
+        assert_eq!(sing("fun", PhonemeSet::Words), vec!["f", "ʌ", "n"]);
+        // …and the alias readings of the SAME strings
+        assert_eq!(sing("two", PhonemeSet::Xsampa), vec!["t", "w", "oʊ"]);
+        assert_eq!(sing("love", PhonemeSet::Xsampa), vec!["l", "oʊ", "v", "ɛ"]);
+        assert_eq!(sing("fun", PhonemeSet::Vccv), vec!["f", "ə", "n"]);
+    }
+
+    /// An alias the convention cannot read fails LOUDLY with its OWN code (never the dictionary's
+    /// `VOCAL_OOV`, whose message sends the user to "check the lyric or the language" — the wrong
+    /// advice here), and the editor's lenient pass marks exactly that note.
+    #[test]
+    fn alias_failure_is_loud_and_marks_only_that_note() {
+        let f = fixtures();
+        let bad = [alias_evt("light", PhonemeSet::Xsampa), alias_evt("zq", PhonemeSet::Xsampa)];
+        let err = resolve_score(&bad, &f).unwrap_err().to_string();
+        assert!(err.contains("VOCAL_ALIAS: xsampa zq"), "own CODE + convention + lyric: {err}");
+        let lenient = classify_score(&bad, &f).unwrap();
+        assert!(matches!(lenient[0], LyricClass::Phones { .. }), "the readable alias still resolves");
+        assert!(matches!(lenient[1], LyricClass::Unknown), "…and only the bad one is marked");
+    }
+
+    /// The precedence ladder, and the things an alias convention must NOT capture.
+    #[test]
+    fn alias_precedence_and_what_it_leaves_alone() {
+        let f = fixtures();
+        let one = |e: ScoreEvt| -> ResolvedNote { resolve_score(&[e], &f).unwrap().remove(0) };
+        // an explicit phoneme_input still wins (the more specific, later user action)
+        let mut e = alias_evt("ju", PhonemeSet::Xsampa);
+        e.phoneme_input = Some("K AE1 T");
+        assert_eq!(phones_of(&one(e)), vec!["k", "æ", "t"]);
+        // a bracket hint wins over the convention (it names the phones outright)
+        assert_eq!(phones_of(&one(alias_evt("[k ae t]", PhonemeSet::Vccv))), vec!["k", "æ", "t"]);
+        // reserved tokens are checked BEFORE any of this and are unaffected
+        assert!(matches!(one(alias_evt("R", PhonemeSet::Vccv)).kind, ResolvedKind::Rest));
+        assert!(matches!(one(alias_evt("AP", PhonemeSet::Xsampa)).kind, ResolvedKind::Breath));
+        // a NON-English note on an alias track keeps the dictionary path — the conventions are
+        // English reclists, and a mixed-language track must not have its ja/zh notes reinterpreted
+        let mut ja = alias_evt("か", PhonemeSet::Vccv);
+        ja.lang = Lang::Ja;
+        assert_eq!(phones_of(&one(ja)), vec!["k", "a"]);
+        // and `Words` is the pre-S91 behaviour, byte for byte
+        assert_eq!(
+            phones_of(&one(alias_evt("light", PhonemeSet::Words))),
+            phones_of(&one(evt("light", Lang::En)))
+        );
+    }
+
+    /// A sustain after an alias note re-emits that note's own carrier — the same rule a word note
+    /// gets, so an alias score can use `-`/`+` for held notes.
+    #[test]
+    fn alias_note_carries_its_sustain() {
+        let f = fixtures();
+        let score = [alias_evt("ju", PhonemeSet::Xsampa), alias_evt("-", PhonemeSet::Xsampa)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["j", "u"]);
+        assert_eq!(phones_of(&r[1]), vec!["u"], "the hold re-emits the alias's own nucleus");
+        assert!(r[1].is_sustain);
     }
 }

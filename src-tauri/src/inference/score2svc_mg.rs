@@ -28,6 +28,7 @@ use super::super::rvc;
 // S90: the probe now resolves through the SHIPPED dictionaries (GlobalDicts), not the
 // dictionary-free JA provider — an English/Chinese score needs stage1, and JA never
 // consults a dictionary either way, so the JA arms are unchanged.
+use super::super::g2p_alias;
 use super::super::score2cv::{is_nucleus_phone, ArticulationTiming};
 use super::super::sovits;
 use std::path::Path;
@@ -76,7 +77,15 @@ fn load_score() -> ScoreJson {
     serde_json::from_str(&s).unwrap()
 }
 
+/// S91: `UTAI_MG_SET=arpasing|xsampa|vccv` renders the probe score as a UTAU ALIAS score — the only
+/// way to hear a real CVVC/VCCV UST through the production pipeline before shipping it (S85 rule 4:
+/// the user must never be the first to execute a new path). Absent/unknown → `words`, i.e. unchanged.
+fn mg_phoneme_set() -> g2p_alias::PhonemeSet {
+    g2p_alias::PhonemeSet::from_wire(std::env::var("UTAI_MG_SET").ok().as_deref())
+}
+
 fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
+    let set = mg_phoneme_set();
     triples
         .iter()
         .map(|t| ScoreEvt {
@@ -85,6 +94,7 @@ fn to_evts(triples: &[TripleJson]) -> Vec<ScoreEvt<'_>> {
             frames: t.frames,
             lang: Lang::from_id(t.lang).unwrap_or(Lang::Ja),
             phoneme_input: t.phoneme_input.as_deref(),
+            phoneme_set: set,
         })
         .collect()
 }

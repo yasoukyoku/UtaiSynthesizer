@@ -4,6 +4,7 @@ pub mod engine;
 pub mod f0;
 pub mod features;
 pub mod g2p;
+pub mod g2p_alias;
 mod g2p_tables;
 #[cfg(test)]
 mod g2p_golden_ref;

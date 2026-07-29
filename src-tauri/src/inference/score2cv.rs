@@ -1325,6 +1325,7 @@ pub fn run_score2cv(
 mod tests {
     use super::*;
     use super::tbl::parity_ref as pr;
+    use crate::inference::g2p_alias::PhonemeSet;
 
     // The Phase 1c GATE: the Rust port must reproduce render_ust.build_arrays bit-for-bit on the fixed
     // score (reference dumped by scratchpad/dump_g2p.py + gen_rust_tables.py).
@@ -1541,7 +1542,14 @@ mod tests {
         EnOnly(g2p::WordDict::from_tsv(g2p::Lang::En, "mine\tM AY1 N\nfined\tF AY1 N D\n"))
     }
     fn en_evt(lyric: &'static str, note_num: i64, frames: i64) -> g2p::ScoreEvt<'static> {
-        g2p::ScoreEvt { lyric, note_num, frames, lang: g2p::Lang::En, phoneme_input: None }
+        g2p::ScoreEvt {
+            lyric,
+            note_num,
+            frames,
+            lang: g2p::Lang::En,
+            phoneme_input: None,
+            phoneme_set: PhonemeSet::Words,
+        }
     }
 
     #[test]
@@ -1632,6 +1640,7 @@ mod tests {
     fn in_note_timing_cluster_is_last_first_and_keeps_the_vowel_share() {
         let sta = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 10, lang: g2p::Lang::Ja, phoneme_input: Some("s t a"),
+            phoneme_set: PhonemeSet::Words,
         };
         let off = build_arrays_daw(&[sta.clone()], &NoDicts, ArticulationTiming::InNote).unwrap();
         assert_eq!(off.phon, vec!["s", "t", "a"]);
@@ -1661,6 +1670,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 20, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
+            phoneme_set: PhonemeSet::Words,
         };
         let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), refined];
         let off = build_arrays_daw(&score, &NoDicts, ArticulationTiming::InNote).unwrap();
@@ -1698,6 +1708,7 @@ mod tests {
             let w = g2p::ScoreEvt {
                 lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja,
                 phoneme_input: Some("ɹ ə f aɪ n d"),
+                phoneme_set: PhonemeSet::Words,
             };
             let arr = build_arrays_daw(&[w], &NoDicts, ArticulationTiming::InNote).unwrap();
             assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "conservation at fr={fr}");
@@ -1786,6 +1797,7 @@ mod tests {
         // drops and its borrowed frame RETURNS to the lender (ʔ got nothing and drops too).
         let tta = g2p::ScoreEvt {
             lyric: "x", note_num: 62, frames: 2, lang: g2p::Lang::Ja, phoneme_input: Some("ʔ t a"),
+            phoneme_set: PhonemeSet::Words,
         };
         let daw = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(daw.phon, vec!["a", "a"]);
@@ -1798,6 +1810,7 @@ mod tests {
     fn medial_vowels_get_two_frames_or_drop() {
         let evt = |fr| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Ja, phoneme_input: Some("p i u"),
+            phoneme_set: PhonemeSet::Words,
         };
         let a10 = build_arrays_daw(&[evt(10)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(a10.phon, vec!["p", "i", "u"]);
@@ -1814,6 +1827,7 @@ mod tests {
         let evt = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"), // refined's shape as a raw-IPA override
+            phoneme_set: PhonemeSet::Words,
         };
         let arr = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), evt], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "ɹ", "ə", "f", "aɪ", "n", "d"]);
@@ -1851,7 +1865,14 @@ mod tests {
         ZhOnly(g2p::ZhDict::from_tsv("wang\tw ang\nxiang\tx iang\n", "", ""))
     }
     fn zh_evt(lyric: &'static str, note_num: i64, frames: i64) -> g2p::ScoreEvt<'static> {
-        g2p::ScoreEvt { lyric, note_num, frames, lang: g2p::Lang::Zh, phoneme_input: None }
+        g2p::ScoreEvt {
+            lyric,
+            note_num,
+            frames,
+            lang: g2p::Lang::Zh,
+            phoneme_input: None,
+            phoneme_set: PhonemeSet::Words,
+        }
     }
 
     #[test]

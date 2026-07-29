@@ -1281,6 +1281,10 @@ pub async fn validate_lyrics(
     state: State<'_, Arc<AppState>>,
     notes: Vec<LyricNote>,
     default_lang: i64,
+    // S91: the editor's red marks and the render MUST judge a lyric under the same convention —
+    // that is the whole reason both go through `resolve_core`. Without this the marking pass would
+    // read `&m` as a word (OOV) while the render sings it, or vice versa.
+    phoneme_set: Option<String>,
 ) -> Result<Vec<score2cv::LyricClass>, String> {
     // ≥ 2×MAX_SCORE_NOTES: the validation payload mirrors the render triples (notes + gap rests can
     // reach twice the note count), so the cap must never reject a segment the render itself accepts
@@ -1294,6 +1298,7 @@ pub async fn validate_lyrics(
         g2p::set_dict_dir(data_dir.join("dictionaries"));
     }
     let fallback = g2p::Lang::from_id(default_lang).unwrap_or(g2p::Lang::Ja);
+    let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(phoneme_set.as_deref());
     // spawn_blocking: the FIRST validation of a language lazily parses its dictionary (the en TSV is
     // ~3.7MB / 135k lines) — that one-time load must never block the IPC/main thread.
     tauri::async_runtime::spawn_blocking(move || {
@@ -1311,6 +1316,7 @@ pub async fn validate_lyrics(
                     .phoneme_input
                     .as_deref()
                     .filter(|p| p.chars().count() <= MAX_LEN),
+                phoneme_set,
             })
             .collect();
         // Err = infrastructure (VOCAL_DICT_MISSING) — the watcher must NOT paint OOV marks for it.
@@ -1350,6 +1356,9 @@ pub async fn preview_vocal_phonemes(
     // caller that simply doesn't know — on the production default instead of silently previewing the
     // OTHER arm; a missing field on a bool would have deserialized to `false` = the wrong picture.
     consonant_preroll: Option<bool>,
+    // S91: same rationale — the lane's contract is "exactly what a render would sing", so it must
+    // read the track's alias convention or it would show the dictionary's phones for an alias score.
+    phoneme_set: Option<String>,
 ) -> Result<Vec<PhonemeSpan>, String> {
     // Same 1× cap as render_vocal_segment: the payload here is byte-for-byte the SAME triples array the
     // render caps at MAX_SCORE_NOTES — an over-cap score can never render, so previewing it has no value
@@ -1377,6 +1386,7 @@ pub async fn preview_vocal_phonemes(
         ..Default::default()
     }
     .articulation_timing(); // ONE bool→enum conversion, shared with the render
+    let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(phoneme_set.as_deref());
     tauri::async_runtime::spawn_blocking(move || {
         let mut evts: Vec<g2p::ScoreEvt> = Vec::with_capacity(score.len());
         for n in &score {
@@ -1386,6 +1396,7 @@ pub async fn preview_vocal_phonemes(
                 frames: n.frames,
                 lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
                 phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LEN),
+                phoneme_set,
             });
         }
         let arr =
@@ -1485,6 +1496,11 @@ pub struct VocalRenderOptions {
     /// alias scores, whose author already moved the consonants ahead by hand, pre-rolling would apply
     /// that head start twice. Absent (old frontends) → true (the production default).
     pub consonant_preroll: bool,
+    /// S91 「音素约定」: which UTAU alias convention this track's ENGLISH lyrics are written in —
+    /// `"arpasing"` | `"xsampa"` | `"vccv"`. Absent/unknown → words through the dictionary (the
+    /// default, byte-for-byte the pre-S91 behaviour). A `String` rather than the enum on purpose: an
+    /// unknown value from a newer frontend must land on the default, not fail the whole render.
+    pub phoneme_set: Option<String>,
     /// Reused SoVITS quality contract (backend=="sovits"): noise_scale/seed/cluster_ratio/spk_mix/speaker_id
     /// + the shallow/only-diffusion group + NSF enhancer + vocoder + gpu_extract. auto_f0/f0_shift/
     /// loudness_envelope/only_diffusion are force-neutralized by the command (they'd break Option-A / need
@@ -1507,6 +1523,7 @@ impl Default for VocalRenderOptions {
             consonant_valley: crate::inference::score2svc::DEFAULT_CONSONANT_VALLEY_SCALE,
             vowel_clarity: true,
             consonant_preroll: true,
+            phoneme_set: None,
             sovits: Default::default(),
             rvc: Default::default(),
         }
@@ -1849,6 +1866,9 @@ pub async fn render_vocal_segment(
         vowel_clarity: options.vowel_clarity, // S84 E 刀 toggle (bool — nothing to sanitize)
         consonant_preroll: options.consonant_preroll, // S89 toggle (bool — nothing to sanitize)
     };
+    // S91: ONE place converts the wire string to the enum, and the track's single setting is fanned
+    // out over every note below (a score never mixes conventions — see `ScoreEvt::phoneme_set`).
+    let phoneme_set = crate::inference::g2p_alias::PhonemeSet::from_wire(options.phoneme_set.as_deref());
     let progress = progress_emitter(app_handle, app.clone(), run_epoch, node_id);
 
     match backend_type {
@@ -1920,6 +1940,7 @@ pub async fn render_vocal_segment(
                         frames: n.frames,
                         lang,
                         phoneme_input: n.phoneme_input.as_deref(),
+                        phoneme_set,
                     })
                     .collect();
                 let f0 = if f0_cents.is_empty() {
@@ -2014,6 +2035,7 @@ pub async fn render_vocal_segment(
                         frames: n.frames,
                         lang,
                         phoneme_input: n.phoneme_input.as_deref(),
+                        phoneme_set,
                     })
                     .collect();
                 let f0 = if f0_cents.is_empty() {

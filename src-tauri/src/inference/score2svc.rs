@@ -1332,6 +1332,7 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::g2p_alias::PhonemeSet;
     use super::super::score2cv::{build_arrays, ArticulationTiming, NoDicts}; // Phase-1c parity entry (rest-capped)
     use super::super::score2cv_tables::parity_ref as pr;
 
@@ -1432,6 +1433,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
+            phoneme_set: PhonemeSet::Words,
         };
         let arr2 = build_arrays_daw(&[refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let flags2 = voiceless_onset_flags(&arr2);
@@ -1472,6 +1474,7 @@ mod tests {
         let refined = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 50, lang: g2p::Lang::Ja,
             phoneme_input: Some("ɹ ə f aɪ n d"),
+            phoneme_set: PhonemeSet::Words,
         };
         let arr2 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), refined], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d2 = boundary_valley_depths(&arr2);
@@ -1493,6 +1496,7 @@ mod tests {
         let sta = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
+            phoneme_set: PhonemeSet::Words,
         };
         let arr4 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("R", 0, 10)), sta], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d4 = boundary_valley_depths(&arr4);
@@ -1504,6 +1508,7 @@ mod tests {
         let sta2 = g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: 30, lang: g2p::Lang::Ja,
             phoneme_input: Some("s t a"),
+            phoneme_set: PhonemeSet::Words,
         };
         let arr5 = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 10)), sta2], &NoDicts, ArticulationTiming::Auto).unwrap();
         let d5 = boundary_valley_depths(&arr5);
@@ -1534,6 +1539,7 @@ mod tests {
             let ma = g2p::ScoreEvt {
                 lyric: "x", note_num: 69, frames: 20, lang: g2p::Lang::Ja,
                 phoneme_input: Some("m a"),
+                phoneme_set: PhonemeSet::Words,
             };
             let score = [g2p::ScoreEvt::ja(&("R", 0, 10)), ma];
             // the DAW's layered pitch: 10 silent frames, then 20 frames of A4 (6900 cents)
