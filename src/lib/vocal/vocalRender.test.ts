@@ -10,7 +10,7 @@ vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 // isVocalDirty resolves the singer via the voice-model store — mock ONE installed "V" so `entry` is found.
 vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () => ({ models: { sovits: [{ name: "V", path: "p" }] } }) } }));
 
-import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, splitSegmentVocalAware } from "./vocalRender";
+import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
 import { useProjectStore } from "../../store/project";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
 import type { Note, Track, Segment, ProcessedOutput, VocalTrackParams } from "../../types/project";
@@ -588,5 +588,33 @@ describe("buildScoreTriples — S87 frame borrowing", () => {
       ["あ", 60, 25], ["あ", 62, 25], ["R", 0, 13], ["あ", 64, 25],
     ]);
     expect(sumFrames(r.triples)).toBe(r.frameCount);
+  });
+});
+
+// S90 — the ALGORITHM-VERSION terms of the bake signature, pinned as a LITERAL. A sig test that compares
+// two sigs to each other passes even when both sides lose the same term (S88 lesson: "sig 自比不是测试"),
+// and these two tokens are the whole mechanism by which a lyric→phone or note→frame fix reaches an
+// already-baked segment. If a round changes what a lyric sings and this literal did not move, the user
+// hears the OLD audio forever and reads it as "the fix did nothing" (S81/S86 R3).
+describe("vocalTrackSig — the version terms are present and literal", () => {
+  const vp: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: DEFAULT_TRANSITION, breathToken: "AP" };
+  const track: Track = { id: "t", name: "V", trackType: "vocal", segments: [], volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {}, voiceModel: "V", vocalParams: vp };
+
+  // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
+  // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
+  it("carries the g2p + timing tokens", () => {
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s90|st:s88");
+    expect(G2P_ALGO_VERSION).toBe("s90"); // S90: phonetic hints + stressless nucleus + bare ah → ə
+    expect(SCORE_TIMING_VERSION).toBe("s88"); // untouched — S90 changes phones, never frame allocation
+  });
+
+  // SHAPE: the whole string, pinned. When this one goes red the question to answer is "did I mean to
+  // invalidate every existing bake?" — every term here is part of the dirty-check for stored renders.
+  // ⚠ It cannot notice a round that CHANGES lyric→phone behaviour and forgets to bump (both sides would
+  // move together); that failure mode has no cheap test, only the review checklist.
+  it("has exactly this shape — a change here invalidates every stored bake", () => {
+    expect(vocalTrackSig(track, 120)).toBe(
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s90|st:s88",
+    );
   });
 });

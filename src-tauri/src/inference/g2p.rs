@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::g2p_tables as gt;
-use super::score2cv::{classify_lyric as classify_lyric_ja, LyricClass};
+use super::score2cv::{classify_lyric as classify_lyric_ja, is_nucleus_phone, LyricClass};
 use super::score2cv_tables as tbl;
 use crate::{Result, UtaiError};
 
@@ -163,6 +163,19 @@ fn convert_opencpop(p: &str) -> String {
 
 /// Port of `convert_arpabet`: sil/sp/spn → SP; `AH*` resolved BEFORE stress-strip (AH0=ə else ʌ —
 /// the A2 fix: stress encodes a phonemic split); else strip a trailing 0/1/2 and map.
+///
+/// S90 — **"no stress digit ≡ unstressed"**: a BARE `ah`/`AH` resolves to ə (it used to give ʌ).
+/// Stress digits are a CMUdict property; the ARPABET people TYPE has none — OpenUtau phonetic hints
+/// and ARPAsing voicebank reclists are written without them — so a bare `ah` is an unstressed vowel,
+/// not a stressed one. Three reasons this is the right default: the shipped en.tsv has AH0 63181 vs
+/// AH1+AH2 8022 (**7.9×**); the errors are asymmetric (ʌ read as ə is a mild centralization, ə read as
+/// ʌ moves the PERCEIVED stress of the word); and `[w ah dh]`-style hints in real UST files are exactly
+/// the reduced-vowel case. Write `ah1`/`AH1` (or `ah2`) to get ʌ.
+/// AH is today the only ARPABET symbol whose IPA splits on stress, so the general rule and this one
+/// branch coincide — but the rule is what the docs promise, so a future split must follow it too.
+/// ⚠ ZERO effect on the dictionary path: en.tsv contains 0 bare-AH tokens and the stage2 golden
+/// vectors 0 — walked exhaustively by `arpabet_stressless_nucleus_is_zero_regression` (golden, in this
+/// file) and by `dictionaries_end_to_end` (the whole shipped en.tsv).
 fn convert_arpabet(p: &str) -> String {
     let lower = p.to_ascii_lowercase();
     if matches!(lower.as_str(), "sil" | "sp" | "spn") {
@@ -170,7 +183,16 @@ fn convert_arpabet(p: &str) -> String {
     }
     let up = p.to_ascii_uppercase();
     if let Some(stress) = up.strip_prefix("AH") {
-        return if stress == "0" { "ə".to_string() } else { "ʌ".to_string() };
+        match stress {
+            "1" | "2" => return "ʌ".to_string(),
+            // (spelled out rather than left to fall through: the generated table's `("AH","ə")` row —
+            //  dead code until now — would agree, but a rule this load-bearing should not depend on a
+            //  row of a file we regenerate from another repo. Mutation-checked both ways.)
+            "" | "0" => return "ə".to_string(),
+            // not an AH symbol at all (a typo like `AHX`) — fall through to the generic path, which
+            // leaves it unmapped so `stage2` reports it LOUDLY instead of guessing a vowel.
+            _ => {}
+        }
     }
     let base = up.strip_suffix(['0', '1', '2']).unwrap_or(&up);
     if let Some(&ipa) = arpabet_map().get(base) {
@@ -257,12 +279,28 @@ pub struct WordDict {
 }
 
 impl WordDict {
-    /// A traditional-layer phone is a syllable NUCLEUS: en = ARPABET vowels carry a stress digit;
-    /// MFA languages use the generated per-dictionary vowel inventory.
+    /// A traditional-layer phone is a syllable NUCLEUS. Delegates to `dict_is_vowel` — ONE
+    /// implementation, so the dictionary BUILD pass (legal onsets) and the syllabifier can never
+    /// drift apart (they were two copies of the same rule until S90).
     pub fn is_vowel(&self, ph: &str) -> bool {
+        dict_is_vowel(self.lang, &self.vowels, ph)
+    }
+
+    /// Normalize an onset cluster for the `onsets` lookup. EN only, and ONLY here: the dictionary
+    /// ships uppercase ARPABET, so that is what `onsets` is keyed by, while phonetic hints are
+    /// conventionally lowercase (OpenUtau's symbol table is). Without this an un-normalized hint
+    /// misses every non-empty onset and each consonant cluster falls into the PREVIOUS syllable's
+    /// coda — `[k ae n d ah l ih t]` cuts as k-ae-n-d | ah-l | ih-t instead of can | dle | lit.
+    ///
+    /// ⚠ It folds the SYLLABIFIER'S LOOKUP KEY and nothing else. The first S90 draft normalized the
+    /// phones themselves, which also fed `stage2` — and there `to_ascii_uppercase` is not a no-op:
+    /// an ASCII IPA token like `ts` stops matching the vocab (`TS` interns to nothing = a brand-new
+    /// silent OOV), so an override written in IPA on an EN note broke. Case belongs to the onset
+    /// index, not to the user's phones. (Review S90 major #1.)
+    fn onset_key(&self, cluster: String) -> String {
         match self.lang {
-            Lang::En => ph.ends_with(['0', '1', '2']),
-            _ => self.vowels.contains(ph),
+            Lang::En => cluster.to_ascii_uppercase(),
+            _ => cluster,
         }
     }
 
@@ -324,8 +362,18 @@ fn lookup_candidates(raw: &str) -> Vec<String> {
     let fold_quotes = |s: &str| -> String {
         s.chars().map(|c| if matches!(c, '\u{2019}' | '\u{2018}' | '\u{02BC}' | '\u{FF07}') { '\'' } else { c }).collect()
     };
-    let trim_punct =
-        |s: &str| -> String { s.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-').to_string() };
+    // ⚠ SQUARE BRACKETS ARE NOT PUNCTUATION HERE (S90 review major #2). They delimit a phonetic hint,
+    // so a bracket-shaped lyric that `phoneme_hint` refused must NOT be rescued into a real word by
+    // trimming them away: `[dr` (a missing `]`) trimmed to `dr` sings **"drive"**, `[k].` sings "kay",
+    // `[[k]]` sings "kay" — a completely different word, no red mark, no error, straight past the
+    // "loud failure" promise this feature is documented with. Zero cost: all 8 shipped dictionaries
+    // contain 0 keys with a bracket in them, so nothing reachable is lost.
+    let trim_punct = |s: &str| -> String {
+        s.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '\'' && c != '-' && !matches!(c, '[' | ']' | '［' | '］')
+        })
+        .to_string()
+    };
 
     let base: String = raw.trim().chars().flat_map(char::to_lowercase).collect();
     let mut out: Vec<String> = Vec::with_capacity(8);
@@ -344,11 +392,44 @@ fn lookup_candidates(raw: &str) -> Vec<String> {
     out
 }
 
+/// THE nucleus test for a TRADITIONAL-layer phone (en = ARPABET, the MFA languages = their own
+/// generated vowel inventory). `WordDict::is_vowel` delegates here; `WordDict::from_tsv` calls it
+/// directly while the dictionary is still half-built.
 fn dict_is_vowel(lang: Lang, vowels: &HashSet<&'static str>, ph: &str) -> bool {
     match lang {
-        Lang::En => ph.ends_with(['0', '1', '2']),
+        Lang::En => en_is_nucleus(ph),
         _ => vowels.contains(ph),
     }
+}
+
+/// EN nucleus test — DERIVED, not a second hand-typed vowel list: strip the optional stress digit and
+/// ask whether that ARPABET symbol's IPA (the generated `ARPABET_IPA` table) is nucleus-capable by
+/// `score2cv::is_nucleus_phone`, the one classifier this repo already walks over all 210 vocab tokens.
+///
+/// ⚠ S90 replaced `ph.ends_with(['0','1','2'])` (= "carries a CMUdict stress digit") with this. Over the
+/// SHIPPED en.tsv the two verdicts agree on every one of the 69 distinct tokens (863018 instances), so
+/// the whole dictionary path — legal onsets, syllable cuts, coda deferral — is unchanged to the byte.
+/// What it ADDS is the spelling users actually type: OpenUtau phonetic hints and ARPAsing reclists carry
+/// NO stress digits, so `[dh ae dh]` had no nucleus at all and the entire word collapsed onto the first
+/// note of its span (S86 audit `syl-en-override-without-stress-collapses`).
+/// Case-insensitive because hints are conventionally lowercase while CMUdict is upper — but the
+/// UPPERCASE membership test is tried first without allocating, which is the only path the dictionary
+/// build (863018 tokens, all uppercase) ever takes.
+fn en_is_nucleus(ph: &str) -> bool {
+    let base = ph.strip_suffix(['0', '1', '2']).unwrap_or(ph);
+    let syms = arpabet_nucleus_syms();
+    syms.contains(base)
+        || (!base.bytes().all(|b| b.is_ascii_uppercase()) && syms.contains(base.to_ascii_uppercase().as_str()))
+}
+
+/// The ARPABET symbols whose IPA can carry a nucleus — DERIVED once from the generated table, never a
+/// second hand-typed vowel list (and `is_nucleus_phone` must be asked about the IPA, not the symbol:
+/// bare `Y`/`y` would look like a nucleus to it, since IPA /y/ is a vowel, while ARPABET Y is /j/).
+fn arpabet_nucleus_syms() -> &'static HashSet<&'static str> {
+    static M: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    M.get_or_init(|| {
+        gt::ARPABET_IPA.iter().filter(|&&(_, ipa)| is_nucleus_phone(ipa)).map(|&(sym, _)| sym).collect()
+    })
 }
 
 /// zh dictionary: pinyin syllable → opencpop phones (M4Singer convention), hanzi → readings
@@ -506,7 +587,7 @@ pub fn syllabify(dict: &WordDict, phones: &[String]) -> Vec<Vec<String>> {
         // (the empty suffix is always legal, so `cut` always resolves).
         let mut cut = cluster.len();
         for s in 0..=cluster.len() {
-            if dict.onsets.contains(&cluster[s..].join(" ")) {
+            if dict.onsets.contains(&dict.onset_key(cluster[s..].join(" "))) {
                 cut = s;
                 break;
             }
@@ -595,6 +676,49 @@ pub fn is_silent_token(lyric: &str) -> bool {
     matches!(token_class(lyric), Tok::Rest | Tok::Breath)
 }
 
+/// An OpenUtau **phonetic hint**: square brackets CLOSING the lyric pin that note's phones —
+/// `read[r iy d]` (the word stays readable, the phones come from the hint) or the bare `[dh ae dh]`
+/// that UST files written against an ARPAsing bank use throughout. Returns the inner text.
+///
+/// It is the SAME user layer as `phoneme_input` (§3.7), only spelled inside the lyric, so `resolve_core`
+/// folds it into that field once and every language branch downstream sees ONE override notion (en/de/
+/// fr/es/it = traditional phones, ja = raw vocab IPA, zh = a pinyin syllable — unchanged semantics).
+/// Three things it deliberately does NOT do:
+///  * it never rewrites the lyric — the score keeps exactly what the user typed (import.rs stores the
+///    raw UST line verbatim) and `token_class` keeps classifying that RAW text, so an all-hint lyric
+///    stays a WORD. Stripping it to an empty word part would classify as a REST and silence the note;
+///  * it never guesses at a malformed hint: `[k aa}` (a real typo in the wild, source file included)
+///    has no closing bracket, so the lyric goes to the dictionary and fails LOUDLY as OOV on that note;
+///  * an EMPTY hint (`[]`, `word[  ]`) is no hint at all — again the lyric goes to the dictionary as
+///    written, rather than resolving to zero phones (which the span builder would report as OOV anyway).
+///
+/// ⚠ DELIBERATELY STRICTER THAN UPSTREAM in exactly one place. OpenUtau's `UNote.cs` uses a GREEDY
+/// `\[(.*)\]` and cuts the match out of the lyric wherever it sits, so `a[x]b[y]c` yields the hint
+/// `x]b[y` — symbols that its own `IsValidSymbol` then silently drops. We require ONE bracket pair
+/// CLOSING the lyric; anything else is not a hint and the lyric goes to the dictionary, i.e. fails
+/// LOUDLY. Real material agrees this costs nothing: across the five reference scores on disk there are
+/// 34 bare `[hint]` lyrics, 1 typo, and zero multi-bracket or trailing-text forms.
+/// ⚠ FULL-WIDTH ［］ (U+FF3B/U+FF3D) count as brackets too — the same tolerance rung S86 added for
+/// typographic apostrophes, and for the same reason: a CJK IME emits them by default, and the
+/// ASCII-only rule failed SILENTLY. `［k］` fell through to the dictionary, where the punctuation-trim
+/// rung reduced it to `k` — a real en.tsv entry — and the note sang the LETTER NAME "kay". Tolerating
+/// the glyph turns a silent mis-pronunciation into the phoneme the user meant; the lyric is still
+/// stored exactly as typed.
+fn phoneme_hint(lyric: &str) -> Option<&str> {
+    const OPEN: [char; 2] = ['[', '［'];
+    const CLOSE: [char; 2] = [']', '］'];
+    let l = lyric.trim_end();
+    let inner = l.strip_suffix(CLOSE)?;
+    let open = inner.rfind(OPEN)?;
+    if inner[..open].contains(OPEN) {
+        return None; // more than one bracket pair — ambiguous, so it is not a hint (see above)
+    }
+    // step over the bracket by its own width — ［ is three bytes, and slicing mid-character panics
+    let after = open + inner[open..].chars().next().map_or(1, char::len_utf8);
+    let hint = inner[after..].trim();
+    (!hint.is_empty()).then_some(hint)
+}
+
 /// Per-note run language for chunking — shared by `build_arrays`' assembly AND `compute_note_groups`
 /// (score2svc) so grouping can never drift between the cv side and the DAW side. Sustains inherit the
 /// previous note's run; rests/breaths attach to the previous run; leading rests take the first run.
@@ -632,6 +756,16 @@ pub fn note_run_langs(score: &[ScoreEvt]) -> Vec<Lang> {
 /// Resolve a whole score to per-note phones (strict mode: LOUD `VOCAL_OOV` on the first unresolvable
 /// note; lenient mode: per-note `Unknown` for the editor's marking pass).
 fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Result<Vec<ResolvedNote>> {
+    // S90: fold an OpenUtau phonetic hint written in the LYRIC into `phoneme_input` exactly once, here,
+    // so every branch below sees a single override notion (and the editor's classify pass, which shares
+    // this function, can never disagree with the render about it). An explicit `phoneme_input` still
+    // wins — it is the more specific, later user action. The lyric is left untouched; only lookup moves.
+    let hinted: Vec<ScoreEvt> = score
+        .iter()
+        .map(|e| ScoreEvt { phoneme_input: e.phoneme_input.or_else(|| phoneme_hint(e.lyric)), ..e.clone() })
+        .collect();
+    let score = &hinted[..];
+
     let n = score.len();
     let run_langs = note_run_langs(score);
     let toks: Vec<Tok> = score.iter().map(|e| token_class(e.lyric)).collect();
@@ -1020,6 +1154,62 @@ mod tests {
         assert!(n > 3000, "golden vector count sanity ({n})");
     }
 
+    // ── S90 ZERO-REGRESSION GATE for the stressless-nucleus switch. The whole argument that changing
+    // `WordDict::is_vowel` cannot move a single dictionary syllable boundary is this equality: on the
+    // ARPABET the dictionaries actually ship, "carries a CMUdict stress digit" and "this symbol's IPA
+    // is nucleus-capable" are the SAME verdict. Hermetic (golden vectors are compiled in); the file-wide
+    // walk over all 863018 en.tsv tokens lives in `dictionaries_end_to_end`.
+    // It also pins the premise of the bare-`ah`→ə rule: the gate material never spells AH without a digit.
+    #[test]
+    fn arpabet_stressless_nucleus_is_zero_regression() {
+        let mut toks = 0usize;
+        for &(lang, word, src, _) in G2P_GOLDEN {
+            if lang != "en" {
+                continue;
+            }
+            for t in src.split_whitespace() {
+                assert_eq!(
+                    t.ends_with(['0', '1', '2']),
+                    en_is_nucleus(t),
+                    "nucleus verdict drifted on {t:?} (golden word {word:?})"
+                );
+                assert!(
+                    !t.eq_ignore_ascii_case("AH"),
+                    "golden carries a BARE AH ({word:?}) — the s90 'no digit ≡ unstressed' rule would move the gate"
+                );
+                toks += 1;
+            }
+        }
+        assert!(toks > 1500, "golden en token count sanity ({toks})");
+    }
+
+    // ── S90 the FEATURE half (this one goes red if the switch is reverted): stressless ARPABET — what
+    // OpenUtau phonetic hints and ARPAsing reclists are written in — must resolve a nucleus, and the
+    // bare-`ah` reading must be the unstressed one.
+    #[test]
+    fn stressless_arpabet_resolves_a_nucleus_and_bare_ah_is_schwa() {
+        for t in ["ae", "ih", "ah", "er", "ow", "AA", "Uw", "ay"] {
+            assert!(en_is_nucleus(t), "{t} must be nucleus-capable without a stress digit");
+        }
+        for t in ["dh", "hh", "ng", "T", "zh", "sp", "sil"] {
+            assert!(!en_is_nucleus(t), "{t} must NOT be nucleus-capable");
+        }
+        // "no stress digit ≡ unstressed" — the ONE symbol whose IPA splits on stress today
+        assert_eq!(convert_arpabet("ah"), "ə");
+        assert_eq!(convert_arpabet("AH"), "ə");
+        assert_eq!(convert_arpabet("AH0"), "ə");
+        assert_eq!(convert_arpabet("ah1"), "ʌ");
+        assert_eq!(convert_arpabet("AH2"), "ʌ");
+        // a typo near AH is left unmapped so stage2 rejects it LOUDLY instead of guessing a vowel
+        assert_eq!(convert_arpabet("AHX"), "AHX");
+        assert!(stage2(Lang::En, &["AHX".to_string()]).is_err());
+        // and the whole point: a stressless word now SPLITS instead of collapsing into one syllable
+        let d = en_fixture();
+        let phones: Vec<String> = "k ae n d ah l ih t".split(' ').map(str::to_string).collect();
+        let syl = syllabify(&d, &phones);
+        assert_eq!(syl.len(), 3, "candlelit must syllabify into 3, got {syl:?}");
+    }
+
     // ── fixture dictionaries (hermetic stage1/span/phrase tests — tiny, inline) ──
     fn en_fixture() -> WordDict {
         // two/fun make bare T/F legal onsets (as in the real dictionary), so beautiful syllabifies
@@ -1286,6 +1476,126 @@ mod tests {
         assert_eq!(phones_of(&r2[0]), vec!["l", "aɪ", "t"], "raw ARPABET override bypasses the dict");
     }
 
+    // ── S90 OpenUtau phonetic hints in the LYRIC (`[p h]` / `word[p h]`) ──
+    #[test]
+    fn phoneme_hint_parsing_forms() {
+        assert_eq!(phoneme_hint("[dh ae dh]"), Some("dh ae dh"), "the bare form real UST files use");
+        assert_eq!(phoneme_hint("read[r iy d]"), Some("r iy d"), "OpenUtau's word+hint form");
+        assert_eq!(phoneme_hint("  [ ae n ]  "), Some("ae n"), "surrounding + inner space tolerated");
+        assert_eq!(phoneme_hint("a[b][c d]"), None, "two bracket pairs are ambiguous → not a hint (upstream would emit garbage here)");
+        // …but a stray CLOSING bracket in the WORD part is not a second pair: there is exactly one `[`,
+        // so every reading (ours, upstream's greedy, upstream's lazy) yields the same hint. The word
+        // part is free text by design — `xyzzy[k ae]` sings `k æ` too. (Review: guard, then un-guard.)
+        assert_eq!(phoneme_hint("a]b[c d]"), Some("c d"));
+        assert_eq!(phoneme_hint("[DH AE DH]"), Some("DH AE DH"), "case is tolerated (convert_arpabet folds it)");
+        // full-width brackets: a CJK IME emits these, and without the rung `［k］` silently sang the
+        // LETTER NAME (dictionary `k` = K EY1) instead of the phone. Mixed pairs count too.
+        assert_eq!(phoneme_hint("［k ae］"), Some("k ae"));
+        assert_eq!(phoneme_hint("［k ae]"), Some("k ae"));
+        assert_eq!(phoneme_hint("word［p h］"), Some("p h"));
+        assert_eq!(phoneme_hint("［］"), None, "an empty full-width hint is still no hint");
+        // multi-byte content must not be sliced mid-character (Rust slices are BYTE ranges)
+        assert_eq!(phoneme_hint("こ［k a］"), Some("k a"));
+        assert_eq!(phoneme_hint("あ[k a]"), Some("k a"));
+        assert_eq!(phoneme_hint("[k aa}"), None, "no closing bracket = not a hint (a real typo in the wild)");
+        assert_eq!(phoneme_hint("[]"), None, "empty hint = no hint");
+        assert_eq!(phoneme_hint("word[  ]"), None, "whitespace-only hint = no hint");
+        assert_eq!(phoneme_hint("[ae n] tail"), None, "the hint must CLOSE the lyric");
+        assert_eq!(phoneme_hint("light"), None);
+        assert_eq!(phoneme_hint("R"), None);
+    }
+
+    #[test]
+    fn phoneme_hint_pins_the_phones_and_survives_the_span() {
+        let f = fixtures();
+        // 1. bare, STRESSLESS hint (what an ARPAsing-bank UST writes) — needs the S90 nucleus rule too
+        let r = resolve_score(&[evt("[l ay t]", Lang::En)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["l", "aɪ", "t"]);
+        // 2. the hint WINS over a lyric that is itself a perfectly good dictionary word
+        let r = resolve_score(&[evt("light[t r iy]", Lang::En)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["t", "ɹ", "i"], "the hint, not the word, decides the phones");
+        // 3. an explicit phoneme_input still outranks the hint (later, more specific user action)
+        let mut e = evt("light[t r iy]", Lang::En);
+        e.phoneme_input = Some("F AH1 N");
+        let r = resolve_score(&[e], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["f", "ʌ", "n"]);
+        // 4. ★ an all-hint lyric must stay a WORD: its "word part" is empty, and an empty lyric is the
+        //    REST token — stripping the hint out of the lyric would silence the note (and desync the
+        //    DAW-side grouping, which classifies the RAW lyric through `is_silent_token`).
+        assert!(!is_silent_token("[ae n]"));
+        assert_eq!(token_class("[ae n]") == Tok::Word, true);
+        // 5. a multi-syllable hint spreads over its `+` notes exactly like a dictionary word does —
+        //    three nuclei that only the S90 stressless rule can see. ⚠ the CUT points come from the
+        //    fixture's onset set: on the SHIPPED dictionary the same word cuts k æ | n d ə | l ɪ t,
+        //    because `N D` is a legal onset there (imported from foreign proper names — the S86 audit's
+        //    `en-onset-pollution`, still open). The syllable COUNT is the invariant this test owns.
+        let span = [evt("[k ae n d ah l ih t]", Lang::En), evt("+", Lang::En), evt("+", Lang::En)];
+        let r = resolve_score(&span, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["k", "æ", "n"]);
+        assert_eq!(phones_of(&r[1]), vec!["d", "ə"], "bare `ah` reads as the unstressed vowel");
+        assert_eq!(phones_of(&r[2]), vec!["l", "ɪ", "t"]);
+        // 6. malformed hint → the lyric goes to the dictionary and fails LOUDLY (never a silent guess)
+        assert!(resolve_score(&[evt("[k aa}", Lang::En)], &f).is_err());
+        assert!(matches!(classify_score(&[evt("[k aa}", Lang::En)], &f).unwrap()[0], LyricClass::Unknown));
+        // 6b. an EN override written in RAW IPA is off-contract (§3.7 = traditional phones) but used to
+        //     resolve by passthrough — the S90 case normalization must not turn it into a silent OOV
+        //     (`aɪ`.to_ascii_uppercase() would be `Aɪ`, which interns to nothing).
+        let mut e = evt("xxxx", Lang::En);
+        e.phoneme_input = Some("ɹ ə f aɪ n d");
+        assert_eq!(phones_of(&resolve_score(&[e], &f).unwrap()[0]), vec!["ɹ", "ə", "f", "aɪ", "n", "d"]);
+        // 7. other languages get the same one notion: ja hints are raw vocab IPA (§3.7), zh a syllable
+        let r = resolve_score(&[evt("[k a]", Lang::Ja)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["k", "a"]);
+        let r = resolve_score(&[evt("长[chang]", Lang::Zh)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["ʈʂʰ", "ɑŋ"]);
+    }
+
+    // ── S90 review major #2: NOTHING bracket-shaped may be quietly rewritten into a different word ──
+    // The lookup ladder trims punctuation off a lyric before consulting the dictionary, and the shipped
+    // en.tsv has an entry for every single letter (`k` = "kay") and for plenty of two-letter forms
+    // (`dr` = "drive", `mr` = "mister"). Once brackets MEAN something, that rescue turns a typo into a
+    // silent mis-pronunciation: `[dr` (missing `]`) sang "drive", `[k].` sang "kay", `[[k]]` sang "kay"
+    // — no red mark, no error, straight past the "either your phones or a red note" promise the feature
+    // is documented with. The parser-level test above cannot see this; only a resolve-level one can.
+    #[test]
+    fn a_bracket_lyric_never_silently_sings_a_different_word() {
+        let f = Fixtures {
+            zh: zh_fixture(),
+            de: de_fixture(),
+            // mirrors the real dictionary's letter-name and abbreviation entries
+            en: WordDict::from_tsv(Lang::En, "k\tK EY1\ndr\tD R AY1 V\nchorus\tK AO1 R AH0 S\n"),
+        };
+        for lyric in [
+            "[dr",     // the closing bracket never got typed
+            "[k",      //
+            "[k].",    // well-formed but with trailing punctuation
+            "[[k]]",   // doubled
+            "\"[k]\"", // quoted
+            "[k]!",    //
+            "[]",      // empty
+            "[chorus]xyz",
+        ] {
+            let r = classify_score(&[evt(lyric, Lang::En)], &f).unwrap();
+            assert!(
+                matches!(r[0], LyricClass::Unknown),
+                "{lyric:?} must be a LOUD OOV, not a quietly substituted word (got {:?})",
+                r[0]
+            );
+            assert!(resolve_score(&[evt(lyric, Lang::En)], &f).is_err(), "{lyric:?} must fail the render");
+        }
+        // …while the well-formed forms still resolve, and a plain word is still trimmed as before
+        assert_eq!(phones_of(&resolve_score(&[evt("[k]", Lang::En)], &f).unwrap()[0]), vec!["k"]);
+        assert_eq!(
+            phones_of(&resolve_score(&[evt("chorus,", Lang::En)], &f).unwrap()[0]),
+            vec!["k", "ɔ", "ɹ", "ə", "s"],
+            "ordinary punctuation trimming is untouched"
+        );
+        // A bracket that holds a WORD instead of phones is a loud OOV too — `[Chorus]`/`[Verse 1]`
+        // section markers pasted from a lyric sheet are not lyrics, and singing them (which the
+        // pre-S90 trim rung did) is worse than showing the user a red note. Documented in §5.4.
+        assert!(resolve_score(&[evt("[chorus]", Lang::En)], &f).is_err());
+    }
+
     // ── run languages: sustains inherit the carrier, rests attach to the previous run ──
     #[test]
     fn run_langs_inherit_and_attach() {
@@ -1378,6 +1688,33 @@ mod tests {
         // the primary (first) — equality holds for the vast majority, membership for all.
         assert!(primary * 10 >= total * 8, "primary-pron match rate too low: {primary}/{total}");
         eprintln!("[g2p-e2e] zh syllables all exact; word lookups {total}, primary matches {primary}");
+
+        // ── S90: the SHIPPED-dictionary half of the stressless-nucleus zero-regression argument. The
+        // golden vectors sample words; this walks every token of every line of en.tsv, which is what
+        // `WordDict::from_tsv` actually feeds the legal-onset pass. If the two verdicts ever diverge
+        // on a real token, the blast radius is not "stressless input" — it is every English syllable
+        // boundary in the app.
+        let en_tsv = std::fs::read_to_string(root.join("../data/dictionaries/en.tsv")).expect("en.tsv");
+        let (mut toks, mut bare_ah) = (0usize, 0usize);
+        let mut distinct: HashSet<&str> = HashSet::new();
+        for line in en_tsv.lines() {
+            let Some((_w, phones)) = line.split_once('\t') else { continue };
+            for t in phones.split_whitespace() {
+                assert_eq!(
+                    t.ends_with(['0', '1', '2']),
+                    en_is_nucleus(t),
+                    "en.tsv token {t:?}: the stress-digit and nucleus verdicts disagree"
+                );
+                if t.eq_ignore_ascii_case("AH") {
+                    bare_ah += 1;
+                }
+                distinct.insert(t);
+                toks += 1;
+            }
+        }
+        assert_eq!(bare_ah, 0, "en.tsv now spells a BARE AH — the s90 'no digit ≡ unstressed' rule would move those words");
+        assert!(toks > 500_000 && distinct.len() > 50, "en.tsv walk looks truncated ({toks} tokens)");
+        eprintln!("[g2p-e2e] en.tsv nucleus equivalence: {toks} tokens / {} distinct, 0 disagreements", distinct.len());
     }
 
     // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL
@@ -1414,6 +1751,11 @@ mod tests {
                 match g.words(lang) {
                     Ok(d) => {
                         let head = lyrics[0].trim();
+                        // S90: show the HINT when the lyric carries one — otherwise this line reports a
+                        // dictionary miss for a note that resolves perfectly well, which reads as a bug.
+                        if let Some(h) = phoneme_hint(head) {
+                            println!("    hint: [{h}]");
+                        }
                         match d.lookup(head) {
                             Some(trad) => {
                                 let sy = syllabify(d, &trad);

@@ -561,8 +561,16 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  multi-mora parsing (ずっと/っと/あー sing in full instead of being truncated to the head mora);
  *  `rest` freed from the reserved rest tokens; tolerant dictionary lookup (ß→ss, typographic
  *  apostrophes, glued punctuation).
- *  ★ Must move in lockstep with `G2P_ALGO_VERSION` in src-tauri/src/commands/audition.rs. */
-export const G2P_ALGO_VERSION = "s86";
+ *  s90 = OpenUtau phonetic hints (`[dh ae dh]` / `read[r iy d]` in the lyric pin that note's phones);
+ *  stressless ARPABET finally carries a syllable nucleus, so a hint spreads over its `+` notes instead
+ *  of collapsing onto the first one; a bare `ah` (no stress digit) reads as ə, not ʌ.
+ *  ⚠ On the SHIPPED dictionaries the phone output is unchanged to the byte — all 69 ARPABET tokens /
+ *  863018 instances of en.tsv judge identically under the old and new nucleus rule, and neither en.tsv
+ *  nor the golden vectors contain a digit-less AH. What moves is user-typed input, which is the point.
+ *  ★ There is NO Rust twin to keep in lockstep any more: the audition cache tag dropped its g2p term in
+ *  S90 (that pipeline renders a fixed clip with no lyrics — see commands/audition.rs). THIS is the one
+ *  place the lyric→phone layer is versioned. */
+export const G2P_ALGO_VERSION = "s90";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
