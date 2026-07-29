@@ -303,16 +303,27 @@ fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
 /// execute on these paths, so they must NOT bump this tag; the one score-rendered audition
 /// (render_candidate_scale) is deliberately uncached. Bump only for changes that alter the
 /// cover audition pipeline's actual output.
-/// Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Auditions render through
-/// `render_score_{rvc,sovits}`, so a change in what phones a lyric resolves to changes this audio —
-/// without a tag term the cache keeps serving the OLD phones forever (S86 review R3).
-/// ★ Must move in lockstep with `G2P_ALGO_VERSION` in src/lib/vocal/vocalRender.ts.
-const G2P_ALGO_VERSION: &str = "s86";
-
+/// ⚠ NO G2P TERM HERE, on purpose (S90 — it was added in S86 and is removed again). S86 reasoned that
+/// "auditions render through render_score_{rvc,sovits}", but that is false for the CACHED paths: the
+/// only score-rendered audition is `render_candidate_scale`, which is deliberately uncached and never
+/// calls this function. The two callers below (`render_audition_voice`, `render_model_audition`) push a
+/// FIXED wav through rvc/sovits::run_pipeline — no lyrics, no g2p, no phones. Keeping the term meant
+/// every future lyric→phone change re-rendered every cached 10 s audition for a byte-identical result
+/// and orphaned the old files — "a re-render where nothing changed", which is the one thing the user
+/// calls a bug outright. It is exactly the same mis-scoping the ★★ paragraph above was written for.
+/// The lyric→phone layer's real invalidation lives in ONE place: `G2P_ALGO_VERSION` in
+/// src/lib/vocal/vocalRender.ts, a term of `vocalTrackSig` (which does depend on phones).
+/// ⚠ A range-LESS model still has no version term at all, and that is left as it was (S90 review, and
+/// the adversarial pass on it): the obvious "fix" — emitting the `_s85e` literal here too — would be
+/// the very thing this round removed, because with no record the range machinery does not execute
+/// (rvc.rs/sovits.rs return empty plans), so a range-decision bump would re-render audio it cannot
+/// change. A genuine COVER-pipeline change has no carrier on this arm; that gap predates S86 (the g2p
+/// literal that sat here was insensitive to it too) and wants a term that names the cover pipeline
+/// itself, which is its own decision — recorded, not smuggled in here.
 fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange>) -> String {
     match range {
-        // NB: still emitted with no range record — the G2P term is unconditional by design.
-        None => format!("_{G2P_ALGO_VERSION}"),
+        // no record → no tag at all, byte-identical to the pre-S60c names (existing caches stay valid)
+        None => String::new(),
         Some(r) => {
             // The bounds alone stopped identifying the decision once S81 made the raw
             // per-semitone scan a render input (the damage curve): a re-test that moves the
@@ -336,7 +347,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // s85d: cover/audition switched to dead-only (whole-clip shift retired; the
             // pipelines own the policy) — a decision change, so the tag moves in lockstep.
             format!(
-                "_{G2P_ALGO_VERSION}_s85e_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s85e_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }
