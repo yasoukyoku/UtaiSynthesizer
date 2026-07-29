@@ -308,6 +308,40 @@ export function isSilentLyric(lyric: string, tokens: VocalTokens): boolean {
   return isRestLyric(lyric, tokens.rest) || isBreathLyric(lyric, tokens.breath);
 }
 
+const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
+
+/** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
+ *  else an all-kana run splits per mora (a base kana + trailing small kana); an all-Han run splits per
+ *  character (S58 — one hanzi per note; the Rust zh G2P reads phrase context from the NOTE SEQUENCE, so
+ *  polyphones still resolve after the split); otherwise one token (latin needs explicit spaces).
+ *  Minimal + PURE (a splitter, NOT a dictionary — the Rust classifier owns phoneme validation), and it
+ *  lives here rather than in the editor so it is unit-testable next to the other lyric predicates.
+ *
+ *  S90: an OpenUtau phonetic hint (`[dh ae dh]`, `read[r iy d]`) is ONE note's content even though it
+ *  contains spaces. Without the bracket-aware pass, typing one would scatter `[dh` / `ae` / `dh]` over
+ *  three notes and paint all three red — while the SAME text arriving through UST import stayed whole.
+ *  The bracket alternative only fires on a group that CLOSES its token (`(?!\S)`), matching Rust's
+ *  `phoneme_hint`, so `pre[a b]post` splits like ordinary text instead of half-becoming a hint.
+ *  Without a bracket the regex is the old `split(/\s+/).filter(Boolean)` — except for an all-whitespace
+ *  string, where `match` returns null and the fallback yields `[emptyFallback]` instead of `[]`;
+ *  commitLyric turns both into the default lyric, so the note ends up identical either way. */
+export function splitLyricTokens(s: string, emptyFallback: string): string[] {
+  if (!s) return [emptyFallback];
+  //  (full-width ［］ too — a CJK IME emits those, and Rust's `phoneme_hint` accepts them for the same reason)
+  //  (the prefix class EXCLUDES brackets so the two halves can never overlap — that keeps the match
+  //   linear; the obvious `\S*[[［]` form backtracks quadratically on a paste full of `[`)
+  if (/\s/.test(s)) return s.match(/[^\s[［]*[[［][^\]］]*[\]］](?!\S)|\S+/g) ?? [emptyFallback];
+  if (/^[\p{Script=Han}]+$/u.test(s)) return [...s];
+  const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);
+  if (!isKana) return [s];
+  const out: string[] = [];
+  for (const ch of s) {
+    if (out.length > 0 && SMALL_KANA.has(ch)) out[out.length - 1] += ch;
+    else out.push(ch);
+  }
+  return out;
+}
+
 /**
  * Sanitize loaded track vocal params (§9.8.1): a corrupt `.usp` can carry a bad backend / out-of-range
  * speaker or lang id / non-finite transpose that later mis-indexes a ScoreToCV input. Absent → undefined.

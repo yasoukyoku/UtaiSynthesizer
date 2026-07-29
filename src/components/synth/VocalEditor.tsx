@@ -14,7 +14,7 @@ import { PIXELS_PER_TICK, TICKS_PER_BEAT } from "../../lib/constants";
 import { msToTicks } from "../../lib/audio/laneOps";
 import { TimeAxis, formatBarBeat } from "../../lib/timeAxis";
 import * as playback from "../../lib/audio/playback";
-import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, vocalTokens, type VocalTokens } from "../../lib/vocalNotes";
+import { resolveOverlaps, DEFAULT_TRANSITION, isSilentLyric, splitLyricTokens, vocalTokens, type VocalTokens } from "../../lib/vocalNotes";
 import { DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { renderVocalPart, vocalRenderErrorMessage, isVocalCancelError, preflightVocalModels, renderFrameTicks } from "../../lib/vocal/vocalRender";
@@ -1790,22 +1790,5 @@ function noteSig(n: Note): string {
   );
 }
 
-const SMALL_KANA = new Set([..."ぁぃぅぇぉゃゅょゎっゕゖァィゥェォャュョヮッ"]);
-/** Split a typed lyric phrase into per-note tokens (§9.2 auto-distribute). Whitespace-separated first;
- *  else an all-kana run splits per mora (a base kana + trailing small kana); an all-Han run splits per
- *  character (S58 — one hanzi per note; the Rust zh G2P reads phrase context from the NOTE SEQUENCE, so
- *  polyphones still resolve after the split); otherwise one token (latin needs explicit spaces).
- *  Minimal + JS-side (a splitter, NOT a dictionary — the Rust classifier owns phoneme validation). */
-function splitLyricTokens(s: string, emptyFallback: string): string[] {
-  if (!s) return [emptyFallback];
-  if (/\s/.test(s)) return s.split(/\s+/).filter(Boolean);
-  if (/^[\p{Script=Han}]+$/u.test(s)) return [...s];
-  const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);
-  if (!isKana) return [s];
-  const out: string[] = [];
-  for (const ch of s) {
-    if (out.length > 0 && SMALL_KANA.has(ch)) out[out.length - 1] += ch;
-    else out.push(ch);
-  }
-  return out;
-}
+// (splitLyricTokens moved to lib/vocalNotes.ts in S90 — it is a pure lyric-domain predicate and now has
+//  to know about phonetic hints, so it belongs next to the other lyric rules where it is unit-tested.)

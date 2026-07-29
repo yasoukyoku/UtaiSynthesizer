@@ -6,6 +6,7 @@ import {
   isBreathLyric,
   isRestLyric,
   isSilentLyric,
+  splitLyricTokens,
   vocalTokens,
   sanitizeVocalParams,
   DEFAULT_BREATH_TOKEN,
@@ -101,5 +102,40 @@ describe("sanitizeVocalParams — the two triggers from an untrusted .usp", () =
     // built from a code point on purpose — an invisible literal in source is unreviewable and unstable.
     const zeroWidth = "休" + String.fromCharCode(0x200b);
     expect(sanitizeVocalParams({ ...base, restToken: zeroWidth })!.restToken).toBe("休");
+  });
+});
+
+// S90 — the lyric splitter (§9.2 auto-distribute). It moved here from VocalEditor so it can be tested,
+// and it had to learn about OpenUtau phonetic hints: a hint contains spaces but is ONE note's content.
+describe("splitLyricTokens — whole-phrase distribution", () => {
+  it("keeps the pre-S90 behaviour byte-for-byte when no bracket is involved", () => {
+    expect(splitLyricTokens("and you don't", "あ")).toEqual(["and", "you", "don't"]);
+    expect(splitLyricTokens("  a   b  ", "あ")).toEqual(["a", "b"]); // collapses runs, drops the edges
+    expect(splitLyricTokens("長大", "あ")).toEqual(["長", "大"]); // one hanzi per note (S58)
+    expect(splitLyricTokens("きゃっと", "あ")).toEqual(["きゃっ", "と"]); // per mora; EVERY small kana (っ too) attaches
+    expect(splitLyricTokens("beautiful", "あ")).toEqual(["beautiful"]); // latin needs explicit spaces
+    expect(splitLyricTokens("", "あ")).toEqual(["あ"]);
+  });
+
+  it("★ a phonetic hint stays ONE token — it contains spaces but belongs to a single note", () => {
+    // Without this, typing what a UST file imports (`[dh ae dh]`) scattered `[dh` / `ae` / `dh]` across
+    // three notes and painted all three OOV-red, while the identical text arriving through import
+    // stayed whole. Two paths, two behaviours, no error message: exactly the asymmetry S88 warned about.
+    expect(splitLyricTokens("[dh ae dh]", "あ")).toEqual(["[dh ae dh]"]);
+    expect(splitLyricTokens("[ae n] you know [w ah dh]", "あ")).toEqual(["[ae n]", "you", "know", "[w ah dh]"]);
+    expect(splitLyricTokens("read[r iy d] this", "あ")).toEqual(["read[r iy d]", "this"]);
+    expect(splitLyricTokens("[k ae n d ah l ih t]", "あ")).toEqual(["[k ae n d ah l ih t]"]);
+    expect(splitLyricTokens("［k ae］ you", "あ")).toEqual(["［k ae］", "you"]); // CJK IME brackets
+  });
+
+  it("an UNCLOSED bracket is not a hint here either — it splits like ordinary text (Rust then says OOV)", () => {
+    expect(splitLyricTokens("[k aa}", "あ")).toEqual(["[k", "aa}"]);
+    // the group must CLOSE its token, exactly like Rust's phoneme_hint — otherwise this splitter would
+    // manufacture a hint out of text the renderer refuses (review S90)
+    expect(splitLyricTokens("pre[a b]post", "あ")).toEqual(["pre[a", "b]post"]);
+  });
+
+  it("all-whitespace: `match` yields null, so the fallback token appears (commitLyric maps both to the default)", () => {
+    expect(splitLyricTokens("   ", "あ")).toEqual(["あ"]); // the old split() gave [] — same note in the end
   });
 });
