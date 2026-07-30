@@ -632,7 +632,13 @@ export const G2P_ALGO_VERSION = "s90";
  *  languages only (zh/ja are CV, their borrow normally works, and their fast-run allocation is
  *  ear-verified; applied unconditionally it pushed し's vowel off the beat). On the user's English
  *  track this moved <=2-frame consonants from 46%% to 27%%. */
-export const SCORE_TIMING_VERSION = "s92c";
+/*  s92d = the same round's fourth cut: the Auto borrow WALKS BACK over the preceding phones (depth 4,
+ *  stopping at silence) instead of inspecting only the immediately previous one, so a starved onset is
+ *  fed from BEFORE the note and the nucleus keeps every frame — the user heard s92c's cost as
+ *  "时序有点怪". From depth 2 a vowel lender keeps NUCLEUS_KEEP_MIN, because the shipped half-clamp's
+ *  floor is the S84 collapse region and the deeper walk was measured taking don't's vowel to 2 frames.
+ *  zh/ja walk depth 1 = byte-identical to the shipped rule. */
+export const SCORE_TIMING_VERSION = "s92d";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

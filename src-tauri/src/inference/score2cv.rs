@@ -1006,26 +1006,66 @@ fn assemble_arrays(
                     if onset_end > 0 && timing == ArticulationTiming::Auto {
                         // borrow the onset consonants' frames from the tail of the previous phone so
                         // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
-                        let avail = match phon.last() {
-                            Some(&"SP") | Some(&"AP") => (pdur.last().copied().unwrap_or(0) - REST_KEEP_MIN).max(0),
-                            Some(_) => {
-                                // UTAU-style auto-scale, structural half: a SUNG lender never loses
-                                // more than half its frames (ceil) — in a fast run the previous
-                                // vowel must stay audible. ⚠this clamp alone CANNOT keep vowels at
-                                // the training ~3 frames when every target exceeds it (S84 review:
-                                // fr=4/5 pinned whole passages at exactly 2) — the fr≤5 target cap
-                                // below is what restores the measured C/V split there.
-                                let last = pdur.last().copied().unwrap_or(0);
-                                (last - SUNG_KEEP_MIN).max(0).min((last + 1) / 2)
-                            }
-                            None => 0, // score start: no lender — the onset falls back in-note below
-                        };
-                        // (the fr≤5 target cap referenced above is hoisted into `target`, shared with
-                        // the InNote arm — same measured justification, same note-length key.)
+                        // (the fr≤5 target cap is hoisted into `target`, shared with the InNote arm —
+                        // same measured justification, same note-length key.)
                         let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
-                        let mut left = want.min(avail);
-                        if left > 0 {
-                            *pdur.last_mut().unwrap() -= left;
+                        // ★S92d — the borrow walks BACK over the preceding phones instead of inspecting
+                        // only the immediately previous one. S92c fed a starved onset from its own nucleus,
+                        // which works but delays the vowel — and "the nucleus starts on the beat" is this
+                        // arm's whole contract; the user heard exactly that ("时序有点怪"). Measured on the
+                        // user's track: all 60 starved onsets (179 frames) could be fed from further back
+                        // instead, because the phone one or two steps back is a long vowel with 5-7 frames
+                        // to spare (`t:2(+0) <- n:3(+1) <- oʊ:10(+5)`). Taking from THERE shifts only the
+                        // intervening short consonants earlier — what English singers do with a word-final
+                        // consonant — and the nucleus keeps every frame it had.
+                        //
+                        // Each lender keeps its own floor and its own shipped half-clamp; a rest may lend
+                        // (REST_KEEP_MIN) but the walk STOPS there (never dig through silence into the
+                        // phrase before). Depth 4 is what the measurement needed for 100% coverage.
+                        // ⚠ zh/ja walk depth 1 = EXACTLY the previous single-phone rule, same clamp, so
+                        // their allocation is bit-identical by construction (their fast-run timing is
+                        // ear-verified — S84 あたし's vowels land on beats 0/7/14).
+                        const BORROW_MAX_DEPTH: usize = 4;
+                        let depth_limit =
+                            if onset_may_reach_target(res.run_lang) { BORROW_MAX_DEPTH } else { 1 };
+                        // ledger of (index in pdur, frames) so a DROPPED onset can hand its frames back to
+                        // the exact phones they came from — the borrow stays zero-sum even when it fails.
+                        let mut borrowed: Vec<(usize, i64)> = Vec::new();
+                        let mut left = 0i64;
+                        let mut j = pdur.len();
+                        let mut depth = 0usize;
+                        while left < want && j > 0 && depth < depth_limit {
+                            j -= 1;
+                            depth += 1;
+                            let is_rest = matches!(phon[j], "SP" | "AP");
+                            let d = pdur[j];
+                            // UTAU-style auto-scale, structural half: a SUNG lender never loses more than
+                            // half its frames (ceil) — in a fast run the previous vowel must stay audible.
+                            // ⚠ That clamp's floor is SUNG_KEEP_MIN = 2, which IS the S84 collapse region;
+                            // it was ear-validated when only ONE phone could ever be tapped. The deeper
+                            // steps are new territory, and measurement showed them taking `don't`'s vowel
+                            // to exactly 2 frames — so from depth 2 on, a VOWEL lender keeps
+                            // NUCLEUS_KEEP_MIN. Depth 1 is left byte-for-byte as shipped (that is what
+                            // makes zh/ja identical and every pre-S92 English note identical too).
+                            let floor = if depth > 1 && is_nucleus_phone(phon[j]) {
+                                NUCLEUS_KEEP_MIN
+                            } else {
+                                SUNG_KEEP_MIN
+                            };
+                            let cap_j = if is_rest {
+                                (d - REST_KEEP_MIN).max(0)
+                            } else {
+                                (d - floor).max(0).min((d + 1) / 2)
+                            };
+                            let take = (want - left).min(cap_j);
+                            if take > 0 {
+                                pdur[j] -= take;
+                                borrowed.push((j, take));
+                                left += take;
+                            }
+                            if is_rest {
+                                break;
+                            }
                         }
                         // distribute LAST-first (the consonant adjacent to the vowel carries the
                         // syllable identity — a starved cluster sheds its outermost member first),
@@ -1100,9 +1140,18 @@ fn assemble_arrays(
                                 *d = 0;
                             }
                         }
-                        if returned > 0 {
-                            *pdur.last_mut().unwrap() += returned;
+                        // S92d: give them back to the exact phones they came from, newest lender first
+                        // (with depth 1 — zh/ja — this ledger holds a single entry and the arithmetic is
+                        // identical to the old `*pdur.last_mut() += returned`).
+                        for (idx, given) in borrowed.iter().rev() {
+                            if returned == 0 {
+                                break;
+                            }
+                            let back = returned.min(*given);
+                            pdur[*idx] += back;
+                            returned -= back;
                         }
+                        debug_assert_eq!(returned, 0, "a dropped onset held frames no lender gave it");
                     }
                     for (&p, &d) in ph.iter().zip(durs.iter()) {
                         if d <= 0 {
@@ -1835,6 +1884,38 @@ mod tests {
             &[raw("d oʊ n t", 8), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
         assert_eq!(j.phone_dur, vec![2, 2, 2, 2, 2, 14], "zh/ja keep the 2-frame rescue (ear-verified)");
+    }
+
+    /// ★S92d — the walk-back borrow, and the property the user actually complained about: with S92c the
+    /// starved onset was fed from its OWN nucleus, so the vowel started late ("时序有点怪"). Feeding it
+    /// from FURTHER BACK restores the Auto arm's contract — **the nucleus keeps every frame it had**.
+    /// Hand-derived. Note A `M AY1 N D`@20 (long bucket): coda want = n4 + d3 = 7, ceiling
+    /// max(20*2/5, min(4, 20-3)) = 8 ⇒ budget 7 ⇒ d 3 (holding 2 back for n), n 4, nucleus 13. Onset m at
+    /// score start: floor pass 2 (nucleus 11), then the target pass — cap (20-2).min(10) = 10, 2 already
+    /// used ⇒ allow 8, m's long-bucket target 5 ⇒ m 5, nucleus 8. A = [m5, aɪ8, n2, d2]… wait: n and d
+    /// then LEND to B below, which is the whole point.
+    /// Note B `S IY1`@16: s's target is 7. The immediate lender d:3 can give (3-2).min(2) = 1; walking
+    /// back n:4 gives (4-2).min(2) = 2; aɪ:8 gives (8-2).min(4) = 4 ⇒ 1+2+4 = 7 = want, all of it from
+    /// BEFORE the note ⇒ **i keeps all 16 frames** and s gets its full target.
+    #[test]
+    fn s92d_walk_back_borrow_keeps_the_vowel_on_the_beat() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
+        assert_eq!(a.phone_dur, vec![5, 4, 2, 2, 7, 16]);
+        assert_eq!(*a.phone_dur.last().unwrap(), 16, "★the vowel keeps ALL its frames — on the beat");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 36, "frame-conserving across the walk-back");
+
+        // ja walks depth 1 = the pre-S92d single-phone rule, bit-identical: only d:3 can lend (1 frame),
+        // so s falls back to the 2-frame rescue out of its own nucleus.
+        let j = build_arrays_daw(
+            &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
+        assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
     }
 
     /// Property sweep over note length for a cluster — three invariants, and the FIRST version of this
