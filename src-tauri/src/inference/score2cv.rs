@@ -393,6 +393,23 @@ const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// covers every non-nucleus token; ≈ the global consonant medians).
 const ONSET_TARGET_FALLBACK: i64 = 4;
 const CODA_TARGET_FALLBACK: i64 = 4;
+/// S92c: may an underfed word-initial consonant keep taking from its OWN nucleus until it reaches its
+/// measured target, instead of stopping at the bare 2-frame rescue?
+///
+/// Only for the languages whose syllables CHAIN consonants. zh/ja are CV: the phone before an onset is
+/// almost always a long vowel, so the pre-roll borrow reaches the target and this pass has nothing to do
+/// — except in fast runs, where it WOULD move behaviour the user has already accepted by ear (S84/S89:
+/// あたし's three vowels land exactly on beats 0/7/14, and that test is the Auto arm's whole contract).
+/// English is the opposite: 46 of 121 word-initial consonants on the user's own track had a lender with
+/// NOTHING to give, so the rescue's 40 ms consonant is the norm rather than the exception there.
+///
+/// Split per language on the user's explicit instruction ("按语言分别使用每个语言的规则"), and because
+/// the alternative was measured: applied unconditionally it turns 6 ja-material tests red, one of them
+/// by pushing し's vowel off the beat. zh/ja do not move until they get their own ear test.
+fn onset_may_reach_target(lang: g2p::Lang) -> bool {
+    !matches!(lang, g2p::Lang::Zh | g2p::Lang::Ja)
+}
+
 /// S92: the frames a coda CLUSTER's raised ceiling may never take from the nucleus. A 2-frame vowel is
 /// the cv/decoder collapse region S84 measured (the audible "briefly mute" fast run the user reported);
 /// `fast_run_fr5_vowels_keep_three_frames` is where the ear-validated onset clamp already lands, so the
@@ -1024,6 +1041,7 @@ fn assemble_arrays(
                         // and the drop pass below could no longer return them to their sources, and a
                         // 1-frame phone is categorically OOD anyway (S83 review #0).
                         let nuc_floor = fr.min(2);
+                        let nuc_before_supplement = durs[nuc];
                         for i in (0..onset_end).rev() {
                             if durs[i] >= 2 {
                                 continue;
@@ -1032,6 +1050,44 @@ fn assemble_arrays(
                             if (durs[nuc] - nuc_floor).max(0) >= need {
                                 durs[nuc] -= need;
                                 durs[i] += need;
+                            }
+                        }
+                        // ★S92c — and then keep going to the MEASURED TARGET instead of stopping at the
+                        // 2-frame floor. The floor was written as a rescue for the rare no-lender case
+                        // (score start); on an English line it is the NORM, because the previous phone is
+                        // itself a short consonant with nothing to lend, and the rescue then hard-codes a
+                        // 40 ms consonant no matter what the training data says. Measured on the user's own
+                        // 283-note English track: 48 of 121 word-initial consonants sat on exactly that
+                        // floor, 46 of them because `avail == 0`, and 38 of THOSE had a nucleus with 6+
+                        // frames to spare — 188 frames (3.76 s) of articulation missing, and self-
+                        // reinforcing, since a 2-frame consonant cannot lend to the next onset either.
+                        // `s` in "seem"/"smell" wants 7 frames and got 2, with a 10-frame vowel next to it.
+                        //
+                        // The clamp is `(have - SUNG_KEEP_MIN).max(0).min((have+1)/2)` — the SAME shipped,
+                        // ear-validated half-clamp the sung-lender borrow above uses, re-aimed at the
+                        // nucleus (S89's rule: reuse a verified rule instead of inventing a constant).
+                        // ⚠ Runs AFTER the all-or-nothing floor pass and skips `durs[i] == 0`, so an onset
+                        // that will DROP below never holds nucleus frames — the drop pass hands its frames
+                        // back to the LENDER, and that stays exact (the conservation invariant this
+                        // supplement was originally written all-or-nothing to protect).
+                        if onset_may_reach_target(res.run_lang) {
+                            // The nucleus's TOTAL contribution is bounded once for the whole cluster by the
+                            // InNote arm's own clamp — never below SUNG_KEEP_MIN, never more than half the
+                            // note. ⚠ A per-onset clamp is NOT enough: [s t a]@10 then had each of the two
+                            // onsets take "half of what is left" in turn and the vowel ended at 2 frames,
+                            // i.e. the S84 collapse region. Measured, not imagined — a test caught it.
+                            let cap = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
+                            let mut allow = (cap - (nuc_before_supplement - durs[nuc])).max(0);
+                            for i in (0..onset_end).rev() {
+                                let t = target(ph[i]);
+                                if allow == 0 || durs[i] == 0 || durs[i] >= t {
+                                    continue;
+                                }
+                                let give =
+                                    (t - durs[i]).min(allow).min((durs[nuc] - SUNG_KEEP_MIN).max(0));
+                                durs[nuc] -= give;
+                                durs[i] += give;
+                                allow -= give;
                             }
                         }
                         // sub-minimum onsets DROP (same policy as codas/medials); at this point their
@@ -1747,6 +1803,38 @@ mod tests {
             &[raw("a", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(fresh.phon, vec!["a", "ɪ"], "a FRESH vowel keeps the full nucleus protection");
         assert_eq!(fresh.phone_dur, vec![12, 4]);
+    }
+
+    /// ★S92c — the onset-starvation cascade. On the Auto arm a word-initial consonant is funded by
+    /// borrowing from the PREVIOUS phone; when that phone is itself a 2-frame consonant (46 of 121 cases
+    /// on the user's own English track) the borrow yields nothing and the onset used to stop at the bare
+    /// 2-frame rescue — a 40 ms /s/ next to a 14-frame vowel, whatever the measured target says.
+    /// Hand-derived: note A `D OW1 N T`@8 ends on t:2, so note B's lender can give
+    /// `(2-SUNG_KEEP_MIN).max(0)` = 0. B = `S IY1`@16 ⇒ allocate leaves [_, 16]; the floor pass gives s 2
+    /// (i:14); then the target pass may take up to `cap = (16-2).min(8) = 8` from the nucleus in total, 2
+    /// of which the floor pass already used ⇒ allow 6, and s's measured onset target at the long bucket
+    /// is 7 ⇒ s takes 5 more. s:7 i:9.
+    /// ★The second arm is the language discriminator: the SAME phones and the SAME frames under ja keep
+    /// the old 2-frame rescue, because zh/ja are CV — their borrow normally works, and their fast-run
+    /// behaviour is ear-verified (S84). Same input, different language, different rule — by design.
+    #[test]
+    fn s92c_starved_onset_reaches_its_target_in_english_only() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(&[en("D OW1 N T", 8), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
+        assert_eq!(a.phone_dur, vec![2, 2, 2, 2, 7, 9], "the starved /s/ reaches its measured 7-frame target");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 24, "frame-conserving");
+
+        // ja, identical phones and frames (raw IPA override): the lender is still empty, but the rule
+        // does not apply — 2-frame rescue, exactly as before S92c.
+        let j = build_arrays_daw(
+            &[raw("d oʊ n t", 8), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
+        assert_eq!(j.phone_dur, vec![2, 2, 2, 2, 2, 14], "zh/ja keep the 2-frame rescue (ear-verified)");
     }
 
     /// Property sweep over note length for a cluster — three invariants, and the FIRST version of this

@@ -627,7 +627,12 @@ export const G2P_ALGO_VERSION = "s90";
  *  lost its /n/ in both choruses on a 4-frame hold, where 2/5 of the note is ONE frame. Bumped again
  *  rather than reusing s92: allocation changed a second time, and a bake taken between the two commits
  *  would otherwise be considered current. */
-export const SCORE_TIMING_VERSION = "s92b";
+/*  s92c = the same round's third cut: an underfed word-initial consonant keeps taking from its own
+ *  nucleus until it reaches its MEASURED target instead of stopping at the 2-frame rescue — WESTERN
+ *  languages only (zh/ja are CV, their borrow normally works, and their fast-run allocation is
+ *  ear-verified; applied unconditionally it pushed し's vowel off the beat). On the user's English
+ *  track this moved <=2-frame consonants from 46%% to 27%%. */
+export const SCORE_TIMING_VERSION = "s92c";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
