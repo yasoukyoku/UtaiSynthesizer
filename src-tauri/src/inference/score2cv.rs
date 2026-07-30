@@ -393,6 +393,12 @@ const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// covers every non-nucleus token; ≈ the global consonant medians).
 const ONSET_TARGET_FALLBACK: i64 = 4;
 const CODA_TARGET_FALLBACK: i64 = 4;
+/// S92: the frames a coda CLUSTER's raised ceiling may never take from the nucleus. A 2-frame vowel is
+/// the cv/decoder collapse region S84 measured (the audible "briefly mute" fast run the user reported);
+/// `fast_run_fr5_vowels_keep_three_frames` is where the ear-validated onset clamp already lands, so the
+/// cluster ceiling stops at the same place instead of inventing its own number. Without it, [i n z]@80ms
+/// pinned the vowel at 2 frames to make room for a coda — a new instance of a bug we already paid for.
+const NUCLEUS_KEEP_MIN: i64 = 3;
 
 /// S83 knives 2+3: per-consonant duration TARGETS from the training distribution (see the
 /// generated score2cv_dur_priors.rs header), BUCKETED by note length. One flat 4-frame target for
@@ -489,11 +495,42 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
     // flattened the 程度), ≥2 each (else DROPPED — never a 1-frame phone), total ≤ 2/5 of the note
     // (training: vowel share median 44-47%). LAST-first: the word-final release is the perceptually
     // load-bearing cue — when the budget starves, inner codas drop before it.
+    //
+    // ★S92: with TWO OR MORE coda consonants — an English CLUSTER, a shape zh cannot even express
+    // (its finals are atomic vocab tokens: `wang` = [w, ɑŋ], n_coda = 0) and ja tops out at one —
+    // "LAST-first, each takes its full measured target" let the outermost consonant eat the whole
+    // budget and SILENTLY DELETED the inner one at perfectly ordinary note lengths. Measured on the
+    // user's real 283-note English track: 6 notes lost a phone with no error and no red mark —
+    // `means`@320ms sang "meez" (z took all 6 of the 6-frame budget, n got 0), `things`@320ms "thiz",
+    // `don't`@160ms "dote", `find`@160ms "fide", `[f ih r s]`@320ms "fiss".
+    // Two bounded changes; BOTH are exact no-ops unless n_coda ≥ 2 (`unserved` is 0 for the only
+    // coda, and `cluster_floor` is 0), and a note with n_coda ≥ 2 does not exist in the ja probe
+    // song (0 of 1215 sung notes) nor in any of the three UTAU-alias tracks (0 of ~325 each) —
+    // so the ear-verified ja/alias allocation is preserved BY CONSTRUCTION, not by a language flag:
+    //   1. RESERVE the minimum for the codas not yet served (they are served after this one), so the
+    //      outermost member can no longer starve them. `means`: z 4 + n 2 instead of z 6 + n DROPPED,
+    //      and **the nucleus keeps exactly the frames it had** — the total budget does not change.
+    //   2. Raise the 2/5 ceiling to `n_coda * CODA_MIN_FRAMES` when 2/5 cannot fund the minimums at
+    //      all (a cluster below 2 frames per member means nothing). `don't`@160ms: 3 → 4 frames of
+    //      coda, i.e. the nucleus pays ONE frame for the /n/ it was losing entirely. Still bounded by
+    //      `fr - nuc_floor - used`, so conservation and the nucleus floor are untouched, and `budget`
+    //      stays monotone in note length (a longer note can never delete a consonant — S89).
+    // ⚠ Deliberately NOT fixed here: a SINGLE coda that cannot reach 2 frames on a very short note
+    // (`ɪ n`@80ms, 2 of the 8 real drops) — raising the k=1 ceiling would change ja (かん@80ms) and
+    // needs its own ear test. See project_v2_pending_cleanups.
     if n_coda > 0 {
         let want: i64 = ph[nuc + 1..].iter().map(|p| coda_target_frames(p, note_frames)).sum();
-        let mut budget = want.min(fr - nuc_floor - used).min(fr * 2 / 5);
+        let cluster_floor = if n_coda >= 2 {
+            (n_coda as i64 * CODA_MIN_FRAMES).min((fr - NUCLEUS_KEEP_MIN).max(0))
+        } else {
+            0
+        };
+        let mut budget = want.min(fr - nuc_floor - used).min((fr * 2 / 5).max(cluster_floor));
         for i in (nuc + 1..n).rev() {
-            let give = coda_target_frames(ph[i], note_frames).min(budget);
+            // held back for the codas BEFORE this one — never so much that THIS one starves.
+            let unserved = (i - (nuc + 1)) as i64;
+            let reserve = (unserved * CODA_MIN_FRAMES).min((budget - CODA_MIN_FRAMES).max(0));
+            let give = coda_target_frames(ph[i], note_frames).min(budget - reserve);
             if give < CODA_MIN_FRAMES {
                 continue; // dropped; the remaining budget stays for the codas before it
             }
@@ -1578,6 +1615,121 @@ mod tests {
         let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");
         assert_eq!(tiny.phone_dur.iter().sum::<i64>(), 13, "still frame-conserving");
+    }
+
+    // ─── S92: the coda CLUSTER (n_coda ≥ 2) — English's shape, which zh/ja cannot produce ───
+    //
+    // Every expectation below is hand-derived from score2cv_dur_priors.rs + the allocator's rules,
+    // never copied from a run (S87: the test only catches arithmetic if the expectation is independent).
+    // Relevant coda targets, [short, mid, long] buckets:
+    //   n [3,3,4]  z [5,5,6]  t [4,3,3]  s [3,5,6]  ŋ [6,6,7]  θ [7,7,7]
+    // A bare vowel-initial phone list is used on purpose: with no onset there is nothing to borrow or
+    // reserve, so each number below isolates the coda pass.
+    fn raw(phones: &'static str, frames: i64) -> g2p::ScoreEvt<'static> {
+        g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames, lang: g2p::Lang::Ja,
+            phoneme_input: Some(phones), phoneme_set: PhonemeSet::Words,
+        }
+    }
+
+    /// `means`@320ms — the real note from the user's English track that sang "meez".
+    /// [i n z] @ 16 fr (long bucket): want = 4+6 = 10, cluster_floor = 2*2 = 4,
+    /// cap = max(16*2/5, 4) = 6 ⇒ budget 6. LAST-first: z holds back 2 for the unserved n ⇒ z = min(6, 6-2) = 4,
+    /// then n = min(4, 2) = 2. Nucleus = 16-6 = 10 — **exactly what it was before the fix**, because the
+    /// TOTAL coda budget did not change; only its split did.
+    #[test]
+    fn s92_coda_cluster_shares_the_budget_instead_of_dropping_the_inner_one() {
+        let arr = build_arrays_daw(&[raw("i n z", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["i", "n", "z"], "the inner coda must survive (pre-S92 it vanished)");
+        assert_eq!(arr.phone_dur, vec![10, 2, 4]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 16, "frame-conserving");
+    }
+
+    /// `don't`@160ms — sang "dote". This one needs the SECOND half of the fix: at 8 frames the 2/5
+    /// ceiling is 3, which cannot fund two 2-frame minimums at all, so it is raised to n_coda*2 = 4.
+    /// [oʊ n t] @ 8 fr (mid bucket): want = 3+3 = 6, budget = min(6, 8-2, max(3,4)) = 4 ⇒
+    /// t = min(3, 4-2) = 2, n = min(3, 2) = 2, nucleus = 4. The nucleus pays exactly ONE frame for the
+    /// /n/ it used to lose entirely (pre-S92: nucleus 5, t 3, n DROPPED).
+    #[test]
+    fn s92_cluster_ceiling_is_raised_only_when_two_fifths_cannot_fund_the_minimums() {
+        let arr = build_arrays_daw(&[raw("oʊ n t", 8)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["oʊ", "n", "t"]);
+        assert_eq!(arr.phone_dur, vec![4, 2, 2]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 8, "frame-conserving");
+    }
+
+    /// A 3-consonant coda (`strengths`) — all three survive, outermost still gets the most.
+    /// [i ŋ θ s] @ 20 fr: want = 7+7+6 = 20, cluster_floor = 6, cap = max(8, 6) = 8 ⇒ budget 8;
+    /// s holds back 2*2 = 4 ⇒ s = min(6, 4) = 4; θ holds back 2 ⇒ min(7, 2) = 2; ŋ = min(7, 2) = 2.
+    #[test]
+    fn s92_three_consonant_coda_all_survive() {
+        let arr = build_arrays_daw(&[raw("i ŋ θ s", 20)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["i", "ŋ", "θ", "s"]);
+        assert_eq!(arr.phone_dur, vec![12, 2, 2, 4]);
+    }
+
+    /// ★The ja/zh-neutrality guard. A SINGLE coda takes exactly the pre-S92 path: `unserved` is 0 for
+    /// the only coda, and `cluster_floor` is 0, so neither half of the fix can bind. That is the whole
+    /// reason no language flag is needed — the ja probe song has 0 notes with n_coda ≥ 2 out of 1215
+    /// sung notes, and so do all three UTAU-alias tracks. (The behavioural proof is the byte-identical
+    /// lane dump; this test exists so a future edit to the single-coda path turns something red.)
+    /// [i n] @ 16 fr: budget = min(4, 14, 6) = 4 ⇒ n = 4, nucleus 12.
+    #[test]
+    fn s92_single_coda_is_untouched() {
+        let arr = build_arrays_daw(&[raw("i n", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phone_dur, vec![12, 4]);
+    }
+
+    /// ★The `fr * 2 / 5` ceiling had ZERO test coverage (an adversarial review measured that changing
+    /// it to 1/2 or 3/5 turned no test red). Pin it on a single coda, where S92 leaves it alone:
+    /// [i s] @ 10 fr (mid bucket): s targets 5 but 10*2/5 = 4 caps it ⇒ s = 4, nucleus 6.
+    /// A 1/2 ceiling would give [5, 5]; 3/5 would give [5, 5]. Either turns this red.
+    #[test]
+    fn coda_ceiling_is_two_fifths_of_the_note() {
+        let arr = build_arrays_daw(&[raw("i s", 10)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phone_dur, vec![6, 4], "2/5 of a 10-frame note = 4");
+    }
+
+    /// The fix does NOT pretend a note has room it does not have: 5 frames cannot hold a nucleus floor
+    /// plus two 2-frame codas, so the inner one still drops (loudly documented, not silently assumed).
+    /// [i n z] @ 5 fr: cluster_floor = min(2*2, 5-NUCLEUS_KEEP_MIN) = 2, so the ceiling stays at
+    /// max(5*2/5, 2) = 2 ⇒ budget 2 ⇒ z takes 2, n = min(3, 0) = 0 < 2 ⇒ dropped, nucleus keeps 3.
+    #[test]
+    fn s92_cluster_still_drops_when_the_note_physically_cannot_hold_it() {
+        let arr = build_arrays_daw(&[raw("i n z", 5)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["i", "z"]);
+        assert_eq!(arr.phone_dur, vec![3, 2]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 5, "frame-conserving even when a phone drops");
+    }
+
+    /// Property sweep over note length for a cluster — three invariants, and the FIRST version of this
+    /// test got the third one wrong in a way worth recording: it demanded every position be monotone,
+    /// including the NUCLEUS. The nucleus takes the remainder, so the moment a coda becomes affordable
+    /// the vowel must give frames back — non-monotone BY CONSERVATION, not by bug. What the test found
+    /// while stating it wrongly was real, though: the cluster ceiling had pinned the vowel at 2 frames
+    /// at fr=4 (the S84 collapse region) — hence `NUCLEUS_KEEP_MIN`.
+    ///   1. conservation: Σ durs == fr
+    ///   2. CONSONANTS are monotone in fr (a longer note may never shorten or delete one — the S89 property)
+    ///   3. the nucleus never lands in the ≤2-frame collapse region once the note can afford 3
+    #[test]
+    fn s92_cluster_allocation_sweep_over_note_length() {
+        let mut prev = vec![0i64; 3];
+        for fr in 3..=60 {
+            let arr = build_arrays_daw(&[raw("i n z", fr)], &NoDicts, ArticulationTiming::Auto).unwrap();
+            assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "conservation at fr={fr}");
+            let mut by_pos = vec![0i64; 3]; // 0 = a dropped phone, so presence is comparable across fr
+            for (p, d) in arr.phon.iter().zip(arr.phone_dur.iter()) {
+                by_pos[["i", "n", "z"].iter().position(|x| x == p).expect("known phone")] = *d;
+            }
+            for k in [1usize, 2] {
+                assert!(by_pos[k] >= prev[k], "fr={fr} shortened/deleted a consonant: {prev:?} -> {by_pos:?}");
+            }
+            assert!(
+                by_pos[0] >= NUCLEUS_KEEP_MIN.min(fr),
+                "fr={fr} left the nucleus in the collapse region: {by_pos:?}"
+            );
+            prev = by_pos;
+        }
     }
 
     // ─── S89 「自动音素时序」 OFF (ArticulationTiming::InNote) ───

@@ -612,8 +612,17 @@ export const G2P_ALGO_VERSION = "s90";
  *  ⚠ ALSO the invalidation carrier for the Rust-side fix in the same round (commands/inference.rs: the
  *  dead-zone planner's note list now zeroes silent tokens instead of reading their drawn pitch). That
  *  fix only reaches the SCORE render path, whose signature is exactly this one — but it does mean the
- *  "frontend-only" line above describes the TOKEN, not the round. */
-export const SCORE_TIMING_VERSION = "s88";
+ *  "frontend-only" line above describes the TOKEN, not the round.
+ *  s92 = the coda CLUSTER split (Rust `allocate_in_note`): with two or more coda consonants the
+ *  outermost one no longer takes the whole budget and silently deletes the inner one — `don't` sang
+ *  "dote", `means` "meez", `things` "thiz" (6 such notes on a real 283-note English track). Frame
+ *  totals are unchanged; WHICH phones exist is not, so every existing bake must be re-judged.
+ *  ⚠ zh/ja bakes re-render to BYTE-IDENTICAL audio (the ja probe song's lane dump is byte-identical
+ *  before/after — n_coda ≥ 2 cannot occur in zh/ja/UTAU-alias material), so for those projects the
+ *  re-render is wasted work rather than a change. Bumping anyway follows the user's S89 ruling:
+ *  "re-running an existing bake is no big deal; triggering a re-render where nothing should have
+ *  changed is the bug" — a per-language token would be the distortion, not the protection. */
+export const SCORE_TIMING_VERSION = "s92";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
