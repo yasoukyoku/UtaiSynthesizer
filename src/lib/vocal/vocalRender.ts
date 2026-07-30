@@ -659,7 +659,17 @@ export const G2P_ALGO_VERSION = "s90";
  *  vowel is held by the next note). "thing"@4fr had its /th/ cut from a measured 7 frames to 2 (40 ms)
  *  to protect a vowel that then continued for another 93 frames. 7 of 7 short onset-bearing notes on
  *  the user's track are that shape. zh/ja lane byte-identical, so no language gate was needed. */
-export const SCORE_TIMING_VERSION = "s92i";
+/*  s92j = the pre-roll borrow stops GUTTING one neighbour. The clamp on a lender that is NOT the phone
+ *  next door drops from half to a quarter of its frames (adjacent stays on the shipped, ear-validated
+ *  half — that phone belongs to the syllable the listener already groups with this onset), and a vowel
+ *  lender keeps NUCLEUS_KEEP_MIN at EVERY depth on the chaining arm, not only from depth 2. The user
+ *  heard the old behaviour as splicing: hurt's onset reached back into might and took its /ai/ from 5
+ *  frames to 3, and shame's /ei/ lost 3 of 11 (a diphthong that short stops completing its glide, which
+ *  is why an open vowel sounded closed). The onsets get exactly as many frames as before — Sigma onset
+ *  frames identical at 595 on the user's track — the same demand is just spread over several lenders:
+ *  vowels shortened by >25%% 42 -> 14, timeline displacement 540 -> 484 frames, collapse-region vowels
+ *  3 -> 2 (the three UTAU-alias tracks 3 -> 0). zh/ja lane byte-identical (SHA256). */
+export const SCORE_TIMING_VERSION = "s92j";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

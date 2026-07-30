@@ -427,6 +427,13 @@ fn consonant_chaining_language(lang: g2p::Lang) -> bool {
 /// pinned the vowel at 2 frames to make room for a coda — a new instance of a bug we already paid for.
 const NUCLEUS_KEEP_MIN: i64 = 3;
 
+/// S92j: the divisor of the pre-roll borrow's clamp once the lender is NOT the phone next door — a
+/// non-adjacent vowel may give away at most `d / DEEP_LENDER_SHARE` of itself (the adjacent lender
+/// keeps the shipped, ear-validated HALF; see the borrow loop for why the two differ perceptually).
+/// Measured on the user's 283-note English track, not derived: /3 still leaves 30 vowels shortened by
+/// more than a quarter, /4 leaves 14, /5 leaves 13 but costs an onset frame ⇒ 4 is the knee.
+const DEEP_LENDER_SHARE: i64 = 4;
+
 /// S83 knives 2+3: per-consonant duration TARGETS from the training distribution (see the
 /// generated score2cv_dur_priors.rs header), BUCKETED by note length. One flat 4-frame target for
 /// every consonant parked each token OFF its own distribution center (stops t/d sit at 3 frames,
@@ -1080,8 +1087,21 @@ fn assemble_arrays(
                         // their allocation is bit-identical by construction (their fast-run timing is
                         // ear-verified — S84 あたし's vowels land on beats 0/7/14).
                         const BORROW_MAX_DEPTH: usize = 4;
-                        let depth_limit =
-                            if onset_may_reach_target(res.run_lang) { BORROW_MAX_DEPTH } else { 1 };
+                        // ONE evaluation point for "does this language chain consonants" — the depth
+                        // limit, the vowel-lender floor and the in-note supplement below must never be
+                        // able to disagree about which arm a track is on.
+                        let chaining = onset_may_reach_target(res.run_lang);
+                        let depth_limit = if chaining { BORROW_MAX_DEPTH } else { 1 };
+                        // ★S92j — a VOWEL lender's floor is NUCLEUS_KEEP_MIN at EVERY depth on the
+                        // chaining arm. It used to be NUCLEUS_KEEP_MIN from depth 2 and SUNG_KEEP_MIN
+                        // (= 2 = the S84 collapse region) at depth 1, and that inconsistency is what
+                        // tightening the deep clamp exposed: the demand simply moved to the adjacent
+                        // lender, which had no vowel protection. Measured on the user's track, `so`@8fr
+                        // came out `s:7 oʊ:2` — a 40 ms diphthong. The in-note half already keeps
+                        // NUCLEUS_KEEP_MIN (S92g); this is the same invariant on the borrow half, so
+                        // "a sung vowel never lands in the collapse region" now holds everywhere.
+                        // zh/ja keep SUNG_KEEP_MIN = the shipped, ear-validated rule, byte-for-byte.
+                        let vowel_keep = if chaining { NUCLEUS_KEEP_MIN } else { SUNG_KEEP_MIN };
                         // ledger of (index in pdur, frames) so a DROPPED onset can hand its frames back to
                         // the exact phones they came from — the borrow stays zero-sum even when it fails.
                         let mut borrowed: Vec<(usize, i64)> = Vec::new();
@@ -1104,26 +1124,40 @@ fn assemble_arrays(
                             let d = pdur[j];
                             // UTAU-style auto-scale, structural half: a SUNG lender never loses more than
                             // half its frames (ceil) — in a fast run the previous vowel must stay audible.
-                            // ⚠ That clamp's floor is SUNG_KEEP_MIN = 2, which IS the S84 collapse region;
-                            // it was ear-validated when only ONE phone could ever be tapped. The deeper
-                            // steps are new territory, and measurement showed them taking `don't`'s vowel
-                            // to exactly 2 frames — so from depth 2 on, a VOWEL lender keeps
-                            // NUCLEUS_KEEP_MIN. Depth 1 is left byte-for-byte as shipped (that is what
-                            // makes zh/ja identical and every pre-S92 English note identical too).
                             // ★At depth ≥ 2 only a VOWEL lends. Draining a preceding CONSONANT would undo
                             // the very fix this round makes for it — measured: note 45's `s p` cluster ate
                             // `whisper`'s /w/ back down from 4 frames to 2, i.e. the cascade re-appearing
                             // through the other end of the borrow.
+                            //
+                            // ★S92j — the half-clamp becomes a QUARTER-clamp once the lender is no longer
+                            // adjacent. Half was ear-validated for the phone RIGHT BEFORE the onset: that
+                            // phone belongs to the syllable the listener already groups with this
+                            // consonant, so shortening it reads as normal legato. From depth 2 the lender
+                            // is a DIFFERENT syllable, and halving it is what the user heard as splicing:
+                            // `hurt`'s onset walked back into `might` and took its /aɪ/ from 5 frames to 3,
+                            // and `shame`'s /eɪ/ lost 3 of 11 — a diphthong that loses a quarter of itself
+                            // stops completing its glide, which is why an open vowel came out sounding
+                            // closed. Quartering does NOT reduce how many frames the onsets get (measured:
+                            // Σ onset frames identical, 595, across the whole track) — it forces the walk
+                            // to spread the same demand over several lenders instead of gutting the first
+                            // one. Measured on the user's track: vowels shortened by >25% fall 42 → 14,
+                            // total timeline displacement 540 → 484 frames, and the count of vowels driven
+                            // into the S84 collapse region falls 3 → 2 (the three alias tracks: 3 → 0).
+                            // ⚠ The coefficient is measured, not derived: /3 leaves 30 vowels over 25% and
+                            // /5 buys only one more (13) while costing an onset frame, i.e. 4 is the knee.
                             let cap_j = if is_rest {
                                 (d - REST_KEEP_MIN).max(0)
+                            } else if !is_nucleus_phone(phon[j]) {
+                                // consonant lender: the shipped rule next door, nothing further back.
+                                if depth == 1 {
+                                    (d - SUNG_KEEP_MIN).max(0).min((d + 1) / 2)
+                                } else {
+                                    0
+                                }
                             } else if depth == 1 {
-                                // depth 1 = the shipped rule, byte-for-byte (zh/ja and every pre-S92
-                                // English note depend on it).
-                                (d - SUNG_KEEP_MIN).max(0).min((d + 1) / 2)
-                            } else if is_nucleus_phone(phon[j]) {
-                                (d - NUCLEUS_KEEP_MIN).max(0).min((d + 1) / 2)
+                                (d - vowel_keep).max(0).min((d + 1) / 2)
                             } else {
-                                0
+                                (d - NUCLEUS_KEEP_MIN).max(0).min(d / DEEP_LENDER_SHARE)
                             };
                             let take = (want - left).min(cap_j);
                             if take > 0 {
@@ -1178,7 +1212,7 @@ fn assemble_arrays(
                         // that will DROP below never holds nucleus frames — the drop pass hands its frames
                         // back to the LENDER, and that stays exact (the conservation invariant this
                         // supplement was originally written all-or-nothing to protect).
-                        if onset_may_reach_target(res.run_lang) {
+                        if chaining {
                             // The nucleus's TOTAL contribution is bounded once for the whole cluster by the
                             // InNote arm's own clamp — never below SUNG_KEEP_MIN, never more than half the
                             // note. ⚠ A per-onset clamp is NOT enough: [s t a]@10 then had each of the two
@@ -2010,10 +2044,12 @@ mod tests {
     /// Note B `S IY1`@16: s's target is 7, and the two mechanisms STACK (the user asked for exactly that).
     /// Walk-back first: the immediate lender d:3 gives (3-2).min(2) = 1 (depth 1 = the shipped rule); n:4
     /// is a CONSONANT at depth 2 so it gives NOTHING (draining it would undo its own fix); aɪ:8 is a vowel
-    /// in the same note ⇒ (8-NUCLEUS_KEEP_MIN).min(4) = 4. That is 5 of the 7, all from BEFORE the note.
-    /// The in-note supplement then covers the last 2 out of B's own nucleus ⇒ s 7, i 14.
-    /// So the vowel gives up only what the walk-back could not supply — 2 frames instead of S92c's 5 —
-    /// and `n` keeps its 4 frames instead of being eaten back down to 2.
+    /// at depth 3 ⇒ **S92j** (8-NUCLEUS_KEEP_MIN).min(8/DEEP_LENDER_SHARE) = 2, where it used to be
+    /// .min(ceil(8/2)) = 4. That is 3 of the 7 from BEFORE the note; the in-note supplement covers the
+    /// last 4 out of B's OWN nucleus ⇒ s 7, i 12.
+    /// So `mind`'s vowel keeps 6 of the 8 frames it has when the note stands alone (it kept 4 before) —
+    /// the "another word reached in and cut this one short" artifact the user named on `might`/`shame` —
+    /// while the onset still reaches its full measured target and `n` keeps its 4 frames.
     #[test]
     fn s92d_walk_back_borrow_keeps_the_vowel_on_the_beat() {
         let d = en_dicts();
@@ -2023,10 +2059,18 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
-        assert_eq!(a.phone_dur, vec![5, 4, 4, 2, 7, 14]);
+        assert_eq!(a.phone_dur, vec![5, 6, 4, 2, 7, 12]);
         assert_eq!(a.phone_dur[4], 7, "★the onset still reaches its measured target");
         assert_eq!(a.phone_dur[2], 4, "★a preceding CONSONANT is not drained back down (its own fix holds)");
-        assert!(a.phone_dur[5] >= 14, "★the vowel only gives up what the walk-back could not supply");
+        // ★S92j, stated as the invariant instead of as a number: the lender's UNDISTURBED duration is
+        // derived from the same note standing alone, so this stays honest if a target or bucket moves.
+        let alone = build_arrays_daw(&[en("M AY1 N D", 20)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(alone.phone_dur[1], 8, "note A's own allocation (sanity anchor for the ratio below)");
+        assert!(
+            a.phone_dur[1] >= alone.phone_dur[1] - alone.phone_dur[1] / DEEP_LENDER_SHARE,
+            "★a NON-ADJACENT vowel lender keeps at least (1 - 1/{DEEP_LENDER_SHARE}) of itself: {} of {}",
+            a.phone_dur[1], alone.phone_dur[1]
+        );
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 36, "frame-conserving across the walk-back");
 
         // ja walks depth 1 = the pre-S92d single-phone rule, bit-identical: only d:3 can lend (1 frame),
@@ -2035,6 +2079,48 @@ mod tests {
             &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
+    }
+
+    /// ★S92j — the OTHER half of the same round, and the one that only showed up once the deep clamp was
+    /// tightened: an ADJACENT vowel lender had no collapse-region protection at all. Depth 1 kept only
+    /// `SUNG_KEEP_MIN` = 2, which is exactly the 2-frame cv/decoder collapse S84 measured, while the
+    /// in-note supplement (S92g) and the deep steps both already kept `NUCLEUS_KEEP_MIN` = 3. So the
+    /// demand the quarter-clamp pushed off the deep lenders landed on the neighbour instead and put it
+    /// where no other path was allowed to: measured on the user's track, `so`@8fr came out `s:7 oʊ:2`.
+    ///
+    /// Fixture: `S OW1`@8 leaves the vowel at 4 frames on its own; the next note's /m/ then borrows from
+    /// it at depth 1. English keeps 3, the shipped zh/ja rule keeps 2 — the gate is what makes the ja
+    /// lane byte-identical (verified on the full 4838-frame track, SHA256 equal).
+    #[test]
+    fn s92j_adjacent_vowel_lender_stays_out_of_the_collapse_region() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let alone = build_arrays_daw(&[en("S OW1", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(alone.phon, vec!["s", "oʊ"]);
+        assert_eq!(alone.phone_dur, vec![4, 4], "the lender's undisturbed allocation");
+
+        let a = build_arrays_daw(&[en("S OW1", 8), en("M IY1", 10)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["s", "oʊ", "m", "i"]);
+        assert_eq!(a.phone_dur, vec![4, 3, 4, 7]);
+        assert!(
+            a.phone_dur[1] >= NUCLEUS_KEEP_MIN,
+            "★an adjacent vowel lender never lands in the 2-frame collapse region: {}",
+            a.phone_dur[1]
+        );
+        assert_eq!(a.phone_dur[2], 4, "the onset still gets fed (this is not a rollback of S92c/d)");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 18, "conserving");
+
+        // zh/ja: the shipped clamp, unchanged — the vowel may still go to SUNG_KEEP_MIN. Their fast-run
+        // timing is the ear-validated contract (S84 あたし), so it does not move without its own ear test.
+        let j0 = build_arrays_daw(&[raw("s oʊ", 6)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j0.phone_dur, vec![2, 4], "ja lender's undisturbed allocation");
+        let j = build_arrays_daw(
+            &[raw("s oʊ", 6), raw("m i", 10)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phone_dur, vec![2, 2, 2, 10], "zh/ja keep SUNG_KEEP_MIN (gate must hold)");
+        assert_eq!(j.phone_dur.iter().sum::<i64>(), 16, "conserving");
     }
 
     /// ★S92h — the per-language voiceless zero-permille table: well-formed, and actually consulted for
