@@ -506,6 +506,12 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
     let n_coda = n - nuc - 1;
     let n_medial = nuc - onset_end;
     let nuc_floor = fr.min(2).max(1); // the nucleus never drops below min(fr,2)
+    // ★S92g: what the MEDIAL pass must leave. `nuc_floor` (2) is the collapse region S84 measured —
+    // a review walked `refined` = [ɹ ə f aɪ n d] @ 20 frames (400 ms!) through this loop and the medial
+    // consonants took it down to a 2-frame aɪ. The coda pass and the S92 borrow both already keep
+    // NUCLEUS_KEEP_MIN; the medial pass was the one branch still on the old floor, and it is the branch
+    // that fires on exactly the shape English produces most (a multi-syllable word on one note).
+    let nuc_keep = fr.min(NUCLEUS_KEEP_MIN).max(1);
     let mut used = 0i64;
     // medial (between the first and last nucleus): a medial CONSONANT is really the NEXT
     // syllable's ONSET — a multi-syllable word on ONE note flattens its syllable boundaries
@@ -519,7 +525,7 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
         } else {
             onset_target_frames(ph[i], note_frames)
         }
-        .min(fr - nuc_floor - used);
+        .min(fr - nuc_keep - used);
         if c < CODA_MIN_FRAMES {
             break;
         }
@@ -1147,8 +1153,15 @@ fn assemble_arrays(
                                 if allow == 0 || durs[i] == 0 || durs[i] >= t {
                                     continue;
                                 }
-                                let give =
-                                    (t - durs[i]).min(allow).min((durs[nuc] - SUNG_KEEP_MIN).max(0));
+                                // ★S92g: NUCLEUS_KEEP_MIN, not SUNG_KEEP_MIN. The S92c supplement was
+                                // written with the lender constant and could therefore leave the note's
+                                // OWN vowel at 2 frames — the collapse region — on ordinary English
+                                // notes (a review's worked case: [f i l] @ 200 ms with an empty lender).
+                                // The walk-back above already keeps 3 from depth 2; this is the same
+                                // invariant on the in-note half, so the two halves can no longer disagree.
+                                let give = (t - durs[i])
+                                    .min(allow)
+                                    .min((durs[nuc] - NUCLEUS_KEEP_MIN).max(0));
                                 durs[nuc] -= give;
                                 durs[i] += give;
                                 allow -= give;
@@ -1984,6 +1997,53 @@ mod tests {
             &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
+    }
+
+    /// ★S92g — the two branches that could still leave a note's vowel in the 2-frame collapse region
+    /// S84 measured, each pinned at the exact shape a mutation run reproduced it on:
+    ///   • the MEDIAL pass bounded itself by `nuc_floor` (2) instead of `NUCLEUS_KEEP_MIN`, so a
+    ///     multi-syllable word crammed onto one note ate its own vowel — `ə n ə n ə`@6 gave [2,2,2].
+    ///   • the S92c onset supplement used the LENDER constant `SUNG_KEEP_MIN` (2) on the note's OWN
+    ///     vowel — `f i l`@10 with no lender left the vowel at 2.
+    /// Both now keep 3. Reverting either constant turns exactly one of these red (verified by mutation).
+    ///
+    /// ⚠ HONEST SCOPE: "the nucleus is never below 3 when the note can afford it" is NOT a property of
+    /// this allocator today. The S83 all-or-nothing floor pass and the S89 InNote onset reservation can
+    /// both still land on 2 (`ɹ ə f aɪ n d`@10 InNote = [4,2,2,2]) — a property-sweep version of this
+    /// test found them one after another. They are ear-validated shipped clamps, so they are RECORDED in
+    /// pending_cleanups for their own round with its own listening test, not widened here at the end of
+    /// an unrelated one.
+    #[test]
+    fn s92g_medial_and_supplement_no_longer_eat_the_vowel() {
+        // case 1 (medial pass) is language-neutral, so a raw ja fixture exercises it;
+        // case 2 (the S92c supplement) only runs for consonant-chaining languages, so it MUST be an
+        // English event — a ja fixture would silently test nothing (this test caught exactly that).
+        let d = en_dicts();
+        let en_note = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let cases: [(Vec<g2p::ScoreEvt<'static>>, &'static str, i64); 2] = [
+            (vec![raw("ə n ə n ə", 6)], "ə n ə n ə", 6),
+            (vec![en_note("S IY1 N Z", 10)], "S IY1 N Z", 10),
+        ];
+        for (score, shape, fr) in cases {
+            let arr = if shape.starts_with('S') {
+                build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap()
+            } else {
+                build_arrays_daw(&score, &NoDicts, ArticulationTiming::Auto).unwrap()
+            };
+            assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "conservation {shape}@{fr}");
+            let nuc = arr
+                .phon
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| is_nucleus_phone(p))
+                .map(|(i, _)| arr.phone_dur[i])
+                .next_back()
+                .expect("the shape has a nucleus");
+            assert!(nuc >= NUCLEUS_KEEP_MIN, "{shape}@{fr}: nucleus {nuc} ({:?})", arr.phone_dur);
+        }
     }
 
     /// Property sweep over note length for a cluster — three invariants, and the FIRST version of this
