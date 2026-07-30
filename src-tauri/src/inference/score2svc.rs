@@ -331,9 +331,14 @@ fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
     for (i, &d) in arr.phone_dur.iter().enumerate() {
         let d = d.max(0) as usize;
         if is_voiceless_phone(arr.phon[i]) {
+            // S92h: the per-phone RUN language (ScoreArrays already carries it) selects the measured
+            // zero-fraction — no call site changes, because every caller already passes `arr`.
+            let lang = super::g2p::Lang::from_id(arr.lang.get(i).copied().unwrap_or(2))
+                .unwrap_or(super::g2p::Lang::Ja);
             let permille = super::score2cv::voiceless_zero_permille(
                 arr.phon[i],
                 arr.note_dur.get(i).copied().unwrap_or(d as i64),
+                lang,
             );
             let z = ((d as f64 * permille as f64 / 1000.0).round() as usize).min(d);
             let start = cursor + (d - z) / 2;
@@ -1816,7 +1821,8 @@ mod tests {
         assert!(hz.iter().all(|&h| h > 0.0), "pre: whole note voiced");
         zero_voiceless_frames(&mut hz, &arr);
         let k = arr.phone_dur[0] as usize;
-        let permille = super::super::score2cv::voiceless_zero_permille("k", arr.note_dur[0]);
+        let permille =
+            super::super::score2cv::voiceless_zero_permille("k", arr.note_dur[0], super::g2p::Lang::Ja);
         let z = (k as f64 * permille as f64 / 1000.0).round() as usize;
         assert!(z >= 1 && z < k, "k zeroes a nonzero PARTIAL core (got z={z} of {k})");
         let zeroed = hz[..k].iter().filter(|&&h| h == 0.0).count();

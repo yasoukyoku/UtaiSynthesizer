@@ -468,8 +468,30 @@ fn coda_target_frames(p: &str, fr: i64) -> i64 {
 /// into the audible "briefly mute" さ/こ/け the user pinpointed. Fallback 1000 = full-window zero:
 /// exactly right for the devoiced vowels i̥/ɨ̥/ɯ̥ (true whispers, not in the consonant table) and
 /// the conservative legacy behavior for anything else unmapped.
-pub fn voiceless_zero_permille(p: &str, group_frames: i64) -> i64 {
-    dur_prior(p).map(|(_, _, z)| z[dur_bucket(group_frames)]).unwrap_or(1000)
+pub fn voiceless_zero_permille(p: &str, group_frames: i64, lang: g2p::Lang) -> i64 {
+    let bi = dur_bucket(group_frames);
+    // ★S92h: the pooled fourth column is dragged DOWN by Chinese — it supplies ~48% of every voiceless
+    // window in the training set and zeroes far less of each one (zh `t` = 43/132/166 permille against
+    // a pooled 195/248/370). Every other language is therefore told to stay VOICED through more of its
+    // own stops and fricatives than its own singers do, which is the "the consonant is there but it
+    // buzzes" end of the user's report. English's own numbers: t 480/344/434, s _/674/701, ʃ _/688/751,
+    // k _/522/525 — up to 2.5x the pooled value.
+    // ⚠ zh/ja are NOT switched over even though their rows exist: their voiceless rendering is the one
+    // the user has verified by ear (S84 knife 5 was tuned on exactly this material), so they keep the
+    // pooled column until they get their own listening round. Same predicate as every other language
+    // split this round, so the four cannot drift apart.
+    if consonant_chaining_language(lang) {
+        let code = lang.code();
+        if let Some(&(_, _, z)) = super::score2cv_dur_priors::PHONE_ZERO_PERMILLE_LANG
+            .iter()
+            .find(|&&(lg, tok, _)| lg == code && tok == p)
+        {
+            if z[bi] != 0 {
+                return z[bi]; // 0 = this language has no own data for the bucket → pooled below
+            }
+        }
+    }
+    dur_prior(p).map(|(_, _, z)| z[bi]).unwrap_or(1000)
 }
 
 /// How many frames this pass may hand out, and which note-length bucket the MEASURED duration priors
@@ -1997,6 +2019,41 @@ mod tests {
             &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
+    }
+
+    /// ★S92h — the per-language voiceless zero-permille table: well-formed, and actually consulted for
+    /// the languages it is meant for while zh/ja stay on the pooled column byte-for-byte.
+    #[test]
+    fn s92h_per_language_zero_permille_table_is_wellformed_and_gated() {
+        use super::super::score2cv_dur_priors::PHONE_ZERO_PERMILLE_LANG as L;
+        use super::is_voiceless_phone;
+        let mut seen = std::collections::HashSet::new();
+        for &(lg, tok, z) in L {
+            assert!(seen.insert((lg, tok)), "duplicate row {lg}/{tok}");
+            assert!(
+                (0..7).filter_map(g2p::Lang::from_id).any(|l| l.code() == lg),
+                "unknown language code {lg}"
+            );
+            assert!(is_voiceless_phone(tok), "{tok} is voiced — it can never be consulted");
+            assert!(dur_prior(tok).is_some(), "{tok} has no pooled row to fall back to");
+            for v in z {
+                assert!((0..=1000).contains(&v), "{lg}/{tok} permille out of range: {z:?}");
+            }
+            assert!(z.iter().any(|&v| v != 0), "{lg}/{tok} is all-zero — the row means nothing");
+        }
+        // BEHAVIOUR, not just shape. English /t/ on a short note: its own data says 480 permille where
+        // the pooled column (dragged down by Chinese) says 195 — and ja/zh must NOT move.
+        let short = 5; // bucket 0
+        let pooled = dur_prior("t").unwrap().2[0];
+        assert_eq!(pooled, 195, "pooled /t/ short-bucket permille (regenerate changed it?)");
+        assert_eq!(voiceless_zero_permille("t", short, g2p::Lang::En), 480, "en uses its own");
+        assert_eq!(voiceless_zero_permille("t", short, g2p::Lang::Ja), pooled, "ja stays pooled");
+        assert_eq!(voiceless_zero_permille("t", short, g2p::Lang::Zh), pooled, "zh stays pooled");
+        // a bucket the language has no data for falls back rather than emitting the 0 sentinel
+        let s_pooled = dur_prior("s").unwrap().2[0];
+        assert_eq!(voiceless_zero_permille("s", short, g2p::Lang::En), s_pooled, "0 cell → pooled");
+        // an unmapped token keeps the historical full-window default
+        assert_eq!(voiceless_zero_permille("zzz", short, g2p::Lang::En), 1000);
     }
 
     /// ★S92g — the two branches that could still leave a note's vowel in the 2-frame collapse region

@@ -650,7 +650,12 @@ export const G2P_ALGO_VERSION = "s90";
  *  rendered 12-20 dB below their own vowel came up by +5 to +17 dB (13 such codas -> 9).
  *  ⚠ This token is the score-render invalidation carrier, not strictly "timing" (S88 set that
  *  precedent by carrying a Rust-side fix through it). */
-export const SCORE_TIMING_VERSION = "s92f";
+/*  s92g/h = the voiceless f0-zeroing fraction is now measured PER LANGUAGE (the pooled column is
+ *  dragged down by Chinese, which supplies ~48%% of all voiceless windows and zeroes far less of each:
+ *  en /t/ wants 480 permille on a short note where the pooled column says 195, so a 2-frame English
+ *  stop used to carry pitch through its WHOLE window). zh/ja keep the pooled column byte-for-byte.
+ *  Same round: two branches that could leave a note vowel at 2 frames now keep 3. */
+export const SCORE_TIMING_VERSION = "s92h";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
