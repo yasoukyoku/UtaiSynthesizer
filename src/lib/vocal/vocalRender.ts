@@ -655,7 +655,11 @@ export const G2P_ALGO_VERSION = "s90";
  *  en /t/ wants 480 permille on a short note where the pooled column says 195, so a 2-frame English
  *  stop used to carry pitch through its WHOLE window). zh/ja keep the pooled column byte-for-byte.
  *  Same round: two branches that could leave a note vowel at 2 frames now keep 3. */
-export const SCORE_TIMING_VERSION = "s92h";
+/*  s92i = the fr<=5 fast-run onset cap no longer fires when the note is the HEAD OF A MELISMA (its
+ *  vowel is held by the next note). "thing"@4fr had its /th/ cut from a measured 7 frames to 2 (40 ms)
+ *  to protect a vowel that then continued for another 93 frames. 7 of 7 short onset-bearing notes on
+ *  the user's track are that shape. zh/ja lane byte-identical, so no language gate was needed. */
+export const SCORE_TIMING_VERSION = "s92i";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

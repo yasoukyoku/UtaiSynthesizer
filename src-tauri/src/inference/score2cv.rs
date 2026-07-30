@@ -962,9 +962,25 @@ fn assemble_arrays(
                     // never enters this branch — bit-identical by construction.
                     // ★The cap keys on the NOTE's own frame count, not on who lends, so it holds
                     // identically on the InNote arm (same measured C/V split, same note length).
+                    // ★S92i: …but a short note whose VOWEL IS HELD BY THE NEXT NOTE is not a fast run at
+                    // all — it is the head of a melisma, the shape this author writes constantly
+                    // (`thing`@4fr followed by 20+8+29+4+20+12 frames of the same ɪ). The cap then cut
+                    // /θ/ from its measured 7 frames to 2 (40 ms) to protect a vowel that is in no
+                    // danger: the note's own frames all stay with the vowel, and the onset is funded by
+                    // BORROWING from the previous note. Measured on the user's track: 7 of 7 short
+                    // onset-bearing notes are of exactly this shape (`man` `your` `thing`×2 `share` …),
+                    // and the user named three of them by ear.
+                    // The predicate is the forward twin of `nucleus_continues` (S92b): the NEXT event is
+                    // a sustain re-emitting this note's nucleus. A genuine fast run — か し た, separate
+                    // syllables — never satisfies it, so S84's ear-validated regime is untouched.
+                    let nucleus_held_by_next = nuc < ph.len()
+                        && resolved.get(k + 1).is_some_and(|r| {
+                            r.is_sustain
+                                && matches!(&r.kind, g2p::ResolvedKind::Phones(np) if np.first() == Some(&ph[nuc]))
+                        });
                     let target = |p: &'static str| {
                         let t = onset_target_frames(p, fr);
-                        if fr <= 5 {
+                        if fr <= 5 && !nucleus_held_by_next {
                             t.min(2)
                         } else {
                             t
