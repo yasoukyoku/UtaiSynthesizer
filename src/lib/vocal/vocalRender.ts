@@ -621,8 +621,13 @@ export const G2P_ALGO_VERSION = "s90";
  *  before/after — n_coda ≥ 2 cannot occur in zh/ja/UTAU-alias material), so for those projects the
  *  re-render is wasted work rather than a change. Bumping anyway follows the user's S89 ruling:
  *  "re-running an existing bake is no big deal; triggering a re-render where nothing should have
- *  changed is the bug" — a per-language token would be the distortion, not the protection. */
-export const SCORE_TIMING_VERSION = "s92";
+ *  changed is the bug" — a per-language token would be the distortion, not the protection.
+ *  s92b = the same round's second cut: a HELD nucleus (a `+` hold re-emitting its vowel, with the word's
+ *  final coda deferred onto it) may fall to 2 frames so that coda can exist at all. The user's `even`
+ *  lost its /n/ in both choruses on a 4-frame hold, where 2/5 of the note is ONE frame. Bumped again
+ *  rather than reusing s92: allocation changed a second time, and a bake taken between the two commits
+ *  would otherwise be considered current. */
+export const SCORE_TIMING_VERSION = "s92b";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

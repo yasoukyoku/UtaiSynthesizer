@@ -457,6 +457,14 @@ struct NoteBudget {
     note_frames: i64,
     /// Frames this pass may actually distribute (nucleus remainder included).
     spendable: i64,
+    /// S92b: this note STARTS with its nucleus and that nucleus is the very phone the previous note
+    /// ended on — i.e. the vowel is not being attacked here, it is being HELD (the western span's
+    /// `+` hold re-emitting its syllable's nucleus, with the word-final coda deferred onto it).
+    /// It is the one case where leaving the nucleus at `CODA_MIN_FRAMES` is safe: those 2 frames
+    /// continue a vowel the model has already been singing, so they are not the 2-frame ATTACK S84
+    /// measured as the collapse region. A fresh syllable (ja かん, any onset-bearing note) can never
+    /// satisfy it, which is what keeps zh/ja out of this branch by construction.
+    nucleus_continues: bool,
 }
 
 /// In-note allocation for one note's phones: medial + coda get bounded shares, the nucleus takes the
@@ -465,7 +473,7 @@ struct NoteBudget {
 /// per-phone durations aligned to `ph`; entries may be 0 (dropped medial/coda / unfunded onset) — the
 /// caller skips 0-duration phones at emission. Σ(durs) ≤ b.spendable always.
 fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: usize) -> Vec<i64> {
-    let NoteBudget { note_frames, spendable: fr } = b;
+    let NoteBudget { note_frames, spendable: fr, nucleus_continues } = b;
     let n = ph.len();
     let mut durs = vec![0i64; n];
     let n_coda = n - nuc - 1;
@@ -520,8 +528,14 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
     // needs its own ear test. See project_v2_pending_cleanups.
     if n_coda > 0 {
         let want: i64 = ph[nuc + 1..].iter().map(|p| coda_target_frames(p, note_frames)).sum();
-        let cluster_floor = if n_coda >= 2 {
-            (n_coda as i64 * CODA_MIN_FRAMES).min((fr - NUCLEUS_KEEP_MIN).max(0))
+        // S92b: a HELD nucleus (see `NoteBudget::nucleus_continues`) may fall to CODA_MIN_FRAMES,
+        // because those frames continue a vowel already in flight rather than attacking a new one —
+        // and it earns the floor at n_coda == 1 too. That single case is the whole reason the user's
+        // `even` sang without its /n/: the word's deferred word-final coda lands on a 4-frame hold,
+        // where 2/5 of the note is ONE frame, so no coda could exist there at any target.
+        let keep = if nucleus_continues { CODA_MIN_FRAMES } else { NUCLEUS_KEEP_MIN };
+        let cluster_floor = if n_coda >= 2 || nucleus_continues {
+            (n_coda as i64 * CODA_MIN_FRAMES).min((fr - keep).max(0))
         } else {
             0
         };
@@ -960,8 +974,17 @@ fn assemble_arrays(
                     }
                     // Auto: reserved == 0 ⇒ `spendable == note_frames` and every onset slot is 0,
                     // which is exactly what this call produced before the switch existed.
-                    let mut durs =
-                        allocate_in_note(ph, NoteBudget { note_frames: fr, spendable: fr - reserved }, onset_end, nuc);
+                    // S92b: "the vowel is being HELD, not attacked" — this note starts with its
+                    // nucleus AND that nucleus is the phone the previous note ended on. `nuc == 0`
+                    // is what makes it exact: any onset before the nucleus (か, `v ɪ`) breaks the
+                    // vowel's continuity, so those notes keep the full nucleus protection.
+                    let nucleus_continues = nuc == 0 && phon.last() == Some(&ph[0]);
+                    let mut durs = allocate_in_note(
+                        ph,
+                        NoteBudget { note_frames: fr, spendable: fr - reserved, nucleus_continues },
+                        onset_end,
+                        nuc,
+                    );
                     durs[..onset_end].copy_from_slice(&onset_durs[..onset_end]);
                     if onset_end > 0 && timing == ArticulationTiming::Auto {
                         // borrow the onset consonants' frames from the tail of the previous phone so
@@ -1700,6 +1723,30 @@ mod tests {
         assert_eq!(arr.phon, vec!["i", "z"]);
         assert_eq!(arr.phone_dur, vec![3, 2]);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 5, "frame-conserving even when a phone drops");
+    }
+
+    /// ★S92b — the user's `even`. The word is spread over three notes, so `resolve_west_span` defers the
+    /// word-final /n/ onto the LAST one, which the author wrote as a 4-frame (80 ms) hold: the note's
+    /// whole content is [re-emitted ɪ, deferred n]. 2/5 of 4 frames is ONE, so no coda could exist there
+    /// at any target and the word sang "even" without its n — in both choruses.
+    /// Held nucleus ⇒ keep = CODA_MIN_FRAMES and the floor applies at n_coda == 1:
+    /// ceiling = max(4*2/5, min(2, 4-2)) = 2 ⇒ n takes 2, the held ɪ keeps 2.
+    /// The SECOND half of this test is the discriminator: the identical 4-frame [ɪ n] note preceded by a
+    /// DIFFERENT vowel is not a continuation, so it keeps the pre-S92b behaviour (n dropped). Same note,
+    /// same length, different history — that is what proves the predicate is doing the work, and it is
+    /// also why ja/zh cannot enter this branch (a fresh syllable never continues the previous phone).
+    #[test]
+    fn s92b_held_nucleus_lets_the_deferred_coda_exist() {
+        let held = build_arrays_daw(
+            &[raw("v ɪ", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(held.phon, vec!["v", "ɪ", "ɪ", "n"], "the deferred word-final n must survive");
+        assert_eq!(held.phone_dur, vec![2, 10, 2, 2]);
+        assert_eq!(held.phone_dur.iter().sum::<i64>(), 16, "frame-conserving");
+
+        let fresh = build_arrays_daw(
+            &[raw("a", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(fresh.phon, vec!["a", "ɪ"], "a FRESH vowel keeps the full nucleus protection");
+        assert_eq!(fresh.phone_dur, vec![12, 4]);
     }
 
     /// Property sweep over note length for a cluster — three invariants, and the FIRST version of this
