@@ -638,7 +638,12 @@ export const G2P_ALGO_VERSION = "s90";
  *  "时序有点怪". From depth 2 a vowel lender keeps NUCLEUS_KEEP_MIN, because the shipped half-clamp's
  *  floor is the S84 collapse region and the deeper walk was measured taking don't's vowel to 2 frames.
  *  zh/ja walk depth 1 = byte-identical to the shipped rule. */
-export const SCORE_TIMING_VERSION = "s92d";
+/*  s92e = the two onset mechanisms STACKED, with the walk-back bounded: it may not reach past the note
+ *  it is already restructuring, and from depth 2 only a VOWEL lends (draining a preceding consonant ate
+ *  whisper's /w/ back down from 4 frames to 2 — the cascade returning through the other end). The
+ *  in-note supplement then covers only what the walk-back could not. Result on the user's track:
+ *  onsets <=2 frames 42%% -> 5.8%%, collapse-region vowels back to the pre-S92 count of 3. */
+export const SCORE_TIMING_VERSION = "s92e";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

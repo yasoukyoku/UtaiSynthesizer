@@ -1034,10 +1034,19 @@ fn assemble_arrays(
                         let mut left = 0i64;
                         let mut j = pdur.len();
                         let mut depth = 0usize;
+                        let prev_evt = pevt.last().copied();
                         while left < want && j > 0 && depth < depth_limit {
                             j -= 1;
                             depth += 1;
                             let is_rest = matches!(phon[j], "SP" | "AP");
+                            // ★Stay inside the note we are ALREADY restructuring (a rest is silence and may
+                            // always lend). Reaching two notes back would shift a whole intervening note
+                            // earlier — the very timing displacement this round exists to remove. Measured:
+                            // without this bound, note 45's `s p` cluster reached past `whisper` into the
+                            // note before it and moved 5 frames across two boundaries.
+                            if depth > 1 && !is_rest && pevt.get(j).copied() != prev_evt {
+                                break;
+                            }
                             let d = pdur[j];
                             // UTAU-style auto-scale, structural half: a SUNG lender never loses more than
                             // half its frames (ceil) — in a fast run the previous vowel must stay audible.
@@ -1047,15 +1056,20 @@ fn assemble_arrays(
                             // to exactly 2 frames — so from depth 2 on, a VOWEL lender keeps
                             // NUCLEUS_KEEP_MIN. Depth 1 is left byte-for-byte as shipped (that is what
                             // makes zh/ja identical and every pre-S92 English note identical too).
-                            let floor = if depth > 1 && is_nucleus_phone(phon[j]) {
-                                NUCLEUS_KEEP_MIN
-                            } else {
-                                SUNG_KEEP_MIN
-                            };
+                            // ★At depth ≥ 2 only a VOWEL lends. Draining a preceding CONSONANT would undo
+                            // the very fix this round makes for it — measured: note 45's `s p` cluster ate
+                            // `whisper`'s /w/ back down from 4 frames to 2, i.e. the cascade re-appearing
+                            // through the other end of the borrow.
                             let cap_j = if is_rest {
                                 (d - REST_KEEP_MIN).max(0)
+                            } else if depth == 1 {
+                                // depth 1 = the shipped rule, byte-for-byte (zh/ja and every pre-S92
+                                // English note depend on it).
+                                (d - SUNG_KEEP_MIN).max(0).min((d + 1) / 2)
+                            } else if is_nucleus_phone(phon[j]) {
+                                (d - NUCLEUS_KEEP_MIN).max(0).min((d + 1) / 2)
                             } else {
-                                (d - floor).max(0).min((d + 1) / 2)
+                                0
                             };
                             let take = (want - left).min(cap_j);
                             if take > 0 {
@@ -1894,9 +1908,13 @@ mod tests {
     /// score start: floor pass 2 (nucleus 11), then the target pass — cap (20-2).min(10) = 10, 2 already
     /// used ⇒ allow 8, m's long-bucket target 5 ⇒ m 5, nucleus 8. A = [m5, aɪ8, n2, d2]… wait: n and d
     /// then LEND to B below, which is the whole point.
-    /// Note B `S IY1`@16: s's target is 7. The immediate lender d:3 can give (3-2).min(2) = 1; walking
-    /// back n:4 gives (4-2).min(2) = 2; aɪ:8 gives (8-2).min(4) = 4 ⇒ 1+2+4 = 7 = want, all of it from
-    /// BEFORE the note ⇒ **i keeps all 16 frames** and s gets its full target.
+    /// Note B `S IY1`@16: s's target is 7, and the two mechanisms STACK (the user asked for exactly that).
+    /// Walk-back first: the immediate lender d:3 gives (3-2).min(2) = 1 (depth 1 = the shipped rule); n:4
+    /// is a CONSONANT at depth 2 so it gives NOTHING (draining it would undo its own fix); aɪ:8 is a vowel
+    /// in the same note ⇒ (8-NUCLEUS_KEEP_MIN).min(4) = 4. That is 5 of the 7, all from BEFORE the note.
+    /// The in-note supplement then covers the last 2 out of B's own nucleus ⇒ s 7, i 14.
+    /// So the vowel gives up only what the walk-back could not supply — 2 frames instead of S92c's 5 —
+    /// and `n` keeps its 4 frames instead of being eaten back down to 2.
     #[test]
     fn s92d_walk_back_borrow_keeps_the_vowel_on_the_beat() {
         let d = en_dicts();
@@ -1906,8 +1924,10 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
-        assert_eq!(a.phone_dur, vec![5, 4, 2, 2, 7, 16]);
-        assert_eq!(*a.phone_dur.last().unwrap(), 16, "★the vowel keeps ALL its frames — on the beat");
+        assert_eq!(a.phone_dur, vec![5, 4, 4, 2, 7, 14]);
+        assert_eq!(a.phone_dur[4], 7, "★the onset still reaches its measured target");
+        assert_eq!(a.phone_dur[2], 4, "★a preceding CONSONANT is not drained back down (its own fix holds)");
+        assert!(a.phone_dur[5] >= 14, "★the vowel only gives up what the walk-back could not supply");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 36, "frame-conserving across the walk-back");
 
         // ja walks depth 1 = the pre-S92d single-phone rule, bit-identical: only d:3 can lend (1 frame),
