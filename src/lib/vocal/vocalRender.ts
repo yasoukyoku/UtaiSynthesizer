@@ -643,7 +643,14 @@ export const G2P_ALGO_VERSION = "s90";
  *  whisper's /w/ back down from 4 frames to 2 — the cascade returning through the other end). The
  *  in-note supplement then covers only what the walk-back could not. Result on the user's track:
  *  onsets <=2 frames 42%% -> 5.8%%, collapse-region vowels back to the pre-S92 count of 3. */
-export const SCORE_TIMING_VERSION = "s92e";
+/*  s92f = the word-final consonant gets the cv-domain oversampling the vowel-clarity knife already did
+ *  for short nuclei (S84 E 刀), for consonant-chaining languages only. The other two knives structurally
+ *  cannot help a coda: they skip codas by design AND only fire on VOICELESS phones, while the sounds the
+ *  user named (ear's r, feel's l, breathe's dh) are voiced. Measured on the user's track: the codas that
+ *  rendered 12-20 dB below their own vowel came up by +5 to +17 dB (13 such codas -> 9).
+ *  ⚠ This token is the score-render invalidation carrier, not strictly "timing" (S88 set that
+ *  precedent by carrying a Rust-side fix through it). */
+export const SCORE_TIMING_VERSION = "s92f";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

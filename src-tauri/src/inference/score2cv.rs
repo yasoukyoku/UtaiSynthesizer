@@ -407,6 +407,16 @@ const CODA_TARGET_FALLBACK: i64 = 4;
 /// the alternative was measured: applied unconditionally it turns 6 ja-material tests red, one of them
 /// by pushing し's vowel off the beat. zh/ja do not move until they get their own ear test.
 fn onset_may_reach_target(lang: g2p::Lang) -> bool {
+    consonant_chaining_language(lang)
+}
+
+/// The languages whose syllables CHAIN consonants — a word can end in one, and an onset can be preceded
+/// by one. zh finals are atomic vocab tokens (`wang` = [w, ɑŋ], no coda at all) and ja is CV with at most
+/// a moraic nasal, so for those two the pre-roll borrow reaches its target and a "coda" barely exists;
+/// their fast-run allocation and their word endings are ear-verified (S84/S89) and do not move without
+/// their own ear test. ONE predicate, two consumers (the onset supplement + the coda clarity pass) — the
+/// language split must not drift between them.
+fn consonant_chaining_language(lang: g2p::Lang) -> bool {
     !matches!(lang, g2p::Lang::Zh | g2p::Lang::Ja)
 }
 
@@ -1302,14 +1312,29 @@ fn clarity_inflated_durs(
     note_pitch: &[i64],
     phone_dur: &[i64],
     evt: &[usize],
+    coda_too: bool,
 ) -> Option<Vec<i64>> {
     let mut durs = phone_dur.to_vec();
     let mut any = false;
     for i in 0..phon.len() {
-        let final_nucleus_of_event = is_nucleus_phone(phon[i])
-            && !(i + 1..phon.len()).any(|j| evt[j] == evt[i] && is_nucleus_phone(phon[j]));
+        let last_nuc = (0..phon.len())
+            .filter(|&j| evt[j] == evt[i] && is_nucleus_phone(phon[j]))
+            .next_back();
+        let final_nucleus_of_event = is_nucleus_phone(phon[i]) && last_nuc == Some(i);
+        // ★S92f: a word-final CONSONANT gets the same cv-domain treatment. The user's report was
+        // "I can hear the th trying to close but it is faint" — and measurement agreed: the phone is
+        // allocated, but 16 of 117 codas render 12-20 dB below their own vowel (`ð` −19.7, `ɹ` −19.0,
+        // `l` −17.5). A 2-4 frame coda is exactly the OOD duration this knife was invented for: the
+        // model sees an in-distribution phone, produces well-formed content, and it is resampled back.
+        // ⚠ The other two knives (voiceless emphasis, closure valley) cannot help these at all: they
+        // skip codas by design (词尾顿挫 guard) AND they only ever fire on VOICELESS phones, while the
+        // three the user named — ɹ, l, ð — are all voiced. This is the only one of the three that can.
+        let short_coda = coda_too
+            && !is_nucleus_phone(phon[i])
+            && matches!(last_nuc, Some(n) if i > n)
+            && !matches!(phon[i], "SP" | "AP");
         if note_pitch[i] > 0
-            && final_nucleus_of_event
+            && (final_nucleus_of_event || short_coda)
             && (1..=VOWEL_CLARITY_MAX_DUR).contains(&phone_dur[i])
         {
             durs[i] = VOWEL_CLARITY_INFLATE.max(phone_dur[i]);
@@ -1358,7 +1383,13 @@ pub fn run_score2cv_vowel_clarity(
     speaker_id: i64,
     lang_id: i64,
 ) -> Result<Array2<f32>> {
-    let Some(pd_inf) = clarity_inflated_durs(phon, &chunk.note_pitch, &chunk.phone_dur, evt) else {
+    // S92f: the coda arm only applies where a word-final consonant exists as a phonological category —
+    // the chunk is single-language by construction (`chunk_at_sp` cuts at every language change), so one
+    // scalar answers it for the whole call.
+    let coda_too = g2p::Lang::from_id(chunk.lang_id).is_some_and(consonant_chaining_language);
+    let Some(pd_inf) =
+        clarity_inflated_durs(phon, &chunk.note_pitch, &chunk.phone_dur, evt, coda_too)
+    else {
         return run_score2cv(engine, session_id, chunk, dim, speaker_id, lang_id);
     };
     let t_inf: usize = pd_inf.iter().map(|&d| d.max(0) as usize).sum();
@@ -1633,21 +1664,38 @@ mod tests {
         let evt = vec![0usize, 1, 1, 2];
         // evt1's final nucleus (3fr) inflates; evt2's long one (12) doesn't; consonants never do.
         let durs = vec![10i64, 2, 3, 12];
-        let plan = clarity_inflated_durs(&phon, &pitch, &durs, &evt).expect("one short nucleus qualifies");
+        let plan = clarity_inflated_durs(&phon, &pitch, &durs, &evt, false).expect("one short nucleus qualifies");
         assert_eq!(plan, vec![10, 2, 6, 12]);
         // nothing qualifies → None (rest-only / long-only scores take the plain path).
-        assert!(clarity_inflated_durs(&phon, &pitch, &[10, 2, 12, 12], &evt).is_none());
+        assert!(clarity_inflated_durs(&phon, &pitch, &[10, 2, 12, 12], &evt, false).is_none());
         // MEDIAL vowel exclusion (refined-shape on ONE event): the ə (short, medial) must NOT
         // inflate — only the final nucleus aɪ qualifies (here long → whole plan is None).
         let phon2: Vec<&'static str> = vec!["ɹ", "ə", "f", "aɪ"];
         let evt2 = vec![0usize, 0, 0, 0];
         assert!(
-            clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 12], &evt2).is_none(),
+            clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 12], &evt2, false).is_none(),
             "medial ə never inflates (unvalidated slow-note scope, S84 review)"
         );
         // …and when the final nucleus IS short, it inflates while the medial still doesn't.
-        let plan2 = clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 4], &evt2).unwrap();
+        let plan2 = clarity_inflated_durs(&phon2, &[60; 4], &[2, 3, 2, 4], &evt2, false).unwrap();
         assert_eq!(plan2, vec![2, 3, 2, 6]);
+        // ★S92f: the CODA arm. `light` = [l aɪ t] on one event with a 3-frame /t/: with `coda_too` the
+        // t inflates like a short nucleus would, so ScoreToCV sees an in-distribution consonant instead
+        // of a 60 ms smear (the user: "I can hear the th trying to close but it is faint"; measured
+        // −12..−20 dB vs the vowel on 16 of 117 codas). The vowel arm is unchanged — aɪ is long here.
+        let phon3: Vec<&'static str> = vec!["l", "aɪ", "t"];
+        let evt3 = vec![0usize, 0, 0];
+        assert!(
+            clarity_inflated_durs(&phon3, &[60; 3], &[3, 12, 3], &evt3, false).is_none(),
+            "zh/ja arm: a coda never inflates (词尾顿挫 guard stays for CV languages)"
+        );
+        let coda = clarity_inflated_durs(&phon3, &[60; 3], &[3, 12, 3], &evt3, true).unwrap();
+        assert_eq!(coda, vec![3, 12, 6], "the word-final /t/ inflates; the ONSET /l/ never does");
+        // a coda that is already long stays put, and a rest is not a coda
+        assert!(clarity_inflated_durs(&phon3, &[60; 3], &[3, 12, 9], &evt3, true).is_none());
+        let with_rest: Vec<&'static str> = vec!["l", "aɪ", "t", "SP"];
+        let plan_r = clarity_inflated_durs(&with_rest, &[60, 60, 60, 0], &[3, 12, 3, 4], &[0, 0, 0, 1], true).unwrap();
+        assert_eq!(plan_r, vec![3, 12, 6, 4], "the SP is untouched (pitch 0 and not a coda)");
         // resample: a 6-row phone down to 2 rows samples centers {1.5→1, 4.5→4}; identity spans
         // (pd_true == pd_inf) map 1:1.
         let mut cv = Array2::<f32>::zeros((8, 1));
