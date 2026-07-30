@@ -182,6 +182,26 @@ fn mg_preroll_tag() -> &'static str {
     }
 }
 
+/// The production ScoreToCV conditioning speaker. Mirrors `VocalRenderOptions::default().cv_speaker_id`
+/// (commands/inference.rs) and the frontend `DEFAULT_VOCAL_PARAMS.speakerId`; the sidecar also carries it
+/// as `default_speaker_id`. 49 = `kiritan` in the training speaker table — a JAPANESE singer.
+const MG_CVSPK_PRODUCTION: i64 = 49;
+
+/// S92 (5d 「非日语轨的日本味」) probe switch: `UTAI_MG_CVSPK=<0..76>` overrides the **ScoreToCV
+/// conditioning speaker** — NOT the SVC voice's speaker (the voicebank is untouched, only the content
+/// features change). The English singers in the training table are 32/33/34 = gt_EN-Alto-1/Alto-2/Tenor-1.
+/// ONE reader (same posture as `mg_timing_env`), so the render arms and the filename tag can never
+/// disagree about which speaker was actually fed.
+fn mg_cvspk_env() -> i64 {
+    std::env::var("UTAI_MG_CVSPK").ok().and_then(|s| s.parse().ok()).unwrap_or(MG_CVSPK_PRODUCTION)
+}
+
+/// Filename marker for a non-production cv speaker — without it two arms of the A/B overwrite each
+/// other and you end up comparing a file with itself (S91: that exact trap cost a round).
+fn mg_cvspk_tag(spk: i64) -> String {
+    if spk == MG_CVSPK_PRODUCTION { String::new() } else { format!("_cvspk{spk}") }
+}
+
 /// cvfix 臂的探针侧逆变换(⚠与生产整段臂的唯一口径偏差:生产 inverse 在 peak-norm 之前,
 /// 这里渲染已 norm 完才逆变换——电平语义微差,听感对比无碍,记档)。fed=移调后 note_hz
 /// (生产整形三连同款)。
@@ -292,6 +312,200 @@ fn mg_lane_dump() {
     );
 }
 
+/// S92 (5d 「非日语轨的日本味」) 的**数值前置件**:同一份乐谱数组喂 ScoreToCV,在
+/// (speaker_id, lang_id) 网格上比较 cv 输出。它回答的只有「这条条件轴活着吗、有多大、差异落在
+/// 元音还是辅音上」——**不回答「哪个更好」**(cv 域一切度量与耳朵解耦=度量坟场铁律,好坏只能耳测)。
+///
+/// ★测量底噪 = 恒 0:ScoreToCV 是确定性的 ⇒ 「基线组合再跑一遍」必须逐位相同,本测试把这条钉成
+/// 断言(S86「同参双渲噪声底」的 cv 域版本)。没有这条,任何差值都可能只是噪声。
+///
+/// 生产口径 = speaker 恒 `MG_CVSPK_PRODUCTION`(49=kiritan,日语歌手)+ lang 逐 chunk 真喂;训练 manifest
+/// 里 speaker→language 是个函数(每个 speaker 只唱一种语言)⇒ (49, en) 这个组合训练里一次都没出现过。
+///
+/// ★S92 实测结论(推翻了 S90 记的两条预期,别再照那个预期设计实验):①**speaker 空间没有「语言级」的
+/// 大跳** —— 49→32 的位移(rel_rms .087)与「两个英语歌手之间」(32↔33 = .075)基本一样大;②**lang 不是
+/// 死输入** —— 只换 lang(en→ja)也有 .081。这台仪器的产物是量级,不是好坏:cv 域一切度量与耳朵解耦。
+///
+/// Run(整曲,不切片;CPU EP):
+///   $env:UTAI_MG_SCORE='<score.json>'; $env:UTAI_MG_OUTTAG='<tag>'
+///   cargo test --lib inference::score2svc::mg_tests::mg_cv_cond_grid -- --ignored --nocapture
+#[test]
+#[ignore]
+fn mg_cv_cond_grid() {
+    let sj = load_score();
+    let evts = to_evts(&sj.triples);
+    let arr = build_arrays_daw(&evts, &super::g2p::GlobalDicts, mg_timing_env()).unwrap();
+    let chunks = chunk_at_sp(&arr, 400);
+    let total_t: usize = arr.phone_dur.iter().map(|&d| d.max(0) as usize).sum();
+    let langs: Vec<i64> = {
+        let mut v = arr.lang.clone();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+
+    // per-frame phone class, so a delta can be split by WHERE it lands (accent lives in the
+    // consonants + vowel quality, not in the silence): 0 = SP/AP, 1 = nucleus (vowel), 2 = consonant.
+    let mut cls: Vec<u8> = Vec::with_capacity(total_t);
+    for i in 0..arr.phon.len() {
+        let d = arr.phone_dur[i].max(0) as usize;
+        let c = match arr.phon[i] {
+            "SP" | "AP" => 0u8,
+            p if is_nucleus_phone(p) => 1,
+            _ => 2,
+        };
+        cls.extend(std::iter::repeat(c).take(d));
+    }
+    assert_eq!(cls.len(), total_t, "frame class map vs Σ phone_dur");
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dll = root.join("../runtime/ort/onnxruntime.dll");
+    assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+    if let Ok(bld) = ort::init_from(&dll) {
+        let _ = bld.commit();
+    }
+    let engine = OnnxEngine::new();
+    engine.set_device(DeviceConfig::Cpu); // deterministic + no GPU setup in a test
+    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+    let s2cv = engine.load_model_with(&aux.join("score2cv_768.onnx"), false).unwrap();
+    const DIM: usize = 768;
+
+    // one arm = (speaker, optional lang override). `None` = every chunk keeps its OWN language = production.
+    let run = |spk: i64, lang: Option<i64>| -> Vec<f32> {
+        let mut out: Vec<f32> = Vec::with_capacity(total_t * DIM);
+        for c in &chunks {
+            let cv = run_score2cv(&engine, &s2cv, c, DIM, spk, lang.unwrap_or(c.lang_id)).unwrap();
+            out.extend(cv.iter().copied());
+        }
+        assert_eq!(out.len(), total_t * DIM, "cv rows vs Σ phone_dur");
+        out
+    };
+
+    // speaker ids ← the training table (Much-Better-S2H/processed/speakers.json).
+    let arms: Vec<(&str, i64, Option<i64>)> = vec![
+        ("PROD_49_kiritan_ja", 49, None),
+        ("REPEAT_49_kiritan_ja", 49, None), // determinism floor — must be bit-identical to PROD
+        ("EN_32_gt_EN-Alto-1", 32, None),
+        ("EN_33_gt_EN-Alto-2", 33, None),
+        ("EN_34_gt_EN-Tenor-1", 34, None),
+        ("JA_42_gt_JA-Soprano-1", 42, None),
+        ("JA_48_itako", 48, None),
+        ("ZH_50_m4_Alto-1", 50, None),
+        ("ZH_75_gt_ZH-Alto-1", 75, None),
+        ("LANGONLY_49_ja", 49, Some(2)),
+        ("LANGONLY_49_zh", 49, Some(0)),
+        ("LANGONLY_49_en", 49, Some(1)),
+    ];
+    let t0 = Instant::now();
+    let data: Vec<Vec<f32>> = arms
+        .iter()
+        .map(|&(n, s, l)| {
+            eprintln!("[mg-cv] arm {n}: speaker_id={s} lang_id={l:?}");
+            run(s, l)
+        })
+        .collect();
+    let floor = data[0].iter().zip(&data[1]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert_eq!(floor, 0.0, "ScoreToCV must be deterministic (measurement floor)");
+
+    // relative RMS distance = RMS(Δ) / RMS(reference), per frame class, plus the mean per-frame cosine
+    // (direction change) and max |Δ|. RMS-relative because cv is de-normalized (raw ContentVec scale).
+    let stat = |a: &[f32], b: &[f32]| -> serde_json::Value {
+        let mut sq = [0f64; 3];
+        let mut ref_sq = [0f64; 3];
+        let mut n = [0usize; 3];
+        let (mut cos_sum, mut cos_n, mut maxabs) = (0f64, 0usize, 0f64);
+        for t in 0..total_t {
+            let c = cls[t] as usize;
+            let (ra, rb) = (&a[t * DIM..(t + 1) * DIM], &b[t * DIM..(t + 1) * DIM]);
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for k in 0..DIM {
+                let (x, y) = (ra[k] as f64, rb[k] as f64);
+                let d = y - x;
+                sq[c] += d * d;
+                ref_sq[c] += x * x;
+                maxabs = maxabs.max(d.abs());
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            n[c] += 1;
+            if na > 0.0 && nb > 0.0 {
+                cos_sum += dot / (na.sqrt() * nb.sqrt());
+                cos_n += 1;
+            }
+        }
+        let rel = |ks: &[usize]| -> f64 {
+            let (d, r) = ks.iter().fold((0.0f64, 0.0f64), |acc, &c| (acc.0 + sq[c], acc.1 + ref_sq[c]));
+            if r > 0.0 { (d / r).sqrt() } else { f64::NAN }
+        };
+        serde_json::json!({
+            "rel_rms_all": rel(&[0, 1, 2]), "rel_rms_vowel": rel(&[1]),
+            "rel_rms_consonant": rel(&[2]), "rel_rms_silence": rel(&[0]),
+            "mean_frame_cosine": if cos_n > 0 { cos_sum / cos_n as f64 } else { f64::NAN },
+            "max_abs_delta": maxabs,
+            "frames": { "silence": n[0], "vowel": n[1], "consonant": n[2] },
+        })
+    };
+
+    // every arm against the production baseline …
+    let vs_prod: Vec<serde_json::Value> = (1..arms.len())
+        .map(|i| {
+            let s = stat(&data[0], &data[i]);
+            eprintln!(
+                "[mg-cv] {:<24} vs PROD: rel_rms all={:.4} vowel={:.4} cons={:.4}  cos={:.5}",
+                arms[i].0,
+                s["rel_rms_all"].as_f64().unwrap_or(f64::NAN),
+                s["rel_rms_vowel"].as_f64().unwrap_or(f64::NAN),
+                s["rel_rms_consonant"].as_f64().unwrap_or(f64::NAN),
+                s["mean_frame_cosine"].as_f64().unwrap_or(f64::NAN),
+            );
+            serde_json::json!({ "arm": arms[i].0, "speaker_id": arms[i].1, "lang_override": arms[i].2, "stats": s })
+        })
+        .collect();
+    // … plus the calibration pairs: how far apart are two speakers of the SAME language? That is the
+    // yardstick the (49 vs 32) number has to be read against.
+    let pairs: [(usize, usize); 6] = [(2, 3), (2, 4), (3, 4), (5, 6), (7, 8), (2, 5)];
+    let calib: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|&(i, j)| {
+            let s = stat(&data[i], &data[j]);
+            eprintln!(
+                "[mg-cv] CALIB {:<22} vs {:<22} rel_rms all={:.4} cos={:.5}",
+                arms[i].0,
+                arms[j].0,
+                s["rel_rms_all"].as_f64().unwrap_or(f64::NAN),
+                s["mean_frame_cosine"].as_f64().unwrap_or(f64::NAN),
+            );
+            serde_json::json!({ "a": arms[i].0, "b": arms[j].0, "stats": s })
+        })
+        .collect();
+
+    let outtag = std::env::var("UTAI_MG_OUTTAG").map(|t| format!("_{t}")).unwrap_or_default();
+    let out = Path::new(WORK).join("probe").join(format!("mg_cv_cond_grid{outtag}.json"));
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "score": std::env::var("UTAI_MG_SCORE").unwrap_or_else(|_| "<default mg_score.json>".into()),
+            "phoneme_set": format!("{:?}", mg_phoneme_set()),
+            "timing": format!("{:?}", mg_timing_env()),
+            "notes": sj.triples.len(), "phones": arr.phon.len(), "frames": total_t,
+            "chunks": chunks.len(), "langs_present": langs,
+            "determinism_floor_max_abs": floor,
+            "vs_production": vs_prod, "calibration_pairs": calib,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "[mg-cv] {} arms x {} frames in {:.1}s -> {}",
+        arms.len(),
+        total_t,
+        t0.elapsed().as_secs_f64(),
+        out.display()
+    );
+}
+
 #[test]
 #[ignore]
 fn mg_render_rvc() {
@@ -391,8 +605,9 @@ fn mg_render_rvc() {
     let no_cancel = || false;
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
+    let cvspk = mg_cvspk_env();
     let r = render_score_rvc(
-        &m, &s2cv768, &evts, 768, 49, &super::g2p::GlobalDicts, &ropts,
+        &m, &s2cv768, &evts, 768, cvspk, &super::g2p::GlobalDicts, &ropts,
         ScoreShaping {
             consonant_emphasis_db: emph,
             consonant_valley_scale: valley,
@@ -422,7 +637,8 @@ fn mg_render_rvc() {
         if valley != DEFAULT_CONSONANT_VALLEY_SCALE { format!("_v{valley}") } else { String::new() },
         if !clarity { "_nc" } else { "" },
         mg_shift_tag(shift, inverse, kappa),
-    ) + mg_preroll_tag();
+    ) + mg_preroll_tag()
+        + &mg_cvspk_tag(cvspk);
     // S86: `UTAI_MG_OUTTAG` keeps two arms of the same score from overwriting each other.
     let outtag = std::env::var("UTAI_MG_OUTTAG").map(|t| format!("_{t}")).unwrap_or_default();
     let name = format!("mg_render_{a}_{b}_{mtag}{tag}{outtag}.wav");
@@ -564,8 +780,9 @@ fn mg_render_sovits() {
     let no_cancel = || false;
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
+    let cvspk = mg_cvspk_env();
     let r = render_score_sovits(
-        &m, &s2cv, &evts, dim, 49, &super::g2p::GlobalDicts, &sopts,
+        &m, &s2cv, &evts, dim, cvspk, &super::g2p::GlobalDicts, &sopts,
         crate::commands::inference::VOCAL_FLAT_VOL,
         ScoreShaping {
             consonant_emphasis_db: emph,
@@ -589,9 +806,10 @@ fn mg_render_sovits() {
         String::new()
     };
     let name = format!(
-        "mg_render_{a}_{b}_{mtag}{}{ftag}{}.wav",
+        "mg_render_{a}_{b}_{mtag}{}{ftag}{}{}.wav",
         mg_shift_tag(shift, inverse, kappa),
-        mg_preroll_tag()
+        mg_preroll_tag(),
+        mg_cvspk_tag(cvspk)
     );
     write_wav16(&out_dir.join(&name), &audio, r.sample_rate);
     eprintln!(
