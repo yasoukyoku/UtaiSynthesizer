@@ -880,13 +880,16 @@ mod selfcheck {
             f.target_measured > f.target_effective,
             "{}: 先验 {} 必须严格大于 effective {}", f.phone, f.target_measured, f.target_effective
         );
-        // ★判别器 —— 证明这条判据真在分流,而不是恒亮:同样的音素放在长音符上,`fr ≤ 5` 的封顶
-        // 不生效,POLICY_CAPPED 必须一条都没有。
-        let long = vec![en("TH IH1 NG", 20)];
-        let rep2 = audit_score(&long, &d, ArticulationTiming::Auto).unwrap();
+        // ★判别器 —— 证明这条判据真在分流,而不是恒亮:一个**分配器足额发得出**的音符上,
+        // POLICY_CAPPED 必须一条都没有。`t` 的 coda 目标只有 3 帧,长音符的预算绰绰有余。
+        // ⚠ 这里原本用 `TH IH1 NG`@20 当判别器,S92n 放开 coda 钳位后它**合法地**变红了:
+        //   `ŋ` 的先验涨到 10,而 `fr*2/5` 只发得出 8 ⇒ 那道预算第一次以 POLICY_CAPPED 现形。
+        //   那正是这条轴该干的事(它是「我们放弃了多少发音时长」的读数),所以换夹具、不放宽断言。
+        let uncapped = vec![en("AA1 T", 28)];
+        let rep2 = audit_score(&uncapped, &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(
             rep2.count(Kind::PolicyCapped), 0,
-            "长音符上没有策略封顶,却报了 ⇒ 判据恒亮:\n{}", rep2.render(10)
+            "预算发得出目标的音符却报了封顶 ⇒ 判据恒亮:\n{}", rep2.render(10)
         );
     }
 

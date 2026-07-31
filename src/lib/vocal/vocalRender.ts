@@ -669,7 +669,19 @@ export const G2P_ALGO_VERSION = "s90";
  *  frames identical at 595 on the user's track — the same demand is just spread over several lenders:
  *  vowels shortened by >25%% 42 -> 14, timeline displacement 540 -> 484 frames, collapse-region vowels
  *  3 -> 2 (the three UTAU-alias tracks 3 -> 0). zh/ja lane byte-identical (SHA256). */
-export const SCORE_TIMING_VERSION = "s92j";
+/*  s92n = the CODA duration target is no longer clamped at 7 frames (the onset clamp is untouched —
+ *  an onset borrows from its NEIGHBOUR, so raising it would re-open the vowel-gutting s92j just fixed).
+ *  The evidence is a new instrument: a score REVERSE-PROJECTED from 36 real English phrases the training
+ *  singers actually sang (403 notes, 31.8%% short-bucket vs this song's 4.4%%) — fed our allocator the
+ *  SAME notes and the SAME phones, all 11 notes carrying an /r/ coda came out at exactly 7 frames, i.e.
+ *  the clamp itself, while the singer gave 10-54 (d:3 o:6 r:54 against our d:3 o:55 r:7 — an r-coloured
+ *  syllable inverted). The regenerated table moves 18 rows, the ones that matter being r 7->16, R 7->17,
+ *  ng 7->10. Measured after: the /r/ coda gap to the singer 13.6 -> 9.3 frames, codas shorter than 60%%
+ *  of the singer 26%% -> 22%%. On the user's own song only FIVE notes move (all + sustains carrying an
+ *  r/ng coda: r +12 frames, ng +2, the vowels give up 14). zh/ja and all three UTAU-alias lanes are
+ *  byte-identical — not by a language gate but structurally (zh finals are atomic so n_coda=0, ja codas
+ *  are only the moraic nasal), which the lanes PROVE rather than the argument. */
+export const SCORE_TIMING_VERSION = "s92n";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

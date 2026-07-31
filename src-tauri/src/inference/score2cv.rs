@@ -775,8 +775,15 @@ mod nucleus_tests {
                 consonants += 1;
                 let (o, c, z) =
                     *prior.get(p).unwrap_or_else(|| panic!("consonant {p} missing a duration prior"));
-                for v in o.iter().chain(c.iter()) {
-                    assert!((2..=7).contains(v), "{p} prior out of window: {o:?}/{c:?}");
+                // ★S92n: onset 与 coda 的上限**不同**。onset 靠向邻居借帧,抬它等于加剧 S92j 刚修好的
+                // 「掏空邻居元音」,所以它仍钉在 7;coda 由音符自己的预算出(`fr*2/5` + 余量两道界),
+                // 抬它只会让词尾辅音回到真人时长。反投影实测:含 `ɹ` coda 的 11 个音符里,我们给的帧数
+                // **每一个都恰好是 7** = 这个钳位本身,而真人给 10-54 帧。
+                for v in o.iter() {
+                    assert!((2..=7).contains(v), "{p} ONSET prior out of window: {o:?}");
+                }
+                for v in c.iter() {
+                    assert!((2..=20).contains(v), "{p} CODA prior out of window: {c:?}");
                 }
                 if is_voiceless_phone(p) {
                     assert!(z.iter().all(|v| (1..=1000).contains(v)), "{p} zero-permille out of range: {z:?}");
@@ -2171,6 +2178,40 @@ mod tests {
             &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
+    }
+
+    /// ★S92n — the coda duration target is no longer clamped at 7 frames.
+    ///
+    /// 反投影对拍(36 个真人英语乐句 / 403 音符,`mg_truth_cmp`)给的是字面证据:含 `ɹ` coda 的
+    /// **11 个音符里,我们给 `ɹ` 的帧数每一个都恰好是 7** —— 那就是钳位本身,不是分配器的算术;
+    /// 真人给 10-54 帧(`d:3 ɔ:6 ɹ:54` vs 我们 `d:3 ɔ:55 ɹ:7`)。放开后 `ɹ` coda 长音桶 7→16。
+    ///
+    /// ⚠ **onset 的 7 没动**:onset 靠向邻居借帧,抬它等于加剧 S92j 刚修好的「掏空邻居元音」。
+    /// ⚠ zh/ja 之所以逐字节不变,**不是语言门,是结构**:zh 韵母是原子 token(n_coda=0),ja 的
+    /// coda 只有 `ɴ`/`ʔ` —— 变了的那些格子(`ɹ`/`ʁ`/`ŋ`/`tʃ`…)在它们的材料里从不出现在 coda 位置。
+    /// 这条由**逐字节泳道**证明,不由这段话证明。
+    #[test]
+    fn s92n_coda_target_is_no_longer_clamped_at_seven() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        // 先钉表本身:长音桶的 coda 目标必须真的超过旧上限,否则下面测的是空气。
+        assert!(coda_target_frames("ɹ", 28) > 7, "ɹ 的 coda 目标还被钳在 7 —— 表没重生成?");
+        assert_eq!(onset_target_frames("ɹ", 28), 7, "onset 的上限**不该**动");
+
+        // [i ɹ] @28:budget = min(want 16, 28-2-0, 28*2/5=11) = 11 ⇒ ɹ 11(旧值 7),核拿余量。
+        let a = build_arrays_daw(&[en("IY1 R", 28)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["i", "ɹ"]);
+        assert_eq!(a.phone_dur, vec![17, 11]);
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 28, "守恒");
+        // ★判别器:`fr*2/5` 那道预算仍然在管事 —— 目标 16 拿不满,拿到的是 11。
+        assert!(a.phone_dur[1] < coda_target_frames("ɹ", 28), "预算上限没生效?那是另一个 bug");
+
+        // ★不是所有辅音都跟着涨:`t` 的 coda 目标本来就低于旧钳位,一帧不该变。
+        let t = build_arrays_daw(&[en("AA1 T", 28)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(t.phone_dur, vec![25, 3], "t 的 coda 目标(3)与钳位无关,不该被这一刀带动");
     }
 
     /// ★S92j — the OTHER half of the same round, and the one that only showed up once the deep clamp was
