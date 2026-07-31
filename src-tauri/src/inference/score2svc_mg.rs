@@ -405,6 +405,123 @@ fn mg_audit() {
     eprintln!("[mg-audit] -> {}", out.display());
 }
 
+/// S92m 反投影对拍:**同一批音符、同一串音素 —— 真人给了几帧 / 我们给了几帧**,逐音素,零主观。
+///
+/// 用户手上没有真的快歌谱,而「我编一首」不能用来做听感判决。这条路绕开了那个问题:谱面是合成的,
+/// **真值是那位歌手本人的对齐结果**;它不判听感,只做**覆盖** —— 补上「短音符/快段」这块用户唯一
+/// 缺的取样面(反投影谱短音桶占 31.8%,用户那首歌只有 4.4%)。
+///
+/// ⚠**诚实边界**:①英语训练语料本身就不快(最快乐句的音符中位也才 7 帧),所以这是「我们能拿到的
+/// 最快的真人英语」,不是「真快歌」;②真人的音符分组里 20% 含多个音节,而我们的分配器把一个音符
+/// 内除末核外的一切都当 medial —— 那部分差异是**我们的设计**,不是对齐误差,读数时要分开看。
+///
+/// Run:
+///   $env:UTAI_MG_SCORE='<...>\gt_en_fast_score.json'; $env:UTAI_MG_TRUTH='<...>\gt_en_fast_truth.json'
+///   cargo test --lib inference::score2svc::mg_tests::mg_truth_cmp -- --ignored --nocapture
+#[test]
+#[ignore]
+fn mg_truth_cmp() {
+    use super::super::score2cv::audit;
+    let sj = load_score();
+    let evts = to_evts(&sj.triples);
+    let timing = mg_timing_env();
+    let arr = build_arrays_daw(&evts, &super::super::g2p::GlobalDicts, timing).unwrap();
+    let tp = std::env::var("UTAI_MG_TRUTH").expect("UTAI_MG_TRUTH=<truth.json>");
+    let tv: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&tp).unwrap()).unwrap();
+    let truth = tv["truth"].as_array().unwrap();
+    assert_eq!(truth.len(), sj.triples.len(), "真值与谱面的事件数不一致 —— 不是同一份反投影");
+
+    // 逐事件收集实发(与审计件同一条对齐规则:实发是期望的子序列)
+    let mut ours: Vec<Vec<(&'static str, i64)>> = vec![Vec::new(); sj.triples.len()];
+    for i in 0..arr.phon.len() {
+        if !matches!(arr.phon[i], "SP" | "AP") {
+            ours[arr.evt[i]].push((arr.phon[i], arr.phone_dur[i]));
+        }
+    }
+
+    // (position, 真人帧, 我们帧) —— position 走生产的 syllable_split,不另写一份
+    let mut pairs: Vec<(&'static str, &'static str, i64, i64)> = Vec::new();
+    let mut dropped: Vec<(usize, String, i64)> = Vec::new();
+    for (k, row) in truth.iter().enumerate() {
+        let exp = row.as_array().unwrap();
+        if exp.is_empty() {
+            continue;
+        }
+        let toks: Vec<&'static str> = exp
+            .iter()
+            .map(|e| audit::intern(e[0].as_str().unwrap()).expect("真值里有词表外的音素"))
+            .collect();
+        let (onset_end, nuc) = super::super::score2cv::syllable_split_for_audit(&toks);
+        let mut gi = 0usize;
+        for (i, &t) in toks.iter().enumerate() {
+            let singer = exp[i][1].as_i64().unwrap();
+            let pos = if i == nuc {
+                "nucleus"
+            } else if i < onset_end {
+                "onset"
+            } else if i > nuc {
+                "coda"
+            } else {
+                "medial"
+            };
+            if gi < ours[k].len() && ours[k][gi].0 == t {
+                pairs.push((t, pos, singer, ours[k][gi].1));
+                gi += 1;
+            } else {
+                dropped.push((k, t.to_string(), singer));
+            }
+        }
+    }
+
+    let stat = |label: &str, sel: &dyn Fn(&(&str, &str, i64, i64)) -> bool| {
+        let s: Vec<_> = pairs.iter().filter(|p| sel(p)).collect();
+        if s.is_empty() {
+            return;
+        }
+        let mut d: Vec<i64> = s.iter().map(|p| p.3 - p.2).collect();
+        d.sort_unstable();
+        let short = s.iter().filter(|p| p.3 < p.2).count();
+        let much = s.iter().filter(|p| p.3 * 5 < p.2 * 3).count();
+        eprintln!(
+            "  {label:<10} n={:<5} 差中位 {:>+3}  比真人短 {:>3.0}%  短过 40% 的 {:>3.0}%",
+            s.len(), d[d.len() / 2], 100.0 * short as f64 / s.len() as f64,
+            100.0 * much as f64 / s.len() as f64
+        );
+    };
+    eprintln!("[mg-truth] 对拍 {} 个音素,我们丢掉 {}", pairs.len(), dropped.len());
+    for (k, t, sd) in dropped.iter().take(8) {
+        eprintln!("   丢音 evt {k} {t} —— 真人给了 {sd} 帧");
+    }
+    stat("全部", &|_| true);
+    for p in ["onset", "medial", "nucleus", "coda"] {
+        stat(p, &|x| x.1 == p);
+    }
+    // 最系统性的偏差(样本 ≥8)
+    let mut by: std::collections::HashMap<(&str, &str), Vec<i64>> = std::collections::HashMap::new();
+    for p in &pairs {
+        by.entry((p.0, p.1)).or_default().push(p.3 - p.2);
+    }
+    let mut rows: Vec<(f64, &str, &str, usize)> = by
+        .iter()
+        .filter(|(_, v)| v.len() >= 8)
+        .map(|((t, pos), v)| (v.iter().sum::<i64>() as f64 / v.len() as f64, *t, *pos, v.len()))
+        .collect();
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    eprintln!("  ── 最系统性的偏差 ──");
+    for (m, t, pos, n) in rows.iter().take(6) {
+        eprintln!("   {t:<4} {pos:<8} 平均比真人短 {:>4.1} 帧 (n={n})", -m);
+    }
+    for (m, t, pos, n) in rows.iter().rev().take(3) {
+        eprintln!("   {t:<4} {pos:<8} 平均比真人长 {m:>4.1} 帧 (n={n})");
+    }
+    assert!(pairs.len() > 500, "对拍样本太少,是不是喂错了真值?");
+    assert_eq!(
+        arr.phone_dur.iter().sum::<i64>(),
+        sj.triples.iter().map(|t| t.frames).sum::<i64>(),
+        "守恒"
+    );
+}
+
 /// S92 (5d 「非日语轨的日本味」) 的**数值前置件**:同一份乐谱数组喂 ScoreToCV,在
 /// (speaker_id, lang_id) 网格上比较 cv 输出。它回答的只有「这条条件轴活着吗、有多大、差异落在
 /// 元音还是辅音上」——**不回答「哪个更好」**(cv 域一切度量与耳朵解耦=度量坟场铁律,好坏只能耳测)。

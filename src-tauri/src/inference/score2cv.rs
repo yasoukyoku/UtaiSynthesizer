@@ -556,6 +556,13 @@ fn nucleus_is_held(prev_phone: Option<&&'static str>, ph: &[&'static str], nuc: 
     nuc == 0 && prev_phone == Some(&ph[0])
 }
 
+/// 同 `syllable_split`,给同级探针模块(`score2svc_mg`)用 —— 它不是 score2cv 的子模块,看不到私有件,
+/// 而反投影对拍必须用**生产的这一条**切分,不许自己再写一份(S92k 审查的三条 major 就是这么来的)。
+#[cfg(test)]
+pub(crate) fn syllable_split_for_audit(ph: &[&'static str]) -> (usize, usize) {
+    syllable_split(ph)
+}
+
 fn syllable_split(ph: &[&'static str]) -> (usize, usize) {
     let n = ph.len();
     let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
