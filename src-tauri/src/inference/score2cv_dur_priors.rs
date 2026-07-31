@@ -7,8 +7,13 @@
 // The training data COMPRESSES consonants on short notes (t 4->2, fricatives 8->3-5) — the
 // UTAU preutterance auto-scaling, measured instead of invented. Median per cell — EXCEPT
 // onset VOICELESS cells, which use p75 (S83 knife 4: fast-run clarity; voiced p75==p50 so
-// only voiceless onsets lift, codas stay median to avoid word-final thud). Clamped to
-// [2, 7]; sparse cells fall back (neighbour bucket -> pooled -> other position -> global).
+// only voiceless onsets lift, codas stay median to avoid word-final thud).
+// ★S92n: the two positions have DIFFERENT ceilings — onset [2, 7], coda [2, 20]. An onset is
+// funded by BORROWING from its neighbour, so raising its ceiling re-opens the vowel-gutting S92j
+// had to bound; a coda is paid for out of the note's own budget (fr*2/5 + the nucleus floor).
+// Measured cause: on 36 reverse-projected real English phrases every one of the 11 notes carrying
+// an /r/ coda came out at exactly 7 frames — the clamp itself — where the singer gave 10-54.
+// Sparse cells fall back (neighbour bucket -> pooled -> other position -> global).
 
 /// (token, onset_target[short,mid,long], coda_target[short,mid,long],
 ///  voiceless_zero_permille[short,mid,long] — measured f0==0 fraction inside the window;

@@ -505,7 +505,7 @@ pub(crate) fn audit(
                 let cap2 = evt.frames <= 5 && !held_by_next;
                 // ★S92b 的「核是被延长而非起音」判据 —— 走生产的 `nucleus_is_held`,因为它决定了
                 //   一个 2 帧的核到底算不算 S84 的塌陷区(生产明文:那 2 帧延续的是已在唱的元音)。
-                let held = nucleus_is_held(prev_phone.as_ref(), &ph, nuc);
+                let held = nucleus_is_held(prev_phone.as_ref(), &ph, nuc, res.is_sustain);
                 // ★目标 = 生产**实际发出**的音符内分配(借帧之前的快照),不是我算的、也不是我
                 //   再调一次分配器算的 —— 两条臂的 `spendable` 不同(InNote 先预留 onset),
                 //   自己再算一次就只能在一条臂上正确。缺快照 ⇒ 响亮记未建模,不猜。

@@ -552,8 +552,20 @@ struct NoteBudget {
 /// S92b 的「核不是起音,是被**延长**」判据,抽成单一真源(同 `syllable_split` 的理由:审计件必须
 /// 用生产的这一条,而不是自己再写一遍 —— 它决定了一个 2 帧的核算不算 S84 的塌陷区)。
 /// `nuc == 0` 是关键:核之前有任何辅音(か / `v ɪ`)都打断元音的连续性。
-fn nucleus_is_held(prev_phone: Option<&&'static str>, ph: &[&'static str], nuc: usize) -> bool {
-    nuc == 0 && prev_phone == Some(&ph[0])
+///
+/// ★S92p — `is_sustain` 是**必要**的一项,不是装饰。只比音素字符串时,任何**元音起头的音节**接在
+/// 以同一个元音收尾的音节之后都会判「延长」,而那是**全新起音**:日语的「な」→「あ」、英语的
+/// `my eyes`。实测:日文探针歌 1215 个有声音符里有 **169 个**命中这条(元音起头的假名极常见),
+/// 三条别名轨 82 个。生产侧后果为 0(那些音符 `n_coda == 0`,`nucleus_continues` 只在 coda 段被读),
+/// 但**审计件用同一个谓词豁免核塌陷报告** ⇒ 那 169 个全新起音被错误豁免,**仪器在替生产隐藏东西**。
+/// 前向孪生 `nucleus_held_by_next` 一直就检查 `r.is_sustain`;这里把两边对齐。
+fn nucleus_is_held(
+    prev_phone: Option<&&'static str>,
+    ph: &[&'static str],
+    nuc: usize,
+    is_sustain: bool,
+) -> bool {
+    is_sustain && nuc == 0 && prev_phone == Some(&ph[0])
 }
 
 /// 同 `syllable_split`,给同级探针模块(`score2svc_mg`)用 —— 它不是 score2cv 的子模块,看不到私有件,
@@ -1115,7 +1127,7 @@ fn assemble_arrays(
                     // nucleus AND that nucleus is the phone the previous note ended on. `nuc == 0`
                     // is what makes it exact: any onset before the nucleus (か, `v ɪ`) breaks the
                     // vowel's continuity, so those notes keep the full nucleus protection.
-                    let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc);
+                    let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc, res.is_sustain);
                     let mut durs = allocate_in_note(
                         ph,
                         NoteBudget { note_frames: fr, spendable: fr - reserved, nucleus_continues },
@@ -1160,8 +1172,12 @@ fn assemble_arrays(
                         // tightening the deep clamp exposed: the demand simply moved to the adjacent
                         // lender, which had no vowel protection. Measured on the user's track, `so`@8fr
                         // came out `s:7 oʊ:2` — a 40 ms diphthong. The in-note half already keeps
-                        // NUCLEUS_KEEP_MIN (S92g); this is the same invariant on the borrow half, so
-                        // "a sung vowel never lands in the collapse region" now holds everywhere.
+                        // NUCLEUS_KEEP_MIN (S92g); this is the same invariant on the borrow half, so a
+                        // BORROWED-FROM vowel never lands in the collapse region.
+                        // ⚠ S92p — the earlier wording here ("…now holds everywhere") was an
+                        // over-claim: a note's OWN nucleus can still end at 2 via the all-or-nothing
+                        // floor pass (`nuc_floor = fr.min(2)`) and via the InNote arm's `avail`. The
+                        // honest scope is written out in `s92g_medial_and_supplement_no_longer_eat_the_vowel`.
                         // zh/ja keep SUNG_KEEP_MIN = the shipped, ear-validated rule, byte-for-byte.
                         let vowel_keep = if chaining { NUCLEUS_KEEP_MIN } else { SUNG_KEEP_MIN };
                         // ledger of (index in pdur, frames) so a DROPPED onset can hand its frames back to
@@ -1251,10 +1267,14 @@ fn assemble_arrays(
                         let nuc_floor = fr.min(2);
                         let nuc_before_supplement = durs[nuc];
                         for i in (0..onset_end).rev() {
-                            if durs[i] >= 2 {
+                            // ★S92p: `CODA_MIN_FRAMES`, not a bare `2`. The InNote twin twenty lines up
+                            // already uses the constant; leaving a literal here means a future round that
+                            // raises the floor (the training data says 0/5608 English consonants are
+                            // shorter than 3 frames) would silently move ONE arm and split the two.
+                            if durs[i] >= CODA_MIN_FRAMES {
                                 continue;
                             }
-                            let need = 2 - durs[i];
+                            let need = CODA_MIN_FRAMES - durs[i];
                             if (durs[nuc] - nuc_floor).max(0) >= need {
                                 durs[nuc] -= need;
                                 durs[i] += need;
@@ -1310,7 +1330,7 @@ fn assemble_arrays(
                         // back — the borrow must stay zero-sum even when it fails (conservation).
                         let mut returned = 0i64;
                         for d in durs.iter_mut().take(onset_end) {
-                            if *d > 0 && *d < 2 {
+                            if *d > 0 && *d < CODA_MIN_FRAMES {
                                 returned += *d;
                                 *d = 0;
                             }
@@ -2036,6 +2056,13 @@ mod tests {
             if lang == g2p::Lang::En { Ok(&self.0) } else { Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into())) }
         }
     }
+    /// 自定义词表的英语 `DictSource` —— 需要 `resolve_west_span`(跨音符的词 + 归韵)时用它,
+    /// 因为**只有走词典的多音符词才会产生真正的 `is_sustain` 音符**;`phoneme_input` 夹具全是
+    /// Word,`is_sustain` 恒 false(S92p:我原先的 S92b/S92o 夹具就是这么绕过延音判据的)。
+    pub(super) fn en_dicts_from(tsv: &str) -> EnOnly {
+        EnOnly(g2p::WordDict::from_tsv(g2p::Lang::En, tsv))
+    }
+
     pub(super) fn en_dicts() -> EnOnly {
         EnOnly(g2p::WordDict::from_tsv(g2p::Lang::En, "mine\tM AY1 N\nfined\tF AY1 N D\n"))
     }
@@ -2175,19 +2202,39 @@ mod tests {
     /// also why ja/zh cannot enter this branch (a fresh syllable never continues the previous phone).
     #[test]
     fn s92b_held_nucleus_lets_the_deferred_coda_exist() {
+        // ★S92p: this fixture now goes through the REAL path — a dictionary word spread over two
+        // notes, so `resolve_west_span` defers the word-final /n/ AND marks the second note
+        // `is_sustain`. The old fixture used two `phoneme_input` WORD notes whose phones merely
+        // happened to touch; those are `is_sustain: false` and, once the predicate stopped ignoring
+        // that flag, they stopped being "held" — i.e. the old fixture was exercising the mechanism
+        // through the very hole S92p closes, and never covered the shape the user actually hears.
+        let d = en_dicts_from("mine\tM AY1 N\n");
         let held = build_arrays_daw(
-            &[raw("v ɪ", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
-        assert_eq!(held.phon, vec!["v", "ɪ", "ɪ", "n"], "the deferred word-final n must survive");
+            &[en_evt("mine", 60, 12), en_evt("+", 60, 4)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(held.phon, vec!["m", "aɪ", "aɪ", "n"], "the deferred word-final n must survive");
         // ★S92o moved this by ONE frame: the coda pre-roll sizes /n/ by the SPAN (12+4 = 16 frames ⇒
         // its measured target is 3, not the 4-frame note's 2) and takes the missing frame from the held
         // ɪ before it. Same word, same total, the release just starts one frame earlier.
-        assert_eq!(held.phone_dur, vec![2, 9, 2, 3]);
+        assert_eq!(held.phone_dur, vec![4, 7, 2, 3]);
         assert_eq!(held.phone_dur.iter().sum::<i64>(), 16, "frame-conserving");
+        assert_eq!(held.phone_dur[2], CODA_MIN_FRAMES, "★the HELD nucleus may fall to 2 — S92b's point");
+        assert!(held.phone_dur[3] >= CODA_MIN_FRAMES, "★and the deferred coda therefore fits");
 
+        // ★判别器 1(原有):同样 4 帧的 [ɪ n],前面是**别的**元音 ⇒ 不是延续 ⇒ 恢复 pre-S92b 行为。
         let fresh = build_arrays_daw(
             &[raw("a", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(fresh.phon, vec!["a", "ɪ"], "a FRESH vowel keeps the full nucleus protection");
         assert_eq!(fresh.phone_dur, vec![12, 4]);
+
+        // ★判别器 2(S92p 新增,补的正是老夹具漏掉的那一维):音素**恰好相同**但不是延音 ⇒
+        //   仍然不算延续。这是日语「な」→「あ」和英语 `my eyes` 的形状 —— 实测日文探针歌里有
+        //   169 个音符命中「首音素 == 上一个发出的音素」,它们全都是全新起音。
+        let same_phone_fresh_word = build_arrays_daw(
+            &[raw("v ɪ", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(
+            same_phone_fresh_word.phon, vec!["v", "ɪ", "ɪ"],
+            "音素相同但不是延音 ⇒ 不许当延续(否则就是 S92p 补掉的那个洞)"
+        );
     }
 
     /// ★S92c — the onset-starvation cascade. On the Auto arm a word-initial consonant is funded by
@@ -2270,6 +2317,41 @@ mod tests {
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
     }
 
+    /// ★S92p — **钉死现行行为,不是改它**:S92i 的「旋律头不算快段」豁免(`fr <= 5 &&
+    /// !nucleus_held_by_next`)**没有语言门**,而日语的「こ」@4帧 +「ー」完全满足它(`Tok::Hold` 把
+    /// 延音解析成 `Phones(vec![carrier])` + `is_sustain`,carrier 就是该 mora 的元音)。
+    /// S92i 当初「日文轨逐字节相同 ⇒ 不需要语言门」的结论**是探针素材的属性,不是语言的属性**。
+    ///
+    /// ⚠ 这里**故意不加语言门**:豁免的道理(「短音符 + 后面接同元音延音 = 旋律头,元音不缺帧」)
+    /// 本身是语言中立的;而 ja 的借帧规则更弱(`depth_limit == 1`、`vowel_keep == SUNG_KEEP_MIN`),
+    /// 所以**代价**才因语言而异。在没有日语耳测的情况下改日语行为,违反本仓自己的规矩。
+    /// ⇒ 把当前行为钉成 golden,让它从「没人知道」变成「已知且有据可查」,并进推广清单等耳测。
+    #[test]
+    fn s92p_ja_melisma_head_exemption_is_pinned_not_gated() {
+        let hold = |fr: i64| g2p::ScoreEvt {
+            lyric: "ー", note_num: 60, frames: fr, lang: g2p::Lang::Ja,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+        };
+        // ⚠ 必须给「こ」一个**出借者**,否则两臂都会落进 2 帧兜底、测不出任何差别 ——
+        //   第一版就是这么写的,是一条空测试(ja 不走 S92c 补齐,谱首又无人可借)。
+        // 「こ」@4 帧,后接同元音延音 ⇒ `nucleus_held_by_next` 为真 ⇒ fr≤5 的快段封顶**不生效**。
+        let melisma = build_arrays_daw(
+            &[raw("a", 20), raw("k o", 4), hold(40)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(melisma.phon, vec!["a", "k", "o", "o"]);
+        assert_eq!(melisma.phone_dur, vec![16, 4, 4, 40], "现行行为(未经耳测,S92p 钉死)");
+        assert_eq!(melisma.phone_dur.iter().sum::<i64>(), 64, "conserving");
+
+        // ★判别器:同样 4 帧的「こ」、同样的出借者,后面**不是**延音 ⇒ 豁免不适用 ⇒ 快段封顶生效,
+        //   k 被钳回 2,出借者少掉一帧的支出。两者必须不同,否则这条钉死测试是空的。
+        let fast = build_arrays_daw(
+            &[raw("a", 20), raw("k o", 4), raw("s a", 12)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_ne!(
+            fast.phone_dur[1], melisma.phone_dur[1],
+            "豁免对 ja 没有任何行为差别 ⇒ 这条测试是空的,别拿它当证据"
+        );
+        assert_eq!(fast.phone_dur[1], 2, "快段封顶把 k 钳在 2");
+    }
+
     /// ★S92o — the CODA pre-roll: a melisma's deferred word-final consonant borrows backwards from the
     /// held vowel, mirroring the onset pre-roll.
     ///
@@ -2294,26 +2376,32 @@ mod tests {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
             phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
         };
-        // `ear`'s shape: a 40-frame hold of /i/, then an 8-frame release carrying the deferred /ɹ/.
-        let a = build_arrays_daw(&[en("IY1", 40), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        // ★S92p: the REAL `ear` shape — the dictionary word spread over two notes, so
+        // `resolve_west_span` defers /ɹ/ onto the second note AND marks it `is_sustain`.
+        // (The first version of this fixture used two `phoneme_input` WORD notes; those are
+        // `is_sustain: false`, i.e. it was driving the mechanism through the hole S92p closes.)
+        let ed = en_dicts_from("ear\tIY1 R\n");
+        let a = build_arrays_daw(
+            &[en_evt("ear", 60, 40), en_evt("+", 60, 8)], &ed, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["i", "i", "ɹ"]);
         assert_eq!(a.phone_dur, vec![27, 5, 16], "the release is sized by the SPAN (48 frames), not by 8");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 48, "zero-sum: the timeline does not move");
 
-        // ★判别器 1:上一个音符以**别的**音素结尾 ⇒ 核不是延续的 ⇒ 前借不许发生。
-        let fresh = build_arrays_daw(&[en("AA1", 40), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
-        assert_eq!(fresh.phone_dur, vec![40, 5, 3], "a FRESH vowel: the release keeps the old 3 frames");
+        // ★判别器 1:同样的音素、同样的长度,但第二个音符是**独立的词**而不是延音 ⇒ 不许前借。
+        let fresh = build_arrays_daw(&[en("IY1", 40), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(fresh.phone_dur, vec![40, 5, 3], "非延音:释放保持原来的 3 帧");
 
         // ★判别器 2:InNote 臂(「自动咬字时序 = 关」)的契约是不跨音符移动 ⇒ 也不许发生。
-        let innote = build_arrays_daw(&[en("IY1", 40), en("IY1 R", 8)], &d, ArticulationTiming::InNote).unwrap();
+        let innote = build_arrays_daw(
+            &[en_evt("ear", 60, 40), en_evt("+", 60, 8)], &ed, ArticulationTiming::InNote).unwrap();
         assert_eq!(innote.phone_dur[0], 40, "InNote must not touch the previous note");
 
         // ★判别器 3:出借的被延长元音**很短**时,那道半数钳位 + `NUCLEUS_KEEP_MIN` 必须咬住 ——
         //   变异实测:补这条之前,把出借上限改成「随便拿」整套自检**照样全绿**(上面几个夹具的
         //   `need` 都小于上限,钳位从没生效过 = 零覆盖)。不设限的话这里会把出借者掏成 0 帧,
         //   连音素都被丢掉(8 帧的 held 元音被拿走 8 帧)。
-        let short_lender =
-            build_arrays_daw(&[en("IY1", 8), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        let short_lender = build_arrays_daw(
+            &[en_evt("ear", 60, 8), en_evt("+", 60, 8)], &ed, ArticulationTiming::Auto).unwrap();
         assert_eq!(short_lender.phon, vec!["i", "i", "ɹ"], "出借者不许被掏到 0 帧而丢音");
         assert_eq!(short_lender.phone_dur, vec![4, 5, 7], "半数钳位 + NUCLEUS_KEEP_MIN 咬住了");
         assert_eq!(short_lender.phone_dur.iter().sum::<i64>(), 16, "conserving");
@@ -2321,8 +2409,13 @@ mod tests {
         // ★★抽干保护:下一个词的**词首**辅音在深度 1 上本可以从这个 16 帧的 /ɹ/ 拿走 8 帧 ——
         //   实测(用户那首歌,加保护之前):前借喂给 `even` 的 /n/ 的 2 帧被 `feel` 的 /f/ 当场取走,
         //   帧最后落到了**下一个词**的词首,收尾一点没改善。同一形状 S92e 已经栽过一次。
+        let cd = en_dicts_from("ear\tIY1 R\nfee\tF IY1\n");
         let chain = build_arrays_daw(
-            &[en("IY1", 40), en("IY1 R", 8), en("F IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
+            &[en_evt("ear", 60, 40), en_evt("+", 60, 8), en_evt("fee", 60, 16)],
+            &cd,
+            ArticulationTiming::Auto,
+        )
+        .unwrap();
         let ri = chain.phon.iter().position(|&p| p == "ɹ").unwrap();
         assert_eq!(chain.phon[ri], "ɹ");
         assert_eq!(chain.phone_dur[ri], 16, "刚被前借喂饱的 coda 不许再被下一个 onset 抽干");
