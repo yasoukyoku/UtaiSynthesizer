@@ -1400,6 +1400,9 @@ mod tests {
             phon,
             lang: vec![2; dur.len()],
             evt: vec![0; dur.len()],
+            // S92k: test-build-only audit fields, irrelevant to this fixture
+            borrow_ledger: Vec::new(),
+            in_note_alloc: Vec::new(),
         };
         // s in a mid-length group (10 fr): zero‰=575 → 4-frame window zeroes round(2.3)=2, centered.
         let a = arr(vec!["s", "a"], vec![4, 6], 10);

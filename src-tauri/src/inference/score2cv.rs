@@ -312,6 +312,23 @@ pub struct ScoreArrays {
     /// lane maps phones back to notes/rests through it (a zh same-pitch hold that merely EXTENDS the
     /// previous entry emits no phone of its own, so its frames show as the carrier stretching through).
     pub evt: Vec<usize>,
+    /// S92k, **测试构建专有**(生产二进制里这个字段不存在,零运行时代价):Auto 臂的前借账本
+    /// `(出借音素下标, 借走的帧数)`,已扣掉「onset 被丢弃后还回去」的那部分 = **净额**。
+    ///
+    /// 为什么必须由生产记而不能由审计件从最终数组反推:一个音符**同时**向前借进(喂自己的词首
+    /// 辅音)又向后借出(喂下一个词的词首辅音),最终数组里只剩净额,两者不可分离 —— 而
+    /// 「另一个词伸过来把这个词的元音剪短」正是用户耳判的那个artifact,它必须能被单独读出来。
+    /// (S92k 对抗审查的 major:核原先连目标都没有,这条轴整个是瞎的。)
+    #[cfg(test)]
+    pub borrow_ledger: Vec<(usize, i64)>,
+    /// S92k, **测试构建专有**:每个走分配器的事件在**借帧发生之前**拿到的音符内分配
+    /// `(事件下标, durs)`。审计件用它当每个音素的「分配器发了多少」基准。
+    ///
+    /// 为什么记而不是让审计件自己再调一次 `allocate_in_note`:两条臂的 `NoteBudget.spendable`
+    /// 不同(InNote 臂先把 onset 预留出去),审计件要么得复制那段预留算术(= 第二份实现,
+    /// S92k 审查抓到的三条 major 就是这么来的),要么就只能在一条臂上正确。记下来即可两条臂全对。
+    #[cfg(test)]
+    pub in_note_alloc: Vec<(usize, Vec<i64>)>,
 }
 
 /// S69 R0b①: whether a vocab phone token is VOICELESS (no vocal-fold vibration) — voiceless
@@ -528,6 +545,24 @@ struct NoteBudget {
 /// on the Auto arm, or by reserving out of `b.spendable` BEFORE this call on the InNote arm). Returns
 /// per-phone durations aligned to `ph`; entries may be 0 (dropped medial/coda / unfunded onset) — the
 /// caller skips 0-duration phones at emission. Σ(durs) ≤ b.spendable always.
+/// The syllable split every downstream pass keys on: `[0, onset_end)` = onset, `[onset_end, nuc)` =
+/// medial, `nuc` = nucleus, `(nuc, n)` = coda. Extracted from `build_arrays_daw` verbatim so the
+/// AUDIT harness (`score2cv_audit.rs`) reads each phone's target through the SAME split the allocator
+/// used — a second copy of these two lines is exactly the kind of drift that makes a checker lie.
+/// S92b 的「核不是起音,是被**延长**」判据,抽成单一真源(同 `syllable_split` 的理由:审计件必须
+/// 用生产的这一条,而不是自己再写一遍 —— 它决定了一个 2 帧的核算不算 S84 的塌陷区)。
+/// `nuc == 0` 是关键:核之前有任何辅音(か / `v ɪ`)都打断元音的连续性。
+fn nucleus_is_held(prev_phone: Option<&&'static str>, ph: &[&'static str], nuc: usize) -> bool {
+    nuc == 0 && prev_phone == Some(&ph[0])
+}
+
+fn syllable_split(ph: &[&'static str]) -> (usize, usize) {
+    let n = ph.len();
+    let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
+    let onset_end = ph.iter().position(|p| is_nucleus_phone(p)).unwrap_or(n - 1).min(nuc);
+    (onset_end, nuc)
+}
+
 fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: usize) -> Vec<i64> {
     let NoteBudget { note_frames, spendable: fr, nucleus_continues } = b;
     let n = ph.len();
@@ -898,6 +933,11 @@ fn assemble_arrays(
     let mut npitch: Vec<i64> = Vec::new();
     let mut plang: Vec<i64> = Vec::new();
     let mut pevt: Vec<usize> = Vec::new();
+    // S92k: test-build-only borrow ledger (see `ScoreArrays::borrow_ledger`).
+    #[cfg(test)]
+    let mut ledger: Vec<(usize, i64)> = Vec::new();
+    #[cfg(test)]
+    let mut alloc_snap: Vec<(usize, Vec<i64>)> = Vec::new();
 
     for (k, (evt, res)) in score.iter().zip(resolved.iter()).enumerate() {
         let (nn, fr) = (evt.note_num, evt.frames);
@@ -954,8 +994,7 @@ fn assemble_arrays(
                     //    allocate_in_note for the full rationale) ──
                     let n = ph.len();
                     let fr = fr.max(1);
-                    let nuc = ph.iter().rposition(|p| is_nucleus_phone(p)).unwrap_or(n - 1);
-                    let onset_end = ph.iter().position(|p| is_nucleus_phone(p)).unwrap_or(n - 1).min(nuc);
+                    let (onset_end, nuc) = syllable_split(ph);
                     // S84 A 刀: at fr ≤ 5 (the tempo-222 160t fast-run regime) the short-bucket
                     // MEDIAN targets (t3/k4/s4 — a ≤7 bucket dominated by 6-7-frame groups)
                     // always exceed the ceil-half clamp, so the LENDER vowel was pinned at
@@ -1056,7 +1095,7 @@ fn assemble_arrays(
                     // nucleus AND that nucleus is the phone the previous note ended on. `nuc == 0`
                     // is what makes it exact: any onset before the nucleus (か, `v ɪ`) breaks the
                     // vowel's continuity, so those notes keep the full nucleus protection.
-                    let nucleus_continues = nuc == 0 && phon.last() == Some(&ph[0]);
+                    let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc);
                     let mut durs = allocate_in_note(
                         ph,
                         NoteBudget { note_frames: fr, spendable: fr - reserved, nucleus_continues },
@@ -1064,6 +1103,9 @@ fn assemble_arrays(
                         nuc,
                     );
                     durs[..onset_end].copy_from_slice(&onset_durs[..onset_end]);
+                    // S92k: snapshot the IN-NOTE allocation before any borrow moves frames.
+                    #[cfg(test)]
+                    alloc_snap.push((k, durs.clone()));
                     if onset_end > 0 && timing == ArticulationTiming::Auto {
                         // borrow the onset consonants' frames from the tail of the previous phone so
                         // the NUCLEUS starts on the beat (zero-sum: the timeline never moves).
@@ -1252,6 +1294,8 @@ fn assemble_arrays(
                         // S92d: give them back to the exact phones they came from, newest lender first
                         // (with depth 1 — zh/ja — this ledger holds a single entry and the arithmetic is
                         // identical to the old `*pdur.last_mut() += returned`).
+                        #[cfg(test)]
+                        let mut returns: Vec<(usize, i64)> = Vec::new();
                         for (idx, given) in borrowed.iter().rev() {
                             if returned == 0 {
                                 break;
@@ -1259,8 +1303,27 @@ fn assemble_arrays(
                             let back = returned.min(*given);
                             pdur[*idx] += back;
                             returned -= back;
+                            #[cfg(test)]
+                            returns.push((*idx, back));
                         }
                         debug_assert_eq!(returned, 0, "a dropped onset held frames no lender gave it");
+                        // S92k: record the NET take per lender (after the drop-return above), so the
+                        // audit harness can say exactly how many frames left a NEIGHBOUR's vowel.
+                        #[cfg(test)]
+                        {
+                            let mut net: Vec<(usize, i64)> = Vec::new();
+                            let mut add = |idx: usize, d: i64| match net.iter_mut().find(|(i, _)| *i == idx) {
+                                Some(e) => e.1 += d,
+                                None => net.push((idx, d)),
+                            };
+                            for &(idx, given) in &borrowed {
+                                add(idx, given);
+                            }
+                            for &(idx, back) in &returns {
+                                add(idx, -back); // a hand-back is a negative take
+                            }
+                            ledger.extend(net.into_iter().filter(|(_, d)| *d > 0));
+                        }
                     }
                     for (&p, &d) in ph.iter().zip(durs.iter()) {
                         if d <= 0 {
@@ -1358,7 +1421,20 @@ fn assemble_arrays(
     }
     let note_dur: Vec<i64> = note_to_phone.iter().map(|&g| group_frames[g as usize]).collect();
 
-    Ok(ScoreArrays { phonemes, phone_dur: pdur, note_pitch: npitch, note_dur, note_to_phone, phon, lang: plang, evt: pevt })
+    Ok(ScoreArrays {
+        phonemes,
+        phone_dur: pdur,
+        note_pitch: npitch,
+        note_dur,
+        note_to_phone,
+        phon,
+        lang: plang,
+        evt: pevt,
+        #[cfg(test)]
+        borrow_ledger: ledger,
+        #[cfg(test)]
+        in_note_alloc: alloc_snap,
+    })
 }
 
 // ─── SP-boundary chunking (≤ max_frames) + per-chunk rebase ──────────────────────────────────────
@@ -1616,6 +1692,13 @@ pub fn run_score2cv(
     Array2::from_shape_vec((t, dim), cv).map_err(|e| UtaiError::Inference(e.to_string()))
 }
 
+// S92k 分配器审计件(记账核对,不是启发式)—— 同 e1/mg 姿势挂子模块,以便复用本文件的私有件
+// (syllable_split / onset_target_frames / coda_target_frames / zh_hold_phone):审计件读的是
+// 生产的同一份切分与同一张目标表,所以它与分配器之间**没有第二份实现可漂移**。详见该文件头注。
+#[cfg(test)]
+#[path = "score2cv_audit.rs"]
+pub(crate) mod audit;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1841,7 +1924,9 @@ mod tests {
 
     // EN closed syllable (the S83 "mine→me" crown case): the CODA is bounded, the NUCLEUS takes the
     // note's remainder, and the onset pre-rolls — the exact inversion of the old split_dur shape.
-    struct EnOnly(g2p::WordDict);
+    // `pub(super)`: the S92k audit harness is a SIBLING test module and reuses these fixtures rather
+    // than growing a second copy of them (HARD RULE: one source of truth, tests included).
+    pub(super) struct EnOnly(g2p::WordDict);
     impl g2p::DictSource for EnOnly {
         fn zh(&self) -> Result<&g2p::ZhDict> {
             Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into()))
@@ -1850,7 +1935,7 @@ mod tests {
             if lang == g2p::Lang::En { Ok(&self.0) } else { Err(UtaiError::Inference("VOCAL_DICT_MISSING: fixture".into())) }
         }
     }
-    fn en_dicts() -> EnOnly {
+    pub(super) fn en_dicts() -> EnOnly {
         EnOnly(g2p::WordDict::from_tsv(g2p::Lang::En, "mine\tM AY1 N\nfined\tF AY1 N D\n"))
     }
     fn en_evt(lyric: &'static str, note_num: i64, frames: i64) -> g2p::ScoreEvt<'static> {
@@ -1900,7 +1985,7 @@ mod tests {
     //   n [3,3,4]  z [5,5,6]  t [4,3,3]  s [3,5,6]  ŋ [6,6,7]  θ [7,7,7]
     // A bare vowel-initial phone list is used on purpose: with no onset there is nothing to borrow or
     // reserve, so each number below isolates the coda pass.
-    fn raw(phones: &'static str, frames: i64) -> g2p::ScoreEvt<'static> {
+    pub(super) fn raw(phones: &'static str, frames: i64) -> g2p::ScoreEvt<'static> {
         g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames, lang: g2p::Lang::Ja,
             phoneme_input: Some(phones), phoneme_set: PhonemeSet::Words,

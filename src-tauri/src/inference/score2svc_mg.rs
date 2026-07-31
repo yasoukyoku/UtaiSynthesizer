@@ -312,6 +312,98 @@ fn mg_lane_dump() {
     );
 }
 
+/// S92k 分配器审计:把 `score2cv::audit` 跑在**真实谱面**上,按严重度排序打印 + 落盘 JSON。
+/// 这是「不用耳朵一个词一个词找」的那台仪器的入口 —— 判据与自检见 `score2cv_audit.rs` 头注。
+///
+/// 两种模式:
+///   ①默认 = 审计**当前代码**对这份谱的分配(`UTAI_MG_SCORE` / `UTAI_MG_SET` / `UTAI_MG_PREROLL` 同其它探针);
+///   ②`UTAI_MG_AUDIT_LANE=<lane.json>` = 审计**一份存档泳道**(用今天的判据去审历史分配)。
+///     ★这一路是仪器的验收凭证:拿 pre-S92 的泳道喂它,它必须**独立重新发现**当初那批静默丢音,
+///     而我们对它一个字都没提示过。审计只读泳道的 phone/dur/evt 三列(其余列 audit 不看)。
+///
+/// Run:
+///   $env:UTAI_MG_SCORE='<score.json>'; cargo test --lib inference::score2svc::mg_tests::mg_audit -- --ignored --nocapture
+#[test]
+#[ignore]
+fn mg_audit() {
+    use super::super::score2cv::audit;
+    let sj = load_score();
+    let evts = to_evts(&sj.triples);
+    let timing = mg_timing_env();
+    let resolved = super::super::g2p::resolve_score(&evts, &super::super::g2p::GlobalDicts).unwrap();
+
+    let (arr, source, src_kind) = match std::env::var("UTAI_MG_AUDIT_LANE") {
+        Ok(p) => {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            // 产物自述对断(S91 陈货规矩):存档泳道的臂/总帧必须与本次请求一致,否则响亮失败。
+            assert_eq!(
+                v["timing"].as_str().unwrap(),
+                format!("{timing:?}"),
+                "存档泳道的臂与本次请求不一致 —— 换 UTAI_MG_PREROLL 或换文件"
+            );
+            let total: i64 = sj.triples.iter().map(|t| t.frames).sum();
+            assert_eq!(v["total_frames"].as_i64(), Some(total), "存档泳道与这份谱不是同一首");
+            let mut a = build_arrays_daw(&evts, &super::super::g2p::GlobalDicts, timing).unwrap();
+            let ph = v["phones"].as_array().unwrap();
+            a.phon = ph
+                .iter()
+                .map(|p| audit::intern(p["phone"].as_str().unwrap()).expect("泳道里有词表外的音素"))
+                .collect();
+            a.phone_dur = ph.iter().map(|p| p["dur"].as_i64().unwrap()).collect();
+            a.evt = ph.iter().map(|p| p["evt"].as_u64().unwrap() as usize).collect();
+            // ★借帧账本是**当前代码**这次构建产生的,与这份存档泳道无关 —— 留着它会让「元音总
+            //   损失帧数」拿今天的账去配历史的分配,是个静默的错数。存档泳道里重建不出账本
+            //   (借进/借出在净额里不可分离),所以这条轴在这个模式下**不可用**,清空并声明。
+            a.borrow_ledger.clear();
+            a.in_note_alloc.clear();
+            (a, format!("存档泳道 {p}"), audit::Source::ArchivedLane)
+        }
+        Err(_) => (
+            build_arrays_daw(&evts, &super::super::g2p::GlobalDicts, timing).unwrap(),
+            "当前代码".to_string(),
+            audit::Source::Live,
+        ),
+    };
+
+    let rep = audit::audit(&evts, &resolved, &arr, src_kind);
+    eprintln!("[mg-audit] 来源 = {source}  臂 = {timing:?}");
+    eprintln!("{}", rep.render(40));
+    assert!(
+        rep.unmodelled.is_empty(),
+        "有未建模的发射路径 ⇒ 上面所有数字都不算数(仪器不许对没覆盖的东西宣称干净): {:?}",
+        rep.unmodelled
+    );
+    assert_eq!(rep.conservation.0, rep.conservation.1, "守恒");
+
+    let out = Path::new(WORK).join("probe").join(format!("mg_audit{}.json", mg_preroll_tag()));
+    let rows: Vec<_> = rep
+        .findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "kind": f.kind.code(), "evt": f.evt, "lyric": f.lyric, "phone": f.phone,
+                "position": f.position.code(), "lang": f.lang, "note_frames": f.note_frames,
+                "actual": f.actual, "target_effective": f.target_effective,
+                "target_measured": f.target_measured, "deficit": f.deficit(),
+                "score_forced": f.score_forced,
+            })
+        })
+        .collect();
+    std::fs::write(
+        &out,
+        serde_json::to_string(&serde_json::json!({
+            "source": source, "timing": format!("{timing:?}"),
+            "events": rep.events, "phones_expected": rep.phones_expected,
+            "phones_emitted": rep.phones_emitted, "displacement": rep.displacement,
+            "findings": rows,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("[mg-audit] -> {}", out.display());
+}
+
 /// S92 (5d 「非日语轨的日本味」) 的**数值前置件**:同一份乐谱数组喂 ScoreToCV,在
 /// (speaker_id, lang_id) 网格上比较 cv 输出。它回答的只有「这条条件轴活着吗、有多大、差异落在
 /// 元音还是辅音上」——**不回答「哪个更好」**(cv 域一切度量与耳朵解耦=度量坟场铁律,好坏只能耳测)。
