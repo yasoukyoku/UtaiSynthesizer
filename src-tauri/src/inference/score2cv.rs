@@ -403,9 +403,22 @@ pub fn is_nucleus_phone(p: &str) -> bool {
 // `split_dur` — see that enum's doc for why conservation forbids it. It only redirects where the onset's
 // frames come from: the note's own nucleus instead of the previous phone. Everything else on this page
 // (targets, buckets, ≥2-or-drop, LAST-first, nucleus-remainder, coda bounds) is shared by both arms.
-const CODA_MIN_FRAMES: i64 = 2; // a 1-frame phone is categorically OOD (0 occurrences in training npz)
+// ⚠ S93 corrected the parenthetical: "0 occurrences" is true for the REALIGNED chaining-language
+// consonants (realign_mindur DCONS=3 — 0/5608 English consonants under 3 frames), NOT for the whole
+// corpus: the ja hand labs never went through that realignment and DO attest 1-frame phones
+// (score2cv_audit_ref.rs: ja ɾ onset p05=1 n=219, ja nucleus short-bucket p05=1). 2 stays the shipped
+// EMISSION floor for every phone we place; the one measured exception is the S93 rescue LENDER
+// (`RESCUE_LENDER_KEEP` below), which may keep 1 because real zh/ja singing does exactly that.
+const CODA_MIN_FRAMES: i64 = 2; // the shipped emission floor: we never PLACE a phone under 2 frames
 const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
 const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
+/// S93 — DROP-RESCUE ONLY: the floor an ADJACENT sung-VOWEL lender may fall to when the alternative
+/// is deleting a word-initial consonant outright (the note then sings the WRONG syllable). A single
+/// frame is in-distribution for real zh/ja singing on short notes — the reference distribution
+/// (score2cv_audit_ref.rs, real aligned singing) puts the short-bucket nucleus p05 at 1 for ja
+/// o/ɯ/i (o/ɯ MEDIAN 2) and zh a/i/o/u (i median 1); JALAB kept its 1-frame phones through S57.
+/// Everywhere else `SUNG_KEEP_MIN` stands.
+const RESCUE_LENDER_KEEP: i64 = 1;
 /// Fallback targets for a consonant missing from the measured priors (defensive — the generator
 /// covers every non-nucleus token; ≈ the global consonant medians).
 const ONSET_TARGET_FALLBACK: i64 = 4;
@@ -1323,6 +1336,70 @@ fn assemble_arrays(
                                 durs[nuc] -= give;
                                 durs[i] += give;
                                 allow -= give;
+                            }
+                        }
+                        // ★S93 — LAST-RESORT drop rescue, NON-chaining arm only (zh/ja). Every pass
+                        // above can still leave a word-initial consonant under the 2-frame minimum
+                        // when the note is very short AND the adjacent lender is itself squeezed: a ja
+                        // fast run pins every vowel at SUNG_KEEP_MIN = 2, so the depth-1 borrow caps
+                        // at 0, and a 3-frame note's nucleus spare above its fr.min(2) floor is 1 < 2.
+                        // The drop pass below then deletes the consonant and the note sings the WRONG
+                        // syllable — S92k's audit found exactly two on the ja probe song (し@3fr sang
+                        // "i", の@3fr sang "o") and the user confirmed both audible. That outcome is
+                        // strictly worse than any in-distribution squeeze, and the real data funds
+                        // one: short-note vowels at a single frame are what real zh/ja singers do
+                        // (see RESCUE_LENDER_KEEP). So, ONLY when the phone would otherwise drop:
+                        //   • the ADJACENT sung-vowel lender's floor relaxes SUNG_KEEP_MIN → 1, still
+                        //     under the shipped ceil-half clamp on its ORIGINAL length (a rest already
+                        //     lends to REST_KEEP_MIN = 1; a consonant lender stays untouchable — NOT
+                        //     because 1-frame consonants are unattested (ja ɾ onset p05 = 1 exists),
+                        //     but because draining a consonant re-creates the S92e cascade this file
+                        //     already paid for — the walk itself gives consonants nothing at depth ≥ 2
+                        //     for the same reason);
+                        //   • the remainder comes from the nucleus's spare above fr.min(2), exactly
+                        //     like the all-or-nothing floor pass above;
+                        //   • all-or-nothing: if the two together cannot reach CODA_MIN_FRAMES, touch
+                        //     NOTHING and drop exactly as before (a 1-frame consonant stays forbidden,
+                        //     and a note that does not drop stays byte-identical by construction).
+                        // ⚠ NOT extended to the chaining arm this round: its S92c supplement already
+                        // funds onsets on ordinary notes, its tracks are ear-validated as shipped
+                        // (S92j/S92o), and the en-words + three alias lanes must not move here.
+                        if !chaining {
+                            for i in (0..onset_end).rev() {
+                                if durs[i] >= CODA_MIN_FRAMES {
+                                    continue;
+                                }
+                                let need = CODA_MIN_FRAMES - durs[i];
+                                // The depth-1 lender, mirrored from the walk above (same skip rule for
+                                // a coda the S92o pre-roll just fed — never immediately re-drain it).
+                                let mut extra = 0i64;
+                                let j = pdur.len().wrapping_sub(1);
+                                if j < pdur.len()
+                                    && !coda_preroll_fed.contains(&j)
+                                    && is_nucleus_phone(phon[j])
+                                {
+                                    let already: i64 = borrowed
+                                        .iter()
+                                        .filter(|(idx, _)| *idx == j)
+                                        .map(|(_, t)| *t)
+                                        .sum();
+                                    let orig = pdur[j] + already;
+                                    let cap = (pdur[j] - RESCUE_LENDER_KEEP)
+                                        .max(0)
+                                        .min((orig + 1) / 2 - already)
+                                        .max(0);
+                                    extra = need.min(cap);
+                                }
+                                let from_nuc = (need - extra).min((durs[nuc] - nuc_floor).max(0));
+                                if extra + from_nuc < need {
+                                    continue; // cannot reach the minimum — drop as before, zero state touched
+                                }
+                                if extra > 0 {
+                                    pdur[j] -= extra;
+                                    borrowed.push((j, extra));
+                                }
+                                durs[nuc] -= from_nuc;
+                                durs[i] += extra + from_nuc;
                             }
                         }
                         // sub-minimum onsets DROP (same policy as codas/medials); at this point their
@@ -2352,6 +2429,115 @@ mod tests {
         assert_eq!(fast.phone_dur[1], 2, "快段封顶把 k 钳在 2");
     }
 
+    /// ★S93 — the LAST-RESORT drop rescue (non-chaining arm). The real shape from the ja probe song:
+    /// a fast run pins the previous vowel at SUNG_KEEP_MIN = 2, so a 3-frame CV note's onset can
+    /// neither borrow (cap 0) nor self-fund (nucleus spare 1 < 2) nor take the S92c supplement
+    /// (ja is not a chaining language) — し@3fr sang "i" and の@3fr sang "o", both confirmed by the
+    /// user's ear (S92k audit, evts 755/731).
+    /// Hand-derived: note A `k ɯ`@4 (score start) ⇒ floor pass k:2, ɯ:2. Note B `n o`@3: borrow cap
+    /// (2-2) = 0; floor needs 2, spare = 3-2 = 1 ⇒ would DROP. Rescue: the adjacent vowel relaxes to
+    /// RESCUE_LENDER_KEEP = 1 under the ceil-half clamp on its ORIGINAL length (min(2-1, (2+1)/2) = 1),
+    /// the nucleus pays its 1 spare frame ⇒ n:2, o:2, ɯ:1 — every value in-distribution (short-bucket
+    /// nucleus p05 = 1 for ja o/ɯ/i, o/ɯ median 2; see RESCUE_LENDER_KEEP).
+    #[test]
+    fn s93_would_drop_onset_is_rescued_by_the_adjacent_vowel_falling_to_one_frame() {
+        let arr = build_arrays_daw(
+            &[raw("k ɯ", 4), raw("n o", 3)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["k", "ɯ", "n", "o"], "★the word-initial consonant must survive");
+        assert_eq!(arr.phone_dur, vec![2, 1, 2, 2]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 7, "frame-conserving across the rescue");
+        // ★审查 confirmed(S93):rescue 的取帧必须进借帧账本 —— 它是 NUCLEUS_LENT_AWAY /
+        //   「元音总损失帧数」轴的全新生产者,而这条接线此前零变异覆盖(删掉 `borrowed.push`
+        //   全套测试照绿、审计从此对 rescue 静默失明 = S89「零覆盖接线点」的标准形状)。
+        //   ɯ 在 pdur 里的下标是 1,rescue 恰取 1 帧。
+        assert!(
+            arr.borrow_ledger.iter().any(|&(idx, n)| idx == 1 && n == 1),
+            "the rescue's take from ɯ must be ON the borrow ledger (audit visibility): {:?}",
+            arr.borrow_ledger
+        );
+
+        // ★判别器 1:出借元音**富裕**(≥3 帧)时,正常借帧已经喂饱 onset ⇒ rescue 一帧不动,
+        //   出借者保持 SUNG_KEEP_MIN 以上 —— rescue 只在「否则整个音素消失」时才存在。
+        let rich = build_arrays_daw(
+            &[raw("k a", 8), raw("n o", 3)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(rich.phon, vec!["k", "a", "n", "o"]);
+        assert_eq!(rich.phone_dur, vec![2, 4, 2, 3], "normal borrow path — rescue idle");
+        assert!(rich.phone_dur[1] >= SUNG_KEEP_MIN, "a healthy lender never falls below the shipped floor");
+        // (两臂的出借者余量 4 vs 1 —— 判别器与主臂确实分流,这条测试不是空的。)
+        assert_ne!(rich.phone_dur[1], arr.phone_dur[1]);
+    }
+
+    /// ★S93 — the CASCADE steady state, PINNED not blessed(与 S92p 的 H2 钉法同款:钉死现行行为,
+    /// 耳测待裁)。rescue 的触发前提(邻居元音被压在 2 帧)恰是它自己的产出(被救音符付完 from_nuc
+    /// 后核也停在 2)⇒ 在连续 3 帧 CV 快跑里逐音符点火,稳态 = 内部元音全部 1 帧、辅音全部 2 帧。
+    /// 手推([a@10] + [k a]@3 ×4):n2 从富裕出借者正常借 2;n3 借 1 + 核补 1(邻居 a 3→2);
+    /// n4/n5 走 rescue(邻居 a 2→1 + 核补 1)。**pre-S93 同一份输入是隔一个音符删一个辅音**
+    /// (n4 的 k 整个消失 = S92k 定罪的「唱错音节」),方向上 rescue 仍是改善 —— 但这个稳态
+    /// 耳朵没听过、真快歌无取样面(管中窥豹),所以钉死在这里等耳测,别当「已验证安全」引用。
+    /// ⚠ 审计对该稳态的可见度有限:1 帧核 == p05 不触发 OOD(判据严格 <),2→1 不改
+    /// NUCLEUS_COLLAPSE 计数(判据 ≤2)—— 位移记在 NUCLEUS_LENT_AWAY 的 deficit 里。
+    #[test]
+    fn s93_cascade_on_a_three_frame_run_is_pinned_awaiting_the_ear() {
+        let arr = build_arrays_daw(
+            &[raw("a", 10), raw("k a", 3), raw("k a", 3), raw("k a", 3), raw("k a", 3)],
+            &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["a", "k", "a", "k", "a", "k", "a", "k", "a"],
+            "★every consonant in the run survives (pre-S93: every other one vanished)");
+        assert_eq!(arr.phone_dur, vec![8, 2, 2, 2, 1, 2, 1, 2, 2], "现行稳态(未经耳测,钉死)");
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 22, "frame-conserving across the whole run");
+    }
+
+    /// ★S93 all-or-nothing: with NO lender at all (score start) a 3-frame note still cannot reach the
+    /// 2-frame minimum (nucleus spare is 1), so the onset drops exactly as before and nothing is
+    /// touched — the rescue never invents frames and a 1-frame consonant stays forbidden.
+    #[test]
+    fn s93_rescue_stays_all_or_nothing_when_the_minimum_is_unreachable() {
+        let arr = build_arrays_daw(&[raw("n o", 3)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["o"], "no lender + no spare ⇒ the drop is unchanged");
+        assert_eq!(arr.phone_dur, vec![3], "…and the nucleus keeps every frame (zero state touched)");
+    }
+
+    /// ★S93 — the ceil-half clamp binds on the lender's ORIGINAL length across both passes: at
+    /// `n o`@2 the walk first takes 1 (cap (3-2).min(2) = 1), the floor pass has zero spare
+    /// (fr = nuc_floor = 2), and the rescue may take exactly ONE more — (3+1)/2 minus the 1 already
+    /// taken — landing the lender at 1. Total taken = 2 = ceil(3/2), never more.
+    #[test]
+    fn s93_rescue_completes_a_partial_borrow_under_the_original_half_clamp() {
+        let arr = build_arrays_daw(
+            &[raw("k a", 5), raw("n o", 2)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["k", "a", "n", "o"]);
+        assert_eq!(arr.phone_dur, vec![2, 1, 2, 2]);
+        assert_eq!(arr.phone_dur.iter().sum::<i64>(), 7, "frame-conserving");
+    }
+
+    /// ★S93 语言门,两个方向都钉死:
+    /// ① zh 与 ja 走同一条 `!consonant_chaining_language` 谓词(单一求值点)⇒ 同形状同获救 ——
+    ///    真人数据对 zh 同样背书(短桶核 p05:zh a/i/o/u 全是 1,i 的中位数就是 1)。
+    /// ② chaining 臂(en/de/fr/es/it)**故意不进 rescue**:S92c 补齐在普通音符上已喂饱 onset,
+    ///    其轨道按出货状态耳测验收过(S92j/S92o),本轮 en-words + 三条别名泳道必须逐字节不变。
+    ///    en 的同形状今天仍然丢弃 —— 这是**已知边界不是疏漏**,要动它得走推广清单 + en 耳测
+    ///    (翻转这条断言 = 那个决定,别顺手)。
+    #[test]
+    fn s93_rescue_is_gated_by_the_chaining_predicate_not_by_ja() {
+        let zh = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::Zh,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let z = build_arrays_daw(&[zh("k ɯ", 4), zh("n o", 3)], &zh_dicts(), ArticulationTiming::Auto).unwrap();
+        // (zh 的记号归一把裸 k 写成送气 kʰ —— 与本测试无关,rescue 才是被测物。)
+        assert_eq!(z.phon, vec!["kʰ", "ɯ", "n", "o"], "zh rides the same non-chaining rescue");
+        assert_eq!(z.phone_dur, vec![2, 1, 2, 2]);
+
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let e = build_arrays_daw(&[en("K UH1", 4), en("N OW1", 3)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(e.phon, vec!["k", "ʊ", "oʊ"], "chaining arm: the boundary is intentional (see doc)");
+        assert_eq!(e.phone_dur, vec![2, 2, 3]);
+    }
+
     /// ★S92o — the CODA pre-roll: a melisma's deferred word-final consonant borrows backwards from the
     /// held vowel, mirroring the onset pre-roll.
     ///
@@ -2820,18 +3006,35 @@ mod tests {
     // nucleus spare) DROPS and hands its frames BACK to the lender — conservation survives the
     // failed pre-roll (a kept 1-frame phone would be the OOD class; a kept borrow with a dropped
     // phone would silently shift the timeline).
+    // ★S93 changed this fixture: the original lender was a VOWEL (あ@3), and the drop rescue now
+    // legitimately saves /t/ there (see the second half). The return path needs a lender the rescue
+    // is structurally barred from — a CONSONANT (no data says a 1-frame consonant exists).
     #[test]
     fn starved_onset_drops_and_returns_its_borrowed_frames() {
-        // geminate-shaped [ʔ,t,a] (raw-IPA override) on a 2-frame note after a 3-frame vowel: the
-        // lender spares only 1 frame, the nucleus (min(fr,2)=2) has no spare → the 1-frame [t]
-        // drops and its borrowed frame RETURNS to the lender (ʔ got nothing and drops too).
+        // [ʔ,t,a] (raw-IPA override) on a 2-frame note after [a t] (coda t:3): the consonant lender
+        // spares (3-2).min(2) = 1 frame, the nucleus (min(fr,2)=2) has no spare, and the rescue may
+        // not touch a consonant lender → the 1-frame inner [t] drops and its borrowed frame RETURNS
+        // to the lender (ʔ got nothing and drops too).
         let tta = g2p::ScoreEvt {
             lyric: "x", note_num: 62, frames: 2, lang: g2p::Lang::Ja, phoneme_input: Some("ʔ t a"),
             phoneme_set: PhonemeSet::Words,
         };
-        let daw = build_arrays_daw(&[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts, ArticulationTiming::Auto).unwrap();
-        assert_eq!(daw.phon, vec!["a", "a"]);
-        assert_eq!(daw.phone_dur, vec![3, 2], "borrowed frame returned to the lender");
+        let at = g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: 10, lang: g2p::Lang::Ja, phoneme_input: Some("a t"),
+            phoneme_set: PhonemeSet::Words,
+        };
+        let daw = build_arrays_daw(&[at, tta.clone()], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(daw.phon, vec!["a", "t", "a"]);
+        assert_eq!(daw.phone_dur, vec![7, 3, 2], "borrowed frame returned to the CONSONANT lender");
+
+        // ★S93 判别器:同一个 [ʔ t a]@2,出借者换成**元音**(原夹具形状)⇒ rescue 生效,
+        //   内侧的 t 活下来(LAST-first:贴着元音的辅音承载音节身份),ʔ 仍丢弃 ——
+        //   唱「た」而不是唱「あ」。出借元音落到 RESCUE_LENDER_KEEP = 1。
+        let rescued = build_arrays_daw(
+            &[g2p::ScoreEvt::ja(&("あ", 60, 3)), tta], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(rescued.phon, vec!["a", "t", "a"], "the vowel-lender arm is RESCUED since S93");
+        assert_eq!(rescued.phone_dur, vec![1, 2, 2]);
+        assert_eq!(rescued.phone_dur.iter().sum::<i64>(), 5, "frame-conserving");
     }
 
     // S83 review #1: medial phones follow the same ≥2-or-DROP policy as codas (never a 1-frame

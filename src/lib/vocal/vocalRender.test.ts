@@ -604,9 +604,9 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s90|st:s92o");
-    expect(G2P_ALGO_VERSION).toBe("s90"); // untouched — S92 changes frame allocation, never lyric→phone
-    expect(SCORE_TIMING_VERSION).toBe("s92o"); // S92o: the coda pre-roll (a melisma release borrows from the held vowel)
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s90|st:s93");
+    expect(G2P_ALGO_VERSION).toBe("s90"); // untouched — S93 changes frame allocation, never lyric→phone
+    expect(SCORE_TIMING_VERSION).toBe("s93"); // S93: the zh/ja would-drop onset rescue (し/の@3fr no longer lose their consonant)
   });
 
   // SHAPE: the whole string, pinned. When this one goes red the question to answer is "did I mean to
@@ -615,7 +615,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s90|st:s92o",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s90|st:s93",
     );
   });
 });

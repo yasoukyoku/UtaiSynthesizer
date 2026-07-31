@@ -696,8 +696,17 @@ export const G2P_ALGO_VERSION = "s90";
  *  UTAU-alias lanes are byte-identical (they never defer a coda onto a sustain).
  *  ⚠ NO distribution evidence exists for this shape: the reverse-projected corpus has 0 of 403 notes
  *  with a held nucleus AND a coda — the training aligner never repeats a vowel across notes, so the
- *  melisma-release shape is ours, not the corpus's. Evidence = the user's ear + English r-colouring. */
-export const SCORE_TIMING_VERSION = "s92o";
+ *  melisma-release shape is ours, not the corpus's. Evidence = the user's ear + English r-colouring.
+ *
+ *  s93 — the LAST-RESORT drop rescue on the NON-chaining arm (zh/ja, Auto only). A very short note
+ *  whose adjacent lender is itself squeezed to 2 frames used to DELETE its word-initial consonant
+ *  outright and sing the wrong syllable — the S92k audit found two on the ja probe song (し@3fr sang
+ *  "i", の@3fr sang "o"; user-confirmed audible). Now, only in that would-drop case, the adjacent
+ *  vowel lender may fall to 1 frame (in-distribution: real ja/zh short-note nucleus p05 = 1) and the
+ *  nucleus pays its spare above min(fr,2); all-or-nothing, so a note that does not drop is
+ *  byte-identical. en-words + the three alias lanes and the whole InNote arm: byte-identical (hash
+ *  gate, 9/10 lanes). ja Auto lane: exactly 6 rows moved, all at the two rescue sites. */
+export const SCORE_TIMING_VERSION = "s93";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
