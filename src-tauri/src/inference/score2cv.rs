@@ -950,6 +950,12 @@ fn assemble_arrays(
     // S92k: test-build-only borrow ledger (see `ScoreArrays::borrow_ledger`).
     #[cfg(test)]
     let mut ledger: Vec<(usize, i64)> = Vec::new();
+    // ★S92o: indices in `pdur` of codas that the CODA PRE-ROLL just fed. The next note's onset borrow
+    // must not drain them again — measured on the user's track before this guard existed: the pre-roll
+    // moved 2 frames into `even`'s /n/ and `feel`'s /f/ took them straight back out at depth 1, so the
+    // frames ended up in the NEXT word's onset and the release was no better off. Same self-defeating
+    // shape S92e already had to bound once (a deep borrow re-draining a consonant it had just fed).
+    let mut coda_preroll_fed: Vec<usize> = Vec::new();
     #[cfg(test)]
     let mut alloc_snap: Vec<(usize, Vec<i64>)> = Vec::new();
 
@@ -1169,6 +1175,10 @@ fn assemble_arrays(
                             j -= 1;
                             depth += 1;
                             let is_rest = matches!(phon[j], "SP" | "AP");
+                            // ★S92o: a coda the pre-roll just fed is off limits — see `coda_preroll_fed`.
+                            if coda_preroll_fed.contains(&j) {
+                                continue;
+                            }
                             // ★Stay inside the note we are ALREADY restructuring (a rest is silence and may
                             // always lend). Reaching two notes back would shift a whole intervening note
                             // earlier — the very timing displacement this round exists to remove. Measured:
@@ -1339,9 +1349,86 @@ fn assemble_arrays(
                             ledger.extend(net.into_iter().filter(|(_, d)| *d > 0));
                         }
                     }
-                    for (&p, &d) in ph.iter().zip(durs.iter()) {
+                    // ★S92o — CODA pre-roll: the word-final consonant of a MELISMA borrows backwards
+                    //   from the held vowel, exactly as the onset pre-roll borrows from the phone before
+                    //   it. User's ear, on his own track: `dear`'s /ɹ/ is audible and `ear`'s is not,
+                    //   "and the second half of those two words should be the same".
+                    //
+                    //   He is right, and the cause is neither the phones nor the render:
+                    //     • both words are V + /ɹ/ with the coda 归韵-deferred onto the LAST note of the
+                    //       span; `dear` ends on a 32-frame note ⇒ /ɹ/ 12 frames, `ear` on an 8-frame one
+                    //       ⇒ /ɹ/ 3 frames (60 ms). The author wrote the releases that differently.
+                    //     • MEASURED in the rendered audio: `ear`'s /ɹ/ sits at −17.1 dBFS and `dear`'s at
+                    //       −16.7, i.e. **the same level, ~3 dB under their own vowel** — the 3 frames are
+                    //       not missing energy, 60 ms is simply too short to be heard as an /r/.
+                    //     • and per-note we are IN distribution: real English gives an 8-15 frame note's
+                    //       coda a median of 4-5 frames (33%); we give 3 (38%).
+                    //   So the only honest fix is to make the release LONGER, and the only frames that may
+                    //   pay for it belong to the same vowel that is already being held — which is what
+                    //   English does anyway: r-colouring starts in the tail of the hold, not in its last
+                    //   60 ms (training data: a long note's /ɹ/ coda runs 16 frames at p50, 90 at p95).
+                    //
+                    //   ⚠ Sized by the SPAN, not by this short release note: `coda_target_frames` keyed on
+                    //   8 frames answers 3 — the same number we already have — so aiming at the note's own
+                    //   bucket could never move anything. The span is the vowel's accumulated length,
+                    //   walked back over the identical held phone.
+                    //   ⚠ Auto arm only: "自动咬字时序 = 关" (InNote, S89) means the author placed the
+                    //   consonants and nothing may cross a note boundary.
+                    let mut preroll_fed = vec![false; n];
+                    if timing == ArticulationTiming::Auto && nucleus_continues && n > nuc + 1 {
+                        let held = ph[nuc];
+                        let mut span = fr;
+                        let mut j = pdur.len();
+                        while j > 0 && phon[j - 1] == held {
+                            j -= 1;
+                            span += pdur[j];
+                        }
+                        let want_span: i64 =
+                            ph[nuc + 1..].iter().map(|p| coda_target_frames(p, span)).sum();
+                        let have: i64 = durs[nuc + 1..].iter().sum();
+                        let mut need = (want_span - have).max(0);
+                        // Lend from the held vowel's tail, newest first. It is the most benign lender
+                        // there is — the SAME vowel, and it continues into this note, so shortening it
+                        // changes no syllable's identity. Still bounded by the shipped, ear-validated
+                        // half-clamp + NUCLEUS_KEEP_MIN, so it can never reach the S84 collapse region.
+                        let mut j = pdur.len();
+                        while need > 0 && j > 0 && phon[j - 1] == held {
+                            j -= 1;
+                            let d = pdur[j];
+                            let cap = (d - NUCLEUS_KEEP_MIN).max(0).min((d + 1) / 2);
+                            let take = need.min(cap);
+                            if take > 0 {
+                                pdur[j] -= take;
+                                need -= take;
+                                // LAST-first: the word-final release carries the cue (same policy as the
+                                // in-note coda pass), each still capped at its own span-sized target.
+                                // `left` MUST decrement — otherwise every coda would be handed the full
+                                // `take` and conservation would break (Σ durs > Σ frames).
+                                let mut left = take;
+                                for i in (nuc + 1..n).rev() {
+                                    if left == 0 {
+                                        break;
+                                    }
+                                    let room = (coda_target_frames(ph[i], span) - durs[i]).max(0);
+                                    let give = room.min(left);
+                                    durs[i] += give;
+                                    left -= give;
+                                    if give > 0 {
+                                        preroll_fed[i] = true;
+                                    }
+                                }
+                                debug_assert_eq!(left, 0, "coda pre-roll took frames it could not place");
+                                #[cfg(test)]
+                                ledger.push((j, take));
+                            }
+                        }
+                    }
+                    for (i, (&p, &d)) in ph.iter().zip(durs.iter()).enumerate() {
                         if d <= 0 {
                             continue; // dropped medial/coda / sub-minimum onset — never emit a 0-frame phone
+                        }
+                        if preroll_fed[i] {
+                            coda_preroll_fed.push(pdur.len());
                         }
                         phon.push(p);
                         pdur.push(d);
@@ -2091,7 +2178,10 @@ mod tests {
         let held = build_arrays_daw(
             &[raw("v ɪ", 12), raw("ɪ n", 4)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(held.phon, vec!["v", "ɪ", "ɪ", "n"], "the deferred word-final n must survive");
-        assert_eq!(held.phone_dur, vec![2, 10, 2, 2]);
+        // ★S92o moved this by ONE frame: the coda pre-roll sizes /n/ by the SPAN (12+4 = 16 frames ⇒
+        // its measured target is 3, not the 4-frame note's 2) and takes the missing frame from the held
+        // ɪ before it. Same word, same total, the release just starts one frame earlier.
+        assert_eq!(held.phone_dur, vec![2, 9, 2, 3]);
         assert_eq!(held.phone_dur.iter().sum::<i64>(), 16, "frame-conserving");
 
         let fresh = build_arrays_daw(
@@ -2178,6 +2268,65 @@ mod tests {
             &[raw("m aɪ n d", 20), raw("s i", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur, vec![2, 11, 4, 2, 2, 15], "zh/ja: depth 1, unchanged");
         assert_eq!(j.phone_dur.iter().sum::<i64>(), 36);
+    }
+
+    /// ★S92o — the CODA pre-roll: a melisma's deferred word-final consonant borrows backwards from the
+    /// held vowel, mirroring the onset pre-roll.
+    ///
+    /// User's ear on his own track: `dear`'s /ɹ/ is audible, `ear`'s is not, "and the second half of
+    /// those two words should be the same". He is right; the cause is the AUTHOR's note lengths —
+    /// both defer /ɹ/ onto the span's last note, `dear`'s is 32 frames (⇒ /ɹ/ 12) and `ear`'s is 8
+    /// (⇒ /ɹ/ 3 = 60 ms). Ruled out by measurement, in order: not the S92n clamp (`ear` never touched
+    /// it), not the `fr*2/5` ceiling (dropping it for held nuclei moved 17 notes and not this one),
+    /// and NOT the render — in the rendered audio `ear`'s /ɹ/ sits at −17.1 dBFS against `dear`'s
+    /// −16.7, the same ~3 dB under their own vowel. 60 ms simply is not heard as an /r/.
+    ///
+    /// ⚠ The target must be sized by the SPAN: `coda_target_frames` keyed on the 8-frame release note
+    /// answers 3 — the number we already have — so nothing could ever move.
+    /// ⚠ **No distribution evidence is available for this shape.** The reverse-projected corpus has
+    /// 0 of 403 notes with a held nucleus AND a coda: the training aligner never emits a repeated vowel
+    /// across notes, so the melisma-release shape is OURS (the `+` sustain), not the corpus's. The
+    /// evidence here is the user's ear plus English r-colouring, not `mg_truth_cmp`.
+    #[test]
+    fn s92o_coda_preroll_borrows_from_the_held_vowel() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        // `ear`'s shape: a 40-frame hold of /i/, then an 8-frame release carrying the deferred /ɹ/.
+        let a = build_arrays_daw(&[en("IY1", 40), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["i", "i", "ɹ"]);
+        assert_eq!(a.phone_dur, vec![27, 5, 16], "the release is sized by the SPAN (48 frames), not by 8");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 48, "zero-sum: the timeline does not move");
+
+        // ★判别器 1:上一个音符以**别的**音素结尾 ⇒ 核不是延续的 ⇒ 前借不许发生。
+        let fresh = build_arrays_daw(&[en("AA1", 40), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(fresh.phone_dur, vec![40, 5, 3], "a FRESH vowel: the release keeps the old 3 frames");
+
+        // ★判别器 2:InNote 臂(「自动咬字时序 = 关」)的契约是不跨音符移动 ⇒ 也不许发生。
+        let innote = build_arrays_daw(&[en("IY1", 40), en("IY1 R", 8)], &d, ArticulationTiming::InNote).unwrap();
+        assert_eq!(innote.phone_dur[0], 40, "InNote must not touch the previous note");
+
+        // ★判别器 3:出借的被延长元音**很短**时,那道半数钳位 + `NUCLEUS_KEEP_MIN` 必须咬住 ——
+        //   变异实测:补这条之前,把出借上限改成「随便拿」整套自检**照样全绿**(上面几个夹具的
+        //   `need` 都小于上限,钳位从没生效过 = 零覆盖)。不设限的话这里会把出借者掏成 0 帧,
+        //   连音素都被丢掉(8 帧的 held 元音被拿走 8 帧)。
+        let short_lender =
+            build_arrays_daw(&[en("IY1", 8), en("IY1 R", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(short_lender.phon, vec!["i", "i", "ɹ"], "出借者不许被掏到 0 帧而丢音");
+        assert_eq!(short_lender.phone_dur, vec![4, 5, 7], "半数钳位 + NUCLEUS_KEEP_MIN 咬住了");
+        assert_eq!(short_lender.phone_dur.iter().sum::<i64>(), 16, "conserving");
+
+        // ★★抽干保护:下一个词的**词首**辅音在深度 1 上本可以从这个 16 帧的 /ɹ/ 拿走 8 帧 ——
+        //   实测(用户那首歌,加保护之前):前借喂给 `even` 的 /n/ 的 2 帧被 `feel` 的 /f/ 当场取走,
+        //   帧最后落到了**下一个词**的词首,收尾一点没改善。同一形状 S92e 已经栽过一次。
+        let chain = build_arrays_daw(
+            &[en("IY1", 40), en("IY1 R", 8), en("F IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
+        let ri = chain.phon.iter().position(|&p| p == "ɹ").unwrap();
+        assert_eq!(chain.phon[ri], "ɹ");
+        assert_eq!(chain.phone_dur[ri], 16, "刚被前借喂饱的 coda 不许再被下一个 onset 抽干");
+        assert_eq!(chain.phone_dur.iter().sum::<i64>(), 64, "conserving");
     }
 
     /// ★S92n — the coda duration target is no longer clamped at 7 frames.

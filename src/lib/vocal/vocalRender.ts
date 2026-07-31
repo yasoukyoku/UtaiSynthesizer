@@ -681,7 +681,23 @@ export const G2P_ALGO_VERSION = "s90";
  *  r/ng coda: r +12 frames, ng +2, the vowels give up 14). zh/ja and all three UTAU-alias lanes are
  *  byte-identical — not by a language gate but structurally (zh finals are atomic so n_coda=0, ja codas
  *  are only the moraic nasal), which the lanes PROVE rather than the argument. */
-export const SCORE_TIMING_VERSION = "s92n";
+/*  s92o = CODA pre-roll: a melisma's deferred word-final consonant borrows backwards from the vowel it
+ *  is still holding, mirroring the onset pre-roll. The user heard it: dear's /r/ is audible and ear's is
+ *  not, "and the second half of those two words should be the same". He is right and it is the AUTHOR's
+ *  note lengths — both defer /r/ onto the span's LAST note, dear's is 32 frames (=> 12) and ear's is 8
+ *  (=> 3 = 60 ms). Ruled out by measurement first: not the s92n clamp (ear never touched it), not the
+ *  2/5 ceiling (dropping it for held nuclei moved 17 notes, not this one), and NOT the render — in the
+ *  audio ear's /r/ is -17.1 dBFS against dear's -16.7, the same ~3 dB under their own vowel; 60 ms just
+ *  is not heard as an /r/. Sized by the SPAN (the note's own 8 frames answer 3, the number we already
+ *  had). On the user's track: ear's /r/ 3 -> 16 frames, dear's 12 -> 16, every -ing's /ng/ 3-4 -> 10,
+ *  58 notes move, frames conserved, phone count unchanged. Auto arm only (InNote means the author placed
+ *  the consonants). A guard stops the NEXT word's onset from draining a coda the pre-roll just fed —
+ *  measured without it, even's /n/ lost its 2 new frames to feel's /f/ immediately. zh/ja and the three
+ *  UTAU-alias lanes are byte-identical (they never defer a coda onto a sustain).
+ *  ⚠ NO distribution evidence exists for this shape: the reverse-projected corpus has 0 of 403 notes
+ *  with a held nucleus AND a coda — the training aligner never repeats a vowel across notes, so the
+ *  melisma-release shape is ours, not the corpus's. Evidence = the user's ear + English r-colouring. */
+export const SCORE_TIMING_VERSION = "s92o";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
