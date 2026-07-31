@@ -386,7 +386,8 @@ fn mg_audit() {
                 "position": f.position.code(), "lang": f.lang, "note_frames": f.note_frames,
                 "actual": f.actual, "target_effective": f.target_effective,
                 "target_measured": f.target_measured, "deficit": f.deficit(),
-                "score_forced": f.score_forced,
+                "score_forced": f.score_forced, "ref_count": f.ref_count,
+                "group_frames": f.group_frames,
             })
         })
         .collect();

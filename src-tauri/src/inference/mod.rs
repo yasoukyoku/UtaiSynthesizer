@@ -17,6 +17,9 @@ mod score2cv_dur_priors;
 mod score2cv_tables;
 #[cfg(test)]
 mod score2cv_cv_ref;
+/// S92k 审计件的真人时长分布参照(生成物;仅测试构建需要)。
+#[cfg(test)]
+mod score2cv_audit_ref;
 pub mod score2svc;
 #[cfg(test)]
 mod score2svc_ref;
