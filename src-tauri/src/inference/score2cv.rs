@@ -639,28 +639,16 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
     }
     // coda: per-token measured target each (S83 second knife: t/d≈3, n≈4, s/ɕ≈6-7 — one flat cap
     // flattened the 程度), ≥2 each (else DROPPED — never a 1-frame phone), total ≤ 2/5 of the note
-    // (training: vowel share median 44-47%). LAST-first: the word-final release is the perceptually
-    // load-bearing cue — when the budget starves, inner codas drop before it.
+    // (training: vowel share median 44-47%). LAST-first is the DROP rule: the word-final release is
+    // the perceptually load-bearing cue — when the budget starves, inner codas drop before it.
     //
-    // ★S92: with TWO OR MORE coda consonants — an English CLUSTER, a shape zh cannot even express
-    // (its finals are atomic vocab tokens: `wang` = [w, ɑŋ], n_coda = 0) and ja tops out at one —
-    // "LAST-first, each takes its full measured target" let the outermost consonant eat the whole
-    // budget and SILENTLY DELETED the inner one at perfectly ordinary note lengths. Measured on the
-    // user's real 283-note English track: 6 notes lost a phone with no error and no red mark —
-    // `means`@320ms sang "meez" (z took all 6 of the 6-frame budget, n got 0), `things`@320ms "thiz",
-    // `don't`@160ms "dote", `find`@160ms "fide", `[f ih r s]`@320ms "fiss".
-    // Two bounded changes; BOTH are exact no-ops unless n_coda ≥ 2 (`unserved` is 0 for the only
-    // coda, and `cluster_floor` is 0), and a note with n_coda ≥ 2 does not exist in the ja probe
-    // song (0 of 1215 sung notes) nor in any of the three UTAU-alias tracks (0 of ~325 each) —
-    // so the ear-verified ja/alias allocation is preserved BY CONSTRUCTION, not by a language flag:
-    //   1. RESERVE the minimum for the codas not yet served (they are served after this one), so the
-    //      outermost member can no longer starve them. `means`: z 4 + n 2 instead of z 6 + n DROPPED,
-    //      and **the nucleus keeps exactly the frames it had** — the total budget does not change.
-    //   2. Raise the 2/5 ceiling to `n_coda * CODA_MIN_FRAMES` when 2/5 cannot fund the minimums at
-    //      all (a cluster below 2 frames per member means nothing). `don't`@160ms: 3 → 4 frames of
-    //      coda, i.e. the nucleus pays ONE frame for the /n/ it was losing entirely. Still bounded by
-    //      `fr - nuc_floor - used`, so conservation and the nucleus floor are untouched, and `budget`
-    //      stays monotone in note length (a longer note can never delete a consonant — S89).
+    // ★S92 (history): "LAST-first, each takes its full measured target" let the outermost consonant
+    // eat the whole budget and SILENTLY DELETED the inner one (`means`@320ms sang "meez",
+    // `don't`@160ms "dote", `find`@160ms "fide" — 6 notes on the user's real track). S92 patched
+    // that with a reserve (outermost may no longer starve the inner ones below their minimum) and
+    // with the `cluster_floor` ceiling raise below. S96 replaces the reserve+serve-in-full loop with
+    // the proportional split (see the block at the budget line) — the reserve's guarantee (every
+    // live member ≥ CODA_MIN_FRAMES) is subsumed by the floors, and the cluster_floor raise is kept.
     // ⚠ Deliberately NOT fixed here: a SINGLE coda that cannot reach 2 frames on a very short note
     // (`ɪ n`@80ms, 2 of the 8 real drops) — raising the k=1 ceiling would change ja (かん@80ms) and
     // needs its own ear test. See project_v2_pending_cleanups.
@@ -677,18 +665,91 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
         } else {
             0
         };
-        let mut budget = want.min(fr - nuc_floor - used).min((fr * 2 / 5).max(cluster_floor));
-        for i in (nuc + 1..n).rev() {
-            // held back for the codas BEFORE this one — never so much that THIS one starves.
-            let unserved = (i - (nuc + 1)) as i64;
-            let reserve = (unserved * CODA_MIN_FRAMES).min((budget - CODA_MIN_FRAMES).max(0));
-            let give = coda_target_frames(ph[i], note_frames).min(budget - reserve);
-            if give < CODA_MIN_FRAMES {
-                continue; // dropped; the remaining budget stays for the codas before it
+        let budget = want.min(fr - nuc_floor - used).min((fr * 2 / 5).max(cluster_floor));
+        // ★S96 — the budget is split IN PROPORTION TO THE MEASURED TARGETS, not LAST-first-take-all.
+        // LAST-first survives as the DROP rule (inner codas die first — the word-final release is
+        // still the perceptually load-bearing cue) but no longer as the SERVING rule: serving the
+        // outermost member its FULL target first inverted the cluster's internal ratio whenever the
+        // budget was tight. The user's own `dears` [d ɪ ɹ z]@21fr: budget = 21*2/5 = 8, z took its
+        // full 6 and ɹ was left at the 2-frame floor — while the language-specific reference
+        // distribution (score2cv_audit_ref.rs) puts a real long-note en ɹ coda at p50=16 vs z p50=6:
+        // the ratio was UPSIDE-DOWN (the r-colour is most of what the listener hears in "-ears").
+        // Proportional split gives ɹ6/z2 out of the SAME 8 — zero-sum inside the budget; the nucleus
+        // keeps exactly the frames it kept before, and the S92 cluster minima are unchanged (every
+        // member that lives still gets ≥ CODA_MIN_FRAMES; `means` n2/z4 and `don't` n2/t2 come out
+        // byte-identical — verified by the pinned tests below).
+        // zh/ja/alias tracks are no-ops BY CONSTRUCTION, same argument as S92: n_coda ≤ 1 there, and
+        // a single member's proportional share IS the whole budget (give = min(budget, target),
+        // exactly the old arithmetic). ⚠ NOT touched this round: the 2/5 ceiling itself (raising it
+        // is the deferred "r-colour is part of the vowel" decision — S92n said ear first).
+        // How many members can live at ≥2 — inner members drop first, exactly as before.
+        let k_live = ((budget / CODA_MIN_FRAMES).max(0) as usize).min(n_coda);
+        if k_live > 0 {
+            let live0 = n - k_live;
+            // ★A DROPPED member still holds back its floor (capped so the survivors keep theirs) —
+            // the exact semantics of the S92 reserve it replaces. Without this, the lone survivor
+            // of a starved cluster swallows the whole budget, and one frame of extra note length
+            // (k_live 1 → 2) then SHRINKS it: the sweep test caught `[.. 0 3] -> [.. 2 2]` at
+            // fr 6 → 7, a violation of "a longer note never shortens a consonant" (S89).
+            let held = (CODA_MIN_FRAMES * (n_coda - k_live) as i64)
+                .min((budget - CODA_MIN_FRAMES * k_live as i64).max(0));
+            let budget = budget - held;
+            // Iterative proportional fill: members whose proportional share rounds below the 2-frame
+            // floor get pinned AT the floor and removed from the pool, the rest re-shares the
+            // remaining budget (straight water-filling; ≤ n_coda rounds). Leftover frames from
+            // integer truncation go to the largest remainders, OUTER member first on ties.
+            let mut give = vec![0i64; k_live];
+            let mut pool: Vec<usize> = (0..k_live).collect(); // indices into give/live members
+            let mut b = budget;
+            while !pool.is_empty() {
+                let w_pool: i64 =
+                    pool.iter().map(|&j| coda_target_frames(ph[live0 + j], note_frames)).sum();
+                if w_pool <= 0 {
+                    break;
+                }
+                let mut under: Vec<usize> = Vec::new();
+                let mut shares: Vec<(usize, i64, i64)> = Vec::new(); // (j, floor, remainder)
+                for &j in &pool {
+                    let t = coda_target_frames(ph[live0 + j], note_frames);
+                    let q = b * t / w_pool;
+                    if q < CODA_MIN_FRAMES {
+                        under.push(j);
+                    } else {
+                        shares.push((j, q, b * t % w_pool));
+                    }
+                }
+                if under.is_empty() {
+                    let assigned: i64 = shares.iter().map(|s| s.1).sum();
+                    for &(j, q, _) in &shares {
+                        give[j] = q;
+                    }
+                    // Leftover from integer truncation (< pool size by construction, so each member
+                    // gains at most 1 and can never exceed its target — q ≤ t−1 whenever b < w_pool,
+                    // and b == w_pool leaves zero remainder): largest remainder first, ties → the
+                    // OUTER (later) member (the word-final release keeps its priority).
+                    shares.sort_by(|x, y| y.2.cmp(&x.2).then(y.0.cmp(&x.0)));
+                    let mut left = b - assigned;
+                    for &(j, _, _) in &shares {
+                        if left == 0 {
+                            break;
+                        }
+                        give[j] += 1;
+                        left -= 1;
+                    }
+                    break;
+                }
+                for &j in &under {
+                    give[j] = CODA_MIN_FRAMES;
+                    b -= CODA_MIN_FRAMES;
+                    pool.retain(|&x| x != j);
+                }
             }
-            durs[i] = give;
-            budget -= give;
-            used += give;
+            for (j, &g) in give.iter().enumerate() {
+                debug_assert!(g >= CODA_MIN_FRAMES, "a live coda member below the emission floor");
+                durs[live0 + j] = g;
+                used += g;
+            }
+            debug_assert!(give.iter().sum::<i64>() <= budget, "coda pass overspent its budget");
         }
     }
     durs[nuc] = fr - used; // nucleus takes the whole remainder (≥ nuc_floor by construction)
@@ -2237,14 +2298,17 @@ mod tests {
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 8, "frame-conserving");
     }
 
-    /// A 3-consonant coda (`strengths`) — all three survive, outermost still gets the most.
-    /// [i ŋ θ s] @ 20 fr: want = 7+7+6 = 20, cluster_floor = 6, cap = max(8, 6) = 8 ⇒ budget 8;
-    /// s holds back 2*2 = 4 ⇒ s = min(6, 4) = 4; θ holds back 2 ⇒ min(7, 2) = 2; ŋ = min(7, 2) = 2.
+    /// A 3-consonant coda (`strengths`) — all three survive (the S92 guarantee, unchanged), and the
+    /// budget now follows the MEASURED target ratio (S96 proportional split): post-S92n targets are
+    /// ŋ 10 / θ 7 / s 6 (W = 23), budget 8 ⇒ shares 3/2/2 + the leftover frame to the largest
+    /// remainder (ŋ) ⇒ [4, 2, 2]. The pre-S96 [2, 2, 4] gave the word-final release the most by
+    /// SERVING ORDER, not by measurement — the sonorant hugging the vowel is what carries the
+    /// cluster's colour (same evidence family as `dears`' ɹ vs z).
     #[test]
     fn s92_three_consonant_coda_all_survive() {
         let arr = build_arrays_daw(&[raw("i ŋ θ s", 20)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["i", "ŋ", "θ", "s"]);
-        assert_eq!(arr.phone_dur, vec![12, 2, 2, 4]);
+        assert_eq!(arr.phone_dur, vec![12, 4, 2, 2]);
     }
 
     /// ★The ja/zh-neutrality guard. A SINGLE coda takes exactly the pre-S92 path: `unserved` is 0 for
@@ -2253,6 +2317,20 @@ mod tests {
     /// sung notes, and so do all three UTAU-alias tracks. (The behavioural proof is the byte-identical
     /// lane dump; this test exists so a future edit to the single-coda path turns something red.)
     /// [i n] @ 16 fr: budget = min(4, 14, 6) = 4 ⇒ n = 4, nucleus 12.
+    /// ★S96 discriminator — the user's `dears` shape ([d] is borrow-funded on the Auto arm; the
+    /// note itself feeds ɪ ɹ z @ 21 fr): budget = 21*2/5 = 8, targets ɹ 16 / z 6 (the en reference
+    /// distribution: real long-note ɹ codas sit at p50 = 16, z at 6 — the r-colour IS the "-ears")
+    /// ⇒ proportional 5(+1 largest-remainder)/2 ⇒ ɹ 6, z 2, nucleus keeps 13. Pre-S96 the
+    /// LAST-first serving order handed z its full 6 and left ɹ on the 2-frame floor — the audible
+    /// "dears 的 r 被吞" the user pinpointed, with the cluster ratio UPSIDE-DOWN vs measurement.
+    /// (Budget itself unchanged — the 2/5 ceiling stays; raising it is the deferred r-colour call.)
+    #[test]
+    fn s96_dears_cluster_ratio_follows_targets() {
+        let arr = build_arrays_daw(&[raw("ɪ ɹ z", 21)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(arr.phon, vec!["ɪ", "ɹ", "z"]);
+        assert_eq!(arr.phone_dur, vec![13, 6, 2], "ɹ must outweigh z (targets 16:6), budget/nucleus unmoved");
+    }
+
     #[test]
     fn s92_single_coda_is_untouched() {
         let arr = build_arrays_daw(&[raw("i n", 16)], &NoDicts, ArticulationTiming::Auto).unwrap();

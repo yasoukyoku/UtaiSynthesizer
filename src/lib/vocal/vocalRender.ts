@@ -711,8 +711,16 @@ export const G2P_ALGO_VERSION = "s94";
  *  vowel lender may fall to 1 frame (in-distribution: real ja/zh short-note nucleus p05 = 1) and the
  *  nucleus pays its spare above min(fr,2); all-or-nothing, so a note that does not drop is
  *  byte-identical. en-words + the three alias lanes and the whole InNote arm: byte-identical (hash
- *  gate, 9/10 lanes). ja Auto lane: exactly 6 rows moved, all at the two rescue sites. */
-export const SCORE_TIMING_VERSION = "s93";
+ *  gate, 9/10 lanes). ja Auto lane: exactly 6 rows moved, all at the two rescue sites.
+ *
+ *  s96 — coda clusters split their budget IN PROPORTION TO THE MEASURED TARGETS instead of
+ *  LAST-first-take-all (the user's dears@21fr sang ɪ:13 ɹ:2 z:6 — the cluster ratio upside-down vs
+ *  the reference distribution, en long-note ɹ coda p50=16 vs z p50=6; now ɹ:6 z:2, budget and
+ *  nucleus untouched). LAST-first survives as the DROP rule; a dropped member still holds back its
+ *  floor (monotonicity: a longer note never shortens a consonant). ja/alias/InNote-ja lanes
+ *  byte-identical BY CONSTRUCTION (n_coda ≤ 1 ⇒ single-member share = whole budget = old arithmetic);
+ *  en lanes: 12 notes moved (dears/things/strengths-class ratio fixes + 2 borrow-source shifts). */
+export const SCORE_TIMING_VERSION = "s96";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
