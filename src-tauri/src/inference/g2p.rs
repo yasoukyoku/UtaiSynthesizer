@@ -330,11 +330,63 @@ impl WordDict {
         }
     }
 
-    pub fn lookup(&self, word: &str) -> Option<Vec<String>> {
+    /// The S86 tolerance ladder ONLY (case/quotes/punct/ß) — no plural reconstruction.
+    /// The fragment-merge TRIGGER must ask THIS question (review S95R-2): with the plural rung
+    /// in the trigger, any s-final fragment that parses as base+s stops counting as OOV —
+    /// "mes" reads as me+Z, the merge never fires, and mes|sage sings "meez sage" with no red
+    /// mark instead of joining to "message". A fragment that can still become a whole word by
+    /// merging must get that chance BEFORE the last-resort plural reading.
+    fn lookup_faithful(&self, word: &str) -> Option<Vec<String>> {
         lookup_candidates(word)
             .iter()
             .find_map(|k| self.map.get(k))
             .map(|p| p.split_whitespace().map(str::to_string).collect())
+    }
+
+    pub fn lookup(&self, word: &str) -> Option<Vec<String>> {
+        if let Some(p) = self.lookup_faithful(word) {
+            return Some(p);
+        }
+        // S95: EN regular plural/possessive rung, strictly LAST — cmudict omits many regular
+        // plurals ("dears" while "dear" ships), and before this rung such a lyric hard-aborted
+        // the render as VOCAL_OOV. EN only: fr plural -s is SILENT, de/es/it inflect on their
+        // own rules — appending /s z ɪz/ there would sing another language's morphology.
+        // (Defense in depth, verified by mutation: even WITHOUT this gate, stage2 rejects the
+        // uppercase ARPABET suffix against every non-EN vocab, so those words stay OOV either
+        // way — the gate states the intent instead of leaning on that coincidence.)
+        if self.lang == Lang::En {
+            lookup_candidates(word).iter().find_map(|k| self.en_plural(k))
+        } else {
+            None
+        }
+    }
+
+    /// One `-'s` / `-s` / `-es` strip of an EN lookup key whose base IS in the dictionary →
+    /// base phones + the suffix cmudict itself uses: sibilant-final → `IH0 Z` (roses), voiceless-
+    /// final → `S` (lights), else → `Z` (dears). Tried per tolerance-ladder candidate so case/
+    /// quote/punct rungs keep working. A base under 3 chars is refused (review S95R-3): en.tsv's
+    /// 1-2 char rows are largely letter names and cmudict ABBREVIATION EXPANSIONS (dr=drive,
+    /// st=street, me/to/be…), so short bases turn mis-typed fragments into silent whole words —
+    /// "mes" would sing "meez", "dres" would sing "drives". The refused recall (djs, tvs) is
+    /// tiny and stays loud instead of guessing.
+    fn en_plural(&self, key: &str) -> Option<Vec<String>> {
+        for base in [key.strip_suffix("'s"), key.strip_suffix('s'), key.strip_suffix("es")] {
+            let Some(b) = base else { continue };
+            if b.chars().count() < 3 {
+                continue;
+            }
+            let Some(p) = self.map.get(b) else { continue };
+            let mut phones: Vec<String> = p.split_whitespace().map(str::to_string).collect();
+            let last = phones.last().map(|s| s.trim_end_matches(['0', '1', '2']).to_string())?;
+            let suffix: &[&str] = match last.as_str() {
+                "S" | "Z" | "SH" | "ZH" | "CH" | "JH" => &["IH0", "Z"],
+                "P" | "T" | "K" | "F" | "TH" => &["S"],
+                _ => &["Z"],
+            };
+            phones.extend(suffix.iter().map(|s| s.to_string()));
+            return Some(phones);
+        }
+        None
     }
 
     /// Parse the canonical `word<TAB>phones` TSV. First-seen pronunciation wins (the build emits the
@@ -705,6 +757,56 @@ fn nucleus_idx(dict: &WordDict, syl: &[String]) -> usize {
     syl.iter().position(|p| dict.is_vowel(p)).unwrap_or(syl.len().saturating_sub(1))
 }
 
+// ─── S95 fragment merge (拆词) ───────────────────────────────────────────────────────────────────
+
+/// Most word-fragment spellings need at most three notes (to|get|ther); four is headroom, and the
+/// cap keeps the join search bounded on pathological scores (eighty one-letter notes must not
+/// explode into windows).
+const MERGE_MAX_WORDS: usize = 4;
+
+/// S95 fragment merge: try every deterministic join of `frags` against the dictionary, fewest
+/// seam-dedupes first (the faithful concatenation is candidate #0). A seam may fold ONE doubled
+/// consonant LETTER: the UTAU re-attack convention writes "nev|ver" / "giv|ving" / "look|king" —
+/// the second note re-attacks with the consonant it shares with the first, but the WORD carries it
+/// once. Vowel letters never fold (no attested case, and "a|and" must not become "and"… minus a).
+/// Every candidate goes through `WordDict::lookup`, i.e. the full S86 tolerance ladder plus the
+/// S95 plural rung — ONE lookup notion, nothing new to drift.
+/// Returns the best (fewest-dedupe = longest) hit for THIS window as
+/// `(joined char length, seam dedupes, trad phones)` — the caller compares windows by length
+/// (see the selection comment in the merge pass; review S95R-1).
+fn join_lookup(dict: &WordDict, frags: &[&str]) -> Option<(usize, u32, Vec<String>)> {
+    let seams = frags.len() - 1;
+    let foldable: Vec<bool> = (0..seams)
+        .map(|s| {
+            match (frags[s].chars().last(), frags[s + 1].chars().next()) {
+                (Some(a), Some(b)) => {
+                    a.eq_ignore_ascii_case(&b)
+                        && a.is_ascii_alphabetic()
+                        && !matches!(a.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u')
+                }
+                _ => false,
+            }
+        })
+        .collect();
+    let mut masks: Vec<u32> = (0u32..1 << seams)
+        .filter(|m| (0..seams).all(|s| m & (1 << s) == 0 || foldable[s]))
+        .collect();
+    masks.sort_by_key(|m| (m.count_ones(), *m));
+    for mask in masks {
+        let mut joined = frags[0].to_string();
+        for (s, f) in frags[1..].iter().enumerate() {
+            if mask & (1 << s) != 0 {
+                joined.pop(); // drop the LEFT copy of the doubled letter (char-wise, UTF-8 safe)
+            }
+            joined.push_str(f);
+        }
+        if let Some(t) = dict.lookup(&joined) {
+            return Some((joined.chars().count(), mask.count_ones(), t));
+        }
+    }
+    None
+}
+
 // ─── the resolve pass ────────────────────────────────────────────────────────────────────────────
 
 /// Per-note resolution outcome (the render consumes `Phones`; the editor consumes the class verbatim).
@@ -991,6 +1093,141 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
         }
     }
 
+    // ── S95 fragment-merge pass (拆词): join adjacent OOV word fragments into ONE dictionary word.
+    // UTAU authors write one word as per-note fragments — "e|ven", "nev|ver", "to|get|ther" — with
+    // the seam consonant usually doubled (CV re-attack). Trigger = a western Word note whose lyric
+    // the FAITHFUL tolerance ladder misses (`lookup_faithful`; the plural rung is deliberately NOT
+    // part of the trigger — review S95R-2: with it, "mes" reads as me+Z, stops counting as OOV,
+    // and mes|sage sings "meez sage" instead of merging to "message". Plural is a last-resort
+    // reading; a fragment that can still become a whole word by merging gets that chance first).
+    // Version note (the precise invariant — review S95R-1 corrected an overclaimed draft): every
+    // affected note (the trigger AND the neighbours a merge re-syllabifies) sits in a segment
+    // whose strict render always ERRORED before this pass, so any bake such a segment still holds
+    // is necessarily sig-DIRTY (a stale stem kept alive by the render-failure fallback is real;
+    // a sig-CLEAN one is impossible pre-S95). First play re-renders through the ordinary dirty
+    // path — no `G2P_ALGO_VERSION` bump is needed for S95 itself, and bumping would force a
+    // pointless full re-render of every project (S90: "hardening" passes the same bar).
+    // ⚠ FORWARD CAVEAT — this argument is NOT reusable for future changes to what a merge SINGS:
+    // post-S95, splitting a cleanly-baked merged span can leave an OOV-only half holding a
+    // window-sig-clean bake, and the pass sees exactly the render wire (buildScoreTriples output;
+    // that shared wire is what keeps editor/render/merge domains equal). Any later change to
+    // merge output MUST bump `G2P_ALGO_VERSION`.
+    // Non-OOV fragment pairs (look|king, pro|miss — both real words) are DELIBERATELY not merged:
+    // they render today, mostly AS the author's intended double-consonant re-attack; rewriting
+    // them would alter already-renderable scores and needs its own bump + ear evidence (user
+    // verdict, S95 scope).
+    // Determinism: triggers scan left→right (a successful merge CLAIMS its words; claimed words
+    // never merge again); window selection is greedy-longest (see the comment at the search).
+    // Holds between fragments are TRANSPARENT — they join the span, where the distribution logic
+    // re-emits the current nucleus ("e|-|ven" holds the /i/). `+`, rests, breaths, hints, aliases,
+    // other languages, `phoneme_input` and alias-failures all BREAK the window: those notes are
+    // not on the plain-dictionary path this pass rescues.
+    let mut merge_trad: Vec<Option<Vec<String>>> = vec![None; n];
+    let mut merge_last: Vec<Option<usize>> = vec![None; n];
+    {
+        let mut claimed: Vec<bool> = vec![false; n];
+        let frag_ok = |k: usize, lang: Lang, claimed: &Vec<bool>| -> bool {
+            !claimed[k]
+                && toks[k] == Tok::Word
+                && !matches!(score[k].lang, Lang::Ja | Lang::Zh)
+                && score[k].lang == lang
+                && score[k].phoneme_input.is_none()
+                && !alias_failed[k]
+        };
+        for i in 0..n {
+            let lang = score[i].lang;
+            if !frag_ok(i, lang, &claimed) {
+                continue;
+            }
+            let dict = dicts.words(lang)?;
+            if dict.lookup_faithful(score[i].lyric.trim()).is_some() {
+                continue; // not faithful-OOV — never a trigger (see the scope note above)
+            }
+            // fragment words reachable from the trigger, nearest-first, holds transparent
+            let mut left: Vec<usize> = Vec::new();
+            let mut k = i;
+            'l: while left.len() < MERGE_MAX_WORDS - 1 {
+                let mut p = k;
+                loop {
+                    if p == 0 {
+                        break 'l;
+                    }
+                    p -= 1;
+                    if toks[p] != Tok::Hold {
+                        break;
+                    }
+                }
+                if frag_ok(p, lang, &claimed) {
+                    left.push(p);
+                    k = p;
+                } else {
+                    break;
+                }
+            }
+            let mut right: Vec<usize> = Vec::new();
+            let mut k = i;
+            'r: while right.len() < MERGE_MAX_WORDS - 1 {
+                let mut p = k + 1;
+                while p < n && toks[p] == Tok::Hold {
+                    p += 1;
+                }
+                if p >= n {
+                    break 'r;
+                }
+                if frag_ok(p, lang, &claimed) {
+                    right.push(p);
+                    k = p;
+                } else {
+                    break;
+                }
+            }
+            // Window selection is GREEDY-LONGEST over every window containing the trigger — the
+            // same rule the zh phrase window and the alias tokenizer already live by. The shipped
+            // first draft took the FIRST hit in fewest-words-first order and review S95R-1 broke
+            // it on the real dictionary: the 2-word forward join ful|fil→"fulfil" stole the tail
+            // of won|der|ful before the 3-word "wonderful" was ever tried (won|der|fulfil|ling,
+            // zero red marks), and the 2-word backward join a|mes→"ames" beats mes|sage→"message"
+            // the same way. Longest joined string wins both. Ties: fewer seam-dedupes (more
+            // faithful), then more backward context (OOV fragments are usually word TAILS), then
+            // the leftmost window — a total order, so the choice is deterministic.
+            let mut best_key: Option<(usize, std::cmp::Reverse<u32>, usize, std::cmp::Reverse<usize>)> = None;
+            let mut best_hit: Option<(Vec<usize>, Vec<String>)> = None;
+            for m in 2..=MERGE_MAX_WORDS {
+                for back in (0..m).rev() {
+                    let fwd = m - 1 - back;
+                    if back > left.len() || fwd > right.len() {
+                        continue;
+                    }
+                    let mut words: Vec<usize> = left[..back].iter().rev().copied().collect();
+                    words.push(i);
+                    words.extend_from_slice(&right[..fwd]);
+                    let frags: Vec<&str> = words.iter().map(|&w| score[w].lyric.trim()).collect();
+                    if let Some((len, dedupes, trad)) = join_lookup(dict, &frags) {
+                        let key = (len, std::cmp::Reverse(dedupes), back, std::cmp::Reverse(words[0]));
+                        if best_key.as_ref().map_or(true, |k| key > *k) {
+                            best_key = Some(key);
+                            best_hit = Some((words, trad));
+                        }
+                    }
+                }
+            }
+            if let Some((words, trad)) = best_hit {
+                let head = words[0];
+                merge_trad[head] = Some(trad);
+                merge_last[head] = Some(*words.last().expect("merge window has >= 2 words"));
+                // Claiming is the determinism invariant ("a word belongs to at most one merge"),
+                // not a behaviour observable at fixture scale: the main pass only consults heads
+                // it visits, so an overlapping later merge is naturally shadowed unless a 4-word
+                // double-overlap re-heads an earlier span — a shape no attested material produces
+                // (mutation M2 survives the test suite; documented rather than pinned, S92p rule
+                // against pinning coincidences).
+                for &w in &words {
+                    claimed[w] = true;
+                }
+            }
+        }
+    }
+
     // main pass: per-note phones + carrier state for sustains; western spans handled look-ahead.
     let mut out: Vec<Option<ResolvedNote>> = vec![None; n];
     let oov = |lyr: &str| UtaiError::Inference(format!("VOCAL_OOV: {}", lyr));
@@ -1068,11 +1305,31 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                     _ => {
                         // western span: this word + following hold/next notes (any language change in a
                         // sustain is ignored — sustains inherit the carrier by construction).
-                        let mut span_end = i + 1;
+                        // S95: a fragment-merged head extends the span over its member words (and any
+                        // holds between them); members consume syllables exactly like `+` notes, so the
+                        // Word→Next rewrite below is the WHOLE integration — distribution, hold re-emit
+                        // and coda deferral are the machinery `+` spans already run.
+                        let mut span_end = merge_last[i].map_or(i + 1, |l| l + 1);
                         while span_end < n && matches!(toks[span_end], Tok::Hold | Tok::Next) {
                             span_end += 1;
                         }
-                        match resolve_west_span(evt, &score[i..span_end], &toks[i..span_end], dicts)? {
+                        let merged_toks: Vec<Tok>;
+                        let span_toks: &[Tok] = if merge_last[i].is_some() {
+                            merged_toks = toks[i..span_end]
+                                .iter()
+                                .map(|&t| if t == Tok::Word { Tok::Next } else { t })
+                                .collect();
+                            &merged_toks
+                        } else {
+                            &toks[i..span_end]
+                        };
+                        match resolve_west_span(
+                            evt,
+                            &score[i..span_end],
+                            span_toks,
+                            dicts,
+                            merge_trad[i].as_deref(),
+                        )? {
                             Some(assignments) => {
                                 for (j, ph) in assignments.into_iter().enumerate() {
                                     carrier = ph.last().copied().or(carrier);
@@ -1190,12 +1447,20 @@ fn resolve_west_span(
     span: &[ScoreEvt],
     toks: &[Tok],
     dicts: &dyn DictSource,
+    // S95 fragment merge: the pre-pass already joined this span's fragment lyrics into one
+    // dictionary word — these are its traditional phones, overriding the per-note lookup
+    // (which by construction MISSED on the trigger fragment). `phoneme_input` still wins:
+    // a merge head never has one (that is a mergeability condition), so the order is moot
+    // today, but the precedence mirrors the documented user-layer chain.
+    merged_trad: Option<&[String]>,
 ) -> Result<Option<Vec<Vec<&'static str>>>> {
     let dict = dicts.words(evt.lang)?;
     // stage1: the word's traditional phones (override with spaces already handled by the caller — a
     // no-space override here is a single traditional phone).
     let trad: Vec<String> = if let Some(pi) = evt.phoneme_input {
         pi.split_whitespace().map(str::to_string).collect()
+    } else if let Some(mt) = merged_trad {
+        mt.to_vec()
     } else {
         match dict.lookup(evt.lyric.trim()) {
             Some(t) => t,
@@ -1392,7 +1657,13 @@ mod tests {
         // `s94_en_onset_vote_gate` below.
         WordDict::from_tsv_min_votes(
             Lang::En,
-            "light\tL AY1 T\nbeautiful\tB Y UW1 T AH0 F AH0 L\ntree\tT R IY1\nsinger\tS IH1 NG ER0\nextra\tEH1 K S T R AH0\ntwo\tT UW1\nfun\tF AH1 N\nlove\tL AH1 V\ndon't\tD OW1 N T\n",
+            // S95 rows (fragment merge / plural rung): all single-consonant or vowel-initial
+            // onsets, so none of them can move an existing maximal-onset cut. Deliberately
+            // ABSENT: nev/ven/ther/giv/ving/leeve/ful/mes + gether/nevver/givving/amessage —
+            // the merge tests need the fragments to genuinely miss and the joins to be
+            // unambiguous. `ames`/`fulfil` are PRESENT on purpose: they are the shorter-window
+            // thieves the greedy-longest selection must beat (review S95R-1).
+            "light\tL AY1 T\nbeautiful\tB Y UW1 T AH0 F AH0 L\ntree\tT R IY1\nsinger\tS IH1 NG ER0\nextra\tEH1 K S T R AH0\ntwo\tT UW1\nfun\tF AH1 N\nlove\tL AH1 V\ndon't\tD OW1 N T\ne\tIY1\neven\tIY1 V AH0 N\nver\tV ER1\nnever\tN EH1 V ER0\nto\tT UW1\nget\tG EH1 T\nthe\tDH AH0\ntogether\tT AH0 G EH1 DH ER0\ngiving\tG IH1 V IH0 NG\nlook\tL UH1 K\nking\tK IH1 NG\nlooking\tL UH1 K IH0 NG\ndear\tD IH1 R\nrose\tR OW1 Z\nbe\tB IY1\na\tAH0\nwon\tW AH1 N\nder\tD ER1\nfil\tF IH1 L\nling\tL IH1 NG\nwonderful\tW AH1 N D ER0 F AH0 L\nfulfil\tF UH0 L F IH1 L\nme\tM IY1\nsage\tS EY1 JH\nmessage\tM EH1 S AH0 JH\names\tEY1 M Z\ngue\tG Y UW1\nsing\tS IH1 NG\nguessing\tG EH1 S IH0 NG\n",
             1,
         )
     }
@@ -1438,6 +1709,237 @@ mod tests {
             ResolvedKind::Phones(p) => p.clone(),
             other => panic!("expected phones, got {other:?}"),
         }
+    }
+
+    // ── S95 fragment merge (拆词): adjacent OOV fragments join into one dictionary word ──
+
+    #[test]
+    fn fragment_merge_joins_backward() {
+        let f = fixtures();
+        // "e|ven": the trigger is the SECOND note (ven is OOV, e is a real word) — the window
+        // reaches BACKWARD and the pair resolves as "even", the member consuming a syllable
+        // exactly like a `+` note.
+        let score = [evt("e", Lang::En), evt("ven", Lang::En)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["i"]);
+        assert_eq!(phones_of(&r[1]), vec!["v", "ə", "n"]);
+        assert!(!r[0].is_sustain && r[1].is_sustain);
+        // discriminator: the fragment alone is genuinely OOV — the merge is what rescued it
+        let e = resolve_score(&[evt("ven", Lang::En)], &f).unwrap_err();
+        assert!(e.to_string().contains("VOCAL_OOV: ven"), "{e}");
+    }
+
+    #[test]
+    fn fragment_merge_folds_the_doubled_seam_consonant() {
+        let f = fixtures();
+        // "nev|ver": the faithful join "nevver" misses; folding the doubled v finds "never".
+        // NB "ver" IS a real dictionary word — only the TRIGGER has to be OOV, not every member.
+        let score = [evt("nev", Lang::En), evt("ver", Lang::En)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["n", "ɛ"]);
+        assert_eq!(phones_of(&r[1]), vec!["v", "ɝ"]);
+        assert!(r[1].is_sustain);
+    }
+
+    #[test]
+    fn fragment_merge_three_word_window_and_disjoint_merges() {
+        let f = fixtures();
+        // TYFD shape "to|get|ther giv|ving": a 3-word window (seam t folded: togetther→together)
+        // and a 2-word window resolve side by side. NB (review S95R-4): the claiming machinery
+        // and the scan direction are NOT observable at this fixture's scale — "thergiv" misses
+        // the dictionary either way — so this test pins the two disjoint merges, nothing more;
+        // claiming stays documented as a determinism invariant at the implementation site.
+        let score = [
+            evt("to", Lang::En),
+            evt("get", Lang::En),
+            evt("ther", Lang::En),
+            evt("giv", Lang::En),
+            evt("ving", Lang::En),
+        ];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["t", "ə"]);
+        assert_eq!(phones_of(&r[1]), vec!["ɡ", "ɛ"]);
+        assert_eq!(phones_of(&r[2]), vec!["ð", "ɝ"]);
+        assert_eq!(phones_of(&r[3]), vec!["ɡ", "ɪ"]);
+        assert_eq!(phones_of(&r[4]), vec!["v", "ɪ", "ŋ"]);
+        assert!(r[1].is_sustain && r[2].is_sustain && !r[3].is_sustain && r[4].is_sustain);
+    }
+
+    #[test]
+    fn fragment_merge_hold_is_transparent() {
+        let f = fixtures();
+        // "e | - | ven": the author held the first fragment's vowel. The hold joins the merged
+        // span, where the distribution logic re-emits the current nucleus — same as a hold
+        // inside an ordinary `+` span.
+        let score = [evt("e", Lang::En), evt("-", Lang::En), evt("ven", Lang::En)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["i"]);
+        assert_eq!(phones_of(&r[1]), vec!["i"]);
+        assert_eq!(phones_of(&r[2]), vec!["v", "ə", "n"]);
+    }
+
+    #[test]
+    fn fragment_merge_never_rewrites_working_notes() {
+        let f = fixtures();
+        // "look|king": BOTH are real words → no OOV → no trigger. They keep singing as two
+        // words (the author's double-consonant re-attack), byte-identical to pre-S95 output.
+        // This IS the scope boundary: merging non-OOV pairs would alter already-renderable
+        // scores and needs its own version bump + ear evidence (user verdict, S95).
+        let score = [evt("look", Lang::En), evt("king", Lang::En)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["l", "ʊ", "k"]);
+        assert_eq!(phones_of(&r[1]), vec!["k", "ɪ", "ŋ"]);
+        assert!(!r[1].is_sustain);
+    }
+
+    #[test]
+    fn fragment_merge_window_breaks_where_the_dictionary_path_ends() {
+        let f = fixtures();
+        let oov = |score: &[ScoreEvt]| {
+            let e = resolve_score(score, &f).unwrap_err().to_string();
+            assert!(e.contains("VOCAL_OOV"), "{e}");
+        };
+        // a rest between fragments = the author separated words → stays loud OOV
+        oov(&[evt("e", Lang::En), evt("R", Lang::En), evt("ven", Lang::En)]);
+        // language mismatch breaks the window (both notes end up individually OOV)
+        oov(&[evt("e", Lang::De), evt("ven", Lang::En)]);
+        // …and in the direction stage2 can NOT mask (review S95R-5): an EN trigger must not
+        // pull a De member in — without the lang gate this would merge to "never" with the De
+        // note silently singing an English syllable, and no later stage would object.
+        oov(&[evt("nev", Lang::En), evt("ver", Lang::De)]);
+        // a bracket hint takes the neighbour off the dictionary path — no merge across it
+        oov(&[evt("e[iy1]", Lang::En), evt("ven", Lang::En)]);
+        // an explicit phoneme_input does the same
+        let mut with_pi = [evt("e", Lang::En), evt("ven", Lang::En)];
+        with_pi[0].phoneme_input = Some("IY1");
+        oov(&with_pi);
+        // no dictionary join exists (respelling, not fragmentation) → loud on the OOV note
+        let e = resolve_score(&[evt("be", Lang::En), evt("leeve", Lang::En)], &f).unwrap_err();
+        assert!(e.to_string().contains("VOCAL_OOV: leeve"), "{e}");
+    }
+
+    #[test]
+    fn fragment_merge_editor_and_render_agree() {
+        let f = fixtures();
+        // §9.5 single classifier: merged members classify Sustain (their red marks clear with
+        // ZERO frontend changes), a failed merge stays Unknown on exactly the OOV note.
+        let score =
+            [evt("nev", Lang::En), evt("ver", Lang::En), evt("be", Lang::En), evt("leeve", Lang::En)];
+        let c = classify_score(&score, &f).unwrap();
+        assert!(matches!(c[0], LyricClass::Phones { .. }), "{:?}", c[0]);
+        assert!(matches!(c[1], LyricClass::Sustain), "{:?}", c[1]);
+        assert!(matches!(c[2], LyricClass::Phones { .. }), "{:?}", c[2]);
+        assert!(matches!(c[3], LyricClass::Unknown), "{:?}", c[3]);
+    }
+
+    #[test]
+    fn fragment_merge_stays_off_alias_tracks() {
+        let f = fixtures();
+        // On an alias track EN words resolve through the convention, never the dictionary —
+        // the pass must not merge them even though "ven" would be dictionary-OOV.
+        let mut score = [evt("e", Lang::En), evt("ven", Lang::En)];
+        for e in &mut score {
+            e.phoneme_set = PhonemeSet::Xsampa;
+        }
+        let r = resolve_score(&score, &f).unwrap();
+        assert!(!r[1].is_sustain, "alias note must stay its own word");
+        assert_eq!(phones_of(&r[1]).len(), 3, "v-e-n as alias symbols, not the merged tail");
+    }
+
+    #[test]
+    fn fragment_merge_longest_join_beats_prefix_theft() {
+        let f = fixtures();
+        // Review S95R-1's real-dictionary counterexample, pinned in fixture form: trigger "ful"
+        // sees BOTH the 2-word forward join ful|fil→"fulfil" (a real word) and the 3-word
+        // backward join won|der|ful→"wonderful". Greedy-longest must pick "wonderful", leaving
+        // fil|ling as two ordinary words (both in-dictionary → outside merge scope).
+        let score = [
+            evt("won", Lang::En),
+            evt("der", Lang::En),
+            evt("ful", Lang::En),
+            evt("fil", Lang::En),
+            evt("ling", Lang::En),
+        ];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["w", "ʌ", "n"]);
+        assert_eq!(phones_of(&r[1]), vec!["d", "ɝ"]);
+        assert_eq!(phones_of(&r[2]), vec!["f", "ə", "l"]);
+        assert_eq!(phones_of(&r[3]), vec!["f", "ɪ", "l"], "fil must stay its own word");
+        assert_eq!(phones_of(&r[4]), vec!["l", "ɪ", "ŋ"], "ling must stay its own word");
+        assert!(r[1].is_sustain && r[2].is_sustain && !r[3].is_sustain && !r[4].is_sustain);
+    }
+
+    #[test]
+    fn fragment_merge_longest_join_beats_backward_theft() {
+        let f = fixtures();
+        // Same defect, backward direction: a|mes→"ames" (a real dictionary word) must lose to
+        // mes|sage→"message". "a" stays its own word.
+        let score = [evt("a", Lang::En), evt("mes", Lang::En), evt("sage", Lang::En)];
+        let r = resolve_score(&score, &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["ə"], "a must stay its own word");
+        assert_eq!(phones_of(&r[1]), vec!["m", "ɛ"]);
+        assert_eq!(phones_of(&r[2]), vec!["s", "ə", "dʒ"]);
+        assert!(!r[1].is_sustain && r[2].is_sustain);
+    }
+
+    #[test]
+    fn fragment_merge_trigger_is_faithful_only() {
+        let f = fixtures();
+        // Review S95R-2: the plural rung must NOT be part of the merge trigger. "mes" parses as
+        // me+Z under the rung — if that killed the trigger, mes|sage would sing "meez sage" with
+        // no red mark. The trigger asks the FAITHFUL ladder, so the merge still fires…
+        let r = resolve_score(&[evt("mes", Lang::En), evt("sage", Lang::En)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["m", "ɛ"]);
+        assert_eq!(phones_of(&r[1]), vec!["s", "ə", "dʒ"]);
+        // …and a lone "mes" (no merge partner) stays LOUD: the 3-char base floor refuses me+Z.
+        let e = resolve_score(&[evt("mes", Lang::En)], &f).unwrap_err();
+        assert!(e.to_string().contains("VOCAL_OOV: mes"), "{e}");
+        // The discriminator the floor CANNOT mask (mutation R2): "gues" parses as gue+Z — gue is
+        // a 3-char dictionary word, so only the faithful trigger lets gues|sing merge to
+        // "guessing" instead of singing "gue-z sing".
+        let r = resolve_score(&[evt("gues", Lang::En), evt("sing", Lang::En)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["ɡ", "ɛ"]);
+        assert_eq!(phones_of(&r[1]), vec!["s", "ɪ", "ŋ"]);
+    }
+
+    #[test]
+    fn fragment_merge_ignores_frames_and_pitch() {
+        let f = fixtures();
+        // §9.5 load-bearing premise (review S95R-6): `validate_lyrics` classifies with dummy
+        // frames=1 / note_num=60, so the merge must reach identical verdicts regardless of
+        // frames/pitch — otherwise the editor clears a red mark the render then trips over.
+        let real = [
+            ScoreEvt { lyric: "nev", note_num: 72, frames: 37, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
+            ScoreEvt { lyric: "ver", note_num: 48, frames: 3, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
+            ScoreEvt { lyric: "be", note_num: 60, frames: 9, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
+            ScoreEvt { lyric: "leeve", note_num: 84, frames: 100, lang: Lang::En, phoneme_input: None, phoneme_set: PhonemeSet::Words },
+        ];
+        let dummy: Vec<ScoreEvt> = real
+            .iter()
+            .map(|e| ScoreEvt { note_num: 60, frames: 1, ..e.clone() })
+            .collect();
+        let r = resolve_core(&real, &f, false).unwrap();
+        let c = classify_score(&dummy, &f).unwrap();
+        assert!(matches!((&r[0].kind, &c[0]), (ResolvedKind::Phones(_), LyricClass::Phones { .. })));
+        assert!(r[1].is_sustain && matches!(c[1], LyricClass::Sustain));
+        assert!(matches!((&r[2].kind, &c[2]), (ResolvedKind::Phones(_), LyricClass::Phones { .. })));
+        assert!(matches!((&r[3].kind, &c[3]), (ResolvedKind::Unknown, LyricClass::Unknown)));
+    }
+
+    // ── S95 EN plural rung: -'s/-s/-es of an in-dictionary base, voice follows the base ──
+    #[test]
+    fn en_plural_rung_is_last_and_voice_follows_the_base() {
+        let f = fixtures();
+        let one = |lyric: &str| {
+            let r = resolve_score(&[evt(lyric, Lang::En)], &f).unwrap();
+            phones_of(&r[0])
+        };
+        assert_eq!(one("dears"), vec!["d", "ɪ", "ɹ", "z"]); // voiced final → Z
+        assert_eq!(one("lights"), vec!["l", "aɪ", "t", "s"]); // voiceless final → S
+        assert_eq!(one("roses"), vec!["ɹ", "oʊ", "z", "ɪ", "z"]); // sibilant final → IH0 Z (-es via the e-final base)
+        // EN only: de/fr/es/it morphology is not "-s plus voicing" — the rung must not fire there
+        let e = resolve_score(&[evt("baums", Lang::De)], &f).unwrap_err();
+        assert!(e.to_string().contains("VOCAL_OOV: baums"), "{e}");
     }
 
     // ── syllabification: data-driven maximal onset ──
@@ -1987,6 +2489,93 @@ mod tests {
             let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
             assert_eq!(got, want, "S94 regeneration-knife primary for {w}");
         }
+    }
+
+    /// S95 fragment-merge / plural-rung gate over the REAL en.tsv (same SKIP contract as the S94
+    /// gate above: the dictionary is a gitignored generated asset — a bare checkout must not go
+    /// red). Pins the TYFD material's verdicts end-to-end: which fragments merge, into what,
+    /// which stay loud — AND the join strings whose ABSENCE the window order silently depends on
+    /// (a regeneration that gains "gether" would re-route to|get|ther through get+ther).
+    #[test]
+    fn s95_fragment_merge_e2e_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/en.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!(
+                "[s95-merge-gate] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)",
+                p.display()
+            );
+            return;
+        };
+        struct EnOnly(WordDict);
+        impl DictSource for EnOnly {
+            fn zh(&self) -> Result<&ZhDict> {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+            fn words(&self, lang: Lang) -> Result<&WordDict> {
+                if lang == Lang::En {
+                    Ok(&self.0)
+                } else {
+                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+                }
+            }
+        }
+        let src = EnOnly(WordDict::from_tsv(Lang::En, &tsv));
+        // (a) order-load-bearing ABSENCES: shorter windows probe these joins BEFORE the winning
+        // one. If a dictionary regeneration ever ships one, the merge re-routes — re-judge.
+        for absent in
+            ["gether", "getther", "nevver", "givving", "willnev", "mydears", "beleeve", "togetther", "amessage"]
+        {
+            assert!(
+                src.0.lookup(absent).is_none(),
+                "en.tsv now resolves {absent:?} — the S95 window order routes through it, re-judge the merge pins"
+            );
+        }
+        // (b) the TYFD fragments end-to-end through the production resolver:
+        let ph = |lyrics: &[&str]| -> Vec<Vec<&'static str>> {
+            let score: Vec<ScoreEvt> = lyrics.iter().map(|l| evt(l, Lang::En)).collect();
+            resolve_score(&score, &src).unwrap().iter().map(phones_of).collect()
+        };
+        assert_eq!(ph(&["e", "ven"]), [vec!["i"], vec!["v", "ə", "n"]]); // S94 even-primary
+        assert_eq!(ph(&["nev", "ver"]), [vec!["n", "ɛ"], vec!["v", "ɝ"]]);
+        assert_eq!(ph(&["to", "get", "ther"]), [vec!["t", "ə"], vec!["ɡ", "ɛ"], vec!["ð", "ɝ"]]);
+        assert_eq!(ph(&["giv", "ving"]), [vec!["ɡ", "ɪ"], vec!["v", "ɪ", "ŋ"]]);
+        assert_eq!(ph(&["dears"]), [vec!["d", "ɪ", "ɹ", "z"]]); // plural rung, S94 tears-family vowel
+        // (c) a respelling no join can rescue stays LOUD on the OOV note:
+        let score: Vec<ScoreEvt> = ["be", "leeve"].iter().map(|l| evt(l, Lang::En)).collect();
+        let e = resolve_score(&score, &src).unwrap_err().to_string();
+        assert!(e.contains("VOCAL_OOV: leeve"), "{e}");
+        // (d) scope boundary: real-word double-consonant pairs stay two words:
+        let r = resolve_score(&[evt("look", Lang::En), evt("king", Lang::En)], &src).unwrap();
+        assert!(!r[1].is_sustain, "look|king must stay two independent words");
+        // (e) review S95R-1's theft shapes on the LIVE dictionary. Backward theft: a|mes→"ames"
+        // (a real cmudict name) must lose to mes|sage→"message" under greedy-longest:
+        assert_eq!(ph(&["a", "mes", "sage"]), [vec!["ə"], vec!["m", "ɛ"], vec!["s", "ə", "dʒ"]]);
+        // Forward case, pinned HONESTLY: on the live dictionary the longest join for
+        // won|der|ful|fil|ling is "fulfilling" (10 chars, beats "wonderful"'s 9), so won|der
+        // stay their own words. Both parses are dictionary-valid segmentations of the author's
+        // "wonderful filling" and land within a schwa of it phonetically; dictionary-only
+        // merging cannot rank them further (per-note phoneme control is the manual override).
+        // What this pin guards is the MECHANISM: the 2-word thief "fulfil" (in-dictionary!)
+        // must never win — the fixture test pins the wonderful-wins shape where no longer
+        // join exists.
+        assert_eq!(
+            ph(&["won", "der", "ful", "fil", "ling"]),
+            [
+                vec!["w", "ʌ", "n"],
+                vec!["d", "ɝ"],
+                vec!["f", "ʊ", "l"],
+                vec!["f", "ɪ"],
+                vec!["l", "ɪ", "ŋ"]
+            ]
+        );
+        // (f) reviews S95R-2/R-3: a lone plural-parsable fragment stays LOUD — the merge trigger
+        // ignores the plural rung, and the 3-char base floor refuses me+Z:
+        let score: Vec<ScoreEvt> = ["mes"].iter().map(|l| evt(l, Lang::En)).collect();
+        let e = resolve_score(&score, &src).unwrap_err().to_string();
+        assert!(e.contains("VOCAL_OOV: mes"), "{e}");
+        // …and the live-dictionary R-2 discriminator the floor cannot mask: "gues" parses as
+        // gue+Z (gue = G Y UW1, 3 chars), so only the faithful trigger merges gues|sing:
+        assert_eq!(ph(&["gues", "sing"]), [vec!["ɡ", "ɛ"], vec!["s", "ɪ", "ŋ"]]);
     }
 
     // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL

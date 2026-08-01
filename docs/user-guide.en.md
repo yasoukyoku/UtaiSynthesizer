@@ -453,6 +453,24 @@ The editor's view is independent of the arrangement view's zoom/scroll. On openi
 
 Lyrics are single-line, at most 64 characters; clearing a lyric falls back to the track language's default lyric.
 
+**Fragmented lyrics join back automatically (new in v0.12)**: UTAU scores often spell one English word as
+per-note fragments with the seam consonant doubled (`nev`+`ver`, `giv`+`ving`). A fragment the dictionary
+cannot find is automatically re-joined with its neighbours into a real word — one copy of the doubled seam
+consonant is folded (`nev|ver`→never, `giv|ving`→giving, `to|get|ther`→together), and the joined word then
+spreads over its notes syllable-by-syllable, exactly like a `+` continuation. The rules:
+
+- A join only happens when a fragment is **itself missing from the dictionary** (the kind that gets a red
+  mark). Pairs that happen to be real words on both sides — `call`+`ling`, `look`+`king`, `pro`+`miss` —
+  are left untouched and sing as two words: that double consonant re-attack is what the author wrote.
+- A `-` (hold) between fragments is joined across; an `R`, `+`, bracket hint, alias convention or a note in
+  another language breaks the join.
+- A fragment no join can turn into a real word (`be`+`leeve` — a respelling of believe) still gets a loud red
+  mark; use a bracket phoneme hint for those.
+
+**English plural fallback (new in v0.12)**: when an English lyric misses the dictionary as written but its
+base without the final `-s`/`-'s`/`-es` is found, the base pronunciation gets /s/, /z/ or /ɪz/ appended
+(`dears` = dear + z; voicing follows the base's final sound). English only.
+
 **Phonetic hints (square brackets)**: writing `[dh ae dh]` as the lyric pins the phonemes that note sings and
 skips the dictionary — this is the OpenUtau convention, and English UST files written for UTAU/OpenUtau use it
 heavily. The `word[hint]` form (`read[r iy d]`) is accepted too: the hint is what gets sung, the word is there
