@@ -180,7 +180,8 @@ fn convert_opencpop(p: &str) -> String {
 /// Stress digits are a CMUdict property; the ARPABET people TYPE has none — OpenUtau phonetic hints
 /// and ARPAsing voicebank reclists are written without them — so a bare `ah` is an unstressed vowel,
 /// not a stressed one. Three reasons this is the right default: the shipped en.tsv has AH0 63181 vs
-/// AH1+AH2 8022 (**7.9×**); the errors are asymmetric (ʌ read as ə is a mild centralization, ə read as
+/// AH1+AH2 8022 (**7.9×**; S90 counts — AH0 is 63260 after the S94 -en schwa regeneration, same
+/// ratio same argument); the errors are asymmetric (ʌ read as ə is a mild centralization, ə read as
 /// ʌ moves the PERCEIVED stress of the word); and `[w ah dh]`-style hints in real UST files are exactly
 /// the reduced-vowel case. Write `ah1`/`AH1` (or `ah2`) to get ʌ.
 /// AH is today the only ARPABET symbol whose IPA splits on stress, so the general rule and this one
@@ -378,10 +379,14 @@ impl WordDict {
         }
         for (cluster, n) in votes {
             // The vote threshold disciplines CLUSTERS only. A lone consonant is never gated: all 23
-            // observed EN singles are ordinary English onsets (weakest = ZH with 94 votes), and
-            // dropping one would glue every intervocalic instance of that consonant to the previous
-            // syllable — a category of damage no attestation count justifies.
-            if cluster.contains(' ') && n < min_votes {
+            // observed EN singles are ordinary English onsets (weakest = DH with 71 votes — the/this
+            // closed class; review S94R-3 corrected an earlier "ZH 94" claim here), and dropping one
+            // would glue every intervocalic instance of that consonant to the previous syllable — a
+            // category of damage no attestation count justifies.
+            if cluster.contains(' ')
+                && (n < min_votes
+                    || (lang == Lang::En && EN_ONSET_DROP.contains(&cluster.as_str())))
+            {
                 continue;
             }
             dict.onsets.insert(cluster);
@@ -400,15 +405,42 @@ impl WordDict {
 /// sadness, midnight, abandon, window…); `Z B` (4 votes, zbigniew) breaks husband, `M L` (5, mladic)
 /// breaks aimless, `L W` (5, luo/lwin) breaks always — the S86 `always|+ → ɔ | l w eɪ z` finding.
 ///
-/// Why SIX: the support histogram has a clean gap — every multi-consonant cluster with 2-5 votes is
-/// carried by non-English proper nouns (survey table in the S94 memory), while the weakest NATIVE
-/// clusters sit exactly at 6 (S P Y spew, TH W thwart) and 9 (S K Y skew). ⛔ Deliberately KEPT
-/// (S92: their cuts are correct — do not "clean" them): T S (27, nazi/pizzeria), ZH (94, asia/azure),
-/// K N (14, technique), the schm-/schn-/schl-/schw- loan families (57-101).
+/// Why SIX (honest version — review S94R-2 broke the first draft's "clean gap" claim): 6 keeps the
+/// weakest NATIVE clusters (S P Y spew and TH W thwart sit exactly at 6, S K Y skew at 9) while
+/// removing the worst 60. It is NOT a clean native/foreign separator: S K L (5 votes) counts real
+/// words (sclerosis/scleroderma) among its voters — dropping it still nets out (disclaim/exclusive
+/// improve) — and several foreign-only families clear 6 on name volume alone; those go through
+/// `EN_ONSET_DROP` below with per-cluster verdicts instead of a blunter threshold.
+///
+/// ★KNOWN COST, accepted deliberately (review S94-DATA-1, then re-judged word-by-word): dropping
+/// the sub-6 C+glide clusters (V W, M W, F W, ZH W, TH Y, S Y…) miscuts ~90 rare French/loan words
+/// (reservoir → Z AH0 V | W AA2 R, bourgeois, armoire, bivouac, Matthew-as-M AE1 TH|Y UW0 is fine).
+/// Restoring any of them was measured to break far commoner words the drop fixed: V W would re-break
+/// driveway, M W teamwork/dreamworks, F W halfway/safeway, L W always, ZH W visualize, TH Y matthew.
+/// Net direction favors the drop everywhere; do NOT add a keep-list without re-running that table.
+///
+/// ⛔ Deliberately KEPT (S92: their cuts are correct — do not "clean" them): T S (27, nazi/
+/// pizzeria), ZH (94, asia/azure), K N (14, technique), the schm-/schn-/schl-/schw- loan families.
 ///
 /// A cluster losing its vote NEVER hurts the words that voted it in: word-initial phones always stay
 /// in the first syllable; the onset set only decides INTERVOCALIC cuts.
 const EN_ONSET_MIN_VOTES: u32 = 6;
+
+/// S94 review follow-up (S94R-2/S94-DATA-5): foreign-supported clusters that clear the vote gate on
+/// proper-noun volume alone, judged cluster-by-cluster (every English word their removal re-cuts was
+/// eyeballed; the improvement lists below are exhaustive samples, not picks):
+///   S R  (12, sri/srebrenica)     → classroom/crossroads/disrespect/disregard now cut at the seam
+///   M R  (11, mraz/mroczek)       → armrest, comrade, camry, amritsar
+///   Z L  (11, zlata/zloty)        → beasley/beardsley name family, ceaselessly (cease|less|ly)
+///   V R  (14, vrabel/vranitzky)   → average(d/s), beverages, chevrolet, avril
+///   K V  (9, kvam/kvetch)         → the mc-V name family (mcveigh/mcvay/macvicar), bankverein
+///   SH T (6, shtick/schtick)      → ashton, hashtag, washtub, rushton, ishtar (German -stadt names
+///                                    get a worse cut — rare, accepted)
+///   HH R (13, hraw-class)         → blast = 1 word (warhol's); hygiene
+///   HH L (6, hlad-class)          → blast = 0 words; hygiene
+/// Word-initial voters themselves are untouched (kvetch/shtick still sing whole), same invariant as
+/// the threshold. de/fr/es/it deliberately not curated here — S86#10 owns their verdicts.
+const EN_ONSET_DROP: &[&str] = &["S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L"];
 
 /// Candidate dictionary keys for one raw lyric, MOST FAITHFUL FIRST (S86 input-tolerance ladder).
 ///
@@ -476,7 +508,8 @@ fn dict_is_vowel(lang: Lang, vowels: &HashSet<&'static str>, ph: &str) -> bool {
 /// `score2cv::is_nucleus_phone`, the one classifier this repo already walks over all 210 vocab tokens.
 ///
 /// ⚠ S90 replaced `ph.ends_with(['0','1','2'])` (= "carries a CMUdict stress digit") with this. Over the
-/// SHIPPED en.tsv the two verdicts agree on every one of the 69 distinct tokens (863018 instances), so
+/// SHIPPED en.tsv the two verdicts agree on every one of the 69 distinct tokens (863018 instances at
+/// the S90 measurement; 862976 after the S94 -en regeneration — the E2E walk re-proves it live), so
 /// the whole dictionary path — legal onsets, syllable cuts, coda deferral — is unchanged to the byte.
 /// What it ADDS is the spelling users actually type: OpenUtau phonetic hints and ARPAsing reclists carry
 /// NO stress digits, so `[dh ae dh]` had no nucleus at all and the entire word collapsed onto the first
@@ -1706,7 +1739,9 @@ mod tests {
         let f = Fixtures {
             zh: zh_fixture(),
             de: de_fixture(),
-            // mirrors the real dictionary's letter-name and abbreviation entries
+            // mirrors the real dictionary's letter-name and abbreviation entries — for LOOKUP only.
+            // S94: its 1-vote "D R" onset is vote-gated away here (unlike the real dict's 482-vote
+            // D R), so never grow an onset/syllabify assertion onto this fixture (review S94R-4).
             en: WordDict::from_tsv(Lang::En, "k\tK EY1\ndr\tD R AY1 V\nchorus\tK AO1 R AH0 S\n"),
         };
         for lyric in [
@@ -1866,15 +1901,25 @@ mod tests {
     /// REAL en.tsv through the production `from_tsv`, then pins (a) the vote-gated onset set and
     /// (b) full syllable splits for both directions: words the S94 threshold FIXES and words whose
     /// (deliberately kept) loanword clusters must keep cutting exactly as before.
-    /// NOT #[ignore]: en.tsv is an in-repo bundle resource and the parse is ~100 ms — this must run
-    /// on every `cargo test`, because a dictionary regeneration is exactly when it has to bite.
+    /// NOT #[ignore] — but with a loud SKIP when the dictionary is absent: en.tsv is a GITIGNORED
+    /// generated asset (data/ is ignored; provenance = the MBS2H generator), so a fresh checkout
+    /// does not have it and must not turn the whole suite red (review S94R-1 — the first draft
+    /// claimed "in-repo bundle resource", which was simply false). On the dev machine the file is
+    /// always present and this bites on every `cargo test`, which is the point: a dictionary
+    /// regeneration is exactly when it has to.
     #[test]
     fn s94_en_onset_vote_gate() {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/en.tsv");
-        let tsv = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("en.tsv missing ({e})"));
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s94-onset-gate] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
         let d = WordDict::from_tsv(Lang::En, &tsv);
-        // (a) gated OUT: proper-noun singleton clusters (support ≤ 5) may no longer cut real words.
-        for gone in ["N D", "D N", "M B", "T L", "S B", "K M", "Z M", "D M", "P SH", "L W", "Z B", "M L", "N W"] {
+        // (a) gated OUT: the sub-6-vote proper-noun clusters AND the curated EN_ONSET_DROP families.
+        for gone in [
+            "N D", "D N", "M B", "T L", "S B", "K M", "Z M", "D M", "P SH", "L W", "Z B", "M L", "N W",
+            "S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L",
+        ] {
             assert!(!d.onsets.contains(gone), "{gone} must be vote-gated out of the EN onset set");
         }
         // (a') kept: the S92-verified correct cutters and the weakest NATIVE clusters (6/9 votes).
@@ -1899,9 +1944,24 @@ mod tests {
             ("admit", "AH0 D | M IH1 T"),           // was AH0 | D M IH1 T (dmitri's D M)
             ("aimless", "EY1 M | L AH0 S"),         // was EY1 | M L AH0 S (mladic's M L)
             ("understand", "AH2 N | D ER0 | S T AE1 N D"),
+            // …and the curated EN_ONSET_DROP families (review S94R-2 follow-up):
+            ("classroom", "K L AE1 S | R UW2 M"),   // was K L AE1 | S R UW2 M (sri's S R)
+            ("comrade", "K AA1 M | R AE2 D"),       // was K AA1 | M R AE2 D (mraz's M R)
+            ("ceaselessly", "S IY1 Z | L AH0 | S L IY0"), // was S IY1 | Z L AH0 | S L IY0 (zloty's Z L)
+            ("averaged", "AE1 V | R AH0 JH D"),     // was AE1 | V R AH0 JH D (vrabel's V R)
+            ("hashtag", "HH AE1 SH | T AE2 G"),     // was HH AE1 | SH T AE2 G (shtick's SH T)
+            ("armrest", "AA1 R M | R EH2 S T"),
         ] {
             assert_eq!(s(w), want(spec), "S94-fixed split for {w}");
         }
+        // (b'') the documented KNOWN COST, pinned so it stays a decision instead of decaying into a
+        // surprise: reservoir's French vw- onset is miscut by the V W drop, and it STAYS miscut
+        // because restoring V W was measured to re-break driveway/lovewell (see EN_ONSET_MIN_VOTES).
+        assert_eq!(
+            s("reservoir"),
+            want("R EH1 | Z AH0 V | W AA2 R"),
+            "the accepted V W cost moved — re-run the S94 keep/drop table before shipping this"
+        );
         // (b') splits that must NOT move — the kept clusters keep cutting exactly as shipped:
         for (w, spec) in [
             ("nazi", "N AA1 | T S IY0"),            // T S kept (27 votes): /ts/ cuts as a unit

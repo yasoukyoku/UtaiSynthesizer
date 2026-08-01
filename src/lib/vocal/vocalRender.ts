@@ -588,7 +588,8 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  stressless ARPABET finally carries a syllable nucleus, so a hint spreads over its `+` notes instead
  *  of collapsing onto the first one; a bare `ah` (no stress digit) reads as ə, not ʌ.
  *  ⚠ On the SHIPPED dictionaries the phone output is unchanged to the byte — all 69 ARPABET tokens /
- *  863018 instances of en.tsv judge identically under the old and new nucleus rule, and neither en.tsv
+ *  863018 instances of en.tsv (S90 count; 862976 after the S94 regeneration) judge identically under
+ *  the old and new nucleus rule, and neither en.tsv
  *  nor the golden vectors contain a digit-less AH. What moves is user-typed input, which is the point.
  *  ★ There is NO Rust twin to keep in lockstep any more: the audition cache tag dropped its g2p term in
  *  S90 (that pipeline renders a fixed clip with no lyrics — see commands/audition.rs). THIS is the one
