@@ -1912,6 +1912,21 @@ mod tests {
         ] {
             assert_eq!(s(w), want(spec), "S94-unchanged split for {w}");
         }
+        // (c) the S94 en.tsv REGENERATION knives, pinned by explicit lookup. The sampled golden
+        // walks every ~41st line, and none of these five landed on a sampled row — so without
+        // these pins a regeneration that silently loses the generator knives (an MBS2H revert, a
+        // cmudict re-import) would ship the old readings with every Utai test green.
+        for (w, spec) in [
+            ("even", "IY1 V AH0 N"),   // word-final -en schwa consistency (was IH0 N — sang "i-i")
+            ("tears", "T IH1 R Z"),    // curated primary flips: crying, not ripping
+            ("wind", "W IH1 N D"),     // the weather noun (winds already led with W IH1 N D Z)
+            ("live", "L IH1 V"),       // the verb (lives/lived already led with L IH1 V-)
+            ("ba", "B AA1"),           // vocalise syllable, not the letter name "bee-ay"
+        ] {
+            let got = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from en.tsv"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "S94 regeneration-knife primary for {w}");
+        }
     }
 
     // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL
