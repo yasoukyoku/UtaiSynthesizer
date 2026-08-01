@@ -827,6 +827,13 @@ pub struct ResolvedNote {
     pub run_lang: Lang,
     /// True when the note was a sustain/next token (editor classification).
     pub is_sustain: bool,
+    /// ★S96 knife ① — per-NUCLEUS ARPABET stress for this note's phones, in nucleus order
+    /// (0 = unstressed, 1 = primary, 2 = secondary). `Some` ONLY for dictionary/hint words whose
+    /// traditional phones carry stress digits (en; the MFA sets have none ⇒ de/fr/es/it stay `None`
+    /// and allocate exactly as before). The S90 zero-regression gate proved "carries a digit" ≡
+    /// "IPA nucleus-capable" over all 863018 en.tsv tokens, so the count matches the resolved
+    /// nuclei BY CONSTRUCTION — the allocator still re-verifies and falls back to None on mismatch.
+    pub nucleus_stress: Option<Vec<u8>>,
 }
 
 /// Universal reserved-token classes (identical in every language — they are checked BEFORE any
@@ -1241,19 +1248,19 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
         match toks[i] {
             Tok::Rest => {
                 carrier = None;
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Rest, run_lang, is_sustain: false });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Rest, run_lang, is_sustain: false, nucleus_stress: None });
                 i += 1;
             }
             Tok::Breath => {
                 carrier = None;
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Breath, run_lang, is_sustain: false });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Breath, run_lang, is_sustain: false, nucleus_stress: None });
                 i += 1;
             }
             Tok::Hold | Tok::Next => {
                 // an orphan sustain (span-attached ones were consumed below): legacy ja semantics —
                 // re-emit the carrier nucleus, default "a".
                 let ph = vec![carrier.unwrap_or("a")];
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Phones(ph), run_lang, is_sustain: true });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Phones(ph), run_lang, is_sustain: true, nucleus_stress: None });
                 i += 1;
             }
             Tok::Word => {
@@ -1269,7 +1276,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                         )));
                     }
                     carrier = None;
-                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false });
+                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
                     i += 1;
                     continue;
                 }
@@ -1290,14 +1297,18 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                     }
                                     _ => carrier = ph.last().copied(),
                                 }
-                                out[i] =
-                                    Some(ResolvedNote { kind: ResolvedKind::Phones(ph), run_lang, is_sustain: false });
+                                out[i] = Some(ResolvedNote {
+                                    kind: ResolvedKind::Phones(ph),
+                                    run_lang,
+                                    is_sustain: false,
+                                    nucleus_stress: None,
+                                });
                             }
                             None => {
                                 if strict {
                                     return Err(oov(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
                             }
                         }
                         i += 1;
@@ -1331,12 +1342,13 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                             merge_trad[i].as_deref(),
                         )? {
                             Some(assignments) => {
-                                for (j, ph) in assignments.into_iter().enumerate() {
+                                for (j, (ph, stress)) in assignments.into_iter().enumerate() {
                                     carrier = ph.last().copied().or(carrier);
                                     out[i + j] = Some(ResolvedNote {
                                         kind: ResolvedKind::Phones(ph),
                                         run_lang: run_langs[i + j],
                                         is_sustain: j > 0,
+                                        nucleus_stress: stress,
                                     });
                                 }
                             }
@@ -1344,13 +1356,14 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                 if strict {
                                     return Err(oov(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
                                 for j in i + 1..span_end {
                                     // the sustains still resolve (hold "a") so ONLY the word marks OOV
                                     out[j] = Some(ResolvedNote {
                                         kind: ResolvedKind::Phones(vec!["a"]),
                                         run_lang: run_langs[j],
                                         is_sustain: true,
+                                        nucleus_stress: None,
                                     });
                                 }
                             }
@@ -1453,7 +1466,7 @@ fn resolve_west_span(
     // a merge head never has one (that is a mergeability condition), so the order is moot
     // today, but the precedence mirrors the documented user-layer chain.
     merged_trad: Option<&[String]>,
-) -> Result<Option<Vec<Vec<&'static str>>>> {
+) -> Result<Option<Vec<(Vec<&'static str>, Option<Vec<u8>>)>>> {
     let dict = dicts.words(evt.lang)?;
     // stage1: the word's traditional phones (override with spaces already handled by the caller — a
     // no-space override here is a single traditional phone).
@@ -1513,11 +1526,26 @@ fn resolve_west_span(
         assign_trad[last_note].extend(coda);
     }
 
-    // stage2 each note's traditional phones → interned IPA (a bad phone = real OOV, not an error)
-    let mut out: Vec<Vec<&'static str>> = Vec::with_capacity(assign_trad.len());
+    // stage2 each note's traditional phones → interned IPA (a bad phone = real OOV, not an error).
+    // ★S96 knife ① — extract the per-NUCLEUS stress digits BEFORE stage2 strips them (the ONLY
+    // point in the pipeline where both the note assignment and the digits exist). "Carries a digit"
+    // ≡ "IPA nucleus-capable" on the shipped dictionaries (the S90 zero-regression gate, all 863018
+    // en.tsv tokens), so collecting digits in token order IS the note's nucleus-stress vector.
+    // A set with no digits at all (the MFA languages) yields empty vecs ⇒ `None` — those languages
+    // allocate exactly as before, no new behaviour without evidence.
+    let mut out: Vec<(Vec<&'static str>, Option<Vec<u8>>)> = Vec::with_capacity(assign_trad.len());
     for tr in assign_trad {
+        let stress: Vec<u8> = tr
+            .iter()
+            .filter_map(|t| match t.chars().last() {
+                Some('0') => Some(0),
+                Some('1') => Some(1),
+                Some('2') => Some(2),
+                _ => None,
+            })
+            .collect();
         match stage2(evt.lang, &tr) {
-            Ok(ph) => out.push(ph),
+            Ok(ph) => out.push((ph, (!stress.is_empty()).then_some(stress))),
             Err(_) => return Ok(None),
         }
     }

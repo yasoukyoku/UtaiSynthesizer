@@ -719,8 +719,23 @@ export const G2P_ALGO_VERSION = "s94";
  *  nucleus untouched). LAST-first survives as the DROP rule; a dropped member still holds back its
  *  floor (monotonicity: a longer note never shortens a consonant). ja/alias/InNote-ja lanes
  *  byte-identical BY CONSTRUCTION (n_coda ≤ 1 ⇒ single-member share = whole budget = old arithmetic);
- *  en lanes: 12 notes moved (dears/things/strengths-class ratio fixes + 2 borrow-source shifts). */
-export const SCORE_TIMING_VERSION = "s96b";
+ *  en lanes: 12 notes moved (dears/things/strengths-class ratio fixes + 2 borrow-source shifts).
+ *
+ *  s96b — knife ②, the vowel-beat round: (a) a REST no longer lends to a chaining-language onset —
+ *  the post-rest attack starts AT the boundary (SV convention, user-ratified; ja/zh keep 先行発声,
+ *  attested in real ja alignment); a would-drop rescue still takes the floor from the rest on tiny
+ *  notes (never sing the wrong word). (b) in-phrase, the in-note target chase is bounded by
+ *  IN_NOTE_ATTACK_MAX = 3 (training DCONS floor) — `ties`/`flowers` vowels no longer land +5/+7 off
+ *  the beat. Cost, honestly: the phrase interior borrows from a thinner pool ⇒ a handful of
+ *  formerly on-beat notes sit at +2/+3; net beat deviation vs the SV reference drops ~52→~33 frames.
+ *
+ *  s96c — knife ①, ARPABET stress reaches the allocator (`ResolvedNote::nucleus_stress`, en
+ *  dictionary/hint words only): a multi-nucleus note splits its nuclei pool by stress weight 3/2/1
+ *  instead of "medial clamped at 4, LAST nucleus takes all the remainder" — `every`@18fr sang the
+ *  stressed ɛ at 60 ms while word-final unstressed IY0 held 9 frames; now ɛ 7, i 3. The pool
+ *  reserves the onset-funding allowance (without it a standalone `flowers` DELETED its /f/ — probe-
+ *  caught pre-ship). MFA langs carry no digits ⇒ de/fr/es/it/ja/zh/alias byte-identical. */
+export const SCORE_TIMING_VERSION = "s96c";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

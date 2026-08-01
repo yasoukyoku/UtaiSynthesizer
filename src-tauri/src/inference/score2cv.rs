@@ -615,10 +615,22 @@ fn syllable_split(ph: &[&'static str]) -> (usize, usize) {
     (onset_end, nuc)
 }
 
-fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: usize) -> Vec<i64> {
-    // `chaining` is bound (not wildcarded) so the field counts as read: it is the G2/G3/G5
-    // landing point, and today's allocation must not depend on it.
-    let NoteBudget { note_frames, spendable: fr, nucleus_continues, chaining: _chaining } = b;
+fn allocate_in_note(
+    ph: &[&'static str],
+    b: NoteBudget,
+    onset_end: usize,
+    nuc: usize,
+    nuc_stress: Option<&[u8]>,
+    // ★S96 knife ① — what the stress POOL must set aside for the Auto arm's post-allocate onset
+    // funding (floor pass + target chase), which draws ONLY from the FINAL nucleus's remainder.
+    // Historically that remainder was always fat (last-takes-all); the stress pool moves the fat to
+    // a MEDIAL nucleus, and without this reserve a standalone `flowers` [f l aʊ ɝ z]@22 DELETED its
+    // /f/ outright (sang "lowers") — caught by the probe, now pinned by a test. The caller computes
+    // it (it knows the arm and the phrase position); 0 whenever the pool is off or InNote already
+    // reserved the onsets upfront.
+    onset_allowance: i64,
+) -> Vec<i64> {
+    let NoteBudget { note_frames, spendable: fr, nucleus_continues, chaining } = b;
     let n = ph.len();
     let mut durs = vec![0i64; n];
     let n_coda = n - nuc - 1;
@@ -637,9 +649,64 @@ fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: u
     // onset target (the old flat 2..4 share made the f inaudible; S83 user-verified). A medial
     // VOWEL (più's i) keeps the small share. Same ≥2-or-DROP policy as codas (1-frame = OOD);
     // the break drops later medials first.
+    //
+    // ★S96 knife ① — when the word's ARPABET stress digits made it here (en dictionary/hint words
+    // only; `ResolvedNote::nucleus_stress`), the nuclei split their POOL by stress weight instead of
+    // "every non-final nucleus is clamped at 4 and the LAST one takes all the remainder". The user's
+    // `every`@18fr sang ɛ:3 v:3 ɝ:3 i:9 — the STRESSED (EH1) vowel got 60 ms while the word-final
+    // unstressed IY0 swallowed the remainder, purely because of its position; the SV reference sings
+    // two clearly attacked segments (EV-ry) and the reference distribution puts a real long-note
+    // non-final nucleus at p50 = 10 frames (gen_vowel_placement, en b2 max-nonfinal), not 4.
+    // Weights 3/2/1 (primary/secondary/unstressed); the pool = spendable minus the medial
+    // consonants' targets minus the coda pass's own budget formula (an ESTIMATE — the per-step
+    // min-guards below still bound every give, so a bad estimate can squeeze but never break
+    // conservation or the nucleus floor). The FINAL nucleus still takes the remainder line — its
+    // weight participates only through what the medials are allowed to claim.
+    // zh/ja/alias and the MFA languages carry no digits ⇒ `nuc_stress` is None ⇒ byte-identical.
+    let n_nuclei = ph.iter().filter(|p| is_nucleus_phone(p)).count();
+    let stress_w: Option<Vec<i64>> = nuc_stress.and_then(|s| {
+        if !chaining || n_nuclei < 2 || s.len() != n_nuclei {
+            debug_assert!(
+                s.len() == n_nuclei || !chaining || n_nuclei < 2,
+                "nucleus_stress count {} != nuclei {} — the S90 digit≡nucleus equivalence broke",
+                s.len(),
+                n_nuclei
+            );
+            return None;
+        }
+        Some(s.iter().map(|&d| match d { 1 => 3, 2 => 2, _ => 1 }).collect())
+    });
+    let (pool, w_total) = match &stress_w {
+        Some(w) => {
+            let med_cons: i64 = (onset_end..nuc)
+                .filter(|&i| !is_nucleus_phone(ph[i]))
+                .map(|i| onset_target_frames(ph[i], note_frames))
+                .sum();
+            let coda_want: i64 =
+                ph[nuc + 1..].iter().map(|p| coda_target_frames(p, note_frames)).sum();
+            let cfe = if n_coda >= 2 {
+                (n_coda as i64 * CODA_MIN_FRAMES).min((fr - NUCLEUS_KEEP_MIN).max(0))
+            } else {
+                0
+            };
+            let coda_est = coda_want.min((fr * 2 / 5).max(cfe));
+            (
+                (fr - med_cons - coda_est - onset_allowance)
+                    .max(n_nuclei as i64 * CODA_MIN_FRAMES),
+                w.iter().sum::<i64>(),
+            )
+        }
+        None => (0, 0),
+    };
+    let mut nuc_ord = 0usize;
     for i in onset_end..nuc {
         let c = if is_nucleus_phone(ph[i]) {
-            (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4)
+            let t = match &stress_w {
+                Some(w) => (pool * w[nuc_ord] / w_total).max(CODA_MIN_FRAMES),
+                None => (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4),
+            };
+            nuc_ord += 1;
+            t
         } else {
             onset_target_frames(ph[i], note_frames)
         }
@@ -1224,6 +1291,25 @@ fn assemble_arrays(
                     // is what makes it exact: any onset before the nucleus (か, `v ɪ`) breaks the
                     // vowel's continuity, so those notes keep the full nucleus protection.
                     let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc, res.is_sustain);
+                    // ★S96 knife ① — the stress pool's onset reserve (see `allocate_in_note`'s
+                    // parameter doc). Auto arm only: the InNote arm reserved its onsets out of
+                    // `spendable` BEFORE this call, so its allowance is structurally 0. Post-rest,
+                    // the funding chases the full measured targets (knife ②a); in-phrase it is
+                    // bounded by the floors + IN_NOTE_ATTACK_MAX (knife ②b) — the reserve mirrors
+                    // exactly what the funding passes below are allowed to take from the final
+                    // nucleus, so a fat MEDIAL can never starve a word-initial consonant.
+                    let onset_allowance = if timing == ArticulationTiming::Auto && onset_end > 0 {
+                        let post_rest = phon.last().map_or(true, |p| matches!(*p, "SP" | "AP"));
+                        let floors = CODA_MIN_FRAMES * onset_end as i64;
+                        if post_rest {
+                            let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                            want.max(floors).min((fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2))
+                        } else {
+                            IN_NOTE_ATTACK_MAX.max(floors)
+                        }
+                    } else {
+                        0
+                    };
                     let mut durs = allocate_in_note(
                         ph,
                         NoteBudget {
@@ -1234,6 +1320,8 @@ fn assemble_arrays(
                         },
                         onset_end,
                         nuc,
+                        res.nucleus_stress.as_deref(),
+                        onset_allowance,
                     );
                     durs[..onset_end].copy_from_slice(&onset_durs[..onset_end]);
                     // S92k: snapshot the IN-NOTE allocation before any borrow moves frames.
@@ -2394,6 +2482,62 @@ mod tests {
     /// sung notes, and so do all three UTAU-alias tracks. (The behavioural proof is the byte-identical
     /// lane dump; this test exists so a future edit to the single-coda path turns something red.)
     /// [i n] @ 16 fr: budget = min(4, 14, 6) = 4 ⇒ n = 4, nucleus 12.
+    /// ★S96 knife ① onset-allowance regression pin. The stress pool moves the note's fat from the
+    /// FINAL nucleus to a stressed MEDIAL — but every onset-funding pass draws only from the final
+    /// nucleus's remainder, and the first cut of this knife therefore DELETED standalone `flowers`'
+    /// /f/ outright (sang "lowers"; the investigation probe caught it before it shipped). The
+    /// allowance reserves, out of the pool, exactly what the funding passes may take — so:
+    ///  • standalone (attack after silence, full-target chase): f SURVIVES at a healthy size and
+    ///    the pool shrinks back toward the old split (the attack has priority there);
+    ///  • in-phrase: the stressed aʊ keeps its win (9 frames vs the old clamp-4) AND f/l stay
+    ///    funded — the win and the funding coexist because the reserve mirrors knife ②b's bound.
+    #[test]
+    fn s96_stress_pool_reserves_the_onset_allowance() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(&[en("F L AW1 ER0 Z", 22)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["f", "l", "aʊ", "ɝ", "z"], "the /f/ must never be deleted");
+        assert_eq!(a.phone_dur, vec![6, 4, 3, 3, 6]);
+        let b = build_arrays_daw(
+            &[en("N IH1 NG", 14), en("F L AW1 ER0 Z", 22), en("N AY1 T", 7)],
+            &d, ArticulationTiming::Auto,
+        ).unwrap();
+        assert_eq!(
+            b.phon,
+            vec!["n", "ɪ", "ŋ", "f", "l", "aʊ", "ɝ", "z", "n", "aɪ", "t"],
+            "no phone deleted in context either"
+        );
+        let fl = &b.phone_dur[3..8];
+        assert!(fl[2] >= 8, "in-phrase, the stressed medial aʊ keeps its share: {fl:?}");
+        assert!(fl[0] >= CODA_MIN_FRAMES && fl[1] >= CODA_MIN_FRAMES, "…and f/l stay funded: {fl:?}");
+    }
+
+    /// ★S96 knife ① discriminator — the user's `every`@18fr shape: [ɛ v ɝ i] with ARPABET stress
+    /// EH1/ER0/IY0. Stress-blind allocation sang ɛ:3 v:3 ɝ:3 i:9 — the PRIMARY-stressed vowel got
+    /// 60 ms and the word-final unstressed IY0 swallowed the remainder purely by position (the SV
+    /// reference sings EV-ry, two clear segments; real long-note non-final nuclei sit at p50 = 10).
+    /// With stress: nuclei pool = 18 − v(3) = 15, weights 3/1/1 ⇒ ɛ 9, ɝ 3, i takes the remaining 3.
+    /// The ja arm (raw IPA carries no digits) keeps the OLD allocation byte-for-byte — the stress
+    /// channel simply never exists there, which is the whole language gate.
+    #[test]
+    fn s96_stressed_medial_nucleus_gets_its_share() {
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(&[en("EH1 V ER0 IY0", 18)], &en_dicts(), ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["ɛ", "v", "ɝ", "i"]);
+        assert_eq!(a.phone_dur, vec![9, 3, 3, 3], "primary-stressed ɛ outweighs the unstressed tail");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 18, "frame-conserving");
+        // ja raw-IPA (no digits ⇒ no stress channel): the shipped stress-blind allocation, untouched.
+        let j = build_arrays_daw(&[raw("ɛ v ɝ i", 18)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phone_dur, vec![3, 3, 3, 9], "no digits ⇒ the old medial clamp + last-takes-all");
+        assert_ne!(a.phone_dur, j.phone_dur, "the two regimes must actually differ on this shape");
+    }
+
     /// ★S96 knife ②a language discriminator — the SAME "rest, then a consonant-initial note" shape
     /// under the two regimes: the CHAINING arm (en) attacks AT the boundary (the rest keeps all its
     /// frames, the onset is funded in-note = the SV-reference post-rest behaviour the user's ear
