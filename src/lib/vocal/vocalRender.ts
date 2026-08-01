@@ -721,21 +721,32 @@ export const G2P_ALGO_VERSION = "s94";
  *  byte-identical BY CONSTRUCTION (n_coda ≤ 1 ⇒ single-member share = whole budget = old arithmetic);
  *  en lanes: 12 notes moved (dears/things/strengths-class ratio fixes + 2 borrow-source shifts).
  *
- *  s96b — knife ②, the vowel-beat round: (a) a REST no longer lends to a chaining-language onset —
- *  the post-rest attack starts AT the boundary (SV convention, user-ratified; ja/zh keep 先行発声,
- *  attested in real ja alignment); a would-drop rescue still takes the floor from the rest on tiny
- *  notes (never sing the wrong word). (b) in-phrase, the in-note target chase is bounded by
- *  IN_NOTE_ATTACK_MAX = 3 (training DCONS floor) — `ties`/`flowers` vowels no longer land +5/+7 off
- *  the beat. Cost, honestly: the phrase interior borrows from a thinner pool ⇒ a handful of
- *  formerly on-beat notes sit at +2/+3; net beat deviation vs the SV reference drops ~52→~33 frames.
+ *  s96b/s96e — knife ②, the vowel-beat round, as it FINALLY shipped: a REST lends a
+ *  chaining-language onset only the SHORTFALL its own note cannot fund, so the post-rest attack
+ *  starts AT the boundary (SV convention, user-ratified) without starving the consonant; a
+ *  would-drop rescue combines rest + nucleus frames on tiny notes (never sing the wrong word).
+ *  ⚠ The in-phrase half (a 3-frame cap on the in-note target chase) was shipped in s96b and
+ *  REVERTED in s96e: the user's ear judged the trade backwards — with dry lenders it put every
+ *  word-initial consonant back on a 40-60 ms stub (`smell` s 7→2, `drowning` ɹ 7→3) and the report
+ *  was "发音反而乱了/辅音和元音割裂". Articulation (S92c/e/j, ear-validated) outranks beat placement.
  *
  *  s96c — knife ①, ARPABET stress reaches the allocator (`ResolvedNote::nucleus_stress`, en
  *  dictionary/hint words only): a multi-nucleus note splits its nuclei pool by stress weight 3/2/1
  *  instead of "medial clamped at 4, LAST nucleus takes all the remainder" — `every`@18fr sang the
  *  stressed ɛ at 60 ms while word-final unstressed IY0 held 9 frames; now ɛ 7, i 3. The pool
  *  reserves the onset-funding allowance (without it a standalone `flowers` DELETED its /f/ — probe-
- *  caught pre-ship). MFA langs carry no digits ⇒ de/fr/es/it/ja/zh/alias byte-identical. */
-export const SCORE_TIMING_VERSION = "s96c";
+ *  caught pre-ship). MFA langs carry no digits ⇒ de/fr/es/it/ja/zh/alias byte-identical.
+ *
+ *  s96d/s96e — the adversarial-review round (15 CONFIRMED findings, every one measured): the stress
+ *  channel became a REDISTRIBUTION over the finished baseline allocation (the first cut targeted
+ *  nuclei inside the medial loop and silently DELETED phones at 200-260 ms — `every`'s ɝ, `very`'s
+ *  ɹ); a count mismatch between digits and nuclei is an ordinary partially-stressed hint, not an
+ *  assertion (it could panic a dev build); coda cluster RATIOS read at the long bucket for every
+ *  note length (bucket-keyed weights flipped `dears`' split at 15→16 frames — a longer note
+ *  SHORTENED the /z/, breaking S89 monotonicity); the would-drop rescue combines its two sources.
+ *  Articulation is restored to the S95 baseline on both probe tracks; ja/alias/InNote lanes remain
+ *  byte-identical to S95 by hash. */
+export const SCORE_TIMING_VERSION = "s96e";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

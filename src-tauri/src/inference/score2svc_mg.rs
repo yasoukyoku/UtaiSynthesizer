@@ -481,6 +481,10 @@ fn mg_truth_cmp() {
             "evt {k}: Σ真值帧 {tsum} != 音符帧 {} —— 拍点轴前提被打破,先查反投影生成器",
             sj.triples[k].frames
         );
+        // ★S96d (review): a 0-frame triple would desync the two cursors silently (the note advances
+        // the boundary walk but emits no phone) — the shipped generator skips those, so make the
+        // assumption LOUD instead of leaving a ±1 drift that no assertion can see.
+        assert!(sj.triples[k].frames > 0, "evt {k}: 0-frame sung triple breaks the beat-axis cursors");
         let truth_off: i64 = exp[..onset_end].iter().map(|e| e[1].as_i64().unwrap()).sum();
         let phrase_initial = k == 0 || truth[k - 1].as_array().is_none_or(|a| a.is_empty());
         let has_first_nucleus = super::super::score2cv::is_nucleus_phone(toks[onset_end]);
@@ -580,6 +584,18 @@ fn mg_truth_cmp() {
         );
     };
     eprintln!("  ── S96 拍点轴(首核起点 − 音符边界;真人=组内 cumsum,我们=wire 游标)──");
+    // ★S96d (review): the sample EXCLUDES notes whose first phone or first nucleus we dropped —
+    // and those are exactly the most-compressed notes, i.e. the ones most likely to attack early.
+    // Printing the exclusion inline stops the next reader from taking the medians as complete
+    // ("没量过" must never read as "量过没问题" — the same rule the distribution table follows).
+    let sung = truth.iter().filter(|r| !r.as_array().unwrap().is_empty()).count();
+    eprintln!(
+        "  样本 {}/{} 个有声音符(差 {} 个:首音素或首核被我们丢弃/非核起首 ⇒ 落点无定义;\
+         这些恰是最被压缩的音符,读数对『早唱』一侧偏保守)",
+        beat.len(),
+        sung,
+        sung - beat.len()
+    );
     beat_stat("全部", &|_| true);
     beat_stat("句首(休止后)", &|b| b.1);
     beat_stat("句中", &|b| !b.1);

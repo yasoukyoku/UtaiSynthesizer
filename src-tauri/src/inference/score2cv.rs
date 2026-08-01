@@ -419,19 +419,6 @@ const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// o/ɯ/i (o/ɯ MEDIAN 2) and zh a/i/o/u (i median 1); JALAB kept its 1-frame phones through S57.
 /// Everywhere else `SUNG_KEEP_MIN` stands.
 const RESCUE_LENDER_KEEP: i64 = 1;
-/// S96 knife ② — the most frames an IN-PHRASE onset may take from its own note BEYOND the 2-frame
-/// floors, i.e. how far the S92c target-chase may delay the vowel when the lenders are dry. 3 is not
-/// invented: it is the training side's own ear-established minimum healthy consonant
-/// (realign_mindur.py DCONS = 3 — "cons 2→3, gesture consonants need ≥3fr, EAR+dry-run"; the same
-/// number the audit's BELOW_TRAINING_FLOOR axis keys on). Dense English lines used to chase the FULL
-/// measured target out of the nucleus (`ties`@18fr: t took 5 in-note, vowel +5 off the beat;
-/// `flowers`: +7) — and "the nucleus starts on the beat" is the Auto arm's whole contract, with the
-/// SV reference pinning vowels to the grid on exactly these notes (S95 user-ratified). Floors are
-/// always allowed on top (a cluster's 2×k frames — dropping a consonant sings the wrong word, which
-/// is strictly worse than a late vowel: the user's own "唱对最重要" rule). Attack-after-silence is
-/// exempt (see the borrow loop): with no beat-anchored material before it, the FULL target chase IS
-/// the reference behaviour (SV delays the post-rest attack; `look` measured +4 there).
-const IN_NOTE_ATTACK_MAX: i64 = 3;
 /// Fallback targets for a consonant missing from the measured priors (defensive — the generator
 /// covers every non-nucleus token; ≈ the global consonant medians).
 const ONSET_TARGET_FALLBACK: i64 = 4;
@@ -510,6 +497,24 @@ fn onset_target_frames(p: &str, fr: i64) -> i64 {
 fn coda_target_frames(p: &str, fr: i64) -> i64 {
     dur_prior(p).map(|(_, c, _)| c[dur_bucket(fr)]).unwrap_or(CODA_TARGET_FALLBACK)
 }
+
+/// ★S96d — the RATIO weight a coda cluster member claims (S96 knife ③'s proportional split), read
+/// at the LONG bucket for every note length.
+///
+/// A cluster's internal proportions are a property of the phones' IDENTITY (how much of "-ears" is
+/// r-colour); the note's compression is already expressed by the shared `budget`. Reading the
+/// weights at the note's own bucket instead made the RATIO jump at a bucket boundary — the review
+/// CONFIRMED it by measurement: `ɹ`'s coda prior is [3, 3, 16], so stretching a `dears`-class note
+/// from 15 to 16 frames (300 → 320 ms) flipped the split from `ɹ2 z4` to `ɹ4 z2` — the word-final
+/// /z/ HALVED because the note got LONGER, the exact S89 non-monotonicity this file pins by sweep
+/// (and the shipped sweep's `[i n z]`, whose two members scale near-proportionally, is blind to it).
+/// The long bucket is the least-compressed measurement, so it is the honest ratio to carry.
+/// Absolute lengths are untouched: every member is still bounded by the budget and by its floor.
+fn coda_share_weight(p: &str) -> i64 {
+    coda_target_frames(p, LONG_BUCKET_FRAMES)
+}
+/// Any note length that lands in `dur_bucket`'s last bucket (≥16 frames = 320 ms).
+const LONG_BUCKET_FRAMES: i64 = 16;
 
 /// S83 knife 5: measured f0==0 fraction (permille) inside a voiceless phone's window, bucketed by
 /// its note GROUP length. Real singing zeroes only 17-48% of a SHORT-note voiceless window (the
@@ -664,49 +669,22 @@ fn allocate_in_note(
     // weight participates only through what the medials are allowed to claim.
     // zh/ja/alias and the MFA languages carry no digits ⇒ `nuc_stress` is None ⇒ byte-identical.
     let n_nuclei = ph.iter().filter(|p| is_nucleus_phone(p)).count();
+    // ★S96d (review CONFIRMED): a count mismatch is a LEGAL, ORDINARY input — S90 made the
+    // stressless ARPABET nucleus a first-class spelling, so a PARTIALLY-stressed hint like
+    // `[EH1 V ER IY]` extracts fewer digits than it has nuclei. The first cut debug_assert!'d
+    // here ("equivalence broke") and a user hint could panic the whole render in a dev build
+    // (tauri dev = debug_assertions on — the user's actual bench). The digit≡nucleus equivalence
+    // is a DICTIONARY property (S90 gate, 863018 tokens), never a hint property. Mismatch ⇒ the
+    // stress channel simply doesn't exist for this note: stress-blind allocation, no noise.
     let stress_w: Option<Vec<i64>> = nuc_stress.and_then(|s| {
         if !chaining || n_nuclei < 2 || s.len() != n_nuclei {
-            debug_assert!(
-                s.len() == n_nuclei || !chaining || n_nuclei < 2,
-                "nucleus_stress count {} != nuclei {} — the S90 digit≡nucleus equivalence broke",
-                s.len(),
-                n_nuclei
-            );
             return None;
         }
         Some(s.iter().map(|&d| match d { 1 => 3, 2 => 2, _ => 1 }).collect())
     });
-    let (pool, w_total) = match &stress_w {
-        Some(w) => {
-            let med_cons: i64 = (onset_end..nuc)
-                .filter(|&i| !is_nucleus_phone(ph[i]))
-                .map(|i| onset_target_frames(ph[i], note_frames))
-                .sum();
-            let coda_want: i64 =
-                ph[nuc + 1..].iter().map(|p| coda_target_frames(p, note_frames)).sum();
-            let cfe = if n_coda >= 2 {
-                (n_coda as i64 * CODA_MIN_FRAMES).min((fr - NUCLEUS_KEEP_MIN).max(0))
-            } else {
-                0
-            };
-            let coda_est = coda_want.min((fr * 2 / 5).max(cfe));
-            (
-                (fr - med_cons - coda_est - onset_allowance)
-                    .max(n_nuclei as i64 * CODA_MIN_FRAMES),
-                w.iter().sum::<i64>(),
-            )
-        }
-        None => (0, 0),
-    };
-    let mut nuc_ord = 0usize;
     for i in onset_end..nuc {
         let c = if is_nucleus_phone(ph[i]) {
-            let t = match &stress_w {
-                Some(w) => (pool * w[nuc_ord] / w_total).max(CODA_MIN_FRAMES),
-                None => (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4),
-            };
-            nuc_ord += 1;
-            t
+            (fr / ((n_medial + n_coda) as i64 + 2)).clamp(CODA_MIN_FRAMES, 4)
         } else {
             onset_target_frames(ph[i], note_frames)
         }
@@ -783,14 +761,14 @@ fn allocate_in_note(
             let mut b = budget;
             while !pool.is_empty() {
                 let w_pool: i64 =
-                    pool.iter().map(|&j| coda_target_frames(ph[live0 + j], note_frames)).sum();
+                    pool.iter().map(|&j| coda_share_weight(ph[live0 + j])).sum();
                 if w_pool <= 0 {
                     break;
                 }
                 let mut under: Vec<usize> = Vec::new();
                 let mut shares: Vec<(usize, i64, i64)> = Vec::new(); // (j, floor, remainder)
                 for &j in &pool {
-                    let t = coda_target_frames(ph[live0 + j], note_frames);
+                    let t = coda_share_weight(ph[live0 + j]);
                     let q = b * t / w_pool;
                     if q < CODA_MIN_FRAMES {
                         under.push(j);
@@ -833,6 +811,73 @@ fn allocate_in_note(
         }
     }
     durs[nuc] = fr - used; // nucleus takes the whole remainder (≥ nuc_floor by construction)
+    // ★S96d knife ① (redesigned after the review + the fr∈[6,13] deletion sweep): stress is a
+    // REDISTRIBUTION over the finished baseline allocation, never a different targeting formula.
+    // The first cut gave stressed medials their own pool targets inside the loop above — and the
+    // fattened early nucleus pushed later medials into the `break`: `every`@12 silently deleted
+    // its ɝ, `very`@7 its /ɹ/ ("ve-y"), while a reserve strict enough to prevent that deleted
+    // EVERYTHING at fr 6..8. Running the shipped arithmetic first makes the survival set equal to
+    // the baseline's BY CONSTRUCTION (the sweep test pins it); stress then only moves SPARE frames
+    // between the surviving nuclei:
+    //   • a medial nucleus keeps ≥ CODA_MIN_FRAMES (its shipped floor);
+    //   • the FINAL nucleus keeps ≥ nuc_keep + onset_allowance — the onset-funding passes draw
+    //     from ITS remainder only, and without the reserve a standalone `flowers` lost its /f/
+    //     (the probe-caught "lowers" bug; the allowance mirrors exactly what those passes may take);
+    //   • the freed frames re-split proportional to weights 3/2/1 (primary/secondary/unstressed),
+    //     largest remainder, ties → higher weight then earlier position. `every`@18fr: the
+    //     stressed ɛ rises 3→7 and the word-final unstressed IY0 falls 9→4 — position privilege
+    //     gone, and the user's "重读 EH1 只拿 60ms" symptom with it. Conservation is structural
+    //     (zero-sum transfer); consonants never move here.
+    if let Some(w) = &stress_w {
+        let mut idx: Vec<(usize, i64)> = Vec::new(); // (ph position, weight) of SURVIVING nuclei
+        let mut ord = 0usize;
+        for (i, p) in ph.iter().enumerate() {
+            if is_nucleus_phone(p) {
+                if durs[i] > 0 {
+                    idx.push((i, w[ord]));
+                }
+                ord += 1;
+            }
+        }
+        if idx.len() >= 2 {
+            // floors captured BEFORE any write (the final nucleus's floor reads its own current
+            // remainder — a live read inside the assignment loop would be order-sensitive)
+            let floors: Vec<i64> = idx
+                .iter()
+                .map(|&(i, _)| {
+                    if i == nuc {
+                        durs[nuc].min(nuc_keep + onset_allowance)
+                    } else {
+                        CODA_MIN_FRAMES
+                    }
+                })
+                .collect();
+            let free: i64 =
+                idx.iter().zip(&floors).map(|(&(i, _), &fl)| (durs[i] - fl).max(0)).sum();
+            let w_sum: i64 = idx.iter().map(|&(_, wi)| wi).sum();
+            if free > 0 && w_sum > 0 {
+                let mut shares: Vec<(usize, i64, i64, i64, i64)> = idx
+                    .iter()
+                    .zip(&floors)
+                    .map(|(&(i, wi), &fl)| (i, free * wi / w_sum, free * wi % w_sum, wi, fl))
+                    .collect();
+                let assigned: i64 = shares.iter().map(|s| s.1).sum();
+                // leftover by largest remainder; ties → higher weight, then earlier position
+                shares.sort_by(|a, b| b.2.cmp(&a.2).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
+                let mut left = free - assigned;
+                for s in shares.iter_mut() {
+                    if left == 0 {
+                        break;
+                    }
+                    s.1 += 1;
+                    left -= 1;
+                }
+                for &(i, share, _, _, fl) in &shares {
+                    durs[i] = fl + share;
+                }
+            }
+        }
+    }
     durs
 }
 
@@ -1293,20 +1338,14 @@ fn assemble_arrays(
                     let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc, res.is_sustain);
                     // ★S96 knife ① — the stress pool's onset reserve (see `allocate_in_note`'s
                     // parameter doc). Auto arm only: the InNote arm reserved its onsets out of
-                    // `spendable` BEFORE this call, so its allowance is structurally 0. Post-rest,
-                    // the funding chases the full measured targets (knife ②a); in-phrase it is
-                    // bounded by the floors + IN_NOTE_ATTACK_MAX (knife ②b) — the reserve mirrors
-                    // exactly what the funding passes below are allowed to take from the final
-                    // nucleus, so a fat MEDIAL can never starve a word-initial consonant.
+                    // `spendable` BEFORE this call, so its allowance is structurally 0. It mirrors
+                    // exactly what the funding passes below may take from the final nucleus (the
+                    // measured targets under the shipped half-note clamp), so a fat MEDIAL can
+                    // never starve a word-initial consonant.
                     let onset_allowance = if timing == ArticulationTiming::Auto && onset_end > 0 {
-                        let post_rest = phon.last().map_or(true, |p| matches!(*p, "SP" | "AP"));
                         let floors = CODA_MIN_FRAMES * onset_end as i64;
-                        if post_rest {
-                            let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
-                            want.max(floors).min((fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2))
-                        } else {
-                            IN_NOTE_ATTACK_MAX.max(floors)
-                        }
+                        let want: i64 = ph[..onset_end].iter().map(|&p| target(p)).sum();
+                        want.max(floors).min((fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2))
                     } else {
                         0
                     };
@@ -1417,18 +1456,34 @@ fn assemble_arrays(
                             // ⚠ The coefficient is measured, not derived: /3 leaves 30 vowels over 25% and
                             // /5 buys only one more (13) while costing an onset frame, i.e. 4 is the knee.
                             let cap_j = if is_rest {
-                                // ★S96 knife ② — a REST no longer lends to a CHAINING-language
-                                // onset: the attack after silence starts AT the boundary (consonant
-                                // on the beat, vowel after it), which is the SV reference behaviour
-                                // the user's ear ratified (`look` after a rest: we sang the vowel on
-                                // the grid, SV +4 — ours read as 2-4 frames EARLY on every
-                                // post-rest note). The onset is funded in-note instead, and the
-                                // in-phrase delay budget below exempts exactly this case.
-                                // zh/ja keep the shipped pre-roll into silence — it is what real
-                                // ja singing does (gen_vowel_placement: 2478 real consonants living
+                                // ★S96 knife ② (S96d revision — the absolute cut-off was CONFIRMED
+                                // to starve short post-rest notes): a REST lends a CHAINING-language
+                                // onset only the SHORTFALL — what the note structurally cannot fund
+                                // from itself. On roomy notes the shortfall is 0 and the attack
+                                // starts AT the boundary (consonant on the beat, vowel after it =
+                                // the SV reference the user's ear ratified: `look` +4). On short
+                                // notes (`can`@7: the nucleus guard leaves only 2 in-note;
+                                // `thing`@4 + sustain: the S92i melisma head wants θ=7 a 4-frame
+                                // note can never hold) the rest funds the difference — the first
+                                // cut set this cap to a flat 0 and can/thing/king/smell's onsets
+                                // collapsed to 40 ms floors, exactly the "乱发音" the user reported.
+                                // The in-note deliverable mirrors the funding passes below: floors
+                                // down to min(fr,2), the chase down to NUCLEUS_KEEP_MIN, both under
+                                // this note's own budget (post-rest = the half-note cap; a DEEP
+                                // rest reached through sung material = the in-phrase attack bound).
+                                // zh/ja keep the shipped full pre-roll into silence — real ja
+                                // singing does exactly that (gen_vowel_placement: 2478 consonants
                                 // inside rest groups) and their timing is ear-anchored (S84/S89).
                                 if chaining {
-                                    0
+                                    let budget_here = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
+                                    // self-funding stops at NUCLEUS_KEEP_MIN, not at the hard
+                                    // min(fr,2) floor: with a rest sitting right there, squeezing
+                                    // the vowel into the 2-frame collapse region to save silence
+                                    // frames is the wrong trade (the floor pass CAN go to 2, but
+                                    // the rest should fund first).
+                                    let deliverable =
+                                        budget_here.min((durs[nuc] - NUCLEUS_KEEP_MIN).max(0));
+                                    (want - left - deliverable).max(0).min((d - REST_KEEP_MIN).max(0))
                                 } else {
                                     (d - REST_KEEP_MIN).max(0)
                                 }
@@ -1509,22 +1564,24 @@ fn assemble_arrays(
                             // i.e. the S84 collapse region. Measured, not imagined — a test caught it.
                             let cap = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
                             // ★S96 knife ② — IN-PHRASE, the chase is additionally bounded by
-                            // IN_NOTE_ATTACK_MAX (see the constant's doc): the floors always fit
+                            // the funding passes' own reach: the floors always fit
                             // (never drop a consonant), but the target-chase beyond them may no
                             // longer push the vowel arbitrarily far off the beat (`ties` t took 5
                             // in-note, `flowers` 7 — while the SV reference pins these vowels to
                             // the grid). Attack-after-silence (incl. score start) is exempt: with
                             // knife ②a the rest no longer lends there, the whole onset is in-note
                             // by design, and the delayed attack IS the reference behaviour.
+                            // ★S96e — knife ②b (an in-phrase cap of IN_NOTE_ATTACK_MAX on this
+                            // chase) is REVERTED. It did bound the worst vowel lateness (+7 → +3),
+                            // but the user's ear judged the trade backwards: with dry lenders — the
+                            // norm on a dense line — every word-initial consonant fell back onto a
+                            // 40-60 ms stub (`smell` s 7→2, `drowning` ɹ 7→3, `ties` t 5→3) and the
+                            // report was "发音反而乱了 / 辅音和元音割裂". That is S92c's whole
+                            // finding re-created, and S92c/S92e/S92j are ear-VALIDATED shipped work.
+                            // The beat half of knife ② lives on in the rest arm above (②a), which
+                            // buys the on-beat attack WITHOUT taking frames from articulation.
                             let floor_takes = nuc_before_supplement - durs[nuc];
-                            let post_rest =
-                                phon.last().map_or(true, |p| matches!(*p, "SP" | "AP"));
-                            let budget = if post_rest {
-                                cap
-                            } else {
-                                cap.min(floor_takes.max(IN_NOTE_ATTACK_MAX))
-                            };
-                            let mut allow = (budget - floor_takes).max(0);
+                            let mut allow = (cap - floor_takes).max(0);
                             for i in (0..onset_end).rev() {
                                 let t = target(ph[i]);
                                 if allow == 0 || durs[i] == 0 || durs[i] >= t {
@@ -1624,15 +1681,26 @@ fn assemble_arrays(
                                     continue;
                                 }
                                 let need = CODA_MIN_FRAMES - durs[i];
+                                // ★S96d (review CONFIRMED): the two funding sources COMBINE, exactly
+                                // like the S93 rescue next door — the first cut was single-source
+                                // all-or-nothing, and [R@2fr][fined@3fr] deleted the /f/ that one
+                                // rest frame plus one nucleus frame together could have saved.
                                 let j = pdur.len().wrapping_sub(1);
+                                let mut extra = 0i64;
                                 if j < pdur.len() && matches!(phon[j], "SP" | "AP") {
-                                    let cap = (pdur[j] - REST_KEEP_MIN).max(0);
-                                    if cap >= need {
-                                        pdur[j] -= need;
-                                        borrowed.push((j, need));
-                                        durs[i] += need;
-                                    }
+                                    extra = need.min((pdur[j] - REST_KEEP_MIN).max(0));
                                 }
+                                let from_nuc =
+                                    (need - extra).min((durs[nuc] - fr.min(2)).max(0));
+                                if extra + from_nuc < need {
+                                    continue; // cannot reach the floor — drop exactly as before
+                                }
+                                if extra > 0 {
+                                    pdur[j] -= extra;
+                                    borrowed.push((j, extra));
+                                }
+                                durs[nuc] -= from_nuc;
+                                durs[i] += extra + from_nuc;
                             }
                         }
                         // sub-minimum onsets DROP (same policy as codas/medials); at this point their
@@ -2500,7 +2568,7 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("F L AW1 ER0 Z", 22)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["f", "l", "aʊ", "ɝ", "z"], "the /f/ must never be deleted");
-        assert_eq!(a.phone_dur, vec![6, 4, 3, 3, 6]);
+        assert_eq!(a.phone_dur, vec![5, 4, 4, 3, 6]);
         let b = build_arrays_daw(
             &[en("N IH1 NG", 14), en("F L AW1 ER0 Z", 22), en("N AY1 T", 7)],
             &d, ArticulationTiming::Auto,
@@ -2510,18 +2578,57 @@ mod tests {
             vec!["n", "ɪ", "ŋ", "f", "l", "aʊ", "ɝ", "z", "n", "aɪ", "t"],
             "no phone deleted in context either"
         );
+        // ★S96e priority order, stated as the invariant: ARTICULATION outranks the stress balance.
+        // In-phrase the onsets take their measured targets first (f reaches its full 7 — this is
+        // the S92c work the user's ear validated and knife ②b had been eroding), and only what is
+        // left of the note re-splits by stress; the stressed medial is merely guaranteed never to
+        // fall BELOW its stress-blind share.
         let fl = &b.phone_dur[3..8];
-        assert!(fl[2] >= 8, "in-phrase, the stressed medial aʊ keeps its share: {fl:?}");
-        assert!(fl[0] >= CODA_MIN_FRAMES && fl[1] >= CODA_MIN_FRAMES, "…and f/l stay funded: {fl:?}");
+        assert_eq!(fl[0], 7, "in-phrase, the word-initial /f/ reaches its measured target: {fl:?}");
+        assert!(fl[1] >= CODA_MIN_FRAMES, "…and /l/ stays funded: {fl:?}");
+        assert!(fl[2] >= 4, "…while the stressed aʊ never drops below its stress-blind share: {fl:?}");
+    }
+
+
+
+    /// ★S96d 属性 sweep(审查 CONFIRMED 的零覆盖带):带重音数字的多核词扫过整个短-中桶,
+    /// 任何基线保得住音素的帧数上,重音臂也**一个都不许丢**——第一版核池在 fr∈[10,13] 把 every
+    /// 的 ɝ 静默吞掉(very@7 吞 ɹ),而全部既有 sweep 都是无数字输入,对此完全失明。
+    /// 同时断言与无数字基线的存活集合逐帧一致(不是时长一致——时长本来就该不同)。
+    #[test]
+    fn s96d_stressed_multicore_never_deletes_where_baseline_survives() {
+        let d = en_dicts();
+        let mk = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        for (stressed, plain) in
+            [("EH1 V ER0 IY0", "EH V ER IY"), ("V EH1 R IY0", "V EH R IY"), ("AE1 F T ER0", "AE F T ER")]
+        {
+            for fr in 6..=24 {
+                let a = build_arrays_daw(&[mk(stressed, fr)], &d, ArticulationTiming::Auto).unwrap();
+                let b = build_arrays_daw(&[mk(plain, fr)], &d, ArticulationTiming::Auto).unwrap();
+                assert_eq!(
+                    a.phon, b.phon,
+                    "{stressed}@{fr}: stress arm dropped a phone the baseline keeps (or vice versa)"
+                );
+                assert_eq!(
+                    a.phone_dur.iter().sum::<i64>(),
+                    b.phone_dur.iter().sum::<i64>(),
+                    "{stressed}@{fr}: conservation"
+                );
+            }
+        }
     }
 
     /// ★S96 knife ① discriminator — the user's `every`@18fr shape: [ɛ v ɝ i] with ARPABET stress
     /// EH1/ER0/IY0. Stress-blind allocation sang ɛ:3 v:3 ɝ:3 i:9 — the PRIMARY-stressed vowel got
     /// 60 ms and the word-final unstressed IY0 swallowed the remainder purely by position (the SV
     /// reference sings EV-ry, two clear segments; real long-note non-final nuclei sit at p50 = 10).
-    /// With stress: nuclei pool = 18 − v(3) = 15, weights 3/1/1 ⇒ ɛ 9, ɝ 3, i takes the remaining 3.
-    /// The ja arm (raw IPA carries no digits) keeps the OLD allocation byte-for-byte — the stress
-    /// channel simply never exists there, which is the whole language gate.
+    /// With stress (S96d redistribution semantics): baseline [3,3,3,9] → nuclei keep floors
+    /// (ɛ2/ɝ2/i3), the freed 8 frames re-split 3/1/1 ⇒ [7,3,4,4] — ɛ 3→7 (140 ms), the word-final
+    /// unstressed i 9→4. The ja arm (raw IPA carries no digits) keeps the OLD allocation
+    /// byte-for-byte — the stress channel simply never exists there, which is the whole gate.
     #[test]
     fn s96_stressed_medial_nucleus_gets_its_share() {
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
@@ -2530,7 +2637,7 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("EH1 V ER0 IY0", 18)], &en_dicts(), ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["ɛ", "v", "ɝ", "i"]);
-        assert_eq!(a.phone_dur, vec![9, 3, 3, 3], "primary-stressed ɛ outweighs the unstressed tail");
+        assert_eq!(a.phone_dur, vec![7, 3, 4, 4], "primary-stressed ɛ outweighs the unstressed tail");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 18, "frame-conserving");
         // ja raw-IPA (no digits ⇒ no stress channel): the shipped stress-blind allocation, untouched.
         let j = build_arrays_daw(&[raw("ɛ v ɝ i", 18)], &NoDicts, ArticulationTiming::Auto).unwrap();
@@ -2681,11 +2788,9 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("D OW1 N T", 8), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
-        // ★S96 ②b: in-phrase, the chase stops at IN_NOTE_ATTACK_MAX = 3 (the training floor), not
-        // at the full 7-frame target — the other 4 frames belong to the beat ("the nucleus starts
-        // on the beat" is this arm's contract, and the SV reference pins these vowels to the grid).
-        // Still 3 vs ja's 2 below: the language discriminator survives.
-        assert_eq!(a.phone_dur, vec![2, 2, 2, 2, 3, 13], "the starved /s/ reaches the training floor, beat-bounded");
+        // ★S96e: knife ②b's in-phrase cap is REVERTED (the user heard the articulation loss), so
+        // this is back to the shipped S92c number — the starved /s/ reaches its measured 7 frames.
+        assert_eq!(a.phone_dur, vec![2, 2, 2, 2, 7, 9], "the starved /s/ reaches its measured 7-frame target");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 24, "frame-conserving");
 
         // ja, identical phones and frames (raw IPA override): the lender is still empty, but the rule
@@ -2722,10 +2827,9 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
-        // ★S96 ②b: s gets its 3 borrowed frames + IN_NOTE_ATTACK_MAX(3) in-note = 6 of its
-        // 7-frame target — the last frame belongs to the beat (vowel +3, not +4).
-        assert_eq!(a.phone_dur, vec![5, 6, 4, 2, 6, 13]);
-        assert_eq!(a.phone_dur[4], 6, "★borrow(3) + beat-bounded chase(3)");
+        // ★S96e: back to the shipped S92d/S92j numbers after knife ②b was reverted.
+        assert_eq!(a.phone_dur, vec![5, 6, 4, 2, 7, 12]);
+        assert_eq!(a.phone_dur[4], 7, "★the onset still reaches its measured target");
         assert_eq!(a.phone_dur[2], 4, "★a preceding CONSONANT is not drained back down (its own fix holds)");
         // ★S92j, stated as the invariant instead of as a number: the lender's UNDISTURBED duration is
         // derived from the same note standing alone, so this stays honest if a target or bucket moves.
@@ -3150,6 +3254,52 @@ mod tests {
                 "fr={fr} left the nucleus in the collapse region: {by_pos:?}"
             );
             prev = by_pos;
+        }
+    }
+
+    /// ★S96d — the sweep the shipped one was BLIND to (review CONFIRMED). `[i n z]` has two members
+    /// whose priors scale near-proportionally across the buckets, so it can never expose a RATIO
+    /// flip; `ɹ`-family clusters can (ɹ coda = [3, 3, 16]) and did: at the 15→16 frame bucket
+    /// boundary the word-final consonant used to halve while the note got LONGER. Sweeps every real
+    /// English cluster family that contains a member with a steep bucket step.
+    #[test]
+    fn s96d_cluster_monotonicity_over_bucket_boundaries() {
+        for phones in [
+            "ɪ ɹ z",   // dears / years / tears — the user's own shape
+            "ɪ ɹ s",   // pierce
+            "ɑ ɹ t",   // art
+            "ɪ ŋ z",   // things
+            "aɪ n d",  // find
+            "ɛ l p",   // help
+            "i ŋ θ s", // strengths (three-member)
+        ] {
+            let toks: Vec<&str> = phones.split(' ').collect();
+            let mut prev = vec![0i64; toks.len()];
+            for fr in 3..=60 {
+                let arr =
+                    build_arrays_daw(&[raw(phones, fr)], &NoDicts, ArticulationTiming::Auto).unwrap();
+                assert_eq!(arr.phone_dur.iter().sum::<i64>(), fr, "{phones}@{fr}: conservation");
+                // 0 = dropped, so presence stays comparable across note lengths
+                let mut by_pos = vec![0i64; toks.len()];
+                let mut seen = 0usize;
+                for (p, d) in arr.phon.iter().zip(arr.phone_dur.iter()) {
+                    // walk forward so a repeated phone maps to its own slot
+                    while seen < toks.len() && toks[seen] != *p {
+                        seen += 1;
+                    }
+                    assert!(seen < toks.len(), "{phones}@{fr}: unexpected phone {p}");
+                    by_pos[seen] = *d;
+                    seen += 1;
+                }
+                for k in 1..toks.len() {
+                    assert!(
+                        by_pos[k] >= prev[k],
+                        "{phones}: fr={fr} SHORTENED a consonant vs fr={}: {prev:?} -> {by_pos:?}",
+                        fr - 1
+                    );
+                }
+                prev = by_pos;
+            }
         }
     }
 
