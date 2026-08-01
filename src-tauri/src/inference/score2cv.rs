@@ -551,6 +551,13 @@ struct NoteBudget {
     /// measured as the collapse region. A fresh syllable (ja かん, any onset-bearing note) can never
     /// satisfy it, which is what keeps zh/ja out of this branch by construction.
     nucleus_continues: bool,
+    /// S94 G1 (enabler, S92 rollout list): does this note's language CHAIN consonants — the same
+    /// `consonant_chaining_language` verdict the borrow loop and the coda clarity pass already key
+    /// on, threaded here so the per-language allocation policies queued behind it (G2 k=1 coda
+    /// ceiling / G3 medial reserve / G5 word-final release) get the language WITHOUT growing a
+    /// second evaluation point. Deliberately unread by the allocation itself today: adding the
+    /// field must not move a single frame (the ten probe lanes are byte-identical across it).
+    chaining: bool,
 }
 
 /// In-note allocation for one note's phones: medial + coda get bounded shares, the nucleus takes the
@@ -596,7 +603,9 @@ fn syllable_split(ph: &[&'static str]) -> (usize, usize) {
 }
 
 fn allocate_in_note(ph: &[&'static str], b: NoteBudget, onset_end: usize, nuc: usize) -> Vec<i64> {
-    let NoteBudget { note_frames, spendable: fr, nucleus_continues } = b;
+    // `chaining` is bound (not wildcarded) so the field counts as read: it is the G2/G3/G5
+    // landing point, and today's allocation must not depend on it.
+    let NoteBudget { note_frames, spendable: fr, nucleus_continues, chaining: _chaining } = b;
     let n = ph.len();
     let mut durs = vec![0i64; n];
     let n_coda = n - nuc - 1;
@@ -1143,7 +1152,12 @@ fn assemble_arrays(
                     let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc, res.is_sustain);
                     let mut durs = allocate_in_note(
                         ph,
-                        NoteBudget { note_frames: fr, spendable: fr - reserved, nucleus_continues },
+                        NoteBudget {
+                            note_frames: fr,
+                            spendable: fr - reserved,
+                            nucleus_continues,
+                            chaining: consonant_chaining_language(res.run_lang),
+                        },
                         onset_end,
                         nuc,
                     );
