@@ -415,6 +415,14 @@ fn mg_audit() {
 /// 最快的真人英语」,不是「真快歌」;②真人的音符分组里 20% 含多个音节,而我们的分配器把一个音符
 /// 内除末核外的一切都当 medial —— 那部分差异是**我们的设计**,不是对齐误差,读数时要分开看。
 ///
+/// ★S96 拍点轴(时长轴之外的第二半):**首核起点相对音符边界的偏移 —— 真人 vs 我们**,按
+/// 「句首(前一事件是休止)/句中」分桶。审计件头注自认抓不到「时长对但落点错」,这条轴就是补它:
+/// 真人侧 = 真值组内首核之前的时长和(前提 Σ真值帧 ≡ 音符帧,本函数里响亮断言);我们侧 = 首核
+/// 音素的 wire 绝对起始帧(全音素游标累加,借帧落在前一事件地界时 onset 先行量为负)− 音符边界。
+/// ⚠口径:「音符边界」= 反投影组头(对齐音素边界,gen_vowel_placement.py 头注★★),ja 六库的边界
+/// 来自真 .mid = 拍点级;en/zh 系是标注惯例合成物,拍点真值另走层1 SV 对照 —— 这条轴回答的是
+/// 「同一套边界下,真人怎么铺、我们怎么铺」,自洽且零主观。
+///
 /// Run:
 ///   $env:UTAI_MG_SCORE='<...>\gt_en_fast_score.json'; $env:UTAI_MG_TRUTH='<...>\gt_en_fast_truth.json'
 ///   cargo test --lib inference::score2svc::mg_tests::mg_truth_cmp -- --ignored --nocapture
@@ -431,17 +439,30 @@ fn mg_truth_cmp() {
     let truth = tv["truth"].as_array().unwrap();
     assert_eq!(truth.len(), sj.triples.len(), "真值与谱面的事件数不一致 —— 不是同一份反投影");
 
-    // 逐事件收集实发(与审计件同一条对齐规则:实发是期望的子序列)
-    let mut ours: Vec<Vec<(&'static str, i64)>> = vec![Vec::new(); sj.triples.len()];
+    // 逐事件收集实发(与审计件同一条对齐规则:实发是期望的子序列)。S96:同步累加 wire 游标,
+    // 每条实发多带自己的绝对起始帧 —— 拍点轴要的落点在生产里没有显式字段,只由顺序+时长隐式决定,
+    // 这里的累加就是 mg_lane_dump 的同一条 cursor 规则(score2svc_mg.rs 泳道 frame0 的定义)。
+    let mut ours: Vec<Vec<(&'static str, i64, i64)>> = vec![Vec::new(); sj.triples.len()];
+    let mut cursor = 0i64;
     for i in 0..arr.phon.len() {
         if !matches!(arr.phon[i], "SP" | "AP") {
-            ours[arr.evt[i]].push((arr.phon[i], arr.phone_dur[i]));
+            ours[arr.evt[i]].push((arr.phon[i], arr.phone_dur[i], cursor));
         }
+        cursor += arr.phone_dur[i];
+    }
+    // 音符边界 = 谱面 frames 顺序累加(音符边界的唯一表达,mg score JSON 无绝对起点字段)
+    let mut note_frame0 = Vec::with_capacity(sj.triples.len());
+    let mut cf = 0i64;
+    for t in &sj.triples {
+        note_frame0.push(cf);
+        cf += t.frames;
     }
 
     // (position, 真人帧, 我们帧) —— position 走生产的 syllable_split,不另写一份
     let mut pairs: Vec<(&'static str, &'static str, i64, i64)> = Vec::new();
     let mut dropped: Vec<(usize, String, i64)> = Vec::new();
+    // S96 拍点轴样本:(evt, 句首?, 真人首核偏移, 我们首核偏移, 我们首音素先行量)
+    let mut beat: Vec<(usize, bool, i64, i64, i64)> = Vec::new();
     for (k, row) in truth.iter().enumerate() {
         let exp = row.as_array().unwrap();
         if exp.is_empty() {
@@ -452,6 +473,19 @@ fn mg_truth_cmp() {
             .map(|e| audit::intern(e[0].as_str().unwrap()).expect("真值里有词表外的音素"))
             .collect();
         let (onset_end, nuc) = super::super::score2cv::syllable_split_for_audit(&toks);
+        // ★拍点轴前提,响亮断言:真值组内音素帧和 ≡ 音符帧(五语 2034 音符核对过 0 例外;
+        //   这里钉死,防将来反投影生成器漂移后 cumsum 落点悄悄失义)
+        let tsum: i64 = exp.iter().map(|e| e[1].as_i64().unwrap()).sum();
+        assert_eq!(
+            tsum, sj.triples[k].frames,
+            "evt {k}: Σ真值帧 {tsum} != 音符帧 {} —— 拍点轴前提被打破,先查反投影生成器",
+            sj.triples[k].frames
+        );
+        let truth_off: i64 = exp[..onset_end].iter().map(|e| e[1].as_i64().unwrap()).sum();
+        let phrase_initial = k == 0 || truth[k - 1].as_array().is_none_or(|a| a.is_empty());
+        let has_first_nucleus = super::super::score2cv::is_nucleus_phone(toks[onset_end]);
+        let mut ours_nuc_off: Option<i64> = None;
+        let mut ours_lead: Option<i64> = None;
         let mut gi = 0usize;
         for (i, &t) in toks.iter().enumerate() {
             let singer = exp[i][1].as_i64().unwrap();
@@ -465,11 +499,20 @@ fn mg_truth_cmp() {
                 "medial"
             };
             if gi < ours[k].len() && ours[k][gi].0 == t {
+                if i == 0 {
+                    ours_lead = Some(ours[k][gi].2 - note_frame0[k]);
+                }
+                if i == onset_end && has_first_nucleus {
+                    ours_nuc_off = Some(ours[k][gi].2 - note_frame0[k]);
+                }
                 pairs.push((t, pos, singer, ours[k][gi].1));
                 gi += 1;
             } else {
                 dropped.push((k, t.to_string(), singer));
             }
+        }
+        if let (Some(no), Some(lead)) = (ours_nuc_off, ours_lead) {
+            beat.push((k, phrase_initial, truth_off, no, lead));
         }
     }
 
@@ -513,6 +556,44 @@ fn mg_truth_cmp() {
     }
     for (m, t, pos, n) in rows.iter().rev().take(3) {
         eprintln!("   {t:<4} {pos:<8} 平均比真人长 {m:>4.1} 帧 (n={n})");
+    }
+
+    // ── S96 拍点轴:首核落点 真人 vs 我们(口径见头注;差 = 我们 − 真人,正 = 我们更晚)──
+    let beat_stat = |label: &str, sel: &dyn Fn(&(usize, bool, i64, i64, i64)) -> bool| {
+        let s: Vec<_> = beat.iter().filter(|b| sel(b)).collect();
+        if s.is_empty() {
+            return;
+        }
+        let mut d: Vec<i64> = s.iter().map(|b| b.3 - b.2).collect();
+        d.sort_unstable();
+        let within1 = d.iter().filter(|&&x| x.abs() <= 1).count();
+        let mut troff: Vec<i64> = s.iter().map(|b| b.2).collect();
+        troff.sort_unstable();
+        let mut lead: Vec<i64> = s.iter().map(|b| b.4).collect();
+        lead.sort_unstable();
+        eprintln!(
+            "  {label:<14} n={:<4} 真人首核偏移 p50={:>2}  差(我−真) p25/p50/p75 = {:>+3}/{:>+3}/{:>+3}  |差|≤1 {:>3.0}%  首音素先行 p50={:>+3}",
+            s.len(), troff[troff.len() / 2],
+            d[d.len() / 4], d[d.len() / 2], d[3 * d.len() / 4],
+            100.0 * within1 as f64 / s.len() as f64,
+            lead[lead.len() / 2],
+        );
+    };
+    eprintln!("  ── S96 拍点轴(首核起点 − 音符边界;真人=组内 cumsum,我们=wire 游标)──");
+    beat_stat("全部", &|_| true);
+    beat_stat("句首(休止后)", &|b| b.1);
+    beat_stat("句中", &|b| !b.1);
+    beat_stat("句中·带onset", &|b| !b.1 && b.2 > 0);
+    let mut worst: Vec<_> = beat.iter().collect();
+    worst.sort_by_key(|b| -(b.3 - b.2).abs());
+    eprintln!("  ── 拍点差最大的音符 ──");
+    for b in worst.iter().take(6) {
+        eprintln!(
+            "   evt {:<4} {} 真人 +{} 我们 {:+} (差 {:+}) 先行 {:+}",
+            b.0,
+            if b.1 { "句首" } else { "句中" },
+            b.2, b.3, b.3 - b.2, b.4
+        );
     }
     assert!(pairs.len() > 500, "对拍样本太少,是不是喂错了真值?");
     assert_eq!(
