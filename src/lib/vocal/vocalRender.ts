@@ -745,8 +745,21 @@ export const G2P_ALGO_VERSION = "s94";
  *  note length (bucket-keyed weights flipped `dears`' split at 15→16 frames — a longer note
  *  SHORTENED the /z/, breaking S89 monotonicity); the would-drop rescue combines its two sources.
  *  Articulation is restored to the S95 baseline on both probe tracks; ja/alias/InNote lanes remain
- *  byte-identical to S95 by hash. */
-export const SCORE_TIMING_VERSION = "s96e";
+ *  byte-identical to S95 by hash.
+ *
+ *  s96f — coda TOP-UP to the real-singer floor (chaining languages only), run AFTER every
+ *  onset-funding pass so it can only spend what the note has left: a coda under 3 frames takes the
+ *  difference from its own nucleus while that nucleus keeps NUCLEUS_KEEP_MIN. Evidence: the user
+ *  reported "and 听起来像错的 / 其他地方的 l 也有点割裂", and the rendered audio showed those
+ *  consonants at NORMAL energy (−0.7…+1.6 dB vs their own vowel) — too SHORT, not too quiet —
+ *  while real English singing keeps coda p05 at 3 frames (en cells n = 500-5400) and the training
+ *  pipeline's ear-set floor is the same 3. Measured effect: 8 codas per probe track reach the
+ *  floor (`and`'s /d/, `dears`' /z/, `if`/`night`/`much`/`thanks`…), paid by ~7 nuclei giving up
+ *  one frame each (all still ≥ 3). ⚠ Honest limit, pinned by test: a 7-frame CVC note cannot pay
+ *  at all (onset 3 + nucleus 3 leaves 2), which is exactly the user's `call`/`will`/`tell`; buying
+ *  those needs a TIMING decision (letting the release ride into the next attack), not a quieter
+ *  vowel. ja/zh and the three alias lanes: 0 phones changed (measured, not argued). */
+export const SCORE_TIMING_VERSION = "s96f";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */

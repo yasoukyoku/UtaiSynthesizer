@@ -285,10 +285,9 @@ fn dist_cell(lang: &str, token: &str, position: Position, group_frames: i64) -> 
     find(lang).or_else(|| find(""))
 }
 
-/// 真英语训练数据里辅音的硬下限:`scripts/realign_mindur.py` 的 `DCONS = 3`(S57 耳测定的),
-/// 8 个 LOOSE 集(含 `gtsinger_en`)按它重对齐过 ⇒ 实测 **0 / 5608** 个英语辅音短于 3 帧。
-/// ⚠ 日语手工 lab 不在那批里(真日语数据保留 19% 的 ≤2 帧辅音),所以这条**只对成丛语言成立**。
-const TRAINING_CONSONANT_FLOOR: i64 = 3;
+/// 真英语训练数据里辅音的硬下限 —— **单一真源在生产侧**(S96f 起分配器自己也用它来给成丛
+/// 语言的 coda 定预算下限),这里只是转发,免得仪器和生产对「什么算够长」各说各话。
+use super::CHAINING_CONSONANT_FLOOR as TRAINING_CONSONANT_FLOOR;
 
 /// 一个事件「该发什么」。**只描述发射契约,不复制分配规则** —— 分配规则的产物是 `arr`,
 /// 拿它当真值就是自证。

@@ -410,6 +410,20 @@ pub fn is_nucleus_phone(p: &str) -> bool {
 // EMISSION floor for every phone we place; the one measured exception is the S93 rescue LENDER
 // (`RESCUE_LENDER_KEEP` below), which may keep 1 because real zh/ja singing does exactly that.
 const CODA_MIN_FRAMES: i64 = 2; // the shipped emission floor: we never PLACE a phone under 2 frames
+/// ★S96f — what a CHAINING-language coda should get when the note can pay for it, as opposed to
+/// `CODA_MIN_FRAMES`, which is only the "never emit anything shorter" survival floor.
+///
+/// Three independent sources put the same number on it: (a) the reference distribution built from
+/// real aligned singing — en coda p05 = 3 for `l` (n=2633+508), `n` (n=5408+1500), `d` (n=2808+751),
+/// `z`, `m`… i.e. real singers essentially never go under 3; (b) the training pipeline's own
+/// `realign_mindur.py DCONS = 3`, which S57 set BY EAR and applied to the 8 LOOSE sets (gtsinger_en
+/// included) ⇒ 0 / 5608 English consonants under 3 frames; (c) the user's ear, 2026-08-01: with the
+/// `fr*2/5` budget handing 7-8 frame notes exactly 2 frames of coda, `call`/`will`/`tell` sang a
+/// 40 ms /l/ and `and` sang 2+2 — measured at NORMAL energy (−0.7…+1.6 dB vs their own vowel), so
+/// they are not weak, they are too SHORT to be heard as themselves ("其他地方的 l 也有点割裂").
+/// ⚠ zh/ja keep `CODA_MIN_FRAMES`: the ja hand labs never went through that realignment and DO
+/// attest 1-2 frame codas, and their allocation is ear-validated as shipped (S84/S89/S93).
+pub(super) const CHAINING_CONSONANT_FLOOR: i64 = 3;
 const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
 const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// S93 — DROP-RESCUE ONLY: the floor an ADJACENT sung-VOWEL lender may fall to when the alternative
@@ -1336,6 +1350,9 @@ fn assemble_arrays(
                     // is what makes it exact: any onset before the nucleus (か, `v ɪ`) breaks the
                     // vowel's continuity, so those notes keep the full nucleus protection.
                     let nucleus_continues = nucleus_is_held(phon.last(), ph, nuc, res.is_sustain);
+                    // ONE evaluation point per note for the language split (the borrow loop binds
+                    // its own `chaining` from the same predicate; they must never disagree).
+                    let chaining_lang = consonant_chaining_language(res.run_lang);
                     // ★S96 knife ① — the stress pool's onset reserve (see `allocate_in_note`'s
                     // parameter doc). Auto arm only: the InNote arm reserved its onsets out of
                     // `spendable` BEFORE this call, so its allowance is structurally 0. It mirrors
@@ -1355,7 +1372,7 @@ fn assemble_arrays(
                             note_frames: fr,
                             spendable: fr - reserved,
                             nucleus_continues,
-                            chaining: consonant_chaining_language(res.run_lang),
+                            chaining: chaining_lang,
                         },
                         onset_end,
                         nuc,
@@ -1818,6 +1835,37 @@ fn assemble_arrays(
                                 debug_assert_eq!(left, 0, "coda pre-roll took frames it could not place");
                                 #[cfg(test)]
                                 ledger.push((j, take));
+                            }
+                        }
+                    }
+                    // ★S96f — CODA TOP-UP to the real-singer floor, on the chaining arm only, and
+                    // deliberately LAST: everything that funds an onset has already run, so this
+                    // pass can only spend what the note has left over and can never starve (let
+                    // alone delete) a word-initial consonant. My first cut raised the floor inside
+                    // `allocate_in_note` instead, and a test caught it deleting `don't`'s /d/ —
+                    // the coda ate the budget the onset needed on a short note.
+                    //
+                    // Why it is needed at all (user's ear, 2026-08-01: "其他地方的 l 处理的也有点
+                    // 割裂" / "and 听起来像错的"): `fr*2/5` on a 7-8 frame note is 2-3 frames, so
+                    // `call`/`will`/`tell` sang a 40 ms /l/ and `and` sang n2+d2 — MEASURED at
+                    // normal energy (−0.7…+1.6 dB vs their own vowel), i.e. not weak, just too
+                    // short to read as themselves. Real English singing essentially never goes
+                    // under 3 frames there (en coda p05 = 3 for l/n/d/m/z, n = 500-5400 per cell),
+                    // and the training pipeline's own ear-set floor is the same 3 (DCONS).
+                    // LAST-first: the word-final release carries the cue (this file's doctrine).
+                    // The nucleus keeps NUCLEUS_KEEP_MIN, so no vowel can be pushed into the S84
+                    // collapse region; zh/ja are untouched (their codas are ear-validated as
+                    // shipped, and their hand labs attest 1-2 frame codas as in-distribution).
+                    if chaining_lang && n > nuc + 1 {
+                        for i in (nuc + 1..n).rev() {
+                            if durs[i] <= 0 || durs[i] >= CHAINING_CONSONANT_FLOOR {
+                                continue;
+                            }
+                            let need = CHAINING_CONSONANT_FLOOR - durs[i];
+                            let take = need.min((durs[nuc] - NUCLEUS_KEEP_MIN).max(0));
+                            if take > 0 {
+                                durs[nuc] -= take;
+                                durs[i] += take;
                             }
                         }
                     }
@@ -3255,6 +3303,45 @@ mod tests {
             );
             prev = by_pos;
         }
+    }
+
+    /// ★S96f — the user's 2026-08-01 report ("其他地方的 l 处理的也有点割裂 / and 听起来像错的"):
+    /// `fr*2/5` on a 7-8 frame note funds exactly 2 frames of coda, and the rendered audio showed
+    /// those consonants at NORMAL energy (−0.7…+1.6 dB vs their own vowel) — not weak, just too
+    /// short to read as themselves, while real English singing puts en coda p05 at 3 frames.
+    /// The top-up runs AFTER every onset-funding pass (an earlier cut raised the floor inside the
+    /// allocator instead and deleted `don't`'s /d/), and stops at NUCLEUS_KEEP_MIN.
+    /// Three arms in one test: it fires (call/and), it does NOT fire when the nucleus cannot pay,
+    /// and ja is untouched.
+    #[test]
+    fn s96f_coda_reaches_the_training_floor_when_the_nucleus_can_pay() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        // single coda on a dense-line note: /l/ 2 → 3, paid by the vowel's spare above its floor
+        // a note with a nucleus that HAS spare pays for the release out of it
+        let a = build_arrays_daw(&[en("M AY1", 8), en("K AO1 L", 11)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["m", "aɪ", "k", "ɔ", "l"]);
+        assert_eq!(a.phone_dur[4], CHAINING_CONSONANT_FLOOR, "the /l/ reaches the real-singer floor: {:?}", a.phone_dur);
+        assert!(a.phone_dur[3] >= NUCLEUS_KEEP_MIN, "…and the vowel keeps its floor: {:?}", a.phone_dur);
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 19, "conservation");
+        // ★and the honest limit, pinned so nobody "fixes" it by squeezing the vowel: at 7 frames a
+        // CVC note cannot pay — onset 3 (ear-validated S92c) + nucleus 3 (S84 collapse guard) + the
+        // release leaves exactly 2. Real singing does not put a full CVC in 140 ms either; buying
+        // that release needs a TIMING decision (letting it ride into the next attack), not a
+        // quieter vowel. The user's `call`/`will`/`tell` are this shape.
+        let tight = build_arrays_daw(&[en("M AY1", 8), en("K AO1 L", 7)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(tight.phone_dur[4], CODA_MIN_FRAMES, "cannot pay ⇒ untouched: {:?}", tight.phone_dur);
+        assert!(tight.phone_dur[3] >= NUCLEUS_KEEP_MIN, "…and the vowel is NOT squeezed: {:?}", tight.phone_dur);
+        // cluster: the word-final release is served first (this file's LAST-first doctrine)
+        let b = build_arrays_daw(&[en("M AY1", 8), en("AH0 N D", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(b.phon, vec!["m", "aɪ", "ə", "n", "d"], "no phone deleted");
+        assert!(b.phone_dur[3] + b.phone_dur[4] >= 5, "the cluster gains: {:?}", b.phone_dur);
+        // ja: same CVC shape, byte-identical to the shipped allocation (no top-up there)
+        let j = build_arrays_daw(&[raw("k a ɴ", 7)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phone_dur[2], CODA_MIN_FRAMES, "ja coda keeps the shipped floor: {:?}", j.phone_dur);
     }
 
     /// ★S96d — the sweep the shipped one was BLIND to (review CONFIRMED). `[i n z]` has two members
