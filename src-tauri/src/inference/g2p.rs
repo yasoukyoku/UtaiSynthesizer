@@ -337,8 +337,21 @@ impl WordDict {
     }
 
     /// Parse the canonical `word<TAB>phones` TSV. First-seen pronunciation wins (the build emits the
-    /// primary first); every word's initial consonant cluster feeds the legal-onset set.
+    /// primary first); every word's initial consonant cluster VOTES for the legal-onset set, and for
+    /// EN a multi-consonant cluster needs `EN_ONSET_MIN_VOTES` votes to be admitted (see the const).
     pub fn from_tsv(lang: Lang, tsv: &str) -> WordDict {
+        let min_votes = match lang {
+            Lang::En => EN_ONSET_MIN_VOTES,
+            // de/fr/es/it carry their own loanword pollution (fr observes 325 onsets!), but their
+            // verdicts belong to the S86#10 self-verification round (reverse-projection fixtures,
+            // S92m) — thresholding them here without one rendered A/B would repeat the exact
+            // mistake this constant exists to prevent. Every observed cluster stays legal for now.
+            _ => 1,
+        };
+        Self::from_tsv_min_votes(lang, tsv, min_votes)
+    }
+
+    fn from_tsv_min_votes(lang: Lang, tsv: &str, min_votes: u32) -> WordDict {
         let vowels: HashSet<&'static str> = match lang {
             Lang::De => gt::MFA_VOWELS_DE.iter().copied().collect(),
             Lang::Fr => gt::MFA_VOWELS_FR.iter().copied().collect(),
@@ -348,6 +361,7 @@ impl WordDict {
         };
         let mut dict = WordDict { lang, map: HashMap::new(), onsets: HashSet::new(), vowels };
         dict.onsets.insert(String::new()); // the empty onset is always legal (V-initial syllables)
+        let mut votes: HashMap<String, u32> = HashMap::new();
         for line in tsv.lines() {
             let Some((word, phones)) = line.split_once('\t') else { continue };
             let phones = phones.trim();
@@ -359,12 +373,42 @@ impl WordDict {
             // word-initial cluster = phones before the first vowel (words with no vowel don't vote)
             let toks: Vec<&str> = phones.split_whitespace().collect();
             if let Some(vi) = toks.iter().position(|t| dict_is_vowel(lang, &dict.vowels, t)) {
-                dict.onsets.insert(toks[..vi].join(" "));
+                *votes.entry(toks[..vi].join(" ")).or_default() += 1;
             }
+        }
+        for (cluster, n) in votes {
+            // The vote threshold disciplines CLUSTERS only. A lone consonant is never gated: all 23
+            // observed EN singles are ordinary English onsets (weakest = ZH with 94 votes), and
+            // dropping one would glue every intervocalic instance of that consonant to the previous
+            // syllable — a category of damage no attestation count justifies.
+            if cluster.contains(' ') && n < min_votes {
+                continue;
+            }
+            dict.onsets.insert(cluster);
         }
         dict
     }
 }
+
+/// S94 (dictionary re-audit, tier-1): an EN onset CLUSTER must be attested by at least this many
+/// word-initial dictionary entries before it may drive intervocalic cuts in `syllabify`.
+///
+/// Why: `from_tsv` admits the prefix of EVERY line with zero filtering, so one loanword/proper-noun
+/// entry rewrites how thousands of ordinary words split across notes. Census over the shipped
+/// en.tsv (S94, blind-verified twice): 149 distinct onsets, 126 multi-consonant; `N D` is supported
+/// by ONE entry (n'dour) yet recuts 2811 words (candle → K AE1 | N D AH0 L, kidney → K IH1 | D N IY0,
+/// sadness, midnight, abandon, window…); `Z B` (4 votes, zbigniew) breaks husband, `M L` (5, mladic)
+/// breaks aimless, `L W` (5, luo/lwin) breaks always — the S86 `always|+ → ɔ | l w eɪ z` finding.
+///
+/// Why SIX: the support histogram has a clean gap — every multi-consonant cluster with 2-5 votes is
+/// carried by non-English proper nouns (survey table in the S94 memory), while the weakest NATIVE
+/// clusters sit exactly at 6 (S P Y spew, TH W thwart) and 9 (S K Y skew). ⛔ Deliberately KEPT
+/// (S92: their cuts are correct — do not "clean" them): T S (27, nazi/pizzeria), ZH (94, asia/azure),
+/// K N (14, technique), the schm-/schn-/schl-/schw- loan families (57-101).
+///
+/// A cluster losing its vote NEVER hurts the words that voted it in: word-initial phones always stay
+/// in the first syllable; the onset set only decides INTERVOCALIC cuts.
+const EN_ONSET_MIN_VOTES: u32 = 6;
 
 /// Candidate dictionary keys for one raw lyric, MOST FAITHFUL FIRST (S86 input-tolerance ladder).
 ///
@@ -1309,9 +1353,14 @@ mod tests {
     fn en_fixture() -> WordDict {
         // two/fun make bare T/F legal onsets (as in the real dictionary), so beautiful syllabifies
         // B Y UW1 | T AH0 | F AH0 L; NG stays coda-only (no fixture word starts with it).
-        WordDict::from_tsv(
+        // S94: built with min_votes = 1 — a nine-word fixture cannot attest a cluster
+        // EN_ONSET_MIN_VOTES times, and these tests exercise the maximal-onset MECHANISM, not the
+        // production threshold. The threshold's behavior over the REAL en.tsv is pinned by
+        // `s94_en_onset_vote_gate` below.
+        WordDict::from_tsv_min_votes(
             Lang::En,
             "light\tL AY1 T\nbeautiful\tB Y UW1 T AH0 F AH0 L\ntree\tT R IY1\nsinger\tS IH1 NG ER0\nextra\tEH1 K S T R AH0\ntwo\tT UW1\nfun\tF AH1 N\nlove\tL AH1 V\ndon't\tD OW1 N T\n",
+            1,
         )
     }
     fn zh_fixture() -> ZhDict {
@@ -1810,6 +1859,59 @@ mod tests {
         assert_eq!(bare_ah, 0, "en.tsv now spells a BARE AH — the s90 'no digit ≡ unstressed' rule would move those words");
         assert!(toks > 500_000 && distinct.len() > 50, "en.tsv walk looks truncated ({toks} tokens)");
         eprintln!("[g2p-e2e] en.tsv nucleus equivalence: {toks} tokens / {} distinct, 0 disagreements", distinct.len());
+    }
+
+    /// S94 onset vote gate — the syllabification half `dictionaries_end_to_end` is structurally
+    /// blind to (S92 measured: deleting onset clusters changes ZERO of its assertions). Loads the
+    /// REAL en.tsv through the production `from_tsv`, then pins (a) the vote-gated onset set and
+    /// (b) full syllable splits for both directions: words the S94 threshold FIXES and words whose
+    /// (deliberately kept) loanword clusters must keep cutting exactly as before.
+    /// NOT #[ignore]: en.tsv is an in-repo bundle resource and the parse is ~100 ms — this must run
+    /// on every `cargo test`, because a dictionary regeneration is exactly when it has to bite.
+    #[test]
+    fn s94_en_onset_vote_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/en.tsv");
+        let tsv = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("en.tsv missing ({e})"));
+        let d = WordDict::from_tsv(Lang::En, &tsv);
+        // (a) gated OUT: proper-noun singleton clusters (support ≤ 5) may no longer cut real words.
+        for gone in ["N D", "D N", "M B", "T L", "S B", "K M", "Z M", "D M", "P SH", "L W", "Z B", "M L", "N W"] {
+            assert!(!d.onsets.contains(gone), "{gone} must be vote-gated out of the EN onset set");
+        }
+        // (a') kept: the S92-verified correct cutters and the weakest NATIVE clusters (6/9 votes).
+        for kept in ["T S", "ZH", "K N", "TH W", "S P Y", "S K Y", "S T R", "S K W", "SH L"] {
+            assert!(d.onsets.contains(kept), "{kept} must stay a legal EN onset");
+        }
+        // (b) splits the threshold FIXES (before S94 the bracketed consonant opened the NEXT syllable):
+        let s = |w: &str| -> Vec<Vec<String>> { syllabify(&d, &d.lookup(w).unwrap()) };
+        let want = |spec: &str| -> Vec<Vec<String>> {
+            spec.split('|').map(|syl| syl.split_whitespace().map(str::to_string).collect()).collect()
+        };
+        for (w, spec) in [
+            ("candle", "K AE1 N | D AH0 L"),        // was K AE1 | N D AH0 L (n'dour's N D)
+            ("window", "W IH1 N | D OW0"),
+            ("abandon", "AH0 | B AE1 N | D AH0 N"),
+            ("kidney", "K IH1 D | N IY0"),          // was K IH1 | D N IY0 (dniester's D N)
+            ("midnight", "M IH1 D | N AY2 T"),
+            ("sadness", "S AE1 D | N AH0 S"),
+            ("husband", "HH AH1 Z | B AH0 N D"),    // was HH AH1 | Z B AH0 N D (zbigniew's Z B)
+            ("always", "AO1 L | W EY2 Z"),          // the S86 `always|+ → ɔ | l w eɪ z` finding (luo's L W)
+            ("atlas", "AE1 T | L AH0 S"),           // was AE1 | T L AH0 S (tlingit's T L)
+            ("admit", "AH0 D | M IH1 T"),           // was AH0 | D M IH1 T (dmitri's D M)
+            ("aimless", "EY1 M | L AH0 S"),         // was EY1 | M L AH0 S (mladic's M L)
+            ("understand", "AH2 N | D ER0 | S T AE1 N D"),
+        ] {
+            assert_eq!(s(w), want(spec), "S94-fixed split for {w}");
+        }
+        // (b') splits that must NOT move — the kept clusters keep cutting exactly as shipped:
+        for (w, spec) in [
+            ("nazi", "N AA1 | T S IY0"),            // T S kept (27 votes): /ts/ cuts as a unit
+            ("asia", "EY1 | ZH AH0"),
+            ("technique", "T EH0 | K N IY1 K"),     // K N kept (14 votes, knish-family) — documented
+            ("southwest", "S AW2 | TH W EH1 S T"),  // TH W native (thwart)
+            ("extra", "EH1 K | S T R AH0"),         // maximal onset itself is alive (S T R, 461 votes)
+        ] {
+            assert_eq!(s(w), want(spec), "S94-unchanged split for {w}");
+        }
     }
 
     // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL

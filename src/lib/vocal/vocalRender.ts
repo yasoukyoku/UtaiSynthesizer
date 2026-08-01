@@ -592,8 +592,13 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  nor the golden vectors contain a digit-less AH. What moves is user-typed input, which is the point.
  *  ★ There is NO Rust twin to keep in lockstep any more: the audition cache tag dropped its g2p term in
  *  S90 (that pipeline renders a fixed clip with no lyrics — see commands/audition.rs). THIS is the one
- *  place the lyric→phone layer is versioned. */
-export const G2P_ALGO_VERSION = "s90";
+ *  place the lyric→phone layer is versioned.
+ *  s94 = the dictionary re-audit batch: EN onset clusters now need ≥6 word-initial attestations to
+ *  drive intervocalic cuts (candle/window/kidney/sadness/husband/always-class splits move — see
+ *  EN_ONSET_MIN_VOTES in g2p.rs), plus the en.tsv regeneration knives of the same session (word-final
+ *  -en IH0→AH0 consistency, curated primary flips). One bump covers the batch: any EN bake from
+ *  before it must re-render to pick the new phones up. */
+export const G2P_ALGO_VERSION = "s94";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
