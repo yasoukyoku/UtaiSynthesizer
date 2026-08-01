@@ -419,6 +419,19 @@ const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// o/ɯ/i (o/ɯ MEDIAN 2) and zh a/i/o/u (i median 1); JALAB kept its 1-frame phones through S57.
 /// Everywhere else `SUNG_KEEP_MIN` stands.
 const RESCUE_LENDER_KEEP: i64 = 1;
+/// S96 knife ② — the most frames an IN-PHRASE onset may take from its own note BEYOND the 2-frame
+/// floors, i.e. how far the S92c target-chase may delay the vowel when the lenders are dry. 3 is not
+/// invented: it is the training side's own ear-established minimum healthy consonant
+/// (realign_mindur.py DCONS = 3 — "cons 2→3, gesture consonants need ≥3fr, EAR+dry-run"; the same
+/// number the audit's BELOW_TRAINING_FLOOR axis keys on). Dense English lines used to chase the FULL
+/// measured target out of the nucleus (`ties`@18fr: t took 5 in-note, vowel +5 off the beat;
+/// `flowers`: +7) — and "the nucleus starts on the beat" is the Auto arm's whole contract, with the
+/// SV reference pinning vowels to the grid on exactly these notes (S95 user-ratified). Floors are
+/// always allowed on top (a cluster's 2×k frames — dropping a consonant sings the wrong word, which
+/// is strictly worse than a late vowel: the user's own "唱对最重要" rule). Attack-after-silence is
+/// exempt (see the borrow loop): with no beat-anchored material before it, the FULL target chase IS
+/// the reference behaviour (SV delays the post-rest attack; `look` measured +4 there).
+const IN_NOTE_ATTACK_MAX: i64 = 3;
 /// Fallback targets for a consonant missing from the measured priors (defensive — the generator
 /// covers every non-nucleus token; ≈ the global consonant medians).
 const ONSET_TARGET_FALLBACK: i64 = 4;
@@ -1316,7 +1329,21 @@ fn assemble_arrays(
                             // ⚠ The coefficient is measured, not derived: /3 leaves 30 vowels over 25% and
                             // /5 buys only one more (13) while costing an onset frame, i.e. 4 is the knee.
                             let cap_j = if is_rest {
-                                (d - REST_KEEP_MIN).max(0)
+                                // ★S96 knife ② — a REST no longer lends to a CHAINING-language
+                                // onset: the attack after silence starts AT the boundary (consonant
+                                // on the beat, vowel after it), which is the SV reference behaviour
+                                // the user's ear ratified (`look` after a rest: we sang the vowel on
+                                // the grid, SV +4 — ours read as 2-4 frames EARLY on every
+                                // post-rest note). The onset is funded in-note instead, and the
+                                // in-phrase delay budget below exempts exactly this case.
+                                // zh/ja keep the shipped pre-roll into silence — it is what real
+                                // ja singing does (gen_vowel_placement: 2478 real consonants living
+                                // inside rest groups) and their timing is ear-anchored (S84/S89).
+                                if chaining {
+                                    0
+                                } else {
+                                    (d - REST_KEEP_MIN).max(0)
+                                }
                             } else if !is_nucleus_phone(phon[j]) {
                                 // consonant lender: the shipped rule next door, nothing further back.
                                 if depth == 1 {
@@ -1393,7 +1420,23 @@ fn assemble_arrays(
                             // onsets take "half of what is left" in turn and the vowel ended at 2 frames,
                             // i.e. the S84 collapse region. Measured, not imagined — a test caught it.
                             let cap = (fr - SUNG_KEEP_MIN).max(0).min((fr + 1) / 2);
-                            let mut allow = (cap - (nuc_before_supplement - durs[nuc])).max(0);
+                            // ★S96 knife ② — IN-PHRASE, the chase is additionally bounded by
+                            // IN_NOTE_ATTACK_MAX (see the constant's doc): the floors always fit
+                            // (never drop a consonant), but the target-chase beyond them may no
+                            // longer push the vowel arbitrarily far off the beat (`ties` t took 5
+                            // in-note, `flowers` 7 — while the SV reference pins these vowels to
+                            // the grid). Attack-after-silence (incl. score start) is exempt: with
+                            // knife ②a the rest no longer lends there, the whole onset is in-note
+                            // by design, and the delayed attack IS the reference behaviour.
+                            let floor_takes = nuc_before_supplement - durs[nuc];
+                            let post_rest =
+                                phon.last().map_or(true, |p| matches!(*p, "SP" | "AP"));
+                            let budget = if post_rest {
+                                cap
+                            } else {
+                                cap.min(floor_takes.max(IN_NOTE_ATTACK_MAX))
+                            };
+                            let mut allow = (budget - floor_takes).max(0);
                             for i in (0..onset_end).rev() {
                                 let t = target(ph[i]);
                                 if allow == 0 || durs[i] == 0 || durs[i] >= t {
@@ -1475,6 +1518,33 @@ fn assemble_arrays(
                                 }
                                 durs[nuc] -= from_nuc;
                                 durs[i] += extra + from_nuc;
+                            }
+                        }
+                        // ★S96 knife ② would-drop rescue, CHAINING arm. Knife ②a stopped the rest
+                        // from funding the attack — but on a TINY post-rest note the in-note passes
+                        // can fail the 2-frame floor too (the nucleus's spare above min(fr,2) is
+                        // under 2). Deleting the consonant sings the WRONG word, which outranks any
+                        // timing consideration (the user's own "唱对最重要" rule, S93). So, ONLY
+                        // when the phone would otherwise drop, the adjacent REST lends back exactly
+                        // the missing frames (down to REST_KEEP_MIN, which it always could) —
+                        // all-or-nothing, so a note that does not drop keeps knife ②a's on-beat
+                        // attack byte-for-byte, and a non-rest neighbour changes nothing (the
+                        // in-phrase drop rules are exactly the shipped ones).
+                        if chaining {
+                            for i in (0..onset_end).rev() {
+                                if durs[i] >= CODA_MIN_FRAMES {
+                                    continue;
+                                }
+                                let need = CODA_MIN_FRAMES - durs[i];
+                                let j = pdur.len().wrapping_sub(1);
+                                if j < pdur.len() && matches!(phon[j], "SP" | "AP") {
+                                    let cap = (pdur[j] - REST_KEEP_MIN).max(0);
+                                    if cap >= need {
+                                        pdur[j] -= need;
+                                        borrowed.push((j, need));
+                                        durs[i] += need;
+                                    }
+                                }
                             }
                         }
                         // sub-minimum onsets DROP (same policy as codas/medials); at this point their
@@ -2236,10 +2306,12 @@ mod tests {
         let score = [en_evt("R", 0, 10), en_evt("mine", 69, 50), en_evt("R", 0, 10)];
         let arr = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["SP", "m", "aɪ", "n", "SP"]);
-        // m pre-rolls at its measured 5-frame target from the leading rest; coda n is bounded at
-        // its 4-frame target; the vowel gets the remainder (46 frames = 92% — the old split_dur
-        // gave it 4 and the [n] hum 42).
-        assert_eq!(arr.phone_dur, vec![5, 5, 46, 4, 10]);
+        // ★S96 knife ②a: the attack after silence starts AT the boundary — the rest keeps all 10
+        // of its frames and m takes its measured 5 from the note itself (the SV-reference post-rest
+        // behaviour; pre-S96 the rest lent 5 and the vowel sat on the boundary, which the user's SV
+        // comparison read as "every post-rest note comes in early"). Coda n still bounded at its
+        // 4-frame target; the vowel takes the remainder.
+        assert_eq!(arr.phone_dur, vec![10, 5, 41, 4, 10]);
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 70, "frame-conserving");
     }
 
@@ -2250,10 +2322,15 @@ mod tests {
         assert_eq!(arr.phon, vec!["SP", "f", "aɪ", "n", "d"]);
         // f (voiceless fricative, long-bucket p75) targets 7, coda n targets 4, the stop d 3 —
         // the 760ms flat [d] is gone AND the consonants are no longer one flat size.
-        assert_eq!(arr.phone_dur, vec![3, 7, 43, 4, 3], "codas at their own measured targets");
+        // S96 ②a: f now takes its 7 from the note (attack after silence), the rest keeps its 10.
+        assert_eq!(arr.phone_dur, vec![10, 7, 36, 4, 3], "codas at their own measured targets");
         // a 3-frame note can't fit any coda at the 2-frame minimum → both drop, the nucleus survives.
         let tiny = build_arrays_daw(&[en_evt("R", 0, 10), en_evt("fined", 69, 3)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(tiny.phon, vec!["SP", "f", "aɪ"], "starved codas DROP (never a 1-frame OOD phone)");
+        // ★S96 ② would-drop rescue: a 3-frame note cannot fund f's floor from itself (nucleus spare
+        // above min(3,2) is 1), so the REST hands back exactly the 2 missing frames — the one case
+        // where silence still lends on the chaining arm. Without it, f is deleted: wrong word.
+        assert_eq!(tiny.phone_dur, vec![8, 2, 3], "the rest funds exactly the would-drop floor");
         assert_eq!(tiny.phone_dur.iter().sum::<i64>(), 13, "still frame-conserving");
     }
 
@@ -2317,6 +2394,39 @@ mod tests {
     /// sung notes, and so do all three UTAU-alias tracks. (The behavioural proof is the byte-identical
     /// lane dump; this test exists so a future edit to the single-coda path turns something red.)
     /// [i n] @ 16 fr: budget = min(4, 14, 6) = 4 ⇒ n = 4, nucleus 12.
+    /// ★S96 knife ②a language discriminator — the SAME "rest, then a consonant-initial note" shape
+    /// under the two regimes: the CHAINING arm (en) attacks AT the boundary (the rest keeps all its
+    /// frames, the onset is funded in-note = the SV-reference post-rest behaviour the user's ear
+    /// ratified), while ja keeps the shipped pre-roll INTO the rest (先行発声 — what real ja singing
+    /// does: 2478 real consonants live inside rest groups in the aligned corpus, and ja timing is
+    /// ear-anchored S84/S89). Same shape, different language, different rule — BY DESIGN, and this
+    /// test is the only place that states it side by side.
+    #[test]
+    fn s96_post_rest_attack_is_per_language() {
+        // en: raw-IPA override so no dictionary is needed; [m i] after a 10-frame rest.
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let rest = |fr: i64| g2p::ScoreEvt {
+            lyric: "R", note_num: 0, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(&[rest(10), en("M IY1", 10)], &en_dicts(), ArticulationTiming::Auto).unwrap();
+        assert_eq!(a.phon, vec!["SP", "m", "i"]);
+        assert_eq!(a.phone_dur[0], 10, "en: the rest keeps ALL its frames (attack on the boundary)");
+        assert!(a.phone_dur[1] >= CODA_MIN_FRAMES, "…and the onset is funded in-note");
+        // ja, same shape (raw IPA): the rest lends and the vowel sits on the boundary, as shipped.
+        let ja_rest = g2p::ScoreEvt {
+            lyric: "R", note_num: 0, frames: 10, lang: g2p::Lang::Ja,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+        };
+        let j = build_arrays_daw(&[ja_rest, raw("m i", 10)], &NoDicts, ArticulationTiming::Auto).unwrap();
+        assert_eq!(j.phon, vec!["SP", "m", "i"]);
+        assert!(j.phone_dur[0] < 10, "ja: the rest still lends (先行発声): {:?}", j.phone_dur);
+        assert_ne!(a.phone_dur, j.phone_dur, "the two regimes must actually differ on this shape");
+    }
+
     /// ★S96 discriminator — the user's `dears` shape ([d] is borrow-funded on the Auto arm; the
     /// note itself feeds ɪ ɹ z @ 21 fr): budget = 21*2/5 = 8, targets ɹ 16 / z 6 (the en reference
     /// distribution: real long-note ɹ codas sit at p50 = 16, z at 6 — the r-colour IS the "-ears")
@@ -2427,7 +2537,11 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("D OW1 N T", 8), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["d", "oʊ", "n", "t", "s", "i"]);
-        assert_eq!(a.phone_dur, vec![2, 2, 2, 2, 7, 9], "the starved /s/ reaches its measured 7-frame target");
+        // ★S96 ②b: in-phrase, the chase stops at IN_NOTE_ATTACK_MAX = 3 (the training floor), not
+        // at the full 7-frame target — the other 4 frames belong to the beat ("the nucleus starts
+        // on the beat" is this arm's contract, and the SV reference pins these vowels to the grid).
+        // Still 3 vs ja's 2 below: the language discriminator survives.
+        assert_eq!(a.phone_dur, vec![2, 2, 2, 2, 3, 13], "the starved /s/ reaches the training floor, beat-bounded");
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 24, "frame-conserving");
 
         // ja, identical phones and frames (raw IPA override): the lender is still empty, but the rule
@@ -2464,8 +2578,10 @@ mod tests {
         };
         let a = build_arrays_daw(&[en("M AY1 N D", 20), en("S IY1", 16)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "n", "d", "s", "i"]);
-        assert_eq!(a.phone_dur, vec![5, 6, 4, 2, 7, 12]);
-        assert_eq!(a.phone_dur[4], 7, "★the onset still reaches its measured target");
+        // ★S96 ②b: s gets its 3 borrowed frames + IN_NOTE_ATTACK_MAX(3) in-note = 6 of its
+        // 7-frame target — the last frame belongs to the beat (vowel +3, not +4).
+        assert_eq!(a.phone_dur, vec![5, 6, 4, 2, 6, 13]);
+        assert_eq!(a.phone_dur[4], 6, "★borrow(3) + beat-bounded chase(3)");
         assert_eq!(a.phone_dur[2], 4, "★a preceding CONSONANT is not drained back down (its own fix holds)");
         // ★S92j, stated as the invariant instead of as a number: the lender's UNDISTURBED duration is
         // derived from the same note standing alone, so this stays honest if a target or bucket moves.
@@ -2913,11 +3029,27 @@ mod tests {
         assert_eq!(off.phone_dur, vec![10, 5, 41, 4]);
         // the note's own phones account for exactly its own frames — nothing crossed the boundary
         assert_eq!(off.phone_dur[1..].iter().sum::<i64>(), 50);
-        // …and the Auto arm demonstrably DOES cross it (guards against a vacuous test: if the two
-        // arms ever produced the same arrays, the assertion above would prove nothing).
+        // …and the Auto arm demonstrably DOES cross a boundary — ★S96 ②a made the two arms
+        // COINCIDE on the post-rest shape (both attack at the boundary now), so the anti-vacuous
+        // discriminator moves to an IN-PHRASE shape: after a sung word, Auto pre-rolls m out of
+        // the neighbour's material while InNote takes it from its own nucleus.
         let on = build_arrays_daw(&score, &d, ArticulationTiming::Auto).unwrap();
-        assert_eq!(on.phone_dur, vec![5, 5, 46, 4], "Auto pre-rolls m out of the rest");
-        assert_ne!(on.phone_dur, off.phone_dur);
+        assert_eq!(on.phone_dur, vec![10, 5, 41, 4], "post-rest: Auto now attacks on the boundary too");
+        let phrase = [en_evt("mine", 69, 16), en_evt("mine", 69, 50)];
+        let on2 = build_arrays_daw(&phrase, &d, ArticulationTiming::Auto).unwrap();
+        let off2 = build_arrays_daw(&phrase, &d, ArticulationTiming::InNote).unwrap();
+        assert_ne!(on2.phone_dur, off2.phone_dur, "in-phrase, the two arms must still differ");
+        assert!(
+            on2.phone_dur[..3].iter().sum::<i64>() < 16,
+            "Auto borrowed from the first word's material: {:?}",
+            on2.phone_dur
+        );
+        assert_eq!(
+            off2.phone_dur[..3].iter().sum::<i64>(),
+            16,
+            "InNote: the first word's frames stay its own: {:?}",
+            off2.phone_dur
+        );
         for arr in [&on, &off] {
             assert_eq!(arr.phone_dur.iter().sum::<i64>(), 60, "both arms conserve frames");
         }

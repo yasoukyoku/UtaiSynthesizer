@@ -720,7 +720,7 @@ export const G2P_ALGO_VERSION = "s94";
  *  floor (monotonicity: a longer note never shortens a consonant). ja/alias/InNote-ja lanes
  *  byte-identical BY CONSTRUCTION (n_coda ≤ 1 ⇒ single-member share = whole budget = old arithmetic);
  *  en lanes: 12 notes moved (dears/things/strengths-class ratio fixes + 2 borrow-source shifts). */
-export const SCORE_TIMING_VERSION = "s96";
+export const SCORE_TIMING_VERSION = "s96b";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
