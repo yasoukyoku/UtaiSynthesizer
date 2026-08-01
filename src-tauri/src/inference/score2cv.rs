@@ -2402,7 +2402,9 @@ mod tests {
     /// ⚠ 这里**故意不加语言门**:豁免的道理(「短音符 + 后面接同元音延音 = 旋律头,元音不缺帧」)
     /// 本身是语言中立的;而 ja 的借帧规则更弱(`depth_limit == 1`、`vowel_keep == SUNG_KEEP_MIN`),
     /// 所以**代价**才因语言而异。在没有日语耳测的情况下改日语行为,违反本仓自己的规矩。
-    /// ⇒ 把当前行为钉成 golden,让它从「没人知道」变成「已知且有据可查」,并进推广清单等耳测。
+    /// ⇒ 把当前行为钉成 golden,让它从「没人知道」变成「已知且有据可查」。
+    /// ★S93 耳测已裁(2026-08-01,用户,A/B=probe 的 s93_h2demo_{current,gated}):**维持现行豁免**
+    /// ——「current 可以,gated 反而听起来有点奇怪」。该债销账;要再改这条得有新的耳测理由。
     #[test]
     fn s92p_ja_melisma_head_exemption_is_pinned_not_gated() {
         let hold = |fr: i64| g2p::ScoreEvt {
@@ -2415,7 +2417,7 @@ mod tests {
         let melisma = build_arrays_daw(
             &[raw("a", 20), raw("k o", 4), hold(40)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(melisma.phon, vec!["a", "k", "o", "o"]);
-        assert_eq!(melisma.phone_dur, vec![16, 4, 4, 40], "现行行为(未经耳测,S92p 钉死)");
+        assert_eq!(melisma.phone_dur, vec![16, 4, 4, 40], "现行行为(S93 耳测通过,维持豁免)");
         assert_eq!(melisma.phone_dur.iter().sum::<i64>(), 64, "conserving");
 
         // ★判别器:同样 4 帧的「こ」、同样的出借者,后面**不是**延音 ⇒ 豁免不适用 ⇒ 快段封顶生效,
@@ -2472,8 +2474,11 @@ mod tests {
     /// 后核也停在 2)⇒ 在连续 3 帧 CV 快跑里逐音符点火,稳态 = 内部元音全部 1 帧、辅音全部 2 帧。
     /// 手推([a@10] + [k a]@3 ×4):n2 从富裕出借者正常借 2;n3 借 1 + 核补 1(邻居 a 3→2);
     /// n4/n5 走 rescue(邻居 a 2→1 + 核补 1)。**pre-S93 同一份输入是隔一个音符删一个辅音**
-    /// (n4 的 k 整个消失 = S92k 定罪的「唱错音节」),方向上 rescue 仍是改善 —— 但这个稳态
-    /// 耳朵没听过、真快歌无取样面(管中窥豹),所以钉死在这里等耳测,别当「已验证安全」引用。
+    /// (n4 的 k 整个消失 = S92k 定罪的「唱错音节」)。
+    /// ★S93 耳测已裁(2026-08-01,用户,A/B=probe 的 s93fastrun_{pre,post}):**稳态放行**——
+    /// 「保辅音取舍元音是对的:极端快音硬保元音听起来唱得很拖沓;『唱对』最重要,隔个丢辅音
+    /// 那是『没唱对』」。⇒ 反级联界不做(已裁,别再排期)。⚠取样面=合成快跑+teto/RVC 一条链,
+    /// 真快歌真素材仍无取样面(管中窥豹,S92 全局盲区)。
     /// ⚠ 审计对该稳态的可见度有限:1 帧核 == p05 不触发 OOD(判据严格 <),2→1 不改
     /// NUCLEUS_COLLAPSE 计数(判据 ≤2)—— 位移记在 NUCLEUS_LENT_AWAY 的 deficit 里。
     #[test]
@@ -2483,7 +2488,7 @@ mod tests {
             &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(arr.phon, vec!["a", "k", "a", "k", "a", "k", "a", "k", "a"],
             "★every consonant in the run survives (pre-S93: every other one vanished)");
-        assert_eq!(arr.phone_dur, vec![8, 2, 2, 2, 1, 2, 1, 2, 2], "现行稳态(未经耳测,钉死)");
+        assert_eq!(arr.phone_dur, vec![8, 2, 2, 2, 1, 2, 1, 2, 2], "级联稳态(S93 耳测放行)");
         assert_eq!(arr.phone_dur.iter().sum::<i64>(), 22, "frame-conserving across the whole run");
     }
 
