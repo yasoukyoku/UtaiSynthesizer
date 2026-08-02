@@ -647,6 +647,19 @@ describe("vocalRenderErrorMessage — VOCAL_ALIAS and the payload-first ordering
     // …and a VOCAL_ALIAS failure is never mistaken for a user cancel
     expect(isVocalCancelError(new Error("VOCAL_ALIAS: vccv 已取消"))).toBe(false);
   });
+
+  // S99 (S90 debt): a mistyped PHONEME must not be reported as a bad LYRIC. The whole value of the
+  // separate code is the advice it carries — `oov` sends the user to check the lyric/language, which
+  // for `[dh ae zzz]` is exactly the wrong place to look.
+  it("★ an unknown PHONEME gets its own code, not the OOV one", () => {
+    expect(vocalRenderErrorMessage(new Error("VOCAL_UNKNOWN_PHONE: zzz"))).toContain("unknownPhone");
+    expect(vocalRenderErrorMessage(new Error("VOCAL_UNKNOWN_PHONE: zzz"))).not.toContain("oov");
+    // it is NOT the internal-invariant code either — that one is worded as OUR bug (score2cv, a phone
+    // that got past g2p), and telling the user "internal error" about their own typo is misleading
+    expect(vocalRenderErrorMessage(new Error("VOCAL_PHONE_MISSING: ʒ"))).toContain("phoneMissing");
+    // never mistaken for a cancel
+    expect(isVocalCancelError(new Error("VOCAL_UNKNOWN_PHONE: 已取消"))).toBe(false);
+  });
 });
 
 // ── S91: the track-params → wire-options mapping. It was an inline literal with ZERO coverage until

@@ -1241,7 +1241,10 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
 
     // main pass: per-note phones + carrier state for sustains; western spans handled look-ahead.
     let mut out: Vec<Option<ResolvedNote>> = vec![None; n];
-    let oov = |lyr: &str| UtaiError::Inference(format!("VOCAL_OOV: {}", lyr));
+    // (S99: the local `oov` closure that used to live here is gone — `NoteFail::into_error` is now the
+    // ONE place that formats a per-note failure, so the OOV wording cannot drift from the new
+    // unknown-phone wording. The alias arm below still formats its own CODE: it fails before a note
+    // resolver is ever called, and its payload is the CONVENTION + lyric, not a phone.)
     // carrier nucleus for holds outside western spans (ja legacy prev_vowel / zh final).
     let mut carrier: Option<&'static str> = None;
 
@@ -1287,7 +1290,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                 match evt.lang {
                     Lang::Ja | Lang::Zh => {
                         match resolve_east_word(evt, zh_syl[i].as_deref(), dicts)? {
-                            Some(ph) => {
+                            Ok(ph) => {
                                 // carrier update: ja = last phone if in VOWEL_SET (legacy prev_vowel
                                 // rule — persists across a non-vowel-final note like ん); zh = the
                                 // final (always the last phone of [initial?, final]).
@@ -1308,9 +1311,9 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                     nucleus_stress: None,
                                 });
                             }
-                            None => {
+                            Err(fail) => {
                                 if strict {
-                                    return Err(oov(evt.lyric));
+                                    return Err(fail.into_error(evt.lyric));
                                 }
                                 out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
                             }
@@ -1345,7 +1348,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                             dicts,
                             merge_trad[i].as_deref(),
                         )? {
-                            Some(assignments) => {
+                            Ok(assignments) => {
                                 for (j, (ph, stress)) in assignments.into_iter().enumerate() {
                                     carrier = ph.last().copied().or(carrier);
                                     out[i + j] = Some(ResolvedNote {
@@ -1356,9 +1359,9 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                     });
                                 }
                             }
-                            None => {
+                            Err(fail) => {
                                 if strict {
-                                    return Err(oov(evt.lyric));
+                                    return Err(fail.into_error(evt.lyric));
                                 }
                                 out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
                                 for j in i + 1..span_end {
@@ -1383,7 +1386,40 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     Ok(out.into_iter().map(|o| o.expect("every note resolved")).collect())
 }
 
-/// Resolve a JA/ZH sung word note to IPA phones. `Ok(None)` = real OOV (unknown word/mora/pinyin);
+/// Why ONE sung word note did not resolve — the distinction the USER sees in the message.
+///
+/// `stage2` and `intern` already NAME the phone they reject — `stage2`'s own doc says so: "Err = the
+/// offending phone (caller wraps the CODE)". Both callers used to drop that name on the floor
+/// (`Err(_) => Ok(None)` and `.ok()`), so a mistyped bracket hint surfaced as `VOCAL_OOV:
+/// [dh ae zzz]` and the frontend told the user to *check the lyrics or the language* — for a note
+/// whose lyric is fine and whose THIRD PHONEME is the typo. S99 pays off that S90 debt by carrying
+/// the name out. (Nothing else changes: an unknown phone is still a per-note failure, so the editor
+/// still marks exactly that note red and the render still stops.)
+enum NoteFail {
+    /// Ordinary OOV: this lyric is not a word / mora / syllable of its language.
+    Oov,
+    /// A phone is not in the 210-token inventory. In practice always user-supplied — a bracket hint
+    /// or a `phoneme_input` override — because every dictionary phone is proven to intern by
+    /// `dictionaries_end_to_end`; naming it is right either way.
+    UnknownPhone(String),
+}
+
+impl NoteFail {
+    /// The strict-render error this becomes. `lyric` is consulted only by the OOV arm: an unknown
+    /// phone names the PHONE, which is the entire point of this type.
+    fn into_error(self, lyric: &str) -> UtaiError {
+        match self {
+            NoteFail::Oov => UtaiError::Inference(format!("VOCAL_OOV: {lyric}")),
+            NoteFail::UnknownPhone(p) => UtaiError::Inference(format!("VOCAL_UNKNOWN_PHONE: {p}")),
+        }
+    }
+}
+
+/// Outer `Err` = INFRASTRUCTURE failure (a missing dictionary — surfaced as `VOCAL_DICT_MISSING` and
+/// never masked as a per-note verdict, audit MAJOR). Inner `Err` = this NOTE failed, and why.
+type NoteResolve<T> = Result<std::result::Result<T, NoteFail>>;
+
+/// Resolve a JA/ZH sung word note to IPA phones. Inner `Err` = the note failed (see `NoteFail`);
 /// `Err` = INFRASTRUCTURE failure (missing dictionary — propagated as VOCAL_DICT_MISSING, never
 /// masked as OOV; audit MAJOR). §3.7 override precedence: whitespace phoneme_input = raw traditional
 /// phones; no-space = a mora (ja) / pinyin syllable (zh); otherwise ja = legacy mora path, zh =
@@ -1392,21 +1428,24 @@ fn resolve_east_word(
     evt: &ScoreEvt,
     zh_phrase_syl: Option<&str>,
     dicts: &dyn DictSource,
-) -> Result<Option<Vec<&'static str>>> {
+) -> NoteResolve<Vec<&'static str>> {
     if let Some(pi) = evt.phoneme_input {
         let pi = pi.trim();
         if pi.contains(char::is_whitespace) {
+            // THE raw-phones escape hatch, and the landing site of a bracket hint — i.e. the one place
+            // where the phones are the USER's, so a rejected one must be named back to them.
             let phones: Vec<String> = pi.split_whitespace().map(str::to_string).collect();
-            return Ok(match evt.lang {
+            let r = match evt.lang {
                 Lang::Ja => ja_phones_from_tokens(&phones),
-                _ => stage2(evt.lang, &phones).ok(),
-            });
+                _ => stage2(evt.lang, &phones),
+            };
+            return Ok(r.map_err(NoteFail::UnknownPhone));
         }
     }
     match evt.lang {
         Lang::Ja => {
             let token = evt.phoneme_input.map(str::trim).unwrap_or(evt.lyric);
-            Ok(ja_word_phones(token))
+            Ok(ja_word_phones(token).ok_or(NoteFail::Oov))
         }
         _ => {
             let zh = dicts.zh()?;
@@ -1418,18 +1457,12 @@ fn resolve_east_word(
                 // (S99 — 「hao,」 was OOV where 「Love,」 was not)
                 (None, None) => lookup_candidates(evt.lyric).iter().find_map(|c| zh.syllable_phones(c)),
             };
-            let Some(trad) = trad else { return Ok(None) };
-            Ok(stage2(Lang::Zh, &trad).ok())
+            let Some(trad) = trad else { return Ok(Err(NoteFail::Oov)) };
+            Ok(stage2(Lang::Zh, &trad).map_err(NoteFail::UnknownPhone))
         }
     }
 }
 
-/// JA word → IPA phones via the legacy mora path (`score2cv::lyric_to_phones` incl. geminates/っ), with
-/// katakana folded to hiragana first (S58 coverage fix — katakana lyrics used to OOV).
-/// S86: the same faithful-first tolerance ladder the word dictionaries use (`lookup_candidates`) —
-/// ONE source, so ja can never drift from en/de/fr/es/it on what counts as "the same lyric". Required
-/// in the same round as `kana_tokenize`: `か、` used to "work" only because the old truncating fallback
-/// silently ate the 、, and the tokenizer (correctly) refuses to consume it.
 /// ZH word lyric → the single hanzi it stands for, through the SAME faithful-first tolerance ladder
 /// (`lookup_candidates`) that `ja_word_phones` and `WordDict::lookup_faithful` already consume.
 ///
@@ -1451,6 +1484,12 @@ fn zh_lyric_hanzi(zh: &ZhDict, lyric: &str) -> Option<char> {
     })
 }
 
+/// JA word → IPA phones via the legacy mora path (`score2cv::lyric_to_phones` incl. geminates/っ), with
+/// katakana folded to hiragana first (S58 coverage fix — katakana lyrics used to OOV).
+/// S86: the same faithful-first tolerance ladder the word dictionaries use (`lookup_candidates`) —
+/// ONE source, so ja can never drift from en/de/fr/es/it on what counts as "the same lyric". Required
+/// in the same round as `kana_tokenize`: `か、` used to "work" only because the old truncating fallback
+/// silently ate the 、, and the tokenizer (correctly) refuses to consume it.
 fn ja_word_phones(token: &str) -> Option<Vec<&'static str>> {
     lookup_candidates(token).iter().find_map(|cand| match classify_lyric_ja(&fold_katakana(cand)) {
         LyricClass::Phones { phones } => Some(phones),
@@ -1459,8 +1498,8 @@ fn ja_word_phones(token: &str) -> Option<Vec<&'static str>> {
 }
 
 /// JA raw-phoneme override: each token must be a vocab IPA phone already (advanced escape hatch).
-fn ja_phones_from_tokens(phones: &[String]) -> Option<Vec<&'static str>> {
-    phones.iter().map(|p| intern(p)).collect()
+fn ja_phones_from_tokens(phones: &[String]) -> std::result::Result<Vec<&'static str>, String> {
+    phones.iter().map(|p| intern(p).ok_or_else(|| p.clone())).collect()
 }
 
 /// Fold katakana (ァ..ヶ + ヴ) to hiragana by the standard −0x60 codepoint shift; everything else
@@ -1493,7 +1532,7 @@ fn resolve_west_span(
     // a merge head never has one (that is a mergeability condition), so the order is moot
     // today, but the precedence mirrors the documented user-layer chain.
     merged_trad: Option<&[String]>,
-) -> Result<Option<Vec<(Vec<&'static str>, Option<Vec<u8>>)>>> {
+) -> NoteResolve<Vec<(Vec<&'static str>, Option<Vec<u8>>)>> {
     let dict = dicts.words(evt.lang)?;
     // stage1: the word's traditional phones (override with spaces already handled by the caller — a
     // no-space override here is a single traditional phone).
@@ -1504,11 +1543,11 @@ fn resolve_west_span(
     } else {
         match dict.lookup(evt.lyric.trim()) {
             Some(t) => t,
-            None => return Ok(None),
+            None => return Ok(Err(NoteFail::Oov)),
         }
     };
     if trad.is_empty() {
-        return Ok(None);
+        return Ok(Err(NoteFail::Oov));
     }
     let sylls = syllabify(dict, &trad);
 
@@ -1573,10 +1612,13 @@ fn resolve_west_span(
             .collect();
         match stage2(evt.lang, &tr) {
             Ok(ph) => out.push((ph, (!stress.is_empty()).then_some(stress))),
-            Err(_) => return Ok(None),
+            // stage2 NAMES the phone it rejected — carry it out instead of collapsing the whole note
+            // to "OOV lyric" (S99 / the S90 debt). Reachable only through user-supplied phones: every
+            // dictionary phone is proven to intern by `dictionaries_end_to_end`.
+            Err(bad) => return Ok(Err(NoteFail::UnknownPhone(bad))),
         }
     }
-    Ok(Some(out))
+    Ok(Ok(out))
 }
 
 /// STRICT resolve for the render: every note must resolve (LOUD `VOCAL_OOV` otherwise).
@@ -2828,6 +2870,32 @@ mod tests {
         assert!(matches!(classes[0], LyricClass::Phones { .. }));
         assert!(matches!(classes[1], LyricClass::Unknown));
         assert!(matches!(classes[2], LyricClass::Phones { .. }), "notes after the OOV still classify");
+    }
+
+    /// S99 (S90 debt): a mistyped PHONEME in a bracket hint / raw override must name THE PHONEME.
+    /// Before this, `stage2`'s `Err(phone)` was discarded (`Err(_) => Ok(None)` / `.ok()`) and the
+    /// note came out as `VOCAL_OOV: [dh ae zzz]` — a message whose advice ("check the lyric or the
+    /// language") points at the two things that are fine.
+    #[test]
+    fn a_mistyped_phoneme_names_the_phoneme_not_the_lyric() {
+        let f = fixtures();
+        let bad = [evt("[dh ae zzz]", Lang::En)];
+        let e = resolve_score(&bad, &f).unwrap_err().to_string();
+        assert!(e.contains("VOCAL_UNKNOWN_PHONE: zzz"), "must name the offending phone: {e}");
+        assert!(!e.contains("VOCAL_OOV"), "must NOT be reported as a bad lyric: {e}");
+        // the editor still marks exactly that note (a per-note verdict, not an infrastructure error)
+        assert!(matches!(classify_score(&bad, &f).unwrap()[0], LyricClass::Unknown));
+        // a well-formed hint is untouched
+        assert_eq!(phones_of(&resolve_score(&[evt("[dh ae dh]", Lang::En)], &f).unwrap()[0]), vec!["ð", "æ", "ð"]);
+        // ★ and an ORDINARY OOV still says VOCAL_OOV with the LYRIC — the two arms must stay distinct
+        let e2 = resolve_score(&[evt("zzzzq", Lang::En)], &f).unwrap_err().to_string();
+        assert!(e2.contains("VOCAL_OOV: zzzzq"), "{e2}");
+        assert!(!e2.contains("VOCAL_UNKNOWN_PHONE"), "{e2}");
+        // ja/zh raw-phoneme overrides go through the same naming (they used to `.ok()` it away too)
+        let mut ja = evt("か", Lang::Ja);
+        ja.phoneme_input = Some("k zzz a");
+        let e3 = resolve_score(&[ja], &f).unwrap_err().to_string();
+        assert!(e3.contains("VOCAL_UNKNOWN_PHONE: zzz"), "{e3}");
     }
 
     // ── audit MAJOR: a MISSING DICTIONARY must surface as VOCAL_DICT_MISSING — never masked as

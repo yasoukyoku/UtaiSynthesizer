@@ -713,6 +713,7 @@
       "autoRenderingCancel": "再次点击取消渲染",
       "aliasBad": "歌词「{{lyric}}」不是「{{set}}」里的合法别名——请检查这个音符，或在侧栏改「音素约定」",
       "oov": "歌词「{{lyric}}」无法转换为音素（OOV）——请检查歌词或音符/轨道的语言设置",
+      "unknownPhone": "「{{phone}}」不是音素——请检查该音符的方括号提示或音素输入",
       "phoneMissing": "内部错误：音素「{{phone}}」不在 ScoreToCV 词表中",
       "dictMissing": "缺少发音词典（{{file}}）——请检查 data/dictionaries 目录是否完整",
       "moreFailures": "还有更多人声轨渲染失败（已省略重复提示）"

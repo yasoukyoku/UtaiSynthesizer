@@ -42,6 +42,13 @@ export const VOCAL_PHONE_MISSING = "VOCAL_PHONE_MISSING";
  *  convention token comes first and is always whitespace-free, so the lyric (arbitrary user text) can
  *  be taken as the rest of the line without a separator that a lyric could contain. */
 export const VOCAL_ALIAS = "VOCAL_ALIAS";
+/** S99 `VOCAL_UNKNOWN_PHONE: <phone>` — the note resolved to phones and one of them is not a phoneme.
+ *  Its OWN code for the same reason `VOCAL_ALIAS` is: `VOCAL_OOV` tells the user to check the LYRIC or
+ *  the LANGUAGE, and for `[dh ae zzz]` both are fine — the third PHONEME is the typo, and `stage2` knew
+ *  which one all along (the S90 debt was that both callers threw that name away). Distinct from
+ *  `VOCAL_PHONE_MISSING`, which is worded as an INTERNAL error: that one fires downstream in
+ *  score2cv for a phone that got past g2p, i.e. our bug, not the user's. */
+export const VOCAL_UNKNOWN_PHONE = "VOCAL_UNKNOWN_PHONE";
 
 /** S66 pre-render model check for the vocal track: the core aux pack (ScoreToCV / ContentVec /
  *  RMVPE / vocoder onnx) must be present or the render dies mid-flight with AUX_FILE_MISSING —
@@ -93,6 +100,11 @@ export function vocalRenderErrorMessage(e: unknown): string {
       set: i18n.t(`vocalEditor.sidebar.phonemeSet_${alias[1]}`, { defaultValue: alias[1] }),
     });
   }
+  // Before the OOV branch, and with a whitespace-free payload: a phone is ONE token by construction
+  // (the resolver splits the user's phones on whitespace before interning), so this can be anchored
+  // much more tightly than the lyric-carrying codes above.
+  const unk = msg.match(/VOCAL_UNKNOWN_PHONE:\s*(\S+)$/);
+  if (unk) return i18n.t("vocalEditor.render.unknownPhone", { phone: unk[1] });
   const oov = msg.match(/VOCAL_OOV:\s*(.*)$/);
   if (oov) return i18n.t("vocalEditor.render.oov", { lyric: oov[1] });
   const ph = msg.match(/VOCAL_PHONE_MISSING:\s*(.*)$/);
@@ -113,7 +125,7 @@ export function vocalRenderErrorMessage(e: unknown): string {
  *  cancel-sentinel substring ("已取消" / "CANCELLED") must not silently swallow the real error (same
  *  ordering rationale as vocalRenderErrorMessage's payload-first rule). */
 export function isVocalCancelError(e: unknown): boolean {
-  if (/VOCAL_(OOV|DICT_MISSING|PHONE_MISSING|ALIAS):/.test(String(e))) return false;
+  if (/VOCAL_(OOV|DICT_MISSING|PHONE_MISSING|UNKNOWN_PHONE|ALIAS):/.test(String(e))) return false;
   return isCancelError(e);
 }
 
