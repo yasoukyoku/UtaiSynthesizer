@@ -603,6 +603,9 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  commit, but they ship together and a second bump would only force a second full re-render):
  *    · JA 「base + small ゃゅょ」 rows the kana chart has no romaji for — てゅ/でゅ/ふゅ/ゔゅ and the
  *      ゃ/ょ members — used to be SILENTLY TRUNCATED to the base mora (てゅ sang [t e]).
+ *    · JA 外来拗音 on an i-column base took the BASE mora's onset instead of its 拗音 row's, so the
+ *      whole family lost its palatalization: にぇ was [n e] where にゃ is [ɲ a], きぇ was [k e] where
+ *      きゃ is [c a] — 7 rows (き/ぎ/に/み/び/ぴ/り) × the ぁ/ぅ/ぇ/ぉ columns.
  *  ⚠ Why this one needs a bump although S95's fragment merge did not: S95's no-bump argument rested
  *  entirely on "every affected note ERRORED before the pass, so any bake it holds is already
  *  sig-dirty". That does not transfer here — the old behaviour was a silent SUCCESS, so a project

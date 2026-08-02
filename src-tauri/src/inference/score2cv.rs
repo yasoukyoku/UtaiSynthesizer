@@ -256,9 +256,34 @@ fn foreign_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
     if !tbl::VOWEL_SET.contains(&tail) {
         return None; // no plain-vowel tail to swap (ん etc.) — legacy chain decides
     }
-    let mut v: Vec<&'static str> = head.to_vec();
+    if small_ipa == tail {
+        // IDENTITY swap — 「にぃ」「てぇ」「ふぅ」: the small vowel is the one the base already has, so the
+        // combo simply IS the base mora (a stylistic lengthening) and the base's own row is by
+        // definition the right answer. Returning early also keeps 「にぃ」 on the training-aligned
+        // [n i] instead of sending it down the palatalizing branch below (に is `n i` in the labels).
+        return Some(seq.to_vec());
+    }
+    // S99 (S86#8-1): an i-column base carries its onset on its 拗音 ROW, not on the base mora. Taking
+    // the base's onset — which is all this rule used to do — silently DE-PALATALIZED the whole family:
+    // にぇ→[n e] (にゃ is [ɲ a]) · きぇ→[k e] (きゃ is [c a]) · ぎぇ→[ɡ e] · みぇ→[m e] · びぇ→[b e] ·
+    // ぴぇ→[p e] · りぇ→[ɾ e], and the same for the ぁ/ぅ/ぉ columns (にぁ→[n a] where にゃ is [ɲ a]).
+    // ひ/し/ち/じ came out right only by accident — their BASE onset is already the palatal (ç/ɕ/tɕ/dʑ).
+    // ⇒ ask the 拗音 row for the onset; rows that have none (て/ふ/つ/す/ゔ… — the genuinely
+    // NON-palatal foreign morae, where 「てぃ」 must stay [t i] and not become [tɕ i]) fall back to the
+    // base onset — which for those rows was the right answer all along.
+    let mut v = yoon_onset(&base).unwrap_or_else(|| head.to_vec());
     v.push(small_ipa);
     Some(v)
+}
+
+/// The onset a base kana wears on its 拗音 row (き→きゃ→[c a] ⇒ `[c]`), or None if it has no such row.
+/// Derived from the SAME generated tables as everything else — the palatal counterparts are never
+/// spelled out by hand here.
+fn yoon_onset(base: &str) -> Option<Vec<&'static str>> {
+    let romaji = kana_map().get(format!("{base}ゃ").as_str())?;
+    let seq = r2ipa_map().get(*romaji)?;
+    let (&tail, head) = seq.split_last()?;
+    tbl::VOWEL_SET.contains(&tail).then(|| head.to_vec())
 }
 
 /// Small palatal-glide kana → the romaji key of the standalone ya-row mora it stands for.
@@ -1039,6 +1064,53 @@ mod foreign_kana_tests {
         }
         // katakana arrives folded (g2p::fold_katakana upstream): ティ → てぃ.
         assert_eq!(phones(&super::super::g2p::fold_katakana("ティ")), vec!["t", "i"]);
+    }
+
+    /// S99 (S86#8-1): an i-column base carries its onset on its 拗音 ROW. Taking the BASE mora's onset
+    /// — all this rule used to do — de-palatalized the whole family, and S86 recorded it as a に-only
+    /// leak; it is not, it is 7 rows × 4 vowel columns.
+    #[test]
+    fn foreign_kana_keeps_the_palatal_onset_of_its_yoon_row() {
+        // the old answers, kept here as the thing that must NOT come back (non-vacuity, S92p)
+        for (k, stale) in [("にぇ", vec!["n", "e"]), ("きぇ", vec!["k", "e"]), ("りぇ", vec!["ɾ", "e"])] {
+            assert_ne!(phones(k), stale, "{k} fell back to the de-palatalized base onset");
+        }
+        for (k, want) in [
+            ("にぇ", vec!["ɲ", "e"]), ("にぁ", vec!["ɲ", "a"]), ("にぅ", vec!["ɲ", "ɯ"]), ("にぉ", vec!["ɲ", "o"]),
+            ("きぇ", vec!["c", "e"]), ("きぉ", vec!["c", "o"]),
+            ("ぎぇ", vec!["ɟ", "e"]), ("みぇ", vec!["mʲ", "e"]),
+            ("びぇ", vec!["bʲ", "e"]), ("ぴぇ", vec!["pʲ", "e"]), ("りぇ", vec!["ɾʲ", "e"]),
+            // already correct BY ACCIDENT (the base onset is itself the palatal) — pinned so a future
+            // refactor of this rule cannot quietly move them either
+            ("ひぇ", vec!["ç", "e"]), ("しぇ", vec!["ɕ", "e"]), ("ちぇ", vec!["tɕ", "e"]), ("じぇ", vec!["dʑ", "e"]),
+            // NON-palatal foreign morae: their rows have no 拗音, so they keep the base onset. If the
+            // fallback ever went the other way these would become [tɕ i]/[ɕ i] — the sounds these very
+            // spellings exist to DISTINGUISH from ち/し.
+            ("てぃ", vec!["t", "i"]), ("すぃ", vec!["s", "i"]), ("ふぁ", vec!["ɸ", "a"]), ("つぁ", vec!["ts", "a"]),
+            // the ぃ column is an IDENTITY swap = the base mora itself, so it must stay on the base row.
+            // にぃ is the load-bearing one: に is `n i` in the training labels (R2IPA_TRAINING_OVERRIDE),
+            // and a lengthened に must not turn into [ɲ i].
+            ("にぃ", vec!["n", "i"]), ("きぃ", vec!["k", "i"]), ("ひぃ", vec!["ç", "i"]),
+        ] {
+            assert_eq!(phones(k), want, "{k}");
+        }
+        // the general statement, swept over the tables rather than spot-checked: for EVERY base that
+        // has a 拗音 row, the foreign-kana onset IS that row's onset.
+        let mut checked = 0usize;
+        for (base, _) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            let Some(&yoon_romaji) = kana_map().get(format!("{base}ゃ").as_str()) else { continue };
+            let want_onset = &r2ipa_map()[yoon_romaji][..1];
+            for (sv, ipa) in [('ぁ', "a"), ('ぅ', "ɯ"), ('ぇ', "e"), ('ぉ', "o")] {
+                let s = format!("{base}{sv}");
+                let Some(v) = foreign_kana_phones(&s) else { continue };
+                if v.last() != Some(&ipa) {
+                    continue; // identity column for a base whose vowel already is this one
+                }
+                checked += 1;
+                assert_eq!(&v[..v.len() - 1], want_onset, "{s} onset ≠ its 拗音 row's");
+            }
+        }
+        assert!(checked >= 40, "sweep actually covered the 拗音-bearing bases (got {checked})");
     }
 
     /// S99 (S86#8-3): 「base + small ゃゅょ」 rows the generated chart has no romaji for. Before this
