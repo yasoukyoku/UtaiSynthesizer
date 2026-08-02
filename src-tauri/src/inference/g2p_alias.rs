@@ -339,6 +339,48 @@ fn symbols_to_phones(set: PhonemeSet, core: &str) -> Result<(Vec<String>, usize)
     Ok((phones, nsym))
 }
 
+/// The longest run of non-nucleus phones a LEGAL alias of these conventions can produce is TWO.
+///
+/// MEASURED, not assumed. (a) Over the 440 distinct aliases of the three parallel reference scores
+/// (arpasing 118 / vccv 153 / xsampa 149, resolved through the production path) the run histogram is
+/// 0→55, 1→334, 2→31 and **nothing reaches 3**. (b) The tables corroborate it structurally: exactly
+/// ONE row maps a symbol to two phones (`nk` = "ng k"), and these are diphone banks whose alias is at
+/// most a two-unit transition — three consonants in a row cannot be assembled out of that.
+const MAX_CONSONANT_RUN: usize = 2;
+
+/// S99 (S91 debt): the longest run of consonants in the RESULT, when it exceeds what the convention
+/// can produce — `None` when the alias is fine.
+///
+/// The tokenizer only ever failed on an unknown CHARACTER, and X-SAMPA has 39 single-character keys /
+/// VCCV 37 — nearly the whole ASCII alphabet — so "unknown symbol" is effectively unreachable for any
+/// all-letter alias (S98 measured 39304 of 140608 three-letter strings passing silently under xsampa).
+/// The RESULT got no check at all: no phone-count bound, no phonotactic test, not even a requirement
+/// to contain a nucleus. `tth` (the fourth bank's ð) came out as [t t h], `ptk` as [p t k], `kkkkkk`
+/// as six /k/ — all sung, silently.
+///
+/// ⚠ The predicate is on the RESULT, never on the input symbols, and that is deliberate (the user's
+/// own criterion, 2026-08-02): splitting an unknown multi-letter symbol into single letters is fine
+/// **as long as the split is something this convention could have produced** — only a cluster it
+/// CANNOT produce is singing nonsense. So a 2-consonant result stays legal even when it came from a
+/// symbol we do not know (`tth` under vccv is t+th = [t θ], an ordinary CC transition, and VCCV really
+/// does have geminate rows `ll`/`mm`/`nn`). That residue is hint-level, deliberately NOT an error.
+/// ⚠ Nucleus-free aliases are legal and common (168 of the 440 above are VC/CC/C transition units) —
+/// requiring a nucleus would reject a third of every real score.
+fn impossible_cluster(phones: &[String]) -> Option<String> {
+    let mut run: Vec<&str> = Vec::new();
+    for p in phones {
+        if super::g2p::en_is_nucleus(p) {
+            run.clear();
+        } else {
+            run.push(p);
+            if run.len() > MAX_CONSONANT_RUN {
+                return Some(run.join(" "));
+            }
+        }
+    }
+    None
+}
+
 /// Resolve one alias to the space-joined ARPABET phones the note should sing, ready to be handed to
 /// the ordinary `phoneme_input` path (→ `stage2` → vocab IPA). `Err(symbol)` = LOUD failure.
 ///
@@ -357,6 +399,11 @@ pub fn alias_phones(set: PhonemeSet, lyric: &str) -> Option<Result<String, Strin
         // THE carried-vowel rule (see the module header). `from_silence` suppresses it.
         if !from_silence && nsym >= 2 && phones.len() >= 2 && super::g2p::en_is_nucleus(&phones[0]) {
             phones.remove(0);
+        }
+        // …and only now, on what the note will ACTUALLY sing, ask whether this convention could have
+        // produced it. Checking before the carried-vowel rule would measure a shape nobody hears.
+        if let Some(cluster) = impossible_cluster(&phones) {
+            return Err(cluster);
         }
         Ok(phones.join(" "))
     }))
@@ -693,6 +740,49 @@ mod tests {
         assert_eq!(alias_phones(PhonemeSet::Xsampa, "-"), Some(Err("-".to_string())));
         // …and `Words` never claims a lyric at all
         assert_eq!(alias_phones(PhonemeSet::Words, "hello"), None);
+    }
+
+    /// ★ S99 (S91 debt) — the predicate is on the RESULT, not on the input symbols.
+    ///
+    /// Before it, failure required an unknown CHARACTER, which for an all-letter alias is effectively
+    /// unreachable (39 single-char keys in X-SAMPA, 37 in VCCV): `ptk`, `sfth`, `kkkkkk` and the
+    /// fourth bank's `tth` were all split into single letters and SUNG. The user's criterion is not
+    /// "was the symbol known" but "could this convention have produced this" — so the bound is on the
+    /// consonant run, measured at 2 over 440 real aliases.
+    #[test]
+    fn alias_rejects_clusters_the_convention_cannot_produce() {
+        let bad = |set, a: &str| match alias_phones(set, a) {
+            Some(Err(e)) => e,
+            other => panic!("{a:?} should have been rejected, got {other:?}"),
+        };
+        // 3+ consonants in a row — the shape zero of the 440 reference aliases has
+        assert_eq!(bad(PhonemeSet::Xsampa, "ptk"), "p t k");
+        assert_eq!(bad(PhonemeSet::Xsampa, "sfth"), "s f t"); // reported at the first offending run
+        assert_eq!(bad(PhonemeSet::Xsampa, "tth"), "t t hh"); // the 4th bank's ð, split into letters
+        assert_eq!(bad(PhonemeSet::Xsampa, "zzz"), "z z z");
+        assert_eq!(bad(PhonemeSet::Vccv, "kkkkkk"), "k k k");
+        // …and it reaches through the carried-vowel rule: the leading vowel is dropped FIRST, so a
+        // shape that only becomes impossible after the drop is still caught.
+        assert_eq!(bad(PhonemeSet::Xsampa, "Emst"), "m s t");
+
+        // ⚠ NON-VACUITY + the anti-over-reach half. These must all still resolve:
+        let ok = |set, a: &str| alias_phones(set, a).expect("not Words").unwrap_or_else(|e| panic!("{a:?} → Err({e})"));
+        for (set, a) in [
+            (PhonemeSet::Xsampa, "e@m"), (PhonemeSet::Xsampa, "N-"), (PhonemeSet::Xsampa, "-aI"),
+            (PhonemeSet::Vccv, "1ng"), (PhonemeSet::Vccv, "hO"), (PhonemeSet::Vccv, "ld"),
+            (PhonemeSet::Arpasing, "n t"), (PhonemeSet::Arpasing, "s t"), (PhonemeSet::Arpasing, "ih ng"),
+            // a 2-consonant result stays legal even when it came from a symbol we do not know:
+            // `tth` under VCCV is t + th = [T TH], an ordinary CC transition (VCCV really does have
+            // geminate rows ll/mm/nn). Deliberately hint-level, NOT an error — the user's calibration.
+            (PhonemeSet::Vccv, "tth"), (PhonemeSet::Xsampa, "TT"),
+        ] {
+            let n = ok(set, a).split_whitespace().count();
+            assert!(n >= 1, "{a:?} resolved to nothing");
+        }
+        // nucleus-free aliases are legal and common (168 of the 440 reference aliases are VC/CC/C
+        // transition units) — requiring a nucleus would reject a third of every real score
+        assert_eq!(ok(PhonemeSet::Arpasing, "n d"), "n d");
+        assert_eq!(MAX_CONSONANT_RUN, 2, "raising this needs new corpus evidence, not a hunch");
     }
 
     /// The tokenizer order this module depends on, as a PROPERTY rather than an assertion about a few

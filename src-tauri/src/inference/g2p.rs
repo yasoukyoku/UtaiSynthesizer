@@ -2984,7 +2984,10 @@ mod tests {
     #[test]
     fn alias_failure_is_loud_and_marks_only_that_note() {
         let f = fixtures();
-        let bad = [alias_evt("light", PhonemeSet::Xsampa), alias_evt("zq", PhonemeSet::Xsampa)];
+        // ⚠ the readable neighbour used to be `light`; S99 rejects it, and correctly — under X-SAMPA
+        // it reads l+i+g+h+t = [l iy g hh t], whose `g hh t` is a 3-consonant cluster no alias of this
+        // convention can produce (see `impossible_cluster`). `two` = [t w oʊ] stays legal.
+        let bad = [alias_evt("two", PhonemeSet::Xsampa), alias_evt("zq", PhonemeSet::Xsampa)];
         let err = resolve_score(&bad, &f).unwrap_err().to_string();
         assert!(err.contains("VOCAL_ALIAS: xsampa zq"), "own CODE + convention + lyric: {err}");
         let lenient = classify_score(&bad, &f).unwrap();

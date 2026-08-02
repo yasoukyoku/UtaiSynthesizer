@@ -530,6 +530,13 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 > - An alias the convention cannot read is marked **red, loudly** (the error names the convention and
 >   the lyric) and **never falls back to the dictionary**: a third of these aliases are also real
 >   English words (`ju`, `to`, `E`, `O`), so a fallback would silently sing a different one.
+> - **New in v0.12: "cannot read" now also covers "the split is something this convention cannot
+>   produce".** The test is on the RESULT, not on the symbols: an alias whose characters are all known
+>   but which splits into **three or more consonants in a row** is marked red too, while a two-consonant
+>   result stays legal (VCCV genuinely has geminate rows `ll`/`mm`/`nn`). The bound is measured — across
+>   the 440 aliases of the three parallel reference scores the longest consonant run is 2 and nothing
+>   reaches 3. ⚠ In practice: typing an English word straight onto an alias track (`light` reads as
+>   `l iy g hh t` under X-SAMPA) used to sing **silent** nonsense; now it is marked.
 > - With an alias convention selected, whatever you type stays on **one note** — no space-splitting
 >   across the following notes (many ARPAsing aliases contain a space, e.g. `ae n`, `y uw`).
 > - ⚠ Banks within one convention still differ in spelling. Our tables were derived from **three
