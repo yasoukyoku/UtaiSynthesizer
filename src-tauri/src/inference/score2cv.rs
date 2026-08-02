@@ -1945,6 +1945,25 @@ fn assemble_arrays(
             let chaining = g2p::Lang::from_id(plang[i]).is_some_and(consonant_chaining_language);
             if chaining && npitch[i] > 0 {
                 if let Some(nuc) = seg.clone().filter(|&x| is_nucleus_phone(phon[x])).next_back() {
+                    // ★S97b — a PROPORTIONAL nucleus floor on top of the absolute one.
+                    //
+                    // `NUCLEUS_KEEP_MIN` is an absolute 3 frames, so on a LONG note whose onset
+                    // cluster already ate most of it, this pass could still take the vowel's last
+                    // spare frame. Measured on the user's own material: `smell`@16fr ships
+                    // [s7 m5 ɛ4 l2] — 78% of its sung frames are consonant BEFORE this pass — and
+                    // the pass moved it to [s7 m5 ɛ3 l3] = 83%. The user located exactly that
+                    // phrase by ear ("Can only smell that we both share 还有点割裂", 2026-08-02).
+                    //
+                    // The bound is measured, not invented: over 53696 real word spans in the
+                    // upstream GTSinger annotation the consonant share is p50 0.37 / p75 0.53 /
+                    // p95 0.76, so a note already past ~3/4 consonant is out of distribution and
+                    // must not be pushed further. Keeping a quarter of the event's sung frames for
+                    // the nucleus is that p95 expressed as a floor.
+                    // ⚠ This does NOT fix the 78% — that is the S92c/S92e onset supplement serving
+                    // BOTH cluster members their full measured target, which is ear-validated
+                    // ground and needs its own round. It only stops THIS pass making it worse.
+                    let sung: i64 = seg.clone().filter(|&x| !matches!(phon[x], "SP" | "AP")).map(|x| pdur[x]).sum();
+                    let nuc_keep = NUCLEUS_KEEP_MIN.max(sung / 4);
                     // LAST-first: the word-final release carries the cue (this file's doctrine).
                     // A member already at ITS OWN floor is skipped, so a cluster's spare frame
                     // goes to the member that is actually short — `and`'s /n/ (upstream p25 3)
@@ -1957,7 +1976,7 @@ fn assemble_arrays(
                         if pdur[x] <= 0 || pdur[x] >= floor {
                             continue;
                         }
-                        let take = (floor - pdur[x]).min((pdur[nuc] - NUCLEUS_KEEP_MIN).max(0));
+                        let take = (floor - pdur[x]).min((pdur[nuc] - nuc_keep).max(0));
                         if take > 0 {
                             pdur[nuc] -= take;
                             pdur[x] += take;
@@ -3420,6 +3439,49 @@ mod tests {
         // ja: same CVC shape, byte-identical to the shipped allocation (no top-up there)
         let j = build_arrays_daw(&[raw("k a ɴ", 7)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur[2], CODA_MIN_FRAMES, "ja coda keeps the shipped floor: {:?}", j.phone_dur);
+    }
+
+    /// ★S97b — the coda top-up must not push an already consonant-heavy note further out of
+    /// distribution. `NUCLEUS_KEEP_MIN` is absolute (3 frames), so on a LONG note whose onset
+    /// cluster already ate most of it the pass could still take the vowel's last spare frame:
+    /// `smell`@16fr ships [s7 m5 ɛ4 l2], 78% consonant BEFORE the pass, and the pass moved it to
+    /// [s7 m5 ɛ3 l3] = 83% — the user located exactly that phrase by ear. Real singing puts the
+    /// per-word consonant share at p50 0.37 / p75 0.53 / p95 0.76 (53696 upstream word spans), so
+    /// the nucleus keeping a quarter of the event's sung frames IS that p95 expressed as a floor.
+    #[test]
+    fn s97b_coda_top_up_respects_a_proportional_nucleus_floor() {
+        let d = en_dicts_from("smell\tS M EH1 L\nmine\tM AY1\nthat\tDH AE1 T\nand\tAH0 N D\n");
+        let ev = |lyric: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric, note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: None, phoneme_set: PhonemeSet::Words,
+        };
+        // The user's own shape, reproduced end to end: `smell` allocates its /l/ at 3, the NEXT
+        // word's onset borrows that third frame straight back, and this pass would then re-fill it
+        // out of a vowel that is already only 4 of the note's 18 sung frames (78% consonant).
+        let a = build_arrays_daw(
+            &[ev("mine", 12), ev("smell", 16), ev("that", 17)], &d, ArticulationTiming::Auto,
+        ).unwrap();
+        assert_eq!(&a.phon[2..6], &["s", "m", "ɛ", "l"], "{:?}", a.phon);
+        let nuc = a.phone_dur[4];
+        let sung: i64 = a.phone_dur[2..6].iter().sum();
+        assert!(
+            nuc >= sung / 4,
+            "the nucleus keeps its proportional share: nuc={nuc} of {sung} sung frames, {:?}",
+            a.phone_dur
+        );
+        // Pinned literally: WITH the guard `smell` keeps [s7 m5 ɛ4 l2]; WITHOUT it the pass takes
+        // the vowel's last frame and it becomes [.. ɛ3 l3] = 83% consonant, past the real p95 of
+        // 0.76 (53696 upstream word spans). The mutation test is what proves that, not this line.
+        assert_eq!(&a.phone_dur[2..6], &[7, 5, 4, 2], "the guard held: {:?}", a.phone_dur);
+        // DISCRIMINATOR: a note whose vowel is NOT starved still gets its coda lifted — otherwise
+        // this guard would have silently disabled the whole pass.
+        let b = build_arrays_daw(&[ev("mine", 8), ev("and", 8)], &d, ArticulationTiming::Auto).unwrap();
+        let n_i = b.phon.iter().position(|&p| p == "n").unwrap();
+        assert_eq!(b.phone_dur[n_i], chaining_coda_floor("n"), "the pass still fires normally: {:?}", b.phone_dur);
+        assert_ne!(
+            a.phone_dur[5], b.phone_dur[n_i],
+            "the two arms must really differ (the guard binds in one and not the other)"
+        );
     }
 
     /// ★S97 — ORDER: the coda floor top-up must run AFTER every borrow, not inside the note loop.

@@ -759,7 +759,7 @@ export const G2P_ALGO_VERSION = "s94";
  *  at all (onset 3 + nucleus 3 leaves 2), which is exactly the user's `call`/`will`/`tell`; buying
  *  those needs a TIMING decision (letting the release ride into the next attack), not a quieter
  *  vowel. ja/zh and the three alias lanes: 0 phones changed (measured, not argued). */
-export const SCORE_TIMING_VERSION = "s97b";
+export const SCORE_TIMING_VERSION = "s97c";
 
 /** 32-bit rolling hash — keeps the per-semitone scan in the signature without pasting ~1 KB of
  *  JSON into every dirty-check string. */
