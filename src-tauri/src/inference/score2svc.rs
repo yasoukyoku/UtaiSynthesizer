@@ -717,6 +717,7 @@ pub fn render_score_sovits(
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
+    let coda_lifts = phrase_final_coda_lifts(&arr);
     let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
         shaping.consonant_valley_scale.min(2.0)
     } else {
@@ -778,6 +779,8 @@ pub fn render_score_sovits(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
+        apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
             let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
@@ -886,6 +889,7 @@ pub fn render_score_rvc(
     };
     // S84 C 刀: chain-internal consonant valley (scale 0/invalid = stage skipped, bit-exact no-op)
     let valley_depths = boundary_valley_depths(&arr);
+    let coda_lifts = phrase_final_coda_lifts(&arr);
     let valley_scale = if shaping.consonant_valley_scale.is_finite() && shaping.consonant_valley_scale > 0.0 {
         shaping.consonant_valley_scale.min(2.0)
     } else {
@@ -932,6 +936,8 @@ pub fn render_score_rvc(
         // S83 knife 6: crisp up voiceless onsets (+2.5 dB trapezoid on their windows)
         let emph_wins = chunk_flag_windows(chunk, wav.len(), &vl_onset[chunk.start..chunk.end]);
         apply_emphasis(&mut wav, &emph_wins, emphasis_gain, emphasis_fade_samples(m.sample_rate));
+        // S97 ②a 刀: restore phrase-final sonorant codas swallowed by the release ramp
+        apply_coda_lift(&mut wav, chunk, &coda_lifts, emphasis_fade_samples(m.sample_rate));
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
             let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
@@ -1138,6 +1144,135 @@ fn boundary_valley_depths(arr: &ScoreArrays) -> Vec<f32> {
         i = j + 1;
     }
     depths
+}
+
+// ─── S97 ②a 刀: PHRASE-FINAL CODA RESTORE ──────────────────────────────────────────────────────
+//
+// 症状(用户 2026-08-02 点名 `bloom` 的 /m/、`all` 的 /l/):音素发出来了、帧数也对,但**没有能量**。
+// 实测:凡「下一个音符是休止」的音符,末尾都有一段单调衰减(0-10 帧,中位 4-6),深到平台以下
+// 20-35 dB,**且与音素身份无关**(以元音收尾的句尾音符同样衰)。coda 按构造就是最后一个音素,
+// 所以比这段斜坡短的 coda 被整个吞掉。它**不是**任何后处理造成的(rest_gate 只动 SP 窗内、
+// 强调只吃清音 onset、谷刀按构造跳过 coda、vol ADSR 只在 vol_embedding 模型上),是 cv/解码器产出的。
+//
+// ★目标值不是 Synthesizer V。S97 实测 SV 把词尾辅音压得**远比真人狠**(SV 给 `and` 的 n/d 压
+// 13-20 dB,真人只压 1.9 / 4.5)。目标取自 `Much-Better-S2H/_onnx_derisk/coda_ref_upstream.json`
+// —— GTSinger **上游标注 + 数据集源音频**(全量 4827 clip,从没经过我们的对齐器),词尾辅音相对
+// **自己那个词的元音** 的电平。取 **p25 而不是 p50**:这是个**单向**(只抬不压)修正,瞄准中位会
+// 把一半样本推到真人之上。
+//
+// 只对**响音**开火:同一张表说真人**确实**把词尾阻塞音压下去(K −15.3 / F −15.3 / T −9.3 / Z −9.9),
+// 那不是缺陷,是对的;而 `dears` 的 /z/ −15.5 dB 正落在真人区间里,抬它才是新缺陷。
+//
+// ⚠ zh/ja 由构造 no-op:实测 ja 1215 个有声音符、三条 UTAU 别名轨 489 个音符里,**位于末核之后的
+// 音素 = 0 个**,所以这一刀在那五条泳道上一次都不会开火(用逐字节泳道证明,不靠论证)。
+fn coda_sonorant_target_db(p: &str) -> Option<f32> {
+    // upstream p25 (dB re its own word's vowel), n = 3293 / 5584 / 1940 / 2538 / 3366
+    match p {
+        "l" | "ɫ" | "ɭ" | "ʎ" => Some(-3.1),
+        "n" | "ɲ" | "n̪" => Some(-4.4),
+        "m" => Some(-5.0),
+        "ŋ" => Some(-3.5),
+        "ɹ" | "ɻ" | "r" => Some(-3.9),
+        _ => None,
+    }
+}
+
+/// The most this stage may add, in dB. A policy cap, not a measurement: the worst real gap on the
+/// user's own material is `all`'s /l/ at 10.4 dB, but that phone's last frame sits at −48 dBFS
+/// absolute, where more gain is amplified decoder noise rather than a consonant. 9 dB covers
+/// `bloom` (3.1) and `gain` (4.3) with room to spare and stops short of the noise floor case.
+const CODA_LIFT_MAX_DB: f32 = 9.0;
+
+/// Per-phone `(target_db, nucleus_phone_index)` for every PHRASE-FINAL sonorant coda; `None` = this
+/// stage does not touch the phone. Phrase-final = the next emitted phone is a rest/breath (or the
+/// array ends) — mid-phrase codas are already right (measured −1.1 dB median vs the −1.9 target),
+/// it is only the ones sitting inside the release ramp that collapse.
+fn phrase_final_coda_lifts(arr: &ScoreArrays) -> Vec<Option<(f32, usize)>> {
+    let n = arr.phon.len();
+    let mut out = vec![None; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i;
+        while j + 1 < n && arr.evt[j + 1] == arr.evt[i] {
+            j += 1;
+        }
+        let chaining = super::g2p::Lang::from_id(arr.lang[i])
+            .is_some_and(super::score2cv::consonant_chaining_language);
+        // phrase-final: nothing after this event, or the next emitted phone is a rest/breath
+        let phrase_final = j + 1 >= n || matches!(arr.phon[j + 1], "SP" | "AP");
+        if chaining && phrase_final && arr.note_pitch[i] > 0 {
+            if let Some(nuc) = (i..=j).rev().find(|&x| super::score2cv::is_nucleus_phone(arr.phon[x])) {
+                for x in nuc + 1..=j {
+                    if let Some(t) = coda_sonorant_target_db(arr.phon[x]) {
+                        out[x] = Some((t, nuc));
+                    }
+                }
+            }
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Measure each eligible coda against its own nucleus in the DECODED audio and lift it toward the
+/// upstream target, bounded by `CODA_LIFT_MAX_DB` and never attenuating. Measuring rather than
+/// applying a fixed curve is deliberate: the release ramp's length varies 0-10 frames, so a fixed
+/// compensation curve would over- or under-correct depending on where the ramp happened to land.
+fn apply_coda_lift(
+    audio: &mut [f32],
+    chunk: &Chunk,
+    lifts: &[Option<(f32, usize)>],
+    fade: usize,
+) {
+    let t = chunk.t.max(1);
+    let out_len = audio.len();
+    let span = |from: i64, dur: i64| -> (usize, usize) {
+        let s = (from as f64 / t as f64 * out_len as f64).round() as usize;
+        let e = (((from + dur) as f64) / t as f64 * out_len as f64).round() as usize;
+        (s.min(out_len), e.min(out_len))
+    };
+    let rms = |a: &[f32], (s, e): (usize, usize)| -> f32 {
+        if e <= s {
+            return 0.0;
+        }
+        (a[s..e].iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / (e - s) as f64).sqrt() as f32
+    };
+    // chunk-local phone start offsets
+    let mut starts = Vec::with_capacity(chunk.phone_dur.len());
+    let mut cur = 0i64;
+    for &d in &chunk.phone_dur {
+        starts.push(cur);
+        cur += d.max(0);
+    }
+    let mut wins: Vec<(usize, usize, f32)> = Vec::new();
+    for (k, &d) in chunk.phone_dur.iter().enumerate() {
+        let Some(Some((target_db, nuc_global))) = lifts.get(chunk.start + k).copied() else {
+            continue;
+        };
+        if d <= 0 {
+            continue;
+        }
+        // the nucleus must live in THIS chunk (it always does — chunks cut at SP, and an event
+        // never spans a rest — but a defensive skip beats a wrong reference window).
+        if nuc_global < chunk.start || nuc_global >= chunk.end {
+            continue;
+        }
+        let nk = nuc_global - chunk.start;
+        let cw = span(starts[k], d);
+        let nw = span(starts[nk], chunk.phone_dur[nk].max(0));
+        let (rc, rn) = (rms(audio, cw), rms(audio, nw));
+        if rc <= 1e-7 || rn <= 1e-7 {
+            continue; // no signal to lift (or no reference) — leave it alone
+        }
+        let measured = 20.0 * (rc / rn).log10();
+        let want = (target_db - measured).clamp(0.0, CODA_LIFT_MAX_DB);
+        if want > 0.05 {
+            wins.push((cw.0, cw.1, 10f32.powf(want / 20.0)));
+        }
+    }
+    for (s, e, gain) in wins {
+        apply_emphasis(audio, &[(s, e)], gain, fade);
+    }
 }
 
 /// Chunk-relative CLUSTERS of contiguous depth>0 phones, each member keeping its OWN class depth.
@@ -1662,6 +1797,82 @@ mod tests {
         // a gap (unflagged phone) splits clusters:
         let cls2 = chunk_valley_clusters(&chunk, 2000, &[11.7, 0.0, 10.4, 0.0]);
         assert_eq!(cls2, vec![vec![(0, 500, 11.7)], vec![(750, 1000, 10.4)]]);
+    }
+
+    /// ★S97 ②a — WHO the phrase-final coda restore fires on. Four arms, deliberately different:
+    /// phrase-final sonorant coda (fires) / the SAME word mid-phrase (does not) / a phrase-final
+    /// OBSTRUENT coda (does not — real singers genuinely devoice those: upstream K −15.3, Z −9.9)
+    /// / ja (structurally cannot — no phone ever sits after its last nucleus).
+    #[test]
+    fn s97_phrase_final_coda_lift_eligibility() {
+        // Built directly so the arms differ ONLY in what this predicate reads (event grouping,
+        // language, phone class, what follows) — a dictionary fixture would drag `resolve_west_span`
+        // into a test about a render-side predicate.
+        let mk = |phon: Vec<&'static str>, dur: Vec<i64>, evt: Vec<usize>, pitch: Vec<i64>, lang_id: i64| ScoreArrays {
+            phonemes: vec![0; phon.len()],
+            phone_dur: dur.clone(),
+            note_pitch: pitch,
+            note_dur: dur.clone(),
+            note_to_phone: evt.iter().map(|&e| e as i64).collect(),
+            phon,
+            lang: vec![lang_id; dur.len()],
+            evt,
+            #[cfg(test)]
+            borrow_ledger: Vec::new(),
+            #[cfg(test)]
+            in_note_alloc: Vec::new(),
+        };
+        let en_id = g2p::Lang::En.id();
+        // bloom + rest → the /m/ is phrase-final and sonorant ⇒ eligible at the upstream p25
+        let a = mk(vec!["b", "l", "u", "m", "SP"], vec![3, 4, 20, 5, 10], vec![0, 0, 0, 0, 1], vec![60, 60, 60, 60, 0], en_id);
+        let la = phrase_final_coda_lifts(&a);
+        assert_eq!(la[3].map(|x| x.0), Some(-5.0), "phrase-final /m/ targets upstream p25");
+        assert_eq!(la[3].map(|x| a.phon[x.1]), Some("u"), "…measured against its own nucleus");
+        assert!(la.iter().enumerate().all(|(i, v)| v.is_none() || i == 3), "nothing else is touched: {la:?}");
+        // DISCRIMINATOR: the same word followed by a SUNG note must NOT fire (mid-phrase codas
+        // measure −1.1 dB = already right). If this ever matches the arm above, the test is empty.
+        let b = mk(vec!["b", "l", "u", "m", "s", "i"], vec![3, 4, 20, 5, 4, 20], vec![0, 0, 0, 0, 1, 1], vec![60; 6], en_id);
+        let lb = phrase_final_coda_lifts(&b);
+        assert_eq!(lb[3], None, "mid-phrase coda is left alone");
+        assert_ne!(la[3].is_some(), lb[3].is_some(), "the two arms must really differ");
+        // phrase-final OBSTRUENT: `dears` → the /ɹ/ lifts, the /z/ does not.
+        let c = mk(vec!["d", "ɪ", "ɹ", "z", "SP"], vec![3, 12, 6, 3, 10], vec![0, 0, 0, 0, 1], vec![60, 60, 60, 60, 0], en_id);
+        let lc = phrase_final_coda_lifts(&c);
+        assert_eq!(lc[2].map(|x| x.0), Some(-3.9), "sonorant coda lifts");
+        assert_eq!(lc[3], None, "a word-final /z/ is SUPPOSED to be quiet (upstream p50 −9.9)");
+        // ja: gated out by language even if a coda-shaped phone existed (and in real ja material
+        // none does — 0 of 1215 sung notes have a phone after their last nucleus).
+        let j = mk(vec!["k", "a", "ɴ", "SP"], vec![3, 12, 4, 10], vec![0, 0, 0, 1], vec![60, 60, 60, 0], g2p::Lang::Ja.id());
+        assert!(phrase_final_coda_lifts(&j).iter().all(|v| v.is_none()), "ja is untouched");
+    }
+
+    /// ★S97 ②a — HOW MUCH. Measures against the note's own nucleus, lifts toward the target, never
+    /// attenuates, and stops at `CODA_LIFT_MAX_DB`.
+    #[test]
+    fn s97_coda_lift_is_bounded_and_one_sided() {
+        let chunk = Chunk {
+            start: 0, end: 2, phonemes: vec![10, 11],
+            note_pitch: vec![60; 2], phone_dur: vec![100, 100], note_dur: vec![200; 2],
+            note_to_phone: vec![0, 0], t: 200, lang_id: 1, hard_seam: false,
+        };
+        // nucleus at 1.0, coda 20 dB below it, target −5 dB ⇒ wants +15 dB, capped at 9.
+        let mut a = vec![1.0f32; 200];
+        for v in a[100..].iter_mut() { *v = 0.1; }
+        apply_coda_lift(&mut a, &chunk, &[None, Some((-5.0, 0))], 4);
+        let lifted = (a[150] / 0.1).max(1.0);
+        assert!((20.0 * lifted.log10() - CODA_LIFT_MAX_DB).abs() < 0.2, "capped at the policy max: {}", 20.0 * lifted.log10());
+        // already ABOVE the target ⇒ bit-exact untouched (this stage never attenuates).
+        let mut b = vec![1.0f32; 200];
+        for v in b[100..].iter_mut() { *v = 0.9; }
+        let before = b.clone();
+        apply_coda_lift(&mut b, &chunk, &[None, Some((-5.0, 0))], 4);
+        assert_eq!(b, before, "a coda already at/above target is bit-exact untouched");
+        // silent coda (nothing to lift) ⇒ untouched, never amplified noise.
+        let mut c = vec![1.0f32; 200];
+        for v in c[100..].iter_mut() { *v = 0.0; }
+        let cbefore = c.clone();
+        apply_coda_lift(&mut c, &chunk, &[None, Some((-5.0, 0))], 4);
+        assert_eq!(c, cbefore, "a coda with no signal is not amplified");
     }
 
     #[test]

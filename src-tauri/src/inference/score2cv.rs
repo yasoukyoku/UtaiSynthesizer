@@ -498,9 +498,10 @@ fn onset_may_reach_target(lang: g2p::Lang) -> bool {
 /// by one. zh finals are atomic vocab tokens (`wang` = [w, ɑŋ], no coda at all) and ja is CV with at most
 /// a moraic nasal, so for those two the pre-roll borrow reaches its target and a "coda" barely exists;
 /// their fast-run allocation and their word endings are ear-verified (S84/S89) and do not move without
-/// their own ear test. ONE predicate, two consumers (the onset supplement + the coda clarity pass) — the
-/// language split must not drift between them.
-fn consonant_chaining_language(lang: g2p::Lang) -> bool {
+/// their own ear test. ONE predicate, now FOUR consumers (the onset supplement, the coda clarity pass,
+/// the S97 coda floor top-up, and the S97 phrase-final coda restore in `score2svc`) — the language
+/// split must not drift between them, which is why this stays a single function and never a copy.
+pub(super) fn consonant_chaining_language(lang: g2p::Lang) -> bool {
     !matches!(lang, g2p::Lang::Zh | g2p::Lang::Ja)
 }
 
