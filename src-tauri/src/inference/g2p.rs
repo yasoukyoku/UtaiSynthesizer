@@ -1730,7 +1730,14 @@ mod tests {
         Fixtures { zh: zh_fixture(), en: en_fixture(), de: de_fixture() }
     }
     fn evt(lyric: &str, lang: Lang) -> ScoreEvt<'_> {
-        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set: PhonemeSet::Words }
+        evt_set(lyric, lang, PhonemeSet::Words)
+    }
+    /// Same note, on a chosen phoneme CONVENTION. S99: `evt` used to hard-code `Words`, which meant
+    /// the `g2p_probe` diagnostic could not reach the alias path AT ALL — the one code path whose
+    /// tokenizer we most need to observe on real symbols (S91's "unknown multi-letter symbol splits
+    /// silently" debt). A probe that structurally cannot exercise an arm cannot report on it.
+    fn evt_set(lyric: &str, lang: Lang, phoneme_set: PhonemeSet) -> ScoreEvt<'_> {
+        ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set }
     }
     fn phones_of(nt: &ResolvedNote) -> Vec<&'static str> {
         match &nt.kind {
@@ -2608,7 +2615,12 @@ mod tests {
 
     // ── #[ignore] DIAGNOSTIC PROBE (S86 dictionary work-line): run the REAL engine over the REAL
     //    shipped dictionaries so every audit finding is grounded in behaviour, not in reading code.
-    //      UTAI_G2P_PROBE=<file>  each non-empty, non-`#` line is  <lang> TAB <note>|<note>|...
+    //      UTAI_G2P_PROBE=<file>  each non-empty, non-`#` line is  <lang>[:<set>] TAB <note>|<note>|...
+    //      <set> ∈ words|arpasing|xsampa|vccv (absent = words). S99 added it: without a convention
+    //      selector the probe could only ever see the dictionary arm, so every question about the
+    //      ALIAS tokenizer had to be answered by reading code — exactly the habit this probe exists
+    //      to replace. An unrecognised <set> is LOUD here (production's `from_wire` folds unknown to
+    //      `words` on purpose — for a diagnostic that same fold would silently answer the wrong question).
     //    Run: UTAI_G2P_PROBE=probe.txt cargo test --lib inference::g2p::tests::g2p_probe -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -2631,12 +2643,28 @@ mod tests {
                 println!("!! malformed probe line (need a TAB): {line}");
                 continue;
             };
-            let lang = lang_of(code.trim());
+            let (lang_code, set_code) = match code.trim().split_once(':') {
+                Some((l, s)) => (l, s),
+                None => (code.trim(), "words"),
+            };
+            let set = match set_code {
+                "words" => PhonemeSet::Words,
+                "arpasing" => PhonemeSet::Arpasing,
+                "xsampa" => PhonemeSet::Xsampa,
+                "vccv" => PhonemeSet::Vccv,
+                other => {
+                    println!("!! unknown phoneme set {other:?} (want words|arpasing|xsampa|vccv): {line}");
+                    continue;
+                }
+            };
+            let lang = lang_of(lang_code);
             let lyrics: Vec<&str> = notes.split('|').collect();
-            let score: Vec<ScoreEvt> = lyrics.iter().map(|l| evt(l, lang)).collect();
+            let score: Vec<ScoreEvt> = lyrics.iter().map(|l| evt_set(l, lang, set)).collect();
             println!("\n=== [{code}] {}", lyrics.join(" | "));
-            // stage1 + syllabification for the western languages (the whole-word head note)
-            if !matches!(lang, Lang::Ja | Lang::Zh) {
+            // stage1 + syllabification for the western languages (the whole-word head note).
+            // Only meaningful on the WORDS arm: on an alias track the lyric is a symbol string, so a
+            // dictionary miss here is expected and printing "OOV — not in en.tsv" would read as a bug.
+            if !matches!(lang, Lang::Ja | Lang::Zh) && set == PhonemeSet::Words {
                 match g.words(lang) {
                     Ok(d) => {
                         let head = lyrics[0].trim();
@@ -2760,7 +2788,7 @@ mod tests {
 
     // ─── S91 UTAU alias conventions (queue 5c) — the resolve_core integration ────────────────────
     fn alias_evt(lyric: &str, set: PhonemeSet) -> ScoreEvt<'_> {
-        ScoreEvt { lyric, note_num: 60, frames: 20, lang: Lang::En, phoneme_input: None, phoneme_set: set }
+        evt_set(lyric, Lang::En, set) // alias conventions are EN-only; one struct literal (`evt_set`)
     }
 
     /// ★★ THE regression this feature could most easily ship: an alias that is ALSO a real dictionary
