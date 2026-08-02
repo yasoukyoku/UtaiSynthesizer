@@ -17,6 +17,32 @@ fn app_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
+/// Where `init_ort_runtime` should look for the ORT **build** — separate from `app_root()` on
+/// purpose, because the two answer different questions and pointing one at the other breaks the
+/// model paths.
+///
+/// ★★S98 — why this exists. ORT ships **one provider set per DLL** (`lib.rs:262`): the DirectML
+/// build has no CUDA provider and vice versa, so `Auto` does not pick a provider inside one build,
+/// it picks **which build to load**. The CUDA build is a ~290 MB **in-app download** that lands in
+/// `{app_dir}/runtime/ort/cuda/` — it is NOT bundled and therefore **never exists inside the repo**.
+/// `app_root()` is the repo, so `cuda_dll.exists()` is permanently false here and every test in this
+/// harness has always, silently, run the **DirectML** arm only.
+///
+/// That is correct behaviour, but it means the CUDA leg — the one a real install actually renders on
+/// — had **zero headless coverage**, and a green run here could never have caught a CUDA-side
+/// regression. Point this at a real install to exercise the other arm:
+///
+///   $env:UTAI_TEST_ORT_ROOT="$env:LOCALAPPDATA\UtaiSynthesizer"
+///
+/// ⚠ It changes ONLY the ORT root. Models still resolve under `app_root()`.
+/// ⚠ A pass here is evidence about **that machine's installed runtime**, not about the bundle.
+fn ort_root() -> PathBuf {
+    match std::env::var("UTAI_TEST_ORT_ROOT") {
+        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
+        _ => app_root(),
+    }
+}
+
 /// Same contract as tests/separation_pipeline.rs: these tests predate the load-dynamic
 /// ORT switch (S12) — without this init any ORT touch hangs FOREVER at 0 CPU behind an
 /// invisible modal DLL dialog (S32 found this exact landmine via a full `cargo test`).
@@ -36,8 +62,8 @@ fn init_ort() {
     // shim resolves its sub-DLLs via PATH at graph-build time — without this the
     // first Conv dies with CUDNN_BACKEND_API_FAILED (bare-harness-only failure
     // that reads like an environment drift; the app does this in run()).
-    utai_lib::setup_cuda_dll_paths(&app_root());
-    utai_lib::init_ort_runtime(&app_root());
+    utai_lib::setup_cuda_dll_paths(&ort_root());
+    utai_lib::init_ort_runtime(&ort_root());
 }
 
 fn test_output(name: &str) -> PathBuf {
