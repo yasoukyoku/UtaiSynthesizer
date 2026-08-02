@@ -410,20 +410,60 @@ pub fn is_nucleus_phone(p: &str) -> bool {
 // EMISSION floor for every phone we place; the one measured exception is the S93 rescue LENDER
 // (`RESCUE_LENDER_KEEP` below), which may keep 1 because real zh/ja singing does exactly that.
 const CODA_MIN_FRAMES: i64 = 2; // the shipped emission floor: we never PLACE a phone under 2 frames
-/// ★S96f — what a CHAINING-language coda should get when the note can pay for it, as opposed to
-/// `CODA_MIN_FRAMES`, which is only the "never emit anything shorter" survival floor.
+/// The shortest a consonant ever is in the TRAINING corpus. This is a fact about the data the
+/// model was fitted on, NOT about singers: `Much-Better-S2H/scripts/realign_mindur.py` sets
+/// `DVOW, DCONS, DSP = 3, 3, 1` and `processed/realign_mindur3_apply.log` records
+/// `=== APPLY (in-place) min-dur vow>=3 cons>=3 ===  gtsinger_en re=7423 keep=62`, i.e. the DP
+/// PUT it there. It is still the right axis for the audit's `BelowTrainingFloor` finding — a phone
+/// shorter than anything the model ever saw is out of the model's distribution — but it must never
+/// again be quoted as evidence of what a real singer does. For that, see `chaining_coda_floor`.
+/// (test-only since S97: its one consumer is the audit件's `BelowTrainingFloor` axis. Production
+/// no longer has a flat consonant floor at all — that was the whole point of the change.)
+#[cfg(test)]
+pub(super) const TRAINING_MIN_FRAMES: i64 = 3;
+
+/// ★S97 — the frames a CHAINING-language coda may be topped up to, **per phone**.
 ///
-/// Three independent sources put the same number on it: (a) the reference distribution built from
-/// real aligned singing — en coda p05 = 3 for `l` (n=2633+508), `n` (n=5408+1500), `d` (n=2808+751),
-/// `z`, `m`… i.e. real singers essentially never go under 3; (b) the training pipeline's own
-/// `realign_mindur.py DCONS = 3`, which S57 set BY EAR and applied to the 8 LOOSE sets (gtsinger_en
-/// included) ⇒ 0 / 5608 English consonants under 3 frames; (c) the user's ear, 2026-08-01: with the
-/// `fr*2/5` budget handing 7-8 frame notes exactly 2 frames of coda, `call`/`will`/`tell` sang a
-/// 40 ms /l/ and `and` sang 2+2 — measured at NORMAL energy (−0.7…+1.6 dB vs their own vowel), so
-/// they are not weak, they are too SHORT to be heard as themselves ("其他地方的 l 也有点割裂").
-/// ⚠ zh/ja keep `CODA_MIN_FRAMES`: the ja hand labs never went through that realignment and DO
-/// attest 1-2 frame codas, and their allocation is ear-validated as shipped (S84/S89/S93).
-pub(super) const CHAINING_CONSONANT_FLOOR: i64 = 3;
+/// ⛔ WHY THIS IS NO LONGER ONE NUMBER. The S96f constant this replaces was justified by two
+/// sources presented as independent: (a) `score2cv_audit_ref.rs` "en coda p05 = 3, real singers
+/// essentially never go under 3" and (b) `realign_mindur.py DCONS = 3`. **They are the same
+/// source.** (b) was applied in place to gtsinger_en and (a) is measured on the result — every one
+/// of the 165 en cells in that table has p05 = 3 because the min-duration DP put it there, so the
+/// table structurally cannot test the floor that produced it. The knife shipped on a circular
+/// argument, and it delivered zero frames to the /l/ it was written for (measured on all eight
+/// lane dumps: post_e → post_f raised n f ŋ t tʃ d k z, no /l/ anywhere).
+///
+/// The numbers below come from the one surface that never touched our code: the GTSinger release
+/// annotation (`datasets/gtsinger/processed/English/metadata.json`, 4827 utterances, 38471
+/// word-final consonant tokens, `ph_durs` × 50 fps). ⚠ The un-floored backup of OUR OWN alignment
+/// (`alignment_backup_pre_mindur`) is NOT a substitute: S97 showed our aligner is systematically
+/// early on rhotics (its `ɹ` boundary sits 231-270 ms before both upstream annotators) and
+/// late/short on l/n/m/z/t/d, so it disagrees with the upstream annotation in both directions.
+///
+/// RULE: keep a 3-frame floor only where the upstream p25 is ≥ 3 — i.e. where lifting a 2-frame
+/// coda to 3 moves it INTO the human distribution instead of past its lower quartile.
+///   floor 3 (upstream p25/p50/p75, n): `l` 3/6/10 (3300) · `n` 3/5/8 (5591) · `z` 4/6/8 (4189) ·
+///     `ŋ` 4/6/9 (2542) · `s` 4/6/8 (2093) · `m` 4/6/8 (1942) · `k` 3/5/7 (1386) · `f` 4/5/7 (561) ·
+///     `θ` 4/6/9 (315) · `tʃ` 6/8/14 (247) · `ɡ` 4/6/9 (132) · `dʒ` 4/6/8 (104) · `ʃ` 4/6/8 (63)
+///   floor 2 (upstream p25 = 2): `t` 2/3/5 (5458) · `d` 2/2/4 (4697) · `ɹ` 2/4/8 (3371) ·
+///     `v` 2/4/6 (1907) · `p` 2/4/6 (494) · `ð` 2/3/6 (58)
+/// `d` is the one the user reported by ear (2026-08-02, "and 听起来像是尾辅音过重"): S96f lifted
+/// `and`'s /d/ from 2 to 3 while the upstream MEDIAN for a word-final /d/ is 2 — the lift pushed it
+/// past the 75th percentile of real singing, i.e. exactly backwards.
+/// Anything not listed has < 50 upstream coda observations ⇒ **no floor**: "not measured" must not
+/// read as "measured and fine" (`score2cv_audit_ref.rs`'s own doctrine, applied to ourselves).
+///
+/// ⚠ SCOPE, stated rather than hidden: these are ENGLISH numbers applied to every chaining
+/// language, because the constant they replace already was. de/fr/es/it have no ear-judgeable
+/// material at all; measuring their own upstream annotations is its own round.
+/// ⚠ zh/ja never reach here (`consonant_chaining_language`), and structurally have no coda at all
+/// (measured: 0 of 1215 ja sung notes, 0 of 489 on each of the three UTAU alias tracks).
+pub(super) fn chaining_coda_floor(p: &str) -> i64 {
+    match p {
+        "l" | "n" | "z" | "ŋ" | "s" | "m" | "k" | "f" | "θ" | "tʃ" | "ɡ" | "dʒ" | "ʃ" => 3,
+        _ => CODA_MIN_FRAMES,
+    }
+}
 const REST_KEEP_MIN: i64 = 1; // a lent-from rest keeps ≥1 frame (chunk_at_sp still cuts on it)
 const SUNG_KEEP_MIN: i64 = 2; // a lent-from sung phone keeps ≥2 frames
 /// S93 — DROP-RESCUE ONLY: the floor an ADJACENT sung-VOWEL lender may fall to when the alternative
@@ -1838,37 +1878,8 @@ fn assemble_arrays(
                             }
                         }
                     }
-                    // ★S96f — CODA TOP-UP to the real-singer floor, on the chaining arm only, and
-                    // deliberately LAST: everything that funds an onset has already run, so this
-                    // pass can only spend what the note has left over and can never starve (let
-                    // alone delete) a word-initial consonant. My first cut raised the floor inside
-                    // `allocate_in_note` instead, and a test caught it deleting `don't`'s /d/ —
-                    // the coda ate the budget the onset needed on a short note.
-                    //
-                    // Why it is needed at all (user's ear, 2026-08-01: "其他地方的 l 处理的也有点
-                    // 割裂" / "and 听起来像错的"): `fr*2/5` on a 7-8 frame note is 2-3 frames, so
-                    // `call`/`will`/`tell` sang a 40 ms /l/ and `and` sang n2+d2 — MEASURED at
-                    // normal energy (−0.7…+1.6 dB vs their own vowel), i.e. not weak, just too
-                    // short to read as themselves. Real English singing essentially never goes
-                    // under 3 frames there (en coda p05 = 3 for l/n/d/m/z, n = 500-5400 per cell),
-                    // and the training pipeline's own ear-set floor is the same 3 (DCONS).
-                    // LAST-first: the word-final release carries the cue (this file's doctrine).
-                    // The nucleus keeps NUCLEUS_KEEP_MIN, so no vowel can be pushed into the S84
-                    // collapse region; zh/ja are untouched (their codas are ear-validated as
-                    // shipped, and their hand labs attest 1-2 frame codas as in-distribution).
-                    if chaining_lang && n > nuc + 1 {
-                        for i in (nuc + 1..n).rev() {
-                            if durs[i] <= 0 || durs[i] >= CHAINING_CONSONANT_FLOOR {
-                                continue;
-                            }
-                            let need = CHAINING_CONSONANT_FLOOR - durs[i];
-                            let take = need.min((durs[nuc] - NUCLEUS_KEEP_MIN).max(0));
-                            if take > 0 {
-                                durs[nuc] -= take;
-                                durs[i] += take;
-                            }
-                        }
-                    }
+                    // (S97: the coda floor top-up used to sit HERE, per note. It now runs once,
+                    // globally, after the whole loop — see `coda_floor_top_up` below for why.)
                     for (i, (&p, &d)) in ph.iter().zip(durs.iter()).enumerate() {
                         if d <= 0 {
                             continue; // dropped medial/coda / sub-minimum onset — never emit a 0-frame phone
@@ -1897,6 +1908,63 @@ fn assemble_arrays(
                 // unreachable via resolve_score (strict errors first) — defensive LOUD error.
                 return Err(UtaiError::Inference(format!("VOCAL_OOV: {}", evt.lyric)));
             }
+        }
+    }
+
+    // ★S97 — CODA FLOOR TOP-UP, run ONCE over the finished arrays instead of per note.
+    //
+    // What it does: a chaining-language coda that ended below its own measured floor
+    // (`chaining_coda_floor`) takes the shortfall from ITS OWN event's last nucleus, never below
+    // NUCLEUS_KEEP_MIN. Nothing else is touched — no onset is read or written, and no phone's
+    // START moves except the codas' own, so the project's beat ruler (nucleus.frame0 −
+    // note.frame0) is unchanged by construction.
+    //
+    // ★WHY IT MOVED OUT OF THE NOTE LOOP (S96f ran it there). Inside the loop it fires BEFORE the
+    // next note's onset pre-roll walks back into this note — so it could spend a nucleus frame
+    // that a word-INITIAL consonant was about to borrow. Measured on the user's own track:
+    // `and`'s /n/ took the frame and `mor`'s /m/ fell 3 → 2 frames, the exact S92c/S92e/S92j
+    // shape whose reversal the user's ear condemned in S96e. "Fund the onset first" is this
+    // file's own stated doctrine (see `allocate_in_note`'s ORDER note); the word-final release
+    // gets what is genuinely left over after every borrow has settled.
+    // Second, smaller gain: run last, a frame it spends can no longer be taken back — S96f spent
+    // 13 nucleus frames on the user's track to keep 8 coda lifts, the rest leaking to later notes.
+    //
+    // zh/ja never qualify (`consonant_chaining_language`) and structurally have no coda at all
+    // (measured: 0 of 1215 ja sung notes, 0 of 489 on each UTAU alias track) — the ja, ja_innote
+    // and three alias lane dumps are byte-identical across this change, which is how that claim
+    // is checked, not by argument.
+    {
+        let mut i = 0usize;
+        while i < phon.len() {
+            let mut j = i;
+            while j + 1 < phon.len() && pevt[j + 1] == pevt[i] {
+                j += 1;
+            }
+            let seg = i..=j;
+            let chaining = g2p::Lang::from_id(plang[i]).is_some_and(consonant_chaining_language);
+            if chaining && npitch[i] > 0 {
+                if let Some(nuc) = seg.clone().filter(|&x| is_nucleus_phone(phon[x])).next_back() {
+                    // LAST-first: the word-final release carries the cue (this file's doctrine).
+                    // A member already at ITS OWN floor is skipped, so a cluster's spare frame
+                    // goes to the member that is actually short — `and`'s /n/ (upstream p25 3)
+                    // rather than its /d/ (upstream p25 2), which is the S96f complaint.
+                    for x in (nuc + 1..=j).rev() {
+                        if matches!(phon[x], "SP" | "AP") {
+                            continue;
+                        }
+                        let floor = chaining_coda_floor(phon[x]);
+                        if pdur[x] <= 0 || pdur[x] >= floor {
+                            continue;
+                        }
+                        let take = (floor - pdur[x]).min((pdur[nuc] - NUCLEUS_KEEP_MIN).max(0));
+                        if take > 0 {
+                            pdur[nuc] -= take;
+                            pdur[x] += take;
+                        }
+                    }
+                }
+            }
+            i = j + 1;
         }
     }
 
@@ -3314,7 +3382,7 @@ mod tests {
     /// Three arms in one test: it fires (call/and), it does NOT fire when the nucleus cannot pay,
     /// and ja is untouched.
     #[test]
-    fn s96f_coda_reaches_the_training_floor_when_the_nucleus_can_pay() {
+    fn s97_coda_reaches_its_own_upstream_floor_when_the_nucleus_can_pay() {
         let d = en_dicts();
         let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
             lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
@@ -3324,24 +3392,78 @@ mod tests {
         // a note with a nucleus that HAS spare pays for the release out of it
         let a = build_arrays_daw(&[en("M AY1", 8), en("K AO1 L", 11)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(a.phon, vec!["m", "aɪ", "k", "ɔ", "l"]);
-        assert_eq!(a.phone_dur[4], CHAINING_CONSONANT_FLOOR, "the /l/ reaches the real-singer floor: {:?}", a.phone_dur);
+        assert_eq!(a.phone_dur[4], chaining_coda_floor("l"), "the /l/ reaches the real-singer floor: {:?}", a.phone_dur);
+        assert_eq!(chaining_coda_floor("l"), 3, "upstream en word-final /l/ p25=3 p50=6 (n=3300)");
         assert!(a.phone_dur[3] >= NUCLEUS_KEEP_MIN, "…and the vowel keeps its floor: {:?}", a.phone_dur);
         assert_eq!(a.phone_dur.iter().sum::<i64>(), 19, "conservation");
         // ★and the honest limit, pinned so nobody "fixes" it by squeezing the vowel: at 7 frames a
         // CVC note cannot pay — onset 3 (ear-validated S92c) + nucleus 3 (S84 collapse guard) + the
-        // release leaves exactly 2. Real singing does not put a full CVC in 140 ms either; buying
-        // that release needs a TIMING decision (letting it ride into the next attack), not a
-        // quieter vowel. The user's `call`/`will`/`tell` are this shape.
+        // release leaves exactly 2. The user's `call`/`will`/`tell` are this shape, and the upstream
+        // annotation puts a word-final /l/ at p50 = 6, so we really are short here — but the frames
+        // do not exist on this note. ⚠ S97 measured the obvious escape and it is WRONG: letting the
+        // release ride into the next attack is the opposite of what real singers do (after a
+        // coda-final short group the NEXT group's nucleus arrives EARLIER, p50 4 frames vs 6 after
+        // an open one). Whatever buys this, it is not delaying the next note.
         let tight = build_arrays_daw(&[en("M AY1", 8), en("K AO1 L", 7)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(tight.phone_dur[4], CODA_MIN_FRAMES, "cannot pay ⇒ untouched: {:?}", tight.phone_dur);
         assert!(tight.phone_dur[3] >= NUCLEUS_KEEP_MIN, "…and the vowel is NOT squeezed: {:?}", tight.phone_dur);
-        // cluster: the word-final release is served first (this file's LAST-first doctrine)
+        // ★S97 cluster: LAST-first still SERVES first, but a member already at ITS OWN floor is
+        // skipped — so `and`'s spare frame goes to the /n/ (upstream p25 3 / p50 5) instead of the
+        // /d/ (upstream p25 2 / p50 2). S96f gave it to the /d/ and the user heard it as
+        // "尾辅音过重". This is the whole point of making the floor per-phone.
         let b = build_arrays_daw(&[en("M AY1", 8), en("AH0 N D", 8)], &d, ArticulationTiming::Auto).unwrap();
         assert_eq!(b.phon, vec!["m", "aɪ", "ə", "n", "d"], "no phone deleted");
+        assert_eq!(b.phone_dur[4], CODA_MIN_FRAMES, "/d/ stays at its own floor: {:?}", b.phone_dur);
+        assert_eq!(b.phone_dur[3], 3, "/n/ gets the spare frame instead: {:?}", b.phone_dur);
         assert!(b.phone_dur[3] + b.phone_dur[4] >= 5, "the cluster gains: {:?}", b.phone_dur);
         // ja: same CVC shape, byte-identical to the shipped allocation (no top-up there)
         let j = build_arrays_daw(&[raw("k a ɴ", 7)], &NoDicts, ArticulationTiming::Auto).unwrap();
         assert_eq!(j.phone_dur[2], CODA_MIN_FRAMES, "ja coda keeps the shipped floor: {:?}", j.phone_dur);
+    }
+
+    /// ★S97 — ORDER: the coda floor top-up must run AFTER every borrow, not inside the note loop.
+    ///
+    /// The shape that decides it is the user's own (`tyfd` evt28→29, `and` then `mor`): a note
+    /// whose coda is under its floor, immediately followed by a note whose WORD-INITIAL consonant
+    /// funds itself by borrowing backwards. Run per-note (S96f), the top-up spends the nucleus
+    /// frame first and the onset falls to 2 — the S92c/S92e/S92j reversal the user's ear
+    /// condemned. Run globally, the onset is already funded and the release takes the remainder.
+    ///
+    /// The two arms really are different: with the pass in the note loop this fixture gives
+    /// `m` = 2, with it after the loop `m` = 3, so deleting or moving the pass turns this red.
+    #[test]
+    fn s97_coda_top_up_never_outbids_the_next_words_onset() {
+        let d = en_dicts();
+        let en = |p: &'static str, fr: i64| g2p::ScoreEvt {
+            lyric: "x", note_num: 60, frames: fr, lang: g2p::Lang::En,
+            phoneme_input: Some(p), phoneme_set: PhonemeSet::Words,
+        };
+        let a = build_arrays_daw(
+            &[en("M AY1", 8), en("AH0 N D", 8), en("M AO1 R", 7)],
+            &d,
+            ArticulationTiming::Auto,
+        )
+        .unwrap();
+        assert_eq!(a.phon, vec!["m", "aɪ", "ə", "n", "d", "m", "ɔ", "ɹ"], "{:?}", a.phon);
+        let m_onset = a.phone_dur[5];
+        assert!(
+            m_onset >= 3,
+            "the next word's onset must be funded FIRST — got m={m_onset}, all={:?}",
+            a.phone_dur
+        );
+        // ★The honest half, pinned so nobody later "improves" it into the S96f behaviour: once the
+        // onset has borrowed, `and`'s nucleus IS at NUCLEUS_KEEP_MIN, so the /n/ genuinely cannot
+        // be topped up and stays at the emission floor. That is the trade this ordering makes —
+        // a word-INITIAL consonant outranks a word-final one when only one frame exists.
+        assert_eq!(a.phone_dur[2], NUCLEUS_KEEP_MIN, "the nucleus really is out of spare: {:?}", a.phone_dur);
+        assert_eq!(a.phone_dur[3], CODA_MIN_FRAMES, "…so the /n/ is NOT topped up: {:?}", a.phone_dur);
+        // DISCRIMINATOR — the same word with NO following onset to outbid it: the nucleus keeps its
+        // spare and the /n/ does reach its floor. Two arms, genuinely different (S92p rule).
+        let b = build_arrays_daw(&[en("M AY1", 8), en("AH0 N D", 8)], &d, ArticulationTiming::Auto).unwrap();
+        assert_eq!(b.phone_dur[3], chaining_coda_floor("n"), "no rival ⇒ the /n/ gets its floor: {:?}", b.phone_dur);
+        assert_ne!(a.phone_dur[3], b.phone_dur[3], "the two arms must really differ");
+        assert_eq!(a.phone_dur.iter().sum::<i64>(), 23, "conservation");
+        assert_eq!(b.phone_dur.iter().sum::<i64>(), 16, "conservation");
     }
 
     /// ★S96d — the sweep the shipped one was BLIND to (review CONFIRMED). `[i n z]` has two members

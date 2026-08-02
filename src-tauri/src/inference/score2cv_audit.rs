@@ -285,9 +285,12 @@ fn dist_cell(lang: &str, token: &str, position: Position, group_frames: i64) -> 
     find(lang).or_else(|| find(""))
 }
 
-/// 真英语训练数据里辅音的硬下限 —— **单一真源在生产侧**(S96f 起分配器自己也用它来给成丛
-/// 语言的 coda 定预算下限),这里只是转发,免得仪器和生产对「什么算够长」各说各话。
-use super::CHAINING_CONSONANT_FLOOR as TRAINING_CONSONANT_FLOOR;
+/// 训练语料里辅音的最短时长 —— **单一真源在生产侧**,这里只转发。
+/// ★S97 澄清:这是「模型见过的最短辅音」(`realign_mindur.py` 的 DCONS=3 造成的),所以它是
+/// **分布外**判据、可以继续用;但它**不是**「真人不会更短」的证据 —— 那句话是循环论证
+/// (参照表的 en p05 全部等于 3 正是这条 DP 的产物)。生产侧的**真人**地板另有其人,
+/// 见 `score2cv::chaining_coda_floor`(取自 GTSinger 上游标注,逐音素)。
+use super::TRAINING_MIN_FRAMES as TRAINING_CONSONANT_FLOOR;
 
 /// 一个事件「该发什么」。**只描述发射契约,不复制分配规则** —— 分配规则的产物是 `arr`,
 /// 拿它当真值就是自证。
