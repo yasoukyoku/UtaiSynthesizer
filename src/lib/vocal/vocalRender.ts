@@ -609,6 +609,10 @@ export const RANGE_ALGO_VERSION = "s85e";
  *    · ZH joined the `lookup_candidates` tolerance ladder the other six languages already had, so
  *      「我，」 resolves instead of aborting the render. (This one owes no bump on its own — every note
  *      it touches used to be OOV, hence already sig-dirty — it simply rides the batch stamp.)
+ *    · DE gained the four ß spellings upstream's Swiss orthography cannot express (Maße/Buße/Floß/saß),
+ *      so they stop folding onto their short-vowelled ss homographs. That one is a DICTIONARY-CONTENT
+ *      change, and dictionary content has no signature carrier of its own (review S94-VB-1) — this
+ *      stamp is the only thing that makes an existing German bake re-render and pick it up.
  *  ⚠ Why this one needs a bump although S95's fragment merge did not: S95's no-bump argument rested
  *  entirely on "every affected note ERRORED before the pass, so any bake it holds is already
  *  sig-dirty". That does not transfer here — the old behaviour was a silent SUCCESS, so a project

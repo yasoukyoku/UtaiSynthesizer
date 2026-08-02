@@ -2494,6 +2494,43 @@ mod tests {
         eprintln!("[g2p-e2e] en.tsv nucleus equivalence: {toks} tokens / {} distinct, 0 disagreements", distinct.len());
     }
 
+    /// S99 (S86#8-4) — the four German ß spellings whose ss-homograph is a DIFFERENT word. Runs on the
+    /// SHIPPED de.tsv because that is where the fix lives: upstream `german_mfa` is Swiss orthography
+    /// with 0 ß keys, so the generator (MBS2H `build_dictionaries.py::DE_SHARP_S_ENTRIES`) adds them as
+    /// ordinary faithful keys, and the ß→ss rung of `lookup_candidates` is then never consulted for
+    /// them. The Rust side is unchanged — which is exactly what this test has to keep true.
+    /// Same loud-SKIP contract as `s94_en_onset_vote_gate` below (de.tsv is a gitignored generated asset).
+    #[test]
+    fn s99_de_sharp_s_homographs() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/de.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s99-de-ß] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let d = WordDict::from_tsv(Lang::De, &tsv);
+        let ph = |w: &str| d.lookup(w).unwrap_or_else(|| panic!("{w} is OOV in de.tsv")).join(" ");
+        for (esz, ss, want_esz) in [
+            ("maße", "masse", "m aː s ə"),
+            ("buße", "busse", "b uː s ə"),
+            ("floß", "floss", "f l oː s"),
+            ("saß", "sass", "z aː s"),
+        ] {
+            assert_eq!(ph(esz), want_esz, "{esz}");
+            // the whole point: the two spellings must NOT resolve alike any more
+            assert_ne!(ph(esz), ph(ss), "{esz} and {ss} collapsed back onto one reading");
+        }
+        // ⚠ the 5875 ss keys whose primary ALREADY carries a long vowel/diphthong were correct through
+        // the ß rung before this and must be untouched by it — no new keys, same answer both ways.
+        for (esz, ss) in [("weiß", "weiss"), ("groß", "gross"), ("straße", "strasse"), ("heißt", "heisst"), ("spaß", "spass")] {
+            assert_eq!(ph(esz), ph(ss), "{esz}/{ss} must still fold together");
+        }
+        // ⚠ pre-1996 orthography wrote ß after SHORT vowels too; those fold to the modern ss spelling
+        // of the same short word, which was already right — the curated table must not have moved them.
+        for (old, modern) in [("daß", "dass"), ("muß", "muss"), ("fluß", "fluss"), ("paßt", "passt"), ("kuß", "kuss")] {
+            assert_eq!(ph(old), ph(modern), "{old}/{modern} must still fold together");
+        }
+    }
+
     /// S94 onset vote gate — the syllabification half `dictionaries_end_to_end` is structurally
     /// blind to (S92 measured: deleting onset clusters changes ZERO of its assertions). Loads the
     /// REAL en.tsv through the production `from_tsv`, then pins (a) the vote-gated onset set and
