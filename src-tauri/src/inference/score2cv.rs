@@ -187,6 +187,17 @@ fn kana_tokenize(s: &str) -> Option<Vec<&'static str>> {
                     }
                 }
             }
+            // S99 THIRD branch — strictly AFTER the table lookup above, never beside the 外来拗音 one:
+            // 「base + small ゃゅょ」 rows the generated chart has no romaji for (てゅ/でゅ/ふゅ/ゔゅ…).
+            // Running it earlier would resolve きゃ here instead of from the table (see the ORDER TRAP
+            // note on `small_ya_kana_phones`, which also refuses table-owned strings on its own).
+            if w == 2 {
+                if let Some(v) = small_ya_kana_phones(&slice) {
+                    out.extend(v);
+                    took = w;
+                    break;
+                }
+            }
         }
         if took == 0 {
             match chars[i] {
@@ -247,6 +258,52 @@ fn foreign_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
     }
     let mut v: Vec<&'static str> = head.to_vec();
     v.push(small_ipa);
+    Some(v)
+}
+
+/// Small palatal-glide kana → the romaji key of the standalone ya-row mora it stands for.
+const SMALL_YA_ROMAJI: &[(char, &str)] = &[('ゃ', "ya"), ('ゅ', "yu"), ('ょ', "yo")];
+
+/// UTAI EXTENSION (S99, S86#8-3): 「base kana + small ゃゅょ」 that the generated kana table does NOT
+/// contain — てゅ/でゅ/ふゅ/ゔゅ and the ゃ/ょ members of those rows. Before this, TWO gaps stacked into a
+/// silent truncation: `foreign_kana_phones` only knows the small VOWELS 「ぁぃぅぇぉ」, and the kana table
+/// only carries the 拗音 rows that exist in the upstream romaji chart (k/g/n/h/b/p/m/r + the ɕ/dʑ/tɕ
+/// rows) — so 「てゅ」 consumed 「て」, hit the small ゅ, and ENDED THE RUN, singing [t e] with no OOV and
+/// no red mark. Audited real UST corpus: 11 files / 101 notes use this family.
+///
+/// The phones are DERIVED, never invented: base onset (base kana → romaji → IPA, minus its vowel) +
+/// the small kana's OWN R2IPA row (`ya`/`yu`/`yo` → `[j a]`/`[j ɯ]`/`[j o]`). So 「てゅ」 = [t] + [j ɯ].
+///
+/// ⚠ WHY NOT the single palatalized token `tʲ`, which the 210-token vocab does contain: **its training
+/// exposure is zero.** `score2cv_dur_priors.rs` measures `tʲ`/`dʲ`/`vʲ`/`fʲ`/`sʲ`/`zʲ`/`rʲ`/`tsʲ` at
+/// `onset n=0, coda n=0` (they are in the vocab for Russian/Korean, neither of which is in the final
+/// training split) — every value on those rows is a fallback, not a measurement. Emitting one is the
+/// "dictionary can spell it, model cannot sing it" dead end S94 ruled out. The pieces used here are
+/// instead heavily attested: `j` onset n=4868, `t` n=16602, `d` n=7759, `ɸ` n=80, `v` n=3475.
+/// The real 拗音 rows keep their measured single-token spelling (きゃ→[c a]) — the generated table
+/// still owns those, see the guard below.
+///
+/// ⚠ ORDER TRAP (S86/S98 both flagged it): this MUST come after the kana table lookup. Placed beside
+/// `foreign_kana_phones` — which runs BEFORE it — 「きゃ」 would resolve here to [k j a] instead of the
+/// table's measured [c a], destroying every ordinary 拗音. Rather than leave that as a call-site
+/// convention that a future edit can quietly break, the invariant is enforced IN the function: a
+/// string the generated table already owns returns None no matter who calls it.
+fn small_ya_kana_phones(s0: &str) -> Option<Vec<&'static str>> {
+    if kana_map().contains_key(s0) {
+        return None; // the generated table owns the real 拗音 rows — see ORDER TRAP above
+    }
+    let chars: Vec<char> = s0.chars().collect();
+    let last = *chars.last()?;
+    let &(_, ya) = SMALL_YA_ROMAJI.iter().find(|&&(c, _)| c == last)?;
+    let base: String = chars[..chars.len() - 1].iter().collect();
+    let romaji = kana_map().get(base.as_str())?;
+    let seq = r2ipa_map().get(*romaji)?;
+    let (&tail, head) = seq.split_last()?;
+    if !tbl::VOWEL_SET.contains(&tail) {
+        return None; // no plain-vowel tail to replace (ん etc.) — legacy chain decides
+    }
+    let mut v: Vec<&'static str> = head.to_vec();
+    v.extend_from_slice(r2ipa_map().get(ya)?);
     Some(v)
 }
 
@@ -982,6 +1039,77 @@ mod foreign_kana_tests {
         }
         // katakana arrives folded (g2p::fold_katakana upstream): ティ → てぃ.
         assert_eq!(phones(&super::super::g2p::fold_katakana("ティ")), vec!["t", "i"]);
+    }
+
+    /// S99 (S86#8-3): 「base + small ゃゅょ」 rows the generated chart has no romaji for. Before this
+    /// they were SILENTLY TRUNCATED to the base mora — てゅ sang [t e] with no OOV and no red mark.
+    #[test]
+    fn small_ya_kana_rows_sing_in_full() {
+        for (k, want) in [
+            ("てゅ", vec!["t", "j", "ɯ"]), ("てゃ", vec!["t", "j", "a"]), ("てょ", vec!["t", "j", "o"]),
+            ("でゅ", vec!["d", "j", "ɯ"]),
+            ("ふゅ", vec!["ɸ", "j", "ɯ"]), ("ふゃ", vec!["ɸ", "j", "a"]), ("ふょ", vec!["ɸ", "j", "o"]),
+            ("ゔゅ", vec!["v", "j", "ɯ"]),
+        ] {
+            assert_eq!(phones(k), want, "{k}");
+        }
+        // katakana arrives folded upstream, same as the small-vowel family
+        assert_eq!(phones(&super::super::g2p::fold_katakana("テュ")), vec!["t", "j", "ɯ"]);
+        // inside a multi-mora string, and with a 長音符 that must add no phone
+        assert_eq!(phones("てゅーん"), vec!["t", "j", "ɯ", "ɴ"]);
+        // a sustain after it must carry the SWAPPED vowel (ɯ), not the base's e
+        let arr = build_arrays(&[("てゅ", 60, 80), ("ー", 60, 80)]).unwrap();
+        assert_eq!(arr.phon, vec!["t", "j", "ɯ", "ɯ"], "sustain re-emits the small-ya vowel");
+    }
+
+    /// ★ THE order trap this rule could most easily cause (S86 and S98 both flagged it in advance):
+    /// run it before the kana table and every ordinary 拗音 resolves compositionally instead of from
+    /// its MEASURED single token — きゃ would become [k j a] rather than [c a]. Two independent guards
+    /// are pinned here: the rule itself refuses table-owned strings, and the resolved answer is still
+    /// the table's. The `assert_ne!` is what keeps this test from being vacuous (S92p): it proves the
+    /// two arms really do disagree, so a regression cannot pass by making them coincide.
+    #[test]
+    fn small_ya_never_steals_a_real_yoon_row() {
+        assert_ne!(phones("きゃ"), vec!["k", "j", "a"], "compositional answer must NOT win here");
+        let mut yoon = 0usize;
+        for (base, _) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            for sy in ['ゃ', 'ゅ', 'ょ'] {
+                let s = format!("{base}{sy}");
+                if let Some(&romaji) = kana_map().get(s.as_str()) {
+                    yoon += 1;
+                    assert!(small_ya_kana_phones(&s).is_none(), "{s} is a table row — the rule must refuse it");
+                    // and the engine still answers with the table's measured token
+                    assert_eq!(phones(&s), r2ipa_map()[romaji].to_vec(), "{s} drifted off the table");
+                }
+            }
+        }
+        assert!(yoon >= 33, "sweep actually covered the 拗音 rows (got {yoon})");
+    }
+
+    /// Vocabulary + training-exposure safety for the new rule. The vocab CONTAINS single palatalized
+    /// tokens (`tʲ` id 142, `dʲ` 141, …) that would spell てゅ in two phones instead of three — and
+    /// they are exactly the wrong answer: `score2cv_dur_priors.rs` measures every one of them at
+    /// `onset n=0, coda n=0` (they are in the 210-token vocab for Russian/Korean, neither of which is
+    /// in the final training split). Pinning it here means a later "tidy-up" toward the shorter
+    /// spelling has to delete this assert and read why.
+    #[test]
+    fn small_ya_emits_only_well_trained_vocab() {
+        let ids = phone_to_id_map();
+        const ZERO_EXPOSURE: &[&str] = &["tʲ", "dʲ", "vʲ", "fʲ", "sʲ", "zʲ", "rʲ", "tsʲ"];
+        let mut combos = 0usize;
+        for (base, _) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            for sy in ['ゃ', 'ゅ', 'ょ'] {
+                let s = format!("{base}{sy}");
+                let Some(v) = small_ya_kana_phones(&s) else { continue };
+                combos += 1;
+                assert_eq!(v.last(), Some(&["a", "ɯ", "o"][['ゃ', 'ゅ', 'ょ'].iter().position(|&c| c == sy).unwrap()]));
+                for p in &v {
+                    assert!(ids.contains_key(p), "{s} emitted out-of-vocab phone {p}");
+                    assert!(!ZERO_EXPOSURE.contains(p), "{s} emitted zero-training-exposure token {p}");
+                }
+            }
+        }
+        assert!(combos > 30, "sweep actually exercised the rule (got {combos})");
     }
 
     #[test]

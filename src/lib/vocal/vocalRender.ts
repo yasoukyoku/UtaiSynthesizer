@@ -598,8 +598,18 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  drive intervocalic cuts (candle/window/kidney/sadness/husband/always-class splits move — see
  *  EN_ONSET_MIN_VOTES in g2p.rs), plus the en.tsv regeneration knives of the same session (word-final
  *  -en IH0→AH0 consistency, curated primary flips). One bump covers the batch: any EN bake from
- *  before it must re-render to pick the new phones up. */
-export const G2P_ALGO_VERSION = "s94";
+ *  before it must re-render to pick the new phones up.
+ *  s99 = the known-target dictionary batch. ONE stamp covers every knife in it (each is its own
+ *  commit, but they ship together and a second bump would only force a second full re-render):
+ *    · JA 「base + small ゃゅょ」 rows the kana chart has no romaji for — てゅ/でゅ/ふゅ/ゔゅ and the
+ *      ゃ/ょ members — used to be SILENTLY TRUNCATED to the base mora (てゅ sang [t e]).
+ *  ⚠ Why this one needs a bump although S95's fragment merge did not: S95's no-bump argument rested
+ *  entirely on "every affected note ERRORED before the pass, so any bake it holds is already
+ *  sig-dirty". That does not transfer here — the old behaviour was a silent SUCCESS, so a project
+ *  containing てゅ can be holding a signature-CLEAN bake of the wrong sound, and without a bump its
+ *  owner would never hear the fix. (S98's handover note claimed this knife needed no bump by citing
+ *  S95; that citation is wrong and this is the correction.) */
+export const G2P_ALGO_VERSION = "s99";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
