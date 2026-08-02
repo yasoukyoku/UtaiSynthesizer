@@ -1050,10 +1050,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
             toks[k] == Tok::Word
                 && score[k].lang == Lang::Zh
                 && score[k].phoneme_input.is_none()
-                && {
-                    let mut cs = score[k].lyric.trim().chars();
-                    matches!((cs.next(), cs.next()), (Some(c), None) if zh.is_hanzi(c))
-                }
+                && zh_lyric_hanzi(zh, score[k].lyric).is_some()
         };
         let transparent = |k: usize| matches!(toks[k], Tok::Hold | Tok::Next | Tok::Rest | Tok::Breath);
         let mut i = 0;
@@ -1075,7 +1072,14 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                     break;
                 }
             }
-            let chars: Vec<char> = idx.iter().map(|&k| score[k].lyric.trim().chars().next().unwrap()).collect();
+            // same resolver as the window scan above — a second, subtly different reading of "which
+            // char is this note" is exactly how a phrase window would silently mis-assign syllables
+            let chars: Vec<char> = idx
+                .iter()
+                .map(|&k| {
+                    zh_lyric_hanzi(zh, score[k].lyric).expect("is_plain_hanzi already proved this resolves")
+                })
+                .collect();
             let mut pos = 0usize;
             while pos < chars.len() {
                 let maxw = zh.max_phrase.min(chars.len() - pos);
@@ -1406,13 +1410,15 @@ fn resolve_east_word(
         }
         _ => {
             let zh = dicts.zh()?;
-            let syl: String = match (evt.phoneme_input, zh_phrase_syl) {
-                (Some(pi), _) => pi.trim().to_lowercase(),
-                (None, Some(s)) => s.to_string(),
-                // not a plain hanzi: try the lyric itself as a bare pinyin syllable
-                (None, None) => evt.lyric.trim().to_lowercase(),
+            let trad = match (evt.phoneme_input, zh_phrase_syl) {
+                // an explicit override is taken at face value — the user typed the syllable itself
+                (Some(pi), _) => zh.syllable_phones(&pi.trim().to_lowercase()),
+                (None, Some(s)) => zh.syllable_phones(s),
+                // not a plain hanzi: try the lyric as a bare pinyin syllable, through the SAME ladder
+                // (S99 — 「hao,」 was OOV where 「Love,」 was not)
+                (None, None) => lookup_candidates(evt.lyric).iter().find_map(|c| zh.syllable_phones(c)),
             };
-            let Some(trad) = zh.syllable_phones(&syl) else { return Ok(None) };
+            let Some(trad) = trad else { return Ok(None) };
             Ok(stage2(Lang::Zh, &trad).ok())
         }
     }
@@ -1424,6 +1430,27 @@ fn resolve_east_word(
 /// ONE source, so ja can never drift from en/de/fr/es/it on what counts as "the same lyric". Required
 /// in the same round as `kana_tokenize`: `か、` used to "work" only because the old truncating fallback
 /// silently ate the 、, and the tokenizer (correctly) refuses to consume it.
+/// ZH word lyric → the single hanzi it stands for, through the SAME faithful-first tolerance ladder
+/// (`lookup_candidates`) that `ja_word_phones` and `WordDict::lookup_faithful` already consume.
+///
+/// S99 (S86#8-2): zh was the ONE language left out of that ladder, so a pasted 「我，」 was a hard OOV
+/// and aborted the whole render, while 「Love,」 and 「か、」 resolved fine — six languages tolerated
+/// trailing punctuation and Chinese did not. Returning the RESOLVED char (not a bool) is what lets the
+/// phrase-context pass use it too: the window scan and the char extraction must agree on what a note
+/// "is", and before this they were two separate `lyric.trim().chars()` expressions.
+///
+/// Faithful-first is preserved by construction: the raw spelling is candidate #0, so a lyric that
+/// really is a bare hanzi never consults a trimmed rung.
+fn zh_lyric_hanzi(zh: &ZhDict, lyric: &str) -> Option<char> {
+    lookup_candidates(lyric).iter().find_map(|cand| {
+        let mut cs = cand.chars();
+        match (cs.next(), cs.next()) {
+            (Some(c), None) if zh.is_hanzi(c) => Some(c),
+            _ => None,
+        }
+    })
+}
+
 fn ja_word_phones(token: &str) -> Option<Vec<&'static str>> {
     lookup_candidates(token).iter().find_map(|cand| match classify_lyric_ja(&fold_katakana(cand)) {
         LyricClass::Phones { phones } => Some(phones),
@@ -2165,6 +2192,40 @@ mod tests {
         let score3 = [evt("zhi", Lang::Zh)];
         let r3 = resolve_score(&score3, &f).unwrap();
         assert_eq!(phones_of(&r3[0]), vec!["ʈʂ", "ɻ̩"]);
+    }
+
+    /// S99 (S86#8-2): zh was the ONE language left out of the `lookup_candidates` tolerance ladder —
+    /// 「Love,」 and 「か、」 resolved, 「长,」 was a hard OOV that aborted the whole render.
+    #[test]
+    fn zh_tolerates_trailing_punctuation_like_every_other_language() {
+        let f = fixtures();
+        // the thing that must not come back (non-vacuity: prove the two arms really differ pre-fix)
+        assert!(
+            !matches!(classify_score(&[evt("长，", Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown),
+            "a punctuated hanzi is still being marked OOV"
+        );
+        for (punctuated, bare) in [("长，", "长"), ("大。", "大"), ("解！", "解"), ("之…", "之"), ("「长」", "长")] {
+            let a = resolve_score(&[evt(punctuated, Lang::Zh)], &f).unwrap();
+            let b = resolve_score(&[evt(bare, Lang::Zh)], &f).unwrap();
+            assert_eq!(phones_of(&a[0]), phones_of(&b[0]), "{punctuated} ≠ {bare}");
+        }
+        // bare pinyin gets the same courtesy
+        assert_eq!(
+            phones_of(&resolve_score(&[evt("zhi,", Lang::Zh)], &f).unwrap()[0]),
+            vec!["ʈʂ", "ɻ̩"]
+        );
+        // ★ and the punctuated note now PARTICIPATES in phrase context instead of breaking the window:
+        // 了 must read liǎo in 「了，|解」 exactly as it does in 「了|解」. (Before the fix the first note
+        // was OOV, so any bake such a segment holds is necessarily already dirty — no extra bump owed.)
+        let r = resolve_score(&[evt("了，", Lang::Zh), evt("解", Lang::Zh)], &f).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["l", "iaʊ"], "phrase context must cross the punctuation");
+        // …and what must STAY loud: punctuation alone, and more than one hanzi on one note
+        for bad in ["，", "。", "长大", "长，大"] {
+            assert!(
+                matches!(classify_score(&[evt(bad, Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown),
+                "{bad} must stay OOV — the ladder trims EDGES, it never invents a reading"
+            );
+        }
     }
 
     // ── zh sustain re-emits the FINAL (whole final token, coda included — it is atomic in the vocab) ──

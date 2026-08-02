@@ -331,7 +331,29 @@ export function splitLyricTokens(s: string, emptyFallback: string): string[] {
   //  (the prefix class EXCLUDES brackets so the two halves can never overlap — that keeps the match
   //   linear; the obvious `\S*[[［]` form backtracks quadratically on a paste full of `[`)
   if (/\s/.test(s)) return s.match(/[^\s[［]*[[［][^\]］]*[\]］](?!\S)|\S+/g) ?? [emptyFallback];
-  if (/^[\p{Script=Han}]+$/u.test(s)) return [...s];
+  // A Han run may carry PUNCTUATION — a pasted lyric line is 「我，你好」, not 「我你好」. S99: splitting
+  // only the pure-Han case left the punctuated line as ONE token = one note = a hard OOV, while the
+  // western path has always kept punctuation attached to its word (`Love,` `world`) and let Rust's
+  // tolerance ladder (`lookup_candidates`) trim it. Same shape here, so the two halves of S86#8-2 meet:
+  // split per hanzi, a trailing non-Han character rides on the token before it, and a LEADING one rides
+  // on the token after it (otherwise 「「我们」」 would mint a lone 「「」 note that can only ever be red).
+  // Guard = contains a hanzi AND every non-Han character is punctuation/symbol, so `我love`, `我123`
+  // and a phonetic hint like `我[kae]` all stay on the old one-token path.
+  if (/\p{Script=Han}/u.test(s) && !/[\p{L}\p{N}]/u.test(s.replace(/\p{Script=Han}/gu, ""))) {
+    const out: string[] = [];
+    let lead = "";
+    for (const ch of s) {
+      if (/\p{Script=Han}/u.test(ch)) {
+        out.push(lead + ch);
+        lead = "";
+      } else if (out.length > 0) {
+        out[out.length - 1] += ch;
+      } else {
+        lead += ch;
+      }
+    }
+    return out.length ? out : [s];
+  }
   const isKana = /^[぀-ヿ゠-ヿー]+$/.test(s);
   if (!isKana) return [s];
   const out: string[] = [];

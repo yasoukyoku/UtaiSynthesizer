@@ -138,4 +138,27 @@ describe("splitLyricTokens — whole-phrase distribution", () => {
   it("all-whitespace: `match` yields null, so the fallback token appears (commitLyric maps both to the default)", () => {
     expect(splitLyricTokens("   ", "あ")).toEqual(["あ"]); // the old split() gave [] — same note in the end
   });
+
+  // S99 (S86#8-2, the frontend half) — a pasted Chinese line carries punctuation. Before this it failed
+  // the pure-Han test and became ONE token: one note, one hard OOV, for an entirely ordinary paste.
+  it("★ a Han run with punctuation still splits per hanzi — punctuation rides on a neighbour", () => {
+    expect(splitLyricTokens("我，你好", "啊")).toEqual(["我，", "你", "好"]);
+    expect(splitLyricTokens("好！", "啊")).toEqual(["好！"]);
+    // a LEADING mark joins the token after it, so an opening quote cannot mint a note that is only ever red
+    expect(splitLyricTokens("「我们」", "啊")).toEqual(["「我", "们」"]);
+    expect(splitLyricTokens("我。你，好？", "啊")).toEqual(["我。", "你，", "好？"]);
+    // …and the Rust side is what turns those back into bare hanzi (`lookup_candidates`, g2p.rs) — this
+    // splitter stays a splitter and never strips anything, so nothing is lost if the ladder changes.
+  });
+
+  it("…but a Han run mixed with LETTERS or DIGITS is left alone (one token, as before)", () => {
+    // the guard is "every non-Han char is punctuation" — these must not start splitting per hanzi
+    expect(splitLyricTokens("我love", "啊")).toEqual(["我love"]);
+    expect(splitLyricTokens("我123", "啊")).toEqual(["我123"]);
+    expect(splitLyricTokens("我[kae]", "啊")).toEqual(["我[kae]"]); // a hint-shaped token stays whole
+    expect(splitLyricTokens("長大", "啊")).toEqual(["長", "大"]); // pure Han unchanged (pre-S99 anchor)
+    expect(splitLyricTokens("beautiful", "啊")).toEqual(["beautiful"]);
+    expect(splitLyricTokens("きゃっと", "啊")).toEqual(["きゃっ", "と"]); // kana path untouched
+    expect(splitLyricTokens("Love, world", "啊")).toEqual(["Love,", "world"]); // western shape this mirrors
+  });
 });
