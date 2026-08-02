@@ -785,8 +785,24 @@ fn allocate_in_note(
         // outermost member its FULL target first inverted the cluster's internal ratio whenever the
         // budget was tight. The user's own `dears` [d ɪ ɹ z]@21fr: budget = 21*2/5 = 8, z took its
         // full 6 and ɹ was left at the 2-frame floor — while the language-specific reference
-        // distribution (score2cv_audit_ref.rs) puts a real long-note en ɹ coda at p50=16 vs z p50=6:
+        // distribution (score2cv_audit_ref.rs) puts a long-note en ɹ coda at p50=16 vs z p50=6:
         // the ratio was UPSIDE-DOWN (the r-colour is most of what the listener hears in "-ears").
+        //
+        // ★★S98 — WHICH reference said 16 matters, and the answer is now on the record.
+        // That p50=16 is the `t_*` (TRAINING) column: our own aligner + realign_mindur's DP floor.
+        // The dataset's OWN annotation (`h_*`, added S98) says en ɹ coda long-bucket p50 = **5**
+        // (n=2603) against z p50 = 6 — i.e. on the human surface the ratio is NOT upside-down, it is
+        // roughly even. The same signature is now visible in French (fr ʁ coda long: train p50=15 vs
+        // human p50=7), which is exactly the cross-language rhotic-boundary artefact S97 traced to
+        // our aligner sitting 231-270 ms early on rhotics.
+        // ⚠ This is NOT a licence to flip the split. Two facts point the other way and neither is
+        // settled: (a) the content model was TRAINED on the `t_*` label convention, so feeding it our
+        // own convention may well be what makes it render correctly — S97 declined to revert S92n for
+        // this reason; (b) the user's ear on this very word asked for MORE r ("dear 的 /r/ 出不来"),
+        // which the current 6:2 delivers. The weight itself comes from `coda_share_weight` ->
+        // PHONE_DUR_PRIORS, which is still wholly on the training surface.
+        // ⇒ Deliberately UNCHANGED this round. Re-deciding it needs its own round: regenerate the
+        // priors on both surfaces, A/B render, and an ear pass. Booked in pending_cleanups.
         // Proportional split gives ɹ6/z2 out of the SAME 8 — zero-sum inside the budget; the nucleus
         // keeps exactly the frames it kept before, and the S92 cluster minima are unchanged (every
         // member that lives still gets ≥ CODA_MIN_FRAMES; `means` n2/z4 and `don't` n2/t2 come out

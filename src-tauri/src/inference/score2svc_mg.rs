@@ -405,11 +405,20 @@ fn mg_audit() {
     eprintln!("[mg-audit] -> {}", out.display());
 }
 
-/// S92m 反投影对拍:**同一批音符、同一串音素 —— 真人给了几帧 / 我们给了几帧**,逐音素,零主观。
+/// S92m 反投影对拍:**同一批音符、同一串音素 —— 参照给了几帧 / 我们给了几帧**,逐音素,零主观。
 ///
 /// 用户手上没有真的快歌谱,而「我编一首」不能用来做听感判决。这条路绕开了那个问题:谱面是合成的,
-/// **真值是那位歌手本人的对齐结果**;它不判听感,只做**覆盖** —— 补上「短音符/快段」这块用户唯一
-/// 缺的取样面(反投影谱短音桶占 31.8%,用户那首歌只有 4.4%)。
+/// 真值来自那位歌手这一句的标注;它不判听感,只做**覆盖** —— 补上「短音符/快段」这块用户唯一
+/// 缺的取样面(反投影谱短音桶占 17-33%,用户那首歌只有 4.4%)。
+///
+/// ★★★S98 —— **真值面是哪一个,决定了这些数字能不能叫「真人」**,所以它现在必须随产物走。
+/// 旧产物的 truth 列其实是 `npz.phone_dur` = 我们自己的对齐器(五个西语系语料还额外压过
+/// `realign_mindur.py` 的 DVOW=DCONS=3 地板)⇒ 那时这台仪器是在拿我们跟我们自己比,而每一行
+/// 都印着「真人」。`gen_reverse_score.py` 现在把 `_surface` 写进 truth.json:
+///   `upstream` = 数据集自带标注,没经过我们任何一行对齐代码 ⇒ 可以叫「真人」;
+///   `training` = 我们的对齐器 + 地板 ⇒ **本函数会把标签换成「训练面」**,别再误读。
+/// 没有该字段的旧产物一律按 `training` 读(那就是它们的真实身份)。
+/// ⚠ ja / zh 今天**没有**上游面,生成器会直接拒绝出 `upstream` 产物。
 ///
 /// ⚠**诚实边界**:①英语训练语料本身就不快(最快乐句的音符中位也才 7 帧),所以这是「我们能拿到的
 /// 最快的真人英语」,不是「真快歌」;②真人的音符分组里 20% 含多个音节,而我们的分配器把一个音符
@@ -438,6 +447,17 @@ fn mg_truth_cmp() {
     let tv: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&tp).unwrap()).unwrap();
     let truth = tv["truth"].as_array().unwrap();
     assert_eq!(truth.len(), sj.triples.len(), "真值与谱面的事件数不一致 —— 不是同一份反投影");
+    // ★S98:真值面身份。缺字段的旧产物 = training(那就是它们的真实身份,不是「未知」)。
+    let surface = tv["_surface"].as_str().unwrap_or("training");
+    let who = if surface == "upstream" { "真人" } else { "训练面" };
+    eprintln!(
+        "[truth] surface={surface} ⇒ 下面所有标着「{who}」的列都来自{}",
+        if surface == "upstream" {
+            "数据集自带标注(没经过我们的对齐器)"
+        } else {
+            "**我们自己的强制对齐 + min-dur 地板** —— 不是真人,别拿它论证任何地板"
+        }
+    );
 
     // 逐事件收集实发(与审计件同一条对齐规则:实发是期望的子序列)。S96:同步累加 wire 游标,
     // 每条实发多带自己的绝对起始帧 —— 拍点轴要的落点在生产里没有显式字段,只由顺序+时长隐式决定,
@@ -530,14 +550,14 @@ fn mg_truth_cmp() {
         let short = s.iter().filter(|p| p.3 < p.2).count();
         let much = s.iter().filter(|p| p.3 * 5 < p.2 * 3).count();
         eprintln!(
-            "  {label:<10} n={:<5} 差中位 {:>+3}  比真人短 {:>3.0}%  短过 40% 的 {:>3.0}%",
+            "  {label:<10} n={:<5} 差中位 {:>+3}  比{who}短 {:>3.0}%  短过 40% 的 {:>3.0}%",
             s.len(), d[d.len() / 2], 100.0 * short as f64 / s.len() as f64,
             100.0 * much as f64 / s.len() as f64
         );
     };
     eprintln!("[mg-truth] 对拍 {} 个音素,我们丢掉 {}", pairs.len(), dropped.len());
     for (k, t, sd) in dropped.iter().take(8) {
-        eprintln!("   丢音 evt {k} {t} —— 真人给了 {sd} 帧");
+        eprintln!("   丢音 evt {k} {t} —— {who}给了 {sd} 帧");
     }
     stat("全部", &|_| true);
     for p in ["onset", "medial", "nucleus", "coda"] {
@@ -556,10 +576,10 @@ fn mg_truth_cmp() {
     rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     eprintln!("  ── 最系统性的偏差 ──");
     for (m, t, pos, n) in rows.iter().take(6) {
-        eprintln!("   {t:<4} {pos:<8} 平均比真人短 {:>4.1} 帧 (n={n})", -m);
+        eprintln!("   {t:<4} {pos:<8} 平均比{who}短 {:>4.1} 帧 (n={n})", -m);
     }
     for (m, t, pos, n) in rows.iter().rev().take(3) {
-        eprintln!("   {t:<4} {pos:<8} 平均比真人长 {m:>4.1} 帧 (n={n})");
+        eprintln!("   {t:<4} {pos:<8} 平均比{who}长 {m:>4.1} 帧 (n={n})");
     }
 
     // ── S96 拍点轴:首核落点 真人 vs 我们(口径见头注;差 = 我们 − 真人,正 = 我们更晚)──
@@ -576,14 +596,14 @@ fn mg_truth_cmp() {
         let mut lead: Vec<i64> = s.iter().map(|b| b.4).collect();
         lead.sort_unstable();
         eprintln!(
-            "  {label:<14} n={:<4} 真人首核偏移 p50={:>2}  差(我−真) p25/p50/p75 = {:>+3}/{:>+3}/{:>+3}  |差|≤1 {:>3.0}%  首音素先行 p50={:>+3}",
+            "  {label:<14} n={:<4} {who}首核偏移 p50={:>2}  差(我−参照) p25/p50/p75 = {:>+3}/{:>+3}/{:>+3}  |差|≤1 {:>3.0}%  首音素先行 p50={:>+3}",
             s.len(), troff[troff.len() / 2],
             d[d.len() / 4], d[d.len() / 2], d[3 * d.len() / 4],
             100.0 * within1 as f64 / s.len() as f64,
             lead[lead.len() / 2],
         );
     };
-    eprintln!("  ── S96 拍点轴(首核起点 − 音符边界;真人=组内 cumsum,我们=wire 游标)──");
+    eprintln!("  ── S96 拍点轴(首核起点 − 音符边界;{who}=组内 cumsum,我们=wire 游标)──");
     // ★S96d (review): the sample EXCLUDES notes whose first phone or first nucleus we dropped —
     // and those are exactly the most-compressed notes, i.e. the ones most likely to attack early.
     // Printing the exclusion inline stops the next reader from taking the medians as complete
@@ -605,7 +625,7 @@ fn mg_truth_cmp() {
     eprintln!("  ── 拍点差最大的音符 ──");
     for b in worst.iter().take(6) {
         eprintln!(
-            "   evt {:<4} {} 真人 +{} 我们 {:+} (差 {:+}) 先行 {:+}",
+            "   evt {:<4} {} {who} +{} 我们 {:+} (差 {:+}) 先行 {:+}",
             b.0,
             if b.1 { "句首" } else { "句中" },
             b.2, b.3, b.3 - b.2, b.4

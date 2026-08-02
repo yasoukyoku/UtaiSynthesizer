@@ -68,13 +68,24 @@ pub(crate) enum Kind {
     BelowTrainingFloor,
     /// 核落进 S84 实测的 2 帧 cv/decoder 塌陷区。
     NucleusCollapse,
-    /// ★★**出了真人的分布** —— 这个音素的时长低于真人歌手在同一格(语言 × 音素 × 音节位置 ×
-    /// 音符长度桶)里的 **p05**。参照来自 `score2cv_audit_ref.rs`(与时长目标同一批录音)。
+    /// ★★**出了参照分布** —— 这个音素的时长低于同一格(语言 × 音素 × 音节位置 × 音符长度桶)
+    /// 参照的 **p05**。参照来自 `score2cv_audit_ref.rs`。
     ///
     /// 这是仪器**发现未知问题**的那一半:上面五条轴都在问「我们有没有做到自己定的目标」,只有这条
-    /// 在问「**我们和真人到底像不像**」。S92 那批根因全是这么挖出来的(「真英语数据 0/5608 个辅音
-    /// 短于 3 帧,而我们 41%」),它把那种一次性的手工比对变成常驻的。
-    /// ⚠ 每条都带 `n=样本量` —— **没有样本量的偏离度不可读**(`ʒ` 全量英语训练数据只有约 14 秒,
+    /// 在问「**我们和参照到底像不像**」。
+    ///
+    /// ★★★S98 —— 这条轴此前一直在拿我们和**我们自己**比,必须讲清楚。参照表现在有两列:
+    ///   `h_*` = 数据集**自带标注**(没经过我们任何一行对齐代码)⇒ 才配叫「真人」;
+    ///   `t_*` = 模型**训练时见到的**标注 = 我们的对齐器 + `realign_mindur.py` 的 DVOW=DCONS=3 地板。
+    /// 旧版只有后者,而在它上面,非核格子 p05 **恰好等于 3** 的比例是 fr 100.0% · es 99.1% ·
+    /// de 99.0% · en 96.1% · it 83.8% —— 也就是说这条轴在这五门语言上**结构性地**退化成了
+    /// `BelowTrainingFloor` 的复制品:3 帧与真人真实下界之间的整段区间它一格也看不见。
+    /// 现在优先读 `h_*`;只有该格没有真人列(今天的 ja / zh,见下)才退回 `t_*`,并且**换话术**
+    /// (`ref_human == false` ⇒ 打印成「训练面」而不是「真人」)。
+    /// ⚠ ja / zh 今天**没有上游面**:它们没被打地板(实测辅音 <3 帧占 12-33%),但仍是 HubertFA
+    /// 强制对齐的产物,**不是真人标注**。补它们要各自的上游面(ja lab 的 mono_label/*.lab;
+    /// m4singer 自带标注),已挂账。
+    /// ⚠ 每条都带 `n=样本量` —— **没有样本量的偏离度不可读**(`ʒ` 全量英语训练数据只有约 3 秒,
     /// 报它「出格」毫无意义,那是数据枯竭不是缺陷)。样本不足的格子**不发参照**,于是「没量过」
     /// 与「量过没问题」永远分得开。
     OutOfDistribution,
@@ -137,8 +148,12 @@ pub(crate) struct Finding {
     /// 只显示一个,读数的人无从判断查表查得对不对。
     pub group_frames: i64,
     /// 只对 `OutOfDistribution` 有意义:这一格参照的**观测样本量**。0 = 与分布无关的其它类。
-    /// **必须随判决一起显示** —— 没有样本量的偏离度不可读(`ʒ` 全量英语只有约 14 秒)。
+    /// **必须随判决一起显示** —— 没有样本量的偏离度不可读(`ʒ` 全量英语只有约 3 秒)。
     pub ref_count: i64,
+    /// 只对 `OutOfDistribution` 有意义:这条判决用的参照是**数据集自带标注**(true)还是
+    /// **我们自己的强制对齐**(false)。S98 之前只有后者却被一路称作「真人」,那是本仓最贵的
+    /// 一次循环论证。**false 时任何输出都不许出现「真人」二字。**
+    pub ref_human: bool,
 }
 
 impl Finding {
@@ -251,18 +266,27 @@ impl Report {
                 f.note_frames, f.actual, f.target_effective, f.target_measured, f.deficit(),
                 if f.score_forced { "谱短 " } else { "" },
                 // ★样本量与判决同行 —— 没有它,偏离度不可读。
-                if f.ref_count > 0 { format!("[真人 p05={} p50={} n={}]", f.target_effective, f.target_measured, f.ref_count) } else { String::new() },
+                // ★★参照的**来源面**也必须同行:`训练面` 是我们自己的对齐器,叫它「真人」正是
+                //   S98 修掉的那个循环论证。
+                if f.ref_count > 0 {
+                    format!("[{} p05={} p50={} n={}]",
+                        if f.ref_human { "真人" } else { "训练面" },
+                        f.target_effective, f.target_measured, f.ref_count)
+                } else { String::new() },
             );
         }
         s
     }
 }
 
-/// 查真人分布参照:先查这门语言自己的格子,没有(或样本不足,生成器根本不发)就退到跨语言池化格。
+/// 查分布参照:先查这门语言自己的格子,没有(或样本不足,生成器根本不发)就退到跨语言池化格。
 /// 两条都没有 ⇒ `None` = **没量过**,与「量过没问题」严格区分 —— 审计件不对没参照的格子下判决。
 ///
-/// ⚠ 桶键必须是 **note group 总帧**(`ScoreArrays.note_dur`),因为参照表就是按那个口径量的;
-/// 拿单音符帧数去查是另一个口径(那正是队列 B 项的不一致,别在这里再制造一次)。
+/// ⚠⚠ **已知口径不一致(挂账,不是本轮引入)**:参照表是按 **note group 总帧**量的,而这里传进来
+/// 的是**单音符**帧数(`evt.frames`)。调用点有一整段注释说明为什么故意这么选(桶键不控制密度,
+/// 生产的 note group 会把整段同音高音符并成一组)。两个口径在**多音符组**上确实不同。
+/// 此前本函数的文档写的是相反的话(「必须用 `note_dur`」),与调用点自相矛盾 —— S98 就地更正为
+/// 描述**事实**;要不要统一口径是独立一轮的决定,别在这里顺手改(改了会换掉哪些格子会开火)。
 fn dist_cell(lang: &str, token: &str, position: Position, group_frames: i64) -> Option<&'static ref_tbl::DurCell> {
     let bucket = if group_frames <= 7 {
         0u8
@@ -283,6 +307,20 @@ fn dist_cell(lang: &str, token: &str, position: Position, group_frames: i64) -> 
             .find(|c| c.lang == lg && c.token == token && c.position == pos && c.bucket == bucket)
     };
     find(lang).or_else(|| find(""))
+}
+
+/// 一格里**可用的最强参照** → `(p05, p50, n, 是不是真人)`。
+///
+/// ★S98 的单一收口:优先用数据集自带标注(`h_*`),它没经过我们任何一行对齐代码;该格没有真人列
+/// (`h_count == 0`,今天的 ja / zh)才退回训练列(`t_*` = 我们的对齐器 + min-dur 地板),
+/// **并把 `false` 一路带到输出**,免得再有人把我们自己的对齐叫成「真人」。
+/// ⚠ 这里**不做**「两列取小/取大」之类的合并 —— 两列回答的是两个不同的问题,混起来正是要修的病。
+fn dist_ref(cell: &ref_tbl::DurCell) -> (i64, i64, i64, bool) {
+    if cell.has_human() {
+        (cell.h_p05, cell.h_p50, cell.h_count, true)
+    } else {
+        (cell.t_p05, cell.t_p50, cell.t_count, false)
+    }
 }
 
 /// 训练语料里辅音的最短时长 —— **单一真源在生产侧**,这里只转发。
@@ -450,6 +488,7 @@ pub(crate) fn audit(
             score_forced,
             group_frames: 0,
             ref_count: 0,
+            ref_human: false,
         };
 
         let expectation = expectation(res, prev_sung, prev_pitch, evt.note_num);
@@ -558,9 +597,10 @@ pub(crate) fn audit(
                     if position == Position::Nucleus && actual <= CODA_MIN_FRAMES && !held {
                         findings.push(mk(Kind::NucleusCollapse, p, position, actual, eff, -1));
                     }
-                    // ★与真人分布对拍 —— 仪器**发现未知问题**的那一半。桶键走生产自己的
-                    //   note group 分组(`note_dur`),与参照表同口径。
+                    // ★与参照分布对拍 —— 仪器**发现未知问题**的那一半。
                     // ★桶键 = **这个音符自己的帧数**,不是 `note_dur` 的音符组。
+                    //   (上一行原本还写着「桶键走 note_dur,与参照表同口径」,与下面这段自相矛盾,
+                    //   S98 删掉;真实情况见 `dist_cell` 的文档 —— 口径确实不一致,是挂账项。)
                     //   实测走过一次弯路:生产的 `note_dur` 把整段同音高音符并成一组(日文快歌里
                     //   一个 4 帧的「さ」报出 86 帧的组),而训练数据的分组**同样会合并**(20% 的组
                     //   含 2 个以上的核,最长 252 帧)⇒ 桶键根本不控制**密度**:同样 86 帧,可能是
@@ -569,10 +609,14 @@ pub(crate) fn audit(
                     if let Some(cell) =
                         dist_cell(res.run_lang.code(), p, position, evt.frames)
                     {
-                        if actual < cell.p05 {
+                        // ★S98:参照值走 `dist_ref` 这个单一收口 —— 有真人列就用真人列,没有就用
+                        //   训练列并把 `ref_human=false` 带下去(输出里换话术)。
+                        let (r_p05, r_p50, r_n, r_human) = dist_ref(cell);
+                        if actual < r_p05 {
                             let mut f =
-                                mk(Kind::OutOfDistribution, p, position, actual, cell.p05, cell.p50);
-                            f.ref_count = cell.count;
+                                mk(Kind::OutOfDistribution, p, position, actual, r_p05, r_p50);
+                            f.ref_count = r_n;
+                            f.ref_human = r_human;
                             f.group_frames = arr.note_dur[got[gi - 1].0];
                             // ★可负担性判据 —— 桶很宽(≤7 帧是一档),拿一个 3 帧音符的元音去比
                             //   「真人在这一档里的 p05=5」是不公平的:那个音符物理上就放不下 5 帧。
@@ -581,7 +625,7 @@ pub(crate) fn audit(
                             //   ⚠ 仍然只是**分类**:这些条目一条不少地留在总表里,只是不进「可动」计数,
                             //   也不排在前面 —— 隐藏才会误导。
                             let others = (ph.len() as i64 - 1).max(0) * CODA_MIN_FRAMES;
-                            f.score_forced = evt.frames < cell.p05 + others;
+                            f.score_forced = evt.frames < r_p05 + others;
                             findings.push(f);
                         }
                     }
@@ -695,15 +739,22 @@ mod selfcheck {
         assert_eq!((f.phone, f.actual), ("s", 1));
         assert!(f.target_effective >= 4, "s 的长音桶目标是量出来的,不是 2");
 
-        // ★分布轴的阳性对照 —— 变异实测:没有这一条,把与真人分布的对拍**整个关掉**,
+        // ★分布轴的阳性对照 —— 变异实测:没有这一条,把与参照分布的对拍**整个关掉**,
         //   全套自检照样绿(别的测试只「允许」它出现,没有一条「要求」它出现)。
         let ood: Vec<_> = rep.of_kind(Kind::OutOfDistribution).collect();
-        assert_eq!(ood.len(), 1, "1 帧的 /s/ 必须被真人分布判为出格:\n{}", rep.render(20));
+        assert_eq!(ood.len(), 1, "1 帧的 /s/ 必须被参照分布判为出格:\n{}", rep.render(20));
         assert_eq!(ood[0].phone, "s");
         assert!(ood[0].ref_count >= 50, "判决必须带样本量");
+        // ★★S98:英语这一格现在读的是**数据集自带标注**,判决必须自报来源。
+        assert!(ood[0].ref_human, "en 有上游面 ⇒ 这条判决必须走真人列: {:?}", ood[0]);
+        // ⛔ 这里**曾经**断言 `target_effective >= TRAINING_CONSONANT_FLOOR`,理由写作「真英语 /s/
+        //    的 p05 不该低于训练管线下限 3」—— 那正是本仓最贵的一次循环论证:那个 3 就是
+        //    `realign_mindur.py` 的 DCONS 自己放上去的。上游标注实测 en /s/ 词首长桶 p05 = 2。
+        //    正确的不变量是「p05 必须是一个合法的正帧数且不超过 p50」,而**不是**「不低于我们
+        //    自己的地板」。
         assert!(
-            ood[0].target_effective >= TRAINING_CONSONANT_FLOOR,
-            "真英语 /s/ 的 p05 不该低于训练管线下限 3(参照表是不是没生成全?): {:?}", ood[0]
+            ood[0].target_effective >= 1 && ood[0].target_effective <= ood[0].target_measured,
+            "参照 p05 必须为正且不超过 p50: {:?}", ood[0]
         );
         // ★判别器:未被破坏的同一份分配里,`s` 拿到自己的目标 ⇒ 分布轴必须**沉默**。
         let clean = audit_score(&score, &d, ArticulationTiming::Auto).unwrap();
@@ -907,14 +958,31 @@ mod selfcheck {
             tbl::PHONE_TO_ID.iter().map(|(t, _)| *t).collect();
         let mut seen = std::collections::HashSet::new();
         let mut langs = std::collections::HashSet::new();
+        let mut human_langs = std::collections::HashSet::new();
         for c in D {
             assert!(seen.insert((c.lang, c.token, c.position, c.bucket)), "重复格 {c:?}");
             assert!(vocab.contains(c.token), "词表外的音素 {c:?}");
             assert!(c.position <= 3 && c.bucket <= 2, "位置/桶越界 {c:?}");
-            assert!(c.p05 <= c.p50 && c.p50 <= c.p95, "分位数不单调 {c:?}");
-            assert!(c.p05 >= 1, "时长下界必须为正 {c:?}");
-            assert!(c.count >= 50, "样本不足的格子不该被发出来(生成器该丢掉它) {c:?}");
+            // 每一列要么完整(单调 + 正 + 样本 ≥50),要么整列缺席(-1/-1/-1/0 = 没量过)。
+            // ⚠ 半列(有分位数没样本量,或反之)是最危险的形态:它看起来像参照,却不可读。
+            for (p05, p50, p95, n, tag) in [
+                (c.h_p05, c.h_p50, c.h_p95, c.h_count, "human"),
+                (c.t_p05, c.t_p50, c.t_p95, c.t_count, "train"),
+            ] {
+                if n == 0 {
+                    assert_eq!((p05, p50, p95), (-1, -1, -1), "{tag} 列缺席时分位数必须是 -1 {c:?}");
+                    continue;
+                }
+                assert!(p05 <= p50 && p50 <= p95, "{tag} 列分位数不单调 {c:?}");
+                assert!(p05 >= 1, "{tag} 列时长下界必须为正 {c:?}");
+                assert!(n >= 50, "{tag} 列样本不足的格子不该被发出来(生成器该丢掉它) {c:?}");
+            }
+            assert!(c.h_count > 0 || c.t_count > 0, "两列都缺席的格子根本不该出现 {c:?}");
+            assert_eq!(c.has_human(), c.h_count > 0, "has_human 与 h_count 不一致 {c:?}");
             langs.insert(c.lang);
+            if c.has_human() {
+                human_langs.insert(c.lang);
+            }
         }
         assert!(langs.contains(""), "缺跨语言池化兜底行");
         for lg in ["zh", "en", "ja"] {
@@ -923,6 +991,30 @@ mod selfcheck {
         // 核(元音)必须在表里 —— 目标表完全没有它们,这正是本表存在的理由之一。
         assert!(D.iter().any(|c| c.position == 2), "参照表没有核 ⇒ 元音轴无从判断");
         assert!(D.iter().any(|c| c.position == 1), "参照表没有 medial");
+
+        // ★★S98 的核心不变量,两条都必须钉死,否则「换面」会静默退回去。
+        // ① 有上游面的五门语言必须真的带真人列 —— 少一门就是生成器那半没跑成。
+        for lg in ["en", "de", "fr", "es", "it"] {
+            assert!(human_langs.contains(lg), "{lg} 一个真人列都没有 ⇒ 上游面没接上");
+        }
+        // ② ja / zh 今天**没有**上游面,必须诚实地缺席,不许拿训练列冒充 —— 一旦哪天补上了
+        //    它们自己的上游面(ja lab 的 .lab / m4singer 自带标注),这条会红,那时把它改掉。
+        for lg in ["ja", "zh"] {
+            assert!(
+                !human_langs.contains(lg),
+                "{lg} 冒出了真人列 —— 要么真补上了上游面(那就更新本断言),\
+                 要么有人把我们自己的对齐当成了真人标注"
+            );
+        }
+        // ③ 那个被反复引用的格子:en 词尾 `ɹ` 长音桶,训练面 p50 远大于真人面 —— 这正是
+        //    S97 追了一整轮的 rhotic 边界 artifact,钉住它,免得哪天悄悄换回单列。
+        let r = D.iter().find(|c| c.lang == "en" && c.token == "ɹ" && c.position == 3 && c.bucket == 2)
+            .expect("en/ɹ/coda/long 该有自有格");
+        assert!(r.has_human(), "en/ɹ/coda/long 必须有真人列");
+        assert!(
+            r.t_p50 >= r.h_p50 + 5,
+            "训练面与真人面在 en/ɹ 上的差距消失了 ⇒ 两列大概率被合并回一列了: {r:?}"
+        );
     }
 
     /// ★查表的回退与「没量过」必须分得开:本语言的格 → 池化格 → `None`。
@@ -938,10 +1030,37 @@ mod selfcheck {
         //   付账的语言」,池化行被中文主导,拿它判英语等于把要找的东西平均掉。
         let ja_a = dist_cell("ja", "a", Position::Nucleus, 10).expect("ja/a/nucleus/mid 该有自有格");
         assert_eq!(ja_a.lang, "ja", "回退顺序反了:本语言有格却用了池化行 {ja_a:?}");
-        assert!(ja_a.count >= 50);
-        // 一门参照表里没有自有格子的语言 ⇒ 落到池化行(而不是 None)
-        let de = dist_cell("de", "a", Position::Nucleus, 10);
-        assert!(de.is_some(), "缺池化兜底");
+        assert!(ja_a.t_count >= 50);
+        // ⛔ 这里**曾经**拿 `de/a/nucleus` 当「没有自有格子的语言」的例子并只断言 `is_some()` ——
+        //    而 `de` 的这一格一直存在(自有格),所以那条断言走的是**自有格分支**,池化兜底从来
+        //    没有被真正测过(S98 对抗审查抓出)。改成一个真正只有池化行的格子,并断言它落在池化行。
+        let pooled_only = ref_tbl::PHONE_DUR_DIST
+            .iter()
+            .find(|c| {
+                c.lang.is_empty()
+                    && !ref_tbl::PHONE_DUR_DIST.iter().any(|o| {
+                        o.lang == "de" && o.token == c.token
+                            && o.position == c.position && o.bucket == c.bucket
+                    })
+            })
+            .expect("找不到任何「de 没有、池化有」的格子 —— 换个语言重挑");
+        let frames = match pooled_only.bucket { 0 => 5, 1 => 10, _ => 20 };
+        let got = dist_cell(
+            "de", pooled_only.token,
+            match pooled_only.position { 0 => Position::Onset, 1 => Position::Medial,
+                                         2 => Position::Nucleus, _ => Position::Coda },
+            frames,
+        ).expect("缺池化兜底");
+        assert!(got.lang.is_empty(), "该走池化行却走了别的格 {got:?}");
+
+        // ★S98:`dist_ref` 的两条分支都要有阳性对照,否则「换面」可以被静默关掉。
+        let en_r = dist_cell("en", "ɹ", Position::Coda, 20).expect("en/ɹ/coda/long 该有自有格");
+        let (p05_h, p50_h, n_h, is_h) = dist_ref(en_r);
+        assert!(is_h && n_h >= 50, "en 该走真人列 {en_r:?}");
+        assert_eq!((p05_h, p50_h), (en_r.h_p05, en_r.h_p50), "真人分支取错列");
+        let (p05_t, p50_t, n_t, is_t) = dist_ref(ja_a);
+        assert!(!is_t && n_t >= 50, "ja 今天没有上游面 ⇒ 必须走训练列并自报 {ja_a:?}");
+        assert_eq!((p05_t, p50_t), (ja_a.t_p05, ja_a.t_p50), "训练分支取错列");
     }
 
     /// ★★MEDIAL 位置的目标必须来自**生产实际发出的分配**,而不是我手抄的公式 —— S92k 对抗审查
