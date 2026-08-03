@@ -1385,12 +1385,10 @@ static DICT_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 ///
 /// `OnceLock`: the dictionaries are `Box::leak`ed on first load and cannot change within a session,
 /// and `sync_bundled_dictionaries` has already run by the time any frontend command is served.
-#[tauri::command]
-pub fn dictionary_fingerprint(state: State<'_, Arc<AppState>>) -> String {
-    if let Some(v) = DICT_FINGERPRINT.get() {
-        return v.clone();
-    }
-    let dir = effective_data_root(&state).join("dictionaries");
+/// The fingerprint of ONE dictionary directory. Split out of the command so it is reachable without
+/// a running Tauri app — the S101 distribution test drives this exact function over a synthesized
+/// install tree, which is the only way to prove the carrier actually MOVES when the sync fires.
+pub fn dictionary_fingerprint_for(dir: &std::path::Path) -> String {
     let mut targets: Vec<String> = bundled_dictionary_targets()
         .iter()
         .filter_map(|t| std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().to_string()))
@@ -1407,9 +1405,17 @@ pub fn dictionary_fingerprint(state: State<'_, Arc<AppState>>) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(acc.as_bytes());
-    let full = format!("{:x}", hasher.finalize());
-    let short = full[..12].to_string();
-    tracing::info!("dictionary fingerprint {} over {} file(s) in {}", short, targets.len(), dir.display());
+    format!("{:x}", hasher.finalize())[..12].to_string()
+}
+
+#[tauri::command]
+pub fn dictionary_fingerprint(state: State<'_, Arc<AppState>>) -> String {
+    if let Some(v) = DICT_FINGERPRINT.get() {
+        return v.clone();
+    }
+    let dir = effective_data_root(&state).join("dictionaries");
+    let short = dictionary_fingerprint_for(&dir);
+    tracing::info!("dictionary fingerprint {} for {}", short, dir.display());
     DICT_FINGERPRINT.get_or_init(|| short).clone()
 }
 
