@@ -4205,6 +4205,87 @@ mod tests {
         assert_eq!(r2ipa_map().len(), tbl::R2IPA.len() + super::super::g2p_tables::R2IPA_EXTRA.len());
     }
 
+    /// S102 — JA kana coverage over the actual UNICODE BLOCKS, not over our own table.
+    ///
+    /// WHY THIS IS A DIFFERENT TEST FROM ALL THE OTHERS: every existing ja table test walks
+    /// `tbl::KANA` (+`KANA_EXTRA`) — `tables_are_well_formed`, the four `foreign_kana_*` sweeps, the
+    /// small-ya rows. Walking our own table can only ever check the rows we already have. A kana a
+    /// user can TYPE that is missing from the table is structurally invisible to all of them, and
+    /// its symptom is a LOUD OOV on a character that looks perfectly ordinary in the editor.
+    /// So this walks the ALPHABET: every code point in the hiragana + katakana blocks either
+    /// resolves, or is in the pinned list below WITH a reason. (S90's pathological-input-list
+    /// discipline: real material never reaches these.)
+    ///
+    /// The ja tables are otherwise in a different risk class from the five word dictionaries — they
+    /// are GENERATED but COMMITTED, so the S96 accident could not delete them, and S102 additionally
+    /// re-ran their provenance chain (`render_ust.py` → `dump_g2p` → `gen_rust_tables`) and got a
+    /// byte-identical `score2cv_tables.rs`. What that chain does NOT cover is coverage — hence this.
+    #[test]
+    fn s102_ja_kana_block_coverage() {
+        let mut unresolved: Vec<String> = Vec::new();
+        let mut readable: Vec<String> = Vec::new();
+        let mut resolved = 0usize;
+        for cp in (0x3041u32..=0x309Fu32).chain(0x30A1u32..=0x30FFu32) {
+            let Some(ch) = char::from_u32(cp) else { continue };
+            let s = ch.to_string();
+            // the editor folds katakana before classifying, so the gate must too
+            let folded = crate::inference::g2p::fold_katakana(&s);
+            match classify_lyric(&folded) {
+                LyricClass::Phones { phones } => {
+                    for p in &phones {
+                        assert!(
+                            phone_to_id_map().contains_key(p),
+                            "{ch:?} ({folded}) emits {p:?}, which is NOT in the 210-token vocab"
+                        );
+                    }
+                    resolved += 1;
+                }
+                LyricClass::Sustain | LyricClass::Rest | LyricClass::Breath => resolved += 1,
+                LyricClass::Unknown => {
+                    unresolved.push(format!("U+{cp:04X}"));
+                    readable.push(format!("U+{cp:04X} {ch}"));
+                }
+            }
+        }
+        // Code points ONLY (two of these are unassigned, so writing them as literals here would put
+        // unprintable bytes in the source). Measured, not guessed — S102 ran it first and pinned the
+        // actual set. Each is a bound form (legal only AFTER a base kana, where the tokenizer's
+        // longest match handles it as a unit), an archaic letter absent from the training inventory,
+        // or a typographic mark. ★ NOTE what is NOT here: ぁぃぅぇぉ resolve standalone (the S99
+        // foreign-kana path), and so does ゔ — but katakana ヷヸヹヺ do not, because they are
+        // WA/WI/WE/WO + dakuten with no hiragana single-character equivalent for the fold to land on.
+        //   3083/3085/3087 ゃゅょ · 308E ゎ · 3090/3091 ゐゑ · 3095/3096 ゕゖ
+        //   3097/3098 unassigned · 3099/309A combining dakuten/handakuten · 309B/309C spacing ones
+        //   309D/309E iteration marks · 309F ゟ (yori ligature)
+        //   30E3/30E5/30E7 ャュョ · 30EE ヮ · 30F0/30F1 ヰヱ · 30F5/30F6 ヵヶ
+        //   30F7-30FA ヷヸヹヺ · 30FB ・ · 30FD/30FE iteration · 30FF ヿ (koto ligature)
+        let expected = [
+            "U+3083", "U+3085", "U+3087", "U+308E", "U+3090", "U+3091", "U+3095", "U+3096",
+            "U+3097", "U+3098", "U+3099", "U+309A", "U+309B", "U+309C", "U+309D", "U+309E",
+            "U+309F", "U+30E3", "U+30E5", "U+30E7", "U+30EE", "U+30F0", "U+30F1", "U+30F5",
+            "U+30F6", "U+30F7", "U+30F8", "U+30F9", "U+30FA", "U+30FB", "U+30FD", "U+30FE",
+            "U+30FF",
+        ];
+        assert_eq!(resolved, 157, "the number of singable kana changed (unresolved: {readable:?})");
+        assert_eq!(
+            unresolved, expected,
+            "\nthe set of kana that do NOT resolve to a singable lyric has changed.\n\
+             resolved = {resolved}\n\
+             got      = {readable:?}\n\
+             A kana that LEFT the list gained coverage (good — update the list and the count). \
+             A kana that JOINED it became unsingable, which is a regression a user hits by typing \
+             an ordinary character."
+        );
+        // …and the tables themselves must be closed: every romaji a kana maps to has to have an
+        // R2IPA row, or that kana is a silent dead end no coverage list would ever reveal.
+        for (kana, romaji) in tbl::KANA.iter().chain(super::super::g2p_tables::KANA_EXTRA) {
+            assert!(
+                r2ipa_map().contains_key(romaji),
+                "kana {kana:?} maps to romaji {romaji:?}, which has no R2IPA row"
+            );
+        }
+    }
+
     // ── S86: the deliberate training-alignment divergence must (a) only ever OVERRIDE an existing
     //    upstream row and (b) actually be the value the engine resolves. ──
     #[test]

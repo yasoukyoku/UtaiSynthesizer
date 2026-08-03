@@ -1,7 +1,13 @@
-//! GENERATED — do not hand-edit. Regenerate with scratchpad/gen_rust_tables.py from g2p_dump.json
-//! (itself dumped from Much-Better-S2H/scripts/render_ust.py by scratchpad/dump_g2p.py). These are the
-//! EXACT ScoreToCV preprocessing tables (IPA vocab + JA G2P) — the single source of truth is the model
-//! repo; this mirrors it bit-for-bit and the parity test (score2cv.rs) proves it.
+//! GENERATED — do not hand-edit. These are the EXACT ScoreToCV preprocessing tables (IPA vocab +
+//! JA G2P); the single source of truth is the model repo, this mirrors it bit-for-bit, and the
+//! parity test (score2cv.rs) proves the port.
+//!
+//! To VERIFY the mirror is still faithful (writes nothing), or to regenerate:
+//!   py -3.10 Much-Better-S2H/_onnx_derisk/dump_g2p.py            # from scripts/render_ust.py
+//!   py -3.10 Much-Better-S2H/_onnx_derisk/gen_rust_tables.py --check   # exit 1 if drifted
+//!   py -3.10 Much-Better-S2H/_onnx_derisk/gen_rust_tables.py           # rewrite this file
+//! ⚠ S102: both paths above used to be hard-coded to a session scratchpad that no longer existed,
+//! so this header pointed at nothing and the chain had never once been run. It has now (IDENTICAL).
 
 /// IPA/special phoneme token -> id (id = index+5; PAD0 BOS1 EOS2 SP3 AP4). 210 entries, vocab_size=210.
 pub const PHONE_TO_ID: &[(&str, i64)] = &[
