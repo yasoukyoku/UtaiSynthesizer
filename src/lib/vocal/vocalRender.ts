@@ -686,7 +686,8 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  anyway). 464 word types cut differently; the only one of them ever observed being sung is
  *  `outside`, which goes from `AW1 | T S AY1 D` to `AW1 T | S AY1 D`. It still earns a bump for the
  *  s99 reason and not the s95 one: the old behaviour was a silent SUCCESS, so a project holding a
- *  signature-CLEAN bake of `out|side` would otherwise never pick the fix up. */
+ *  signature-CLEAN bake of `ou|tside` — the PRE-s102 cut; an adversarial pass caught this sentence
+ *  naming the post-fix one — would otherwise never pick the fix up. */
 export const G2P_ALGO_VERSION = "s102";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a

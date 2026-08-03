@@ -510,18 +510,32 @@ const EN_ONSET_MIN_VOTES: u32 = 6;
 ///    cut — albert+son, out+side, best+seller, white+side, pant+suit, sight+see, it+self,
 ///    august+son, short+sighted, west+side, sweat+suit… Only FOUR carry evidence the other way
 ///    (ma+tsuda, ma+tsui, mi+tsui, tse+tse).
-///  · what anyone actually SINGS settles it: across GTSinger English's 65319 lyric tokens exactly
-///    ONE of the 464 is ever sung — `outside`, 25 times — and it is on the drop side. The keep side
-///    (nazi, pizzeria, the Italian/Japanese/Slavic surnames) has zero occurrences there, and zero
-///    across all 334 scores/USTs on this machine.
+///  · EXPOSURE, and it is weak — recorded at its true strength because an adversarial pass demoted
+///    it from "what anyone actually sings settles it", which is what the first draft said. Across
+///    GTSinger English exactly ONE of the 464 is ever sung — `outside`, 25 times — and it is on the
+///    drop side. But that corpus is 65319 tokens over only 4827 items / 1156 DISTINCT lyric lines,
+///    vocabulary 1602 types = 1.24% of en.tsv, and those 25 tokens are 6 lyric lines. A random
+///    464-word draw would be expected to hit ~5.7. So this says "neither family is sung often enough
+///    for the knife to be loud either way", NOT "the drop side wins".
+///    ⛔ Do NOT re-add "and the keep side has zero occurrences there" as corroboration: with ONE hit
+///    across 464 words, zero on the keep side is the MODAL outcome under no asymmetry whatsoever
+///    (P = 0.52-0.90). The instrument itself is alive — the same measurement over `V R`'s 92 capture
+///    words returns 7 lyric types / 94 tokens — which is precisely why its near-silence here is a
+///    statement about coverage, not about the verdict.
+///    ⇒ THE VERDICT RESTS ON THE TWO en.tsv-INTERNAL LINES ABOVE (27/27 loan voters; 77 vs 4), not
+///      on this one.
 ///  · `T S` is TWO IPA phones on the English path — the real affricate token t͡s lives in it.tsv
 ///    (1316 lines) and en.tsv never emits it — so keeping it preserved no affricate. It only moved
 ///    a /t/ onto the next note.
 /// ⚠ RECORDED NEGATIVE so nobody re-runs it: the upstream note-boundary surface (GTSinger's own
-///    note annotation, the S97/S98 truth surface) CANNOT judge this cluster — English has ZERO
-///    word-internal `T S` in it. Its 201 npz instances are all CROSS-WORD, where a word-final /t/
-///    is structurally unable to open a note; counting them would be S98's "a thing that could not
-///    have moved is not a control".
+///    note annotation, the S97/S98 truth surface) CANNOT judge this cluster. Say it PRECISELY,
+///    because the first draft of this note did not and an adversarial pass caught it: "English has
+///    ZERO word-internal `T S`" is FALSE — there are 27 word-internal intervocalic ones (outside
+///    x25, outskirts x2). What is true, and is what empties the surface, is that ALL 27 sit entirely
+///    inside ONE note: not a single one is CROSSED by a note boundary, so none of them can say which
+///    side of the cut the /t/ belongs on. The 201 npz instances are all CROSS-WORD, where a
+///    word-final /t/ is structurally unable to open a note; counting those would be S98's "a thing
+///    that could not have moved is not a control".
 /// ★KNOWN COST, accepted deliberately (same shape as the SH T / German -stadt cost above): the
 ///    Japanese <tsu> family (matsumoto, mitsubishi, fujitsu, atsushi — ~45 types), the Slavic/Greek
 ///    <ts> names (yeltsin, tutsi, vorontsov, mitsotakis), and `tsetse` — the one ordinary English
