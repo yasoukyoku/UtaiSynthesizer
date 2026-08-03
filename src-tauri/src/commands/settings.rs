@@ -2896,4 +2896,52 @@ mod tests {
         // File paths only — a trailing-slash directory entry would make `file_name()` useless.
         assert!(t.iter().all(|x| x.starts_with("data/dictionaries/") && !x.ends_with('/')), "{t:?}");
     }
+
+    /// S101: actually RUN `sync_bundled_dictionaries` over temp trees. It is dead code on this
+    /// machine otherwise — a dev build resolves src and dst to the same repo directory, so the whole
+    /// function no-ops and the first execution of the real path would be on a user's install
+    /// (S85 rule: the user is never the first tester). Covers all four behaviours that matter,
+    /// including the two "do nothing" ones, because those are where a sync goes from useless to
+    /// destructive.
+    #[test]
+    fn dictionary_sync_refreshes_stale_and_never_destroys() {
+        let base = std::env::temp_dir().join(format!("utai_dictsync_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (app, data) = (base.join("install"), base.join("data"));
+        let (src, dst) = (app.join("data").join("dictionaries"), data.join("dictionaries"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("fr.tsv"), "abstenir\ta p s t ə n i ʁ\n").unwrap();
+        std::fs::write(src.join("en.tsv"), "even\tIY1 V AH0 N\n").unwrap();
+        std::fs::write(dst.join("fr.tsv"), "abstenir\ta p s t ə ɲ i ʁ\n").unwrap(); // STALE
+        std::fs::write(dst.join("en.tsv"), "even\tIY1 V AH0 N\n").unwrap(); // already current
+        std::fs::write(dst.join("keepme.txt"), "not ours").unwrap();
+
+        super::sync_bundled_dictionaries(&app, &data);
+        // 1. the stale one is refreshed …
+        assert_eq!(std::fs::read_to_string(dst.join("fr.tsv")).unwrap(), "abstenir\ta p s t ə n i ʁ\n");
+        // 2. … a file that already matches is left alone, and nothing foreign is touched or removed.
+        assert_eq!(std::fs::read_to_string(dst.join("en.tsv")).unwrap(), "even\tIY1 V AH0 N\n");
+        assert_eq!(std::fs::read_to_string(dst.join("keepme.txt")).unwrap(), "not ours");
+        // 3. no `.syncing` temp survives a successful run.
+        let leftovers: Vec<_> = std::fs::read_dir(&dst).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("syncing")).collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+        // 4. a MISSING source is a silent no-op, never "the destination is now wrong/empty".
+        let empty_app = base.join("no_install");
+        super::sync_bundled_dictionaries(&empty_app, &data);
+        assert_eq!(std::fs::read_to_string(dst.join("fr.tsv")).unwrap(), "abstenir\ta p s t ə n i ʁ\n");
+
+        // 5. src == dst (the DEFAULT install, and the dev build) must not walk a tree onto itself.
+        super::sync_bundled_dictionaries(&app, &app.join("data"));
+        assert_eq!(std::fs::read_to_string(src.join("fr.tsv")).unwrap(), "abstenir\ta p s t ə n i ʁ\n");
+        let self_leftovers: Vec<_> = std::fs::read_dir(&src).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("syncing")).collect();
+        assert!(self_leftovers.is_empty(), "self-sync left temp files: {self_leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
