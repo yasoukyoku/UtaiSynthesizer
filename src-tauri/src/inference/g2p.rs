@@ -2899,6 +2899,148 @@ mod tests {
         }
     }
 
+    // ─── S102: the three dictionaries that had NO tripwire at all ────────────────────────────────
+    //
+    // THE HOLE (found in S101, and S101 only closed the French half of it): the golden test
+    // `stage2_matches_python_golden` is hermetic — it reads the COMPILED golden, so changing a .tsv
+    // leaves it green; the ONE test that cross-checks golden against the shipped .tsv
+    // (`dictionaries_end_to_end`) is `#[ignore]`; and `release.ps1` runs a bare `cargo test`.
+    // ⇒ a regeneration that silently loses a generator knife, or picks up a drifted upstream, SHIPS
+    // ALL GREEN. en has had a gate since S94, de since S99, fr since S101. es / it / zh had none.
+    //
+    // Shape copied from `s101_fr_d6_gate`: (a) the generator's POSTCONDITION over every line,
+    // (b) spot-pinned primaries, (c) an upstream-drift fingerprint whose message names the cause.
+    // Same loud-SKIP contract — data/dictionaries is a gitignored generated asset (MBS2H
+    // `build_dictionaries.py`), so a bare checkout must not turn the suite red.
+    //
+    // ⚠ The exact counts in (c) are DELIBERATELY brittle. They exist to go red when the upstream
+    // file changes underneath us — which is the failure S98 proved is otherwise invisible (a
+    // different `german_mfa` release silently rewrote 3051 primary readings while the row count,
+    // the word set and the file size all matched). If one of them fires, the answer is to diff the
+    // regeneration against a snapshot (`verify_dictionaries.py --against`), not to update the number.
+
+    /// The generator's only Italian knife is `MFA_SUBS` (it is the one language where it actually
+    /// fires: ɡː×130, vː×324, ã×9, ẽ×1, ħ×1 at the S102 measurement). Everything else Italian comes
+    /// from upstream `italian_cv.dict` verbatim, so the fingerprint carries the weight here.
+    #[test]
+    fn s102_it_dictionary_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/it.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s102-it-gate] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let d = WordDict::from_tsv(Lang::It, &tsv);
+        // (a) MFA_SUBS postcondition: none of the substituted tokens may survive into the product.
+        for dead in ["vː", "ɡː", "ã", "ẽ", "ħ"] {
+            let n = tsv.lines().filter(|l| l.split_whitespace().any(|t| t == dead)).count();
+            assert_eq!(n, 0, "it.tsv still emits {dead} in {n} lines — MBS2H MFA_SUBS did not run");
+        }
+        // (b) spot pins. `canzone`/`grazie`/`zucchero` are pinned on purpose even though their `s`
+        //     for single ⟨z⟩ is the OPEN question (queue (b)2, "it z→ts"): pinning current behaviour
+        //     is what makes a change to it VISIBLE instead of silent.
+        for (w, spec) in [
+            ("mezzo", "m e t͡s o"),        // ⟨zz⟩ = the real affricate token
+            ("pizza", "p i t͡s a"),
+            ("canzone", "k a n s o n e"), // single ⟨z⟩ → s  (OPEN: queue (b)2)
+            ("zucchero", "s u kː e r o"),
+        ] {
+            let got = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from it.tsv"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "it primary for {w}");
+        }
+        // (c) upstream-drift fingerprint + the case-collapse fact.
+        //     it.tsv is the ONE dictionary whose keys are capitalised, and `from_tsv` lowercases
+        //     them — so 76963 rows become 66881 keys, first row winning. That is where the queue's
+        //     "it 66,881 条是五语最少" comes from; if the case convention upstream ever changes,
+        //     this number moves and a lot of readings silently change which variant is primary.
+        let rows = tsv.lines().filter(|l| l.contains('\t')).count();
+        assert_eq!(rows, 76963, "it.tsv row count moved — upstream italian_cv.dict drifted");
+        assert_eq!(d.map.len(), 66881, "it.tsv case-collapsed key count moved (rows {rows})");
+        let affr = tsv.lines().filter(|l| l.split_whitespace().any(|t| t == "t͡s")).count();
+        assert_eq!(affr, 1316, "it.tsv rows carrying the t͡s affricate moved — upstream drifted");
+    }
+
+    /// Spanish has NO generator knife of its own (`MFA_SUBS` fires zero times on it), so this gate
+    /// is entirely an upstream-drift detector — plus the θ pins, which guard a DECISION: S100
+    /// measured that [θ] is real in the corpus and that our pipeline renders θ/s apart, and
+    /// explicitly REFUSED a θ→s remap. If a regeneration ever flattens θ, that refusal must go red
+    /// here rather than ship silently.
+    #[test]
+    fn s102_es_dictionary_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/es.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s102-es-gate] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let d = WordDict::from_tsv(Lang::Es, &tsv);
+        for dead in ["vː", "ɡː", "ã", "ẽ", "ħ"] {
+            let n = tsv.lines().filter(|l| l.split_whitespace().any(|t| t == dead)).count();
+            assert_eq!(n, 0, "es.tsv emits {dead} in {n} lines — MBS2H MFA_SUBS did not run");
+        }
+        for (w, spec) in [
+            ("cielo", "θ j e l o"),          // distinción — the S100 decision lives on these
+            ("corazón", "k o ɾ a θ o n"),
+            ("zapato", "θ a p a t̪ o"),
+            ("llorar", "ʎ o ɾ a ɾ"),         // and the yeísmo axis (S86#3)
+            ("caballo", "k a β a ʝ o"),
+        ] {
+            let got = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from es.tsv"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "es primary for {w}");
+        }
+        let rows = tsv.lines().filter(|l| l.contains('\t')).count();
+        assert_eq!(rows, 95998, "es.tsv row count moved — upstream spanish_mfa drifted");
+        assert_eq!(d.map.len(), 90319, "es.tsv key count moved (rows {rows})");
+        for (tok, want) in [("θ", 14064), ("ʎ", 2147), ("ɟʝ", 598), ("ʝ", 2241)] {
+            let n = tsv.lines().filter(|l| l.split_whitespace().any(|t| t == tok)).count();
+            assert_eq!(n, want, "es.tsv rows carrying {tok} moved — upstream drifted, or a remap \
+                                 that S100 explicitly refused has been introduced");
+        }
+    }
+
+    /// Chinese is the one built from THREE files, and its knives are all in the syllable table:
+    /// the bare-final folding (yi→i, ya→ia …), the apical-i split, and the two DECIDED
+    /// substitutions for finals M4Singer never trained (`weng`→ong, `yo`→o). None of it had a test.
+    #[test]
+    fn s102_zh_dictionary_gate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries");
+        let read = |n: &str| std::fs::read_to_string(dir.join(n));
+        let (Ok(syl), Ok(chars), Ok(phrases)) =
+            (read("zh_syllables.tsv"), read("zh_chars.tsv"), read("zh_phrases.tsv"))
+        else {
+            eprintln!("[s102-zh-gate] SKIPPED — zh dictionaries not present in {} (gitignored generated assets)", dir.display());
+            return;
+        };
+        let d = ZhDict::from_tsv(&syl, &chars, &phrases);
+        let phones = |s: &str| d.syllable_phones(s).unwrap_or_else(|| panic!("{s} missing from zh_syllables.tsv")).join(" ");
+        // (a) the two DECIDED substitutions — finals absent from the M4Singer inventory, mapped to
+        //     the nearest TRAINED final. Losing them means asking the model for a final it never saw.
+        assert_eq!(phones("weng"), "ong", "the zh weng→ong substitution is missing");
+        assert_eq!(phones("yo"), "o", "the zh yo→o substitution is missing");
+        // (b) the bare-final folding: y-/w- initials are spelling, not phonology, in this convention.
+        for (syl, want) in [("yi", "i"), ("ya", "ia"), ("you", "iu"), ("yan", "ian"),
+                            ("yong", "iong"), ("wo", "uo")] {
+            assert_eq!(phones(syl), want, "the zh bare-final folding for {syl}");
+        }
+        // (c) the apical-i split stays a two-phone syllable (initial + final), not a fused token.
+        assert_eq!(phones("zhi"), "zh i");
+        assert_eq!(phones("si"), "s i");
+        // (d) the four syllables the generator reports as unmapped must stay ABSENT — if one of them
+        //     silently gains a reading, some hanzi starts singing a final nobody chose.
+        for gone in ["hm", "hng", "m", "wong"] {
+            assert!(d.syllable_phones(gone).is_none(), "{gone} must stay unmapped in zh_syllables.tsv");
+        }
+        // (e) upstream-drift fingerprint across all three files.
+        let n = |t: &str| t.lines().filter(|l| l.contains('\t')).count();
+        assert_eq!(n(&syl), 422, "zh_syllables.tsv row count moved");
+        assert_eq!(n(&chars), 44434, "zh_chars.tsv row count moved — kMandarin/pinyin drifted");
+        assert_eq!(n(&phrases), 47111, "zh_phrases.tsv row count moved — phrase_pinyin drifted");
+        // …and one real lookup through each of the other two tables, so the loader path is exercised
+        // rather than just the file contents.
+        assert!(d.is_hanzi('中'), "zh_chars.tsv did not load");
+        assert_eq!(d.char_default('中'), Some("zhong"));
+    }
+
     /// S95 fragment-merge / plural-rung gate over the REAL en.tsv (same SKIP contract as the S94
     /// gate above: the dictionary is a gitignored generated asset — a bare checkout must not go
     /// red). Pins the TYFD material's verdicts end-to-end: which fragments merge, into what,
