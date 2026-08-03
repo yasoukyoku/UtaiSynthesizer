@@ -35,7 +35,34 @@ It contains code ported from, or written with reference to, the following projec
 - **ContentVec** (auspicious3000, MIT) and **RMVPE** — feature-extraction / pitch models exported
   to ONNX for the in-app downloader.
 
-## Model weights (downloaded on demand, NEVER bundled)
+## Models trained by this project (downloaded on demand, NEVER bundled)
+
+These are **our own** weights — not derived from anyone else's checkpoint — but they were trained on
+third-party singing corpora, and those corpora's terms carry over to the trained weights.
+
+- **ScoreToCV** — `score2cv_768.onnx` / `score2cv_256.onnx` (core inference pack).
+- **Automatic pitch tuning** — `autotune_a1.onnx` (optional `autotune` pack).
+
+Both were trained on the same corpus set (44,947 clips; `train_final` / `val_final`):
+
+| Corpus | Share | License |
+|---|---|---|
+| GTSinger (English direct; French/German/Italian/Spanish re-aligned) | 49.5% | **CC BY-NC-SA 4.0** — https://github.com/AaronZ345/GTSinger |
+| M4Singer (Chinese) | 44.5% | **CC BY-NC-SA 4.0** — https://github.com/M4Singer/M4Singer |
+| Namine Ritsu "Kiritan" song DB / Tohoku Itako song DB (SSS LLC) | 1.2% / 1.1% | Non-commercial use permitted; https://zunko.jp/ |
+| Natsume Yuuri song DB (ATSUYA) · Ofuton P song DB · Oniku Kurumi "Utagoe" DB | 1.0% / 1.0% / 1.4% | Non-commercial; redistribution of derived voice models requires prior permission from each author |
+| PJS: Phoneme-balanced Japanese Singing-voice corpus | 0.4% | **CC BY-SA 4.0** (commercial use permitted) |
+
+**Consequence:** 93.96% of the training set is NonCommercial-licensed, so these two models are
+distributed for **non-commercial use only**, with attribution to the corpora above and under
+ShareAlike terms inherited from the CC BY-NC-SA sets. This is the same pattern as the NSF-HiFiGAN
+weights below. The application source (see `LICENSE`, AGPL-3.0) is a separate matter and does not
+grant any rights over these weights, nor do these corpus terms restrict the source code.
+
+Corpora that appear in intermediate data but are **not** in the shipped models' training set
+(`ace_opencpop`, `PopCS`, `CSD`, `NUS-48E`) are listed here only to record that they were excluded.
+
+## Third-party model weights (downloaded on demand, NEVER bundled)
 
 No model weights ship inside the installer. The app downloads them on demand, and weights that
 carry terms of their own are shown with those terms before the download starts.
@@ -62,8 +89,10 @@ never the third-party weights it fetches.
 - **DirectML** (Microsoft) — `runtime/ort/DirectML.dll`, redistributed under the Microsoft
   DirectML redistributable license (shipped because the Windows inbox copy is older than what
   ONNX Runtime requires).
-- **FFmpeg** (GPL build, gyan.dev "essentials") — `ffmpeg.exe`, invoked as a separate process for
-  audio decode/encode. Source: https://ffmpeg.org / builds: https://www.gyan.dev/ffmpeg/builds/.
+- **FFmpeg** — `ffmpeg.exe`, invoked as a separate process for audio decode/encode. The shipped
+  binary is a **BtbN** win64 GPL build (currently `n8.1.2-34-g9b6c8969e0-20260801`, configured with
+  `--enable-gpl --enable-version3` ⇒ **GPL-3.0**). Source: https://ffmpeg.org / builds:
+  https://github.com/BtbN/FFmpeg-Builds.
 
 ## Bundled dictionary data (`data/dictionaries/`)
 

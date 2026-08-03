@@ -104,7 +104,11 @@ const SOVITS_V2_TRAIN_FILES: &[AssetFile] = &[
     AssetFile { rel: "training/sovits_v2/D_0.pth", size: 561_070_439, sha256: "028b7db89f184327cfa1c8ee701887e1cb513b9eaa21b4b573bbbd6f10ad38de" },
 ];
 
-// S73 自动音高调教(旋钮线 Phase A/runA3;SVC2SVS pitch/export_onnx.py 产,自训无许可负担)。
+// S73 自动音高调教(旋钮线 Phase A/runA3;SVC2SVS pitch/export_onnx.py 产)。
+// ⚠ S100 更正:这里原本写着「自训无许可负担」——**错的,别照抄**。它不来自别人的 checkpoint
+// (那一半对),但训练数据与 score2cv 是同一批(SVC2SVS pitch/dataprep/build_clip_map.py 读的就是
+// MBS2H processed/splits/{train,val}_final.jsonl)⇒ **93.96% 是 NC 语料**(GTSinger / M4Singer
+// CC BY-NC-SA 4.0 + 四个日语声库非商用),权重随之只能非商用分发。清单与出处 = 仓根 NOTICE.md。
 // ★独立 pack,绝不并入 aux-inference:渲染预检(preflightVocalModels)按 aux-inference 的
 // missing 计数硬挡 Play——往老 pack 加新文件会让所有升级用户的存量工程被缺模型对话框卡死
 // (断网即死锁,S73 审查 HIGH)。可选功能的模型 = 自己的 pack,用到时才提示下载。
