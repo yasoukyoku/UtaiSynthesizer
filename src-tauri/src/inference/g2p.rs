@@ -437,7 +437,8 @@ impl WordDict {
             // category of damage no attestation count justifies.
             if cluster.contains(' ')
                 && (n < min_votes
-                    || (lang == Lang::En && EN_ONSET_DROP.contains(&cluster.as_str())))
+                    || (lang == Lang::En && EN_ONSET_DROP.contains(&cluster.as_str()))
+                    || (lang == Lang::Fr && FR_ONSET_DROP.contains(&cluster.as_str())))
             {
                 continue;
             }
@@ -493,6 +494,36 @@ const EN_ONSET_MIN_VOTES: u32 = 6;
 /// Word-initial voters themselves are untouched (kvetch/shtick still sing whole), same invariant as
 /// the threshold. de/fr/es/it deliberately not curated here — S86#10 owns their verdicts.
 const EN_ONSET_DROP: &[&str] = &["S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L"];
+
+/// S101 blast containment for the fr D6 mirror — NOT a general curation of the French onset set.
+///
+/// The D6 mirror (MBS2H `build_dictionaries.py`) rewrites `ɲ`→`n` before `i`, which renames three
+/// word-initial clusters rather than inventing them: the SAME three entries vote before and after —
+/// `d ɲ`→`d n` (dniepr / dnipro / dnipropetrovsk, 3 votes), `s f ɲ`→`s f n` (spheniscidae, 1),
+/// `z v ɲ`→`z v n` (zvenigorod, 1). With `min_votes = 1` for fr, each is instantly legal.
+///
+/// `d n` then captures a family it has no business in. Measured over the shipped fr.tsv, admitting it
+/// re-cuts **45** word types whose own phones never changed — sidney/sydney → `s i | d n ɛ`,
+/// kidnappe/kidnapping, wednesday, midnight, madness, ordnance, gardner, dreadnought, cadena,
+/// pasadena, grodno… — i.e. it moves /d/ out of the coda where every one of those loanwords wants it.
+/// **This is literally the same river S94 already judged on the English side**: `EN_ONSET_DROP`'s
+/// gate pins `kidney → K IH1 D | N IY0` with the comment "was K IH1 | D N IY0 (dniester's D N)".
+/// Same cluster, same source language, same damage family — so the verdict is not a new opinion.
+///
+/// Dropping costs the voters nothing, by the invariant stated above `EN_ONSET_MIN_VOTES`:
+/// word-initial phones always stay in the first syllable, the onset set only decides INTERVOCALIC
+/// cuts. `dniepr` still sings `dn-` whole. `s f n` / `z v n` capture 0 words today and are listed
+/// only so the knife's invariant is exact and testable: **the D6 mirror changes phone identity and
+/// creates no new legal onset.**
+///
+/// ⛔ The three clusters D6 REMOVES (`s ɲ` 5 votes sneek/snider/sniffer/snyder, `ɡ ɲ` gnifetti,
+/// `ʃ ɲ` schnitzler) are deliberately allowed to go: they were legal only because of the upstream
+/// `ni`→`ɲi` bug, and losing them moves 16 words the other way — `bosnien` `b ɔ s | ɲ ɛ̃` instead of
+/// `b ɔ | s ɲ ɛ̃`, `baguenier` `b a ɡ | ɲ e` — which is where French phonotactics wants the cut.
+///
+/// ⚠ fr `min_votes` is still 1 and this list does NOT change that. The general four-language vote
+/// gate remains untested and unowned by this round (see `EN_ONSET_MIN_VOTES`, S86#10).
+const FR_ONSET_DROP: &[&str] = &["d n", "s f n", "z v n"];
 
 /// Candidate dictionary keys for one raw lyric, MOST FAITHFUL FIRST (S86 input-tolerance ladder).
 ///
@@ -2663,6 +2694,88 @@ mod tests {
             let got = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from en.tsv"));
             let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
             assert_eq!(got, want, "S94 regeneration-knife primary for {w}");
+        }
+    }
+
+    /// S101 fr D6 gate over the REAL fr.tsv (same SKIP contract as the S94 gate above — the
+    /// dictionary is a gitignored generated asset, a bare checkout must not go red).
+    ///
+    /// WHY IT EXISTS: before this, French had no dictionary tripwire that runs in `cargo test` at
+    /// all. `stage2_matches_python_golden` is hermetic (it reads the COMPILED golden and would stay
+    /// green if fr.tsv changed and the golden were never regenerated), and the only test that
+    /// cross-checks the two — `dictionaries_end_to_end` — is `#[ignore]`, while `release.ps1` runs a
+    /// bare `cargo test`. So an fr.tsv regeneration that silently loses the MBS2H D6 mirror would
+    /// have shipped completely green. That is exactly the hole `s94_en_onset_vote_gate` was created
+    /// to close on the English side.
+    ///
+    /// Pins the two invariants the D6 mirror is defined by:
+    ///  (a) POSTCONDITION — no French primary emits `ɲ` immediately before `i`. The training npz the
+    ///      shipped model was built from contains that bigram ZERO times (fr has 55 `ɲ` total;
+    ///      it 30 / es 3 / de 0 on the same measurement), because the training side's
+    ///      `repair_d_relabel.py` D6 relabelled it. The dictionary now agrees with the weights.
+    ///  (b) NO NEW LEGAL ONSET — see `FR_ONSET_DROP`. `d n` is the one that bites (45 loanwords).
+    /// Both are pinned by explicit lookup as well, so a regeneration that loses the knife goes red
+    /// with a message naming the cause rather than a bare count.
+    #[test]
+    fn s101_fr_d6_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/fr.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s101-fr-d6-gate] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let d = WordDict::from_tsv(Lang::Fr, &tsv);
+        // (a) the postcondition, over every LINE of the file (variants included, not just primaries).
+        let mut offenders = Vec::new();
+        for line in tsv.lines() {
+            let Some((w, phones)) = line.split_once('\t') else { continue };
+            let toks: Vec<&str> = phones.split_whitespace().collect();
+            if toks.windows(2).any(|p| p[0] == "ɲ" && p[1] == "i") {
+                offenders.push(w);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "fr.tsv emits ɲ before i in {} entries (e.g. {:?}) — the MBS2H D6 mirror is missing from \
+             this build of the dictionary. The model was never trained on that bigram.",
+            offenders.len(),
+            &offenders[..offenders.len().min(5)]
+        );
+        // (a') spot-pins, including the four words the training-side D6 was originally verified on.
+        for (w, spec) in [
+            ("souvenir", "s u v n i ʁ"),
+            ("fini", "f i n i"),
+            ("venir", "v ə n i ʁ"),
+            ("harmonie", "a ʁ m ɔ n i"),
+            // magnassini is the internal control: TWO ɲ, only the one before `i` moves.
+            ("magnassini", "m a ɲ a s i n i"),
+            // and the ɲ that must NOT move — before a non-`i` vowel, and word-final.
+            ("agneau", "a ɲ o"),
+            ("montagne", "m ɔ̃ t a ɲ"),
+        ] {
+            let got = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from fr.tsv"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "fr D6 primary for {w}");
+        }
+        // (b) the knife creates no new legal onset.
+        for gone in FR_ONSET_DROP {
+            assert!(!d.onsets.contains(*gone), "{gone} must stay out of the FR onset set");
+        }
+        // (b') and the cut those drops protect — /d/ belongs to the coda in this loanword family.
+        let s = |w: &str| -> Vec<Vec<String>> { syllabify(&d, &d.lookup(w).unwrap()) };
+        let want = |spec: &str| -> Vec<Vec<String>> {
+            spec.split('|').map(|syl| syl.split_whitespace().map(str::to_string).collect()).collect()
+        };
+        for (w, spec) in [
+            ("sidney", "s i d | n ɛ"),
+            ("kidnappe", "c i d | n a p"),
+            ("midnight", "m i d | n a j t"),
+        ] {
+            assert_eq!(s(w), want(spec), "the FR_ONSET_DROP cut for {w}");
+        }
+        // (b'') the OTHER direction, pinned so it stays a decision: the clusters D6 removes are
+        // allowed to go, and these cuts move BECAUSE of that. French wants /s/ and /ɡ/ in the coda.
+        for (w, spec) in [("bosnien", "b ɔ s | ɲ ɛ̃"), ("baguenier", "b a ɡ | ɲ e")] {
+            assert_eq!(s(w), want(spec), "the post-D6 cut for {w}");
         }
     }
 

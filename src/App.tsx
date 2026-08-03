@@ -8,6 +8,7 @@ import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs, re
 import { installAutosave, clearAutosave, readAutosave, setRecoveryPending } from "./lib/project/autosave";
 import { runExitFlow } from "./lib/exitFlow";
 import { installOovWatch } from "./lib/vocal/oovWatch";
+import { ensureDictionarySig } from "./lib/vocal/vocalRender";
 import { Titlebar } from "./components/common/Titlebar";
 import { DawWorkflowSplit } from "./components/synth/DawWorkflowSplit";
 import { TrainingPage } from "./components/training/TrainingPage";
@@ -185,6 +186,14 @@ export function App() {
         if (issue) useAppStore.getState().showToast(i18n.t("startup.dataDirIssue"), "error");
       })
       .catch(() => {});
+  }, []);
+
+  // S101: pull the dictionary-content fingerprint into the bake signature as early as possible.
+  // Rust has already refreshed the data root's dictionaries synchronously in setup(), so this reads
+  // a settled value. `ensureDictionarySig` is idempotent and never rejects; until it resolves,
+  // isVocalDirty deliberately reports "not dirty" rather than compare against a placeholder.
+  useEffect(() => {
+    void ensureDictionarySig();
   }, []);
 
   // S64: startup update check (GitHub Releases; Settings-toggleable, default ON). Failure is a MODAL

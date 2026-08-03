@@ -549,10 +549,44 @@ export function vocalRenderSig(track: Track, seg: Segment, tempo: number): strin
  *  fresh ids (contentSig can never match the source's), so validity = "source bake was clean AND the
  *  track/tempo terms are byte-equal between copy-source and paste-destination". Kept HERE so it can never
  *  drift from vocalRenderSig (same string, single construction). */
+/** The value the fingerprint takes when the backend could not produce one. STABLE on purpose: a
+ *  changing placeholder would make every bake flap, and a `null` that never resolves would make
+ *  `isVocalDirty` permanently answer "not dirty" and brick rendering. "?" does neither. */
+const UNKNOWN_DICTIONARY_SIG = "?";
+
+/** S101 — the DICTIONARY-CONTENT term of the bake signature (review S94-VB-1: content never had a
+ *  carrier of its own, `G2P_ALGO_VERSION` was standing in for it). Filled once per session from
+ *  `dictionary_fingerprint` (a hash of the ACTIVE data root's .tsv). `null` = not fetched yet.
+ *
+ *  ⚠ THE reason this needs a gate and `rr:` does not. `rangeRecordSig` also reads ambient state, but
+ *  it reads the SAME store `resolveTrackVoice` reads — so while that store is empty `isVocalDirty`
+ *  has already returned false at the voice gate and `renderVocalPart` has already thrown, and an
+ *  empty `rr:` can never be compared against or stamped. This value has no such shield of its own,
+ *  and `renderedSig` is written into the `.usp` — stamping a placeholder would persist a signature
+ *  that never matches again, re-rendering the segment on every single Play, across restarts. So the
+ *  shield is built explicitly, in exactly the same two places: `isVocalDirty` short-circuits while
+ *  it is null, and `renderVocalPart` awaits `ensureDictionarySig()` before it can stamp anything. */
+let dictionarySig: string | null = null;
+
+/** Seed the dictionary fingerprint (App bootstrap). Exported for tests + the startup fetch. */
+export function setDictionarySig(v: string): void {
+  dictionarySig = v;
+}
+
+/** The fingerprint, fetching it on first use. Never rejects — a backend failure resolves to the
+ *  stable placeholder so a render can still happen (a wrong-but-stable term costs one re-render;
+ *  a hang costs the feature). */
+export async function ensureDictionarySig(): Promise<string> {
+  if (dictionarySig === null) {
+    dictionarySig = await invoke<string>("dictionary_fingerprint").catch(() => UNKNOWN_DICTIONARY_SIG);
+  }
+  return dictionarySig;
+}
+
 export function vocalTrackSig(track: Track, tempo: number): string {
   // forRender=true:autoTune 三元组不进渲染 sig(它们经 θ→contentSig 间接生效;直接进会让
   // 切 follow 开关/拖缩放凭空判废整段 bake——S73b 审查假脏)。
-  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}|g2p:${G2P_ALGO_VERSION}|st:${SCORE_TIMING_VERSION}`;
+  return `vp:${vocalParamsSig(track.vocalParams, true)}|vm:${track.voiceModel ?? ""}|bpm:${tempo}|rr:${rangeRecordSig(track)}|g2p:${G2P_ALGO_VERSION}|st:${SCORE_TIMING_VERSION}|dict:${dictionarySig ?? ""}`;
 }
 
 /** Resolve a track's configured singer to its installed model entry (undefined = no vocalParams, no
@@ -630,8 +664,22 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  sig-dirty". That does not transfer here — the old behaviour was a silent SUCCESS, so a project
  *  containing てゅ can be holding a signature-CLEAN bake of the wrong sound, and without a bump its
  *  owner would never hear the fix. (S98's handover note claimed this knife needed no bump by citing
- *  S95; that citation is wrong and this is the correction.) */
-export const G2P_ALGO_VERSION = "s99";
+ *  S95; that citation is wrong and this is the correction.)
+ *  s101 = the FR D6 mirror. `build_dictionaries.py` now rewrites `ɲ`→`n` before `i` when it builds
+ *  fr.tsv, matching what the TRAINING labels already say: the model's own French npz contain that
+ *  bigram ZERO times (the training side's `repair_d_relabel.py` D6 relabelled it years ago; fr has
+ *  55 `ɲ` left, vs it 30 / es 3 for the same bigram, so the erasure is French-specific). The shipped
+ *  dictionary never got that knife, so 3441 word types were asking the model for a sound it has
+ *  never been fed — `abstenir` → `a p s t ə ɲ i ʁ`. Another DICTIONARY-CONTENT change, so the same
+ *  S94-VB-1 note as the German ß case above applies: this stamp is what makes an existing French
+ *  bake re-render. Second-order effect, measured not assumed: the substituted consonant moves from
+ *  the `ɲ` duration prior to the `n` one (7 → 5 frames on a long note) and the freed frames go to
+ *  the following vowel; total frames are unchanged.
+ *  ★ It rides WITH the startup dictionary freshness sync landing in the same round, and that pairing
+ *  is not optional. A bump alone would be WORSE than nothing for anyone whose data dir was migrated:
+ *  they would be forced to re-render against their STALE dictionary copy and then be stamped s101,
+ *  after which no carrier could ever invalidate them again (the S83 distribution fault). */
+export const G2P_ALGO_VERSION = "s101";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
@@ -873,6 +921,10 @@ export async function renderVocalPart(track: Track, seg: Segment, tempo: number,
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   if (!entry) throw new Error(VOCAL_NO_VOICE);
+  // S101 shield (see `dictionarySig`): this function STAMPS `renderedSig` onto the deposit and that
+  // sig rides the `.usp`. Resolving the fingerprint first is what stops a placeholder from being
+  // written to disk, where it would never match again and re-render on every Play forever.
+  await ensureDictionarySig();
   const { triples, f0Cents, f0Voiced, loudnessEnv, formantEnv } = buildVocalScore(
     seg.content.notes, seg.content.pitchDev, tempo, vp.transition, vocalTokens(vp),
     seg.content.paramCurves, vp.formant ?? 0, vp.langId,
@@ -936,6 +988,11 @@ export function isVocalDirty(track: Track, seg: Segment, tempo: number): boolean
   if (seg.content.notes.length === 0) return !!bake;
   if (!track.vocalParams) return false;
   if (!resolveTrackVoice(track)) return false;
+  // S101 shield (see `dictionarySig`): never COMPARE against a signature carrying a placeholder
+  // dictionary term. Answering "not dirty" for the few hundred ms before the fingerprint lands is
+  // the safe direction — Play serves the existing bake and the next Play re-checks for real; the
+  // unsafe direction would be declaring every segment dirty on every boot.
+  if (dictionarySig === null) return false;
   if (!bake) return true;
   // ② DUAL-SIG acceptance (§user: split is not a re-render). A carried SPLIT-WINDOW bake keeps the PARENT's
   // whole-stem `renderedSig` but is windowed to this half; `windowSig` is THIS half's own content sig (stamped

@@ -1035,6 +1035,11 @@ pub fn run() {
             // it now, on the first boot that runs on the NEW root (this process holds zero handles
             // into the old tree at this point; the worker delta-syncs stragglers before deleting).
             commands::settings::spawn_pending_data_dir_delete(app_dir_early.clone(), data_dir.clone());
+            // S101 (S83 distribution fault): refresh the data root's stage1 dictionaries from the
+            // bundled install copy. SYNCHRONOUS on purpose — g2p loads a dictionary lazily and
+            // `Box::leak`s it for the process lifetime, so a background sync could race the first
+            // render and pin a stale one. No-op on a default install (same directory) and in dev.
+            commands::settings::sync_bundled_dictionaries(&app_dir_early, &data_dir);
             let cache_dir = data_dir.join("cache");
             let models_dir = data_dir.join("models");
             let _ = std::fs::create_dir_all(&cache_dir);
@@ -1343,6 +1348,7 @@ pub fn run() {
             commands::update::update_install,
             commands::update::update_cancel,
             commands::settings::bundled_integrity_report,
+            commands::settings::dictionary_fingerprint,
             commands::settings::migrate_pending_restart,
             commands::window::quit_app,
             commands::window::restart_app,

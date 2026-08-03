@@ -10,7 +10,13 @@ vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
 // isVocalDirty resolves the singer via the voice-model store — mock ONE installed "V" so `entry` is found.
 vi.mock("../../store/voice-models", () => ({ useVoiceModelStore: { getState: () => ({ models: { sovits: [{ name: "V", path: "p" }] } }) } }));
 
-import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, vocalRenderOptions, vocalRenderErrorMessage, isVocalCancelError, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
+import { buildVocalScore, buildScoreTriples, isVocalDirty, vocalRenderSig, vocalTrackSig, splitSegmentVocalAware, vocalRenderOptions, vocalRenderErrorMessage, isVocalCancelError, setDictionarySig, G2P_ALGO_VERSION, SCORE_TIMING_VERSION } from "./vocalRender";
+
+// S101: the dictionary fingerprint is ambient module state, and `isVocalDirty` deliberately answers
+// "not dirty" until it is seeded (so a placeholder can never be compared against or stamped into a
+// `.usp`). Seed it here or every dirty-check assertion below silently tests the shield instead of the
+// thing it was written for — which is exactly what happened when this term landed: 5 tests went red.
+setDictionarySig("d0");
 import { aliasDefaultLyric } from "./languages";
 import { useProjectStore } from "../../store/project";
 import { DEFAULT_TRANSITION } from "../vocalNotes";
@@ -604,8 +610,8 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s99|st:s97c");
-    expect(G2P_ALGO_VERSION).toBe("s99"); // S99 known-target dictionary batch (starts with the JA small-ゃゅょ rows)
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s101|st:s97c");
+    expect(G2P_ALGO_VERSION).toBe("s101"); // S101 FR D6 mirror (ɲ→n before i, matching the training labels)
     expect(SCORE_TIMING_VERSION).toBe("s97c"); // S97b: + phrase-final sonorant coda restore (render side, upstream level target)
   });
 
@@ -615,8 +621,25 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s99|st:s97c",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s101|st:s97c|dict:d0",
     );
+  });
+
+  // S101 WIRING (review S94-VB-1): dictionary CONTENT now moves the signature on its own. Asserted as
+  // a real difference between two fingerprints, not `toContain` — a term that is present but ignored
+  // would pass a containment check and still leave a stale French bake playing forever. Restores the
+  // shared value afterwards: it is module state and every other test in this file depends on it.
+  it("carries the dictionary fingerprint, and a different dictionary moves the sig", () => {
+    const before = vocalTrackSig(track, 120);
+    try {
+      setDictionarySig("d1");
+      const after = vocalTrackSig(track, 120);
+      expect(after).not.toBe(before);
+      expect(after.endsWith("|dict:d1")).toBe(true);
+    } finally {
+      setDictionarySig("d0");
+    }
+    expect(vocalTrackSig(track, 120)).toBe(before);
   });
 });
 

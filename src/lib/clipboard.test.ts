@@ -17,6 +17,10 @@ import { useAppStore } from "../store/app";
 import { useAudioStore } from "../store/audio";
 import { useWorkflowStore } from "../store/workflow";
 import { useVoiceModelStore } from "../store/voice-models";
+import { setDictionarySig } from "./vocal/vocalRender";
+// S101: seed the dictionary fingerprint — `isVocalDirty` reports "not dirty" until it exists, so the
+// (E) dual-sig assertions below would silently test that shield instead of the paste rules.
+setDictionarySig("d0");
 import {
   clearClipboard, clipboardKind, copySelectedSegments, copyTrackToClipboard,
   cutSelectedSegments, pasteClipboard,
