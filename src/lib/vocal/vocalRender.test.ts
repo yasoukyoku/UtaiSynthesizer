@@ -610,8 +610,8 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s101|st:s97c");
-    expect(G2P_ALGO_VERSION).toBe("s101"); // S101 FR D6 mirror (ɲ→n before i, matching the training labels)
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s102|st:s97c");
+    expect(G2P_ALGO_VERSION).toBe("s102"); // S102: `T S` leaves the EN legal-onset set (out|side, not ou|tside)
     expect(SCORE_TIMING_VERSION).toBe("s97c"); // S97b: + phrase-final sonorant coda restore (render side, upstream level target)
   });
 
@@ -621,7 +621,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s101|st:s97c|dict:d0",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s102|st:s97c|dict:d0",
     );
   });
 

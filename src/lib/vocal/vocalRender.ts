@@ -678,8 +678,16 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  ★ It rides WITH the startup dictionary freshness sync landing in the same round, and that pairing
  *  is not optional. A bump alone would be WORSE than nothing for anyone whose data dir was migrated:
  *  they would be forced to re-render against their STALE dictionary copy and then be stamped s101,
- *  after which no carrier could ever invalidate them again (the S83 distribution fault). */
-export const G2P_ALGO_VERSION = "s101";
+ *  after which no carrier could ever invalidate them again (the S83 distribution fault).
+ *  s102 = `T S` leaves the English legal-onset set (`EN_ONSET_DROP` in g2p.rs, where the whole
+ *  evidence table lives). Unlike s101 this is NOT a dictionary-content change — en.tsv is byte-for-
+ *  byte unchanged and no regeneration is involved; what moves is where a word's syllables are CUT,
+ *  which only shows up when a word is spread over a `+` span (one note swallows every syllable
+ *  anyway). 464 word types cut differently; the only one of them ever observed being sung is
+ *  `outside`, which goes from `AW1 | T S AY1 D` to `AW1 T | S AY1 D`. It still earns a bump for the
+ *  s99 reason and not the s95 one: the old behaviour was a silent SUCCESS, so a project holding a
+ *  signature-CLEAN bake of `out|side` would otherwise never pick the fix up. */
+export const G2P_ALGO_VERSION = "s102";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

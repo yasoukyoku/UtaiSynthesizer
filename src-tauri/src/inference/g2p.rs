@@ -472,8 +472,9 @@ impl WordDict {
 /// driveway, M W teamwork/dreamworks, F W halfway/safeway, L W always, ZH W visualize, TH Y matthew.
 /// Net direction favors the drop everywhere; do NOT add a keep-list without re-running that table.
 ///
-/// ⛔ Deliberately KEPT (S92: their cuts are correct — do not "clean" them): T S (27, nazi/
-/// pizzeria), ZH (94, asia/azure), K N (14, technique), the schm-/schn-/schl-/schw- loan families.
+/// ⛔ Deliberately KEPT (S92: their cuts are correct — do not "clean" them): ZH (94, asia/azure),
+/// K N (14, technique), the schm-/schn-/schl-/schw- loan families.
+/// (`T S` sat on this list until S102 re-judged it on evidence S92 did not have — see EN_ONSET_DROP.)
 ///
 /// A cluster losing its vote NEVER hurts the words that voted it in: word-initial phones always stay
 /// in the first syllable; the onset set only decides INTERVOCALIC cuts.
@@ -491,9 +492,47 @@ const EN_ONSET_MIN_VOTES: u32 = 6;
 ///                                    get a worse cut — rare, accepted)
 ///   HH R (13, hraw-class)         → blast = 1 word (warhol's); hygiene
 ///   HH L (6, hlad-class)          → blast = 0 words; hygiene
+///   T S  (27, tsar/tsunami/matsu-) → S102; the one entry here that OVERTURNS a verdict, so its
+///                                    evidence is written out in full below.
 /// Word-initial voters themselves are untouched (kvetch/shtick still sing whole), same invariant as
 /// the threshold. de/fr/es/it deliberately not curated here — S86#10 owns their verdicts.
-const EN_ONSET_DROP: &[&str] = &["S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L"];
+///
+/// ★S102 — why `T S` moved from the KEPT list to this one (queue (a3-2); it was carried as
+/// 【未验证】 because two criteria disagreed, and they disagreed because they were looking at
+/// DIFFERENT WORDS. Dropping it moves 464 word types, in two opposed families).
+/// S92's case for keeping it was one eyeballed word: "ZH and T S cut correctly — versions /
+/// massagers / pizzeria". `ZH` is a LONE consonant and is structurally never gated (see the
+/// paragraph above this list), so `pizzeria` WAS the entire case. What S102 measured against it:
+///  · all 27 word-initial voters are loans (tsar, tsunami, tsetse, tsu-/matsu- names, csaszar,
+///    zeitgeist) — NO native English word begins with /ts/. That is the definition of this list.
+///  · 77 of the 464 carry mechanical evidence FOR the drop, out of en.tsv itself: the word splits
+///    into two dictionary words whose phones concatenate to exactly its own, at exactly the dropped
+///    cut — albert+son, out+side, best+seller, white+side, pant+suit, sight+see, it+self,
+///    august+son, short+sighted, west+side, sweat+suit… Only FOUR carry evidence the other way
+///    (ma+tsuda, ma+tsui, mi+tsui, tse+tse).
+///  · what anyone actually SINGS settles it: across GTSinger English's 65319 lyric tokens exactly
+///    ONE of the 464 is ever sung — `outside`, 25 times — and it is on the drop side. The keep side
+///    (nazi, pizzeria, the Italian/Japanese/Slavic surnames) has zero occurrences there, and zero
+///    across all 334 scores/USTs on this machine.
+///  · `T S` is TWO IPA phones on the English path — the real affricate token t͡s lives in it.tsv
+///    (1316 lines) and en.tsv never emits it — so keeping it preserved no affricate. It only moved
+///    a /t/ onto the next note.
+/// ⚠ RECORDED NEGATIVE so nobody re-runs it: the upstream note-boundary surface (GTSinger's own
+///    note annotation, the S97/S98 truth surface) CANNOT judge this cluster — English has ZERO
+///    word-internal `T S` in it. Its 201 npz instances are all CROSS-WORD, where a word-final /t/
+///    is structurally unable to open a note; counting them would be S98's "a thing that could not
+///    have moved is not a control".
+/// ★KNOWN COST, accepted deliberately (same shape as the SH T / German -stadt cost above): the
+///    Japanese <tsu> family (matsumoto, mitsubishi, fujitsu, atsushi — ~45 types), the Slavic/Greek
+///    <ts> names (yeltsin, tutsi, vorontsov, mitsotakis), and `tsetse` — the one ordinary English
+///    word on that side — now put /t/ in the coda, which their source languages do not want. A
+///    word-level compound-seam exception would serve both families and is NOT built here for a
+///    measured reason: the general seam rule is wrong. Over the whole dictionary 10191 of 27743
+///    live seams disagree with maximal onset, and the disagreements include SUFFIX seams English
+///    genuinely does resyllabify (aachen+er, mast+er → mas-ter). Restricting it to true compounds
+///    needs its own round with its own truth surface.
+const EN_ONSET_DROP: &[&str] =
+    &["S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L", "T S"];
 
 /// S101 blast containment for the fr D6 mirror — NOT a general curation of the French onset set.
 ///
@@ -2627,11 +2666,12 @@ mod tests {
         for gone in [
             "N D", "D N", "M B", "T L", "S B", "K M", "Z M", "D M", "P SH", "L W", "Z B", "M L", "N W",
             "S R", "M R", "Z L", "V R", "K V", "SH T", "HH R", "HH L",
+            "T S", // S102 — see the evidence block above EN_ONSET_DROP; this one overturns S92.
         ] {
             assert!(!d.onsets.contains(gone), "{gone} must be vote-gated out of the EN onset set");
         }
         // (a') kept: the S92-verified correct cutters and the weakest NATIVE clusters (6/9 votes).
-        for kept in ["T S", "ZH", "K N", "TH W", "S P Y", "S K Y", "S T R", "S K W", "SH L"] {
+        for kept in ["ZH", "K N", "TH W", "S P Y", "S K Y", "S T R", "S K W", "SH L"] {
             assert!(d.onsets.contains(kept), "{kept} must stay a legal EN onset");
         }
         // (b) splits the threshold FIXES (before S94 the bracketed consonant opened the NEXT syllable):
@@ -2659,6 +2699,14 @@ mod tests {
             ("averaged", "AE1 V | R AH0 JH D"),     // was AE1 | V R AH0 JH D (vrabel's V R)
             ("hashtag", "HH AE1 SH | T AE2 G"),     // was HH AE1 | SH T AE2 G (shtick's SH T)
             ("armrest", "AA1 R M | R EH2 S T"),
+            // …and S102's `T S` drop. The first three are the ONLY member of the 464-word capture
+            // set anyone was ever measured singing (`outside`, 25× in GTSinger) plus two of the 77
+            // that carry en.tsv-internal decomposition evidence for exactly this cut.
+            ("outside", "AW1 T | S AY1 D"),         // was AW1 | T S AY1 D; out+side
+            ("albertson", "AE1 L | B ER0 T | S AH0 N"), // was …| B ER0 | T S AH0 N; albert+son
+            ("bestseller", "B EH1 S T | S EH1 | L ER0"), // was B EH1 S | T S EH1 |…; best+seller
+            ("itself", "IH2 T | S EH1 L F"),        // was IH2 | T S EH1 L F; it+self
+            ("antsy", "AE1 N T | S IY0"),           // no decomposition, but /ts/ is not an EN onset
         ] {
             assert_eq!(s(w), want(spec), "S94-fixed split for {w}");
         }
@@ -2670,9 +2718,21 @@ mod tests {
             want("R EH1 | Z AH0 V | W AA2 R"),
             "the accepted V W cost moved — re-run the S94 keep/drop table before shipping this"
         );
+        // (b''') S102's own accepted cost, pinned for the same reason: the source languages of these
+        // want /ts/ to OPEN the syllable (ja つ, ru ц, and `tsetse` is the one ordinary English word
+        // on that side), and after the drop they do not get it. Zero of them occur in any corpus or
+        // score on this machine — that is the whole reason the trade was taken. If someone reports
+        // one of these singing wrong, the fix is the compound-seam exception named above
+        // EN_ONSET_DROP, NOT putting `T S` back (that would re-break outside/itself/bestseller).
+        for (w, spec) in [
+            ("matsumoto", "M AA0 T | S UW0 | M OW1 | T OW0"),
+            ("tsetse", "T S IY1 T | S IY0"),        // word-INITIAL T S is untouched, as always
+            ("yeltsin", "Y EH1 L T | S AH0 N"),
+        ] {
+            assert_eq!(s(w), want(spec), "the accepted S102 T S cost moved for {w}");
+        }
         // (b') splits that must NOT move — the kept clusters keep cutting exactly as shipped:
         for (w, spec) in [
-            ("nazi", "N AA1 | T S IY0"),            // T S kept (27 votes): /ts/ cuts as a unit
             ("asia", "EY1 | ZH AH0"),
             ("technique", "T EH0 | K N IY1 K"),     // K N kept (14 votes, knish-family) — documented
             ("southwest", "S AW2 | TH W EH1 S T"),  // TH W native (thwart)
@@ -2695,6 +2755,52 @@ mod tests {
             let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
             assert_eq!(got, want, "S94 regeneration-knife primary for {w}");
         }
+    }
+
+    /// S102 — the onset set's BEHAVIOURAL blast radius, proved by mutation rather than asserted.
+    ///
+    /// Two things nobody had ever demonstrated, and both were needed before dropping `T S`:
+    ///  (1) the legal-onset set is invisible on a note that holds a whole word. `resolve_west_span`
+    ///      gives the FINAL consumer every remaining syllable, so a one-note `outside` emits the
+    ///      word's phones in dictionary order no matter where the syllables were cut. That is the
+    ///      reason this whole question is smaller than it looks — but "by construction" is exactly
+    ///      the kind of claim S88 caught being silently false, so it is measured here: the SAME
+    ///      score is resolved against two dictionaries that differ ONLY in whether `T S` is a legal
+    ///      onset, and the one-note arm must come out identical.
+    ///  (2) on a `+` span it is fully visible, and the second arm shows exactly where: `out|side`
+    ///      instead of `ou|tside`. If a future refactor made the cut stop reaching the render, arm
+    ///      (2) would go green-by-vacuum — the `assert_ne!` is what stops that (S92p: a pinning test
+    ///      whose two arms agree is testing nothing).
+    #[test]
+    fn s102_onset_set_only_moves_multi_note_spans() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/en.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s102-onset-scope] SKIPPED — {} not present (gitignored generated asset)", p.display());
+            return;
+        };
+        let shipped = WordDict::from_tsv(Lang::En, &tsv);
+        assert!(!shipped.onsets.contains("T S"), "precondition: the shipped set has T S dropped");
+        let mut pre_s102 = WordDict::from_tsv(Lang::En, &tsv);
+        pre_s102.onsets.insert("T S".to_string()); // the ONLY difference between the two dicts
+        let source = |w: WordDict| Fixtures { zh: zh_fixture(), en: w, de: de_fixture() };
+        let (fx_new, fx_old) = (source(shipped), source(pre_s102));
+
+        // (1) one note holding the whole word — the two onset sets must agree, byte for byte.
+        let one = [evt("outside", Lang::En)];
+        let a = phones_of(&resolve_score(&one, &fx_new).unwrap()[0]);
+        let b = phones_of(&resolve_score(&one, &fx_old).unwrap()[0]);
+        assert_eq!(a, b, "a single note must not see the onset set at all");
+        assert_eq!(a, vec!["aʊ", "t", "s", "aɪ", "d"], "…and it emits the word in dictionary order");
+
+        // (2) the same word over a `+` span — now the cut is audible, and it moved.
+        let span = [evt("outside", Lang::En), evt("+", Lang::En)];
+        let rn = resolve_score(&span, &fx_new).unwrap();
+        let ro = resolve_score(&span, &fx_old).unwrap();
+        let (n0, n1) = (phones_of(&rn[0]), phones_of(&rn[1]));
+        let (o0, o1) = (phones_of(&ro[0]), phones_of(&ro[1]));
+        assert_ne!((&n0, &n1), (&o0, &o1), "the knife must actually reach the render wire");
+        assert_eq!((o0, o1), (vec!["aʊ"], vec!["t", "s", "aɪ", "d"]), "pre-S102: ou|tside");
+        assert_eq!((n0, n1), (vec!["aʊ", "t"], vec!["s", "aɪ", "d"]), "S102: out|side");
     }
 
     /// S101 fr D6 gate over the REAL fr.tsv (same SKIP contract as the S94 gate above — the
