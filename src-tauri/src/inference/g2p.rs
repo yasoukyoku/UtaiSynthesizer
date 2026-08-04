@@ -1134,10 +1134,22 @@ impl ZhDict {
     /// So this is a latent drift risk, not a live defect, which is why it is a comment and not a
     /// change: FLIPPING either side today would be a behaviour change with no evidence behind it.
     ///
-    /// ⇒ If a regenerated zh dictionary ever gains a duplicate key, decide the policy DELIBERATELY
-    /// (and note that the western side's first-row-wins is load-bearing — `build_dictionaries.py`
-    /// sorts variants by upstream pronunciation probability, so "first" means "most likely", while
-    /// the zh tables carry no probability column at all).
+    /// ★★ AND THE ASYMMETRY IS NOT AN OVERSIGHT — the two sides model variation differently, so
+    /// "which row wins" is a question only ONE of them actually has. The western dictionaries spell
+    /// a word's variants as SEPARATE ROWS ordered by upstream pronunciation probability, so
+    /// first-row-wins is load-bearing: "first" means "most likely". The zh tables have no such
+    /// notion, because a polyphone's readings live INSIDE one row, comma-joined and primary-first
+    /// (`和` → `he,hu,huo`). One key, one row, by design.
+    ///
+    /// ⇒ Therefore a duplicate key appearing in a zh tsv is NOT a tie to be broken — it is a
+    /// SYMPTOM. `build_dictionaries.py` emits all three tables by iterating a python dict
+    /// (`mapped.items()` / `sorted(char_readings.items())` / `sorted(phrases.items())`), so unique
+    /// keys are guaranteed by construction and today's generator CANNOT produce one. If you ever see
+    /// one, the first question is "what did I break upstream — generator, source, or merge?", not
+    /// "which policy should win". And do not answer it by ADDING a duplicate row to a table that has
+    /// structurally never had any: that would give the zh side a shape it was never designed for,
+    /// and every consumer assuming one-row-per-key would need re-examining — a far deeper change
+    /// than a tie-break rule firing.
     pub fn from_tsv(syllables: &str, chars: &str, phrases: &str) -> ZhDict {
         let mut d = ZhDict {
             syllables: HashMap::new(),
