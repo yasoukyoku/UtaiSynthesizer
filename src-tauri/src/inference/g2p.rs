@@ -347,6 +347,17 @@ impl WordDict {
         if let Some(p) = self.lookup_faithful(word) {
             return Some(p);
         }
+        // S104: FR/IT elision rung — `l'amour` = `l'` + `amour`. Before it, every productive
+        // elision was VOCAL_OOV, i.e. it ABORTED THE WHOLE SEGMENT (the strict resolve returns
+        // Err), and elision is not an edge case in these languages — French orthography REQUIRES
+        // it before a vowel, so a lyric line carrying l'/j'/t'/m'/s'/n'/d'/c'/qu' + a vowel-initial
+        // word simply could not be sung unless that exact form happened to be one of the 209
+        // lexicalised `clitic+X` rows fr.tsv inherited from MFA.
+        if matches!(self.lang, Lang::Fr | Lang::It) {
+            if let Some(p) = lookup_candidates(word).iter().find_map(|k| self.elision(k)) {
+                return Some(p);
+            }
+        }
         // S95: EN regular plural/possessive rung, strictly LAST — cmudict omits many regular
         // plurals ("dears" while "dear" ships), and before this rung such a lyric hard-aborted
         // the render as VOCAL_OOV. EN only: fr plural -s is SILENT, de/es/it inflect on their
@@ -359,6 +370,61 @@ impl WordDict {
         } else {
             None
         }
+    }
+
+    /// S104 — FR/IT elision: split a lookup key at its FIRST internal apostrophe and concatenate
+    /// `<proclitic'>` + `<rest>`. Three conditions, and all three are the GRAMMAR of elision rather
+    /// than heuristics tuned to a sample:
+    ///   1. the key has an apostrophe that is neither first nor last;
+    ///   2. the part up to and including it is itself a dictionary key — i.e. an attested
+    ///      proclitic. fr.tsv carries `l' j' t' m' s' n' d' c' ç' p' z' qu'` (the 12 vowel-less rows
+    ///      the S86 audit flagged as a hazard — they are the ENABLING data here) plus `jusqu'`,
+    ///      `lorsqu'`, `aujourd'`…; it.tsv carries `l' c' d' all' dell' un'`…;
+    ///   3. ★the rest begins with a VOWEL LETTER or mute `h`. Elision happens BECAUSE the next word
+    ///      is vowel-initial; a consonant-initial right half means this is not an elision at all.
+    ///
+    /// Why the SPELLING test and not "the right half's first PHONE is a vowel" — measured, all three
+    /// variants, on the shipped dictionaries (`TESTING/s104_dict_recheck/guard_compare.py`):
+    ///   phone-vowel        fr 208/222 = 93.7% · **misses l'oiseau / l'ouest / l'huile / l'hiérarchie**
+    ///                      (⟨oi ou hui hi⟩ surface as the glides /w ɥ j/, which are not nuclei)
+    ///   phone-vowel+glide  fr 208/223 = 93.3% · admits `l'yacht` / `l'watt` / `l'week-end`, where
+    ///                      French does NOT elide — and it needs a hand-written glide table
+    ///   **spelling**       **fr 204/216 = 94.4% · it 1446/1446 = 100% · zero non-elision leaks in it**
+    /// The letter test is also the rule as it is actually taught (elide before a vowel letter or
+    /// mute h; ⟨y⟩ and foreign ⟨w⟩ block it), so ⟨y⟩ is deliberately NOT elidable here.
+    ///
+    /// The percentages above are a VALIDATION, not a prediction: they replay the rung against the
+    /// `clitic+X` rows the dictionary already ships, where the shipped reading is the known-correct
+    /// answer. In production those rows are hit by `lookup_faithful` first and the rung never runs.
+    /// The residual disagreements are (a) English junk rows (`a's`, `edward's`, `rock'n`), (b) MFA's
+    /// cross-boundary narrowing (`l'initiative` = `ʎ i…`, where the GTSinger French word-level
+    /// annotation writes the composed `l i` — the clitic is a word boundary), and (c) the e-caduc
+    /// (`l'oeuvre` keeps a final `ə`) — see the queue's fr e-caduc item.
+    ///
+    /// ⚠ KNOWN IMPRECISION, stated so nobody reads this as more than it is: French *h aspiré*
+    /// (`le héros`, `le hasard`) blocks elision lexically, and a lookup table cannot know which
+    /// ⟨h⟩ is which, so `l'héros` composes. It sings what the author typed rather than aborting the
+    /// segment, which is the trade this rung exists to make.
+    ///
+    /// ⚠ SCOPE: fr/it only. es.tsv has **0** apostrophe keys and de.tsv has 1, so the rung is a
+    /// structural no-op there; EN's 7478 apostrophe keys are possessives and contractions
+    /// (`don't`, `john's`) where splitting is simply wrong.
+    ///
+    /// This never changes an answer the dictionary already had: it runs only on the branch where
+    /// `lookup_faithful` returned None, so it can only turn a hard `VOCAL_OOV` abort into a reading
+    /// (`s104_elision_never_overrides_a_faithful_hit` pins that rather than leaving it to construction).
+    fn elision(&self, key: &str) -> Option<Vec<String>> {
+        let i = key.find('\'')?;
+        let (left, right) = (key.get(..=i)?, key.get(i + 1..)?);
+        if left.len() == 1 || right.is_empty() {
+            return None; // leading apostrophe, or nothing to the right
+        }
+        if !right.chars().next().is_some_and(elidable_head) {
+            return None;
+        }
+        let lp = self.map.get(left)?;
+        let rp = self.map.get(right)?;
+        Some(lp.split_whitespace().chain(rp.split_whitespace()).map(str::to_string).collect())
     }
 
     /// One `-'s` / `-s` / `-es` strip of an EN lookup key whose base IS in the dictionary →
@@ -627,6 +693,29 @@ fn lookup_candidates(raw: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// S104 — may a FR/IT elision attach to a word that starts with this letter? (`WordDict::elision`.)
+///
+/// This is an ORTHOGRAPHIC test on purpose and it is not interchangeable with `dict_is_vowel`: the
+/// question elision asks is the one French spelling asks — "does the next word begin with a vowel
+/// letter or a mute h?" — not "is its first PHONE a nucleus". The two differ exactly on ⟨oi ou hui
+/// hi⟩ (`oiseau` = `w a z o`, `huile` = `ɥ i l`: elidable, but the first phone is a glide) and on
+/// ⟨y w⟩ (`yacht`, `week-end`: first phone is likewise a glide, and French does NOT elide). A phone
+/// test has to get one of those two families wrong; the letter test gets both right. ⟨y⟩ is
+/// therefore deliberately absent from the list below.
+fn elidable_head(c: char) -> bool {
+    matches!(
+        c.to_lowercase().next().unwrap_or(c),
+        'a' | 'e' | 'i' | 'o' | 'u'
+            | 'à' | 'á' | 'â' | 'ä' | 'ã' | 'å'
+            | 'è' | 'é' | 'ê' | 'ë'
+            | 'ì' | 'í' | 'î' | 'ï'
+            | 'ò' | 'ó' | 'ô' | 'ö' | 'õ'
+            | 'ù' | 'ú' | 'û' | 'ü'
+            | 'æ' | 'œ'
+            | 'h'
+    )
 }
 
 /// THE nucleus test for a TRADITIONAL-layer phone (en = ARPABET, the MFA languages = their own
@@ -2897,6 +2986,157 @@ mod tests {
         for (w, spec) in [("bosnien", "b ɔ s | ɲ ɛ̃"), ("baguenier", "b a ɡ | ɲ e")] {
             assert_eq!(s(w), want(spec), "the post-D6 cut for {w}");
         }
+    }
+
+    /// S104 — the FR/IT elision rung over the REAL dictionaries. Same loud-SKIP contract.
+    ///
+    /// WHAT IT PROTECTS: before this rung, `l'amour` / `j'aime` / `t'aime` were `VOCAL_OOV`, and OOV
+    /// aborts the WHOLE SEGMENT (`resolve_score` is the strict resolve). Elision is obligatory
+    /// French orthography, so that is not an edge case — measured on the shipped fr.tsv, the
+    /// lexicalised `clitic+X` rows inherited from MFA cover 209 of the ~220k possible combinations
+    /// (0.095%). Every one of the 14 elisions the S86 audit named was still absent today.
+    ///
+    /// The four groups below fail for four DIFFERENT reasons, on purpose (S101: one mutation must
+    /// not be able to satisfy them all):
+    ///  (1) RESCUE — the rung fires and the phones are right;
+    ///  (2) GUARD — a non-elision apostrophe string stays LOUDLY OOV. Deleting the `elidable_head`
+    ///      check turns `o'clock` / `c'mon` / `n'djamena` into silently-sung nonsense;
+    ///  (3) ⟨y⟩ vs ⟨oi⟩ — the reason the guard is a LETTER test. Both `oiseau` and `yacht` begin
+    ///      with a GLIDE phone, so any phone-based guard must get one of them wrong;
+    ///  (4) INERTNESS — the rung never overrides a reading the dictionary already had. This is what
+    ///      makes "no successful render can change" a measured fact instead of an argument from
+    ///      construction (S88: constructions fail silently when the domain gains a new member).
+    #[test]
+    fn s104_fr_it_elision_gate() {
+        let read = |name: &str| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../data/dictionaries")
+                .join(name);
+            std::fs::read_to_string(&p).map_err(|_| p)
+        };
+        let (Ok(fr_tsv), Ok(it_tsv)) = (read("fr.tsv"), read("it.tsv")) else {
+            eprintln!("[s104-elision-gate] SKIPPED — data/dictionaries/{{fr,it}}.tsv not present \
+                       (gitignored generated asset; run MBS2H build_dictionaries.py)");
+            return;
+        };
+        let fr = WordDict::from_tsv(Lang::Fr, &fr_tsv);
+        let it = WordDict::from_tsv(Lang::It, &it_tsv);
+
+        // (1) RESCUE — each of these hard-aborted the segment before S104.
+        for (w, spec) in [
+            ("l'amour", "l a m u ʁ"),
+            ("l'homme", "l ɔ m"),      // mute h
+            ("l'eau", "l o"),
+            ("j'aime", "ʒ ɛ m"),
+            ("t'aime", "t ɛ m"),
+            ("m'aime", "m ɛ m"),
+            ("c'était", "s e t ɛ"),
+            ("d'amour", "d a m u ʁ"),
+            ("l'enfant", "l ɑ̃ f ɑ̃"),
+            ("j'entends", "ʒ ɑ̃ t ɑ̃"),
+            ("l'hiver", "l i v ɛ ʁ"),  // mute h again, and the ⟨i⟩ the MFA narrowing would palatalise
+        ] {
+            let got = fr.lookup(w).unwrap_or_else(|| panic!("fr elision {w} still OOV"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "fr elision reading for {w}");
+        }
+        // …and the composed word syllabifies like French, not like a vowel-less clitic note.
+        assert_eq!(
+            syllabify(&fr, &fr.lookup("l'amour").unwrap()),
+            vec![vec!["l", "a"], vec!["m", "u", "ʁ"]],
+            "l'amour must cut la|mour"
+        );
+
+        // (2) GUARD — apostrophe strings that are NOT elisions must stay loudly OOV rather than
+        //     silently compose. (`d'artagnan` is deliberately NOT in this list: it composes, and
+        //     `d a ʁ t a ɲ ɑ̃` is the correct French reading of it.)
+        for w in ["o'clock", "c'mon", "s'more", "n'djamena", "m'bappe", "l'oreal", "y'all"] {
+            assert!(fr.lookup(w).is_none(), "fr must stay OOV on the non-elision {w}");
+        }
+        for w in ["o'brien", "o'connor", "o'neill", "o'clock", "c'mon", "s'more", "rock'n'roll"] {
+            assert!(it.lookup(w).is_none(), "it must stay OOV on the non-elision {w}");
+        }
+
+        // (3) The exact pair that rules out a phone-based guard: `oiseau` = `w a z o` and `yacht`
+        //     also opens on a glide, yet French elides before only one of them. A guard reading the
+        //     first PHONE cannot separate these two; the letter test does.
+        assert_eq!(fr.map.get("oiseau").map(String::as_str), Some("w a z o"), "fixture assumption");
+        assert_eq!(
+            fr.lookup("l'oiseau"),
+            Some(vec!["l".into(), "w".into(), "a".into(), "z".into(), "o".into()]),
+            "⟨oi⟩ elides even though its first phone is a glide"
+        );
+        assert!(fr.lookup("l'yacht").is_none(), "⟨y⟩ blocks elision");
+
+        // (4) INERTNESS over EVERY apostrophe-bearing key the dictionaries already ship: wherever
+        //     the faithful ladder answers, `lookup` must return THAT answer, not a composed one.
+        for (tag, d, tsv) in [("fr", &fr, &fr_tsv), ("it", &it, &it_tsv)] {
+            let mut checked = 0usize;
+            for line in tsv.lines() {
+                let Some((w, _)) = line.split_once('\t') else { continue };
+                if !w.contains('\'') {
+                    continue;
+                }
+                let key = w.to_lowercase();
+                let Some(faithful) = d.lookup_faithful(&key) else { continue };
+                assert_eq!(d.lookup(&key), Some(faithful), "{tag}: elision overrode {w}");
+                checked += 1;
+            }
+            // …and the loop really ran (an empty sweep would pass vacuously — S102's "which set is
+            // this zero over" rule applied to a test).
+            assert!(checked > 300, "{tag}: only {checked} apostrophe keys swept");
+        }
+
+        // Italian works the same way and is where the rung is most accurate (1446/1446 of the
+        // shipped `clitic+X` rows reproduce exactly when composed — see `WordDict::elision`).
+        // (`uomo` is `u o m o` in it.tsv, not `u ɔ m o` — the upstream italian_cv transcription does
+        //  not mark the open-mid vowel here. Pinned as it is, not as the IPA chart would have it.)
+        for (w, spec) in [("l'uomo", "l u o m o"), ("un'ora", "u n o r a")] {
+            let got = it.lookup(w).unwrap_or_else(|| panic!("it elision {w} still OOV"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "it elision reading for {w}");
+        }
+    }
+
+    /// S104 — the editor and the render must agree about an elision. `classify_score` is the lenient
+    /// resolve behind the red OOV marks in the piano roll and `resolve_score` is the strict one the
+    /// render uses; they share `WordDict::lookup`, which is WHY the rung was put there instead of in
+    /// `resolve_west_span`. Pinning it makes that a test rather than a code-reading.
+    #[test]
+    fn s104_elision_agrees_between_editor_and_render() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/fr.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s104-elision-editor] SKIPPED — {} not present", p.display());
+            return;
+        };
+        struct FrOnly(WordDict);
+        impl DictSource for FrOnly {
+            fn zh(&self) -> Result<&ZhDict> {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+            fn words(&self, lang: Lang) -> Result<&WordDict> {
+                if lang == Lang::Fr {
+                    Ok(&self.0)
+                } else {
+                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+                }
+            }
+        }
+        let src = FrOnly(WordDict::from_tsv(Lang::Fr, &tsv));
+        let score = [evt("l'amour", Lang::Fr)];
+        let rendered = resolve_score(&score, &src).expect("the render must not abort on an elision");
+        assert_eq!(phones_of(&rendered[0]), vec!["l", "a", "m", "u", "ʁ"]);
+        let classed = classify_score(&score, &src).unwrap();
+        assert!(
+            matches!(classed[0], LyricClass::Phones { .. }),
+            "the editor still marks l'amour unknown while the render sings it — editor/render split \
+             (got {:?})",
+            classed[0]
+        );
+        // …and the same call really did mark an OOV neighbour, so the assertion above is not
+        // passing because `classify_score` stopped reporting anything (S102: which set is the zero over).
+        let control = classify_score(&[evt("zzqqxx'zzqq", Lang::Fr)], &src).unwrap();
+        assert!(matches!(control[0], LyricClass::Unknown), "control: {:?}", control[0]);
     }
 
     // ─── S102: the three dictionaries that had NO tripwire at all ────────────────────────────────

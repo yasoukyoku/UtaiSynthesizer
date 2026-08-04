@@ -687,8 +687,20 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  `outside`, which goes from `AW1 | T S AY1 D` to `AW1 T | S AY1 D`. It still earns a bump for the
  *  s99 reason and not the s95 one: the old behaviour was a silent SUCCESS, so a project holding a
  *  signature-CLEAN bake of `ou|tside` — the PRE-s102 cut; an adversarial pass caught this sentence
- *  naming the post-fix one — would otherwise never pick the fix up. */
-export const G2P_ALGO_VERSION = "s102";
+ *  naming the post-fix one — would otherwise never pick the fix up.
+ *  s104 = the FR/IT elision rung (`WordDict::elision` in g2p.rs). `l'amour` / `j'aime` / `t'aime`
+ *  used to be VOCAL_OOV, and OOV aborts the WHOLE segment, so French lyrics could not be sung at all
+ *  unless every elision in them happened to be one of the 209 forms MFA had lexicalised.
+ *  ★ Honestly, the S95 argument applies here and would say NOT to bump: the rung runs only on the
+ *  branch where the faithful ladder already returned nothing, so every score it changes is a score
+ *  whose strict render ERRORED — there is no signature-clean bake anywhere that could go stale
+ *  (`s104_fr_it_elision_gate` group (4) pins that inertness over every apostrophe key we ship,
+ *  rather than leaving it as an argument from construction). It is bumped anyway for one reason:
+ *  this stamp has ALREADY moved twice in the unreleased 0.12 batch (s99 → s101 → s102), so every
+ *  0.11.0 project re-renders on upgrade regardless and the bump costs nothing real — while it does
+ *  close the one contrived path the S95 argument leaves open, namely that `join_lookup` also calls
+ *  `lookup`, so a fragment-merge window that previously found nothing can now win by being longer. */
+export const G2P_ALGO_VERSION = "s104";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
