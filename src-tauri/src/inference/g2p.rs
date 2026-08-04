@@ -1122,6 +1122,22 @@ pub struct ZhDict {
 }
 
 impl ZhDict {
+    /// ⚠ S107 (queue §C20) — THE DUPLICATE-KEY POLICY HERE IS THE OPPOSITE OF `WordDict::from_tsv`,
+    /// and it was never written down. These three loops use `HashMap::insert`, so a repeated key means
+    /// **LAST row wins**; the western dictionaries match on `Entry::Vacant` instead, so there it is
+    /// **FIRST row wins** (and S106 keeps the losers in `alts`). Two opposite, unstated rules in one
+    /// file is exactly the shape that turns into a silent drift later.
+    ///
+    /// Consequence TODAY is zero, and that is a measured statement rather than an assumption: the
+    /// three shipped tsv have 0 duplicate keys each (422/422 syllables, 44434/44434 chars,
+    /// 47111/47111 phrases — recount with a one-line `Counter` over column 0 if you doubt it).
+    /// So this is a latent drift risk, not a live defect, which is why it is a comment and not a
+    /// change: FLIPPING either side today would be a behaviour change with no evidence behind it.
+    ///
+    /// ⇒ If a regenerated zh dictionary ever gains a duplicate key, decide the policy DELIBERATELY
+    /// (and note that the western side's first-row-wins is load-bearing — `build_dictionaries.py`
+    /// sorts variants by upstream pronunciation probability, so "first" means "most likely", while
+    /// the zh tables carry no probability column at all).
     pub fn from_tsv(syllables: &str, chars: &str, phrases: &str) -> ZhDict {
         let mut d = ZhDict {
             syllables: HashMap::new(),
