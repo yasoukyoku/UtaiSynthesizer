@@ -1971,6 +1971,26 @@ mod tests {
     fn fixtures() -> Fixtures {
         Fixtures { zh: zh_fixture(), en: en_fixture(), de: de_fixture() }
     }
+    /// S104 — the REAL fr.tsv as a `DictSource`, so a French test can drive `resolve_score` /
+    /// `classify_score` down the same chain the app uses instead of only calling `lookup`.
+    struct FrOnly(WordDict);
+    impl DictSource for FrOnly {
+        fn zh(&self) -> Result<&ZhDict> {
+            Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+        }
+        fn words(&self, lang: Lang) -> Result<&WordDict> {
+            if lang == Lang::Fr {
+                Ok(&self.0)
+            } else {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+        }
+    }
+    /// Read the shipped fr.tsv, or `None` when this is a bare checkout (data/ is gitignored).
+    fn fr_tsv() -> Option<String> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/fr.tsv");
+        std::fs::read_to_string(&p).ok()
+    }
     fn evt(lyric: &str, lang: Lang) -> ScoreEvt<'_> {
         evt_set(lyric, lang, PhonemeSet::Words)
     }
@@ -3109,19 +3129,6 @@ mod tests {
             eprintln!("[s104-elision-editor] SKIPPED — {} not present", p.display());
             return;
         };
-        struct FrOnly(WordDict);
-        impl DictSource for FrOnly {
-            fn zh(&self) -> Result<&ZhDict> {
-                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
-            }
-            fn words(&self, lang: Lang) -> Result<&WordDict> {
-                if lang == Lang::Fr {
-                    Ok(&self.0)
-                } else {
-                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
-                }
-            }
-        }
         let src = FrOnly(WordDict::from_tsv(Lang::Fr, &tsv));
         let score = [evt("l'amour", Lang::Fr)];
         let rendered = resolve_score(&score, &src).expect("the render must not abort on an elision");
@@ -3137,6 +3144,53 @@ mod tests {
         // passing because `classify_score` stopped reporting anything (S102: which set is the zero over).
         let control = classify_score(&[evt("zzqqxx'zzqq", Lang::Fr)], &src).unwrap();
         assert!(matches!(control[0], LyricClass::Unknown), "control: {:?}", control[0]);
+    }
+
+    /// S104 (b)-G3 — `yeux` must sing the WORD, not the phrase *les yeux*.
+    ///
+    /// Upstream ships two rows and `build_mfa` sorts by MFA's probability column, which put the
+    /// liaison reading `l e z j ø` first; the Rust loader keeps the first row, so `les | yeux` on
+    /// two notes sang `l e | l e z j ø` — "le-lezyeu". MBS2H `FR_PRIMARY_OVERRIDES` now flips it,
+    /// REORDER ONLY (the liaison row is still there for a future per-note reading selector).
+    ///
+    /// This gate exists because the flip lives in the generator: a regeneration that loses it, or
+    /// an upstream that respells the wanted variant, must go red here rather than ship green — the
+    /// exact hole `s94_en_onset_vote_gate` / `s101_fr_d6_gate` were created to close for their own
+    /// knives. Same loud-SKIP contract.
+    #[test]
+    fn s104_fr_yeux_primary_is_the_word_not_the_phrase() {
+        let Some(tsv) = fr_tsv() else {
+            eprintln!("[s104-yeux] SKIPPED — data/dictionaries/fr.tsv not present (gitignored)");
+            return;
+        };
+        let src = FrOnly(WordDict::from_tsv(Lang::Fr, &tsv));
+
+        // (a) the reading itself.
+        assert_eq!(
+            src.0.lookup("yeux"),
+            Some(vec!["j".to_string(), "ø".to_string()]),
+            "yeux must be /jø/ — if this is `l e z j ø` the MBS2H FR_PRIMARY_OVERRIDES flip is gone"
+        );
+
+        // (b) REORDER ONLY: the liaison reading is demoted, never deleted. (A future per-note
+        //     reading selector needs it, and `EN_PRIMARY_OVERRIDES` makes the same promise.)
+        let rows: Vec<&str> = tsv
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(w, _)| *w == "yeux")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(rows, vec!["j ø", "l e z j ø"], "yeux rows: flipped, not pruned");
+
+        // (c) the behaviour that was actually wrong — two ordinary notes of a French lyric line.
+        let score = [evt("les", Lang::Fr), evt("yeux", Lang::Fr)];
+        let r = resolve_score(&score, &src).unwrap();
+        assert_eq!(phones_of(&r[0]), vec!["l", "e"]);
+        assert_eq!(
+            phones_of(&r[1]),
+            vec!["j", "ø"],
+            "`les | yeux` must not re-sing the article on the second note"
+        );
     }
 
     // ─── S102: the three dictionaries that had NO tripwire at all ────────────────────────────────
