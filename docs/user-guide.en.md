@@ -453,6 +453,25 @@ The editor's view is independent of the arrangement view's zoom/scroll. On openi
 
 Lyrics are single-line, at most 64 characters; clearing a lyric falls back to the track language's default lyric.
 
+**`+` and `-` are not the same thing (they really diverge from v0.12)**: the two tokens have always
+meant different things — `+` is "**give this note the word's next syllable**" and `-` is "**hold the
+previous vowel through this note**" (the same split Synthesizer V uses) — but before v0.12 they behaved
+identically once a word ran out of syllables, both falling back to a sustain. Now they differ:
+
+- **The French mute e**: French's silent word-final ⟨e⟩ (`belle`, `banque`, `arbres`, `chantent`) is
+  sung whenever the composer gives it a note of its own. So `belle` + `+` now sings `b ɛ | l ə`
+  (bel-le), while `belle` + `-` still sings `b ɛ | ɛ l` (the ɛ held).
+  ⇒ **write `+` for the mute e; write `-` for a melisma (one syllable over several notes).**
+- **Everything else**: when a word has no syllable left and no mute e to give (`pour` + `+`, or any
+  word in English/German/Spanish/Italian), `+` still falls back to a sustain, exactly like `-`.
+- ⚠ Whether a French mute e is pronounced **depends on the next word**: French elides it before a
+  vowel (`belle amie` is sung "be-lla-mie", not "bel-le-a-mie"). A dictionary cannot know that — but
+  **you already decided it when you wrote the score**: simply do not give that ⟨e⟩ a note of its own.
+- ⚠ Only French has this rule today, and which spellings count as a mute e is decided orthographically
+  (consonant letter + ⟨e⟩, including ⟨-que⟩/⟨-gue⟩, the plural ⟨-es⟩ and the 3rd-person-plural
+  ⟨-ent⟩). Anything it gets wrong can be overridden with phoneme input (`[square brackets]` in the
+  lyric, or the phoneme field in the sidebar).
+
 **Fragmented lyrics join back automatically (new in v0.12)**: UTAU scores often spell one English word as
 per-note fragments with the seam consonant doubled (`nev`+`ver`, `giv`+`ving`). A fragment the dictionary
 cannot find is automatically re-joined with its neighbours into a real word — one copy of the doubled seam
