@@ -616,6 +616,7 @@ impl WordDict {
                 if !seams.any.contains(&n) {
                     seams.any.push(n);
                     if !is_bound
+                        && n >= SEAM_STRICT_HEAD_PHONES
                         && tail_chars >= SEAM_STRICT_TAIL_CHARS
                         && want.len() - n >= SEAM_STRICT_TAIL_PHONES
                         // ★ the tail may not be spelled with an initial ⟨i⟩ or ⟨e⟩. Those are the
@@ -1310,7 +1311,13 @@ pub struct Seams {
 // the biggest source of real seams (62 + 45 words for ab-/auf- alone) and the thing that makes
 // `abtragen` = ab+tragen vs abt+ragen ambiguous.
 const SEAM_HEAD_CHARS: usize = 2;
-const SEAM_HEAD_PHONES: usize = 2;
+// ★ ONE phone, not two — a head as short as `eye` (`AY1`) has to be VISIBLE or the abstention
+// cannot see it. `eyedrops` decomposes both as eye+drops (right) and eyed+rops (wrong); with a
+// two-phone floor only the wrong one existed and the word was mis-cut with nothing to abstain
+// against. Costs exactly one word, and that word was a known error. The STRICT tier keeps its
+// own two-phone floor below, so this can only ever ADD abstentions.
+const SEAM_HEAD_PHONES: usize = 1;
+const SEAM_STRICT_HEAD_PHONES: usize = 2;
 const SEAM_TAIL_CHARS: usize = 2;
 const SEAM_TAIL_PHONES: usize = 2;
 // Strict tier — the tail must be long enough to be a word rather than a Latin/Greek ending. Every
@@ -3792,8 +3799,8 @@ mod tests {
             return;
         };
         let dicts = [
-            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1132usize),
-            ("en", WordDict::from_tsv(Lang::En, &en_tsv), &en_tsv, 1479),
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1129usize),
+            ("en", WordDict::from_tsv(Lang::En, &en_tsv), &en_tsv, 1478),
             ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, 0),
             ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, 0),
             ("it", WordDict::from_tsv(Lang::It, &it_tsv), &it_tsv, 0),
@@ -3837,8 +3844,9 @@ mod tests {
         // probe that edits a constant must fire HERE, naming the constant, instead of surfacing as
         // an unexplained cut change three groups later (S101/S105: one mutation red in the wrong
         // group leaves the right group unverified).
-        assert_eq!((SEAM_HEAD_CHARS, SEAM_HEAD_PHONES), (2, 2), "the LOOSE head tier moved");
+        assert_eq!((SEAM_HEAD_CHARS, SEAM_HEAD_PHONES), (2, 1), "the LOOSE head tier moved");
         assert_eq!((SEAM_TAIL_CHARS, SEAM_TAIL_PHONES), (2, 2), "the LOOSE tail tier moved");
+        assert_eq!(SEAM_STRICT_HEAD_PHONES, 2, "the STRICT head tier moved");
         assert_eq!(
             (SEAM_STRICT_TAIL_CHARS, SEAM_STRICT_TAIL_PHONES),
             (4, 3),
