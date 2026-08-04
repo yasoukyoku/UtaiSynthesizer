@@ -3359,6 +3359,88 @@ mod tests {
                 assert_eq!(syllabify(d, &phones), want(spec), "{name}: the S105 cut for {w}");
             }
         }
+
+        // (5) ★END TO END — the only group that runs the PRODUCTION path this knife actually
+        // changes. Everything above tests `syllabify` in isolation; what the user hears is
+        // `resolve_score` distributing those syllables over a multi-note word (`word` + `+`),
+        // which is the ONE consumer of the onset set (`resolve_west_span`, g2p.rs). S85 rule 4 —
+        // "the user must never be the first to execute a path" — is why this group exists: a
+        // cluster verdict that is right in the table and wrong on the wire is exactly the shape
+        // that has bitten this repo before.
+        struct OneLang(Lang, WordDict);
+        impl DictSource for OneLang {
+            fn zh(&self) -> Result<&ZhDict> {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+            fn words(&self, lang: Lang) -> Result<&WordDict> {
+                if lang == self.0 {
+                    Ok(&self.1)
+                } else {
+                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+                }
+            }
+        }
+        // Each case is an A/B against a dictionary that differs ONLY in the gate, exactly like
+        // `s102_onset_set_only_moves_multi_note_spans` does for English. The `assert_ne!` is the
+        // point (S92p: a pinning test whose two arms agree is testing nothing) — it is what would
+        // catch a future refactor that stops the onset set from reaching the render.
+        for (name, lang, word, before, after) in [
+            ("de", Lang::De, "fenster",
+             &[&["f", "ɛ", "n"][..], &["s", "t", "ɐ"][..]][..],
+             &[&["f", "ɛ", "n", "s"][..], &["t", "ɐ"][..]][..]),
+            ("fr", Lang::Fr, "espace",
+             &[&["ɛ"][..], &["s", "p", "a", "s"][..]][..],
+             &[&["ɛ", "s"][..], &["p", "a", "s"][..]][..]),
+            ("it", Lang::It, "fronte",
+             &[&["f", "r", "o"][..], &["n", "t", "e"][..]][..],
+             &[&["f", "r", "o", "n"][..], &["t", "e"][..]][..]),
+            // ⚠ only the FIRST cut moves here: `n t̪` was never in the onset set even pre-S105
+            // (nothing attests it word-initially), so `men|tos` was already right — a live example
+            // of the `observed ∩ KEEP` limitation noted above (`n t̪ ɾ` is attested, `n t̪` is not).
+            ("es", Lang::Es, "fundamentos",
+             &[&["f", "u"][..], &["n", "d̪", "a"][..], &["m", "e", "n"][..], &["t̪", "o", "s"][..]][..],
+             &[&["f", "u", "n"][..], &["d̪", "a"][..], &["m", "e", "n"][..], &["t̪", "o", "s"][..]][..]),
+        ] {
+            let tsv = dicts.iter().find(|x| x.0 == name).unwrap().2;
+            // pre-S105 = the same dictionary with EVERY observed cluster admitted (`min_votes = 1`)
+            let mut pre = WordDict::from_tsv(lang, tsv);
+            for line in tsv.lines() {
+                let Some((_, phones)) = line.split_once('\t') else { continue };
+                let toks: Vec<&str> = phones.split_whitespace().collect();
+                if let Some(vi) = toks.iter().position(|t| pre.is_vowel(t)) {
+                    if vi >= 2 {
+                        pre.onsets.insert(toks[..vi].join(" "));
+                    }
+                }
+            }
+            let now = OneLang(lang, WordDict::from_tsv(lang, tsv));
+            let old = OneLang(lang, pre);
+            let mut score = vec![evt(word, lang)];
+            score.extend(std::iter::repeat_with(|| evt("+", lang)).take(after.len() - 1));
+            let run = |src: &OneLang| -> Vec<Vec<&'static str>> {
+                resolve_score(&score, src)
+                    .unwrap_or_else(|e| panic!("{name}: strict resolve of {word} failed: {e:?}"))
+                    .iter()
+                    .map(phones_of)
+                    .collect()
+            };
+            let (a, b) = (run(&old), run(&now));
+            assert_ne!(a, b, "{name}: the S105 gate must actually reach the render wire for {word}");
+            assert_eq!(a, *before, "{name}: pre-S105 wire shape for {word}");
+            assert_eq!(
+                b, *after,
+                "{name}: {word} over {} notes came out wrong ON THE WIRE (the table may still be \
+                 right — this is the consumer, `resolve_west_span`)",
+                after.len()
+            );
+            // …and on ONE note the onset set is invisible (S102 arm (1)): same phones either way.
+            let one = [evt(word, lang)];
+            assert_eq!(
+                phones_of(&resolve_score(&one, &old).unwrap()[0]),
+                phones_of(&resolve_score(&one, &now).unwrap()[0]),
+                "{name}: a single note must not see the onset set at all"
+            );
+        }
     }
 
     /// S104 — the FR/IT elision rung over the REAL dictionaries. Same loud-SKIP contract.
