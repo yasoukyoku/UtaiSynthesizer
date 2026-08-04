@@ -461,10 +461,9 @@ impl WordDict {
     pub fn from_tsv(lang: Lang, tsv: &str) -> WordDict {
         let min_votes = match lang {
             Lang::En => EN_ONSET_MIN_VOTES,
-            // de/fr/es/it carry their own loanword pollution (fr observes 325 onsets!), but their
-            // verdicts belong to the S86#10 self-verification round (reverse-projection fixtures,
-            // S92m) — thresholding them here without one rendered A/B would repeat the exact
-            // mistake this constant exists to prevent. Every observed cluster stays legal for now.
+            // de/fr/es/it are NOT gated by a vote count — see `WEST_ONSET_KEEP` below. The count is
+            // left at 1 so the vote table stays a pure observation and the keep list is the only
+            // filter; `s105_west_onset_gate` pins that reading.
             _ => 1,
         };
         Self::from_tsv_min_votes(lang, tsv, min_votes)
@@ -501,11 +500,7 @@ impl WordDict {
             // closed class; review S94R-3 corrected an earlier "ZH 94" claim here), and dropping one
             // would glue every intervocalic instance of that consonant to the previous syllable — a
             // category of damage no attestation count justifies.
-            if cluster.contains(' ')
-                && (n < min_votes
-                    || (lang == Lang::En && EN_ONSET_DROP.contains(&cluster.as_str()))
-                    || (lang == Lang::Fr && FR_ONSET_DROP.contains(&cluster.as_str())))
-            {
+            if cluster.contains(' ') && !onset_admitted(lang, &cluster, n, min_votes) {
                 continue;
             }
             dict.onsets.insert(cluster);
@@ -643,6 +638,196 @@ const EN_ONSET_DROP: &[&str] =
 /// ⚠ fr `min_votes` is still 1 and this list does NOT change that. The general four-language vote
 /// gate remains untested and unowned by this round (see `EN_ONSET_MIN_VOTES`, S86#10).
 const FR_ONSET_DROP: &[&str] = &["d n", "s f n", "z v n"];
+
+/// S105 (queue §C2) — the FOUR-LANGUAGE onset gate. Until now de/fr/es/it had NONE: `from_tsv`
+/// admitted the word-initial cluster of every line with zero filtering, so ONE loanword or proper
+/// noun made a cluster legal and rewrote how thousands of ordinary words split across notes.
+/// Measured on the shipped dictionaries: it `n t` is attested by a single entry (`N-terminali`) and
+/// captures **5825** word types (`fronte` → `f r o | n t e`); es `n d̪` by one (`ndocciata`) → 3820
+/// (`abandera` → `a | β a | n d̪ e | ɾ a`); de `t l` by two exonyms (tlingit / tlaxcalteken) → 2182
+/// (`deutlich` → `d ɔʏ | t l ɪ ç`, `atlas` → `a | t l a s`).
+///
+/// ★ THE CRITERION IS NOT THE VOTE COUNT — and it is not "can this cluster begin a word" either. It
+///   is: **when the cluster sits between two vowels INSIDE a word, does the language put the WHOLE
+///   of it into the second syllable?** French /sp st sk/ do begin words (sport, station, ski) and
+///   French still syllabifies es-pace, es-ca-lier with /s/ in the CODA. Italian `v r` is attested
+///   word-initially by ONE Dutch surname (`Vries`) and must be KEPT (a-vran-no, muta cum liquida);
+///   Italian `k k` is likewise attested once (`K-Chart`) and must be GATED (ac-qua). Same vote
+///   count, opposite verdicts — that pair is the ruler, and it is why no threshold can work here.
+///
+/// ⇒ SHAPE: per-language curated KEEP lists, and the onset set becomes `observed ∩ KEEP`, never
+///   `observed − DROP`. Fail-CLOSED on purpose: a dictionary regeneration that introduces a NEW
+///   word-initial cluster gets it gated and turns `s105_west_onset_gate` red for judgement instead
+///   of silently making it legal — the river S94 (`N D` / kidney) and S101 (`d n` / sidney) each had
+///   to dam by hand after the fact. The cost of that choice is stated under RESIDUE below.
+///
+/// ⚠ BLAST RADIUS, measured not argued: over all 406182 keys of the four dictionaries this moves
+///   consonants BETWEEN syllables and never changes the SYLLABLE COUNT or the phone sequence
+///   (`syllabify` emits exactly one syllable per nucleus, whatever the onset set). So
+///   `resolve_west_span`'s `n_consumers` is untouched, no word becomes OOV or stops being OOV, and
+///   the only audible difference is which note a consonant lands on in a multi-note word.
+///   Deduplicated word types re-cut: de 27119 (18.9%) · fr 11347 (10.7%) · es 21285 (23.6%) ·
+///   it 12939 (19.4%) = 72690 in total.
+///
+/// ⛔ TWO NEGATIVE RESULTS, recorded so nobody re-runs them:
+///  1. The upstream GTSinger note-boundary surface — which queue (b)8 proposed for exactly this
+///     question — CANNOT judge onset legality. Control: a SINGLE intervocalic consonant,
+///     unambiguously the onset of the next syllable in all four languages, is assigned to the
+///     PREVIOUS note 43% / 47% / 55% / 46% of the time (de/fr/es/it, n = 2221/2323/2817/3531, and
+///     identical under both note-segmentation conventions). On the two Spanish clusters whose answer
+///     is certain it returns the OPPOSITE of the truth (`t̪ ɾ` whole-in-next 24%, `s t̪` 66%). That
+///     annotation encodes articulatory timing, not syllable affiliation.
+///  2. The morphological-seam oracle (S102's `T S` instrument) DOES work here — de Fugen-s scores
+///     `s f` 666:2, `s b` 596:0, `t l` 426:0 for GATE while obstruent+liquid scores `ɡ ʁ` 0:538,
+///     `ʃ p` 0:425 for KEEP — but only after two fixes: a word with a seam BOTH at the cluster start
+///     and inside it (`abtragen` = ab+tragen vs abt+ragen) must count as ambiguous, and suffix seams
+///     must be excluded (the German superlative `-ste` gave `s t` 324 false KEEP hits, the same
+///     mast+er shape S102 already warned about).
+///
+/// ★ FIVE VERDICTS THE PHONOTACTIC TEMPLATE GOT WRONG ON ITS OWN — all caught by counting the words
+///   each cluster actually captures, none by reasoning:
+///  · de `s j` / `ts j` — the template said GATE; 1104 of `s j`'s 1292 captures are the ⟨-tion⟩ /
+///    ⟨-sion⟩ family (`abduktion` = `a p | d ʊ k t | s j oː n`, `dimension`, `depression`) where the
+///    present cut is right or one phone from it and gating moves a SECOND phone into the coda. KEEP.
+///    The ~40 Fugen-s compounds on the other side (`abschlussjahr`) keep their existing wrong cut:
+///    a named cost, not a regression. ⚠ The clause is RECURSIVE — `X j` is kept only when `X` itself
+///    is admitted — so `k s j` and `s t j` are gated with their bases (`Kriegs-jahr`, `Dienst-jah-re`,
+///    and `Reflexion` is [ʁeflɛk.si̯oːn] exactly as `Hexe` is Hek-se).
+///  · de `t l` — the blanket obstruent+liquid template has to carve out the *tl/*dl gap. 2182 word
+///    types, every one of them German morphology (deut-lich, Sport-ler, Abend-land) or a name from a
+///    language that forbids /tl/ too. en.tsv was ALREADY gated for this exact cluster citing this
+///    exact exonym (`EN_ONSET_DROP`'s gate pins `atlas` = `AE1 T | L AH0 S`, "was … tlingit's T L").
+///    French carries the identical gap (183 types: ath-lète, at-las, mat(e)-lot, out-law).
+///  · fr obstruent+`ʎ` and obstruent+`ɟ`/`c` — fr.tsv narrows /l/ to `ʎ` before /i/ (S104 §4a proved
+///    the training side does the same) and writes /k ɡ/ as `c ɟ` before front vowels (`guerre` =
+///    `ɟ ɛ ʁ`, `basket` = `b a s c ɛ t`). So `p ʎ` IS muta cum liquida (`accompli`) and `ɟ ʁ` IS
+///    /ɡʁ/. Missing either half of an allophone pair is how a template silently regresses.
+///  · it `s`-vs-`z` — it.tsv writes the same environment both ways (`disgustato` = `d i s ɡ …` but
+///    `sbagliando` = `z b …`), so the s-impura clause must treat them identically or a transcription
+///    detail decides a linguistic verdict (di-sgu-sto, di-sgra-zia).
+///  · it `ʃ r` / `ʃ l` — upstream transcribes ⟨scr⟩/⟨scl⟩ that way (`Scritta`, `Sclerosi`,
+///    `javascript` = java+script): s-impura + liquid, not /ʃ/ + liquid.
+///
+/// ★ KNOWN COSTS, each a decision rather than an oversight:
+///  · es `t̪ l` / `d̪ l` gated = the PENINSULAR norm (at-le-ta, At-lan-ta). 79 word types; the ~30
+///    Nahuatl toponyms in that set (`amatitlán`, `tuxtla`) want the Mexican a-tla and now lose.
+///  · it `t l` KEPT while `d l` and `v l` are gated — deliberately NOT symmetric, and the asymmetry
+///    is the double-entry, not a rule: `t l`'s 102 captures include ~28 everyday Italian words
+///    (atleta / atletica / atlantico / -athlon) that DOP hyphenates a-tlè-ta, whereas `d l` (33) and
+///    `v l` (10) contain **no Italian word at all** — only adler/bundle/chandler and
+///    pavlova/yakovlev/Vlad, which want the coda. The ~70 foreign names inside `t l` keep the wrong
+///    cut; that is the compound-seam residue below, not a new defect.
+///  · it `p s` / `p n` / `k t` / `m n` gated = printed hyphenation (au-top-sì-a, cap-su-la,
+///    am-ni-stì-a) rather than the school rule "clusters that can begin a word never divide".
+///    Genuinely contested in Italian; 192 word types.
+///  · es keeps NO obstruent+trill onset. A handful of rows spell the tap with the trill glyph
+///    (`labranza` = `l a β r a n s a`, `enjambre` = `e ŋ x a m b r e`) and lose their cut — ~9 word
+///    types. Adding `β r` / `b r` back was measured and REJECTED: every genuine Spanish complex
+///    onset is written `ɾ` with hundreds of votes, every obstruent+trill entry is a 1-3 vote junk
+///    row, and 16 of `β r`'s 23 captures are the sub- prefix family where sub-ra-yar is correct.
+///    That is an es.tsv transcription defect and must be fixed there.
+///  · Likewise es `d̪ ʃ` (1 word, `neozelandés` — a corrupt two-phone spelling of ⟨z⟩) and fr `ɡ n`
+///    (39 of 104 captures are ⟨gn⟩=/ɲ/ that upstream failed to write as `ɲ`; the other 65 are
+///    genuine /ɡn/ and want the gate). Both are dictionary rows, not onset-set questions.
+///
+/// ★ RESIDUE this round does NOT fix, named so it is not mistaken for done:
+///  · `observed ∩ KEEP` can only REMOVE. Clusters that are legal but never attested word-initially
+///    stay absent, so e.g. es `k l w` (39 types: `excluida` → `e k s k | l w i ð | a`) and `ɡ l j`
+///    (4) still mis-cut. Making the keep list authoritative would fix them but requires the list to
+///    be exhaustive, which is a separate round with its own evidence.
+///  · Compound seams INSIDE kept clusters are untouched (German `Bank|rott`, `Blick|richtung`,
+///    `alternativ|los`; the ~70 foreign names in it `t l`). Same missing instrument as queue §C3 —
+///    a true-compound seam exception — now owed in four more languages.
+const DE_ONSET_KEEP: &[&str] = &[
+    // obstruent + liquid (muta cum liquida) — 15 clusters, 16051 captured word types
+    "t ʁ", "ɡ ʁ", "k l", "b ʁ", "k ʁ", "p ʁ", "p l", "f l", "f ʁ", "b l", "d ʁ", "ɡ l", "pf l",
+    "v ʁ", "pf ʁ",
+    // ⟨sch⟩ family, ʃ + C — 7 clusters, 8582 types (ver-ste-hen, ge-spielt)
+    "ʃ t", "ʃ p", "ʃ l", "ʃ ʁ", "ʃ v", "ʃ n", "ʃ m",
+    // ʃ + stop + liquid — 3 clusters, 1400 types (Straße, sprechen, Splitter)
+    "ʃ t ʁ", "ʃ p ʁ", "ʃ p l",
+    // the glide clause, single consonant + j (⟨-ion⟩ / ⟨-ie⟩) — 10 clusters, 2105 types
+    "s j", "ts j", "p j", "t j", "m j", "ʁ j", "f j", "v j", "d j", "k j",
+    // …and an ADMITTED cluster + j (recursive; `k s j` / `s t j` / `m b j` are gated with their
+    // bases) — 3 clusters, 2 types
+    "b ʁ j", "k n j", "p l j",
+    // German-specific onsets: kn-, gn-, ⟨qu⟩ = k v, ⟨zw⟩ = ts v.
+    // ⛔ `ɡ v` was proposed here as "⟨qu⟩'s voiced twin" and MEASURED DOWN: ⟨qu⟩+V really is
+    //    `k v` (843/909 = 93%), but ⟨gu⟩+V is `ɡ ʊ` — a VOWEL, its own nucleus — in 173 words
+    //    against 11 with `ɡ v`, and `guadalquivir` = `ɡ ʊ a d aː l k v ɪ v iː ɐ` carries both
+    //    graphemes in one entry. Of the 15 words `ɡ v` captures, the four where the /v/ is real
+    //    (Rogg+wil, Edg+ware, Trygg-va-son, mogwai) are exactly the ones German splits; the other
+    //    11 are the 6% error tail of ⟨gu⟩ (baguette `ɡ ʊ` vs baguettes `ɡ v`; paraguay `ɡ ʊ` vs
+    //    paraguayischen `ɡ v`). Fix belongs in de.tsv, not in the onset set.
+    "k v", "ɡ n", "ts v", "k n",
+];
+
+/// French. `ʎ` is /l/ before /i/ and `c`/`ɟ` are /k/ /ɡ/ before front vowels — both are allophone
+/// spellings of members already in the list, and both cost real words if only half the pair is kept.
+const FR_ONSET_KEEP: &[&str] = &[
+    // C + glide — 52 clusters, 10828 captured word types (pied, bien, soi, nuit)
+    "s j", "ʁ j", "d j", "z j", "t j", "f j", "v j", "t ɥ", "n j", "t w", "ʒ j", "n w", "v w",
+    "b j", "d ɥ", "p j", "ʁ w", "k w", "d w", "l w", "n ɥ", "s w", "m w", "ʒ w", "s ɥ", "ɡ w",
+    "b w", "l ɥ", "p w", "p ɥ", "b ɥ", "ɡ j", "ʃ w", "ʃ j", "k ɥ", "ɡ ɥ", "z w", "m ɥ", "f w",
+    "ʁ ɥ", "f ɥ", "ts w", "ʒ ɥ", "ts j", "c w", "ts ɥ", "ɟ w", "ʃ ɥ", "tʃ j", "ŋ ɥ", "ʎ w", "ɟ j",
+    // obstruent + liquid, MINUS the *tl/*dl gap — 21 clusters, 9990 types
+    "t ʁ", "p ʁ", "ɡ ʁ", "d ʁ", "b ʁ", "k ʁ", "p l", "k l", "b l", "v ʁ", "f ʁ", "f l", "p ʎ",
+    "ɡ l", "b ʎ", "k ʎ", "ɡ ʎ", "v l", "f ʎ", "v ʎ", "ɟ ʁ",
+    // obstruent + liquid + glide — 28 clusters, 254 types (croire, trois, fruit)
+    "p l w", "t ʁ ɥ", "k ʁ w", "f ʁ w", "t ʁ w", "d ʁ w", "p ʁ j", "b l w", "t ʁ j", "p l ɥ",
+    "ɡ l w", "ɡ ʁ j", "ɡ ʁ w", "b ʁ j", "b ʁ w", "b ʁ ɥ", "d ʁ ɥ", "f l w", "f l ɥ", "f ʁ ɥ",
+    "k l w", "b l ɥ", "k l ɥ", "k ʁ j", "k ʁ ɥ", "p ʁ w", "p ʁ ɥ", "ɡ ʁ ɥ",
+];
+
+/// Spanish. RAE's inventory of complex onsets is exactly obstruent+liquid, plus the rising diphthong
+/// (C + glide) which is one syllable with its onset. Everything else closes the previous syllable —
+/// es-tar, cam-po, bol-sa, abs-trac-ción — which is why this list is the shortest relative to what
+/// the dictionary observes (192 clusters seen, 63 kept).
+const ES_ONSET_KEEP: &[&str] = &[
+    // C + glide — 34 clusters, 10684 captured word types (cie-lo, puer-ta, pre-mio)
+    "θ j", "s j", "m j", "ɲ j", "t̪ j", "l j", "t̪ w", "k w", "p j", "x j", "ɣ w", "f j", "d̪ j",
+    "s w", "k j", "p w", "n w", "b j", "l w", "r j", "ɡ w", "x w", "m w", "f w", "r w", "b w",
+    "θ w", "d̪ w", "tʃ w", "ʃ w", "ɡ j", "ʎ w", "ɟʝ w", "tʃ j",
+    // obstruent + liquid, tap only, minus *t̪l / *d̪l — 12 clusters, 6316 types
+    "t̪ ɾ", "p l", "p ɾ", "k ɾ", "k l", "f ɾ", "b ɾ", "f l", "d̪ ɾ", "ɡ ɾ", "b l", "ɡ l",
+    // obstruent + liquid + glide — 17 clusters, 314 types (prie-to, true-no)
+    "t̪ ɾ j", "t̪ ɾ w", "f l w", "p l j", "f ɾ j", "b ɾ j", "p ɾ j", "k ɾ j", "p ɾ w", "ɡ ɾ j",
+    "ɡ ɾ w", "b ɾ w", "d̪ ɾ w", "f ɾ w", "k l j", "k ɾ w", "ɡ l w",
+];
+
+/// Italian. Two families only: muta cum liquida, and s impura — the one syllabification rule Italian
+/// grammars are unanimous about ("la s seguita da consonante non si divide mai": pa-sta, que-sto,
+/// mo-stro, di-sgu-sto). `j`/`w` get no clause at all: it.tsv writes native rising diphthongs as
+/// VOWELS (`piano` = `p i a n o`, `acqua` = `a k k u a`), so every `C j` / `C w` cluster it observes
+/// is a loanword (Twain, Brentwood) and belongs in the coda.
+const IT_ONSET_KEEP: &[&str] = &[
+    // obstruent + liquid — 14 clusters, 5034 captured word types (a-vran-no; `t l` see KNOWN COSTS)
+    "t r", "p r", "ɡ r", "b r", "k r", "k l", "p l", "d r", "f r", "b l", "v r", "ɡ l", "f l",
+    "t l",
+    // s impura, s and z treated identically — 14 clusters, 5919 types
+    "s t", "s t͡ʃ", "s p", "z m", "s k", "z l", "s f", "z b", "z n", "z d", "z v", "z r", "s ɡ",
+    "s m",
+    // s impura + obstruent + liquid — 10 clusters, 966 types (mo-stro, di-sgra-zia)
+    "s t r", "s p l", "s p r", "s ɡ r", "s k r", "z b r", "z d r", "s k l", "s f r", "z b l",
+    // ⟨scr⟩ / ⟨scl⟩ as upstream spells them — 2 clusters, 141 types
+    "ʃ r", "ʃ l",
+];
+
+/// May this OBSERVED word-initial multi-consonant cluster drive INTERVOCALIC cuts in `syllabify`?
+/// EN keeps the S94 vote threshold plus its curated drop list; de/fr/es/it are governed by the
+/// per-language keep lists above (`FR_ONSET_DROP` is redundant under them and kept as the S101
+/// D6 invariant's own tripwire). zh/ja never reach here with a space in the cluster — their phones
+/// are single consonants by construction — so the fallback preserves the pre-S105 behaviour.
+fn onset_admitted(lang: Lang, cluster: &str, votes: u32, min_votes: u32) -> bool {
+    match lang {
+        Lang::En => votes >= min_votes && !EN_ONSET_DROP.contains(&cluster),
+        Lang::De => DE_ONSET_KEEP.contains(&cluster),
+        Lang::Fr => FR_ONSET_KEEP.contains(&cluster) && !FR_ONSET_DROP.contains(&cluster),
+        Lang::Es => ES_ONSET_KEEP.contains(&cluster),
+        Lang::It => IT_ONSET_KEEP.contains(&cluster),
+        _ => votes >= min_votes,
+    }
+}
 
 /// Candidate dictionary keys for one raw lyric, MOST FAITHFUL FIRST (S86 input-tolerance ladder).
 ///
@@ -3005,6 +3190,174 @@ mod tests {
         // allowed to go, and these cuts move BECAUSE of that. French wants /s/ and /ɡ/ in the coda.
         for (w, spec) in [("bosnien", "b ɔ s | ɲ ɛ̃"), ("baguenier", "b a ɡ | ɲ e")] {
             assert_eq!(s(w), want(spec), "the post-D6 cut for {w}");
+        }
+    }
+
+    /// S105 (queue §C2) — the four-language onset gate over the REAL dictionaries. The criterion,
+    /// the measurements, the two negative results and every accepted cost live above
+    /// `DE_ONSET_KEEP`; this pins the behaviour they justify. Same loud-SKIP contract as the gates
+    /// around it (data/dictionaries is a gitignored generated asset).
+    ///
+    /// Four groups, each able to fail for its OWN reason (S101: one mutation must not satisfy them
+    /// all):
+    ///  (1) INVENTORY — every keep-list entry is still ATTESTED word-initially, and the number of
+    ///      multi-consonant clusters each dictionary observes is unchanged. This is the fail-loud
+    ///      half of `observed ∩ KEEP`: a regeneration that invents a cluster moves the count and
+    ///      names itself HERE instead of silently becoming a legal onset (the S94 `N D` / S101
+    ///      `d n` river). ⚠ If one of these numbers fires, judge the newcomer — do not update it.
+    ///  (2) GATED — the high-impact clusters this round removed are out of the onset set.
+    ///  (3) KEPT — the clusters that must survive DESPITE one-vote loanword attestation are in it.
+    ///      `v r` (1 vote, `Vries`) vs it `k k` (1 vote, `K-Chart`) is the pair that proves this
+    ///      cannot be a threshold.
+    ///  (4) CUTS — full splits in both directions, including the verdicts the phonotactic template
+    ///      got wrong on its own: de `s j` (⟨-tion⟩), fr `p ʎ` (/l/ narrowed before /i/) and it
+    ///      `s ɡ` (s impura the dictionary forgot to voice) — plus `uruguay`, where the SAME kind of
+    ///      argument was made for `ɡ v` and lost (see the ⛔ note in `DE_ONSET_KEEP`).
+    #[test]
+    fn s105_west_onset_gate() {
+        let read = |name: &str| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../data/dictionaries")
+                .join(name);
+            std::fs::read_to_string(&p)
+        };
+        let (Ok(de_tsv), Ok(fr_tsv), Ok(es_tsv), Ok(it_tsv)) =
+            (read("de.tsv"), read("fr.tsv"), read("es.tsv"), read("it.tsv"))
+        else {
+            eprintln!("[s105-west-onset-gate] SKIPPED — data/dictionaries/{{de,fr,es,it}}.tsv not \
+                       present (gitignored generated assets; run MBS2H build_dictionaries.py)");
+            return;
+        };
+        // (name, dict, tsv, keep list, clusters the dictionary OBSERVES, entries the list KEEPS)
+        let dicts = [
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, DE_ONSET_KEEP, 145usize, 42usize),
+            ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, FR_ONSET_KEEP, 295, 101),
+            ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, ES_ONSET_KEEP, 192, 63),
+            ("it", WordDict::from_tsv(Lang::It, &it_tsv), &it_tsv, IT_ONSET_KEEP, 160, 40),
+        ];
+
+        // (1) INVENTORY
+        for (name, d, tsv, keep, observed, kept) in &dicts {
+            // ★ this one exists because a mutation probe found the hole: without it, ADDING a bogus
+            //   cluster to a keep list passed every other assertion in this test (the live-set
+            //   comparison below is against the list itself, so it cannot see the list moving).
+            //   Editing a curated list is a linguistic decision — it must be announced here.
+            assert_eq!(
+                keep.len(),
+                *kept,
+                "{name}: the curated keep list now has {} entries, not {kept}. Adding or removing \
+                 one is a per-cluster VERDICT — write its evidence next to the entry (which words \
+                 it captures, and which cut each of them wants) before moving this number.",
+                keep.len()
+            );
+            let mut seen: HashSet<String> = HashSet::new();
+            for line in tsv.lines() {
+                let Some((_, phones)) = line.split_once('\t') else { continue };
+                let toks: Vec<&str> = phones.split_whitespace().collect();
+                if let Some(vi) = toks.iter().position(|t| d.is_vowel(t)) {
+                    if vi >= 2 {
+                        seen.insert(toks[..vi].join(" "));
+                    }
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                *observed,
+                "{name}: the dictionary now observes {} multi-consonant word-initial clusters, not \
+                 {observed} — a regeneration introduced or lost one. JUDGE the newcomer against the \
+                 criterion above DE_ONSET_KEEP; do not update this number.",
+                seen.len()
+            );
+            for c in *keep {
+                assert!(
+                    seen.contains(*c),
+                    "{name}: keep-list entry {c:?} is no longer attested word-initially — the \
+                     curated list has drifted from the dictionary it was derived on"
+                );
+            }
+            // and the keep list is exactly what survived into the onset set
+            let live: HashSet<&str> =
+                d.onsets.iter().filter(|c| c.contains(' ')).map(|c| c.as_str()).collect();
+            let want: HashSet<&str> = keep.iter().copied().collect();
+            assert_eq!(live, want, "{name}: admitted multi-consonant onsets ≠ the keep list");
+        }
+
+        // (2) GATED — the knives, by language
+        for (name, gone) in [
+            ("de", &["s t", "t l", "s f", "s b", "s m", "k s", "t v", "s l", "s p", "s v",
+                     "s t ʁ", "s k", "k s j", "s t j", "p s", "m b", "p tʰ", "t kʰ", "ɡ v"][..]),
+            ("fr", &["s t", "k t", "s p", "k s", "s k", "s t ʁ", "s m", "k s j", "p t", "ɡ z",
+                     "t l", "p s", "s c", "ɡ n"][..]),
+            ("es", &["s t̪", "n d̪", "s k", "s p", "m p", "m b", "s t̪ ɾ", "r s", "n t̪ ɾ",
+                     "s m", "r l", "l d̪", "t̪ l", "s ʝ", "β r", "b r"][..]),
+            ("it", &["n t", "n d", "r s", "m p", "n ɡ", "m b", "k k", "r p", "k s", "n d r",
+                     "k t", "d l", "v l", "p s", "m n", "t w"][..]),
+        ] {
+            let d = &dicts.iter().find(|x| x.0 == name).unwrap().1;
+            for c in gone {
+                assert!(!d.onsets.contains(*c), "{name}: {c:?} must be GATED out of the onset set");
+            }
+        }
+        // (3) KEPT — the ones a vote threshold would have killed, plus the allophone pairs
+        for (name, alive) in [
+            ("de", &["ʃ t", "ʃ p ʁ", "s j", "ts j", "pf l", "k v", "ɡ n", "k n"][..]),
+            ("fr", &["p ʎ", "ɟ ʁ", "s j", "v ʁ", "t ʁ w", "k ʎ", "v l"][..]),
+            ("es", &["θ j", "t̪ ɾ", "m j", "ɡ w", "p l j", "ʃ w"][..]),
+            ("it", &["v r", "s t", "s ɡ", "s ɡ r", "ʃ r", "t l", "z b", "s t r"][..]),
+        ] {
+            let d = &dicts.iter().find(|x| x.0 == name).unwrap().1;
+            for c in alive {
+                assert!(d.onsets.contains(*c), "{name}: {c:?} must STAY in the onset set");
+            }
+        }
+
+        // (4) CUTS
+        let want = |spec: &str| -> Vec<Vec<String>> {
+            spec.split('|').map(|s| s.split_whitespace().map(str::to_string).collect()).collect()
+        };
+        for (name, cases) in [
+            ("de", &[
+                // gated: the Fugen-s / compound seam and the *tl gap
+                ("fenster", "f ɛ n s | t ɐ"),
+                ("geburtstag", "ɡ ə | b ʊ ʁ t s | t aː k"),
+                ("deutlich", "d ɔʏ t | l ɪ ç"),
+                ("atlas", "a t | l a s"),
+                ("abendland", "aː | b n̩ t | l a n t"),
+                // …and the one where the "it is just ⟨qu⟩'s voiced twin" argument LOST
+                ("uruguay", "uː | ʁ ʊ ɡ | v aj"),
+                // kept: ⟨sch⟩ at a morpheme start, and the ⟨-tion⟩ glide
+                ("verstehen", "f ɛ | ɐ | ʃ t eː | ə n"),
+                ("abduktion", "a p | d ʊ k t | s j oː n"),
+            ][..]),
+            ("fr", &[
+                ("espace", "ɛ s | p a s"),
+                ("escalier", "ɛ s | k a | ʎ e"),
+                ("athlète", "a t | l ɛ t"),
+                ("atlas", "a t | l a s"),
+                ("accompli", "a | k ɔ̃ | p ʎ i"),
+                ("abbatial", "a | b a | s j a l"),
+            ][..]),
+            ("es", &[
+                ("especifica", "e s | p e | s i | f i | k a"),
+                ("fundamentos", "f u n | d̪ a | m e n | t̪ o s"),
+                ("abstracción", "a β s | t̪ ɾ a ɣ | θ j o n"),
+                ("premio", "p ɾ e | m j o"),
+            ][..]),
+            ("it", &[
+                ("fronte", "f r o n | t e"),
+                ("acqua", "a k | k u | a"),
+                ("avranno", "a | v r a nː | o"),
+                ("questo", "k u | e | s t o"),
+                ("mostro", "m o | s t r o"),
+                ("disgusto", "d i | s ɡ u | s t o"),
+                ("atleta", "a | t l e | t a"),
+            ][..]),
+        ] {
+            let d = &dicts.iter().find(|x| x.0 == name).unwrap().1;
+            for (w, spec) in cases {
+                let phones = d.lookup(w).unwrap_or_else(|| panic!("{name}: {w} is OOV"));
+                assert_eq!(syllabify(d, &phones), want(spec), "{name}: the S105 cut for {w}");
+            }
         }
     }
 

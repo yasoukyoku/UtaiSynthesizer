@@ -700,7 +700,7 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  0.11.0 project re-renders on upgrade regardless and the bump costs nothing real — while it does
  *  close the one contrived path the S95 argument leaves open, namely that `join_lookup` also calls
  *  `lookup`, so a fragment-merge window that previously found nothing can now win by being longer. */
-export const G2P_ALGO_VERSION = "s104";
+export const G2P_ALGO_VERSION = "s105";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
