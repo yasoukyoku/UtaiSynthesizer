@@ -699,8 +699,31 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  this stamp has ALREADY moved twice in the unreleased 0.12 batch (s99 → s101 → s102), so every
  *  0.11.0 project re-renders on upgrade regardless and the bump costs nothing real — while it does
  *  close the one contrived path the S95 argument leaves open, namely that `join_lookup` also calls
- *  `lookup`, so a fragment-merge window that previously found nothing can now win by being longer. */
-export const G2P_ALGO_VERSION = "s105";
+ *  `lookup`, so a fragment-merge window that previously found nothing can now win by being longer.
+ *  s105 = the FOUR-LANGUAGE onset gate (`DE/FR/ES/IT_ONSET_KEEP` in g2p.rs). Until it landed, de/fr/
+ *  es/it had NO gate at all: `from_tsv` admitted the word-initial cluster of every line, so one
+ *  loanword made a cluster legal and rewrote how thousands of ordinary words split across notes.
+ *  72690 word types now cut differently (`es-pace` not `e-space`, `fron-te` not `fro-nte`) while the
+ *  syllable COUNT and the phone sequence stay identical on all 406182 keys — same class of change as
+ *  s102, same reason for the bump (the old behaviour was a silent success).
+ *  ⚠ This paragraph was written in S107. `ea015fd` moved the literal without documenting it, and the
+ *  gap is the reason the two entries below exist as a pair rather than one line.
+ *  s106 = the COMPOUND-SEAM exception (`seam_language` / `Seams` in g2p.rs): a real compound's seam
+ *  now constrains the maximal onset, so `worldwide` stops singing "worl-dwide" and `Blickrichtung`,
+ *  `Halbjahr`, `backyard`, `bandwidth` cut where the words join. de 1129 / en 1478 word types move;
+ *  fr/es/it were measured and turned OFF (net negative). ⛔ S106 SHIPPED WITHOUT BUMPING — its two
+ *  commits touched only g2p.rs — so between S106 and S107 those 2607 word types were riding the
+ *  s105 stamp and any bake made in that window is stale. This entry is that debt being paid; there
+ *  is no separate "s106" literal and there should not be one.
+ *  s107 = the FRENCH MUTE ⟨e⟩ (`WordDict::ecaduc_extend`). When the author writes more `+` notes
+ *  than the word has syllables, a French word whose spelling ends in a mute ⟨e⟩ now sings that
+ *  syllable (`belle` + `+` → `b ɛ | l ə`) instead of holding the previous vowel. `+` is documented
+ *  as "take the NEXT SYLLABLE" and `-` as "sustain", but until now the two were IDENTICAL once a
+ *  span ran out of syllables — so this is the first round in which they diverge, and a stored bake
+ *  of any French score using `+` that way is exactly what the stamp has to invalidate. `-` keeps
+ *  its old output to the phone. Evidence, the external truth surface (183 fr.tsv keys where
+ *  upstream spells the schwa out itself) and the accepted costs live above `ecaduc_language`. */
+export const G2P_ALGO_VERSION = "s107";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

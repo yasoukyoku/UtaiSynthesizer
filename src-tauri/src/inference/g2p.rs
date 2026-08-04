@@ -646,6 +646,35 @@ impl WordDict {
         seams.strict.sort_unstable();
         seams
     }
+
+    /// S107 §C17 — the French mute ⟨e⟩ (e-caduc) that the AUTHOR explicitly asked for.
+    ///
+    /// Returns this word's phones with one `ə` appended, or `None` to leave them exactly alone. The
+    /// caller (`resolve_west_span`) asks ONLY when the author wrote more `+` notes than the word has
+    /// syllables — that condition, not this predicate, is where the justification lives.
+    ///
+    /// The spelling test runs on the dictionary KEY rather than on `evt.lyric`, for the same reason
+    /// `compound_seams` does it: `Belle,` and `BELLE` have to reach the same verdict as `belle`.
+    fn ecaduc_extend(&self, word: &str, phones: &[String]) -> Option<Vec<String>> {
+        if !ecaduc_language(self.lang) {
+            return None;
+        }
+        // ★ The last phone must be a CONSONANT, and this clause is load-bearing rather than a
+        // belt-and-braces check: 348 fr.tsv rows ALREADY end in `ə` (`abattre` = `a b a t ʁ ə` —
+        // the -tre/-bre family upstream spells out), and without it those would grow a SECOND one.
+        // It is also what keeps ⟨-ent⟩ safe below (`moment` /mɔmɑ̃/ ends in a nasal vowel).
+        match phones.last() {
+            Some(p) if !self.is_vowel(p) => {}
+            _ => return None,
+        }
+        let key = lookup_candidates(word).into_iter().find(|k| self.map.contains_key(k))?;
+        if !fr_mute_e_spelling(&key) {
+            return None;
+        }
+        let mut out = phones.to_vec();
+        out.push(FR_ECADUC_PHONE.to_string());
+        Some(out)
+    }
 }
 
 /// S94 (dictionary re-audit, tier-1): an EN onset CLUSTER must be attested by at least this many
@@ -1371,6 +1400,13 @@ impl Seams {
 /// (`c3_invariant.py`), so `resolve_west_span`'s consumer count, the OOV verdict and the
 /// word-final coda deferral are all unaffected — only WHICH NOTE a consonant lands on changes.
 /// Pass `&Seams::default()` where no word is available (phonetic overrides, fixtures).
+///
+/// ⚠ S107: that invariant is about SEAMS and it still holds, but do not read it as "the syllable
+/// count never moves". `resolve_west_span` may now hand this function a phone string with one more
+/// phone than the dictionary row has (`WordDict::ecaduc_extend`, French mute ⟨e⟩) — the function
+/// itself is unchanged, the INPUT is what differs, and that path is gated on the author having
+/// written an explicit extra `+`. Anything reasoning about consumer counts has to read the call
+/// site, not just this comment.
 pub fn syllabify(dict: &WordDict, phones: &[String], seams: &Seams) -> Vec<Vec<String>> {
     let nuclei: Vec<usize> = (0..phones.len()).filter(|&i| dict.is_vowel(&phones[i])).collect();
     if nuclei.is_empty() {
@@ -1398,6 +1434,91 @@ pub fn syllabify(dict: &WordDict, phones: &[String], seams: &Seams) -> Vec<Vec<S
 /// A syllable's nucleus index (first vowel; falls back to the last phone for vowel-less words).
 fn nucleus_idx(dict: &WordDict, syl: &[String]) -> usize {
     syl.iter().position(|p| dict.is_vowel(p)).unwrap_or(syl.len().saturating_sub(1))
+}
+
+// ─── S107 §C17: the French mute ⟨e⟩ (e-caduc) ───────────────────────────────────────────────────
+
+/// Which languages have a syllable the SPELLING promises while the dictionary leaves it out.
+///
+/// French only, and the reason is orthographic rather than phonological, so nothing else in the set
+/// can borrow it: French writes a word-final ⟨e⟩ that is silent in speech and SUNG whenever the
+/// composer gives it a note (`belle` = /bɛl/ spoken, /bɛ.lə/ over two notes). Shaped like
+/// `seam_language` on purpose — one predicate, pinned ON *and* OFF by the gate, so "fr only" is an
+/// assertion rather than an accident of where the caller happens to sit.
+fn ecaduc_language(lang: Lang) -> bool {
+    matches!(lang, Lang::Fr)
+}
+
+/// What a French mute ⟨e⟩ is sung as. Already a vocab phone (`PHONE_TO_ID` id 17), untouched by
+/// `convert_mfa` and `apply_fixes`, and French training carries 3185 tokens / 59015 frames of it —
+/// this rule introduces no phone the models have never sung.
+const FR_ECADUC_PHONE: &str = "ə";
+
+/// Is the letter sitting before a word-final ⟨e⟩ itself a VOWEL letter — i.e. is that ⟨e⟩ the tail of
+/// a vowel digraph (`-ée`, `-ie`, `-ue`) rather than a mute e? (`vie` = /vi/, `abaissée` = /abese/:
+/// there is no syllable to hand out.)
+///
+/// ⚠ This is NOT `elidable_head`, and the overlap between the two lists is a coincidence of the
+/// alphabet, not of the question. That one asks "may an elision attach to this word?", which is why
+/// it counts ⟨h⟩ (mute h elides: `l'homme`) and deliberately omits ⟨y⟩ (French does not elide before
+/// ⟨y⟩: `le yacht`). Here BOTH verdicts flip — ⟨y⟩ *is* a vowel letter (`paye` = /pɛj/ has no mute e)
+/// and ⟨h⟩ is not (⟨-he⟩ is not a French vowel digraph). Folding them would get both families wrong;
+/// `elidable_head`'s own comment makes the mirror image of this argument.
+fn fr_vowel_letter(c: char) -> bool {
+    matches!(
+        c.to_lowercase().next().unwrap_or(c),
+        'a' | 'e' | 'i' | 'o' | 'u' | 'y'
+            | 'à' | 'á' | 'â' | 'ä' | 'ã' | 'å'
+            | 'è' | 'é' | 'ê' | 'ë'
+            | 'ì' | 'í' | 'î' | 'ï'
+            | 'ò' | 'ó' | 'ô' | 'ö' | 'õ'
+            | 'ù' | 'ú' | 'û' | 'ü'
+            | 'ÿ' | 'æ' | 'œ'
+    )
+}
+
+/// Does this spelling end in a mute ⟨e⟩ that French singing can give a note of its own?
+///
+/// ★★ THE TRUTH SURFACE, and it is EXTERNAL. fr.tsv carries 183 keys with BOTH readings — `contre` =
+/// `k ɔ̃ t ʁ` *and* `contre` = `k ɔ̃ t ʁ ə` — because upstream MFA spells the schwa out wherever the
+/// three-consonant rule forces it (the -tre/-bre/-dre family). Those rows predate this rule and
+/// cannot be argued with, so they are what it is measured against: appending `ə` to the primary
+/// reproduces the upstream row TOKEN FOR TOKEN on all 183 (`c17_census.py`; the gate pins a sample
+/// and the count). ⚠ Bounded: upstream only writes schwa in that one phonotactic environment, so the
+/// surface says nothing about `belle`/`homme` — those rest on the orthographic rule alone.
+///
+/// ★ The truth surface is also what set the three clauses. The first draft had only the middle one
+/// and caught 131/183; every miss was `-es` (`ancêtres`, `arbres`, `chambres` — 46) or `-ent`
+/// (`livrent`, `offrent` — 5), i.e. upstream itself says the plural ⟨s⟩ and the 3pl ⟨-ent⟩ ride
+/// along. With all three clauses: 182/183 (the one miss is `km`).
+///
+/// ⚠ ⟨-ent⟩ is the risky clause and it is guarded by PHONES, not here: `moment` /mɔmɑ̃/, `argent`,
+/// every ⟨-ment⟩ adverb ends in a nasal VOWEL, so `ecaduc_extend`'s consonant-final test throws them
+/// out before this function is consulted. What survives is the 3pl verb family (2011 keys —
+/// `abattent` = `a b a t`, `abritent`, `accablent`) where the ending really is silent as a whole.
+fn fr_mute_e_spelling(key: &str) -> bool {
+    let c: Vec<char> = key.chars().collect();
+    // ⟨-ent⟩: the 3rd-person-plural ending is silent as a WHOLE (`chantent` = /ʃɑ̃t/), so there is
+    // no word-final ⟨e⟩ to find and it needs a clause of its own.
+    if c.len() >= 5 && key.ends_with("ent") {
+        return true;
+    }
+    // A plural / 2sg ⟨s⟩ rides along: `belles`, `chantes`, `arbres` carry the same mute e.
+    let c = match c.last() {
+        Some('s') if c.len() >= 4 => &c[..c.len() - 1],
+        _ => &c[..],
+    };
+    let n = c.len();
+    if n < 3 || c[n - 1] != 'e' {
+        return false;
+    }
+    // ⟨qu⟩/⟨gu⟩ before the final ⟨e⟩ is ONE consonant grapheme — that ⟨u⟩ is orthographic filler and
+    // not a vowel (`banque` /bɑ̃k/, `langue` /lɑ̃ɡ/, `musique` /myzik/ are ordinary mute-e words).
+    // 1431 keys hang on this clause; without it the entire ⟨-ique⟩ family is invisible to the rule.
+    if n >= 4 && c[n - 2] == 'u' && matches!(c[n - 3], 'q' | 'g') {
+        return true;
+    }
+    !fr_vowel_letter(c[n - 2])
 }
 
 // ─── S95 fragment merge (拆词) ───────────────────────────────────────────────────────────────────
@@ -2197,7 +2318,43 @@ fn resolve_west_span(
     // concatenates to exactly `trad`. So an override, a merged fragment or a plural/elision reading
     // simply finds no seam and syllabifies as before, without a special case here.
     let seams = dict.compound_seams(evt.lyric.trim(), &trad);
-    let sylls = syllabify(dict, &trad, &seams);
+    let mut sylls = syllabify(dict, &trad, &seams);
+
+    // ★S107 §C17 — the author asked for MORE syllables than this word has, and French spelling has
+    // one more to give. THE WHOLE JUSTIFICATION IS THE TOKEN THE AUTHOR WROTE: `+` is documented
+    // (user guide §5.4, all three languages) as "take the NEXT SYLLABLE of the previous word" and `-` as "sustain the
+    // last sung vowel" — the same split Synthesizer V defines — yet until now the two were
+    // IDENTICAL once a span ran out of syllables (both fell into the hold branch below, which is
+    // why `belle|+|-` and `belle|-|+` are phone-for-phone equal on the pre-S107 build). An explicit
+    // `+` was being silently downgraded to a sustain.
+    //
+    // ⛔ It is NOT a claim about what French singers usually do, and the corpus CANNOT make one:
+    // GTSinger scores carry no `+`/`-` distinction, so melisma notes and syllable notes are
+    // indistinguishable in it. Measured anyway, because the negative result is worth having: of the
+    // 1021 French word tokens whose human note count exceeds their syllable count, the singer's own
+    // note boundaries look like a mute-e setting 414 times and like a melisma 522 times. Both are
+    // legal French — and our two tokens are exactly how the author chooses between them.
+    // (`TESTING\s107_c17_ecaduc\c17_discriminate.py`. The same corpus pass proves the other half:
+    // this rule can never SQUEEZE a word, because it only fires when notes outnumber syllables —
+    // the 1848 tokens that killed the dictionary-layer version of C17 are structurally untouched.)
+    //
+    // ⚠ Counted from `Tok::Next` ONLY, never from `span.len()`: `belle -` is the melisma the author
+    //   asked for and keeps today's behaviour to the phone.
+    // ⚠ `phoneme_input` / `merged_trad` are excluded EXPLICITLY. `compound_seams` gets away without
+    //   a check because its phone-equality test fails by construction on those paths; APPENDING a
+    //   phone has no such immunity, and S95's merge rewrites the head note's `Tok::Word` into
+    //   `Tok::Next`, so `bel|le` would otherwise report 2 requested syllables against belle's 1.
+    // ⚠ Ordering: after `compound_seams`, which requires head+tail to concatenate to exactly these
+    //   phones. Today fr computes no seams at all (`seam_language` is de/en) so the order is inert —
+    //   it becomes load-bearing the moment §C3 opens another language.
+    if evt.phoneme_input.is_none() && merged_trad.is_none() {
+        let requested = 1 + toks.iter().skip(1).filter(|&&t| t == Tok::Next).count();
+        if requested > sylls.len() {
+            if let Some(extended) = dict.ecaduc_extend(evt.lyric.trim(), &trad) {
+                sylls = syllabify(dict, &extended, &seams);
+            }
+        }
+    }
 
     // distribute: consumers = the carrier note + every `+` note, in order. Consumer k takes ONE
     // syllable; the FINAL consumer (the min(consumers, syllables)-th) absorbs every remaining
@@ -4030,6 +4187,285 @@ mod tests {
                 "{name}: a single note must not see the seam at all"
             );
         }
+    }
+
+    /// S107 (queue §C17) — the FRENCH MUTE ⟨e⟩ over the REAL dictionary. The justification, the
+    /// external truth surface and the measured negative result live above `ecaduc_language` and at
+    /// the call site in `resolve_west_span`; this pins the behaviour they justify. Same loud-SKIP
+    /// contract as the gates around it.
+    ///
+    /// Six groups, each able to fail for its OWN reason (S101: one mutation must not satisfy them
+    /// all — `mutate_s107.py` keeps that honest):
+    ///  (1) SCOPE — fr ON, every other language OFF, as a predicate AND on the wire.
+    ///  (2) GUARD — each clause of the spelling test and the consonant-phone test pinned
+    ///      INDIVIDUALLY, and BEFORE the cut table (S105/S106: an assertion of the form "live ==
+    ///      my expectation" cannot see a threshold move if a broader assertion fires first).
+    ///  (3) ★TRUTH SURFACE — the 183 fr.tsv keys where upstream MFA spells the schwa out itself.
+    ///      This is the one external, un-arguable check this rule has; it is what set the guard's
+    ///      three clauses (see `fr_mute_e_spelling`).
+    ///  (4) CUTS — words that gain the syllable and words that must NOT, each for its own reason.
+    ///  (5) END TO END — `resolve_score`, i.e. the only thing a user hears. The control arm is
+    ///      `-`, which is STRUCTURALLY the pre-S107 behaviour, so the `assert_ne!` proves both that
+    ///      the knife reaches the wire and that the two tokens now diverge.
+    ///  (6) NEVER SQUEEZES — the rule cannot fire when the author's note count only MATCHES the
+    ///      syllable count. That is the whole reason the parse layer works where the dictionary
+    ///      layer failed (S104 measured the dictionary-layer version at 1021 saved : 1848 broken).
+    #[test]
+    fn s107_fr_ecaduc_gate() {
+        let read = |name: &str| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../data/dictionaries")
+                .join(name);
+            std::fs::read_to_string(&p)
+        };
+        let (Ok(fr_tsv), Ok(en_tsv)) = (read("fr.tsv"), read("en.tsv")) else {
+            eprintln!("[s107-fr-ecaduc-gate] SKIPPED — data/dictionaries/{{fr,en}}.tsv not present \
+                       (gitignored generated assets; run MBS2H build_dictionaries.py)");
+            return;
+        };
+        let fr = WordDict::from_tsv(Lang::Fr, &fr_tsv);
+        let en = WordDict::from_tsv(Lang::En, &en_tsv);
+        // Same one-language `DictSource` the S105 and S106 gates each declare locally — a real
+        // `DictSource` needs every language's dictionary, and these gates deliberately hand out
+        // exactly one so a cross-language leak fails loudly instead of resolving.
+        struct OneLang(Lang, WordDict);
+        impl DictSource for OneLang {
+            fn zh(&self) -> Result<&ZhDict> {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+            fn words(&self, lang: Lang) -> Result<&WordDict> {
+                if lang == self.0 {
+                    Ok(&self.1)
+                } else {
+                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+                }
+            }
+        }
+
+        // ── (1) SCOPE ────────────────────────────────────────────────────────────────────────────
+        for (lang, on) in [
+            (Lang::Fr, true),
+            (Lang::En, false),
+            (Lang::De, false),
+            (Lang::Es, false),
+            (Lang::It, false),
+            (Lang::Ja, false),
+            (Lang::Zh, false),
+        ] {
+            assert_eq!(ecaduc_language(lang), on, "ecaduc scope for {lang:?}");
+        }
+        // …and OFF means off on the wire, not just in the predicate. English `table` is the exact
+        // shape that would fire (spelling ⟨-le⟩, phones end in a consonant) — and it is also why
+        // removing the language gate is LOUD rather than subtle: the English traditional layer is
+        // ARPABET, so an appended `ə` would not intern at all.
+        assert_eq!(en.lookup("table").unwrap(), vec!["T", "EY1", "B", "AH0", "L"]);
+        let en_src = OneLang(Lang::En, WordDict::from_tsv(Lang::En, &en_tsv));
+        let three = [evt("table", Lang::En), evt("+", Lang::En), evt("+", Lang::En)];
+        let got: Vec<Vec<&'static str>> =
+            resolve_score(&three, &en_src).unwrap().iter().map(phones_of).collect();
+        assert_eq!(
+            got,
+            vec![vec!["t", "eɪ"], vec!["b", "ə"], vec!["ə", "l"]],
+            "English must be untouched: two syllables, the third note holds and takes the coda"
+        );
+
+        // ── (2) GUARD — each clause on its own ───────────────────────────────────────────────────
+        for (key, want, why) in [
+            ("belle", true, "the base clause: consonant letter + final ⟨e⟩"),
+            ("banque", true, "⟨qu⟩ is ONE consonant grapheme — without this clause ⟨-que⟩ is invisible"),
+            ("langue", true, "…and ⟨gu⟩ likewise"),
+            ("belles", true, "a plural ⟨s⟩ rides along"),
+            ("chantent", true, "⟨-ent⟩ is silent as a whole (3pl); it has no final ⟨e⟩ to find"),
+            ("vie", false, "⟨ie⟩ is a vowel digraph, not a mute e"),
+            ("joue", false, "⟨ue⟩ likewise — and note it is NOT rescued by the ⟨gu⟩ clause"),
+            ("annee", false, "⟨ée⟩ likewise"),
+            ("le", false, "too short to carry a mute e of its own"),
+            ("ent", false, "the ⟨-ent⟩ clause needs a real word in front of it"),
+        ] {
+            assert_eq!(fr_mute_e_spelling(key), want, "fr_mute_e_spelling({key}): {why}");
+        }
+        // The PHONE half. `abattre` is the load-bearing case: upstream already spells its schwa, so
+        // without this clause the word grows a SECOND one.
+        assert_eq!(fr.lookup("abattre").unwrap().last().unwrap(), "ʁ");
+        assert!(fr.ecaduc_extend("abattre", &fr.lookup("abattre").unwrap()).is_some());
+        let already: Vec<String> = "a b a t ʁ ə".split(' ').map(str::to_string).collect();
+        assert!(
+            fr.ecaduc_extend("abattre", &already).is_none(),
+            "a reading that ALREADY ends in ə must never grow a second one"
+        );
+        // `moment` is why ⟨-ent⟩ is safe: the ending is a nasal VOWEL, so the phone clause stops it
+        // long before the spelling clause is consulted.
+        assert!(fr_mute_e_spelling("moment"), "spelling alone cannot tell moment from chantent…");
+        assert!(
+            fr.ecaduc_extend("moment", &fr.lookup("moment").unwrap()).is_none(),
+            "…and the PHONE clause is what does: /mɔmɑ̃/ ends in a vowel"
+        );
+        // The key, not the raw lyric: punctuation and case must reach the same verdict.
+        let belle = fr.lookup("belle").unwrap();
+        for lyric in ["belle", "Belle", "belle,", "BELLE"] {
+            assert!(fr.ecaduc_extend(lyric, &belle).is_some(), "{lyric} must resolve to the key");
+        }
+
+        // ── (3) ★TRUTH SURFACE — upstream MFA's own schwa readings ───────────────────────────────
+        // Every fr.tsv key whose primary is `X` and which ALSO carries the row `X ə`. Those rows
+        // predate this rule and cannot be argued with, so appending `ə` has to reproduce them.
+        let mut rows: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        for line in fr_tsv.lines() {
+            let Some((w, phones)) = line.split_once('\t') else { continue };
+            rows.entry(w.to_lowercase())
+                .or_default()
+                .push(phones.split_whitespace().map(str::to_string).collect());
+        }
+        let mut pairs = 0usize;
+        let mut fired = 0usize;
+        let mut missed: Vec<String> = Vec::new();
+        for (w, variants) in &rows {
+            let prim = &variants[0]; // from_tsv is FIRST-row-wins for the western dictionaries
+            let mut with_schwa = prim.clone();
+            with_schwa.push("ə".to_string());
+            if !variants[1..].contains(&with_schwa) {
+                continue;
+            }
+            pairs += 1;
+            match fr.ecaduc_extend(w, prim) {
+                Some(got) => {
+                    assert_eq!(got, with_schwa, "{w}: the rule must reproduce upstream's own row");
+                    fired += 1;
+                }
+                None => missed.push(w.clone()),
+            }
+        }
+        missed.sort();
+        assert_eq!(
+            pairs, 183,
+            "the truth surface changed size ({pairs} keys carry both `X` and `X ə`). That is an \
+             UPSTREAM change — judge the newcomers before moving this number."
+        );
+        assert_eq!(
+            (fired, missed.as_slice()),
+            (182, &["km".to_string()][..]),
+            "the guard must catch every word upstream itself gives a schwa to, except `km`"
+        );
+
+        // ── (4) CUTS ─────────────────────────────────────────────────────────────────────────────
+        let cut = |w: &str| -> String {
+            let prim = fr.lookup(w).unwrap_or_else(|| panic!("{w} missing from fr.tsv"));
+            match fr.ecaduc_extend(w, &prim) {
+                Some(ext) => syllabify(&fr, &ext, &Seams::default())
+                    .iter()
+                    .map(|s| s.join(" "))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                None => "(no extension)".to_string(),
+            }
+        };
+        for (w, want, why) in [
+            ("belle", "b ɛ | l ə", "the /l/ becomes the schwa's ONSET — this is why the rule appends \
+                                    a phone and re-syllabifies instead of pushing a syllable"),
+            ("homme", "ɔ | m ə", "one-phone onset"),
+            ("banque", "b ɑ̃ | k ə", "the ⟨qu⟩ clause, end to end"),
+            ("musique", "m y | z i | k ə", "…on a longer word"),
+            ("contre", "k ɔ̃ | t ʁ ə", "an obstruent+liquid onset stays together (muta cum liquida)"),
+            ("pourpre", "p u ʁ | p ʁ ə", "…and the earlier cluster still splits"),
+            ("table", "t a | b l ə", "French `table`, not the English one from group (1)"),
+            ("fille", "f i | j ə", "a glide is not a nucleus, so ⟨-ille⟩ qualifies"),
+            ("chantent", "ʃ ɑ̃ | t ə", "3pl ⟨-ent⟩"),
+            ("arbres", "a ʁ | b ʁ ə", "plural ⟨s⟩ + obstruent/liquid"),
+            ("vie", "(no extension)", "vowel digraph"),
+            ("année", "(no extension)", "…likewise"),
+            ("joue", "(no extension)", "…likewise"),
+        ] {
+            assert_eq!(cut(w), want, "{w}: {why}");
+        }
+
+        // ── (5) END TO END — the wire, with `-` as the pre-S107 control arm ──────────────────────
+        let src = OneLang(Lang::Fr, WordDict::from_tsv(Lang::Fr, &fr_tsv));
+        let run = |lyrics: &[&str]| -> Vec<Vec<&'static str>> {
+            let score: Vec<ScoreEvt> = lyrics.iter().map(|l| evt(l, Lang::Fr)).collect();
+            resolve_score(&score, &src)
+                .unwrap_or_else(|e| panic!("strict resolve of {lyrics:?} failed: {e:?}"))
+                .iter()
+                .map(phones_of)
+                .collect()
+        };
+        let plus = run(&["belle", "+"]);
+        let hold = run(&["belle", "-"]);
+        assert_ne!(
+            plus, hold,
+            "`+` and `-` MUST now diverge — this assertion is the whole feature. Before S107 both \
+             fell into the hold branch and were phone-for-phone equal."
+        );
+        assert_eq!(
+            hold,
+            vec![vec!["b", "ɛ"], vec!["ɛ", "l"]],
+            "`-` keeps the pre-S107 behaviour exactly: hold the nucleus, 归韵 defers the coda"
+        );
+        assert_eq!(plus, vec![vec!["b", "ɛ"], vec!["l", "ə"]], "`+` gets the syllable it asked for");
+        // ★ The SPELLING half, on the wire. `pour` ends in a consonant PHONE exactly like `belle`
+        // does, so the phone clause alone cannot tell them apart — only the orthography can. Without
+        // this case, deleting the whole spelling test still passes every other assertion here (the
+        // negative examples in group (4) are all vowel-FINAL, so the phone clause stops them first).
+        assert_eq!(
+            run(&["pour", "+"]),
+            vec![vec!["p", "u"], vec!["u", "ʁ"]],
+            "a consonant-final word with no mute ⟨e⟩ keeps the hold — the extra note is the \
+             author's melisma, and there is no syllable to hand out"
+        );
+        // A THIRD note has nothing left to take, so it holds the schwa — one mute e, not two.
+        assert_eq!(
+            run(&["homme", "+", "+"]),
+            vec![vec!["ɔ"], vec!["m", "ə"], vec!["ə"]],
+            "the extra `+` holds the schwa; the rule adds exactly one syllable"
+        );
+        // Mixed tokens: `-` before the `+` still only counts the `+`.
+        assert_eq!(
+            run(&["belle", "-", "+"]),
+            vec![vec!["b", "ɛ"], vec!["ɛ"], vec!["l", "ə"]],
+            "a `-` in the middle sustains; the `+` after it still gets the schwa syllable"
+        );
+        // One note: the rule is invisible.
+        assert_eq!(run(&["belle"]), vec![vec!["b", "ɛ", "l"]], "a single note never sees the rule");
+        // ★ USER-SUPPLIED PHONES ARE NEVER EXTENDED. `compound_seams` is immune to the override
+        // path by construction (its phone-equality test cannot match), but APPENDING a phone has no
+        // such immunity — it has to be an explicit check, and this is the case that proves it.
+        // The lyric here is a clean `belle`, so the spelling half of the guard says YES; only the
+        // `phoneme_input.is_none()` clause stops it.
+        let overridden = [
+            ScoreEvt { phoneme_input: Some("b ɛ l"), ..evt("belle", Lang::Fr) },
+            evt("+", Lang::Fr),
+        ];
+        assert_eq!(
+            resolve_score(&overridden, &src).unwrap().iter().map(phones_of).collect::<Vec<_>>(),
+            vec![vec!["b", "ɛ"], vec!["ɛ", "l"]],
+            "phoneme_input means the user typed the phones — the rule must not add one"
+        );
+
+        // ── (6) NEVER SQUEEZES ───────────────────────────────────────────────────────────────────
+        // `lumière` has TWO syllables. Two notes = exactly enough ⇒ the rule must stay out of it;
+        // three notes = the author asking for the mute e. This pair is the parse-layer answer to
+        // the 1848 tokens that killed the dictionary-layer version of C17.
+        assert_eq!(
+            run(&["lumière", "+"]),
+            vec![vec!["l", "y"], vec!["mʲ", "ɛ", "ʁ"]],
+            "notes == syllables ⇒ untouched (a dictionary-layer rule could not tell)"
+        );
+        assert_eq!(
+            run(&["lumière", "+", "+"]),
+            vec![vec!["l", "y"], vec!["mʲ", "ɛ"], vec!["ʁ", "ə"]],
+            "one more note than syllables ⇒ the mute e"
+        );
+        // `espace` is pinned two notes away in `s105_west_onset_gate`; keep both verdicts visible
+        // so a future edit cannot move one without the other showing up.
+        assert_eq!(
+            run(&["espace", "+"]),
+            vec![vec!["ɛ", "s"], vec!["p", "a", "s"]],
+            "unchanged from S105 — notes == syllables"
+        );
+        assert_eq!(
+            run(&["espace", "+", "+"]),
+            vec![vec!["ɛ", "s"], vec!["p", "a"], vec!["s", "ə"]],
+            "…and the third note is where the mute e appears"
+        );
     }
 
     /// S104 — the FR/IT elision rung over the REAL dictionaries. Same loud-SKIP contract.
