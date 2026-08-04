@@ -300,6 +300,15 @@ pub fn stage2(lang: Lang, phones: &[String]) -> std::result::Result<Vec<&'static
 pub struct WordDict {
     lang: Lang,
     map: HashMap<String, String>,
+    /// S106 (queue §C3) — the NON-primary rows, kept only for words that ship more than one
+    /// pronunciation. `map` is first-row-wins and every other consumer wants exactly that; the
+    /// compound-seam test is the one place that must see the alternates, because German writes a
+    /// compound with whichever variant of the tail fits (`tragen` ships `t ʁ aː ɡ n̩` first but
+    /// `abtragen` = `a p` + `t ʁ aː ɡ ə n`). Measured on de.tsv: without the alternates the seam
+    /// test misses 185 real compounds AND — worse — loses the competing analysis that makes
+    /// `abtragen`/`abklingen` ambiguous, so 10 words get the WRONG cut instead of no change.
+    /// Cost is one Vec per multi-row word: 9517 rows in de.tsv, 9114 in en.tsv.
+    alts: HashMap<String, Vec<String>>,
     onsets: HashSet<String>,
     vowels: HashSet<&'static str>,
 }
@@ -477,7 +486,13 @@ impl WordDict {
             Lang::It => gt::MFA_VOWELS_IT.iter().copied().collect(),
             _ => HashSet::new(),
         };
-        let mut dict = WordDict { lang, map: HashMap::new(), onsets: HashSet::new(), vowels };
+        let mut dict = WordDict {
+            lang,
+            map: HashMap::new(),
+            alts: HashMap::new(),
+            onsets: HashSet::new(),
+            vowels,
+        };
         dict.onsets.insert(String::new()); // the empty onset is always legal (V-initial syllables)
         let mut votes: HashMap<String, u32> = HashMap::new();
         for line in tsv.lines() {
@@ -487,7 +502,23 @@ impl WordDict {
                 continue;
             }
             let key = word.to_lowercase();
-            dict.map.entry(key).or_insert_with(|| phones.to_string());
+            match dict.map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(phones.to_string());
+                }
+                // S106 §C3: a later row for a key already seen is an ALTERNATE pronunciation. The
+                // primary is untouched (first-row-wins, as every other consumer requires); this only
+                // records the rest so `compound_seams` can see them. Duplicated identical rows are
+                // dropped so the alternates stay a set.
+                std::collections::hash_map::Entry::Occupied(o) => {
+                    if o.get() != phones {
+                        let e = dict.alts.entry(key).or_default();
+                        if !e.iter().any(|p| p == phones) {
+                            e.push(phones.to_string());
+                        }
+                    }
+                }
+            }
             // word-initial cluster = phones before the first vowel (words with no vowel don't vote)
             let toks: Vec<&str> = phones.split_whitespace().collect();
             if let Some(vi) = toks.iter().position(|t| dict_is_vowel(lang, &dict.vowels, t)) {
@@ -506,6 +537,113 @@ impl WordDict {
             dict.onsets.insert(cluster);
         }
         dict
+    }
+
+    /// Every pronunciation this dictionary ships for `key`, primary first (S106 §C3; see `alts`).
+    fn pronunciations<'a>(&'a self, key: &str) -> impl Iterator<Item = &'a str> {
+        self.map
+            .get(key)
+            .map(String::as_str)
+            .into_iter()
+            .chain(self.alts.get(key).into_iter().flatten().map(String::as_str))
+    }
+
+    /// S106 (queue §C3) — where does this word decompose into two dictionary words?
+    ///
+    /// Returns phone indices. `any` is every decomposition the dictionary licenses and exists ONLY
+    /// to make the syllabifier ABSTAIN when two analyses compete; `strict` is the subset allowed to
+    /// actually move a syllable boundary. Both are ascending and `strict ⊆ any`.
+    ///
+    /// A split at character `c` counts when: the head and the tail are BOTH dictionary keys, and one
+    /// pronunciation of each concatenates — token for token, ignoring ARPABET stress digits — to
+    /// exactly the phones being syllabified. The phone-equality test is what makes this safe to run
+    /// on any lyric: when the phones came from a `phoneme_input` override, a fragment merge or the
+    /// plural/elision rungs, no split matches and the word is syllabified exactly as before.
+    ///
+    /// ★ WHY STRESS DIGITS ARE IGNORED — this is the English compound stress rule, not a fudge.
+    /// cmudict demotes the second element of a compound (`backyard` = `B AE1 K Y AA2 R D` while
+    /// `yard` = `Y AA1 R D`; `birthday` vs `day`), so a token-exact test calls almost every real
+    /// English compound indecomposable: 36 words move under it, 1905 without it. For de/fr/es/it the
+    /// stripping is a structural no-op — no MFA phone ends in 0/1/2 (`s106_seam_gate` pins that).
+    fn compound_seams(&self, word: &str, phones: &[String]) -> Seams {
+        let mut seams = Seams::default();
+        // ⚠ `phones.len() < 4` is a cheap early-out, NOT a filter: a seam needs ≥2 phones on each
+        // side, so four is the structural minimum anyway. A mutation probe that raised it to 5
+        // passed the whole gate green — that is what proved it inert (`mutate_s106.py` M5).
+        if !seam_language(self.lang) || phones.len() < 4 {
+            return seams;
+        }
+        // The key the dictionary itself would have used — the same tolerance ladder as `lookup`, so
+        // `Bankrott`, `bankrott,` and `Straßenbahn` all reach their rows. If no rung is a key, the
+        // phones came from a rung that composes (elision/plural) or from an override: no seams.
+        let key = lookup_candidates(word).into_iter().find(|k| self.map.contains_key(k));
+        let Some(key) = key else { return seams };
+        let chars: Vec<char> = key.chars().collect();
+        let want: Vec<&str> = phones.iter().map(|p| destress(p)).collect();
+        for c in SEAM_HEAD_CHARS..chars.len().saturating_sub(SEAM_TAIL_CHARS - 1) {
+            let head: String = chars[..c].iter().collect();
+            let tail: String = chars[c..].iter().collect();
+            if !self.map.contains_key(&tail) {
+                continue;
+            }
+            // A bound prefix is admitted as a head even though it is not a usable dictionary key —
+            // and ONLY into the loose tier (see `DE_SEAM_BOUND_PREFIXES`).
+            let bound = (self.lang == Lang::De)
+                .then(|| DE_SEAM_BOUND_PREFIXES.iter().find(|(p, _)| *p == head).map(|(_, ph)| *ph))
+                .flatten();
+            if !self.map.contains_key(&head) && bound.is_none() {
+                continue;
+            }
+            let tail_chars = chars.len() - c;
+            let heads = self
+                .pronunciations(&head)
+                .map(|p| (p, false))
+                .chain(bound.map(|p| (p, true)));
+            for (hp, is_bound) in heads {
+                let n = hp.split_whitespace().count();
+                if n < SEAM_HEAD_PHONES || n + SEAM_TAIL_PHONES > phones.len() {
+                    continue;
+                }
+                if !hp.split_whitespace().map(destress).eq(want[..n].iter().copied()) {
+                    continue;
+                }
+                let rest = syllabic_expand(want[n..].iter().copied());
+                if !self.pronunciations(&tail).any(|tp| {
+                    syllabic_expand(tp.split_whitespace().map(destress)) == rest
+                }) {
+                    continue;
+                }
+                if !seams.any.contains(&n) {
+                    seams.any.push(n);
+                    if !is_bound
+                        && tail_chars >= SEAM_STRICT_TAIL_CHARS
+                        && want.len() - n >= SEAM_STRICT_TAIL_PHONES
+                        // ★ the tail may not be spelled with an initial ⟨i⟩ or ⟨e⟩. Those are the
+                        //   Latin hiatus suffixes whose ⟨i⟩ surfaces as /j/ — ⟨-ion⟩, ⟨-ius⟩,
+                        //   ⟨-ienne⟩ — where the preceding consonant is the GLIDE's onset, not a
+                        //   coda (`pens|ionen`, `stad|ions`; Duden Pen·si·o·nen, Sta·di·on). A real
+                        //   German second element starting with /j/ is spelled ⟨j⟩, 102 times out
+                        //   of 102. ⚠ Deliberately NOT "any vowel letter": measured on en.tsv that
+                        //   version costs 46 correct rows (the whole ⟨yard⟩/⟨year⟩ compound family,
+                        //   plus un|used, sub|unit, non|union, end|user) to remove 5 wrong ones.
+                        //   Narrowed to ⟨i⟩/⟨e⟩ it is a structural no-op for English and free here.
+                        && !matches!(chars[c].to_lowercase().next(), Some('i') | Some('e'))
+                        // ★ the head must own a FULL vowel. A German free-standing word cannot have
+                        //   schwa as its only nucleus, so a "head" like `get` (`ɡ ə t`, the residue
+                        //   of ge+trödelt) is a dictionary artefact by construction. Zero cost
+                        //   measured, and a structural no-op outside the MFA sets (ARPABET has no
+                        //   `ə`/`ɐ` token).
+                        && want[..n].iter().any(|p| self.is_vowel(p) && !matches!(*p, "ə" | "ɐ"))
+                    {
+                        seams.strict.push(n);
+                    }
+                }
+                break;
+            }
+        }
+        seams.any.sort_unstable();
+        seams.strict.sort_unstable();
+        seams
     }
 }
 
@@ -1083,10 +1221,150 @@ impl DictSource for GlobalDicts {
 
 // ─── syllabification (data-driven maximal onset) ─────────────────────────────────────────────────
 
+/// Strip the optional ARPABET stress digit. `WordDict::compound_seams` is the only caller — see the
+/// compound-stress paragraph there for why the seam test must not see stress.
+fn destress(p: &str) -> &str {
+    p.strip_suffix(['0', '1', '2']).unwrap_or(p)
+}
+
+/// S106 §C3 — German writes the same morpheme two ways: `trauen` ships `t ʁ aw ə n` while
+/// `misstrauen` is `m ɪ s t ʁ aw n̩`, `trauben` vs `weintrauben` the same. Without folding the
+/// syllabic consonants together, the COMPETING analysis (`miss`+`trauen`) is invisible and the
+/// seam test settles on the wrong one (`misst`+`rauen`) with nothing to abstain against — exactly
+/// the hole the `alts` map fixes for the other half of this problem. Only the TAIL is folded; the
+/// head has to stay an exact token prefix or the seam index would be ambiguous.
+/// (Structural no-op outside German: no other shipped set has syllabic consonants.)
+fn syllabic_expand<'a>(toks: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    for t in toks {
+        match t {
+            "n̩" => out.extend(["ə", "n"]),
+            "m̩" => out.extend(["ə", "m"]),
+            "l̩" => out.extend(["ə", "l"]),
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// S106 §C3 — German BOUND PREFIXES, with the pronunciation they carry INSIDE a compound.
+///
+/// Why a table at all: these three cannot be reached through the dictionary. de.tsv stores `ge` as
+/// the LETTER NAME `ɟ eː eː`, `ver` only in its reduced citation form `f ɐ` (compounds use `f ɛ ɐ`),
+/// and `rück` not at all. So for `vertragt`, `getrennt`, `rücktritt` the CORRECT analysis is
+/// structurally invisible and only the accidental one (`vert`+`ragt`, `get`+`rennt`, `rückt`+`ritt`)
+/// survives — these are ordinary German words, the most damaging errors the audit found.
+///
+/// ★ SAFETY: entries here feed the LOOSE tier ONLY. A bound prefix can therefore make the
+/// syllabifier ABSTAIN but can never move a boundary, so the table is monotone — adding to it only
+/// ever removes changes. That is why it needs no per-entry truth surface beyond "does this prefix
+/// really sound like this inside a compound".
+///
+/// Each entry is ablated: removing it re-breaks exactly the words listed.
+///   ver  → vertragen vertragt vertraten vertraue vertrauen vertraute vertrauten vertreibt
+///          vertrieben vertritt (10)
+///   ge   → getragen getrennt getrieben geträumt (4)
+///   rück → rücktritt (1)
+/// ⛔ `zer`, `er` and `vor` were measured and REMOVED: each saved 0 words (`er` already has the
+///    right variant in de.tsv). A table entry that fires on nothing is a landmine, not insurance.
+const DE_SEAM_BOUND_PREFIXES: &[(&str, &str)] =
+    &[("ver", "f ɛ ɐ"), ("ge", "ɡ ə"), ("rück", "ʁ ʏ k")];
+
+/// S106 (queue §C3) — WHICH LANGUAGES GET THE COMPOUND-SEAM EXCEPTION. Measured, not assumed: the
+/// same detector was run over all five shipped dictionaries and the candidate sets were judged word
+/// by word (`TESTING/s106_c3_seam/`).
+///
+///   de  1145 word types move, and the moves are German compounds — the mechanism was built for a
+///       compounding language and it shows.               → ON
+///   en  1426 move (goodwill, worldwide, backyard, bandwidth, lightweight, artwork, ceasefire…).
+///       Today `worldwide` sung over two notes gives "worl"+"dwide"; this is exactly the class of
+///       defect §C3 exists for.                            → ON
+///   fr  886 candidates and they are essentially ALL wrong: `chantera` = chante+ra (chan-tra),
+///       `actrice` = act+rice (ac-trice), `aria` = ar+ia. French does not compound this way; every
+///       hit is an inflectional ending or an accident.      → OFF
+///   es  45 candidates, 41 wrong: `aplacar` = ap+lacar (a-pla-car), `agresiones` = agres+iones.
+///                                                          → OFF
+///   it  576 candidates, ~all wrong, and Italian has a rule that OVERRIDES morphology — s impura
+///       never divides. The existing S105 gate proves it without any new judgement: with the seam
+///       exception on, `disgusto` moves to `d i s | ɡ u | s t o` and
+///       `s105_west_onset_gate` turns red on its own pinned `d i | s ɡ u | s t o`.  → OFF
+///
+/// Tightening the filter does not rescue the three: at tail ≥4 chars ∧ ≥3 phones the survivors are
+/// still `apprendra` = app+rendra, `dis|perse`, `ap|lacar`. This is a property of the languages, not
+/// of the threshold.
+fn seam_language(lang: Lang) -> bool {
+    matches!(lang, Lang::De | Lang::En)
+}
+
+/// Where a word decomposes, in phone indices. Two tiers on purpose — see `Seams::constraint`.
+#[derive(Debug, Default, Clone)]
+pub struct Seams {
+    /// EVERY decomposition the dictionary licenses (head ≥2 chars/phones, tail ≥2 chars/phones).
+    any: Vec<usize>,
+    /// The subset allowed to move a boundary (tail ≥4 chars ∧ ≥3 phones).
+    strict: Vec<usize>,
+}
+
+// Loose tier — deliberately permissive, because its only job is to notice that a SECOND analysis
+// exists. German separable prefixes are two characters (`ab`, `an`, `um`, `zu`), and they are both
+// the biggest source of real seams (62 + 45 words for ab-/auf- alone) and the thing that makes
+// `abtragen` = ab+tragen vs abt+ragen ambiguous.
+const SEAM_HEAD_CHARS: usize = 2;
+const SEAM_HEAD_PHONES: usize = 2;
+const SEAM_TAIL_CHARS: usize = 2;
+const SEAM_TAIL_PHONES: usize = 2;
+// Strict tier — the tail must be long enough to be a word rather than a Latin/Greek ending. Every
+// known false family sits under it: de `zent+rum`, `pet+ra`, `ast+ro`, `mak+ro`, `sac+rum`,
+// `annex+ion`, `claus+ius`, `buck+le`, `beck+ley`; en `mag+li`, `pet+ru`, `pad+re`, `nec+ula`.
+// ⚠ It also drops ~50 CORRECT German compounds whose tail is a three-letter word (`arg+los`,
+// `welt+ruf`, `hand+rad`, `hof+rat`, `salz+weg`, `blut+rot`). Dropping a correct seam costs
+// nothing — the word keeps today's cut — while keeping a wrong one is a regression, so the
+// threshold is set on the safe side of that asymmetry.
+const SEAM_STRICT_TAIL_CHARS: usize = 4;
+const SEAM_STRICT_TAIL_PHONES: usize = 3;
+
+impl Seams {
+    /// How far into `cluster` (the consonants between two nuclei at `a+1..b`) the onset must start.
+    ///
+    /// ★ THE ABSTENTION RULE, and it is the whole safety story. A word can decompose more than one
+    /// way — `abtragen` is ab+tragen (right) and abt+ragen (wrong), `abklingen` is ab+klingen
+    /// (right) and abk+lingen (wrong), `outside` is out+side (right) and outs+ide (wrong). When two
+    /// analyses land in the same cluster there is no evidence for either, so this returns 0 and the
+    /// maximal onset decides exactly as before.
+    ///
+    /// ⚠ The loose tier is what makes that work, and the two tiers must not be collapsed: measured
+    /// on de.tsv, raising the SINGLE threshold to the strict one starts changing `diploma`, because
+    /// the competing (correct) analysis `diplom+a` gets filtered out and the wrong `dip+loma`
+    /// survives alone. A stricter filter that REMOVES protection is a trap; two tiers are monotone.
+    fn constraint(&self, a: usize, b: usize) -> usize {
+        let mut only = None;
+        for &s in &self.any {
+            if s >= a + 1 && s <= b {
+                if only.is_some() {
+                    return 0; // two competing analyses in this cluster → abstain
+                }
+                only = Some(s);
+            }
+        }
+        match only {
+            // strictly inside the cluster, and admitted by the strict tier
+            Some(s) if s > a + 1 && s < b && self.strict.contains(&s) => s - (a + 1),
+            _ => 0,
+        }
+    }
+}
+
 /// Split a word's traditional phones into syllables by MAXIMAL ONSET: between two nuclei, the largest
 /// suffix of the consonant cluster that is an OBSERVED word-initial cluster of this language starts the
 /// next syllable; the rest closes the previous one. A word with no nucleus is one "syllable".
-pub fn syllabify(dict: &WordDict, phones: &[String]) -> Vec<Vec<String>> {
+///
+/// `seams` (S106 §C3) CONSTRAINS the search rather than inserting a boundary: the onset may not
+/// start before a compound seam, but every nucleus still yields exactly one syllable. That is why
+/// the syllable COUNT and the phone sequence are untouched for all 269304 de+en keys
+/// (`c3_invariant.py`), so `resolve_west_span`'s consumer count, the OOV verdict and the
+/// word-final coda deferral are all unaffected — only WHICH NOTE a consonant lands on changes.
+/// Pass `&Seams::default()` where no word is available (phonetic overrides, fixtures).
+pub fn syllabify(dict: &WordDict, phones: &[String], seams: &Seams) -> Vec<Vec<String>> {
     let nuclei: Vec<usize> = (0..phones.len()).filter(|&i| dict.is_vowel(&phones[i])).collect();
     if nuclei.is_empty() {
         return vec![phones.to_vec()];
@@ -1096,9 +1374,9 @@ pub fn syllabify(dict: &WordDict, phones: &[String]) -> Vec<Vec<String>> {
         let (a, b) = (w[0], w[1]);
         let cluster = &phones[a + 1..b];
         // longest legal onset = the SMALLEST cut whose suffix is an observed word-initial cluster
-        // (the empty suffix is always legal, so `cut` always resolves).
+        // (the empty suffix is always legal, so `cut` always resolves), NOT crossing a compound seam.
         let mut cut = cluster.len();
-        for s in 0..=cluster.len() {
+        for s in seams.constraint(a, b)..=cluster.len() {
             if dict.onsets.contains(&dict.onset_key(cluster[s..].join(" "))) {
                 cut = s;
                 break;
@@ -1907,7 +2185,12 @@ fn resolve_west_span(
     if trad.is_empty() {
         return Ok(Err(NoteFail::Oov));
     }
-    let sylls = syllabify(dict, &trad);
+    // S106 §C3 — the compound seam is looked up from the LYRIC the author wrote (the same string
+    // the dictionary lookup above used), and it only ever binds when one head+tail pronunciation
+    // concatenates to exactly `trad`. So an override, a merged fragment or a plural/elision reading
+    // simply finds no seam and syllabifies as before, without a special case here.
+    let seams = dict.compound_seams(evt.lyric.trim(), &trad);
+    let sylls = syllabify(dict, &trad, &seams);
 
     // distribute: consumers = the carrier note + every `+` note, in order. Consumer k takes ONE
     // syllable; the FINAL consumer (the min(consumers, syllables)-th) absorbs every remaining
@@ -2098,7 +2381,7 @@ mod tests {
         // and the whole point: a stressless word now SPLITS instead of collapsing into one syllable
         let d = en_fixture();
         let phones: Vec<String> = "k ae n d ah l ih t".split(' ').map(str::to_string).collect();
-        let syl = syllabify(&d, &phones);
+        let syl = syllabify(&d, &phones, &Seams::default());
         assert_eq!(syl.len(), 3, "candlelit must syllabify into 3, got {syl:?}");
     }
 
@@ -2429,7 +2712,7 @@ mod tests {
     fn syllabify_maximal_onset() {
         let d = en_fixture();
         let s = |w: &str| -> Vec<Vec<String>> {
-            syllabify(&d, &d.lookup(w).unwrap())
+            syllabify(&d, &d.lookup(w).unwrap(), &Seams::default())
         };
         // singer: NG is never word-initial in the fixture → it closes the first syllable (si-ng.er → "sing-er")
         assert_eq!(s("singer"), vec![vec!["S", "IH1", "NG"], vec!["ER0"]]);
@@ -2983,7 +3266,14 @@ mod tests {
             assert!(d.onsets.contains(kept), "{kept} must stay a legal EN onset");
         }
         // (b) splits the threshold FIXES (before S94 the bracketed consonant opened the NEXT syllable):
-        let s = |w: &str| -> Vec<Vec<String>> { syllabify(&d, &d.lookup(w).unwrap()) };
+        // S106 §C3 — seam-aware ON PURPOSE: this closure must answer "what does the user hear",
+        // and production computes the seam from the lyric. Passing `Seams::default()` here would
+        // leave two different notions of "the cut for X" in the repo.
+        let s = |w: &str| -> Vec<Vec<String>> {
+            let ph = d.lookup(w).unwrap();
+            let seams = d.compound_seams(w, &ph);
+            syllabify(&d, &ph, &seams)
+        };
         let want = |spec: &str| -> Vec<Vec<String>> {
             spec.split('|').map(|syl| syl.split_whitespace().map(str::to_string).collect()).collect()
         };
@@ -3043,10 +3333,23 @@ mod tests {
         for (w, spec) in [
             ("asia", "EY1 | ZH AH0"),
             ("technique", "T EH0 | K N IY1 K"),     // K N kept (14 votes, knish-family) — documented
-            ("southwest", "S AW2 | TH W EH1 S T"),  // TH W native (thwart)
+            ("athwart", "AH0 | TH W AO1 R T"),      // TH W native (thwart) — see the S106 note below
             ("extra", "EH1 K | S T R AH0"),         // maximal onset itself is alive (S T R, 461 votes)
         ] {
             assert_eq!(s(w), want(spec), "S94-unchanged split for {w}");
+        }
+        // ★S106 §C3 — this pin USED TO BE `southwest`, and its expectation was
+        // `S AW2 | TH W EH1 S T`. The compound-seam exception moves it, deliberately: `southwest` is
+        // south+west and English divides it there, so the new value below is the corrected one and
+        // the old one was an artefact of maximal onset. The pin's ORIGINAL job — proving that `TH W`
+        // survives the vote gate as an intervocalic onset — is now done by `athwart` above, which
+        // has no decomposition and therefore cannot be confused with the seam mechanism.
+        // ⚠ Nothing about `TH W`'s legality changed; only which word demonstrates it.
+        for (w, spec) in [
+            ("southwest", "S AW2 TH | W EH1 S T"),
+            ("northwest", "N AO2 R TH | W EH1 S T"),
+        ] {
+            assert_eq!(s(w), want(spec), "S106 compound-seam split for {w}");
         }
         // (c) the S94 en.tsv REGENERATION knives, pinned by explicit lookup. The sampled golden
         // walks every ~41st line, and none of these five landed on a sampled row — so without
@@ -3175,7 +3478,14 @@ mod tests {
             assert!(!d.onsets.contains(*gone), "{gone} must stay out of the FR onset set");
         }
         // (b') and the cut those drops protect — /d/ belongs to the coda in this loanword family.
-        let s = |w: &str| -> Vec<Vec<String>> { syllabify(&d, &d.lookup(w).unwrap()) };
+        // S106 §C3 — seam-aware ON PURPOSE: this closure must answer "what does the user hear",
+        // and production computes the seam from the lyric. Passing `Seams::default()` here would
+        // leave two different notions of "the cut for X" in the repo.
+        let s = |w: &str| -> Vec<Vec<String>> {
+            let ph = d.lookup(w).unwrap();
+            let seams = d.compound_seams(w, &ph);
+            syllabify(&d, &ph, &seams)
+        };
         let want = |spec: &str| -> Vec<Vec<String>> {
             spec.split('|').map(|syl| syl.split_whitespace().map(str::to_string).collect()).collect()
         };
@@ -3356,7 +3666,8 @@ mod tests {
             let d = &dicts.iter().find(|x| x.0 == name).unwrap().1;
             for (w, spec) in cases {
                 let phones = d.lookup(w).unwrap_or_else(|| panic!("{name}: {w} is OOV"));
-                assert_eq!(syllabify(d, &phones), want(spec), "{name}: the S105 cut for {w}");
+                let seams = d.compound_seams(w, &phones);
+                assert_eq!(syllabify(d, &phones, &seams), want(spec), "{name}: the S105 cut for {w}");
             }
         }
 
@@ -3443,6 +3754,276 @@ mod tests {
         }
     }
 
+    /// S106 (queue §C3) — the COMPOUND-SEAM gate over the REAL dictionaries. The criterion, the
+    /// per-language measurements and every accepted cost live above `seam_language`; this pins the
+    /// behaviour they justify. Same loud-SKIP contract as the gates around it.
+    ///
+    /// Five groups, each able to fail for its OWN reason (S101: one mutation must not satisfy them
+    /// all — `mutate_s106.py` keeps that honest):
+    ///  (1) SCOPE — de/en ON, fr/es/it OFF, and the three OFF languages really do compute NO seams.
+    ///      Plus the structural precondition for ignoring stress digits: no MFA phone ends in 0/1/2.
+    ///  (2) THRESHOLDS — the six constants are pinned individually, and BEFORE the cut table.
+    ///      Without this, editing one is a silent linguistic decision (the S105 lesson: an
+    ///      assertion of the form "live == my table" cannot see the table itself move).
+    ///  (3) CUTS — words that move, and words that must NOT, each for its own named reason
+    ///      (two competing analyses ⇒ abstain · tail below the strict threshold · no decomposition).
+    ///  (4) BLAST RADIUS + INVARIANT — over EVERY key of all five dictionaries: the syllable COUNT
+    ///      and the phone sequence are identical with and without seams, and the number of word
+    ///      types whose cut moves is exactly what the analysis measured. ⚠ If one of these numbers
+    ///      fires, judge the newcomers — do not update it.
+    ///  (5) END TO END — `resolve_score` over a multi-note word, i.e. the only thing a user hears.
+    #[test]
+    fn s106_compound_seam_gate() {
+        let read = |name: &str| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../data/dictionaries")
+                .join(name);
+            std::fs::read_to_string(&p)
+        };
+        let (Ok(de_tsv), Ok(en_tsv), Ok(fr_tsv), Ok(es_tsv), Ok(it_tsv)) = (
+            read("de.tsv"),
+            read("en.tsv"),
+            read("fr.tsv"),
+            read("es.tsv"),
+            read("it.tsv"),
+        ) else {
+            eprintln!("[s106-compound-seam-gate] SKIPPED — data/dictionaries/*.tsv not present \
+                       (gitignored generated assets; run MBS2H build_dictionaries.py)");
+            return;
+        };
+        let dicts = [
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1132usize),
+            ("en", WordDict::from_tsv(Lang::En, &en_tsv), &en_tsv, 1479),
+            ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, 0),
+            ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, 0),
+            ("it", WordDict::from_tsv(Lang::It, &it_tsv), &it_tsv, 0),
+        ];
+        let pick = |name: &str| &dicts.iter().find(|x| x.0 == name).unwrap().1;
+
+        // (1) SCOPE
+        for l in [Lang::De, Lang::En] {
+            assert!(seam_language(l), "{l:?} must have the compound-seam exception");
+        }
+        for l in [Lang::Fr, Lang::Es, Lang::It, Lang::Zh, Lang::Ja] {
+            assert!(!seam_language(l), "{l:?} must NOT have the compound-seam exception");
+        }
+        // Ignoring stress digits is only a no-op for the MFA sets if they carry none.
+        for (name, tsv) in [("de", &de_tsv), ("fr", &fr_tsv), ("es", &es_tsv), ("it", &it_tsv)] {
+            for line in tsv.lines() {
+                let Some((_, phones)) = line.split_once('\t') else { continue };
+                for t in phones.split_whitespace() {
+                    assert_eq!(
+                        destress(t), t,
+                        "{name}: phone {t:?} ends in a stress digit — `destress` is no longer a \
+                         structural no-op for the MFA sets and the seam test's key changes meaning"
+                    );
+                }
+            }
+        }
+        // …and the OFF languages compute nothing, so no filter tuning can leak into them.
+        for (name, w) in [("fr", "chantera"), ("fr", "actrice"), ("es", "aplacar"), ("it", "disgusto")] {
+            let d = pick(name);
+            let ph = d.lookup(w).unwrap_or_else(|| panic!("{name}: {w} is OOV"));
+            let s = d.compound_seams(w, &ph);
+            assert!(
+                s.any.is_empty() && s.strict.is_empty(),
+                "{name}: {w} produced seams {s:?} — `seam_language` says this language is OFF. \
+                 (it `disgusto` is the live proof: s impura OVERRIDES morphology, and turning \
+                 Italian on turns `s105_west_onset_gate` red on its own pinned di|sgu|sto.)"
+            );
+        }
+
+        // (2) THRESHOLDS — pinned individually, and BEFORE the cut table on purpose: a mutation
+        // probe that edits a constant must fire HERE, naming the constant, instead of surfacing as
+        // an unexplained cut change three groups later (S101/S105: one mutation red in the wrong
+        // group leaves the right group unverified).
+        assert_eq!((SEAM_HEAD_CHARS, SEAM_HEAD_PHONES), (2, 2), "the LOOSE head tier moved");
+        assert_eq!((SEAM_TAIL_CHARS, SEAM_TAIL_PHONES), (2, 2), "the LOOSE tail tier moved");
+        assert_eq!(
+            (SEAM_STRICT_TAIL_CHARS, SEAM_STRICT_TAIL_PHONES),
+            (4, 3),
+            "the STRICT tail tier moved. Lowering it re-admits the Latin/Greek ending families \
+             (zent+rum, pet+ra, annex+ion, mag+li); raising it drops real compounds. Either way it \
+             is a verdict — re-run TESTING/s106_c3_seam and write the new double-entry down."
+        );
+        assert_eq!(
+            DE_SEAM_BOUND_PREFIXES.len(),
+            3,
+            "the German bound-prefix table changed size. Each entry is ablated in the doc comment \
+             (ver 10 words, ge 4, rück 1) and three candidates were REMOVED for saving zero — a new \
+             entry needs the same double-entry before it goes in."
+        );
+
+        // (3) CUTS — generated from the analysis by `TESTING/s106_c3_seam/c3_emit_rust.py` and
+        // cross-checked back against it by `c3_crosscheck_rust.py`; do not hand-edit the strings.
+        let want = |spec: &str| -> Vec<Vec<String>> {
+            spec.split('|').map(|s| s.split_whitespace().map(str::to_string).collect()).collect()
+        };
+        for (name, w, before, after) in [
+            // ── de — the seam MOVES the cut
+            ("de", "bankrott", "b a ŋ | k ʁ ɔ t", "b a ŋ k | ʁ ɔ t"),   // bank+rott
+            ("de", "auflage", "aw | f l aː | ɡ ə", "aw f | l aː | ɡ ə"),   // auf+lage
+            ("de", "blickrichtung", "b l ɪ | k ʁ ɪ ç | tʰ ʊ ŋ", "b l ɪ k | ʁ ɪ ç | tʰ ʊ ŋ"),   // blick+richtung
+            ("de", "betrieblich", "b ə | t ʁ iː | p l ɪ ç", "b ə | t ʁ iː p | l ɪ ç"),   // betrieb+lich
+            ("de", "fischmehl", "f ɪ | ʃ m eː l", "f ɪ ʃ | m eː l"),   // fisch+mehl
+            ("de", "banknote", "b a ŋ | k n oː | tʰ ə", "b a ŋ k | n oː | tʰ ə"),   // bank+note
+            ("de", "englischlehrer", "ɛ ŋ | l ɪ | ʃ l eː | ʁ ɐ", "ɛ ŋ | l ɪ ʃ | l eː | ʁ ɐ"),   // englisch+lehrer
+            ("de", "notrufen", "n oː | t ʁ uː | f ə n", "n oː t | ʁ uː | f ə n"),   // not+rufen
+            ("de", "halbjährige", "h a l | p j eː | ʁ ɪ | ɡ ə", "h a l p | j eː | ʁ ɪ | ɡ ə"),   // halb+jährige
+            ("de", "ableiten", "a | p l aj | tʰ n̩", "a p | l aj | tʰ n̩"),   // ab+leiten (only visible once `n̩` ≡ `ə n`)
+            ("de", "zeitrahmens", "ts aj | t ʁ aː | m n̩ s", "ts aj t | ʁ aː | m n̩ s"),   // zeit+rahmens
+            // ── de — unchanged, each for its own reason
+            ("de", "alternativlos", "a l | tʰ ɐ | n a | tʰ iː | f l oː s", "a l | tʰ ɐ | n a | tʰ iː | f l oː s"),   // alternativ+los (tail below the strict threshold)
+            ("de", "abendland", "aː | b n̩ t | l a n t", "aː | b n̩ t | l a n t"),   // abend+land — already cut there by the S105 *tl gate
+            ("de", "geburtstag", "ɡ ə | b ʊ ʁ t s | t aː k", "ɡ ə | b ʊ ʁ t s | t aː k"),   // geburt+stag
+            ("de", "abtragen", "a p | t ʁ aː | ɡ ə n", "a p | t ʁ aː | ɡ ə n"),   // ab+tragen (two analyses ⇒ abstain)
+            ("de", "abklingen", "a p | k l ɪ ŋ | ə n", "a p | k l ɪ ŋ | ə n"),   // ab+klingen (two analyses ⇒ abstain)
+            ("de", "alfred", "a l | f ʁ eː t", "a l | f ʁ eː t"),   // al+fred (two analyses ⇒ abstain)
+            ("de", "zentrum", "ts ɛ n | t ʁ ʊ m", "ts ɛ n | t ʁ ʊ m"),   // zent+rum (tail below the strict threshold)
+            ("de", "annexion", "a | n ɛ k | s j oː n", "a | n ɛ k | s j oː n"),   // annex+ion (tail below the strict threshold)
+            ("de", "reflexion", "ʁ ɛ | f l ɛ k | s j oː n", "ʁ ɛ | f l ɛ k | s j oː n"),   // reflex+ion (tail below the strict threshold)
+            ("de", "petra", "pʰ eː | t ʁ a", "pʰ eː | t ʁ a"),   // pet+ra (tail below the strict threshold)
+            ("de", "buckle", "b ʊ | k l ə", "b ʊ | k l ə"),   // buck+le (tail below the strict threshold)
+            ("de", "diplom", "d ɪ | p l ɔ m", "d ɪ | p l ɔ m"),   // dip+lom (tail below the strict threshold)
+            ("de", "complex", "kʰ ɔ m | p l ɛ k s", "kʰ ɔ m | p l ɛ k s"),   // comp+lex (tail below the strict threshold)
+            ("de", "arglos", "a ʁ | k l oː s", "a ʁ | k l oː s"),   // arg+los (tail below the strict threshold)
+            ("de", "weltruf", "v ɛ l | t ʁ uː f", "v ɛ l | t ʁ uː f"),   // welt+ruf (tail below the strict threshold)
+            ("de", "verstehen", "f ɛ | ɐ | ʃ t eː | ə n", "f ɛ | ɐ | ʃ t eː | ə n"),   // ver+stehen (tail below the strict threshold)
+            ("de", "abduktion", "a p | d ʊ k t | s j oː n", "a p | d ʊ k t | s j oː n"),   // no decomposition
+            // …and the ones `DE_SEAM_BOUND_PREFIXES` + the syllabic-consonant fold rescued. Every
+            // one is an ordinary German word that WOULD have been mis-cut (`f ɛ ɐ t | ʁ aw n̩`):
+            ("de", "vertrauen", "f ɛ | ɐ | t ʁ aw | n̩", "f ɛ | ɐ | t ʁ aw | n̩"),   // ver+trauen (two analyses ⇒ abstain)
+            ("de", "vertragt", "f ɛ | ɐ | t ʁ aː k t", "f ɛ | ɐ | t ʁ aː k t"),   // ver+tragt (two analyses ⇒ abstain)
+            ("de", "getrennt", "ɡ ə | t ʁ ɛ n t", "ɡ ə | t ʁ ɛ n t"),   // ge+trennt (two analyses ⇒ abstain)
+            ("de", "geträumt", "ɡ ə | t ʁ ɔʏ m t", "ɡ ə | t ʁ ɔʏ m t"),   // ge+träumt (two analyses ⇒ abstain)
+            ("de", "rücktritt", "ʁ ʏ k | t ʁ ɪ t", "ʁ ʏ k | t ʁ ɪ t"),   // rück+tritt (two analyses ⇒ abstain)
+            ("de", "misstrauen", "m ɪ s | t ʁ aw | n̩", "m ɪ s | t ʁ aw | n̩"),   // miss+trauen (needs `n̩` ≡ `ə n`)
+            ("de", "weintrauben", "v aj n | t ʁ aw | b n̩", "v aj n | t ʁ aw | b n̩"),   // wein+trauben (needs `n̩` ≡ `ə n`)
+            // …and the two extra STRICT clauses (Latin ⟨i⟩/⟨e⟩ tail · head needs a full vowel):
+            ("de", "pensionen", "pʰ ɛ n | s j oː | n ə n", "pʰ ɛ n | s j oː | n ə n"),   // pens+ionen (⟨i⟩ tail)
+            ("de", "stadions", "ʃ t a | t j oː n s", "ʃ t a | t j oː n s"),   // stad+ions (⟨i⟩ tail)
+            ("de", "getrödelt", "ɡ ə | t ʁ øː | d ə l t", "ɡ ə | t ʁ øː | d ə l t"),   // get+rödelt (head has only schwa)
+            // ── en — the seam MOVES the cut
+            ("en", "worldwide", "W ER1 L | D W AY1 D", "W ER1 L D | W AY1 D"),   // world+wide
+            ("en", "goodwill", "G UH1 | D W IH1 L", "G UH1 D | W IH1 L"),   // good+will
+            ("en", "lightweight", "L AY1 | T W EY1 T", "L AY1 T | W EY1 T"),   // light+weight
+            ("en", "ceasefire", "S IY1 | S F AY1 | ER0", "S IY1 S | F AY1 | ER0"),   // cease+fire
+            ("en", "backyard", "B AE1 | K Y AA2 R D", "B AE1 K | Y AA2 R D"),   // back+yard
+            ("en", "bandwidth", "B AE1 N | D W IH0 D TH", "B AE1 N D | W IH0 D TH"),   // band+width
+            ("en", "artwork", "AA1 R | T W ER2 K", "AA1 R T | W ER2 K"),   // art+work
+            ("en", "outright", "AW1 | T R AY1 T", "AW1 T | R AY1 T"),   // out+right
+            ("en", "worthwhile", "W ER1 | TH W AY1 L", "W ER1 TH | W AY1 L"),   // worth+while
+            ("en", "lifelong", "L AY1 | F L AO1 NG", "L AY1 F | L AO1 NG"),   // life+long
+            ("en", "handwriting", "HH AE1 N | D R AY2 | T IH0 NG", "HH AE1 N D | R AY2 | T IH0 NG"),   // hand+writing
+            ("en", "dishwasher", "D IH1 | SH W AA2 | SH ER0", "D IH1 SH | W AA2 | SH ER0"),   // dish+washer
+            // ── en — unchanged, each for its own reason
+            ("en", "outside", "AW1 T | S AY1 D", "AW1 T | S AY1 D"),   // out+side (two analyses ⇒ abstain)
+            ("en", "itself", "IH2 T | S EH1 L F", "IH2 T | S EH1 L F"),   // it+self (two analyses ⇒ abstain)
+            ("en", "matsumoto", "M AA0 T | S UW0 | M OW1 | T OW0", "M AA0 T | S UW0 | M OW1 | T OW0"),   // no decomposition
+            ("en", "antsy", "AE1 N T | S IY0", "AE1 N T | S IY0"),   // no decomposition
+            ("en", "magli", "M AE1 | G L IY0", "M AE1 | G L IY0"),   // mag+li (tail below the strict threshold)
+            ("en", "padre", "P AE1 | D R EY2", "P AE1 | D R EY2"),   // pad+re (tail below the strict threshold)
+            ("en", "petru", "P EH1 | T R UW0", "P EH1 | T R UW0"),   // pet+ru (tail below the strict threshold)
+            ("en", "athwart", "AH0 | TH W AO1 R T", "AH0 | TH W AO1 R T"),   // no decomposition
+            ("en", "extra", "EH1 K | S T R AH0", "EH1 K | S T R AH0"),   // no decomposition
+            ("en", "technique", "T EH0 | K N IY1 K", "T EH0 | K N IY1 K"),   // no decomposition
+            ("en", "asia", "EY1 | ZH AH0", "EY1 | ZH AH0"),   // no decomposition
+            ("en", "albertson", "AE1 L | B ER0 T | S AH0 N", "AE1 L | B ER0 T | S AH0 N"),   // albert+son (tail below the strict threshold)
+        ] {
+            let d = pick(name);
+            let ph = d.lookup(w).unwrap_or_else(|| panic!("{name}: {w} is OOV"));
+            assert_eq!(
+                syllabify(d, &ph, &Seams::default()),
+                want(before),
+                "{name}: the PRE-S106 cut for {w} moved — that is an onset-set change, not a seam one"
+            );
+            assert_eq!(
+                syllabify(d, &ph, &d.compound_seams(w, &ph)),
+                want(after),
+                "{name}: the S106 compound-seam cut for {w}"
+            );
+        }
+
+        // (4) BLAST RADIUS + INVARIANT over EVERY key
+        for (name, d, _tsv, expect_moved) in &dicts {
+            let mut moved = 0usize;
+            for (key, phones) in &d.map {
+                let ph: Vec<String> = phones.split_whitespace().map(str::to_string).collect();
+                let base = syllabify(d, &ph, &Seams::default());
+                let now = syllabify(d, &ph, &d.compound_seams(key, &ph));
+                assert_eq!(
+                    base.len(),
+                    now.len(),
+                    "{name}: {key} changed SYLLABLE COUNT — the seam must constrain the cut, never \
+                     insert a boundary (n_consumers and the OOV verdict depend on this)"
+                );
+                let flat: Vec<&String> = now.iter().flatten().collect();
+                assert!(
+                    flat.iter().copied().eq(ph.iter()),
+                    "{name}: {key} changed its PHONE SEQUENCE"
+                );
+                if base != now {
+                    moved += 1;
+                }
+            }
+            assert_eq!(
+                moved, *expect_moved,
+                "{name}: {moved} word types now change their cut, not {expect_moved}. A dictionary \
+                 regeneration moved the seam surface — JUDGE the newcomers (TESTING/s106_c3_seam/\
+                 c3_final_{name}.txt is the shipped list); do not update this number."
+            );
+        }
+
+        // (5) ★END TO END — the production path, `resolve_score` over a multi-note word. Same
+        // reasoning as `s105_west_onset_gate` group (5): a verdict that is right in `syllabify` and
+        // wrong on the wire is the shape that has bitten this repo before (S85 rule 4).
+        struct OneLang(Lang, WordDict);
+        impl DictSource for OneLang {
+            fn zh(&self) -> Result<&ZhDict> {
+                Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+            }
+            fn words(&self, lang: Lang) -> Result<&WordDict> {
+                if lang == self.0 {
+                    Ok(&self.1)
+                } else {
+                    Err(UtaiError::Inference("VOCAL_DICT_MISSING: test".into()))
+                }
+            }
+        }
+        for (name, lang, word, pre, post) in [
+            ("de", Lang::De, "bankrott",
+             &[&["b", "a", "ŋ"][..], &["k", "ʁ", "ɔ", "t"][..]][..],
+             &[&["b", "a", "ŋ", "k"][..], &["ʁ", "ɔ", "t"][..]][..]),
+            ("en", Lang::En, "worldwide",
+             &[&["w", "ɝ", "l"][..], &["d", "w", "aɪ", "d"][..]][..],
+             &[&["w", "ɝ", "l", "d"][..], &["w", "aɪ", "d"][..]][..]),
+        ] {
+            let tsv = dicts.iter().find(|x| x.0 == name).unwrap().2;
+            let src = OneLang(lang, WordDict::from_tsv(lang, tsv));
+            let score = [evt(word, lang), evt("+", lang)];
+            let wire: Vec<Vec<&'static str>> = resolve_score(&score, &src)
+                .unwrap_or_else(|e| panic!("{name}: strict resolve of {word} failed: {e:?}"))
+                .iter()
+                .map(phones_of)
+                .collect();
+            assert_ne!(
+                wire, *pre,
+                "{name}: the compound seam never reached the render wire for {word} — the table may \
+                 still be right; this is the consumer (`resolve_west_span`)"
+            );
+            assert_eq!(wire, *post, "{name}: {word} over two notes came out wrong ON THE WIRE");
+            // …and on ONE note the seam is invisible: one consumer takes every syllable.
+            let one = [evt(word, lang)];
+            let all: Vec<&'static str> =
+                post.iter().flat_map(|s| s.iter().copied()).collect();
+            assert_eq!(
+                phones_of(&resolve_score(&one, &src).unwrap()[0]),
+                all,
+                "{name}: a single note must not see the seam at all"
+            );
+        }
+    }
+
     /// S104 — the FR/IT elision rung over the REAL dictionaries. Same loud-SKIP contract.
     ///
     /// WHAT IT PROTECTS: before this rung, `l'amour` / `j'aime` / `t'aime` were `VOCAL_OOV`, and OOV
@@ -3497,7 +4078,7 @@ mod tests {
         }
         // …and the composed word syllabifies like French, not like a vowel-less clitic note.
         assert_eq!(
-            syllabify(&fr, &fr.lookup("l'amour").unwrap()),
+            syllabify(&fr, &fr.lookup("l'amour").unwrap(), &Seams::default()),
             vec![vec!["l", "a"], vec!["m", "u", "ʁ"]],
             "l'amour must cut la|mour"
         );
@@ -3919,7 +4500,7 @@ mod tests {
                         }
                         match d.lookup(head) {
                             Some(trad) => {
-                                let sy = syllabify(d, &trad);
+                                let sy = syllabify(d, &trad, &d.compound_seams(head, &trad));
                                 println!("    trad: {}", trad.join(" "));
                                 println!(
                                     "    syl : {}",
@@ -4037,7 +4618,7 @@ mod tests {
     fn de_syllabic_consonant_is_nucleus() {
         let f = fixtures();
         let d = de_fixture();
-        let sylls = syllabify(&d, &d.lookup("haben").unwrap());
+        let sylls = syllabify(&d, &d.lookup("haben").unwrap(), &Seams::default());
         assert_eq!(sylls, vec![vec!["h", "aː"], vec!["b", "n̩"]], "n̩ carries the 2nd syllable");
         let score = [evt("haben", Lang::De), evt("+", Lang::De)];
         let r = resolve_score(&score, &f).unwrap();
