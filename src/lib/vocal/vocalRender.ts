@@ -722,8 +722,20 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  span ran out of syllables — so this is the first round in which they diverge, and a stored bake
  *  of any French score using `+` that way is exactly what the stamp has to invalidate. `-` keeps
  *  its old output to the phone. Evidence, the external truth surface (183 fr.tsv keys where
- *  upstream spells the schwa out itself) and the accepted costs live above `ecaduc_language`. */
-export const G2P_ALGO_VERSION = "s107";
+ *  upstream spells the schwa out itself) and the accepted costs live above `ecaduc_language`.
+ *  s108 = the ONSET INVENTORY stops depending on word-initial attestation (`single_onset_forbidden`
+ *  + the keep lists becoming authoritative, both in g2p.rs). Until now a phone could open a syllable
+ *  only if some row of the dictionary began with it — so Spanish, whose [β ð ɣ] are by definition
+ *  non-initial allophones, glued every intervocalic ⟨d⟩ and ⟨g⟩ to the previous syllable (`nada` =
+ *  `n a ð | a`, `madre` = `m a ð | ɾ e`, `abatible` = `… t̪ i β | l e`) while the same phoneme after a
+ *  nasal, spelled as a stop, came out right (`hombre` = `o m | b ɾ e`). 46031 word types move:
+ *  es 37702 · it 6388 · de 1395 · fr 246 · **en 0** (English was healthy — every one of its 23 lone
+ *  consonants has ≥71 attestations). Syllable COUNT and phone sequence are identical on every key of
+ *  all five dictionaries, exactly as in s105 — only which note a consonant lands on changes, which is
+ *  precisely what a stored bake would get wrong. Evidence, the accidental one-row attestations this
+ *  removes (`two` was holding up German /t/) and every accepted cost live above
+ *  `single_onset_forbidden`. */
+export const G2P_ALGO_VERSION = "s108";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

@@ -610,12 +610,14 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s107|st:s97c");
-    // S107: the French mute ⟨e⟩ — `belle` + `+` sings `b ɛ | l ə` instead of holding the vowel, so
-    // `+` and `-` diverge for the first time. ⚠ This literal ALSO carries S106's compound-seam round
-    // (de 1129 / en 1478 word types), which shipped without bumping — see the version log next to
-    // the constant. Two rounds behind one stamp is a debt being repaid, not a pattern to copy.
-    expect(G2P_ALGO_VERSION).toBe("s107");
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s108|st:s97c");
+    // S108: the onset inventory stops depending on word-initial attestation — 46031 word types cut
+    // differently (es 37702 · it 6388 · de 1395 · fr 246 · en 0), e.g. `madre` = `m a | ð ɾ e` where
+    // it used to be `m a ð | ɾ e`. Same class as s105: the syllable COUNT never moves, only which
+    // note carries the consonant, which is exactly what a stored bake gets wrong.
+    // (s107 = the French mute ⟨e⟩; that literal also carried S106's compound-seam round, which had
+    // shipped without bumping — see the version log next to the constant.)
+    expect(G2P_ALGO_VERSION).toBe("s108");
     expect(SCORE_TIMING_VERSION).toBe("s97c"); // S97b: + phrase-final sonorant coda restore (render side, upstream level target)
   });
 
@@ -625,7 +627,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s107|st:s97c|dict:d0",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s108|st:s97c|dict:d0",
     );
   });
 
