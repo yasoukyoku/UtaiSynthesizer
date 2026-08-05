@@ -608,7 +608,17 @@ impl WordDict {
         //   all 152769 rows the hoist changes nothing. It is the correct placement for a shorter
         //   input that does not exist yet; do not cite it as load-bearing. (Same treatment as the
         //   note in `Seams::constraint`.)
+        // S111 §C24b — a second contributor to the same field. The two never disagree about a
+        // position (one only ever adds a block, the other only ever withholds one), so the union is
+        // the join; they are separate functions because the EVIDENCE is opposite in sign — see
+        // `de_lj_license_blocks`'s doc for why one defaults to blocking and the other to not.
         seams.glide_block = self.de_literal_j_blocks(word, phones);
+        for p in self.de_lj_license_blocks(word, phones) {
+            if !seams.glide_block.contains(&p) {
+                seams.glide_block.push(p);
+            }
+        }
+        seams.glide_block.sort_unstable();
         // ⚠ `phones.len() < 4` is a cheap early-out, NOT a filter: a seam needs ≥2 phones on each
         // side, so four is the structural minimum anyway. A mutation probe that raised it to 5
         // passed the whole gate green — that is what proved it inert (`mutate_s106.py` M5).
@@ -755,6 +765,70 @@ impl WordDict {
         }
         out.sort_unstable();
         out
+    }
+
+    /// S111 §C24b — the /l j/ positions that must NOT join the onset.
+    ///
+    /// ★★ THIS ONE IS INVERTED RELATIVE TO `de_literal_j_blocks`, on purpose. That guard blocks on
+    /// POSITIVE evidence (the key spells a literal ⟨Cj⟩) and its blind default is the onset. Here
+    /// the blind default is the CODA — which is what every /l j/ in this dictionary got before this
+    /// round — and a site is released only on positive evidence that the glide came from an ⟨i⟩.
+    /// So this function returns "block everything" when it has nothing to go on, and that direction
+    /// is the whole safety story: `l j` is entering the keep list for one measured family, and
+    /// nothing outside that family may move.
+    ///
+    /// ★ THE LICENSE is ⟨V⟩ ⟨l⟩ ⟨l⟩? ⟨i⟩ ⟨V⟩ — Mil-li-on, Mil-li-ar-de, Al-li-anz, Au-re-li-us,
+    /// a-li-ens. The leading vowel letter is not decoration: the site being judged is INTERVOCALIC,
+    /// so the license has to be too. Without it `liouville` licensed its word-FINAL /l j/ from the
+    /// word-INITIAL ⟨lio⟩ — a word-level predicate standing in for a positional one where the proxy
+    /// does not hold (S88), and the only word in the dictionary where it showed.
+    ///
+    /// ⛔ WHAT THE LICENSE DELIBERATELY DOES NOT REACH, all measured:
+    ///   · Romance ⟨ill⟩+non-⟨i⟩ — Me-dail-le, Pa-vil-lon, bril-lant, Bouil-lon, Se-vil-la,
+    ///     Ba-tail-lon, Bil-lard, Pa-trouil-le (145 word types). They have no ⟨li⟩+V, so they are
+    ///     never licensed and keep today's cut, which is the RIGHT one: **0 confirmed : 15 refuted**
+    ///     if they were flipped (`bʁɪlˈjant`, `bulˈjɔŋ`, `bilˈjaːɐ̯`, `batalˈjoːn`, `ˈpa.vɪlˌjɔŋ`).
+    ///   · Ten keys with a /l j/ from neither spelling (`apollon`, `tastaturlayout`, `wesleyan`,
+    ///     `vallejo`, `milliliter`, `littleton`, `tilak`, `kirilov`, `ollon`, `zelaya`). The ruler is
+    ///     silent on every one, and two of them (Tastatur|Layout, Wesley|an) are real morpheme
+    ///     boundaries — so "flip them and see" would have been 10 unmeasured changes, two of them
+    ///     probably wrong. Fail-closed means they simply never move.
+    ///   · Literal ⟨lj⟩ (`aufholjagd`, `fiskaljahr`, `balljunge`, `alljährlich`, `ilja`, 57 keys).
+    ///     They carry no ⟨li⟩+V license, so the DEFAULT here already holds every one of them —
+    ///     which means `DE_LITERAL_J_SPELLING`'s ("l","lj") row, written by S110 in the expectation
+    ///     that §C24b would make it load-bearing, is **still inert** (measured: deleting it changes
+    ///     `glide_block` on 0 keys, and 0 keys carry both a literal ⟨lj⟩ and a license). Its note
+    ///     says so; the prediction was wrong in a harmless direction and is recorded rather than
+    ///     quietly inherited.
+    ///
+    /// ⚠ THE OVERRIDE PATH IS A STRICT NO-OP. `phoneme_input`, a merged fragment or a composed rung
+    /// arrives with phones the letters do not describe, so there is no license to read — and because
+    /// "no license" means "block", such a word is cut exactly as it was before S111. Not a ratio, an
+    /// identity. (`de_literal_j_blocks` cannot say that; its abstention falls through to a default
+    /// that S110 changed, which its own doc records.)
+    fn de_lj_license_blocks(&self, word: &str, phones: &[String]) -> Vec<usize> {
+        if self.lang != Lang::De || !phones.iter().any(|p| p == "j") {
+            return Vec::new();
+        }
+        let nuclei: Vec<usize> = (0..phones.len()).filter(|&i| self.is_vowel(&phones[i])).collect();
+        let sites: Vec<usize> = nuclei
+            .windows(2)
+            .filter(|w| w[1] >= w[0] + 3 && phones[w[1] - 1] == "j" && phones[w[1] - 2] == "l")
+            .map(|w| w[1] - 1)
+            .collect();
+        if sites.is_empty() {
+            return Vec::new();
+        }
+        let licensed = lookup_candidates(word)
+            .into_iter()
+            .find(|k| self.map.contains_key(k))
+            .filter(|key| {
+                self.pronunciations(key)
+                    .any(|p| p.split_whitespace().eq(phones.iter().map(String::as_str)))
+            })
+            .filter(|key| !DE_LJ_CODA_SPELLINGS.iter().any(|s| key.contains(s)))
+            .is_some_and(|key| de_lj_license_count(&key) >= sites.len());
+        if licensed { Vec::new() } else { sites }
     }
 
     /// S107 §C17 — the French mute ⟨e⟩ (e-caduc) that the AUTHOR explicitly asked for.
@@ -1046,20 +1120,23 @@ const DE_ONSET_KEEP: &[&str] = &[
     //    separates them, and `n j` then measures 235 helped : 0 harmed (⟨-linie⟩, ⟨-nion⟩, Mil-li-on
     //    style ⟨ni⟩+V), with 78 more in the ⟨gn⟩/⟨ny⟩/⟨nh⟩ foreign-digraph families that the guard
     //    cannot judge either way.
-    // ⛔ `l j` STAYS OUT, and this is a NEGATIVE RESULT with a number: the same split measures
-    //    **130 helped : 145 harmed**. The harmed side is Romance ⟨ill⟩ — Me-dail-le, Pa-vil-lon,
-    //    bril-lant, Bouil-lon, Se-vil-la, Pa-trouil-le, and 140 more — where German breaks AFTER the
-    //    ⟨l⟩, so those words are cut CORRECTLY today and admitting `l j` would break them to buy the
-    //    ⟨lli⟩+V family (Million, Milliarde, ⟨-ius⟩). Same instrument as the ⟨ni⟩ side, opposite
-    //    answer: Duden/Wiktionary put the stress inside the cluster for `brillant` [bʁɪlˈjant] and
-    //    `Bouillon` [bulˈjɔŋ] but before it for `Million` [mɪˈli̯oːn]. ⇒ Admitting it needs a SECOND
-    //    spelling predicate (⟨lli⟩+V vs ⟨ill⟩+non-⟨i⟩), which is its own round with its own truth
-    //    surface — it has false members both ways (`Wil·liam` [ˈvɪljam] is ⟨lli⟩+V and wants coda).
-    //    Queue §C24b carries the measurement. Shipping `l j` bare would be a net REGRESSION, and the
-    //    first version of S110 did exactly that until an adversarial review caught it.
+    // ★★ `l j` (S111 §C24b) — admitted, but ONLY under a spelling license. Read this whole note
+    //    before touching it, because bare admission is a measured REGRESSION and S110 shipped it for
+    //    one commit before an adversarial review pulled it back.
+    //    · BARE:      130 helped : **145 harmed**. The harmed side is Romance ⟨ill⟩ — Me-dail-le,
+    //      Pa-vil-lon, bril-lant, Bouil-lon, Se-vil-la, Ba-tail-lon, Pa-trouil-le — which German
+    //      breaks AFTER the ⟨l⟩, i.e. those words are cut CORRECTLY today. Admitting `l j` for
+    //      everyone buys the ⟨lli⟩+V family by breaking them: 145 right answers traded for 130.
+    //    · LICENSED:  `de_lj_license_blocks` releases a site only when the key spells ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩
+    //      and the CODA is the default everywhere else, so the ⟨ill⟩ side never moves at all.
+    //      Blast radius **119 word types**, measured **59 confirmed : 0 refuted** against the S111
+    //      wiktionary instrument (`ˈaːbɐmɪˌli̯oːnən`, `aˈli̯ant͡s`, `aʊ̯ˈʁeːli̯ʊs`, `ˈɛɪ̯li̯əns`),
+    //      with the ⟨ill⟩ side independently confirmed **0 : 15** in the direction of staying put.
+    //    · The one false member the queue predicted by name — `Wil·liam` [ˈvɪl.jam], ⟨illi⟩+⟨a⟩ just
+    //      like Mil-li-on — is `DE_LJ_CODA_SPELLINGS`. There is no rule that separates them.
     //    ⚠ The literal-⟨j⟩ defect was already in this list for the OTHER thirteen consonants — see
     //    `DE_LITERAL_J_SPELLING`'s doc. Admitting `n j` did not create it; it is what made it visible.
-    "t s j", "z j", "ɡ j", "b j", "n j",
+    "t s j", "z j", "ɡ j", "b j", "n j", "l j",
     // German-specific onsets: kn-, gn-, ⟨qu⟩ = k v, ⟨zw⟩ = ts v.
     // ⛔ `ɡ v` was proposed here as "⟨qu⟩'s voiced twin" and MEASURED DOWN: ⟨qu⟩+V really is
     //    `k v` (843/909 = 93%), but ⟨gu⟩+V is `ɡ ʊ` — a VOWEL, its own nucleus — in 173 words
@@ -1192,12 +1269,21 @@ const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
     // ⛔ Their lenis twins are NOT here and must not be re-added: a voiced /b d ɡ v z/ before the
     //    /j/ is the dictionary saying "this one is an onset" (`a d j ɛ k tʰ iː f`, `n a d j aː`).
     ("p", "bj"), ("t", "dj"),
-    // ⚠ INERT TODAY, kept deliberately — measured: it changes 0 word types. `l j` is NOT in
-    //   `DE_ONSET_KEEP` (see the ⛔ note there), so the maximal onset already cuts at the /j/ and
-    //   there is nothing for this row to block. It is here because it goes LIVE the moment §C24b
-    //   admits `l j`, and a `Schul|jahr` unguarded for one round is exactly the shape this table
-    //   exists to prevent. `s110_de_literal_j_gate` group (5) is what keeps the claim honest: it
-    //   asserts which consonants the table covers, so this row cannot rot into a silent no-op.
+    // ⚠ STILL INERT AFTER S111, and for a DIFFERENT REASON than before — this correction is the
+    //   point of the note. S110 added the row while `l j` was not a keep-list member (the maximal
+    //   onset already cut at the /j/, so it blocked nothing) and predicted it would "go live the
+    //   moment §C24b admits `l j`". §C24b landed and it did NOT: `de_lj_license_blocks` defaults
+    //   every /l j/ to the coda, so all 57 literal-⟨lj⟩ keys (`aufholjagd`, `fiskaljahr`,
+    //   `balljunge`, `alljährlich`, `ilja`, `jubeljahre`, …) are already blocked by the license
+    //   guard. Measured: deleting this row changes `glide_block` on **0 keys**, and the number of
+    //   keys carrying BOTH a literal ⟨lj⟩ and an ⟨li⟩+V license — the only place it could ever
+    //   bind — is **0** too.
+    //   ⇒ It stays anyway, for two stated reasons and no others: (a) it is the fallback if the
+    //   license guard's default is ever flipped to "release", which is the one edit that would
+    //   silently unguard `Schul|jahr`; (b) group (5) of `s110_de_literal_j_gate` asserts that every
+    //   consonant appearing before an intervocalic /j/ is either in this table or has a written
+    //   reason not to be, and /l/ fits neither existing reason (it IS a legal onset with /j/ now,
+    //   and it is not a lenis obstruent). Removing it would need a third reason category.
     ("l", "lj"),
 ];
 
@@ -1217,6 +1303,46 @@ const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
 /// silent or has no page for `premjer`, `artjom`, `fedja`, `katjuscha`, `semjon`, `winnyzja`, … They
 /// join this list one at a time, each with its transcription, or not at all.
 const DE_CJ_ONSET_KEYS: &[&str] = &["orjol", "reykjavik"];
+
+/// S111 §C24b — key spellings that carry the ⟨lli⟩+V license but want the CODA anyway.
+///
+/// One entry, and it is the counterexample S110's queue note predicted by name: **`Wil·liam`**
+/// [ˈvɪl.jam] is ⟨illi⟩+⟨a⟩, exactly like `Mil·li·on` [mɪˈli̯oːn], and wants the opposite cut.
+/// There is no orthographic rule separating them — ⟨illi⟩+V is not an English-only shape — so the
+/// only honest instrument is the transcription, one key at a time.
+/// ⚠ A SPELLING FRAGMENT, not a key list, and the difference is deliberate: it covers `william`,
+/// `williams`, `williamsburg`, `williamson`, `williamstown` and `fitzwilliam` — six keys today, all
+/// one name, and a regeneration that adds `williamsport` gets the same treatment instead of
+/// silently flipping. `s110_de_literal_j_gate` pins which keys it currently reaches, so the set
+/// growing is visible rather than automatic.
+/// ⚠ Only `william` itself has a transcription; the other five ride on being the same name. That is
+/// a family inference and it is stated, not hidden — but it moves them in the direction of NOT
+/// changing, so a wrong inference here costs nothing that today does not already cost.
+const DE_LJ_CODA_SPELLINGS: &[&str] = &["willia"];
+
+/// The ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩ occurrences in a key — see `de_lj_license_blocks` for why the leading vowel
+/// letter is required. Non-overlapping, because the phone sites it is counted against cannot
+/// overlap either.
+fn de_lj_license_count(key: &str) -> usize {
+    const V: &str = "aeiouyäöüáàâéèêíìîóòôúùû";
+    let ch: Vec<char> = key.chars().collect();
+    let (mut n, mut i) = (0usize, 0usize);
+    while i + 3 < ch.len() {
+        if V.contains(ch[i]) && ch[i + 1] == 'l' {
+            let mut j = i + 2;
+            if ch[j] == 'l' {
+                j += 1;
+            }
+            if j + 1 < ch.len() && ch[j] == 'i' && V.contains(ch[j + 1]) {
+                n += 1;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    n
+}
 
 /// French. `ʎ` is /l/ before /i/ and `c`/`ɟ` are /k/ /ɡ/ before front vowels — both are allophone
 /// spellings of members already in the list, and both cost real words if only half the pair is kept.
@@ -4330,9 +4456,12 @@ mod tests {
         };
         // (name, dict, tsv, keep list, clusters the dictionary OBSERVES, entries the list KEEPS)
         let dicts = [
-            // S110 §C24: 46 -> 47 (`n j` only — `l j` was measured NET NEGATIVE and stays out;
-            // the evidence sits next to the entries and in `DE_LITERAL_J_SPELLING`).
-            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, DE_ONSET_KEEP, 145usize, 47usize),
+            // S110 §C24: 46 -> 47 (`n j`). S111 §C24b: 47 -> 48 (`l j`).
+            // ⚠ `l j` is admitted UNDER A LICENSE, not bare — bare is a measured net regression
+            // (130 helped : 145 harmed). This list only says the cluster is a legal German onset;
+            // `de_lj_license_blocks` is what decides where it is allowed to act, and the two must be
+            // read together. Adding it here alone would re-ship exactly what S110 pulled back.
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, DE_ONSET_KEEP, 145usize, 48usize),
             ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, FR_ONSET_KEEP, 295, 113),
             ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, ES_ONSET_KEEP, 192, 87),
             ("it", WordDict::from_tsv(Lang::It, &it_tsv), &it_tsv, IT_ONSET_KEEP, 160, 41),
@@ -6128,12 +6257,14 @@ mod tests {
 
         // ── (3) AUTHORITATIVE — unattested keep entries are live ────────────────────────────────
         for (name, unattested, examples) in [
-            // S110 §C24 added `n j` and `l j`, and both belong in this group for the same reason as
-            // the other four: German never STARTS a word with them, and that has never been the
-            // question — inside a word ⟨-linie⟩/⟨-nion⟩ hands the consonant to the glide. What made
-            // them look different from the rest of the glide clause was the literal-⟨j⟩ population,
-            // which `DE_LITERAL_J_SPELLING` now separates out instead of trading against.
-            ("de", 5usize, &["t s j", "z j", "ɡ j", "b j", "n j"][..]),
+            // S110 §C24 added `n j`; S111 §C24b added `l j` (5 → 6). Both belong in this group for
+            // the same reason as the other four: German never STARTS a word with them, and that has
+            // never been the question — inside a word ⟨-linie⟩/⟨-nion⟩/⟨lli⟩+V hands the consonant
+            // to the glide. What made them look different from the rest of the glide clause was the
+            // literal-⟨j⟩ population, which `DE_LITERAL_J_SPELLING` now separates out instead of
+            // trading against — and for `l j` the Romance ⟨ill⟩ population too, which
+            // `de_lj_license_blocks` keeps out by defaulting to the coda.
+            ("de", 6usize, &["t s j", "z j", "ɡ j", "b j", "n j", "l j"][..]),
             ("fr", 12, &["z ɥ", "ɲ j", "c l", "ɟ ʎ", "v ʁ w"][..]),
             ("es", 24, &["β ɾ", "ð ɾ", "ɾ j", "k l w", "β l w"][..]),
             ("it", 1, &["z d͡ʒ"][..]),
@@ -6283,7 +6414,10 @@ mod tests {
             //   number would silently become the blast radius of two rounds added together
             //   (measured: de 1395 -> 1988). A per-round number that quietly starts summing rounds
             //   is worse than no number, because it still looks pinned. They go in both arms.
-            const LATER_ROUNDS: &[(&str, &[&str])] = &[("de", &["n j"])];
+            // ★ S111 confirmed the warning was load-bearing rather than decorative: admitting `l j`
+            //   in §C24b took this straight to **1510** (= 1391 + §C24b's 119) until it was listed
+            //   here too. The comment above said `l j` would need this a round before it did.
+            const LATER_ROUNDS: &[(&str, &[&str])] = &[("de", &["n j", "l j"])];
             let later: Vec<String> = LATER_ROUNDS
                 .iter()
                 .filter(|(n, _)| n == name)
@@ -6438,7 +6572,8 @@ mod tests {
         }
         for (name, n, digest) in [
             // S110 §C24 re-took this digest: `n j` joined the glide clause. 46 -> 47.
-            ("de", 47usize, 0x1d8f_2b49_35d0_3489u64),
+            // S111 §C24b: `l j` joined it too. 47 -> 48, digest re-taken.
+            ("de", 48usize, 0x9a4e_93bd_e8c9_3de3u64),
             ("fr", 113, 0x3300_c9d2_a090_c4d8),
             ("es", 87, 0xa373_ded6_ca9d_223e),
             ("it", 41, 0x60d2_fcbd_57a2_c919),
@@ -6553,6 +6688,27 @@ mod tests {
              assertion above passes for the wrong reason (S92p: a pinning test whose two arms give \
              the same answer is testing nothing)"
         );
+        // ★ S111 — the SAME question for `de_lj_license_blocks`, and the answer has the opposite
+        // shape, which is why it needs its own arms rather than riding on the ones above. There,
+        // "not one of the dictionary's readings" means DO NOT BLOCK. Here it means BLOCK ALL — the
+        // license cannot be read off letters that do not describe these phones, and blocking is the
+        // pre-S111 behaviour, so an override is a strict no-op instead of a guess.
+        {
+            let typed: Vec<String> = "m ɪ l j oː n ə".split(' ').map(str::to_string).collect();
+            assert_ne!(typed, phones("million"), "fixture is vacuous: these ARE the shipped phones");
+            assert_eq!(
+                d.de_lj_license_blocks("million", &typed),
+                vec![3usize],
+                "a hand-typed German lyric took the ⟨lli⟩ license from letters that do not describe \
+                 its phones. On the override path the licence is unreadable, so every /l j/ must \
+                 stay in the coda — which is exactly what this word did before S111."
+            );
+            assert!(
+                d.de_lj_license_blocks("million", &phones("million")).is_empty(),
+                "control: with the dictionary's own phones `million` MUST be released, or the \
+                 assertion above passes for the wrong reason"
+            );
+        }
 
         // ── (3) CUTS, CONTROLS AND NAMED COSTS ──────────────────────────────────────────────────
         for (w, want, why) in [
@@ -6560,16 +6716,27 @@ mod tests {
             ("richtlinie", "ʁ ɪ ç t | l iː | n j ə", "⟨-linie⟩; this pin was S108's REJECTION of `l j`"),
             ("anion", "a | n j oː n", "⟨-nion⟩"),
             ("ammoniak", "a | m ɔ | n j a k", "Am-mo-ni-ak"),
-            // ⛔ THE NEGATIVE RESULT, pinned so it cannot be un-decided by accident. `l j` is NOT in
-            //    the keep list (130 helped : 145 harmed — see the ⛔ note in DE_ONSET_KEEP), so the
-            //    ⟨lli⟩+V family keeps its wrong cut and the Romance ⟨ill⟩ family keeps its RIGHT one.
-            //    Both are pinned: fixing one at the cost of the other is the trade this round refused.
-            ("million", "m ɪ l | j oː n", "⛔ still wrong — the ⟨lli⟩+V side §C24b would buy"),
-            ("billion", "b ɪ l | j oː n", "⛔ same family"),
-            ("aemilius", "ɛ | m iː l | j ʊ s", "⛔ the ⟨-ius⟩ family, same side"),
-            ("medaille", "m ɛ | d a l | j ə", "✅ Me-dail-le — the Romance ⟨ill⟩ side, RIGHT today"),
-            ("brillant", "b ʁ ɪ l | j a n t", "✅ bril-lant [bʁɪlˈjant] — stress lands INSIDE the cluster"),
-            ("pavillon", "pʰ a | v ɪ l | j oː n", "✅ Pa-vil-lon"),
+            // ★★ THE TWO-SIDED PIN S110 BUILT AND S111 COLLECTED ON. S110 pinned the ⟨lli⟩ side at
+            //    its WRONG cut with a ⛔ and the Romance ⟨ill⟩ side at its RIGHT one with a ✅, so
+            //    that "fixing one by breaking the other" could not happen quietly. §C24b fixed the
+            //    first WITHOUT moving the second — which is the only outcome that was ever allowed —
+            //    and both halves stay pinned, now both ✅.
+            ("million", "m ɪ | l j oː n", "✅ S111 — [mɪˈli̯oːn], the ⟨lli⟩+V side, now RIGHT"),
+            ("billion", "b ɪ | l j oː n", "✅ same family"),
+            ("aemilius", "ɛ | m iː | l j ʊ s", "✅ the ⟨-ius⟩ family, same side"),
+            ("medaille", "m ɛ | d a l | j ə", "✅ Me-dail-le — Romance ⟨ill⟩, UNMOVED and still right"),
+            ("brillant", "b ʁ ɪ l | j a n t", "✅ bril-lant [bʁɪlˈjant] — stress INSIDE the cluster"),
+            ("pavillon", "pʰ a | v ɪ l | j oː n", "✅ Pa-vil-lon [ˈpa.vɪlˌjɔŋ] — UNMOVED"),
+            // ⚠ CONTROL, and it corrects an assumption: `bataillon` looks like the ⟨ill⟩ family but
+            //    de.tsv writes ⟨ai⟩+⟨ll⟩ as `aj l` — **no /j/ after the /l/ at all**, so it has no
+            //    site and §C24b cannot reach it either way. The Romance ⟨ill⟩ words are not uniform
+            //    in this dictionary, and a pin written from the WIKTIONARY form (`batalˈjoːn`)
+            //    instead of the shipped row is how one would find that out the hard way.
+            ("bataillon", "b aː | tʰ aj | l ɔ ŋ", "CONTROL: no /l j/ site in the shipped row"),
+            ("william", "v ɪ l | j a m", "⛔ DE_LJ_CODA_SPELLINGS — ⟨illi⟩+V but [ˈvɪl.jam] wants coda"),
+            ("tastaturlayout", "tʰ a s | t a | tʰ uː | ɐ l | j uː t", "Tastatur|Layout — no license, UNMOVED"),
+            ("aufholjagd", "aw f | h oː l | j aː k t", "literal ⟨lj⟩ — the ('l','lj') row, live since S111"),
+            ("liouville", "l iː | ʊ | v ə l | j ə", "the leading-vowel clause: word-INITIAL ⟨lio⟩ licenses nothing"),
             // literal ⟨j⟩, German compounds — the 116 the guard fixes
             ("ausbildungsjahr", "aw s | b ɪ l | d ʊ ŋ s | j aː | ɐ", "Fugen-s: S105 named this cost, this pays it"),
             ("achtjähriger", "a x t | j eː | ʁ ɪ | ɡ ɐ", "acht|jährig"),
@@ -6737,6 +6904,14 @@ mod tests {
         // nothing to block.
         let mut pre = WordDict::from_tsv(Lang::De, &de_tsv);
         pre.onsets.remove("n j");
+        // ★ S111 — `l j` comes out of the PRE arm too, so this stays "everything the spelling guard
+        //   does", cumulatively, rather than becoming "…plus whatever the newest cluster does with
+        //   no guard at all". Leaving it in measured 670: the pre arm would have had `l j` as a bare
+        //   onset for all 344 sites, a state that never shipped in any version. The number is
+        //   CUMULATIVE over §C24 + §C24b and says so; that is different from the s108 gate's
+        //   `LATER_ROUNDS`, which keeps a per-round number per-round by putting the newcomer in BOTH
+        //   arms. Two gates, two jobs — do not "harmonise" them.
+        pre.onsets.remove("l j");
         let (mut moved, mut bad_count, mut bad_seq) = (0usize, 0usize, 0usize);
         for (key, ph) in &d.map {
             let toks: Vec<String> = ph.split_whitespace().map(str::to_string).collect();
@@ -6761,16 +6936,17 @@ mod tests {
                                   consonants between syllables and must never add or remove one");
         assert_eq!(bad_seq, 0, "{bad_seq} German words changed their PHONE SEQUENCE");
         assert_eq!(
-            moved, 473,
-            "§C24 now re-cuts {moved} German word types, not 473. ★ S111 moved this from 431 and the \
-             delta is reconciled word by word (`TESTING\\s111_c24bc_ruler\\blastdelta.py`): \
-             431 − 21 + 63. The 21 that LEFT are the ones the lenis rows used to drag into a coda \
-             (18 ⟨dj⟩→/d j/ ad-prefix and Slavic keys, plus `murawjow`, `orjol`, `reykjavik`); they \
-             now match pre-§C24 again, which is the repair. The 63 that JOINED are the devoiced \
-             spellings (54 ⟨bj⟩→/p j/, 9 ⟨dj⟩→/t j/; the tenth ⟨dj⟩ key was already in the set for \
-             its ⟨sj⟩). A dictionary regeneration can legitimately move this — recompute with that \
-             script and reconcile before touching the number; two implementations disagreeing is \
-             information, not an inconvenience (S108)."
+            moved, 592,
+            "§C24 + §C24b now re-cut {moved} German word types, not 592. This number is CUMULATIVE \
+             over the whole spelling-guard line and its history is reconciled word by word, never \
+             re-baselined: 431 (S110) − 21 + 63 = 473 (S111 §C24c/d) + 119 (S111 §C24b) = 592. \
+             The 21 that left are the ones the lenis rows dragged into a coda (18 ⟨dj⟩→/d j/, plus \
+             `murawjow`, `orjol`, `reykjavik`); the 63 that joined are the devoiced spellings \
+             (54 ⟨bj⟩, 9 ⟨dj⟩); the 119 are the licensed ⟨lli⟩+V family. Per-consonant today: \
+             /n/ 313 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /ʁ/ 12 · /f/ 10 · /m/ 6 · /ts/ 5 · /k/ 2. \
+             Independently recomputed by `TESTING\\s111_c24bc_ruler\\blast_c24b.py`; a dictionary \
+             regeneration can legitimately move this — re-run that script and reconcile before \
+             touching the number. Two implementations disagreeing is information (S108)."
         );
 
         // ── (7) ★★ S111 — THE PREMISE ITSELF ────────────────────────────────────────────────────

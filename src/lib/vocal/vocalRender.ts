@@ -750,8 +750,32 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  and the phone sequence are identical on every de.tsv key, so — exactly as in s105/s108 — only
  *  which note a consonant lands on changes, which is precisely what a stored bake gets wrong.
  *  Evidence, the one word where the test must abstain (`produktionsjahr`) and every named cost live
- *  above `DE_LITERAL_J_SPELLING`. */
-export const G2P_ALGO_VERSION = "s110";
+ *  above `DE_LITERAL_J_SPELLING`.
+ *  s111 = the same German glide clause, corrected and completed, in three cuts. All of it rests on an
+ *  EXTERNAL instrument built this round (de.wiktionary + en.wiktionary IPA — stress position, syllable
+ *  dots, the ⟨i̯⟩-vs-⟨j⟩ notation) that was validated against a pre-registered control group of
+ *  indisputable cases BEFORE being used: 20 agree, **0 contradict**, 4 silent, two sources never
+ *  disagreeing. German has structurally zero ear adjudication, so this is the first real truth surface
+ *  the line has had.
+ *  (a) The spelling table was paired on the WRONG SIDE OF THE DEVOICING. German final devoicing means a
+ *  lenis obstruent /b d ɡ v z/ cannot end a syllable — de.tsv encodes that exceptionlessly, 0 of its
+ *  143252 keys end in one — so ⟨bj⟩ shipped as /p j/ (`objekt`) is the upstream SAYING "coda", while
+ *  ⟨bi⟩+V shipped as /b j/ (`bibliothek`) says "onset". s110 paired lenis letters with lenis phones,
+ *  which asserted the impossible; four of those six rows were inert and ("d","dj") was actively wrong.
+ *  Removed the six, added ("p","bj") and ("t","dj"): 64 word types onset→coda (17 confirmed : 0
+ *  refuted) and 19 coda→onset (3 : 0), repairing three of the five harms an audit of s110's own 431
+ *  found (37 right : 5 wrong). ⛔ ⟨wj⟩ is deliberately NOT paired with /f/ — `sowjet`'s row is corrupt
+ *  on a second segment and no transcription anywhere describes it, so the ruler is SILENT, which is a
+ *  coverage fact and not a verdict.
+ *  (b) `l j` is ADMITTED, under a spelling license. Bare admission was s110's measured regression
+ *  (130 helped : 145 harmed); `de_lj_license_blocks` defaults every /l j/ to the coda and releases one
+ *  only when the key spells ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩, so the Romance ⟨ill⟩ side (Me-dail-le, Pa-vil-lon,
+ *  bril-lant) never moves at all. 119 word types, **59 confirmed : 0 refuted**; the one named
+ *  counterexample, `Wil·liam` [ˈvɪl.jam], is a curated spelling exception.
+ *  592 German word types now differ from pre-s110 (313 `n j` · 119 `l j` · 160 the guard), and as in
+ *  s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv key — only
+ *  which note a consonant lands on changes, which is exactly what a stored bake gets wrong. */
+export const G2P_ALGO_VERSION = "s111";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

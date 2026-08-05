@@ -610,7 +610,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // WIRING: the two tokens are actually IN the signature, with their current values. Robust against
   // unrelated additions to vocalParamsSig — it is not this test's job to notice those.
   it("carries the g2p + timing tokens", () => {
-    expect(vocalTrackSig(track, 120)).toContain("|g2p:s110|st:s97c");
+    expect(vocalTrackSig(track, 120)).toContain("|g2p:s111|st:s97c");
     // S110: the German glide clause reads the spelling — an ⟨i⟩-derived /j/ takes the consonant with
     // it (`anion` = `a | n j oː n`) while a literal ⟨j⟩ leaves it behind (`ausbildungsjahr` =
     // `… d ʊ ŋ s | j aː | ɐ`, `anja` = `a n | j a`). 431 German word types cut differently. Same
@@ -619,7 +619,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
     // (s108 = the onset inventory stopping at word-initial attestation, 46031 word types;
     //  s107 = the French mute ⟨e⟩, which also carried S106's compound-seam round — that one had
     //  shipped without bumping. See the version log next to the constant.)
-    expect(G2P_ALGO_VERSION).toBe("s110");
+    expect(G2P_ALGO_VERSION).toBe("s111");
     expect(SCORE_TIMING_VERSION).toBe("s97c"); // S97b: + phrase-final sonorant coda restore (render side, upstream level target)
   });
 
@@ -629,7 +629,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s110|st:s97c|dict:d0",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s111|st:s97c|dict:d0",
     );
   });
 
