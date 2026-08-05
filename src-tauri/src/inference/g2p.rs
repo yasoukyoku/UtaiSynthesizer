@@ -2827,6 +2827,14 @@ mod tests {
     /// the `g2p_probe` diagnostic could not reach the alias path AT ALL — the one code path whose
     /// tokenizer we most need to observe on real symbols (S91's "unknown multi-letter symbol splits
     /// silently" debt). A probe that structurally cannot exercise an arm cannot report on it.
+    /// ⚠ S109 — the `note_num: 60, frames: 20` here look load-bearing and are NOT. An old review
+    /// (AUDIT.critic G1) filed them as "the probe hardcodes 60/20, so no finding was ever evaluated
+    /// on a realistic 3-8 frame note". At THIS layer that is a non-issue and stays one by contract:
+    /// `g2p.rs` reads neither field anywhere (grep — the only writer is the `From<(&str,i64,i64)>`
+    /// impl above), and `fragment_merge_ignores_frames_and_pitch` below pins that resolve/classify
+    /// reach identical verdicts under real vs dummy frames. Setting `frames: 3` would change nothing.
+    /// The complaint's REAL content — "the probe stops short of the render" — is answered by the
+    /// label on the print block in `g2p_probe`, not by these numbers. Don't re-file it.
     fn evt_set(lyric: &str, lang: Lang, phoneme_set: PhonemeSet) -> ScoreEvt<'_> {
         ScoreEvt { lyric, note_num: 60, frames: 20, lang, phoneme_input: None, phoneme_set }
     }
@@ -5176,8 +5184,19 @@ mod tests {
                     Err(e) => println!("    !! dictionary error: {e}"),
                 }
             }
-            // RENDER path (authoritative — the editor's classify collapses `+` notes to "Sustain",
-            // which would hide the phones those notes actually sing).
+            // PHONE-RESOLUTION path — `resolve_score`, i.e. what the render is HANDED, not what it
+            // sings. Printed instead of the editor's `classify_score` because that one collapses `+`
+            // notes to "Sustain" and would hide the phones those notes actually carry.
+            //
+            // ⚠ S109 — this block used to be labelled "RENDER path (authoritative)", and that was an
+            // over-claim with teeth: the frame allocator downstream DROPS phones a short note cannot
+            // fund, so the probe reports phones the user will never hear. Nailed in this repo:
+            // `fined` on a 50-frame note renders `[SP f aɪ n d]`, on a 3-frame note `[SP f aɪ]`
+            // (score2cv.rs, `en_double_coda_bounded_and_dropped_when_starved`) — while this block
+            // prints `f aɪ n d` for both, because `resolve_score` never sees a frame count.
+            // ⇒ For "which phones survive at this note length", the instrument is
+            // `score2cv_audit.rs` (S92k `7cbbcd7`), which drives the production `build_arrays_daw`.
+            // Do not read the line below as a render verdict; it answers a different question.
             match resolve_score(&score, &g) {
                 Ok(notes) => {
                     for (i, nt) in notes.iter().enumerate() {
