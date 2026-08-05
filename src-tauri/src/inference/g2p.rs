@@ -1344,6 +1344,15 @@ const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
 ///     whole `ʁ j` starts the stressed syllable. The ("ʁ","rj") row is right in general
 ///     (`verjüngen` = `fɛʁˈjʏŋən`, stress between the two ⇒ coda) — this is the exception.
 ///   · `reykjavik` — `ˈʁɛɪ̯.kja.vɪk`, the syllable dot before the /k/.
+///     ⚠ WEAKER EVIDENCE THAN `orjol`'s, stated rather than glossed over: this rests on the syllable
+///     dot alone, and the pre-registered control group never exercised that signal (0 agree /
+///     0 contradict / 24 silent — de.wiktionary does not write dots, and en.wiktionary's dotted
+///     variants were never the first transcription for a control word). It was validated separately
+///     instead: of the 22 dotted German transcriptions in the S111 cache, 20 follow "lenis ⇒ dot
+///     before, fortis ⇒ dot after" exactly. `reykjavik` is one of the two that do not — a FORTIS /k/
+///     with the dot before it — which is the whole reason it is an exception key rather than noise
+///     (Icelandic Reykja-vík has ⟨kj⟩ as a genuine onset). If a second source ever contradicts it,
+///     this key goes, and nothing else in the list depends on it.
 /// ⚠ WHY A KEY LIST AND NOT A RULE: the transliterated ⟨Cj⟩ names do not agree with each other.
 /// `tatjana` is `tatˈjaːna` (coda) and `banjo` is `ˈban.jo` (coda) while these two are onsets, so
 /// there is no family-level predicate to write — S110 reached the same conclusion from the other
