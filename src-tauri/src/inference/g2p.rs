@@ -5556,6 +5556,46 @@ mod tests {
                  `single_onset_forbidden` and say so in writing, then update this string."
             );
         }
+        // …and the CLUSTERS the dictionary uses BETWEEN VOWELS — the face the whole criterion is
+        // about, and until S108 the one with no tripwire at all.
+        //
+        // ⚠ `s105_west_onset_gate` counts WORD-INITIAL clusters, so a regeneration that introduces a
+        //   cluster which only ever appears INSIDE words is structurally invisible there: it is made
+        //   of phones that already exist (consonant inventory unchanged), it never votes (word-initial
+        //   count unchanged), it is not in any keep list (digest unchanged), and both arms of the
+        //   blast-radius comparison gate it identically (count unchanged). It simply defaults to
+        //   "the whole cluster closes the previous syllable" with nobody judging it. A probe
+        //   appending one row `zzzprobe → a β m a` passed every other assertion in this file.
+        // ★ That face is not marginal — it is where this round's work actually lived: `ɾ j` (1852
+        //   word types), `β ɾ`, `β l`, `ɣ ɾ` are all clusters Spanish only ever writes inside words,
+        //   which is exactly why the criterion above `DE_ONSET_KEEP` asks about intervocalic
+        //   position rather than about what can begin a word.
+        // ⚠ WHEN THIS FIRES it is a BATCH OF VERDICTS TO MAKE, not a number to refresh: diff the
+        //   dictionaries (`verify_dictionaries.py --against`) and list the newcomers with
+        //   `TESTING\s108_c21_onset_authority\c21_census.py`, then judge each against the criterion.
+        for (name, want) in
+            [("de", 2742usize), ("fr", 1311), ("es", 741), ("it", 770), ("en", 1401)]
+        {
+            let d = pick(name);
+            let mut inner: HashSet<String> = HashSet::new();
+            for phones in d.map.values() {
+                let toks: Vec<&str> = phones.split_whitespace().collect();
+                let nuclei: Vec<usize> =
+                    (0..toks.len()).filter(|&i| d.is_vowel(toks[i])).collect();
+                for w in nuclei.windows(2) {
+                    if w[1] - w[0] >= 3 {
+                        inner.insert(d.onset_key(toks[w[0] + 1..w[1]].join(" ")));
+                    }
+                }
+            }
+            assert_eq!(
+                inner.len(), want,
+                "{name}: the dictionary now uses {} distinct intervocalic consonant clusters, not \
+                 {want}. Each newcomer silently defaults to CODA — judge it against the criterion \
+                 above DE_ONSET_KEEP before moving this number.",
+                inner.len()
+            );
+        }
 
         // ── (3) AUTHORITATIVE — unattested keep entries are live ────────────────────────────────
         for (name, unattested, examples) in [
