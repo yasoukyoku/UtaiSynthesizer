@@ -3088,4 +3088,98 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// S109 (queue §H7, first baseline) — the IDENTITY of the dictionaries this build ships.
+    ///
+    /// Nothing in this repo pinned their bytes before: they are gitignored generated assets, so git
+    /// does not carry them; `release.ps1` checked only `Test-Path`; and the ~15 dictionary gates in
+    /// `g2p.rs` pin PROPERTIES (a knife survived, a cluster count held), not identity. An installer
+    /// could therefore carry a dictionary generation nobody chose with every gate green — the S98
+    /// shape exactly, where the wrong upstream file had the same line count, word set and size while
+    /// 3051 German primary pronunciations differed.
+    ///
+    /// Two halves, and they fail for different reasons ON PURPOSE:
+    ///   (1) MANIFEST vs bundle.resources — pure data, no files needed, so this half can NEVER skip.
+    ///       It is also the missing direction of `bundled_dictionary_targets_are_actually_found`,
+    ///       which only checks that the eight known names are PRESENT (`>= 8`): a ninth dictionary
+    ///       added to the bundle without a manifest entry goes red here.
+    ///   (2) MANIFEST vs the bytes on disk — skips when the assets are absent, same contract as the
+    ///       `g2p.rs` gates, so a bare checkout stays green. The skip is printed as a single
+    ///       grep-able `SKIPPED-ASSET` line (queue §G12 wants these countable rather than silent;
+    ///       making the release script assert zero of them is §G12's own item, not this one).
+    ///
+    /// FAIL-CLOSED BY DESIGN: regenerating a dictionary turns this red. That is the same rule S105
+    /// chose for the curated onset tables — a dictionary change is a decision that has to be
+    /// announced, not something that slips through. Fix: rerun `verify_dictionaries.py` (MBS2H
+    /// `_onnx_derisk/`, proves the files are what the generator produces from the upstream sources),
+    /// then `py -3.10 scripts/dict_manifest.py --write`, and name the change in the commit.
+    ///
+    /// ★ MUTATION-PROBED, one per half, and they land on different assertions:
+    ///   · M3 — flip one hex character of de.tsv's digest ⇒ red on half (2), naming the file and
+    ///     both digests. ⚠ The FIRST version of this probe used a PowerShell `-replace '^4c0d545e'`,
+    ///     where `^` anchors to the start of the whole STRING, not the line — the manifest was never
+    ///     modified and the all-green result said nothing. Re-run with an asserted-applied mutation.
+    ///   · M4 — drop one entry from the manifest ⇒ red on half (1), printing both sets.
+    ///   Logs: TESTING\s109_c16_dict_distribution\mut_M3_digest_flipped.log / mut_M4_*.log.
+    #[test]
+    fn shipped_dictionaries_match_the_committed_manifest() {
+        static MANIFEST: &str = include_str!("../../dictionaries.sha256");
+        let want: std::collections::BTreeMap<&str, &str> = MANIFEST
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (digest, name) = l.split_once("  ").unwrap_or_else(|| {
+                    panic!("malformed manifest line (expected '<sha256>  <name>'): {l:?}")
+                });
+                (name.trim(), digest.trim())
+            })
+            .collect();
+
+        // (1) the manifest and the bundle must describe the SAME set of files.
+        let bundled: std::collections::BTreeSet<String> = super::bundled_dictionary_targets()
+            .iter()
+            .filter_map(|t| std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        let listed: std::collections::BTreeSet<String> = want.keys().map(|k| k.to_string()).collect();
+        assert_eq!(
+            listed, bundled,
+            "src-tauri/dictionaries.sha256 and tauri.conf.json bundle.resources disagree about which \
+             dictionaries ship — run `py -3.10 scripts/dict_manifest.py --write`"
+        );
+
+        // (2) … and the bytes on disk must be the ones the manifest names.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries");
+        let mut absent: Vec<&str> = Vec::new();
+        let mut wrong: Vec<String> = Vec::new();
+        for (name, digest) in &want {
+            let p = dir.join(name);
+            if !p.is_file() {
+                absent.push(name);
+                continue;
+            }
+            match crate::download::sha256_file(&p) {
+                Ok(live) if live.eq_ignore_ascii_case(digest) => {}
+                Ok(live) => wrong.push(format!("{name}: on disk {}…, manifest {}…", &live[..16], &digest[..16])),
+                Err(e) => wrong.push(format!("{name}: cannot hash ({e})")),
+            }
+        }
+        if !absent.is_empty() {
+            eprintln!(
+                "SKIPPED-ASSET: data/dictionaries — {} of {} shipped dictionaries absent ({}); \
+                 gitignored generated assets, run MBS2H build_dictionaries.py",
+                absent.len(),
+                want.len(),
+                absent.join(", ")
+            );
+            // Partial presence still gets checked: `wrong` below covers whatever WAS readable.
+        }
+        assert!(
+            wrong.is_empty(),
+            "shipped dictionaries do not match src-tauri/dictionaries.sha256:\n  {}\n\
+             If this was an intentional regeneration: rerun verify_dictionaries.py, then \
+             `py -3.10 scripts/dict_manifest.py --write`, and say so in the commit.",
+            wrong.join("\n  ")
+        );
+    }
 }

@@ -47,6 +47,13 @@ foreach ($p in @(
 )) { if (-not (Test-Path $p)) { Fail "bundle input missing: $p" } }
 $dicts = @("zh_syllables","zh_chars","zh_phrases","en","de","fr","es","it")
 foreach ($d in $dicts) { if (-not (Test-Path "data\dictionaries\$d.tsv")) { Fail "dictionary missing: $d.tsv" } }
+# S109 (§H7 first baseline): EXISTENCE was the only check here, so a stale or swapped TSV shipped
+# silently — and `installer.nsi` takes these files straight from data\dictionaries, not from the
+# target staging copy, so this is the last place to catch it. The manifest is derived from
+# tauri.conf.json's own resource map, so it cannot drift into a 5th hand-kept copy of the file list.
+# `cargo test` below covers the same ground from inside the suite; this runs FIRST and needs no build.
+py -3.10 scripts\dict_manifest.py
+if ($LASTEXITCODE -ne 0) { Fail "dictionary identity: data\dictionaries does not match src-tauri\dictionaries.sha256 (intentional regeneration? rerun verify_dictionaries.py, then scripts\dict_manifest.py --write)" }
 $enc = & bin\ffmpeg.exe -hide_banner -encoders 2>$null | Out-String
 foreach ($e in @("libmp3lame", "libvorbis", "libopus", " aac", " flac")) {
   if ($enc -notmatch [regex]::Escape($e)) { Fail "bundled ffmpeg lacks encoder:$e" }
