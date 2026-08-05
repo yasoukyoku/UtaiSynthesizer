@@ -78,6 +78,7 @@ async function validatePass(): Promise<void> {
         if (seg.content.notes.length === 0) {
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, null);
+          app.setVocalUnknownPhone(seg.id, null);
           app.setVocalDropped(seg.id, null);
           app.setVocalShort(seg.id, null);
           continue;
@@ -99,7 +100,7 @@ async function validatePass(): Promise<void> {
         app.setVocalDropped(seg.id, droppedNoteIds.length ? droppedNoteIds : null);
         app.setVocalShort(seg.id, amber.length ? amber : null);
         try {
-          const classes = await invoke<Array<{ kind: string }>>("validate_lyrics", {
+          const classes = await invoke<Array<{ kind: string; phone?: string }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
             defaultLang: vp.langId,
             phonemeSet: vp.phonemeSet ?? null,
@@ -109,13 +110,23 @@ async function validatePass(): Promise<void> {
           const trNow = now.tracks.find((x) => x.id === tr.id);
           const segNow = trNow?.segments.find((x) => x.id === seg.id);
           if (!trNow || !segNow || oovSig(trNow, segNow, now.tempo) !== sig) continue;
+          // S109 (§C15): `unknown` now carries WHY. `phone` is present only when the failure was a
+          // mistyped PHONEME (bracket hint / phoneme_input override); an ordinary OOV lyric has no
+          // such field, so the wire shape for that case is byte-identical to before. `oov` keeps
+          // ALL of them — the red marking, the segment badge and the blocking counts must go on
+          // reading exactly one map — and `badPhone` is the SUBSET that lets the track header stop
+          // telling the user to "check the lyric" about a lyric that is fine.
           const oov: string[] = [];
+          const badPhone: string[] = [];
           classes.forEach((c, i) => {
             const id = tripleNoteIds[i];
-            if (id && c.kind === "unknown") oov.push(id);
+            if (!id || c.kind !== "unknown") return;
+            oov.push(id);
+            if (c.phone) badPhone.push(id);
           });
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, oov.length ? oov : null);
+          app.setVocalUnknownPhone(seg.id, badPhone.length ? badPhone : null);
         } catch (e) {
           console.warn("[oovWatch] validate_lyrics failed:", e);
           validated.set(seg.id, stamp); // don't hot-loop on a persistent backend error
@@ -127,6 +138,7 @@ async function validatePass(): Promise<void> {
       if (!live.has(id)) {
         validated.delete(id);
         app.setVocalOov(id, null);
+        app.setVocalUnknownPhone(id, null);
         app.setVocalDropped(id, null);
         app.setVocalShort(id, null);
       }

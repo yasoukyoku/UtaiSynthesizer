@@ -136,6 +136,21 @@ interface AppState {
    *  §9.5 single Rust classifier, so this ALWAYS equals what the render would reject). Drives the red
    *  note marking (VocalEditor), the segment badge (Arrangement) and the track header warning (TrackList). */
   vocalOov: Record<string, string[]>;
+  /** S109 (§C15): the SUBSET of `vocalOov` whose failure was a mistyped PHONEME (a bracket hint or a
+   *  `phoneme_input` override carrying a symbol outside the 210-token inventory) rather than an
+   *  unrecognized LYRIC. Same red mark, different sentence — the third instance of the split S85b
+   *  made for `vocalDropped` and S87 for `vocalShort`, and for the identical reason recorded there:
+   *  **a merged channel forces the wording to lie about at least one of its members.** Here it was
+   *  lying about the phoneme case, telling the user to "check the lyric or the note/track language"
+   *  about a lyric that is fine (the S90 debt; S99 fixed the render's wording, this fixes the
+   *  editor's).
+   *
+   *  ⚠ UNLIKE its two siblings this map is a SUBSET, not a disjoint channel: every id in it is ALSO
+   *  in `vocalOov`. That is deliberate — it leaves the red marking, the segment badge and the
+   *  blocking counts reading exactly one map, so this change cannot make a note stop being red.
+   *  ⇒ NEVER union it into a red/blocking set: you would double-count. Its only consumer is the
+   *  wording, plus `vocalOov.length - vocalUnknownPhone.length` = "are there ALSO plain OOV notes". */
+  vocalUnknownPhone: Record<string, string[]>;
   /** S85b: notes whose span rounds to ZERO 50fps frames (S84 D 刀 dropped notes) — same red
    *  marking as OOV (both = "will not sound") but a SEPARATE map so the track-header text can
    *  tell the truth: these are too-short notes, not unrecognized lyrics(用户实机反馈:合并
@@ -202,6 +217,9 @@ interface AppState {
   /** ② S58: publish one segment's OOV verdict (null = clear the entry). No-op-guarded (identical
    *  verdicts don't re-render subscribers). Written ONLY by the oovWatch validation watcher. */
   setVocalOov: (segmentId: string, noteIds: string[] | null) => void;
+  /** S109 (§C15): publish the phoneme-typo subset of one segment's OOV verdict. Same writer
+   *  (oovWatch), same merge/no-op semantics; see the field's doc for why it is a SUBSET. */
+  setVocalUnknownPhone: (segmentId: string, noteIds: string[] | null) => void;
   /** S85b: publish one segment's dropped-note verdict(语义同 setVocalOov,写者同为 oovWatch)。 */
   setVocalDropped: (segmentId: string, noteIds: string[] | null) => void;
   /** S87: publish one segment's frame-borrow verdict(语义同上,写者同为 oovWatch)。 */
@@ -271,6 +289,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vocalRenderActive: false,
   renderingVocalTrackId: null,
   vocalOov: {},
+  vocalUnknownPhone: {},
   vocalDropped: {},
   vocalShort: {},
   midiExtracting: {},
@@ -370,6 +389,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const next = verdictMapUpdate(s.vocalOov, segmentId, noteIds);
       return next ? { vocalOov: next } : {};
+    }),
+  setVocalUnknownPhone: (segmentId, noteIds) =>
+    set((s) => {
+      const next = verdictMapUpdate(s.vocalUnknownPhone, segmentId, noteIds);
+      return next ? { vocalUnknownPhone: next } : {};
     }),
   setVocalDropped: (segmentId, noteIds) =>
     set((s) => {

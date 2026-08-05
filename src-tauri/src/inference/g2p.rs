@@ -1777,8 +1777,15 @@ pub enum ResolvedKind {
     Breath,
     /// Sung phones (words, sustains resolved to their carrier nucleus, zh finals, ja morae…).
     Phones(Vec<&'static str>),
-    /// OOV (lenient mode only — strict render errors instead).
-    Unknown,
+    /// This note did not resolve (lenient mode only — strict render errors instead).
+    ///
+    /// S109 (§C15): `phone` names the offending PHONE when that is what failed (a bracket hint or a
+    /// `phoneme_input` override carrying a symbol outside the 210-token inventory), and is `None`
+    /// for an ordinary OOV lyric. Both still mark the note red — the distinction exists so the
+    /// editor can stop telling the user to "check the lyric" about a lyric that is fine. Keeping it
+    /// on the variant rather than beside it means every construction site has to decide, which is
+    /// how the two that used to drop it were found.
+    Unknown { phone: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -2244,7 +2251,9 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                         )));
                     }
                     carrier = None;
-                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
+                    // No phone to name: the ALIAS tokenizer failed before any note resolver ran, so
+                    // the payload is the convention + lyric (see `VOCAL_ALIAS` above), not a phone.
+                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: None }, run_lang, is_sustain: false, nucleus_stress: None });
                     i += 1;
                     continue;
                 }
@@ -2276,7 +2285,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                 if strict {
                                     return Err(fail.into_error(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None });
                             }
                         }
                         i += 1;
@@ -2324,7 +2333,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                 if strict {
                                     return Err(fail.into_error(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown, run_lang, is_sustain: false, nucleus_stress: None });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None });
                                 for j in i + 1..span_end {
                                     // the sustains still resolve (hold "a") so ONLY the word marks OOV
                                     out[j] = Some(ResolvedNote {
@@ -2372,6 +2381,21 @@ impl NoteFail {
         match self {
             NoteFail::Oov => UtaiError::Inference(format!("VOCAL_OOV: {lyric}")),
             NoteFail::UnknownPhone(p) => UtaiError::Inference(format!("VOCAL_UNKNOWN_PHONE: {p}")),
+        }
+    }
+
+    /// S109 (§C15) — the same distinction, for the NON-strict path.
+    ///
+    /// `into_error` is the strict half and has always kept the phone. The editor half threw it away:
+    /// both `Err(fail)` arms below wrote a bare `ResolvedKind::Unknown`, so `validate_lyrics` could
+    /// only ever say "unknown", and the one sentence the frontend attaches to a red mark is
+    /// "check the lyric or the note/track language" — the wrong advice for a note whose lyric is
+    /// fine and whose THIRD PHONEME is the typo. That is the S90 debt S99 paid off for the RENDER
+    /// and not for the EDITOR; this carries it the rest of the way.
+    fn unknown_phone(self) -> Option<String> {
+        match self {
+            NoteFail::Oov => None,
+            NoteFail::UnknownPhone(p) => Some(p),
         }
     }
 }
@@ -2645,7 +2669,7 @@ pub fn classify_score(score: &[ScoreEvt], dicts: &dyn DictSource) -> Result<Vec<
                     LyricClass::Phones { phones: ph }
                 }
             }
-            ResolvedKind::Unknown => LyricClass::Unknown,
+            ResolvedKind::Unknown { phone } => LyricClass::Unknown { phone },
         })
         .collect())
 }
@@ -2963,7 +2987,7 @@ mod tests {
         assert!(matches!(c[0], LyricClass::Phones { .. }), "{:?}", c[0]);
         assert!(matches!(c[1], LyricClass::Sustain), "{:?}", c[1]);
         assert!(matches!(c[2], LyricClass::Phones { .. }), "{:?}", c[2]);
-        assert!(matches!(c[3], LyricClass::Unknown), "{:?}", c[3]);
+        assert!(matches!(c[3], LyricClass::Unknown { .. }), "{:?}", c[3]);
     }
 
     #[test]
@@ -3057,7 +3081,7 @@ mod tests {
         assert!(matches!((&r[0].kind, &c[0]), (ResolvedKind::Phones(_), LyricClass::Phones { .. })));
         assert!(r[1].is_sustain && matches!(c[1], LyricClass::Sustain));
         assert!(matches!((&r[2].kind, &c[2]), (ResolvedKind::Phones(_), LyricClass::Phones { .. })));
-        assert!(matches!((&r[3].kind, &c[3]), (ResolvedKind::Unknown, LyricClass::Unknown)));
+        assert!(matches!((&r[3].kind, &c[3]), (ResolvedKind::Unknown { .. }, LyricClass::Unknown { .. })));
     }
 
     // ── S95 EN plural rung: -'s/-s/-es of an in-dictionary base, voice follows the base ──
@@ -3273,7 +3297,7 @@ mod tests {
         let f = fixtures();
         // the thing that must not come back (non-vacuity: prove the two arms really differ pre-fix)
         assert!(
-            !matches!(classify_score(&[evt("长，", Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown),
+            !matches!(classify_score(&[evt("长，", Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown { .. }),
             "a punctuated hanzi is still being marked OOV"
         );
         for (punctuated, bare) in [("长，", "长"), ("大。", "大"), ("解！", "解"), ("之…", "之"), ("「长」", "长")] {
@@ -3294,7 +3318,7 @@ mod tests {
         // …and what must STAY loud: punctuation alone, and more than one hanzi on one note
         for bad in ["，", "。", "长大", "长，大"] {
             assert!(
-                matches!(classify_score(&[evt(bad, Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown),
+                matches!(classify_score(&[evt(bad, Lang::Zh)], &f).unwrap()[0], LyricClass::Unknown { .. }),
                 "{bad} must stay OOV — the ladder trims EDGES, it never invents a reading"
             );
         }
@@ -3383,7 +3407,7 @@ mod tests {
         assert_eq!(phones_of(&r[2]), vec!["l", "ɪ", "t"]);
         // 6. malformed hint → the lyric goes to the dictionary and fails LOUDLY (never a silent guess)
         assert!(resolve_score(&[evt("[k aa}", Lang::En)], &f).is_err());
-        assert!(matches!(classify_score(&[evt("[k aa}", Lang::En)], &f).unwrap()[0], LyricClass::Unknown));
+        assert!(matches!(classify_score(&[evt("[k aa}", Lang::En)], &f).unwrap()[0], LyricClass::Unknown { .. }));
         // 6b. an EN override written in RAW IPA is off-contract (§3.7 = traditional phones) but used to
         //     resolve by passthrough — the S90 case normalization must not turn it into a silent OOV
         //     (`aɪ`.to_ascii_uppercase() would be `Aɪ`, which interns to nothing).
@@ -3426,7 +3450,7 @@ mod tests {
         ] {
             let r = classify_score(&[evt(lyric, Lang::En)], &f).unwrap();
             assert!(
-                matches!(r[0], LyricClass::Unknown),
+                matches!(r[0], LyricClass::Unknown { .. }),
                 "{lyric:?} must be a LOUD OOV, not a quietly substituted word (got {:?})",
                 r[0]
             );
@@ -4931,7 +4955,7 @@ mod tests {
         // …and the same call really did mark an OOV neighbour, so the assertion above is not
         // passing because `classify_score` stopped reporting anything (S102: which set is the zero over).
         let control = classify_score(&[evt("zzqqxx'zzqq", Lang::Fr)], &src).unwrap();
-        assert!(matches!(control[0], LyricClass::Unknown), "control: {:?}", control[0]);
+        assert!(matches!(control[0], LyricClass::Unknown { .. }), "control: {:?}", control[0]);
     }
 
     /// S104 (b)-G3 — `yeux` must sing the WORD, not the phrase *les yeux*.
@@ -5304,7 +5328,11 @@ mod tests {
                         let what = match &nt.kind {
                             ResolvedKind::Rest => "REST".to_string(),
                             ResolvedKind::Breath => "BREATH".to_string(),
-                            ResolvedKind::Unknown => "**OOV**".to_string(),
+                            // S109 §C15: name the phone when THAT is what failed — the probe exists
+                            // to answer "why did this note not resolve", and "**OOV**" was the same
+                            // lie the editor was telling.
+                            ResolvedKind::Unknown { phone: Some(p) } => format!("**UNKNOWN PHONE: {p}**"),
+                            ResolvedKind::Unknown { phone: None } => "**OOV**".to_string(),
                             ResolvedKind::Phones(p) => p.join(" "),
                         };
                         let tag = if nt.is_sustain { " [sustain]" } else { "" };
@@ -5317,7 +5345,7 @@ mod tests {
             match classify_score(&score, &g) {
                 Ok(cl) => {
                     let bad: Vec<usize> =
-                        (0..cl.len()).filter(|&i| matches!(cl[i], LyricClass::Unknown)).collect();
+                        (0..cl.len()).filter(|&i| matches!(cl[i], LyricClass::Unknown { .. })).collect();
                     if !bad.is_empty() {
                         println!("    editor marks OOV at {bad:?}");
                     }
@@ -5336,7 +5364,7 @@ mod tests {
         assert!(err.contains("VOCAL_OOV: zzzzq"), "strict render error carries the CODE + lyric: {err}");
         let classes = classify_score(&score, &f).unwrap();
         assert!(matches!(classes[0], LyricClass::Phones { .. }));
-        assert!(matches!(classes[1], LyricClass::Unknown));
+        assert!(matches!(classes[1], LyricClass::Unknown { .. }));
         assert!(matches!(classes[2], LyricClass::Phones { .. }), "notes after the OOV still classify");
     }
 
@@ -5351,19 +5379,63 @@ mod tests {
         let e = resolve_score(&bad, &f).unwrap_err().to_string();
         assert!(e.contains("VOCAL_UNKNOWN_PHONE: zzz"), "must name the offending phone: {e}");
         assert!(!e.contains("VOCAL_OOV"), "must NOT be reported as a bad lyric: {e}");
-        // the editor still marks exactly that note (a per-note verdict, not an infrastructure error)
-        assert!(matches!(classify_score(&bad, &f).unwrap()[0], LyricClass::Unknown));
+        // ★★S109 (§C15) — THE EDITOR SIDE, which S99 could not reach and this assertion used to let
+        // through. It said only `LyricClass::Unknown { .. }`: true both before and after the fix, so
+        // it was compatible with the editor knowing nothing. `resolve_core`'s two lenient arms were
+        // discarding `NoteFail` entirely, so `validate_lyrics` returned a bare "unknown" and the one
+        // sentence the frontend shows for it is "check the lyric or the note/track language" — the
+        // same misdirection, one surface over. The verdict must NAME the phone.
+        match &classify_score(&bad, &f).unwrap()[0] {
+            LyricClass::Unknown { phone } => assert_eq!(
+                phone.as_deref(),
+                Some("zzz"),
+                "the editor verdict must name the offending phone, or the frontend can only repeat \
+                 the 'check the lyric' advice about a lyric that is fine"
+            ),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
         // a well-formed hint is untouched
         assert_eq!(phones_of(&resolve_score(&[evt("[dh ae dh]", Lang::En)], &f).unwrap()[0]), vec!["ð", "æ", "ð"]);
         // ★ and an ORDINARY OOV still says VOCAL_OOV with the LYRIC — the two arms must stay distinct
         let e2 = resolve_score(&[evt("zzzzq", Lang::En)], &f).unwrap_err().to_string();
         assert!(e2.contains("VOCAL_OOV: zzzzq"), "{e2}");
         assert!(!e2.contains("VOCAL_UNKNOWN_PHONE"), "{e2}");
+        // ★ CONTROL for the editor side too: an ordinary OOV must carry NO phone. Without this the
+        // fix could be "always Some(...)", which renames the lie instead of removing it.
+        let plain = classify_score(&[evt("zzzzq", Lang::En)], &f).unwrap();
+        match &plain[0] {
+            LyricClass::Unknown { phone } => assert_eq!(phone.as_deref(), None, "an OOV WORD has no offending phone"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // ★ THE WIRE SHAPE, pinned: an ordinary OOV must serialize EXACTLY as it did before this
+        // change, so every existing `kind === "unknown"` consumer is provably untouched (the red
+        // marking, the segment badge, the track header). Only the phone case gains a field.
+        assert_eq!(serde_json::to_string(&plain[0]).unwrap(), r#"{"kind":"unknown"}"#);
+        assert_eq!(
+            serde_json::to_string(&classify_score(&bad, &f).unwrap()[0]).unwrap(),
+            r#"{"kind":"unknown","phone":"zzz"}"#
+        );
         // ja/zh raw-phoneme overrides go through the same naming (they used to `.ok()` it away too)
         let mut ja = evt("か", Lang::Ja);
         ja.phoneme_input = Some("k zzz a");
-        let e3 = resolve_score(&[ja], &f).unwrap_err().to_string();
+        let e3 = resolve_score(&[ja.clone()], &f).unwrap_err().to_string();
         assert!(e3.contains("VOCAL_UNKNOWN_PHONE: zzz"), "{e3}");
+        // …and so does the ja EDITOR verdict — the east and west lenient arms are two different
+        // `Err(fail)` sites, so one of them being fixed says nothing about the other.
+        match &classify_score(&[ja], &f).unwrap()[0] {
+            LyricClass::Unknown { phone } => assert_eq!(phone.as_deref(), Some("zzz"), "ja editor verdict"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        // ★ the ja BRACKET-HINT path is a THIRD entry point (a hint in the lyric, not a
+        // `phoneme_input` override) and it reaches the same east resolver — pinned so "the ja side
+        // works" cannot rest on the override arm alone.
+        let ja_hint = [evt("[k zzz]", Lang::Ja)];
+        let e4 = resolve_score(&ja_hint, &f).unwrap_err().to_string();
+        assert!(e4.contains("VOCAL_UNKNOWN_PHONE: zzz"), "ja bracket hint must name the phone: {e4}");
+        match &classify_score(&ja_hint, &f).unwrap()[0] {
+            LyricClass::Unknown { phone } => assert_eq!(phone.as_deref(), Some("zzz"), "ja hint editor verdict"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     // ── audit MAJOR: a MISSING DICTIONARY must surface as VOCAL_DICT_MISSING — never masked as
@@ -5460,7 +5532,7 @@ mod tests {
         assert!(err.contains("VOCAL_ALIAS: xsampa zq"), "own CODE + convention + lyric: {err}");
         let lenient = classify_score(&bad, &f).unwrap();
         assert!(matches!(lenient[0], LyricClass::Phones { .. }), "the readable alias still resolves");
-        assert!(matches!(lenient[1], LyricClass::Unknown), "…and only the bad one is marked");
+        assert!(matches!(lenient[1], LyricClass::Unknown { .. }), "…and only the bad one is marked");
     }
 
     /// The precedence ladder, and the things an alias convention must NOT capture.

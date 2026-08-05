@@ -348,8 +348,22 @@ pub enum LyricClass {
     Sustain,
     /// A pronounceable lyric → its IPA phones (all in the 210-token vocab).
     Phones { phones: Vec<&'static str> },
-    /// OOV — no G2P mapping. The editor must LOUD-mark it (never silent SP), the render LOUD-errors.
-    Unknown,
+    /// This lyric did not resolve. The editor must LOUD-mark it (never silent SP), the render
+    /// LOUD-errors.
+    ///
+    /// S109 (§C15): `phone` names the offending PHONE when THAT is what failed — a bracket hint or a
+    /// `phoneme_input` override carrying a symbol outside the 210-token inventory — and is absent for
+    /// an ordinary out-of-vocabulary lyric. Wire shape is unchanged for the ordinary case
+    /// (`skip_serializing_if`): plain OOV still serializes as exactly `{"kind":"unknown"}`, so every
+    /// existing consumer of `kind === "unknown"` keeps working byte-for-byte and the red marking is
+    /// untouched. The field exists for ONE reason — the frontend's single OOV sentence tells the user
+    /// to "check the lyric or the note/track language", which is the wrong advice for a note whose
+    /// lyric is fine and whose phoneme is the typo (the S90 debt; S99 fixed the render's wording and
+    /// could not reach the editor's, because this is where the name was being dropped).
+    Unknown {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phone: Option<String>,
+    },
 }
 
 /// Classify one lyric token via the SAME `lyric_to_phones` the render uses (owned result for the wire).
@@ -359,7 +373,9 @@ pub fn classify_lyric(lyr: &str) -> LyricClass {
         Lyric::Breath => LyricClass::Breath,
         Lyric::Sustain => LyricClass::Sustain,
         Lyric::Phones(ph) => LyricClass::Phones { phones: ph },
-        Lyric::Unknown => LyricClass::Unknown,
+        // `lyric_to_phones` is the ja/zh token-level classifier — it never inspects a bracket hint,
+        // so there is no phone to name here by construction.
+        Lyric::Unknown => LyricClass::Unknown { phone: None },
     }
 }
 
@@ -2121,9 +2137,14 @@ fn assemble_arrays(
                     }
                 }
             }
-            g2p::ResolvedKind::Unknown => {
-                // unreachable via resolve_score (strict errors first) — defensive LOUD error.
-                return Err(UtaiError::Inference(format!("VOCAL_OOV: {}", evt.lyric)));
+            g2p::ResolvedKind::Unknown { phone } => {
+                // unreachable via resolve_score (strict errors first) — defensive LOUD error. Uses
+                // the SAME split as `NoteFail::into_error` so a defensive path can never contradict
+                // the real one about which of the two things went wrong.
+                return Err(UtaiError::Inference(match phone {
+                    Some(p) => format!("VOCAL_UNKNOWN_PHONE: {p}"),
+                    None => format!("VOCAL_OOV: {}", evt.lyric),
+                }));
             }
         }
     }
@@ -4184,7 +4205,7 @@ mod tests {
         assert!(matches!(classify_lyric("ー"), LyricClass::Sustain));
         assert!(matches!(classify_lyric("AP"), LyricClass::Breath));
         assert!(matches!(classify_lyric("ap"), LyricClass::Breath));
-        assert!(matches!(classify_lyric("zzzz"), LyricClass::Unknown));
+        assert!(matches!(classify_lyric("zzzz"), LyricClass::Unknown { .. }));
         match classify_lyric("か") {
             LyricClass::Phones { phones } => assert_eq!(phones, vec!["k", "a"]),
             other => panic!("か should classify as phones [k,a], got {:?}", other),
@@ -4241,7 +4262,7 @@ mod tests {
                     resolved += 1;
                 }
                 LyricClass::Sustain | LyricClass::Rest | LyricClass::Breath => resolved += 1,
-                LyricClass::Unknown => {
+                LyricClass::Unknown { .. } => {
                     unresolved.push(format!("U+{cp:04X}"));
                     readable.push(format!("U+{cp:04X} {ch}"));
                 }

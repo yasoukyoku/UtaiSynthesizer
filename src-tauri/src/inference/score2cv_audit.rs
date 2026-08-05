@@ -356,7 +356,7 @@ fn expectation(
     match &res.kind {
         g2p::ResolvedKind::Rest => Expect::Single("SP"),
         g2p::ResolvedKind::Breath => Expect::Single("AP"),
-        g2p::ResolvedKind::Unknown => Expect::Unmodelled,
+        g2p::ResolvedKind::Unknown { .. } => Expect::Unmodelled,
         g2p::ResolvedKind::Phones(ph) => {
             if res.is_sustain && res.run_lang == g2p::Lang::Zh && prev_sung {
                 if prev_pitch == Some(note_num) {

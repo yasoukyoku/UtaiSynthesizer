@@ -574,9 +574,14 @@ When a note's lyric cannot be found in its effective language's dictionary (Out-
 
 1. The **note** turns red in the piano roll.
 2. The **clip** gets a red warning triangle at its top-right corner in the arrangement view (a green dot at the top-left means "has render results" — do not confuse the two).
-3. The **track header** shows a red warning triangle whose hover text reads: "Unrecognized lyrics (OOV) — check the lyric or the note/track language".
+3. The **track header** shows a red warning triangle whose hover text says which of the two problems below it found.
 
-**What to do**: either fix the lyric's spelling, or switch the note/track language to the one matching the lyric. The red marks clear themselves within about 0.3 s of the fix. Rendering with OOV present produces a clear error naming the offending lyric.
+**Two different problems wear the same red mark — read the hover text, it tells you which:**
+
+- **"Unrecognized lyrics (OOV)"** — the *word* has no pronunciation in the current language's dictionary. **What to do**: fix the lyric's spelling, or switch the note/track language to the one matching the lyric.
+- **"A note's PHONEME is not recognized"** (v0.12) — the lyric is *fine*; a phoneme you wrote yourself is not in the inventory. This happens when a `[bracket hint]` (5.4) or a phoneme override contains a typo, e.g. `[dh ae zzz]`. **What to do**: check the phonemes inside the brackets — *not* the lyric and *not* the language. Render once and the error names the exact phoneme (`VOCAL_UNKNOWN_PHONE: zzz`).
+
+The red marks clear themselves within about 0.3 s of the fix.
 
 > Tip: if the error says "Pronunciation dictionary missing" instead of OOV, the dictionary file itself is missing/broken — see [Chapter 13](#13-faq-and-troubleshooting).
 
@@ -700,6 +705,7 @@ On a first render the clip shows a loading placeholder; on a re-render the old a
 | "No notes to render" | The clip is empty |
 | "A render is already in progress" | Only one vocal render runs at a time — wait for it |
 | Lyric "××" cannot be mapped to phonemes (OOV) | See 5.6 — fix the lyric or the language |
+| `VOCAL_UNKNOWN_PHONE: ××` | See 5.6 — the lyric is fine; `××` is a phoneme you typed that is not in the inventory. Fix it inside the `[brackets]` / the phoneme override |
 | "Pronunciation dictionary missing" | Dictionary files are missing, see Chapter 13 |
 | "Render failed: …" | Anything else — follow the details or ask for help with the log |
 

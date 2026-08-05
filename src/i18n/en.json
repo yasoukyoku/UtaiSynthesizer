@@ -220,6 +220,7 @@
     "language": "Track default language",
     "noVoices": "No singer models available — import one in the Resource Manager first",
     "oovWarning": "Unrecognized lyrics (OOV) — check the lyric or the note/track language",
+    "unknownPhoneWarning": "A note's PHONEME is not recognized — the lyric is fine; check the phonemes inside its [brackets] (or its phoneme override). Render once to see which phoneme it is",
     "droppedWarning": "Some notes are shorter than one frame (~20 ms) and cannot sound — lengthen or delete them (marked red)",
     "shortWarning": "Some notes are shorter than one render frame (~20 ms) — the renderer rescues the ones it can by borrowing a frame from a neighbour; the rest are skipped (marked red). Lengthen them for a predictable result"
   },

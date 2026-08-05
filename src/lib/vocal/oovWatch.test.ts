@@ -10,10 +10,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 let invokeFails = false;
-const invokeMock = vi.fn((_cmd: string, args: { notes?: unknown[] }) =>
+/** S109 (§C15): the verdict the fake backend returns for one lyric. Declared BEFORE `invokeMock` on
+ *  purpose — a `const` holding a closure that reads a later binding is the TDZ shape this repo has
+ *  been bitten by. Default = everything resolves. */
+let classFor: (lyric: string) => { kind: string; phone?: string } = () => ({ kind: "ok" });
+const invokeMock = vi.fn((_cmd: string, args: { notes?: Array<{ lyric?: string }> }) =>
   invokeFails
     ? Promise.reject(new Error("validate_lyrics exploded"))
-    : Promise.resolve((args?.notes ?? []).map(() => ({ kind: "ok" }))),
+    : Promise.resolve((args?.notes ?? []).map((n) => classFor(n?.lyric ?? ""))),
 );
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (c: string, a: never) => invokeMock(c, a) }));
 vi.mock("../../i18n", () => ({ default: { t: (k: string) => k } }));
@@ -63,7 +67,8 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     (globalThis as unknown as { window: unknown }).window = globalThis;
     vi.useFakeTimers();
     invokeFails = false;
-    useAppStore.setState({ vocalOov: {}, vocalDropped: {}, vocalShort: {} });
+    classFor = () => ({ kind: "ok" });
+    useAppStore.setState({ vocalOov: {}, vocalUnknownPhone: {}, vocalDropped: {}, vocalShort: {} });
     SEG = `S${++seq}`;
     seed();
   });
@@ -96,6 +101,60 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     await settle();
     expect(useAppStore.getState().vocalShort).toEqual({ [SEG]: ["b"] });
     expect(useAppStore.getState().vocalShort[newId]).toBeUndefined();
+  });
+
+  // S109 (§C15): a mistyped PHONEME and an unrecognized LYRIC are two different problems wearing the
+  // same red mark, and until now the track header could only say the second sentence about both —
+  // "check the lyric or the note/track language", which is the wrong advice for a note whose lyric is
+  // fine. `vocalUnknownPhone` is the third instance of the split S85b/S87 already made twice.
+  it("★ splits the phoneme-typo verdict out of the lyric verdict, as a SUBSET", async () => {
+    // one note with a bad PHONEME in its hint, one with a genuinely unknown LYRIC, one fine.
+    classFor = (l) =>
+      l === "[a zzz]" ? { kind: "unknown", phone: "zzz" } : l === "qqq" ? { kind: "unknown" } : { kind: "ok" };
+    const notes: Note[] = [
+      { ...mk("p", 0, 480, 60), lyric: "[a zzz]" },
+      { ...mk("w", 480, 480, 62), lyric: "qqq" },
+      { ...mk("g", 960, 480, 64), lyric: "あ" },
+    ];
+    const seg: Segment = {
+      id: SEG, startTick: 0, durationTicks: 1440,
+      content: { type: "notes", notes } as SegmentContent,
+    };
+    useProjectStore.setState({
+      name: "P",
+      tracks: [{ id: "T", name: "V", trackType: "vocal", segments: [seg], voiceModel: "V",
+        volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {} } as Track],
+      tempo: TEMPO, timeSignature: [4, 4], dirty: false, filePath: null, selectedNotes: [], playheadTick: 0,
+    });
+    uninstall = installOovWatch();
+    await settle();
+    const app = useAppStore.getState();
+    // BOTH failures still wear the red mark — the marking must read exactly one map, so a change
+    // here could never make a note silently stop being red.
+    expect(app.vocalOov).toEqual({ [SEG]: ["p", "w"] });
+    // …and only the phoneme one is in the new channel, so the header can say the right sentence.
+    expect(app.vocalUnknownPhone).toEqual({ [SEG]: ["p"] });
+    // the SUBSET invariant the store's doc promises, asserted rather than asserted-in-prose
+    for (const id of app.vocalUnknownPhone[SEG]!) expect(app.vocalOov[SEG]).toContain(id);
+    // and "are there ALSO plain OOV lyrics" — what TrackList computes — is a difference, not a flag
+    expect(app.vocalOov[SEG]!.length > app.vocalUnknownPhone[SEG]!.length).toBe(true);
+  });
+
+  it("★ an ordinary OOV publishes NOTHING to the phoneme channel (the control)", async () => {
+    classFor = (l) => (l === "qqq" ? { kind: "unknown" } : { kind: "ok" });
+    const notes: Note[] = [{ ...mk("w", 0, 480, 60), lyric: "qqq" }];
+    const seg: Segment = { id: SEG, startTick: 0, durationTicks: 960, content: { type: "notes", notes } as SegmentContent };
+    useProjectStore.setState({
+      name: "P",
+      tracks: [{ id: "T", name: "V", trackType: "vocal", segments: [seg], voiceModel: "V",
+        volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {} } as Track],
+      tempo: TEMPO, timeSignature: [4, 4], dirty: false, filePath: null, selectedNotes: [], playheadTick: 0,
+    });
+    uninstall = installOovWatch();
+    await settle();
+    expect(useAppStore.getState().vocalOov).toEqual({ [SEG]: ["w"] });
+    // Without this arm the fix could be "always publish", which renames the lie instead of ending it.
+    expect(useAppStore.getState().vocalUnknownPhone).toEqual({});
   });
 
   it("★ publishes the FRAME verdicts even when validate_lyrics fails (they need no backend)", async () => {

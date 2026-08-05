@@ -207,6 +207,7 @@ export function TrackList({ width }: Props) {
   const voiceModels = useVoiceModelStore((s) => s.models);
   const setVocalParams = useProjectStore((s) => s.setVocalParams);
   const vocalOov = useAppStore((s) => s.vocalOov); // ② S58 track-level OOV warning
+  const vocalUnknownPhone = useAppStore((s) => s.vocalUnknownPhone); // S109 §C15: 音素写错 ≠ 歌词不认识
   const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: too-short dropped notes(独立文案)
   const vocalShort = useAppStore((s) => s.vocalShort); // S87: rescued notes — advisory, amber badge
 
@@ -359,7 +360,10 @@ export function TrackList({ width }: Props) {
               setMenu({ kind: "voice", trackId: track.id, x, y });
             }}
             onOpenLangMenu={(x, y) => setMenu({ kind: "lang", trackId: track.id, x, y })}
-            hasOov={track.segments.some((sg) => (vocalOov[sg.id]?.length ?? 0) > 0)}
+            hasOov={track.segments.some(
+              (sg) => (vocalOov[sg.id]?.length ?? 0) > (vocalUnknownPhone[sg.id]?.length ?? 0),
+            )}
+            hasUnknownPhone={track.segments.some((sg) => (vocalUnknownPhone[sg.id]?.length ?? 0) > 0)}
             hasDropped={track.segments.some((sg) => (vocalDropped[sg.id]?.length ?? 0) > 0)}
             hasShort={track.segments.some((sg) => (vocalShort[sg.id]?.length ?? 0) > 0)}
           />
@@ -423,8 +427,17 @@ interface TrackItemProps {
   /** ② S58 vocal-track header pickers (anchor = the trigger button's rect). */
   onOpenVoiceMenu: (x: number, y: number) => void;
   onOpenLangMenu: (x: number, y: number) => void;
-  /** ② S58: some segment on this track has OOV lyrics → header warning badge. */
+  /** ② S58: some segment on this track has OOV lyrics → header warning badge.
+   *  ⚠ S109 (§C15): this is now "…an OOV LYRIC", i.e. EXCLUDING the notes whose failure was a
+   *  mistyped phoneme — computed as `vocalOov.length > vocalUnknownPhone.length` per segment,
+   *  because the latter is a SUBSET of the former (see the store's doc). Per SEGMENT and not per
+   *  track: one segment can hold both kinds, and a track-level subtraction would hide one. */
   hasOov: boolean;
+  /** S109 (§C15): some segment has a note whose BRACKET HINT / phoneme override names a phoneme that
+   *  is not in the inventory. Same red badge as `hasOov`, different sentence — telling that user to
+   *  "check the lyric or the language" points at the two things that are fine. Third instance of the
+   *  split S85b/S87 made for `hasDropped`/`hasShort`. */
+  hasUnknownPhone: boolean;
   /** S85b: some note rounded to zero frames(过短被跳过)→ same badge, truthful tooltip. */
   hasDropped: boolean;
   /** S87: some note was rescued by a frame borrow — ADVISORY (it sounds), so the badge turns amber
@@ -456,6 +469,7 @@ function TrackItem({
   onOpenVoiceMenu,
   onOpenLangMenu,
   hasOov,
+  hasUnknownPhone,
   hasDropped,
   hasShort,
 }: TrackItemProps) {
@@ -568,11 +582,16 @@ function TrackItem({
                 too-short note is not a lyric problem and must not read as one(用户实机反馈). */}
             {/* S87: …and a third line for RESCUED notes, which are ADVISORY — the badge only goes red when
                 something actually will not sound; a track whose only finding is a borrow shows amber. */}
-            {(hasOov || hasDropped || hasShort) && (
+            {(hasOov || hasUnknownPhone || hasDropped || hasShort) && (
               <span
-                className={hasOov || hasDropped ? "track-oov-badge" : "track-oov-badge advisory"}
+                className={
+                  hasOov || hasUnknownPhone || hasDropped ? "track-oov-badge" : "track-oov-badge advisory"
+                }
                 title={[
                   hasOov ? t("tracks.oovWarning") : null,
+                  // S109 §C15: its OWN line, and it can appear together with the OOV one — a segment
+                  // may hold both kinds and each sentence must be true of the notes it describes.
+                  hasUnknownPhone ? t("tracks.unknownPhoneWarning") : null,
                   hasDropped ? t("tracks.droppedWarning") : null,
                   hasShort ? t("tracks.shortWarning") : null,
                 ]
