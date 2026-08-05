@@ -3949,6 +3949,14 @@ mod tests {
             //   `seen.len() == observed` count just above (unchanged) plus the single-consonant
             //   inventory pinned in `s108_onset_authority_gate` group (1).
             // and the keep list is exactly what survived into the onset set
+            // ⚠ S108 HONESTY NOTE: for de/es/it this is now TRUE BY CONSTRUCTION — `onset_admitted`
+            //   is "is it in the keep list" and `from_tsv` inserts exactly the keep list, so this
+            //   compares the list with itself (the very shape S105's own probe caught once, and the
+            //   one `c21_crosscheck_rust.py` was rewritten to avoid). It still carries content for
+            //   FRENCH, whose admission is `KEEP && !FR_ONSET_DROP` — that is the one arm where the
+            //   two sides can disagree. What actually guards "the list reaches the onset set" is
+            //   `s108_onset_authority_gate` group (3), whose examples are checked against the LIVE
+            //   set and which a mutation probe (re-adding `∩ observed`) turns red.
             let live: HashSet<&str> =
                 d.onsets.iter().filter(|c| c.contains(' ')).map(|c| c.as_str()).collect();
             let want: HashSet<&str> = keep.iter().copied().collect();
@@ -5516,6 +5524,38 @@ mod tests {
                  this string."
             );
         }
+        // …and the RAW MATERIAL: every consonant the dictionary contains, admitted or FORBIDDEN.
+        // ⚠ The assertion above cannot see the forbidden half — a phone that is gated never reaches
+        //   the onset set, so a regeneration that introduces one is invisible there. A mutation
+        //   probe demonstrated exactly that: appending a row with a new phone AND forbidding it left
+        //   every other assertion in this file green, i.e. a future dictionary could grow a segment
+        //   that silently never opens a syllable. Symmetrically, a forbidden phone DISAPPEARING is
+        //   only noticed for the handful group (1) enumerates.
+        for (name, want) in [
+            ("de", "b c cʰ d f h j k kʰ l m n p pf pʰ s t ts tʃ tʰ v x z ç ŋ ɟ ɡ ɲ ʁ ʃ"),
+            ("fr", "b c d dʒ f j k l m mʲ n p s t ts tʃ v w z ŋ ɟ ɡ ɥ ɲ ʁ ʃ ʎ ʒ"),
+            ("es", "b c d̪ f j k l m n p r s tʃ t̪ w x ç ð ŋ ɟ ɟʝ ɡ ɣ ɲ ɾ ʃ ʎ ʝ β θ"),
+            ("it", "b bː d dː d͡ʒ d͡ʒː f fː g h hː j k kː l lː m mː n nː p pː r rː s sː t tː t͡s t͡ʃ \
+                    t͡ʃː v w x z ð ɡ ɲ ʃ ʎ"),
+            ("en", "B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH"),
+        ] {
+            let (_, lang, d, tsv) = dicts.iter().find(|x| x.0 == name).unwrap();
+            let mut seen: Vec<&str> = tsv
+                .lines()
+                .filter_map(|l| l.split_once('\t'))
+                .flat_map(|(_, p)| p.split_whitespace())
+                .filter(|t| !dict_is_vowel(*lang, &d.vowels, t))
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(
+                seen.join(" "),
+                want.split_whitespace().collect::<Vec<_>>().join(" "),
+                "{name}: the dictionary's CONSONANT inventory changed. This fires whether or not the \
+                 newcomer would be admitted, which is the point — judge it against \
+                 `single_onset_forbidden` and say so in writing, then update this string."
+            );
+        }
 
         // ── (3) AUTHORITATIVE — unattested keep entries are live ────────────────────────────────
         for (name, unattested, examples) in [
@@ -5764,6 +5804,50 @@ mod tests {
             assert_ne!(got(&r_old), got(&r_now), "{name}: the S108 onset set never reaches the wire");
             assert_eq!(got(&r_old), as_vec(before), "{name}: pre-S108 render of {word}");
             assert_eq!(got(&r_now), as_vec(after), "{name}: post-S108 render of {word}");
+        }
+
+        // ── (7) THE CATCH-ALL — LAST ON PURPOSE ─────────────────────────────────────────────────
+        // The curated lists by CONTENT. S105 pinned their LENGTH because a probe showed that
+        // comparing the live set against the list compares the list with itself. Length is still not
+        // enough: 19 of the 287 entries capture no word at all, and 223 clusters in these
+        // dictionaries are attested word-initially while never occurring INSIDE a word — swap one of
+        // the former for one of the latter and no cut, no blast-radius count and no attestation
+        // count moves. A probe confirmed such a swap passed every other assertion in this file.
+        //
+        // ⚠⚠ IT IS LAST BECAUSE IT IS A CATCH-ALL, and that ordering rule is the third time this
+        //    round taught it: a group that fires for EVERY edit steals the failure from the specific
+        //    groups, leaving them untested (put this before (4)/(5) — as the first draft did — and
+        //    the CUTS and BLAST RADIUS probes both go red HERE instead of where they belong).
+        //    Specific assertions first, catch-alls last; group (1) sits before group (2) for the
+        //    same reason at the other end of the file.
+        // ⚠ The digest is over the SORTED list, so reordering (not a behaviour change) stays free.
+        // ⚠ A digest cannot tell you WHAT changed — `TESTING\s108_c21_onset_authority\
+        //   c21_crosscheck_rust.py` does, by diffing the constants against the ones in git HEAD.
+        fn keep_digest(list: &[&str]) -> u64 {
+            let mut v: Vec<&str> = list.to_vec();
+            v.sort_unstable();
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in v.join(" ").bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        }
+        for (name, n, digest) in [
+            ("de", 46usize, 0x70a6_f5b1_e2d8_1ea5u64),
+            ("fr", 113, 0x3300_c9d2_a090_c4d8),
+            ("es", 87, 0xa373_ded6_ca9d_223e),
+            ("it", 41, 0x60d2_fcbd_57a2_c919),
+        ] {
+            let keep = west_onset_keep(dicts.iter().find(|x| x.0 == name).unwrap().1).unwrap();
+            assert_eq!(keep.len(), n, "{name}: the curated onset list changed LENGTH");
+            assert_eq!(
+                keep_digest(keep), digest,
+                "{name}: the curated onset list changed CONTENT without moving any behaviour this \
+                 file measures. Every entry is a per-cluster linguistic VERDICT — write its evidence \
+                 next to it (which words it captures, and which cut each of them wants) before \
+                 moving this digest."
+            );
         }
     }
 }
