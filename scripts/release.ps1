@@ -49,11 +49,30 @@ $dicts = @("zh_syllables","zh_chars","zh_phrases","en","de","fr","es","it")
 foreach ($d in $dicts) { if (-not (Test-Path "data\dictionaries\$d.tsv")) { Fail "dictionary missing: $d.tsv" } }
 # S109 (§H7 first baseline): EXISTENCE was the only check here, so a stale or swapped TSV shipped
 # silently — and `installer.nsi` takes these files straight from data\dictionaries, not from the
-# target staging copy, so this is the last place to catch it. The manifest is derived from
-# tauri.conf.json's own resource map, so it cannot drift into a 5th hand-kept copy of the file list.
-# `cargo test` below covers the same ground from inside the suite; this runs FIRST and needs no build.
-py -3.10 scripts\dict_manifest.py
-if ($LASTEXITCODE -ne 0) { Fail "dictionary identity: data\dictionaries does not match src-tauri\dictionaries.sha256 (intentional regeneration? rerun verify_dictionaries.py, then scripts\dict_manifest.py --write)" }
+# target staging copy, so this is the last place to catch it. `cargo test` in section 5 asserts the
+# same manifest from inside the suite (and additionally that it agrees with tauri.conf.json); this
+# runs FIRST, needs no build, and is deliberately written in plain PowerShell — release.ps1 had no
+# python dependency before and must not gain one.
+$manifestPath = "src-tauri\dictionaries.sha256"
+if (-not (Test-Path $manifestPath)) { Fail "dictionary manifest missing: $manifestPath" }
+$want = @{}
+foreach ($line in (Get-Content $manifestPath)) {
+  $t = $line.Trim()
+  if (-not $t -or $t.StartsWith('#')) { continue }
+  $parts = $t -split '\s+', 2
+  if ($parts.Count -eq 2) { $want[$parts[1].Trim()] = $parts[0].Trim() }
+}
+if ($want.Count -ne $dicts.Count) {
+  Fail "dictionary manifest lists $($want.Count) files but $($dicts.Count) ship — regenerate with: py -3.10 scripts\dict_manifest.py --write"
+}
+foreach ($name in $want.Keys) {
+  $dp = "data\dictionaries\$name"
+  if (-not (Test-Path $dp)) { Fail "dictionary in the manifest but not on disk: $name" }
+  # -ne on strings is case-insensitive in PowerShell; Get-FileHash returns upper-case hex.
+  if ((Get-FileHash $dp -Algorithm SHA256).Hash -ne $want[$name]) {
+    Fail "dictionary identity: $name does not match $manifestPath (intentional regeneration? rerun verify_dictionaries.py, then ``py -3.10 scripts\dict_manifest.py --write``)"
+  }
+}
 $enc = & bin\ffmpeg.exe -hide_banner -encoders 2>$null | Out-String
 foreach ($e in @("libmp3lame", "libvorbis", "libopus", " aac", " flac")) {
   if ($enc -notmatch [regex]::Escape($e)) { Fail "bundled ffmpeg lacks encoder:$e" }
