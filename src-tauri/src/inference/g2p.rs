@@ -600,8 +600,14 @@ impl WordDict {
     /// stripping is a structural no-op — no MFA phone ends in 0/1/2 (`s106_seam_gate` pins that).
     fn compound_seams(&self, word: &str, phones: &[String]) -> Seams {
         let mut seams = Seams::default();
-        // S110 §C24 — computed FIRST and outside the `phones.len() < 4` early-out below, because a
-        // literal ⟨j⟩ needs no head and no tail: `anja` is four phones and `nja` would be three.
+        // S110 §C24 — computed before the `phones.len() < 4` early-out below because a literal ⟨j⟩
+        // needs no head and no tail, unlike a seam.
+        // ⚠ INERT TODAY, and the first version of this comment implied otherwise by citing `anja` —
+        //   which is four phones and clears the early-out anyway. `de_literal_j_blocks` needs a
+        //   nucleus at index ≥ 3 to return anything (`b >= a + 3`), i.e. ≥ 4 phones, so measured on
+        //   all 152769 rows the hoist changes nothing. It is the correct placement for a shorter
+        //   input that does not exist yet; do not cite it as load-bearing. (Same treatment as the
+        //   note in `Seams::constraint`.)
         seams.glide_block = self.de_literal_j_blocks(word, phones);
         // ⚠ `phones.len() < 4` is a cheap early-out, NOT a filter: a seam needs ≥2 phones on each
         // side, so four is the structural minimum anyway. A mutation probe that raised it to 5
@@ -696,8 +702,16 @@ impl WordDict {
     /// `phoneme_input` override, a merged fragment or a plural/elision reading; a SPELLING test has
     /// no such property — the letters of `evt.lyric` say nothing about phones the user typed by
     /// hand. So this binds only when `phones` IS one of the readings the dictionary ships for this
-    /// key, which reproduces exactly the same immunity for exactly the same reason. (S88: when you
-    /// add a member to a domain, go back and read why the existing members were safe.)
+    /// key. (S88: when you add a member to a domain, go back and read why the existing members
+    /// were safe.)
+    /// ⚠ NOT "exactly the same immunity", and the difference matters. For `compound_seams`,
+    /// abstaining is a NO-OP — no seam means the maximal onset decides, which is what would have
+    /// happened anyway. Here, abstaining means the SPELLING-BLIND default applies, and since S110
+    /// the blind default for `n j` is the onset. So on the override / fragment-merge path a German
+    /// word carrying a literal ⟨j⟩ is cut as though it were ⟨i⟩-derived. Measured on the shipped
+    /// dictionary that path is 592 better : 198 worse versus pre-S110 (the blind default is the
+    /// more often right one, which is exactly what S108's 4:1 said) — but it is a real asymmetry,
+    /// not the same immunity, and the gate's blast-radius arm does not exercise it.
     fn de_literal_j_blocks(&self, word: &str, phones: &[String]) -> Vec<usize> {
         if self.lang != Lang::De || !phones.iter().any(|p| p == "j") {
             return Vec::new();
@@ -1020,17 +1034,29 @@ const DE_ONSET_KEEP: &[&str] = &[
     //  · `z j` (Ver-si-on, Vi-si-on) and `ɡ j` (Re-gi-on, Le-gi-on) — the voiced twins of `s j` and
     //    `k j`, which are already here; 147 + 117 captures, no compound in either capture set.
     //  · `b j` — 34 captures, the ⟨-bio-⟩/⟨-blio-⟩ family.
-    // …and S110 (§C24) closed the family: `n j` and `l j` were the only two consonants missing from
-    //    it, and they were missing for a reason that was never about them. S108 measured them at
-    //    ~4:1 for the onset against a coda side that is NOT junk (⟨-jährig⟩ on every numeral,
-    //    Kon-junk-tur, Schul-jahr, In-jek-tion, the Slavic ⟨nj⟩ names) while everything else here
-    //    runs at 15-34:1, and rejected them. That reading was right about the numbers and wrong
-    //    about the cause: the two populations are not a ratio to be traded off, they are TWO
-    //    DIFFERENT SPELLINGS, and German writes the difference down. `DE_LITERAL_J_SPELLING` below
-    //    now separates them, so both sides get their own cut and the ratio stops mattering.
-    //    ⚠ The same defect was already in this list for the OTHER thirteen consonants — see that
-    //    table's doc. Adding these two did not create it; it is what made it visible.
-    "t s j", "z j", "ɡ j", "b j", "n j", "l j",
+    // …and S110 (§C24) admitted `n j` — but NOT `l j`, and the asymmetry is measured, not stylistic.
+    //    S108 rejected both at ~4:1 for the onset against a coda side that is NOT junk (⟨-jährig⟩ on
+    //    every numeral, Kon-junk-tur, Schul-jahr, In-jek-tion, the Slavic ⟨nj⟩ names) while
+    //    everything else here runs at 15-34:1. That reading was right about the numbers and wrong
+    //    about the cause for `n j`: those two populations are not a ratio to trade off, they are TWO
+    //    DIFFERENT SPELLINGS and German writes the difference down — `DE_LITERAL_J_SPELLING` below
+    //    separates them, and `n j` then measures 235 helped : 0 harmed (⟨-linie⟩, ⟨-nion⟩, Mil-li-on
+    //    style ⟨ni⟩+V), with 78 more in the ⟨gn⟩/⟨ny⟩/⟨nh⟩ foreign-digraph families that the guard
+    //    cannot judge either way.
+    // ⛔ `l j` STAYS OUT, and this is a NEGATIVE RESULT with a number: the same split measures
+    //    **130 helped : 145 harmed**. The harmed side is Romance ⟨ill⟩ — Me-dail-le, Pa-vil-lon,
+    //    bril-lant, Bouil-lon, Se-vil-la, Pa-trouil-le, and 140 more — where German breaks AFTER the
+    //    ⟨l⟩, so those words are cut CORRECTLY today and admitting `l j` would break them to buy the
+    //    ⟨lli⟩+V family (Million, Milliarde, ⟨-ius⟩). Same instrument as the ⟨ni⟩ side, opposite
+    //    answer: Duden/Wiktionary put the stress inside the cluster for `brillant` [bʁɪlˈjant] and
+    //    `Bouillon` [bulˈjɔŋ] but before it for `Million` [mɪˈli̯oːn]. ⇒ Admitting it needs a SECOND
+    //    spelling predicate (⟨lli⟩+V vs ⟨ill⟩+non-⟨i⟩), which is its own round with its own truth
+    //    surface — it has false members both ways (`Wil·liam` [ˈvɪljam] is ⟨lli⟩+V and wants coda).
+    //    Queue §C24b carries the measurement. Shipping `l j` bare would be a net REGRESSION, and the
+    //    first version of S110 did exactly that until an adversarial review caught it.
+    //    ⚠ The literal-⟨j⟩ defect was already in this list for the OTHER thirteen consonants — see
+    //    `DE_LITERAL_J_SPELLING`'s doc. Admitting `n j` did not create it; it is what made it visible.
+    "t s j", "z j", "ɡ j", "b j", "n j",
     // German-specific onsets: kn-, gn-, ⟨qu⟩ = k v, ⟨zw⟩ = ts v.
     // ⛔ `ɡ v` was proposed here as "⟨qu⟩'s voiced twin" and MEASURED DOWN: ⟨qu⟩+V really is
     //    `k v` (843/909 = 93%), but ⟨gu⟩+V is `ɡ ʊ` — a VOWEL, its own nucleus — in 173 words
@@ -1058,7 +1084,7 @@ const DE_ONSET_KEEP: &[&str] = &[
 /// a 4:1 trade-off on `n j`/`l j` instead of two separable populations.
 ///
 /// ⚠ AND THE DEFECT WAS ALREADY SHIPPED FOR THE OTHER THIRTEEN — this table is not the price of
-/// adding `n j`/`l j`, it repays a debt. Measured on the shipped de.tsv, 114 word types whose
+/// admitting `n j`, it repays a debt. Measured on the shipped de.tsv, 116 word types whose
 /// cluster is ALREADY in the keep list are cut wrong today: `ausbildungsjahr` =
 /// `… d ʊ ŋ | s j aː | ɐ` with the Fugen-s pulled into `jahr`'s onset (S105's own doc named that
 /// family — "the ~40 Fugen-s compounds on the other side (`abschlussjahr`) keep their existing wrong
@@ -1073,27 +1099,53 @@ const DE_ONSET_KEEP: &[&str] = &[
 /// guessing, so it keeps today's cut. If a regeneration creates more, `s110_de_literal_j_gate`
 /// counts them and goes red.
 ///
-/// ★ KNOWN COST, measured and named rather than discovered later — 6 word types, all foreign proper
-/// names, where the source language really does start a syllable with the pair:
-///   · ⟨fj⟩ in `limfjord` / `oslofjord` / `sognefjord` / `prokofjew(s)` — Fjord IS a German word
-///     with a word-initial /fj/. Blocking it costs those 6 and buys the 13 ⟨…f|jahr/jähr⟩ compounds
-///     (`elfjährig`, `fünfjahresvertrag`), so the blanket rule is the better half of that trade.
-///   · ⟨skj⟩ in `nordenskjöld` — was already cut wrong (`s k j` is not an onset either way).
-///   · a handful of Russian palatalised consonants written ⟨Cj⟩ (`murawjow`, `premjer`, `grigorjew`,
-///     `winnyzja`) where German usage is genuinely contested. ⛔ There is no instrument for this
-///     population — de has structurally zero ear adjudication (queue "判据能力") — so it is recorded
-///     as a cost, not resolved. If it ever needs resolving it wants a curated KEY list, the
-///     `FR_DROP_ROWS` shape, not a change here.
+/// ★ KNOWN COSTS, measured and named rather than discovered later. ⚠ The counts below were corrected
+/// after an adversarial review recomputed them — the first version said "6 word types" while its own
+/// bullets named 10, and claimed a 6-vs-13 trade that measures 5 vs 5. Numbers now:
+///   · ⟨fj⟩ — **5**: `limfjord` / `oslofjord` / `sognefjord` / `prokofjew` / `prokofjews`. Fjord IS a
+///     German word with a word-initial /fj/, so blocking it is wrong for them. It buys the ⟨…f|jahr /
+///     f|jähr⟩ compounds — of the 11 such keys only **5** actually move (`elfjährig`, `elfjähriger`,
+///     `fünfjahresvertrag`, `fünfjähriger`, `zwölfjähriger`); the other six were already held by the
+///     §C3 compound seam. So the honest trade is **5 for 5**, and the tie-breaker is that the ⟨fj⟩
+///     five are foreign place names while the five ⟨jahr⟩ compounds are ordinary German.
+///   · ⟨skj⟩ — **1**: `nordenskjöld`, already cut wrong either way (`s k j` is not an onset).
+///   · ★ **~25 transliterated Slavic/other ⟨Cj⟩ names** (`murawjow`, `premjer`, `grigorjew`,
+///     `winnyzja`, `artjom`, `fedja`, `nadja`, `katjuscha`, `semjon(ow)`, `tretjakow`, `orjol`,
+///     `syrdarja`, `prypjat`, `demjanjuk`, `kirjat`, `midtjylland`, `fridtjof`, `otjimbingwe`, …).
+///     ⛔ **There is no instrument for this population** — de has structurally zero ear adjudication
+///     (queue "判据能力") — and the doc previously booked four of them as costs and the other ~21 as
+///     fixes with no stated criterion. They are all one class; all of it is recorded as a cost.
+///     Resolving it wants a curated KEY list (the `FR_DROP_ROWS` shape), not a change here.
+///
+/// ⚠ TWO POPULATIONS THIS TABLE CANNOT SEE, both named after the review found them:
+///   · **⟨Cy⟩ — the same glide written with ⟨y⟩** (23 word types). `anja` and `anya` are BYTE-
+///     IDENTICAL in de.tsv (`a n j a`), and so are `tanja`/`tanya` — yet only the ⟨j⟩ spelling is
+///     guarded. `vineyard` (vine|yard) and `tastaturlayout` (Tastatur|Layout) are the two with a real
+///     morpheme boundary; the rest are ⟨ny⟩ = a foreign single /ɲ/ (`canyon`, `kenya`, `catalunya`)
+///     where the onset reading is defensible. ⛔ The obvious fix (`("n","ny")`, `("l","ly")`) was
+///     measured and REJECTED: it reaches only 19 of the 23 and newly breaks the `olympiamedaille`
+///     family, because *Olympia* contributes the letters ⟨ly⟩ to a key whose /l j/ is the French
+///     ⟨ill⟩ kind. Same "a tightening removes protection" shape S106 recorded.
+///   · **Romance ⟨ill⟩ and ⟨gn⟩/⟨nh⟩** — see the ⛔ note on `l j` in `DE_ONSET_KEEP`. ⟨gn⟩ (42:
+///     `kampagne`, `champagner`, `lasagne`, `bologna`) and ⟨nh⟩ (9) ride along with `n j`; they are
+///     foreign digraphs for one /ɲ/ and the guard makes no claim about them either way.
 ///
 /// ⚠ Phones are listed as they appear in de.tsv. The aspirated (`tʰ` `kʰ` `pʰ`) and palatal (`c` `ɟ`)
 /// spellings do NOT occur before a /j/ in the shipped dictionary (`s110_de_literal_j_gate` pins the
 /// whole pre-/j/ consonant inventory), so listing them here would be inventing coverage.
 const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
-    ("n", "nj"), ("l", "lj"), ("s", "sj"), ("z", "sj"), ("ts", "zj"),
+    ("n", "nj"), ("s", "sj"), ("z", "sj"), ("ts", "zj"),
     ("t", "tj"), ("d", "dj"), ("p", "pj"), ("b", "bj"), ("k", "kj"),
     ("ɡ", "gj"), ("m", "mj"), ("f", "fj"), ("ʁ", "rj"),
     // ⟨w⟩ is /v/ in German; ⟨v⟩ only in loans (`vjosa`). Both spellings, one phone.
     ("v", "wj"), ("v", "vj"),
+    // ⚠ INERT TODAY, kept deliberately — measured: it changes 0 word types. `l j` is NOT in
+    //   `DE_ONSET_KEEP` (see the ⛔ note there), so the maximal onset already cuts at the /j/ and
+    //   there is nothing for this row to block. It is here because it goes LIVE the moment §C24b
+    //   admits `l j`, and a `Schul|jahr` unguarded for one round is exactly the shape this table
+    //   exists to prevent. `s110_de_literal_j_gate` group (5) is what keeps the claim honest: it
+    //   asserts which consonants the table covers, so this row cannot rot into a silent no-op.
+    ("l", "lj"),
 ];
 
 /// French. `ʎ` is /l/ before /i/ and `c`/`ɟ` are /k/ /ɡ/ before front vowels — both are allophone
@@ -4208,9 +4260,9 @@ mod tests {
         };
         // (name, dict, tsv, keep list, clusters the dictionary OBSERVES, entries the list KEEPS)
         let dicts = [
-            // S110 §C24: 46 -> 48 (`n j`, `l j` — the two consonants the glide clause was missing;
+            // S110 §C24: 46 -> 47 (`n j` only — `l j` was measured NET NEGATIVE and stays out;
             // the evidence sits next to the entries and in `DE_LITERAL_J_SPELLING`).
-            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, DE_ONSET_KEEP, 145usize, 48usize),
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, DE_ONSET_KEEP, 145usize, 47usize),
             ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, FR_ONSET_KEEP, 295, 113),
             ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, ES_ONSET_KEEP, 192, 87),
             ("it", WordDict::from_tsv(Lang::It, &it_tsv), &it_tsv, IT_ONSET_KEEP, 160, 41),
@@ -4486,9 +4538,14 @@ mod tests {
             // seam alone; the literal-⟨j⟩ guard now reaches the same cut independently, so the seam
             // is no longer NECESSARY there. It is still sufficient, and the two agreeing is the
             // point — but a measurement that counted them together would stop being about §C3.
-            // (Both arms carry the guard; see the note at the blast-radius loop. Seams+guard vs
-            // nothing would read 1445.)
-            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1048usize),
+            // (Both arms carry the guard; see the note at the blast-radius loop.)
+            // ★ 1046, not 1048: `l j` was measured NET NEGATIVE and pulled back out of the keep list
+            //   before this round shipped, and exactly two words follow it — `segelyacht` /
+            //   `segelyachten`. With `l j` an onset the Segel|yacht seam was the ONLY thing holding
+            //   their coda cut; without it the maximal onset lands there anyway, so the seam stops
+            //   being load-bearing for them. (Named rather than absorbed: an unexplained ±2 in a
+            //   fail-closed number is how a real regression gets waved through next time.)
+            ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1046usize),
             ("en", WordDict::from_tsv(Lang::En, &en_tsv), &en_tsv, 1478),
             ("fr", WordDict::from_tsv(Lang::Fr, &fr_tsv), &fr_tsv, 0),
             ("es", WordDict::from_tsv(Lang::Es, &es_tsv), &es_tsv, 0),
@@ -5995,7 +6052,7 @@ mod tests {
             // question — inside a word ⟨-linie⟩/⟨-nion⟩ hands the consonant to the glide. What made
             // them look different from the rest of the glide clause was the literal-⟨j⟩ population,
             // which `DE_LITERAL_J_SPELLING` now separates out instead of trading against.
-            ("de", 6usize, &["t s j", "z j", "ɡ j", "b j", "n j", "l j"][..]),
+            ("de", 5usize, &["t s j", "z j", "ɡ j", "b j", "n j"][..]),
             ("fr", 12, &["z ɥ", "ɲ j", "c l", "ɟ ʎ", "v ʁ w"][..]),
             ("es", 24, &["β ɾ", "ð ɾ", "ɾ j", "k l w", "β l w"][..]),
             ("it", 1, &["z d͡ʒ"][..]),
@@ -6145,7 +6202,7 @@ mod tests {
             //   number would silently become the blast radius of two rounds added together
             //   (measured: de 1395 -> 1988). A per-round number that quietly starts summing rounds
             //   is worse than no number, because it still looks pinned. They go in both arms.
-            const LATER_ROUNDS: &[(&str, &[&str])] = &[("de", &["n j", "l j"])];
+            const LATER_ROUNDS: &[(&str, &[&str])] = &[("de", &["n j"])];
             let later: Vec<String> = LATER_ROUNDS
                 .iter()
                 .filter(|(n, _)| n == name)
@@ -6299,8 +6356,8 @@ mod tests {
             h
         }
         for (name, n, digest) in [
-            // S110 §C24 re-took this digest: `n j` and `l j` joined the glide clause. 46 -> 48.
-            ("de", 48usize, 0x9a4e_93bd_e8c9_3de3u64),
+            // S110 §C24 re-took this digest: `n j` joined the glide clause. 46 -> 47.
+            ("de", 47usize, 0x1d8f_2b49_35d0_3489u64),
             ("fr", 113, 0x3300_c9d2_a090_c4d8),
             ("es", 87, 0xa373_ded6_ca9d_223e),
             ("it", 41, 0x60d2_fcbd_57a2_c919),
@@ -6404,14 +6461,20 @@ mod tests {
 
         // ── (3) CUTS, CONTROLS AND NAMED COSTS ──────────────────────────────────────────────────
         for (w, want, why) in [
-            // ⟨i⟩-derived — the 598 the two new clusters fix
-            ("million", "m ɪ | l j oː n", "Mil-li-on: ⟨lli⟩+V is one morpheme"),
-            ("billion", "b ɪ | l j oː n", "same family"),
+            // ⟨i⟩-derived — the 313 `n j` fixes
             ("richtlinie", "ʁ ɪ ç t | l iː | n j ə", "⟨-linie⟩; this pin was S108's REJECTION of `l j`"),
             ("anion", "a | n j oː n", "⟨-nion⟩"),
             ("ammoniak", "a | m ɔ | n j a k", "Am-mo-ni-ak"),
-            ("aemilius", "ɛ | m iː | l j ʊ s", "the ⟨-ius⟩ family"),
-            ("allianz", "a | l j a n ts", "Al-li-anz"),
+            // ⛔ THE NEGATIVE RESULT, pinned so it cannot be un-decided by accident. `l j` is NOT in
+            //    the keep list (130 helped : 145 harmed — see the ⛔ note in DE_ONSET_KEEP), so the
+            //    ⟨lli⟩+V family keeps its wrong cut and the Romance ⟨ill⟩ family keeps its RIGHT one.
+            //    Both are pinned: fixing one at the cost of the other is the trade this round refused.
+            ("million", "m ɪ l | j oː n", "⛔ still wrong — the ⟨lli⟩+V side §C24b would buy"),
+            ("billion", "b ɪ l | j oː n", "⛔ same family"),
+            ("aemilius", "ɛ | m iː l | j ʊ s", "⛔ the ⟨-ius⟩ family, same side"),
+            ("medaille", "m ɛ | d a l | j ə", "✅ Me-dail-le — the Romance ⟨ill⟩ side, RIGHT today"),
+            ("brillant", "b ʁ ɪ l | j a n t", "✅ bril-lant [bʁɪlˈjant] — stress lands INSIDE the cluster"),
+            ("pavillon", "pʰ a | v ɪ l | j oː n", "✅ Pa-vil-lon"),
             // literal ⟨j⟩, German compounds — the 116 the guard fixes
             ("ausbildungsjahr", "aw s | b ɪ l | d ʊ ŋ s | j aː | ɐ", "Fugen-s: S105 named this cost, this pays it"),
             ("achtjähriger", "a x t | j eː | ʁ ɪ | ɡ ɐ", "acht|jährig"),
@@ -6473,9 +6536,9 @@ mod tests {
                     .collect()
             };
             assert_eq!(
-                sung("million"),
-                vec![vec!["m", "ɪ"], vec!["l", "j", "oː", "n"]],
-                "`l j` must reach the WIRE as an onset, not merely be right inside syllabify"
+                sung("anion"),
+                vec![vec!["a"], vec!["n", "j", "oː", "n"]],
+                "`n j` must reach the WIRE as an onset, not merely be right inside syllabify"
             );
             assert_eq!(
                 sung("anja"),
@@ -6483,7 +6546,7 @@ mod tests {
                 "…and a literal ⟨j⟩ must leave /n/ in the coda on the wire"
             );
             assert_ne!(
-                sung("million")[0], sung("anja")[0],
+                sung("anion")[0], sung("anja")[0],
                 "the two spellings have to reach DIFFERENT wires — if the carrier notes agree the \
                  guard is inert and every assertion above passed for some other reason"
             );
@@ -6549,7 +6612,6 @@ mod tests {
         // nothing to block.
         let mut pre = WordDict::from_tsv(Lang::De, &de_tsv);
         pre.onsets.remove("n j");
-        pre.onsets.remove("l j");
         let (mut moved, mut bad_count, mut bad_seq) = (0usize, 0usize, 0usize);
         for (key, ph) in &d.map {
             let toks: Vec<String> = ph.split_whitespace().map(str::to_string).collect();
@@ -6574,10 +6636,10 @@ mod tests {
                                   consonants between syllables and must never add or remove one");
         assert_eq!(bad_seq, 0, "{bad_seq} German words changed their PHONE SEQUENCE");
         assert_eq!(
-            moved, 716,
-            "§C24 now re-cuts {moved} German word types, not 716. Independently recomputed by \
-             `TESTING\\s110_c24_de_cj\\c24_blast.py` (598 from the two new clusters, 116 from the \
-             literal-⟨j⟩ guard, 2 from both). A dictionary regeneration can legitimately move this \
+            moved, 431,
+            "§C24 now re-cuts {moved} German word types, not 431. Independently recomputed by \
+             `TESTING\\s110_c24_de_cj\\c24_blast.py` (313 from `n j`, 116 from the literal-⟨j⟩ \
+             guard, 2 from both). A dictionary regeneration can legitimately move this \
              — re-run that script and reconcile the two numbers before touching this one; two \
              implementations disagreeing is information, not an inconvenience (S108)."
         );

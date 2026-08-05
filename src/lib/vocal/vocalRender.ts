@@ -740,14 +740,17 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  a glide INSIDE one morpheme (Mil-li-on, ⟨-linie⟩, ⟨-ius⟩), and a literal ⟨j⟩, which in German is
  *  morpheme-initial (Schul|jahr, acht|jährig, Ausbildungs|jahr, ad|jektiv, plus borrowed names like
  *  Kat|ja, Ban|jo, Skop|je). The keep list treated the two identically, which is why S108 could only
- *  see `n j` / `l j` as a 4:1 trade-off and rejected them; separating the spellings makes both sides
- *  come out right, so those two clusters join the clause and the same guard repairs the thirteen that
- *  were already in it — `ausbildungsjahr` had its Fugen-s pulled into `jahr`'s onset, a cost S105
- *  named and left owed. 716 German word types move: 598 from the two new clusters, 116 from the
- *  guard, 2 from both; the syllable COUNT and the phone sequence are identical on every de.tsv key,
- *  so — exactly as in s105/s108 — only which note a consonant lands on changes, which is precisely
- *  what a stored bake gets wrong. Evidence, the one word where the test must abstain
- *  (`produktionsjahr`) and the 6 named costs live above `DE_LITERAL_J_SPELLING`. */
+ *  see `n j` / `l j` as a 4:1 trade-off and rejected both; separating the spellings makes both sides
+ *  of `n j` come out right (235 helped : 0 harmed), so it joins the clause — and the same guard
+ *  repairs the thirteen consonants already in it, where `ausbildungsjahr` had its Fugen-s pulled into
+ *  `jahr`'s onset, a cost S105 named and left owed. ⛔ `l j` STAYS OUT: measured 130 helped : 145
+ *  harmed, because the harmed side is Romance ⟨ill⟩ (Me-dail-le, Pa-vil-lon, bril-lant) which is cut
+ *  correctly today — admitting it needs a second spelling predicate and is queued as §C24b.
+ *  431 German word types move: 313 from `n j`, 116 from the guard, 2 from both; the syllable COUNT
+ *  and the phone sequence are identical on every de.tsv key, so — exactly as in s105/s108 — only
+ *  which note a consonant lands on changes, which is precisely what a stored bake gets wrong.
+ *  Evidence, the one word where the test must abstain (`produktionsjahr`) and every named cost live
+ *  above `DE_LITERAL_J_SPELLING`. */
 export const G2P_ALGO_VERSION = "s110";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a

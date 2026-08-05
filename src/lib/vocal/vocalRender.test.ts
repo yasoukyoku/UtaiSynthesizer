@@ -612,8 +612,8 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   it("carries the g2p + timing tokens", () => {
     expect(vocalTrackSig(track, 120)).toContain("|g2p:s110|st:s97c");
     // S110: the German glide clause reads the spelling — an ⟨i⟩-derived /j/ takes the consonant with
-    // it (`million` = `m ɪ | l j oː n`) while a literal ⟨j⟩ leaves it behind (`ausbildungsjahr` =
-    // `… d ʊ ŋ s | j aː | ɐ`, `anja` = `a n | j a`). 716 German word types cut differently. Same
+    // it (`anion` = `a | n j oː n`) while a literal ⟨j⟩ leaves it behind (`ausbildungsjahr` =
+    // `… d ʊ ŋ s | j aː | ɐ`, `anja` = `a n | j a`). 431 German word types cut differently. Same
     // class as s105/s108: the syllable COUNT never moves, only which note carries the consonant,
     // which is exactly what a stored bake gets wrong.
     // (s108 = the onset inventory stopping at word-initial attestation, 46031 word types;
