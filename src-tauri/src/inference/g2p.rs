@@ -5564,8 +5564,14 @@ mod tests {
         //   of phones that already exist (consonant inventory unchanged), it never votes (word-initial
         //   count unchanged), it is not in any keep list (digest unchanged), and both arms of the
         //   blast-radius comparison gate it identically (count unchanged). It simply defaults to
-        //   "the whole cluster closes the previous syllable" with nobody judging it. A probe
-        //   appending one row `zzzprobe → a β m a` passed every other assertion in this file.
+        //   "the whole cluster closes the previous syllable" with nobody judging it. The probe that
+        //   showed this appends one row spelling `a x ɲ a` to es.tsv IN MEMORY — /x/ and /ɲ/ both
+        //   already exist, the pair never does — and every other assertion here stayed green.
+        //   ⚠ The FIRST attempt used `a β m a` and proved nothing: `submarino` = `s u β m a ɾ i n o`
+        //   already carries that cluster, so the count did not move either. A mutation has to be
+        //   checked for actually changing the quantity you think it changes before its green or red
+        //   means anything (Spanish has 613 two-consonant pairs that never occur between vowels —
+        //   pick any of them).
         // ★ That face is not marginal — it is where this round's work actually lived: `ɾ j` (1852
         //   word types), `β ɾ`, `β l`, `ɣ ɾ` are all clusters Spanish only ever writes inside words,
         //   which is exactly why the criterion above `DE_ONSET_KEEP` asks about intervocalic
