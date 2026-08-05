@@ -3872,6 +3872,107 @@ mod tests {
         }
     }
 
+    /// S109 (queue §C18) — the ⟨œ⟩ ligature is ONE nucleus, whichever way the author spells it.
+    ///
+    /// Upstream `french_mfa.dict` ships some ⟨œ⟩ words twice, once with the ligature and once with
+    /// the ASCII ⟨oe⟩ digraph a normal keyboard produces, and on a handful the ASCII row treats the
+    /// digraph as a vowel SEQUENCE. That is not inert: `syllabify` cuts between adjacent nuclei, so
+    /// a one-note `coeur` sang /kɔœʁ/ ("ko-eur") while `cœur` — the same French word — sang /kœʁ/,
+    /// with no OOV and no red mark either way. The generator now borrows the ligature twin's reading
+    /// for the four ASCII keys that have one (`FR_LIGATURE_TWINS`, MBS2H `build_dictionaries.py`).
+    ///
+    /// Three groups, each able to fail for its own reason:
+    ///  (1) PAIR EQUALITY — the two spellings resolve to the same phones and the same syllables.
+    ///  (2) THE VALUE ITSELF — (1) alone would be satisfied by both sides going wrong together
+    ///      (S105: "actual == a table I wrote" must have the table nailed down separately), so the
+    ///      readings and the syllable COUNT are pinned literally. The count is the user-facing half:
+    ///      one nucleus means one syllable means one note's worth of vowel.
+    ///  (3) CENSUS — no OTHER ⟨oe⟩/⟨ae⟩ pair may resolve to more vowels on the ASCII side than on
+    ///      the ligature side. Pinned as a SET OF NAMES WITH THEIR READINGS, not a count (S100: a
+    ///      name-level baseline is the only kind that survives one row appearing while another
+    ///      vanishes). ★ It compares through the full lookup LADDER, not raw rows — that is what
+    ///      makes it answer "what does the user get". Writing it the obvious way (raw tsv keys)
+    ///      would have missed `l'oeil` entirely, because `l'œil` is not a key: its correct reading
+    ///      comes from the elision rung composing l' + œil. The probe found that, not the design.
+    ///
+    /// ⚠ WHAT THIS DELIBERATELY DOES NOT COVER: the five defective rows that have NO ligature twin
+    /// (`l'oeil` `oeillades` `descoeur` `jolicoeur` `hautecoeur` — the last has additionally lost its
+    /// /k/). Correcting those means hand-writing phones, which every curated table in the generator
+    /// is contracted not to do, so they stay in the upstream bucket (queue §G10) until someone rules
+    /// on relaxing that contract. A census over twin-less keys would need a judgement, not a
+    /// measurement, so it is not attempted here — do not read this gate as "the family is clean".
+    /// Same loud-SKIP contract as the gates around it.
+    #[test]
+    fn s109_fr_ligature_is_one_nucleus() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/fr.tsv");
+        let Ok(tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s109-fr-ligature] SKIPPED — {} not present (gitignored generated asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let d = WordDict::from_tsv(Lang::Fr, &tsv);
+        let syl = |w: &str| -> Vec<Vec<String>> {
+            let ph = d.lookup(w).unwrap_or_else(|| panic!("{w} missing from fr.tsv"));
+            let seams = d.compound_seams(w, &ph);
+            syllabify(&d, &ph, &seams)
+        };
+
+        // (1) the borrowed pairs agree, phones AND cut.
+        for (ascii, lig) in [("coeur", "cœur"), ("coeurs", "cœurs"), ("oeil", "œil"), ("voeu", "vœu")] {
+            let a = d.lookup(ascii).unwrap_or_else(|| panic!("{ascii} missing from fr.tsv"));
+            let l = d.lookup(lig).unwrap_or_else(|| panic!("{lig} missing from fr.tsv"));
+            assert_eq!(
+                a, l,
+                "{ascii} and {lig} are the same French word but read differently — the \
+                 FR_LIGATURE_TWINS borrow is missing from this build of the dictionary"
+            );
+            assert_eq!(syl(ascii), syl(lig), "{ascii} and {lig} are cut differently");
+        }
+        // (2) …and they agree on the RIGHT value, not merely with each other.
+        for (w, spec) in [("coeur", "k œ ʁ"), ("coeurs", "k œ ʁ"), ("oeil", "œ j"), ("voeu", "v ø")] {
+            let got = d.lookup(w).unwrap();
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "fr primary for {w}");
+            assert_eq!(syl(w).len(), 1, "{w} must be ONE syllable — {:?}", syl(w));
+        }
+
+        // (3) census over every twinned ⟨oe⟩/⟨ae⟩ pair.
+        let mut flagged: Vec<String> = Vec::new();
+        for line in tsv.lines() {
+            let Some((w, _)) = line.split_once('\t') else { continue };
+            if !(w.contains("oe") || w.contains("ae")) {
+                continue;
+            }
+            let lig = w.replace("oe", "œ").replace("ae", "æ");
+            let (Some(a), Some(l)) = (d.lookup(w), d.lookup(&lig)) else { continue };
+            let nuclei = |ph: &[String]| ph.iter().filter(|p| d.is_vowel(p)).count();
+            if nuclei(&a) > nuclei(&l) && !flagged.iter().any(|f| f == w) {
+                flagged.push(format!("{w} = {a:?} vs {lig} = {l:?}"));
+            }
+        }
+        flagged.sort();
+        assert_eq!(
+            flagged,
+            vec![
+                // Fixable for FREE and NOT taken: `l'œil` is not a dictionary key at all — that
+                // reading is the ELISION rung composing l' + œil, so simply deleting the bad
+                // `l'oeil` row would already give the right answer. Deleting a row is a different
+                // contract from borrowing one, and S109's sanctioned scope was the four borrows.
+                r#"l'oeil = ["l", "ɔ", "ɛ", "j"] vs l'œil = ["l", "œ", "j"]"#.to_string(),
+                // A DIFFERENT corruption wearing the same coat: a spurious /s/, not adjacent
+                // vowels. It does have a correct twin, so it is a fifth zero-invention candidate
+                // that nobody has ruled on.
+                r#"voeux = ["v", "u", "s", "ø"] vs vœux = ["v", "ø"]"#.to_string(),
+                // Not the French ligature at all — Alsatian/German ⟨oe⟩ = ⟨ö⟩. Left alone on purpose.
+                r#"woerth = ["w", "ɔ", "ɛ", "ʁ", "t"] vs wœrth = ["w", "e", "ʁ", "t"]"#.to_string(),
+            ],
+            "the set of ⟨oe⟩/⟨ae⟩ pairs whose ASCII spelling resolves to MORE vowels than its \
+             ligature twin changed. The three above are known and deliberately unfixed (see the \
+             comments beside each). Anything else here is a new upstream defect — measure it, do \
+             not just add it to this list.\n⚠ These are RESOLVED readings, not raw rows: the pair is \
+             compared through the full lookup ladder, which is why `l'œil` has a reading at all."
+        );
+    }
+
     /// S105 (queue §C2) — the four-language onset gate over the REAL dictionaries. The criterion,
     /// the measurements, the two negative results and every accepted cost live above
     /// `DE_ONSET_KEEP`; this pins the behaviour they justify. Same loud-SKIP contract as the gates
