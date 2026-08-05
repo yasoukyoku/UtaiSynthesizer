@@ -62,8 +62,12 @@ fn repo_dictionaries() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries")
 }
 
-fn tmp_root() -> PathBuf {
-    std::env::temp_dir().join(format!("utai_dictdist_{}", std::process::id()))
+/// ⚠ Per-test SIBLING roots, never nested (S109 review). Both tests live in one binary and libtest
+/// runs them on concurrent threads; when the second test's base was a CHILD of the first's, the
+/// first's two `remove_dir_all(&base)` calls could delete the second's fixture mid-run. The
+/// interleaving was not observed in practice, but "not observed" is not a guard.
+fn tmp_root(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("utai_dictdist_{tag}_{}", std::process::id()))
 }
 
 #[test]
@@ -76,7 +80,7 @@ fn migrated_data_root_gets_the_new_dictionary_and_the_render_sings_it() {
         );
         return;
     }
-    let base = tmp_root();
+    let base = tmp_root("migrated");
     let _ = std::fs::remove_dir_all(&base);
     let app_dir = base.join("install");
     let data_dir = base.join("data");
@@ -184,7 +188,7 @@ fn absent_data_root_directory_is_created_not_skipped() {
         eprintln!("[dict-dist] SKIPPED — no shipped dictionaries");
         return;
     }
-    let base = tmp_root().join("legacy");
+    let base = tmp_root("legacy");
     let _ = std::fs::remove_dir_all(&base);
     let app_dir = base.join("install");
     let data_dir = base.join("appdata");

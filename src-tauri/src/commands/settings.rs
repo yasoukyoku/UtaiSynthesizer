@@ -1172,6 +1172,35 @@ fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: b
 /// `layout_aware` (S76, used for the `training` subtree ONLY): refuse to MERGE two top-level
 /// directories that are in different layouts.
 ///
+/// `skip_top_names` (S109, used for the `dictionaries` subtree ONLY): TOP-LEVEL names this walk must
+/// not carry over, because the destination already has a more authoritative source for them. The one
+/// caller passes the bundled dictionary file names. Rationale — and why "old→new delta" is the wrong
+/// rule for exactly these files:
+///
+///   * every other subtree here holds USER data, for which the old root is the only source and
+///     "newer or different ⇒ carry it over" is right;
+///   * `<data>/dictionaries/*.tsv` are BUNDLE resources whose single authority is
+///     `<install>/data/dictionaries`, and `sync_bundled_dictionaries` has already written that
+///     authority into the active root EARLIER IN THE SAME BOOT (lib.rs setup). A queued old root's
+///     copy is by construction that authority as of some EARLIER version — never newer.
+///
+/// Without this the reclaim thread (spawned at lib.rs:1037, five lines before the sync) walks the
+/// old root's `dictionaries` with the predicate below — `size differs || src newer` — and the SIZE
+/// clause alone is enough: an old root left over from before an app update holds a different-sized
+/// de/en/fr.tsv, so those three get written BACK over the freshly-synced ones while es/it/zh_* (same
+/// sizes across those two generations) do not, leaving a MIXED dictionary set no build ever shipped.
+/// The session then renders with the old phones; the next boot restores the new files, so nothing is
+/// ever red. Worse, `DICT_FINGERPRINT` is a `OnceLock` read once per session, so a bake made in that
+/// window can be stamped with the NEW fingerprint while carrying OLD phones — the precise hole the
+/// fingerprint was introduced to close (see `dictionary_fingerprint_for`).
+///
+/// Skipped names are NOT counted as failures: they are reproducible from the bundle, so keeping the
+/// old subtree undeleted on their account would only leak disk. Anything else the user parked in
+/// that directory is still carried over, so the "never delete a straggler we could not carry" rule
+/// below is untouched. Side effect worth knowing: both writers stage through the same temp name
+/// (`<name>.tsv.syncing`) in the same destination directory, and skipping these names here makes
+/// that collision structurally impossible for the eight shipped files.
+///
 /// Both roots can hold a `training/<id>/` — but one may be a pre-S76 workspace (checkpoints
 /// at its root) while the other is a migrated PROJECT (checkpoints one level down, in a
 /// family slot). Merging those per-file plants `G_*.pth` / `config.json` / `run_manifest.json`
@@ -1189,12 +1218,16 @@ fn sync_dir_delta(
     dst: &std::path::Path,
     skip_dot_top: bool,
     layout_aware: bool,
+    skip_top_names: &[String],
 ) -> (u64, u64) {
     let mut copied = 0u64;
     let mut failed = 0u64;
     let Ok(rd) = std::fs::read_dir(src) else { return (0, 0) };
     for entry in rd.flatten() {
         if skip_dot_top && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if skip_top_names.iter().any(|n| *n == entry.file_name().to_string_lossy()) {
             continue;
         }
         let from = entry.path();
@@ -1213,7 +1246,8 @@ fn sync_dir_delta(
                     continue;
                 }
             }
-            let (c, f) = sync_dir_delta(&from, &to, false, false);
+            // Nested levels are never bundle resources — the skip list is a TOP-LEVEL rule.
+            let (c, f) = sync_dir_delta(&from, &to, false, false, &[]);
             copied += c;
             failed += f;
             continue;
@@ -1652,6 +1686,12 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     // every launch (S68c review major). ~18 MB — keep it; every other subtree is user data.
     let old_is_default_root = canon_old
         == std::fs::canonicalize(app_dir.join("data")).unwrap_or_else(|_| app_dir.join("data"));
+    // Derived from tauri.conf.json (ONE authority, same as the sync and the fingerprint) — never a
+    // hand-kept sixth copy of the file list.
+    let bundled_names: Vec<String> = bundled_dictionary_targets()
+        .iter()
+        .filter_map(|t| std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().to_string()))
+        .collect();
     let mut synced = 0u64;
     let mut freed = 0u64;
     let mut kept: Vec<String> = Vec::new();
@@ -1668,8 +1708,18 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
         if name == "training" {
             crate::training::tproject::RECLAIM_TOUCHING_TRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let (c, sync_failed) =
-            sync_dir_delta(&sub, &active_data_dir.join(name), skips_dot_top(name), name == "training");
+        // S109: the bundled TSVs are the ONE subtree whose authority is the install, not the old
+        // root — carrying them over would undo the sync `lib.rs` performed a few lines before this
+        // thread was spawned. See `sync_dir_delta`'s doc for the full mechanism. Note this is about
+        // the COPY; the `old_is_default_root` branch below only governs the DELETE.
+        let skip_top: &[String] = if name == "dictionaries" { &bundled_names } else { &[] };
+        let (c, sync_failed) = sync_dir_delta(
+            &sub,
+            &active_data_dir.join(name),
+            skips_dot_top(name),
+            name == "training",
+            skip_top,
+        );
         if name == "training" {
             crate::training::tproject::RECLAIM_TOUCHING_TRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
         }
@@ -2947,6 +2997,94 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains("syncing")).collect();
         assert!(self_leftovers.is_empty(), "self-sync left temp files: {self_leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S109 — the OTHER writer into `<data-root>/dictionaries`, and the one that could undo the
+    /// sync above. `lib.rs` setup() spawns the reclaim thread (line ~1037) and THEN calls
+    /// `sync_bundled_dictionaries` (line ~1042), whose doc justifies being synchronous by saying a
+    /// background sync "could pin a stale dictionary for the whole session with nothing able to
+    /// invalidate it" — while `reclaim_one_root` walks the old root's `dictionaries` subtree with a
+    /// `size differs || src newer` predicate and copies old→new. Before the skip list this test
+    /// pins, a queued old root left over from before an app update wrote its de/en/fr.tsv back over
+    /// the freshly synced ones (es/it/zh_* have equal sizes across the two real generations, so they
+    /// did not move — the result was a MIXED set no build ever shipped), the session rendered with
+    /// the old phones, and the next boot put the new files back so nothing was ever red.
+    ///
+    /// WHY THIS IS A UNIT TEST AND NOT PART OF `tests/dictionary_distribution.rs`: the production
+    /// entry point `spawn_pending_data_dir_delete` is guarded by three checks that depend on the
+    /// MACHINE, not on the fixture — `crashlog::other_instance_alive()` reads the real
+    /// `%LOCALAPPDATA%\UtaiSynthesizer\logs`, so a gate driving that entry point would postpone (and
+    /// pass while asserting nothing) whenever the maintainer happens to have the app open. Driving
+    /// `reclaim_one_root` directly is the deterministic half; the environment-dependent half is
+    /// written up as a real-window item rather than faked here.
+    ///
+    /// ★ MUTATION-PROBED, twice, and the two probes go red on DIFFERENT assertions — which is the
+    /// point, because it is what separates "the fix" from "the lazy fix":
+    ///   · M1 — pass `&[]` as `skip_top_names` at the call site (i.e. no fix at all)
+    ///     ⇒ red on assertion 1, "the reclaim wrote the old root's stale fr.tsv over the freshly
+    ///     synced one".
+    ///   · M2 — skip the whole `dictionaries` subtree in the reclaim instead of just the bundled
+    ///     names (the tempting one-liner) ⇒ red on assertion 2, the user file that was parked in
+    ///     that directory never arrives.
+    /// (A single probe would not have shown this: assertion 1 aborts the test, so M1 alone says
+    /// nothing about whether assertions 2-3 can still fire. Logs: TESTING\s109_c16_dict_distribution
+    /// \mut_M1_no_skiplist.log and \mut_M2_whole_subtree_skipped.log.)
+    #[test]
+    fn reclaim_never_carries_a_stale_bundled_dictionary_into_the_active_root() {
+        let base = std::env::temp_dir().join(format!("utai_reclaimdict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let app = base.join("install");
+        let active = base.join("active");
+        let old = base.join("oldroot"); // deliberately NOT app/data — that population is safe already
+        let install_dicts = app.join("data").join("dictionaries");
+        for d in [&install_dicts, &active.join("dictionaries"), &old.join("dictionaries"), &old.join("cache")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        const FRESH: &str = "abstenir\ta p s t ə n i ʁ\n"; // post-D6, what the install ships
+        const STALE: &str = "abstenir\ta p s t ə ɲ i ʁ\n"; // pre-D6, what an old root still holds
+        // Written FIRST so the active copy ends up with the newer mtime: that removes the
+        // `src newer` clause from play and leaves the SIZE clause — which is exactly the shape the
+        // real world has, because `fs::copy` preserves mtimes on Windows.
+        std::fs::write(old.join("dictionaries").join("fr.tsv"), STALE).unwrap();
+        std::fs::write(old.join("dictionaries").join("notes.txt"), "user parked this here").unwrap();
+        std::fs::write(old.join("cache").join("straggler.bin"), b"written after the migration").unwrap();
+        std::fs::write(install_dicts.join("fr.tsv"), FRESH).unwrap();
+        std::fs::write(active.join("dictionaries").join("fr.tsv"), FRESH).unwrap();
+        // The two arms must actually differ, or every assertion below is vacuous (S92p).
+        assert_ne!(STALE.len(), FRESH.len(), "fixture is vacuous: the size clause could never fire");
+
+        let processed = super::reclaim_one_root(&app, &active, old.to_str().unwrap());
+
+        // 1. THE POINT: the authoritative copy survived the reclaim untouched.
+        assert_eq!(
+            std::fs::read_to_string(active.join("dictionaries").join("fr.tsv")).unwrap(),
+            FRESH,
+            "the reclaim wrote the old root's stale fr.tsv over the freshly synced one"
+        );
+        // 2. … and it did not buy that by refusing to carry NON-bundled files out of the same
+        //    directory. That rule exists so a straggler is never deleted with its tree.
+        //    Read with a message rather than `unwrap`: the failure mode here is an ABSENT file, and
+        //    a bare unwrap would report only "called `Result::unwrap()` on an `Err`" (the probe M2
+        //    made exactly that unreadable panic — see this repo's rule about reporting layers).
+        assert_eq!(
+            std::fs::read_to_string(active.join("dictionaries").join("notes.txt")).ok().as_deref(),
+            Some("user parked this here"),
+            "a user file in the old dictionaries dir was dropped instead of carried over — the skip \
+             list must name the bundled TSVs only, never the whole subtree"
+        );
+        // 3. … nor by disabling the delta-sync for unrelated subtrees.
+        assert_eq!(
+            std::fs::read_to_string(active.join("cache").join("straggler.bin")).ok().as_deref(),
+            Some("written after the migration"),
+            "the cache straggler was not carried over — the delta-sync itself is broken"
+        );
+        // 4. The entry is PROCESSED and the old tree is gone — skipping must not leak disk forever.
+        assert!(processed, "the queue entry was not processed");
+        assert!(!old.join("dictionaries").exists(), "old dictionaries subtree kept: {}", old.display());
+        assert!(!old.join("cache").exists(), "old cache subtree kept");
 
         let _ = std::fs::remove_dir_all(&base);
     }
