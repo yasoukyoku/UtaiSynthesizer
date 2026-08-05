@@ -3902,10 +3902,25 @@ mod tests {
     /// the ASCII ⟨oe⟩ digraph a normal keyboard produces, and on a handful the ASCII row treats the
     /// digraph as a vowel SEQUENCE. That is not inert: `syllabify` cuts between adjacent nuclei, so
     /// a one-note `coeur` sang /kɔœʁ/ ("ko-eur") while `cœur` — the same French word — sang /kœʁ/,
-    /// with no OOV and no red mark either way. The generator now borrows the ligature twin's reading
-    /// for the four ASCII keys that have one (`FR_LIGATURE_TWINS`, MBS2H `build_dictionaries.py`).
+    /// with no OOV and no red mark either way.
     ///
-    /// Three groups, each able to fail for its own reason:
+    /// Two generator-side remedies, both in MBS2H `build_dictionaries.py`, and they are NOT the same
+    /// contract — see (0) and (1):
+    ///   · `FR_LIGATURE_TWINS` — five ASCII keys BORROW the reading of their ligature twin, verbatim
+    ///     (`coeur` `coeurs` `oeil` `voeu`, plus `voeux`, whose corruption is a spurious /s/ rather
+    ///     than adjacent vowels but whose remedy is identical);
+    ///   · `FR_DROP_ROWS` — two keys whose row is corrupt and which have NO twin to borrow from, but
+    ///     which the LOOKUP LADDER already resolves correctly once the bad row is gone (`l'oeil`,
+    ///     `l'intervention`). Deleting is a different contract from borrowing, which is why it is a
+    ///     separate table with its own guards and its own assertion group here.
+    ///
+    /// Four groups, each able to fail for its own reason:
+    ///  (0) THE DROPS — the two keys are gone AND the ladder composes the right reading without
+    ///      them. Only Rust can assert this half: the generator can prove the tail's reading, not
+    ///      that the elision rung fires. ⚠ `l'oeil` depends on (1) — its tail `oeil` is itself a
+    ///      borrowed reading, so these two tables are coupled and the coupling is asserted, not
+    ///      assumed (the generator's own guard caught a first draft that compared against the RAW
+    ///      upstream `oeil` instead of the shipped one).
     ///  (1) PAIR EQUALITY — the two spellings resolve to the same phones and the same syllables.
     ///  (2) THE VALUE ITSELF — (1) alone would be satisfied by both sides going wrong together
     ///      (S105: "actual == a table I wrote" must have the table nailed down separately), so the
@@ -3919,12 +3934,13 @@ mod tests {
     ///      would have missed `l'oeil` entirely, because `l'œil` is not a key: its correct reading
     ///      comes from the elision rung composing l' + œil. The probe found that, not the design.
     ///
-    /// ⚠ WHAT THIS DELIBERATELY DOES NOT COVER: the five defective rows that have NO ligature twin
-    /// (`l'oeil` `oeillades` `descoeur` `jolicoeur` `hautecoeur` — the last has additionally lost its
-    /// /k/). Correcting those means hand-writing phones, which every curated table in the generator
-    /// is contracted not to do, so they stay in the upstream bucket (queue §G10) until someone rules
-    /// on relaxing that contract. A census over twin-less keys would need a judgement, not a
-    /// measurement, so it is not attempted here — do not read this gate as "the family is clean".
+    /// ⚠ WHAT THIS DELIBERATELY DOES NOT COVER: four defective rows that have NO twin to borrow AND
+    /// no ladder fallback to hand them to — `oeillades` `descoeur` `jolicoeur` `hautecoeur` (the last
+    /// has additionally lost its /k/: `o t ɛ œ ʁ` for haute+cœur). Correcting those means
+    /// HAND-WRITING phones, which every curated table in the generator is contracted not to do, so
+    /// they stay in the upstream bucket (queue §G10) until someone rules on relaxing that contract.
+    /// A census over twin-less keys would need a judgement, not a measurement, so it is not attempted
+    /// here — do not read this gate as "the ⟨œ⟩ family is clean".
     /// Same loud-SKIP contract as the gates around it.
     #[test]
     fn s109_fr_ligature_is_one_nucleus() {
@@ -3940,8 +3956,29 @@ mod tests {
             syllabify(&d, &ph, &seams)
         };
 
+        // (0) S109 §C18b — the two rows the generator DROPS, and the reason dropping them is a fix:
+        //     they are no longer keys, so `lookup_candidates`' FR elision rung composes them from
+        //     `l'` + the tail, and the tail is right. This is the load-bearing half of that decision
+        //     and only Rust can assert it — the generator can only prove the tail's reading.
+        //     ⚠ `l'oeil` depends on (1) below: the tail `oeil` is itself a BORROWED reading.
+        for (dropped, want) in [
+            ("l'oeil", "l œ j"),                                  // was `l ɔ ɛ j` — the ⟨œ⟩ defect
+            ("l'intervention", "l ɛ̃ t ɛ ʁ v ɑ̃ s j ɔ̃"),          // was `ʎ i n t …` — ⟨in⟩ denasalized
+        ] {
+            assert!(
+                !tsv.lines().any(|l| l.split_once('\t').map(|(k, _)| k) == Some(dropped)),
+                "{dropped} is a KEY again — the generator's FR_DROP_ROWS entry stopped applying, so \
+                 the corrupt row is back and the elision fallback is no longer reached"
+            );
+            let got = d.lookup(dropped).unwrap_or_else(|| panic!("{dropped} no longer resolves AT ALL — \
+                dropping its row stranded the word instead of handing it to the elision rung"));
+            let expect: Vec<String> = want.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, expect, "the elision fallback for {dropped}");
+        }
+
         // (1) the borrowed pairs agree, phones AND cut.
-        for (ascii, lig) in [("coeur", "cœur"), ("coeurs", "cœurs"), ("oeil", "œil"), ("voeu", "vœu")] {
+        for (ascii, lig) in [("coeur", "cœur"), ("coeurs", "cœurs"), ("oeil", "œil"), ("voeu", "vœu"),
+                             ("voeux", "vœux")] {
             let a = d.lookup(ascii).unwrap_or_else(|| panic!("{ascii} missing from fr.tsv"));
             let l = d.lookup(lig).unwrap_or_else(|| panic!("{lig} missing from fr.tsv"));
             assert_eq!(
@@ -3952,7 +3989,8 @@ mod tests {
             assert_eq!(syl(ascii), syl(lig), "{ascii} and {lig} are cut differently");
         }
         // (2) …and they agree on the RIGHT value, not merely with each other.
-        for (w, spec) in [("coeur", "k œ ʁ"), ("coeurs", "k œ ʁ"), ("oeil", "œ j"), ("voeu", "v ø")] {
+        for (w, spec) in [("coeur", "k œ ʁ"), ("coeurs", "k œ ʁ"), ("oeil", "œ j"), ("voeu", "v ø"),
+                          ("voeux", "v ø")] {
             let got = d.lookup(w).unwrap();
             let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
             assert_eq!(got, want, "fr primary for {w}");
@@ -3977,16 +4015,10 @@ mod tests {
         assert_eq!(
             flagged,
             vec![
-                // Fixable for FREE and NOT taken: `l'œil` is not a dictionary key at all — that
-                // reading is the ELISION rung composing l' + œil, so simply deleting the bad
-                // `l'oeil` row would already give the right answer. Deleting a row is a different
-                // contract from borrowing one, and S109's sanctioned scope was the four borrows.
-                r#"l'oeil = ["l", "ɔ", "ɛ", "j"] vs l'œil = ["l", "œ", "j"]"#.to_string(),
-                // A DIFFERENT corruption wearing the same coat: a spurious /s/, not adjacent
-                // vowels. It does have a correct twin, so it is a fifth zero-invention candidate
-                // that nobody has ruled on.
-                r#"voeux = ["v", "u", "s", "ø"] vs vœux = ["v", "ø"]"#.to_string(),
-                // Not the French ligature at all — Alsatian/German ⟨oe⟩ = ⟨ö⟩. Left alone on purpose.
+                // The ONLY survivor, and deliberately so: not the French ligature at all —
+                // Alsatian/German ⟨oe⟩ = ⟨ö⟩, a proper name. Left alone.
+                // (S109 §C18b closed the other two that used to be here: `voeux` gained a borrow,
+                //  `l'oeil` had its corrupt row dropped so the elision rung composes it — see (0).)
                 r#"woerth = ["w", "ɔ", "ɛ", "ʁ", "t"] vs wœrth = ["w", "e", "ʁ", "t"]"#.to_string(),
             ],
             "the set of ⟨oe⟩/⟨ae⟩ pairs whose ASCII spelling resolves to MORE vowels than its \
