@@ -734,8 +734,21 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  all five dictionaries, exactly as in s105 — only which note a consonant lands on changes, which is
  *  precisely what a stored bake would get wrong. Evidence, the accidental one-row attestations this
  *  removes (`two` was holding up German /t/) and every accepted cost live above
- *  `single_onset_forbidden`. */
-export const G2P_ALGO_VERSION = "s108";
+ *  `single_onset_forbidden`.
+ *  s110 = the GERMAN GLIDE CLAUSE learns to read the spelling (`DE_LITERAL_J_SPELLING` in g2p.rs).
+ *  German writes two different things as the same consonant+/j/ pair: an ⟨i⟩ before a vowel, which is
+ *  a glide INSIDE one morpheme (Mil-li-on, ⟨-linie⟩, ⟨-ius⟩), and a literal ⟨j⟩, which in German is
+ *  morpheme-initial (Schul|jahr, acht|jährig, Ausbildungs|jahr, ad|jektiv, plus borrowed names like
+ *  Kat|ja, Ban|jo, Skop|je). The keep list treated the two identically, which is why S108 could only
+ *  see `n j` / `l j` as a 4:1 trade-off and rejected them; separating the spellings makes both sides
+ *  come out right, so those two clusters join the clause and the same guard repairs the thirteen that
+ *  were already in it — `ausbildungsjahr` had its Fugen-s pulled into `jahr`'s onset, a cost S105
+ *  named and left owed. 716 German word types move: 598 from the two new clusters, 116 from the
+ *  guard, 2 from both; the syllable COUNT and the phone sequence are identical on every de.tsv key,
+ *  so — exactly as in s105/s108 — only which note a consonant lands on changes, which is precisely
+ *  what a stored bake gets wrong. Evidence, the one word where the test must abstain
+ *  (`produktionsjahr`) and the 6 named costs live above `DE_LITERAL_J_SPELLING`. */
+export const G2P_ALGO_VERSION = "s110";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a
