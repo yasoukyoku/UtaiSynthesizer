@@ -13,10 +13,22 @@
 //!   2. build a MIGRATED data root `<tmp>/data/dictionaries/` holding a STALE fr.tsv
 //!      (= the S83 fault: `migrate_data_dir` copied once, every later update refreshed only
 //!       the install copy)
-//!   3. `commands::settings::sync_bundled_dictionaries(app_dir, data_dir)`  — the exact call
+//!   3. `commands::settings::sync_bundled_dictionaries(app_dir, data_dir)`  — the same call
 //!      `lib.rs` setup() makes, with the same two arguments
-//!   4. `inference::g2p::set_dict_dir(<data root>/dictionaries)` — the exact call the command
+//!   4. `inference::g2p::set_dict_dir(<data root>/dictionaries)` — the same call the command
 //!      layer makes (`commands/inference.rs`, `data_dir.join("dictionaries")`)
+//!
+//! ⚠ S110 — "the SAME call", not "the EXACT call", and the difference is the whole reason two more
+//! gates had to be written. This file builds both argument values itself, as literals. So:
+//!   · it passes with `lib.rs`'s call site DELETED — nothing here goes through setup(). That hole is
+//!     now covered by `boot_steps_with_a_single_call_site_stay_wired_into_setup`
+//!     (`commands/settings.rs`), which reads lib.rs as text.
+//!   · step 4 uses a path this test computed, whereas production computes
+//!     `state.models.models_dir().parent().join("dictionaries")` — a re-derivation that has to land
+//!     on the same directory the sync just wrote. That link is covered by
+//!     `data_root_derivations_agree` (same module).
+//! Neither gap makes the chain below less real; they are the two joints this shape structurally
+//! cannot reach, and they are named here so the next reader does not conclude they are covered.
 //!   5. `inference::g2p::resolve_score(...)` through `GlobalDicts` — the render's own entry point,
 //!      including the lazy `Box::leak` load. Assert the FRENCH note comes out with the post-D6
 //!      phones.

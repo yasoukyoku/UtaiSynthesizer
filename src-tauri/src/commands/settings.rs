@@ -1056,6 +1056,15 @@ pub fn resolve_data_dir(app_dir: &std::path::Path) -> std::path::PathBuf {
 /// The data root ACTUALLY in use this session — parent of cache_dir (cache_dir = data_root/cache,
 /// models = data_root/models). May differ from `resolve_data_dir`: startup can pick the legacy
 /// AppData fallback for upgraders (see lib.rs setup).
+///
+/// ⚠ That parenthesis is a claim about a layout built in ANOTHER file, and until S110 nothing
+/// enforced it — while three consumers depend on it agreeing: this function (which
+/// `dictionary_fingerprint` hashes), `models.models_dir().parent()` (which the three
+/// `g2p::set_dict_dir` call sites read), and the `data_dir` local the bundled sync WRITES. A
+/// disagreement stamps a bake with the fingerprint of a directory it did not sing from. Both halves
+/// are now pinned: `data_root_derivations_agree` (this layout ⇒ both derivations return the root)
+/// and `boot_steps_with_a_single_call_site_stay_wired_into_setup` (lib.rs still builds that layout
+/// out of the same root the sync was handed).
 fn effective_data_root(state: &AppState) -> &std::path::Path {
     state.cache_dir.parent().unwrap_or(state.cache_dir.as_path())
 }
@@ -1180,9 +1189,16 @@ fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: b
 ///   * every other subtree here holds USER data, for which the old root is the only source and
 ///     "newer or different ⇒ carry it over" is right;
 ///   * `<data>/dictionaries/*.tsv` are BUNDLE resources whose single authority is
-///     `<install>/data/dictionaries`, and `sync_bundled_dictionaries` has already written that
-///     authority into the active root EARLIER IN THE SAME BOOT (lib.rs setup). A queued old root's
-///     copy is by construction that authority as of some EARLIER version — never newer.
+///     `<install>/data/dictionaries`, and a queued old root's copy is BY CONSTRUCTION that same
+///     authority as of some EARLIER version — never newer.
+///     ⚠ S110 correction: an earlier draft of this paragraph justified the rule with "the sync has
+///     already written that authority into the active root earlier in the same boot". That is
+///     FALSE and it contradicted the next paragraph of this very doc — `lib.rs` SPAWNS this thread
+///     (line ~1037) and only THEN calls the sync (~1042), so at the moment this walk starts the
+///     fresh bytes may not be on disk yet. The rule is safe for the version reason above, which
+///     needs no ordering at all; the temporal claim was decoration that happened to be wrong.
+///     (This is the same shape S109 was written up for: a comment whose invariant is broken by
+///     code five lines away — here it was broken by the doc's own next paragraph.)
 ///
 /// Without this the reclaim thread (spawned at lib.rs:1037, five lines before the sync) walks the
 /// old root's `dictionaries` with the predicate below — `size differs || src newer` — and the SIZE
@@ -1197,9 +1213,19 @@ fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: b
 /// Skipped names are NOT counted as failures: they are reproducible from the bundle, so keeping the
 /// old subtree undeleted on their account would only leak disk. Anything else the user parked in
 /// that directory is still carried over, so the "never delete a straggler we could not carry" rule
-/// below is untouched. Side effect worth knowing: both writers stage through the same temp name
-/// (`<name>.tsv.syncing`) in the same destination directory, and skipping these names here makes
-/// that collision structurally impossible for the eight shipped files.
+/// below is untouched.
+///
+/// ⚠ S110 — THE SKIP LIST HAS TO NAME THE STAGING TWIN TOO, and S109's claim that it did not need
+/// to was wrong. Both writers stage through the SAME temp path in the destination directory:
+/// `sync_bundled_dictionaries` computes `fr.tsv`.with_extension("tsv.syncing") = `fr.tsv.syncing`,
+/// and this walk, handed a source entry literally named `fr.tsv.syncing` (what a previous boot's
+/// torn sync leaves behind — the cleanup at the end of that function is on the FAILURE branch only,
+/// so a crash between copy and rename leaves one), renames onto that same `fr.tsv.syncing`. Skipping
+/// `fr.tsv` does not skip `fr.tsv.syncing`: the predicate below is exact-match. A reclaim rename
+/// landing between the sync's copy and its rename replaces the fresh bytes with the old root's
+/// straggler, and the sync then logs "refreshed" over them. S109's doc said that collision was
+/// "structurally impossible for the eight shipped files"; it was impossible only for the eight
+/// NAMES, which is not the same set. The caller now passes both spellings.
 ///
 /// Both roots can hold a `training/<id>/` — but one may be a pre-S76 workspace (checkpoints
 /// at its root) while the other is a migrated PROJECT (checkpoints one level down, in a
@@ -1318,6 +1344,10 @@ fn bundled_dictionary_targets() -> Vec<String> {
 /// render. A background thread would race that and could pin a stale dictionary for the whole
 /// session with nothing able to invalidate it. Running here — before the main window exists — means
 /// the first lookup of the session already sees the fresh file.
+/// ⇒ S110: every clause of that sentence ("here", "synchronous", "before the main window") is now
+/// asserted by `boot_steps_with_a_single_call_site_stay_wired_into_setup`. Until then the paragraph
+/// was a promise with nothing behind it: `lib.rs:1042` is the ONLY production call site, and
+/// deleting it or wrapping it in a `thread::spawn` left the entire suite green.
 ///
 /// ⚠ The identity test is a CONTENT HASH, deliberately not size+mtime like `sync_dir_delta`. That
 /// predicate is wrong for this job in both directions: S98 caught an upstream swap that changed
@@ -1326,20 +1356,35 @@ fn bundled_dictionary_targets() -> Vec<String> {
 /// hashes in well under a second, once per boot, and only when the paths actually differ.
 ///
 /// Never deletes and never fails the boot: a missing source (dev checkout — `data/` is gitignored
-/// and the TSVs are generated by the MBS2H generator) is a silent no-op, and a copy that cannot be
+/// and the TSVs are generated by the MBS2H generator) is a no-op, and a copy that cannot be
 /// made is logged at ERROR and left alone. It is not a repair path for a *corrupt* dictionary — only
 /// for a stale or absent one.
+///
+/// ★ S110 — IT LOGS ON EVERY RETURN PATH, and that is the point rather than tidiness. Until now the
+/// two early returns and the "everything already matches" tail were all silent, so an installed
+/// build's log could not distinguish "the step ran and correctly did nothing" from "the step never
+/// ran at all". That ambiguity is not hypothetical: S109 had to settle exactly this question about a
+/// shipped exe and could only do it by searching the BINARY for the `dictionary sync:` format string
+/// (the code predated the feature — but the same search on a build that HAS the code proves nothing
+/// about whether the call still executes). It is also what release-checklist item #5 asks a tester to
+/// read, and its old acceptance line — "confirm the `dictionary sync:` row" — was unsatisfiable on a
+/// healthy machine, because a healthy machine printed nothing. One INFO row per boot.
 pub fn sync_bundled_dictionaries(app_dir: &std::path::Path, data_dir: &std::path::Path) {
     let src_dir = app_dir.join("data").join("dictionaries");
     let dst_dir = data_dir.join("dictionaries");
     if !src_dir.is_dir() {
-        return; // dev checkout / stripped install — never treat "no source" as "delete the copy"
+        // dev checkout / stripped install — never treat "no source" as "delete the copy"
+        tracing::info!("dictionary sync: no bundled source at {} — nothing to do", src_dir.display());
+        return;
     }
     // Default install and dev build both land here: the two paths are the SAME directory. Compare
     // canonicalized, so a hand-set data_dir pointing back at the install root is caught too — not
     // just the cfg!(debug_assertions) case.
     if let (Ok(a), Ok(b)) = (src_dir.canonicalize(), dst_dir.canonicalize()) {
         if a == b {
+            // NOT an anomaly — this is the DEFAULT install and every dev build. Logged anyway so
+            // "ran, correctly did nothing" is distinguishable from "never ran" (see the doc above).
+            tracing::info!("dictionary sync: data root reads the bundled copy directly ({}) — no-op", a.display());
             return;
         }
     }
@@ -1377,6 +1422,13 @@ pub fn sync_bundled_dictionaries(app_dir: &std::path::Path, data_dir: &std::path
             let _ = std::fs::remove_file(&tmp);
             failed.push(name.to_string_lossy().to_string());
         }
+    }
+    if updated.is_empty() && failed.is_empty() {
+        tracing::info!(
+            "dictionary sync: all {} already match the bundled copy -> {}",
+            targets.len(),
+            dst_dir.display()
+        );
     }
     if !updated.is_empty() {
         tracing::info!(
@@ -1688,9 +1740,16 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
         == std::fs::canonicalize(app_dir.join("data")).unwrap_or_else(|_| app_dir.join("data"));
     // Derived from tauri.conf.json (ONE authority, same as the sync and the fingerprint) — never a
     // hand-kept sixth copy of the file list.
+    //
+    // S110: each name goes in TWICE — `fr.tsv` and `fr.tsv.syncing`. The second spelling is the temp
+    // path `sync_bundled_dictionaries` stages through in this very directory, so carrying a torn
+    // straggler of that name out of the old root lets the two writers collide on one path (full
+    // mechanism in `sync_dir_delta`'s doc). It is NOT a defence-in-depth extra: `fr.tsv.syncing` is
+    // a real file a previous boot can leave behind, and the skip predicate is exact-match.
     let bundled_names: Vec<String> = bundled_dictionary_targets()
         .iter()
         .filter_map(|t| std::path::Path::new(t).file_name().map(|n| n.to_string_lossy().to_string()))
+        .flat_map(|n| [format!("{n}.syncing"), n])
         .collect();
     let mut synced = 0u64;
     let mut freed = 0u64;
@@ -1709,9 +1768,12 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
             crate::training::tproject::RECLAIM_TOUCHING_TRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         // S109: the bundled TSVs are the ONE subtree whose authority is the install, not the old
-        // root — carrying them over would undo the sync `lib.rs` performed a few lines before this
-        // thread was spawned. See `sync_dir_delta`'s doc for the full mechanism. Note this is about
-        // the COPY; the `old_is_default_root` branch below only governs the DELETE.
+        // root — carrying them over would undo the sync `lib.rs` performs five lines AFTER it
+        // spawns this thread (S110 correction: the original wording had that order backwards, which
+        // read as "the fresh bytes are already down" — they may not be. The rule does not depend on
+        // it; see `sync_dir_delta`'s doc for why the version argument is the load-bearing one, and
+        // for the full mechanism). Note this is about the COPY; the `old_is_default_root` branch
+        // below only governs the DELETE.
         let skip_top: &[String] = if name == "dictionaries" { &bundled_names } else { &[] };
         let (c, sync_failed) = sync_dir_delta(
             &sub,
@@ -3050,6 +3112,12 @@ mod tests {
         // real world has, because `fs::copy` preserves mtimes on Windows.
         std::fs::write(old.join("dictionaries").join("fr.tsv"), STALE).unwrap();
         std::fs::write(old.join("dictionaries").join("notes.txt"), "user parked this here").unwrap();
+        // S110 (assertion 5): what a previous boot's TORN dictionary sync leaves in a root — the
+        // cleanup in `sync_bundled_dictionaries` runs on the failure branch only, so a crash between
+        // `fs::copy` and the rename strands exactly this file. It is not covered by skipping
+        // "fr.tsv": the skip predicate is exact-match, and carrying it over lands it on the very
+        // path the sync stages through in the ACTIVE root.
+        std::fs::write(old.join("dictionaries").join("fr.tsv.syncing"), b"torn temp from a previous boot").unwrap();
         std::fs::write(old.join("cache").join("straggler.bin"), b"written after the migration").unwrap();
         std::fs::write(install_dicts.join("fr.tsv"), FRESH).unwrap();
         std::fs::write(active.join("dictionaries").join("fr.tsv"), FRESH).unwrap();
@@ -3085,8 +3153,376 @@ mod tests {
         assert!(processed, "the queue entry was not processed");
         assert!(!old.join("dictionaries").exists(), "old dictionaries subtree kept: {}", old.display());
         assert!(!old.join("cache").exists(), "old cache subtree kept");
+        // 5. S110 — and the old root's TORN STAGING FILE was not carried over either. This is a
+        //    separate failure from 1: `fr.tsv` itself is skipped by name, so 1-3 stay green while
+        //    `fr.tsv.syncing` still arrives — landing on the exact path `sync_bundled_dictionaries`
+        //    stages through (`fr.tsv`.with_extension("tsv.syncing")), i.e. a rename from this thread
+        //    can replace the fresh bytes between that function's copy and its own rename, after
+        //    which it logs "refreshed" over the old content.
+        assert!(
+            !active.join("dictionaries").join("fr.tsv.syncing").exists(),
+            "the old root's torn `fr.tsv.syncing` was carried into the active root — that is the \
+             temp path the bundled sync stages through, so the two writers can collide on one file. \
+             The skip list must name the `.syncing` twin of every bundled TSV, not just the TSV."
+        );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S110 (queue §G14-②) — the BOOT-STEP CONTRACT: steps whose only production call site is
+    /// `lib.rs` setup(), where deleting or backgrounding the call leaves the whole suite green.
+    ///
+    /// ★ WHY A TEXT GATE, stated as a negative result rather than a preference. Three other shapes
+    /// were evaluated first and each one is structurally unable to catch the mutation:
+    ///  · a UNIT TEST of the callee — that is what already exists
+    ///    (`dictionary_sync_refreshes_stale_and_never_destroys`). It proves the function works; the
+    ///    defect is that nothing calls it.
+    ///  · the INTEGRATION chain (`tests/dictionary_distribution.rs`) — it calls
+    ///    `sync_bundled_dictionaries` itself, with literal paths, so it passes with `lib.rs`'s call
+    ///    deleted. Its own header says it drives "the exact call `lib.rs` setup() makes"; it drives
+    ///    an identical call, which is not the same claim.
+    ///  · a RUNTIME "did it run" flag (`OnceLock`, the shape `pyenv::RUNTIME_ROOT` already uses) —
+    ///    it cannot go red anywhere: in the lib binary the sibling unit test at
+    ///    `dictionary_sync_refreshes_stale_and_never_destroys` sets it for the whole process, in the
+    ///    integration binary the test sets it itself, and the real consumers are `#[tauri::command]`
+    ///    fns needing `State<'_, Arc<AppState>>`, which no test target can build (`tauri` is not
+    ///    compiled with its `test` feature here and there are no dev-dependencies). Such a flag is
+    ///    production OBSERVABILITY, not a tripwire — worth having, but it must not be recorded as
+    ///    closing this item. (The cheap half of it did land: `sync_bundled_dictionaries` now logs on
+    ///    every return path, so an installed build's log distinguishes "ran, no-op" from "never ran".)
+    ///
+    /// ⚠ So this reads `src/lib.rs` AS TEXT, the same zero-drift trick as
+    /// `phoneme_input_bound_is_unreachable_from_the_editor` (`commands/inference.rs`, S109) and
+    /// `bundled_dictionary_targets` (tauri.conf.json). Text pins have a real cost — an honest
+    /// refactor can turn them red — so every message below says how to RE-POINT it and why it is not
+    /// safe to simply delete.
+    ///
+    /// The contract, per step, and each clause is a claim `lib.rs` makes about itself somewhere:
+    ///  1. the call EXISTS and is UNIQUE (a second call site would mean two authorities);
+    ///  2. it is a STATEMENT, not an argument or a closure body — catches the brace-less
+    ///     `spawn_blocking(move || sync(..))` shape that keeps brace depth at 1;
+    ///  3. it sits at brace depth 1 inside the setup closure — catches `thread::spawn(move || {…})`,
+    ///     `async_runtime::spawn`, and being buried in a new `if`/`match` arm;
+    ///  4. it carries no `#[cfg(…)]` attribute — otherwise a build profile can silently drop it;
+    ///  5. it runs AFTER the last write to `data_dir` — `lib.rs:1011` resolves the root and the
+    ///     legacy-AppData block can REASSIGN it, so hoisting the call above that block keeps this
+    ///     line byte-identical while the sync starts refreshing a directory nobody reads. That
+    ///     population — an upgrader whose models still live under AppData — is exactly one of the
+    ///     two the sync was written for;
+    ///  6. (dictionary sync only) it runs BEFORE the main window is built: `g2p::set_dict_dir` is a
+    ///     first-call-wins `OnceLock` reached from three `#[tauri::command]`s, and commands cannot be
+    ///     invoked until the window exists;
+    ///  7. its ARGUMENTS still name the same two roots. Deliberately LAST: it is the broadest clause,
+    ///     so putting it earlier would let it swallow failures that belong to 2/3/5 (S108's rule —
+    ///     specific groups first, catch-all last, or the specific ones are never exercised).
+    ///
+    /// ★ THE SCANNER IS SELF-CHECKED BEFORE IT IS TRUSTED (S89: feed a checker a known-correct
+    /// sample first). It asserts the `.setup(` opener line has depth 1 on its own, then walks forward
+    /// to the line where depth returns to 0 and requires that closer to lie beyond every anchor —
+    /// which is also what proves the calls are inside the closure rather than merely after it.
+    ///
+    /// ★ SECOND STEP COVERED ON PURPOSE — `pyenv::init_runtime_root`. The survey behind this gate
+    /// ranked all 20 setup steps by "what breaks if this line disappears"; the dictionary sync was
+    /// not first. `init_runtime_root` fills the `RUNTIME_ROOT` `OnceLock`, and without it
+    /// `list_packs()` returns empty, so every training/converter GPU check answers
+    /// `TRAINING_GPU_PACK_MISSING` — the whole training side goes dark and tells the user to install
+    /// a pack they already have. That consequence is not inferred: the repo already paid for it once
+    /// (`training_device_gate_on_this_machine`: "WITHOUT this the probe LIES … Cost me one wrong
+    /// conclusion — S75"). The remaining untied steps are listed in queue §G14-④ rather than pinned
+    /// here, because each needs its own ordering claim and inventing one is worse than none.
+    ///
+    /// ★ MUTATION-PROBED, one probe per clause, each landing on a DIFFERENT assertion — logs in
+    /// `TESTING\s110_g14_2_callsite\`. See the commit for the table.
+    #[test]
+    fn boot_steps_with_a_single_call_site_stay_wired_into_setup() {
+        // Compile-time coupling: a rename or a signature change fails HERE, as a build error, rather
+        // than as a baffling text mismatch below.
+        let _: fn(&std::path::Path, &std::path::Path) = super::sync_bundled_dictionaries;
+        let _: fn(&std::path::Path) = crate::pyenv::init_runtime_root;
+
+        static LIB_RS: &str = include_str!("../lib.rs");
+        // `trim_end` everywhere: this repo has no .gitattributes and core.autocrlf is on, so a fresh
+        // clone can carry CRLF even though the working tree today is pure LF.
+        let lines: Vec<&str> = LIB_RS.lines().map(str::trim_end).collect();
+        let is_comment = |l: &str| l.trim_start().starts_with("//");
+
+        // Exactly-one-match lookup. A 0-match is the dangerous direction: it would leave this gate
+        // blind rather than satisfied, so it panics with instructions instead of quietly passing.
+        let only = |needle: &str, what: &str| -> usize {
+            let hits: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| !is_comment(l) && l.contains(needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "BOOT CONTRACT — anchor {what} ({needle:?}) matched {} non-comment lines in \
+                 src/lib.rs (1-based: {:?}), expected exactly 1.\n\
+                 0 matches means this gate can no longer SEE its subject, which is worse than no \
+                 gate (S108). Re-point it, do NOT delete it — it is the only thing in the repo that \
+                 notices when one of these boot steps stops being called.\n\
+                 >1 match means there are now two authorities for the same step; decide which one \
+                 owns it before touching this test.",
+                hits.len(),
+                hits.iter().map(|i| i + 1).collect::<Vec<_>>()
+            );
+            hits[0]
+        };
+
+        // Brace depth over [from..=to], skipping string literals and trailing line comments.
+        // (Verified by hand: the span this walks contains no char literals and no raw strings, which
+        // is why a scanner this small is enough. If either appears, this must grow — the self-check
+        // below is what will tell you.)
+        let depth = |from: usize, to: usize| -> i32 {
+            let mut d = 0i32;
+            for l in &lines[from..=to] {
+                let b: Vec<char> = l.chars().collect();
+                let (mut in_s, mut esc) = (false, false);
+                let mut i = 0usize;
+                while i < b.len() {
+                    let c = b[i];
+                    if in_s {
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            in_s = false;
+                        }
+                    } else if c == '"' {
+                        in_s = true;
+                    } else if c == '/' && b.get(i + 1) == Some(&'/') {
+                        break;
+                    } else if c == '{' {
+                        d += 1;
+                    } else if c == '}' {
+                        d -= 1;
+                    }
+                    i += 1;
+                }
+            }
+            d
+        };
+
+        let i_setup = only(".setup(", "the setup() opener");
+        let i_win = only("WebviewWindowBuilder::new", "the main-window builder");
+
+        // ── SELF-CHECK the scanner on answers that are known independently ──────────────────────
+        assert_eq!(
+            depth(i_setup, i_setup),
+            1,
+            "BOOT CONTRACT — scanner self-check failed: the `.setup(` line (src/lib.rs:{}) should \
+             open exactly one block on its own. The brace scanner is reading something it was not \
+             built for (a char literal, a raw string, a macro body). Fix the scanner before \
+             believing anything else this test says.",
+            i_setup + 1
+        );
+        let i_close = (i_setup..lines.len())
+            .find(|&j| depth(i_setup, j) == 0)
+            .unwrap_or_else(|| panic!(
+                "BOOT CONTRACT — the setup() closure opened at src/lib.rs:{} never closes according \
+                 to the brace scanner. Same conclusion as the self-check above: distrust the scanner.",
+                i_setup + 1
+            ));
+        assert!(
+            i_close > i_win,
+            "BOOT CONTRACT — the main-window builder (src/lib.rs:{}) is OUTSIDE the setup() closure \
+             (which closes at src/lib.rs:{}). Clause 6 below compares against it as a landmark \
+             INSIDE setup; that comparison is meaningless now. Re-point the landmark.",
+            i_win + 1,
+            i_close + 1
+        );
+
+        // The last write to `data_dir` — matched by ASSIGNMENT SHAPE, not by what the assigned
+        // expression happens to be, so restructuring the legacy-AppData fallback does not false-red.
+        let i_data_dir_last = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, l)| {
+                let t = l.trim_start();
+                *i > i_setup
+                    && *i < i_close
+                    && !is_comment(l)
+                    && (t.starts_with("data_dir = ") || t.starts_with("let mut data_dir = ") || t.starts_with("let data_dir = "))
+            })
+            .map(|(i, _)| i)
+            .next_back()
+            .expect(
+                "BOOT CONTRACT — no `data_dir` assignment found inside setup() in src/lib.rs. \
+                 Clause 5 (\"the boot steps run after the data root is final\") cannot be evaluated, \
+                 so this gate is blind. Re-point it at whatever now decides the data root.",
+            );
+
+        struct Step {
+            callee: &'static str,
+            what: &'static str,
+            args: &'static [&'static str],
+            before_window: bool,
+            why: &'static str,
+        }
+        let steps = [
+            Step {
+                callee: "commands::settings::sync_bundled_dictionaries(",
+                what: "the bundled-dictionary refresh",
+                args: &["&app_dir_early", "&data_dir"],
+                before_window: true,
+                why: "every machine that migrated its data root stops receiving new dictionaries \
+                      forever, silently — the S83 distribution fault this call was written to close",
+            },
+            Step {
+                callee: "pyenv::init_runtime_root(",
+                what: "the python runtime-root init",
+                args: &["&data_dir"],
+                // Not asserted: its doc claims only \"AFTER the data root is resolved\". Pinning an
+                // ordering the code never promised is how a gate starts lying about its subject.
+                before_window: false,
+                why: "RUNTIME_ROOT stays unset, list_packs() returns empty, and every training / \
+                      converter GPU check answers TRAINING_GPU_PACK_MISSING to a user who has the \
+                      pack installed (see training_device_gate_on_this_machine)",
+            },
+        ];
+
+        for s in &steps {
+            let i = only(s.callee, s.what);
+            let line = lines[i];
+            let t = line.trim_start();
+
+            // (2) STATEMENT, not an argument / closure body.
+            assert!(
+                t.starts_with(s.callee),
+                "BOOT CONTRACT — {} (src/lib.rs:{}) is no longer a statement of its own; the line \
+                 reads `{}`.\nA brace-less closure body such as \
+                 `spawn_blocking(move || {}…))` keeps the brace depth at 1 and would slip past \
+                 clause 3, so this clause is the one that catches it. If the call was merely \
+                 reflowed, keep the callee at the START of its own line.\nWhat breaks if it really \
+                 was backgrounded: {}",
+                s.what, i + 1, t, s.callee, s.why
+            );
+
+            // (3) depth 1 inside setup.
+            let d = depth(i_setup, i);
+            assert_eq!(
+                d, 1,
+                "BOOT CONTRACT — {} (src/lib.rs:{}) sits {d} block(s) deep inside setup(), not 1: \
+                 it was moved into a thread / async block / conditional. It MUST stay a plain \
+                 statement in the setup() body.\nFor the dictionary sync specifically, \
+                 `g2p::set_dict_dir` is a first-call-wins OnceLock and the loaded dictionary is \
+                 `Box::leak`ed for the process lifetime, so a backgrounded refresh races the \
+                 session's first render and can pin a STALE dictionary for the whole session with \
+                 nothing able to invalidate it.\nWhat breaks: {}",
+                s.what, i + 1, s.why
+            );
+
+            // (4) no cfg attribute smuggling it out of a build profile.
+            let prev = lines[..i].iter().rev().find(|l| !l.trim().is_empty() && !is_comment(l));
+            assert!(
+                !prev.map(|l| l.trim_start().starts_with("#[cfg")).unwrap_or(false),
+                "BOOT CONTRACT — {} (src/lib.rs:{}) now carries a `#[cfg(…)]` attribute. Depth and \
+                 order still look right, so nothing else here can see it, yet a build profile can \
+                 drop the step entirely. What breaks in that profile: {}",
+                s.what, i + 1, s.why
+            );
+
+            // (5) after the data root is final.
+            assert!(
+                i > i_data_dir_last,
+                "BOOT CONTRACT — {} (src/lib.rs:{}) runs BEFORE the last write to `data_dir` \
+                 (src/lib.rs:{}). The call text is unchanged, which is exactly why this needs its \
+                 own clause: the step would operate on the pre-fallback root while every later \
+                 consumer reads the one that line selects. The population this silently strands is \
+                 the upgrader whose data still lives under AppData.",
+                s.what, i + 1, i_data_dir_last + 1
+            );
+
+            // (6) before the window can serve commands (dictionary sync only).
+            if s.before_window {
+                assert!(
+                    i < i_win,
+                    "BOOT CONTRACT — {} (src/lib.rs:{}) now runs AFTER the main window is built \
+                     (src/lib.rs:{}). Once the window exists the frontend can invoke \
+                     validate_lyrics / preview_vocal_phonemes / render_vocal_segment, each of which \
+                     calls `g2p::set_dict_dir` — first-call-wins. Whoever wins pins the dictionary \
+                     for the whole session, so the refresh has to be finished before the window is \
+                     constructed.",
+                    s.what, i + 1, i_win + 1
+                );
+            }
+
+            // (7) arguments — LAST, because it is the broadest clause.
+            let joined: String = lines[i..(i + 4).min(lines.len())].join(" ");
+            for a in s.args {
+                assert!(
+                    joined.contains(a),
+                    "BOOT CONTRACT — {} (src/lib.rs:{}) no longer passes `{a}`; the call reads \
+                     `{}`.\nIf it was only reflowed across more than 4 lines, widen the join window \
+                     here. If an argument was CLONED, the call was probably moved into a thread — \
+                     see clause 3. If a different root is passed, the step now targets a directory \
+                     the readers do not read.",
+                    s.what, i + 1, t
+                );
+            }
+        }
+
+        // ── ONE DATA ROOT, THREE READERS (the invariant the call-site clauses do not cover) ─────
+        // `sync_bundled_dictionaries` writes into `data_dir`; the render reads
+        // `state.models.models_dir().parent()`; `dictionary_fingerprint` hashes
+        // `effective_data_root` = `state.cache_dir.parent()`. Those three coincide ONLY because
+        // setup() derives both dirs from the same local — an unenforced claim that the doc on
+        // `effective_data_root` states as fact. `data_root_derivations_agree` pins the reader side;
+        // this pins that lib.rs still feeds it from the root the sync just wrote.
+        for (needle, what) in [
+            ("let cache_dir = data_dir.join(\"cache\");", "the cache dir"),
+            ("let models_dir = data_dir.join(\"models\");", "the models dir"),
+        ] {
+            let i = only(needle, what);
+            assert!(
+                i > i_data_dir_last && i < i_close,
+                "BOOT CONTRACT — {what} (src/lib.rs:{}) is no longer derived from the FINAL \
+                 `data_dir` inside setup(). If it is derived from anything else, the dictionary \
+                 sync writes one root while the render and the bake fingerprint read another, and \
+                 the bake gets stamped with the hash of a directory it did not sing from — the very \
+                 hole `dictionary_fingerprint_for` exists to close.",
+                i + 1
+            );
+        }
+    }
+
+    /// S110 (queue §G14-②) — the READER half of "one data root, three consumers".
+    ///
+    /// `AppState` has no `data_dir` field, so two consumers each re-derive the root by walking UP
+    /// from a dir they were handed: `effective_data_root` takes `cache_dir.parent()`, and the three
+    /// `g2p::set_dict_dir` call sites take `models.models_dir().parent()`. Nothing asserted they
+    /// agree, and nothing constructs `AppState` anywhere in the test suite. If they ever disagree the
+    /// render leaks one dictionary directory while the bake signature carries the hash of another —
+    /// silent, and permanent for the session because `set_dict_dir` is first-call-wins.
+    ///
+    /// Kept deliberately small: it does not test `lib.rs` (the text gate above does that), only that
+    /// GIVEN the layout lib.rs builds, the two derivations land on the same directory.
+    #[test]
+    fn data_root_derivations_agree() {
+        let root = std::env::temp_dir().join(format!("utai_dataroot_{}", std::process::id()));
+        let state = crate::AppState::new(
+            root.join("app"),
+            root.join("cache"),
+            root.join("models"),
+            std::sync::Arc::new(crate::logging::LogBuffer::new(8)),
+        );
+        // The two arms must be able to disagree, or this asserts nothing (S92p).
+        assert_ne!(state.cache_dir, *state.models.models_dir(), "fixture is vacuous");
+        assert_eq!(
+            super::effective_data_root(&state),
+            root.as_path(),
+            "`effective_data_root` (cache_dir.parent) no longer returns the data root — \
+             `dictionary_fingerprint` would hash the wrong directory"
+        );
+        assert_eq!(
+            state.models.models_dir().parent(),
+            Some(root.as_path()),
+            "`models_dir().parent()` no longer returns the data root — the three `set_dict_dir` \
+             call sites in commands/inference.rs would point g2p at the wrong directory"
+        );
     }
 
     /// S109 (queue §H7, first baseline) — the IDENTITY of the dictionaries this build ships.
