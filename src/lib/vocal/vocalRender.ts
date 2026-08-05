@@ -757,24 +757,33 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  indisputable cases BEFORE being used: 20 agree, **0 contradict**, 4 silent, two sources never
  *  disagreeing. German has structurally zero ear adjudication, so this is the first real truth surface
  *  the line has had.
- *  (a) The spelling table was paired on the WRONG SIDE OF THE DEVOICING. German final devoicing means a
- *  lenis obstruent /b d ɡ v z/ cannot end a syllable — de.tsv encodes that exceptionlessly, 0 of its
- *  143252 keys end in one — so ⟨bj⟩ shipped as /p j/ (`objekt`) is the upstream SAYING "coda", while
- *  ⟨bi⟩+V shipped as /b j/ (`bibliothek`) says "onset". s110 paired lenis letters with lenis phones,
- *  which asserted the impossible; four of those six rows were inert and ("d","dj") was actively wrong.
- *  Removed the six, added ("p","bj") and ("t","dj"): 64 word types onset→coda (17 confirmed : 0
- *  refuted) and 19 coda→onset (3 : 0), repairing three of the five harms an audit of s110's own 431
- *  found (37 right : 5 wrong). ⛔ ⟨wj⟩ is deliberately NOT paired with /f/ — `sowjet`'s row is corrupt
- *  on a second segment and no transcription anywhere describes it, so the ruler is SILENT, which is a
- *  coverage fact and not a verdict.
- *  (b) `l j` is ADMITTED, under a spelling license. Bare admission was s110's measured regression
- *  (130 helped : 145 harmed); `de_lj_license_blocks` defaults every /l j/ to the coda and releases one
- *  only when the key spells ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩, so the Romance ⟨ill⟩ side (Me-dail-le, Pa-vil-lon,
- *  bril-lant) never moves at all. 119 word types, **59 confirmed : 0 refuted**; the one named
- *  counterexample, `Wil·liam` [ˈvɪl.jam], is a curated spelling exception.
- *  592 German word types now differ from pre-s110 (313 `n j` · 119 `l j` · 160 the guard), and as in
- *  s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv key — only
- *  which note a consonant lands on changes, which is exactly what a stored bake gets wrong. */
+ *  (a) §C24c — TWO DEVOICED SPELLINGS. German writes the ob-/sub- prefix and a compound-final ⟨d⟩ with
+ *  a lenis LETTER while de.tsv ships a FORTIS phone (`objekt` = `ɔ p j ɛ k t`, `grosswildjagd`), so the
+ *  rows keyed on ⟨pj⟩/⟨tj⟩ never saw them: 64 word types had the /p/ or /t/ dragged into the following
+ *  onset. Added ("p","bj") and ("t","dj") — 17 confirmed : 0 refuted, and independently supported by
+ *  `Ob·jekt`/`Sub·jekt`/`Halb·jahr` and by ob-/sub- morphology.
+ *  ⛔ ⟨wj⟩ is deliberately NOT paired with /f/: every source has `zɔˈvjɛt` with the boundary BEFORE the
+ *  labial, and our `s ɔ f j ɛ t` disagrees with them on two segments at once, so those 19 `sowjet*`
+ *  keys are an upstream defect (§C22/§G10), not something to paper over here.
+ *  ⚠⚠ A THIRD CUT WAS ATTEMPTED, SHIPPED FOR ONE COMMIT, AND REVERTED — recorded because the mistake
+ *  is more useful than the fix. It deleted the six LENIS rows on the argument that a voiced obstruent
+ *  cannot end a German syllable, so a voiced phone before /j/ means onset. Both halves failed: the
+ *  premise is true word-finally (0 of 143252 keys) but false word-internally (`rad` = `ʁ aː t` vs
+ *  `radkappen` = `ʁ aː d kʰ a pʰ ə n`, same morpheme; 60 such keys), and the measurement that
+ *  "confirmed" it was circular — the instrument picks which glide site to read by matching the
+ *  consonant to de.tsv's phone, i.e. the selection key contained the variable under test, turning
+ *  16 external transcriptions writing /t/ into "silence". Voicing-neutralised, the same cut measures
+ *  1 confirmed : 4 refuted. The rows are back.
+ *  (b) §C24b — `l j` is ADMITTED, under a spelling license. Bare admission was s110's measured
+ *  regression (130 helped : 145 harmed); `de_lj_license_blocks` defaults every /l j/ to the coda and
+ *  releases one only when the key spells ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩, so the Romance ⟨ill⟩ side (Me-dail-le,
+ *  Pa-vil-lon, bril-lant) is structurally out of reach rather than merely filtered. 119 word types,
+ *  **59 confirmed : 0 refuted**; the one named counterexample, `Wil·liam` [ˈvɪl.jam], is a curated
+ *  spelling exception.
+ *  611 German WORD TYPES now differ from pre-s110 (`n j` 313 · `l j` 119 · the spelling guard 179),
+ *  and as in s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv
+ *  key — only which note a consonant lands on changes, which is exactly what a stored bake gets
+ *  wrong. */
 export const G2P_ALGO_VERSION = "s111";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a

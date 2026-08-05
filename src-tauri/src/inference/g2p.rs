@@ -718,10 +718,16 @@ impl WordDict {
     /// abstaining is a NO-OP — no seam means the maximal onset decides, which is what would have
     /// happened anyway. Here, abstaining means the SPELLING-BLIND default applies, and since S110
     /// the blind default for `n j` is the onset. So on the override / fragment-merge path a German
-    /// word carrying a literal ⟨j⟩ is cut as though it were ⟨i⟩-derived. Measured on the shipped
-    /// dictionary that path is 592 better : 198 worse versus pre-S110 (the blind default is the
-    /// more often right one, which is exactly what S108's 4:1 said) — but it is a real asymmetry,
-    /// not the same immunity, and the gate's blast-radius arm does not exercise it.
+    /// word carrying a literal ⟨j⟩ is cut as though it were ⟨i⟩-derived, and that is a real
+    /// asymmetry, not the same immunity — the gate's blast-radius arm does not exercise it.
+    /// ⚠ S111 WITHDREW A NUMBER THAT USED TO SIT HERE. S110 wrote "592 better : 198 worse versus
+    /// pre-S110" for this path; neither the population nor the better/worse criterion was recorded
+    /// with it and no re-derivation reproduces it, so it is removed rather than inherited (S102:
+    /// an unreproducible figure in a load-bearing comment is worse than none). What IS reproducible:
+    /// **454** keys have an intervocalic `n j` site, and **737** keys are cut differently on this
+    /// path than they were pre-S110. Which of those 737 the blind default gets RIGHT is exactly the
+    /// question `DE_LITERAL_J_SPELLING` exists to answer with the spelling, so measuring it without
+    /// the spelling would be measuring nothing.
     fn de_literal_j_blocks(&self, word: &str, phones: &[String]) -> Vec<usize> {
         if self.lang != Lang::De || !phones.iter().any(|p| p == "j") {
             return Vec::new();
@@ -778,21 +784,34 @@ impl WordDict {
     /// nothing outside that family may move.
     ///
     /// ★ THE LICENSE is ⟨V⟩ ⟨l⟩ ⟨l⟩? ⟨i⟩ ⟨V⟩ — Mil-li-on, Mil-li-ar-de, Al-li-anz, Au-re-li-us,
-    /// a-li-ens. The leading vowel letter is not decoration: the site being judged is INTERVOCALIC,
-    /// so the license has to be too. Without it `liouville` licensed its word-FINAL /l j/ from the
-    /// word-INITIAL ⟨lio⟩ — a word-level predicate standing in for a positional one where the proxy
-    /// does not hold (S88), and the only word in the dictionary where it showed.
+    /// a-li-ens. Two separate properties are packed into that pattern and they cost different things:
+    ///   · **the leading ⟨V⟩** — the site being judged is INTERVOCALIC, so the license must be too.
+    ///     Its price is 5 keys that carry ⟨li⟩+V behind a CONSONANT letter and are therefore never
+    ///     licensed: `manlius` (Man-li-us, and the only one of the five that is plainly a cost),
+    ///     `bentivoglio`, `cagliari`, `scaglietti` (⟨gl⟩ rows whose upstream transcription is broken
+    ///     anyway — `cʰ ɛ ɪ ŋ ə l j aː ʁ ɪ` has neither the syllable count nor the phones of
+    ///     Cag·li·ari), and `liouville`. The ruler is silent on all five. Fail-closed keeps them.
+    ///   · **the ⟨i⟩ before the second ⟨V⟩** — what actually separates Postillion [pɔstɪˈli̯oːn],
+    ///     licensed, from Pavillon [ˈpavɪljɔŋ], not licensed. That is the whole ⟨lli⟩-vs-⟨ill⟩ split.
+    /// ⚠ `liouville` is the case where the WORD-level predicate stood in for a positional one and
+    /// the proxy failed outright (S88): its ⟨lio⟩ is word-initial and its /l j/ site is word-final.
+    /// It is one word, but it is the one that proves the leading-⟨V⟩ clause is doing positional work
+    /// rather than decoration.
     ///
-    /// ⛔ WHAT THE LICENSE DELIBERATELY DOES NOT REACH, all measured:
+    /// ⛔ WHAT THE LICENSE DELIBERATELY DOES NOT REACH:
     ///   · Romance ⟨ill⟩+non-⟨i⟩ — Me-dail-le, Pa-vil-lon, bril-lant, Bouil-lon, Se-vil-la,
     ///     Ba-tail-lon, Bil-lard, Pa-trouil-le (145 word types). They have no ⟨li⟩+V, so they are
     ///     never licensed and keep today's cut, which is the RIGHT one: **0 confirmed : 15 refuted**
-    ///     if they were flipped (`bʁɪlˈjant`, `bulˈjɔŋ`, `bilˈjaːɐ̯`, `batalˈjoːn`, `ˈpa.vɪlˌjɔŋ`).
-    ///   · Ten keys with a /l j/ from neither spelling (`apollon`, `tastaturlayout`, `wesleyan`,
-    ///     `vallejo`, `milliliter`, `littleton`, `tilak`, `kirilov`, `ollon`, `zelaya`). The ruler is
-    ///     silent on every one, and two of them (Tastatur|Layout, Wesley|an) are real morpheme
-    ///     boundaries — so "flip them and see" would have been 10 unmeasured changes, two of them
-    ///     probably wrong. Fail-closed means they simply never move.
+    ///     if they were flipped (`bʁɪlˈjant`, `bulˈjɔŋ`, `ˈbɪl.jaʁt`, `seˈvɪl.ja`, `ˈpa.vɪlˌjɔŋ`,
+    ///     `…meˌdal.jə`).
+    ///   · **16** keys whose /l j/ comes from neither spelling: `apollon`, `tastaturlayout`,
+    ///     `wesleyan`, `segelyacht`, `segelyachten`, `vallejo`, `milliliter`, `littleton`, `tilak`,
+    ///     `kirilov`, `ollon`, `zelaya`, plus the four consonant-blocked ones above. The ruler is
+    ///     silent on every one, and **three** are real morpheme boundaries (Tastatur|Layout,
+    ///     Wesley|an, Segel|Yacht ×2 — the ⟨y⟩ spelling of the same glide, a population
+    ///     `DE_LITERAL_J_SPELLING` cannot see either). So "flip them and see" would have been 16
+    ///     unmeasured changes with at least three known-wrong. Fail-closed means they never move.
+    ///     ⚠ `segelyacht(en)` additionally has its own §C3 strict seam, so it is doubly held.
     ///   · Literal ⟨lj⟩ (`aufholjagd`, `fiskaljahr`, `balljunge`, `alljährlich`, `ilja`, 57 keys).
     ///     They carry no ⟨li⟩+V license, so the DEFAULT here already holds every one of them —
     ///     which means `DE_LITERAL_J_SPELLING`'s ("l","lj") row, written by S110 in the expectation
@@ -801,11 +820,14 @@ impl WordDict {
     ///     says so; the prediction was wrong in a harmless direction and is recorded rather than
     ///     quietly inherited.
     ///
-    /// ⚠ THE OVERRIDE PATH IS A STRICT NO-OP. `phoneme_input`, a merged fragment or a composed rung
-    /// arrives with phones the letters do not describe, so there is no license to read — and because
-    /// "no license" means "block", such a word is cut exactly as it was before S111. Not a ratio, an
-    /// identity. (`de_literal_j_blocks` cannot say that; its abstention falls through to a default
-    /// that S110 changed, which its own doc records.)
+    /// ⚠ THE OVERRIDE PATH REPRODUCES THE PRE-S111 CUT, with one stated exception. `phoneme_input`,
+    /// a merged fragment or a composed rung arrives with phones the letters do not describe, so
+    /// there is no license to read — and because "no license" means "block", the /j/ keeps the
+    /// boundary in front of it, which is where pre-S111's maximal onset put it. The exception is
+    /// `V p l j V`: `p l j` is itself in `DE_ONSET_KEEP`, so pre-S111 took all three phones as the
+    /// onset while this blocks back to `… p l | j …`. Measured on the shipped dictionary the only
+    /// key containing `p l j` is `plejaden`, where it is WORD-INITIAL and therefore not a site, so
+    /// nothing in the dictionary reaches it — only a hand-typed override could.
     fn de_lj_license_blocks(&self, word: &str, phones: &[String]) -> Vec<usize> {
         if self.lang != Lang::De || !phones.iter().any(|p| p == "j") {
             return Vec::new();
@@ -819,6 +841,13 @@ impl WordDict {
         if sites.is_empty() {
             return Vec::new();
         }
+        // ⚠ `>= sites.len()` is a COUNT test standing in for a positional one, exactly like
+        //   `de_literal_j_blocks`'s — but unlike that one it has no ABSTAIN branch, because it does
+        //   not need one YET: measured on the shipped dictionary the /l j/-site histogram is
+        //   {0: 142908, 1: 344}, i.e. **no key has two**, so `>=` and "aligned" cannot differ.
+        //   `s110_de_literal_j_gate` group (5) asserts that histogram. The day a key has two sites,
+        //   this needs the same three-way (all / none / abstain) treatment its twin already has —
+        //   do not just let the count win.
         let licensed = lookup_candidates(word)
             .into_iter()
             .find(|k| self.map.contains_key(k))
@@ -1157,13 +1186,13 @@ const DE_ONSET_KEEP: &[&str] = &[
 ///   · an ⟨i⟩ before a vowel becomes a glide INSIDE one morpheme — Mil-li-on, Re-gi-on, ⟨-linie⟩,
 ///     ⟨-ius⟩. The consonant belongs with the glide, so `C j` is an onset;
 ///   · a literal ⟨j⟩ is, in German, morpheme-initial — Schul|jahr, acht|jährig, Ausbildungs|jahr,
-///     kon|junktur, in|jektion — plus most borrowed names that keep their own syllable break
-///     (Kat|ja, An|ja, Ban|jo [ˈban.jo], Skop|je). The consonant closes the syllable before it, so
-///     `C j` must NOT be an onset there.
-///     ⚠ S111 CORRECTED TWO EXAMPLES THIS LINE USED TO CARRY. `ad|jektiv` is NOT one of them — see
-///     the devoicing section below — and `Reyk|javik` is measured the other way (`ˈʁɛɪ̯.kja.vɪk`),
-///     so it lives in `DE_CJ_ONSET_KEYS`. Citing a word as an example of a rule it violates is how
-///     the ⟨dj⟩ family stayed wrong for a round.
+///     ad|jektiv (`Ad·jek·tiv`, and `Ad·junkt` = `ˌatˈjʊnkt` in both wiktionaries), kon|junktur,
+///     in|jektion — plus most borrowed names that keep their own syllable break (Kat|ja, An|ja,
+///     Ban|jo [ˈban.jo], Skop|je, Tat|jana [tatˈjaːna]). The consonant closes the syllable before
+///     it, so `C j` must NOT be an onset there.
+///     ⚠ S111 corrected ONE example this line used to carry: `Reyk|javik` measures the other way
+///     (`ˈʁɛɪ̯.kja.vɪk`), so it lives in `DE_CJ_ONSET_KEYS`. Citing a word as an example of a rule
+///     it violates is how a wrong family survives a round.
 /// The glide clause of `DE_ONSET_KEEP` treated the two identically, which is why S108 could only see
 /// a 4:1 trade-off on `n j`/`l j` instead of two separable populations.
 ///
@@ -1175,43 +1204,54 @@ const DE_ONSET_KEEP: &[&str] = &[
 /// cut: a named cost" — this is that cost, paid), `achtjähriger` = `a x | t j eː | …`, `ganzjährig`,
 /// `adjektiv`, `dasjenige`, `elfjährig`, `fallschirmjägern`, `verjüngung`.
 ///
-/// ★★ S111 — THIS TABLE WAS PAIRED ON THE WRONG SIDE OF THE DEVOICING, and the dictionary itself
-/// says so. German has final devoicing (Auslautverhärtung): a lenis obstruent /b d ɡ v z/ CANNOT
-/// stand at the end of a syllable. de.tsv encodes that exceptionlessly — **0 of its 143252 keys end
-/// in one** — so the voicing of the consonant before a /j/ is not decoration, it is the upstream
-/// transcriber's own statement about where the syllable ends:
-///   · ⟨bj⟩ shipped as **/p j/** (`objekt` = `ɔ p j ɛ k t`, 54 keys) — devoiced ⇒ the /p/ closed a
-///     syllable ⇒ CODA. Meanwhile ⟨bi⟩+V ships as **/b j/** (`bibliothek`, 34 keys) — voiced ⇒ onset.
-///     Same upstream, same environment, two voicings: that contrast IS the boundary.
-///   · The old rows paired lenis phones with lenis letters — ("d","dj"), ("b","bj"), ("ɡ","gj"),
-///     ("v","wj"/"vj"), ("z","sj") — i.e. they asserted that a lenis obstruent can be a coda. Four
-///     of the six never fired at all; ("d","dj") fired on 18 keys and ("v","wj") on one.
-/// ⇒ Removed those six, added the DEVOICED pairs ("p","bj") and ("t","dj").
+/// ★ S111 §C24c — TWO DEVOICED SPELLINGS ADDED: ("p","bj") and ("t","dj"). German writes the
+/// ob-/sub- prefix and the compound-final ⟨d⟩ with a lenis LETTER while this dictionary ships a
+/// FORTIS phone (`objekt` = `ɔ p j ɛ k t`; `grosswildjagd` = `… v ɪ l t j aː k t`), so the
+/// letter-pair rows keyed on ⟨pj⟩/⟨tj⟩ never saw them and 64 word types were cut with the /p/ or
+/// /t/ dragged into the following onset.
+/// ★ THE EVIDENCE, and note what it deliberately does NOT rest on:
+///   · Worttrennung, which is decisive for a morpheme boundary even though it is useless for
+///     syllable COUNT: `Ob·jekt`, `Sub·jekt`, `Halb·jahr`, `Ad·jek·tiv`;
+///   · ob-/sub-/…-jagd are morpheme boundaries by inspection, not by transcription;
+///   · de.wiktionary `ɔpˈjɛkt`, `ˈkʊnstʔɔpˌjɛktə`, `ˈɡʁoːsvɪltˌjaːkt`, `ˈɪʁɡn̩tˌjeːmant` — the stress
+///     mark sits between the consonant and the /j/. ⚠ These are safe to cite because the source and
+///     this dictionary AGREE on the voicing at that site, so no filter is choosing between variants.
+///   · 64 word types move, **17 confirmed : 0 refuted** on the S111 wiktionary instrument.
 ///
-/// ★ MEASURED, both directions, against an external instrument built for this in S111 (de.wiktionary
-/// + en.wiktionary IPA; stress/syllable-dot position and the ⟨i̯⟩-vs-⟨j⟩ notation. It was validated
-/// against a pre-registered control group of indisputable cases FIRST — 20 agree / **0 contradict** /
-/// 4 silent, two sources never disagreeing — see `TESTING\s111_c24bc_ruler\`):
-///   · adding ("p","bj") + ("t","dj"): 64 word types move onset→coda, **17 confirmed : 0 refuted**
-///     (`ɔpˈjɛkt`, `ˈkʊnstʔɔpˌjɛktə`, `ˈɡʁoːsvɪltˌjaːkt`, `ˈɪʁɡn̩tˌjeːmant`);
-///   · dropping the six lenis rows: 19 word types move coda→onset, **3 confirmed : 0 refuted**
-///     (`ˈa.djɛkˌtiːf`, `a.djuˈtant`, `ˈna.dja`) — and those three were harms this table INFLICTED in
-///     S110, found by re-auditing S110's own 431-word blast radius with the new instrument
-///     (37 right : 5 wrong; three of the five were these, and `murawjow` — one of S110's named
-///     Slavic costs — is the ("v","wj") one, also repaid here).
-/// ★ THE SAME LETTER PAIR SPLITS BY VOICING AND THE RULER FOLLOWS IT, 4/4: ⟨dj⟩ → /t j/ is
-/// `grosswildjagd`/`irgendjemand` (ruler: CODA) while ⟨dj⟩ → /d j/ is `adjektiv`/`adjutant`/`nadja`
-/// (ruler: ONSET). An internal signal predicting an external verdict in both directions is the
-/// strongest thing this line has; de has structurally zero ear adjudication (queue "判据能力").
+/// ⚠⚠⚠ AND HERE IS THE ONE THAT ALMOST SHIPPED — read it before touching the lenis rows above.
+/// S111 first ALSO deleted the six lenis-obstruent rows (("d","dj"), ("b","bj"), ("ɡ","gj"),
+/// ("v","wj"/"vj"), ("z","sj")), arguing: German final devoicing means /b d ɡ v z/ cannot end a
+/// syllable, so a VOICED phone before a /j/ must be the dictionary saying "onset". An adversarial
+/// review killed it, and it was wrong twice over:
+///   1. **The premise is false in the environment it was applied to.** de.tsv devoices without
+///      exception WORD-finally (0 of 143252 keys end in a lenis obstruent — group (7) still pins
+///      that), but NOT word-internally: `rad` = `ʁ aː t` while `radkappen` = `ʁ aː **d** kʰ a pʰ ə n`
+///      — the same morpheme, before a voiceless stop. Also `radkasten`, `fahrradkette`,
+///      `schandfleck`, `zugtoilette`. (And it goes the other way too: `tagblatt` = `tʰ aː k b l a t`,
+///      `liebhaber` = `l iː p h aː b ɐ`.) Word-internal voicing in this dictionary is simply
+///      INCONSISTENT, so `a d j ɛ k tʰ iː f`'s /d/ is an upstream failure to devoice at a morpheme
+///      boundary — the same disease as `sowjet` below, in the opposite direction — not a statement
+///      about syllabification.
+///   2. **The measurement that "confirmed" it was circular.** The instrument picks which glide site
+///      in a transcription to read by MATCHING THE CONSONANT to this dictionary's phone — and the
+///      hypothesis under test was that this phone's voicing decides the answer. Selection variable =
+///      tested variable, so on exactly the words where the sources disagree with us about voicing,
+///      counter-evidence became "silence". The ⟨dj⟩+/d/ words have **16 external transcriptions
+///      writing /t/ against 3 writing /d/**; the filter saw only the 3. `Adjunkt` is the sharpest
+///      case: both wiktionaries write `ˌatˈjʊnkt`, the stress mark landing squarely between the
+///      /t/ and the /j/ — the instrument's own primary signal saying CODA — and it was recorded as
+///      "silent". With the filter made voicing-neutral the same cut re-measures **1 confirmed :
+///      4 refuted**. The six rows are back.
+/// ⇒ **Never use the voicing of a word-internal obstruent as evidence about syllable position in
+/// this dictionary, and never let the site-selection key contain the variable under test.**
 ///
-/// ⛔ ⟨wj⟩ IS DELIBERATELY NOT PAIRED WITH /f/, and this is a measured abstention, not an oversight.
-/// It would move the 19 `sowjet*` keys to coda. The internal signal says coda (⟨w⟩ shipped as /f/),
-/// but the row is corrupt on a SECOND segment — de.tsv has `s ɔ f j ɛ t` where both wiktionaries
-/// have `zɔˈvjɛt` (word-initial ⟨S⟩ before a vowel is /z/ in German, and `sonne` = `z ɔ n ə` in this
-/// very dictionary) — so its /f/ cannot be trusted as an analysis. And the external ruler is
-/// STRUCTURALLY SILENT here: no transcription anywhere carries our phone string, so it cannot rule
-/// on it. That is a coverage fact, not a verdict (queue §C24c's three-way rule). The row belongs in
-/// the upstream bucket (§C22/§G10), not here.
+/// ⛔ ⟨wj⟩ IS DELIBERATELY NOT PAIRED WITH /f/. It would move the 19 `sowjet*` keys to coda, and
+/// every source says the opposite: de.wiktionary `zɔˈvjɛt` and en.wiktionary `ˈzɔ.vjɛt` both put the
+/// boundary BEFORE the labial. Our row `s ɔ f j ɛ t` disagrees with them on two segments at once
+/// (word-initial ⟨S⟩ before a vowel is /z/ in German — this very dictionary has `sonne` = `z ɔ n ə`),
+/// so it is an upstream defect, and it belongs in the §C22/§G10 bucket rather than being papered
+/// over here. ⚠ An earlier version of this note claimed the ruler was "structurally silent" on
+/// `sowjet`; that was the same filter artifact — asked neutrally it answers, and it answers ONSET.
 /// ⛔ ⟨cj⟩ (`lucjan`) and ⟨xj⟩ (`växjö`) are one key each with no evidence either way — adding them
 /// would be inventing coverage, which is the same reason the aspirated phones are absent below.
 ///
@@ -1233,15 +1273,18 @@ const DE_ONSET_KEEP: &[&str] = &[
 ///     §C3 compound seam. So the honest trade is **5 for 5**, and the tie-breaker is that the ⟨fj⟩
 ///     five are foreign place names while the five ⟨jahr⟩ compounds are ordinary German.
 ///   · ⟨skj⟩ — **1**: `nordenskjöld`, already cut wrong either way (`s k j` is not an onset).
-///   · ★ **the transliterated Slavic/other ⟨Cj⟩ names** (`premjer`, `grigorjew`, `winnyzja`,
-///     `artjom`, `katjuscha`, `semjon(ow)`, `tretjakow`, `syrdarja`, `prypjat`, `demjanjuk`,
-///     `kirjat`, `midtjylland`, `fridtjof`, `otjimbingwe`, …). The doc once booked four as costs and
-///     ~21 as fixes with no stated criterion; they are one class and all of it was recorded as a cost.
-///     ⚠ S111 UPDATE — **it is no longer true that there is no instrument**, and four of them have
-///     been repaid: `murawjow` and `nadja` by the devoicing correction above, `orjol` and
-///     `reykjavik` by `DE_CJ_ONSET_KEYS`. What remains true is that the instrument is SILENT or has
-///     no page for the rest, so the rest is still a cost — and the family does not vote as a bloc
-///     (`tatjana`/`banjo` measure CODA), so it can only ever be paid one name at a time.
+///   · ★ **the transliterated Slavic/other ⟨Cj⟩ names** (`murawjow`, `premjer`, `grigorjew`,
+///     `winnyzja`, `artjom`, `fedja`, `nadja`, `katjuscha`, `semjon(ow)`, `tretjakow`, `syrdarja`,
+///     `prypjat`, `demjanjuk`, `kirjat`, `midtjylland`, `fridtjof`, `otjimbingwe`, …). The doc once
+///     booked four as costs and ~21 as fixes with no stated criterion; they are one class and all of
+///     it is recorded as a cost.
+///     ⚠ S111 UPDATE — **there is an instrument now**, and it changes the shape of this entry
+///     without emptying it. Two members were measured and moved out into `DE_CJ_ONSET_KEYS`
+///     (`orjol`, `reykjavik`). The rest stays a cost, and the family does NOT vote as a bloc:
+///     `tatjana` = `tatˈjaːna`, `banjo` = `ˈban.jo` and `nadja` = `ˈnat.ja` all measure CODA — i.e.
+///     the guard is RIGHT about most of them. It can only ever be paid one name at a time, and
+///     ⚠ S111 tried to pay a batch of them with a rule (a voicing argument) and had to take it back:
+///     see the ⚠⚠⚠ block above.
 ///
 /// ⚠ TWO POPULATIONS THIS TABLE CANNOT SEE, both named after the review found them:
 ///   · **⟨Cy⟩ — the same glide written with ⟨y⟩** (23 word types). `anja` and `anya` are BYTE-
@@ -1260,14 +1303,20 @@ const DE_ONSET_KEEP: &[&str] = &[
 /// spellings do NOT occur before a /j/ in the shipped dictionary (`s110_de_literal_j_gate` pins the
 /// whole pre-/j/ consonant inventory), so listing them here would be inventing coverage.
 const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
-    // Sonorants and fortis obstruents — the letter and the phone say the same thing.
     ("n", "nj"), ("m", "mj"), ("ʁ", "rj"),
-    ("s", "sj"), ("ts", "zj"), ("t", "tj"), ("p", "pj"), ("k", "kj"), ("f", "fj"),
-    // …and the DEVOICED spellings (S111): the letter is lenis, the phone this dictionary ships is
-    // fortis, and that devoicing only happens syllable-finally. ⟨bj⟩ → /p j/ is the ob|jekt /
-    // sub|jekt / …halb|jahr family (54 keys); ⟨dj⟩ → /t j/ is grosswild|jagd / irgend|jemand (10).
-    // ⛔ Their lenis twins are NOT here and must not be re-added: a voiced /b d ɡ v z/ before the
-    //    /j/ is the dictionary saying "this one is an onset" (`a d j ɛ k tʰ iː f`, `n a d j aː`).
+    ("s", "sj"), ("z", "sj"), ("ts", "zj"),
+    ("t", "tj"), ("d", "dj"), ("p", "pj"), ("b", "bj"), ("k", "kj"), ("ɡ", "gj"), ("f", "fj"),
+    // ⟨w⟩ is /v/ in German; ⟨v⟩ only in loans (`vjosa`). Both spellings, one phone.
+    ("v", "wj"), ("v", "vj"),
+    // …and the DEVOICED spellings (S111 §C24c). The letter is lenis, the phone this dictionary
+    // ships is fortis: ⟨bj⟩ → /p j/ is the ob|jekt / sub|jekt / …halb|jahr family, ⟨dj⟩ → /t j/ is
+    // grosswild|jagd / irgend|jemand. They sit BESIDE their lenis twins, not instead of them —
+    // the two rows route by PHONE, so `objekt` (/p/) and a hypothetical /b j/ spelling both land on
+    // the coda, which is what the literal ⟨j⟩ means either way.
+    // ⛔ DO NOT read the fortis rows as "the devoicing proves it is a coda" — see the ⚠⚠ block in
+    //    this table's doc. That inference was tried in S111, shipped for one commit, and measured
+    //    NET NEGATIVE by the adversarial review. These two rows survive on completely different
+    //    evidence (Trennung + ob-/sub- morphology + a stress mark that needs no voicing agreement).
     ("p", "bj"), ("t", "dj"),
     // ⚠ STILL INERT AFTER S111, and for a DIFFERENT REASON than before — this correction is the
     //   point of the note. S110 added the row while `l j` was not a keep-list member (the maximal
@@ -1313,16 +1362,22 @@ const DE_CJ_ONSET_KEYS: &[&str] = &["orjol", "reykjavik"];
 /// ⚠ A SPELLING FRAGMENT, not a key list, and the difference is deliberate: it covers `william`,
 /// `williams`, `williamsburg`, `williamson`, `williamstown` and `fitzwilliam` — six keys today, all
 /// one name, and a regeneration that adds `williamsport` gets the same treatment instead of
-/// silently flipping. `s110_de_literal_j_gate` pins which keys it currently reaches, so the set
-/// growing is visible rather than automatic.
+/// silently flipping. `s110_de_literal_j_gate` group (5) asserts the EXACT key list it reaches, so
+/// the set growing (or shrinking) is visible rather than automatic — the fragment is convenient,
+/// not unsupervised.
 /// ⚠ Only `william` itself has a transcription; the other five ride on being the same name. That is
 /// a family inference and it is stated, not hidden — but it moves them in the direction of NOT
 /// changing, so a wrong inference here costs nothing that today does not already cost.
 const DE_LJ_CODA_SPELLINGS: &[&str] = &["willia"];
 
 /// The ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩ occurrences in a key — see `de_lj_license_blocks` for why the leading vowel
-/// letter is required. Non-overlapping, because the phone sites it is counted against cannot
-/// overlap either.
+/// letter is required.
+/// ⚠ OVERLAPPING at the shared vowel, deliberately: after a hit the scan resumes at the trailing
+/// ⟨V⟩ (`i = j + 1`), so a hypothetical ⟨…alialia…⟩ counts 2 rather than 1. That matches what it is
+/// compared against — `nuclei.windows(2)` pairs, which also share their boundary nucleus. (An
+/// earlier version of this line claimed "non-overlapping"; the Python cross-check in
+/// `TESTING\s111_c24bc_ruler\` uses a genuinely non-overlapping `findall`, and the two agree today
+/// only because no de.tsv key has two /l j/ sites at all.)
 fn de_lj_license_count(key: &str) -> usize {
     const V: &str = "aeiouyäöüáàâéèêíìîóòôúùû";
     let ch: Vec<char> = key.chars().collect();
@@ -6635,15 +6690,19 @@ mod tests {
             ("schuljahr", vec![3]),          // Schul|jahr
             ("million", vec![]),             // ⟨lli⟩ + vowel: an ⟨i⟩-derived glide, nothing to block
             ("richtlinie", vec![]),          // ⟨-linie⟩, likewise
-            // ★★ S111 — THE VOICING SPLIT, pinned from BOTH sides. The same letter pair ⟨dj⟩ ships
-            //    two ways and they want opposite cuts; one of these four goes red whichever
-            //    direction a future edit drags the table.
-            ("objekt", vec![2]),             // ⟨bj⟩ → /p j/ DEVOICED ⇒ coda (`ɔpˈjɛkt`)
-            ("irgendjemand", vec![5]),       // ⟨dj⟩ → /t j/ DEVOICED ⇒ coda (`ˈɪʁɡn̩tˌjeːmant`)
-            ("adjektiv", vec![]),            // ⟨dj⟩ → /d j/ VOICED ⇒ onset (`ˈa.djɛkˌtiːf`)
-            ("nadja", vec![]),               // ⟨dj⟩ → /d j/ VOICED ⇒ onset (`ˈna.dja`)
-            // …and the control for the pair above: a /b j/ with no literal ⟨bj⟩ in the key at all.
-            // If ("b","bj") ever comes back this still passes, so it is a control, not the test.
+            // ★★ S111 §C24c — the DEVOICED spellings, and their lenis twins, all blocked. The two
+            //    rows route by phone and must not fight: whichever way ⟨dj⟩ is written, a literal
+            //    ⟨j⟩ is a morpheme boundary.
+            ("objekt", vec![2]),             // ⟨bj⟩ → /p j/  (`ɔpˈjɛkt`, `Ob·jekt`)
+            ("irgendjemand", vec![5]),       // ⟨dj⟩ → /t j/  (`ˈɪʁɡn̩tˌjeːmant`)
+            ("adjektiv", vec![2]),           // ⟨dj⟩ → /d j/  (`Ad·jek·tiv`; de.wikt writes `ˈatjɛktiːf`)
+            ("adjunkt", vec![2]),            // ⟨dj⟩ → /d j/  ★ both wiktionaries: `ˌatˈjʊnkt` — the
+                                             //   stress mark lands BETWEEN the /t/ and the /j/, so
+                                             //   this one needs no voicing agreement at all. It is
+                                             //   the word that refuted S111's first attempt.
+            ("nadja", vec![3]),              // ⟨dj⟩ → /d j/  (`ˈnat.ja`, `Nad·ja`)
+            // …and the control: a /b j/ with NO literal ⟨bj⟩ in the key at all must stay unblocked,
+            // or the rows above are passing for the wrong reason.
             ("bibliothek", vec![]),
             // the two curated onset keys — `DE_CJ_ONSET_KEYS` must actually reach the predicate
             ("orjol", vec![]),               // `ɔˈʁjoːl` — stress BEFORE the /ʁ/
@@ -6735,7 +6794,13 @@ mod tests {
             ("bataillon", "b aː | tʰ aj | l ɔ ŋ", "CONTROL: no /l j/ site in the shipped row"),
             ("william", "v ɪ l | j a m", "⛔ DE_LJ_CODA_SPELLINGS — ⟨illi⟩+V but [ˈvɪl.jam] wants coda"),
             ("tastaturlayout", "tʰ a s | t a | tʰ uː | ɐ l | j uː t", "Tastatur|Layout — no license, UNMOVED"),
-            ("aufholjagd", "aw f | h oː l | j aː k t", "literal ⟨lj⟩ — the ('l','lj') row, live since S111"),
+            // ⚠ ATTRIBUTION, corrected: this word is held by `de_lj_license_blocks`' fail-closed
+            //   DEFAULT (no ⟨li⟩+V license), NOT by the ("l","lj") row — that row measures inert
+            //   (deleting it changes 0 keys) and is itself pinned by group (1)'s `schuljahr` entry.
+            //   The first version of this string said "live since S111", contradicting the row's own
+            //   note four hundred lines up. A pin whose REASON is wrong still passes, which is why
+            //   the reason has to be checked as carefully as the value.
+            ("aufholjagd", "aw f | h oː l | j aː k t", "literal ⟨lj⟩ — held by the LICENSE default"),
             ("liouville", "l iː | ʊ | v ə l | j ə", "the leading-vowel clause: word-INITIAL ⟨lio⟩ licenses nothing"),
             // literal ⟨j⟩, German compounds — the 116 the guard fixes
             ("ausbildungsjahr", "aw s | b ɪ l | d ʊ ŋ s | j aː | ɐ", "Fugen-s: S105 named this cost, this pays it"),
@@ -6743,21 +6808,22 @@ mod tests {
             ("ganzjährig", "ɡ a n ts | j eː | ʁ ɪ ç", "ganz|jährig — S108's `t s j` had pulled BOTH phones over"),
             ("dasjenige", "d aː s | j eː | n ɪ | ɡ ə", "das|jenige"),
             ("verjüngung", "f ɛ ʁ | j ʏ ŋ | ʊ ŋ", "ver|jüngung"),
-            // ★★ S111 — THE DEVOICING PAIRS. Letter lenis + phone fortis ⇒ the upstream itself put a
-            // syllable end there, and both wiktionaries agree. Their VOICED twins are three lines
-            // down and cut the other way; that contrast is the whole argument.
-            ("objekt", "ɔ p | j ɛ k t", "⟨bj⟩→/p j/ · `ɔpˈjɛkt`"),
+            // ★★ S111 §C24c — THE DEVOICED SPELLINGS. Letter lenis + phone fortis; the letter-pair
+            // rows keyed on ⟨pj⟩/⟨tj⟩ could not see them and 64 word types were mis-cut.
+            ("objekt", "ɔ p | j ɛ k t", "⟨bj⟩→/p j/ · `ɔpˈjɛkt` · `Ob·jekt`"),
             ("subjekt", "z ʊ p | j ɛ k t", "⟨bj⟩→/p j/ · same family, 54 word types"),
             ("objektiv", "ɔ p | j ɛ k | tʰ iː f", "⟨bj⟩→/p j/"),
             ("irgendjemand", "ɪ ʁ | ɡ n̩ t | j eː | m a n t", "⟨dj⟩→/t j/ · `ˈɪʁɡn̩tˌjeːmant`"),
             ("grosswildjagd", "ɡ ʁ oː s | v ɪ l t | j aː k t", "⟨dj⟩→/t j/ · `ˈɡʁoːsvɪltˌjaːkt`"),
             ("halbjahr", "h a l p | j aː | ɐ", "⟨bj⟩→/p j/; the §C3 seam ALSO holds it — two agreeing"),
-            // ★★ …and the VOICED twins, which S110's table cut the other way and S111 repays.
-            // A lenis obstruent cannot end a German syllable (0 of 143252 keys end in one), so the
-            // dictionary writing /d/ here IS the statement that it is an onset.
-            ("adjektiv", "a | d j ɛ k | tʰ iː f", "⟨dj⟩→/d j/ VOICED · `ˈa.djɛkˌtiːf` — S110 had this wrong"),
-            ("adjutant", "a | d j uː | tʰ a n t", "⟨dj⟩→/d j/ VOICED · `a.djuˈtant`"),
-            ("nadja", "n a | d j aː", "⟨dj⟩→/d j/ VOICED · `ˈna.dja`"),
+            // ★★ …and their LENIS twins, which stay blocked too. S111 briefly deleted these rows on
+            // the theory that a voiced obstruent cannot be a coda; the review measured that at
+            // 1 confirmed : 4 refuted and it was reverted. These three pins are what it costs to
+            // get that wrong, so they are worth having.
+            ("adjektiv", "a d | j ɛ k | tʰ iː f", "⟨dj⟩→/d j/ · `Ad·jek·tiv`; de.wikt writes `ˈatjɛktiːf`"),
+            ("adjunkt", "a d | j ʊ ŋ k t", "★ `ˌatˈjʊnkt` in BOTH sources — stress lands between /t/ and /j/"),
+            ("adjutant", "a d | j uː | tʰ a n t", "⟨dj⟩→/d j/ · `at.juˈtant` · `Ad·ju·tant`"),
+            ("nadja", "n a d | j aː", "⟨dj⟩→/d j/ · `ˈnat.ja` · `Nad·ja`"),
             // ★ the two curated exceptions, and one control each showing their rows still fire
             ("orjol", "ɔ | ʁ j oː l", "DE_CJ_ONSET_KEYS · `ɔˈʁjoːl`"),
             ("reykjavik", "ʁ ɛ | ɪ | k j a | v ɪ k", "DE_CJ_ONSET_KEYS · `ˈʁɛɪ̯.kja.vɪk`"),
@@ -6779,8 +6845,10 @@ mod tests {
             ("produktionsjahr", "p ʁ ɔ | d ʊ k | t s j ɔ n s | j aː | ɐ", "guard abstains; §C3's seam still binds"),
             // ⛔ NAMED COSTS — wrong, measured, and recorded so they are not rediscovered as bugs
             ("oslofjord", "ɔ s | l ɔ f | j ɔ ʁ t", "COST: ⟨fj⟩ is a real German onset (Fjord); 6 word types"),
-            // ★ S111 repaid this one: the ("v","wj") row asserted a VOICED /v/ could close a syllable.
-            ("murawjow", "m ʊ | ʁ a | v j ɔ f", "was a named COST; the devoicing rule repays it"),
+            // ⛔ STILL A COST. S111 briefly moved this to `m ʊ | ʁ a | v j ɔ f` on the voicing
+            //    argument; the argument fell and it came back. It has no page in either source, so
+            //    "silence ≠ support" applies in BOTH directions — it keeps S110's cut, unmeasured.
+            ("murawjow", "m ʊ | ʁ a v | j ɔ f", "COST: Russian palatalised ⟨wj⟩ — no instrument, unmeasured"),
             // ⛔ STILL A COST, and pinned so it stays visible: `s ɔ f j ɛ t` is corrupt on TWO
             //    segments (both wiktionaries have `zɔˈvjɛt`), so the ruler has nothing that describes
             //    our phones and ⟨wj⟩ is deliberately NOT paired with /f/. 19 word types.
@@ -6871,22 +6939,63 @@ mod tests {
         let uncovered: Vec<&str> = before_j.difference(&covered).copied().collect();
         assert_eq!(
             uncovered,
-            // Not in the table, and there are now TWO different reasons — S111 added the second and
-            // it must not be conflated with the first, because only the first is about onsets:
-            //  · `ŋ ç x h ʃ` + the doubled glide `j` — never a legal onset with /j/ (`ŋ` cannot open
-            //    a German syllable at all; the rest have no `C j` entry in DE_ONSET_KEEP), so the
-            //    maximal onset already starts at the /j/ and a guard would be a no-op;
-            //  · `b d ɡ v z` — LENIS OBSTRUENTS. These ARE legal onsets with /j/, so the first
-            //    reason does not apply. They are absent because a lenis obstruent cannot END a
-            //    German syllable, which makes "block it into the coda" the one thing that is
-            //    certainly wrong. Their devoiced twins /p t k f s/ carry the ⟨bj⟩/⟨dj⟩ spellings.
-            //    ⛔ Do not "restore" them for symmetry — that is exactly what S110 shipped.
-            vec!["b", "d", "h", "j", "v", "x", "z", "ç", "ŋ", "ɡ", "ʃ"],
+            // Not in the table, and none of them needs to be: `ŋ` cannot open a German syllable at
+            // all (`single_onset_forbidden`), and `ç x h ʃ` have no `C j` entry in DE_ONSET_KEEP, so
+            // the maximal onset already starts at the /j/. `j j` is a doubled glide, same.
+            // ⚠ S111 briefly added `b d ɡ v z` to this list on the argument that a lenis obstruent
+            //   cannot be a coda and therefore needs no guard. That argument was measured down (see
+            //   the ⚠⚠⚠ block above `DE_LITERAL_J_SPELLING`) and the rows are back, so this list is
+            //   back to its S110 contents. Anyone re-deriving it will reach for the same shortcut —
+            //   the reason it is wrong is written there, not here.
+            vec!["h", "j", "x", "ç", "ŋ", "ʃ"],
             "de.tsv now writes a consonant before an intervocalic /j/ that DE_LITERAL_J_SPELLING has \
-             no spelling for. If that consonant is (or becomes) a legal onset with /j/ AND is not a \
-             lenis obstruent, its literal ⟨Cj⟩ words are unguarded and will be mis-cut silently — \
-             add it to the table with its letter pair, or state here why it needs no entry."
+             no spelling for. If that consonant is (or becomes) a legal onset with /j/, its literal \
+             ⟨Cj⟩ words are unguarded and will be mis-cut silently — add it to the table with its \
+             letter pair, or state here why it needs no entry."
         );
+        // ★ S111 — the /l j/-site histogram. `de_lj_license_blocks` compares a COUNT of license
+        // spellings against a COUNT of sites and has no abstain branch; that is only safe while no
+        // key has two sites. Assert it rather than believe it.
+        let mut two_site_lj: Vec<&str> = Vec::new();
+        for (key, ph) in &d.map {
+            let toks: Vec<&str> = ph.split_whitespace().collect();
+            let nuclei: Vec<usize> = (0..toks.len()).filter(|&i| d.is_vowel(toks[i])).collect();
+            let n = nuclei
+                .windows(2)
+                .filter(|w| w[1] >= w[0] + 3 && toks[w[1] - 1] == "j" && toks[w[1] - 2] == "l")
+                .count();
+            if n > 1 {
+                two_site_lj.push(key);
+            }
+        }
+        assert!(
+            two_site_lj.is_empty(),
+            "{} keys now have TWO intervocalic /l j/ sites ({:?}). `de_lj_license_blocks` decides \
+             all-or-nothing on a count and cannot tell which site a license belongs to; with two \
+             sites that stops being equivalent to a positional test and it needs the three-way \
+             all/none/ABSTAIN treatment `de_literal_j_blocks` already has.",
+            two_site_lj.len(),
+            { two_site_lj.sort_unstable(); two_site_lj.iter().take(6).collect::<Vec<_>>() }
+        );
+
+        // ★ S111 — `DE_LJ_CODA_SPELLINGS` is a spelling FRAGMENT, so what it actually reaches has to
+        // be asserted or it is unsupervised. Its doc names these six; this is where that claim lives.
+        let mut lj_coda_reached: Vec<&str> = d
+            .map
+            .keys()
+            .filter(|k| DE_LJ_CODA_SPELLINGS.iter().any(|s| k.contains(s)))
+            .map(String::as_str)
+            .collect();
+        lj_coda_reached.sort_unstable();
+        assert_eq!(
+            lj_coda_reached,
+            vec!["fitzwilliam", "william", "williams", "williamsburg", "williamson", "williamstown"],
+            "the ⟨willia⟩ fragment now reaches a different key set. Every member is a word §C24b \
+             licenses and then takes back, so a NEW one is a word being held at the coda with no \
+             transcription of its own (only `william` itself has one: `/ˈvɪl.jam/`), and a LOST one \
+             is a word quietly flipping to the onset. Either way somebody has to look."
+        );
+
         ambiguous.sort_unstable();
         ambiguous.dedup();
         assert_eq!(
@@ -6936,33 +7045,48 @@ mod tests {
                                   consonants between syllables and must never add or remove one");
         assert_eq!(bad_seq, 0, "{bad_seq} German words changed their PHONE SEQUENCE");
         assert_eq!(
-            moved, 592,
-            "§C24 + §C24b now re-cut {moved} German word types, not 592. This number is CUMULATIVE \
+            moved, 611,
+            "§C24 + §C24b now re-cut {moved} German word types, not 611. This number is CUMULATIVE \
              over the whole spelling-guard line and its history is reconciled word by word, never \
-             re-baselined: 431 (S110) − 21 + 63 = 473 (S111 §C24c/d) + 119 (S111 §C24b) = 592. \
-             The 21 that left are the ones the lenis rows dragged into a coda (18 ⟨dj⟩→/d j/, plus \
-             `murawjow`, `orjol`, `reykjavik`); the 63 that joined are the devoiced spellings \
-             (54 ⟨bj⟩, 9 ⟨dj⟩); the 119 are the licensed ⟨lli⟩+V family. Per-consonant today: \
-             /n/ 313 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /ʁ/ 12 · /f/ 10 · /m/ 6 · /ts/ 5 · /k/ 2. \
-             Independently recomputed by `TESTING\\s111_c24bc_ruler\\blast_c24b.py`; a dictionary \
-             regeneration can legitimately move this — re-run that script and reconcile before \
-             touching the number. Two implementations disagreeing is information (S108)."
+             re-baselined: 431 (S110) + 2 (`DE_CJ_ONSET_KEYS` leaving) + 59 (S111 §C24c's devoiced \
+             rows) + 119 (S111 §C24b's licensed ⟨lli⟩+V family) = 611. ⚠ It passed through 473 and \
+             592 mid-session while the lenis rows were deleted; those two values described a state \
+             that was measured down and reverted, and are recorded only so the history reads \
+             straight. Per-consonant CLUSTER MOVES today (they sum to 612, one more than the word \
+             types, because `landesjugendjazzorchester` moves at two sites — /s/ and /t/): \
+             /n/ 313 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
+             /ts/ 5 · /k/ 2 · /v/ 1. Independently recomputed by \
+             `TESTING\\s111_c24bc_ruler\\blast_c24b.py`; a dictionary regeneration can legitimately \
+             move this — re-run that script and reconcile before touching the number. Two \
+             implementations disagreeing is information (S108)."
         );
 
-        // ── (7) ★★ S111 — THE PREMISE ITSELF ────────────────────────────────────────────────────
-        // Everything above about /p j/ vs /b j/ rests on ONE claim about this dictionary: it encodes
-        // German final devoicing, so a lenis obstruent never ends a syllable. That claim is data,
-        // not doctrine — a regeneration could break it — and if it breaks silently then the table is
-        // pairing letters against a voicing that no longer means anything. So it is asserted, not
-        // assumed. (S98: a conclusion I can only reach by reading code and reasoning is unverified;
-        // this one is reachable by counting, so it gets counted.)
+        // ── (7) ★★ S111 — WHAT THE DEVOICING ACTUALLY SUPPORTS, AND WHAT IT DOES NOT ────────────
+        // This group exists because S111 built an argument on "a lenis obstruent cannot end a
+        // German syllable, so a voiced phone before a /j/ means onset", shipped it, and had it
+        // measured down. The premise is TRUE word-finally and FALSE word-internally, and the first
+        // version of this very group only checked the true half — which is how the false half got
+        // through. Both halves are now counted, so the distinction cannot rot back into prose.
         let lenis = ["b", "d", "ɡ", "v", "z"];
+        let voiceless = [
+            "p", "pʰ", "t", "tʰ", "k", "kʰ", "c", "cʰ", "ts", "t͡s", "tʃ", "pf", "f", "s", "ʃ", "ç", "x", "h",
+        ];
         let mut word_final_lenis: Vec<&str> = Vec::new();
+        let mut internal_undevoiced: Vec<&str> = Vec::new();
         let mut lenis_before_j: Vec<&str> = Vec::new();
         for (key, ph) in &d.map {
             let toks: Vec<&str> = ph.split_whitespace().collect();
             if toks.last().is_some_and(|t| lenis.contains(t)) {
                 word_final_lenis.push(key);
+            }
+            // A lenis obstruent immediately followed by a voiceless one is syllable-final by any
+            // analysis (no German onset starts /d k/, /d f/, /ɡ t/ …), so if the dictionary still
+            // writes it voiced there, it is NOT applying devoicing syllable-internally.
+            for w in toks.windows(2) {
+                if lenis.contains(&w[0]) && voiceless.contains(&w[1]) {
+                    internal_undevoiced.push(key);
+                    break;
+                }
             }
             if !toks.contains(&"j") {
                 continue;
@@ -6970,35 +7094,54 @@ mod tests {
             let nuclei: Vec<usize> = (0..toks.len()).filter(|&i| d.is_vowel(toks[i])).collect();
             for w in nuclei.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                // a literal ⟨Cj⟩ in the spelling AND a lenis phone: the two signals disagree, and
-                // the dictionary's own voicing is the one this round trusts.
                 if b >= a + 3 && toks[b - 1] == "j" && lenis.contains(&toks[b - 2]) {
-                    let has_literal = ["bj", "dj", "gj", "vj", "wj", "sj"].iter().any(|l| key.contains(l));
+                    let has_literal =
+                        DE_LITERAL_J_SPELLING.iter().any(|(_, letters)| key.contains(letters));
                     if has_literal {
                         lenis_before_j.push(key);
                     }
                 }
             }
         }
+        word_final_lenis.sort_unstable();
         assert!(
             word_final_lenis.is_empty(),
-            "{} de.tsv keys END in a lenis obstruent (e.g. {:?}). German final devoicing says that \
-             cannot happen, and DE_LITERAL_J_SPELLING's fortis/lenis pairing is built on the \
-             dictionary obeying it. If this fires, the voicing of the phone before a /j/ has stopped \
-             being evidence about syllable position and the ⟨bj⟩/⟨dj⟩ rows need a new argument.",
+            "{} de.tsv keys END in a lenis obstruent (e.g. {:?}). WORD-final devoicing is the half \
+             of the claim that is true, and it is what makes `sowjet`'s `s ɔ f j ɛ t` diagnosable \
+             as an upstream defect at all. If this fires, that diagnosis needs re-checking.",
             word_final_lenis.len(),
-            { word_final_lenis.sort_unstable(); word_final_lenis.iter().take(8).collect::<Vec<_>>() }
+            word_final_lenis.iter().take(8).collect::<Vec<_>>()
+        );
+        internal_undevoiced.sort_unstable();
+        internal_undevoiced.dedup();
+        assert_eq!(
+            internal_undevoiced.len(), 60,
+            "{} de.tsv keys write a lenis obstruent immediately before a voiceless one, not 60 \
+             (`radkappen` = `ʁ aː d kʰ a pʰ ə n` against `rad` = `ʁ aː t` — same morpheme; also \
+             `radkasten`, `fahrradkette`, `schandfleck`, `zugtoilette`, `zugpferd`, \
+             `verkehrsflughafen`, `lokomotivführer`, `abgewälzt`, `eingeloggt`, `redoxreaktion`). \
+             ★ THIS NUMBER IS THE POINT, and it is deliberately measured WITHOUT our syllabifier: \
+             no German onset begins /d k/, /d f/, /ɡ t/ …, so every one of these is syllable-final \
+             by inspection. It is not a defect list — it is the proof that word-INTERNAL voicing in \
+             this dictionary is not a syllabification signal. As long as it is far from zero, nobody \
+             may argue 'the phone is voiced, therefore the dictionary means onset'; S111 did, \
+             shipped it for one commit, and the adversarial review measured it at 1 confirmed : \
+             4 refuted. If a regeneration ever drives this to 0 the argument becomes available for \
+             the first time — and would still need its own measurement, on an instrument whose \
+             site-selection does not key on the voicing it is testing.",
+            internal_undevoiced.len()
         );
         lenis_before_j.sort_unstable();
         lenis_before_j.dedup();
         assert_eq!(
             lenis_before_j.len(), 19,
-            "{} keys spell a literal ⟨Cj⟩ but ship a VOICED obstruent before the /j/, not 19. Each \
-             one is a word where the spelling says 'morpheme boundary' and the voicing says 'onset', \
-             and S111 measured the voicing to be the right witness on all three that any source \
-             covers (`ˈa.djɛkˌtiːf`, `a.djuˈtant`, `ˈna.dja`). A NEW one is not automatically fine: \
-             it could equally be an upstream row that forgot to devoice (`sowjet` is exactly that \
-             failure in the other direction). Look it up before moving this number.",
+            "{} keys spell a literal ⟨Cj⟩ but ship a VOICED obstruent before the /j/, not 19. These \
+             are the words where the two signals disagree, and the SPELLING wins: `adjektiv`, \
+             `adjunkt` (`ˌatˈjʊnkt` in both wiktionaries — the stress mark lands between the /t/ and \
+             the /j/), `adjutant`, `nadja` (`ˈnat.ja`), `murawjow`, and the ad-/Slavic tail. A NEW \
+             one is not automatically fine either way: it could be a genuine onset (that is what \
+             `DE_CJ_ONSET_KEYS` is for, one measured key at a time) or one more upstream row that \
+             forgot to devoice. Look it up before moving this number.",
             lenis_before_j.len()
         );
     }
