@@ -1271,6 +1271,29 @@ pub struct LyricNote {
     pub phoneme_input: Option<String>,
 }
 
+/// S109 (§G13-M2) — the ONE text-length bound the editor-side commands apply, hoisted out of the two
+/// local `const MAX_LEN: usize = 256` that used to declare it twice with the same literal.
+///
+/// ⚠ IT IS APPLIED ASYMMETRICALLY, AND THAT ASYMMETRY IS ONLY SAFE BECAUSE OF A CONSTANT IN ANOTHER
+/// LANGUAGE. Read this before touching either side:
+///   · an over-long LYRIC is a loud error here (`VOCAL_LYRIC_TOO_LONG`, `preview_vocal_phonemes`);
+///   · an over-long `phoneme_input` is SILENTLY dropped (`Option::filter` → `None`, both editor
+///     commands), so the editor would preview a note WITHOUT the override;
+///   · `render_vocal_segment` applies no text bound at all, so it would sing WITH the override.
+/// ⇒ On the same note the editor and the render would disagree — the exact editor-vs-render fork
+/// this file's `phoneme_set` parameter exists to prevent (see `validate_lyrics` below).
+///
+/// It is unreachable today for a reason that lives in `src/lib/vocalNotes.ts`: `MAX_LYRIC_LEN = 64`,
+/// and `sanitizeText` slices `phonemeInput` to it on EVERY ingress (store edits, `.usp` load, UST/
+/// USTX import), so no `phoneme_input` over 64 chars can exist in a project. 64 < 256, therefore the
+/// filter has never fired. `phoneme_input_bound_is_unreachable_from_the_editor` (tests below) pins
+/// that inequality by READING the TypeScript file, so raising `MAX_LYRIC_LEN` — or shipping the
+/// backlogged SV-style phoneme editor with its own larger cap — goes red HERE rather than shipping a
+/// note that previews one thing and sings another.
+/// (S88's rule: when A is used as a proxy for B, write down why A ⇒ B, and re-read it before adding
+/// a new member to the domain. The proxy here is "the frontend caps shorter than we do".)
+pub(crate) const MAX_LYRIC_CHARS: usize = 256;
+
 /// §9.5 single Rust classifier: classify each note's lyric (rest / breath / sustain / valid phones /
 /// OOV) via the SAME `g2p::resolve` pass the render uses — language-aware (S58: per-note language,
 /// zh phrase context from the NOTE SEQUENCE, western word lookup, phoneme_input overrides) with NO JS
@@ -1290,7 +1313,6 @@ pub async fn validate_lyrics(
     // reach twice the note count), so the cap must never reject a segment the render itself accepts
     // (audit: a legal huge segment would otherwise silently lose its OOV marking forever).
     const MAX_TOKENS: usize = 2 * MAX_SCORE_NOTES + 1;
-    const MAX_LEN: usize = 256;
     if notes.len() > MAX_TOKENS {
         return Err(format!("VOCAL_TOO_MANY_NOTES: {} > {}", notes.len(), MAX_TOKENS));
     }
@@ -1308,14 +1330,14 @@ pub async fn validate_lyrics(
         let evts: Vec<g2p::ScoreEvt> = notes
             .iter()
             .map(|n| g2p::ScoreEvt {
-                lyric: if n.lyric.chars().count() > MAX_LEN { TOO_LONG } else { n.lyric.as_str() },
+                lyric: if n.lyric.chars().count() > MAX_LYRIC_CHARS { TOO_LONG } else { n.lyric.as_str() },
                 note_num: 60,
                 frames: 1,
                 lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
                 phoneme_input: n
                     .phoneme_input
                     .as_deref()
-                    .filter(|p| p.chars().count() <= MAX_LEN),
+                    .filter(|p| p.chars().count() <= MAX_LYRIC_CHARS),
                 phoneme_set,
             })
             .collect();
@@ -1370,11 +1392,11 @@ pub async fn preview_vocal_phonemes(
     if total_frames > MAX_TOTAL_FRAMES {
         return Err(format!("VOCAL_SEGMENT_TOO_LONG: {} frames > {}", total_frames, MAX_TOTAL_FRAMES));
     }
-    // DoS bound on the watcher-driven surface (mirrors validate_lyrics' MAX_LEN rationale). LOUD error
-    // instead of the U+FFFD swap: build_arrays_daw is strict (whole-score error), so a swap would just
-    // rename the failure — and a >256-char lyric is pathological (the editor caps at 64). Review #10.
-    const MAX_LEN: usize = 256;
-    if score.iter().any(|n| n.lyric.chars().count() > MAX_LEN) {
+    // DoS bound on the watcher-driven surface (same bound as the editor commands — S109 hoisted it to
+    // `MAX_LYRIC_CHARS`, read its doc before touching either side). LOUD error instead of the U+FFFD
+    // swap: build_arrays_daw is strict (whole-score error), so a swap would just rename the failure —
+    // and a >256-char lyric is pathological (the editor caps at 64). Review #10.
+    if score.iter().any(|n| n.lyric.chars().count() > MAX_LYRIC_CHARS) {
         return Err("VOCAL_LYRIC_TOO_LONG".into());
     }
     if let Some(data_dir) = state.models.models_dir().parent() {
@@ -1395,7 +1417,7 @@ pub async fn preview_vocal_phonemes(
                 note_num: n.note_num,
                 frames: n.frames,
                 lang: n.lang.and_then(g2p::Lang::from_id).unwrap_or(fallback),
-                phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LEN),
+                phoneme_input: n.phoneme_input.as_deref().filter(|p| p.chars().count() <= MAX_LYRIC_CHARS),
                 phoneme_set,
             });
         }
@@ -2154,6 +2176,45 @@ mod tests {
         assert!(
             welded.first().is_none_or(|g| g.start == 0),
             "…and when it does decide, it drags the healthy phrase along (start 0)"
+        );
+    }
+
+    /// S109 (§G13-M2) — the ONE inequality that keeps the editor/render `phoneme_input` fork
+    /// unreachable, pinned across the language boundary.
+    ///
+    /// The editor commands silently DROP a `phoneme_input` longer than `MAX_LYRIC_CHARS`, while
+    /// `render_vocal_segment` applies no text bound at all — so on such a note the preview would show
+    /// one thing and the render sing another. That never happens today only because the FRONTEND caps
+    /// `phonemeInput` at `MAX_LYRIC_LEN = 64` on every ingress (`sanitizeText`, `src/lib/vocalNotes.ts`),
+    /// and 64 < 256. That inequality is the whole guarantee, it lives in another language, and until
+    /// now nothing checked it — raise `MAX_LYRIC_LEN` past 256 (or ship the backlogged SV-style
+    /// phoneme editor with its own cap) and the fork goes live silently.
+    ///
+    /// Read out of the TypeScript source with `include_str!` — the same zero-drift trick
+    /// `bundled_dictionary_targets` uses on tauri.conf.json — so this cannot rot into a hand-copied
+    /// number. If the declaration is ever reshaped, this test fails at the PARSE with a message
+    /// saying so, rather than silently finding nothing and passing (S108: a gate that can't see its
+    /// own subject is worse than no gate).
+    #[test]
+    fn phoneme_input_bound_is_unreachable_from_the_editor() {
+        static VOCAL_NOTES_TS: &str = include_str!("../../../src/lib/vocalNotes.ts");
+        let front_cap: usize = VOCAL_NOTES_TS
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("export const MAX_LYRIC_LEN"))
+            .and_then(|rest| rest.split('=').nth(1))
+            .and_then(|v| v.trim().trim_end_matches(';').parse().ok())
+            .expect(
+                "could not parse `export const MAX_LYRIC_LEN = <n>;` out of src/lib/vocalNotes.ts — \
+                 the declaration was reshaped, so this guard is now blind. Re-point it, do NOT delete it: \
+                 it is the only thing keeping the editor/render phoneme_input fork unreachable.",
+            );
+        assert!(
+            front_cap < MAX_LYRIC_CHARS,
+            "MAX_LYRIC_LEN ({front_cap}) is no longer below the backend bound MAX_LYRIC_CHARS ({}) — \
+             a phoneme_input can now reach the editor commands over that bound, where it is SILENTLY \
+             dropped, while render_vocal_segment keeps it. Fix the fork (make both sides agree and be \
+             loud) before raising the frontend cap; see MAX_LYRIC_CHARS' doc comment.",
+            MAX_LYRIC_CHARS
         );
     }
 }
