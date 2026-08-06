@@ -188,7 +188,17 @@ def plan_loader(requested_workers, requested_prefetch, batch_bytes, available_by
     """
     log = logger or _LOG
     w, p = int(requested_workers), int(requested_prefetch)
-    if w <= 0 or not batch_bytes or not available_bytes:
+    # ⚠ S115: ``available_bytes`` is tested for None, NOT for falsiness. A MEASURED zero is
+    # the most dangerous state this whole module exists for -- the commit charge is spent,
+    # which IS the Windows-1455 condition -- and ``not available_bytes`` used to send it down
+    # the "change nothing" path, granting the full request with the guard silent. A measured
+    # zero now walks the ladder and lands on 0 workers (in-process: no shared mappings, so
+    # 1455 is structurally impossible). Only None -- "the probe could not answer" -- means
+    # keep the defaults.
+    # ``batch_bytes`` keeps the falsy test on purpose: it is the DIVISOR of ``budget`` below,
+    # and a batch measured at 0 bytes bounds nothing anyway, so 0 and None are genuinely the
+    # same answer there. The asymmetry is the point; do not "tidy" the two into one form.
+    if w <= 0 or not batch_bytes or available_bytes is None:
         log.info(
             "loader budget: no adaptation (workers=%s prefetch=%s batch_bytes=%s avail_commit=%s)",
             w, p, batch_bytes, available_bytes,

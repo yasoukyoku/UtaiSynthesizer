@@ -32,6 +32,8 @@ MUTATION PROBES (driver: scratchpad mutate_s114_loader.py; never edits the repo)
     L5  probe_batch_bytes: skip the torch restore            -> C2 red
     L6  plan_loader: allow raising prefetch when it fits     -> A2 red
     L7  rvc/train.py: pass prefetch_factor unconditionally   -> E2 red
+    L8  probe_batch_bytes: ignore the caller's batching      -> C1 red
+    L9  plan_loader: `available_bytes is None` -> falsy test -> C6 red   (S115)
 """
 
 import io
@@ -221,6 +223,19 @@ check("C4 a failing probe returns None instead of raising",
       lb.probe_batch_bytes(Boom(), collate, batch_size=2) is None)
 check("C5 ...and an unmeasurable probe means 'change nothing'",
       lb.plan_loader(4, 8, None, 20 * GiB) == (4, 8))
+# ★S115: None ("could not answer") and 0 ("answered: nothing left") are OPPOSITE
+# answers, and a falsy test conflates them into the safest-looking one. Zero available
+# commit IS the 1455 condition, so it must reduce, not pass through. C6/C7 pin both
+# sides so the two can never be collapsed back into `not available_bytes`.
+check("C6 a MEASURED zero available commit reduces (it is the 1455 condition)",
+      lb.plan_loader(4, 8, MiB, 0) == (0, 8),
+      str(lb.plan_loader(4, 8, MiB, 0)))
+check("C7 ...while None still means 'change nothing' -- the two must not be conflated",
+      lb.plan_loader(4, 8, MiB, None) == (4, 8),
+      str(lb.plan_loader(4, 8, MiB, None)))
+check("C8 a batch measured at 0 bytes still changes nothing (it divides the budget)",
+      lb.plan_loader(4, 8, 0, 20 * GiB) == (4, 8),
+      str(lb.plan_loader(4, 8, 0, 20 * GiB)))
 
 
 # ── D. measure_batch_bytes ───────────────────────────────────────────────────
