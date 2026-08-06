@@ -798,8 +798,15 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  reading — 11521 reachable keys, 36 word types / ~430 tokens on the real Italian corpus, **0
  *  measured wrong**. So no CLEAN bake can change; the bump is for the segments whose bake is stale
  *  precisely because they used to error, and for honesty about the version stamp meaning "what the
- *  lyric→phone layer does". See `WordDict::troncamento` for what that 0 can and cannot say. */
-export const G2P_ALGO_VERSION = "s113";
+ *  lyric→phone layer does". See `WordDict::troncamento` for what that 0 can and cannot say.
+ *  (e) s113b §C25 — a SUSTAIN note after a `ん` note now holds the moraic nasal instead of
+ *  re-opening the vowel before it (`運|ん|ー` sang `[o]`, now `[ɴ]`). ⚠ Unlike (d) this one DOES
+ *  change a reading that already resolved, so the bump is load-bearing: it is a separate letter
+ *  from (d) because s113 shipped one commit earlier and a bake stamped s113 renders (d) but not (e).
+ *  Blast radius over 180 real Japanese scores on disk: ONE note. Truth surface = the shipped
+ *  GTSinger annotation, where a `ɴ` held across two notes inside one word occurs 87 times and a
+ *  `ɴ` re-opening to a vowel inside one word occurs 0. */
+export const G2P_ALGO_VERSION = "s113b";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

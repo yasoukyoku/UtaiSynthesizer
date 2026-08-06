@@ -2914,6 +2914,9 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     // resolver is ever called, and its payload is the CONVENTION + lyric, not a phone.)
     // carrier nucleus for holds outside western spans (ja legacy prev_vowel / zh final).
     let mut carrier: Option<&'static str> = None;
+    /// S113 (§C25) — `ん`. Spelled once, next to the only predicate that consults it; the kana table
+    /// maps `ん` here (`ja_word_phones` → `["ɴ"]`, pinned in tests).
+    const JA_MORAIC_NASAL: &str = "ɴ";
 
     let mut i = 0;
     while i < n {
@@ -2960,13 +2963,50 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                     Lang::Ja | Lang::Zh => {
                         match resolve_east_word(evt, zh_syl[i].as_deref(), dicts)? {
                             Ok(ph) => {
-                                // carrier update: ja = last phone if in VOWEL_SET (legacy prev_vowel
-                                // rule — persists across a non-vowel-final note like ん); zh = the
-                                // final (always the last phone of [initial?, final]).
+                                // carrier update: ja = last phone if it can be HELD; zh = the final
+                                // (always the last phone of [initial?, final]).
+                                //
+                                // S113 (§C25) — the moraic nasal counts. The legacy rule was
+                                // `VOWEL_SET` alone, which "persists across a non-vowel-final note
+                                // like ん": a `ん` note followed by a SUSTAIN note re-articulated the
+                                // vowel before it (`運|ん|ー` sang `[o]`), instead of holding the
+                                // nasal. Three witnesses, in increasing order of hardness:
+                                //  * THIS FILE already says so for the other spelling — the test
+                                //    `assert_eq!(ok("んー"), ["ɴ"], "holding the moraic nasal is
+                                //    ordinary Japanese")` covers `ん` and `ー` written in ONE lyric,
+                                //    where the kana tokenizer handles the mark. Only the ACROSS-NOTE
+                                //    spelling was wrong, so the two spellings of the same intent
+                                //    disagreed;
+                                //  * the shipped GTSinger annotation: a `ɴ` spanning two notes
+                                //    inside one word occurs 87 times (74 distinct (song, segment)
+                                //    events over 23 songs) and `ɴ` → a vowel inside one word occurs
+                                //    0 times — the singers hold the nasal, never re-open it. Same
+                                //    measurement over the 175 `ɴ`→vowel transitions of any kind:
+                                //    0 land on a new note within a word;
+                                //  * `ɴ` is an ordinary vocab token with real exposure (onset 133 /
+                                //    coda 752). ⚠ `ɴː` has ZERO (0/0), which is why a held nasal is
+                                //    a REPEATED `ɴ` and must never become a lengthened one.
+                                //
+                                // ⛔ THE WIDENING LIVES HERE, NOT IN `tbl::VOWEL_SET`. That table is
+                                // shared with three `score2cv` predicates (the upstream parity port)
+                                // where "is a JA vowel" means exactly the five vowels; widening it
+                                // would silently change the parity surface for a Japanese-only
+                                // articulation question. (S97: never touch a shared surface because
+                                // one language needs something — ask whether the predicate, not the
+                                // table, is what is wrong.) `s113_ja_holds_the_moraic_nasal` pins
+                                // the table's contents so a future "simplification" cannot move it.
+                                //
+                                // ⚠ Measured blast radius: over 180 real Japanese scores / 35545
+                                // notes on disk this changes exactly ONE note. That is not because
+                                // the shape is rare in singing — 120 of those files never write a
+                                // sustain token at all — so read it as "no regression risk", not as
+                                // "no user will hit it".
+                                // ⚠ `っ` (`ʔ`) is deliberately NOT added: a held glottal stop is not
+                                // a sound, and the corpus has 0 instances of a sustain after one.
                                 match evt.lang {
                                     Lang::Ja => {
                                         if let Some(&last) = ph.last() {
-                                            if tbl::VOWEL_SET.contains(&last) {
+                                            if tbl::VOWEL_SET.contains(&last) || last == JA_MORAIC_NASAL {
                                                 carrier = Some(last);
                                             }
                                         }
@@ -3964,6 +4004,70 @@ mod tests {
         // punctuation tolerance must arrive in the SAME round as the truncation fix
         assert_eq!(ok("か、"), vec!["k", "a"]);
         assert_eq!(ok("か。"), vec!["k", "a"]);
+    }
+
+    /// ★ S113 (§C25) — a SUSTAIN after `ん` holds the nasal, it does not re-open the vowel before it.
+    ///
+    /// The defect was that the same intent, written the two ways a user can write it, disagreed:
+    /// `んー` in ONE lyric already resolved to `[ɴ]` (asserted in `ja_kana_tokenizer` above, with the
+    /// comment "holding the moraic nasal is ordinary Japanese"), while `ん` and `ー` on TWO NOTES
+    /// re-articulated whatever vowel came before — `運|ん|ー` sang `[o]`.
+    ///
+    /// Groups, most specific first (S108):
+    ///  (1) THE FIX, and the two-spellings-agree property that names what "correct" means here;
+    ///  (2) NON-VACUITY — an ordinary mora still hands its VOWEL to the sustain (this is the whole
+    ///      legacy behaviour, and it must be untouched);
+    ///  (3) ⛔ THE SHARED TABLE — the widening lives in the ja predicate, never in `tbl::VOWEL_SET`,
+    ///      which three `score2cv` parity predicates read as "the five JA vowels";
+    ///  (4) SCOPE — `っ` is not holdable, and zh is not touched.
+    #[test]
+    fn s113_ja_holds_the_moraic_nasal() {
+        let f = fixtures();
+        let sing = |lyrics: &[&str]| -> Vec<Vec<&'static str>> {
+            let evts: Vec<ScoreEvt> = lyrics.iter().map(|l| evt(l, Lang::Ja)).collect();
+            resolve_score(&evts, &f).unwrap().iter().map(phones_of).collect()
+        };
+
+        // ── (1) THE FIX ─────────────────────────────────────────────────────────────────────────
+        assert_eq!(sing(&["ん", "ー"]), vec![vec!["ɴ"], vec!["ɴ"]]);
+        assert_eq!(sing(&["ほ", "ん", "ー"]), vec![vec!["h", "o"], vec!["ɴ"], vec!["ɴ"]], "…not [o]");
+        assert_eq!(sing(&["ほ", "ん", "-"]), vec![vec!["h", "o"], vec!["ɴ"], vec!["ɴ"]], "ASCII spelling too");
+        assert_eq!(sing(&["ほ", "ん", "+"]), vec![vec!["h", "o"], vec!["ɴ"], vec!["ɴ"]], "…and `+`");
+        // ★ THE PROPERTY, not just the value: the two ways a user can write "hold the nasal" now
+        // agree. `んー` on one note has always been `[ɴ]` — that is what made the split a defect
+        // rather than a preference.
+        assert_eq!(sing(&["んー"]), vec![vec!["ɴ"]], "control: the one-lyric spelling, unchanged");
+        assert_eq!(sing(&["んー"])[0], sing(&["ん", "ー"])[1], "the two spellings must agree");
+
+        // ── (2) NON-VACUITY — the legacy vowel carrier is untouched ─────────────────────────────
+        for (word, held) in [("か", "a"), ("し", "i"), ("こ", "o"), ("ふ", "ɯ"), ("せ", "e")] {
+            assert_eq!(sing(&[word, "ー"])[1], vec![held], "an ordinary mora still hands over its vowel");
+        }
+        // a sustain with nothing before it still falls back to "a" (unchanged)
+        assert_eq!(sing(&["ー"]), vec![vec!["a"]]);
+
+        // ── (3) ⛔ THE SHARED TABLE MUST NOT HAVE MOVED ─────────────────────────────────────────
+        // `score2cv` reads this as "is one of the five JA vowels" in three parity predicates; a
+        // widening there would change the upstream-parity surface to fix an articulation question.
+        assert_eq!(tbl::VOWEL_SET, ["a", "e", "i", "o", "ɯ"], "the widening belongs in the ja predicate");
+        assert!(!tbl::VOWEL_SET.contains(&"ɴ"), "…and specifically NOT here");
+
+        // ── (4) SCOPE ───────────────────────────────────────────────────────────────────────────
+        // `っ` is a glottal stop: holding it is not a sound, and the real material has 0 instances.
+        assert_eq!(sing(&["っ", "ー"])[1], vec!["a"], "a held `っ` falls back, it does not sustain `ʔ`");
+        // …and the mora before it still wins, i.e. `ʔ` does not clear the carrier either
+        assert_eq!(sing(&["こ", "っ", "ー"])[2], vec!["o"]);
+        // zh's carrier is the syllable FINAL and has nothing to do with this rule
+        assert_eq!(sing(&["ん", "ー"])[1], vec!["ɴ"]);
+        assert_eq!(
+            resolve_score(&[evt("长", Lang::Zh), evt("ー", Lang::Zh)], &f)
+                .unwrap()
+                .iter()
+                .map(phones_of)
+                .collect::<Vec<_>>()[1],
+            vec!["ɑŋ"],
+            "zh still holds its final"
+        );
     }
 
     // ── western span: coda deferral (归韵) on pure holds ──
