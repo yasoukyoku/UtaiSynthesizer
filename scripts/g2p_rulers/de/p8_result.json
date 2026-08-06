@@ -1,0 +1,72 @@
+{
+ "ONSET/弱": [
+  "acilius",
+  "aemilius",
+  "aurelian",
+  "auxiliary",
+  "berzelius",
+  "delius",
+  "dibelius",
+  "fantastilliarden",
+  "hevelius",
+  "hilliard",
+  "iulius",
+  "juilliard",
+  "lucilius",
+  "nilius",
+  "ortelius",
+  "sibelius",
+  "statilius",
+  "vergilius",
+  "vopelius"
+ ],
+ "None/—": [
+  "aliakmonas",
+  "balliol",
+  "billie",
+  "gellius",
+  "gillian",
+  "italiana",
+  "jillian",
+  "kallio",
+  "killian",
+  "lillian",
+  "metallionen",
+  "millie",
+  "mylius",
+  "obertilliach",
+  "pollio",
+  "richelieus",
+  "scholion",
+  "tertullian",
+  "tullius",
+  "vesalius",
+  "vitellius",
+  "vocalion"
+ ],
+ "ONSET/强": [
+  "alliance",
+  "allianzfreier",
+  "goliat",
+  "italienaufenthalt",
+  "italienfeldzug",
+  "juliusz",
+  "luftfahrtallianz",
+  "milliardenprojektes",
+  "millionaire",
+  "millionenbereich",
+  "millionenfrage",
+  "millionenseller",
+  "palliativschwester",
+  "vitalienbrüder"
+ ],
+ "ONSET/中": [
+  "filiation",
+  "kilianskirche",
+  "maximiliansgymnasium",
+  "siciliana"
+ ],
+ "CODA/弱": [
+  "gilliam"
+ ]
+}

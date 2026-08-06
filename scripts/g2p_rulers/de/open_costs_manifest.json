@@ -1,0 +1,371 @@
+{
+ "A. §C24b 授权放行、尺子沉默(今天=ONSET)": {
+  "knob": "旋钮 = `DE_LJ_CODA_SPELLINGS` 加这个键(照 `gilliam` 的形状),它就翻回 CODA",
+  "rows": [
+   [
+    "acilius",
+    "a | ts iː | l j ʊ s",
+    "a | ts iː l | j ʊ s"
+   ],
+   [
+    "aemilius",
+    "ɛ | m iː | l j ʊ s",
+    "ɛ | m iː l | j ʊ s"
+   ],
+   [
+    "aliakmonas",
+    "a | l j a k | m oː | n a s",
+    "a l | j a k | m oː | n a s"
+   ],
+   [
+    "aurelian",
+    "aw ʁ | l j a n",
+    "aw ʁ l | j a n"
+   ],
+   [
+    "auxiliary",
+    "aw k | s iː | l j aː | ɪ",
+    "aw k | s iː l | j aː | ɪ"
+   ],
+   [
+    "balliol",
+    "b a | l j oː l",
+    "b a l | j oː l"
+   ],
+   [
+    "berzelius",
+    "b ɛ ʁ | ts ə | l j ʊ s",
+    "b ɛ ʁ | ts ə l | j ʊ s"
+   ],
+   [
+    "billie",
+    "b ɪ | l j ə",
+    "b ɪ l | j ə"
+   ],
+   [
+    "delius",
+    "d ɛ | l j ʊ s",
+    "d ɛ l | j ʊ s"
+   ],
+   [
+    "dibelius",
+    "d iː | b ə | l j ʊ s",
+    "d iː | b ə l | j ʊ s"
+   ],
+   [
+    "fantastilliarden",
+    "f a n | tʰ a s | t ɪ | l j aː | d ə n",
+    "f a n | tʰ a s | t ɪ l | j aː | d ə n"
+   ],
+   [
+    "gellius",
+    "ɟ ɛ | l j ʊ s",
+    "ɟ ɛ l | j ʊ s"
+   ],
+   [
+    "gillian",
+    "ɟ ɪ | l j a n",
+    "ɟ ɪ l | j a n"
+   ],
+   [
+    "hevelius",
+    "h eː | f ə | l j ʊ s",
+    "h eː | f ə l | j ʊ s"
+   ],
+   [
+    "hilliard",
+    "ç ɪ | l j a | ɐ t",
+    "ç ɪ l | j a | ɐ t"
+   ],
+   [
+    "italiana",
+    "ɪ | tʰ a | l j aː | n a",
+    "ɪ | tʰ a l | j aː | n a"
+   ],
+   [
+    "iulius",
+    "ɪ | ʊ | l j ʊ s",
+    "ɪ | ʊ l | j ʊ s"
+   ],
+   [
+    "jillian",
+    "j ɪ | l j a n",
+    "j ɪ l | j a n"
+   ],
+   [
+    "juilliard",
+    "j uː | ɪ | l j a | ɐ t",
+    "j uː | ɪ l | j a | ɐ t"
+   ],
+   [
+    "kallio",
+    "kʰ a | l j ɔ",
+    "kʰ a l | j ɔ"
+   ],
+   [
+    "killian",
+    "cʰ ɪ | l j a n",
+    "cʰ ɪ l | j a n"
+   ],
+   [
+    "lillian",
+    "l ɪ | l j a n",
+    "l ɪ l | j a n"
+   ],
+   [
+    "lucilius",
+    "l ʊ | cʰ iː | l j ʊ s",
+    "l ʊ | cʰ iː l | j ʊ s"
+   ],
+   [
+    "metallionen",
+    "m ɛ | tʰ a | l j oː | n ə n",
+    "m ɛ | tʰ a l | j oː | n ə n"
+   ],
+   [
+    "millie",
+    "m ɪ | l j ə",
+    "m ɪ l | j ə"
+   ],
+   [
+    "mylius",
+    "m ʏ | l j ʊ s",
+    "m ʏ l | j ʊ s"
+   ],
+   [
+    "nilius",
+    "n iː | l j ʊ s",
+    "n iː l | j ʊ s"
+   ],
+   [
+    "obertilliach",
+    "oː | b ɐ | tʰ ɪ | l j a x",
+    "oː | b ɐ | tʰ ɪ l | j a x"
+   ],
+   [
+    "ortelius",
+    "ɔ ʁ | tʰ ə | l j ʊ s",
+    "ɔ ʁ | tʰ ə l | j ʊ s"
+   ],
+   [
+    "pollio",
+    "pʰ ɔ | l j ɔ",
+    "pʰ ɔ l | j ɔ"
+   ],
+   [
+    "richelieus",
+    "ʁ ɪ | ç ə | l j eː | ʊ s",
+    "ʁ ɪ | ç ə l | j eː | ʊ s"
+   ],
+   [
+    "scholion",
+    "ʃ ɔ | l j oː n",
+    "ʃ ɔ l | j oː n"
+   ],
+   [
+    "sibelius",
+    "z ɪ | b ə | l j ʊ s",
+    "z ɪ | b ə l | j ʊ s"
+   ],
+   [
+    "statilius",
+    "ʃ t a | tʰ iː | l j ʊ s",
+    "ʃ t a | tʰ iː l | j ʊ s"
+   ],
+   [
+    "tertullian",
+    "tʰ ɛ ʁ | tʰ ʊ | l j a n",
+    "tʰ ɛ ʁ | tʰ ʊ l | j a n"
+   ],
+   [
+    "tullius",
+    "tʰ ʊ | l j ʊ s",
+    "tʰ ʊ l | j ʊ s"
+   ],
+   [
+    "vergilius",
+    "f ɛ | ɐ | ɟ ɪ | l j ʊ s",
+    "f ɛ | ɐ | ɟ ɪ l | j ʊ s"
+   ],
+   [
+    "vesalius",
+    "f ɛ | s a | l j ʊ s",
+    "f ɛ | s a l | j ʊ s"
+   ],
+   [
+    "vitellius",
+    "v ɪ | tʰ ə | l j ʊ s",
+    "v ɪ | tʰ ə l | j ʊ s"
+   ],
+   [
+    "vocalion",
+    "v ɔ | kʰ aː | l j oː n",
+    "v ɔ | kʰ aː l | j oː n"
+   ],
+   [
+    "vopelius",
+    "f oː | pʰ ə | l j ʊ s",
+    "f oː | pʰ ə l | j ʊ s"
+   ]
+  ]
+ },
+ "B. ⟨ny⟩ —— `n j` 的第三个子族,零证据(今天=ONSET)": {
+  "knob": "旋钮 = 给 `DE_ROMANCE_GN_SPELLING` 加一行 `(\"n\",\"ny\")`(照 ⟨gn⟩ 的形状)",
+  "rows": [
+   [
+    "anya",
+    "a | n j a",
+    "a n | j a"
+   ],
+   [
+    "banyan",
+    "b a | n j a n",
+    "b a n | j a n"
+   ],
+   [
+    "banyas",
+    "b a | n j a s",
+    "b a n | j a s"
+   ],
+   [
+    "canyon",
+    "cʰ ɛ | n j ə n",
+    "cʰ ɛ n | j ə n"
+   ],
+   [
+    "canyons",
+    "cʰ ɛ | n j ə n s",
+    "cʰ ɛ n | j ə n s"
+   ],
+   [
+    "catalunya",
+    "kʰ a | tʰ a | l ʊ | n j a",
+    "kʰ a | tʰ a | l ʊ n | j a"
+   ],
+   [
+    "chikungunya",
+    "tʃ ɪ | kʰ ʊ ŋ | ɡ ʊ | n j a",
+    "tʃ ɪ | kʰ ʊ ŋ | ɡ ʊ n | j a"
+   ],
+   [
+    "inyo",
+    "ɪ | n j ə",
+    "ɪ n | j ə"
+   ],
+   [
+    "kanyakumari",
+    "kʰ a | n j a | kʰ ʊ | m aː | ʁ ɪ",
+    "kʰ a n | j a | kʰ ʊ | m aː | ʁ ɪ"
+   ],
+   [
+    "kardinya",
+    "kʰ a ʁ | d ɪ | n j a",
+    "kʰ a ʁ | d ɪ n | j a"
+   ],
+   [
+    "kenya",
+    "cʰ ɛ | n j a",
+    "cʰ ɛ n | j a"
+   ],
+   [
+    "kenyon",
+    "cʰ ɛ | n j ə n",
+    "cʰ ɛ n | j ə n"
+   ],
+   [
+    "konya",
+    "kʰ ɔ | n j a",
+    "kʰ ɔ n | j a"
+   ],
+   [
+    "runyon",
+    "ʁ ʊ | n j ə n",
+    "ʁ ʊ n | j ə n"
+   ],
+   [
+    "sanyo",
+    "z a | n j ə",
+    "z a n | j ə"
+   ],
+   [
+    "sunyani",
+    "z ʊ | n j aː | n ɪ",
+    "z ʊ n | j aː | n ɪ"
+   ],
+   [
+    "tanya",
+    "tʰ a | n j a",
+    "tʰ a n | j a"
+   ],
+   [
+    "tigrinya",
+    "tʰ iː | ɡ ʁ ɪ | n j a",
+    "tʰ iː | ɡ ʁ ɪ n | j a"
+   ],
+   [
+    "tonya",
+    "tʰ oː | n j a",
+    "tʰ oː n | j a"
+   ]
+  ]
+ },
+ "C. ⟨lli⟩ 授权的前导元音子句拦下的(今天=CODA)": {
+  "knob": "旋钮 = `de_lj_license_count` 的前导元音字母要求;⚠ 拿掉它 `liouville` 会拿词首授权词尾",
+  "rows": [
+   [
+    "bentivoglio",
+    "b ɛ n | tʰ iː | f oː l | j ɔ",
+    "b ɛ n | tʰ iː | f oː | l j ɔ"
+   ],
+   [
+    "cagliari",
+    "cʰ ɛ | ɪ ŋ | ə l | j aː | ʁ ɪ",
+    "cʰ ɛ | ɪ ŋ | ə | l j aː | ʁ ɪ"
+   ],
+   [
+    "liouville",
+    "l iː | ʊ | v ə l | j ə",
+    "l iː | ʊ | v ə | l j ə"
+   ],
+   [
+    "manlius",
+    "m a n l | j ʊ s",
+    "m a n | l j ʊ s"
+   ],
+   [
+    "scaglietti",
+    "s c ɛ | ɪ ŋ | ə l | j ɛ | tʰ ɪ",
+    "s c ɛ | ɪ ŋ | ə | l j ɛ | tʰ ɪ"
+   ]
+  ]
+ },
+ "D. ⛔上游行本身坏 —— 不许在 G2P 侧代偿,归 §C22/§G10 重训桶": {
+  "knob": "⚠ 第三列是**病因**不是替代切法:这些词两种切法都错,改 onset/coda 都救不了",
+  "rows": [
+   [
+    "designs",
+    "d ɪ | z aj n | j uː s",
+    "德语说 [dɪˈzaɪ̯ns],根本没有 /j/;上游写成 `d ɪ z aj n j uː s`"
+   ],
+   [
+    "industriedesigns",
+    "ɪ n | d ʊ s | t ʁ iː | d ɪ | z aj n | j uː s",
+    "同上"
+   ],
+   [
+    "metallionen",
+    "m ɛ | tʰ a | l j oː | n ə n",
+    "Metall+Ionen,而 de.tsv 的 `ionen` 存成 `j oː n ə n`(少一个音节,§C22⑤)"
+   ],
+   [
+    "sowjet",
+    "s ɔ | f j ɛ t",
+    "词首 ⟨S⟩ 在元音前德语是 /z/,而我们写 `s`;⟨wj⟩ 边界也在唇音之前(§C24c 明写弃权)"
+   ]
+  ]
+ },
+ "_meta": {
+  "silent_lj_keys_total": 242,
+  "regen": "py -3.10 scripts/g2p_rulers/de/open_costs_manifest.py(仓库根下跑)"
+ }
+}

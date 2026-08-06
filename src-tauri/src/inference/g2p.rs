@@ -1379,7 +1379,7 @@ const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
 /// page (23) and ride on the family, which is stated, not hidden.
 ///
 /// ⚠ SAFETY, measured rather than argued: of every /n j/ key in the shipped dictionary that the
-/// ruler confirms as an ONSET, this guard flips **0**. `TESTING\s112_dictline_residual\p14_gn_guard_blast.py`.
+/// ruler confirms as an ONSET, this guard flips **0**. `scripts\g2p_rulers\de\ (measured by p14_gn_guard_blast.py, S112 scratch)`.
 ///
 /// ⚠ WHAT IT DELIBERATELY DOES NOT COVER:
 ///   · **⟨ny⟩ — 19 sites, 0 evidence in either direction** (`kenya`, `sonya`, …). Untouched and
@@ -1462,7 +1462,7 @@ const DE_LJ_CODA_SPELLINGS: &[&str] = &["willia", "gilliam"];
 /// ⟨V⟩ (`i = j + 1`), so a hypothetical ⟨…alialia…⟩ counts 2 rather than 1. That matches what it is
 /// compared against — `nuclei.windows(2)` pairs, which also share their boundary nucleus. (An
 /// earlier version of this line claimed "non-overlapping"; the Python cross-check in
-/// `TESTING\s111_c24bc_ruler\` uses a genuinely non-overlapping `findall`, and the two agree today
+/// `scripts/g2p_rulers/de/` uses a genuinely non-overlapping `findall`, and the two agree today
 /// only because no de.tsv key has two /l j/ sites at all.)
 fn de_lj_license_count(key: &str) -> usize {
     const V: &str = "aeiouyäöüáàâéèêíìîóòôúùû";
@@ -2106,8 +2106,9 @@ impl Seams {
         // ⚠ INERT TODAY, stated rather than implied: running this loop after the abstention `break`
         //   means a compound ambiguity no longer discards the spelling evidence — but measured on
         //   the shipped de.tsv, the number of intervocalic clusters that have BOTH ≥2 seam
-        //   candidates and a literal ⟨j⟩ is **0** (`TESTING\s110_c24_de_cj\c24_blast.py` sibling
-        //   check). So the placement is the correct semantics for a dictionary that does not exist
+        //   candidates and a literal ⟨j⟩ is **0** (`c24_blast.py` sibling check — S110 scratch,
+        //   NOT migrated into `scripts/g2p_rulers/de/`; it lives only in TESTING and may not run).
+        //   So the placement is the correct semantics for a dictionary that does not exist
         //   yet, not a behaviour this round relies on; do not cite it as load-bearing.
         for &g in &self.glide_block {
             if g >= a + 1 && g < b {
@@ -4894,7 +4895,7 @@ mod tests {
             //   changed its cut** — they were coda before and are coda now. Two independent
             //   mechanisms recognising the same compounds is the same "still sufficient, no longer
             //   necessary" story, not a regression. Enumerated by
-            //   `TESTING\s111_c24bc_ruler\seamdelta.py` (which reads the OLD table out of git —
+            //   `scripts\g2p_rulers\de\ (seamdelta.py, S111 scratch)` (which reads the OLD table out of git —
             //   a tool that parses the working tree cannot be its own control arm once you edit it).
             ("de", WordDict::from_tsv(Lang::De, &de_tsv), &de_tsv, 1029usize),
             ("en", WordDict::from_tsv(Lang::En, &en_tsv), &en_tsv, 1478),
@@ -7215,7 +7216,7 @@ mod tests {
              /s/ and /t/): \
              /n/ 269 · /l/ 118 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
              /ts/ 5 · /k/ 2 · /v/ 1. Independently recomputed by \
-             `TESTING\\s111_c24bc_ruler\\blast_c24b.py` — which since S112 PARSES all three \
+             `scripts\\g2p_rulers\\de\\blast_c24b.py` — which since S112 PARSES all three \
              constants out of this file; it used to hard-code `DE_CJ_ONSET_KEYS` and \
              `DE_LJ_CODA_SPELLINGS`, so it would have gone on reporting the pre-§C24e number and \
              manufactured one fake disagreement. A dictionary regeneration can legitimately move \
