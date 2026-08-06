@@ -780,11 +780,19 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  Pa-vil-lon, bril-lant) is structurally out of reach rather than merely filtered. 119 word types,
  *  **59 confirmed : 0 refuted**; the one named counterexample, `Wil·liam` [ˈvɪl.jam], is a curated
  *  spelling exception.
- *  611 German WORD TYPES now differ from pre-s110 (`n j` 313 · `l j` 119 · the spelling guard 179),
- *  and as in s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv
- *  key — only which note a consonant lands on changes, which is exactly what a stored bake gets
- *  wrong. */
-export const G2P_ALGO_VERSION = "s111";
+ *  (c) s112 §C24e — `n j` was admitted as ONE member in s110 and it was TWO populations. Split by
+ *  spelling and measured against the same wiktionary ruler (after filling in every title the earlier
+ *  rounds had never fetched): ⟨ni⟩+V = 235 sites, **96 confirmed : 0 refuted** — right; Romance ⟨gn⟩
+ *  = 44 sites, **0 confirmed : 5 refuted** — wrong, and wrong in the direction that counts, because
+ *  those keys were cut correctly BEFORE s110 (`mignon` [mɪnˈjɔ̃] and `mignons`, de.wiktionary, stress
+ *  landing between the /n/ and the /j/; `champignon` [ˈʃam.pɪnˌjɔŋ]; `bretagne` and `champagne` on the
+ *  weaker syllable-dot signal). `DE_ROMANCE_GN_SPELLING` returns those 44 to their pre-s110 cut.
+ *  ⟨ny⟩ (19 sites) still has no evidence either way and is deliberately untouched.
+ *  567 German WORD TYPES now differ from pre-s110 (`n j` 269 · `l j` 119 · the spelling guard 179);
+ *  the count FELL by 44 because §C24e un-does a s110 change rather than adding one. As in
+ *  s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv key — only
+ *  which note a consonant lands on changes, which is exactly what a stored bake gets wrong. */
+export const G2P_ALGO_VERSION = "s112";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

@@ -704,8 +704,13 @@ impl WordDict {
     /// See `DE_LITERAL_J_SPELLING` for the argument, the repaid debt and the named costs. This is
     /// only the mechanics:
     ///  · group the intervocalic clusters that END in `C j` by their `C`;
-    ///  · count how often the key spells that `C` followed by a literal ⟨j⟩;
+    ///  · count how often the key spells that `C` in a way that says "this consonant is not free to
+    ///    join the glide" — a literal ⟨j⟩ (`DE_LITERAL_J_SPELLING`) or, since S112, the Romance
+    ///    digraph ⟨gn⟩ (`DE_ROMANCE_GN_SPELLING`), which is one segment /ɲ/ rather than a boundary;
     ///  · **all** of them / **none** of them / ABSTAIN, in that order. Never a guess about which.
+    /// ⚠ The function name still says "literal j" because that is what fourteen of its fifteen rows
+    /// are; the ⟨gn⟩ row is the one that is not, and it is kept in its own table so the distinction
+    /// survives being read quickly.
     ///
     /// ⚠⚠ THE OVERRIDE IMMUNITY IS NOT INHERITED — it had to be written. `compound_seams` gets away
     /// without a check because its head+tail phone-equality test fails by construction on a
@@ -756,8 +761,16 @@ impl WordDict {
         }
         let mut out = Vec::new();
         for (consonant, positions) in by_consonant {
+            // S112 §C24e: two tables, one counter. `DE_LITERAL_J_SPELLING` says "these letters
+            // write a literal ⟨j⟩, which is morpheme-initial in German"; `DE_ROMANCE_GN_SPELLING`
+            // says "these letters write ONE Romance segment /ɲ/, whose nasal closes the syllable".
+            // Different arguments, same consequence for the cut, so they share the all/none/abstain
+            // logic rather than growing a second copy of it. A key that spells BOTH (⟨gn⟩ somewhere
+            // and a literal ⟨nj⟩ somewhere else) sums to 2 and blocks both sites, which is right —
+            // and if it spells only one of two sites it ABSTAINS, exactly as before.
             let literal: usize = DE_LITERAL_J_SPELLING
                 .iter()
+                .chain(DE_ROMANCE_GN_SPELLING.iter())
                 .filter(|(p, _)| *p == consonant)
                 .map(|(_, letters)| key.matches(letters).count())
                 .sum();
@@ -1335,6 +1348,52 @@ const DE_LITERAL_J_SPELLING: &[(&str, &str)] = &[
     //   and it is not a lenis obstruent). Removing it would need a third reason category.
     ("l", "lj"),
 ];
+
+/// S112 §C24e — the Romance palatal ⟨gn⟩, which this dictionary ships as `n j`.
+///
+/// ★★ A SEPARATE TABLE ON PURPOSE, even though it is fed to the same counter. Every row of
+/// `DE_LITERAL_J_SPELLING` contains a literal ⟨j⟩ and its argument is "a ⟨j⟩ is morpheme-initial in
+/// German". ⟨gn⟩ has no ⟨j⟩ in it at all: the argument is that the letters spell ONE Romance
+/// segment /ɲ/, and German pronounces the borrowing with the nasal closing the syllable before the
+/// glide — Kam-pan-je, Mi-njõ. Same mechanics (count the spelling, all / none / abstain), different
+/// evidence, and separately revertible. Folding it into the other table would have made that
+/// table's own doc a lie.
+///
+/// ★ WHY IT EXISTS — this repays a debt S110 took on without seeing it. S110 put `n j` into
+/// `DE_ONSET_KEEP` as one member. Split by SPELLING the member is two populations pointing opposite
+/// ways (measured against the S111 wiktionary ruler after filling in every missing title, so the
+/// coverage is a fact and not an accident of what a previous round happened to fetch):
+///   · ⟨ni⟩+V — 235 sites, **96 confirmed : 0 refuted**. `linie`, `union`, `seniorenheim`. Right.
+///   · ⟨gn⟩  —  44 sites, **0 confirmed : 5 refuted**. Wrong, and wrong in the direction that
+///     matters: these keys were cut correctly BEFORE S110 (`n j` was not an onset, so the maximal
+///     onset already cut at the /j/), so admitting `n j` wholesale did not fail to fix them — it
+///     BROKE them. That is the same shape as `l j` in S110, which was reverted for it.
+/// The five refutations, with their signal named because they are not equally strong:
+///   · `mignon` [mɪnˈjɔ̃] and `mignons` [mɪnˈjɔ̃ːs] — de.wiktionary, and the stress mark lands
+///     BETWEEN the /n/ and the /j/. That is S1, the only signal the pre-registered control group
+///     actually exercised (17 agree : 0 contradict).
+///   · `champignon` [ˈʃam.pɪnˌjɔŋ] — en.wiktionary's German section, secondary stress, same signal.
+///   · `bretagne` [bʁeˈtan.jə] and `champagne` [ʃamˈpan.jə] — the syllable DOT only (S3). The
+///     control group never put a verdict on that signal, so these two are corroboration, not proof.
+/// ⇒ Two lexemes carry this on the strong signal. The other 39 sites are silent (16) or have no
+/// page (23) and ride on the family, which is stated, not hidden.
+///
+/// ⚠ SAFETY, measured rather than argued: of every /n j/ key in the shipped dictionary that the
+/// ruler confirms as an ONSET, this guard flips **0**. `TESTING\s112_dictline_residual\p14_gn_guard_blast.py`.
+///
+/// ⚠ WHAT IT DELIBERATELY DOES NOT COVER:
+///   · **⟨ny⟩ — 19 sites, 0 evidence in either direction** (`kenya`, `sonya`, …). Untouched and
+///     still a named cost. S110 recorded the twin ⟨Cy⟩ population; it is still unmeasured.
+///   · `designs` / `industriedesigns` are inside the 44 but their upstream row is broken —
+///     `d ɪ z aj n j uː s` for a word German says [dɪˈzaɪ̯ns], with no /j/ at all. The guard is
+///     neutral there because the row is wrong either way (§C22 / §G10 bucket), and they are named
+///     here so the next reader does not take them as evidence for or against.
+/// ⛔ AND ONE TRAP, recorded because this analysis walked into it: an intermediate pass reported
+/// "⟨nh⟩ = 3 confirmed : 0 refuted, so Portuguese ⟨nh⟩ wants the onset". That was a CLASSIFIER
+/// artifact — `seniorenheim` / `seniorenheime` / `seniorenwohnheim` carry the letters ⟨nh⟩ across a
+/// compound seam (Senioren+Heim) while the /n j/ site they actually contain is ⟨ni⟩+V. Genuine
+/// ⟨nh⟩ has no evidence at all. Do not add an ⟨nh⟩ row on the strength of those three.
+const DE_ROMANCE_GN_SPELLING: &[(&str, &str)] = &[("n", "gn")];
 
 /// S111 — keys whose literal ⟨Cj⟩ takes the ONSET reading anyway. A curated KEY list, the
 /// `FR_DROP_ROWS` shape S110's doc predicted this population would eventually need.
@@ -6722,6 +6781,23 @@ mod tests {
             // phones later is a DIFFERENT consonant (`s`) and is judged separately, so it stays an onset.
             ("konjugation", vec![3]),
             ("produktionsjahr", vec![]),     // THE ambiguous word: one ⟨sj⟩ spelled, two `s j` clusters
+            // ★★ S112 §C24e — the Romance ⟨gn⟩ row, and its controls. These four are the reason the
+            //    second table exists: the letters spell ONE segment /ɲ/, so the /n/ closes the
+            //    syllable before the glide. `mignon` and `champignon` are the two lexemes measured
+            //    on the STRESS signal (`mɪnˈjɔ̃`, `ˈʃam.pɪnˌjɔŋ`); the others ride the family.
+            ("mignon", vec![3]),             // `m ɪ n j ɔ ŋ`
+            ("champignon", vec![6]),         // `ʃ a m pʰ ɪ n j ɔ ŋ`
+            ("kampagne", vec![6]),           // `kʰ a m pʰ a n j ə`
+            ("bretagne", vec![6]),           // `b ʁ ɛ tʰ a n j ə`
+            // …and the controls that keep the ⟨gn⟩ row from being a blanket /n j/ block. Both have
+            // an intervocalic `n j` and BOTH must stay unblocked, or the ⟨ni⟩+V half (235 sites,
+            // 96 confirmed : 0 refuted) has been thrown away with the ⟨gn⟩ half.
+            ("linie", vec![]),               // `l iː n j ə` — the ⟨i⟩-derived glide
+            // ⛔ THE ⟨nh⟩ TRAP, pinned so it cannot come back: this key carries the LETTERS ⟨nh⟩
+            //    across a compound seam (Senioren+Heim) while its actual `n j` site is ⟨ni⟩+V. An
+            //    intermediate pass of the S112 analysis read three such words as "⟨nh⟩ wants the
+            //    onset" and nearly added an ⟨nh⟩ row on that basis. Genuine ⟨nh⟩ has no evidence.
+            ("seniorenheim", vec![]),        // `z ɪ n j oː ʁ n̩ h aj m`
         ] {
             assert_eq!(
                 d.de_literal_j_blocks(w, &phones(w)),
@@ -6833,6 +6909,17 @@ mod tests {
             ("adjunkt", "a d | j ʊ ŋ k t", "★ `ˌatˈjʊnkt` in BOTH sources — stress lands between /t/ and /j/"),
             ("adjutant", "a d | j uː | tʰ a n t", "⟨dj⟩→/d j/ · `at.juˈtant` · `Ad·ju·tant`"),
             ("nadja", "n a d | j aː", "⟨dj⟩→/d j/ · `ˈnat.ja` · `Nad·ja`"),
+            // ★★ S112 §C24e — the Romance ⟨gn⟩, and the ⟨ni⟩+V control it must not touch. These are
+            // the OTHER direction from every pin above it: they are not a defect this line is
+            // repairing, they are 44 keys s110 BROKE and this returns to their earlier cut. Pinning
+            // both sides here is what makes "the `n j` member was two populations" checkable rather
+            // than a sentence in a doc.
+            ("mignon", "m ɪ n | j ɔ ŋ", "★ de.wikt `mɪnˈjɔ̃` — the stress mark lands between /n/ and /j/"),
+            ("champignon", "ʃ a m | pʰ ɪ n | j ɔ ŋ", "★ `ˈʃam.pɪnˌjɔŋ` — secondary stress, same signal"),
+            ("kampagne", "kʰ a m | pʰ a n | j ə", "rides the family; 44 keys total, 16 silent / 23 no page"),
+            ("bretagne", "b ʁ ɛ | tʰ a n | j ə", "`bʁeˈtan.jə` — syllable DOT only, weaker than the two above"),
+            ("linie", "l iː | n j ə", "⛔ CONTROL: the ⟨ni⟩+V half stays ONSET (96 confirmed : 0 refuted)"),
+            ("seniorenheim", "z ɪ | n j oː | ʁ n̩ | h aj m", "⛔ CONTROL: ⟨nh⟩ letters across a compound seam, NOT an ⟨nh⟩ site"),
             // ★ the two curated exceptions, and one control each showing their rows still fire
             ("orjol", "ɔ | ʁ j oː l", "DE_CJ_ONSET_KEYS · `ɔˈʁjoːl`"),
             ("reykjavik", "ʁ ɛ | ɪ | k j a | v ɪ k", "DE_CJ_ONSET_KEYS · `ˈʁɛɪ̯.kja.vɪk`"),
@@ -7005,6 +7092,33 @@ mod tests {
              is a word quietly flipping to the onset. Either way somebody has to look."
         );
 
+        // ★★ S112 §C24e — the same treatment for the ⟨gn⟩ row: a spelling row without a key-set
+        // assertion is unsupervised. Counted PRECISELY (a blocked position whose preceding phone is
+        // /n/) rather than "key contains ⟨gn⟩ and something got blocked" — the loose version returns
+        // 45 because `sognefjord` is So-gne-fjord, blocked by the ⟨fj⟩ row at a different site, and
+        // a number that quietly includes a word the row never touched is worse than no number.
+        let gn_reached = d
+            .map
+            .keys()
+            .filter(|k| k.contains("gn"))
+            .filter(|k| {
+                let ph: Vec<String> =
+                    d.map[k.as_str()].split_whitespace().map(str::to_string).collect();
+                d.de_literal_j_blocks(k, &ph).iter().any(|&p| p >= 1 && ph[p - 1] == "n")
+            })
+            .count();
+        assert_eq!(
+            gn_reached, 44,
+            "the ⟨gn⟩ row now holds {gn_reached} keys at the coda, not 44. This population is \
+             `mignon` / `champignon` / the `kampagne` family / `bretagne` / `lasagne` / `cognac` / \
+             `avignon` / `bologna` / `sauvignon` …, measured 0 confirmed : 5 refuted for the ONSET \
+             reading before the row existed. A NEW member is a Romance ⟨gn⟩ word returning to its \
+             pre-s110 cut (fine, but say so); a LOST one is such a word quietly going back to the \
+             onset, which is the regression this row exists to undo. ⚠ Two of the 44 (`designs`, \
+             `industriedesigns`) have a broken upstream row — `d ɪ z aj n j uː s` for a word German \
+             says [dɪˈzaɪ̯ns], no /j/ at all — so they are neutral either way and belong to §C22."
+        );
+
         ambiguous.sort_unstable();
         ambiguous.dedup();
         assert_eq!(
@@ -7054,19 +7168,27 @@ mod tests {
                                   consonants between syllables and must never add or remove one");
         assert_eq!(bad_seq, 0, "{bad_seq} German words changed their PHONE SEQUENCE");
         assert_eq!(
-            moved, 611,
-            "§C24 + §C24b now re-cut {moved} German word types, not 611. This number is CUMULATIVE \
-             over the whole spelling-guard line and its history is reconciled word by word, never \
-             re-baselined: 431 (S110) + 2 (`DE_CJ_ONSET_KEYS` leaving) + 59 (S111 §C24c's devoiced \
-             rows) + 119 (S111 §C24b's licensed ⟨lli⟩+V family) = 611. ⚠ It passed through 473 and \
-             592 mid-session while the lenis rows were deleted; those two values described a state \
-             that was measured down and reverted, and are recorded only so the history reads \
-             straight. Per-consonant CLUSTER MOVES today (they sum to 612, one more than the word \
-             types, because `landesjugendjazzorchester` moves at two sites — /s/ and /t/): \
-             /n/ 313 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
+            moved, 567,
+            "§C24 + §C24b + §C24e now re-cut {moved} German word types, not 567. This number is \
+             CUMULATIVE over the whole spelling-guard line and its history is reconciled word by \
+             word, never re-baselined: 431 (S110) + 2 (`DE_CJ_ONSET_KEYS` leaving) + 59 (S111 \
+             §C24c's devoiced rows) + 119 (S111 §C24b's licensed ⟨lli⟩+V family) = 611, \
+             − 44 (S112 §C24e's Romance ⟨gn⟩) = 567. ⚠ THE MINUS IS THE POINT: those 44 keys LEAVE \
+             the re-cut set because the ⟨gn⟩ guard returns them to the cut they had BEFORE §C24. \
+             S110 admitted `n j` as one member and it was two populations — ⟨ni⟩+V (235 sites, \
+             96 confirmed : 0 refuted) and ⟨gn⟩ (44 sites, 0 confirmed : 5 refuted). \
+             ⚠ It passed through 473 and 592 mid-S111 while the lenis rows were deleted; those two \
+             values described a state that was measured down and reverted, and are recorded only so \
+             the history reads straight. Per-consonant CLUSTER MOVES today (they sum to 568, one \
+             more than the word types, because `landesjugendjazzorchester` moves at two sites — \
+             /s/ and /t/): \
+             /n/ 269 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
              /ts/ 5 · /k/ 2 · /v/ 1. Independently recomputed by \
-             `TESTING\\s111_c24bc_ruler\\blast_c24b.py`; a dictionary regeneration can legitimately \
-             move this — re-run that script and reconcile before touching the number. Two \
+             `TESTING\\s111_c24bc_ruler\\blast_c24b.py` — which since S112 PARSES all three \
+             constants out of this file; it used to hard-code `DE_CJ_ONSET_KEYS` and \
+             `DE_LJ_CODA_SPELLINGS`, so it would have gone on reporting the pre-§C24e number and \
+             manufactured one fake disagreement. A dictionary regeneration can legitimately move \
+             this — re-run that script and reconcile before touching the number. Two \
              implementations disagreeing is information (S108)."
         );
 
