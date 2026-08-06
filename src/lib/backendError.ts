@@ -342,6 +342,11 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_INTERNAL_ASSET_BRANCH: { key: "backend.TRAINING_INTERNAL_ASSET_BRANCH" },
   TRAINING_KILL_FAILED: { key: "backend.TRAINING_KILL_FAILED" },
   TRAINING_MULTI_BACKEND: { key: "backend.TRAINING_MULTI_BACKEND" },
+  // S114 §F5-3 divergence guard (numerics.DivergenceGuard → protocol error).
+  // Community issue #2: every loss went nan ~600 steps after a resume, the loop
+  // ran 13+ more hours, and the previously valid *_best.pth was overwritten with
+  // the poisoned weights. The run now dies loudly instead.
+  TRAINING_NUMERICS_DIVERGED: { key: "backend.TRAINING_NUMERICS_DIVERGED" },
   TRAINING_NAME_EMPTY: { key: "backend.TRAINING_NAME_EMPTY" },
   TRAINING_NO_DATA: { key: "training.needData" },
   TRAINING_NO_SHARED_POOL: { key: "backend.TRAINING_NO_SHARED_POOL" },

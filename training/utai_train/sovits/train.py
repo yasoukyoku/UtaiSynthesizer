@@ -46,6 +46,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
+from .. import numerics
 from . import utils
 from .data_utils import TextAudioCollate, TextAudioSpeakerLoader
 from .flist import resolve_speakers
@@ -167,6 +168,9 @@ def train(cfg, exp_dir, reporter, stop):
 
     scaler = device_shim.make_scaler(amp_backend, hps.train.fp16_run)
     half_type = torch.bfloat16 if hps.train.half_type == "bf16" else torch.float16
+    # S114 §F5-3 (community issue #2, reported on the RVC trainer — this loop has
+    # the identical open-coded best tracking, so it had the identical defect).
+    divergence = numerics.DivergenceGuard((("G", net_g), ("D", net_d)), logger=logger)
 
     weights_dir = os.path.join(exp_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
@@ -196,11 +200,17 @@ def train(cfg, exp_dir, reporter, stop):
     final_path = None
     last_epoch = epoch_str - 1
 
-    def save_best(epoch):
-        export_release(net_g.state_dict(), best_path, epoch, hps.train.learning_rate)
+    # S114 §F5-3: returns False without touching anything when the weights are
+    # already poisoned; the caller must then leave best_metric/best_step alone.
+    def save_best(epoch, metric, step):
+        state = net_g.state_dict()
+        if not numerics.best_save_is_safe(state, logger):
+            return False
+        export_release(state, best_path, epoch, hps.train.learning_rate)
         with open(best_state_path, "w", encoding="utf-8") as f:
-            json.dump({"metric": best_metric, "step": best_step}, f)
-        reporter.ckpt("best", best_path, best_step, epoch, metric=best_metric)
+            json.dump({"metric": metric, "step": step}, f)
+        reporter.ckpt("best", best_path, step, epoch, metric=metric)
+        return True
 
     def save_gd(epoch, step):
         # step = the number of the last EXECUTED update: upstream saves inside
@@ -306,22 +316,25 @@ def train(cfg, exp_dir, reporter, stop):
                     BEST_EMA_ALPHA * raw_mel + (1 - BEST_EMA_ALPHA) * ema_mel
                 )
             lr = optim_g.param_groups[0]['lr']
+            step_losses = {
+                "g_total": float(loss_gen_all),
+                "d_total": float(loss_disc_all),
+                "gen": float(loss_gen),
+                "fm": float(loss_fm),
+                "mel": raw_mel,
+                "kl": float(loss_kl),
+                "lf0": float(loss_lf0),
+            }
             reporter.step(
                 global_step,
                 total_steps,
                 epoch,
                 total_epochs,
                 lr,
-                {
-                    "g_total": float(loss_gen_all),
-                    "d_total": float(loss_disc_all),
-                    "gen": float(loss_gen),
-                    "fm": float(loss_fm),
-                    "mel": raw_mel,
-                    "kl": float(loss_kl),
-                    "lf0": float(loss_lf0),
-                },
+                step_losses,
             )
+            # AFTER reporter.step on purpose — see the rvc trainer's note.
+            divergence.observe(global_step, step_losses)
 
             if global_step % hps.train.log_interval == 0:
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
@@ -394,9 +407,9 @@ def train(cfg, exp_dir, reporter, stop):
                     and math.isfinite(ema_mel)
                     and (best_metric is None or ema_mel < best_metric)
                 ):
-                    best_metric = ema_mel
-                    best_step = global_step
-                    save_best(epoch)
+                    if save_best(epoch, ema_mel, global_step):
+                        best_metric = ema_mel
+                        best_step = global_step
                 final_path = path
             break
 
@@ -405,9 +418,9 @@ def train(cfg, exp_dir, reporter, stop):
             and math.isfinite(ema_mel)
             and (best_metric is None or ema_mel < best_metric)
         ):
-            best_metric = ema_mel
-            best_step = global_step
-            save_best(epoch)
+            if save_best(epoch, ema_mel, global_step):
+                best_metric = ema_mel
+                best_step = global_step
 
         now = time.time()
         logger.info('====> Epoch: %s, cost %.2f s', epoch, now - start_time)

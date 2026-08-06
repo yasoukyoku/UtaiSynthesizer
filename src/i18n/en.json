@@ -938,6 +938,7 @@
     "TRAINING_RUNTIME_VARIANT_MISSING": "The training runtime pack for the selected GPU disappeared before the run started — aborted; reinstall it under Settings → Training Runtime",
     "TRAINING_GPU_UNAVAILABLE": "Training could not access the selected GPU — the run was aborted. Check the GPU driver and try again; if this machine's GPU does not support accelerated training, enable \"Force CPU training\" in the parameters step to proceed",
     "TRAINING_RUNTIME_CPU_ONLY": "A GPU was detected, but only the CPU training runtime pack is installed — the run was aborted instead of silently training on CPU. Install the runtime pack matching your GPU in Settings → Training Runtime; if you really mean to train on CPU, enable \"Force CPU training\" in the parameters step to proceed",
+    "TRAINING_NUMERICS_DIVERGED": "Training diverged numerically (the losses became nan/inf) — the run was aborted instead of carrying on for hours with broken weights. Your previous \"best\" checkpoint was NOT overwritten and is still usable. Things to try: resume from an earlier checkpoint, lower the learning rate, or check the dataset for corrupt audio",
     "TRAINING_IMPORT_COPY_FAILED": "Failed to import a data file",
     "TRAINING_INTERNAL_ASSET_BRANCH": "Training backend is missing its asset-resolution branch (internal error)",
     "TRAINING_KILL_FAILED": "Failed to kill the training process",

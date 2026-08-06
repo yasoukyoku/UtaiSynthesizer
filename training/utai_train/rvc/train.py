@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import device as device_shim  # aliased: 'device' is a collision-prone name in torch code (device = torch.device(...))
+from .. import numerics
 from . import train_utils as utils
 from .infer_pack import commons
 from .data_utils import (
@@ -203,6 +204,9 @@ def train(cfg, exp_dir, reporter, stop):
     )
 
     scaler = device_shim.make_scaler(amp_backend, hps.train.fp16_run)
+    # S114 §F5-3 (community issue #2): halt a run whose losses have gone nan
+    # instead of burning hours writing poisoned weights.
+    divergence = numerics.DivergenceGuard((("G", net_g), ("D", net_d)), logger=logger)
 
     weights_dir = os.path.join(exp_dir, "weights")
     os.makedirs(weights_dir, exist_ok=True)
@@ -229,11 +233,18 @@ def train(cfg, exp_dir, reporter, stop):
     last_epoch = epoch_str - 1
     cache = []
 
-    def save_best(epoch):
+    # S114 §F5-3: the caller must NOT advance best_metric/best_step until this
+    # returns True — see numerics.best_save_is_safe for why the metric alone
+    # cannot catch a poisoned state (the EMA freezes, so the number it is
+    # compared against is a stale HEALTHY one).
+    def save_best(epoch, metric, step):
+        if not numerics.best_save_is_safe(net_g.state_dict(), logger):
+            return False
         save_small("%s_best" % hps.name, epoch)
         with open(best_state_path, "w", encoding="utf-8") as f:
-            json.dump({"metric": best_metric, "step": best_step}, f)
-        reporter.ckpt("best", best_path, best_step, epoch, metric=best_metric)
+            json.dump({"metric": metric, "step": step}, f)
+        reporter.ckpt("best", best_path, step, epoch, metric=metric)
+        return True
 
     def save_gd(epoch):
         if hps.if_latest == 0:
@@ -404,21 +415,25 @@ def train(cfg, exp_dir, reporter, stop):
                     BEST_EMA_ALPHA * raw_mel + (1 - BEST_EMA_ALPHA) * ema_mel
                 )
             lr = optim_g.param_groups[0]["lr"]
+            step_losses = {
+                "g_total": float(loss_gen_all),
+                "d_total": float(loss_disc),
+                "gen": float(loss_gen),
+                "fm": float(loss_fm),
+                "mel": raw_mel,
+                "kl": float(loss_kl),
+            }
             reporter.step(
                 global_step,
                 total_steps,
                 epoch,
                 hps.total_epoch,
                 lr,
-                {
-                    "g_total": float(loss_gen_all),
-                    "d_total": float(loss_disc),
-                    "gen": float(loss_gen),
-                    "fm": float(loss_fm),
-                    "mel": raw_mel,
-                    "kl": float(loss_kl),
-                },
+                step_losses,
             )
+            # AFTER reporter.step on purpose: the step that trips the guard is the
+            # evidence, so the UI must still receive it before the run dies.
+            divergence.observe(global_step, step_losses)
 
             if global_step % hps.train.log_interval == 0:
                 logger.info(
@@ -489,9 +504,9 @@ def train(cfg, exp_dir, reporter, stop):
                     and math.isfinite(ema_mel)
                     and (best_metric is None or ema_mel < best_metric)
                 ):
-                    best_metric = ema_mel
-                    best_step = global_step
-                    save_best(epoch)
+                    if save_best(epoch, ema_mel, global_step):
+                        best_metric = ema_mel
+                        best_step = global_step
                 final_path = path
             break
 
@@ -506,9 +521,9 @@ def train(cfg, exp_dir, reporter, stop):
             and math.isfinite(ema_mel)
             and (best_metric is None or ema_mel < best_metric)
         ):
-            best_metric = ema_mel
-            best_step = global_step
-            save_best(epoch)
+            if save_best(epoch, ema_mel, global_step):
+                best_metric = ema_mel
+                best_step = global_step
 
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
 

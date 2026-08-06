@@ -2484,6 +2484,86 @@ fn run_worker(
 mod tests {
     use super::*;
 
+    /// S114 §F5-3: the numerical-divergence guard is python, so `cargo test` cannot
+    /// exercise its behaviour — that is `converter/verify/training/gate_numerics_guard.py`
+    /// (38 checks, 10 mutation probes). What CAN rot without anyone noticing is the
+    /// cross-language contract, and that is what this pins, in the same
+    /// `include_str!` style as `s113_alias_hint_wire_matches_the_ts_union` and
+    /// `shipped_dictionaries_match_the_committed_manifest`.
+    ///
+    /// The failure this prevents is concrete: the trainer raises
+    /// `RuntimeError("TRAINING_NUMERICS_DIVERGED: ...")`, `runner.py` turns it into a
+    /// protocol error, and the frontend maps the CODE to i18n. Rename the CODE on the
+    /// python side, or ship a language whose json never got the key, and the user sees
+    /// a raw English CODE at the exact moment their training just died — the S67
+    /// `TRAINING_GPU_UNAVAILABLE` chain has the identical shape.
+    ///
+    /// ⚠ It pins TEXT, not behaviour. If you rename the constant, this test tells you
+    /// the four other places that have to move with it; that IS the point.
+    #[test]
+    fn s114_divergence_code_is_wired_across_python_rust_and_all_three_locales() {
+        static NUMERICS_PY: &str = include_str!("../../../training/utai_train/numerics.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        // The CODE's single source is the python constant — parse it, never retype it.
+        let code = NUMERICS_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("CODE_DIVERGED = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect(
+                "numerics.py must keep `CODE_DIVERGED = \"...\"` as a plain top-level literal — \
+                 this gate parses it as the single source for the i18n key",
+            );
+        assert!(
+            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+            "the CODE crosses a process boundary and lands in json keys: keep it SCREAMING_SNAKE ascii, got {code:?}"
+        );
+
+        assert!(
+            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\" }}")),
+            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+        );
+
+        for (lang, raw) in [
+            ("zh", include_str!("../../../src/i18n/zh.json")),
+            ("en", include_str!("../../../src/i18n/en.json")),
+            ("ja", include_str!("../../../src/i18n/ja.json")),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v.pointer(&format!("/backend/{code}")).and_then(|m| m.as_str());
+            let msg = msg.unwrap_or_else(|| {
+                panic!("src/i18n/{lang}.json is missing backend.{code} (docs are trilingual and so is this)")
+            });
+            // A stub like "TODO" would satisfy a mere presence check; this text is what a
+            // user reads while their run is dying, so require it to actually say something.
+            assert!(
+                msg.chars().count() >= 30,
+                "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                msg.chars().count()
+            );
+        }
+
+        // And the guard must still be CALLED. A guard nobody calls passes review and
+        // protects nothing (S109 §G14: `sync_bundled_dictionaries` had exactly one
+        // production call site and nothing pinned it).
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("divergence.observe("),
+                "{name}/train.py no longer calls divergence.observe() — a run that goes nan would \
+                 again burn hours in silence"
+            );
+            assert!(
+                src.contains("numerics.best_save_is_safe("),
+                "{name}/train.py no longer consults numerics.best_save_is_safe() — save_best would \
+                 again be free to overwrite a good checkpoint with nan weights"
+            );
+        }
+    }
+
     fn tmp_ws(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("utai_ws_test_{}_{}", tag, uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
