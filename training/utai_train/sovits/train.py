@@ -33,6 +33,16 @@
 #   - DataLoader gets persistent_workers when num_workers > 0 (Windows spawn
 #     would otherwise re-import torch in every worker at EVERY epoch; math
 #     unchanged, only the volume-aug RNG stream differs from a per-epoch respawn)
+#   - ★the DataLoader worker/prefetch numbers below are a REQUEST, not the final
+#     values: loader_budget.plan_loader steps them DOWN (reduce-only) when this
+#     machine's Windows commit budget is short (S114 §F5-1 — the "training froze"
+#     reports are err 1455, "the paging file is too small"). A machine with room
+#     gets upstream's numbers unchanged, so the loss-trajectory gate is unaffected
+#     there; a tight machine deliberately deviates from upstream rather than
+#     deadlocking. (S115 added this line: the adaptation was documented inline but
+#     NOT registered here, while the far smaller persistent_workers deviation above
+#     was — a reader trusting this register would have believed upstream's numbers
+#     always reach the DataLoader.)
 import json
 import logging
 import math
@@ -118,6 +128,14 @@ def train(cfg, exp_dir, reporter, stop):
     collate_fn = TextAudioCollate()
     all_in_mem = hps.train.all_in_mem
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps, all_in_mem=all_in_mem)
+    # ★S115 (§G15-⑤ was "check, not fix" — this is the answer, so nobody re-opens it):
+    # the 5 is UPSTREAM's own number, not something we picked. Byte-identical, indent
+    # included (87 bytes, same sha256), to so-vits-svc 4.1-Stable train.py @730930d —
+    # the pin in this file's header. Measured over that clone's entire object store:
+    # 918 of the 965 revisions that carry train.py have this exact line, and ZERO carry
+    # a `4` variant of the expression. The 4 you may be looking for belongs to a
+    # DIFFERENT codebase — the 4.0-v2 lineage @cf5a8fb, which moved the loader into
+    # data_utils.py — and that is what sovits_v2/ vendors.
     num_workers = 5 if multiprocessing.cpu_count() > 4 else multiprocessing.cpu_count()
     if all_in_mem:
         num_workers = 0

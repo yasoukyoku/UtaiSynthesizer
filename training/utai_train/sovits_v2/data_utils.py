@@ -21,6 +21,12 @@
 #     persistent_workers on Windows (per-epoch worker respawn re-imports torch
 #     every epoch; math unchanged — only the >550-crop draws of worker
 #     processes come from per-worker RNG either way)
+#   - ★those worker/prefetch numbers are a REQUEST, not the final values:
+#     loader_budget.plan_loader steps them DOWN (reduce-only) when this machine's
+#     Windows commit budget is short (S114 §F5-1 — err 1455, "the paging file is
+#     too small"). A machine with room gets the numbers above unchanged; a tight
+#     machine deliberately deviates rather than deadlocking. (S115 added this
+#     line — the adaptation was documented inline but never registered here.)
 import os
 import random
 import numpy as np

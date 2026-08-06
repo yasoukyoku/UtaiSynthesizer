@@ -19,6 +19,14 @@
 #   - on natural completion also saves latest G/D (upstream's resume point was
 #     the last save_every_epoch boundary, losing tail epochs)
 #   - normal termination emits the protocol "done" (upstream: os._exit(2333333))
+#   - ★upstream's DataLoader worker/prefetch numbers (4 / 8, vendored verbatim
+#     together with their own 8->4 comment) are a REQUEST, not the final values:
+#     loader_budget.plan_loader steps them DOWN (reduce-only) when this machine's
+#     Windows commit budget is short (S114 §F5-1 — err 1455, "the paging file is
+#     too small"). A machine with room gets upstream's numbers unchanged, so the
+#     loss-trajectory gate is unaffected there; a tight machine deliberately
+#     deviates rather than deadlocking. (S115 added this line — the adaptation was
+#     documented inline but never registered here.)
 import datetime
 import json
 import logging
