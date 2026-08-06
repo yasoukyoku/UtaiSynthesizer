@@ -5,6 +5,13 @@
 //!     cargo test --test pyenv_pack -- --ignored --nocapture
 //!
 //! Optional: UTAI_TEST_ROOT=<dir> (default %TEMP%\utai_pyenv_test — WIPED each run).
+//!           ⛔ NEVER point it at the repo's data/ — step 0 is `remove_dir_all(root)`.
+//! Optional: UTAI_PACK_DEVICE=cpu|cuda|xpu to override the envtest tier. By default the
+//!           tier comes from the pack's variant via `pyenv::envtest_device_for_variant`,
+//!           the same function the app uses (S115 — before that this harness passed no
+//!           --device at all, and envtest defaults to `cpu`, so a GPU pack could pass
+//!           here without a single GPU check having run). Use the override only to run a
+//!           GPU pack's CPU half on a box that lacks the device, and say so when you do.
 //! The envtest step runs against the repo's real training/ dir (utai_train.envtest).
 //!
 //! ⚠️ File deliberately NOT named `pyenv_install.rs`: Windows Installer Detection
@@ -68,9 +75,23 @@ fn install_local_pack_and_envtest() {
     let training = repo.join("training");
     assert!(training.join("utai_train").join("envtest.py").exists());
     let report_path = root.join("runtimes").join(&meta.id).join("envtest.json");
+    // ★S115: the tier MUST be derived from the pack's variant, through the SAME function
+    // the app uses. envtest's own `--device` defaults to `cpu`, and this harness used to
+    // pass no --device at all — so re-verifying a GPU pack here produced a green badge
+    // from a run that never touched the GPU (`cuda_driver`, `gpu_stft_vs_cpu`,
+    // `gpu_amp_step` and `fallback_ops` all report "not applicable to this tier"). That is
+    // precisely the false-green `envtest_device_for_variant`'s own doc warns about,
+    // reached through a different door.
+    // On a box WITHOUT that device the run is expected to fail loudly — measured S115: the
+    // xpu pack reports `XPU_NO_DEVICE: torch.xpu.is_available()=False` and overall=fail.
+    // That failure is not a nuisance, it is the control that proves the passing runs
+    // actually reached the device.
+    let device = std::env::var("UTAI_PACK_DEVICE")
+        .unwrap_or_else(|_| utai_lib::pyenv::envtest_device_for_variant(&meta.variant).to_string());
+    println!("envtest tier: variant {:?} -> --device {device}", meta.variant);
     let status = utai_lib::util::python_command(&py)
         .current_dir(&training)
-        .args(["-m", "utai_train.envtest", "--out"])
+        .args(["-m", "utai_train.envtest", "--device", &device, "--out"])
         .arg(&report_path)
         .status()
         .unwrap();

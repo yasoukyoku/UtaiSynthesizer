@@ -639,6 +639,29 @@ pub fn envtest_active() -> bool {
     ENVTEST_BUSY.load(Ordering::SeqCst)
 }
 
+/// The envtest tier a pack must pass, from its variant. AMD deliberately maps to
+/// "cuda": torch-hip exposes the `torch.cuda.*` namespace (design §4.2), so the
+/// cuda-tier checks ARE the ROCm checks. Forgetting this mapping when GPU packs
+/// land would hand GPU packs a green badge from a cpu-tier run — the exact silent
+/// false-green §2.6 exists to prevent.
+///
+/// ★S115 moved it here (from `commands::pyenv`, where it was private) so the manual
+/// end-to-end harness `tests/pyenv_pack.rs` can call the SAME mapping the app uses.
+/// It could not before, and so it ran `utai_train.envtest` with no `--device` at all
+/// — whose default is `cpu`. Re-verifying a GPU pack through that harness therefore
+/// produced a green that said nothing whatsoever about the GPU, which is the very
+/// false-green the paragraph above warns about, reached by a different door.
+/// ⛔ Do not re-privatise this or copy the match arms anywhere: two copies of this
+/// mapping is how the badge and the harness start disagreeing about the same pack.
+pub fn envtest_device_for_variant(variant: &str) -> &'static str {
+    match variant {
+        v if v.starts_with("nv") => "cuda",
+        "amd" => "cuda",
+        "xpu" => "xpu",
+        _ => "cpu",
+    }
+}
+
 /// Validate everything a REMOTE manifest feeds into filesystem paths — one gate,
 /// called right after fetch (covers the download flow; local installs derive part
 /// paths from a real directory listing and extract_and_commit re-validates the id).
@@ -1093,5 +1116,49 @@ pub fn sweep_staging() {
                 Err(e) => tracing::warn!("pyenv sweep: could not reclaim {} ({e})", path.display()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The variant→tier mapping is the ONLY thing between a GPU pack and a green badge
+    /// earned by a run that never touched a GPU — S115 found the manual E2E harness had
+    /// exactly that hole (it passed no `--device`, whose default is `cpu`, so four GPU
+    /// checks reported "not applicable to this tier" and the pack still went green).
+    /// Two halves, and the SECOND is the one that survives a new pack being added.
+    #[test]
+    fn s115_envtest_tier_is_derived_for_every_catalog_variant() {
+        // (1) the arms, including the counterintuitive one: torch-hip answers to
+        //     `torch.cuda.*`, so ROCm's tier IS the cuda tier.
+        assert_eq!(envtest_device_for_variant("amd"), "cuda");
+        assert_eq!(envtest_device_for_variant("nv-cu130"), "cuda");
+        assert_eq!(envtest_device_for_variant("xpu"), "xpu");
+        assert_eq!(envtest_device_for_variant("cpu"), "cpu");
+
+        // (2) tie it to the CATALOG. Exactly one shipped variant may take the cpu tier,
+        //     and it must be the one whose whole point is the cpu. A new GPU pack added
+        //     without extending the mapping lands in the `_ => "cpu"` arm and reddens
+        //     HERE, instead of shipping a self-test that skips everything it exists for.
+        for e in CATALOG {
+            let tier = envtest_device_for_variant(e.variant);
+            if e.variant == "cpu" {
+                assert_eq!(tier, "cpu", "the cpu pack must take the cpu tier");
+            } else {
+                assert_ne!(
+                    tier, "cpu",
+                    "catalog variant {:?} ({}) falls through to the cpu tier — extend \
+                     envtest_device_for_variant, or this pack's self-test will pass \
+                     without ever touching the device it exists for",
+                    e.variant, e.id
+                );
+            }
+        }
+
+        // …and pin the TABLE too, so the loop above can never pass vacuously (S105: an
+        // assertion over a table needs a second one that only the table can fail).
+        assert_eq!(CATALOG.len(), 4, "catalog size changed — re-read the loop above");
+        assert_eq!(CATALOG.iter().filter(|e| e.variant != "cpu").count(), 3);
     }
 }

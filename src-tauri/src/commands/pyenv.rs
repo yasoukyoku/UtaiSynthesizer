@@ -468,19 +468,10 @@ pub async fn delete_runtime_pack(
 /// python.exe) must not leave a zombie + a forever-spinning badge.
 const ENVTEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The envtest tier a pack must pass, from its variant. AMD deliberately maps to
-/// "cuda": torch-hip exposes the `torch.cuda.*` namespace (design §4.2), so the
-/// cuda-tier checks ARE the ROCm checks. Forgetting this mapping when GPU packs
-/// land would hand GPU packs a green badge from a cpu-tier run — the exact silent
-/// false-green §2.6 exists to prevent.
-fn envtest_device_for_variant(variant: &str) -> &'static str {
-    match variant {
-        v if v.starts_with("nv") => "cuda",
-        "amd" => "cuda",
-        "xpu" => "xpu",
-        _ => "cpu",
-    }
-}
+/// S115: the variant→tier mapping moved to `pyenv::envtest_device_for_variant` (with its
+/// reasoning) so the manual E2E harness `tests/pyenv_pack.rs` can use the same one. It is
+/// re-exported here only because this module's call site reads better with a short name.
+use crate::pyenv::envtest_device_for_variant;
 
 /// Per-failed-check detail cap — a check's detail carries a source location, and an error
 /// toast must not become a wall of text (the Settings panel renders the full breakdown).
