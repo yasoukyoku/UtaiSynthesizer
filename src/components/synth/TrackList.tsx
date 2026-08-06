@@ -210,6 +210,7 @@ export function TrackList({ width }: Props) {
   const vocalUnknownPhone = useAppStore((s) => s.vocalUnknownPhone); // S109 §C15: 音素写错 ≠ 歌词不认识
   const vocalDropped = useAppStore((s) => s.vocalDropped); // S85b: too-short dropped notes(独立文案)
   const vocalShort = useAppStore((s) => s.vocalShort); // S87: rescued notes — advisory, amber badge
+  const vocalAliasHint = useAppStore((s) => s.vocalAliasHint); // S113 §C14: 别名形状提示 — advisory
 
   const menuItems: MenuItem[] = (() => {
     if (!menu) return [];
@@ -366,6 +367,7 @@ export function TrackList({ width }: Props) {
             hasUnknownPhone={track.segments.some((sg) => (vocalUnknownPhone[sg.id]?.length ?? 0) > 0)}
             hasDropped={track.segments.some((sg) => (vocalDropped[sg.id]?.length ?? 0) > 0)}
             hasShort={track.segments.some((sg) => (vocalShort[sg.id]?.length ?? 0) > 0)}
+            hasAliasHint={track.segments.some((sg) => (vocalAliasHint[sg.id]?.length ?? 0) > 0)}
           />
           </Fragment>
         ))}
@@ -443,6 +445,10 @@ interface TrackItemProps {
   /** S87: some note was rescued by a frame borrow — ADVISORY (it sounds), so the badge turns amber
    *  rather than red unless a blocking finding is also present. */
   hasShort: boolean;
+  /** S113 (§C14): some note's ALIAS resolved to a shape its convention cannot produce (an English
+   *  word typed into an alias track). ADVISORY like `hasShort` — the note sounds, and it sounds
+   *  exactly as it did before this channel existed. Fourth line of the same tooltip. */
+  hasAliasHint: boolean;
 }
 
 function TrackItem({
@@ -472,6 +478,7 @@ function TrackItem({
   hasUnknownPhone,
   hasDropped,
   hasShort,
+  hasAliasHint,
 }: TrackItemProps) {
   const { t } = useTranslation();
   const colorVar = trackTypeCssVar(track.trackType);
@@ -582,7 +589,9 @@ function TrackItem({
                 too-short note is not a lyric problem and must not read as one(用户实机反馈). */}
             {/* S87: …and a third line for RESCUED notes, which are ADVISORY — the badge only goes red when
                 something actually will not sound; a track whose only finding is a borrow shows amber. */}
-            {(hasOov || hasUnknownPhone || hasDropped || hasShort) && (
+            {/* S113 §C14: …and a fourth, also advisory — the alias resolved and sings, it just does
+                not have a shape the chosen convention can make. */}
+            {(hasOov || hasUnknownPhone || hasDropped || hasShort || hasAliasHint) && (
               <span
                 className={
                   hasOov || hasUnknownPhone || hasDropped ? "track-oov-badge" : "track-oov-badge advisory"
@@ -594,6 +603,7 @@ function TrackItem({
                   hasUnknownPhone ? t("tracks.unknownPhoneWarning") : null,
                   hasDropped ? t("tracks.droppedWarning") : null,
                   hasShort ? t("tracks.shortWarning") : null,
+                  hasAliasHint ? t("tracks.aliasHintWarning") : null,
                 ]
                   .filter(Boolean)
                   .join("\n")}

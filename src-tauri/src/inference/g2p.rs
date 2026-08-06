@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use super::g2p_alias::{alias_phones, PhonemeSet};
+use super::g2p_alias::{alias_phones, AliasHint, PhonemeSet};
 use super::g2p_tables as gt;
 use super::score2cv::{classify_lyric as classify_lyric_ja, is_nucleus_phone, LyricClass};
 use super::score2cv_tables as tbl;
@@ -2334,6 +2334,16 @@ pub struct ResolvedNote {
     /// "IPA nucleus-capable" over all 863018 en.tsv tokens, so the count matches the resolved
     /// nuclei BY CONSTRUCTION — the allocator still re-verifies and falls back to None on mismatch.
     pub nucleus_stress: Option<Vec<u8>>,
+    /// S113 (§C14) — a NON-ERROR remark about a note that RESOLVED. Nothing downstream of the
+    /// render reads it: the phones, the frames and the audio are byte-identical with it present or
+    /// absent. It exists so the editor can tell the user "this alias produced a two-syllable shape,
+    /// which no bank sample is" instead of leaving it silent.
+    ///
+    /// A field on the note rather than on `ResolvedKind::Phones` because it is orthogonal to WHY
+    /// the note resolved (an alias hint must not have to be re-stated by every future variant), and
+    /// because putting it here makes the compiler ask every construction site — which is exactly
+    /// how S109 found the two sites that were dropping `Unknown { phone }`.
+    pub hint: Option<AliasHint>,
 }
 
 /// Universal reserved-token classes (identical in every language — they are checked BEFORE any
@@ -2497,6 +2507,10 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
     // A FAILED alias is recorded, never fallen back on: 31-38 % of these aliases are also real en.tsv
     // keys (`ju`, `to`, `E`, `O`), so "try the alias, else look it up" would sing a different WORD.
     let mut alias_failed: Vec<bool> = vec![false; score.len()];
+    // S113 (§C14): a resolved alias may ALSO carry a non-error remark. Collected here, beside the
+    // phones, because this is the one place that knows a note came from the alias path at all —
+    // downstream the alias is indistinguishable from any other `phoneme_input` override, by design.
+    let mut alias_hint: Vec<Option<AliasHint>> = vec![None; score.len()];
     let alias_owned: Vec<Option<String>> = score
         .iter()
         .enumerate()
@@ -2509,7 +2523,10 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                 return None;
             }
             match alias_phones(e.phoneme_set, e.lyric) {
-                Some(Ok(ph)) => Some(ph),
+                Some(Ok(reading)) => {
+                    alias_hint[i] = reading.hint;
+                    Some(reading.phones)
+                }
                 Some(Err(_sym)) => {
                     alias_failed[i] = true;
                     None
@@ -2755,19 +2772,19 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
         match toks[i] {
             Tok::Rest => {
                 carrier = None;
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Rest, run_lang, is_sustain: false, nucleus_stress: None });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Rest, run_lang, is_sustain: false, nucleus_stress: None, hint: None });
                 i += 1;
             }
             Tok::Breath => {
                 carrier = None;
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Breath, run_lang, is_sustain: false, nucleus_stress: None });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Breath, run_lang, is_sustain: false, nucleus_stress: None, hint: None });
                 i += 1;
             }
             Tok::Hold | Tok::Next => {
                 // an orphan sustain (span-attached ones were consumed below): legacy ja semantics —
                 // re-emit the carrier nucleus, default "a".
                 let ph = vec![carrier.unwrap_or("a")];
-                out[i] = Some(ResolvedNote { kind: ResolvedKind::Phones(ph), run_lang, is_sustain: true, nucleus_stress: None });
+                out[i] = Some(ResolvedNote { kind: ResolvedKind::Phones(ph), run_lang, is_sustain: true, nucleus_stress: None, hint: None });
                 i += 1;
             }
             Tok::Word => {
@@ -2785,7 +2802,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                     carrier = None;
                     // No phone to name: the ALIAS tokenizer failed before any note resolver ran, so
                     // the payload is the convention + lyric (see `VOCAL_ALIAS` above), not a phone.
-                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: None }, run_lang, is_sustain: false, nucleus_stress: None });
+                    out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: None }, run_lang, is_sustain: false, nucleus_stress: None, hint: None });
                     i += 1;
                     continue;
                 }
@@ -2811,13 +2828,14 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                     run_lang,
                                     is_sustain: false,
                                     nucleus_stress: None,
+                                    hint: None,
                                 });
                             }
                             Err(fail) => {
                                 if strict {
                                     return Err(fail.into_error(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None, hint: None });
                             }
                         }
                         i += 1;
@@ -2858,6 +2876,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                         run_lang: run_langs[i + j],
                                         is_sustain: j > 0,
                                         nucleus_stress: stress,
+                                        hint: None,
                                     });
                                 }
                             }
@@ -2865,7 +2884,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                 if strict {
                                     return Err(fail.into_error(evt.lyric));
                                 }
-                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None });
+                                out[i] = Some(ResolvedNote { kind: ResolvedKind::Unknown { phone: fail.unknown_phone() }, run_lang, is_sustain: false, nucleus_stress: None, hint: None });
                                 for j in i + 1..span_end {
                                     // the sustains still resolve (hold "a") so ONLY the word marks OOV
                                     out[j] = Some(ResolvedNote {
@@ -2873,6 +2892,7 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
                                         run_lang: run_langs[j],
                                         is_sustain: true,
                                         nucleus_stress: None,
+                                        hint: None,
                                     });
                                 }
                             }
@@ -2885,7 +2905,29 @@ fn resolve_core(score: &[ScoreEvt], dicts: &dyn DictSource, strict: bool) -> Res
         }
     }
 
-    Ok(out.into_iter().map(|o| o.expect("every note resolved")).collect())
+    // S113 (§C14) — attach the alias remarks LAST, and only to notes that actually resolved to
+    // phones. Doing it here rather than at each construction site keeps the property visible in one
+    // place: a hint is a remark ABOUT A READING, so a note that ended up `Unknown`/`Rest`/`Breath`
+    // must never carry one (an OOV note already has its own, louder channel — S109 §C15 — and two
+    // messages on one note is how a channel starts getting ignored).
+    //
+    // ⚠ THE `Phones` CHECK IS INERT TODAY, and saying so is the point (S111: "behaviourally
+    // unreachable" and "structurally unguarded" are two different questions, and claiming a guard
+    // is load-bearing when it is not leaves a false evidence trail). A hint only exists where
+    // `alias_phones` returned `Ok`, and every phone those tables can emit is proven to survive
+    // `stage2` (`alias_tables_emit_only_real_arpabet`) — so an alias note cannot resolve here and
+    // then fail downstream. MEASURED: deleting the check leaves the whole S113 gate green
+    // (`TESTING/s113_dictline/mutate_s113_c14.py`, probe M6). It stays because it states the
+    // invariant for whatever variant is added next, not because anything reaches it now.
+    let mut out: Vec<ResolvedNote> = out.into_iter().map(|o| o.expect("every note resolved")).collect();
+    for (i, h) in alias_hint.into_iter().enumerate() {
+        if let (Some(h), Some(n)) = (h, out.get_mut(i)) {
+            if matches!(n.kind, ResolvedKind::Phones(_)) {
+                n.hint = Some(h);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Why ONE sung word note did not resolve — the distinction the USER sees in the message.
@@ -3009,7 +3051,7 @@ fn zh_lyric_hanzi(zh: &ZhDict, lyric: &str) -> Option<char> {
 /// silently ate the 、, and the tokenizer (correctly) refuses to consume it.
 fn ja_word_phones(token: &str) -> Option<Vec<&'static str>> {
     lookup_candidates(token).iter().find_map(|cand| match classify_lyric_ja(&fold_katakana(cand)) {
-        LyricClass::Phones { phones } => Some(phones),
+        LyricClass::Phones { phones, .. } => Some(phones),
         _ => None,
     })
 }
@@ -3196,9 +3238,12 @@ pub fn classify_score(score: &[ScoreEvt], dicts: &dyn DictSource) -> Result<Vec<
             ResolvedKind::Breath => LyricClass::Breath,
             ResolvedKind::Phones(ph) => {
                 if nt.is_sustain {
+                    // A sustain carries no lyric of its own — it holds the previous note's vowel —
+                    // so an alias remark could not belong to it (and `resolve_core` only attaches
+                    // one to the note whose lyric produced it).
                     LyricClass::Sustain
                 } else {
-                    LyricClass::Phones { phones: ph }
+                    LyricClass::Phones { phones: ph, hint: nt.hint }
                 }
             }
             ResolvedKind::Unknown { phone } => LyricClass::Unknown { phone },
@@ -6135,6 +6180,85 @@ mod tests {
         let lenient = classify_score(&bad, &f).unwrap();
         assert!(matches!(lenient[0], LyricClass::Phones { .. }), "the readable alias still resolves");
         assert!(matches!(lenient[1], LyricClass::Unknown { .. }), "…and only the bad one is marked");
+    }
+
+    /// ★ S113 (§C14) — the alias HINT, end to end: `resolve_core` → `classify_score` → the wire.
+    ///
+    /// The channel exists because the tokenizer's only bound was on the consonant RUN, which clears
+    /// at every nucleus: an English word typed into an alias track resolved SILENTLY (`love` under
+    /// X-SAMPA = `[l oʊ v ɛ]`, pinned two tests up as the behaviour that must not change). The hint
+    /// says so without changing a single phone.
+    ///
+    /// Groups, most specific first (S108):
+    ///  (1) IT IS A REMARK, NOT A VERDICT — the render is byte-identical with the hint present.
+    ///  (2) IT RIDES ONLY THE NOTE THAT EARNED IT — not the neighbours, not a failure, not a sustain.
+    ///  (3) IT IS ALIAS-ONLY — the dictionary path can produce a three-nucleus note (`beautiful`) and
+    ///      must stay silent; the channel is about a CONVENTION's shape, not about syllable counts.
+    ///  (4) THE WIRE — absent ⇒ byte-identical to the pre-S113 shape; present ⇒ one added field.
+    #[test]
+    fn s113_alias_hint_reaches_the_editor_without_touching_the_render() {
+        let f = fixtures();
+        let class = |evts: &[ScoreEvt]| classify_score(evts, &f).unwrap();
+        let hint_of = |c: &LyricClass| match c {
+            LyricClass::Phones { hint, .. } => *hint,
+            _ => None,
+        };
+
+        // ── (1) A REMARK, NOT A VERDICT ─────────────────────────────────────────────────────────
+        let word_in_alias_track = [alias_evt("love", PhonemeSet::Xsampa)];
+        let c = class(&word_in_alias_track);
+        assert_eq!(hint_of(&c[0]), Some(AliasHint::MultipleNuclei));
+        assert!(matches!(c[0], LyricClass::Phones { .. }), "still a perfectly resolved note");
+        // the render does not merely "also work" — it produces the SAME phones it did before S113
+        assert_eq!(
+            phones_of(&resolve_score(&word_in_alias_track, &f).unwrap()[0]),
+            vec!["l", "oʊ", "v", "ɛ"],
+            "a hint must never change what is sung"
+        );
+
+        // ── (2) ONLY THE NOTE THAT EARNED IT ────────────────────────────────────────────────────
+        let mixed = [
+            alias_evt("ju", PhonemeSet::Xsampa),   // a real alias
+            alias_evt("love", PhonemeSet::Xsampa), // the word
+            alias_evt("zq", PhonemeSet::Xsampa),   // an unreadable alias → Unknown
+            alias_evt("e@n", PhonemeSet::Xsampa),  // a real alias again
+        ];
+        let c = class(&mixed);
+        assert_eq!(
+            c.iter().map(hint_of).collect::<Vec<_>>(),
+            vec![None, Some(AliasHint::MultipleNuclei), None, None],
+            "exactly one note carries the remark"
+        );
+        // a note that FAILED gets the loud channel and nothing else — two messages on one note is
+        // how a channel starts being ignored (the reason this one exists at all).
+        assert!(matches!(c[2], LyricClass::Unknown { .. }));
+        // a sustain holds the previous vowel, so it has no lyric of its own to remark on
+        let held = [alias_evt("love", PhonemeSet::Xsampa), evt("-", Lang::En)];
+        let c = class(&held);
+        assert!(matches!(c[1], LyricClass::Sustain), "control: the second note really is a sustain");
+        assert_eq!(hint_of(&c[1]), None);
+
+        // ── (3) ALIAS-ONLY ──────────────────────────────────────────────────────────────────────
+        // `beautiful` is B Y UW1 | T AH0 | F AH0 L — THREE nuclei, through the dictionary, and
+        // completely fine. If the predicate ever migrated to the word path this goes red.
+        let c = class(&[evt("beautiful", Lang::En)]);
+        assert!(matches!(c[0], LyricClass::Phones { .. }), "control: the word resolves");
+        assert_eq!(hint_of(&c[0]), None, "the dictionary path is not this channel's business");
+        // …and the very same string, on a Words track, is the ordinary word reading with no remark
+        assert_eq!(hint_of(&class(&[evt("love", Lang::En)])[0]), None);
+
+        // ── (4) THE WIRE ────────────────────────────────────────────────────────────────────────
+        let json = |c: &LyricClass| serde_json::to_string(c).unwrap();
+        assert_eq!(
+            json(&class(&[alias_evt("ju", PhonemeSet::Xsampa)])[0]),
+            // X-SAMPA `j` is the GLIDE (ARPABET Y = /j/); `dZ` is the affricate. `ju` = "you".
+            r#"{"kind":"phones","phones":["j","u"]}"#,
+            "no hint ⇒ the wire is exactly what every pre-S113 consumer already parses"
+        );
+        assert_eq!(
+            json(&class(&word_in_alias_track)[0]),
+            r#"{"kind":"phones","phones":["l","oʊ","v","ɛ"],"hint":"multiple_nuclei"}"#
+        );
     }
 
     /// The precedence ladder, and the things an alias convention must NOT capture.

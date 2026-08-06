@@ -381,11 +381,108 @@ fn impossible_cluster(phones: &[String]) -> Option<String> {
     None
 }
 
+/// S113 (§C14) — a NON-ERROR observation about an alias that DID resolve. The note sings exactly
+/// what it sang before; this only lets the editor say something about it.
+///
+/// ★★ ADMISSION RULE — a HARD gate on what may ever become a variant here (queue §C14; the user's
+/// instruction of 2026-08-06, and it points the OPPOSITE way from this repo's usual "fail loudly"
+/// preference, deliberately):
+///
+///   **A condition may enter this channel only if the user can make it go away by editing the
+///   score** — rewriting the alias, switching the track's convention, or writing a phoneme
+///   override. A condition they cannot clear (an upstream dictionary row that is simply wrong, a
+///   hard limit of our own mapping) must NOT be surfaced here at all: it belongs in the retraining
+///   bucket (queue §C22 / §G10, key list in the `de_glide_open_costs` memory).
+///
+/// The reasoning is the user's and it is about the CHANNEL, not about any one message: a warning
+/// nobody can silence is not observability, it is noise, and it teaches users to ignore every
+/// other message that arrives the same way. `user_can_clear` states the answer per variant and
+/// `s113_alias_hint_channel_is_actionable` enforces that every variant answers yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasHint {
+    /// The resolved phones carry TWO OR MORE nuclei — the note would articulate more than one
+    /// syllable, which no single sample of a diphone bank does. In practice this is an ordinary
+    /// English WORD typed into an alias track (`love` under X-SAMPA = l+o+v+e = `[L OW V EH]`).
+    /// Clearable: switch the track to `words`, rewrite the alias, or write a phoneme override.
+    MultipleNuclei,
+}
+
+impl AliasHint {
+    /// Every variant, so the actionability gate and the i18n coverage test can iterate them
+    /// (there is no `strum` in this tree; a missing entry is caught by `alias_hint_all_is_complete`).
+    pub const ALL: &'static [AliasHint] = &[AliasHint::MultipleNuclei];
+
+    /// The wire spelling, kept next to the enum for the same reason `PhonemeSet::as_str` is —
+    /// the TS union and this can then only drift together, and a test pins it against what serde
+    /// actually emits so a stray `rename_all` cannot change the wire silently.
+    pub fn wire(self) -> &'static str {
+        match self {
+            AliasHint::MultipleNuclei => "multiple_nuclei",
+        }
+    }
+
+    /// ★ THE actionability gate (see the type doc). Answer `false` and the variant must not exist.
+    pub const fn user_can_clear(self) -> bool {
+        match self {
+            // rewrite the alias · switch the track's convention to `words` · phoneme override
+            AliasHint::MultipleNuclei => true,
+        }
+    }
+}
+
+/// What one resolved alias yields: the phones, plus anything worth SAYING about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasReading {
+    /// Space-joined ARPABET, ready for the ordinary `phoneme_input` path.
+    pub phones: String,
+    /// `None` = nothing to say. Never affects what is sung.
+    pub hint: Option<AliasHint>,
+}
+
+/// S113 (§C14) — the NON-ERROR half of "could this convention have produced it".
+///
+/// [`impossible_cluster`] bounds the consonant RUN, and that is all it bounds: it clears the run at
+/// every nucleus, so the number of NUCLEI — and with it the number of syllables the note would
+/// articulate — is unbounded. An all-letter word typed into an alias track therefore resolves
+/// SILENTLY: `love` under X-SAMPA tokenises as l+o+v+e = `[L OW V EH]`, two nuclei, no run over two.
+///
+/// These banks are diphone systems and an alias is ONE transition (module header), so a legal alias
+/// articulates AT MOST ONE nucleus. MEASURED over the reference material still on disk — the three
+/// parallel Duvet scores as S91 imported them, 439 distinct aliases — the nucleus histogram is
+/// **0 → 176, 1 → 263, and nothing reaches 2**.
+///
+/// ⚠ WHY A HINT AND NOT AN ERROR (the two bounds are answering different questions):
+///   * the cluster bound rejects a shape that cannot be SUNG — three consonants in a row is not a
+///     sample any of these banks holds. This one rejects a shape that cannot have been MEANT.
+///   * the evidence is one song written by three authors (S92's 管中窥豹 bound), so 0/439 says
+///     "unattested", not "impossible". Aborting a whole segment on an unattested shape would be the
+///     wrong trade; saying it out loud costs nothing and is reversible by the user.
+///
+/// ⛔ Two neighbouring criteria measured and deliberately NOT adopted — recorded so the next person
+///    does not re-derive them (`TESTING/s113_dictline/c14_shape_census.py`):
+///   * **symbol count ≥ 3**: 2 REAL aliases have it (`1ngz`, `smI`, both in the VCCV score) because
+///     VCCV does hold CCV units. A criterion with attested counter-examples is not a criterion.
+///   * **phone count ≥ 4**: also 0/439 today (the histogram is 1 → 200, 2 → 238, 3 → 1) and it would
+///     additionally catch single-nucleus words such as `blur`. Left out because its margin over the
+///     observed maximum is ONE on a 439-alias corpus, whereas the nucleus bound is what this
+///     module's own premise states. Revisit it if more alias material ever arrives.
+///
+/// ⚠ HONEST BOUNDARY on that corpus: the original `.ust` files are no longer on disk (searched), so
+/// this was measured on S91's imported dump of them. Against the counts S91 wrote into
+/// `MAX_CONSONANT_RUN` above, VCCV (153) and X-SAMPA (149) reproduce EXACTLY and ARPAsing does not
+/// (137 here vs 118 there) — the difference is in the corpus, not the tokenizer, and the "440
+/// distinct" in that doc comment does not match its own parts either (118+153+149 = 420).
+fn shape_hint(phones: &[String]) -> Option<AliasHint> {
+    let nuclei = phones.iter().filter(|p| super::g2p::en_is_nucleus(p)).count();
+    (nuclei >= 2).then_some(AliasHint::MultipleNuclei)
+}
+
 /// Resolve one alias to the space-joined ARPABET phones the note should sing, ready to be handed to
 /// the ordinary `phoneme_input` path (→ `stage2` → vocab IPA). `Err(symbol)` = LOUD failure.
 ///
 /// Returns `None` only for `PhonemeSet::Words`, i.e. "not my job — use the dictionary".
-pub fn alias_phones(set: PhonemeSet, lyric: &str) -> Option<Result<String, String>> {
+pub fn alias_phones(set: PhonemeSet, lyric: &str) -> Option<Result<AliasReading, String>> {
     if set == PhonemeSet::Words {
         return None;
     }
@@ -405,7 +502,10 @@ pub fn alias_phones(set: PhonemeSet, lyric: &str) -> Option<Result<String, Strin
         if let Some(cluster) = impossible_cluster(&phones) {
             return Err(cluster);
         }
-        Ok(phones.join(" "))
+        // Same "on what is actually sung" rule for the hint — and it runs AFTER the cluster check so
+        // a rejected alias never also carries advice about a reading nobody will hear.
+        let hint = shape_hint(&phones);
+        Ok(AliasReading { phones: phones.join(" "), hint })
     }))
 }
 
@@ -416,7 +516,7 @@ mod tests {
     use crate::inference::g2p::{stage2, Lang};
 
     fn ph(set: PhonemeSet, alias: &str) -> String {
-        alias_phones(set, alias).expect("not Words").unwrap_or_else(|s| panic!("{alias:?} -> Err({s})"))
+        alias_phones(set, alias).expect("not Words").unwrap_or_else(|s| panic!("{alias:?} -> Err({s})")).phones
     }
 
     /// ★ THE gate for the tables. The three reference USTs are the SAME song on the SAME timeline in
@@ -766,7 +866,9 @@ mod tests {
         assert_eq!(bad(PhonemeSet::Xsampa, "Emst"), "m s t");
 
         // ⚠ NON-VACUITY + the anti-over-reach half. These must all still resolve:
-        let ok = |set, a: &str| alias_phones(set, a).expect("not Words").unwrap_or_else(|e| panic!("{a:?} → Err({e})"));
+        let ok = |set, a: &str| {
+            alias_phones(set, a).expect("not Words").unwrap_or_else(|e| panic!("{a:?} → Err({e})")).phones
+        };
         for (set, a) in [
             (PhonemeSet::Xsampa, "e@m"), (PhonemeSet::Xsampa, "N-"), (PhonemeSet::Xsampa, "-aI"),
             (PhonemeSet::Vccv, "1ng"), (PhonemeSet::Vccv, "hO"), (PhonemeSet::Vccv, "ld"),
@@ -783,6 +885,93 @@ mod tests {
         // transition units) — requiring a nucleus would reject a third of every real score
         assert_eq!(ok(PhonemeSet::Arpasing, "n d"), "n d");
         assert_eq!(MAX_CONSONANT_RUN, 2, "raising this needs new corpus evidence, not a hunch");
+    }
+
+    /// ★ S113 (§C14) — THE alias-hint gate. Groups run most-specific first (S108: a catch-all
+    /// placed early eats every later group's failures), so a mutation lands in the group that owns
+    /// the thing it broke.
+    ///
+    /// (1) THE PREDICATE — what `shape_hint` says, and the non-vacuity half.
+    /// (2) THE ACTIONABILITY GATE — the user's hard rule about what may live in this channel.
+    /// (3) THE REJECTED CRITERIA — the two neighbours, pinned by their real counter-examples.
+    /// (4) THE CORPUS — every alias this module's own cross-convention table calls REAL must be
+    ///     hint-free. This is what replaces the reference `.ust` files, which are gone from disk.
+    #[test]
+    fn s113_alias_hint_channel() {
+        let read = |set, a: &str| {
+            alias_phones(set, a).expect("not Words").unwrap_or_else(|e| panic!("{a:?} → Err({e})"))
+        };
+        let hint = |set, a: &str| read(set, a).hint;
+        let ok = |set, a: &str| read(set, a).phones;
+
+        // ── (1) THE PREDICATE ───────────────────────────────────────────────────────────────────
+        // Ordinary English words typed into an alias track: they resolve (no impossible cluster) and
+        // sing a multi-syllable shape no bank sample holds.
+        for (set, a, phones) in [
+            (PhonemeSet::Xsampa, "love", "l ow v eh"),
+            (PhonemeSet::Xsampa, "banana", "b aa n aa n aa"),
+            (PhonemeSet::Vccv, "money", "m uw n eh y"),
+            (PhonemeSet::Vccv, "hello", "hh eh l uw"),
+            (PhonemeSet::Arpasing, "l ow v eh", "l ow v eh"),
+        ] {
+            assert_eq!(hint(set, a), Some(AliasHint::MultipleNuclei), "{a:?} should be hinted");
+            assert_eq!(ok(set, a), phones, "{a:?} must still sing exactly what it sang before");
+        }
+        // NON-VACUITY: legal aliases of all three conventions say nothing, including the ones with a
+        // nucleus (a hint that fired on those would be noise on every real score).
+        for (set, a) in [
+            (PhonemeSet::Xsampa, "-aI"), (PhonemeSet::Xsampa, "ju"), (PhonemeSet::Xsampa, "e@n"),
+            (PhonemeSet::Vccv, "1ng"), (PhonemeSet::Vccv, "hO"), (PhonemeSet::Vccv, "tth"),
+            (PhonemeSet::Arpasing, "- ay"), (PhonemeSet::Arpasing, "y uw"), (PhonemeSet::Arpasing, "ay ae"),
+        ] {
+            assert_eq!(hint(set, a), None, "{a:?} is a real alias — nothing to say about it");
+        }
+        // ★ the carried-vowel rule runs FIRST, and that is load-bearing for this predicate too:
+        // `ay ae` has two nuclei BEFORE the drop and one after, and one after is what is sung.
+        assert_eq!(ok(PhonemeSet::Arpasing, "ay ae"), "ae");
+
+        // ── (2) THE ACTIONABILITY GATE (the user's rule, 2026-08-06) ────────────────────────────
+        // Every variant must be one the user can clear by editing the score. A variant that cannot
+        // be cleared does not belong in this channel at all — see the `AliasHint` doc.
+        for h in AliasHint::ALL {
+            assert!(h.user_can_clear(), "{h:?} cannot be cleared by the user — it must not be here");
+        }
+        // `ALL` must really be all of them, and the wire spelling must be what serde emits (a stray
+        // `rename_all` would otherwise re-spell the wire while the TS union kept the old literal).
+        assert_eq!(AliasHint::ALL.len(), 1, "a new variant must state its own actionability answer");
+        for h in AliasHint::ALL {
+            assert_eq!(
+                serde_json::to_string(h).unwrap(),
+                format!("\"{}\"", h.wire()),
+                "serde and `wire()` disagree — the TS union is keyed on `wire()`"
+            );
+        }
+
+        // ── (3) THE TWO REJECTED CRITERIA, pinned by the counter-examples that killed them ───────
+        // "symbol count ≥ 3" was rejected because these two are REAL VCCV aliases of the reference
+        // score (VCCV holds CCV units). Both must stay silent.
+        for a in ["1ngz", "smI"] {
+            assert_eq!(hint(PhonemeSet::Vccv, a), None, "{a:?} is a real VCCV alias, not a word");
+        }
+        // "phone count ≥ 4" was rejected for having a margin of one over the observed maximum; it is
+        // NOT in force, so a 4-phone single-nucleus alias stays silent. If a later round adopts it,
+        // this line goes red and the decision gets re-argued rather than drifting in.
+        assert_eq!(ok(PhonemeSet::Xsampa, "blur"), "b l uw r");
+        assert_eq!(hint(PhonemeSet::Xsampa, "blur"), None);
+
+        // ── (4) THE CORPUS ──────────────────────────────────────────────────────────────────────
+        // `CROSS` is this module's own record of aliases that occur in the three parallel reference
+        // scores, verified three ways. Not one of them may be hinted.
+        let mut checked = 0usize;
+        for &(arp, xs, vc, _) in CROSS {
+            for (set, a) in [(PhonemeSet::Arpasing, arp), (PhonemeSet::Xsampa, xs), (PhonemeSet::Vccv, vc)] {
+                if let Some(Ok(r)) = alias_phones(set, a) {
+                    assert_eq!(r.hint, None, "real reference alias {a:?} ({set:?}) must not be hinted");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 400, "the corpus sweep only reached {checked} aliases — it went vacuous");
     }
 
     /// The tokenizer order this module depends on, as a PROPERTY rather than an assertion about a few

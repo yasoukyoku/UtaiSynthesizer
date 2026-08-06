@@ -2217,4 +2217,43 @@ mod tests {
             MAX_LYRIC_CHARS
         );
     }
+
+    /// S113 (§C14) — the alias-hint wire spelling exists in TWO languages, and this is what keeps
+    /// them from drifting. `validate_lyrics` serializes `AliasHint` into the `hint` field of a
+    /// `phones` verdict; `oovWatch.ts` types that field as `AliasHintId`. Add a variant on one side
+    /// only and the frontend silently stops recognising it — the note would keep sounding (this
+    /// channel is advisory) and NOTHING would report the gap, which is the worst shape a warning
+    /// channel can fail in.
+    ///
+    /// Same `include_str!` trick as the bound test above: read the union out of the TypeScript
+    /// source rather than hand-copying it, and fail at the PARSE if the declaration is reshaped.
+    /// ⚠ `PhonemeSetId`, three lines above it in that file, carries the same "must change together"
+    /// comment with NO guard — recorded in `project_v2_pending_cleanups`, deliberately not widened
+    /// into this round.
+    #[test]
+    fn s113_alias_hint_wire_matches_the_ts_union() {
+        use crate::inference::g2p_alias::AliasHint;
+        static PROJECT_TS: &str = include_str!("../../../src/types/project.ts");
+        let decl = PROJECT_TS
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("export type AliasHintId ="))
+            .expect(
+                "could not find `export type AliasHintId = …;` in src/types/project.ts — the \
+                 declaration was reshaped, so this guard is now blind. Re-point it, do NOT delete it.",
+            );
+        let ts: Vec<&str> = decl
+            .split('|')
+            .map(|s| s.trim().trim_end_matches(';').trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut rust: Vec<&str> = AliasHint::ALL.iter().map(|h| h.wire()).collect();
+        rust.sort_unstable();
+        let mut ts_sorted = ts.clone();
+        ts_sorted.sort_unstable();
+        assert_eq!(
+            rust, ts_sorted,
+            "AliasHint::ALL and the TS `AliasHintId` union disagree — a hint the frontend cannot \
+             name is a hint nobody sees"
+        );
+    }
 }

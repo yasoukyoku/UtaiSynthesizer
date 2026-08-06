@@ -13,7 +13,7 @@ let invokeFails = false;
 /** S109 (§C15): the verdict the fake backend returns for one lyric. Declared BEFORE `invokeMock` on
  *  purpose — a `const` holding a closure that reads a later binding is the TDZ shape this repo has
  *  been bitten by. Default = everything resolves. */
-let classFor: (lyric: string) => { kind: string; phone?: string } = () => ({ kind: "ok" });
+let classFor: (lyric: string) => { kind: string; phone?: string; hint?: string } = () => ({ kind: "ok" });
 const invokeMock = vi.fn((_cmd: string, args: { notes?: Array<{ lyric?: string }> }) =>
   invokeFails
     ? Promise.reject(new Error("validate_lyrics exploded"))
@@ -68,7 +68,7 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     vi.useFakeTimers();
     invokeFails = false;
     classFor = () => ({ kind: "ok" });
-    useAppStore.setState({ vocalOov: {}, vocalUnknownPhone: {}, vocalDropped: {}, vocalShort: {} });
+    useAppStore.setState({ vocalOov: {}, vocalUnknownPhone: {}, vocalDropped: {}, vocalShort: {}, vocalAliasHint: {} });
     SEG = `S${++seq}`;
     seed();
   });
@@ -155,6 +155,47 @@ describe("oovWatch — frame warnings survive a split and a backend failure", ()
     expect(useAppStore.getState().vocalOov).toEqual({ [SEG]: ["w"] });
     // Without this arm the fix could be "always publish", which renames the lie instead of ending it.
     expect(useAppStore.getState().vocalUnknownPhone).toEqual({});
+  });
+
+  // S113 (§C14): the alias-shape channel. Unlike `vocalUnknownPhone` this one is DISJOINT from
+  // `vocalOov` — it rides a note that RESOLVED and will sound — so the thing to pin is that it never
+  // leaks into the blocking maps, in either direction.
+  it("★ publishes the alias hint WITHOUT touching the blocking channels", async () => {
+    classFor = (l) =>
+      l === "love" ? { kind: "phones", hint: "multiple_nuclei" } : l === "qqq" ? { kind: "unknown" } : { kind: "phones" };
+    const notes: Note[] = [
+      { ...mk("p", 0, 480, 60), lyric: "love" }, // an English word on an alias track: sings, oddly
+      { ...mk("w", 480, 480, 62), lyric: "qqq" }, // a genuine OOV: red, blocking
+      { ...mk("g", 960, 480, 64), lyric: "ju" }, // a real alias: nothing at all
+    ];
+    const seg: Segment = {
+      id: SEG, startTick: 0, durationTicks: 1440,
+      content: { type: "notes", notes } as SegmentContent,
+    };
+    useProjectStore.setState({
+      name: "P",
+      tracks: [{ id: "T", name: "V", trackType: "vocal", segments: [seg], voiceModel: "V",
+        volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {} } as Track],
+      tempo: TEMPO, timeSignature: [4, 4], dirty: false, filePath: null, selectedNotes: [], playheadTick: 0,
+    });
+    uninstall = installOovWatch();
+    await settle();
+    const app = useAppStore.getState();
+    expect(app.vocalAliasHint).toEqual({ [SEG]: ["p"] });
+    // ⚠ THE property: a hinted note is NOT red. Merging the two would make the header say "cannot be
+    // sung" about a note that sings — the lie every one of these splits exists to prevent.
+    expect(app.vocalOov).toEqual({ [SEG]: ["w"] });
+    expect(app.vocalUnknownPhone).toEqual({});
+    // …and the OOV note does not acquire a hint either (the Rust side attaches one only to `phones`).
+    expect(app.vocalAliasHint[SEG]).not.toContain("w");
+  });
+
+  it("★ a plain `phones` verdict publishes NOTHING to the alias channel (the control)", async () => {
+    classFor = () => ({ kind: "phones" });
+    uninstall = installOovWatch();
+    await settle();
+    // Without this arm the implementation could be "publish every phones note" and still look right.
+    expect(useAppStore.getState().vocalAliasHint).toEqual({});
   });
 
   it("★ publishes the FRAME verdicts even when validate_lyrics fails (they need no backend)", async () => {

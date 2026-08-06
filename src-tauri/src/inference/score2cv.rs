@@ -347,7 +347,17 @@ pub enum LyricClass {
     /// A sustain token (`-`/`ー`/`+`) — continues the previous vowel (承前元音 legato).
     Sustain,
     /// A pronounceable lyric → its IPA phones (all in the 210-token vocab).
-    Phones { phones: Vec<&'static str> },
+    ///
+    /// S113 (§C14): `hint` is a NON-ERROR remark about a note that resolved perfectly well — today
+    /// only "this alias produced a shape its convention cannot make" (see `g2p_alias::AliasHint`).
+    /// It is absent for every other note, and `skip_serializing_if` keeps the wire byte-identical
+    /// in that case, so every existing consumer of `{"kind":"phones",...}` is untouched. It must
+    /// never be read as a failure: nothing about the render changes when it is present.
+    Phones {
+        phones: Vec<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<crate::inference::g2p_alias::AliasHint>,
+    },
     /// This lyric did not resolve. The editor must LOUD-mark it (never silent SP), the render
     /// LOUD-errors.
     ///
@@ -372,7 +382,9 @@ pub fn classify_lyric(lyr: &str) -> LyricClass {
         Lyric::Rest => LyricClass::Rest,
         Lyric::Breath => LyricClass::Breath,
         Lyric::Sustain => LyricClass::Sustain,
-        Lyric::Phones(ph) => LyricClass::Phones { phones: ph },
+        // ja/zh token classifier: it never goes through an alias convention, so there is nothing
+        // to remark on here BY CONSTRUCTION (the alias path is English-only, `resolve_core`).
+        Lyric::Phones(ph) => LyricClass::Phones { phones: ph, hint: None },
         // `lyric_to_phones` is the ja/zh token-level classifier — it never inspects a bracket hint,
         // so there is no phone to name here by construction.
         Lyric::Unknown => LyricClass::Unknown { phone: None },
@@ -1056,7 +1068,7 @@ mod foreign_kana_tests {
 
     fn phones(lyr: &str) -> Vec<&'static str> {
         match classify_lyric(lyr) {
-            LyricClass::Phones { phones } => phones,
+            LyricClass::Phones { phones, .. } => phones,
             other => panic!("{lyr} should sing, got {other:?}"),
         }
     }
@@ -4207,7 +4219,7 @@ mod tests {
         assert!(matches!(classify_lyric("ap"), LyricClass::Breath));
         assert!(matches!(classify_lyric("zzzz"), LyricClass::Unknown { .. }));
         match classify_lyric("か") {
-            LyricClass::Phones { phones } => assert_eq!(phones, vec!["k", "a"]),
+            LyricClass::Phones { phones, .. } => assert_eq!(phones, vec!["k", "a"]),
             other => panic!("か should classify as phones [k,a], got {:?}", other),
         }
     }
@@ -4252,7 +4264,7 @@ mod tests {
             // the editor folds katakana before classifying, so the gate must too
             let folded = crate::inference::g2p::fold_katakana(&s);
             match classify_lyric(&folded) {
-                LyricClass::Phones { phones } => {
+                LyricClass::Phones { phones, .. } => {
                     for p in &phones {
                         assert!(
                             phone_to_id_map().contains_key(p),
@@ -4332,7 +4344,7 @@ mod tests {
 
     fn lyric_phones_for_test(lyric: &str) -> Vec<&'static str> {
         match classify_lyric(lyric) {
-            LyricClass::Phones { phones } => phones,
+            LyricClass::Phones { phones, .. } => phones,
             other => panic!("{lyric:?} did not resolve to phones: {other:?}"),
         }
     }

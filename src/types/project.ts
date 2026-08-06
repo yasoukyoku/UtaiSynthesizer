@@ -270,6 +270,15 @@ export interface VibratoSpec {
  *  shared with Rust's `g2p_alias::PhonemeSet::as_str` — the two must only ever change together. */
 export type PhonemeSetId = "arpasing" | "xsampa" | "vccv";
 
+/** S113 (§C14): the NON-ERROR remarks `validate_lyrics` may attach to a `phones` verdict. A note
+ *  carrying one RESOLVED and SOUNDS — this is not a failure channel and must never be unioned into
+ *  a red/blocking set (see `AppState.vocalAliasHint`).
+ *
+ *  Wire spelling shared with Rust's `g2p_alias::AliasHint::wire`. Unlike `PhonemeSetId` above, that
+ *  sharing is ENFORCED: `s113_alias_hint_wire_matches_the_ts_union` reads THIS line out of this
+ *  file, so a variant added on one side and not the other goes red at `cargo test`. */
+export type AliasHintId = "multiple_nuclei";
+
 /** ② Vocal-track (自己唱) parameters (§3.1). The SVC voice/singer stays in `Track.voiceModel`; this holds
  *  the backend choice + the ScoreToCV conditioning (speaker/lang) + a track-level transpose. */
 export interface VocalTrackParams {

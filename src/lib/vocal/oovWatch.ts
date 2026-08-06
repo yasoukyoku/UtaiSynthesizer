@@ -15,7 +15,7 @@ import { useProjectStore, DEFAULT_VOCAL_PARAMS } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { buildScoreTriples } from "./vocalRender";
 import { vocalTokens } from "../vocalNotes";
-import type { Segment, Track } from "../../types/project";
+import type { AliasHintId, Segment, Track } from "../../types/project";
 
 const DEBOUNCE_MS = 300;
 
@@ -81,6 +81,7 @@ async function validatePass(): Promise<void> {
           app.setVocalUnknownPhone(seg.id, null);
           app.setVocalDropped(seg.id, null);
           app.setVocalShort(seg.id, null);
+          app.setVocalAliasHint(seg.id, null);
           continue;
         }
         const vp = tr.vocalParams ?? DEFAULT_VOCAL_PARAMS;
@@ -100,7 +101,7 @@ async function validatePass(): Promise<void> {
         app.setVocalDropped(seg.id, droppedNoteIds.length ? droppedNoteIds : null);
         app.setVocalShort(seg.id, amber.length ? amber : null);
         try {
-          const classes = await invoke<Array<{ kind: string; phone?: string }>>("validate_lyrics", {
+          const classes = await invoke<Array<{ kind: string; phone?: string; hint?: AliasHintId }>>("validate_lyrics", {
             notes: triples.map((t) => ({ lyric: t.lyric, lang: t.lang, phoneme_input: t.phoneme_input ?? null })),
             defaultLang: vp.langId,
             phonemeSet: vp.phonemeSet ?? null,
@@ -116,17 +117,28 @@ async function validatePass(): Promise<void> {
           // ALL of them — the red marking, the segment badge and the blocking counts must go on
           // reading exactly one map — and `badPhone` is the SUBSET that lets the track header stop
           // telling the user to "check the lyric" about a lyric that is fine.
+          // S113 (§C14): `phones` may now carry a NON-ERROR `hint`. It rides a note that resolved,
+          // so it is a DISJOINT channel — never added to `oov`, never red, never blocking. Notes
+          // that failed keep the loud channel and only that one (the Rust side attaches a hint
+          // exclusively to `Phones`, and `s113_alias_hint_reaches_the_editor…` pins it).
           const oov: string[] = [];
           const badPhone: string[] = [];
+          const aliasHint: string[] = [];
           classes.forEach((c, i) => {
             const id = tripleNoteIds[i];
-            if (!id || c.kind !== "unknown") return;
+            if (!id) return;
+            if (c.kind === "phones") {
+              if (c.hint) aliasHint.push(id);
+              return;
+            }
+            if (c.kind !== "unknown") return;
             oov.push(id);
             if (c.phone) badPhone.push(id);
           });
           validated.set(seg.id, stamp);
           app.setVocalOov(seg.id, oov.length ? oov : null);
           app.setVocalUnknownPhone(seg.id, badPhone.length ? badPhone : null);
+          app.setVocalAliasHint(seg.id, aliasHint.length ? aliasHint : null);
         } catch (e) {
           console.warn("[oovWatch] validate_lyrics failed:", e);
           validated.set(seg.id, stamp); // don't hot-loop on a persistent backend error
@@ -141,6 +153,7 @@ async function validatePass(): Promise<void> {
         app.setVocalUnknownPhone(id, null);
         app.setVocalDropped(id, null);
         app.setVocalShort(id, null);
+        app.setVocalAliasHint(id, null);
       }
     }
     lastTracks = st.tracks;

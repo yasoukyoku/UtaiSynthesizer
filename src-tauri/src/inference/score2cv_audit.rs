@@ -887,6 +887,7 @@ mod selfcheck {
             run_lang: g2p::Lang::Zh,
             is_sustain: sustain,
             nucleus_stress: None,
+            hint: None,
         };
         // `wang` = [w, uɑŋ](zh 韵母是原子 token);两个延音各自 re-emit 载体。
         let resolved = vec![

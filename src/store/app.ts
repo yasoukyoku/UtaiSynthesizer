@@ -162,6 +162,23 @@ interface AppState {
    *  是阻塞性警告). Third map for the same reason S85b split dropped out of oov: a merged channel forces
    *  the wording to lie about at least one of its members. */
   vocalShort: Record<string, string[]>;
+  /** S113 (§C14): the NON-ERROR hint channel — notes that resolved perfectly well but whose ALIAS
+   *  produced a shape its convention cannot make (today: two or more nuclei, i.e. an English word
+   *  typed into an alias track — `love` under X-SAMPA sings [l oʊ v ɛ]). The note SOUNDS, and it
+   *  sounds exactly as it did before this channel existed; nothing here is blocking.
+   *
+   *  ⚠ Fourth map for the reason the first three were split (S85b `vocalDropped`, S87 `vocalShort`,
+   *  S109 `vocalUnknownPhone`): **a merged channel forces the wording to lie about at least one of
+   *  its members.** Never union it into a red/blocking set — red means "this note will not sound"
+   *  (§user), and these notes do.
+   *
+   *  ⛔ ADMISSION RULE for anything that ever joins this channel (the user's instruction,
+   *  2026-08-06): it must be something the user can make go away by editing the score. A condition
+   *  they cannot clear — an upstream dictionary row that is wrong, a limit of our own mapping —
+   *  must NOT be surfaced here; it belongs in the retraining bucket (queue §C22/§G10). A warning
+   *  nobody can silence is not observability, it is noise. The Rust side states this per variant
+   *  (`AliasHint::user_can_clear`) and a gate enforces it. */
+  vocalAliasHint: Record<string, string[]>;
   /** S60 GAME MIDI extraction in flight — key = `${segmentId}:${group}` (lane group), value =
    *  the job context. Drives the lane-row "extracting" indicator (Arrangement per-frame overlay),
    *  the menu-item double-trigger guard, and the undo-cancels-extraction interceptor. Runtime-only. */
@@ -224,6 +241,8 @@ interface AppState {
   setVocalDropped: (segmentId: string, noteIds: string[] | null) => void;
   /** S87: publish one segment's frame-borrow verdict(语义同上,写者同为 oovWatch)。 */
   setVocalShort: (segmentId: string, noteIds: string[] | null) => void;
+  /** S113 (§C14): publish one segment's alias-hint notes(语义同上,写者同为 oovWatch)。 */
+  setVocalAliasHint: (segmentId: string, noteIds: string[] | null) => void;
   /** S60: publish/clear one lane group's MIDI-extraction job (null = done/cancelled). */
   setMidiExtracting: (key: string, v: { trackId: string; segId: string; group: string; jobIds: string[] } | null) => void;
   openUpdateDialog: (info: { version: string; currentVersion: string; notes: string | null }) => void;
@@ -292,6 +311,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   vocalUnknownPhone: {},
   vocalDropped: {},
   vocalShort: {},
+  vocalAliasHint: {},
   midiExtracting: {},
   toasts: [],
   banner: null,
@@ -404,6 +424,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => {
       const next = verdictMapUpdate(s.vocalShort, segmentId, noteIds);
       return next ? { vocalShort: next } : {};
+    }),
+  setVocalAliasHint: (segmentId, noteIds) =>
+    set((s) => {
+      const next = verdictMapUpdate(s.vocalAliasHint, segmentId, noteIds);
+      return next ? { vocalAliasHint: next } : {};
     }),
   setMidiExtracting: (key, v) =>
     set((s) => {

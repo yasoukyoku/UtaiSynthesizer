@@ -206,6 +206,13 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
   const shortIds = useAppStore((s) => s.vocalShort[segmentId]);
   const shortRef = useRef<Set<string>>(new Set());
   shortRef.current = new Set(shortIds ?? []);
+  // S113 (§C14): the alias-shape channel — also NON-blocking (the note sings exactly what it sang
+  // before), so it joins the amber tier rather than the red one. Kept as its OWN store map for the
+  // reason S85b/S87/S109 each kept theirs: the track-header sentence has to be true of the notes it
+  // describes, and "this alias is a word" is not "this note was lent a frame".
+  const aliasHintIds = useAppStore((s) => s.vocalAliasHint[segmentId]);
+  const aliasHintRef = useRef<Set<string>>(new Set());
+  aliasHintRef.current = new Set(aliasHintIds ?? []);
   // S73b/c 调教所有权着色(θ 维度):手设 vibrato/transition 的音符=用户地盘(左缘金条,
   // 自动调教绕行);pitchDev 的手绘段则由音高线分段染金表达(逐采样查 dev,画线循环内)。
   const userTunedIds = useMemo(() => {
@@ -610,7 +617,8 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
         // S87 #3: a BORROWED note is a NON-blocking notice — it sounds; the renderer merely lent it a frame
         // from a neighbour. Amber, never the blocking red (§user: 红色现在一律=阻塞性警告). `oov` wins if a
         // note somehow lands in both (blocking always outranks advisory).
-        const borrowed = !oov && shortRef.current.has(n.id);
+        // S113 §C14 joins this tier: an alias whose shape its convention cannot produce also SOUNDS.
+        const borrowed = !oov && (shortRef.current.has(n.id) || aliasHintRef.current.has(n.id));
         const cx0 = Math.max(noteAreaX, x0);
         ctx.fillStyle = selected
           ? (col("--note-selected") || "#8b5cf6")
@@ -979,7 +987,7 @@ export function VocalEditor({ segmentId, onClose, style }: Props) {
 
   // ② S58 OOV marking: async verdicts from the oovWatch watcher (app store) → ref + redraw (the draw
   // closure reads the ref — the standard三处同步: ref sync here + this dedicated redraw effect).
-  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, shortIds, requestRedraw]);
+  useEffect(() => { requestRedraw(); }, [oovIds, droppedIds, shortIds, aliasHintIds, requestRedraw]);
   // (laneParam/laneOpen repaints ride the draw-closure rebuild effect above — laneParam is in its dep
   // array and it ends in requestRedraw(); a second dedicated effect here would be a duplicate
   // invalidation path. S83 review #7.)

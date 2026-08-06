@@ -556,6 +556,19 @@ Seven languages are supported; the language decides how lyrics turn into phoneme
 >   the 440 aliases of the three parallel reference scores the longest consonant run is 2 and nothing
 >   reaches 3. ⚠ In practice: typing an English word straight onto an alias track (`light` reads as
 >   `l iy g hh t` under X-SAMPA) used to sing **silent** nonsense; now it is marked.
+> - **Also new in v0.12: an alias that reads as MORE THAN ONE SYLLABLE gets an amber notice — and
+>   still sings.** One alias of a voicebank is a single *transition*, so it carries at most one
+>   syllable nucleus; `love` under X-SAMPA splits into `l ow v eh` = two nuclei, which is almost
+>   always an ordinary **word** typed onto an alias track. This whole class used to be completely
+>   **silent** (the red bound only limits consonant runs, and a vowel clears the run, so the number
+>   of syllables was unbounded).
+>   ⚠ It is **not an error**: the note sings, the render is byte-for-byte what it was, and you only
+>   get an extra line on the track header plus an amber note mark.
+>   To sing by spelling, switch that track's phoneme set back to **"Words"**; to keep the alias
+>   track, rewrite the alias (or give that one note a bracket hint / phoneme override — both bypass
+>   the alias layer).
+>   Measured the same way: across the **439 aliases** of the three parallel reference scores we
+>   still have on disk, **zero** read as two nuclei.
 > - With an alias convention selected, whatever you type stays on **one note** — no space-splitting
 >   across the following notes (many ARPAsing aliases contain a space, e.g. `ae n`, `y uw`).
 > - ⚠ Banks within one convention still differ in spelling. Our tables were derived from **three
