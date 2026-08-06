@@ -27,6 +27,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 import torch
 
+from .. import loader_budget
 from . import utils
 from .modules import audio
 from .utils import load_wav
@@ -296,6 +297,23 @@ class DatasetConstructor():
         # upstream hardcodes 4/1; train.num_workers (default 4) keeps that
         # while letting the determinism gate pin both loaders to 0
         num_workers = int(getattr(self.hparams.train, "num_workers", 4))
+        # S114 §F5-1: same in-flight commit budget as the rvc/sovits trainers.
+        # REDUCE-ONLY, so `train.num_workers` stays the user's request and a roomy
+        # machine gets exactly what it asked for. ⚠ This dataset draws from the
+        # global RNG stream (see this file's header) — the probe snapshots and
+        # restores it, and verifies the restore before trusting the measurement.
+        num_workers, _ = loader_budget.plan_loader(
+            num_workers,
+            2,  # torch's default prefetch_factor; this loader never named one
+            loader_budget.probe_batch_bytes(
+                self._train_dataset,
+                self._collate_fn,
+                batch_size=self.hparams.train.batch_size,
+                drop_last=True,
+                sampler=train_sampler,
+            ),
+            loader_budget.available_commit_bytes(),
+        )
         valid_workers = 1 if num_workers > 0 else 0
         self.train_loader = DataLoader(self._train_dataset, num_workers=num_workers, shuffle=False,
                                        batch_size=self.hparams.train.batch_size, pin_memory=True,

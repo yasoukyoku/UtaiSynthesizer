@@ -2562,6 +2562,27 @@ mod tests {
                  again be free to overwrite a good checkpoint with nan weights"
             );
         }
+
+        // S114 §F5-1, same reasoning, different guard: the DataLoader commit budget.
+        // Behaviour lives in converter/verify/training/gate_loader_budget.py (37 checks,
+        // 8 mutation probes); what rots silently is a loader quietly losing its call.
+        // sovits_v2 builds its loaders in data_utils.py, not train.py.
+        for (name, src) in [
+            ("rvc/train", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits/train", include_str!("../../../training/utai_train/sovits/train.py")),
+            (
+                "sovits_v2/data_utils",
+                include_str!("../../../training/utai_train/sovits_v2/data_utils.py"),
+            ),
+        ] {
+            assert!(
+                src.contains("loader_budget.plan_loader(")
+                    && src.contains("loader_budget.probe_batch_bytes("),
+                "{name}.py no longer budgets its DataLoader — the 'training froze' report \
+                 (Windows error 1455: worker shared mappings exhausted the commit limit) is \
+                 unguarded again"
+            );
+        }
     }
 
     fn tmp_ws(tag: &str) -> PathBuf {

@@ -46,6 +46,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
+from .. import loader_budget
 from .. import numerics
 from . import utils
 from .data_utils import TextAudioCollate, TextAudioSpeakerLoader
@@ -120,9 +121,29 @@ def train(cfg, exp_dir, reporter, stop):
     num_workers = 5 if multiprocessing.cpu_count() > 4 else multiprocessing.cpu_count()
     if all_in_mem:
         num_workers = 0
+    # S114 §F5-1: same budget guard as the rvc trainer. ⚠ THIS dataset draws from
+    # the GLOBAL random module in __getitem__ (volume aug + spec crop), so the
+    # measurement probe has to snapshot and restore it — loader_budget does, and
+    # asserts the restore rather than assuming it. all_in_mem already forces 0
+    # workers, and plan_loader passes 0 through untouched.
+    # torch's default prefetch_factor is 2; naming it here makes the request explicit.
+    num_workers, _lb_prefetch = loader_budget.plan_loader(
+        num_workers,
+        2,
+        loader_budget.probe_batch_bytes(
+            train_dataset, collate_fn, logger, batch_size=hps.train.batch_size
+        ),
+        loader_budget.available_commit_bytes(),
+        logger=logger,
+    )
+    _lb_extra = (
+        {"persistent_workers": True, "prefetch_factor": _lb_prefetch}
+        if num_workers > 0
+        else {}
+    )
     train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True,
                               batch_size=hps.train.batch_size, collate_fn=collate_fn,
-                              persistent_workers=num_workers > 0)
+                              **_lb_extra)
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps, all_in_mem=all_in_mem, vol_aug=False)
     eval_loader = DataLoader(eval_dataset, num_workers=1, shuffle=False,
                              batch_size=1, pin_memory=False,

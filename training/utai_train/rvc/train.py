@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import device as device_shim  # aliased: 'device' is a collision-prone name in torch code (device = torch.device(...))
+from .. import loader_budget
 from .. import numerics
 from . import train_utils as utils
 from .infer_pack import commons
@@ -133,15 +134,36 @@ def train(cfg, exp_dir, reporter, stop):
         shuffle=True,
     )
     collate_fn = TextAudioCollateMultiNSFsid()
+    # S114 §F5-1: upstream's own comment two lines above this loader in their
+    # train.py records that they went num_workers=8 -> 4 for EVERYONE because
+    # "dataloader's workers are out of shared memory". We keep 4/8 as the REQUEST
+    # (a roomy machine still gets exactly upstream's numbers) and only step down
+    # when this machine's commit budget says 4*8 batches will not fit — the
+    # "training just froze" report is that budget running dry (Windows 1455).
+    # ⚠ The probe restores the global RNG; see loader_budget.probe_batch_bytes.
+    _lb_workers, _lb_prefetch = loader_budget.plan_loader(
+        4,
+        8,
+        loader_budget.probe_batch_bytes(
+            train_dataset, collate_fn, logger, batch_sampler=train_sampler
+        ),
+        loader_budget.available_commit_bytes(),
+        logger=logger,
+    )
+    # prefetch_factor/persistent_workers are rejected by torch when workers == 0
+    _lb_extra = (
+        {"persistent_workers": True, "prefetch_factor": _lb_prefetch}
+        if _lb_workers > 0
+        else {}
+    )
     train_loader = DataLoader(
         train_dataset,
-        num_workers=4,
+        num_workers=_lb_workers,
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
+        **_lb_extra,
     )
 
     net_g = RVC_Model_f0(
