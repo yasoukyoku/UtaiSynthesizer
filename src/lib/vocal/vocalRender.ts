@@ -791,8 +791,15 @@ export const RANGE_ALGO_VERSION = "s85e";
  *  567 German WORD TYPES now differ from pre-s110 (`n j` 269 · `l j` 119 · the spelling guard 179);
  *  the count FELL by 44 because §C24e un-does a s110 change rather than adding one. As in
  *  s105/s108/s110 the syllable COUNT and the phone sequence are identical on every de.tsv key — only
- *  which note a consonant lands on changes, which is exactly what a stored bake gets wrong. */
-export const G2P_ALGO_VERSION = "s112";
+ *  which note a consonant lands on changes, which is exactly what a stored bake gets wrong.
+ *  (d) s113 §C9 — the IT **troncamento** rung (`crudel` = `crudele` minus its final vowel).
+ *  ⚠ This one is a different SHAPE of change from (a)-(c): it never alters a reading the dictionary
+ *  already had (swept over all 66881 it.tsv keys), it only turns a hard `VOCAL_OOV` abort into a
+ *  reading — 11521 reachable keys, 36 word types / ~430 tokens on the real Italian corpus, **0
+ *  measured wrong**. So no CLEAN bake can change; the bump is for the segments whose bake is stale
+ *  precisely because they used to error, and for honesty about the version stamp meaning "what the
+ *  lyric→phone layer does". See `WordDict::troncamento` for what that 0 can and cannot say. */
+export const G2P_ALGO_VERSION = "s113";
 
 /** Version of the note → FRAME allocation layer (buildScoreTriples). Bump it whenever the frame counts a
  *  given note set resolves to change — the timing twin of G2P_ALGO_VERSION, and for the same reason: a

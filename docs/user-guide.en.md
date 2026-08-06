@@ -598,6 +598,31 @@ The red marks clear themselves within about 0.3 s of the fix.
 
 > Tip: if the error says "Pronunciation dictionary missing" instead of OOV, the dictionary file itself is missing/broken — see [Chapter 13](#13-faq-and-troubleshooting).
 
+**⚠ There is also an AMBER mark, and it is not an error** (new in v0.12, see the alias part of 5.5):
+on an **alias track**, typing something that reads as a multi-syllable word marks the note amber and
+adds a line to the track header — but it still sings. Amber = a remark; red = this note will not sound.
+
+#### Italian poetic truncation (troncamento, new in v0.12)
+
+Italian lyrics — arias and classical art song above all — are full of **apocope**: `crudele` written
+`crudel`, `cantare` written `cantar`, `almeno` written `almen`, `amore` written `amor`. The upstream
+dictionary lists only the full forms, so before v0.12 **every one of those aborted the whole render**.
+Now the reading is recovered as "the base word's pronunciation minus its final vowel".
+
+- It runs ONLY where the dictionary has nothing, and **never changes a reading the dictionary already
+  has**.
+- It only accepts the shape "vowel + a SINGLE l/m/n/r", which is what Italian grammar says: the
+  degeminating kind (`bello → bel`) and digraphs (`figl`, `ogn`) are deliberately out of scope.
+- It restores `e`/`o`/`a` only, **never `i`** (`-i` is a plural / 2sg ending; dropping it changes the
+  word form rather than truncating it).
+- ⚠ **The ceiling is the dictionary's completeness, not the rule's**: `alfin` cannot be recovered
+  because `alfine` is not in the dictionary either, and whole conjugation rows are missing (`amiamo`,
+  `cantiamo`). That part waits for a dictionary rebuild.
+- ⚠ **Known cost**: about a third of the words this rule can reach are also words of another language
+  or proper nouns (`senator`, `terror`, `carlyl`). Typing one of those on an **Italian** track used to
+  abort loudly and now sings an Italian reading. If one comes out wrong, override that note with a
+  `[bracket hint]` or a phoneme override.
+
 ### 5.7 Pitch: transitions, vibrato, edge glides, freehand drawing
 
 The pink pitch line always shows **the pitch that will actually be sung** (note pitch + transitions + hand-drawn deviation + vibrato). By default the app **auto-tunes** — it gives every note natural glides, edge scoops and vibrato, so you only fine-tune where you want extra nuance, or hand a whole part over to it.

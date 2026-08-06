@@ -367,6 +367,14 @@ impl WordDict {
                 return Some(p);
             }
         }
+        // S113 (§C9): IT troncamento rung — `crudel` = `crudele` minus its final vowel. Same shape
+        // and same placement rationale as the elision rung above: it runs ONLY where the faithful
+        // ladder (and elision) already failed, so it can never change an answer the dictionary had.
+        if self.lang == Lang::It {
+            if let Some(p) = lookup_candidates(word).iter().find_map(|k| self.troncamento(k)) {
+                return Some(p);
+            }
+        }
         // S95: EN regular plural/possessive rung, strictly LAST — cmudict omits many regular
         // plurals ("dears" while "dear" ships), and before this rung such a lyric hard-aborted
         // the render as VOCAL_OOV. EN only: fr plural -s is SILENT, de/es/it inflect on their
@@ -434,6 +442,148 @@ impl WordDict {
         let lp = self.map.get(left)?;
         let rp = self.map.get(right)?;
         Some(lp.split_whitespace().chain(rp.split_whitespace()).map(str::to_string).collect())
+    }
+
+    /// S113 (§C9) — IT **troncamento** (poetic apocope): a word may drop its final unstressed vowel
+    /// after a single sonorant. `crudele → crudel`, `cantare → cantar`, `almeno → almen`,
+    /// `signore → signor`. It is not decoration: sung Italian — opera, art song, anything before the
+    /// 20th century — is full of it, and `italian_cv.dict` lists only the full forms, so before this
+    /// rung every one of these was a hard `VOCAL_OOV` that ABORTED THE WHOLE SEGMENT.
+    ///
+    /// Placement and contract are the elision rung's, for the same reasons: it runs only on the
+    /// branch where `lookup_faithful` (and elision) returned None, so it cannot change an answer the
+    /// dictionary already had — `s113_troncamento_never_overrides_a_faithful_hit` pins that instead
+    /// of leaving it to construction. The S95 fragment-merge trigger asks `lookup_faithful`, NOT
+    /// `lookup`, so this rung also cannot stop a merge from firing (the exact hazard S95R-2 records
+    /// about the plural rung; measured: 0 merges gained, 0 lost).
+    ///
+    /// ## Every gate is Italian grammar, not a knob fitted to a sample
+    ///
+    /// * **final letter ∈ l m n r** — troncamento happens after a SINGLE SONORANT. This is the rule
+    ///   as grammars state it, and it also happens to keep us away from the one place where
+    ///   "which vowel do I restore" would change the consonant: ⟨c g⟩ are soft before ⟨e i⟩ and hard
+    ///   before ⟨a o u⟩ (`dolce` vs `amica`). Before a sonorant nothing changes either way.
+    /// * **the letter before it must be a VOWEL letter** — the "single" in "single sonorant". It is
+    ///   what excludes the digraphs ⟨gl gn⟩ (`figl`, `ogn`) and every geminate: `bello → bel`
+    ///   is a DIFFERENT process (it degeminates), and running it through here would be inventing
+    ///   a reading. Measured, this clause blocks 2440 shapes, led by ⟨ll⟩ 445 / ⟨nn⟩ 273 / ⟨tr⟩ 249.
+    /// * **≥ 3 characters** — same floor, and the same reasoning, as `en_plural`'s. ⚠ On today's
+    ///   it.tsv it has no measured effect; it is a stated defence, not an observed one.
+    /// * **restore only ⟨e o a⟩, never ⟨i u⟩** — `-i` is the plural / 2sg marker, so dropping it is
+    ///   a change of WORD FORM, not apocope. Measured: adding ⟨i⟩ buys 0 extra tokens on the real
+    ///   Italian corpus while widening the dictionary-face population by 1121 keys.
+    /// * **the restored vowel is never stressed** — Italian orthography guarantees it: a word-final
+    ///   stressed vowel is always written with an accent (`città`, `perché`, `virtù`), and we only
+    ///   ever append an UNACCENTED ⟨e o a⟩. So the rule needs no stress information, which is just
+    ///   as well: it.tsv carries none (0 of its 55 phone symbols is a stress mark).
+    /// * **the base must be a FAITHFUL hit** — rungs do not stack; one guess at a time.
+    /// * **the base's last PHONE must be a vowel** — the literal reading of "the vowel is dropped".
+    ///   ⚠ Inert on today's it.tsv (no base spells a final vowel yet ends in a consonant phone);
+    ///   kept as a statement of what is being removed.
+    /// * **two restorations that disagree ⇒ abstain**, loudly OOV rather than a coin flip.
+    ///   ⚠ It cannot fire on today's dictionary and that is STRUCTURAL, not luck — and NARROWER
+    ///   than it first looks. The cut removes exactly the final vowel, i.e. the very phone two
+    ///   restorations of the same stem disagree about, so `cara`/`care` both reduce to `k a r` and
+    ///   resolve. Reaching this branch needs two bases that differ BEFORE the final vowel, which a
+    ///   compositional letter-to-phoneme generator does not produce. The gate proves the branch is
+    ///   not dead code with a synthetic dictionary that does differ in the stem, rather than
+    ///   pretending the zero is evidence.
+    ///
+    /// ## What it is worth — and ⛔ WHAT THAT MEASUREMENT CANNOT SAY, which is most of it
+    ///
+    /// On the real Italian corpus (GTSinger, 36 songs / 3 singers / 16963 word tokens), against the
+    /// per-word annotation the model was trained on: **36 word types : 0 wrong**, **427–436 tokens**
+    /// : 0, 44 (singer, song, word) clusters : 0. Line-level OOV 73.4 % → 65.3 %. Two independent
+    /// implementations produced these byte-for-byte, each after proving it reproduces production
+    /// (888/888 word types and 384/384 whole lines against the real `g2p_probe`).
+    ///
+    /// The token count is a RANGE and not a number on purpose: this corpus writes a breath token
+    /// between `crudel` and the next word, and if a user does not draw that breath note the S95
+    /// fragment merge joins `crudel`+`e` back into `crudele` — 9 of that word's 54 tokens (17 %)
+    /// then never reach this rung at all. Which end of the range is right depends on the score, not
+    /// on us.
+    ///
+    /// **The direction is solid. The strength is not, and here is exactly why — all four measured:**
+    ///  1. ★★ **"0 wrong" is close to structural, so it carries little information.** it.tsv is a
+    ///     machine letter-to-phoneme dictionary (`computer` = `k o m p u t e r`, `hotel` = `o t e l`),
+    ///     and the corpus annotation for words the dictionary does NOT contain comes from the SAME
+    ///     machine (`alfin` = `a l f i n`). On the 612 word types where both faces speak they agree
+    ///     **612/612**. So this test answers "**is this the string the model was trained to see for
+    ///     this spelling**" — which IS this repo's criterion (S101: the question is what the model
+    ///     was fed, not what a phonology textbook says) — and it cannot answer "is this correct
+    ///     Italian". The 669/669 self-replay is circular the same way: a compositional generator
+    ///     satisfies `dict[k+v] == dict[k] + <vowel>` almost by construction.
+    ///  2. **The minority class is n = 2.** Only two captured tokens are NOT real truncations
+    ///     (`dor` ← `dorma`, `vol` ← `v'oltraggino`: corpus mis-segmentation), and the criterion
+    ///     scored BOTH as "saved" — Italian orthography is near-phonemic, so a fragment plus a
+    ///     restored vowel minus that vowel is still itself. That is precisely the failure mode this
+    ///     rung would have in the wild, and the measurement cannot see it.
+    ///  3. **The three shape gates block zero measured counter-examples.** Removing the sonorant
+    ///     gate widens the dictionary-face population 11521 → **19132 (+66 %)** and changes the
+    ///     corpus result by NOTHING; removing the vowel-before gate gives 13961; removing all three
+    ///     produces exactly one wrong reading (`ni`). ⇒ They are **population restrictions justified
+    ///     by grammar, not by measurement**, and that is the honest reason to keep them: they shrink
+    ///     the part of the risk nothing here can see. Do not present them as validated.
+    ///  4. **99.65 % of the 11521 reachable keys were never asked.** 36 word types is what one
+    ///     corpus of art song happened to contain, and 30 of those 36 occur in exactly one song.
+    ///
+    /// Two mutations confirm the ruler is not answering yes to everything: cutting nothing scores
+    /// 0/38 and cutting two phones scores 0/38. And de/fr/es/it have no ear judgment at all (the
+    /// user does not speak them), so nothing here says it SOUNDS right.
+    ///
+    /// ⚠ What this rung does NOT reach, so nobody reads the −8 pp as "Italian is fixed": it covers
+    /// **15 % of the OOV mass**. The rest is it.tsv's own gaps — whole conjugation rows are missing
+    /// (`spandere` has 0 of 6 present-tense forms, `amiamo` and `cantiamo` are not keys), and the
+    /// corpus's highest-frequency Italian OOV, `alfin` (61 tokens), is unreachable for exactly that
+    /// reason: `alfine` is not in the dictionary either. **The recall ceiling here is the
+    /// dictionary's completeness, not the rule's** (⇒ queue §C22/§G10).
+    ///
+    /// ## KNOWN COST, stated rather than discovered later
+    ///
+    /// Of the 11521 reachable keys, **3494 (30.3 %)** are either also keys of the en/de/fr/es
+    /// dictionaries (1914) or derived from a base that only ever appears capitalised, i.e. a proper
+    /// noun (1951) — `alabam` ← Alabama, `ankar` ← Ankara, `aberdeenshir`. Typing one of those on an
+    /// ITALIAN track used to abort loudly and now sings an Italian reading. Two things bound it:
+    /// a 90-word probe of foreign words a real Italian lyric might contain found 83 already IN
+    /// it.tsv (so the rung never sees them), 5 still OOV, and 2 (`senator`, `terror`) captured —
+    /// and both of those are genuine Italian poetic truncations, not errors. The 30.3 % is an upper
+    /// bound on the population, NOT a false-positive rate: `altar`, `bastion`, `cadaver`,
+    /// `centurion`, `creator` are Italian–foreign cognates whose Italian reading is exactly what the
+    /// rule produces. Full list: `TESTING/s113_dictline/t8_fp_lists.txt`.
+    fn troncamento(&self, key: &str) -> Option<Vec<String>> {
+        const SONORANTS: [char; 4] = ['l', 'm', 'n', 'r'];
+        /// Written with the accented vowels too: they cannot be the RESTORED vowel (see the doc),
+        /// but they can perfectly well be the vowel that PRECEDES the sonorant.
+        /// ⛔ ⟨y⟩ IS DELIBERATELY ABSENT, and it was in the first draft. Adding it changes nothing
+        /// Italian and admits 34 loanword/proper-noun keys plus 2 self-replay rows — `boyl`,
+        /// `doyl`, `carlyl`, `freestyl`, `mcintyr`, `bryn`, `lyn` — i.e. it grows exactly the
+        /// population this rung's KNOWN COST is about. It was also not in the shape that was
+        /// measured, so keeping it would have made every number above describe a different rule.
+        /// (Caught by two implementations disagreeing 671 vs 669 — the difference was the letter.)
+        const VOWEL_LETTERS: [char; 14] =
+            ['a', 'e', 'i', 'o', 'u', 'à', 'è', 'é', 'ì', 'í', 'ò', 'ó', 'ù', 'ú'];
+        let mut it = key.chars().rev();
+        let last = it.next()?;
+        let prev = it.next()?;
+        if key.chars().count() < 3 || !SONORANTS.contains(&last) || !VOWEL_LETTERS.contains(&prev) {
+            return None;
+        }
+        let mut found: Option<Vec<String>> = None;
+        for v in ['e', 'o', 'a'] {
+            let Some(base) = self.map.get(&format!("{key}{v}")) else { continue };
+            let phones: Vec<String> = base.split_whitespace().map(str::to_string).collect();
+            if phones.len() < 3 || !self.vowels.contains(phones.last()?.as_str()) {
+                continue;
+            }
+            let cut = phones[..phones.len() - 1].to_vec();
+            match &found {
+                None => found = Some(cut),
+                Some(prev_cut) if *prev_cut == cut => {}
+                // two restorations, two different readings — refuse rather than pick one
+                Some(_) => return None,
+            }
+        }
+        found
     }
 
     /// One `-'s` / `-s` / `-es` strip of an EN lookup key whose base IS in the dictionary →
@@ -5574,6 +5724,170 @@ mod tests {
             let got = it.lookup(w).unwrap_or_else(|| panic!("it elision {w} still OOV"));
             let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
             assert_eq!(got, want, "it elision reading for {w}");
+        }
+    }
+
+    /// ★ S113 (§C9) — THE troncamento gate, over the REAL it.tsv. Same loud-SKIP contract as the
+    /// elision gate above.
+    ///
+    /// Groups run most specific first (S108: a catch-all placed early eats every later group's
+    /// failures), and each guard gets a sample that ONLY IT can block (S107:串联 guards let the
+    /// later one's negatives be swallowed by the earlier one, and then it is never tested):
+    ///  (1) RESCUE — the rung fires and the phones are exactly the base minus its final vowel;
+    ///  (2) GUARDS — four samples, one per gate, each a REAL it.tsv-derived key that would be
+    ///      captured if that one gate were removed;
+    ///  (3) ABSTENTION IS LIVE — proven on a synthetic dictionary, because the real one structurally
+    ///      cannot trigger it (see the rung's doc);
+    ///  (4) INERTNESS — the rung never overrides a reading the dictionary already had, swept over
+    ///      every key rather than argued from construction;
+    ///  (5) BLAST RADIUS + SELF-REPLAY — the population it can reach, and the 669 keys where the
+    ///      dictionary itself is the answer key;
+    ///  (6) SCOPE — Italian only.
+    #[test]
+    fn s113_it_troncamento_gate() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/it.tsv");
+        let Ok(it_tsv) = std::fs::read_to_string(&p) else {
+            eprintln!("[s113-troncamento-gate] SKIPPED — {} not present (gitignored generated \
+                       asset; run MBS2H build_dictionaries.py)", p.display());
+            return;
+        };
+        let it = WordDict::from_tsv(Lang::It, &it_tsv);
+
+        // ── (1) RESCUE — every one of these aborted the whole segment before S113 ────────────────
+        for (w, spec) in [
+            ("crudel", "k r u d e l"),        // crudele — the corpus's most frequent one
+            ("martir", "m a r t i r"),        // martire
+            ("almen", "a l m e n"),           // almeno
+            ("cantar", "k a n t a r"),        // cantare, the -are infinitive family (1296 keys)
+            ("pregar", "p r e ɡ a r"),        // pregare
+            ("stagion", "s t a d͡ʒ o n"),     // stagione — the -one family (1619 keys)
+            ("piaccion", "p i a t͡ʃː o n"),   // piacciono, a VERB form, not just nouns
+            ("seppellir", "s e pː e lː i r"), // seppellire — geminate INSIDE the word is fine
+            ("d'amor", "d a m o r"),          // …and it composes over an elided clitic
+        ] {
+            let got = it.lookup(w).unwrap_or_else(|| panic!("it troncamento {w} still OOV"));
+            let want: Vec<String> = spec.split_whitespace().map(str::to_string).collect();
+            assert_eq!(got, want, "it troncamento reading for {w}");
+        }
+
+        // ── (2) GUARDS — one sample per gate, each blocked by THAT gate alone ────────────────────
+        // ⚠ Every one of these has a base in it.tsv, so it is captured the moment its gate is
+        // removed — that is what makes it a test of the gate rather than of the shape.
+        for (w, base, why) in [
+            ("abat", "abate", "final letter is not a sonorant (`abate` is not apocopated to `abat`)"),
+            ("abbocc", "abbocca", "…nor is ⟨cc⟩"),
+            ("accoll", "accolla", "⟨ll⟩ — a geminate, no VOWEL before the sonorant. `bello → bel`"),
+            ("acern", "acerno", "⟨rn⟩ — a cluster, not a single sonorant"),
+            ("abnorm", "abnorme", "⟨rm⟩ — likewise"),
+            ("ir", "ira", "under three characters"),
+            ("abbain", "abbaini", "only an ⟨i⟩ would restore it, and -i is a plural marker"),
+            ("acar", "acari", "…same family (1121 keys reach the rung only through ⟨i⟩)"),
+        ] {
+            assert!(it.lookup_faithful(base).is_some(), "gate sample {w}: base {base} must be a key");
+            assert!(it.lookup_faithful(w).is_none(), "gate sample {w} must not be a key itself");
+            assert!(it.lookup(w).is_none(), "{w} must stay loudly OOV — {why}");
+        }
+        // …and the anti-over-reach half: the four families above are big, so a loosened gate is not
+        // a rounding error. (Measured on this dictionary: dropping the sonorant gate alone widens
+        // the reachable population 11521 → 19132.)
+
+        // ── (3) THE ABSTENTION BRANCH IS ALIVE ──────────────────────────────────────────────────
+        // The real dictionary cannot exercise it, so prove it on a synthetic one rather than
+        // reading the zero as evidence.
+        // ⚠ AND THE FIXTURE HAS TO DIFFER IN THE **STEM**. The obvious probe — `cara` = `k a r a`
+        // vs `care` = `k a r ɛ` — does NOT abstain, because the rung removes exactly the phone the
+        // two bases disagree about, so both cuts are `k a r`. That is why the branch is unreachable
+        // on a compositional dictionary: reaching it needs two bases that differ BEFORE the final
+        // vowel, which a letter-to-phoneme generator does not produce. (I wrote the easy fixture
+        // first and it resolved — the abstention here is narrower than it looks.)
+        let synth = WordDict::from_tsv(
+            Lang::It,
+            "cara\tk a r a\ncare\tk ɛ r ɛ\nsola\ts o l a\nsole\ts o l e\nvel\tv ɛ l\nvela\tv e l a\n",
+        );
+        assert!(synth.lookup("car").is_none(), "two restorations, two READINGS ⇒ abstain, not a coin flip");
+        assert_eq!(
+            synth.lookup("sol"),
+            Some(vec!["s".into(), "o".into(), "l".into()]),
+            "…but agreeing restorations still resolve — the abstention must not swallow the normal case"
+        );
+        // ★ ORDER. The whole-dictionary sweep in (4) below CANNOT see a reordering, and that is a
+        // property of the data, not an oversight: on the real it.tsv the rung reproduces the shipped
+        // row on all 669 keys where both exist, so running it first would return the same answer.
+        // (Probe N7 was expected to go red and came back GREEN — this fixture is what that bought.)
+        // `vel` is a key in its own right AND reachable from `vela`, with a DIFFERENT vowel, so only
+        // a faithful-first ladder can answer `v ɛ l`.
+        assert_eq!(
+            synth.lookup("vel"),
+            Some(vec!["v".into(), "ɛ".into(), "l".into()]),
+            "faithful must win over the rung — a reordering answers `v e l` here"
+        );
+
+        // ── (4) INERTNESS — swept, not argued ───────────────────────────────────────────────────
+        let mut checked = 0usize;
+        for key in it.map.keys() {
+            let faithful = it.lookup_faithful(key).expect("every key is its own faithful hit");
+            assert_eq!(it.lookup(key), Some(faithful), "troncamento overrode the dictionary on {key}");
+            checked += 1;
+        }
+        assert_eq!(checked, 66881, "it.tsv key count moved — re-derive the numbers below before editing them");
+
+        // ── (5) BLAST RADIUS + SELF-REPLAY ──────────────────────────────────────────────────────
+        // Everything the rung can reach: a key it.tsv does NOT have, whose base it does.
+        // ⚠ fail-closed. If a regenerated dictionary moves this, someone must look at WHY before
+        // changing the number — 30 % of this population are cross-language collisions and proper
+        // nouns (see the rung's KNOWN COST), so it growing quietly is exactly what must not happen.
+        // ⚠ the reachable set is a SET of stems, not a count of source keys: `abbinata`/`abbinate`/
+        // `abbinato` all strip to `abbinat`, and counting per source key inflates it to 12568.
+        // (Two implementations disagreed 12568 vs 11521 and this was the whole difference.)
+        let mut reachable_set: HashSet<String> = HashSet::new();
+        let mut replay_ok = 0usize;
+        let mut replay_n = 0usize;
+        for key in it.map.keys() {
+            // the self-replay set: the dictionary ships BOTH forms, so it is its own answer key
+            if let Some(cut) = it.troncamento(key) {
+                replay_n += 1;
+                if cut == it.lookup_faithful(key).unwrap() {
+                    replay_ok += 1;
+                }
+            }
+            // …and the reachable set: strip a final vowel, and ask whether that is a NEW key
+            let mut cs = key.chars().collect::<Vec<_>>();
+            if !matches!(cs.pop(), Some('e' | 'o' | 'a')) {
+                continue;
+            }
+            let stem: String = cs.into_iter().collect();
+            if !it.map.contains_key(&stem) && it.troncamento(&stem).is_some() {
+                reachable_set.insert(stem);
+            }
+        }
+        let reachable = reachable_set.len();
+        assert_eq!(replay_n, 669, "the self-replay set changed size");
+        assert_eq!(replay_ok, 669, "the rule no longer reproduces the dictionary's own truncated rows");
+        assert_eq!(reachable, 11521, "troncamento blast radius moved — see the rung's KNOWN COST");
+        // named costs, pinned so they are found by grep rather than rediscovered: both are captured,
+        // and both happen to be genuine Italian poetic truncations rather than the foreign words
+        // they look like.
+        assert_eq!(it.lookup("senator").unwrap().join(" "), "s e n a t o r");
+        assert_eq!(it.lookup("terror").unwrap().join(" "), "t e rː o r");
+        // …and the recall ceiling is the dictionary, not the rule: the corpus's most frequent
+        // Italian OOV cannot be reached because its BASE is missing too.
+        assert!(it.lookup_faithful("alfine").is_none(), "if `alfine` is ever added, `alfin` starts working");
+        assert!(it.lookup("alfin").is_none(), "…and until then it stays loudly OOV");
+
+        // ── (6) SCOPE — Italian only ────────────────────────────────────────────────────────────
+        let es_p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/dictionaries/es.tsv");
+        if let Ok(es_tsv) = std::fs::read_to_string(&es_p) {
+            let es = WordDict::from_tsv(Lang::Es, &es_tsv);
+            // ⚠ The sample has to be a NON-key whose base IS a key — `señor` is itself a key, so
+            // faithful answers it whatever the language gate says, and the test would pass for the
+            // wrong reason. (Probe N8 was expected to go red and came back GREEN on exactly that.)
+            // es.tsv has 3958 stems with this shape; `abander`/`abandera` is one, and Spanish simply
+            // does not apocopate like this.
+            for (w, base) in [("abander", "abandera"), ("abacor", "abacora"), ("aban", "abana")] {
+                assert!(es.lookup_faithful(base).is_some(), "control: {base} must be an es key");
+                assert!(es.lookup_faithful(w).is_none(), "control: {w} must NOT be an es key");
+                assert!(es.lookup(w).is_none(), "the troncamento rung must not run on es ({w})");
+            }
         }
     }
 
