@@ -163,6 +163,33 @@ UtaiSynthesizer は創作ツールです。**制作物への責任はすべて�
   一切の責任を負いません。サードパーティの帰属表示は [NOTICE.md](NOTICE.md) を
   参照してください。
 
+## 既知の制限と未解決の課題
+
+以下は**把握したうえで意図的に開いたままにしている**項目で、協力していただけると
+本当に助かる部分です。誰も見ていないからではなく、**手元のハードウェアでは答えが出せない**
+から開いています。
+
+- **大きなマシンでの学習スループットを使い切れていません。** データローダーは固定値では
+  なくマシンの**利用可能なコミットメモリ**に応じて worker / prefetch の規模を決めるように
+  なりましたが、**減らす方向にしか働きません** —— 余裕のあるマシンは上流のデフォルトを
+  そのまま受け取り、いかなる場合も引き上げられません。大きなマシンで**さらに上げる**のは
+  性能に関する主張であり、責任を持って言えません（worker 数は速度に対して単調ではなく、
+  結論を出すには RAM / CPU の異なる複数台で実データセットを回す必要があります）。
+  開発機は 1 台のみ（RAM 32GB、RTX 3080 Ti 12GB）で、**変曲点を見つける手段がありません**。
+  **より良いハードウェアをお持ちの方へ**：実測（実データセットでの step 時間 vs worker 数）、
+  issue、PR のいずれも大歓迎です。ノブと根拠は
+  `training/utai_train/loader_budget.py` にあります。
+- **AMD ランタイムパックは現在 gfx1103 系の内蔵 GPU のみ対応です**
+  （Radeon 780M / 760M / 740M）。パックに入っている汎用計算カーネルがその 1 ターゲット
+  だけなので、ダウンロードのゲートはパックに忠実に従い、それ以外では自身を隠します
+  —— **ゲートは正直で、狭いのはパックの方です**。RDNA3 / RDNA4 のディスクリート GPU や
+  他世代の内蔵 GPU はまだ対象外です。対応を広げるにはアーキテクチャごとのカーネル
+  ホイール（各 100MB 前後）を追加し、**かつ**能力ゲートを同じ厳格さで保つ必要があり、
+  広げた部分は所有していないハードウェアでは検証できません。
+- **Intel XPU 対応は実験的で、実機での検証はできていません** —— Intel GPU がありません。
+  正しさは構成上の担保とアプリ内のランタイム自己診断（`envtest`）によるもので、
+  コミュニティからの自己診断レポートが集まるまで「実験的」の表記は外しません。
+
 ## コミュニティ
 
 - **QQ グループ**:[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)

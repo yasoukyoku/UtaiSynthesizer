@@ -144,6 +144,28 @@ UtaiSynthesizer 是一个创作工具。**你用它做出的内容,责任完全�
 - 对任何侵犯声音权利、著作权或违反适用法律的使用方式,开发者不予认可,亦不承担
   任何责任。第三方致谢见 [NOTICE.md](NOTICE.md)。
 
+## 已知限制与开放问题
+
+下面这些是我们**知道、并且有意留着**的问题,也是真心希望有人一起做的部分。
+它们开着不是因为没人看过,而是因为**我们手上的硬件回答不了**。
+
+- **大机器上的训练吞吐没有被吃满。** 数据加载器现在按机器的**可用提交内存**来决定
+  worker/预取的规模,而不是一个固定数字;但它是**只减不增**的 —— 内存宽裕的机器
+  拿到的就是上游默认值,任何情况下都不会被调高。要在大机器上**往上调**属于性能主张,
+  我们没法负责任地下这个结论:worker 数对速度并不单调,要定下来需要多台不同内存/CPU
+  的机器跑真实数据集。我们只有一台开发机(32GB 内存 + RTX 3080 Ti 12GB),
+  **找不到那个拐点**。
+  **如果你有更好的硬件**:一份实测(真实数据集上 step 耗时 vs worker 数)、一个 issue
+  或者一个 PR 都非常欢迎。旋钮和全部推理写在 `training/utai_train/loader_budget.py`。
+- **A 卡运行时包目前只覆盖 gfx1103 一类核显**(Radeon 780M / 760M / 740M)。
+  包里的通用计算内核只有这一个目标,所以下载闸忠实地按包来放行、在别的卡上把自己隐藏
+  —— **闸是诚实的,窄的是包**。RDNA3 / RDNA4 独显和其它世代核显目前吃不到。
+  要扩面就得往包里加各架构的内核轮子(每个约百 MB)**并且**让能力闸保持同样严格,
+  而扩出去那部分我们**在没有的硬件上没法验证**。
+- **Intel XPU 支持是实验性的,没有在真实硬件上验证过** —— 我们没有 Intel 显卡。
+  正确性靠构造 + 程序内的运行时自检(`envtest`);在收到社区的自检报告之前,
+  「实验性」这个标签不会摘。
+
 ## 社区
 
 - **QQ 群**:[1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)

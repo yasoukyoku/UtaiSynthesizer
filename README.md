@@ -162,6 +162,32 @@ UtaiSynthesizer is a creative tool. **You are solely responsible for what you ma
   infringes voice rights, copyright, or applicable law. See [NOTICE.md](NOTICE.md) for
   third-party attributions.
 
+## Known limitations & open questions
+
+Things we know about, have deliberately left open, and would genuinely like help with.
+They are open because we cannot answer them on the hardware we have — not because nobody
+looked.
+
+- **Training throughput on large machines is left on the table.** The data loader now sizes
+  its worker/prefetch pool against the machine's *available commit* instead of a fixed
+  number, but it is **reduce-only**: a roomy machine gets exactly the upstream defaults, and
+  nothing ever raises them. Going *higher* on a big box is a performance claim we cannot
+  make responsibly — worker count is not monotonic in speed, and settling it needs several
+  machines with different RAM/CPU running real datasets. We develop on a single box
+  (32 GB RAM, RTX 3080 Ti 12 GB), so we have no way to find the knee.
+  **If you have bigger hardware**: measurements (step time vs worker count on a real
+  dataset), an issue, or a PR would be very welcome. The knob and the reasoning live in
+  `training/utai_train/loader_budget.py`.
+- **The AMD runtime pack only covers gfx1103-class integrated GPUs** (Radeon 780M / 760M /
+  740M). The pack ships general compute kernels for that one target only, so the download
+  gate mirrors it and hides itself elsewhere — the gate is honest, the *pack* is narrow.
+  Discrete RDNA3/RDNA4 cards and other iGPU generations are not covered yet. Widening it
+  means adding per-architecture kernel wheels (~100 MB each) **and** keeping the capability
+  gate just as strict, and we cannot test the widened part on hardware we do not own.
+- **Intel XPU support is experimental and unverified on real hardware** — we have no Intel
+  GPU. Correctness is by construction plus the in-app runtime self-test (`envtest`); the
+  "experimental" label stays until community self-test reports come back.
+
 ## Community
 
 - **QQ group**: [1058227212](https://qun.qq.com/universal-share/share?ac=1&authKey=3uD5AoM8e50y00vhOYOZsa2VI341dBNfr07S2IK9wraewz0rcFHpSzONYJ9QrTP7&busi_data=eyJncm91cENvZGUiOiIxMDU4MjI3MjEyIiwidG9rZW4iOiJONGpqQ2MzM3h3N3BDMVBMRzZiSUFOU05YWnRnbHBxdTZDUElZYlZOSGN3VnhCaEc5eWludlJBYlltK3hkdlFwIiwidWluIjoiMjc2Njc2NDM1NSJ9&data=VyWCaG06iaMLBFcfEx_fjE2Tme2X7YvJsUIUjJ51zk6XymaED6Z6TEC_zOvAdm9q2MbzbYbpuO4ukQHZ1GBHLw&svctype=4&tempid=h5_group_info)
