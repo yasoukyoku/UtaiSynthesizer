@@ -1436,7 +1436,25 @@ const DE_CJ_ONSET_KEYS: &[&str] = &["orjol", "reykjavik"];
 /// ⚠ Only `william` itself has a transcription; the other five ride on being the same name. That is
 /// a family inference and it is stated, not hidden — but it moves them in the direction of NOT
 /// changing, so a wrong inference here costs nothing that today does not already cost.
-const DE_LJ_CODA_SPELLINGS: &[&str] = &["willia"];
+///
+/// ★★ S112 — the SECOND entry, `gilliam`, and why it is a whole key rather than a wider fragment.
+/// It is one of the costs §C24b wrote down by name, and it is the only one of them that turned out
+/// to have a witness at the level this list works at — the LEXEME:
+///   · en.wiktionary's `Gilliam` entry, Etymology: *"From a medieval variant of the given name
+///     William."* Neither wiktionary gives Gilliam a German (or any) transcription, so this is the
+///     only thing there is, and it is the same KIND of claim the five ride-alongs above already
+///     rest on: same name ⇒ same cut.
+/// ⛔ It is deliberately NOT written as the fragment ⟨illiam⟩, even though on today's dictionary the
+/// two reach exactly the same seven keys (verified key by key). ⟨illiam⟩ would move the boundary
+/// from "the William lexeme" to "any key with these six letters", which is a claim nobody measured
+/// and which the doc above would then be lying about. Adjacent, one-letter-away keys are on the
+/// other side of it and stay there: `gillian`, `jillian`, `killian`, `lillian` come from Juliana /
+/// Cillian / Lily, not from William — the etymology does NOT transfer, and they remain named costs.
+/// ⚠ The evidence tier is stated: this is a lexeme inference from a dictionary etymology, not a
+/// transcription. The asymmetry above applies to it too — it holds `gilliam` at the cut it had
+/// before §C24b, so being wrong costs nothing today does not already cost, while being right undoes
+/// one. If a German transcription of Gilliam ever turns up saying onset, delete this entry.
+const DE_LJ_CODA_SPELLINGS: &[&str] = &["willia", "gilliam"];
 
 /// The ⟨V⟩⟨l⟩⟨l⟩?⟨i⟩⟨V⟩ occurrences in a key — see `de_lj_license_blocks` for why the leading vowel
 /// letter is required.
@@ -6878,6 +6896,13 @@ mod tests {
             //    instead of the shipped row is how one would find that out the hard way.
             ("bataillon", "b aː | tʰ aj | l ɔ ŋ", "CONTROL: no /l j/ site in the shipped row"),
             ("william", "v ɪ l | j a m", "⛔ DE_LJ_CODA_SPELLINGS — ⟨illi⟩+V but [ˈvɪl.jam] wants coda"),
+            // ★ S112 — the second entry, and the pin that shows the two are cut the SAME way. It
+            //   has no transcription of its own anywhere; what it has is en.wiktionary's etymology
+            //   ("a medieval variant of the given name William"). Its one-letter neighbours are
+            //   pinned right below it, on the OTHER side, because their etymologies do not transfer.
+            ("gilliam", "ɟ ɪ l | j a m", "S112 — William's lexeme, held at the coda with it"),
+            ("gillian", "ɟ ɪ | l j a n", "⛔ CONTROL: from Juliana, NOT William — stays licensed, still a named cost"),
+            ("lillian", "l ɪ | l j a n", "⛔ CONTROL: from Lily — same"),
             ("tastaturlayout", "tʰ a s | t a | tʰ uː | ɐ l | j uː t", "Tastatur|Layout — no license, UNMOVED"),
             // ⚠ ATTRIBUTION, corrected: this word is held by `de_lj_license_blocks`' fail-closed
             //   DEFAULT (no ⟨li⟩+V license), NOT by the ("l","lj") row — that row measures inert
@@ -7085,11 +7110,16 @@ mod tests {
         lj_coda_reached.sort_unstable();
         assert_eq!(
             lj_coda_reached,
-            vec!["fitzwilliam", "william", "williams", "williamsburg", "williamson", "williamstown"],
-            "the ⟨willia⟩ fragment now reaches a different key set. Every member is a word §C24b \
+            vec!["fitzwilliam", "gilliam", "william", "williams", "williamsburg", "williamson",
+                 "williamstown"],
+            "`DE_LJ_CODA_SPELLINGS` now reaches a different key set. Every member is a word §C24b \
              licenses and then takes back, so a NEW one is a word being held at the coda with no \
              transcription of its own (only `william` itself has one: `/ˈvɪl.jam/`), and a LOST one \
-             is a word quietly flipping to the onset. Either way somebody has to look."
+             is a word quietly flipping to the onset. Either way somebody has to look. \
+             ⚠ SEVEN since S112: `gilliam` was added as its own key — en.wiktionary's etymology says \
+             it is a medieval variant of William, which is a LEXEME witness, the same kind the five \
+             ride-alongs already rest on. It is not the fragment ⟨illiam⟩ (which reaches these same \
+             seven today) because that would silently claim the six letters, not the name."
         );
 
         // ★★ S112 §C24e — the same treatment for the ⟨gn⟩ row: a spelling row without a key-set
@@ -7168,12 +7198,13 @@ mod tests {
                                   consonants between syllables and must never add or remove one");
         assert_eq!(bad_seq, 0, "{bad_seq} German words changed their PHONE SEQUENCE");
         assert_eq!(
-            moved, 567,
-            "§C24 + §C24b + §C24e now re-cut {moved} German word types, not 567. This number is \
+            moved, 566,
+            "§C24 + §C24b + §C24e now re-cut {moved} German word types, not 566. This number is \
              CUMULATIVE over the whole spelling-guard line and its history is reconciled word by \
              word, never re-baselined: 431 (S110) + 2 (`DE_CJ_ONSET_KEYS` leaving) + 59 (S111 \
              §C24c's devoiced rows) + 119 (S111 §C24b's licensed ⟨lli⟩+V family) = 611, \
-             − 44 (S112 §C24e's Romance ⟨gn⟩) = 567. ⚠ THE MINUS IS THE POINT: those 44 keys LEAVE \
+             − 44 (S112 §C24e's Romance ⟨gn⟩) − 1 (S112 adding `gilliam` to \
+             `DE_LJ_CODA_SPELLINGS`) = 566. ⚠ THE MINUS IS THE POINT: those 44 keys LEAVE \
              the re-cut set because the ⟨gn⟩ guard returns them to the cut they had BEFORE §C24. \
              S110 admitted `n j` as one member and it was two populations — ⟨ni⟩+V (235 sites, \
              96 confirmed : 0 refuted) and ⟨gn⟩ (44 sites, 0 confirmed : 5 refuted). \
@@ -7182,7 +7213,7 @@ mod tests {
              the history reads straight. Per-consonant CLUSTER MOVES today (they sum to 568, one \
              more than the word types, because `landesjugendjazzorchester` moves at two sites — \
              /s/ and /t/): \
-             /n/ 269 · /l/ 119 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
+             /n/ 269 · /l/ 118 · /p/ 56 · /t/ 41 · /s/ 29 · /d/ 18 · /ʁ/ 12 · /f/ 10 · /m/ 6 · \
              /ts/ 5 · /k/ 2 · /v/ 1. Independently recomputed by \
              `TESTING\\s111_c24bc_ruler\\blast_c24b.py` — which since S112 PARSES all three \
              constants out of this file; it used to hard-code `DE_CJ_ONSET_KEYS` and \
