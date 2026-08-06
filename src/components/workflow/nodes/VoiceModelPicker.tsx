@@ -34,8 +34,11 @@ export const VOICE_STRINGS = {
 
 /** S66 GPU-extraction VRAM gate: the feature's measured steady peak is ~9.4 GB (user, two
  *  runs), so enabling it needs a ≥12 GB card. nvidia-smi truth, cached module-level (one
- *  subprocess per session, not per node mount); undetermined / non-NVIDIA fails OPEN (the
- *  variant_supported convention — DirectML cards can't be queried reliably). */
+ *  subprocess per session, not per node mount); undetermined / non-NVIDIA fails OPEN — the
+ *  probe is NVIDIA-only while the extractors run on the GLOBAL device, so denying here would
+ *  take the feature away from every card we simply cannot measure (DirectML included).
+ *  ⛔ S115: NOT "the variant_supported convention" — S74b made that one fail-CLOSED. Why this
+ *  gate points the other way is documented on `nvidia_total_vram_mb` (commands/settings.rs). */
 const GPU_EXTRACT_MIN_VRAM_MB = 12_000;
 let vramProbe: Promise<number | null> | null = null;
 function nvidiaVramMb(): Promise<number | null> {

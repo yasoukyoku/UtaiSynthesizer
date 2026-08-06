@@ -1199,11 +1199,16 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
       rtTestStale: { zh: "需重新自检", en: "Re-run self-test", ja: "再セルフテストが必要" },
       rtStaleNote: { zh: "这份自检报告来自不同的硬件配置（显卡或驱动已变更），当前结果仅供参考——请重新自检。", en: "This self-test report was produced on a different hardware configuration (GPU or driver changed) — re-run the self-test for a current verdict.", ja: "このセルフテストレポートは異なるハードウェア構成（GPU またはドライバーが変更）で作成されました。現在の結果を得るにはセルフテストを再実行してください。" },
       rtWhyNv: { zh: "需要算力 sm_75 及以上的 NVIDIA 显卡（GTX 16 / RTX 20 系及更新）。此包在本机不会被使用；修好驱动后可重新自检，或直接删除。", en: "Needs an NVIDIA GPU of compute capability sm_75 or newer (GTX 16 / RTX 20 series and up). This pack won't be used on this machine — re-run the self-test after fixing a driver, or delete it.", ja: "compute capability sm_75 以上の NVIDIA GPU が必要です（GTX 16 / RTX 20 シリーズ以降）。この PC では使用されません。ドライバー修正後にセルフテストを再実行するか、削除してください。" },
-      // MEASURED, not inferred (S74b): the installed pack ships exactly ONE device target —
-      // torch/.kpack/torch_gfx1103.kpack plus {blas,fft,rand}_lib_gfx1103.kpack. The
-      // `amd-torch-device-gfx110x` entry in the lock is only a family dist-info; no gfx1100/1101/
-      // 1102 kernels are present. So this pack runs on gfx1103 iGPUs and nothing else — saying
-      // "needs an AMD GPU" (or even "RDNA3") would send RX 7000 owners after a 4.5 GB dead end.
+      // MEASURED from the shipped tarball, not inferred (S74b, re-measured S115): the pack's
+      // GENERAL compute kernels are gfx1103-only — every one of the 876 objects in the four
+      // .kpack files and the 124 in the .hsaco/.co files is gfx1103, and torch_hip.dll carries
+      // no device code at all.
+      // ⚠ CORRECTION: amd-torch-device-gfx110x is NOT "only a family dist-info" — it installs
+      // 1738 files / 232 MiB of AOTriton flash-attention images that DO contain gfx1100/1101/1102
+      // code. Flash-attn alone is not a runtime, so an RX 7000 still has no torch-HIP or rocBLAS
+      // kernel 【unverified: no such card has ever been run against it — the inventory is what
+      // was measured】. So this string must still not say "needs an AMD GPU" or "RDNA3", or it
+      // sends RX 7000 owners after a 4.5 GB dead end.
       rtWhyAmd: { zh: "需要 Radeon 780M/760M/740M 这类核显（gfx1103）——本包只带了 gfx1103 的计算内核，其它 AMD 显卡（含 RX 7000/6000/9000 系独显）都不被它支持。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs a Radeon 780M/760M/740M-class iGPU (gfx1103) — this pack ships compute kernels for gfx1103 only, so no other AMD GPU (including RX 7000/6000/9000 discrete cards) can run it. It won't be used on this machine — re-run the self-test or delete it.", ja: "Radeon 780M/760M/740M クラスの内蔵 GPU（gfx1103）が必要です——このパックは gfx1103 の計算カーネルのみを同梱しているため、他の AMD GPU（RX 7000/6000/9000 シリーズの単体 GPU を含む）では動作しません。この PC では使用されません。セルフテストを再実行するか削除してください。" },
       rtWhyXpu: { zh: "需要 Arc 系列 Intel 显卡（Iris Xe / UHD / HD Graphics 不被 torch-XPU 支持）。此包在本机不会被使用；可重新自检或直接删除。", en: "Needs an Arc-family Intel GPU (Iris Xe / UHD / HD Graphics are not torch-XPU targets). This pack won't be used on this machine — re-run the self-test or delete it.", ja: "Arc シリーズの Intel GPU が必要です（Iris Xe / UHD / HD Graphics は torch-XPU 非対応）。この PC では使用されません。セルフテストを再実行するか削除してください。" },
       rtWhyGeneric: { zh: "当前设备不支持此包，它不会被使用；可重新自检或直接删除。", en: "This machine doesn't support this pack, so it won't be used — re-run the self-test or delete it.", ja: "この PC はこのパックに非対応のため使用されません。セルフテストを再実行するか削除してください。" },

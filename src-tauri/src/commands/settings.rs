@@ -580,8 +580,26 @@ pub(crate) fn cuda_pkg_supported() -> bool {
 
 /// Total VRAM of the largest NVIDIA card in MB (nvidia-smi memory.total), None = undetermined
 /// (no nvidia-smi / no NVIDIA card). S66: feeds the GPU-特征提取 gate — the feature's measured
-/// steady peak is ~9.4 GB (user, two runs), so cards under 12 GB can't enable it. Undetermined
-/// fails OPEN (the variant_supported convention: never hide a capability on a probe failure).
+/// steady peak is ~9.4 GB (user, two runs), so cards under 12 GB can't enable it. Sole consumer:
+/// `VoiceModelPicker.tsx`, via `HardwareInfo::nvidia_vram_mb`.
+///
+/// ⚠ THIS gate fails OPEN — `None` leaves the checkbox ENABLED — which is the OPPOSITE of
+/// `cuda_pkg_supported` / `variant_supported`. ⛔ Do NOT cite those as the reason.
+/// S115: this line used to say "the variant_supported convention", and that citation was CORRECT
+/// WHEN WRITTEN (S66 `a2b6359`: `variant_supported` then read `nv_cc.map_or(true, |cc| cc >= 7.5)`
+/// and its own doc said an undetermined cap "fails OPEN"). S74b (`f87443a`) INVERTED the
+/// convention repo-wide and left three citers behind — this one, `download_cuda_runtime`, and
+/// VoiceModelPicker.tsx. The direction is chosen per CONSEQUENCE, never by a global convention:
+///   - fail-CLOSED there, because an unanswered probe would strand a multi-GB package as
+///     invisible-and-unreclaimable, or keep offering a download that cannot run;
+///   - fail-OPEN here, because this probe is NVIDIA-only by construction (`get_hardware_info`
+///     returns None outright when `!has_nvidia`) while the gated extractors run on the GLOBAL
+///     device ⇒ fail-closed would permanently disable the feature on every DirectML box the probe
+///     knows nothing about; and only the ENABLE direction is gated, so a pre-existing `true` can
+///     always be switched off.
+/// Accepted consequence: on an NVIDIA box under 12 GB whose nvidia-smi merely fails, the user can
+/// tick the box and hit an OOM at render — recoverable by unticking, and S66 already chunk-bounded
+/// the worst offender (`inference/rvc.rs`, the last unbounded GPU feed).
 #[cfg(windows)]
 pub(crate) fn nvidia_total_vram_mb() -> Option<u64> {
     use std::os::windows::process::CommandExt;
@@ -657,13 +675,27 @@ pub(crate) fn machine_sig() -> String {
 
 /// S74b: whether an AMD GPU here is one our SHIPPED rocm pack can actually run.
 ///
-/// MEASURED from the installed pack, not inferred from its name: it contains exactly ONE device
-/// target — `torch/.kpack/torch_gfx1103.kpack` plus `{blas,fft,rand}_lib_gfx1103.kpack`. The
-/// `amd-torch-device-gfx110x` entry in the lock is a family dist-info with no kernels behind it.
-/// gfx1103 is the Phoenix / Hawk Point iGPU sold as Radeon 780M / 760M / 740M; NO discrete RX card
-/// (gfx1100-1102 RDNA3, RDNA2, RDNA4) and no other iGPU generation (680M = gfx1035, 880M/890M =
-/// gfx115x) has kernels in the pack. Offering those a 4.5 GB download whose only possible outcome
-/// is a failed self-test is the Iris-Xe mistake with a bigger file.
+/// MEASURED from the shipped tarball, not inferred from names — S115 listed all 43104 members and
+/// decompressed every kernel container: the pack's GENERAL compute kernels are gfx1103-only. All
+/// 876 code objects inside the four `.kpack` files and all 124 inside the `.hsaco`/`.co` files
+/// carry EF_AMDGPU_MACH gfx1103 and none names another arch; `torch_hip.dll`, `c10_hip.dll`,
+/// `rocblas.dll` and `libhipblaslt.dll` embed no device objects at all, so those kpacks really are
+/// that code's only home. gfx1103 is the Phoenix / Hawk Point iGPU sold as Radeon 780M / 760M /
+/// 740M; no discrete RX card (gfx1100-1102 RDNA3, RDNA2, RDNA4) and no other iGPU generation
+/// (680M = gfx1035, 880M/890M = gfx115x) has a compute kernel here.
+///
+/// ⚠ S115 CORRECTION — this comment used to claim `amd-torch-device-gfx110x` was "a family
+/// dist-info with no kernels behind it". That is FALSE: it installs 1738 files / 232 MiB, 1731 of
+/// them AOTriton flash-attention images under `torch/lib/aotriton.images/amd-gfx110x/`, and those
+/// DO carry gfx1100/1101/1102/1103 machine code (76748 code objects censused via ELF `e_flags`,
+/// 1731 of 1731 files). The CONCLUSION is unchanged, because SDPA images are not a runtime: an
+/// RX 7000 would still find no torch-HIP and no rocBLAS/hipBLASLt kernel for its arch.
+/// 【unverified】 that such a card actually FAILS — no gfx1100-1102 card has ever been run against
+/// this pack, and the pack also ships a complete AMDGPU compiler (amd_comgr / hiprtc / clang;
+/// `_rocm_sdk_core/` alone is 49% of the 4.5 GB) plus device-libs bitcode for gfx1100-1102, so
+/// "no precompiled kernels" is not by itself proof of "cannot run". What is measured is the
+/// INVENTORY. Offering a 4.5 GB download on an untested guess is the Iris-Xe mistake with a
+/// bigger file, so this gate stays narrow until someone runs one.
 ///
 /// Token match on the adapter name, like `intel_is_xpu_capable` — reading the real gfx target
 /// needs ROCm tooling we do not bundle. "780m" cannot collide with "RX 7800M" (the char after 780
@@ -2058,9 +2090,13 @@ pub async fn download_cuda_runtime(
 ) -> Result<(), String> {
     // S64c: the download is now fully self-contained (cudart/cublas/cufft/cudnn all fetched from
     // NVIDIA's official PyPI redistributables — no CUDA Toolkit needed, which beta testers proved
-    // nobody has). The one hard requirement left is an NVIDIA GPU + its driver. FAIL-OPEN on an
-    // EMPTY probe (WMI/PowerShell failure = undetermined, the variant_supported convention) —
-    // refuse only on a POSITIVE non-NVIDIA determination.
+    // nobody has). The one hard requirement left is an NVIDIA GPU + its driver. THIS FIRST HOP is
+    // fail-OPEN on an EMPTY probe (WMI/PowerShell failure = undetermined) — refuse only on a
+    // POSITIVE non-NVIDIA determination. ⛔ S115: that is this hop alone, and it is NOT "the
+    // variant_supported convention" — S74b (`f87443a`) made that one fail-CLOSED (the citation
+    // was true when written at S64c; see the note on `nvidia_total_vram_mb`). The command as a
+    // WHOLE stays fail-closed: `cuda_pkg_supported()` right below refuses a box whose cap probe
+    // also came back empty.
     let gpus = query_gpu_adapters();
     if !gpus.is_empty() && !gpus.iter().any(|g| g.vendor == "nvidia") {
         return Err("CUDA_GPU_REQUIRED".to_string());
@@ -2903,7 +2939,10 @@ mod tests {
             assert!(amd_is_rocm_capable(&[gpu(name, "amd")]), "{name}");
         }
         for name in [
-            "AMD Radeon RX 7900 XTX",   // gfx1100 — RDNA3 but no kernels in the pack
+            "AMD Radeon RX 7900 XTX",   // gfx1100 — RDNA3, no ATen/BLAS kernel in the pack
+                                        // (S115: it DOES get the gfx110x flash-attn images —
+                                        //  "no kernels at all" was the third copy of that
+                                        //  falsehood; see amd_adapter_is_rocm_capable)
             "AMD Radeon RX 7800M XT",   // must NOT match the "780m" token
             "AMD Radeon RX 6800 XT",    // RDNA2
             "AMD Radeon RX 9070",       // RDNA4

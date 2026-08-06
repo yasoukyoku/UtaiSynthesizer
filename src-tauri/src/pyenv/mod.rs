@@ -5,13 +5,27 @@
 //! `pack.json` describing it. One directory per pack under `<data_root>/runtimes/`:
 //!
 //!   <data_root>/runtimes/
-//!     runtime-cpu-v1/
-//!       pack.json            ← presence = installed (scan-based discovery, no registry)
+//!     runtime-cpu-v1/        ← the tar unpacks DIRECTLY here; there is no staging copy
+//!       pack.json            ← presence = installed (scan-based discovery, no registry) AND
+//!                              the install commit point: written LAST, via a same-dir
+//!                              tmp+rename of that one file ⇒ a torn install is a MARKER-LESS
+//!                              directory — invisible to list_packs, reclaimed by sweep_staging.
+//!                              ⛔ There is deliberately NO staging→final DIRECTORY rename; the
+//!                              WHY-NOT is on `extract_and_commit` and is load-bearing (it cost
+//!                              a live failure to learn). Read it before touching the protocol.
 //!       envtest.json         ← latest self-test report (written by utai_train.envtest)
 //!       python/python.exe    ← the interpreter (invoked as `python.exe -m ...`)
-//!     .staging/              ← in-flight extractions; the staging→final DIRECTORY
-//!                              RENAME is the install commit point, so a torn install
-//!                              can never be mistaken for a pack
+//!     .staging/              ← NOT an extraction target. Exactly two tenants, one writer each:
+//!                              `dl-<id>/`            resumable download parts (commands/pyenv.rs)
+//!                              `.old-<id>-<millis>/` the previous tree, moved aside during a
+//!                                                    reinstall and renamed back if it fails
+//!
+//! ⚠ S115: the three lines that used to describe `.staging/` ("in-flight extractions; the
+//! staging→final DIRECTORY RENAME is the install commit point") described the design that was
+//! REJECTED, as if it had shipped. It never shipped — `git log -S` puts this header and the
+//! WHY-NOT paragraph that refutes it in the SAME commit (`4e9c77d`), and every one of the 9
+//! revisions of this file unpacks straight into the final directory. The header was not made
+//! stale by later work; it was born contradicting the code beneath it.
 //!
 //! Distribution: `<id>.manifest.json` + `<id>.tar.zst` (split into `.partNN` volumes
 //! when a host caps file size — GH releases: 2 GiB) hosted on HF/GH. The manifest
@@ -999,13 +1013,21 @@ pub fn delete_pack(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Startup reclamation of `.staging` (audit S42 — nothing else ever GC'd it):
+/// Startup reclamation of `.staging` — AND of marker-less directories under the
+/// runtimes root (the second loop below); the name understates it (audit S42 —
+/// nothing else ever GC'd either):
 ///   - `.old-<id>-<ts>`: the previous pack moved out during a reinstall. If the
 ///     final dir went MISSING (crash between the two commit renames), RESTORE it —
 ///     the user's working pack must not silently vanish. Otherwise delete.
-///   - `.del-*`: deferred deletes — remove.
-///   - uuid extraction dirs: torn installs — remove.
 ///   - `dl-<id>`: KEEP (resumable downloaded parts).
+///   - anything else: remove. Only those two are ever written here (the only two
+///     writers in the tree: `commands/pyenv.rs` and `extract_and_commit`), but the
+///     sweep stays blind on purpose — blindness is free insurance.
+/// ⚠ S115 deleted two bullets that named tenants NOTHING has ever created here:
+/// `.del-*` "deferred deletes" (the only `.del-` prefix in this repo is
+/// `CUDA_TRASH_PREFIX` = `.del-cuda-` under `<app>/runtime/` — a different root,
+/// swept by `sweep_deleted_cuda`) and "uuid extraction dirs", which belonged to the
+/// staging-extraction design that was rejected before this module's first commit.
 pub fn sweep_staging() {
     // Hold the install slot for the whole sweep: without it an install starting
     // mid-sweep can have its (deliberately marker-less) target dir reclaimed out

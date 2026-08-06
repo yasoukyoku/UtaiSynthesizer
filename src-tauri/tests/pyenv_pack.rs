@@ -36,7 +36,9 @@ fn install_local_pack_and_envtest() {
         println!("no manifest next to archive — verification skipped");
     }
 
-    // 2. extract + staging→final commit
+    // 2. extract DIRECTLY into <root>/<id>, then commit by writing pack.json LAST
+    //    (same-dir tmp+rename). There is NO staging→final directory rename — see the
+    //    WHY-NOT on extract_and_commit. (S115: this line used to say there was one.)
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let t0 = std::time::Instant::now();
     let meta = utai_lib::pyenv::extract_and_commit(&parts, &cancel, |n| {
