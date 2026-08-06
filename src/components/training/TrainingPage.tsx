@@ -2929,6 +2929,28 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         </div>
       )}
 
+      {/* ★S115: a force-stop that FOLLOWED a warning. "hung run → user presses stop" is the
+          S114 §F5-1 signature, and until now that path rendered nothing at all: the card above
+          is gated on state === "error", and a force-stop returns Ok. The raw lines are in the
+          log file either way — what was missing is any reason for the user to suspect there is
+          something worth sending. Gated on `warnings` (the app's own "I noticed something
+          wrong") rather than on every stop, so an ordinary cancel stays quiet and the signal
+          keeps its meaning. */}
+      {snapshot.state === "stopped" &&
+        (snapshot.warnings ?? []).length > 0 &&
+        snapshot.stderr_tail.length > 0 && (
+          <div className="training-error-card">
+            <div className="training-error-title">{t("training.stoppedWithWarnings")}</div>
+            <div className="training-error-msg">{t("training.stoppedWithWarningsHint")}</div>
+            <pre className="training-error-tail">{snapshot.stderr_tail.join("\n")}</pre>
+            <div className="training-error-hint">
+              <button className="settings-mini-btn" onClick={() => void invoke("open_log_dir").catch(() => {})}>
+                {t("training.openLogFolder")}
+              </button>
+            </div>
+          </div>
+        )}
+
       {/* a finished run must not be a dead end — start the next one right here.
           清空结果 clears only the DISPLAY (snapshot + curve); the workspace and
           its checkpoints stay resumable */}

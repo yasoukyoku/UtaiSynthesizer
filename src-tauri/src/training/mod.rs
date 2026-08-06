@@ -1808,6 +1808,18 @@ fn emit_done(inner: &Inner, app: &tauri::AppHandle) {
     let _ = app.emit("training-done", &snap);
 }
 
+/// S115: what a force-stop leaves behind. Split out of the branch so it can be pinned — the
+/// defect it fixes was an ABSENCE (the branch set the state and nothing else), and an absence
+/// is exactly what no test notices.
+///
+/// ⛔ It must NOT clear `warnings`: those are the app's own record that it had already noticed
+/// something wrong, and they are the trigger the UI uses to decide this stop is worth
+/// explaining. Clearing them here would silently restore the old behaviour.
+fn mark_force_stopped(snap: &mut TrainingSnapshot, tail: Vec<String>) {
+    snap.state = "stopped".into();
+    snap.stderr_tail = tail;
+}
+
 /// Everything try_start resolves for the sidecar run: asset paths plus the
 /// values a diff run inherits from the workspace manifest.
 struct RunCtx {
@@ -2607,8 +2619,20 @@ fn run_worker(
     // no protocol verdict at all — crashed / killed externally. BE LOUD.
     if status.is_none() {
         finalize_elapsed(inner);
+        // ★S115: KEEP THE EVIDENCE. This branch used to set only the state, and "hung run →
+        // user presses stop" is the S114 §F5-1 signature — so the one path that most needs
+        // forensics was the one that threw them away: the error card renders on
+        // `state === "error"` only, and the next start wipes the whole snapshot AND the
+        // stderr ring. The raw lines do survive in `utai.log.<date>` (the `[train-py]`
+        // forward is `tracing::debug!` with target "utai", and the FILE filter is
+        // `warn,utai=debug`) — but a user who sees a blank "stopped" has no reason to
+        // suspect there is anything worth sending. Carrying the tail here is what turns
+        // "it just stopped" into "here is what it said before it stopped".
+        // ⚠ Take the tail BEFORE locking the snapshot: `stderr_tail` locks the ring, and the
+        // error path above (`:1755`) establishes that order.
+        let tail = stderr_tail(inner);
         let mut s = inner.snapshot.lock();
-        s.state = "stopped".into();
+        mark_force_stopped(&mut s, tail);
         drop(s);
         emit_done(inner, app);
         tracing::warn!("training force-stopped by user");
@@ -2734,6 +2758,8 @@ mod tests {
     fn s114_live_warning_codes_are_wired_and_raised_at_most_once() {
         static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
         static TRAINING_TS: &str = include_str!("../../../src/store/training.ts");
+        static TRAINING_PAGE_TSX: &str =
+            include_str!("../../../src/components/training/TrainingPage.tsx");
 
         for code in [warn_code::HOST_MEMORY, warn_code::NO_PROGRESS] {
             assert!(
@@ -2776,6 +2802,25 @@ mod tests {
             "an empty warnings list must not appear on the wire at all"
         );
         assert!(serde_json::to_value(&snap).unwrap().get("warnings").is_some());
+
+        // ★S115: a force-stop must keep the evidence — see `mark_force_stopped`. The bug it
+        // fixes is an ABSENCE, so pin the presence: the tail lands in the snapshot AND the
+        // warnings that made this stop worth explaining are still there afterwards.
+        let mut stopped = TrainingSnapshot::default();
+        assert!(push_warning_code(&mut stopped, warn_code::HOST_MEMORY));
+        mark_force_stopped(&mut stopped, vec!["RuntimeError: boom".into(), "  at foo".into()]);
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(stopped.stderr_tail.len(), 2, "the tail must survive a force-stop");
+        assert_eq!(
+            stopped.warnings,
+            vec![warn_code::HOST_MEMORY],
+            "clearing warnings here would silently re-hide the hang this exists for"
+        );
+        // …and the UI must actually render that combination, or the data is dead weight.
+        assert!(
+            TRAINING_PAGE_TSX.contains("training.stoppedWithWarnings"),
+            "TrainingPage.tsx no longer explains a force-stop that followed a warning"
+        );
 
         // The threshold has to clear the known-legitimate stall (gfx1103 MIOpen
         // compiles its first conv for 6-8 minutes with no output whatsoever).
