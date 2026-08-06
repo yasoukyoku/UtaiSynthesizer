@@ -2604,6 +2604,22 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
 
   return (
     <div className="training-run-step">
+      {/* S114 §F5-1: diagnostics for a run that is STILL RUNNING. The community's
+          "training just froze" report had nothing to show here — the DataLoader's
+          feeder thread dies inside a daemon thread, so the sidecar never fails and
+          never finishes, and every field of the snapshot still said "running".
+          These never gate the UI: the run may recover on its own. */}
+      {(snapshot.warnings ?? []).length > 0 && (
+        <div className="training-warn-list">
+          {(snapshot.warnings ?? []).map((code) => (
+            <div key={code} className="training-warn-row">
+              <span className="training-warn-mark">!</span>
+              <span>{backendErrorMessage(code) ?? code}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* preprocessing stages (ordered by the LIVE run's backend) */}
       {!trainingStarted && running && (
         <div className="training-stages">

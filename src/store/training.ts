@@ -433,6 +433,11 @@ export interface TrainingSnapshot {
   /** ①c: ordered speaker display names for a multi-speaker run (index = emb_g id); empty for
    *  single-speaker. Reflects the RUN (frozen at start), used by the audition speaker picker. */
   speakers?: string[];
+  /** S114 §F5-1: stable CODEs for problems raised while the run is STILL RUNNING —
+   *  localized through the same `backendErrorMessage` map as failures. Optional because
+   *  the backend omits the field entirely for a healthy run (wire stays pre-S114 identical).
+   *  A warning never changes `state`: the run may still recover, so this informs only. */
+  warnings?: string[];
 }
 
 export interface TrainingFormConfig {

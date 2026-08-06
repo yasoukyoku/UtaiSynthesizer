@@ -463,6 +463,19 @@ pub struct TrainingSnapshot {
     /// state. Empty for single-speaker runs. Reflects the RUN (frozen at start), not the form.
     #[serde(default)]
     pub speakers: Vec<String>,
+    /// S114 §F5-1: stable CODEs for things that went wrong WHILE THE RUN IS STILL ALIVE —
+    /// the frontend localizes them through the same `backendError.ts` map as failures.
+    ///
+    /// This exists because the community's "training just froze" report has no failure to
+    /// report: the DataLoader's feeder thread dies inside a daemon thread, the main process
+    /// waits forever on a queue nobody will fill, and `error`/`done` never arrive. Everything
+    /// this struct could previously say was "running". A warning is deliberately NOT a state
+    /// change: the run may still be fine (a first-conv MIOpen compile legitimately stalls a
+    /// gfx1103 box for minutes), so it informs and never aborts.
+    ///
+    /// `skip_serializing_if` keeps the wire byte-identical to pre-S114 for every healthy run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 struct Inner {
@@ -477,6 +490,57 @@ struct Inner {
     /// child, silently no-oping during a minutes-long import.
     abort: AtomicBool,
     started_at: Mutex<Option<Instant>>,
+    /// S114 §F5-1: when the sidecar last said ANYTHING on the protocol. The stall
+    /// watchdog reads it; `None` = nothing has been heard yet, so it is not armed.
+    last_progress_at: Mutex<Option<Instant>>,
+}
+
+/// S114 §F5-1 diagnostics that can be raised while a run is still alive.
+mod warn_code {
+    /// Windows commit limit exhausted -> a DataLoader worker could not create the
+    /// shared file mapping for its batch (error 1455). The exception lands in
+    /// multiprocessing's daemon feeder thread, which prints and carries on, so the
+    /// trainer hangs instead of failing: without this we have nothing to say.
+    pub const HOST_MEMORY: &str = "TRAINING_HOST_MEMORY_EXHAUSTED";
+    /// Nothing on the protocol for a long time. Deliberately generic — it catches
+    /// the 1455 hang AND every other cause we have not met yet.
+    pub const NO_PROGRESS: &str = "TRAINING_NO_PROGRESS";
+}
+
+/// How long the sidecar may say nothing before the watchdog speaks up.
+///
+/// ⚠ Generous ON PURPOSE, and the number has a reason: a gfx1103 (780M) box
+/// compiles its first conv configuration for 6-8 minutes with no output at all
+/// (MIOpen ships no pre-built kernel DB for it — see util.rs FIND_MODE=5). A
+/// threshold under that would fire on every AMD iGPU run and train users to
+/// ignore it. It also only arms after the first protocol message, so a long
+/// preprocessing stage cannot trip it either.
+const STALL_WARN_SECS: u64 = 15 * 60;
+
+/// Raise `code` once per run. Returns true if it was newly raised.
+///
+/// Idempotent because both raisers can fire repeatedly: the 1455 traceback is
+/// printed once PER WORKER (five in the field report) and the watchdog re-checks
+/// on a timer. A warning list that grows without bound would push the real first
+/// occurrence out of view.
+fn raise_warning(inner: &Inner, app: &tauri::AppHandle, code: &str) -> bool {
+    if !push_warning_code(&mut inner.snapshot.lock(), code) {
+        return false;
+    }
+    tracing::error!("training warning: {}", code);
+    let _ = app.emit("training-warning", code.to_string());
+    true
+}
+
+/// The dedupe half of `raise_warning`, split out so it is testable: the emit half
+/// needs a `tauri::AppHandle` and tauri ships no test feature here, so anything
+/// left inside the handle-taking function is unreachable from `cargo test`.
+fn push_warning_code(s: &mut TrainingSnapshot, code: &str) -> bool {
+    if s.warnings.iter().any(|w| w == code) {
+        return false;
+    }
+    s.warnings.push(code.to_string());
+    true
 }
 
 pub struct TrainingManager {
@@ -850,6 +914,7 @@ impl TrainingManager {
                 running: AtomicBool::new(false),
                 abort: AtomicBool::new(false),
                 started_at: Mutex::new(None),
+                last_progress_at: Mutex::new(None),
             }),
         }
     }
@@ -886,6 +951,7 @@ impl TrainingManager {
         self.inner.history.lock().clear();
         self.inner.stderr_ring.lock().clear();
         *self.inner.started_at.lock() = None;
+        *self.inner.last_progress_at.lock() = None;
         Ok(())
     }
 
@@ -1654,6 +1720,7 @@ impl TrainingManager {
         self.inner.stderr_ring.lock().clear();
         *self.inner.stop_file.lock() = Some(stop_file.clone());
         *self.inner.started_at.lock() = Some(Instant::now());
+        *self.inner.last_progress_at.lock() = None;
 
         let ctx = RunCtx {
             ffmpeg,
@@ -2339,14 +2406,54 @@ fn run_worker(
     // stderr → ring buffer (surfaced on abnormal exit) + debug tracing
     if let Some(stderr) = stderr {
         let ring_inner = Arc::clone(inner);
+        let warn_app = app.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
                 tracing::debug!(target: "utai", "[train-py] {}", line);
+                // S114 §F5-1: this stream is the ONLY place the commit-limit failure
+                // is ever visible. torch raises it inside multiprocessing's daemon
+                // feeder thread, which prints the traceback and keeps looping, so it
+                // never reaches the runner's except block and never becomes a
+                // protocol `error`. Reading it here is not a shortcut — it is the
+                // only evidence that exists.
+                if line.contains("Couldn't open shared file mapping")
+                    || line.contains("error code: <1455>")
+                {
+                    raise_warning(&ring_inner, &warn_app, warn_code::HOST_MEMORY);
+                }
                 let mut ring = ring_inner.stderr_ring.lock();
                 if ring.len() >= STDERR_RING_CAP {
                     ring.pop_front();
                 }
                 ring.push_back(line);
+            }
+        });
+    }
+
+    // S114 §F5-1 stall watchdog. It only INFORMS — see STALL_WARN_SECS for why it
+    // must never abort. It exits with the run (`running` is cleared in every exit
+    // path, including force-kill), so it cannot outlive it.
+    {
+        let wd_inner = Arc::clone(inner);
+        let wd_app = app.clone();
+        std::thread::spawn(move || {
+            while wd_inner.running.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                if !wd_inner.running.load(Ordering::SeqCst) {
+                    break;
+                }
+                // armed only after the first protocol message: a preprocessing stage
+                // that takes longer than the threshold must not trip it
+                let Some(last) = *wd_inner.last_progress_at.lock() else { continue };
+                if last.elapsed().as_secs() >= STALL_WARN_SECS
+                    && raise_warning(&wd_inner, &wd_app, warn_code::NO_PROGRESS)
+                {
+                    tracing::error!(
+                        "training has produced no protocol output for {}s — the sidecar may be \
+                         hung (see TRAINING_HOST_MEMORY_EXHAUSTED for the known cause)",
+                        last.elapsed().as_secs()
+                    );
+                }
             }
         });
     }
@@ -2360,6 +2467,10 @@ fn run_worker(
                 tracing::debug!(target: "utai", "[train-proto?] {}", line);
                 continue;
             };
+            // S114 §F5-1: ANY well-formed protocol message counts as progress, not
+            // just `step`. Stages report during preprocessing, and arming the
+            // watchdog on steps alone would make every long f0-extraction look hung.
+            *inner.last_progress_at.lock() = Some(Instant::now());
             match msg.get("type").and_then(|t| t.as_str()) {
                 Some("stage") => {
                     let stage = StageInfo {
@@ -2583,6 +2694,67 @@ mod tests {
                  unguarded again"
             );
         }
+    }
+
+    /// S114 §F5-1: the live-diagnostic codes must reach i18n too, and the warning
+    /// list must not grow without bound. Both raisers fire repeatedly by nature —
+    /// the 1455 traceback is printed once PER WORKER (five of them in the field
+    /// report) and the watchdog re-checks on a timer — so a list that appended
+    /// every time would push the FIRST, most informative occurrence off screen.
+    #[test]
+    fn s114_live_warning_codes_are_wired_and_raised_at_most_once() {
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+        static TRAINING_TS: &str = include_str!("../../../src/store/training.ts");
+
+        for code in [warn_code::HOST_MEMORY, warn_code::NO_PROGRESS] {
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\" }}")),
+                "backendError.ts has no mapping for {code}"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is too short to be the real message: {msg:?}"
+                );
+            }
+        }
+        // The frontend must actually carry the field, or the banner renders nothing.
+        assert!(
+            TRAINING_TS.contains("warnings?: string[]"),
+            "src/store/training.ts lost TrainingSnapshot.warnings — the UI banner would be dead"
+        );
+
+        let mut snap = TrainingSnapshot::default();
+        assert!(push_warning_code(&mut snap, warn_code::HOST_MEMORY), "first raise must take");
+        assert!(!push_warning_code(&mut snap, warn_code::HOST_MEMORY), "second must be a no-op");
+        assert!(push_warning_code(&mut snap, warn_code::NO_PROGRESS), "a DIFFERENT code must take");
+        assert!(!push_warning_code(&mut snap, warn_code::NO_PROGRESS));
+        assert_eq!(snap.warnings, vec![warn_code::HOST_MEMORY, warn_code::NO_PROGRESS]);
+
+        // A healthy run must stay byte-identical on the wire (skip_serializing_if).
+        let healthy = serde_json::to_value(TrainingSnapshot::default()).unwrap();
+        assert!(
+            healthy.get("warnings").is_none(),
+            "an empty warnings list must not appear on the wire at all"
+        );
+        assert!(serde_json::to_value(&snap).unwrap().get("warnings").is_some());
+
+        // The threshold has to clear the known-legitimate stall (gfx1103 MIOpen
+        // compiles its first conv for 6-8 minutes with no output whatsoever).
+        assert!(
+            STALL_WARN_SECS >= 10 * 60,
+            "STALL_WARN_SECS={STALL_WARN_SECS} would fire during a normal AMD iGPU first-conv \
+             compile and train users to ignore the warning"
+        );
     }
 
     fn tmp_ws(tag: &str) -> PathBuf {

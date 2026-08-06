@@ -853,6 +853,32 @@
   font-size: var(--font-size-sm);
 }
 
+/* S114 §F5-1: live diagnostics for a run that is still going. Deliberately the
+   SAME warning colour as .training-cpu-note and NOT the error red — these say
+   "something is probably wrong, here is what to do", not "the run failed".
+   Square corners like everything else in this app (no border-radius). */
+.training-warn-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.training-warn-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-warning);
+  background: var(--bg-tertiary, rgba(128, 128, 128, 0.12));
+  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+.training-warn-mark {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
 /* ─── S41 audition rows (试听多选保留) ─────────────────────────────────── */
 .training-ckpt-row.missing {
   opacity: 0.45;
