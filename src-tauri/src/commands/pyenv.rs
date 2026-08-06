@@ -159,7 +159,7 @@ pub fn get_runtime_env_info() -> Result<RuntimeEnvInfo, String> {
 /// pyenv::training_interpreter (never a forked re-implementation).
 #[tauri::command]
 pub fn training_env_ready(state: State<'_, Arc<AppState>>) -> bool {
-    let (py, _) = pyenv::training_interpreter(&state.app_dir, false);
+    let py = pyenv::training_interpreter(&state.app_dir, false).python;
     py != std::path::Path::new("python")
 }
 

@@ -1326,6 +1326,8 @@ pub fn run() {
             commands::settings::cancel_cuda_download,
             commands::settings::get_cuda_mem_limit,
             commands::settings::set_cuda_mem_limit,
+            commands::settings::get_diagnostic_mode,
+            commands::settings::set_diagnostic_mode,
             commands::settings::install_cuda_runtime_local,
             commands::settings::cuda_runtime_paths,
             commands::settings::delete_cuda_runtime,

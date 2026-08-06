@@ -875,6 +875,20 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
     setStartupComponentCheckEnabled(v);
   };
 
+  // S115 §F5-2 — diagnostic mode. Backend-persisted (config.json), NOT localStorage: a crash
+  // repro spans app restarts, and the value has to be readable by the Rust side that injects
+  // the env at the training spawn. Same round trip as the CUDA memory cap above it.
+  const [diagMode, setDiagMode] = useState(false);
+  useEffect(() => {
+    invoke<boolean>("get_diagnostic_mode").then(setDiagMode).catch(() => {});
+  }, []);
+  const handleDiagToggle = (v: boolean) => {
+    setDiagMode(v); // optimistic: the checkbox must not lag behind the click
+    invoke("set_diagnostic_mode", { on: v }).catch(() => {
+      setDiagMode(!v); // …but a refused write must not leave the UI claiming it stuck
+    });
+  };
+
   const handleUpdateCheck = useCallback(async () => {
     setUpdChecking(true);
     setUpdResult(null);
@@ -1320,6 +1334,26 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
       stErrBusy: { zh: "渲染/试听进行中，稍后再试", en: "Rendering/audition in flight — try again later", ja: "レンダリング/試聴中です。後でもう一度お試しください" },
       stErrWsMissing: { zh: "工作区不存在（可能已被删除）", en: "Workspace not found (already deleted?)", ja: "ワークスペースが見つかりません" },
       rtTitle: { zh: "训练环境（内嵌 Python 运行时）", en: "Training Runtime (embedded Python)", ja: "トレーニング環境（内蔵 Python）" },
+      // S115 §F5-2. ⚠ Plain text only — these render as text nodes (settings-note / a <span>
+      // inside a <label>), NOT as markdown, so no `**` here (the house rule that bit S91).
+      diagTitle: { zh: "诊断", en: "Diagnostics", ja: "診断" },
+      diagToggle: { zh: "诊断模式（训练会明显变慢）", en: "Diagnostic mode (training becomes noticeably slower)", ja: "診断モード（学習が目に見えて遅くなります）" },
+      diagNote: {
+        zh: "只在复现问题时打开。开启后训练子进程会以同步方式启动 GPU 计算，崩溃时报出的位置才是真正出错的地方；代价是整个训练过程都会变慢。复现完记得关掉。",
+        en: "Turn this on only while reproducing a problem. It makes the training subprocess launch GPU work synchronously, so a crash reports where it actually happened — at the cost of a slower run from start to finish. Turn it off once you have reproduced it.",
+        ja: "問題を再現するときだけオンにしてください。学習サブプロセスが GPU 処理を同期実行するようになり、クラッシュ時に本当に落ちた場所が報告されます。その代わり学習全体が遅くなります。再現できたらオフに戻してください。",
+      },
+      diagOnNote: {
+        zh: "诊断模式当前开启中 —— 训练会明显变慢。下次开始训练时生效，日志开头会写明这一次具体启用了什么。",
+        en: "Diagnostic mode is currently ON — training will be noticeably slower. It applies to the NEXT run, and the log records exactly what that run enabled.",
+        ja: "診断モードは現在オンです——学習は目に見えて遅くなります。次回の実行から有効になり、そのとき何を有効にしたかがログの先頭に記録されます。",
+      },
+      diagOpenLogs: { zh: "打开日志文件夹", en: "Open log folder", ja: "ログフォルダーを開く" },
+      diagSubmit: {
+        zh: "复现之后，把日志文件夹里当天的日志交给我们，就能定位问题。",
+        en: "After reproducing it, send us that day's file from the log folder and we can locate the fault.",
+        ja: "再現できたら、ログフォルダー内のその日のログをお送りください。原因を特定できます。",
+      },
       rtRoot: { zh: "运行时目录", en: "Runtime folder", ja: "ランタイムフォルダ" },
       rtAsciiWarn: { zh: "数据目录路径含非英文字符——内嵌 Python/torch 在此类路径下会加载失败。请先在「存储位置」迁移到纯英文路径（如 D:\\UtaiData）。", en: "Data folder path contains non-ASCII characters — the embedded Python/torch will fail to load there. Migrate the data folder to an ASCII-only path first.", ja: "データフォルダに非 ASCII 文字が含まれています。内蔵 Python/torch が読み込めないため、英数字のみのパスへ移行してください。" },
       rtTestPass: { zh: "自检通过", en: "Self-test passed", ja: "セルフテスト合格" },
@@ -2316,6 +2350,28 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
               </p>
             </>
           )}
+        </section>
+
+        {/* S115 §F5-2 — Diagnostics. Global (not under Training) on purpose: the switch is the
+            entry point for future "reproduce it, then send us the log" flows, and it sits on the
+            same path as the log folder button so the two steps are one motion. The training page
+            carries its own permanent banner while this is on — a persisted flag whose only cost
+            is silent slowness would otherwise come back to us as "your update made training
+            slower", a regression we would have manufactured ourselves. */}
+        <section className="settings-section" style={{ marginTop: 16 }}>
+          <h3 className="settings-section-title">{L("diagTitle")}</h3>
+          <label className="training-check-row" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <input type="checkbox" checked={diagMode} onChange={(e) => handleDiagToggle(e.target.checked)} />
+            <span>{L("diagToggle")}</span>
+          </label>
+          <p className="settings-note">{L("diagNote")}</p>
+          {diagMode && <p className="settings-error">{L("diagOnNote")}</p>}
+          <div className="settings-row" style={{ marginTop: 6 }}>
+            <button className="settings-mini-btn" onClick={() => void invoke("open_log_dir").catch(() => {})}>
+              {L("diagOpenLogs")}
+            </button>
+          </div>
+          <p className="settings-note">{L("diagSubmit")}</p>
         </section>
       </div>
     </aside>

@@ -238,6 +238,7 @@
     "title": "Model Training",
     "close": "Back to arrangement",
     "active": "Training",
+    "diagnosticOn": "Diagnostic mode is ON — training will be noticeably slower. It is meant for reproducing a problem; turn it off under Settings → Diagnostics once you have.",
     "step1": "Project",
     "step2": "Data",
     "step3": "Parameters",

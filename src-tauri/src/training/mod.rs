@@ -22,6 +22,7 @@ use tauri::Emitter;
 
 use crate::{Result, UtaiError};
 
+pub mod diagnostics;
 pub mod dsmanifest;
 pub mod resume_lock;
 pub mod tproject;
@@ -78,7 +79,7 @@ fn refuse_cpu_only_runtime(app_dir: &Path, force_cpu: bool) -> Result<()> {
     if force_cpu {
         return Ok(());
     }
-    let (_python, device_backend) = crate::pyenv::training_interpreter(app_dir, false);
+    let device_backend = crate::pyenv::training_interpreter(app_dir, false).device_backend;
     if device_backend != "cpu" {
         return Ok(());
     }
@@ -1142,19 +1143,20 @@ impl TrainingManager {
             }
             (g.value, g.variant)
         };
-        let (python, device_backend) = crate::pyenv::training_interpreter_for(
-            &self.app_dir,
-            req.force_cpu,
-            want_variant.as_deref(),
-        )
-        .ok_or_else(|| {
+        let crate::pyenv::TrainingInterpreter { python, device_backend, variant: runtime_variant } =
+            crate::pyenv::training_interpreter_for(
+                &self.app_dir,
+                req.force_cpu,
+                want_variant.as_deref(),
+            )
+            .ok_or_else(|| {
             // Only reachable if the pack vanished between the UI listing it and this call — fail
             // CLOSED rather than fall back to whatever else happens to be installed.
-            UtaiError::Training(format!(
-                "TRAINING_RUNTIME_VARIANT_MISSING: {}",
-                want_variant.clone().unwrap_or_default()
-            ))
-        })?;
+                UtaiError::Training(format!(
+                    "TRAINING_RUNTIME_VARIANT_MISSING: {}",
+                    want_variant.clone().unwrap_or_default()
+                ))
+            })?;
         if !req.force_cpu && device_backend == "cpu" {
             tracing::warn!(
                 "Training runtime is the CPU variant: this run will train on CPU (slow). For GPU training install the runtime pack matching your GPU in Settings → Training Environment."
@@ -1737,6 +1739,7 @@ impl TrainingManager {
             aug_copies: eff_aug_copies,
             python,
             device_backend,
+            runtime_variant,
             gpu_mask,
             project_id: project.id.clone(),
             speakers: eff_speakers,
@@ -1832,6 +1835,16 @@ struct RunCtx {
     /// fully-decidable condition must not cost a wiped workspace plus a multi-minute import).
     python: PathBuf,
     device_backend: String,
+    /// S115: the PACK variant behind `python` ("nv-cu130"/"amd"/"xpu"/"cpu"), `None` when the
+    /// interpreter is not a pack (dev venv / manual slot / bare python).
+    ///
+    /// ⛔ It is NOT a duplicate of `device_backend`: that one collapses **amd → "cuda"**
+    /// (torch-hip owns the `torch.cuda.*` namespace), so it cannot tell an NVIDIA run from a
+    /// ROCm one — and the two builds do not even read the same diagnostic env var (measured
+    /// S115: the amd pack's `c10_hip.dll` contains `AMD_SERIALIZE_KERNEL` and ZERO occurrences
+    /// of `CUDA_LAUNCH_BLOCKING`; the nv pack is the mirror image). Resolved once at PREFLIGHT
+    /// and carried, like `python`/`device_backend` above — never re-derived here.
+    runtime_variant: Option<String>,
     /// run.json "gpu": the accelerator-native mask (UUID / vendor index), "-1" for forced CPU,
     /// "" when no device was chosen. Resolved from the picked entry's `value` — NOT from the
     /// request, whose `gpu` field carries the UI id.
@@ -2365,14 +2378,30 @@ fn run_worker(
         python.display(),
         run_json.display()
     );
-    let mut child = crate::util::python_command(&python)
-        .current_dir(&training_dir)
+    let mut cmd = crate::util::python_command(&python);
+    cmd.current_dir(&training_dir)
         .arg("-m")
         .arg("utai_train.runner")
         .arg("--config")
         .arg(&run_json)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // S115 §F5-2: diagnostic mode. Call-site env, NOT `util::python_command` — that helper is
+    // shared with the converter / MSST-export / envtest spawns, and these variables serialize
+    // every kernel launch. Keyed on the pack VARIANT (see `RunCtx::runtime_variant`), because
+    // `device_backend` says "cuda" for ROCm too and the two builds read different names.
+    if diagnostics::enabled() {
+        let vars = diagnostics::apply(&mut cmd, ctx.runtime_variant.as_deref(), &ctx.device_backend);
+        // The banner names every variable it set + the app version: a diagnostic log mailed to
+        // us months from now has to say what its diagnostic mode contained. Emitted even when
+        // the set is EMPTY — "we turned it on and this runtime has no knob" is also an answer,
+        // and the user who ticked the box deserves to see it rather than wonder.
+        tracing::info!(
+            "{}",
+            diagnostics::banner(&vars, ctx.runtime_variant.as_deref(), &ctx.device_backend)
+        );
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             UtaiError::Training(format!(

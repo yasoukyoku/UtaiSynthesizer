@@ -82,6 +82,17 @@ export function TrainingPage() {
     void refresh();
   }, [refresh]);
 
+  // S115 §F5-2: diagnostic mode is PERSISTED, so a user who turned it on to reproduce a crash
+  // will still have it on weeks later — and its only symptom is a slower run. Unexplained
+  // slowness gets reported to us as a regression, so the page says so permanently while it is
+  // set. Re-read on every step change: the switch lives in the Settings panel, and the moment
+  // that matters is the user coming back here to start a run.
+  const [diagMode, setDiagMode] = useState(false);
+  const diagStep = route.seg;
+  useEffect(() => {
+    invoke<boolean>("get_diagnostic_mode").then(setDiagMode).catch(() => {});
+  }, [diagStep]);
+
   // single fetch site for the diff host's slot info (S41 共享池模式):
   // DataStep/ParamsStep/RunStep all consume the store copy via diffPoolReady.
   // S76 batch 4: keyed by PROJECT, not by the typed model name. Picking a host that belongs to
@@ -350,6 +361,16 @@ export function TrainingPage() {
           X
         </button>
       </div>
+      {/* S115 §F5-2 — permanent while diagnostic mode is on. Reuses the S114 warning strip's
+          styling rather than inventing a second banner look. */}
+      {diagMode && (
+        <div className="training-warn-list">
+          <div className="training-warn-row">
+            <span className="training-warn-mark">!</span>
+            <span>{t("training.diagnosticOn")}</span>
+          </div>
+        </div>
+      )}
       <nav className="training-steps">
         {steps.map((label, i) => {
           const n = (i + 1) as 1 | 2 | 3 | 4;

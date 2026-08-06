@@ -323,7 +323,7 @@ pub fn training_interpreter_for(
     app_dir: &Path,
     force_cpu: bool,
     want: Option<&str>,
-) -> Option<(PathBuf, String)> {
+) -> Option<TrainingInterpreter> {
     let Some(want) = want else {
         return Some(training_interpreter(app_dir, force_cpu));
     };
@@ -333,7 +333,7 @@ pub fn training_interpreter_for(
     // NVIDIA+CPU-only claim for the two non-pack tiers that `available_training_variants` makes.
     let venv = dev_training_venv(app_dir);
     if venv.exists() && matches!(want, "nv-cu130" | "cpu") {
-        return Some((venv, backend));
+        return Some(TrainingInterpreter::non_pack(venv, backend));
     }
     if let Some(p) = list_packs()
         .into_iter()
@@ -342,14 +342,47 @@ pub fn training_interpreter_for(
     {
         let py = pack_python(Path::new(&p.path));
         if py.exists() {
-            return Some((py, backend));
+            return Some(TrainingInterpreter::from_pack(py, backend, want));
         }
     }
     let manual = crate::util::manual_python_slot(app_dir);
     if manual.exists() && matches!(want, "nv-cu130" | "cpu") {
-        return Some((manual, backend));
+        return Some(TrainingInterpreter::non_pack(manual, backend));
     }
     None
+}
+
+/// What the training-role resolution decided — carried as a NAMED struct, never a tuple.
+///
+/// ⛔ `device_backend` and `variant` are both strings and they are NOT interchangeable:
+/// `variant_backend` collapses **amd → "cuda"** (torch-hip drives the `torch.cuda.*`
+/// namespace), so anything that must tell an NVIDIA run from a ROCm one has to read
+/// `variant`, not `device_backend`. S115 found that exact confusion while designing the
+/// diagnostic-mode env injection — `if device_backend == "cuda"` would have fired on every
+/// ROCm run and set a variable that build does not read (measured: 0 occurrences of
+/// `CUDA_LAUNCH_BLOCKING` in the amd pack's `c10_hip.dll`, which asks for
+/// `AMD_SERIALIZE_KERNEL` instead). Two same-typed positional fields is precisely the shape
+/// this repo banned after S85, so the resolvers return this instead of a 3-tuple.
+pub struct TrainingInterpreter {
+    pub python: PathBuf,
+    /// device.py's shim key: "cuda" (nv-cu130 AND amd), "xpu", or "cpu".
+    pub device_backend: String,
+    /// The PACK variant that won — "nv-cu130" / "amd" / "xpu" / "cpu".
+    ///
+    /// `None` = the interpreter is NOT a pack (dev venv / manual slot / bare python). Those
+    /// tiers are claimed for NVIDIA+CPU only, by the same rule `available_training_variants`
+    /// states, so `None` with `device_backend == "cuda"` means an NVIDIA CUDA torch — but
+    /// say so at the point of use rather than storing a guess here.
+    pub variant: Option<String>,
+}
+
+impl TrainingInterpreter {
+    fn from_pack(python: PathBuf, device_backend: String, variant: &str) -> Self {
+        Self { python, device_backend, variant: Some(variant.to_string()) }
+    }
+    fn non_pack(python: PathBuf, device_backend: String) -> Self {
+        Self { python, device_backend, variant: None }
+    }
 }
 
 /// nv-cu130 and amd(torch-hip) both drive the `torch.cuda.*` namespace, so both map
@@ -367,13 +400,13 @@ fn variant_backend(variant: &str) -> &'static str {
 /// for device.py's shim. `force_cpu` pins "cpu" regardless (the train-on-CPU-anyway
 /// path). Priority: dev venv (unchanged dev experience — backend from the box's own
 /// GPU) → best installed pack (GPU variants first, newest version) → manual slot →
-/// bare python. Returns `(interpreter, device_backend)`.
-pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> (PathBuf, String) {
+/// bare python. Returns a `TrainingInterpreter` (⛔ read its doc before touching `variant`).
+pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> TrainingInterpreter {
     let default_gpu = || if force_cpu { "cpu" } else { "cuda" }.to_string();
 
     let venv = dev_training_venv(app_dir);
     if venv.exists() {
-        return (venv, default_gpu());
+        return TrainingInterpreter::non_pack(venv, default_gpu());
     }
     // Same GPU-first order as the converter role; here the variant also fixes the
     // backend, so an NVIDIA box holding only nv-cu130 trains on GPU (device=cuda).
@@ -391,15 +424,15 @@ pub fn training_interpreter(app_dir: &Path, force_cpu: bool) -> (PathBuf, String
                 } else {
                     variant_backend(variant).to_string()
                 };
-                return (py, backend);
+                return TrainingInterpreter::from_pack(py, backend, variant);
             }
         }
     }
     let embedded = crate::util::manual_python_slot(app_dir);
     if embedded.exists() {
-        return (embedded, default_gpu());
+        return TrainingInterpreter::non_pack(embedded, default_gpu());
     }
-    (PathBuf::from("python"), default_gpu())
+    TrainingInterpreter::non_pack(PathBuf::from("python"), default_gpu())
 }
 
 // ─── catalog ────────────────────────────────────────────────────────────────

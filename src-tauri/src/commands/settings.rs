@@ -122,6 +122,16 @@ pub struct AppConfig {
     /// migrate keep byte-identical config.json.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_delete_dirs: Vec<String>,
+    /// S115 §F5-2: diagnostic mode — makes a training run reproduce a crash legibly at the
+    /// cost of speed (see `training::diagnostics` for the exact set and why it is keyed on the
+    /// runtime variant). PERSISTED on purpose: reproducing a GPU fault can take several
+    /// attempts across app restarts, so a per-session flag would be useless for the case it
+    /// exists for. The other half of that decision lives in the UI — because it persists, a
+    /// user WILL forget it on, so the training page carries a permanent banner while it is
+    /// set; a slow run that never explains itself would come back to us as "your update made
+    /// training slower", i.e. a regression we manufactured.
+    #[serde(default)]
+    pub diagnostic_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -132,6 +142,7 @@ impl Default for AppConfig {
             cuda_mem_limit_mb: 0,
             auto_gpu: None,
             pending_delete_dirs: Vec::new(),
+            diagnostic_mode: false,
         }
     }
 }
@@ -913,6 +924,31 @@ pub fn set_cuda_mem_limit(state: State<'_, Arc<AppState>>, mb: u64) -> Result<()
 }
 
 #[tauri::command]
+pub fn get_diagnostic_mode(state: State<'_, Arc<AppState>>) -> bool {
+    let _ = &state; // same shape as get_cuda_mem_limit: config on disk, the live static is read
+    crate::training::diagnostics::enabled()
+}
+
+/// S115 §F5-2: turn diagnostic mode on/off. Persisted in config.json (a crash repro can span
+/// restarts) and applied to the live static immediately — it is read at the next training
+/// spawn, so a run already in flight is unaffected, which is correct: its env block was fixed
+/// when it started and pretending otherwise would make the banner a lie.
+#[tauri::command]
+pub fn set_diagnostic_mode(state: State<'_, Arc<AppState>>, on: bool) -> Result<(), String> {
+    crate::training::diagnostics::set_enabled(on);
+    let mut cfg = load_config(&state.app_dir).unwrap_or_default();
+    cfg.diagnostic_mode = on;
+    if let Err(e) = save_config(&state.app_dir, &cfg) {
+        tracing::warn!("Failed to save config: {}", e);
+    }
+    tracing::info!(
+        "Diagnostic mode {} (takes effect on the NEXT training run)",
+        if on { "ENABLED — training runs will be noticeably slower" } else { "disabled" }
+    );
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_device_preference(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let current = state.inference.engine.device();
     Ok(match current {
@@ -986,6 +1022,16 @@ pub fn load_and_apply_config(state: &AppState) {
             crate::inference::engine::CUDA_MEM_LIMIT_MB
                 .store(cfg.cuda_mem_limit_mb, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("CUDA memory limit: {} MB (config.json)", cfg.cuda_mem_limit_mb);
+        }
+        // S115 §F5-2: only announced when ON — a machine that never touched it should not carry
+        // a line about a feature it does not use. Announced LOUDLY when it is on, because it
+        // survives restarts and its whole cost is silent slowness (see the field's doc).
+        if cfg.diagnostic_mode {
+            crate::training::diagnostics::set_enabled(true);
+            tracing::warn!(
+                "Diagnostic mode is ON (config.json): training runs will be noticeably slower. \
+                 Turn it off in Settings → Diagnostics when you are done reproducing."
+            );
         }
     } else {
         tracing::info!(
@@ -2783,6 +2829,35 @@ mod tests {
 
     fn find<'a>(list: &'a [TrainingGpu], label: &str) -> &'a TrainingGpu {
         list.iter().find(|g| g.label == label).unwrap_or_else(|| panic!("{label} not listed"))
+    }
+
+    /// S115 §F5-2: the upgrade path. Every existing user's `config.json` predates
+    /// `diagnostic_mode`, and the whole feature is opt-in — an absent field that deserialized to
+    /// anything but `false` would turn diagnostic mode ON for the entire installed base at once
+    /// (a silent global slowdown). Also pins that turning it on actually SURVIVES a round trip,
+    /// which is the only reason it lives in config.json instead of localStorage.
+    #[test]
+    fn s115_diagnostic_mode_defaults_off_and_survives_a_round_trip() {
+        // An old config, exactly as it exists on disk today: no such key.
+        let legacy = r#"{"device":"auto","cuda_mem_limit_mb":0}"#;
+        let cfg: AppConfig = serde_json::from_str(legacy).expect("legacy config must still parse");
+        assert!(!cfg.diagnostic_mode, "an absent field must read as OFF, never as on");
+        assert!(!AppConfig::default().diagnostic_mode);
+
+        let mut cfg = AppConfig::default();
+        cfg.diagnostic_mode = true;
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"diagnostic_mode\":true"), "{json}");
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.diagnostic_mode, "the flag must survive save+load — a repro spans restarts");
+
+        // ⛔ Deliberately NOTHING here touches `training::diagnostics`'s process-wide static.
+        // The first version of this test did, and so does the `apply` test in that module —
+        // measured: 3 of 6 plain `cargo test` runs FAILED, because libtest runs them in
+        // parallel and they fought over one AtomicBool. The release gate runs plain
+        // `cargo test`, so that would have been an intermittent red with no stable cause.
+        // ONE test owns that static (`s115_apply_stages_the_env_only_when_the_mode_is_on`),
+        // and it also covers "the accessor pair actually moves it". Keep it that way.
     }
 
     /// ★The S75 regression pin. The vendor EARLY-RETURN chain used to return the first matching
