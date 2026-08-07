@@ -903,6 +903,7 @@
     "RMVPE_NO_OUTPUT": "RMVPE 模型没有返回输出",
     "RUNTIME_DRIVER_TOO_OLD": "NVIDIA 显卡驱动过旧，无法运行 NVIDIA 运行时（CUDA 13 需要 580 或更新的驱动）。请到 NVIDIA 官网更新显卡驱动后重试；暂不更新可先使用 CPU 运行时",
     "RUNTIME_PACK_REQUIRED": "模型转换需要 Python 运行时，但尚未安装任何运行时包。请到 设置 → 训练环境 安装「CPU 运行时」包（约 0.4GB 下载），或安装适合你显卡的运行时包后重试。",
+    "RUNTIME_PACK_UNSUPPORTED": "这台机器无法运行该运行时包——设置页的下载列表本来就不会列出它。请刷新设置页，再从列表中实际提供的运行时包里选择。",
     "RUNTIME_PATH_NON_ASCII": "运行时安装路径含非 ASCII 字符。内嵌 Python + torch 在含中文/日文等字符的路径下会出现 DLL 加载失败——请先在 设置→存储位置 把数据目录迁移到纯英文路径（例如 D:\\UtaiData）后重试。",
     "RUNTIME_ROOT_UNINIT": "运行时根目录未初始化",
     "RVC_CHUNK_TOO_SHORT": "音频片段过短：模型输出不足以裁掉前后填充",

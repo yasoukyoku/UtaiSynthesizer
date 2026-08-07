@@ -291,6 +291,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RMVPE_MEL_SHAPE: { key: "backend.RMVPE_MEL_SHAPE" },
   RMVPE_NO_OUTPUT: { key: "backend.RMVPE_NO_OUTPUT" },
   RUNTIME_PACK_REQUIRED: { key: "backend.RUNTIME_PACK_REQUIRED" },
+  // S116: the pack download's server-side refusal — the twin of CUDA_UNSUPPORTED_GPU. Reached
+  // only from a stale Settings panel or a direct invoke; the list never offers such a pack.
+  RUNTIME_PACK_UNSUPPORTED: { key: "backend.RUNTIME_PACK_UNSUPPORTED" },
   RUNTIME_PATH_NON_ASCII: { key: "backend.RUNTIME_PATH_NON_ASCII" },
   RUNTIME_ROOT_UNINIT: { key: "backend.RUNTIME_ROOT_UNINIT" },
   RVC_CHUNK_TOO_SHORT: { key: "backend.RVC_CHUNK_TOO_SHORT" },

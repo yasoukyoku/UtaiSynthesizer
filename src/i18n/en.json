@@ -903,6 +903,7 @@
     "RMVPE_NO_OUTPUT": "The RMVPE model returned no output",
     "RUNTIME_DRIVER_TOO_OLD": "The NVIDIA driver is too old for the NVIDIA runtime (CUDA 13 requires driver 580 or newer). Update the driver at nvidia.com and retry; until then the CPU runtime works",
     "RUNTIME_PACK_REQUIRED": "Model conversion needs a Python runtime, but no runtime pack is installed. Install the \"CPU runtime\" pack (about 0.4 GB download) in Settings → Training Runtime, or install the pack matching your GPU, then retry.",
+    "RUNTIME_PACK_UNSUPPORTED": "This machine cannot run that runtime pack — the Settings download list does not offer it here. Refresh Settings and pick one of the packs it actually lists.",
     "RUNTIME_PATH_NON_ASCII": "The runtime install path contains non-ASCII characters. Embedded Python + torch fail to load DLLs under paths with Chinese/Japanese characters — migrate the data folder to an ASCII-only path (e.g. D:\\UtaiData) in Settings → Storage first, then retry.",
     "RUNTIME_ROOT_UNINIT": "Runtime root directory not initialized",
     "RVC_CHUNK_TOO_SHORT": "Audio chunk too short: the model output cannot cover the front/back padding trim",

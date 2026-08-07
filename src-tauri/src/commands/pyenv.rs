@@ -182,6 +182,28 @@ pub async fn download_runtime_pack(
         .iter()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("PACK_UNKNOWN: {id}"))?;
+    // ★S116 §G16 — the stale-UI / scripted-call defense, which f87443a (S74b) wrote for the
+    // INFERENCE twin and never gave this one. `download_cuda_runtime` refuses with
+    // CUDA_UNSUPPORTED_GPU right after its vendor check and says why in a comment: "The Settings
+    // entry is already hidden for these (cuda_supported); this is the stale-UI and scripted-call
+    // defense." Here the entire offer gate lived in a frontend filter
+    // (`rt.catalog.filter(c => !c.installed && c.supported)`), so a panel that had not refreshed —
+    // or anything invoking the command directly — could start a multi-GB download of a pack this
+    // machine cannot run. That is the shape settings.rs already names in writing: "the Iris-Xe
+    // mistake with a bigger file".
+    // ⛔ NOT applied to `install_runtime_pack_local`: `variant_supported`'s own doc says local-file
+    //    install is deliberately ungated, and it is the escape hatch for a machine our best-effort
+    //    name/cap gates judge wrongly. Gating it would take that away.
+    // ⚠ Same predicate as the list, never a second rule (S74b): an undetermined probe reads as
+    //    "unsupported" here exactly as it does in the list, so the button and the refusal can
+    //    never disagree about the same machine.
+    {
+        let gpus = crate::commands::settings::query_gpu_adapters();
+        let nv_cc10 = crate::commands::settings::nvidia_compute_caps_cc10();
+        if !crate::commands::settings::variant_supported(entry.variant, &gpus, &nv_cc10) {
+            return Err(format!("RUNTIME_PACK_UNSUPPORTED: {}", entry.variant));
+        }
+    }
     // S68f pre-download gate: cu130 = CUDA 13 runtime = NVIDIA driver r580+. The
     // variant gate only checks vendor + compute cap, so a perfectly capable card on a
     // pre-580 driver (community RTX 4070 Laptop: CUDA-12 inference fine, torch-cu130
@@ -744,6 +766,47 @@ pub async fn test_download_source(url: String) -> crate::download::ProbeResult {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// ★S116 §G16 — the download gate is asymmetric ON PURPOSE, and BOTH halves are load-bearing.
+    ///
+    /// `download_runtime_pack` must refuse a pack this machine cannot run (the stale-UI /
+    /// scripted-call defense f87443a wrote for `download_cuda_runtime` and never gave this one),
+    /// while `install_runtime_pack_local` must stay ungated — it is the escape hatch for a machine
+    /// our best-effort name/cap gates judge wrongly, and `variant_supported`'s own doc promises it.
+    /// Losing either half is silent: adding the gate to the local path removes the escape hatch
+    /// with nothing to notice, and dropping it from the download path restores a multi-GB dead end.
+    ///
+    /// Both commands take `State<'_, Arc<AppState>>` and tauri ships no test feature here (S110),
+    /// so the only hermetic way to state this is to read the file. ⚠ TO FIX A FAILURE: re-establish
+    /// the asymmetry, or — if the commands were renamed — re-anchor the two slices below.
+    #[test]
+    fn s116_only_the_network_download_is_capability_gated() {
+        static SELF_SRC: &str = include_str!("pyenv.rs");
+        let body = |name: &str| -> String {
+            let i = SELF_SRC
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("`{name}` is gone — re-anchor s116_only_the_network_download_is_capability_gated"));
+            // up to the next `#[tauri::command]`, i.e. this command and nothing after it
+            let rest = &SELF_SRC[i..];
+            let end = rest.find("#[tauri::command]").unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        // Self-check FIRST (S105): if the slicer silently returned something tiny, every
+        // assertion below would be vacuous in the direction that matters.
+        let dl = body("download_runtime_pack");
+        let local = body("install_runtime_pack_local");
+        assert!(dl.len() > 400 && local.len() > 400, "slices too short: {} / {}", dl.len(), local.len());
+        assert!(dl.contains("InstallGuard::acquire") && local.contains("InstallGuard::acquire"), "sliced the wrong region");
+
+        assert!(
+            dl.contains("variant_supported") && dl.contains("RUNTIME_PACK_UNSUPPORTED"),
+            "the network download stopped refusing packs this machine cannot run"
+        );
+        assert!(
+            !local.contains("variant_supported"),
+            "local-file install must stay ungated — it is the documented escape hatch"
+        );
+    }
 
     /// The xpu-tier report shape captured from a REAL headless run
     /// (`python -m utai_train.envtest --device xpu` on a non-XPU box, S74): a dead torch
