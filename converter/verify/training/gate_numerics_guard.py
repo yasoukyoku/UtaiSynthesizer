@@ -49,6 +49,11 @@ MUTATION PROBES (run by hand; each must turn exactly one check red)
     M7  change the epoch predicate text in any one trainer        -> A1 red
     M8  advance best_metric without checking save_best's result   -> F4 red
     M9  give the vocoder an EMA-based best                        -> G1/G4 red
+    M10 drop the "if self._first_seen is None" guard (rescan every
+        episode)                                                  -> C7 red
+    M11 record the first sighting with no weight scan (None)       -> C5d red
+    M12 drop first_seen_note() from the terminal raise             -> C6 red
+    M13 clear _first_seen on the recovery path                     -> C6 red
 
 ⛔ ONE PROBE MEASURED GREEN AND IS RECORDED AS SUCH, not deleted:
     M4  drop the is_floating_point() skip -> NOTHING goes red. torch 2.5.1's
@@ -300,6 +305,81 @@ check(
     "C4b and says so when the weights are still clean",
     msg_clean is not None and "weights=all finite" in msg_clean,
     "the two messages differ: %s" % (msg_poisoned != msg_clean),
+)
+
+
+# ── C5-C7. §4-4: WHERE this run FIRST saw a non-finite loss ──────────────────
+# The terminal message above scans the weights, but only at the moment the guard gives
+# up -- and by then the answer is always "the weights are nan", which cannot separate the
+# two failure shapes the investigation is stuck between (a forward/data overflow with
+# healthy weights vs. weights that were ALREADY broken when the losses first went bad).
+# That distinction exists only at the FIRST bad step, so it has to be recorded there.
+# (project_v2_resume_divergence_open §4-4 -- the last of that section's four.)
+
+print("C5-C7. the first sighting")
+
+g = guard(tiny_net())
+check("C5 nothing recorded before the first bad step", g.first_seen is None and g.first_seen_note() == "")
+g.observe(5, NAN)
+seen_clean = g.first_seen
+note_clean = g.first_seen_note()
+check(
+    "C5b the first sighting records step AND fields",
+    seen_clean is not None and seen_clean[0] == 5 and set(seen_clean[1]) == set(NAN),
+    repr(seen_clean),
+)
+check(
+    "C5c clean weights at the first sighting are reported as clean",
+    seen_clean[2] is None and "weights were all finite" in note_clean,
+    note_clean,
+)
+
+g = guard(tiny_net(float("nan")))
+g.observe(5, NAN)
+note_poisoned = g.first_seen_note()
+check(
+    "C5d already-poisoned weights at the first sighting NAME the tensor",
+    g.first_seen[2] is not None and "ALREADY non-finite" in note_poisoned,
+    note_poisoned,
+)
+# ⚠ Mandatory companion: a pinning check whose two arms return the same string has
+# measured nothing (S92p). These two must disagree, and they are the whole point.
+check("C5e the two arms really disagree", note_clean != note_poisoned, "clean != poisoned")
+
+# ★ The discriminating case, and the reason "record it at the first step" is not the same
+# thing as "scan again at the end": a run whose FIRST non-finite loss happened while the
+# weights were still healthy, whose weights are poisoned only LATER, must report both
+# facts -- and they contradict each other by design.
+net = tiny_net()
+g = numerics.DivergenceGuard((("G", net),), logger=None)
+g.observe(5, NAN)   # first sighting: weights still clean
+g.observe(6, OK)    # recovered -> the consecutive counter resets
+with torch.no_grad():
+    list(net.parameters())[2][0, 0] = float("nan")   # something breaks them afterwards
+msg_late = None
+try:
+    for i in range(numerics.DEFAULT_PATIENCE):
+        g.observe(100 + i, NAN)
+except RuntimeError as e:
+    msg_late = str(e)
+# ⚠ These two are deliberately split along the axis a mutation can move them along
+# separately (S101: every assertion needs a breakage that ONLY it catches). C6 owns the
+# STEP, C7 owns the VERDICT AT THAT STEP -- confusing the run's first bad step with the
+# current episode's first bad step reddens C6 alone; re-scanning the weights inside the
+# note reddens C7 alone.
+check(
+    "★C6 the terminal error names the FIRST step of the RUN, not of this episode",
+    msg_late is not None and "step 5 (" in msg_late,
+    (msg_late or "NO RAISE")[-96:],
+)
+check(
+    "★C7 ...with the verdict recorded THEN, not a fresh scan now",
+    msg_late is not None
+    and "weights were all finite" in msg_late      # what was true at step 5
+    and "ALREADY non-finite" not in msg_late
+    and "weights=G." in msg_late                   # ...and what is true now
+    and " is non-finite" in msg_late,
+    "one message, two clauses that disagree on purpose",
 )
 
 

@@ -115,10 +115,46 @@ class DivergenceGuard:
         self._logger = logger
         self._consecutive = 0
         self._first_step = None
+        self._first_seen = None
 
     @property
     def consecutive(self):
         return self._consecutive
+
+    @property
+    def first_seen(self):
+        """``(step, fields, poisoned_tensor_or_None)`` for the run's FIRST non-finite loss.
+
+        ``None`` until one happens. The third element is the answer to the question the
+        terminal error cannot answer by itself — see :meth:`first_seen_note`.
+        """
+        return self._first_seen
+
+    def first_seen_note(self):
+        """The run's first non-finite loss as one clause; ``""`` before there is one.
+
+        ★S118 (`project_v2_resume_divergence_open` §4-4, the last of that section's four).
+        The terminal error already scans the weights, but only at the moment it gives up —
+        by then the answer is always "the weights are nan", which does not distinguish the
+        two failure shapes the investigation is actually stuck between:
+
+        * the FORWARD produced a non-finite loss while every weight was still finite
+          (a bad batch / an fp16 overflow / a data defect), or
+        * the weights were ALREADY poisoned when the losses first went bad, i.e. something
+          earlier and quieter broke them (issue #2's "five losses finite at 12200, all five
+          nan at 12400" is compatible with both, which is exactly why it stalled).
+
+        The distinction only exists at the FIRST bad step, so it has to be recorded there.
+        """
+        if self._first_seen is None:
+            return ""
+        step, fields, poisoned = self._first_seen
+        where = (
+            "weights were ALREADY non-finite (%s)" % poisoned
+            if poisoned
+            else "weights were all finite"
+        )
+        return "first non-finite of this run: step %s (%s), %s" % (step, ",".join(fields), where)
 
     def observe(self, step, values):
         """Record one step. ``values`` maps a loss name to its float value.
@@ -133,12 +169,24 @@ class DivergenceGuard:
 
         if self._consecutive == 0:
             self._first_step = step
+            if self._first_seen is None:
+                # ⛔ ONCE PER RUN, not once per episode, and that bound is the whole design.
+                # Under fp16 an isolated overflow is NORMAL and recovers by construction
+                # (that is why DEFAULT_PATIENCE is not 1), so a scan per episode would be an
+                # unbounded, silent slowdown on healthy runs — a loss that alternates
+                # bad/good every other step would pay for it forever.
+                self._first_seen = (step, tuple(bad), first_nonfinite_module(self._modules))
             if self._logger is not None:
+                # ⛔ DELIBERATELY the log and not `Reporter.warn`: a single recovered fp16
+                # overflow must not put a warning bar on the user's screen. A run that
+                # screams when nothing is wrong trains the real signal into noise (S114/S115),
+                # and this text is diagnostic detail for a bug report, not a stable CODE.
                 self._logger.warning(
-                    "non-finite loss at step %s (%s) - watching for %s consecutive steps",
+                    "non-finite loss at step %s (%s) - watching for %s consecutive steps; %s",
                     step,
                     ",".join(bad),
                     self._patience,
+                    self.first_seen_note(),
                 )
         self._consecutive += 1
         if self._consecutive < self._patience:
@@ -149,7 +197,7 @@ class DivergenceGuard:
         poisoned = first_nonfinite_module(self._modules)
         weights = "weights=%s is non-finite" % poisoned if poisoned else "weights=all finite"
         raise RuntimeError(
-            "%s: %d consecutive non-finite steps (first at step %s, latest %s; fields %s); %s"
+            "%s: %d consecutive non-finite steps (first at step %s, latest %s; fields %s); %s; %s"
             % (
                 CODE_DIVERGED,
                 self._consecutive,
@@ -157,6 +205,7 @@ class DivergenceGuard:
                 step,
                 ",".join(bad),
                 weights,
+                self.first_seen_note(),
             )
         )
 
