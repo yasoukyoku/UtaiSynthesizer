@@ -206,18 +206,20 @@ for label, mod, want_step, why_step in (
 
     g, d, og, od = fresh_pair()
     random_fp = fingerprint(g)
-    ep, gs = mod.load_start_state(dbase, g, d, og, od, False)
+    ep, gs, side = mod.load_start_state(dbase, g, d, og, od, False)
     check("★★B[%s] 全新工作区必须把底模加载进 net_g(而不是留着随机初始值)" % label,
           abs(fingerprint(g) - base_fp) < 1e-6 and abs(random_fp - base_fp) > 1e-6,
           "loaded=%.6f base=%.6f random=%.6f" % (fingerprint(g), base_fp, random_fp))
     check("B[%s] net_d 同样" % label, abs(fingerprint(d) - base_fp) < 1e-6)
     check("B[%s] epoch_str = 1" % label, ep == 1, str(ep))
+    check("★B[%s] 全新工作区不许带回 resume sidecar(那是别人的 RNG/scale)" % label,
+          side is None, repr(side)[:80])
     check("★B[%s] global_step = %d —— %s" % (label, want_step, why_step), gs == want_step, str(gs))
 
     # 空目录:什么都不加载,权重必须原样
     dempty = tempfile.mkdtemp(prefix="s117_empty_%s_" % label)
     g2, d2, og2, od2 = fresh_pair()
-    ep2, gs2 = mod.load_start_state(dempty, g2, d2, og2, od2, False)
+    ep2, gs2, _ = mod.load_start_state(dempty, g2, d2, og2, od2, False)
     check("B[%s] 空工作区:不加载任何东西,(1,0)" % label,
           (ep2, gs2) == (1, 0) and abs(fingerprint(g2) - random_fp) < 1e-6)
 
@@ -228,7 +230,7 @@ for label, mod, want_step, why_step in (
     trained = Tiny()
     seed_base_pair(dres, trained, suffix=800, optimizer_none=False)
     g3, d3m, og3, od3 = fresh_pair()
-    ep3, gs3 = mod.load_start_state(dres, g3, d3m, og3, od3, False)
+    ep3, gs3, _ = mod.load_start_state(dres, g3, d3m, og3, od3, False)
     check("B[%s] 真续训:加载 step-800 那一对,step = 801" % label,
           gs3 == 801 and abs(fingerprint(g3) - fingerprint(trained)) < 1e-6,
           "step=%s" % gs3)
@@ -247,11 +249,12 @@ for label, mod, want_step, why_step in (
 
 d_skip = seed_base_pair(tempfile.mkdtemp(prefix="s117_skip_"), base)
 g5, d5, og5, od5 = fresh_pair()
-ep5, gs5 = SOVITS_V2.load_start_state(d_skip, g5, d5, og5, od5, True)
+ep5, gs5, side5 = SOVITS_V2.load_start_state(d_skip, g5, d5, og5, od5, True)
 check("B[sovits_v2] skip_optimizer=True:epoch/step 被压回 (1,0)", (ep5, gs5) == (1, 0), "%s,%s" % (ep5, gs5))
 check("★B[sovits_v2] skip_optimizer=True 时底模【仍然】被加载(它是『用底模播种权重』的旋钮,不是『什么都不加载』)",
       abs(fingerprint(g5) - base_fp) < 1e-6,
       "loaded=%.6f base=%.6f" % (fingerprint(g5), base_fp))
+check("B[sovits_v2] skip_optimizer=True 也不许带回 sidecar(它是播种,不是继续)", side5 is None)
 
 print()
 print("=== C12: refuse_unreadable 带 CODE ===")
