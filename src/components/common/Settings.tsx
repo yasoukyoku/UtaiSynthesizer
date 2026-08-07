@@ -58,8 +58,13 @@ interface InferenceGpuChoice {
   id: number;
   label: string;
   selectable: boolean;
-  /** S74b: stable CODE for WHY it isn't selectable ("SOFTWARE_ADAPTER" | "CC_UNSUPPORTED"),
-   *  localized into the option label — a greyed row with no reason is a guessing game. */
+  /** S74b: stable CODE for WHY it isn't selectable, localized into the option label — a greyed
+   *  row with no reason is a guessing game. FOUR codes today, not the two this used to list
+   *  (S116): "SOFTWARE_ADAPTER" | "DUPLICATE_ADAPTER" | "CC_UNSUPPORTED" | "CC_UNKNOWN".
+   *  ⚠ CC_UNSUPPORTED and CC_UNKNOWN are deliberately different: "we read the cap and it is out
+   *  of range" vs "we could not read it at all", and the backend refuses to collapse them because
+   *  calling an unread card unsupported would be a false statement about the user's hardware.
+   *  `gpuOptionLabel` must keep a distinct string for each. */
   reason?: string | null;
   /** "nvidia" | "amd" | "intel" | "other" — drives the Auto-mode restart hint. */
   vendor: string;
@@ -115,9 +120,11 @@ interface RuntimeCatalogItem {
   experimental: boolean;
   downloadable: boolean;
   installed: boolean;
-  /** Whether THIS machine's hardware can run the variant (backend variant_supported):
-   *  CPU always; NVIDIA needs an sm_75+ card; AMD/Intel need the matching-vendor GPU.
-   *  Unsupported variants are hidden from the download list (local-file install still works). */
+  /** Whether THIS machine's hardware can run the variant. THE authority is the backend's
+   *  `variant_supported` — do not restate its rule here (S116: the old summary "AMD/Intel need the
+   *  matching-vendor GPU" stopped being true at S75, when both arms became adapter-NAME gates).
+   *  Unsupported variants are hidden from the download list; the backend refuses them again if the
+   *  panel is stale. Local-file install is deliberately still allowed. */
   supported: boolean;
 }
 
@@ -2293,9 +2300,11 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
                 </div>
               )}
 
-              {/* Only offer packs this machine's hardware can run (backend-gated:
-                  CPU always; NVIDIA needs sm_75+; AMD/Intel need the matching GPU).
-                  Unsupported variants are hidden here — local-file install stays open. */}
+              {/* Only offer packs this machine's hardware can run. The rule lives in the backend's
+                  `variant_supported`; do not restate it here (S116 removed the third drifted copy
+                  of "AMD/Intel need the matching GPU", false since S75). Unsupported variants are
+                  hidden here AND refused server-side if this panel is stale — local-file install
+                  stays open on purpose. */}
               {rt.catalog.filter((c) => !c.installed && c.supported).map((c) => (
                 <div key={c.id} className="settings-field">
                   <label>{packLabel(c)}{c.experimental ? `（${L("rtExperimental")}）` : ""}</label>

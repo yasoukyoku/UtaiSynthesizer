@@ -94,10 +94,15 @@ pub struct CatalogItem {
     /// override) — drives whether the 下载 button shows at all.
     pub downloadable: bool,
     pub installed: bool,
-    /// Whether THIS machine's hardware can actually run this variant (settings.rs
-    /// `variant_supported`: CPU always; nv needs an sm_75+ NVIDIA card; amd/intel need
-    /// the matching-vendor GPU). The UI hides download entries for unsupported variants
-    /// so a box is only offered packs it can use. Local-file install is NOT gated by this.
+    /// Whether THIS machine's hardware can actually run this variant. THE authority is
+    /// settings.rs `variant_supported` — read it there, do not restate the rule here.
+    /// ⚠ S116: this used to say "amd/intel need the matching-vendor GPU", which S75 stopped being
+    /// true: both arms are adapter-NAME gates, so most cards of the right vendor are rejected on
+    /// purpose. A summary that drifts is worse than a pointer, because it is the summary people
+    /// read before deciding what the flag means.
+    /// The UI hides download entries for unsupported variants so a box is only offered packs it
+    /// can use; `download_runtime_pack` refuses them again server-side (S116).
+    /// ⛔ Local-file install is deliberately NOT gated by this — it is the escape hatch.
     pub supported: bool,
 }
 

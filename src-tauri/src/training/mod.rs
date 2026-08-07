@@ -75,6 +75,18 @@ pub(crate) fn backend_family(backend: &str) -> &str {
 /// as before (review round 1: the unconditional refusal sent those users chasing a
 /// download the Settings UI deliberately hides). The nvidia-smi/DXGI probes only run
 /// on the rare cpu-pack path — zero cost for every GPU-pack install.
+///
+/// ⚠ S116 — that enumeration is INCOMPLETE, and for the missing member the stated reason does
+/// not hold. Since S74b `variant_supported`'s NVIDIA arm reads `nvidia_compute_caps_cc10()`,
+/// which is EMPTY whenever nvidia-smi is absent, exits non-zero, or misses the 8 s cap (a wedged
+/// driver — the probe's own comment says so) ⇒ a perfectly supported RTX card on a sick driver
+/// also lands in the silent set, and for THAT box "has no in-app pack to install" is false: the
+/// pack exists, local-file install is ungated, and fixing the driver brings the entry back.
+/// ⛔ The BEHAVIOUR is still right and must not be "fixed" to fire: refusing there would print
+/// "install the runtime pack matching your GPU in Settings" while that entry is fail-closed out
+/// of the list — the exact review-round-1 regression. And the box is not left mute: it shows up
+/// in `training_gpu_list` as non-selectable with reason `TRAINING_GPU_CC_UNKNOWN`, wired through
+/// backendError.ts into all three locales.
 fn refuse_cpu_only_runtime(app_dir: &Path, force_cpu: bool) -> Result<()> {
     if force_cpu {
         return Ok(());

@@ -78,9 +78,21 @@ describe("restartWouldChangeOrtBuild", () => {
 });
 
 describe("buildMismatch ↔ init_ort_runtime 对拍", () => {
+  /**
+   * Blank out `//` line comments, keeping length and line count so any future line-based
+   * assertion still lines up. ⚠ REQUIRED, not tidiness: the assertions below ask whether the gate
+   * READS a predicate, and the gate is surrounded by prose that legitimately NAMES the predicates
+   * it does not use — S116 added a comment saying "`is_cuda_available()` is the latter and gates
+   * nothing here" and that alone turned this suite red. A parity test that cannot tell code from
+   * commentary reports the documentation, not the behaviour. (Same trick as `ipcParity`.)
+   */
+  function codeOnly(s: string): string {
+    return s.replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+  }
+
   /** The body of `init_ort_runtime` up to the point where the build decision is finished. */
   async function gateBody(): Promise<string> {
-    const src = (await importFs()).readFileSync(LIB_RS, "utf8");
+    const src = codeOnly((await importFs()).readFileSync(LIB_RS, "utf8"));
     const start = src.indexOf("pub fn init_ort_runtime");
     expect(start, `${LIB_RS} no longer defines init_ort_runtime`).toBeGreaterThan(0);
     const end = src.indexOf("let mut search_paths", start);

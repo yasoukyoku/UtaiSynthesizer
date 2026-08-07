@@ -301,15 +301,18 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
     let runtime_dir = app_dir.join("runtime").join("ort");
 
     // Decide which ORT BUILD to load. ORT bundles ONE provider set per DLL: the DirectML build has
-    // no CUDA provider and vice-versa. Explicit "cuda" → CUDA build; "directml"/"cpu" → DirectML
-    // build. Auto/unset → load the CUDA build ONLY when this machine actually has CUDA (Toolkit cudart
-    // present) AND the CUDA build is downloaded — that's what lets Auto's "CUDA → … → CPU" chain
-    // actually light up CUDA. On a non-CUDA machine we keep the DirectML build, because loading the
-    // CUDA build there has no DirectML provider and would drop Auto straight to CPU.
+    // no CUDA provider and vice-versa, which is why this decision is load-bearing rather than a
+    // preference — on a non-CUDA-capable machine we keep the DirectML build, because the CUDA build
+    // there has no DirectML provider and would drop Auto straight to CPU. The CUDA build MUST also
+    // match the ort crate's API (1.24.x / API 24); a mismatch deadlocks.
+    // ⛔★S116: two near-duplicate paragraphs used to sit here describing the PRE-S74b rule —
+    // "explicit \"cuda\" → CUDA build" (unconditional) and "Auto loads CUDA when this machine
+    // actually has CUDA (Toolkit cudart present)". Both were wrong about today's code and sat
+    // ABOVE the accurate S74b block below, so they read as its summary. The real rule is stated
+    // once, right where it is implemented — see `prefer_cuda`: an explicit pick is honoured ONLY
+    // while `cuda_pkg_supported()` still says yes, and that predicate is an nvidia-smi COMPUTE-CAP
+    // read, not a cudart-on-PATH probe (`is_cuda_available()` is the latter and gates nothing here).
     let cuda_dll = runtime_dir.join("cuda").join(dll_name);
-    // Auto/unset → load the CUDA build when this machine actually has CUDA (Toolkit cudart present) AND
-    // the CUDA build is downloaded — the whole point of Auto: light up CUDA without a manual pick. The
-    // CUDA build MUST be the version matching the ort crate's API (1.24.x / API 24); a mismatch deadlocks.
     // ★S74b CONSUMPTION POINT 2 — the ORT BUILD gate. This is the decision that makes every
     // downstream fallback either possible or impossible, because the CUDA build ships CUDA+CPU
     // EPs ONLY: once it is loaded, "fall back to DirectML" cannot happen in this process, and

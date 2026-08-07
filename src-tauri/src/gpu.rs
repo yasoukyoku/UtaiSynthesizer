@@ -7,6 +7,17 @@
 //! stack was healthy. DXGI is subprocess-free and works wherever a display stack exists,
 //! so it is now the PRIMARY enumeration; WMI stays as a fallback (settings.rs).
 //!
+//! ⚠ S116 — that history is accurate, but do NOT read it as "the cascade is closed and this
+//! module is where it is prevented". All three consequences it names have since moved off the
+//! ADAPTER probe onto nvidia-smi: the CUDA option/entry is `cuda_pkg_supported()`, the NVIDIA
+//! training pack is `variant_supported("nv-cu130", …, nv_cc10)`, and the silent-CPU guard
+//! (`training::refuse_cpu_only_runtime`) keys on the same `nv_cc10`. None of them consult
+//! `dxgi_adapters()`. `nvidia_compute_caps_cc10` is a subprocess probe with the identical
+//! single-point-of-failure shape as the WMI one this header indicts — and S74b made ITS failure
+//! mean "unsupported" ON PURPOSE, with the reasoning written out on `cuda_pkg_supported`.
+//! ⇒ The lesson that survives is "probes must corroborate, never gate each other"; the specific
+//! cascade was re-opened one probe over, as a deliberate, argued trade.
+//!
 //! ORDERING CONTRACT (do not break): `DxgiAdapterInfo.index` is the raw
 //! `IDXGIFactory1::EnumAdapters1` ordinal — exactly the id space ORT's DirectML EP
 //! consumes for an explicit device_id (verified in ONNX Runtime v1.24.4
@@ -228,10 +239,34 @@ pub fn cuda_devices() -> Vec<CudaDeviceInfo> {
 
 /// Compute capability (major, minor) for a CUDA RUNTIME ordinal (the ORT CUDA EP's
 /// device space — same ordinal cudaSetDevice uses), via cudart cudaDeviceGetAttribute.
-/// None = cudart unloadable / the call failed. ⚠ Callers consume `None` as NOT SUPPORTED
-/// (fail-CLOSED — the S74b package rule), except `cuda_device_label`, which only formats a log
-/// suffix. Do not reintroduce a `map_or(true, …)` here: that is the fail-open this predicate was
-/// changed away from.
+/// `None` = cudart unloadable / the call failed — and that is the ORDINARY reading, not an edge
+/// case: `cudart64_12.dll` only reaches PATH via `setup_cuda_dll_paths` once the CUDA runtime
+/// package is installed, so every box without that package answers `None` for every ordinal.
+///
+/// ⛔★S116 — CONSUMPTION IS NOT UNIFORM, AND MUST NOT BE MADE UNIFORM. This doc used to claim
+/// every caller treats `None` as NOT SUPPORTED "except `cuda_device_label`". That was false the
+/// day it was written: two of the four production callers were authored in the SAME commit and
+/// let `None` through. The direction is chosen per CONSEQUENCE (the rule spelled out on
+/// `nvidia_total_vram_mb` in settings.rs), and here the consequences differ:
+///   · `list_inference_gpus` (settings.rs) — fail-CLOSED: `None` ⇒ `CC_UNKNOWN` ⇒ not selectable,
+///     because "you could pick it" must imply "it can run here". ⚠ It reports CC_UNKNOWN and
+///     deliberately NOT CC_UNSUPPORTED: calling an unread card unsupported would be a false
+///     statement about the user's hardware (that site says so in writing).
+///   · `build_session`'s explicit-CUDA arm and `build_session_auto`'s CUDA leg (inference/engine.rs)
+///     — fail-OPEN ON PURPOSE. Those guards exist only to upgrade a raw ORT error into a localized
+///     `CUDA_UNSUPPORTED_GPU` modal / a WARN; firing them on `None` would announce a fabricated
+///     `sm_` value about a card we never read. A genuinely incapable card is still caught one layer
+///     down by `.error_on_failure()` + `is_cuda_kernel_failure` / `notify_cuda_degraded_once`,
+///     at the cost of one wasted session build.
+///   · `cuda_device_label` — formats a log suffix, no policy at all.
+/// ⇒ Do NOT "restore fail-closed" at the engine.rs sites; do NOT relax the settings.rs one.
+///
+/// ⚠ The old line also said `map_or(true, …)` was "the fail-open this predicate was changed away
+/// from" — it never was. `git show e3673a5:src-tauri/src/gpu.rs` has no `cuda_compute_cap` at all
+/// (this whole function was BORN in f87443a). The real historical fail-open belonged to a
+/// different predicate over a different probe: `variant_supported`'s
+/// `nv_cc.map_or(true, |cc| cc >= 7.5)` over nvidia-smi, introduced in `683d713` (S45) and
+/// inverted by f87443a (S74b). Don't reintroduce THAT one — in settings.rs, where it lived.
 #[cfg(windows)]
 pub fn cuda_compute_cap(ordinal: u32) -> Option<(i32, i32)> {
     type GetAttr = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
