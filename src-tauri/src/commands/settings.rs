@@ -2660,7 +2660,7 @@ pub async fn install_cuda_runtime_local(
 #[tauri::command]
 pub async fn delete_cuda_runtime(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     crate::commands::window::ensure_idle_for_package_delete(&state)?;
-    if crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false) {
+    if crate::ort_build_is_cuda() {
         tracing::warn!("delete_cuda_runtime refused: this process loaded the CUDA ORT build");
         return Err("CUDA_DELETE_IN_USE".to_string());
     }
@@ -3122,6 +3122,72 @@ mod tests {
             "the recommendation must be derived from the SAME hoisted probe the pack gates use, \
              or it can drift back into naming a pack the download list hides. Found: {call:?}"
         );
+    }
+
+    /// ★S116 — nobody re-scatters the ORT build identity.
+    ///
+    /// `ORT_LOADED_BUILD` is a four-valued DISPLAY string, and since S74b one of its readings
+    /// decides whether the DirectML EP may be registered — which on the CUDA build does not fail
+    /// cleanly, it ACCESS-VIOLATES the process. It was compared to the bare literal `"CUDA"` in
+    /// five places across three files (one of them negated), i.e. five chances to disagree about
+    /// the identity of a value that gates a process crash, and no single place stating what the
+    /// two UNCLASSIFIED values mean. `crate::ort_build_is_cuda` is now that place.
+    /// ⚠ TO FIX A FAILURE: call `crate::ort_build_is_cuda()` instead of comparing the tag; if you
+    /// genuinely need a different question, add it NEXT TO that helper with its own doc.
+    #[test]
+    fn s116_the_ort_build_identity_has_exactly_one_reader() {
+        for (name, src) in [
+            ("lib.rs", include_str!("../lib.rs")),
+            ("inference/engine.rs", include_str!("../inference/engine.rs")),
+            ("commands/settings.rs", include_str!("settings.rs")),
+        ] {
+            // Self-check first (S105): a typo in the path would make this vacuous. Each of the
+            // three files must still PARTICIPATE in the contract — either by holding the tag or
+            // by asking the one question. (engine.rs holds neither literal any more, which is
+            // exactly the point of this commit, so "contains ORT_LOADED_BUILD" is NOT the test.)
+            assert!(
+                src.contains("ORT_LOADED_BUILD") || src.contains("ort_build_is_cuda"),
+                "{name}: sliced the wrong file, or it dropped out of the ORT-build contract"
+            );
+            for (n, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                assert!(
+                    !(code.contains("ORT_LOADED_BUILD") && code.contains("\"CUDA\"")),
+                    "{name}:{}: a sixth copy of the build identity — use crate::ort_build_is_cuda()\n  {line}",
+                    n + 1
+                );
+            }
+        }
+        // …and the single reader must still exist and still be the one that answers.
+        assert!(include_str!("../lib.rs").contains("pub fn ort_build_is_cuda()"));
+        assert!(!crate::ort_build_is_cuda(), "an unset OnceLock must answer false (test processes never set it)");
+    }
+
+    /// ★S116 — the collapse of those five expressions into one is only allowed if it is
+    /// BEHAVIOUR-IDENTICAL, and "I read it carefully" is not a criterion. This enumerates every
+    /// value the tag can hold and re-evaluates BOTH original shapes against the new one — the
+    /// negated site (`try_dml`) included, since that is the one an off-by-a-polarity rewrite
+    /// would break silently (Auto would stop probing DirectML, i.e. land on CPU).
+    #[test]
+    fn s116_the_single_reader_is_byte_equivalent_to_the_five_it_replaced() {
+        for tag in [
+            None,
+            Some("CUDA"),
+            Some("DirectML"),
+            Some("dev/system (D:\\ort\\onnxruntime.dll)"),
+            Some("system PATH"),
+            Some("?"), // what get_hardware_info shows before init records anything
+        ] {
+            let new = crate::ort_tag_is_cuda(tag);
+            // the four positive sites: `…get().map(|b| b == "CUDA").unwrap_or(false)`
+            assert_eq!(new, tag.map(|b| b == "CUDA").unwrap_or(false), "positive form, tag={tag:?}");
+            // the negated site: `let try_dml = …get().map(|b| b != "CUDA").unwrap_or(true)`
+            assert_eq!(!new, tag.map(|b| b != "CUDA").unwrap_or(true), "negated form, tag={tag:?}");
+        }
+        // The two classified values must stay distinguishable — a rename that collapsed them
+        // would make every guard above answer for the wrong build.
+        assert!(crate::ort_tag_is_cuda(Some("CUDA")));
+        assert!(!crate::ort_tag_is_cuda(Some("DirectML")));
     }
 
     #[test]

@@ -250,7 +250,48 @@ fn preload_cudnn_frontend_libs(_cudnn_dir: &std::path::Path) {}
 /// dev-cache/system path). Recorded so later startup lines can state the FACT of
 /// what loaded instead of re-announcing the Auto chain — the S22 logging rule
 /// ("log the actual hardware, not the intent") applied to the startup path.
+///
+/// ⚠ It is a DISPLAY string with FOUR possible values, not a two-valued flag — see
+/// `ort_build_is_cuda` below before comparing it to anything.
 pub static ORT_LOADED_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The tag values `init_ort_runtime` can record. Exactly two of them are CLASSIFIED, i.e. we
+/// know which provider set the DLL carries because we recognised its path.
+const ORT_BUILD_CUDA: &str = "CUDA";
+const ORT_BUILD_DIRECTML: &str = "DirectML";
+
+/// ★S116 — THE single question every guard actually asks: "is the DLL this process loaded the
+/// CUDA build?" It used to be five separate `== "CUDA"` literal comparisons (settings.rs ×1,
+/// inference/engine.rs ×4, one of them negated), and that is not a stylistic complaint: the tag
+/// stopped being cosmetic at S74b — it decides whether the DirectML EP may be REGISTERED at all,
+/// and registering it on the CUDA build does not fail cleanly, it ACCESS-VIOLATES the process
+/// (headless-verified S74, stated at both guard sites). Five hand-written copies of the identity
+/// of a value that gates a process crash is one typo away from a crash nobody can reproduce.
+///
+/// ⛔ THE UNCLASSIFIED VALUES HAVE A POLICY, AND IT IS FAIL-OPEN ON PURPOSE. `dev/system (<path>)`
+/// and `system PATH` mean "we loaded a DLL from a fallback source and do NOT know its provider
+/// set" (lib.rs's search order: the two known paths first, then the exe-adjacent shadow, then the
+/// ort.pyke.io dev cache, then bare `ort::init()`). This function answers `false` for them, so the
+/// DirectML EP WILL be probed on such a DLL — a documented crash if it happens to be a CUDA build.
+/// That is the accepted trade: failing closed would silently drop every dev / system-PATH box to
+/// CPU, which is this project's #1 pain class, while the crash needs a CUDA-build onnxruntime.dll
+/// sitting in the exe directory or the dev cache of a machine whose `runtime/ort/` is missing.
+/// ⇒ If you want to change that, change it HERE, once, and say so — do not re-scatter the literal.
+/// (An unset OnceLock answers `false` too: in-crate `#[cfg(test)]` harnesses call `ort::init_from`
+/// directly and never set it, and the pre-existing behaviour there was to allow the DML probe.)
+pub fn ort_build_is_cuda() -> bool {
+    ort_tag_is_cuda(ORT_LOADED_BUILD.get().map(|s| s.as_str()))
+}
+
+/// The pure form, split out ONLY so the rewrite above can be proved equivalent to the five
+/// hand-written expressions it replaced — over EVERY value the tag can hold, including the
+/// negated one (`map(|b| b != "CUDA").unwrap_or(true)`), which is the one that is easy to get
+/// subtly wrong. ⛔ Do not test `ort_build_is_cuda()` by setting the `OnceLock`: it is process
+/// global, a test that writes it poisons every other test in the binary, and reaching for
+/// `--test-threads=1` to hide that is a report of shared state, not a fix (S115).
+pub(crate) fn ort_tag_is_cuda(tag: Option<&str>) -> bool {
+    tag == Some(ORT_BUILD_CUDA)
+}
 
 /// Find and initialize the ORT runtime DLL.
 /// Picks CUDA or DirectML DLL based on user's saved device preference.
@@ -388,10 +429,11 @@ pub fn init_ort_runtime(app_dir: &std::path::Path) {
                     // named cuda" heuristic would mis-tag an app installed under e.g. D:\AI\cuda\
                     // and silently strip that machine of GPU inference.
                     let build = if *path == cuda_dll {
-                        "CUDA".to_string()
+                        ORT_BUILD_CUDA.to_string()
                     } else if *path == runtime_dir.join(dll_name) {
-                        "DirectML".to_string()
+                        ORT_BUILD_DIRECTML.to_string()
                     } else {
+                        // UNCLASSIFIED — see `ort_build_is_cuda` for what every guard does with it.
                         format!("dev/system ({})", path.display())
                     };
                     tracing::info!("ORT runtime loaded successfully ({build} build)");

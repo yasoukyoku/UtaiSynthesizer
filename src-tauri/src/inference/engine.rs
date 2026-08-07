@@ -284,7 +284,7 @@ static AUTO_CUDA_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// meant ~10 identical lines per render, drowning the log the line exists to serve.)
 fn notify_cuda_degraded_once() -> bool {
     static NOTIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let on_cuda_build = crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false);
+    let on_cuda_build = crate::ort_build_is_cuda();
     if on_cuda_build && !NOTIFIED.swap(true, Ordering::Relaxed) {
         crate::app_emit("auto-cuda-fallback", ());
         return true;
@@ -1240,7 +1240,7 @@ fn build_session(
             // in this session is asking for something this process cannot do; Settings already
             // shows the "restart required" hint, and this is the guard that keeps a render started
             // BEFORE that restart from taking the whole app down. Same predicate as build_session_auto.
-            if crate::ORT_LOADED_BUILD.get().map(|b| b == "CUDA").unwrap_or(false) {
+            if crate::ort_build_is_cuda() {
                 return Err(UtaiError::Inference("DML_NEEDS_RESTART".to_string()));
             }
             builder = builder
@@ -1343,7 +1343,7 @@ fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> 
         if let Some(idx) = auto_gpu {
             if cuda_id.is_none()
                 && preferred_vendor == Some("nvidia")
-                && crate::ORT_LOADED_BUILD.get().map(|s| s == "CUDA").unwrap_or(false)
+                && crate::ort_build_is_cuda()
             {
                 tracing::warn!(
                     "Auto-mode preferred GPU {idx} couldn't be mapped to a CUDA ordinal — probing ORT's default CUDA device"
@@ -1402,7 +1402,10 @@ fn build_session_auto(path: &Path, mem_pattern: bool, auto_gpu: Option<u32>) -> 
     // CUDA build (poisoned after a run failure, or a compute-cap-unsupported card) the Auto
     // fallback must be CPU, not a DML probe that crashes the process. The DirectML build (where
     // DML actually lives) takes the real probe below.
-    let try_dml = crate::ORT_LOADED_BUILD.get().map(|b| b != "CUDA").unwrap_or(true);
+    // ⚠ The negation of the SAME question, not a second rule: an UNCLASSIFIED build tag
+    // (`dev/system (…)` / `system PATH`) answers "not CUDA" and therefore probes DML — see
+    // `crate::ort_build_is_cuda` for why that fail-open is deliberate and what it costs.
+    let try_dml = !crate::ort_build_is_cuda();
     let dml = if try_dml {
         let mut dml_ep = ort::ep::DirectML::default();
         if let Some(idx) = auto_gpu {

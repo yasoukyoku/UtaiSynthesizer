@@ -30,7 +30,14 @@
 export interface OrtBuildHintInput {
   /** The saved inference device preference: "auto" | "cuda" | "directml" | "cpu". */
   device: string;
-  /** `HardwareInfo.ort_build` — which build THIS process actually loaded. */
+  /**
+   * `HardwareInfo.ort_build` — which build THIS process actually loaded.
+   * ⚠ Four possible values, not two: "CUDA" | "DirectML" | `dev/system (<path>)` | "system PATH"
+   * (lib.rs `init_ort_runtime`). The last two mean "loaded from a fallback source, provider set
+   * unknown"; they are neither of the legs below, so no hint fires — which is right, because we
+   * cannot say what a restart would do. Rust asks this question through `ort_build_is_cuda`;
+   * this file is the frontend mirror of the same two literals.
+   */
   ortBuild: string;
   /** Vendor of the Auto-mode preferred GPU; undefined when the device is not Auto or none is picked. */
   autoVendor: string | undefined;
