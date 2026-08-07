@@ -3190,6 +3190,34 @@ mod tests {
         assert!(!crate::ort_tag_is_cuda(Some("DirectML")));
     }
 
+    /// ★S116 — the ONE user-facing copy of the compute-capability floor stays tied to the constant.
+    ///
+    /// `CUDA_CC10_FLOOR`'s own doc says "do not derive a second floor anywhere", and after S116
+    /// removed the drifted prose copies there is exactly one number left outside gpu.rs:
+    /// `rtWhyNv` in Settings.tsx, in all three languages. That is a legitimate place for it (the
+    /// string has to name a card generation the user recognises) — what it must not do is drift.
+    /// ⚠ The moment it WILL drift is already written down: gpu.rs step ⑨ of the CUDA-13 migration
+    /// checklist. Whoever does that will change the constant and has no reason to think about a
+    /// TSX string; this test is what tells them.
+    #[test]
+    fn s116_the_user_facing_cc_floor_still_matches_the_constant() {
+        static SETTINGS_TSX: &str = include_str!("../../../src/components/common/Settings.tsx");
+        let i = SETTINGS_TSX
+            .find("rtWhyNv:")
+            .expect("`rtWhyNv` is gone from Settings.tsx — re-anchor or drop this test");
+        // ⚠ char-wise, not byte-wise: this line is three languages of CJK (S115).
+        let row: String = SETTINGS_TSX[i..].chars().take(700).collect();
+        let expected = format!("sm_{}", crate::gpu::CUDA_CC10_FLOOR);
+        // All three locales live on that one row; each must name the floor.
+        let hits = row.matches(&expected).count();
+        assert!(
+            hits >= 3,
+            "rtWhyNv names the CUDA floor {hits} time(s), expected one per locale (zh/en/ja).\n\
+             CUDA_CC10_FLOOR is now {} ⇒ the user-facing text must say {expected}. Row was:\n{row}",
+            crate::gpu::CUDA_CC10_FLOOR
+        );
+    }
+
     #[test]
     fn intel_gate_accepts_arc_never_xe() {
         for name in ["Intel(R) Arc(TM) A770 Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) Data Center GPU Max 1100"] {
