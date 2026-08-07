@@ -189,7 +189,9 @@ pub fn get_hardware_info(state: State<'_, Arc<AppState>>) -> Result<HardwareInfo
         current_device_id,
         auto_gpu: state.inference.engine.auto_gpu(),
         ort_build: crate::ORT_LOADED_BUILD.get().cloned().unwrap_or_else(|| "?".to_string()),
-        recommended_variant: recommend_variant(&gpus, has_nvidia).to_string(),
+        // S116: the SAME hoisted probe the pack gates use — `nvidia_compute_caps_cc10` is a
+        // per-process OnceLock, so asking here costs no extra nvidia-smi subprocess.
+        recommended_variant: recommend_variant(&gpus, &nvidia_compute_caps_cc10()).to_string(),
         nvidia_vram_mb: if has_nvidia { nvidia_total_vram_mb() } else { None },
         training_gpus: training_gpu_list(
             &gpus,
@@ -424,10 +426,20 @@ fn nvidia_gpu_uuids() -> Vec<NvSmiGpu> {
 /// only fully-supported training path); AMD over Intel. iGPU-vs-dGPU is deliberately
 /// NOT guessed — the pick is only a DEFAULT and the UI lets the user override
 /// (Pinokio's silent wrong-variant installs are the anti-pattern we're avoiding).
-/// `has_nvidia` = adapter-vendor OR nvidia-smi evidence (S68b — one dead probe must
-/// not funnel an RTX box into the CPU pack).
-fn recommend_variant(gpus: &[GpuAdapter], has_nvidia: bool) -> &'static str {
-    if has_nvidia {
+///
+/// ★S116: every arm asks the SAME question `variant_supported` asks, so this can never
+/// name a pack the download list hides. It used to take a bare `has_nvidia` (vendor
+/// presence) while f87443a narrowed the amd/intel arms beside it to capability
+/// predicates — so a GTX 10-series box, or one whose nvidia-smi cannot answer, read
+/// "Recommended variant: nv-cu130" directly above a list that filters on `c.supported`
+/// and therefore does not contain it, with no reason shown. Naming a pack we then
+/// refuse to offer is consumption point 6 (禁用必给理由) run backwards.
+/// ⚠ The S68b rescue is KEPT, for the same reason `cuda_supported` keeps it one screen
+/// up (see `get_hardware_info`): `nv_cc10` IS nvidia-smi evidence, so a box whose ADAPTER
+/// probe died still recommends nv-cu130. What no longer survives is a dead nvidia-smi —
+/// and that is exactly the case S74b made fail-CLOSED, where the pack is hidden anyway.
+fn recommend_variant(gpus: &[GpuAdapter], nv_cc10: &[i32]) -> &'static str {
+    if nv_cc10.iter().any(|&cc| crate::gpu::cuda_cc_supported_training(cc)) {
         "nv-cu130"
     } else if amd_is_rocm_capable(gpus) {
         "amd"
@@ -3029,6 +3041,87 @@ mod tests {
         // Vendor still matters: a same-named adapter attributed to another vendor is not ours.
         assert!(!amd_is_rocm_capable(&[gpu("Radeon 780M", "intel")]));
         assert!(!amd_is_rocm_capable(&[]));
+    }
+
+    /// ★S116 §G16 — the recommendation and the offer gate must never disagree.
+    ///
+    /// The panel prints "Recommended variant: X" directly above a download list filtered on
+    /// `variant_supported`. If those two can differ, we name a pack and then hide it with no
+    /// reason — which is consumption point 6 (禁用必给理由) run backwards. So the invariant is
+    /// not a lookup table, it is a PROPERTY: whatever `recommend_variant` returns must satisfy
+    /// `variant_supported` on the very same inputs.
+    #[test]
+    fn s116_recommendation_is_always_a_pack_this_machine_may_download() {
+        // ⚠ Every arm needs at least one box it can get WRONG, or that arm is untested here: a
+        // mutation replacing the Intel arm with bare vendor presence stayed green until the
+        // Iris Xe row existed (there is no such thing as a "safe" arm to leave uncovered).
+        let boxes: [(&str, Vec<GpuAdapter>, Vec<i32>); 10] = [
+            ("supported NVIDIA", vec![gpu("NVIDIA GeForce RTX 3080 Ti", "nvidia")], vec![86]),
+            ("Pascal NVIDIA", vec![gpu("NVIDIA GeForce GTX 1080", "nvidia")], vec![61]),
+            ("Blackwell NVIDIA", vec![gpu("NVIDIA GeForce RTX 5090", "nvidia")], vec![120]),
+            ("NVIDIA adapter, nvidia-smi silent", vec![gpu("NVIDIA GeForce RTX 4070", "nvidia")], vec![]),
+            ("Pascal + gfx1103 iGPU", vec![gpu("NVIDIA GeForce GTX 1080", "nvidia"), gpu("AMD Radeon 780M Graphics", "amd")], vec![61]),
+            ("Arc only", vec![gpu("Intel(R) Arc(TM) A770 Graphics", "intel")], vec![]),
+            ("Iris Xe only", vec![gpu("Intel(R) Iris(R) Xe Graphics", "intel")], vec![]),
+            ("RX 7900 XTX only", vec![gpu("AMD Radeon RX 7900 XTX", "amd")], vec![]),
+            ("Pascal + Iris Xe", vec![gpu("NVIDIA GeForce GTX 1080", "nvidia"), gpu("Intel(R) Iris(R) Xe Graphics", "intel")], vec![61]),
+            ("no adapters at all", vec![], vec![]),
+        ];
+        for (label, gpus, cc) in boxes {
+            let rec = recommend_variant(&gpus, &cc);
+            assert!(
+                variant_supported(rec, &gpus, &cc),
+                "{label}: recommended {rec:?}, which variant_supported() rejects — the Settings \
+                 panel would name a pack its own download list hides"
+            );
+        }
+    }
+
+    /// The four rows that carry the actual behaviour change, pinned individually so a regression
+    /// says WHICH machine it broke. (The property above passes even for a `_ => \"cpu\"` stub, so
+    /// it cannot be the only gate — S108: the specific assertions have to be separable.)
+    #[test]
+    fn s116_recommendation_tracks_capability_not_vendor_presence() {
+        // Blackwell is fine for TRAINING (cu130) even though inference excludes it — the
+        // recommendation must follow the training predicate, not the inference one.
+        assert_eq!(recommend_variant(&[gpu("NVIDIA GeForce RTX 5090", "nvidia")], &[120]), "nv-cu130");
+        // Below the shared floor: a real NVIDIA card with no pack we would let it download.
+        assert_eq!(recommend_variant(&[gpu("NVIDIA GeForce GTX 1080", "nvidia")], &[61]), "cpu");
+        // nvidia-smi cannot answer ⇒ S74b says NOT supported ⇒ the pack is hidden ⇒ do not name it.
+        assert_eq!(recommend_variant(&[gpu("NVIDIA GeForce RTX 4070", "nvidia")], &[]), "cpu");
+        // ★S68b rescue, KEPT: the ADAPTER probe died (no gpus at all) but nvidia-smi answered.
+        assert_eq!(recommend_variant(&[], &[86]), "nv-cu130", "a dead WMI probe must not funnel an RTX box into the CPU pack");
+        // The AMD arm was unreachable behind the old bare-vendor NVIDIA arm; on this box the
+        // 780M is the only thing that can actually train.
+        assert_eq!(
+            recommend_variant(
+                &[gpu("NVIDIA GeForce GTX 1080", "nvidia"), gpu("AMD Radeon 780M Graphics", "amd")],
+                &[61]
+            ),
+            "amd"
+        );
+    }
+
+    /// The two tests above call `recommend_variant` directly, so neither can see what the ONE
+    /// production call site actually feeds it. The compiler blocks the exact old bug (a `bool`
+    /// no longer type-checks), but not "hand it some other `&[i32]`" — and an empty slice would
+    /// make every machine read "cpu" while both tests above stay green. `get_hardware_info` takes
+    /// a `State<'_, Arc<AppState>>` and tauri ships no test feature here (S110), so the call site
+    /// is pinned in the only hermetic way left: by reading this file.
+    /// ⚠ TO FIX A FAILURE HERE: do not delete the assertion — either restore the shared probe as
+    /// the argument, or, if `recommended_variant` genuinely moved, re-anchor the search string.
+    #[test]
+    fn s116_the_recommendation_call_site_uses_the_shared_probe() {
+        static SELF_SRC: &str = include_str!("settings.rs");
+        let i = SELF_SRC
+            .find("recommended_variant: recommend_variant(")
+            .expect("`recommended_variant: recommend_variant(` is gone from get_hardware_info");
+        let call: String = SELF_SRC[i..].chars().take(160).collect();
+        assert!(
+            call.contains("nvidia_compute_caps_cc10()"),
+            "the recommendation must be derived from the SAME hoisted probe the pack gates use, \
+             or it can drift back into naming a pack the download list hides. Found: {call:?}"
+        );
     }
 
     #[test]
