@@ -50,6 +50,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from .. import diag
 from .. import device as device_shim  # aliased: 'device' is a collision-prone name in torch code (device = torch.device(...))
 from .. import ckpt_guard
 from .. import loader_budget
@@ -552,12 +553,19 @@ def train(cfg, exp_dir, reporter, stop):
             # evidence, so the UI must still receive it before the run dies.
             divergence.observe(global_step, step_losses)
 
-            if global_step % hps.train.log_interval == 0:
+            if global_step % diag.log_interval(hps.train.log_interval) == 0:
                 logger.info(
                     "Train Epoch: {} [{:.0f}%]".format(
                         epoch, 100.0 * batch_idx / len(train_loader)
                     )
                 )
+                # ★S117 §4 — the three things community issue #2's log could not say. Empty
+                # string when diagnostic mode is off, so a normal run's log is byte-identical.
+                if diag.enabled():
+                    logger.info(
+                        "diag step=%s%s grad_norm_d=%.4g grad_norm_g=%.4g",
+                        global_step, diag.scaler_note(scaler), grad_norm_d, grad_norm_g,
+                    )
                 if loss_mel > 75:
                     loss_mel = 75
                 if loss_kl > 9:

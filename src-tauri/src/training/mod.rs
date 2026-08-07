@@ -2948,7 +2948,26 @@ mod tests {
                 src.contains("resume_state.restore("),
                 "{name}/train.py writes the sidecar but never restores from it"
             );
+            // ★S117 §4 — the 200-step blind spot that made community issue #2 unanswerable.
+            assert!(
+                src.contains("diag.log_interval(hps.train.log_interval)"),
+                "{name}/train.py stopped routing log_interval through diag — diagnostic mode \
+                 would still sample every 200 steps, which is the gap that report died in"
+            );
         }
+
+        // The diagnostic flag's NAME is a cross-language contract: Rust sets it, python reads it.
+        static DIAG_PY: &str = include_str!("../../../training/utai_train/diag.py");
+        static DIAG_RS: &str = include_str!("diagnostics.rs");
+        let env = DIAG_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ENV = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("utai_train/diag.py must keep ENV as a plain top-level literal");
+        assert!(
+            DIAG_RS.contains(&format!("name: \"{env}\"")),
+            "training/diagnostics.rs never sets {env}, so nothing in diag.py can ever turn on"
+        );
     }
 
     #[test]

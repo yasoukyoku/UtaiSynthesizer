@@ -106,7 +106,20 @@ pub fn apply(
     if !enabled() {
         return Vec::new();
     }
-    let vars = vars_for(variant, device_backend);
+    // ★S117 — our OWN flag, set on every runtime because it gates things we wrote rather than a
+    // torch knob: per-step logging (the 200-step blind spot that made community issue #2
+    // unanswerable), the GradScaler scale + whether the step was skipped, and the gradient norms
+    // the loop already computes and throws away. Kept OUT of `vars_for` on purpose — that
+    // function answers "what does THIS runtime's torch understand", and the xpu/cpu tiers
+    // legitimately answer "nothing", which must stay a true statement.
+    const OURS: DiagnosticVar = DiagnosticVar {
+        name: "UTAI_DIAGNOSTICS",
+        value: "1",
+        why: "turns on our own per-step evidence in the trainer: log_interval=1, the fp16 loss \
+               scale and whether each step was skipped, and the per-step gradient norms",
+    };
+    let mut vars = vec![OURS];
+    vars.extend(vars_for(variant, device_backend));
     for v in &vars {
         cmd.env(v.name, v.value);
     }
@@ -223,13 +236,29 @@ mod tests {
         assert!(staged(Some("nv-cu130"), "cuda").is_empty(), "OFF must stage nothing at all");
 
         set_enabled(true);
+        // ★S117 — our own flag is staged on EVERY runtime, because what it gates is ours: the
+        // trainer's per-step evidence (log_interval=1, the loss scale + skipped flag, the
+        // gradient norms). It is not a placebo — it changes what gets written down on a cpu box
+        // exactly as much as on an NVIDIA one.
+        // ⚠ `Command::get_envs()` yields them SORTED BY NAME, not in insertion order — so these
+        // lists are alphabetical, not "ours first". (Learned by reading the failure, S117.)
+        let ours = ("UTAI_DIAGNOSTICS".to_string(), Some("1".to_string()));
         let nv = staged(Some("nv-cu130"), "cuda");
-        assert_eq!(nv, vec![("CUDA_LAUNCH_BLOCKING".to_string(), Some("1".to_string()))]);
+        assert_eq!(
+            nv,
+            vec![("CUDA_LAUNCH_BLOCKING".to_string(), Some("1".to_string())), ours.clone()]
+        );
         let amd = staged(Some("amd"), "cuda");
-        assert_eq!(amd, vec![("AMD_SERIALIZE_KERNEL".to_string(), Some("3".to_string()))]);
-        // …and the runtime with no knob must get a CLEAN command, not a placebo variable.
-        assert!(staged(Some("xpu"), "xpu").is_empty());
-        assert!(staged(Some("cpu"), "cpu").is_empty());
+        assert_eq!(
+            amd,
+            vec![("AMD_SERIALIZE_KERNEL".to_string(), Some("3".to_string())), ours.clone()]
+        );
+        // …and the runtime with no TORCH knob still gets no placebo torch variable: exactly our
+        // own flag and nothing else. (The original assertion here was `is_empty()`; keeping that
+        // would now mean "diagnostic mode does nothing at all on xpu/cpu", which is the opposite
+        // of true.)
+        assert_eq!(staged(Some("xpu"), "xpu"), vec![ours.clone()]);
+        assert_eq!(staged(Some("cpu"), "cpu"), vec![ours.clone()]);
         set_enabled(false);
     }
 

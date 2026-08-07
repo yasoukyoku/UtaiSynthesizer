@@ -65,6 +65,7 @@ from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import ckpt_guard
+from .. import diag
 from .. import device as device_shim  # aliased: train() has a local `device`
 from .. import numerics
 from .. import resume_state
@@ -478,7 +479,7 @@ def train(cfg, exp_dir, reporter, stop):
             # AFTER reporter.step on purpose — see the rvc trainer's note.
             divergence.observe(global_step, step_losses)
 
-            if global_step % hps.train.log_interval == 0:
+            if global_step % diag.log_interval(hps.train.log_interval) == 0:
                 logger.info('Train Epoch: {} [{:.0f}%]'.format(
                     epoch,
                     100. * batch_idx / len(train_loader)))

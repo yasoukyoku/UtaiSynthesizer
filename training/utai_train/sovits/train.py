@@ -63,6 +63,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import ckpt_guard
+from .. import diag
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
 from .. import loader_budget
 from .. import numerics
@@ -480,12 +481,16 @@ def train(cfg, exp_dir, reporter, stop):
             # AFTER reporter.step on purpose — see the rvc trainer's note.
             divergence.observe(global_step, step_losses)
 
-            if global_step % hps.train.log_interval == 0:
+            if global_step % diag.log_interval(hps.train.log_interval) == 0:
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
                 logger.info('Train Epoch: {} [{:.0f}%]'.format(
                     epoch,
                     100. * batch_idx / len(train_loader)))
                 logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr}")
+                # ★S117 §4 — see rvc/train.py; empty when diagnostic mode is off.
+                if diag.enabled():
+                    logger.info("diag step=%s%s grad_norm_d=%.4g grad_norm_g=%.4g",
+                                global_step, diag.scaler_note(scaler), grad_norm_d, grad_norm_g)
 
                 scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr,
                                "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
