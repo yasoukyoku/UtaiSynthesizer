@@ -23,6 +23,7 @@ import { autoUpdateCheckEnabled, setAutoUpdateCheckEnabled, checkForUpdate, type
 import { startupComponentCheckEnabled, setStartupComponentCheckEnabled } from "../../lib/startupCheck";
 import { useFloatingPanel } from "../../lib/useFloatingPanel";
 import { runExitFlow } from "../../lib/exitFlow";
+import { restartWouldChangeOrtBuild } from "../../lib/ortBuild";
 import { PanelResizeHandles } from "./PanelResizeHandles";
 import "./Settings.css";
 
@@ -1631,21 +1632,24 @@ ${L("stSlotDiffNote").replace("{steps}", String(slot.diffSteps))}`
               Say explicitly when the preference needs a restart to actually apply.
               Auto legs: a non-NVIDIA pick can't run on the CUDA build (no DML EP — it
               would land on CPU until restart); an NVIDIA pick on the DML build runs on
-              the right card but only reaches CUDA after a restart. */}
+              the right card but only reaches CUDA after a restart.
+              ★S116: the predicate lives in lib/ortBuild.ts and is tested there. It used to
+              ask `hw.cuda_available` ("is some cudart reachable"), which is not what decides
+              the build — so a Blackwell / pre-Turing box promised a restart that could never
+              deliver. See that file for the full reasoning; do not inline a second copy. */}
           {hw &&
             (() => {
               const autoVendor =
                 device === "auto" && autoGpu !== null
                   ? gpuLists?.directml.find((o) => o.id === autoGpu)?.vendor
                   : undefined;
-              const mismatch =
-                (device === "cuda" && hw.ort_build === "DirectML") ||
-                (device === "directml" && hw.ort_build === "CUDA") ||
-                (autoVendor !== undefined &&
-                  ((autoVendor !== "nvidia" && hw.ort_build === "CUDA") ||
-                    (autoVendor === "nvidia" &&
-                      hw.ort_build === "DirectML" &&
-                      hw.cuda_available)));
+              const mismatch = restartWouldChangeOrtBuild({
+                device,
+                ortBuild: hw.ort_build,
+                autoVendor,
+                cudaSupported: hw.cuda_supported,
+                cudaReady,
+              });
               return mismatch ? (
                 <p className="settings-error">
                   {L("buildMismatch").replace("{build}", hw.ort_build)}
