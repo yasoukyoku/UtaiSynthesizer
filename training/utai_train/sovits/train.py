@@ -55,6 +55,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from .. import ckpt_guard
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
 from .. import loader_budget
 from .. import numerics
@@ -185,16 +186,25 @@ def train(cfg, exp_dir, reporter, stop):
         eps=hps.train.eps)
 
     skip_optimizer = False
-    try:
-        _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g,
-                                                   optim_g, skip_optimizer)
-        _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d,
-                                                   optim_d, skip_optimizer)
-        epoch_str = max(epoch_str, 1)
-        ckpt_name = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
-        global_step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
-    except Exception:
-        logger.warning("load old checkpoint failed, starting from scratch")
+    # ★S116 §F5-③ⓒ — same shape as rvc/train.py (see utai_train/ckpt_guard.py). Upstream's
+    # `except Exception: starting from scratch` turns a truncated or incomplete checkpoint into a
+    # silent restart, and because the two loads mutate as they go, "G loaded, D threw" left net_g
+    # and optim_g resumed while epoch/step reset to 1/0. Deciding up front whether a resume was
+    # intended gives the fallback exactly one meaning and makes every real failure loud.
+    if ckpt_guard.resume_was_intended(hps.model_dir, seeded_base_is_step_zero=True):
+        try:
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g,
+                                                       optim_g, skip_optimizer, resume=True)
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d,
+                                                       optim_d, skip_optimizer, resume=True)
+            epoch_str = max(epoch_str, 1)
+            ckpt_name = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
+            global_step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+        except ckpt_guard.ResumeRefused:
+            raise  # already carries its stable CODE
+        except Exception as e:
+            raise ckpt_guard.refuse_unreadable(hps.model_dir, e) from e
+    else:
         epoch_str = 1
         global_step = 0
     if skip_optimizer:

@@ -36,6 +36,8 @@ import re
 
 import numpy as np
 import torch
+
+from .. import ckpt_guard
 import librosa
 
 MATPLOTLIB_FLAG = False
@@ -84,7 +86,7 @@ def compute_f0_dio(wav_numpy, p_len=None, sampling_rate=44100, hop_length=512):
     return resize_f0(f0, p_len)
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False):
+def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False, resume=False):
     assert os.path.isfile(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     iteration = checkpoint_dict['iteration']
@@ -96,6 +98,12 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
+    # ★S116 §F5-③ⓒ: on a RESUME, refuse instead of quietly substituting fresh random weights
+    # for keys the checkpoint cannot supply — and note the optimizer above has ALREADY been
+    # restored by then, so the result is random weights driven by stale Adam moments.
+    # (Measured on the real functions; see utai_train/ckpt_guard.py.)
+    if resume:
+        ckpt_guard.check_resume_state_dict(checkpoint_path, state_dict, saved_state_dict)
     new_state_dict = {}
     for k, v in state_dict.items():
         try:

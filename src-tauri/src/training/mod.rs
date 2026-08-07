@@ -2676,6 +2676,89 @@ mod tests {
     ///
     /// ⚠ It pins TEXT, not behaviour. If you rename the constant, this test tells you
     /// the four other places that have to move with it; that IS the point.
+    /// ★S116 §F5-③ⓒ — the same cross-language contract for the two RESUME refusals.
+    ///
+    /// Behaviour lives in `converter/verify/training/gate_ckpt_guard.py` (15 checks); what rots
+    /// silently is the wiring. These two CODEs fire at the worst possible moment — the user asked
+    /// to continue a run they have already paid hours for — so a raw English CODE on the screen
+    /// there is exactly the S67 `TRAINING_GPU_UNAVAILABLE` failure again.
+    /// ⚠ Both CODEs are parsed OUT of ckpt_guard.py, never retyped here.
+    #[test]
+    fn s116_resume_guard_codes_are_wired_across_python_rust_and_all_three_locales() {
+        static CKPT_GUARD_PY: &str = include_str!("../../../training/utai_train/ckpt_guard.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let parse = |name: &str| -> String {
+            CKPT_GUARD_PY
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("ckpt_guard.py must keep `{name} = \"...\"` as a plain top-level literal — this gate parses it as the single source")
+                })
+        };
+        let codes = [parse("CODE"), parse("FAILED_CODE")];
+        assert_ne!(codes[0], codes[1], "the two refusals must stay distinguishable to the user");
+
+        for code in &codes {
+            assert!(
+                code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message: {msg:?}",
+                    msg.chars().count()
+                );
+            }
+        }
+
+        // ★The half a text gate CAN check about behaviour: every trainer must re-raise the
+        // refusal BEFORE its catch-all, or the guard is swallowed and a corrupt resume silently
+        // becomes "restart from the base model at step 0" — a WORSE silent failure than the one
+        // it replaces. That interaction is the whole reason ResumeRefused is its own type.
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("ckpt_guard.resume_was_intended("),
+                "{name}/train.py stopped deciding up front whether a resume was intended"
+            );
+            let re_raise = src
+                .find("except ckpt_guard.ResumeRefused:")
+                .unwrap_or_else(|| panic!("{name}/train.py must re-raise ResumeRefused"));
+            // ⚠ Compare against the catch-all OF THE SAME BLOCK, identified by its unique body —
+            // the first draft asked "does `except Exception` appear anywhere after this?", which
+            // every one of these files satisfies from an unrelated later try, so swapping the two
+            // arms left it green. A mutation caught that (S116); do not weaken it back.
+            let catch_all = src
+                .find("raise ckpt_guard.refuse_unreadable(")
+                .unwrap_or_else(|| panic!("{name}/train.py lost its loud unreadable-checkpoint arm"));
+            assert!(
+                re_raise < catch_all,
+                "{name}/train.py: the catch-all is ordered BEFORE the ResumeRefused arm, so python \
+                 matches it first and the refusal is swallowed — a corrupt resume would silently \
+                 restart from the base model at step 0"
+            );
+        }
+    }
+
     #[test]
     fn s114_divergence_code_is_wired_across_python_rust_and_all_three_locales() {
         static NUMERICS_PY: &str = include_str!("../../../training/utai_train/numerics.py");

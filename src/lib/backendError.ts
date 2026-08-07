@@ -291,6 +291,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RMVPE_MEL_SHAPE: { key: "backend.RMVPE_MEL_SHAPE" },
   RMVPE_NO_OUTPUT: { key: "backend.RMVPE_NO_OUTPUT" },
   RUNTIME_PACK_REQUIRED: { key: "backend.RUNTIME_PACK_REQUIRED" },
+  // S116 §F5-③ⓒ: a resume checkpoint that exists but cannot be used as one. Both are modal-worthy
+  // — the run stopped, and the alternative was silently poisoning or discarding the user's work.
+  TRAINING_RESUME_CHECKPOINT_INCOMPLETE: { key: "backend.TRAINING_RESUME_CHECKPOINT_INCOMPLETE", modal: true },
+  TRAINING_RESUME_CHECKPOINT_UNREADABLE: { key: "backend.TRAINING_RESUME_CHECKPOINT_UNREADABLE", modal: true },
   // S116: the pack download's server-side refusal — the twin of CUDA_UNSUPPORTED_GPU. Reached
   // only from a stale Settings panel or a direct invoke; the list never offers such a pack.
   RUNTIME_PACK_UNSUPPORTED: { key: "backend.RUNTIME_PACK_UNSUPPORTED" },

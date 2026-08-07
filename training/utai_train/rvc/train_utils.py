@@ -17,13 +17,15 @@ import numpy as np
 import torch
 from scipy.io.wavfile import read
 
+from .. import ckpt_guard
+
 MATPLOTLIB_FLAG = False
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
+def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, resume=False):
     assert os.path.isfile(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -32,6 +34,12 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
+    # ★S116 §F5-③ⓒ: on a RESUME, refuse instead of quietly substituting fresh random weights.
+    # The loop below is upstream's and its own comment defends the PRETRAIN case ("pretrain 缺失的")
+    # — but in this repo `load_checkpoint` has exactly one caller per trainer and it is the resume
+    # block; the pretrained path never comes through here. See ckpt_guard for the measurement.
+    if resume:
+        ckpt_guard.check_resume_state_dict(checkpoint_path, state_dict, saved_state_dict)
     new_state_dict = {}
     for k, v in state_dict.items():  # 模型需要的shape
         try:

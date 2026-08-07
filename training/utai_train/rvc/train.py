@@ -27,6 +27,16 @@
 #     loss-trajectory gate is unaffected there; a tight machine deliberately
 #     deviates rather than deadlocking. (S115 added this line — the adaptation was
 #     documented inline but never registered here.)
+#   - ★S116 §F5-③ⓒ: the resume block no longer uses upstream's BARE `except:` fallback.
+#     Upstream turns EVERY resume failure (truncated checkpoint, half-written optimizer blob,
+#     OOM) into "load the pretrained model, restart from epoch 1" — silently discarding the
+#     epochs the user already paid for — and its two sequential loads could leave a resumed
+#     optim_d attached to a pretrain-weight net_d. Here the presence of BOTH checkpoints decides
+#     up front whether a resume was intended; inside that branch every failure is loud with a
+#     stable CODE, and the pretrain branch means exactly one thing. `load_checkpoint(resume=True)`
+#     additionally refuses a checkpoint that cannot supply every parameter the model needs —
+#     upstream substitutes fresh RANDOM weights for those keys and then restores the optimizer's
+#     Adam moments on top (measured, S116). See utai_train/ckpt_guard.py.
 import datetime
 import json
 import logging
@@ -41,6 +51,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from .. import device as device_shim  # aliased: 'device' is a collision-prone name in torch code (device = torch.device(...))
+from .. import ckpt_guard
 from .. import loader_budget
 from .. import numerics
 from . import train_utils as utils
@@ -199,16 +210,30 @@ def train(cfg, exp_dir, reporter, stop):
         eps=hps.train.eps,
     )
 
-    try:  # 如果能加载自动resume
-        _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
-        )
-        logger.info("loaded D")
-        _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
-        )
+    # ★S116 §F5-③ⓒ — upstream wraps this in a BARE `except:` whose fallback is "load the
+    # pretrained model and restart from epoch 1". That makes EVERY failure mode of a resume look
+    # like "there was nothing to resume from": a truncated G_*.pth, a half-written optimizer blob,
+    # an OOM — all silently discard the epochs the user already paid for and begin overwriting
+    # from step 0, with `loaded pretrained …` as the only trace. Worse, the two loads mutate state
+    # as they go, so "D loaded, G threw" left a resumed optim_d driving a pretrain-weight net_d.
+    # ⇒ Decide FIRST whether a resume was intended (both checkpoints present), then let every
+    # failure inside be loud. The pretrain branch now means exactly one thing.
+    # ⚠ Deviation from upstream, registered in the header.
+    if ckpt_guard.resume_was_intended(hps.model_dir):
+        try:
+            _, _, _, epoch_str = utils.load_checkpoint(
+                utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d, resume=True
+            )
+            logger.info("loaded D")
+            _, _, _, epoch_str = utils.load_checkpoint(
+                utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g, resume=True
+            )
+        except ckpt_guard.ResumeRefused:
+            raise  # already carries its stable CODE
+        except Exception as e:
+            raise ckpt_guard.refuse_unreadable(hps.model_dir, e) from e
         global_step = (epoch_str - 1) * len(train_loader)
-    except:  # 如果首次不能加载，加载pretrain
+    else:  # 首次训练：加载pretrain
         epoch_str = 1
         global_step = 0
         if hps.pretrainG != "":
