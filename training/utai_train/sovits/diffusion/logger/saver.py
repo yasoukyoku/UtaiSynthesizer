@@ -112,19 +112,14 @@ class Saver(object):
                 seconds=total_time))[:-5]
         return total_time
 
-    def save_model(
-            self,
-            model,
-            optimizer,
-            name='model',
-            postfix='',
-            to_json=False):
-        # path
-        if postfix:
-            postfix = '_' + postfix
-        path_pt = os.path.join(
-            self.expdir , name+postfix+'.pt')
+    def save_model_to(self, path_pt, model, optimizer):
+        """Write ONE checkpoint to an EXPLICIT path (atomic: temp + rename).
 
+        ★S118 §F8⒜: extracted from ``save_model`` unchanged, because the resume snapshots live in
+        a SUBDIRECTORY of the expdir and therefore cannot be addressed by ``name``+``postfix``.
+        A second ``torch.save`` in the caller would be a second opinion about the checkpoint
+        layout, which is exactly what this project pays for repeatedly.
+        """
         # check
         logger.info(' [*] model checkpoint saved: %s', path_pt)
 
@@ -141,6 +136,19 @@ class Saver(object):
                 'model': model.state_dict()}, tmp_pt)
         os.replace(tmp_pt, path_pt)
         return path_pt
+
+    def save_model(
+            self,
+            model,
+            optimizer,
+            name='model',
+            postfix='',
+            to_json=False):
+        # path
+        if postfix:
+            postfix = '_' + postfix
+        return self.save_model_to(
+            os.path.join(self.expdir, name+postfix+'.pt'), model, optimizer)
 
 
     def delete_model(self, name='model', postfix=''):

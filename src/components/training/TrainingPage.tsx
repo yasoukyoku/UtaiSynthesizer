@@ -1579,8 +1579,16 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   /** Deployable model → import. Release/best/final weights, but NOT the diffusion ones. */
   const rowConvertible = (r: CkptRecord) =>
     !rowIsDiffusion(r.rel) && (r.kind === "release" || r.kind === "best" || r.kind === "final");
-  /** Shallow-diffusion product → attach to an installed SoVITS host. */
-  const rowAttachable = (r: CkptRecord) => rowIsDiffusion(r.rel) && r.kind !== "base";
+  /** ★S118 §F8⒜ — a resume SNAPSHOT (`resume_best/` / `resume_latest/`), not a product. */
+  const rowIsResumeSnapshot = (rel: string) =>
+    /\/resume_(best|latest)\//.test(rel.replace(/\\/g, "/"));
+  /** Shallow-diffusion product → attach to an installed SoVITS host.
+   *  ⛔ NOT the diffusion resume snapshots: `export_diffusion.py` resolves the config yaml NEXT
+   *  TO the .pt and errors when there is none, and a snapshot subdirectory has no yaml — so the
+   *  button would be there and fail. It is also the wrong offer: the snapshot is a resume point,
+   *  and its deployable twin (`diffusion/model_best.pt`, same weights) is listed right beside it. */
+  const rowAttachable = (r: CkptRecord) =>
+    rowIsDiffusion(r.rel) && r.kind !== "base" && !rowIsResumeSnapshot(r.rel);
   /** Auditionable = anything that renders through the inference chain. Raw resume state (G_/D_
    *  pairs, model_ckpt_steps) is not a deployable model — it has no audition. */
   const rowAuditionable = (r: CkptRecord) => rowConvertible(r) || rowAttachable(r);
@@ -2011,6 +2019,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         return;
       }
       let fresh = false;
+      let diffResumeFrom: "latest" | "best" = "latest";
       if (info.exists) {
         const hasProgress = info.diff_steps > 0;
         // 重训 only spares the workspace when a main model lives in it — a
@@ -2019,6 +2028,19 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         const wipeNote = info.has_main_progress
           ? ""
           : " " + t("training.diffRetrainFullWipeNote");
+        // ★S118 §F8⒜ — the diffusion twin of the GAN dialog's option, gated on the DIFFUSION
+        // snapshot (`diff_best_resume_step`) and never on `best_resume_step`: a sovits_diff probe
+        // resolves to the sovits SLOT, so that field describes the MAIN model's G+D snapshot and
+        // this label would carry the wrong model's step.
+        const bestResume =
+          info.diff_best_resume_step != null
+            ? [
+                {
+                  id: "resumeBest",
+                  label: t("training.resumeFromBest", { step: info.diff_best_resume_step }),
+                },
+              ]
+            : [];
         const choice = await showConfirm({
           title: t("training.diffConfirmTitle"),
           body:
@@ -2031,15 +2053,19 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
               label: hasProgress ? t("training.resume") : t("training.continueTrain"),
               kind: "primary",
             },
+            ...bestResume,
             { id: "retrain", label: t("training.retrainDiff"), kind: "danger" },
             { id: "cancel", label: t("training.cancel") },
           ],
         });
-        if (choice !== "resume" && choice !== "retrain") return;
+        if (choice !== "resume" && choice !== "retrain" && choice !== "resumeBest") return;
         fresh = choice === "retrain";
+        if (choice === "resumeBest") diffResumeFrom = "best";
       }
       // fresh here can only come from the「重训(仅扩散)」button above = an answered dialog
-      await start(fresh, fresh).catch(() => undefined);
+      // ⚠ `fresh` also means「wipe confirmed」on this path (same argument twice, as before);
+      // resume_from is ignored by the backend for a fresh start (it normalizes to "").
+      await start(fresh, fresh, diffResumeFrom).catch(() => undefined);
       return;
     }
 

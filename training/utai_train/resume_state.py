@@ -79,11 +79,50 @@ BEST_G = "G.pth"
 BEST_D = "D.pth"
 BEST_STATE = "state.json"
 
+#: The shallow-diffusion payload: ONE file, because that trainer's checkpoint IS one file
+#: (``{'global_step', 'model', 'optimizer'}``) instead of a G+D pair (S118 §F8⒜).
+BEST_MODEL = "model.pt"
+
+#: Directory holding the ROLLING complete resume point — shallow diffusion only, and it exists
+#: because that trainer is the only one whose periodic checkpoint is NOT a resume point:
+#: ``diffusion_template.yaml`` ships upstream's ``save_opt: false``, so every ``interval_val``
+#: save is ``{global_step, model}`` with no optimizer (measured: 210.7 MB against 631.9 MB for
+#: one that has it), and ``logger/utils.load_model`` restores such a file in TOTAL silence —
+#: ``optim.state`` simply stays ``{}``. Our stop/final saves do carry the optimizer, so the hole
+#: is exactly "the run ended ungracefully": a kill, an OOM, a power loss. Flipping ``save_opt``
+#: would put 421 MB of moments into every kept MILESTONE instead (20 milestones = 12.6 GB), so
+#: the resume point gets its own rolling file and the numbered archive grid stays byte-identical
+#: to today. ★ User decision 2026-08-07: pay the ~632 MB, no switch — same call as §F2⒜'s.
+LATEST_DIR = "resume_latest"
+
+#: ⛔ BOTH directory names MUST be at least 6 characters, and this is not cosmetic.
+#: ``logger/utils.load_model`` finds candidates with a RECURSIVE ``os.walk`` and then slices each
+#: path with ``s[len(expdir + "/model_"):]`` before asking ``str.isdigit()``. Measured (S118,
+#: `TESTING/s118_f8a/probe_nested_pt_arithmetic.py`): with a subdirectory name of 6+ characters
+#: the discarded 7-char prefix ends INSIDE the name, so the remainder still contains the path
+#: separator and can never be all-digits — the nested file contributes step 0 and is ignored.
+#: With a name of 5 or fewer the separator is consumed and the FILENAME's tail is exposed:
+#: ``logs/x9999.pt`` slices to ``"9999"``, and ``load_model`` then rebuilds a flat
+#: ``model_9999.pt`` that does not exist and dies with ``FileNotFoundError``. ``logs/`` is 4
+#: characters and IS created in production (``Saver`` puts tensorboard there) — it is only
+#: dormant because tensorboard writes no ``.pt``. `gate_resume_state` pins the length.
+SNAPSHOT_DIR_MIN_LEN = 6
+
 #: Stable CODE (→ `utai_train.runner` → `backendError.ts` → all three locales) for "you are
 #: resuming onto a dataset that is not the one this checkpoint was trained on". It is a WARNING,
 #: never a refusal: `resume_lock.rs` classifies `dataset` as Costly, i.e. changing it is
 #: legitimate and merely re-runs preprocessing. Refusing here would contradict that table.
 CODE_DATASET_CHANGED = "TRAINING_RESUME_DATASET_CHANGED"
+
+#: Stable CODE for "this resume could not restore the optimizer's momentum, because the archive it
+#: continues from does not contain any" (shallow diffusion only — the three GANs always write it).
+#: Also a WARNING, never a refusal: continuing without the moments is far better than refusing to
+#: continue at all, and it is the ONLY option a user with a pre-S118 workspace has. It earns a
+#: user-visible line because the cost is real and measurable (S118: the first post-resume update
+#: is ±lr for every parameter at once, 4.7x-25.5x the warm optimizer's, and the second moment
+#: takes ~1700-2000 steps to recover) — and because it should now be RARE: `LATEST_DIR` exists so
+#: that a normal run never lands here.
+CODE_OPTIMIZER_NOT_RESTORED = "TRAINING_RESUME_OPTIMIZER_MISSING"
 
 
 class RestoreReport:
@@ -186,6 +225,10 @@ def read_dataset_fingerprint(exp_dir):
     in. That is why it has to be copied into the checkpoint's sidecar: comparing the file against
     itself would always match.
     """
+    if not exp_dir:
+        # The upstream loss-trajectory gate drives the diffusion solver with no workspace at all;
+        # "we do not know" has to be an answer, not a TypeError inside a resume header.
+        return None
     p = os.path.join(exp_dir, "dataset.fingerprint")
     try:
         with open(p, encoding="utf-8") as f:
@@ -225,12 +268,46 @@ def capture(scaler=None, *, epoch, global_step, exp_dir=None, dataset_items=None
     return blob
 
 
+def snapshot_dir(exp_dir, sub_dir=BEST_DIR):
+    return os.path.join(exp_dir, sub_dir)
+
+
 def best_dir(exp_dir):
-    return os.path.join(exp_dir, BEST_DIR)
+    return snapshot_dir(exp_dir, BEST_DIR)
+
+
+def save_snapshot(exp_dir, sub_dir, write_payload, *, blob, metric=None):
+    """Write a resumable snapshot into ``<exp_dir>/<sub_dir>/``, marker LAST. Returns the dir.
+
+    ``write_payload(dir)`` writes the checkpoint file(s) and returns the list of names it wrote.
+    Those names go INTO the marker, so :func:`read_snapshot` verifies exactly what the writer
+    produced instead of consulting a second hard-coded list that can drift from it — the two
+    shapes in this repo (a GAN's G+D pair, shallow diffusion's single file) already differ.
+
+    ⛔ ORDER: payload first, ``state.json`` LAST, and the old marker is removed BEFORE the
+    payload is touched. The marker's presence is what says the files beside it are complete, so a
+    kill anywhere in between must read as "there is no snapshot", never as a half-written one.
+    """
+    d = snapshot_dir(exp_dir, sub_dir)
+    os.makedirs(d, exist_ok=True)
+    state_path = os.path.join(d, BEST_STATE)
+    # Remove the marker FIRST: while the payload is being rewritten the old marker would describe
+    # files that no longer exist.
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+    names = list(write_payload(d))
+    out = dict(blob)
+    out["files"] = names
+    if metric is not None:
+        out["best_metric"] = float(metric)
+    write(state_path, out)
+    return d
 
 
 def save_best_pair(exp_dir, save_checkpoint, nets, optims, learning_rate, *, epoch, metric, blob):
-    """Write the resumable snapshot OF THE BEST POINT. Returns the directory, or None if refused.
+    """Write the resumable snapshot OF THE BEST POINT (the GAN shape: a G+D pair).
 
     `save_checkpoint` is the trainer's own vendored function, passed in rather than imported: the
     three copies differ (argument order, sovits' `clean_checkpoints` tail) and this module must
@@ -242,28 +319,32 @@ def save_best_pair(exp_dir, save_checkpoint, nets, optims, learning_rate, *, epo
     AND zero the AdamW momentum". So when a run degrades past its best, the user's only resume
     point is the LATEST one — which is the degraded state. The best was a dead end.
 
-    ⛔ ORDER: G, then D, then `state.json` LAST. `state.json`'s presence is the completion marker;
-    a kill anywhere earlier leaves a directory that `read_best` reports as absent rather than as
-    a half-written pair.
-
     ⛔ NOT in `model_dir`, and the reason is five separate consumers — see BEST_DIR.
     """
-    d = best_dir(exp_dir)
-    os.makedirs(d, exist_ok=True)
-    state_path = os.path.join(d, BEST_STATE)
-    # Remove the marker FIRST: while the pair is being rewritten the old marker would describe a
-    # pair that no longer exists.
-    try:
-        os.remove(state_path)
-    except OSError:
-        pass
     (net_g, net_d), (optim_g, optim_d) = nets, optims
-    save_checkpoint(net_g, optim_g, learning_rate, epoch, os.path.join(d, BEST_G))
-    save_checkpoint(net_d, optim_d, learning_rate, epoch, os.path.join(d, BEST_D))
-    out = dict(blob)
-    out["best_metric"] = float(metric)
-    write(state_path, out)
-    return d
+
+    def payload(d):
+        save_checkpoint(net_g, optim_g, learning_rate, epoch, os.path.join(d, BEST_G))
+        save_checkpoint(net_d, optim_d, learning_rate, epoch, os.path.join(d, BEST_D))
+        return [BEST_G, BEST_D]
+
+    return save_snapshot(exp_dir, BEST_DIR, payload, blob=blob, metric=metric)
+
+
+def save_solo_snapshot(exp_dir, sub_dir, save_one, *, blob, metric=None):
+    """The single-model shape (shallow diffusion): ``save_one(path)`` writes ONE checkpoint file.
+
+    Self-contained on purpose. Storing only the optimizer here and reusing the weights already
+    sitting in ``model_<step>.pt`` / ``model_best.pt`` would save ~211 MB, but it would invent a
+    cross-file invariant nothing else in this repo has — and the archive cleanup CAN delete a
+    numbered checkpoint, which would leave the moments behind as an unusable orphan.
+    """
+
+    def payload(d):
+        save_one(os.path.join(d, BEST_MODEL))
+        return [BEST_MODEL]
+
+    return save_snapshot(exp_dir, sub_dir, payload, blob=blob, metric=metric)
 
 
 #: `cfg["resume_from"]` — which archive a 续训 continues from. Default is the historical behaviour.
@@ -292,15 +373,26 @@ def choose_pair(exp_dir, prefer, latest):
     return latest("G_*.pth"), latest("D_*.pth"), None, PREFER_LATEST
 
 
-def read_best(exp_dir):
-    """The best snapshot's state, or None when there is not a complete one."""
-    d = best_dir(exp_dir)
+def read_snapshot(exp_dir, sub_dir=BEST_DIR):
+    """A snapshot's state, or None when there is not a COMPLETE one in ``<exp_dir>/<sub_dir>/``.
+
+    The payload names come out of the marker itself (``files``), so this cannot disagree with
+    whatever :func:`save_snapshot` actually wrote. A marker from before S118 lists none, and for
+    those the payload was always the GAN pair — hence the fallback.
+    """
+    d = snapshot_dir(exp_dir, sub_dir)
     blob = read(os.path.join(d, BEST_STATE))
     if blob is None:
         return None
-    if not (os.path.isfile(os.path.join(d, BEST_G)) and os.path.isfile(os.path.join(d, BEST_D))):
+    names = blob.get("files") or (BEST_G, BEST_D)
+    if not all(os.path.isfile(os.path.join(d, n)) for n in names):
         return None
     return blob
+
+
+def read_best(exp_dir):
+    """The best snapshot's state, or None when there is not a complete one."""
+    return read_snapshot(exp_dir, BEST_DIR)
 
 
 def write(path, blob):

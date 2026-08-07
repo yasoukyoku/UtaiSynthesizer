@@ -274,6 +274,13 @@ export interface WorkspaceInfo {
    * complete snapshot would be a button that silently continues from the latest instead.
    */
   best_resume_step: number | null;
+  /**
+   * ★S118 §F8⒜: step of the SHALLOW-DIFFUSION best snapshot (`diffusion/resume_best/`), or null.
+   * ⛔ A separate field, and the diffusion dialog must use THIS one: a `sovits_diff` probe
+   * resolves to the sovits slot, so `best_resume_step` above is the MAIN GAN model's snapshot.
+   * Labelling a diffusion button with it would print the wrong model's step.
+   */
+  diff_best_resume_step: number | null;
   /** manifest 数据增强份数 (S41) — what a diff run will inherit */
   aug_copies: number;
   /** a reusable shared slice pool exists — diff may start without importing */

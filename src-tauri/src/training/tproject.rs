@@ -681,6 +681,37 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
             }
         }
 
+        // ── ★S118 §F8⒜: the diffusion resume snapshots ────────────────────────────────
+        // `diffusion/resume_best/{model.pt,state.json}` and `diffusion/resume_latest/…`. Same
+        // reason the GAN block above has to be explicit: the loop below only accepts names of the
+        // form `model_<digits>.pt` / `model_best.pt`, so a DIRECTORY entry falls straight through
+        // its `continue` and 600 MB apiece would never appear in the archive list.
+        // ⚠ Their bytes DO already reach the user through the recursive `storage::dir_size`
+        // totals, so this is about the ARCHIVE view: seeing that the resume point exists, what
+        // step it is at, and being able to reason about it at all.
+        //
+        // Reported as `Resumable` for the same reason as the GAN pair: `Best` means the
+        // inference-only export (here `diffusion/model_best.pt`, which is written with
+        // `optimizer=None`), and the snapshot is the opposite of that — it is the ONLY diffusion
+        // artifact that always carries the optimizer.
+        {
+            let dd = slot.join("diffusion");
+            for sub in ["resume_best", "resume_latest"] {
+                let sd = dd.join(sub);
+                let (m, st) = (sd.join("model.pt"), sd.join("state.json"));
+                // `state.json` is the completion marker python writes LAST — without it the
+                // payload beside it may be half-written, and offering that as a resume point is
+                // worse than not offering it.
+                if st.is_file() && m.is_file() {
+                    let step = std::fs::read_to_string(&st)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v["global_step"].as_u64());
+                    push(m, Some(st), CkptKind::Resumable, step);
+                }
+            }
+        }
+
         // ── diffusion progress (lives inside the sovits slot) ─────────────────────────
         if let Ok(rd) = std::fs::read_dir(slot.join("diffusion")) {
             for e in rd.flatten() {

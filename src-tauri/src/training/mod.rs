@@ -605,6 +605,13 @@ pub struct WorkspaceInfo {
     /// Drives the「从最佳存档继续」option in the resume dialog: offering it when the directory
     /// is absent or half-written would be a button that silently does something else.
     pub best_resume_step: Option<u64>,
+    /// ★S118 §F8⒜ — the SHALLOW-DIFFUSION best snapshot's step (`<slot>/diffusion/resume_best/`).
+    /// ⛔ A SEPARATE field on purpose: `backend_family("sovits_diff") == "sovits"`, so a diffusion
+    /// probe gets the sovits slot and `best_resume_step` above therefore describes the MAIN GAN
+    /// model's G+D snapshot. Driving a diffusion「从最佳存档继续」button off that field would
+    /// print the main model's step for a diffusion run — a lie in the label AND in the effect.
+    /// ⚠ Serde: `WorkspaceInfo` has NO `rename_all`, so the TS mirror is snake_case.
+    pub diff_best_resume_step: Option<u64>,
     /// manifest aug_copies (S41 数据增强份数) — diff runs inherit it from the
     /// main training; surfaced so the diff params page shows the real value
     pub aug_copies: u64,
@@ -649,7 +656,11 @@ pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
 pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
     has_main_progress(ws)
         || max_vocoder_ckpt_step(ws).is_some()
-        || max_diffusion_step(ws).unwrap_or(0) > 0
+        // ★S118 §F8⒜ — the SNAPSHOTS count as diffusion work too, and they can outlive the
+        // numbered grid (the archive cleanup and a user freeing disk space both delete the big
+        // numbered files first). Asking only `max_diffusion_step` here would let a slot whose
+        // only resume point is a snapshot be wiped with no dialog at all.
+        || diffusion_progress_step(ws).unwrap_or(0) > 0
         // Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR
         // part of a training run, and a slot that has it but no checkpoint yet is the normal
         // state of「刚开始练」. `dataset.fingerprint` is the one artifact every family writes
@@ -700,8 +711,9 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         version: field("version"),
         sample_rate: field("sample_rate"),
         has_main_progress: has_main_progress(&ws),
-        diff_steps: max_diffusion_step(&ws).unwrap_or(0),
+        diff_steps: diffusion_progress_step(&ws).unwrap_or(0),
         best_resume_step: best_resume_step(&ws),
+        diff_best_resume_step: diff_snapshot_step(&ws, "resume_best"),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
@@ -796,20 +808,62 @@ pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<d
         .collect()
 }
 
-/// ★S117 §F2⒜ — the step of the COMPLETE resumable best snapshot, or None.
+/// ★S117 §F2⒜ / S118 §F8⒜ — the step of a COMPLETE resume snapshot under `<dir>/<sub>/`, or None.
 ///
-/// The three files are written G → D → `state.json`, so `state.json` is the completion marker;
-/// requiring all three means a kill mid-write reads as "there is no best snapshot" instead of
-/// offering a half-written pair as a resume point. Mirrors `utai_train/resume_state.read_best`.
-/// ⚠ Keep the two in step — python owns the layout, this only reads it.
-fn best_resume_step(workspace: &Path) -> Option<u64> {
-    let d = workspace.join("resume_best");
-    if !d.join("G.pth").is_file() || !d.join("D.pth").is_file() {
-        return None;
-    }
+/// Python owns the layout (`utai_train/resume_state.save_snapshot`): the payload file(s) first,
+/// `state.json` LAST, and the marker itself records WHICH files the payload was (`files`).
+/// Requiring the marker AND every file it names means a kill mid-write reads as "there is no
+/// snapshot" instead of offering a half-written one as a resume point.
+/// ⚠ Keep the two in step — python owns the layout, this only reads it. `fallback` covers markers
+/// written before `files` existed, where the payload was always the GAN pair.
+fn snapshot_step(dir: &Path, sub: &str, fallback: &[&str]) -> Option<u64> {
+    let d = dir.join(sub);
     let raw = std::fs::read_to_string(d.join("state.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let listed: Vec<String> = v["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let files: Vec<String> = if listed.is_empty() {
+        fallback.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        listed
+    };
+    if files.is_empty() || !files.iter().all(|f| d.join(f).is_file()) {
+        return None;
+    }
     v["global_step"].as_u64()
+}
+
+/// The GAN trainers' resumable best snapshot: `<slot>/resume_best/{G.pth,D.pth,state.json}`.
+fn best_resume_step(workspace: &Path) -> Option<u64> {
+    snapshot_step(workspace, "resume_best", &["G.pth", "D.pth"])
+}
+
+/// The shallow-diffusion snapshots, which live one level down in `<slot>/diffusion/` and hold ONE
+/// payload file each (that trainer's checkpoint is one file, not a G+D pair).
+fn diff_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
+    snapshot_step(&workspace.join("diffusion"), sub, &["model.pt"])
+}
+
+/// How far shallow diffusion has ACTUALLY progressed in this slot: the numbered grid, or either
+/// resume snapshot, whichever is further.
+///
+/// ★S118 §F8⒜ — `max_diffusion_step` alone answers "the highest numbered file", and that stopped
+/// being the same question. `resume_latest/` is the only artifact that always carries the
+/// optimizer (upstream's `save_opt: false` makes the numbered grid optimizer-less), and the
+/// archive cleanup can leave a slot whose progress lives ONLY in the snapshots. Every consumer
+/// that asks "is there diffusion work here / how far is it" must use this one, or a wipe-consent
+/// dialog goes missing and a resume lock silently stops locking.
+fn diffusion_progress_step(workspace: &Path) -> Option<u64> {
+    [
+        max_diffusion_step(workspace),
+        diff_snapshot_step(workspace, "resume_latest"),
+        diff_snapshot_step(workspace, "resume_best"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 fn has_main_progress(workspace: &Path) -> bool {
@@ -1557,7 +1611,11 @@ impl TrainingManager {
             &resume_lock::ResumeState {
                 manifest: old_manifest.as_ref(),
                 has_main,
-                max_diffusion_step: max_diffusion_step(&workspace),
+                // ★S118 §F8⒜ — the k_step_max lock hangs off this being >0. It must therefore see
+                // the SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a
+                // resume point, and letting k_step_max change under it would silently retrain a
+                // different diffusion distribution into the same model.
+                max_diffusion_step: diffusion_progress_step(&workspace),
                 frozen_speakers: &frozen_speakers(&data_dir, &project.id, &family),
             },
             !req.fresh || diff_partial_wipe,
@@ -1612,7 +1670,19 @@ impl TrainingManager {
         // would "complete" instantly without training a step (S37 的续训 config
         // 校验同族坑) — refuse loudly so the user fixes 总步数 first
         if req.backend == "sovits_diff" && !req.fresh {
-            if let Some(max_step) = max_diffusion_step(&workspace) {
+            // ★S118 §F8⒜ — against the step this run will actually START from, NOT the highest
+            // file on disk. 「从最佳存档继续」 rewinds BELOW the newest checkpoint on purpose, so
+            // comparing the newest one would refuse a resume that still has thousands of steps to
+            // train. ⚠ python's `diff_pipeline.load_start_state` is the authority on the choice;
+            // this mirrors it only so the refusal lands before the user waits for a run that would
+            // do nothing (python raises its own 「没有执行任何训练步」 if this ever guesses wrong).
+            let start_step = if req.resume_from.trim() == "best" {
+                diff_snapshot_step(&workspace, "resume_best")
+                    .or_else(|| diffusion_progress_step(&workspace))
+            } else {
+                diffusion_progress_step(&workspace)
+            };
+            if let Some(max_step) = start_step {
                 if max_step > 0 && max_step >= req.total_steps as u64 {
                     return Err(UtaiError::Training(format!(
                         "RESUME_TARGET_REACHED_DIFF: {} >= {}",
@@ -2968,6 +3038,204 @@ mod tests {
             DIAG_RS.contains(&format!("name: \"{env}\"")),
             "training/diagnostics.rs never sets {env}, so nothing in diag.py can ever turn on"
         );
+    }
+
+    /// ★S118 §F8⒜ — the shallow-diffusion half of the resume-snapshot contract.
+    ///
+    /// Behaviour is `converter/verify/training/gate_resume_state.py` (groups D1-D17). What rots
+    /// silently is the WIRING, and this one crosses four languages with a twist the GAN side does
+    /// not have: **Rust joins the directory and file names itself**, so python's constants and
+    /// Rust's literals are a contract with no compiler behind it. A rename on either side would
+    /// leave a 600 MB resume point that the archive list cannot see and the resume dialog cannot
+    /// offer — silently, because every individual test would still pass.
+    #[test]
+    fn s118_diffusion_resume_snapshots_are_wired_across_python_rust_and_all_three_locales() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static DIFF_PIPELINE_PY: &str =
+            include_str!("../../../training/utai_train/sovits/diff_pipeline.py");
+        static SOLVER_PY: &str =
+            include_str!("../../../training/utai_train/sovits/diffusion/solver.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+        static TPROJECT_RS: &str = include_str!("tproject.rs");
+        static THIS_RS: &str = include_str!("mod.rs");
+
+        // ── the names, parsed out of python and never retyped ────────────────────────────
+        let py_str = |name: &str| -> String {
+            RESUME_STATE_PY
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name} = ")))
+                .map(|v| v.trim().trim_matches('"').to_string())
+                .unwrap_or_else(|| {
+                    panic!("resume_state.py must keep `{name} = \"...\"` as a plain top-level literal")
+                })
+        };
+        let (best_dir, latest_dir) = (py_str("BEST_DIR"), py_str("LATEST_DIR"));
+        let (best_model, best_state) = (py_str("BEST_MODEL"), py_str("BEST_STATE"));
+        let min_len: usize = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("SNAPSHOT_DIR_MIN_LEN = "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("resume_state.py must keep SNAPSHOT_DIR_MIN_LEN as a plain int literal");
+
+        // ⛔ NOT cosmetic. `logger/utils.load_model` scans RECURSIVELY and slices each path at
+        // `len(expdir + "/model_")` before asking isdigit(); a name shorter than this lets the
+        // path separator fall into the discarded prefix and exposes the FILENAME's tail, after
+        // which the scan rebuilds a flat `model_<that number>.pt` that does not exist and the
+        // resume dies inside torch.load. Measured — `logs/` (4 chars, created by Saver) does it.
+        for d in [&best_dir, &latest_dir] {
+            assert!(
+                d.chars().count() >= min_len,
+                "snapshot directory {d:?} is shorter than SNAPSHOT_DIR_MIN_LEN={min_len} — it \
+                 would hijack the diffusion resume scan"
+            );
+        }
+        // Rust joins these names by hand in two files; a python rename must break a test here
+        // rather than the user's resume.
+        for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
+            for name in [&best_dir, &latest_dir, &best_model, &best_state] {
+                assert!(
+                    src.contains(&format!("\"{name}\"")),
+                    "{file} no longer mentions {name:?} — python and Rust have drifted apart \
+                     about where the resume snapshots live"
+                );
+            }
+        }
+
+        // ── the payload is written BEFORE the marker ─────────────────────────────────────
+        let payload = RESUME_STATE_PY
+            .find("names = list(write_payload(d))")
+            .expect("resume_state.save_snapshot lost its payload call");
+        let marker = RESUME_STATE_PY
+            .find("write(state_path, out)")
+            .expect("resume_state.save_snapshot lost its marker write");
+        assert!(
+            payload < marker,
+            "save_snapshot writes the completion marker BEFORE the payload it describes — a kill \
+             in between would then offer a half-written checkpoint as a resume point"
+        );
+
+        // ── the diffusion trainer actually uses all of it ────────────────────────────────
+        for needle in [
+            "def load_start_state(",            // module level ⇒ a test can drive it (S117)
+            "cfg.get(\"resume_from\")",         // 「从最佳存档继续」 reaches python at all
+            "resume_state.read_snapshot(",      // …and is answered from the snapshot
+            "resumed=start.blob",               // the scale/RNG/dataset identity travels on
+            "superseded_step=(start.step if",   // the sweep is told whether this is a REWIND
+            "CODE_OPTIMIZER_NOT_RESTORED",      // an optimizer-less resume is not silent
+        ] {
+            assert!(
+                DIFF_PIPELINE_PY.contains(needle),
+                "sovits/diff_pipeline.py no longer contains {needle:?} — §F8a's wiring is broken"
+            );
+        }
+        for needle in [
+            "resume_state.restore(",
+            "resume_state.report_drift(",
+            "resume_state.save_solo_snapshot(",
+            "numerics.best_save_is_safe(",
+            "numerics.optimizer_state_is_safe(",
+            "diag.log_interval(args.train.interval_log)",
+        ] {
+            assert!(
+                SOLVER_PY.contains(needle),
+                "diffusion/solver.py no longer contains {needle:?} — §F8a's wiring is broken"
+            );
+        }
+        // The rolling resume point must be refreshed at every save that IS a resume point:
+        // validation, graceful stop, completion. Two of three is the shape where a killed run
+        // silently loses the optimizer again.
+        assert_eq!(
+            SOLVER_PY.matches("refresh_resume_point(epoch)").count()
+                - SOLVER_PY.matches("def refresh_resume_point(epoch)").count(),
+            3,
+            "diffusion/solver.py must refresh the rolling resume point at all three save points"
+        );
+
+        // ── the new CODE, across four languages ─────────────────────────────────────────
+        let code = py_str("CODE_OPTIMIZER_NOT_RESTORED");
+        assert!(
+            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+            "the CODE crosses a process boundary and lands in json keys: {code:?}"
+        );
+        assert!(
+            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+        );
+        // ⚠ NOT modal: the run is still training, and this is a cost report, not a failure.
+        assert!(
+            !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
+            "{code} is a warning — a modal would cover a run that is still training"
+        );
+        for (lang, raw) in [
+            ("zh", include_str!("../../../src/i18n/zh.json")),
+            ("en", include_str!("../../../src/i18n/en.json")),
+            ("ja", include_str!("../../../src/i18n/ja.json")),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v
+                .pointer(&format!("/backend/{code}"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+            assert!(
+                msg.chars().count() >= 30,
+                "backend.{code} in {lang}.json is {} chars — too short to be the real message",
+                msg.chars().count()
+            );
+        }
+    }
+
+    /// ★S118 §F8⒜ — the diffusion best snapshot needs its OWN reader, and every file it names.
+    #[test]
+    fn s118_the_diffusion_best_resume_option_needs_a_complete_snapshot() {
+        let root = std::env::temp_dir().join(format!("utai_s118_diff_{}", std::process::id()));
+        let d = root.join("diffusion").join("resume_best");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), None, "empty directory");
+
+        std::fs::write(d.join("model.pt"), b"m").unwrap();
+        assert_eq!(
+            diff_snapshot_step(&root, "resume_best"),
+            None,
+            "the payload without the completion marker may be half-written"
+        );
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt"]}"#,
+        )
+        .unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), Some(1400));
+
+        // ★The marker lists WHAT the payload was; a marker naming a file that is not there is not
+        // a snapshot, however well-formed it looks.
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt","nope.pt"]}"#,
+        )
+        .unwrap();
+        assert_eq!(diff_snapshot_step(&root, "resume_best"), None);
+
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":1400,"files":["model.pt"]}"#,
+        )
+        .unwrap();
+        // ⛔ It must not be confused with the GAN pair's reader: that snapshot lives in the SLOT
+        // root and holds G.pth + D.pth, so a diffusion one must not satisfy it.
+        assert_eq!(
+            best_resume_step(&root),
+            None,
+            "the GAN reader must not accept a diffusion snapshot as its own"
+        );
+        // …and the progress reader HAS to count it, or the wipe-consent dialog goes missing for a
+        // slot whose only resume point is the snapshot.
+        assert_eq!(diffusion_progress_step(&root), Some(1400));
+        assert!(
+            workspace_holds_work(&root),
+            "a slot holding only a diffusion snapshot still holds work"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

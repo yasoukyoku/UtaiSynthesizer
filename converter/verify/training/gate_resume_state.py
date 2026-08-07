@@ -313,6 +313,225 @@ check("★★R31 ……但动量已经是 inf,而 best_save_is_safe 看不见它
       not numerics.optimizer_state_is_safe((("G", ho),)))
 
 print()
+print("=== ★D1-D14: 浅扩散(§F8⒜ —— 把上面这一套推广过去)===")
+# ⛔ 全部驱动生产函数:真的 Saver 写存档、真的 load_start_state 选存档、真的 latest_numbered_path
+# 扫目录。夹具只负责造一个小模型 —— 用 torch.save 自己拼 checkpoint 就等于在测我自己的布局。
+from utai_train.sovits import diff_pipeline as DP  # noqa: E402
+from utai_train.sovits.diffusion.logger import utils as DU  # noqa: E402
+from utai_train.sovits.diffusion.logger.saver import Saver  # noqa: E402
+
+
+class TinyDiff(nn.Module):
+    def __init__(self, fill):
+        super().__init__()
+        self.w = nn.Parameter(torch.full((4,), float(fill)))
+
+
+def make_saver(expdir, step):
+    os.makedirs(expdir, exist_ok=True)
+    args = DU.DotDict({"env": {"expdir": expdir}, "data": {"sampling_rate": 44100}})
+    sv = Saver(args, initial_global_step=step)
+    return sv
+
+
+def warm(net):
+    """真的让 AdamW 建出动量 —— 空 optimizer 与热 optimizer 的区别正是这一刀的标的。"""
+    o = torch.optim.AdamW(net.parameters(), 1e-4)
+    sum(p.pow(2).sum() for p in net.parameters()).backward()
+    o.step()
+    o.zero_grad(set_to_none=False)
+    return o
+
+
+def fresh_pair(fill):
+    """⚠ 返回值第三项是【热身之后】的真实读数,不是 `fill`。
+
+    第一版拿 fill 当期望值,五条断言全红 —— 因为 warm() 真的走了一步 AdamW,盘上的权重
+    是 2.9999… 而不是 3.0。那正是「我编的期望 + 生产写下的真值 = 假断言」(S114),
+    正解是把期望从夹具的实际状态里取出来,不是从我脑子里取。
+    """
+    n = TinyDiff(fill)
+    o = warm(n)
+    return n, o, float(n.w[0])
+
+
+def start(expdir, prefer=None):
+    n = TinyDiff(-1.0)
+    o = torch.optim.AdamW(n.parameters(), 1e-4)
+    return DP.load_start_state(expdir, n, o, device="cpu", prefer=prefer), n, o
+
+
+dexp = os.path.join(tempfile.mkdtemp(prefix="s118_diff_"), "diffusion")
+sv = make_saver(dexp, 0)
+net_p, opt_p, W_P = fresh_pair(3.0)      # 周期存档的内容
+sv.global_step = 2000
+sv.save_model(net_p, None, postfix="2000")           # 周期存档:上游 save_opt=false ⇒ 无 optimizer
+net_b, opt_b, W_B = fresh_pair(7.0)      # best 的内容
+sv.global_step = 1400
+RS.save_solo_snapshot(dexp, RS.BEST_DIR, lambda p: sv.save_model_to(p, net_b, opt_b),
+                      blob=RS.capture(None, epoch=0, global_step=1400, exp_dir=tmp,
+                                      dataset_items=12, loader_len=3),
+                      metric=0.25)
+bdir = RS.snapshot_dir(dexp, RS.BEST_DIR)
+check("D1 best 快照:一个 model.pt + 一个 state.json",
+      os.path.isfile(os.path.join(bdir, RS.BEST_MODEL)) and os.path.isfile(os.path.join(bdir, RS.BEST_STATE)))
+check("★D2 state.json 自己写下了 payload 清单(读的一侧不许再有第二份硬编清单)",
+      RS.read_snapshot(dexp, RS.BEST_DIR)["files"] == [RS.BEST_MODEL],
+      str(RS.read_snapshot(dexp, RS.BEST_DIR).get("files")))
+os.remove(os.path.join(bdir, RS.BEST_STATE))
+check("★D3 少了完成标记就当【没有】 —— 而 model.pt 还在盘上",
+      RS.read_snapshot(dexp, RS.BEST_DIR) is None and os.path.isfile(os.path.join(bdir, RS.BEST_MODEL)))
+RS.save_solo_snapshot(dexp, RS.BEST_DIR, lambda p: sv.save_model_to(p, net_b, opt_b),
+                      blob=RS.capture(None, epoch=0, global_step=1400, exp_dir=tmp), metric=0.25)
+
+# ★ 上游那把「最大编号」的尺子不许被子目录动到 —— 它是递归扫的(os.walk)
+p_no_snap, s_no_snap = DU.latest_numbered_path(dexp)
+check("★D4 快照子目录【不改变】上游扫描的答案(它是递归的,这条不是显然的)",
+      s_no_snap == 2000 and os.path.basename(p_no_snap) == "model_2000.pt",
+      "%s step=%s" % (os.path.basename(str(p_no_snap)), s_no_snap))
+# 阳性对照:目录名短到 5 字符以下时,分隔符被吃掉、文件名尾巴暴露给 isdigit() ⇒ 真的会劫持
+short = os.path.join(tempfile.mkdtemp(prefix="s118_short_"), "diffusion")
+sv2 = make_saver(short, 500)
+sv2.save_model(net_p, None, postfix="500")
+os.makedirs(os.path.join(short, "logs"), exist_ok=True)
+sv2.save_model_to(os.path.join(short, "logs", "x9999.pt"), net_p, None)
+p_hj, s_hj = DU.latest_numbered_path(short)
+check("★D4b 阳性对照:4 字符的子目录名(logs/,而 Saver 真的会建它)确实劫持了扫描",
+      s_hj == 9999 and not os.path.isfile(p_hj),
+      "step=%s 指向不存在的 %s" % (s_hj, os.path.basename(str(p_hj))))
+check("★D4c ⇒ 所以两个快照目录名的长度是【判据】,不是排版",
+      len(RS.BEST_DIR) >= RS.SNAPSHOT_DIR_MIN_LEN and len(RS.LATEST_DIR) >= RS.SNAPSHOT_DIR_MIN_LEN
+      and RS.SNAPSHOT_DIR_MIN_LEN == 6,
+      "best=%d latest=%d min=%d" % (len(RS.BEST_DIR), len(RS.LATEST_DIR), RS.SNAPSHOT_DIR_MIN_LEN))
+
+print()
+print("--- 谁被选中 ---")
+st, n1, o1 = start(dexp)                      # 默认 latest:此时还没有滚动快照
+check("★D5 默认 = 上游那一格(编号 2000),而且如实说它【没带 optimizer】",
+      st.source == DP.SRC_NUMBERED and st.step == 2000 and st.had_optimizer is False
+      and not o1.state and float(n1.w[0]) == W_P,
+      "source=%s step=%s had_opt=%s 动量=%s" % (st.source, st.step, st.had_optimizer, bool(o1.state)))
+st, n2, o2 = start(dexp, RS.PREFER_BEST)
+check("★★D6 要 best 就给 best:权重来自 best(fill=7)、步号来自它自己的 1400、动量真的回来了",
+      st.source == DP.SRC_BEST and st.step == 1400 and st.had_optimizer is True
+      and float(n2.w[0]) == W_B and bool(o2.state),
+      "source=%s step=%s w=%.3f 动量=%s" % (st.source, st.step, float(n2.w[0]), bool(o2.state)))
+check("★D6b 而且把 best 的 state.json 交回给了调用方(scaler/RNG/数据集身份要靠它)",
+      st.blob is not None and st.blob.get("best_metric") == 0.25)
+
+# 滚动的完整续训点(生产里由 solver.refresh_resume_point 在每次验证/停止/完成时刷新)
+net_l, opt_l, W_L = fresh_pair(9.0)
+sv.global_step = 2000
+RS.save_solo_snapshot(dexp, RS.LATEST_DIR, lambda p: sv.save_model_to(p, net_l, opt_l),
+                      blob=RS.capture(None, epoch=0, global_step=2000, exp_dir=tmp))
+st, n3, o3 = start(dexp)
+check("★★D7 同一步上【完整的那一份赢】:2000 == 2000 ⇒ 取滚动快照,动量不再是空的",
+      st.source == DP.SRC_SNAPSHOT and st.step == 2000 and st.had_optimizer is True
+      and float(n3.w[0]) == W_L and bool(o3.state),
+      "source=%s step=%s w=%.3f" % (st.source, st.step, float(n3.w[0])))
+sv.global_step = 4000
+sv.save_model(net_p, None, postfix="4000")     # 编号跑到快照前面去了
+st, _, _ = start(dexp)
+check("★D8 编号超过快照时不许倒退:4000 > 2000 ⇒ 回到编号那一格",
+      st.source == DP.SRC_NUMBERED and st.step == 4000, "source=%s step=%s" % (st.source, st.step))
+
+print()
+print("--- 退化路径 / 全新训练 ---")
+nobest = os.path.join(tempfile.mkdtemp(prefix="s118_nobest_"), "diffusion")
+svn = make_saver(nobest, 600)
+svn.save_model(net_p, opt_p, postfix="600")
+st, _, o4 = start(nobest, RS.PREFER_BEST)
+check("★D9 要 best 但没有完整的 ⇒ 退回去,并把 source 如实报成别的(调用方据此发警告)",
+      st.source != DP.SRC_BEST and st.step == 600 and st.had_optimizer is True and bool(o4.state),
+      "source=%s" % st.source)
+empty_exp = os.path.join(tempfile.mkdtemp(prefix="s118_fresh_"), "diffusion")
+os.makedirs(empty_exp)
+st, n5, o5 = start(empty_exp)
+check("★★D10 全新训练:什么都不恢复、step 0、blob 为 None ⇒ 一个字节都不受影响",
+      st.source == DP.SRC_FRESH and st.step == 0 and st.blob is None and not o5.state
+      and abs(float(n5.w[0]) + 1.0) < 1e-6)
+# 编号扫描指到一个不存在的文件(非规范名/被劫持)——今天会死在 torch.load 里
+broken = os.path.join(tempfile.mkdtemp(prefix="s118_broken_"), "diffusion")
+svb = make_saver(broken, 100)
+svb.save_model_to(os.path.join(broken, "model_0100.pt"), net_p, None)   # int('0100') -> 100
+net_r, opt_r, W_R = fresh_pair(5.0)
+svb.global_step = 100
+RS.save_solo_snapshot(broken, RS.LATEST_DIR, lambda p: svb.save_model_to(p, net_r, opt_r),
+                      blob=RS.capture(None, epoch=0, global_step=100, exp_dir=tmp))
+st, n6, _ = start(broken)
+check("★D11 扫描指向一个不存在的文件时,快照能把它救回来(今天是 FileNotFoundError)",
+      st.source == DP.SRC_SNAPSHOT and float(n6.w[0]) == W_R,
+      "source=%s" % st.source)
+
+print()
+print("--- 底模不许在【其实是续训】的时候被重新播种 ---")
+onlysnap = os.path.join(tempfile.mkdtemp(prefix="s118_onlysnap_"), "diffusion")
+svs = make_saver(onlysnap, 4000)
+RS.save_solo_snapshot(onlysnap, RS.LATEST_DIR, lambda p: svs.save_model_to(p, net_l, opt_l),
+                      blob=RS.capture(None, epoch=0, global_step=4000, exp_dir=tmp))
+
+
+class _NoopReporter:
+    def stage(self, *a, **k):
+        pass
+
+
+DP._seed_base_model(onlysnap, "", _NoopReporter())
+check("★D12 只剩快照(编号存档被清理/手删了)时,不许再落一个 model_0.pt 进去",
+      not os.path.isfile(os.path.join(onlysnap, "model_0.pt")))
+
+print()
+print("--- ★清扫器:从 best 回退续训时不许走过别人的分支 ---")
+import re as _re  # noqa: E402
+
+from utai_train.sovits.diffusion import solver as SOLVER  # noqa: E402
+
+
+def sweep_case(files, current, written, superseded, force_save):
+    """驱动【真的】_sweep_old_checkpoints + 真的 Saver.delete_model,返回幸存的步号。"""
+    d = os.path.join(tempfile.mkdtemp(prefix="s118_sweep_"), "diffusion")
+    s = make_saver(d, 0)
+    for st in files:
+        s.global_step = st
+        s.save_model(net_p, None, postfix=str(st))
+    a = DU.DotDict({"train": {"interval_force_save": force_save}})
+    SOLVER._sweep_old_checkpoints(s, a, current, written, superseded_step=superseded)
+    return sorted(int(_re.fullmatch(r"model_(\d+)\.pt", n).group(1))
+                  for n in os.listdir(d) if _re.fullmatch(r"model_(\d+)\.pt", n))
+
+
+# 正常续训(从编号那一格接着练):行为与今天一致 —— 被接续的那一格 + 本轮自己的非里程碑存档死掉,
+# 更早的运行留下的东西一个都不许动。
+norm = sweep_case([0, 1000, 2000, 3000, 4000], current=5000,
+                  written={4000}, superseded=3000, force_save=5000)
+check("★D15 正常续训:被接续的那格与本轮的非里程碑死掉,更早运行的留着(= 今天的行为)",
+      norm == [0, 1000, 2000], str(norm))
+
+# ★回退续训(从 best 快照):被放弃分支在【上方】,而它的尾巴是唯一带 optimizer 的那个文件。
+rew = sweep_case([0, 700, 1400, 2100, 3500, 5000], current=5600,
+                 written={2100}, superseded=None, force_save=1400)
+check("★★D16 从 best 回退:被放弃分支的 3500 / 5000 必须活着(旧的区间写法会把它们逐个删掉)",
+      3500 in rew and 5000 in rew and 2100 not in rew, str(rew))
+# 阳性对照:同一批文件、同一个当前步,只把「谁写的」改成「本轮写的」⇒ 它们真的会被删
+ctl = sweep_case([0, 700, 1400, 2100, 3500, 5000], current=5600,
+                 written={2100, 3500, 5000}, superseded=None, force_save=1400)
+check("★D16b 阳性对照:同一格清扫器【有能力】删掉它们 ⇒ 上面那条是所有权规则挡住的,不是别的豁免",
+      3500 not in ctl and 5000 not in ctl and rew != ctl, "%s vs %s" % (rew, ctl))
+check("★D17 里程碑与 model_0(底模)永不被删",
+      0 in rew and 1400 in rew and 0 in ctl and 1400 in ctl, "%s / %s" % (rew, ctl))
+
+print()
+print("--- 那两个 CODE 的形状 ---")
+check("D13 两个 CODE 都是 SCREAMING_SNAKE 且带 TRAINING_ 前缀(它们要当 json 键用)",
+      all(c.startswith("TRAINING_") and c.replace("_", "").isupper()
+          for c in (RS.CODE_DATASET_CHANGED, RS.CODE_OPTIMIZER_NOT_RESTORED)))
+check("★D14 solver 的三个存档点都刷新了滚动续训点(验证 / 停止 / 完成)",
+      (lambda s: s.count("refresh_resume_point(epoch)") - s.count("def refresh_resume_point(epoch)") == 3)(
+          open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                            "training", "utai_train", "sovits", "diffusion", "solver.py"),
+               encoding="utf-8").read()))
+
+print()
 print(f"gate_resume_state: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

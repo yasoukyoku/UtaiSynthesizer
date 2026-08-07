@@ -39,6 +39,7 @@ Deviations vs upstream (deliberate):
   - amp fp16 is forced off on CPU (torch CPU autocast has no fp16 path; same
     policy as the sovits trainer's CPU fallback)
 """
+import collections
 import json
 import logging
 import os
@@ -48,6 +49,7 @@ import shutil
 
 import yaml
 
+from .. import resume_state
 from ..augment import (
     augment_slices,
     is_aug_name,
@@ -364,6 +366,12 @@ def _seed_base_model(expdir, pretrain_path, reporter):
     for name in os.listdir(expdir):
         if re.fullmatch(r"model_(\d+)\.pt", name):
             return  # resume state present — never reseed
+    # ★S118 §F8⒜ — a snapshot alone is resume state too. Without this a workspace whose numbered
+    # grid was cleaned away (or hand-deleted for disk space) would get a base model dropped back
+    # in and log 「seeded diffusion base model」 during what is actually a resume from step 4000.
+    for sub in (resume_state.LATEST_DIR, resume_state.BEST_DIR):
+        if resume_state.read_snapshot(expdir, sub) is not None:
+            return
     if not pretrain_path:
         logger.warning("no diffusion base model — training from scratch")
         # force past the Reporter throttle — this notice follows the stage's
@@ -384,6 +392,95 @@ def _seed_base_model(expdir, pretrain_path, reporter):
         torch.save({"global_step": 0, "model": ckpt["model"]}, tmp)
     os.replace(tmp, dst)
     logger.info("seeded diffusion base model %s -> model_0.pt", pretrain_path)
+
+
+#: What `load_start_state` decided. A named tuple rather than a bare tuple on purpose: four
+#: same-typed fields in a row is the shape S85 banned after `(i64,i64,i64)` silently swapped.
+DiffStart = collections.namedtuple("DiffStart", "step blob source had_optimizer path")
+
+#: `source` values, in the order the chooser prefers them.
+SRC_BEST = "best"                # resume_best/  — the user asked for the best point
+SRC_SNAPSHOT = "latest_snapshot"  # resume_latest/ — our rolling COMPLETE resume point
+SRC_NUMBERED = "numbered"        # model_<n>.pt   — upstream's grid; may carry no optimizer
+SRC_FRESH = "fresh"              # nothing to restore
+
+
+def load_start_state(expdir, model, optimizer, device="cpu", prefer=None):
+    """WHICH diffusion checkpoint this run starts from, and what state comes with it.
+
+    ★ MODULE-LEVEL on purpose. Inside `_train_diff` no test could drive it without a vocoder, a
+    dataset and a GPU — and "the startup load is unreachable from a test" is exactly how S117's
+    regression (every fresh so-vits run training from random init) shipped and survived two
+    sessions. Returns a :class:`DiffStart`.
+
+    Three sources, and the order matters:
+
+    1. ``prefer="best"`` → ``resume_best/`` when it holds a COMPLETE snapshot. Falling back is
+       LOUD: silently continuing from somewhere else than the button said is the same class of
+       lie this feature exists to remove.
+    2. ``resume_latest/`` when its step is >= the numbered grid's. The tie goes to the snapshot
+       BY DESIGN — at a graceful stop both describe the same step, and only the snapshot has the
+       scale/RNG/dataset identity.
+    3. the numbered grid, i.e. exactly what upstream would have picked.
+
+    ⚠ Two things this function does that upstream's scan does not, both measured
+    (`TESTING/s118_f8a/probe_nested_pt_arithmetic.py`):
+    * it checks that the rebuilt numbered path EXISTS. Upstream synthesises
+      ``model_<maxstep>.pt`` from a number rather than keeping the file it found, so a hijacked
+      or non-canonical name (``model_0100.pt`` -> ``model_100.pt``) produces a path that is not
+      there and dies inside ``torch.load``. With a snapshot present that is now recoverable.
+    * it REPORTS ``had_optimizer``. An optimizer-less resume is not a rounding error: measured,
+      the AdamW state comes back ``{}``, the step counter resets to 1, so bias correction makes
+      the first post-resume update exactly ±lr for EVERY parameter at once (4.7x-25.5x the warm
+      optimizer's step in the same gradient state), and the second moment needs ~1700-2000 steps
+      to come back within 10% of where it was.
+    """
+    prefer = (prefer or resume_state.PREFER_LATEST).strip() or resume_state.PREFER_LATEST
+    from .diffusion.logger import utils as du
+
+    def restore(path, blob, source):
+        step, had_optimizer = du.load_checkpoint_file(path, model, optimizer, device)
+        logger.info("diffusion resume: %s (step %s) via %s", os.path.basename(path), step, source)
+        return DiffStart(int(step), blob, source, had_optimizer, path)
+
+    if prefer == resume_state.PREFER_BEST:
+        blob = resume_state.read_snapshot(expdir, resume_state.BEST_DIR)
+        if blob is not None:
+            return restore(
+                os.path.join(resume_state.snapshot_dir(expdir, resume_state.BEST_DIR),
+                             resume_state.BEST_MODEL),
+                blob, SRC_BEST,
+            )
+        logger.warning(
+            "asked to continue from the BEST diffusion snapshot, but %s holds no complete one — "
+            "continuing from the latest instead",
+            resume_state.snapshot_dir(expdir, resume_state.BEST_DIR),
+        )
+
+    numbered, numbered_step = du.latest_numbered_path(expdir)
+    if numbered is not None and not os.path.isfile(numbered):
+        logger.warning(
+            "the checkpoint scan points at %s, which does not exist — treating the numbered grid "
+            "as empty (a non-canonical or nested .pt name can do this)", numbered,
+        )
+        numbered, numbered_step = None, -1
+
+    snap = resume_state.read_snapshot(expdir, resume_state.LATEST_DIR)
+    if snap is not None:
+        snap_step = int(snap.get("global_step", -1))
+        snap_path = os.path.join(resume_state.snapshot_dir(expdir, resume_state.LATEST_DIR),
+                                 resume_state.BEST_MODEL)
+        if snap_step >= numbered_step:
+            return restore(snap_path, snap, SRC_SNAPSHOT)
+        logger.info(
+            "the rolling resume snapshot is behind the numbered grid (%s < %s) — using the grid",
+            snap_step, numbered_step,
+        )
+
+    if numbered is None:
+        logger.info("no diffusion checkpoint to restore — starting from step 0")
+        return DiffStart(0, None, SRC_FRESH, False, "")
+    return restore(numbered, None, SRC_NUMBERED)
 
 
 def _train_diff(cfg, exp_dir, reporter, stop):
@@ -429,7 +526,23 @@ def _train_diff(cfg, exp_dir, reporter, stop):
 
     # load parameters
     optimizer = torch.optim.AdamW(model.parameters())
-    initial_global_step, model, optimizer = du.load_model(args.env.expdir, model, optimizer, device=args.device)
+    # ★S118 §F8⒜ — WHICH archive, decided in ONE module-level place (see load_start_state).
+    # Upstream's `du.load_model` only knows "the highest number wins", which cannot express
+    # 「从最佳存档继续」 and cannot see that the highest number may be optimizer-less.
+    start = load_start_state(
+        args.env.expdir, model, optimizer, device=args.device,
+        prefer=cfg.get("resume_from"),
+    )
+    initial_global_step = start.step
+    if start.source == SRC_NUMBERED and start.step > 0 and not start.had_optimizer:
+        # ⚠ A WARNING, not a refusal: the moments are gone either way, and refusing would leave
+        # the user with no way to continue at all. It is worth the user's attention because the
+        # first steps after this really are mis-scaled — see resume_state.CODE_OPTIMIZER_NOT_RESTORED.
+        logger.warning(
+            "%s: %s carries no optimizer state (upstream's save_opt=false), so the AdamW moments "
+            "restart from zero", resume_state.CODE_OPTIMIZER_NOT_RESTORED, os.path.basename(start.path),
+        )
+        reporter.warn(resume_state.CODE_OPTIMIZER_NOT_RESTORED)
     for param_group in optimizer.param_groups:
         param_group['initial_lr'] = args.train.lr
         param_group['lr'] = args.train.lr * (args.train.gamma ** max(((initial_global_step-2)//args.train.decay_step),0) )
@@ -461,4 +574,12 @@ def _train_diff(cfg, exp_dir, reporter, stop):
         loader_train, loader_valid,
         reporter=reporter, stop=stop,
         total_steps=int(cfg["total_steps"]), best_state=True,
+        # ★S118 §F8⒜ — `resumed` carries the scale/RNG/dataset identity of whatever archive we
+        # just loaded; `ws_dir` is the WORKSPACE (the expdir's parent), which is where
+        # `dataset.fingerprint` lives — the expdir itself never has one.
+        resumed=start.blob, ws_dir=exp_dir,
+        # ⛔ None on a REWIND (resuming from the BEST snapshot starts BELOW files an earlier run
+        # wrote, and the sweep must not walk over them); otherwise the step we resumed at, whose
+        # numbered file our own first save legitimately supersedes. See _sweep_old_checkpoints.
+        superseded_step=(start.step if start.source in (SRC_NUMBERED, SRC_SNAPSHOT) else None),
     )
