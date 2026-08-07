@@ -131,6 +131,44 @@ def resume_was_intended(model_dir, seeded_base_is_step_zero=False):
     return real("G_*.pth") and real("D_*.pth")
 
 
+#: What a trainer's startup must do with what it finds on disk. THREE outcomes, not two — see
+#: `plan_load`.
+LOAD_RESUME = "resume"
+LOAD_SEEDED_BASE = "seeded_base"
+LOAD_PRETRAIN = "pretrain"
+
+
+def plan_load(model_dir, seeded_base_is_step_zero=False):
+    """The single decision every trainer's startup makes. THREE outcomes, and they live here
+    together because splitting them across call sites lost one of them for a whole release cycle.
+
+    * `LOAD_RESUME` — a real resume point is here: load it STRICTLY (`resume=True`).
+    * `LOAD_SEEDED_BASE` — only the step-0 base pair is here, i.e. this is a FRESH so-vits run.
+      Load it TOLERANTLY (`resume=False`): a base legitimately disagrees with the model about
+      `emb_g.weight` — its speaker count is not the user's — and absorbing exactly that is what
+      the vendored loop's random-fill is for, and why `seeded_base_is_step_zero` exists at all.
+      Unreachable without that flag, which is what says "this trainer's base lives under those
+      names".
+    * `LOAD_PRETRAIN` — nothing resumable here. RVC loads `hps.pretrainG/D` from its own paths;
+      a so-vits workspace whose base was never seeded starts from random init.
+
+    ⛔ THE REGRESSION THIS PREVENTS (S117, and it is why the middle case is not optional). The
+    two so-vits trainers have no separate pretrain branch: upstream's entire pretrain mechanism
+    is "copy the base models in as `G_0.pth`/`D_0.pth` and let `latest_checkpoint_path` pick them
+    up" (`sovits/pipeline.py:_seed_base_checkpoints`, whose docstring says exactly that). S116
+    put that single load site behind `resume_was_intended(..., seeded_base_is_step_zero=True)` —
+    a predicate that filters out `*_0.pth` **by design** — so from `c44dec6` until this fix a
+    fresh so-vits or so-vits-v2 run fell to the `else` branch, set `epoch_str = 1`, and trained
+    the whole model from RANDOM INIT with a 180-425 MB base sitting unread on disk. Silent: no
+    exception, no warning, just a far worse model after the same hours.
+    """
+    if resume_was_intended(model_dir, seeded_base_is_step_zero=seeded_base_is_step_zero):
+        return LOAD_RESUME
+    if seeded_base_is_step_zero and resume_was_intended(model_dir):
+        return LOAD_SEEDED_BASE
+    return LOAD_PRETRAIN
+
+
 def refuse_unreadable(model_dir, exc):
     return ResumeRefused(
         f"{FAILED_CODE}: {os.path.basename(os.path.normpath(model_dir))} — "

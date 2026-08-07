@@ -139,6 +139,121 @@ except ckpt_guard.ResumeRefused:
 check("C11 完整 checkpoint 在 resume=True 下照常加载", fine)
 
 print()
+print("=== P1-P6: plan_load —— 三个分岔的唯一真源(S117)===")
+d3 = tempfile.mkdtemp(prefix="s117_plan_")
+check("P1 空目录 = pretrain", ckpt_guard.plan_load(d3) == ckpt_guard.LOAD_PRETRAIN)
+check("P1b 空目录 + sovits 口径 = pretrain",
+      ckpt_guard.plan_load(d3, seeded_base_is_step_zero=True) == ckpt_guard.LOAD_PRETRAIN)
+open(os.path.join(d3, "G_0.pth"), "wb").close()
+open(os.path.join(d3, "D_0.pth"), "wb").close()
+check("★★P2 只有 step-0 底模 + sovits 口径 = seeded_base(**这一条就是 c44dec6 丢掉的分支**)",
+      ckpt_guard.plan_load(d3, seeded_base_is_step_zero=True) == ckpt_guard.LOAD_SEEDED_BASE,
+      ckpt_guard.plan_load(d3, seeded_base_is_step_zero=True))
+check("P3 同一个目录在 RVC 口径下 = resume(RVC 的底模不叫 *_0)",
+      ckpt_guard.plan_load(d3) == ckpt_guard.LOAD_RESUME)
+open(os.path.join(d3, "G_800.pth"), "wb").close()
+open(os.path.join(d3, "D_800.pth"), "wb").close()
+check("P4 真存过一次 = resume", ckpt_guard.plan_load(d3, seeded_base_is_step_zero=True) == ckpt_guard.LOAD_RESUME)
+d4 = tempfile.mkdtemp(prefix="s117_plan2_")
+open(os.path.join(d4, "G_0.pth"), "wb").close()
+check("P5 只有半个底模 = pretrain(撕裂的一半不许当底模加载)",
+      ckpt_guard.plan_load(d4, seeded_base_is_step_zero=True) == ckpt_guard.LOAD_PRETRAIN)
+check("P6 三个返回值互不相同", len({ckpt_guard.LOAD_RESUME, ckpt_guard.LOAD_SEEDED_BASE,
+                                   ckpt_guard.LOAD_PRETRAIN}) == 3)
+
+print()
+print("=== B1-B8: ★底模【真的被加载了】—— 这是 c44dec6 溜过去的那条断言(S117)===")
+print("    (缺陷的形状是「什么都没做」:S116 的 C7 只钉了『全新训练不许被【拒】』,")
+print("     没有任何一条钉『底模仍然被【加载】』。)")
+from utai_train.sovits import train as SOVITS  # noqa: E402
+from utai_train.sovits import utils as SOVITS_UTILS  # noqa: E402
+from utai_train.sovits_v2 import train as SOVITS_V2  # noqa: E402
+
+
+def seed_base_pair(dirpath, base_net, suffix=0, optimizer_none=True):
+    """写一对 G_<suffix>/D_<suffix>。真底模的 optimizer 是 None(实测上游 logs/44k 的 G_0.pth:
+    iteration=0, optimizer=None)—— 夹具照着造,否则测的是一个现实里不存在的文件。"""
+    o = torch.optim.AdamW(base_net.parameters(), 1e-4)
+    for name in ("G", "D"):
+        p = os.path.join(dirpath, "%s_%d.pth" % (name, suffix))
+        SOVITS_UTILS.save_checkpoint(base_net, o, 1e-4, 0, p)
+        if optimizer_none:
+            b = torch.load(p, map_location="cpu", weights_only=False)
+            b["optimizer"] = None
+            torch.save(b, p)
+    return dirpath
+
+
+def fresh_pair():
+    torch.manual_seed(4242)
+    g, d = Tiny(), Tiny()
+    return g, d, torch.optim.AdamW(g.parameters(), 1e-4), torch.optim.AdamW(d.parameters(), 1e-4)
+
+
+def fingerprint(m):
+    return float(m.a.weight.detach().abs().sum())
+
+
+for label, mod, want_step, why_step in (
+    ("sovits", SOVITS, 1, "4.x 在 global_step += 1 之前判 eval_interval ⇒ 0 会在第一步就用练过的副本覆盖原始底模"),
+    ("sovits_v2", SOVITS_V2, 0, "v2 有显式的 step-0 处理(存档跳过、evaluate 照跑)"),
+):
+    dbase = tempfile.mkdtemp(prefix="s117_base_%s_" % label)
+    torch.manual_seed(7)
+    base = Tiny()
+    base_fp = fingerprint(base)
+    seed_base_pair(dbase, base)
+
+    g, d, og, od = fresh_pair()
+    random_fp = fingerprint(g)
+    ep, gs = mod.load_start_state(dbase, g, d, og, od, False)
+    check("★★B[%s] 全新工作区必须把底模加载进 net_g(而不是留着随机初始值)" % label,
+          abs(fingerprint(g) - base_fp) < 1e-6 and abs(random_fp - base_fp) > 1e-6,
+          "loaded=%.6f base=%.6f random=%.6f" % (fingerprint(g), base_fp, random_fp))
+    check("B[%s] net_d 同样" % label, abs(fingerprint(d) - base_fp) < 1e-6)
+    check("B[%s] epoch_str = 1" % label, ep == 1, str(ep))
+    check("★B[%s] global_step = %d —— %s" % (label, want_step, why_step), gs == want_step, str(gs))
+
+    # 空目录:什么都不加载,权重必须原样
+    dempty = tempfile.mkdtemp(prefix="s117_empty_%s_" % label)
+    g2, d2, og2, od2 = fresh_pair()
+    ep2, gs2 = mod.load_start_state(dempty, g2, d2, og2, od2, False)
+    check("B[%s] 空工作区:不加载任何东西,(1,0)" % label,
+          (ep2, gs2) == (1, 0) and abs(fingerprint(g2) - random_fp) < 1e-6)
+
+    # 真续训:严格检查仍然生效
+    dres = tempfile.mkdtemp(prefix="s117_res_%s_" % label)
+    seed_base_pair(dres, base, suffix=0)
+    torch.manual_seed(31)
+    trained = Tiny()
+    seed_base_pair(dres, trained, suffix=800, optimizer_none=False)
+    g3, d3m, og3, od3 = fresh_pair()
+    ep3, gs3 = mod.load_start_state(dres, g3, d3m, og3, od3, False)
+    check("B[%s] 真续训:加载 step-800 那一对,step = 801" % label,
+          gs3 == 801 and abs(fingerprint(g3) - fingerprint(trained)) < 1e-6,
+          "step=%s" % gs3)
+
+    # 真续训 + 缺 key ⇒ 必须拒(S116 那一刀不许被本次重构弄丢)
+    bad = torch.load(os.path.join(dres, "G_800.pth"), map_location="cpu", weights_only=False)
+    bad["model"].pop("a.weight")
+    torch.save(bad, os.path.join(dres, "G_800.pth"))
+    g4, d4, og4, od4 = fresh_pair()
+    try:
+        mod.load_start_state(dres, g4, d4, og4, od4, False)
+        refused_still = False
+    except ckpt_guard.ResumeRefused:
+        refused_still = True
+    check("★B[%s] 真续训遇到盖不住的存档仍然拒(S116 §F5-③ⓒ 不许被这次重构弄丢)" % label, refused_still)
+
+d_skip = seed_base_pair(tempfile.mkdtemp(prefix="s117_skip_"), base)
+g5, d5, og5, od5 = fresh_pair()
+ep5, gs5 = SOVITS_V2.load_start_state(d_skip, g5, d5, og5, od5, True)
+check("B[sovits_v2] skip_optimizer=True:epoch/step 被压回 (1,0)", (ep5, gs5) == (1, 0), "%s,%s" % (ep5, gs5))
+check("★B[sovits_v2] skip_optimizer=True 时底模【仍然】被加载(它是『用底模播种权重』的旋钮,不是『什么都不加载』)",
+      abs(fingerprint(g5) - base_fp) < 1e-6,
+      "loaded=%.6f base=%.6f" % (fingerprint(g5), base_fp))
+
+print()
 print("=== C12: refuse_unreadable 带 CODE ===")
 e = ckpt_guard.refuse_unreadable(d1, RuntimeError("boom"))
 check("C12 unreadable 的消息带自己的 CODE 与原异常类型",

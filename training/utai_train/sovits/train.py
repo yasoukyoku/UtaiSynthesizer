@@ -43,6 +43,13 @@
 #     NOT registered here, while the far smaller persistent_workers deviation above
 #     was — a reader trusting this register would have believed upstream's numbers
 #     always reach the DataLoader.)
+#   - ★S116 §F5-③ⓒ: a RESUME is strict and loud (utai_train/ckpt_guard.py) instead of upstream's
+#     bare `except Exception: starting from scratch`. ⚠ S117 had to add the branch that commit
+#     lost: upstream's pretrain mechanism IS "the base sits in the log dir as G_0.pth/D_0.pth
+#     and latest_checkpoint_path picks it up", so gating the single load site on a predicate
+#     that filters out `*_0.pth` made every FRESH run train from random init, silently. The
+#     three-case decision now lives in `ckpt_guard.plan_load` and the load in the module-level
+#     `load_start_state` — out of `train()` specifically so a test can drive it.
 import json
 import logging
 import math
@@ -96,6 +103,61 @@ def export_release(state_dict, path, epoch, learning_rate):
     )
     os.replace(tmp, path)
     return path
+
+
+def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
+    """Decide what this workspace is, load it, and return `(epoch_str, global_step)`.
+
+    ⛔ THIS IS A MODULE-LEVEL FUNCTION SO IT CAN BE PINNED. The defect it was extracted for had
+    the shape "did nothing": S116 gated the single load site on a predicate that excludes
+    `*_0.pth`, so a fresh workspace stopped loading its base model and trained from random init
+    — silently, and no test noticed, because the gate written alongside it only asserted that a
+    fresh run is not REFUSED. Nothing asserted that anything was LOADED. Inside `train()` that
+    was untestable without a dataset; out here `gate_ckpt_guard` drives it directly and checks
+    the weights actually moved. See `ckpt_guard.plan_load` for the three cases.
+
+    ⚠ Deviations from upstream (registered in the header): the resume branch is strict and loud
+    instead of upstream's bare `except:` (S116 §F5-③ⓒ); everything else — including the
+    warn-and-continue on a base that will not load, and the exact `epoch_str`/`global_step`
+    arithmetic of each branch — is what upstream does.
+    """
+    plan = ckpt_guard.plan_load(model_dir, seeded_base_is_step_zero=True)
+    if plan == ckpt_guard.LOAD_RESUME:
+        # S116 §F5-③ⓒ: upstream's `except Exception: starting from scratch` turns a truncated or
+        # incomplete checkpoint into a silent restart, and because the two loads mutate as they
+        # go, "G loaded, D threw" left net_g and optim_g resumed while epoch/step reset to 1/0.
+        try:
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g,
+                                                       optim_g, skip_optimizer, resume=True)
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d,
+                                                       optim_d, skip_optimizer, resume=True)
+            epoch_str = max(epoch_str, 1)
+            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+            return epoch_str, int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+        except ckpt_guard.ResumeRefused:
+            raise  # already carries its stable CODE
+        except Exception as e:
+            raise ckpt_guard.refuse_unreadable(model_dir, e) from e
+    if plan == ckpt_guard.LOAD_SEEDED_BASE:
+        # 首次训练：加载底模 — the arithmetic of this branch is what it was before `c44dec6`.
+        # ⛔ `global_step` MUST come out of the filename as `0 + 1`, never a literal 0: this
+        # trainer tests `global_step % eval_interval == 0` BEFORE the increment, so a fresh run
+        # starting at 0 takes the eval branch on its very first step and `save_gd(epoch, 0)`
+        # overwrites the pristine `G_0.pth`/`D_0.pth` with a one-step-trained copy. (The v2
+        # trainer legitimately starts at 0 — it has explicit step-0 handling; see its header.)
+        try:
+            _, _, _, base_iter = utils.load_checkpoint(
+                utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g, optim_g, skip_optimizer)
+            _, _, _, base_iter = utils.load_checkpoint(
+                utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d, optim_d, skip_optimizer)
+            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+            step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+            logger.info("loaded the seeded base checkpoints (epoch %s, step %s)", max(base_iter, 1), step)
+            return max(base_iter, 1), step
+        except Exception:
+            logger.warning("load old checkpoint failed, starting from scratch")
+            return 1, 0
+    return 1, 0
 
 
 def train(cfg, exp_dir, reporter, stop):
@@ -186,27 +248,9 @@ def train(cfg, exp_dir, reporter, stop):
         eps=hps.train.eps)
 
     skip_optimizer = False
-    # ★S116 §F5-③ⓒ — same shape as rvc/train.py (see utai_train/ckpt_guard.py). Upstream's
-    # `except Exception: starting from scratch` turns a truncated or incomplete checkpoint into a
-    # silent restart, and because the two loads mutate as they go, "G loaded, D threw" left net_g
-    # and optim_g resumed while epoch/step reset to 1/0. Deciding up front whether a resume was
-    # intended gives the fallback exactly one meaning and makes every real failure loud.
-    if ckpt_guard.resume_was_intended(hps.model_dir, seeded_base_is_step_zero=True):
-        try:
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g,
-                                                       optim_g, skip_optimizer, resume=True)
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d,
-                                                       optim_d, skip_optimizer, resume=True)
-            epoch_str = max(epoch_str, 1)
-            ckpt_name = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
-            global_step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
-        except ckpt_guard.ResumeRefused:
-            raise  # already carries its stable CODE
-        except Exception as e:
-            raise ckpt_guard.refuse_unreadable(hps.model_dir, e) from e
-    else:
-        epoch_str = 1
-        global_step = 0
+    epoch_str, global_step = load_start_state(
+        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
+    )
     if skip_optimizer:
         epoch_str = 1
         global_step = 0

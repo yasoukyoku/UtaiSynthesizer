@@ -48,6 +48,12 @@
 #     halves the weights (the converter re-floats and tolerates the stripped
 #     posterior via its has_posterior flag; f0_decoder is KEPT — the auto-f0
 #     companion export needs it), 424MB -> ~180MB
+#   - ★S116 §F5-③ⓒ: a RESUME is strict and loud (utai_train/ckpt_guard.py) instead of upstream's
+#     bare `except Exception`. ⚠ S117 had to add the branch that commit lost — the base IS
+#     G_0.pth/D_0.pth in the workspace, and gating the only load site on a predicate that filters
+#     out `*_0.pth` made every FRESH run train from random init, silently. The three-case
+#     decision is `ckpt_guard.plan_load`; the load is the module-level `load_start_state`, out of
+#     `train()` specifically so a test can drive it.
 import json
 import logging
 import math
@@ -105,6 +111,67 @@ def export_release(state_dict, path, epoch, learning_rate):
     return path
 
 
+def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
+    """Decide what this workspace is, load it, and return `(epoch_str, global_step)`.
+
+    ⛔ MODULE-LEVEL SO IT CAN BE PINNED — same reason as the 4.x trainer's twin: the defect this
+    was extracted for had the shape "did nothing", and nothing inside `train()` is reachable from
+    a test without a dataset. `gate_ckpt_guard` drives this directly and asserts the weights
+    moved. Three cases, decided by `ckpt_guard.plan_load`.
+
+    ⚠ `skip_optimizer` is upstream cpurun's "seed the weights from a base model" knob, NOT a
+    resume: it deliberately drops the optimizer and forces epoch/step back to 1/0, so a
+    checkpoint that only partially covers the model is legitimate there. That is why the strict
+    coverage check is applied only when this really is a resume.
+    """
+    plan = ckpt_guard.plan_load(model_dir, seeded_base_is_step_zero=True)
+    if plan == ckpt_guard.LOAD_RESUME:
+        is_resume = not skip_optimizer
+        try:
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g,
+                                                       optim_g, skip_optimizer, resume=is_resume)
+            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d,
+                                                       optim_d, skip_optimizer, resume=is_resume)
+            epoch_str = max(epoch_str, 1)
+            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+            parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
+            # a real save at step N (pre-increment) resumes at N+1 (header). The `parsed == 0`
+            # arm is kept verbatim from before the extraction even though `plan_load` makes it
+            # unreachable here — the ordering argument that makes it unreachable depends on
+            # `latest_checkpoint_path` concatenating the digits of the WHOLE PATH, which is not
+            # a property worth betting a silent step-0 overwrite on.
+            global_step = 0 if parsed == 0 else parsed + 1
+        except ckpt_guard.ResumeRefused:
+            raise  # already carries its stable CODE
+        except Exception as e:
+            raise ckpt_guard.refuse_unreadable(model_dir, e) from e
+    elif plan == ckpt_guard.LOAD_SEEDED_BASE:
+        # ★S117 — the branch `c44dec6` lost. This trainer has no separate pretrain path either:
+        # the base IS `G_0.pth`/`D_0.pth` in the workspace. Arithmetic reproduced from before
+        # that commit, including `global_step = 0` for the step-0 base — unlike the 4.x trainer
+        # this one HAS explicit step-0 handling (header: evaluate() runs at the boundary but the
+        # G_0/D_0 save is skipped so the pristine base is not overwritten).
+        try:
+            _, _, _, base_iter = utils.load_checkpoint(
+                utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g, optim_g, skip_optimizer)
+            _, _, _, base_iter = utils.load_checkpoint(
+                utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d, optim_d, skip_optimizer)
+            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+            parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
+            epoch_str = max(base_iter, 1)
+            global_step = 0 if parsed == 0 else parsed + 1
+            logger.info("loaded the seeded base checkpoints (epoch %s, step %s)", epoch_str, global_step)
+        except Exception:
+            logger.warning("load old checkpoint failed, starting from scratch")
+            epoch_str, global_step = 1, 0
+    else:
+        epoch_str, global_step = 1, 0
+    if skip_optimizer:
+        # upstream cpurun verbatim: optimizer fresh, epoch/step forced to start
+        epoch_str, global_step = 1, 0
+    return epoch_str, global_step
+
+
 def train(cfg, exp_dir, reporter, stop):
     hps = utils.get_hparams_from_file(os.path.join(exp_dir, "config.json"))
     hps.model_dir = exp_dir
@@ -144,36 +211,9 @@ def train(cfg, exp_dir, reporter, stop):
 
     # skip_optimizer: gate knob mirroring upstream cpurun (see header)
     skip_optimizer = bool(cfg.get("skip_optimizer", False))
-    global_step = 0
-    # ★S116 §F5-③ⓒ — same shape as rvc/train.py (see utai_train/ckpt_guard.py).
-    # ⚠ `skip_optimizer` is upstream's "seed the weights from a base model" knob, NOT a resume:
-    # it deliberately drops the optimizer and forces epoch/step back to 1/0 below, so a checkpoint
-    # that only partially covers the model is legitimate there. The strict check applies to a
-    # genuine resume only.
-    is_resume = ckpt_guard.resume_was_intended(hps.model_dir, seeded_base_is_step_zero=True) and not skip_optimizer
-    if ckpt_guard.resume_was_intended(hps.model_dir, seeded_base_is_step_zero=True):
-        try:
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g,
-                                                       optim_g, skip_optimizer, resume=is_resume)
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d,
-                                                       optim_d, skip_optimizer, resume=is_resume)
-            epoch_str = max(epoch_str, 1)
-            ckpt_name = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
-            parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
-            # fresh seeded base (D_0) -> 0, matching upstream's (epoch-1)*len; a
-            # real save at step N (pre-increment) resumes at N+1 (header)
-            global_step = 0 if parsed == 0 else parsed + 1
-        except ckpt_guard.ResumeRefused:
-            raise  # already carries its stable CODE
-        except Exception as e:
-            raise ckpt_guard.refuse_unreadable(hps.model_dir, e) from e
-    else:
-        epoch_str = 1
-        global_step = 0
-    if skip_optimizer:
-        # upstream cpurun verbatim: optimizer fresh, epoch/step forced to start
-        epoch_str = 1
-        global_step = 0
+    epoch_str, global_step = load_start_state(
+        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
+    )
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)

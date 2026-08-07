@@ -219,7 +219,11 @@ def train(cfg, exp_dir, reporter, stop):
     # ⇒ Decide FIRST whether a resume was intended (both checkpoints present), then let every
     # failure inside be loud. The pretrain branch now means exactly one thing.
     # ⚠ Deviation from upstream, registered in the header.
-    if ckpt_guard.resume_was_intended(hps.model_dir):
+    # ⚠ RVC is the trainer whose base is NOT a `*_0.pth` in the workspace — it has the explicit
+    # pretrain branch below — so it asks with `seeded_base_is_step_zero` off and only ever sees
+    # two of `plan_load`'s three answers. It still asks through `plan_load` so the decision has
+    # exactly one home; S117's regression happened because it had two.
+    if ckpt_guard.plan_load(hps.model_dir) == ckpt_guard.LOAD_RESUME:
         try:
             _, _, _, epoch_str = utils.load_checkpoint(
                 utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d, resume=True
