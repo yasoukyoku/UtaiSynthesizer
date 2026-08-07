@@ -1646,7 +1646,14 @@ impl TrainingManager {
                 // shared preprocessing caches survive
                 let diff_dir = workspace.join("diffusion");
                 if diff_dir.exists() {
-                    std::fs::remove_dir_all(&diff_dir).map_err(|e| {
+                    // ★S118 §F8-res⒌ — `remove_dir_all_robust`, like the full-wipe branch below.
+                    // This one used plain `remove_dir_all`, and the difference is not cosmetic: a
+                    // READONLY attribute (backup / 网盘 restores carry them) fails the delete
+                    // AFTER it has already emptied part of the directory, so the start errors out
+                    // with a half-erased diffusion dir — and "the newest checkpoint is gone but
+                    // model_best.pt is still there" is exactly the shape that used to make the
+                    // next resume silently restart from the base model.
+                    crate::util::remove_dir_all_robust(&diff_dir).map_err(|e| {
                         UtaiError::Training(format!("DIFF_WIPE_FAILED: {}", e))
                     })?;
                 }

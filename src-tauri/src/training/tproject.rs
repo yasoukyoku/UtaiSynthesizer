@@ -823,6 +823,30 @@ pub struct CleanupPlan {
 ///   a file that is being written is already guaranteed by the idle gate.
 /// * "protect anything from the last N hours" — same problem at a coarser grain. What remains
 ///   is a seconds-scale guard against a save landing between the scan and the delete.
+/// The record a DEFAULT 续训 would actually continue from — the one the project card's
+/// 「可从第 N 步继续」 must name. `recs` must be `scan_project_ckpts`' output (newest-first by mtime).
+///
+/// ⛔★S118 §F8-res⒈ — this exists because "the newest Resumable" stopped meaning that in S117.
+/// `resume_best/` is written AFTER the rolling pair (`sovits/train.py` saves `save_gd` inside the
+/// epoch and `save_best` at its end), so whenever the metric improved in the last epoch the best
+/// snapshot IS the mtime-newest Resumable — and the card then printed the BEST step while a
+/// default resume (`resume_from` = "latest", every previous release's behaviour) continues from
+/// the latest one. A label naming a step the button will not continue from is the same class of
+/// lie §F2⒜ was built to remove.
+///
+/// The mtime ordering itself is KEPT and is not incidental: it is the order upstream resumes by,
+/// and RVC's rolling `G_2333333.pth` has no orderable step at all (it maps to `step: None`), so
+/// "max step" is not available as a rule. The fix is therefore a filter, not a re-sort.
+///
+/// ⚠ A slot whose ONLY resumable record is the best snapshot still reports it: that really is the
+/// only thing there to continue from, and answering "no resume point" would be its own lie.
+pub fn default_resume_record(recs: &[CkptRecord]) -> Option<&CkptRecord> {
+    let is_best_snapshot = |r: &CkptRecord| r.rel.contains("/resume_best/");
+    recs.iter()
+        .find(|r| matches!(r.kind, CkptKind::Resumable) && !is_best_snapshot(r))
+        .or_else(|| recs.iter().find(|r| matches!(r.kind, CkptKind::Resumable)))
+}
+
 pub fn plan_cleanup(
     records: &[CkptRecord],
     ledger_since_ms: u64,
@@ -2217,6 +2241,38 @@ mod tests {
             imported,
             companions: Vec::new(),
         }
+    }
+
+    /// ★S118 §F8-res⒈ — the project card must name the step a DEFAULT 续训 continues from.
+    ///
+    /// The bug this pins was introduced by S117 and lived on the GAN side too: `resume_best/` is
+    /// written after the rolling pair, so it becomes the mtime-newest Resumable and the card
+    /// started printing the BEST step — a number the「续训」button will not continue from.
+    #[test]
+    fn s118_the_project_card_names_the_step_a_default_resume_uses() {
+        let mut best = ck("sovits/resume_best/G.pth", CkptKind::Resumable, 9_000_500, false);
+        best.step = Some(1400);
+        let mut latest = ck("sovits/G_5000.pth", CkptKind::Resumable, 9_000_000, false);
+        latest.step = Some(5000);
+        // newest-first by mtime, exactly as `scan_project_ckpts` returns it: best is NEWER.
+        let recs = vec![best.clone(), latest.clone()];
+        assert_eq!(
+            default_resume_record(&recs).and_then(|r| r.step),
+            Some(5000),
+            "the mtime-newest Resumable is the BEST snapshot — the card must still name the latest"
+        );
+        // ⚠ Companion arm, or the assertion above would also pass if the function just returned
+        // the max step for unrelated reasons: with the best snapshot ABSENT nothing changes.
+        assert_eq!(
+            default_resume_record(&[latest.clone()]).and_then(|r| r.step),
+            Some(5000)
+        );
+        // …and a slot whose ONLY resumable record IS the best snapshot must still report it:
+        // that really is the only thing there to continue from.
+        assert_eq!(default_resume_record(&[best]).and_then(|r| r.step), Some(1400));
+        // Non-resumable kinds are never a resume point, however new they are.
+        assert!(default_resume_record(&[ck("rvc/weights/m_best.pth", CkptKind::Best, 9_9, false)])
+            .is_none());
     }
 
     /// The most expensive judgement in the whole refactor: getting it wrong deletes hours of a

@@ -817,10 +817,11 @@ pub async fn get_training_project(
         .map(|f| {
             let recs = crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, Some(f));
             // `scan_project_ckpts` returns newest-first by mtime — the same ordering upstream
-            // itself resumes by (the RVC sentinel makes step numbers unorderable).
-            let newest_resumable = recs
-                .iter()
-                .find(|r| matches!(r.kind, crate::training::tproject::CkptKind::Resumable));
+            // itself resumes by (the RVC sentinel makes step numbers unorderable). ★S118 §F8-res⒈:
+            // the CHOICE now lives in `default_resume_record`, because "the mtime-newest Resumable"
+            // stopped meaning "what a 续训 continues from" the moment S117 started writing a
+            // `resume_best/` pair after the rolling one — see that function.
+            let newest_resumable = crate::training::tproject::default_resume_record(&recs);
             SlotDetail {
                 family: f.to_string(),
                 model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, f)
