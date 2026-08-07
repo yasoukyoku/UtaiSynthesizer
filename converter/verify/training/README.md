@@ -487,6 +487,37 @@ training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_compar
 - SovitsOptions serde 兼容单测（tests/voice_pipeline.rs）：缺键/null→None（默认
   声码器路径）、CJK 名透传、未知键不炸。cargo test 全绿（41+5+3+1）。
 
+## ★S119 §F8⒝ 冒烟 —— 声码器的可续训 best + 活分支指针（端到端，真的跑 fit 循环）
+
+```
+training\.venv\Scripts\python.exe -u D:\MyDev\TESTING\s119_vocoder\smoke_voc_resume.py
+```
+**16/16 PASS / ~151 s**（RTX 3080 Ti）。为什么必须有它:`gate_resume_state` 的 V 组驱动的是
+`choose_start_ckpt` / `_prune_workspace_ckpts` / `save_solo_snapshot` 这些**函数**,而
+`on_fit_start` 的 RNG 恢复、`note_saved` 的指针刷新、`_save_resumable_best`、
+`UtaiDsModelCheckpoint._save_checkpoint` **全都在 lightning 的循环里**。
+
+配方(每一项都是判据的一部分):
+- 素材 = `TESTING\smoke_vocoder\dataset\vocal.wav`(126 s 44.1k 干声 → 9 切片 / 8 train / 1 val),
+  拷成 `TESTING\s119_vocoder\smoke_data`;底模指 live 数据根(仓库 `data/models` 仍是弹坑)。
+- ⛔**工作区必须在 D:** —— 每个 lightning 存档 **1.2 GB**,C: 只剩十几 GB,实测在 C: 上
+  `_atomic_save` 会中途死在 `unexpected pos …`,而那看起来完全像本轮改的存档路径出了 bug。
+- ⛔**脚本必须有 `if __name__ == "__main__"` 守卫** —— `ds_workers=4` 写死在
+  `build_train_config`,Windows spawn 会重新 import `__main__`(扩散那份冒烟不需要,别照抄它的
+  平铺写法)。`aug_copies=0` 才能免掉 RMVPE 资产。
+- **步数编排是分辨力的来源**(global = 2×real,存档只落在 val 边界):
+  R1 total 8 → 存档 8/16 · R2 total 12 → 24 · **埋诱饵 26**(`26 % 8 != 0` ⇒ 新分支的验证网格
+  永远写不出这个名字)· R3 `resume_from="best"` total 11 → 新 tip 22 **低于** 24/26 ·
+  R4 默认续训 total 14 → **必须从 22 起,而不是盘上最大的 26**。
+- 读数(不是推的):`resume state: scaler=absent; rng[numpy,python,torch_cpu,torch_cuda 全 restored]` ·
+  `resume: dataset unchanged (<指纹前 12 位>)` · `dataset items = 8` ·
+  回退后 `grid=[16,22,24,26] pointer=22` · R4 后 `grid=[26,28] pointer=28`,
+  `pruned workspace checkpoint 24/22/16`(全部 ≤ tip)。
+- ★**它当场买回两条**:①E14 第一版实现照搬扩散「只试最大那一格」是错的——扩散有
+  `resume_latest/` 兜底,声码器的编号网格就是它的主要续训面,一格中毒会让整个工作区不可续训;
+  ②另一条红的是**我的夹具**:诱饵是别处复制来的,内部 `global_step` 与文件名不一致 ⇒
+  断言必须落在「选中了哪个**文件**」上。
+
 ## 坑（S40 新增）
 
 1. **上游 wav2spec 的 f0/mel 采样率错配**（gate0(b) 有数值实证）——切片统一 44.1k

@@ -133,8 +133,13 @@ const AUTOTUNE_FILES: &[AssetFile] = &[
 // (ckpt crc32=0x3ec4e407 / zh NOTICE 0xb3004cf3 / NOTICE 0x34c73950)，故直接以它们为镜像原件。
 //
 // ⚠️ 这份 ckpt ≠ 推理用的「默认声码器」(auxiliary/nsf_hifigan.onnx)：后者 56.8MB、**只有
-// generator**、且是 2022.12 代；微调要的是 2024.02 代的 lightning 训练档（generator.* 457 键 +
-// discriminator.* 299 键）。两者格式类相同但不可互换 —— 别再想着「复用已分发的那个」。
+// generator**、且是 2022.12 代；微调要的是 2024.02 代的 lightning 训练档。两者格式类相同但
+// 不可互换 —— 别再想着「复用已分发的那个」。
+// ⛔★S119 更正：这里原本写着「generator.* 457 键 + discriminator.* 299 键」，那是**假的**。
+// 逐件复算 sha256 与 size 都与上表逐位相同（= 字节没问题），而真值是 `{'state_dict': …}` 一个
+// 顶层键、**509 项 = generator 303 + discriminator 206**，与我们生产 config 建出来的模型
+// missing=0 / unexpected=0 逐键对上。那句错的散文的用途恰恰是「让下一个人认出这是不是对的
+// 文件」，所以它是一条会误导人的证据链，不是排版。工具：`TESTING\s119_vocoder\probe_finetune_load.py`。
 const VOCODER_TRAIN_FILES: &[AssetFile] = &[
     AssetFile { rel: "training/vocoder/nsf_hifigan_44.1k_hop512_128bin_2024.02.ckpt", size: 405_661_921, sha256: "5f4b4eb097b6e8126ada72651e32986908903b2780b478e3dfd05a5615f57fe2" },
     AssetFile { rel: "training/vocoder/NOTICE.txt", size: 3_725, sha256: "31005a94c1e591d3a09dd0702bc21082b2aaa2f36d3689fe248a651cdd83ebf6" },
