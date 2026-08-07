@@ -360,6 +360,35 @@ extract.py 是 S38 主链共享文件（本次加 diff_mode 分支 + vol 门扩�
 - 三段式：主模型（S38 smoke）在 diff 之后续训 2 epochs 正常（G_91 续、GAN loss
   健康、diffusion/ 产物无扰）。
 
+## ★S118 §F8⒜ 冒烟 —— 可续训快照（端到端,真的跑循环）
+
+```
+training\.venv\Scripts\python.exe -u D:\MyDev\TESTING\s118_f8a\smoke_diff_resume.py
+```
+
+**为什么它必须存在**：`gate_resume_state.py` 的 D 组驱动的是 `load_start_state` /
+`save_solo_snapshot` / `_sweep_old_checkpoints` 这些**函数**,一次也没有执行过
+`solver.train` 的循环 —— 而 `refresh_resume_point` / `capture_state` / `restore` /
+`report_drift` / best 那一段全在循环里。「所有单元判据都绿」在那种情况下什么也不证明
+（S117b 血训）。它不做成仓内 gate 是因为要 220 MB 底模 + 一个备好的工作区。
+
+素材：`TESTING\utai-v2-testing\smoke_sovits41` **复制**出一份（原件逐字节不动）,
+只带 `diffusion\model_0.pt` 过来 ⇒ 这一轮是「全新 + 播种底模」;
+yaml 覆盖 `interval_val=4 / interval_force_save=8 / batch_size=2 /
+amp_dtype=fp16`（★fp16 是硬要求 —— 否则 GradScaler 那一半根本没被跑到）;
+vocoder 指 live 数据根的 `nsf_hifigan\model`（仓内 `data\models\` 仍是炸仓后的空缺）。
+
+**S118 实测读数（2026-08-07,16/16 PASS,四轮共 ~46 s）：**
+
+| 轮 | 内容 | 读数 |
+|---|---|---|
+| 1 | 全新 8 步 | 两个快照都写出;`resume_latest\model.pt` = **631.9 MB**,`state.json` 带 scaler+四套 RNG+数据集指纹;编号网格 = `[0, 8]`（第 4 步被清扫器按里程碑谓词删掉 = 设计行为） |
+| 2 | 默认续训→12 | 选中 `latest_snapshot`;日志 `scaler=restored (scale=65536.0)` + `rng[numpy,python,torch_cpu,torch_cuda 全 restored]` + `dataset unchanged` + `items=9 / batches=5`;零警告 |
+| 3 | 从 best 回退→16 | 选中 `best`(step 8),`steps_this_run=8`;★埋进去的被放弃分支存档 `model_10.pt`（不在新分支的验证网格上）**活着** —— 旧的区间写法会在第 12 步的保存时删掉它 |
+| 4 | 落到不带 optimizer 的存档上 | 删掉两个快照 + 把最新那格改回周期保存的形状 ⇒ `warn == ["TRAINING_RESUME_OPTIMIZER_MISSING"]`,训练照常进行,收工后又有完整续训点（下一次不再警告） |
+
+⚠ 复跑注意：脚本会**重建** `TESTING\s118_f8a\smoke_ws`（先 rmtree）,别把东西放在那里面。
+
 ### train_diff 复跑注意
 - gate1 prepare 会清双侧 expdir；gate0 prepare 会清 diff_orig/diff_ours。
 - 原版侧 gate0 需要 diff_orig 里已预置 soft/f0/spec（prepare 负责）。
