@@ -66,6 +66,7 @@ from .. import ckpt_guard
 from .. import device as device_shim  # aliased: train() has a local `device = torch.device(...)` that would shadow a bare `device` import
 from .. import loader_budget
 from .. import numerics
+from .. import resume_state
 from . import utils
 from .data_utils import TextAudioCollate, TextAudioSpeakerLoader
 from .flist import resolve_speakers
@@ -106,7 +107,11 @@ def export_release(state_dict, path, epoch, learning_rate):
 
 
 def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
-    """Decide what this workspace is, load it, and return `(epoch_str, global_step)`.
+    """Decide what this workspace is, load it, and return `(epoch_str, global_step, resumed)`.
+
+    `resumed` is the `resume_state` sidecar when this really was a resume and the sidecar belongs
+    to the checkpoint that was just read, else None. It is returned rather than applied because
+    the GradScaler it feeds does not exist yet at this point in `train()`.
 
     ⛔ THIS IS A MODULE-LEVEL FUNCTION SO IT CAN BE PINNED. The defect it was extracted for had
     the shape "did nothing": S116 gated the single load site on a predicate that excludes
@@ -133,7 +138,11 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
                                                        optim_d, skip_optimizer, resume=True)
             epoch_str = max(epoch_str, 1)
             ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
-            return epoch_str, int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+            step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+            sidecar = resume_state.load_for(
+                epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
+            )
+            return epoch_str, step, sidecar
         except ckpt_guard.ResumeRefused:
             raise  # already carries its stable CODE
         except Exception as e:
@@ -153,11 +162,11 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
             ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
             step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
             logger.info("loaded the seeded base checkpoints (epoch %s, step %s)", max(base_iter, 1), step)
-            return max(base_iter, 1), step
+            return max(base_iter, 1), step, None
         except Exception:
             logger.warning("load old checkpoint failed, starting from scratch")
-            return 1, 0
-    return 1, 0
+            return 1, 0, None
+    return 1, 0, None
 
 
 def train(cfg, exp_dir, reporter, stop):
@@ -248,7 +257,7 @@ def train(cfg, exp_dir, reporter, stop):
         eps=hps.train.eps)
 
     skip_optimizer = False
-    epoch_str, global_step = load_start_state(
+    epoch_str, global_step, resumed = load_start_state(
         hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
     )
     if skip_optimizer:
@@ -261,6 +270,13 @@ def train(cfg, exp_dir, reporter, stop):
 
     scaler = device_shim.make_scaler(amp_backend, hps.train.fp16_run)
     half_type = torch.bfloat16 if hps.train.half_type == "bf16" else torch.float16
+    # ★S117 §F2⒜ — restore the one piece of run state no checkpoint held (see resume_state).
+    resume_state.restore(resumed, scaler, logger)
+    if resumed is not None:
+        resume_state.report_drift(
+            resumed, reporter, logger,
+            exp_dir=exp_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
+        )
     # S114 §F5-3 (community issue #2, reported on the RVC trainer — this loop has
     # the identical open-coded best tracking, so it had the identical defect).
     divergence = numerics.DivergenceGuard((("G", net_g), ("D", net_d)), logger=logger)
@@ -314,6 +330,15 @@ def train(cfg, exp_dir, reporter, stop):
         d_path = os.path.join(hps.model_dir, "D_{}.pth".format(step))
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, g_path)
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, d_path)
+        # ★S117 — LAST: the sidecar's presence marks the pair beside it complete, and its epoch
+        # lets a stale copy (kill between the two writes) be detected and ignored.
+        resume_state.write(
+            os.path.join(hps.model_dir, resume_state.LATEST_NAME),
+            resume_state.capture(
+                scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                dataset_items=len(train_dataset), loader_len=len(train_loader),
+            ),
+        )
         if keep_ckpts > 0:
             utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
         return g_path

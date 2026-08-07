@@ -67,6 +67,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .. import ckpt_guard
 from .. import device as device_shim  # aliased: train() has a local `device`
 from .. import numerics
+from .. import resume_state
 from . import utils
 from .data_utils import DatasetConstructor
 from ..sovits.flist import resolve_speakers
@@ -141,6 +142,9 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
             # `latest_checkpoint_path` concatenating the digits of the WHOLE PATH, which is not
             # a property worth betting a silent step-0 overwrite on.
             global_step = 0 if parsed == 0 else parsed + 1
+            sidecar = resume_state.load_for(
+                epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
+            )
         except ckpt_guard.ResumeRefused:
             raise  # already carries its stable CODE
         except Exception as e:
@@ -160,16 +164,19 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
             parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
             epoch_str = max(base_iter, 1)
             global_step = 0 if parsed == 0 else parsed + 1
+            sidecar = None
             logger.info("loaded the seeded base checkpoints (epoch %s, step %s)", epoch_str, global_step)
         except Exception:
             logger.warning("load old checkpoint failed, starting from scratch")
-            epoch_str, global_step = 1, 0
+            epoch_str, global_step, sidecar = 1, 0, None
     else:
-        epoch_str, global_step = 1, 0
+        epoch_str, global_step, sidecar = 1, 0, None
     if skip_optimizer:
-        # upstream cpurun verbatim: optimizer fresh, epoch/step forced to start
-        epoch_str, global_step = 1, 0
-    return epoch_str, global_step
+        # upstream cpurun verbatim: optimizer fresh, epoch/step forced to start. The sidecar goes
+        # with it: this is "seed the weights from a base", not a continuation, so restoring the
+        # previous run's RNG stream would be a lie about what this run is.
+        epoch_str, global_step, sidecar = 1, 0, None
+    return epoch_str, global_step, sidecar
 
 
 def train(cfg, exp_dir, reporter, stop):
@@ -211,9 +218,18 @@ def train(cfg, exp_dir, reporter, stop):
 
     # skip_optimizer: gate knob mirroring upstream cpurun (see header)
     skip_optimizer = bool(cfg.get("skip_optimizer", False))
-    epoch_str, global_step = load_start_state(
+    epoch_str, global_step, resumed = load_start_state(
         hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
     )
+    # ★S117 §F2⒜ — v2 is pure fp32 (no GradScaler anywhere, header line 14), so `scaler=None`
+    # here is the truth, not an omission: what a v2 resume was missing is the RNG streams and any
+    # record of WHICH dataset the checkpoint was trained on.
+    resume_state.restore(resumed, None, logger)
+    if resumed is not None:
+        resume_state.report_drift(
+            resumed, reporter, logger, exp_dir=exp_dir,
+            dataset_items=len(train_loader.dataset), loader_len=len(train_loader),
+        )
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2)
@@ -270,6 +286,14 @@ def train(cfg, exp_dir, reporter, stop):
         d_path = os.path.join(hps.model_dir, "D_{}.pth".format(step))
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, g_path)
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, d_path)
+        # ★S117 — LAST: presence marks the pair complete; the epoch detects a stale copy.
+        resume_state.write(
+            os.path.join(hps.model_dir, resume_state.LATEST_NAME),
+            resume_state.capture(
+                None, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                dataset_items=len(train_loader.dataset), loader_len=len(train_loader),
+            ),
+        )
         if keep_ckpts > 0:
             utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
         return g_path

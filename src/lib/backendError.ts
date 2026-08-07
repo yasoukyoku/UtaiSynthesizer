@@ -354,6 +354,7 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // ran 13+ more hours, and the previously valid *_best.pth was overwritten with
   // the poisoned weights. The run now dies loudly instead.
   TRAINING_NUMERICS_DIVERGED: { key: "backend.TRAINING_NUMERICS_DIVERGED" },
+  TRAINING_RESUME_DATASET_CHANGED: { key: "backend.TRAINING_RESUME_DATASET_CHANGED" },
   // S114 §F5-1 live diagnostics (TrainingSnapshot.warnings) — raised while the run is
   // still going, so they never set `state = "error"`. The "froze" report had NO failure
   // to show: the DataLoader's feeder thread dies in a daemon thread and the trainer just

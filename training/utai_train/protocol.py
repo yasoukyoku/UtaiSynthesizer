@@ -10,6 +10,7 @@ Message shapes (protocol v2):
    "lr":float,"losses":{name:float,...},"eta_secs":int?}
   {"type":"ckpt","kind":"periodic|best|final|stop","path":str,"step":int,"epoch":int,
    "metric":float?}
+  {"type":"warn","code":str}
   {"type":"done","reason":"completed|stopped","summary":{...}}
   {"type":"error","message":str}
 """
@@ -105,6 +106,21 @@ class Reporter:
         if metric is not None:
             obj["metric"] = round(float(metric), 6)
         self._emit(obj)
+
+    def warn(self, code):
+        """A stable CODE for something wrong that does NOT stop the run (S117).
+
+        Until now the only warnings the app could raise came from the Rust side reading our
+        stderr (the 1455 shared-mapping failure) or from its stall watchdog — there was no way
+        for the trainer itself to say "this is worth telling the user about" without either
+        failing the run or hiding it in a log line nobody reads. `TrainingSnapshot.warnings` has
+        existed since S114; this is the missing half of that channel.
+
+        ⚠ Never localize here. The CODE goes to `backendError.ts` like every other one, and Rust
+        dedupes it — see `training::raise_warning`, which is idempotent because a raiser may
+        legitimately fire more than once.
+        """
+        self._emit({"type": "warn", "code": str(code)})
 
     def done(self, reason, summary=None):
         self._emit({"type": "done", "reason": reason, "summary": summary or {}})

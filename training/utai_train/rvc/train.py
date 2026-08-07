@@ -54,6 +54,7 @@ from .. import device as device_shim  # aliased: 'device' is a collision-prone n
 from .. import ckpt_guard
 from .. import loader_budget
 from .. import numerics
+from .. import resume_state
 from . import train_utils as utils
 from .infer_pack import commons
 from .data_utils import (
@@ -223,7 +224,8 @@ def train(cfg, exp_dir, reporter, stop):
     # pretrain branch below — so it asks with `seeded_base_is_step_zero` off and only ever sees
     # two of `plan_load`'s three answers. It still asks through `plan_load` so the decision has
     # exactly one home; S117's regression happened because it had two.
-    if ckpt_guard.plan_load(hps.model_dir) == ckpt_guard.LOAD_RESUME:
+    is_resume = ckpt_guard.plan_load(hps.model_dir) == ckpt_guard.LOAD_RESUME
+    if is_resume:
         try:
             _, _, _, epoch_str = utils.load_checkpoint(
                 utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d, resume=True
@@ -236,10 +238,17 @@ def train(cfg, exp_dir, reporter, stop):
             raise  # already carries its stable CODE
         except Exception as e:
             raise ckpt_guard.refuse_unreadable(hps.model_dir, e) from e
+        # ⛔ RECOMPUTED, never read back from the sidecar: a resume re-runs epoch `epoch_str`
+        # from its beginning (upstream semantics), so the counter must be the step at the START
+        # of that epoch. The sidecar records the save-time step for DIAGNOSIS only.
         global_step = (epoch_str - 1) * len(train_loader)
+        resumed = resume_state.load_for(
+            epoch_str, os.path.join(hps.model_dir, resume_state.LATEST_NAME), logger
+        )
     else:  # 首次训练：加载pretrain
         epoch_str = 1
         global_step = 0
+        resumed = None
         if hps.pretrainG != "":
             logger.info("loaded pretrained %s" % (hps.pretrainG))
             logger.info(
@@ -263,6 +272,16 @@ def train(cfg, exp_dir, reporter, stop):
     )
 
     scaler = device_shim.make_scaler(amp_backend, hps.train.fp16_run)
+    # ★S117 §F2⒜ — the scaler is the ONE piece of run state that `save_checkpoint` never held,
+    # so until now every resume restarted it at init_scale=65536 and silently threw away the
+    # handful of steps it takes to back down. Restoring it makes the resumed trajectory
+    # bit-identical to never having stopped (measured; see utai_train/resume_state.py).
+    resume_state.restore(resumed, scaler, logger)
+    if is_resume:
+        resume_state.report_drift(
+            resumed, reporter, logger,
+            exp_dir=exp_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
+        )
     # S114 §F5-3 (community issue #2): halt a run whose losses have gone nan
     # instead of burning hours writing poisoned weights.
     divergence = numerics.DivergenceGuard((("G", net_g), ("D", net_d)), logger=logger)
@@ -314,6 +333,20 @@ def train(cfg, exp_dir, reporter, stop):
             d_path = os.path.join(hps.model_dir, "D_{}.pth".format(2333333))
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, g_path)
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, d_path)
+        # ★S117 — LAST, on purpose: the sidecar's presence is what says the pair beside it is
+        # complete, and it carries the epoch so a copy left behind by a kill between the two
+        # writes is detected and ignored instead of restoring a stale scale/RNG.
+        resume_state.write(
+            os.path.join(hps.model_dir, resume_state.LATEST_NAME),
+            resume_state.capture(
+                scaler,
+                epoch=epoch,
+                global_step=global_step,
+                exp_dir=exp_dir,
+                dataset_items=len(train_dataset),
+                loader_len=len(train_loader),
+            ),
+        )
 
     def save_small(name, epoch):
         path = os.path.join(weights_dir, "%s.pth" % name)

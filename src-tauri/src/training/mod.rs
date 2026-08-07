@@ -2596,6 +2596,20 @@ fn run_worker(
                     s.state = if reason == "stopped" { "stopped" } else { "completed" }.into();
                     s.summary = Some(msg["summary"].clone());
                 }
+                // ★S117: the sidecar's own warning channel. Until now the app could only raise a
+                // warning from OUTSIDE the trainer — the stderr scan for err 1455, and the stall
+                // watchdog — so anything the trainer itself noticed had to either fail the run or
+                // disappear into a log line. `raise_warning` dedupes, so a repeat is free.
+                Some("warn") => {
+                    let code = msg["code"].as_str().unwrap_or("").trim().to_string();
+                    // An empty or absurd code would land in the UI as a raw string; drop it and
+                    // leave the evidence in the log rather than render nonsense at the user.
+                    if !code.is_empty() && code.len() <= 64 {
+                        raise_warning(inner, app, &code);
+                    } else {
+                        tracing::debug!(target: "utai", "[train-proto?] unusable warn code {:?}", code);
+                    }
+                }
                 Some("error") => {
                     got_error = Some(
                         msg["message"]
@@ -2779,6 +2793,92 @@ mod tests {
                 src.contains("def load_start_state("),
                 "{name}/train.py must keep the startup load in a module-level function — inside \
                  train() no test can drive it, which is exactly how the S117 regression shipped"
+            );
+        }
+    }
+
+    /// ★S117 §F2⒜ — the resume-state sidecar's wiring, across four languages.
+    ///
+    /// Behaviour is `converter/verify/training/gate_resume_state.py`; what rots silently is the
+    /// wiring, and this one has an extra hop nothing else has: python now raises WARNINGS on the
+    /// protocol (`Reporter.warn`), which the loop above turns into `TrainingSnapshot.warnings`.
+    /// Before S117 the only warning raisers were Rust-side (the err-1455 stderr scan and the
+    /// stall watchdog), so a trainer that noticed something could only fail the run or say it to
+    /// a log nobody reads.
+    ///
+    /// ⚠ The CODE is parsed OUT of resume_state.py, never retyped here.
+    #[test]
+    fn s117_resume_state_sidecar_and_the_warn_channel_are_wired_end_to_end() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static PROTOCOL_PY: &str = include_str!("../../../training/utai_train/protocol.py");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        let code = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("CODE_DATASET_CHANGED = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("resume_state.py must keep CODE_DATASET_CHANGED as a plain top-level literal");
+        assert!(
+            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+            "the CODE crosses a process boundary and lands in json keys: {code:?}"
+        );
+        assert!(
+            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+        );
+        // ⚠ NOT `modal` on purpose: the run is still going. A modal here would cover the live
+        // training screen for something that is explicitly not a failure.
+        assert!(
+            !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
+            "{code} is a warning, not a failure — a modal would cover a run that is still training"
+        );
+        for (lang, raw) in [
+            ("zh", include_str!("../../../src/i18n/zh.json")),
+            ("en", include_str!("../../../src/i18n/en.json")),
+            ("ja", include_str!("../../../src/i18n/ja.json")),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let msg = v
+                .pointer(&format!("/backend/{code}"))
+                .and_then(|m| m.as_str())
+                .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+            assert!(
+                msg.chars().count() >= 30,
+                "backend.{code} in {lang}.json is {} chars — too short to be the real message",
+                msg.chars().count()
+            );
+        }
+
+        assert!(
+            PROTOCOL_PY.contains("def warn(self, code):")
+                && PROTOCOL_PY.contains("\"type\": \"warn\""),
+            "utai_train/protocol.py lost Reporter.warn — the trainer would have no way to raise a \
+             warning without failing the run"
+        );
+
+        // ★The ordering that makes the sidecar trustworthy: it is written AFTER both halves of
+        // the pair, so its presence means the pair beside it is complete. Writing it first would
+        // make a kill between the writes restore a scale/RNG belonging to a checkpoint that was
+        // never finished.
+        for (name, src) in [
+            ("rvc", include_str!("../../../training/utai_train/rvc/train.py")),
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            let last_save = src
+                .rfind("utils.save_checkpoint(net_d")
+                .unwrap_or_else(|| panic!("{name}/train.py lost its D-side save"));
+            let sidecar = src
+                .find("resume_state.write(")
+                .unwrap_or_else(|| panic!("{name}/train.py never writes the resume-state sidecar"));
+            assert!(
+                last_save < sidecar,
+                "{name}/train.py writes the resume-state sidecar BEFORE the pair it describes"
+            );
+            assert!(
+                src.contains("resume_state.restore("),
+                "{name}/train.py writes the sidecar but never restores from it"
             );
         }
     }
