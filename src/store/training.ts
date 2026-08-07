@@ -268,6 +268,12 @@ export interface WorkspaceInfo {
   has_main_progress: boolean;
   /** max diffusion checkpoint step; 0 = none/base only */
   diff_steps: number;
+  /**
+   * ★S117 §F2⒜: step of the resumable BEST snapshot (`resume_best/`), or null when this slot
+   * has none / it is half-written. Gates the「从最佳存档继续」button — offering it without a
+   * complete snapshot would be a button that silently continues from the latest instead.
+   */
+  best_resume_step: number | null;
   /** manifest 数据增强份数 (S41) — what a diff run will inherit */
   aug_copies: number;
   /** a reusable shared slice pool exists — diff may start without importing */
@@ -677,7 +683,12 @@ interface TrainingStoreState {
   refreshProjectCkpts: (projectId: string, backend: string) => Promise<void>;
   /** `wipeConfirmed` = the user answered a destructive「重训」dialog for THIS run. The backend
    *  refuses a `fresh` start that would destroy checkpoints / an imported dataset without it. */
-  start: (fresh: boolean, wipeConfirmed: boolean) => Promise<void>;
+  /**
+   * ★S117 §F2⒜ `resumeFrom`: "latest" (default = every previous release) or "best" — WHICH
+   * archive a 续训 continues from. Ignored on a fresh run. The trainer falls back to the latest
+   * LOUDLY if "best" is asked for and no complete snapshot exists.
+   */
+  start: (fresh: boolean, wipeConfirmed: boolean, resumeFrom?: "latest" | "best") => Promise<void>;
   stop: () => Promise<void>;
   forceStop: () => Promise<void>;
   /** Clear the finished run's display state (snapshot + curve) back to idle.
@@ -841,7 +852,7 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
     }
   },
 
-  start: async (fresh, wipeConfirmed) => {
+  start: async (fresh, wipeConfirmed, resumeFrom) => {
     // S64 release gating (the S43 decision): no REAL training interpreter (dev venv / runtime pack /
     // manual slot) → the spawn is doomed on an end-user machine; offer the runtime download instead.
     // Dev machines always resolve training/.venv, so this only ever fires on packaged installs.
@@ -966,6 +977,10 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         spk_id: 0,
         fresh,
         wipe_confirmed: wipeConfirmed,
+        // ⚠ empty string, not omitted: the Rust field is `#[serde(default)] String` and the
+        // request builder normalizes "" -> "latest", so an old payload and a fresh run behave
+        // exactly as they did before this existed.
+        resume_from: fresh ? "" : (resumeFrom ?? "latest"),
       };
       const request =
         config.backend === "rvc"

@@ -161,6 +161,45 @@ class DivergenceGuard:
         )
 
 
+def optimizer_state_is_safe(optimizers, logger=None):
+    """Every Adam moment across `optimizers` is finite. `optimizers` = ``(tag, optimizer)`` pairs.
+
+    ⚠ THIS IS NOT COVERED BY ``best_save_is_safe``, and the gap is reachable without a single nan
+    ever appearing in the weights or the losses. Measured (S117, on RVC's real hyper-parameters
+    lr=1e-4 / betas=[0.8, 0.99] / eps=1e-9):
+
+    * the three GAN trainers pass ``clip_value=None``, so `clip_grad_value_` clips nothing — it
+      only computes a norm and throws it away — and `GradScaler.step` skips a step on
+      ``found_inf``, which tests FINITENESS, never magnitude;
+    * a huge but FINITE gradient therefore reaches the optimizer. It does *not* blow the weights
+      up — AdamW's normalisation keeps that step at ~lr — but it poisons ``exp_avg_sq``, which
+      decays only as ``beta2**k``: after one 1e12 gradient the affected parameter moved **2.3% of
+      the control arm's distance over the next 200 steps**;
+    * above ``sqrt(fp32_max / (1 - beta2)) ≈ 1.8e20`` the square overflows to ``inf``,
+      ``denom`` becomes ``inf``, ``addcdiv_`` adds exactly zero, and ``inf * beta2 + …`` stays
+      ``inf``. That parameter **never learns again** — permanently, silently, with finite weights,
+      finite losses, and nothing in any log.
+
+    So a checkpoint can carry a dead optimizer while every weight is finite. That matters most
+    exactly where this is called: a checkpoint offered as "the good one to go back to" must not
+    be one whose momenta are already inf.
+    """
+    for tag, optim in optimizers:
+        for group in optim.state.values():
+            bad = first_nonfinite_tensor(group.items())
+            if bad is not None:
+                if logger is not None:
+                    logger.error(
+                        "REFUSING to write a resumable checkpoint: %s's optimizer state is "
+                        "non-finite (first: %s). Resuming from it would carry a parameter that "
+                        "can never learn again.",
+                        tag,
+                        bad,
+                    )
+                return False
+    return True
+
+
 def best_save_is_safe(state_dict, logger=None):
     """Last line of defence for ``save_best`` -- see defect (b) in the module doc.
 

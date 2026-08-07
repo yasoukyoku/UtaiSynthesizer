@@ -2050,6 +2050,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     // which refuses an unconfirmed wipe of a workspace that holds work.
     let fresh = true;
     let wipeConfirmed = false;
+    let resumeFrom: "latest" | "best" = "latest";
     let modelExists = false;
     try {
       modelExists = await invoke<boolean>("check_model_exists", {
@@ -2111,6 +2112,14 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       // them re-decide against a primary-styled 续训 that may now be refused. Both options stay:
       // this dialog is the authoritative wipe consent, and changing one's mind must be possible.
       const wantsRetrain = useTrainingStore.getState().retrainIntent;
+      // ★S117 §F2⒜ — offered ONLY when the slot really holds a complete resumable best snapshot
+      // (`resume_best/` with its completion marker). A button that silently continues from the
+      // latest instead would be the same class of lie as the one this feature exists to remove:
+      // until now the best point was an inference-only export, i.e. a dead end.
+      const bestResume =
+        info.best_resume_step != null
+          ? [{ id: "resumeBest", label: t("training.resumeFromBest", { step: info.best_resume_step }) }]
+          : [];
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
         body: t("training.confirmExistBody", { name }) + diffWarn,
@@ -2118,17 +2127,20 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
           ? [
               { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
               { id: "resume", label: t("training.resume") },
+              ...bestResume,
               { id: "cancel", label: t("training.cancel") },
             ]
           : [
               { id: "resume", label: t("training.resume"), kind: "primary" as const },
+              ...bestResume,
               { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
               { id: "cancel", label: t("training.cancel") },
             ],
       });
-      if (choice !== "resume" && choice !== "retrain") return;
+      if (choice !== "resume" && choice !== "retrain" && choice !== "resumeBest") return;
       fresh = choice === "retrain";
       wipeConfirmed = fresh;
+      if (choice === "resumeBest") resumeFrom = "best";
       // (The old `else if (wsExists)` branch — "the slot exists but its facts are unreadable" —
       // is gone with the fail-open probe that produced it. `get_training_slot_info` either
       // answers or the start is refused above; an unreadable MANIFEST still lands in the branch
@@ -2165,7 +2177,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       // (the backend guard is a no-op when the workspace holds nothing).
       fresh = true;
     }
-    await start(fresh, wipeConfirmed).catch(() => undefined);
+    await start(fresh, wipeConfirmed, resumeFrom).catch(() => undefined);
   };
 
   const onStop = async () => {

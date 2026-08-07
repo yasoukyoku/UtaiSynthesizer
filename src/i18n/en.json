@@ -472,6 +472,7 @@
     "noWorkspaceBody": "A model named \"{{name}}\" already exists but there is no resumable training workspace — training starts from scratch; importing under the same name afterwards replaces the existing model.",
     "confirmExistBody": "\"{{name}}\" already exists. Resume continues from the last checkpoint; Retrain wipes the workspace and starts over.",
     "resume": "Resume",
+    "resumeFromBest": "Continue from the best checkpoint (step {{step}})",
     "retrain": "Retrain",
     "needData": "Import training data first",
     "needName": "Enter a model name first",

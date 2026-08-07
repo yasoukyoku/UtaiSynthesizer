@@ -112,7 +112,7 @@ def export_release(state_dict, path, epoch, learning_rate):
     return path
 
 
-def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
+def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer, prefer=None):
     """Decide what this workspace is, load it, and return `(epoch_str, global_step)`.
 
     ⛔ MODULE-LEVEL SO IT CAN BE PINNED — same reason as the 4.x trainer's twin: the defect this
@@ -128,23 +128,37 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
     plan = ckpt_guard.plan_load(model_dir, seeded_base_is_step_zero=True)
     if plan == ckpt_guard.LOAD_RESUME:
         is_resume = not skip_optimizer
+        # ★S117 §F2⒜ — which pair (latest, or the resumable best snapshot).
+        g_ckpt, d_ckpt, best_blob, source = resume_state.choose_pair(
+            model_dir,  # `hps.model_dir = exp_dir` for this trainer — the same directory
+            prefer or resume_state.PREFER_LATEST,
+            lambda pattern: utils.latest_checkpoint_path(model_dir, pattern),
+        )
+        if prefer == resume_state.PREFER_BEST and source != resume_state.PREFER_BEST:
+            logger.warning("asked to continue from the BEST snapshot, but there is no complete "
+                           "one — continuing from the latest checkpoint instead")
+        logger.info("resuming from the %s checkpoint: %s", source, os.path.basename(g_ckpt))
         try:
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g,
-                                                       optim_g, skip_optimizer, resume=is_resume)
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d,
-                                                       optim_d, skip_optimizer, resume=is_resume)
+            _, _, _, epoch_str = utils.load_checkpoint(g_ckpt, net_g, optim_g, skip_optimizer, resume=is_resume)
+            _, _, _, epoch_str = utils.load_checkpoint(d_ckpt, net_d, optim_d, skip_optimizer, resume=is_resume)
             epoch_str = max(epoch_str, 1)
-            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
-            parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
-            # a real save at step N (pre-increment) resumes at N+1 (header). The `parsed == 0`
-            # arm is kept verbatim from before the extraction even though `plan_load` makes it
-            # unreachable here — the ordering argument that makes it unreachable depends on
-            # `latest_checkpoint_path` concatenating the digits of the WHOLE PATH, which is not
-            # a property worth betting a silent step-0 overwrite on.
-            global_step = 0 if parsed == 0 else parsed + 1
-            sidecar = resume_state.load_for(
-                epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
-            )
+            if best_blob is not None:
+                # `resume_best/D.pth` carries no step in its name — the snapshot's own record is
+                # the only source (same contract as a `D_<n>.pth`: N executed ⇒ resume at N+1).
+                global_step = int(best_blob.get("global_step", 0)) + 1
+                sidecar = best_blob
+            else:
+                ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+                parsed = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")])
+                # a real save at step N (pre-increment) resumes at N+1 (header). The `parsed == 0`
+                # arm is kept verbatim from before the extraction even though `plan_load` makes it
+                # unreachable here — the ordering argument that makes it unreachable depends on
+                # `latest_checkpoint_path` concatenating the digits of the WHOLE PATH, which is not
+                # a property worth betting a silent step-0 overwrite on.
+                global_step = 0 if parsed == 0 else parsed + 1
+                sidecar = resume_state.load_for(
+                    epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
+                )
         except ckpt_guard.ResumeRefused:
             raise  # already carries its stable CODE
         except Exception as e:
@@ -219,7 +233,8 @@ def train(cfg, exp_dir, reporter, stop):
     # skip_optimizer: gate knob mirroring upstream cpurun (see header)
     skip_optimizer = bool(cfg.get("skip_optimizer", False))
     epoch_str, global_step, resumed = load_start_state(
-        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
+        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer,
+        prefer=cfg.get("resume_from", resume_state.PREFER_LATEST),
     )
     # ★S117 §F2⒜ — v2 is pure fp32 (no GradScaler anywhere, header line 14), so `scaler=None`
     # here is the truth, not an omission: what a v2 resume was missing is the RNG streams and any
@@ -273,6 +288,19 @@ def train(cfg, exp_dir, reporter, stop):
         if not numerics.best_save_is_safe(state, logger):
             return False
         export_release(state, best_path, epoch, hps.train.learning_rate)
+        # ★S117 §F2⒜ — a RESUMABLE snapshot beside the inference-only export (see resume_state).
+        # ⚠ v2 has no GradScaler (pure fp32), so it has NO found_inf backstop either: a nan
+        # gradient here goes straight into the momenta. The optimizer check is if anything more
+        # load-bearing on this trainer than on the other two.
+        if numerics.optimizer_state_is_safe((("G", optim_g), ("D", optim_d)), logger):
+            resume_state.save_best_pair(
+                exp_dir, utils.save_checkpoint, (net_g, net_d), (optim_g, optim_d),
+                hps.train.learning_rate, epoch=epoch, metric=metric,
+                blob=resume_state.capture(
+                    None, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                    dataset_items=len(train_loader.dataset), loader_len=len(train_loader),
+                ),
+            )
         with open(best_state_path, "w", encoding="utf-8") as f:
             json.dump({"metric": metric, "step": step}, f)
         reporter.ckpt("best", best_path, step, epoch, metric=metric)

@@ -378,6 +378,14 @@ pub struct StartTrainingRequest {
     /// how many G_/D_ checkpoints to keep (upstream keep_ckpts; *_0.pth exempt)
     #[serde(default = "d_keep_ckpts")]
     pub keep_ckpts: u32,
+    /// ★S117 §F2⒜ — which archive a 续训 continues from: "latest" (default, = every previous
+    /// release) or "best" (the resumable snapshot written next to `weights/<name>_best.pth`).
+    ///
+    /// ⚠ Deliberately NOT in `resume_lock`'s table: that table is about values baked into
+    /// artifacts that already exist, and this one chooses WHICH artifact to read. It changes
+    /// nothing about what the slot is allowed to contain.
+    #[serde(default)]
+    pub resume_from: String,
     /// cache the whole dataset in RAM (upstream all_in_mem)
     #[serde(default)]
     pub all_in_mem: bool,
@@ -593,6 +601,10 @@ pub struct WorkspaceInfo {
     pub has_main_progress: bool,
     /// max numbered diffusion checkpoint step (model_<n>.pt); 0 = none/base only
     pub diff_steps: u64,
+    /// ★S117 §F2⒜ — the step of the resumable BEST snapshot, or None when this slot has none.
+    /// Drives the「从最佳存档继续」option in the resume dialog: offering it when the directory
+    /// is absent or half-written would be a button that silently does something else.
+    pub best_resume_step: Option<u64>,
     /// manifest aug_copies (S41 数据增强份数) — diff runs inherit it from the
     /// main training; surfaced so the diff params page shows the real value
     pub aug_copies: u64,
@@ -689,6 +701,7 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         sample_rate: field("sample_rate"),
         has_main_progress: has_main_progress(&ws),
         diff_steps: max_diffusion_step(&ws).unwrap_or(0),
+        best_resume_step: best_resume_step(&ws),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
@@ -781,6 +794,22 @@ pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<d
             dsmanifest::DsSpeaker { slug, name }
         })
         .collect()
+}
+
+/// ★S117 §F2⒜ — the step of the COMPLETE resumable best snapshot, or None.
+///
+/// The three files are written G → D → `state.json`, so `state.json` is the completion marker;
+/// requiring all three means a kill mid-write reads as "there is no best snapshot" instead of
+/// offering a half-written pair as a resume point. Mirrors `utai_train/resume_state.read_best`.
+/// ⚠ Keep the two in step — python owns the layout, this only reads it.
+fn best_resume_step(workspace: &Path) -> Option<u64> {
+    let d = workspace.join("resume_best");
+    if !d.join("G.pth").is_file() || !d.join("D.pth").is_file() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(d.join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v["global_step"].as_u64()
 }
 
 fn has_main_progress(workspace: &Path) -> bool {
@@ -2344,6 +2373,11 @@ fn run_worker(
         "kmeans": req.kmeans,
         "save_every_steps": req.save_every_steps,
         "keep_ckpts": req.keep_ckpts,
+        // ★S117 §F2⒜ — WHICH archive a 续训 continues from. Absent / "latest" is exactly the
+        // historical behaviour, so an old front-end and every non-resume path are unaffected.
+        // The trainers fall back to the latest LOUDLY when "best" is asked for and no complete
+        // snapshot exists (utai_train/resume_state.choose_pair).
+        "resume_from": if req.resume_from.trim().is_empty() { "latest" } else { req.resume_from.trim() },
         "all_in_mem": req.all_in_mem,
         // sovits_diff-only knobs (ignored by the other pipelines)
         "total_steps": req.total_steps,
@@ -2795,6 +2829,40 @@ mod tests {
                  train() no test can drive it, which is exactly how the S117 regression shipped"
             );
         }
+    }
+
+    /// ★S117 §F2⒜ — the「从最佳存档继续」button is gated on a COMPLETE snapshot.
+    ///
+    /// Python writes G → D → `state.json`, so the marker is written last. If this side accepted
+    /// anything less, a kill mid-write would put a button on the screen that continues from the
+    /// latest checkpoint instead — silently doing something other than what it says, which is
+    /// the exact defect §F2⒜ exists to remove (the best point used to be an inference-only
+    /// export, i.e. a dead end that nothing said was a dead end).
+    #[test]
+    fn s117_the_best_resume_option_needs_all_three_files() {
+        let root = std::env::temp_dir().join(format!("utai_s117_best_{}", std::process::id()));
+        let d = root.join("resume_best");
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(best_resume_step(&root), None, "empty directory is not a snapshot");
+
+        std::fs::write(d.join("G.pth"), b"g").unwrap();
+        assert_eq!(best_resume_step(&root), None, "G alone is not a resumable pair");
+        std::fs::write(d.join("D.pth"), b"d").unwrap();
+        assert_eq!(
+            best_resume_step(&root),
+            None,
+            "the pair without the completion marker may be half-written — must not be offered"
+        );
+        std::fs::write(d.join("state.json"), br#"{"schema":1,"global_step":1400}"#).unwrap();
+        assert_eq!(best_resume_step(&root), Some(1400));
+
+        // A marker we cannot parse is not a licence to guess a step.
+        std::fs::write(d.join("state.json"), b"{ not json").unwrap();
+        assert_eq!(best_resume_step(&root), None);
+        // …and one that parses but has no step is not "step 0".
+        std::fs::write(d.join("state.json"), br#"{"schema":1}"#).unwrap();
+        assert_eq!(best_resume_step(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// ★S117 §F2⒜ — the resume-state sidecar's wiring, across four languages.

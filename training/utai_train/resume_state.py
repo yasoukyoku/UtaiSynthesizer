@@ -225,6 +225,84 @@ def capture(scaler=None, *, epoch, global_step, exp_dir=None, dataset_items=None
     return blob
 
 
+def best_dir(exp_dir):
+    return os.path.join(exp_dir, BEST_DIR)
+
+
+def save_best_pair(exp_dir, save_checkpoint, nets, optims, learning_rate, *, epoch, metric, blob):
+    """Write the resumable snapshot OF THE BEST POINT. Returns the directory, or None if refused.
+
+    `save_checkpoint` is the trainer's own vendored function, passed in rather than imported: the
+    three copies differ (argument order, sovits' `clean_checkpoints` tail) and this module must
+    not become a fourth opinion about how a checkpoint is written.
+
+    WHY THIS EXISTS. `weights/<name>_best.pth` is an inference-only export — the generator alone,
+    no discriminator, no optimizer. `tproject.rs` already says the same thing about the diffusion
+    twin: "a BEST SNAPSHOT, never a resume point … offering it would rewind thousands of steps
+    AND zero the AdamW momentum". So when a run degrades past its best, the user's only resume
+    point is the LATEST one — which is the degraded state. The best was a dead end.
+
+    ⛔ ORDER: G, then D, then `state.json` LAST. `state.json`'s presence is the completion marker;
+    a kill anywhere earlier leaves a directory that `read_best` reports as absent rather than as
+    a half-written pair.
+
+    ⛔ NOT in `model_dir`, and the reason is five separate consumers — see BEST_DIR.
+    """
+    d = best_dir(exp_dir)
+    os.makedirs(d, exist_ok=True)
+    state_path = os.path.join(d, BEST_STATE)
+    # Remove the marker FIRST: while the pair is being rewritten the old marker would describe a
+    # pair that no longer exists.
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+    (net_g, net_d), (optim_g, optim_d) = nets, optims
+    save_checkpoint(net_g, optim_g, learning_rate, epoch, os.path.join(d, BEST_G))
+    save_checkpoint(net_d, optim_d, learning_rate, epoch, os.path.join(d, BEST_D))
+    out = dict(blob)
+    out["best_metric"] = float(metric)
+    write(state_path, out)
+    return d
+
+
+#: `cfg["resume_from"]` — which archive a 续训 continues from. Default is the historical behaviour.
+PREFER_LATEST = "latest"
+PREFER_BEST = "best"
+
+
+def choose_pair(exp_dir, prefer, latest):
+    """Which (G, D) a resume should read. Returns `(g_path, d_path, best_blob, source)`.
+
+    `latest(pattern)` is the trainer's OWN `latest_checkpoint_path` already bound to its model
+    dir — the three copies sort differently (rvc by `(mtime, digits)`, the so-vits pair by the
+    digits of the whole path) and this module must not become a fourth opinion about "latest".
+
+    `best_blob` is non-None only when the best snapshot was chosen; it carries the step number,
+    which is the ONE thing a `resume_best/G.pth` cannot state the way a `G_<n>.pth` does.
+
+    ⚠ Falling back is loud, never silent: asking for the best point and quietly getting the
+    latest one is the exact shape of failure this whole feature exists to remove.
+    """
+    if prefer == PREFER_BEST:
+        blob = read_best(exp_dir)
+        if blob is not None:
+            d = best_dir(exp_dir)
+            return os.path.join(d, BEST_G), os.path.join(d, BEST_D), blob, PREFER_BEST
+    return latest("G_*.pth"), latest("D_*.pth"), None, PREFER_LATEST
+
+
+def read_best(exp_dir):
+    """The best snapshot's state, or None when there is not a complete one."""
+    d = best_dir(exp_dir)
+    blob = read(os.path.join(d, BEST_STATE))
+    if blob is None:
+        return None
+    if not (os.path.isfile(os.path.join(d, BEST_G)) and os.path.isfile(os.path.join(d, BEST_D))):
+        return None
+    return blob
+
+
 def write(path, blob):
     """Atomic write. Callers MUST write this AFTER both halves of the pair — its presence is what
     says the pair beside it is complete."""

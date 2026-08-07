@@ -472,6 +472,7 @@
     "modelVersionMismatchBody": "已存在同名模型「{{name}}」（{{old}}），且没有可续训的工作区。当前选择 {{new}}，将从头开始训练；训练完成后以同名导入会替换原模型。",
     "noWorkspaceBody": "已存在同名模型「{{name}}」，但没有可续训的训练工作区——将从头开始训练；训练完成后以同名导入会替换原模型。",
     "resume": "续训",
+    "resumeFromBest": "从最佳存档继续（第 {{step}} 步）",
     "retrain": "重训",
     "needData": "请先导入训练数据",
     "needName": "请先填写模型名称",

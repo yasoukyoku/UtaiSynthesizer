@@ -211,6 +211,108 @@ rep_none = RS.restore(None, device_shim.make_scaler("cpu", False))
 check("R19b restore(None) 是无害的空操作", rep_none.scaler is None and rep_none.rng == {})
 
 print()
+print("=== ★R20-R28: 可续训的 best 存档(§F2⒜ 的正题)===")
+from utai_train import numerics  # noqa: E402
+from utai_train.sovits import train as SOVITS  # noqa: E402
+from utai_train.sovits import utils as SOVITS_UTILS  # noqa: E402
+
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Linear(8, 8)
+        self.emb_g = nn.Embedding(4, 8)
+
+
+ws = tempfile.mkdtemp(prefix="s117_best_")
+torch.manual_seed(21)
+bg, bd = Tiny(), Tiny()
+bog = torch.optim.AdamW(bg.parameters(), 1e-4)
+bod = torch.optim.AdamW(bd.parameters(), 1e-4)
+for net, opt in ((bg, bog), (bd, bod)):     # 让 AdamW 真的建出动量
+    sum(p.float().pow(2).sum() for p in net.parameters()).backward()
+    opt.step(); opt.zero_grad(set_to_none=False)
+
+blob_best = RS.capture(None, epoch=7, global_step=1400, exp_dir=ws, dataset_items=10, loader_len=5)
+out = RS.save_best_pair(ws, SOVITS_UTILS.save_checkpoint, (bg, bd), (bog, bod), 1e-4,
+                        epoch=7, metric=12.5, blob=blob_best)
+check("R20 三个文件都写出来了", all(os.path.isfile(os.path.join(out, n))
+                                   for n in (RS.BEST_G, RS.BEST_D, RS.BEST_STATE)))
+import glob as _glob  # noqa: E402
+
+check("★R21 它【不在】model_dir 的 G_*/D_* 平面上(五个消费点都在那一层:"
+      "sovits 从 D 文件名 parse step · clean_checkpoints · 两个 latest_checkpoint_path · resume_was_intended)",
+      not _glob.glob(os.path.join(ws, "G_*.pth")) and not _glob.glob(os.path.join(ws, "D_*.pth")))
+check("R22 state.json 记下了 metric/epoch/step", (lambda b: b["best_metric"] == 12.5
+      and b["epoch"] == 7 and b["global_step"] == 1400)(RS.read_best(ws)))
+os.remove(os.path.join(out, RS.BEST_STATE))
+check("★R23 少了完成标记就当作【没有】,而不是半份",
+      RS.read_best(ws) is None)
+RS.write(os.path.join(out, RS.BEST_STATE), dict(blob_best, best_metric=12.5))
+os.remove(os.path.join(out, RS.BEST_D))
+check("★R23b 有标记但少了 D 也当作【没有】(GAN 只能从一对续)", RS.read_best(ws) is None)
+
+print()
+print("--- choose_pair ---")
+mdir = tempfile.mkdtemp(prefix="s117_choose_")
+torch.manual_seed(3)
+latest_net = Tiny()
+lo = torch.optim.AdamW(latest_net.parameters(), 1e-4)
+for n in ("G_800", "D_800"):
+    SOVITS_UTILS.save_checkpoint(latest_net, lo, 1e-4, 5, os.path.join(mdir, "%s.pth" % n))
+RS.save_best_pair(mdir, SOVITS_UTILS.save_checkpoint, (bg, bd), (bog, bod), 1e-4,
+                  epoch=7, metric=12.5, blob=blob_best)
+lf = lambda pat: SOVITS_UTILS.latest_checkpoint_path(mdir, pat)  # noqa: E731
+g1, d1, b1, s1 = RS.choose_pair(mdir, RS.PREFER_LATEST, lf)
+check("R24 默认取最新那一对,且不带 best 的 blob",
+      s1 == RS.PREFER_LATEST and b1 is None and g1.endswith("G_800.pth"))
+g2, d2, b2, s2 = RS.choose_pair(mdir, RS.PREFER_BEST, lf)
+check("★R25 要 best 就给 best,并把它的 step 一起给出来",
+      s2 == RS.PREFER_BEST and b2 is not None and b2["global_step"] == 1400
+      and g2.endswith(RS.BEST_G) and d2.endswith(RS.BEST_D))
+empty2 = tempfile.mkdtemp(prefix="s117_nobest_")
+for n in ("G_800", "D_800"):
+    SOVITS_UTILS.save_checkpoint(latest_net, lo, 1e-4, 5, os.path.join(empty2, "%s.pth" % n))
+g3, d3, b3, s3 = RS.choose_pair(empty2, RS.PREFER_BEST,
+                                lambda pat: SOVITS_UTILS.latest_checkpoint_path(empty2, pat))
+check("★R26 要 best 但没有 ⇒ 退回最新,并且**把 source 如实报成 latest**(调用方据此发警告)",
+      s3 == RS.PREFER_LATEST and b3 is None)
+
+print()
+print("--- 端到端:从 best 续训 ---")
+g5, d5 = Tiny(), Tiny()
+og5, od5 = torch.optim.AdamW(g5.parameters(), 1e-4), torch.optim.AdamW(d5.parameters(), 1e-4)
+ep, gs, side = SOVITS.load_start_state(mdir, g5, d5, og5, od5, False, prefer=RS.PREFER_BEST)
+check("★★R27 prefer=best:权重来自 best 那一对,step 用它自己记的 1400+1",
+      gs == 1401 and abs(float(g5.a.weight.abs().sum()) - float(bg.a.weight.abs().sum())) < 1e-6,
+      "step=%s" % gs)
+g6, d6 = Tiny(), Tiny()
+og6, od6 = torch.optim.AdamW(g6.parameters(), 1e-4), torch.optim.AdamW(d6.parameters(), 1e-4)
+ep6, gs6, _ = SOVITS.load_start_state(mdir, g6, d6, og6, od6, False, prefer=RS.PREFER_LATEST)
+check("★R28 prefer=latest(默认)行为不变:走 G_800/D_800,step=801",
+      gs6 == 801 and abs(float(g6.a.weight.abs().sum()) - float(latest_net.a.weight.abs().sum())) < 1e-6,
+      "step=%s" % gs6)
+
+print()
+print("--- optimizer_state_is_safe(实测机制,不是手戳一个 inf 进去)---")
+torch.manual_seed(11)
+hn = Tiny()
+ho = torch.optim.AdamW(hn.parameters(), 1e-4, betas=[0.8, 0.99], eps=1e-9)
+for _ in range(5):
+    for p in hn.parameters():
+        p.grad = torch.full_like(p, 0.05)
+    ho.step(); ho.zero_grad(set_to_none=False)
+check("R29 健康的动量:通过", numerics.optimizer_state_is_safe((("G", ho),)))
+weights_before = float(hn.a.weight.detach().abs().sum())
+for p in hn.parameters():                    # 一个「巨大但有限」的梯度,阈值以上
+    p.grad = torch.full_like(p, 1e21)
+ho.step(); ho.zero_grad(set_to_none=False)
+check("★R30 一个 1e21 的【有限】梯度之后:权重仍然全部有限……",
+      numerics.best_save_is_safe(hn.state_dict()))
+check("★★R31 ……但动量已经是 inf,而 best_save_is_safe 看不见它",
+      not numerics.optimizer_state_is_safe((("G", ho),)))
+
+print()
 print(f"gate_resume_state: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

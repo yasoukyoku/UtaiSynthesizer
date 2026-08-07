@@ -106,7 +106,7 @@ def export_release(state_dict, path, epoch, learning_rate):
     return path
 
 
-def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
+def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer, prefer=None):
     """Decide what this workspace is, load it, and return `(epoch_str, global_step, resumed)`.
 
     `resumed` is the `resume_state` sidecar when this really was a resume and the sidecar belongs
@@ -131,17 +131,32 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer):
         # S116 §F5-③ⓒ: upstream's `except Exception: starting from scratch` turns a truncated or
         # incomplete checkpoint into a silent restart, and because the two loads mutate as they
         # go, "G loaded, D threw" left net_g and optim_g resumed while epoch/step reset to 1/0.
+        # ★S117 §F2⒜ — which pair (latest, or the resumable best snapshot).
+        g_ckpt, d_ckpt, best_blob, source = resume_state.choose_pair(
+            model_dir,  # `hps.model_dir = exp_dir` for this trainer — the same directory
+            prefer or resume_state.PREFER_LATEST,
+            lambda pattern: utils.latest_checkpoint_path(model_dir, pattern),
+        )
+        if prefer == resume_state.PREFER_BEST and source != resume_state.PREFER_BEST:
+            logger.warning("asked to continue from the BEST snapshot, but there is no complete "
+                           "one — continuing from the latest checkpoint instead")
+        logger.info("resuming from the %s checkpoint: %s", source, os.path.basename(g_ckpt))
         try:
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "G_*.pth"), net_g,
-                                                       optim_g, skip_optimizer, resume=True)
-            _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(model_dir, "D_*.pth"), net_d,
-                                                       optim_d, skip_optimizer, resume=True)
+            _, _, _, epoch_str = utils.load_checkpoint(g_ckpt, net_g, optim_g, skip_optimizer, resume=True)
+            _, _, _, epoch_str = utils.load_checkpoint(d_ckpt, net_d, optim_d, skip_optimizer, resume=True)
             epoch_str = max(epoch_str, 1)
-            ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
-            step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
-            sidecar = resume_state.load_for(
-                epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
-            )
+            if best_blob is not None:
+                # `resume_best/D.pth` carries no step in its name — the snapshot's own record is
+                # the only source, and it is the step that was already EXECUTED, so +1 keeps the
+                # same numbering contract as a `D_<n>.pth`.
+                step = int(best_blob.get("global_step", 0)) + 1
+                sidecar = best_blob
+            else:
+                ckpt_name = utils.latest_checkpoint_path(model_dir, "D_*.pth")
+                step = int(ckpt_name[ckpt_name.rfind("_") + 1:ckpt_name.rfind(".")]) + 1
+                sidecar = resume_state.load_for(
+                    epoch_str, os.path.join(model_dir, resume_state.LATEST_NAME), logger
+                )
             return epoch_str, step, sidecar
         except ckpt_guard.ResumeRefused:
             raise  # already carries its stable CODE
@@ -258,7 +273,8 @@ def train(cfg, exp_dir, reporter, stop):
 
     skip_optimizer = False
     epoch_str, global_step, resumed = load_start_state(
-        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer
+        hps.model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer,
+        prefer=cfg.get("resume_from", resume_state.PREFER_LATEST),
     )
     if skip_optimizer:
         epoch_str = 1
@@ -316,6 +332,16 @@ def train(cfg, exp_dir, reporter, stop):
         if not numerics.best_save_is_safe(state, logger):
             return False
         export_release(state, best_path, epoch, hps.train.learning_rate)
+        # ★S117 §F2⒜ — a RESUMABLE snapshot beside the inference-only export (see resume_state).
+        if numerics.optimizer_state_is_safe((("G", optim_g), ("D", optim_d)), logger):
+            resume_state.save_best_pair(
+                exp_dir, utils.save_checkpoint, (net_g, net_d), (optim_g, optim_d),
+                hps.train.learning_rate, epoch=epoch, metric=metric,
+                blob=resume_state.capture(
+                    scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                    dataset_items=len(train_dataset), loader_len=len(train_loader),
+                ),
+            )
         with open(best_state_path, "w", encoding="utf-8") as f:
             json.dump({"metric": metric, "step": step}, f)
         reporter.ckpt("best", best_path, step, epoch, metric=metric)

@@ -226,14 +226,26 @@ def train(cfg, exp_dir, reporter, stop):
     # exactly one home; S117's regression happened because it had two.
     is_resume = ckpt_guard.plan_load(hps.model_dir) == ckpt_guard.LOAD_RESUME
     if is_resume:
+        # ★S117 §F2⒜ — WHICH pair, decided once. The step arithmetic below is untouched by the
+        # choice: RVC derives `global_step` from the epoch the checkpoint itself carries, so the
+        # best snapshot needs no special case here (the two so-vits trainers parse the step out
+        # of the FILE NAME, so they do — see their `load_start_state`).
+        g_ckpt, d_ckpt, best_blob, source = resume_state.choose_pair(
+            exp_dir,
+            cfg.get("resume_from", resume_state.PREFER_LATEST),
+            lambda pattern: utils.latest_checkpoint_path(hps.model_dir, pattern),
+        )
+        if cfg.get("resume_from") == resume_state.PREFER_BEST and source != resume_state.PREFER_BEST:
+            logger.warning(
+                "asked to continue from the BEST snapshot, but %s holds no complete one — "
+                "continuing from the latest checkpoint instead",
+                resume_state.best_dir(exp_dir),
+            )
+        logger.info("resuming from the %s checkpoint: %s", source, os.path.basename(g_ckpt))
         try:
-            _, _, _, epoch_str = utils.load_checkpoint(
-                utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d, resume=True
-            )
+            _, _, _, epoch_str = utils.load_checkpoint(d_ckpt, net_d, optim_d, resume=True)
             logger.info("loaded D")
-            _, _, _, epoch_str = utils.load_checkpoint(
-                utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g, resume=True
-            )
+            _, _, _, epoch_str = utils.load_checkpoint(g_ckpt, net_g, optim_g, resume=True)
         except ckpt_guard.ResumeRefused:
             raise  # already carries its stable CODE
         except Exception as e:
@@ -242,7 +254,7 @@ def train(cfg, exp_dir, reporter, stop):
         # from its beginning (upstream semantics), so the counter must be the step at the START
         # of that epoch. The sidecar records the save-time step for DIAGNOSIS only.
         global_step = (epoch_str - 1) * len(train_loader)
-        resumed = resume_state.load_for(
+        resumed = best_blob if best_blob is not None else resume_state.load_for(
             epoch_str, os.path.join(hps.model_dir, resume_state.LATEST_NAME), logger
         )
     else:  # 首次训练：加载pretrain
@@ -319,6 +331,19 @@ def train(cfg, exp_dir, reporter, stop):
         if not numerics.best_save_is_safe(net_g.state_dict(), logger):
             return False
         save_small("%s_best" % hps.name, epoch)
+        # ★S117 §F2⒜ — and a RESUMABLE snapshot beside it, so "go back to the best point" is a
+        # thing the user can actually do. The extra guard is not decoration: a finite-but-huge
+        # gradient can leave the momenta at inf while every weight is still finite, and such a
+        # checkpoint is worse than useless as a rollback target (numerics.optimizer_state_is_safe).
+        if numerics.optimizer_state_is_safe((("G", optim_g), ("D", optim_d)), logger):
+            resume_state.save_best_pair(
+                exp_dir, utils.save_checkpoint, (net_g, net_d), (optim_g, optim_d),
+                hps.train.learning_rate, epoch=epoch, metric=metric,
+                blob=resume_state.capture(
+                    scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                    dataset_items=len(train_dataset), loader_len=len(train_loader),
+                ),
+            )
         with open(best_state_path, "w", encoding="utf-8") as f:
             json.dump({"metric": metric, "step": step}, f)
         reporter.ckpt("best", best_path, step, epoch, metric=metric)

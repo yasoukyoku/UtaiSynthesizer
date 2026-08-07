@@ -654,6 +654,33 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
             }
         }
 
+        // ── ★S117 §F2⒜: the resumable BEST snapshot ──────────────────────────────────
+        // `resume_best/{G,D}.pth` + `state.json`. It lives in a SUBDIRECTORY on purpose (five
+        // separate consumers walk the slot root looking for `G_*`/`D_*` and every one of them
+        // would mis-handle it there — see `utai_train/resume_state.BEST_DIR`), which is exactly
+        // why it has to be listed HERE explicitly: a scan that only knows the slot root would
+        // leave a gigabyte-scale pair that nothing in the UI can see or reclaim, the failure
+        // this inventory exists to end.
+        //
+        // Reported as `Resumable` rather than `Best`: `Best` means the inference-only release
+        // snapshot under `weights/`, and the snapshot-cleanup copy explicitly promises to keep
+        // 「可续训存档」. Which of the two resumable rows is the best point is answered by the
+        // path (and by the resume picker), not by inventing an eighth kind.
+        {
+            let bd = slot.join("resume_best");
+            let (g, d, st) = (bd.join("G.pth"), bd.join("D.pth"), bd.join("state.json"));
+            // `state.json` is the completion marker python writes LAST — without it the pair
+            // beside it may be half-written, and offering that as a resume point is worse than
+            // not offering it.
+            if st.is_file() && g.is_file() && d.is_file() {
+                let step = std::fs::read_to_string(&st)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v["global_step"].as_u64());
+                push(g, Some(d), CkptKind::Resumable, step);
+            }
+        }
+
         // ── diffusion progress (lives inside the sovits slot) ─────────────────────────
         if let Ok(rd) = std::fs::read_dir(slot.join("diffusion")) {
             for e in rd.flatten() {
