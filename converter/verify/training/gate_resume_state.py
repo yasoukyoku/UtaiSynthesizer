@@ -521,6 +521,23 @@ check("★D17 里程碑与 model_0(底模)永不被删",
       0 in rew and 1400 in rew and 0 in ctl and 1400 in ctl, "%s / %s" % (rew, ctl))
 
 print()
+print("--- ★NaN 的 best metric:写不进去,而且已经在盘上的那份要被修好 ---")
+_SOL = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "training", "utai_train", "sovits", "diffusion", "solver.py"),
+            encoding="utf-8").read()
+check("★D18 写入侧:metric 必须有限才许写 best(json.dump 会写出裸 NaN,load 又收得回来)",
+      "if math.isfinite(test_loss) and numerics.best_save_is_safe(" in _SOL)
+check("★D19 读取侧:已经记进 best_state.json 的 NaN 要被当作【没有】,否则那个工作区永久冻结",
+      "if not math.isfinite(best_metric):" in _SOL)
+# 行为面:json 真的会把 NaN 原样往返,所以上面那两条不是防一个不存在的问题
+_q = os.path.join(tmp, "best_state_nan.json")
+json.dump({"metric": float("nan"), "step": 5}, open(_q, "w", encoding="utf-8"))
+_back = json.load(open(_q, encoding="utf-8"))
+check("★D20 阳性对照:json 的确会把 NaN 原样往返,而 (0.1 < nan) 恒为 False",
+      _back["metric"] != _back["metric"] and not (0.1 < _back["metric"]),
+      "%r" % (_back["metric"],))
+
+print()
 print("--- 那两个 CODE 的形状 ---")
 check("D13 两个 CODE 都是 SCREAMING_SNAKE 且带 TRAINING_ 前缀(它们要当 json 键用)",
       all(c.startswith("TRAINING_") and c.replace("_", "").isupper()

@@ -227,6 +227,18 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
                     prev = json.load(f)
                 best_metric = float(prev['metric'])
                 best_step = int(prev['step'])
+                # ★S118 §F8⒜ — a metric that is not finite has to be treated as ABSENT, and this
+                # is the REPAIR half of the write-side guard below. `json.dump` emits a bare `NaN`
+                # and `json.load` takes it back, so a workspace that recorded one before this fix
+                # would compare `test_loss < nan` — always False — and its best could never be
+                # updated again, in any future run, silently and with a well-formed-looking file.
+                if not math.isfinite(best_metric):
+                    logger.warning(
+                        'best_state.json records a non-finite metric (%r) — that value can never '
+                        'be beaten, so best tracking would stay frozen forever; starting it fresh',
+                        prev.get('metric'),
+                    )
+                    best_metric, best_step = None, None
             except Exception:
                 logger.warning('best_state.json unreadable, starting best tracking fresh')
 
