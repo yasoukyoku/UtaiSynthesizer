@@ -378,7 +378,7 @@ yaml 覆盖 `interval_val=4 / interval_force_save=8 / batch_size=2 /
 amp_dtype=fp16`（★fp16 是硬要求 —— 否则 GradScaler 那一半根本没被跑到）;
 vocoder 指 live 数据根的 `nsf_hifigan\model`（仓内 `data\models\` 仍是炸仓后的空缺）。
 
-**S118 实测读数（2026-08-07,16/16 PASS,四轮共 ~46 s）：**
+**S118 实测读数（2026-08-07,**20/20 PASS**,六轮共 ~60 s）：**
 
 | 轮 | 内容 | 读数 |
 |---|---|---|
@@ -386,6 +386,8 @@ vocoder 指 live 数据根的 `nsf_hifigan\model`（仓内 `data\models\` 仍是
 | 2 | 默认续训→12 | 选中 `latest_snapshot`;日志 `scaler=restored (scale=65536.0)` + `rng[numpy,python,torch_cpu,torch_cuda 全 restored]` + `dataset unchanged` + `items=9 / batches=5`;零警告 |
 | 3 | 从 best 回退→16 | 选中 `best`(step 8),`steps_this_run=8`;★埋进去的被放弃分支存档 `model_10.pt`（不在新分支的验证网格上）**活着** —— 旧的区间写法会在第 12 步的保存时删掉它 |
 | 4 | 落到不带 optimizer 的存档上 | 删掉两个快照 + 把最新那格改回周期保存的形状 ⇒ `warn == ["TRAINING_RESUME_OPTIMIZER_MISSING"]`,训练照常进行,收工后又有完整续训点（下一次不再警告） |
+| 5 | ★§F8⒡ 最新那格是**毒的** | 写一个 nan 的 `model_22.pt`（步号高于第 20 步的健康快照）⇒ 毒的被跳过、退回快照、`warn == ["TRAINING_RESUME_ARCHIVE_POISONED"]`,训练照常跑完。⚠ 第一版把毒写在**与快照同步号**那一格,warns 是空的 —— 而那是**行为比期望更好**:同步号平局归快照,毒的压根没被读 |
+| 6 | 连快照也毒了 | 两个候选都被响亮拒绝 ⇒ `RuntimeError("TRAINING_RESUME_ARCHIVE_POISONED: …")`,而不是拿 nan 接着练 |
 
 ⚠ 复跑注意：脚本会**重建** `TESTING\s118_f8a\smoke_ws`（先 rmtree）,别把东西放在那里面。
 
