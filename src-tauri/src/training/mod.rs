@@ -2737,8 +2737,9 @@ mod tests {
             ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
         ] {
             assert!(
-                src.contains("ckpt_guard.resume_was_intended("),
-                "{name}/train.py stopped deciding up front whether a resume was intended"
+                src.contains("ckpt_guard.plan_load("),
+                "{name}/train.py stopped deciding up front what to load — that decision has ONE \
+                 home (`ckpt_guard.plan_load`) precisely because S117 found it had grown two"
             );
             let re_raise = src
                 .find("except ckpt_guard.ResumeRefused:")
@@ -2755,6 +2756,29 @@ mod tests {
                 "{name}/train.py: the catch-all is ordered BEFORE the ResumeRefused arm, so python \
                  matches it first and the refusal is swallowed — a corrupt resume would silently \
                  restart from the base model at step 0"
+            );
+        }
+
+        // ★S117 — the other half of the same wiring, and the one that actually shipped broken.
+        // The two so-vits trainers have NO separate pretrain branch: their base model IS the
+        // `G_0.pth`/`D_0.pth` pair in the workspace. `c44dec6` gated their only load site on a
+        // predicate that filters those out, so every FRESH run trained from random init with the
+        // base unread on disk — silently, for two sessions. Behaviour is pinned by
+        // `gate_ckpt_guard.py`'s B block (it drives `load_start_state` and asserts the weights
+        // moved); what THIS gate can add is that the branch has not simply been deleted again.
+        for (name, src) in [
+            ("sovits", include_str!("../../../training/utai_train/sovits/train.py")),
+            ("sovits_v2", include_str!("../../../training/utai_train/sovits_v2/train.py")),
+        ] {
+            assert!(
+                src.contains("ckpt_guard.LOAD_SEEDED_BASE"),
+                "{name}/train.py no longer handles LOAD_SEEDED_BASE — a fresh run would leave its \
+                 base model unread on disk and train from random init, silently (S117)"
+            );
+            assert!(
+                src.contains("def load_start_state("),
+                "{name}/train.py must keep the startup load in a module-level function — inside \
+                 train() no test can drive it, which is exactly how the S117 regression shipped"
             );
         }
     }
