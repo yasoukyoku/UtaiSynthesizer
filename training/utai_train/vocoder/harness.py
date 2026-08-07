@@ -12,13 +12,19 @@ lightning-internal artifacts (model_ckpt_steps_<N>.ckpt names, TB x-axis,
 Trainer max_steps, log_interval) stay in global units verbatim.
 """
 import json
+import logging
 import math
 import os
 
 import lightning.pytorch as pl
 import torch
 
+from .. import numerics
+from .. import resume_state
 from .training.nsf_HiFigan_task import nsf_HiFigan
+from .utils.training_utils import DsModelCheckpoint
+
+logger = logging.getLogger(__name__)
 
 
 class UtaiNsfTask(nsf_HiFigan):
@@ -110,14 +116,57 @@ def save_weights_snapshot(weights_dir, filename, pl_module, pristine_config):
     return path
 
 
+class UtaiDsModelCheckpoint(DsModelCheckpoint):
+    """DsModelCheckpoint + "say WHICH file you just wrote" (★S119 §F8⒝).
+
+    The upstream callback is the only thing that writes the periodic
+    ``model_ckpt_steps_<global>.ckpt`` grid, and until §F8⒝ nothing needed to know which of them
+    is the newest — ``max(step)`` answered that. 「从最佳存档继续」 breaks that equivalence
+    (see :func:`utai_train.resume_state.save_pointer`), so the rolling pointer has to be
+    refreshed by whoever actually writes a file, AFTER it exists.
+
+    ⛔ It has to be HERE and not in :class:`UtaiProtocolCallback`. Lightning force-reorders
+    Checkpoint-class callbacks to the END of the list
+    (``callback_connector.py``: ``tuner_callbacks + other_callbacks + checkpoint_callbacks``),
+    so a plain callback's ``on_validation_end`` runs BEFORE this save — a pointer written there
+    would name a file that does not exist yet.
+    """
+
+    def __init__(self, *args, on_saved=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_saved = on_saved
+
+    def _save_checkpoint(self, trainer, filepath):
+        super()._save_checkpoint(trainer, filepath)
+        if self._on_saved is not None:
+            # The parent flattens every path to `dirpath/<basename>` (training_utils.py), so the
+            # basename is the whole truth about where the file landed.
+            self._on_saved(trainer, os.path.basename(str(filepath)))
+
+
 class UtaiProtocolCallback(pl.Callback):
     """Protocol bridge: per-batch step messages + stop-flag polling; per-val
     periodic/best weights snapshots. best = TRUE validation loss (the task's
     full-length log10-STFT L1 — S39 precedent: a real val loss beats the EMA
     heuristic GANs are usually forced into), tracked across resumes via
-    workspace/best_state.json."""
+    workspace/best_state.json.
 
-    def __init__(self, reporter, stop, total_steps_real, workspace, pristine_config):
+    ★S119 §F8⒝ added three jobs to it, all of which belong to the same moment (a validation
+    boundary is where this backend decides anything):
+
+    * write a RESUMABLE archive of the best point — ``weights/vocoder_best.ckpt`` has always been
+      quality-selected, but it is ``{'generator': sd}`` only, so the best point was a dead end for
+      續訓 exactly like the three GANs before §F2⒜;
+    * refresh the rolling POINTER (which flat checkpoint is this branch's tip) and carry the RNG
+      + dataset identity that lightning's own checkpoint does not store (measured: its 8 keys
+      hold no RNG at any precision);
+    * watch the reported losses, because this backend had no divergence guard at all — measured
+      (S119 recon), resuming from a nan-poisoned checkpoint ran to `completed`, exit 0, and
+      exported a 100%-nan vocoder as a success.
+    """
+
+    def __init__(self, reporter, stop, total_steps_real, workspace, pristine_config,
+                 resumed=None, start_step=0, dataset_items=None):
         self.reporter = reporter
         self.stop = stop
         self.total_steps = int(total_steps_real)
@@ -133,6 +182,18 @@ class UtaiProtocolCallback(pl.Callback):
         # off-grid completion does NOT, the pipeline back-fills it post-fit)
         self.last_val_global = None
         self.last_val_value = None
+        # ★S119 §F8⒝ — the sidecar of the archive this run continues from (None when fresh);
+        # `restore_report` is filled at on_fit_start so the run can LOG what it managed to
+        # restore rather than assume it (resume_state.RestoreReport exists for that reason).
+        self.resumed = resumed
+        self.restore_report = None
+        # The flat checkpoint this branch last wrote — the pointer's payload. Seeded with the
+        # file we resumed FROM so that a run killed before its first save still leaves a pointer
+        # describing the live branch rather than none at all.
+        self.tip_name = None
+        self.tip_step = int(start_step)
+        self.dataset_items = dataset_items
+        self.guard = None
 
     # ---- best bookkeeping (survives resumes independently of lightning state) ----
     def _load_best(self):
@@ -149,10 +210,67 @@ class UtaiProtocolCallback(pl.Callback):
             json.dump({"best_val": val, "step": real_step}, f)
         os.replace(tmp, self.best_file)
 
+    # ---- resume state (★S119 §F8⒝) ----
+    def capture(self, trainer):
+        """The part of a resume lightning's own checkpoint does NOT carry.
+
+        Measured (S119): a lightning 2.6.5 checkpoint from this chain has exactly 8 top-level
+        keys and holds NO RNG at any precision, and there is no GradScaler to lose because
+        ``pl_trainer_precision`` is pinned to ``"32-true"`` — so ``scaler=None`` here is a
+        structural fact, not an omission.
+        """
+        return resume_state.capture(
+            None,
+            epoch=trainer.current_epoch,
+            global_step=trainer.global_step,
+            exp_dir=self.workspace,
+            dataset_items=self.dataset_items,
+        )
+
+    def note_saved(self, trainer, basename):
+        """A flat checkpoint just landed — remember it and refresh the rolling pointer."""
+        self.tip_name = basename
+        self.tip_step = int(trainer.global_step)
+        resume_state.save_pointer(self.workspace, basename, blob=self.capture(trainer))
+
+    def on_fit_start(self, trainer, pl_module):
+        """Put the captured RNG back — and this is the LAST hook where that still does anything.
+
+        ⛔★ Measured (S119 recon, real hook trace): the train DataLoader's ``_base_seed`` is drawn
+        in ``_FitLoop.setup_data()``, which runs BEFORE ``on_train_start``. Every worker's python
+        / numpy / torch seed derives from that one number
+        (``pl_worker_init_function``: ``base_seed = torch.initial_seed() - worker_id``), and the
+        crop offset + volume augmentation are drawn in the WORKERS. So restoring at
+        ``on_train_start`` would be a silent no-op — the exact "the verification is empty" shape.
+
+        ⚠ WHAT THIS DOES AND DOES NOT BUY, measured end-to-end, because the honest ceiling here is
+        lower than for the GANs. Without it a resumed vocoder run does not merely diverge from an
+        uninterrupted one, it REPLAYS: ``seed_everything`` re-runs at every launch, nothing
+        between it and the iterator differs between fresh and resume, so the resumed run redraws
+        the ORIGINAL run's opening batches — same records, byte-identical crops. Restoring the
+        CPU generator changes ``_base_seed`` and ends the replay. It does NOT restore the DATA
+        POSITION: lightning truncates the interrupted epoch to the right NUMBER of batches but
+        feeds them from the start of the dataloader (it warns about this itself: "your dataloader
+        is not resumable"), so the head of the filelist is still seen twice and its tail skipped
+        once per resume. Fixing that needs a stateful dataloader — a deviation on the gate1
+        parity surface, deliberately not taken here.
+        """
+        if self.resumed is None:
+            return
+        self.restore_report = resume_state.restore(self.resumed, None, logger)
+
     # ---- hooks ----
     def on_train_start(self, trainer, pl_module):
         if self.initial_global is None:
             self.initial_global = trainer.global_step
+        if self.guard is None:
+            # ⛔★S119 — this backend had NO divergence guard. Measured: resuming from a
+            # nan-poisoned checkpoint trained to `completed` with exit 0 and exported a
+            # 100%-nan vocoder as a success. `discriminator` is a ModuleDict (msd+mpd); both
+            # halves are scanned through it.
+            self.guard = numerics.DivergenceGuard(
+                (("G", pl_module.generator), ("D", pl_module.discriminator)), logger=logger
+            )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         real = trainer.global_step // 2
@@ -161,6 +279,8 @@ class UtaiProtocolCallback(pl.Callback):
         # total_epochs = 0 sentinel: the vocoder run is step-based, the UI hides
         # epoch displays (S39 diffusion precedent)
         self.reporter.step(real, self.total_steps, trainer.current_epoch, 0, lr, losses)
+        if self.guard is not None and losses:
+            self.guard.observe(real, losses)
         if not self.stop_requested and self.stop.requested():
             self.stop_requested = True
             trainer.should_stop = True
@@ -178,10 +298,18 @@ class UtaiProtocolCallback(pl.Callback):
         )
         self.reporter.ckpt("periodic", path, real, trainer.current_epoch)
 
-        self.last_val_global = trainer.global_step
         val = trainer.callback_metrics.get("val_loss")
         if val is None:
+            # ⛔★S119 — `last_val_global` is committed only WITH a value. It used to be set one
+            # line earlier, unconditionally, while `last_val_value` kept an older step's number:
+            # `pipeline._train` pairs them (`last_val_value if last_val_global == final_global`)
+            # precisely to prove the metric belongs to that checkpoint, and the split assignment
+            # made that pair able to disagree with itself — the final checkpoint reported with
+            # another checkpoint's score. Latent today (the only non-logging validation path is
+            # gated on `skip_immediate_validation`, whose setter is commented out upstream), so
+            # this is closing the shape, not a live bug.
             return
+        self.last_val_global = trainer.global_step
         v = float(val)
         self.last_val_value = v
         if math.isfinite(v) and (self.best_val is None or v < self.best_val):
@@ -191,3 +319,49 @@ class UtaiProtocolCallback(pl.Callback):
             )
             self._save_best(v, real)
             self.reporter.ckpt("best", best_path, real, trainer.current_epoch, metric=v)
+            self._save_resumable_best(trainer, pl_module, v)
+
+    def _save_resumable_best(self, trainer, pl_module, metric):
+        """★S119 §F8⒝ — the RESUMABLE archive of the best point.
+
+        ``weights/vocoder_best.ckpt`` beside it has always been quality-selected on a real
+        validation loss, but it is ``{'generator': sd}``: no discriminator, no optimizer moments,
+        no loop state. So until now the best point was a DEAD END for 續訓 — the only thing a user
+        could continue from was the newest checkpoint, i.e. the degraded state — the same defect
+        §F2⒜ removed for the three GANs and §F8⒜ for shallow diffusion.
+
+        ⛔ Why it needs its own file rather than "protect the flat checkpoint at the best step":
+        the flat grid is pruned by ``DsModelCheckpoint(monitor="step", mode="max", save_top_k=N)``,
+        i.e. strictly the newest N, so the best point's checkpoint is deleted whenever the best
+        validation falls outside the last ``keep_ckpts`` validations (measured). That sweeper is
+        upstream bookkeeping keyed on the step number; teaching it about quality is a bigger and
+        more fragile change than writing one archive.
+
+        ⛔ ``trainer.save_checkpoint`` — never the checkpoint callback: ``DsModelCheckpoint``
+        flattens every path to ``dirpath/<basename>`` (measured), so handing it a nested path
+        writes to the workspace ROOT and its remove path deletes the ROOT file of that name.
+
+        The write is guarded on BOTH halves, because they fail independently (S117/S118): weights
+        can be nan while the moments are fine, and the moments can be permanently dead
+        (``exp_avg_sq = inf``) while every weight is finite. Refusing leaves the previous best
+        archive in place, which is the whole point of having one.
+        """
+        if not numerics.resume_point_is_safe(
+            pl_module.state_dict(),
+            [("G", trainer.optimizers[0]), ("D", trainer.optimizers[1])]
+            if len(trainer.optimizers) >= 2
+            else [],
+            logger,
+        ):
+            return
+        try:
+            resume_state.save_solo_snapshot(
+                self.workspace,
+                resume_state.BEST_DIR,
+                lambda p: trainer.save_checkpoint(p),
+                blob=self.capture(trainer),
+                metric=metric,
+                payload_name=resume_state.BEST_CKPT,
+            )
+        except Exception as e:  # a full disk must not take the training run down with it
+            logger.error("failed to write the resumable best archive: %s: %s", type(e).__name__, e)

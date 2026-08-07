@@ -625,6 +625,167 @@ check("★D14 solver 的三个存档点都刷新了滚动续训点(验证 / 停�
                encoding="utf-8").read()))
 
 print()
+print("=== ★V1-V16:§F8⒝ 声码器(lightning)的可续训 best + 活分支指针 ===")
+# 声码器的存档是【一个 lightning .ckpt】,不是我们自己的 dict,也不是 G/D 对。
+# 这一组全部驱动生产函数:真的 choose_start_ckpt 选存档、真的 _prune_workspace_ckpts 删存档、
+# 真的 save_solo_snapshot 写快照、真的 UtaiProtocolCallback 决定 last_val_global。
+from utai_train.vocoder import pipeline as VP  # noqa: E402
+
+_VP_SRC = open(os.path.join(REPO_TRAINING, "utai_train", "vocoder", "pipeline.py"),
+               encoding="utf-8").read()
+_VH_SRC = open(os.path.join(REPO_TRAINING, "utai_train", "vocoder", "harness.py"),
+               encoding="utf-8").read()
+
+
+def voc_ckpt(path, gstep, *, fill=0.0, optim=True):
+    """A lightning-shaped checkpoint — the 8 keys `trainer.save_checkpoint` really writes."""
+    torch.save({
+        "epoch": 0,
+        "global_step": int(gstep),
+        "pytorch-lightning_version": "2.6.5",
+        "state_dict": {"generator.w": torch.full((4,), float(fill))},
+        "loops": {},
+        "callbacks": {},
+        "optimizer_states": [{"state": {}}, {"state": {}}] if optim else [],
+        "lr_schedulers": [],
+    }, path)
+
+
+def voc_ws(steps, *, pointer=None, best=None, poison=(), no_optim=()):
+    d = tempfile.mkdtemp(prefix="s119_voc_")
+    with open(os.path.join(d, "dataset.fingerprint"), "w", encoding="utf-8") as f:
+        f.write("ffffeeee1111|enc=x")
+    for s in steps:
+        voc_ckpt(os.path.join(d, "model_ckpt_steps_%d.ckpt" % s), s,
+                 fill=float("nan") if s in poison else float(s),
+                 optim=s not in no_optim)
+    if pointer is not None:
+        RS.save_pointer(d, "model_ckpt_steps_%d.ckpt" % pointer,
+                        blob=RS.capture(None, epoch=0, global_step=pointer, exp_dir=d))
+    if best is not None:
+        RS.save_solo_snapshot(
+            d, RS.BEST_DIR,
+            lambda p, _s=best: voc_ckpt(p, _s, fill=float(_s)),
+            blob=RS.capture(None, epoch=0, global_step=best, exp_dir=d),
+            metric=0.25, payload_name=RS.BEST_CKPT)
+    return d
+
+
+s = VP.choose_start_ckpt(voc_ws([]))
+check("V1 全新工作区:什么都不恢复、step 0、blob 为 None",
+      (s.source, s.step, s.blob, s.path) == (VP.SRC_FRESH, 0, None, ""))
+
+s = VP.choose_start_ckpt(voc_ws([1000, 2000]))
+check("V2 只有编号网格 ⇒ 取最大的那一格(= 今天的行为)",
+      s.source == VP.SRC_NUMBERED and s.step == 2000 and s.had_optimizer, str(s))
+
+# ★这一格就是这条功能存在的理由:回退之后,盘上最大的那个是【被放弃的分支】。
+ws_rewound = voc_ws([1000, 2000, 2600, 3644], pointer=2600)
+s = VP.choose_start_ckpt(ws_rewound)
+check("★★V3 指针赢过更大的编号:回退后 3644 是被放弃分支,续训必须回到本分支的 2600",
+      s.source == VP.SRC_POINTER and s.step == 2600
+      and os.path.basename(s.path) == "model_ckpt_steps_2600.ckpt", str(s))
+os.remove(os.path.join(ws_rewound, RS.LATEST_NAME))
+s = VP.choose_start_ckpt(ws_rewound)
+check("★V3b 阳性对照:把指针拿掉,同一个目录立刻退回 3644 ⇒ 上面那条不是空断言",
+      s.source == VP.SRC_NUMBERED and s.step == 3644, str(s))
+
+ws_stale = voc_ws([1000, 2000], pointer=2000)
+os.remove(os.path.join(ws_stale, "model_ckpt_steps_2000.ckpt"))
+s = VP.choose_start_ckpt(ws_stale)
+check("★V4 指针指向一个已经不在的文件 ⇒ 当作没有指针,而不是 torch.load 一个不存在的路径",
+      s.source == VP.SRC_NUMBERED and s.step == 1000, str(s))
+
+s = VP.choose_start_ckpt(voc_ws([1000, 3644], best=1400), prefer=RS.PREFER_BEST)
+check("★★V5 要 best 就给 best:步号 1400、payload 是 model.ckpt、metric 随 blob 回来",
+      s.source == VP.SRC_BEST and s.step == 1400
+      and os.path.basename(s.path) == RS.BEST_CKPT
+      and s.blob is not None and s.blob.get("best_metric") == 0.25, str(s))
+
+s = VP.choose_start_ckpt(voc_ws([1000, 3644]), prefer=RS.PREFER_BEST)
+check("★V6 要 best 但没有完整的 ⇒ 退回去,并把 source 如实报成别的(调用方据此发警告)",
+      s.source != VP.SRC_BEST and s.step == 3644, str(s))
+
+s = VP.choose_start_ckpt(voc_ws([1000, 2000], poison=(2000,)))
+check("★★V7 毒存档被跳过、沿编号网格退回更早的健康档,并把跳过的条数报出来",
+      s.step == 1000 and s.poisoned_skipped == 1, str(s))
+s = VP.choose_start_ckpt(voc_ws([2400, 2600, 3644], pointer=2600, poison=(2600,)))
+check("★★V7b 但向下走【不许跨到指针以上】:活分支的 tip 中毒时退到 2400,绝不掉进被放弃的 3644",
+      s.step == 2400 and s.poisoned_skipped == 1, str(s))
+
+_err = None
+try:
+    VP.choose_start_ckpt(voc_ws([1000, 2000], poison=(1000, 2000)))
+except RuntimeError as e:
+    _err = str(e)
+check("★★V8 一个健康的都没有 ⇒ 带 CODE 响亮拒绝(而不是拿 nan 接着练)",
+      _err is not None and _err.startswith(RS.CODE_ARCHIVE_POISONED + ":"), str(_err)[:90])
+
+s = VP.choose_start_ckpt(voc_ws([2000], no_optim=(2000,)))
+check("★V9 如实报「这一格带没带 optimizer」(不报的话它只会在 lightning 里变成裸 KeyError)",
+      s.source == VP.SRC_NUMBERED and s.had_optimizer is False, str(s))
+
+# ---- 清扫器:回退之后「最大的 N 个」不再等于「本分支最新的 N 个」 ----
+def prune_case(steps, keep, tip):
+    d = voc_ws(steps)
+    VP._prune_workspace_ckpts(d, keep, tip_step=tip)
+    return sorted(int(n[len("model_ckpt_steps_"):-len(".ckpt")])
+                  for n in os.listdir(d) if n.startswith("model_ckpt_steps_"))
+
+
+left = prune_case([2000, 2200, 2400, 2600, 3200, 3644], keep=2, tip=2600)
+check("★★V10 回退后清扫:本分支只留最新 2 个,而被放弃分支(> tip)一个都不许动",
+      left == [2400, 2600, 3200, 3644], str(left))
+left_old = prune_case([2000, 2200, 2400, 2600, 3200, 3644], keep=2, tip=None)
+check("★V10b 阳性对照:没有 tip 的老写法把本分支删得只剩它自己刚做的活的相反面",
+      left_old == [3200, 3644] and 2600 not in left_old, str(left_old))
+left_fwd = prune_case([1000, 2000, 3000], keep=2, tip=3000)
+check("★V11 正常前进(tip = 盘上最大)时行为与今天逐格相同",
+      left_fwd == prune_case([1000, 2000, 3000], keep=2, tip=None) == [2000, 3000], str(left_fwd))
+
+# ---- 快照与指针的载荷契约 ----
+d = voc_ws([], best=1400)
+_blob = RS.read_snapshot(d, RS.BEST_DIR)
+check("★V12 best 快照:载荷叫 model.ckpt,而【清单写在 state.json 里】(读的一侧不许再硬编)",
+      _blob is not None and _blob["files"] == [RS.BEST_CKPT]
+      and os.path.isfile(os.path.join(d, RS.BEST_DIR, RS.BEST_CKPT)))
+os.remove(os.path.join(d, RS.BEST_DIR, RS.BEST_CKPT))
+check("★V13 少了载荷就当【没有】(完成标记还在,但它描述的文件没了)",
+      RS.read_snapshot(d, RS.BEST_DIR) is None)
+
+d2 = voc_ws([2000], pointer=2000)
+check("★V14 指针也带着数据集身份与 RNG —— 它不是一个两行的文本文件",
+      (lambda b: b is not None and b["files"] == ["model_ckpt_steps_2000.ckpt"]
+       and b.get("dataset_fingerprint", "").startswith("ffffeeee")
+       and {"python", "torch_cpu"} <= set(b["rng"]))(RS.read_pointer(d2)))
+
+# ---- ★全新训练必须一个字节都不受影响(这一刀最容易造出的退化) ----
+from utai_train.vocoder.harness import UtaiProtocolCallback as _VCB  # noqa: E402
+
+_d = voc_ws([])
+_before = torch.get_rng_state().clone()
+_VCB(None, None, 10, _d, {}, resumed=None).on_fit_start(None, None)
+check("★★V17 全新训练:on_fit_start 什么也不恢复 ⇒ torch 的 RNG 流逐位不动",
+      torch.equal(torch.get_rng_state(), _before))
+_cb = _VCB(None, None, 10, _d, {}, resumed=RS.capture(None, epoch=0, global_step=8, exp_dir=_d))
+torch.manual_seed(999)
+_cb.on_fit_start(None, None)
+check("★V17b 阳性对照:有 sidecar 时它确实动了 RNG(否则上面那条不携带信息)",
+      not torch.equal(torch.get_rng_state(), torch.manual_seed(999).get_state())
+      and _cb.restore_report is not None)
+
+# ---- 接线(这些不是排版,每一条都对应一个实测过的失效) ----
+check("★V15 版本计数器必须关掉:回退会造出 model_ckpt_steps_N-v1.ckpt,四个消费者里三个认不出它",
+      "enable_version_counter=False" in _VP_SRC and "on_saved=protocol_cb.note_saved" in _VP_SRC)
+check("★★V16 RNG 必须在 on_fit_start 恢复(on_train_start 已经晚了 —— _base_seed 在那之前就抽了)"
+      " · best 归档过 resume_point_is_safe · 循环里有 DivergenceGuard",
+      "def on_fit_start(self, trainer, pl_module):" in _VH_SRC
+      and "resume_state.restore(self.resumed, None, logger)" in _VH_SRC
+      and "numerics.resume_point_is_safe(" in _VH_SRC
+      and "numerics.DivergenceGuard(" in _VH_SRC
+      and "self.guard.observe(real, losses)" in _VH_SRC)
+
+print()
 print(f"gate_resume_state: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

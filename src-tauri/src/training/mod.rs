@@ -655,7 +655,14 @@ pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
 /// class the resume paths can read back (add a family ⇒ add its ckpt shape here).
 pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
     has_main_progress(ws)
-        || max_vocoder_ckpt_step(ws).is_some()
+        // ★S119 §F8⒝ — the resumable BEST snapshot counts as work too, for the same reason the
+        // diffusion arm below was widened in S118: it can outlive the numbered grid, and then a
+        // wipe with no dialog would destroy the only thing the slot could be continued from.
+        // ⚠ `voc_snapshot_step` reads the payload list out of the marker, so this also picks up
+        // the GAN pair's `resume_best/` — a slot that used to read as「无活」when its numbered
+        // files were gone now reads as「有活」. That is a widening, deliberately: it can only
+        // ever ADD a consent dialog, never remove one.
+        || vocoder_progress_step(ws).is_some()
         // ★S118 §F8⒜ — the SNAPSHOTS count as diffusion work too, and they can outlive the
         // numbered grid (the archive cleanup and a user freeing disk space both delete the big
         // numbered files first). Asking only `max_diffusion_step` here would let a slot whose
@@ -712,7 +719,15 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         sample_rate: field("sample_rate"),
         has_main_progress: has_main_progress(&ws),
         diff_steps: diffusion_progress_step(&ws).unwrap_or(0),
-        best_resume_step: best_resume_step(&ws),
+        // ★S119 §F8⒝ — the vocoder's marker records a lightning GLOBAL step while every other
+        // number this struct carries for that backend is REAL (`model_ckpt_steps_3644.ckpt` is
+        // step 1822 everywhere the user can see it). Halving here, once, keeps the resume
+        // dialog's 「从最佳存档继续（第 N 步）」 in the same units as the rest of the card.
+        best_resume_step: if backend_family(backend) == "vocoder" {
+            voc_best_resume_step(&ws)
+        } else {
+            best_resume_step(&ws)
+        },
         diff_best_resume_step: diff_snapshot_step(&ws, "resume_best"),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
@@ -844,6 +859,42 @@ fn best_resume_step(workspace: &Path) -> Option<u64> {
 /// payload file each (that trainer's checkpoint is one file, not a G+D pair).
 fn diff_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
     snapshot_step(&workspace.join("diffusion"), sub, &["model.pt"])
+}
+
+/// ★S119 §F8⒝ — the vocoder's resumable best snapshot, in GLOBAL lightning units.
+///
+/// It lives in the SAME `<slot>/resume_best/` directory as the GAN pair, and `snapshot_step` does
+/// not care which payload is in there because python records the payload names in the marker
+/// (`files`). What differs is the payload name — one lightning `model.ckpt` carrying generator,
+/// discriminator, BOTH optimizers and the loop state — and the units: the number in that marker
+/// is `trainer.global_step`, which for this manual-optimization GAN is 2× the real step
+/// (设计红队 A8). Every other vocoder number Rust and the UI show is REAL, so the halving happens
+/// in `voc_best_resume_step` and nowhere else.
+fn voc_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
+    snapshot_step(workspace, sub, &["model.ckpt"])
+}
+
+/// The vocoder's best snapshot in REAL steps — what the resume dialog's 「从最佳存档继续（第 N
+/// 步）」 must say, and what the target guard compares against `total_steps`.
+fn voc_best_resume_step(workspace: &Path) -> Option<u64> {
+    voc_snapshot_step(workspace, "resume_best").map(|g| g / 2)
+}
+
+/// How far the VOCODER has actually progressed in this slot, in GLOBAL units: the numbered grid
+/// or the best snapshot, whichever is further.
+///
+/// ★S119 §F8⒝, and the reason is the same one S118 wrote for `diffusion_progress_step`: the
+/// archive cleanup and a user freeing disk space both delete the big numbered files first, so a
+/// slot whose only resume point is the snapshot must still read as「有活」— otherwise the
+/// wipe-consent dialog goes missing and the manifest guard stops guarding.
+fn vocoder_progress_step(workspace: &Path) -> Option<u64> {
+    [
+        max_vocoder_ckpt_step(workspace),
+        voc_snapshot_step(workspace, "resume_best"),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// How far shallow diffusion has ACTUALLY progressed in this slot: the numbered grid, or either
@@ -1591,7 +1642,10 @@ impl TrainingManager {
             && !req.fresh
             && workspace.exists()
             && old_manifest.is_none()
-            && max_vocoder_ckpt_step(&workspace).is_some()
+            // ★S119 §F8⒝ — the snapshot is a resume point too; asking only about the numbered
+            // grid would let a snapshot-only workspace through the very guard that exists to
+            // stop a「quiet fake resume」.
+            && vocoder_progress_step(&workspace).is_some()
         {
             return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
@@ -1701,8 +1755,17 @@ impl TrainingManager {
         // vocoder twin of the guard — ckpt numbers are GLOBAL (2× real), the
         // //2 here is exactly the ×2-class bug the design flagged (红队 A8)
         if req.backend == "vocoder" && !req.fresh {
-            if let Some(max_global) = max_vocoder_ckpt_step(&workspace) {
-                let real = max_global / 2;
+            // ★S119 §F8⒝ — same correction the diffusion twin got in S118: compare against the
+            // step this run will actually START from. 「从最佳存档继续」 rewinds BELOW the newest
+            // checkpoint on purpose, so judging by the newest one would refuse a resume that
+            // still has thousands of steps to train — a visible button that always fails.
+            let real = if req.resume_from.trim() == "best" {
+                voc_best_resume_step(&workspace)
+                    .or_else(|| vocoder_progress_step(&workspace).map(|g| g / 2))
+            } else {
+                vocoder_progress_step(&workspace).map(|g| g / 2)
+            };
+            if let Some(real) = real {
                 if real > 0 && real >= req.total_steps as u64 {
                     return Err(UtaiError::Training(format!(
                         "RESUME_TARGET_REACHED_VOCODER: {} >= {}",
@@ -3268,6 +3331,168 @@ mod tests {
             "a slot holding only a diffusion snapshot still holds work"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S119 §F8⒝ — the VOCODER's resumable best snapshot: units, reachability, and the two
+    /// guards a rewind breaks if nobody teaches them about it.
+    #[test]
+    fn s119_the_vocoder_best_resume_snapshot_is_read_in_real_steps() {
+        let root = std::env::temp_dir().join(format!("utai_s119_voc_{}", std::process::id()));
+        let d = root.join("resume_best");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(voc_best_resume_step(&root), None, "empty directory");
+
+        std::fs::write(d.join("model.ckpt"), b"m").unwrap();
+        assert_eq!(
+            voc_best_resume_step(&root),
+            None,
+            "the payload without the completion marker may be half-written"
+        );
+        std::fs::write(
+            d.join("state.json"),
+            br#"{"schema":1,"global_step":3644,"files":["model.ckpt"]}"#,
+        )
+        .unwrap();
+        // ★THE UNITS. 3644 is what python records (trainer.global_step); 1822 is the number the
+        // user sees on every other row of the same slot. Getting this wrong is 设计红队 A8's
+        // ×2 class, and it would show up as a button offering to continue from a step that does
+        // not exist.
+        assert_eq!(voc_snapshot_step(&root, "resume_best"), Some(3644));
+        assert_eq!(voc_best_resume_step(&root), Some(1822));
+
+        // ★And the halving has to survive the trip through `slot_info`, because THAT is what the
+        // resume dialog reads (`info.best_resume_step` → 「从最佳存档继续（第 N 步）」). Build a
+        // real project layout so the family branch is genuinely exercised, and pin the GAN arm
+        // beside it so a future "simplification" that drops the branch goes red.
+        let data = std::env::temp_dir().join(format!("utai_s119_data_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        for (family, payload) in [
+            ("vocoder", &["model.ckpt"][..]),
+            ("sovits", &["G.pth", "D.pth"][..]),
+        ] {
+            let bd = tproject::family_dir(&data, "p1", family).join("resume_best");
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::write(
+                bd.join("state.json"),
+                format!(
+                    r#"{{"schema":1,"global_step":3644,"files":[{}]}}"#,
+                    payload
+                        .iter()
+                        .map(|n| format!("\"{n}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            )
+            .unwrap();
+            for n in payload {
+                std::fs::write(bd.join(n), b"x").unwrap();
+            }
+        }
+        assert_eq!(
+            slot_info(&data, "p1", "vocoder").best_resume_step,
+            Some(1822),
+            "the vocoder's resume button must offer the REAL step"
+        );
+        assert_eq!(
+            slot_info(&data, "p1", "sovits").best_resume_step,
+            Some(3644),
+            "the GAN arm is NOT halved — its checkpoints count real steps already"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+
+        // …and the progress reader HAS to count it: `_prune_workspace_ckpts` and a user freeing
+        // disk space both delete the big numbered files first, so a slot whose only resume point
+        // is the snapshot must still read as「有活」.
+        assert_eq!(vocoder_progress_step(&root), Some(3644));
+        assert!(
+            workspace_holds_work(&root),
+            "a slot holding only a vocoder snapshot still holds work"
+        );
+        // ⚠ The two readers are NOT told apart by the payload's name, and that is deliberate:
+        // S118 made `snapshot_step` take the payload list out of the marker itself, so the GAN
+        // reader answers 3644 for this same directory. The ONLY difference between them is the
+        // units — which is precisely why `slot_info` has to branch on the family instead of
+        // relying on one reader failing to see the other's snapshot.
+        // (This assertion started life as "the GAN reader must not accept it", which was MY
+        // expectation and was wrong; the behaviour is by construction and it is fine.)
+        assert_eq!(
+            best_resume_step(&root),
+            Some(3644),
+            "payload-agnostic by construction — the family branch in slot_info is what separates \
+             the two, not the file name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S119 §F8⒝ — python and Rust must keep agreeing about the vocoder snapshot's layout, and
+    /// the python wiring that makes it exist at all must stay wired.
+    #[test]
+    fn s119_vocoder_resume_snapshot_is_wired_across_python_and_rust() {
+        static RESUME_STATE_PY: &str =
+            include_str!("../../../training/utai_train/resume_state.py");
+        static VOC_PIPELINE_PY: &str =
+            include_str!("../../../training/utai_train/vocoder/pipeline.py");
+        static VOC_HARNESS_PY: &str =
+            include_str!("../../../training/utai_train/vocoder/harness.py");
+        static TPROJECT_RS: &str = include_str!("tproject.rs");
+        static THIS_RS: &str = include_str!("mod.rs");
+
+        let best_ckpt = RESUME_STATE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("BEST_CKPT = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("resume_state.py must keep `BEST_CKPT = \"...\"` as a plain top-level literal");
+        for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
+            assert!(
+                src.contains(&format!("\"{best_ckpt}\"")),
+                "{file} no longer mentions {best_ckpt:?} — python and Rust have drifted apart \
+                 about what the vocoder resume snapshot is called, and the archive list would \
+                 silently stop showing a gigabyte-scale resume point"
+            );
+        }
+
+        for needle in [
+            "def choose_start_ckpt(",           // module level ⇒ a test can drive it (S117)
+            "cfg.get(\"resume_from\")",         // 「从最佳存档继续」 reaches this backend at all
+            "resume_state.read_pointer(",       // the live branch's tip, not max(step)
+            "resume_state.read_snapshot(",      // …and the best archive is read the shared way
+            "enable_version_counter=False",     // a rewind must not mint names 3 consumers reject
+            "on_saved=protocol_cb.note_saved",  // the pointer is refreshed by whoever writes
+            "tip_step=protocol_cb.tip_step",    // the prune judges by the LIVE branch's tip
+            "resume_state.report_drift(",       // the dataset-identity warning
+            "resumed=start.blob",               // the RNG + dataset identity travel on
+        ] {
+            assert!(
+                VOC_PIPELINE_PY.contains(needle),
+                "vocoder/pipeline.py no longer contains {needle:?} — §F8b's wiring is broken"
+            );
+        }
+        for needle in [
+            "def on_fit_start(self, trainer, pl_module):",  // the ONLY hook early enough for RNG
+            "resume_state.restore(self.resumed, None, logger)",
+            "resume_state.save_solo_snapshot(",
+            "payload_name=resume_state.BEST_CKPT",
+            "numerics.resume_point_is_safe(",   // never publish a dead resume point
+            "numerics.DivergenceGuard(",        // this backend had no divergence guard at all
+        ] {
+            assert!(
+                VOC_HARNESS_PY.contains(needle),
+                "vocoder/harness.py no longer contains {needle:?} — §F8b's wiring is broken"
+            );
+        }
+        // ⛔ The RNG restore has to happen at on_fit_start and NOT at on_train_start: the train
+        // DataLoader's `_base_seed` — from which every worker's python/numpy/torch seed derives,
+        // and therefore the mel-crop offsets — is drawn in `_FitLoop.setup_data()`, which runs
+        // BETWEEN the two. Restoring afterwards is a silent no-op.
+        let fit = VOC_HARNESS_PY.find("def on_fit_start(").unwrap();
+        let restore = VOC_HARNESS_PY.find("resume_state.restore(self.resumed").unwrap();
+        let train_start = VOC_HARNESS_PY.find("def on_train_start(").unwrap();
+        assert!(
+            fit < restore && restore < train_start,
+            "the RNG restore moved out of on_fit_start — after the dataloader iterator exists it \
+             cannot change a single worker's stream"
+        );
     }
 
     #[test]

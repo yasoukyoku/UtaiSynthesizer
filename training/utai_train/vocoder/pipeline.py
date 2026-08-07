@@ -77,6 +77,7 @@ overwrite) is part of the stream and aligns because both gate sides run the
 identical sequence. The train dataloader has NO shuffle (upstream Sequential-
 Sampler; order = filelist line order) — never "fix" that.
 """
+import collections
 import copy
 import json
 import logging
@@ -88,6 +89,7 @@ import re
 import numpy as np
 import yaml
 
+from .. import resume_state  # torch-free at import time — see `choose_start_ckpt`
 from ..augment import (
     augment_slices,
     is_aug_name,
@@ -563,15 +565,192 @@ def build_train_config(cfg, pretrain, flist_dir):
 
 # ─── stage: train ────────────────────────────────────────────────────────────
 
-def _prune_workspace_ckpts(exp_dir, keep):
+def _filelist_len(flist_dir, name):
+    """How many npz rows one filelist holds, or ``None`` when it cannot be read.
+
+    The resume header (`resume_state.describe_drift`) reports this so the NEXT bug report can
+    tell "resumed onto identical data" apart from "resumed onto a dataset that grew" — today's
+    logs cannot. Reading the file is cheap and, unlike `len(dataset)`, available before fit.
+    """
+    try:
+        with open(os.path.join(flist_dir, name), encoding="utf8") as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return None
+
+
+#: What :func:`choose_start_ckpt` decided. A named tuple rather than a bare tuple: four
+#: same-typed fields in a row is the shape S85 banned after `(i64,i64,i64)` silently swapped.
+VocStart = collections.namedtuple(
+    "VocStart", "path step blob source had_optimizer poisoned_skipped")
+
+#: `source` values, in the order the chooser prefers them.
+SRC_BEST = "best"          # resume_best/model.ckpt — the user asked for the best point
+SRC_POINTER = "pointer"    # resume_state.json names the flat checkpoint this branch last wrote
+SRC_NUMBERED = "numbered"  # model_ckpt_steps_<n>.ckpt — upstream's max(step) scan
+SRC_FRESH = "fresh"        # nothing to restore
+
+
+def choose_start_ckpt(exp_dir, prefer=None):
+    """WHICH lightning checkpoint this run resumes from. Returns a :class:`VocStart`.
+
+    ★ MODULE-LEVEL on purpose. Inside `_train` no test could drive it without a dataset, a
+    1.2 GB base model and a GPU — and "the startup load is unreachable from a test" is exactly
+    how S117's regression (every fresh so-vits run training from random init) shipped and
+    survived two sessions.
+
+    Three sources, and the order is the whole point:
+
+    1. ``prefer="best"`` → ``resume_best/`` when it holds a COMPLETE snapshot. Falling back is
+       LOUD: silently continuing from somewhere else than the button said is the same class of
+       lie this feature exists to remove.
+    2. the rolling POINTER — the flat checkpoint the live branch last wrote.
+    3. the numbered grid, i.e. exactly what upstream's ``get_latest_checkpoint_path`` picks.
+
+    ⛔★ WHY (2) EXISTS AT ALL, and why it BEATS (3) instead of being compared with it.
+    ``get_latest_checkpoint_path`` is ``max(step)``. That is equivalent to "the tip of the branch
+    we are training" only while training moves forward — which is precisely the invariant
+    「从最佳存档继续」 breaks. Measured on the production functions: after a rewind to step 2000
+    with an abandoned branch still on disk at 3644, the scan still returns
+    ``model_ckpt_steps_3644.ckpt``, so the NEXT default 續訓 walks straight back onto the branch
+    the user deliberately left — discarding everything the rewound run trained, silently. The
+    pointer records the answer instead of deriving it from a proxy whose premise this feature
+    removes (S118's blood lesson, one family over).
+
+    ⛔★§F8⒡, one family over: each candidate's weights are scanned after loading and a poisoned
+    one is skipped LOUDLY, next candidate tried, and the run REFUSES if none is healthy. This
+    backend had no such check at all — measured (S119): resuming from a nan-poisoned checkpoint
+    ran to `completed` with exit 0 and exported a 100%-nan vocoder as a success.
+    """
+    # ⛔ Imported HERE, not at module scope: `utai_train.numerics` imports torch, and this
+    # module is imported by the runner BEFORE `device.setup_visibility` has masked the GPUs
+    # (that is why `_train` also defers its own `import torch`). Same shape as
+    # `sovits/diff_pipeline.load_start_state`.
+    import torch
+
+    from .. import numerics
+
+    prefer = (prefer or resume_state.PREFER_LATEST).strip() or resume_state.PREFER_LATEST
+    candidates = []
+
+    if prefer == resume_state.PREFER_BEST:
+        blob = resume_state.read_snapshot(exp_dir, resume_state.BEST_DIR)
+        if blob is not None:
+            candidates.append((
+                os.path.join(resume_state.snapshot_dir(exp_dir, resume_state.BEST_DIR),
+                             resume_state.BEST_CKPT),
+                blob, SRC_BEST,
+            ))
+        else:
+            logger.warning(
+                "asked to continue from the BEST vocoder archive, but %s holds no complete one "
+                "— continuing from the latest instead",
+                resume_state.snapshot_dir(exp_dir, resume_state.BEST_DIR),
+            )
+
+    pointer = resume_state.read_pointer(exp_dir)
+    ceiling = None
+    if pointer is not None:
+        name = pointer["files"][0]
+        candidates.append((os.path.join(exp_dir, name), pointer, SRC_POINTER))
+        m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
+        ceiling = int(m.group(1)) if m else int(pointer.get("global_step", 0))
+
+    # The WHOLE numbered grid, newest first — not just `get_latest_checkpoint_path`'s max.
+    # Shallow diffusion can stop at the max because it always has `resume_latest/` underneath it;
+    # here the grid IS the resume surface, so a single poisoned newest file would otherwise make
+    # a workspace with `keep_ckpts` healthy checkpoints in it unresumable. Walking down is loud
+    # (each skip logs the CODE and `poisoned_skipped` reaches the frontend), never silent.
+    #
+    # ⚠ And the enumeration uses the SAME pattern `_prune_workspace_ckpts` and the two Rust
+    # readers use (`model_ckpt_steps_<digits>.ckpt`), not the vendored scan's looser
+    # `re.search(r'steps_\d+')` — that looseness is what let a `…_48-v1.ckpt` be resumed from
+    # while three other consumers could not even see it.
+    numbered = []
+    for name in sorted(os.listdir(exp_dir)) if os.path.isdir(exp_dir) else []:
+        m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
+        if m:
+            numbered.append((int(m.group(1)), name))
+    if ceiling is not None:
+        # Everything ABOVE the pointer belongs to a branch this workspace walked away from.
+        # Falling onto it because the live tip happened to be poisoned would be a silent branch
+        # switch — the exact failure the pointer exists to prevent.
+        numbered = [c for c in numbered if c[0] <= ceiling]
+    for step, name in sorted(numbered, reverse=True):
+        candidates.append((os.path.join(exp_dir, name), None, SRC_NUMBERED))
+
+    # de-duplicate by path, keeping the first (= highest-priority) mention: the pointer normally
+    # names the same file the scan finds, and loading it twice would just pay 1.2 GB twice.
+    seen, ordered = set(), []
+    for cand in candidates:
+        key = os.path.normcase(os.path.abspath(cand[0]))
+        if key not in seen:
+            seen.add(key)
+            ordered.append(cand)
+
+    if not ordered:
+        logger.info("no vocoder checkpoint to restore — starting fresh from the finetune base")
+        return VocStart("", 0, None, SRC_FRESH, False, 0)
+
+    poisoned = 0
+    for path, blob, source in ordered:
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            logger.error("cannot read %s (%s: %s) — trying the next archive",
+                         path, type(e).__name__, e)
+            poisoned += 1
+            continue
+        step = int(ck.get("global_step", 0))
+        had_optimizer = bool(ck.get("optimizer_states"))
+        bad = numerics.first_nonfinite_tensor((ck.get("state_dict") or {}).items())
+        if bad is None:
+            logger.info(
+                "vocoder resume: %s (global step %s, real %s) via %s; optimizer state present=%s",
+                os.path.basename(path), step, step // 2, source, had_optimizer,
+            )
+            return VocStart(path, step, blob, source, had_optimizer, poisoned)
+        poisoned += 1
+        logger.error(
+            "%s: %s (global step %s) holds NON-FINITE weights (first: %s) — refusing to continue "
+            "from it; a previous run went numerically dead before writing it",
+            resume_state.CODE_ARCHIVE_POISONED, os.path.basename(path), step, bad,
+        )
+
+    raise RuntimeError(
+        "%s: every vocoder archive in %s holds nan/inf weights or is unreadable (%d tried)"
+        % (resume_state.CODE_ARCHIVE_POISONED, exp_dir, poisoned)
+    )
+
+
+def _prune_workspace_ckpts(exp_dir, keep, tip_step=None):
     """Manually saved tail checkpoints live outside DsModelCheckpoint's top-k
     bookkeeping and would accumulate across stop/resume cycles (红队 A24) —
-    prune the workspace to the newest `keep` by step number."""
+    prune the workspace to the newest `keep` by step number.
+
+    ⛔★S119 §F8⒝ — ``tip_step`` is the live branch's tip, and everything ABOVE it is left alone.
+    "Newest N by step number" means "newest N of this branch" only while training moves forward.
+    After a 「从最佳存档继续」 rewind the abandoned branch still holds HIGHER numbers, and the
+    unqualified rule then keeps those and deletes the rewound run's own saves instead — measured
+    on this function: rewind to 2000 with 3644 on disk and keep=5 left ``[2600, 2800, 3000, 3200,
+    3644]``, i.e. it pruned exactly the work the user had just done. This is the same shape S118
+    fixed for the diffusion sweeper, with a different remedy: the diffusion sweep needed an
+    explicit "steps this run wrote" set because it judges by a milestone grid that changes between
+    runs, whereas this one is a plain keep-newest-N and the branch question is answered entirely by
+    "at or below the tip".
+
+    Files above the tip are NOT deleted. Walking away from a branch is the user's decision;
+    destroying it is not this function's job — they stay visible in 存档中心 and reclaimable there.
+    ``tip_step=None`` keeps the historical behaviour (the tip is whatever is highest on disk),
+    which is what a run that never wrote anything should do.
+    """
     ckpts = []
     for name in os.listdir(exp_dir):
         m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
         if m:
             ckpts.append((int(m.group(1)), name))
+    if tip_step is not None:
+        ckpts = [c for c in ckpts if c[0] <= int(tip_step)]
     ckpts.sort(reverse=True)
     for _, name in ckpts[max(1, int(keep)):]:
         try:
@@ -593,8 +772,12 @@ def _train(cfg, exp_dir, config, reporter, stop):
     import lightning.pytorch as pl
     from lightning.pytorch.loggers import TensorBoardLogger
 
-    from .harness import UtaiNsfTask, UtaiProtocolCallback, save_weights_snapshot
-    from .utils.training_utils import DsModelCheckpoint, get_latest_checkpoint_path
+    from .harness import (
+        UtaiDsModelCheckpoint,
+        UtaiNsfTask,
+        UtaiProtocolCallback,
+        save_weights_snapshot,
+    )
 
     # Lightning 2.6.5 ships NO XPU accelerator (accelerators/ = cpu/cuda/mps/xla only),
     # so accelerator="auto" would SILENTLY pick CPU on an Intel box — design §4.5 forbids
@@ -622,12 +805,27 @@ def _train(cfg, exp_dir, config, reporter, stop):
     # config['model_args'] in place (harness.export_config_json reads this)
     pristine = copy.deepcopy(config)
 
+    # ★S119 §F8⒝ — decide WHICH archive this run continues from BEFORE seeding. It is a
+    # filesystem + `torch.load` decision and consumes no RNG (the 红队 A12 discipline in this
+    # module's header is about the window BETWEEN seed_everything and fit), and doing it first
+    # means a refusal (every archive poisoned) costs nothing but the read.
+    start = choose_start_ckpt(work_dir, cfg.get("resume_from"))
+    train_items = _filelist_len(config["DataIndexPath"], config["train_set_name"])
+
     pl.seed_everything(config["seed"], workers=True)  # train.py:50 — BEFORE the task
     task = UtaiNsfTask(config=config)
 
     protocol_cb = UtaiProtocolCallback(
-        reporter, stop, cfg["total_steps"], work_dir, pristine
+        reporter, stop, cfg["total_steps"], work_dir, pristine,
+        resumed=start.blob, start_step=start.step, dataset_items=train_items,
     )
+    if start.source != SRC_FRESH:
+        # ONE call, shared with the other four trainers — the dataset-identity warning and the
+        # resume header both come out of it (`utai_train.resume_state.report_drift`).
+        resume_state.report_drift(
+            start.blob, reporter, logger,
+            exp_dir=work_dir, dataset_items=train_items,
+        )
     trainer = pl.Trainer(
         accelerator=config["pl_trainer_accelerator"],
         devices=config["pl_trainer_devices"],
@@ -644,7 +842,7 @@ def _train(cfg, exp_dir, config, reporter, stop):
         # the list — our protocol callback always runs first on shared hooks;
         # snapshots therefore come from live state_dict, never from ckpt files
         callbacks=[
-            DsModelCheckpoint(
+            UtaiDsModelCheckpoint(
                 dirpath=work_dir,
                 filename="model_ckpt_steps_{step}",
                 auto_insert_metric_name=False,
@@ -655,6 +853,19 @@ def _train(cfg, exp_dir, config, reporter, stop):
                 permanent_ckpt_start=config["permanent_ckpt_start"],
                 permanent_ckpt_interval=config["permanent_ckpt_interval"],
                 verbose=True,
+                # ⛔★S119 §F8⒝ — a REWIND (「从最佳存档继续」) re-saves the same step numbers the
+                # abandoned branch already holds, and lightning's version counter then mints
+                # `model_ckpt_steps_<N>-v1.ckpt`. Measured: THREE of the four consumers reject
+                # that name (`_prune_workspace_ckpts`, Rust `max_vocoder_ckpt_step`, Rust
+                # `scan_project_ckpts`) while `get_latest_checkpoint_path` accepts and PREFERS
+                # it, and lightning pins whichever file it resumed from as undeletable — so the
+                # live branch becomes a 1.2 GB file that nothing can prune and the archive UI
+                # cannot see, while the abandoned same-numbered file is the one shown. Turning
+                # the counter off makes the rewound branch overwrite those numbers in place,
+                # which is the same semantics shallow diffusion already has (§F8-res⒎) and the
+                # only one all four consumers agree on.
+                enable_version_counter=False,
+                on_saved=protocol_cb.note_saved,
             ),
             protocol_cb,
         ],
@@ -669,9 +880,9 @@ def _train(cfg, exp_dir, config, reporter, stop):
         num_sanity_val_steps=config["num_sanity_val_steps"],
         enable_progress_bar=False,  # deviation 7 (stdout/stderr hygiene)
     )
-    ckpt_path = get_latest_checkpoint_path(work_dir)
+    ckpt_path = start.path or None
     if ckpt_path:
-        logger.info("resuming from %s", ckpt_path)
+        logger.info("resuming from %s (%s)", ckpt_path, start.source)
     trainer.fit(task, ckpt_path=ckpt_path)
 
     # ---- post-fit accounting (deviation 8) ----
@@ -704,10 +915,14 @@ def _train(cfg, exp_dir, config, reporter, stop):
             trainer.validate(task, verbose=False)
         # resume-grade tail checkpoint: DsModelCheckpoint only saves on val
         # boundaries — an off-grid tail would silently retrain on resume
-        trainer.save_checkpoint(
-            os.path.join(work_dir, "model_ckpt_steps_%d.ckpt" % final_global)
-        )
-        _prune_workspace_ckpts(work_dir, config["num_ckpt_keep"])
+        tail_name = "model_ckpt_steps_%d.ckpt" % final_global
+        trainer.save_checkpoint(os.path.join(work_dir, tail_name))
+        # ★S119 §F8⒝ — the tail is written by US, not by the checkpoint callback, so the pointer
+        # has to be refreshed here too, and it must happen BEFORE the prune (the prune keeps the
+        # newest N at or below the tip, and the tip is what this line records).
+        protocol_cb.note_saved(trainer, tail_name)
+        _prune_workspace_ckpts(work_dir, config["num_ckpt_keep"],
+                               tip_step=protocol_cb.tip_step)
         snap = save_weights_snapshot(
             protocol_cb.weights_dir, "vocoder_%d.ckpt" % real_final, task, pristine
         )

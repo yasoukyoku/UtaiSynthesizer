@@ -681,6 +681,30 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
             }
         }
 
+        // ── ★S119 §F8⒝: the VOCODER's resumable best snapshot ─────────────────────────
+        // Same directory as the GAN pair above and deliberately NOT gated on the family: the two
+        // payload shapes are mutually exclusive on disk (a GAN slot has no `model.ckpt`, a
+        // vocoder slot has no `G.pth`), so a family test here would be one more thing that can
+        // drift out of step with python. `state.json` is again the completion marker written
+        // LAST.
+        //
+        // ⚠ The step is HALVED like every other vocoder row (`model_ckpt_steps_3644.ckpt` is
+        // step 1822 above): python records `trainer.global_step`, which this manual-optimization
+        // GAN advances 2 per batch. Reporting it raw would put the one number in the archive
+        // list that is twice everything beside it.
+        {
+            let bd = slot.join("resume_best");
+            let (m, st) = (bd.join("model.ckpt"), bd.join("state.json"));
+            if st.is_file() && m.is_file() {
+                let step = std::fs::read_to_string(&st)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v["global_step"].as_u64())
+                    .map(|g| g / 2);
+                push(m, Some(st), CkptKind::Resumable, step);
+            }
+        }
+
         // ── ★S118 §F8⒜: the diffusion resume snapshots ────────────────────────────────
         // `diffusion/resume_best/{model.pt,state.json}` and `diffusion/resume_latest/…`. Same
         // reason the GAN block above has to be explicit: the loop below only accepts names of the

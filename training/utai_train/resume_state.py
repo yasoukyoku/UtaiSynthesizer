@@ -83,6 +83,14 @@ BEST_STATE = "state.json"
 #: (``{'global_step', 'model', 'optimizer'}``) instead of a G+D pair (S118 §F8⒜).
 BEST_MODEL = "model.pt"
 
+#: The VOCODER payload (S119 §F8⒝): also one file, but a lightning checkpoint rather than one of
+#: our own dicts — generator, discriminator, BOTH optimizers, `loops` and the callback ledger all
+#: live in it, and only `trainer.save_checkpoint` may write it. It gets its own name because
+#: calling a lightning `.ckpt` `model.pt` would mislead everyone who opens the directory, and
+#: because the two shapes are not interchangeable: `torch.load`ing this one gives you the
+#: 8-key lightning envelope, not a `{'model': …}` dict.
+BEST_CKPT = "model.ckpt"
+
 #: Directory holding the ROLLING complete resume point — shallow diffusion only, and it exists
 #: because that trainer is the only one whose periodic checkpoint is NOT a resume point:
 #: ``diffusion_template.yaml`` ships upstream's ``save_opt: false``, so every ``interval_val``
@@ -344,20 +352,71 @@ def save_best_pair(exp_dir, save_checkpoint, nets, optims, learning_rate, *, epo
     return save_snapshot(exp_dir, BEST_DIR, payload, blob=blob, metric=metric)
 
 
-def save_solo_snapshot(exp_dir, sub_dir, save_one, *, blob, metric=None):
-    """The single-model shape (shallow diffusion): ``save_one(path)`` writes ONE checkpoint file.
+def save_solo_snapshot(exp_dir, sub_dir, save_one, *, blob, metric=None, payload_name=BEST_MODEL):
+    """The single-model shape (shallow diffusion, vocoder): ``save_one(path)`` writes ONE file.
 
     Self-contained on purpose. Storing only the optimizer here and reusing the weights already
     sitting in ``model_<step>.pt`` / ``model_best.pt`` would save ~211 MB, but it would invent a
     cross-file invariant nothing else in this repo has — and the archive cleanup CAN delete a
     numbered checkpoint, which would leave the moments behind as an unusable orphan.
+
+    ``payload_name`` exists so the vocoder can call its lightning archive :data:`BEST_CKPT`
+    without a second copy of this function. The name goes into the marker's ``files``, so
+    :func:`read_snapshot` and the Rust reader both follow it automatically.
     """
 
     def payload(d):
-        save_one(os.path.join(d, BEST_MODEL))
-        return [BEST_MODEL]
+        save_one(os.path.join(d, payload_name))
+        return [payload_name]
 
     return save_snapshot(exp_dir, sub_dir, payload, blob=blob, metric=metric)
+
+
+def save_pointer(exp_dir, payload_name, *, blob, name=LATEST_NAME):
+    """A sidecar that NAMES an existing checkpoint instead of copying it. Vocoder only (S119).
+
+    ⚠ WHY THE VOCODER GETS A POINTER WHERE SHALLOW DIFFUSION NEEDED A COPY (:data:`LATEST_DIR`).
+    Diffusion's periodic saves carry no optimizer, so the rolling resume point had to be a
+    separate 632 MB file. Every lightning checkpoint the vocoder writes already carries both
+    optimizers, so copying one would buy nothing and cost 1.2 GB. What the vocoder is missing is
+    not the STATE, it is the ANSWER TO "WHICH FILE" — and that answer stopped being derivable the
+    moment 「从最佳存档继续」 made a rewind possible:
+
+        `get_latest_checkpoint_path` is ``max(step)`` over ``model_ckpt_steps_*.ckpt``. After a
+        rewind to step 6000 with an abandoned branch still on disk at 10000, ``max(step)`` is the
+        ABANDONED branch — so the next default 續訓 would silently walk back onto the branch the
+        user deliberately left, discarding everything the rewound run trained. Measured (S119
+        recon, driving the production function): rewind to 2000 with 3644 on disk still returns
+        `model_ckpt_steps_3644.ckpt`, and `_prune_workspace_ckpts` then deletes the rewound run's
+        own saves while keeping the abandoned ones.
+
+    So the pointer records WHICH file this run last wrote. It is written AFTER that file exists
+    (:func:`write` is atomic), and :func:`read_pointer` returns ``None`` when the named file is
+    gone — so a stale pointer degrades to today's behaviour instead of to a crash.
+
+    It carries the same ``blob`` as every other resume sidecar (RNG + dataset identity), which is
+    why it is a sidecar and not a two-line text file.
+    """
+    out = dict(blob)
+    out["files"] = [payload_name]
+    write(os.path.join(exp_dir, name), out)
+    return os.path.join(exp_dir, name)
+
+
+def read_pointer(exp_dir, name=LATEST_NAME):
+    """The pointer sidecar, or ``None`` when it is absent / unreadable / names a missing file.
+
+    ⚠ Deliberately stricter than :func:`read`: a pointer whose payload has been deleted (the
+    archive cleanup, a user freeing disk space, `_prune_workspace_ckpts`) is worse than no
+    pointer, because acting on it means `torch.load` on a path that is not there.
+    """
+    blob = read(os.path.join(exp_dir, name))
+    if blob is None:
+        return None
+    names = blob.get("files") or ()
+    if not names or not all(os.path.isfile(os.path.join(exp_dir, n)) for n in names):
+        return None
+    return blob
 
 
 #: `cfg["resume_from"]` — which archive a 续训 continues from. Default is the historical behaviour.
