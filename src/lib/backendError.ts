@@ -358,6 +358,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // ★S118 §F8⒜ — a WARNING, not a failure: the moments are gone either way and refusing
   // would leave the user unable to continue at all. NOT `modal` — the run is still training.
   TRAINING_RESUME_OPTIMIZER_MISSING: { key: "backend.TRAINING_RESUME_OPTIMIZER_MISSING" },
+  // ★S118 §F8⒡ — used BOTH as a warning (an older healthy archive rescued the run) and as the
+  // run's error (nothing healthy left). ⛔ NOT `modal`: in the warning case the run is training.
+  TRAINING_RESUME_ARCHIVE_POISONED: { key: "backend.TRAINING_RESUME_ARCHIVE_POISONED" },
   // S114 §F5-1 live diagnostics (TrainingSnapshot.warnings) — raised while the run is
   // still going, so they never set `state = "error"`. The "froze" report had NO failure
   // to show: the DataLoader's feeder thread dies in a daemon thread and the trainer just

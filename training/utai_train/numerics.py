@@ -249,6 +249,36 @@ def optimizer_state_is_safe(optimizers, logger=None):
     return True
 
 
+def resume_point_is_safe(state_dict, optimizers, logger=None):
+    """May this state be PUBLISHED as a resume point? Both halves, in one place.
+
+    ★S118 §F8⒡. Distinct from :func:`best_save_is_safe` in what it protects and in what it says:
+    that one guards an inference-only export and promises "the previous best file is left
+    untouched"; this one guards the ROLLING resume point, which the diffusion chooser actively
+    PREFERS — so publishing a dead one would make it preferred garbage, while refusing leaves the
+    previous snapshot in place as the last healthy point to roll back to.
+
+    ⛔ Module-level so a test can drive it. Inside the trainer it was a closure over `model`,
+    `optimizer` and `saver`, i.e. unreachable without a vocoder, a dataset and a GPU — and
+    "the guard is unreachable from a test" is exactly how S117's regression shipped.
+
+    Both halves are load-bearing and they fail independently: measured (S118), ONE inf loss on the
+    fp32 path leaves the weights nan AND the moments unsafe, while a finite-but-huge gradient
+    (S117) leaves every weight finite and only the moments dead.
+    """
+    bad = first_nonfinite_tensor(state_dict.items())
+    if bad is not None:
+        if logger is not None:
+            logger.error(
+                "REFUSING to publish a resume point: the model holds nan/inf (first: %s). The "
+                "previous snapshot is left untouched — it is the last healthy point this run can "
+                "be continued from.",
+                bad,
+            )
+        return False
+    return optimizer_state_is_safe(optimizers, logger)
+
+
 def best_save_is_safe(state_dict, logger=None):
     """Last line of defence for ``save_best`` -- see defect (b) in the module doc.
 

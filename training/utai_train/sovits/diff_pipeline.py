@@ -396,7 +396,9 @@ def _seed_base_model(expdir, pretrain_path, reporter):
 
 #: What `load_start_state` decided. A named tuple rather than a bare tuple on purpose: four
 #: same-typed fields in a row is the shape S85 banned after `(i64,i64,i64)` silently swapped.
-DiffStart = collections.namedtuple("DiffStart", "step blob source had_optimizer path")
+#: `poisoned_skipped` = how many candidates were rejected for holding nan/inf weights (§F8⒡).
+DiffStart = collections.namedtuple(
+    "DiffStart", "step blob source had_optimizer path poisoned_skipped")
 
 #: `source` values, in the order the chooser prefers them.
 SRC_BEST = "best"                # resume_best/  — the user asked for the best point
@@ -434,28 +436,39 @@ def load_start_state(expdir, model, optimizer, device="cpu", prefer=None):
       the first post-resume update exactly ±lr for EVERY parameter at once (4.7x-25.5x the warm
       optimizer's step in the same gradient state), and the second moment needs ~1700-2000 steps
       to come back within 10% of where it was.
+
+    ⛔★S118 §F8⒡ — and it REFUSES a poisoned archive. `torch.isnan(inf)` is False (measured), so
+    an inf loss walks through the loop's upstream nan gate; in fp32 — the DEFAULT path, with no
+    GradScaler to skip the step — one such step leaves every weight nan, and only the step after
+    it trips the gate, by which time a save boundary may already have written the poisoned state.
+    So the candidates are tried IN ORDER and each one's weights are scanned after loading: a
+    poisoned one is skipped LOUDLY and the next is tried; if none is healthy the run refuses
+    rather than training from nan. (Not silent, and not "quietly something else": picking the
+    highest number was always OUR heuristic, and correcting it when it yields garbage is what the
+    user asked for — `poisoned_skipped` makes the frontend say it happened.)
     """
     prefer = (prefer or resume_state.PREFER_LATEST).strip() or resume_state.PREFER_LATEST
+    from .. import numerics
     from .diffusion.logger import utils as du
 
-    def restore(path, blob, source):
-        step, had_optimizer = du.load_checkpoint_file(path, model, optimizer, device)
-        logger.info("diffusion resume: %s (step %s) via %s", os.path.basename(path), step, source)
-        return DiffStart(int(step), blob, source, had_optimizer, path)
+    def snap_candidate(sub, source):
+        blob = resume_state.read_snapshot(expdir, sub)
+        if blob is None:
+            return None
+        path = os.path.join(resume_state.snapshot_dir(expdir, sub), resume_state.BEST_MODEL)
+        return (path, blob, source, int(blob.get("global_step", -1)))
 
+    candidates = []
     if prefer == resume_state.PREFER_BEST:
-        blob = resume_state.read_snapshot(expdir, resume_state.BEST_DIR)
-        if blob is not None:
-            return restore(
-                os.path.join(resume_state.snapshot_dir(expdir, resume_state.BEST_DIR),
-                             resume_state.BEST_MODEL),
-                blob, SRC_BEST,
+        best = snap_candidate(resume_state.BEST_DIR, SRC_BEST)
+        if best is not None:
+            candidates.append(best)
+        else:
+            logger.warning(
+                "asked to continue from the BEST diffusion snapshot, but %s holds no complete one "
+                "— continuing from the latest instead",
+                resume_state.snapshot_dir(expdir, resume_state.BEST_DIR),
             )
-        logger.warning(
-            "asked to continue from the BEST diffusion snapshot, but %s holds no complete one — "
-            "continuing from the latest instead",
-            resume_state.snapshot_dir(expdir, resume_state.BEST_DIR),
-        )
 
     numbered, numbered_step = du.latest_numbered_path(expdir)
     if numbered is not None and not os.path.isfile(numbered):
@@ -465,22 +478,43 @@ def load_start_state(expdir, model, optimizer, device="cpu", prefer=None):
         )
         numbered, numbered_step = None, -1
 
-    snap = resume_state.read_snapshot(expdir, resume_state.LATEST_DIR)
+    rest = []
+    snap = snap_candidate(resume_state.LATEST_DIR, SRC_SNAPSHOT)
     if snap is not None:
-        snap_step = int(snap.get("global_step", -1))
-        snap_path = os.path.join(resume_state.snapshot_dir(expdir, resume_state.LATEST_DIR),
-                                 resume_state.BEST_MODEL)
-        if snap_step >= numbered_step:
-            return restore(snap_path, snap, SRC_SNAPSHOT)
-        logger.info(
-            "the rolling resume snapshot is behind the numbered grid (%s < %s) — using the grid",
-            snap_step, numbered_step,
-        )
+        rest.append(snap)
+    if numbered is not None:
+        rest.append((numbered, None, SRC_NUMBERED, int(numbered_step)))
+    # Highest step first; a TIE goes to the snapshot BY DESIGN — at a graceful stop both describe
+    # the same step and only the snapshot carries the scale/RNG/dataset identity.
+    rest.sort(key=lambda c: (c[3], c[2] != SRC_NUMBERED), reverse=True)
+    candidates.extend(c for c in rest if c not in candidates)
 
-    if numbered is None:
+    if not candidates:
         logger.info("no diffusion checkpoint to restore — starting from step 0")
-        return DiffStart(0, None, SRC_FRESH, False, "")
-    return restore(numbered, None, SRC_NUMBERED)
+        return DiffStart(0, None, SRC_FRESH, False, "", 0)
+
+    poisoned = 0
+    for path, blob, source, _cand_step in candidates:
+        step, had_optimizer = du.load_checkpoint_file(path, model, optimizer, device)
+        bad = numerics.first_nonfinite_tensor(model.state_dict().items())
+        if bad is None:
+            logger.info("diffusion resume: %s (step %s) via %s",
+                        os.path.basename(path), step, source)
+            return DiffStart(int(step), blob, source, had_optimizer, path, poisoned)
+        poisoned += 1
+        logger.error(
+            "%s: %s (step %s) holds NON-FINITE weights (first: %s) — refusing to continue from it; "
+            "a previous run went numerically dead before writing it",
+            resume_state.CODE_ARCHIVE_POISONED, os.path.basename(path), step, bad,
+        )
+        # ⛔ The poisoned MOMENTS must not survive into the next attempt: the fallback may be a
+        # checkpoint with no optimizer at all, and `load_state_dict` would then simply not run.
+        optimizer.state.clear()
+
+    raise RuntimeError(
+        "%s: every diffusion archive in %s holds nan/inf weights (%d tried)"
+        % (resume_state.CODE_ARCHIVE_POISONED, expdir, poisoned)
+    )
 
 
 def _train_diff(cfg, exp_dir, reporter, stop):
@@ -543,6 +577,16 @@ def _train_diff(cfg, exp_dir, reporter, stop):
             "restart from zero", resume_state.CODE_OPTIMIZER_NOT_RESTORED, os.path.basename(start.path),
         )
         reporter.warn(resume_state.CODE_OPTIMIZER_NOT_RESTORED)
+    if start.poisoned_skipped:
+        # ★S118 §F8⒡ — we DID continue, but not from where the highest number said. Saying it is
+        # the whole point: the user's newest archive is dead, and the run they are watching is
+        # standing on an older one.
+        logger.error(
+            "%s: skipped %d archive(s) whose weights were nan/inf; continuing from %s (step %s)",
+            resume_state.CODE_ARCHIVE_POISONED, start.poisoned_skipped,
+            os.path.basename(start.path), start.step,
+        )
+        reporter.warn(resume_state.CODE_ARCHIVE_POISONED)
     for param_group in optimizer.param_groups:
         param_group['initial_lr'] = args.train.lr
         param_group['lr'] = args.train.lr * (args.train.gamma ** max(((initial_global_step-2)//args.train.decay_step),0) )

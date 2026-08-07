@@ -124,6 +124,19 @@ CODE_DATASET_CHANGED = "TRAINING_RESUME_DATASET_CHANGED"
 #: that a normal run never lands here.
 CODE_OPTIMIZER_NOT_RESTORED = "TRAINING_RESUME_OPTIMIZER_MISSING"
 
+#: Stable CODE for "the archive this run was going to continue from already holds nan/inf".
+#: ★S118 §F8⒡. Used BOTH ways on purpose, and the text says both outcomes:
+#:   * as a WARNING when an older, healthy archive was available and we continued from that;
+#:   * as the run's ERROR when there was nothing healthy left to continue from.
+#: Splitting it into two CODEs would mean two i18n texts describing one situation whose only
+#: difference is whether we could rescue it — and the severity already carries that.
+#: ⚠ Measured (S118): `torch.isnan(inf)` is False, so an inf loss walks straight through the
+#: diffusion loop's upstream nan gate; in fp32 (the default path — no GradScaler to skip the
+#: step) ONE such step leaves every weight nan and the Adam moments already unsafe, and only the
+#: step AFTER that trips the gate. If that first step lands on a save boundary the poisoned state
+#: is on disk before anything notices.
+CODE_ARCHIVE_POISONED = "TRAINING_RESUME_ARCHIVE_POISONED"
+
 
 class RestoreReport:
     """What `restore` actually managed to do — every field is reported, none is assumed.

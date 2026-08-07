@@ -538,6 +538,82 @@ check("★D20 阳性对照:json 的确会把 NaN 原样往返,而 (0.1 < nan) �
       "%r" % (_back["metric"],))
 
 print()
+print("=== ★D21-D27:§F8⒡ 毒存档既不许被写成续训点,也不许被续训 ===")
+
+
+def poison(net):
+    with torch.no_grad():
+        net.w[0] = float("nan")
+    return net
+
+
+# ⒜ 发布侧:resume_point_is_safe 的两半各自独立失效(实测机制,不是手戳)
+ok_net, ok_opt, _ = fresh_pair(1.0)
+check("D21 健康的权重 + 健康的动量:允许发布",
+      numerics.resume_point_is_safe(ok_net.state_dict(), (("d", ok_opt),)) is True)
+bad_net, bad_opt, _ = fresh_pair(1.0)
+poison(bad_net)
+check("★D21b 权重坏了:拒绝发布(否则它会覆盖掉【最后一个健康的续训点】,而选择器还优先它)",
+      numerics.resume_point_is_safe(bad_net.state_dict(), (("d", bad_opt),)) is False)
+hn = TinyDiff(1.0)
+ho = torch.optim.AdamW(hn.parameters(), 1e-4, betas=[0.8, 0.99], eps=1e-9)
+for p2 in hn.parameters():                      # S117 的机制:巨大但【有限】的梯度
+    p2.grad = torch.full_like(p2, 1e21)
+ho.step()
+check("★D21c 权重全有限、只有动量死了:同样拒绝(两半独立失效 —— S117 实测过这一种)",
+      numerics.best_save_is_safe(hn.state_dict()) is True
+      and numerics.resume_point_is_safe(hn.state_dict(), (("d", ho),)) is False)
+
+# ⒝ 读取侧:毒存档要被跳过,而且【毒动量不许活到下一次尝试】
+pexp = os.path.join(tempfile.mkdtemp(prefix="s118_poison_"), "diffusion")
+svp = make_saver(pexp, 0)
+good_net, good_opt, W_GOOD = fresh_pair(2.0)
+svp.global_step = 100
+RS.save_solo_snapshot(pexp, RS.LATEST_DIR, lambda p: svp.save_model_to(p, good_net, good_opt),
+                      blob=RS.capture(None, epoch=0, global_step=100, exp_dir=tmp))
+bad2 = poison(TinyDiff(8.0))
+svp.global_step = 200
+svp.save_model(bad2, None, postfix="200")        # 毒的、编号更大的、而且不带 optimizer
+st, npm, opm = start(pexp)
+check("★★D22 毒存档被跳过,退回更早的健康快照,并把跳过的条数报出来",
+      st.source == DP.SRC_SNAPSHOT and st.step == 100 and st.poisoned_skipped == 1
+      and float(npm.w[0]) == W_GOOD,
+      "source=%s step=%s skipped=%s w=%r" % (st.source, st.step, st.poisoned_skipped, float(npm.w[0])))
+check("★★D22b 而且【毒的动量没有活下来】—— 退回的那份带 optimizer,所以动量必须是它的",
+      bool(opm.state) and all(bool(torch.isfinite(v).all())
+                              for g in opm.state.values() for v in g.values()
+                              if torch.is_tensor(v)),
+      "动量条目=%d" % len(opm.state))
+check("D22c 健康路径不受影响:没有毒存档时 poisoned_skipped == 0",
+      start(dexp)[0].poisoned_skipped == 0)
+
+# ⒞ 全都是毒的 ⇒ 拒绝,而不是拿 nan 接着练
+allbad = os.path.join(tempfile.mkdtemp(prefix="s118_allbad_"), "diffusion")
+sva = make_saver(allbad, 0)
+sva.global_step = 50
+sva.save_model(poison(TinyDiff(3.0)), None, postfix="50")
+_err = None
+try:
+    start(allbad)
+except RuntimeError as e:
+    _err = str(e)
+check("★D23 一个健康的都没有 ⇒ 带着 CODE 响亮拒绝(不许拿 nan 接着练)",
+      _err is not None and _err.startswith(RS.CODE_ARCHIVE_POISONED + ":"), str(_err)[:90])
+
+# ⒟ 上游那道 nan 闸:条件逐字保留,消息换成可本地化的 CODE
+check("★D24 nan abort 现在带稳定 CODE(原本是裸英文 prose,backendError.ts 认不出来)",
+      "numerics.CODE_DIVERGED, saver.global_step" in _SOL and "if torch.isnan(loss):" in _SOL)
+check("★D25 而那个【inf 走得过去】的洞由 DivergenceGuard 接住(patience 不是 1 —— fp16 的单次溢出"
+      "按设计会自愈,实测同一个 inf 损失权重毫发无伤)",
+      "divergence.observe(saver.global_step, {'loss': current_loss})" in _SOL
+      and "numerics.DivergenceGuard(((\"diffusion\", model),)" in _SOL)
+check("★D26 滚动续训点的发布走的是那个【模块级】谓词,不是闭包里手写的两句",
+      "numerics.resume_point_is_safe(" in _SOL)
+check("D27 三个 CODE 都是 SCREAMING_SNAKE 且带 TRAINING_ 前缀",
+      all(c.startswith("TRAINING_") and c.replace("_", "").isupper()
+          for c in (RS.CODE_DATASET_CHANGED, RS.CODE_OPTIMIZER_NOT_RESTORED, RS.CODE_ARCHIVE_POISONED)))
+
+print()
 print("--- 那两个 CODE 的形状 ---")
 check("D13 两个 CODE 都是 SCREAMING_SNAKE 且带 TRAINING_ 前缀(它们要当 json 键用)",
       all(c.startswith("TRAINING_") and c.replace("_", "").isupper()

@@ -298,12 +298,30 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
 
     def refresh_resume_point(epoch):
         """Rewrite the rolling COMPLETE resume point — see `resume_state.LATEST_DIR` for why the
-        numbered grid cannot be one (upstream's `save_opt: false`)."""
-        resume_state.save_solo_snapshot(
+        numbered grid cannot be one (upstream's `save_opt: false`).
+
+        ⛔★S118 §F8⒡ — NEVER publish a poisoned one. `torch.isnan(inf)` is False (measured), so an
+        inf loss reaches `backward()`; in fp32 one such step leaves every weight nan and the
+        moments already unsafe, and the loop only notices on the step AFTER. If that first step
+        lands on a save boundary this function would otherwise overwrite the last healthy resume
+        point with a dead one — and the chooser PREFERS this file, so it would be preferred garbage.
+        Refusing leaves the previous snapshot in place, which is exactly the point the user needs
+        to roll back to.
+        """
+        if not numerics.resume_point_is_safe(
+            model.state_dict(), (("diffusion", optimizer),), logger
+        ):
+            return None
+        return resume_state.save_solo_snapshot(
             args.env.expdir, resume_state.LATEST_DIR,
             lambda path: saver.save_model_to(path, model, optimizer),
             blob=capture_state(epoch),
         )
+
+    # ★S118 §F8⒡ — the same watchdog the three GAN trainers have had since S114, on this loop's
+    # single loss. `model` is the only module here (no discriminator), so the poisoned-tensor scan
+    # names a diffusion parameter.
+    divergence = numerics.DivergenceGuard((("diffusion", model),), logger=logger)
 
     resume_state.restore(resumed, scaler, logger)
     if resumed is not None:
@@ -347,7 +365,16 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
 
             # handle nan loss
             if torch.isnan(loss):
-                raise ValueError(' [x] nan loss ')
+                # ★S118 §F8⒡ — upstream's immediate halt is KEPT verbatim in condition and timing;
+                # only the message changes, to the CODE the three GAN trainers already use. It used
+                # to be `ValueError(' [x] nan loss ')`, i.e. raw English prose that
+                # `backendError.ts` cannot recognise, so the user read a python type name while
+                # their run died. The existing text for this CODE is already the right advice
+                # ("aborted instead of carrying on for hours with broken weights; your best
+                # checkpoint was NOT overwritten; try resuming from an earlier checkpoint").
+                raise RuntimeError(
+                    '%s: nan loss at step %s (diffusion)' % (numerics.CODE_DIVERGED, saver.global_step)
+                )
             else:
                 # backpropagate
                 if dtype == torch.float32:
@@ -360,6 +387,14 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
                 scheduler.step()
 
             current_loss = loss.item()
+            # ★S118 §F8⒡ — the hole upstream's gate cannot see: an INF loss. `isnan(inf)` is False,
+            # so a run whose loss is inf forever (fp16, where GradScaler skips every step and the
+            # weights therefore stay finite) trains nothing and says nothing, indefinitely. The
+            # guard is patience-based ON PURPOSE — a SINGLE fp16 overflow is normal and recovers by
+            # design (measured: same inf loss, weights untouched, next step back to a normal
+            # value), so halting on the first one would kill healthy runs. It also brings this
+            # trainer the §4-4 diagnosis: WHERE the first non-finite step found the weights.
+            divergence.observe(saver.global_step, {'loss': current_loss})
             steps_this_run += 1
             report_step(epoch)
 

@@ -3152,36 +3152,61 @@ mod tests {
             "diffusion/solver.py must refresh the rolling resume point at all three save points"
         );
 
-        // ── the new CODE, across four languages ─────────────────────────────────────────
-        let code = py_str("CODE_OPTIMIZER_NOT_RESTORED");
-        assert!(
-            code.starts_with("TRAINING_") && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
-            "the CODE crosses a process boundary and lands in json keys: {code:?}"
-        );
-        assert!(
-            BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
-            "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
-        );
-        // ⚠ NOT modal: the run is still training, and this is a cost report, not a failure.
-        assert!(
-            !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
-            "{code} is a warning — a modal would cover a run that is still training"
-        );
-        for (lang, raw) in [
-            ("zh", include_str!("../../../src/i18n/zh.json")),
-            ("en", include_str!("../../../src/i18n/en.json")),
-            ("ja", include_str!("../../../src/i18n/ja.json")),
+        // ── ★S118 §F8f: poison must neither be published as a resume point nor resumed from ──
+        for needle in [
+            "numerics.resume_point_is_safe(",          // the rolling snapshot is never published dead
+            "divergence.observe(saver.global_step",    // the INF hole upstream's isnan cannot see
+            "numerics.CODE_DIVERGED, saver.global_step",  // …and the nan abort is localizable now
+            "if torch.isnan(loss):",                   // ⛔ upstream's CONDITION stays verbatim
         ] {
-            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
-            let msg = v
-                .pointer(&format!("/backend/{code}"))
-                .and_then(|m| m.as_str())
-                .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
             assert!(
-                msg.chars().count() >= 30,
-                "backend.{code} in {lang}.json is {} chars — too short to be the real message",
-                msg.chars().count()
+                SOLVER_PY.contains(needle),
+                "diffusion/solver.py no longer contains {needle:?} — §F8f's wiring is broken"
             );
+        }
+        assert!(
+            DIFF_PIPELINE_PY.contains("numerics.first_nonfinite_tensor(model.state_dict().items())")
+                && DIFF_PIPELINE_PY.contains("optimizer.state.clear()"),
+            "sovits/diff_pipeline.py stopped scanning a loaded archive for nan/inf (or stopped \
+             clearing the poisoned moments before trying the next candidate) — a resume would go \
+             back to training from nan"
+        );
+
+        // ── the new CODEs, across four languages ────────────────────────────────────────
+        for name in ["CODE_OPTIMIZER_NOT_RESTORED", "CODE_ARCHIVE_POISONED"] {
+            let code = py_str(name);
+            assert!(
+                code.starts_with("TRAINING_")
+                    && code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "the CODE crosses a process boundary and lands in json keys: {code:?}"
+            );
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\"")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            // ⚠ NOT modal. `CODE_ARCHIVE_POISONED` is used BOTH ways (a warning when an older
+            // healthy archive rescued the run, the run's error when nothing healthy was left), and
+            // in the rescued case the run is still training — a modal would cover it.
+            assert!(
+                !BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\", modal")),
+                "{code} can arrive while the run is still training — a modal would cover it"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to be the real message",
+                    msg.chars().count()
+                );
+            }
         }
     }
 
