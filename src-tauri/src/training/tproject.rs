@@ -956,7 +956,25 @@ pub fn cleanup_snapshots(
     let records = scan_project_ckpts(data_dir, id, family);
     // Tripwire: the ledger names exports that are nowhere on disk. Something moved or deleted
     // files behind our back, so every judgement below is suspect — report, do not delete.
-    if !meta.exported.is_empty() && !meta.exported.iter().any(|e| records.iter().any(|r| r.rel == e.from_ckpt_rel)) {
+    //
+    // ⚠ It has to compare LIKE WITH LIKE. `records` is family-filtered whenever the caller names
+    // one — and the only caller always does (Settings' per-slot「清理未导入的快照」button passes
+    // `slot.family`) — while `meta.exported` is PROJECT-wide. Comparing the two directly meant a
+    // project that had exported from one family could never clean ANOTHER: every ledger row
+    // starts with the exporting family's directory name, so it can never match a record from a
+    // different slot, the tripwire fired on a perfectly healthy ledger, and the button became a
+    // permanent hard modal for that slot. Multi-family projects are the whole point of the S76
+    // layout, so this was reachable rather than theoretical.
+    let in_scope = |rel: &str| match family {
+        // `<family>/…`. The trailing separator is load-bearing: without it `sovits` would also
+        // claim every `sovits_v2/…` row.
+        Some(f) => rel.starts_with(f) && rel.as_bytes().get(f.len()) == Some(&b'/'),
+        None => true,
+    };
+    let scoped: Vec<&ExportedModel> =
+        meta.exported.iter().filter(|e| in_scope(&e.from_ckpt_rel)).collect();
+    if !scoped.is_empty() && !scoped.iter().any(|e| records.iter().any(|r| r.rel == e.from_ckpt_rel))
+    {
         return Err(UtaiError::Training("PROJECT_LEDGER_STALE".into()));
     }
     let plan = plan_cleanup(&records, meta.export_ledger_since_ms, now_ms(), installed_stem);
@@ -2442,6 +2460,62 @@ mod tests {
         let plan = plan_cleanup(&recs, 1_000, now, &|_| false);
         assert_eq!(plan.delete.len(), 19, "this is the whole point of the feature");
         assert_eq!(plan.freeable_bytes, 1900);
+    }
+
+    /// ⛔ The stale-ledger tripwire compares a PROJECT-wide ledger against a FAMILY-filtered
+    /// record set, and every caller names a family. A project that exported from one slot could
+    /// therefore never clean another one — a hard modal, permanently, on a healthy ledger.
+    ///
+    /// Both directions are asserted here: the tripwire must stop firing on the innocent slot AND
+    /// must still fire when the rows it is actually responsible for have vanished. Asserting only
+    /// the first would pass just as well with the tripwire deleted.
+    #[test]
+    fn the_stale_ledger_tripwire_is_scoped_to_the_family_being_cleaned() {
+        let data = tmp_root("ledger");
+        let id = "led_11112222";
+        let p = project_dir(&data, id);
+        let rvc_rel = "rvc/weights/m_e1_s100.pth";
+        for rel in [rvc_rel, "sovits/weights/s_e2_s200.pth"] {
+            let f = p.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"x").unwrap();
+        }
+        let meta = ProjectMeta {
+            id: id.into(),
+            name: "n".into(),
+            // 1 ⇒ nothing is PreLedger-protected, so the plan is decided by the rules under test
+            export_ledger_since_ms: 1,
+            exported: vec![ExportedModel {
+                name: "m".into(),
+                model_type: "rvc".into(),
+                from_ckpt_rel: rvc_rel.into(),
+                at_ms: 1,
+            }],
+            ..Default::default()
+        };
+        write_meta(&data, &meta).unwrap();
+        let none = |_: &str| false;
+
+        // the innocent slot: no ledger row belongs to it, so there is nothing to be stale
+        cleanup_snapshots(&data, id, Some("sovits"), &none)
+            .expect("cleaning a family the ledger says nothing about must not read as stale");
+        // …and the family that DOES own a row is fine while the file is there
+        cleanup_snapshots(&data, id, Some("rvc"), &none).expect("its own file is on disk");
+        // project-wide is fine too
+        cleanup_snapshots(&data, id, None, &none).expect("at least one row matches");
+
+        // now make that row's file vanish behind our back — the tripwire must fire, for the
+        // family that owns it and project-wide, and only there.
+        std::fs::remove_file(p.join(rvc_rel)).unwrap();
+        for scope in [Some("rvc"), None] {
+            let err = cleanup_snapshots(&data, id, scope, &none)
+                .expect_err("a ledger row with no file on disk is exactly what this guards");
+            assert!(err.to_string().contains("PROJECT_LEDGER_STALE"), "{err}");
+        }
+        cleanup_snapshots(&data, id, Some("sovits"), &none)
+            .expect("still none of sovits' business");
+
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]
