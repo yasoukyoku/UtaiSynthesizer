@@ -271,7 +271,11 @@ pub fn read_slot_meta(slot: &Path) -> Option<SlotMeta> {
 
 /// Atomic write (tmp + rename in the same directory) — a torn `slot.json` reads as "not
 /// migrated" and would send the next boot into a second migration of an already-migrated slot.
-fn write_slot_meta(slot: &Path, meta: &SlotMeta) -> Result<()> {
+///
+/// Shared with [`super::trun`], which advances the SAME file to layout 3. Deliberately one
+/// writer: two atomic-write implementations for one commit point is how the two halves of a
+/// staged migration start disagreeing about what "committed" means.
+pub(crate) fn write_slot_meta(slot: &Path, meta: &SlotMeta) -> Result<()> {
     let io_err = |e: std::io::Error| {
         UtaiError::Training(format!("SLOT_META_WRITE_FAILED: {}: {e}", slot.display()))
     };

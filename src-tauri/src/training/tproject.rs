@@ -1498,6 +1498,7 @@ pub(crate) const WORKSPACE_SUBDIRS: &[&str] = &[
     "pools",         // §F2⒝ preprocessing pools
     "resume_best",   // S117/S118/S119 resumable best snapshot
     "resume_latest", // S118 rolling resume point
+    "runs",          // §F2⒝ batch 2 per-run container (`training::trun::RUNS_DIR`)
     "slices",        // vocoder slices
     "weights",       // published small checkpoints
 ];
@@ -1855,7 +1856,7 @@ mod tests {
         assert_eq!(sorted.as_slice(), WORKSPACE_SUBDIRS, "keep it sorted and duplicate-free");
         assert_eq!(
             WORKSPACE_SUBDIRS.len(),
-            22,
+            23,
             "adding a workspace subdirectory is a deliberate edit: add it above, then update this \
              count, then re-read why `has_family_slot` depends on the list"
         );
