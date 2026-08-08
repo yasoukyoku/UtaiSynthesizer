@@ -25,6 +25,7 @@ use crate::{Result, UtaiError};
 pub mod diagnostics;
 pub mod dsmanifest;
 pub mod resume_lock;
+pub mod tpool;
 pub mod tproject;
 
 const STDERR_RING_CAP: usize = 200;
