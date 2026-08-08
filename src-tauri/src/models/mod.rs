@@ -570,6 +570,14 @@ impl ModelRegistry {
                 let d = subdir.join(format!("{}.diffusion", stem));
                 if d.join("diffusion.json").exists() { Some(d) } else { None }
             });
+        // ★S119 §F9 — asked ONCE, here, because this is the single point every route to an
+        // attachment converges on (converted from a .pt, copied beside a direct .onnx, or
+        // unpacked from a package). Saying it per-route would be three chances to say it twice.
+        if let Some(d) = diffusion_path.as_ref() {
+            if let Some(code) = diffusion_vocoder_warning(d) {
+                warnings.push(code.to_string());
+            }
+        }
 
         let avatar_path = match avatar_file {
             Some(src) if src.exists() => match copy_avatar(&subdir, &stem, src) {
@@ -1606,6 +1614,35 @@ fn diffusion_sidecar_dim(diffusion_dir: &Path) -> Option<u64> {
         .and_then(|v| v.get("encoder_out_channels").and_then(|d| d.as_u64()))
 }
 
+/// ★S119 §F9 — what a `.diffusion` attachment says about the vocoder it was FITTED to, as an
+/// import-time warning CODE (or `None` when there is nothing worth saying).
+///
+/// WHY THIS EXISTS. A shallow-diffusion model predicts MEL; the vocoder turns that mel into
+/// audio. Fine-tune the vocoder and it is a different function, so a diffusion model trained
+/// against it is only correct WITH it. Nothing in the community's packaging expresses that
+/// dependency — the reported case (S117b) is a shared model whose fine-tuned vocoder was simply
+/// not shared, and the app had no way to say so. `export_diffusion.py` now records the vocoder's
+/// sha256 for anything WE build, so:
+///
+/// * no `vocoder` key  ⇒ this did not come from us and nobody wrote it down ⇒ 「it MAY have used
+///   a fine-tuned vocoder」— which is the honest statement, and the one the user asked for;
+/// * recorded and NOT the stock hash ⇒ we can say it definitely did.
+///
+/// ⛔ INFORMATION, at IMPORT, ONCE. Deliberately not a render-time warning and not a refusal:
+/// the vocoder it wants may not exist on this machine at all (that is the reported case), the
+/// user picks the vocoder per render anyway, and a warning that fires on every render would
+/// train the real signal into noise. The render path is not touched by this at all.
+fn diffusion_vocoder_warning(diffusion_dir: &Path) -> Option<&'static str> {
+    let v: serde_json::Value = std::fs::read_to_string(diffusion_dir.join("diffusion.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())?;
+    match v.get("vocoder").and_then(|x| x.get("is_stock")).and_then(|b| b.as_bool()) {
+        Some(true) => None,
+        Some(false) => Some("WARN_DIFFUSION_VOCODER_CUSTOM"),
+        None => Some("WARN_DIFFUSION_VOCODER_UNKNOWN"),
+    }
+}
+
 /// The directory + file stem a model's companion assets key off
 /// (`<dir>/<stem>.diffusion` etc.).
 fn entry_dir_and_stem(entry: &ModelEntry) -> Result<(PathBuf, String)> {
@@ -2096,5 +2133,119 @@ mod tests {
         assert_eq!(absent.speakers, default_speakers());
         // Unknown keys survive into `extra` (full config flows through list_models).
         assert_eq!(absent.extra.get("custom_key").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    /// ★S119 §F9 — the import-time vocoder hint: which sidecar shapes say what.
+    #[test]
+    fn s119_diffusion_vocoder_hint_reads_the_sidecar() {
+        let root = std::env::temp_dir().join(format!("utai_s119_voc_hint_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // No sidecar at all ⇒ nothing to say (the caller only asks about a dir it already
+        // decided IS an attachment, but a torn copy must not become a confident claim).
+        assert_eq!(diffusion_vocoder_warning(&root), None);
+
+        let write = |json: &str| std::fs::write(root.join("diffusion.json"), json).unwrap();
+
+        // The 东雪莲 shape: a real, complete, foreign sidecar that simply never recorded it.
+        write(r#"{"type":"diffusion","encoder_out_channels":768,"k_step_max":100}"#);
+        assert_eq!(
+            diffusion_vocoder_warning(&root),
+            Some("WARN_DIFFUSION_VOCODER_UNKNOWN"),
+            "a model that does not record its vocoder MAY have used a fine-tuned one"
+        );
+
+        // Ours, stock vocoder ⇒ SILENT. This is the one that keeps the hint from becoming noise:
+        // every model this app exports lands here.
+        write(r#"{"type":"diffusion","vocoder":{"sha256":"abc","is_stock":true}}"#);
+        assert_eq!(diffusion_vocoder_warning(&root), None);
+
+        // Recorded and NOT stock ⇒ we can state it rather than guess.
+        write(r#"{"type":"diffusion","vocoder":{"sha256":"def","is_stock":false}}"#);
+        assert_eq!(
+            diffusion_vocoder_warning(&root),
+            Some("WARN_DIFFUSION_VOCODER_CUSTOM")
+        );
+
+        // A `vocoder` key that carries no verdict is「we do not know」, not「stock」— defaulting
+        // the other way would silence the hint for exactly the malformed packages that need it.
+        write(r#"{"type":"diffusion","vocoder":{"sha256":"def"}}"#);
+        assert_eq!(
+            diffusion_vocoder_warning(&root),
+            Some("WARN_DIFFUSION_VOCODER_UNKNOWN")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★S119 §F9 — the hint only means anything if BOTH ends stay wired: python must record the
+    /// identity, the exporter must carry it into the sidecar, and the stock hash python compares
+    /// against must be the one `commands/assets.rs` actually distributes.
+    #[test]
+    fn s119_vocoder_identity_is_wired_across_python_ts_and_all_three_locales() {
+        static DIFF_PIPELINE_PY: &str =
+            include_str!("../../../training/utai_train/sovits/diff_pipeline.py");
+        static EXPORT_DIFF_PY: &str = include_str!("../../../converter/export_diffusion.py");
+        static ASSETS_RS: &str = include_str!("../commands/assets.rs");
+        static BACKEND_ERR_TS: &str = include_str!("../../../src/lib/backendError.ts");
+
+        assert!(
+            DIFF_PIPELINE_PY.contains(r#"config["vocoder"]["utai_identity"] = _vocoder_identity("#),
+            "diff_pipeline.py stopped recording which vocoder a diffusion run is fitted to"
+        );
+        assert!(
+            EXPORT_DIFF_PY.contains(r#"sidecar["vocoder"] = {"#)
+                && EXPORT_DIFF_PY.contains(r#"(cfg.get("vocoder") or {}).get("utai_identity")"#),
+            "export_diffusion.py stopped carrying the vocoder identity into diffusion.json — the \
+             import hint would then fire on this app's OWN models"
+        );
+
+        // ⛔ ONE source for the stock hash. python hard-codes it (the file may not be present at
+        // import time, so it cannot be re-hashed), and this is what stops that copy from drifting
+        // away from what the downloader actually distributes.
+        let py_hash = DIFF_PIPELINE_PY
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("STOCK_VOCODER_SHA256 = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .expect("diff_pipeline.py must keep STOCK_VOCODER_SHA256 as a plain literal");
+        let catalog_hash = ASSETS_RS
+            .lines()
+            .find(|l| l.contains(r#"rel: "training/sovits/nsf_hifigan/model""#))
+            .and_then(|l| l.rsplit_once("sha256: \""))
+            .and_then(|(_, rest)| rest.split('"').next())
+            .expect("assets.rs must still register training/sovits/nsf_hifigan/model")
+            .to_string();
+        assert_eq!(
+            py_hash, catalog_hash,
+            "diff_pipeline.STOCK_VOCODER_SHA256 no longer matches the vocoder assets.rs \
+             distributes — every model this app exports would be labelled as using a FINE-TUNED \
+             vocoder"
+        );
+
+        for code in ["WARN_DIFFUSION_VOCODER_CUSTOM", "WARN_DIFFUSION_VOCODER_UNKNOWN"] {
+            assert!(
+                BACKEND_ERR_TS.contains(&format!("{code}: {{ key: \"backend.{code}\" }}")),
+                "src/lib/backendError.ts has no mapping for {code} — the user would see the raw CODE"
+            );
+            for (lang, raw) in [
+                ("zh", include_str!("../../../src/i18n/zh.json")),
+                ("en", include_str!("../../../src/i18n/en.json")),
+                ("ja", include_str!("../../../src/i18n/ja.json")),
+            ] {
+                let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+                let msg = v
+                    .pointer(&format!("/backend/{code}"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_else(|| panic!("src/i18n/{lang}.json is missing backend.{code}"));
+                // It has to say what to DO — "your model may be wrong" with no next step is the
+                // kind of warning users learn to dismiss.
+                assert!(
+                    msg.chars().count() >= 30,
+                    "backend.{code} in {lang}.json is {} chars — too short to tell the user what \
+                     to do about it",
+                    msg.chars().count()
+                );
+            }
+        }
     }
 }

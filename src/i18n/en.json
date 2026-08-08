@@ -1063,6 +1063,8 @@
     "WARN_DIFFUSION_DIM_MISMATCH": "The diffusion model's feature dim differs from the main model — they cannot work together; the attachment was removed",
     "WARN_DIFFUSION_FILE_MISSING": "Diffusion model file not found",
     "WARN_DIFFUSION_SOVITS_ONLY": "Diffusion models are SoVITS-only — ignored",
+    "WARN_DIFFUSION_VOCODER_CUSTOM": "This model's shallow diffusion was trained against a FINE-TUNED vocoder, and vocoders are not imported with a model — if it sounds wrong, pick a different vocoder in the quality settings",
+    "WARN_DIFFUSION_VOCODER_UNKNOWN": "This model does not record which vocoder its shallow diffusion was trained against (nothing exported outside this app does) — it may have used a fine-tuned one; if it sounds wrong, pick a different vocoder in the quality settings",
     "WARN_INDEX_CONVERT_FAILED": "Index file conversion failed — model imported, but retrieval enhancement unavailable",
     "WARN_INDEX_COPY_FAILED": "Failed to copy the index file",
     "WARN_INDEX_MISSING": "Index file not found",

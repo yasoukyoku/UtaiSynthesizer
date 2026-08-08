@@ -274,6 +274,20 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
     config["spk"] = {display: 0}
     config["device"] = backend  # "cuda"|"xpu"|"cpu" -> solver args.device (shim-driven amp; xpu=fp32)
     config["vocoder"]["ckpt"] = _p(cfg["assets"]["nsf_hifigan_model"])
+    # ★S119 §F9 — WHICH vocoder this diffusion model is being trained against, recorded so the
+    # answer survives the trip to somebody else's machine.
+    #
+    # A shallow-diffusion model predicts MEL; the vocoder turns that mel into audio, and a
+    # FINE-TUNED vocoder is a different function from the stock one. Until now nothing anywhere
+    # wrote down which one a given diffusion model was fitted to — not the checkpoint, not the
+    # exported sidecar — so a model shared without its vocoder arrives sounding wrong with no
+    # way for the receiving app, or the user, to even suspect why (the 东雪莲 case, S117b).
+    #
+    # ⚠ Today this can only ever say「the stock one」: `training/mod.rs` hard-wires
+    # `assets.nsf_hifigan_model` to the shipped `training/sovits/nsf_hifigan/model` and the UI
+    # offers no choice. Recording it anyway is the point — it makes the field's ABSENCE mean
+    #「this did not come from us」, which is exactly the signal the import side needs.
+    config["vocoder"]["utai_identity"] = _vocoder_identity(cfg["assets"]["nsf_hifigan_model"])
     config["env"]["expdir"] = _p(expdir)
     config["env"]["gpu_id"] = 0  # device selection is CUDA_VISIBLE_DEVICES (runner)
     config["train"]["batch_size"] = int(cfg["batch_size"])
@@ -292,6 +306,40 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
         yaml.dump(config, f)
     os.replace(tmp, out)
     return float(config["data"]["duration"])
+
+
+#: The stock NSF-HiFiGAN this app trains shallow diffusion against — `commands/assets.rs`'s
+#: `training/sovits/nsf_hifigan/model`. Recorded as a CONSTANT rather than re-hashed at import
+#: time so that「是不是出厂那一个」is answerable without the file being present.
+STOCK_VOCODER_SHA256 = "2c576b63b7ed952161b70fad34e0562ace502ce689195520d8a2a6c051de29d6"
+
+
+def _vocoder_identity(path):
+    """`{"sha256", "bytes", "is_stock"}` for the vocoder a diffusion run is fitted to.
+
+    ★ The hash is the identity, not the file NAME: everybody's fine-tuned vocoder is called
+    `model` or `model.ckpt`, so a name would answer nothing. ~56 MB, measured well under a second
+    — and it runs once per run, at config time.
+
+    ⚠ Failing to read it must not take the training run down: this is provenance for a hint, and
+    a hint is never worth losing a training run over. An unreadable file records `sha256: None`,
+    which the import side reads exactly like a missing field — 「we do not know」.
+    """
+    import hashlib
+
+    try:
+        h = hashlib.sha256()
+        n = 0
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+                n += len(chunk)
+        digest = h.hexdigest()
+        return {"sha256": digest, "bytes": n, "is_stock": digest == STOCK_VOCODER_SHA256}
+    except OSError as e:
+        logger.warning("could not fingerprint the vocoder at %s (%s) — the exported model will "
+                       "not be able to say which vocoder it was trained against", path, e)
+        return {"sha256": None, "bytes": None, "is_stock": None}
 
 
 def _read_flist(path):

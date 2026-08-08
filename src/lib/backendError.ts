@@ -473,6 +473,12 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   WARN_DIFFUSION_DIM_MISMATCH: { key: "backend.WARN_DIFFUSION_DIM_MISMATCH" },
   WARN_DIFFUSION_FILE_MISSING: { key: "backend.WARN_DIFFUSION_FILE_MISSING" },
   WARN_DIFFUSION_SOVITS_ONLY: { key: "backend.WARN_DIFFUSION_SOVITS_ONLY" },
+  // ★S119 §F9 — INFORMATION, raised once at IMPORT and never during a render. A shallow-diffusion
+  // model predicts mel, so the vocoder it was fitted to is part of what it is; a model shared
+  // without its fine-tuned vocoder arrives sounding wrong and nothing used to say why. The render
+  // path is untouched — the user still picks the vocoder per render.
+  WARN_DIFFUSION_VOCODER_CUSTOM: { key: "backend.WARN_DIFFUSION_VOCODER_CUSTOM" },
+  WARN_DIFFUSION_VOCODER_UNKNOWN: { key: "backend.WARN_DIFFUSION_VOCODER_UNKNOWN" },
   WARN_INDEX_CONVERT_FAILED: { key: "backend.WARN_INDEX_CONVERT_FAILED" },
   WARN_INDEX_COPY_FAILED: { key: "backend.WARN_INDEX_COPY_FAILED" },
   WARN_INDEX_MISSING: { key: "backend.WARN_INDEX_MISSING" },

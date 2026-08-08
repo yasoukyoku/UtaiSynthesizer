@@ -3457,7 +3457,10 @@ mod tests {
             "cfg.get(\"resume_from\")",         // 「从最佳存档继续」 reaches this backend at all
             "resume_state.read_pointer(",       // the live branch's tip, not max(step)
             "resume_state.read_snapshot(",      // …and the best archive is read the shared way
-            "enable_version_counter=False",     // a rewind must not mint names 3 consumers reject
+            // ⚠ The exact INDENTED line, not the bare substring: a commented-out
+            // `# enable_version_counter=False,` still contains the substring, so the loose form
+            // could not tell live code from a corpse (caught by the mutation probe, S119).
+            "\n                enable_version_counter=False,\n",
             "on_saved=protocol_cb.note_saved",  // the pointer is refreshed by whoever writes
             "tip_step=protocol_cb.tip_step",    // the prune judges by the LIVE branch's tip
             "resume_state.report_drift(",       // the dataset-identity warning

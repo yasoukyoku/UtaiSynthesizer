@@ -1063,6 +1063,8 @@
     "WARN_DIFFUSION_DIM_MISMATCH": "扩散模型的特征维度与主模型不一致——两者无法配合使用，已移除该扩散附件",
     "WARN_DIFFUSION_FILE_MISSING": "扩散模型文件不存在",
     "WARN_DIFFUSION_SOVITS_ONLY": "扩散模型仅支持 SoVITS——已忽略",
+    "WARN_DIFFUSION_VOCODER_CUSTOM": "这个模型的浅扩散是对着一个【微调声码器】训练的，而声码器不会随模型一起导入——渲染时如果听感不对，请在音质设置里改选声码器",
+    "WARN_DIFFUSION_VOCODER_UNKNOWN": "这个模型没有记录它的浅扩散是对着哪个声码器训练的（不是本程序导出的模型都没有）——它可能用过微调声码器；渲染时如果听感不对，请在音质设置里改选声码器",
     "WARN_INDEX_CONVERT_FAILED": "索引文件转换失败——模型已导入，但检索增强不可用",
     "WARN_INDEX_COPY_FAILED": "索引文件复制失败",
     "WARN_INDEX_MISSING": "索引文件不存在",

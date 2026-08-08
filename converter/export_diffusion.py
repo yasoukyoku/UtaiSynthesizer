@@ -171,6 +171,20 @@ def export_diffusion_assets(input_path, outdir, config_path=None, out_dims=128):
     # --- diffusion.json (contract §2.3, EXACT schema) ---
     sidecar = {k: meta[k] for k in SIDECAR_KEYS}
     sidecar["files"] = {"encoder": "encoder.onnx", "denoiser": "denoiser.onnx"}
+    # ★S119 §F9 — WHICH vocoder this diffusion model was trained against, carried out of the
+    # training config (`vocoder.utai_identity`, written by utai_train/sovits/diff_pipeline.py).
+    #
+    # Outside SIDECAR_KEYS on purpose, exactly like `files`: §2.3 is the RUNTIME contract (the
+    # facts the sampler cannot guess) and this is provenance. Absent for every model that was not
+    # trained by this app — and that absence is the whole signal: a shallow-diffusion model
+    # predicts MEL, so a fine-tuned vocoder is part of what it was fitted to, and a model shared
+    # without its vocoder arrives sounding wrong with nothing in the package to hint at why.
+    voc_id = (cfg.get("vocoder") or {}).get("utai_identity")
+    if isinstance(voc_id, dict) and voc_id.get("sha256"):
+        sidecar["vocoder"] = {
+            "sha256": str(voc_id["sha256"]),
+            "is_stock": bool(voc_id.get("is_stock")),
+        }
     sidecar_path = outdir / "diffusion.json"
     sidecar_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2),
                             encoding="utf-8")
