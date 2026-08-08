@@ -1460,13 +1460,23 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     if (!attachTarget || attaching) return;
     setAttaching(ckpt.path);
     try {
-      await invoke("attach_diffusion", { name: attachTarget, ckptPath: ckpt.path });
+      // ★S120: attach_diffusion now answers with the import shape ({entry, warnings}) instead of
+      // a bare entry — attaching is one of the three ways an attachment becomes live, and §F9's
+      // vocoder hint has to be able to reach the user from THIS route too (it is the one the
+      // reported case walks). Same rendering funnel as import_model: localize known CODEs.
+      const outcome = await invoke<{ warnings?: string[] }>("attach_diffusion", {
+        name: attachTarget,
+        ckptPath: ckpt.path,
+      });
       await useVoiceModelStore.getState().fetchModels();
       // Attach IS the export path for shallow diffusion — its checkpoints never go through
       // import_model, so `attach_diffusion` writes the ledger row itself (Rust side, batch 3);
       // this only re-reads the list so its「已导入」marks are current.
       await refreshArchive();
       showToast(t("training.diffAttached", { name: attachTarget }), "success");
+      for (const w of outcome?.warnings ?? []) {
+        showToast(backendErrorMessage(w) ?? w, "info");
+      }
     } catch (e) {
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
     } finally {

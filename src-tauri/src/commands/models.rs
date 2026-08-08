@@ -163,12 +163,19 @@ fn record_training_export(state: &AppState, src: &Path, name: &str, model_type: 
 /// sessions are dropped — a failure leaves an existing attachment untouched
 /// and still loaded; the swap itself is rename-based with rollback.
 #[tauri::command]
+/// ★S120 — returns `ImportOutcome`, not a bare `ModelEntry`. Reason: attaching is one of the
+/// three ways a shallow-diffusion attachment becomes live, and §F9's import-time vocoder hint
+/// has to be able to reach the user from here too. Reusing `ImportOutcome` (rather than minting
+/// a second `{entry, warnings}` shape) keeps the frontend on ONE warning-rendering path — the
+/// same `backendErrorMessage(w) ?? w` funnel `import_model` already uses.
+/// ⚠ Shape change: the previous return value was the entry itself. The only caller
+/// (`TrainingPage.attachCkpt`) discarded it, so nothing read the old shape.
 pub async fn attach_diffusion(
     state: State<'_, Arc<AppState>>,
     name: String,
     ckpt_path: String,
     config_path: Option<String>,
-) -> Result<ModelEntry, String> {
+) -> Result<ImportOutcome, String> {
     // S66: the attachment converts (encoder/denoiser export) — same convert slot as import.
     let _convert = state.acquire_convert_slot()?;
     let cfg = config_path.map(PathBuf::from);
@@ -187,7 +194,7 @@ pub async fn attach_diffusion(
     // sessions hold Windows file handles on the OLD attachment — drop them
     // only now, after everything that can fail has succeeded
     state.inference.unload_voice(&name);
-    state
+    let (_dir, warnings) = state
         .models
         .commit_diffusion_attachment(&name, &tmp)
         .map_err(|e| {
@@ -199,10 +206,11 @@ pub async fn attach_diffusion(
     // `sovits` (not `sovits_diff`) is deliberate: the ledger's model_type names a REGISTRY
     // type, and the thing that got installed is a SoVITS model's attachment.
     record_training_export(&state, &PathBuf::from(&ckpt_path), &name, "sovits");
-    state
+    let entry = state
         .models
         .get(&name)
-        .ok_or_else(|| format!("MODEL_NOT_FOUND: {}", name))
+        .ok_or_else(|| format!("MODEL_NOT_FOUND: {}", name))?;
+    Ok(ImportOutcome { entry, warnings })
 }
 
 #[tauri::command]

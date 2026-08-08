@@ -570,9 +570,17 @@ impl ModelRegistry {
                 let d = subdir.join(format!("{}.diffusion", stem));
                 if d.join("diffusion.json").exists() { Some(d) } else { None }
             });
-        // ★S119 §F9 — asked ONCE, here, because this is the single point every route to an
-        // attachment converges on (converted from a .pt, copied beside a direct .onnx, or
-        // unpacked from a package). Saying it per-route would be three chances to say it twice.
+        // ★S119 §F9 — asked once per import, here, because the two ways THIS function can end up
+        // with an attachment (converted from a .pt above, or copied beside a direct .onnx) both
+        // land on `diffusion_path`. Asking per-branch would be two chances to say it twice.
+        //
+        // ⛔ S120 correction — the sentence that used to be here said this was "the single point
+        // EVERY route to an attachment converges on (… or unpacked from a package)". It was not:
+        // `import_package` and `commit_diffusion_attachment` are separate installers and neither
+        // asked, which left the reported workflow (a community 浅扩散 attached to an installed
+        // SoVITS model) silent. Both now ask at their own site, and
+        // `s120_every_attachment_installer_asks_about_the_vocoder` pins the set — the previous
+        // completeness claim was prose, and prose does not go red.
         if let Some(d) = diffusion_path.as_ref() {
             if let Some(code) = diffusion_vocoder_warning(d) {
                 warnings.push(code.to_string());
@@ -721,6 +729,23 @@ impl ModelRegistry {
             }
         }
 
+        // ★S120 — the SAME question `import_file` asks, asked on this route too. A package
+        // carries `<stem>.diffusion/` verbatim (it is in `collect_stem_family`'s portable set),
+        // so a shared model whose shallow diffusion was fitted to a fine-tuned vocoder arrives
+        // here with no `vocoder` key — and the whole point of §F9 is that the user hears about
+        // that ONCE, at import. `diffusion_vocoder_warning` is silent when there is no
+        // attachment at all (unreadable/absent sidecar ⇒ None), so no guard is needed here.
+        //
+        // ⛔ WHY THIS LINE EXISTS: S119 shipped the ask on `import_file` only, with a comment
+        // claiming "every route converges here". It did not — this route and
+        // `commit_diffusion_attachment` were both uncovered, and the SECOND of those is the
+        // reported 东雪莲 workflow. The claim was prose; prose is what failed.
+        // `attachment_installers_all_ask` now pins the set mechanically.
+        let diff_dir = subdir.join(format!("{}.diffusion", target_stem));
+        if let Some(code) = diffusion_vocoder_warning(&diff_dir) {
+            warnings.push(code.to_string());
+        }
+
         // Rebuild from disk truth (scan is THE disk→entry reconstructor — the package is exactly
         // the on-disk layout it reads), then surface the fresh entry.
         self.scan()?;
@@ -853,7 +878,14 @@ impl ModelRegistry {
     /// S39 attach flow, step 2 — the caller must have dropped the model's live
     /// sessions FIRST (they hold Windows file handles on the OLD attachment):
     /// swap the prepared temp dir into place, rolling back on failure.
-    pub fn commit_diffusion_attachment(&self, name: &str, tmp_dir: &Path) -> Result<PathBuf> {
+    /// Returns the live attachment dir **and** the non-fatal findings about it. ★S120: the
+    /// second half is new — this function is one of the three places an attachment becomes
+    /// live, and until now it had no way to say anything about what it just installed.
+    pub fn commit_diffusion_attachment(
+        &self,
+        name: &str,
+        tmp_dir: &Path,
+    ) -> Result<(PathBuf, Vec<String>)> {
         self.ensure_scanned();
         let mut entries = self.entries.write();
         let entry = entries
@@ -886,7 +918,14 @@ impl ModelRegistry {
         }
         entry.diffusion_path = Some(final_dir.clone());
         tracing::info!("attached diffusion assets for {}: {}", name, final_dir.display());
-        Ok(final_dir)
+        // ★S120 §F9 — asked HERE, at the moment the attachment becomes live, because this is the
+        // route the REPORTED case actually walks: a community 浅扩散 `.pt` attached to an
+        // already-installed SoVITS model. S119 covered only `import_file`, so the one workflow
+        // the feature was built for stayed silent.
+        let warnings: Vec<String> = diffusion_vocoder_warning(&final_dir)
+            .map(|c| vec![c.to_string()])
+            .unwrap_or_default();
+        Ok((final_dir, warnings))
     }
 
     /// S60-2: write ONE extra key into a model's sidecar json (raw-map update — unknown keys
@@ -2176,6 +2215,298 @@ mod tests {
             Some("WARN_DIFFUSION_VOCODER_UNKNOWN")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Strip comments before asking "is this identifier wired in".
+    ///
+    /// ⛔ S119 blood lesson, and the reason this helper exists at all: a bare
+    /// `src.contains("enable_version_counter=False")` stayed GREEN when the probe commented that
+    /// line out — the substring lives in the corpse too. A wiring assertion that cannot tell code
+    /// from a comment is not an assertion.
+    ///
+    /// Full-line `//` goes; a trailing `//` goes only on lines with no `"` (so a `//` inside a
+    /// string literal is never mistaken for a comment). That is deliberately conservative: the
+    /// mutation this must survive is "comment the call out", which always produces a full-line
+    /// comment.
+    fn strip_comments_for_wiring(src: &str) -> String {
+        src.lines()
+            .map(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") {
+                    return "";
+                }
+                if !l.contains('"') {
+                    if let Some(i) = l.find("//") {
+                        return &l[..i];
+                    }
+                }
+                l
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Split a Rust source into (fn name, fn body-ish chunk) pairs by `fn` headers.
+    /// Crude on purpose: a chunk runs to the next `fn` header, which is all a wiring check needs.
+    fn split_by_fn(code: &str) -> Vec<(String, String)> {
+        const HEADS: [&str; 5] = ["fn ", "pub fn ", "pub(crate) fn ", "async fn ", "pub async fn "];
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut name = String::from("<preamble>");
+        let mut body = String::new();
+        for line in code.lines() {
+            let t = line.trim_start();
+            if HEADS.iter().any(|h| t.starts_with(h)) {
+                out.push((std::mem::take(&mut name), std::mem::take(&mut body)));
+                let after = t.split("fn ").nth(1).unwrap_or("");
+                name = after
+                    .split(|c| c == '(' || c == '<')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        out.push((name, body));
+        out
+    }
+
+    /// ★★S120 §F9 — the defect this round found, turned into a gate instead of a sentence.
+    ///
+    /// S119 wired the import-time vocoder hint into `import_file` and wrote, one line above that
+    /// call, that it was「the single point every route to an attachment converges on (converted
+    /// from a .pt, copied beside a direct .onnx, **or unpacked from a package**)」. That was false
+    /// in two directions at once: `import_package` never called it, and
+    /// `commit_diffusion_attachment` — the route the REPORTED case walks — did not either.
+    /// The completeness claim was prose, and prose cannot go red.
+    ///
+    /// ⚠ **What this gate can and cannot promise** (stated here rather than implied, because
+    /// over-claiming coverage is the exact failure being repaired):
+    /// * it CAN catch a future import route that returns `ImportOutcome` and forgets to ask —
+    ///   that is group (2), the generalizing half;
+    /// * it CAN catch deleting **or commenting out** any of today's three calls — group (1),
+    ///   with comments stripped first;
+    /// * it CANNOT catch an installer that neither returns `ImportOutcome` nor appears in
+    ///   `NAMED_INSTALLERS`. That is precisely why the committer is pinned BY NAME: it returns a
+    ///   tuple, so the generalizing half would never see it.
+    ///
+    /// Group order follows the S108 rule — the specific group first, the catch-all last — so a
+    /// broken call site reds on the assertion that names it, and each group owns a mutation only
+    /// it can catch (delete the call in `commit_diffusion_attachment` ⇒ only (1); add a new
+    /// `-> Result<ImportOutcome>` fn without the call ⇒ only (2)).
+    #[test]
+    fn s120_every_attachment_installer_asks_about_the_vocoder() {
+        static SRC: &str = include_str!("mod.rs");
+        // Cut the test module off: its fixtures mention the identifier in string literals, and a
+        // wiring gate must read production code only. Fail-closed if the marker ever moves.
+        let cut = SRC
+            .find("#[cfg(test)]")
+            .expect("models/mod.rs lost its #[cfg(test)] marker — this gate reads production code only");
+        let code = strip_comments_for_wiring(&SRC[..cut]);
+        let fns = split_by_fn(&code);
+        // Parser self-check FIRST: a splitter that silently returns nothing would make every
+        // assertion below vacuously true (S105: an assertion against a table must also pin the
+        // table; S116: a classifier that has never seen a positive carries no information).
+        assert!(
+            fns.len() > 20,
+            "split_by_fn parsed only {} chunks out of models/mod.rs — the gate below would pass \
+             vacuously. Fix the splitter, do not relax the assertions.",
+            fns.len()
+        );
+
+        // ── group (1): the three installers we know about today, BY NAME ──────────────────
+        const NAMED_INSTALLERS: [&str; 3] =
+            ["import_file", "import_package", "commit_diffusion_attachment"];
+        for want in NAMED_INSTALLERS {
+            let (_, body) = fns
+                .iter()
+                .find(|(n, _)| n == want)
+                .unwrap_or_else(|| panic!("`{}` is gone from models/mod.rs — if an attachment \
+                     installer was renamed or removed, update NAMED_INSTALLERS *and* re-check \
+                     that the new shape still asks about the vocoder.", want));
+            assert!(
+                body.contains("diffusion_vocoder_warning("),
+                "`{}` installs a live <stem>.diffusion/ but never asks \
+                 `diffusion_vocoder_warning` about it.\n\
+                 That is §F9's whole contract: the hint is one-shot, AT IMPORT. A route that \
+                 skips it is silent for exactly the shared community model the feature exists \
+                 for (浅扩散 shared without its fine-tuned vocoder).\n\
+                 ⚠ Do NOT satisfy this by writing the identifier in a comment — comments are \
+                 stripped before this check.",
+                want
+            );
+        }
+
+        // ── group (2): catch-all — any NEW import route must ask too ──────────────────────
+        let mut generalized = 0usize;
+        for (name, body) in &fns {
+            let head = body.lines().take(14).collect::<Vec<_>>().join(" ");
+            if head.contains("-> Result<ImportOutcome>") {
+                generalized += 1;
+                assert!(
+                    body.contains("diffusion_vocoder_warning("),
+                    "`{}` returns ImportOutcome (i.e. it installs a model and can carry \
+                     warnings) but never asks about the diffusion vocoder. Add the ask; do not \
+                     add an exception here.",
+                    name
+                );
+            }
+        }
+        assert!(
+            generalized >= 2,
+            "expected at least the two ImportOutcome routes (import_file, import_package), found \
+             {} — the signature match broke, so group (2) stopped checking anything.",
+            generalized
+        );
+    }
+
+    /// ★★S120 §F9 — BEHAVIOUR on the package route. This is the half the wiring gate above
+    /// structurally cannot prove: that one only shows the identifier appears inside the function;
+    /// this one drives a real export → extract → import round trip and reads what the caller
+    /// actually receives.
+    ///
+    /// TWO ARMS on purpose (S92p: a pinning test whose arms return the same value has tested
+    /// nothing). Same fixture, same route, differing ONLY in whether `diffusion.json` recorded a
+    /// vocoder — one must warn, the other must stay silent. The silent arm is not decoration: it
+    /// is the property that keeps §F9 from degrading into noise, since every model this app
+    /// exports lands there.
+    #[test]
+    fn s120_package_import_surfaces_the_vocoder_hint() {
+        let round_trip = |diff_json: &str, tag: &str| -> Vec<String> {
+            let models_dir = temp_models_dir();
+            let sovits_dir = models_dir.join("sovits");
+            std::fs::create_dir_all(&sovits_dir).unwrap();
+            // CJK + space: the shared-community shape this feature exists for.
+            let name = format!("東雪蓮風 {}", tag);
+            std::fs::write(sovits_dir.join(format!("{}.onnx", name)), b"main-graph-bytes").unwrap();
+            std::fs::write(
+                sovits_dir.join(format!("{}.json", name)),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "name": name, "type": "sovits", "sample_rate": 44100,
+                    "speech_encoder": "vec768l12",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let diff = sovits_dir.join(format!("{}.diffusion", name));
+            std::fs::create_dir_all(&diff).unwrap();
+            std::fs::write(diff.join("diffusion.json"), diff_json).unwrap();
+            std::fs::write(diff.join("denoiser.onnx"), b"denoise").unwrap();
+
+            let reg = ModelRegistry::new(models_dir.clone());
+            let entry = reg
+                .get_by_type(&name, &ModelType::SoVits)
+                .expect("scan should find the fixture model");
+            assert!(
+                entry.diffusion_path.is_some(),
+                "fixture must actually carry an attachment, else both arms answer 'no warning' \
+                 for the wrong reason"
+            );
+
+            let zip_path = models_dir.join("pkg.zip");
+            write_model_package(&entry, "sovits", &zip_path).unwrap();
+            let pkg_dir = extract_zip_for_test(&zip_path, &models_dir.join("extracted"));
+            let manifest: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(pkg_dir.join("utai-package").join("manifest.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            let pkg_stem = manifest["stem"].as_str().unwrap().to_string();
+
+            let reg2 = ModelRegistry::new(temp_models_dir());
+            reg2.import_package(&name, ModelType::SoVits, &pkg_dir, &pkg_stem)
+                .unwrap()
+                .warnings
+        };
+
+        // Arm 1 — the reported shape: a real, complete, foreign sidecar that simply never said.
+        let unknown = round_trip(r#"{"type":"diffusion","encoder_out_channels":768}"#, "a");
+        assert!(
+            unknown.iter().any(|w| w == "WARN_DIFFUSION_VOCODER_UNKNOWN"),
+            "a package whose 浅扩散 never recorded its vocoder must say so on the PACKAGE route \
+             too — this route was silent from S119 until S120. got {:?}",
+            unknown
+        );
+
+        // Arm 2 — ours, stock vocoder: silence, or the hint trains itself into noise.
+        let stock = round_trip(
+            r#"{"type":"diffusion","vocoder":{"sha256":"abc","is_stock":true}}"#,
+            "b",
+        );
+        assert!(
+            !stock.iter().any(|w| w.starts_with("WARN_DIFFUSION_VOCODER")),
+            "a model this app exported (stock vocoder) must stay silent. got {:?}",
+            stock
+        );
+    }
+
+    /// ★★S120 §F9 — BEHAVIOUR on the ATTACH route, which is the one the reported case actually
+    /// walks: 「社区分享的 SoVITS 模型带了浅扩散、没带它的微调声码器」→ the user attaches that
+    /// `.pt` to an already-installed model. S119 left this route silent, and it is also the route
+    /// that had no warnings channel at all until this round (`attach_diffusion` returned a bare
+    /// `ModelEntry`), so this test is what proves the new channel actually carries something.
+    ///
+    /// Drives `commit_diffusion_attachment` directly — the conversion half
+    /// (`prepare_diffusion_attachment`) shells out to python and is not what is under test here;
+    /// what is under test is「the moment an attachment becomes live, does it say anything」.
+    /// Two arms again, for the same reason as the package test.
+    #[test]
+    fn s120_attach_route_surfaces_the_vocoder_hint() {
+        let attach = |diff_json: &str, tag: &str| -> Vec<String> {
+            let models_dir = temp_models_dir();
+            let sovits_dir = models_dir.join("sovits");
+            std::fs::create_dir_all(&sovits_dir).unwrap();
+            let name = format!("東雪蓮 attach {}", tag);
+            std::fs::write(sovits_dir.join(format!("{}.onnx", name)), b"main-graph-bytes").unwrap();
+            std::fs::write(
+                sovits_dir.join(format!("{}.json", name)),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "name": name, "type": "sovits", "sample_rate": 44100,
+                    "speech_encoder": "vec768l12",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let reg = ModelRegistry::new(models_dir.clone());
+            let entry = reg
+                .get_by_type(&name, &ModelType::SoVits)
+                .expect("scan should find the host model");
+            assert!(
+                entry.diffusion_path.is_none(),
+                "the host must start WITHOUT an attachment, or this test could pass on the old one"
+            );
+
+            // what `prepare_diffusion_attachment` hands over: a staged, converted dir
+            let stem = entry.path.file_stem().unwrap().to_string_lossy().to_string();
+            let tmp = sovits_dir.join(format!("{}.diffusion.tmp_probe_{}", stem, tag));
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("diffusion.json"), diff_json).unwrap();
+            std::fs::write(tmp.join("denoiser.onnx"), b"denoise").unwrap();
+
+            let (dir, warnings) = reg.commit_diffusion_attachment(&name, &tmp).unwrap();
+            assert!(dir.join("diffusion.json").exists(), "the attachment must be live");
+            warnings
+        };
+
+        let unknown = attach(r#"{"type":"diffusion","encoder_out_channels":768}"#, "a");
+        assert!(
+            unknown.iter().any(|w| w == "WARN_DIFFUSION_VOCODER_UNKNOWN"),
+            "attaching a community 浅扩散 that never recorded its vocoder must say so — this is \
+             THE reported workflow, and it was silent from S119 until S120. got {:?}",
+            unknown
+        );
+
+        let stock = attach(
+            r#"{"type":"diffusion","vocoder":{"sha256":"abc","is_stock":true}}"#,
+            "b",
+        );
+        assert!(
+            !stock.iter().any(|w| w.starts_with("WARN_DIFFUSION_VOCODER")),
+            "attaching something WE trained (stock vocoder) must stay silent. got {:?}",
+            stock
+        );
     }
 
     /// ★S119 §F9 — the hint only means anything if BOTH ends stay wired: python must record the
