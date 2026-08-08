@@ -171,18 +171,87 @@ def samples_equal(pa, pb):
     return ra == rb and da.shape == db.shape and np.array_equal(da, db)
 
 
+def pools_in(root):
+    """Pool ids under `<slot>/pools`, sorted. Dot entries are migration staging, never a pool."""
+    pools = os.path.join(root, "pools")
+    if not os.path.isdir(pools):
+        return []
+    return sorted(n for n in os.listdir(pools) if not n.startswith("."))
+
+
+def text_equal_modulo_pool(pa, pb, prefix_a, prefix_b):
+    """Text equality after deleting the pool path segment from both sides.
+
+    Both separators are handled because filelists are written with forward slashes while the
+    workspace paths they are built from use the platform separator.
+    """
+    def norm(path, prefix):
+        s = open(path, encoding="utf-8", errors="replace").read()
+        for p in filter(None, {prefix, prefix.replace(os.sep, "/")}):
+            s = s.replace(p, "")
+        return s
+
+    return norm(pa, prefix_a) == norm(pb, prefix_b)
+
+
+def pool_prefix(root):
+    """The ONE declared relocation of §F2⒝: `<slot>/pools/<pool_id>/`, or "" if this side has none.
+
+    Returned so the comparison can state exactly what it normalised. Refuses to guess when a slot
+    holds more than one pool — the whole point of the layout is that several can coexist, and a
+    normaliser that silently picked one would be comparing an arbitrary half of the tree.
+    """
+    ids = pools_in(root)
+    if not ids:
+        return ""
+    if len(ids) != 1:
+        raise SystemExit(
+            "gate cannot normalise a slot holding %d pools (%s) — a cold single-identity run must "
+            "produce exactly one" % (len(ids), ids)
+        )
+    return os.path.join("pools", ids[0]) + os.sep
+
+
+def pool_of(root):
+    """The preprocessing pool directory of a slot, or the slot itself when it has none.
+
+    Shared with `gate_aug_pipeline` so both gates ask ONE question about where the products are.
+    """
+    p = pool_prefix(root)
+    return os.path.join(root, p.rstrip(os.sep)) if p else root
+
+
 def compare_trees(base, ours):
-    def walk(root):
+    # ⚠ §F2⒝: the preprocessing products moved from the slot root into `pools/<id>/`, and the
+    # absolute paths embedded in filelists moved with them. That is ONE declared relocation, so it
+    # is normalised away here rather than being reported 30 times as "extra in ours" — but the
+    # relocation itself is then NOT what this gate proves. It is pinned separately, by
+    # `tpool::POOL_ENTRIES` + `gate_pool_table.py` + the migration's multiset comparison.
+    # What survives here is this gate's actual claim: the product BYTES are unchanged.
+    prefix_a, prefix_b = pool_prefix(base), pool_prefix(ours)
+    if prefix_a or prefix_b:
+        print("  [note] normalising the pool relocation: base=%r ours=%r"
+              % (prefix_a or "<none>", prefix_b or "<none>"))
+
+    def walk(root, strip):
         out = {}
         for dirpath, _, files in os.walk(root):
             for f in files:
                 if f in EXCLUDE_FILES:
                     continue
                 p = os.path.join(dirpath, f)
-                out[os.path.relpath(p, root)] = p
+                rel = os.path.relpath(p, root)
+                if strip and rel.startswith(strip):
+                    rel = rel[len(strip):]
+                if rel in out:
+                    raise SystemExit(
+                        "pool normalisation collided on %r — the same relative path exists both "
+                        "inside and outside the pool, so this comparison cannot be trusted" % rel
+                    )
+                out[rel] = p
         return out
 
-    a, b = walk(base), walk(ours)
+    a, b = walk(base, prefix_a), walk(ours, prefix_b)
     bad = []
     only_a = sorted(set(a) - set(b))
     only_b = sorted(set(b) - set(a))
@@ -202,6 +271,14 @@ def compare_trees(base, ours):
         if rel.endswith(".wav") and samples_equal(a[rel], b[rel]):
             same_ct += 1
             print("  [note] %s: bytes differ, samples exact-equal (PEAK-chunk timestamp axis)" % rel)
+            continue
+        # filelists hold ABSOLUTE paths into the products, so the same relocation shows up inside
+        # them. Normalised on the same terms, and only for text — never for a product.
+        if rel.endswith((".txt", ".json")) and text_equal_modulo_pool(
+            a[rel], b[rel], prefix_a, prefix_b
+        ):
+            same_ct += 1
+            print("  [note] %s: identical after normalising the pool path segment" % rel)
             continue
         bad.append("content differs: %s" % rel)
     print("compared %d files: %d identical, %d problems" % (len(a | b.keys() if False else set(a) | set(b)), same_ct, len(bad)))

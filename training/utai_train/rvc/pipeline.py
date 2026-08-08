@@ -31,7 +31,8 @@ import numpy as np
 from . import train_utils as utils
 from .. import device as device_shim
 from ..augment import augment_slices, is_aug_name, list_aug_entries, read_wav, run_f0_gate
-from ..cache import dataset_fingerprint, invalidate_extract_caches
+from ..cache import dataset_fingerprint
+from ..pool import assert_identity, open_pool
 from .extract_f0 import extract_f0
 from .extract_feature import extract_features
 from .filelist import build_filelist_and_config
@@ -42,9 +43,6 @@ from .train import train
 logger = logging.getLogger(__name__)
 
 SR_MAP = {"32k": 32000, "40k": 40000, "48k": 48000}
-
-# f0/feature caches are keyed by slice file name — see utai_train/cache.py
-EXTRACT_CACHE_SUBDIRS = ("2a_f0", "2b-f0nsf", "3_feature256", "3_feature768")
 
 
 def _resolve_rvc_speakers(cfg):
@@ -92,27 +90,32 @@ def run(cfg, reporter, stop):
         if is_multi
         else dataset_fingerprint(cfg["dataset_dir"])
     )
-    invalidate_extract_caches(exp_dir, fp_src, EXTRACT_CACHE_SUBDIRS)
+    # §F2⒝ — the identity now NAMES the directory the products live in instead of gating a
+    # `shutil.rmtree` of them. The fp_text above is unchanged, so the pool boundary is exactly
+    # today's cache-invalidation boundary; the only difference is that a run with a different
+    # identity gets a sibling directory instead of deleting this one.
+    pool_dir = open_pool(exp_dir, fp_src)
+    assert_identity(pool_dir, fp_src)
 
     per = float(cfg.get("per", 3.7))
     if is_multi:
-        _wipe_slice_dirs(exp_dir)  # once, before the loop — later speakers must not clobber earlier
+        _wipe_slice_dirs(pool_dir)  # once, before the loop — later speakers must not clobber earlier
         for sp in speakers:
             stop.check()
             preprocess_trainset(
-                sp["dataset_dir"], SR_MAP[sr_str], exp_dir, per, ffmpeg, reporter, stop,
+                sp["dataset_dir"], SR_MAP[sr_str], pool_dir, per, ffmpeg, reporter, stop,
                 spk_prefix="%d_" % sp["spk_id"], wipe=False,
             )
     else:
         preprocess_trainset(
-            cfg["dataset_dir"], SR_MAP[sr_str], exp_dir, per, ffmpeg, reporter, stop,
+            cfg["dataset_dir"], SR_MAP[sr_str], pool_dir, per, ffmpeg, reporter, stop,
         )
 
     stop.check()
-    _augment_rvc(exp_dir, int(cfg.get("aug_copies", 0)), seed, reporter, stop)
+    _augment_rvc(pool_dir, int(cfg.get("aug_copies", 0)), seed, reporter, stop)
 
     extract_f0(
-        exp_dir,
+        pool_dir,
         assets["rmvpe_pt"],
         backend,  # "cuda"|"xpu"|"cpu" bare device string (rmvpe checks str(device)=="cuda")
         backend == "cuda",  # is_half: rmvpe half is CUDA-only (upstream always-half-on-NVIDIA); xpu/cpu run float
@@ -121,17 +124,21 @@ def run(cfg, reporter, stop):
         stop,
     )
 
-    extract_features(exp_dir, version, assets["contentvec_onnx"], reporter, stop)
+    extract_features(pool_dir, version, assets["contentvec_onnx"], reporter, stop)
 
     stop.check()
-    _rvc_aug_gate(exp_dir, reporter, stop)
+    # products from the pool, report at the slot root: the gate report is a RUN artifact (it
+    # describes what this run's aug plan produced), and the publish chain reads it by a fixed
+    # slot-relative name.
+    _rvc_aug_gate(pool_dir, exp_dir, reporter, stop)
 
     stop.check()
-    index_path, index_rows = build_index(exp_dir, version, seed, reporter)
+    index_path, index_rows = build_index(exp_dir, pool_dir, version, seed, reporter)
 
     stop.check()
     build_filelist_and_config(
         exp_dir,
+        pool_dir,
         sr_str,
         version,
         # ①c: mute rows use spk 0 (silence — negligible per-speaker bias); real slices resolve
@@ -147,7 +154,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
-    summary = train(cfg, exp_dir, reporter, stop)
+    summary = train(cfg, exp_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:
         raise RuntimeError(
@@ -173,29 +180,31 @@ _RVC_AUG_PRODUCTS = (
 )
 
 
-def _rvc_meta_dir(exp_dir):
-    return os.path.join(exp_dir, "aug_meta")
+def _rvc_meta_dir(pool_dir):
+    # aug_meta belongs to the POOL: it records which slices are augmentations, of what, with
+    # which seed — it lives and dies with the slices it describes.
+    return os.path.join(pool_dir, "aug_meta")
 
 
-def _remove_rvc_aug_products(exp_dir, stem):
+def _remove_rvc_aug_products(pool_dir, stem):
     for rel, suffix in (("0_gt_wavs", ".wav"),) + _RVC_AUG_PRODUCTS:
-        p = os.path.join(exp_dir, rel, stem + suffix)
+        p = os.path.join(pool_dir, rel, stem + suffix)
         try:
             os.remove(p)
         except OSError:
             pass
     try:
-        os.remove(os.path.join(_rvc_meta_dir(exp_dir), stem + ".json"))
+        os.remove(os.path.join(_rvc_meta_dir(pool_dir), stem + ".json"))
     except OSError:
         pass
 
 
-def _augment_rvc(exp_dir, copies, seed, reporter, stop):
+def _augment_rvc(pool_dir, copies, seed, reporter, stop):
     import librosa
     from scipy.io import wavfile
 
-    gt_dir = os.path.join(exp_dir, "0_gt_wavs")
-    wav16k_dir = os.path.join(exp_dir, "1_16k_wavs")
+    gt_dir = os.path.join(pool_dir, "0_gt_wavs")
+    wav16k_dir = os.path.join(pool_dir, "1_16k_wavs")
 
     def write_gt(tmp_path, samples, sr):
         wavfile.write(tmp_path, sr, samples.astype(np.float32))
@@ -210,10 +219,10 @@ def _augment_rvc(exp_dir, copies, seed, reporter, stop):
         gt_dir,
         copies,
         seed,
-        _rvc_meta_dir(exp_dir),
+        _rvc_meta_dir(pool_dir),
         read_wav,
         write_gt,
-        lambda stem: _remove_rvc_aug_products(exp_dir, stem),
+        lambda stem: _remove_rvc_aug_products(pool_dir, stem),
         reporter,
         stop,
         companion_write_fn=write_16k_twin,
@@ -229,7 +238,7 @@ def _augment_rvc(exp_dir, copies, seed, reporter, stop):
         if n.endswith(".wav") and is_aug_name(n)
     }
     for rel, _suffix in _RVC_AUG_PRODUCTS:
-        d = os.path.join(exp_dir, rel)
+        d = os.path.join(pool_dir, rel)
         if not os.path.isdir(d):
             continue
         for name in os.listdir(d):
@@ -240,12 +249,12 @@ def _augment_rvc(exp_dir, copies, seed, reporter, stop):
                     pass
 
 
-def _rvc_aug_gate(exp_dir, reporter, stop):
+def _rvc_aug_gate(pool_dir, slot_dir, reporter, stop):
     """f0 quality gate on the 2b-f0nsf products (Hz floats, unvoiced = 0,
     NOT interpolated — voiced mask is f0 > 0; 2a_f0 is the 256-bin coarse
     quantization and must never be used for cents comparisons)."""
-    gt_dir = os.path.join(exp_dir, "0_gt_wavs")
-    f0nsf_dir = os.path.join(exp_dir, "2b-f0nsf")
+    gt_dir = os.path.join(pool_dir, "0_gt_wavs")
+    f0nsf_dir = os.path.join(pool_dir, "2b-f0nsf")
 
     def load_f0(stem):
         try:
@@ -257,10 +266,10 @@ def _rvc_aug_gate(exp_dir, reporter, stop):
             return None
 
     run_f0_gate(
-        list_aug_entries(gt_dir, _rvc_meta_dir(exp_dir)),
+        list_aug_entries(gt_dir, _rvc_meta_dir(pool_dir)),
         load_f0,
-        lambda stem: _remove_rvc_aug_products(exp_dir, stem),
+        lambda stem: _remove_rvc_aug_products(pool_dir, stem),
         reporter,
         stop,
-        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+        report_path=os.path.join(slot_dir, "aug_gate_report.json"),
     )

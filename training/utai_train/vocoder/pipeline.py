@@ -98,7 +98,8 @@ from ..augment import (
     run_f0_gate,
 )
 from .. import device as device_shim
-from ..cache import dataset_fingerprint, invalidate_extract_caches
+from ..cache import dataset_fingerprint
+from ..pool import assert_identity, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 from ..sovits.preprocess import _decode  # single source decoder (librosa+ffmpeg)
@@ -133,16 +134,21 @@ def run(cfg, reporter, stop):
     # ---- cache identity (slices + npz are keyed on slice names — S37 lesson;
     # bump the version tag whenever slice/process semantics change) ----
     fp_text = "%s|vocoder-v3" % dataset_fingerprint(cfg["dataset_dir"])
-    invalidate_extract_caches(exp_dir, fp_text, ("slices", "npz"))
+    # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
+    # ⚠ This chain is the FLATTEST of the five (pool and run products sat side by side at the
+    # workspace root with no existing divide), which is why every path below is now derived from
+    # one of two explicitly named directories instead of from `exp_dir` alone.
+    pool_dir = open_pool(exp_dir, fp_text)
+    assert_identity(pool_dir, fp_text)
 
-    slices_dir = os.path.join(exp_dir, "slices")
-    npz_dir = os.path.join(exp_dir, "npz")
-    flist_dir = os.path.join(exp_dir, "filelists")
+    slices_dir = os.path.join(pool_dir, "slices")
+    npz_dir = os.path.join(pool_dir, "npz")
+    flist_dir = os.path.join(exp_dir, "filelists")  # RUN product: rewritten every run
 
     slice_dataset(cfg["dataset_dir"], slices_dir, assets["ffmpeg"], reporter, stop)
 
     stop.check()
-    _augment_vocoder(exp_dir, slices_dir, npz_dir,
+    _augment_vocoder(pool_dir, slices_dir, npz_dir,
                      int(cfg.get("aug_copies", 0)), int(cfg.get("seed", 1234)),
                      reporter, stop)
 
@@ -156,7 +162,7 @@ def run(cfg, reporter, stop):
     # prior smooths over frames rmvpe reads as 300+ cents off — gate_aug_semantic
     # part 4 keeps that blind spot on record), so the gate must not use the
     # npz f0 products
-    _vocoder_aug_gate(exp_dir, slices_dir, npz_dir,
+    _vocoder_aug_gate(pool_dir, exp_dir, slices_dir, npz_dir,
                       assets.get("rmvpe_pt", ""), backend, reporter, stop)
 
     stop.check()
@@ -165,7 +171,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载底模与数据，训练即将开始")
-    summary = _train(cfg, exp_dir, config, reporter, stop)
+    summary = _train(cfg, exp_dir, pool_dir, config, reporter, stop)
 
     stopped = summary.pop("stopped")
     reporter.done("stopped" if stopped else "completed", summary)
@@ -348,18 +354,27 @@ def build_filelists(npz_dir, flist_dir, seed, crop_frames, reporter):
 
 # ─── S41 PSOLA augmentation (design doc B3, vocoder row) ─────────────────────
 
-def _vocoder_meta_dir(exp_dir):
-    return os.path.join(exp_dir, "aug_meta")
+def _vocoder_meta_dir(pool_dir):
+    """⛔ THE one derivation of this path.
+
+    Until §F2⒝ there were TWO: this function (from the workspace) and a second, independent
+    `os.path.dirname(slices_dir) + "/aug_meta"` inside `_remove_vocoder_aug_products`. They agreed
+    only while `slices_dir == <workspace>/slices` was true — and the moment the slices moved into
+    a pool, changing one and not the other would have made the remover delete meta files from a
+    directory the lister never reads: aug slices whose wav+npz are gone but whose meta says they
+    exist. Silent, and it survives every run. So there is now exactly one derivation and the other
+    call site goes through it."""
+    return os.path.join(pool_dir, "aug_meta")
 
 
-def _remove_vocoder_aug_products(slices_dir, npz_dir, stem):
+def _remove_vocoder_aug_products(pool_dir, slices_dir, npz_dir, stem):
     """wav + npz + meta as ONE unit — the trainer reads npz only (audio is
     embedded), so a deleted wav with a surviving npz would keep training on
     'removed' data invisibly (red-team F4/V18, the quietest pollution channel)."""
     for p in (
         os.path.join(slices_dir, stem + ".wav"),
         os.path.join(npz_dir, stem + ".npz"),
-        os.path.join(os.path.dirname(slices_dir), "aug_meta", stem + ".json"),
+        os.path.join(_vocoder_meta_dir(pool_dir), stem + ".json"),
     ):
         try:
             os.remove(p)
@@ -367,10 +382,10 @@ def _remove_vocoder_aug_products(slices_dir, npz_dir, stem):
             pass
 
 
-def _augment_vocoder(exp_dir, slices_dir, npz_dir, copies, seed, reporter, stop):
+def _augment_vocoder(pool_dir, slices_dir, npz_dir, copies, seed, reporter, stop):
     import soundfile as sf
 
-    meta_dir = _vocoder_meta_dir(exp_dir)
+    meta_dir = _vocoder_meta_dir(pool_dir)
 
     def write_float(tmp_path, samples, sr):
         # explicit format: the .tmp suffix defeats soundfile's inference; the
@@ -385,7 +400,7 @@ def _augment_vocoder(exp_dir, slices_dir, npz_dir, copies, seed, reporter, stop)
         meta_dir,
         read_wav,
         write_float,
-        lambda stem: _remove_vocoder_aug_products(slices_dir, npz_dir, stem),
+        lambda stem: _remove_vocoder_aug_products(pool_dir, slices_dir, npz_dir, stem),
         reporter,
         stop,
     )
@@ -404,13 +419,18 @@ def _augment_vocoder(exp_dir, slices_dir, npz_dir, copies, seed, reporter, stop)
                     pass
 
 
-def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter, stop):
+def _vocoder_aug_gate(pool_dir, slot_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter, stop):
     """rmvpe-blooded f0 gate over the aug AUDIO pairs (never the npz f0 — its
     parselmouth lineage is blind to the PSOLA glitch tail, see run())."""
-    entries = list_aug_entries(slices_dir, _vocoder_meta_dir(exp_dir))
+    entries = list_aug_entries(slices_dir, _vocoder_meta_dir(pool_dir))
+    report_path = os.path.join(slot_dir, "aug_gate_report.json")
     if not entries:
+        # ⚠ `report_path` on this arm too. It was omitted, so this chain alone kept a PREVIOUS
+        # run's report after augmentation went back to zero — the same shape as the two
+        # independent aug_meta derivations this file used to have: one call site quietly not
+        # obeying the contract the others do.
         run_f0_gate(entries, lambda stem: None,
-                    lambda stem: None, reporter, stop)
+                    lambda stem: None, reporter, stop, report_path=report_path)
         return
     if not rmvpe_pt or not os.path.isfile(rmvpe_pt):
         raise RuntimeError(
@@ -444,10 +464,12 @@ def _vocoder_aug_gate(exp_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter,
     run_f0_gate(
         entries,
         load_f0,
-        lambda stem: _remove_vocoder_aug_products(slices_dir, npz_dir, stem),
+        lambda stem: _remove_vocoder_aug_products(pool_dir, slices_dir, npz_dir, stem),
         reporter,
         stop,
-        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+        # RUN artifact: it describes what THIS run's aug plan produced, and the slot-relative
+        # name is what the publish chain reads.
+        report_path=report_path,
     )
 
 
@@ -760,7 +782,7 @@ def _prune_workspace_ckpts(exp_dir, keep, tip_step=None):
             pass
 
 
-def _train(cfg, exp_dir, config, reporter, stop):
+def _train(cfg, exp_dir, pool_dir, config, reporter, stop):
     """Transcription of upstream train.py:31-104 (same statement order — the
     RNG stream from seed_everything through fit must match the original for
     gate1) + the utai protocol callback. No RNG consumption is allowed between
@@ -816,7 +838,7 @@ def _train(cfg, exp_dir, config, reporter, stop):
     task = UtaiNsfTask(config=config)
 
     protocol_cb = UtaiProtocolCallback(
-        reporter, stop, cfg["total_steps"], work_dir, pristine,
+        reporter, stop, cfg["total_steps"], work_dir, pool_dir, pristine,
         resumed=start.blob, start_step=start.step, dataset_items=train_items,
     )
     if start.source != SRC_FRESH:
@@ -824,7 +846,7 @@ def _train(cfg, exp_dir, config, reporter, stop):
         # resume header both come out of it (`utai_train.resume_state.report_drift`).
         resume_state.report_drift(
             start.blob, reporter, logger,
-            exp_dir=work_dir, dataset_items=train_items,
+            pool_dir=pool_dir, dataset_items=train_items,
         )
     trainer = pl.Trainer(
         accelerator=config["pl_trainer_accelerator"],

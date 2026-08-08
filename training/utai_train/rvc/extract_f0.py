@@ -60,10 +60,10 @@ class FeatureInput(object):
         return f0_coarse
 
 
-def extract_f0(exp_dir, rmvpe_pt, device, is_half, ffmpeg, reporter, stop):
-    inp_root = os.path.join(exp_dir, "1_16k_wavs")
-    opt_root1 = os.path.join(exp_dir, "2a_f0")
-    opt_root2 = os.path.join(exp_dir, "2b-f0nsf")
+def extract_f0(pool_dir, rmvpe_pt, device, is_half, ffmpeg, reporter, stop):
+    inp_root = os.path.join(pool_dir, "1_16k_wavs")
+    opt_root1 = os.path.join(pool_dir, "2a_f0")
+    opt_root2 = os.path.join(pool_dir, "2b-f0nsf")
     os.makedirs(opt_root1, exist_ok=True)
     os.makedirs(opt_root2, exist_ok=True)
 

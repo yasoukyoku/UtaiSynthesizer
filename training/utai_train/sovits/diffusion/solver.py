@@ -196,15 +196,19 @@ def test(args, model, vocoder, loader_test, saver):
 def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
           loader_train, loader_test,
           reporter=None, stop=None, total_steps=None, best_state=None,
-          resumed=None, ws_dir=None, superseded_step=None):
+          resumed=None, pool_dir=None, superseded_step=None):
     """Deviation surface (see file header): reporter/stop/total_steps/
-    best_state/resumed/ws_dir are OUR harness hooks; passing None for all of
+    best_state/resumed/pool_dir are OUR harness hooks; passing None for all of
     them runs the loop with upstream semantics (the loss-trajectory gate does
     exactly that aside from total_steps as the cutoff).
 
     `resumed` is the `state.json` of the snapshot this run continued from, or None
-    (`diff_pipeline.load_start_state` decides); `ws_dir` is the WORKSPACE, which is
-    the expdir's parent and the only place `dataset.fingerprint` lives;
+    (`diff_pipeline.load_start_state` decides); `pool_dir` is the PREPROCESSING POOL, the only
+    place `dataset.fingerprint` lives — the expdir never has one.
+    ⚠ §F2⒝ renamed this from `ws_dir`: it used to be DERIVED as "the expdir's parent", which was
+    true only while the pool was the slot root. The derivation is now an explicit fact passed in,
+    and the rename is what makes a caller that missed the change fail with a TypeError instead of
+    silently recording "dataset identity unavailable" in every resume header.
     `superseded_step` is None on a REWIND and otherwise the resumed step — see
     `_sweep_old_checkpoints`, where getting this wrong destroys an earlier branch."""
     # saver
@@ -293,7 +297,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
     def capture_state(epoch):
         return resume_state.capture(
             scaler, epoch=epoch, global_step=saver.global_step,
-            exp_dir=ws_dir, dataset_items=dataset_items, loader_len=num_batches,
+            pool_dir=pool_dir, dataset_items=dataset_items, loader_len=num_batches,
         )
 
     def refresh_resume_point(epoch):
@@ -327,7 +331,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder,
     if resumed is not None:
         resume_state.report_drift(
             resumed, reporter, logger,
-            exp_dir=ws_dir, dataset_items=dataset_items, loader_len=num_batches,
+            pool_dir=pool_dir, dataset_items=dataset_items, loader_len=num_batches,
         )
     if args.train.amp_dtype == 'fp32':
         dtype = torch.float32

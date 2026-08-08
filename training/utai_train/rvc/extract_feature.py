@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 MIN_SAMPLES = 400
 
 
-def extract_features(exp_dir, version, contentvec_onnx, reporter, stop):
+def extract_features(pool_dir, version, contentvec_onnx, reporter, stop):
     import onnxruntime as ort
 
-    inp_root = os.path.join(exp_dir, "1_16k_wavs")
+    inp_root = os.path.join(pool_dir, "1_16k_wavs")
     out_root = os.path.join(
-        exp_dir, "3_feature256" if version == "v1" else "3_feature768"
+        pool_dir, "3_feature256" if version == "v1" else "3_feature768"
     )
     os.makedirs(out_root, exist_ok=True)
 

@@ -119,7 +119,12 @@ def build_hps(cfg, exp_dir):
     return hps
 
 
-def train(cfg, exp_dir, reporter, stop):
+def train(cfg, exp_dir, pool_dir, reporter, stop):
+    # ⚠ TWO directories. `exp_dir` is the slot = where this RUN lives (checkpoints, weights,
+    # config.json, filelist.txt, the resume sidecars). `pool_dir` is the preprocessing pool this
+    # run was matched to; the trainer needs it for exactly one thing — reading the dataset
+    # identity that goes into the resume sidecar, which is what makes "the data changed under
+    # this checkpoint" answerable.
     hps = build_hps(cfg, exp_dir)
     global_step = 0
 
@@ -293,7 +298,7 @@ def train(cfg, exp_dir, reporter, stop):
     if is_resume:
         resume_state.report_drift(
             resumed, reporter, logger,
-            exp_dir=exp_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
+            pool_dir=pool_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
         )
     # S114 §F5-3 (community issue #2): halt a run whose losses have gone nan
     # instead of burning hours writing poisoned weights.
@@ -341,7 +346,7 @@ def train(cfg, exp_dir, reporter, stop):
                 exp_dir, utils.save_checkpoint, (net_g, net_d), (optim_g, optim_d),
                 hps.train.learning_rate, epoch=epoch, metric=metric,
                 blob=resume_state.capture(
-                    scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                    scaler, epoch=epoch, global_step=step, pool_dir=pool_dir,
                     dataset_items=len(train_dataset), loader_len=len(train_loader),
                 ),
             )
@@ -368,7 +373,7 @@ def train(cfg, exp_dir, reporter, stop):
                 scaler,
                 epoch=epoch,
                 global_step=global_step,
-                exp_dir=exp_dir,
+                pool_dir=pool_dir,
                 dataset_items=len(train_dataset),
                 loader_len=len(train_loader),
             ),

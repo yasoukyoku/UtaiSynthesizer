@@ -58,7 +58,7 @@ from ..augment import (
     run_f0_gate,
 )
 from .. import device as device_shim
-from ..cache import invalidate_extract_caches
+from ..pool import assert_identity, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
 from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists, resolve_speakers
@@ -127,9 +127,15 @@ def run(cfg, reporter, stop):
     # resolve_speakers is single-speaker here (multi is refused above) so this
     # is byte-identical to the pre-①c fingerprint.
     fp_text = extract_cache_fp_text(resolve_speakers(cfg), encoder, loudnorm)
-    invalidate_extract_caches(exp_dir, fp_text, ("dataset_44k",))
+    # §F2⒝ — ⛔ this MUST land on the same pool as the main sovits run: the fp_text comes from the
+    # same single-source helper, and `open_pool` selects by that text, so "shared workspace" now
+    # means "provably the same directory" instead of "the same string happened to be written
+    # last". A drift in the formula used to WIPE the main run's caches; now it would merely mint
+    # a second pool, which the identity gate catches without costing anyone their slices.
+    pool_dir = open_pool(exp_dir, fp_text)
+    assert_identity(pool_dir, fp_text)
 
-    dataset_44k = os.path.join(exp_dir, "dataset_44k")
+    dataset_44k = os.path.join(pool_dir, "dataset_44k")
     spk_dir = os.path.join(dataset_44k, slug)
     slice_and_resample(cfg["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop)
 
@@ -140,7 +146,7 @@ def run(cfg, reporter, stop):
     # slices (red-team R2/A5)
     stop.check()
     aug_copies = int(cfg.get("aug_copies", 0))
-    meta_dir = os.path.join(exp_dir, "aug_meta")
+    meta_dir = os.path.join(pool_dir, "aug_meta")  # §F2⒝: aug_meta belongs to the pool
     augment_slices(
         spk_dir,
         aug_copies,
@@ -226,7 +232,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载扩散模型与数据，训练即将开始")
-    summary = _train_diff(cfg, exp_dir, reporter, stop)
+    summary = _train_diff(cfg, exp_dir, pool_dir, reporter, stop)
 
     if summary["steps_this_run"] == 0 and not summary["stopped"]:
         raise RuntimeError(
@@ -565,7 +571,7 @@ def load_start_state(expdir, model, optimizer, device="cpu", prefer=None):
     )
 
 
-def _train_diff(cfg, exp_dir, reporter, stop):
+def _train_diff(cfg, exp_dir, pool_dir, reporter, stop):
     """Port of upstream train_diff.py __main__ (@ 730930d) — construction,
     resume-lr math (incl. the max(...,0) clamp: the base model's
     global_step=0 makes (0-2)//decay_step == -1, without the clamp every
@@ -667,9 +673,10 @@ def _train_diff(cfg, exp_dir, reporter, stop):
         reporter=reporter, stop=stop,
         total_steps=int(cfg["total_steps"]), best_state=True,
         # ★S118 §F8⒜ — `resumed` carries the scale/RNG/dataset identity of whatever archive we
-        # just loaded; `ws_dir` is the WORKSPACE (the expdir's parent), which is where
-        # `dataset.fingerprint` lives — the expdir itself never has one.
-        resumed=start.blob, ws_dir=exp_dir,
+        # just loaded; `pool_dir` is the PREPROCESSING POOL, where `dataset.fingerprint` lives —
+        # the expdir itself never has one. §F2⒝ made this an explicit argument instead of the
+        # old "expdir's parent" derivation, which stopped being true once the pool moved down.
+        resumed=start.blob, pool_dir=pool_dir,
         # ⛔ None on a REWIND (resuming from the BEST snapshot starts BELOW files an earlier run
         # wrote, and the sweep must not walk over them); otherwise the step we resumed at, whose
         # numbered file our own first save legitimately supersedes. See _sweep_old_checkpoints.

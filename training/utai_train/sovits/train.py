@@ -185,7 +185,10 @@ def load_start_state(model_dir, net_g, net_d, optim_g, optim_d, skip_optimizer, 
     return 1, 0, None
 
 
-def train(cfg, exp_dir, reporter, stop):
+def train(cfg, exp_dir, pool_dir, reporter, stop):
+    # ⚠ TWO directories: `exp_dir` is the slot (this RUN's checkpoints, weights, config,
+    # filelists, resume sidecars); `pool_dir` is the preprocessing pool this run matched, needed
+    # here only to read the dataset identity that goes into the resume sidecar.
     hps = utils.get_hparams_from_file(os.path.join(exp_dir, "config.json"))
     hps.model_dir = exp_dir
     name = cfg["model_slug"]
@@ -292,7 +295,7 @@ def train(cfg, exp_dir, reporter, stop):
     if resumed is not None:
         resume_state.report_drift(
             resumed, reporter, logger,
-            exp_dir=exp_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
+            pool_dir=pool_dir, dataset_items=len(train_dataset), loader_len=len(train_loader),
         )
     # S114 §F5-3 (community issue #2, reported on the RVC trainer — this loop has
     # the identical open-coded best tracking, so it had the identical defect).
@@ -339,7 +342,7 @@ def train(cfg, exp_dir, reporter, stop):
                 exp_dir, utils.save_checkpoint, (net_g, net_d), (optim_g, optim_d),
                 hps.train.learning_rate, epoch=epoch, metric=metric,
                 blob=resume_state.capture(
-                    scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                    scaler, epoch=epoch, global_step=step, pool_dir=pool_dir,
                     dataset_items=len(train_dataset), loader_len=len(train_loader),
                 ),
             )
@@ -362,7 +365,7 @@ def train(cfg, exp_dir, reporter, stop):
         resume_state.write(
             os.path.join(hps.model_dir, resume_state.LATEST_NAME),
             resume_state.capture(
-                scaler, epoch=epoch, global_step=step, exp_dir=exp_dir,
+                scaler, epoch=epoch, global_step=step, pool_dir=pool_dir,
                 dataset_items=len(train_dataset), loader_len=len(train_loader),
             ),
         )

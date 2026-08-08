@@ -119,23 +119,38 @@ def tree_equal_to(base, ours, label):
 # ─── per-backend descriptors ─────────────────────────────────────────────────
 
 def backend_paths(backend, ws):
+    """⚠ §F2⒝ — every path here is now explicitly on ONE side of the pool/run divide.
+
+    `pool` holds the products a preprocessing identity owns (slices, features, aug_meta); `ws` is
+    the slot, where the run's own artifacts stay (filelists, retrieval asset, config). Deriving
+    them all from `ws` was correct only while the two were the same directory, and having this
+    gate keep its own second opinion about which is which is exactly how the two would drift.
+    """
+    pool = noop.pool_of(ws)
     if backend == "sovits":
         return {
-            "slice_dir": os.path.join(ws, "dataset_44k", "gateaug"),
+            "slice_dir": os.path.join(pool, "dataset_44k", "gateaug"),
+            "meta": os.path.join(pool, "aug_meta"),
+            "cache_roots": [os.path.join(pool, "dataset_44k", "gateaug")],
             "val": os.path.join(ws, "filelists", "val.txt"),
             "train": os.path.join(ws, "filelists", "train.txt"),
             "index": os.path.join(ws, "cluster", "0.index_vectors.npy"),
         }
     if backend == "rvc":
         return {
-            "slice_dir": os.path.join(ws, "0_gt_wavs"),
+            "slice_dir": os.path.join(pool, "0_gt_wavs"),
+            "meta": os.path.join(pool, "aug_meta"),
+            "cache_roots": [os.path.join(pool, d) for d in
+                            ("2a_f0", "2b-f0nsf", "3_feature768")],
             "val": None,
             "train": os.path.join(ws, "filelist.txt"),
             "index": os.path.join(ws, "total_fea.npy"),
         }
     if backend == "vocoder":
         return {
-            "slice_dir": os.path.join(ws, "slices"),
+            "slice_dir": os.path.join(pool, "slices"),
+            "meta": os.path.join(pool, "aug_meta"),
+            "cache_roots": [os.path.join(pool, "npz")],
             "val": os.path.join(ws, "filelists", "valid"),
             "train": os.path.join(ws, "filelists", "train"),
             "index": None,
@@ -147,7 +162,6 @@ def exercise(backend):
     print("== %s" % backend)
     ws = os.path.join(GATE_ROOT, "ws_pipe_%s" % backend)
     base_snap = ws + "_c0"
-    P = backend_paths(backend, ws)
 
     # step0: fresh copies=0 baseline
     wipe(ws, base_snap)
@@ -155,11 +169,16 @@ def exercise(backend):
     snap_tree(ws, base_snap)
     check("%s: baseline has no aug artifacts" % backend,
           not [r for r in list_rel(base_snap) if is_aug_rel(r)]
-          and not os.path.isdir(os.path.join(base_snap, "aug_meta")))
+          # aug_meta lives inside the pool now, so "is there one" is asked of the whole tree
+          # rather than of one hard-coded depth — otherwise this check would pass by looking in
+          # a place where the directory can no longer appear.
+          and not [r for r in list_rel(base_snap) if r.replace("\\", "/").split("/")[-2:-1] == ["aug_meta"]])
 
     # step2: fresh copies=2
     wipe(ws)
     run_pipeline(backend, ws, 2)
+    # ⚠ AFTER the run: the pool directory does not exist until the pipeline resolves it.
+    P = backend_paths(backend, ws)
     aug_wavs = list_rel(P["slice_dir"], lambda r: is_aug_rel(r) and r.endswith(".wav"))
     check("%s: aug slices generated" % backend, len(aug_wavs) > 0, "(%d)" % len(aug_wavs))
     if P["val"]:
@@ -177,7 +196,7 @@ def exercise(backend):
         idx_base = os.path.join(base_snap, os.path.relpath(P["index"], ws))
         check("%s: retrieval asset identical to copies=0 (originals-only)" % backend,
               filecmp.cmp(P["index"], idx_base, shallow=False))
-    metas = [n for n in os.listdir(os.path.join(ws, "aug_meta"))
+    metas = [n for n in os.listdir(P["meta"])
              if n.endswith(".json") and not n.startswith("_")]
     check("%s: meta count == surviving aug count" % backend,
           len(metas) == len(aug_wavs), "(%d/%d)" % (len(metas), len(aug_wavs)))
@@ -185,10 +204,7 @@ def exercise(backend):
     # rerun2: cache semantics — feature caches live in the slice dir (sovits)
     # or sibling dirs (rvc 2a/2b/3_feature*, vocoder npz)
     slice_dir = P["slice_dir"]
-    cache_roots = {"sovits": [slice_dir],
-                   "rvc": [os.path.join(ws, d) for d in
-                           ("2a_f0", "2b-f0nsf", "3_feature768")],
-                   "vocoder": [os.path.join(ws, "npz")]}[backend]
+    cache_roots = P["cache_roots"]
     before = {r: open(os.path.join(slice_dir, r), "rb").read() for r in aug_wavs}
     mt_before = mtimes(slice_dir, aug_wavs)
 
@@ -256,9 +272,10 @@ def dirty_rejection():
     ws = os.path.join(GATE_ROOT, "ws_pipe_dirty")
     wipe(ws)
     run_pipeline("sovits", ws, 1, dataset_dir=dirty_ds)
-    spk = os.path.join(ws, "dataset_44k", "gateaug")
+    P = backend_paths("sovits", ws)
+    spk = P["slice_dir"]
     kept = [n for n in os.listdir(spk) if n.endswith(".wav") and is_aug_rel(n)]
-    metas = [n for n in os.listdir(os.path.join(ws, "aug_meta"))
+    metas = [n for n in os.listdir(P["meta"])
              if n.endswith(".json") and not n.startswith("_")]
     train = open(os.path.join(ws, "filelists", "train.txt"), encoding="utf-8").read().splitlines()
     train_aug = [l for l in train if is_aug_rel(l)]
@@ -290,7 +307,7 @@ def diff_inherit():
     ws = os.path.join(GATE_ROOT, "ws_pipe_diff")
     wipe(ws)
     run_pipeline("sovits", ws, 2)
-    spk = os.path.join(ws, "dataset_44k", "gateaug")
+    spk = backend_paths("sovits", ws)["slice_dir"]
     aug_wavs = list_rel(spk, lambda r: is_aug_rel(r) and r.endswith(".wav"))
     mt = mtimes(spk, aug_wavs)
 
@@ -303,14 +320,36 @@ def diff_inherit():
     val = open(os.path.join(ws, "filelists", "val.txt"), encoding="utf-8").read().splitlines()
     check("diff: val still aug-free", not [l for l in val if is_aug_rel(l)])
 
-    # cache-wipe: different dataset -> fingerprint change -> full rebuild
+    # ★★ §F2⒝ — this used to be "cache-wipe: different dataset -> fingerprint change -> full
+    # rebuild", and it pinned the behaviour this batch exists to remove: a parameter or dataset
+    # change `shutil.rmtree`'d hours of preprocessing. The replacement pins the NEW guarantee, in
+    # the same place, driven by the same production pipeline:
+    #     a different identity gets a SIBLING pool, and the first one is still there, byte for byte.
+    # (The half of the old check that is still meaningful — "the new material really does get
+    # built, with diff products" — is kept below and simply asks it of the new pool.)
+    before_pools = noop.pools_in(ws)
+    old_pool_shape = {
+        r: open(os.path.join(spk, r), "rb").read()
+        for r in list_rel(spk, lambda r: r.endswith(".wav"))
+    }
     dirty_ds = os.path.join(GATE_ROOT, "dataset_dirty")
     run_pipeline("sovits_diff", ws, 2, dataset_dir=dirty_ds)
-    aug2 = list_rel(spk, lambda r: is_aug_rel(r) and r.endswith(".wav"))
-    check("diff: cache-wipe rebuild regenerates aug slices", len(aug2) > 0,
+    after_pools = noop.pools_in(ws)
+    check("diff: a different dataset mints a SIBLING pool (it does not wipe the old one)",
+          len(after_pools) == len(before_pools) + 1,
+          "(%s -> %s)" % (before_pools, after_pools))
+    check("★ diff: every wav of the previous pool survived, byte for byte",
+          all(os.path.isfile(os.path.join(spk, r))
+              and open(os.path.join(spk, r), "rb").read() == v
+              for r, v in old_pool_shape.items()),
+          "(%d wavs)" % len(old_pool_shape))
+    new_id = [p for p in after_pools if p not in before_pools][0]
+    new_spk = os.path.join(ws, "pools", new_id, "dataset_44k", "gateaug")
+    aug2 = list_rel(new_spk, lambda r: is_aug_rel(r) and r.endswith(".wav"))
+    check("diff: the new pool really was built (aug slices present)", len(aug2) > 0,
           "(%d)" % len(aug2))
-    check("diff: rebuilt aug have diff products",
-          all(os.path.exists(os.path.join(spk, r.replace(".wav", ".wav.aug_mel.npy")))
+    check("diff: the new pool's aug have diff products",
+          all(os.path.exists(os.path.join(new_spk, r.replace(".wav", ".wav.aug_mel.npy")))
               for r in aug2))
 
 

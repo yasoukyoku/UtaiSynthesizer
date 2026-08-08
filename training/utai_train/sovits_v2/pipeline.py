@@ -32,7 +32,7 @@ import os
 
 from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
-from ..cache import invalidate_extract_caches
+from ..pool import assert_identity, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..sovits.cluster import build_kmeans, build_retrieval
 from ..sovits.flist import build_filelists, resolve_speakers
@@ -82,14 +82,16 @@ def run(cfg, reporter, stop):
     fp_text = extract_cache_fp_text(speakers, ENCODER, loudnorm)
     if f0_method != "rmvpe":
         fp_text += "|f0=%s" % f0_method
-    invalidate_extract_caches(exp_dir, fp_text, ("dataset_44k",))
+    # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
+    pool_dir = open_pool(exp_dir, fp_text)
+    assert_identity(pool_dir, fp_text)
 
-    dataset_44k = os.path.join(exp_dir, "dataset_44k")
+    dataset_44k = os.path.join(pool_dir, "dataset_44k")
     aug_copies = int(cfg.get("aug_copies", 0))
 
     for sp in speakers:
         spk_dir = os.path.join(dataset_44k, sp["slug"])
-        meta_dir = _speaker_meta_dir(exp_dir, is_multi, sp["slug"])
+        meta_dir = _speaker_meta_dir(pool_dir, is_multi, sp["slug"])
         slice_and_resample(
             sp["dataset_dir"], spk_dir, loudnorm, ffmpeg, reporter, stop,
             trim_top_db=TRIM_TOP_DB,
@@ -139,14 +141,14 @@ def run(cfg, reporter, stop):
         logger.warning("removing aug slice with failed extraction: %s/%s", fslug, stem)
         _remove_aug_products(
             os.path.join(dataset_44k, fslug),
-            _speaker_meta_dir(exp_dir, is_multi, fslug),
+            _speaker_meta_dir(pool_dir, is_multi, fslug),
             stem,
         )
 
     stop.check()
     for sp in speakers:
         spk_dir = os.path.join(dataset_44k, sp["slug"])
-        meta_dir = _speaker_meta_dir(exp_dir, is_multi, sp["slug"])
+        meta_dir = _speaker_meta_dir(pool_dir, is_multi, sp["slug"])
         report = os.path.join(
             exp_dir,
             "aug_gate_report_%s.json" % sp["slug"] if is_multi else "aug_gate_report.json",
@@ -192,7 +194,7 @@ def run(cfg, reporter, stop):
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
     _seed_base_checkpoints(exp_dir, cfg)
-    summary = train(cfg, exp_dir, reporter, stop)
+    summary = train(cfg, exp_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:
         raise RuntimeError(

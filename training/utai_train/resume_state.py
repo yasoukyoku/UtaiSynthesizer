@@ -239,18 +239,20 @@ def _restore_rng(blob, report):
             report.rng["numpy"] = "%s: %s" % (type(e).__name__, e)
 
 
-def read_dataset_fingerprint(exp_dir):
-    """The fingerprint `utai_train.cache.invalidate_extract_caches` last wrote for this slot.
+def read_dataset_fingerprint(pool_dir):
+    """The identity text stored in a preprocessing pool (`utai_train.pool.FINGERPRINT`).
 
-    ⚠ It always describes the dataset as it is RIGHT NOW — preprocessing overwrites it on the way
-    in. That is why it has to be copied into the checkpoint's sidecar: comparing the file against
-    itself would always match.
+    ⚠ It always describes the pool this run RESOLVED to, which by construction matches this run's
+    parameters. That is why it has to be copied into the checkpoint's sidecar: comparing the file
+    against itself would always match. What the sidecar copy answers is "was this checkpoint
+    trained on the data that is in front of me now" — and since §F2⒝ that question is asked of the
+    POOL, not of the slot, because a slot can now hold several.
     """
-    if not exp_dir:
+    if not pool_dir:
         # The upstream loss-trajectory gate drives the diffusion solver with no workspace at all;
         # "we do not know" has to be an answer, not a TypeError inside a resume header.
         return None
-    p = os.path.join(exp_dir, "dataset.fingerprint")
+    p = os.path.join(pool_dir, "dataset.fingerprint")
     try:
         with open(p, encoding="utf-8") as f:
             return f.read().strip() or None
@@ -258,8 +260,14 @@ def read_dataset_fingerprint(exp_dir):
         return None
 
 
-def capture(scaler=None, *, epoch, global_step, exp_dir=None, dataset_items=None, loader_len=None):
+def capture(scaler=None, *, epoch, global_step, pool_dir=None, dataset_items=None, loader_len=None):
     """Everything a resume needs that the `G_*/D_*` pair does not already carry.
+
+    ⚠ `pool_dir` is the PREPROCESSING POOL, not the slot. §F2⒝ renamed it from `exp_dir` on
+    purpose: a slot can now hold several pools, so passing the slot would read no fingerprint at
+    all and quietly record "dataset identity unavailable" in every resume header — the exact
+    silent degradation this sidecar exists to prevent. The rename turns that mistake into a
+    TypeError at the call site.
 
     ⛔ `global_step` is recorded for DIAGNOSIS ONLY — do not restore the step counter from it.
     A resume re-runs epoch `epoch_str` from its beginning (upstream's semantics, preserved), so
@@ -280,8 +288,8 @@ def capture(scaler=None, *, epoch, global_step, exp_dir=None, dataset_items=None
         # to guess whether "no scaler" means "fp32 run" or "we forgot".
         blob["scaler"] = st if st else None
         blob["scaler_enabled"] = bool(st)
-    if exp_dir is not None:
-        blob["dataset_fingerprint"] = read_dataset_fingerprint(exp_dir)
+    if pool_dir is not None:
+        blob["dataset_fingerprint"] = read_dataset_fingerprint(pool_dir)
     if dataset_items is not None:
         blob["dataset_items"] = int(dataset_items)
     if loader_len is not None:
@@ -537,14 +545,14 @@ def restore(blob, scaler=None, logger=None):
     return report
 
 
-def report_drift(blob, reporter, logger, *, exp_dir, dataset_items=None, loader_len=None):
+def report_drift(blob, reporter, logger, *, pool_dir, dataset_items=None, loader_len=None):
     """Log the resume header and raise the warning CODE if the dataset moved. ONE call per
     trainer — the three of them must not each grow their own version of this.
 
     Returns the CODE (or None), so a caller that wants to assert on it can.
     """
     code, lines = describe_drift(
-        blob, exp_dir=exp_dir, dataset_items=dataset_items, loader_len=loader_len
+        blob, pool_dir=pool_dir, dataset_items=dataset_items, loader_len=loader_len
     )
     for line in lines:
         logger.info("%s", line)
@@ -553,7 +561,7 @@ def report_drift(blob, reporter, logger, *, exp_dir, dataset_items=None, loader_
     return code
 
 
-def describe_drift(blob, *, exp_dir, dataset_items=None, loader_len=None):
+def describe_drift(blob, *, pool_dir, dataset_items=None, loader_len=None):
     """What changed between the checkpoint's world and this run's. Returns (code, lines).
 
     `code` is `CODE_DATASET_CHANGED` when the dataset identity itself moved, else None. `lines`
@@ -566,7 +574,7 @@ def describe_drift(blob, *, exp_dir, dataset_items=None, loader_len=None):
     code = None
     if blob is None:
         return None, ["resume: no state sidecar — dataset identity at checkpoint time is unknown"]
-    now_fp = read_dataset_fingerprint(exp_dir)
+    now_fp = read_dataset_fingerprint(pool_dir)
     was_fp = blob.get("dataset_fingerprint")
     if was_fp and now_fp and was_fp != now_fp:
         code = CODE_DATASET_CHANGED

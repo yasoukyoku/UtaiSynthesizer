@@ -165,12 +165,16 @@ class UtaiProtocolCallback(pl.Callback):
       exported a 100%-nan vocoder as a success.
     """
 
-    def __init__(self, reporter, stop, total_steps_real, workspace, pristine_config,
+    def __init__(self, reporter, stop, total_steps_real, workspace, pool_dir, pristine_config,
                  resumed=None, start_step=0, dataset_items=None):
         self.reporter = reporter
         self.stop = stop
         self.total_steps = int(total_steps_real)
         self.workspace = workspace
+        # §F2⒝ — every RUN artifact below hangs off `workspace`; `pool_dir` is used for exactly
+        # one thing, reading the dataset identity into the resume sidecar. They were the same
+        # directory until the preprocessing pool moved down a level.
+        self.pool_dir = pool_dir
         self.weights_dir = os.path.join(workspace, "weights")
         self.pristine_config = pristine_config
         self.best_file = os.path.join(workspace, "best_state.json")
@@ -223,7 +227,7 @@ class UtaiProtocolCallback(pl.Callback):
             None,
             epoch=trainer.current_epoch,
             global_step=trainer.global_step,
-            exp_dir=self.workspace,
+            pool_dir=self.pool_dir,
             dataset_items=self.dataset_items,
         )
 

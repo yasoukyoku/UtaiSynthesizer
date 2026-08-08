@@ -47,7 +47,7 @@ scaler = device_shim.make_scaler("cuda" if torch.cuda.is_available() else "cpu",
                                  torch.cuda.is_available())
 if scaler.is_enabled():
     scaler._scale = torch.full((), 1024.0, dtype=torch.float32, device="cuda")
-blob = RS.capture(scaler, epoch=4, global_step=1234, exp_dir=tmp,
+blob = RS.capture(scaler, epoch=4, global_step=1234, pool_dir=tmp,
                   dataset_items=24058, loader_len=6014)
 p = os.path.join(tmp, RS.LATEST_NAME)
 RS.write(p, blob)
@@ -78,24 +78,24 @@ for label, a, b in zip(("torch_cpu", "python", "numpy"), nxt_expected, nxt_got):
 
 print()
 print("=== R10-R12: 漂移描述 ===")
-code, lines = RS.describe_drift(got, exp_dir=tmp, dataset_items=24058, loader_len=6014)
+code, lines = RS.describe_drift(got, pool_dir=tmp, dataset_items=24058, loader_len=6014)
 check("R10 同一份数据:不报 CODE", code is None, str(code))
 check("R10b 但仍然把身份打进日志(下一次报告要靠它)", any("dataset unchanged" in l for l in lines))
 with open(os.path.join(tmp, "dataset.fingerprint"), "w", encoding="utf-8") as f:
     f.write("ffff0000dddd9999|enc=x|loudnorm=0")
-code2, lines2 = RS.describe_drift(got, exp_dir=tmp, dataset_items=20000, loader_len=5000)
+code2, lines2 = RS.describe_drift(got, pool_dir=tmp, dataset_items=20000, loader_len=5000)
 check("★R11 数据换了必须报 CODE_DATASET_CHANGED", code2 == RS.CODE_DATASET_CHANGED, str(code2))
 check("R11b 并说清两个规模各变成了多少",
       any("24058 -> 20000" in l for l in lines2) and any("6014 -> 5000" in l for l in lines2),
       str(lines2))
 check("R12 没有 sidecar 时说【不知道】,不假装没变",
-      RS.describe_drift(None, exp_dir=tmp)[0] is None
-      and "unknown" in RS.describe_drift(None, exp_dir=tmp)[1][0])
+      RS.describe_drift(None, pool_dir=tmp)[0] is None
+      and "unknown" in RS.describe_drift(None, pool_dir=tmp)[1][0])
 
 print()
 print("=== R13-R15: scaler 的三种臂 ===")
 cpu_scaler = device_shim.make_scaler("cpu", False)
-blob_cpu = RS.capture(cpu_scaler, epoch=1, global_step=0, exp_dir=tmp)
+blob_cpu = RS.capture(cpu_scaler, epoch=1, global_step=0, pool_dir=tmp)
 check("R13 关掉的 scaler:记成 None + scaler_enabled=False(而不是一个空 dict)",
       blob_cpu["scaler"] is None and blob_cpu["scaler_enabled"] is False)
 rep = RS.restore(blob_cpu, device_shim.make_scaler("cuda" if torch.cuda.is_available() else "cpu", False))
@@ -171,7 +171,7 @@ if torch.cuda.is_available():
 
     mB, oB = make(); sB = device_shim.make_scaler("cuda", True)
     run(mB, oB, sB, 0, WARM)
-    state = RS.capture(sB, epoch=1, global_step=WARM, exp_dir=tmp)
+    state = RS.capture(sB, epoch=1, global_step=WARM, pool_dir=tmp)
     sd = {k: v.detach().clone() for k, v in mB.state_dict().items()}
     od = {"state": {k: {kk: (vv.clone() if torch.is_tensor(vv) else vv) for kk, vv in v.items()}
                     for k, v in oB.state_dict()["state"].items()},
@@ -233,7 +233,7 @@ for net, opt in ((bg, bog), (bd, bod)):     # 让 AdamW 真的建出动量
     sum(p.float().pow(2).sum() for p in net.parameters()).backward()
     opt.step(); opt.zero_grad(set_to_none=False)
 
-blob_best = RS.capture(None, epoch=7, global_step=1400, exp_dir=ws, dataset_items=10, loader_len=5)
+blob_best = RS.capture(None, epoch=7, global_step=1400, pool_dir=ws, dataset_items=10, loader_len=5)
 out = RS.save_best_pair(ws, SOVITS_UTILS.save_checkpoint, (bg, bd), (bog, bod), 1e-4,
                         epoch=7, metric=12.5, blob=blob_best)
 check("R20 三个文件都写出来了", all(os.path.isfile(os.path.join(out, n))
@@ -369,7 +369,7 @@ sv.save_model(net_p, None, postfix="2000")           # 周期存档:上游 save_
 net_b, opt_b, W_B = fresh_pair(7.0)      # best 的内容
 sv.global_step = 1400
 RS.save_solo_snapshot(dexp, RS.BEST_DIR, lambda p: sv.save_model_to(p, net_b, opt_b),
-                      blob=RS.capture(None, epoch=0, global_step=1400, exp_dir=tmp,
+                      blob=RS.capture(None, epoch=0, global_step=1400, pool_dir=tmp,
                                       dataset_items=12, loader_len=3),
                       metric=0.25)
 bdir = RS.snapshot_dir(dexp, RS.BEST_DIR)
@@ -382,7 +382,7 @@ os.remove(os.path.join(bdir, RS.BEST_STATE))
 check("★D3 少了完成标记就当【没有】 —— 而 model.pt 还在盘上",
       RS.read_snapshot(dexp, RS.BEST_DIR) is None and os.path.isfile(os.path.join(bdir, RS.BEST_MODEL)))
 RS.save_solo_snapshot(dexp, RS.BEST_DIR, lambda p: sv.save_model_to(p, net_b, opt_b),
-                      blob=RS.capture(None, epoch=0, global_step=1400, exp_dir=tmp), metric=0.25)
+                      blob=RS.capture(None, epoch=0, global_step=1400, pool_dir=tmp), metric=0.25)
 
 # ★ 上游那把「最大编号」的尺子不许被子目录动到 —— 它是递归扫的(os.walk)
 p_no_snap, s_no_snap = DU.latest_numbered_path(dexp)
@@ -423,7 +423,7 @@ check("★D6b 而且把 best 的 state.json 交回给了调用方(scaler/RNG/数
 net_l, opt_l, W_L = fresh_pair(9.0)
 sv.global_step = 2000
 RS.save_solo_snapshot(dexp, RS.LATEST_DIR, lambda p: sv.save_model_to(p, net_l, opt_l),
-                      blob=RS.capture(None, epoch=0, global_step=2000, exp_dir=tmp))
+                      blob=RS.capture(None, epoch=0, global_step=2000, pool_dir=tmp))
 st, n3, o3 = start(dexp)
 check("★★D7 同一步上【完整的那一份赢】:2000 == 2000 ⇒ 取滚动快照,动量不再是空的",
       st.source == DP.SRC_SNAPSHOT and st.step == 2000 and st.had_optimizer is True
@@ -457,7 +457,7 @@ svb.save_model_to(os.path.join(broken, "model_0100.pt"), net_p, None)   # int('0
 net_r, opt_r, W_R = fresh_pair(5.0)
 svb.global_step = 100
 RS.save_solo_snapshot(broken, RS.LATEST_DIR, lambda p: svb.save_model_to(p, net_r, opt_r),
-                      blob=RS.capture(None, epoch=0, global_step=100, exp_dir=tmp))
+                      blob=RS.capture(None, epoch=0, global_step=100, pool_dir=tmp))
 st, n6, _ = start(broken)
 check("★D11 扫描指向一个不存在的文件时,快照能把它救回来(今天是 FileNotFoundError)",
       st.source == DP.SRC_SNAPSHOT and float(n6.w[0]) == W_R,
@@ -468,7 +468,7 @@ print("--- 底模不许在【其实是续训】的时候被重新播种 ---")
 onlysnap = os.path.join(tempfile.mkdtemp(prefix="s118_onlysnap_"), "diffusion")
 svs = make_saver(onlysnap, 4000)
 RS.save_solo_snapshot(onlysnap, RS.LATEST_DIR, lambda p: svs.save_model_to(p, net_l, opt_l),
-                      blob=RS.capture(None, epoch=0, global_step=4000, exp_dir=tmp))
+                      blob=RS.capture(None, epoch=0, global_step=4000, pool_dir=tmp))
 
 
 class _NoopReporter:
@@ -570,7 +570,7 @@ svp = make_saver(pexp, 0)
 good_net, good_opt, W_GOOD = fresh_pair(2.0)
 svp.global_step = 100
 RS.save_solo_snapshot(pexp, RS.LATEST_DIR, lambda p: svp.save_model_to(p, good_net, good_opt),
-                      blob=RS.capture(None, epoch=0, global_step=100, exp_dir=tmp))
+                      blob=RS.capture(None, epoch=0, global_step=100, pool_dir=tmp))
 bad2 = poison(TinyDiff(8.0))
 svp.global_step = 200
 svp.save_model(bad2, None, postfix="200")        # 毒的、编号更大的、而且不带 optimizer
@@ -661,12 +661,12 @@ def voc_ws(steps, *, pointer=None, best=None, poison=(), no_optim=()):
                  optim=s not in no_optim)
     if pointer is not None:
         RS.save_pointer(d, "model_ckpt_steps_%d.ckpt" % pointer,
-                        blob=RS.capture(None, epoch=0, global_step=pointer, exp_dir=d))
+                        blob=RS.capture(None, epoch=0, global_step=pointer, pool_dir=d))
     if best is not None:
         RS.save_solo_snapshot(
             d, RS.BEST_DIR,
             lambda p, _s=best: voc_ckpt(p, _s, fill=float(_s)),
-            blob=RS.capture(None, epoch=0, global_step=best, exp_dir=d),
+            blob=RS.capture(None, epoch=0, global_step=best, pool_dir=d),
             metric=0.25, payload_name=RS.BEST_CKPT)
     return d
 
@@ -764,10 +764,10 @@ from utai_train.vocoder.harness import UtaiProtocolCallback as _VCB  # noqa: E40
 
 _d = voc_ws([])
 _before = torch.get_rng_state().clone()
-_VCB(None, None, 10, _d, {}, resumed=None).on_fit_start(None, None)
+_VCB(None, None, 10, _d, _d, {}, resumed=None).on_fit_start(None, None)
 check("★★V17 全新训练:on_fit_start 什么也不恢复 ⇒ torch 的 RNG 流逐位不动",
       torch.equal(torch.get_rng_state(), _before))
-_cb = _VCB(None, None, 10, _d, {}, resumed=RS.capture(None, epoch=0, global_step=8, exp_dir=_d))
+_cb = _VCB(None, None, 10, _d, _d, {}, resumed=RS.capture(None, epoch=0, global_step=8, pool_dir=_d))
 torch.manual_seed(999)
 _cb.on_fit_start(None, None)
 check("★V17b 阳性对照:有 sidecar 时它确实动了 RNG(否则上面那条不携带信息)",

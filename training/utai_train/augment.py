@@ -419,6 +419,18 @@ def run_f0_gate(entries, load_f0_fn, remove_products_fn, reporter, stop,
     Per-copy details go to `report_path` (json) — NOT the log stream: a 50%
     rejection run would flood the frontend ring with a thousand lines."""
     if not entries:
+        # ⚠ A run with no augmentations must not inherit the PREVIOUS run's report. The report
+        # lives at a fixed slot-relative name, so a leftover one describes copies that no longer
+        # exist on disk — and "no report" is already the well-handled state of every
+        # non-augmented run (the publish chain reads it fail-open). Found by S122's
+        # gate_aug_pipeline "copies 2->..->0 tree equals fresh copies=0" check, which had never
+        # reached this far before; the behaviour itself predates §F2⒝ (augment.py is byte-identical
+        # to the commit before it).
+        if report_path:
+            try:
+                os.remove(report_path)
+            except OSError:
+                pass
         reporter.stage("aug_check", done=1, total=1, message="无增强样本", force=True)
         return 0, 0
 

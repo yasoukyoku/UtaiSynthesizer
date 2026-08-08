@@ -1,16 +1,21 @@
-"""Dataset fingerprint / extraction-cache invalidation, shared by all training
-backends (extracted from rvc/pipeline.py in the SoVITS port — single source of
-truth per the no-duplication rule).
+"""Dataset identity, shared by all five training backends (extracted from rvc/pipeline.py in the
+SoVITS port — single source of truth per the no-duplication rule).
 
-The per-file extraction caches (f0 / features / spec / ...) are keyed by SLICE
-FILE NAME — after a dataset change the re-sliced wavs reuse the same names with
-different content, so stale cache entries would silently mismatch. Fingerprint
-change → wipe the caches the backend names.
+The per-file extraction caches (f0 / features / spec / ...) are keyed by SLICE FILE NAME — after a
+dataset change the re-sliced wavs reuse the same names with different content, so stale cache
+entries would silently mismatch. That is why the products of one preprocessing identity must
+never be mixed with another's.
+
+⚠ §F2⒝ moved the *consequence* of an identity change out of this module. `invalidate_extract_caches`
+used to compare the stored fingerprint and `shutil.rmtree` the named cache directories on a
+mismatch — flip `loudnorm`, lose the slices; flip it back, pay for them again, with one
+`logger.info` line as the only trace. The identity now NAMES a directory instead
+(`utai_train.pool`), so a different identity is a sibling pool and nothing is deleted. What stays
+here is the identity itself, because it is the one thing all five chains genuinely share.
 """
 import hashlib
 import logging
 import os
-import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +27,9 @@ def dataset_fingerprint(dataset_dir):
     is shared by every architecture slot, so a flat-dataset backend (vocoder, sovits_diff)
     can be pointed at a multi-speaker project whose dataset is one subdirectory per speaker.
     That combination must fail LOUDLY here: skipping subdirectories instead would fingerprint
-    the empty set — a constant — so `invalidate_extract_caches` would conclude "data never
-    changes", keep stale caches forever, and the slicer would then produce zero slices. The
+    the empty set — a constant — so every run would resolve to the SAME pool no matter what the
+    speakers' data is, keep stale products forever, and the slicer would then produce zero
+    slices. The
     Rust side refuses the combination first (PROJECT_DATASET_SHAPE); this is the assertion
     behind it.
     """
@@ -44,22 +50,3 @@ def dataset_fingerprint(dataset_dir):
                 f.seek(-65536, 2)
                 h.update(f.read(65536))
     return h.hexdigest()
-
-
-def invalidate_extract_caches(exp_dir, fingerprint, cache_subdirs):
-    """Compare against the stored fingerprint; on change delete cache_subdirs
-    (paths relative to exp_dir), then store the new fingerprint."""
-    fp_file = os.path.join(exp_dir, "dataset.fingerprint")
-    old = None
-    if os.path.exists(fp_file):
-        with open(fp_file, encoding="utf-8") as f:
-            old = f.read().strip()
-    if old != fingerprint:
-        if old is not None:
-            logger.info("dataset changed — clearing stale extraction caches")
-        for sub in cache_subdirs:
-            d = os.path.join(exp_dir, sub)
-            if os.path.isdir(d):
-                shutil.rmtree(d)
-    with open(fp_file, "w", encoding="utf-8") as f:
-        f.write(fingerprint)

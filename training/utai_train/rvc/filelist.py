@@ -15,8 +15,11 @@ import shutil
 logger = logging.getLogger(__name__)
 
 
-def _copy_mute_assets(mute_assets_dir, exp_dir, sr_str, fea_dim):
-    ws_mute = os.path.join(exp_dir, "mute")
+def _copy_mute_assets(mute_assets_dir, pool_dir, sr_str, fea_dim):
+    # into the POOL, not the slot root: the copy is keyed by sample rate and feature dim (both in
+    # the preprocessing identity) and the trainer writes a `.spec.pt` next to the gt wav, so it is
+    # a preprocessing product in every sense. Its absolute path is baked into filelist.txt.
+    ws_mute = os.path.join(pool_dir, "mute")
     pairs = [
         ("0_gt_wavs/mute%s.wav" % sr_str, "0_gt_wavs/mute%s.wav" % sr_str),
         ("3_feature%s/mute.npy" % fea_dim, "3_feature%s/mute.npy" % fea_dim),
@@ -38,6 +41,7 @@ def _p(path):
 
 def build_filelist_and_config(
     exp_dir,
+    pool_dir,
     sr_str,
     version,
     spk_id,
@@ -52,12 +56,16 @@ def build_filelist_and_config(
     # preprocess prefix), so the per-line spk_id is recovered from the stem's first "_"-token
     # instead of the single scalar `spk_id` (which is used only for the mute rows then). The
     # single-speaker path (multi_speaker=False) stamps every line with `spk_id` = byte-identical.
+    # ⚠ TWO directories on purpose: every artifact READ here is a pool product, while both
+    # artifacts WRITTEN (filelist.txt, config.json) stay at the slot root — the filelist is
+    # rewritten in full by every run and holds absolute paths INTO the pool, so pooling it would
+    # only duplicate it, and config.json is per-run by design (fp16_run follows the run's toggle).
     reporter.stage("filelist", message="生成训练清单与配置")
-    gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
+    gt_wavs_dir = os.path.join(pool_dir, "0_gt_wavs")
     fea_dim = 256 if version == "v1" else 768
-    feature_dir = os.path.join(exp_dir, "3_feature%s" % fea_dim)
-    f0_dir = os.path.join(exp_dir, "2a_f0")
-    f0nsf_dir = os.path.join(exp_dir, "2b-f0nsf")
+    feature_dir = os.path.join(pool_dir, "3_feature%s" % fea_dim)
+    f0_dir = os.path.join(pool_dir, "2a_f0")
+    f0nsf_dir = os.path.join(pool_dir, "2b-f0nsf")
 
     names = (
         set([name.split(".")[0] for name in os.listdir(gt_wavs_dir)])
@@ -88,7 +96,7 @@ def build_filelist_and_config(
             )
         )
 
-    ws_mute = _copy_mute_assets(mute_assets_dir, exp_dir, sr_str, fea_dim)
+    ws_mute = _copy_mute_assets(mute_assets_dir, pool_dir, sr_str, fea_dim)
     for _ in range(2):
         opt.append(
             "%s/0_gt_wavs/mute%s.wav|%s/3_feature%s/mute.npy|%s/2a_f0/mute.wav.npy|%s/2b-f0nsf/mute.wav.npy|%s"
