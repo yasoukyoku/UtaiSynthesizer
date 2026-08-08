@@ -88,7 +88,41 @@ def rust_table():
 #: bases that ARE the pool (or a directory inside it). Everything else is the slot / a run dir.
 POOL_BASES = {"pool_dir", "self.pool_dir"}
 #: bases that are the SLOT. A pool product joined onto one of these is finding (3).
-SLOT_BASES = {"exp_dir", "slot_dir", "ws", "workspace", "work_dir", "self.workspace"}
+#:
+#: ⚠ `ws` and `self.workspace` were listed here and the census below found they reach NOTHING —
+#: no join site in the tree uses either name. They are gone: a classification nothing can reach
+#: cannot be wrong in a way anything notices, so it rots into a false claim of coverage (the same
+#: lesson `run_id_is_usable` in `trun.rs` records about its own deleted clauses). Nothing is lost,
+#: because check (0c) refuses any base it has not been told about — so if `ws` ever comes back it
+#: arrives as a FAILURE demanding classification, not as a silent gap.
+SLOT_BASES = {"exp_dir", "slot_dir", "workspace", "work_dir"}
+#: ★§F2⒝ batch 2 — EVERY base name the scan finds, whether or not this gate classifies it.
+#:
+#: The two sets above are what checks (1)-(3) act on, and a join onto anything else is simply
+#: skipped. That is fine while the unclassified names are all leaf directories already derived
+#: from a pool or a slot — but it means the gate LOSES COVERAGE SILENTLY the moment python grows a
+#: new base. Batch 3 introduces exactly that (`run_dir`), and the `len(joins) > 60` floor below
+#: cannot notice: re-basing `os.path.join(exp_dir, "weights")` to `os.path.join(run_dir, "weights")`
+#: leaves the site count unchanged while moving the site out of every check.
+#:
+#: So the census is declared. It is a source-vs-declaration ratchet, not a table compared with
+#: itself: the left side is parsed out of the python tree by the AST scan below. Adding a base
+#: turns check (0c) red, and whoever adds it has to say which of the two sets it belongs to (or
+#: that it belongs to neither, here).
+KNOWN_BASES = {
+    # the two the checks act on
+    "exp_dir", "slot_dir", "workspace", "work_dir",
+    "pool_dir",
+    # leaf directories, each already derived from a pool or a slot by the code that binds them
+    "weights_dir", "flist_dir", "configs_dir", "cluster_dir", "meta_dir",
+    "slices_dir", "slice_dir", "out_dir", "out_spk_dir", "tmp",
+    "self.gt_wavs_dir", "self.wavs16k_dir",
+    # the shallow-diffusion expdir, which is a RUN directory (`<run>/diffusion`) — it is not a
+    # slot and not a pool, and batch 3 is where it stops being derived from the slot
+    "expdir", "self.expdir",
+    # so-vits' own name for the run directory it writes checkpoints into
+    "hps.model_dir",
+}
 #: marker for a name this gate could not resolve to a literal (a `%`-format or an f-string).
 #: Plain ASCII on purpose — this repo has five separate incidents of a NUL byte written into a
 #: source file by an escape that looked harmless (feedback_claude_tooling_pitfalls A3).
@@ -185,6 +219,13 @@ def main():
     print("\n(0) the readers")
     check("the Rust table covers every family", set(table) == set(families), str(sorted(table)))
     check("the python scan found a plausible number of join sites", len(joins) > 60, str(len(joins)))
+    seen_bases = {b for _, _, b, _ in joins}
+    check(
+        "every join base is declared (a NEW one silently leaves checks 1-3 uncovered)",
+        seen_bases == KNOWN_BASES,
+        "unexpected: %s | vanished: %s"
+        % (sorted(seen_bases - KNOWN_BASES), sorted(KNOWN_BASES - seen_bases)),
+    )
 
     # ── (1) most specific: every POOL join is declared, per family ──────────────────────────
     print("\n(1) every directory python writes into the pool is DECLARED in the Rust table")

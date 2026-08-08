@@ -285,6 +285,40 @@ def compare_trees(base, ours):
     return bad
 
 
+def assert_no_reparse_points(root):
+    """⛔ Refuse to hand a tree to `git worktree remove --force` if anything in it is a link.
+
+    This repository has one catastrophic incident on record and this is its exact operation:
+    `git worktree remove --force` walked THROUGH a hand-made junction and emptied `data/`,
+    `runtime/` and `bin/` in the real checkout. Nothing in this script creates a link today, so
+    this costs one directory walk and finds nothing — which is the point. The moment someone
+    junctions a gitignored asset (models, runtimes) into the baseline worktree so the training
+    code can find it, that walk is the difference between a loud refusal and the same accident.
+
+    Symlinks AND junctions: `os.path.islink` misses a Windows junction, so the reparse-point bit
+    is read directly from the stat result.
+    """
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in list(dirnames) + filenames:
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if os.path.islink(p) or (
+                getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                found.append(p)
+    if found:
+        raise SystemExit(
+            "REFUSING to `git worktree remove --force` %s: it contains %d reparse point(s), and "
+            "that removal walks through them into whatever they point at:\n  %s"
+            % (root, len(found), "\n  ".join(found[:10]))
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default="sovits")
