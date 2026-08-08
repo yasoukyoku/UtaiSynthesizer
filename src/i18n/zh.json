@@ -309,6 +309,8 @@
     "slotResumeLatest": "可从最新存档继续",
     "slotNoResume": "有存档,但没有可续训的存档点",
     "slotArchive": "存档 {{size}}",
+    "slotPrepPools": "预处理 {{count}} 份 · {{size}}",
+    "slotPrepPoolsHint": "预处理产物(切片/f0/特征)按参数身份分开存放。换了数据集或预处理参数会新增一份,旧的保留着以便随时切回来;清理功能在后续版本提供。",
     "runNameTitle": "本次训练名",
     "runNameBody": "产物文件名与模型名都用它,默认取项目名。之后续训会一直沿用这个名字。",
     "runNameFrozen": "本次训练名:{{name}}",

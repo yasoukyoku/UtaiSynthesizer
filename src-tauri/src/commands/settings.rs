@@ -1333,7 +1333,13 @@ fn sync_dir_delta(
     src: &std::path::Path,
     dst: &std::path::Path,
     skip_dot_top: bool,
-    layout_aware: bool,
+    // ★§F2⒝ — was `layout_aware: bool`, which only ever guarded ONE level. The training tree has
+    // TWO layout decisions stacked on top of each other now (project-shaped vs legacy flat, and
+    // pooled slot vs flat slot), each with its own marker file, and a guard that stops after the
+    // first one lets a flat slot merge file-by-file into a pooled one — re-seeding `dataset_44k/`
+    // at the slot root, where nothing will ever read it again and nothing will ever delete it.
+    // Same family as S109's reclaim thread building a dictionary set no build ever shipped.
+    layout_marker: Option<&str>,
     skip_top_names: &[String],
 ) -> (u64, u64) {
     let mut copied = 0u64;
@@ -1349,12 +1355,12 @@ fn sync_dir_delta(
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            if layout_aware && to.exists() {
-                let meta = crate::training::tproject::PROJECT_META;
-                if from.join(meta).is_file() != to.join(meta).is_file() {
+            if let Some(marker) = layout_marker {
+                if to.exists() && from.join(marker).is_file() != to.join(marker).is_file() {
                     tracing::warn!(
-                        "data-dir reclaim: {} and {} are in different training layouts — keeping \
-                         the old tree instead of merging (move it by hand once you have checked it)",
+                        "data-dir reclaim: {} and {} are in different training layouts ({marker} \
+                         on one side only) — keeping the old tree instead of merging (move it by \
+                         hand once you have checked it)",
                         from.display(),
                         to.display()
                     );
@@ -1362,8 +1368,16 @@ fn sync_dir_delta(
                     continue;
                 }
             }
+            // One level down from a PROJECT are its family slots, whose own layout marker is
+            // `slot.json`. Below that there is no layout decision left to make.
+            let inner = match layout_marker {
+                Some(m) if m == crate::training::tproject::PROJECT_META => {
+                    Some(crate::training::tpool::SLOT_META)
+                }
+                _ => None,
+            };
             // Nested levels are never bundle resources — the skip list is a TOP-LEVEL rule.
-            let (c, f) = sync_dir_delta(&from, &to, false, false, &[]);
+            let (c, f) = sync_dir_delta(&from, &to, false, inner, &[]);
             copied += c;
             failed += f;
             continue;
@@ -1852,6 +1866,11 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     // reclaimed as it always was. Skipping it instead would leave the single biggest subtree
     // permanently un-merged AND un-deleted, with the queue entry consumed either way.
     crate::training::tproject::migrate_legacy_layout(&old_p);
+    // §F2⒝ — and the same argument one level down: the active root's slots have been folded into
+    // `pools/<identity>/`, so fold the old root's too before any per-file merge. The guard below
+    // is the belt (it refuses to merge two different slot layouts); this is the braces, and it is
+    // what actually lets the subtree be reclaimed instead of stranded.
+    crate::training::tpool::migrate_all(&old_p);
     for name in MIGRATED_SUBTREES {
         let sub = old_p.join(name);
         if name == "training" {
@@ -1869,7 +1888,7 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
             &sub,
             &active_data_dir.join(name),
             skips_dot_top(name),
-            name == "training",
+            (name == "training").then_some(crate::training::tproject::PROJECT_META),
             skip_top,
         );
         if name == "training" {

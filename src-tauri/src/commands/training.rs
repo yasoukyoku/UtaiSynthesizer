@@ -444,6 +444,20 @@ pub struct SlotDetail {
     /// Everything under this slot that the archive list would show, and what it weighs.
     pub ckpt_count: u32,
     pub ckpt_bytes: u64,
+    /// ★§F2⒝ — how many PREPROCESSING pools this slot holds, and what they weigh.
+    ///
+    /// This is the visible half of the batch's one real cost: a preprocessing identity change
+    /// used to `shutil.rmtree` the old products and now keeps them as a sibling. Disk therefore
+    /// grows where it used to shrink, and the user has to be able to SEE that rather than
+    /// discover it as an unexplained slot size. (Reclaiming them is batch 2's job — a pool has
+    /// to know which run references it before anything may delete it.)
+    ///
+    /// ⚠ `prep_` prefix ON PURPOSE: "pool" already means the project's imported DATASET
+    /// elsewhere in this app (`training.ts`'s `poolCount` is that one's file count, and
+    /// `has_dataset_pool` is about that too). Two different things called `poolCount` on the same
+    /// screen is how a reader ends up reasoning about the wrong one.
+    pub prep_pool_count: u32,
+    pub prep_pool_bytes: u64,
 }
 
 /// A ledger row plus the answer to「它现在还在不在」.
@@ -822,6 +836,9 @@ pub async fn get_training_project(
             // stopped meaning "what a 续训 continues from" the moment S117 started writing a
             // `resume_best/` pair after the rolling one — see that function.
             let newest_resumable = crate::training::tproject::default_resume_record(&recs);
+            let pools = crate::training::tpool::list_pools(
+                &crate::training::tproject::family_dir(&data_dir, &project_id, f),
+            );
             SlotDetail {
                 family: f.to_string(),
                 model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, f)
@@ -836,6 +853,11 @@ pub async fn get_training_project(
                 has_resume_point: newest_resumable.is_some(),
                 ckpt_count: recs.len() as u32,
                 ckpt_bytes: recs.iter().map(|r| r.bytes).sum(),
+                prep_pool_count: pools.len() as u32,
+                prep_pool_bytes: pools
+                    .iter()
+                    .map(|p| crate::commands::storage::dir_size(&p.dir))
+                    .sum(),
             }
         })
         .collect();

@@ -309,6 +309,8 @@
     "slotResumeLatest": "Can resume from the latest checkpoint",
     "slotNoResume": "Has archives, but no resumable checkpoint",
     "slotArchive": "Archives {{size}}",
+    "slotPrepPools": "Preprocessing ×{{count}} · {{size}}",
+    "slotPrepPoolsHint": "Preprocessed data (slices, f0, features) is stored per parameter identity. Changing the dataset or a preprocessing setting adds another set; the old one is kept so you can switch back at any time. Cleanup arrives in a later version.",
     "runNameTitle": "Name for this training run",
     "runNameBody": "Used for the artifact file names and the model name; defaults to the project name. Later resumes keep using it.",
     "runNameFrozen": "Run name: {{name}}",

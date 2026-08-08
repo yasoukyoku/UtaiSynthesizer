@@ -1072,6 +1072,11 @@ pub fn run() {
             // nothing has, and no training can have been started. Never fails the boot: an
             // undecidable directory is flagged, a torn one is rolled back and retried next boot.
             training::tproject::migrate_legacy_layout(&data_dir);
+            // §F2⒝ — and then fold each slot's preprocessing products into `pools/<identity>/`.
+            // MUST be after the line above: that one creates the family slots this one folds, so
+            // running it first would migrate nothing and leave every legacy tree flat for another
+            // whole launch.
+            training::tpool::migrate_all(&data_dir);
             // Reclaim delete staging dirs a previous session could not finish removing (locked
             // file, crash, forced quit). Same window as the migration: nothing holds a handle
             // under <data>/training yet.

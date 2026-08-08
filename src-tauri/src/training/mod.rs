@@ -672,11 +672,16 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
         // Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR
         // part of a training run, and a slot that has it but no checkpoint yet is the normal
         // state of「刚开始练」. `dataset.fingerprint` is the one artifact every family writes
-        // (python does it on ENTERING preprocessing — `utai_train/cache.py`), which makes it
+        // (python does it on ENTERING preprocessing — `utai_train/pool.py`), which makes it
         // the single portable judge. Without this the wipe-consent guard would let a
         // half-trained slot be erased with no dialog, and the shared-dataset guard would not
         // recognise a sibling slot as "using this data".
-        || ws.join("dataset.fingerprint").is_file()
+        // ★§F2⒝ — that judge now lives INSIDE the pool. Both arms are kept on purpose: the
+        // second is not a fallback, it is the shape of a slot that has not been through the
+        // layout migration (and `tproject::empty_shell` still depends on it for pre-S76 trees).
+        // Dropping it would make an unmigrated slot read as「无活」and wipeable with no dialog.
+        || tpool::slot_has_pool(ws)
+        || ws.join(tpool::FINGERPRINT).is_file()
         // pre-S76 shape only (dataset/ used to be a sibling of the checkpoints); still true
         // for a directory the migration has not folded yet.
         || has_dataset_pool(ws)
@@ -1836,7 +1841,15 @@ impl TrainingManager {
                     // on a different loudness domain than the main model
                     // (review F1); backfilled into the manifest so the next
                     // main resume doesn't re-wipe either.
-                    let v = std::fs::read_to_string(workspace.join("dataset.fingerprint"))
+                    // ★§F2⒝ — a slot can hold several pools now, so ask the one that can
+                    // ANSWER: `sole_pool_fingerprint` refuses to guess with more than one.
+                    // Every workspace old enough to reach this backfill was migrated from a
+                    // single flat slot and therefore has exactly one; the second arm is that
+                    // same flat slot before the migration has run.
+                    let v = tpool::sole_pool_fingerprint(&workspace)
+                        .or_else(|| {
+                            std::fs::read_to_string(workspace.join(tpool::FINGERPRINT)).ok()
+                        })
                         .map(|s| s.contains("|loudnorm=1"))
                         .unwrap_or(false);
                     manifest["loudnorm"] = serde_json::json!(v);

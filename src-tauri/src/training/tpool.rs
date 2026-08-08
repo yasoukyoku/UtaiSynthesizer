@@ -71,6 +71,15 @@ pub const SLOT_LAYOUT: u32 = 2;
 /// a half-filled pool must never be readable as a pool.
 const STAGING_PREFIX: &str = ".mig_pool_";
 
+/// The staging prefix, for the verifier that builds torn states from outside this module.
+///
+/// Exposed rather than duplicated: enumerating the crash points means creating exactly the
+/// half-migrated shapes this module leaves behind, and a second copy of this string in the
+/// verifier would let the two drift until the "crash recovery" leg silently tested nothing.
+pub fn staging_prefix() -> &'static str {
+    STAGING_PREFIX
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SlotMeta {
     pub layout: u32,
@@ -454,6 +463,62 @@ pub fn migrate_slot(slot: &Path, family: &str) -> Result<SlotOutcome> {
     }
     write_slot_meta(slot, &SlotMeta { layout: SLOT_LAYOUT, ..Default::default() })?;
     Ok(SlotOutcome::Migrated(pool_id))
+}
+
+/// Fold every slot of every project into layout 2. Called at startup, immediately after
+/// `tproject::migrate_legacy_layout` — the two are one migration seen from two levels.
+///
+/// ## Why here and not lazily on first use
+///
+/// python resolves its pool by identity and treats an unmigrated slot root as a legitimate pool
+/// (`utai_train/pool.py`), so training is correct with or without this pass. What it buys is that
+/// the DISK converges to one shape: the storage view can account for pools, the next batch's
+/// per-run work has one layout to reason about, and a slot does not sit half in each world for as
+/// long as nobody happens to train it.
+///
+/// Never fails the boot, per the same reasoning as the layout-1 migration: a slot that cannot be
+/// migrated is logged and retried next launch, and a torn one rolls itself back first.
+/// ⚠ Stands down entirely when another instance is alive — two processes racing these renames
+/// would produce exactly the half-in-half-out tree the guards treat as corrupt.
+pub fn migrate_all(data_dir: &Path) {
+    let root = crate::training::tproject::training_root(data_dir);
+    if !root.is_dir() {
+        return;
+    }
+    if crate::crashlog::other_instance_alive() {
+        tracing::warn!("training pool migration postponed: another live instance detected");
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return };
+    let (mut migrated, mut failed) = (0usize, 0usize);
+    for entry in rd.flatten() {
+        let proj = entry.path();
+        // `project.json` is the authority for "this is a project" one level up, exactly as
+        // `tproject` uses it; `.del_*` tombstones and `.migrating_*` markers are skipped by it.
+        if !proj.join(crate::training::tproject::PROJECT_META).is_file() {
+            continue;
+        }
+        for family in crate::training::tproject::FAMILIES {
+            let slot = proj.join(family);
+            if !slot.is_dir() {
+                continue;
+            }
+            match migrate_slot(&slot, family) {
+                Ok(SlotOutcome::Migrated(id)) => {
+                    migrated += 1;
+                    tracing::info!("pool layout: {} -> pools/{id}", slot.display());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!("pool layout: {} could not be migrated: {e}", slot.display());
+                }
+            }
+        }
+    }
+    if migrated > 0 || failed > 0 {
+        tracing::info!("pool layout migration: {migrated} slot(s) folded, {failed} failed");
+    }
 }
 
 /// Undo a torn migration: whatever is in staging goes back to the slot root.

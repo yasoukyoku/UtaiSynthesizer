@@ -588,6 +588,21 @@ export function ProjectDetail() {
                       >
                         {t("training.slotArchive", { size: fmtSize(slot?.ckptBytes ?? 0) })}
                       </button>
+                      {/* ★§F2⒝ — the accumulating half of the layout change, made visible where
+                          the slot's other sizes already are. A preprocessing parameter change no
+                          longer deletes the previous products, so without this line the disk
+                          would simply grow with no explanation anywhere in the app. */}
+                      {(slot?.prepPoolCount ?? 0) > 0 && (
+                        <>
+                          <span className="tproj-dot">·</span>
+                          <span title={t("training.slotPrepPoolsHint")}>
+                            {t("training.slotPrepPools", {
+                              count: slot?.prepPoolCount ?? 0,
+                              size: fmtSize(slot?.prepPoolBytes ?? 0),
+                            })}
+                          </span>
+                        </>
+                      )}
                     </>
                   ) : (
                     <span>{t("training.slotNotStarted")}</span>

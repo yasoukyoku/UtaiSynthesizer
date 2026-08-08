@@ -198,6 +198,11 @@ export interface SlotDetail {
   hasResumePoint: boolean;
   ckptCount: number;
   ckptBytes: number;
+  /** ★§F2⒝ — PREPROCESSING pools in this slot (a different thing from this store's `poolCount`,
+   *  which counts the project's imported dataset files). A preprocessing identity change keeps
+   *  the old products as a sibling instead of deleting them, so this is where the disk goes. */
+  prepPoolCount: number;
+  prepPoolBytes: number;
 }
 
 /** Mirror of Rust `commands::training::ExportedModelStatus`. */

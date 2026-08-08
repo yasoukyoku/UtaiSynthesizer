@@ -1443,17 +1443,53 @@ fn detect_family(ws: &Path) -> std::result::Result<String, String> {
     }
 }
 
+/// Every subdirectory name this repo creates inside a workspace/slot root.
+///
+/// ⛔ It exists to be CHECKED, not read. `has_family_slot` decides "legacy or new layout" by
+/// asking whether a subdirectory is named exactly after a family, and that decision is only sound
+/// while no such name can occur — a claim that has to be enforced, because the thing that breaks
+/// it (someone adding a directory) is precisely the thing nobody would think to re-verify.
+///
+/// The previous generation of this contract was the prose above the function claiming to list
+/// "the complete set of subdirectories anything has ever created inside a workspace root". It was
+/// ALREADY false when §F2⒝ read it: `resume_best/`, `resume_latest/`, `eval/` and
+/// `lightning_logs/` had been added since, and nothing anywhere noticed. A claim of completeness
+/// that nothing checks decays silently from the moment it is written (S120 §F9's blood lesson,
+/// in the same shape).
+///
+/// Kept ALPHABETICAL, and asserted against the two Rust-side names plus this list's own length so
+/// that adding an entry is a deliberate edit rather than a drive-by.
+pub(crate) const WORKSPACE_SUBDIRS: &[&str] = &[
+    "0_gt_wavs",     // rvc slices (gt sample rate)
+    "1_16k_wavs",    // rvc slices (16k, the feature/f0 input)
+    "2a_f0",         // rvc coarse f0
+    "2b-f0nsf",      // rvc Hz f0
+    "3_feature256",  // rvc ContentVec v1
+    "3_feature768",  // rvc ContentVec v2
+    "audition",      // Rust: per-checkpoint audition cache
+    "aug_meta",      // S41 augmentation provenance
+    "cluster",       // sovits retrieval / kmeans
+    "dataset",       // Rust: pre-S76 imported dataset (a sibling of the checkpoints back then)
+    "dataset_44k",   // sovits / sovits_v2 slices + extracted features
+    "diffusion",     // sovits_diff run products (expdir)
+    "eval",          // sovits TensorBoard eval subdir
+    "filelists",     // train/val lists
+    "lightning_logs",// vocoder (lightning)
+    "mute",          // rvc mute-asset copy
+    "npz",           // vocoder processed slices
+    "pools",         // §F2⒝ preprocessing pools
+    "resume_best",   // S117/S118/S119 resumable best snapshot
+    "resume_latest", // S118 rolling resume point
+    "slices",        // vocoder slices
+    "weights",       // published small checkpoints
+];
+
 /// Does this directory already have the new shape? Used INSTEAD of a phase field in the
 /// marker, because the two shapes are structurally distinguishable: a legacy workspace can
 /// never contain a subdirectory named exactly after a family.
 ///
-/// That claim is verified, not assumed — the complete set of subdirectories anything has ever
-/// created inside a workspace root is
-/// `0_gt_wavs 1_16k_wavs 2a_f0 2b-f0nsf 3_feature{256,768} aug_meta cluster dataset_44k
-/// diffusion filelists mute npz slices weights` (every `os.path.join(exp_dir, …)` in
-/// `training/utai_train/`) plus `dataset audition` from the Rust side. None collides.
-/// ⚠ Adding a workspace subdirectory named after a family would silently break migration
-/// recovery — grep this comment before you do.
+/// The claim is enforced by [`WORKSPACE_SUBDIRS`] + `workspace_subdirs_never_collide_with_a_family`,
+/// not by a comment.
 fn has_family_slot(dir: &Path) -> bool {
     FAMILIES.iter().any(|f| dir.join(f).is_dir())
 }
@@ -1777,6 +1813,49 @@ fn roll_back(data_dir: &Path, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ The enumeration that replaced a prose claim of completeness (see [`WORKSPACE_SUBDIRS`]).
+    ///
+    /// Three separate things are pinned, because each of them can rot on its own:
+    /// (1) the load-bearing property — no workspace subdirectory is named after a family;
+    /// (2) the LIST itself — otherwise "the live set equals my table" is the table compared with
+    ///     itself, and adding a wrong entry passes (S105);
+    /// (3) every pool product is in it — so adding one to `tpool::POOL_ENTRIES` without declaring
+    ///     it here turns this red instead of quietly re-opening the collision question.
+    #[test]
+    fn workspace_subdirs_never_collide_with_a_family() {
+        for name in WORKSPACE_SUBDIRS {
+            assert!(
+                !FAMILIES.contains(name),
+                "{name:?} collides with a family name — `has_family_slot` would read a legacy \
+                 workspace as already migrated and migration recovery would silently break"
+            );
+        }
+        let mut sorted = WORKSPACE_SUBDIRS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), WORKSPACE_SUBDIRS, "keep it sorted and duplicate-free");
+        assert_eq!(
+            WORKSPACE_SUBDIRS.len(),
+            22,
+            "adding a workspace subdirectory is a deliberate edit: add it above, then update this \
+             count, then re-read why `has_family_slot` depends on the list"
+        );
+        for family in FAMILIES {
+            for entry in crate::training::tpool::pool_entries_for(family) {
+                // the fingerprint is a FILE, everything else in the table is a directory
+                if entry == crate::training::tpool::FINGERPRINT {
+                    continue;
+                }
+                assert!(
+                    WORKSPACE_SUBDIRS.contains(&entry),
+                    "pool entry {entry:?} ({family}) is not in WORKSPACE_SUBDIRS"
+                );
+            }
+        }
+        // and the container the pools live in, which is the newest member of the set
+        assert!(WORKSPACE_SUBDIRS.contains(&crate::training::tpool::POOLS_DIR));
+    }
 
     fn tmp_root(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("utai_tproj_{}_{}", tag, uuid::Uuid::new_v4()));
