@@ -2308,7 +2308,15 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       // vocoders have no index/cluster companion — probing would only find
       // another backend's leftovers (红队 A16 fallback-site sweep)
       if (archiveBackend === "rvc") {
-        indexPath = `${exportWorkspace}\\total_fea.npy`;
+        // ★§F2⒝ — this branch used to hand back the path UNCONDITIONALLY, with no exists check,
+        // overriding the negative answer Rust had already given (`get_slot_export_context` probes
+        // `is_file()` and returns null). Naming a file that is not there is not the same as
+        // naming nothing: `import_model` treats an explicit index as「用户选的,别再自动找」and
+        // SKIPS its own auto-detection beside the checkpoint, leaving only a WARN_INDEX_MISSING —
+        // a warning the single-import path below did not even read. The model installed without
+        // its retrieval index, and the only symptom was that it sounded wrong.
+        const cand = `${exportWorkspace}\\total_fea.npy`;
+        if (await exists(cand)) indexPath = cand;
       } else {
         for (const cand of [
           `${exportWorkspace}\\cluster\\kmeans_10000.pt`,
@@ -2353,7 +2361,11 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     if (!name || name === "__cancel") return;
     const indexPath = await resolveIndexPath();
     try {
-      await invoke("import_model", {
+      // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
+      // this one-row button is the path the archive list actually uses. `import_model` reports the
+      // failures it can recover from as warnings, not errors (WARN_INDEX_MISSING above all), so
+      // discarding them meant「装上了但没有检索索引」reached the user as nothing at all.
+      const outcome = await invoke<{ warnings?: string[] }>("import_model", {
         name,
         path: ckpt.path,
         // the family this segment is acting on — `snapshot.backend` is "" with no run displayed
@@ -2362,7 +2374,13 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       });
       await useVoiceModelStore.getState().fetchModels();
       await refreshArchive();
-      showToast(t("training.imported", { name }), "success");
+      const warns = (outcome?.warnings ?? []).map((w) => backendErrorMessage(w) ?? w);
+      showToast(
+        warns.length > 0
+          ? `${t("training.imported", { name })}\n${warns.join("\n")}`
+          : t("training.imported", { name }),
+        warns.length > 0 ? "info" : "success",
+      );
     } catch (e) {
       // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
