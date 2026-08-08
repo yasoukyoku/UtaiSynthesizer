@@ -120,6 +120,27 @@ fn is_audition_wav(name: &str) -> bool {
     name.contains(".audition_spk") && name.ends_with(".wav")
 }
 
+/// Every audition-cache directory one training PROJECT can hold.
+///
+/// ONE source, because the two consumers — the storage report's byte total and 「清理试听缓存」—
+/// have to agree about what that button empties, and the note beside the cleanup records that they
+/// already drifted once: S76 moved the cache one level down and only one of them followed, which
+/// made the button silently free zero bytes forever.
+///
+/// Three levels, all real and all live at once:
+/// * `<project>/<family>/runs/<run>/audition` — ★§F2⒝ batch 2, one cache per RUN;
+/// * `<project>/<family>/audition` — every slot that has not been through the run migration
+///   (`trun::run_dirs` answers with the slot itself there, so this arm is the same expression);
+/// * `<project>/audition` — the pre-S76 shape, still on disk for anything flagged or postponed.
+pub(crate) fn audition_dirs_of_project(project: &Path) -> Vec<std::path::PathBuf> {
+    crate::training::tproject::FAMILIES
+        .iter()
+        .flat_map(|f| crate::training::trun::run_dirs(&project.join(f)))
+        .map(|r| r.join("audition"))
+        .chain(std::iter::once(project.join("audition")))
+        .collect()
+}
+
 /// Sum of model-side audition wavs under the models tree (recursive).
 fn model_audition_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
@@ -197,7 +218,6 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                     if !fd.is_dir() {
                         continue;
                     }
-                    ws_audition += dir_size(&fd.join("audition"));
                     fams.push(f.to_string());
                     let recs = crate::training::tproject::scan_project_ckpts(&root, &id, Some(f));
                     let plan = crate::training::tproject::plan_cleanup(
@@ -227,8 +247,9 @@ pub async fn get_storage_report(state: State<'_, Arc<AppState>>) -> Result<Stora
                             .unwrap_or(0),
                     });
                 }
-                // pre-S76 shape (not folded yet — flagged, or migration postponed)
-                ws_audition += dir_size(&p.join("audition"));
+                // every family slot's runs, plus the two legacy shapes — ONE source, shared with
+                // 「清理试听缓存」so the number and the button can never describe different sets
+                ws_audition += audition_dirs_of_project(&p).iter().map(|d| dir_size(d)).sum::<u64>();
                 let has_pool = crate::training::tproject::has_dataset(&root, &id);
                 workspaces.push(WorkspaceUsage {
                     slug: id,
@@ -375,15 +396,10 @@ pub async fn cleanup_audition_caches(state: State<'_, Arc<AppState>>) -> Result<
         let mut freed = 0u64;
         if let Ok(rd) = std::fs::read_dir(root.join("training")) {
             for entry in rd.flatten() {
-                // S76: audition caches sit one level deeper — `<project>/<family>/audition`.
-                // Missing this would have made「清理试听缓存」silently free zero bytes forever.
-                // family slots, plus the pre-S76 shape for anything migration has not folded
-                // yet (a flagged or postponed directory still holds its audition cache).
-                for rel in crate::training::tproject::FAMILIES
-                    .iter()
-                    .map(|f| entry.path().join(f).join("audition"))
-                    .chain(std::iter::once(entry.path().join("audition")))
-                {
+                // Where the caches are is decided ONCE, in `audition_dirs_of_project` — the
+                // storage total above and this button must empty the same set, and S76 already
+                // paid for them knowing it separately.
+                for rel in audition_dirs_of_project(&entry.path()) {
                     if rel.is_dir() {
                         let len = dir_size(&rel);
                         if crate::util::remove_dir_all_robust(&rel).is_ok() {
@@ -490,6 +506,37 @@ mod tests {
         write(&root.join("m/voice.audition_spk0.wav"), 50);
         write(&root.join("m/voice.onnx"), 999);
         assert_eq!(model_audition_bytes(&root), 50);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ⛔ §F2⒝ batch 2 — 「清理试听缓存」and the number beside it must name the same set, and the
+    /// set now has THREE shapes on disk at once. A per-run cache missing from this list is bytes
+    /// the storage page counts (`dir_size` on the slot is recursive) and the button never frees:
+    /// a cleanup that reports 「已释放 0 B」 while the disk stays full, which is exactly the
+    /// regression the S76 note in this file records.
+    #[test]
+    fn audition_dirs_cover_every_layout_that_exists_on_disk() {
+        let root = tmp_root("auddirs");
+        let proj = root.join("p1_aaaabbbb");
+        // pre-S76: the cache sat beside the project
+        write(&proj.join("audition/x/model.json"), 1);
+        // S76: one level down, in the family slot (a slot with no `runs/` container)
+        write(&proj.join("sovits/audition/x/model.json"), 1);
+        // §F2⒝ batch 2: one per run
+        write(&proj.join("rvc/runs/rfeedfacefeed/audition/x/model.json"), 1);
+        write(&proj.join("rvc/runs/rbeefbeefbeef/audition/y/model.json"), 1);
+
+        let dirs = audition_dirs_of_project(&proj);
+        for want in [
+            proj.join("audition"),
+            proj.join("sovits").join("audition"),
+            proj.join("rvc").join("runs").join("rfeedfacefeed").join("audition"),
+            proj.join("rvc").join("runs").join("rbeefbeefbeef").join("audition"),
+        ] {
+            assert!(dirs.contains(&want), "{} is a live cache and must be listed", want.display());
+        }
+        // …and nothing outside the project sneaks in
+        assert!(dirs.iter().all(|d| d.starts_with(&proj)));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -979,6 +979,7 @@
     "TRAINING_BAD_FAMILY": "未知的训练架构。",
     "TRAINING_DELETE_JOIN": "删除任务异常结束。",
     "AUDITION_WORKSPACE_OUTSIDE_ROOT": "试听目标不在训练目录内(该训练项目可能已被删除或移动)——已拒绝。请刷新训练页后重试。",
+    "AUDITION_WORKSPACE_IS_A_SLOT": "试听目标是训练槽而不是某一次训练——已拒绝,以免读到别次训练的缓存。请刷新训练页后重试。",
     "PROJECT_META_WRITE_FAILED": "写入训练项目信息失败(数据目录可能只读或被占用)——请检查数据目录的写入权限后重试。",
     "PROJECT_META_ENCODE_FAILED": "训练项目信息序列化失败(内部错误)。",
     "PROJECT_META_UNREADABLE": "这个训练项目的 project.json 读不出来(可能已损坏)——请到 设置 → 存储占用 处理该项目,或从备份恢复该文件。",

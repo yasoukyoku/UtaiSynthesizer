@@ -979,6 +979,7 @@
     "TRAINING_BAD_FAMILY": "Unknown training architecture.",
     "TRAINING_DELETE_JOIN": "The delete task ended abnormally.",
     "AUDITION_WORKSPACE_OUTSIDE_ROOT": "The audition target is not inside the training directory (the project may have been deleted or moved) — refused. Reopen the training page and try again.",
+    "AUDITION_WORKSPACE_IS_A_SLOT": "The audition target is a training slot rather than one training run — refused, so another run’s cache cannot be read as this one’s. Reopen the training page and try again.",
     "PROJECT_META_WRITE_FAILED": "Could not write the training project info (the data directory may be read-only or locked) — check write permissions on the data directory and try again.",
     "PROJECT_META_ENCODE_FAILED": "Could not serialize the training project info (internal error).",
     "PROJECT_META_UNREADABLE": "This training project's project.json cannot be read (likely corrupted) — handle the project under Settings → Storage, or restore that file from a backup.",

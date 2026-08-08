@@ -266,11 +266,30 @@ fn check_in_training_root(workspace: &str, state: &AppState) -> Result<(), Strin
         (Ok(w), Ok(r)) => w.starts_with(&r),
         _ => ws.starts_with(&root),
     };
-    if inside {
-        Ok(())
-    } else {
-        Err("AUDITION_WORKSPACE_OUTSIDE_ROOT".into())
+    if !inside {
+        return Err("AUDITION_WORKSPACE_OUTSIDE_ROOT".into());
     }
+    // ★§F2⒝ batch 2 — containment alone cannot catch the mistake this batch makes possible: a
+    // STALE family-slot path is still inside the root, so every command would keep working and
+    // quietly build a second cache tree at the slot root — read back later as this run's, because
+    // a cache hit is decided by `model.json` existing and nothing else.
+    //
+    // The tripwire is a POSITIVE fact, not an absence: a directory that CONTAINS a `runs/`
+    // container is a slot by construction, and a run never contains one. It is a no-op for as long
+    // as no slot has been migrated (which is why it can land now, before the migration does), and
+    // it fires the moment a caller is left behind.
+    if workspace_is_a_slot(ws) {
+        return Err("AUDITION_WORKSPACE_IS_A_SLOT".into());
+    }
+    Ok(())
+}
+
+/// Does this path name a family SLOT rather than one training run?
+///
+/// A slot is the thing that HOLDS runs, so the container's presence answers it — a positive fact,
+/// never an absence, which is why it is safe to land before the layout migration exists.
+fn workspace_is_a_slot(ws: &Path) -> bool {
+    ws.join(crate::training::trun::RUNS_DIR).is_dir()
 }
 
 fn ckpt_stem(ckpt_path: &str) -> Result<String, String> {
@@ -1414,4 +1433,36 @@ pub async fn get_candidate_vocal_range(
         return Ok(None);
     };
     Ok(map.get("vocal_range").cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⛔ §F2⒝ batch 2 — the tripwire under `check_in_training_root`, in both directions.
+    ///
+    /// Containment cannot catch the mistake this batch makes possible: a caller left holding a
+    /// family-slot path is still inside the training root, so every audition command keeps
+    /// working and quietly builds a SECOND cache tree at the slot root. It is read back later as
+    /// this run's, because a cache hit is decided by `model.json` existing and nothing else — and
+    /// two of these commands DELETE. Both directions are asserted: inverting the comparison would
+    /// refuse every legitimate run instead, which is the other way this line can be wrong.
+    #[test]
+    fn a_family_slot_is_never_mistaken_for_a_training_run() {
+        let base = std::env::temp_dir().join(format!("utai_aud_slot_{}", uuid::Uuid::new_v4()));
+        let slot = base.join("p1_aaaabbbb").join("rvc");
+        let run = crate::training::trun::runs_root(&slot).join("rfeedfacefeed");
+        std::fs::create_dir_all(run.join("audition")).unwrap();
+
+        assert!(workspace_is_a_slot(&slot), "it holds a runs/ container, so it is a slot");
+        assert!(!workspace_is_a_slot(&run), "a run must stay usable — this is not a blanket ban");
+
+        // …and an unmigrated slot IS its own run, which is exactly why this cannot be an
+        // "absence" test: there is no container there and none is expected.
+        let flat = base.join("p2_ccccdddd").join("sovits");
+        std::fs::create_dir_all(flat.join("audition")).unwrap();
+        assert!(!workspace_is_a_slot(&flat));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

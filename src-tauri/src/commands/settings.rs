@@ -1329,17 +1329,77 @@ fn verify_dir_copy(src: &std::path::Path, dst: &std::path::Path, skip_dot_top: b
 /// the old `training/` along with everything it still held that the new root does not — the
 /// concrete loss being every checkpoint written between "migrated the data dir" and "actually
 /// restarted", which lands in the OLD root. Same-layout pairs merge per file as before.
+/// Where in the training tree a [`sync_dir_delta`] recursion currently is.
+///
+/// ★§F2⒝ — it was a `bool`, then an `Option<&str>` marker, and neither could express the level
+/// this batch adds. The levels do NOT share one rule:
+/// * a PROJECT and a SLOT each decide their layout with a marker file, and merging two different
+///   layouts per-file re-seeds products at a level nothing reads them from any more;
+/// * a POOL merges harmlessly, because a pool's content is a pure function of the identity its
+///   directory is named after — two roots' `pools/<same id>/` hold the same recipe;
+/// * ⛔ a RUN does NOT. Its content is not a function of its id, and the layout migration mints
+///   the legacy run's id DETERMINISTICALLY per family, so two data roots each holding a migrated
+///   `rvc` slot have a `runs/<same id>/` containing two DIFFERENT trainings. Merging those
+///   file-by-file, newest-mtime-wins, interleaves two trainings' `G_*.pth` / `D_*.pth` /
+///   `best_state.json` / `resume_best/` into one directory — the unrecoverable tree this whole
+///   function exists to prevent, one level deeper than the guard used to reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncLevel {
+    /// Below every layout decision (or outside the training tree): plain per-file delta.
+    Plain,
+    /// The training ROOT — children are projects.
+    Projects,
+    /// A PROJECT — children are family slots.
+    Slots,
+    /// A family SLOT — children are `pools/`, `runs/`, and whatever an unmigrated slot still has.
+    Slot,
+    /// The `runs/` container — every child is one training RUN.
+    Runs,
+}
+
+impl SyncLevel {
+    /// Are these two child directories in DIFFERENT layouts? Returns what to say if so.
+    ///
+    /// ⛔ For a slot this compares the layout NUMBER, not the marker's existence. Layout 2 and
+    /// layout 3 advance the SAME `slot.json` (`trun::SLOT_LAYOUT_RUNS` is deliberately not a bump
+    /// of `tpool::SLOT_LAYOUT` — see that constant), so an existence test cannot tell "pool folded"
+    /// from "pool AND run folded": a layout-2 slot would merge file-by-file into a layout-3 one and
+    /// re-seed `G_*.pth` / `run.json` / `weights/` at the slot root, beside a `runs/` that already
+    /// holds them. Nothing would ever read that copy and nothing would ever delete it — S121's
+    /// `dataset_44k` finding, one layout later, and the reason this is a number.
+    fn layout_conflict(self, from: &std::path::Path, to: &std::path::Path) -> Option<String> {
+        match self {
+            SyncLevel::Projects => {
+                let m = crate::training::tproject::PROJECT_META;
+                (from.join(m).is_file() != to.join(m).is_file())
+                    .then(|| format!("{m} on one side only"))
+            }
+            SyncLevel::Slots => {
+                let layout = |d: &std::path::Path| {
+                    crate::training::tpool::read_slot_meta(d).map(|m| m.layout).unwrap_or(0)
+                };
+                let (a, b) = (layout(from), layout(to));
+                (a != b).then(|| format!("slot layout {a} vs {b}"))
+            }
+            _ => None,
+        }
+    }
+
+    fn descend(self, child: &str) -> SyncLevel {
+        match self {
+            SyncLevel::Projects => SyncLevel::Slots,
+            SyncLevel::Slots => SyncLevel::Slot,
+            SyncLevel::Slot if child == crate::training::trun::RUNS_DIR => SyncLevel::Runs,
+            _ => SyncLevel::Plain,
+        }
+    }
+}
+
 fn sync_dir_delta(
     src: &std::path::Path,
     dst: &std::path::Path,
     skip_dot_top: bool,
-    // ★§F2⒝ — was `layout_aware: bool`, which only ever guarded ONE level. The training tree has
-    // TWO layout decisions stacked on top of each other now (project-shaped vs legacy flat, and
-    // pooled slot vs flat slot), each with its own marker file, and a guard that stops after the
-    // first one lets a flat slot merge file-by-file into a pooled one — re-seeding `dataset_44k/`
-    // at the slot root, where nothing will ever read it again and nothing will ever delete it.
-    // Same family as S109's reclaim thread building a dictionary set no build ever shipped.
-    layout_marker: Option<&str>,
+    level: SyncLevel,
     skip_top_names: &[String],
 ) -> (u64, u64) {
     let mut copied = 0u64;
@@ -1355,12 +1415,12 @@ fn sync_dir_delta(
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if from.is_dir() {
-            if let Some(marker) = layout_marker {
-                if to.exists() && from.join(marker).is_file() != to.join(marker).is_file() {
+            if to.exists() {
+                if let Some(why) = level.layout_conflict(&from, &to) {
                     tracing::warn!(
-                        "data-dir reclaim: {} and {} are in different training layouts ({marker} \
-                         on one side only) — keeping the old tree instead of merging (move it by \
-                         hand once you have checked it)",
+                        "data-dir reclaim: {} and {} are in different training layouts ({why}) — \
+                         keeping the old tree instead of merging (move it by hand once you have \
+                         checked it)",
                         from.display(),
                         to.display()
                     );
@@ -1368,16 +1428,23 @@ fn sync_dir_delta(
                     continue;
                 }
             }
-            // One level down from a PROJECT are its family slots, whose own layout marker is
-            // `slot.json`. Below that there is no layout decision left to make.
-            let inner = match layout_marker {
-                Some(m) if m == crate::training::tproject::PROJECT_META => {
-                    Some(crate::training::tpool::SLOT_META)
-                }
-                _ => None,
-            };
+            // ⛔ A RUN is copied whole or not at all — see [`SyncLevel`]. Counted as a failure so
+            // the old subtree is kept: both directories hold real training results and only a
+            // human can say which one is wanted.
+            if level == SyncLevel::Runs && to.exists() {
+                tracing::warn!(
+                    "data-dir reclaim: {} and {} are both training runs with the same id — \
+                     keeping the old tree instead of merging them (they are two different \
+                     trainings; move the one you want by hand)",
+                    from.display(),
+                    to.display()
+                );
+                failed += 1;
+                continue;
+            }
             // Nested levels are never bundle resources — the skip list is a TOP-LEVEL rule.
-            let (c, f) = sync_dir_delta(&from, &to, false, inner, &[]);
+            let child = entry.file_name().to_string_lossy().into_owned();
+            let (c, f) = sync_dir_delta(&from, &to, false, level.descend(&child), &[]);
             copied += c;
             failed += f;
             continue;
@@ -1888,7 +1955,7 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
             &sub,
             &active_data_dir.join(name),
             skips_dot_top(name),
-            (name == "training").then_some(crate::training::tproject::PROJECT_META),
+            if name == "training" { SyncLevel::Projects } else { SyncLevel::Plain },
             skip_top,
         );
         if name == "training" {
@@ -2860,6 +2927,101 @@ mod tests {
 
     fn find<'a>(list: &'a [TrainingGpu], label: &str) -> &'a TrainingGpu {
         list.iter().find(|g| g.label == label).unwrap_or_else(|| panic!("{label} not listed"))
+    }
+
+    /// ⛔ §F2⒝ batch 2 — the data-root reclaim must never MERGE two training runs.
+    ///
+    /// The layout migration mints the legacy run's id deterministically per family, so two data
+    /// roots that both went through it have `runs/<the same id>/` holding two DIFFERENT trainings.
+    /// A per-file, newest-mtime-wins merge would interleave their `G_*.pth` / `D_*.pth` /
+    /// `best_state.json` into one directory — the unrecoverable tree this function exists to
+    /// prevent, one level below where the guard used to reach. A pool at the same depth DOES merge
+    /// harmlessly, and that contrast is asserted here too: a rule that refused everything below a
+    /// slot would be indistinguishable from this one on the run alone.
+    #[test]
+    fn a_reclaim_merges_pools_but_never_two_runs_with_the_same_id() {
+        let base = std::env::temp_dir().join(format!("utai_sync_runs_{}", uuid::Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        let w = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // Both roots: the same project, the same family slot, both migrated (slot.json present),
+        // both holding a run with the SAME id — but different weights.
+        for (root, tag) in [(&old, "old"), (&new, "new")] {
+            w(root.join("p1_aaaabbbb").join("project.json"), r#"{"id":"p1_aaaabbbb"}"#);
+            w(root.join("p1_aaaabbbb").join("rvc").join("slot.json"), r#"{"layout":3}"#);
+            w(root.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth"), tag);
+            w(root.join("p1_aaaabbbb/rvc/pools/pdeadbeef0000/dataset.fingerprint"), "same");
+        }
+        // …and one artifact that exists only in the OLD root, on each side of the rule
+        w(old.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/D_1400.pth"), "old");
+        w(old.join("p1_aaaabbbb/rvc/pools/pdeadbeef0000/0_gt_wavs/0.wav"), "old");
+
+        let (_copied, failed) = sync_dir_delta(&old, &new, false, SyncLevel::Projects, &[]);
+
+        assert!(failed > 0, "a colliding run must be REPORTED, not silently skipped — the caller \
+                             deletes the old tree exactly when nothing failed");
+        assert_eq!(
+            std::fs::read_to_string(new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth"))
+                .unwrap(),
+            "new",
+            "the destination run must be left exactly as it was"
+        );
+        assert!(
+            !new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/D_1400.pth").exists(),
+            "…and nothing from the other training may leak into it: a G from one run beside a D \
+             from another is a pair that resumes into garbage"
+        );
+        // the POOL at the same depth still merges — its content IS a function of its identity
+        assert!(
+            new.join("p1_aaaabbbb/rvc/pools/pdeadbeef0000/0_gt_wavs/0.wav").is_file(),
+            "pools carry over as before; refusing them too would cost hours of preprocessing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔ §F2⒝ batch 2 — layout 2 and layout 3 write the SAME `slot.json`, so "the marker exists on
+    /// both sides" cannot tell them apart. The guard has to read the NUMBER.
+    ///
+    /// Without this a slot whose run products are still at its root merges into one that has
+    /// folded them into `runs/<id>/`, planting `G_*.pth` / `run.json` / `weights/` back at the slot
+    /// root beside the container that already holds them — a copy nothing reads and nothing
+    /// deletes. It is S121's `dataset_44k` finding one layout later, and it is invisible: the merge
+    /// reports success and the reclaim then deletes the old root.
+    #[test]
+    fn a_reclaim_will_not_merge_a_layout_2_slot_into_a_layout_3_one() {
+        let base = std::env::temp_dir().join(format!("utai_sync_lay_{}", uuid::Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        let w = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        for root in [&old, &new] {
+            w(root.join("p1_aaaabbbb").join("project.json"), r#"{"id":"p1_aaaabbbb"}"#);
+        }
+        // OLD: pools folded, run products still at the slot root
+        w(old.join("p1_aaaabbbb/rvc/slot.json"), r#"{"layout":2}"#);
+        w(old.join("p1_aaaabbbb/rvc/G_1400.pth"), "old");
+        w(old.join("p1_aaaabbbb/rvc/run.json"), "{}");
+        // NEW: the same slot, already folded into runs/
+        w(new.join("p1_aaaabbbb/rvc/slot.json"), r#"{"layout":3}"#);
+        w(new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth"), "new");
+
+        let (_copied, failed) = sync_dir_delta(&old, &new, false, SyncLevel::Projects, &[]);
+
+        assert!(failed > 0, "a layout mismatch must be reported, or the old root gets deleted");
+        assert!(
+            !new.join("p1_aaaabbbb/rvc/G_1400.pth").exists(),
+            "a layout-2 run product must never be planted at a layout-3 slot root"
+        );
+        assert!(!new.join("p1_aaaabbbb/rvc/run.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth"))
+                .unwrap(),
+            "new"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// S115 §F5-2: the upgrade path. Every existing user's `config.json` predates

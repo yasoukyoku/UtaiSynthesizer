@@ -403,6 +403,7 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   PROJECT_NEEDS_ATTENTION: { key: "backend.PROJECT_NEEDS_ATTENTION", modal: true },
   TRAINING_LAYOUT_MIGRATION_PENDING: { key: "backend.TRAINING_LAYOUT_MIGRATION_PENDING", modal: true },
   AUDITION_WORKSPACE_OUTSIDE_ROOT: { key: "backend.AUDITION_WORKSPACE_OUTSIDE_ROOT" },
+  AUDITION_WORKSPACE_IS_A_SLOT: { key: "backend.AUDITION_WORKSPACE_IS_A_SLOT" },
   PROJECT_DATASET_SHAPE: { key: "backend.PROJECT_DATASET_SHAPE" },
   TRAINING_DATASET_SELF_SOURCE: { key: "backend.TRAINING_DATASET_SELF_SOURCE" },
   // S76 batch 5b — managing the project's shared dataset outside a run. The three interlocks are

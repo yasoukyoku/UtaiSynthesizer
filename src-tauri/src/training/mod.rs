@@ -468,9 +468,16 @@ pub struct TrainingSnapshot {
     /// carried from the very first batch rather than bolted on later.
     #[serde(default)]
     pub project_id: String,
-    /// The FAMILY SLOT directory of this run (`<data>/training/<project>/<family>`) — the
-    /// exact equivalent of the pre-S76 workspace root, which is why every consumer that
-    /// joins `audition/` or reads `weights/` off it keeps working unchanged.
+    /// The RUN directory of this run — where `weights/` and the audition cache live.
+    ///
+    /// ★§F2⒝ batch 2: it was the family slot while a slot could only ever hold one run. It is
+    /// resolved through `trun::resolve_run_dir` now, which answers with the slot root for as long
+    /// as there is no `runs/` container — so every frontend consumer that joins `audition/<stem>`
+    /// or reads `weights/` off it keeps working byte-for-byte, and starts addressing the right run
+    /// the moment the layout migration is turned on.
+    ///
+    /// ⚠ NOT the same value as the `workspace` key in the sidecar's run config: that one is the
+    /// SLOT, because python resolves its preprocessing pool relative to it.
     pub workspace: String,
     pub total_epochs: u32,
     pub stage: Option<StageInfo>,
@@ -648,28 +655,41 @@ pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// Does this workspace hold anything a wipe would destroy? = any family's checkpoints, any
+/// Does this SLOT hold anything a wipe would destroy? = any run's checkpoints, any run's
 /// diffusion progress, or an imported dataset pool (which cost a multi-minute import). An
 /// empty leftover directory — try_start's `create_dir_all` runs before the run can fail —
 /// holds nothing and stays freely wipeable.
 ///
 /// Single source for the fail-closed wipe-consent guard; keep it a superset of every artifact
 /// class the resume paths can read back (add a family ⇒ add its ckpt shape here).
-pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
-    has_main_progress(ws)
-        // ★S119 §F8⒝ — the resumable BEST snapshot counts as work too, for the same reason the
-        // diffusion arm below was widened in S118: it can outlive the numbered grid, and then a
-        // wipe with no dialog would destroy the only thing the slot could be continued from.
-        // ⚠ `voc_snapshot_step` reads the payload list out of the marker, so this also picks up
-        // the GAN pair's `resume_best/` — a slot that used to read as「无活」when its numbered
-        // files were gone now reads as「有活」. That is a widening, deliberately: it can only
-        // ever ADD a consent dialog, never remove one.
-        || vocoder_progress_step(ws).is_some()
-        // ★S118 §F8⒜ — the SNAPSHOTS count as diffusion work too, and they can outlive the
-        // numbered grid (the archive cleanup and a user freeing disk space both delete the big
-        // numbered files first). Asking only `max_diffusion_step` here would let a slot whose
-        // only resume point is a snapshot be wiped with no dialog at all.
-        || diffusion_progress_step(ws).unwrap_or(0) > 0
+///
+/// ⛔ **PLURAL over runs, and that is a safety property, not tidiness.** A 「重训」 erases the
+/// whole slot, so the question is "does ANY run hold work". Asking only one run would let this
+/// answer `false` while another run's gigabytes sit right there — and `false` here removes the
+/// backend's last refusal of an unconfirmed wipe (`TRAINING_WIPE_NOT_CONFIRMED`) *and* makes the
+/// sibling-slot `PROJECT_DATASET_IN_USE` pre-check fail open. Both failures are silent: the
+/// destructive dialog hangs off `WorkspaceInfo::exists`, not off this, so the prompt would still
+/// appear while the guard behind it was gone.
+///
+/// ⚠ It was named `workspace_holds_work` while "workspace" meant both the slot and the run. The
+/// name changed with the meaning: three of its arms are per-RUN questions and three are per-SLOT.
+pub(crate) fn slot_holds_work(slot: &Path) -> bool {
+    trun::run_dirs(slot).iter().any(|run| {
+        has_main_progress(run)
+            // ★S119 §F8⒝ — the resumable BEST snapshot counts as work too, for the same reason the
+            // diffusion arm below was widened in S118: it can outlive the numbered grid, and then a
+            // wipe with no dialog would destroy the only thing the slot could be continued from.
+            // ⚠ `voc_snapshot_step` reads the payload list out of the marker, so this also picks up
+            // the GAN pair's `resume_best/` — a slot that used to read as「无活」when its numbered
+            // files were gone now reads as「有活」. That is a widening, deliberately: it can only
+            // ever ADD a consent dialog, never remove one.
+            || vocoder_progress_step(run).is_some()
+            // ★S118 §F8⒜ — the SNAPSHOTS count as diffusion work too, and they can outlive the
+            // numbered grid (the archive cleanup and a user freeing disk space both delete the big
+            // numbered files first). Asking only `max_diffusion_step` here would let a slot whose
+            // only resume point is a snapshot be wiped with no dialog at all.
+            || diffusion_progress_step(run).unwrap_or(0) > 0
+    })
         // Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR
         // part of a training run, and a slot that has it but no checkpoint yet is the normal
         // state of「刚开始练」. `dataset.fingerprint` is the one artifact every family writes
@@ -681,11 +701,13 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
         // second is not a fallback, it is the shape of a slot that has not been through the
         // layout migration (and `tproject::empty_shell` still depends on it for pre-S76 trees).
         // Dropping it would make an unmigrated slot read as「无活」and wipeable with no dialog.
-        || tpool::slot_has_pool(ws)
-        || ws.join(tpool::FINGERPRINT).is_file()
+        // ⚠ These three are per-SLOT questions and stay on the slot: the pool is shared by every
+        // run of it, which is the entire point of layout 2.
+        || tpool::slot_has_pool(slot)
+        || slot.join(tpool::FINGERPRINT).is_file()
         // pre-S76 shape only (dataset/ used to be a sibling of the checkpoints); still true
         // for a directory the migration has not folded yet.
-        || has_dataset_pool(ws)
+        || has_dataset_pool(slot)
 }
 
 // `workspace_info(name, backend)` lived here until S76 batch 4. Every consumer now knows WHICH
@@ -695,22 +717,32 @@ pub(crate) fn workspace_holds_work(ws: &Path) -> bool {
 // belongs: `list_project_summaries` lists such directories as「待迁移」rows, which is visible
 // instead of merely non-empty.
 
-/// Structured facts about ONE architecture slot of ONE project — the id-keyed form, which is
+/// Structured facts about ONE RUN of ONE architecture slot — the id-keyed form, which is
 /// the only one that stays correct across a rename.
-pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceInfo {
+///
+/// ⛔ Every field except `exists` and `has_dataset` describes a RUN: the frozen manifest values,
+/// the progress probes, the resume points, the speaker order. It therefore resolves the run
+/// through [`trun::resolve_run_dir`] and RETURNS AN ERROR rather than guessing when a slot holds
+/// more than one — the batch that starts minting a second run is the batch that must hand this a
+/// run id, and an Err here is how a forgotten call site says so out loud. Answering with an empty
+/// `WorkspaceInfo` instead would blank `has_main_progress` and `version`, which the parameters
+/// page reads to decide whether the four resume-locked controls are locked: the user would get
+/// them unlocked, change one, and be refused by Rust with a CODE they did nothing to earn.
+pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> Result<WorkspaceInfo> {
     let ws = tproject::family_dir(data_dir, project_id, backend_family(backend));
-    let manifest = std::fs::read_to_string(ws.join("run_manifest.json"))
+    let run = trun::resolve_run_dir(&ws, None)?;
+    let manifest = std::fs::read_to_string(run.join("run_manifest.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or_default();
     let field = |k: &str| manifest[k].as_str().unwrap_or("").to_string();
     // ①c: display speaker names, ordered = emb_g id. The carriers and their precedence live in
-    // ONE place (`frozen_speakers`) so this and the project's dataset view can never disagree
-    // about who row i is. Empty for single-speaker — and also when NO carrier holds a name, so
-    // the pre-existing "nothing to compare" semantics of the resume dialog are preserved
+    // ONE place (`frozen_speakers_of_run`) so this and the project's dataset view can never
+    // disagree about who row i is. Empty for single-speaker — and also when NO carrier holds a
+    // name, so the pre-existing "nothing to compare" semantics of the resume dialog are preserved
     // (a vec of blanks would read as a speaker mismatch).
     let speakers: Vec<String> = {
-        let mut v: Vec<String> = frozen_speakers(data_dir, project_id, backend)
+        let mut v: Vec<String> = frozen_speakers_of_run(&run)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -719,23 +751,25 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         }
         v
     };
-    WorkspaceInfo {
+    Ok(WorkspaceInfo {
+        // ⚠ the SLOT's existence, not the run's: the destructive-retrain dialog hangs off this
+        // one field, and a slot that holds pools but no run must still prompt.
         exists: ws.exists(),
         family: field("backend"),
         version: field("version"),
         sample_rate: field("sample_rate"),
-        has_main_progress: has_main_progress(&ws),
-        diff_steps: diffusion_progress_step(&ws).unwrap_or(0),
+        has_main_progress: has_main_progress(&run),
+        diff_steps: diffusion_progress_step(&run).unwrap_or(0),
         // ★S119 §F8⒝ — the vocoder's marker records a lightning GLOBAL step while every other
         // number this struct carries for that backend is REAL (`model_ckpt_steps_3644.ckpt` is
         // step 1822 everywhere the user can see it). Halving here, once, keeps the resume
         // dialog's 「从最佳存档继续（第 N 步）」 in the same units as the rest of the card.
         best_resume_step: if backend_family(backend) == "vocoder" {
-            voc_best_resume_step(&ws)
+            voc_best_resume_step(&run)
         } else {
-            best_resume_step(&ws)
+            best_resume_step(&run)
         },
-        diff_best_resume_step: diff_snapshot_step(&ws, "resume_best"),
+        diff_best_resume_step: diff_snapshot_step(&run, "resume_best"),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
@@ -744,15 +778,20 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
         n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
         speakers,
         diff_k_step_max: manifest["diff_k_step_max"].as_u64().unwrap_or(0),
-    }
+    })
 }
 
-/// The `(slug, display name)` pairs ONE slot froze, in emb_g row order. Empty when this slot
+/// The `(slug, display name)` pairs ONE RUN froze, in emb_g row order. Empty when that run
 /// never co-trained speakers.
 ///
-/// SINGLE SOURCE for「这个槽的第 i 号歌手是谁」 — `slot_info` reports the names half of it.
+/// SINGLE SOURCE for「第 i 号歌手是谁」 — `slot_info` reports the names half of it.
 /// `slugify` is one-way, so without this a `dataset/<slug>/` directory can never be shown as
 /// the singer it holds, and the order is exactly what a manual rebuild must reproduce.
+///
+/// ⛔ `run` is a RUN directory. Both carriers are run products, and the value is what decides
+/// which emb_g row a singer occupies — reading another run's copy would silently map this run's
+/// speakers onto that one's rows (`effective_speaker_slugs` adopts frozen slugs whenever the
+/// COUNT matches, which two runs of the same project routinely do).
 ///
 /// Two carriers, in this order:
 /// * `run_manifest.json` — `speakers` (slugs) + `speaker_names`. Durable: merge-preserved
@@ -762,8 +801,7 @@ pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> WorkspaceI
 ///   machine's real 2-singer projects). Matched BY SLUG, never by position: a `sovits_diff`
 ///   run rewrites `run.json` without the key at all, and a mismatched pair would print one
 ///   singer's name against another's emb_g row — the exact confusion this is meant to end.
-pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<dsmanifest::DsSpeaker> {
-    let ws = tproject::family_dir(data_dir, project_id, backend_family(family));
+pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
     let read_json = |p: PathBuf| -> Option<serde_json::Value> {
         std::fs::read_to_string(p)
             .ok()
@@ -830,6 +868,32 @@ pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<d
         .collect()
 }
 
+/// The speaker set this SLOT has frozen — the answer the PROJECT-level guards need.
+///
+/// ⛔ **PLURAL over runs, and deliberately over-strict.** Its consumers ask 「这个项目的歌手结构
+/// 还能不能改」, and the load-bearing one is a REFUSAL: `delete_project_dataset_files` returns
+/// `DATASET_SPEAKERS_FROZEN` when a delete would empty a singer and any slot has frozen the set
+/// (`commands::training`). Answering EMPTY here removes that refusal — the delete then goes
+/// through, the singer's files are gone, and the speaker set has changed under a model that can
+/// no longer resume from it. (The `drop_empty_speaker_dirs` flag the same call passes is the
+/// small half: it only removes a directory that is already empty. Pointing a fix at the flag
+/// instead of at the refusal is how this reads if you skim it.)
+///
+/// Saying "frozen" when only one of several runs froze a set costs a refused edit; saying "not
+/// frozen" costs the data. Over-strict is the only safe direction, so this is a first-non-empty
+/// over every run rather than a question about one of them.
+///
+/// ⚠ It is NOT the right answer for「这一次 run 从哪些 slug 续训」— that is
+/// [`frozen_speakers_of_run`], asked of the run that is actually resuming.
+pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<dsmanifest::DsSpeaker> {
+    let slot = tproject::family_dir(data_dir, project_id, backend_family(family));
+    trun::run_dirs(&slot)
+        .into_iter()
+        .map(|run| frozen_speakers_of_run(&run))
+        .find(|v| !v.is_empty())
+        .unwrap_or_default()
+}
+
 /// ★S117 §F2⒜ / S118 §F8⒜ — the step of a COMPLETE resume snapshot under `<dir>/<sub>/`, or None.
 ///
 /// Python owns the layout (`utai_train/resume_state.save_snapshot`): the payload file(s) first,
@@ -858,14 +922,14 @@ fn snapshot_step(dir: &Path, sub: &str, fallback: &[&str]) -> Option<u64> {
 }
 
 /// The GAN trainers' resumable best snapshot: `<slot>/resume_best/{G.pth,D.pth,state.json}`.
-fn best_resume_step(workspace: &Path) -> Option<u64> {
-    snapshot_step(workspace, "resume_best", &["G.pth", "D.pth"])
+fn best_resume_step(run: &trun::RunDir) -> Option<u64> {
+    snapshot_step(run, "resume_best", &["G.pth", "D.pth"])
 }
 
 /// The shallow-diffusion snapshots, which live one level down in `<slot>/diffusion/` and hold ONE
 /// payload file each (that trainer's checkpoint is one file, not a G+D pair).
-fn diff_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
-    snapshot_step(&workspace.join("diffusion"), sub, &["model.pt"])
+fn diff_snapshot_step(run: &trun::RunDir, sub: &str) -> Option<u64> {
+    snapshot_step(&run.join("diffusion"), sub, &["model.pt"])
 }
 
 /// ★S119 §F8⒝ — the vocoder's resumable best snapshot, in GLOBAL lightning units.
@@ -877,14 +941,14 @@ fn diff_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
 /// is `trainer.global_step`, which for this manual-optimization GAN is 2× the real step
 /// (设计红队 A8). Every other vocoder number Rust and the UI show is REAL, so the halving happens
 /// in `voc_best_resume_step` and nowhere else.
-fn voc_snapshot_step(workspace: &Path, sub: &str) -> Option<u64> {
-    snapshot_step(workspace, sub, &["model.ckpt"])
+fn voc_snapshot_step(run: &trun::RunDir, sub: &str) -> Option<u64> {
+    snapshot_step(run, sub, &["model.ckpt"])
 }
 
 /// The vocoder's best snapshot in REAL steps — what the resume dialog's 「从最佳存档继续（第 N
 /// 步）」 must say, and what the target guard compares against `total_steps`.
-fn voc_best_resume_step(workspace: &Path) -> Option<u64> {
-    voc_snapshot_step(workspace, "resume_best").map(|g| g / 2)
+fn voc_best_resume_step(run: &trun::RunDir) -> Option<u64> {
+    voc_snapshot_step(run, "resume_best").map(|g| g / 2)
 }
 
 /// How far the VOCODER has actually progressed in this slot, in GLOBAL units: the numbered grid
@@ -894,10 +958,10 @@ fn voc_best_resume_step(workspace: &Path) -> Option<u64> {
 /// archive cleanup and a user freeing disk space both delete the big numbered files first, so a
 /// slot whose only resume point is the snapshot must still read as「有活」— otherwise the
 /// wipe-consent dialog goes missing and the manifest guard stops guarding.
-fn vocoder_progress_step(workspace: &Path) -> Option<u64> {
+fn vocoder_progress_step(run: &trun::RunDir) -> Option<u64> {
     [
-        max_vocoder_ckpt_step(workspace),
-        voc_snapshot_step(workspace, "resume_best"),
+        max_vocoder_ckpt_step(run),
+        voc_snapshot_step(run, "resume_best"),
     ]
     .into_iter()
     .flatten()
@@ -913,35 +977,47 @@ fn vocoder_progress_step(workspace: &Path) -> Option<u64> {
 /// archive cleanup can leave a slot whose progress lives ONLY in the snapshots. Every consumer
 /// that asks "is there diffusion work here / how far is it" must use this one, or a wipe-consent
 /// dialog goes missing and a resume lock silently stops locking.
-fn diffusion_progress_step(workspace: &Path) -> Option<u64> {
+fn diffusion_progress_step(run: &trun::RunDir) -> Option<u64> {
     [
-        max_diffusion_step(workspace),
-        diff_snapshot_step(workspace, "resume_latest"),
-        diff_snapshot_step(workspace, "resume_best"),
+        max_diffusion_step(run),
+        diff_snapshot_step(run, "resume_latest"),
+        diff_snapshot_step(run, "resume_best"),
     ]
     .into_iter()
     .flatten()
     .max()
 }
 
-fn has_main_progress(workspace: &Path) -> bool {
-    std::fs::read_dir(workspace)
+/// Does this RUN hold a main-model generator?
+///
+/// ⛔ `run` is a RUN directory ([`trun::resolve_run_dir`]), not the family slot. This predicate is
+/// the load-bearing one of the whole per-run change: it drives `diff_partial_wipe`, and when it
+/// goes false a shallow-diffusion 「重训」 stops meaning "clear `diffusion/`" and becomes
+/// `remove_dir_all_robust` of the entire slot — taking the main model and the preprocessing pools
+/// with it. Handing it a slot root once the products live one level down answers `false` with no
+/// error anywhere.
+///
+/// ⚠ `is_file()` is not decoration: this scans a directory listing, and a DIRECTORY named
+/// `G_something.pth` would otherwise read as a checkpoint. Same guard the sibling scanners below
+/// and `tproject::scan_project_ckpts` need, for the same reason.
+fn has_main_progress(run: &trun::RunDir) -> bool {
+    std::fs::read_dir(run)
         .map(|rd| {
             rd.filter_map(|e| e.ok()).any(|e| {
                 let n = e.file_name().to_string_lossy().into_owned();
-                n.starts_with("G_") && n.ends_with(".pth")
+                n.starts_with("G_") && n.ends_with(".pth") && e.path().is_file()
             })
         })
         .unwrap_or(false)
 }
 
-/// Max numbered model_ckpt_steps_<N>.ckpt at the workspace root — the vocoder
+/// Max numbered model_ckpt_steps_<N>.ckpt at the RUN root — the vocoder
 /// backend's lightning checkpoints (mirrors get_latest_checkpoint_path in the
 /// sidecar). ⚠️ N is in lightning GLOBAL units: the manual-opt GAN counts the
 /// D and G optimizer steps separately, so N = 2 × 实际步 — every comparison
 /// against total_steps must divide by 2 first (设计红队 A8).
-fn max_vocoder_ckpt_step(workspace: &Path) -> Option<u64> {
-    let rd = std::fs::read_dir(workspace).ok()?;
+fn max_vocoder_ckpt_step(run: &trun::RunDir) -> Option<u64> {
+    let rd = std::fs::read_dir(run).ok()?;
     let mut max: Option<u64> = None;
     for e in rd.filter_map(|e| e.ok()) {
         let n = e.file_name().to_string_lossy().into_owned();
@@ -950,23 +1026,35 @@ fn max_vocoder_ckpt_step(workspace: &Path) -> Option<u64> {
             .and_then(|s| s.strip_suffix(".ckpt"))
         {
             if let Ok(v) = num.parse::<u64>() {
-                max = Some(max.map_or(v, |m| m.max(v)));
+                if e.path().is_file() {
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
             }
         }
     }
     max
 }
 
-/// Max numbered model_<n>.pt in workspace/diffusion — mirrors the sidecar's
+/// Max numbered model_<n>.pt in <run>/diffusion — mirrors the sidecar's
 /// load_model resume scan (model_0.pt = the seeded base counts as 0).
-fn max_diffusion_step(workspace: &Path) -> Option<u64> {
-    let rd = std::fs::read_dir(workspace.join("diffusion")).ok()?;
+///
+/// ⚠ `diffusion/` is a RUN product, so this takes the run directory. It must stay ONE level below
+/// the run root rather than becoming it: python's snapshot scan slices checkpoint paths by a fixed
+/// prefix length (`SNAPSHOT_DIR_MIN_LEN`), and a run root has `eval/` and `logs/` inside its scope.
+fn max_diffusion_step(run: &trun::RunDir) -> Option<u64> {
+    let rd = std::fs::read_dir(run.join("diffusion")).ok()?;
     let mut max: Option<u64> = None;
     for e in rd.filter_map(|e| e.ok()) {
         let n = e.file_name().to_string_lossy().into_owned();
         if let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt")) {
             if let Ok(v) = num.parse::<u64>() {
-                max = Some(max.map_or(v, |m| m.max(v)));
+                // `resume_best/` and `resume_latest/` are directories here, and the diffusion
+                // snapshot payload inside them is `model.pt` — a directory that happened to be
+                // named `model_<digits>.pt` would be reported as the newest checkpoint and then
+                // handed to the resume path as one.
+                if e.path().is_file() {
+                    max = Some(max.map_or(v, |m| m.max(v)));
+                }
             }
         }
     }
@@ -1004,12 +1092,7 @@ pub(crate) fn slugify(name: &str) -> String {
 /// multi-speaker project unresumable AND orphans its data directories. (Frozen values are only
 /// adopted when the COUNT matches; anything else is a genuine structure change and falls through
 /// to the resume guard, which refuses it with a specific CODE.)
-fn effective_speaker_slugs(
-    data_dir: &Path,
-    project_id: &str,
-    family: &str,
-    req: &StartTrainingRequest,
-) -> Vec<(String, String)> {
+fn effective_speaker_slugs(run: &trun::RunDir, req: &StartTrainingRequest) -> Vec<(String, String)> {
     if req.speakers.len() <= 1 {
         return Vec::new();
     }
@@ -1017,7 +1100,11 @@ fn effective_speaker_slugs(
     if req.fresh {
         return fresh;
     }
-    let frozen = frozen_speakers(data_dir, project_id, family);
+    // ⛔ THIS run's frozen slugs, never the slot's. The adoption test below is only "the COUNT
+    // matches", which two runs of one project routinely do — reading a sibling run's list here
+    // would map this run's singers onto that one's emb_g rows and preprocess them into that one's
+    // `dataset_44k/<slug>/` directories, with nothing anywhere reporting a mismatch.
+    let frozen = frozen_speakers_of_run(run);
     if frozen.len() != req.speakers.len() {
         return fresh;
     }
@@ -1416,9 +1503,14 @@ impl TrainingManager {
                     })
                     .unwrap_or_default();
                 let declared: std::collections::BTreeSet<String> = effective_speaker_slugs(
-                    &data_dir,
-                    &existing.unwrap().id,
-                    backend_family(&req.backend),
+                    &trun::resolve_run_dir(
+                        &tproject::family_dir(
+                            &data_dir,
+                            &existing.unwrap().id,
+                            backend_family(&req.backend),
+                        ),
+                        None,
+                    )?,
                     &req,
                 )
                 .into_iter()
@@ -1543,7 +1635,17 @@ impl TrainingManager {
         };
         let family = backend_family(&req.backend).to_string();
         let workspace = tproject::family_dir(&data_dir, &project.id, &family);
-        let manifest_path = workspace.join("run_manifest.json");
+        // ★§F2⒝ batch 2 — the SLOT and the RUN are two different directories now, and every
+        // preflight below is one or the other:
+        //   * SLOT — the wipe, `slot_holds_work`, the shared-dataset pre-check, and the
+        //     `workspace` key handed to python (python resolves its POOL relative to that, see
+        //     `utai_train/pool.open_pool`, so re-pointing it at a run would make every migrated
+        //     slot mint an empty pool inside the run and re-preprocess for hours, silently);
+        //   * RUN — the manifest, every progress probe, the frozen speaker set, the resume locks.
+        // Resolved BEFORE any deletion, exactly like the manifest read below: these guards exist
+        // to judge the PRE-wipe state.
+        let run = trun::resolve_run_dir(&workspace, None)?;
+        let manifest_path = run.join("run_manifest.json");
 
         // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
         // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
@@ -1560,7 +1662,7 @@ impl TrainingManager {
         // Rust releases, and every one of those slugs is a directory name on disk plus a
         // `config.spk` key. Re-deriving would mean a toolchain bump silently renames every
         // co-trained speaker's data directory out from under a half-trained model.
-        let eff_speakers = effective_speaker_slugs(&data_dir, &project.id, &family, &req);
+        let eff_speakers = effective_speaker_slugs(&run, &req);
         let planned = dataset_plan(&req, &eff_speakers);
         if !planned.is_empty() {
             let replacing = !current_dataset_listing(&dataset_dir).is_empty()
@@ -1568,7 +1670,7 @@ impl TrainingManager {
             if replacing {
                 if let Some(other) = tproject::FAMILIES.iter().find(|f| {
                     **f != family
-                        && workspace_holds_work(&tproject::family_dir(&data_dir, &project.id, f))
+                        && slot_holds_work(&tproject::family_dir(&data_dir, &project.id, f))
                 }) {
                     return Err(UtaiError::Training(format!(
                         "PROJECT_DATASET_IN_USE: {}",
@@ -1632,7 +1734,7 @@ impl TrainingManager {
             return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
 
-        let has_main = has_main_progress(&workspace);
+        let has_main = has_main_progress(&run);
         // a manifest-less workspace that still holds checkpoints is an anomaly
         // (every run since S37 writes the manifest before spawning): resuming
         // into it would let e.g. 4.1 weights stream into a 4.0 graph through
@@ -1652,7 +1754,7 @@ impl TrainingManager {
             // ★S119 §F8⒝ — the snapshot is a resume point too; asking only about the numbered
             // grid would let a snapshot-only workspace through the very guard that exists to
             // stop a「quiet fake resume」.
-            && vocoder_progress_step(&workspace).is_some()
+            && vocoder_progress_step(&run).is_some()
         {
             return Err(UtaiError::Training("WORKSPACE_MANIFEST_MISSING".into()));
         }
@@ -1676,8 +1778,8 @@ impl TrainingManager {
                 // the SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a
                 // resume point, and letting k_step_max change under it would silently retrain a
                 // different diffusion distribution into the same model.
-                max_diffusion_step: diffusion_progress_step(&workspace),
-                frozen_speakers: &frozen_speakers(&data_dir, &project.id, &family),
+                max_diffusion_step: diffusion_progress_step(&run),
+                frozen_speakers: &frozen_speakers_of_run(&run),
             },
             !req.fresh || diff_partial_wipe,
         ) {
@@ -1690,7 +1792,7 @@ impl TrainingManager {
         // answered the destructive dialog. An empty leftover directory (a prior start that
         // died after create_dir_all) holds nothing and stays freely wipeable.
         if req.fresh && workspace.exists() && !req.wipe_confirmed {
-            if workspace_holds_work(&workspace) {
+            if slot_holds_work(&workspace) {
                 tracing::error!(
                     "refusing unconfirmed wipe of {} — the caller sent fresh=true without \
                      wipe_confirmed; a UI probe most likely failed silently",
@@ -1705,7 +1807,7 @@ impl TrainingManager {
                 // diffusion retrain inside a live main-model workspace: clear
                 // ONLY the diffusion progress — the main checkpoints and the
                 // shared preprocessing caches survive
-                let diff_dir = workspace.join("diffusion");
+                let diff_dir = run.join("diffusion");
                 if diff_dir.exists() {
                     // ★S118 §F8-res⒌ — `remove_dir_all_robust`, like the full-wipe branch below.
                     // This one used plain `remove_dir_all`, and the difference is not cosmetic: a
@@ -1745,10 +1847,10 @@ impl TrainingManager {
             // this mirrors it only so the refusal lands before the user waits for a run that would
             // do nothing (python raises its own 「没有执行任何训练步」 if this ever guesses wrong).
             let start_step = if req.resume_from.trim() == "best" {
-                diff_snapshot_step(&workspace, "resume_best")
-                    .or_else(|| diffusion_progress_step(&workspace))
+                diff_snapshot_step(&run, "resume_best")
+                    .or_else(|| diffusion_progress_step(&run))
             } else {
-                diffusion_progress_step(&workspace)
+                diffusion_progress_step(&run)
             };
             if let Some(max_step) = start_step {
                 if max_step > 0 && max_step >= req.total_steps as u64 {
@@ -1767,10 +1869,10 @@ impl TrainingManager {
             // checkpoint on purpose, so judging by the newest one would refuse a resume that
             // still has thousands of steps to train — a visible button that always fails.
             let real = if req.resume_from.trim() == "best" {
-                voc_best_resume_step(&workspace)
-                    .or_else(|| vocoder_progress_step(&workspace).map(|g| g / 2))
+                voc_best_resume_step(&run)
+                    .or_else(|| vocoder_progress_step(&run).map(|g| g / 2))
             } else {
-                vocoder_progress_step(&workspace).map(|g| g / 2)
+                vocoder_progress_step(&run).map(|g| g / 2)
             };
             if let Some(real) = real {
                 if real > 0 && real >= req.total_steps as u64 {
@@ -1890,7 +1992,7 @@ impl TrainingManager {
         let interval_force_save =
             ((req.interval_force_save.max(1) + interval_val - 1) / interval_val) * interval_val;
 
-        let stop_file = workspace.join("stop.flag");
+        let stop_file = run.join("stop.flag");
         let _ = std::fs::remove_file(&stop_file); // stale flag would insta-stop the run
 
         // ---- reset run state ----
@@ -1902,7 +2004,7 @@ impl TrainingManager {
                 model_name: req.model_name.clone(),
                 model_slug: slug.clone(),
                 project_id: project.id.clone(),
-                workspace: workspace.to_string_lossy().into_owned(),
+                workspace: run.to_string_lossy().into_owned(),
                 total_epochs: req.total_epoch,
                 // ①c: freeze the run's speaker names (id order) for the audition picker; empty
                 // for a single-speaker run (len ≤ 1) so nothing changes there.
@@ -1946,7 +2048,8 @@ impl TrainingManager {
             .name("training-run".into())
             .spawn(move || {
                 let outcome = run_worker(
-                    &inner, &app, &app_dir, &data_dir, &workspace, &stop_file, &req, &ctx, &slug,
+                    &inner, &app, &app_dir, &data_dir, &workspace, &run, &stop_file, &req, &ctx,
+                    &slug,
                 );
                 if let Err(e) = outcome {
                     finalize_elapsed(&inner);
@@ -2297,7 +2400,16 @@ fn run_worker(
     app: &tauri::AppHandle,
     app_dir: &Path,
     data_dir: &Path,
+    // ⛔ `workspace` is the SLOT, and it is what python is handed as its `workspace` key:
+    // `utai_train.pool.open_pool` resolves the preprocessing pool relative to it
+    // (`<slot>/pools/<id>/`, or the slot root itself for an unmigrated slot). Pointing it at a run
+    // directory would make every migrated slot mint an EMPTY pool inside the run and re-preprocess
+    // for hours, announced by one log line. The batch that turns the layout migration on has to
+    // add a separate `run_dir` key rather than re-point this one.
+    // `run` is the RUN, resolved by the caller before any wipe — where `run.json` and the
+    // checkpoints go.
     workspace: &Path,
+    run: &trun::RunDir,
     stop_file: &Path,
     req: &StartTrainingRequest,
     ctx: &RunCtx,
@@ -2577,7 +2689,7 @@ fn run_worker(
     if is_multi {
         run_config["speakers"] = serde_json::json!(run_speakers);
     }
-    let run_json = workspace.join("run.json");
+    let run_json = run.join("run.json");
     std::fs::write(&run_json, serde_json::to_vec_pretty(&run_config)?)?;
 
     // ---- spawn the sidecar ----
@@ -2995,7 +3107,11 @@ mod tests {
     /// export, i.e. a dead end that nothing said was a dead end).
     #[test]
     fn s117_the_best_resume_option_needs_all_three_files() {
-        let root = std::env::temp_dir().join(format!("utai_s117_best_{}", std::process::id()));
+        // ⛔ a RUN directory: `best_resume_step` reads a run product, and the newtype is what
+        // stops a family slot being handed to it once the two stop being the same directory.
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s117_best_{}", std::process::id())),
+        );
         let d = root.join("resume_best");
         std::fs::create_dir_all(&d).unwrap();
         assert_eq!(best_resume_step(&root), None, "empty directory is not a snapshot");
@@ -3175,6 +3291,19 @@ mod tests {
                  would hijack the diffusion resume scan"
             );
         }
+        // ★§F2⒝ batch 2 — the OTHER half of the same rule, and the reason `diffusion/` has to stay
+        // one level BELOW a run root rather than becoming it. The loop above only says python's own
+        // snapshot names are long enough; it knows nothing about depth, so both `diffusion` (9) and
+        // a minted run id (13) sail through it and `trun`'s doc used to cite it as this rule's
+        // guard. What actually makes the run root unusable as an expdir is that a run root has
+        // these beside the snapshots — and they are SHORT:
+        for d in ["eval", "logs"] {
+            assert!(
+                d.chars().count() < min_len,
+                "{d:?} now clears SNAPSHOT_DIR_MIN_LEN={min_len} — re-read why the shallow-diffusion \
+                 expdir may not be the run root, because the reason just changed"
+            );
+        }
         // Rust joins these names by hand in two files; a python rename must break a test here
         // rather than the user's resume.
         for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
@@ -3298,7 +3427,9 @@ mod tests {
     /// ★S118 §F8⒜ — the diffusion best snapshot needs its OWN reader, and every file it names.
     #[test]
     fn s118_the_diffusion_best_resume_option_needs_a_complete_snapshot() {
-        let root = std::env::temp_dir().join(format!("utai_s118_diff_{}", std::process::id()));
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s118_diff_{}", std::process::id())),
+        );
         let d = root.join("diffusion").join("resume_best");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&d).unwrap();
@@ -3342,7 +3473,7 @@ mod tests {
         // slot whose only resume point is the snapshot.
         assert_eq!(diffusion_progress_step(&root), Some(1400));
         assert!(
-            workspace_holds_work(&root),
+            slot_holds_work(&root),
             "a slot holding only a diffusion snapshot still holds work"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3352,7 +3483,9 @@ mod tests {
     /// guards a rewind breaks if nobody teaches them about it.
     #[test]
     fn s119_the_vocoder_best_resume_snapshot_is_read_in_real_steps() {
-        let root = std::env::temp_dir().join(format!("utai_s119_voc_{}", std::process::id()));
+        let root = trun::RunDir::for_test(
+            std::env::temp_dir().join(format!("utai_s119_voc_{}", std::process::id())),
+        );
         let d = root.join("resume_best");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&d).unwrap();
@@ -3405,12 +3538,12 @@ mod tests {
             }
         }
         assert_eq!(
-            slot_info(&data, "p1", "vocoder").best_resume_step,
+            slot_info(&data, "p1", "vocoder").unwrap().best_resume_step,
             Some(1822),
             "the vocoder's resume button must offer the REAL step"
         );
         assert_eq!(
-            slot_info(&data, "p1", "sovits").best_resume_step,
+            slot_info(&data, "p1", "sovits").unwrap().best_resume_step,
             Some(3644),
             "the GAN arm is NOT halved — its checkpoints count real steps already"
         );
@@ -3421,7 +3554,7 @@ mod tests {
         // is the snapshot must still read as「有活」.
         assert_eq!(vocoder_progress_step(&root), Some(3644));
         assert!(
-            workspace_holds_work(&root),
+            slot_holds_work(&root),
             "a slot holding only a vocoder snapshot still holds work"
         );
         // ⚠ The two readers are NOT told apart by the payload's name, and that is deliberate:
@@ -3796,7 +3929,8 @@ mod tests {
         };
 
         // no manifest yet ⇒ derive
-        let fresh_slugs = effective_speaker_slugs(&data, id, "rvc", &req(false));
+        let ws = trun::RunDir::for_test(ws);
+        let fresh_slugs = effective_speaker_slugs(&ws, &req(false));
         assert_eq!(fresh_slugs, assign_speaker_slugs(&req(false).speakers));
 
         // slugs a toolchain change (or an older build) could have produced — nothing `slugify`
@@ -3812,7 +3946,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let resumed = effective_speaker_slugs(&data, id, "rvc", &req(false));
+        let resumed = effective_speaker_slugs(&ws, &req(false));
         assert_eq!(
             resumed,
             vec![
@@ -3825,7 +3959,7 @@ mod tests {
 
         // 重训 wipes the slot, so it is free to mint new ones
         assert_eq!(
-            effective_speaker_slugs(&data, id, "rvc", &req(true)),
+            effective_speaker_slugs(&ws, &req(true)),
             fresh_slugs
         );
 
@@ -3838,7 +3972,7 @@ mod tests {
             "total_epoch": 1, "batch_size": 1,
         }));
         assert_eq!(
-            effective_speaker_slugs(&data, id, "rvc", &three),
+            effective_speaker_slugs(&ws, &three),
             assign_speaker_slugs(&three.speakers)
         );
         let _ = std::fs::remove_dir_all(&data);
@@ -3904,7 +4038,7 @@ mod tests {
         assert_eq!(f.len(), 2);
         assert_eq!((f[0].slug.as_str(), f[0].name.as_str()), ("sayo_a", "sayo"));
         assert_eq!((f[1].slug.as_str(), f[1].name.as_str()), ("teto_b", "teto"));
-        assert_eq!(slot_info(&data, id, "rvc").speakers, vec!["sayo", "teto"]);
+        assert_eq!(slot_info(&data, id, "rvc").unwrap().speakers, vec!["sayo", "teto"]);
 
         // 2. pre-`speaker_names` workspace: names live only in run.json, matched BY SLUG —
         //    and note run.json lists them in the OTHER order, which must not reorder anything
@@ -3933,7 +4067,7 @@ mod tests {
         );
         assert_eq!(f[0].name, "sayo");
         assert_eq!(f[1].name, "teto");
-        assert_eq!(slot_info(&data, id, "rvc").speakers, vec!["sayo", "teto"]);
+        assert_eq!(slot_info(&data, id, "rvc").unwrap().speakers, vec!["sayo", "teto"]);
 
         // 3. a later sovits_diff run rewrote run.json without the key: order survives, names do
         //    not — and `slot_info` must then report NOTHING rather than two blanks
@@ -3942,7 +4076,7 @@ mod tests {
         assert_eq!(f.len(), 2, "the order is still recoverable");
         assert!(f.iter().all(|s| s.name.is_empty()));
         assert!(
-            slot_info(&data, id, "rvc").speakers.is_empty(),
+            slot_info(&data, id, "rvc").unwrap().speakers.is_empty(),
             "all-blank must collapse to empty — a blank vec of the right length would read as \
              a speaker mismatch in the resume dialog"
         );
@@ -3957,7 +4091,7 @@ mod tests {
         )
         .unwrap();
         assert!(frozen_speakers(&data, id, "sovits").is_empty());
-        assert!(slot_info(&data, id, "sovits").speakers.is_empty());
+        assert!(slot_info(&data, id, "sovits").unwrap().speakers.is_empty());
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -3966,35 +4100,35 @@ mod tests {
     /// leftover directory try_start itself creates, which must stay freely wipeable (else a
     /// crashed first run would lock the user out of ever retrying that model name).
     #[test]
-    fn workspace_holds_work_covers_every_artifact_class() {
+    fn slot_holds_work_covers_every_artifact_class() {
         let empty = tmp_ws("empty");
-        assert!(!workspace_holds_work(&empty), "empty leftover dir holds nothing");
+        assert!(!slot_holds_work(&empty), "empty leftover dir holds nothing");
 
         let main = tmp_ws("main");
         std::fs::write(main.join("G_2333333.pth"), b"x").unwrap();
-        assert!(workspace_holds_work(&main), "rvc/sovits main checkpoint");
+        assert!(slot_holds_work(&main), "rvc/sovits main checkpoint");
 
         let voc = tmp_ws("voc");
         std::fs::write(voc.join("model_ckpt_steps_4000.ckpt"), b"x").unwrap();
-        assert!(workspace_holds_work(&voc), "vocoder lightning checkpoint");
+        assert!(slot_holds_work(&voc), "vocoder lightning checkpoint");
 
         let diff = tmp_ws("diff");
         std::fs::create_dir_all(diff.join("diffusion")).unwrap();
         std::fs::write(diff.join("diffusion").join("model_5000.pt"), b"x").unwrap();
-        assert!(workspace_holds_work(&diff), "diffusion progress");
+        assert!(slot_holds_work(&diff), "diffusion progress");
 
         // model_0.pt = the seeded base only (step 0) — no user progress yet.
         let base_only = tmp_ws("base");
         std::fs::create_dir_all(base_only.join("diffusion")).unwrap();
         std::fs::write(base_only.join("diffusion").join("model_0.pt"), b"x").unwrap();
-        assert!(!workspace_holds_work(&base_only), "seeded diffusion base is not progress");
+        assert!(!slot_holds_work(&base_only), "seeded diffusion base is not progress");
 
         // preprocessing alone is HOURS of work — a slot with a fingerprint but no checkpoint
         // yet is just「刚开始练」, and it is also what makes a sibling slot count as "using"
         // the shared dataset.
         let pre = tmp_ws("pre");
         std::fs::write(pre.join("dataset.fingerprint"), b"abc").unwrap();
-        assert!(workspace_holds_work(&pre), "preprocessing counts as work");
+        assert!(slot_holds_work(&pre), "preprocessing counts as work");
         let _ = std::fs::remove_dir_all(pre);
 
         // an imported dataset pool alone is worth protecting: re-importing costs minutes.
@@ -4002,11 +4136,162 @@ mod tests {
         std::fs::create_dir_all(pool.join("dataset")).unwrap();
         std::fs::write(pool.join("dataset").join("000.wav"), b"x").unwrap();
         std::fs::write(pool.join("dataset.fingerprint"), b"abc").unwrap();
-        assert!(workspace_holds_work(&pool), "imported dataset pool");
+        assert!(slot_holds_work(&pool), "imported dataset pool");
 
         for d in [empty, main, voc, diff, base_only, pool] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// Everything one training run leaves behind, written into `home`.
+    ///
+    /// `home` is a RUN directory — which under layout ≤ 2 IS the slot root and under layout 3 is
+    /// `<slot>/runs/<id>/`. That the same writer serves both is the point of the test below.
+    fn run_products(home: &Path, step: u64) {
+        std::fs::create_dir_all(home.join("weights")).unwrap();
+        std::fs::create_dir_all(home.join("resume_best")).unwrap();
+        std::fs::create_dir_all(home.join("diffusion")).unwrap();
+        std::fs::create_dir_all(home.join("audition").join("m_e14_s147")).unwrap();
+        let w = |rel: &str, body: &str| std::fs::write(home.join(rel), body).unwrap();
+        w(&format!("G_{step}.pth"), "g");
+        w(&format!("D_{step}.pth"), "d");
+        w("weights/m_e14_s147.pth", "w");
+        w("resume_best/G.pth", "g");
+        w("resume_best/D.pth", "d");
+        w(
+            "resume_best/state.json",
+            &serde_json::json!({"global_step": step, "files": ["G.pth", "D.pth"]}).to_string(),
+        );
+        w("diffusion/model_5000.pt", "m");
+        w("audition/m_e14_s147/model.json", "{}");
+        w("total_fea.npy", "f");
+        w(
+            "run_manifest.json",
+            &serde_json::json!({
+                "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "n_speakers": 2, "speakers": ["sayo_1", "teto_2"],
+                "speaker_names": ["sayo", "teto"], "aug_copies": 3,
+            })
+            .to_string(),
+        );
+        w("run.json", &serde_json::json!({"model_name": "歌姫"}).to_string());
+    }
+
+    /// ⛔ §F2⒝ batch 2 — THE test for this batch, because the batch moves no bytes.
+    ///
+    /// Every other test in this file still exercises the layout-≤2 arm, and every one of them
+    /// would stay green if not a single reader had been re-pointed at the run. So: build the same
+    /// slot twice — products at the slot root, and the identical products inside `runs/<id>/` —
+    /// and demand the SAME answers. A reader still joining names onto the slot answers「什么都
+    /// 没有」for the second one, which is how `has_main_progress` going false turns a
+    /// shallow-diffusion「重训」into `remove_dir_all` of the whole slot.
+    #[test]
+    fn every_run_reader_gives_the_same_answer_in_both_layouts() {
+        let data = tmp_ws("layouts");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        for (id, layout3) in [("pflat_11112222", false), ("pruns_33334444", true)] {
+            tproject::write_meta(
+                &data,
+                &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+            )
+            .unwrap();
+            let slot = tproject::family_dir(&data, id, "rvc");
+            let home = if layout3 {
+                std::fs::write(
+                    { std::fs::create_dir_all(&slot).unwrap(); slot.join(tpool::SLOT_META) },
+                    br#"{"layout":3}"#,
+                )
+                .unwrap();
+                trun::runs_root(&slot).join("rfeedfacefeed")
+            } else {
+                slot.clone()
+            };
+            std::fs::create_dir_all(&home).unwrap();
+            run_products(&home, 1400);
+
+            let where_ = if layout3 { "layout 3" } else { "layout 2" };
+            assert!(slot_holds_work(&slot), "{where_}: a wipe here would destroy real work");
+                assert_eq!(trun::resolve_run_dir(&slot, None).unwrap().path(), home, "{where_}");
+
+            let info = slot_info(&data, id, "rvc").unwrap();
+            assert!(info.exists, "{where_}");
+            assert!(info.has_main_progress, "{where_}: G_*.pth is the diff-partial-wipe judge");
+            assert_eq!(info.version, "v2", "{where_}");
+            assert_eq!(info.sample_rate, "40k", "{where_}");
+            assert_eq!(info.aug_copies, 3, "{where_}: the diff run inherits this");
+            assert_eq!(info.n_speakers, 2, "{where_}");
+            assert_eq!(info.speakers, vec!["sayo", "teto"], "{where_}");
+            assert_eq!(info.best_resume_step, Some(1400), "{where_}");
+            assert_eq!(info.diff_steps, 5000, "{where_}");
+            assert_eq!(
+                frozen_speakers(&data, id, "rvc").iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
+                vec!["sayo_1", "teto_2"],
+                "{where_}: the dataset page's frozen-structure gate reads this"
+            );
+            assert_eq!(
+                tproject::slot_model_name(&data, id, "rvc").as_deref(),
+                Some("歌姫"),
+                "{where_}"
+            );
+
+            // the archive inventory: same rows, and the paths really address the files
+            let recs = tproject::scan_project_ckpts(&data, id, Some("rvc"));
+            let mut names: Vec<String> = recs
+                .iter()
+                .map(|r| r.rel.rsplit('/').next().unwrap().to_string())
+                .collect();
+            names.sort();
+            names.dedup();
+            assert_eq!(
+                names,
+                vec!["G.pth", "G_1400.pth", "m_e14_s147.pth", "model_5000.pt"],
+                "{where_}: every archive class must still be listed"
+            );
+            for r in &recs {
+                assert!(Path::new(&r.path).is_file(), "{where_}: {} does not exist", r.path);
+                assert!(
+                    tproject::project_dir(&data, id).join(&r.rel).is_file(),
+                    "{where_}: the project-relative rel must address the file — the export ledger \
+                     and the「已导入」marker match on this string"
+                );
+                assert_eq!(r.rel.contains("/runs/"), layout3, "{where_}: {}", r.rel);
+            }
+        }
+
+        // ⛔ A DIRECTORY whose name looks like a checkpoint is not a checkpoint. These scanners
+        // read a directory listing, and until this batch none of them asked; the archive would
+        // then offer a directory as a resume point and hand it to the cleanup as a deletable
+        // file. (`runs/` itself is the first entry at a slot root that is a directory and not a
+        // product, which is what makes the omission worth closing now rather than later.)
+        {
+            let bogus = tmp_ws("dirnamed");
+            let bogus = trun::RunDir::for_test(bogus);
+            std::fs::create_dir_all(bogus.join("G_9999.pth")).unwrap();
+            std::fs::create_dir_all(bogus.join("model_ckpt_steps_9999.ckpt")).unwrap();
+            std::fs::create_dir_all(bogus.join("diffusion").join("model_9999.pt")).unwrap();
+            assert!(!has_main_progress(&bogus), "a directory is not a generator checkpoint");
+            assert_eq!(max_vocoder_ckpt_step(&bogus), None);
+            assert_eq!(max_diffusion_step(&bogus), None);
+            let _ = std::fs::remove_dir_all(bogus.path());
+        }
+
+        // …and with TWO runs the plural readers grow while the singular ones refuse to guess
+        let id = "pruns_33334444";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let second = trun::runs_root(&slot).join("rbeefbeefbeef");
+        run_products(&second, 2800);
+        assert_eq!(
+            tproject::scan_project_ckpts(&data, id, Some("rvc")).len(),
+            8,
+            "two runs, four archive rows each — anything less is gigabytes the UI cannot reclaim"
+        );
+        assert!(slot_holds_work(&slot));
+        assert!(
+            slot_info(&data, id, "rvc").is_err(),
+            "「这个 run 练到哪了」has no answer without being told which run"
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     fn src_file(dir: &Path, name: &str, bytes: usize) -> String {

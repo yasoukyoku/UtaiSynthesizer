@@ -38,8 +38,10 @@
 //! * `workspace_holds_work` goes false ⇒ the backend's refusal of an unconfirmed wipe stops
 //!   firing (the dialog itself hangs off `WorkspaceInfo::exists`, so the prompt stays and only the
 //!   guard disappears), and the sibling-slot `PROJECT_DATASET_IN_USE` pre-check fails open;
-//! * `frozen_speakers` goes empty ⇒ `DATASET_SPEAKERS_FROZEN` stops guarding the dataset page AND
-//!   `drop_empty_speaker_dirs` flips to true, so emptying a singer really deletes their directory;
+//! * `frozen_speakers` goes empty ⇒ the dataset page's REFUSAL goes with it: emptying a singer
+//!   stops returning `DATASET_SPEAKERS_FROZEN`, the files go, and the speaker set changes under a
+//!   model that can no longer resume from it. (The `drop_empty_speaker_dirs` flag beside it only
+//!   removes an already-empty directory — the refusal is the part that was holding;)
 //! * `project.json`'s `exported[].from_ckpt_rel` stops matching ⇒ every imported checkpoint loses
 //!   `KeptReason::Exported` and becomes a cleanup candidate.
 //!
@@ -73,12 +75,11 @@ pub const SLOT_LAYOUT_RUNS: u32 = 3;
 /// is: a half-filled `runs/<id>/` would be readable as a run.
 const STAGING_PREFIX: &str = ".mig_run_";
 
-/// The staging prefix, for the verifier that builds torn states from outside this module (the
-/// crash-point leg has to create exactly the shapes this module leaves behind, and a second copy
-/// of the string in the verifier would let the two drift apart silently).
-pub fn staging_prefix() -> &'static str {
-    STAGING_PREFIX
-}
+// ⚠ `tpool` publishes its staging prefix through a `staging_prefix()` accessor so the migration
+// verifier can build torn states without a second copy of the string. The run half deliberately
+// does NOT have one yet: there is no run verifier to consume it, and an exported accessor whose
+// entire justification is an anti-drift mechanism that has no other end is a claim of protection
+// nothing can falsify. It lands in the batch that writes `tests/trun_migrate.rs`, with its caller.
 
 // ─────────────────────────── the decision table ───────────────────────────
 
@@ -115,8 +116,13 @@ pub enum RunEntry {
 /// * `diffusion/` moves whole, and it must stay ONE LEVEL DOWN from the run root rather than
 ///   becoming the run root itself: the diffusion snapshot scan slices checkpoint paths by a fixed
 ///   prefix length (`SNAPSHOT_DIR_MIN_LEN = 6` in `utai_train/resume_state.py`), and a run root
-///   would put `eval/` (4) and `logs/` (4) inside its scope. The rule is guarded by exactly one
-///   two-element assertion in `training::tests`, so nothing would catch the regression.
+///   would put `eval/` (4) and `logs/` (4) inside its scope.
+///   ⚠ The assertion this used to cite as its guard does NOT guard it: `training::tests`'
+///   two-element loop checks that PYTHON's own snapshot directory names (`resume_best`,
+///   `resume_latest`) clear the minimum, and knows nothing about run depth — `diffusion` (9) and
+///   a minted `r`+12hex id (13) both pass it. What is asserted there now is the MECHANISM: that
+///   `eval` and `logs` fall BELOW the minimum, which is precisely why the run root cannot be the
+///   expdir. Turning that into a rule a test can fail is the batch that hands python its expdir.
 pub const RUN_ENTRIES: &[RunEntry] = &[
     // ── run metadata ────────────────────────────────────────────────────────────────────
     RunEntry::Exact("run.json"),
@@ -250,6 +256,47 @@ pub fn runs_root(slot: &Path) -> PathBuf {
     slot.join(RUNS_DIR)
 }
 
+/// A directory that has been RESOLVED to be one run's home.
+///
+/// ⛔ The point of the newtype is the thing a test cannot reach. Every per-run reader used to take
+/// a `&Path`, and the family slot is also a `&Path` — so the whole per-run change came down to
+/// remembering which of two identical-looking variables to pass at each of ~30 call sites, inside
+/// functions (`try_start`) that no unit test drives. Getting one wrong is silent: the probe answers
+/// "nothing here", `diff_partial_wipe` goes false, and a shallow-diffusion 「重训」 deletes the
+/// whole slot. With this type that mistake does not compile.
+///
+/// It `Deref`s to `Path`, so a resolved run can still be handed to anything that takes a plain
+/// path (`<run>/diffusion` is not itself a run, for instance) — the coercion only ever goes that
+/// way, which is the direction that is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDir(PathBuf);
+
+impl RunDir {
+    /// ⚠ Only [`resolve_run_dir`] and [`run_dirs`] may mint one in production — that is the entire
+    /// guarantee. Tests build fixtures directly and are allowed to say so out loud.
+    #[cfg(test)]
+    pub fn for_test(p: PathBuf) -> Self {
+        RunDir(p)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RunDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for RunDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunInfo {
     pub id: String,
@@ -285,7 +332,17 @@ pub fn list_runs(slot: &Path) -> Vec<RunInfo> {
 /// ⚠ It is NOT "look in the new place, fall back to the old one on failure". A named run that
 /// does not exist is an error, not a reason to answer with the slot root: that is how a wiring
 /// mistake turns into a run silently training into another run's directory.
-pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<PathBuf> {
+///
+/// ## Singular or plural is not a style choice — see [`run_dirs`]
+///
+/// `None` here asserts a POSITIVE FACT: *this slot has at most one run*. It is checked, and when
+/// it is false the answer is an error rather than a guess. That is what makes the wiring batches
+/// safe to land one at a time: while the migration is off, and again after it has folded each
+/// slot's single legacy run, `None` is exactly right everywhere. The batch that starts minting a
+/// SECOND run per slot is therefore also the batch in which every one of these call sites has to
+/// be handed a real id — and any that is forgotten fails loudly here instead of silently reading
+/// another run's weights.
+pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<RunDir> {
     match run_id {
         Some(id) => {
             if !run_id_is_usable(id) {
@@ -295,14 +352,14 @@ pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<PathBuf> {
             if !dir.is_dir() {
                 return Err(UtaiError::Training(format!("RUN_NOT_FOUND: {id}")));
             }
-            Ok(dir)
+            Ok(RunDir(dir))
         }
         None => {
             let runs = list_runs(slot);
             match runs.len() {
                 // layout ≤ 2: the slot root is the one run
-                0 => Ok(slot.to_path_buf()),
-                1 => Ok(runs[0].dir.clone()),
+                0 => Ok(RunDir(slot.to_path_buf())),
+                1 => Ok(RunDir(runs[0].dir.clone())),
                 // Refuses to guess for the same reason `tpool::sole_pool_fingerprint` does: with
                 // several runs present, picking one is a decision the caller has to have made.
                 _ => Err(UtaiError::Training(format!(
@@ -313,6 +370,37 @@ pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<PathBuf> {
             }
         }
     }
+}
+
+/// EVERY run directory of a slot — the answer for questions about the SLOT AS A WHOLE.
+///
+/// With no `runs/` container the answer is `[slot]`, for the same positive-fact reason
+/// [`resolve_run_dir`] gives: the slot root IS the one run.
+///
+/// ## Which resolver a caller wants is decided by the QUESTION, not by convenience
+///
+/// * **Plural** — "what is on disk", "what would this wipe destroy", "what must the cleanup be
+///   able to reach", "how many bytes is this slot". Answering any of these with one run is how
+///   gigabytes become invisible AND unreclaimable, which is the exact failure
+///   `tproject::scan_project_ckpts` was written to end. A guard that answers one of these with
+///   `false` because it only looked at one run fails OPEN, and every one of those guards protects
+///   against destroying work.
+/// * **Singular** — "which weights is THIS run resuming from", "whose emb_g row is speaker 3",
+///   "what version was THIS run frozen at". [`resolve_run_dir`] refuses to guess between runs.
+///
+/// ⚠ What this deliberately does NOT do: once a slot has a `runs/` container, the slot ROOT is no
+/// longer scanned. A run product still sitting there means the migration classified it as
+/// `unknown` and left it behind (`plan_slot_runs`), which is a loud `warn!` at migration time and
+/// a gate against the python sources — not something to paper over here by scanning both, because
+/// "both" is how one checkpoint gets listed twice and deleted once.
+pub fn run_dirs(slot: &Path) -> Vec<RunDir> {
+    let runs = list_runs(slot);
+    if runs.is_empty() {
+        // Also the shape of a MIGRATED slot whose runs have all been deleted: the root holds no
+        // run products then either, so scanning it finds nothing and costs nothing.
+        return vec![RunDir(slot.to_path_buf())];
+    }
+    runs.into_iter().map(|r| RunDir(r.dir)).collect()
 }
 
 // ─────────────────────────── migration (layout 2 → 3) ───────────────────────────
@@ -648,6 +736,50 @@ mod tests {
         }
     }
 
+    /// ⛔ The two resolvers answer DIFFERENT questions and the difference is the whole batch.
+    ///
+    /// Pinned together in one test on purpose: the failure mode is not "one of them is buggy", it
+    /// is a caller reaching for the wrong one. The plural answer must cover every run (a slot-wide
+    /// guard that saw one run would fail open), and the singular one must REFUSE rather than pick
+    /// (a resume that guessed would train into another run's weights).
+    #[test]
+    fn the_plural_resolver_sees_every_run_and_the_singular_one_refuses_to_guess() {
+        let data = tmp_data("resolvers");
+        let slot = project_dir(&data, "p777_5555eeee").join("rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+
+        // layout ≤ 2: the slot root is the one run, and BOTH resolvers say so
+        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(slot.clone())]);
+        assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), slot);
+
+        // one run: still unambiguous
+        let a = runs_root(&slot).join("ra11111111111");
+        touch(&a.join("G_100.pth"));
+        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(a.clone())]);
+        assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), a);
+
+        // two runs: the plural answer GROWS, the singular one becomes an error. Anything else —
+        // "the newest", "the first" — is a guess, and the thing being guessed at is which
+        // checkpoints a 续训 continues from.
+        let b = runs_root(&slot).join("rb22222222222");
+        touch(&b.join("G_200.pth"));
+        assert_eq!(
+            run_dirs(&slot),
+            vec![RunDir::for_test(a.clone()), RunDir::for_test(b.clone())],
+            "sorted by id, never wobbling"
+        );
+        let e = resolve_run_dir(&slot, None).unwrap_err().to_string();
+        assert!(e.contains("RUN_AMBIGUOUS"), "{e}");
+        // …and naming one still works, which is what the later batches hand it
+        assert_eq!(resolve_run_dir(&slot, Some("rb22222222222")).unwrap().path(), b);
+
+        // staging is never a run — a half-migrated tree must not be selectable by either resolver
+        std::fs::create_dir_all(runs_root(&slot).join(format!("{STAGING_PREFIX}rc3"))).unwrap();
+        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(a), RunDir::for_test(b)]);
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     /// The two tables must not both claim a name: a doubly-claimed entry is moved by whichever
     /// migration runs first and then silently "missing" for the other.
     #[test]
@@ -705,8 +837,8 @@ mod tests {
         assert!(pool.join("dataset.fingerprint").is_file());
         assert_eq!(tpool::sole_pool_fingerprint(&slot).as_deref(), Some("abc123"));
 
-        assert_eq!(resolve_run_dir(&slot, None).unwrap(), run);
-        assert_eq!(resolve_run_dir(&slot, Some(&run_id)).unwrap(), run);
+        assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), run);
+        assert_eq!(resolve_run_dir(&slot, Some(&run_id)).unwrap().path(), run);
         assert!(resolve_run_dir(&slot, Some("rdeadbeefdead")).is_err(), "a named miss is an error");
 
         // idempotent
@@ -788,7 +920,7 @@ mod tests {
         assert_eq!(tpool::read_slot_meta(&slot).unwrap().layout, SLOT_LAYOUT_RUNS);
         assert!(list_runs(&slot).is_empty());
         // …and with no runs the slot root still answers, because it IS the (empty) run
-        assert_eq!(resolve_run_dir(&slot, None).unwrap(), slot);
+        assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), slot);
 
         let _ = std::fs::remove_dir_all(data);
     }
@@ -845,6 +977,42 @@ mod tests {
 
         // …and the retry then migrates cleanly
         assert!(matches!(migrate_slot_runs(&data, id, "rvc").unwrap(), RunOutcome::Migrated(_)));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔ The staging reaper must run for a slot that is ALREADY migrated.
+    ///
+    /// This pins an ORDER, and the order is the only thing that recovers a killed migration.
+    /// `.mig_run_*` is dot-prefixed, so nothing else on this tree can see it: `scan_project_ckpts`
+    /// filters dot entries, `tproject::migrate_all` only strips `.mig_` at the TRAINING ROOT,
+    /// `sweep_tombstones` only knows `.del_`, and the storage sweeper is depth-1 under the root.
+    /// Meanwhile `dir_size` counts it — so a slot killed mid-migration would show its full size
+    /// with zero snapshots and zero reclaimable bytes, forever. The one thing that gets those
+    /// weights back is `reconcile_staging` running BEFORE the `layout >= 3` early return, on every
+    /// boot, for every slot. Moving that call below the early return compiles, passes every other
+    /// test, and silently strands the payload.
+    #[test]
+    fn a_torn_staging_directory_is_reclaimed_even_when_the_slot_is_already_migrated() {
+        let data = tmp_data("reap");
+        let id = "p888_7777cccc";
+        let slot = project_dir(&data, id).join("rvc");
+        write_meta(&data, &ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() })
+            .unwrap();
+        // an already-migrated slot: one run folded, commit point written
+        touch(&runs_root(&slot).join(legacy_run_id("rvc")).join("G_1400.pth"));
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        // …and a previous boot that was killed mid-migration, leaving a payload behind
+        touch(&slot.join(format!("{STAGING_PREFIX}rdeadbeefdead")).join("D_1400.pth"));
+
+        assert_eq!(migrate_slot_runs(&data, id, "rvc").unwrap(), RunOutcome::AlreadyDone);
+        assert!(
+            slot.join("D_1400.pth").is_file(),
+            "the staged payload must come back to the slot root — nothing else on this tree can \
+             see a dot directory, and `dir_size` keeps charging the user for it"
+        );
+        assert!(!slot.join(format!("{STAGING_PREFIX}rdeadbeefdead")).exists());
+        assert!(runs_root(&slot).join(legacy_run_id("rvc")).join("G_1400.pth").is_file());
+
         let _ = std::fs::remove_dir_all(data);
     }
 

@@ -473,12 +473,20 @@ pub fn update_project(data_dir: &Path, id: &str, name: &str, note: &str) -> Resu
 /// The「本次训练名」a slot's artifacts were built under: `hps.name`, the `weights/<slug>*`
 /// prefix, the `config.spk` key. Returns the NAME (the slug derives from it via `slugify`).
 ///
-/// It only ever lived in the slot's own `run.json`, which is written AFTER a successful data
+/// It only ever lived in the run's own `run.json`, which is written AFTER a successful data
 /// import — so `None` means this slot never completed a run, and a slot that never ran holds
 /// no slug-bearing artifact for a different name to orphan. That is what makes「存量项目的
 /// model_slug 冻结」a READ rather than a migration: there is nothing to back-fill.
+///
+/// ⚠ It answers for ONE run and there is no run selector yet, so it declines rather than picks
+/// when a slot holds several. The caller then falls back to the project name, which is a worse
+/// SUGGESTION and nothing more — but it is also the shape §F2⒝ batch 5 removes outright: the
+/// training name stops being an identity there, and this becomes a label lookup.
 pub fn slot_model_name(data_dir: &Path, id: &str, family: &str) -> Option<String> {
-    std::fs::read_to_string(family_dir(data_dir, id, family).join("run.json"))
+    let run = crate::training::trun::resolve_run_dir(&family_dir(data_dir, id, family), None)
+        .inspect_err(|e| tracing::warn!("slot_model_name({id}/{family}): {e}"))
+        .ok()?;
+    std::fs::read_to_string(run.join("run.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v["model_name"].as_str().map(String::from))
@@ -606,196 +614,210 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
             });
         };
 
-        // ── slot root: the resumable pairs ────────────────────────────────────────────
-        // `.` entries are never archives — a delete stages files into `.del_*` and the layout
-        // migration parks trees in `.mig_*`. Reading them back as checkpoints would put a
-        // half-deleted file in the list AND feed it into the next cleanup round.
-        let entries: Vec<String> = std::fs::read_dir(&slot)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| !n.starts_with('.'))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for n in &entries {
-            if let Some(num) = n.strip_prefix("G_").and_then(|s| s.strip_suffix(".pth")) {
-                let step = if num == "2333333" { None } else { num.parse::<u64>().ok() };
-                // A GAN resumes only from a G+D PAIR — a lone half would silently restart the
-                // discriminator. But it is still hundreds of MB on disk, and the two halves are
-                // written by SEPARATE calls (a kill between them leaves one behind; upstream's
-                // `clean_checkpoints` also prunes the two sides independently), so dropping it
-                // from the inventory would recreate the exact problem this inventory exists to
-                // end: a file nothing in the UI can see or reclaim.
-                let paired = entries.iter().any(|d| d == &format!("D_{num}.pth"));
-                let kind = match (paired, step) {
-                    (false, _) => CkptKind::Orphan,
-                    (true, Some(0)) => CkptKind::Base,
-                    (true, _) => CkptKind::Resumable,
-                };
-                // The pair is ONE archive. D is the same order of magnitude and can be LARGER
-                // than G (on this machine an RVC D is 857 MB against G's 452 MB), so counting
-                // only G would understate a project by nearly half — and leave batch 3 deleting
-                // one side of every pair.
-                let companion = paired.then(|| slot.join(format!("D_{num}.pth")));
-                push(slot.join(n), companion, kind, step);
-            } else if let Some(num) = n.strip_prefix("D_").and_then(|s| s.strip_suffix(".pth")) {
-                // the mirror orphan: a D whose G is gone
-                if !entries.iter().any(|g| g == &format!("G_{num}.pth")) {
-                    push(slot.join(n), None, CkptKind::Orphan, num.parse::<u64>().ok());
+        // ★§F2⒝ batch 2 — EVERY run of the slot, not one of them. This inventory exists precisely
+        // because「盘上几个 GB、UI 看不见」, so scanning a single run would recreate the failure it
+        // was written to end: the other runs' checkpoints would be invisible in the archive view
+        // AND unreachable by the cleanup, while still costing the disk. `trun::run_dirs` answers
+        // `[slot]` for as long as there is no `runs/` container, so this is byte-identical today.
+        for run in crate::training::trun::run_dirs(&slot) {
+            // ── run root: the resumable pairs ─────────────────────────────────────────────
+            // `.` entries are never archives — a delete stages files into `.del_*` and the layout
+            // migration parks trees in `.mig_*`. Reading them back as checkpoints would put a
+            // half-deleted file in the list AND feed it into the next cleanup round.
+            let entries: Vec<String> = std::fs::read_dir(&run)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().is_file())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !n.starts_with('.'))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for n in &entries {
+                if let Some(num) = n.strip_prefix("G_").and_then(|s| s.strip_suffix(".pth")) {
+                    let step = if num == "2333333" { None } else { num.parse::<u64>().ok() };
+                    // A GAN resumes only from a G+D PAIR — a lone half would silently restart the
+                    // discriminator. But it is still hundreds of MB on disk, and the two halves are
+                    // written by SEPARATE calls (a kill between them leaves one behind; upstream's
+                    // `clean_checkpoints` also prunes the two sides independently), so dropping it
+                    // from the inventory would recreate the exact problem this inventory exists to
+                    // end: a file nothing in the UI can see or reclaim.
+                    let paired = entries.iter().any(|d| d == &format!("D_{num}.pth"));
+                    let kind = match (paired, step) {
+                        (false, _) => CkptKind::Orphan,
+                        (true, Some(0)) => CkptKind::Base,
+                        (true, _) => CkptKind::Resumable,
+                    };
+                    // The pair is ONE archive. D is the same order of magnitude and can be LARGER
+                    // than G (on this machine an RVC D is 857 MB against G's 452 MB), so counting
+                    // only G would understate a project by nearly half — and leave batch 3 deleting
+                    // one side of every pair.
+                    let companion = paired.then(|| run.join(format!("D_{num}.pth")));
+                    push(run.join(n), companion, kind, step);
+                } else if let Some(num) = n.strip_prefix("D_").and_then(|s| s.strip_suffix(".pth")) {
+                    // the mirror orphan: a D whose G is gone
+                    if !entries.iter().any(|g| g == &format!("G_{num}.pth")) {
+                        push(run.join(n), None, CkptKind::Orphan, num.parse::<u64>().ok());
+                    }
+                } else if let Some(num) = n
+                    .strip_prefix("model_ckpt_steps_")
+                    .and_then(|s| s.strip_suffix(".ckpt"))
+                {
+                    // GLOBAL lightning steps — halve for the real one (see the doc comment).
+                    let step = num.parse::<u64>().ok().map(|v| v / 2);
+                    push(run.join(n), None, CkptKind::Resumable, step);
                 }
-            } else if let Some(num) = n
-                .strip_prefix("model_ckpt_steps_")
-                .and_then(|s| s.strip_suffix(".ckpt"))
+            }
+
+            // ── ★S117 §F2⒜: the resumable BEST snapshot ──────────────────────────────────
+            // `resume_best/{G,D}.pth` + `state.json`. It lives in a SUBDIRECTORY on purpose (five
+            // separate consumers walk the slot root looking for `G_*`/`D_*` and every one of them
+            // would mis-handle it there — see `utai_train/resume_state.BEST_DIR`), which is exactly
+            // why it has to be listed HERE explicitly: a scan that only knows the slot root would
+            // leave a gigabyte-scale pair that nothing in the UI can see or reclaim, the failure
+            // this inventory exists to end.
+            //
+            // Reported as `Resumable` rather than `Best`: `Best` means the inference-only release
+            // snapshot under `weights/`, and the snapshot-cleanup copy explicitly promises to keep
+            // 「可续训存档」. Which of the two resumable rows is the best point is answered by the
+            // path (and by the resume picker), not by inventing an eighth kind.
             {
-                // GLOBAL lightning steps — halve for the real one (see the doc comment).
-                let step = num.parse::<u64>().ok().map(|v| v / 2);
-                push(slot.join(n), None, CkptKind::Resumable, step);
-            }
-        }
-
-        // ── ★S117 §F2⒜: the resumable BEST snapshot ──────────────────────────────────
-        // `resume_best/{G,D}.pth` + `state.json`. It lives in a SUBDIRECTORY on purpose (five
-        // separate consumers walk the slot root looking for `G_*`/`D_*` and every one of them
-        // would mis-handle it there — see `utai_train/resume_state.BEST_DIR`), which is exactly
-        // why it has to be listed HERE explicitly: a scan that only knows the slot root would
-        // leave a gigabyte-scale pair that nothing in the UI can see or reclaim, the failure
-        // this inventory exists to end.
-        //
-        // Reported as `Resumable` rather than `Best`: `Best` means the inference-only release
-        // snapshot under `weights/`, and the snapshot-cleanup copy explicitly promises to keep
-        // 「可续训存档」. Which of the two resumable rows is the best point is answered by the
-        // path (and by the resume picker), not by inventing an eighth kind.
-        {
-            let bd = slot.join("resume_best");
-            let (g, d, st) = (bd.join("G.pth"), bd.join("D.pth"), bd.join("state.json"));
-            // `state.json` is the completion marker python writes LAST — without it the pair
-            // beside it may be half-written, and offering that as a resume point is worse than
-            // not offering it.
-            if st.is_file() && g.is_file() && d.is_file() {
-                let step = std::fs::read_to_string(&st)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v["global_step"].as_u64());
-                push(g, Some(d), CkptKind::Resumable, step);
-            }
-        }
-
-        // ── ★S119 §F8⒝: the VOCODER's resumable best snapshot ─────────────────────────
-        // Same directory as the GAN pair above and deliberately NOT gated on the family: the two
-        // payload shapes are mutually exclusive on disk (a GAN slot has no `model.ckpt`, a
-        // vocoder slot has no `G.pth`), so a family test here would be one more thing that can
-        // drift out of step with python. `state.json` is again the completion marker written
-        // LAST.
-        //
-        // ⚠ The step is HALVED like every other vocoder row (`model_ckpt_steps_3644.ckpt` is
-        // step 1822 above): python records `trainer.global_step`, which this manual-optimization
-        // GAN advances 2 per batch. Reporting it raw would put the one number in the archive
-        // list that is twice everything beside it.
-        {
-            let bd = slot.join("resume_best");
-            let (m, st) = (bd.join("model.ckpt"), bd.join("state.json"));
-            if st.is_file() && m.is_file() {
-                let step = std::fs::read_to_string(&st)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                    .and_then(|v| v["global_step"].as_u64())
-                    .map(|g| g / 2);
-                push(m, Some(st), CkptKind::Resumable, step);
-            }
-        }
-
-        // ── ★S118 §F8⒜: the diffusion resume snapshots ────────────────────────────────
-        // `diffusion/resume_best/{model.pt,state.json}` and `diffusion/resume_latest/…`. Same
-        // reason the GAN block above has to be explicit: the loop below only accepts names of the
-        // form `model_<digits>.pt` / `model_best.pt`, so a DIRECTORY entry falls straight through
-        // its `continue` and 600 MB apiece would never appear in the archive list.
-        // ⚠ Their bytes DO already reach the user through the recursive `storage::dir_size`
-        // totals, so this is about the ARCHIVE view: seeing that the resume point exists, what
-        // step it is at, and being able to reason about it at all.
-        //
-        // Reported as `Resumable` for the same reason as the GAN pair: `Best` means the
-        // inference-only export (here `diffusion/model_best.pt`, which is written with
-        // `optimizer=None`), and the snapshot is the opposite of that — it is the ONLY diffusion
-        // artifact that always carries the optimizer.
-        {
-            let dd = slot.join("diffusion");
-            for sub in ["resume_best", "resume_latest"] {
-                let sd = dd.join(sub);
-                let (m, st) = (sd.join("model.pt"), sd.join("state.json"));
-                // `state.json` is the completion marker python writes LAST — without it the
-                // payload beside it may be half-written, and offering that as a resume point is
-                // worse than not offering it.
-                if st.is_file() && m.is_file() {
+                let bd = run.join("resume_best");
+                let (g, d, st) = (bd.join("G.pth"), bd.join("D.pth"), bd.join("state.json"));
+                // `state.json` is the completion marker python writes LAST — without it the pair
+                // beside it may be half-written, and offering that as a resume point is worse than
+                // not offering it.
+                if st.is_file() && g.is_file() && d.is_file() {
                     let step = std::fs::read_to_string(&st)
                         .ok()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                         .and_then(|v| v["global_step"].as_u64());
+                    push(g, Some(d), CkptKind::Resumable, step);
+                }
+            }
+
+            // ── ★S119 §F8⒝: the VOCODER's resumable best snapshot ─────────────────────────
+            // Same directory as the GAN pair above and deliberately NOT gated on the family: the two
+            // payload shapes are mutually exclusive on disk (a GAN slot has no `model.ckpt`, a
+            // vocoder slot has no `G.pth`), so a family test here would be one more thing that can
+            // drift out of step with python. `state.json` is again the completion marker written
+            // LAST.
+            //
+            // ⚠ The step is HALVED like every other vocoder row (`model_ckpt_steps_3644.ckpt` is
+            // step 1822 above): python records `trainer.global_step`, which this manual-optimization
+            // GAN advances 2 per batch. Reporting it raw would put the one number in the archive
+            // list that is twice everything beside it.
+            {
+                let bd = run.join("resume_best");
+                let (m, st) = (bd.join("model.ckpt"), bd.join("state.json"));
+                if st.is_file() && m.is_file() {
+                    let step = std::fs::read_to_string(&st)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v["global_step"].as_u64())
+                        .map(|g| g / 2);
                     push(m, Some(st), CkptKind::Resumable, step);
                 }
             }
-        }
 
-        // ── diffusion progress (lives inside the sovits slot) ─────────────────────────
-        if let Ok(rd) = std::fs::read_dir(slot.join("diffusion")) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if n.starts_with('.') {
-                    continue;
+            // ── ★S118 §F8⒜: the diffusion resume snapshots ────────────────────────────────
+            // `diffusion/resume_best/{model.pt,state.json}` and `diffusion/resume_latest/…`. Same
+            // reason the GAN block above has to be explicit: the loop below only accepts names of the
+            // form `model_<digits>.pt` / `model_best.pt`, so a DIRECTORY entry falls straight through
+            // its `continue` and 600 MB apiece would never appear in the archive list.
+            // ⚠ Their bytes DO already reach the user through the recursive `storage::dir_size`
+            // totals, so this is about the ARCHIVE view: seeing that the resume point exists, what
+            // step it is at, and being able to reason about it at all.
+            //
+            // Reported as `Resumable` for the same reason as the GAN pair: `Best` means the
+            // inference-only export (here `diffusion/model_best.pt`, which is written with
+            // `optimizer=None`), and the snapshot is the opposite of that — it is the ONLY diffusion
+            // artifact that always carries the optimizer.
+            {
+                let dd = run.join("diffusion");
+                for sub in ["resume_best", "resume_latest"] {
+                    let sd = dd.join(sub);
+                    let (m, st) = (sd.join("model.pt"), sd.join("state.json"));
+                    // `state.json` is the completion marker python writes LAST — without it the
+                    // payload beside it may be half-written, and offering that as a resume point is
+                    // worse than not offering it.
+                    if st.is_file() && m.is_file() {
+                        let step = std::fs::read_to_string(&st)
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .and_then(|v| v["global_step"].as_u64());
+                        push(m, Some(st), CkptKind::Resumable, step);
+                    }
                 }
-                let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt"))
-                else {
-                    continue;
-                };
-                if num == "best" {
-                    // `model_best.pt` is a BEST SNAPSHOT, never a resume point: the solver
-                    // writes it with `optimizer=None` so it carries no optimizer state, and
-                    // upstream's resume scan reads a non-numeric name as step 0. Offering it
-                    // would rewind thousands of steps AND zero the AdamW momentum.
-                    push(e.path(), None, CkptKind::Best, None);
-                    continue;
-                }
-                // anything that is not `model_<digits>.pt` is not ours — do not guess
-                let Some(step) = num.parse::<u64>().ok() else { continue };
-                let kind = if step == 0 { CkptKind::Base } else { CkptKind::Resumable };
-                push(e.path(), None, kind, Some(step));
             }
-        }
 
-        // ── release snapshots ─────────────────────────────────────────────────────────
-        if let Ok(rd) = std::fs::read_dir(slot.join("weights")) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().into_owned();
-                if n.starts_with('.') || !(n.ends_with(".pth") || n.ends_with(".ckpt")) {
-                    continue;
+            // ── diffusion progress (lives inside the sovits slot) ─────────────────────────
+            if let Ok(rd) = std::fs::read_dir(run.join("diffusion")) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if n.starts_with('.') {
+                        continue;
+                    }
+                    let Some(num) = n.strip_prefix("model_").and_then(|s| s.strip_suffix(".pt"))
+                    else {
+                        continue;
+                    };
+                    if !e.path().is_file() {
+                        continue;
+                    }
+                    if num == "best" {
+                        // `model_best.pt` is a BEST SNAPSHOT, never a resume point: the solver
+                        // writes it with `optimizer=None` so it carries no optimizer state, and
+                        // upstream's resume scan reads a non-numeric name as step 0. Offering it
+                        // would rewind thousands of steps AND zero the AdamW momentum.
+                        push(e.path(), None, CkptKind::Best, None);
+                        continue;
+                    }
+                    // anything that is not `model_<digits>.pt` is not ours — do not guess
+                    let Some(step) = num.parse::<u64>().ok() else { continue };
+                    let kind = if step == 0 { CkptKind::Base } else { CkptKind::Resumable };
+                    push(e.path(), None, kind, Some(step));
                 }
-                let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
-                // Exactly two real shapes: `<slug>_e<epoch>_s<step>` (rvc/sovits/sovits_v2
-                // periodic) and `vocoder_<real step>` (vocoder — already halved on this side).
-                //
-                // ⚠ There was a blind `rsplit_once('_')` fallback here. `<slug>` is
-                // `<≤24 ascii>_<8 hex>` and the naturally-finished export is a plain
-                // `weights/<slug>.pth`, so whenever that hash happened to be all decimal
-                // digits (~2% of names) the fallback reported the HASH as the training step.
-                // No step is the honest answer; the UI renders it as "—".
-                let step = stem
-                    .rsplit_once("_s")
-                    .and_then(|(_, s)| s.parse::<u64>().ok())
-                    .or_else(|| stem.strip_prefix("vocoder_").and_then(|s| s.parse::<u64>().ok()));
-                let kind = if stem.ends_with("_best") {
-                    CkptKind::Best
-                } else if step.is_none() {
-                    // no step in the name and not `_best` ⇒ the plain `<slug>.pth` the run
-                    // writes when it finishes naturally. Distinguishing it matters: as a
-                    // `Release` it would sit in the cleanup's candidate set, and it is the one
-                    // file in `weights/` a user is most likely to actually want.
-                    CkptKind::Final
-                } else {
-                    CkptKind::Release
-                };
-                push(e.path(), None, kind, step);
             }
-        }
+
+            // ── release snapshots ─────────────────────────────────────────────────────────
+            if let Ok(rd) = std::fs::read_dir(run.join("weights")) {
+                for e in rd.flatten() {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if n.starts_with('.')
+                        || !(n.ends_with(".pth") || n.ends_with(".ckpt"))
+                        || !e.path().is_file()
+                    {
+                        continue;
+                    }
+                    let stem = n.rsplit_once('.').map(|(s, _)| s).unwrap_or(&n);
+                    // Exactly two real shapes: `<slug>_e<epoch>_s<step>` (rvc/sovits/sovits_v2
+                    // periodic) and `vocoder_<real step>` (vocoder — already halved on this side).
+                    //
+                    // ⚠ There was a blind `rsplit_once('_')` fallback here. `<slug>` is
+                    // `<≤24 ascii>_<8 hex>` and the naturally-finished export is a plain
+                    // `weights/<slug>.pth`, so whenever that hash happened to be all decimal
+                    // digits (~2% of names) the fallback reported the HASH as the training step.
+                    // No step is the honest answer; the UI renders it as "—".
+                    let step = stem
+                        .rsplit_once("_s")
+                        .and_then(|(_, s)| s.parse::<u64>().ok())
+                        .or_else(|| stem.strip_prefix("vocoder_").and_then(|s| s.parse::<u64>().ok()));
+                    let kind = if stem.ends_with("_best") {
+                        CkptKind::Best
+                    } else if step.is_none() {
+                        // no step in the name and not `_best` ⇒ the plain `<slug>.pth` the run
+                        // writes when it finishes naturally. Distinguishing it matters: as a
+                        // `Release` it would sit in the cleanup's candidate set, and it is the one
+                        // file in `weights/` a user is most likely to actually want.
+                        CkptKind::Final
+                    } else {
+                        CkptKind::Release
+                    };
+                    push(e.path(), None, kind, step);
+                }
+            }
+        } // ★ end of the per-RUN loop (§F2⒝ batch 2)
     }
     // Newest first — and mtime, not the step number, is the ordering upstream itself trusts
     // (the RVC sentinel makes step ordering meaningless).
@@ -1733,7 +1755,7 @@ fn migrate_one(data_dir: &Path, id: &str) -> Result<Outcome> {
 
     // An empty leftover (`try_start` creates the directory before it can fail) needs no
     // moving at all — and must not be flagged, or every abandoned name becomes a chore.
-    let empty_shell = !crate::training::workspace_holds_work(&dir)
+    let empty_shell = !crate::training::slot_holds_work(&dir)
         && !dir.join("run_manifest.json").is_file()
         && !dir.join("config.json").is_file();
     if empty_shell {
@@ -1874,6 +1896,61 @@ mod tests {
         }
         // and the container the pools live in, which is the newest member of the set
         assert!(WORKSPACE_SUBDIRS.contains(&crate::training::tpool::POOLS_DIR));
+        // ★§F2⒝ batch 2 — and every RUN product that is a directory, for the same reason as the
+        // pool half: the run table IS consumed in production (`trun::plan_slot_runs` classifies a
+        // real slot with it), so anchoring the list to it means "someone added a directory kind"
+        // cannot pass silently here. `Prefix` entries are checkpoint FILES; the exact names below
+        // are the ones that are, or can be, directories.
+        for name in ["weights", "resume_best", "resume_latest", "diffusion", "cluster", "eval",
+                     "lightning_logs", "filelists", "audition"] {
+            assert!(
+                crate::training::trun::is_run_entry(name),
+                "{name:?} is listed here as a run directory but the run table does not claim it"
+            );
+            assert!(WORKSPACE_SUBDIRS.contains(&name), "run directory {name:?} is not declared");
+        }
+        assert!(WORKSPACE_SUBDIRS.contains(&crate::training::trun::RUNS_DIR));
+    }
+
+    /// ⛔ §F2⒝ batch 2 — the claim [`WORKSPACE_SUBDIRS`] exists to protect, asserted against a
+    /// REAL directory tree instead of against the list itself.
+    ///
+    /// The list-vs-list assertions above cannot see the failure that actually happens: someone
+    /// CREATES a directory. This builds a slot that really contains every declared name plus both
+    /// containers and then asks `has_family_slot` — the predicate the layout migration bets on —
+    /// what it sees. If a future entry is ever named after a family, this goes red by running the
+    /// real predicate over the real bytes rather than by comparing two copies of one table.
+    ///
+    /// ⚠ Its honest limit, stated so nothing reads it as more than it is: it can only build names
+    /// that are DECLARED. A directory python invents and nobody lists is still invisible here —
+    /// what catches that one is `trun::plan_slot_runs` reporting it as `unknown` (a loud warn at
+    /// migration time, in production) and the python-side `gate_pool_table.py`.
+    #[test]
+    fn a_real_slot_tree_never_makes_has_family_slot_lie() {
+        let data = tmp_root("subdirs");
+        let proj = project_dir(&data, "p1_aaaabbbb");
+        let slot = proj.join("rvc");
+        for name in WORKSPACE_SUBDIRS {
+            std::fs::create_dir_all(slot.join(name)).unwrap();
+        }
+        // …plus what really lives inside the two containers on a migrated slot
+        std::fs::create_dir_all(slot.join(crate::training::tpool::POOLS_DIR).join("p0123456789ab"))
+            .unwrap();
+        std::fs::create_dir_all(
+            crate::training::trun::runs_root(&slot).join(crate::training::trun::legacy_run_id("rvc")),
+        )
+        .unwrap();
+
+        assert!(has_family_slot(&proj), "the project really does hold a family slot");
+        assert!(
+            !has_family_slot(&slot),
+            "no entry inside a slot may be named after a family — `has_family_slot` decides \
+             「legacy or migrated」 by exactly this question, and a hit here would make the \
+             migration read an unmigrated tree as already done"
+        );
+        // the same must hold one level deeper, where a RUN id is a directory name
+        assert!(!has_family_slot(&crate::training::trun::runs_root(&slot)));
+        let _ = std::fs::remove_dir_all(data);
     }
 
     fn tmp_root(tag: &str) -> PathBuf {

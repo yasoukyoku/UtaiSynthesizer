@@ -47,7 +47,7 @@ pub async fn start_training(
     //
     // An empty `project_id` is still the documented legacy shape (resolve by name), so it keeps
     // the old derivation — which is correct for exactly that case.
-    let audition_dir = if request.project_id.trim().is_empty() {
+    let slot = if request.project_id.trim().is_empty() {
         crate::training::slot_path(&data_dir, &request.model_name, &request.backend)
     } else {
         checked_project_id(&request.project_id)?;
@@ -56,12 +56,18 @@ pub async fn start_training(
             &request.project_id,
             crate::training::backend_family(&request.backend),
         )
-    }
-    .join("audition");
+    };
+    // ★§F2⒝ batch 2 — the cache is a RUN product, so the cleanup below has to name the run.
+    let audition_dir = crate::training::trun::resolve_run_dir(&slot, None)
+        .map_err(|e| e.to_string())?
+        .join("audition");
     // BEFORE manager.start(): drop every audition session (file locks) so the
     // fresh-wipe path inside try_start cannot trip over them. Non-destructive —
     // an evicted session reloads on miss.
-    state.inference.engine.unload_paths_with_prefix(&audition_dir);
+    // ⚠ Prefixed on the SLOT, not on the run: what `fresh` erases is the whole slot, so a
+    // session held open under ANY of its runs is a live Windows file handle in the way. Scoping
+    // this to one run would leave the others locked and turn the wipe into a hard failure.
+    state.inference.engine.unload_paths_with_prefix(&slot);
     state
         .training
         .start(app, data_dir, request)
@@ -610,7 +616,11 @@ pub struct SlotExportContext {
     /// Empty when the slot never completed a run (no `run.json`), in which case the caller
     /// falls back to the project name.
     pub model_name: String,
-    /// Absolute path of the family slot (the old「workspace」).
+    /// Absolute path of the RUN whose artifacts this describes (the old「workspace」).
+    ///
+    /// ★§F2⒝ batch 2: `weights/` and the audition cache are run products, and the frontend joins
+    /// both off this string. It resolves to the slot root for as long as there is no `runs/`
+    /// container, so nothing about today's behaviour changes.
     pub workspace: String,
     /// The retrieval/cluster companion an import should carry, if one exists on disk. Same
     /// probe order the run summary uses as its no-summary fallback: RVC keeps its historical
@@ -618,6 +628,32 @@ pub struct SlotExportContext {
     /// exist even for an early stop). Vocoders have none — probing would only find another
     /// backend's leftovers.
     pub index_path: Option<String>,
+}
+
+/// The retrieval companion an import of THIS run should carry, or `None`.
+///
+/// ★§F2⒝ batch 2 — `total_fea.npy` and `cluster/` are RUN products. Layout 2 deliberately left
+/// them at the slot root and `tpool::POOL_ENTRIES`' reason 2 names this very probe; that reasoning
+/// was about the pool and does not survive per-run, because both are rebuilt wholesale by every
+/// run. A fixed slot-relative name would hand one model the OTHER run's retrieval matrix, and this
+/// probe fails OPEN — the wrong index arrives as a warning at most.
+///
+/// Split out of the command so it can be driven against a real layout-3 tree: the command itself
+/// takes tauri `State` and nothing can call it from a test.
+fn run_index_path(run: &crate::training::trun::RunDir, backend: &str) -> Option<String> {
+    if backend == "vocoder" {
+        // vocoders have none — probing would only find another backend's leftovers
+        return None;
+    }
+    if backend == "rvc" {
+        let p = run.join("total_fea.npy");
+        return p.is_file().then(|| p.to_string_lossy().into_owned());
+    }
+    ["cluster/kmeans_10000.pt", "cluster/0.index_vectors.npy"]
+        .iter()
+        .map(|rel| run.join(rel))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -629,19 +665,9 @@ pub async fn get_slot_export_context(
     checked_project_id(&project_id)?;
     let data_dir = data_root(&state);
     let family = crate::training::backend_family(&backend);
-    let ws = crate::training::tproject::family_dir(&data_dir, &project_id, family);
-    let index_path = if backend == "vocoder" {
-        None
-    } else if backend == "rvc" {
-        let p = ws.join("total_fea.npy");
-        p.is_file().then(|| p.to_string_lossy().into_owned())
-    } else {
-        ["cluster/kmeans_10000.pt", "cluster/0.index_vectors.npy"]
-            .iter()
-            .map(|rel| ws.join(rel))
-            .find(|p| p.is_file())
-            .map(|p| p.to_string_lossy().into_owned())
-    };
+    let slot = crate::training::tproject::family_dir(&data_dir, &project_id, family);
+    let ws = crate::training::trun::resolve_run_dir(&slot, None).map_err(|e| e.to_string())?;
+    let index_path = run_index_path(&ws, &backend);
     Ok(SlotExportContext {
         model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, family)
             .unwrap_or_default(),
@@ -825,10 +851,14 @@ pub async fn get_training_project(
         })
         .collect();
 
-    let slots = crate::training::tproject::FAMILIES
+    // ★§F2⒝ batch 2 — `slot_info` can now REFUSE (a slot holding several runs cannot answer
+    // 「这个 run 练到哪了」 without being told which). Collected through a `Result` rather than
+    // defaulted, because the empty `WorkspaceInfo` a default would produce reads as「未开始」and
+    // silently unlocks the four resume-locked controls on the parameters page.
+    let slots: Vec<SlotDetail> = crate::training::tproject::FAMILIES
         .iter()
         .filter(|f| crate::training::tproject::family_dir(&data_dir, &project_id, f).is_dir())
-        .map(|f| {
+        .map(|f| -> Result<SlotDetail, String> {
             let recs = crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, Some(f));
             // `scan_project_ckpts` returns newest-first by mtime — the same ordering upstream
             // itself resumes by (the RVC sentinel makes step numbers unorderable). ★S118 §F8-res⒈:
@@ -839,11 +869,12 @@ pub async fn get_training_project(
             let pools = crate::training::tpool::list_pools(
                 &crate::training::tproject::family_dir(&data_dir, &project_id, f),
             );
-            SlotDetail {
+            Ok(SlotDetail {
                 family: f.to_string(),
                 model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, f)
                     .unwrap_or_default(),
-                info: crate::training::slot_info(&data_dir, &project_id, f),
+                info: crate::training::slot_info(&data_dir, &project_id, f)
+                    .map_err(|e| e.to_string())?,
                 bytes: crate::commands::storage::dir_size(&crate::training::tproject::family_dir(
                     &data_dir,
                     &project_id,
@@ -858,9 +889,9 @@ pub async fn get_training_project(
                     .iter()
                     .map(|p| crate::commands::storage::dir_size(&p.dir))
                     .sum(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     Ok(ProjectDetail {
         id: meta.id,
@@ -900,6 +931,40 @@ mod tests {
         }
     }
 
+    /// ⛔ §F2⒝ batch 2 — the export's retrieval companion, found in the RUN.
+    ///
+    /// It fails OPEN by design: a missing index is a warning, never an error. That is exactly why
+    /// it needs a test of its own — pointed at the slot after the migration it would find nothing,
+    /// every RVC import would install without its retrieval matrix, and the only symptom is that
+    /// the voice sounds wrong. The command around it takes tauri `State`, so this is the level a
+    /// test can reach.
+    #[test]
+    fn the_export_index_is_found_inside_the_run() {
+        use crate::training::trun::RunDir;
+        let base = std::env::temp_dir().join(format!("utai_idx_{}", uuid::Uuid::new_v4()));
+        let slot = base.join("rvc");
+        let run = RunDir::for_test(slot.join("runs").join("rfeedfacefeed"));
+        std::fs::create_dir_all(run.join("cluster")).unwrap();
+        std::fs::write(run.join("total_fea.npy"), b"x").unwrap();
+        std::fs::write(run.join("cluster").join("0.index_vectors.npy"), b"x").unwrap();
+
+        assert_eq!(run_index_path(&run, "rvc"), Some(run.join("total_fea.npy").to_string_lossy().into_owned()));
+        // ⚠ the literal carries its own `/`, so the answer is a mixed-separator path — that is
+        // pre-existing and Windows accepts it. Asserting a `join`-built expectation here was MY
+        // invention and it is what turned this test red the first time it ran.
+        assert_eq!(
+            run_index_path(&run, "sovits"),
+            Some(run.join("cluster/0.index_vectors.npy").to_string_lossy().into_owned()),
+            "kmeans is preferred but absent here, so the vectors file answers"
+        );
+        assert_eq!(run_index_path(&run, "vocoder"), None, "probing would find another backend's");
+
+        // …and the slot itself holds neither, which is the whole point
+        assert_eq!(run_index_path(&RunDir::for_test(slot.clone()), "rvc"), None);
+        assert_eq!(run_index_path(&RunDir::for_test(slot), "sovits"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn the_ledgers_model_types_all_resolve() {
         use crate::models::ModelType;
@@ -924,7 +989,7 @@ pub async fn get_training_slot_info(
     backend: String,
 ) -> Result<crate::training::WorkspaceInfo, String> {
     checked_project_id(&project_id)?;
-    Ok(crate::training::slot_info(&data_root(&state), &project_id, &backend))
+    crate::training::slot_info(&data_root(&state), &project_id, &backend).map_err(|e| e.to_string())
 }
 
 // `get_training_workspace_info(name, backend)` lived here until S76 batch 4 — see the note in
