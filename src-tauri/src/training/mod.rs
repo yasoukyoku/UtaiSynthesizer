@@ -29,6 +29,32 @@ pub mod tpool;
 pub mod tproject;
 pub mod trun;
 
+/// 把一个数据根里的每一个训练槽往前折的**那条链** —— 顺序就是这个函数体,别处不许再排一遍。
+///
+/// ## 为什么它是一个函数,而不是三行 copy 两份
+///
+/// 每一步都提交**同一个** `slot.json` 的 layout 数字,而后一步的早退条件是「layout ≥ 我」:
+/// * `tproject::migrate_legacy_layout` 建出 family 槽 —— 不先跑它,下面两步无槽可折;
+/// * `tpool::migrate_all` 把预处理产物折进 `pools/<身份>/`(提交 layout 2);
+/// * `trun::migrate_all` 把 run 产物折进 `runs/<id>/`(提交 layout 3,早退于 `>= 3`)。
+///
+/// 顺序反了不是报错而是**静默退休**:先盖 layout 3,`tpool::migrate_slot` 从此对这个槽永远
+/// 答 `AlreadyDone`,预处理产物永久留在槽根,连一行 warn 都没有(`plan_slot_runs` 把它们归进
+/// `staying` 而不是 `unknown`)。
+///
+/// ⛔ 而它有**两个**调用点:开机一次,以及**换数据根时对旧根**再一次。漏掉第二个的后果不是
+/// 「旧根停在上一档」—— `SyncLevel::Slots` 逐**数字**比较槽 layout,两侧不同就整槽拒绝合并,
+/// 于是整棵 `training/` 子树**既不合并也不删除**(`commands/settings.rs` 的
+/// `sync_failed > 0 ⇒ continue`)。这是这条链最贵的一种漏法,而它长得像一次遗忘。
+///
+/// ⇒ 把顺序与调用点收成一个函数,是为了让「**加一步而漏掉一个调用点**」这件事不可能发生。
+/// §F2⒝ ④d 要加的 layout 3→4 就挂在这里,一行。
+pub fn migrate_layouts(root: &Path) {
+    tproject::migrate_legacy_layout(root);
+    tpool::migrate_all(root);
+    trun::migrate_all(root);
+}
+
 const STDERR_RING_CAP: usize = 200;
 const HISTORY_CAP: usize = 40_000;
 const SEED: u32 = 1234;

@@ -1983,17 +1983,11 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     // project-shaped, the ordinary per-file delta-sync is correct again and the subtree can be
     // reclaimed as it always was. Skipping it instead would leave the single biggest subtree
     // permanently un-merged AND un-deleted, with the queue entry consumed either way.
-    crate::training::tproject::migrate_legacy_layout(&old_p);
-    // §F2⒝ — and the same argument one level down: the active root's slots have been folded into
-    // `pools/<identity>/`, so fold the old root's too before any per-file merge. The guard below
-    // is the belt (it refuses to merge two different slot layouts); this is the braces, and it is
-    // what actually lets the subtree be reclaimed instead of stranded.
-    crate::training::tpool::migrate_all(&old_p);
-    // …and one level further, for the same reason and in the same order: the active root's slots
-    // have been folded into `runs/<id>/`, and `SyncLevel::Slots` compares the layout NUMBER, so an
-    // old root left at 2 would refuse to merge into a 3 and strand the largest subtree — neither
-    // merged nor reclaimed. ⛔ After the pool fold, never before (see `trun::migrate_all`).
-    crate::training::trun::migrate_all(&old_p);
+    // ★§F2⒝ ④d 笔 2 —— **整条链**,与开机走的是同一个函数。这里的每一步都要跑,理由是
+    // `SyncLevel::Slots` 逐**数字**比较槽 layout:旧根比活根少折一档,就整槽拒绝合并,于是
+    // 最大的那棵子树既不合并也不删除。以前这里是抄过来的三行,而「活根加了一档、这里忘了」
+    // 长得跟一次遗忘一模一样 —— 现在漏不掉了。
+    crate::training::migrate_layouts(&old_p);
     for name in MIGRATED_SUBTREES {
         let sub = old_p.join(name);
         if name == "training" {

@@ -1318,32 +1318,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
-    /// ⛔ THE ordering constraint of this batch, asserted on the two files that encode it.
+    /// 把每一行的注释抹掉(**字符串字面量里的 `//` 不算**)。
+    ///
+    /// ⛔ 承重,不是整洁:裸子串搜索分不开【代码】与【尸体】—— 一条内容恰好是锚点的注释就能
+    /// 替真正的调用点满足断言。S127 在 mod.rs 的姊妹棘轮上实测过这个形状并把那边硬化了,
+    /// 这一条是它当时欠下的另一半(队列 R5)。
+    fn code_only(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let ch: Vec<char> = line.chars().collect();
+            let (mut in_str, mut esc, mut cut, mut i) = (false, false, ch.len(), 0usize);
+            while i < ch.len() {
+                let c = ch[i];
+                if esc {
+                    esc = false;
+                } else if in_str && c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = !in_str;
+                } else if !in_str && c == '/' && ch.get(i + 1) == Some(&'/') {
+                    cut = i;
+                    break;
+                }
+                i += 1;
+            }
+            out.extend(ch[..cut].iter());
+            out.push('\n');
+        }
+        out
+    }
+
+    /// ⛔ THE ordering constraint of this batch — 现在钉在**声明它的那一个函数**上。
     ///
     /// `trun` commits `layout: 3` into the same `slot.json` whose `layout >= 2` makes
     /// `tpool::migrate_slot` return early. Calling the run fold first therefore retires the POOL
     /// migration for that slot permanently, and silently: `plan_slot_runs` files a pool product
     /// left at the slot root under `staying`, not `unknown`, so there is not even a warn.
     ///
-    /// A unit test cannot observe the boot sequence, so this reads the sequence itself. The
-    /// mechanism is demonstrated below it, so the constant relationship is red-able too.
+    /// ★§F2⒝ ④d 笔 2 —— 这条棘轮此前在**两个文件**里各找一次 `tpool::migrate_all(` 与
+    /// `trun::migrate_all(` 的偏移。那个形状有两个洞,而 ④d 会同时踩中:
+    /// ⒜ 它只钉**两个**字面量 ⇒ 加第三步时对它零覆盖;
+    /// ⒝ 它逐文件比较 ⇒ 「在 lib.rs 加了第三步而 settings.rs 忘了」**照样绿**,而那一漏的后果
+    ///    是 `SyncLevel::Slots` 逐数字比较拒绝合并 ⇒ 整棵 `training/` 子树既不并也不删。
+    /// 现在顺序住在 `training::migrate_layouts` 一个函数里,两个调用点都只能调它,而且
+    /// **不许**自己再排一遍 —— 于是 ⒜⒝ 都变成结构上不可能。
     #[test]
     fn the_boot_chain_folds_pools_before_runs() {
         const LIB_RS: &str = include_str!("../lib.rs");
         const SETTINGS_RS: &str = include_str!("../commands/settings.rs");
+        const MOD_RS: &str = include_str!("mod.rs");
+
+        // ⑴′ 注释屏蔽的**存活证明**。两个方向都要:抹不掉 ⇒ 一条注释就能替调用点满足断言;
+        // 抹过头 ⇒ 字符串字面量里的 `//` 会把真代码切掉半行,那时断言变成「找不到」而不是绿。
+        assert!(!code_only("// tpool::migrate_all(x);\n").contains("tpool::migrate_all("));
+        assert!(
+            code_only("let s = \"// x\"; tpool::migrate_all(y);\n").contains("tpool::migrate_all(")
+        );
+
+        // ⑴ 顺序只写在一个地方,而且是这个顺序。
+        let m = code_only(MOD_RS);
+        let head = m.find("pub fn migrate_layouts(").expect("那条链没了");
+        let body = &m[head..];
+        let body = &body[..body.find("\n}").expect("migrate_layouts 没有顶格收尾")];
+        let at = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| panic!("migrate_layouts 里已经没有 {needle} 了"))
+        };
+        assert!(
+            at("tproject::migrate_legacy_layout(") < at("tpool::migrate_all("),
+            "legacy 折叠必须最先跑:它建出的 family 槽正是下一步要折的东西"
+        );
+        assert!(
+            at("tpool::migrate_all(") < at("trun::migrate_all("),
+            "run 折叠排在池折叠之前 = 先盖 layout 3 ⇒ `tpool::migrate_slot` 对这个槽永远 \
+             AlreadyDone,预处理产物永久留在槽根,连一行 warn 都没有"
+        );
+
+        // ⑵ 两个调用点都走那条链,而且不许把任何一步再抄一遍到自己身上。
         for (name, src) in [("lib.rs", LIB_RS), ("commands/settings.rs", SETTINGS_RS)] {
-            let pool = src.find("tpool::migrate_all(").unwrap_or_else(|| {
-                panic!("{name} no longer folds the preprocessing pools at all")
-            });
-            let run = src
-                .find("trun::migrate_all(")
-                .unwrap_or_else(|| panic!("{name} no longer folds the runs at all"));
-            assert!(
-                pool < run,
-                "{name} calls the RUN migration before the POOL one — that stamps layout 3 on a \
-                 slot whose pool products are still at its root, and `tpool::migrate_slot` will \
-                 answer AlreadyDone for it forever"
-            );
+            let c = code_only(src);
+            assert!(c.contains("migrate_layouts("), "{name} 不再折 layout 了");
+            for inlined in ["tpool::migrate_all(", "trun::migrate_all(", "migrate_legacy_layout("] {
+                assert!(
+                    !c.contains(inlined),
+                    "{name} 自己排了一遍 {inlined} —— 这条链加一步时,这里就是会被漏掉的那处"
+                );
+            }
         }
         // the mechanism itself: run-first really does retire the pool fold
         let data = tmp_data("order");

@@ -1071,18 +1071,11 @@ pub fn run() {
             // and before anything opens a handle under <data>/training — at this point in setup
             // nothing has, and no training can have been started. Never fails the boot: an
             // undecidable directory is flagged, a torn one is rolled back and retried next boot.
-            training::tproject::migrate_legacy_layout(&data_dir);
-            // §F2⒝ — and then fold each slot's preprocessing products into `pools/<identity>/`.
-            // MUST be after the line above: that one creates the family slots this one folds, so
-            // running it first would migrate nothing and leave every legacy tree flat for another
-            // whole launch.
-            training::tpool::migrate_all(&data_dir);
-            // §F2⒝ batch 2 — …and then fold what is left (the weights, the resume sidecars, the
-            // audition cache) into `runs/<id>/`. ⛔ MUST be after the line above: both advance the
-            // same `slot.json`, and this one stamps layout 3 while the pool migration returns early
-            // on `layout >= 2` — running it first would leave every slot's preprocessing products
-            // at the slot root permanently, without so much as a warn line.
-            training::trun::migrate_all(&data_dir);
+            // …and then the whole layout chain (legacy → `pools/<identity>/` → `runs/<id>/`).
+            // ★§F2⒝ ④d 笔 2 — 顺序住在 `training::migrate_layouts` 里,不在这里:同一条链有
+            // 两个调用点(这里,以及换数据根时对旧根),而「加一步漏掉一个调用点」的后果是
+            // 整棵 `training/` 子树既不合并也不删除。一个函数,两处调用,漏不掉。
+            training::migrate_layouts(&data_dir);
             // Reclaim delete staging dirs a previous session could not finish removing (locked
             // file, crash, forced quit). Same window as the migration: nothing holds a handle
             // under <data>/training yet.
