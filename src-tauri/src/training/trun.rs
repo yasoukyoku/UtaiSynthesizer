@@ -22,12 +22,19 @@
 //!     aug_gate_report*.json  stop.flag  audition/  diffusion.yaml  diffusion/
 //! ```
 //!
-//! ## ⛔ This module is the DATA LAYER only — it has no production callers yet
+//! ## Where this module currently stands (batch 2, step ② landed)
 //!
-//! That is deliberate and it is the whole sequencing of this change. Moving the bytes before the
-//! readers are run-aware does not merely break a listing; it silently destroys work, because a
-//! surprising number of load-bearing predicates are spelled "is there a `G_*.pth` at the slot
-//! root". The ones measured on this tree, each with what it costs:
+//! * **The RESOLVERS are wired.** [`resolve_run_dir`] and [`run_dirs`] are what every reader of a
+//!   run product goes through — the progress probes, `slot_holds_work`, `frozen_speakers_of_run`,
+//!   `slot_info`, `scan_project_ckpts`, the export context, the audition paths, the storage
+//!   totals. Nothing on disk moved to make that true: with no `runs/` container the answer IS the
+//!   slot root, so the wiring batch is a byte-for-byte no-op that leaves every reader able to
+//!   address a run once one exists.
+//! * ⛔ **The MIGRATION is still uncalled.** [`migrate_slot_runs`] has no production caller, and
+//!   that ordering is the whole point of the change. Moving the bytes before the readers were
+//!   run-aware would not merely break a listing; it silently destroys work, because a surprising
+//!   number of load-bearing predicates are spelled "is there a `G_*.pth` at the slot root". The
+//!   ones measured on this tree, each with what it costs:
 //!
 //! * `has_main_progress` goes false ⇒ `diff_partial_wipe` goes false ⇒ a shallow-diffusion
 //!   「重训」 stops meaning "clear `diffusion/`" and becomes `remove_dir_all_robust(&workspace)`
@@ -35,9 +42,10 @@
 //! * the same flag drives `eff_aug_copies`: a diffusion run stops INHERITING the main model's
 //!   augmentation count and starts using its own, which rebuilds the shared slices to a different
 //!   recipe under a main model that is still resuming from them. The user changed nothing;
-//! * `workspace_holds_work` goes false ⇒ the backend's refusal of an unconfirmed wipe stops
-//!   firing (the dialog itself hangs off `WorkspaceInfo::exists`, so the prompt stays and only the
-//!   guard disappears), and the sibling-slot `PROJECT_DATASET_IN_USE` pre-check fails open;
+//! * `slot_holds_work` (named `workspace_holds_work` until step ②) goes false ⇒ the backend's
+//!   refusal of an unconfirmed wipe stops
+//!   firing (the dialog itself hangs off `WorkspaceInfo::exists`, so the prompt stays and only
+//!   the guard disappears), and the sibling-slot `PROJECT_DATASET_IN_USE` pre-check fails open;
 //! * `frozen_speakers` goes empty ⇒ the dataset page's REFUSAL goes with it: emptying a singer
 //!   stops returning `DATASET_SPEAKERS_FROZEN`, the files go, and the speaker set changes under a
 //!   model that can no longer resume from it. (The `drop_empty_speaker_dirs` flag beside it only
@@ -46,9 +54,12 @@
 //!   `KeptReason::Exported` and becomes a cleanup candidate.
 //!
 //! So the order is: this data layer, then every reader routed through one resolver that accepts
-//! BOTH shapes, and only then the migration. [`resolve_run_dir`] is that resolver, and it is here
-//! rather than in the wiring batch so that there is exactly one answer to "where does this run
-//! live" from the first line of code that asks.
+//! BOTH shapes, and only then the migration. Two of the three are done.
+//!
+//! ⚠ The list above is what breaks if the bytes move FIRST — it is not a list of things still
+//! broken. Each of those readers now takes the run directory, and three of them can no longer be
+//! handed a slot at all: [`RunDir`] is a type only this module can mint, which is what closes the
+//! call sites no test can reach (`training::try_start` above all).
 
 use std::path::{Path, PathBuf};
 
