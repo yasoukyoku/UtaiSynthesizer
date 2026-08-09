@@ -47,7 +47,7 @@ import {
 } from "../../lib/training/indexPath";
 import { resolveRowIdentity } from "../../lib/training/rowIdentity";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
-import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
+import { lockedFieldIds, poolInvalidatingIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { preview } from "../common/previewPlayer";
@@ -858,7 +858,13 @@ function ParamsStep() {
   // 这个槽已经付过那笔时间。「再训一个」会清空整槽,那时不存在「换池」这回事。
   const slotHasPreprocessing =
     !retrainIntent && !!slotInfo?.exists && (slotInfo.version !== "" || slotInfo.sample_rate !== "");
-  const costly = slotHasPreprocessing ? lockedFieldIds(config.backend, "costly") : new Set<string>();
+  // ⛔ 交集,不是 tier 一个人说了算:tier=costly 说的是「不会被拒」,而屏幕上这句话说的是
+  // 「会重跑预处理」—— 那是 scope 回答的。两者今天恰好等价,而「恰好等价」不是能写进渲染
+  // 逻辑的理由(锁表加一行 costly 但 run 级的字段,这里就会开始撒谎)。
+  const poolIds = poolInvalidatingIds(config.backend);
+  const costly = slotHasPreprocessing
+    ? new Set([...lockedFieldIds(config.backend, "costly")].filter((id) => poolIds.has(id)))
+    : new Set<string>();
   /** costly 项的代价标记:改它合法,但下一次运行会落到**另一个**预处理池上,切片与特征全部重跑。 */
   const costlyNote = (id: string) =>
     costly.has(id) ? (
