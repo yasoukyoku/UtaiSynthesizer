@@ -435,6 +435,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
   // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.
   TRAINING_WIPE_NOT_CONFIRMED: { key: "backend.TRAINING_WIPE_NOT_CONFIRMED", modal: true },
+  // ★§E2E-M1 —— **前端自己发的** CODE（不是 Rust）：存档导入时连「去哪找索引」都不知道。
+  // 它与「确实没有索引」必须可区分：后者正常，前者会装出一个缺检索矩阵的模型，
+  // 而那是**听不出来**的（只是相似度下降）—— 所以它必须走同一个漏斗到达用户。
+  WARN_INDEX_CONTEXT_UNKNOWN: { key: "backend.WARN_INDEX_CONTEXT_UNKNOWN" },
   // ★§F2⒝ 批 2 ④ —— 批 1-3 引入的训练布局 CODE。它们在 ④ 之前【结构上不可达】(每个槽恒一个 run),
   // 而 ④ 让第一条真的可达 —— 没有这张表的话,用户看到的是一串带绝对路径的英文 Rust 字符串。
   RUN_AMBIGUOUS: { key: "backend.RUN_AMBIGUOUS", modal: true },

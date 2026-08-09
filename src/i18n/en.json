@@ -1008,6 +1008,7 @@
     "PROJECT_ID_EXHAUSTED": "Could not allocate a free directory name for this project — the training folder already holds many leftovers under this name. Clean up under Settings → Storage and try again.",
     "PROJECT_ID_INVALID": "Invalid project id; the action was refused. This is an internal problem — please send us the log.",
     "TRAINING_WIPE_NOT_CONFIRMED": "This training workspace holds existing progress or an imported dataset and a retrain would wipe them — the start request carried no user confirmation, so it was refused. Click Start training again and choose Retrain in the dialog.",
+    "WARN_INDEX_CONTEXT_UNKNOWN": "The import could not locate this model's training products (its workspace context was unavailable), so NO retrieval/cluster index was installed. The model works, but timbre similarity will be worse. Reopen the architecture's archive view from the project detail and retry; if the project was moved or deleted, check the data directory in Settings.",
     "RUN_AMBIGUOUS": "This architecture slot holds more than one training run, so the target is ambiguous. Go back to the project detail and pick a specific run from that slot's list.",
     "RUN_NOT_FOUND": "The requested training run does not exist — it may have been deleted, or the project was changed outside the app. Refresh the project detail and try again.",
     "RUN_ID_INVALID": "The training run identifier is not a valid one. This usually means the request was hand-built, or a directory this app never created was placed in the workspace.",

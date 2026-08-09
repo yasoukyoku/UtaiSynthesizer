@@ -1826,6 +1826,94 @@ mod tests {
         dir
     }
 
+    /// ⛔ §E2E-M1 — **the retrieval index is installed, and its ABSENCE is silent by design.**
+    ///
+    /// This is the Rust half of a chain whose only symptom is that the voice sounds slightly less
+    /// like the target: an RVC model installed without `total_fea.npy` works, converts, auditions
+    /// and exports — it just retrieves nothing. Nobody can hear that without an A/B, and even
+    /// hearing it nobody attributes it to a missing index. So it may never be "checked in the
+    /// window"; it has to be an assertion, and the assertion has to cover the SILENT arm.
+    ///
+    /// The four arms below are the whole decision, and the last two are the load-bearing pair:
+    /// naming a file that is not there is LOUD, while naming nothing is SILENT — which is exactly
+    /// why the frontend must never degrade "I don't know where to look" into "no index".
+    #[test]
+    fn the_rvc_index_is_installed_and_its_absence_is_silent_by_design() {
+        let models_dir = temp_models_dir();
+        let rvc_dir = models_dir.join("rvc");
+        std::fs::create_dir_all(&rvc_dir).unwrap();
+        let reg = ModelRegistry::new(models_dir.clone());
+        let app_dir = temp_models_dir();
+
+        // A REAL layout-3 shape, spelled out by hand — ⚠ deliberately NOT built with
+        // `run_index_path`, which is the function whose answer this test exists to check.
+        let run = temp_models_dir().join("rvc").join("runs").join("rfeedfacefeed");
+        std::fs::create_dir_all(run.join("weights")).unwrap();
+        let ckpt = run.join("weights").join("m_e14_s147.pth");
+        std::fs::write(&ckpt, b"ckpt").unwrap();
+        let real_index = run.join("total_fea.npy");
+        std::fs::write(&real_index, b"idx").unwrap();
+
+        let dest = rvc_dir.join("m.npy");
+        // ★ A same-stem `.npy` BESIDE the checkpoint, present for ⑴-⑶ on purpose: without it,
+        // arm ⑵'s claim ("must not fall back to auto-detection") is DECORATIVE — falling through
+        // and not falling through would both answer `None`, so the assertion could not tell them
+        // apart. With it present, a fallback returns `Some` and ⑵ goes red.
+        let beside = ckpt.with_extension("npy");
+        std::fs::write(&beside, b"beside").unwrap();
+
+        // ⑴ named and present ⇒ installed, and NOTHING is reported (success is quiet)
+        let mut w = Vec::new();
+        let got = reg.resolve_index("m", &ModelType::Rvc, &ckpt, Some(&real_index), &app_dir, &mut w);
+        assert_eq!(got.as_deref(), Some(dest.as_path()));
+        assert!(dest.is_file(), "the index must actually land beside the model");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"idx", "the NAMED file is the one installed");
+        assert!(w.is_empty(), "{w:?}");
+        std::fs::remove_file(&dest).unwrap();
+
+        // ⑵ named and MISSING ⇒ LOUD, and it must NOT fall back to auto-detection: the user
+        // picked that file, so quietly installing a different one would be worse than nothing.
+        let mut w = Vec::new();
+        let ghost = run.join("not_here.npy");
+        assert!(
+            reg.resolve_index("m", &ModelType::Rvc, &ckpt, Some(&ghost), &app_dir, &mut w)
+                .is_none(),
+            "a named-but-absent index must not silently become the neighbour file"
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("WARN_INDEX_MISSING:"), "{w:?}");
+        assert!(!dest.exists());
+
+        // ⑶ unnamed, and that same neighbour IS reachable ⇒ auto-detected
+        let mut w = Vec::new();
+        assert_eq!(
+            reg.resolve_index("m", &ModelType::Rvc, &ckpt, None, &app_dir, &mut w).as_deref(),
+            Some(dest.as_path())
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"beside");
+        assert!(w.is_empty(), "{w:?}");
+        std::fs::remove_file(&beside).unwrap();
+        std::fs::remove_file(&dest).unwrap();
+
+        // ⑷ ★★ unnamed, and nothing beside the checkpoint ⇒ **None, and not one word pushed**.
+        // This is the real RVC shape: the index lives at `<run>/total_fea.npy` while the archive
+        // row points at `<run>/weights/<stem>.pth`, so auto-detection cannot reach it. Pinned as
+        // the SILENT arm on purpose — a future change that starts warning here is welcome, but it
+        // must be a deliberate one, and until then the caller carries the whole burden of not
+        // arriving with an empty workspace (`src/lib/training/indexPath.ts`).
+        let mut w = Vec::new();
+        assert!(reg
+            .resolve_index("m", &ModelType::Rvc, &ckpt, None, &app_dir, &mut w)
+            .is_none());
+        assert!(w.is_empty(), "the absence of an index is SILENT here: {w:?}");
+        assert!(!dest.exists(), "and nothing is installed");
+        assert!(real_index.is_file(), "…while the index it should have found is right there");
+
+        for d in [models_dir, app_dir, run] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
     /// 审查 S78: a failed SoVITS conversion leaves `<stem>.onnx` + `<stem>.f0.onnx` on disk. The
     /// old sweep deleted only the main graph, so the orphaned f0 predictor resurrected on the next
     /// scan() as a selectable phantom model (its base `.onnx` gone, the `.f0` skip no longer

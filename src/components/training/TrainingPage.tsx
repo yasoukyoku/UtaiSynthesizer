@@ -40,6 +40,11 @@ import {
 } from "../../store/voice-models";
 import { AUDIO_EXT_RE, AUDIO_EXTENSIONS, fmtDur, fmtSize } from "../../lib/constants";
 import { backendErrorMessage, isBusyError, isCancelError } from "../../lib/backendError";
+import {
+  resolveArchiveIndex,
+  indexPathArg,
+  indexWarningCode,
+} from "../../lib/training/indexPath";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
@@ -2318,44 +2323,25 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     }
   };
 
-  const resolveIndexPath = async (runId?: string | null): Promise<string | undefined> => {
+  /** §E2E-M1 —— 决策本身已抽成纯函数 `resolveArchiveIndex`（`src/lib/training/indexPath.ts`），
+   *  因为它的失败是**静默**的：缺检索矩阵的症状只是音色相似度下降，而它在盘上不过是一个
+   *  文件在不在 ⇒ 这件事不能留给实机窗口去「看一眼」。探针注入之后，vitest 能把每一种形状
+   *  （含工作区未知的退化态）当普通用例跑。 */
+  const resolveIndex = async (runId?: string | null) => {
     const ctx = await ctxForRun(runId);
-    const rowWorkspace = (useLiveIdentity ? snapshot.workspace : "") || ctx?.workspace || "";
-    // ★ The live run's summary index is ONLY trustworthy when this segment is that run
-    // (`useLiveIdentity`). In the standalone 存档中心 the snapshot may be a DIFFERENT family's
-    // finished run of the same project, and its `summary.index` (e.g. a SoVITS cluster .npy)
-    // would then be silently attached to an RVC import. The same `useLiveIdentity` gate that
-    // decouples name/workspace must gate the index too — the correct one is `slotCtx.indexPath`.
-    const summaryIndex = useLiveIdentity
-      ? (snapshot.summary as { index?: string } | null)?.index
-      : undefined;
-    let indexPath = summaryIndex ?? ctx?.indexPath ?? undefined;
-    if (!indexPath && archiveBackend !== "vocoder") {
-      // vocoders have no index/cluster companion — probing would only find
-      // another backend's leftovers (红队 A16 fallback-site sweep)
-      if (archiveBackend === "rvc") {
-        // ★§F2⒝ — this branch used to hand back the path UNCONDITIONALLY, with no exists check,
-        // overriding the negative answer Rust had already given (`get_slot_export_context` probes
-        // `is_file()` and returns null). Naming a file that is not there is not the same as
-        // naming nothing: `import_model` treats an explicit index as「用户选的,别再自动找」and
-        // SKIPS its own auto-detection beside the checkpoint, leaving only a WARN_INDEX_MISSING —
-        // a warning the single-import path below did not even read. The model installed without
-        // its retrieval index, and the only symptom was that it sounded wrong.
-        const cand = `${rowWorkspace}\\total_fea.npy`;
-        if (await exists(cand)) indexPath = cand;
-      } else {
-        for (const cand of [
-          `${rowWorkspace}\\cluster\\kmeans_10000.pt`,
-          `${rowWorkspace}\\cluster\\0.index_vectors.npy`,
-        ]) {
-          if (await exists(cand)) {
-            indexPath = cand;
-            break;
-          }
-        }
-      }
-    }
-    return indexPath;
+    return resolveArchiveIndex({
+      backend: archiveBackend,
+      workspace: (useLiveIdentity ? snapshot.workspace : "") || ctx?.workspace || "",
+      // ★ The live run's summary index is ONLY trustworthy when this segment is that run
+      // (`useLiveIdentity`). In the standalone 存档中心 the snapshot may be a DIFFERENT family's
+      // finished run of the same project, and its `summary.index` (e.g. a SoVITS cluster .npy)
+      // would then be silently attached to an RVC import.
+      summaryIndex: useLiveIdentity
+        ? (snapshot.summary as { index?: string } | null)?.index
+        : undefined,
+      ctxIndexPath: ctx?.indexPath,
+      exists,
+    });
   };
 
   /** Re-read the archive list after an export, so its「已导入」marks are current.
@@ -2393,7 +2379,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       input: { initial: suggestedName(ckpt) },
     });
     if (!name || name === "__cancel") return;
-    const indexPath = await resolveIndexPath(ckpt.runId);
+    const idx = await resolveIndex(ckpt.runId);
     try {
       // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
       // this one-row button is the path the archive list actually uses. `import_model` reports the
@@ -2404,11 +2390,14 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         path: ckpt.path,
         // the family this segment is acting on — `snapshot.backend` is "" with no run displayed
         modelType: backendFamily(archiveBackend),
-        indexPath,
+        indexPath: indexPathArg(idx),
       });
       await useVoiceModelStore.getState().fetchModels();
       await refreshArchive();
-      const warns = (outcome?.warnings ?? []).map((w) => backendErrorMessage(w) ?? w);
+      // ⛔§E2E-M1：「我们不知道该去哪找索引」必须跟后端的 warning 走**同一个漏斗**——
+      // 否则它与「确实没有索引」在界面上长得一模一样，而两者的后果完全不同。
+      const warns = [...(outcome?.warnings ?? []), ...(indexWarningCode(idx) ? [indexWarningCode(idx)!] : [])]
+        .map((w) => backendErrorMessage(w) ?? w);
       showToast(
         warns.length > 0
           ? `${t("training.imported", { name })}\n${warns.join("\n")}`
@@ -2457,7 +2446,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     try {
       // 批量导入只处理【实时 run】的候选（`snapshot.ckpts`），而那时 `useLiveIdentity` 下的
       // `snapshot.workspace` 就是那个 run 的目录 —— 所以这里没有【哪个 run】的歧义可言。
-      const indexPath = await resolveIndexPath(null);
+      const idx = await resolveIndex(null);
       const audName = isVocoderRun ? "vocoder" : "model";
       let ok = 0;
       const failed: string[] = [];
@@ -2488,14 +2477,17 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
             path,
             // family (identity for every backend the batch bar shows — it is !isDiff gated)
             modelType: backendFamily(archiveBackend),
-            indexPath,
+            indexPath: indexPathArg(idx),
             // ★ the ledger must record the ORIGINAL checkpoint, not `path` — which may have
             // been swapped to the audition-converted onnx above. Recording the onnx would leave
             // the real snapshot looking un-imported, and batch 3's cleanup would delete it.
             sourceCkpt: path === c.path ? null : c.path,
           });
           ok += 1;
-          for (const w of outcome?.warnings ?? []) {
+          for (const w of [
+            ...(outcome?.warnings ?? []),
+            ...(indexWarningCode(idx) ? [indexWarningCode(idx)!] : []),
+          ]) {
             warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
           }
         } catch (e) {
