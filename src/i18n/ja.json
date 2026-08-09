@@ -500,7 +500,10 @@
     "dropHint": "ここにドロップして学習データに追加",
     "pausePreview": "一時停止",
     "loadingPreview": "読み込み中…",
-    "ckptRangeTip": "自動音域テスト結果（快適域）——試聴では高めのクリップをこの域に移調してから戻します"
+    "ckptRangeTip": "自動音域テスト結果（快適域）——試聴では高めのクリップをこの域に移調してから戻します",
+    "runRename": "名前変更",
+    "runRenameTitle": "学習名を変更",
+    "runRenameBody": "学習名はこの run のラベルにすぎません。変更しても、すでに生成されたファイルは移動せず、学習の続行にも影響しません。リソース管理に書き出し済みのモデルの名前は変わりません。"
   },
   "workflow": {
     "title": "ワークフローエディタ",
@@ -1092,6 +1095,10 @@
     "WORKSPACE_MANIFEST_MISSING": "同名のトレーニングワークスペースに run_manifest.json がありません（状態異常）。再トレーニング（ワークスペースをクリア）するか、別のモデル名を使ってください",
     "WORKSPACE_WIPE_FAILED": "旧トレーニングワークスペースのクリアに失敗しました",
     "XPU_NO_DEVICE": "使用可能な Intel XPU GPU が見つかりません：torch-XPU が対応するのは Arc シリーズのみ（Arc A/B 単体GPU、Core Ultra の「Arc Graphics」内蔵GPU、Data Center GPU Max）で、Iris Xe / UHD / HD Graphics は非対応です。推論には影響ありません（既定の DirectML はどの GPU でも動作します）。トレーニングとモデル変換の GPU 高速化には Arc 以降が必要です。Arc 搭載の場合は、最新の Intel グラフィックスドライバーを入れてからセルフテストを再実行してください",
-    "ZSTD_INIT_FAILED": "zstd デコーダの初期化に失敗しました"
+    "ZSTD_INIT_FAILED": "zstd デコーダの初期化に失敗しました",
+    "RUN_NEVER_NAMED": "この学習 run にはまだ名前がありません（一度も開始されていません）。名前は最初に学習を開始するときに尋ねられます。",
+    "RUN_RENAME_FAILED": "名前の変更に失敗し、学習名は変更されていません。ファイルが使用中か、ディスクのエラーの可能性があります。再試行してください。",
+    "RENAME_WHILE_BUSY": "タスクが実行中です——終了を待つか停止してから学習名を変更してください。",
+    "RENAME_OTHER_INSTANCE": "別の Utai インスタンスが実行中で、この学習 run を使用している可能性があります。名前の変更を拒否しました。他の Utai ウィンドウを閉じてください。"
   }
 }

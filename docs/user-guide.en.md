@@ -1091,7 +1091,7 @@ With enough data, click "Next" for the parameters page; if you arrived straight 
 
 ### 8.6 The six training targets: which one?
 
-Under "Architectures" on the project detail page, each architecture is a slot card. Clicking a card's "Start training / Continue training" selects it and prompts for a "Name for this training run" (defaults to the project name, editable; later resumes keep using it). There are six targets:
+Under "Architectures" on the project detail page, each architecture is a slot card. Clicking a card's "Start training / Continue training" selects it and prompts for a "Name for this training run" (defaults to the project name; later resumes keep using it). The name is **only this run's label** — there is a ✎ beside each run's name on the slot card, so you can change it at any time; renaming moves none of the files the run has already produced and does not affect resuming. Models already exported to the resource manager keep their own names. There are six targets:
 
 | Target | What it is | When to pick it |
 | --- | --- | --- |

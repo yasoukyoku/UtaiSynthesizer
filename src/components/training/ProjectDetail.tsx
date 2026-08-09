@@ -112,6 +112,48 @@ export function ProjectDetail() {
     }
   };
 
+  /** ★§F2⒝ 批 2 ④b —— 改**这一个 run 的标签**。
+   *
+   *  这条能力之所以现在才敢做,是因为产物身份先被冻结在 run 自己的 `run.json` 里
+   *  (`training::effective_artifact_slug`)。在那之前「改名」会在这个 run **下一次开始**时
+   *  把 `hps.name`、`weights/<slug>*`、`audition/<slug>_*` 以及**共享池里**的
+   *  `dataset_44k/<slug>/` 一起改指向:已有产物全变孤儿,池里凭空多一棵完整预处理树,
+   *  而没有任何东西会说一句话。
+   *
+   *  ⚠ 已经导出到资源管理的模型**不跟着改名** —— 导出是一次快照,那边的名字归那边管
+   *  (而且按名字改动那边会撞上「同名即替换」)。文案里明写了这一条。 */
+  const renameRun = async (family: Family, run: RunDetail) => {
+    const typed = await showConfirm({
+      title: t("training.runRenameTitle"),
+      body: t("training.runRenameBody"),
+      buttons: [
+        { id: "ok", label: t("training.next"), kind: "primary" },
+        { id: "__cancel", label: t("training.cancel") },
+      ],
+      input: {
+        initial: run.modelName ?? "",
+        invalid: (v) => (v.trim() ? null : t("backend.TRAINING_NAME_EMPTY")),
+      },
+    });
+    if (!typed || typed === "__cancel") return;
+    if (typed.trim() === (run.modelName ?? "")) return;
+    setBusy(true);
+    try {
+      await invoke("rename_training_run", {
+        projectId,
+        backend: family,
+        runId: run.id,
+        name: typed,
+      });
+      await load();
+    } catch (e) {
+      const msg = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const removeFile = async (rel: string, label: string) => {
     if (!detail) return;
     if (dataHasDependents(detail)) {
@@ -616,6 +658,16 @@ export function ProjectDetail() {
                         {r.modelName
                           ? t("training.runNameFrozen", { name: r.modelName })
                           : t("training.runUnnamed")}
+                        {/* ★§F2⒝ 批 2 ④b —— 训练名从此只是标签,所以它可以改。同一个 ✎ 字形
+                            与项目改名一致(UI 铁律:方角复古、不用 emoji)。 */}
+                        <button
+                          className="tproj-run-rename"
+                          disabled={blocked}
+                          title={t("training.runRename")}
+                          onClick={() => void renameRun(f, r)}
+                        >
+                          ✎
+                        </button>
                       </span>
                       {r.info.version && <span className="tproj-slot-ver">{r.info.version}</span>}
                     </div>

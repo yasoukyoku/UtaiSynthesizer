@@ -445,6 +445,11 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RUN_NOT_FOUND: { key: "backend.RUN_NOT_FOUND" },
   RUN_ID_INVALID: { key: "backend.RUN_ID_INVALID" },
   RUN_CREATE_FAILED: { key: "backend.RUN_CREATE_FAILED", modal: true },
+  // ★§F2⒝ 批 2 ④b —— 改名(训练名从此只是标签)。
+  RUN_NEVER_NAMED: { key: "backend.RUN_NEVER_NAMED" },
+  RUN_RENAME_FAILED: { key: "backend.RUN_RENAME_FAILED", modal: true },
+  RENAME_WHILE_BUSY: { key: "backend.RENAME_WHILE_BUSY", busy: true },
+  RENAME_OTHER_INSTANCE: { key: "backend.RENAME_OTHER_INSTANCE", modal: true },
   RUN_MIGRATE_FAILED: { key: "backend.RUN_MIGRATE_FAILED", modal: true },
   SLOT_MIGRATE_FAILED: { key: "backend.SLOT_MIGRATE_FAILED", modal: true },
   SLOT_META_WRITE_FAILED: { key: "backend.SLOT_META_WRITE_FAILED" },

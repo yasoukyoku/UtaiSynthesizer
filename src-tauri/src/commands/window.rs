@@ -95,6 +95,15 @@ pub fn ensure_idle_for_dataset_write(state: &AppState) -> Result<(), String> {
     ensure_idle(state, "DATASET_WHILE_BUSY")
 }
 
+/// The SAME idleness question, for renaming ONE run's training name (§F2⒝ 批 2 ④b). `run.json` is
+/// the file `try_start`'s guards and python's five chains both read; rewriting it under a live run
+/// would also leave the running snapshot's `model_name` disagreeing with the disk, with no event
+/// to reconcile them. Its own CODE for the same reason the two above have theirs: the refusal text
+/// has to say what was actually refused.
+pub fn ensure_idle_for_run_rename(state: &AppState) -> Result<(), String> {
+    ensure_idle(state, "RENAME_WHILE_BUSY")
+}
+
 fn ensure_idle(state: &AppState, code: &str) -> Result<(), String> {
     let tasks = running_tasks_of(state);
     if tasks.is_empty() {

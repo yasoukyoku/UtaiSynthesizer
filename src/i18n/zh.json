@@ -500,7 +500,10 @@
     "dropHint": "拖放到此处以添加为训练数据",
     "pausePreview": "暂停",
     "loadingPreview": "加载中…",
-    "ckptRangeTip": "自动音域测试结果（舒适区）——训练试听会自动把偏高的试听片段移调进该区间再移回"
+    "ckptRangeTip": "自动音域测试结果（舒适区）——训练试听会自动把偏高的试听片段移调进该区间再移回",
+    "runRename": "改名",
+    "runRenameTitle": "修改训练名",
+    "runRenameBody": "训练名只是这个 run 的标签 —— 改它不会移动任何已经练出来的文件,也不会影响续训。已经导出到资源管理的模型不会跟着改名。"
   },
   "workflow": {
     "title": "工作流编辑器",
@@ -1092,6 +1095,10 @@
     "WORKSPACE_MANIFEST_MISSING": "同名训练工作区缺少 run_manifest.json（状态异常）：请选择重训（将清空该工作区）或换一个模型名",
     "WORKSPACE_WIPE_FAILED": "清空旧训练工作区失败",
     "XPU_NO_DEVICE": "未检测到可用的 Intel XPU 显卡：torch-XPU 只支持 Arc 系列（Arc A/B 独立显卡、酷睿 Ultra 的「Arc Graphics」核显、Data Center GPU Max），不支持 Iris Xe / UHD / HD Graphics。推理不受影响（默认的 DirectML 任何显卡都能用）；训练与模型转换的显卡加速需要 Arc 及以上。若你的确是 Arc 显卡，请安装最新的 Intel 显卡驱动后重新自检",
-    "ZSTD_INIT_FAILED": "zstd 解码器初始化失败"
+    "ZSTD_INIT_FAILED": "zstd 解码器初始化失败",
+    "RUN_NEVER_NAMED": "这个训练 run 还没有起过名字 —— 它还没开始训练过。名字会在第一次开始训练时询问。",
+    "RUN_RENAME_FAILED": "改名失败,训练名没有被修改。可能是文件被占用或磁盘出错;请稍后重试。",
+    "RENAME_WHILE_BUSY": "有任务正在运行——请等它结束(或先停止它)再改训练名。",
+    "RENAME_OTHER_INSTANCE": "检测到另一个 Utai 实例正在运行——它可能正在使用这个训练 run,已拒绝改名。请先关闭其它 Utai 窗口。"
   }
 }

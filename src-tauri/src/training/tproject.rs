@@ -524,6 +524,39 @@ pub fn run_artifact_slug(run: &crate::training::trun::RunDir) -> Option<String> 
         .filter(|s| !s.is_empty())
 }
 
+/// Rewrite ONE run's training name — **and nothing else**.
+///
+/// ★§F2⒝ batch 2 step ④b. This command can only exist because the artifact identity was frozen
+/// first ([`run_artifact_slug`]): before that, "renaming" would have re-pointed `hps.name`, the
+/// `weights/<slug>*` prefix, the `audition/<slug>_*` stems and the pool's slice directory on the
+/// run's NEXT start, leaving every existing product an orphan and growing a second full
+/// preprocessing tree. Here the file keeps its `model_slug` byte for byte; only the label moves.
+///
+/// The write is atomic (temp + rename) because `run.json` is the file `try_start`'s guards and
+/// python's five chains both read: a kill mid-write would strand a truncated one, and the readers
+/// treat "unparseable" as「这个 run 还没起过名」— an absence, not an error.
+pub fn rename_run(run: &crate::training::trun::RunDir, name: &str) -> Result<()> {
+    let fail = |e: String| UtaiError::Training(format!("RUN_RENAME_FAILED: {e}"));
+    let path = run.join("run.json");
+    // A run that never started has no `run.json` — and no artifacts to label either. It is not a
+    // failure of the rename, it is a run whose name has not been asked for yet.
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| UtaiError::Training("RUN_NEVER_NAMED".into()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| fail("run.json is not an object".to_string()))?;
+    obj.insert(
+        "model_name".to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
+    let tmp = run.join("run.json.tmp");
+    let bytes = serde_json::to_vec_pretty(&v).map_err(|e| fail(e.to_string()))?;
+    std::fs::write(&tmp, bytes).map_err(|e| fail(e.to_string()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| fail(e.to_string()))?;
+    Ok(())
+}
+
 /// The run's own `run.json`, parsed. One reader for both accessors above so they can never
 /// disagree about which file answers「这个 run 的身份」.
 fn run_json(run: &crate::training::trun::RunDir) -> Option<serde_json::Value> {
@@ -2742,6 +2775,70 @@ mod tests {
         let e = create_project(&data, "A", "").unwrap_err().to_string();
         assert!(e.contains("PROJECT_META_UNREADABLE"), "got {e}");
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ★§F2⒝ 批 2 ④b —— 改名**只改标签**。
+    ///
+    /// The assertion that carries the batch: `model_slug` must come out unchanged. It is
+    /// `hps.name`, the `weights/<slug>*` prefix, the `audition/<slug>_*` stems and — through the
+    /// pool the runs SHARE — the `dataset_44k/<slug>/` slice directory. A rename that moved it
+    /// would orphan every existing product and grow a second full preprocessing tree on the run's
+    /// next start, with nothing anywhere reporting it.
+    ///
+    /// ⚠ 「其余键不变」is asserted on the PARSED object, not on bytes: the file is rewritten
+    /// pretty-printed, so a byte comparison would fail for a reason that has nothing to do with
+    /// the property under test.
+    #[test]
+    fn renaming_a_run_moves_the_label_and_nothing_else() {
+        let data = tmp_root("runrename");
+        let ws = legacy_rvc(&data, "slugdir");
+        // a realistic run.json: the label, the frozen artifact identity, and the absolute asset
+        // paths a rewrite must not lose
+        let before = serde_json::json!({
+            "model_name": "初号机",
+            "model_slug": "LEGACY-STEM",
+            "backend": "rvc",
+            "assets": { "rmvpe_pt": "C:\\x\\rmvpe.pt" },
+            "total_epoch": 200,
+            "fp16": true,
+        });
+        std::fs::write(ws.join("run.json"), serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+        let run = crate::training::trun::RunDir::for_test(ws.clone());
+
+        rename_run(&run, "改了个名字").unwrap();
+
+        assert_eq!(run_model_name(&run).as_deref(), Some("改了个名字"));
+        assert_eq!(
+            run_artifact_slug(&run).as_deref(),
+            Some("LEGACY-STEM"),
+            "★ the artifact identity must not move — that is the whole reason a rename is allowed"
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(ws.join("run.json")).unwrap()).unwrap();
+        for (k, v) in before.as_object().unwrap() {
+            if k == "model_name" {
+                continue;
+            }
+            assert_eq!(after.get(k), Some(v), "key {k} changed");
+        }
+        assert_eq!(
+            after.as_object().unwrap().len(),
+            before.as_object().unwrap().len(),
+            "the rewrite added or dropped a key"
+        );
+        // the temp file must not survive: `run.json.tmp` sitting in a run directory is invisible
+        // to every scanner but counts toward `dir_size`
+        assert!(!ws.join("run.json.tmp").exists());
+
+        // a run that never started has no label to change — and no artifacts to orphan either
+        let fresh = tmp_root("runrename2");
+        let empty = crate::training::trun::RunDir::for_test(training_root(&fresh).join("never"));
+        std::fs::create_dir_all(empty.path()).unwrap();
+        let e = rename_run(&empty, "x").unwrap_err().to_string();
+        assert!(e.contains("RUN_NEVER_NAMED"), "got {e}");
+
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(fresh);
     }
 
     #[test]

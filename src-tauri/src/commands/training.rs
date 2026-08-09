@@ -734,6 +734,42 @@ pub async fn get_slot_export_context(
     })
 }
 
+/// Rename ONE run's「本次训练名」. ★§F2⒝ 批 2 ④b —— **它只改标签。**
+///
+/// The capability only became safe once the artifact identity was frozen in the run
+/// ([`crate::training::tproject::run_artifact_slug`]). Before that, a rename would have
+/// re-pointed `hps.name`, `weights/<slug>*`, `audition/<slug>_*` and — through the pool the runs
+/// SHARE — the `dataset_44k/<slug>/` slice directory, on the run's next start: every existing
+/// product orphaned, a second full preprocessing tree grown, and nothing anywhere reporting it.
+///
+/// `run_id` empty ⇒「这个槽至多一个 run」, the same convention as every other run-taking command;
+/// a slot with several runs refuses rather than picks (`RUN_AMBIGUOUS`).
+#[tauri::command]
+pub async fn rename_training_run(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    backend: String,
+    run_id: Option<String>,
+    name: String,
+) -> Result<(), String> {
+    checked_project_id(&project_id)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("TRAINING_NAME_EMPTY".into());
+    }
+    crate::commands::window::ensure_idle_for_run_rename(&state)?;
+    if crate::crashlog::other_instance_alive() {
+        return Err("RENAME_OTHER_INSTANCE".into());
+    }
+    let data_dir = data_root(&state);
+    let family = crate::training::backend_family(&backend);
+    let slot = crate::training::tproject::family_dir(&data_dir, &project_id, family);
+    let run =
+        crate::training::trun::resolve_run_dir(&slot, opt_run_id(run_id.as_deref().unwrap_or("")))
+            .map_err(|e| e.to_string())?;
+    crate::training::tproject::rename_run(&run, name).map_err(|e| e.to_string())
+}
+
 /// Import audio INTO the project's shared dataset, independent of any training run.
 ///
 /// Appends — the run-time import replaces wholesale, this one adds. `speaker` is a display name
@@ -1012,6 +1048,53 @@ mod tests {
         // anything path-like does not — `training_root.join(id)` must stay inside the root
         for bad in ["", "..", "../..", "a/b", "a\\b", ".del_x", "C:", "a:b", "a b", "项目"] {
             assert!(checked_project_id(bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    /// ★§F2⒝ 批 2 ④b —— 改名命令的四道闸,钉在源码上。
+    ///
+    /// `rename_training_run` takes `State`, so no unit test can drive it;「`rename_run` 是对的」and
+    /// 「命令在调它之前该拒绝的都拒绝了」are two separate claims and only the first is drivable.
+    /// Dropping any one of these is silent in a different way: no idle guard ⇒ `run.json` is
+    /// rewritten under a live run while the running snapshot keeps the old label; no
+    /// other-instance guard ⇒ two processes write the same file; no empty-name guard ⇒ every
+    /// reader that treats `""` as「这个 run 还没起过名」starts asking for a name on every 继续训练.
+    ///
+    /// ⛔ Full-line comments are blanked before the search: a raw substring scan reads comments
+    /// too, so one comment naming a guard would satisfy the assertion the guard is supposed to
+    /// carry (the sibling ratchets in `training::mod` were hardened for the same reason).
+    #[test]
+    fn renaming_a_run_is_guarded_before_it_touches_the_file() {
+        static THIS_RS: &str = include_str!("training.rs");
+        let code: String = THIS_RS
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    " ".repeat(l.len())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let open = code
+            .find("pub async fn rename_training_run(")
+            .expect("the rename command is gone");
+        let body = &code[open..];
+        let end = body.find("\n}\n").expect("unterminated fn");
+        let body = &body[..end];
+        for needle in [
+            "TRAINING_NAME_EMPTY",
+            "ensure_idle_for_run_rename(",
+            "other_instance_alive()",
+        ] {
+            let at = body.find(needle).unwrap_or_else(|| {
+                panic!("rename_training_run no longer contains {needle:?} — a guard was dropped")
+            });
+            let write = body
+                .find("tproject::rename_run(")
+                .expect("the rename command no longer writes");
+            assert!(at < write, "{needle} is checked AFTER the file is rewritten");
         }
     }
 

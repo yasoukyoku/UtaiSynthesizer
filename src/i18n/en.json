@@ -500,7 +500,10 @@
     "dropHint": "Drop here to add as training data",
     "pausePreview": "Pause",
     "loadingPreview": "Loading…",
-    "ckptRangeTip": "Auto range-test result (comfort zone) — auditions transpose the high-skewed clip into this zone and back"
+    "ckptRangeTip": "Auto range-test result (comfort zone) — auditions transpose the high-skewed clip into this zone and back",
+    "runRename": "Rename",
+    "runRenameTitle": "Rename training run",
+    "runRenameBody": "The training name is just this run's label — changing it moves none of the files it has already produced and does not affect resuming. Models already exported to the resource manager keep their own names."
   },
   "workflow": {
     "title": "Workflow Editor",
@@ -1092,6 +1095,10 @@
     "WORKSPACE_MANIFEST_MISSING": "The same-named training workspace lacks run_manifest.json (inconsistent state) — retrain (wipes the workspace) or use a different model name",
     "WORKSPACE_WIPE_FAILED": "Failed to wipe the old training workspace",
     "XPU_NO_DEVICE": "No usable Intel XPU GPU was found: torch-XPU supports only the Arc family (Arc A/B discrete cards, the Core Ultra \"Arc Graphics\" iGPU, Data Center GPU Max) — not Iris Xe / UHD / HD Graphics. Inference is unaffected (the default DirectML runs on any GPU); GPU acceleration for training and model conversion needs Arc or newer. If you do have an Arc card, install the latest Intel graphics driver and run the self-test again",
-    "ZSTD_INIT_FAILED": "Failed to initialize the zstd decoder"
+    "ZSTD_INIT_FAILED": "Failed to initialize the zstd decoder",
+    "RUN_NEVER_NAMED": "This training run has no name yet — it has never started. The name is asked for when training first starts.",
+    "RUN_RENAME_FAILED": "The rename failed and the training name was left unchanged — the file may be locked or the disk may have errored. Try again.",
+    "RENAME_WHILE_BUSY": "A task is running — wait for it to finish (or stop it) before renaming this training run.",
+    "RENAME_OTHER_INSTANCE": "Another Utai instance is running and may be using this training run — the rename was refused. Close the other Utai windows first."
   }
 }

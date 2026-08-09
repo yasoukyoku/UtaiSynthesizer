@@ -289,6 +289,29 @@
   color: var(--text-muted);
 }
 
+/* ★§F2⒝ 批 2 ④b —— 训练名旁边的改名入口。字形与项目改名一致(✎),方角、无背景,
+   只在悬停时提亮:它是一个次要动作,不该和「继续训练」抢注意力。 */
+.tproj-run-rename {
+  margin-left: var(--space-xs);
+  padding: 0 var(--space-xs);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tproj-run-rename:hover:not(:disabled) {
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.tproj-run-rename:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* 每行自己的动作条:不吃 `margin-top: auto`(那是槽底部按钮的定位),否则 N 行会被推开。 */
 .tproj-run .tproj-slot-actions {
   margin-top: 0;

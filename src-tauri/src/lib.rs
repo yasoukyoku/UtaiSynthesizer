@@ -1320,6 +1320,7 @@ pub fn run() {
             commands::training::forget_training_project,
             commands::training::get_training_project,
             commands::training::get_slot_export_context,
+            commands::training::rename_training_run,
             commands::training::import_project_dataset,
             commands::training::delete_project_dataset_files,
             commands::training::get_training_slot_info,
