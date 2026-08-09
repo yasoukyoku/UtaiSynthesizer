@@ -2294,7 +2294,33 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // historical total_fea.npy; sovits probes the workspace cluster assets
   // (built before training, so they exist even for early stops). Shared by the
   // single-import prompt and the S41 batch import (single source).
-  const resolveIndexPath = async (): Promise<string | undefined> => {
+  /** ★§F2⒝ 批 2 ④ —— **这一行所属那个 run** 的导出上下文,现取现问。
+   *
+   *  ⛔ 为什么必须按行问:这条命令的错误在上面的 effect 里是被 `catch` 吃掉的,于是
+   *  `exportWorkspace` 塌成 `""` —— 而空串不是一个可见的失败,是一个**继续往下走的错答案**。
+   *  链条实测过:`resolveIndexPath` 拿 `""` 拼出的路径不存在 ⇒ `indexPath` 是 undefined ⇒
+   *  `import_model` 收到 `index_file: None` ⇒ **整个 WARN_INDEX_MISSING 分支被跳过**,它转而在
+   *  **存档文件旁边**(`<run>/weights/`)自动探测,而 RVC 的索引在 `<run>/total_fea.npy`,
+   *  三条探测全落空、`warnings` 里一个字都不 push ⇒ 装出来的模型没有检索矩阵,
+   *  **无警告、无 CODE、无 toast**,只是听起来不对。
+   *
+   *  `null` = 这一行是 `pending`(还没被磁盘扫描看见,`runId` 未知)⇒ 退回槽级上下文,
+   *  那正是它今天的行为。 */
+  const ctxForRun = async (runId?: string | null) => {
+    if (runId == null || !route.projectId) return slotCtx;
+    try {
+      return await invoke<{ modelName: string; workspace: string; indexPath: string | null }>(
+        "get_slot_export_context",
+        { projectId: route.projectId, backend: archiveBackend, runId },
+      );
+    } catch {
+      return slotCtx;
+    }
+  };
+
+  const resolveIndexPath = async (runId?: string | null): Promise<string | undefined> => {
+    const ctx = await ctxForRun(runId);
+    const rowWorkspace = (useLiveIdentity ? snapshot.workspace : "") || ctx?.workspace || "";
     // ★ The live run's summary index is ONLY trustworthy when this segment is that run
     // (`useLiveIdentity`). In the standalone 存档中心 the snapshot may be a DIFFERENT family's
     // finished run of the same project, and its `summary.index` (e.g. a SoVITS cluster .npy)
@@ -2303,7 +2329,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     const summaryIndex = useLiveIdentity
       ? (snapshot.summary as { index?: string } | null)?.index
       : undefined;
-    let indexPath = summaryIndex ?? slotCtx?.indexPath ?? undefined;
+    let indexPath = summaryIndex ?? ctx?.indexPath ?? undefined;
     if (!indexPath && archiveBackend !== "vocoder") {
       // vocoders have no index/cluster companion — probing would only find
       // another backend's leftovers (红队 A16 fallback-site sweep)
@@ -2315,12 +2341,12 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         // SKIPS its own auto-detection beside the checkpoint, leaving only a WARN_INDEX_MISSING —
         // a warning the single-import path below did not even read. The model installed without
         // its retrieval index, and the only symptom was that it sounded wrong.
-        const cand = `${exportWorkspace}\\total_fea.npy`;
+        const cand = `${rowWorkspace}\\total_fea.npy`;
         if (await exists(cand)) indexPath = cand;
       } else {
         for (const cand of [
-          `${exportWorkspace}\\cluster\\kmeans_10000.pt`,
-          `${exportWorkspace}\\cluster\\0.index_vectors.npy`,
+          `${rowWorkspace}\\cluster\\kmeans_10000.pt`,
+          `${rowWorkspace}\\cluster\\0.index_vectors.npy`,
         ]) {
           if (await exists(cand)) {
             indexPath = cand;
@@ -2345,7 +2371,15 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     await useTrainingStore.getState().refreshProjectCkpts(route.projectId, archiveBackend);
   };
 
-  const importCkpt = async (ckpt: { kind: string; epoch?: number; step: number | null; rel?: string; path: string }) => {
+  const importCkpt = async (ckpt: {
+    kind: string;
+    epoch?: number;
+    step: number | null;
+    rel?: string;
+    path: string;
+    /** ★§F2⑭ 批 2 ④ —— 存档行带着它；实时 run 的候选行没有（那时 `snapshot.workspace` 已经就是那个 run）。 */
+    runId?: string | null;
+  }) => {
     const name = await showConfirm({
       title: t("training.import"),
       body: t("training.importName"),
@@ -2359,7 +2393,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       input: { initial: suggestedName(ckpt) },
     });
     if (!name || name === "__cancel") return;
-    const indexPath = await resolveIndexPath();
+    const indexPath = await resolveIndexPath(ckpt.runId);
     try {
       // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
       // this one-row button is the path the archive list actually uses. `import_model` reports the
@@ -2421,7 +2455,9 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     if (okId !== "ok") return;
     setImportingAll(true);
     try {
-      const indexPath = await resolveIndexPath();
+      // 批量导入只处理【实时 run】的候选（`snapshot.ckpts`），而那时 `useLiveIdentity` 下的
+      // `snapshot.workspace` 就是那个 run 的目录 —— 所以这里没有【哪个 run】的歧义可言。
+      const indexPath = await resolveIndexPath(null);
       const audName = isVocoderRun ? "vocoder" : "model";
       let ok = 0;
       const failed: string[] = [];

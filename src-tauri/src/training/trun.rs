@@ -293,6 +293,26 @@ pub fn runs_root(slot: &Path) -> PathBuf {
     slot.join(RUNS_DIR)
 }
 
+/// Which run a PROJECT-RELATIVE artifact path belongs to; `""` when the slot root is the run.
+///
+/// ★§F2⒝ batch 2 step ④. Derived rather than threaded through the scanners, and that is on
+/// purpose: the export LEDGER already keys on exactly this prefix (`repoint_ledger` rewrites
+/// `<family>/` rows into `<family>/runs/<id>/` ones), so a second derivation of "which run is this
+/// path in" would be a second chance to disagree with the ledger about the same string. One
+/// function, both readers.
+///
+/// `""` is a POSITIVE answer, not a failure: it is the layout ≤ 2 shape where the slot root holds
+/// the run products, which is what [`resolve_run_dir`] answers with too.
+pub fn run_id_in_rel(rel: &str, family: &str) -> String {
+    let rel = rel.replace('\\', "/");
+    let Some(tail) = rel.strip_prefix(&format!("{family}/{RUNS_DIR}/")) else {
+        return String::new();
+    };
+    // A bare `<family>/runs/<id>` with nothing after it is not an artifact path; requiring the
+    // separator keeps this from naming a run for the container listing itself.
+    tail.split_once('/').map(|(id, _)| id.to_string()).unwrap_or_default()
+}
+
 /// A directory that has been RESOLVED to be one run's home.
 ///
 /// ⛔ The point of the newtype is the thing a test cannot reach. Every per-run reader used to take
@@ -350,6 +370,29 @@ pub fn list_runs(slot: &Path) -> Vec<RunInfo> {
         let id = entry.file_name().to_string_lossy().into_owned();
         // `.` entries are staging, never a run — a half-migrated tree must not be selectable.
         if id.starts_with('.') || !entry.path().is_dir() {
+            continue;
+        }
+        // ★§F2⒝ batch 2 step ④ — a name this app could never have minted is NOT a run.
+        //
+        // ⛔ This is a REACHABLE-TODAY fix, not preparation. Nothing else filtered here, so one
+        // stray directory under `<slot>/runs/` — a backup tool's copy, a half-finished manual
+        // rename, an antivirus quarantine folder — made the slot answer `RUN_AMBIGUOUS`, and that
+        // answer is `?`-ed in front of BOTH `start_training` (`commands/training.rs`, before the
+        // manager ever runs) and the project-detail command (which collects every slot through one
+        // `Result`) ⇒ no training of ANY backend in that project, and a project page that will not
+        // open, both reporting a raw untranslated Rust string with an absolute path in it.
+        //
+        // Skipping it is the lesser evil and it is not silent: the slot keeps working, the entry
+        // still counts toward the slot's byte total (`dir_size` walks the directory, not this
+        // list), and the reason is one `warn!` away. Widening `run_id_is_usable` instead would be
+        // the mistake — it is the same predicate the minting paths assert on, so the two must
+        // agree or a minted id could fail to list.
+        if !run_id_is_usable(&id) {
+            tracing::warn!(
+                "ignoring {} — not a run id this app could have minted; \
+                 it is invisible to every per-run reader (but still occupies disk)",
+                entry.path().display()
+            );
             continue;
         }
         out.push(RunInfo { id, dir: entry.path() });
@@ -833,6 +876,74 @@ mod tests {
         walk(dir, dir, &mut v);
         v.sort();
         v
+    }
+
+    /// ⛔ REACHABLE TODAY, and it takes down more than the slot it is in.
+    ///
+    /// `list_runs` used to accept every non-dot directory under `runs/`, so ONE stray entry — a
+    /// backup tool's copy, an antivirus quarantine folder, an abandoned manual rename — made the
+    /// slot answer `RUN_AMBIGUOUS`. That answer is `?`-ed in front of `start_training` (so no
+    /// backend in the project can train) and inside the project-detail command's per-slot
+    /// `collect::<Result<_>>` (so the page will not open at all), both surfacing a raw
+    /// untranslated Rust string. The stray directory is not a run and never was.
+    ///
+    /// ⚠ The assertion is deliberately two-sided: skipping it must NOT also make a legitimately
+    /// minted id disappear, because `list_runs` and the minting paths share `run_id_is_usable` and
+    /// a one-sided change there is how a real run becomes invisible (fail-OPEN for every byte).
+    #[test]
+    fn a_name_this_app_could_not_have_minted_is_not_a_run() {
+        let data = tmp_data("stray");
+        let slot = project_dir(&data, "p_11111111").join("rvc");
+        let real = legacy_run_id("rvc");
+        touch(&runs_root(&slot).join(&real).join("G_1.pth"));
+        // what a human or a tool leaves behind
+        for stray in ["G_2333333.pth backup", "runs.bak", "副本", "rvc"] {
+            std::fs::create_dir_all(runs_root(&slot).join(stray)).unwrap();
+        }
+        let listed: Vec<String> = list_runs(&slot).into_iter().map(|r| r.id).collect();
+        assert_eq!(listed, vec![real.clone()], "only the minted id is a run");
+        // …and therefore the two commands that used to die still answer
+        assert_eq!(
+            resolve_run_dir(&slot, None).unwrap().path(),
+            runs_root(&slot).join(&real),
+            "one stray directory must not make the slot unanswerable"
+        );
+        assert_eq!(run_dirs(&slot).len(), 1);
+        // the opposite direction: every id the app can mint must survive the filter
+        for family in tproject::FAMILIES {
+            assert!(
+                run_id_is_usable(&legacy_run_id(family)),
+                "the filter must never hide a minted run: {family}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The record ↔ run attribution, in BOTH layouts, from the same function the ledger uses.
+    #[test]
+    fn a_relative_path_names_the_run_it_came_out_of() {
+        let id = legacy_run_id("rvc");
+        // layout ≥3 — the id is a path segment
+        assert_eq!(run_id_in_rel(&format!("rvc/{RUNS_DIR}/{id}/G_1.pth"), "rvc"), id);
+        assert_eq!(
+            run_id_in_rel(&format!("rvc/{RUNS_DIR}/{id}/weights/m_e1_s1.pth"), "rvc"),
+            id
+        );
+        // windows separators reach this from `path`-derived strings
+        assert_eq!(run_id_in_rel(&format!("rvc\\{RUNS_DIR}\\{id}\\G_1.pth"), "rvc"), id);
+        // layout ≤2 — the slot root IS the run, and "" is the POSITIVE answer for it
+        assert_eq!(run_id_in_rel("rvc/G_1.pth", "rvc"), "");
+        assert_eq!(run_id_in_rel("rvc/weights/m_e1_s1.pth", "rvc"), "");
+        // a sibling family's rows are never attributed to this one
+        assert_eq!(run_id_in_rel(&format!("sovits/{RUNS_DIR}/{id}/G_1.pth"), "rvc"), "");
+        // the container listing itself names no run (no artifact after the id)
+        assert_eq!(run_id_in_rel(&format!("rvc/{RUNS_DIR}/{id}"), "rvc"), "");
+        // ⚠ the ledger rewrites the SAME prefix — if these two ever disagree, a re-pointed export
+        // row stops matching the record it protects and the cleanup deletes it as unexported.
+        let old = format!("rvc/weights/m.pth");
+        let new = format!("rvc/{RUNS_DIR}/{id}/weights/m.pth");
+        assert_eq!(run_id_in_rel(&old, "rvc"), "");
+        assert_eq!(run_id_in_rel(&new, "rvc"), id);
     }
 
     #[test]

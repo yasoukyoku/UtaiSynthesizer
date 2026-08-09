@@ -486,6 +486,18 @@ pub fn slot_model_name(data_dir: &Path, id: &str, family: &str) -> Option<String
     let run = crate::training::trun::resolve_run_dir(&family_dir(data_dir, id, family), None)
         .inspect_err(|e| tracing::warn!("slot_model_name({id}/{family}): {e}"))
         .ok()?;
+    run_model_name(&run)
+}
+
+/// The「本次训练名」ONE run's artifacts were built under.
+///
+/// ★§F2⒝ batch 2 step ④ — split out of [`slot_model_name`] because the slot-level question has
+/// no answer once a slot holds two runs, and the way it FAILED was the dangerous part: the `.ok()?`
+/// above turns `RUN_AMBIGUOUS` into `None`, i.e. into「这个槽还没起过名」. That is not a blank label
+/// but a live behaviour change — `askRunName` returns the frozen name only `if (slot?.modelName)`,
+/// so an empty one makes the app ask for a name on every 继续训练, and the name is what
+/// `slugify` turns into `dataset_44k/<slug>/`, `config.spk` keys and `weights/<slug>*`.
+pub fn run_model_name(run: &crate::training::trun::RunDir) -> Option<String> {
     std::fs::read_to_string(run.join("run.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -525,6 +537,13 @@ pub struct CkptRecord {
     /// Relative to the PROJECT directory — a data-dir move must not orphan the ledger that
     /// protects these files from the cleanup.
     pub rel: String,
+    /// ★§F2⒝ batch 2 step ④ — WHICH run of the slot produced it (`trun::run_id_in_rel`).
+    /// `""` = the slot root is the run (layout ≤ 2), a positive fact rather than "unknown".
+    ///
+    /// Carried on the record because the archive view lists a whole family in one table: without
+    /// it, two runs' checkpoints interleave by mtime with nothing on the row saying which model
+    /// they belong to, and「导入」would offer the same suggested name for both.
+    pub run_id: String,
     /// Absolute path: what audition / import / attach already take.
     pub path: String,
     pub family: String,
@@ -603,6 +622,7 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
                 .collect();
             out.push(CkptRecord {
                 imported: exported.contains(&rel),
+                run_id: crate::training::trun::run_id_in_rel(&rel, family),
                 rel,
                 path: abs.to_string_lossy().into_owned(),
                 family: family.to_string(),
@@ -887,10 +907,30 @@ pub struct CleanupPlan {
 /// ⚠ A slot whose ONLY resumable record is the best snapshot still reports it: that really is the
 /// only thing there to continue from, and answering "no resume point" would be its own lie.
 pub fn default_resume_record(recs: &[CkptRecord]) -> Option<&CkptRecord> {
-    let is_best_snapshot = |r: &CkptRecord| r.rel.contains("/resume_best/");
-    recs.iter()
+    pick_default_resume(recs.iter())
+}
+
+/// Same rule, asked of ONE RUN's records (which the project detail holds as borrowed rows).
+///
+/// ★§F2⒝ batch 2 step ④ — a slot's record list spans every run, and its mtime order then answers
+/// 「哪个 run 最后练过」, not 「这个 run 从哪继续」. Filtering first and asking after is the only
+/// arrangement in which the number on a run's row is that run's.
+pub fn default_resume_record_of<'a>(recs: &[&'a CkptRecord]) -> Option<&'a CkptRecord> {
+    pick_default_resume(recs.iter().copied())
+}
+
+/// THE rule, once. Two entry points above only differ in how the caller holds the records.
+fn pick_default_resume<'a>(
+    it: impl Iterator<Item = &'a CkptRecord> + Clone,
+) -> Option<&'a CkptRecord> {
+    let is_best_snapshot = |r: &&CkptRecord| r.rel.contains("/resume_best/");
+    let mut primary = it.clone();
+    primary
         .find(|r| matches!(r.kind, CkptKind::Resumable) && !is_best_snapshot(r))
-        .or_else(|| recs.iter().find(|r| matches!(r.kind, CkptKind::Resumable)))
+        .or_else(|| {
+            let mut fallback = it;
+            fallback.find(|r| matches!(r.kind, CkptKind::Resumable))
+        })
 }
 
 pub fn plan_cleanup(
@@ -2430,6 +2470,7 @@ mod tests {
 
     fn ck(rel: &str, kind: CkptKind, mtime_ms: u64, imported: bool) -> CkptRecord {
         CkptRecord {
+            run_id: crate::training::trun::run_id_in_rel(rel, "rvc"),
             rel: rel.into(),
             path: format!("D:/x/{rel}"),
             family: "rvc".into(),

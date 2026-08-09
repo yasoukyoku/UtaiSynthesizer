@@ -388,6 +388,17 @@ pub struct StartTrainingRequest {
     /// nothing about what the slot is allowed to contain.
     #[serde(default)]
     pub resume_from: String,
+    /// ★§F2⒝ batch 2 step ④ — WHICH RUN of the slot this start addresses. Same posture as
+    /// `resume_from` above and for the same reason: a PRODUCT SELECTOR, never a lock-table row.
+    /// It picks which existing artifacts get read and written; it changes nothing about what the
+    /// slot is allowed to contain.
+    ///
+    /// Empty = "the slot holds at most one run, use it" — which is what `trun::resolve_run_dir`
+    /// asserts and REFUSES to guess about. That is why the field can be added a batch before the
+    /// one that mints a second run: while every slot has one run, empty is right everywhere, and
+    /// the batch that starts minting hands a real id to each call site or hears `RUN_AMBIGUOUS`.
+    #[serde(default)]
+    pub run_id: String,
     /// cache the whole dataset in RAM (upstream all_in_mem)
     #[serde(default)]
     pub all_in_mem: bool,
@@ -723,14 +734,22 @@ pub(crate) fn slot_holds_work(slot: &Path) -> bool {
 /// ⛔ Every field except `exists` and `has_dataset` describes a RUN: the frozen manifest values,
 /// the progress probes, the resume points, the speaker order. It therefore resolves the run
 /// through [`trun::resolve_run_dir`] and RETURNS AN ERROR rather than guessing when a slot holds
-/// more than one — the batch that starts minting a second run is the batch that must hand this a
-/// run id, and an Err here is how a forgotten call site says so out loud. Answering with an empty
-/// `WorkspaceInfo` instead would blank `has_main_progress` and `version`, which the parameters
-/// page reads to decide whether the four resume-locked controls are locked: the user would get
-/// them unlocked, change one, and be refused by Rust with a CODE they did nothing to earn.
-pub fn slot_info(data_dir: &Path, project_id: &str, backend: &str) -> Result<WorkspaceInfo> {
+/// more than one and no id was given — an Err here is how a forgotten call site says so out loud.
+/// Answering with an empty `WorkspaceInfo` instead would blank `has_main_progress` and `version`,
+/// which the parameters page reads to decide whether the four resume-locked controls are locked:
+/// the user would get them unlocked, change one, and be refused by Rust with a CODE they did
+/// nothing to earn.
+///
+/// ★§F2⒝ batch 2 step ④ — `run_id` is how a caller says WHICH run it means. `None` keeps the
+/// pre-④ meaning exactly: "this slot has at most one run". Both are checked, neither guesses.
+pub fn slot_info(
+    data_dir: &Path,
+    project_id: &str,
+    backend: &str,
+    run_id: Option<&str>,
+) -> Result<WorkspaceInfo> {
     let ws = tproject::family_dir(data_dir, project_id, backend_family(backend));
-    let run = trun::resolve_run_dir(&ws, None)?;
+    let run = trun::resolve_run_dir(&ws, run_id)?;
     let manifest = std::fs::read_to_string(run.join("run_manifest.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -1509,7 +1528,11 @@ impl TrainingManager {
                             &existing.unwrap().id,
                             backend_family(&req.backend),
                         ),
-                        None,
+                        // ★step ④ — THIS run's frozen slugs. `effective_speaker_slugs` adopts a
+                        // frozen list whenever the COUNT matches, which two runs of one project
+                        // routinely do, so a sibling's list here would map these singers onto that
+                        // run's emb_g rows and then check the dataset against the wrong names.
+                        Some(req.run_id.trim()).filter(|s| !s.is_empty()),
                     )?,
                     &req,
                 )
@@ -1644,7 +1667,11 @@ impl TrainingManager {
         //   * RUN — the manifest, every progress probe, the frozen speaker set, the resume locks.
         // Resolved BEFORE any deletion, exactly like the manifest read below: these guards exist
         // to judge the PRE-wipe state.
-        let run = trun::resolve_run_dir(&workspace, None)?;
+        // ★step ④ — the run the REQUEST names (empty = "this slot holds at most one"). Every
+        // guard below reads THIS run's manifest and progress, so answering with a sibling run's
+        // would let a resume continue from weights the locks were never checked against.
+        let req_run = Some(req.run_id.trim()).filter(|s| !s.is_empty());
+        let run = trun::resolve_run_dir(&workspace, req_run)?;
         let manifest_path = run.join("run_manifest.json");
 
         // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
@@ -3599,12 +3626,12 @@ mod tests {
             }
         }
         assert_eq!(
-            slot_info(&data, "p1", "vocoder").unwrap().best_resume_step,
+            slot_info(&data, "p1", "vocoder", None).unwrap().best_resume_step,
             Some(1822),
             "the vocoder's resume button must offer the REAL step"
         );
         assert_eq!(
-            slot_info(&data, "p1", "sovits").unwrap().best_resume_step,
+            slot_info(&data, "p1", "sovits", None).unwrap().best_resume_step,
             Some(3644),
             "the GAN arm is NOT halved — its checkpoints count real steps already"
         );
@@ -4099,7 +4126,7 @@ mod tests {
         assert_eq!(f.len(), 2);
         assert_eq!((f[0].slug.as_str(), f[0].name.as_str()), ("sayo_a", "sayo"));
         assert_eq!((f[1].slug.as_str(), f[1].name.as_str()), ("teto_b", "teto"));
-        assert_eq!(slot_info(&data, id, "rvc").unwrap().speakers, vec!["sayo", "teto"]);
+        assert_eq!(slot_info(&data, id, "rvc", None).unwrap().speakers, vec!["sayo", "teto"]);
 
         // 2. pre-`speaker_names` workspace: names live only in run.json, matched BY SLUG —
         //    and note run.json lists them in the OTHER order, which must not reorder anything
@@ -4128,7 +4155,7 @@ mod tests {
         );
         assert_eq!(f[0].name, "sayo");
         assert_eq!(f[1].name, "teto");
-        assert_eq!(slot_info(&data, id, "rvc").unwrap().speakers, vec!["sayo", "teto"]);
+        assert_eq!(slot_info(&data, id, "rvc", None).unwrap().speakers, vec!["sayo", "teto"]);
 
         // 3. a later sovits_diff run rewrote run.json without the key: order survives, names do
         //    not — and `slot_info` must then report NOTHING rather than two blanks
@@ -4137,7 +4164,7 @@ mod tests {
         assert_eq!(f.len(), 2, "the order is still recoverable");
         assert!(f.iter().all(|s| s.name.is_empty()));
         assert!(
-            slot_info(&data, id, "rvc").unwrap().speakers.is_empty(),
+            slot_info(&data, id, "rvc", None).unwrap().speakers.is_empty(),
             "all-blank must collapse to empty — a blank vec of the right length would read as \
              a speaker mismatch in the resume dialog"
         );
@@ -4152,7 +4179,7 @@ mod tests {
         )
         .unwrap();
         assert!(frozen_speakers(&data, id, "sovits").is_empty());
-        assert!(slot_info(&data, id, "sovits").unwrap().speakers.is_empty());
+        assert!(slot_info(&data, id, "sovits", None).unwrap().speakers.is_empty());
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -4238,7 +4265,92 @@ mod tests {
         w("run.json", &serde_json::json!({"model_name": "歌姫"}).to_string());
     }
 
-    /// ⛔ §F2⒝ batch 2 — THE test for this batch, because the batch moves no bytes.
+    /// ⛔ §F2⒝ batch 2 step ④ — THE test for THIS batch, for the same reason: it moves no bytes
+    /// either, so「套件全绿」carries no information about it. What ④ changes is that every
+    /// per-run question can now be ASKED of a named run — so the only assertion that means
+    /// anything is one where the two runs would give DIFFERENT answers, and each is asked its own.
+    ///
+    /// The slot below cannot be produced through the app yet (both minting paths use
+    /// `legacy_run_id`, which is a pure function of the family) — it is built on disk on purpose,
+    /// because that is exactly the state the NEXT batch creates and this is the shape that has to
+    /// be right BEFORE it does.
+    #[test]
+    fn each_run_answers_for_itself_and_the_unnamed_question_refuses() {
+        let data = tmp_ws("tworuns");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "ptwo_55556666";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let (a, b) = ("raaaaaaaaaaaa", "rbbbbbbbbbbbb");
+        for (rid, step, name) in [(a, 1400u64, "歌姫A"), (b, 900u64, "歌姫B")] {
+            let home = trun::runs_root(&slot).join(rid);
+            std::fs::create_dir_all(&home).unwrap();
+            run_products(&home, step);
+            std::fs::write(
+                home.join("run.json"),
+                serde_json::json!({ "model_name": name }).to_string(),
+            )
+            .unwrap();
+        }
+
+        // ⛔ the UNNAMED question must refuse rather than pick one. This is the whole reason the
+        // shape had to change first: `slot_info(None)` is what the project page used to ask for
+        // every slot, through one `collect::<Result<_>>` — so this Err took the WHOLE page down.
+        assert!(slot_info(&data, id, "rvc", None).is_err(), "two runs cannot answer「哪个」");
+        assert!(trun::resolve_run_dir(&slot, None).is_err());
+        assert!(tproject::slot_model_name(&data, id, "rvc").is_none(), "…and it swallows to None");
+
+        // …while each NAMED run answers for itself, with numbers that differ.
+        assert_eq!(slot_info(&data, id, "rvc", Some(a)).unwrap().best_resume_step, Some(1400));
+        assert_eq!(slot_info(&data, id, "rvc", Some(b)).unwrap().best_resume_step, Some(900));
+        for (rid, want) in [(a, "歌姫A"), (b, "歌姫B")] {
+            let dir = trun::resolve_run_dir(&slot, Some(rid)).unwrap();
+            assert_eq!(tproject::run_model_name(&dir).as_deref(), Some(want), "{rid}");
+        }
+        // a name that is not there is an ERROR, never a fallback to「随便挑一个」
+        assert!(trun::resolve_run_dir(&slot, Some("rccccccccccccc")).is_err());
+
+        // the archive inventory attributes every row, and asking one run's rows gives that run's
+        // resume point — the number the run's row on the project page prints.
+        let recs = tproject::scan_project_ckpts(&data, id, Some("rvc"));
+        assert!(!recs.is_empty());
+        for r in &recs {
+            assert!(r.run_id == a || r.run_id == b, "unattributed row {}", r.rel);
+        }
+        // ⚠ The property is「它永不跨 run」, NOT a particular step number: the ordering these
+        // functions work over is mtime, and two runs built inside one test tick can tie. Asserting
+        // an invented step here would be my own expectation dressed as a fact — and a flaky one.
+        for rid in [a, b] {
+            let mine: Vec<&tproject::CkptRecord> =
+                recs.iter().filter(|r| r.run_id == rid).collect();
+            assert!(mine.len() < recs.len(), "{rid}: the filter must actually filter");
+            let picked = tproject::default_resume_record_of(&mine)
+                .unwrap_or_else(|| panic!("{rid}: a run with checkpoints has a resume point"));
+            assert_eq!(picked.run_id, rid, "{rid}: a run's row must never name another run's file");
+            assert!(
+                !picked.rel.contains("/resume_best/"),
+                "{rid}: the S118 rule must survive the per-run split — a default 续训 continues \
+                 from the latest, so naming the BEST snapshot is a step the button will not use"
+            );
+        }
+        // …and the SLOT-level answer cannot tell them apart: it names exactly one of the two runs,
+        // which is precisely why the row on the project page had to stop using it.
+        let slot_wide = tproject::default_resume_record(&recs).unwrap();
+        assert!(slot_wide.run_id == a || slot_wide.run_id == b);
+
+        // every run is still visible to the SLOT-level questions (bytes, wipe consent)
+        assert_eq!(trun::run_dirs(&slot).len(), 2);
+        assert!(slot_holds_work(&slot));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔ §F2⒝ batch 2 — THE test for the previous batch, because that batch moved no bytes.
     ///
     /// Every other test in this file still exercises the layout-≤2 arm, and every one of them
     /// would stay green if not a single reader had been re-pointed at the run. So: build the same
@@ -4274,7 +4386,7 @@ mod tests {
             assert!(slot_holds_work(&slot), "{where_}: a wipe here would destroy real work");
                 assert_eq!(trun::resolve_run_dir(&slot, None).unwrap().path(), home, "{where_}");
 
-            let info = slot_info(&data, id, "rvc").unwrap();
+            let info = slot_info(&data, id, "rvc", None).unwrap();
             assert!(info.exists, "{where_}");
             assert!(info.has_main_progress, "{where_}: G_*.pth is the diff-partial-wipe judge");
             assert_eq!(info.version, "v2", "{where_}");
@@ -4348,7 +4460,7 @@ mod tests {
         );
         assert!(slot_holds_work(&slot));
         assert!(
-            slot_info(&data, id, "rvc").is_err(),
+            slot_info(&data, id, "rvc", None).is_err(),
             "「这个 run 练到哪了」has no answer without being told which run"
         );
 
@@ -4388,7 +4500,11 @@ mod tests {
             "`run_manifest.json` is written before the post-wipe run is resolved"
         );
         // …and the PRE-wipe resolution has to stay where it is: the guards judge the pre-wipe state
-        let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, None)?;");
+        // ⚠ step ④ re-anchored this: the guards' run is now the one the REQUEST names, so the
+        // needle is the resolver call, not the literal `None` it used to pass. The anchor was
+        // deliberately NOT loosened to just `resolve_run_dir` — that substring also matches the two
+        // calls inside the dataset pre-check above, and this assertion is about THIS one.
+        let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, req_run)?;");
         assert!(
             guard_resolve < wipe,
             "the guards' run is resolved after the wipe — they exist to judge what the wipe would \

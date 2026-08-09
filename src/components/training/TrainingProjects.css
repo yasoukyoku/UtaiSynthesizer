@@ -263,6 +263,38 @@
   padding-top: var(--space-sm);
 }
 
+/* ★§F2⒝ 批 2 ④ —— 槽卡片里的【一个 run 一行】。方角、无圆角、无 emoji(UI 铁律);
+   左侧一条竖线是唯一的装饰,作用是让 N 行读起来是「同一个槽下的并列项」而不是 N 张卡片。 */
+.tproj-run {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding-left: var(--space-sm);
+  border-left: 2px solid var(--border-subtle);
+}
+
+.tproj-slot.started .tproj-run {
+  border-left-color: var(--accent-primary-dim);
+}
+
+.tproj-run-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.tproj-run-name {
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+/* 每行自己的动作条:不吃 `margin-top: auto`(那是槽底部按钮的定位),否则 N 行会被推开。 */
+.tproj-run .tproj-slot-actions {
+  margin-top: 0;
+  padding-top: var(--space-xs);
+}
+
 .tproj-slot-host {
   display: flex;
   align-items: center;

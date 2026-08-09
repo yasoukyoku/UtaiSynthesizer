@@ -14,6 +14,7 @@ const rec = (over: Partial<CkptRecord> = {}): CkptRecord => ({
   rel: "rvc/weights/m_e1_s100.pth",
   path: "D:\\data\\training\\p\\rvc\\weights\\m_e1_s100.pth",
   family: "rvc",
+  runId: "",
   kind: "release",
   step: 100,
   bytes: 55,

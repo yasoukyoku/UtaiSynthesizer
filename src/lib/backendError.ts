@@ -435,6 +435,18 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // workspace that holds checkpoints / an imported dataset. Reaching a user means a UI probe
   // failed — modal, because the remedy is「重新点开始并在对话框里选重训」, not a retry.
   TRAINING_WIPE_NOT_CONFIRMED: { key: "backend.TRAINING_WIPE_NOT_CONFIRMED", modal: true },
+  // ★§F2⒝ 批 2 ④ —— 批 1-3 引入的训练布局 CODE。它们在 ④ 之前【结构上不可达】(每个槽恒一个 run),
+  // 而 ④ 让第一条真的可达 —— 没有这张表的话,用户看到的是一串带绝对路径的英文 Rust 字符串。
+  RUN_AMBIGUOUS: { key: "backend.RUN_AMBIGUOUS", modal: true },
+  RUN_NOT_FOUND: { key: "backend.RUN_NOT_FOUND" },
+  RUN_ID_INVALID: { key: "backend.RUN_ID_INVALID" },
+  RUN_CREATE_FAILED: { key: "backend.RUN_CREATE_FAILED", modal: true },
+  RUN_MIGRATE_FAILED: { key: "backend.RUN_MIGRATE_FAILED", modal: true },
+  SLOT_MIGRATE_FAILED: { key: "backend.SLOT_MIGRATE_FAILED", modal: true },
+  SLOT_META_WRITE_FAILED: { key: "backend.SLOT_META_WRITE_FAILED" },
+  SLOT_META_ENCODE_FAILED: { key: "backend.SLOT_META_ENCODE_FAILED" },
+  TRAINING_MIGRATE_UNDO_BLOCKED: { key: "backend.TRAINING_MIGRATE_UNDO_BLOCKED", modal: true },
+  TRAINING_SCAN_JOIN: { key: "backend.TRAINING_SCAN_JOIN" },
   UPDATE_CHECK_FAILED: { key: "backend.UPDATE_CHECK_FAILED" },
   UPDATE_DOWNLOAD_FAILED: { key: "backend.UPDATE_DOWNLOAD_FAILED" },
   UPDATE_INSTALL_FAILED: { key: "backend.UPDATE_INSTALL_FAILED" },

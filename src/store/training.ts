@@ -103,6 +103,17 @@ export interface CkptRecord {
   rel: string;
   path: string;
   family: string;
+  /** ★§F2⒝ 批 2 ④ — 这份存档出自哪个 run(`trun::run_id_in_rel`)。
+   *
+   *  `""` = **槽根就是那个 run**(layout ≤2)—— 肯定事实,不是缺席。
+   *  `null` = 只有前端造的 `pending` 行才会有:它的 `rel` 是事件里的绝对路径**砍成最后两段**
+   *  拼的,`runs/<id>/` 那一层压根不在里面。填 `""` 会把它说成「槽根那个 run」,而那正是
+   *  layout 3 下**不存在**的东西 ⇒ 分组时会凭空多出一个空 run。这一行只活到下一次磁盘扫描,
+   *  而扫描出来的行带着真的 id,所以「不知道」才是它诚实的值。
+   *
+   *  存档中心一张表列整个 family:没有这个字段,两个 run 的存档只按 mtime 交织,行上没有
+   *  任何东西说它属于哪个模型,而「导入」会给两边提议同一个名字。 */
+  runId: string | null;
   /** base = the seeded pretrained (not the user's work); release/best = generator-only
    *  snapshots you import; resumable = training can continue from it. */
   /** Mirrors Rust `CkptKind` (six variants) plus the frontend-only `pending`. `final` was
@@ -143,6 +154,9 @@ export function mergeCkptSources(
       rel: c.path.replace(/\\/g, "/").split("/").slice(-2).join("/"),
       path: c.path,
       family,
+      // ★§F2⒝ 批 2 ④ —— **不猜**(见 `CkptRecord.runId` 的注释:`""` 是「槽根就是 run」这个
+      // 肯定事实,不是「不知道」)。
+      runId: null,
       // Do NOT infer a kind here. The event only says periodic/best/final/stop, and the same
       // file can be a release snapshot (rvc/sovits weights) or a resume point (diffusion
       // model_<step>.pt) depending on family — guessing made a diffusion ckpt read「快照」for
@@ -186,16 +200,32 @@ export interface ProjectSummary {
   missing: boolean;
 }
 
-/** Mirror of Rust `commands::training::SlotDetail`. */
-export interface SlotDetail {
-  family: string;
-  /** The「本次训练名」this slot's artifacts carry. "" = never ran, so the next run may choose. */
+/** Mirror of Rust `commands::training::RunDetail` —— **一个 run**,不是一个槽。
+ *
+ *  ★§F2⒝ 批 2 ④:这里每个字段都是 run 事实。以前它们挂在槽上,而回答它们的解析器在
+ *  「一个槽有两个 run」时**拒绝作答** —— 于是四个槽经同一个 `Result` 收集,一个歧义槽会让
+ *  整个项目详情页打不开。所以形状先变复数,再谈铸第二个 run。 */
+export interface RunDetail {
+  /** `trun` run id。`""` = 未迁移槽的槽根就是那个 run(layout ≤2);命令收 `runId?: string`,
+   *  不传 = 同一个意思。 */
+  id: string;
+  /** 这个 **run** 的「本次训练名」(读它自己的 `run.json`)。"" = 它还没跑完过。 */
   modelName: string;
   info: WorkspaceInfo;
-  bytes: number;
   /** null WITH hasResumePoint = RVC's「只保留最新」sentinel, whose name carries no step. */
   resumeStep: number | null;
   hasResumePoint: boolean;
+  ckptCount: number;
+  ckptBytes: number;
+}
+
+/** Mirror of Rust `commands::training::SlotDetail`. */
+export interface SlotDetail {
+  family: string;
+  /** 这个槽的每个 run,按 id 排序。今天恒为 1 条。 */
+  runs: RunDetail[];
+  bytes: number;
+  /** 槽**总计**(逐 run 求和)—— 「这个架构占多大」是槽问题,不是 run 问题。 */
   ckptCount: number;
   ckptBytes: number;
   /** ★§F2⒝ — PREPROCESSING pools in this slot (a different thing from this store's `poolCount`,
@@ -460,6 +490,12 @@ export interface TrainingSnapshot {
 
 export interface TrainingFormConfig {
   modelName: string;
+  /** ★§F2⒝ 批 2 ④ —— 这次开始训练**针对哪个 run**。`""` = 「这个槽最多只有一个 run」,
+   *  正是 `trun::resolve_run_dir` 断言并**拒绝猜**的那个肯定事实。
+   *
+   *  ⚠ 它是**产物选择器**,不是锁表的一行(和 `resumeFrom` 同一个定位):它决定读写哪一份
+   *  已有产物,不改变这个槽被允许持有什么。 */
+  runId: string;
   /** sovits_v2 = SoVITS 4.0-v2 (VISinger2, S68) — its own backend/workspace
    *  family; it SHARES the sovits* form fields below (same 44.1k step-cadenced
    *  shape; v2-less switches — volEmbedding/fp16/allInMem — are hidden). */
@@ -559,6 +595,7 @@ export const IDLE_SNAPSHOT: TrainingSnapshot = {
 
 const DEFAULT_CONFIG: TrainingFormConfig = {
   modelName: "",
+  runId: "",
   backend: "rvc",
   version: "v2",
   sampleRate: "48k",
@@ -733,9 +770,12 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
       projectDataset: d?.dataset ?? null,
       poolCount: d?.dataset.files ?? 0,
       poolFlat: !!d && d.dataset.files > 0 && d.dataset.speakers.length === 0,
+      // ★§F2⒝ 批 2 ④ —— 对每个 run 求或(与 ProjectDetail 的 `dataHasDependents` 同一条规则)。
       projectHasProgress:
-        d?.slots.some((s) => s.hasResumePoint || s.info.has_main_progress || s.ckptCount > 0) ??
-        false,
+        d?.slots.some(
+          (s) =>
+            s.ckptCount > 0 || s.runs.some((r) => r.hasResumePoint || r.info.has_main_progress),
+        ) ?? false,
     }) ,
 
   refreshProjectDataset: async () => {
@@ -993,6 +1033,9 @@ export const useTrainingStore = create<TrainingStoreState>((set, get) => ({
         // request builder normalizes "" -> "latest", so an old payload and a fresh run behave
         // exactly as they did before this existed.
         resume_from: fresh ? "" : (resumeFrom ?? "latest"),
+        // ★§F2⒝ 批 2 ④ —— 同样是「空串而不是省略」:Rust 那边是 `#[serde(default)] String`,
+        // 而 `run_id_of` 把空串归成 `None`,于是旧载荷与今天的每槽一 run 行为逐字节相同。
+        run_id: config.runId,
       };
       const request =
         config.backend === "rvc"

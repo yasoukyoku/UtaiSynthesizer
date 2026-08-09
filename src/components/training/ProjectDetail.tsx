@@ -25,6 +25,7 @@ import {
   trainingDataOk,
   type ProjectDetail as ProjectDetailData,
   type SlotDetail,
+  type RunDetail,
   type TrainingBackend,
   type TrainingFormConfig,
   type TrainingSeg,
@@ -84,7 +85,9 @@ export function ProjectDetail() {
    *  full re-extraction on the next run — worth one confirmation. With nothing trained yet it is
    *  free, and a dialog per file would just be in the way. */
   const dataHasDependents = (d: ProjectDetailData) =>
-    d.slots.some((s) => s.hasResumePoint || s.info.has_main_progress || s.ckptCount > 0);
+    // ★§F2⒝ 批 2 ④ —— 对**每个** run 求或。这是一道「要不要确认」的闸,漏看一个 run 就是
+    // fail-open:代价落在那个 run 的几小时预处理上,而对话框根本不会弹。
+    d.slots.some((s) => s.ckptCount > 0 || s.runs.some((r) => r.hasResumePoint || r.info.has_main_progress));
 
   const addFilesTo = async (speaker?: string) => {
     const picked = await open({
@@ -175,10 +178,14 @@ export function ProjectDetail() {
     return ready ? "params" : "data";
   };
 
-  /** The name this run's ARTIFACTS will carry. Frozen once a slot has produced any, because it
-   *  is baked into every file name in `weights/`. */
-  const askRunName = async (slot: SlotDetail | undefined): Promise<string | null> => {
-    if (slot?.modelName) return slot.modelName;
+  /** The name this run's ARTIFACTS will carry. Frozen once THIS RUN has produced any, because it
+   *  is baked into every file name in its `weights/`.
+   *
+   *  ★§F2⒝ 批 2 ④ —— 参数从槽换成 **run**。这不只是「换个取值处」:名字是 `slugify` 的输入,
+   *  而 slug 是 `dataset_44k/<slug>/`、`config.spk` 的键和 `weights/<slug>*` 的前缀。槽级取值在
+   *  两个 run 之后会给**每一个** run 回答最后那个 run 的名字。 */
+  const askRunName = async (run: RunDetail | undefined): Promise<string | null> => {
+    if (run?.modelName) return run.modelName;
     const name = await showConfirm({
       title: t("training.runNameTitle"),
       body: t("training.runNameBody"),
@@ -208,10 +215,10 @@ export function ProjectDetail() {
    *  legitimately change the version. */
   const formForSlot = (
     family: Family,
-    slot: SlotDetail | undefined,
+    run: RunDetail | undefined,
     pin?: "4.1" | "4.0",
   ): Partial<TrainingFormConfig> => {
-    const info = slot?.info;
+    const info = run?.info;
     if (family === "rvc") {
       const v = info?.version === "v1" || info?.version === "v2" ? info.version : undefined;
       const sr =
@@ -242,16 +249,24 @@ export function ProjectDetail() {
     setRoute({ seg: "archive", projectId });
   };
 
-  const startFamily = async (family: Family, sovitsVersion?: "4.1" | "4.0") => {
-    const slot = slots.get(family);
-    const runName = await askRunName(slot);
+  /** 继续训练 / 首次开始 —— `run` 是要继续的**那一个** run(未开始的槽只有一条占位 run)。 */
+  const startFamily = async (
+    family: Family,
+    run: RunDetail | undefined,
+    sovitsVersion?: "4.1" | "4.0",
+  ) => {
+    const runName = await askRunName(run);
     if (runName === null) return;
-    // 继续训练 / 首次开始:the slot's frozen values stand, so the params page locks them.
+    // 继续训练 / 首次开始:this run's frozen values stand, so the params page locks them.
     useTrainingStore.getState().setRetrainIntent(false);
     updateConfig({
       backend: family,
       modelName: runName,
-      ...formForSlot(family, slot, sovitsVersion),
+      // ★§F2⒝ 批 2 ④ —— 把「哪个 run」一路带到 start_training。今天恒为 ""(每槽一个 run),
+      // 但它必须**在铸第二个 run 之前**就通到底:`resolve_run_dir` 对多于一个 run 拒绝作答,
+      // 所以漏穿的调用点是响亮的错误,而不是悄悄写进别人的 run。
+      runId: run?.id ?? "",
+      ...formForSlot(family, run, sovitsVersion),
     });
     setRoute({ seg: nextSegFor(family), projectId });
   };
@@ -259,7 +274,7 @@ export function ProjectDetail() {
   /** 再训一个:说清楚代价再走。真正的擦除同意仍然只有一处 —— 运行段「开始训练」那个
    *  续训/重训对话框(后端的 wipe_confirmed 就认它)。这里不重复那道门,只负责让用户在点进去
    *  之前就知道会发生什么。 */
-  const retrainFamily = async (family: Family) => {
+  const retrainFamily = async (family: Family, run: RunDetail | undefined) => {
     const slot = slots.get(family);
     // ★ The SoVITS slot holds both 4.1 and 4.0, and the version can only ever change on a
     // retrain (a resume is version-locked). With the old target step gone, this dialog is the
@@ -290,8 +305,11 @@ export function ProjectDetail() {
     useTrainingStore.getState().setRetrainIntent(true);
     updateConfig({
       backend: family,
-      modelName: slot?.modelName || detail?.name || "",
-      ...formForSlot(family, slot, pin),
+      modelName: run?.modelName || detail?.name || "",
+      // 今天这条路仍然是「清空这个槽重来」(⑤ 才把它变成新建 run),所以它带的正是被清空的
+      // 那个 run 的 id —— 后端的每一道闸都要判**它**的 pre-wipe 状态。
+      runId: run?.id ?? "",
+      ...formForSlot(family, run, pin),
     });
     setRoute({ seg: nextSegFor(family), projectId });
   };
@@ -305,9 +323,8 @@ export function ProjectDetail() {
    *  已安装模型的名字后训练,而浅扩散 run 会整体重写 `<project>/sovits/run.json` —— 于是宿主槽
    *  的「本次训练名」被悄悄改掉(正是本文件第 3 条要防的);跳过去的项目若被标记 needsAttention
    *  也照进不误;模型没有项目时还会凭空建一个。 */
-  const startDiff = async (version: "4.1" | "4.0") => {
-    const slot = slots.get("sovits");
-    const runName = await askRunName(slot);
+  const startDiff = async (version: "4.1" | "4.0", run: RunDetail | undefined) => {
+    const runName = await askRunName(run);
     if (runName === null) return;
     // Fetch the slot's REAL facts BEFORE touching the form. Two things depend on them and both
     // fail quietly if guessed —
@@ -322,6 +339,9 @@ export function ProjectDetail() {
       info = await invoke<WorkspaceInfo>("get_training_slot_info", {
         projectId,
         backend: "sovits_diff",
+        // 浅扩散跑在**主模型那个 run** 的目录里(`runs/<主 run>/diffusion/`),两道 config.json
+        // 闸就挂在「相邻」上 —— 所以问的必须是同一个 run。
+        runId: run?.id ?? "",
       });
       useTrainingStore.getState().setDiffWsInfo(info);
     } catch {
@@ -331,6 +351,7 @@ export function ProjectDetail() {
     updateConfig({
       backend: "sovits_diff",
       modelName: runName,
+      runId: run?.id ?? "",
       // ★ DERIVED from the slot whenever it has one: the diffusion has to live in the same
       //   ContentVec space as the cached features it trains on (4.1 = vec768 / 4.0 = vec256).
       //   A mismatch does not error — it just produces something that does not fit its host.
@@ -381,13 +402,18 @@ export function ProjectDetail() {
   // actions are dead ends dressed as buttons.
   const blocked = !!detail.needsAttention;
   const sovitsSlot = slots.get("sovits");
+  /** ★§F2⒝ 批 2 ④ —— 浅扩散跑在**主模型那个 run** 里(`runs/<主 run>/diffusion/`),所以这张
+   *  卡问的是「哪个 run 里有主模型」。今天每槽恒一个 run,所以它就是那一个;两个 run 之后
+   *  这条 `find` 是「挂到有主模型的那个」这个**肯定事实**,不是「挑第一个」。 */
+  const diffHost =
+    sovitsSlot?.runs.find((r) => r.info.has_main_progress) ?? sovitsSlot?.runs[0];
   /** The ContentVec space this project's sovits slot is already committed to, if any. Shallow
    *  diffusion trains on that slot's cached features, so a manifest version PINS it. */
   const sovitsVersionPinned =
-    sovitsSlot?.info.version === "4.1" || sovitsSlot?.info.version === "4.0"
-      ? sovitsSlot.info.version
+    diffHost?.info.version === "4.1" || diffHost?.info.version === "4.0"
+      ? diffHost.info.version
       : undefined;
-  const diffSteps = sovitsSlot?.info.diff_steps ?? 0;
+  const diffSteps = diffHost?.info.diff_steps ?? 0;
 
   return shell(
     <>
@@ -556,23 +582,44 @@ export function ProjectDetail() {
         <div className="tproj-slots">
           {FAMILIES.map((f) => {
             const slot = slots.get(f);
-            const started = !!slot && (slot.hasResumePoint || slot.info.has_main_progress);
+            // ★§F2⒝ 批 2 ④ —— 这张卡从此是「一个槽 + 它的每个 run」。今天恒一条,所以视觉上
+            // 与改动前几乎相同;形状先变复数,是因为回答「这个 run 练到哪了」的解析器在两个
+            // run 之后**拒绝作答**,而四个槽是经同一个 `Result` 收上来的。
+            const runs = slot?.runs ?? [];
+            const startedRun = (r: RunDetail) => r.hasResumePoint || r.info.has_main_progress;
+            const started = runs.some(startedRun);
             return (
               <div key={f} className={`tproj-slot ${started ? "started" : ""}`}>
                 <div className="tproj-slot-head">
                   <span className="tproj-slot-name">{t(FAMILY_TEXT[f].label)}</span>
-                  {slot?.info.version && (
-                    <span className="tproj-slot-ver">{slot.info.version}</span>
+                  {runs.length > 1 && (
+                    <span className="tproj-slot-ver">
+                      {t("training.slotRunCount", { count: runs.length })}
+                    </span>
                   )}
                 </div>
                 <div className="tproj-slot-desc">{t(FAMILY_TEXT[f].desc)}</div>
-                <div className="tproj-slot-facts">
-                  {started ? (
-                    <>
+                {!started && (
+                  <div className="tproj-slot-facts">
+                    <span>{t("training.slotNotStarted")}</span>
+                  </div>
+                )}
+                {/* ── 每个 run 一行 ─────────────────────────────────────────── */}
+                {runs.filter(startedRun).map((r) => (
+                  <div key={r.id} className="tproj-run">
+                    <div className="tproj-run-head">
+                      <span className="tproj-run-name">
+                        {r.modelName
+                          ? t("training.runNameFrozen", { name: r.modelName })
+                          : t("training.runUnnamed")}
+                      </span>
+                      {r.info.version && <span className="tproj-slot-ver">{r.info.version}</span>}
+                    </div>
+                    <div className="tproj-slot-facts">
                       <span>
-                        {slot?.hasResumePoint
-                          ? slot.resumeStep != null
-                            ? t("training.slotResume", { step: slot.resumeStep })
+                        {r.hasResumePoint
+                          ? r.resumeStep != null
+                            ? t("training.slotResume", { step: r.resumeStep })
                             : t("training.slotResumeLatest")
                           : t("training.slotNoResume")}
                       </span>
@@ -586,87 +633,87 @@ export function ProjectDetail() {
                         onClick={() => openArchive(f)}
                         title={t("training.archiveOpen")}
                       >
-                        {t("training.slotArchive", { size: fmtSize(slot?.ckptBytes ?? 0) })}
+                        {t("training.slotArchive", { size: fmtSize(r.ckptBytes) })}
                       </button>
-                      {/* ★§F2⒝ — the accumulating half of the layout change, made visible where
-                          the slot's other sizes already are. A preprocessing parameter change no
-                          longer deletes the previous products, so without this line the disk
-                          would simply grow with no explanation anywhere in the app. */}
-                      {(slot?.prepPoolCount ?? 0) > 0 && (
-                        <>
-                          <span className="tproj-dot">·</span>
-                          <span title={t("training.slotPrepPoolsHint")}>
-                            {t("training.slotPrepPools", {
-                              count: slot?.prepPoolCount ?? 0,
-                              size: fmtSize(slot?.prepPoolBytes ?? 0),
-                            })}
+                    </div>
+                    {/* ★ The emb_g order THIS RUN froze. This is the authoritative answer to
+                        「这个模型的 0 号歌手是谁」, and continuing it demands the exact same order
+                        (RESUME_SPEAKER_SET_MISMATCH) — so it belongs on the row that offers 继续训练,
+                        never on the slot: two runs may have frozen different orders. */}
+                    {r.info.speakers.length > 1 && (
+                      <div className="tproj-slot-spk">
+                        <span className="tproj-ds-sub" title={t("training.projectDatasetOrderNote")}>
+                          {t("training.slotSpeakers")}
+                        </span>
+                        {r.info.speakers.map((n, i) => (
+                          <span key={`${i}:${n}`} className="tproj-slot-spk-item">
+                            <span className="training-spk-idx">{i}</span>
+                            <span className="tproj-slot-spk-name">{n}</span>
                           </span>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <span>{t("training.slotNotStarted")}</span>
-                  )}
-                </div>
-                {slot?.modelName && (
-                  <div className="tproj-slot-run">
-                    {t("training.runNameFrozen", { name: slot.modelName })}
-                  </div>
-                )}
-                {/* ★ The emb_g order this SLOT froze — per-slot by nature, because each slot
-                    trained its own rows. This is the authoritative answer to「这个模型的 0 号
-                    歌手是谁」, and it has been available in `info.speakers` since ①c with
-                    nothing reading it. Continuing this run demands the exact same order
-                    (RESUME_SPEAKER_SET_MISMATCH), so it belongs on the card that offers 继续训练. */}
-                {slot && slot.info.speakers.length > 1 && (
-                  <div className="tproj-slot-spk">
-                    <span
-                      className="tproj-ds-sub"
-                      title={t("training.projectDatasetOrderNote")}
-                    >
-                      {t("training.slotSpeakers")}
-                    </span>
-                    {slot.info.speakers.map((n, i) => (
-                      <span key={`${i}:${n}`} className="tproj-slot-spk-item">
-                        <span className="training-spk-idx">{i}</span>
-                        <span className="tproj-slot-spk-name">{n}</span>
-                      </span>
-                    ))}
-                  </div>
-                )}
-                <div className="tproj-slot-actions">
-                  {f === "sovits" && !started ? (
-                    // The two SoVITS cards of the old target step: 4.1 and 4.0 write into the
-                    // same slot, and the choice is only available while it is empty.
-                    (["4.1", "4.0"] as const).map((v) => (
+                        ))}
+                      </div>
+                    )}
+                    <div className="tproj-slot-actions">
                       <button
-                        key={v}
+                        className="training-btn small primary"
+                        disabled={blocked}
+                        onClick={() => void startFamily(f, r)}
+                      >
+                        {t("training.slotContinue")}
+                      </button>
+                      <button
                         className="training-btn small"
                         disabled={blocked}
-                        onClick={() => void startFamily("sovits", v)}
+                        onClick={() => void retrainFamily(f, r)}
                       >
-                        {t("training.slotStartVersion", { version: v })}
+                        {t("training.slotRetrain")}
                       </button>
-                    ))
-                  ) : (
-                    <button
-                      className="training-btn small primary"
-                      disabled={blocked}
-                      onClick={() => void startFamily(f)}
-                    >
-                      {started ? t("training.slotContinue") : t("training.slotStart")}
-                    </button>
-                  )}
-                  {started && (
-                    <button
-                      className="training-btn small"
-                      disabled={blocked}
-                      onClick={() => void retrainFamily(f)}
-                    >
-                      {t("training.slotRetrain")}
-                    </button>
-                  )}
-                </div>
+                    </div>
+                  </div>
+                ))}
+                {/* ★§F2⒝ — the accumulating half of the layout change, made visible where the
+                    slot's other sizes already are. A preprocessing parameter change no longer
+                    deletes the previous products, so without this line the disk would simply
+                    grow with no explanation anywhere in the app. SLOT-level: the pool is shared
+                    by every run of it, which is the entire point of layout 2. */}
+                {(slot?.prepPoolCount ?? 0) > 0 && (
+                  <div className="tproj-slot-facts">
+                    <span title={t("training.slotPrepPoolsHint")}>
+                      {t("training.slotPrepPools", {
+                        count: slot?.prepPoolCount ?? 0,
+                        size: fmtSize(slot?.prepPoolBytes ?? 0),
+                      })}
+                    </span>
+                  </div>
+                )}
+                {/* 槽级动作 = 「开始」。「继续 / 重训」挂在**每个 run 的那一行**上,因为它们
+                    问的是「这一个 run」;放在槽上就必须替用户挑一个,而那正是被判死的规则。 */}
+                {!started && (
+                  <div className="tproj-slot-actions">
+                    {f === "sovits" ? (
+                      // The two SoVITS cards of the old target step: 4.1 and 4.0 write into the
+                      // same slot, and the choice is only available while it is empty.
+                      (["4.1", "4.0"] as const).map((v) => (
+                        <button
+                          key={v}
+                          className="training-btn small"
+                          disabled={blocked}
+                          onClick={() => void startFamily("sovits", runs[0], v)}
+                        >
+                          {t("training.slotStartVersion", { version: v })}
+                        </button>
+                      ))
+                    ) : (
+                      <button
+                        className="training-btn small primary"
+                        disabled={blocked}
+                        onClick={() => void startFamily(f, runs[0])}
+                      >
+                        {t("training.slotStart")}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -692,7 +739,7 @@ export function ProjectDetail() {
                 <button
                   className="training-btn small primary"
                   disabled={blocked}
-                  onClick={() => void startDiff(sovitsVersionPinned)}
+                  onClick={() => void startDiff(sovitsVersionPinned, diffHost)}
                 >
                   {diffSteps > 0 ? t("training.slotContinue") : t("training.slotStart")}
                 </button>
@@ -704,7 +751,7 @@ export function ProjectDetail() {
                     key={v}
                     className="training-btn small"
                     disabled={blocked}
-                    onClick={() => void startDiff(v)}
+                    onClick={() => void startDiff(v, diffHost)}
                   >
                     {t("training.slotStartVersion", { version: v })}
                   </button>

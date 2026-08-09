@@ -5,6 +5,25 @@ use tauri::State;
 use crate::training::{StartTrainingRequest, StepPoint, TrainingSnapshot};
 use crate::AppState;
 
+/// The run a start request addresses, in the shape `trun` takes.
+///
+/// ★§F2⒝ batch 2 step ④ — `""` and `None` mean the SAME thing here ("the slot holds at most one
+/// run"), and they have to: the field is `#[serde(default)]`, so an older frontend and every
+/// non-run-aware caller send the empty string, and mapping that to `Some("")` would ask
+/// `resolve_run_dir` for a run literally named `""` and get `RUN_ID_INVALID` on every start.
+fn run_id_of(req: &StartTrainingRequest) -> Option<&str> {
+    opt_run_id(&req.run_id)
+}
+
+/// Same normalization for the commands that take `run_id: Option<String>` over IPC.
+///
+/// ⛔ `Some("")` must never reach `trun::resolve_run_dir`: it would look for a run literally named
+/// `""`, fail `run_id_is_usable`, and answer `RUN_ID_INVALID` — turning "this slot has one run"
+/// (which every caller means by an empty string) into a hard error on every call.
+fn opt_run_id(s: &str) -> Option<&str> {
+    Some(s.trim()).filter(|s| !s.is_empty())
+}
+
 fn data_root(state: &AppState) -> PathBuf {
     // data root = parent of the models dir (data/models -> data/)
     state
@@ -58,7 +77,10 @@ pub async fn start_training(
         )
     };
     // ★§F2⒝ batch 2 — the cache is a RUN product, so the cleanup below has to name the run.
-    let audition_dir = crate::training::trun::resolve_run_dir(&slot, None)
+    // ⛔ step ④: the run the REQUEST names. Resolving `None` here once a slot holds several runs
+    // is not a wrong number, it is `remove_dir_all` of another run's converted .onnx — and of the
+    // measured vocal range stored beside it in `model.json`, which nothing re-measures.
+    let audition_dir = crate::training::trun::resolve_run_dir(&slot, run_id_of(&request))
         .map_err(|e| e.to_string())?
         .join("audition");
     // BEFORE manager.start(): drop every audition session (file locks) so the
@@ -433,21 +455,47 @@ pub async fn forget_training_project(
     Ok(())
 }
 
+/// ONE RUN of one architecture slot, as the detail page's run list shows it.
+///
+/// ★§F2⒝ batch 2 step ④. Every field here is a RUN fact and was previously read off the slot
+/// through a resolver that refuses to answer once there are two runs — which is why splitting the
+/// shape had to come BEFORE anything mints a second run, not after: the failure of the old shape
+/// is `slot_info` returning `Err`, and `get_training_project` collects the four slots through one
+/// `Result`, so a single two-run slot took the whole project page down.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDetail {
+    /// `trun` run id. Empty string = an UNMIGRATED slot whose root is the run (layout ≤ 2) —
+    /// a positive fact, not a missing value, and the same one `trun::resolve_run_dir` encodes by
+    /// answering with the slot root. Commands take `run_id: Option<String>` and `None` means
+    /// exactly this.
+    pub id: String,
+    /// The「本次训练名」THIS run's artifacts were built under (`weights/<slug>*`, `hps.name`),
+    /// read from its own `run.json`. Empty = it never completed a run.
+    pub model_name: String,
+    pub info: crate::training::WorkspaceInfo,
+    /// Newest checkpoint training can CONTINUE from, within THIS run. `None` with
+    /// `has_resume_point` still true is RVC's「只保留最新」sentinel, whose file name carries no step.
+    pub resume_step: Option<u64>,
+    pub has_resume_point: bool,
+    /// What the archive list would show FOR THIS RUN, and what it weighs.
+    pub ckpt_count: u32,
+    pub ckpt_bytes: u64,
+}
+
 /// One architecture slot of a project, as the detail page shows it.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlotDetail {
     pub family: String,
-    /// The「本次训练名」this slot's artifacts were built under (`weights/<slug>*`, `hps.name`).
-    /// Empty = this slot never completed a run, so the next one may choose freely.
-    pub model_name: String,
-    pub info: crate::training::WorkspaceInfo,
+    /// ★§F2⒝ batch 2 step ④ — every run this slot holds, sorted by id (see `trun::list_runs`).
+    /// Exactly one entry for every slot that exists today; the shape is plural first so that the
+    /// batch which mints a second one changes no consumer.
+    pub runs: Vec<RunDetail>,
     pub bytes: u64,
-    /// Newest checkpoint training can CONTINUE from. `None` with `has_resume_point` still true
-    /// is RVC's「只保留最新」sentinel, whose file name carries no step.
-    pub resume_step: Option<u64>,
-    pub has_resume_point: bool,
-    /// Everything under this slot that the archive list would show, and what it weighs.
+    /// Everything under this slot that the archive list would show, and what it weighs —
+    /// the SLOT total, summed over runs. Kept alongside the per-run numbers because the
+    /// destructive/disk questions ("how big is this architecture") are slot questions.
     pub ckpt_count: u32,
     pub ckpt_bytes: u64,
     /// ★§F2⒝ — how many PREPROCESSING pools this slot holds, and what they weigh.
@@ -661,16 +709,26 @@ pub async fn get_slot_export_context(
     state: State<'_, Arc<AppState>>,
     project_id: String,
     backend: String,
+    run_id: Option<String>,
 ) -> Result<SlotExportContext, String> {
     checked_project_id(&project_id)?;
     let data_dir = data_root(&state);
     let family = crate::training::backend_family(&backend);
     let slot = crate::training::tproject::family_dir(&data_dir, &project_id, family);
-    let ws = crate::training::trun::resolve_run_dir(&slot, None).map_err(|e| e.to_string())?;
+    // ★§F2⒝ batch 2 step ④ — the SILENT twin of the project-detail coupling, and the reason this
+    // command had to take a run id in the same batch as the run list. Its Err is CAUGHT by the
+    // frontend (`TrainingPage`'s archive context probe), which then falls back to an empty
+    // workspace string — and an empty string is not a visible failure, it is a WRONG ANSWER that
+    // keeps going: `resolveIndexPath` probes a path under `""`, misses, and passes `index_file:
+    // None` to `import_model`; that skips the WARN_INDEX_MISSING branch entirely and runs the
+    // auto-detect BESIDE THE CHECKPOINT (`<run>/weights/`), where RVC's `total_fea.npy` has never
+    // lived. Result: the model installs with no retrieval matrix, no warning, no CODE, no toast —
+    // it only sounds wrong.
+    let ws = crate::training::trun::resolve_run_dir(&slot, opt_run_id(run_id.as_deref().unwrap_or("")))
+        .map_err(|e| e.to_string())?;
     let index_path = run_index_path(&ws, &backend);
     Ok(SlotExportContext {
-        model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, family)
-            .unwrap_or_default(),
+        model_name: crate::training::tproject::run_model_name(&ws).unwrap_or_default(),
         workspace: ws.to_string_lossy().into_owned(),
         index_path,
     })
@@ -851,37 +909,63 @@ pub async fn get_training_project(
         })
         .collect();
 
-    // ★§F2⒝ batch 2 — `slot_info` can now REFUSE (a slot holding several runs cannot answer
-    // 「这个 run 练到哪了」 without being told which). Collected through a `Result` rather than
-    // defaulted, because the empty `WorkspaceInfo` a default would produce reads as「未开始」and
-    // silently unlocks the four resume-locked controls on the parameters page.
+    // ★§F2⒝ batch 2 step ④ — ONE ROW PER RUN, and the slot only carries what is genuinely a slot
+    // fact (its bytes, its preprocessing pools, the totals).
+    //
+    // ⛔ What this replaces mattered more than it looks: `slot_info` REFUSES to answer「这个 run
+    // 练到哪了」for a slot holding several runs, and the four slots were collected through a single
+    // `Result` — so one ambiguous slot took the whole project page down. Asking per RUN removes the
+    // ambiguity at the source instead of papering over it: every question here now names its run.
     let slots: Vec<SlotDetail> = crate::training::tproject::FAMILIES
         .iter()
         .filter(|f| crate::training::tproject::family_dir(&data_dir, &project_id, f).is_dir())
         .map(|f| -> Result<SlotDetail, String> {
+            let slot = crate::training::tproject::family_dir(&data_dir, &project_id, f);
             let recs = crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, Some(f));
-            // `scan_project_ckpts` returns newest-first by mtime — the same ordering upstream
-            // itself resumes by (the RVC sentinel makes step numbers unorderable). ★S118 §F8-res⒈:
-            // the CHOICE now lives in `default_resume_record`, because "the mtime-newest Resumable"
-            // stopped meaning "what a 续训 continues from" the moment S117 started writing a
-            // `resume_best/` pair after the rolling one — see that function.
-            let newest_resumable = crate::training::tproject::default_resume_record(&recs);
-            let pools = crate::training::tpool::list_pools(
-                &crate::training::tproject::family_dir(&data_dir, &project_id, f),
-            );
+            let pools = crate::training::tpool::list_pools(&slot);
+            // `""` for an unmigrated slot, matching `CkptRecord::run_id` and the `None` that every
+            // command takes — one vocabulary for「槽根就是那个 run」across Rust, IPC and the UI.
+            let ids: Vec<String> = {
+                let listed = crate::training::trun::list_runs(&slot);
+                if listed.is_empty() {
+                    vec![String::new()]
+                } else {
+                    listed.into_iter().map(|r| r.id).collect()
+                }
+            };
+            let runs = ids
+                .into_iter()
+                .map(|id| -> Result<RunDetail, String> {
+                    let opt = if id.is_empty() { None } else { Some(id.as_str()) };
+                    let dir = crate::training::trun::resolve_run_dir(&slot, opt)
+                        .map_err(|e| e.to_string())?;
+                    let mine: Vec<&crate::training::tproject::CkptRecord> =
+                        recs.iter().filter(|r| r.run_id == id).collect();
+                    // `scan_project_ckpts` returns newest-first by mtime — the same ordering
+                    // upstream itself resumes by (the RVC sentinel makes step numbers unorderable).
+                    // ★S118 §F8-res⒈: the CHOICE lives in `default_resume_record`, because "the
+                    // mtime-newest Resumable" stopped meaning "what a 续训 continues from" the
+                    // moment S117 started writing a `resume_best/` pair after the rolling one.
+                    // ⚠ Fed THIS run's records only: across runs the mtime order says which run was
+                    // trained last, which is a different question from「这个 run 从哪继续」.
+                    let newest = crate::training::tproject::default_resume_record_of(&mine);
+                    Ok(RunDetail {
+                        model_name: crate::training::tproject::run_model_name(&dir)
+                            .unwrap_or_default(),
+                        info: crate::training::slot_info(&data_dir, &project_id, f, opt)
+                            .map_err(|e| e.to_string())?,
+                        resume_step: newest.and_then(|r| r.step),
+                        has_resume_point: newest.is_some(),
+                        ckpt_count: mine.len() as u32,
+                        ckpt_bytes: mine.iter().map(|r| r.bytes).sum(),
+                        id,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             Ok(SlotDetail {
                 family: f.to_string(),
-                model_name: crate::training::tproject::slot_model_name(&data_dir, &project_id, f)
-                    .unwrap_or_default(),
-                info: crate::training::slot_info(&data_dir, &project_id, f)
-                    .map_err(|e| e.to_string())?,
-                bytes: crate::commands::storage::dir_size(&crate::training::tproject::family_dir(
-                    &data_dir,
-                    &project_id,
-                    f,
-                )),
-                resume_step: newest_resumable.and_then(|r| r.step),
-                has_resume_point: newest_resumable.is_some(),
+                runs,
+                bytes: crate::commands::storage::dir_size(&slot),
                 ckpt_count: recs.len() as u32,
                 ckpt_bytes: recs.iter().map(|r| r.bytes).sum(),
                 prep_pool_count: pools.len() as u32,
@@ -965,6 +1049,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// ⛔ §F2⒝ batch 2 step ④ — `""` and「没传」are the SAME question.
+    ///
+    /// A mutation probe found this line had nothing driving it: drop the emptiness filter and every
+    /// start / slot probe asks `trun::resolve_run_dir` for a run literally NAMED `""`, which fails
+    /// `run_id_is_usable` and answers `RUN_ID_INVALID` — i.e. the app stops working entirely, from
+    /// a one-token change, with the whole suite still green. The frontend sends `""` from a
+    /// `#[serde(default)]` field on every non-run-aware path, so this is the normal case, not an
+    /// edge one.
+    #[test]
+    fn an_empty_run_id_means_the_slot_holds_one_run() {
+        assert_eq!(opt_run_id(""), None);
+        assert_eq!(opt_run_id("   "), None, "a whitespace payload is not a run name");
+        assert_eq!(opt_run_id("rfeedfacefeed"), Some("rfeedfacefeed"));
+        assert_eq!(opt_run_id(" rfeedfacefeed "), Some("rfeedfacefeed"));
+        // …and the request wrapper answers identically, because the two must never diverge
+        let req = |v: serde_json::Value| -> StartTrainingRequest { serde_json::from_value(v).unwrap() };
+        let base = serde_json::json!({
+            "model_name": "m", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [], "total_epoch": 1, "batch_size": 1,
+        });
+        assert_eq!(run_id_of(&req(base.clone())), None, "an absent field is「一个 run」");
+        let mut with = base.clone();
+        with["run_id"] = serde_json::json!("");
+        assert_eq!(run_id_of(&req(with)), None, "…and so is an empty one");
+        let mut named = base;
+        named["run_id"] = serde_json::json!("rfeedfacefeed");
+        assert_eq!(run_id_of(&req(named)), Some("rfeedfacefeed"));
+    }
+
     #[test]
     fn the_ledgers_model_types_all_resolve() {
         use crate::models::ModelType;
@@ -987,9 +1100,16 @@ pub async fn get_training_slot_info(
     state: State<'_, Arc<AppState>>,
     project_id: String,
     backend: String,
+    run_id: Option<String>,
 ) -> Result<crate::training::WorkspaceInfo, String> {
     checked_project_id(&project_id)?;
-    crate::training::slot_info(&data_root(&state), &project_id, &backend).map_err(|e| e.to_string())
+    crate::training::slot_info(
+        &data_root(&state),
+        &project_id,
+        &backend,
+        opt_run_id(run_id.as_deref().unwrap_or("")),
+    )
+    .map_err(|e| e.to_string())
 }
 
 // `get_training_workspace_info(name, backend)` lived here until S76 batch 4 — see the note in
