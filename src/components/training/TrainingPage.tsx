@@ -45,6 +45,7 @@ import {
   indexPathArg,
   indexWarningCode,
 } from "../../lib/training/indexPath";
+import { resolveRowIdentity } from "../../lib/training/rowIdentity";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
@@ -1575,9 +1576,50 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   /** 产物身份:有 run(且这一段就在看它)用 run 的,否则用槽里冻结的(再没有就用项目名)。
    *  archiveOnly 一律走槽——那时的 live snapshot 可能是别的项目的运行。 */
   const useLiveIdentity = !archiveOnly;
-  const exportName =
-    (useLiveIdentity ? snapshot.model_name : "") || slotCtx?.modelName || config.modelName;
-  const exportWorkspace = (useLiveIdentity ? snapshot.workspace : "") || slotCtx?.workspace || "";
+
+  /** ★§F2⒝ 批 2 ④ —— **这一行所属那个 run** 的导出上下文,现取现问。
+   *
+   *  ⛔ 为什么必须按行问:这条命令的错误在上面的 effect 里是被 `catch` 吃掉的,于是工作区
+   *  塌成 `""` —— 而空串不是一个可见的失败,是一个**继续往下走的错答案**。链条实测过:
+   *  `resolveIndexPath` 拿 `""` 拼出的路径不存在 ⇒ `indexPath` 是 undefined ⇒
+   *  `import_model` 收到 `index_file: None` ⇒ **整个 WARN_INDEX_MISSING 分支被跳过**,它转而在
+   *  **存档文件旁边**(`<run>/weights/`)自动探测,而 RVC 的索引在 `<run>/total_fea.npy`,
+   *  三条探测全落空、`warnings` 里一个字都不 push ⇒ 装出来的模型没有检索矩阵,
+   *  **无警告、无 CODE、无 toast**,只是听起来不对。
+   *
+   *  `null` = 这一行是 `pending`(还没被磁盘扫描看见,`runId` 未知)⇒ 退回槽级上下文,
+   *  那正是它今天的行为。 */
+  const ctxForRun = async (runId?: string | null) => {
+    if (runId == null || !route.projectId) return slotCtx;
+    try {
+      return await invoke<{ modelName: string; workspace: string; indexPath: string | null }>(
+        "get_slot_export_context",
+        { projectId: route.projectId, backend: archiveBackend, runId },
+      );
+    } catch {
+      return slotCtx;
+    }
+  };
+
+  /** ★§F2⒝ 批 2 ④b —— 一行的**名字**与**工作区**由同一次解析回答(决策抽成纯函数
+   *  `resolveRowIdentity`,`src/lib/training/rowIdentity.ts`)。
+   *
+   *  ⛔ 它们分头回答时的失败形态:行标着 run B 的名字、试听放的却是 run A 的缓存 ——
+   *  而缓存命中只看 `<dir>/model.json` 在不在,那道结构闸对**兄弟 run** 也放行。
+   *  症状是「这个存档听起来像那个存档」,耳朵判不出来。 */
+  const rowIdentityFor = async (runId?: string | null) =>
+    resolveRowIdentity({
+      runId,
+      ctx: await ctxForRun(runId),
+      live: useLiveIdentity
+        ? {
+            modelName: snapshot.model_name,
+            workspace: snapshot.workspace,
+            summaryIndex: (snapshot.summary as { index?: string } | null)?.index,
+          }
+        : null,
+      fallbackName: config.modelName,
+    });
 
   const archiveRows = mergeCkptSources(
     // the standalone archive must not fold in a DIFFERENT run's in-memory candidates
@@ -1867,7 +1909,12 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // S78: the render command is decided PER ROW, not per run — a unified archive list can hold a
   // main model (voice) and a shallow-diffusion checkpoint (diffusion) in the same sovits slot.
   // `null` candidate = the vocoder A/B reference row.
-  const auditionCandidate = async (c: { path: string } | null, mode: "voice" | "diffusion" | "vocoder") => {
+  const auditionCandidate = async (
+    /** ★§F2⒝ 批 2 ④b —— 行带着自己的 `runId`:试听缓存在 `<run>/audition/<stem>/`,而命中
+     *  只看 `model.json` 在不在,兄弟 run 的目录也过得了那道结构闸。 */
+    c: { path: string; runId?: string | null } | null,
+    mode: "voice" | "diffusion" | "vocoder",
+  ) => {
     const id = c ? c.path : "__default__";
     const phase = auditionState[id];
     // pause only when this row REALLY owns the playback — a stale 'playing'
@@ -1906,21 +1953,24 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     setAuditionState((s) => ({ ...s, [id]: "converting" }));
     try {
       let wav: string;
-      // S78: the workspace comes from the slot-resolved context (`exportWorkspace`), not the live
-      // snapshot — so a row auditions the same whether it is a just-finished candidate or a cold
-      // archive entry (with a run displayed the two are equal). The render command is `mode`,
-      // decided by the CALLER per row.
+      // S78: the workspace comes from the slot-resolved context, not the live snapshot — so a row
+      // auditions the same whether it is a just-finished candidate or a cold archive entry (with a
+      // run displayed the two are equal). The render command is `mode`, decided by the CALLER.
+      // ★§F2⒝ 批 2 ④b —— 现在它是**按行**解析的:一个槽有两个 run 之后,槽级的那一个标量会
+      // 把 run B 的行渲染成 run A 的缓存,而缓存命中只看 `model.json` 在不在 ⇒ 无声、无 CODE,
+      // 症状只是「这个存档听起来像那个存档」。
+      const auditionWs = (await rowIdentityFor(c?.runId)).workspace;
       if (mode === "vocoder" || c === null) {
         wav = await invoke<string>("render_audition_vocoder", {
           ckptPath: c?.path ?? null,
-          workspace: exportWorkspace,
+          workspace: auditionWs,
           candidateId: id,
         });
       } else if (mode === "diffusion") {
         wav = await invoke<string>("render_audition_diffusion", {
           hostName: attachTarget,
           ckptPath: c.path,
-          workspace: exportWorkspace,
+          workspace: auditionWs,
           candidateId: id,
         });
       } else {
@@ -1928,7 +1978,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
           // main-model render: the FAMILY, never sovits_diff (a stray main row in a diff-run view)
           backend: backendFamily(archiveBackend),
           ckptPath: c.path,
-          workspace: exportWorkspace,
+          workspace: auditionWs,
           candidateId: id,
           // ①c: null for single-speaker (→ speaker 0, byte-identical); the chosen speaker otherwise
           speakerId: auditionSpeakers.length > 0 ? auditionSpeaker : null,
@@ -2279,7 +2329,15 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // sovits/vocoder periodics are step-cadenced (several per epoch) — an
   // epoch-keyed suggestion would collide and silently replace the previous
   // import (rvc keeps its historical epoch tag)
-  const suggestedName = (ckpt: { kind: string; epoch?: number; step: number | null; rel?: string }) => {
+  /** ★§F2⒝ 批 2 ④b —— `exportName` 由**调用方按行解析**后传进来。以前它取的是槽级的那一个
+   *  标量,于是同一个槽的两个 run **提议同一个模型名**,而 `import_model` 同名即 REPLACE、
+   *  连对话框都没有 ⇒ 第二次导入把第一次的整套文件删掉,而**保存过的工程按名字绑音源**
+   *  (`Track.voiceModel` 是字符串,加载时 `modelPathHeal` 按名重绑)⇒ 几个月没打开的工程
+   *  静默换了歌手。 */
+  const suggestedName = (
+    ckpt: { kind: string; epoch?: number; step: number | null; rel?: string },
+    exportName: string,
+  ) => {
     // an archive row (CkptRecord) carries no epoch — recover it from the release filename.
     // Anchor to the FULL `_e<epoch>_s<step>` tail, never a bare `_e<digits>_`: the model slug
     // ends in an 8-hex hash, and a hash of the form `e1234567` would otherwise be read as the
@@ -2299,50 +2357,22 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   // historical total_fea.npy; sovits probes the workspace cluster assets
   // (built before training, so they exist even for early stops). Shared by the
   // single-import prompt and the S41 batch import (single source).
-  /** ★§F2⒝ 批 2 ④ —— **这一行所属那个 run** 的导出上下文,现取现问。
-   *
-   *  ⛔ 为什么必须按行问:这条命令的错误在上面的 effect 里是被 `catch` 吃掉的,于是
-   *  `exportWorkspace` 塌成 `""` —— 而空串不是一个可见的失败,是一个**继续往下走的错答案**。
-   *  链条实测过:`resolveIndexPath` 拿 `""` 拼出的路径不存在 ⇒ `indexPath` 是 undefined ⇒
-   *  `import_model` 收到 `index_file: None` ⇒ **整个 WARN_INDEX_MISSING 分支被跳过**,它转而在
-   *  **存档文件旁边**(`<run>/weights/`)自动探测,而 RVC 的索引在 `<run>/total_fea.npy`,
-   *  三条探测全落空、`warnings` 里一个字都不 push ⇒ 装出来的模型没有检索矩阵,
-   *  **无警告、无 CODE、无 toast**,只是听起来不对。
-   *
-   *  `null` = 这一行是 `pending`(还没被磁盘扫描看见,`runId` 未知)⇒ 退回槽级上下文,
-   *  那正是它今天的行为。 */
-  const ctxForRun = async (runId?: string | null) => {
-    if (runId == null || !route.projectId) return slotCtx;
-    try {
-      return await invoke<{ modelName: string; workspace: string; indexPath: string | null }>(
-        "get_slot_export_context",
-        { projectId: route.projectId, backend: archiveBackend, runId },
-      );
-    } catch {
-      return slotCtx;
-    }
-  };
-
   /** §E2E-M1 —— 决策本身已抽成纯函数 `resolveArchiveIndex`（`src/lib/training/indexPath.ts`），
    *  因为它的失败是**静默**的：缺检索矩阵的症状只是音色相似度下降，而它在盘上不过是一个
    *  文件在不在 ⇒ 这件事不能留给实机窗口去「看一眼」。探针注入之后，vitest 能把每一种形状
-   *  （含工作区未知的退化态）当普通用例跑。 */
-  const resolveIndex = async (runId?: string | null) => {
-    const ctx = await ctxForRun(runId);
-    return resolveArchiveIndex({
+   *  （含工作区未知的退化态）当普通用例跑。
+   *
+   *  ★§F2⒝ 批 2 ④b —— 工作区与 summary 的取舍搬进 `resolveRowIdentity`:实时 run 的 summary
+   *  索引以前只按「本段是不是实时视图」判,而那个条件对**兄弟 run 的存档行**同样为真 ⇒
+   *  run A 产出的检索矩阵会被装进 run B 的模型。现在它挂在一个肯定事实上(两个工作区相等)。 */
+  const resolveIndexOf = (id: Awaited<ReturnType<typeof rowIdentityFor>>) =>
+    resolveArchiveIndex({
       backend: archiveBackend,
-      workspace: (useLiveIdentity ? snapshot.workspace : "") || ctx?.workspace || "",
-      // ★ The live run's summary index is ONLY trustworthy when this segment is that run
-      // (`useLiveIdentity`). In the standalone 存档中心 the snapshot may be a DIFFERENT family's
-      // finished run of the same project, and its `summary.index` (e.g. a SoVITS cluster .npy)
-      // would then be silently attached to an RVC import.
-      summaryIndex: useLiveIdentity
-        ? (snapshot.summary as { index?: string } | null)?.index
-        : undefined,
-      ctxIndexPath: ctx?.indexPath,
+      workspace: id.workspace,
+      summaryIndex: id.summaryIndex,
+      ctxIndexPath: id.indexPath,
       exists,
     });
-  };
 
   /** Re-read the archive list after an export, so its「已导入」marks are current.
    *
@@ -2366,6 +2396,9 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     /** ★§F2⒝ 批 2 ④ —— 存档行带着它；实时 run 的候选行没有（那时 `snapshot.workspace` 已经就是那个 run）。 */
     runId?: string | null;
   }) => {
+    // ⛔ ONE resolution for this row: the suggested NAME and the WORKSPACE the index is probed in
+    // must come from the same run, or the row is labelled after run B and rendered from run A.
+    const rowId = await rowIdentityFor(ckpt.runId);
     const name = await showConfirm({
       title: t("training.import"),
       body: t("training.importName"),
@@ -2376,10 +2409,10 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         // model literally named "cancel"
         { id: "__cancel", label: t("training.cancel") },
       ],
-      input: { initial: suggestedName(ckpt) },
+      input: { initial: suggestedName(ckpt, rowId.name) },
     });
     if (!name || name === "__cancel") return;
-    const idx = await resolveIndex(ckpt.runId);
+    const idx = await resolveIndexOf(rowId);
     try {
       // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
       // this one-row button is the path the archive list actually uses. `import_model` reports the
@@ -2417,14 +2450,16 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
   const importSelected = async () => {
     const chosen = snapshot.ckpts.filter(ckptChosen);
     if (chosen.length === 0 || importingAll) return;
+    // 批量导入只处理【实时 run】的候选（`snapshot.ckpts`），所以整批共用一次解析。
+    const rowId = await rowIdentityFor(null);
     const names = new Map<string, string>();
     const used = new Set<string>();
     for (const c of chosen) {
-      let n = suggestedName(c);
+      let n = suggestedName(c, rowId.name);
       if (used.has(n)) n = `${n}_${c.kind}`;
       let i = 2;
       while (used.has(n)) {
-        n = `${suggestedName(c)}_${c.kind}${i}`;
+        n = `${suggestedName(c, rowId.name)}_${c.kind}${i}`;
         i += 1;
       }
       used.add(n);
@@ -2444,9 +2479,9 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     if (okId !== "ok") return;
     setImportingAll(true);
     try {
-      // 批量导入只处理【实时 run】的候选（`snapshot.ckpts`），而那时 `useLiveIdentity` 下的
-      // `snapshot.workspace` 就是那个 run 的目录 —— 所以这里没有【哪个 run】的歧义可言。
-      const idx = await resolveIndex(null);
+      // 那时 `useLiveIdentity` 下的 `snapshot.workspace` 就是那个 run 的目录 —— 这里没有
+      // 【哪个 run】的歧义可言。
+      const idx = await resolveIndexOf(rowId);
       const audName = isVocoderRun ? "vocoder" : "model";
       let ok = 0;
       const failed: string[] = [];
