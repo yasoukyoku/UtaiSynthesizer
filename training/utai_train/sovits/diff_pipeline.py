@@ -61,7 +61,7 @@ from ..augment import (
     run_f0_gate,
 )
 from .. import device as device_shim
-from ..pool import assert_identity, checked_run_dir, open_pool
+from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
 from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists, resolve_speakers
@@ -142,7 +142,6 @@ def run(cfg, reporter, stop):
         raise RuntimeError("非法 SoVITS 版本: %s（可选 4.1/4.0）" % version)
     encoder = VERSION_ENCODER[version]
     dim = ENCODER_DIMS[encoder]
-    slug = cfg["model_slug"]
     seed = int(cfg.get("seed", 1234))
     loudnorm = bool(cfg.get("loudnorm", False))
     vol_embedding = bool(cfg.get("vol_embedding", False))
@@ -170,7 +169,17 @@ def run(cfg, reporter, stop):
     # format drift here would wipe the shared caches on every backend switch).
     # resolve_speakers is single-speaker here (multi is refused above) so this
     # is byte-identical to the pre-①c fingerprint.
-    fp_text = extract_cache_fp_text(resolve_speakers(cfg), encoder, loudnorm)
+    #
+    # ★§F2⒝ ④d — `slug` comes from the SAME call, not from `cfg["model_slug"]`. It names the
+    # `dataset_44k` subdirectory, which is a POOL product shared with the main sovits run: two
+    # derivations of one directory name is how the main run and its diffusion companion end up
+    # slicing into two different trees inside one pool. (They agree today because Rust omits the
+    # `speakers` key entirely for a single-speaker run — that is an accident of the writer, not a
+    # property of the readers, and ④d's constant sole-speaker name only exists in ONE of the two.)
+    aug_copies = int(cfg.get("aug_copies", 0))
+    speakers = resolve_speakers(cfg)
+    slug = speakers[0]["slug"]
+    fp_text = extract_cache_fp_text(speakers, encoder, loudnorm) + identity_suffix(cfg, aug_copies)
     # §F2⒝ — ⛔ this MUST land on the same pool as the main sovits run: the fp_text comes from the
     # same single-source helper, and `open_pool` selects by that text, so "shared workspace" now
     # means "provably the same directory" instead of "the same string happened to be written
@@ -192,7 +201,6 @@ def run(cfg, reporter, stop):
     # workspace would claim "augmented" (manifest) while holding zero aug
     # slices (red-team R2/A5)
     stop.check()
-    aug_copies = int(cfg.get("aug_copies", 0))
     meta_dir = os.path.join(pool_dir, "aug_meta")  # §F2⒝: aug_meta belongs to the pool
     augment_slices(
         spk_dir,

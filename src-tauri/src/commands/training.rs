@@ -741,6 +741,9 @@ pub async fn get_slot_export_context(
 /// re-pointed `hps.name`, `weights/<slug>*`, `audition/<slug>_*` and — through the pool the runs
 /// SHARE — the `dataset_44k/<slug>/` slice directory, on the run's next start: every existing
 /// product orphaned, a second full preprocessing tree grown, and nothing anywhere reporting it.
+/// ⚠ §F2⒝ ④d took the last of those off the table for a sole speaker on an identity-v2 slot (the
+/// slice directory is a constant there, not a name); the other three are still name-derived, so
+/// the freeze is still what makes this command safe.
 ///
 /// `run_id` empty ⇒「这个槽至多一个 run」, the same convention as every other run-taking command;
 /// a slot with several runs refuses rather than picks (`RUN_AMBIGUOUS`).

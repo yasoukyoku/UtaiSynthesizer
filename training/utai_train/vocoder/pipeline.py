@@ -101,7 +101,7 @@ from ..augment import (
 )
 from .. import device as device_shim
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, checked_run_dir, open_pool
+from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 from ..sovits.preprocess import _decode  # single source decoder (librosa+ffmpeg)
@@ -139,7 +139,13 @@ def run(cfg, reporter, stop):
 
     # ---- cache identity (slices + npz are keyed on slice names — S37 lesson;
     # bump the version tag whenever slice/process semantics change) ----
+    aug_copies = int(cfg.get("aug_copies", 0))
     fp_text = "%s|vocoder-v3" % dataset_fingerprint(cfg["dataset_dir"])
+    # ★§F2⒝ ④d — appended LAST, same rule as the other four chains. ⚠ The tail above is a manual
+    # version TAG, not a `key=value` token, so the text this chain emits is the one place a reader
+    # meets both shapes at once (`<hash>|vocoder-v3|aug=2`); `training::loudnorm_from_fingerprint`
+    # skips `=`-less tokens for exactly that reason. See `pool.identity_suffix`.
+    fp_text += identity_suffix(cfg, aug_copies)
     # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
     # ⚠ This chain is the FLATTEST of the five (pool and run products sat side by side at the
     # workspace root with no existing divide), which is why every path below is now derived from
@@ -158,7 +164,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     _augment_vocoder(pool_dir, slices_dir, npz_dir,
-                     int(cfg.get("aug_copies", 0)), int(cfg.get("seed", 1234)),
+                     aug_copies, int(cfg.get("seed", 1234)),
                      reporter, stop)
 
     stop.check()

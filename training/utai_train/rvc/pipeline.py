@@ -33,7 +33,7 @@ from . import train_utils as utils
 from .. import device as device_shim
 from ..augment import augment_slices, is_aug_name, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, checked_run_dir, open_pool
+from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from .extract_f0 import extract_f0
 from .extract_feature import extract_features
 from .filelist import build_filelist_and_config
@@ -90,11 +90,17 @@ def run(cfg, reporter, stop):
     is_multi = speakers is not None and len(speakers) > 1
 
     # cache fingerprint spans ALL speakers' datasets (a change in any invalidates the caches)
+    aug_copies = int(cfg.get("aug_copies", 0))
     fp_src = (
         "|".join(dataset_fingerprint(sp["dataset_dir"]) for sp in speakers)
         if is_multi
         else dataset_fingerprint(cfg["dataset_dir"])
     )
+    # ★§F2⒝ ④d — appended LAST, same rule as the other four chains. rvc is the ONLY chain whose
+    # sample rate is a user choice, and `1_16k_wavs` is resampled FROM it while every f0 / feature
+    # product is cached by slice NAME — so before this token a slot that changed sample rate
+    # silently reused the features computed for the other one. See `pool.identity_suffix`.
+    fp_src += identity_suffix(cfg, aug_copies, sample_rate=SR_MAP[sr_str])
     # §F2⒝ — the identity now NAMES the directory the products live in instead of gating a
     # `shutil.rmtree` of them. The fp_text above is unchanged, so the pool boundary is exactly
     # today's cache-invalidation boundary; the only difference is that a run with a different
@@ -120,7 +126,7 @@ def run(cfg, reporter, stop):
         )
 
     stop.check()
-    _augment_rvc(pool_dir, int(cfg.get("aug_copies", 0)), seed, reporter, stop)
+    _augment_rvc(pool_dir, aug_copies, seed, reporter, stop)
 
     extract_f0(
         pool_dir,

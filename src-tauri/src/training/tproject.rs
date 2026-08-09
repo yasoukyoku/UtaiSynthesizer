@@ -503,9 +503,15 @@ pub fn run_model_name(run: &crate::training::trun::RunDir) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// THE artifact identity ONE run's products were actually built under — `hps.name`, the
-/// `weights/<slug>*` prefix, the `config.spk` key, and (single-speaker SoVITS) the
-/// `<pool>/dataset_44k/<slug>/` slice directory.
+/// THE artifact identity ONE run's products were actually built under — `hps.name` and the
+/// `weights/<slug>*` prefix.
+///
+/// ⚠ §F2⒝ ④d removed two entries from that list, and the removal is the point: the `config.spk`
+/// key and the `<pool>/dataset_44k/<slug>/` slice directory are POOL products, and from identity
+/// v2 ([`crate::training::tpool::identity_version`]) a sole speaker's are the constant
+/// `tpool::SOLE_SPEAKER_DIR` instead of this run's name. A RUN-scoped label naming a POOL product
+/// is what let a second run of one slot grow a second complete slice tree inside the shared pool.
+/// Co-trained speakers keep their own slugs there — those are folded into the pool fingerprint.
 ///
 /// ★§F2⒝ batch 2 step ④b — the reason this is a READ rather than a derivation. Until now the
 /// slug was re-derived from the display name on every start, so the name WAS the identity: rename

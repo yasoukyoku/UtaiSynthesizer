@@ -12,9 +12,16 @@ The identity now names a DIRECTORY instead of gating a deletion::
         dataset.fingerprint   <- the identity text; the same file we have always written
         …the preprocessing products…
 
-**Nothing about WHICH artifacts share an identity changed.** The fp_text formulas in the five
-pipelines are untouched, so the pool boundary is byte-for-byte today's cache-invalidation
-boundary. The only change is that a non-matching pool is now a SIBLING instead of a deletion.
+Batch 1 changed nothing about WHICH artifacts share an identity: the fp_text formulas in the five
+pipelines were untouched, so the pool boundary was byte-for-byte the old cache-invalidation
+boundary, and the only difference was that a non-matching pool became a SIBLING instead of a
+deletion.
+
+§F2⒝ ④d is where the boundary itself moves, because two knobs that DO decide what the products
+are were never in it (rvc's sample rate; every chain's augmentation count). Both halves of that
+move — the formula here and the text already written on disk — have to change at the same
+instant, so the formula is VERSIONED and the version rides in on `run.json`: see
+[`identity_version`] for the carrier and [`identity_suffix`] for the tokens.
 
 ## Why the slot root is itself a pool
 
@@ -69,6 +76,132 @@ FINGERPRINT = "dataset.fingerprint"
 
 #: Container for every RUN of one slot. Must equal `trun::RUNS_DIR`.
 RUNS_DIR = "runs"
+
+#: The pool-identity FORMULA version this python understands. Must equal
+#: `tpool::POOL_IDENTITY_VERSION`. See [`identity_version`] for what the number gates.
+POOL_IDENTITY_VERSION = 2
+
+#: The `dataset_44k` subdirectory a SINGLE-speaker sovits-family run slices into, from identity
+#: version 2 on. Must equal `tpool::SOLE_SPEAKER_DIR`.
+#:
+#: Before version 2 this was the run's `model_slug`, which made a POOL product carry a RUN's name:
+#: two runs of the same slot with different names grew two complete slice trees inside one pool,
+#: each paying for its own features, and `extract_all` walks EVERY subdirectory of `dataset_44k`
+#: so the abandoned one was re-scanned forever. §F2⒝ ④e (重训 = a NEW run) turns that from a
+#: historical accident into the normal case, which is why it is fixed here rather than there.
+#:
+#: ⛔ Three rules the name obeys, each with a real failure behind it:
+#: ⑴ no ``.wav`` substring — `filename.replace(".wav", ".spec.pt")` rewrites PATH segments, so a
+#:    directory carrying it would send every spec cache to a path that can never be hit again;
+#: ⑵ not ``nul`` — `os.makedirs` succeeds on Windows and creates nothing;
+#: ⑶ not derived from user text — Windows silently eats trailing spaces/dots, so the name on disk
+#:    and the string in `config.spk` would differ.
+#: ⚠ It also cannot collide with a real speaker slug: `slugify` (`training::slugify`) always
+#: appends ``_`` + 8 hex, and this name has no underscore.
+#: ⚠ MULTI-speaker keeps each speaker's own slug — those slugs are folded into the fingerprint
+#: (`sovits/pipeline.py`), so renaming them would re-identify every multi-speaker pool on disk.
+SOLE_SPEAKER_DIR = "spk0"
+
+
+def identity_version(cfg):
+    """WHICH pool-identity formula this run must use — 1 (pre-④d) or 2.
+
+    ## Why the formula is versioned at all
+
+    ④d adds two tokens (`|sr=` for rvc, `|aug=` for every chain) to the text that NAMES the
+    directory hours of preprocessing live in. Both halves of that change have to happen at the
+    same instant or the user pays for it: a python that computes the new text against a disk still
+    stamped with the old one finds no match and rebuilds everything into a sibling pool, and the
+    reverse order is the same bill. The two halves are in different languages and different
+    processes, so "at the same instant" needs a carrier.
+
+    ⛔ It cannot be `slot.json`: python never reads it (`open_pool` has no layout concept, and
+    nothing under `utai_train/` opens that file). It is `run.json`, which is already the channel
+    Rust uses to hand python EFFECTIVE values it alone can compute (`loudnorm`, `aug_copies`,
+    `slot_has_main_model`).
+
+    ⇒ The number is a pure function of the slot's layout on the Rust side: version 2 is written
+    ONLY for a slot whose 3→4 migration has committed, i.e. only when every pool in that slot has
+    already been re-stamped with the new text. A slot the migration skipped, failed on, or never
+    reached (another instance was alive at boot; a data root restored from a backup) keeps
+    answering 1, and its pools keep matching. That is the whole point: a refusal on the Rust side
+    is now visible to python instead of being a log line python cannot see.
+
+    ## Why absent means 1 and why the upper bound is fail-closed
+
+    Absent = an old `run.json`, or a hand-built gate config. Both describe a disk built by the old
+    formula, so 1 is the answer that matches what is actually there — the same "fire on a positive
+    fact" posture `open_pool`'s slot-root arm takes.
+
+    A version ABOVE what this python knows is the opposite case: some newer Rust has stamped the
+    disk in a shape this code cannot reproduce, and computing an identity we do not understand
+    would either rebuild everything or, worse, claim someone else's products. Refuse loudly.
+    """
+    raw = cfg.get("pool_identity_version")
+    # ⚠ `is None`, not truthiness: an explicit `0` is a value someone WROTE, and collapsing it into
+    # "the key is absent" would hide a writer that is producing nonsense. Rust only ever writes 1
+    # or 2, so this is about keeping the two states distinguishable rather than about today.
+    v = 1 if raw is None else int(raw)
+    if v < 1:
+        raise RuntimeError(
+            "POOL_IDENTITY_VERSION_INVALID: run.json says pool identity v%d; the lowest formula "
+            "that has ever existed is v1" % v
+        )
+    if v > POOL_IDENTITY_VERSION:
+        raise RuntimeError(
+            "POOL_IDENTITY_VERSION_UNKNOWN: run.json asks for pool identity v%d but this "
+            "training package only knows v%d — refusing to guess at the identity of the "
+            "preprocessing products on disk" % (v, POOL_IDENTITY_VERSION)
+        )
+    return v
+
+
+def identity_suffix(cfg, aug_copies, sample_rate=None):
+    """The trailing identity tokens EVERY chain appends to its own fp_text, and appends LAST.
+
+    ## Why one helper, and why the call is the last thing each formula does
+
+    The five chains do not share a formula: sovits / sovits_diff / sovits_v2 go through
+    `extract_cache_fp_text`, sovits_v2 then appends a conditional `|f0=` of its own, and rvc and
+    vocoder build their text inline without touching a single shared symbol. So "add a token to
+    the identity" is a four-site edit where 「改 3 漏 2」 costs the user hours and says nothing.
+
+    ⛔ The tokens are NOT added inside `extract_cache_fp_text`, and that is not a style choice.
+    sovits_v2 appends `|f0=` AFTER that helper returns, so a token added inside it would come out
+    as ``…|loudnorm=0|aug=2|f0=dio`` for v2 and ``…|loudnorm=0|aug=2`` for the others — two
+    different concatenation ORDERS for one logical set of tokens, and the Rust migration would
+    have to know which chain it is looking at to reproduce either. Appending last means the order
+    is the same everywhere: the chain's own text, then this suffix, in this suffix's own order.
+    Byte-for-byte agreement with `tpool::identity_suffix` is what lets Rust re-stamp an existing
+    pool instead of the user re-preprocessing it.
+
+    ## What each token is for
+
+    `|sr=` (rvc only, unconditional): `1_16k_wavs` is resampled FROM the target rate, and every f0
+    / feature product is cached by slice NAME — so a slot that changed sample rate used to reuse
+    the features computed for the other rate, silently. rvc is the only chain that has this knob;
+    the other four hard-code 44100.
+    ⚠ The value is the rate in Hz, not the `"40k"` UI string: the migration's authority for an
+    EXISTING pool is the header of a wav already sitting in `0_gt_wavs`, which is an integer.
+    Routing that through a display string would be a second encoding of one fact.
+
+    `|aug=` (every chain, only when > 0): `augment_slices` prunes by `idx > copies` and takes the
+    slice's companions with it, so two runs sharing a pool with different counts destroy each
+    other's products. Omitting the token at 0 is what keeps every existing un-augmented pool
+    matching after this change — the overwhelming majority.
+    ⚠ rvc would have survived sharing (`_wipe_slice_dirs` rebuilds its slice dirs every run and
+    PSOLA is deterministic, so its aug wavs come back identical). It is included anyway: one rule
+    for five chains is the property that makes 「改 3 漏 2」 impossible, and it is what makes the
+    lock table's `costly("augCopies")` label — 「改它会重新指纹化」 — true for the first time.
+    """
+    if identity_version(cfg) < 2:
+        return ""
+    out = ""
+    if sample_rate is not None:
+        out += "|sr=%d" % int(sample_rate)
+    if int(aug_copies) > 0:
+        out += "|aug=%d" % int(aug_copies)
+    return out
 
 
 def checked_run_dir(cfg, slot_dir):

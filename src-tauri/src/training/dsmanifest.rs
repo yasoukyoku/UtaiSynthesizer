@@ -59,7 +59,14 @@ pub struct DsFile {
 /// One co-trained speaker. The POSITION in [`DsManifest::speakers`] is the emb_g row id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DsSpeaker {
-    /// `dataset/<slug>/` — also the `dataset_44k` subdir name and the `config.spk` key.
+    /// `dataset/<slug>/` — for a CO-TRAINED speaker, also the `dataset_44k` subdir name and the
+    /// `config.spk` key.
+    ///
+    /// ⚠ §F2⒝ ④d: that second half holds for co-training only. A SOLE speaker's slice directory
+    /// and `config.spk` key are the constant `tpool::SOLE_SPEAKER_DIR` from identity v2 on —
+    /// those are POOL products and this slug is a RUN-scoped label, so tying them together is
+    /// exactly what let a second run of one slot grow a second slice tree. Multi-speaker slugs
+    /// keep the coupling because they are folded into the pool fingerprint itself.
     pub slug: String,
     /// What the user typed. `slugify` is not invertible, so this is the only carrier that
     /// survives outside a slot's `run_manifest.json`.

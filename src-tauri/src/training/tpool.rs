@@ -25,10 +25,15 @@
 //!   …run products, exactly where they have always been…
 //! ```
 //!
-//! **The pool boundary is byte-for-byte today's cache-invalidation boundary.** Nothing about
-//! WHICH artifacts share an identity changed; the only change is that a non-matching pool is now
-//! a SIBLING instead of a deletion. Keeping that statement true is what makes this batch
+//! **In batch 1 the pool boundary was byte-for-byte the old cache-invalidation boundary.** Nothing
+//! about WHICH artifacts share an identity changed; the only change was that a non-matching pool
+//! became a SIBLING instead of a deletion. Keeping that statement true is what made that batch
 //! reviewable, and it is why no identity formula was touched (see [`POOL_ENTRIES`]).
+//!
+//! §F2⒝ ④d is where the boundary itself moves: two knobs that decide what the products ARE (rvc's
+//! sample rate, every chain's augmentation count) were never in it. Because the formula and the
+//! text already on disk have to change together, the formula is VERSIONED and the version travels
+//! to python in `run.json` — [`identity_version`], [`identity_suffix`], [`SLOT_LAYOUT_POOL_ID`].
 //!
 //! ## Why run products do not move in this batch
 //!
@@ -66,6 +71,89 @@ pub const FINGERPRINT: &str = "dataset.fingerprint";
 
 /// Current slot layout. Bumped when the meaning of the directory changes, never for content.
 pub const SLOT_LAYOUT: u32 = 2;
+
+/// Slot layout whose pools carry a **v2 identity text** ([`POOL_IDENTITY_VERSION`]).
+///
+/// ⛔ A THIRD constant, deliberately not a bump of either existing one — for the reason
+/// [`trun::SLOT_LAYOUT_RUNS`](super::trun::SLOT_LAYOUT_RUNS) spells out: both migrations return
+/// early on `layout >= <their own constant>` and otherwise compute a plan, so raising one of them
+/// makes every already-folded slot compute an EMPTY plan, take the "nothing to move" branch and
+/// stamp the new number — marked as migrated without a byte having moved. Each migration advances
+/// the same file exactly one step, and the ordering between them is asserted in `trun`'s tests.
+pub const SLOT_LAYOUT_POOL_ID: u32 = 4;
+
+/// The pool-identity FORMULA version this build understands. Must equal
+/// `utai_train.pool.POOL_IDENTITY_VERSION`.
+pub const POOL_IDENTITY_VERSION: u32 = 2;
+
+/// The `run.json` key that carries [`identity_version`] to python.
+///
+/// ⛔ A named constant rather than a literal in the `json!` block, because a rename on either
+/// side is the one failure this whole mechanism cannot notice by itself: python's reader falls
+/// back to 1 for an ABSENT key (an old `run.json` describes a v1 disk, so 1 is the truthful
+/// answer there), which means a typo'd key does not error — it silently switches ④d off for
+/// every slot, forever, with the old formula quietly computing against a re-stamped disk.
+/// `tests/pool_identity_formula.rs` drives this constant into `utai_train/pool.py`'s reader.
+pub const IDENTITY_VERSION_KEY: &str = "pool_identity_version";
+
+/// The `dataset_44k` subdirectory a SINGLE-speaker sovits-family run slices into, from identity
+/// v2 on. Must equal `utai_train.pool.SOLE_SPEAKER_DIR`, which states the three naming rules and
+/// why a run's name had no business being a pool product's directory name.
+pub const SOLE_SPEAKER_DIR: &str = "spk0";
+
+/// WHICH identity formula this slot's pools are stamped with — the number handed to python in
+/// `run.json`.
+///
+/// ★§F2⒝ ④d — this is the carrier that lets the formula and the disk change **at the same
+/// instant** despite living in two languages. The new formula names a different directory, so a
+/// python computing it against a disk still holding the old text finds no match and rebuilds
+/// hours of preprocessing into a sibling pool; the reverse order costs the same. Tying the answer
+/// to the slot's own layout marker means the answer flips exactly when the 3→4 migration commits
+/// — i.e. only after every pool in this slot has been re-stamped.
+///
+/// ⛔ It is a pure function of the marker and nothing else. In particular it does NOT try to be
+/// clever about a slot with no pools yet (a brand-new one, or one a full 重训 just erased): such a
+/// slot is at layout 0 until the next boot folds it, so it is born with the v1 formula and gets
+/// re-stamped like everything else. The alternative — "no pools ⇒ safe to use v2" — has to
+/// exclude an UNMIGRATED slot whose pool sits at the slot root (`open_pool`'s legacy arm), and
+/// getting that second condition wrong is a full re-preprocess for exactly the users whose data
+/// root came back from a backup. One condition cannot be got wrong.
+///
+/// ⇒ A slot the migration skipped, failed on, or never reached (another instance was alive at
+/// boot) answers 1 and keeps matching its own pools. Before ④d that refusal was invisible to
+/// python, which would have gone on computing the new text against the old disk.
+pub fn identity_version(slot: &Path) -> u32 {
+    match read_slot_meta(slot) {
+        Some(m) if m.layout >= SLOT_LAYOUT_POOL_ID => POOL_IDENTITY_VERSION,
+        _ => 1,
+    }
+}
+
+/// The trailing identity tokens, byte-for-byte `utai_train.pool.identity_suffix`.
+///
+/// ⛔ The two implementations produce ONE string or the user re-preprocesses. That is why both
+/// append this suffix LAST (sovits_v2 has a conditional `|f0=` tail of its own, so a token folded
+/// into the shared `extract_cache_fp_text` would sit before it there and after everything in the
+/// other two sovits chains — one token set, two orders, and a migration that cannot reproduce
+/// either without knowing which chain it is looking at).
+///
+/// `sample_rate_hz` is `Some` for **rvc only** — the one chain where the rate is a user choice.
+/// It is Hz rather than the `"40k"` UI string because the migration's authority for an existing
+/// pool is the header of a wav already in `0_gt_wavs`, and routing that through a display string
+/// would be a second encoding of one fact.
+pub fn identity_suffix(version: u32, aug_copies: u32, sample_rate_hz: Option<u32>) -> String {
+    if version < 2 {
+        return String::new();
+    }
+    let mut s = String::new();
+    if let Some(hz) = sample_rate_hz {
+        s.push_str(&format!("|sr={hz}"));
+    }
+    if aug_copies > 0 {
+        s.push_str(&format!("|aug={aug_copies}"));
+    }
+    s
+}
 
 /// Staging directory for a migration in flight. Dot-prefixed so every existing scan ignores it —
 /// a half-filled pool must never be readable as a pool.
@@ -587,6 +675,33 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, b"x").unwrap();
+    }
+
+    /// ★§F2⒝ ④d —— 池身份版本闸是这一批的**承重梁**:它是 python 唯一能看见的「这个槽迁没迁」。
+    ///
+    /// 判据必须驱动**真的 `slot.json`**,不能只比常量:一个把 `>=` 写成 `>` 或把常量记错的
+    /// 实现,在「今天盘上还没有 layout 4」的世界里对任何比常量的断言都是绿的,而它的后果是
+    /// ④d **永远不生效**(python 一直算旧公式)—— 一次静默的空转,没有任何报错。
+    #[test]
+    fn the_identity_version_flips_exactly_when_the_slot_marker_commits() {
+        let slot = tmp_slot("identver");
+        // 没有 slot.json = 从没迁过(全新槽 / 刚被整槽重训删掉的槽)
+        assert_eq!(identity_version(&slot), 1, "没有 marker ⇒ 旧公式,它的池还是旧串");
+        for layout in 0..SLOT_LAYOUT_POOL_ID {
+            write_slot_meta(&slot, &SlotMeta { layout, ..Default::default() }).unwrap();
+            assert_eq!(identity_version(&slot), 1, "layout {layout} 的槽还没被重新打戳过");
+        }
+        write_slot_meta(&slot, &SlotMeta { layout: SLOT_LAYOUT_POOL_ID, ..Default::default() })
+            .unwrap();
+        assert_eq!(identity_version(&slot), POOL_IDENTITY_VERSION, "3→4 提交那一刻才翻面");
+        // 未来的 layout 仍然是 v2:版本闸问的是「有没有过 ④d 这一步」,不是「现在是第几层」。
+        write_slot_meta(&slot, &SlotMeta { layout: SLOT_LAYOUT_POOL_ID + 7, ..Default::default() })
+            .unwrap();
+        assert_eq!(identity_version(&slot), POOL_IDENTITY_VERSION);
+        // 一个读不动的 marker 必须答旧公式(fail-closed:猜错的代价是几小时重跑)
+        std::fs::write(slot.join(SLOT_META), b"{not json").unwrap();
+        assert_eq!(identity_version(&slot), 1, "读不动 marker ⇒ 不许猜新公式");
+        let _ = std::fs::remove_dir_all(slot);
     }
 
     /// A real RVC slot, in the shape the frozen pre-migration fixture actually has on disk

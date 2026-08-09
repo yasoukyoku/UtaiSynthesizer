@@ -120,6 +120,10 @@ export function ProjectDetail() {
    *  `dataset_44k/<slug>/` 一起改指向:已有产物全变孤儿,池里凭空多一棵完整预处理树,
    *  而没有任何东西会说一句话。
    *
+   *  ⚠ §F2⒝ ④d 把最后那一项拿掉了(只对**单说话人**、且池身份已是 v2 的槽):切片目录名
+   *  与 `config.spk` 的键是**池**产物,现在是一个常量而不是这个 run 的名字。前三项仍然按
+   *  名字派生,所以冻结身份仍然是这条能力安全的理由。
+   *
    *  ⚠ 已经导出到资源管理的模型**不跟着改名** —— 导出是一次快照,那边的名字归那边管
    *  (而且按名字改动那边会撞上「同名即替换」)。文案里明写了这一条。 */
   const renameRun = async (family: Family, run: RunDetail) => {
@@ -229,7 +233,9 @@ export function ProjectDetail() {
    *  最后那个 run 的名字。
    *  ★§F2⒝ 批 2 ④b —— 它**不再是产物身份**。以前这个字符串是 `slugify` 的输入,而 slug 是
    *  `dataset_44k/<slug>/`、`config.spk` 的键和 `weights/<slug>*` 的前缀;现在身份冻结在
-   *  `run.json[model_slug]` 里(`training::effective_artifact_slug`),这里只决定用户看见什么。 */
+   *  `run.json[model_slug]` 里(`training::effective_artifact_slug`),这里只决定用户看见什么。
+   *  ★§F2⒝ 批 2 ④d —— 前两项**连身份都不再是**:单说话人的切片目录与 `config.spk` 键是**池**
+   *  产物,身份 v2 之后是一个常量。slug 今天只名了 `weights/<slug>*` 与 `hps.name`。 */
   const askRunName = async (run: RunDetail | undefined): Promise<string | null> => {
     if (run?.modelName) return run.modelName;
     const name = await showConfirm({

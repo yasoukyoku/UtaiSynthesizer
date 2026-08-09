@@ -28,6 +28,7 @@ import random
 import wave
 
 from ..augment import is_aug_name
+from ..pool import SOLE_SPEAKER_DIR, identity_version
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +54,40 @@ def resolve_speakers(cfg):
 
     Single-speaker (the overwhelming case, and every existing caller / gate):
     cfg has no "speakers" key -> a 1-element list built from the flat
-    dataset_dir + model_slug, which makes build_config/build_filelists/cluster
-    emit BYTE-IDENTICAL output to the pre-①c code (slug key, id 0)."""
+    dataset_dir + model_slug, which made build_config/build_filelists/cluster
+    emit BYTE-IDENTICAL output to the pre-①c code (slug key, id 0).
+
+    ★§F2⒝ ④d — from pool identity v2 a SOLE speaker's `slug` is a CONSTANT
+    (`pool.SOLE_SPEAKER_DIR`) instead of this run's name. `slug` is three things
+    at once — the `dataset_44k` subdirectory, the `config.spk` key, and what the
+    data loader looks that key up by (`data_utils.py`, and sovits_v2's second
+    loader) — and all three are POOL-scoped while the name is RUN-scoped, so a
+    second run of the same slot under a different name used to grow a second
+    complete slice tree inside the shared pool. Deriving all three from this one
+    function is what makes them impossible to change apart.
+
+    ⛔ The switch keys on `len(...) == 1`, the SAME predicate
+    `extract_cache_fp_text` uses to decide whether slugs enter the fingerprint at
+    all — so a sole speaker's slug is never part of any pool's identity and this
+    cannot re-identify anything on disk. A multi-speaker list keeps every slug,
+    because those ARE folded into the fingerprint.
+    ⚠ `name` is untouched: `_write_release_config` keys the exported sidecar by
+    display name, so what the user sees in an installed model does not move."""
     spks = cfg.get("speakers")
     if spks:
-        return [
+        out = [
             {"name": s["name"], "slug": s["slug"], "dataset_dir": s["dataset_dir"]}
             for s in spks
         ]
-    return [{
-        "name": cfg.get("model_name") or cfg["model_slug"],
-        "slug": cfg["model_slug"],
-        "dataset_dir": cfg["dataset_dir"],
-    }]
+    else:
+        out = [{
+            "name": cfg.get("model_name") or cfg["model_slug"],
+            "slug": cfg["model_slug"],
+            "dataset_dir": cfg["dataset_dir"],
+        }]
+    if len(out) == 1 and identity_version(cfg) >= 2:
+        out[0]["slug"] = SOLE_SPEAKER_DIR
+    return out
 
 
 def _split_speaker(dataset_44k_dir, spk_slug, seed, min_dur=0.3):

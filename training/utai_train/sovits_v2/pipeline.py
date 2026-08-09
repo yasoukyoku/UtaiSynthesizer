@@ -34,7 +34,7 @@ import os
 
 from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
-from ..pool import assert_identity, checked_run_dir, open_pool
+from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..sovits.cluster import build_kmeans, build_retrieval
 from ..sovits.flist import build_filelists, resolve_speakers
@@ -85,9 +85,15 @@ def run(cfg, reporter, stop):
     # dio-extracted tree can never be mistaken for the rmvpe product tree
     speakers = resolve_speakers(cfg)
     is_multi = len(speakers) > 1
+    aug_copies = int(cfg.get("aug_copies", 0))
     fp_text = extract_cache_fp_text(speakers, ENCODER, loudnorm)
     if f0_method != "rmvpe":
         fp_text += "|f0=%s" % f0_method
+    # ★§F2⒝ ④d — LAST, i.e. after this chain's own conditional tail. This chain is exactly why
+    # the suffix is not folded into `extract_cache_fp_text`: a token added in there would land
+    # BEFORE `|f0=` here and AFTER everything in the other two sovits chains, giving one logical
+    # token set two concatenation orders. See `pool.identity_suffix`.
+    fp_text += identity_suffix(cfg, aug_copies)
     # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
     # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
     # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
@@ -96,7 +102,6 @@ def run(cfg, reporter, stop):
     assert_identity(pool_dir, fp_text)
 
     dataset_44k = os.path.join(pool_dir, "dataset_44k")
-    aug_copies = int(cfg.get("aug_copies", 0))
 
     for sp in speakers:
         spk_dir = os.path.join(dataset_44k, sp["slug"])

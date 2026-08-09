@@ -42,7 +42,7 @@ import numpy as np
 from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, checked_run_dir, open_pool
+from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from . import utils
 from .cluster import build_kmeans, build_retrieval
@@ -122,7 +122,12 @@ def run(cfg, reporter, stop):
     # with no "speakers" key is a 1-element list = pre-①c single-speaker path.
     speakers = resolve_speakers(cfg)
     is_multi = len(speakers) > 1
-    fp_text = extract_cache_fp_text(speakers, encoder, loudnorm)
+    aug_copies = int(cfg.get("aug_copies", 0))
+    # ★§F2⒝ ④d — this chain's own text, then the SHARED suffix, and the suffix is appended LAST
+    # by all five chains so the concatenation order is one rule instead of five. Byte-for-byte
+    # agreement with `tpool::identity_suffix` is what lets the layout 3→4 migration re-stamp an
+    # existing pool rather than making the user re-preprocess it. See `pool.identity_suffix`.
+    fp_text = extract_cache_fp_text(speakers, encoder, loudnorm) + identity_suffix(cfg, aug_copies)
     # §F2⒝ — the identity now NAMES the directory instead of gating a `shutil.rmtree` of it.
     # ⛔ `sovits_diff` MUST resolve to the same pool: it builds the same fp_text from the same
     # helper and shares this slot, which is exactly why that string has one home.
@@ -133,7 +138,6 @@ def run(cfg, reporter, stop):
     assert_identity(pool_dir, fp_text)
 
     dataset_44k = os.path.join(pool_dir, "dataset_44k")
-    aug_copies = int(cfg.get("aug_copies", 0))
 
     # slice + augment EACH speaker into its own dataset_44k/<slug> subdir (the
     # data loader derives the speaker id from the parent-dir name). aug_meta is

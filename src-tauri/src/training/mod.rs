@@ -1282,6 +1282,14 @@ pub(crate) fn slugify(name: &str) -> String {
 ///   * the main `config.json` keeps the OLD slug as its `config.spk` key, and nothing compares them.
 /// The rename button (§F2⒝ ④b) is what made that reachable, which is why the caller now composes
 /// the flag from the one `diff_partial_wipe` binding rather than from `req.fresh` alone.
+///
+/// ⚠ §F2⒝ ④d narrowed the FIRST and THIRD bullets, and only for a slot whose pools carry identity
+/// v2 ([`tpool::identity_version`]): there a SOLE speaker's slice directory and `config.spk` key
+/// are the constant [`tpool::SOLE_SPEAKER_DIR`], derived from arity rather than from the run's
+/// name, so a rename no longer moves either. The slug still names `weights/<slug>*`,
+/// `audition/<slug>_*` and `hps.name`, so the second bullet — and this whole guard — stands
+/// unchanged; and on an identity-v1 slot (one the 3→4 migration has not committed) all three
+/// bullets are still literally true.
 /// ⛔ Do NOT widen it to「工作区会不会被删」in general: the FULL wipe branch must keep minting, or
 /// 重训 stops being able to change the name — which is what that button is for.
 ///
@@ -1982,8 +1990,10 @@ impl TrainingManager {
             req.fresh && req.backend == "sovits_diff" && workspace.exists()
                 && old_manifest.is_some() && has_main;
 
-        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`, the
-        // `config.spk` key, and (single-speaker SoVITS) `<pool>/dataset_44k/<slug>/`.
+        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`.
+        // ⚠ §F2⒝ ④d dropped `config.spk` and `<pool>/dataset_44k/<slug>/` from this list for a
+        // SOLE speaker on an identity-v2 slot: those two are POOL products and are now the
+        // constant `tpool::SOLE_SPEAKER_DIR`. Co-trained speakers keep their slugs there.
         // ★§F2⒝ batch 2 step ④b: FROZEN per run, no longer re-derived from the display name on
         // every start. Still resolved BEFORE any deletion — the answer is a fact that lives in the
         // PRE-wipe `run.json` — but now BELOW the `diff_partial_wipe` binding, because that is the
@@ -2937,6 +2947,16 @@ fn run_worker(
             "vocoder_pretrain": ctx.vocoder_pretrain,
         },
     });
+    // ★§F2⒝ ④d — WHICH pool-identity formula this slot's products are stamped with. The third
+    // fact in this file that only this side can establish (beside `run_dir` and
+    // `slot_has_main_model`): python has no layout concept at all — `utai_train/pool.py`'s
+    // `open_pool` never opens `slot.json`, and nothing under `utai_train/` does — so before this
+    // key a Rust-side decision NOT to migrate a slot was invisible to it, and python would have
+    // gone on computing the NEW identity text against a disk still holding the old one: a sibling
+    // pool and hours of preprocessing, under a single `logger.info`.
+    // (Assigned rather than written into the `json!` block above so the key is one named
+    // constant on both sides of the language boundary — see `tpool::IDENTITY_VERSION_KEY`.)
+    run_config[tpool::IDENTITY_VERSION_KEY] = serde_json::json!(tpool::identity_version(&workspace));
     // ①c: the sovits pipeline's resolve_speakers reads this array for co-training;
     // single-speaker omits the key entirely -> pipeline falls back to
     // dataset_dir/model_slug = byte-identical run.json / behavior.
@@ -4823,6 +4843,8 @@ mod tests {
         // ⒜ 与旧探针逐串对拍。这七条覆盖四条公式的全部形状:sovits(带/不带)· sovits_v2 的
         //    条件尾巴 · rvc 单说话人(裸指纹,连一个 `|` 都没有)· rvc 多说话人(全是**无 `=`**
         //    的 token,所以「跳过没有 `=` 的 token」是必需的而不是防御性的)· vocoder · 空。
+        //    ★§F2⒝ ④d —— 后四条是**新公式**能产出的形状(共享尾巴 `|sr=` / `|aug=` 接在最末)。
+        //    加 token 会不会让这个读者改口,是 R4 当初被写下来的**唯一**理由,所以新串必须进这张表。
         for text in [
             "d41d8c|enc=vec768l12|loudnorm=1",
             "d41d8c|enc=vec768l12|loudnorm=0",
@@ -4831,6 +4853,11 @@ mod tests {
             "aaaa|bbbb|cccc",
             "e0098e8d7d7be4b04eef47007e01729d|vocoder-v3",
             "",
+            "d41d8c|enc=vec768l12|loudnorm=1|aug=2",
+            "d41d8c|enc=vec256l9|loudnorm=0|f0=dio|aug=3",
+            "96d753dd248b7decf6832e950b9c044e|sr=40000|aug=2",
+            "aaaa|bbbb|cccc|sr=48000",
+            "e0098e8d7d7be4b04eef47007e01729d|vocoder-v3|aug=1",
         ] {
             assert_eq!(
                 loudnorm_from_fingerprint(text).unwrap_or(false),

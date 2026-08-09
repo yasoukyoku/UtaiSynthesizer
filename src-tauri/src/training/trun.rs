@@ -1462,13 +1462,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
-    /// ⛔ The two layouts advance the SAME `slot.json`, one step each. Bumping `tpool`'s constant
-    /// instead of adding one would make an already-folded slot compute an empty pool plan, take
-    /// the "nothing to move" branch and stamp the new layout — migrated on paper, untouched on
-    /// disk.
+    /// ⛔ The layouts advance the SAME `slot.json`, one step each. Bumping an existing constant
+    /// instead of adding one would make an already-folded slot compute an empty plan, take the
+    /// "nothing to move" branch and stamp the new layout — migrated on paper, untouched on disk.
+    ///
+    /// ★§F2⒝ ④d —— 这条断言此前是**两个常量差 1**,而加第三个常量时它**恒绿**(它根本不提第三个)。
+    /// 改成一条**逐步的链**:每一步都必须比上一步大 1,而且步数写死 —— 加一个常量却忘了把它接进
+    /// 链里,这里当场红。⚠ 这只钉**数字关系**;「新那一步有没有被接进 `migrate_layouts`」由
+    /// [`the_boot_chain_folds_pools_before_runs`] 钉,两条缺一不可。
     #[test]
     fn the_two_migrations_advance_the_same_commit_point_one_step_each() {
-        assert_eq!(SLOT_LAYOUT_RUNS, tpool::SLOT_LAYOUT + 1);
+        const CHAIN: &[(&str, u32)] = &[
+            ("tpool::SLOT_LAYOUT", tpool::SLOT_LAYOUT),
+            ("trun::SLOT_LAYOUT_RUNS", SLOT_LAYOUT_RUNS),
+            ("tpool::SLOT_LAYOUT_POOL_ID", tpool::SLOT_LAYOUT_POOL_ID),
+        ];
+        for w in CHAIN.windows(2) {
+            let ((prev_name, prev), (next_name, next)) = (w[0], w[1]);
+            assert_eq!(
+                next,
+                prev + 1,
+                "{next_name} 必须紧接 {prev_name}:同一个 slot.json,一步一个数字"
+            );
+        }
+        // ⛔ 上面那个循环的全集是**这张表自己**,所以它对「新增了一个常量但没接进来」是瞎的 ——
+        // 而那正是加第三个常量时最容易犯的错。补上的判据不看表,看**源码**:两个文件里
+        // `pub const SLOT_LAYOUT` 开头的常量有几个,链里就必须有几项。
+        // ⚠ `concat!` 拆开写,否则这一行**自己**就是第四个命中(`code_only` 抹注释,不抹字符串
+        //   字面量)—— 尺子把自己量了进去。仓里 `mod.rs` 的反向断言用的是同一个手法。
+        let needle = concat!("pub const ", "SLOT_LAYOUT");
+        let declared = [include_str!("tpool.rs"), include_str!("trun.rs")]
+            .iter()
+            .map(|src| code_only(src).matches(needle).count())
+            .sum::<usize>();
+        assert_eq!(
+            declared,
+            CHAIN.len(),
+            "源码里有 {declared} 个 layout 常量,链里只有 {} 项 —— 新增一个就要接进这条链",
+            CHAIN.len()
+        );
         let data = tmp_data("layouts");
         let id = "p666_9999aaaa";
         let slot = project_dir(&data, id).join("rvc");
