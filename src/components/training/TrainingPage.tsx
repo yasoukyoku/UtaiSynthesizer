@@ -2374,6 +2374,34 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       exists,
     });
 
+  /** 已装模型的名字(这一族)。sovits 与 sovits_v2 共用 SoVITS 注册表(`parse_voice_type`)。 */
+  const installedNames = (family: string) =>
+    (family === "rvc" ? rvcModels : family === "vocoder" ? vocoderModels : sovitsModels).map(
+      (m) => m.name,
+    );
+
+  /** ★§F2⒝ 批 2 ④b —— 同名导入是 REPLACE,而单条导入这条路以前**连问都不问**。
+   *
+   *  ⛔ 它删掉的不只是那个模型的文件。保存过的工程里,音轨是**按显示名**绑定音源的
+   *  (`Track.voiceModel` 是一个字符串,`.usp` 里存的就是它,加载时 `modelPathHeal` 按名重绑)——
+   *  于是「同名替换」会让**几个月没打开过的工程静默换成另一个歌手**,没有 undo、没有日志,
+   *  症状出现在完全不同的功能区。而 ④ 这一批正是让**同一个槽的两个 run 提议同一个名字**的那批。
+   *
+   *  ⚠ 这里只是**训练侧的止血**:引用完整性本身(音轨改为按模型 id 绑定 + 存量 .usp 迁移)
+   *  是队列里单独的一格,不在本批。 */
+  const confirmReplaceInstalled = async (name: string) => {
+    if (!installedNames(backendFamily(archiveBackend)).includes(name)) return true;
+    const id = await showConfirm({
+      title: t("training.importReplaceTitle"),
+      body: t("training.importReplaceBody", { name }),
+      buttons: [
+        { id: "__cancel", label: t("training.cancel") },
+        { id: "go", label: t("training.importReplace"), kind: "danger" },
+      ],
+    });
+    return id === "go";
+  };
+
   /** Re-read the archive list after an export, so its「已导入」marks are current.
    *
    *  S76 batch 4: this used to ALSO write the ledger row itself — a second write beside the
@@ -2412,6 +2440,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       input: { initial: suggestedName(ckpt, rowId.name) },
     });
     if (!name || name === "__cancel") return;
+    if (!(await confirmReplaceInstalled(name))) return;
     const idx = await resolveIndexOf(rowId);
     try {
       // ★§F2⒝ — the warnings were DROPPED here while the batch import below collected them, and
@@ -2468,9 +2497,18 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     const lines = chosen.map(
       (c) => `${names.get(c.path)}  ←  ${c.path.split(/[\\/]/).pop()}`,
     );
+    // ★§F2⒝ 批 2 ④b —— 批量这条路的清单以前也不说哪几行会**顶掉一个已装的同名模型**。
+    // 与单条那条同一个理由(见 `confirmReplaceInstalled`),只是这里把它并进已有的清单里,
+    // 而不是为一批弹 N 个对话框。
+    const already = installedNames(backendFamily(archiveBackend));
+    const clashes = [...used].filter((n) => already.includes(n));
     const okId = await showConfirm({
       title: t("training.importSelectedTitle"),
-      body: `${t("training.importSelectedBody")}\n\n${lines.join("\n")}`,
+      body:
+        `${t("training.importSelectedBody")}\n\n${lines.join("\n")}` +
+        (clashes.length > 0
+          ? `\n\n${t("training.importReplaceBody", { name: clashes.join("、") })}`
+          : ""),
       buttons: [
         { id: "ok", label: t("training.import"), kind: "primary" },
         { id: "cancel", label: t("training.cancel") },

@@ -74,6 +74,34 @@ describe("archive rows resolve their identity per row", () => {
     }
   });
 
+  it("★ a same-name install is never silent — on either import path", async () => {
+    // Why this is a training-page gate at all: `import_model` replaces by NAME, and a saved
+    // project remembers its voice by that same string (`Track.voiceModel`, re-bound at load by
+    // `modelPathHeal`). So a silent replace does not merely lose a model — it swaps the singer in
+    // projects the user has not opened in months. ④ is the batch that makes two runs of one slot
+    // propose the same name, so the ask has to exist before that lands.
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(FILE, "utf8"));
+
+    const single = code.indexOf("const importCkpt = async (");
+    expect(single, "importCkpt is gone").toBeGreaterThan(0);
+    const singleInvoke = code.indexOf('"import_model"', single);
+    expect(singleInvoke).toBeGreaterThan(single);
+    expect(
+      code.slice(single, singleInvoke),
+      "the single-row import reaches import_model without asking about a same-name replace",
+    ).toContain("confirmReplaceInstalled(name)");
+
+    const batch = code.indexOf("const importSelected = async (");
+    expect(batch, "importSelected is gone").toBeGreaterThan(0);
+    const batchInvoke = code.indexOf('"import_model"', batch);
+    expect(batchInvoke).toBeGreaterThan(batch);
+    expect(
+      code.slice(batch, batchInvoke),
+      "the batch import's confirmation does not say which rows would replace an installed model",
+    ).toContain("importReplaceBody");
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();
