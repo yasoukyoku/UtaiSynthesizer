@@ -635,6 +635,19 @@ pub struct WorkspaceInfo {
     /// manifest aug_copies (S41 数据增强份数) — diff runs inherit it from the
     /// main training; surfaced so the diff params page shows the real value
     pub aug_copies: u64,
+    /// ★§F2⒝ 批 2 ④d — the loudness-normalisation flag this slot's PREPROCESSING was built with.
+    /// `None` = nothing on disk answers (a slot that never ran, or a manifest old enough to
+    /// predate the field with no single pool fingerprint to read it out of).
+    ///
+    /// ⛔ `Option`, not `bool`, and the difference is the whole point: the params-page form
+    /// restore has to tell "this slot was built WITHOUT loudnorm" apart from "nobody knows".
+    /// `loudnorm` is folded into the sovits-family dataset fingerprint
+    /// (`utai_train/sovits/pipeline.py`'s `extract_cache_fp_text`), so it is not a display
+    /// preference — it NAMES the pool. A form that forgets it and sends `false` against a pool
+    /// built with `true` resolves a different pool and re-slices + re-extracts every file in it,
+    /// with one `logger.info` as the only sign. Collapsing unknown into `false` is exactly how
+    /// that happens, which is why this field refuses to.
+    pub loudnorm: Option<bool>,
     /// a reusable shared slice pool exists (prior completed import): diff runs
     /// may start WITHOUT re-importing data when this is true (S41 共享池模式)
     pub has_dataset: bool,
@@ -652,6 +665,43 @@ pub struct WorkspaceInfo {
     pub speakers: Vec<String>,
     /// ①c: manifest diff_k_step_max (sovits_diff); 0 when absent.
     pub diff_k_step_max: u64,
+}
+
+/// The `loudnorm` flag a pool FINGERPRINT TEXT records, or `None` when the text does not answer.
+///
+/// The four fingerprint formulas (`utai_train/{sovits,sovits_v2,rvc,vocoder}/pipeline.py`) all
+/// build a `|`-joined token list, and only the sovits family carries this token — so "no answer"
+/// is the ordinary case here, not a corruption.
+///
+/// ⛔ Deliberately NOT the `text.contains("|loudnorm=1")` this replaced. That shape had three
+/// failure modes and no way to report any of them:
+/// * `|loudnorm=10` reads as true (a value that is not a flag at all);
+/// * `|note=|loudnorm=1` reads as true (the token embedded in another token's VALUE);
+/// * it cannot say "unknown", so every one of those collapsed into `false` at the call site —
+///   and `false` is a legal answer that then gets written into the manifest as fact.
+/// Tokenising is free and lets both callers distinguish absent from off.
+///
+/// ⚠ A token without `=` is normal input: a multi-speaker RVC fingerprint is a `|`-join of bare
+/// hashes (`rvc/pipeline.py`), so skipping those is required, not defensive.
+/// ⚠ Two `loudnorm` tokens that disagree answer `None`. No formula can emit that, so it is a text
+/// we do not understand — and not guessing at a text we do not understand is the entire job.
+pub(crate) fn loudnorm_from_fingerprint(text: &str) -> Option<bool> {
+    let mut seen: Option<bool> = None;
+    for tok in text.trim().split('|') {
+        let Some(raw) = tok.strip_prefix("loudnorm=") else {
+            continue;
+        };
+        let v = match raw {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        match seen {
+            Some(prev) if prev != v => return None,
+            _ => seen = Some(v),
+        }
+    }
+    seen
 }
 
 /// LEGACY-SHAPE predicate: a pre-S76 workspace where `dataset/` and `dataset.fingerprint`
@@ -790,6 +840,20 @@ pub fn slot_info(
         },
         diff_best_resume_step: diff_snapshot_step(&run, "resume_best"),
         aug_copies: manifest["aug_copies"].as_u64().unwrap_or(0),
+        // ★§F2⒝ 批 2 ④d — manifest first, then the pool's own fingerprint. The order is not
+        // arbitrary: the manifest records what was REQUESTED, the fingerprint records what the
+        // products on disk were actually BUILT with, and they agree except in the one case the
+        // fallback exists for — an S38-era manifest that predates the key. Reading the pool there
+        // is the same recovery `try_start` already does for a diffusion run's inheritance
+        // (see `eff_loudnorm`), asked of the same two places in the same order.
+        // ⚠ `sole_pool_fingerprint` answers `None` with more than one pool, and that is the
+        // honest answer: with two pools nothing on disk says which one this run belongs to
+        // (nothing records the run↔pool edge yet). The caller then leaves the form alone.
+        loudnorm: manifest["loudnorm"].as_bool().or_else(|| {
+            tpool::sole_pool_fingerprint(&ws)
+                .or_else(|| std::fs::read_to_string(ws.join(tpool::FINGERPRINT)).ok())
+                .and_then(|s| loudnorm_from_fingerprint(&s))
+        }),
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
         has_dataset: tproject::has_dataset(data_dir, project_id),
@@ -2094,11 +2158,15 @@ impl TrainingManager {
                     // Every workspace old enough to reach this backfill was migrated from a
                     // single flat slot and therefore has exactly one; the second arm is that
                     // same flat slot before the migration has run.
+                    // ★§F2⒝ 批 2 ④d(R4)—— the reader is a tokeniser now, not a substring
+                    // probe: ④d appends new tokens to this very text, and `contains` cannot tell
+                    // "the text says off" from "the text does not say". Same answer as before on
+                    // every string the four formulas can emit (see the unit tests).
                     let v = tpool::sole_pool_fingerprint(&workspace)
                         .or_else(|| {
                             std::fs::read_to_string(workspace.join(tpool::FINGERPRINT)).ok()
                         })
-                        .map(|s| s.contains("|loudnorm=1"))
+                        .and_then(|s| loudnorm_from_fingerprint(&s))
                         .unwrap_or(false);
                     manifest["loudnorm"] = serde_json::json!(v);
                     v
@@ -4707,6 +4775,106 @@ mod tests {
         // every run is still visible to the SLOT-level questions (bytes, wipe consent)
         assert_eq!(trun::run_dirs(&slot).len(), 2);
         assert!(slot_holds_work(&slot));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ★§F2⒝ 批 2 ④d 笔 0 —— 「这个槽的预处理是带响度归一化建的吗」必须有**第三个**答案。
+    ///
+    /// 此前只有 `try_start` 内部一处读者问过这个问题,而它只能答 true/false:一个
+    /// `contains("|loudnorm=1")`,答不上来就算 `false`。而 `loudnorm` 折进 sovits 家的数据集
+    /// 指纹(`utai_train/sovits/pipeline.py` 的 `extract_cache_fp_text`)⇒ 它**命名了那个池**。
+    /// 答错一次的代价不是一次报错,是下一次运行落到**另一个**池上、把整份切片与特征重跑一遍,
+    /// 而唯一的痕迹是 python 那边一行 `logger.info`。参数页的表单还原要用它,所以「不知道」
+    /// 必须是一个能说出口的答案 —— 塌成 `false` 就等于替用户关掉一个他从没碰过的开关。
+    ///
+    /// 判据两半,缺任何一半另一半都会被一个常量满足:
+    /// ⒜ 纯读者在**四条公式能产出的每一种串**上与被它替换掉的子串探针**逐串同值**,并在那三类
+    ///    子串探针答错的串上**拒绝作答**;
+    /// ⒝ `slot_info` 的三态,而且三态各自有**方向**:manifest 的 `false` ≠ 没说 · 池答得上来时
+    ///    要采纳池 · 池不唯一时答 `None` 而不是挑一个。
+    #[test]
+    fn the_loudnorm_a_pool_was_built_with_is_readable_and_may_answer_unknown() {
+        // ⒜ 与旧探针逐串对拍。这七条覆盖四条公式的全部形状:sovits(带/不带)· sovits_v2 的
+        //    条件尾巴 · rvc 单说话人(裸指纹,连一个 `|` 都没有)· rvc 多说话人(全是**无 `=`**
+        //    的 token,所以「跳过没有 `=` 的 token」是必需的而不是防御性的)· vocoder · 空。
+        for text in [
+            "d41d8c|enc=vec768l12|loudnorm=1",
+            "d41d8c|enc=vec768l12|loudnorm=0",
+            "d41d8c|enc=vec256l9|loudnorm=1|f0=dio",
+            "96d753dd248b7decf6832e950b9c044e",
+            "aaaa|bbbb|cccc",
+            "e0098e8d7d7be4b04eef47007e01729d|vocoder-v3",
+            "",
+        ] {
+            assert_eq!(
+                loudnorm_from_fingerprint(text).unwrap_or(false),
+                text.contains("|loudnorm=1"),
+                "{text}: 换一个读者不许改变任何一条【现有】输入的答案"
+            );
+        }
+        // …而 unwrap_or(false) 之下藏着的正是新读者多出来的那一档,所以单独钉一次:
+        assert_eq!(loudnorm_from_fingerprint("d41d8c|enc=vec768l12|loudnorm=0"), Some(false));
+        assert_eq!(loudnorm_from_fingerprint("aaaa|bbbb|cccc"), None, "没有这个 token = 没有答案");
+
+        // 这三类是旧探针答错的。它们今天产不出来 —— 钉住它们是因为 ④d 要往这个串上**加 token**,
+        // 而「加一个 token 会不会让这个读者改口」这件事必须有东西看着。
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=10"), None, "旧探针在这条上答 true");
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=1extra"), None, "旧探针在这条上答 true");
+        assert_eq!(loudnorm_from_fingerprint("x|loudnorm=1|loudnorm=0"), None, "自相矛盾不许挑一个");
+
+        // ⒝ 三态,用真目录驱动 `slot_info`。
+        let data = tmp_ws("loudnorm3");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "pln_11112222";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "sovits");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let manifest = |v: serde_json::Value| {
+            std::fs::write(run.join("run_manifest.json"), v.to_string()).unwrap()
+        };
+        let ask = || slot_info(&data, id, "sovits", None).unwrap().loudnorm;
+
+        // manifest 说了就听 manifest —— 而 `false` 与「没说」必须给出**不同**的答案,否则这个
+        // 字段还是两态,只是换了个类型。
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": true }));
+        assert_eq!(ask(), Some(true));
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": false }));
+        assert_eq!(ask(), Some(false));
+
+        // manifest 没这个键(S38 之前的形状)⇒ 读**池自己的指纹**。先证明它此刻确实答不上来,
+        // 否则下面那条「池答上来了」会被上一步的残留满足。
+        manifest(serde_json::json!({ "version": "4.1" }));
+        assert_eq!(ask(), None, "先证明缺口是真的");
+
+        let fp = "d41d8c|enc=vec768l12|loudnorm=1";
+        let pool = tpool::pools_root(&slot).join(tpool::pool_id_for(fp));
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join(tpool::FINGERPRINT), fp).unwrap();
+        assert_eq!(ask(), Some(true), "盘上那棵切片树就是在这个值下建起来的");
+
+        // 方向性:池说 0 就必须是 Some(false)。少了这一条,「读池」可以由一个恒 true 实现。
+        std::fs::write(pool.join(tpool::FINGERPRINT), "d41d8c|enc=vec768l12|loudnorm=0").unwrap();
+        assert_eq!(ask(), Some(false));
+
+        // 两个池 ⇒ 盘上没有任何东西记着这个 run 属于哪一个(run↔pool 这条边今天不存在)
+        // ⇒ 诚实地答 None。塌成 false 会让参数页把复选框关掉,而那正是这个字段要防的那件事。
+        let fp2 = "9e9e9e|enc=vec768l12|loudnorm=1";
+        let pool2 = tpool::pools_root(&slot).join(tpool::pool_id_for(fp2));
+        std::fs::create_dir_all(&pool2).unwrap();
+        std::fs::write(pool2.join(tpool::FINGERPRINT), fp2).unwrap();
+        assert_eq!(ask(), None, "不唯一就不猜");
+
+        // …而 manifest 一旦说了话,池有几个都不再重要(顺序:manifest 是这次请求的记录,
+        // 池是产物的记录,只有前者缺席时才需要问后者)。
+        manifest(serde_json::json!({ "version": "4.1", "loudnorm": true }));
+        assert_eq!(ask(), Some(true));
+
         let _ = std::fs::remove_dir_all(&data);
     }
 

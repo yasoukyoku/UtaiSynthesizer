@@ -318,6 +318,10 @@ export interface WorkspaceInfo {
   diff_best_resume_step: number | null;
   /** manifest 数据增强份数 (S41) — what a diff run will inherit */
   aug_copies: number;
+  /** ★§F2⒝ 批 2 ④d — 这个槽的**预处理**是不是带响度归一化建的。`null` = 盘上没有东西回答
+   *  (从没跑过 / manifest 老到没这个键且池不唯一)。三态是**有意**的:`false` 要把复选框放回
+   *  「关」,`null` 必须**不动**用户当前的值 —— 这个字段就是为了让这两件事分得开才存在的。 */
+  loudnorm: boolean | null;
   /** a reusable shared slice pool exists — diff may start without importing */
   has_dataset: boolean;
   /** ①c resume config-diff: manifest vol_embedding (SoVITS); null when absent/not-sovits */

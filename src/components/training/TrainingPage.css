@@ -853,6 +853,17 @@
   font-size: var(--font-size-sm);
 }
 
+/* ★§F2⒝ 批 2 ④d: the COSTLY tier of the 续训锁 table, on screen for the first time. Locked
+   fields replace their control (`.training-fixed-value`); costly ones keep it — the change is
+   allowed — and only say what it will cost, so this sits BESIDE the control, quieter than
+   `.training-cpu-note` (that one reports a fact about this run; this one is a price tag). */
+.training-costly-note {
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+  margin-left: var(--space-sm);
+  white-space: nowrap;
+}
+
 /* S114 §F5-1: live diagnostics for a run that is still going. Deliberately the
    SAME warning colour as .training-cpu-note and NOT the error red — these say
    "something is probably wrong, here is what to do", not "the run failed".

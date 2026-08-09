@@ -360,6 +360,8 @@
     "resumeLocked": "locked for resume",
     "resumeLockedTip": "This value is baked into the artifacts this architecture already produced, so a resume cannot change it. To change it, choose Retrain at start — that clears this architecture's progress.",
     "resumeLockedNote": "Fields marked \"locked for resume\" cannot change: they are baked into the existing model, and changing one makes it impossible to continue. To change them, pick retrain at start.",
+    "resumeCostly": "changing this re-runs preprocessing",
+    "resumeCostlyTip": "This value decides WHICH set of preprocessing products (slices, f0, features) this architecture trains on. Change it and the next run switches to a different set and rebuilds all of it — the bigger the dataset, the longer that takes. No model progress is lost, and the previous set stays on disk.",
     "on": "On",
     "off": "Off",
     "totalSteps": "Total steps",

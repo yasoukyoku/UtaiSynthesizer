@@ -849,6 +849,24 @@ function ParamsStep() {
     </span>
   );
 
+  // ★§F2⒝ 批 2 ④d —— costly 档头一次在屏幕上有东西。`resume_lock.rs` 的档位文档写着
+  // 「Costly … These are NOT refused; the UI says what it will cost」,而在此之前那句话是空的:
+  // `lockedFieldIds(_, "costly")` 全仓零调用点,i18n 里也没有一条 costly 串。
+  // ⚠ 判据与 locked 那一档**不同,而且必须不同**:locked 问「这个值有没有被烧进已有产物」
+  // (扩散那条链问的是扩散自己的进度),costly 问的是「这个**槽**里有没有一份预处理池会被
+  // 换掉」—— 与哪条链在练无关。manifest 写在 worker 开始预处理**之前**,所以它一存在就说明
+  // 这个槽已经付过那笔时间。「再训一个」会清空整槽,那时不存在「换池」这回事。
+  const slotHasPreprocessing =
+    !retrainIntent && !!slotInfo?.exists && (slotInfo.version !== "" || slotInfo.sample_rate !== "");
+  const costly = slotHasPreprocessing ? lockedFieldIds(config.backend, "costly") : new Set<string>();
+  /** costly 项的代价标记:改它合法,但下一次运行会落到**另一个**预处理池上,切片与特征全部重跑。 */
+  const costlyNote = (id: string) =>
+    costly.has(id) ? (
+      <span className="training-costly-note" title={t("training.resumeCostlyTip")}>
+        {t("training.resumeCostly")}
+      </span>
+    ) : null;
+
   // S68b: an empty GPU list used to hide ALL device UI (dropdown AND the force-CPU
   // checkbox) while silently forcing CPU — a community RTX 3080 box with a dead GPU
   // probe trained on CPU with zero visual hint. The CPU fact now shows on the form.
@@ -1156,12 +1174,15 @@ function ParamsStep() {
                     : ""}
                 </span>
               ) : (
-                <NumberField
-                  value={config.diffAugCopies}
-                  min={0}
-                  max={3}
-                  onChange={(v) => updateConfig({ diffAugCopies: v })}
-                />
+                <>
+                  <NumberField
+                    value={config.diffAugCopies}
+                    min={0}
+                    max={3}
+                    onChange={(v) => updateConfig({ diffAugCopies: v })}
+                  />
+                  {costlyNote("augCopies")}
+                </>
               )}
             </div>
             <label className="training-check-row">
@@ -1219,6 +1240,7 @@ function ParamsStep() {
                 value={config.vocAugCopies}
                 onChange={(v) => updateConfig({ vocAugCopies: v })}
               />
+              {costlyNote("augCopies")}
             </div>
             {forceCpuRow}
           </div>
@@ -1273,6 +1295,7 @@ function ParamsStep() {
                 value={config.augCopies}
                 onChange={(v) => updateConfig({ augCopies: v })}
               />
+              {costlyNote("augCopies")}
             </div>
             {forceCpuRow}
           </div>
@@ -1310,6 +1333,7 @@ function ParamsStep() {
                 onChange={(e) => updateConfig({ sovitsLoudnorm: e.target.checked })}
               />
               {t("training.loudnorm")}
+              {costlyNote("loudnorm")}
             </label>
             {/* v2 (VISinger2) is pure fp32 upstream and its loader has no
                 all-in-mem mode — hidden per the "不能选的隐藏" rule */}
@@ -1341,6 +1365,7 @@ function ParamsStep() {
                 value={config.sovitsAugCopies}
                 onChange={(v) => updateConfig({ sovitsAugCopies: v })}
               />
+              {costlyNote("augCopies")}
             </div>
             {forceCpuRow}
           </div>

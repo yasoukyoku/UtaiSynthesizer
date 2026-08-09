@@ -30,10 +30,10 @@ import {
   type SlotDetail,
   type RunDetail,
   type TrainingBackend,
-  type TrainingFormConfig,
   type TrainingSeg,
   type WorkspaceInfo,
 } from "../../store/training";
+import { formForSlot } from "../../lib/training/formForSlot";
 import { backendErrorMessage } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
@@ -248,45 +248,16 @@ export function ProjectDetail() {
     return name;
   };
 
-  /** Put the form back where the SLOT already is.
+  /** Put the form back where this RUN already is —— 实现在 `lib/training/formForSlot.ts`。
    *
-   *  Every field here is resume-guarded Rust-side (`RESUME_PARAMS_MISMATCH` /
-   *  `RESUME_VOL_EMBEDDING_MISMATCH`): if the form disagrees with the manifest, 续训 is
-   *  impossible and the start dialog can only offer 重训 —— a button labelled「继续训练」whose
-   *  one available outcome is wiping the slot. The defaults are NOT harmless here: `sampleRate`
-   *  defaults to 48k while an existing RVC slot may be 40k, and `sovitsVersion` defaults to 4.1
-   *  while the slot may be 4.0.
-   *
-   *  `pin` overrides the manifest — used by 重训, which wipes the slot and may therefore
-   *  legitimately change the version. */
-  const formForSlot = (
-    family: Family,
-    run: RunDetail | undefined,
-    pin?: "4.1" | "4.0",
-  ): Partial<TrainingFormConfig> => {
-    const info = run?.info;
-    if (family === "rvc") {
-      const v = info?.version === "v1" || info?.version === "v2" ? info.version : undefined;
-      const sr =
-        info?.sample_rate === "32k" || info?.sample_rate === "40k" || info?.sample_rate === "48k"
-          ? info.sample_rate
-          : undefined;
-      return { ...(v ? { version: v } : {}), ...(sr ? { sampleRate: sr } : {}) };
-    }
-    if (family === "sovits") {
-      const manifest = info?.version === "4.1" || info?.version === "4.0" ? info.version : undefined;
-      const v = pin ?? manifest ?? "4.1";
-      return {
-        sovitsVersion: v,
-        // 响度嵌入 is 4.1-only and is baked into the graph AND the wire inputs.
-        ...(v === "4.1" && !pin && info?.vol_embedding != null
-          ? { sovitsVolEmbedding: info.vol_embedding }
-          : {}),
-      };
-    }
-    // sovits_v2 / vocoder carry fixed manifest markers — nothing to restore.
-    return {};
-  };
+   *  ★§F2⒝ 批 2 ④d —— 它从这个组件里搬出去了,理由有两条,都不是整洁:
+   *  ⒜ `resume_lock.rs` 的模块头把「项目页的表单还原」列为必须与守卫一致的四处之一,而这一处
+   *     此前**结构上无法有闸**(组件内闭包,vitest 不做组件测试);
+   *  ⒝ 它此前**只还原 locked 那一档**,漏掉的 `costly` 那一档恰好是「决定用哪个预处理池」的
+   *     那些值 —— 漏还原不会被拒,而是静默换池重跑几小时,并把 manifest 里的记录一起覆盖掉。
+   *  两条的完整推导与判据在那个文件的头注释与 `formForSlot.test.ts`。 */
+  const formFor = (family: Family, run: RunDetail | undefined, pin?: "4.1" | "4.0") =>
+    formForSlot(family, run?.info, pin);
 
   /** Open this architecture's 存档中心. Sets the family the archive page speaks for (it reads
    *  `config.backend`), then routes — no name prompt, no run, just the product inventory. */
@@ -312,7 +283,7 @@ export function ProjectDetail() {
       // 但它必须**在铸第二个 run 之前**就通到底:`resolve_run_dir` 对多于一个 run 拒绝作答,
       // 所以漏穿的调用点是响亮的错误,而不是悄悄写进别人的 run。
       runId: run?.id ?? "",
-      ...formForSlot(family, run, sovitsVersion),
+      ...formFor(family, run, sovitsVersion),
     });
     setRoute({ seg: nextSegFor(family), projectId });
   };
@@ -355,7 +326,7 @@ export function ProjectDetail() {
       // 今天这条路仍然是「清空这个槽重来」(⑤ 才把它变成新建 run),所以它带的正是被清空的
       // 那个 run 的 id —— 后端的每一道闸都要判**它**的 pre-wipe 状态。
       runId: run?.id ?? "",
-      ...formForSlot(family, run, pin),
+      ...formFor(family, run, pin),
     });
     setRoute({ seg: nextSegFor(family), projectId });
   };
@@ -402,7 +373,10 @@ export function ProjectDetail() {
       //   ContentVec space as the cached features it trains on (4.1 = vec768 / 4.0 = vec256).
       //   A mismatch does not error — it just produces something that does not fit its host.
       diffVersion: version,
-      ...(info && info.diff_steps > 0 ? { diffKStepMax: Number(info.diff_k_step_max) } : {}),
+      // ★§F2⒝ 批 2 ④d —— k_step_max 的还原(以及 diff-first 槽的增强份数)与另外四张卡走
+      // **同一个**函数。此前这里自己写了一份 `diff_steps > 0` 的判断,而那正是「同一条规则的
+      // 第五份副本」—— `resume_lock.rs` 的模块头说这个模块存在就是为了消灭它们。
+      ...formForSlot("sovits_diff", info),
     });
     setRoute({ seg: nextSegFor("sovits_diff"), projectId });
   };
