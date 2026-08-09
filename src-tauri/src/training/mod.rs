@@ -1175,11 +1175,33 @@ pub(crate) fn slugify(name: &str) -> String {
 /// that never started has nothing to orphan. (The banned shape — see `utai_train/pool.py:30-32` —
 /// is the one where absence is indistinguishable from a forgotten wiring change.)
 ///
-/// `req.fresh` mints instead: 重训 wipes the slot, so there are no artifacts left to keep the
-/// old identity for, and choosing a new name there is exactly the point of the button. Same
-/// early-out, same reason, as [`effective_speaker_slugs`].
-fn effective_artifact_slug(run: &trun::RunDir, req: &StartTrainingRequest) -> String {
-    if req.fresh {
+/// `wipes_this_run` mints instead: a full 重训 erases the slot, so there are no artifacts left to
+/// keep the old identity for, and choosing a new name there is exactly the point of the button.
+///
+/// ⛔★ It is NOT `req.fresh`. That was this function's first form and it was WRONG on exactly one
+/// branch — `diff_partial_wipe` (see `try_start`): a 「重训(仅扩散)」 sets `fresh` and yet deletes
+/// only `<run>/diffusion/`, leaving the pool, `weights/`, `audition/` and `run.json` in place. So
+/// on that branch a minted slug is not「没有产物需要保住旧身份」, it is a rename applied to a run
+/// whose products all still exist:
+///   * the diffusion chain slices into `<pool>/dataset_44k/<newslug>/` — a SECOND full tree beside
+///     the first, inside the SAME pool (the pool is chosen by fingerprint CONTENT, which has no
+///     slug in it), and the two share ONE flat `<pool>/aug_meta` whose entries they then delete
+///     from each other;
+///   * `run.json` is rewritten wholesale with the new slug, so the MAIN model's frozen identity is
+///     silently re-pointed and its `weights/<oldslug>*` / `audition/<oldslug>_*` become orphans;
+///   * the main `config.json` keeps the OLD slug as its `config.spk` key, and nothing compares them.
+/// The rename button (§F2⒝ ④b) is what made that reachable, which is why the caller now composes
+/// the flag from the one `diff_partial_wipe` binding rather than from `req.fresh` alone.
+/// ⛔ Do NOT widen it to「工作区会不会被删」in general: the FULL wipe branch must keep minting, or
+/// 重训 stops being able to change the name — which is what that button is for.
+///
+/// Same early-out, same reason, as [`effective_speaker_slugs`].
+fn effective_artifact_slug(
+    run: &trun::RunDir,
+    req: &StartTrainingRequest,
+    wipes_this_run: bool,
+) -> String {
+    if wipes_this_run {
         return slugify(&req.model_name);
     }
     tproject::run_artifact_slug(run).unwrap_or_else(|| slugify(&req.model_name))
@@ -1756,12 +1778,6 @@ impl TrainingManager {
         let req_run = Some(req.run_id.trim()).filter(|s| !s.is_empty());
         let run = trun::resolve_run_dir(&workspace, req_run)?;
 
-        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`, the
-        // `config.spk` key. ★§F2⒝ batch 2 step ④b: FROZEN per run, no longer re-derived from the
-        // display name on every start. Resolved here, after the run is known and BEFORE any
-        // deletion, because the answer is a fact that lives in the PRE-wipe `run.json`.
-        let slug = effective_artifact_slug(&run, &req);
-
         // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
         // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
         // slot, so their next「续训」would rmtree hours of preprocessing AND continue on data
@@ -1875,6 +1891,16 @@ impl TrainingManager {
         let diff_partial_wipe =
             req.fresh && req.backend == "sovits_diff" && workspace.exists()
                 && old_manifest.is_some() && has_main;
+
+        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`, the
+        // `config.spk` key, and (single-speaker SoVITS) `<pool>/dataset_44k/<slug>/`.
+        // ★§F2⒝ batch 2 step ④b: FROZEN per run, no longer re-derived from the display name on
+        // every start. Still resolved BEFORE any deletion — the answer is a fact that lives in the
+        // PRE-wipe `run.json` — but now BELOW the `diff_partial_wipe` binding, because that is the
+        // one branch where a `fresh` start destroys nothing and the identity must therefore hold.
+        // ⛔ Reading `req.fresh` alone here (its first form) let 「重训(仅扩散)」 of a RENAMED run
+        // mint a new slug against a run whose products all still exist — see the function's doc.
+        let slug = effective_artifact_slug(&run, &req, req.fresh && !diff_partial_wipe);
 
         // ---- resume-parameter guard ----
         // The rule itself lives in `resume_lock` — ONE table plus ONE enforcement, driven
@@ -4180,14 +4206,14 @@ mod tests {
 
         // ⑴ a run that never started carries no artifacts to keep an identity for ⇒ mint
         assert_eq!(
-            effective_artifact_slug(&run, &req("初号机", false)),
+            effective_artifact_slug(&run, &req("初号机", false), false),
             slugify("初号机"),
             "with no run.json the slug is minted from the name, exactly as before ④b"
         );
 
         // ⑵ a run whose own run.json records a slug must ADOPT it
         write_run_json("LEGACY-STEM");
-        let adopted = effective_artifact_slug(&run, &req("初号机", false));
+        let adopted = effective_artifact_slug(&run, &req("初号机", false), false);
         assert_eq!(adopted, "LEGACY-STEM");
         assert_ne!(
             adopted,
@@ -4200,25 +4226,42 @@ mod tests {
         // different `audition/` stem and a SECOND `dataset_44k/<slug>/` tree inside the pool the
         // runs share — none of which anything ever reclaims.
         assert_eq!(
-            effective_artifact_slug(&run, &req("改了个名字", false)),
+            effective_artifact_slug(&run, &req("改了个名字", false), false),
             "LEGACY-STEM",
             "renaming a run must not re-point its artifacts"
         );
 
-        // ⑷ 重训 wipes the slot, so there is nothing left to keep the old identity FOR, and
+        // ⑷ a full 重训 erases the slot, so there is nothing left to keep the old identity FOR, and
         // picking a different name there is the button's purpose ⇒ mint from the NEW name.
         assert_eq!(
-            effective_artifact_slug(&run, &req("改了个名字", true)),
+            effective_artifact_slug(&run, &req("改了个名字", true), true),
             slugify("改了个名字")
         );
         assert_ne!(slugify("改了个名字"), slugify("初号机"), "…two distinct names");
+
+        // ⑷′ ★★ THE PAIR that ⑷ alone cannot be: `fresh` is ALSO true on the one branch that
+        // destroys nothing — 「重训(仅扩散)」 with a live main model deletes only `<run>/diffusion/`.
+        // The first form of this function read `req.fresh` directly and therefore minted here too,
+        // which after the ④b rename button meant: a second `<pool>/dataset_44k/<slug>/` tree in the
+        // SAME pool (they even share one flat `aug_meta` and delete each other's entries), plus the
+        // MAIN model's identity silently re-pointed by the `run.json` rewrite.
+        //
+        // ⚠ The two arms differ ONLY in the third argument and BOTH must be asserted: either one
+        // alone is satisfied by a constant, and a `req`-shaped fixture cannot express the
+        // difference at all (`diff_partial_wipe` demands `backend == "sovits_diff"`, so the rvc
+        // fixture above can never reach it — which is exactly why ⑷ looked complete and was not).
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", true), false),
+            "LEGACY-STEM",
+            "a start that destroys nothing must not re-mint the identity, even with fresh set"
+        );
 
         // ⑸ an EMPTY key is not an identity. A run.json truncated mid-write (or written by a
         // build that did not have the field) must fall through to minting, never adopt `""` —
         // `""` would make `hps.name` empty and every `weights/` file start with `_e1_s3`.
         write_run_json("");
         assert_eq!(
-            effective_artifact_slug(&run, &req("初号机", false)),
+            effective_artifact_slug(&run, &req("初号机", false), false),
             slugify("初号机")
         );
 
@@ -4229,8 +4272,11 @@ mod tests {
     /// driver (that is why `RunDir` exists as a type), so「函数是对的」and「start 调的是这个函数」
     /// are two separate claims and only one of them is provable by driving the function.
     ///
-    /// It also pins the ORDER: the adoption reads the PRE-wipe `run.json`, so it has to happen
-    /// after the run is resolved and before the wipe removes the file it reads.
+    /// It also pins the ORDER, and the order is load-bearing in TWO directions: the adoption reads
+    /// the PRE-wipe `run.json`, so it must sit before the wipe — and it must sit AFTER the
+    /// `diff_partial_wipe` binding, because that flag is the difference between「这次会毁掉本 run 的
+    /// 产物」and「这次只删 diffusion/」, and the first form of this call read `req.fresh` alone from
+    /// 112 lines above the binding, where the answer was structurally unreachable.
     #[test]
     fn start_takes_its_artifact_identity_from_the_run_not_from_the_request_name() {
         let code = mod_rs_code();
@@ -4245,10 +4291,28 @@ mod tests {
              display name on every start. Reviving this line silently re-points every renamed \
              run's weights/, audition/ and pool slice directory."
         );
+        // ⛔ and the ④b-era form, which read `req.fresh` alone: it minted on the one branch that
+        // destroys nothing (`diff_partial_wipe`), so a renamed run's 「重训(仅扩散)」 grew a second
+        // slice tree in the shared pool and re-pointed the MAIN model's identity.
+        assert!(
+            !code.contains(concat!("effective_artifact_slug(&run, &req", ")")),
+            "the artifact slug is being decided without asking whether this start actually \
+             destroys this run's products — `req.fresh` alone is true on the diffusion partial \
+             wipe, which deletes only <run>/diffusion/"
+        );
         let resolve_run = at(concat!("let run = trun::resolve_run_dir(&workspace, ", "req_run)?;"));
-        let slug = at(concat!("let slug = effective_artifact_slug(&run, ", "&req);"));
+        let partial = at(concat!("let diff_partial_wipe =", "\n"));
+        let slug = at(concat!(
+            "let slug = effective_artifact_slug(&run, &req, req.fresh && ",
+            "!diff_partial_wipe);"
+        ));
         let wipe = at("remove_dir_all_robust(&workspace)");
         assert!(resolve_run < slug, "the slug is taken before its run is known");
+        assert!(
+            partial < slug,
+            "the slug is decided ABOVE the `diff_partial_wipe` binding, so it cannot know whether \
+             this start destroys anything — that is the exact shape of the ④b regression"
+        );
         assert!(
             slug < wipe,
             "the slug is adopted AFTER the wipe, which has already deleted the run.json it reads \
