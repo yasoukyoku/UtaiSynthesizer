@@ -2377,7 +2377,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     step: number | null;
     rel?: string;
     path: string;
-    /** ★§F2⑭ 批 2 ④ —— 存档行带着它；实时 run 的候选行没有（那时 `snapshot.workspace` 已经就是那个 run）。 */
+    /** ★§F2⒝ 批 2 ④ —— 存档行带着它；实时 run 的候选行没有（那时 `snapshot.workspace` 已经就是那个 run）。 */
     runId?: string | null;
   }) => {
     const name = await showConfirm({
