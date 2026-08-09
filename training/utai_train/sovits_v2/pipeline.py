@@ -9,7 +9,9 @@ builders, filelist split, base-checkpoint seeding) is imported from the sovits
 package — single source, do not copy.
 
 Run config (JSON, written by the Rust TrainingManager) — required keys:
-  backend "sovits_v2", workspace, dataset_dir, model_slug, version "4.0-v2",
+  backend "sovits_v2", dataset_dir, model_slug, version "4.0-v2",
+  workspace = the family SLOT (`open_pool` resolves `<slot>/pools/<id>/` against it),
+  run_dir = THIS run's directory (weights, config, filelists, logs, resume sidecars),
   total_epoch, batch_size, stop_file, pretrain_g, pretrain_d,
   assets{ffmpeg, rmvpe_pt, contentvec_onnx, configs_dir}
 optional: model_name, seed(1234), loudnorm(false), kmeans(false),
@@ -32,7 +34,7 @@ import os
 
 from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
-from ..pool import assert_identity, open_pool
+from ..pool import assert_identity, checked_run_dir, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..sovits.cluster import build_kmeans, build_retrieval
 from ..sovits.flist import build_filelists, resolve_speakers
@@ -61,9 +63,13 @@ TRIM_TOP_DB = 20  # v2 branch resample.py value (4.x uses 40)
 def run(cfg, reporter, stop):
     backend = device_shim.resolve_backend(cfg)
 
-    exp_dir = cfg["workspace"]
-    os.makedirs(exp_dir, exist_ok=True)
-    get_logger(exp_dir)  # file log train.log (utf-8) in the run dir
+    # §F2⒝ batch 2 — the SLOT and this RUN are two directories now. `workspace` still names the
+    # slot because that is what `open_pool` resolves `<slot>/pools/<id>/` against; everything a RUN
+    # owns (weights, config.json, filelists/, the resume sidecars, train.log) hangs off `run_dir`.
+    slot_dir = cfg["workspace"]
+    run_dir = checked_run_dir(cfg, slot_dir)
+    os.makedirs(run_dir, exist_ok=True)
+    get_logger(run_dir)  # file log train.log (utf-8) in the run dir
 
     assets = cfg["assets"]
     version = cfg["version"]
@@ -83,7 +89,10 @@ def run(cfg, reporter, stop):
     if f0_method != "rmvpe":
         fp_text += "|f0=%s" % f0_method
     # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
-    pool_dir = open_pool(exp_dir, fp_text)
+    # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
+    # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
+    # hours of preprocessing — with one info line as the only sign.
+    pool_dir = open_pool(slot_dir, fp_text)
     assert_identity(pool_dir, fp_text)
 
     dataset_44k = os.path.join(pool_dir, "dataset_44k")
@@ -111,7 +120,7 @@ def run(cfg, reporter, stop):
         stop.check()
 
     build_config(
-        exp_dir,
+        run_dir,
         speakers[0]["slug"],
         int(cfg["total_epoch"]),
         int(cfg["batch_size"]),
@@ -124,7 +133,7 @@ def run(cfg, reporter, stop):
     )
 
     stop.check()
-    hps = utils.get_hparams_from_file(os.path.join(exp_dir, "config.json"))
+    hps = utils.get_hparams_from_file(os.path.join(run_dir, "config.json"))
     failed_aug = extract_all(
         dataset_44k,
         hps,
@@ -150,7 +159,7 @@ def run(cfg, reporter, stop):
         spk_dir = os.path.join(dataset_44k, sp["slug"])
         meta_dir = _speaker_meta_dir(pool_dir, is_multi, sp["slug"])
         report = os.path.join(
-            exp_dir,
+            run_dir,
             "aug_gate_report_%s.json" % sp["slug"] if is_multi else "aug_gate_report.json",
         )
         run_f0_gate(
@@ -169,20 +178,20 @@ def run(cfg, reporter, stop):
     # 2-slice val loader) crashes the collate. Registered deviation vs the
     # upstream 0.3s floor (upstream has the same latent crash window).
     build_filelists(
-        exp_dir, speakers[0]["slug"], dataset_44k, seed, reporter,
+        run_dir, speakers[0]["slug"], dataset_44k, seed, reporter,
         speakers=speakers, min_dur=0.35,
     )
 
     stop.check()
     if bool(cfg.get("kmeans", False)):
         named = [(sp["name"], os.path.join(dataset_44k, sp["slug"])) for sp in speakers]
-        index_path, index_rows = build_kmeans(exp_dir, named, reporter, stop)
+        index_path, index_rows = build_kmeans(run_dir, named, reporter, stop)
     else:
         index_path = None
         index_rows = 0
         for i, sp in enumerate(speakers):
             index_path, rows = build_retrieval(
-                exp_dir,
+                run_dir,
                 os.path.join(dataset_44k, sp["slug"]),
                 seed,
                 reporter,
@@ -193,8 +202,8 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
-    _seed_base_checkpoints(exp_dir, cfg)
-    summary = train(cfg, exp_dir, pool_dir, reporter, stop)
+    _seed_base_checkpoints(run_dir, cfg)
+    summary = train(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:
         raise RuntimeError(

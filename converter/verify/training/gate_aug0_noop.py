@@ -25,6 +25,7 @@ training/assets/audition_10s.wav + a kazane excerpt; deleting it only changes
 the dataset fingerprint, not the gate's validity)."""
 import argparse
 import filecmp
+import glob
 import json
 import os
 import shutil
@@ -67,6 +68,21 @@ def build_cfg(backend, workspace):
     cfg = {
         "backend": backend,
         "workspace": workspace,
+        # §F2⒝ batch 2 — the RUN directory. `workspace` is the SLOT (python resolves
+        # `<slot>/pools/<id>/` against it); this is where the run's own products go.
+        #
+        # ★ Equal to the workspace here, and that is the PRODUCTION shape rather than a shortcut:
+        # a slot with no `runs/` container IS its own single run (`trun::resolve_run_dir`), which is
+        # every slot that has not been through the layout-3 migration. So this gate keeps comparing
+        # byte-for-byte trees across a baseline worktree that predates the key — both halves write
+        # to the same directory — while still exercising the split that batch 2 introduced.
+        "run_dir": workspace,
+        # Whether the SLOT holds a main model at all. These fixtures are built fresh per backend,
+        # so the honest answer is False — and the shallow-diffusion chain needs it stated rather
+        # than inferred from a missing `config.json`, which per-run can no longer be told apart
+        # from「pointed at the wrong run」. The `sovits` → `sovits_diff` pair in `smoke_aug` reuses
+        # one workspace on purpose and re-derives this before the second leg.
+        "slot_has_main_model": bool(glob.glob(os.path.join(workspace, "G_*.pth"))),
         "dataset_dir": FIXTURE,
         "model_slug": "gateaug",
         "model_name": "gateaug",

@@ -85,7 +85,9 @@ def main():
 
     npz_dir = GATE / "npz"
     npz_dir.mkdir(exist_ok=True)
-    vpipe.process_slices(str(SLICES), str(npz_dir), cfg, _Rep(), _Stop())
+    # §F2⒝: the pool is the parent of both product directories in this fixture — the aug
+    # cleanup path needs it to reach `<pool>/aug_meta`.
+    vpipe.process_slices(str(SLICES.parent), str(SLICES), str(npz_dir), cfg, _Rep(), _Stop())
     vpipe.build_filelists(str(npz_dir), str(GATE / "filelists"), 1234,
                           int(cfg["crop_mel_frames"]), _Rep())
 

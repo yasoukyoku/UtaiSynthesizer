@@ -56,7 +56,7 @@ class UtaiNsfTask(nsf_HiFigan):
         # trainer.validate() re-enters setup, and the upstream implementation
         # unconditionally REBUILDS the model — post-fit that would evaluate
         # freshly initialized weights (and even skip the finetune seed, since
-        # the workspace already holds checkpoints). fit calls setup exactly
+        # the run_dir already holds checkpoints). fit calls setup exactly
         # once, so the gate1 parity surface is untouched.
         # ⚠️ sentinel is generator, NOT model: upstream build_model() has no
         # return statement, so GanBaseTask.setup leaves self.model = None
@@ -89,7 +89,7 @@ def export_config_json(pristine_config):
 
 
 def save_weights_snapshot(weights_dir, filename, pl_module, pristine_config):
-    """workspace/weights/<filename> = {'generator': sd} deploy-format snapshot
+    """run_dir/weights/<filename> = {'generator': sd} deploy-format snapshot
     (weight_norm params kept raw — remove_weight_norm happens at LOAD time,
     exactly like the community checkpoints) + a config.json beside it.
     Atomic writes; the .tmp+replace changes the zip archive name embedded by
@@ -149,7 +149,7 @@ class UtaiProtocolCallback(pl.Callback):
     periodic/best weights snapshots. best = TRUE validation loss (the task's
     full-length log10-STFT L1 — S39 precedent: a real val loss beats the EMA
     heuristic GANs are usually forced into), tracked across resumes via
-    workspace/best_state.json.
+    run_dir/best_state.json.
 
     ★S119 §F8⒝ added three jobs to it, all of which belong to the same moment (a validation
     boundary is where this backend decides anything):
@@ -165,19 +165,19 @@ class UtaiProtocolCallback(pl.Callback):
       exported a 100%-nan vocoder as a success.
     """
 
-    def __init__(self, reporter, stop, total_steps_real, workspace, pool_dir, pristine_config,
+    def __init__(self, reporter, stop, total_steps_real, run_dir, pool_dir, pristine_config,
                  resumed=None, start_step=0, dataset_items=None):
         self.reporter = reporter
         self.stop = stop
         self.total_steps = int(total_steps_real)
-        self.workspace = workspace
-        # §F2⒝ — every RUN artifact below hangs off `workspace`; `pool_dir` is used for exactly
+        self.run_dir = run_dir
+        # §F2⒝ — every RUN artifact below hangs off `run_dir`; `pool_dir` is used for exactly
         # one thing, reading the dataset identity into the resume sidecar. They were the same
         # directory until the preprocessing pool moved down a level.
         self.pool_dir = pool_dir
-        self.weights_dir = os.path.join(workspace, "weights")
+        self.weights_dir = os.path.join(run_dir, "weights")
         self.pristine_config = pristine_config
-        self.best_file = os.path.join(workspace, "best_state.json")
+        self.best_file = os.path.join(run_dir, "best_state.json")
         self.best_val = self._load_best()
         self.stop_requested = False
         self.initial_global = None
@@ -235,7 +235,7 @@ class UtaiProtocolCallback(pl.Callback):
         """A flat checkpoint just landed — remember it and refresh the rolling pointer."""
         self.tip_name = basename
         self.tip_step = int(trainer.global_step)
-        resume_state.save_pointer(self.workspace, basename, blob=self.capture(trainer))
+        resume_state.save_pointer(self.run_dir, basename, blob=self.capture(trainer))
 
     def on_fit_start(self, trainer, pl_module):
         """Put the captured RNG back — and this is the LAST hook where that still does anything.
@@ -296,7 +296,7 @@ class UtaiProtocolCallback(pl.Callback):
         real = trainer.global_step // 2
         # periodic snapshot = the convert-ready import candidate (S38: the
         # protocol must reference weights/, never the keep_ckpts-cleaned
-        # workspace lightning checkpoints)
+        # run_dir lightning checkpoints)
         path = save_weights_snapshot(
             self.weights_dir, f"vocoder_{real}.ckpt", pl_module, self.pristine_config
         )
@@ -343,7 +343,7 @@ class UtaiProtocolCallback(pl.Callback):
 
         ⛔ ``trainer.save_checkpoint`` — never the checkpoint callback: ``DsModelCheckpoint``
         flattens every path to ``dirpath/<basename>`` (measured), so handing it a nested path
-        writes to the workspace ROOT and its remove path deletes the ROOT file of that name.
+        writes to the run_dir ROOT and its remove path deletes the ROOT file of that name.
 
         The write is guarded on BOTH halves, because they fail independently (S117/S118): weights
         can be nan while the moments are fine, and the moments can be permanently dead
@@ -360,7 +360,7 @@ class UtaiProtocolCallback(pl.Callback):
             return
         try:
             resume_state.save_solo_snapshot(
-                self.workspace,
+                self.run_dir,
                 resume_state.BEST_DIR,
                 lambda p: trainer.save_checkpoint(p),
                 blob=self.capture(trainer),

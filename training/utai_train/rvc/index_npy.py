@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 
 def build_index(exp_dir, pool_dir, version, seed, reporter, n_cpu=None):
     # ⚠ TWO directories on purpose: the features are a POOL product (shared by every run with
-    # this preprocessing identity), while `total_fea.npy` stays at the SLOT root. It is rebuilt
-    # in full by every run anyway (there is no skip-if-exists below), and the publish chain reads
-    # it at a fixed slot-relative name and fails OPEN — a model would install with no retrieval
-    # asset, no error and no log line. See `tpool::POOL_ENTRIES` for the same reasoning in Rust.
+    # this preprocessing identity), while `total_fea.npy` is a RUN product — `exp_dir` is the RUN
+    # directory (§F2⒝ batch 2). It is rebuilt in full by every run anyway (no skip-if-exists
+    # below), and the publish chain reads it at a fixed RUN-relative name and fails OPEN — so a
+    # copy left at the slot root while the probe looks in the run would install a model with no
+    # retrieval asset, no error and no log line. `trun::RUN_ENTRIES` states the same in Rust, and
+    # `commands::training::get_slot_export_context` is the probe.
     reporter.stage("index", message="构建检索特征库")
     feature_dir = os.path.join(
         pool_dir, "3_feature256" if version == "v1" else "3_feature768"

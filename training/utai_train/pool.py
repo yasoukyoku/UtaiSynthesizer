@@ -39,6 +39,15 @@ had) and python (which mints every later one) agree on a name without coordinati
 matches on the FILE CONTENT, so a pool whose name came from an older derivation keeps being
 reused instead of silently abandoned — the name is a convenience, the file is the truth.
 
+## Why the RUN directory is validated here too
+
+§F2⒝ batch 3 split one directory into two: `workspace` is the SLOT (what `open_pool` resolves
+against) and `run_dir` is where this run's own products go. Telling them apart is this module's
+subject, and getting it backwards has exactly one symptom — a brand-new empty pool inside the run
+and every preprocessing stage re-run, under a single `logger.info`. So [`checked_run_dir`] lives
+beside [`open_pool`] rather than in each pipeline: one rule, five callers, and the fail-closed
+posture is stated once.
+
 ⚠ The id charset is ``[p0-9a-f]`` on purpose. A pool path segment containing ``.wav`` would be
 rewritten by ``filename.replace(".wav", ".spec.pt")`` (sovits/extract.py and both data_utils),
 and ``wav`` / ``spec`` substrings break the RVC name surgery (rvc/extract_f0.py,
@@ -57,6 +66,43 @@ POOLS_DIR = "pools"
 
 #: The identity file inside a pool. Must equal `tpool::FINGERPRINT`.
 FINGERPRINT = "dataset.fingerprint"
+
+#: Container for every RUN of one slot. Must equal `trun::RUNS_DIR`.
+RUNS_DIR = "runs"
+
+
+def checked_run_dir(cfg, slot_dir):
+    """THE run directory for this run, fail-closed.
+
+    ⛔ Never ``cfg.get("run_dir", cfg["workspace"])``. Every pipeline opens with
+    ``os.makedirs(run_dir, exist_ok=True)`` and ``get_logger`` makes the directory too, so a
+    missing, empty or misspelled value does not fail — it CREATES a directory and trains a whole
+    run into it, out of sight of `trun::run_dirs` (which stops scanning the slot root the moment
+    the container exists). That is the same shape as handing `open_pool` a run directory: silent,
+    expensive, and announced by nothing.
+
+    So the positive fact `trun::resolve_run_dir` establishes on the Rust side is re-asserted here:
+    **the run is either the slot itself (layout ≤ 2, where the slot root IS the run) or a direct
+    child of ``<slot>/runs/``.** Anything else means the caller built this config by hand — a gate
+    driver that was not updated, or an old `run.json` from before the key existed — and training
+    into whatever it names would be worse than refusing.
+    """
+    run_dir = cfg.get("run_dir")
+    if not run_dir:
+        raise RuntimeError(
+            "RUN_DIR_MISSING: the run config has no 'run_dir'. Rust writes it beside 'workspace' "
+            "(the slot); a hand-built config must set it too — to the slot itself for an "
+            "unmigrated slot, or to <slot>/%s/<run_id>." % RUNS_DIR
+        )
+    norm = lambda p: os.path.normcase(os.path.abspath(p))
+    if norm(run_dir) != norm(slot_dir) and norm(os.path.dirname(run_dir)) != norm(
+        os.path.join(slot_dir, RUNS_DIR)
+    ):
+        raise RuntimeError(
+            "RUN_DIR_NOT_IN_SLOT: %r is neither the slot %r nor a run under its %r container"
+            % (run_dir, slot_dir, RUNS_DIR)
+        )
+    return run_dir
 
 
 def pool_id_for(fp_text):

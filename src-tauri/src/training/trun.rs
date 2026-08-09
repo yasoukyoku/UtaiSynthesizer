@@ -22,19 +22,24 @@
 //!     aug_gate_report*.json  stop.flag  audition/  diffusion.yaml  diffusion/
 //! ```
 //!
-//! ## Where this module currently stands (batch 2, step ② landed)
+//! ## Where this module currently stands (batch 2, step ③ landed — the bytes move now)
 //!
 //! * **The RESOLVERS are wired.** [`resolve_run_dir`] and [`run_dirs`] are what every reader of a
 //!   run product goes through — the progress probes, `slot_holds_work`, `frozen_speakers_of_run`,
 //!   `slot_info`, `scan_project_ckpts`, the export context, the audition paths, the storage
 //!   totals. Nothing on disk moved to make that true: with no `runs/` container the answer IS the
-//!   slot root, so the wiring batch is a byte-for-byte no-op that leaves every reader able to
+//!   slot root, so the wiring batch was a byte-for-byte no-op that left every reader able to
 //!   address a run once one exists.
-//! * ⛔ **The MIGRATION is still uncalled.** [`migrate_slot_runs`] has no production caller, and
-//!   that ordering is the whole point of the change. Moving the bytes before the readers were
-//!   run-aware would not merely break a listing; it silently destroys work, because a surprising
-//!   number of load-bearing predicates are spelled "is there a `G_*.pth` at the slot root". The
-//!   ones measured on this tree, each with what it costs:
+//! * **The MIGRATION now runs**, from [`migrate_all`] at boot and again over the OLD root when a
+//!   data-directory reclaim folds it. ⛔ Always AFTER `tpool::migrate_all` — see that function.
+//! * **Where a START writes** is [`run_dir_for_start`], not [`resolve_run_dir`]: the guards resolve
+//!   the run BEFORE the wipe (they judge the pre-wipe state), and the wipe takes the run directory
+//!   with it.
+//!
+//! The ordering above was the whole point of the change. Moving the bytes before the readers were
+//! run-aware would not merely break a listing; it silently destroys work, because a surprising
+//! number of load-bearing predicates are spelled "is there a `G_*.pth` at the slot root". The
+//! ones measured on this tree, each with what it costs:
 //!
 //! * `has_main_progress` goes false ⇒ `diff_partial_wipe` goes false ⇒ a shallow-diffusion
 //!   「重训」 stops meaning "clear `diffusion/`" and becomes `remove_dir_all_robust(&workspace)`
@@ -53,13 +58,28 @@
 //! * `project.json`'s `exported[].from_ckpt_rel` stops matching ⇒ every imported checkpoint loses
 //!   `KeptReason::Exported` and becomes a cleanup candidate.
 //!
-//! So the order is: this data layer, then every reader routed through one resolver that accepts
-//! BOTH shapes, and only then the migration. Two of the three are done.
+//! So the order was: this data layer, then every reader routed through one resolver that accepts
+//! BOTH shapes, and only then the migration. All three are done.
 //!
 //! ⚠ The list above is what breaks if the bytes move FIRST — it is not a list of things still
 //! broken. Each of those readers now takes the run directory, and three of them can no longer be
 //! handed a slot at all: [`RunDir`] is a type only this module can mint, which is what closes the
 //! call sites no test can reach (`training::try_start` above all).
+//!
+//! ## The invariant step ③ establishes
+//!
+//! **layout ≥ 3 ⟹ every run product lives under `runs/`.** It is not automatic — [`run_dir_for_start`]
+//! is what holds it up, and two shapes would break it without that:
+//!
+//! * a full 「重训」 deletes the WHOLE slot, `slot.json` included, so the slot falls back to layout 0
+//!   and the slot root is legitimately the run again (the shape both migrations already handle);
+//! * a slot that had nothing to move is committed at layout 3 with no `runs/` container at all, and
+//!   its first training would otherwise write to the slot root under a marker that says otherwise.
+//!
+//! That second one reads fine today ([`run_dirs`] answers `[slot]` when the container is absent),
+//! and goes silently wrong the moment a SECOND run appears beside it: the slot root stops being
+//! scanned, so those checkpoints leave the archive listing while staying on disk — precisely the
+//! failure `tproject::scan_project_ckpts` exists to end.
 
 use std::path::{Path, PathBuf};
 
@@ -86,11 +106,17 @@ pub const SLOT_LAYOUT_RUNS: u32 = 3;
 /// is: a half-filled `runs/<id>/` would be readable as a run.
 const STAGING_PREFIX: &str = ".mig_run_";
 
-// ⚠ `tpool` publishes its staging prefix through a `staging_prefix()` accessor so the migration
-// verifier can build torn states without a second copy of the string. The run half deliberately
-// does NOT have one yet: there is no run verifier to consume it, and an exported accessor whose
-// entire justification is an anti-drift mechanism that has no other end is a claim of protection
-// nothing can falsify. It lands in the batch that writes `tests/trun_migrate.rs`, with its caller.
+/// The staging prefix, for the verifier that builds torn states from outside this module.
+///
+/// Exposed rather than duplicated, for the reason [`tpool::staging_prefix`] gives: enumerating the
+/// crash points means creating exactly the half-migrated shapes this module leaves behind, and a
+/// second copy of this string in the verifier would let the two drift until the "crash recovery"
+/// leg silently tested nothing. The wiring batch deleted this accessor because it had no consumer
+/// then and an anti-drift mechanism with only one end is a claim nothing can falsify; it comes back
+/// here WITH its caller, `tests/trun_migrate.rs`.
+pub fn staging_prefix() -> &'static str {
+    STAGING_PREFIX
+}
 
 // ─────────────────────────── the decision table ───────────────────────────
 
@@ -414,6 +440,48 @@ pub fn run_dirs(slot: &Path) -> Vec<RunDir> {
     runs.into_iter().map(|r| RunDir(r.dir)).collect()
 }
 
+/// Where a START writes — resolved AFTER the wipe, and it CREATES the directory.
+///
+/// ⛔ A different question from [`resolve_run_dir`], and the difference was a real hole:
+/// `training::try_start` resolves the run BEFORE any deletion (its guards have to judge the
+/// pre-wipe state), then a full 「重训」 removes the whole slot and re-creates only the SLOT root.
+/// Everything written next — `run_manifest.json`, `run.json`, `stop.flag` — addresses a run
+/// directory the wipe deleted. That failure is not loud-and-final either: the first press errors
+/// out with an io NotFound *after* the slot has already been emptied, and the second press
+/// succeeds (no `runs/` left ⇒ the slot root answers), so it reads as a one-off glitch while
+/// having silently taken the slot back to layout 0.
+///
+/// The answers, and why each is a positive fact rather than a fallback:
+/// * **one run** — that is the run, migrated or not;
+/// * **no runs, layout < 3** — the slot root IS the run, exactly as [`resolve_run_dir`] says;
+/// * **no runs, layout ≥ 3** — the marker asserts the container is where runs live, so MINT one
+///   rather than writing beside it. This is what keeps "layout ≥ 3 ⟹ products under `runs/`" true
+///   for a slot that had nothing to move at migration time, and for one whose runs were all
+///   deleted;
+/// * **several runs** — refuse. The batch that mints a second run hands this an id.
+pub fn run_dir_for_start(slot: &Path, family: &str) -> Result<RunDir> {
+    let runs = list_runs(slot);
+    match runs.len() {
+        1 => Ok(RunDir(runs.into_iter().next().unwrap().dir)),
+        0 => {
+            if !tpool::read_slot_meta(slot).is_some_and(|m| m.layout >= SLOT_LAYOUT_RUNS) {
+                return Ok(RunDir(slot.to_path_buf()));
+            }
+            let id = legacy_run_id(family);
+            debug_assert!(run_id_is_usable(&id));
+            let dir = runs_root(slot).join(&id);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| UtaiError::Training(format!("RUN_CREATE_FAILED: {e}")))?;
+            Ok(RunDir(dir))
+        }
+        _ => Err(UtaiError::Training(format!(
+            "RUN_AMBIGUOUS: {} runs in {}",
+            runs.len(),
+            slot.display()
+        ))),
+    }
+}
+
 // ─────────────────────────── migration (layout 2 → 3) ───────────────────────────
 
 #[derive(Debug, PartialEq, Eq)]
@@ -475,6 +543,67 @@ pub fn plan_slot_runs(slot: &Path) -> RunPlan {
     plan.staying.sort();
     plan.unknown.sort();
     plan
+}
+
+/// Fold EVERY slot of every project into layout 3.
+///
+/// ⛔ **MUST run after `tpool::migrate_all`, and the reason is byte-level rather than stylistic.**
+/// This function commits `layout: 3` into the same `slot.json`, while `tpool::migrate_slot` returns
+/// early on `layout >= tpool::SLOT_LAYOUT` (2). Folding the runs first would therefore make the
+/// POOL migration answer `AlreadyDone` for that slot forever — and it would do so silently, because
+/// [`plan_slot_runs`] classifies a pool product left at the slot root as `staying`, not `unknown`,
+/// so not even a warn line would appear.
+///
+/// The concurrency guard sits in this public entry point rather than beside the walk, mirroring
+/// `tpool::migrate_all`: every test in this module drives the per-slot [`migrate_slot_runs`], so
+/// there is nothing here for a live dev build to break (`tproject::migrate_legacy_layout` splits
+/// the two only because its own tests call the walk directly).
+///
+/// Unlike the pool half this needs the project ID as well as the path, because the export ledger
+/// [`migrate_slot_runs`] re-points lives one level up. The DIRECTORY NAME is that identity —
+/// `tproject::read_meta` overwrites the stored field with it precisely so a hand-renamed directory
+/// stays addressable.
+pub fn migrate_all(data_dir: &Path) {
+    let root = tproject::training_root(data_dir);
+    if !root.is_dir() {
+        return;
+    }
+    if crate::crashlog::other_instance_alive() {
+        tracing::warn!("training run migration postponed: another live instance detected");
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return };
+    let (mut migrated, mut failed) = (0usize, 0usize);
+    for entry in rd.flatten() {
+        let proj = entry.path();
+        // `project.json` is the authority for "this is a project", exactly as `tpool::migrate_all`
+        // has it; `.del_*` tombstones and `.migrating_*` markers do not have one.
+        if !proj.join(tproject::PROJECT_META).is_file() {
+            continue;
+        }
+        let Some(project_id) = proj.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        for family in tproject::FAMILIES {
+            if !proj.join(family).is_dir() {
+                continue;
+            }
+            match migrate_slot_runs(data_dir, &project_id, family) {
+                Ok(RunOutcome::Migrated(id)) => {
+                    migrated += 1;
+                    tracing::info!("run layout: {project_id}/{family} -> runs/{id}");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!("run layout: {project_id}/{family} could not be migrated: {e}");
+                }
+            }
+        }
+    }
+    if migrated > 0 || failed > 0 {
+        tracing::info!("run layout migration: {migrated} slot(s) folded, {failed} failed");
+    }
 }
 
 /// Fold one slot's run products into `runs/<id>/`, and re-point the project's export ledger at the
@@ -1023,6 +1152,142 @@ mod tests {
         );
         assert!(!slot.join(format!("{STAGING_PREFIX}rdeadbeefdead")).exists());
         assert!(runs_root(&slot).join(legacy_run_id("rvc")).join("G_1400.pth").is_file());
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔ Where a START writes, across every shape `try_start` can hand it.
+    ///
+    /// The last arm is the one this batch exists to close, and it is a REGRESSION test rather than
+    /// a design one: `try_start` resolves the run before its guards (they judge the pre-wipe state)
+    /// and a full 「重训」 then deletes the whole slot and re-creates only the slot ROOT. Writing the
+    /// manifest into the pre-wipe answer fails with a bare io NotFound *after* the slot is already
+    /// empty — and the second press succeeds, so it reads as a glitch rather than as "that press
+    /// deleted everything".
+    #[test]
+    fn a_start_always_gets_a_run_directory_that_exists() {
+        let data = tmp_data("start");
+        let id = "p999_5150abcd";
+        let slot = project_dir(&data, id).join("rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+
+        // layout ≤ 2 — the slot root IS the run, and it must NOT mint a container
+        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        assert_eq!(r.path(), slot);
+        assert!(!runs_root(&slot).exists(), "an unmigrated slot must stay unmigrated");
+
+        // layout 3 with nothing folded (a slot that had nothing to move at migration time, or one
+        // whose runs were all deleted): the marker says runs live in the container, so mint one.
+        // Answering with the slot root here is readable TODAY and goes silently wrong the moment a
+        // second run appears beside it — the products at the root leave `run_dirs`' view entirely.
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        assert_eq!(r.path(), runs_root(&slot).join(legacy_run_id("rvc")));
+        assert!(r.is_dir(), "it must CREATE it — run.json is written before python is spawned");
+        assert_eq!(run_dirs(&slot), vec![r.clone()], "and the plural reader must see it");
+
+        // one run: the same answer, idempotently
+        assert_eq!(run_dir_for_start(&slot, "rvc").unwrap(), r);
+
+        // ★ the wipe: `remove_dir_all(slot)` + `create_dir_all(slot)`, exactly as try_start does.
+        // `slot.json` goes with it, so the slot is honestly back at layout 0.
+        std::fs::remove_dir_all(&slot).unwrap();
+        std::fs::create_dir_all(&slot).unwrap();
+        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        assert_eq!(r.path(), slot, "a wiped slot is a fresh slot");
+        // …and the write that used to fail now lands
+        std::fs::write(r.join("run_manifest.json"), b"{}").unwrap();
+
+        // several runs: refuse rather than pick. The batch that mints a second one passes an id.
+        touch(&runs_root(&slot).join("ra11111111111").join("G_1.pth"));
+        touch(&runs_root(&slot).join("rb22222222222").join("G_2.pth"));
+        let e = run_dir_for_start(&slot, "rvc").unwrap_err().to_string();
+        assert!(e.contains("RUN_AMBIGUOUS"), "{e}");
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔ THE ordering constraint of this batch, asserted on the two files that encode it.
+    ///
+    /// `trun` commits `layout: 3` into the same `slot.json` whose `layout >= 2` makes
+    /// `tpool::migrate_slot` return early. Calling the run fold first therefore retires the POOL
+    /// migration for that slot permanently, and silently: `plan_slot_runs` files a pool product
+    /// left at the slot root under `staying`, not `unknown`, so there is not even a warn.
+    ///
+    /// A unit test cannot observe the boot sequence, so this reads the sequence itself. The
+    /// mechanism is demonstrated below it, so the constant relationship is red-able too.
+    #[test]
+    fn the_boot_chain_folds_pools_before_runs() {
+        const LIB_RS: &str = include_str!("../lib.rs");
+        const SETTINGS_RS: &str = include_str!("../commands/settings.rs");
+        for (name, src) in [("lib.rs", LIB_RS), ("commands/settings.rs", SETTINGS_RS)] {
+            let pool = src.find("tpool::migrate_all(").unwrap_or_else(|| {
+                panic!("{name} no longer folds the preprocessing pools at all")
+            });
+            let run = src
+                .find("trun::migrate_all(")
+                .unwrap_or_else(|| panic!("{name} no longer folds the runs at all"));
+            assert!(
+                pool < run,
+                "{name} calls the RUN migration before the POOL one — that stamps layout 3 on a \
+                 slot whose pool products are still at its root, and `tpool::migrate_slot` will \
+                 answer AlreadyDone for it forever"
+            );
+        }
+        // the mechanism itself: run-first really does retire the pool fold
+        let data = tmp_data("order");
+        let id = "paaa_0f0f0f0f";
+        let slot = project_dir(&data, id).join("rvc");
+        touch(&slot.join("0_gt_wavs").join("0.wav"));
+        touch(&slot.join("G_2333333.pth"));
+        std::fs::write(slot.join(tpool::FINGERPRINT), b"abc123").unwrap();
+        write_meta(&data, &ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() })
+            .unwrap();
+
+        assert!(matches!(migrate_slot_runs(&data, id, "rvc").unwrap(), RunOutcome::Migrated(_)));
+        assert_eq!(tpool::migrate_slot(&slot, "rvc").unwrap(), tpool::SlotOutcome::AlreadyDone);
+        assert!(
+            slot.join("0_gt_wavs").join("0.wav").is_file() && !slot.join(tpool::POOLS_DIR).exists(),
+            "…and the preprocessing products are stranded at the slot root, unfoldable"
+        );
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// The walk: every project, every family, and nothing that is not a project.
+    #[test]
+    fn migrate_all_folds_every_slot_of_every_project() {
+        let data = tmp_data("all");
+        for id in ["pone_11111111", "ptwo_22222222"] {
+            write_meta(&data, &ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() })
+                .unwrap();
+            for family in ["rvc", "sovits"] {
+                let slot = project_dir(&data, id).join(family);
+                layout2_rvc_slot(&slot);
+            }
+        }
+        // a directory under the training root that is NOT a project (no project.json) — the pool
+        // migration skips these by the same rule, and a tombstone must not be folded
+        let bogus = tproject::training_root(&data).join(".del_pthree_33333333");
+        touch(&bogus.join("rvc").join("G_1.pth"));
+
+        migrate_all(&data);
+
+        for id in ["pone_11111111", "ptwo_22222222"] {
+            for family in ["rvc", "sovits"] {
+                let slot = project_dir(&data, id).join(family);
+                assert_eq!(tpool::read_slot_meta(&slot).unwrap().layout, SLOT_LAYOUT_RUNS);
+                let run = runs_root(&slot).join(legacy_run_id(family));
+                assert!(run.join("G_2333333.pth").is_file(), "{id}/{family}");
+                assert!(!slot.join("G_2333333.pth").exists(), "{id}/{family}");
+            }
+        }
+        assert!(bogus.join("rvc").join("G_1.pth").is_file(), "a tombstone is not a project");
+
+        // idempotent: a second boot folds nothing and breaks nothing
+        migrate_all(&data);
+        let run = project_dir(&data, "pone_11111111").join("rvc").join(RUNS_DIR).join(legacy_run_id("rvc"));
+        assert!(run.join("G_2333333.pth").is_file());
 
         let _ = std::fs::remove_dir_all(data);
     }

@@ -13,7 +13,9 @@ deviations vs upstream:
     is split out (extract needs hps from it) and written before extract.
 
 Run config (JSON, written by the Rust TrainingManager) — required keys:
-  backend "sovits", workspace, dataset_dir, model_slug, version "4.1|4.0",
+  backend "sovits", dataset_dir, model_slug, version "4.1|4.0",
+  workspace = the family SLOT (`open_pool` resolves `<slot>/pools/<id>/` against it),
+  run_dir = THIS run's directory (weights, config, filelists, logs, resume sidecars),
   total_epoch, batch_size, stop_file, pretrain_g, pretrain_d,
   assets{ffmpeg, rmvpe_pt, contentvec_onnx, configs_dir}
 optional: model_name (display name for the release config), seed(1234),
@@ -40,7 +42,7 @@ import numpy as np
 from .. import device as device_shim
 from ..augment import augment_slices, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, open_pool
+from ..pool import assert_identity, checked_run_dir, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from . import utils
 from .cluster import build_kmeans, build_retrieval
@@ -93,9 +95,13 @@ def run(cfg, reporter, stop):
     # to torch.cuda.is_available() on cpu/cuda; resolves to "xpu" on an Intel box.
     backend = device_shim.resolve_backend(cfg)
 
-    exp_dir = cfg["workspace"]
-    os.makedirs(exp_dir, exist_ok=True)
-    get_logger(exp_dir)  # file log train.log (utf-8) in the run dir
+    # §F2⒝ batch 2 — the SLOT and this RUN are two directories now. `workspace` still names the
+    # slot because that is what `open_pool` resolves `<slot>/pools/<id>/` against; everything a RUN
+    # owns (weights, config.json, filelists/, the resume sidecars, train.log) hangs off `run_dir`.
+    slot_dir = cfg["workspace"]
+    run_dir = checked_run_dir(cfg, slot_dir)
+    os.makedirs(run_dir, exist_ok=True)
+    get_logger(run_dir)  # file log train.log (utf-8) in the run dir
 
     assets = cfg["assets"]
     version = cfg["version"]
@@ -120,7 +126,10 @@ def run(cfg, reporter, stop):
     # §F2⒝ — the identity now NAMES the directory instead of gating a `shutil.rmtree` of it.
     # ⛔ `sovits_diff` MUST resolve to the same pool: it builds the same fp_text from the same
     # helper and shares this slot, which is exactly why that string has one home.
-    pool_dir = open_pool(exp_dir, fp_text)
+    # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
+    # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
+    # hours of preprocessing — with one info line as the only sign.
+    pool_dir = open_pool(slot_dir, fp_text)
     assert_identity(pool_dir, fp_text)
 
     dataset_44k = os.path.join(pool_dir, "dataset_44k")
@@ -148,7 +157,7 @@ def run(cfg, reporter, stop):
         stop.check()
 
     build_config(
-        exp_dir,
+        run_dir,
         speakers[0]["slug"],
         encoder,
         vol_embedding,
@@ -164,7 +173,7 @@ def run(cfg, reporter, stop):
     )
 
     stop.check()
-    hps = utils.get_hparams_from_file(os.path.join(exp_dir, "config.json"))
+    hps = utils.get_hparams_from_file(os.path.join(run_dir, "config.json"))
     failed_aug = extract_all(
         dataset_44k,
         hps,
@@ -193,7 +202,7 @@ def run(cfg, reporter, stop):
         spk_dir = os.path.join(dataset_44k, sp["slug"])
         meta_dir = _speaker_meta_dir(pool_dir, is_multi, sp["slug"])
         report = os.path.join(
-            exp_dir,
+            run_dir,
             "aug_gate_report_%s.json" % sp["slug"] if is_multi else "aug_gate_report.json",
         )
         run_f0_gate(
@@ -206,19 +215,19 @@ def run(cfg, reporter, stop):
         )
 
     stop.check()
-    build_filelists(exp_dir, speakers[0]["slug"], dataset_44k, seed, reporter, speakers=speakers)
+    build_filelists(run_dir, speakers[0]["slug"], dataset_44k, seed, reporter, speakers=speakers)
 
     stop.check()
     if bool(cfg.get("kmeans", False)):
         named = [(sp["name"], os.path.join(dataset_44k, sp["slug"])) for sp in speakers]
-        index_path, index_rows = build_kmeans(exp_dir, named, reporter, stop)
+        index_path, index_rows = build_kmeans(run_dir, named, reporter, stop)
     else:
         # retrieval matrix per speaker -> <id>.index_vectors.npy (id = list order)
         index_path = None
         index_rows = 0
         for i, sp in enumerate(speakers):
             index_path, rows = build_retrieval(
-                exp_dir,
+                run_dir,
                 os.path.join(dataset_44k, sp["slug"]),
                 seed,
                 reporter,
@@ -229,8 +238,8 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
-    _seed_base_checkpoints(exp_dir, cfg)
-    summary = train(cfg, exp_dir, pool_dir, reporter, stop)
+    _seed_base_checkpoints(run_dir, cfg)
+    summary = train(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:
         raise RuntimeError(
@@ -284,7 +293,7 @@ def _load_gate_f0(spk_dir, stem):
         return None
 
 
-def _seed_base_checkpoints(exp_dir, cfg):
+def _seed_base_checkpoints(run_dir, cfg):
     """Upstream's pretrain mechanism is literally 'put G_0.pth/D_0.pth into the
     log dir' — latest_checkpoint_path picks them up, global_step parses to 0,
     clean_checkpoints never deletes *_0.pth. Reproduce exactly: copy each base
@@ -295,13 +304,13 @@ def _seed_base_checkpoints(exp_dir, cfg):
         ("pretrain_g", "G_*.pth", "G_0.pth"),
         ("pretrain_d", "D_*.pth", "D_0.pth"),
     ):
-        if glob.glob(os.path.join(exp_dir, pattern)):
+        if glob.glob(os.path.join(run_dir, pattern)):
             continue
         src = cfg.get(key, "") or ""
         if not src:
             raise RuntimeError("缺少底模路径: %s" % key)
         logger.info("seeding base checkpoint %s -> %s", src, dst_name)
-        dst = os.path.join(exp_dir, dst_name)
+        dst = os.path.join(run_dir, dst_name)
         tmp = dst + ".tmp"
         shutil.copyfile(src, tmp)
         os.replace(tmp, dst)

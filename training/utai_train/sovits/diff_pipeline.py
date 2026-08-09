@@ -8,7 +8,10 @@ sovits main training on purpose: slice/soft/f0/spec/vol caches are shared
 mel/aug_mel/aug_vol incrementally.
 
 Run config (JSON, written by the Rust TrainingManager) — required keys:
-  backend "sovits_diff", workspace, dataset_dir, model_slug, version "4.1|4.0",
+  backend "sovits_diff", dataset_dir, model_slug, version "4.1|4.0",
+  workspace = the family SLOT (`open_pool` resolves `<slot>/pools/<id>/` against it),
+  run_dir = THIS run's directory (weights, config, filelists, logs, resume sidecars),
+  slot_has_main_model (bool — see the config.json gates in run()),
   total_steps, batch_size, save_every_steps (=interval_val),
   interval_force_save (Rust-normalized to a multiple of save_every_steps),
   k_step_max (0 = full diffusion), stop_file,
@@ -58,7 +61,7 @@ from ..augment import (
     run_f0_gate,
 )
 from .. import device as device_shim
-from ..pool import assert_identity, open_pool
+from ..pool import assert_identity, checked_run_dir, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from .extract import extract_all
 from .flist import ENCODER_DIMS, _wav_duration, build_config, build_filelists, resolve_speakers
@@ -83,14 +86,55 @@ _PLACEHOLDER_MAIN = dict(
 )
 
 
+def assert_diff_first(cfg, run_dir):
+    """This run really is 「先练扩散」 — the ONE branch that may skip both main-model gates.
+
+    ⛔ Writing a placeholder `config.json` is the only path that bypasses the multi-speaker refusal
+    and the speech-encoder agreement check, and until §F2⒝ batch 2 it fired on a purely NEGATIVE
+    fact: `config.json` is not in this directory. That was safe while a slot held ONE run, because
+    "not here" could only mean "there is no main model" — the supported diff-first shape.
+
+    Per-run, "not here" can equally mean "this run was pointed somewhere else", and from inside the
+    directory the two are indistinguishable: the placeholder is a complete, normal-looking main
+    config (spk, n_speakers, speech_encoder all present), so no later reader can tell either. One
+    wiring slip would disguise itself as diff-first, with both gates silently disabled.
+
+    So the branch hangs on a POSITIVE fact instead, and on the only side that can establish it —
+    Rust enumerates the slot's runs, this process sees one directory.
+
+    Extracted from `run()` deliberately: `run()` needs a dataset, torch and a live reporter, so a
+    decision left inline there is one no probe can reach. `gate_pool_table` drives this.
+    """
+    if "slot_has_main_model" not in cfg:
+        raise RuntimeError(
+            "DIFF_MAIN_MODEL_UNKNOWN: the run config does not say whether this slot holds a main "
+            "model, so 'no config.json here' cannot be read as 'diff-first'. Rust writes the key; "
+            "a hand-built config must set it too."
+        )
+    if cfg["slot_has_main_model"]:
+        raise RuntimeError(
+            "DIFF_MAIN_CONFIG_MISSING: 这个工作区有主模型，但本次扩散训练指向的 run 目录里没有 "
+            "config.json (%s)——拒绝按「先练扩散」继续，那会跳过多说话人与编码器一致性检查" % run_dir
+        )
+    logger.info(
+        "diff-first: this slot holds no main model, writing a placeholder config.json in %s "
+        "(the multi-speaker and speech-encoder gates have nothing to check against)",
+        run_dir,
+    )
+
+
 def run(cfg, reporter, stop):
     # backend = effective device (cuda|xpu|cpu), single source (shim). Byte-identical
     # to torch.cuda.is_available() on cpu/cuda; resolves to "xpu" on an Intel box.
     backend = device_shim.resolve_backend(cfg)
 
-    exp_dir = cfg["workspace"]
-    os.makedirs(exp_dir, exist_ok=True)
-    get_logger(exp_dir)  # file log train.log (utf-8) in the run dir
+    # §F2⒝ batch 2 — the SLOT and this RUN are two directories now. `workspace` still names the
+    # slot because that is what `open_pool` resolves `<slot>/pools/<id>/` against; everything a RUN
+    # owns (weights, config.json, filelists/, the resume sidecars, train.log) hangs off `run_dir`.
+    slot_dir = cfg["workspace"]
+    run_dir = checked_run_dir(cfg, slot_dir)
+    os.makedirs(run_dir, exist_ok=True)
+    get_logger(run_dir)  # file log train.log (utf-8) in the run dir
 
     assets = cfg["assets"]
     version = cfg["version"]
@@ -111,7 +155,7 @@ def run(cfg, reporter, stop):
     # op so a multi-speaker workspace's shared caches are never touched.
     if len(cfg.get("speakers") or []) > 1:
         raise RuntimeError("浅扩散暂不支持多说话人模型（请先训练单说话人扩散）")
-    _existing_cfg = os.path.join(exp_dir, "config.json")
+    _existing_cfg = os.path.join(run_dir, "config.json")
     if os.path.exists(_existing_cfg):
         try:
             _probe_n = int(getattr(
@@ -132,7 +176,10 @@ def run(cfg, reporter, stop):
     # means "provably the same directory" instead of "the same string happened to be written
     # last". A drift in the formula used to WIPE the main run's caches; now it would merely mint
     # a second pool, which the identity gate catches without costing anyone their slices.
-    pool_dir = open_pool(exp_dir, fp_text)
+    # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
+    # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
+    # hours of preprocessing — with one info line as the only sign.
+    pool_dir = open_pool(slot_dir, fp_text)
     assert_identity(pool_dir, fp_text)
 
     dataset_44k = os.path.join(pool_dir, "dataset_44k")
@@ -160,7 +207,7 @@ def run(cfg, reporter, stop):
     )
 
     stop.check()
-    config_path = os.path.join(exp_dir, "config.json")
+    config_path = os.path.join(run_dir, "config.json")
     hps_probe = None
     if os.path.exists(config_path):
         try:
@@ -179,8 +226,9 @@ def run(cfg, reporter, stop):
                 "扩散模型必须与主模型同版本" % (existing_encoder, version, encoder)
             )
     else:
+        assert_diff_first(cfg, run_dir)
         build_config(
-            exp_dir, slug, encoder, vol_embedding,
+            run_dir, slug, encoder, vol_embedding,
             _PLACEHOLDER_MAIN["fp16"], _PLACEHOLDER_MAIN["total_epoch"],
             _PLACEHOLDER_MAIN["batch_size"], _PLACEHOLDER_MAIN["save_every_steps"],
             _PLACEHOLDER_MAIN["keep_ckpts"], _PLACEHOLDER_MAIN["all_in_mem"],
@@ -213,26 +261,26 @@ def run(cfg, reporter, stop):
         lambda stem: _remove_aug_products(spk_dir, meta_dir, stem),
         reporter,
         stop,
-        report_path=os.path.join(exp_dir, "aug_gate_report.json"),
+        report_path=os.path.join(run_dir, "aug_gate_report.json"),
     )
 
     # filelists AFTER the gate (they must not reference rejected aug slices);
     # deterministic — a main-model run rebuilds the identical split from the
     # same seed (val = originals only, S41 split protocol in flist.py)
     stop.check()
-    build_filelists(exp_dir, slug, dataset_44k, seed, reporter)
+    build_filelists(run_dir, slug, dataset_44k, seed, reporter)
 
     stop.check()
     reporter.stage("diff_prep", message="准备扩散配置与底模")
-    expdir = os.path.join(exp_dir, "diffusion")
+    expdir = os.path.join(run_dir, "diffusion")
     os.makedirs(expdir, exist_ok=True)
-    duration = _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim)
-    _ensure_long_samples(exp_dir, duration)
+    duration = _write_diffusion_yaml(cfg, run_dir, expdir, encoder, dim)
+    _ensure_long_samples(run_dir, duration)
     _seed_base_model(expdir, assets.get("diffusion_pretrain") or "", reporter)
 
     stop.check()
     reporter.stage("train_prep", message="加载扩散模型与数据，训练即将开始")
-    summary = _train_diff(cfg, exp_dir, pool_dir, reporter, stop)
+    summary = _train_diff(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["steps_this_run"] == 0 and not summary["stopped"]:
         raise RuntimeError(
@@ -252,7 +300,7 @@ def _p(path):
     return str(path).replace("\\", "/")
 
 
-def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
+def _write_diffusion_yaml(cfg, run_dir, expdir, encoder, dim):
     """configs_template/diffusion_template.yaml -> workspace/diffusion.yaml.
     Template values stay verbatim except the documented fills; Saver re-dumps
     the whole config as expdir/config.yaml at train start = the exact pair
@@ -267,7 +315,7 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
         config = yaml.safe_load(f)
 
     display = cfg.get("model_name") or cfg["model_slug"]
-    flist_dir = os.path.join(exp_dir, "filelists")
+    flist_dir = os.path.join(run_dir, "filelists")
     backend = device_shim.resolve_backend(cfg)
     fp16 = bool(cfg.get("fp16", False)) and backend == "cuda"  # xpu/cpu = fp32; CPU autocast has no fp16
 
@@ -306,7 +354,7 @@ def _write_diffusion_yaml(cfg, exp_dir, expdir, encoder, dim):
     # train.epochs stays the upstream 100000 sentinel — completion is
     # total_steps-based (solver deviation); lr/decay/gamma/save_opt verbatim
 
-    out = os.path.join(exp_dir, "diffusion.yaml")
+    out = os.path.join(run_dir, "diffusion.yaml")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(config, f)
@@ -358,7 +406,7 @@ def _write_flist(path, rows):
         f.write("\n".join(rows) + "\n")
 
 
-def _ensure_long_samples(exp_dir, duration):
+def _ensure_long_samples(run_dir, duration):
     """data_loaders.__getitem__ skips samples shorter than duration+0.1s by
     recursing to the next index — a filelist with no long sample recurses
     forever (train: first batch; val: the FIRST validation, i.e. only after
@@ -370,7 +418,7 @@ def _ensure_long_samples(exp_dir, duration):
     regenerated by EVERY run's flist stage, so a later main run rebuilds its
     own split from the same seed untouched."""
     need = duration + 0.1
-    flist_dir = os.path.join(exp_dir, "filelists")
+    flist_dir = os.path.join(run_dir, "filelists")
     train_list = os.path.join(flist_dir, "train.txt")
     val_list = os.path.join(flist_dir, "val.txt")
     train = _read_flist(train_list)
@@ -571,7 +619,7 @@ def load_start_state(expdir, model, optimizer, device="cpu", prefer=None):
     )
 
 
-def _train_diff(cfg, exp_dir, pool_dir, reporter, stop):
+def _train_diff(cfg, run_dir, pool_dir, reporter, stop):
     """Port of upstream train_diff.py __main__ (@ 730930d) — construction,
     resume-lr math (incl. the max(...,0) clamp: the base model's
     global_step=0 makes (0-2)//decay_step == -1, without the clamp every
@@ -590,7 +638,7 @@ def _train_diff(cfg, exp_dir, pool_dir, reporter, stop):
     random.seed(seed)
     torch.manual_seed(seed)
 
-    args = du.load_config(os.path.join(exp_dir, "diffusion.yaml"))
+    args = du.load_config(os.path.join(run_dir, "diffusion.yaml"))
     logger.info(" > exp: %s", args.env.expdir)
 
     # load vocoder

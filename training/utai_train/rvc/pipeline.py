@@ -7,7 +7,8 @@ the user stops mid-training (the "index gen on stop" requirement, solved by
 construction).
 
 Run config (JSON, written by the Rust TrainingManager) — required keys:
-  backend "rvc", workspace, dataset_dir, model_slug, sample_rate "32k|40k|48k",
+  backend "rvc", workspace (the family SLOT), run_dir (THIS run), dataset_dir,
+  model_slug, sample_rate "32k|40k|48k",
   version "v1|v2", total_epoch, batch_size, stop_file,
   assets{ffmpeg, rmvpe_pt, contentvec_onnx, configs_dir, mute_dir}
 optional: spk_id(0), seed(1234), per(3.7), fp16(true), save_every_epoch(5),
@@ -32,7 +33,7 @@ from . import train_utils as utils
 from .. import device as device_shim
 from ..augment import augment_slices, is_aug_name, list_aug_entries, read_wav, run_f0_gate
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, open_pool
+from ..pool import assert_identity, checked_run_dir, open_pool
 from .extract_f0 import extract_f0
 from .extract_feature import extract_features
 from .filelist import build_filelist_and_config
@@ -65,9 +66,13 @@ def run(cfg, reporter, stop):
     # torch.cuda.is_available() on cpu/cuda; on an Intel box it resolves to "xpu".
     backend = device_shim.resolve_backend(cfg)
 
-    exp_dir = cfg["workspace"]
-    os.makedirs(exp_dir, exist_ok=True)
-    utils.get_logger(exp_dir)  # file log train.log (utf-8) in the run dir
+    # §F2⒝ batch 2 — the SLOT and this RUN are two directories now. `workspace` still names the
+    # slot because that is what `open_pool` resolves `<slot>/pools/<id>/` against; everything a RUN
+    # owns (weights, config.json, filelist.txt, the resume sidecars, train.log) hangs off `run_dir`.
+    slot_dir = cfg["workspace"]
+    run_dir = checked_run_dir(cfg, slot_dir)
+    os.makedirs(run_dir, exist_ok=True)
+    utils.get_logger(run_dir)  # file log train.log (utf-8) in the run dir
 
     assets = cfg["assets"]
     sr_str = cfg["sample_rate"]
@@ -94,7 +99,10 @@ def run(cfg, reporter, stop):
     # `shutil.rmtree` of them. The fp_text above is unchanged, so the pool boundary is exactly
     # today's cache-invalidation boundary; the only difference is that a run with a different
     # identity gets a sibling directory instead of deleting this one.
-    pool_dir = open_pool(exp_dir, fp_src)
+    # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
+    # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
+    # hours of preprocessing — with one info line as the only sign.
+    pool_dir = open_pool(slot_dir, fp_src)
     assert_identity(pool_dir, fp_src)
 
     per = float(cfg.get("per", 3.7))
@@ -127,17 +135,17 @@ def run(cfg, reporter, stop):
     extract_features(pool_dir, version, assets["contentvec_onnx"], reporter, stop)
 
     stop.check()
-    # products from the pool, report at the slot root: the gate report is a RUN artifact (it
-    # describes what this run's aug plan produced), and the publish chain reads it by a fixed
-    # slot-relative name.
-    _rvc_aug_gate(pool_dir, exp_dir, reporter, stop)
+    # products from the pool, report in the RUN: the gate report describes what THIS run's aug
+    # plan produced. ⚠ Nothing in the repo reads it — the only mention outside the writers is the
+    # augCopies tooltip telling the user where to look, so「工作区」there now means the run.
+    _rvc_aug_gate(pool_dir, run_dir, reporter, stop)
 
     stop.check()
-    index_path, index_rows = build_index(exp_dir, pool_dir, version, seed, reporter)
+    index_path, index_rows = build_index(run_dir, pool_dir, version, seed, reporter)
 
     stop.check()
     build_filelist_and_config(
-        exp_dir,
+        run_dir,
         pool_dir,
         sr_str,
         version,
@@ -154,7 +162,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载模型与数据，训练即将开始")
-    summary = train(cfg, exp_dir, pool_dir, reporter, stop)
+    summary = train(cfg, run_dir, pool_dir, reporter, stop)
 
     if summary["final_weight"] is None and not summary["stopped"]:
         raise RuntimeError(
@@ -249,7 +257,7 @@ def _augment_rvc(pool_dir, copies, seed, reporter, stop):
                     pass
 
 
-def _rvc_aug_gate(pool_dir, slot_dir, reporter, stop):
+def _rvc_aug_gate(pool_dir, run_dir, reporter, stop):
     """f0 quality gate on the 2b-f0nsf products (Hz floats, unvoiced = 0,
     NOT interpolated — voiced mask is f0 > 0; 2a_f0 is the 256-bin coarse
     quantization and must never be used for cents comparisons)."""
@@ -271,5 +279,5 @@ def _rvc_aug_gate(pool_dir, slot_dir, reporter, stop):
         lambda stem: _remove_rvc_aug_products(pool_dir, stem),
         reporter,
         stop,
-        report_path=os.path.join(slot_dir, "aug_gate_report.json"),
+        report_path=os.path.join(run_dir, "aug_gate_report.json"),
     )

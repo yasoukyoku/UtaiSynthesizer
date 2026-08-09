@@ -6,7 +6,9 @@ CLI entry points (click / ProcessPoolExecutor orchestration) with the utai
 stage/protocol harness; the Trainer construction transcribes train.py:31-104.
 
 Run config keys (run.json, written by the Rust TrainingManager):
-  backend "vocoder", workspace, dataset_dir, model_slug, model_name,
+  backend "vocoder", dataset_dir, model_slug, model_name,
+  workspace = the family SLOT (`open_pool` resolves `<slot>/pools/<id>/` against it),
+  run_dir = THIS run's directory (weights, config, filelists, logs, resume sidecars),
   total_steps (REAL steps — lightning global = 2x, see harness.py),
   save_every_steps (REAL = val_check_interval batches), batch_size,
   keep_ckpts, crop_mel_frames, freeze_mpd, seed, stop_file,
@@ -99,7 +101,7 @@ from ..augment import (
 )
 from .. import device as device_shim
 from ..cache import dataset_fingerprint
-from ..pool import assert_identity, open_pool
+from ..pool import assert_identity, checked_run_dir, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 from ..sovits.preprocess import _decode  # single source decoder (librosa+ffmpeg)
@@ -116,12 +118,16 @@ MIN_PIECE_SAMPLES = TARGET_SR // 2
 
 
 def run(cfg, reporter, stop):
-    exp_dir = cfg["workspace"]
-    os.makedirs(exp_dir, exist_ok=True)
+    # §F2⒝ batch 2 — the SLOT and this RUN are two directories now. `workspace` still names the
+    # slot because that is what `open_pool` resolves `<slot>/pools/<id>/` against; everything a RUN
+    # owns (weights, config.json, filelists/, the resume sidecars, train.log) hangs off `run_dir`.
+    slot_dir = cfg["workspace"]
+    run_dir = checked_run_dir(cfg, slot_dir)
+    os.makedirs(run_dir, exist_ok=True)
     # root logger → stderr + train.log BEFORE any vendored/lightning import:
     # base_task_gan's module-level logging.basicConfig(stream=sys.stdout) must
     # stay a no-op (root already has handlers) or it would poison the protocol
-    get_logger(exp_dir)
+    get_logger(run_dir)
 
     assets = cfg["assets"]
     # backend = effective device (cuda|xpu|cpu). Drives the aug-gate rmvpe device;
@@ -137,13 +143,16 @@ def run(cfg, reporter, stop):
     # §F2⒝ — the identity NAMES the directory now; a different one is a sibling, not a deletion.
     # ⚠ This chain is the FLATTEST of the five (pool and run products sat side by side at the
     # workspace root with no existing divide), which is why every path below is now derived from
-    # one of two explicitly named directories instead of from `exp_dir` alone.
-    pool_dir = open_pool(exp_dir, fp_text)
+    # one of two explicitly named directories instead of from `run_dir` alone.
+    # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
+    # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
+    # hours of preprocessing — with one info line as the only sign.
+    pool_dir = open_pool(slot_dir, fp_text)
     assert_identity(pool_dir, fp_text)
 
     slices_dir = os.path.join(pool_dir, "slices")
     npz_dir = os.path.join(pool_dir, "npz")
-    flist_dir = os.path.join(exp_dir, "filelists")  # RUN product: rewritten every run
+    flist_dir = os.path.join(run_dir, "filelists")  # RUN product: rewritten every run
 
     slice_dataset(cfg["dataset_dir"], slices_dir, assets["ffmpeg"], reporter, stop)
 
@@ -154,7 +163,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     config = build_train_config(cfg, pretrain, flist_dir)
-    process_slices(slices_dir, npz_dir, config, reporter, stop)
+    process_slices(pool_dir, slices_dir, npz_dir, config, reporter, stop)
 
     stop.check()
     # S41 quality gate — rmvpe-blooded BY DESIGN: parselmouth (this chain's own
@@ -162,7 +171,7 @@ def run(cfg, reporter, stop):
     # prior smooths over frames rmvpe reads as 300+ cents off — gate_aug_semantic
     # part 4 keeps that blind spot on record), so the gate must not use the
     # npz f0 products
-    _vocoder_aug_gate(pool_dir, exp_dir, slices_dir, npz_dir,
+    _vocoder_aug_gate(pool_dir, run_dir, slices_dir, npz_dir,
                       assets.get("rmvpe_pt", ""), backend, reporter, stop)
 
     stop.check()
@@ -171,7 +180,7 @@ def run(cfg, reporter, stop):
 
     stop.check()
     reporter.stage("train_prep", message="加载底模与数据，训练即将开始")
-    summary = _train(cfg, exp_dir, pool_dir, config, reporter, stop)
+    summary = _train(cfg, run_dir, pool_dir, config, reporter, stop)
 
     stopped = summary.pop("stopped")
     reporter.done("stopped" if stopped else "completed", summary)
@@ -264,7 +273,7 @@ def slice_dataset(dataset_dir, slices_dir, ffmpeg, reporter, stop):
 
 # ─── stage: process (wav2spec → npz) ─────────────────────────────────────────
 
-def process_slices(slices_dir, npz_dir, config, reporter, stop):
+def process_slices(pool_dir, slices_dir, npz_dir, config, reporter, stop):
     from .process_sv import wav2spec  # vendored process.py (heavy imports)
 
     os.makedirs(npz_dir, exist_ok=True)
@@ -289,7 +298,7 @@ def process_slices(slices_dir, npz_dir, config, reporter, stop):
                 logger.warning("dropping aug slice with failed wav2spec: %s (%s)",
                                name, result)
                 _remove_vocoder_aug_products(
-                    slices_dir, npz_dir, os.path.splitext(name)[0]
+                    pool_dir, slices_dir, npz_dir, os.path.splitext(name)[0]
                 )
                 aug_dropped += 1
             else:
@@ -419,11 +428,11 @@ def _augment_vocoder(pool_dir, slices_dir, npz_dir, copies, seed, reporter, stop
                     pass
 
 
-def _vocoder_aug_gate(pool_dir, slot_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter, stop):
+def _vocoder_aug_gate(pool_dir, run_dir, slices_dir, npz_dir, rmvpe_pt, backend, reporter, stop):
     """rmvpe-blooded f0 gate over the aug AUDIO pairs (never the npz f0 — its
     parselmouth lineage is blind to the PSOLA glitch tail, see run())."""
     entries = list_aug_entries(slices_dir, _vocoder_meta_dir(pool_dir))
-    report_path = os.path.join(slot_dir, "aug_gate_report.json")
+    report_path = os.path.join(run_dir, "aug_gate_report.json")
     if not entries:
         # ⚠ `report_path` on this arm too. It was omitted, so this chain alone kept a PREVIOUS
         # run's report after augmentation went back to zero — the same shape as the two
@@ -613,7 +622,7 @@ SRC_NUMBERED = "numbered"  # model_ckpt_steps_<n>.ckpt — upstream's max(step) 
 SRC_FRESH = "fresh"        # nothing to restore
 
 
-def choose_start_ckpt(exp_dir, prefer=None):
+def choose_start_ckpt(run_dir, prefer=None):
     """WHICH lightning checkpoint this run resumes from. Returns a :class:`VocStart`.
 
     ★ MODULE-LEVEL on purpose. Inside `_train` no test could drive it without a dataset, a
@@ -656,10 +665,10 @@ def choose_start_ckpt(exp_dir, prefer=None):
     candidates = []
 
     if prefer == resume_state.PREFER_BEST:
-        blob = resume_state.read_snapshot(exp_dir, resume_state.BEST_DIR)
+        blob = resume_state.read_snapshot(run_dir, resume_state.BEST_DIR)
         if blob is not None:
             candidates.append((
-                os.path.join(resume_state.snapshot_dir(exp_dir, resume_state.BEST_DIR),
+                os.path.join(resume_state.snapshot_dir(run_dir, resume_state.BEST_DIR),
                              resume_state.BEST_CKPT),
                 blob, SRC_BEST,
             ))
@@ -667,14 +676,14 @@ def choose_start_ckpt(exp_dir, prefer=None):
             logger.warning(
                 "asked to continue from the BEST vocoder archive, but %s holds no complete one "
                 "— continuing from the latest instead",
-                resume_state.snapshot_dir(exp_dir, resume_state.BEST_DIR),
+                resume_state.snapshot_dir(run_dir, resume_state.BEST_DIR),
             )
 
-    pointer = resume_state.read_pointer(exp_dir)
+    pointer = resume_state.read_pointer(run_dir)
     ceiling = None
     if pointer is not None:
         name = pointer["files"][0]
-        candidates.append((os.path.join(exp_dir, name), pointer, SRC_POINTER))
+        candidates.append((os.path.join(run_dir, name), pointer, SRC_POINTER))
         m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
         ceiling = int(m.group(1)) if m else int(pointer.get("global_step", 0))
 
@@ -689,7 +698,7 @@ def choose_start_ckpt(exp_dir, prefer=None):
     # `re.search(r'steps_\d+')` — that looseness is what let a `…_48-v1.ckpt` be resumed from
     # while three other consumers could not even see it.
     numbered = []
-    for name in sorted(os.listdir(exp_dir)) if os.path.isdir(exp_dir) else []:
+    for name in sorted(os.listdir(run_dir)) if os.path.isdir(run_dir) else []:
         m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
         if m:
             numbered.append((int(m.group(1)), name))
@@ -699,7 +708,7 @@ def choose_start_ckpt(exp_dir, prefer=None):
         # switch — the exact failure the pointer exists to prevent.
         numbered = [c for c in numbered if c[0] <= ceiling]
     for step, name in sorted(numbered, reverse=True):
-        candidates.append((os.path.join(exp_dir, name), None, SRC_NUMBERED))
+        candidates.append((os.path.join(run_dir, name), None, SRC_NUMBERED))
 
     # de-duplicate by path, keeping the first (= highest-priority) mention: the pointer normally
     # names the same file the scan finds, and loading it twice would just pay 1.2 GB twice.
@@ -741,11 +750,11 @@ def choose_start_ckpt(exp_dir, prefer=None):
 
     raise RuntimeError(
         "%s: every vocoder archive in %s holds nan/inf weights or is unreadable (%d tried)"
-        % (resume_state.CODE_ARCHIVE_POISONED, exp_dir, poisoned)
+        % (resume_state.CODE_ARCHIVE_POISONED, run_dir, poisoned)
     )
 
 
-def _prune_workspace_ckpts(exp_dir, keep, tip_step=None):
+def _prune_workspace_ckpts(run_dir, keep, tip_step=None):
     """Manually saved tail checkpoints live outside DsModelCheckpoint's top-k
     bookkeeping and would accumulate across stop/resume cycles (红队 A24) —
     prune the workspace to the newest `keep` by step number.
@@ -767,7 +776,7 @@ def _prune_workspace_ckpts(exp_dir, keep, tip_step=None):
     which is what a run that never wrote anything should do.
     """
     ckpts = []
-    for name in os.listdir(exp_dir):
+    for name in os.listdir(run_dir):
         m = re.fullmatch(r"model_ckpt_steps_(\d+)\.ckpt", name)
         if m:
             ckpts.append((int(m.group(1)), name))
@@ -776,13 +785,13 @@ def _prune_workspace_ckpts(exp_dir, keep, tip_step=None):
     ckpts.sort(reverse=True)
     for _, name in ckpts[max(1, int(keep)):]:
         try:
-            os.remove(os.path.join(exp_dir, name))
+            os.remove(os.path.join(run_dir, name))
             logger.info("pruned workspace checkpoint %s", name)
         except OSError:
             pass
 
 
-def _train(cfg, exp_dir, pool_dir, config, reporter, stop):
+def _train(cfg, run_dir, pool_dir, config, reporter, stop):
     """Transcription of upstream train.py:31-104 (same statement order — the
     RNG stream from seed_everything through fit must match the original for
     gate1) + the utai protocol callback. No RNG consumption is allowed between
@@ -818,7 +827,7 @@ def _train(cfg, exp_dir, pool_dir, config, reporter, stop):
         logger.warning(_xpu_msg)
         reporter.stage("train_prep", message=_xpu_msg, force=True)
 
-    work_dir = str(exp_dir)
+    work_dir = str(run_dir)
     # config.yaml dump BEFORE the work_dir key lands in the dict (train.py:42-44)
     with open(os.path.join(work_dir, "config.yaml"), "w", encoding="utf8") as f:
         yaml.safe_dump(config, f)

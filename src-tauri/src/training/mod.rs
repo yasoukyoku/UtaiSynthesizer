@@ -1835,6 +1835,21 @@ impl TrainingManager {
             }
         }
         std::fs::create_dir_all(&workspace)?;
+        // ★§F2⒝ batch 2 step ③ — RE-RESOLVE, because the wipe above took the run directory with
+        // it. Everything from here on WRITES: the manifest, `run.json`, `stop.flag`, the
+        // checkpoints. The `run` resolved before the guards was deliberately the pre-wipe answer
+        // and is now a path that no longer exists — writing to it fails with a bare io NotFound
+        // AFTER the slot has already been emptied, so the user sees an unreadable error, presses
+        // the button again (which now succeeds, since there is no `runs/` left) and never learns
+        // that the first press is what deleted everything.
+        //
+        // `run_dir_for_start` also CREATES the directory: `create_dir_all(&workspace)` above only
+        // makes the slot, and python cannot cover for it — `run.json` is written before the sidecar
+        // is spawned at all. And python covering for it is exactly the failure mode to avoid: every
+        // pipeline opens with `os.makedirs(run_dir)`, so a wrong path there is not an error, it is a
+        // brand-new directory with a full training run inside it that nothing ever scans.
+        let run = trun::run_dir_for_start(&workspace, &family)?;
+        let manifest_path = run.join("run_manifest.json");
 
         // resume dead-end guard: a resume whose target步数 is already reached
         // would "complete" instantly without training a step (S37 的续训 config
@@ -2615,6 +2630,21 @@ fn run_worker(
     let mut run_config = serde_json::json!({
         "backend": req.backend,
         "workspace": workspace,
+        // ★§F2⒝ batch 2 step ③ — the SLOT above, THIS RUN here. python splits the same way:
+        // `open_pool` keeps taking the slot (it resolves `<slot>/pools/<id>/`), everything else —
+        // weights, `config.json`, `filelists/`, the seeded base checkpoints, `train.log`, the
+        // diffusion expdir — hangs off this one. `.path()` because `RunDir` is deliberately not
+        // `Serialize`: the only way to obtain one is through a resolver.
+        "run_dir": run.path(),
+        // Whether the SLOT holds a main model AT ALL — a fact only this side can establish, since
+        // python sees one directory and cannot enumerate the slot's other runs. The shallow
+        // diffusion chain needs it because both of its gates (multi-speaker refusal, encoder
+        // agreement with the main model) hang off `<run>/config.json` EXISTING, and their absent
+        // branch quietly writes a placeholder. Without this key「there is genuinely no main model」
+        // (diff-first, which is a supported shape) and「this run was pointed at the wrong place」
+        // are the same observation, and a wiring slip would disguise itself as diff-first with both
+        // gates silently disabled and not one log line.
+        "slot_has_main_model": trun::run_dirs(&workspace).iter().any(has_main_progress),
         "dataset_dir": dataset_dir,
         "model_slug": slug,
         "model_name": req.model_name,
@@ -3291,19 +3321,50 @@ mod tests {
                  would hijack the diffusion resume scan"
             );
         }
-        // ★§F2⒝ batch 2 — the OTHER half of the same rule, and the reason `diffusion/` has to stay
-        // one level BELOW a run root rather than becoming it. The loop above only says python's own
+        // ★§F2⒝ — the OTHER half of the same rule, and the reason `diffusion/` has to stay one
+        // level BELOW a run root rather than becoming it. The loop above only says python's own
         // snapshot names are long enough; it knows nothing about depth, so both `diffusion` (9) and
-        // a minted run id (13) sail through it and `trun`'s doc used to cite it as this rule's
-        // guard. What actually makes the run root unusable as an expdir is that a run root has
-        // these beside the snapshots — and they are SHORT:
-        for d in ["eval", "logs"] {
-            assert!(
-                d.chars().count() < min_len,
-                "{d:?} now clears SNAPSHOT_DIR_MIN_LEN={min_len} — re-read why the shallow-diffusion \
-                 expdir may not be the run root, because the reason just changed"
-            );
-        }
+        // a minted run id (13) sail through it, and `trun`'s doc once cited it as this rule's guard.
+        //
+        // ⚠ Batch 3 measured the replacement written here in batch 2 and found it WEAK in two ways.
+        // It asserted that `eval` and `logs` fall below the minimum — true, but:
+        //   * `logs` does not DISCRIMINATE: it is `<expdir>/logs` under the correct layout too, so
+        //     it is inside the scan's scope either way and cannot tell the two choices apart;
+        //   * the hazard it describes is DORMANT — it needs a `.pt` inside one of those directories
+        //     and `traverse_dir` filters on `.pt` while both are written only by TensorBoard.
+        // Both halves stay (they are the arithmetic, and `eval` really is run-root-only), but the
+        // load-bearing statement is the one below, which needs no `.pt` anywhere unusual:
+        assert!("eval".chars().count() < min_len, "`eval/` is the run-root-only short name");
+        assert!(
+            "logs".chars().count() < min_len,
+            "`logs/` no longer falls below SNAPSHOT_DIR_MIN_LEN={min_len} — the arithmetic changed"
+        );
+        // ⛔ THE reason, and it fires on the ordinary layout rather than on an unusual file. The
+        // scan slices every checkpoint path at `len(expdir) + len("/model_")` and asks isdigit().
+        // With the expdir one level above the checkpoints — which is what a run root would be —
+        // what survives the slice is not the step number but the tail of the directory name:
+        // `<run>/diffusion/model_24.pt` becomes `ion/model_24`. Not a number, so the ENTIRE
+        // numbered grid reads as empty and a resume restarts from step 0 — silently, on a run that
+        // really does hold checkpoints.
+        // python: `steps = [s[len(os.path.join(expdir, "model_")):] for s in <*.pt, recursive>]`,
+        // so past `<expdir>/` it discards exactly `len("model_")` more characters. Both directions
+        // are asserted, because only the PAIR discriminates — one of them alone is a fact about
+        // arithmetic, not about which directory may be the expdir.
+        let after_slice = |tail_under_expdir: &str| -> String {
+            tail_under_expdir.chars().skip("model_".len()).collect()
+        };
+        assert_eq!(
+            after_slice("model_24"),
+            "24",
+            "with `diffusion/` AS the expdir the step number survives the slice — if this fails the \
+             resume scan can no longer read its own checkpoints"
+        );
+        let hijacked = after_slice("diffusion/model_24");
+        assert!(
+            !hijacked.chars().all(|c| c.is_ascii_digit()) && hijacked.contains('/'),
+            "the run root would now be a usable expdir ({hijacked:?} parses as a step) — re-read \
+             why `diffusion/` sits one level below it, because that reason just changed"
+        );
         // Rust joins these names by hand in two files; a python rename must break a test here
         // rather than the user's resume.
         for (file, src) in [("mod.rs", THIS_RS), ("tproject.rs", TPROJECT_RS)] {
@@ -4292,6 +4353,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔ §F2⒝ batch 2 step ③ — the run a START writes into must be re-resolved AFTER the wipe.
+    ///
+    /// This is a SOURCE assertion because the thing it protects is unreachable from a test:
+    /// `try_start` needs a pyenv, a `State` and a live process, which is the same reason
+    /// `trun::RunDir` had to become a type rather than a convention. What it pins is an ORDER, and
+    /// getting it wrong is worse than loud: the pre-wipe `run` points inside the `runs/` container
+    /// the wipe just deleted, so `run_manifest.json` fails with a bare io NotFound — but only after
+    /// the slot has already been emptied, and the second press succeeds because there is no
+    /// container left. The user experiences one unreadable error and a button that then works,
+    /// while the checkpoints are gone and the slot has silently fallen back to layout 0.
+    #[test]
+    fn a_start_re_resolves_its_run_after_the_wipe() {
+        static THIS_RS: &str = include_str!("mod.rs");
+        let at = |needle: &str| -> usize {
+            THIS_RS
+                .find(needle)
+                .unwrap_or_else(|| panic!("try_start no longer contains {needle:?}"))
+        };
+        let wipe = at("remove_dir_all_robust(&workspace)");
+        let recreate = at("std::fs::create_dir_all(&workspace)?;");
+        let resolve = at("trun::run_dir_for_start(&workspace, &family)?");
+        let manifest_write = at("std::fs::write(&manifest_path, serde_json::to_vec_pretty");
+        assert!(wipe < recreate, "the slot is re-created after the wipe, not before");
+        assert!(
+            recreate < resolve,
+            "the run is resolved BEFORE the slot is re-created — it would name a directory that \
+             the wipe removed and nothing has put back"
+        );
+        assert!(
+            resolve < manifest_write,
+            "`run_manifest.json` is written before the post-wipe run is resolved"
+        );
+        // …and the PRE-wipe resolution has to stay where it is: the guards judge the pre-wipe state
+        let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, None)?;");
+        assert!(
+            guard_resolve < wipe,
+            "the guards' run is resolved after the wipe — they exist to judge what the wipe would \
+             destroy, and post-wipe they would all answer「什么都没有」"
+        );
     }
 
     fn src_file(dir: &Path, name: &str, bytes: usize) -> String {

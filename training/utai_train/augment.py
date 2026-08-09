@@ -15,7 +15,7 @@ Invariants (red-team ruling, design doc appendix A):
   - file naming: <stem>_aug<copy_idx>.wav, DIGIT index only; the keyshift
     lives in the meta json (a float in the name would break the RVC
     filelist's split('.')[0] key intersection)
-  - meta jsons live in a SEPARATE dir (exp_dir/aug_meta), never in product
+  - meta jsons live in a SEPARATE dir (<pool>/aug_meta), never in product
     dirs (same split('.')[0] ghost-key hazard)
   - draws use a per-(slice, copy) seeded RNG — independent of processing
     order and cache state (unlike the diff aug's sequential stream)

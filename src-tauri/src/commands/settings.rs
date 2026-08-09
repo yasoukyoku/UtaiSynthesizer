@@ -1395,6 +1395,45 @@ impl SyncLevel {
     }
 }
 
+/// Would a per-file delta from `src` into `dst` write anything? Returns the first file that would.
+///
+/// Stat-only and recursive, and it MUST answer with the same rule the copier uses — hence
+/// [`needs_copy`], shared by both. A second opinion here would let the two drift until the run-level
+/// refusal fired on a tree the copier would have left alone (or, worse, the other way round).
+fn delta_would_write(src: &std::path::Path, dst: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rd = std::fs::read_dir(src).ok()?;
+    for entry in rd.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            if let Some(p) = delta_would_write(&from, &to) {
+                return Some(p);
+            }
+            continue;
+        }
+        if needs_copy(&from, &to) {
+            return Some(from);
+        }
+    }
+    None
+}
+
+/// Is `from` newer than, or absent from, `to`? The one rule the delta sync runs on.
+///
+/// An unreadable SOURCE answers `true` on purpose: the caller then treats it as unsynced and keeps
+/// the old subtree, which is the safe direction — the alternative would silently delete a file the
+/// process could not read.
+fn needs_copy(from: &std::path::Path, to: &std::path::Path) -> bool {
+    match (std::fs::metadata(from), std::fs::metadata(to)) {
+        (Ok(s), Ok(d)) => {
+            s.len() != d.len()
+                || matches!((s.modified(), d.modified()), (Ok(sm), Ok(dm)) if sm > dm)
+        }
+        (Ok(_), Err(_)) => true,
+        (Err(_), _) => true,
+    }
+}
+
 fn sync_dir_delta(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -1428,18 +1467,35 @@ fn sync_dir_delta(
                     continue;
                 }
             }
-            // ⛔ A RUN is copied whole or not at all — see [`SyncLevel`]. Counted as a failure so
-            // the old subtree is kept: both directories hold real training results and only a
-            // human can say which one is wanted.
+            // ⛔ A RUN is copied whole or not at all — see [`SyncLevel`]. Two runs that really are
+            // different trainings must never be interleaved file by file, and only a human can say
+            // which one is wanted.
+            //
+            // ⚠ But "same id" does not mean "same training" in this batch, and refusing on the NAME
+            // alone would strand every reclaim there is: `trun::legacy_run_id` is a pure function of
+            // the FAMILY, so both roots of the ordinary case — `migrate_data_dir` copies the tree,
+            // the copy is queued for reclaim, and the new root has since been trained on — hold
+            // `runs/<the same id>/` by construction. Every migrated slot would then contribute a
+            // failure, the whole `training/` subtree would be kept forever, and the warning would
+            // tell the user they are two different trainings, which in that case is false.
+            //
+            // So the refusal hangs on the POSITIVE fact that the old copy actually has something to
+            // contribute. A delta that would write NOTHING is not a merge at all — it is the stale
+            // copy of a run that has moved on, and keeping the subtree for it only costs disk.
             if level == SyncLevel::Runs && to.exists() {
-                tracing::warn!(
-                    "data-dir reclaim: {} and {} are both training runs with the same id — \
-                     keeping the old tree instead of merging them (they are two different \
-                     trainings; move the one you want by hand)",
-                    from.display(),
-                    to.display()
-                );
-                failed += 1;
+                if let Some(newer) = delta_would_write(&from, &to) {
+                    tracing::warn!(
+                        "data-dir reclaim: {} and {} are both training runs with the same id AND \
+                         the old one holds newer or extra files (e.g. {}) — keeping the old tree \
+                         instead of merging them (move the one you want by hand)",
+                        from.display(),
+                        to.display(),
+                        newer.display()
+                    );
+                    failed += 1;
+                }
+                // …otherwise there is nothing to carry over: fall through WITHOUT recursing, so the
+                // subtree stays deletable.
                 continue;
             }
             // Nested levels are never bundle resources — the skip list is a TOP-LEVEL rule.
@@ -1449,19 +1505,14 @@ fn sync_dir_delta(
             failed += f;
             continue;
         }
-        let needs_copy = match (entry.metadata(), std::fs::metadata(&to)) {
-            (Ok(s), Ok(d)) => {
-                s.len() != d.len()
-                    || matches!((s.modified(), d.modified()), (Ok(sm), Ok(dm)) if sm > dm)
-            }
-            (Ok(_), Err(_)) => true,
-            (Err(_), _) => {
-                tracing::warn!("data-dir reclaim: cannot stat {} — treating as unsynced", from.display());
-                failed += 1;
-                continue;
-            }
-        };
-        if !needs_copy {
+        // An unreadable SOURCE is kept rather than skipped silently — same as before; everything
+        // else goes through the one shared rule, so `delta_would_write` cannot drift from it.
+        if entry.metadata().is_err() {
+            tracing::warn!("data-dir reclaim: cannot stat {} — treating as unsynced", from.display());
+            failed += 1;
+            continue;
+        }
+        if !needs_copy(&from, &to) {
             continue;
         }
         let tmp = to.with_extension(format!(
@@ -1938,6 +1989,11 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     // is the belt (it refuses to merge two different slot layouts); this is the braces, and it is
     // what actually lets the subtree be reclaimed instead of stranded.
     crate::training::tpool::migrate_all(&old_p);
+    // …and one level further, for the same reason and in the same order: the active root's slots
+    // have been folded into `runs/<id>/`, and `SyncLevel::Slots` compares the layout NUMBER, so an
+    // old root left at 2 would refuse to merge into a 3 and strand the largest subtree — neither
+    // merged nor reclaimed. ⛔ After the pool fold, never before (see `trun::migrate_all`).
+    crate::training::trun::migrate_all(&old_p);
     for name in MIGRATED_SUBTREES {
         let sub = old_p.join(name);
         if name == "training" {
@@ -2977,6 +3033,56 @@ mod tests {
         assert!(
             new.join("p1_aaaabbbb/rvc/pools/pdeadbeef0000/0_gt_wavs/0.wav").is_file(),
             "pools carry over as before; refusing them too would cost hours of preprocessing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔ §F2⒝ batch 3 — the SAME id is not the same evidence any more, and reading it as such
+    /// would strand every reclaim there is.
+    ///
+    /// `trun::legacy_run_id` is a pure function of the FAMILY while a slot holds one run, so the
+    /// ordinary reclaim — `migrate_data_dir` copies the tree, queues the copy, and the new root is
+    /// trained on afterwards — puts `runs/<the same id>/` on both sides BY CONSTRUCTION. Refusing on
+    /// the name alone therefore makes every migrated slot report a failure, and one failure keeps
+    /// the whole `training/` subtree: gigabytes that can never be freed again, under a warning that
+    /// says they are two different trainings.
+    ///
+    /// So the refusal hangs on whether the old copy has anything to contribute. Both halves are
+    /// asserted, because only the pair distinguishes the rule from "always allow" and from
+    /// "always refuse" — the sibling test above is the other half.
+    #[test]
+    fn a_reclaim_frees_a_stale_copy_of_the_same_run() {
+        let base = std::env::temp_dir().join(format!("utai_sync_same_{}", uuid::Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        let w = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        for root in [&old, &new] {
+            w(root.join("p1_aaaabbbb").join("project.json"), r#"{"id":"p1_aaaabbbb"}"#);
+            w(root.join("p1_aaaabbbb").join("rvc").join("slot.json"), r#"{"layout":3}"#);
+            w(root.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth"), "same");
+        }
+        // the new root trained on: a checkpoint the old copy never saw. The old copy has NOTHING
+        // the new one lacks, which is the whole point.
+        w(new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_2800.pth"), "newer");
+
+        let (copied, failed) = sync_dir_delta(&old, &new, false, SyncLevel::Projects, &[]);
+
+        assert_eq!(
+            failed, 0,
+            "a stale copy of the same run has nothing to carry over — reporting it keeps the whole \
+             training subtree forever, and the id it collides on is a constant"
+        );
+        assert_eq!(copied, 0, "…and nothing may be written into the destination run either");
+        assert!(
+            !new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_1400.pth.syncing").exists(),
+            "no staging file may be left behind"
+        );
+        assert_eq!(
+            std::fs::read_to_string(new.join("p1_aaaabbbb/rvc/runs/rfeedfacefeed/G_2800.pth"))
+                .unwrap(),
+            "newer"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1077,6 +1077,12 @@ pub fn run() {
             // running it first would migrate nothing and leave every legacy tree flat for another
             // whole launch.
             training::tpool::migrate_all(&data_dir);
+            // §F2⒝ batch 2 — …and then fold what is left (the weights, the resume sidecars, the
+            // audition cache) into `runs/<id>/`. ⛔ MUST be after the line above: both advance the
+            // same `slot.json`, and this one stamps layout 3 while the pool migration returns early
+            // on `layout >= 2` — running it first would leave every slot's preprocessing products
+            // at the slot root permanently, without so much as a warn line.
+            training::trun::migrate_all(&data_dir);
             // Reclaim delete staging dirs a previous session could not finish removing (locked
             // file, crash, forced quit). Same window as the migration: nothing holds a handle
             // under <data>/training yet.
