@@ -1150,6 +1150,41 @@ pub(crate) fn slugify(name: &str) -> String {
     format!("{}_{:08x}", base, h.finish() as u32)
 }
 
+/// THE artifact identity this run trains under: `hps.name`, the `weights/<slug>*` prefix, the
+/// `audition/<slug>_*` cache stems, the `config.spk` key, and — single-speaker SoVITS — the
+/// `<pool>/dataset_44k/<slug>/` slice directory.
+///
+/// ★§F2⒝ batch 2 step ④b —— **训练名从此只是标签:改变它永远不搬动任何字节。** Until this, the
+/// slug was `slugify(req.model_name)` recomputed on every start, which made the display name the
+/// identity. Three things hung off that, all of them silent:
+///
+/// * a renamed run's `weights/` and `audition/` entries become orphans, and the plain
+///   `weights/<slug>.pth` written at natural completion would exist TWICE, both classified
+///   `CkptKind::Final` (a kind whose doc says "one per slot");
+/// * `best_state.json` is name-INDEPENDENT (it sits at the run root) while `weights/<slug>_best.pth`
+///   is not, so a run continuing under a new name inherits the old best METRIC and may never write
+///   a best snapshot under the new name at all;
+/// * worst, the single-speaker SoVITS slice directory lives in the pool that runs SHARE, and the
+///   pool is selected by `dataset.fingerprint` CONTENT — the slug is not in it. A second name
+///   therefore grows a second full preprocessing tree inside the SAME pool, which nothing ever
+///   reclaims and which `extract.py` re-decodes in full on every later run, forever.
+///
+/// ⛔ Why the fallback is an ADOPTION and not a "the new way found nothing, use the old way" arm:
+/// `run.json[model_slug]` is a POSITIVE fact written by this very function's previous run — it is
+/// the value the artifacts on disk actually carry. Absence means the run never started, and a run
+/// that never started has nothing to orphan. (The banned shape — see `utai_train/pool.py:30-32` —
+/// is the one where absence is indistinguishable from a forgotten wiring change.)
+///
+/// `req.fresh` mints instead: 重训 wipes the slot, so there are no artifacts left to keep the
+/// old identity for, and choosing a new name there is exactly the point of the button. Same
+/// early-out, same reason, as [`effective_speaker_slugs`].
+fn effective_artifact_slug(run: &trun::RunDir, req: &StartTrainingRequest) -> String {
+    if req.fresh {
+        return slugify(&req.model_name);
+    }
+    tproject::run_artifact_slug(run).unwrap_or_else(|| slugify(&req.model_name))
+}
+
 /// The `(display name, slug)` this run must use for each co-trained speaker.
 ///
 /// Fresh run ⇒ derive from the names. RESUME of a slot that already froze a speaker set ⇒ REUSE
@@ -1680,12 +1715,8 @@ impl TrainingManager {
             ..
         } = assets;
 
-        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, the `config.spk` key. It has
-        // NOTHING to do with the directory layout any more (S76) and must keep deriving from
-        // the run's model name, or every existing checkpoint would change its file name and
-        // `best_state.json`'s carried-over metric would suppress the next best write.
-        let slug = slugify(&req.model_name);
-        // Directory identity — separate from the artifact identity above, and NOT derived from
+        // Directory identity — separate from the artifact identity (see `effective_artifact_slug`,
+        // resolved below once the run is known), and NOT derived from
         // the model name whenever the caller knows better (see `StartTrainingRequest.project_id`).
         // An id that names nothing is a hard refusal: silently falling back to name resolution
         // would create a SECOND project under the display name and train into it, which is the
@@ -1724,6 +1755,12 @@ impl TrainingManager {
         // would let a resume continue from weights the locks were never checked against.
         let req_run = Some(req.run_id.trim()).filter(|s| !s.is_empty());
         let run = trun::resolve_run_dir(&workspace, req_run)?;
+
+        // Artifact identity — `hps.name`, `weights/<slug>*.pth`, `audition/<slug>_*`, the
+        // `config.spk` key. ★§F2⒝ batch 2 step ④b: FROZEN per run, no longer re-derived from the
+        // display name on every start. Resolved here, after the run is known and BEFORE any
+        // deletion, because the answer is a fact that lives in the PRE-wipe `run.json`.
+        let slug = effective_artifact_slug(&run, &req);
 
         // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
         // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
@@ -4106,6 +4143,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// ★§F2⒝ 批 2 ④b —— **训练名从此只是标签:改变它永远不搬动任何字节。**
+    ///
+    /// ⚠ The test above looks like it already covers this and does NOT: `effective_speaker_slugs`
+    /// returns an empty vec for ≤1 speaker, so it drives a TWO-speaker request and `model_slug`
+    /// is not in its call graph at all. The single-speaker slug — which is the one that names
+    /// `<pool>/dataset_44k/<slug>/`, the directory two runs of one slot SHARE a pool for — came
+    /// from a completely different line (`slugify(&req.model_name)` in `try_start`).
+    ///
+    /// ⛔ Why the frozen value is a string `slugify` can never emit: every slug it produces ends
+    /// in `_` + 8 lowercase hex, so asserting against a REALISTIC frozen value (one that equals
+    /// `slugify(name)`) would return the same answer whether the adoption arm exists or not —
+    /// the decorative shape this project keeps re-inventing.
+    #[test]
+    fn the_artifact_slug_is_frozen_in_the_run_not_re_derived_from_the_display_name() {
+        let data = tmp_ws("artslug");
+        let ws = tproject::family_dir(&data, "proj_a", "rvc");
+        std::fs::create_dir_all(&ws).unwrap();
+        let run = trun::RunDir::for_test(ws);
+        let req = |name: &str, fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": name, "backend": "rvc", "version": "v2", "sample_rate": "40k",
+                "dataset_files": [], "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let write_run_json = |slug: &str| {
+            std::fs::write(
+                run.join("run.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "model_name": "初号机", "model_slug": slug,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // ⑴ a run that never started carries no artifacts to keep an identity for ⇒ mint
+        assert_eq!(
+            effective_artifact_slug(&run, &req("初号机", false)),
+            slugify("初号机"),
+            "with no run.json the slug is minted from the name, exactly as before ④b"
+        );
+
+        // ⑵ a run whose own run.json records a slug must ADOPT it
+        write_run_json("LEGACY-STEM");
+        let adopted = effective_artifact_slug(&run, &req("初号机", false));
+        assert_eq!(adopted, "LEGACY-STEM");
+        assert_ne!(
+            adopted,
+            slugify("初号机"),
+            "…and that is NOT what slugify derives today — which is the whole point"
+        );
+
+        // ⑶ ★ THE property of this batch: a RENAME must not move the artifact identity. Before
+        // ④b this returned `slugify("改了个名字")`, i.e. a different `weights/` prefix, a
+        // different `audition/` stem and a SECOND `dataset_44k/<slug>/` tree inside the pool the
+        // runs share — none of which anything ever reclaims.
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", false)),
+            "LEGACY-STEM",
+            "renaming a run must not re-point its artifacts"
+        );
+
+        // ⑷ 重训 wipes the slot, so there is nothing left to keep the old identity FOR, and
+        // picking a different name there is the button's purpose ⇒ mint from the NEW name.
+        assert_eq!(
+            effective_artifact_slug(&run, &req("改了个名字", true)),
+            slugify("改了个名字")
+        );
+        assert_ne!(slugify("改了个名字"), slugify("初号机"), "…two distinct names");
+
+        // ⑸ an EMPTY key is not an identity. A run.json truncated mid-write (or written by a
+        // build that did not have the field) must fall through to minting, never adopt `""` —
+        // `""` would make `hps.name` empty and every `weights/` file start with `_e1_s3`.
+        write_run_json("");
+        assert_eq!(
+            effective_artifact_slug(&run, &req("初号机", false)),
+            slugify("初号机")
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The call site, because the unit test above cannot reach it: `try_start` has no unit-test
+    /// driver (that is why `RunDir` exists as a type), so「函数是对的」and「start 调的是这个函数」
+    /// are two separate claims and only one of them is provable by driving the function.
+    ///
+    /// It also pins the ORDER: the adoption reads the PRE-wipe `run.json`, so it has to happen
+    /// after the run is resolved and before the wipe removes the file it reads.
+    #[test]
+    fn start_takes_its_artifact_identity_from_the_run_not_from_the_request_name() {
+        let code = mod_rs_code();
+        let at = |needle: &str| at_in(&code, needle);
+        // ⛔ every needle is assembled from pieces: written as one literal, THIS test's own source
+        // satisfies it (`code` is mod.rs, and mod.rs contains this file's test module). The
+        // `contains` assertion below failed for exactly that reason on its first run.
+        let old_form = concat!("let slug = slug", "ify(&req.model_name)");
+        assert!(
+            !code.contains(old_form),
+            "④b flipped this: the artifact slug is frozen per run, not re-derived from the \
+             display name on every start. Reviving this line silently re-points every renamed \
+             run's weights/, audition/ and pool slice directory."
+        );
+        let resolve_run = at(concat!("let run = trun::resolve_run_dir(&workspace, ", "req_run)?;"));
+        let slug = at(concat!("let slug = effective_artifact_slug(&run, ", "&req);"));
+        let wipe = at("remove_dir_all_robust(&workspace)");
+        assert!(resolve_run < slug, "the slug is taken before its run is known");
+        assert!(
+            slug < wipe,
+            "the slug is adopted AFTER the wipe, which has already deleted the run.json it reads \
+             — every 续训 would then silently mint a fresh identity"
+        );
+    }
+
     /// ★ Why `run_worker` needs an `importing` flag separate from `dataset_unchanged`.
     ///
     /// A structure declaration (every group's files empty) plans NOTHING, and `dataset_matches`
@@ -4625,12 +4775,8 @@ mod tests {
     /// while the checkpoints are gone and the slot has silently fallen back to layout 0.
     #[test]
     fn a_start_re_resolves_its_run_after_the_wipe() {
-        static THIS_RS: &str = include_str!("mod.rs");
-        let at = |needle: &str| -> usize {
-            THIS_RS
-                .find(needle)
-                .unwrap_or_else(|| panic!("try_start no longer contains {needle:?}"))
-        };
+        let code = mod_rs_code();
+        let at = |needle: &str| at_in(&code, needle);
         let wipe = at("remove_dir_all_robust(&workspace)");
         let recreate = at("std::fs::create_dir_all(&workspace)?;");
         let resolve = at("trun::run_dir_for_start(&workspace, &family)?");
@@ -4656,6 +4802,35 @@ mod tests {
             "the guards' run is resolved after the wipe — they exist to judge what the wipe would \
              destroy, and post-wipe they would all answer「什么都没有」"
         );
+    }
+
+    /// `mod.rs`'s own source with every FULL-LINE `//` comment blanked out (line count and
+    /// relative order preserved), so a source-order ratchet anchors on CODE.
+    ///
+    /// ⛔★S127: the raw `THIS_RS.find(needle)` form these ratchets used is **one added comment
+    /// away from being decorative** — a comment that happens to contain an anchor literal becomes
+    /// the offset the assertion compares, and the real call sites are then free to move in any
+    /// order while the gate stays green. (Found by the ④b recon's completeness critic on the
+    /// sibling ratchet `trun::the_boot_chain_folds_pools_before_runs`, which is safe today only
+    /// because the nearby comments write the function names WITHOUT the opening paren.)
+    fn mod_rs_code() -> String {
+        static THIS_RS: &str = include_str!("mod.rs");
+        THIS_RS
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    " ".repeat(l.len())
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn at_in(code: &str, needle: &str) -> usize {
+        code.find(needle)
+            .unwrap_or_else(|| panic!("mod.rs no longer contains the anchor {needle:?}"))
     }
 
     fn src_file(dir: &Path, name: &str, bytes: usize) -> String {

@@ -39,10 +39,12 @@
 //!    device name), and reusing it means migration never has to rename the project directory
 //!    itself. Only NEW projects get an id from [`new_project_id`], which uses sha2 instead of
 //!    `DefaultHasher`.
-//! 4. **`model_slug` is NOT this module's business.** It is the artifact identity
-//!    (`hps.name`, `weights/<slug>*.pth`, the `config.spk` key) and still derives from the
-//!    run's model name exactly as before. Directory identity and artifact identity are
-//!    separate on purpose; conflating them would rename every existing checkpoint.
+//! 4. **`model_slug` is a different identity from the directory id.** It is the artifact identity
+//!    (`hps.name`, `weights/<slug>*.pth`, the `config.spk` key). Directory identity and artifact
+//!    identity are separate on purpose; conflating them would rename every existing checkpoint.
+//!    ★§F2⒝ batch 2 step ④b: it is no longer derived from the display name on every start —
+//!    it is FROZEN per run and read back from that run's `run.json` by [`run_artifact_slug`],
+//!    so renaming a run moves no bytes. The minting rule itself still lives in `training::mod`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -470,13 +472,11 @@ pub fn update_project(data_dir: &Path, id: &str, name: &str, note: &str) -> Resu
     Ok(meta)
 }
 
-/// The「本次训练名」a slot's artifacts were built under: `hps.name`, the `weights/<slug>*`
-/// prefix, the `config.spk` key. Returns the NAME (the slug derives from it via `slugify`).
+/// The「本次训练名」a slot's run carries — a LABEL. ★§F2⒝ batch 2 step ④b: the artifact slug no
+/// longer derives from it (see [`run_artifact_slug`]), so this answers「显示什么」and nothing else.
 ///
 /// It only ever lived in the run's own `run.json`, which is written AFTER a successful data
-/// import — so `None` means this slot never completed a run, and a slot that never ran holds
-/// no slug-bearing artifact for a different name to orphan. That is what makes「存量项目的
-/// model_slug 冻结」a READ rather than a migration: there is nothing to back-fill.
+/// import — so `None` means this slot never completed a run.
 ///
 /// ⚠ It answers for ONE run and there is no run selector yet, so it declines rather than picks
 /// when a slot holds several. The caller then falls back to the project name, which is a worse
@@ -498,11 +498,38 @@ pub fn slot_model_name(data_dir: &Path, id: &str, family: &str) -> Option<String
 /// so an empty one makes the app ask for a name on every 继续训练, and the name is what
 /// `slugify` turns into `dataset_44k/<slug>/`, `config.spk` keys and `weights/<slug>*`.
 pub fn run_model_name(run: &crate::training::trun::RunDir) -> Option<String> {
+    run_json(run)
+        .and_then(|v| v["model_name"].as_str().map(String::from))
+        .filter(|s| !s.is_empty())
+}
+
+/// THE artifact identity ONE run's products were actually built under — `hps.name`, the
+/// `weights/<slug>*` prefix, the `config.spk` key, and (single-speaker SoVITS) the
+/// `<pool>/dataset_44k/<slug>/` slice directory.
+///
+/// ★§F2⒝ batch 2 step ④b — the reason this is a READ rather than a derivation. Until now the
+/// slug was re-derived from the display name on every start, so the name WAS the identity: rename
+/// the run and every one of those paths moves, orphaning what is already on disk and (for the
+/// slice directory, which lives in the pool the runs SHARE) growing a second full preprocessing
+/// tree that nothing ever reclaims — the pool is selected by `dataset.fingerprint` CONTENT, and
+/// the slug is not in it.
+///
+/// `run.json` is written by [`crate::training::TrainingManager`] on every start, so its
+/// `model_slug` is a POSITIVE fact: it is the value this run's existing artifacts carry. `None`
+/// means the run has never started, and a run that never started holds nothing to orphan — which
+/// is what makes the freeze a read instead of a migration.
+pub fn run_artifact_slug(run: &crate::training::trun::RunDir) -> Option<String> {
+    run_json(run)
+        .and_then(|v| v["model_slug"].as_str().map(String::from))
+        .filter(|s| !s.is_empty())
+}
+
+/// The run's own `run.json`, parsed. One reader for both accessors above so they can never
+/// disagree about which file answers「这个 run 的身份」.
+fn run_json(run: &crate::training::trun::RunDir) -> Option<serde_json::Value> {
     std::fs::read_to_string(run.join("run.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["model_name"].as_str().map(String::from))
-        .filter(|s| !s.is_empty())
 }
 
 // ─────────────────────────── checkpoint inventory ───────────────────────────

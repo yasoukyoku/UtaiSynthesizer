@@ -11,9 +11,12 @@
  *  2. **「附着到任意已安装 SoVITS 模型」**。浅扩散可以挂到任何已装的 SoVITS 上,不限于本项目。
  *     现在这条能力表现为「跳到那个模型所属的项目」(没有项目就建一个),语义与旧的
  *     `resolve_or_create(model_name)` 完全一致,只是变显式了。
- *  3. **「本次训练名」的冻结**。槽里已经跑过的话,产物文件名带的是 `slugify(旧名)`;换个名字
- *     会让 weights/ 里那一堆改名、best_state.json 的携带指标压掉下一次 best 写入。所以已经
- *     跑过的槽只读显示旧名,只有全新的槽才让用户起名(默认=项目名)。
+ *  3. **「本次训练名」的冻结**。已经跑过的 run 只读显示旧名,只有全新的 run 才让用户起名
+ *     (默认=项目名)。
+ *     ⚠★§F2⒝ 批 2 ④b 起,这条只读**不再是数据安全的要求**:产物身份(`weights/<slug>*`、
+ *     `audition/<slug>_*`、`config.spk`、池里的切片目录)已经**冻结在 run 自己的 `run.json`
+ *     里**,不再每次从显示名现算 —— 改名搬不动任何字节。留着只读是因为**改名要有自己的入口
+ *     和自己的闸**(运行中不许改、空名不许),而不是因为改名会毁东西。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -178,12 +181,13 @@ export function ProjectDetail() {
     return ready ? "params" : "data";
   };
 
-  /** The name this run's ARTIFACTS will carry. Frozen once THIS RUN has produced any, because it
-   *  is baked into every file name in its `weights/`.
+  /** 这个 run 的**标签**。已经起过名的 run 直接沿用,只有还没起过的才问。
    *
-   *  ★§F2⒝ 批 2 ④ —— 参数从槽换成 **run**。这不只是「换个取值处」:名字是 `slugify` 的输入,
-   *  而 slug 是 `dataset_44k/<slug>/`、`config.spk` 的键和 `weights/<slug>*` 的前缀。槽级取值在
-   *  两个 run 之后会给**每一个** run 回答最后那个 run 的名字。 */
+   *  ★§F2⒝ 批 2 ④ —— 参数从槽换成 **run**:槽级取值在两个 run 之后会给**每一个** run 回答
+   *  最后那个 run 的名字。
+   *  ★§F2⒝ 批 2 ④b —— 它**不再是产物身份**。以前这个字符串是 `slugify` 的输入,而 slug 是
+   *  `dataset_44k/<slug>/`、`config.spk` 的键和 `weights/<slug>*` 的前缀;现在身份冻结在
+   *  `run.json[model_slug]` 里(`training::effective_artifact_slug`),这里只决定用户看见什么。 */
   const askRunName = async (run: RunDetail | undefined): Promise<string | null> => {
     if (run?.modelName) return run.modelName;
     const name = await showConfirm({
