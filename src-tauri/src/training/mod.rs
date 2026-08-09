@@ -800,6 +800,58 @@ pub fn slot_info(
     })
 }
 
+/// Everything the resume guard learns FROM DISK about one run.
+///
+/// ⛔ Extracted so a test can reach it, and the gap it closes is structural rather than a coverage
+/// number: `check_resume_locks` is fed FOUR disk reads, and if any one of them silently answers
+/// "nothing here" the guard's very first line (`let old = st.manifest?`) returns `None` and
+/// **every lock disappears at once** — a slot resumed with a mismatched version streams 4.1
+/// weights into a 4.0 graph and degrades to near-scratch while claiming「续训」.
+///
+/// Both existing test suites hand-write their `serde_json` manifests and their `has_main` /
+/// `max_diffusion_step` / `frozen_speakers` literals, so NOT ONE of them touches a filesystem.
+/// Re-point any of these reads at the wrong directory — exactly what per-run does — and the whole
+/// table goes quiet with the suite still green. That is why this is a function and not four
+/// expressions inline in `try_start` (which no test can drive: it needs a pyenv, a tauri `State`
+/// and a live process).
+pub(crate) struct ResumeLockFacts {
+    pub has_main: bool,
+    pub max_diffusion_step: Option<u64>,
+    pub frozen_speakers: Vec<dsmanifest::DsSpeaker>,
+}
+
+impl ResumeLockFacts {
+    /// The manifest is read separately by `try_start` (its family guard needs it BEFORE the wipe),
+    /// so it is passed in rather than re-read — one read, one truth.
+    pub fn state<'a>(&'a self, manifest: Option<&'a serde_json::Value>) -> resume_lock::ResumeState<'a> {
+        resume_lock::ResumeState {
+            manifest,
+            has_main: self.has_main,
+            max_diffusion_step: self.max_diffusion_step,
+            frozen_speakers: &self.frozen_speakers,
+        }
+    }
+}
+
+pub(crate) fn resume_lock_facts(run: &trun::RunDir) -> ResumeLockFacts {
+    ResumeLockFacts {
+        has_main: has_main_progress(run),
+        // ★S118 §F8⒜ — the k_step_max lock hangs off this being >0. It must therefore see the
+        // SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a resume point,
+        // and letting k_step_max change under it would silently retrain a different diffusion
+        // distribution into the same model.
+        max_diffusion_step: diffusion_progress_step(run),
+        frozen_speakers: frozen_speakers_of_run(run),
+    }
+}
+
+/// The manifest a resume guard judges against — read from THE RUN, never the slot.
+pub(crate) fn read_run_manifest(run: &trun::RunDir) -> Option<serde_json::Value> {
+    std::fs::read_to_string(run.join("run_manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
 /// The `(slug, display name)` pairs ONE RUN froze, in emb_g row order. Empty when that run
 /// never co-trained speakers.
 ///
@@ -1672,7 +1724,6 @@ impl TrainingManager {
         // would let a resume continue from weights the locks were never checked against.
         let req_run = Some(req.run_id.trim()).filter(|s| !s.is_empty());
         let run = trun::resolve_run_dir(&workspace, req_run)?;
-        let manifest_path = run.join("run_manifest.json");
 
         // ---- shared-dataset guard (PREFLIGHT, never in run_worker) ----
         // `dataset/` belongs to the project now. Replacing it re-fingerprints every sibling
@@ -1723,10 +1774,7 @@ impl TrainingManager {
         // the fresh path too — a diffusion「重训」must never partial-wipe a
         // same-named RVC workspace (RVC roots also contain G_*.pth, so file
         // heuristics alone cannot tell the families apart).
-        let mut old_manifest: Option<serde_json::Value> =
-            std::fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok());
+        let mut old_manifest: Option<serde_json::Value> = read_run_manifest(&run);
         let old_family = old_manifest
             .as_ref()
             .and_then(|m| m["backend"].as_str())
@@ -1796,18 +1844,10 @@ impl TrainingManager {
         // against each other by a unit test, because three other places (the run step's
         // pre-start dialog, the project page's form restore, the parameters page's read-only
         // rendering) have to agree with it and used to do so from memory.
+        let lock_facts = resume_lock_facts(&run);
         if let Some(code) = resume_lock::check_resume_locks(
             &req,
-            &resume_lock::ResumeState {
-                manifest: old_manifest.as_ref(),
-                has_main,
-                // ★S118 §F8⒜ — the k_step_max lock hangs off this being >0. It must therefore see
-                // the SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a
-                // resume point, and letting k_step_max change under it would silently retrain a
-                // different diffusion distribution into the same model.
-                max_diffusion_step: diffusion_progress_step(&run),
-                frozen_speakers: &frozen_speakers_of_run(&run),
-            },
+            &lock_facts.state(old_manifest.as_ref()),
             !req.fresh || diff_partial_wipe,
         ) {
             return Err(UtaiError::Training(code));
@@ -4263,6 +4303,112 @@ mod tests {
             .to_string(),
         );
         w("run.json", &serde_json::json!({"model_name": "歌姫"}).to_string());
+    }
+
+    /// ⛔ THE resume-lock test that did not exist: one built from a REAL DIRECTORY.
+    ///
+    /// Both existing suites hand-write their manifests and their `has_main` / `max_diffusion_step`
+    /// / `frozen_speakers` literals, so the four DISK READS that feed the guard were covered by
+    /// nothing at all. That is not a coverage number — it is the shape of a silent total failure:
+    /// `check_resume_locks` opens with `let old = st.manifest?`, so ONE read answering「什么都
+    /// 没有」 drops EVERY lock at once, and a 续训 with a mismatched version then streams 4.1
+    /// weights into a 4.0 graph and degrades to near-scratch while the UI says「继续训练」.
+    ///
+    /// ★ The slot root carries a DECOY manifest that would ALLOW the resume. So a read re-pointed
+    /// from the run to the slot — the exact mistake per-run invites — does not merely return less
+    /// information, it returns a PERMISSIVE answer, and this test is red for it.
+    #[test]
+    fn the_resume_guard_reads_this_runs_files_and_a_slot_shaped_read_is_permissive() {
+        let data = tmp_ws("lockdisk");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "plock_77778888";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        let run = trun::runs_root(&slot).join("rd00dd00dd00d");
+        std::fs::create_dir_all(&run).unwrap();
+        run_products(&run, 700); // ← writes THIS run's manifest: v2 / 40k
+        // ★ the decoy: same shape, at the SLOT root, saying what the request wants to hear
+        std::fs::write(
+            slot.join("run_manifest.json"),
+            serde_json::json!({ "backend": "rvc", "version": "v1", "sample_rate": "48k" })
+                .to_string(),
+        )
+        .unwrap();
+
+        let req = |fresh: bool| {
+            req_from(serde_json::json!({
+                "model_name": "m", "backend": "rvc",
+                // both differ from what THIS run froze (v2 / 40k)
+                "version": "v1", "sample_rate": "48k",
+                "dataset_files": [], "fresh": fresh, "total_epoch": 1, "batch_size": 1,
+            }))
+        };
+        let dir = trun::resolve_run_dir(&slot, None).unwrap();
+        assert_eq!(dir.path(), run, "the run really is where the products are");
+        let facts = resume_lock_facts(&dir);
+        let manifest = read_run_manifest(&dir);
+        assert!(manifest.is_some(), "the guard must have something to judge against");
+        assert!(facts.has_main, "G_700.pth is in this run");
+
+        let code = resume_lock::check_resume_locks(&req(false), &facts.state(manifest.as_ref()), true);
+        assert!(
+            code.as_deref().is_some_and(|c| c.starts_with("RESUME_PARAMS_MISMATCH")),
+            "a 续训 that changes version AND sample rate must be refused, got {code:?}"
+        );
+
+        // …and the decoy really is permissive, so the assertion above is load-bearing rather than
+        // trivially true: a read pointed at the SLOT allows the very same request.
+        let decoy = trun::RunDir::for_test(slot.clone());
+        assert!(
+            resume_lock::check_resume_locks(
+                &req(false),
+                &resume_lock_facts(&decoy).state(read_run_manifest(&decoy).as_ref()),
+                true,
+            )
+            .is_none(),
+            "the decoy must ALLOW — otherwise this test would pass with every read broken"
+        );
+
+        // ★ the THIRD disk read — the frozen speaker set — and its failure direction is the
+        // opposite one: losing it does not open a lock, it invents a REFUSAL. A mutation probe
+        // found the assertions above could not reach it at all (they are single-speaker).
+        //
+        // The run froze names ["sayo","teto"]; a resume that asks for exactly those must be
+        // ALLOWED. It is allowed only because the names were read off disk: with an empty list
+        // the guard falls back to comparing recomputed SLUGS, and `slugify` hash-suffixes with
+        // `DefaultHasher` — so the fallback answers「换人了」for the very same two singers and
+        // the slot becomes permanently unresumable.
+        let multi = req_from(serde_json::json!({
+            "model_name": "m", "backend": "rvc", "version": "v2", "sample_rate": "40k",
+            "dataset_files": [],
+            "speakers": [{"name": "sayo", "files": []}, {"name": "teto", "files": []}],
+            "fresh": false, "total_epoch": 1, "batch_size": 1,
+        }));
+        assert_eq!(facts.frozen_speakers.len(), 2, "read off disk, not invented here");
+        assert!(
+            resume_lock::check_resume_locks(&multi, &facts.state(manifest.as_ref()), true).is_none(),
+            "the same two singers must still be resumable"
+        );
+        let blind = ResumeLockFacts { frozen_speakers: Vec::new(), ..facts };
+        assert_eq!(
+            resume_lock::check_resume_locks(&multi, &blind.state(manifest.as_ref()), true)
+                .as_deref(),
+            Some("RESUME_SPEAKER_SET_MISMATCH"),
+            "…and losing that read is a FALSE REFUSAL, which is why it needs its own assertion"
+        );
+
+        // the manifest going missing is the total-failure shape: every lock vanishes at once.
+        assert!(
+            resume_lock::check_resume_locks(&req(false), &facts.state(None), true).is_none(),
+            "pinned deliberately: `st.manifest?` is why ONE broken read silences the whole table"
+        );
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     /// ⛔ §F2⒝ batch 2 step ④ — THE test for THIS batch, for the same reason: it moves no bytes
