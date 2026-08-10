@@ -1546,6 +1546,14 @@ fn sync_dir_delta(
             // So the refusal hangs on the POSITIVE fact that the old copy actually has something to
             // contribute. A delta that would write NOTHING is not a merge at all — it is the stale
             // copy of a run that has moved on, and keeping the subtree for it only costs disk.
+            //
+            // ⚠★S133 re-checked this whole argument (§F2⒝ ④e's handoff asked for it to be rewritten)
+            // and it stands unchanged: `legacy_run_id` really is still a pure function of the family,
+            // and the refusal really does still hang on the delta. What S133 added is a SEPARATE
+            // mechanism one level up — `reclaim_one_root` now removes the paths the user deleted on
+            // purpose from the old copy BEFORE this runs (see `AppConfig::deleted_since_migration`),
+            // so a deliberately-deleted run never reaches this comparison at all. Do not merge the
+            // two ideas: this one is about two real trainings colliding, that one is about a delete.
             if level == SyncLevel::Runs && to.exists() {
                 if let Some(newer) = delta_would_write(&from, &to) {
                     tracing::warn!(

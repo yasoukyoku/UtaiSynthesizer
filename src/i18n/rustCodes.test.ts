@@ -104,7 +104,6 @@ const UNMAPPED_SNAPSHOT_S126 = [
   "TEMPO_TOO_SHORT",
   "UPDATE_DOWNLOAD_CANCELLED",
   "UTAI_DIAGNOSTICS",
-  "WORKSPACE_MISSING",
 ].sort();
 
 function rsFiles(fs: NodeFs, dir: string): string[] {

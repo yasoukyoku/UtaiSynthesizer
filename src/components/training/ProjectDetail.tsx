@@ -508,8 +508,15 @@ export function ProjectDetail() {
   const blocked = !!detail.needsAttention;
   const sovitsSlot = slots.get("sovits");
   /** ★§F2⒝ 批 2 ④ —— 浅扩散跑在**主模型那个 run** 里(`runs/<主 run>/diffusion/`),所以这张
-   *  卡问的是「哪个 run 里有主模型」。今天每槽恒一个 run,所以它就是那一个;两个 run 之后
-   *  这条 `find` 是「挂到有主模型的那个」这个**肯定事实**,不是「挑第一个」。 */
+   *  卡问的是「哪个 run 里有主模型」。
+   *
+   *  ⛔★★S133 —— **这句话原本写的是「这条 `find` 是一个肯定事实,不是『挑第一个』」,而它现在
+   *  是假的。** 那个说法成立的前提是「**至多一个** run 有主模型」,而 ④e 的 flip 让「再训一个」
+   *  真的铸第二个 run:两个 run 都练出主模型之后,`find` 返回的是 `list_runs` 的排序(按 run id
+   *  的**字典序**)里的第一个 —— 一个与「用户想挂到哪个」毫无关系的答案,而这张卡会据此
+   *  显示版本、步数,并把它当宿主开训。
+   *  ⇒ 真正的修法是给这张卡一个 run 选择器,那是 **B2-⑤**(队列里已排,带笔序与判据)。
+   *  在那之前这里**保持现状**并说真话:留一条会背书错改动的假注释,是本轮花了一整轮清理的那类东西。 */
   const diffHost =
     sovitsSlot?.runs.find((r) => r.info.has_main_progress) ?? sovitsSlot?.runs[0];
   /** The ContentVec space this project's sovits slot is already committed to, if any. Shallow

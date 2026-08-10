@@ -422,6 +422,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // 它挡的是房规 `opt_run_id("") → None → resolve_run_dir → 槽根` 那条路 —— 一次伪装成
   // 「删一个 run」的删槽。
   RUN_ID_REQUIRED: { key: "backend.RUN_ID_REQUIRED", modal: true },
+  // ★S133 —— 以前它只从 Settings 的内联 `L()` 表出去(`stErrWsMissing`),所以不在这张表里也没人发现。`delete_run` 让它头一次能落到项目详情页的
+  // `backendErrorMessage(e) ?? String(e)` 漏斗上 —— 那里没映射就是一串裸 Rust 串。Settings 那一条内联处理排在前面，它自己的措辞不变。
+  WORKSPACE_MISSING: { key: "backend.WORKSPACE_MISSING" },
   DATASET_COPY_FAILED: { key: "backend.DATASET_COPY_FAILED" },
   DATASET_DELETE_FAILED: { key: "backend.DATASET_DELETE_FAILED" },
   DATASET_WRITE_FAILED: { key: "backend.DATASET_WRITE_FAILED" },
