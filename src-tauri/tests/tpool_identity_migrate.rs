@@ -72,6 +72,7 @@ fn identity_migrate_data_root() {
             }
             let layout = tpool::read_slot_meta(&slot).map(|m| m.layout).unwrap_or(0);
             let pools: Vec<String> = tpool::list_pools(&slot)
+                .expect("the fixture's pools/ must be listable")
                 .into_iter()
                 .map(|p| format!("{{\"id\":{:?},\"fp\":{:?}}}", p.id, p.fp_text))
                 .collect();

@@ -976,7 +976,10 @@ pub async fn get_training_project(
         .map(|f| -> Result<SlotDetail, String> {
             let slot = crate::training::tproject::family_dir(&data_dir, &project_id, f);
             let recs = crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, Some(f));
-            let pools = crate::training::tpool::list_pools(&slot);
+            // ⛔ S132 — an unreadable `pools/` is not「零个池」: that would report 0 B of
+            // preprocessing for a slot holding gigabytes of it, on the very screen the user reads
+            // to decide what to delete.
+            let pools = crate::training::tpool::list_pools(&slot).map_err(|e| e.to_string())?;
             // `""` for an unmigrated slot, matching `CkptRecord::run_id` and the `None` that every
             // command takes — one vocabulary for「槽根就是那个 run」across Rust, IPC and the UI.
             let ids: Vec<String> = {

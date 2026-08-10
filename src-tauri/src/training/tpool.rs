@@ -297,17 +297,37 @@ pub fn pool_id_for(fp_text: &str) -> String {
 pub struct PoolInfo {
     pub id: String,
     pub dir: PathBuf,
-    /// Content of `dataset.fingerprint`, trimmed. Empty when the file is missing or unreadable —
-    /// such a pool is never MATCHED (it would be a guess), but it is still listed so its bytes
-    /// stay visible and reclaimable.
+    /// Content of `dataset.fingerprint`, trimmed. Empty when the file is missing — such a pool is
+    /// never MATCHED (it would be a guess), but it is still listed so its bytes stay visible and
+    /// reclaimable.
     pub fp_text: String,
+    /// ⛔★★S132 §F2⒝ — the file EXISTS but could not be read. Empty `fp_text` used to mean both
+    /// this and「there is no identity here」, and the difference decides an irreversible action:
+    /// `plan_slot_identity` skips an identity-less pool (correct — nothing matches it anyway) and
+    /// then stamps the SLOT as identity-v2. Do that to a pool whose text is merely locked and the
+    /// slot is told 「the disk is v2」 while that pool still holds v1 text — python then misses it
+    /// by one byte, mints a sibling pool, and re-preprocesses for hours behind one `info` line.
+    /// A slot at layout 4 never re-enters this chain, so it cannot heal.
+    pub fp_unreadable: bool,
 }
 
 /// Every pool of one slot, sorted by id so listings never wobble.
-pub fn list_pools(slot: &Path) -> Vec<PoolInfo> {
+///
+/// ⛔ S132 — an unreadable `pools/` is an ERROR, not an empty slot: an empty list makes
+/// `plan_slot_identity` return an empty plan, and an empty plan COMMITS layout 4 — stamping every
+/// pool in the slot as v2 without having looked at a single one.
+pub fn list_pools(slot: &Path) -> Result<Vec<PoolInfo>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(pools_root(slot)) else {
-        return out;
+    let root = pools_root(slot);
+    let rd = match std::fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => {
+            return Err(UtaiError::Training(format!(
+                "POOLS_DIR_UNREADABLE: {}: {e}",
+                root.display()
+            )))
+        }
     };
     for entry in rd.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
@@ -315,13 +335,16 @@ pub fn list_pools(slot: &Path) -> Vec<PoolInfo> {
         if id.starts_with('.') || !entry.path().is_dir() {
             continue;
         }
-        let fp_text = std::fs::read_to_string(entry.path().join(FINGERPRINT))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        out.push(PoolInfo { id, dir: entry.path(), fp_text });
+        let (fp_text, fp_unreadable) = match std::fs::read_to_string(entry.path().join(FINGERPRINT))
+        {
+            Ok(s) => (s.trim().to_string(), false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
+            Err(_) => (String::new(), true),
+        };
+        out.push(PoolInfo { id, dir: entry.path(), fp_text, fp_unreadable });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    Ok(out)
 }
 
 /// Has this slot ever been preprocessed?
@@ -331,7 +354,18 @@ pub fn list_pools(slot: &Path) -> Vec<PoolInfo> {
 /// pool now. The legacy arm is kept by the caller (`training::workspace_holds_work`) because a
 /// pre-S76 directory that has not been through either migration still has it at the root.
 pub fn slot_has_pool(slot: &Path) -> bool {
-    list_pools(slot).iter().any(|p| !p.fp_text.is_empty())
+    // ⛔ S132 — an unreadable `pools/` answers YES. The consumer is `training::slot_holds_work`,
+    // i.e. a refusal: 「no pool」 there is what lets an unconfirmed wipe through.
+    match list_pools(slot) {
+        Ok(pools) => pools.iter().any(|p| !p.fp_text.is_empty()),
+        Err(e) => {
+            tracing::error!(
+                "cannot list the pools of {} ({e}) — answering 「has a pool」 so the wipe-consent                  guard in front of hours of preprocessing stays closed",
+                slot.display()
+            );
+            true
+        }
+    }
 }
 
 /// The fingerprint text of this slot's pool, when exactly ONE pool can answer.
@@ -343,7 +377,16 @@ pub fn slot_has_pool(slot: &Path) -> bool {
 /// can reach that backfill was migrated from a single flat slot and therefore has exactly one
 /// pool; `None` keeps the pre-existing default (`false`) for anything else.
 pub fn sole_pool_fingerprint(slot: &Path) -> Option<String> {
-    let pools: Vec<PoolInfo> = list_pools(slot).into_iter().filter(|p| !p.fp_text.is_empty()).collect();
+    // ⛔ S132 — 「could not list」 joins 「more than one」 in answering None (this function's whole
+    // posture is「refuse to guess」), but it says so: silence here reads as「exactly zero pools」.
+    let listed = match list_pools(slot) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("cannot list the pools of {} ({e}) — refusing to name a sole pool", slot.display());
+            return None;
+        }
+    };
+    let pools: Vec<PoolInfo> = listed.into_iter().filter(|p| !p.fp_text.is_empty()).collect();
     match pools.len() {
         1 => Some(pools[0].fp_text.clone()),
         _ => None,
@@ -898,8 +941,18 @@ fn plan_slice_rename(
     n_speakers: usize,
 ) -> std::result::Result<Option<(PathBuf, PathBuf)>, String> {
     let root = pool.join("dataset_44k");
-    let Ok(rd) = std::fs::read_dir(&root) else {
-        return Ok(None); // rvc / vocoder, or a sovits pool that never got as far as slicing
+    // ⛔★★S132 — 「there is no slice tree」 and 「I could not look」 used to be the same `Ok(None)`.
+    // `Ok(None)` means「no rename needed」, and at aug=0 the new fingerprint text equals the old
+    // one, so the pool drops out of the plan entirely and the slot still gets stamped v2. python
+    // then asks for `dataset_44k/spk0` (flist.py, identity ≥ 2), does not find the tree that is
+    // still named `<model_slug>`, and slices a SECOND complete one — the exact shape ④d/S127 spent
+    // a batch closing, resurrected from one transient read failure. And because the slot is now at
+    // layout 4, the loud「two slice trees ⇒ Err」below can never fire for it again.
+    let rd = match std::fs::read_dir(&root) {
+        Ok(rd) => rd,
+        // rvc / vocoder, or a sovits pool that never got as far as slicing — a positive fact.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: slice tree unreadable: {e}", root.display())),
     };
     let mut subs: Vec<String> = rd
         .flatten()
@@ -952,13 +1005,20 @@ fn plan_slice_rename(
 /// take the "nothing to do" branch, stamp layout 4 — and hand python a v2 formula to run against a
 /// v1 disk. That is not a rare edge; it is 100% of installations.
 fn plan_slot_identity(slot: &Path, family: &str) -> std::result::Result<Vec<PoolStep>, String> {
-    let pools = list_pools(slot);
+    let pools = list_pools(slot).map_err(|e| e.to_string())?;
     if pools.is_empty() {
         return Ok(Vec::new());
     }
     let facts = slot_facts(slot)?;
     let mut out = Vec::new();
     for p in pools {
+        // ⛔★★S132 — 「I could not READ this pool's identity」 must never take the same exit as
+        // 「this pool HAS no identity」. Only the second one is safe to skip: nothing matches an
+        // identity-less pool, so leaving it behind costs nothing. Skipping the first one and then
+        // committing layout 4 tells python 「the disk is v2」 about a pool that still says v1.
+        if p.fp_unreadable {
+            return Err(format!("POOL_FINGERPRINT_UNREADABLE: {}", p.dir.display()));
+        }
         if p.fp_text.is_empty() {
             // A pool with no identity is never MATCHED by anything (`open_pool` compares content),
             // so there is nothing to keep matching. Leave its bytes visible.
@@ -968,14 +1028,19 @@ fn plan_slot_identity(slot: &Path, family: &str) -> std::result::Result<Vec<Pool
             match rvc_pool_sample_rate(&p.dir)? {
                 Some(hz) => Some(hz),
                 None => {
-                    // No slices ⇒ nothing this pool holds is worth protecting, and there is no
-                    // honest rate to write. Leaving it alone costs an empty directory; guessing
-                    // costs a wrong result on a pool that might not be empty tomorrow.
-                    tracing::warn!(
-                        "pool identity: {} holds no rvc slices — leaving its identity alone",
+                    // ⛔★★S132 — this used to `continue`, and the comment justified it with 「no
+                    // slices ⇒ nothing worth protecting」. But we are PAST the `fp_text.is_empty()`
+                    // arm, so this pool HAS an identity — i.e. it has been preprocessed, and
+                    // `rvc/preprocess.py::_wipe_slice_dirs` empties `0_gt_wavs`/`1_16k_wavs` on
+                    // every run while KEEPING the f0/feature trees. So the real shape here is
+                    // 「hours of derived products, zero gt wavs」 (a run stopped mid-preprocess),
+                    // and skipping it while stamping the slot v2 orphans exactly those products.
+                    // Undecidable ⇒ refuse the SLOT, loudly, and look again next launch.
+                    return Err(format!(
+                        "POOL_SAMPLE_RATE_UNKNOWN: {} has an identity but no rvc slices to read \
+                         the rate from",
                         p.dir.display()
-                    );
-                    continue;
+                    ));
                 }
             }
         } else {
@@ -1117,8 +1182,16 @@ fn repoint_resume_sidecars(slot: &Path, steps: &[PoolStep]) -> usize {
 /// ⛔ Never overwrites: python records this from inside the run it belongs to and therefore always
 /// knows better; a backfill that clobbered it would replace a fact with an inference.
 fn backfill_pool_refs(slot: &Path) -> usize {
-    let named: Vec<PoolInfo> =
-        list_pools(slot).into_iter().filter(|p| !p.fp_text.is_empty()).collect();
+    // ⛔ S132 — best-effort like the sidecar re-pointer: an unreadable `pools/` writes no edge and
+    // says so, rather than failing a migration whose real work is already done.
+    let listed = match list_pools(slot) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("cannot list the pools of {} ({e}) — no run↔pool edge was backfilled", slot.display());
+            return 0;
+        }
+    };
+    let named: Vec<PoolInfo> = listed.into_iter().filter(|p| !p.fp_text.is_empty()).collect();
     let [only] = &named[..] else { return 0 };
     let mut n = 0usize;
     // `list_runs`, not `run_dirs`: the latter answers「槽根就是那个 run」for a slot with no `runs/`
@@ -1466,6 +1539,73 @@ mod tests {
 
     fn fp_of(pool: &Path) -> String {
         std::fs::read_to_string(pool.join(FINGERPRINT)).unwrap()
+    }
+
+    /// `plan_slot_identity` 在看池**之前**先要 `slot_facts`(= 一份 run manifest),所以任何
+    /// 「关于池的判据」的夹具都得先有它,否则红的是「没有 run manifest」而不是被测的那一条。
+    fn mk_run_manifest(slot: &Path, aug: u32, n_speakers: usize) {
+        let d = super::super::trun::runs_root(slot).join("r000000000000");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("run_manifest.json"),
+            format!("{{\"aug_copies\":{aug},\"n_speakers\":{n_speakers}}}"),
+        )
+        .unwrap();
+    }
+
+    /// ★★S132 §F2⒝ ④e —— 「我判不了这个池」**永远不许**和「这个池没什么可判的」走同一个出口。
+    ///
+    /// ## 为什么这条比它看起来重
+    /// 3→4 的提交点是**整槽**的一个数字,而计划是**逐池**算的。任何一条让某个池悄悄退出计划的
+    /// 路径,都会让这个槽被盖上「盘上是 v2」的章,而那个池还写着 v1 —— python 于是差一个字节
+    /// 匹配不上,铸兄弟池、重跑几小时,痕迹只有一行 info。而 layout 4 的槽**再也不会回到这条链**,
+    /// 所以它连自愈的机会都没有。⇒ 不可判定的池必须让**整槽** Refused(响亮、下次开机重来)。
+    ///
+    /// ⚠ 反方向同样要钉:一个**真的没有身份**的池(指纹文件不存在)跳过是对的 —— 它本来就
+    /// 匹配不上任何东西。把它也变成 Refused 会让那种槽永远迁不动。所以每一格都有阴性对照。
+    #[test]
+    fn an_undecidable_pool_refuses_the_slot_instead_of_being_skipped() {
+        // ⑴ 指纹文件**不存在** ⇒ 合法跳过,而且整槽照样能提交
+        let slot = tmp_slot("skip_ok");
+        std::fs::create_dir_all(pools_root(&slot).join("p_nameless")).unwrap();
+        mk_run_manifest(&slot, 0, 1);
+        let pools = list_pools(&slot).unwrap();
+        assert_eq!(pools.len(), 1);
+        assert!(!pools[0].fp_unreadable, "缺文件不是「读不动」");
+        assert!(plan_slot_identity(&slot, "sovits").is_ok(), "没有身份的池跳过是对的");
+
+        // ⑵ 指纹**读不动**(用目录冒充文件 —— 「存在但读不出来」唯一可移植的形状)
+        let slot2 = tmp_slot("fp_unreadable");
+        let p2 = pools_root(&slot2).join("p_locked");
+        std::fs::create_dir_all(p2.join(FINGERPRINT)).unwrap();
+        mk_run_manifest(&slot2, 0, 1);
+        let pools2 = list_pools(&slot2).unwrap();
+        assert!(pools2[0].fp_unreadable, "存在但读不出来必须与缺文件分开");
+        let e = plan_slot_identity(&slot2, "sovits").unwrap_err();
+        assert!(e.contains("POOL_FINGERPRINT_UNREADABLE"), "{e}");
+
+        // ⑶ `pools/` 自己读不动 ⇒ 计划**不许**变成空的(空计划会直接提交 layout 4)
+        let slot3 = tmp_slot("pools_unreadable");
+        std::fs::create_dir_all(&slot3).unwrap();
+        std::fs::write(pools_root(&slot3), b"not a directory").unwrap();
+        assert!(list_pools(&slot3).unwrap_err().to_string().contains("POOLS_DIR_UNREADABLE"));
+        let e3 = plan_slot_identity(&slot3, "sovits").unwrap_err();
+        assert!(e3.contains("POOLS_DIR_UNREADABLE"), "{e3}");
+
+        // ⑷ 切片树读不动 ⇒ 不许当成「还没切过片」
+        let slot4 = tmp_slot("slices_unreadable");
+        let p4 = mk_pool(&slot4, "p_sliced", "abc|enc=vec768l12|loudnorm=1");
+        std::fs::write(p4.join("dataset_44k"), b"not a directory").unwrap();
+        mk_run_manifest(&slot4, 0, 1);
+        let e4 = plan_slot_identity(&slot4, "sovits").unwrap_err();
+        assert!(e4.contains("slice tree unreadable"), "{e4}");
+        // 阴性对照:同一个池**没有** dataset_44k ⇒ 正常(rvc/vocoder,或还没切片的 sovits)
+        std::fs::remove_file(p4.join("dataset_44k")).unwrap();
+        assert!(plan_slot_identity(&slot4, "sovits").is_ok(), "没有切片树是肯定事实,不是错误");
+
+        for d in [slot, slot2, slot3, slot4] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     /// ⛔ **这条是这一批最重要的一条**:3→4 要干的活全在 `pools/<id>/` 里面,槽顶层前后**一模一样**。
