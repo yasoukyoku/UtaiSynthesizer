@@ -31,6 +31,26 @@ fn identity_migrate_data_root() {
         return;
     };
     let data = Path::new(&root);
+
+    // ★S130 —— ⛔ 两件事必须在**跑之前**说清楚,否则这条闸违反 S129 立的那条铁律
+    // (「闸跑不起来」与「被测的东西不对」不许报成同一种红)。
+    //
+    // ⑴ **机器级的静默停机开关**:开机链的四步每一步都先问 `other_instance_alive()`,为真就
+    //    直接 `return` —— 什么都不做、不报错、不返回计数(tproject.rs / tpool.rs / trun.rs 各一处,
+    //    外加 `migrate_identity_all`)。它扫的是日志目录下的 `session.<pid>.alive` 哨兵,是**整机**
+    //    状态,与 `UTAI_IDENTITY_DATA` 指的这份副本无关。⇒ 机器上开着一个 dev build 时,这条闸会
+    //    打出 layout=0 / identity_version=1,而 python 那半读到的红与「④d 真的坏了」**一模一样**。
+    //    所以把它作为一条**事实**打出来,让读者不必猜。
+    // ⑵ **拒绝的理由此前根本不进转录**:`IdentityOutcome::Refused(why)` 只经 `tracing::warn!` 出场,
+    //    而这个测试从来没装过 subscriber ⇒ 那些行去了虚空,python 侧只剩 `layout` 一个数字,
+    //    而 layout<4 同时对应【被 refuse】【被 other_instance 跳过】【前面几折失败】三种因。
+    let blocked = utai_lib::crashlog::other_instance_alive();
+    println!("IDENTITY_ENV {{\"other_instance_alive\":{blocked}}}");
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+
     // The WHOLE chain, not just the last step: a slot arrives here at layout 0 (python built its
     // pools without any marker), and the identity step must refuse anything the earlier folds have
     // not committed. Driving only the last step would prove the one thing that cannot happen.

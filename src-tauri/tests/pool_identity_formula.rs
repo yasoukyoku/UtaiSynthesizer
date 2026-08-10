@@ -390,10 +390,17 @@ fn the_two_languages_build_the_same_identity_suffix() {
         POOL_PY.contains(&format!("cfg.get(\"{}\")", tpool::IDENTITY_VERSION_KEY)),
         "python 读的 run.json 键与 `tpool::IDENTITY_VERSION_KEY` 对不上"
     );
+    // ⛔★S130 —— 左值与**右值**要一起钉。只钉 `run_config[…KEY]` 的版本(S129 那版)对
+    //   「把右值写死成 `json!(2)`」是**瞎的**,而那个改动的后果最重:每个槽都被告知「你已经
+    //   迁完了」,于是 python 对**没迁过**的槽也算 v2 公式 ⇒ 全量重跑到一个兄弟池 ——
+    //   恰恰是版本闸存在的全部理由(「Rust 拒绝迁移 ⇒ python 照新公式算」)反过来发生一遍。
+    //   ⇒ 值必须是**那个槽的**纯函数,不是常量。
+    const VERSION_WRITE: &str =
+        "run_config[tpool::IDENTITY_VERSION_KEY] = serde_json::json!(tpool::identity_version(";
     assert!(
-        include_str!("../src/training/mod.rs")
-            .contains("run_config[tpool::IDENTITY_VERSION_KEY]"),
-        "run.json 不再写这个键了 —— python 会一直回落到 v1,而迁移器照样打新戳"
+        include_str!("../src/training/mod.rs").contains(VERSION_WRITE),
+        "run.json 里那个版本号不再是**这个槽的** `identity_version(...)` 了 —— 写成常量的话,\
+         没迁过的槽也会被告知自己是 v2,python 于是按新公式算一个盘上不存在的池"
     );
     // 固定名的三条硬规矩(`pool.py` 写明了每一条背后的故障)。
     let d = tpool::SOLE_SPEAKER_DIR;
