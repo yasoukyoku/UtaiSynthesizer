@@ -121,6 +121,17 @@ export function TrainingPage() {
         const info = await invoke<WorkspaceInfo>("get_training_slot_info", {
           projectId: pid,
           backend: config.backend,
+          // ⛔★§F2⒝ ④e —— **这个参数不是可选的**。S132 的 flip 让「再训一个」真的铸出第二个
+          // run,而 `resolve_run_dir(None)` 对多于一个 run **拒绝作答**(`RUN_AMBIGUOUS`)——
+          // 不传就等于问「这个槽整体练到哪了」,那是一个从此没有答案的问题。
+          //
+          // 这一条是三处里**静默**的那一处:catch 把它吞成 `setSlotInfo(null)`,而
+          // `resumeWouldBeGuarded` 头一行就是 `if (!info) return false` ⇒ 续训锁全部解除、
+          // `costly` 变空集合 ⇒ 「改这个字段会重跑预处理」的提示**整体消失**。locked 那一档
+          // 改了还会被后端响亮拒;costly 那一档按设计就是「允许,但要把代价说出来」——
+          // 提示没了,用户改一个字段,下次运行静默落到另一个池、切片/f0/特征重跑几小时,
+          // 屏幕上一个字都没有。
+          runId: config.runId,
         });
         if (cancelled) return;
         useTrainingStore.getState().setSlotInfo(info);
@@ -136,7 +147,7 @@ export function TrainingPage() {
     return () => {
       cancelled = true;
     };
-  }, [config.backend, route.projectId]);
+  }, [config.backend, config.runId, route.projectId]);
 
   // Does the CURRENT project hold a reusable flat (single-speaker) dataset? Derived HERE, keyed
   // on route.projectId, so it stays correct on every path — including「训练中直落运行段」, which
@@ -1592,7 +1603,18 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       try {
         const c = await invoke<{ modelName: string; workspace: string; indexPath: string | null }>(
           "get_slot_export_context",
-          { projectId: pid, backend: archiveBackend },
+          {
+            projectId: pid,
+            backend: archiveBackend,
+            // ★§F2⒝ ④e —— R2 的**第四处**(前三处是那两个 onStart 探针与页根 effect)。同样在
+            // 两个 run 之后 `RUN_AMBIGUOUS`,只是它的失败被 catch 吞成 `slotCtx = null`。
+            //
+            // ⚠ 这里只有在**同一个 family** 时才传得动:`config.runId` 说的是「本次训练选中的
+            // run」,而这一段问的是 `archiveBackend` 那个族的存档。族不同就没有可用的 id,
+            // 那时保持今天的行为(退回 `ctxForRun` 的按行现问 / live 身份)。
+            runId:
+              backendFamily(archiveBackend) === backendFamily(config.backend) ? config.runId : "",
+          },
         );
         if (!cancelled) setSlotCtx(c);
       } catch {
@@ -1602,7 +1624,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
     return () => {
       cancelled = true;
     };
-  }, [route.projectId, archiveBackend, snapshot.state]);
+  }, [route.projectId, archiveBackend, config.backend, config.runId, snapshot.state]);
 
   /** 产物身份:有 run(且这一段就在看它)用 run 的,否则用槽里冻结的(再没有就用项目名)。
    *  archiveOnly 一律走槽——那时的 live snapshot 可能是别的项目的运行。 */
@@ -2105,9 +2127,10 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         info = await invoke<WorkspaceInfo>("get_training_slot_info", {
           projectId: route.projectId,
           backend: config.backend,
+          runId: config.runId, // ⛔ 见页根 effect 那条:不传 = 问一个从 flip 起没有答案的问题
         });
       } catch (e) {
-        showToast(t("training.probeFailed", { err: String(e) }), "error");
+        showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
         return;
       }
       if (info.exists && info.family && info.family !== "sovits") {
@@ -2180,7 +2203,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         modelType: config.backend,
       });
     } catch (e) {
-      showToast(t("training.probeFailed", { err: String(e) }), "error");
+      showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
       return;
     }
     // ⚠ FAIL-CLOSED, like every other probe on this path. `fresh` is seeded to true = WIPE and
@@ -2197,9 +2220,10 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       info = await invoke<WorkspaceInfo>("get_training_slot_info", {
         projectId: route.projectId,
         backend: config.backend,
+        runId: config.runId, // ⛔ 见页根 effect 那条:不传 = 问一个从 flip 起没有答案的问题
       });
     } catch (e) {
-      showToast(t("training.probeFailed", { err: String(e) }), "error");
+      showToast(t("training.probeFailed", { err: backendErrorMessage(e) ?? String(e) }), "error");
       return;
     }
     const wsExists = info.exists;

@@ -501,7 +501,7 @@
       "orphan": "torn half",
       "pending": "just saved"
     },
-    "probeFailed": "Could not read the training-workspace state for this model name ({{err}}) — training was NOT started, so existing progress cannot be wiped by mistake. Restart the app and try again",
+    "probeFailed": "Could not read the training-workspace state for this model name ({{err}}) — training was NOT started, so existing progress cannot be wiped by mistake. Try again; if it keeps happening, check that the training data directory is readable (permissions / antivirus / cloud-sync lock)",
     "dropHint": "Drop here to add as training data",
     "pausePreview": "Pause",
     "loadingPreview": "Loading…",

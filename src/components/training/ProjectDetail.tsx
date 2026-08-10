@@ -285,9 +285,11 @@ export function ProjectDetail() {
     updateConfig({
       backend: family,
       modelName: runName,
-      // ★§F2⒝ 批 2 ④ —— 把「哪个 run」一路带到 start_training。今天恒为 ""(每槽一个 run),
-      // 但它必须**在铸第二个 run 之前**就通到底:`resolve_run_dir` 对多于一个 run 拒绝作答,
-      // 所以漏穿的调用点是响亮的错误,而不是悄悄写进别人的 run。
+      // ★§F2⒝ 批 2 ④ —— 把「哪个 run」一路带到 start_training。
+      // ⚠ 那句「今天恒为 ""(每槽一个 run)」随 S132 的 flip 死了:「再训一个」现在真的铸第二个
+      //   run,所以这个值从此可以是真 id,而 `resolve_run_dir` 对多于一个 run **拒绝作答** ——
+      //   漏穿的调用点是响亮的错误,不是悄悄写进别人的 run。(S133 R2:训练页那四处探针
+      //   正是漏穿的,后果是那个槽从此开不了训。)
       runId: run?.id ?? "",
       ...formFor(family, run, sovitsVersion),
     });
@@ -349,8 +351,12 @@ export function ProjectDetail() {
       },
     });
     if (!newName || newName === "__cancel") return;
-    // ★ 再训一个 = 这个架构会被清空,所以续训锁全部解除 —— 换采样率/换版本重练正是这颗按钮
-    // 的用途。真正的擦除同意仍然只有一处(运行段那个对话框,后端的 wipe_confirmed 只认它)。
+    // ★ 再训一个 = **另起一个 run**,所以续训锁全部解除 —— 新 run 里什么都还没被烧进去,
+    // 换采样率/换版本重练正是这颗按钮的用途。
+    // ⚠ 这句话在 S132 的 flip 之前写的是「这个架构会被清空」,那已经是假的(旧 run 原样留着,
+    //   `remove_dir_all_robust(&workspace)` 那一行没有了);结论不变,理由换成真的那个 ——
+    //   一条**理由已死的注释**会活过重构,然后在下一个人手里背书一个错的改动。
+    // 真正的擦除同意仍然只有一处(运行段那个对话框,后端的 wipe_confirmed 只认它)。
     useTrainingStore.getState().setRetrainIntent(true);
     updateConfig({
       backend: family,
