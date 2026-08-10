@@ -241,6 +241,10 @@ export interface ExportedModelStatus {
   modelType: string;
   fromCkptRel: string;
   atMs: number;
+  /** ★§F2⒝ ④e —— 产它的那个 run(或整个架构)已被用户主动删除。行照列(「导出过」是历史),
+   *  变的只是这一行还能**被用来做什么**:它不再保护任何快照不被清理,也不再算作
+   *  「账本对得上盘」的证据。 */
+  sourceDeleted: boolean;
   /** Live registry check — false = deleted in the resource manager since. */
   installed: boolean;
 }

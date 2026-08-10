@@ -845,7 +845,7 @@ export function ProjectDetail() {
             {detail.exported.map((e) => (
               <div
                 key={`${e.name}:${e.fromCkptRel}`}
-                className={`tproj-export-row ${e.installed ? "" : "gone"}`}
+                className={`tproj-export-row ${e.installed && !e.sourceDeleted ? "" : "gone"}`}
               >
                 <span className="tproj-export-name">{e.name}</span>
                 <span className="tproj-export-type">{e.modelType}</span>
@@ -855,6 +855,12 @@ export function ProjectDetail() {
                 {/* 「导出过」是历史,不是状态:注册表里已经没有了也照列,只是标灰 */}
                 {!e.installed && (
                   <span className="tproj-export-gone">{t("training.exportedDeleted")}</span>
+                )}
+                {/* ★§F2⒝ ④e —— 同一条口径的第二种「已经不在了」:产它的 run 被删了。
+                    模型本身是独立副本,所以它可以**仍然装着**而来源已经没有 —— 两个标记
+                    因此是并列的,不是二选一。 */}
+                {e.sourceDeleted && (
+                  <span className="tproj-export-gone">{t("training.exportedSourceGone")}</span>
                 )}
               </div>
             ))}

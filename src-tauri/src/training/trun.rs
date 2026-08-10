@@ -1498,12 +1498,14 @@ mod tests {
                         model_type: "rvc".into(),
                         from_ckpt_rel: "rvc/weights/m_e14_s147.pth".into(),
                         at_ms: 1,
+                        source_deleted_ms: 0,
                     },
                     ExportedModel {
                         name: "s".into(),
                         model_type: "sovits".into(),
                         from_ckpt_rel: "sovits/weights/s_e2_s200.pth".into(),
                         at_ms: 1,
+                        source_deleted_ms: 0,
                     },
                 ],
                 ..Default::default()

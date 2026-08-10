@@ -296,6 +296,7 @@
     "projectExported": "已导出的模型",
     "projectExportedNone": "还没有从这个项目导出过模型。",
     "exportedDeleted": "已删除",
+    "exportedSourceGone": "来源已删除",
     "familySovits": "SoVITS",
     "familySovitsDesc": "质量 · 4.1(vec768/响度嵌入)或 4.0(vec256/兼容老生态) · 浅扩散也住在这里 · 44.1k",
     "slotStart": "开始训练",

@@ -106,6 +106,38 @@ pub struct ExportedModel {
     /// Path of the source checkpoint RELATIVE to the project directory.
     pub from_ckpt_rel: String,
     pub at_ms: u64,
+    /// When the RUN (or slot) that produced this checkpoint was deliberately deleted; 0 = it is
+    /// still on disk as far as this ledger knows.
+    ///
+    /// ★★§F2⒝ ④e — 「导出过」是**历史**,不是状态(`ExportedModelStatus.installed` is a live
+    /// registry check and the row stays visible either way), so a delete may not drop the row.
+    /// But the row has two OTHER jobs that a deleted source invalidates, and both of them are
+    /// load-bearing:
+    /// * it is the sole source of `KeptReason::Exported` (`scan_project_ckpts` → `imported`).
+    ///   `trun::legacy_run_id` is a pure function of the FAMILY, so deleting the last run and
+    ///   training again re-creates the SAME `runs/<id>/` path — and with the same training name
+    ///   and step count the new checkpoint's `from_ckpt_rel` is byte-identical to this row's.
+    ///   A stale row would then hand delete-protection to a snapshot nobody ever exported;
+    /// * it feeds `cleanup_snapshots`' stale tripwire, which fires when NO scoped row matches a
+    ///   file on disk ⇒ that slot's 「清理未导入的快照」 becomes a permanent hard modal.
+    ///
+    /// ⛔ `#[serde(default)]` is not optional: `ExportedModel` has no `#[serde(flatten)] extra`,
+    /// so a field without it makes every existing `project.json` fail to parse ⇒ `read_meta`
+    /// returns None ⇒ `PROJECT_META_UNREADABLE` on the project page, and `cleanup_snapshots`
+    /// refuses outright. (`ProjectMeta` carries `extra` for exactly this reason; this struct
+    /// does not, and that asymmetry is easy to miss.)
+    #[serde(default)]
+    pub source_deleted_ms: u64,
+}
+
+impl ExportedModel {
+    /// Is the checkpoint this row points at still supposed to exist?
+    ///
+    /// The two consumers that must ask (protection + tripwire) go through this so they cannot
+    /// drift apart; the DISPLAY consumer deliberately does not.
+    pub fn source_live(&self) -> bool {
+        self.source_deleted_ms == 0
+    }
 }
 
 pub const PROJECT_META: &str = "project.json";
@@ -654,8 +686,19 @@ fn stat_of(p: &Path) -> (u64, u64) {
 ///   on this machine root {1000,2000,3000,3644} sits beside weights {500,1000,1500,1822}.
 pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<CkptRecord> {
     let proj = project_dir(data_dir, id);
+    // ★§F2⒝ ④e — rows whose SOURCE was deliberately deleted are excluded here and only here-ish
+    // (the other consumer is the stale tripwire; the DISPLAY list keeps them). See
+    // [`ExportedModel::source_deleted_ms`]: `legacy_run_id` is a pure function of the family, so a
+    // deleted-then-retrained slot re-creates byte-identical `from_ckpt_rel` strings, and a stale
+    // row would hand `KeptReason::Exported` to a snapshot nobody ever exported.
     let exported: Vec<String> = read_meta(data_dir, id)
-        .map(|m| m.exported.into_iter().map(|e| e.from_ckpt_rel).collect())
+        .map(|m| {
+            m.exported
+                .into_iter()
+                .filter(|e| e.source_live())
+                .map(|e| e.from_ckpt_rel)
+                .collect()
+        })
         .unwrap_or_default();
     let mut out: Vec<CkptRecord> = Vec::new();
 
@@ -1115,8 +1158,16 @@ pub fn cleanup_snapshots(
         Some(f) => rel.starts_with(f) && rel.as_bytes().get(f.len()) == Some(&b'/'),
         None => true,
     };
-    let scoped: Vec<&ExportedModel> =
-        meta.exported.iter().filter(|e| in_scope(&e.from_ckpt_rel)).collect();
+    // ★§F2⒝ ④e — …and a row whose source we deleted ON PURPOSE is not evidence that something
+    // moved behind our back. Without this filter the FIRST per-run delete turns that slot's
+    // 「清理未导入的快照」 into the permanent hard modal this tripwire's own comment describes,
+    // while the storage panel (which calls `plan_cleanup` directly, bypassing all three gates)
+    // keeps advertising a non-zero 可清理 number beside it.
+    let scoped: Vec<&ExportedModel> = meta
+        .exported
+        .iter()
+        .filter(|e| e.source_live() && in_scope(&e.from_ckpt_rel))
+        .collect();
     if !scoped.is_empty() && !scoped.iter().any(|e| records.iter().any(|r| r.rel == e.from_ckpt_rel))
     {
         return Err(UtaiError::Training("PROJECT_LEDGER_STALE".into()));
@@ -1129,7 +1180,7 @@ pub fn cleanup_snapshots(
         paths.extend(r.companions.iter().map(|c| proj.join(c)));
     }
     let tomb = tombstone(data_dir, id, &paths)?;
-    let deferred = match &tomb {
+    let deferred = match tomb.dir() {
         Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
         None => false,
     };
@@ -1139,6 +1190,52 @@ pub fn cleanup_snapshots(
         kept: plan.kept.into_iter().map(|(rel, reason)| KeptEntry { rel, reason }).collect(),
         deferred,
     })
+}
+
+/// Stamp every export-ledger row whose checkpoint lived under `rel_prefix` as 「its source is
+/// gone」. Returns how many rows changed.
+///
+/// ⛔★★§F2⒝ ④e — **AFTER the tombstone, never before.** `tombstone` renames, so a failure there
+/// means NOTHING was deleted; stamping first and then failing would strip `KeptReason::Exported`
+/// from snapshots that are still sitting on disk, and the next 「清理未导入的快照」 would delete
+/// the very work the user exported. (`trun::migrate_slot_runs` already wrote this causality down
+/// once, for the mirror-image case: 「that window is exactly when a cleanup deletes work」.)
+///
+/// ⚠ Prefix, not [`crate::training::trun::run_id_in_rel`] equality. The derived-id form looks more
+/// structured and is a trap: it answers `""` for every path that is not under `<family>/runs/`,
+/// including every OTHER family's rows — so one call with an empty id would stamp the entire
+/// ledger. With a prefix the same mistake produces `"<family>/runs//"`, which matches nothing.
+/// The trailing separator is load-bearing for the same reason it is in `cleanup_snapshots`'
+/// `in_scope`: without it `sovits` also claims every `sovits_v2/…` row.
+///
+/// Idempotent (an already-stamped row keeps its first timestamp) so a retried delete cannot
+/// rewrite history, and so this is safe to call from both delete paths.
+pub fn mark_exports_source_deleted(
+    data_dir: &Path,
+    id: &str,
+    rel_prefix: &str,
+    // ⛔ Not decoration and not documentation: only [`tombstone`] can mint one, so calling this
+    // BEFORE the delete does not compile. See [`Tombstoned`] for why that order is destructive.
+    _bytes_are_gone: &Tombstoned,
+) -> Result<usize> {
+    let Some(mut meta) = read_meta(data_dir, id) else {
+        // A project whose metadata cannot be read has no ledger to protect, and every consumer of
+        // it refuses outright (`cleanup_snapshots` on `PROJECT_META_UNREADABLE`). Same reasoning
+        // as `trun::repoint_ledger`, and the delete itself already happened.
+        return Ok(0);
+    };
+    let mut changed = 0usize;
+    let now = now_ms();
+    for e in meta.exported.iter_mut() {
+        if e.source_live() && e.from_ckpt_rel.starts_with(rel_prefix) {
+            e.source_deleted_ms = now;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        write_meta(data_dir, &meta)?;
+    }
+    Ok(changed)
 }
 
 /// Delete ONE architecture slot — its checkpoints, caches and audition renders. The project's
@@ -1153,7 +1250,17 @@ pub fn delete_slot(data_dir: &Path, id: &str, family: &str) -> Result<DeleteRepo
     }
     let freed = crate::commands::storage::dir_size(&slot);
     let tomb = tombstone(data_dir, id, &[slot])?;
-    let deferred = match &tomb {
+    // ★§F2⒝ ④e — this call is a FIX, not preparation for `delete_run`: without it, deleting a
+    // slot and then training the same family again leaves rows pointing at files that no longer
+    // exist, and the stale tripwire turns that slot's 「清理未导入的快照」 into a hard modal that
+    // only a fresh export can clear. `<family>/` covers both layouts (`<family>/weights/…` and
+    // `<family>/runs/<id>/weights/…`).
+    if let Err(e) = mark_exports_source_deleted(data_dir, id, &format!("{family}/"), &tomb) {
+        // The bytes are already gone; refusing now would report a failed delete for a delete that
+        // succeeded. Loud, and the ledger stays consistent-but-stale rather than wrong.
+        tracing::warn!("export ledger not updated after deleting {id}/{family}: {e}");
+    }
+    let deferred = match tomb.dir() {
         Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
         None => false,
     };
@@ -1177,7 +1284,7 @@ pub fn delete_project(data_dir: &Path, id: &str) -> Result<DeleteReport> {
     // (The listing cache's row is dropped by the COMMAND — `forget_project` — because the cache
     // lives beside `config.json`, not in the data dir, and this function only knows the latter.
     // Leaving it would resurrect the project as a MISSING ghost right after a deliberate delete.)
-    let deferred = match &tomb {
+    let deferred = match tomb.dir() {
         Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
         None => false,
     };
@@ -1204,9 +1311,32 @@ const TOMB_PREFIX: &str = ".del_";
 ///   checks `G_*` and `D_*` INDEPENDENTLY, so a crash between deleting one and the other makes
 ///   the next run seed a fresh 0-step counterpart for the surviving half: a silently corrupt
 ///   resume rather than a missing one.
-fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Option<PathBuf>> {
+/// Proof that a tombstone rename SUCCEEDED — i.e. that the bytes really are out of the way.
+///
+/// ⛔★★§F2⒝ ④e — this exists so that 「retire the ledger rows BEFORE the delete」 **does not
+/// compile**. The order is load-bearing and its violation is silent-then-destructive: `tombstone`
+/// RENAMES, so a failure there means nothing was deleted, and a ledger stamped first would have
+/// stripped `KeptReason::Exported` off snapshots that are still sitting on disk — the next
+/// 「清理未导入的快照」 then deletes exactly the work the user exported. (`trun::migrate_slot_runs`
+/// wrote the same causality down for the mirror case: 「that window is exactly when a cleanup
+/// deletes work」.)
+///
+/// A source-order ratchet was the alternative and it would have been the FOURTH hand-rolled
+/// 「blank the comments, cut the scope」 helper in this repo. A type costs one struct and cannot
+/// drift.
+#[derive(Debug)]
+pub struct Tombstoned(Option<PathBuf>);
+
+impl Tombstoned {
+    /// The staging directory, when anything was actually moved.
+    fn dir(&self) -> Option<&PathBuf> {
+        self.0.as_ref()
+    }
+}
+
+fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Tombstoned> {
     if paths.is_empty() {
-        return Ok(None);
+        return Ok(Tombstoned(None));
     }
     let tomb = training_root(data_dir).join(format!(
         "{TOMB_PREFIX}{id}_{}_{}",
@@ -1241,7 +1371,7 @@ fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Option<Path
         crate::util::rename_with_retry(p, &tomb.join(format!("{i:04}_{name}")), "TRAINING_DELETE")
             .map_err(UtaiError::Training)?;
     }
-    Ok(Some(tomb))
+    Ok(Tombstoned(Some(tomb)))
 }
 
 /// Does `.del_<id>_<pid>_<ms>` belong to a live SIBLING instance (⇒ leave it alone)?
@@ -1311,6 +1441,10 @@ pub fn record_export(
         model_type: model_type.to_string(),
         from_ckpt_rel: rel,
         at_ms: now_ms(),
+        // A fresh export is by definition live — and the `retain` above is what makes a
+        // deleted-then-recreated path (see `source_deleted_ms`) recover its protection: the stale
+        // row for the same rel+name is dropped rather than inherited.
+        source_deleted_ms: 0,
     });
     meta.updated_ms = now_ms();
     write_meta(data_dir, &meta)
@@ -2724,6 +2858,7 @@ mod tests {
                 model_type: "rvc".into(),
                 from_ckpt_rel: rvc_rel.into(),
                 at_ms: 1,
+                source_deleted_ms: 0,
             }],
             ..Default::default()
         };
@@ -2749,6 +2884,125 @@ mod tests {
         cleanup_snapshots(&data, id, Some("sovits"), &none)
             .expect("still none of sovits' business");
 
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— 删掉产物之后,账本行**留着**,但它不再保护任何东西、也不再算作
+    /// 「盘上对得上」的证据。三件事必须同时成立,少一件都会咬人:
+    ///
+    /// ⑴ **行还在**(`导出过` 是历史;模型是独立副本,还装在资源管理器里);
+    /// ⑵ 它不再给快照发 `KeptReason::Exported` —— `legacy_run_id` 是 family 的纯函数,删光
+    ///    再练一次会造出**逐字节相同**的 `from_ckpt_rel`,一条陈行会把删除保护发给一个从没
+    ///    导出过的快照;
+    /// ⑶ 它不再喂 `PROJECT_LEDGER_STALE` —— 否则第一次删完,那个槽的「清理未导入的快照」
+    ///    就变成永久硬模态,而存储页(直接调 `plan_cleanup`,绕过三道闸)照样在旁边写着
+    ///    「可清理 N GB」。
+    #[test]
+    fn deleting_a_slot_retires_its_ledger_rows_without_erasing_the_history() {
+        let data = tmp_root("ledgermark");
+        let id = "led_33334444";
+        let p = project_dir(&data, id);
+        let rvc_rel = "rvc/weights/m_e1_s100.pth";
+        // ⚠ `sovits_v2` is in the fixture for ONE reason: it is the only sample that can catch a
+        // prefix written without its trailing separator (`sovits` would then claim every
+        // `sovits_v2/…` row too). Same trap `cleanup_snapshots`' `in_scope` documents.
+        for rel in [rvc_rel, "sovits/weights/s_e2_s200.pth", "sovits_v2/weights/v_e1_s10.pth"] {
+            let f = p.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"x").unwrap();
+        }
+        let row = |name: &str, mt: &str, rel: &str| ExportedModel {
+            name: name.into(),
+            model_type: mt.into(),
+            from_ckpt_rel: rel.into(),
+            at_ms: 1,
+            source_deleted_ms: 0,
+        };
+        write_meta(
+            &data,
+            &ProjectMeta {
+                id: id.into(),
+                name: "n".into(),
+                export_ledger_since_ms: 1,
+                exported: vec![
+                    row("m", "rvc", rvc_rel),
+                    row("s", "sovits", "sovits/weights/s_e2_s200.pth"),
+                    row("v", "sovits_v2", "sovits_v2/weights/v_e1_s10.pth"),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 前置:两行都是活的,rvc 那个快照因此受保护
+        assert!(scan_project_ckpts(&data, id, Some("rvc")).iter().any(|r| r.imported));
+
+        delete_slot(&data, id, "rvc").unwrap();
+
+        let after = read_meta(&data, id).unwrap();
+        // ⑴ 历史没丢 —— 三行都还在,而且**只有** rvc 那行被打了戳
+        assert_eq!(after.exported.len(), 3, "「导出过」是历史,删除不许把它抹掉");
+        let rvc_row = after.exported.iter().find(|e| e.name == "m").unwrap();
+        let sov_row = after.exported.iter().find(|e| e.name == "s").unwrap();
+        assert!(!rvc_row.source_live(), "被删架构那一行没有被打戳");
+        assert!(
+            sov_row.source_live(),
+            "打戳跨到了别的架构 —— `<family>/` 后面那个分隔符就是防这个的"
+        );
+
+        // ⑶ 绊线不再为它响。⚠ 顺序是承重的:这一条**必须在文件还没被放回去之前**判 ——
+        //    文件在盘上时绊线本来就不会响,那样这条断言对「筛掉戳」这件事零覆盖(实测:
+        //    变异 N17 就是这样存活的)。
+        cleanup_snapshots(&data, id, Some("rvc"), &|_| false)
+            .expect("被打了戳的行不是「有人在背后动了文件」的证据");
+
+        // ⑵ 保护没了。⚠ 阴性对照:把文件重新放回原路径(「删光再练一次」会造出逐字节相同的
+        //    rel),它**仍然**不受保护 —— 否则这条断言只是在测「文件不在了」。
+        let f = p.join(rvc_rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"x").unwrap();
+        assert!(
+            !scan_project_ckpts(&data, id, Some("rvc")).iter().any(|r| r.imported),
+            "一条来源已被删除的账本行仍然在给新快照发 KeptReason::Exported"
+        );
+
+        // …而 sovits 那一行(仍然活着、文件也还在)照样能挡住乱清理
+        cleanup_snapshots(&data, id, Some("sovits"), &|_| false).expect("sovits 那行没被碰过");
+        std::fs::remove_file(p.join("sovits/weights/s_e2_s200.pth")).unwrap();
+        assert!(
+            cleanup_snapshots(&data, id, Some("sovits"), &|_| false)
+                .unwrap_err()
+                .to_string()
+                .contains("PROJECT_LEDGER_STALE"),
+            "绊线被整个关掉了 —— 它对**没被删过**的行必须照样响"
+        );
+
+        // ★ 只有这一格能抓住「前缀少写了那个分隔符」:删 sovits 不许碰 sovits_v2 的行
+        delete_slot(&data, id, "sovits").unwrap();
+        let after = read_meta(&data, id).unwrap();
+        assert!(!after.exported.iter().find(|e| e.name == "s").unwrap().source_live());
+        assert!(
+            after.exported.iter().find(|e| e.name == "v").unwrap().source_live(),
+            "`sovits` 认领了 `sovits_v2/…` 的行 —— 前缀末尾那个 `/` 是承重的"
+        );
+
+        // 幂等:一次重试的删除不许改写历史(戳留在第一次那个时刻),而且报「改了 0 行」
+        let stamp = rvc_row.source_deleted_ms;
+        let proof = tombstone(&data, id, &[]).unwrap();
+        assert_eq!(mark_exports_source_deleted(&data, id, "rvc/", &proof).unwrap(), 0);
+        assert_eq!(
+            read_meta(&data, id).unwrap().exported.iter().find(|e| e.name == "m").unwrap().source_deleted_ms,
+            stamp
+        );
+        // ⚠ 阴性对照:空前缀会**扫掉整本账本**,而这正是「用 run_id_in_rel 的 id 相等」那条
+        //    路的失败形态(它对任何不在 `<family>/runs/` 下的 rel 都答 `""`)。前缀法在同样的
+        //    输入上拼出 `rvc/runs//`,一行都匹配不到 —— 这条断言就是那个结构性差别本身。
+        assert_eq!(
+            mark_exports_source_deleted(&data, id, "rvc/runs//", &proof).unwrap(),
+            0,
+            "一个空 run id 拼出来的前缀匹配到了东西"
+        );
+        assert!(read_meta(&data, id).unwrap().exported.iter().any(|e| e.source_live()));
         let _ = std::fs::remove_dir_all(data);
     }
 
@@ -2779,7 +3033,9 @@ mod tests {
         }
         let tomb = tombstone(&data, id, &[a.clone(), b.clone()])
             .expect("both paths exist and are movable")
-            .expect("a non-empty path list always mints a tombstone");
+            .dir()
+            .expect("a non-empty path list always mints a tombstone")
+            .clone();
 
         assert_eq!(
             tomb.parent(),
@@ -2819,7 +3075,9 @@ mod tests {
         // the assertion below would also pass with the whole distinction deleted (everything Err).
         let tomb = tombstone(&data, id, &[p.join("never_existed")])
             .expect("a path that is really gone is not a failure")
-            .unwrap();
+            .dir()
+            .expect("the staging directory is minted before the loop, so it exists")
+            .clone();
         assert_eq!(std::fs::read_dir(&tomb).unwrap().count(), 0);
 
         // …and a path we cannot stat is.

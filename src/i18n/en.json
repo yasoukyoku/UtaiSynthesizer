@@ -296,6 +296,7 @@
     "projectExported": "Exported models",
     "projectExportedNone": "Nothing has been exported from this project yet.",
     "exportedDeleted": "Deleted",
+    "exportedSourceGone": "Source removed",
     "familySovits": "SoVITS",
     "familySovitsDesc": "Quality · 4.1 (vec768 / volume embedding) or 4.0 (vec256, 4.0-ecosystem compatible) · shallow diffusion lives here too · 44.1k",
     "slotStart": "Start training",

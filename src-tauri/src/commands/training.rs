@@ -545,6 +545,11 @@ pub struct ExportedModelStatus {
     pub model_type: String,
     pub from_ckpt_rel: String,
     pub at_ms: u64,
+    /// ★§F2⒝ ④e — the RUN (or slot) that produced this checkpoint was deleted on purpose. The row
+    /// still lists, for the same reason `installed: false` does: 「导出过」is history. What it
+    /// changes is only what the row can still be USED for — it no longer protects anything from
+    /// the snapshot cleanup, and it no longer counts as evidence for the stale-ledger tripwire.
+    pub source_deleted: bool,
     /// LIVE registry check. False = the user deleted it in the resource manager since; the row
     /// stays visible and greyed rather than vanishing, because「导出过」is history, not state.
     pub installed: bool,
@@ -951,6 +956,7 @@ pub async fn get_training_project(
             model_type: e.model_type.clone(),
             from_ckpt_rel: e.from_ckpt_rel.clone(),
             at_ms: e.at_ms,
+            source_deleted: !e.source_live(),
             installed: ledger_model_type(&e.model_type)
                 .map(|mt| state.models.exists(&e.name, &mt))
                 .unwrap_or(false),

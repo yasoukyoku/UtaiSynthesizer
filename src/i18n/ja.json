@@ -296,6 +296,7 @@
     "projectExported": "エクスポート済みモデル",
     "projectExportedNone": "このプロジェクトからはまだ何もエクスポートされていません。",
     "exportedDeleted": "削除済み",
+    "exportedSourceGone": "元データ削除済み",
     "familySovits": "SoVITS",
     "familySovitsDesc": "高品質 · 4.1（vec768 / 音量埋め込み）または 4.0（vec256 / 4.0 エコシステム互換） · 浅い拡散もここに入る · 44.1k",
     "slotStart": "学習を開始",
