@@ -60,6 +60,45 @@ pub fn migrate_layouts(root: &Path) {
     tpool::migrate_identity_all(root);
 }
 
+/// 把**一个**槽折到当前 layout —— 与 [`migrate_layouts`] **同一条链**,只是逐槽,而且**按需**。
+///
+/// ## 它为什么必须存在(不是一个便利函数)
+///
+/// §F2⒝ ④e 的「再训一个」会在这个槽里铸**第二个** run。而 `tpool::slot_facts` 在槽里看到两份
+/// `run_manifest.json` 时**直接 Err** ⇒ `plan_slot_identity` Err ⇒ 3→4 对这个槽**永久**
+/// `Refused`;把 run 全删光(④e 的另一半招牌功能)撞的是同一个函数的**零份**那条出口。
+/// 而 [`migrate_layouts`] **只在开机跑** ⇒「先长出第二个 run,再重启一次让它自愈」这条路
+/// **不存在**。⇒ 唯一堵得住的地方是**预防**:让这个槽在长出第二个 run **之前**就已经到
+/// layout 4 —— 那之后 `migrate_slot_identity` 早退 `AlreadyDone`,`slot_facts` 再也不会被问到。
+///
+/// ## 与开机链的关系
+///
+/// ⛔ 顺序**不许**在这里重排。理由逐条写在 [`migrate_layouts`] 的 doc 上(每一步都提交同一个
+/// `slot.json` 的数字,先盖章的那个会让后面的永远 `AlreadyDone`),而两条链由
+/// `trun::tests::the_boot_chain_folds_pools_before_runs` **逐步对拍** —— 加一步而只改一条,
+/// 或者在这里换个次序,都当场红。
+///
+/// ⚠ 少了根级的 `tproject::migrate_legacy_layout`,这是**有意**的:那一步的活是把一个 pre-S76
+/// 的项目**建出** family 槽,而本函数的前提恰恰是「这个槽已经在那里、而且里面有东西」——
+/// 一个连槽都还没建出来的项目走不到「再训一个」。
+///
+/// ## 失败就是失败
+///
+/// ⛔ `IdentityOutcome::Refused` 在开机链里是**一个真实的答案**(那个槽继续按身份 v1 工作,
+/// 用户什么都不用付,下次开机再看一眼)。**在这里它必须是 `Err`**:调用方接着就要铸第二个 run,
+/// 而那一铸下去,这个槽就再也迁不动了 —— 「下次开机再看」在那之后永远等不到。
+pub fn migrate_one_slot(data_dir: &Path, project_id: &str, family: &str) -> Result<()> {
+    let slot = tproject::family_dir(data_dir, project_id, family);
+    tpool::migrate_slot(&slot, family)?;
+    trun::migrate_slot_runs(data_dir, project_id, family)?;
+    match tpool::migrate_slot_identity(&slot, family)? {
+        tpool::IdentityOutcome::Refused(why) => {
+            Err(UtaiError::Training(format!("SLOT_NOT_MIGRATABLE: {why}")))
+        }
+        _ => Ok(()),
+    }
+}
+
 const STDERR_RING_CAP: usize = 200;
 const HISTORY_CAP: usize = 40_000;
 const SEED: u32 = 1234;
@@ -4545,6 +4584,80 @@ mod tests {
             "…and an empty plan never 'matches' — hence the separate importing flag"
         );
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// ★★S132 §F2⒝ ④e —— 按需折叠**真的**把一个槽送到当前 layout,而不是「跑过了」。
+    ///
+    /// 源序棘轮(`trun::tests::the_boot_chain_folds_pools_before_runs`)钉的是**步骤与顺序**;
+    /// 它证明不了这条链跑完之后槽真的到了 layout 4 —— 而 ④e 的准入正是建立在那个**结果**上。
+    ///
+    /// ⚠ 夹具是 **layout 0 且已有产物**的槽,因为那不是边角:没有任何代码在**建槽**时写
+    /// `slot.json`(S130 M17/L7 实测),所以「同一次会话里新建的槽」整场都是 layout 0 ——
+    /// 而「建槽 → 训练 → 再训一个」正是 ④e 最常见的一条路。
+    #[test]
+    fn the_on_demand_fold_takes_one_slot_all_the_way_to_the_current_layout() {
+        let data = tmp_ws("s132_on_demand");
+        let id = "proj_ondemand";
+        // ⚠ sovits 而不是 rvc:rvc 的池身份要从 `0_gt_wavs` 的 **RIFF 头**读采样率,那要一份
+        //    真 wav。这条判据测的是**折叠链**,不是 wav 解析,所以用不需要它的那一家。
+        let slot = tproject::family_dir(&data, id, "sovits");
+        std::fs::create_dir_all(&slot).unwrap();
+        // 一个练过的老形状:预处理产物 + 权重都还在**槽根**上
+        std::fs::create_dir_all(slot.join("dataset_44k").join("someslug")).unwrap();
+        std::fs::write(slot.join("dataset_44k").join("someslug").join("0.wav"), b"x").unwrap();
+        std::fs::write(slot.join(tpool::FINGERPRINT), b"abc123").unwrap();
+        std::fs::write(slot.join("G_2333333.pth"), b"x").unwrap();
+        std::fs::write(
+            slot.join("run_manifest.json"),
+            br#"{"backend":"sovits","aug_copies":0,"n_speakers":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tpool::read_slot_meta(&slot).map(|m| m.layout).unwrap_or(0),
+            0,
+            "夹具前提:这就是一个会话中途新建的槽的形状"
+        );
+
+        migrate_one_slot(&data, id, "sovits").expect("这个槽是可判定的,必须折得动");
+
+        assert_eq!(
+            tpool::read_slot_meta(&slot).map(|m| m.layout).unwrap_or(0),
+            tpool::SLOT_LAYOUT_POOL_ID,
+            "按需折叠必须把槽送到**当前** layout —— 停在 3 的槽正是 `slot_facts` 那两扇\
+             永久死胡同的入口,而 ④e 接下来就要在这个槽里铸第二个 run"
+        );
+        // …而且是真的折了,不是把 marker 一盖了事
+        assert!(!slot.join("G_2333333.pth").is_file(), "权重应该已经进 runs/<id>/");
+        assert!(!slot.join(tpool::FINGERPRINT).is_file(), "池产物应该已经进 pools/<id>/");
+        assert_eq!(trun::list_runs(&slot).unwrap().len(), 1, "折出来恰好一个 run");
+
+        // 幂等:再跑一次什么都不该变(准入会在每一次「再训一个」之前调它)
+        migrate_one_slot(&data, id, "sovits").expect("幂等");
+        assert_eq!(trun::list_runs(&slot).unwrap().len(), 1);
+
+        // ⛔ 不可判定 ⇒ **Err**,不是「Refused 但返回 Ok」。开机链把 Refused 当成一个真实的
+        // 答案(下次开机再看),而这里下一步就是铸第二个 run —— 那之后「下次开机」永远等不到。
+        // 摆成 layout 3 的形状,而池的指纹**读不动**(目录冒充文件)⇒ 3→4 只能 Refused
+        let slot2 = tproject::family_dir(&data, "proj_bad", "sovits");
+        let r2 = trun::runs_root(&slot2).join("r000000000000");
+        std::fs::create_dir_all(&r2).unwrap();
+        std::fs::write(
+            r2.join("run_manifest.json"),
+            br#"{"backend":"sovits","aug_copies":0,"n_speakers":1}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tpool::pools_root(&slot2).join("p_x").join(tpool::FINGERPRINT))
+            .unwrap();
+        tpool::write_slot_meta(
+            &slot2,
+            &tpool::SlotMeta { layout: trun::SLOT_LAYOUT_RUNS, ..Default::default() },
+        )
+        .unwrap();
+        let e = migrate_one_slot(&data, "proj_bad", "sovits").unwrap_err().to_string();
+        assert!(
+            e.contains("SLOT_NOT_MIGRATABLE") || e.contains("POOL_"),
+            "一个判不了的槽必须响亮拒绝这次操作: {e}"
+        );
     }
 
     /// ★★S132 §F2⒝ ④e — what the SLOT-level readers answer when the runs cannot be enumerated.

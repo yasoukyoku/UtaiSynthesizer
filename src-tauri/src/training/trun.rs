@@ -1558,18 +1558,27 @@ mod tests {
         // ★§F2⒝ ④d —— 这里此前是**两条手写的先后断言**,而那个形状对「加第四步」完全是瞎的
         // (新步骤排在链首也全绿)。改成一张**有序表**:链里的步骤必须与这张表**逐个同序**,
         // 少一步、多一步、换个位置都当场红。
-        const CHAIN: &[(&str, &str)] = &[
-            ("tproject::migrate_legacy_layout(", "它建出的 family 槽正是下一步要折的东西"),
-            ("tpool::migrate_all(", "先盖 layout 3 ⇒ 池折叠对这个槽永远 AlreadyDone,预处理产物永久留在槽根,连一行 warn 都没有"),
-            ("trun::migrate_all(", "run 折叠要在池折叠之后"),
-            ("tpool::migrate_identity_all(", "它盖的章同时打开 python 的 v2 公式 ⇒ 排到前面 = 先告诉 python 盘上是 v2 文本,再让另外两个迁移器去搬还写着 v1 文本的字节"),
+        // ★★S132 §F2⒝ ④e —— 第三列是**按需**那条链(`training::migrate_one_slot`)里对应的
+        // 单槽函数。④e 的「再训一个」必须在铸第二个 run 之前把这个槽折到 layout 4(否则
+        // `slot_facts` 的两份/零份 manifest 出口会让它永久迁不动,而开机链只在开机跑),
+        // 于是这条顺序**第二次**被写了出来 —— 而「顺序只存在一份」正是这条棘轮存在的理由。
+        // ⇒ 两条链在这里逐步对拍。`None` = 这一步在单槽版里**有意缺席**,理由写在
+        //    `migrate_one_slot` 的 doc 里(它的前提是槽已经存在)。
+        const CHAIN: &[(&str, Option<&str>, &str)] = &[
+            ("tproject::migrate_legacy_layout(", None, "它建出的 family 槽正是下一步要折的东西"),
+            ("tpool::migrate_all(", Some("tpool::migrate_slot("), "先盖 layout 3 ⇒ 池折叠对这个槽永远 AlreadyDone,预处理产物永久留在槽根,连一行 warn 都没有"),
+            ("trun::migrate_all(", Some("trun::migrate_slot_runs("), "run 折叠要在池折叠之后"),
+            ("tpool::migrate_identity_all(", Some("tpool::migrate_slot_identity("), "它盖的章同时打开 python 的 v2 公式 ⇒ 排到前面 = 先告诉 python 盘上是 v2 文本,再让另外两个迁移器去搬还写着 v1 文本的字节"),
         ];
         let m = code_only(MOD_RS);
-        let head = m.find("pub fn migrate_layouts(").expect("那条链没了");
-        let body = &m[head..];
-        let body = &body[..body.find("\n}").expect("migrate_layouts 没有顶格收尾")];
+        let fn_body = |sig: &str| -> String {
+            let head = m.find(sig).unwrap_or_else(|| panic!("{sig} 没了"));
+            let rest = &m[head..];
+            rest[..rest.find("\n}").unwrap_or_else(|| panic!("{sig} 没有顶格收尾"))].to_string()
+        };
+        let body = fn_body("pub fn migrate_layouts(");
         let mut cursor = 0usize;
-        for (needle, why) in CHAIN {
+        for (needle, _, why) in CHAIN {
             let at = body[cursor..]
                 .find(needle)
                 .unwrap_or_else(|| panic!("migrate_layouts 里没有 {needle}(或它排错了位置):{why}"));
@@ -1579,11 +1588,40 @@ mod tests {
         let calls = body.matches("::migrate_").count();
         assert_eq!(calls, CHAIN.len(), "migrate_layouts 里的步数与这张表对不上");
 
+        // ⑴b 按需那条链:同样的步骤、同样的顺序,一步都不许少也不许多。
+        let one = fn_body("pub fn migrate_one_slot(");
+        let mut cursor = 0usize;
+        let mut expected = 0usize;
+        for (_, slot_needle, why) in CHAIN {
+            let Some(needle) = slot_needle else { continue };
+            expected += 1;
+            let at = one[cursor..].find(needle).unwrap_or_else(|| {
+                panic!("migrate_one_slot 里没有 {needle}(或它排错了位置):{why}")
+            });
+            cursor += at + needle.len();
+        }
+        let one_calls = one.matches("::migrate_").count();
+        assert_eq!(
+            one_calls, expected,
+            "migrate_one_slot 的步数与这张表对不上 —— 加一步只改了开机链、或者在这里多排了一步,\
+             两种都会让「铸第二个 run 之前这个槽已经折到位」这个前提悄悄失效"
+        );
+        // ⛔ 而且缺席的那一步是**有意**缺席的,不是忘了:它在开机链里必须还在。
+        for (boot_needle, slot_needle, _) in CHAIN {
+            if slot_needle.is_none() {
+                assert!(
+                    body.contains(boot_needle) && !one.contains(boot_needle),
+                    "{boot_needle} 的缺席状态变了 —— 要么开机链丢了它,要么单槽版偷偷加了它,\
+                     两种都要先想清楚再改这张表"
+                );
+            }
+        }
+
         // ⑵ 两个调用点都走那条链,而且不许把任何一步再抄一遍到自己身上。
         for (name, src) in [("lib.rs", LIB_RS), ("commands/settings.rs", SETTINGS_RS)] {
             let c = code_only(src);
             assert!(c.contains("migrate_layouts("), "{name} 不再折 layout 了");
-            for (inlined, _) in CHAIN {
+            for (inlined, _, _) in CHAIN {
                 assert!(
                     !c.contains(inlined),
                     "{name} 自己排了一遍 {inlined} —— 这条链加一步时,这里就是会被漏掉的那处"
