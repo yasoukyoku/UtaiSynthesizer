@@ -852,7 +852,21 @@ fn slot_facts(slot: &Path) -> std::result::Result<SlotFacts, String> {
     let mut found: Option<serde_json::Value> = None;
     for run in super::trun::run_dirs(slot) {
         let p = run.path().join("run_manifest.json");
-        let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+        // ⛔★§F2⒝ ④e 笔 2 — 「不在」与「读不动」必须分开,而它们此前是同一条 `continue`。
+        //
+        // 少一个 run 不是少一点信息,是**换一个答案**:这个函数的返回值会被打到这个槽的**每一个**
+        // 池的身份串上。今天槽恒一个 run,所以「跳过」= `found` 仍是 None ⇒ 下面那条「没有 run
+        // manifest」的拒绝,结果对但措辞错。④e 之后槽有 N 个 run,而那时同一条 `continue` 会让
+        // 「两个 run 里有一个的 manifest 被杀软/网盘/ACL 占着」**静默降级成「只有一个 run」** ⇒
+        // 拿另一个 run 的 `aug_copies` 给整槽打戳,而 E2 那条响亮拒绝**根本不会触发**。
+        // ⇒ 这正是这道闸存在的理由反过来发生一遍,而且是**fail-open** 方向。
+        let raw = match std::fs::read_to_string(&p) {
+            Ok(raw) => raw,
+            // 真的没有:一个 `try_start` 建了目录却没走到写 manifest 的 run(失败的启动留下的形状)。
+            // 它确实什么都说不出来,跳过是对的。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: unreadable run manifest: {e}", p.display())),
+        };
         let v: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("{}: unreadable run manifest: {e}", p.display()))?;
         if found.is_some() {
@@ -1188,7 +1202,42 @@ pub fn migrate_slot_identity(slot: &Path, family: &str) -> Result<IdentityOutcom
             slot.display()
         );
     }
-    commit(slot)?;
+    // ⛔★★§F2⒝ ④e 笔 2 —— 提交失败也必须退回去,而它此前**不在回滚里**。
+    //
+    // `commit` 的最后一步是 `write_slot_meta`,它会以 `SLOT_META_WRITE_FAILED` 失败(只读属性、
+    // 网盘、杀软占住 `slot.json.tmp` —— 与上面那条 `apply_step` 会失败的理由一模一样)。
+    // 那一刻盘上是:**每个池都已经是 v2 的串、单说话人切片树已经改名成 `spk0`、续训 sidecar 也已
+    // 经跟上了新串**,而 marker 停在 3 ⇒ `identity_version` 答 1 ⇒ python 按 **v1** 拼串 ⇒ 和盘上
+    // 的 v2 串**一个都对不上** ⇒ 当场铸一个兄弟池,把几小时预处理重跑一遍,唯一的痕迹是一行
+    // `logger.info`。⇒ 正是 ④d「两半必须同一刻改变」那句话反过来发生一遍,只不过方向是**盘先走**。
+    //
+    // ⚠ sidecar 必须**先**退:它是按 `old_fp == 盘上的串` 匹配的,所以只要先把池的戳退回 v1,
+    //    这份反向重写就再也匹配不上了。反向步骤只需要 old/new 对调 —— `repoint_resume_sidecars`
+    //    不看 `rename`,所以这里的 `rename: None` 是如实陈述而不是偷懒。
+    // ⚠ `backfill_pool_refs` 写的 `pool.json` **不需要退**:它记的是池的**目录名**,而这次迁移
+    //    从头到尾没有重命名过任何池目录(身份是文件内容,不是目录名)。
+    if let Err(e) = commit(slot) {
+        let back: Vec<PoolStep> = done
+            .iter()
+            .map(|s| PoolStep {
+                dir: s.dir.clone(),
+                old_fp: s.new_fp.clone(),
+                new_fp: s.old_fp.clone(),
+                rename: None,
+            })
+            .collect();
+        let un = repoint_resume_sidecars(slot, &back);
+        for d in done.iter().rev() {
+            undo_step(d);
+        }
+        tracing::error!(
+            "pool identity: {} could not be committed ({e}) — rolled {} pool(s) and {un} resume \
+             sidecar(s) back to v1 so python keeps matching what is actually on disk",
+            slot.display(),
+            done.len()
+        );
+        return Err(e);
+    }
     Ok(IdentityOutcome::Restamped(steps.len()))
 }
 
@@ -1638,6 +1687,95 @@ mod tests {
         assert!(!b.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
         assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "没盖章");
         assert_eq!(identity_version(&slot), 1, "⇒ python 仍然算 v1,而盘上确实还是 v1 的串");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// ★★§F2⒝ ④e 笔 2 —— **提交那一步失败,盘也必须退回去**。
+    ///
+    /// ## 为什么这条判据必须存在
+    ///
+    /// 回滚此前只包住 `apply_step` 的循环,而 `commit` 排在循环**之后**。`commit` 的最后一步
+    /// (`write_slot_meta`)会以 `SLOT_META_WRITE_FAILED` 失败 —— 理由和 `apply_step` 会失败的
+    /// 一模一样(只读属性、网盘、杀软占住 tmp)。它失败的那一刻,盘上**每个池都已经是 v2 的串**、
+    /// 切片树已经改名、sidecar 也已经跟上,而 marker 停在 3 ⇒ `identity_version` 答 1 ⇒
+    /// python 按 v1 拼串、和盘上一个都对不上 ⇒ **铸兄弟池 + 几小时全量重跑**,唯一痕迹一行 info。
+    ///
+    /// ⇒ 这是 ④d 那句「两半必须同一刻改变」**反过来**发生一遍(盘先走了一步),
+    /// 而 S130 修的是它的镜像(marker 先走)。两个方向都要有人守着。
+    ///
+    /// ⛔ 这条分支此前**一次都没有被执行过** —— 一条从没被执行过的错误分支就是一条空判据。
+    #[test]
+    fn a_failed_commit_rolls_the_disk_back_to_v1_too() {
+        let slot = layout3_slot("id_commitfail", serde_json::json!({ "aug_copies": 2 }));
+        let a = mk_pool(&slot, "p00000000000a", "aaaa|enc=x|loudnorm=0");
+        std::fs::create_dir_all(a.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
+        // 一份续训 sidecar,记着**旧**串 —— 它是这条回滚里最容易被忘掉的一半。
+        let run = super::super::trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        let sidecar = run.join("resume_state.json");
+        std::fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": 1, "dataset_fingerprint": "aaaa|enc=x|loudnorm=0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(run.join("run_manifest.json"), br#"{"aug_copies":2}"#).unwrap();
+        // ⇒ 让 `write_slot_meta` 的原子写**必然**失败:tmp 路径被一个目录占住。
+        //   ⚠ 不能改 `slot.json` 本身 —— 那会让上面 `read_slot_meta` 判成 layout 0,
+        //     于是在准入那一关就被挡掉,这条分支根本走不到。
+        std::fs::create_dir_all(slot.join(format!("{SLOT_META}.tmp"))).unwrap();
+
+        // 前置:这个池**确实**有活要干,否则下面全是对空气断言。
+        let planned = plan_slot_identity(&slot, "sovits").unwrap();
+        assert_eq!(planned.len(), 1, "前置:这一步本来就该改点什么");
+
+        assert!(migrate_slot_identity(&slot, "sovits").is_err(), "盖章失败必须是错误");
+        assert_eq!(fp_of(&a), "aaaa|enc=x|loudnorm=0", "池的戳必须退回 v1");
+        assert!(
+            a.join("dataset_44k").join("mymodel_deadbeef").is_dir(),
+            "切片目录名必须退回去 —— 留着 `spk0` 而 marker 是 3,python 按 v1 会重切一棵树"
+        );
+        assert!(!a.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            v["dataset_fingerprint"].as_str().unwrap(),
+            "aaaa|enc=x|loudnorm=0",
+            "⛔ sidecar 也必须退 —— 否则每个存量 run 第一次续训报一次**假的** DATASET_CHANGED,\
+             而那条信号正是「续训崩溃」那份未结案卷宗赖以区分问题的东西"
+        );
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "没盖章");
+        assert_eq!(identity_version(&slot), 1, "⇒ python 算 v1,而盘上确实还是 v1 —— 两边同步");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// ★★§F2⒝ ④e 笔 2 —— 「读不动」不许被当成「不在」。
+    ///
+    /// 这个函数的返回值会被打到这个槽**每一个**池的身份串上,所以少看见一个 run 不是少一点信息,
+    /// 是**换一个答案**。今天槽恒一个 run ⇒ 结果不变(照样 Refused),但措辞从「没有 run manifest」
+    /// 变成「读不动」;④e 之后槽有 N 个 run,而那时旧写法会把「两个 run 里有一个的 manifest 被占着」
+    /// **静默降级成「只有一个 run」** ⇒ 拿另一个 run 的份数给整槽打戳,而那条响亮的
+    /// 「more than one run manifest」**根本不会触发**。⇒ fail-open,方向正好反了。
+    #[test]
+    fn a_run_manifest_that_cannot_be_read_is_refused_not_skipped() {
+        let slot = tmp_slot("id_unreadable");
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        mk_pool(&slot, "p000000000001", "aaaa|enc=x|loudnorm=0");
+        let run = super::super::trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        // 「在,但读不动」:用一个**目录**顶替那个文件 —— 跨平台都不是 NotFound。
+        std::fs::create_dir_all(run.join("run_manifest.json")).unwrap();
+
+        match migrate_slot_identity(&slot, "sovits") {
+            Ok(IdentityOutcome::Refused(why)) => assert!(
+                why.contains("unreadable run manifest"),
+                "拒绝的理由必须说清是【读不动】,不是【不在】:{why}"
+            ),
+            other => panic!("读不动的 manifest 必须是响亮拒绝,得到 {other:?}"),
+        }
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "拒绝不许盖章");
         let _ = std::fs::remove_dir_all(slot);
     }
 
