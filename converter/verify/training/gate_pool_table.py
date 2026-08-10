@@ -38,10 +38,72 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.stdout.reconfigure(encoding="utf-8")
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+#: Set when check (4) could not even ASK Rust for its constants. See [`_publish_constants`].
+INFRA_FAILED = None
+
+
+def _publish_constants():
+    """Ask the Rust side to print `TPOOL_JSON`. Returns `(parsed_json | None, diagnosis)`.
+
+    ⛔ **This function exists because of a real, twice-repeated failure, and the fix is not the
+    retry — it is the SEPARATION.**
+
+    History: check (4) spawns `cargo test --test tpool_migrate -- --ignored --nocapture
+    tpool_layout_constants` and used to report a non-zero cargo exit as
+    `[FAIL] the Rust side published its constants  - rc=101` — i.e. **as a contract violation**.
+    That red fired once in S125 and once in S129; both times an immediate re-run passed, both
+    times the cause was never established, and both times it was written off as「并发假红」.
+    S129 then ran the exact command 18 times under three deliberately hostile conditions
+    (back-to-back, chained behind another cargo invocation, and with a forced re-link) and could
+    not reproduce it. **The cause is still unknown.**
+
+    What IS established is the defect in the gate itself: *「cargo 没跑起来」和「两种语言算出了
+    不同的池名」被报成同一种红*。A red that can mean either "your change is wrong" or "your
+    toolchain hiccuped" is a red that gets ignored the second time — which is exactly what
+    happened. So:
+
+    * a cargo failure is NEVER reported through `check()`; it sets [`INFRA_FAILED`] and the gate
+      exits with its own code (2), so a caller can tell the two apart;
+    * the retry runs with `-v`, because the ONLY moment more cargo detail is worth having is the
+      moment it failed twice in a row — and that is the transcript the next investigation needs;
+    * both attempts' rc, elapsed time and output tail are always reported.
+
+    ⚠ Do NOT "fix" this by making the retry silent. The retry exists to gather evidence, not to
+    make the number green.
+    """
+    cmd = ["cargo", "test", "--test", "tpool_migrate", "--",
+           "--ignored", "--nocapture", "tpool_layout_constants"]
+    notes = []
+    for attempt, extra in enumerate(([], ["-v"])):
+        # ⚠ index 2, not 3: `cmd[3]` is `--test`'s VALUE. Inserting there produced
+        # `cargo test --test -v tpool_migrate`, i.e. a retry that failed for a reason of its own —
+        # found only because the forced-failure run below was actually EXECUTED. An error path
+        # nobody has run is not a criterion.
+        argv = cmd[:2] + extra + cmd[2:]
+        t0 = time.time()
+        try:
+            r = subprocess.run(argv, cwd=os.path.join(REPO, "src-tauri"), capture_output=True,
+                               text=True, encoding="utf-8", errors="replace")
+            out, rc = (r.stdout or "") + "\n" + (r.stderr or ""), r.returncode
+        except OSError as e:  # cargo not on PATH, cwd gone, …
+            out, rc = "spawn failed: %r" % e, -1
+        dt = time.time() - t0
+        line = [l for l in out.splitlines() if l.startswith("TPOOL_JSON ")]
+        notes.append("attempt %d: rc=%d %.1fs argv=%s" % (attempt + 1, rc, dt, " ".join(argv)))
+        if line:
+            if attempt:
+                notes.append("⚠ 第一次失败、重试成功 —— 这正是 S125/S129 那两次的形状,别当没发生")
+                print("  ⚠ " + " / ".join(notes))
+            return json.loads(line[0][len("TPOOL_JSON "):]), "\n".join(notes)
+        notes.append("  ---- cargo 输出尾巴 ----")
+        notes.append("\n".join(l for l in out.splitlines() if l.strip())[-3000:])
+    return None, "\n".join(notes)
 TRAIN = os.path.join(REPO, "training", "utai_train")
 TPOOL_RS = os.path.join(REPO, "src-tauri", "src", "training", "tpool.rs")
 TRUN_RS = os.path.join(REPO, "src-tauri", "src", "training", "trun.rs")
@@ -476,24 +538,16 @@ def main():
     sys.path.insert(0, os.path.join(REPO, "training"))
     from utai_train.pool import pool_id_for  # noqa: E402
 
-    r = subprocess.run(
-        ["cargo", "test", "--test", "tpool_migrate", "--",
-         "--ignored", "--nocapture", "tpool_layout_constants"],
-        cwd=os.path.join(REPO, "src-tauri"), capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    )
-    both = (r.stdout or "") + "\n" + (r.stderr or "")
-    line = [l for l in both.splitlines() if l.startswith("TPOOL_JSON ")]
-    if not line:
-        # ⛔ Print what cargo actually said. This branch used to report `rc=101` and nothing else,
-        # and S129 hit it once (the next two runs passed) with NO WAY to tell a compile error from
-        # a failed assertion from a locked `target/`. A gate whose failure cannot be attributed is
-        # a gate that gets shrugged off the second time it fires.
-        tail = "\n".join(l for l in both.splitlines() if l.strip())[-1500:]
-        check("the Rust side published its constants", False,
-              "rc=%d — cargo said:\n%s" % (r.returncode, tail))
+    L, diag = _publish_constants()
+    if L is None:
+        # ⛔⛔ NOT `check(...)`. Read the block above `_publish_constants` — conflating "the gate
+        # could not run" with "the contract is broken" is what let this fire twice (S125, S129) and
+        # be shrugged off twice.
+        global INFRA_FAILED
+        INFRA_FAILED = diag
+        print("  [⛔ 闸跑不起来 —— 这不是契约不符] " + diag.splitlines()[0])
+        print("     " + "\n     ".join(diag.splitlines()[1:])[:4000])
     else:
-        L = json.loads(line[0][len("TPOOL_JSON "):])
         check("pool_id_for agrees for every probe",
               all(pool_id_for(k) == v for k, v in L["pool_id_for"].items()),
               json.dumps(L["pool_id_for"], ensure_ascii=False))
@@ -508,6 +562,14 @@ def main():
               pool_id_for("abc123") == want == L["pool_id_for"]["abc123"], want)
 
     print("")
+    if INFRA_FAILED:
+        # ⛔ Its own exit code, and it is NOT 1. 「闸跑不起来」不是「契约不符」—— 把两者报成同一个
+        # 数字,正是这条检查两次红都被当成抖动的原因。⚠ 它也**不是绿**:此刻 (4) 一个字都没验过。
+        print("RESULT: INFRA-FAIL —— 契约检查 (4) 根本没跑起来,它验没验过是【未知】,不是通过。")
+        print("        %d 条契约检查的结果仍然有效:%s"
+              % (len(FAIL), "FAIL %s" % FAIL if FAIL else "全过"))
+        print("        ⇒ 这一次必须查明。两次先例与已排除的假设:_publish_constants 的 docstring。")
+        return 2
     print("RESULT: %s" % ("ALL PASS" if not FAIL else "FAIL (%d): %s" % (len(FAIL), FAIL)))
     return 1 if FAIL else 0
 
