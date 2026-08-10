@@ -484,8 +484,15 @@ pub fn run_id_in_rel(rel: &str, family: &str) -> String {
 pub struct RunDir(PathBuf);
 
 impl RunDir {
-    /// ⚠ Only [`resolve_run_dir`] and [`run_dirs`] may mint one in production — that is the entire
-    /// guarantee. Tests build fixtures directly and are allowed to say so out loud.
+    /// ⚠ Only the RESOLVERS may mint one in production — that is the entire guarantee. Tests build
+    /// fixtures directly and are allowed to say so out loud.
+    ///
+    /// ⛔★§F2⒝ ④e — the resolvers are [`resolve_run_dir`], [`run_dirs`], [`run_dir_for_start`] and
+    /// [`mint_run_dir`]. This doc used to name only the first two, and that was **already false**
+    /// before ④e (`run_dir_for_start` constructed three of them) — a reader looking here for 「every
+    /// place a run directory is decided」 would have missed the one the flip had to change. The list
+    /// is load-bearing precisely because this newtype exists so that 「which of two identical-looking
+    /// `&Path`s did I pass」 stops being a question a reviewer has to answer by hand.
     #[cfg(test)]
     pub fn for_test(p: PathBuf) -> Self {
         RunDir(p)

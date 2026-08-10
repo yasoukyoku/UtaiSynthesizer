@@ -176,10 +176,17 @@ pub struct ResumeState<'a> {
 
 /// THE resume guard. Returns the CODE (with its payload) to refuse with, or None to allow.
 ///
-/// `enforce` is `!req.fresh || diff_partial_wipe`: a full 重训 wipes the slot, so nothing is
-/// baked in any more — but the diffusion partial wipe KEEPS the manifest, so a mismatched
-/// version could never train afterwards; deleting first would destroy hours of diffusion
-/// progress and only THEN refuse.
+/// `enforce` is `!req.fresh || diff_partial_wipe`: a 重训 trains into a run where nothing is baked
+/// in yet — but the diffusion partial wipe KEEPS the manifest, so a mismatched version could never
+/// train afterwards; deleting first would destroy hours of diffusion progress and only THEN refuse.
+///
+/// ⚠★§F2⒝ ④e — the CONCLUSION is unchanged and the REASON is not. Until the flip this said 「a
+/// full 重训 wipes the slot, so nothing is baked in any more」, and that sentence died the moment
+/// 「重训」 stopped erasing anything. What makes a fresh start unguardable now is that it MINTS a
+/// new run (`trun::run_dir_for_start` with `mint`), so the fields are being chosen for a directory
+/// that is empty by construction rather than for one that was just emptied.
+/// ⛔ Worth spelling out because the guard would have stayed GREEN either way: a criterion whose
+/// stated reason is dead is the shape that survives a refactor and then licenses the wrong edit.
 pub fn check_resume_locks(
     req: &super::StartTrainingRequest,
     st: &ResumeState<'_>,
@@ -513,6 +520,13 @@ mod tests {
     }
 
     /// 重训 unlocks everything — that is the ONLY way out of a Locked field, so it must work.
+    ///
+    /// ⚠★§F2⒝ ④e — this test passes `false` as a LITERAL, so it pins the function's contract and
+    /// not the call site. That means the flip could not make it red, and it did not: what changed
+    /// is the reason (see `check_resume_locks`'s doc — 「the slot was wiped」 became 「the run is
+    /// newly minted and therefore empty」). The call site itself (`training::try_start`) has no
+    /// unit driver at all; the source-order ratchet
+    /// `training::tests::a_start_re_resolves_its_run_after_the_wipe` is what pins it instead.
     #[test]
     fn a_fresh_run_is_never_guarded() {
         let m = manifest("sovits");
