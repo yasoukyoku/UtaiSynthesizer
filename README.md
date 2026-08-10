@@ -88,7 +88,7 @@ npm run tauri dev      # full app in a real window (Vite on :1420 + Rust backend
 
 npm run build          # frontend gate: tsc -b && vite build
 npm test               # vitest suite
-cd src-tauri; cargo test   # Rust suite (heavier E2E tests are #[ignore]d)
+cd src-tauri; cargo test --workspace   # Rust suite (heavier E2E tests are #[ignore]d)
 
 pwsh -File scripts/release.ps1          # gated, signed installer build (see below)
 pwsh -File scripts/verify-install.ps1   # 39-point audit of an installed tree

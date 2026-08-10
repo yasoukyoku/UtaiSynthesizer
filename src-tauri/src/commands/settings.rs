@@ -4443,4 +4443,113 @@ mod tests {
             wrong.join("\n  ")
         );
     }
+
+    /// S134 (§F7 first pass) — the release gate must run the WHOLE workspace, not just the root
+    /// package.
+    ///
+    /// `src-tauri/Cargo.toml` is BOTH `[workspace]` and `[package]`, so a bare `cargo test` there
+    /// resolves to the root package alone. Measured on one tree at one moment (2026-08-11, HEAD
+    /// 5d3385a): bare `cargo test` = 545 passed, `cargo test --workspace` = 583 — the 38 missing
+    /// are exactly utai-dsp's 30 (MDX / demucs / formant) and utai-stretch's 8 (the range-extension
+    /// engine). Nothing was ever RED: both crates are BUILT either way (utai depends on them by
+    /// path), their tests simply never ran in a release gate.
+    ///
+    /// Same family as the `--lib` hole four lines above it in release.ps1 — the one that let a red
+    /// `download_http.rs` ship through four releases — one level up: `--lib` hid `tests/`, a bare
+    /// `cargo test` hides whole member crates.
+    ///
+    /// Shape notes, each paid for elsewhere in this repo:
+    ///   · Comments AND string literals are stripped before looking for the invocation. release.ps1
+    ///     both narrates (`Write-Host "gate: cargo test"`) and blames (`Fail "cargo test"`) with the
+    ///     same three words, and the paragraph above the invocation discusses it in prose ⇒ a
+    ///     substring check over the raw text is satisfied by a corpse (S119(a)).
+    ///   · The assertion is over EVERY invocation, not "the file contains the good string": adding a
+    ///     second, bare `cargo test` line has to go red too.
+    ///   · The stripper SELF-CHECKS on a known positive and a known negative first. A classifier that
+    ///     has never seen a positive carries no information in its negatives (S116).
+    ///
+    /// ⛔ Honest boundary: this test CANNOT prove that `--workspace` changes what runs — that was
+    /// measured by hand once (the two numbers above). What it pins is that the flag is still there
+    /// and that the workspace still has members for it to reach.
+    #[test]
+    fn the_release_gate_runs_the_whole_workspace() {
+        static RELEASE_PS1: &str = include_str!("../../../scripts/release.ps1");
+        static CARGO_TOML: &str = include_str!("../../Cargo.toml");
+
+        /// Drop PowerShell string literals so prose about a command cannot pass for the command.
+        fn strip_ps_strings(line: &str) -> String {
+            let mut out = String::new();
+            let mut quote: Option<char> = None;
+            for ch in line.chars() {
+                match quote {
+                    Some(q) => {
+                        if ch == q {
+                            quote = None;
+                        }
+                    }
+                    None => {
+                        if ch == '"' || ch == '\'' {
+                            quote = Some(ch);
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        // (0) the stripper must be able to fail in BOTH directions before its verdict means anything.
+        assert!(
+            !strip_ps_strings("Write-Host \"gate: cargo test\" -ForegroundColor Cyan").contains("cargo test"),
+            "strip_ps_strings no longer removes quoted prose — part (1) below would be satisfied by \
+             a Write-Host line and this whole test would be decoration"
+        );
+        assert!(
+            strip_ps_strings("Push-Location src-tauri; cargo test --workspace; Pop-Location").contains("cargo test"),
+            "strip_ps_strings ate a real invocation — part (1) below would silently find nothing"
+        );
+
+        // (1) every real `cargo test` invocation must carry --workspace.
+        let mut invocations: Vec<String> = Vec::new();
+        for line in RELEASE_PS1.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let code = strip_ps_strings(line);
+            if code.contains("cargo test") {
+                invocations.push(code.trim().to_string());
+            }
+        }
+        assert!(
+            !invocations.is_empty(),
+            "scripts/release.ps1 no longer invokes `cargo test` at all — the Rust suite has left the \
+             release gate entirely"
+        );
+        for inv in &invocations {
+            assert!(
+                inv.contains("--workspace"),
+                "scripts/release.ps1 invokes cargo test WITHOUT --workspace:\n  {inv}\n\
+                 src-tauri is the workspace root AND a package, so that runs the root package only \
+                 and silently skips crates/utai-dsp + crates/utai-stretch (38 tests as of S134)."
+            );
+        }
+
+        // (2) …and the workspace still has members for --workspace to reach.
+        let members = CARGO_TOML
+            .lines()
+            .find(|l| l.trim_start().starts_with("members"))
+            .expect("src-tauri/Cargo.toml lost its [workspace] members line");
+        for krate in ["crates/utai-dsp", "crates/utai-stretch"] {
+            assert!(
+                members.contains(krate),
+                "{krate} is no longer a workspace member ({members}) — if it really is gone, retire \
+                 it from this test too; if it merely moved, --workspace must still reach it"
+            );
+            assert!(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(krate).is_dir(),
+                "{krate} is listed as a workspace member but its directory is missing"
+            );
+        }
+    }
 }

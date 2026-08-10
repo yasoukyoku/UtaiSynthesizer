@@ -90,8 +90,16 @@ npx vitest run; if ($LASTEXITCODE -ne 0) { Fail "vitest" }
 # Full suite (unit + tests/), not --lib: the integration tests (downloader E2E, parity
 # gates, ...) are exactly where cross-module regressions hide — --lib let a red
 # download_http.rs slip through four releases (caught 2026-07-13).
+# --workspace is the SECOND half of that same lesson (S134, §F7 first pass): src-tauri is
+# both the workspace root AND a package, so a bare `cargo test` runs the root package only.
+# Measured on one tree at one moment: `cargo test` = 545 passed, `cargo test --workspace` =
+# 583 — the 38 missing are utai-dsp's 30 (MDX / demucs / formant) and utai-stretch's 8 (the
+# range-extension engine). Both crates were BUILT either way (utai depends on them by path),
+# so nothing was ever red; their tests simply never ran in a release gate.
+# Guarded by `the_release_gate_runs_the_whole_workspace` in commands/settings.rs — delete
+# --workspace and that test goes red.
 Write-Host "gate: cargo test" -ForegroundColor Cyan
-Push-Location src-tauri; cargo test; $rc = $LASTEXITCODE; Pop-Location
+Push-Location src-tauri; cargo test --workspace; $rc = $LASTEXITCODE; Pop-Location
 if ($rc -ne 0) { Fail "cargo test" }
 
 # ── 6. build (signed) ── (the CLI wants TAURI_SIGNING_PRIVATE_KEY — content works everywhere,

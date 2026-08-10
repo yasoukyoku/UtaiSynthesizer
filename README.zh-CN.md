@@ -80,7 +80,7 @@ npm run tauri dev      # 完整应用真窗口(Vite :1420 + Rust 后端)
 
 npm run build          # 前端 gate:tsc -b && vite build
 npm test               # vitest 测试
-cd src-tauri; cargo test   # Rust 测试(重型 E2E 用 #[ignore] 标注)
+cd src-tauri; cargo test --workspace   # Rust 测试(重型 E2E 用 #[ignore] 标注)
 
 pwsh -File scripts/release.ps1          # 带门禁的签名安装包构建(见下)
 pwsh -File scripts/verify-install.ps1   # 装机目录 39 项核对

@@ -89,7 +89,7 @@ npm run tauri dev      # 実ウィンドウでフル起動(Vite :1420 + Rust バ
 
 npm run build          # フロントエンドゲート:tsc -b && vite build
 npm test               # vitest スイート
-cd src-tauri; cargo test   # Rust スイート(重い E2E は #[ignore])
+cd src-tauri; cargo test --workspace   # Rust スイート(重い E2E は #[ignore])
 
 pwsh -File scripts/release.ps1          # ゲートつき署名インストーラビルド(下記参照)
 pwsh -File scripts/verify-install.ps1   # インストール済みツリーの 39 項目監査
