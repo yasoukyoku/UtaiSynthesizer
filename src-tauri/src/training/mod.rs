@@ -2100,15 +2100,24 @@ impl TrainingManager {
         // multi-minute import) may only proceed when the frontend states the user actually
         // answered the destructive dialog. An empty leftover directory (a prior start that
         // died after create_dir_all) holds nothing and stays freely wipeable.
-        if req.fresh && workspace.exists() && !req.wipe_confirmed {
-            if slot_holds_work(&workspace) {
-                tracing::error!(
-                    "refusing unconfirmed wipe of {} — the caller sent fresh=true without \
-                     wipe_confirmed; a UI probe most likely failed silently",
-                    workspace.display()
-                );
-                return Err(UtaiError::Training("TRAINING_WIPE_NOT_CONFIRMED".into()));
-            }
+        // ★★§F2⒝ ④e — narrowed to the one branch that still DESTROYS something.
+        //
+        // 「重训」 no longer erases the slot, so demanding wipe consent for it would be a dialog in
+        // front of a door that no longer exists. What survives is 「重训(仅扩散)」: that branch
+        // still deletes `<run>/diffusion/`, and the diffusion progress it removes is exactly the
+        // kind of work this gate was written to protect (hours of it, and the only resume point).
+        //
+        // ⛔ Deleting the gate outright was the tempting edit and it is wrong: `diff_partial_wipe`
+        // is reached with `req.fresh == true`, so the branch that still destroys work is the one
+        // that would have lost its guard.
+        if diff_partial_wipe && !req.wipe_confirmed && diffusion_progress_step(&run).unwrap_or(0) > 0
+        {
+            tracing::error!(
+                "refusing unconfirmed diffusion wipe of {} — the caller sent fresh=true without \
+                 wipe_confirmed; a UI probe most likely failed silently",
+                run.display()
+            );
+            return Err(UtaiError::Training("TRAINING_WIPE_NOT_CONFIRMED".into()));
         }
 
         if req.fresh && workspace.exists() {
@@ -2129,36 +2138,64 @@ impl TrainingManager {
                         UtaiError::Training(format!("DIFF_WIPE_FAILED: {}", e))
                     })?;
                 }
-            } else {
-                // main retrain / diff-only slot (a full wipe here is what unlocks a version
-                // change) / manifest-less anomaly.
-                //
-                // S76: `workspace` is now the FAMILY slot, so the project's shared `dataset/`
-                // is outside it and survives structurally — a retrain clears this
-                // architecture's progress and keeps the data, exactly as 拍板 1 says. Robust
-                // removal because a READONLY attribute (backup/网盘 restores carry them) used
-                // to fail the whole start with WORKSPACE_WIPE_FAILED.
-                crate::util::remove_dir_all_robust(&workspace)
-                    .map_err(|e| UtaiError::Training(format!("WORKSPACE_WIPE_FAILED: {}", e)))?;
-                old_manifest = None;
             }
         }
+        // ★★§F2⒝ ④e — 「重训」 no longer erases anything. It MINTS a new run beside the old ones.
+        //
+        // What used to be here: `remove_dir_all_robust(&workspace)` — the whole slot, checkpoints,
+        // pools and all. That is the behaviour 拍板 replaced with 「新建 run + 旧 run 可管理/删除」.
+        //
+        // ⛔ The fold below is a PRECONDITION, not housekeeping. `tpool::slot_facts` refuses a slot
+        // that holds two `run_manifest.json` (and one that holds none), which makes the 3→4 pool
+        // identity migration refuse it FOREVER — `migrate_layouts` only runs at boot, so a slot
+        // that grows its second run while still at layout 3 can never be folded again, and its
+        // pools stay on identity v1 for good. Growing that second run is what the next line does.
+        // ⇒ fold first, and refuse the start if the slot cannot be folded. Loudly failing to start
+        // a retrain is recoverable; silently retiring a slot's pool identity is not.
+        //
+        // ⚠ Guarded by `slot_holds_work` so a FIRST training is untouched: an empty slot has no
+        // second run to grow, and `migrate_one_slot` on it would be a no-op with a cost.
+        if mints_fresh_run && slot_holds_work(&workspace) {
+            migrate_one_slot(&data_dir, &project.id, &family)?;
+        }
         std::fs::create_dir_all(&workspace)?;
-        // ★§F2⒝ batch 2 step ③ — RE-RESOLVE, because the wipe above took the run directory with
-        // it. Everything from here on WRITES: the manifest, `run.json`, `stop.flag`, the
-        // checkpoints. The `run` resolved before the guards was deliberately the pre-wipe answer
-        // and is now a path that no longer exists — writing to it fails with a bare io NotFound
-        // AFTER the slot has already been emptied, so the user sees an unreadable error, presses
-        // the button again (which now succeeds, since there is no `runs/` left) and never learns
-        // that the first press is what deleted everything.
+        // ★§F2⒝ batch 2 step ③ — RE-RESOLVE. Everything from here on WRITES: the manifest,
+        // `run.json`, `stop.flag`, the checkpoints. The `run` resolved before the guards is
+        // deliberately the run the guards judged — and on a mint it is the run being left BEHIND,
+        // so writing to it is exactly the failure ④e exists to remove.
+        //
+        // ⚠ The pre-④e reason for re-resolving was different and is now dead: the wipe used to
+        // take the run directory with it, so the pre-wipe `run` pointed at something that no longer
+        // existed. Nothing is deleted any more; what changed is WHICH run a start writes into.
         //
         // `run_dir_for_start` also CREATES the directory: `create_dir_all(&workspace)` above only
         // makes the slot, and python cannot cover for it — `run.json` is written before the sidecar
         // is spawned at all. And python covering for it is exactly the failure mode to avoid: every
         // pipeline opens with `os.makedirs(run_dir)`, so a wrong path there is not an error, it is a
         // brand-new directory with a full training run inside it that nothing ever scans.
-        let run = trun::run_dir_for_start(&workspace, &family)?;
+        let run = trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?;
         let manifest_path = run.join("run_manifest.json");
+        // ★★§F2⒝ ④e — a minted run inherits NOTHING.
+        //
+        // This used to live inside the wipe branch (`old_manifest = None;` right after
+        // `remove_dir_all_robust`), which is why deleting that branch without moving this line is a
+        // silent data bug rather than a compile error. The manifest write below is a MERGE
+        // (read-modify-write, by design — a diff run must not drop the main run's fields), and the
+        // keys that are written CONDITIONALLY would survive the merge into a run that never had
+        // them: `speakers`/`n_speakers`/`speaker_names` are only written for `req.speakers.len() >
+        // 1`, `aug_copies` only for non-diff, `vol_embedding`/`loudnorm` only for sovits,
+        // `diff_k_step_max` only for diff.
+        //
+        // ⛔ The one that costs data: `frozen_speakers_of_run` reads the manifest FIRST and lets it
+        // win over `run.json`, so a single-speaker run minted after a 3-way co-training would
+        // report a frozen speaker set it never had — and its next 续训 would refuse itself with
+        // `RESUME_SPEAKER_COUNT_MISMATCH`. Born unresumable, with nothing red at mint time.
+        // ⚠ `version`/`sample_rate`/`backend` are NOT evidence of this working: they are
+        // overwritten unconditionally a few lines below, so a criterion pinned on them stays green
+        // with this line deleted.
+        if mints_fresh_run {
+            old_manifest = None;
+        }
 
         // resume dead-end guard: a resume whose target步数 is already reached
         // would "complete" instantly without training a step (S37 的续训 config
@@ -2950,7 +2987,17 @@ fn run_worker(
         (&ctx.python, ctx.device_backend.as_str(), ctx.gpu_mask.as_str());
 
     // ---- run config for the sidecar ----
-    let slot_has_main_model = trun::run_dirs(workspace)?.iter().any(has_main_progress);
+    // ★★§F2⒝ ④e — RUN-level, and it used to be slot-level (`run_dirs(..).any(..)`).
+    //
+    // python's two gates (the multi-speaker refusal and the encoder-agreement check) hang off
+    // THIS run's `config.json`, so the question they need answered is 「本该有东西可查吗」 —
+    // a question about this run, not about the slot. While a slot held exactly one run the two
+    // readings were byte-identical; once ④e mints a second one they diverge, and the slot-level
+    // answer turns a legitimate diff-first run in a slot that HAS a main model elsewhere into a
+    // hard `DIFF_MAIN_CONFIG_MISSING`.
+    // ⛔ Renamed rather than silently re-pointed: `slot_has_main_model` would have become a
+    // name that lies, and the python side reads it by name.
+    let run_has_main_model = has_main_progress(run);
     let mut run_config = serde_json::json!({
         "backend": req.backend,
         "workspace": workspace,
@@ -2968,10 +3015,9 @@ fn run_worker(
         // (diff-first, which is a supported shape) and「this run was pointed at the wrong place」
         // are the same observation, and a wiring slip would disguise itself as diff-first with both
         // gates silently disabled and not one log line.
-        // ⛔★S132 §F2⒝ ④e — an unreadable `runs/` refuses the start instead of answering `false`.
-        // `false` here is precisely 「there is genuinely no main model」, i.e. it turns BOTH of the
-        // diffusion chain's gates off — the failure this key was added to make impossible.
-        "slot_has_main_model": slot_has_main_model,
+        // ⛔ `false` here is precisely 「there is genuinely no main model」, i.e. it turns BOTH of
+        // the diffusion chain's gates off — the failure this key was added to make impossible.
+        "run_has_main_model": run_has_main_model,
         "dataset_dir": dataset_dir,
         "model_slug": slug,
         "model_name": req.model_name,
@@ -4539,7 +4585,12 @@ mod tests {
             "let slug = effective_artifact_slug(&run, &req, ",
             "mints_fresh_run);"
         ));
-        let wipe = at("remove_dir_all_robust(&workspace)");
+        // ★★§F2⒝ ④e RE-ANCHORED — the wipe this used to point at is gone; the mint took its place
+        // as「产物从这里开始换地方」. The property is unchanged: the slug must be ADOPTED from the
+        // run the request names, and that read has to happen before the start starts addressing a
+        // different directory.
+        let mint_site =
+            at("trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?");
         assert!(
             partial < mints && mints < slug,
             "the binding that answers「这次启动会不会毁掉本 run 的产物」 no longer sits between the \
@@ -4552,9 +4603,11 @@ mod tests {
              this start destroys anything — that is the exact shape of the ④b regression"
         );
         assert!(
-            slug < wipe,
-            "the slug is adopted AFTER the wipe, which has already deleted the run.json it reads \
-             — every 续训 would then silently mint a fresh identity"
+            slug < mint_site,
+            "the slug is adopted AFTER the mint, so it reads the `run.json` of a directory that was \
+             created EMPTY one line earlier — every 「再训一个」 would mint a fresh identity even \
+             for a run the user never renamed. (Before ④e the same assertion said 「after the \
+             wipe」, and the file it read had been deleted rather than not-yet-written.)"
         );
     }
 
@@ -5303,30 +5356,61 @@ mod tests {
     fn a_start_re_resolves_its_run_after_the_wipe() {
         let code = production_code();
         let at = |needle: &str| at_in(&code, needle);
-        let wipe = at("remove_dir_all_robust(&workspace)");
+        // ★★§F2⒝ ④e RE-ANCHORED. The old anchor was `remove_dir_all_robust(&workspace)` and the
+        // flip deleted that line — so this ratchet panicked, loudly and with the right attribution
+        // (S131/S132 笔 0 are what make that true; before them `find` would have latched onto this
+        // test module's own copy of the literal and the order assertion would have gone green).
+        //
+        // ⛔ Re-anchoring must preserve the PROPERTY, not just restore green. What the wipe used to
+        // stand for was 「the point of no return」: everything above it judged the pre-wipe state,
+        // everything below it wrote. The mint is that point now — `run_dir_for_start` with
+        // `mints_fresh_run` picks a DIFFERENT directory, and from there on every write lands in the
+        // new run while every guard above was asked about the old one.
+        let fold = at("migrate_one_slot(&data_dir, &project.id, &family)?;");
         let recreate = at("std::fs::create_dir_all(&workspace)?;");
-        let resolve = at("trun::run_dir_for_start(&workspace, &family)?");
+        let resolve = at("trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?");
         let manifest_write = at("std::fs::write(&manifest_path, serde_json::to_vec_pretty");
-        assert!(wipe < recreate, "the slot is re-created after the wipe, not before");
+        assert!(
+            fold < resolve,
+            "the on-demand layout fold runs AFTER the mint — a slot that grows its second run \
+             while still below layout 4 can never be folded again (`tpool::slot_facts` refuses two \
+             run manifests, and `migrate_layouts` only runs at boot), so its pools are stranded on \
+             identity v1 for good"
+        );
         assert!(
             recreate < resolve,
-            "the run is resolved BEFORE the slot is re-created — it would name a directory that \
-             the wipe removed and nothing has put back"
+            "the run is resolved BEFORE the slot directory is ensured — on a first training the \
+             slot root IS the answer, and it has to exist by then"
         );
         assert!(
             resolve < manifest_write,
-            "`run_manifest.json` is written before the post-wipe run is resolved"
+            "`run_manifest.json` is written before the run that a START writes into is resolved — \
+             on a mint that puts the new run's manifest inside the OLD run"
         );
-        // …and the PRE-wipe resolution has to stay where it is: the guards judge the pre-wipe state
-        // ⚠ step ④ re-anchored this: the guards' run is now the one the REQUEST names, so the
-        // needle is the resolver call, not the literal `None` it used to pass. The anchor was
+        // …and the PRE-mint resolution has to stay where it is: the guards judge the state of the
+        // run the request names, which on a 「再训一个」 is the one being left behind.
+        // ⚠ step ④ re-anchored this once already: the guards' run is the one the REQUEST names, so
+        // the needle is the resolver call, not the literal `None` it used to pass. The anchor was
         // deliberately NOT loosened to just `resolve_run_dir` — that substring also matches the two
         // calls inside the dataset pre-check above, and this assertion is about THIS one.
         let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, req_run)?;");
         assert!(
-            guard_resolve < wipe,
-            "the guards' run is resolved after the wipe — they exist to judge what the wipe would \
-             destroy, and post-wipe they would all answer「什么都没有」"
+            guard_resolve < resolve,
+            "the guards' run is resolved after the mint — they exist to judge the run the request \
+             names, and post-mint they would all be asked about a directory that was created \
+             empty one line earlier (every progress probe would answer「什么都没有」)"
+        );
+        // ★§F2⒝ ④e — and the inheritance reset sits between the mint and the merge-write.
+        // ⛔ It used to live INSIDE the deleted wipe branch, which is why its absence is a silent
+        // data bug rather than a compile error: the merge below would carry another run's
+        // conditionally-written keys (`speakers`/`n_speakers`/`speaker_names`, `aug_copies`,
+        // `loudnorm`, `diff_k_step_max`) into a run that never had them.
+        let reset = at("if mints_fresh_run {\n            old_manifest = None;");
+        assert!(
+            resolve < reset && reset < manifest_write,
+            "the minted run's manifest is no longer reset between the mint and the merge-write — \
+             a run minted after a co-training would report a frozen speaker set it never had and \
+             refuse its own next 续训 with RESUME_SPEAKER_COUNT_MISMATCH"
         );
     }
 

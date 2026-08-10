@@ -343,6 +343,68 @@ pub fn run_id_for(seed: &str) -> String {
     s
 }
 
+/// Create `<slot>/runs/<id>/` for a run that does not exist yet.
+///
+/// ⛔ Split out of [`run_dir_for_start`] so that its two refusals can be DRIVEN. Both are error
+/// branches on a path whose id is derived from the clock, so inside the caller they were
+/// unreachable from any test — and 「a branch that has never executed is an empty criterion」
+/// (S129). Here a test hands the id in.
+///
+/// * **`RUN_ID_COLLISION`** — ⛔ NOT `create_dir_all`'s idempotence. Landing on an existing run
+///   makes everything below it write into that run: `run_manifest.json` (`try_start`) and
+///   `run.json` (`run_worker`) are both written BEFORE python is spawned, so by the time
+///   `ckpt_guard.refuse_to_resume_into_a_fresh_run` says no, the victim's frozen identity
+///   (`model_slug`, `model_name`) and its recorded version/sample_rate have already been replaced.
+///   Its `weights/<oldslug>*` and `audition/<oldslug>_*` are orphans, and the error the user is
+///   shown talks about something else entirely.
+/// * **`RUN_ID_INVALID`** — [`run_id_is_usable`] is what [`list_runs`] filters on, so an id that
+///   fails it would be written to disk and then be invisible to every per-run reader (gigabytes
+///   that no scan, no cleanup and no archive view can reach).
+fn mint_run_dir(slot: &Path, id: &str) -> Result<RunDir> {
+    if !run_id_is_usable(id) {
+        return Err(UtaiError::Training(format!("RUN_ID_INVALID: {id}")));
+    }
+    let dir = runs_root(slot).join(id);
+    if dir.exists() {
+        return Err(UtaiError::Training(format!("RUN_ID_COLLISION: {}", dir.display())));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| UtaiError::Training(format!("RUN_CREATE_FAILED: {e}")))?;
+    Ok(RunDir(dir))
+}
+
+/// The id a NEWLY MINTED run gets — §F2⒝ ④e's 「再训一个」.
+///
+/// ⛔ A different seed namespace from [`legacy_run_id`], and that is the whole point: the legacy id
+/// is a pure function of the FAMILY, so a second run minted from it would land on the existing
+/// directory and `create_dir_all` would hand it back **silently** — 「再训一个」 would then be a
+/// resume that overwrites, which is exactly the failure ④e exists to remove.
+///
+/// ⚠ Still `r` + 12 lowercase hex (it goes through [`run_id_for`]), and that is load-bearing rather
+/// than tidy: the vendored `latest_checkpoint_path` sorts by `int("".join(filter(str.isdigit, …)))`,
+/// `TrainingPage.tsx` recovers a release snapshot's epoch with `/_e(\d+)_s\d+\./` over the whole
+/// project-relative path, and the export ledger keys on the `<family>/runs/<id>/` prefix. Keeping
+/// the SHAPE constant means none of those three had to be re-examined.
+///
+/// ⚠ Not sortable, deliberately: sha256 destroys the ordering of its seed. 「最新的 run」 is
+/// answered by a recorded creation time, not by the id — a fact rather than an artefact of hashing.
+pub fn minted_run_id(family: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    // nanos + pid + a process-local counter. The counter is what makes two mints inside the same
+    // nanosecond distinct; the caller still asserts the directory does not exist, because a seed
+    // that is merely *unlikely* to repeat is not the same thing as a guarantee.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    run_id_for(&format!(
+        "mint/{family}/{nanos}/{}/{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// The id the layout migration gives a slot's single pre-existing run.
 ///
 /// Deterministic on purpose: the crash-point leg of the migration verification kills the process
@@ -636,9 +698,35 @@ pub fn run_dirs(slot: &Path) -> Result<Vec<RunDir>> {
 ///   rather than writing beside it. This is what keeps "layout ≥ 3 ⟹ products under `runs/`" true
 ///   for a slot that had nothing to move at migration time, and for one whose runs were all
 ///   deleted;
-/// * **several runs** — refuse. The batch that mints a second run hands this an id.
-pub fn run_dir_for_start(slot: &Path, family: &str) -> Result<RunDir> {
+/// * **several runs** — answer the one the request names; refuse if it named none.
+///
+/// ## ★★§F2⒝ ④e — `mint`
+///
+/// `mint` is `try_start`'s `mints_fresh_run` (= `req.fresh && !diff_partial_wipe`), i.e. 「这次启动
+/// 会毁掉本 run 的产物吗」. It used to be answered by deleting the whole slot; now it is answered
+/// by writing somewhere else.
+///
+/// ⛔ **`mint` IGNORES `requested`, on purpose.** The frontend's 「再训一个」 sends the id of the
+/// run the user pressed it on — correctly, because every guard above this point has to judge THAT
+/// run's pre-start state. Honouring it here as well is precisely how 「再训一个」 would become
+/// 「resume into the old run and overwrite it」: the guards would pass (they were asked about the
+/// right run) and the training would land on top of it, with `run_is_fresh: true` in `run.json` and
+/// nothing to notice it — the whole failure S126's critic wrote up in five links.
+///
+/// ⛔ Minting does NOT happen for a slot that holds nothing yet: a first training keeps today's
+/// answer (the slot root at layout ≤ 2, a first `runs/<id>/` above it), byte for byte. The caller
+/// is what decides — see `training::try_start`, which also runs the on-demand fold before the mint
+/// so that a slot can never grow its SECOND run while still below layout 4.
+pub fn run_dir_for_start(
+    slot: &Path,
+    family: &str,
+    requested: Option<&str>,
+    mint: bool,
+) -> Result<RunDir> {
     let runs = list_runs(slot)?;
+    if mint && !runs.is_empty() {
+        return mint_run_dir(slot, &minted_run_id(family));
+    }
     match runs.len() {
         1 => Ok(RunDir(runs.into_iter().next().unwrap().dir)),
         0 => {
@@ -652,11 +740,17 @@ pub fn run_dir_for_start(slot: &Path, family: &str) -> Result<RunDir> {
                 .map_err(|e| UtaiError::Training(format!("RUN_CREATE_FAILED: {e}")))?;
             Ok(RunDir(dir))
         }
-        _ => Err(UtaiError::Training(format!(
-            "RUN_AMBIGUOUS: {} runs in {}",
-            runs.len(),
-            slot.display()
-        ))),
+        // ★§F2⒝ ④e — several runs is a normal shape now, so the resolver answers the one the
+        // request named rather than refusing outright. `None` still refuses: picking between runs
+        // is a decision the caller has to have made.
+        _ => match requested {
+            Some(id) => resolve_run_dir(slot, Some(id)),
+            None => Err(UtaiError::Training(format!(
+                "RUN_AMBIGUOUS: {} runs in {}",
+                runs.len(),
+                slot.display()
+            ))),
+        },
     }
 }
 
@@ -1013,6 +1107,104 @@ mod tests {
         v
     }
 
+    /// ★★★S132 §F2⒝ ④e —— **flip 本身**:「再训一个」头一次真的写到别处去。
+    ///
+    /// ## 这条判据的要害是「无视 requested」
+    ///
+    /// 前端的「再训一个」送的是**用户按下它的那一行 run 的 id**,而且那是**对的** ——
+    /// 上面每一道闸都必须判**那个** run 的启动前状态。危险的是在这里**也**尊重它:
+    /// 闸会全部通过(它们问的是对的 run),训练会落在它上面,`run.json` 里还写着
+    /// `run_is_fresh: true` —— 这正是 S126 批评员用五个环节写下来的那条静默覆盖。
+    ///
+    /// ⚠ 判据必须是**字节级**的:「调用成功 + 目录存在」在那个失败里**也成立**。
+    #[test]
+    fn a_mint_writes_somewhere_new_even_when_the_request_names_an_existing_run() {
+        let data = tmp_data("mint");
+        let slot = project_dir(&data, "p_33333333").join("sovits");
+        let old = legacy_run_id("sovits");
+        touch(&runs_root(&slot).join(&old).join("G_2333333.pth"));
+        touch(&runs_root(&slot).join(&old).join("run_manifest.json"));
+        let before = shape(&runs_root(&slot).join(&old));
+        assert!(!before.is_empty(), "夹具前提:旧 run 里确实有东西");
+
+        // ⑴ 续训:指名旧 run ⇒ 就是它
+        let resumed = run_dir_for_start(&slot, "sovits", Some(&old), false).unwrap();
+        assert_eq!(resumed.path(), runs_root(&slot).join(&old));
+
+        // ⑵ 铸新 + **指名同一个旧 run** ⇒ 必须落在别处
+        let minted = run_dir_for_start(&slot, "sovits", Some(&old), true).unwrap();
+        assert_ne!(
+            minted.path(),
+            runs_root(&slot).join(&old),
+            "「再训一个」落在了它要保留的那个 run 上 —— 训练会从旧步号接着练并覆盖它,\
+             而每一道闸都会通过(它们问的正是这个 run)"
+        );
+        assert!(minted.path().is_dir(), "铸出来的目录必须真的在盘上(python 不会替它建)");
+        assert_eq!(
+            std::fs::read_dir(minted.path()).unwrap().count(),
+            0,
+            "新铸的 run 必须是空的 —— `ckpt_guard.refuse_to_resume_into_a_fresh_run` 之外,\
+             Rust 这一侧也不许把别人的产物交给一个自称新铸的 run"
+        );
+        // ⑶ 旧 run 逐字节不变(「调用成功 + 目录存在」在覆盖那个失败里也成立)
+        assert_eq!(shape(&runs_root(&slot).join(&old)), before, "旧 run 被动过了");
+        // ⑷ 两个 run 都在,而且不指名时**不许**替用户挑
+        assert_eq!(list_runs(&slot).unwrap().len(), 2);
+        assert!(resolve_run_dir(&slot, None).unwrap_err().to_string().contains("RUN_AMBIGUOUS"));
+        // …但**指名**的续训在多 run 槽上照常工作(否则铸出第二个 run 就等于废掉这个槽)
+        assert_eq!(
+            run_dir_for_start(&slot, "sovits", Some(&old), false).unwrap().path(),
+            runs_root(&slot).join(&old)
+        );
+
+        // ⑸ 再铸一个 ⇒ 又一个新目录(id 不是 family 的纯函数了)
+        let third = run_dir_for_start(&slot, "sovits", None, true).unwrap();
+        assert_ne!(third.path(), minted.path());
+        assert_eq!(list_runs(&slot).unwrap().len(), 3);
+
+        // ⑹ 空槽的第一次训练**不铸**:layout ≤ 2 时槽根就是那个 run —— 今天的行为,逐字节不变
+        let fresh_slot = project_dir(&data, "p_44444444").join("rvc");
+        std::fs::create_dir_all(&fresh_slot).unwrap();
+        assert_eq!(
+            run_dir_for_start(&fresh_slot, "rvc", None, true).unwrap().path(),
+            fresh_slot,
+            "一个还什么都没有的槽没有「第二个 run」要长,铸新会白白把产物挪进 runs/ 一层"
+        );
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔ 撞上一个已经存在的 run 目录必须**响亮拒绝**,不许靠 `create_dir_all` 的幂等交回去。
+    ///
+    /// 因为那之后的每一次写都会落进受害者:`run_manifest.json`(try_start)与 `run.json`
+    /// (run_worker)都在**拉起 python 之前**写完,所以等
+    /// `ckpt_guard.refuse_to_resume_into_a_fresh_run` 说不行的时候,受害 run 的冻结身份
+    /// (`model_slug`/`model_name`)与它记录的 version/sample_rate 已经被换掉了 ——
+    /// 它的 `weights/<旧slug>*` 与 `audition/<旧slug>_*` 当场变孤儿,而用户看到的错误在说别的事。
+    #[test]
+    fn a_mint_that_would_land_on_an_existing_run_refuses() {
+        let data = tmp_data("collide");
+        let slot = project_dir(&data, "p_55555555").join("sovits");
+        touch(&runs_root(&slot).join(legacy_run_id("sovits")).join("G_1.pth"));
+        // ⚠ `minted_run_id` 从时钟派生,所以在 `run_dir_for_start` 内部这条分支**任何测试都够不着**
+        //    ——「一条从没被执行过的错误分支就是一条空判据」。⇒ 铸造点被抽了出来,id 由这里递给它。
+        let taken = legacy_run_id("sovits"); // 已经有一个 run 在这个 id 上
+        let e = mint_run_dir(&slot, &taken).unwrap_err().to_string();
+        assert!(e.contains("RUN_ID_COLLISION"), "{e}");
+        assert!(
+            runs_root(&slot).join(&taken).join("G_1.pth").is_file(),
+            "受害 run 的产物必须一个字节都没被动"
+        );
+        // 另一条同样够不着的:铸出一个 `list_runs` 会滤掉的 id ⇒ 盘上有几个 GB 而每个 run 级读者都看不见
+        let e2 = mint_run_dir(&slot, "diffusion").unwrap_err().to_string();
+        assert!(e2.contains("RUN_ID_INVALID"), "{e2}");
+        assert!(!runs_root(&slot).join("diffusion").exists(), "拒绝之后不许留下目录");
+        // …而正常的 id 照常建
+        assert!(mint_run_dir(&slot, "rabcdef012345").unwrap().path().is_dir());
+        // 两次铸出来的 id 必须不同,否则「再训一个」会自己撞自己
+        assert_ne!(minted_run_id("sovits"), minted_run_id("sovits"));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     /// ★★S132 §F2⒝ ④e — 「this slot has no `runs/`」 and 「its `runs/` could not be READ」 are
     /// two different answers, and they used to be the same `let Ok(rd) = … else { return out }`.
     ///
@@ -1053,7 +1245,7 @@ mod tests {
         );
         // and the two resolvers a START goes through refuse rather than answering the slot root
         assert!(resolve_run_dir(&slot, None).unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"));
-        assert!(run_dir_for_start(&slot, "rvc").unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"));
+        assert!(run_dir_for_start(&slot, "rvc", None, false).unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"));
     }
 
     /// ⛔ REACHABLE TODAY, and it takes down more than the slot it is in.
@@ -1461,7 +1653,7 @@ mod tests {
         std::fs::create_dir_all(&slot).unwrap();
 
         // layout ≤ 2 — the slot root IS the run, and it must NOT mint a container
-        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        let r = run_dir_for_start(&slot, "rvc", None, false).unwrap();
         assert_eq!(r.path(), slot);
         assert!(!runs_root(&slot).exists(), "an unmigrated slot must stay unmigrated");
 
@@ -1470,19 +1662,19 @@ mod tests {
         // Answering with the slot root here is readable TODAY and goes silently wrong the moment a
         // second run appears beside it — the products at the root leave `run_dirs`' view entirely.
         std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
-        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        let r = run_dir_for_start(&slot, "rvc", None, false).unwrap();
         assert_eq!(r.path(), runs_root(&slot).join(legacy_run_id("rvc")));
         assert!(r.is_dir(), "it must CREATE it — run.json is written before python is spawned");
         assert_eq!(run_dirs(&slot).unwrap(), vec![r.clone()], "and the plural reader must see it");
 
         // one run: the same answer, idempotently
-        assert_eq!(run_dir_for_start(&slot, "rvc").unwrap(), r);
+        assert_eq!(run_dir_for_start(&slot, "rvc", None, false).unwrap(), r);
 
         // ★ the wipe: `remove_dir_all(slot)` + `create_dir_all(slot)`, exactly as try_start does.
         // `slot.json` goes with it, so the slot is honestly back at layout 0.
         std::fs::remove_dir_all(&slot).unwrap();
         std::fs::create_dir_all(&slot).unwrap();
-        let r = run_dir_for_start(&slot, "rvc").unwrap();
+        let r = run_dir_for_start(&slot, "rvc", None, false).unwrap();
         assert_eq!(r.path(), slot, "a wiped slot is a fresh slot");
         // …and the write that used to fail now lands
         std::fs::write(r.join("run_manifest.json"), b"{}").unwrap();
@@ -1490,7 +1682,7 @@ mod tests {
         // several runs: refuse rather than pick. The batch that mints a second one passes an id.
         touch(&runs_root(&slot).join("ra11111111111").join("G_1.pth"));
         touch(&runs_root(&slot).join("rb22222222222").join("G_2.pth"));
-        let e = run_dir_for_start(&slot, "rvc").unwrap_err().to_string();
+        let e = run_dir_for_start(&slot, "rvc", None, false).unwrap_err().to_string();
         assert!(e.contains("RUN_AMBIGUOUS"), "{e}");
 
         let _ = std::fs::remove_dir_all(data);

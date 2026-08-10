@@ -83,6 +83,8 @@ pub async fn start_training(
     let audition_dir = crate::training::trun::resolve_run_dir(&slot, run_id_of(&request))
         .map_err(|e| e.to_string())?
         .join("audition");
+    // read before `request` is moved into `start`; see the cleanup below for why it is `fresh`
+    let request_was_fresh = request.fresh;
     // BEFORE manager.start(): drop every audition session (file locks) so the
     // fresh-wipe path inside try_start cannot trip over them. Non-destructive —
     // an evicted session reloads on miss.
@@ -97,7 +99,21 @@ pub async fn start_training(
     // AFTER a successful launch (never on guard-rejected starts, red-team R10 —
     // a rejected start must not cost the user their audition cache): the new
     // run's candidate list supersedes the old one.
-    if audition_dir.exists() {
+    //
+    // ⛔★★§F2⒝ ④e — …but ONLY for a start that trains into this same run. `audition_dir` is
+    // resolved from `request.run_id`, and 「再训一个」 sends the id of the run the user pressed it
+    // on (correctly — every guard in `try_start` has to judge THAT run). Before ④e that run was
+    // about to be erased anyway, so deleting its cache was free. Now the training lands in a
+    // newly minted run and this line would delete the cache of the run ④e exists to KEEP —
+    // and what is in there is a converted .onnx plus the measured vocal range in `model.json`,
+    // which nothing re-measures.
+    //
+    // ⚠ The condition is `!fresh`, not「不是铸新」: the command cannot compute `mints_fresh_run`
+    // (it does not know `diff_partial_wipe`) and re-deriving it here would be a second copy of a
+    // rule that already exists in one place. The two answers differ only for 「重训(仅扩散)」,
+    // where keeping the cache costs a stale candidate list — while getting it wrong the other way
+    // costs work that cannot be recomputed.
+    if !request_was_fresh && audition_dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&audition_dir) {
             tracing::warn!("audition dir cleanup failed (non-fatal): {}", e);
         }

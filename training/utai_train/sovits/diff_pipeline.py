@@ -11,7 +11,7 @@ Run config (JSON, written by the Rust TrainingManager) — required keys:
   backend "sovits_diff", dataset_dir, model_slug, version "4.1|4.0",
   workspace = the family SLOT (`open_pool` resolves `<slot>/pools/<id>/` against it),
   run_dir = THIS run's directory (weights, config, filelists, logs, resume sidecars),
-  slot_has_main_model (bool — see the config.json gates in run()),
+  run_has_main_model (bool — see the config.json gates in run()),
   total_steps, batch_size, save_every_steps (=interval_val),
   interval_force_save (Rust-normalized to a multiple of save_every_steps),
   k_step_max (0 = full diffusion), stop_file,
@@ -105,13 +105,13 @@ def assert_diff_first(cfg, run_dir):
     Extracted from `run()` deliberately: `run()` needs a dataset, torch and a live reporter, so a
     decision left inline there is one no probe can reach. `gate_pool_table` drives this.
     """
-    if "slot_has_main_model" not in cfg:
+    if "run_has_main_model" not in cfg:
         raise RuntimeError(
             "DIFF_MAIN_MODEL_UNKNOWN: the run config does not say whether this slot holds a main "
             "model, so 'no config.json here' cannot be read as 'diff-first'. Rust writes the key; "
             "a hand-built config must set it too."
         )
-    if cfg["slot_has_main_model"]:
+    if cfg["run_has_main_model"]:
         raise RuntimeError(
             "DIFF_MAIN_CONFIG_MISSING: 这个工作区有主模型，但本次扩散训练指向的 run 目录里没有 "
             "config.json (%s)——拒绝按「先练扩散」继续，那会跳过多说话人与编码器一致性检查" % run_dir

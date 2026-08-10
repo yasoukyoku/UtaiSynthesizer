@@ -527,11 +527,11 @@ def main():
     check("an unstated main-model fact is refused",
           verdict({}) == "DIFF_MAIN_MODEL_UNKNOWN", verdict({}))
     check("a slot WITH a main model refuses the placeholder",
-          verdict({"slot_has_main_model": True}) == "DIFF_MAIN_CONFIG_MISSING",
-          verdict({"slot_has_main_model": True}))
+          verdict({"run_has_main_model": True}) == "DIFF_MAIN_CONFIG_MISSING",
+          verdict({"run_has_main_model": True}))
     check("a slot with no main model is genuinely diff-first",
-          verdict({"slot_has_main_model": False}) == "allowed",
-          verdict({"slot_has_main_model": False}))
+          verdict({"run_has_main_model": False}) == "allowed",
+          verdict({"run_has_main_model": False}))
 
     # ── (4) the two derivations of the pool NAME ────────────────────────────────────────────
     print("\n(4) Rust and python name the same pool for the same identity")

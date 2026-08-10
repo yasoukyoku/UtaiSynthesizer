@@ -82,7 +82,7 @@ def build_cfg(backend, workspace):
         # than inferred from a missing `config.json`, which per-run can no longer be told apart
         # from「pointed at the wrong run」. The `sovits` → `sovits_diff` pair in `smoke_aug` reuses
         # one workspace on purpose and re-derives this before the second leg.
-        "slot_has_main_model": bool(glob.glob(os.path.join(workspace, "G_*.pth"))),
+        "run_has_main_model": bool(glob.glob(os.path.join(workspace, "G_*.pth"))),
         "dataset_dir": FIXTURE,
         "model_slug": "gateaug",
         "model_name": "gateaug",

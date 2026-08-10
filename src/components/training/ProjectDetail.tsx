@@ -323,14 +323,42 @@ export function ProjectDetail() {
     });
     if (choice !== "go" && !versions.includes(choice as "4.1" | "4.0")) return;
     const pin = versions.includes(choice as "4.1" | "4.0") ? (choice as "4.1" | "4.0") : undefined;
+    // ★★§F2⒝ ④e —— 「再训一个」铸的是一个**新** run,所以它要一个**新**名字。
+    // ⛔ 不能沿用 `askRunName`:那个在 `run.modelName` 已经有值时**直接返回它、不问** ——
+    //    对「继续训练」是对的,对这里是灾难:名字是产物前缀(`weights/<slug>*`、`audition/<slug>_*`),
+    //    两个 run 同名 ⇒ 同 slug ⇒ 存档页两行同名,而 `plan_cleanup` 的 `installed_stem`
+    //    按 file_stem 判「还装着」,于是会把**另一个** run 的快照也判成 StillInstalled 永久保留。
+    const takenNames = new Set(
+      (slot?.runs ?? []).map((r) => r.modelName?.trim()).filter((n): n is string => !!n),
+    );
+    const newName = await showConfirm({
+      title: t("training.newRunNameTitle"),
+      body: t("training.newRunNameBody"),
+      buttons: [
+        { id: "ok", label: t("training.next"), kind: "primary" },
+        { id: "__cancel", label: t("training.cancel") },
+      ],
+      input: {
+        initial: "",
+        invalid: (v) =>
+          !v.trim()
+            ? t("backend.TRAINING_NAME_EMPTY")
+            : takenNames.has(v.trim())
+              ? t("training.newRunNameTaken")
+              : null,
+      },
+    });
+    if (!newName || newName === "__cancel") return;
     // ★ 再训一个 = 这个架构会被清空,所以续训锁全部解除 —— 换采样率/换版本重练正是这颗按钮
     // 的用途。真正的擦除同意仍然只有一处(运行段那个对话框,后端的 wipe_confirmed 只认它)。
     useTrainingStore.getState().setRetrainIntent(true);
     updateConfig({
       backend: family,
-      modelName: run?.modelName || detail?.name || "",
-      // 今天这条路仍然是「清空这个槽重来」(⑤ 才把它变成新建 run),所以它带的正是被清空的
-      // 那个 run 的 id —— 后端的每一道闸都要判**它**的 pre-wipe 状态。
+      modelName: newName.trim(),
+      // ★§F2⒝ ④e —— 它带的仍然是**用户按下这颗按钮的那一行 run** 的 id,而且必须是:
+      // 后端每一道闸都要判**那个** run 的启动前状态(锁、家族、已有产物)。
+      // ⛔ 而「写到哪里去」**不**由它决定 —— `trun::run_dir_for_start` 在 mint 时无视它并
+      //    铸一个新目录。两者混为一谈正是「再训一个 = 续训并覆盖旧 run」那条静默失败。
       runId: run?.id ?? "",
       ...formFor(family, run, pin),
     });

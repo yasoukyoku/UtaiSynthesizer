@@ -445,6 +445,17 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RUN_NOT_FOUND: { key: "backend.RUN_NOT_FOUND" },
   RUN_ID_INVALID: { key: "backend.RUN_ID_INVALID" },
   RUN_CREATE_FAILED: { key: "backend.RUN_CREATE_FAILED", modal: true },
+  // ★§F2⒝ 批 2 ④e(S132)—— flip 与它的准入。
+  // ⛔ 前四条是「读不动 ≠ 不存在」那一族:它们的**存在**就是本轮修掉的缺陷的另一半 ——
+  //    此前这些情形被静默当成「这个槽没有 run / 这个池没有身份」,于是覆盖进度、误盖版本章。
+  //    既然现在响亮拒绝,用户就必须读得懂,而且要读得懂**为什么拒绝比继续好**。
+  RUNS_DIR_UNREADABLE: { key: "backend.RUNS_DIR_UNREADABLE", modal: true },
+  POOLS_DIR_UNREADABLE: { key: "backend.POOLS_DIR_UNREADABLE", modal: true },
+  POOL_FINGERPRINT_UNREADABLE: { key: "backend.POOL_FINGERPRINT_UNREADABLE", modal: true },
+  POOL_SAMPLE_RATE_UNKNOWN: { key: "backend.POOL_SAMPLE_RATE_UNKNOWN", modal: true },
+  // 「再训一个」自己的两条:槽折不动 / 铸出来的目录名撞了。
+  SLOT_NOT_MIGRATABLE: { key: "backend.SLOT_NOT_MIGRATABLE", modal: true },
+  RUN_ID_COLLISION: { key: "backend.RUN_ID_COLLISION" },
   // ★§F2⒝ 批 2 ④b —— 改名(训练名从此只是标签)。
   RUN_NEVER_NAMED: { key: "backend.RUN_NEVER_NAMED" },
   RUN_RENAME_FAILED: { key: "backend.RUN_RENAME_FAILED", modal: true },
