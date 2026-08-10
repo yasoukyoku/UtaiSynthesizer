@@ -482,10 +482,16 @@ def main():
         cwd=os.path.join(REPO, "src-tauri"), capture_output=True, text=True,
         encoding="utf-8", errors="replace",
     )
-    line = [l for l in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines()
-            if l.startswith("TPOOL_JSON ")]
+    both = (r.stdout or "") + "\n" + (r.stderr or "")
+    line = [l for l in both.splitlines() if l.startswith("TPOOL_JSON ")]
     if not line:
-        check("the Rust side published its constants", False, "rc=%d" % r.returncode)
+        # ⛔ Print what cargo actually said. This branch used to report `rc=101` and nothing else,
+        # and S129 hit it once (the next two runs passed) with NO WAY to tell a compile error from
+        # a failed assertion from a locked `target/`. A gate whose failure cannot be attributed is
+        # a gate that gets shrugged off the second time it fires.
+        tail = "\n".join(l for l in both.splitlines() if l.strip())[-1500:]
+        check("the Rust side published its constants", False,
+              "rc=%d — cargo said:\n%s" % (r.returncode, tail))
     else:
         L = json.loads(line[0][len("TPOOL_JSON "):])
         check("pool_id_for agrees for every probe",
