@@ -999,6 +999,54 @@ pub(crate) fn resume_lock_facts(run: &trun::RunDir) -> Result<ResumeLockFacts> {
     })
 }
 
+/// Drop the audition cache of every checkpoint directly under `going` — call it IMMEDIATELY
+/// before deleting them.
+///
+/// ⛔★S133 §F2⒝ ④e. The cache is keyed by the checkpoint's file STEM
+/// (`commands::audition::audition_dir`), and a hit is decided by `<dir>/model.json` existing and
+/// nothing else — so a checkpoint that is replaced by a DIFFERENT one of the same name (the
+/// diffusion products are fixed-name: `model_best.pt`) keeps serving the old converted graph, the
+/// old rendered wav and the old measured vocal range, with nothing on screen to tell them apart.
+///
+/// ⚠ Per checkpoint, never the whole `audition/` directory: the sibling entries belong to the MAIN
+/// model, which a 「重训(仅扩散)」 does not touch, and they hold the only copy of a measured vocal
+/// range (nothing re-measures it). Extracted as a function because that is what a test can drive —
+/// `try_start` cannot be driven at all.
+///
+/// Returns how many entries were removed. Best-effort by design: a cache that cannot be dropped is
+/// worth a log line, not a refused retrain (the training itself is still correct).
+fn evict_audition_of(run: &trun::RunDir, going: &Path) -> usize {
+    let cache = run.join("audition");
+    if !cache.is_dir() {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(going) else { return 0 };
+    let mut n = 0;
+    for e in rd.flatten() {
+        // Only FILES: a snapshot subdirectory (`resume_best/`, …) is not a candidate anyone can
+        // audition, and its name is not a cache key.
+        if !e.path().is_file() {
+            continue;
+        }
+        let Some(stem) = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let dir = cache.join(&stem);
+        if !dir.is_dir() {
+            continue;
+        }
+        match crate::util::remove_dir_all_robust(&dir) {
+            Ok(()) => n += 1,
+            Err(err) => tracing::warn!(
+                "stale audition cache {} could not be dropped ({err}) — 试听 may replay the \
+                 previous run's render for this checkpoint",
+                dir.display()
+            ),
+        }
+    }
+    n
+}
+
 /// The manifest a resume guard judges against — read from THE RUN, never the slot.
 pub(crate) fn read_run_manifest(run: &trun::RunDir) -> Option<serde_json::Value> {
     std::fs::read_to_string(run.join("run_manifest.json"))
@@ -2164,6 +2212,27 @@ impl TrainingManager {
                 // shared preprocessing caches survive
                 let diff_dir = run.join("diffusion");
                 if diff_dir.exists() {
+                    // ⛔★★S133 §F2⒝ ④e —— 与这些字节一起过期的还有**它们的试听缓存**,而
+                    // S132 的 flip 恰好把清理它的那条路关上了。
+                    //
+                    // 链:`start_training` 的缓存清理被收窄成 `if !request_was_fresh`,而这条臂
+                    // **正是带着 `fresh == true` 进来的**(`diff_partial_wipe = req.fresh && …`)
+                    // 且 `mints_fresh_run` 为假 ⇒ 训练落在**同一个 run** 里。于是那条臂从
+                    // 「每次都清」变成了「永不清」。扩散产物里 `model_best.pt` 是**固定名**,
+                    // 缓存键就是 ckpt 的 stem,而命中判据只看 `<dir>/model.json` 在不在 ⇒
+                    // 重训完点「试听」,放的是**上一次**扩散 run 的转换图与音频,界面上没有任何区别。
+                    //
+                    // ⚠ 不能在命令层整棵删 `<run>/audition/`:主模型那几行的转换 .onnx 与
+                    // **实测音域**(`model.json`,没有任何东西会重测)也在里面,而主模型这一次
+                    // 根本没变。所以清理必须**逐 ckpt**,而唯一知道「哪几个 ckpt 正在消失」的
+                    // 地方就是这里 —— 删除的旁边。
+                    let evicted = evict_audition_of(&run, &diff_dir);
+                    if evicted > 0 {
+                        tracing::info!(
+                            "diffusion retrain: dropped {evicted} stale audition cache entr(ies) in {}",
+                            run.display()
+                        );
+                    }
                     // ★S118 §F8-res⒌ — `remove_dir_all_robust`, like the full-wipe branch below.
                     // This one used plain `remove_dir_all`, and the difference is not cosmetic: a
                     // READONLY attribute (backup / 网盘 restores carry them) fails the delete
@@ -4537,6 +4606,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// ⛔★★S133 §F2⒝ ④e —— 「重训(仅扩散)」之后,试听不许再放上一次那个模型。
+    ///
+    /// S132 的 flip 把 `start_training` 的缓存清理收窄成 `if !request_was_fresh`,而
+    /// `diff_partial_wipe` 那条臂**正是带着 `fresh == true` 进来的**且不铸新 run ⇒ 那条臂从
+    /// 「每次都清」变成「永不清」。扩散产物是**固定名**(`model_best.pt`),缓存键就是 stem,
+    /// 命中只看 `model.json` 在不在 ⇒ 重训完点试听,放的是上一次的转换图与音频。
+    ///
+    /// ⚠ 一半的判据在「删掉了什么」,另一半在「**没有**删掉什么」:主模型那几行的转换 .onnx 与
+    /// **实测音域**也住在同一个 `audition/` 下,而这一次主模型根本没变、音域没有任何东西会重测。
+    /// 只断言前一半的话,「整棵删掉 audition/」这种实现也会绿。
+    #[test]
+    fn a_diffusion_retrain_drops_exactly_the_stale_audition_entries() {
+        let data = tmp_ws("evictaud");
+        let run = trun::RunDir::for_test(data.join("run"));
+        let diff = run.join("diffusion");
+        let cache = run.join("audition");
+        std::fs::create_dir_all(&diff).unwrap();
+        // 扩散产物:两个 ckpt + 一个快照子目录(它不是任何人能试听的候选)
+        for f in ["model_best.pt", "model_2000.pt"] {
+            std::fs::write(diff.join(f), b"w").unwrap();
+        }
+        std::fs::create_dir_all(diff.join("resume_best")).unwrap();
+        std::fs::write(diff.join("resume_best").join("state.json"), b"{}").unwrap();
+        // 缓存:两条扩散的 + 一条**主模型**的(带实测音域)
+        for stem in ["model_best", "model_2000", "myvoice_deadbeef_e1_s100"] {
+            std::fs::create_dir_all(cache.join(stem)).unwrap();
+            std::fs::write(cache.join(stem).join("model.json"), b"{\"low\":48,\"high\":72}").unwrap();
+        }
+        // 一条扩散侧没有对应缓存的 ckpt —— 不许计进返回值
+        std::fs::write(diff.join("model_4000.pt"), b"w").unwrap();
+
+        assert_eq!(evict_audition_of(&run, &diff), 2, "只有真的存在的那两条算数");
+        assert!(!cache.join("model_best").exists(), "固定名的那条正是必须消失的");
+        assert!(!cache.join("model_2000").exists());
+        assert!(
+            cache.join("resume_best").symlink_metadata().is_err(),
+            "快照子目录本来就不该有缓存,更不该被当成 key 造出来"
+        );
+        // ★ 另一半:主模型那条**必须原样在**,内容一字节不动
+        assert_eq!(
+            std::fs::read_to_string(cache.join("myvoice_deadbeef_e1_s100").join("model.json")).unwrap(),
+            "{\"low\":48,\"high\":72}",
+            "主模型这一次根本没变,而实测音域没有任何东西会重测"
+        );
+
+        // 阴性对照:没有 audition/ 的 run ⇒ 0,不 panic
+        let bare = trun::RunDir::for_test(data.join("bare"));
+        std::fs::create_dir_all(bare.join("diffusion")).unwrap();
+        assert_eq!(evict_audition_of(&bare, &bare.join("diffusion")), 0);
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     /// ★§F2⒝ 批 2 ④b —— **训练名从此只是标签:改变它永远不搬动任何字节。**
     ///
     /// ⚠ The test above looks like it already covers this and does NOT: `effective_speaker_slugs`
@@ -5516,6 +5638,25 @@ mod tests {
             "the minted run's manifest is no longer reset between the mint and the merge-write — \
              a run minted after a co-training would report a frozen speaker set it never had and \
              refuse its own next 续训 with RESUME_SPEAKER_COUNT_MISMATCH"
+        );
+        // ★★S133 §F2⒝ ④e — 试听缓存的失效必须**先于**那些字节消失。
+        //
+        // ⛔ 顺序是硬的,而反过来会**静默**:`evict_audition_of` 是从 `<run>/diffusion/` 的目录
+        // 列表推出「哪几个 stem 过期了」的。删完再调,那个列表是空的 ⇒ 一条都不清 ⇒ 函数返回 0、
+        // 不报错、日志一行都没有,而试听照旧放上一次那个模型。这正是「什么都没做」的形状,
+        // 单测驱不到(`try_start` 没有任何驱动器),所以它只能落在这里。
+        let evict = at("let evicted = evict_audition_of(&run, &diff_dir);");
+        let diff_wipe = at("crate::util::remove_dir_all_robust(&diff_dir).map_err(|e| {");
+        assert!(
+            evict < diff_wipe,
+            "the stale audition caches are dropped AFTER the diffusion checkpoints they were \
+             derived from — the directory listing is empty by then, so nothing is evicted, \
+             nothing errors, and 「试听」 keeps replaying the previous run's render"
+        );
+        assert!(
+            diff_wipe < resolve,
+            "the diffusion partial wipe happens after the mint — it would then delete the NEW \
+             run's (empty) diffusion dir while the stale one it was aimed at survives"
         );
     }
 

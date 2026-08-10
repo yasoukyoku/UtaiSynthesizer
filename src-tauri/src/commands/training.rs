@@ -110,9 +110,16 @@ pub async fn start_training(
     //
     // ⚠ The condition is `!fresh`, not「不是铸新」: the command cannot compute `mints_fresh_run`
     // (it does not know `diff_partial_wipe`) and re-deriving it here would be a second copy of a
-    // rule that already exists in one place. The two answers differ only for 「重训(仅扩散)」,
-    // where keeping the cache costs a stale candidate list — while getting it wrong the other way
-    // costs work that cannot be recomputed.
+    // rule that already exists in one place. The two answers differ only for 「重训(仅扩散)」.
+    //
+    // ⛔★S133 — that difference was NOT free, and the original wording ("costs a stale candidate
+    // list") under-read it by an order of magnitude: the diffusion products are FIXED-NAME
+    // (`model_best.pt`), the cache key is the checkpoint's stem, and a hit is decided by
+    // `model.json` existing and nothing else ⇒ after a diffusion retrain 「试听」 replayed the
+    // PREVIOUS run's converted graph and wav with nothing on screen to tell them apart.
+    // It is now handled where it belongs — `training::evict_audition_of`, called right next to the
+    // deletion whose staleness it mirrors, per checkpoint rather than per directory (the sibling
+    // entries are the MAIN model's, and they hold the only copy of a measured vocal range).
     if !request_was_fresh && audition_dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&audition_dir) {
             tracing::warn!("audition dir cleanup failed (non-fatal): {}", e);
