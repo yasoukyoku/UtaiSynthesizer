@@ -1190,9 +1190,14 @@ const TOMB_PREFIX: &str = ".del_";
 /// Move `paths` into a fresh tombstone DIRECTORY at the training root and return it.
 ///
 /// Three properties, each paid for by a specific failure:
-/// * **a directory, at the ROOT** — the only reaper is `get_storage_report`'s depth-1 scan,
-///   which skips non-directories and never recurses, so a tombstone FILE or one parked inside
-///   a project would never be reclaimed and would keep counting toward the project's size;
+/// * **a directory, at the ROOT** — BOTH reapers scan the training root at depth 1 and skip
+///   non-directories ([`sweep_tombstones`] at startup, `get_storage_report` when the storage
+///   panel opens), so a tombstone FILE, or one parked inside a project / a slot / `<slot>/runs/`,
+///   would never be reclaimed by anything while still counting toward that slot's size — the
+///   user presses delete, the disk does not shrink, and it never will.
+///   ⚠ This used to say 「the only reaper is `get_storage_report`」 and that was already false;
+///   the two reapers also disagree (only the startup one checks the pid). §F2⒝ ④e — a reader
+///   designing `delete_run` from this paragraph would have got both facts wrong;
 /// * **rename, not delete** — same volume, so it is atomic, and a locked file fails the rename
 ///   instead of leaving a half-erased archive;
 /// * **the whole unit at once** — a GAN pair must vanish together. `_seed_base_checkpoints`
@@ -1211,8 +1216,25 @@ fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Option<Path
     std::fs::create_dir_all(&tomb)
         .map_err(|e| UtaiError::Training(format!("TRAINING_DELETE_FAILED: {e}")))?;
     for (i, p) in paths.iter().enumerate() {
-        if !p.exists() {
-            continue;
+        // ⛔★§F2⒝ ④e —— 「它已经没了」与「我 stat 不动它」此前是同一条 `continue`,而
+        // `Path::exists()` 把**每一种** io 错误都吞成 false。
+        //
+        // 这条的形状是「什么都没做」:调用方在这个循环**之前**就用 `dir_size` 算好了
+        // `freed_bytes`,`deleted` 也是无条件填的,`deferred` 只反映后台那一步 ⇒ 一次权限/占用
+        // 失败会让函数返回 `Ok(DeleteReport { freed_bytes: 20 GB, … })`,前端弹「已释放 20 GB」,
+        // 盘上一个字节没动,日志里一行都没有。`delete_slot` 靠 `slot.is_dir()` 把这条路挤得很窄
+        // (同一种吞法,两次判断多半一致),但 `cleanup_snapshots` 一次传几十条路径、零前置检查,
+        // 而 ④e 的 `delete_run` 报的正是用户按下按钮想释放的那个数字。
+        match std::fs::symlink_metadata(p) {
+            Ok(_) => {}
+            // 真的不在:一次已经完成的删除、或者计划里列了个伴生文件而它本来就没有。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(UtaiError::Training(format!(
+                    "TRAINING_DELETE_FAILED: {}: {e}",
+                    p.display()
+                )))
+            }
         }
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         // prefix with an index: two families can hold identically-named files
@@ -1220,6 +1242,24 @@ fn tombstone(data_dir: &Path, id: &str, paths: &[PathBuf]) -> Result<Option<Path
             .map_err(UtaiError::Training)?;
     }
     Ok(Some(tomb))
+}
+
+/// Does `.del_<id>_<pid>_<ms>` belong to a live SIBLING instance (⇒ leave it alone)?
+///
+/// ⛔★§F2⒝ ④e — split out so BOTH arms can be driven. The 「someone else is mid-delete」 branch
+/// had never been executed by anything, and an error path that has never run is an empty
+/// judgement (S129). `alive` is injected for the same reason: the honest way to test 「a live
+/// sibling」 is to say so, not to hunt for a real second pid.
+///
+/// The pid is the **second-to-last** underscore field, and OUR OWN pid deliberately reads as not
+/// busy: this runs at startup, before this process can have a delete in flight, so a tombstone
+/// carrying our pid is a previous boot that happened to be handed the same number.
+fn tombstone_is_busy(name: &str, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+    let Some(rest) = name.strip_prefix(TOMB_PREFIX) else { return false };
+    rest.rsplit('_')
+        .nth(1)
+        .and_then(|p| p.parse::<u32>().ok())
+        .is_some_and(|pid| pid != me && alive(pid))
 }
 
 /// Reclaim tombstones left by a previous session. Called at startup, next to the layout
@@ -1231,17 +1271,10 @@ pub fn sweep_tombstones(data_dir: &Path) {
     let Ok(rd) = std::fs::read_dir(training_root(data_dir)) else { return };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(TOMB_PREFIX) else { continue };
-        if !e.path().is_dir() {
+        if !name.starts_with(TOMB_PREFIX) || !e.path().is_dir() {
             continue;
         }
-        // `.del_<id>_<pid>_<ms>` — the pid is the second-to-last field.
-        let alive = rest
-            .rsplit('_')
-            .nth(1)
-            .and_then(|p| p.parse::<u32>().ok())
-            .is_some_and(|pid| pid != std::process::id() && crate::crashlog::pid_alive(pid));
-        if alive {
+        if tombstone_is_busy(&name, std::process::id(), crate::crashlog::pid_alive) {
             tracing::info!("tombstone {name} belongs to a live sibling instance — leaving it");
             continue;
         }
@@ -2716,6 +2749,153 @@ mod tests {
         cleanup_snapshots(&data, id, Some("sovits"), &none)
             .expect("still none of sovits' business");
 
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    // ───────────────── §F2⒝ ④e: the tombstone machinery finally gets drivers ─────────────────
+    //
+    // ⛔ Until this batch NOTHING had ever executed `tombstone`'s move loop or `sweep_tombstones`
+    // at all. The only test that reaches `tombstone` is the stale-ledger one above, and it writes
+    // its fixture files on the spot ⇒ `JUST_WRITTEN_MS` keeps every candidate ⇒ `plan.delete` is
+    // empty ⇒ `paths` is empty ⇒ `tombstone` returns at its first line. `delete_run` is about to
+    // become this code's fourth and by far most frequent caller, so it gets judgements FIRST.
+
+    /// The property whose violation is 「the user pressed delete, the disk did not shrink, and it
+    /// never will」: the tombstone has to be a DIRECTORY AT THE TRAINING ROOT, because that is the
+    /// only place either reaper looks (both scan depth 1 there). Parked under the slot it would be
+    /// invisible to `list_runs`, to `plan_slot_runs`, to `sweep_tombstones` and to the storage
+    /// panel — while `dir_size(&slot)` kept charging the user for every byte of it.
+    #[test]
+    fn a_tombstone_is_a_directory_at_the_training_root_and_moves_whole_units() {
+        let data = tmp_root("tomb_root");
+        let id = "tomb_11112222";
+        let p = project_dir(&data, id);
+        // two DIFFERENT paths that share a basename — the index prefix is what keeps them apart
+        let a = p.join("rvc").join("weights");
+        let b = p.join("sovits").join("weights");
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("m.pth"), b"weights").unwrap();
+        }
+        let tomb = tombstone(&data, id, &[a.clone(), b.clone()])
+            .expect("both paths exist and are movable")
+            .expect("a non-empty path list always mints a tombstone");
+
+        assert_eq!(
+            tomb.parent(),
+            Some(training_root(&data).as_path()),
+            "a tombstone anywhere but the training root is reclaimed by NOTHING while still \
+             counting toward the slot's size"
+        );
+        assert!(tomb.is_dir(), "both reapers skip non-directories");
+        assert!(
+            tomb.file_name().unwrap().to_string_lossy().starts_with(TOMB_PREFIX),
+            "neither reaper recognises a tombstone that is not {TOMB_PREFIX}-prefixed"
+        );
+        assert!(!a.exists() && !b.exists(), "the sources must be gone, not copied");
+        // whole unit, and the two same-named entries did not collide
+        assert_eq!(
+            std::fs::read_to_string(tomb.join("0000_weights").join("m.pth")).unwrap(),
+            "weights"
+        );
+        assert!(tomb.join("0001_weights").join("m.pth").is_file());
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔「I cannot stat this path」 must not take the same exit as 「it is already gone」.
+    ///
+    /// The callers compute `freed_bytes` BEFORE the move loop and fill `deleted` unconditionally,
+    /// so a silent skip returns `Ok(DeleteReport { freed_bytes: <the whole run>, … })` with not one
+    /// byte moved and not one line in the log — the purest 「什么都没做」 shape there is, and
+    /// `delete_run` reports exactly the number the user pressed the button for.
+    #[test]
+    fn a_path_that_cannot_be_stated_fails_the_delete_instead_of_reporting_success() {
+        let data = tmp_root("tomb_stat");
+        let id = "tomb_33334444";
+        let p = project_dir(&data, id);
+        std::fs::create_dir_all(&p).unwrap();
+
+        // ⚠ Positive control FIRST: a genuinely absent path is skipped, not an error. Without this
+        // the assertion below would also pass with the whole distinction deleted (everything Err).
+        let tomb = tombstone(&data, id, &[p.join("never_existed")])
+            .expect("a path that is really gone is not a failure")
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&tomb).unwrap().count(), 0);
+
+        // …and a path we cannot stat is.
+        //
+        // ⚠ The realistic cause is an ACL / antivirus / 网盘 / open-handle failure, which a test
+        // cannot produce without changing this machine. `*` is the one non-NotFound stat error
+        // constructible for free — measured on this box (Win 11 26200): `a*b` ⇒ os error 123
+        // `InvalidFilename`, while the tempting 「a file where a directory is expected」 trick gives
+        // os error 3, which maps to NotFound and would have driven the WRONG arm.
+        #[cfg(windows)]
+        {
+            let err = tombstone(&data, id, &[p.join("a*b")])
+                .expect_err("an unreadable path must fail the delete, not be skipped");
+            assert!(err.to_string().contains("TRAINING_DELETE_FAILED"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// Both arms of 「is a live sibling instance mid-delete on this tombstone?」.
+    ///
+    /// The 「leave it alone」 arm had never been executed by anything — and by this repo's rule an
+    /// error path that has never run is an empty judgement. Driving it honestly means SAYING
+    /// 「that pid is alive」 rather than hunting for a real second process.
+    #[test]
+    fn a_tombstones_owner_pid_is_the_second_to_last_field() {
+        let live = |_: u32| true;
+        let dead = |_: u32| false;
+        // ⭐ the id itself contains underscores (every project id does: `led_11112222`), so the pid
+        // can only be found from the RIGHT — parsing from the left picks a fragment of the id.
+        let name = ".del_led_11112222_4321_1700000000000";
+        assert!(tombstone_is_busy(name, 1, live), "4321 is alive and is not us ⇒ leave it");
+        assert!(!tombstone_is_busy(name, 4321, live), "our own pid is never a live SIBLING");
+        assert!(!tombstone_is_busy(name, 1, dead), "a dead owner ⇒ reclaim it");
+        assert!(!tombstone_is_busy(".del_x_notapid_1", 1, live), "unparseable ⇒ reclaim it");
+        assert!(!tombstone_is_busy("some_other_dir", 1, live), "not a tombstone at all");
+    }
+
+    /// End to end: the startup sweep reclaims a tombstone whose owner is gone and touches nothing
+    /// else. `u32::MAX` is used as the owner because it cannot be a live pid on Windows (pids are
+    /// multiples of 4 below the handle-table limit) — the injected-predicate test above is what
+    /// covers the live arm.
+    #[test]
+    fn the_startup_sweep_reclaims_dead_tombstones_and_leaves_everything_else() {
+        let data = tmp_root("tomb_sweep");
+        let root = training_root(&data);
+        let dead = root.join(format!("{TOMB_PREFIX}proj_1111_{}_1700000000000", u32::MAX));
+        std::fs::create_dir_all(dead.join("0000_weights")).unwrap();
+        std::fs::write(dead.join("0000_weights").join("m.pth"), b"x").unwrap();
+        let a_real_project = root.join("proj_22223333");
+        std::fs::create_dir_all(&a_real_project).unwrap();
+        // A FILE carrying the tombstone prefix. ⚠ Asserting only 「it is still there」 would be an
+        // EMPTY judgement: `remove_dir_all_robust` fails on a file anyway, so that assertion is
+        // green with the `is_dir()` guard deleted (measured — mutation N6 survived it). What the
+        // guard actually buys is one level down: the recovery path calls `clear_readonly`, whose
+        // FIRST action is `set_readonly(false)` on the ROOT it was handed (`util.rs:170-179`) ⇒
+        // without the guard the sweep strips the read-only attribute off a file that is not its
+        // business, and burns a 300 ms sleep per stray entry at every startup.
+        let decoy = root.join(format!("{TOMB_PREFIX}not_a_dir"));
+        std::fs::write(&decoy, b"x").unwrap();
+        let mut ro = std::fs::metadata(&decoy).unwrap().permissions();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&decoy, ro).unwrap();
+
+        sweep_tombstones(&data);
+
+        assert!(!dead.exists(), "a tombstone nobody owns is exactly what the sweep is for");
+        assert!(a_real_project.is_dir(), "the sweep must not touch real projects");
+        assert!(decoy.is_file(), "a non-directory is not a tombstone");
+        assert!(
+            std::fs::metadata(&decoy).unwrap().permissions().readonly(),
+            "the sweep reached inside a file it had already decided was not a tombstone"
+        );
+
+        let mut rw = std::fs::metadata(&decoy).unwrap().permissions();
+        rw.set_readonly(false);
+        std::fs::set_permissions(&decoy, rw).unwrap();
         let _ = std::fs::remove_dir_all(data);
     }
 
