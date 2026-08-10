@@ -18,8 +18,13 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+#: ★§F2⒝ ④d — all FIVE chains, not the four this driver started with. `sovits_v2` was the one
+#: missing, and it is the only chain whose own formula appends a conditional tail (`|f0=`) BEFORE
+#: `pool.identity_suffix` — i.e. the only one that can catch the shared suffix being concatenated
+#: in the wrong order. A gate that cannot drive it cannot see that class of bug at all.
 PIPELINES = {
     "sovits": "utai_train.sovits.pipeline",
+    "sovits_v2": "utai_train.sovits_v2.pipeline",
     "sovits_diff": "utai_train.sovits.diff_pipeline",
     "rvc": "utai_train.rvc.pipeline",
     "vocoder": "utai_train.vocoder.pipeline",
