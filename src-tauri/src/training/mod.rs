@@ -5212,13 +5212,32 @@ mod tests {
         blanked[..end].to_string()
     }
 
-    /// Where an anchor sits in [`production_code`] — with the two failures kept APART.
+    /// Where an anchor sits in [`production_code`] — with the three failures kept APART.
     ///
     /// ⛔ 「the anchor moved out of production」and「the anchor never existed」used to be one
     /// panic, and neither of them used to happen at all when the needle also appeared in this test
     /// module. Reporting them separately is the whole point: the first means a production edit
     /// (probably ④e's) needs the ratchet re-anchored ON PURPOSE; the second means a typo.
+    ///
+    /// ⛔★★S132 §F2⒝ ④e 笔 0 — and there is a THIRD, which S131 left open because it comes from
+    /// the other direction: the anchor occurring TWICE **in production**. S131 closed 「the
+    /// searched text contains this test module's own copy」; this one ④e creates itself —
+    /// `delete_run` reaches for the same `remove_dir_all_robust(` the wipe used, and `find` pins
+    /// whichever comes first. The order assertion then compares two lines it was never about and
+    /// **stays green** while the property it holds is dead. That is S131's own second failure mode
+    /// (「a typo in a NEW production anchor … goes GREEN」) with a new source, so it gets the same
+    /// treatment: named, separate, and driven by a `#[should_panic]` below.
     fn at_in(code: &str, needle: &str) -> usize {
+        let hits = code.matches(needle).count();
+        assert!(
+            hits < 2,
+            "the anchor {needle:?} occurs {hits} times in mod.rs's PRODUCTION source. `find` \
+             returns the FIRST, so the order assertion that uses it silently starts comparing a \
+             line it was never about. Give this ratchet a longer needle that names THIS call site \
+             (the way the pre-wipe resolver's anchor spells out its whole argument list); do NOT \
+             keep the ambiguous one and do NOT switch to `rfind` — which of the two is 'the' one \
+             would then depend on edit order."
+        );
         code.find(needle).unwrap_or_else(|| {
             static THIS_RS: &str = include_str!("mod.rs");
             assert!(
@@ -5235,8 +5254,8 @@ mod tests {
 
     /// ★S131 笔 0 —— the two things [`production_part`] / [`at_in`] promise, driven for real.
     ///
-    /// ⛔ Both of `at_in`'s refusals are error branches, and 「a branch that has never executed is
-    /// an empty criterion」 (S129). They are executed by the two `#[should_panic]` tests below;
+    /// ⛔ All THREE of `at_in`'s refusals are error branches, and 「a branch that has never executed
+    /// is an empty criterion」 (S129). They are executed by the `#[should_panic]` tests below;
     /// this one covers the cut itself, on synthetic source, because asserting the property against
     /// mod.rs's real text would be satisfied by a helper that returns the whole file.
     #[test]
@@ -5272,6 +5291,21 @@ mod tests {
     fn an_anchor_that_exists_nowhere_says_so_differently() {
         // assembled from pieces so that THIS line is not itself an occurrence of it
         at_in(&production_code(), concat!("this-anchor-exists-", "in-no-file-at-all"));
+    }
+
+    /// ★S132 ④e 笔 0 — the third refusal, and the one ④e itself is about to trigger.
+    ///
+    /// ⚠ Driven on SYNTHETIC source on purpose. Pointing it at a real duplicated anchor in
+    /// `mod.rs` would make this test's meaning move with production code — and the whole point of
+    /// this refusal is to be the thing that notices when production code moves.
+    #[test]
+    #[should_panic(expected = "occurs 2 times")]
+    fn an_anchor_that_is_not_unique_in_production_is_named_as_such() {
+        let synthetic = format!(
+            "fn a() {{ twice_over(); }}\nfn b() {{ twice_over(); }}\n{}\nmod tests {{}}\n",
+            concat!("#[cfg", "(test)]")
+        );
+        at_in(&production_part(&synthetic), "twice_over()");
     }
 
     fn src_file(dir: &Path, name: &str, bytes: usize) -> String {
