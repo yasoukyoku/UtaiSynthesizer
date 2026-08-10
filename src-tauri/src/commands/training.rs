@@ -625,15 +625,22 @@ fn ensure_safe_dataset_write(state: &AppState) -> Result<(), String> {
 /// (`get_training_project`, and both dataset writers): they must see the SAME view of who the
 /// project's singers are, or a name the UI got from one will not resolve in the other — which
 /// is exactly how「给已有歌手加文件」came out as「新增歌手」and hit the frozen-structure guard.
+///
+/// ⛔ S132 — propagates instead of skipping a slot it could not read: EMPTY is the permissive
+/// answer for every consumer, so an unreadable slot must not be able to look like an unfrozen one.
 fn frozen_lists(
     data_dir: &std::path::Path,
     project_id: &str,
-) -> Vec<Vec<crate::training::dsmanifest::DsSpeaker>> {
-    crate::training::tproject::FAMILIES
-        .iter()
-        .map(|f| crate::training::frozen_speakers(data_dir, project_id, f))
-        .filter(|v| !v.is_empty())
-        .collect()
+) -> Result<Vec<Vec<crate::training::dsmanifest::DsSpeaker>>, String> {
+    let mut out = Vec::new();
+    for f in crate::training::tproject::FAMILIES {
+        let v = crate::training::frozen_speakers(data_dir, project_id, f)
+            .map_err(|e| e.to_string())?;
+        if !v.is_empty() {
+            out.push(v);
+        }
+    }
+    Ok(out)
 }
 
 /// The first architecture slot that has FROZEN a speaker set, if any.
@@ -642,11 +649,19 @@ fn frozen_lists(
 /// are baked into that slot's emb_g rows, and changing either makes it unresumable
 /// (`RESUME_SPEAKER_COUNT_MISMATCH` / `RESUME_SPEAKER_SET_MISMATCH`). Adding or removing FILES
 /// stays allowed — it only costs a re-extraction, which the UI says out loud.
-fn frozen_structure_family(data_dir: &std::path::Path, project_id: &str) -> Option<String> {
-    crate::training::tproject::FAMILIES
-        .iter()
-        .find(|f| !crate::training::frozen_speakers(data_dir, project_id, f).is_empty())
-        .map(|f| f.to_string())
+fn frozen_structure_family(
+    data_dir: &std::path::Path,
+    project_id: &str,
+) -> Result<Option<String>, String> {
+    for f in crate::training::tproject::FAMILIES {
+        if !crate::training::frozen_speakers(data_dir, project_id, f)
+            .map_err(|e| e.to_string())?
+            .is_empty()
+        {
+            return Ok(Some(f.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 /// Everything an EXPORT needs to know about a slot, resolved from disk instead of from a live
@@ -803,7 +818,7 @@ pub async fn import_project_dataset(
     let facts = crate::training::dsmanifest::read_facts(
         &data_dir,
         &project_id,
-        &frozen_lists(&data_dir, &project_id),
+        &frozen_lists(&data_dir, &project_id)?,
     );
     let has_flat = facts.entries.iter().any(|e| !e.rel.contains('/'));
     let name = speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -818,7 +833,7 @@ pub async fn import_project_dataset(
                 None => {
                     // a NEW singer changes the speaker set — refuse while any slot's emb_g rows
                     // depend on it
-                    if let Some(fam) = frozen_structure_family(&data_dir, &project_id) {
+                    if let Some(fam) = frozen_structure_family(&data_dir, &project_id)? {
                         // The family id goes to the LOG, not into the message: the text already
                         // explains what to do, and a bare「(rvc)」tacked onto the end of a
                         // paragraph reads as noise (the error funnel appends any payload
@@ -872,11 +887,11 @@ pub async fn delete_project_dataset_files(
     if rels.is_empty() {
         return Ok(());
     }
-    let frozen = frozen_structure_family(&data_dir, &project_id);
+    let frozen = frozen_structure_family(&data_dir, &project_id)?;
     let facts = crate::training::dsmanifest::read_facts(
         &data_dir,
         &project_id,
-        &frozen_lists(&data_dir, &project_id),
+        &frozen_lists(&data_dir, &project_id)?,
     );
     let plan = crate::training::dsmanifest::plan_delete(&facts, &rels);
     if !plan.emptied_speakers.is_empty() {
@@ -925,7 +940,7 @@ pub async fn get_training_project(
     let facts = crate::training::dsmanifest::read_facts(
         &data_dir,
         &project_id,
-        &frozen_lists(&data_dir, &project_id),
+        &frozen_lists(&data_dir, &project_id)?,
     );
     let entries: Vec<DatasetFileRow> = facts
         .entries
@@ -965,7 +980,10 @@ pub async fn get_training_project(
             // `""` for an unmigrated slot, matching `CkptRecord::run_id` and the `None` that every
             // command takes — one vocabulary for「槽根就是那个 run」across Rust, IPC and the UI.
             let ids: Vec<String> = {
-                let listed = crate::training::trun::list_runs(&slot);
+                // ⛔ S132 — an unreadable `runs/` is NOT「this slot has one unnamed run」: that
+                // would show the user a slot whose real runs are hidden, and every action on the
+                // fabricated row would address the slot root.
+                let listed = crate::training::trun::list_runs(&slot).map_err(|e| e.to_string())?;
                 if listed.is_empty() {
                     vec![String::new()]
                 } else {

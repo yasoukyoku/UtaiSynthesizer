@@ -705,7 +705,23 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
         // was written to end: the other runs' checkpoints would be invisible in the archive view
         // AND unreachable by the cleanup, while still costing the disk. `trun::run_dirs` answers
         // `[slot]` for as long as there is no `runs/` container, so this is byte-identical today.
-        for run in crate::training::trun::run_dirs(&slot) {
+        // ⛔ S132 §F2⒝ ④e — 「there is no `runs/`」and「`runs/` could not be read」are different
+        // answers now (`trun::list_runs`). This inventory cannot express「I could not look」in its
+        // return type, so the honest thing it CAN do is refuse to pretend the slot was scanned:
+        // skipping it loudly keeps the cleanup from treating an unreadable slot as an empty one.
+        let runs = match crate::training::trun::run_dirs(&slot) {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::error!(
+                    "cannot enumerate the runs of {} ({e}) — its checkpoints are missing from this \
+                     inventory; the archive view will not list them and the cleanup will not \
+                     consider them",
+                    slot.display()
+                );
+                continue;
+            }
+        };
+        for run in runs {
             // ── run root: the resumable pairs ─────────────────────────────────────────────
             // `.` entries are never archives — a delete stages files into `.del_*` and the layout
             // migration parks trees in `.mig_*`. Reading them back as checkpoints would put a

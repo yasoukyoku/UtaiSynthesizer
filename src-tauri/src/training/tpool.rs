@@ -850,7 +850,10 @@ fn strip_identity_suffix(fp: &str) -> String {
 /// The run-level facts, or why this slot cannot be decided.
 fn slot_facts(slot: &Path) -> std::result::Result<SlotFacts, String> {
     let mut found: Option<serde_json::Value> = None;
-    for run in super::trun::run_dirs(slot) {
+    // ⛔ S132 — the same distinction S131 笔 2 drew for the manifest FILE, one level up: an
+    // unreadable `runs/` must not read as「this slot has no runs」, which here would silently
+    // become「the slot root is the one run」and stamp every pool from a manifest that is not there.
+    for run in super::trun::run_dirs(slot).map_err(|e| e.to_string())? {
         let p = run.path().join("run_manifest.json");
         // ⛔★§F2⒝ ④e 笔 2 — 「不在」与「读不动」必须分开,而它们此前是同一条 `continue`。
         //
@@ -1061,7 +1064,22 @@ fn repoint_resume_sidecars(slot: &Path, steps: &[PoolStep]) -> usize {
         }
     }
     let mut files = Vec::new();
-    for run in super::trun::run_dirs(slot) {
+    // ⛔ S132 — best-effort is this function's DOCUMENTED posture (its worst case is one spurious
+    // warning), so an unreadable `runs/` still returns 0 rather than rolling a correct migration
+    // back. What changes is that it stops being SILENT: 0 used to mean「没有 sidecar 要改」and
+    // 「我根本没看成」at the same time, and only the second one needs a human.
+    let runs = match super::trun::run_dirs(slot) {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::warn!(
+                "cannot enumerate the runs of {} ({e}) — no resume sidecar was re-pointed, so the \
+                 next 续训 of each run may report a spurious TRAINING_RESUME_DATASET_CHANGED",
+                slot.display()
+            );
+            return 0;
+        }
+    };
+    for run in runs {
         // `<run>/resume_state.json` · `<run>/resume_{best,latest}/state.json` ·
         // `<run>/diffusion/resume_{best,latest}/state.json` — three levels is all of them.
         walk(run.path(), 3, &mut files);
@@ -1106,7 +1124,17 @@ fn backfill_pool_refs(slot: &Path) -> usize {
     // `list_runs`, not `run_dirs`: the latter answers「槽根就是那个 run」for a slot with no `runs/`
     // container, and writing this file at the SLOT root would put a run product one level up —
     // after the migration that would have moved it has already gone by.
-    let run_dirs: Vec<PathBuf> = super::trun::list_runs(slot).into_iter().map(|r| r.dir).collect();
+    // ⛔ S132 — same posture as `repoint_resume_sidecars`: this edge is an ANNOTATION, never an
+    // authority (`trun::pool_of_run`'s doc says a missing one must read as「不回收」), so a slot
+    // whose `runs/` cannot be listed writes nothing and says so, rather than failing the migration.
+    let listed = match super::trun::list_runs(slot) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("cannot enumerate the runs of {} ({e}) — no run↔pool edge was backfilled", slot.display());
+            return 0;
+        }
+    };
+    let run_dirs: Vec<PathBuf> = listed.into_iter().map(|r| r.dir).collect();
     for dir in run_dirs {
         let final_path = dir.join(super::trun::POOL_REF);
         if final_path.exists() {
@@ -1814,7 +1842,7 @@ mod tests {
         let run = slot.join("runs").join("r0123456789ab");
         assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
         assert_eq!(
-            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]),
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot).unwrap()[0]),
             Some("p00000000000a".to_string())
         );
         assert!(!slot.join(super::super::trun::POOL_REF).exists(), "写到槽根去了");
@@ -1840,17 +1868,17 @@ mod tests {
         mk_pool(&two, "p00000000000b", "bbbb|enc=x|loudnorm=0");
         assert_eq!(migrate_slot_identity(&two, "sovits").unwrap(), IdentityOutcome::Committed);
         assert!(
-            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&two)[0]).is_none(),
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&two).unwrap()[0]).is_none(),
             "两个池时不许猜一条边出来"
         );
 
         // 读者对「记了但没答案」必须答 None:python 在**未迁移的槽**上写的正是 `null`,
         // 而一个空串会被当成一个真的池名传给 ④e 的回收。
         std::fs::write(run.join(super::super::trun::POOL_REF), br#"{"pool_id":null}"#).unwrap();
-        assert!(super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]).is_none());
+        assert!(super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot).unwrap()[0]).is_none());
         std::fs::write(run.join(super::super::trun::POOL_REF), br#"{"pool_id":""}"#).unwrap();
         assert!(
-            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]).is_none(),
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot).unwrap()[0]).is_none(),
             "空串被当成了一个真的池名"
         );
 
@@ -1860,7 +1888,7 @@ mod tests {
         write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
         assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
         assert_eq!(
-            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]),
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot).unwrap()[0]),
             Some("pFROMPYTHON".to_string()),
             "回填覆盖了 python 记下的事实"
         );

@@ -1038,7 +1038,7 @@ mod tests {
         for m in &projects {
             let frozen: Vec<Vec<DsSpeaker>> = super::super::tproject::FAMILIES
                 .iter()
-                .map(|f| super::super::frozen_speakers(&data, &m.id, f))
+                .map(|f| super::super::frozen_speakers(&data, &m.id, f).unwrap())
                 .filter(|v| !v.is_empty())
                 .collect();
             let t0 = std::time::Instant::now();

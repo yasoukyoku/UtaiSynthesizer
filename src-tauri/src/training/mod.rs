@@ -766,7 +766,25 @@ pub(crate) fn has_dataset_pool(ws: &Path) -> bool {
 /// ⚠ It was named `workspace_holds_work` while "workspace" meant both the slot and the run. The
 /// name changed with the meaning: three of its arms are per-RUN questions and three are per-SLOT.
 pub(crate) fn slot_holds_work(slot: &Path) -> bool {
-    trun::run_dirs(slot).iter().any(|run| {
+    // ⛔★S132 §F2⒝ ④e — an UNREADABLE `runs/` answers 「yes, there is work」, never 「no」.
+    // This predicate's only two consumers are refusals (`TRAINING_WIPE_NOT_CONFIRMED` and the
+    // sibling-slot `PROJECT_DATASET_IN_USE`), so the safe answer under uncertainty is the one that
+    // REFUSES. `list_runs` used to swallow the error into an empty list, which made an ACL blip
+    // read as「this slot is empty」 — i.e. it removed the last guard in front of an unconfirmed
+    // wipe, silently. The dialog would still have appeared (it hangs off `WorkspaceInfo::exists`),
+    // so nothing on screen would have differed.
+    let runs = match trun::run_dirs(slot) {
+        Ok(runs) => runs,
+        Err(e) => {
+            tracing::error!(
+                "cannot enumerate the runs of {} ({e}) — answering 「holds work」 so every guard \
+                 in front of a destructive action stays closed",
+                slot.display()
+            );
+            return true;
+        }
+    };
+    runs.iter().any(|run| {
         has_main_progress(run)
             // ★S119 §F8⒝ — the resumable BEST snapshot counts as work too, for the same reason the
             // diffusion arm below was widened in S118: it can outlive the numbered grid, and then a
@@ -1051,13 +1069,22 @@ pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
 ///
 /// ⚠ It is NOT the right answer for「这一次 run 从哪些 slug 续训」— that is
 /// [`frozen_speakers_of_run`], asked of the run that is actually resuming.
-pub fn frozen_speakers(data_dir: &Path, project_id: &str, family: &str) -> Vec<dsmanifest::DsSpeaker> {
+/// ⛔★S132 §F2⒝ ④e — returns a Result rather than answering EMPTY when the runs cannot be
+/// enumerated. Empty is the permissive answer here (see the over-strict note above), so swallowing
+/// an unreadable `runs/` into `vec![]` would remove `DATASET_SPEAKERS_FROZEN` exactly when the
+/// filesystem is already misbehaving. There is no honest in-band value for「I could not look」:
+/// a placeholder speaker would show up in the UI's singer list, so the refusal has to travel.
+pub fn frozen_speakers(
+    data_dir: &Path,
+    project_id: &str,
+    family: &str,
+) -> Result<Vec<dsmanifest::DsSpeaker>> {
     let slot = tproject::family_dir(data_dir, project_id, backend_family(family));
-    trun::run_dirs(&slot)
+    Ok(trun::run_dirs(&slot)?
         .into_iter()
         .map(|run| frozen_speakers_of_run(&run))
         .find(|v| !v.is_empty())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// ★S117 §F2⒜ / S118 §F8⒜ — the step of a COMPLETE resume snapshot under `<dir>/<sub>/`, or None.
@@ -2884,6 +2911,7 @@ fn run_worker(
         (&ctx.python, ctx.device_backend.as_str(), ctx.gpu_mask.as_str());
 
     // ---- run config for the sidecar ----
+    let slot_has_main_model = trun::run_dirs(workspace)?.iter().any(has_main_progress);
     let mut run_config = serde_json::json!({
         "backend": req.backend,
         "workspace": workspace,
@@ -2901,7 +2929,10 @@ fn run_worker(
         // (diff-first, which is a supported shape) and「this run was pointed at the wrong place」
         // are the same observation, and a wiring slip would disguise itself as diff-first with both
         // gates silently disabled and not one log line.
-        "slot_has_main_model": trun::run_dirs(&workspace).iter().any(has_main_progress),
+        // ⛔★S132 §F2⒝ ④e — an unreadable `runs/` refuses the start instead of answering `false`.
+        // `false` here is precisely 「there is genuinely no main model」, i.e. it turns BOTH of the
+        // diffusion chain's gates off — the failure this key was added to make impossible.
+        "slot_has_main_model": slot_has_main_model,
         "dataset_dir": dataset_dir,
         "model_slug": slug,
         "model_name": req.model_name,
@@ -4516,6 +4547,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&proj);
     }
 
+    /// ★★S132 §F2⒝ ④e — what the SLOT-level readers answer when the runs cannot be enumerated.
+    ///
+    /// `trun::list_runs` used to swallow that into an empty list, and every reader below turns an
+    /// empty list into its PERMISSIVE answer. Each assertion here names the guard that would have
+    /// been removed, because 「it returns false」 is not the interesting part — 「the refusal in
+    /// front of a destructive action disappears」 is.
+    ///
+    /// ⚠ The pre-assertions are load-bearing: they prove the fixture is otherwise a slot that
+    /// HOLDS work, so a red below cannot be explained by「there was nothing there anyway」.
+    #[test]
+    fn slot_readers_refuse_rather_than_answer_permissively_when_the_runs_cannot_be_listed() {
+        let data = tmp_ws("s132_unlistable");
+        let id = "proj_unlistable";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        std::fs::create_dir_all(trun::runs_root(&slot).join(trun::legacy_run_id("rvc"))).unwrap();
+        std::fs::write(
+            trun::runs_root(&slot).join(trun::legacy_run_id("rvc")).join("G_1.pth"),
+            b"x",
+        )
+        .unwrap();
+        // pre: with a readable container this slot holds work and freezes nothing
+        assert!(slot_holds_work(&slot), "fixture pre-condition: this slot DOES hold work");
+        assert!(frozen_speakers(&data, id, "rvc").unwrap().is_empty());
+
+        // now the container cannot be enumerated (a FILE where the directory should be — the
+        // portable stand-in for an ACL / open handle / 网盘 placeholder)
+        std::fs::remove_dir_all(trun::runs_root(&slot)).unwrap();
+        std::fs::write(trun::runs_root(&slot), b"not a directory").unwrap();
+
+        assert!(
+            slot_holds_work(&slot),
+            "an unreadable `runs/` must still answer 「holds work」 — `false` here is what removes \
+             TRAINING_WIPE_NOT_CONFIRMED and makes the sibling-slot PROJECT_DATASET_IN_USE \
+             pre-check fail open, both without changing anything on screen"
+        );
+        let e = frozen_speakers(&data, id, "rvc").unwrap_err().to_string();
+        assert!(
+            e.contains("RUNS_DIR_UNREADABLE"),
+            "EMPTY is the permissive answer for every consumer of this (it is what lets \
+             DATASET_SPEAKERS_FROZEN through), so it must not double as「我没看成」: {e}"
+        );
+    }
+
     /// Both carriers of「第 i 号歌手是谁」, and the two semantics `slot_info` must keep.
     ///
     /// REGRESSION GUARD: `slot_info().speakers` used to fall back from the manifest to
@@ -4544,7 +4618,7 @@ mod tests {
                 "speaker_names": ["sayo", "teto"],
             }),
         );
-        let f = frozen_speakers(&data, id, "rvc");
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
         assert_eq!(f.len(), 2);
         assert_eq!((f[0].slug.as_str(), f[0].name.as_str()), ("sayo_a", "sayo"));
         assert_eq!((f[1].slug.as_str(), f[1].name.as_str()), ("teto_b", "teto"));
@@ -4569,7 +4643,7 @@ mod tests {
                 ]
             }),
         );
-        let f = frozen_speakers(&data, id, "rvc");
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
         assert_eq!(
             f.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>(),
             vec!["sayo_a", "teto_b"],
@@ -4582,7 +4656,7 @@ mod tests {
         // 3. a later sovits_diff run rewrote run.json without the key: order survives, names do
         //    not — and `slot_info` must then report NOTHING rather than two blanks
         write("run.json", serde_json::json!({"backend": "sovits_diff"}));
-        let f = frozen_speakers(&data, id, "rvc");
+        let f = frozen_speakers(&data, id, "rvc").unwrap();
         assert_eq!(f.len(), 2, "the order is still recoverable");
         assert!(f.iter().all(|s| s.name.is_empty()));
         assert!(
@@ -4600,7 +4674,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(frozen_speakers(&data, id, "sovits").is_empty());
+        assert!(frozen_speakers(&data, id, "sovits").unwrap().is_empty());
         assert!(slot_info(&data, id, "sovits", None).unwrap().speakers.is_empty());
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -4873,7 +4947,7 @@ mod tests {
         assert!(slot_wide.run_id == a || slot_wide.run_id == b);
 
         // every run is still visible to the SLOT-level questions (bytes, wipe consent)
-        assert_eq!(trun::run_dirs(&slot).len(), 2);
+        assert_eq!(trun::run_dirs(&slot).unwrap().len(), 2);
         assert!(slot_holds_work(&slot));
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -5032,7 +5106,7 @@ mod tests {
             assert_eq!(info.best_resume_step, Some(1400), "{where_}");
             assert_eq!(info.diff_steps, 5000, "{where_}");
             assert_eq!(
-                frozen_speakers(&data, id, "rvc").iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
+                frozen_speakers(&data, id, "rvc").unwrap().iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
                 vec!["sayo_1", "teto_2"],
                 "{where_}: the dataset page's frozen-structure gate reads this"
             );

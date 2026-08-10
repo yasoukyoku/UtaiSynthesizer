@@ -76,6 +76,7 @@ fn identity_migrate_data_root() {
                 .map(|p| format!("{{\"id\":{:?},\"fp\":{:?}}}", p.id, p.fp_text))
                 .collect();
             let runs: Vec<String> = utai_lib::training::trun::run_dirs(&slot)
+                .expect("the fixture's runs/ must be listable")
                 .iter()
                 .map(|r| {
                     let pool = utai_lib::training::trun::pool_of_run(r)

@@ -135,7 +135,17 @@ fn is_audition_wav(name: &str) -> bool {
 pub(crate) fn audition_dirs_of_project(project: &Path) -> Vec<std::path::PathBuf> {
     crate::training::tproject::FAMILIES
         .iter()
-        .flat_map(|f| crate::training::trun::run_dirs(&project.join(f)))
+        // ⛔ S132 — a slot whose `runs/` cannot be listed contributes NO directories rather than
+        // the slot root. Both consumers (the size report and the cache purge) then under-count /
+        // under-delete, which is the harmless direction; pretending the slot root is the run would
+        // point a purge at a directory that is not a cache.
+        .flat_map(|f| {
+            let slot = project.join(f);
+            crate::training::trun::run_dirs(&slot).unwrap_or_else(|e| {
+                tracing::warn!("cannot enumerate the runs of {} ({e}) — its audition caches are not counted", slot.display());
+                Vec::new()
+            })
+        })
         .map(|r| r.join("audition"))
         .chain(std::iter::once(project.join("audition")))
         .collect()

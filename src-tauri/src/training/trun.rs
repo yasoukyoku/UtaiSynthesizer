@@ -467,10 +467,39 @@ pub struct RunInfo {
 }
 
 /// Every run of one slot, sorted by id so listings never wobble.
-pub fn list_runs(slot: &Path) -> Vec<RunInfo> {
+///
+/// ⛔★★S132 §F2⒝ ④e — 「there is no `runs/` container」and「the container could not be READ」are
+/// two different answers, and they used to be one `let Ok(rd) = … else { return out }`.
+///
+/// The first is a POSITIVE fact: a layout ≤ 2 slot keeps its run products at the slot root, and
+/// [`run_dirs`] answering `[slot]` for it is the whole reason that shape works. The second is an
+/// ACL / antivirus / 网盘 / open-handle failure, and answering it with "this slot has no runs"
+/// fails OPEN in every direction that matters:
+///
+/// * [`resolve_run_dir`] would answer the SLOT ROOT ⇒ `old_manifest` reads nothing ⇒ `has_main`
+///   goes false ⇒ the `WORKSPACE_MANIFEST_MISSING` guard (which requires `has_main`) does not
+///   fire ⇒ a 「续训」 silently restarts from the base model — S119's 「quiet fake resume」 with a
+///   new cause;
+/// * `slot_holds_work` would answer false ⇒ the fail-closed wipe-consent gate stops being
+///   fail-closed;
+/// * `scan_project_ckpts` would find no checkpoints ⇒ every one of them loses its
+///   `KeptReason::Exported` protection at the next cleanup.
+///
+/// ⚠ S131 笔 2 fixed exactly this shape one level down (`tpool::slot_facts` reading
+/// `run_manifest.json`) — this is the same distinction on the directory itself, and it was NOT
+/// covered by that fix.
+pub fn list_runs(slot: &Path) -> Result<Vec<RunInfo>> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(runs_root(slot)) else {
-        return out;
+    let root = runs_root(slot);
+    let rd = match std::fs::read_dir(&root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => {
+            return Err(UtaiError::Training(format!(
+                "RUNS_DIR_UNREADABLE: {}: {e}",
+                root.display()
+            )))
+        }
     };
     for entry in rd.flatten() {
         let id = entry.file_name().to_string_lossy().into_owned();
@@ -504,7 +533,7 @@ pub fn list_runs(slot: &Path) -> Vec<RunInfo> {
         out.push(RunInfo { id, dir: entry.path() });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
+    Ok(out)
 }
 
 /// Where a run's products live — THE single answer, for both layouts.
@@ -541,7 +570,7 @@ pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<RunDir> {
             Ok(RunDir(dir))
         }
         None => {
-            let runs = list_runs(slot);
+            let runs = list_runs(slot)?;
             match runs.len() {
                 // layout ≤ 2: the slot root is the one run
                 0 => Ok(RunDir(slot.to_path_buf())),
@@ -579,14 +608,14 @@ pub fn resolve_run_dir(slot: &Path, run_id: Option<&str>) -> Result<RunDir> {
 /// `unknown` and left it behind (`plan_slot_runs`), which is a loud `warn!` at migration time and
 /// a gate against the python sources — not something to paper over here by scanning both, because
 /// "both" is how one checkpoint gets listed twice and deleted once.
-pub fn run_dirs(slot: &Path) -> Vec<RunDir> {
-    let runs = list_runs(slot);
+pub fn run_dirs(slot: &Path) -> Result<Vec<RunDir>> {
+    let runs = list_runs(slot)?;
     if runs.is_empty() {
         // Also the shape of a MIGRATED slot whose runs have all been deleted: the root holds no
         // run products then either, so scanning it finds nothing and costs nothing.
-        return vec![RunDir(slot.to_path_buf())];
+        return Ok(vec![RunDir(slot.to_path_buf())]);
     }
-    runs.into_iter().map(|r| RunDir(r.dir)).collect()
+    Ok(runs.into_iter().map(|r| RunDir(r.dir)).collect())
 }
 
 /// Where a START writes — resolved AFTER the wipe, and it CREATES the directory.
@@ -609,7 +638,7 @@ pub fn run_dirs(slot: &Path) -> Vec<RunDir> {
 ///   deleted;
 /// * **several runs** — refuse. The batch that mints a second run hands this an id.
 pub fn run_dir_for_start(slot: &Path, family: &str) -> Result<RunDir> {
-    let runs = list_runs(slot);
+    let runs = list_runs(slot)?;
     match runs.len() {
         1 => Ok(RunDir(runs.into_iter().next().unwrap().dir)),
         0 => {
@@ -984,6 +1013,49 @@ mod tests {
         v
     }
 
+    /// ★★S132 §F2⒝ ④e — 「this slot has no `runs/`」 and 「its `runs/` could not be READ」 are
+    /// two different answers, and they used to be the same `let Ok(rd) = … else { return out }`.
+    ///
+    /// ⛔ The fixture makes `runs` a FILE, which is the cheapest reachable shape of "read_dir
+    /// fails with something other than NotFound" — the real-world causes (an ACL, an antivirus
+    /// quarantine, a 网盘 placeholder, an open handle) cannot be created portably in a test, and a
+    /// branch that has never executed is an empty criterion (S129).
+    ///
+    /// ⚠ Both halves are asserted, and the FIRST half is the one that makes the second
+    /// attributable: without it, a `list_runs` that returned `Err` for *every* slot would satisfy
+    /// the second half while breaking every unmigrated slot in the product.
+    #[test]
+    fn an_unreadable_runs_container_is_not_an_empty_slot() {
+        let data = tmp_data("unreadable");
+        let slot = project_dir(&data, "p_22222222").join("rvc");
+        std::fs::create_dir_all(&slot).unwrap();
+
+        // ⑴ no container at all — a POSITIVE fact: the slot root is the one run (layout ≤ 2)
+        assert!(list_runs(&slot).unwrap().is_empty(), "no `runs/` ⇒ no runs, and that is not an error");
+        assert_eq!(
+            run_dirs(&slot).unwrap(),
+            vec![RunDir::for_test(slot.clone())],
+            "…and the plural reader still answers 「the slot root IS the run」"
+        );
+
+        // ⑵ the container exists but cannot be enumerated
+        std::fs::write(runs_root(&slot), b"not a directory").unwrap();
+        let e = list_runs(&slot).unwrap_err().to_string();
+        assert!(
+            e.contains("RUNS_DIR_UNREADABLE"),
+            "an unreadable container must be its own answer, not「no runs」: {e}"
+        );
+        assert!(
+            run_dirs(&slot).unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"),
+            "the plural reader must propagate it — answering `[slot]` here is what made an ACL \
+             blip read as「未迁移的空槽」 (has_main false ⇒ WORKSPACE_MANIFEST_MISSING never fires \
+             ⇒ a 续训 silently restarts from the base model)"
+        );
+        // and the two resolvers a START goes through refuse rather than answering the slot root
+        assert!(resolve_run_dir(&slot, None).unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"));
+        assert!(run_dir_for_start(&slot, "rvc").unwrap_err().to_string().contains("RUNS_DIR_UNREADABLE"));
+    }
+
     /// ⛔ REACHABLE TODAY, and it takes down more than the slot it is in.
     ///
     /// `list_runs` used to accept every non-dot directory under `runs/`, so ONE stray entry — a
@@ -1006,7 +1078,7 @@ mod tests {
         for stray in ["G_2333333.pth backup", "runs.bak", "副本", "rvc"] {
             std::fs::create_dir_all(runs_root(&slot).join(stray)).unwrap();
         }
-        let listed: Vec<String> = list_runs(&slot).into_iter().map(|r| r.id).collect();
+        let listed: Vec<String> = list_runs(&slot).unwrap().into_iter().map(|r| r.id).collect();
         assert_eq!(listed, vec![real.clone()], "only the minted id is a run");
         // …and therefore the two commands that used to die still answer
         assert_eq!(
@@ -1014,7 +1086,7 @@ mod tests {
             runs_root(&slot).join(&real),
             "one stray directory must not make the slot unanswerable"
         );
-        assert_eq!(run_dirs(&slot).len(), 1);
+        assert_eq!(run_dirs(&slot).unwrap().len(), 1);
         // the opposite direction: every id the app can mint must survive the filter
         for family in tproject::FAMILIES {
             assert!(
@@ -1106,13 +1178,13 @@ mod tests {
         std::fs::create_dir_all(&slot).unwrap();
 
         // layout ≤ 2: the slot root is the one run, and BOTH resolvers say so
-        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(slot.clone())]);
+        assert_eq!(run_dirs(&slot).unwrap(), vec![RunDir::for_test(slot.clone())]);
         assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), slot);
 
         // one run: still unambiguous
         let a = runs_root(&slot).join("ra11111111111");
         touch(&a.join("G_100.pth"));
-        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(a.clone())]);
+        assert_eq!(run_dirs(&slot).unwrap(), vec![RunDir::for_test(a.clone())]);
         assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), a);
 
         // two runs: the plural answer GROWS, the singular one becomes an error. Anything else —
@@ -1121,7 +1193,7 @@ mod tests {
         let b = runs_root(&slot).join("rb22222222222");
         touch(&b.join("G_200.pth"));
         assert_eq!(
-            run_dirs(&slot),
+            run_dirs(&slot).unwrap(),
             vec![RunDir::for_test(a.clone()), RunDir::for_test(b.clone())],
             "sorted by id, never wobbling"
         );
@@ -1132,7 +1204,7 @@ mod tests {
 
         // staging is never a run — a half-migrated tree must not be selectable by either resolver
         std::fs::create_dir_all(runs_root(&slot).join(format!("{STAGING_PREFIX}rc3"))).unwrap();
-        assert_eq!(run_dirs(&slot), vec![RunDir::for_test(a), RunDir::for_test(b)]);
+        assert_eq!(run_dirs(&slot).unwrap(), vec![RunDir::for_test(a), RunDir::for_test(b)]);
 
         let _ = std::fs::remove_dir_all(data);
     }
@@ -1275,7 +1347,7 @@ mod tests {
 
         assert_eq!(migrate_slot_runs(&data, id, "sovits").unwrap(), RunOutcome::Committed);
         assert_eq!(tpool::read_slot_meta(&slot).unwrap().layout, SLOT_LAYOUT_RUNS);
-        assert!(list_runs(&slot).is_empty());
+        assert!(list_runs(&slot).unwrap().is_empty());
         // …and with no runs the slot root still answers, because it IS the (empty) run
         assert_eq!(resolve_run_dir(&slot, None).unwrap().path(), slot);
 
@@ -1401,7 +1473,7 @@ mod tests {
         let r = run_dir_for_start(&slot, "rvc").unwrap();
         assert_eq!(r.path(), runs_root(&slot).join(legacy_run_id("rvc")));
         assert!(r.is_dir(), "it must CREATE it — run.json is written before python is spawned");
-        assert_eq!(run_dirs(&slot), vec![r.clone()], "and the plural reader must see it");
+        assert_eq!(run_dirs(&slot).unwrap(), vec![r.clone()], "and the plural reader must see it");
 
         // one run: the same answer, idempotently
         assert_eq!(run_dir_for_start(&slot, "rvc").unwrap(), r);
