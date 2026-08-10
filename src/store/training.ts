@@ -249,6 +249,18 @@ export interface ExportedModelStatus {
   installed: boolean;
 }
 
+/** Mirror of Rust `tproject::DeleteReport` — what a destructive action actually did.
+ *
+ *  ⚠ Shared by Settings(删架构 / 删项目 / 清理快照)and the project detail page(§F2⒝ ④e 的
+ *  per-run 删除)。两份手写镜像会各自漂,而它描述的是**破坏性操作真的做了什么**。 */
+export interface DeleteReport {
+  freedBytes: number;
+  deleted: string[];
+  kept: { rel: string; reason: string }[];
+  /** rename done, background removal blocked — the archives are already unreachable. */
+  deferred: boolean;
+}
+
 /** Mirror of Rust `commands::training::DatasetFileRow`. */
 export interface DatasetFileRow {
   /** Path under `dataset/` — `000.wav` or `<slug>/000.wav`. */

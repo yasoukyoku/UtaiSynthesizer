@@ -352,6 +352,46 @@ pub async fn training_delete_slot(
     .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
 }
 
+/// Delete ONE run of one architecture slot. The slot's preprocessing pools, its sibling runs and
+/// the project's shared dataset all stay.
+///
+/// ★★§F2⒝ 批 2 ④e —— 「重训 = 铸新 run」的另一条腿。三道前置与删槽/删项目**完全一致**,
+/// 而它们不是可选的:
+/// * `ensure_safe_to_delete` —— ⛔ 别照抄 `rename_training_run` 的闸链,那一条**没有**
+///   `RECLAIM_TOUCHING_TRAINING`(改名不搬字节,删除搬);数据根回收线程按相对路径往回拷,
+///   它会把刚删掉的东西原样拷回来;
+/// * `unload_under` —— ⚠ 前缀取到 **run**,不是槽。`start_training` 那处取槽是因为当年
+///   `fresh` 擦整槽(理由已随 flip 死掉);这里只删一个 run,收窄到 run 语义更对而且安全:
+///   匹配是 `Path::starts_with`(按**路径分量**比),兄弟 run 的 id 定长同构,谁也不是谁的前缀;
+///   漏卸只会让 rename 响亮失败,不会静默毁数据。
+/// * ⚠ 粒度:进程级(`ensure_idle_for_package_delete` 问的是「有没有训练在跑」,不问是哪个 run)。
+///   过严、安全;前端可以更精确地禁用按钮(`resolveRowIdentity` 已经能判「这一行是不是正在跑的
+///   那个 run」),但后端这道保险不许因此放宽。
+#[tauri::command]
+pub async fn training_delete_run(
+    state: State<'_, Arc<AppState>>,
+    project_id: String,
+    family: String,
+    run_id: String,
+) -> Result<crate::training::tproject::DeleteReport, String> {
+    checked_project_id(&project_id)?;
+    ensure_safe_to_delete(&state)?;
+    let data_dir = data_root(&state);
+    let slot = crate::training::tproject::family_dir(&data_dir, &project_id, &family);
+    // Resolve for the UNLOAD only, and tolerate a failure: `delete_run` re-resolves and is the
+    // authority on whether this id names anything. A refusal here would turn 「this run is gone
+    // already」 into an untranslated error before the real guard ever spoke.
+    if let Ok(run) = crate::training::trun::resolve_run_dir(&slot, opt_run_id(run_id.trim())) {
+        unload_under(&state, run.path());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::training::tproject::delete_run(&data_dir, &project_id, &family, &run_id)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
+}
+
 /// Delete a whole training project, including its shared dataset. Models already exported into
 /// the registry are independent copies and are NOT affected.
 #[tauri::command]

@@ -32,6 +32,7 @@ import {
   type TrainingBackend,
   type TrainingSeg,
   type WorkspaceInfo,
+  type DeleteReport,
 } from "../../store/training";
 import { formForSlot } from "../../lib/training/formForSlot";
 import { backendErrorMessage } from "../../lib/backendError";
@@ -149,6 +150,50 @@ export function ProjectDetail() {
         runId: run.id,
         name: typed,
       });
+      await load();
+    } catch (e) {
+      const msg = backendErrorMessage(e) ?? String(e);
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** ★★§F2⒝ 批 2 ④e —— 删掉**这一个 run**。槽、它的预处理池、兄弟 run 与项目数据集都不动。
+   *
+   *  ⛔ 只在 `run.id` **非空**时才画得出来:空串是「未迁移的槽,槽根就是那个 run」这个**肯定
+   *  事实**(`RunDetail.id` 的 doc),而后端对空 id 一律 `RUN_ID_REQUIRED`。对那种槽,诚实的
+   *  出口是设置里的「删除这个架构」——因为那时 run 产物与池产物混在同一个槽根上,「只删这个
+   *  run」根本不是一个可分离的操作。
+   *
+   *  ⚠ 爆炸半径要说清楚两件事,而它们都有先例:
+   *  ⒜ **浅扩散跟着走** —— 它训练在 `runs/<主 run>/diffusion/` 里,而「sovits」这个词一个字
+   *     都没提到扩散(存储页的 `SlotUsage` 为同一件事专门带了一个 `diff_steps` 字段);
+   *  ⒝ **已导出的模型不受影响** —— 导入是独立副本,来源没了它照样装着(项目页那一行会标
+   *     「来源已删除」)。 */
+  const deleteRun = async (family: Family, run: RunDetail) => {
+    const steps = run.info.diff_steps ?? 0;
+    const choice = await showConfirm({
+      title: t("training.runDeleteTitle"),
+      body:
+        t("training.runDeleteBody", {
+          name: run.modelName?.trim() || t("training.runUnnamed"),
+          size: fmtSize(run.ckptBytes),
+        }) + (steps > 0 ? " " + t("training.runDeleteDiffNote", { steps }) : ""),
+      buttons: [
+        { id: "cancel", label: t("training.cancel") },
+        { id: "go", label: t("training.runDelete"), kind: "danger" },
+      ],
+    });
+    if (choice !== "go") return;
+    setBusy(true);
+    try {
+      const report = await invoke<DeleteReport>("training_delete_run", {
+        projectId,
+        family,
+        runId: run.id,
+      });
+      showToast(t("training.runDeleteDone", { size: fmtSize(report.freedBytes) }), "info");
       await load();
     } catch (e) {
       const msg = backendErrorMessage(e) ?? String(e);
@@ -648,6 +693,20 @@ export function ProjectDetail() {
             const runs = slot?.runs ?? [];
             const startedRun = (r: RunDetail) => r.hasResumePoint || r.info.has_main_progress;
             const started = runs.some(startedRun);
+            /** ⛔★★§F2⒝ ④e —— 画哪几行。
+             *
+             *  此前是 `runs.filter(startedRun)`,而 flip 之后那条过滤会**结构性**地藏起最需要
+             *  被删的那一类:`try_start` 先建 run 目录、再跑几小时预处理,中途崩/强停/盘满
+             *  留下的就是一个**有目录、没有断点**的 run。它两个条件都假 ⇒ 零行零按钮,却
+             *  ⑴ 计进 `runs.length` 的徽标(卡片写「2 个 run」而下面只有 1 行,当场自相矛盾)、
+             *  ⑵ 计进 `list_runs`(于是那个槽的每一次探针都要靠 runId 才答得出)、
+             *  ⑶ 计进 `SlotDetail.bytes`(盘看得见、删不掉)。
+             *  ⇒ 只要这个槽**不止一个 run**,就把每一个都画出来 —— 恰恰因为那时才需要挑。
+             *  单 run 的槽保持原样(未开始 ⇒ 显示「尚未开始」+ 槽级「开始」按钮)。
+             *
+             *  ⚠ `id === ""` 那一行是后端在**零 run** 时伪造的(`get_training_project`),它寻址
+             *  的是**槽根**。删除按钮因此按 id 非空来画,而不是按这条过滤 —— 显示条件不是校验。 */
+            const visibleRuns = runs.length > 1 ? runs : runs.filter(startedRun);
             return (
               <div key={f} className={`tproj-slot ${started ? "started" : ""}`}>
                 <div className="tproj-slot-head">
@@ -665,7 +724,7 @@ export function ProjectDetail() {
                   </div>
                 )}
                 {/* ── 每个 run 一行 ─────────────────────────────────────────── */}
-                {runs.filter(startedRun).map((r) => (
+                {visibleRuns.map((r) => (
                   <div key={r.id} className="tproj-run">
                     <div className="tproj-run-head">
                       <span className="tproj-run-name">
@@ -738,6 +797,19 @@ export function ProjectDetail() {
                       >
                         {t("training.slotRetrain")}
                       </button>
+                      {/* ★★§F2⒝ ④e —— per-run 删除。⛔ `r.id` 为空 = 未迁移的槽(槽根就是那个
+                          run),那时 run 产物与预处理池混在同一个目录里,「只删这个 run」不是一个
+                          可分离的操作 ⇒ 不画这颗按钮,诚实的出口是设置里的「删除这个架构」。
+                          后端对空 id 一律 `RUN_ID_REQUIRED`,这里只是不让用户白点一次。 */}
+                      {r.id !== "" && (
+                        <button
+                          className="training-btn small danger"
+                          disabled={blocked || busy}
+                          onClick={() => void deleteRun(f, r)}
+                        >
+                          {t("training.runDelete")}
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}

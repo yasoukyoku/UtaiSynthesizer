@@ -1305,6 +1305,7 @@ pub fn run() {
             commands::training::reset_training_display,
             commands::training::training_cleanup_snapshots,
             commands::training::training_delete_slot,
+            commands::training::training_delete_run,
             commands::training::training_delete_project,
             commands::training::list_project_ckpts,
             commands::training::list_training_projects,

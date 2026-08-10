@@ -418,6 +418,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   // DATASET_SPEAKERS_FROZEN 的反面(「没有人冻过」)共用一个静默的空答案,而空是宽容答案 ⇒
   // 恰好在文件系统出问题时把那道拒绝拿掉。modal:它挡的是一次会改动数据集结构的操作。
   FROZEN_SPEAKERS_UNREADABLE: { key: "backend.FROZEN_SPEAKERS_UNREADABLE", modal: true },
+  // ★§F2⒝ ④e —— 与 `RUN_ID_INVALID`(「这个名字不合法」)是两件事:这一条是「你必须指名一个」。
+  // 它挡的是房规 `opt_run_id("") → None → resolve_run_dir → 槽根` 那条路 —— 一次伪装成
+  // 「删一个 run」的删槽。
+  RUN_ID_REQUIRED: { key: "backend.RUN_ID_REQUIRED", modal: true },
   DATASET_COPY_FAILED: { key: "backend.DATASET_COPY_FAILED" },
   DATASET_DELETE_FAILED: { key: "backend.DATASET_DELETE_FAILED" },
   DATASET_WRITE_FAILED: { key: "backend.DATASET_WRITE_FAILED" },

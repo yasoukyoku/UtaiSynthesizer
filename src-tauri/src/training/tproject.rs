@@ -1267,6 +1267,76 @@ pub fn delete_slot(data_dir: &Path, id: &str, family: &str) -> Result<DeleteRepo
     Ok(DeleteReport { freed_bytes: freed, deleted: vec![family.to_string()], kept: Vec::new(), deferred })
 }
 
+/// Delete ONE run of one slot. The slot, its preprocessing pools, its sibling runs and the
+/// project's shared `dataset/` are untouched.
+///
+/// ★★§F2⒝ 批 2 ④e 的后一半 —— 「重训 = 铸新 run」的另一条腿。四条约束,每一条都有一个具体的
+/// 失败形态在后面顶着:
+///
+/// ⒜ **`run_id` 必须非空,而且必须走 `Some(id)`。** ⛔ 这不是卫生要求。房规是
+///    `opt_run_id("") → None`(全仓每一条 run-aware 命令共用),而 `resolve_run_dir(slot, None)`
+///    在**零个或一个** run 时答的不是错误,是一个**正当答案** —— 零个时是槽根。所以一条照抄
+///    `rename_training_run` 那一行写出来的 `delete_run`,在前端漏传 / 传空串 / 拿到那行
+///    `get_training_project` 在零 run 时**伪造**的 `id: ""` 时,会 `tombstone(&[slot])` ——
+///    一次点击端掉 `pools/`(几小时预处理)和全部兄弟 run,而报告说「删掉了一个 run」。
+/// ⒝ **先按需把这个槽折到当前 layout。** `tpool::slot_facts` 在槽里看到**零份**
+///    `run_manifest.json` 时直接 Err ⇒ `plan_slot_identity` Err ⇒ 3→4 对这个槽**永久**
+///    `Refused`;而 `migrate_layouts` 只在开机跑,`try_start` 的准入又因为池还在(
+///    `slot_holds_work` 恒真)一定会问它 ⇒ **这个槽从此再也训练不了**。到了 layout 4,
+///    `migrate_slot_identity` 早退 `AlreadyDone`,`slot_facts` 再也不会被问到 —— 所以唯一堵得住
+///    的地方是**删之前就折好**。(`migrate_one_slot` 的 doc 已经点名了这条出口。)
+/// ⒞ **墓碑落在训练根**(`tombstone` 负责),而不是槽里:两个收割者都只扫训练根一层,
+///    落进 `<slot>/runs/.del_*` 的话没有任何东西会收它,而 `dir_size(&slot)` 照样全额计费 ——
+///    用户点了删除、盘一个字节都不少,而且永远不会少。
+/// ⒟ **不许顺手删空的 `runs/` 容器。** 全仓唯一读它物理存在的是
+///    `audition::workspace_is_a_slot`,它是一道**响亮拒绝**(`AUDITION_WORKSPACE_IS_A_SLOT`),
+///    守着六个试听命令入口 —— 删掉容器就是亲手把那道闸拆了,而它拦的正是「有人还攥着旧的槽
+///    路径」这种错误。⚠ 交接里那句「下一个真 run 会读到别人的转换权重和音域」**无条件形式
+///    证不成**(铸新 run 走的是 `runs/<legacy>/audition`,与槽根不是同一个路径),所以理由按
+///    上面这条写,别按那条。
+pub fn delete_run(data_dir: &Path, id: &str, family: &str, run_id: &str) -> Result<DeleteReport> {
+    if !FAMILIES.contains(&family) {
+        return Err(UtaiError::Training(format!("TRAINING_BAD_FAMILY: {family}")));
+    }
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        // ⒜ — a distinct CODE from `RUN_ID_INVALID`: that one means 「这个名字不合法」, this one
+        // means 「你必须指名一个」. An unmigrated slot's sole run genuinely has no id (the slot
+        // root IS the run), and the honest answer for it is 「删除这个架构」, not a guess.
+        return Err(UtaiError::Training("RUN_ID_REQUIRED".into()));
+    }
+    let slot = family_dir(data_dir, id, family);
+    if !slot.is_dir() {
+        return Err(UtaiError::Training("WORKSPACE_MISSING".into()));
+    }
+    // ⒝ — before anything is removed, and unconditionally: at layout ≥ 4 this is an early return,
+    // and below it the fold is exactly what keeps 「删到零个 run」 from retiring the slot's pool
+    // identity for good.
+    crate::training::migrate_one_slot(data_dir, id, family)?;
+    // ⒜ — `Some(run_id)`, never `opt_run_id`. `RUN_NOT_FOUND` / `RUN_ID_INVALID` come from here.
+    let run = crate::training::trun::resolve_run_dir(&slot, Some(run_id))?;
+    let freed = crate::commands::storage::dir_size(&run);
+    // ⒞⒟ — the RUN directory only. `runs/` itself is left in place.
+    let tomb = tombstone(data_dir, id, &[run.path().to_path_buf()])?;
+    // AFTER the tombstone — the type makes the other order impossible; see [`Tombstoned`].
+    let prefix = format!("{family}/{}/{run_id}/", crate::training::trun::RUNS_DIR);
+    if let Err(e) = mark_exports_source_deleted(data_dir, id, &prefix, &tomb) {
+        // The bytes are gone already; failing here would report a failed delete for one that
+        // succeeded. Loud, and it leaves the ledger stale rather than wrong.
+        tracing::warn!("export ledger not updated after deleting {id}/{family}/{run_id}: {e}");
+    }
+    let deferred = match tomb.dir() {
+        Some(t) => crate::util::remove_dir_all_robust(t).is_err(),
+        None => false,
+    };
+    Ok(DeleteReport {
+        freed_bytes: freed,
+        deleted: vec![run_id.to_string()],
+        kept: Vec::new(),
+        deferred,
+    })
+}
+
 /// Delete a whole project: every slot AND the shared dataset. Models already exported into the
 /// registry are copies and are not affected.
 pub fn delete_project(data_dir: &Path, id: &str) -> Result<DeleteReport> {
@@ -3003,6 +3073,134 @@ mod tests {
             "一个空 run id 拼出来的前缀匹配到了东西"
         );
         assert!(read_meta(&data, id).unwrap().exported.iter().any(|e| e.source_live()));
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// A slot that really holds two runs and one preprocessing pool, at layout 3 — i.e. the shape
+    /// `delete_run` has to survive, not a hand-waved one. Returns (slot, run_a, run_b).
+    fn run_slot(data: &Path, id: &str, family: &str, run_ids: &[&str], layout: u32) -> PathBuf {
+        let slot = family_dir(data, id, family);
+        let pool = slot.join(crate::training::tpool::POOLS_DIR).join("p0000");
+        std::fs::create_dir_all(&pool).unwrap();
+        // A pool with a real (v1) identity: this is what gives the 3→4 fold work to do, and
+        // therefore what makes the 「零份 manifest」 dead end reachable at all. An empty `pools/`
+        // would make `plan_slot_identity` return early and the whole trap would be invisible.
+        std::fs::write(pool.join(crate::training::tpool::FINGERPRINT), "ds|v1").unwrap();
+        std::fs::create_dir_all(pool.join("1_16k_wavs")).unwrap();
+        for rid in run_ids {
+            let d = crate::training::trun::runs_root(&slot).join(rid);
+            std::fs::create_dir_all(d.join("weights")).unwrap();
+            std::fs::write(d.join("run_manifest.json"), r#"{"aug_copies":0,"n_speakers":1}"#).unwrap();
+            std::fs::write(d.join("weights").join(format!("{rid}_e1_s100.pth")), vec![7u8; 64]).unwrap();
+        }
+        crate::training::tpool::write_slot_meta(
+            &slot,
+            &crate::training::tpool::SlotMeta { layout, ..Default::default() },
+        )
+        .unwrap();
+        slot
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— `delete_run` 删的是**这一个 run**,而且删完之后这个槽**还能训练**。
+    ///
+    /// 后半句才是这条测试真正的靶子:`tpool::slot_facts` 在槽里看到**零份** `run_manifest.json`
+    /// 时直接 Err ⇒ `plan_slot_identity` Err ⇒ 3→4 对这个槽**永久** `Refused`,而 `try_start` 的
+    /// 准入因为池还在(`slot_holds_work` 恒真)一定会问它 ⇒ 这个槽再也练不了。
+    /// 唯一堵得住的地方是**删之前就把槽折到 layout 4**,之后 `migrate_slot_identity` 早退。
+    #[test]
+    fn deleting_a_run_leaves_the_slot_trainable_and_touches_nothing_else() {
+        let data = tmp_root("delrun");
+        let id = "run_55556666";
+        // ⚠ 两个 run 的槽**一定**已经在 layout 4:S132 的准入要求铸第二个 run 之前先折。
+        //    把夹具造成「两个 run + layout 3」是一个现实里不存在的形状,而它会撞上 slot_facts
+        //    的**另一扇**死胡同(两份 manifest),于是这条测试会为一个错的理由红。
+        let slot = run_slot(&data, id, "sovits", &["r0000000000aa", "r0000000000bb"],
+                            crate::training::tpool::SLOT_LAYOUT_POOL_ID);
+        let runs_root = crate::training::trun::runs_root(&slot);
+        let (run_a, run_b) = (runs_root.join("r0000000000aa"), runs_root.join("r0000000000bb"));
+        let pool = slot.join(crate::training::tpool::POOLS_DIR).join("p0000");
+        write_meta(
+            &data,
+            &ProjectMeta {
+                id: id.into(),
+                name: "n".into(),
+                export_ledger_since_ms: 1,
+                exported: vec![
+                    ExportedModel {
+                        name: "a".into(),
+                        model_type: "sovits".into(),
+                        from_ckpt_rel: "sovits/runs/r0000000000aa/weights/r0000000000aa_e1_s100.pth".into(),
+                        at_ms: 1,
+                        source_deleted_ms: 0,
+                    },
+                    ExportedModel {
+                        name: "b".into(),
+                        model_type: "sovits".into(),
+                        from_ckpt_rel: "sovits/runs/r0000000000bb/weights/r0000000000bb_e1_s100.pth".into(),
+                        at_ms: 1,
+                        source_deleted_ms: 0,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // ── 拒绝:空 id。⛔ 这是最贵的那条 —— 房规把 "" 归一成 None,而 `resolve_run_dir(None)`
+        //    在零/一个 run 时答的是一个**正当答案**(零个时是槽根)⇒ 一次伪装成「删一个 run」的
+        //    删槽(连 pools/ 和兄弟 run 一起)。
+        let err = delete_run(&data, id, "sovits", "  ").unwrap_err();
+        assert!(err.to_string().contains("RUN_ID_REQUIRED"), "{err}");
+        assert!(run_a.is_dir() && run_b.is_dir() && pool.is_dir(), "一次被拒的删除必须什么都没动");
+        // ── 拒绝:不存在的 id
+        assert!(delete_run(&data, id, "sovits", "r000000000zzz")
+            .unwrap_err()
+            .to_string()
+            .contains("RUN_NOT_FOUND"));
+
+        // ── 删掉 A
+        let report = delete_run(&data, id, "sovits", "r0000000000aa").unwrap();
+        assert!(report.freed_bytes >= 64, "freed_bytes 是在 tombstone 之前量的,不能是 0");
+        assert_eq!(report.deleted, vec!["r0000000000aa".to_string()]);
+        assert!(!run_a.exists(), "被点名的 run 没有真的消失");
+        assert!(run_b.is_dir(), "兄弟 run 被一起带走了");
+        assert!(pool.join("1_16k_wavs").is_dir(), "预处理池被一起带走了 —— 那是几小时");
+        assert!(slot.is_dir());
+        // ⒟ 空容器不许顺手删:它是 `audition::workspace_is_a_slot` 那道响亮拒绝的唯一载体
+        assert!(crate::training::trun::runs_root(&slot).is_dir());
+        // 账本:A 的行退役,B 的原样
+        let m = read_meta(&data, id).unwrap();
+        assert!(!m.exported.iter().find(|e| e.name == "a").unwrap().source_live());
+        assert!(m.exported.iter().find(|e| e.name == "b").unwrap().source_live());
+
+        delete_run(&data, id, "sovits", "r0000000000bb").unwrap();
+        assert!(crate::training::trun::list_runs(&slot).unwrap().is_empty());
+        assert!(runs_root.is_dir(), "删光之后容器仍然要在");
+
+        // ── ⭐ 真正的靶子:一个**还停在 layout 3**、只有一个 run 的槽。这是删除会撞上
+        //    「零份 run manifest」死胡同的唯一现实形状 —— `delete_run` 必须在删之前把它折到 4。
+        let id2 = "run_77778888";
+        let slot2 = run_slot(&data, id2, "sovits", &["r0000000000cc"],
+                             crate::training::trun::SLOT_LAYOUT_RUNS);
+        delete_run(&data, id2, "sovits", "r0000000000cc").unwrap();
+        assert_eq!(
+            crate::training::tpool::read_slot_meta(&slot2).map(|m| m.layout),
+            Some(crate::training::tpool::SLOT_LAYOUT_POOL_ID),
+            "删之前没有把槽折到 layout 4"
+        );
+        crate::training::migrate_one_slot(&data, id2, "sovits")
+            .expect("删光 run 之后这个槽再也折不动了 —— 它从此练不了");
+
+        // ⚠ 阴性对照:那个死胡同**是真的**,不是我编的。同一个形状、run 被绕过 `delete_run`
+        //    直接从盘上拿掉(= 没折过)时,按需折叠必须响亮拒绝 —— 否则上面那条 `expect`
+        //    只是在测「migrate_one_slot 从不失败」。
+        let id3 = "run_99990000";
+        let slot3 = run_slot(&data, id3, "sovits", &["r0000000000dd"],
+                             crate::training::trun::SLOT_LAYOUT_RUNS);
+        std::fs::remove_dir_all(crate::training::trun::runs_root(&slot3).join("r0000000000dd")).unwrap();
+        let stuck = crate::training::migrate_one_slot(&data, id3, "sovits").unwrap_err();
+        assert!(stuck.to_string().contains("SLOT_NOT_MIGRATABLE"), "{stuck}");
+
         let _ = std::fs::remove_dir_all(data);
     }
 

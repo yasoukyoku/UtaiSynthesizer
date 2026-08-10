@@ -11,7 +11,7 @@ import { useMsstModelStore } from "../../store/msst-models";
 import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { useWorkflowStore } from "../../store/workflow";
-import { useTrainingStore } from "../../store/training";
+import { useTrainingStore, type DeleteReport } from "../../store/training";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { applyMirror, applyGhMirror, hfBaseForMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
@@ -210,14 +210,10 @@ interface AssetPackProgress {
 }
 
 /** Mirror of Rust `commands::storage::{StorageReport, WorkspaceUsage}` (S61). */
-/** Mirror of Rust `tproject::DeleteReport` — what a destructive action actually did. */
-interface DeleteReport {
-  freedBytes: number;
-  deleted: string[];
-  kept: { rel: string; reason: string }[];
-  /** rename done, background removal blocked — the archives are already unreachable. */
-  deferred: boolean;
-}
+// ⚠ `DeleteReport` used to be declared here. §F2⒝ ④e gave the training page a destructive action
+// of its own (per-run delete), and a second hand-written mirror of the same Rust struct is the
+// duplication this repo treats as the bullseye — it now lives beside the other training IPC
+// mirrors in `store/training.ts`.
 
 interface SlotUsage {
   family: string;
