@@ -122,6 +122,23 @@ pub struct AppConfig {
     /// migrate keep byte-identical config.json.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_delete_dirs: Vec<String>,
+    /// ★★S133 §F2⒝ ④e — DATA-ROOT-RELATIVE paths the user deliberately deleted **while an old
+    /// root was still queued above**. The reclaim removes them from the old copy before syncing.
+    ///
+    /// ⛔ Without this the delta sync copies them straight back: every one of its refusals hangs
+    /// on `to.exists()`, and a path the user just deleted does not exist on the destination ⇒ the
+    /// whole subtree falls through to a plain per-file recursion, `needs_copy` answers true for
+    /// every missing file, and the run/slot/project comes back — counted as `copied`, logged as
+    /// 「freed X MB … stragglers synced first」. Zero warnings. (`delete_slot` / `delete_project`
+    /// have had this hole since S68c; ④e's per-run delete would have made it frequent.)
+    ///
+    /// ⚠ It lives in `config.json` (the APP dir) on purpose — anything kept in the data root is
+    /// itself a reclaim target, and `project.json` is demonstrably one (see `needs_copy`).
+    /// ⚠ Recorded ONLY while `pending_delete_dirs` is non-empty, and dropped when that queue
+    /// empties: with no old root there is nothing that could resurrect anything, so the list has
+    /// no reason to grow on the machine of a user who never migrated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_since_migration: Vec<String>,
     /// S115 §F5-2: diagnostic mode — makes a training run reproduce a crash legibly at the
     /// cost of speed (see `training::diagnostics` for the exact set and why it is keyed on the
     /// runtime variant). PERSISTED on purpose: reproducing a GPU fault can take several
@@ -142,6 +159,7 @@ impl Default for AppConfig {
             cuda_mem_limit_mb: 0,
             auto_gpu: None,
             pending_delete_dirs: Vec::new(),
+            deleted_since_migration: Vec::new(),
             diagnostic_mode: false,
         }
     }
@@ -1423,14 +1441,60 @@ fn delta_would_write(src: &std::path::Path, dst: &std::path::Path) -> Option<std
 /// An unreadable SOURCE answers `true` on purpose: the caller then treats it as unsynced and keeps
 /// the old subtree, which is the safe direction — the alternative would silently delete a file the
 /// process could not read.
+///
+/// ⛔★★S133 §F2⒝ ④e — **a destination that has MOVED ON is never overwritten.** The rule used to be
+/// 「different size OR source newer」, and the `size` half fires on its own: `project.json` is a
+/// read-modify-write JSON that lives in the project directory like any other file, so the ordinary
+/// script — migrate the data root, train on the NEW root, export a model (the ledger gains a row,
+/// the file gains bytes) — makes the OLD root's shorter copy overwrite the live one at the next
+/// reclaim. That is not 「history loses a line」: `meta.exported` is the sole source of
+/// `KeptReason::Exported`, so the next 「清理未导入的快照」 deletes the checkpoint the user
+/// exported. The same silent rollback would also undo ④e's own ledger retirement.
+///
+/// ⚠ The size clause is KEPT for the same-mtime case — that is the torn-copy shape it was there
+/// for. Only 「destination strictly newer」 became decisive, which is also the answer
+/// `delta_would_write` needs: an old copy with nothing newer to contribute has nothing to carry
+/// over, which is exactly what its own doc says the run-level refusal hangs on.
 fn needs_copy(from: &std::path::Path, to: &std::path::Path) -> bool {
     match (std::fs::metadata(from), std::fs::metadata(to)) {
-        (Ok(s), Ok(d)) => {
-            s.len() != d.len()
-                || matches!((s.modified(), d.modified()), (Ok(sm), Ok(dm)) if sm > dm)
-        }
+        (Ok(s), Ok(d)) => match (s.modified(), d.modified()) {
+            (Ok(sm), Ok(dm)) if dm > sm => false,
+            (Ok(sm), Ok(dm)) if sm > dm => true,
+            _ => s.len() != d.len(),
+        },
         (Ok(_), Err(_)) => true,
         (Err(_), _) => true,
+    }
+}
+
+/// Remember that `rel` (relative to the DATA root) was deleted on purpose, so a queued data-root
+/// reclaim cannot copy it back. No-op when nothing is queued. See [`AppConfig::deleted_since_migration`].
+///
+/// Best-effort by design: the bytes are already gone by the time this runs, and refusing a
+/// completed delete because a preference file could not be written would be the wrong trade.
+pub fn record_deliberate_delete(app_dir: &std::path::Path, rel: &str) {
+    let Some(mut cfg) = load_config(app_dir) else { return };
+    if cfg.pending_delete_dirs.is_empty() {
+        return; // no old copy exists ⇒ nothing can resurrect it ⇒ nothing to remember
+    }
+    let rel = rel.replace('\\', "/");
+    // The paths are built by this app from ids it validated, but this list is later joined onto a
+    // root and DELETED from — so it refuses anything that could climb out, rather than trusting
+    // that no future caller ever passes something else.
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.split('/').any(|c| c == ".." || c.is_empty())
+        || std::path::Path::new(&rel).is_absolute()
+    {
+        tracing::warn!("refusing to record a suspicious deliberate-delete path: {rel}");
+        return;
+    }
+    if cfg.deleted_since_migration.iter().any(|r| *r == rel) {
+        return;
+    }
+    cfg.deleted_since_migration.push(rel);
+    if let Err(e) = save_config(app_dir, &cfg) {
+        tracing::warn!("could not record a deliberate delete for the pending reclaim: {e}");
     }
 }
 
@@ -1917,6 +1981,12 @@ pub fn spawn_pending_data_dir_delete(app_dir: std::path::PathBuf, active_data_di
         let _g = CONFIG_LOCK.lock();
         let mut cfg = load_config(&app_dir).unwrap_or_default();
         cfg.pending_delete_dirs.retain(|p| !done.contains(p));
+        // ★S133 — the deliberate-delete list only exists to protect against a queued old root.
+        // With the queue empty it can never do anything again, so it goes rather than growing
+        // forever. (`record_deliberate_delete` is a no-op in that state for the same reason.)
+        if cfg.pending_delete_dirs.is_empty() {
+            cfg.deleted_since_migration.clear();
+        }
         if let Err(e) = save_config(&app_dir, &cfg) {
             tracing::warn!("data-dir reclaim: failed to update queue: {e}");
         }
@@ -1988,6 +2058,38 @@ fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path
     // 最大的那棵子树既不合并也不删除。以前这里是抄过来的三行,而「活根加了一档、这里忘了」
     // 长得跟一次遗忘一模一样 —— 现在漏不掉了。
     crate::training::migrate_layouts(&old_p);
+    // ⛔★★S133 §F2⒝ ④e — BEFORE the delta sync: drop from the OLD copy everything the user
+    // deleted on purpose since it was queued. Otherwise the sync below copies it straight back —
+    // every refusal in `sync_dir_delta` hangs on `to.exists()`, and a just-deleted path does not
+    // exist on the destination, so the whole subtree falls through to a per-file recursion that
+    // recreates it and counts it as `copied`. The user then sees a run they explicitly deleted
+    // reappear, with the log saying 「freed X MB」.
+    //
+    // ⚠ Removing it here rather than skipping it in the sync is deliberate: the old subtree is
+    // going to be `remove_dir_all`'d at the end of this very function anyway, so this only makes
+    // that happen a few lines earlier — and it keeps `sync_dir_delta`'s rule set (which
+    // `delta_would_write` MUST mirror exactly) from growing a second opinion.
+    let deliberate: Vec<String> = load_config(app_dir)
+        .map(|c| c.deleted_since_migration)
+        .unwrap_or_default();
+    for rel in &deliberate {
+        let victim = old_p.join(rel);
+        if !victim.exists() {
+            continue;
+        }
+        match crate::util::remove_dir_all_robust(&victim) {
+            Ok(()) => tracing::info!(
+                "data-dir reclaim: {} was deleted on purpose — dropping the old copy too",
+                victim.display()
+            ),
+            // Loud: leaving it means the sync below resurrects it.
+            Err(e) => tracing::warn!(
+                "data-dir reclaim: could not drop the old copy of the deliberately deleted {} \
+                 ({e}) — it may be copied back",
+                victim.display()
+            ),
+        }
+    }
     for name in MIGRATED_SUBTREES {
         let sub = old_p.join(name);
         if name == "training" {
@@ -3078,6 +3180,139 @@ mod tests {
                 .unwrap(),
             "newer"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— **一份活根上已经改过的文件,不许被旧根那份盖回去。**
+    ///
+    /// 规则原本是「大小不同 **或** 源更新」,而 `size` 那一半会单独触发。走一遍最普通的剧本:
+    /// 迁数据根 → 在**新根**上训练并导出一次(`project.json` 多了一行 `exported`、字节数变了)
+    /// → 下次开机回收 ⇒ **旧根那份短的把活的盖掉**。
+    /// 后果不是「历史少一行」:`meta.exported` 是 `KeptReason::Exported` 的唯一来源 ⇒
+    /// 下一次「清理未导入的快照」把用户导出过的那个存档真删掉。④e 自己的账本退役也会被同一条
+    /// 路静默回滚。
+    ///
+    /// ⚠ 三条 sync 测试此前两边的 `project.json` 都写成同一个字面量(同长同新)⇒ 这条分支
+    /// **一次都没被执行过**。
+    #[test]
+    fn a_reclaim_never_overwrites_a_file_the_active_root_has_moved_on_from() {
+        let base = std::env::temp_dir().join(format!("utai_sync_newer_{}", uuid::Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        let w = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        // 旧根:迁移那一刻的快照
+        let op = old.join("p1_aaaabbbb").join("project.json");
+        w(op.clone(), r#"{"id":"p1_aaaabbbb","exported":[]}"#);
+        // 活根:之后导出过一次 —— 更长、而且**更新**。
+        // ⚠ 「更新」要等时钟真的走一格:Windows 的文件时间戳按 ~15.6 ms 跳,同一个 tick 里的两次
+        //   写会读成一样新,而那时判据落回 size 那一条(它是为**撕裂的拷贝**准备的:`std::fs::copy`
+        //   保留源的时间戳,所以半截文件就是「同样新、更短」)。真实剧本里这两次相差几分钟到
+        //   几小时。⛔ 用 sleep 凑一个固定毫秒数才是会闪的那种写法。
+        let np = new.join("p1_aaaabbbb").join("project.json");
+        let body = r#"{"id":"p1_aaaabbbb","exported":[{"name":"m","model_type":"rvc","from_ckpt_rel":"rvc/w.pth","at_ms":9}]}"#;
+        loop {
+            w(np.clone(), body);
+            if mtime(&np) > mtime(&op) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let (copied, failed) = sync_dir_delta(&old, &new, false, SyncLevel::Projects, &[]);
+        assert_eq!((copied, failed), (0, 0), "旧根那份没有任何东西可贡献");
+        assert!(
+            std::fs::read_to_string(new.join("p1_aaaabbbb").join("project.json"))
+                .unwrap()
+                .contains("from_ckpt_rel"),
+            "活根上更新的那份被旧根盖掉了 —— 导出账本被静默回滚,而它是删除保护的唯一来源"
+        );
+
+        // ⚠ 阴性对照:方向反过来时**必须**照拷 —— 否则这条修复等于把 straggler 同步整个关掉,
+        //    而那正是这个函数存在的理由(「迁移完还在旧根上跑了一会」)。
+        let straggler = old.join("p1_aaaabbbb").join("late.txt");
+        w(straggler.clone(), "written on the old root after the copy");
+        let (copied2, failed2) = sync_dir_delta(&old, &new, false, SyncLevel::Projects, &[]);
+        assert_eq!((copied2, failed2), (1, 0));
+        assert!(new.join("p1_aaaabbbb").join("late.txt").is_file());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— **用户主动删掉的东西,回收不许把它拷回来。**
+    ///
+    /// 这个洞今天就在(`delete_slot` / `delete_project` 一样中招),而 ④e 的 per-run 删除会把它
+    /// 从「几乎不发生」推成常态。机理:`sync_dir_delta` 的每一道拒绝都挂在 `to.exists()` 上,
+    /// 而一个刚被删掉的路径在目标侧**不存在** ⇒ 整棵子树落到逐文件递归 ⇒ 每个文件都 `needs_copy`
+    /// ⇒ 原样复活,计成 `copied`,收尾日志写「freed X MB(N straggler synced first)」。
+    #[test]
+    fn a_reclaim_never_resurrects_something_the_user_deleted_on_purpose() {
+        let base = std::env::temp_dir().join(format!("utai_sync_tomb_{}", uuid::Uuid::new_v4()));
+        let (app, old, new) = (base.join("app"), base.join("old"), base.join("new"));
+        let w = |p: std::path::PathBuf, body: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        let seed = |root: &std::path::Path| {
+            // a project both roots share, plus ONE run that only the old copy still has
+            w(root.join("training/p1_aaaabbbb/project.json"), r#"{"id":"p1_aaaabbbb"}"#);
+            w(root.join("training/p1_aaaabbbb/rvc/slot.json"), r#"{"layout":4}"#);
+        };
+        let run_rel = "training/p1_aaaabbbb/rvc/runs/rfeedfacefeed";
+        let mk = || {
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&app).unwrap();
+            for r in [&old, &new] {
+                seed(r);
+            }
+            w(old.join(run_rel).join("G_1400.pth"), "weights");
+            save_config(
+                &app,
+                &AppConfig {
+                    pending_delete_dirs: vec![old.to_string_lossy().into_owned()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+
+        // ⚠ 阴性对照先跑:**不记账**时它真的会复活。没有这一半,下面那条断言可能只是在测
+        //    「回收本来就不拷这个目录」。
+        mk();
+        reclaim_one_root(&app, &new, &old.to_string_lossy());
+        assert!(
+            new.join(run_rel).join("G_1400.pth").is_file(),
+            "阴性对照失效:回收本来就没打算拷它 —— 那么下面那条断言什么也证明不了"
+        );
+
+        // …记了账之后就不会
+        mk();
+        record_deliberate_delete(&app, run_rel);
+        reclaim_one_root(&app, &new, &old.to_string_lossy());
+        assert!(
+            !new.join(run_rel).exists(),
+            "用户明确删掉的 run 被回收原样拷了回来(而日志会说 freed)"
+        );
+        // 兄弟内容照样搬得动 —— 这不是把 straggler 同步关掉
+        assert!(new.join("training/p1_aaaabbbb/rvc/slot.json").is_file());
+
+        // 队列空时不记账(没有旧根就没有东西能复活,清单没有理由生长)
+        save_config(&app, &AppConfig::default()).unwrap();
+        record_deliberate_delete(&app, run_rel);
+        assert!(load_config(&app).unwrap().deleted_since_migration.is_empty());
+
+        // 会爬出根的路径一律拒绝 —— 这份清单后面会被 join 到一个根上并**删除**
+        save_config(
+            &app,
+            &AppConfig { pending_delete_dirs: vec!["x".into()], ..Default::default() },
+        )
+        .unwrap();
+        for bad in ["../escape", "training/../../etc", "/abs", "C:/abs", ""] {
+            record_deliberate_delete(&app, bad);
+        }
+        assert!(load_config(&app).unwrap().deleted_since_migration.is_empty());
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

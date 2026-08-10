@@ -344,9 +344,13 @@ pub async fn training_delete_slot(
     ensure_safe_to_delete(&state)?;
     let data_dir = data_root(&state);
     unload_under(&state, &crate::training::tproject::family_dir(&data_dir, &project_id, &family));
+    let app_dir = state.app_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::training::tproject::delete_slot(&data_dir, &project_id, &family)
-            .map_err(|e| e.to_string())
+        let rel = format!("training/{project_id}/{family}");
+        let report = crate::training::tproject::delete_slot(&data_dir, &project_id, &family)
+            .map_err(|e| e.to_string())?;
+        crate::commands::settings::record_deliberate_delete(&app_dir, &rel);
+        Ok(report)
     })
     .await
     .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
@@ -384,9 +388,21 @@ pub async fn training_delete_run(
     if let Ok(run) = crate::training::trun::resolve_run_dir(&slot, opt_run_id(run_id.trim())) {
         unload_under(&state, run.path());
     }
+    let app_dir = state.app_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        crate::training::tproject::delete_run(&data_dir, &project_id, &family, &run_id)
-            .map_err(|e| e.to_string())
+        let rel = format!(
+            "training/{project_id}/{}/{}/{}",
+            crate::training::backend_family(&family),
+            crate::training::trun::RUNS_DIR,
+            run_id.trim()
+        );
+        let report = crate::training::tproject::delete_run(&data_dir, &project_id, &family, &run_id)
+            .map_err(|e| e.to_string())?;
+        // ★S133 — only AFTER it succeeded, and only while a data-root reclaim is queued (the
+        // helper is a no-op otherwise): the reclaim copies back by relpath, so without this the
+        // run the user just deleted comes back at the next boot and the log calls it 「freed」.
+        crate::commands::settings::record_deliberate_delete(&app_dir, &rel);
+        Ok(report)
     })
     .await
     .map_err(|e| format!("TRAINING_DELETE_JOIN: {e}"))?
@@ -411,6 +427,10 @@ pub async fn training_delete_project(
         // straight back as a MISSING ghost. Only after the delete SUCCEEDED — a refused delete
         // must leave every trace of the project exactly as it was.
         crate::training::tproject::forget_project(&app_dir, &data_dir, &project_id);
+        crate::commands::settings::record_deliberate_delete(
+            &app_dir,
+            &format!("training/{project_id}"),
+        );
         Ok(report)
     })
     .await
