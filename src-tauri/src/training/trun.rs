@@ -1376,28 +1376,36 @@ mod tests {
         );
 
         // ⑴ 顺序只写在一个地方,而且是这个顺序。
+        //
+        // ★§F2⒝ ④d —— 这里此前是**两条手写的先后断言**,而那个形状对「加第四步」完全是瞎的
+        // (新步骤排在链首也全绿)。改成一张**有序表**:链里的步骤必须与这张表**逐个同序**,
+        // 少一步、多一步、换个位置都当场红。
+        const CHAIN: &[(&str, &str)] = &[
+            ("tproject::migrate_legacy_layout(", "它建出的 family 槽正是下一步要折的东西"),
+            ("tpool::migrate_all(", "先盖 layout 3 ⇒ 池折叠对这个槽永远 AlreadyDone,预处理产物永久留在槽根,连一行 warn 都没有"),
+            ("trun::migrate_all(", "run 折叠要在池折叠之后"),
+            ("tpool::migrate_identity_all(", "它盖的章同时打开 python 的 v2 公式 ⇒ 排到前面 = 先告诉 python 盘上是 v2 文本,再让另外两个迁移器去搬还写着 v1 文本的字节"),
+        ];
         let m = code_only(MOD_RS);
         let head = m.find("pub fn migrate_layouts(").expect("那条链没了");
         let body = &m[head..];
         let body = &body[..body.find("\n}").expect("migrate_layouts 没有顶格收尾")];
-        let at = |needle: &str| {
-            body.find(needle).unwrap_or_else(|| panic!("migrate_layouts 里已经没有 {needle} 了"))
-        };
-        assert!(
-            at("tproject::migrate_legacy_layout(") < at("tpool::migrate_all("),
-            "legacy 折叠必须最先跑:它建出的 family 槽正是下一步要折的东西"
-        );
-        assert!(
-            at("tpool::migrate_all(") < at("trun::migrate_all("),
-            "run 折叠排在池折叠之前 = 先盖 layout 3 ⇒ `tpool::migrate_slot` 对这个槽永远 \
-             AlreadyDone,预处理产物永久留在槽根,连一行 warn 都没有"
-        );
+        let mut cursor = 0usize;
+        for (needle, why) in CHAIN {
+            let at = body[cursor..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("migrate_layouts 里没有 {needle}(或它排错了位置):{why}"));
+            cursor += at + needle.len();
+        }
+        // …而且链里**只有**这几步:多出来的一步会带着自己的顺序问题溜进来。
+        let calls = body.matches("::migrate_").count();
+        assert_eq!(calls, CHAIN.len(), "migrate_layouts 里的步数与这张表对不上");
 
         // ⑵ 两个调用点都走那条链,而且不许把任何一步再抄一遍到自己身上。
         for (name, src) in [("lib.rs", LIB_RS), ("commands/settings.rs", SETTINGS_RS)] {
             let c = code_only(src);
             assert!(c.contains("migrate_layouts("), "{name} 不再折 layout 了");
-            for inlined in ["tpool::migrate_all(", "trun::migrate_all(", "migrate_legacy_layout("] {
+            for (inlined, _) in CHAIN {
                 assert!(
                     !c.contains(inlined),
                     "{name} 自己排了一遍 {inlined} —— 这条链加一步时,这里就是会被漏掉的那处"
@@ -1485,8 +1493,32 @@ mod tests {
                 "{next_name} 必须紧接 {prev_name}:同一个 slot.json,一步一个数字"
             );
         }
-        // ⛔ 上面那个循环的全集是**这张表自己**,所以它对「新增了一个常量但没接进来」是瞎的 ——
-        // 而那正是加第三个常量时最容易犯的错。补上的判据不看表,看**源码**:两个文件里
+        // ★§F2⒝ ④d —— **每一个 layout 常量都必须有一个生产写者。**
+        //
+        // 「常量加了、迁移器忘了」是这条线上唯一一种**功能上线了却一个字节都没动**的状态,而它
+        // 此前没有任何东西看得见:`identity_version` 对每个槽都答 1、`identity_suffix` 恒空、
+        // 去名字化恒不触发,而全部闸绿。⇒ 判据必须问「谁写它」,不能只问「它等于几」。
+        // ⚠ 只看顶层测试模块**之前**的部分:测试里当然会写各种 layout,拿测试当写者就是让尺子
+        //   自己满足自己。⛔ 切点必须是 `#[cfg(test)]\nmod tests` 而不是第一个 `#[cfg(test)]` ——
+        //   这两个文件里都有**函数级**的 `#[cfg(test)]`(trun.rs 的 `RunDir` 测试构造器就是),
+        //   按第一个切会把大半个生产文件一起切掉,于是这条判据变成「谁都没写」的假红。
+        let production = |src: &'static str| -> String {
+            let s = code_only(src);
+            let cut = s.find("#[cfg(test)]\nmod tests").expect("顶层测试模块的形状变了");
+            s[..cut].to_string()
+        };
+        let prod = format!("{}{}", production(include_str!("tpool.rs")), production(include_str!("trun.rs")));
+        for (name, _) in CHAIN {
+            let short = name.rsplit("::").next().unwrap();
+            assert!(
+                prod.contains(&format!("layout: {short}")) || prod.contains(&format!("layout = {short}")),
+                "{name} 没有任何生产代码**写**它 —— 一个没人写的 layout 就是一个永远不会发生的 \
+                 layout,而依赖它的那些开关会静默地永远保持关闭"
+            );
+        }
+
+        // ⛔ 上面那两个循环的全集都是**这张表自己**,所以它们对「新增了一个常量但没接进来」是瞎的
+        // —— 而那正是加第三个常量时最容易犯的错。补上的判据不看表,看**源码**:两个文件里
         // `pub const SLOT_LAYOUT` 开头的常量有几个,链里就必须有几项。
         // ⚠ `concat!` 拆开写,否则这一行**自己**就是第四个命中(`code_only` 抹注释,不抹字符串
         //   字面量)—— 尺子把自己量了进去。仓里 `mod.rs` 的反向断言用的是同一个手法。

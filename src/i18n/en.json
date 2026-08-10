@@ -1023,6 +1023,7 @@
     "RUN_CREATE_FAILED": "Could not create the run directory for this training. Check that the data drive is writable, has free space, and is not locked by antivirus or a cloud-sync client.",
     "RUN_MIGRATE_FAILED": "Upgrading the training workspace layout failed and was rolled back to its previous state; no files were lost. Make sure the drive is writable and restart the app to retry.",
     "SLOT_MIGRATE_FAILED": "Upgrading the preprocessing-cache layout failed and was rolled back to its previous state; no files were lost. Make sure the drive is writable and restart the app to retry.",
+    "POOL_FINGERPRINT_WRITE_FAILED": "Could not write the preprocessing cache's identity file. The step was rolled back and the cache on disk is unchanged. Make sure the drive is writable and not locked by antivirus or a cloud-sync client, then restart the app to retry.",
     "SLOT_META_WRITE_FAILED": "Could not write the training slot's layout marker file. The drive may be full or read-only.",
     "SLOT_META_ENCODE_FAILED": "Failed to encode the training slot's layout marker. This is an internal error — please report it with the log.",
     "TRAINING_MIGRATE_UNDO_BLOCKED": "The old training directory's migration could not be undone — the target is in use or locked. Close whatever is holding it (Explorer, antivirus, cloud sync) and retry.",

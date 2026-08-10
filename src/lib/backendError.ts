@@ -452,6 +452,7 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RENAME_OTHER_INSTANCE: { key: "backend.RENAME_OTHER_INSTANCE", modal: true },
   RUN_MIGRATE_FAILED: { key: "backend.RUN_MIGRATE_FAILED", modal: true },
   SLOT_MIGRATE_FAILED: { key: "backend.SLOT_MIGRATE_FAILED", modal: true },
+  POOL_FINGERPRINT_WRITE_FAILED: { key: "backend.POOL_FINGERPRINT_WRITE_FAILED" },
   SLOT_META_WRITE_FAILED: { key: "backend.SLOT_META_WRITE_FAILED" },
   SLOT_META_ENCODE_FAILED: { key: "backend.SLOT_META_ENCODE_FAILED" },
   TRAINING_MIGRATE_UNDO_BLOCKED: { key: "backend.TRAINING_MIGRATE_UNDO_BLOCKED", modal: true },

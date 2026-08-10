@@ -660,6 +660,528 @@ fn roll_back(slot: &Path) -> Result<()> {
     Ok(())
 }
 
+// ─────────────────────────── migration (layout 3 → 4) ───────────────────────────
+//
+// ★§F2⒝ ④d — re-stamp every pool of a slot with the v2 identity text, and give a sole speaker's
+// slice directory its constant name. THIS is what flips [`identity_version`] for the slot, so it
+// is also the moment python starts computing the v2 formula: the two halves change together
+// because the marker is written LAST and nothing else writes it.
+//
+// ## Why there is no staging directory here
+//
+// The other two migrations MOVE files, so they need a single rename to commit. This one edits a
+// file's CONTENT and renames a directory INSIDE the pool — two actions no single rename can
+// commit together. What makes that acceptable is the version gate rather than a protocol:
+//
+// * the marker is the commit point and it is written last, so any torn state still reads as
+//   layout 3 ⇒ python still computes v1 ⇒ it still sees the world it knows;
+// * every step is IDEMPOTENT (the new text is rebuilt from the stripped old one, the rename is
+//   skipped when the target name is already there), so re-running converges;
+// * this runs at boot, before a window exists — so "torn state, then the user trains" needs a
+//   restart in between, and the restart re-runs this first.
+//
+// ⛔ The one hole that argument does NOT cover is a slot with SEVERAL pools where a later pool
+// fails after an earlier one was already re-stamped: that state is persistent, the app keeps
+// running, and python (still v1) would then miss the re-stamped pool and mint a sibling. So a
+// failure mid-slot rolls back every step this slot already applied, mirror-image, exactly as the
+// other two migrations do.
+
+/// What re-stamping one slot did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IdentityOutcome {
+    /// Already at layout 4, or the slot does not exist.
+    AlreadyDone,
+    /// Nothing needed changing (no pools, or every pool already carries the v2 text). Committed so
+    /// the next boot does not look again.
+    Committed,
+    /// n pools re-stamped.
+    Restamped(usize),
+    /// The slot could not be decided, so NOTHING was changed and the marker was NOT advanced.
+    ///
+    /// ⚠ A real answer, not a failure: at layout 3 python is told identity v1, so every pool in
+    /// this slot keeps matching and the user pays nothing. Looked at again on the next boot.
+    /// ⛔ Refusing is always better than stamping a guessed value — a wrong `|sr=` is not a slow
+    /// run, it is features computed at one sample rate silently reused at another.
+    Refused(String),
+}
+
+/// One pool's work, computed before anything is touched.
+#[derive(Debug, Clone)]
+struct PoolStep {
+    dir: PathBuf,
+    old_fp: String,
+    new_fp: String,
+    /// The sole-speaker slice directory, `(from, to)`. `None` for every chain without one.
+    rename: Option<(PathBuf, PathBuf)>,
+}
+
+/// The run-level facts every pool of one slot is stamped from.
+struct SlotFacts {
+    /// `run_manifest.json`'s `aug_copies`.
+    ///
+    /// ⛔ THE authority, and the reason is not that it is the most accurate record of what is on
+    /// disk — it is that it is the value the NEXT request will send. `formForSlot` restores the
+    /// params form from this same manifest (`WorkspaceInfo.aug_copies`), so a stamp that agrees
+    /// with it is a stamp the next run will match. Counting `_aug<idx>` files instead would be a
+    /// LOWER BOUND: `augment_slices` prunes before it generates, and the f0 gate deletes copies it
+    /// rejects, so a pool built with 3 can hold a maximum index of 1.
+    /// ⚠ It is also the EFFECTIVE value everywhere it matters: a non-diff start writes
+    /// `req.aug_copies` here, and a diffusion start either inherits this very number or (diff-first)
+    /// writes its own back into it.
+    aug_copies: u32,
+    /// `n_speakers` (absent = 1) — decides whether the slice directory is name-derived at all.
+    n_speakers: usize,
+}
+
+/// Sample rate from a RIFF header.
+///
+/// Format-agnostic on purpose: rvc slices are IEEE-float wavs (`wavfile.write(..., float32)`), so
+/// anything that assumed 16-bit PCM would read a garbage rate out of a valid file.
+fn wav_sample_rate(path: &Path) -> Option<u32> {
+    let b = std::fs::read(path).ok()?;
+    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut i = 12usize;
+    while i + 8 <= b.len() {
+        let size = u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize;
+        let body = i + 8;
+        if &b[i..i + 4] == b"fmt " {
+            if body + 8 > b.len() {
+                return None;
+            }
+            return Some(u32::from_le_bytes([b[body + 4], b[body + 5], b[body + 6], b[body + 7]]));
+        }
+        i = body + size + (size & 1);
+    }
+    None
+}
+
+/// THE sample rate an rvc pool's products were built at, read off the pool itself.
+/// `Ok(None)` = this pool holds no rvc slices at all.
+///
+/// ⛔ Deliberately NOT the run manifest. A wrong `|sr=` is a WRONG RESULT — the next run at that
+/// rate would match this pool, re-slice, and reuse f0/features computed at the other rate (they
+/// are cached by slice NAME and the names do not change) — so it has to be a positive fact about
+/// these bytes. The manifest says what the last REQUEST asked for, and it is one record for a slot
+/// that can hold several pools.
+///
+/// Two independent witnesses, and they must agree:
+/// * the header of the gt slices (`<pool>/0_gt_wavs/*.wav`);
+/// * the mute assets, whose FILENAME carries the rate (`<pool>/mute/0_gt_wavs/mute48k.wav`) and
+///   which are copied skip-if-exists, so they accumulate one entry per rate the pool ever served.
+///
+/// Disagreement is what a pool merged from two data roots looks like (`pools/` merges file by
+/// file and the pool id does not contain the rate), and there is no honest single answer for it.
+fn rvc_pool_sample_rate(pool: &Path) -> std::result::Result<Option<u32>, String> {
+    let mut seen: Option<u32> = None;
+    let mut disagree: Vec<String> = Vec::new();
+    let mut note = |what: String, hz: u32, seen: &mut Option<u32>| match *seen {
+        Some(prev) if prev != hz => disagree.push(what),
+        _ => *seen = Some(hz),
+    };
+
+    let gt = pool.join("0_gt_wavs");
+    let mut wavs = 0usize;
+    if let Ok(rd) = std::fs::read_dir(&gt) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // ⚠ `.wav` only: a trained pool also holds `<stem>.spec.pt` in this very directory
+            // (the loader writes it beside the wav), and it sorts BEFORE the wavs.
+            if !name.ends_with(".wav") {
+                continue;
+            }
+            wavs += 1;
+            match wav_sample_rate(&e.path()) {
+                Some(hz) => note(format!("{name}={hz}"), hz, &mut seen),
+                None => continue,
+            }
+        }
+    }
+    if wavs > 0 && seen.is_none() {
+        return Err(format!("{}: slices are present but none has a readable RIFF header", gt.display()));
+    }
+    if let Ok(rd) = std::fs::read_dir(pool.join("mute").join("0_gt_wavs")) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(k) = name
+                .strip_prefix("mute")
+                .and_then(|s| s.strip_suffix("k.wav"))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            note(format!("mute/{name}"), k * 1000, &mut seen);
+        }
+    }
+    if !disagree.is_empty() {
+        return Err(format!(
+            "{}: products of more than one sample rate in one pool ({}) — refusing to stamp a \
+             single identity on it",
+            pool.display(),
+            disagree.join(", ")
+        ));
+    }
+    Ok(seen)
+}
+
+/// The identity text with any `|sr=` / `|aug=` token removed — the v1 text a v2 one was built from.
+///
+/// This is what makes the whole migration idempotent (and therefore what makes a torn state
+/// self-heal): the new text is always REBUILT from the stripped old one rather than appended to it,
+/// so running twice cannot produce `…|aug=2|aug=2`.
+///
+/// ⚠ It strips those two keys ANYWHERE, not only at the end. That is safe because no chain emits
+/// either key elsewhere — a fact `tests/pool_identity_formula.rs` pins per chain — and it is the
+/// robust choice: a token in an unexpected position means the text was written by something we do
+/// not understand, and dropping it puts us back on the one text we can rebuild.
+/// ⚠ A multi-speaker rvc identity is a `|`-join of BARE hashes with no `=` at all; those have
+/// neither prefix and are preserved.
+fn strip_identity_suffix(fp: &str) -> String {
+    let kept: Vec<&str> = fp
+        .split('|')
+        .enumerate()
+        .filter(|(i, t)| *i == 0 || !(t.starts_with("sr=") || t.starts_with("aug=")))
+        .map(|(_, t)| t)
+        .collect();
+    kept.join("|")
+}
+
+/// The run-level facts, or why this slot cannot be decided.
+fn slot_facts(slot: &Path) -> std::result::Result<SlotFacts, String> {
+    let mut found: Option<serde_json::Value> = None;
+    for run in super::trun::run_dirs(slot) {
+        let p = run.path().join("run_manifest.json");
+        let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("{}: unreadable run manifest: {e}", p.display()))?;
+        if found.is_some() {
+            // Layout 3 allows one run per slot; two manifests means ④e already happened and this
+            // migration predates the rule for choosing between them.
+            return Err(format!("{}: more than one run manifest", slot.display()));
+        }
+        found = Some(v);
+    }
+    let Some(m) = found else {
+        return Err(format!("{}: no run manifest — nothing says what this pool was built with", slot.display()));
+    };
+    Ok(SlotFacts {
+        aug_copies: m["aug_copies"].as_u64().unwrap_or(0) as u32,
+        n_speakers: m["n_speakers"].as_u64().unwrap_or(1).max(1) as usize,
+    })
+}
+
+/// Where this pool's sole-speaker slice directory has to move, if anywhere.
+///
+/// ⛔ `to.exists()` is not defensive. `std::fs::rename(dir, <an existing FILE>)` returns **Ok** on
+/// Windows and destroys that file silently (measured), so a user note or a crash leftover named
+/// `spk0` would disappear into a log line that says the migration succeeded.
+fn plan_slice_rename(
+    pool: &Path,
+    n_speakers: usize,
+) -> std::result::Result<Option<(PathBuf, PathBuf)>, String> {
+    let root = pool.join("dataset_44k");
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return Ok(None); // rvc / vocoder, or a sovits pool that never got as far as slicing
+    };
+    let mut subs: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    subs.sort();
+    if subs.is_empty() {
+        return Ok(None);
+    }
+    if n_speakers > 1 {
+        // Co-trained slugs are folded into the fingerprint itself, so renaming one would
+        // re-identify the pool. They stay, and the count has to match or we do not understand
+        // this pool.
+        if subs.len() != n_speakers {
+            return Err(format!(
+                "{}: manifest says {n_speakers} speakers but {} slice tree(s) are present",
+                root.display(),
+                subs.len()
+            ));
+        }
+        return Ok(None);
+    }
+    if subs.len() != 1 {
+        // The shape S127 closed: a rename plus 「重训(仅扩散)」 used to grow a second complete
+        // tree in one pool. Which one is live is not knowable from here, and picking wrong means
+        // the next run slices a THIRD.
+        return Err(format!(
+            "{}: a sole-speaker pool with {} slice trees ({}) — cannot tell which one is live",
+            root.display(),
+            subs.len(),
+            subs.join(", ")
+        ));
+    }
+    if subs[0] == SOLE_SPEAKER_DIR {
+        return Ok(None);
+    }
+    let to = root.join(SOLE_SPEAKER_DIR);
+    if to.exists() {
+        return Err(format!("{}: {} is already taken", root.display(), SOLE_SPEAKER_DIR));
+    }
+    Ok(Some((root.join(&subs[0]), to)))
+}
+
+/// Everything this slot needs, or why it cannot be decided. Pure — nothing is touched.
+///
+/// ⛔ The plan reads POOL CONTENTS, and that is the one thing it cannot inherit from the other two
+/// migrations: their plans are computed from the slot's TOP-LEVEL listing, which for 3→4 is
+/// identical before and after. A plan shaped like theirs would be EMPTY for every slot on earth,
+/// take the "nothing to do" branch, stamp layout 4 — and hand python a v2 formula to run against a
+/// v1 disk. That is not a rare edge; it is 100% of installations.
+fn plan_slot_identity(slot: &Path, family: &str) -> std::result::Result<Vec<PoolStep>, String> {
+    let pools = list_pools(slot);
+    if pools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let facts = slot_facts(slot)?;
+    let mut out = Vec::new();
+    for p in pools {
+        if p.fp_text.is_empty() {
+            // A pool with no identity is never MATCHED by anything (`open_pool` compares content),
+            // so there is nothing to keep matching. Leave its bytes visible.
+            continue;
+        }
+        let sr = if family == "rvc" {
+            match rvc_pool_sample_rate(&p.dir)? {
+                Some(hz) => Some(hz),
+                None => {
+                    // No slices ⇒ nothing this pool holds is worth protecting, and there is no
+                    // honest rate to write. Leaving it alone costs an empty directory; guessing
+                    // costs a wrong result on a pool that might not be empty tomorrow.
+                    tracing::warn!(
+                        "pool identity: {} holds no rvc slices — leaving its identity alone",
+                        p.dir.display()
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let new_fp = format!(
+            "{}{}",
+            strip_identity_suffix(&p.fp_text),
+            identity_suffix(POOL_IDENTITY_VERSION, facts.aug_copies, sr)
+        );
+        let rename = plan_slice_rename(&p.dir, facts.n_speakers)?;
+        if new_fp == p.fp_text && rename.is_none() {
+            continue;
+        }
+        out.push(PoolStep { dir: p.dir, old_fp: p.fp_text, new_fp, rename });
+    }
+    Ok(out)
+}
+
+/// Atomic, because this file IS the pool's identity — the same protocol `utai_train/pool.py` uses
+/// and for the same reason: a truncated identity matches nothing and rebuilds everything.
+///
+/// ⚠ Bare `rename`, not `rename_with_retry`: os error 5 (a READONLY target, which backup restores
+/// really do produce) is in that helper's retry set, so it would burn ~12 s per pool before
+/// failing anyway. Here failing immediately is the better answer — the caller rolls back.
+fn write_fingerprint(pool: &Path, text: &str) -> Result<()> {
+    let io_err =
+        |e: std::io::Error| UtaiError::Training(format!("POOL_FINGERPRINT_WRITE_FAILED: {}: {e}", pool.display()));
+    let final_path = pool.join(FINGERPRINT);
+    let tmp = pool.join(format!("{FINGERPRINT}.tmp"));
+    std::fs::write(&tmp, text.as_bytes()).map_err(io_err)?;
+    std::fs::rename(&tmp, &final_path).map_err(io_err)?;
+    Ok(())
+}
+
+fn apply_step(step: &PoolStep) -> Result<()> {
+    if let Some((from, to)) = &step.rename {
+        crate::util::rename_with_retry(from, to, "POOL_SLICE_RENAME").map_err(UtaiError::Training)?;
+    }
+    write_fingerprint(&step.dir, &step.new_fp)
+}
+
+/// Mirror image of [`apply_step`], best-effort: a rollback that itself fails is logged, never
+/// hidden, and never turned into the caller's error (that would replace the real cause).
+fn undo_step(step: &PoolStep) {
+    if let Err(e) = write_fingerprint(&step.dir, &step.old_fp) {
+        tracing::error!("pool identity: could not roll back {}: {e}", step.dir.display());
+    }
+    if let Some((from, to)) = &step.rename {
+        if to.exists() && !from.exists() {
+            if let Err(e) = crate::util::rename_with_retry(to, from, "POOL_SLICE_RENAME_UNDO") {
+                tracing::error!("pool identity: could not roll back {}: {e}", to.display());
+            }
+        }
+    }
+}
+
+/// The two sidecar file names that record a pool's identity text (`utai_train/resume_state.py`'s
+/// `LATEST_NAME` and the `BEST_STATE` marker inside a snapshot directory).
+const RESUME_SIDECARS: [&str; 2] = ["resume_state.json", "state.json"];
+
+/// Re-point every resume sidecar that recorded one of these pools' OLD identity text.
+///
+/// Without this, the first 续训 of every existing run reports `TRAINING_RESUME_DATASET_CHANGED`
+/// while the dataset has not moved a byte — and that CODE is the signal
+/// `project_v2_resume_divergence_open` relies on to tell two different failures apart, so polluting
+/// it has a real cost.
+///
+/// ⚠ Matched on the exact old TEXT, so it cannot touch anything that is not this pool's record;
+/// and best-effort, because its failure mode is one spurious warning rather than a broken pool —
+/// rolling a correct migration back over it would be the worse trade.
+fn repoint_resume_sidecars(slot: &Path, steps: &[PoolStep]) -> usize {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                walk(&p, depth - 1, out);
+            } else if RESUME_SIDECARS.contains(&name.as_str()) {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for run in super::trun::run_dirs(slot) {
+        // `<run>/resume_state.json` · `<run>/resume_{best,latest}/state.json` ·
+        // `<run>/diffusion/resume_{best,latest}/state.json` — three levels is all of them.
+        walk(run.path(), 3, &mut files);
+    }
+    let mut changed = 0usize;
+    for f in files {
+        let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let Some(old) = v["dataset_fingerprint"].as_str().map(String::from) else { continue };
+        let Some(step) = steps.iter().find(|s| s.old_fp == old) else { continue };
+        v["dataset_fingerprint"] = serde_json::json!(step.new_fp);
+        let Ok(body) = serde_json::to_vec_pretty(&v) else { continue };
+        let tmp = f.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &f).is_ok() {
+            changed += 1;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("pool identity: could not re-point {}", f.display());
+        }
+    }
+    changed
+}
+
+/// Re-stamp one slot's pools with the v2 identity text. Idempotent.
+pub fn migrate_slot_identity(slot: &Path, family: &str) -> Result<IdentityOutcome> {
+    if !slot.is_dir() {
+        return Ok(IdentityOutcome::AlreadyDone);
+    }
+    // Same rule as the other two: reconcile a torn PREDECESSOR before the early return, or a slot
+    // that crashed mid-fold would be judged on a half-moved tree.
+    reconcile_staging(slot)?;
+    let layout = read_slot_meta(slot).map(|m| m.layout).unwrap_or(0);
+    if layout >= SLOT_LAYOUT_POOL_ID {
+        return Ok(IdentityOutcome::AlreadyDone);
+    }
+    // ⛔ …and NOT below layout 3 either. The chain (`training::migrate_layouts`) promotes every
+    // healthy slot to 3 before this step runs, so a slot still under 3 means one of the earlier
+    // folds FAILED for it — and such a slot still keeps its pool at the SLOT ROOT, where
+    // `list_pools` cannot see it. Planning it would therefore produce an empty plan, stamp layout
+    // 4, and tell python to compute the v2 formula against a root pool still holding v1 text: a
+    // brand-new pool and hours of preprocessing. That is S123's "structurally empty plan" trap
+    // arriving through a different door, and the admission range is the whole defence.
+    if layout < super::trun::SLOT_LAYOUT_RUNS {
+        return Ok(IdentityOutcome::Refused(format!(
+            "layout {layout}: the earlier folds have not committed for this slot"
+        )));
+    }
+    let commit = |slot: &Path| -> Result<()> {
+        // Read-modify-write: `..Default::default()` would drop a newer build's unknown keys, which
+        // is exactly what `SlotMeta::extra` exists to prevent.
+        let mut meta = read_slot_meta(slot).unwrap_or_default();
+        meta.layout = SLOT_LAYOUT_POOL_ID;
+        write_slot_meta(slot, &meta)
+    };
+    let steps = match plan_slot_identity(slot, family) {
+        Ok(s) => s,
+        Err(why) => return Ok(IdentityOutcome::Refused(why)),
+    };
+    if steps.is_empty() {
+        commit(slot)?;
+        return Ok(IdentityOutcome::Committed);
+    }
+    let mut done: Vec<&PoolStep> = Vec::new();
+    for s in &steps {
+        if let Err(e) = apply_step(s) {
+            for d in done.iter().rev() {
+                undo_step(d);
+            }
+            return Err(e);
+        }
+        done.push(s);
+    }
+    let repointed = repoint_resume_sidecars(slot, &steps);
+    if repointed > 0 {
+        tracing::info!(
+            "pool identity: re-pointed {repointed} resume sidecar(s) of {}",
+            slot.display()
+        );
+    }
+    commit(slot)?;
+    Ok(IdentityOutcome::Restamped(steps.len()))
+}
+
+/// Re-stamp every slot of every project. Called from `training::migrate_layouts`, LAST.
+///
+/// Never fails the boot, for the same reason the other two do not: a slot that cannot be decided
+/// keeps answering identity v1 and therefore keeps working, and it is looked at again next launch.
+pub fn migrate_identity_all(data_dir: &Path) {
+    let root = crate::training::tproject::training_root(data_dir);
+    if !root.is_dir() {
+        return;
+    }
+    if crate::crashlog::other_instance_alive() {
+        tracing::warn!("pool identity migration postponed: another live instance detected");
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(&root) else { return };
+    let (mut done, mut refused, mut failed) = (0usize, 0usize, 0usize);
+    for entry in rd.flatten() {
+        let proj = entry.path();
+        if !proj.join(crate::training::tproject::PROJECT_META).is_file() {
+            continue;
+        }
+        for family in crate::training::tproject::FAMILIES {
+            let slot = proj.join(family);
+            if !slot.is_dir() {
+                continue;
+            }
+            match migrate_slot_identity(&slot, family) {
+                Ok(IdentityOutcome::Restamped(n)) => {
+                    done += 1;
+                    tracing::info!("pool identity: {} -> v2 ({n} pool(s))", slot.display());
+                }
+                Ok(IdentityOutcome::Refused(why)) => {
+                    refused += 1;
+                    // Loud, and once per boot: the slot keeps working on the v1 formula, but it
+                    // will never advance until someone looks at this line.
+                    tracing::warn!("pool identity: {} left at v1 — {why}", slot.display());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!("pool identity: {} could not be re-stamped: {e}", slot.display());
+                }
+            }
+        }
+    }
+    if done > 0 || refused > 0 || failed > 0 {
+        tracing::info!(
+            "pool identity migration: {done} slot(s) re-stamped, {refused} left at v1, {failed} failed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +1223,339 @@ mod tests {
         // 一个读不动的 marker 必须答旧公式(fail-closed:猜错的代价是几小时重跑)
         std::fs::write(slot.join(SLOT_META), b"{not json").unwrap();
         assert_eq!(identity_version(&slot), 1, "读不动 marker ⇒ 不许猜新公式");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    // ─────────────────── layout 3 → 4:重新打戳 ───────────────────
+
+    /// 最小 RIFF 头 + 一个静音样本。用真头是因为被测的正是「从头里读采样率」。
+    fn wav_at(path: &Path, hz: u32) {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // mono
+        b.extend_from_slice(&hz.to_le_bytes());
+        b.extend_from_slice(&(hz * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 4]);
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(path, &b).unwrap();
+    }
+
+    /// 一个 layout 3 的槽:`slot.json` + 一个 run(带 manifest)+ 若干池。
+    fn layout3_slot(tag: &str, manifest: serde_json::Value) -> PathBuf {
+        let slot = tmp_slot(tag);
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        let run = slot.join("runs").join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("run_manifest.json"), serde_json::to_vec_pretty(&manifest).unwrap())
+            .unwrap();
+        slot
+    }
+
+    fn mk_pool(slot: &Path, id: &str, fp: &str) -> PathBuf {
+        let d = pools_root(slot).join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(FINGERPRINT), fp).unwrap();
+        d
+    }
+
+    fn fp_of(pool: &Path) -> String {
+        std::fs::read_to_string(pool.join(FINGERPRINT)).unwrap()
+    }
+
+    /// ⛔ **这条是这一批最重要的一条**:3→4 要干的活全在 `pools/<id>/` 里面,槽顶层前后**一模一样**。
+    /// 照抄前两个迁移器的 plan(它们只 `read_dir(slot)` 顶层一层)会得到一个**结构上恒空**的
+    /// 计划,于是每个槽都走「没什么可搬」那一支、盖上 layout 4 —— 而 layout 4 同时打开 python 的
+    /// v2 公式。纸面迁移 + 真实全量重跑,命中 100% 的安装。
+    ///
+    /// 判据因此不是「plan 非空」,而是打戳之后盘上的那个串必须**恰好等于**python 会算出来的那个
+    /// (用生产函数 `identity_suffix` 拼,不在测试里重打一遍)。
+    #[test]
+    fn the_identity_migration_reads_pool_contents_not_the_slot_top_level() {
+        let slot = layout3_slot("id_contents", serde_json::json!({ "aug_copies": 2 }));
+        let pool = mk_pool(&slot, "p000000000001", "d41d8c|enc=vec768l12|loudnorm=1");
+        std::fs::create_dir_all(pool.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
+        let top = |p: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(p)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        let before = top(&slot);
+
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Restamped(1));
+        assert_eq!(
+            fp_of(&pool),
+            format!(
+                "d41d8c|enc=vec768l12|loudnorm=1{}",
+                identity_suffix(POOL_IDENTITY_VERSION, 2, None)
+            ),
+            "盘上的串必须与 python 会算出来的逐字节相同"
+        );
+        assert!(pool.join("dataset_44k").join(SOLE_SPEAKER_DIR).is_dir(), "切片目录没改名");
+        assert!(!pool.join("dataset_44k").join("mymodel_deadbeef").exists(), "旧名树还在 = 孤儿树");
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, SLOT_LAYOUT_POOL_ID);
+        assert_eq!(identity_version(&slot), POOL_IDENTITY_VERSION, "打完戳才轮到 python 用 v2");
+
+        // …而槽顶层在这次迁移前后**逐项一模一样**(`slot.json` 的内容变了,名字没变),
+        // 这正是「照抄骨架的 plan 结构上恒空」的机械理由。
+        assert_eq!(before, top(&slot), "槽顶层一项都没变 —— 只读顶层的 plan 会恒空");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 幂等,而且是靠**重建**而不是**追加**做到的 —— 这是撕裂态能自愈的全部理由。
+    #[test]
+    fn restamping_rebuilds_the_text_instead_of_appending_to_it() {
+        assert_eq!(strip_identity_suffix("d41d8c|enc=x|loudnorm=1|aug=2"), "d41d8c|enc=x|loudnorm=1");
+        assert_eq!(strip_identity_suffix("abc|sr=48000|aug=3"), "abc");
+        assert_eq!(strip_identity_suffix("abc"), "abc", "v1 的串原样穿过");
+        // 多说话人 rvc 的身份是一串**没有 `=`** 的裸 hash 用 `|` 拼 —— 一个都不许丢。
+        assert_eq!(strip_identity_suffix("aaaa|bbbb|cccc|aug=1"), "aaaa|bbbb|cccc");
+
+        let slot = layout3_slot("id_idem", serde_json::json!({ "aug_copies": 3 }));
+        let pool = mk_pool(&slot, "p000000000001", "d41d8c|enc=vec768l12|loudnorm=0");
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Restamped(1));
+        let once = fp_of(&pool);
+        // 把 marker 退回去(= 一次「盖章前被杀」的撕裂态),再跑一遍
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert_eq!(fp_of(&pool), once, "第二遍不许再追加一次 —— `|aug=3|aug=3` 就是这么来的");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// rvc 的 `|sr=` 来自**这个池自己的盘**。判据是「同一个槽的两个池拿到两个不同的答案」——
+    /// 那是 manifest(只有一份)结构上给不出的东西,也正是跨数据根逐文件合并会造出来的形状。
+    ///
+    /// ⚠ 那个 `.spec.pt` 是**健壮性**输入不是承重判据:训练跑过之后它就躺在 `0_gt_wavs` 里,而且
+    /// 字典序排在 wav 之前 —— 一个「读第一个文件」的实现会把它当音频。这里的实现读全部并取第一个
+    /// 解析得出的,所以它只证明「非音频邻居不会把答案带偏」。
+    #[test]
+    fn an_rvc_pool_is_stamped_with_the_rate_on_its_own_disk() {
+        let slot = layout3_slot("id_sr", serde_json::json!({ "aug_copies": 0 }));
+        let a = mk_pool(&slot, "p00000000000a", "aaaa");
+        wav_at(&a.join("0_gt_wavs").join("0_0.wav"), 40_000);
+        touch(&a.join("0_gt_wavs").join("0_0.spec.pt"));
+        let b = mk_pool(&slot, "p00000000000b", "bbbb");
+        wav_at(&b.join("0_gt_wavs").join("0_0.wav"), 48_000);
+
+        assert_eq!(migrate_slot_identity(&slot, "rvc").unwrap(), IdentityOutcome::Restamped(2));
+        assert_eq!(fp_of(&a), "aaaa|sr=40000");
+        assert_eq!(fp_of(&b), "bbbb|sr=48000", "两个池两个答案 —— 一份 manifest 给不出这个");
+
+        // mute 资产是第二个见证人(文件名带速率、skip-if-exists 所以每服务过一个速率就多一份)。
+        // 它与切片的头不一致 = 这个池被两个数据根揉过 ⇒ 拒绝。
+        let c = mk_pool(&slot, "p00000000000c", "cccc");
+        wav_at(&c.join("0_gt_wavs").join("0_0.wav"), 40_000);
+        touch(&c.join("mute").join("0_gt_wavs").join("mute48k.wav"));
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        assert!(matches!(
+            migrate_slot_identity(&slot, "rvc").unwrap(),
+            IdentityOutcome::Refused(_)
+        ));
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 一个池里混着两种采样率 = 跨数据根合并出来的形状。没有诚实的单一答案 ⇒ **整槽拒绝**,
+    /// 而拒绝之后这个槽仍然在 v1 上正常工作。
+    #[test]
+    fn a_pool_holding_two_sample_rates_is_refused_and_nothing_moves() {
+        let slot = layout3_slot("id_mixed", serde_json::json!({ "aug_copies": 0 }));
+        let a = mk_pool(&slot, "p00000000000a", "aaaa");
+        wav_at(&a.join("0_gt_wavs").join("0_0.wav"), 40_000);
+        wav_at(&a.join("0_gt_wavs").join("0_1.wav"), 48_000);
+
+        let out = migrate_slot_identity(&slot, "rvc").unwrap();
+        assert!(matches!(out, IdentityOutcome::Refused(_)), "混装池必须拒绝,不许挑一个");
+        assert_eq!(fp_of(&a), "aaaa", "拒绝 = 一个字节都没动");
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "拒绝 = 不盖章");
+        assert_eq!(identity_version(&slot), 1, "⇒ python 继续算 v1,这个槽照常工作");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 多说话人的 slug **折进了指纹**,改名 = 每个多说话人池当场失配。所以只有独唱才换名。
+    #[test]
+    fn only_a_sole_speaker_slice_tree_gets_the_constant_name() {
+        let slot =
+            layout3_slot("id_multi", serde_json::json!({ "aug_copies": 0, "n_speakers": 2 }));
+        let pool = mk_pool(&slot, "p000000000001", "d41d8c|enc=vec768l12|loudnorm=0");
+        for s in ["alice_11111111", "bob_22222222"] {
+            std::fs::create_dir_all(pool.join("dataset_44k").join(s)).unwrap();
+        }
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
+        for s in ["alice_11111111", "bob_22222222"] {
+            assert!(pool.join("dataset_44k").join(s).is_dir(), "{s} 被改名了 —— 那个池当场失配");
+        }
+        assert!(!pool.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
+        assert_eq!(fp_of(&pool), "d41d8c|enc=vec768l12|loudnorm=0", "aug=0 ⇒ 串逐字节不变");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 独唱池里有两棵切片树 = S127 关掉的那个形状的存量。哪一棵是活的从这里判不出来,而挑错
+    /// 一棵的后果是下一次运行切出**第三棵** ⇒ 拒绝。
+    #[test]
+    fn a_sole_speaker_pool_with_two_slice_trees_is_refused() {
+        let slot = layout3_slot("id_twotrees", serde_json::json!({ "aug_copies": 0 }));
+        let pool = mk_pool(&slot, "p000000000001", "d41d8c|enc=x|loudnorm=0");
+        for s in ["old_11111111", "new_22222222"] {
+            std::fs::create_dir_all(pool.join("dataset_44k").join(s)).unwrap();
+        }
+        assert!(matches!(
+            migrate_slot_identity(&slot, "sovits").unwrap(),
+            IdentityOutcome::Refused(_)
+        ));
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3);
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// ⛔ `std::fs::rename(目录, 一个**已存在的文件**)` 在这台机器上返回 **Ok**,并把那个文件
+    /// **无声销毁**(实测)。所以改名前的 `exists()` 不是防御性检查:少了它,一个恰好叫 `spk0`
+    /// 的用户笔记 / 崩溃残留会消失在一行「迁移成功」的日志里。
+    #[test]
+    fn a_slice_rename_never_overwrites_something_that_is_already_there() {
+        let slot = layout3_slot("id_occupied", serde_json::json!({ "aug_copies": 0 }));
+        let pool = mk_pool(&slot, "p000000000001", "d41d8c|enc=x|loudnorm=0");
+        std::fs::create_dir_all(pool.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
+        let squatter = pool.join("dataset_44k").join(SOLE_SPEAKER_DIR);
+        std::fs::write(&squatter, b"a user's note").unwrap();
+
+        assert!(matches!(
+            migrate_slot_identity(&slot, "sovits").unwrap(),
+            IdentityOutcome::Refused(_)
+        ));
+        assert_eq!(std::fs::read(&squatter).unwrap(), b"a user's note", "那个文件被顶掉了");
+        assert!(pool.join("dataset_44k").join("mymodel_deadbeef").is_dir());
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3);
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 存量 run 的续训 sidecar 记着**旧**的身份串;不一起改写,每个存量 run 的第一次续训都会报
+    /// 一次假的 `TRAINING_RESUME_DATASET_CHANGED` —— 而那条 CODE 正是那卷未结案的续训崩溃赖以
+    /// 区分问题的信号。四个落点(含扩散链自己那两份)都要跟上。
+    #[test]
+    fn the_resume_sidecars_follow_the_pool_they_describe() {
+        let slot = layout3_slot("id_sidecar", serde_json::json!({ "aug_copies": 1 }));
+        let old = "d41d8c|enc=vec768l12|loudnorm=1";
+        let pool = mk_pool(&slot, "p000000000001", old);
+        let run = slot.join("runs").join("r0123456789ab");
+        let blob = serde_json::json!({ "schema": 1, "epoch": 7, "dataset_fingerprint": old });
+        let spots = [
+            run.join("resume_state.json"),
+            run.join("resume_best").join("state.json"),
+            run.join("resume_latest").join("state.json"),
+            run.join("diffusion").join("resume_best").join("state.json"),
+        ];
+        for p in &spots {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, serde_json::to_vec_pretty(&blob).unwrap()).unwrap();
+        }
+        // 阴性对照:一份记着**别的**串的 sidecar 不许被碰。
+        let other = run.join("diffusion").join("resume_latest").join("state.json");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        let foreign = serde_json::json!({ "dataset_fingerprint": "somebody-elses-pool" });
+        std::fs::write(&other, serde_json::to_vec_pretty(&foreign).unwrap()).unwrap();
+
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Restamped(1));
+        let now = fp_of(&pool);
+        assert_ne!(now, old);
+        for p in &spots {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            assert_eq!(v["dataset_fingerprint"], serde_json::json!(now), "{} 没跟上", p.display());
+            assert_eq!(v["epoch"], serde_json::json!(7), "{} 的其余内容被动过", p.display());
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&other).unwrap()).unwrap();
+        assert_eq!(v["dataset_fingerprint"], serde_json::json!("somebody-elses-pool"));
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// ⛔ 这是「不做 staging」那个决定唯一没被版本闸兜住的洞:一个槽有几个池,第 2 个失败时第 1 个
+    /// 已经带着新戳而 layout 仍是 3 ⇒ python 算 v1、池里是新串 ⇒ 铸兄弟池全量重跑,而且**不需要
+    /// 重启就能踩到**(失败是持久的,app 照常在跑)。⇒ 中途失败必须把这一槽做过的每一步按镜像退回。
+    #[test]
+    fn a_failure_part_way_through_rolls_the_whole_slot_back() {
+        let slot = layout3_slot("id_rollback", serde_json::json!({ "aug_copies": 2 }));
+        let a = mk_pool(&slot, "p00000000000a", "aaaa|enc=x|loudnorm=0");
+        let b = mk_pool(&slot, "p00000000000b", "bbbb|enc=x|loudnorm=0");
+        std::fs::create_dir_all(a.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
+        // 让 B 的原子写**必然**失败:tmp 路径被一个目录占住 ⇒ `std::fs::write` 写不进去。
+        std::fs::create_dir_all(b.join(format!("{FINGERPRINT}.tmp"))).unwrap();
+
+        assert!(migrate_slot_identity(&slot, "sovits").is_err(), "B 写不下去必须是错误");
+        assert_eq!(fp_of(&a), "aaaa|enc=x|loudnorm=0", "A 的戳必须退回去");
+        assert!(
+            a.join("dataset_44k").join("mymodel_deadbeef").is_dir(),
+            "A 的切片目录名必须退回去"
+        );
+        assert!(!a.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "没盖章");
+        assert_eq!(identity_version(&slot), 1, "⇒ python 仍然算 v1,而盘上确实还是 v1 的串");
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// 取不到权威就不许打戳 —— 打错 `|aug=` 的代价是一次全量重跑,打错 `|sr=` 是错结果。
+    #[test]
+    fn a_slot_whose_facts_cannot_be_read_is_refused_rather_than_guessed() {
+        let slot = tmp_slot("id_nofacts");
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        let pool = mk_pool(&slot, "p000000000001", "aaaa|enc=x|loudnorm=0");
+        // runs/ 里没有任何 run_manifest.json ⇒ 没有东西说得出这些切片是按几份增强建的。
+        std::fs::create_dir_all(slot.join("runs").join("r0123456789ab")).unwrap();
+        assert!(matches!(
+            migrate_slot_identity(&slot, "sovits").unwrap(),
+            IdentityOutcome::Refused(_)
+        ));
+        assert_eq!(fp_of(&pool), "aaaa|enc=x|loudnorm=0");
+        assert_eq!(read_slot_meta(&slot).unwrap().layout, 3);
+
+        // …而一个**从来没有池**的槽照常盖章:它没有任何要保住的东西。
+        let empty = layout3_slot("id_nopools", serde_json::json!({}));
+        assert_eq!(migrate_slot_identity(&empty, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert_eq!(read_slot_meta(&empty).unwrap().layout, SLOT_LAYOUT_POOL_ID);
+        let _ = std::fs::remove_dir_all(slot);
+        let _ = std::fs::remove_dir_all(empty);
+    }
+
+    /// ⛔ 准入的**下**界,而它守的是同一个「结构上恒空」的陷阱换了个入口:一个还没被前两步折过
+    /// 的槽,它的池在**槽根**,而 `list_pools` 只看 `pools/` ⇒ plan 恒空 ⇒ 盖 layout 4 ⇒ 告诉
+    /// python 用 v2 公式去对一个写着 v1 文本的槽根池 ⇒ 铸新池 + 全量重跑。
+    ///
+    /// 开机链保证健康的槽走到这一步已经是 3,所以「低于 3」只剩一种含义:前两步对它失败过。
+    #[test]
+    fn a_slot_the_earlier_folds_have_not_committed_is_never_stamped() {
+        let slot = tmp_slot("id_tooearly");
+        // layout 1 的形状:池产物与身份文件都在**槽根**,`pools/` 还不存在。
+        std::fs::write(slot.join(FINGERPRINT), "aaaa|enc=x|loudnorm=0").unwrap();
+        touch(&slot.join("0_gt_wavs").join("0_0.wav"));
+        for layout in 0..super::super::trun::SLOT_LAYOUT_RUNS {
+            write_slot_meta(&slot, &SlotMeta { layout, ..Default::default() }).unwrap();
+            assert!(
+                matches!(
+                    migrate_slot_identity(&slot, "sovits").unwrap(),
+                    IdentityOutcome::Refused(_)
+                ),
+                "layout {layout} 的槽被盖章了 —— 它的池还在槽根,plan 看不见它"
+            );
+            assert_eq!(read_slot_meta(&slot).unwrap().layout, layout, "layout {layout}: 盖章了");
+            assert_eq!(identity_version(&slot), 1);
+        }
+        assert_eq!(
+            std::fs::read_to_string(slot.join(FINGERPRINT)).unwrap(),
+            "aaaa|enc=x|loudnorm=0",
+            "槽根的身份一个字节都不许动"
+        );
         let _ = std::fs::remove_dir_all(slot);
     }
 

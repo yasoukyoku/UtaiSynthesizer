@@ -561,6 +561,20 @@ def report_drift(blob, reporter, logger, *, pool_dir, dataset_items=None, loader
     return code
 
 
+def _fp_brief(fp):
+    """The part of a pool identity worth printing: a short dataset hash plus EVERY token.
+
+    ★§F2⒝ ④d — this used to be `fp[:12]`, and those twelve characters are all inside the dataset
+    hash. From ④d on the identity carries `|aug=` / `|sr=` tokens APPENDED AT THE END, so a resume
+    that changed only the augmentation count printed the same twelve characters on both sides of
+    the arrow: 「DATASET CHANGED (aaaaaaaaaaaa -> aaaaaaaaaaaa)」. This header exists to make the
+    next bug report answerable (`project_v2_resume_divergence_open` §4-3), and the most common
+    difference is exactly the one it had gone blind to.
+    """
+    head, sep, tail = fp.partition("|")
+    return head[:12] + (sep + tail if sep else "")
+
+
 def describe_drift(blob, *, pool_dir, dataset_items=None, loader_len=None):
     """What changed between the checkpoint's world and this run's. Returns (code, lines).
 
@@ -578,7 +592,10 @@ def describe_drift(blob, *, pool_dir, dataset_items=None, loader_len=None):
     was_fp = blob.get("dataset_fingerprint")
     if was_fp and now_fp and was_fp != now_fp:
         code = CODE_DATASET_CHANGED
-        lines.append("resume: DATASET CHANGED since this checkpoint (%s -> %s)" % (was_fp[:12], now_fp[:12]))
+        lines.append(
+            "resume: DATASET CHANGED since this checkpoint (%s -> %s)"
+            % (_fp_brief(was_fp), _fp_brief(now_fp))
+        )
     elif was_fp and now_fp:
         lines.append("resume: dataset unchanged (%s)" % was_fp[:12])
     else:

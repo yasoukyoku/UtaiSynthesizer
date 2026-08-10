@@ -48,11 +48,16 @@ pub mod trun;
 /// `sync_failed > 0 ⇒ continue`)。这是这条链最贵的一种漏法,而它长得像一次遗忘。
 ///
 /// ⇒ 把顺序与调用点收成一个函数,是为了让「**加一步而漏掉一个调用点**」这件事不可能发生。
-/// §F2⒝ ④d 要加的 layout 3→4 就挂在这里,一行。
+///
+/// ★§F2⒝ ④d 的第四步 `tpool::migrate_identity_all` 挂在**最后**,而这一步的顺序理由与前三步
+/// **不同**:前三步是「先盖章的那个会让后面的永远 AlreadyDone」,这一步是「它盖的章同时打开
+/// python 的 v2 公式」(`tpool::identity_version`)。排到前面去 = 先告诉 python 盘上是 v2 文本,
+/// 再让另外两个迁移器去搬那些还写着 v1 文本的字节。
 pub fn migrate_layouts(root: &Path) {
     tproject::migrate_legacy_layout(root);
     tpool::migrate_all(root);
     trun::migrate_all(root);
+    tpool::migrate_identity_all(root);
 }
 
 const STDERR_RING_CAP: usize = 200;
