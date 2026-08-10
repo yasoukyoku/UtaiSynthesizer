@@ -1045,6 +1045,8 @@
     "CONVERT_BUSY": "A model conversion is already running — wait for it to finish and try again",
     "CONVERT_RENDER_BUSY": "A render is in progress — start the conversion after it finishes",
     "CONVERT_LOW_MEMORY": "Not enough memory to convert this model — the export ran out of memory. Close other memory-heavy applications and try again, or convert on a machine with more RAM.",
+    "FRESH_RUN_FLAG_INVALID": "The training config's “is this a new run” field holds a value that is not valid. This is an internal error — please report it with the log.",
+    "FRESH_RUN_HAS_PRODUCTS": "This run was supposed to be written into a brand-new run directory, but that directory already holds checkpoints from another run. Training stopped before any preprocessing so nothing would be overwritten — please report it with the log.",
     "MSST_ARCH_UNKNOWN": "Cannot detect the model architecture from the filename",
     "MSST_CONVERT_FAILED": "Model conversion failed",
     "MSST_FILE_NOT_FOUND": "Model file not found",

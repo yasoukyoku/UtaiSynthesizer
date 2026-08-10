@@ -450,6 +450,12 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   RUN_RENAME_FAILED: { key: "backend.RUN_RENAME_FAILED", modal: true },
   RENAME_WHILE_BUSY: { key: "backend.RENAME_WHILE_BUSY", busy: true },
   RENAME_OTHER_INSTANCE: { key: "backend.RENAME_OTHER_INSTANCE", modal: true },
+  // ★§F2⒝ 批 2 ④e 笔 1 —— **python 抛的** CODE(不是 Rust)。它们经 `utai_train.runner` 的
+  // `reporter.error("<类型>: <消息>")` 到达 `store/training.ts`,而 `findCode` 是子串匹配,
+  // 所以这两行就是 python 侧 CODE 头一次不再是一串裸英文。
+  // ⚠ 队列 ④e 检查表第 ⑤ 条要求同批重估「python CODE 没有 i18n」那张表 —— 本轮至少不往里加新条目。
+  FRESH_RUN_HAS_PRODUCTS: { key: "backend.FRESH_RUN_HAS_PRODUCTS", modal: true },
+  FRESH_RUN_FLAG_INVALID: { key: "backend.FRESH_RUN_FLAG_INVALID", modal: true },
   RUN_MIGRATE_FAILED: { key: "backend.RUN_MIGRATE_FAILED", modal: true },
   SLOT_MIGRATE_FAILED: { key: "backend.SLOT_MIGRATE_FAILED", modal: true },
   POOL_FINGERPRINT_WRITE_FAILED: { key: "backend.POOL_FINGERPRINT_WRITE_FAILED" },

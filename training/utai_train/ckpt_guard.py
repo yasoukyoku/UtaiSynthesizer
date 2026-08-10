@@ -174,3 +174,130 @@ def refuse_unreadable(model_dir, exc):
         f"{FAILED_CODE}: {os.path.basename(os.path.normpath(model_dir))} — "
         f"{type(exc).__name__}: {exc}"
     )
+
+
+# ─────────────────── §F2⒝ ④e 笔 1:「这个 run 是新铸的」 ───────────────────
+
+#: The `run.json` key Rust uses to say so. Must equal `tpool`'s sibling — see
+#: `trun::FRESH_RUN_KEY`, whose doc carries the whole rationale.
+FRESH_RUN_KEY = "run_is_fresh"
+
+#: A start that declared itself a fresh mint landed on a directory somebody already trained in.
+FRESH_CODE = "FRESH_RUN_HAS_PRODUCTS"
+#: The carrier itself is malformed — a writer is producing something Rust never emits.
+FRESH_FLAG_CODE = "FRESH_RUN_FLAG_INVALID"
+
+
+def declares_fresh_run(cfg):
+    """Does this config say「the run directory is supposed to be untouched」?
+
+    ⛔ ABSENT ⇒ False, and that is the truthful answer rather than a default: every `run.json`
+    written before ④e describes a start under the old regime, where 「fresh」 was expressed
+    IMPLICITLY by the workspace having just been deleted. Same posture as
+    `pool.identity_version`'s absent⇒1.
+
+    ⛔ Anything that is not a JSON boolean is REFUSED, not coerced. `bool(raw)` would read the
+    string ``"false"`` as True (refusing every resume) and ``0``/``""`` as False (switching the
+    guard off forever). Both are silent, and a carrier that cannot notice its own writer is
+    exactly the failure `trun::FRESH_RUN_KEY` exists to prevent.
+    """
+    raw = cfg.get(FRESH_RUN_KEY)
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise RuntimeError(
+            "%s: run.json's %r must be a JSON boolean, got %r (%s). Rust only ever writes true "
+            "or false; a value of another type means something else wrote this file."
+            % (FRESH_FLAG_CODE, FRESH_RUN_KEY, raw, type(raw).__name__)
+        )
+    return raw
+
+
+def _main_resume_point(run_dir):
+    """A GAN checkpoint from a previous run of this directory, or None.
+
+    ⚠ Step 0 is excluded on purpose and it is not the same exclusion `resume_was_intended` makes
+    for so-vits: there it means「a base is not a resume point」, here it means「a fresh start that
+    died after seeding its base left these behind, and refusing because of them would block the
+    retry」. Same files, different question, same answer.
+
+    ⚠ Either half counts — unlike `resume_was_intended`, which needs the PAIR. A lone `G_800.pth`
+    is not resumable, but it is still a previous run's work that this start would overwrite, and
+    this function's job is 「would anything be destroyed」, not 「could it be continued」.
+    """
+    for pattern in ("G_*.pth", "D_*.pth"):
+        for p in sorted(glob.glob(os.path.join(run_dir, pattern))):
+            if _suffix(p) not in (0, None):
+                return os.path.basename(p)
+    return None
+
+
+def _vocoder_resume_point(run_dir):
+    for p in sorted(glob.glob(os.path.join(run_dir, "model_ckpt_steps_*.ckpt"))):
+        return os.path.basename(p)
+    if os.path.isfile(os.path.join(run_dir, "resume_best", "state.json")):
+        return "resume_best"
+    return None
+
+
+def _diffusion_resume_point(run_dir):
+    # ⚠ Every path here is rooted at `run_dir` rather than at a `diff_dir` local, and that is not
+    # style: `gate_pool_table.py` keeps a census of every `os.path.join` BASE NAME in this tree and
+    # turns red on a new one, because a base it cannot classify as pool-derived or run-derived
+    # silently drops those sites out of its pool/run checks. It caught this function's first form.
+    for p in sorted(glob.glob(os.path.join(run_dir, "diffusion", "model_*.pt"))):
+        if os.path.isfile(p):
+            return "diffusion/" + os.path.basename(p)
+    for snap in ("resume_latest", "resume_best"):
+        if os.path.isfile(os.path.join(run_dir, "diffusion", snap, "state.json")):
+            return "diffusion/" + snap
+    return None
+
+
+def refuse_to_resume_into_a_fresh_run(cfg, run_dir):
+    """⛔ THE ④e guard: a start that says it minted a new run must not find somebody's work there.
+
+    ## Why this exists at all
+
+    「重训」 is becoming 「mint a run beside the old ones」. If the mint ever hands back a directory
+    that is already in use — an id that is a pure function of the family, a migration that did not
+    finish, a hand-built config — python cannot tell: `fresh` never crosses the boundary, an empty
+    `resume_from` is normalised to `"latest"` before it gets here, and `plan_load` judges purely by
+    which files exist. So the trainer would resume the OTHER run and overwrite it while the UI
+    reports a new run.
+
+    ⚠ Honest scope: the five pipelines DO raise 「没有执行任何训练步」 when the collided run has
+    already passed its target, so that case is loud today — after hours of preprocessing are
+    already paid for. The silent case is colliding with a run that is still SHORT of its target,
+    which simply continues it. This guard fires before either.
+
+    ## Why it lives on the `checked_run_dir` path
+
+    That is the one place all five chains pass through with `cfg` in hand, at the top of each
+    `pipeline.run` before anything is created. Putting it in `runner.main` would cover the same
+    five chains and be invisible to `gate_aug0_driver.py`, which imports each pipeline and calls
+    `run()` directly — i.e. the behaviour legs could never drive it.
+
+    ## What counts as「somebody's work」
+
+    The run-level arms of `training::slot_holds_work`, mirrored: the GAN pair, the vocoder's
+    numbered ckpts + resumable snapshot, and the diffusion sub-tree. Checking only the GAN pair
+    would leave the vocoder and diffusion chains structurally uncovered while reading as complete.
+    ⚠ Deliberately BROADER than the Rust probes for the snapshots (a `state.json` is enough; Rust
+    also verifies the payload list). A half-written snapshot is still a previous run's work, and
+    for a refusal the broad side is the safe one — a freshly minted directory has none of these.
+    """
+    if not declares_fresh_run(cfg):
+        return
+    found = (
+        _main_resume_point(run_dir)
+        or _diffusion_resume_point(run_dir)
+        or _vocoder_resume_point(run_dir)
+    )
+    if found is None:
+        return
+    raise RuntimeError(
+        "%s: this start declared a freshly minted run, but %r already holds %r — continuing "
+        "would train on top of another run's checkpoints and overwrite them. Refusing before "
+        "any preprocessing." % (FRESH_CODE, os.path.basename(os.path.normpath(run_dir)), found)
+    )

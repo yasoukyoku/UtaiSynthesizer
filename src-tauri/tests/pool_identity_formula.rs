@@ -43,6 +43,7 @@ const RVC_PY: &str = include_str!("../../training/utai_train/rvc/pipeline.py");
 const VOC_PY: &str = include_str!("../../training/utai_train/vocoder/pipeline.py");
 const POOL_PY: &str = include_str!("../../training/utai_train/pool.py");
 const FLIST_PY: &str = include_str!("../../training/utai_train/sovits/flist.py");
+const CKPT_PY: &str = include_str!("../../training/utai_train/ckpt_guard.py");
 
 /// 一个顶层 python 函数的函数体(到下一个顶格 `def ` 为止)。
 fn top_level_fn(src: &'static str, name: &str, what: &str) -> &'static str {
@@ -407,6 +408,90 @@ fn the_two_languages_build_the_same_identity_suffix() {
     assert!(!d.contains(".wav"), "路径级 replace 会改写目录段");
     assert!(!d.eq_ignore_ascii_case("nul"), "Windows 上 makedirs 成功却什么也没建");
     assert!(!d.contains('_'), "slugify 产出的 slug 一律带 `_`+8 hex ⇒ 无 `_` 就撞不上真说话人");
+}
+
+/// ★★§F2⒝ ④e 笔 1 —— 「这个 run 是新铸的」这条载体,两侧各钉一条。
+///
+/// ## 它守的是什么
+///
+/// ④e 要把「重训」从**删掉整个槽**改成**在旁边铸一个新 run**。那一刀能造出的故障不是崩溃:
+/// 只要铸造哪天把一个**已经在用**的目录交回来(id 是 family 的纯函数、迁移半途、手搭的 cfg),
+/// python **无从分辨** —— `fresh` 根本不过语言边界,空的 `resume_from` 在上游被规范成 `latest`,
+/// 而 `plan_load` 只看文件在不在。于是它续训**别人那个 run** 并覆盖它,而 UI 说新 run 开始了。
+///
+/// ⚠ 诚实边界(交接里写的「没有任何现存判据看得见」是**夸大**,侦察核验推翻了绝对形式):
+/// 五条链**都**有 `steps_run == 0` 的事后抛,所以撞上一个**已经练完**的 run 今天是响亮的
+/// —— 代价是几小时预处理已经付掉。**静默的是撞上一个还没练完的 run**,那才是「再训一个」的常态。
+///
+/// ## ⛔ 为什么这条判据必须钉**右值**
+///
+/// `run_worker` 的作用域里 `req` 就在手边,所以 `json!(req.fresh)` 是最顺手的一笔,而它在
+/// `diff_partial_wipe` 那条臂上是**错的**(那条臂 `fresh==true` 却只删 `<run>/diffusion/`,
+/// run 根下主模型的 `G_*.pth` 全在)⇒ python 会拒绝一次完全正常的「重训(仅扩散)」,
+/// 而且**今天不会有任何判据变红**(扩散链根本不走 `plan_load`)。
+/// ⇒ 右值必须是 `try_start` 里那个具名绑定;绑定本身的右值由 `mod.rs` 的源序棘轮钉。
+#[test]
+fn the_two_languages_agree_on_the_fresh_run_carrier() {
+    use utai_lib::training::trun;
+    // ⑴ 键名逐字相同。⛔ 与 ④d 的版本号键同一种失效:python 对 ABSENT 回落 False(旧 run.json
+    //    描述的确实是旧世界的 start),所以**改名不会报错**,只会让这道闸永远不生效。
+    assert!(
+        CKPT_PY.contains(&format!("FRESH_RUN_KEY = \"{}\"", trun::FRESH_RUN_KEY)),
+        "python 读的 run.json 键与 `trun::FRESH_RUN_KEY` 对不上 —— 改名是**静默**失效"
+    );
+    // ⑵ 缺键必须回落成「不是新铸的」。反过来(缺键⇒True)会让每一次续训都被拒。
+    let reader = top_level_fn(CKPT_PY, "declares_fresh_run", "④e 的载体读点没了");
+    assert!(
+        reader.contains("if raw is None:\n        return False"),
+        "缺键不再回落成「不是新铸的」—— 存量 run.json 会被当成新铸,续训当场被拒"
+    );
+    // ⑶ 非布尔值必须**响亮拒绝**,不许 `bool(raw)`:`\"false\"` 会是 True(拒绝每一次续训),
+    //    `0`/`\"\"` 会是 False(这道闸永远关着)。两种都静默。
+    assert!(
+        reader.contains("if not isinstance(raw, bool):"),
+        "载体的值不再被校验类型 —— 一个写错的写者会静默地把这道闸常开或常关"
+    );
+    // ⑷ Rust 那半的**右值**。照 ④d 的教训:只钉左值对「写死成常量」是瞎的,而写死 `true`
+    //    会让**每一次续训**都声称自己是新铸的 ⇒ 只要盘上有存档就当场拒,功能整个不可用。
+    const FRESH_WRITE: &str =
+        "run_config[trun::FRESH_RUN_KEY] = serde_json::json!(ctx.mints_fresh_run);";
+    assert!(
+        include_str!("../src/training/mod.rs").contains(FRESH_WRITE),
+        "run.json 里那个「是不是新铸的」不再是 `ctx.mints_fresh_run` —— 写成常量或写成 \
+         `req.fresh` 的后果全在 `trun::FRESH_RUN_KEY` 的 doc 里"
+    );
+}
+
+/// ★★§F2⒝ ④e 笔 1 —— 那条闸挂在**五条链共用的那一个**读点上,一条都不许漏。
+///
+/// ⛔ 挂在 `runner.main` 上覆盖面一样,但 `gate_aug0_driver.py` 是 `importlib` 进来直接调
+/// `pipeline.run(cfg, …)` 的 —— 绕开 runner ⇒ **行为腿结构上永远驱不到那条闸**。
+/// 这道断言钉的就是「它挂在腿够得着的那一层」。
+///
+/// ⚠ 与上面那条 `open_pool(…, run_dir)` 的五链断言同形,理由也同:漏掉一条链是**静默**的。
+#[test]
+fn every_chain_routes_its_run_dir_through_the_fresh_run_guard() {
+    for c in chains() {
+        assert!(
+            c.src.contains("checked_run_dir(cfg, slot_dir)"),
+            "{}: 这条链不再经过共用的 run 目录解析器 —— ④e 的闸(以及 RUN_DIR_NOT_IN_SLOT)\
+             对它零覆盖",
+            c.name
+        );
+    }
+    // …而那个解析器**真的**调闸。⛔ 少了这一句,上面五条断言就退化成「五条链都调了一个不做事的
+    //   函数」——「测试自己是空的」那一族。
+    let body = top_level_fn(POOL_PY, "checked_run_dir", "共用的 run 目录解析器没了");
+    assert!(
+        body.contains("ckpt_guard.refuse_to_resume_into_a_fresh_run(cfg, run_dir)"),
+        "共用读点不再问「这个新铸的 run 是不是已经有人练过了」"
+    );
+    // 闸自己必须把三类产物都看一遍:只查 GAN 那对,等于扩散与声码器两条链**结构上没被盖到**,
+    // 而报告读起来像盖全了。
+    let guard = top_level_fn(CKPT_PY, "refuse_to_resume_into_a_fresh_run", "④e 的闸没了");
+    for arm in ["_main_resume_point(", "_diffusion_resume_point(", "_vocoder_resume_point("] {
+        assert!(guard.contains(arm), "④e 的闸少了一类续训点:{arm}");
+    }
 }
 
 /// ★④d 去名字化的**两个守卫**,一条一条钉住。

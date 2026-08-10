@@ -67,6 +67,8 @@ import json
 import logging
 import os
 
+from . import ckpt_guard
+
 logger = logging.getLogger(__name__)
 
 #: Container for every pool of one slot. Must equal `tpool::POOLS_DIR`.
@@ -249,6 +251,11 @@ def checked_run_dir(cfg, slot_dir):
             "RUN_DIR_NOT_IN_SLOT: %r is neither the slot %r nor a run under its %r container"
             % (run_dir, slot_dir, RUNS_DIR)
         )
+    # ★§F2⒝ ④e 笔 1 — and while we are the one place every chain resolves its run, ask the other
+    # question about that directory: if this start says it MINTED it, nobody may have trained
+    # there. See `ckpt_guard.refuse_to_resume_into_a_fresh_run` for why here and not in `runner`.
+    # ⇒ no-op until Rust starts writing `run_is_fresh: true`, which is ④e's next 笔.
+    ckpt_guard.refuse_to_resume_into_a_fresh_run(cfg, run_dir)
     return run_dir
 
 

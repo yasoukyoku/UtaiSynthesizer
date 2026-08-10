@@ -1045,6 +1045,8 @@
     "CONVERT_BUSY": "已有一个模型转换在进行中，请等它完成后再试",
     "CONVERT_RENDER_BUSY": "渲染任务进行中，请等渲染完成后再开始转换",
     "CONVERT_LOW_MEMORY": "内存不足，无法转换该模型——导出过程内存耗尽。请关闭其他占用内存的程序后重试，或换一台内存更大的机器转换。",
+    "FRESH_RUN_FLAG_INVALID": "训练配置里「是否新建 run」这一项的取值不合法。这属于内部错误，请把日志反馈给我们。",
+    "FRESH_RUN_HAS_PRODUCTS": "这次训练本应写进一个全新的 run，但那个目录里已经有别的 run 练出来的存档了。为避免覆盖它，训练在开始预处理之前就停下了。请把日志反馈给我们。",
     "MSST_ARCH_UNKNOWN": "无法从文件名识别模型架构",
     "MSST_CONVERT_FAILED": "模型转换失败",
     "MSST_FILE_NOT_FOUND": "找不到模型文件",

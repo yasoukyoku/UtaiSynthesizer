@@ -119,6 +119,45 @@ pub const SLOT_LAYOUT_RUNS: u32 = 3;
 /// reader that will one day refuse to open a perfectly good project.
 pub const POOL_REF: &str = "pool.json";
 
+/// The `run.json` key that tells python **this start is supposed to be writing into a run nobody
+/// has trained yet**. Must equal `utai_train.ckpt_guard.FRESH_RUN_KEY`.
+///
+/// ★§F2⒝ ④e 笔 1 — the carrier, landed BEFORE the behaviour it guards, exactly as
+/// [`tpool::IDENTITY_VERSION_KEY`](super::tpool::IDENTITY_VERSION_KEY) was.
+///
+/// ## What it is for
+///
+/// 「重训」 is about to stop erasing the slot and start MINTING a run beside the old ones. The
+/// failure that change can produce is not a crash: if the mint ever hands back a directory that is
+/// already in use — an id that is a pure function of the family (today's [`legacy_run_id`]), a
+/// half-finished migration, a hand-built config — then nothing anywhere notices. `fresh` does not
+/// cross the language boundary at all, an empty `resume_from` is normalised to `"latest"`, and
+/// `ckpt_guard.plan_load` decides purely on whether files exist. So the trainer resumes the OTHER
+/// run and overwrites it, while the UI says a new run has started.
+///
+/// ⚠ Honest scope, because the ④e handover overstated this and the recon caught it: all five
+/// chains DO raise 「没有执行任何训练步」 when the collided run has already reached its target, so
+/// that case is loud today — after the user has paid for the preprocessing. The silent case is the
+/// common one: colliding with a run that is still short of its target, which simply continues it.
+///
+/// ## Why THIS file and not the manifest
+///
+/// `run.json` being rewritten wholesale on every start is a defect for a durable fact (see
+/// [`POOL_REF`] above) and exactly the right property for a per-START signal: it cannot be
+/// inherited. `run_manifest.json` is the opposite and would LIE here — `try_start` reads the old
+/// manifest from the run resolved BEFORE the mint and merge-writes it into the run resolved AFTER
+/// it, so a 「this run is new」 marker placed there would be copied out of the previous run.
+///
+/// ⛔ ABSENT means "not a fresh mint" — the truthful answer for every `run.json` written before
+/// this key existed, and for every hand-built gate config. It is also the fail-SAFE direction:
+/// the guard behind this key can only ever refuse, so a missing key costs nothing but a missing
+/// refusal, whereas a defaulted-true key would refuse legitimate 续训 for everyone.
+/// ⚠ The value is a JSON boolean and python refuses anything else rather than coercing: a writer
+/// that emits `"false"` would otherwise switch the guard ON for every resume, and one that emits
+/// `0`/`""` would switch it OFF forever — silently, which is the one failure a carrier cannot
+/// notice about itself.
+pub const FRESH_RUN_KEY: &str = "run_is_fresh";
+
 /// Staging directory for a run migration in flight. Dot-prefixed for the same reason layout 2's
 /// is: a half-filled `runs/<id>/` would be readable as a run.
 const STAGING_PREFIX: &str = ".mig_run_";

@@ -2005,7 +2005,15 @@ impl TrainingManager {
         // one branch where a `fresh` start destroys nothing and the identity must therefore hold.
         // ⛔ Reading `req.fresh` alone here (its first form) let 「重训(仅扩散)」 of a RENAMED run
         // mint a new slug against a run whose products all still exist — see the function's doc.
-        let slug = effective_artifact_slug(&run, &req, req.fresh && !diff_partial_wipe);
+        //
+        // ★§F2⒝ ④e 笔 1 — the same question python has to be told the answer to
+        // (`trun::FRESH_RUN_KEY`), so it is ONE binding rather than the expression written twice.
+        // ⛔ Not `req.fresh`: on the `diff_partial_wipe` branch that flag is true while the run
+        // keeps its main `G_*.pth`/`D_*.pth`, so a python guard fed `req.fresh` would refuse
+        // 「重训(仅扩散)」 outright — and refuse it INVISIBLY today, because the diffusion chain
+        // does not go through `plan_load` and no current criterion drives that branch.
+        let mints_fresh_run = req.fresh && !diff_partial_wipe;
+        let slug = effective_artifact_slug(&run, &req, mints_fresh_run);
 
         // ---- resume-parameter guard ----
         // The rule itself lives in `resume_lock` — ONE table plus ONE enforcement, driven
@@ -2289,6 +2297,7 @@ impl TrainingManager {
             loudnorm: eff_loudnorm,
             interval_force_save,
             aug_copies: eff_aug_copies,
+            mints_fresh_run,
             python,
             device_backend,
             runtime_variant,
@@ -2395,6 +2404,15 @@ struct RunCtx {
     interval_force_save: u32,
     /// S41 effective augmentation copies (manifest-inherited for sovits_diff)
     aug_copies: u32,
+    /// ★§F2⒝ ④e 笔 1 — does this start write into a run that nobody has trained yet?
+    /// Handed to python as `trun::FRESH_RUN_KEY`.
+    ///
+    /// ⛔ Decided in `try_start` and CARRIED, like every other effective value here, and for a
+    /// harder reason than usual: the answer is `req.fresh && !diff_partial_wipe`, and
+    /// `diff_partial_wipe` is a local of `try_start` that depends on the PRE-wipe disk. `req` is
+    /// in scope down in `run_worker`, so re-deriving it there would compile, read naturally, and
+    /// be wrong on exactly the one branch (「重训(仅扩散)」) whose run keeps all of its products.
+    mints_fresh_run: bool,
     /// S75: device resolution, decided at PREFLIGHT and carried here. It is NOT re-derived in
     /// run_worker — that placement is exactly what the S68b review moved out (a refusal on a
     /// fully-decidable condition must not cost a wiped workspace plus a multi-minute import).
@@ -2962,6 +2980,16 @@ fn run_worker(
     // (Assigned rather than written into the `json!` block above so the key is one named
     // constant on both sides of the language boundary — see `tpool::IDENTITY_VERSION_KEY`.)
     run_config[tpool::IDENTITY_VERSION_KEY] = serde_json::json!(tpool::identity_version(&workspace));
+    // ★§F2⒝ ④e 笔 1 — the FOURTH fact only this side can establish: 「this run directory is
+    // supposed to be untouched」. python cannot derive it (`fresh` never crosses the boundary, an
+    // empty `resume_from` is normalised to "latest" one screen up, and `plan_load` judges purely
+    // by which files exist), and after ④e flips the mint it is the only thing standing between
+    // 「a new run」 and 「someone else's run, continued and overwritten」.
+    // ⛔ `ctx.mints_fresh_run`, never `req.fresh` — see the field's doc: the two differ exactly on
+    // 「重训(仅扩散)」, whose run legitimately keeps its main checkpoints.
+    // (Assigned outside the `json!` block above so the key is one named constant on each side of
+    // the language boundary, same as the line above it.)
+    run_config[trun::FRESH_RUN_KEY] = serde_json::json!(ctx.mints_fresh_run);
     // ①c: the sovits pipeline's resolve_speakers reads this array for co-training;
     // single-speaker omits the key entirely -> pipeline falls back to
     // dataset_dir/model_slug = byte-identical run.json / behavior.
@@ -4419,13 +4447,34 @@ mod tests {
              destroys this run's products — `req.fresh` alone is true on the diffusion partial \
              wipe, which deletes only <run>/diffusion/"
         );
+        // ★§F2⒝ ④e 笔 1 re-anchored this: the third argument is now a NAMED binding, because
+        // python needs the same answer (`trun::FRESH_RUN_KEY`) and writing the expression twice is
+        // how the two would drift. Re-anchoring a ratchet must preserve the PROPERTY it holds, not
+        // just make it green, so the binding's own right-hand side is pinned here too — plus the
+        // negative for the one-word edit that would break it.
+        assert!(
+            !code.contains(concat!("let mints_fresh_run = req.fresh;", "")),
+            "the fresh-run carrier is being computed from `req.fresh` alone. That is TRUE on \
+             「重训(仅扩散)」, whose run keeps its main G_*/D_* — so python's guard would refuse a \
+             perfectly good partial retrain, and refuse it invisibly (the diffusion chain has no \
+             `plan_load` call and no criterion drives that branch today)."
+        );
         let resolve_run = at(concat!("let run = trun::resolve_run_dir(&workspace, ", "req_run)?;"));
         let partial = at(concat!("let diff_partial_wipe =", "\n"));
+        let mints = at(concat!(
+            "let mints_fresh_run = req.fresh && ",
+            "!diff_partial_wipe;"
+        ));
         let slug = at(concat!(
-            "let slug = effective_artifact_slug(&run, &req, req.fresh && ",
-            "!diff_partial_wipe);"
+            "let slug = effective_artifact_slug(&run, &req, ",
+            "mints_fresh_run);"
         ));
         let wipe = at("remove_dir_all_robust(&workspace)");
+        assert!(
+            partial < mints && mints < slug,
+            "the binding that answers「这次启动会不会毁掉本 run 的产物」 no longer sits between the \
+             flag it reads and the slug it feeds"
+        );
         assert!(resolve_run < slug, "the slug is taken before its run is known");
         assert!(
             partial < slug,
