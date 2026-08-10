@@ -536,7 +536,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   WORKSPACE_BACKEND_MISMATCH: { key: "backend.WORKSPACE_BACKEND_MISMATCH" },
   WORKSPACE_MANIFEST_MISSING: { key: "backend.WORKSPACE_MANIFEST_MISSING" },
   WORKSPACE_DELETE_FAILED: { key: "backend.WORKSPACE_DELETE_FAILED" },
-  WORKSPACE_WIPE_FAILED: { key: "backend.WORKSPACE_WIPE_FAILED" },
+  // ⚰ `WORKSPACE_WIPE_FAILED` 曾经在这里。它的**最后一个产生点**随 S132 的 flip 一起没了
+  // (那一笔删掉的正是 `remove_dir_all_robust(&workspace)`),而它描述的动作在产品里已经不存在 ——
+  // 一条到不了用户面前的文案就是一条会误导下一个人的文案。S133 连同三语一起清掉。
   // S74: emitted by the runtime-pack self-test (utai_train/envtest.py check_torch_backend, xpu
   // tier) — torch-XPU found no Arc-family GPU. Surfaces per-check in the Settings pack list, so
   // a pre-Arc Intel user learns WHY instead of reading a bare check name.

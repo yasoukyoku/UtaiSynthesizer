@@ -2141,12 +2141,14 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       let diffResumeFrom: "latest" | "best" = "latest";
       if (info.exists) {
         const hasProgress = info.diff_steps > 0;
-        // 重训 only spares the workspace when a main model lives in it — a
-        // diff-only workspace gets fully wiped (that is what unlocks a version
-        // change); the dialog must not promise otherwise (review F17)
+        // ★★§F2⒝ ④e — this branch's meaning FLIPPED and the text did not follow.
+        // `diff_partial_wipe` requires `has_main`, so with NO main model 「重训」 falls through to
+        // `mints_fresh_run` ⇒ it mints a new run and deletes nothing. The old note promised
+        // 「清空整个工作区(含预处理缓存)」, which is now exactly backwards — the pool is shared
+        // and untouched, and the previous diff-only run stays where it is.
         const wipeNote = info.has_main_progress
           ? ""
-          : " " + t("training.diffRetrainFullWipeNote");
+          : " " + t("training.diffRetrainMintsNewRunNote");
         // ★S118 §F8⒜ — the diffusion twin of the GAN dialog's option, gated on the DIFFUSION
         // snapshot (`diff_best_resume_step`) and never on `best_resume_step`: a sovits_diff probe
         // resolves to the sovits SLOT, so that field describes the MAIN model's G+D snapshot and
@@ -2238,10 +2240,12 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
           : config.backend === "sovits_v2"
             ? "4.0-v2"
             : config.sovitsVersion;
-    // the wipe would also destroy any diffusion training progress living in
-    // this workspace — the user must see that before choosing 重训
+    // ★★§F2⒝ ④e — 「重训」 no longer wipes anything: it MINTS a new run beside this one. So the
+    // shallow-diffusion progress in the CURRENT run is not destroyed — it simply does not come
+    // along, and the new run starts without it. The old wording (「重训将一并清除」) survived the
+    // flip and was still telling the user their diffusion was about to be deleted.
     const diffWarn =
-      info.diff_steps > 0 ? " " + t("training.retrainWipesDiff", { steps: info.diff_steps }) : "";
+      info.diff_steps > 0 ? " " + t("training.retrainKeepsDiffBehind", { steps: info.diff_steps }) : "";
 
     if (wsExists) {
       // S78: the resume-guarded params can no longer DIFFER — the parameters page renders them

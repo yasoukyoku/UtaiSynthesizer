@@ -692,21 +692,24 @@ export function ProjectDetail() {
             // run 之后**拒绝作答**,而四个槽是经同一个 `Result` 收上来的。
             const runs = slot?.runs ?? [];
             const startedRun = (r: RunDetail) => r.hasResumePoint || r.info.has_main_progress;
-            const started = runs.some(startedRun);
             /** ⛔★★§F2⒝ ④e —— 画哪几行。
              *
              *  此前是 `runs.filter(startedRun)`,而 flip 之后那条过滤会**结构性**地藏起最需要
-             *  被删的那一类:`try_start` 先建 run 目录、再跑几小时预处理,中途崩/强停/盘满
-             *  留下的就是一个**有目录、没有断点**的 run。它两个条件都假 ⇒ 零行零按钮,却
-             *  ⑴ 计进 `runs.length` 的徽标(卡片写「2 个 run」而下面只有 1 行,当场自相矛盾)、
-             *  ⑵ 计进 `list_runs`(于是那个槽的每一次探针都要靠 runId 才答得出)、
-             *  ⑶ 计进 `SlotDetail.bytes`(盘看得见、删不掉)。
-             *  ⇒ 只要这个槽**不止一个 run**,就把每一个都画出来 —— 恰恰因为那时才需要挑。
-             *  单 run 的槽保持原样(未开始 ⇒ 显示「尚未开始」+ 槽级「开始」按钮)。
-             *
-             *  ⚠ `id === ""` 那一行是后端在**零 run** 时伪造的(`get_training_project`),它寻址
-             *  的是**槽根**。删除按钮因此按 id 非空来画,而不是按这条过滤 —— 显示条件不是校验。 */
-            const visibleRuns = runs.length > 1 ? runs : runs.filter(startedRun);
+             *  被删的那一类:`run_manifest.json` 在 spawn **之前**就写好,随后的切片/f0/特征要
+             *  跑几小时 —— 中途崩/强停/盘满留下的就是一个**有目录、有 manifest、没有断点**的
+             *  run。它两个条件都假 ⇒ 零行零按钮,却
+             *  ⑴ 计进 `runs.length` 的徽标(卡片写「2 个 run」而下面只有 1 行);
+             *  ⑵ 计进 `list_runs`(那个槽从此每一次探针都要靠 runId);
+             *  ⑶ 计进 `SlotDetail.bytes`(盘看得见、删不掉);
+             *  ⑷ ★ 它是一个**满强度的冻结源** —— manifest 里有 `speakers` ⇒ 整个项目的数据集
+             *     被它锁着,而卡片上写着「尚未开始」。同一屏两句话互相打脸,而且新文案里
+             *     「去逐个 run 删掉」的指引对它**执行不下去**。
+             *  ⇒ 真正的 run(`id` 非空)一律画出来。只有那条 `id === ""` 的伪造行(后端在**零
+             *  run** 时补的,寻址**槽根**)仍然按「练出过东西」过滤 —— 那种槽本来就没有 run 可挑。 */
+            const visibleRuns = runs.filter((r) => r.id !== "" || startedRun(r));
+            // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
+            // 同时「尚未开始」的自相矛盾。
+            const started = visibleRuns.length > 0;
             return (
               <div key={f} className={`tproj-slot ${started ? "started" : ""}`}>
                 <div className="tproj-slot-head">
