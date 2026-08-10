@@ -108,7 +108,7 @@ def run(cfg, reporter, stop):
     # ⛔ The SLOT, never `run_dir`: this resolves `<slot>/pools/*` and treats a matching slot root
     # as a pool. Handed a run it would find neither, mint an empty pool INSIDE the run and re-run
     # hours of preprocessing — with one info line as the only sign.
-    pool_dir = open_pool(slot_dir, fp_src)
+    pool_dir = open_pool(slot_dir, fp_src, run_dir)
     assert_identity(pool_dir, fp_src)
 
     per = float(cfg.get("per", 3.7))

@@ -102,6 +102,23 @@ pub const RUNS_DIR: &str = "runs";
 /// single run product. The two migrations advance the same file, one step each.
 pub const SLOT_LAYOUT_RUNS: u32 = 3;
 
+/// What a run records about the POOL it preprocessed into. Must equal `utai_train.pool.POOL_REF`.
+///
+/// ★§F2⒝ ④d — nothing on disk has ever recorded the run↔pool edge. ④e ("重训 = a new run", and
+/// managing/DELETING old runs) cannot reclaim a pool without it: once a slot holds several runs
+/// over several pools, 「这些字节还有人用吗」 has no answer, and re-deriving it means re-reading
+/// every imported audio file.
+///
+/// ⛔ **python writes it, and it is a file of its own.** Both halves are forced:
+/// * Rust cannot compute the value — the pool is named by the dataset fingerprint;
+/// * and a key appended to `run.json` would not survive, because `try_start` rewrites that file
+///   wholesale on every start. It would vanish exactly for the runs that trained more than once.
+///
+/// ⚠ An ANNOTATION, never an authority (same posture as `dsmanifest`): absent for every run that
+/// predates it, and absent whenever the write failed. A reader that cannot cope with `None` is a
+/// reader that will one day refuse to open a perfectly good project.
+pub const POOL_REF: &str = "pool.json";
+
 /// Staging directory for a run migration in flight. Dot-prefixed for the same reason layout 2's
 /// is: a half-filled `runs/<id>/` would be readable as a run.
 const STAGING_PREFIX: &str = ".mig_run_";
@@ -164,6 +181,9 @@ pub const RUN_ENTRIES: &[RunEntry] = &[
     // ── run metadata ────────────────────────────────────────────────────────────────────
     RunEntry::Exact("run.json"),
     RunEntry::Exact("run_manifest.json"),
+    // ★§F2⒝ ④d — WHICH pool this run used ([`POOL_REF`]). A run product even though it names a
+    // pool: it is this run's record of a choice, and two runs of one slot can name two pools.
+    RunEntry::Exact("pool.json"),
     // ── weights and the resume sidecars ─────────────────────────────────────────────────
     RunEntry::Exact("weights"),
     RunEntry::Exact("best_state.json"),
@@ -203,6 +223,40 @@ pub const RUN_ENTRIES: &[RunEntry] = &[
     // preview, and today it is survivable only because 重训 deletes the whole slot.
     RunEntry::Exact("audition"),
 ];
+
+/// ⛔ Every file a run OWNS has to be in [`RUN_ENTRIES`], and the two ends of that rule live in
+/// different places: the name is a constant used by the writer and the reader, the table is what
+/// the layout 2→3 fold consults. Removing the row is silent — an unmigrated slot (where the run IS
+/// the slot root) would then have its `pool.json` classified as UNKNOWN and left behind at the slot
+/// root, so the folded run has no record and the slot root keeps a stale one.
+///
+/// ⚠ A table cannot check itself: a fixture built BY iterating `RUN_ENTRIES` goes green when a row
+/// is deleted, because the fixture stops creating that file too. This assertion is the outside end.
+const _: () = {
+    let mut i = 0;
+    let mut found = false;
+    while i < RUN_ENTRIES.len() {
+        if let RunEntry::Exact(n) = RUN_ENTRIES[i] {
+            // `const` context: compare bytes, `str::eq` is not const here.
+            if n.len() == POOL_REF.len() {
+                let (a, b) = (n.as_bytes(), POOL_REF.as_bytes());
+                let mut j = 0;
+                let mut same = true;
+                while j < a.len() {
+                    if a[j] != b[j] {
+                        same = false;
+                    }
+                    j += 1;
+                }
+                if same {
+                    found = true;
+                }
+            }
+        }
+        i += 1;
+    }
+    assert!(found, "POOL_REF is not in RUN_ENTRIES — the fold would leave it at the slot root");
+};
 
 /// Does this top-level slot entry move into the run?
 pub fn is_run_entry(name: &str) -> bool {
@@ -339,6 +393,19 @@ impl RunDir {
     pub fn path(&self) -> &Path {
         &self.0
     }
+}
+
+/// WHICH pool this run preprocessed into — the directory name under `<slot>/pools/`.
+///
+/// `None` covers three genuinely different things, and none of them is an error: the run predates
+/// [`POOL_REF`], the record could not be written, or the pool IS the slot root (an unmigrated
+/// slot, where there is no id to name). §F2⒝ ④e is the consumer; today nothing reads it, which is
+/// deliberate — the edge has to exist on disk BEFORE the batch that needs it, because that batch
+/// can no longer derive it.
+pub fn pool_of_run(run: &RunDir) -> Option<String> {
+    let raw = std::fs::read_to_string(run.path().join(POOL_REF)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v["pool_id"].as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
 impl std::ops::Deref for RunDir {

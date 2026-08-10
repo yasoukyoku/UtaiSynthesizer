@@ -171,20 +171,23 @@ fn tokens_of(src: &str) -> BTreeSet<String> {
 struct Chain {
     name: &'static str,
     region: &'static str,
+    /// 这条链的整份源码 —— `region` 在 `open_pool(` 处收尾,所以它**看不到那次调用的实参**。
+    src: &'static str,
     emitted: BTreeSet<String>,
 }
 
 fn chains() -> Vec<Chain> {
     let h = helper_body();
     let raw: [(&'static str, &'static str, &'static str); 5] = [
-        ("sovits", h, own_region(SOVITS_PY, "sovits")),
-        ("sovits_diff", h, own_region(DIFF_PY, "sovits_diff")),
-        ("sovits_v2", h, own_region(V2_PY, "sovits_v2")),
-        ("rvc", "", own_region(RVC_PY, "rvc")),
-        ("vocoder", "", own_region(VOC_PY, "vocoder")),
+        ("sovits", h, SOVITS_PY),
+        ("sovits_diff", h, DIFF_PY),
+        ("sovits_v2", h, V2_PY),
+        ("rvc", "", RVC_PY),
+        ("vocoder", "", VOC_PY),
     ];
     raw.into_iter()
-        .map(|(name, shared, region)| {
+        .map(|(name, shared, src)| {
+            let region = own_region(src, name);
             let mut emitted = tokens_of(&format!("{shared}\n{region}"));
             if region.contains("identity_suffix(") {
                 emitted.insert("aug".into());
@@ -192,7 +195,7 @@ fn chains() -> Vec<Chain> {
                     emitted.insert("sr".into());
                 }
             }
-            Chain { name, region, emitted }
+            Chain { name, region, src, emitted }
         })
         .collect()
 }
@@ -329,7 +332,19 @@ fn every_chain_appends_the_one_shared_suffix_last() {
         }
     }
 
-    // ⑷ 只有 rvc 传采样率。它是五条链里唯一一条采样率是用户选的;另外四条硬编 44100,
+    // ⑷ 五条链都把 `run_dir` 交给 `open_pool` —— 那是 run↔pool 这条边**唯一**的记录点
+    //    (④e 的池回收离了它就没有答案,而 Rust 算不出池名:池由数据集指纹命名)。
+    //    ⚠ 漏掉一条链是**静默**的:`run_dir` 是可选参数,不传就是不记,没有任何东西会说话。
+    for c in chains() {
+        assert!(
+            c.src.contains("open_pool(slot_dir, fp_text, run_dir)")
+                || c.src.contains("open_pool(slot_dir, fp_src, run_dir)"),
+            "{}: 这条链没有把 run_dir 交给 open_pool —— 它选的池不会被记下来",
+            c.name
+        );
+    }
+
+    // ⑸ 只有 rvc 传采样率。它是五条链里唯一一条采样率是用户选的;另外四条硬编 44100,
     //    给它们发一个恒定的 token 只会让每一个存量池当场换身份。
     let with_sr: Vec<&str> = chains()
         .iter()

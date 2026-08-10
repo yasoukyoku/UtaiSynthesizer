@@ -1071,6 +1071,47 @@ fn repoint_resume_sidecars(slot: &Path, steps: &[PoolStep]) -> usize {
     changed
 }
 
+/// Give every existing run its `pool.json`, while the answer is still cheap to know. Returns how
+/// many were written.
+///
+/// ★§F2⒝ ④d — this migration is the LAST moment when the run↔pool edge is knowable from here: at
+/// layout 3 a slot holds exactly one run, so a single pool leaves no ambiguity. ④e turns that into
+/// several runs over several pools with nothing on disk to tell them apart, and re-deriving the
+/// edge then means re-reading every imported audio file (the pool is named by its fingerprint).
+///
+/// ⛔ Written ONLY when the slot has exactly one pool. With two, this side genuinely does not know
+/// — and a guessed edge is worse than an absent one, because ④e's reclamation would use it to
+/// decide which bytes may go.
+/// ⛔ Never overwrites: python records this from inside the run it belongs to and therefore always
+/// knows better; a backfill that clobbered it would replace a fact with an inference.
+fn backfill_pool_refs(slot: &Path) -> usize {
+    let named: Vec<PoolInfo> =
+        list_pools(slot).into_iter().filter(|p| !p.fp_text.is_empty()).collect();
+    let [only] = &named[..] else { return 0 };
+    let mut n = 0usize;
+    // `list_runs`, not `run_dirs`: the latter answers「槽根就是那个 run」for a slot with no `runs/`
+    // container, and writing this file at the SLOT root would put a run product one level up —
+    // after the migration that would have moved it has already gone by.
+    let run_dirs: Vec<PathBuf> = super::trun::list_runs(slot).into_iter().map(|r| r.dir).collect();
+    for dir in run_dirs {
+        let final_path = dir.join(super::trun::POOL_REF);
+        if final_path.exists() {
+            continue;
+        }
+        let body = match serde_json::to_vec(&serde_json::json!({ "pool_id": only.id })) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let tmp = dir.join(format!("{}.tmp", super::trun::POOL_REF));
+        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &final_path).is_ok() {
+            n += 1;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    n
+}
+
 /// Re-stamp one slot's pools with the v2 identity text. Idempotent.
 pub fn migrate_slot_identity(slot: &Path, family: &str) -> Result<IdentityOutcome> {
     if !slot.is_dir() {
@@ -1096,6 +1137,14 @@ pub fn migrate_slot_identity(slot: &Path, family: &str) -> Result<IdentityOutcom
         )));
     }
     let commit = |slot: &Path| -> Result<()> {
+        // The run↔pool edge, recorded while it is still knowable — see [`backfill_pool_refs`].
+        // Inside `commit` so BOTH commit paths (work done / nothing to do) get it, and before the
+        // marker for the same reason every non-idempotent side effect is: a kill in between leaves
+        // the slot at layout 3 and the next boot does it again.
+        let wrote = backfill_pool_refs(slot);
+        if wrote > 0 {
+            tracing::info!("pool identity: recorded the pool of {wrote} run(s) in {}", slot.display());
+        }
         // Read-modify-write: `..Default::default()` would drop a newer build's unknown keys, which
         // is exactly what `SlotMeta::extra` exists to prevent.
         let mut meta = read_slot_meta(slot).unwrap_or_default();
@@ -1526,6 +1575,72 @@ mod tests {
         assert_eq!(read_slot_meta(&empty).unwrap().layout, SLOT_LAYOUT_POOL_ID);
         let _ = std::fs::remove_dir_all(slot);
         let _ = std::fs::remove_dir_all(empty);
+    }
+
+    /// ★§F2⒝ ④d —— run↔pool 这条边:盘上从来没有任何东西记过它,而 ④e 的「旧 run 可管理/删除」
+    /// 离了它就回收不了池。迁移是**最后一次便宜地知道**它的时刻(layout 3 的槽恰好一个 run)。
+    ///
+    /// ⛔ 只在**恰好一个池**时写:两个池时这一侧是真的不知道,而一条猜出来的边比没有更糟 ——
+    /// ④e 会拿它去决定哪些字节可以删。
+    #[test]
+    fn the_run_to_pool_edge_is_recorded_while_it_is_still_knowable() {
+        let slot = layout3_slot("id_poolref", serde_json::json!({ "aug_copies": 0 }));
+        let pool = mk_pool(&slot, "p00000000000a", "aaaa|enc=x|loudnorm=0");
+        let run = slot.join("runs").join("r0123456789ab");
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert_eq!(
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]),
+            Some("p00000000000a".to_string())
+        );
+        assert!(!slot.join(super::super::trun::POOL_REF).exists(), "写到槽根去了");
+        let _ = pool;
+
+        // ⛔ 一个**没有 `runs/` 容器**的 layout-3 槽(迁移时无产物可搬)——`run_dirs` 对它答
+        //    「槽根就是那个 run」,照它写就把一个 run 产物落在**槽根**,而会搬走它的那次迁移
+        //    已经过去了。
+        let noruns = tmp_slot("id_poolref_noruns");
+        write_slot_meta(&noruns, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        mk_pool(&noruns, "p00000000000a", "aaaa|enc=x|loudnorm=0");
+        std::fs::write(noruns.join("run_manifest.json"), br#"{"aug_copies":0}"#).unwrap();
+        assert_eq!(migrate_slot_identity(&noruns, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert!(
+            !noruns.join(super::super::trun::POOL_REF).exists(),
+            "把一个 run 产物写到了槽根"
+        );
+        let _ = std::fs::remove_dir_all(noruns);
+
+        // …而两个池时**不猜**。
+        let two = layout3_slot("id_poolref2", serde_json::json!({ "aug_copies": 0 }));
+        mk_pool(&two, "p00000000000a", "aaaa|enc=x|loudnorm=0");
+        mk_pool(&two, "p00000000000b", "bbbb|enc=x|loudnorm=0");
+        assert_eq!(migrate_slot_identity(&two, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert!(
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&two)[0]).is_none(),
+            "两个池时不许猜一条边出来"
+        );
+
+        // 读者对「记了但没答案」必须答 None:python 在**未迁移的槽**上写的正是 `null`,
+        // 而一个空串会被当成一个真的池名传给 ④e 的回收。
+        std::fs::write(run.join(super::super::trun::POOL_REF), br#"{"pool_id":null}"#).unwrap();
+        assert!(super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]).is_none());
+        std::fs::write(run.join(super::super::trun::POOL_REF), br#"{"pool_id":""}"#).unwrap();
+        assert!(
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]).is_none(),
+            "空串被当成了一个真的池名"
+        );
+
+        // …而 python 已经写下的那份不许被回填覆盖(它是从 run 内部看到的事实)。
+        std::fs::write(run.join(super::super::trun::POOL_REF), br#"{"pool_id":"pFROMPYTHON"}"#)
+            .unwrap();
+        write_slot_meta(&slot, &SlotMeta { layout: 3, ..Default::default() }).unwrap();
+        assert_eq!(migrate_slot_identity(&slot, "sovits").unwrap(), IdentityOutcome::Committed);
+        assert_eq!(
+            super::super::trun::pool_of_run(&super::super::trun::run_dirs(&slot)[0]),
+            Some("pFROMPYTHON".to_string()),
+            "回填覆盖了 python 记下的事实"
+        );
+        let _ = std::fs::remove_dir_all(slot);
+        let _ = std::fs::remove_dir_all(two);
     }
 
     /// ⛔ 准入的**下**界,而它守的是同一个「结构上恒空」的陷阱换了个入口:一个还没被前两步折过

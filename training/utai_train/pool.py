@@ -63,6 +63,7 @@ ever being read as a number. `src-tauri/src/training/tpool.rs` states the same t
 asserts them; `gate_pool_table.py` drives the two derivations against each other.
 """
 import hashlib
+import json
 import logging
 import os
 
@@ -76,6 +77,19 @@ FINGERPRINT = "dataset.fingerprint"
 
 #: Container for every RUN of one slot. Must equal `trun::RUNS_DIR`.
 RUNS_DIR = "runs"
+
+#: What a RUN records about the pool it preprocessed into. Must equal `trun::POOL_REF`.
+#:
+#: ★§F2⒝ ④d — nothing on disk has ever recorded the run↔pool edge, and §F2⒝ ④e ("重训 = a new
+#: run", plus managing and DELETING old runs) cannot reclaim a pool without it: a slot will hold
+#: several runs sharing several pools, and "which bytes may go" has no answer.
+#:
+#: ⛔ It is a file of its own rather than a key in `run.json`, and that is not a style choice:
+#: Rust REWRITES `run.json` wholesale on every start, so a key python appended would vanish on the
+#: next one — silently, and precisely for the runs that have been trained more than once.
+#: ⛔ And it is written HERE rather than by Rust, because Rust cannot compute it: the pool is named
+#: by the dataset fingerprint, and computing that means reading every imported file.
+POOL_REF = "pool.json"
 
 #: The pool-identity FORMULA version this python understands. Must equal
 #: `tpool::POOL_IDENTITY_VERSION`. See [`identity_version`] for what the number gates.
@@ -295,7 +309,34 @@ def list_pools(slot_dir):
     return out
 
 
-def open_pool(slot_dir, fp_text):
+def _record_pool_choice(run_dir, slot_dir, pool_dir):
+    """Write `<run>/pool.json` — WHICH pool this run just resolved. Best-effort.
+
+    Best-effort on purpose: this is an ANNOTATION for §F2⒝ ④e's reclamation, never an authority.
+    Failing to write it must not fail a training run that is otherwise fine, and any reader has to
+    cope with its absence anyway (every run that predates the key).
+
+    `pool_id` is the directory NAME, not `pool_id_for(fp_text)`: a pool minted under an older
+    derivation, or one that stepped aside from a name collision, keeps working — and its name is
+    the handle that addresses it. ``None`` = the slot root IS the pool (an unmigrated slot), which
+    is a real answer rather than a failure.
+    """
+    if not run_dir:
+        return
+    try:
+        norm = lambda p: os.path.normcase(os.path.abspath(p))
+        under_pools = norm(os.path.dirname(pool_dir)) == norm(pools_root(slot_dir))
+        blob = {"pool_id": os.path.basename(pool_dir) if under_pools else None}
+        final = os.path.join(run_dir, POOL_REF)
+        tmp = final + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(blob, f, ensure_ascii=False)
+        os.replace(tmp, final)
+    except Exception as e:  # noqa: BLE001 — an annotation must never break a run
+        logger.warning("could not record which pool this run used: %s", e)
+
+
+def open_pool(slot_dir, fp_text, run_dir=None):
     """THE entry point: the directory this run's preprocessing products belong in.
 
     Resolution order, and why it is this order:
@@ -309,7 +350,16 @@ def open_pool(slot_dir, fp_text):
 
     Creating a pool is not the same event as "the products are missing": every stage already
     decides what to do by skip-if-exists, so a fresh pool simply has nothing to skip.
+
+    ★§F2⒝ ④d — pass `run_dir` and the answer is RECORDED (`POOL_REF`). One recording point for
+    five chains, and it sits here because this function is the only place that knows the answer.
     """
+    pool_dir = _resolve_pool(slot_dir, fp_text)
+    _record_pool_choice(run_dir, slot_dir, pool_dir)
+    return pool_dir
+
+
+def _resolve_pool(slot_dir, fp_text):
     if not fp_text:
         # Every chain builds a non-empty identity. An empty one would collapse every run in this
         # slot into a single anonymous pool, which is worse than any rebuild.
