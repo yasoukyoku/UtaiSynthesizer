@@ -1005,6 +1005,7 @@
     "DATASET_OTHER_INSTANCE": "Another Utai instance is running and may be using this data — the change was refused. Close the other Utai windows first.",
     "DATASET_RECLAIM_IN_PROGRESS": "The data directory is still reclaiming files in the background; a change made now would be overwritten. Try again shortly.",
     "DATASET_SPEAKERS_FROZEN": "An architecture in this project has already trained on the current singer layout, and the number and order of singers are baked into the model's voice slots — adding or removing a singer would make that architecture impossible to continue. To change the layout, the run that trained on it has to be removed first. Adding or removing audio for an EXISTING singer is not restricted.",
+    "FROZEN_SPEAKERS_UNREADABLE": "A run's record of its singer layout could not be read (the file may be locked, unreadable, or corrupt) — whether this change is safe cannot be judged without it, so the operation was refused. Check that the training directory is accessible and try again.",
     "DATASET_COPY_FAILED": "Failed to copy audio into the project data set",
     "DATASET_DELETE_FAILED": "Failed to delete a file from the project data set",
     "DATASET_WRITE_FAILED": "Failed to write to the project data set — check that the data directory is writable and the disk is not full.",

@@ -899,7 +899,7 @@ pub fn slot_info(
     // name, so the pre-existing "nothing to compare" semantics of the resume dialog are preserved
     // (a vec of blanks would read as a speaker mismatch).
     let speakers: Vec<String> = {
-        let mut v: Vec<String> = frozen_speakers_of_run(&run)
+        let mut v: Vec<String> = frozen_speakers_of_run(&run)?
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -985,16 +985,18 @@ impl ResumeLockFacts {
     }
 }
 
-pub(crate) fn resume_lock_facts(run: &trun::RunDir) -> ResumeLockFacts {
-    ResumeLockFacts {
+pub(crate) fn resume_lock_facts(run: &trun::RunDir) -> Result<ResumeLockFacts> {
+    Ok(ResumeLockFacts {
         has_main: has_main_progress(run),
         // ★S118 §F8⒜ — the k_step_max lock hangs off this being >0. It must therefore see the
         // SNAPSHOTS too: a slot whose numbered grid was cleaned away still holds a resume point,
         // and letting k_step_max change under it would silently retrain a different diffusion
         // distribution into the same model.
         max_diffusion_step: diffusion_progress_step(run),
-        frozen_speakers: frozen_speakers_of_run(run),
-    }
+        // ⛔ 这里必须 `?`:`check_resume_locks` 的第一行是 `let old = st.manifest?`,而
+        // `frozen_speakers` 一空,说话人那一族的锁就整组消失 —— 与「读不动」正好同形。
+        frozen_speakers: frozen_speakers_of_run(run)?,
+    })
 }
 
 /// The manifest a resume guard judges against — read from THE RUN, never the slot.
@@ -1024,14 +1026,39 @@ pub(crate) fn read_run_manifest(run: &trun::RunDir) -> Option<serde_json::Value>
 ///   machine's real 2-singer projects). Matched BY SLUG, never by position: a `sovits_diff`
 ///   run rewrites `run.json` without the key at all, and a mismatched pair would print one
 ///   singer's name against another's emb_g row — the exact confusion this is meant to end.
-pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
-    let read_json = |p: PathBuf| -> Option<serde_json::Value> {
-        std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+/// ⛔★★S133 §F2⒝ ④e —— **「载体不在」与「载体读不动」不是同一个答案**,而它们此前是同一个
+/// `.ok()`。空是这条链上的**宽容**答案(见 [`frozen_speakers`] 的 over-strict 那一段),所以把
+/// 权限/杀软/网盘占用/半写坏的 JSON 收成空 = **恰好在文件系统已经出问题的时候**把
+/// `DATASET_SPEAKERS_FROZEN` 那道拒绝拿掉:
+/// `frozen_structure_family` 答 None ⇒ 数据页放行 ⇒ `delete_files(.., drop_empty_speaker_dirs =
+/// frozen.is_none())` 连空掉的 `dataset/<slug>/` 一起删 ⇒ 等文件重新读得动时,那套 `G_*.pth`
+/// 已经永久 `RESUME_SPEAKER_COUNT_MISMATCH`,全程零报错。
+///
+/// ⚠ 这不是「A 有而 B 没有」的缺席推断:这个函数**自己上面两行**的文档就写着「EMPTY 是宽容
+/// 答案 ⇒ 没有诚实的 in-band 值表示『我没看成』」,而它引入的判据在两行之下就用 `.ok()`
+/// 违反了那句话;而**同一个文件名**在 `tpool::slot_facts` 里是 fail-**closed** 的
+/// (S131 笔 2 花一笔买回来的区分)—— 同一份文件、同一种故障,一个消费者拒绝、一个放行,
+/// 而放行的那个是毁数据方向。
+pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Result<Vec<dsmanifest::DsSpeaker>> {
+    let read_json = |p: PathBuf| -> Result<Option<serde_json::Value>> {
+        let raw = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            // 真的没有:单歌手 run 不写 `speakers`,`sovits_diff` 的 run.json 也可能没有这一段。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(UtaiError::Training(format!(
+                    "FROZEN_SPEAKERS_UNREADABLE: {}: {e}",
+                    p.display()
+                )))
+            }
+        };
+        // 半写/损坏的 JSON 同样不是「没冻歌手」—— 它是「我读不懂这个载体」。
+        serde_json::from_str(&raw).map(Some).map_err(|e| {
+            UtaiError::Training(format!("FROZEN_SPEAKERS_UNREADABLE: {}: {e}", p.display()))
+        })
     };
     // `run.json` pairs, whether or not the manifest needs them.
-    let run_pairs: Vec<(String, String)> = read_json(ws.join("run.json"))
+    let run_pairs: Vec<(String, String)> = read_json(ws.join("run.json"))?
         .and_then(|v| {
             v.get("speakers").and_then(|s| s.as_array()).map(|arr| {
                 arr.iter()
@@ -1045,11 +1072,11 @@ pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
             })
         })
         .unwrap_or_default();
-    let Some(manifest) = read_json(ws.join("run_manifest.json")) else {
-        return run_pairs
+    let Some(manifest) = read_json(ws.join("run_manifest.json"))? else {
+        return Ok(run_pairs
             .into_iter()
             .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
-            .collect();
+            .collect());
     };
     let str_array = |k: &str| -> Vec<String> {
         manifest[k]
@@ -1065,13 +1092,13 @@ pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
     if slugs.is_empty() {
         // single-speaker (no key) — or a manifest that lost it; `run.json` only ever carries
         // the array for a genuine co-training, so this stays empty for single-speaker runs.
-        return run_pairs
+        return Ok(run_pairs
             .into_iter()
             .map(|(slug, name)| dsmanifest::DsSpeaker { slug, name })
-            .collect();
+            .collect());
     }
     let names = str_array("speaker_names");
-    slugs
+    Ok(slugs
         .into_iter()
         .enumerate()
         .map(|(i, slug)| {
@@ -1088,7 +1115,7 @@ pub fn frozen_speakers_of_run(ws: &trun::RunDir) -> Vec<dsmanifest::DsSpeaker> {
                 .unwrap_or_default();
             dsmanifest::DsSpeaker { slug, name }
         })
-        .collect()
+        .collect())
 }
 
 /// The speaker set this SLOT has frozen — the answer the PROJECT-level guards need.
@@ -1119,11 +1146,15 @@ pub fn frozen_speakers(
     family: &str,
 ) -> Result<Vec<dsmanifest::DsSpeaker>> {
     let slot = tproject::family_dir(data_dir, project_id, backend_family(family));
-    Ok(trun::run_dirs(&slot)?
-        .into_iter()
-        .map(|run| frozen_speakers_of_run(&run))
-        .find(|v| !v.is_empty())
-        .unwrap_or_default())
+    for run in trun::run_dirs(&slot)? {
+        // ⛔ `?` 而不是 `.ok()`:这一条的返回值决定的是一道**拒绝**,而空是宽容答案。
+        // 一个读不动的 run 被跳过 ⇒ 它冻的那组歌手对整个项目**隐形**。
+        let v = frozen_speakers_of_run(&run)?;
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// ★S117 §F2⒜ / S118 §F8⒜ — the step of a COMPLETE resume snapshot under `<dir>/<sub>/`, or None.
@@ -1389,27 +1420,33 @@ fn effective_artifact_slug(
 /// multi-speaker project unresumable AND orphans its data directories. (Frozen values are only
 /// adopted when the COUNT matches; anything else is a genuine structure change and falls through
 /// to the resume guard, which refuses it with a specific CODE.)
-fn effective_speaker_slugs(run: &trun::RunDir, req: &StartTrainingRequest) -> Vec<(String, String)> {
+fn effective_speaker_slugs(
+    run: &trun::RunDir,
+    req: &StartTrainingRequest,
+) -> Result<Vec<(String, String)>> {
     if req.speakers.len() <= 1 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let fresh = assign_speaker_slugs(&req.speakers);
     if req.fresh {
-        return fresh;
+        return Ok(fresh);
     }
     // ⛔ THIS run's frozen slugs, never the slot's. The adoption test below is only "the COUNT
     // matches", which two runs of one project routinely do — reading a sibling run's list here
     // would map this run's singers onto that one's emb_g rows and preprocess them into that one's
     // `dataset_44k/<slug>/` directories, with nothing anywhere reporting a mismatch.
-    let frozen = frozen_speakers_of_run(run);
+    // ⛔ `?`:读不动时退回 `fresh` 会把这一次续训的歌手**重新分配 slug**,于是预处理落进另一组
+    // `dataset_44k/<slug>/` 目录、emb_g 行号整体错位 —— 而这个函数存在的理由正是防这件事。
+    let frozen = frozen_speakers_of_run(run)?;
     if frozen.len() != req.speakers.len() {
-        return fresh;
+        return Ok(fresh);
     }
-    req.speakers
+    Ok(req
+        .speakers
         .iter()
         .zip(frozen.iter())
         .map(|(sp, fz)| (sp.name.clone(), fz.slug.clone()))
-        .collect()
+        .collect())
 }
 
 /// ①c deterministic ASCII slug per co-trained speaker — the slug is the
@@ -1813,7 +1850,7 @@ impl TrainingManager {
                         Some(req.run_id.trim()).filter(|s| !s.is_empty()),
                     )?,
                     &req,
-                )
+                )?
                 .into_iter()
                 .map(|(_, s)| s)
                 .collect();
@@ -1962,7 +1999,7 @@ impl TrainingManager {
         // Rust releases, and every one of those slugs is a directory name on disk plus a
         // `config.spk` key. Re-deriving would mean a toolchain bump silently renames every
         // co-trained speaker's data directory out from under a half-trained model.
-        let eff_speakers = effective_speaker_slugs(&run, &req);
+        let eff_speakers = effective_speaker_slugs(&run, &req)?;
         let planned = dataset_plan(&req, &eff_speakers);
         if !planned.is_empty() {
             let replacing = !current_dataset_listing(&dataset_dir).is_empty()
@@ -2086,7 +2123,7 @@ impl TrainingManager {
         // against each other by a unit test, because three other places (the run step's
         // pre-start dialog, the project page's form restore, the parameters page's read-only
         // rendering) have to agree with it and used to do so from memory.
-        let lock_facts = resume_lock_facts(&run);
+        let lock_facts = resume_lock_facts(&run)?;
         if let Some(code) = resume_lock::check_resume_locks(
             &req,
             &lock_facts.state(old_manifest.as_ref()),
@@ -4384,7 +4421,7 @@ mod tests {
 
         // no manifest yet ⇒ derive
         let ws = trun::RunDir::for_test(ws);
-        let fresh_slugs = effective_speaker_slugs(&ws, &req(false));
+        let fresh_slugs = effective_speaker_slugs(&ws, &req(false)).unwrap();
         assert_eq!(fresh_slugs, assign_speaker_slugs(&req(false).speakers));
 
         // slugs a toolchain change (or an older build) could have produced — nothing `slugify`
@@ -4400,7 +4437,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let resumed = effective_speaker_slugs(&ws, &req(false));
+        let resumed = effective_speaker_slugs(&ws, &req(false)).unwrap();
         assert_eq!(
             resumed,
             vec![
@@ -4413,7 +4450,7 @@ mod tests {
 
         // 重训 wipes the slot, so it is free to mint new ones
         assert_eq!(
-            effective_speaker_slugs(&ws, &req(true)),
+            effective_speaker_slugs(&ws, &req(true)).unwrap(),
             fresh_slugs
         );
 
@@ -4426,9 +4463,77 @@ mod tests {
             "total_epoch": 1, "batch_size": 1,
         }));
         assert_eq!(
-            effective_speaker_slugs(&ws, &three),
+            effective_speaker_slugs(&ws, &three).unwrap(),
             assign_speaker_slugs(&three.speakers)
         );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// ⛔★★S133 §F2⒝ ④e —— 「这个 run 没冻歌手」与「我读不动它的载体」必须是两个答案。
+    ///
+    /// 空是这条链上的**宽容**答案,所以把读不动折成空 = 恰好在文件系统已经出问题的时候
+    /// 把 `DATASET_SPEAKERS_FROZEN` 那道拒绝拿掉:数据页放行 ⇒ `delete_files` 连
+    /// `drop_empty_speaker_dirs` 一起走 ⇒ 歌手目录没了 ⇒ 那套 `G_*.pth` 永久
+    /// `RESUME_SPEAKER_*_MISMATCH`,全程零报错。
+    ///
+    /// ⚠ 每一条拒绝都配了**阴性对照**:载体真的不在、以及内容真的是空的,都必须仍然答「空」——
+    /// 否则「一律 Err」这种实现也会让上面那几条变绿,而它会把单歌手 run 全部判成冻结。
+    #[test]
+    fn an_unreadable_freeze_carrier_is_not_the_same_answer_as_an_unfrozen_run() {
+        let data = tmp_ws("frozenio");
+        let id = "proj_fz";
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        let rd = trun::RunDir::for_test(run.clone());
+
+        // ── 阴性对照 1:两个载体都不在 = 一个单歌手 run。空,而且不是错误。
+        assert!(frozen_speakers_of_run(&rd).unwrap().is_empty());
+        assert!(frozen_speakers(&data, id, "rvc").unwrap().is_empty());
+
+        // ── 正例:manifest 冻了两位歌手
+        std::fs::write(
+            run.join("run_manifest.json"),
+            serde_json::json!({ "speakers": ["a_1", "b_2"], "speaker_names": ["A", "B"] })
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(frozen_speakers_of_run(&rd).unwrap().len(), 2);
+        assert_eq!(frozen_speakers(&data, id, "rvc").unwrap().len(), 2);
+
+        // ── 拒绝 1:manifest 读得到但**不是 JSON**(半写 / 被截断)
+        std::fs::write(run.join("run_manifest.json"), b"{ not json").unwrap();
+        for err in [
+            frozen_speakers_of_run(&rd).unwrap_err(),
+            // ⭐ 槽级那一条必须**同样**红:它是那道拒绝真正挂着的地方,而它此前会把这个 run
+            //    整个跳过 ⇒ 它冻的歌手对整个项目隐形。
+            frozen_speakers(&data, id, "rvc").unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("FROZEN_SPEAKERS_UNREADABLE"), "{err}");
+        }
+
+        // ── 阴性对照 2:manifest 是合法 JSON 但没有 speakers 键 = 单歌手,仍然是「空」
+        std::fs::write(run.join("run_manifest.json"), serde_json::json!({ "backend": "rvc" }).to_string())
+            .unwrap();
+        assert!(frozen_speakers_of_run(&rd).unwrap().is_empty());
+
+        // ── 拒绝 2:第二个载体 `run.json` 坏掉时同样要红(它是老工作区唯一带名字的地方)
+        std::fs::write(run.join("run.json"), b"\x00\x01 not json").unwrap();
+        assert!(frozen_speakers_of_run(&rd)
+            .unwrap_err()
+            .to_string()
+            .contains("FROZEN_SPEAKERS_UNREADABLE"));
+
+        // ── 拒绝 3:**io 层**(不是解析层)读不动。真实成因是 ACL / 杀软 / 网盘占用,测试里造不
+        //    出来;拿目录冒充文件是本仓已有的手法,它给的是一个**非 NotFound** 的 io 错误 ——
+        //    与那些成因走同一条臂。少了这一条,「解析错拒绝、io 错照旧吞掉」的实现会全绿。
+        std::fs::remove_file(run.join("run.json")).unwrap();
+        std::fs::create_dir(run.join("run.json")).unwrap();
+        assert!(frozen_speakers_of_run(&rd)
+            .unwrap_err()
+            .to_string()
+            .contains("FROZEN_SPEAKERS_UNREADABLE"));
+
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -4973,7 +5078,7 @@ mod tests {
         };
         let dir = trun::resolve_run_dir(&slot, None).unwrap();
         assert_eq!(dir.path(), run, "the run really is where the products are");
-        let facts = resume_lock_facts(&dir);
+        let facts = resume_lock_facts(&dir).unwrap();
         let manifest = read_run_manifest(&dir);
         assert!(manifest.is_some(), "the guard must have something to judge against");
         assert!(facts.has_main, "G_700.pth is in this run");
@@ -4990,7 +5095,7 @@ mod tests {
         assert!(
             resume_lock::check_resume_locks(
                 &req(false),
-                &resume_lock_facts(&decoy).state(read_run_manifest(&decoy).as_ref()),
+                &resume_lock_facts(&decoy).unwrap().state(read_run_manifest(&decoy).as_ref()),
                 true,
             )
             .is_none(),

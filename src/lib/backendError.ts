@@ -414,6 +414,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   DATASET_OTHER_INSTANCE: { key: "backend.DATASET_OTHER_INSTANCE", modal: true },
   DATASET_RECLAIM_IN_PROGRESS: { key: "backend.DATASET_RECLAIM_IN_PROGRESS", busy: true },
   DATASET_SPEAKERS_FROZEN: { key: "backend.DATASET_SPEAKERS_FROZEN", modal: true },
+  // ★§F2⒝ ④e —— 「我读不动那个 run 的冻结载体」的**专属**出口。它此前与
+  // DATASET_SPEAKERS_FROZEN 的反面(「没有人冻过」)共用一个静默的空答案,而空是宽容答案 ⇒
+  // 恰好在文件系统出问题时把那道拒绝拿掉。modal:它挡的是一次会改动数据集结构的操作。
+  FROZEN_SPEAKERS_UNREADABLE: { key: "backend.FROZEN_SPEAKERS_UNREADABLE", modal: true },
   DATASET_COPY_FAILED: { key: "backend.DATASET_COPY_FAILED" },
   DATASET_DELETE_FAILED: { key: "backend.DATASET_DELETE_FAILED" },
   DATASET_WRITE_FAILED: { key: "backend.DATASET_WRITE_FAILED" },
