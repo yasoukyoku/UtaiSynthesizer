@@ -4398,7 +4398,7 @@ mod tests {
     /// 112 lines above the binding, where the answer was structurally unreachable.
     #[test]
     fn start_takes_its_artifact_identity_from_the_run_not_from_the_request_name() {
-        let code = mod_rs_code();
+        let code = production_code();
         let at = |needle: &str| at_in(&code, needle);
         // ⛔ every needle is assembled from pieces: written as one literal, THIS test's own source
         // satisfies it (`code` is mod.rs, and mod.rs contains this file's test module). The
@@ -5065,7 +5065,7 @@ mod tests {
     /// while the checkpoints are gone and the slot has silently fallen back to layout 0.
     #[test]
     fn a_start_re_resolves_its_run_after_the_wipe() {
-        let code = mod_rs_code();
+        let code = production_code();
         let at = |needle: &str| at_in(&code, needle);
         let wipe = at("remove_dir_all_robust(&workspace)");
         let recreate = at("std::fs::create_dir_all(&workspace)?;");
@@ -5094,7 +5094,7 @@ mod tests {
         );
     }
 
-    /// `mod.rs`'s own source with every FULL-LINE `//` comment blanked out (line count and
+    /// `mod.rs`'s PRODUCTION source with every FULL-LINE `//` comment blanked out (line count and
     /// relative order preserved), so a source-order ratchet anchors on CODE.
     ///
     /// ⛔★S127: the raw `THIS_RS.find(needle)` form these ratchets used is **one added comment
@@ -5103,9 +5103,43 @@ mod tests {
     /// order while the gate stays green. (Found by the ④b recon's completeness critic on the
     /// sibling ratchet `trun::the_boot_chain_folds_pools_before_runs`, which is safe today only
     /// because the nearby comments write the function names WITHOUT the opening paren.)
-    fn mod_rs_code() -> String {
+    ///
+    /// ⛔★★S131 §F2⒝ ④e 笔 0 — and blanking comments was only HALF of it. The searched text still
+    /// included THIS test module, whose own source contains every anchor literal it passes in. The
+    /// hazard was known — the sibling ratchet's header says so verbatim, and works around it by
+    /// splitting each needle with `concat!` — but the workaround was applied to three needles and
+    /// NOT to `remove_dir_all_robust(&workspace)`, `std::fs::create_dir_all(&workspace)?;`,
+    /// `trun::run_dir_for_start(&workspace, &family)?` or the manifest write. Both directions of
+    /// that are bad, and the quiet one is worse:
+    /// * ④e's flip DELETES the production `remove_dir_all_robust(&workspace)` line. `find` would
+    ///   then latch onto this module's own literal — a much larger offset — so `slug < wipe`
+    ///   silently becomes a tautology and `wipe < recreate` panics with the message REVERSED
+    ///   (「the slot is re-created after the wipe, not before」about a wipe that no longer exists).
+    ///   A red nobody can attribute is the exact shape S129 made a 铁律 out of.
+    /// * a typo in a NEW production anchor matches this module's copy instead, and the order
+    ///   assertion that was supposed to guard it goes GREEN.
+    ///
+    /// ⇒ the ratchets see production only, and [`at_in`] names which of the two failures happened.
+    fn production_code() -> String {
         static THIS_RS: &str = include_str!("mod.rs");
-        THIS_RS
+        production_part(THIS_RS)
+    }
+
+    /// The truncation itself, on a source handed in — so the negative control below can drive it.
+    ///
+    /// ⚠ The marker is assembled from pieces, or this line would be a second occurrence of it and
+    /// the uniqueness assertion below would fail on its own source.
+    /// ⛔ Uniqueness is asserted rather than assumed: S129 shipped a `production()` helper that cut
+    /// at the FIRST `#[cfg(test)]`, and `trun.rs` has a function-level one — so it truncated
+    /// production code and produced a FALSE RED that cost most of a session. Cutting too early
+    /// here is loud (`at_in` panics with "not in the production source"), but the message would
+    /// send the reader after the wrong thing, so say it here instead.
+    fn production_part(src: &str) -> String {
+        // ⛔ Blank FIRST, cut second. Counting the marker in the raw text makes any prose that
+        // mentions the attribute a second occurrence — this very helper's own header did exactly
+        // that on its first run, which is the same「the ruler counted its own source」mistake S129
+        // made twice. Blanking is length-preserving, so every byte offset below is unaffected.
+        let blanked: String = src
             .lines()
             .map(|l| {
                 if l.trim_start().starts_with("//") {
@@ -5115,12 +5149,80 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        let marker = concat!("#[cfg", "(test)]");
+        assert_eq!(
+            blanked.matches(marker).count(),
+            1,
+            "mod.rs grew a second cfg-test attribute in CODE: this helper cuts at the first one, \
+             so a function-level one would truncate PRODUCTION code and every ratchet below would \
+             report its anchor as missing (that false red is exactly what S129 paid for in \
+             `trun.rs`). Cut at the module's attribute explicitly instead."
+        );
+        let end = blanked.find(marker).expect("just counted one");
+        blanked[..end].to_string()
     }
 
+    /// Where an anchor sits in [`production_code`] — with the two failures kept APART.
+    ///
+    /// ⛔ 「the anchor moved out of production」and「the anchor never existed」used to be one
+    /// panic, and neither of them used to happen at all when the needle also appeared in this test
+    /// module. Reporting them separately is the whole point: the first means a production edit
+    /// (probably ④e's) needs the ratchet re-anchored ON PURPOSE; the second means a typo.
     fn at_in(code: &str, needle: &str) -> usize {
-        code.find(needle)
-            .unwrap_or_else(|| panic!("mod.rs no longer contains the anchor {needle:?}"))
+        code.find(needle).unwrap_or_else(|| {
+            static THIS_RS: &str = include_str!("mod.rs");
+            assert!(
+                !THIS_RS.contains(needle),
+                "the anchor {needle:?} is NOT in mod.rs's production source — it matches only \
+                 inside this file's own test module. Re-anchor the ratchet onto whatever the \
+                 production code says now; do NOT loosen the needle, and do not delete the \
+                 assertion: before S131 this case was accepted silently and turned the order \
+                 assertion into a tautology."
+            );
+            panic!("mod.rs no longer contains the anchor {needle:?} anywhere")
+        })
+    }
+
+    /// ★S131 笔 0 —— the two things [`production_part`] / [`at_in`] promise, driven for real.
+    ///
+    /// ⛔ Both of `at_in`'s refusals are error branches, and 「a branch that has never executed is
+    /// an empty criterion」 (S129). They are executed by the two `#[should_panic]` tests below;
+    /// this one covers the cut itself, on synthetic source, because asserting the property against
+    /// mod.rs's real text would be satisfied by a helper that returns the whole file.
+    #[test]
+    fn the_ratchets_see_production_only() {
+        let synthetic = format!(
+            "fn real() {{ anchor_in_production(); }}\n{}\nmod tests {{\n    fn t() \
+             {{ anchor_in_production(); }}\n}}\n",
+            concat!("#[cfg", "(test)]")
+        );
+        let cut = production_part(&synthetic);
+        assert_eq!(
+            cut.matches("anchor_in_production()").count(),
+            1,
+            "the test module's own copy of an anchor is still in the searched text — every \
+             `at_in` below can latch onto it instead of the real call site"
+        );
+        assert!(!cut.contains("mod tests"), "the cut did not happen at all");
+        // …and the cut keeps BYTE OFFSETS of everything before it, which is what the order
+        // assertions actually compare.
+        assert!(synthetic.starts_with(&cut[..cut.len().min(30)]), "the prefix was rewritten");
+    }
+
+    #[test]
+    #[should_panic(expected = "matches only")]
+    fn an_anchor_that_lives_only_in_the_test_module_is_named_as_such() {
+        // `fn production_part(` is defined INSIDE this module, so it is present in mod.rs and
+        // absent from production — exactly the shape that used to be accepted silently.
+        at_in(&production_code(), "fn production_part(");
+    }
+
+    #[test]
+    #[should_panic(expected = "anywhere")]
+    fn an_anchor_that_exists_nowhere_says_so_differently() {
+        // assembled from pieces so that THIS line is not itself an occurrence of it
+        at_in(&production_code(), concat!("this-anchor-exists-", "in-no-file-at-all"));
     }
 
     fn src_file(dir: &Path, name: &str, bytes: usize) -> String {
