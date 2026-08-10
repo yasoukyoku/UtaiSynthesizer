@@ -1162,6 +1162,18 @@ pub fn migrate_slot_identity(slot: &Path, family: &str) -> Result<IdentityOutcom
     let mut done: Vec<&PoolStep> = Vec::new();
     for s in &steps {
         if let Err(e) = apply_step(s) {
+            // ⛔★ 失败的那一步**自己也是半应用的**,所以它必须第一个退回来。
+            //
+            // `apply_step` 先改名后写戳,于是「戳写失败」留下的是一个**改了名却还挂着旧戳**的池。
+            // 只退 `done` 会把它留在盘上,而 layout 停在 3 ⇒ `identity_version` 答 1 ⇒ python 按
+            // v1 取 slug(`flist.resolve_speakers` 的 `len(out)==1 && version>=2` 不成立)⇒ 它去
+            // `dataset_44k/<model_slug>` 找不到东西,**重新切一棵树** ⇒ 这个池里从此有两棵,而
+            // `plan_slice_rename` 见到两棵就再也决定不了哪棵是活的 ⇒ 这个槽**永久 Refused**。
+            // ⇒ 一次写失败会把「一次全量重跑」升级成「再也迁不动」,而且不需要重启就能踩到。
+            //
+            // ⚠ `undo_step` 对「什么都没应用成」的步骤是安全的:写戳是把**旧串**写回去(盘上本来
+            //    就是它),改名回滚有 `to.exists() && !from.exists()` 那道守卫挡着。
+            undo_step(s);
             for d in done.iter().rev() {
                 undo_step(d);
             }
@@ -1276,6 +1288,64 @@ mod tests {
     }
 
     // ─────────────────── layout 3 → 4:重新打戳 ───────────────────
+
+    /// ★§F2⒝ ④d(S130 · 待验清单 M14⑴)—— 身份文件是**先写 tmp 再 rename** 出来的。
+    ///
+    /// ## 为什么这条判据必须存在
+    /// `write_fingerprint` 此前只有间接判据(「tmp 被占住就失败」)。而它写的是**命名了几小时
+    /// 预处理产物的那个文件**:一个被截断的身份串与任何池都不匹配,于是全量重建到一个兄弟池里。
+    /// 把它退回成一句 `fs::write(final)` 是一个**一个字节都不会报错**的改动。
+    ///
+    /// ## ⛔ 这条判据**不是**原子性判据
+    /// 它证明的是【顺序】与【成功路径不留残渣】。真正的原子性要在 write 与 rename **之间**把进程
+    /// 杀掉,`cargo test` 里做不到 —— 那是 M14⑵,归 §F7 第二遍(与 S122/S125 的撕裂态枚举同一族
+    /// 工装)。别把这条读成「原子性已验」。
+    ///
+    /// ## 为什么是行为判据而不是源码断言
+    /// 待验清单原本排的是「一条源码断言『先写 tmp 再 rename』(与 `write_slot_meta` 同形)」。
+    /// 换成行为的理由有两条:⑴ 仓里的注释剥离器 `code_only` 是 `trun.rs` 测试模块的私有件,
+    /// 照抄一份就是 drift;⑵ 行为判据**严格更强** —— 源码断言对「tmp 里写了错的内容再 rename」
+    /// 完全瞎,而下面第二段连那个都能抓。
+    #[test]
+    fn the_pool_identity_lands_through_a_temp_file() {
+        // ⑴ 成功路径:文件内容对,而且目录里**没有**任何残渣。
+        let pool = tmp_slot("fp_write_ok");
+        write_fingerprint(&pool, "abc123|sr=48000|aug=2").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pool.join(FINGERPRINT)).unwrap(),
+            "abc123|sr=48000|aug=2"
+        );
+        let left: Vec<String> = std::fs::read_dir(&pool)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != FINGERPRINT)
+            .collect();
+        assert!(left.is_empty(), "写完之后池里多了 {left:?}");
+
+        // ⑵ ★ 顺序的**行为**判据:把最终路径变成一个**目录** ⇒ rename 必然失败。
+        //    先 tmp 后 rename 的实现会在失败之前已经把内容落在 `<name>.tmp` 上;
+        //    一个 `fs::write(final)` 的实现则连 tmp 都不会出现 —— 这就是两者分得开的地方。
+        //    ⚠ 断言 rename **真的**失败,而不是假设:S129 实测过 `rename(目录, 已存在的文件)`
+        //      在本机返回 Ok 并把那个文件无声销毁,所以这一族的方向性不许靠印象。
+        let pool2 = tmp_slot("fp_write_torn");
+        std::fs::create_dir_all(pool2.join(FINGERPRINT)).unwrap();
+        let err = write_fingerprint(&pool2, "tmp-comes-first")
+            .expect_err("最终路径是一个目录,rename 不该成功");
+        assert!(
+            format!("{err}").contains("POOL_FINGERPRINT_WRITE_FAILED"),
+            "失败必须带得走归因:{err}"
+        );
+        let tmp = pool2.join(format!("{FINGERPRINT}.tmp"));
+        assert!(tmp.is_file(), "没有 tmp ⇒ 这不是『先写 tmp 再 rename』");
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            "tmp-comes-first",
+            "tmp 里必须已经是**要写的那个串**(源码断言看不见这一条)"
+        );
+        let _ = std::fs::remove_dir_all(pool);
+        let _ = std::fs::remove_dir_all(pool2);
+    }
 
     /// 最小 RIFF 头 + 一个静音样本。用真头是因为被测的正是「从头里读采样率」。
     fn wav_at(path: &Path, hz: u32) {
@@ -1539,6 +1609,13 @@ mod tests {
         let a = mk_pool(&slot, "p00000000000a", "aaaa|enc=x|loudnorm=0");
         let b = mk_pool(&slot, "p00000000000b", "bbbb|enc=x|loudnorm=0");
         std::fs::create_dir_all(a.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
+        // ★S130 —— B **也**要有一棵待改名的切片树。
+        //
+        // ⛔ 这一行修的是这条测试自己的一个洞:B 原本没有 `dataset_44k`,于是 `plan_slice_rename`
+        //    对它早返回 None,B 的那一步**没有改名动作** ⇒ 「改了名却没打上戳」这个半应用状态
+        //    在全仓一次都没有被执行过,而它恰恰是失败那一步唯一会留下的形状。
+        //    (S129 的镜像回滚只退 `done`,而失败的那一步不在里面 —— 见 `migrate_slot_identity`。)
+        std::fs::create_dir_all(b.join("dataset_44k").join("mymodel_deadbeef")).unwrap();
         // 让 B 的原子写**必然**失败:tmp 路径被一个目录占住 ⇒ `std::fs::write` 写不进去。
         std::fs::create_dir_all(b.join(format!("{FINGERPRINT}.tmp"))).unwrap();
 
@@ -1549,6 +1626,16 @@ mod tests {
             "A 的切片目录名必须退回去"
         );
         assert!(!a.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
+        // ★ 失败的那一步自己:戳没写成(本来就该是旧串),但**改名已经发生了** ——
+        //   它必须也被退回去,否则 python 按 v1 找不到 `<model_slug>` 那棵树,会重新切一棵,
+        //   而一个池里两棵树会让这个槽从此**永久 Refused**。
+        assert_eq!(fp_of(&b), "bbbb|enc=x|loudnorm=0", "B 的戳本来就没写成");
+        assert!(
+            b.join("dataset_44k").join("mymodel_deadbeef").is_dir(),
+            "⛔ 失败那一步的切片改名也必须退回去 —— 留着它 = 下一次 python 重切一棵树,\
+             而两棵树会让这个槽再也迁不动"
+        );
+        assert!(!b.join("dataset_44k").join(SOLE_SPEAKER_DIR).exists());
         assert_eq!(read_slot_meta(&slot).unwrap().layout, 3, "没盖章");
         assert_eq!(identity_version(&slot), 1, "⇒ python 仍然算 v1,而盘上确实还是 v1 的串");
         let _ = std::fs::remove_dir_all(slot);
