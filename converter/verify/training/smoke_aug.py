@@ -40,9 +40,15 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
-def train_cfg(backend, ws, copies, dataset_dir):
+def train_cfg(backend, ws, copies, dataset_dir, identity_version=None):
+    # ⛔ Defaults to None (= the key is absent = v1) ON PURPOSE. This is the only one of
+    # the three `build_cfg` callers that runs REAL training into workspaces that already
+    # hold a v1 `dataset_44k/<model_slug>` tree; switching it to v2 would resolve to the
+    # SAME pool (single-speaker slug does not enter the fingerprint and `|aug=` is absent
+    # at 0) and grow a second `spk0` tree INSIDE it. Flip this only together with fresh
+    # workspaces.
     tr = os.path.join(APP, "data", "models", "training")
-    cfg = noop.build_cfg(backend, ws)
+    cfg = noop.build_cfg(backend, ws, identity_version=identity_version)
     cfg["aug_copies"] = copies
     cfg["dataset_dir"] = dataset_dir
     # real training needs the real base models (the noop driver never reached

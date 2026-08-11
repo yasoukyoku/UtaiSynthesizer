@@ -65,8 +65,8 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
-def run_pipeline(backend, ws, copies, dataset_dir=None):
-    cfg = noop.build_cfg(backend, ws)
+def run_pipeline(backend, ws, copies, dataset_dir=None, identity_version=None):
+    cfg = noop.build_cfg(backend, ws, identity_version=identity_version)
     cfg["aug_copies"] = int(copies)
     if dataset_dir:
         cfg["dataset_dir"] = dataset_dir

@@ -43,6 +43,7 @@ the dataset fingerprint, not the gate's validity)."""
 import argparse
 import filecmp
 import glob
+import io
 import json
 import os
 import shutil
@@ -80,7 +81,12 @@ MIN_COMPARED_FILES = 10
 #: here and in `gate_aug_pipeline`. ⛔ This is a SECOND place that lists them, so
 #: `--selftest` asserts every name here really gets a config out of `build_cfg` — a
 #: choices list that has drifted from the dispatch is worse than no choices list.
-BACKENDS = ("rvc", "sovits", "sovits_diff", "vocoder")
+BACKENDS = ("rvc", "sovits", "sovits_diff", "sovits_v2", "vocoder")
+
+#: The run.json key that tells python WHICH pool-identity formula to use (④d / S129).
+#: Must stay byte-equal to `tpool::IDENTITY_VERSION_KEY` and to the string
+#: `utai_train.pool.identity_version` reads. ⛔ Do not spell it inline anywhere else.
+IDENTITY_VERSION_KEY = "pool_identity_version"
 
 
 class GateUnrunnable(RuntimeError):
@@ -106,7 +112,24 @@ def ensure_fixture():
     print("fixture dataset created: %s" % FIXTURE)
 
 
-def build_cfg(backend, workspace):
+def build_cfg(backend, workspace, identity_version=None):
+    """The gate's stand-in for the `run.json` Rust hands python.
+
+    `identity_version` — which pool-identity formula (④d / S129) this run must use:
+      * ``None``  the key is **absent**. That is an old `run.json` or a hand-built gate
+                  config, and `pool.identity_version` answers 1 for it. This is the
+                  DEFAULT so that every existing v1 fixture keeps coming out byte-identical.
+      * ``1``     explicitly v1. ⚠ Not the same state as absent: production
+                  (`mod.rs`, `run_config[tpool::IDENTITY_VERSION_KEY] = …`) writes the key
+                  UNCONDITIONALLY, so an unmigrated slot in the field is `1`, never absent.
+                  A gate that only ever drives the absent arm never drives what ships.
+      * ``2``     the ④d formula: `|sr=` (rvc, unconditional) and `|aug=<n>` (all chains,
+                  only when n>0), plus single-speaker slices under `pool.SOLE_SPEAKER_DIR`.
+
+    ⛔ It is a keyword argument with a default because `build_cfg` has THREE callers
+    (`gate_aug_pipeline.run_pipeline`, `smoke_aug.train_cfg`, and `main` here); making it
+    positional breaks the other two silently at import time.
+    """
     aux = os.path.join(APP, "data", "models", "auxiliary")
     tr = os.path.join(APP, "data", "models", "training")
     cfg = {
@@ -172,6 +195,27 @@ def build_cfg(backend, workspace):
             "fp16": False, "cache_all_data": True, "vol_embedding": False,
             "loudnorm": False, "aug_copies": 0,
         })
+    elif backend == "sovits_v2":
+        # ⛔ NOT 「照抄 sovits 改个版本号」 — v2 is a different encoder with a different
+        # asset and a different config template, and `pipeline.py:76-77` hard-refuses any
+        # `version` but "4.0-v2".
+        cfg["assets"]["contentvec_onnx"] = os.path.join(aux, "contentvec_256l9.onnx")
+        cfg["assets"]["configs_dir"] = os.path.join(
+            APP, "training", "assets", "configs", "sovits_v2"
+        )
+        cfg.update({
+            "version": "4.0-v2", "total_epoch": 1, "batch_size": 2,
+            "fp16": False, "vol_embedding": False, "loudnorm": False,
+            "kmeans": False, "save_every_steps": 800, "keep_ckpts": 3,
+            "all_in_mem": False, "aug_copies": 0,
+            # ⛔ LOAD-BEARING, not a taste. `pipeline.py:81` defaults to "rmvpe" and
+            # `:90-91` only appends `|f0=` when it is NOT rmvpe. sovits_v2 is the one
+            # chain whose own conditional tail lands BEFORE `pool.identity_suffix`, so it
+            # is the only chain that can catch the shared suffix being concatenated in the
+            # wrong order (`gate_aug0_driver.py:21-24`) — and with rmvpe there is no tail
+            # to get the order of. Same reason the S130 hand fixture pins it.
+            "f0_method": "dio",
+        })
     elif backend == "vocoder":
         # run() isfile-checks the base model up front (never loaded — the
         # driver stops at train_prep), so point at the real asset
@@ -185,6 +229,8 @@ def build_cfg(backend, workspace):
         })
     else:
         raise GateUnrunnable("backend %s not wired yet" % backend)
+    if identity_version is not None:
+        cfg[IDENTITY_VERSION_KEY] = int(identity_version)
     return cfg
 
 
@@ -522,6 +568,64 @@ def selftest():
         check("build_cfg refuses an unknown backend", False, "(it returned a config)")
     except GateUnrunnable:
         check("build_cfg refuses an unknown backend", True)
+
+    # ⑴b the identity-version knob: three distinguishable states, and v1 unchanged.
+    ws_probe = os.path.join(tempfile.gettempdir(), "s136_selftest_ws")
+    for b in BACKENDS:
+        c_none = build_cfg(b, ws_probe)
+        c_expl = build_cfg(b, ws_probe, identity_version=None)
+        check("%s: default == identity_version=None" % b, c_none == c_expl)
+        check("%s: default leaves the key ABSENT (v1 fixtures stay byte-identical)" % b,
+              IDENTITY_VERSION_KEY not in c_none)
+        for v in (1, 2):
+            cv = build_cfg(b, ws_probe, identity_version=v)
+            check("%s: identity_version=%d writes the key" % (b, v),
+                  cv.get(IDENTITY_VERSION_KEY) == v)
+
+    # ⑴c the key name is a cross-language contract — pin it to both sides' source text.
+    # ⛔ Spelling it right in this file and wrong in production is invisible at runtime:
+    # `pool.identity_version` would just answer 1 forever and every arm would look v1.
+    py = io.open(os.path.join(APP, "training", "utai_train", "pool.py"),
+                 encoding="utf-8").read()
+    rs = io.open(os.path.join(APP, "src-tauri", "src", "training", "tpool.rs"),
+                 encoding="utf-8").read()
+    check("python reads exactly this key", 'cfg.get("%s")' % IDENTITY_VERSION_KEY in py)
+    check("Rust names exactly this key", '= "%s";' % IDENTITY_VERSION_KEY in rs)
+
+    # ⑴d encoder ↔ contentvec asset pairing. There is NO negative control for this
+    # anywhere: the only retrieval-asset check in `gate_aug_pipeline` compares base
+    # against current, so both sides holding the WRONG matrix compare equal and pass.
+    # Pin it to the pipelines' own source TEXT (the shape `pool_identity_formula.rs` uses).
+    #
+    # ⚠ The two chains express it differently and the selftest found that the hard way:
+    # sovits_v2 has a module constant `ENCODER`, while sovits/4.x looks it up from
+    # `VERSION_ENCODER` by the cfg's own `version`. Which also means: flipping this gate's
+    # sovits `version` to "4.0" would silently pair vec256l9 with the 768 asset, and
+    # nothing else in the repo would notice.
+    for b, mod_rel in (("sovits", ("sovits", "pipeline.py")),
+                       ("sovits_diff", ("sovits", "pipeline.py")),
+                       ("sovits_v2", ("sovits_v2", "pipeline.py"))):
+        src = io.open(os.path.join(APP, "training", "utai_train", *mod_rel),
+                      encoding="utf-8").read()
+        cfg_b = build_cfg(b, ws_probe)
+        enc = None
+        for line in src.splitlines():
+            if line.startswith("ENCODER = "):
+                enc = line.split('"')[1]
+                break
+            if line.startswith("VERSION_ENCODER = "):
+                import ast
+                enc = ast.literal_eval(line.split("=", 1)[1].strip()).get(cfg_b["version"])
+                break
+        got = os.path.basename(cfg_b["assets"]["contentvec_onnx"])
+        # "vec768l12" -> "768l12" must appear in "contentvec_768l12.onnx"
+        check("%s: contentvec asset matches the encoder production picks (%r)" % (b, enc),
+              bool(enc) and enc[len("vec"):] in got, "(asset=%s)" % got)
+
+    check("sovits_v2: version is the one pipeline.py hard-requires",
+          build_cfg("sovits_v2", ws_probe)["version"] == "4.0-v2")
+    check("sovits_v2: f0_method=dio (without it `|f0=` never appears and the chain is pointless)",
+          build_cfg("sovits_v2", ws_probe)["f0_method"] == "dio")
 
     # ⑵ the empty-set floor — the trap this gate shipped with.
     d = tempfile.mkdtemp(prefix="s136_floor_")
