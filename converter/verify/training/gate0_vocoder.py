@@ -74,6 +74,16 @@ def mel_config():
 
 
 def main():
+    # ⛔ S135 二审:本文件此前是唯一一个**不调 read_t0、也不 declare_frozen** 的 gate0
+    #    脚本 ⇒ 它对「我读的输入是哪一批」完全无话可说,而它的输入(声码器冒烟切出来的
+    #    9 片)gate0/gate1 里**没有任何脚本能重建**。⇒ 那是一份**故意冻结**的输入,
+    #    要把它的件数与日期打进转录自证,而不是默不作声。
+    t0 = G.read_t0("GATE0 VOCODER")
+    G.declare_frozen(
+        "输入 smoke_vocoder/ws/slices", str(SLICES), [""], MIN_SLICES,
+        "声码器冒烟的产物;gate0/gate1 里没有任何脚本能重建它 ⇒ 故意冻结,不是陈货",
+        suffixes=[".wav"],
+    )
     OUT.mkdir(parents=True, exist_ok=True)
     cfg = mel_config()
 
@@ -148,8 +158,10 @@ def main():
         print(f"  (demo) upstream raw-48k path f0 median = {np.median(f0r):.2f}Hz "
               f"(expected mislabel ≈ {440 * 44100 / 48000:.2f}Hz — why deviation #9 exists)")
 
+    # ⛔ 同上:走 G.finish 才让 note_uncovered / PASS-WITH-GAPS 这条路闭合
     print("\n=== gate0_vocoder:", "PASS" if ok else "FAIL", "===")
-    sys.exit(G.EXIT_PASS if ok else G.EXIT_RED)
+    G.finish("GATE0 VOCODER", [] if ok else ["vocoder 判据"],
+             allow_uncovered="--allow-uncovered" in sys.argv)
 
 
 if __name__ == "__main__":

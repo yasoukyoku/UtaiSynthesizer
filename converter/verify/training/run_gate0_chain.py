@@ -246,13 +246,30 @@ def main():
     #    (S135 实测踩到过一次:v2 的 C1 报 "33/33 件不是本轮产物",而那批切片
     #     是三分钟前 4.1 的 prepare 刚产的。)
     #    ⇒ t0 落盘到 <runs>/T0.txt,同一场会话里所有链复用它。
+    # ⛔⛔ S135 二审自己抓出来的:t0 落盘复用**必须有时效上界**,否则这把尺子有一条
+    #    默认打开的失效通道 —— `--runs` 默认落在固定路径,第二次调用起,凡是落在
+    #    [旧 t0, now] 窗口里的陈货一律被判 FRESH 并绿。
+    #    ⇒ 花一整笔买来的「不许拿陈货比陈货」,分辨力就取决于调用者记不记得加 --new-session。
+    #    现在:超过 SESSION_MAX_AGE 一律**当新会话**,并**响亮说明**为什么。
+    SESSION_MAX_AGE = 6 * 3600.0
     t0_file = os.path.join(args.runs, "T0.txt")
+    reuse = None
+    if args.t0 is None and not args.new_session and os.path.isfile(t0_file):
+        cand = float(open(t0_file, encoding="utf-8").read().strip())
+        age = time.time() - cand
+        if age <= SESSION_MAX_AGE:
+            reuse = cand
+        else:
+            print("⛔ %s 里的 t0 已经 %.1f 小时前了(上界 %.0f 小时)—— **不复用**,"
+                  "否则这期间产生的任何陈货都会被判成本轮产物。改起新会话。"
+                  % (t0_file, age / 3600.0, SESSION_MAX_AGE / 3600.0))
     if args.t0 is not None:
         t0 = args.t0
-        print("GATE0_T0 = %.3f (显式指定)" % t0)
-    elif not args.new_session and os.path.isfile(t0_file):
-        t0 = float(open(t0_file, encoding="utf-8").read().strip())
-        print("GATE0_T0 = %.3f (复用本次 gate0 会话的 t0,记在 %s)" % (t0, t0_file))
+        print("GATE0_T0 = %.3f (显式指定 —— ⚠ 你自己负责它早于本轮全部产物)" % t0)
+    elif reuse is not None:
+        t0 = reuse
+        print("GATE0_T0 = %.3f (复用 %s,%.1f 分钟前记下的)"
+              % (t0, t0_file, (time.time() - t0) / 60.0))
     else:
         # 让 t0 严格早于任何产物 —— 文件系统时间戳的分辨率与时钟漂移都可能让
         # "同一秒产出的文件" mtime 略早于 t0,那会报成一条假的"陈货"。

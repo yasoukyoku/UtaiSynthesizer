@@ -145,8 +145,10 @@ def main():
         and stats["aug_mel"] <= AUG_MEL_FLOOR_LINE
         and stats["aug_vol"] <= AUG_VOL_LINE
     )
-    print("GATE0 DIFF:", "PASS" if ok else "FAIL")
-    raise SystemExit(G.EXIT_PASS if ok else G.EXIT_RED)
+    # ⛔ S135 二审:原来这里直接 raise SystemExit,**绕过了 G.finish** ⇒ 这条链上
+    #    `note_uncovered` 是一条结构性空判据(记了账也没人读)。走 finish 才闭合。
+    G.finish("GATE0 DIFF", [] if ok else ["diff 判据"],
+             allow_uncovered="--allow-uncovered" in sys.argv)
 
 
 if __name__ == "__main__":

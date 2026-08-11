@@ -47,6 +47,15 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ⛔ S135 追加:**驱动生产函数的脚本不止仓内这一个目录**。这三个在仓库外(无 git、
+# 不进任何自动闸),而它们恰恰是「gate_resume_state 的 D/V 组之所以携带信息」的唯一来源
+# 与「M20 每轮收工手跑」的那一条。实测 S135:前两个今天已经漂了。
+OUT_OF_REPO_DRIVERS = [
+    r"D:\MyDev\TESTING\s118_f8a\smoke_diff_resume.py",    # §F8⒜ 端到端续训冒烟(S118, 20/20)
+    r"D:\MyDev\TESTING\s119_vocoder\smoke_voc_resume.py",  # §F8⒝ 声码器端到端冒烟(S119, 16/16)
+    r"D:\MyDev\TESTING\s129_f2b2g\legs_s129.py",           # M20 每轮收工手跑的行为腿
+]
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 TRAINING = os.path.join(REPO, "training")
 
@@ -207,6 +216,22 @@ def main():
         os.path.join(HERE, f) for f in os.listdir(HERE)
         if f.endswith(".py") and f != os.path.basename(__file__)
     )
+
+    # ⛔ S135:这道闸自己带着它要防的那个盲区 —— 它只扫仓内这一个目录,
+    # 而**驱动生产函数的脚本有一部分在仓库外**(TESTING\ 下,无 git、不进任何闸)。
+    # S134 立它时写的理由原文是「the gate scripts are not imported by anything
+    # (no tsc/cargo/vitest reaches them)」—— 那条理由对仓外驱动**一字不差地成立**,
+    # 而且今天已经真的漂了两个(见下)。
+    # ⇒ 显式登记它们。⛔ 名单里的路径**必须存在**,否则当场判 exit 2 ——
+    #    一份可以静默变空的名单等于没有名单。
+    for extra in OUT_OF_REPO_DRIVERS:
+        if not os.path.isfile(extra):
+            print("VERDICT LIST-STALE — 登记的仓外驱动不在了:%s\n"
+                  "      (名单一旦能静默变空,这道闸的覆盖面就是假的)" % extra)
+            sys.exit(2)
+        scripts.append(extra)
+    scripts = sorted(scripts)
+
     bad, total = [], 0
     for s in scripts:
         n = scan(s, bad)
