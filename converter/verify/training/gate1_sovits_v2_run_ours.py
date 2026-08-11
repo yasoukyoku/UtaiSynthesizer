@@ -33,7 +33,9 @@ def main():
         "dataset_dir": "",  # resolve_speakers' single-speaker fallback reads it
         "skip_optimizer": True,  # upstream cpurun semantics (see train.py header)
     }
-    summary = train(cfg, EXP, reporter, stop)
+    # S134: 3rd positional `pool_dir` (sovits_v2/train.py:197). Position matters — appending would
+    # keep the arity right and misbind every later parameter silently.
+    summary = train(cfg, EXP, EXP, reporter, stop)
     print("SUMMARY %s" % summary, file=sys.stderr)
 
 

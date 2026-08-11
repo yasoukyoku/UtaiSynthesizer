@@ -443,9 +443,16 @@ training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_run_ou
 training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_compare.py
 ```
 - 小型化（双侧同值）：batch 2 / crop 16 / ds_workers 0 / log_interval 1（红队 A11：
-  默认 100 下 24 global 步只有 step0 一个点 = 空交集假 PASS——compare 先断言点数）/
-  val_check_interval 5（3 个 val 边界@global 0/10/20，跨 3 个 epoch）/ max_updates 24
-  （global = 2×实际步：lightning manual-opt GAN 的 D、G 各计一步）/ seed 1234 /
+  默认 100 下只有 step0 一个点 = 空交集假 PASS——compare 先断言点数）/
+  val_check_interval 5 / **max_updates 30**（global = 2×实际步：lightning manual-opt
+  GAN 的 D、G 各计一步；`total_steps: 15` × 2，`pipeline.py:577` 现算）/ seed 1234 /
+  ⛔ **S134 更正**：这一段此前写着「max_updates 24 / 3 个 val 边界@global 0/10/20」，
+  两个数都是陈的，而且**十行之下的 S40 读数自己就写着 15 步 / 4 边界(0/10/20/30)** ——
+  同一段文字自相矛盾。真值由 `vocoder/pipeline.py:577 "max_updates": 2 * total_real`
+  与驱动里的 `total_steps: 15` 现算 = **30 global / 15 实际步**，盘上实证 =
+  `SingingVocoders\experiments\gate1_voc\model_ckpt_steps_{10,20,30}.ckpt` 三个存档。
+  `gate1_vocoder_compare.py` 断言的 `EXPECT_TRAIN_POINTS=15 / EXPECT_VAL_MIN=4` 与真值一致。
+  ⇒ **按这一段的旧文字去核对点数，会拿 24/3 去量一个 30/4 的东西，然后把对的判成错的。**/
   finetune 底模 = 正式 2024.02 ckpt（CPU 重存副本——原版裸 torch.load 在 CPU 下炸，
   见下"坑"）。
 - 原版侧 = 原仓库 train.py 真实执行（repo 代码零改动）+ 执行环境 shim 三件
@@ -593,10 +600,28 @@ diff 继承：增量路径 aug 不动 + 缓存失效重建再生 aug + diff 产�
 - 基线归档：`TESTING/utai-v2-testing/sovits_ours_s38_archive`（永久只读参照）。
 - **regress_extract_sovits.py 实跑 PASS**：新 extract.py（含 aug 失败降级改动）vs S38
   时代存档 132 产物逐字节 0 失配、零杂散。
-- **传递规则生效**：四链 noop 树等价 + 训练循环文件（train.py/solver/data_loaders/
-  losses/harness）git diff 为空 ⇒ S37-40 的 gate1 结论直接传递，不重跑（S33 先例）。
-- 旧 gate 脚本调用面：既有阶段函数签名零改动（build_flist_and_config 保留为兼容包装；
-  extract_all 仅新增返回值）。
+- ~~**传递规则生效**：四链 noop 树等价 + 训练循环文件（train.py/solver/data_loaders/
+  losses/harness）git diff 为空 ⇒ S37-40 的 gate1 结论直接传递，不重跑（S33 先例）。~~
+  ⛔⛔ **S134 作废（2026-08-11）**：这条捷径的前提早已不成立。取证命令与读数——
+  `git log --oneline --since=2026-07-08 -- training/utai_train/{rvc,sovits,sovits_v2}/train.py
+  training/utai_train/sovits/diffusion/{solver,data_loaders}.py
+  training/utai_train/{rvc,sovits,sovits_v2}/../*/losses.py training/utai_train/vocoder/pipeline.py`
+  = **20 笔**（S68/S114/S116/S117/S118/S119/S122/S125/S129）。
+  ⇒ **S37-40 的 gate1 结论对今天的代码不再可传递，gate1 必须真跑。**
+  ⚠ 但这条规则本身没有错，错的是「它还成立」这个前提：它今天仍然是判断「要不要重跑」的
+  正确形状，只是答案变成了「要」。
+- ~~旧 gate 脚本调用面：既有阶段函数签名零改动（build_flist_and_config 保留为兼容包装；
+  extract_all 仅新增返回值）。~~
+  ⛔⛔ **S134 判为【今天为假】，而且它比上面那条更危险** —— 它会让人以为零号前置不存在。
+  §F2⒝（S122/S125）给五条链的入口加了 `pool_dir` 形参，而 `converter/verify/training/` 里
+  **七个我方侧调用点一个都没跟上**：`gate0_run_ours.py` 的 `build_index`/`build_filelist_and_config`、
+  五条 `gate1_*_run_ours.py` 的 `train()`/`_train_diff()`/`_train()`。
+  ⇒ **五条链的 gate1 与 RVC 的 gate0 在第 0 步之前就 TypeError**，而这个事实
+  **从每一个绿着的闸里都看不见**（python 夹具不进任何自动闸）。S134 已补齐。
+  ▶ 新的机械看守 = **`gate_driver_arity.py`**（把每个 gate 脚本的调用点静态绑到
+  `utai_train` 今天的签名上，自带 `--selftest` 阴性对照）。**跑任何 gate 之前先跑它。**
+  ⛔ 它的边界写在脚本 docstring 里：**只看得见 arity，看不见「插错位置」** ——
+  `pool_dir` 在四个签名里都在第 3 位，追加到末尾会让实参数刚好凑够而把后面每个参数错绑一格。
 
 ## smoke_aug.py（runner 直驱真训练，21 检查全 PASS）
 sovits(dirty 混合, 剔除消息实证)→sovits_diff(同工作区继承)→rvc→vocoder 各 aug=1 短训完训：

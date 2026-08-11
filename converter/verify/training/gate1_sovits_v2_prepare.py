@@ -50,15 +50,30 @@ def main():
                 assert not p or os.path.exists(p), "filelist 路径缺失: %s" % p
 
     # upstream lazy-mel cache: duplicate .aam80.npy -> .mel.npy (see header)
+    #
+    # ⛔ S134 (§F7 first pass) — this used to be guarded by `if not os.path.exists(dst)`, and that
+    # guard could turn this file's own promise ("both sides consume a BYTE-IDENTICAL mel", header)
+    # into a lie on the second run: our side eats .aam80.npy, upstream eats .mel.npy, and a
+    # surviving stale .mel.npy from an earlier gate0 means the two sides are comparing different
+    # mel. It never said a word either — the second run just printed "duplicated 0".
+    # The copy is cheap (33 files) and this is a prepare step, so: copy UNCONDITIONALLY and report
+    # fresh vs overwritten separately, so "0 new / 33 refreshed" reads as the normal steady state
+    # and "0 / 0" reads as "gate0 has not run" instead of hiding under the same number.
     spk_dir = os.path.join(GATE0_EXP, "dataset_44k", "gate")
-    dup = 0
+    fresh = refreshed = 0
     for n in os.listdir(spk_dir):
         if n.endswith(".aam80.npy"):
             dst = os.path.join(spk_dir, n.replace(".aam80.npy", ".mel.npy"))
-            if not os.path.exists(dst):
-                shutil.copyfile(os.path.join(spk_dir, n), dst)
-                dup += 1
-    print("duplicated %d aam80 -> mel.npy for the upstream lazy cache" % dup)
+            if os.path.exists(dst):
+                refreshed += 1
+            else:
+                fresh += 1
+            shutil.copyfile(os.path.join(spk_dir, n), dst)
+    assert fresh + refreshed > 0, (
+        "no .aam80.npy under %s — gate0 (v2) has not produced anything, so the upstream lazy-mel "
+        "cache would be whatever an older run left behind" % spk_dir
+    )
+    print("aam80 -> mel.npy for the upstream lazy cache: %d new, %d refreshed" % (fresh, refreshed))
 
     for exp in (ORIG_EXP, OURS_EXP):
         if os.path.isdir(exp):

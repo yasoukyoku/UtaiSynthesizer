@@ -27,8 +27,13 @@ def main():
         "model_slug": "gate1_sovits",
         "model_name": "gate1_sovits",
         "workspace": EXP,
+        "dataset_dir": "",  # resolve_speakers' single-speaker fallback reads it (flist.py:86,
+        # hard-subscript); _write_release_config runs at train.py:306, BEFORE the loop at :378 ⇒
+        # without this key the run dies with KeyError before step 0. Same key the v2 driver
+        # already carries — 4.1's driver was simply never updated alongside it.
     }
-    summary = train(cfg, EXP, reporter, stop)
+    # S134: 3rd positional `pool_dir` (sovits/train.py:188). Position matters — see gate1_run_ours.
+    summary = train(cfg, EXP, EXP, reporter, stop)
     print("SUMMARY", summary, file=sys.stderr)
 
 

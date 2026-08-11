@@ -41,7 +41,12 @@ def main():
     train_utils.get_logger(EXP)
     reporter = Reporter(throttle_secs=0.0)  # 每 step 全量 emit（关卡用）
     stop = StopFlag(os.path.join(EXP, "stop.flag.never"))
-    summary = train(CFG, EXP, reporter, stop)
+    # S134 (§F7 first pass): §F2⒝ gave train() a 3rd positional `pool_dir`
+    # (rvc/train.py:122 `train(cfg, exp_dir, pool_dir, reporter, stop)`), and this driver was
+    # never updated ⇒ it TypeError'd before step 0. ⛔ It has to go in POSITION 3, not appended:
+    # appending would make the arity right and bind pool_dir=reporter / reporter=stop silently.
+    # EXP is correct: the gate workspace is the pre-split flat shape where the run dir IS the pool.
+    summary = train(CFG, EXP, EXP, reporter, stop)
     print("SUMMARY:", summary, file=sys.stderr)
 
 

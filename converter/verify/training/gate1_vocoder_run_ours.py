@@ -52,7 +52,10 @@ def main():
         config = yaml.safe_load(f)
 
     cfg = {"total_steps": 15, "save_every_steps": 5, "seed": 1234}
-    summary = vpipe._train(cfg, str(exp_dir), config, _Rep(), _Stop())
+    # S134: 3rd positional `pool_dir` (vocoder/pipeline.py:800 `_train(cfg, run_dir, pool_dir,
+    # config, reporter, stop)`) — it sits BEFORE `config`, so appending would bind
+    # pool_dir=config / config=_Rep() / reporter=_Stop() and still not raise TypeError.
+    summary = vpipe._train(cfg, str(exp_dir), str(exp_dir), config, _Rep(), _Stop())
     print("ours summary:", json.dumps(summary, ensure_ascii=False))
 
 

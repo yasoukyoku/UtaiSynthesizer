@@ -12,7 +12,12 @@ gate 小型化（双侧同值，README 登记）：
   batch 2 / crop 16 / ds_workers 0（原版侧由 run_orig 的 monkeypatch shim 对齐
   vendored A2 补丁）/ log_interval 1（红队 A11：默认 100 下 24 global 步只有
   step0 一个点 = 空交集假 PASS）/ val_check_interval 5（≥2 个 val 边界，S39 铁律）/
-  num_sanity_val_steps 2 / max_updates 24（global = 12 实际步）/ seed 1234 /
+  num_sanity_val_steps 2 / max_updates 30（global = 15 实际步）/ seed 1234 /
+  ⛔ S134 更正：这一行此前写「max_updates 24（global = 12 实际步）」，两个数都是陈的。
+  真值由 vocoder/pipeline.py:577 `"max_updates": 2 * total_real` 与本文件驱动的
+  total_steps=15 现算 = 30 global / 15 实际步；盘上实证 = SingingVocoders/experiments/
+  gate1_voc 的 model_ckpt_steps_{10,20,30}.ckpt；gate1_vocoder_compare.py 的
+  EXPECT_TRAIN_POINTS=15 / EXPECT_VAL_MIN=4 也是按真值写的。照旧文字核点数会把对的判成错的。/
   finetune = 正式底模 / fp32 CPU（库内共识：训练侧 bitwise 对拍只能 CPU）。
 """
 import copy

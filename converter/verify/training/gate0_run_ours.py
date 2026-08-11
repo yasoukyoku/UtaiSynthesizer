@@ -49,8 +49,16 @@ def main():
         reporter,
         stop,
     )
-    build_index(EXP, "v2", 1234, reporter)
+    # S134 (§F7 first pass): §F2⒝ split "the run directory" from "the pool" and gave these two
+    # entry points a `pool_dir` parameter — build_index takes it 2nd, build_filelist_and_config
+    # takes it 2nd as well. The gate workspace is the pre-split flat shape where slot == pool, and
+    # the three calls ABOVE have been feeding EXP as pool_dir all along (preprocess.py:110
+    # `pool_dir` is the 3rd arg = EXP; extract_f0.py:63 and extract_feature.py:24 take it 1st = EXP),
+    # so EXP is where `3_feature768/` and the slice dirs actually live ⇒ pool_dir MUST be EXP here
+    # or build_index would look for features in an empty directory.
+    build_index(EXP, EXP, "v2", 1234, reporter)
     build_filelist_and_config(
+        EXP,
         EXP,
         "48k",
         "v2",

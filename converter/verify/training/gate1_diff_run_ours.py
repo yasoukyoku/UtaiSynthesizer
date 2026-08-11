@@ -32,7 +32,9 @@ def main():
 
     reporter = Reporter(throttle_secs=0.0)  # every step on the wire for the gate
     cfg = {"seed": 1234, "total_steps": 24}
-    summary = _train_diff(cfg, WS, reporter, _Stop())
+    # S134: 3rd positional `pool_dir` (diff_pipeline.py:630 `_train_diff(cfg, run_dir, pool_dir,
+    # reporter, stop)`). Position matters — appending keeps the arity right and misbinds silently.
+    summary = _train_diff(cfg, WS, WS, reporter, _Stop())
     reporter.done("completed", {k: v for k, v in summary.items() if k != "stopped"})
     sys.stderr.write("GATE1 DIFF OURS SIDE DONE\n")
 
