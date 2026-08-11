@@ -57,6 +57,11 @@ DRIVABLE = ("sovits", "rvc", "vocoder")
 #: A floor, not a pin: today `--backend all` prints 52 (README:610) and it may grow.
 MIN_CHECKS_ALL = 48
 
+#: Floor on the checks ONE chain's identity-v2 ladder must print. Counted, not guessed:
+#: 4 (step0) + 24 (three rungs, including the cumulative 「earlier pools intact」 checks)
+#: + 3 (back to zero) + 3-4 (positive observations) = 34-35.
+MIN_CHECKS_V2 = 30
+
 
 def check(name, ok, detail=""):
     print("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail))
@@ -65,12 +70,44 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
+#: The identity-v2 arm writes EVERYTHING under this subdirectory of GATE_ROOT.
+#:
+#: ⛔ Not a `_v2` suffix on the file names, and that is not a style choice: for
+#: backend="sovits" the obvious name `cfg_pipe_sovits_v2.json` **is already taken** — it is
+#: `legs_s129.py`'s hand-written template for its fourth chain (`workspace` literally reads
+#: "SET-BY-THE-LEG"). `run_pipeline` overwrites its cfg path unconditionally, so the v2 arm
+#: would have eaten that fixture, and the damage would have been SILENT: the ladder's last
+#: step is copies=0, `|aug=` is only appended above 0, so the leg would go on stamping
+#: `aug_copies: 0` into its manifest and stay green while no longer covering ④d's token.
+#:
+#: A whole separate directory also makes 「did the v2 arm touch anything legs owns」 a
+#: one-line question instead of a per-name audit.
+IDV2_DIR = "idv2"
+
+
+def arena(identity_version):
+    """Where this arm's workspaces and configs live. v1 == GATE_ROOT, byte-for-byte as before."""
+    if identity_version is None or int(identity_version) < 2:
+        return GATE_ROOT
+    d = os.path.join(GATE_ROOT, IDV2_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def run_pipeline(backend, ws, copies, dataset_dir=None, identity_version=None):
     cfg = noop.build_cfg(backend, ws, identity_version=identity_version)
     cfg["aug_copies"] = int(copies)
     if dataset_dir:
         cfg["dataset_dir"] = dataset_dir
-    cfg_path = os.path.join(GATE_ROOT, "cfg_pipe_%s.json" % backend)
+    # ⛔ The cfg lands NEXT TO the workspace it configures, never at `arena(identity_version)`.
+    # Those two can disagree, and when they do the damage is silent and lands on someone else:
+    # a caller running this ladder with the knob OFF but the v2 workspaces ON writes
+    # `cfg_pipe_rvc.json` back into GATE_ROOT — which is `legs_s129.py`'s template, and legs
+    # reads `aug_copies` out of it to stamp `run_manifest.json`.
+    # ⚠ Measured, not imagined: S136's own negative control did exactly this and moved
+    # cfg_pipe_rvc.json's `aug_copies` from 0 to 2 before the drift checker caught it.
+    # Deriving the directory from `ws` makes the two structurally incapable of disagreeing.
+    cfg_path = os.path.join(os.path.dirname(ws), "cfg_pipe_%s.json" % backend)
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=1)
     r = subprocess.run(
@@ -144,8 +181,16 @@ def backend_paths(backend, ws):
     the slot, where the run's own artifacts stay (filelists, retrieval asset, config). Deriving
     them all from `ws` was correct only while the two were the same directory, and having this
     gate keep its own second opinion about which is which is exactly how the two would drift.
+
+    ⛔ Keeps `noop.pool_of`'s 「exactly one pool」 refusal, and that refusal is a REAL criterion
+    for the v1 arm: one identity, one cold run, one pool. The identity-v2 arm legitimately holds
+    several sibling pools at once (that is the whole of ④d), so it calls `backend_paths_in` with
+    the pool it means — it does not get to relax this one.
     """
-    pool = noop.pool_of(ws)
+    return backend_paths_in(backend, ws, noop.pool_of(ws))
+
+
+def backend_paths_in(backend, ws, pool):
     if backend == "sovits":
         return {
             "slice_dir": os.path.join(pool, "dataset_44k", "gateaug"),
@@ -178,6 +223,205 @@ def backend_paths(backend, ws):
         "backend %r has no backend_paths arm — this gate cannot say where its products live, "
         "so it cannot test anything about them. Drivable here: %s "
         "(sovits_diff is only exercised through diff_inherit)" % (backend, ", ".join(DRIVABLE)))
+
+
+# ─── identity-v2 arm ────────────────────────────────────────────────────────────────────
+#
+# ⛔ This is NOT 「the same ladder with a knob」. Under ④d `aug_copies` is part of the pool
+# identity, so each copies value gets its own SIBLING pool — which means two of the v1
+# ladder's checks stop asking a question that exists:
+#   · 「copies=3 preserves aug1/2 bytes」 was about INCREMENTAL growth inside one pool.
+#     Under v2 copies=3 is a different pool, so asserting the old pool is untouched is
+#     VACUOUSLY true — and it is exactly what ④d guarantees anyway, so it is re-asked here
+#     as an explicit 「every earlier pool survives byte-for-byte」.
+#   · 「copies=1 removes ALL idx>=2 products」 was about `augment_slices`' stale pruning.
+#     Under v2 nothing is pruned (the low count gets a fresh pool), and the v1 check would
+#     go RED for a correct implementation because it scans the WHOLE workspace and finds
+#     the other pools' legitimate aug2/aug3. That pruning branch is still live in
+#     production for un-migrated slots (a brand-new slot is born v1, `tpool.rs`), so the
+#     **v1 arm keeps it** — it is the only coverage of a shape that still ships.
+#
+# What this arm pins is what `pool.py:204-208` says `|aug=` was added FOR: two runs with
+# different counts no longer destroy each other's products.
+
+
+def _pool_api():
+    """Production's own identity helpers. ⛔ Never re-implement the formula here — the five
+    chains build `fp_text` five different ways, and a sixth copy in a gate would drift.
+    Precedent: `gate_pool_table.py` imports `pool_id_for` the same way."""
+    sys.path.insert(0, os.path.join(APP, "training"))
+    from utai_train.pool import FINGERPRINT, POOLS_DIR, identity_suffix, pool_id_for
+    return identity_suffix, pool_id_for, POOLS_DIR, FINGERPRINT
+
+
+def _sr_hz(cfg):
+    """The value production feeds `identity_suffix` — rvc only, and it is the Hz int, not the
+    "48k" UI string (`pool.py:200-202` explains why routing it through a display string would
+    be a second encoding of one fact)."""
+    if cfg.get("backend") != "rvc":
+        return None
+    sys.path.insert(0, os.path.join(APP, "training"))
+    from utai_train.rvc.pipeline import SR_MAP
+    return SR_MAP[cfg["sample_rate"]]
+
+
+def _pool_dir(ws, pid):
+    _s, _p, pools_dir, _f = _pool_api()
+    return os.path.join(ws, pools_dir, pid)
+
+
+def pool_fp(ws, pid):
+    _s, _p, _d, fname = _pool_api()
+    with open(os.path.join(_pool_dir(ws, pid), fname), encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def snapshot_pool(ws, pid):
+    """{rel: sha256} of everything in one pool. Content, not mtime: a rebuild that produced
+    identical bytes is not a violation of anything ④d promises."""
+    import hashlib
+    root = _pool_dir(ws, pid)
+    out = {}
+    for rel in list_rel(root):
+        h = hashlib.sha256()
+        with open(os.path.join(root, rel), "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        out[rel] = h.hexdigest()
+    return out
+
+
+def assert_pool_intact(ws, pid, before, label):
+    now = snapshot_pool(ws, pid)
+    lost = sorted(set(before) - set(now))
+    changed = sorted(r for r in set(before) & set(now) if before[r] != now[r])
+    # ⛔ A floor, because `all(... for r in {})` is the vacuous-green shape this whole arm
+    # exists to avoid: an empty `before` would make every one of these checks free.
+    if not before:
+        check(label, False, "(the snapshot was EMPTY — this check would have been free)")
+        return
+    check(label, not lost and not changed,
+          "" if not (lost or changed) else "lost=%s changed=%s" % (lost[:4], changed[:4]))
+
+
+def observe_v2(backend, ws, pool_ids, fp_of):
+    """⭐ Positive proof that the v2 code path was actually taken — not just that nothing broke.
+
+    ⛔ Per chain, because they are not equally observable, and pretending otherwise is how a
+    structurally-empty criterion gets counted as coverage:
+      · rvc         `|sr=` is UNCONDITIONAL ⇒ observable at every count, including 0.
+      · sovits fam  the single-speaker slice dir is renamed to `pool.SOLE_SPEAKER_DIR`.
+      · vocoder     at copies=0 there is NOTHING: no `|sr=`, no `|aug=` (omitted at 0), no
+                    `dataset_44k` at all. Its v1 and v2 strings are byte-identical there.
+                    The only knob that makes it observable is copies>0 — which this ladder
+                    does drive, so vocoder DOES get real v2 coverage here (unlike the
+                    copies=0-only `gate_aug0_noop`).
+    """
+    if backend == "rvc":
+        check("%s v2: fingerprints carry the unconditional |sr= token" % backend,
+              all("|sr=" in fp_of[n] for n in pool_ids), str(fp_of))
+    elif backend in ("sovits", "sovits_diff", "sovits_v2"):
+        sys.path.insert(0, os.path.join(APP, "training"))
+        from utai_train.pool import SOLE_SPEAKER_DIR
+        for n, pid in pool_ids.items():
+            d44 = os.path.join(_pool_dir(ws, pid), "dataset_44k")
+            subs = sorted(os.listdir(d44)) if os.path.isdir(d44) else []
+            check("%s v2: copies=%d slices live under the constant %r, not the run's name"
+                  % (backend, n, SOLE_SPEAKER_DIR), subs == [SOLE_SPEAKER_DIR], str(subs))
+    # every chain: above 0 the shared suffix must actually be there
+    for n in sorted(pool_ids):
+        if n > 0:
+            check("%s v2: the copies=%d fingerprint ends with |aug=%d" % (backend, n, n),
+                  fp_of[n].endswith("|aug=%d" % n), fp_of[n])
+    if backend == "vocoder":
+        print("  [NOTE] %s copies=0 carries NO v1/v2 observable (no |sr=, |aug= omitted at 0, "
+              "no dataset_44k) — that格 is a structurally empty criterion and is not counted "
+              "as v2 coverage." % backend)
+
+
+def exercise_v2(backend):
+    print("== %s [identity v2]" % backend)
+    identity_suffix, pool_id_for, _pools_dir, _fname = _pool_api()
+    ws = os.path.join(arena(2), "ws_pipe_%s" % backend)
+    wipe(ws)
+    cfg = noop.build_cfg(backend, ws, identity_version=2)
+    sr = _sr_hz(cfg)
+
+    def suffix(n):
+        return identity_suffix(cfg, n, sample_rate=sr)
+
+    # ── step0: the un-augmented identity ────────────────────────────────────────────────
+    run_pipeline(backend, ws, 0, identity_version=2)
+    ids = noop.pools_in(ws)
+    check("%s v2: copies=0 minted exactly one pool" % backend, len(ids) == 1, str(ids))
+    if len(ids) != 1:
+        return
+    p0 = ids[0]
+    fp0 = pool_fp(ws, p0)
+    s0 = suffix(0)
+    check("%s v2: the copies=0 fingerprint ends with the shared suffix %r" % (backend, s0),
+          fp0.endswith(s0), fp0)
+    # ⭐ BASE is DERIVED from the disk, never re-computed: the five chains build the part
+    # before the shared suffix five different ways, and a sixth copy here would be the
+    # 「两侧同意一起漂」 shape `gate_pool_table.py` warns about.
+    base = fp0[:len(fp0) - len(s0)] if s0 else fp0
+    check("%s v2: the pool's directory name IS pool_id_for(its fingerprint)" % backend,
+          p0 == pool_id_for(fp0), "%s vs %s" % (p0, pool_id_for(fp0)))
+
+    seen = {0: p0}
+    fps = {0: fp0}
+    snaps = {0: snapshot_pool(ws, p0)}
+    check("%s v2: the copies=0 pool is not empty" % backend, len(snaps[0]) > 0,
+          "(%d files)" % len(snaps[0]))
+
+    # ── the ladder: every count gets its OWN pool, and the earlier ones must survive ─────
+    for n in (2, 3, 1):
+        run_pipeline(backend, ws, n, identity_version=2)
+        want_fp = base + suffix(n)
+        want_id = pool_id_for(want_fp)
+        live = noop.pools_in(ws)
+        check("%s v2: copies=%d resolved to the pool named by BASE+%r" % (backend, n, suffix(n)),
+              want_id in live, "want %s, live %s" % (want_id, live))
+        if want_id not in live:
+            return
+        check("%s v2: …and that pool's fingerprint is EXACTLY that string" % backend,
+              pool_fp(ws, want_id) == want_fp, pool_fp(ws, want_id))
+        check("%s v2: …and it is a NEW sibling, not one of the earlier pools" % backend,
+              want_id not in seen.values(), "%s in %s" % (want_id, seen))
+        # ⭐⭐ THE ④d guarantee: `pool.py:206-208` — 「two runs sharing a pool with different
+        # counts destroy each other's products」. This is the check that says they no longer do.
+        for m, pid in sorted(seen.items()):
+            assert_pool_intact(ws, pid, snaps[m],
+                               "%s v2: copies=%d left the copies=%d pool byte-intact"
+                               % (backend, n, m))
+        seen[n] = want_id
+        fps[n] = want_fp
+        snaps[n] = snapshot_pool(ws, want_id)
+
+        P = backend_paths_in(backend, ws, _pool_dir(ws, want_id))
+        augs = list_rel(P["slice_dir"], lambda r: is_aug_rel(r) and r.endswith(".wav"))
+        check("%s v2: copies=%d pool holds aug slices" % (backend, n), len(augs) > 0,
+              "(%d)" % len(augs))
+        idxs = sorted({aug_idx(r) for r in augs})
+        check("%s v2: copies=%d pool holds exactly aug1..aug%d" % (backend, n, n),
+              idxs == list(range(1, n + 1)), str(idxs))
+        metas = [x for x in os.listdir(P["meta"])
+                 if x.endswith(".json") and not x.startswith("_")]
+        check("%s v2: copies=%d meta count == aug count" % (backend, n),
+              len(metas) == len(augs), "(%d/%d)" % (len(metas), len(augs)))
+
+    # ── back to zero: the ORIGINAL pool is re-selected, byte for byte ────────────────────
+    run_pipeline(backend, ws, 0, identity_version=2)
+    check("%s v2: copies back to 0 re-selects the SAME pool it started with" % backend,
+          p0 in noop.pools_in(ws), "%s not in %s" % (p0, noop.pools_in(ws)))
+    assert_pool_intact(ws, p0, snaps[0],
+                       "%s v2: …and that pool is byte-identical to before the whole ladder"
+                       % backend)
+    check("%s v2: the ladder left exactly the 4 pools it declared" % backend,
+          sorted(noop.pools_in(ws)) == sorted(seen.values()),
+          "live=%s declared=%s" % (sorted(noop.pools_in(ws)), sorted(seen.values())))
+
+    observe_v2(backend, ws, seen, fps)
 
 
 def exercise(backend):
@@ -375,24 +619,94 @@ def diff_inherit():
               for r in aug2))
 
 
+#: Which chains the identity-v2 ladder can drive today.
+#: ⛔ The sovits family is NOT here yet and that is deliberate, not an oversight: under v2 its
+#: single-speaker slices move to `pool.SOLE_SPEAKER_DIR`, and `backend_paths_in` still hard-codes
+#: `dataset_44k/gateaug` in two places (plus `diff_inherit`'s third). Adding the name without
+#: that handling would not go red — `list_rel` returns `[]` for a missing directory, so the
+#: counts would quietly be 0 and several `all(...)` checks would pass vacuously.
+#: rvc and vocoder need no change at all: rvc has no speaker directory, vocoder has no
+#: `dataset_44k`. (Confirmed against `flist.py:88-89`, which is sovits-family only.)
+DRIVABLE_V2 = ("rvc", "vocoder")
+
+#: What `legs_s129.py` reads out of GATE_ROOT. The v2 arm must not touch ANY of it.
+LEGS_OWNED = ("ws_pipe_rvc", "ws_pipe_sovits", "ws_pipe_vocoder",
+              "cfg_pipe_rvc.json", "cfg_pipe_sovits.json", "cfg_pipe_sovits_diff.json",
+              "cfg_pipe_sovits_v2.json", "cfg_pipe_vocoder.json")
+
+
+def legs_fixture_digest():
+    """{rel: sha256} of everything legs_s129 consumes from GATE_ROOT. Missing entries are
+    recorded as None so 「it vanished」 and 「it changed」 are different answers."""
+    import hashlib
+    out = {}
+    for name in LEGS_OWNED:
+        p = os.path.join(GATE_ROOT, name)
+        if os.path.isfile(p):
+            files = [(name, p)]
+        elif os.path.isdir(p):
+            files = [(os.path.join(name, r), os.path.join(p, r)) for r in list_rel(p)]
+        else:
+            out[name] = None
+            continue
+        for rel, fp in files:
+            h = hashlib.sha256()
+            with open(fp, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            out[rel] = h.hexdigest()
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     # ⛔ `choices=` mirrors gate_aug0_driver.py, which has always had it. A mistyped
     # backend used to reach `backend_paths` and die with a one-word message.
     ap.add_argument("--backend", default="all", choices=("all",) + DRIVABLE)
+    ap.add_argument("--arm", default="v1", choices=("v1", "v2", "both"),
+                    help="v1 = the pre-④d identity formula (the existing baseline, unchanged); "
+                         "v2 = ④d's, where aug_copies is part of the pool identity")
     args = ap.parse_args()
     backends = list(DRIVABLE) if args.backend == "all" else [args.backend]
     noop.ensure_fixture()
-    for b in backends:
-        exercise(b)
-    if args.backend in ("all", "sovits"):
-        dirty_rejection()
-        diff_inherit()
+
+    if args.arm in ("v2", "both"):
+        # ⛔ The acceptance criterion S134 wrote for M15 —「跑完 v2 档之后 legs 的夹具没变」—
+        # lives INSIDE the gate, not in my head. Its own version of this check was
+        # 「pools/ 里仍然只有 v1 那个 id」, which is satisfied EXACTLY WHEN the contamination
+        # happens: at aug=0 the sovits family's v2 fingerprint is byte-identical to v1, so a
+        # v2 run against a v1 workspace resolves to the SAME pool and grows a second slice
+        # tree INSIDE it. Hence: per-file digests, and 「extra file」 counts as damage.
+        before = legs_fixture_digest()
+        for b in [x for x in backends if x in DRIVABLE_V2]:
+            n_before = len(CHECKS)
+            exercise_v2(b)
+            # ⛔ The ladder `return`s early at three points (one pool expected but N found;
+            # the wanted pool absent). Those returns are right — carrying on would compare
+            # against a pool nobody selected — but they leave a SHORT green run, and a short
+            # green run reads exactly like a complete one. A floor, not a pin.
+            ran = len(CHECKS) - n_before
+            check("%s v2: the ladder ran to the end (%d checks, floor %d)"
+                  % (b, ran, MIN_CHECKS_V2), ran >= MIN_CHECKS_V2)
+        skipped = [x for x in backends if x not in DRIVABLE_V2]
+        if skipped:
+            print("  [NOTE] identity-v2 arm SKIPPED for %s — not yet wired (see DRIVABLE_V2). "
+                  "⛔ Their v1 green says nothing about ④d." % ", ".join(skipped))
+        check("v2 arm touched nothing legs_s129 owns", legs_fixture_digest() == before,
+              "" if legs_fixture_digest() == before else "⛔ STOP — legs' 存量池 fixtures moved")
+
+    if args.arm in ("v1", "both"):
+        for b in backends:
+            exercise(b)
+        if args.backend in ("all", "sovits"):
+            dirty_rejection()
+            diff_inherit()
     if FAILURES:
         print("RESULT: FAIL (%d): %s" % (len(FAILURES), ", ".join(FAILURES)))
         return 1
-    # ⛔ Only meaningful for the full run; a single-backend run legitimately prints fewer.
-    if args.backend == "all" and len(CHECKS) < MIN_CHECKS_ALL:
+    # ⛔ Only meaningful for the full v1 run; a single-backend or v2-only run legitimately
+    # prints fewer, and the v2 ladder's own count is pinned by its own floor below.
+    if args.arm in ("v1", "both") and args.backend == "all" and len(CHECKS) < MIN_CHECKS_ALL:
         print("GATE-UNRUNNABLE: only %d checks ran (floor %d) — checks behind `if` gates "
               "(val / index / feature-cache mtimes) DISAPPEAR rather than go red when a path "
               "stops resolving, so a short green run is not a green run." % (len(CHECKS),
