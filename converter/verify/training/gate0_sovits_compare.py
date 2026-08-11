@@ -17,6 +17,18 @@ CPU fp32）的实跑产物。
         (torch2.5)，双方 fp32 CPU —— 只剩 torch 版本轴
      C4 spec / C5 vol：同一 44k 输入，torch 版本轴
   S  我方 filelist / config / 检索库语义自检 + config 与原版逐键语义对拍。
+
+★ S135(§F7 笔 2)接入 `gate0_guard`,补两条一直缺的东西:
+  ⑴ **防空集守卫**。这条缺陷 S68(`f599e76`, 2026-07-17)的对抗审查已判为 **[major]**
+     并在孪生脚本 `gate0_sovits_v2_compare.py:72-75` 修好,**从没回移到本文件**
+     (同一笔 commit 碰过这里,只改了 `aux→auxiliary` 一个词)。开了 25 天。
+     没有它:两侧目录都空 ⇒ `a == b` 通过 ⇒ a_products/c4_c5 的循环 0 次 ⇒
+     A/44k、A/soft、A/spec、A/vol、C4、C5 六条全部 PASS 而什么都没比。
+  ⑵ **非同源守卫**。全文此前零个 mtime 检查。实测后果:2026-07-17 那次"复跑"
+     其实只跑了第 ③ 步与 compare —— ①② 自 2026-07-07 起就没再跑过,
+     而 A 层四条比的是 12 天前的产物,两份 rerun 日志逐字节相同(那不是可复现性的
+     证据,是两次都在同一批冻住的产物上空转的证据)。
+  ⛔ 需要环境变量 `GATE0_T0`(本轮起始 epoch 秒)。
 """
 import json
 import os
@@ -24,6 +36,9 @@ import sys
 
 import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate0_guard as G  # noqa: E402
 
 sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
@@ -38,12 +53,21 @@ OURS = os.path.join(TESTING, "sovits_ours")
 OURS_44K = os.path.join(OURS, "dataset_44k", "gate")
 AUX = os.path.join(REPO, "data", "models", "auxiliary")
 
+MIN_SLICES = 30      # gate 固定 33 片(v2 那条链用的也是 30 这个下限)
+
 failures = []
+emitted = []
+
+# ⛔ a_wavs():78-79 与 a_products():96-97 在长度/帧数不合时 `return`,会把后面几条判据
+# **整段跳过而一行都不打印** —— 转录看起来像"只跑了一部分",却没有任何东西核对
+# "14 条都跑了"。所以收尾要数一遍。(C2 跑 768/256 两次 ⇒ 是 14 不是 13。)
+EXPECTED_CRITERIA = 14
 
 
 def check(label, ok, detail):
     tag = "PASS" if ok else "FAIL"
     print(f"[{tag}] {label}: {detail}")
+    emitted.append(label)
     if not ok:
         failures.append(label)
 
@@ -64,6 +88,9 @@ def a_wavs():
     from scipy.io import wavfile
 
     a, b = wav_names(ORIG_44K), wav_names(OURS_44K)
+    # 防空集(S68 已判 [major],补丁形状 = gate0_sovits_v2_compare.py:72-75)
+    G.require_min("A/44k orig 件数", len(a), MIN_SLICES)
+    G.require_min("A/44k ours 件数", len(b), MIN_SLICES)
     check("A/44k 文件集合", a == b, f"orig={len(a)} ours={len(b)} 差集={sorted(a ^ b)[:6]}")
     if a != b:
         return
@@ -85,6 +112,8 @@ def a_wavs():
 
 def a_products():
     names = sorted(wav_names(ORIG_44K) & wav_names(OURS_44K))
+    # 没有这一行，交集为空时下面 A/soft、A/f0、A/spec、A/vol 四条会一起 PASS 而零比较
+    G.require_min("A/产物 交集件数", len(names), MIN_SLICES)
 
     # .soft.pt — [1, 768, T]
     worst_cos, worst_max = (1.0, ""), (0.0, "")
@@ -209,6 +238,7 @@ def c3_f0():
     )
     tot = bad = flips = 0
     worst = 0.0
+    G.require_min("C3 输入件数", len(wav_names(ORIG_44K)), MIN_SLICES)
     for n in sorted(wav_names(ORIG_44K)):
         fo, uo = np.load(os.path.join(ORIG_44K, n + ".f0.npy"), allow_pickle=True)
         wav, _ = librosa.load(os.path.join(ORIG_44K, n), sr=44100)
@@ -234,6 +264,9 @@ def c4_c5_spec_vol():
 
     vex = Volume_Extractor(512)
     worst_spec, worst_vol = (0.0, ""), (0.0, "")
+    # ⛔ 没有这一行，ORIG_44K 为空时 C4/C5 会打印 `max_rel=0.000e+00 @ `（文件名是空串）
+    # —— 与「逐位完美」的输出**逐字符相同**。盘上 gate0_4x_rerun2.log 就有这么一行。
+    G.require_min("C4/C5 输入件数", len(wav_names(ORIG_44K)), MIN_SLICES)
     for n in sorted(wav_names(ORIG_44K)):
         wav, _ = librosa.load(os.path.join(ORIG_44K, n), sr=44100)
         audio_norm = torch.FloatTensor(wav).unsqueeze(0)
@@ -299,6 +332,21 @@ def s_layer():
 
 
 def main():
+    t0 = G.read_t0("GATE0 SOVITS")
+
+    print("== 0: 产物身份（本轮算的 vs 陈货）==")
+    # 这条链两侧都该是本轮重建的：第 ② 步 gate0_sovits_orig.py:116 会 rmtree
+    # dataset44k 整棵重建，第 ③ 步我方侧重建 .wav —— 但 .soft.pt/.f0.npy/.spec.pt/
+    # .vol.npy 四类是 skip-if-exists（extract.py:169/183/188），不清就永远是旧的。
+    G.require_fresh("原版侧 sovits_orig/dataset44k/gate", ORIG_44K, [""], t0, MIN_SLICES * 4)
+    G.require_fresh("原版侧 oracle", ORACLE, [""], t0, MIN_SLICES * 2)
+    G.require_fresh("我方 sovits_ours/dataset_44k/gate", OURS_44K, [""], t0, MIN_SLICES * 4)
+    G.require_fresh("我方 filelists", os.path.join(OURS, "filelists"), [""], t0, 2)
+    G.require_fresh("我方 cluster", os.path.join(OURS, "cluster"), [""], t0, 1)
+    G.require_fresh("双侧 config.json", TESTING,
+                    [os.path.join("sovits_orig"), os.path.join("sovits_ours")], t0, 2,
+                    suffixes=["config.json"])
+
     print("== A: 端到端 vs 原版时代环境实跑（librosa/torch/提取器数值轴，松阈值）==")
     a_wavs()
     a_products()
@@ -308,12 +356,17 @@ def main():
     c4_c5_spec_vol()
     print("== S: 我方产物语义自检 ==")
     s_layer()
-    print()
-    if failures:
-        print("GATE0 SOVITS: FAILURES:", failures)
-        sys.exit(1)
-    print("GATE0 SOVITS: ALL PASS (C1 需另跑 gate0_sovits_c_resample.py)")
+    # 判据完整性:真的数一遍,别只在注释里承诺
+    if not failures and len(emitted) != EXPECTED_CRITERIA:
+        raise G.GateUnrunnable(
+            "只打出了 %d 条判据(应为 %d)—— 有 return 把后面整段跳过了,"
+            "这一轮不是一次完整判定。已打出:%s"
+            % (len(emitted), EXPECTED_CRITERIA, ", ".join(emitted))
+        )
+    print("[COUNT] 判据条数 %d/%d" % (len(emitted), EXPECTED_CRITERIA))
+    G.finish("GATE0 SOVITS", failures,
+             allow_uncovered="--allow-uncovered" in sys.argv)
 
 
 if __name__ == "__main__":
-    main()
+    G.run("GATE0 SOVITS", main)
