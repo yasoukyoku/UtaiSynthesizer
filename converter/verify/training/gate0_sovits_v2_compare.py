@@ -25,6 +25,9 @@ import sys
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate0_guard as G  # noqa: E402
+
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "training"))
 
@@ -34,6 +37,7 @@ OURS = os.path.join(TESTING, "sovits_v2_ours")
 ORIG_44K = os.path.join(ORIG, "dataset44k", "gate")
 OURS_44K = os.path.join(OURS, "dataset_44k", "gate")
 ORACLE = os.path.join(ORIG, "oracle")
+MIN_SLICES = 30      # gate 固定 33 片(与 a_wavs 的 >=30 下限同源)
 
 import numpy as np
 import torch
@@ -256,6 +260,23 @@ def s_semantics(names):
 
 
 def main():
+    # ★ S135(§F7 笔 2):本文件的**防空集**守卫在 S68 就修好了(:72-75),缺的是
+    # **非同源守卫**。实测后果比 4.1 那条更重:S134 那句 sovits_v2 gate1
+    # 「BITWISE-SAME」正是在这棵陈货树上取得的 —— .soft.pt/.f0.npy 是 07-17 08:37、
+    # .aam80.npy/filelists/config 是 07-17 08:41,而 08-11 那天对这棵树唯一的写入
+    # 是把 07-17 的 .aam80.npy 复制改名成 .mel.npy(gate1 prepare 干的)。
+    # ⇒ 那条绿证的是训练循环可复现,**不是预处理可复现**。
+    # 还有一条一命令假绿:只跑本文件(不跑 ①②③)今天就会打印 ALL PASS —— A 层与
+    # S 层两侧全陈 ⇒ 覆盖 0,只有 C2/C3/C4 是当场重算的。
+    t0 = G.read_t0("GATE0 SOVITS_V2")
+    print("== 0: 产物身份（本轮算的 vs 陈货）==")
+    G.require_fresh("原版侧 sovits_v2_orig/dataset44k/gate", ORIG_44K, [""], t0, MIN_SLICES * 2)
+    G.require_fresh("原版侧 oracle", ORACLE, [""], t0, MIN_SLICES * 2)
+    G.require_fresh("我方 sovits_v2_ours/dataset_44k/gate", OURS_44K, [""], t0, MIN_SLICES * 3)
+    G.require_fresh("我方 filelists", os.path.join(OURS, "filelists"), [""], t0, 2)
+    G.require_fresh("双侧 config.json", TESTING, ["sovits_v2_orig", "sovits_v2_ours"], t0, 2,
+                    suffixes=["config.json"])
+
     names = a_wavs()
     if not names:
         # a_wavs 已记 FAIL；显式兜底防「零文件全跳过 → 无 failure → 假 PASS」
@@ -266,12 +287,9 @@ def main():
         c3_dio(names)
         c4_aam_mel(names)
         s_semantics(names)
-    print()
-    if failures:
-        print("GATE0 SOVITS_V2 FAILED: %s" % failures)
-        sys.exit(1)
-    print("GATE0 SOVITS_V2 ALL PASS（C1 需另跑 gate0_sovits_v2_c_resample.py）")
+    G.finish("GATE0 SOVITS_V2（C1 需另跑 gate0_sovits_v2_c_resample.py）", failures,
+             allow_uncovered="--allow-uncovered" in sys.argv)
 
 
 if __name__ == "__main__":
-    main()
+    G.run("GATE0 SOVITS_V2", main)

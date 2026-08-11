@@ -15,6 +15,18 @@ parselmouth 的跨版本轴由 gate0b_parselmouth_xenv.py 一次性交叉定审�
       上游原始路径（48k 直喂）的 f0 会系统性偏低 ×44100/48000——证明偏离 #9 的
       必要性（该演示仅打印，不计 PASS/FAIL）。
 
+⛔ S135(§F7 笔 2)登记的**覆盖边界**（别把这一关的绿读成它不具备的东西）：
+  · (a) 段的两份 wav2spec 是逐字拷贝只改 import 行 ⇒ 它能抓的只有**移植抄写错误**；
+    管线层 slice_dataset / process_slices / build_filelists 是我方带登记偏离的代码，
+    (a) 段一行都没碰。
+  · (b) 段是**自合成 48k 440Hz 正弦的自检**，不是与上游对拍；而且它的上游对照
+    (:124-129) 明写「仅打印，不计 PASS/FAIL」，:125 的 `if ok_raw:` 还让上游那条
+    失败时什么都不打印、什么都不失败。
+  · 这两条链**结构上够不着 pool_dir**（extract_all 没有这个形参，本文件三个调用点
+    也都不带）⇒ 它们的绿对 §F2⒝ 的池布局一个字也没说。
+  · 退出码此前只有 0/1：`assert slices` 触发、`assert ok_a and ok_b` 触发、import 阶段炸，
+    与「被测的东西不对」共用同一个非零 —— 违反 S129 铁律第一条。已改成走 gate0_guard。
+
 用法：training/.venv/Scripts/python.exe converter/verify/training/gate0_vocoder.py
 """
 import os
@@ -26,10 +38,14 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate0_guard as G  # noqa: E402
+
 APP = pathlib.Path(r"D:\MyDev\Utai_v2-dev")
 ORIG = pathlib.Path(r"D:\MyDev\SingingVocoders")
 SLICES = pathlib.Path(r"D:\MyDev\TESTING\smoke_vocoder\ws\slices")
 OUT = pathlib.Path(r"D:\MyDev\TESTING\gate0_vocoder")
+MIN_SLICES = 9      # 声码器冒烟固定切出 9 片
 
 sys.path.insert(0, str(APP / "training"))
 sys.path.insert(0, str(ORIG))  # original repo package roots (utils/, process.py)
@@ -63,7 +79,11 @@ def main():
 
     # ---- (a) side-by-side wav2spec on the SAME slices ----
     slices = sorted(SLICES.glob("*.wav"))
-    assert slices, f"no slices in {SLICES} — run the vocoder smoke first"
+    # ⛔ S135:原来这里是裸 assert —— 切片没了给的是 traceback + 非零,与「被测的东西
+    # 不对」共用同一个退出码(S129 铁律第一条)。而 SLICES 是声码器冒烟的产物,
+    # gate0/gate1 里没有任何脚本能重建它 ⇒ 它没了属于「闸跑不起来」。
+    G.require_min("gate0(a) 输入切片", len(slices), MIN_SLICES,
+                  "SLICES=%s(声码器冒烟的产物,gate 里没有脚本能重建)" % SLICES)
     print(f"=== gate0(a): {len(slices)} slices, orig vs vendored, bitwise ===")
     worst = {}
     for s in slices:
@@ -129,8 +149,8 @@ def main():
               f"(expected mislabel ≈ {440 * 44100 / 48000:.2f}Hz — why deviation #9 exists)")
 
     print("\n=== gate0_vocoder:", "PASS" if ok else "FAIL", "===")
-    sys.exit(0 if ok else 1)
+    sys.exit(G.EXIT_PASS if ok else G.EXIT_RED)
 
 
 if __name__ == "__main__":
-    main()
+    G.run("GATE0 VOCODER", main)
