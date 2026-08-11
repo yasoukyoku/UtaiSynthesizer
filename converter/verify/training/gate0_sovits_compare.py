@@ -338,9 +338,17 @@ def main():
     # 这条链两侧都该是本轮重建的：第 ② 步 gate0_sovits_orig.py:116 会 rmtree
     # dataset44k 整棵重建，第 ③ 步我方侧重建 .wav —— 但 .soft.pt/.f0.npy/.spec.pt/
     # .vol.npy 四类是 skip-if-exists（extract.py:169/183/188），不清就永远是旧的。
-    G.require_fresh("原版侧 sovits_orig/dataset44k/gate", ORIG_44K, [""], t0, MIN_SLICES * 4)
-    G.require_fresh("原版侧 oracle", ORACLE, [""], t0, MIN_SLICES * 2)
-    G.require_fresh("我方 sovits_ours/dataset_44k/gate", OURS_44K, [""], t0, MIN_SLICES * 4)
+    # ⛔ `classes` 是 S135 二审补的(M12):合计件数下限**挡不住整整一类产物消失**。
+    # 实测算术:这里原来写 MIN_SLICES*4 = 120,而目录里是 33 片 × 5 类 = 165
+    # ⇒ 少掉一整类(33 件)后剩 132 >= 120,照样判 FRESH。⇒ 逐类报下限。
+    D44K_CLASSES = [".wav", ".wav.soft.pt", ".wav.f0.npy", ".spec.pt", ".wav.vol.npy"]
+    G.require_fresh("原版侧 sovits_orig/dataset44k/gate", ORIG_44K, [""], t0, MIN_SLICES * 4,
+                    classes=D44K_CLASSES, per_class=MIN_SLICES)
+    G.require_fresh("原版侧 oracle", ORACLE, [""], t0, MIN_SLICES * 2,
+                    classes=[".wav16k.npy", ".venc768.npy", ".venc256.npy"],
+                    per_class=MIN_SLICES)
+    G.require_fresh("我方 sovits_ours/dataset_44k/gate", OURS_44K, [""], t0, MIN_SLICES * 4,
+                    classes=D44K_CLASSES, per_class=MIN_SLICES)
     G.require_fresh("我方 filelists", os.path.join(OURS, "filelists"), [""], t0, 2)
     G.require_fresh("我方 cluster", os.path.join(OURS, "cluster"), [""], t0, 1)
     G.require_fresh("双侧 config.json", TESTING,

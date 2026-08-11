@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\admin\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+            "args": [
+              "D:\\MyDev\\Utai_v2-dev\\scripts\\memory_hook_guard.py"
+            ],
+            "timeout": 15,
+            "statusMessage": "查记忆钩子"
+          }
+        ]
+      }
+    ]
+  }
+}

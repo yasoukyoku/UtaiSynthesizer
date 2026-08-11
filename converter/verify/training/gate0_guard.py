@@ -41,6 +41,7 @@ S135(§F7 笔 2)新建。起因是侦察 + 逐面对抗核验查明:**gate0 今�
 
 自检:`python gate0_guard.py --selftest`
 """
+import hashlib
 import os
 import sys
 import time
@@ -99,7 +100,19 @@ def collect(root, subs, suffixes=None):
     return out
 
 
-def require_fresh(label, root, subs, t0, minimum, suffixes=None):
+def dirhash(root, subs, suffixes=None):
+    """目录内容的可复算指纹(按相对路径排序,喂 路径 + 字节)。"""
+    h = hashlib.sha256()
+    for p, _m in collect(root, subs, suffixes):
+        h.update(os.path.relpath(p, root).replace("\\", "/").encode("utf-8"))
+        with open(p, "rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""):
+                h.update(c)
+    return h.hexdigest()
+
+
+def require_fresh(label, root, subs, t0, minimum, suffixes=None,
+                  classes=None, per_class=None):
     """我方侧产物:必须存在、够数、而且**全部是本轮算出来的**。
 
     ⛔ 别拿「stage 的 done 计数走满」当判据 —— 三处 reporter.stage 全在 skip 的
@@ -111,6 +124,29 @@ def require_fresh(label, root, subs, t0, minimum, suffixes=None):
         raise GateUnrunnable(
             "%s: 只有 %d 件(下限 %d)—— 这不是一次比较,是一次空转。root=%s subs=%s"
             % (label, len(items), minimum, root, subs)
+        )
+    # ⛔ S135 二审自己抓出来的洞(M12):合计件数下限**挡不住整整一类产物消失**。
+    #    实测算术:sovits 那条写的是 MIN_SLICES*4 = 120,而目录里是 33 片 × 5 类 = 165
+    #    ⇒ 少掉一整类(33 件)后剩 132 >= 120,照样判 FRESH。
+    #    ⇒ 一个目录里有多类产物时,必须**逐类**报下限。
+    if classes:
+        pc = per_class if per_class is not None else minimum
+        counts = {}
+        for c in classes:
+            counts[c] = sum(1 for p, _m in items if os.path.basename(p).endswith(c))
+        short = {c: n for c, n in counts.items() if n < pc}
+        if short:
+            raise GateUnrunnable(
+                "%s: 逐类下限没走满(每类应 >= %d)—— 缺的类:%s;全表:%s\n"
+                "       ⇒ 合计件数够不代表每一类都在:整整一类产物消失时合计仍可能达标。"
+                % (label, pc, short, counts)
+            )
+    # ⛔ 同族(S134 的 .part 血训):0 字节的新鲜文件照样是新鲜的,但它不是产物。
+    empty = [p for p, _m in items if os.path.getsize(p) == 0]
+    if empty:
+        raise GateUnrunnable(
+            "%s: %d 件是 0 字节(崩在写一半 / 占位)—— 新鲜但不是产物:%s"
+            % (label, len(empty), [os.path.basename(p) for p in empty[:5]])
         )
     stale = [(p, m) for p, m in items if m < t0]
     if stale:
@@ -128,11 +164,17 @@ def require_fresh(label, root, subs, t0, minimum, suffixes=None):
     return items
 
 
-def declare_frozen(label, root, subs, minimum, why, suffixes=None):
-    """冻结参照:**故意**不重算的一侧。必须存在且够数,并把日期打进转录自证。
+def declare_frozen(label, root, subs, minimum, why, suffixes=None, expect_sha=None):
+    """冻结参照:**故意**不重算的一侧。必须存在、够数、**而且还是同一份东西**。
 
-    这样做的理由要写进 why —— 转录里看得见「这一侧是冻结的、为什么冻结、它有多旧」,
+    理由要写进 why —— 转录里看得见「这一侧是冻结的、为什么冻结、它有多旧」,
     下一个人才不会把「参照没变」误读成「本轮验过了」。
+
+    ⛔ S135 二审抓出来的洞(M11):这个函数原本**只判件数下限,然后把 mtime 打印出来** ——
+       而**打印是汇报不是判据**。参照侧被重跑、被从别的备份还原、被指到另一个目录,
+       三种情况一律照常返回,唯一差别是那一行的日期变了。
+       ⇒ 加 `expect_sha`:给了就**必须逐字节对上**。
+       (同一批代码里本来就有正确形状:`gate0_rebuild_b2_ours.py` 的 dirhash 同源守卫。)
     """
     items = collect(root, subs, suffixes)
     if len(items) < minimum:
@@ -142,7 +184,16 @@ def declare_frozen(label, root, subs, minimum, why, suffixes=None):
         )
     lo = _fmt(min(m for _p, m in items))
     hi = _fmt(max(m for _p, m in items))
-    print("[FROZEN-REF] %s: %d 件,mtime %s ~ %s —— %s" % (label, len(items), lo, hi, why))
+    got = dirhash(root, subs, suffixes)
+    if expect_sha is not None and got != expect_sha:
+        raise GateUnrunnable(
+            "%s: 冻结参照的内容**变了**。期望 %s,实测 %s。\n"
+            "       ⇒ 它被重跑 / 从别的备份还原 / 指到了另一个目录。这一轮的对拍失去参照身份,\n"
+            "         **不是**被测代码红了。要接受新参照必须显式改掉登记的 sha。"
+            % (label, expect_sha[:16], got[:16])
+        )
+    print("[FROZEN-REF] %s: %d 件,mtime %s ~ %s,sha %s —— %s"
+          % (label, len(items), lo, hi, got[:16], why))
     return items
 
 
@@ -283,6 +334,51 @@ def _selftest():
         expect_unrunnable(
             "require_fresh(后缀过滤后不够数)",
             lambda: require_fresh("st/滤", tmp, ["sub"], now, minimum=2, suffixes=[".npy"]))
+
+        # 6) M12:合计够但**整整一类**消失 —— 必须被逐类下限抓住
+        for i in range(3):
+            for ext in (".a.npy", ".b.npy"):
+                q = os.path.join(d, "x%d%s" % (i, ext))
+                with open(q, "wb") as f:
+                    f.write(b"z")
+                os.utime(q, (now + 5, now + 5))
+        expect_ok("require_fresh(逐类都在)",
+                  lambda: require_fresh("st/类", tmp, ["sub"], now, minimum=6,
+                                        suffixes=[".npy"], classes=[".a.npy", ".b.npy"],
+                                        per_class=3))
+        for i in range(3):                       # 把 .b 整类删掉,再补 3 个 .a 顶上合计
+            os.remove(os.path.join(d, "x%d.b.npy" % i))
+            q = os.path.join(d, "y%d.a.npy" % i)
+            with open(q, "wb") as f:
+                f.write(b"z")
+            os.utime(q, (now + 5, now + 5))
+        expect_unrunnable(
+            "require_fresh(合计够但少了一整类)",
+            lambda: require_fresh("st/类缺", tmp, ["sub"], now, minimum=6,
+                                  suffixes=[".npy"], classes=[".a.npy", ".b.npy"],
+                                  per_class=3))
+
+        # 7) 0 字节的新鲜文件不是产物(.part 血训同族)
+        z = os.path.join(d, "zero.a.npy")
+        open(z, "wb").close()
+        os.utime(z, (now + 5, now + 5))
+        expect_unrunnable("require_fresh(0 字节)",
+                          lambda: require_fresh("st/零", tmp, ["sub"], now, minimum=1,
+                                                suffixes=[".npy"]))
+        os.remove(z)
+
+        # 8) M11:冻结参照被换掉必须被抓住,而不是只换一行日期
+        good = dirhash(tmp, ["sub"], [".npy"])
+        expect_ok("declare_frozen(sha 对得上)",
+                  lambda: declare_frozen("st/冻sha", tmp, ["sub"], 1, "自检",
+                                         suffixes=[".npy"], expect_sha=good))
+        swap = os.path.join(d, "y0.a.npy")
+        with open(swap, "wb") as f:
+            f.write(b"CHANGED")
+        expect_unrunnable(
+            "declare_frozen(参照内容被换掉)",
+            lambda: declare_frozen("st/冻换", tmp, ["sub"], 1, "自检",
+                                   suffixes=[".npy"], expect_sha=good))
 
         if old is not None:
             os.environ[T0_ENV] = old

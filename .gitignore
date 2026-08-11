@@ -92,3 +92,6 @@ bin/
 # byte length, so a file we rewrite on every listing would abort a data-dir migration.
 # In dev the app dir IS the repo (same reason logging.rs keeps dev logs out of the tree).
 /training-projects.json
+
+# Claude Code:worktrees 是本地状态,settings.json 与 scripts/memory_hook*.* 要进版本库
+.claude/worktrees/

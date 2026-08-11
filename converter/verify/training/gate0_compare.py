@@ -199,17 +199,25 @@ def main():
     # CUDA 跑的（它自己的 extract_f0_feature.log 写着 'move model to cuda'，本文件
     # 头注也记了 cudnn TF32 噪声 ~1e-2）⇒ **重算反而会换掉参照物**，README 的 A 层
     # 读数从此对不上原件。
+    # ⛔ `expect_sha` 是 S135 二审补的(M11):在那之前 `declare_frozen` **只判件数**、
+    # 然后把 mtime **打印**出来 —— 而打印是汇报不是判据。参照侧被重跑、被从别的备份还原、
+    # 被指到另一个目录,三种情况一律照常通过,唯一差别是那一行的日期变了。
+    # 下面三串是 2026-08-11 登记的值。⛔ 它们变了要**先弄清为什么**,再决定改不改这里 ——
+    # 改这三行等于宣布「我接受一个新的参照物」。
     G.declare_frozen(
         "原版侧 rvc_orig", ORIG, OURS_PRODUCT_DIRS, MIN_SLICES,
         "不变输入 × 不变上游代码的函数；3_feature768 是 CUDA/TF32 产物、不逐位可复现，重算即换参照",
+        expect_sha="65f171f76d76e0e20d8ce7896b5c594acd64a3b111cde21bf3bfcb376e06ccdb",
     )
     G.declare_frozen(
         "C 参照 rvc_B2_orig", F0_FP32_REF, ["2a_f0", "2b-f0nsf"], MIN_SLICES,
         "原版 rmvpe CPU fp32 参照（README 的 ② 命令生成）",
+        expect_sha="704092e7e46e47791fef873d5fd28799c910954bb147a4953b0046e1c56923a0",
     )
     G.declare_frozen(
         "C 参照 rvc_fairseq_fp32", FEAT_FP32_REF, ["3_feature768"], MIN_SLICES,
         "真 fairseq 0.12.2 fp32 CPU 参照；重建 = CUDA_VISIBLE_DEVICES=-1 跑上游 extract_feature_print",
+        expect_sha="a53d5f9f90983d129e6dfdd850db92d1d43c4726f9144466f758dea88f9f09e8",
     )
 
     print("== A: 端到端 vs 原版整合包实跑（含 librosa/CUDA-TF32/half 数值轴，松阈值）==")

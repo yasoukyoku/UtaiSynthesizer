@@ -13,8 +13,26 @@ python3.9 + torch 2.0.0+cu118 + fairseq 0.12.2 + librosa 0.9.1）。
 
 ## 关卡0 —— 预处理对拍（切片/f0/特征/filelist/index）
 
+> ⛔⛔ **S135 起，别再照抄下面这几行手敲。** gate0 的 compare 现在要求环境变量 `GATE0_T0`
+> （本轮起始 epoch 秒）——**没有它就没有新鲜度判据**，分不出读到的产物是今天算的还是七月的，
+> 脚本会以 `exit 3`（不可归因）拒绝，而不是给你一个没有意义的绿。
+> ⇒ **一律用跑器**：
+> ```
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate0_chain.py all --clear
+> ```
+> 它负责钉 t0、按硬顺序跑五条链（sovits 的 prepare 产 `sovits_slices`，v2 与两条 C1 都吃它；
+> diff 的 prepare 源是 `sovits_ours/dataset_44k/gate`）、把每段分开报（出口码七档），
+> 并且**清货是"删目录"而不是"清空目录"**——compare 的守卫只看 `isdir`，
+> 清空会打印 `max|Δ|=0.000e+00` 的**假 PASS**，删掉才会正确地红。
+> ⚠ 下面这几行原始命令保留下来是为了说清**每一段到底在干什么**，不是操作配方。
+> ⚠ ③ 那句「见本 README 末尾内联脚本」是**从来没存在过**的（S135 用 `git log -S` 全历史核过）；
+> `rvc_fairseq_fp32` 今天不用重建，`gate0_compare.py` 已把它连同另外两份冻结参照
+> 用 `expect_sha` 钉死——它们被换掉会当场红，而不是只换一行日期。
+
 ```
 # ① 原版侧（ground truth，用原版自带 runtime，cwd=RVC 根）：
+#    ⛔ S135 起 rvc_orig 改判【冻结参照，DO-NOT-TOUCH】：它是「不变输入 × 不变上游代码」
+#       的函数，而且 3_feature768 是 CUDA/TF32 产物、不逐位可复现 ⇒ 重跑反而换掉参照物。
 cd D:\MyDev\RVC\RVC20240604Nvidia
 runtime\python.exe infer\modules\train\preprocess.py <gate_dataset> 48000 4 <rvc_orig> True 3.7
 runtime\python.exe infer\modules\train\extract\extract_f0_rmvpe.py 1 0 0 <rvc_orig> True

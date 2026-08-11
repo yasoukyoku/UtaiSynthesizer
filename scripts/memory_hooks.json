@@ -1,0 +1,96 @@
+{
+  "_why": "把记忆里的『动 X 前必读 Y』从【我该记得读的文本】变成【碰到那个文件时工具链打给我的东西】。起因:用户 2026-08-11 —— 『钩子存在但是不读 这个问题你也想想办法吧... 每次出这个问题的后果都挺灾难』。这已经发生过两次:S120(没读 MEMORY.md 明写的『动训练侧前必读 S75+S76』),S135(拿『某一场已经销过账』顶替了『去读核验经验』)。记忆层解决不了它 —— 失效点不在『我不知道规矩』,而在【动手那一刻没有任何东西拦我】。",
+  "_how": "PreToolUse 钩子在 Edit/Write 触到下面任一 match 前缀时打出该区的必读清单。⛔ 每个 session × 每个区**只打一次**(打多了必然被调成噪音、然后被无视)。",
+  "_maintenance": "新增一个区之前先问:它的『必读』真的会改变我要写的代码吗?不会就别加 —— 这份清单的价值与它的长度成反比。",
+  "memory_dir": "C:\\Users\\admin\\.claude\\projects\\D--MyDev-Utai-v2-dev\\memory",
+  "areas": [
+    {
+      "id": "gate",
+      "match": ["converter/verify/training/"],
+      "headline": "你在动训练侧的【关卡】。这套闸的绿曾经不代表任何事。",
+      "must_read": [
+        "project_v2_session135.md",
+        "project_v2_session134.md"
+      ],
+      "hard_rules": [
+        "⛔ 用户 2026-08-11 拍板的三条判据(别自己发明别的):⑴ gate 有没有【自证陷阱】 ⑵ gate 覆不覆盖【全部】训练架构 ⑶ 今天的 gate【至少和以前版本一样严谨】。三条成立就『问题不大』。",
+        "⛔ 跑验证之前**先去看以前版本时候是怎么做的**(用户 2026-08-11 立的常驻规矩)—— 有没有可借鉴的经验或启发。S75/S76/S78/S79 是训练侧的坑单与做法;S37-S41 是这套 gate 建立时的方法论(README.md 里有)。**不许拿『某一场已经销过账』当替代:销账是结论,经验是做法。**",
+        "⛔ 删目录 = 正确地红,清空目录 = 假 PASS(compare 的守卫只看 isdir)。",
+        "⛔ 别用 reporter.stage 的 done 计数当判据 —— 它在 skip 之前汇报,全跳过也走满。",
+        "⛔ 五条链的 gate0 两侧解释器**天生不同**(原版侧 = RVC 整合包 runtime),不许改成 gate1 那种『两侧同一个』。"
+      ]
+    },
+    {
+      "id": "training-py",
+      "match": ["training/utai_train/"],
+      "headline": "你在动 python 训练侧的生产代码。",
+      "must_read": [
+        "reference_training_workspace_layout.md",
+        "project_v2_session75.md",
+        "project_v2_session76.md",
+        "project_v2_session78.md"
+      ],
+      "hard_rules": [
+        "⛔ S75/S76 的原文有 3 条已被后来的设计**有意换掉**,照原文『补回来』会当场制造新拒绝:loudnorm/aug_copies 被 S78 从必锁降为 Costly · 『一 family 一槽、重训清空该架构』被 S132 的 flip 整条换掉 · 『续训起点只读呈现』被 §F2⒜ 换成 latest/best 两选。",
+        "⛔ additive-then-flip:会让 N 个调用点同时失效的改动,**删除留到最后一笔**(S121 血训)。",
+        "⛔ 改了阶段函数的签名 ⇒ 仓内**和仓外**的驱动都要跟上。跑 `gate_driver_arity.py` 核一遍(S134 那七个调用点漂了四个月;S135 又在仓外抓到两个)。"
+      ]
+    },
+    {
+      "id": "training-rs",
+      "match": ["src-tauri/src/training/"],
+      "headline": "你在动 Rust 训练侧(槽 / run / 池 / 锁表 / 导出账本)。",
+      "must_read": [
+        "reference_training_workspace_layout.md",
+        "project_v2_session133.md",
+        "project_v2_session132.md",
+        "project_v2_session129.md"
+      ],
+      "hard_rules": [
+        "⛔ 危险不在把权重挪个位置,而在于**八条承重谓词同时变假,五条静默毁数据**(S123)。",
+        "⛔ 房规 `opt_run_id(\"\")→None` ⇒ 照抄 rename 那一行会做出**伪装成删 run 的删槽**(S133)。",
+        "⛔ 训练侧的 i18n:权威表是 `backendError.ts` 的 `CODE_KEYS`,json 里有文案不算数;动 i18n 一律**文本行插入**(json 往返会整体重排序)。"
+      ]
+    },
+    {
+      "id": "training-ui",
+      "match": ["src/components/training/", "src/lib/training/", "src/store/training"],
+      "headline": "你在动训练侧前端。",
+      "must_read": [
+        "project_v2_devserver_and_e2e_backlog.md",
+        "project_v2_session128.md"
+      ],
+      "hard_rules": [
+        "⛔ devServer **只查观感**,不是行为验证手段。行为一律做程序化验证。",
+        "⛔ 决策写在组件体内联表达式里 ⇒ vitest 结构上够不着。**先抽成 `src/lib/training/` 下的纯模块**(M1 已示范)。",
+        "⚠ 记忆里 M4/M7 的阴性对照**写错过**,以 devserver backlog 的『S134 §2』那张表为准。"
+      ]
+    },
+    {
+      "id": "dictline",
+      "match": ["converter/architectures/", "scripts/g2p_rulers/", "src/lib/vocal/"],
+      "headline": "你在动词典线 / G2P / 人声轨那一块 —— 它的 session 行 S83-S113 在 S135 被整块搬出 MEMORY.md 了。",
+      "must_read": [
+        "memory_dictline_sessions_index.md"
+      ],
+      "hard_rules": [
+        "⛔ 那 31 行里的钩子**全部仍然有效**(G2P/各语词典 · syllabify/onset/接缝 · allocate_in_note/借帧/PHONE_DUR_PRIORS · 音域扩展 donor · UTAU 别名 · restToken/吸附 · 反投影尺子)。去那篇 grep 你要动的模块名。",
+        "⛔ 造新尺子/改判据前先读 `scripts/g2p_rulers/README.md` 的 8 条硬规矩。",
+        "⚠ 收到某个词唱错的反馈:意语先读 it_troncamento_open_costs 的判定流程,德语先 grep de_glide_open_costs。"
+      ]
+    },
+    {
+      "id": "release",
+      "match": ["scripts/release.ps1", "src-tauri/tauri.conf.json"],
+      "headline": "你在动发版链。",
+      "must_read": [
+        "reference_release_signing_and_publishing.md",
+        "project_v2_release_bundle.md"
+      ],
+      "hard_rules": [
+        "⛔ minisign 私钥丢了 = 更新链死。",
+        "⛔ `cargo test` 必须带 `--workspace`(S134:裸 cargo test 漏跑 utai-dsp + utai-stretch 共 38 条,而它从来没红过)。"
+      ]
+    }
+  ]
+}
