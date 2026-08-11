@@ -607,12 +607,56 @@ vocoder 切片跨 run 恒差 1 字节，本次实测定责]）。读数：sovits
 vocoder 12/12、sovits_diff 37/37 文件全等。复跑：
 `.venv\Scripts\python.exe ..\converter\verify\training\gate_aug0_noop.py --backend <b>`
 
-## gate_aug_pipeline.py（管线不变量，52 检查全 PASS）
+## gate_aug_pipeline.py（管线不变量，**两条臂**：`--arm v1` / `v2` / `both`）
+
+### `--arm v1` —— ④d 之前那个池身份公式（既有基线）
 每链 0→2→2(rerun)→3→1→0 档位阶梯：val 与份数0 逐字节同且永无 aug；检索/index 资产
 与份数0 逐字节同（原片-only 拍板）；meta==幸存 aug 数；rerun 逐位稳定+缓存 mtime 不变
 （rvc 每 run 重算但逐位相同=名键特征缓存有效性的实证）；降档产物连坐清除（vocoder 含
-npz 侧）；**2→…→0 树 == fresh-0**。dirty 混合集：≥1 剔除 + 幸存片全材料化 + 零残渣。
-diff 继承：增量路径 aug 不动 + 缓存失效重建再生 aug + diff 产物齐全。
+npz 侧）；**2→…→0 树 == fresh-0**。dirty 混合集：≥1 剔除 + **≥1 幸存**(S137 新增地板)
++ 幸存片全材料化 + 零残渣。diff 继承：增量路径 aug 不动 + **换数据集铸兄弟池、旧池
+逐字节存活** + diff 产物齐全。
+
+⚠ **`--backend all` 的期望条数 = 53**（sovits 15 + rvc 12 + vocoder 14 + dirty 5 + diff 7），
+是**地板不是钉子**（`MIN_CHECKS_ALL=48`）。⛔ **这个数是数出来的，不是量出来的**：v1 臂
+**自 2026-08-08 起没有真跑过**，而今天的 `build_cfg` 比那时多写 `run_dir` /
+`run_has_main_model` 两个键 ⇒ 重跑会改写 `GATE_ROOT/cfg_pipe_*.json`，而那五份同时是
+`legs_s129.py` 的**输入模板**。⇒ 重跑 v1 臂是**单独一笔**，跑之前必须先
+`TESTING\s136_f7\backup_pre_m15.py`，跑之后 `check_fixtures_untouched.py`。
+
+### `--arm v2` —— ④d 的公式（`aug_copies` 与 `sample_rate` 进池身份，单说话人切片改名）
+S136 建、S137 接进 sovits。它**不是「同一条阶梯加个旋钮」**：v2 下每个份数是一个**兄弟池**，
+所以阶梯钉的是 `pool.py:204-208` 说的 `|aug=` 立项理由本身 ——
+**两个不同份数的 run 不再互相摧毁产物**。逐级：解析到 `pool_id_for(BASE+后缀)` 命名的兄弟池、
+fingerprint **整串相等**、是**新**池、**更早的每一个池逐字节没少也没多一个东西**、
+切片落在闸**预先声明**的目录里、恰好 aug1..augn、meta 计数相等；回零重选**同一个**池且逐字节相同。
+⭐ BASE **从盘上推导**，绝不在闸里重算（五条链构造它的方式各不相同，第六份副本 = 两侧一起漂）。
+
+| | 期望条数（**地板，不是钉子**） | 备注 |
+|---|---|---|
+| `--backend sovits` | **43** | 阶梯 41 + 链地板 1 + legs 守卫 1 |
+| `--backend rvc` | **40** | 阶梯 38 |
+| `--backend vocoder` | **39** | 阶梯 37 |
+| `--backend all` | **120** | 三条阶梯 + 三条链地板 + 1 条 legs 守卫 |
+
+⛔ **v2 臂覆盖不到什么（写在这里，免得被当成整块 ④d 覆盖记账）**：
+- 它只读 `slice_dir` 与 `meta`，**`val` / `train` / `index` 一次都不碰** ⇒
+  「aug 永不进 val」「检索资产原片-only」这两条 sovits 家特有的协议在 v2 下**覆盖仍然是 0**，
+  而且结构上够不着（阶梯五步共用一个 run 目录，filelists/index 被每一档覆写）。
+- `observe_v2` 的 `spk0` 观测**不是新覆盖**：`legs_s129.py:418-424` 已经对 sovits 与 sovits_v2
+  钉过逐字同义的一条。这条臂的净买入是**阶梯那一半**（legs 只驱一个份数）。
+- **`sovits_diff` / `sovits_v2` 的 ④d 覆盖仍然是零**，每一跑由 `main` 的 `[NOTE]` 点名
+  （它对 `noop.BACKENDS` 取差集，**不是**对本次 `--backend` 取差集，否则两个元组一相等就哑了）。
+- `vocoder` 的 copies=0 那一格没有任何 v1/v2 可观测量（无 `|sr=`、`|aug=` 在 0 时不产出、
+  无 `dataset_44k`）⇒ 闸打 `[NOTE]` 标成结构性空判据，不计入覆盖。
+- **`smoke_aug.py` 从没走过 v2**（`:84` 从不传 `identity_version`）。
+
+▶ `--selftest`（毫秒级、不碰夹具）：`DRIVABLE_V2 ⊆ DRIVABLE` · 目录名两档真的不同且 v1 那档
+取自 `build_cfg` · `backend_paths_in` 拒绝猜说话人 · **`assert_pool_intact` 的
+lost / gained / changed / 空快照四条臂各真触发一次** · 零链空转与 legs 名单变空各被拒一次 ·
+v2 臂拒绝把工作区解析进 GATE_ROOT。
+
+▶ 阴性对照 `TESTING\s137_f7\negctl_s137.py {NC1,NC3,NC4,NC5}`，跑在自己的 arena 里。
 
 ## 既有关卡复跑协议（V13）
 - 基线归档：`TESTING/utai-v2-testing/sovits_ours_s38_archive`（永久只读参照）。
