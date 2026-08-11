@@ -30,10 +30,12 @@ import gate_aug0_noop as noop  # build_cfg / paths / fixture
 APP = noop.APP
 GATE_ROOT = noop.GATE_ROOT
 FAILURES = []
+CHECKS = []
 
 
 def check(name, ok, detail=""):
     print("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail))
+    CHECKS.append(name)
     if not ok:
         FAILURES.append(name)
 
@@ -109,9 +111,17 @@ def run_smoke(backend, ws, copies, dataset_dir, wipe=True, tag=None):
     return msgs
 
 
+#: ⛔ Before S136 `--only` had no `choices=` and the four arms below are all
+#: `if args.only in ("all", "<name>")`. So `--only sovits_v2` — or any typo — matched
+#: NOTHING, ran zero checks, and printed `RESULT: ALL PASS` with exit 0. That is the
+#: empty-set false PASS `gate0_guard.py:6-11` describes word for word, occurring at the
+#: OUTERMOST layer of a gate. It was live today; it is not something S136 introduced.
+LEGS = ("sovits", "sovits_diff", "rvc", "vocoder")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="all")
+    ap.add_argument("--only", default="all", choices=("all",) + LEGS)
     args = ap.parse_args()
     noop.ensure_fixture()
     dirty_ds = os.path.join(GATE_ROOT, "dataset_dirty")
@@ -136,9 +146,21 @@ def main():
 
     if FAILURES:
         print("RESULT: FAIL (%d): %s" % (len(FAILURES), ", ".join(FAILURES)))
-        sys.exit(1)
-    print("RESULT: ALL PASS")
+        return 1
+    # ⛔ Belt as well as braces: `choices=` stops a typo, but it cannot stop someone
+    # adding a fifth name to LEGS and forgetting the arm that runs it. Zero checks is
+    # never a pass.
+    if not CHECKS:
+        print("GATE-UNRUNNABLE: `--only %s` ran ZERO checks. An arm is registered in LEGS "
+              "but nothing dispatches on it." % args.only)
+        return noop.EXIT_UNRUNNABLE
+    print("RESULT: ALL PASS (%d checks)" % len(CHECKS))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except noop.GateUnrunnable as e:
+        print("GATE-UNRUNNABLE: %s" % e)
+        sys.exit(noop.EXIT_UNRUNNABLE)

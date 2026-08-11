@@ -1,11 +1,28 @@
 # -*- coding: utf-8 -*-
 """S41 gate_aug0_noop — with aug_copies=0 the WHOLE preprocessing product tree
-must be byte-identical to the pre-S41 code (design B5; red-team V1/V3/V4/V5/V6).
+must be byte-identical to the BASELINE code (design B5; red-team V1/V3/V4/V5/V6).
+
+⛔⛔ S136: `--baseline-rev` defaults to `HEAD`, and that default was correct for
+EXACTLY ONE DAY. This script and `utai_train/augment.py` were born in the same
+commit (`af8ad8b`, 2026-07-07), so on the day it was written HEAD was still the
+parent (`c82ca55`, 2026-07-06) = genuinely pre-augmentation code, and the aug
+changes lived uncommitted in the working tree. The moment `af8ad8b` landed, the
+same default turned into **the working tree compared against itself**: with a
+clean tree both arms run byte-identical code and `RESULT: PASS — copies=0 tree
+is byte-identical to HEAD` becomes true and empty.
+
+⇒ The default is kept (it is the right answer while you are holding uncommitted
+changes — that is what makes this a mutation detector), but the script now SAYS
+which of the two things it measured, because one RESULT line meant both:
+  · baseline-rev resolves to a commit != HEAD          -> a real cross-code claim
+  · baseline-rev resolves to HEAD and the tree is clean -> A/A determinism only
+The genuinely pre-augmentation revision is `c82ca55`; pass it explicitly to make
+the S41 claim. ⚠ `sovits_v2` did not exist then (born `f599e76`, 2026-07-17, and
+it reused `augment` from birth) — that chain has NO pre-aug baseline at all.
 
 Cold-run protocol (anti-self-certification, V1):
-  1. git worktree of BASELINE (HEAD by default — pre-S41 code) is the reference
-     implementation; both sides run through gate_aug0_driver (pipeline.run
-     orchestration layer, CPU-pinned)
+  1. git worktree of BASELINE is the reference implementation; both sides run
+     through gate_aug0_driver (pipeline.run orchestration layer, CPU-pinned)
   2. wipe workspace -> run BASELINE cold -> rename tree aside as the snapshot
   3. run OURS cold at the SAME workspace path (filelists/config embed absolute
      paths, V4)
@@ -41,6 +58,33 @@ DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate_aug0_dri
 GATE_ROOT = r"D:\MyDev\TESTING\utai-v2-testing\gate_aug"
 FIXTURE = os.path.join(GATE_ROOT, "dataset")
 EXCLUDE_FILES = {"train.log"}
+
+#: Exit codes — the SAME four tiers `gate0_guard.py` established in S135, deliberately
+#: not a second scheme. S129's first iron rule: 「闸自己跑不起来」and 「被测的东西不对」
+#: must not report as the same red, or the second occurrence gets shrugged off.
+#: ⛔ Before S136 this gate had only 0/1: a failed driver (`run_side`), a slot the
+#: normaliser refuses (`pool_prefix`), and a genuine byte difference all exited 1.
+EXIT_PASS = 0
+EXIT_RED = 1           # the thing under test is wrong
+EXIT_UNRUNNABLE = 3    # the gate could not run / this reading is not attributable
+EXIT_SELFTEST = 4      # this script's own self-check failed
+
+#: Floor on how many files a comparison must have looked at. ⛔ Two empty trees make
+#: `set()==set()` ⇒ zero iterations ⇒ zero diffs ⇒ `RESULT: PASS`. That is the exact
+#: shape S68 judged [major] and S135 had to fix across gate0; it was never carried
+#: over here. **A floor, not a pin** — counts are allowed to grow (S125 added
+#: `pool.json`, so today every chain has one more file than the README records).
+MIN_COMPARED_FILES = 10
+
+#: The backends `build_cfg` can actually build a config for. Used for `--backend choices=`
+#: here and in `gate_aug_pipeline`. ⛔ This is a SECOND place that lists them, so
+#: `--selftest` asserts every name here really gets a config out of `build_cfg` — a
+#: choices list that has drifted from the dispatch is worse than no choices list.
+BACKENDS = ("rvc", "sovits", "sovits_diff", "vocoder")
+
+
+class GateUnrunnable(RuntimeError):
+    """This reading is not attributable. ⛔ Must never be read as 『通过』."""
 
 
 def ensure_fixture():
@@ -140,7 +184,7 @@ def build_cfg(backend, workspace):
             "aug_copies": 0,
         })
     else:
-        raise SystemExit("backend %s not wired yet" % backend)
+        raise GateUnrunnable("backend %s not wired yet" % backend)
     return cfg
 
 
@@ -155,7 +199,12 @@ def run_side(label, code_root, backend, cfg_path):
     if r.returncode != 0 or "STOPPED_AT_TRAIN_PREP" not in (r.stdout or ""):
         print(r.stdout)
         print(r.stderr[-4000:] if r.stderr else "")
-        raise SystemExit("%s side failed (rc=%d)" % (label, r.returncode))
+        # ⛔ NOT a red: one side of the comparison never produced a tree, so there is
+        # nothing to compare. Reporting this as 1 (like a byte difference) is what
+        # S129's iron rule forbids.
+        raise GateUnrunnable("%s side failed (rc=%d) — no tree was produced, so this "
+                             "run says nothing about the copies=0 no-op property"
+                             % (label, r.returncode))
 
 
 def tensors_equal(pa, pb):
@@ -221,7 +270,9 @@ def pool_prefix(root):
     if not ids:
         return ""
     if len(ids) != 1:
-        raise SystemExit(
+        # ⛔ The gate cannot normalise this shape — that is a statement about the GATE,
+        # not about the products. Exit 3, never 1.
+        raise GateUnrunnable(
             "gate cannot normalise a slot holding %d pools (%s) — a cold single-identity run must "
             "produce exactly one" % (len(ids), ids)
         )
@@ -237,7 +288,7 @@ def pool_of(root):
     return os.path.join(root, p.rstrip(os.sep)) if p else root
 
 
-def compare_trees(base, ours):
+def compare_trees(base, ours, min_files=MIN_COMPARED_FILES):
     # ⚠ §F2⒝: the preprocessing products moved from the slot root into `pools/<id>/`, and the
     # absolute paths embedded in filelists moved with them. That is ONE declared relocation, so it
     # is normalised away here rather than being reported 30 times as "extra in ours" — but the
@@ -260,7 +311,7 @@ def compare_trees(base, ours):
                 if strip and rel.startswith(strip):
                     rel = rel[len(strip):]
                 if rel in out:
-                    raise SystemExit(
+                    raise GateUnrunnable(
                         "pool normalisation collided on %r — the same relative path exists both "
                         "inside and outside the pool, so this comparison cannot be trusted" % rel
                     )
@@ -297,7 +348,17 @@ def compare_trees(base, ours):
             print("  [note] %s: identical after normalising the pool path segment" % rel)
             continue
         bad.append("content differs: %s" % rel)
-    print("compared %d files: %d identical, %d problems" % (len(a | b.keys() if False else set(a) | set(b)), same_ct, len(bad)))
+    seen = set(a) | set(b)
+    print("compared %d files: %d identical, %d problems" % (len(seen), same_ct, len(bad)))
+    # ⛔ The floor goes here and not in main(): both trees empty ⇒ zero diffs ⇒ `bad`
+    # is empty ⇒ every caller reads that as PASS. `gate_aug_pipeline.tree_equal_to`
+    # would turn it into a green `[PASS]` line with no hint that it looked at nothing.
+    if len(seen) < min_files:
+        raise GateUnrunnable(
+            "only %d file(s) to compare (floor %d) — a comparison this small cannot carry the "
+            "claim. base=%s ours=%s. ⚠ Two empty trees compare equal, so this is a refusal, "
+            "not a PASS." % (len(seen), min_files, base, ours)
+        )
     return bad
 
 
@@ -328,18 +389,56 @@ def assert_no_reparse_points(root):
             ):
                 found.append(p)
     if found:
-        raise SystemExit(
+        raise GateUnrunnable(
             "REFUSING to `git worktree remove --force` %s: it contains %d reparse point(s), and "
             "that removal walks through them into whatever they point at:\n  %s"
             % (root, len(found), "\n  ".join(found[:10]))
         )
+    return len(found)
+
+
+def describe_baseline_axis(baseline_rev):
+    """WHICH of the two things this run is about to measure. Printed, never inferred.
+
+    ⛔ One `RESULT:` line used to mean both 「今天的码与 pre-aug 的码产物相同」 and
+    「同一份码跑两遍结果相同」, and which one you got depended on a default plus the
+    state of the working tree. That is the shape S135 spent a whole session buying
+    back on gate0 (「删目录 = 正确地红,清空目录 = 假 PASS」), one level up: the
+    reading looks perfect in both cases.
+    """
+    def git(*a):
+        r = subprocess.run(["git", "-C", APP] + list(a), capture_output=True, text=True)
+        return (r.stdout or "").strip() if r.returncode == 0 else None
+
+    base_sha = git("rev-parse", baseline_rev)
+    head_sha = git("rev-parse", "HEAD")
+    dirty = git("status", "--porcelain")
+    if base_sha is None:
+        raise GateUnrunnable("cannot resolve --baseline-rev %r" % baseline_rev)
+    if base_sha != head_sha:
+        return ("CROSS-CODE", "baseline %s != HEAD %s — this run compares two different "
+                              "revisions of training/" % (base_sha[:12], head_sha[:12]))
+    if dirty:
+        return ("MUTATION", "baseline == HEAD but the working tree is dirty (%d changed path(s)) "
+                            "— this run compares HEAD against your uncommitted changes"
+                            % len(dirty.splitlines()))
+    return ("A/A", "baseline == HEAD and the working tree is clean — ⛔ both arms run BYTE-"
+                   "IDENTICAL code, so this run measures rerun determinism ONLY and says "
+                   "NOTHING about the copies=0 no-op property. Pass --baseline-rev c82ca55 "
+                   "(the pre-augmentation parent of af8ad8b) to make that claim.")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="sovits")
+    # ⛔ `choices=` mirrors gate_aug0_driver.py, which has always had it. Without it a
+    # mistyped backend name fell through to build_cfg's `raise ... not wired yet` — the
+    # same sentence and the same exit code as 「这条链真没接线」.
+    ap.add_argument("--backend", default="sovits", choices=sorted(BACKENDS))
     ap.add_argument("--baseline-rev", default="HEAD")
     args = ap.parse_args()
+
+    axis, why = describe_baseline_axis(args.baseline_rev)
+    print("[axis] %s — %s" % (axis, why))
 
     ensure_fixture()
     ws = os.path.join(GATE_ROOT, "ws_noop_%s" % args.backend)
@@ -355,6 +454,12 @@ def main():
             ["git", "-C", APP, "worktree", "add", "--detach", wt, args.baseline_rev],
             check=True, capture_output=True,
         )
+        # ⛔ S124 added `assert_no_reparse_points` for exactly the `--force` removal in the
+        # `finally` below and NEVER CALLED IT (34 lines of function body, zero call sites,
+        # from 4e2a9d9 all the way to S136). A guard that has never executed is an empty
+        # criterion — S129's iron rule, in the one place where the failure mode on record
+        # is S96 emptying `data/`, `runtime/` and `bin/`.
+        assert_no_reparse_points(wt)
         for d in (ws, snap):
             if os.path.isdir(d):
                 shutil.rmtree(d)
@@ -367,14 +472,135 @@ def main():
             for line in bad:
                 print("  [FAIL] %s" % line)
             print("RESULT: FAIL (%d diffs)" % len(bad))
-            sys.exit(1)
-        print("RESULT: PASS — copies=0 tree is byte-identical to %s" % args.baseline_rev)
+            return EXIT_RED
+        print("RESULT: PASS [%s] — copies=0 tree is byte-identical to %s"
+              % (axis, args.baseline_rev))
+        return EXIT_PASS
     finally:
+        # Re-checked immediately before the destructive call: the baseline run above is
+        # what could have created a link in there.
+        #
+        # ⚠ If this refuses, the worktree is deliberately LEFT BEHIND (registered in
+        # `.git/worktrees`) — removing it is the exact operation being refused. Say so,
+        # because a leftover registration makes the NEXT run fail in a stranger way.
+        try:
+            assert_no_reparse_points(wt)
+        except GateUnrunnable:
+            print("⛔ leaving the baseline worktree at %s in place ON PURPOSE.\n"
+                  "   Inspect what the reparse point(s) point at, delete them BY HAND, then\n"
+                  "   `git -C %s worktree remove --force %s` (or `worktree prune`)." % (wt, APP, wt))
+            raise
         subprocess.run(
             ["git", "-C", APP, "worktree", "remove", "--force", wt],
             capture_output=True,
         )
 
 
+def selftest():
+    """Actually trigger every refusal branch once. S129: 一条从没被执行过的错误分支就是一条空判据。
+
+    ⛔ Every check here must be able to FAIL. A self-test that cannot go red (e.g. because
+    the OS refused to create the junction it needed) reports that as a self-test failure,
+    never as a pass — that is the whole point of the exercise.
+    """
+    fails = []
+
+    def check(name, ok, detail=""):
+        print("  [%s] %s %s" % ("OK" if ok else "FAIL", name, detail))
+        if not ok:
+            fails.append(name)
+
+    # ⑴ choices list vs the dispatch it claims to mirror — both directions.
+    for b in BACKENDS:
+        try:
+            cfg = build_cfg(b, os.path.join(tempfile.gettempdir(), "s136_selftest_ws"))
+            check("build_cfg builds %r" % b, isinstance(cfg, dict) and cfg.get("backend") == b)
+        except GateUnrunnable as e:
+            check("build_cfg builds %r" % b, False, str(e))
+    try:
+        build_cfg("__not_a_backend__", os.path.join(tempfile.gettempdir(), "s136_selftest_ws"))
+        check("build_cfg refuses an unknown backend", False, "(it returned a config)")
+    except GateUnrunnable:
+        check("build_cfg refuses an unknown backend", True)
+
+    # ⑵ the empty-set floor — the trap this gate shipped with.
+    d = tempfile.mkdtemp(prefix="s136_floor_")
+    try:
+        a, b = os.path.join(d, "a"), os.path.join(d, "b")
+        os.makedirs(a)
+        os.makedirs(b)
+        try:
+            compare_trees(a, b)
+            check("two empty trees are refused, not PASSed", False,
+                  "(compare_trees returned no diffs ⇒ callers read it as PASS)")
+        except GateUnrunnable as e:
+            check("two empty trees are refused, not PASSed", "floor" in str(e))
+        # and the floor must not fire when there IS enough to look at
+        for i in range(MIN_COMPARED_FILES):
+            for side in (a, b):
+                with open(os.path.join(side, "f%02d.bin" % i), "wb") as fh:
+                    fh.write(b"x" * (i + 1))
+        try:
+            bad = compare_trees(a, b)
+            check("a big enough comparison is not refused", not bad)
+        except GateUnrunnable as e:
+            check("a big enough comparison is not refused", False, str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ⑶ the reparse-point guard — the one S124 wrote and nobody ever called.
+    d = tempfile.mkdtemp(prefix="s136_reparse_")
+    try:
+        target = os.path.join(d, "target")
+        inside = os.path.join(d, "tree")
+        os.makedirs(target)
+        os.makedirs(inside)
+        link = os.path.join(inside, "junction")
+        # Directory junctions do not need administrator rights on Windows.
+        rc = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                            capture_output=True, text=True).returncode
+        if rc != 0 or not os.path.exists(link):
+            check("reparse guard fires on a junction", False,
+                  "(could not create a junction to test with — this check is EMPTY, "
+                  "not passing)")
+        else:
+            try:
+                assert_no_reparse_points(inside)
+                check("reparse guard fires on a junction", False, "(it walked straight past)")
+            except GateUnrunnable as e:
+                check("reparse guard fires on a junction", "REFUSING" in str(e))
+            # negative side: a tree with no links must NOT be refused
+            try:
+                assert_no_reparse_points(target)
+                check("reparse guard passes a clean tree", True)
+            except GateUnrunnable as e:
+                check("reparse guard passes a clean tree", False, str(e))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ⑷ the baseline axis really distinguishes the two claims.
+    axis_head, _ = describe_baseline_axis("HEAD")
+    check("axis(HEAD) is A/A or MUTATION, never CROSS-CODE", axis_head in ("A/A", "MUTATION"),
+          "(got %s)" % axis_head)
+    axis_old, _ = describe_baseline_axis("HEAD~1")
+    check("axis(HEAD~1) is CROSS-CODE", axis_old == "CROSS-CODE", "(got %s)" % axis_old)
+    try:
+        describe_baseline_axis("__no_such_rev__")
+        check("axis refuses an unresolvable rev", False)
+    except GateUnrunnable:
+        check("axis refuses an unresolvable rev", True)
+
+    print("SELFTEST: %s" % ("ALL OK" if not fails else "FAILED (%s)" % ", ".join(fails)))
+    return EXIT_PASS if not fails else EXIT_SELFTEST
+
+
 if __name__ == "__main__":
-    main()
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    try:
+        sys.exit(main())
+    except GateUnrunnable as e:
+        # ⛔ 3, never 1: the gate could not produce an attributable reading. Printing it
+        # as a red is what makes the second occurrence get shrugged off.
+        print("GATE-UNRUNNABLE: %s" % e)
+        sys.exit(EXIT_UNRUNNABLE)

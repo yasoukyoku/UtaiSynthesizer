@@ -42,10 +42,25 @@ import gate_aug0_noop as noop  # build_cfg / comparators / VENV_PY / fixtures
 APP = noop.APP
 GATE_ROOT = noop.GATE_ROOT
 FAILURES = []
+CHECKS = []
+
+#: Backends this gate can drive END TO END. ⛔ Narrower than `noop.BACKENDS`:
+#: `sovits_diff` has no `backend_paths` arm — it is only ever run *through*
+#: `diff_inherit()`, never exercised on its own. Before S136 `--backend sovits_diff`
+#: died at `raise SystemExit(backend)`, whose entire message was the word "sovits_diff".
+DRIVABLE = ("sovits", "rvc", "vocoder")
+
+#: Floor on how many checks a full `--backend all` run must have printed.
+#: ⛔ Three of this gate's checks are behind `if` gates (`if P["val"]`, `if P["index"]`,
+#: `if mt_orig_before`). When a path stops resolving, those do not go red — they
+#: **disappear**, and the total silently shrinks while everything left prints PASS.
+#: A floor, not a pin: today `--backend all` prints 52 (README:610) and it may grow.
+MIN_CHECKS_ALL = 48
 
 
 def check(name, ok, detail=""):
     print("  [%s] %s %s" % ("PASS" if ok else "FAIL", name, detail))
+    CHECKS.append(name)
     if not ok:
         FAILURES.append(name)
 
@@ -68,7 +83,11 @@ def run_pipeline(backend, ws, copies, dataset_dir=None):
     if r.returncode != 0 or "STOPPED_AT_TRAIN_PREP" not in (r.stdout or ""):
         print(r.stdout)
         print((r.stderr or "")[-4000:])
-        raise SystemExit("pipeline run failed (backend=%s copies=%s)" % (backend, copies))
+        # ⛔ exit 3, not 1: the pipeline never produced a tree, so nothing downstream of
+        # here was measured. Same code as a real byte difference is what S129 forbids.
+        raise noop.GateUnrunnable(
+            "pipeline run failed (backend=%s copies=%s) — no products were produced, so the "
+            "invariants below were never tested" % (backend, copies))
 
 
 def snap_tree(src, dst):
@@ -155,7 +174,10 @@ def backend_paths(backend, ws):
             "train": os.path.join(ws, "filelists", "train"),
             "index": None,
         }
-    raise SystemExit(backend)
+    raise noop.GateUnrunnable(
+        "backend %r has no backend_paths arm — this gate cannot say where its products live, "
+        "so it cannot test anything about them. Drivable here: %s "
+        "(sovits_diff is only exercised through diff_inherit)" % (backend, ", ".join(DRIVABLE)))
 
 
 def exercise(backend):
@@ -355,9 +377,11 @@ def diff_inherit():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default="all")
+    # ⛔ `choices=` mirrors gate_aug0_driver.py, which has always had it. A mistyped
+    # backend used to reach `backend_paths` and die with a one-word message.
+    ap.add_argument("--backend", default="all", choices=("all",) + DRIVABLE)
     args = ap.parse_args()
-    backends = ["sovits", "rvc", "vocoder"] if args.backend == "all" else [args.backend]
+    backends = list(DRIVABLE) if args.backend == "all" else [args.backend]
     noop.ensure_fixture()
     for b in backends:
         exercise(b)
@@ -366,9 +390,21 @@ def main():
         diff_inherit()
     if FAILURES:
         print("RESULT: FAIL (%d): %s" % (len(FAILURES), ", ".join(FAILURES)))
-        sys.exit(1)
-    print("RESULT: ALL PASS")
+        return 1
+    # ⛔ Only meaningful for the full run; a single-backend run legitimately prints fewer.
+    if args.backend == "all" and len(CHECKS) < MIN_CHECKS_ALL:
+        print("GATE-UNRUNNABLE: only %d checks ran (floor %d) — checks behind `if` gates "
+              "(val / index / feature-cache mtimes) DISAPPEAR rather than go red when a path "
+              "stops resolving, so a short green run is not a green run." % (len(CHECKS),
+                                                                             MIN_CHECKS_ALL))
+        return noop.EXIT_UNRUNNABLE
+    print("RESULT: ALL PASS (%d checks)" % len(CHECKS))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except noop.GateUnrunnable as e:
+        print("GATE-UNRUNNABLE: %s" % e)
+        sys.exit(noop.EXIT_UNRUNNABLE)
