@@ -179,8 +179,17 @@ pub fn dataset_dir(data_dir: &Path, id: &str) -> PathBuf {
 /// lives one level down and can no longer corroborate the dataset. Non-empty `dataset/` is
 /// sufficient: the import stage is the only writer.)
 pub fn has_dataset(data_dir: &Path, id: &str) -> bool {
+    // S134 (§F7 笔 5): `.part` must not count. `dsmanifest`'s rule 2 promises in so many words that
+    // "a crash mid-copy cannot leave a truncated wav that `has_dataset` would accept and a run would
+    // then slice" — and that promise is exactly what this predicate has to keep. Without the filter
+    // a single crash remnant makes an otherwise-empty dataset look imported, and the run that
+    // follows hands the truncated file to ffmpeg. (The python readers had the same hole; they now
+    // share `utai_train.cache.dataset_entries`.)
     std::fs::read_dir(dataset_dir(data_dir, id))
-        .map(|mut d| d.next().is_some())
+        .map(|d| {
+            d.flatten()
+                .any(|e| !e.file_name().to_string_lossy().ends_with(".part"))
+        })
         .unwrap_or(false)
 }
 
@@ -3673,5 +3682,91 @@ mod tests {
         assert_eq!(rows.len(), 1, "a future version's rows are not ours to interpret");
         assert!(!rows[0].missing);
         let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// S134 (§F7 笔 5) — a `.part` crash remnant is NOT an imported dataset, on either side of the
+    /// language boundary.
+    ///
+    /// `dsmanifest`'s rule 2 says it in so many words: "a crash mid-copy cannot leave a truncated
+    /// wav that `has_dataset` would accept and a run would then slice." S78 recorded the readers as
+    /// fixed; measured in S134, only the two Rust *manifest* readers skipped `.part` —
+    /// `has_dataset` did not, and none of the four python dataset readers did.
+    ///
+    /// Reachable sequence: hard-kill during import (between copy and rename) → user opens the
+    /// project → `has_dataset` says yes → the run slices a truncated wav, the fingerprint counts it
+    /// (⇒ a sibling pool ⇒ hours of preprocessing paid again), and on the vocoder chain it is a
+    /// hard crash rather than a different pool (`_probe_sr` returns None for an unreadable header
+    /// and the sr guard PASSES None, then `_decode` runs unprotected).
+    ///
+    /// Part (2) is a source nail on the four python readers. It pins the INDENTED FULL LINE, not a
+    /// loose substring: a `#`-comment mentioning the same call cannot satisfy it, because the
+    /// comment marker sits where the needle expects code (S119(a): a loose substring cannot tell
+    /// code from a corpse). It is a nail, not a behaviour test — the python side has no automated
+    /// gate at all (`release.ps1` runs tsc / vitest / cargo test and nothing else).
+    #[test]
+    fn a_part_remnant_is_not_a_dataset_on_either_side() {
+        // (1) behaviour — Rust
+        let data = tmp_root("partonly");
+        create_project(&data, "P", "").unwrap();
+        let id = list_projects(&data)[0].id.clone();
+        let ds = dataset_dir(&data, &id);
+        std::fs::create_dir_all(&ds).unwrap();
+        assert!(!has_dataset(&data, &id), "empty dataset dir is not an imported dataset");
+
+        std::fs::write(ds.join("001.wav.part"), b"trunc").unwrap();
+        assert!(
+            !has_dataset(&data, &id),
+            "a `.part` crash remnant must not count as an imported dataset — dsmanifest rule 2 \
+             promises exactly this, and the run that follows would slice a truncated wav"
+        );
+
+        std::fs::write(ds.join("001.wav"), b"real").unwrap();
+        assert!(
+            has_dataset(&data, &id),
+            "…and a real file next to the remnant must still count (the filter must not be a veto)"
+        );
+        let _ = std::fs::remove_dir_all(data);
+
+        // (2) source nail — the four python dataset readers must go through the shared helper.
+        // ⛔ Normalise line endings first. These files are CRLF on disk while an edited line can
+        //    land as LF, so a needle written with either ending silently misses — and a miss reads
+        //    exactly like the drift this test exists to catch (S128: ANCHOR-MISS must never be
+        //    confused with RED). Normalising removes the whole failure mode instead of guessing.
+        let lf = |s: &str| s.replace("\r\n", "\n");
+        for (label, src, needle) in [
+            (
+                "cache.dataset_fingerprint",
+                include_str!("../../../training/utai_train/cache.py"),
+                "\n    for name in dataset_entries(dataset_dir):\n",
+            ),
+            (
+                "rvc.preprocess_trainset",
+                include_str!("../../../training/utai_train/rvc/preprocess.py"),
+                "\n        for idx, name in enumerate(dataset_entries(inp_root))\n",
+            ),
+            (
+                "sovits.slice_and_resample",
+                include_str!("../../../training/utai_train/sovits/preprocess.py"),
+                "\n    names = dataset_entries(dataset_dir)\n",
+            ),
+            (
+                "vocoder.slice_dataset",
+                include_str!("../../../training/utai_train/vocoder/pipeline.py"),
+                "\n    names = dataset_entries(dataset_dir)\n",
+            ),
+        ] {
+            assert!(
+                lf(src).contains(needle),
+                "{label} no longer reads the dataset through `dataset_entries` — a `.part` crash \
+                 remnant would be fingerprinted / sliced again. Expected the line {needle:?}"
+            );
+        }
+        // …and the helper itself must still do the one thing it exists for.
+        let cache_py = include_str!("../../../training/utai_train/cache.py");
+        assert!(
+            cache_py.contains("if not n.endswith(PART_SUFFIX)"),
+            "utai_train.cache.dataset_entries stopped filtering `.part` — the four call sites above \
+             would then all be nailed to a helper that does nothing"
+        );
     }
 }

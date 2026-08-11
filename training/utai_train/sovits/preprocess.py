@@ -23,6 +23,7 @@ from scipy.io import wavfile
 
 from ..audio import load_audio
 from ..augment import is_aug_name
+from ..cache import dataset_entries
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
 
 logger = logging.getLogger(__name__)
@@ -74,7 +75,8 @@ def slice_and_resample(dataset_dir, out_spk_dir, loudnorm, ffmpeg, reporter, sto
         if name.endswith(".wav") and not is_aug_name(name):
             os.remove(os.path.join(out_spk_dir, name))
 
-    names = sorted(os.listdir(dataset_dir))
+    # S134 (§F7 笔 5): dataset_entries 而不是裸 listdir —— 见 ../cache.py 的理由(单一真源)。
+    names = dataset_entries(dataset_dir)
     failed = 0
     written = 0
     for n, name in enumerate(names):

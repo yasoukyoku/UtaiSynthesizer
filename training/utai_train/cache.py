@@ -19,6 +19,29 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# S134 (§F7 笔 5):`<n>.<ext>.part` 是 Rust 导入阶段 stage-then-rename 的**崩溃残留**。
+# `dsmanifest.rs` 的 rule 2 原话:「Copies land on a `.part` name in the same directory and are
+# renamed into place, so a crash mid-copy cannot leave a truncated wav that `has_dataset` would
+# accept and a run would then slice.」—— 那句承诺靠**每一个读者都跳过它**才成立,而 S78 记的
+# 「读侧三处跳过」只兑现在 Rust 侧(`dsmanifest.rs:236/247` 与 `mod.rs:2779-2795`);
+# python 侧**四处一个都不跳**,`has_dataset` 自己也不跳。可达序列:导入时被硬杀(copy↔rename
+# 之间)→ 用户直接开训 → ⑴ 指纹把 `.part` 算进去 ⇒ 解析到一个**新池** ⇒ 白重跑几小时预处理;
+# ⑵ 切片器把那个**截断的 wav** 真的送进 ffmpeg;⑶ 声码器链更是**硬崩**而不是换池 ——
+# `_probe_sr` 读不出 header 时返回 None,`slice_dataset` 的 sr 闸对 None **放行**,
+# 随后 `_decode` 没有 try 保护。
+# ⇒ 单一真源放这里(五条链都已经 import 本模块的 `dataset_fingerprint`)。
+PART_SUFFIX = ".part"
+
+
+def dataset_entries(dataset_dir):
+    """数据集目录里【真正算数】的条目名,按名字排序,跳过 `.part` 崩溃残留。
+
+    ⛔ 只跳 `.part`,不跳子目录 —— 子目录是「多歌手项目喂给平铺数据集后端」这条要
+    **响亮失败**的形状,由 `dataset_fingerprint` 自己抛(见它的 docstring)。
+    这里少跳一样东西都会把那条断言变成静默通过。
+    """
+    return sorted(n for n in os.listdir(dataset_dir) if not n.endswith(PART_SUFFIX))
+
 
 def dataset_fingerprint(dataset_dir):
     """Content identity of the imported dataset (name + size + head/tail sample).
@@ -34,7 +57,7 @@ def dataset_fingerprint(dataset_dir):
     behind it.
     """
     h = hashlib.blake2b(digest_size=16)
-    for name in sorted(os.listdir(dataset_dir)):
+    for name in dataset_entries(dataset_dir):
         p = os.path.join(dataset_dir, name)
         if os.path.isdir(p):
             raise RuntimeError(

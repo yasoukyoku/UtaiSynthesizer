@@ -14,6 +14,7 @@ from scipy import signal
 from scipy.io import wavfile
 
 from ..audio import load_audio
+from ..cache import dataset_entries
 from .slicer2 import Slicer
 
 logger = logging.getLogger(__name__)
@@ -116,9 +117,11 @@ def preprocess_trainset(inp_root, sr, pool_dir, per, ffmpeg, reporter, stop,
         _wipe_slice_dirs(pool_dir)
 
     pp = PreProcess(sr, pool_dir, per, ffmpeg, name_prefix=spk_prefix)
+    # S134 (§F7 笔 5): dataset_entries 而不是裸 listdir —— 一个 `.part` 崩溃残留会被当成素材
+    # 送进 ffmpeg(截断的 wav)。理由与全部四个 python 读者共用一份,写在 ../cache.py。
     infos = [
         (os.path.join(inp_root, name), idx)
-        for idx, name in enumerate(sorted(os.listdir(inp_root)))
+        for idx, name in enumerate(dataset_entries(inp_root))
     ]
     failed = 0
     for n, (path, idx0) in enumerate(infos):

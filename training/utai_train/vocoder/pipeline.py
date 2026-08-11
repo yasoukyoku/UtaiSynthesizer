@@ -100,7 +100,7 @@ from ..augment import (
     run_f0_gate,
 )
 from .. import device as device_shim
-from ..cache import dataset_fingerprint
+from ..cache import dataset_entries, dataset_fingerprint
 from ..pool import assert_identity, checked_run_dir, identity_suffix, open_pool
 from ..rvc.train_utils import get_logger  # shared harness helper (single source)
 from ..rvc.slicer2 import Slicer  # single source — the vendored openvpi slicer
@@ -211,7 +211,10 @@ def slice_dataset(dataset_dir, slices_dir, ffmpeg, reporter, stop):
     import soundfile as sf
 
     marker = os.path.join(slices_dir, ".complete")
-    names = sorted(os.listdir(dataset_dir))
+    # S134 (§F7 笔 5): dataset_entries 而不是裸 listdir。这一条链的代价比另外三条【重一档】——
+    # `_probe_sr` 对读不出 header 的文件返回 None,而下面那道 sr 闸对 None **放行**,
+    # 随后 `_decode` 没有 try 保护 ⇒ 一个 `.part` 在这里是**硬崩**,不是「换个池」。
+    names = dataset_entries(dataset_dir)
     if os.path.isfile(marker):
         reporter.stage("slice", done=len(names), total=len(names),
                        message="切片缓存有效，跳过")
