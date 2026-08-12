@@ -46,6 +46,12 @@ import {
   indexWarningCode,
 } from "../../lib/training/indexPath";
 import { resolveRowIdentity } from "../../lib/training/rowIdentity";
+import {
+  attachToasts,
+  batchImportToast,
+  collectWarningCodes,
+  importToast,
+} from "../../lib/training/importToast";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { lockedFieldIds, poolInvalidatingIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
@@ -1521,9 +1527,13 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       // import_model, so `attach_diffusion` writes the ledger row itself (Rust side, batch 3);
       // this only re-reads the list so its「已导入」marks are current.
       await refreshArchive();
-      showToast(t("training.diffAttached", { name: attachTarget }), "success");
-      for (const w of outcome?.warnings ?? []) {
-        showToast(backendErrorMessage(w) ?? w, "info");
+      // ⛔ S141 §E2E-M6:这条路无条件先弹一条 success,再**另开** N 条 info —— 与导入
+      // (把 warning 折进同一条 toast)不是同一个漏斗。决策与判据在 lib/training/importToast。
+      for (const toast of attachToasts(
+        t("training.diffAttached", { name: attachTarget }),
+        collectWarningCodes(outcome).map((w) => backendErrorMessage(w) ?? w),
+      )) {
+        showToast(toast.text, toast.level);
       }
     } catch (e) {
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
@@ -2517,14 +2527,11 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       await refreshArchive();
       // ⛔§E2E-M1：「我们不知道该去哪找索引」必须跟后端的 warning 走**同一个漏斗**——
       // 否则它与「确实没有索引」在界面上长得一模一样，而两者的后果完全不同。
-      const warns = [...(outcome?.warnings ?? []), ...(indexWarningCode(idx) ? [indexWarningCode(idx)!] : [])]
-        .map((w) => backendErrorMessage(w) ?? w);
-      showToast(
-        warns.length > 0
-          ? `${t("training.imported", { name })}\n${warns.join("\n")}`
-          : t("training.imported", { name }),
-        warns.length > 0 ? "info" : "success",
+      const warns = collectWarningCodes(outcome, indexWarningCode(idx)).map(
+        (w) => backendErrorMessage(w) ?? w,
       );
+      const toast = importToast(t("training.imported", { name }), warns);
+      showToast(toast.text, toast.level);
     } catch (e) {
       // MODEL_BUSY_AUDITION / APP_BUSY land here raw without the shared mapper (audit gap).
       showToast(backendErrorMessage(e) ?? String(e), isBusyError(e) ? "info" : "error");
@@ -2616,10 +2623,7 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
             sourceCkpt: path === c.path ? null : c.path,
           });
           ok += 1;
-          for (const w of [
-            ...(outcome?.warnings ?? []),
-            ...(indexWarningCode(idx) ? [indexWarningCode(idx)!] : []),
-          ]) {
+          for (const w of collectWarningCodes(outcome, indexWarningCode(idx))) {
             warns.push(`${names.get(c.path)}: ${backendErrorMessage(w) ?? w}`);
           }
         } catch (e) {
@@ -2628,19 +2632,13 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       }
       await useVoiceModelStore.getState().fetchModels();
       await refreshArchive();
-      if (failed.length > 0) {
-        showToast(
-          `${t("training.importSelectedPartial", { ok, total: chosen.length })}\n${[...failed, ...warns].join("\n")}`,
-          "error",
-        );
-      } else if (warns.length > 0) {
-        showToast(
-          `${t("training.importSelectedDone", { count: ok })}\n${warns.join("\n")}`,
-          "info",
-        );
-      } else {
-        showToast(t("training.importSelectedDone", { count: ok }), "success");
-      }
+      const batchToast = batchImportToast({
+        doneText: t("training.importSelectedDone", { count: ok }),
+        partialText: t("training.importSelectedPartial", { ok, total: chosen.length }),
+        failed,
+        warns,
+      });
+      showToast(batchToast.text, batchToast.level);
     } finally {
       setImportingAll(false);
     }

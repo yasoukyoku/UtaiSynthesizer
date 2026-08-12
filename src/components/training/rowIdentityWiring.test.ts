@@ -212,6 +212,47 @@ describe("archive rows resolve their identity per row", () => {
     }
   });
 
+  it("★ S141 §E2E-M6/M7 —— 三条导入路的 toast 决策留在纯模块里,不许再长回闭包", async () => {
+    // 后端把「能恢复的失败」报成 warning(`WARN_INDEX_MISSING` / §F9 的
+    // `WARN_DIFFUSION_VOCODER_CUSTOM`)。整条呈现链此前活在三个 async 闭包里,没有可导出的
+    // 决策函数 ⇒ M6 的 Rust 半边做完了,而「它到底有没有到达用户」零判据。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(FILE, "utf8"));
+
+    expect(code, "TrainingPage 不再从 lib/training/importToast 取决策").toContain(
+      "lib/training/importToast",
+    );
+
+    // 具体的形状排前面(S108)——「它被写回闭包了」是诊断,「调用点不见了」只是症状。
+    const reInlined: [RegExp, string][] = [
+      [
+        /outcome\?\.warnings \?\? \[\]/,
+        "又直接摊开了后端 warning —— 前端那条「不知道去哪找索引」就会从这条路上掉出去(§E2E-M1)",
+      ],
+      [
+        /warns\.length > 0\s*\n?\s*\?/,
+        "单条导入的档位三元又被写回闭包了(它决定 warning 是 info 还是被 success 盖住)",
+      ],
+      [
+        /failed\.length > 0\s*\)\s*\{/,
+        "批量导入的三档又被写回闭包了 —— 有失败时 warning 会不会一起呈现就没人守了",
+      ],
+    ];
+    for (const [re, why] of reInlined) {
+      expect(re.test(code), why).toBe(false);
+    }
+
+    // 兜底:决策整个消失也要红。⚠ `collectWarningCodes` 必须**三条路都在用**(单条 / 批量 /
+    // 附加)—— 少一条就是那条路上的 warning 又变回了「后端说了但界面没说」。
+    for (const fn of ["attachToasts(", "importToast(", "batchImportToast("]) {
+      expect(code, `${fn} 的调用点不见了`).toContain(fn);
+    }
+    expect(
+      [...code.matchAll(/collectWarningCodes\(/g)].length,
+      "collectWarningCodes 的调用点少于三处 —— 三条导入路里有一条又不走同一个漏斗了",
+    ).toBeGreaterThanOrEqual(3);
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();
