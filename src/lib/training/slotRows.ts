@@ -114,3 +114,26 @@ export function prepPoolLine(slot: SlotDetail | undefined): PrepPoolLine {
   const count = slot?.prepPoolCount ?? 0;
   return { show: count > 0, count, bytes: slot?.prepPoolBytes ?? 0 };
 }
+
+/** 「再训一个」那个新名字有什么毛病;`null` = 可以用。 */
+export type NewRunNameProblem = "empty" | "taken" | null;
+
+/**
+ * ★§E2E-M24 —— 「再训一个」的新名字不许与**同槽已有 run** 重名。
+ *
+ * ⛔ 为什么重名是灾难而不是不方便:名字是**产物前缀**(`weights/<slug>*`、`audition/<slug>_*`)。
+ * 两个 run 同名 ⇒ 同 slug ⇒ 存档页两行同名,而 `plan_cleanup` 的 `installed_stem` 按 file_stem
+ * 判「这份快照还装着」—— 于是它会把**另一个** run 的快照也判成 StillInstalled 而永久保留。
+ *
+ * ⛔ 比对的是 **trim 之后**的串,两边都是:落库时写的就是 `newName.trim()`,所以一个只差首尾
+ * 空格的名字**不是**一个新名字 —— 只 trim 一边的话,` 歌姫 ` 会顺利通过,然后落成 `歌姫`。
+ *
+ * ⚠ 没有名字的 run(铸了但没练成)不占名额:它的 `modelName` 是 `""`,而空名字走的是
+ * `"empty"` 那一档。这条过滤是防御性的,不是由某条判据买回来的 —— 说清楚免得下一个人以为它有。
+ */
+export function newRunNameProblem(raw: string, runs: readonly RunDetail[]): NewRunNameProblem {
+  const name = raw.trim();
+  if (!name) return "empty";
+  const taken = new Set(runs.map((r) => r.modelName?.trim()).filter((n): n is string => !!n));
+  return taken.has(name) ? "taken" : null;
+}

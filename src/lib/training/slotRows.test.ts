@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { RunDetail, SlotDetail, WorkspaceInfo } from "../../store/training";
-import { pickDiffHost, prepPoolLine, slotStarted, startedRun, visibleRuns } from "./slotRows";
+import {
+  newRunNameProblem,
+  pickDiffHost,
+  prepPoolLine,
+  slotStarted,
+  startedRun,
+  visibleRuns,
+} from "./slotRows";
 
 /**
  * §E2E-M3 / M4 / M5(S141)—— 一个槽画成什么样。
@@ -202,6 +209,41 @@ describe("prepPoolLine(§E2E-M5 的渲染那一跳)", () => {
 
   it("槽不存在 ⇒ 不画,而不是画一行「0 份」", () => {
     expect(prepPoolLine(undefined)).toEqual({ show: false, count: 0, bytes: 0 });
+  });
+});
+
+describe("newRunNameProblem(§E2E-M24)", () => {
+  const named = (id: string, modelName: string) => mkRun(id, { modelName });
+
+  it("★ 与同槽已有 run 重名必须被拒 —— 那不是不方便,是产物前缀撞车", () => {
+    // 名字 ⇒ slug ⇒ `weights/<slug>*` 与 `audition/<slug>_*`。两个 run 同名之后,
+    // `plan_cleanup` 的 `installed_stem` 按 file_stem 判「还装着」,会把**另一个** run 的
+    // 快照也判成 StillInstalled 而永久保留。
+    const runs = [named("raaa", "歌姫"), named("rbbb", "歌姫2")];
+    expect(newRunNameProblem("歌姫", runs)).toBe("taken");
+    expect(newRunNameProblem("歌姫3", runs)).toBe(null);
+  });
+
+  it("★ 只差首尾空格的名字**不是**新名字(落库写的就是 trim 之后的串)", () => {
+    // ⛔ 两边都要 trim:只 trim 一边的话 ` 歌姫 ` 会顺利通过,然后落成 `歌姫` —— 撞车照旧,
+    //    而对话框亲口说过没问题。
+    expect(newRunNameProblem("  歌姫  ", [named("raaa", "歌姫")])).toBe("taken");
+    expect(newRunNameProblem("歌姫", [named("raaa", "  歌姫  ")])).toBe("taken");
+  });
+
+  it("空 / 全空白 ⇒ empty,而且它与 taken 是两条不同的路", () => {
+    expect(newRunNameProblem("", [])).toBe("empty");
+    expect(newRunNameProblem("   ", [])).toBe("empty");
+    // 两档必须分得开:文案不同(一条说「名字不能为空」,一条说「这个名字已经被占了」)
+    expect(newRunNameProblem("x", [named("raaa", "x")])).toBe("taken");
+  });
+
+  it("没有名字的 run(铸了但没练成)不占名额", () => {
+    expect(newRunNameProblem("歌姫", [mkRun("raaa"), named("rbbb", "别的")])).toBe(null);
+  });
+
+  it("空槽 ⇒ 任何非空名字都行", () => {
+    expect(newRunNameProblem("歌姫", [])).toBe(null);
   });
 });
 

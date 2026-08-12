@@ -4606,6 +4606,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// ⛔★★S141 §E2E-M23 —— **铸一个新 run 不许抹掉旧 run 的任何东西。**
+    ///
+    /// ④e 之前,`try_start` 的重训分支是一句 `remove_dir_all_robust(&workspace)` —— **整个槽**,
+    /// 存档、池、试听缓存一起没。拍板换成「铸新 run + 旧 run 可管理/删除」之后那一行删掉了,
+    /// 而**没有任何东西守着它不回来**:`try_start` 吃 `&self` 与一大堆状态,仓内驱不动它,
+    /// 所以旧 run 的 `audition/`(里面是转换好的 .onnx 和 `model.json` 里那份**没人会重测**的
+    /// 实测音域)今天只有源码在守。
+    ///
+    /// 这道闸钉两件事,而第二件是那句代码注释自己点名的:
+    /// ⑴ 那句整槽 `remove_dir_all_robust(&workspace)` 不许出现在 `try_start` 里;
+    /// ⑵ 「铸新 run」这个事实必须仍然由 `mints_fresh_run` 表达,而**不是**直接读 `req.fresh` ——
+    ///    `diff_partial_wipe` 那条臂正是带着 `fresh == true` 进来的却**不**铸新 run,
+    ///    两者混为一谈就是「再训一个 = 续训并覆盖旧 run」那条静默失败。
+    ///
+    /// ⚠ 诚实边界:这是**源码**闸。它证明那一行不在代码里,不证明别的路径不会删
+    /// (`delete_run` 会删,那是用户点的)。行为那一半要等 `try_start` 能被驱动,
+    /// 或者一条真工作区的腿。
+    ///
+    /// ⛔ 切生产区用的是本模块**已有的** `production_part`,不是自己再写一遍 `find("#[cfg…")`。
+    /// 第一版就是自己写的,而那两个字面串让这份文件的 cfg-test 计数从 1 变成 3 ⇒ 当场打红
+    /// **三条既有的源序棘轮**(它们的切割点被推到我的字符串上)。`production_part` 用
+    /// `concat!` 拼这个标记,正是为了不数到自己 —— 那条教训 S129 在 `trun.rs` 上付过一次账。
+    #[test]
+    fn minting_a_new_run_never_wipes_the_slot_the_old_runs_live_in() {
+        let code = production_part(include_str!("mod.rs"));
+        let fns = crate::wiring_gate::split_by_fn(&code);
+        assert!(
+            fns.len() >= 40,
+            "split_by_fn parsed only {} chunks out of training/mod.rs — the checks below would \
+             pass by not looking",
+            fns.len()
+        );
+        let (_, body) = fns
+            .iter()
+            .find(|(n, _)| n == "try_start")
+            .expect("`try_start` is gone from training/mod.rs — if the start path was renamed, \
+                     re-check that it still does not wipe the slot, then update this gate");
+
+        assert!(
+            !body.contains("remove_dir_all_robust(&workspace)"),
+            "`try_start` wipes the WHOLE SLOT again. That line is what ④e replaced with \
+             「铸新 run + 旧 run 可管理/删除」: it takes the other runs' weights, their audition \
+             caches (converted .onnx plus the measured vocal range nothing will re-measure) and \
+             the shared preprocessing pools with it.\n\
+             ⚠ Do NOT satisfy this by commenting it out — comments are stripped before this check."
+        );
+        // ⛔ 钉的是**那个调用点收到的实参**,不是「`mints_fresh_run` 这个词出现过」——
+        // 后者是 R3 那条已知的弱点(钉文本不钉值):实测把 `migrate_one_slot` 的守卫塌回
+        // `req.fresh` 之后,标识符仍然在别处出现,那条弱断言**照样绿**(探针 V5 第一版)。
+        assert!(
+            body.contains("run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)"),
+            "`run_dir_for_start` 不再收 `mints_fresh_run`。**这个实参决定这次 start 往哪个目录写**:\
+             `diff_partial_wipe` 那条臂正是带着 `fresh == true` 进来却**不**铸新 run 的,所以塌回裸 \
+             `req.fresh` 就是「再训一个 = 续训并覆盖旧 run」那条静默失败;而反过来传 false,\
+             「再训一个」会写进旧 run。\n\
+             ⚠ 换了形参名/换行格式也会红 —— 那时请**重新确认这条性质仍然成立**再改锚点,\
+             别只把这行字符串改到能过。"
+        );
+    }
+
     /// ⛔★★S133 §F2⒝ ④e —— 「重训(仅扩散)」之后,试听不许再放上一次那个模型。
     ///
     /// S132 的 flip 把 `start_training` 的缓存清理收窄成 `if !request_was_fresh`,而

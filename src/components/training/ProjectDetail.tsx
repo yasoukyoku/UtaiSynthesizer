@@ -36,6 +36,7 @@ import {
 } from "../../store/training";
 import { formForSlot } from "../../lib/training/formForSlot";
 import {
+  newRunNameProblem,
   pickDiffHost,
   prepPoolLine,
   slotStarted,
@@ -385,9 +386,8 @@ export function ProjectDetail() {
     //    对「继续训练」是对的,对这里是灾难:名字是产物前缀(`weights/<slug>*`、`audition/<slug>_*`),
     //    两个 run 同名 ⇒ 同 slug ⇒ 存档页两行同名,而 `plan_cleanup` 的 `installed_stem`
     //    按 file_stem 判「还装着」,于是会把**另一个** run 的快照也判成 StillInstalled 永久保留。
-    const takenNames = new Set(
-      (slot?.runs ?? []).map((r) => r.modelName?.trim()).filter((n): n is string => !!n),
-    );
+    //    判据在 `lib/training/slotRows.ts` 的 `newRunNameProblem`(S141 §E2E-M24 把它搬出来:
+    //    写在这里的校验闭包 vitest 结构上够不着,而 i18n 那两道闸只钉结构、看不见对话框行为)。
     const newName = await showConfirm({
       title: t("training.newRunNameTitle"),
       body: t("training.newRunNameBody"),
@@ -397,12 +397,12 @@ export function ProjectDetail() {
       ],
       input: {
         initial: "",
-        invalid: (v) =>
-          !v.trim()
-            ? t("backend.TRAINING_NAME_EMPTY")
-            : takenNames.has(v.trim())
-              ? t("training.newRunNameTaken")
-              : null,
+        invalid: (v) => {
+          const problem = newRunNameProblem(v, slot?.runs ?? []);
+          if (problem === "empty") return t("backend.TRAINING_NAME_EMPTY");
+          if (problem === "taken") return t("training.newRunNameTaken");
+          return null;
+        },
       },
     });
     if (!newName || newName === "__cancel") return;
