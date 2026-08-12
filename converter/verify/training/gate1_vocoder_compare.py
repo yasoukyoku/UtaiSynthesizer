@@ -50,7 +50,8 @@ GATE_ROOT = r"D:\MyDev\TESTING\gate1_vocoder"
 # orig 跑在上游仓库树里(它的 DsModelCheckpoint 断言 cwd 是 work_dir 的祖先,见 run_orig 头注)
 ORIG_EXP = r"D:\MyDev\SingingVocoders\experiments\gate1_voc"
 ORIG_LOGS = os.path.join(ORIG_EXP, "lightning_logs", "lastest")
-OURS_LOGS = os.path.join(GATE_ROOT, "ours", "gate1_voc", "lightning_logs", "lastest")
+OURS_EXP = os.path.join(GATE_ROOT, "ours", "gate1_voc")
+OURS_LOGS = os.path.join(OURS_EXP, "lightning_logs", "lastest")
 TOL = 1e-7
 
 # ⛔ **登记的名单,不是个数**。S139 从两侧真夹具逐个量出来的 11 个。
@@ -94,6 +95,12 @@ def main():
     failures = []
     G1._say("[COVERAGE] 两侧都带齐了登记的 %d 个 tag(9 training + 2 validation)"
             % len(REQUIRED_TAGS))
+
+    # ⛔ S140:我方侧 **reporter 通道**的记账 —— 与上面那些 TB 点数是**两个数**。
+    #    此前 `_Rep` 三个方法全 `pass` ⇒ 这一面零判据(见 gate1_guard.check_tally 头注)。
+    #    ⚠ 这条链是五条里唯一没有协议 JSONL 的,所以它的协议层此前整层不在被比较的面上。
+    G1.check_tally("ours/reporter", os.path.join(OURS_EXP, "reporter_tally.json"),
+                   exp.get("tally"))
 
     # ⛔ S140:补回 S139 重写时**被删掉且没记账**的那半条 —— 两臂 tag 集合必须相等。
     #    今天的 `tb_scalars` 只判「每一臂各自 ⊇ 登记名单」,对「**单侧**多出一个标量」零信号。

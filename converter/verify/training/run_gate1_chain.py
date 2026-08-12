@@ -15,6 +15,8 @@ S134 建于仓库之外(`TESTING\\s134_f7\\`,无 git、只有一份);**S139 收�
     4 = 我方侧失败          <- 被测代码抛了
     5 = 用法 / 夹具缺件 / 被拒绝
     6 = 某一段判「不可归因」 <- gate0_guard.EXIT_UNRUNNABLE(读数不构成一次判定)
+    7 = 历史对拍判负        <- ★ gate1 独有:今天的数字与 07-07/07-17、08-11 不一样了
+                              (与 1 是**两个不同的问题**:1 说移植不对,7 说它变了)
 
 每段的完整 stdout+stderr 落盘到 `<runs>/<chain>/<时间戳>/`,一个字都不丢。
 
@@ -49,11 +51,15 @@ S139 修掉的五条(全部实测,机理写在各自落点)
    ⚠ **另起 `GATE1_T0` 而不是复用 `GATE0_T0`**:同一个 shell 里先跑 gate0 再跑 gate1 时,
    复用会让 gate1 读到几小时前的 t0 而**静默变宽**。
 
-⛔ 本跑器**不产生历史对拍**。`compare_vs_history.py`(仓外)问的是另一个问题
-   (「今天的我方产物 vs 07-07/07-17 的历史 jsonl」),它**不在 CHAINS 里、全仓零调用者**,
-   要另外手敲。⚠ 而且 S139 实测它的新鲜度守卫(`getmtime(new) <= getmtime(old)`)
-   **自 2026-08-11 起结构上不可能再成立** ⇒ 它今天是一条**永远绿**的判据,
-   在它被修好之前不许接进主路(接进来等于把一条死判据挂上仓库招牌)。
+✅ **S140:历史对拍已经进仓并接成每条链的第 5 段**(`gate1_history_compare.py`,退 7)。
+   它问的是**另一个问题**:「自上一次跑 gate1 以来的那些 commit,数值上动过什么吗」。
+   ⚠ 它的前身 `TESTING\s134_f7\compare_vs_history.py` 今天仍然在盘上,**别再跑它** ——
+   S140 实测它整条链上没有一处能红:新鲜度守卫是一条**单调恒真**的谓词
+   (比的是「live 是不是比一份 copy2 冻在七月的备份新」),缺件走**静默绿**,
+   地板是与真值无关的 `步数×5`(真实分量数 6/7/10/2 ⇒ rvc 删任一个键仍恰好过线、
+   sovits_v2 可以删五个),NaN 对 `if d > worst[0]` 恒不可见。
+   ⇒ **同一天、同一份盘的实测对照**:老脚本一条链都没跑就打四行 `BITWISE-SAME` 退 **0**;
+     新闸退 **3** 并点名「live/diff:1/1 件不是本轮产物」。
 
 解释器轴(S134 决定,理由写在 EVIDENCE):每条链用【当年产出它自己那份历史基线的那个解释器】,
 两侧同一个 ⇒ 代码轴仍然隔离,同时白拿一条「与历史 jsonl 对拍」的回归线。
@@ -107,8 +113,14 @@ ALLOW_REBUILD_ENV = "GATE1_ALLOW_REBUILD"
 
 EXIT_COMPARE, EXIT_PREPARE, EXIT_ORIG, EXIT_OURS = 1, 2, 3, 4
 EXIT_USAGE, EXIT_UNRUNNABLE = 5, 6
+# ⛔ S140:**7 = 历史对拍判负**,gate1 独有(gate0 那张表没有 7,不会撞)。
+#    为什么不复用 1:两条判据问的是**两个不同的问题** —— 1 说「今天我们的循环 != 上游」,
+#    7 说「今天的数字与七月/08-11 不一样了」。复用同一个码,汇总表上「移植不对」与
+#    「历史漂了」就变成同一个数字,而那正是 S129 铁律要拆开的东西。
+EXIT_HISTORY = 7
+HISTORY_DRIVER = "gate1_history_compare.py"
 KIND_EXIT = {"prepare": EXIT_PREPARE, "orig": EXIT_ORIG,
-             "ours": EXIT_OURS, "compare": EXIT_COMPARE}
+             "ours": EXIT_OURS, "compare": EXIT_COMPARE, "history": EXIT_HISTORY}
 
 # ⛔⛔ S140:`all` 的退出码此前取**第一条非零**(而变量名叫 `worst`)。
 #    配上 `ORDER` 把 rvc 排在第一位,一条 exit 6(读数不可归因,语义是「重跑一次就好」)
@@ -116,7 +128,8 @@ KIND_EXIT = {"prepare": EXIT_PREPARE, "orig": EXIT_ORIG,
 #    `1` 被单列为「★ 只有这一种是被测的东西不对」。⇒ 改成按**严重度**取。
 #    排序理由:真红最重;其次是被测代码抛了;再是闸自己没准备好/参照物没跑起来;
 #    用法错误与不可归因最轻(它们都不是关于被测对象的判决)。
-SEVERITY = [EXIT_COMPARE, EXIT_OURS, EXIT_PREPARE, EXIT_ORIG, EXIT_USAGE, EXIT_UNRUNNABLE]
+SEVERITY = [EXIT_COMPARE, EXIT_HISTORY, EXIT_OURS, EXIT_PREPARE, EXIT_ORIG,
+            EXIT_USAGE, EXIT_UNRUNNABLE]
 
 
 def _worst_rc(results):
@@ -132,19 +145,19 @@ CHAINS = {
     "diff": dict(py=STAGING, prepare="gate1_diff_prepare.py", orig="gate1_diff_run_orig.py",
                  ours="gate1_diff_run_ours.py",
                  ours_stdout=os.path.join(TESTING, "gate1_diff_ours_steps.jsonl"),
-                 compare="gate1_diff_compare.py",
+                 compare="gate1_diff_compare.py", history=HISTORY_DRIVER,
                  wipes=[os.path.join(TESTING, "gate1_diff_orig"),
                         os.path.join(TESTING, "gate1_diff_ours")]),
     "sovits": dict(py=STAGING, prepare="gate1_sovits_prepare.py", orig="gate1_sovits_run_orig.py",
                    ours="gate1_sovits_run_ours.py",
                    ours_stdout=os.path.join(TESTING, "gate1_sovits_ours_steps.jsonl"),
-                   compare="gate1_sovits_compare.py",
+                   compare="gate1_sovits_compare.py", history=HISTORY_DRIVER,
                    wipes=[r"D:\MyDev\so-vits-svc\so-vits-svc\logs\gate1_sovits",
                           os.path.join(TESTING, "gate1_sovits_ours")]),
     "sovits_v2": dict(py=VENV, prepare="gate1_sovits_v2_prepare.py",
                       orig="gate1_sovits_v2_run_orig.py", ours="gate1_sovits_v2_run_ours.py",
                       ours_stdout=os.path.join(TESTING, "gate1_sovits_v2_ours_steps.jsonl"),
-                      compare="gate1_sovits_v2_compare.py",
+                      compare="gate1_sovits_v2_compare.py", history=HISTORY_DRIVER,
                       wipes=[r"D:\MyDev\TESTING\SoVITS-4.0_v2\src\so-vits-svc\logs\gate1_sovits_v2",
                              os.path.join(TESTING, "gate1_sovits_v2_ours")]),
     # ⛔ 声码器:`ours_stdout=None` —— 它没有 JSONL 步流(两侧都从 TB 取)⇒ tmp 落位保护
@@ -161,7 +174,7 @@ CHAINS = {
     #       **一个都不删** ⇒ 打出来的体积必须等于真会没的体积。
     "vocoder": dict(py=STAGING, prepare="gate1_vocoder_prepare.py",
                     orig="gate1_vocoder_run_orig.py", ours="gate1_vocoder_run_ours.py",
-                    ours_stdout=None, compare="gate1_vocoder_compare.py",
+                    ours_stdout=None, compare="gate1_vocoder_compare.py", history=HISTORY_DRIVER,
                     wipes=[r"D:\MyDev\TESTING\gate1_vocoder\ours",
                            r"D:\MyDev\TESTING\gate1_vocoder\orig"],
                     orig_wipes=[r"D:\MyDev\SingingVocoders\experiments\gate1_voc"]),
@@ -173,7 +186,7 @@ CHAINS = {
     "rvc": dict(py=STAGING, prepare="gate1_prepare.py", orig="gate1_run_orig.py",
                 orig_ok=(0, 2333333), ours="gate1_run_ours.py",
                 ours_stdout=os.path.join(TESTING, "gate1_ours_steps.jsonl"),
-                compare="gate1_compare.py",
+                compare="gate1_compare.py", history=HISTORY_DRIVER,
                 wipes=[r"D:\MyDev\RVC\RVC20240604Nvidia\logs\gate1",
                        os.path.join(TESTING, "gate1_ours")]),
 }
@@ -286,7 +299,7 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
     if not os.path.isfile(c["py"]):
         G._say("MISSING interpreter: %s" % c["py"])
         return EXIT_USAGE
-    for key in ("prepare", "orig", "ours", "compare"):
+    for key in ("prepare", "orig", "ours", "compare", "history"):
         # ⛔ S139:原来 `orig is None` 会**跳过整段并仍然打 PASS**。五条链没有一条是 None,
         #    所以那是一条死分支 —— 而任何人临时把某条置 None(「原版侧太慢先跳过」)
         #    拿到的就是 VERDICT PASS + exit 0,而那一跑根本没有参照物。
@@ -323,7 +336,8 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
 
     if dry:
         for name, key in (("1_prepare", "prepare"), ("2_orig", "orig"),
-                          ("3_ours", "ours"), ("4_compare", "compare")):
+                          ("3_ours", "ours"), ("4_compare", "compare"),
+                          ("5_history", "history")):
             if name == "1_prepare" and not rebuild:
                 G._say("  WOULD-SKIP 1_prepare               (默认不重建夹具)")
                 continue
@@ -334,7 +348,7 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
         return 0
 
     os.makedirs(out, exist_ok=True)
-    plan = [("3_ours", "ours"), ("4_compare", "compare")]
+    plan = [("3_ours", "ours"), ("4_compare", "compare"), ("5_history", "history")]
     if not skip_orig:
         plan.insert(0, ("2_orig", "orig"))
     if rebuild:
@@ -343,7 +357,11 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
     for name, kind in plan:
         # ⛔ `--allow-uncovered` 只透传给 compare —— 它是「我知道这一轮有缺口,仍然接受」的
         #    显式表态,而 gate0_guard.finish 的默认是**有缺口就 exit 3**。
-        extra = ("--allow-uncovered",) if (kind == "compare" and allow_uncovered) else ()
+        extra = ()
+        if kind == "history":
+            extra = ("--chain", chain)
+        if allow_uncovered and kind in ("compare", "history"):
+            extra = extra + ("--allow-uncovered",)
         rc, _dt, log = step(chain, name, c["py"], c[kind], out, t0, flags, extra)
         if kind == "orig" and rc in c.get("orig_ok", (0,)):
             continue
@@ -360,13 +378,15 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
             label = {"prepare": "PREPARE-FAILED (闸自己没准备好)",
                      "orig": "ORIG-FAILED (参照物没跑起来 ≠ 我们的代码不对)",
                      "ours": "OURS-FAILED (被测代码抛了)",
-                     "compare": "COMPARE-FAILED (★ 这一种才是「被测的东西不对」)"}[kind]
+                     "compare": "COMPARE-FAILED (★ 这一种才是「被测的东西不对」)",
+                     "history": "HISTORY-DRIFT (数值自 07-07/07-17 与 08-11 起变了 "
+                                "≠ 今天的移植不对 —— 两条判据问的是两个问题)"}[kind]
             G._say("VERDICT %s rc=%d — %s" % (label, rc, log))
             for ln in _tail(log):
                 G._say("   " + ln)
             return KIND_EXIT[kind]
-        if kind == "compare":
-            G._say("---- compare ----")
+        if kind in ("compare", "history"):
+            G._say("---- %s ----" % kind)
             for ln in _tail(log, 12):
                 G._say("   " + ln)
 
@@ -533,9 +553,13 @@ def _selftest():
                     f.write(_STUB % (kind, code))
                 names[kind] = fn
             CHAINS.clear()
+            # ⛔ S140:**第 5 段也要给桩**。不给的话 :296 的驱动存在性检查会先返回
+            #    EXIT_USAGE ⇒ 每一个场景都在测「缺驱动」而不是它自己那一档,
+            #    而其中几条恰好也期望 5 ⇒ **红了、码也对,但理由变了**。
             CHAINS["st"] = dict(py=sys.executable, prepare=names.get("prepare"),
                                 orig=names.get("orig"), ours=names.get("ours"),
-                                compare=names.get("compare"), ours_stdout=None,
+                                compare=names.get("compare"),
+                                history=names.get("history"), ours_stdout=None,
                                 wipes=[], **chain_kw)
             got = run_chain("st", os.path.join(td, "runs"), time.time() - 2.0,
                             rebuild, skip_orig, False, [])
@@ -559,22 +583,25 @@ def _selftest():
                 os.environ.pop(ALLOW_REBUILD_ENV, None)
             shutil.rmtree(td, ignore_errors=True)
 
-    ok = dict(prepare=0, orig=0, ours=0, compare=0)
+    ok = dict(prepare=0, orig=0, ours=0, compare=0, history=0)
     scenario("四段全过", ok, 0)
     scenario("prepare 失败", dict(ok, prepare=7), EXIT_PREPARE)
     scenario("原版侧失败", dict(ok, orig=9), EXIT_ORIG)
     scenario("我方侧抛了", dict(ok, ours=9), EXIT_OURS)
     scenario("compare 判负", dict(ok, compare=1), EXIT_COMPARE)
+    # ⛔ S140:第 5 段 —— 历史漂了退 **7**,不许和「移植不对」共用 1
+    scenario("历史对拍判负", dict(ok, history=1), EXIT_HISTORY)
     # ⛔ 「不可归因」对**每一段**都成立,不只 compare —— 起因是 `gate1_run_orig.py` 那三条
     #    前置(它们自称「闸没准备好」,而退 1 会被读成「参照物没跑起来」)。逐段各触发一次。
-    for kind in ("prepare", "orig", "ours", "compare"):
+    for kind in ("prepare", "orig", "ours", "compare", "history"):
         scenario("%s 判不可归因(退 3)" % kind, dict(ok, **{kind: G.EXIT_UNRUNNABLE}),
                  EXIT_UNRUNNABLE)
     # ⛔ 上游 RVC 正常完训:配了 orig_ok 要放行,没配要判 ORIG-FAILED —— 两条一起才是判据
     scenario("上游 2333333 + orig_ok", dict(ok, orig=2333333), 0, orig_ok=(0, 2333333))
     scenario("上游 2333333 无 orig_ok", dict(ok, orig=2333333), EXIT_ORIG)
     # ⛔ 死分支:没有参照物绝不许退 0
-    scenario("没有 orig 驱动", dict(prepare=0, ours=0, compare=0), EXIT_USAGE)
+    scenario("没有 orig 驱动", dict(prepare=0, ours=0, compare=0, history=0), EXIT_USAGE)
+    scenario("没有 history 驱动", dict(prepare=0, orig=0, ours=0, compare=0), EXIT_USAGE)
 
     # 转录不许被覆盖
     td = tempfile.mkdtemp(prefix="gate1_runner_selftest2_")
@@ -589,7 +616,7 @@ def _selftest():
         CHAINS.clear()
         CHAINS["st"] = dict(py=sys.executable, prepare="stub_ours.py", orig="stub_ours.py",
                             ours="stub_ours.py", compare="stub_ours.py",
-                            ours_stdout=None, wipes=[])
+                            history="stub_ours.py", ours_stdout=None, wipes=[])
         try:
             run_chain("st", out, time.time() - 2.0, False, False, False, [])
             fails.append("转录覆盖:应该被拒绝,却跑过去了")
@@ -637,6 +664,8 @@ def _selftest():
     #    此前 rvc 排第一 + 一条 exit 6 会把后面任何一条真红(exit 1)整个盖住。
     for name, res, want in (
             ("真红排在不可归因之后", [("a", EXIT_UNRUNNABLE), ("b", EXIT_COMPARE)], EXIT_COMPARE),
+            ("真红 vs 历史漂了", [("a", EXIT_HISTORY), ("b", EXIT_COMPARE)], EXIT_COMPARE),
+            ("历史漂了 vs 不可归因", [("a", EXIT_UNRUNNABLE), ("b", EXIT_HISTORY)], EXIT_HISTORY),
             ("真红排在最前", [("a", EXIT_COMPARE), ("b", EXIT_UNRUNNABLE)], EXIT_COMPARE),
             ("我方抛了 vs 用法错误", [("a", EXIT_USAGE), ("b", EXIT_OURS)], EXIT_OURS),
             ("全过", [("a", 0), ("b", 0)], 0)):

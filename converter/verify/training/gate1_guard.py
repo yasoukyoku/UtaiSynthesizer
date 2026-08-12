@@ -70,6 +70,8 @@ note_uncovered = G.note_uncovered
 finish = G.finish
 run = G.run
 dirhash = G.dirhash
+require_fresh = G.require_fresh          # S140:此前只在本模块内部用 `G.require_fresh`,
+collect = G.collect                      # 没有转调出去 ⇒ 新的消费者会去 import 第二份
 
 # ⛔ **另起 `GATE1_T0`,不复用 `GATE0_T0`**:同一个 shell 里先跑 gate0 会话(它把 t0 落盘
 #    并 export)再跑 gate1,复用同一个变量名会让 gate1 读到**几小时前**的 t0
@@ -110,7 +112,11 @@ EXPECT = {
     "diff": dict(steps=24, val_boundaries=3),
     # vocoder/pipeline.py:577 max_updates = 2*total_real,驱动 total_steps=15
     # ⇒ training 每分量 15 点、validation 每分量 4 点 @global [0,10,20,30];共 11 个 tag
-    "vocoder": dict(train_points=15, val_points=4, tags=11),
+    # ⛔ S140:`tally` = 我方侧 **reporter 通道**收到了多少条读数(与 TB 点数是两个数)。
+    #    此前这条链的 `_Rep` 三个方法全 `pass` ⇒ 这一面**零判据**。
+    #    `None` = **还没登记**:那一跑只报数并响亮说明自己没判(照 `declare_frozen`
+    #    在没给 expect_sha 时的做法)。⛔ 别拿一个推算出来的数去填它 —— 登记值必须是量出来的。
+    "vocoder": dict(train_points=15, val_points=4, tags=11, tally=None),
 }
 
 
@@ -319,6 +325,47 @@ def compare_pairs(label, items, line, floor=1e-6, symmetric=False, min_cmp=1):
     return {"worst": worst, "worst_tag": worst_tag, "worst_step": worst_step,
             "mean": (total / n_cmp) if n_cmp else 0.0,
             "n_cmp": n_cmp, "n_bad": len(failures), "failures": failures}
+
+
+def check_tally(label, path, expect):
+    """我方侧 reporter 通道的记账对拍(声码器那条链专用,形状照 `check_clamped`)。
+
+    ⛔ 立项理由:`gate1_vocoder_run_ours._Rep` 的三个方法此前**全是 `pass`** ⇒
+       reporter 被调十几次、一条都没落地,而这条链的点数下限量的是 **TB writer**
+       写了几个点,不是**尺子收到几条** ⇒ 协议层整层不在被比较的面上。
+    ⛔ `expect is None` ⇒ **还没登记**:只报数 + 响亮说明这一处没判
+       (照 `gate0_guard.declare_frozen` 在没给 expect_sha 时的做法)。
+       此时仍然要判一条**最低限度**的:通道必须真的活着(n_step > 0),
+       否则「三个方法全 pass」这个原始状态会原样通过。
+    """
+    import json
+    if not os.path.isfile(path):
+        raise GateUnrunnable(
+            "%s: reporter 记账不在:%s\n"
+            "       ⇒ 我方侧没有把它收到的读数条数写下来(本轮没跑 ours?)——\n"
+            "         而这一面此前是零判据,别让它悄悄退回去。" % (label, path))
+    got = json.load(open(path, encoding="utf-8"))
+    if expect is None:
+        if not got.get("n_step"):
+            raise GateUnrunnable(
+                "%s: reporter 通道收到 **0** 条 step —— 桩把它们全吞了(这正是 S140 之前的状态)。"
+                "\n       实测记账:%s" % (label, got))
+        _say("[NOTE] %s: reporter 记账 = %s" % (label, json.dumps(got, ensure_ascii=False,
+                                                                 sort_keys=True)))
+        _say("       ⚠ 这一处**没有登记期望值** ⇒ 它只判了「通道是活的」,"
+             "**没判「收到的条数对不对」**。把上面这个 dict 填进 "
+             "`gate1_guard.EXPECT[...]['tally']` 之后它才有牙。")
+        return got
+    bad = {k: (expect[k], got.get(k)) for k in expect if got.get(k) != expect[k]}
+    if bad:
+        raise GateUnrunnable(
+            "%s: reporter 记账与登记值不同:%s\n"
+            "       ⇒ 我方侧上报的读数条数变了 —— 这不是「数值不一致」,是**这一跑到底报了什么**变了。\n"
+            "         核实之后去改 `gate1_guard.EXPECT[...]['tally']`,并在 commit 里说明为什么。"
+            % (label, {k: "登记 %r / 实测 %r" % v for k, v in bad.items()}))
+    _say("[COVERAGE] %s: reporter 记账与登记值逐项相等(%s)"
+         % (label, json.dumps(expect, ensure_ascii=False, sort_keys=True)))
+    return got
 
 
 def require_components(chain, n, what="PAIRS"):

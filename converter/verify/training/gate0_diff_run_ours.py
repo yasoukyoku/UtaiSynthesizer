@@ -29,9 +29,35 @@ class _Stop:
 
 
 class _Reporter:
-    def stage(self, stage, done=None, total=None, message=None):
+    """⛔ S140:形参**逐字照抄** `training/utai_train/protocol.py` 的 Reporter
+    (:60/:78/:98/:110/:125/:128)。此前仓内四个桩类有**三种**写法(`*a, **k` / 窄签名缺
+    `force` / 少五个方法),而 `gate_driver_arity` **结构上看不见类方法**(它只解析模块级
+    `def`,:97-99 与 :184-186)⇒ 桩与生产 Reporter 的签名漂移是一条**全仓无人看守**的面,
+    而它的 `VERDICT ALL-BIND` 那条绿对这一面是空的。
+    ⚠ 生产里 `stage`/`step` 各有 8 处与 4 处 `force=True` 的调用点 ⇒ 窄签名不只在 stage 上会炸。
+    """
+
+    def stage(self, stage, done=None, total=None, message=None, force=False):
+        # ⚠ 这一行是**转录装饰,不是判据** —— `gate0_guard.py:214-216` 与
+        #   `gate0_compare.py:188-190` 都明写「别拿 stage 的 done 计数当判据」
+        #   (它在 skip 之前汇报,全跳过也走满)。
         if done is not None and total is not None and done >= total:
             print("stage %s %s/%s" % (stage, done, total))
+
+    def step(self, step, total_steps, epoch, total_epochs, lr, losses, force=False):
+        pass
+
+    def ckpt(self, kind, path, step, epoch, metric=None):
+        pass
+
+    def warn(self, code):
+        pass
+
+    def done(self, reason, summary=None):
+        pass
+
+    def error(self, message):
+        pass
 
 
 def main():

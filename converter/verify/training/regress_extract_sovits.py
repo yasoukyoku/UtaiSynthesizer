@@ -41,7 +41,30 @@ class _Stop:
 
 
 class _Reporter:
-    def stage(self, stage, done=None, total=None, message=None):
+    """⛔ S140:形参**逐字照抄** `training/utai_train/protocol.py` 的 Reporter
+    (:60/:78/:98/:110/:125/:128)。此前仓内四个桩类有**三种**写法(`*a, **k` / 窄签名缺
+    `force` / 少五个方法),而 `gate_driver_arity` **结构上看不见类方法**(它只解析模块级
+    `def`,:97-99 与 :184-186)⇒ 桩与生产 Reporter 的签名漂移是一条**全仓无人看守**的面,
+    而它的 `VERDICT ALL-BIND` 那条绿对这一面是空的。
+    ⚠ 生产里 `stage`/`step` 各有 8 处与 4 处 `force=True` 的调用点 ⇒ 窄签名不只在 stage 上会炸。
+    """
+
+    def stage(self, stage, done=None, total=None, message=None, force=False):
+        pass
+
+    def step(self, step, total_steps, epoch, total_epochs, lr, losses, force=False):
+        pass
+
+    def ckpt(self, kind, path, step, epoch, metric=None):
+        pass
+
+    def warn(self, code):
+        pass
+
+    def done(self, reason, summary=None):
+        pass
+
+    def error(self, message):
         pass
 
 

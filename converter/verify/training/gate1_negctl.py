@@ -235,7 +235,7 @@ VOC_VAL = ["validation/stft_loss", "validation/total_loss"]
 
 
 def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False,
-                nan_tag=None, extra_tag_ours=False):
+                nan_tag=None, extra_tag_ours=False, tally_dead=False):
     o, u = os.path.join(td, "orig"), os.path.join(td, "ours")
     tsteps = [2 * (i + 1) for i in range(n_train)]
     vsteps = [0, 10, 20, 30]
@@ -256,7 +256,15 @@ def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False,
             series["training/BRAND_NEW"] = {s: 1.0 for s in tsteps}
         write_tb(d, series)
     orig_exp = os.path.join(td, "orig_exp")
-    over = dict(ORIG_LOGS=o, OURS_LOGS=u, ORIG_EXP=orig_exp, GATE_ROOT=td)
+    ours_exp = os.path.join(td, "ours_exp")
+    # ⛔ S140:reporter 记账也要造 —— 真跑一定会写它,合成夹具不写就等于让
+    #    「健康」那条对照臂又去验一个盘上不存在的形状(这一场刚为身份文件补过同一件事)。
+    os.makedirs(ours_exp, exist_ok=True)
+    with open(os.path.join(ours_exp, "reporter_tally.json"), "w", encoding="utf-8") as f:
+        json.dump({"n_stage": 0, "n_step": 0 if tally_dead else 16,
+                   "ckpt_kinds": ["periodic"], "n_ckpt": 1,
+                   "n_warn": 0, "n_done": 0, "n_error": 0, "summary_steps": 15}, f)
+    over = dict(ORIG_LOGS=o, OURS_LOGS=u, ORIG_EXP=orig_exp, OURS_EXP=ours_exp, GATE_ROOT=td)
     apply_ident(over, orig_exp, u, "same")
     return over, [o, u]
 
@@ -326,6 +334,11 @@ def build_cases():
         #    ⇒ 「我方多 log 了一个量 / 上游新增了一个」今天是**零信号**。
         ("voc/我方单侧多一个 tag", "gate1_vocoder_compare.py",
          lambda td: voc_fixture(td, extra_tag_ours=True), 3, "tag 集合"),
+
+        # ── ⛔ S140:reporter 通道。此前 `_Rep` 三个方法全 `pass` ⇒ 这一面零判据。
+        #    「记账里 n_step=0」正是那个原始状态,它必须红 —— 否则改回去没人看得见。
+        ("voc/reporter 记账说它收到 0 条", "gate1_vocoder_compare.py",
+         lambda td: voc_fixture(td, tally_dead=True), 3, "桩把它们全吞了"),
 
         # ── ⛔ S140:登记的分量数变判据。此前 EXPECT[*]["components"] 是**零读者**,
         #    从 PAIRS 里删掉一个分量 ⇒ 每行照打 [PASS]、总判照打 ALL PASS,转录零变化。
