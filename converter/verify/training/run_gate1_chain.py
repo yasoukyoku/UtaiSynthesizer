@@ -110,6 +110,24 @@ EXIT_USAGE, EXIT_UNRUNNABLE = 5, 6
 KIND_EXIT = {"prepare": EXIT_PREPARE, "orig": EXIT_ORIG,
              "ours": EXIT_OURS, "compare": EXIT_COMPARE}
 
+# ⛔⛔ S140:`all` 的退出码此前取**第一条非零**(而变量名叫 `worst`)。
+#    配上 `ORDER` 把 rvc 排在第一位,一条 exit 6(读数不可归因,语义是「重跑一次就好」)
+#    会把后面四条链里**任何一条真红(exit 1)整个盖住** —— 而这套码的全部价值就在于
+#    `1` 被单列为「★ 只有这一种是被测的东西不对」。⇒ 改成按**严重度**取。
+#    排序理由:真红最重;其次是被测代码抛了;再是闸自己没准备好/参照物没跑起来;
+#    用法错误与不可归因最轻(它们都不是关于被测对象的判决)。
+SEVERITY = [EXIT_COMPARE, EXIT_OURS, EXIT_PREPARE, EXIT_ORIG, EXIT_USAGE, EXIT_UNRUNNABLE]
+
+
+def _worst_rc(results):
+    """(码, 是哪条链)。⛔ 不是「第一条非零」。"""
+    bad = [(SEVERITY.index(rc) if rc in SEVERITY else 99, rc, c)
+           for c, rc in results if rc != 0]
+    if not bad:
+        return 0, None
+    bad.sort()
+    return bad[0][1], bad[0][2]
+
 CHAINS = {
     "diff": dict(py=STAGING, prepare="gate1_diff_prepare.py", orig="gate1_diff_run_orig.py",
                  ours="gate1_diff_run_ours.py",
@@ -131,11 +149,22 @@ CHAINS = {
                              os.path.join(TESTING, "gate1_sovits_v2_ours")]),
     # ⛔ 声码器:`ours_stdout=None` —— 它没有 JSONL 步流(两侧都从 TB 取)⇒ tmp 落位保护
     #    对它不适用,而它恰好也是唯一没有历史对拍的一条(`compare_vs_history.CASES` 只有四条)。
+    # ⛔⛔ S140:这条链的删除账**此前是错的,而且错在最贵的方向**。
+    #    ⑴ `SingingVocoders\experiments\gate1_voc`(**3.66 GB**,S134 声码器**原版侧**
+    #       唯一在盘证据 —— 头注此前写成「我方侧」,照那句话去备份会拷错一棵树)
+    #       **不是 prepare 删的**,是 `gate1_vocoder_run_orig.py:75-77` 在 import 期
+    #       **无条件** rmtree ⇒ 它在**不给 `--rebuild-fixtures`、不给 `GATE1_ALLOW_REBUILD`、
+    #       一行警告都不打**的默认跑里就会没,而 S139 造的那道联锁只在 `if rebuild:` 里
+    #       ⇒ **那道锁在这条链上是装饰**。⇒ 单开 `orig_wipes`,由 2_orig 段自己的联锁管。
+    #    ⑵ prepare 只删 `gate1_vocoder\{ours,orig}`(5.11 GB),整棵 5.54 GB 里
+    #       npz(24.9 MB)/ `pretrain_cpu.ckpt`(405.6 MB)/ 两份 07-06 的 *_run.log
+    #       **一个都不删** ⇒ 打出来的体积必须等于真会没的体积。
     "vocoder": dict(py=STAGING, prepare="gate1_vocoder_prepare.py",
                     orig="gate1_vocoder_run_orig.py", ours="gate1_vocoder_run_ours.py",
                     ours_stdout=None, compare="gate1_vocoder_compare.py",
-                    wipes=[r"D:\MyDev\SingingVocoders\experiments\gate1_voc",
-                           r"D:\MyDev\TESTING\gate1_vocoder"]),
+                    wipes=[r"D:\MyDev\TESTING\gate1_vocoder\ours",
+                           r"D:\MyDev\TESTING\gate1_vocoder\orig"],
+                    orig_wipes=[r"D:\MyDev\SingingVocoders\experiments\gate1_voc"]),
     # ⛔ orig_ok:上游 RVC 正常完训是 `os._exit(2333333)`(train.py:635),不是失败。
     #    S134 实测:第一版跑器把这次【成功】报成了 ORIG-FAILED —— 幸好它把真 rc 打了出来。
     #    ⚠ 这个数在两个地方读出来**不一样**:python 的 `returncode` 拿到 2333333,
@@ -172,15 +201,27 @@ def _measure(path):
     return n, total
 
 
-def report_wipes(chain, cfg):
-    G._say("  ⛔ --rebuild-fixtures:这条链的 prepare 会 rmtree 下面这些(首句就删,删在任何断言之前):")
+def report_wipes(chain, cfg, key="wipes", who="prepare"):
+    """⛔ 逐条报「会没的东西」。措辞按**谁删的**分开 —— S140 之前这里对五条链统一写
+    「这条链的 prepare 会 rmtree(首句就删,删在任何断言之前)」,而对声码器那条**两句都是假的**
+    (删的是 run_orig;而 S139 已经把断言前移到 rmtree 之前)。一句错的账目会决定备份什么。
+    """
+    G._say("  ⛔ 这一跑的 **%s** 会 rmtree 下面这些(不可再生的历史证据,先拷走再来):" % who)
     grand = 0
-    for p in cfg.get("wipes", []):
+    for p in cfg.get(key, []):
         n, b = _measure(p)
         grand += b
         G._say("       %-58s %5d 件 %9.1f MB%s"
                % (p, n, b / 1e6, "   ⚠ 不在盘上" if n == 0 else ""))
     G._say("     合计 %.2f GB" % (grand / 1e9))
+    # ⛔ S140:**只报「删」不报「覆盖」的账目,对不可再生产物的保护只有半个。**
+    #    四条链的 `ours_stdout` 不在任何 `wipes` 里 ⇒ `--dry-run` 一个字都不提,
+    #    而 `step()` 在 rc==0 时 `os.replace(tmp, stdout_to)` 直接落位覆盖。
+    #    盘上那四份 08-11 的 jsonl 是 S134 我方侧读数的**协议层**载体。
+    out = cfg.get("ours_stdout")
+    if out and key == "wipes":
+        n, b = _measure(out)
+        G._say("     ⚠ 另外还会**覆盖**(不是删):%s(%d 件 %.1f KB)" % (out, n, b / 1e3))
     return grand
 
 
@@ -265,6 +306,21 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
                     "          上面那些是**不可再生的历史证据**(S134 五条链在盘的唯一副本),"
                     "先拷走再来。" % ALLOW_REBUILD_ENV)
 
+    # ⛔⛔ S140:`orig_wipes` —— 由**原版侧驱动自己**在 import 期删掉的东西。
+    #    声码器那条会无条件 rmtree 3.66 GB(S134 原版侧唯一在盘证据),而它**不受
+    #    `--rebuild-fixtures` 管辖** ⇒ 此前 `run_gate1_chain.py vocoder`(不加任何参数)
+    #    就能把它抹掉,终端上一个字的警告都没有,因为 `report_wipes` 只在 `if rebuild:` 里被调。
+    #    ⇒ 只要这一跑的 plan 里有 2_orig,就用**同一道联锁**管它。
+    if c.get("orig_wipes") and not skip_orig:
+        report_wipes(chain, c, key="orig_wipes", who="原版侧驱动(import 期自清,⛔ 不受 --rebuild-fixtures 管)")
+        if dry:
+            G._say("  (--dry-run:不删)")
+        elif os.environ.get(ALLOW_REBUILD_ENV) != "1":
+            _refuse("这条链的**原版侧驱动**会在 import 期自清上面那个目录,而它不受"
+                    "`--rebuild-fixtures` 管辖。\n"
+                    "          要跑 2_orig 就得同样给 %s=1(或用 --skip-orig 跳过原版侧)。"
+                    % ALLOW_REBUILD_ENV)
+
     if dry:
         for name, key in (("1_prepare", "prepare"), ("2_orig", "orig"),
                           ("3_ours", "ours"), ("4_compare", "compare")):
@@ -319,7 +375,7 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
     return 0
 
 
-def _resolve_t0(runs_root, explicit, new_session):
+def _resolve_t0(runs_root, explicit, new_session, dry=False):
     """会话级 t0。⛔ 整块照 `run_gate0_chain.py:249-265` —— 尤其那条 **6 小时上界**:
     它是 S135 二审自己买回来的,只搬「传 t0」会把一条已经修过的洞重新引进来
     (`--runs` 落在固定路径 ⇒ 第二次调用起,凡是落在 [旧 t0, now] 窗口里的陈货一律判 FRESH)。
@@ -341,6 +397,13 @@ def _resolve_t0(runs_root, explicit, new_session):
     # 让 t0 严格早于任何产物 —— 文件系统时间戳分辨率与时钟漂移会让「同一秒产出的文件」
     # mtime 略早于 t0,那会报成一条假的「陈货」。
     t0 = time.time() - 2.0
+    # ⛔⛔ S140:**`--dry-run` 不许写盘。** 一次「只说会做什么」的调用不许改掉整场会话的
+    #    新鲜度基准 —— 而这里原来是无条件写的:`main()` 在 `if dry` 的早退**之前**就调它。
+    #    ⚠ 这条 S139 **在 gate0 跑器上当场买到并修掉了**(`run_gate0_chain.py:329-333`),
+    #      而它同一场自己新建的这个 gate1 跑器**没有回移** —— 「修在孪生脚本」第 N 次。
+    if dry:
+        G._say("%s = %.3f (⚠ --dry-run ⇒ **没有**写进 %s)" % (T0_ENV, t0, t0_file))
+        return t0
     with open(t0_file, "w", encoding="utf-8") as f:
         f.write("%.3f\n" % t0)
     G._say("%s = %.3f (新会话,已记入 %s)" % (T0_ENV, t0, t0_file))
@@ -387,24 +450,46 @@ def main(argv=None):
     if args.skip_orig:
         flags.append("orig")
 
-    t0 = _resolve_t0(args.runs, args.t0, args.new_session)
+    t0 = _resolve_t0(args.runs, args.t0, args.new_session, dry=args.dry_run)
     G._say("           = %s" % time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0)))
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
 
     chains = ORDER if args.chain == "all" else [args.chain]
+
+    # ⛔⛔ S140:**全局预检**。此前 `report_wipes` 与破坏是**交错**的 —— `all` 跑到
+    #    声码器那 9.20 GB 的行出现在屏幕上时,前四条链的 15.07 GB 已经删掉了;
+    #    放行(`GATE1_ALLOW_REBUILD`)同样是逐链的。⇒ 头注 ⑵ 承诺的「先把要删的体积
+    #    逐条打出来」此前**只对第一条链成立**。这里在任何 run_chain 之前先把全账打完。
+    if (args.rebuild_fixtures or not args.skip_orig) and len(chains) > 1:
+        G._say("\n===== 预检:这一跑总共会毁掉多少(⛔ 在任何一条链动手之前)=====")
+        total = 0
+        for c in chains:
+            cfg = CHAINS[c]
+            for key, who in (("wipes", "prepare"), ("orig_wipes", "原版侧驱动自清")):
+                if key == "wipes" and not args.rebuild_fixtures:
+                    continue
+                if key == "orig_wipes" and (args.skip_orig or not cfg.get("orig_wipes")):
+                    continue
+                for p in cfg.get(key, []):
+                    n, b = _measure(p)
+                    total += b
+                    G._say("  %-10s %-10s %-56s %5d 件 %9.1f MB" % (c, who, p, n, b / 1e6))
+        G._say("  ---- 全局合计 %d B = %.2f GB(= %.3f GiB)----" % (total, total / 1e9, total / 2 ** 30))
+
     worst, results = 0, []
     for c in chains:
         out = os.path.join(args.runs, c, stamp)
         rc = run_chain(c, out, t0, args.rebuild_fixtures, args.skip_orig, args.dry_run,
                        flags, args.allow_uncovered)
         results.append((c, rc))
-        if rc != 0 and worst == 0:
-            worst = rc
+    # ⛔ S140:按**严重度**取,不是「第一条非零」—— 见 SEVERITY 的注释。
+    worst, why = _worst_rc(results)
     G._say("\n===== 汇总 (t0=%.3f, 转录 %s) =====" % (t0, os.path.join(args.runs, "<chain>", stamp)))
     for c, rc in results:
         G._say("  %-10s rc=%d %s" % (c, rc, "PASS" if rc == 0 else "^^^"))
     if flags:
         G._say("  ⚠ 这一跑跳过了:%s ⇒ 相关产物**不保证是本轮的**" % ", ".join(flags))
+    G._say("  EXIT=%d%s" % (worst, "" if why is None else "  因为 %s(按严重度取,不是第一条非零)" % why))
     return worst
 
 
@@ -537,6 +622,47 @@ def _selftest():
     # ⛔ --rebuild-fixtures 没有环境变量时必须被拒;而有环境变量时 prepare 必须**真的跑到**
     scenario("重建夹具但没有放行环境变量", ok, EXIT_USAGE, rebuild=True, allow_rebuild=False)
     scenario("默认不跑 prepare(它是删东西那一段)", dict(ok, prepare=7), 0, rebuild=False)
+    # ⛔ S140:`orig_wipes` —— 原版侧驱动 import 期自清的目录,**不受 --rebuild-fixtures 管**。
+    #    两条一起才是判据:没放行必须被拒(而且**默认跑就要拒**,不是只有 rebuild 时),
+    #    放行了必须跑得过去。
+    scenario("原版侧会自清但没放行(默认跑)", ok, EXIT_USAGE, rebuild=False,
+             allow_rebuild=False, orig_wipes=[os.path.join(HERE, "__nonexistent_orig_wipe__")])
+    scenario("原版侧会自清 + 放行", ok, 0, rebuild=False, allow_rebuild=True,
+             orig_wipes=[os.path.join(HERE, "__nonexistent_orig_wipe__")])
+    scenario("--skip-orig ⇒ 原版侧自清那条联锁不该拦", ok, 0, rebuild=False,
+             skip_orig=True, allow_rebuild=False,
+             orig_wipes=[os.path.join(HERE, "__nonexistent_orig_wipe__")])
+
+    # ⛔⛔ S140:`all` 的退出码按**严重度**取,不是「第一条非零」。
+    #    此前 rvc 排第一 + 一条 exit 6 会把后面任何一条真红(exit 1)整个盖住。
+    for name, res, want in (
+            ("真红排在不可归因之后", [("a", EXIT_UNRUNNABLE), ("b", EXIT_COMPARE)], EXIT_COMPARE),
+            ("真红排在最前", [("a", EXIT_COMPARE), ("b", EXIT_UNRUNNABLE)], EXIT_COMPARE),
+            ("我方抛了 vs 用法错误", [("a", EXIT_USAGE), ("b", EXIT_OURS)], EXIT_OURS),
+            ("全过", [("a", 0), ("b", 0)], 0)):
+        got, _why = _worst_rc(res)
+        if got == want:
+            G._say("  ok   %-34s -> exit %d" % ("汇总严重度:" + name, got))
+        else:
+            fails.append("汇总严重度 %s 应该 %d,实际 %d" % (name, want, got))
+
+    # ⛔⛔ S140:`--dry-run` **不许写盘** —— 一次「只说不做」的调用不许改掉整场会话的
+    #    新鲜度基准。S139 在 gate0 跑器上买到并修了这条,而它同一场建的这个跑器没有回移。
+    td = tempfile.mkdtemp(prefix="gate1_runner_selftest3_")
+    try:
+        t0_file = os.path.join(td, "T0.txt")
+        _resolve_t0(td, None, True, dry=True)
+        if os.path.exists(t0_file):
+            fails.append("--dry-run 写了 T0.txt(它不许改变下一次判定的基准)")
+        else:
+            G._say("  ok   %-34s -> 没有写 T0.txt" % "--dry-run 不落盘")
+        _resolve_t0(td, None, True, dry=False)
+        if os.path.isfile(t0_file):
+            G._say("  ok   %-34s -> 写了 T0.txt" % "真跑落盘(对照)")
+        else:
+            fails.append("真跑没有写 T0.txt")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
     G._say()
     if fails:
