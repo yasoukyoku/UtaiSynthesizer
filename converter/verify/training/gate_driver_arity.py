@@ -55,15 +55,12 @@ OUT_OF_REPO_DRIVERS = [
     r"D:\MyDev\TESTING\s118_f8a\smoke_diff_resume.py",    # §F8⒜ 端到端续训冒烟(S118, 20/20)
     r"D:\MyDev\TESTING\s119_vocoder\smoke_voc_resume.py",  # §F8⒝ 声码器端到端冒烟(S119, 16/16)
     r"D:\MyDev\TESTING\s129_f2b2g\legs_s129.py",           # M20 每轮收工手跑的行为腿
-    # ⛔ S139 追加(笔 E 的第 0 步,先于搬运):gate1 那套「红能归因」的五档出口码,
-    #    唯一载体就是这个跑器,而它在仓外、无 git、只有一份(实测:那个目录 `git status`
-    #    答 `fatal: not a git repository`)。这份名单存在的理由——「名单一旦能静默变空,
-    #    这道闸的覆盖面就是假的」——逐字就是它今天的处境,而它恰好漏了这一个。
-    #    ⇒ 先登记,再搬。顺序反了的话,搬运过程中的窗口期仍然是零判据。
-    #    ⚠ 它一次也没 import 过 utai_train(全靠 subprocess 拉起 gate 脚本)⇒ 解析出 0 个
-    #      调用点、`resolved` 计数不变,这里白拿的只有 :227-232 那条 LIST-STALE 判据。
-    #    ▶ 搬进仓之后**必须**把这一条从名单里摘掉(否则搬完这道闸当场 exit 2)。
-    r"D:\MyDev\TESTING\s134_f7\run_gate1_chain.py",        # §F7 gate1 链跑器(S134)
+    # ⛔ S139:`run_gate1_chain.py` 曾在这里登记过**一笔的时间** —— 那是笔 E 的第 0 步
+    #    (先登记再搬,否则搬运过程中的窗口期仍然是零判据)。它现在已经进仓,
+    #    在 `converter/verify/training/run_gate1_chain.py`,由上面的目录扫描覆盖 ⇒ 摘掉。
+    #    ⚠ `TESTING\s134_f7\run_gate1_chain.py` **仍然在盘上**(S134 的历史证据,别删),
+    #      但它已被取代,而且**跑它会截掉 S134 自己的转录**(它的 RUNS 硬编码指着那个目录,
+    #      `open(log,"w")` 在子进程启动之前就截断)⇒ 那边放了一份 README_SUPERSEDED.md。
 ]
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 TRAINING = os.path.join(REPO, "training")
