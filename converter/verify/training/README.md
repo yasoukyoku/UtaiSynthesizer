@@ -603,9 +603,22 @@ training\.venv\Scripts\python.exe -u D:\MyDev\TESTING\s119_vocoder\smoke_voc_res
 gate_aug0_driver.py，CPU 钉死 CUDA_VISIBLE_DEVICES=-1）→ 同路径快照 → 现行代码冷跑 →
 按后缀比对（V6：wav/npy/txt/json=字节；.pt=字节→张量级降级[torch zip 档案名轴]；
 .wav 字节不等时=采样级降级[**libsndfile float32 wav 的 PEAK chunk 带写入时间戳**，
-vocoder 切片跨 run 恒差 1 字节，本次实测定责]）。读数：sovits 21/21、rvc 43/43、
-vocoder 12/12、sovits_diff 37/37 文件全等。复跑：
+vocoder 切片跨 run 恒差 1 字节，本次实测定责]）。复跑：
 `.venv\Scripts\python.exe ..\converter\verify\training\gate_aug0_noop.py --backend <b>`
+
+⚠ **读数 sovits 21/21、rvc 43/43、vocoder 12/12、sovits_diff 37/37 是 S122 期（2026-08-08
+以前）的，今天【没有被复核过】，而且已知会漂**：S125 之后每条链的池里多一个 `pool.json`，
+S136 的 `build_cfg` 又多写 `run_dir` / `run_has_main_model` 两个键。⇒ 下次真跑这个闸时把这四个
+数当**地板**重新量，别拿它们对表判退化。
+⭐ **2026-08-12 直接数过盘上那四棵 `ws_noop_*`：22 / 44 / 13 / 38 件**，各减掉一个被
+`EXCLUDE_FILES` 排除的 `train.log`，正好是 **21 / 43 / 12 / 37** ⇒ **这四个数今天仍然对得上
+盘上的树**，它们的含义是「**参与比较的文件数**」而不是「树里有多少文件」。
+⛔ **但重跑一次会各加一**：那四棵树的 mtime 是 2026-07-08 / 08-08，**都还没有 `pool.json`**
+（`open_pool` 的 `POOL_REF` 是 S125 之后才写的，本轮在 `gate_aug_pipeline` 那三棵上实测到它是
+「只在新」）⇒ 真跑之后**预期变成 22 / 44 / 13 / 38**。
+⚠ 这一段是**先推错了再被实测纠正的**：我起初以为盘上就已经多了 `pool.json`。**别按推论对表。**
+⛔ 另外 `--baseline-rev` 默认 `HEAD`：工作树干净时那是 **A/A**（同一份码跑两遍），
+**不是** S41 那条跨代码断言；要做后者得显式传 `c82ca55`。闸自己会打 `[axis]` 说明这一次量了哪种。
 
 ## gate_aug_pipeline.py（管线不变量，**两条臂**：`--arm v1` / `v2` / `both`）
 
@@ -617,12 +630,36 @@ npz 侧）；**2→…→0 树 == fresh-0**。dirty 混合集：≥1 剔除 + **
 + 幸存片全材料化 + 零残渣。diff 继承：增量路径 aug 不动 + **换数据集铸兄弟池、旧池
 逐字节存活** + diff 产物齐全。
 
-⚠ **`--backend all` 的期望条数 = 53**（sovits 15 + rvc 12 + vocoder 14 + dirty 5 + diff 7），
-是**地板不是钉子**（`MIN_CHECKS_ALL=48`）。⛔ **这个数是数出来的，不是量出来的**：v1 臂
-**自 2026-08-08 起没有真跑过**，而今天的 `build_cfg` 比那时多写 `run_dir` /
-`run_has_main_model` 两个键 ⇒ 重跑会改写 `GATE_ROOT/cfg_pipe_*.json`，而那五份同时是
-`legs_s129.py` 的**输入模板**。⇒ 重跑 v1 臂是**单独一笔**，跑之前必须先
-`TESTING\s136_f7\backup_pre_m15.py`，跑之后 `check_fixtures_untouched.py`。
+**`--backend all` = 57 条**（sovits 15 + rvc 12 + vocoder 14 + dirty 5 + diff 7 + 模板申报 4），
+**地板不是钉子**（`MIN_CHECKS_ALL=48`，且自 S137 起**只数 v1 臂自己的**——`CHECKS` 与 v2 臂共享，
+之前 `--arm both` 下 v1 臂打零条也照样过）。
+⭐ **2026-08-12 实测**：对着盘上那三棵存量池夹具真跑，**53 条 ALL PASS / 172 s**
+（那次还没有末尾那 4 条模板申报）。此前最后一次真跑是 2026-08-08。
+
+⛔ **跑这条臂会【合法地】改写 `legs_s129.py` 的输入面**，先备份再跑：
+`exercise()` 第一句 `wipe(ws, base_snap)` 重建 `ws_pipe_{sovits,rvc,vocoder}` 与三个 `_c0`；
+`run_pipeline` 把 cfg 写到 `dirname(ws)` = GATE_ROOT ⇒ 重写四份 `cfg_pipe_*.json`。
+⇒ 跑完 `check_fixtures_untouched.py` **应该红**，工作是证明那片红**恰好等于**下面这张表。
+
+⭐ **重建一次到底变了什么（2026-08-12 逐件对拍，`TESTING\s137_f7\compare_rebuilt_vs_backup.py`）**：
+
+| | |
+|---|---|
+| `ws_pipe_sovits` **21/21** · `ws_pipe_rvc` **43/43** · `ws_pipe_dirty` 38/38 · `ws_pipe_diff` 200/200 | **逐字节相同** |
+| `ws_pipe_vocoder` | 8/8 相同，**4 个 `slices/*.wav` 差** = libsndfile 的 PEAK-chunk 时间戳轴（本文件上一节记的同一条轴） |
+| 每棵树 `pool.json` | **ONLY-NEW** —— S125 之后新增的产物，08-08 那批树里没有 |
+| 四份 `cfg_pipe_*.json` | 多出 `run_dir` / `run_has_main_model`（S136 起 `build_cfg` 无条件写） |
+| 三个 `train.log` | 追加写，比较器按 `.log` 跳过并计数 |
+
+⚠ **rvc 的 f0/特征在这份夹具上逐字节可复现**，但**别把它读成「RVC 的 CPU f0 是确定性的」**：
+S135 在 gate0 的 51 件样本里量到过 2 件不同（`max|Δ| = 8.87e-05 Hz`）。这里只有 4 个源切片，
+**是没踩到，不是踩不到**。
+
+⛔ 末尾 4 条「模板申报」不是装饰：`run_pipeline` 每调用一次就重写一份 `cfg_pipe_<backend>.json`，
+所以每份模板留下的是**该后端最后一次调用**的值，而 `legs_s129.py:182` 直接读它去盖
+`run_manifest.json`。`cfg_pipe_sovits.json` 是 2 **只因为** `dirty_rejection()`（copies=1）排在
+`diff_inherit()`（copies=2）**前面** —— 两行一对调它就静默变 1，而 legs 会**照样全绿**，
+只是它的 L4⒞ 阴性对照不再是对照。⇒ `LEGS_TEMPLATE_AUG` 把这条耦合钉成会红的判据。
 
 ### `--arm v2` —— ④d 的公式（`aug_copies` 与 `sample_rate` 进池身份，单说话人切片改名）
 S136 建、S137 接进 sovits。它**不是「同一条阶梯加个旋钮」**：v2 下每个份数是一个**兄弟池**，

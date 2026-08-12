@@ -55,7 +55,9 @@ DRIVABLE = ("sovits", "rvc", "vocoder")
 #: ⛔ Three of this gate's checks are behind `if` gates (`if P["val"]`, `if P["index"]`,
 #: `if mt_orig_before`). When a path stops resolving, those do not go red — they
 #: **disappear**, and the total silently shrinks while everything left prints PASS.
-#: A floor, not a pin: today the v1 arm at `--backend all` prints 53 and it may grow.
+#: A floor, not a pin: today the v1 arm at `--backend all` prints 57 and it may grow.
+#: (Measured 2026-08-12: 53 against the real fixtures in 172 s, before the four template
+#: declarations at the end of the arm were added.)
 #: ⚠ Counted over the v1 arm ALONE since S137 — `CHECKS` is shared with the v2 arm, which runs
 #: first, so `len(CHECKS)` here used to be fed by the other arm entirely.
 MIN_CHECKS_ALL = 48
@@ -781,6 +783,20 @@ LEGS_OWNED = ("ws_pipe_rvc", "ws_pipe_sovits", "ws_pipe_vocoder", "dataset",
               "cfg_pipe_rvc.json", "cfg_pipe_sovits.json", "cfg_pipe_sovits_diff.json",
               "cfg_pipe_sovits_v2.json", "cfg_pipe_vocoder.json")
 
+#: What the v1 arm must LEAVE BEHIND in legs' templates, per backend.
+#:
+#: ⛔⛔ This is a live, undeclared coupling between two verification lines, and it is held
+#: together by nothing but statement order. `run_pipeline` rewrites `cfg_pipe_<backend>.json` on
+#: every single call (:110), so each template ends up holding whatever the LAST call for that
+#: backend happened to pass — and `legs_s129.py:182` reads `aug_copies` straight out of those
+#: files to stamp `run_manifest.json` for every leg.
+#: `cfg_pipe_sovits.json` is 2 for ONE reason: `dirty_rejection()` (copies=1) is called BEFORE
+#: `diff_inherit()` (copies=2) in `main`. Swap those two lines and it silently becomes 1 — legs
+#: stays entirely green while its L4⒞ negative control (`legs_s129.py:489`, whose comment reads
+#: 「⇒ 与 cfg_pipe_sovits 的 2 不一致」) quietly stops being a control at all.
+#: ⚠ Measured 2026-08-12 after a full `--arm v1 --backend all`: 2 / 2 / 0 / 0.
+LEGS_TEMPLATE_AUG = {"sovits": 2, "sovits_diff": 2, "rvc": 0, "vocoder": 0}
+
 #: Floor on how many files the legs digest must have hashed. ⛔ Without it the guard below is
 #: `{} == {}`: an emptied / renamed / mistyped `LEGS_OWNED` produces two empty dicts and a green
 #: 「touched nothing」 forever. `assert_pool_intact` (:300) and `noop.compare_trees` (:399) each
@@ -827,6 +843,31 @@ def require_usable_legs_digest(before):
             "absent) — the guard that proves this arm did not touch legs_s129's 存量池 fixtures "
             "would be comparing two empty dicts and passing. LEGS_OWNED=%s"
             % (len(before), MIN_LEGS_FILES, absent, list(LEGS_OWNED)))
+
+
+def report_v1_templates(root=GATE_ROOT):
+    """Declare what the v1 arm left in legs_s129's input templates, and pin the values legs reads.
+
+    ⛔ The v1 arm cannot use the 「touched nothing」 guard the v2 arm has — rewriting these files
+    is what it legitimately does. So the honest guard is the opposite one: say out loud what was
+    left behind, and go RED if it is not what the other verification line needs. See
+    `LEGS_TEMPLATE_AUG` for why statement order alone decides this today.
+    ⚠ Reads the files rather than remembering what was passed: legs reads the FILES, so the file
+    is the fact. A `--backend <one>` run leaves the other templates alone, and this still checks
+    them — 「is legs' input still valid after this gate ran」 is the question either way.
+    """
+    for backend in sorted(LEGS_TEMPLATE_AUG):
+        want = LEGS_TEMPLATE_AUG[backend]
+        p = os.path.join(root, "cfg_pipe_%s.json" % backend)
+        try:
+            with open(p, encoding="utf-8") as f:
+                got = json.load(f).get("aug_copies")
+        except Exception as e:                              # noqa: BLE001
+            check("v1 arm: legs' template cfg_pipe_%s.json is readable" % backend, False,
+                  "%s: %s" % (p, e))
+            continue
+        check("v1 arm: left cfg_pipe_%s.json at aug_copies=%d (legs_s129:182 reads this)"
+              % (backend, want), got == want, "(got %r)" % (got,))
 
 
 def require_nonempty_v2_arm(drivable, backend_arg, backends):
@@ -915,8 +956,13 @@ def main():
         for b in backends:
             exercise(b)
         if args.backend in ("all", "sovits"):
+            # ⛔ ORDER IS LOAD-BEARING and not for this gate's own sake: `dirty_rejection` runs
+            # at copies=1 and `diff_inherit` at copies=2, both writing `cfg_pipe_sovits.json`,
+            # and legs_s129 reads the survivor. `report_v1_templates` below is what makes a swap
+            # go red instead of silently disarming legs' L4⒞ control.
             dirty_rejection()
             diff_inherit()
+        report_v1_templates()
         v1_ran = len(CHECKS) - v1_start
     if FAILURES:
         print("RESULT: FAIL (%d): %s" % (len(FAILURES), ", ".join(FAILURES)))
@@ -1045,7 +1091,30 @@ def selftest():
     ok("…and a real digest of the declared fixtures passes that floor",
        _digest_floor_ok())
 
-    # ⑸ the v2 arm refuses to rmtree anything living directly in GATE_ROOT
+    # ⑸ the v1 arm's declaration of what it left in legs' templates — all three branches.
+    #    ⛔ Fired here rather than by re-running the v1 arm: that arm takes ~3 minutes and
+    #    rebuilds three 存量池 fixtures, and 「it is expensive to test」 is exactly the excuse
+    #    that leaves a branch unexecuted.
+    d = tempfile.mkdtemp(prefix="s137_tmpl_")
+    try:
+        for backend, aug in LEGS_TEMPLATE_AUG.items():
+            with open(os.path.join(d, "cfg_pipe_%s.json" % backend), "w", encoding="utf-8") as fh:
+                json.dump({"aug_copies": aug}, fh)
+        _n, failed = capture(lambda: report_v1_templates(d))
+        ok("templates: the expected values pass", not failed and len(_n) == len(LEGS_TEMPLATE_AUG))
+        p = os.path.join(d, "cfg_pipe_sovits.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"aug_copies": 1}, fh)   # ← the exact silent drift a statement swap causes
+        _n, failed = capture(lambda: report_v1_templates(d))
+        ok("templates: aug_copies drifting 2→1 is caught ⭐ (legs' L4⒞ depends on the 2)",
+           len(failed) == 1, str(failed))
+        os.remove(p)
+        _n, failed = capture(lambda: report_v1_templates(d))
+        ok("templates: a missing template is a FAIL, not a skip", len(failed) == 1)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # ⑹ the v2 arm refuses to rmtree anything living directly in GATE_ROOT
     real_arena = globals()["arena"]
     globals()["arena"] = lambda v: GATE_ROOT
     try:
