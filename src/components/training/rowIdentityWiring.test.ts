@@ -174,6 +174,44 @@ describe("archive rows resolve their identity per row", () => {
     }
   });
 
+  it("★ S141 §E2E-M3/M4/M5 —— 槽卡片的决策留在纯模块里,不许再长回组件体", async () => {
+    // 纯模块那半有 13 条判据(`lib/training/slotRows.test.ts`),但它们证明的是**函数是对的**。
+    // 「这张卡真的在用那个函数」是另一条断言,而 vitest 不做组件测试 ⇒ 只有这道闸看得见。
+    // 具体的坏法:有人在组件里就地写回一句 `runs.filter(startedRun)`(那正是 ④e 修掉的那条),
+    // 纯模块的 13 条判据**全部照绿** —— 因为屏幕根本不再经过它们。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    expect(
+      code,
+      "ProjectDetail 不再从 lib/training/slotRows 取决策 —— 那几个决策要么被删了,要么被就地写回了",
+    ).toContain("lib/training/slotRows");
+    // 搬走的那几个形状不许在这个文件里复活。⚠ 只钉**具体的那几个形状**,不是「不许出现
+    // .filter(」—— 一条过宽的禁令会在下一次正常改动时误红,然后被人放宽成没有。
+    //
+    // ⛔ 这一组必须排在下面那条「调用点还在吗」**之前**(S108:具体的排前面,兜底的排最后)。
+    // 把一句 `visibleRuns(runs)` 就地写回 `runs.filter(startedRun)` 会让**两组同时**为真,
+    // 而先红的那一组决定下一个人读到的是哪句话:「它被写回组件体了」是诊断,
+    // 「调用点不见了」只是症状。实测 R1 第一版正是红在症状上。
+    const reInlined: [RegExp, string][] = [
+      [/runs\.filter\(/, "画哪几行的过滤又被写回组件体了(④e 修的正是这一条)"],
+      [/\.runs\.find\(/, "浅扩散宿主的挑选又被写回组件体了"],
+      [/prepPoolCount/, "「预处理 N 份」的字段又被组件直接读了 —— show 与 count 会分头取值"],
+      [
+        /hasResumePoint\s*\|\|\s*\w+\.info\.has_main_progress/,
+        "「练出过东西没有」这个谓词又出现了第二份手抄件(S141 刚收编掉一份)",
+      ],
+    ];
+    for (const [re, why] of reInlined) {
+      expect(re.test(code), why).toBe(false);
+    }
+
+    // 兜底:决策整个消失(不是被写回,而是被删掉/改名)也要红。
+    for (const fn of ["visibleRuns(", "slotStarted(", "pickDiffHost(", "prepPoolLine("]) {
+      expect(code, `${fn} 的调用点不见了`).toContain(fn);
+    }
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();
@@ -183,5 +221,15 @@ describe("archive rows resolve their identity per row", () => {
     expect(code.length).toBe(raw.length);
     expect(code).toContain("const rowIdentityFor");
     expect(code.replace(/\s/g, "").length).toBeGreaterThan(raw.replace(/\s/g, "").length * 0.5);
+
+    // ⚠ 同一条自检也要盖住**第二个**被扫的文件:S141 那条闸里有四个 `not.toMatch`,
+    // 而一个读空 / 全抹白的 ProjectDetail 会让它们**全部为错误的原因变绿**
+    // (「否定式断言 + 空输入 = 恒真」是本仓反复买过的形状)。
+    const pdRaw = fs.readFileSync(PROJECT_DETAIL, "utf8");
+    const pdCode = codeOnly(pdRaw);
+    expect(pdRaw.length).toBeGreaterThan(20_000);
+    expect(pdCode.length).toBe(pdRaw.length);
+    expect(pdCode).toContain("const dataHasDependents");
+    expect(pdCode.replace(/\s/g, "").length).toBeGreaterThan(pdRaw.replace(/\s/g, "").length * 0.5);
   });
 });

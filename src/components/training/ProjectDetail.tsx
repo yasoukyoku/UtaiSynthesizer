@@ -35,6 +35,13 @@ import {
   type DeleteReport,
 } from "../../store/training";
 import { formForSlot } from "../../lib/training/formForSlot";
+import {
+  pickDiffHost,
+  prepPoolLine,
+  slotStarted,
+  startedRun,
+  visibleRuns,
+} from "../../lib/training/slotRows";
 import { backendErrorMessage } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
@@ -91,7 +98,10 @@ export function ProjectDetail() {
   const dataHasDependents = (d: ProjectDetailData) =>
     // ★§F2⒝ 批 2 ④ —— 对**每个** run 求或。这是一道「要不要确认」的闸,漏看一个 run 就是
     // fail-open:代价落在那个 run 的几小时预处理上,而对话框根本不会弹。
-    d.slots.some((s) => s.ckptCount > 0 || s.runs.some((r) => r.hasResumePoint || r.info.has_main_progress));
+    // ⛔ S141:这里原本手抄了一份 `r.hasResumePoint || r.info.has_main_progress` —— 与槽卡片
+    // 那一份是同一个谓词的第二个副本,而两份会各自漂。改判「练出过东西没有」时只有一处会被
+    // 想起来,另一处静默保持旧语义,而这一处的错法是 fail-open(对话框不弹)。
+    d.slots.some((s) => s.ckptCount > 0 || s.runs.some(startedRun));
 
   const addFilesTo = async (speaker?: string) => {
     const picked = await open({
@@ -508,24 +518,14 @@ export function ProjectDetail() {
   const blocked = !!detail.needsAttention;
   const sovitsSlot = slots.get("sovits");
   /** ★§F2⒝ 批 2 ④ —— 浅扩散跑在**主模型那个 run** 里(`runs/<主 run>/diffusion/`),所以这张
-   *  卡问的是「哪个 run 里有主模型」。
-   *
-   *  ⛔★★S133 —— **这句话原本写的是「这条 `find` 是一个肯定事实,不是『挑第一个』」,而它现在
-   *  是假的。** 那个说法成立的前提是「**至多一个** run 有主模型」,而 ④e 的 flip 让「再训一个」
-   *  真的铸第二个 run:两个 run 都练出主模型之后,`find` 返回的是 `list_runs` 的排序(按 run id
-   *  的**字典序**)里的第一个 —— 一个与「用户想挂到哪个」毫无关系的答案,而这张卡会据此
-   *  显示版本、步数,并把它当宿主开训。
-   *  ⇒ 真正的修法是给这张卡一个 run 选择器,那是 **B2-⑤**(队列里已排,带笔序与判据)。
-   *  在那之前这里**保持现状**并说真话:留一条会背书错改动的假注释,是本轮花了一整轮清理的那类东西。 */
-  const diffHost =
-    sovitsSlot?.runs.find((r) => r.info.has_main_progress) ?? sovitsSlot?.runs[0];
-  /** The ContentVec space this project's sovits slot is already committed to, if any. Shallow
-   *  diffusion trains on that slot's cached features, so a manifest version PINS it. */
-  const sovitsVersionPinned =
-    diffHost?.info.version === "4.1" || diffHost?.info.version === "4.0"
-      ? diffHost.info.version
-      : undefined;
-  const diffSteps = diffHost?.info.diff_steps ?? 0;
+   *  卡问的是「哪个 run 里有主模型」。决策与它的全部说明在 `lib/training/slotRows.ts`;
+   *  ⛔ S141 §E2E-M4 把它搬出组件体,是因为写在这里的表达式 vitest 结构上够不着 ——
+   *  那条「两个 run 都有主模型时它挑的是字典序第一个」的已知歧义,此前只有一段注释在守,
+   *  现在是 `withMainProgress` 这个可断言的数(行为仍然保持现状,改它是 B2-⑤)。 */
+  const diff = pickDiffHost(sovitsSlot);
+  const diffHost = diff.host;
+  const sovitsVersionPinned = diff.pinnedVersion;
+  const diffSteps = diff.steps;
 
   return shell(
     <>
@@ -698,25 +698,14 @@ export function ProjectDetail() {
             // 与改动前几乎相同;形状先变复数,是因为回答「这个 run 练到哪了」的解析器在两个
             // run 之后**拒绝作答**,而四个槽是经同一个 `Result` 收上来的。
             const runs = slot?.runs ?? [];
-            const startedRun = (r: RunDetail) => r.hasResumePoint || r.info.has_main_progress;
-            /** ⛔★★§F2⒝ ④e —— 画哪几行。
-             *
-             *  此前是 `runs.filter(startedRun)`,而 flip 之后那条过滤会**结构性**地藏起最需要
-             *  被删的那一类:`run_manifest.json` 在 spawn **之前**就写好,随后的切片/f0/特征要
-             *  跑几小时 —— 中途崩/强停/盘满留下的就是一个**有目录、有 manifest、没有断点**的
-             *  run。它两个条件都假 ⇒ 零行零按钮,却
-             *  ⑴ 计进 `runs.length` 的徽标(卡片写「2 个 run」而下面只有 1 行);
-             *  ⑵ 计进 `list_runs`(那个槽从此每一次探针都要靠 runId);
-             *  ⑶ 计进 `SlotDetail.bytes`(盘看得见、删不掉);
-             *  ⑷ ★ 它是一个**满强度的冻结源** —— manifest 里有 `speakers` ⇒ 整个项目的数据集
-             *     被它锁着,而卡片上写着「尚未开始」。同一屏两句话互相打脸,而且新文案里
-             *     「去逐个 run 删掉」的指引对它**执行不下去**。
-             *  ⇒ 真正的 run(`id` 非空)一律画出来。只有那条 `id === ""` 的伪造行(后端在**零
-             *  run** 时补的,寻址**槽根**)仍然按「练出过东西」过滤 —— 那种槽本来就没有 run 可挑。 */
-            const visibleRuns = runs.filter((r) => r.id !== "" || startedRun(r));
+            /** ⛔★★§F2⒝ ④e —— 画哪几行。机理与「为什么真 run 一律画、只有 `id === ""` 的
+             *  伪造行按练没练过滤」的全部说明在 `lib/training/slotRows.ts`(S141 §E2E-M3 把它
+             *  搬出组件体:写在这里的表达式没有导出,vitest 结构上够不着,变异会存活)。 */
+            const rows = visibleRuns(runs);
             // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
             // 同时「尚未开始」的自相矛盾。
-            const started = visibleRuns.length > 0;
+            const started = slotStarted(runs);
+            const prepPools = prepPoolLine(slot);
             return (
               <div key={f} className={`tproj-slot ${started ? "started" : ""}`}>
                 <div className="tproj-slot-head">
@@ -734,7 +723,7 @@ export function ProjectDetail() {
                   </div>
                 )}
                 {/* ── 每个 run 一行 ─────────────────────────────────────────── */}
-                {visibleRuns.map((r) => (
+                {rows.map((r) => (
                   <div key={r.id} className="tproj-run">
                     <div className="tproj-run-head">
                       <span className="tproj-run-name">
@@ -828,12 +817,12 @@ export function ProjectDetail() {
                     deletes the previous products, so without this line the disk would simply
                     grow with no explanation anywhere in the app. SLOT-level: the pool is shared
                     by every run of it, which is the entire point of layout 2. */}
-                {(slot?.prepPoolCount ?? 0) > 0 && (
+                {prepPools.show && (
                   <div className="tproj-slot-facts">
                     <span title={t("training.slotPrepPoolsHint")}>
                       {t("training.slotPrepPools", {
-                        count: slot?.prepPoolCount ?? 0,
-                        size: fmtSize(slot?.prepPoolBytes ?? 0),
+                        count: prepPools.count,
+                        size: fmtSize(prepPools.bytes),
                       })}
                     </span>
                   </div>
