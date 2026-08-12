@@ -254,7 +254,7 @@ def build_cases():
     ]
 
 
-def run_case(name, mod, make, want, needle, mode="normal"):
+def run_case(name, mod, make, want, needle, mode="normal", extra_argv=()):
     td = tempfile.mkdtemp(prefix="gate1_negctl_")
     try:
         over, paths = make(td)
@@ -263,6 +263,13 @@ def run_case(name, mod, make, want, needle, mode="normal"):
         if mode == "stale":
             for p in paths:
                 touch(p, t0 - 86400)
+        elif mode.startswith("skip_orig"):
+            # ⛔ `--skip-orig` 那一跑里参照侧**本来就不是本轮的** ⇒ 它该走 declare_frozen
+            #    + note_uncovered(结论是 exit 3 或 PASS-WITH-GAPS),**不许是干净的绿**,
+            #    也不许被新鲜度当成一条陈货红。paths[0] 恒为参照侧(五条链的夹具都这么排)。
+            touch(paths[0], t0 - 86400)
+            for p in paths[1:]:
+                touch(p, now)
         else:
             for p in paths:
                 touch(p, now)
@@ -286,11 +293,14 @@ def run_case(name, mod, make, want, needle, mode="normal"):
             f.write(RUNNER)
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         env.pop(G1.SKIPPED_ENV, None)
+        if mode.startswith("skip_orig"):
+            env[G1.SKIPPED_ENV] = "orig"
         if mode != "no_t0":
             env[G1.T0_ENV] = "%.3f" % t0
         else:
             env.pop(G1.T0_ENV, None)
-        p = subprocess.run([sys.executable, "-u", rp, HERE, mod, json.dumps(over)],
+        p = subprocess.run([sys.executable, "-u", rp, HERE, mod, json.dumps(over)]
+                           + list(extra_argv),
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", env=env, timeout=600)
         body = (p.stdout or "") + (p.stderr or "")
@@ -334,6 +344,19 @@ def main():
                              ("missing", "不在"), ("two_events", "events 文件")):
             r = run_case("%s/%s" % (label, mode), mod, lambda td, f=fx: f(td), 3, needle,
                          mode=mode)
+            if r:
+                fails.append(r)
+
+    # ── ⛔ `--skip-orig` 那条路:S139 **自己新造的分支**,而第一版的 40 条对照
+    #    把 GATE1_SKIPPED 清掉了 ⇒ 它一次没被执行过 = S129 说的空判据。补上。
+    #    两条一起才是判据:不放行 ⇒ exit 3(**不许是干净的绿**);显式放行 ⇒ PASS-WITH-GAPS 退 0。
+    _say("")
+    for label, mod, fx in per_chain:
+        for extra, want, needle in (((), 3, "零覆盖"),
+                                    (("--allow-uncovered",), 0, "PASS-WITH-GAPS")):
+            nm = "%s/--skip-orig%s" % (label, " +放行" if extra else "")
+            r = run_case(nm, mod, lambda td, f=fx: f(td), want, needle,
+                         mode="skip_orig", extra_argv=extra)
             if r:
                 fails.append(r)
 
