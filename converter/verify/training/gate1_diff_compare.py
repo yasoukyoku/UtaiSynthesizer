@@ -66,6 +66,8 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig logs", ORIG_DIR), ("ours logs", OURS_DIR)])
+    G1.say_input_identity([("orig", os.path.dirname(ORIG_DIR)),
+                           ("ours", os.path.dirname(OURS_DIR))])
 
     tags = ["train/loss", "validation/loss"]
     orig = G1.tb_scalars(

@@ -28,7 +28,10 @@ OURS_EXP = os.path.join(TESTING, "gate1_sovits_v2_ours")
 GATE_CFG = os.path.join(TESTING, "gate1_sovits_v2_config.json")
 BASE_DIR = os.path.join(REPO, "data", "models", "training", "sovits_v2")
 
-sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
+# ⚠ `gate1_guard` 在 import 时把 stdout **与 stderr** 都钉成 UTF-8;原来这里只钉了 stdout,
+#   而这个文件的断言(中文)走的是 stderr —— 本机 locale 是 cp932。
 
 
 def main():
@@ -75,12 +78,21 @@ def main():
     )
     print("aam80 -> mel.npy for the upstream lazy cache: %d new, %d refreshed" % (fresh, refreshed))
 
+    # ⛔ S139 输入身份:这条链的输入是 gate0(v2)的 dataset_44k/gate ——
+    #    见 gate1_guard 的「输入身份」一段。**必须在 rmtree 之前算**。
+    ident = G1.src_identity("gate1/sovits_v2 的输入(gate0 v2 的 dataset_44k/gate)",
+                            spk_dir, [""], min_files=10)
+    for n in ("G_0.pth", "D_0.pth"):
+        if not os.path.isfile(os.path.join(BASE_DIR, n)):
+            raise G1.GateUnrunnable("底模缺 %s:%s" % (n, BASE_DIR))
+
     for exp in (ORIG_EXP, OURS_EXP):
         if os.path.isdir(exp):
             shutil.rmtree(exp)
         os.makedirs(exp, exist_ok=True)
         for n in ("G_0.pth", "D_0.pth"):
             shutil.copyfile(os.path.join(BASE_DIR, n), os.path.join(exp, n))
+        G1.write_input_identity(exp, ident)
     # ours reads config from its exp dir (train() contract)
     shutil.copyfile(GATE_CFG, os.path.join(OURS_EXP, "config.json"))
 
@@ -90,4 +102,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    G1.run("gate1_sovits_v2_prepare", main)

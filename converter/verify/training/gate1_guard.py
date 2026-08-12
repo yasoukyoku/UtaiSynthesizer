@@ -320,6 +320,153 @@ def note_clamped(label, clamped, total, limit_frac=0.5):
             % (label, len(clamped), total, limit_frac * 100))
 
 
+# ────────────────────────────────────────────────────────────── 输入身份
+#
+# ⛔⛔ 立项理由(S139 实测,不是推的):`gate1_prepare.py:22` 的 `SRC = rvc_ours` 是
+#    **gate0 的产物目录**,而它在 **2026-08-11 20:23** 被 S135 的 gate0 整棵重写过
+#    (263 个文件全部落在 20:23:44–20:23:53 的 9 秒里);而 S134 那次 gate1 是当天
+#    **09:04** 跑的 —— 拷进 `gate1_ours` 的 `2a_f0/2b-f0nsf/3_feature768` 至今还带着
+#    **07-05** 的 mtime。⇒ **S134 那次 gate1 PASS 背后的树今天不在盘上了,
+#    而没有任何东西记录或检查过这一点。**
+#    ⚠ 交接把这条写成「树不在了」;严格说**内容可能没变**(S135 逐件对拍报过
+#      rvc_ours 262/262 IDENTICAL)——但那次对拍属于 **17:57 那笔**,管不到 20:23 这一次。
+#      ⇒ 准确措辞是「**今天没有任何证据说 20:23 那次只改了 mtime**」。这正是要记身份的理由。
+#
+# ⛔ 载体**不许**复用 `dataset.fingerprint` 这个文件名:它是**跨语言契约** ——
+#    `tpool.rs:70 FINGERPRINT` 被三处池选择读、`mod.rs:756-773` 按 `|` 分词解析、
+#    而 `mod.rs:844-856` 把「这个文件在不在」当成**擦除同意判据**(preprocessing counts as work)
+#    ⇒ 往 gate 夹具里放一个同名文件,会让 Rust 扫描器把它读成一个有活的训练槽。
+# ⛔ 公式也**不许**用 `cache.dataset_fingerprint`:它是 blake2b(名+size+头尾 64KB),
+#    S139 实测**对中段改动是瞎的**(在 565376 字节的特征文件 offset 282688 翻一位 ⇒ 指纹不变),
+#    而且对 rvc_ours 直接抛 `DATASET_SHAPE_UNEXPECTED`。⇒ 走 `gate0_guard.dirhash`(全字节)。
+IDENTITY_FILE = "gate1_input.identity.json"
+
+
+def src_identity(label, root, subs, min_files, suffixes=None):
+    """在**任何破坏性动作之前**验证源树完整,并算出它的身份。
+
+    ⛔ 顺序是承重的(S139 实测):五个 `*_prepare.py` 里有四个是 **rmtree 在断言之前** ——
+       只缺一个子目录,就会留下「参照侧 1.39 GB 已经没了 + 只重建了一半」的残局,
+       而跑器报的是 PREPARE-FAILED(归因是对的,东西已经没了)。
+       ⇒ 这个函数就是那条要被前移的断言,顺带白拿一份身份。
+    """
+    import json                                        # noqa: F401  (给 write 用)
+    items = G.collect(root, subs, suffixes)
+    if len(items) < min_files:
+        raise GateUnrunnable(
+            "%s: 源树只有 %d 件(下限 %d),root=%s subs=%s\n"
+            "       ⛔ 这条断言**必须**跑在第一句 rmtree 之前 —— 否则失败留下的是"
+            "「参照侧已经删了、只重建了一半」的残局。" % (label, len(items), min_files, root, subs))
+    missing = [s for s in subs if s and not os.path.isdir(os.path.join(root, s))]
+    if missing:
+        raise GateUnrunnable("%s: 源树缺子目录 %s(root=%s)" % (label, missing, root))
+    # ⛔ 合计件数下限**挡不住整整一个子目录变空**(S135 的 M12 在 gate0 上量过同一件事:
+    #    sovits 那条写 MIN_SLICES*4=120 而目录里是 33×5=165 ⇒ 少一整类仍达标)。⇒ 逐个判。
+    empty_subs = [s for s in subs
+                  if len(G.collect(root, [s], suffixes)) == 0]
+    if empty_subs:
+        raise GateUnrunnable(
+            "%s: 源树的这些子目录**是空的**:%s(root=%s)\n"
+            "       ⇒ 合计件数够不代表每一类都在。" % (label, empty_subs, root))
+    import time as _t
+    sha = dirhash(root, subs, suffixes)
+    total = sum(os.path.getsize(p) for p, _m in items)
+    newest = max(m for _p, m in items)
+    ident = {
+        "root": root, "subs": list(subs), "files": len(items), "bytes": total,
+        "dirhash_sha256": sha,
+        "src_newest_mtime": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(newest)),
+        "recorded_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _say("[INPUT] %s: %d 件 / %.1f MB / sha %s / 源最新 mtime %s"
+         % (label, len(items), total / 1e6, sha[:16], ident["src_newest_mtime"]))
+    return ident
+
+
+def src_identity_files(label, paths, min_files):
+    """同上,但源是一份**显式文件清单**(sovits 那两条链的输入是 filelist 里的绝对路径)。
+
+    ⛔ 顺带就是那条「filelist 里的路径必须都在」的断言 —— 而它在 `gate1_sovits_prepare.py`
+       原来排在 `rmtree` **之后**(:53 vs :39)。
+    """
+    import hashlib
+    import time as _t
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise GateUnrunnable(
+            "%s: filelist 里有 %d 条路径不在盘上,例如 %s\n"
+            "       ⛔ 这条断言**必须**跑在第一句 rmtree 之前。" % (label, len(missing), missing[:3]))
+    if len(paths) < min_files:
+        raise GateUnrunnable("%s: 只有 %d 条(下限 %d)" % (label, len(paths), min_files))
+    h = hashlib.sha256()
+    total = newest = 0
+    for p in sorted(paths):
+        h.update(os.path.basename(p).encode("utf-8"))
+        total += os.path.getsize(p)
+        newest = max(newest, os.path.getmtime(p))
+        with open(p, "rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""):
+                h.update(c)
+    ident = {
+        "root": "(filelist)", "subs": [], "files": len(paths), "bytes": total,
+        "dirhash_sha256": h.hexdigest(),
+        "src_newest_mtime": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime(newest)),
+        "recorded_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _say("[INPUT] %s: %d 件 / %.1f MB / sha %s / 源最新 mtime %s"
+         % (label, len(paths), total / 1e6, ident["dirhash_sha256"][:16],
+            ident["src_newest_mtime"]))
+    return ident
+
+
+def write_input_identity(exp_dir, ident):
+    """把身份落进这一侧的 expdir。⛔ 用 tmp + os.replace(照 `pool.py:281-287` 的理由:
+    半个文件比没有文件更坏)。"""
+    import json
+    os.makedirs(exp_dir, exist_ok=True)
+    p = os.path.join(exp_dir, IDENTITY_FILE)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ident, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, p)
+
+
+def read_input_identity(exp_dir):
+    import json
+    p = os.path.join(exp_dir, IDENTITY_FILE)
+    if not os.path.isfile(p):
+        return None
+    try:
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def say_input_identity(exp_dirs):
+    """把「这一轮的输入是哪一次 gate0 产的」打进读数头。
+
+    ⛔ 缺席时**响亮说明**,不许安静 —— 「没有记录」和「记录说一切正常」必须长得不一样。
+    """
+    seen = []
+    for label, d in exp_dirs:
+        ident = read_input_identity(d)
+        if ident is None:
+            _say("  [NO-INPUT-ID] %-10s 这一侧没有输入身份记录(它由 prepare 写;"
+                 "本轮或上一轮没跑 prepare)⇒ **说不出这份产物是哪一棵 gate0 树喂出来的**"
+                 % label)
+        else:
+            _say("  [INPUT-ID] %-10s sha %s / %d 件 / 源最新 mtime %s / 记于 %s"
+                 % (label, ident.get("dirhash_sha256", "?")[:16], ident.get("files", -1),
+                    ident.get("src_newest_mtime", "?"), ident.get("recorded_at", "?")))
+            seen.append((label, ident.get("dirhash_sha256")))
+    if len(seen) == 2 and seen[0][1] != seen[1][1]:
+        raise GateUnrunnable(
+            "两侧的输入身份**不同**:%s=%s vs %s=%s\n"
+            "       ⇒ 两侧吃的不是同一棵树 ⇒ 这一轮的对拍没有意义(而它会长得像数值不一致)。"
+            % (seen[0][0], seen[0][1][:16], seen[1][0], seen[1][1][:16]))
+
+
 def header(gate_name, chain, sides):
     """读数头 —— ⛔ 绿必须自陈它这一轮到底量了什么(gate0_guard.finish 的同一条纪律)。"""
     _say("=" * 72)
@@ -459,6 +606,43 @@ def _selftest():
         os.utime(jp, (now - 86400, now - 86400))
         expect_unrunnable("jsonl_steps(陈货)",
                           lambda: jsonl_steps("st", jp, "g_total", now))
+
+        # 7) 输入身份:算 / 落盘 / 读回 / 两侧不同 / 缺席时响亮但不抛
+        src = os.path.join(tmp, "src")
+        for sub in ("a", "b"):
+            os.makedirs(os.path.join(src, sub), exist_ok=True)
+            for i in range(3):
+                with open(os.path.join(src, sub, "f%d.npy" % i), "wb") as f:
+                    f.write(b"payload-%d" % i)
+        ident = src_identity("st/输入", src, ["a", "b"], min_files=6)
+        expect_unrunnable("src_identity(件数不够)",
+                          lambda: src_identity("st/少", src, ["a", "b"], min_files=99),
+                          because="下限")
+        expect_unrunnable("src_identity(缺子目录)",
+                          lambda: src_identity("st/缺", src, ["a", "zzz"], min_files=1),
+                          because="缺子目录")
+        os.makedirs(os.path.join(src, "empty"), exist_ok=True)
+        expect_unrunnable("src_identity(某个子目录是空的)",
+                          lambda: src_identity("st/空子目录", src, ["a", "empty"], min_files=1),
+                          because="是空的")
+        d1, d2 = os.path.join(tmp, "exp1"), os.path.join(tmp, "exp2")
+        write_input_identity(d1, ident)
+        write_input_identity(d2, ident)
+        back = read_input_identity(d1)
+        if not back or back["dirhash_sha256"] != ident["dirhash_sha256"]:
+            fails.append("输入身份落盘/读回对不上")
+        else:
+            _say("  ok   输入身份(落盘 -> 读回)-> sha 一致")
+        expect_ok("say_input_identity(两侧相同)",
+                  lambda: say_input_identity([("orig", d1), ("ours", d2)]))
+        other = dict(ident, dirhash_sha256="deadbeef" * 8)
+        write_input_identity(d2, other)
+        expect_unrunnable("say_input_identity(两侧输入身份不同)",
+                          lambda: say_input_identity([("orig", d1), ("ours", d2)]),
+                          because="不同")
+        # ⛔ 缺席必须**响亮但不抛**:它是「今天没有记录」而不是「记录说出了问题」
+        expect_ok("say_input_identity(缺席 ⇒ 响亮说明,不抛)",
+                  lambda: say_input_identity([("orig", os.path.join(tmp, "nope"))]))
     finally:
         os.environ.pop("GATE0_T0", None)
         if old_t0 is not None:

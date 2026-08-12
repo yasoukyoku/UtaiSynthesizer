@@ -25,7 +25,11 @@ import pathlib
 import shutil
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+import os                                                       # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
+# ⚠ guard 在 import 时把 stdout **与 stderr** 都钉成 UTF-8(原来这里只钉了 stdout)
 
 import yaml
 
@@ -79,12 +83,26 @@ def gate_config():
 
 
 def main():
+    # ⛔⛔ S139:前置断言 + 输入身份,全部跑在第一句 rmtree 之前。
+    #    ⚠ 这条链的 orig 侧 expdir **不在这里**(在上游树 `SingingVocoders\experiments\gate1_voc`,
+    #      由 `gate1_vocoder_run_orig.py:75-77` 自清)—— 那是**设计**不是缺陷,别去「修 prepare」:
+    #      正因为 run_orig 自清,声码器是五条链里**唯一免疫「忘了跑 prepare ⇒ 参照侧续训」**的一条。
+    if not SLICES.is_dir() or not any(SLICES.iterdir()):
+        raise G1.GateUnrunnable(
+            "声码器的输入切片不在 / 是空的:%s\n"
+            "       ⛔ gate0/gate1 里**没有任何脚本能重建它**(它是声码器冒烟的产物)。" % SLICES)
+    if not PRETRAIN.is_file():
+        raise G1.GateUnrunnable("声码器底模不在:%s" % PRETRAIN)
+    ident = G1.src_identity("gate1/vocoder 的输入(冒烟切片,不可再生)",
+                            str(SLICES), [""], min_files=5)
+
     GATE.mkdir(parents=True, exist_ok=True)
     for sub in ("ours", "orig"):
         d = GATE / sub
         if d.exists():
             shutil.rmtree(d)
         d.mkdir()
+        G1.write_input_identity(str(d), ident)
 
     cfg = gate_config()
 
@@ -111,4 +129,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    G1.run("gate1_vocoder_prepare", main)

@@ -47,6 +47,8 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
+    G1.say_input_identity([("orig", ORIG_TB_DIR),
+                           ("ours", r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours")])
 
     orig = G1.tb_scalars(
         "orig/TB", ORIG_TB_DIR, [t for t, _k in PAIRS], t0,

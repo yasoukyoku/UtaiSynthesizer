@@ -53,6 +53,10 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
+    # ⛔ 「这一轮的输入是哪一次 gate0 产的」—— 由 prepare 记下,这里读出来并**两侧对拍**。
+    #    缺席时响亮说明(见 gate1_guard.say_input_identity)。
+    G1.say_input_identity([("orig", ORIG_TB_DIR),
+                           ("ours", r"D:\MyDev\TESTING\utai-v2-testing\gate1_ours")])
 
     orig = G1.tb_scalars(
         "orig/TB", ORIG_TB_DIR, [t for t, _k, _c in PAIRS], t0,

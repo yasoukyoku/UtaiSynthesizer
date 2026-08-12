@@ -23,8 +23,12 @@ NB re-running WIPES both expdirs (like the S38 sovits gate1 prepare).
 import os
 import random
 import shutil
+import sys
 
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
 
 UTAI = r"D:\MyDev\Utai_v2-dev"
 SOVITS = r"D:\MyDev\so-vits-svc\so-vits-svc"
@@ -83,9 +87,18 @@ def make_yaml(expdir, flist_dir):
 
 
 def main():
-    assert os.path.isfile(os.path.join(DATA, "000_000.wav.mel.npy")), (
-        "gate0_diff our-side products missing — run gate0_diff_run_ours.py first"
-    )
+    if not os.path.isfile(os.path.join(DATA, "000_000.wav.mel.npy")):
+        raise G1.GateUnrunnable(
+            "gate0_diff 我方侧产物缺席(%s)—— 先跑 gate0_diff_run_ours.py。\n"
+            "       ⚠ 原来这里是裸 assert:消息是中文、走 stderr,而本机 locale 是 cp932"
+            "(重定向/管道下它自己会 UnicodeEncodeError),而退出码同样是 1 = 真红的码。" % DATA)
+    # ⛔ S139 输入身份 —— 见 gate1_guard 的「输入身份」一段。
+    #    ⭐ 这条链是五个 prepare 里**唯一原本就把断言排在 rmtree 之前**的,别把它改坏。
+    ident = G1.src_identity("gate1/diff 的输入(gate0 的 diff_ours/gate)", DATA, [""],
+                            min_files=10)
+    if not os.path.isfile(BASE):
+        raise G1.GateUnrunnable("底模缺:%s" % BASE)
+
     flist_dir = os.path.join(TESTING, "gate1_diff_filelists")
     n_train, n_val = build_filelists(flist_dir)
     print(f"filelists: {n_train} train / {n_val} val")
@@ -96,6 +109,7 @@ def main():
             shutil.rmtree(expdir)
         os.makedirs(expdir)
         shutil.copyfile(BASE, os.path.join(expdir, "model_0.pt"))
+        G1.write_input_identity(expdir, ident)
         print(f"seeded base -> {expdir}")
 
     with open(
@@ -112,4 +126,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    G1.run("gate1_diff_prepare", main)

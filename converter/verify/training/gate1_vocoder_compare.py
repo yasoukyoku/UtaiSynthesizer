@@ -70,6 +70,10 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig logs", ORIG_LOGS), ("ours logs", OURS_LOGS)])
+    # ⚠ 身份记在 prepare 造的 GATE/{orig,ours} 里 —— 而 orig 侧的 **expdir** 在上游树
+    #   (`SingingVocoders\experiments\gate1_voc`,由 run_orig 自清),两者不是一个地方。
+    G1.say_input_identity([("orig", os.path.join(GATE_ROOT, "orig")),
+                           ("ours", os.path.join(GATE_ROOT, "ours"))])
 
     exp = G1.EXPECT[CHAIN]
     if len(REQUIRED_TAGS) != exp["tags"]:

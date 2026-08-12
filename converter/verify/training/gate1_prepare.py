@@ -15,7 +15,10 @@ import os
 import shutil
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
+# ⚠ `gate1_guard` 在 import 时就把 stdout/stderr 钉成 UTF-8(见 gate0_guard 头注第四条)——
+#   这一行原来是 `sys.stdout.reconfigure(...)`,只钉了 stdout,而这个文件的断言走的是 stderr。
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 TESTING = r"D:\MyDev\TESTING\utai-v2-testing"
@@ -57,19 +60,39 @@ def write_config(dst_exp):
 
 
 def main():
+    # ⛔⛔ S139:**全部前置断言 + 输入身份,都要跑在第一句 rmtree 之前。**
+    #    `copy_artifacts` 的 `rmtree(dst)` 一执行,`RVC\logs\gate1`(1.39 GB)与
+    #    `gate1_ours`(2.93 GB)就没了 —— 而原来只缺一个子目录就会在 copytree 中途
+    #    FileNotFoundError,留下「参照侧已经删了、只重建了一半」的残局(S139 实测:
+    #    只缺 `3_feature768` ⇒ 退 1,而原版侧落点已残留 12 件 / 5 个子目录只建了 3 个)。
+    #    ⚠ 五个 prepare 里只有 `gate1_diff_prepare.py` 原本就把断言放在 rmtree 之前。
+    ident = G1.src_identity("gate1/rvc 的输入(= gate0 的 rvc_ours)", SRC, SUBDIRS,
+                            min_files=200)
+    for extra in ("filelist.txt", "config.json"):
+        if not os.path.isfile(os.path.join(SRC, extra)):
+            raise G1.GateUnrunnable("gate1/rvc 的输入缺 %s:%s" % (extra, SRC))
+
     for exp in (ORIG_EXP, OURS_EXP):
         copy_artifacts(exp)
         n = rewrite_filelist(exp)
         write_config(exp)
+        # ⛔ 记下**这一轮的输入是哪一棵 gate0 树** —— 见 gate1_guard 的「输入身份」一段:
+        #    `rvc_ours` 在 2026-08-11 20:23 被整棵重写过,而 S134 那次 gate1 是当天 09:04 跑的,
+        #    此前**没有任何东西记录或检查这一点**。
+        G1.write_input_identity(exp, ident)
         print(f"prepared {exp}: {n} filelist entries")
+
     # 抽查两侧行序一致（样本名序列必须逐行相同）
     def sample_names(exp):
         with open(os.path.join(exp, "filelist.txt"), encoding="utf-8") as f:
             return [l.split("|")[0].rsplit("/", 1)[-1] for l in f.read().splitlines() if l]
 
-    assert sample_names(ORIG_EXP) == sample_names(OURS_EXP), "两侧样本顺序不一致"
+    if sample_names(ORIG_EXP) != sample_names(OURS_EXP):
+        # ⛔ 原来是裸 assert:AssertionError 走 stderr、消息是中文、本机 locale 是 cp932
+        #    ⇒ 在重定向/管道下它自己会 UnicodeEncodeError,而退出码同样是 1 = 真红的码。
+        raise G1.GateUnrunnable("两侧样本顺序不一致 —— 这是【闸没准备好】,不是被测的东西不对")
     print("sample order identical:", len(sample_names(ORIG_EXP)), "entries")
 
 
 if __name__ == "__main__":
-    main()
+    G1.run("gate1_prepare (RVC)", main)

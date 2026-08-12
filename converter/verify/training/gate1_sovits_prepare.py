@@ -13,6 +13,9 @@ import os
 import shutil
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
+
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 TESTING = r"D:\MyDev\TESTING\utai-v2-testing"
 SOVITS = r"D:\MyDev\so-vits-svc\so-vits-svc"
@@ -34,26 +37,35 @@ def main():
     with open(GATE_CFG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
+    # ⛔⛔ S139:这条「filelist 里的路径必须都在」的断言原来排在 **rmtree 之后**(:53 vs :39)
+    #    ⇒ 一次失败留下的是「两侧 expdir 已经删了、只铺了底模」的残局。全部前移。
+    #    顺带白拿一份**输入身份** —— 见 gate1_guard 的「输入身份」一段:
+    #    这两条链的输入是 gate0 我方侧产物,而 gate0 重跑一次就换了一棵树,
+    #    此前没有任何东西记录或检查这一点。
+    paths = []
+    for lst in ("training_files", "validation_files"):
+        for line in open(cfg["data"][lst], encoding="utf-8"):
+            p = line.strip()
+            if p:
+                paths.append(p)
+    ident = G1.src_identity_files("gate1/sovits 的输入(filelist 指向的 gate0 产物)",
+                                  paths, min_files=10)
+    for n in ("G_0.pth", "D_0.pth"):
+        if not os.path.isfile(os.path.join(OURS_G0, n)):
+            raise G1.GateUnrunnable("底模缺 %s:%s" % (n, OURS_G0))
+
     for d in (ORIG_DIR, OURS_DIR):
         if os.path.isdir(d):
             shutil.rmtree(d)
         os.makedirs(d)
         shutil.copyfile(os.path.join(OURS_G0, "G_0.pth"), os.path.join(d, "G_0.pth"))
         shutil.copyfile(os.path.join(OURS_G0, "D_0.pth"), os.path.join(d, "D_0.pth"))
+        G1.write_input_identity(d, ident)
     # ours side reads exp_dir/config.json
     shutil.copyfile(GATE_CFG, os.path.join(OURS_DIR, "config.json"))
 
-    # sanity: filelist entries must exist (both sides will read them)
-    missing = []
-    for lst in ("training_files", "validation_files"):
-        for line in open(cfg["data"][lst], encoding="utf-8"):
-            p = line.strip()
-            if p and not os.path.exists(p):
-                missing.append(p)
-    assert not missing, "filelist 路径缺失: %s" % missing[:3]
     print("prepared:", ORIG_DIR, "and", OURS_DIR)
-    sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    G1.run("gate1_sovits_prepare", main)
