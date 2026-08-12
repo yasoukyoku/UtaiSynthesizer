@@ -143,6 +143,47 @@ def _refuse(msg):
     sys.exit(5)
 
 
+# ⛔ S139(§F7 笔 F)—— S135 立的那条,而当时写着「**今天没有任何闸在检查这一点**」:
+#    `f1f0347` 之后 `gate_dataset` 是一个**「不许有任何 `.part`」的受保护目录**。
+#    机理:我方的 `utai_train.cache.dataset_entries()` **跳过** `.part`(那一笔的全部内容),
+#    而**上游的枚举永远不跳** ⇒ 目录里出现一个 `.part`,两侧当场吃的就不是同一批文件,
+#    而 gate0 会把它报成一条**数值差** —— 一条由夹具造成的红,被归因成我们的代码。
+#    ⚠ 同族还有「非 .wav 的杂物」:上游 preprocess 对非音频文件的行为与我方不一定一致。
+GATE_DATASET = os.path.join(TESTING, "gate_dataset")
+
+
+def assert_dataset_clean(root=None):
+    """开跑前断言:数据集目录里只有 .wav,且**一个 `.part` 都没有**。
+
+    返回 (件数, 总字节)。⛔ 空目录同样拒绝 —— 空集不是通过。
+    """
+    root = root or GATE_DATASET
+    if not os.path.isdir(root):
+        _refuse("数据集目录不在:%s" % root)
+    names = sorted(os.listdir(root))
+    parts = [n for n in names if n.endswith(".part")]
+    if parts:
+        _refuse("⛔ `%s` 里有 %d 个 `.part`:%s\n"
+                "          我方 `cache.dataset_entries()` 会**跳过**它们,而上游的枚举**永远不跳**\n"
+                "          ⇒ 两侧当场吃的不是同一批文件,而 gate0 会把它报成一条【数值差】。\n"
+                "          (这条判据是 S135 记下、S139 补上的:在此之前没有任何闸在看它)"
+                % (root, len(parts), parts[:5]))
+    others = [n for n in names
+              if not n.lower().endswith(".wav") and os.path.isfile(os.path.join(root, n))]
+    if others:
+        _refuse("`%s` 里有非 .wav 的文件:%s —— 两侧对它们的枚举行为不保证一致" % (root, others[:5]))
+    wavs = [n for n in names if n.lower().endswith(".wav")]
+    if not wavs:
+        _refuse("`%s` 里一个 .wav 都没有 —— 空集不是通过" % root)
+    total = sum(os.path.getsize(os.path.join(root, n)) for n in wavs)
+    empty = [n for n in wavs if os.path.getsize(os.path.join(root, n)) == 0]
+    if empty:
+        _refuse("`%s` 里有 0 字节的 wav:%s(崩在写一半 / 占位)" % (root, empty))
+    print("[DATASET] %s:%d 个 wav / %.1f MB,无 .part、无杂物、无 0 字节"
+          % (root, len(wavs), total / 1e6))
+    return len(wavs), total
+
+
 def do_clear(chain, dry):
     paths = CLEAR[chain]
     if not paths:
@@ -223,7 +264,8 @@ def run_chain(chain, runs_root, t0, do_clear_first, dry, only_clear=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("chain", choices=sorted(CHAINS) + ["all"])
+    # nargs="?" —— 让 `--selftest` 不必再给一条链(S139:自检不跑任何链)
+    ap.add_argument("chain", nargs="?", choices=sorted(CHAINS) + ["all"])
     ap.add_argument("--clear", action="store_true",
                     help="跑之前先删掉那几个没人会清的 skip-if-exists 产物目录(白名单内)")
     ap.add_argument("--dry-run", action="store_true", help="只打印会删什么、会跑什么")
@@ -235,7 +277,17 @@ def main():
                     help="显式指定 t0(epoch 秒)。一般不用 —— 默认会复用本次 gate0 会话的 t0")
     ap.add_argument("--new-session", action="store_true",
                     help="重新起一个 gate0 会话(丢弃 <runs>/T0.txt 里记的 t0)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="阴性对照:把开跑前断言与清货白名单的每一条拒绝分支真触发一次")
     args = ap.parse_args()
+
+    if args.selftest:
+        sys.exit(_selftest())
+    if not args.chain:
+        _refuse("要跑哪条链?%s(或 all);只想跑自检用 --selftest" % ", ".join(sorted(CHAINS)))
+
+    # ⛔ S139:开跑前断言,先于清货与任何一段 —— 见 assert_dataset_clean 的头注。
+    assert_dataset_clean()
 
     os.makedirs(args.runs, exist_ok=True)
 
@@ -274,9 +326,15 @@ def main():
         # 让 t0 严格早于任何产物 —— 文件系统时间戳的分辨率与时钟漂移都可能让
         # "同一秒产出的文件" mtime 略早于 t0,那会报成一条假的"陈货"。
         t0 = time.time() - 2.0
-        with open(t0_file, "w", encoding="utf-8") as f:
-            f.write("%.3f\n" % t0)
-        print("GATE0_T0 = %.3f (新会话,已记入 %s)" % (t0, t0_file))
+        # ⛔ S139:`--dry-run` **不许写盘**。此前它照样 stamp 一个新 t0 并覆盖 T0.txt ——
+        #    一次「只说不做」的调用改掉了整场会话的新鲜度基准,而那正是这份文件里
+        #    花一整笔(S135 二审)买来的东西。S139 跑 `rvc --dry-run` 时当场踩到并修。
+        if args.dry_run:
+            print("GATE0_T0 = %.3f (新会话;⚠ --dry-run ⇒ **没有**写进 %s)" % (t0, t0_file))
+        else:
+            with open(t0_file, "w", encoding="utf-8") as f:
+                f.write("%.3f\n" % t0)
+            print("GATE0_T0 = %.3f (新会话,已记入 %s)" % (t0, t0_file))
     print("           = %s" % time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0)))
 
     chains = ORDER if args.chain == "all" else [args.chain]
@@ -294,6 +352,88 @@ def main():
     for c, rc in results:
         print("  %-10s rc=%d %s" % (c, rc, "PASS" if rc == 0 else "^^^"))
     sys.exit(worst)
+
+
+def _selftest():
+    """⛔ S139:这个跑器此前**没有自检**,而它的拒绝分支(清货白名单、`..`、t0 时效上界)
+    从没被执行过 —— S129:一条从没被执行过的错误分支就是一条空判据。
+    这里逐条真触发,并**顺带证明干净的输入不会被误拒**(对照臂)。
+    """
+    import tempfile
+    fails = []
+
+    def expect_refuse(name, fn, needle=None):
+        try:
+            fn()
+        except SystemExit as e:
+            if e.code != 5:
+                fails.append("%s 应该 exit 5,实际 %r" % (name, e.code))
+            else:
+                print("  ok   %-42s -> REFUSING exit 5" % name)
+            return
+        except Exception as e:                       # noqa: BLE001
+            fails.append("%s 应该 REFUSING,却抛了 %r" % (name, e))
+            return
+        fails.append("%s 应该 REFUSING,却过了" % name)
+
+    def expect_ok(name, fn):
+        try:
+            fn()
+            print("  ok   %-42s -> 正常通过" % name)
+        except Exception as e:                       # noqa: BLE001
+            fails.append("%s 不该拒,却拒了 %r" % (name, e))
+
+    tmp = tempfile.mkdtemp(prefix="run_gate0_selftest_")
+    try:
+        d = os.path.join(tmp, "gate_dataset")
+        os.makedirs(d)
+        expect_refuse("数据集目录空", lambda: assert_dataset_clean(d))
+        for n in ("a.wav", "b.wav"):
+            with open(os.path.join(d, n), "wb") as f:
+                f.write(b"RIFFxxxx")
+        expect_ok("数据集干净(2 个 wav)", lambda: assert_dataset_clean(d))
+        # ⭐ 本笔的主角:一个 .part 就会让两侧吃不同的文件集合
+        with open(os.path.join(d, "c.wav.part"), "wb") as f:
+            f.write(b"half")
+        expect_refuse("数据集里有 .part", lambda: assert_dataset_clean(d))
+        os.remove(os.path.join(d, "c.wav.part"))
+        with open(os.path.join(d, "notes.txt"), "w") as f:
+            f.write("x")
+        expect_refuse("数据集里有非 .wav 杂物", lambda: assert_dataset_clean(d))
+        os.remove(os.path.join(d, "notes.txt"))
+        open(os.path.join(d, "zero.wav"), "wb").close()
+        expect_refuse("数据集里有 0 字节 wav", lambda: assert_dataset_clean(d))
+        os.remove(os.path.join(d, "zero.wav"))
+        expect_refuse("数据集目录不在", lambda: assert_dataset_clean(os.path.join(tmp, "nope")))
+
+        # 清货白名单:落在白名单之外 / 含 '..' —— 两条都必须当场拒
+        saved = dict(CLEAR)
+        try:
+            CLEAR["rvc"] = [os.path.join(tmp, "somewhere_else")]
+            expect_refuse("清货路径落在白名单之外", lambda: do_clear("rvc", dry=True))
+            # ⚠ 第一版这条用的是 `rvc_ours\..\evil` —— 而 `abspath` 先把 `..` 规范化掉了,
+            #   于是它被**白名单**那一条拦下,`".." in p` 那条分支根本没跑到。
+            #   ⇒ 要真触发它,路径必须**规范化之后仍落在白名单内**但字面上带 `..`。
+            #   (这就是「红了、断言也对,但它在回答另一个问题」的又一次小复现。)
+            CLEAR["rvc"] = [os.path.join(TESTING, "rvc_ours", "sub", "..", "2a_f0")]
+            expect_refuse("清货路径含 '..'(规范化后仍在白名单内)",
+                          lambda: do_clear("rvc", dry=True))
+            CLEAR["rvc"] = [os.path.join(TESTING, "rvc_ours", "2a_f0")]
+            expect_ok("清货路径在白名单内(--dry-run)", lambda: do_clear("rvc", dry=True))
+        finally:
+            CLEAR.clear()
+            CLEAR.update(saved)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print()
+    if fails:
+        for f in fails:
+            print("  FAIL %s" % f)
+        print("run_gate0_chain 自检: FAILED(%d)" % len(fails))
+        return 4
+    print("run_gate0_chain 自检: ALL OK")
+    return 0
 
 
 if __name__ == "__main__":
