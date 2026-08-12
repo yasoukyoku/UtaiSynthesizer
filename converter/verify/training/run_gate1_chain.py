@@ -370,7 +370,13 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
         #    而 1 在 orig 段会被这里读成 `ORIG-FAILED`(参照物没跑起来)—— 可它自己说的是
         #    「这是【闸没准备好】,不是被测对象的问题」。**一条红,两种归因**,正是 S129 铁律要拆开的。
         if rc == G.EXIT_UNRUNNABLE:
-            G._say("VERDICT UNRUNNABLE (读数不可归因,这不是一次判定) — %s" % log)
+            # ⛔ S140:**6 是一个被复用的码** —— 「prepare 在第一句 rmtree 之前拒绝(盘上
+            #    什么都没删)」与「compare/history 说这一轮不构成判定(夹具已经换过一轮、
+            #    旧证据已经没了)」在退出码与汇总行上完全一样,区别只在**盘上还剩什么**。
+            #    ⇒ 至少把**是哪一段**和**prepare 跑没跑**打进 VERDICT 行。
+            G._say("VERDICT UNRUNNABLE@%s (读数不可归因,这不是一次判定;"
+                   "本跑 prepare=%s)— %s"
+                   % (name, "跑了(夹具已重建)" if rebuild else "没跑(夹具原样)", log))
             for ln in _tail(log, 8):
                 G._say("   " + ln)
             return EXIT_UNRUNNABLE

@@ -261,9 +261,14 @@ def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False,
     #    「健康」那条对照臂又去验一个盘上不存在的形状(这一场刚为身份文件补过同一件事)。
     os.makedirs(ours_exp, exist_ok=True)
     with open(os.path.join(ours_exp, "reporter_tally.json"), "w", encoding="utf-8") as f:
-        json.dump({"n_stage": 0, "n_step": 0 if tally_dead else 16,
-                   "ckpt_kinds": ["periodic"], "n_ckpt": 1,
-                   "n_warn": 0, "n_done": 0, "n_error": 0, "summary_steps": 15}, f)
+        # ⛔ 与 `gate1_guard.EXPECT["vocoder"]["tally"]` 的登记值**逐项一致** ——
+        #    S140 那一跑量出来的真值。合成夹具与真夹具不同形,「健康」那条对照臂就在
+        #    验一个盘上不存在的形状(这一场已经为身份文件补过同一件事)。
+        tally = dict(G1.EXPECT["vocoder"]["tally"])
+        tally["n_done"] = 0
+        if tally_dead:
+            tally["n_step"] = 0
+        json.dump(tally, f)
     over = dict(ORIG_LOGS=o, OURS_LOGS=u, ORIG_EXP=orig_exp, OURS_EXP=ours_exp, GATE_ROOT=td)
     apply_ident(over, orig_exp, u, "same")
     return over, [o, u]
@@ -338,7 +343,7 @@ def build_cases():
         # ── ⛔ S140:reporter 通道。此前 `_Rep` 三个方法全 `pass` ⇒ 这一面零判据。
         #    「记账里 n_step=0」正是那个原始状态,它必须红 —— 否则改回去没人看得见。
         ("voc/reporter 记账说它收到 0 条", "gate1_vocoder_compare.py",
-         lambda td: voc_fixture(td, tally_dead=True), 3, "桩把它们全吞了"),
+         lambda td: voc_fixture(td, tally_dead=True), 3, "reporter 记账与登记值不同"),
 
         # ── ⛔ S140:登记的分量数变判据。此前 EXPECT[*]["components"] 是**零读者**,
         #    从 PAIRS 里删掉一个分量 ⇒ 每行照打 [PASS]、总判照打 ALL PASS,转录零变化。

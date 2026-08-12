@@ -116,7 +116,18 @@ EXPECT = {
     #    此前这条链的 `_Rep` 三个方法全 `pass` ⇒ 这一面**零判据**。
     #    `None` = **还没登记**:那一跑只报数并响亮说明自己没判(照 `declare_frozen`
     #    在没给 expect_sha 时的做法)。⛔ 别拿一个推算出来的数去填它 —— 登记值必须是量出来的。
-    "vocoder": dict(train_points=15, val_points=4, tags=11, tally=None),
+    # `tally` 由 **S140 那一跑第一次量出来**(2026-08-12 19:28,五条链 all --rebuild-fixtures):
+    #   n_step=16(15 个 train batch + `pipeline.py:980` 那次 forced 收尾)·
+    #   ckpt 六次,序列 periodic/best/periodic/periodic/best/final ·
+    #   n_stage=0(xpu 与 resume 两条 stage 路径在 gate 条件下**结构上不可达**:
+    #             cfg 没有 `device_backend` 且 CUDA 被屏蔽 ⇒ 恒为 "cpu";start.source 是 fresh)·
+    #   summary_steps=15(= `real_final`,global 30 折半)。
+    # ⛔ 这些数**是量出来的不是推的** —— 推算值(交接给的「n_step≈16 / ckpt≥5」)不许写进登记。
+    "vocoder": dict(train_points=15, val_points=4, tags=11,
+                    tally={"n_step": 16, "n_stage": 0, "n_ckpt": 6,
+                           "ckpt_kinds": ["periodic", "best", "periodic", "periodic",
+                                          "best", "final"],
+                           "n_warn": 0, "n_error": 0, "summary_steps": 15}),
 }
 
 
@@ -683,7 +694,12 @@ def assert_cpu_only(where):
     """
     try:
         import torch
-    except Exception:                                   # noqa: BLE001
+    except Exception as e:                              # noqa: BLE001
+        # ⛔ S140:原来这里是**静默 `return`** —— 一条 CPU 判据在「torch 导不进来」时
+        #    一个字都不说,而它的调用方会以为它判过了。判据可以放弃,但**不许安静地放弃**。
+        sys.stderr.write("[NO-COVERAGE] %s: torch 导不进来(%r)⇒ 这条 CPU 判据本轮**没有执行**\n"
+                         % (where, e))
+        sys.stderr.flush()
         return
     vis = os.environ.get("CUDA_VISIBLE_DEVICES")
     if torch.cuda.is_available():
@@ -917,6 +933,37 @@ def _selftest():
         else:
             os.environ.pop(T0_ENV, None)
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── check_tally 的五条(⛔ 其中「未登记」那两条在 `gate1_negctl` 里**结构上不可达**
+    #    —— EXPECT["vocoder"]["tally"] 一旦被填上,那条分支就再也走不到了。
+    #    ⇒ 它只能在这里被真触发,否则将来给第二条链接这套机制时它是一条空判据。)
+    import json as _json
+    tmp2 = tempfile.mkdtemp(prefix="gate1_guard_tally_")
+    try:
+        good = {"n_step": 16, "n_stage": 0, "n_ckpt": 6,
+                "ckpt_kinds": ["periodic", "best", "periodic", "periodic", "best", "final"],
+                "n_warn": 0, "n_error": 0, "summary_steps": 15}
+        p_missing = os.path.join(tmp2, "nope.json")
+        p_good = os.path.join(tmp2, "good.json")
+        p_dead = os.path.join(tmp2, "dead.json")
+        for p, body in ((p_good, good), (p_dead, dict(good, n_step=0))):
+            with open(p, "w", encoding="utf-8") as f:
+                _json.dump(body, f)
+        expect_unrunnable("check_tally(记账文件不在)",
+                          lambda: check_tally("st", p_missing, None),
+                          because="reporter 记账不在")
+        expect_unrunnable("check_tally(未登记 + 通道是死的 ⇒ 仍然要红)",
+                          lambda: check_tally("st", p_dead, None),
+                          because="桩把它们全吞了")
+        expect_ok("check_tally(未登记 + 通道活着 ⇒ 只报数并自陈没判)",
+                  lambda: check_tally("st", p_good, None))
+        expect_ok("check_tally(已登记 + 逐项相等)",
+                  lambda: check_tally("st", p_good, good))
+        expect_unrunnable("check_tally(已登记 + 少了一次 ckpt)",
+                          lambda: check_tally("st", p_good, dict(good, n_ckpt=5)),
+                          because="reporter 记账与登记值不同")
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
 
     _say()
     if fails:

@@ -92,7 +92,28 @@ training\.venv\Scripts\python.exe converter\verify\training\gate0_compare.py
 >
 > **⑶ 出口码(与 `run_gate0_chain.py` 同一张表):**
 > `0` PASS · `1` **compare 判负(★ 只有这一种是「被测的东西不对」)** · `2` prepare 失败 ·
-> `3` 原版侧失败 · `4` 我方侧失败 · `5` 用法/夹具缺件 · `6` 读数不可归因。
+> `3` 原版侧失败 · `4` 我方侧失败 · `5` 用法/夹具缺件 · `6` 读数不可归因 ·
+> **`7` 历史对拍判负(S140 新增,gate1 独有)**。
+> ⚠ **`all` 的退出码按【严重度】取,不是「第一条非零」**(S140 修):此前 rvc 排第一,
+> 一条 exit 6(语义是「重跑一次就好」)会把后面四条链里**任何一条真红整个盖住**。
+> 汇总最后一行会打 `EXIT=n 因为 <哪条链>`。⛔ 跑完**别只看 `$LASTEXITCODE`**,逐条读汇总的五个 rc。
+>
+> **⑸ ⭐ 每条链现在有【五段】:`1_prepare / 2_orig / 3_ours / 4_compare / 5_history`。**
+> 第 5 段 = `gate1_history_compare.py`,它问的是与 `4_compare` **不同的问题**:
+> 「自上一次跑 gate1 以来的那些 commit,**数值上动过什么吗**」——
+> 主判据是「**除 `eta_secs` 外整份 jsonl 归一化后逐字节相同**」(声码器那条走 TB,11 tag / 143 点),
+> 两个基线 = 七月(`s134_f7\baseline_backup\_loose`)与 08-11(`s135_f7\backup_pre_gate0\root_files`),
+> 两侧都由 `declare_frozen` 的 `expect_sha` 逐字节钉住。
+> ⛔ **它的前身 `TESTING\s134_f7\compare_vs_history.py` 别再跑** —— S140 实测它整条链上
+> 没有一处能红(新鲜度守卫是单调恒真的谓词 / 缺件走静默绿 / 地板是 `步数×5` 而真实分量数
+> 是 6/7/10/2 / NaN 恒不可见)。同一天同一份盘:老脚本**一条链都没跑**就打四行
+> `BITWISE-SAME` 退 **0**,新闸退 **3** 并点名「不是本轮产物」。旁边有 `.SUPERSEDED.md`。
+>
+> **⑹ ⛔ 声码器那条链:`2_orig` 段会删 3.66 GB,而它【不受 `--rebuild-fixtures` 管辖】。**
+> `gate1_vocoder_run_orig.py` 在 import 期无条件 rmtree
+> `SingingVocoders\experiments\gate1_voc`(= S134 声码器**原版侧**唯一在盘证据 ——
+> 上面 ⑵ 此前把它写成「我方侧」,照那句话去备份会拷错一棵树;我方侧是
+> `TESTING\gate1_vocoder\ours`)。S140 起它由 `orig_wipes` 走**同一道** `GATE1_ALLOW_REBUILD` 联锁。
 >
 > **⑷ ⚠ torch 轴:下面各节写的「双方同 torch(2.5.1)」是【陈货】。**
 > 经跑器跑时 rvc / sovits / diff / vocoder 用的是 `envs\s42_staging_nv_cu130`

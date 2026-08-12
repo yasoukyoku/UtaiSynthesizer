@@ -107,7 +107,13 @@ CASES = {
                                       "lightning_logs", "lastest"),
                     july=os.path.join(r"D:\MyDev\TESTING\s134_f7\baseline_backup", "voc_gate",
                                       "ours", "gate1_voc", "lightning_logs", "lastest"),
-                    july_sha="74a31d18e12fe3684ff3cdaabf5874278af5c069f20c046004ed0b8414ad093a"),
+                    # ⚠ 这是**整个目录**的 dirhash(events + 那个 3 字节的 `hparams.yaml`),
+                    #   不是 events 单件的。S140 第一次真跑当场踩到:我量 sha 时只算了 events,
+                    #   而 `declare_frozen(..., [""])` 无后缀过滤 ⇒ 它算的是整目录 ⇒ 判 exit 3
+                    #   「冻结参照的内容变了」。⛔ **闸是对的,错的是登记值** —— 已复核
+                    #   events 单件 sha 仍逐位等于 74a31d18e12fe368…(参照物没变)。
+                    #   ⇒ 改登记整目录口径,顺带把 hparams.yaml 也钉住(更强)。
+                    july_sha="eda6a6f53f1d7b0d2fb4522e5d5f4e39c5a1665a1b74f7a5225ea1385928f81e"),
 }
 
 # ⛔ 历史对拍量的是**同实现跨时间**,不是跨实现 ⇒ 容差是 **0.0**,不是 1e-6。
