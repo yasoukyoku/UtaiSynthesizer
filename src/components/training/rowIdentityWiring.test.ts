@@ -261,11 +261,19 @@ describe("archive rows resolve their identity per row", () => {
     // async 闭包里,vitest 驱不动 —— 而「文案在不在」恰恰是 i18n 那两道结构闸看不见的东西。
     const fs = await importFs();
     const code = codeOnly(fs.readFileSync(FILE, "utf8"));
-    const at = code.indexOf('t("training.confirmExistBody"');
+    // ⚠ 锚点取 `wantsRetrain` 的**绑定处**,不是某个文案键 —— 第一版锚在
+    // `t("training.confirmExistBody"` 上,而我随后在它**前面**加了一个三元分支,窗口的起点
+    // 就被自己的改动挤到了后面、看不见新加的那一支(当场红)。**锚点要选一个不会被正文改动
+    // 推走的东西。**
+    const at = code.indexOf("const wantsRetrain = useTrainingStore.getState().retrainIntent;");
     expect(at, "开始训练那个「已存在」对话框的锚点漂了").toBeGreaterThan(0);
     // 只看这次 showConfirm 调用的正文构造,别一路扫到下一个对话框去(W1 那条血训)。
     const window = code.slice(at, code.indexOf("buttons:", at));
-    expect(window.length, "正文窗口长得不像一次调用").toBeLessThan(800);
+    // ⚠ 量的是**去掉空白之后**的长度:`codeOnly` 把注释抹成**等长空白**,所以原始长度会随
+    // 注释一起涨(这一段的注释很长),拿它当「像不像一次调用」的尺子会被注释推着走。
+    const dense = window.replace(/\s/g, "").length;
+    expect(dense, `正文窗口长得不像一次调用(去空白 ${dense} 字符)`).toBeLessThan(900);
+    expect(dense, "正文窗口是空的 —— 锚点之后立刻就是 buttons:,这道闸什么也没看").toBeGreaterThan(80);
     expect(
       window,
       "续训那一档不再对「刚起了新名字」的情况说明它会放弃那个新 run —— 用户点下去之后,\
@@ -276,6 +284,20 @@ describe("archive rows resolve their identity per row", () => {
       "那句提醒不再受「是不是从再训一个进来的」约束 —— 无条件挂上去会让普通续训也读到一句\
        与它无关的警告,而一条到处都亮的警告等于没有警告",
     ).toContain("wantsRetrain");
+    // ⛔ 用户实机第二次报的那条:这个分支的条件是「**旧** run 有没有产物」,而不是「这个名字被占了」。
+    // 拿 `confirmExistBody`(「已存在名为『X』的模型/训练记录」)去讲它,填进去的是用户**刚起的
+    // 新名字** ⇒ 那句话是假的,而且读起来正好像「重训会覆盖 X」。
+    expect(
+      window,
+      "带着新名字进来时又用回了 confirmExistBody —— 那句话会说「已存在名为『刚起的新名字』的\
+       训练记录」,而那个名字哪里都不存在;它把「铸一个新 run」讲成了「覆盖一个同名的」",
+    ).toContain("confirmExistRetrainBody");
+    // …而且它必须**挂在那个条件上**:无条件用它,普通续训会读到一句「重训会新建一个名为 X 的
+    // run」——那句话对它同样是假的,只是方向反过来。
+    expect(
+      /wantsRetrain[\s\S]{0,60}confirmExistRetrainBody/.test(window),
+      "那句「会新建一个名为 X 的 run」不再受「是不是从再训一个进来的」约束",
+    ).toBe(true);
   });
 
   it("the wiring probe can actually see the file it claims to scan", async () => {

@@ -2287,8 +2287,16 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
         // 一个字都没说。用户实机走的正是这条:起名 `run2-rvc` → 选了从最佳存档继续 ⇒ 没铸新 run,
         // 而那个新名字曾经被写进**旧 run** 的 run.json(后端那一半已在 `name_to_persist` 修掉)。
         // 两半都要:后端保证**不毁东西**,这里保证**用户知道自己在选什么**。
+        // ⛔⛔ S141(用户实机第二次报的):这个分支的条件是 `wsExists`,而 `wsExists` 问的是
+        // **`config.runId` 指的那个【旧】run 有没有练出过东西** —— 与用户刚输入的名字毫无关系。
+        // 而 `confirmExistBody` 把**新**名字填进「已存在名为『X』的模型/训练记录」⇒ 那句话是假的,
+        // 而且读起来正好像「重训会覆盖 X」。用户原话:「无论我输入什么训练名都会提示已存在,
+        // 是不是再训一个一直在硬替换旧的 run」。**行为是对的(铸新),说错话的是这一句。**
+        // ⇒ 带着新名字进来时换一句**描述真实处境**的:这个 run 已有产物;重训在它旁边新建。
         body:
-          t("training.confirmExistBody", { name }) +
+          (wantsRetrain
+            ? t("training.confirmExistRetrainBody", { name })
+            : t("training.confirmExistBody", { name })) +
           (wantsRetrain ? t("training.retrainIntentResumeWarn") : "") +
           diffWarn,
         buttons: wantsRetrain
