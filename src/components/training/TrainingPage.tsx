@@ -2272,6 +2272,25 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
       // them re-decide against a primary-styled 续训 that may now be refused. Both options stay:
       // this dialog is the authoritative wipe consent, and changing one's mind must be possible.
       const wantsRetrain = useTrainingStore.getState().retrainIntent;
+      // ⛔⛔ S141(用户实机连报两次)——「再训一个」这条路上**不再问第三遍**。
+      //
+      // 用户已经在项目页答过两次:①「重训这个架构」那个 danger 对话框(它明说会新建一个 run、
+      // 旧的原样保留)②「给这个新 run 起个名字」。走到这里再弹一个标题写着**「模型已存在」**、
+      // 正文把**新**名字说成「已存在名为 X 的模型/训练记录」的框,是第三遍 —— 而且那句话是**假的**:
+      // 这个分支的条件是 `wsExists`,而 `wsExists` 问的是 `config.runId` 指的那个【旧】run 有没有
+      // 产物,**与用户输入的名字毫无关系**。用户原话:「无论我输入什么训练名都会提示已存在」。
+      //
+      // ⛔ 它也不再是一道「擦除同意」:`wipe_confirmed` 在后端**只有一个消费点**
+      // (`training/mod.rs` 的 `if diff_partial_wipe && !req.wipe_confirmed && …`),而
+      // `diff_partial_wipe` 要求 `backend == "sovits_diff"`;而 `retrainIntent` **只由**
+      // `ProjectDetail.retrainFamily` 置位,它只传 family(rvc/sovits/sovits_v2/vocoder)——
+      // 结构上到不了那个分支。⇒ 这一问没有任何东西要被同意。
+      //
+      // ⚠ `wipeConfirmed` 保持 false:这条路读不到它,而万一将来那个分类变了,
+      // 「没同意过」是 fail-closed 的方向(后端会拒绝而不是默默删)。
+      if (wantsRetrain) {
+        fresh = true; // 与种子值相同;写出来是让这条路的意图显式,而不是靠「没人改过它」
+      } else {
       // ★S117 §F2⒜ — offered ONLY when the slot really holds a complete resumable best snapshot
       // (`resume_best/` with its completion marker). A button that silently continues from the
       // latest instead would be the same class of lie as the one this feature exists to remove:
@@ -2282,41 +2301,19 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
           : [];
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
-        // ⛔ S141(实机第一次开窗口买回来的):带着「再训一个」的意图和一个**已经起好的新名字**
-        // 走到这里,选「续训 / 从最佳存档继续」是一个**放弃新 run** 的决定 —— 而屏幕上此前
-        // 一个字都没说。用户实机走的正是这条:起名 `run2-rvc` → 选了从最佳存档继续 ⇒ 没铸新 run,
-        // 而那个新名字曾经被写进**旧 run** 的 run.json(后端那一半已在 `name_to_persist` 修掉)。
-        // 两半都要:后端保证**不毁东西**,这里保证**用户知道自己在选什么**。
-        // ⛔⛔ S141(用户实机第二次报的):这个分支的条件是 `wsExists`,而 `wsExists` 问的是
-        // **`config.runId` 指的那个【旧】run 有没有练出过东西** —— 与用户刚输入的名字毫无关系。
-        // 而 `confirmExistBody` 把**新**名字填进「已存在名为『X』的模型/训练记录」⇒ 那句话是假的,
-        // 而且读起来正好像「重训会覆盖 X」。用户原话:「无论我输入什么训练名都会提示已存在,
-        // 是不是再训一个一直在硬替换旧的 run」。**行为是对的(铸新),说错话的是这一句。**
-        // ⇒ 带着新名字进来时换一句**描述真实处境**的:这个 run 已有产物;重训在它旁边新建。
-        body:
-          (wantsRetrain
-            ? t("training.confirmExistRetrainBody", { name })
-            : t("training.confirmExistBody", { name })) +
-          (wantsRetrain ? t("training.retrainIntentResumeWarn") : "") +
-          diffWarn,
-        buttons: wantsRetrain
-          ? [
-              { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
-              { id: "resume", label: t("training.resume") },
-              ...bestResume,
-              { id: "cancel", label: t("training.cancel") },
-            ]
-          : [
-              { id: "resume", label: t("training.resume"), kind: "primary" as const },
-              ...bestResume,
-              { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
-              { id: "cancel", label: t("training.cancel") },
-            ],
+        body: t("training.confirmExistBody", { name }) + diffWarn,
+        buttons: [
+          { id: "resume", label: t("training.resume"), kind: "primary" as const },
+          ...bestResume,
+          { id: "retrain", label: t("training.retrain"), kind: "danger" as const },
+          { id: "cancel", label: t("training.cancel") },
+        ],
       });
       if (choice !== "resume" && choice !== "retrain" && choice !== "resumeBest") return;
       fresh = choice === "retrain";
       wipeConfirmed = fresh;
       if (choice === "resumeBest") resumeFrom = "best";
+      }
       // (The old `else if (wsExists)` branch — "the slot exists but its facts are unreadable" —
       // is gone with the fail-open probe that produced it. `get_training_slot_info` either
       // answers or the start is refused above; an unreadable MANIFEST still lands in the branch

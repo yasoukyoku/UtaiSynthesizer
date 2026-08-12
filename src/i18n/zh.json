@@ -479,8 +479,6 @@
     "errorHint": "详细日志见训练工作区 train.log",
     "confirmExistTitle": "模型已存在",
     "confirmExistBody": "已存在名为「{{name}}」的模型/训练记录。续训将从上次进度继续；重训将新建一个 run 从头开始,现有的 run 原样保留。",
-    "confirmExistRetrainBody": "这个 run 已经练出过训练产物。选「重训」会在它旁边新建一个名为「{{name}}」的 run —— 现有的 run 和它的存档原样保留,不会被替换,也不会被改名。",
-    "retrainIntentResumeWarn": "\n⚠ 你是从「再训一个」进来的,并且已经给新 run 起好了名字。在这里选「续训」或「从最佳存档继续」= 放弃那个新 run,在现有的 run 上接着练——新名字不会生效,现有 run 的名字也不会被改掉。",
     "modelVersionMismatchBody": "已存在同名模型「{{name}}」（{{old}}），且没有可续训的工作区。当前选择 {{new}}，将从头开始训练；训练完成后以同名导入会替换原模型。",
     "noWorkspaceBody": "已存在同名模型「{{name}}」，但没有可续训的训练工作区——将从头开始训练；训练完成后以同名导入会替换原模型。",
     "resume": "续训",

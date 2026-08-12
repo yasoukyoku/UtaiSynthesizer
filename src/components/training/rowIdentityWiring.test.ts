@@ -253,51 +253,48 @@ describe("archive rows resolve their identity per row", () => {
     ).toBeGreaterThanOrEqual(3);
   });
 
-  it("★ S141 —— 带着「再训一个」的新名字走到开始对话框时,续训那一档必须先说清它放弃了什么", async () => {
-    // 实机第一次开窗口撞到的那一条:用户点「再训一个」、给新 run 起名 `run2-rvc`,然后在这个
-    // 对话框里改主意选了「从最佳存档继续」⇒ **没有铸出新 run**,而那个新名字被写进了**旧 run**
-    // 的 run.json(后端那一半已由 `training::name_to_persist` 修掉)。
-    // 这道闸守的是另一半:**那个决定必须在屏幕上说出来**。它是源码闸,因为这段活在组件的
-    // async 闭包里,vitest 驱不动 —— 而「文案在不在」恰恰是 i18n 那两道结构闸看不见的东西。
+  it("★ S141 —— 「再训一个」这条路不许再弹第三个对话框问「模型已存在」", async () => {
+    // 用户实机**连报两次**的那一条。他已经在项目页答过两次(「重训这个架构」的 danger 框、
+    // 「给这个新 run 起个名字」),而走到开始训练时还会撞上第三个框,标题写着**「模型已存在」**、
+    // 正文把**新**名字说成「已存在名为 X 的模型/训练记录」——**那句话是假的**:这个分支的条件是
+    // `wsExists`,问的是 `config.runId` 指的那个【旧】run 有没有产物,与输入的名字毫无关系。
+    // 用户原话:「无论我输入什么训练名 我选『再训一个』的时候都会提示已存在模型/训练记录」。
+    //
+    // ⛔ 它也不再是一道「擦除同意」:`wipe_confirmed` 在后端只有一个消费点,且要求
+    // `backend == "sovits_diff"`,而 `retrainIntent` 只由 `retrainFamily` 置位、它只传 family
+    // ⇒ 结构上到不了那个分支。⇒ 这一问没有任何东西要被同意,只剩噪音与一句假话。
+    //
+    // 这道闸是**源码闸**:这段活在组件的 async 闭包里,vitest 驱不动;而「弹不弹」恰恰是
+    // i18n 那两道结构闸看不见的东西。
     const fs = await importFs();
     const code = codeOnly(fs.readFileSync(FILE, "utf8"));
-    // ⚠ 锚点取 `wantsRetrain` 的**绑定处**,不是某个文案键 —— 第一版锚在
-    // `t("training.confirmExistBody"` 上,而我随后在它**前面**加了一个三元分支,窗口的起点
-    // 就被自己的改动挤到了后面、看不见新加的那一支(当场红)。**锚点要选一个不会被正文改动
-    // 推走的东西。**
+    // ⚠ 锚点取 `wantsRetrain` 的**绑定处**,不是某个文案键 —— 早一版锚在
+    // `t("training.confirmExistBody"` 上,而我随后在它**前面**加了分支,窗口起点就被自己的
+    // 改动挤走、看不见新加的那一支(当场红)。**锚点要选不会被正文改动推走的东西。**
     const at = code.indexOf("const wantsRetrain = useTrainingStore.getState().retrainIntent;");
     expect(at, "开始训练那个「已存在」对话框的锚点漂了").toBeGreaterThan(0);
-    // 只看这次 showConfirm 调用的正文构造,别一路扫到下一个对话框去(W1 那条血训)。
     const window = code.slice(at, code.indexOf("buttons:", at));
-    // ⚠ 量的是**去掉空白之后**的长度:`codeOnly` 把注释抹成**等长空白**,所以原始长度会随
-    // 注释一起涨(这一段的注释很长),拿它当「像不像一次调用」的尺子会被注释推着走。
+    // ⚠ 量**去掉空白之后**的长度:`codeOnly` 把注释抹成等长空白,原始长度会随注释一起涨。
     const dense = window.replace(/\s/g, "").length;
-    expect(dense, `正文窗口长得不像一次调用(去空白 ${dense} 字符)`).toBeLessThan(900);
-    expect(dense, "正文窗口是空的 —— 锚点之后立刻就是 buttons:,这道闸什么也没看").toBeGreaterThan(80);
+    expect(dense, `窗口长得不像一次调用(去空白 ${dense} 字符)`).toBeLessThan(900);
+    expect(dense, "窗口是空的 —— 锚点之后立刻就是 buttons:,这道闸什么也没看").toBeGreaterThan(20);
+
+    // ⑴ 「再训一个」必须**短路**在弹框之前。
     expect(
-      window,
-      "续训那一档不再对「刚起了新名字」的情况说明它会放弃那个新 run —— 用户点下去之后,\
-       屏幕上唯一的变化是名字,而产物仍然是旧 run 的",
-    ).toContain("retrainIntentResumeWarn");
-    expect(
-      window,
-      "那句提醒不再受「是不是从再训一个进来的」约束 —— 无条件挂上去会让普通续训也读到一句\
-       与它无关的警告,而一条到处都亮的警告等于没有警告",
-    ).toContain("wantsRetrain");
-    // ⛔ 用户实机第二次报的那条:这个分支的条件是「**旧** run 有没有产物」,而不是「这个名字被占了」。
-    // 拿 `confirmExistBody`(「已存在名为『X』的模型/训练记录」)去讲它,填进去的是用户**刚起的
-    // 新名字** ⇒ 那句话是假的,而且读起来正好像「重训会覆盖 X」。
-    expect(
-      window,
-      "带着新名字进来时又用回了 confirmExistBody —— 那句话会说「已存在名为『刚起的新名字』的\
-       训练记录」,而那个名字哪里都不存在;它把「铸一个新 run」讲成了「覆盖一个同名的」",
-    ).toContain("confirmExistRetrainBody");
-    // …而且它必须**挂在那个条件上**:无条件用它,普通续训会读到一句「重训会新建一个名为 X 的
-    // run」——那句话对它同样是假的,只是方向反过来。
-    expect(
-      /wantsRetrain[\s\S]{0,60}confirmExistRetrainBody/.test(window),
-      "那句「会新建一个名为 X 的 run」不再受「是不是从再训一个进来的」约束",
+      /if \(wantsRetrain\)\s*\{[\s\S]{0,200}fresh = true;/.test(window),
+      "「再训一个」这条路又落进那个『模型已存在』对话框了 —— 用户已经答过两次,而这一问的标题" +
+        "对他刚起的新名字是假话,且它已经没有任何东西要征求同意(wipe_confirmed 只对 sovits_diff 有效)",
     ).toBe(true);
+    // ⑵ 而且**不许**在那条路上顺手把擦除同意也给了:后端今天读不到它,但将来分类若变,
+    //    「没同意过」是 fail-closed 的方向。
+    expect(
+      /if \(wantsRetrain\)\s*\{[\s\S]{0,200}wipeConfirmed = true/.test(window),
+      "「再训一个」这条路自作主张地把 wipeConfirmed 置成了 true —— 那是把一道 fail-closed 的" +
+        "保险默认打开",
+    ).toBe(false);
+    // ⑶ 兜底:另一条路(普通续训/重训)那个对话框仍然在,别把它一起删了。
+    expect(window, "「已存在」对话框整个不见了 —— 普通续训那条路失去了它唯一的选择入口")
+      .toContain("training.confirmExistBody");
   });
 
   it("the wiring probe can actually see the file it claims to scan", async () => {
