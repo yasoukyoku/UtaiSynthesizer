@@ -203,14 +203,10 @@
   /* 与 `.training-backend-cards` 同款:固定列数把 step 栏填满,不跟着内容抖 */
   grid-template-columns: repeat(2, 1fr);
   gap: var(--space-md);
-  /* ⛔ S141(用户实机)—— grid 的默认 `align-items: stretch` 会让同一行的卡片被**最高的那张**
-     拉齐。④e 之前每个槽恒一行 run,四张卡片高度差不多,拉齐反而整齐;而「再训一个」真的能铸出
-     第二、第三个 run 之后,一个有五个 run 的槽会把它旁边那个**空槽**也拉成同样高,
-     于是那张空卡片里只有标题和一大片空白。⇒ 每张卡片按自己的内容高。
-     ⚠ 顺带治好第二个症状:`.tproj-slot-actions` 的 `margin-top: auto` 是为了让几张卡片的
-     「开始训练」横向对齐,而卡片被拉长之后它就把按钮顶到了空白的最底下 —— 高度自然之后
-     那条 auto 没有多余空间可分,按钮回到内容正下方。 */
-  align-items: start;
+  /* ⚠ S141 —— 这里**故意保留** grid 的默认 `align-items: stretch`(同一行的卡片被最高的那张
+     拉齐)。我一度改成 `start`,用户当场否掉:「拉长还是有必要的,要不然底下空一块也难看」。
+     ⇒ 难受的点**只有一个**:被拉长之后「开始训练」被 `margin-top: auto` 顶到那张大半是空的
+     卡片最底下。所以要治的是**那颗按钮**,不是卡片的高度。见 `.tproj-slot-actions`。 */
 }
 
 .tproj-slot {
@@ -267,7 +263,12 @@
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  margin-top: auto;
+  /* ⛔ S141(用户实机)—— 这里原本是 `margin-top: auto`,为的是让几张卡片的「开始训练」
+     **横向对齐**。④e 之前那是对的:每个槽恒一行 run,四张卡片高度差不多,底部对齐更整齐。
+     而「再训一个」真的能铸出第二、第三个 run 之后,一个多 run 的槽会把同一行那张**空槽**
+     一起拉高(grid 的 stretch,那一条是用户明确要保留的),于是那颗按钮被顶到一大片空白的
+     最底下,离它说明的那段内容十万八千里 —— 用户原话:「它难受的点其实就只有『开始训练』
+     跟着卡片长度跑」。⇒ 按钮跟着**内容**走,空白留在它下面。 */
   padding-top: var(--space-sm);
 }
 
@@ -320,9 +321,10 @@
   cursor: default;
 }
 
-/* 每行自己的动作条:不吃 `margin-top: auto`(那是槽底部按钮的定位),否则 N 行会被推开。 */
+/* 每行自己的动作条比槽级那条更紧凑(N 行叠起来时行距要收)。
+   ⚠ S141:这里原本还有一条 `margin-top: 0`,用来抵消槽级的 `margin-top: auto` —— 而那条 auto
+   已经删掉了(见 `.tproj-slot-actions`),留着就是一条**描述着不存在之物**的规则加一句假注释。 */
 .tproj-run .tproj-slot-actions {
-  margin-top: 0;
   padding-top: var(--space-xs);
 }
 
