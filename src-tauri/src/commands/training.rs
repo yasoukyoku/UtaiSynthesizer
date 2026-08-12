@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::State;
 
@@ -992,6 +992,25 @@ pub async fn delete_project_dataset_files(
         .map_err(|e| e.to_string())
 }
 
+/// The two preprocessing facts a slot card carries: how many pools it holds, and what they cost.
+///
+/// ⛔ S141 §E2E-M5 — extracted so this seam is drivable. `get_training_project` takes
+/// `State<'_, Arc<AppState>>` and calls `state.models.scan()` on the way in, so nothing can reach
+/// these lines through the command; as two inline expressions they had no judgement of any kind,
+/// and "the number on the card comes from the pool listing" was prose. It is the number the user
+/// reads to decide what to delete.
+///
+/// ⛔ S132 — an unreadable `pools/` is not「零个池」. Reporting 0 B of preprocessing for a slot
+/// holding gigabytes of it, on that exact screen, is worse than refusing to draw the page: the
+/// error propagates, it does not get rounded down to zero.
+fn slot_pool_facts(slot: &Path) -> Result<(u32, u64), String> {
+    let pools = crate::training::tpool::list_pools(slot).map_err(|e| e.to_string())?;
+    Ok((
+        pools.len() as u32,
+        pools.iter().map(|p| crate::commands::storage::dir_size(&p.dir)).sum(),
+    ))
+}
+
 #[tauri::command]
 pub async fn get_training_project(
     state: State<'_, Arc<AppState>>,
@@ -1065,10 +1084,9 @@ pub async fn get_training_project(
         .map(|f| -> Result<SlotDetail, String> {
             let slot = crate::training::tproject::family_dir(&data_dir, &project_id, f);
             let recs = crate::training::tproject::scan_project_ckpts(&data_dir, &project_id, Some(f));
-            // ⛔ S132 — an unreadable `pools/` is not「零个池」: that would report 0 B of
-            // preprocessing for a slot holding gigabytes of it, on the very screen the user reads
-            // to decide what to delete.
-            let pools = crate::training::tpool::list_pools(&slot).map_err(|e| e.to_string())?;
+            // The count/bytes pair and its S132 refusal live in `slot_pool_facts` (S141 §E2E-M5),
+            // which is where they are drivable — this command is not.
+            let (prep_pool_count, prep_pool_bytes) = slot_pool_facts(&slot)?;
             // `""` for an unmigrated slot, matching `CkptRecord::run_id` and the `None` that every
             // command takes — one vocabulary for「槽根就是那个 run」across Rust, IPC and the UI.
             let ids: Vec<String> = {
@@ -1117,11 +1135,8 @@ pub async fn get_training_project(
                 bytes: crate::commands::storage::dir_size(&slot),
                 ckpt_count: recs.len() as u32,
                 ckpt_bytes: recs.iter().map(|r| r.bytes).sum(),
-                prep_pool_count: pools.len() as u32,
-                prep_pool_bytes: pools
-                    .iter()
-                    .map(|p| crate::commands::storage::dir_size(&p.dir))
-                    .sum(),
+                prep_pool_count,
+                prep_pool_bytes,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1162,6 +1177,73 @@ mod tests {
         for bad in ["", "..", "../..", "a/b", "a\\b", ".del_x", "C:", "a:b", "a b", "项目"] {
             assert!(checked_project_id(bad).is_err(), "must refuse {bad:?}");
         }
+    }
+
+    /// ★S141 §E2E-M5 —— 槽卡片上「预处理 N 份 · X」的那两个数,第一次有判据。
+    ///
+    /// 它们此前是 `get_training_project` 体内的两句内联表达式,而那个命令吃
+    /// `State<'_, Arc<AppState>>` 并在半路 `state.models.scan()` ⇒ 结构上驱不动 ⇒
+    /// 「这个数来自池的列举」只是一句散文。
+    ///
+    /// ⛔ 字节数用**字面值**断言,不用 `dir_size(p1) + dir_size(p2)`:后者拿被测代码用的
+    /// 同一个求和器去算期望值,对「求和的是哪几个目录」有分辨力,对「它自己算错了」没有。
+    ///
+    /// ⚠ 夹具里那四样多余的字节各有各的用途,而且是**归因**用的,不是判死活用的:
+    /// 每一种写错的求和法都会返回一个**一眼认得出是谁**的数(3000 = 对 / 15000 = 求了
+    /// 整个 `pools/` / 20000 = 求了整个槽 / 4000 或 8000 混进来 = 那两条过滤掉了一半)。
+    /// 少了它们,四种坏法会挤在同一个「不等于 3000」里,红是红了,却说不出红在哪一种 ——
+    /// 而「一条闸的红必须能被归因」是 S129 立的铁律。
+    #[test]
+    fn the_preprocessing_line_counts_pools_and_charges_only_their_bytes() {
+        let base = std::env::temp_dir().join(format!("utai_poolfacts_{}", uuid::Uuid::new_v4()));
+        let slot = base.join("rvc");
+        let pools = crate::training::tpool::pools_root(&slot);
+        std::fs::create_dir_all(pools.join("paaa")).unwrap();
+        std::fs::create_dir_all(pools.join("pbbb").join("dataset_44k")).unwrap();
+        std::fs::write(pools.join("paaa").join("a.wav"), vec![0u8; 1000]).unwrap();
+        std::fs::write(pools.join("pbbb").join("dataset_44k").join("b.wav"), vec![0u8; 2000])
+            .unwrap();
+        // 池之外的槽内字节 —— 没有它,「把 dir_size(slot) 当答案」那条变异不可见
+        std::fs::create_dir_all(slot.join("weights")).unwrap();
+        std::fs::write(slot.join("weights").join("G.pth"), vec![0u8; 5000]).unwrap();
+        // pools/ 里不是池的两样东西,各自带着**很大**的字节数:如果它们混进来,3000 这个
+        // 数字会变成一个一眼认得出是谁的数
+        std::fs::create_dir_all(pools.join(".staging_x")).unwrap();
+        std::fs::write(pools.join(".staging_x").join("half.wav"), vec![0u8; 4000]).unwrap();
+        std::fs::write(pools.join("stray.txt"), vec![0u8; 8000]).unwrap();
+
+        assert_eq!(
+            slot_pool_facts(&slot).unwrap(),
+            (2, 3000),
+            "两个池、合计 3000 B。4000 混进来 = `.staging` 被当成池;8000 混进来 = pools/ 里的\
+             普通文件被当成池;5000 混进来 = 求的是整个槽而不是那几个池;15000/20000 = 两者都有"
+        );
+
+        // 从没预处理过的槽是**正常状态**,不是错误
+        let virgin = base.join("sovits");
+        std::fs::create_dir_all(&virgin).unwrap();
+        assert_eq!(slot_pool_facts(&virgin).unwrap(), (0, 0), "没有 pools/ ⇒ 零份,不是报错");
+
+        // ⛔ 但「读不动」必须响亮:退化成 (0,0) 会在用户用来决定删什么的那一屏上,
+        // 把一个压着几 GB 预处理的槽画成 0 B(S132)
+        let broken = base.join("vocoder");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(crate::training::tpool::pools_root(&broken), b"not a directory").unwrap();
+        // ⛔ 用 match 而不是 `unwrap_err()`:被吞掉时 `unwrap_err` 抛的是
+        // 「called Result::unwrap_err() on an Ok value」,读起来像**测试写坏了**,
+        // 而它其实是产品缺陷 —— 一条红必须能被归因(S129 铁律),两种坏法各说各的话。
+        match slot_pool_facts(&broken) {
+            Ok(v) => panic!(
+                "读不动的 pools/ 被吞成了 {v:?} —— 必须让整个槽报错。退化成 (0, 0) 会在用户\
+                 用来决定删什么的那一屏上,把一个压着几 GB 预处理的槽画成 0 B(S132)"
+            ),
+            Err(e) => assert!(
+                e.contains("POOLS_DIR_UNREADABLE"),
+                "报错了,但没说出是 pools/ 读不动 ⇒ 下一个人分不清「闸坏了」和「盘坏了」:{e}"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★§F2⒝ 批 2 ④b —— 改名命令的四道闸,钉在源码上。

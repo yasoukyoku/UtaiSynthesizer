@@ -1553,6 +1553,43 @@ mod tests {
         .unwrap();
     }
 
+    /// ★S141 §E2E-M5 —— `pools/` 里不是每一样东西都是池,而这条过滤此前没有任何判据。
+    ///
+    /// 它守的是屏幕上那句「预处理 N 份 · X」,而那正是用户用来决定**删什么**的读数。
+    /// 数字虚高一份,他就会以为那里还压着一份预处理;数字里混进 `.staging` 的字节,
+    /// 「删掉能省多少」就是错的。
+    ///
+    /// ⛔ 两条守卫写在**同一行**(`id.starts_with('.') || !entry.path().is_dir()`),所以
+    /// 它们必须**分开断言**:合成一句 `assert_eq!(ids, [...])` 的话,删掉其中任一半红的都是
+    /// 同一句,而「少了哪一半」看不出来 —— 一条红两种归因,正是 S129 铁律点名的形状。
+    /// 兜底的全等断言排在最后(S108:具体的排前面,兜底的排最后)。
+    #[test]
+    fn the_pool_listing_counts_pools_and_not_whatever_else_sits_in_that_directory() {
+        let slot = tmp_slot("pool_filter");
+        // 故意乱序建,顺便钉住「按 id 排序,列表不会抖」这句 doc
+        mk_pool(&slot, "pbbb", "fp-b");
+        mk_pool(&slot, "paaa", "fp-a");
+        // ⑴ staging:铸池铸到一半留下的形状
+        std::fs::create_dir_all(pools_root(&slot).join(".staging_abcdef")).unwrap();
+        // ⑵ 一个普通**文件**躺在 pools/ 里。今天没有任何代码会写出它 —— 而那恰恰是这半条
+        //    守卫从来没被执行过的原因(Thumbs.db / desktop.ini / 用户手动放的东西都是这一形)
+        std::fs::write(pools_root(&slot).join("stray.txt"), b"x").unwrap();
+
+        let ids: Vec<String> = list_pools(&slot).unwrap().into_iter().map(|p| p.id).collect();
+
+        assert!(
+            !ids.iter().any(|i| i.starts_with('.')),
+            "一个 `.staging` 目录被当成了池 —— 它是铸池的中间态,算进「预处理 N 份」\
+             会让用户看见一份并不存在的预处理。实得:{ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i == "stray.txt"),
+            "`pools/` 里的一个普通文件被当成了池 —— 之后每一个把 `PoolInfo.dir` 当目录用的\
+             读者都会在它身上得到「读不动」。实得:{ids:?}"
+        );
+        assert_eq!(ids, vec!["paaa".to_string(), "pbbb".to_string()], "兜底:恰好这两个,且有序");
+    }
+
     /// ★★S132 §F2⒝ ④e —— 「我判不了这个池」**永远不许**和「这个池没什么可判的」走同一个出口。
     ///
     /// ## 为什么这条比它看起来重
