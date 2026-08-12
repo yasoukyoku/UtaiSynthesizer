@@ -24,6 +24,7 @@ import copy
 import pathlib
 import shutil
 import sys
+import time
 
 import os                                                       # noqa: E402
 
@@ -93,8 +94,9 @@ def main():
             "       ⛔ gate0/gate1 里**没有任何脚本能重建它**(它是声码器冒烟的产物)。" % SLICES)
     if not PRETRAIN.is_file():
         raise G1.GateUnrunnable("声码器底模不在:%s" % PRETRAIN)
+    # ⛔ S140:地板从与真值无关的 5 改成实测真值 10(9 片 .wav + 1 个 `.complete` 标记)。
     ident = G1.src_identity("gate1/vocoder 的输入(冒烟切片,不可再生)",
-                            str(SLICES), [""], min_files=5)
+                            str(SLICES), [""], min_files=10)
 
     GATE.mkdir(parents=True, exist_ok=True)
     for sub in ("ours", "orig"):
@@ -111,6 +113,35 @@ def main():
     # §F2⒝: the pool is the parent of both product directories in this fixture — the aug
     # cleanup path needs it to reach `<pool>/aug_meta`.
     vpipe.process_slices(str(SLICES.parent), str(SLICES), str(npz_dir), cfg, _Rep(), _Stop())
+
+    # ⛔⛔ S140:**`--rebuild-fixtures` 重建不了这条链真正吃的东西。**
+    #    两侧训练消费的是 `npz/*.npz`,而 `vocoder/pipeline.py:296` 是 skip-if-exists,
+    #    且 npz 目录**不在上面那段 rmtree 的名单里**(只删 ours/orig)⇒ 盘上那批 npz
+    #    在「重建夹具」之后仍然是原来那批。实测(2026-08-12):9 份 npz 全部 mtime
+    #    **2026-07-06 20:09**,而它们自称的来源切片是 **20:56** —— 特征比输入早 47 分钟。
+    #    ⇒ 上面那行 `[INPUT]` 描述的是 SLICES,而被消费的是 npz,**两者不是一回事**。
+    #    这里补两件:⑴ 一条**真判据**(件数必须配对,少一个 npz 就是漏算);
+    #               ⑵ 一行把上面这个事实打进转录 —— ⛔「打印是汇报不是判据」,所以两件都要。
+    wavs = sorted(p.name for p in SLICES.iterdir() if p.suffix == ".wav")
+    npzs = sorted(p.stem for p in npz_dir.iterdir() if p.suffix == ".npz")
+    if sorted(os.path.splitext(w)[0] for w in wavs) != npzs:
+        raise G1.GateUnrunnable(
+            "gate1/vocoder:切片与特征对不上 —— %d 片 .wav vs %d 份 .npz\n"
+            "       只在切片侧:%s;只在特征侧:%s\n"
+            "       ⇒ `process_slices` 是 skip-if-exists,一份漏算的特征在这里不会自愈。"
+            % (len(wavs), len(npzs),
+               sorted(set(os.path.splitext(w)[0] for w in wavs) - set(npzs))[:5],
+               sorted(set(npzs) - set(os.path.splitext(w)[0] for w in wavs))[:5]))
+    try:
+        _newest_npz = max(p.stat().st_mtime for p in npz_dir.iterdir() if p.suffix == ".npz")
+        _newest_wav = max(p.stat().st_mtime for p in SLICES.iterdir() if p.suffix == ".wav")
+        G1._say("[NOTE] 声码器的特征是 skip-if-exists 的:npz 最新 %s / 切片最新 %s ⇒ "
+                "`--rebuild-fixtures` **不重建特征**,这一跑吃的是盘上已有的那 %d 份。"
+                % (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_newest_npz)),
+                   time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_newest_wav)), len(npzs)))
+    except ValueError:
+        pass
+
     vpipe.build_filelists(str(npz_dir), str(GATE / "filelists"), 1234,
                           int(cfg["crop_mel_frames"]), _Rep())
 

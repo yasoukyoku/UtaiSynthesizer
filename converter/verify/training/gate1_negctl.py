@@ -79,6 +79,37 @@ def write_jsonl(path, steps, keys, override=None):
             f.write(json.dumps({"type": "step", "step": s, "losses": losses}) + "\n")
 
 
+SHA_A = "a" * 64
+SHA_B = "b" * 64
+
+
+def seed_ident(dirs, sha=SHA_A):
+    """往这些目录里写 `gate1_input.identity.json`。
+
+    ⛔ S140:此前合成夹具**一个身份文件都不写**,而真 prepare 五条链每一条都写两侧
+       ⇒ 「健康」那条对照臂验的是一个**盘上不存在的形状**(S140 侦察点名的那一条)。
+       补上之后,身份缺席/不符才有资格成为**另外两条**独立的阴性对照。
+    """
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+        G1.write_input_identity(d, {
+            "root": "(negctl 合成夹具)", "subs": [], "files": 208, "bytes": 1,
+            "dirhash_sha256": sha,
+            "src_newest_mtime": "2026-01-01T00:00:00",
+            "recorded_at": "2026-01-01T00:00:00"})
+
+
+def apply_ident(over, orig_dir, ours_dir, ident):
+    """ident: same / differ / absent_orig / absent_both"""
+    if ident == "absent_both":
+        return
+    if ident == "absent_orig":
+        seed_ident([ours_dir])
+        return
+    seed_ident([orig_dir])
+    seed_ident([ours_dir], SHA_B if ident == "differ" else SHA_A)
+
+
 def touch(path, when):
     for root, _d, files in os.walk(path) if os.path.isdir(path) else [(None, None, None)]:
         if root is None:
@@ -90,7 +121,8 @@ def touch(path, when):
 
 
 # ─────────────────────────────────────────────────────────── 链的合成规格
-def rvc_fixture(td, steps=None, kl_override=None, jitter=0.0, clamp_steps=(0, 2)):
+def rvc_fixture(td, steps=None, kl_override=None, jitter=0.0, clamp_steps=(0, 2),
+                ident="same", pairs=None):
     steps = steps if steps is not None else list(range(30))
     tb = os.path.join(td, "orig")
     keys = ["g_total", "d_total", "fm", "mel", "kl"]
@@ -113,7 +145,12 @@ def rvc_fixture(td, steps=None, kl_override=None, jitter=0.0, clamp_steps=(0, 2)
                 r["losses"] = {k: (v + jitter if v is not None else None)
                                for k, v in r["losses"].items()}
                 f.write(json.dumps(r) + "\n")
-    return dict(ORIG_TB_DIR=tb, OURS_JSONL=jp), [tb, jp]
+    ours_exp = os.path.join(td, "ours_exp")
+    over = dict(ORIG_TB_DIR=tb, OURS_JSONL=jp, OURS_EXP=ours_exp)
+    if pairs is not None:
+        over["PAIRS"] = pairs
+    apply_ident(over, tb, ours_exp, ident)
+    return over, [tb, jp]
 
 
 def sovits_fixture(td, steps=None, jitter=0.0):
@@ -132,7 +169,10 @@ def sovits_fixture(td, steps=None, jitter=0.0):
             for r in rows:
                 r["losses"] = {k: v + jitter for k, v in r["losses"].items()}
                 f.write(json.dumps(r) + "\n")
-    return dict(ORIG_TB_DIR=tb, OURS_JSONL=jp), [tb, jp]
+    ours_exp = os.path.join(td, "ours_exp")
+    over = dict(ORIG_TB_DIR=tb, OURS_JSONL=jp, OURS_EXP=ours_exp)
+    apply_ident(over, tb, ours_exp, "same")
+    return over, [tb, jp]
 
 
 V2_TAGS = ["loss/total", "loss/mel", "loss/adv", "loss/fm", "loss/mel_ddsp",
@@ -140,11 +180,17 @@ V2_TAGS = ["loss/total", "loss/mel", "loss/adv", "loss/fm", "loss/mel_ddsp",
 V2_KEYS = ["g_total", "mel", "adv", "fm", "mel_ddsp", "spec_ddsp", "mel_am", "kl", "lf0"]
 
 
-def v2_fixture(td, steps=None, none_at=None, jitter=0.0):
+def v2_fixture(td, steps=None, none_at=None, jitter=0.0, orig_nan_at=None):
     steps = steps if steps is not None else list(range(14))
     tb = os.path.join(td, "orig")
-    write_tb(tb, {t: {s: 1.0 + 0.01 * s + 0.001 * i for s in steps}
-                  for i, t in enumerate(V2_TAGS)})
+    series = {t: {s: 1.0 + 0.01 * s + 0.001 * i for s in steps}
+              for i, t in enumerate(V2_TAGS)}
+    # ⛔ S140:往**参照（TB）那一侧**注射非有限值 —— `require_no_none` 只吃我方 JSONL，
+    #    而旧的滚动比较 `if rel > worst[0]` 对 NaN 恒为 False ⇒ 无论在哪一步都被丢掉。
+    for _s in (orig_nan_at or []):
+        if _s in series[V2_TAGS[0]]:
+            series[V2_TAGS[0]][_s] = float("nan")
+    write_tb(tb, series)
     jp = os.path.join(td, "ours.jsonl")
     ov = {}
     for s in (none_at or []):
@@ -158,10 +204,13 @@ def v2_fixture(td, steps=None, none_at=None, jitter=0.0):
                 r["losses"] = {k: (v + jitter if v is not None else None)
                                for k, v in r["losses"].items()}
                 f.write(json.dumps(r) + "\n")
-    return dict(ORIG_TB_DIR=tb, OURS_JSONL=jp), [tb, jp]
+    ours_exp = os.path.join(td, "ours_exp")
+    over = dict(ORIG_TB_DIR=tb, OURS_JSONL=jp, OURS_EXP=ours_exp)
+    apply_ident(over, tb, ours_exp, "same")
+    return over, [tb, jp]
 
 
-def diff_fixture(td, train_steps=None, val_steps=(8, 16, 24), jitter=0.0):
+def diff_fixture(td, train_steps=None, val_steps=(8, 16, 24), jitter=0.0, orig_nan_at=None):
     train_steps = list(range(1, 25)) if train_steps is None else train_steps
     o, u = os.path.join(td, "orig", "logs"), os.path.join(td, "ours", "logs")
     for d, j in ((o, 0.0), (u, jitter)):
@@ -169,8 +218,14 @@ def diff_fixture(td, train_steps=None, val_steps=(8, 16, 24), jitter=0.0):
         if train_steps:
             series["train/loss"] = {s: 1.0 + 0.01 * s + j for s in train_steps}
         series["validation/loss"] = {s: 0.5 + 0.001 * s + j for s in val_steps}
+        if d is o:
+            for _s in (orig_nan_at or []):
+                if "train/loss" in series and _s in series["train/loss"]:
+                    series["train/loss"][_s] = float("nan")
         write_tb(d, series)
-    return dict(ORIG_DIR=o, OURS_DIR=u), [o, u]
+    over = dict(ORIG_DIR=o, OURS_DIR=u)
+    apply_ident(over, os.path.dirname(o), os.path.dirname(u), "same")
+    return over, [o, u]
 
 
 VOC_TRAIN = ["training/DmpdlossF", "training/DmpdlossT", "training/DmsdlossF",
@@ -179,7 +234,8 @@ VOC_TRAIN = ["training/DmpdlossF", "training/DmpdlossT", "training/DmsdlossF",
 VOC_VAL = ["validation/stft_loss", "validation/total_loss"]
 
 
-def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False):
+def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False,
+                nan_tag=None, extra_tag_ours=False):
     o, u = os.path.join(td, "orig"), os.path.join(td, "ours")
     tsteps = [2 * (i + 1) for i in range(n_train)]
     vsteps = [0, 10, 20, 30]
@@ -194,8 +250,15 @@ def voc_fixture(td, n_train=15, rename=False, jitter=0.0, empty=False):
         for i, t in enumerate(VOC_VAL):
             name = t.replace("validation/", "val/") if rename else t
             series[name] = {s: 0.5 + 0.001 * s + j for s in vsteps}
+        if nan_tag and d is o:
+            series[nan_tag] = {s: float("nan") for s in series[nan_tag]}
+        if extra_tag_ours and d is u:
+            series["training/BRAND_NEW"] = {s: 1.0 for s in tsteps}
         write_tb(d, series)
-    return dict(ORIG_LOGS=o, OURS_LOGS=u), [o, u]
+    orig_exp = os.path.join(td, "orig_exp")
+    over = dict(ORIG_LOGS=o, OURS_LOGS=u, ORIG_EXP=orig_exp, GATE_ROOT=td)
+    apply_ident(over, orig_exp, u, "same")
+    return over, [o, u]
 
 
 # ─────────────────────────────────────────────────────────── 场景表
@@ -241,6 +304,48 @@ def build_cases():
         ("rvc/致盲区内我方=1e9(闸自陈看不见)", "gate1_compare.py",
          lambda td: rvc_fixture(td, kl_override={(0, "kl"): 1e9, (2, "kl"): 1e9}),
          0, "在数值上不可证伪"),
+
+        # ── ⛔⛔ S140:**参照(TB)那一侧的非有限值**。此前五条里只有 vocoder 判它;
+        #    diff 用内置 `max(生成器)`、sovits_v2 用滚动 `if rel > worst[0]`,
+        #    而 NaN 的一切比较都是 False ⇒ **静默丢掉**(v2 连首位都丢,九分量全 NaN 时
+        #    打 `max_rel=0.000e+00 @ step -1` 并 PASS)。而 NaN 正是这台闸的立项理由。
+        #    ⚠ **首步与中间步各一条** —— 内置 max 的行为**取决于 NaN 落在哪一位**,
+        #      只测一处会得到一条「红对了但理由不是我以为的那个」的绿。
+        ("v2/参照 TB 首步 NaN", "gate1_sovits_v2_compare.py",
+         lambda td: v2_fixture(td, orig_nan_at=[0]), 1, "非有限"),
+        ("v2/参照 TB 中间步 NaN", "gate1_sovits_v2_compare.py",
+         lambda td: v2_fixture(td, orig_nan_at=[7]), 1, "非有限"),
+        ("diff/参照 TB 首步 NaN", "gate1_diff_compare.py",
+         lambda td: diff_fixture(td, orig_nan_at=[1]), 1, "非有限"),
+        ("diff/参照 TB 中间步 NaN", "gate1_diff_compare.py",
+         lambda td: diff_fixture(td, orig_nan_at=[12]), 1, "非有限"),
+        ("voc/某 tag 全非有限", "gate1_vocoder_compare.py",
+         lambda td: voc_fixture(td, nan_tag="training/Gmpdloss"), 1, "非有限"),
+
+        # ── ⛔ S140:单侧多一个 tag。S139 重写时把「两臂 tag 集合相等」删掉了而没记账
+        #    ⇒ 「我方多 log 了一个量 / 上游新增了一个」今天是**零信号**。
+        ("voc/我方单侧多一个 tag", "gate1_vocoder_compare.py",
+         lambda td: voc_fixture(td, extra_tag_ours=True), 3, "tag 集合"),
+
+        # ── ⛔ S140:登记的分量数变判据。此前 EXPECT[*]["components"] 是**零读者**,
+        #    从 PAIRS 里删掉一个分量 ⇒ 每行照打 [PASS]、总判照打 ALL PASS,转录零变化。
+        ("rvc/PAIRS 少一个分量(登记 5)", "gate1_compare.py",
+         lambda td: rvc_fixture(td, pairs=[["loss/g/total", "g_total", None],
+                                           ["loss/d/total", "d_total", None],
+                                           ["loss/g/fm", "fm", None],
+                                           ["loss/g/mel", "mel", 75.0]]),
+         3, "两份登记对不上"),
+
+        # ── ⛔ S140:输入身份。**缺席**此前只打一行字(汇报不是判据);
+        #    **两侧不同**那条在生产链上结构不可能红(五个 prepare 把同一个 ident 写两侧),
+        #    所以它只能在这里被真触发一次 —— 两条一起才说明这台机器还有牙。
+        ("rvc/输入身份缺席(orig 侧)", "gate1_compare.py",
+         lambda td: rvc_fixture(td, ident="absent_orig"), 3, "输入身份缺席"),
+        ("rvc/输入身份缺席 +放行", "gate1_compare.py",
+         lambda td: rvc_fixture(td, ident="absent_orig"), 0, "PASS-WITH-GAPS",
+         "normal", ("--allow-uncovered",)),
+        ("rvc/两侧输入身份不同", "gate1_compare.py",
+         lambda td: rvc_fixture(td, ident="differ"), 3, "两侧吃的不是同一棵树"),
 
         # ── 阳性对照:数值真的差必须红(exit 1),而不是 3 ────────────
         ("rvc/数值差 5%", "gate1_compare.py", lambda td: rvc_fixture(td, jitter=0.05),

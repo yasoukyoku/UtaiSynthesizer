@@ -76,6 +76,21 @@ work = ORIG / "experiments" / "gate1_voc"
 if work.exists():
     shutil.rmtree(work)
 
+# ⛔⛔ S140:把 prepare 记下的**输入身份**搬到这条臂**真正的** expdir 里。
+#    此前它只写在 `TESTING\gate1_vocoder\orig\` —— 而那个目录**原版臂从头到尾不碰**
+#    (实测今天 0 件),原版臂的 expdir 是上面这个 `work`,compare 的 ORIG_LOGS 也指那里。
+#    ⇒ 那条 `[INPUT-ID] orig` 行挂在一个与被读数据**没有任何因果链**的空壳上,
+#      而「一个指着无关目录的身份比没有身份更坏」。
+#    ⚠ 必须在 rmtree **之后**写(否则连同 expdir 一起被自己删掉)。
+_ident_src = GATE / "orig" / "gate1_input.identity.json"
+work.mkdir(parents=True, exist_ok=True)
+if _ident_src.is_file():
+    shutil.copy2(str(_ident_src), str(work / "gate1_input.identity.json"))
+else:
+    sys.stderr.write(
+        "[NO-INPUT-ID] gate1_vocoder_run_orig:%s 不在 ⇒ 这条臂的 expdir 里不会有输入身份"
+        "(本轮没跑 prepare?)\n" % _ident_src)
+
 sys.argv = [
     "train.py",
     "--config", str(GATE / "gate_config.yaml"),

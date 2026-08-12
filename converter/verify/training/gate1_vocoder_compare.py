@@ -38,7 +38,6 @@
    ⇒ 走默认(scalars 上限 10000,超了 reservoir **随机抽样**)。今天 15 点用不到,但它是一颗
    「把 gate 放大一点就两侧各自随机丢点」的地雷,而 tag 集合判据对这种丢失是瞎的。
 """
-import math
 import os
 import sys
 
@@ -49,8 +48,8 @@ CHAIN = "vocoder"
 GATE = "GATE1 VOCODER"
 GATE_ROOT = r"D:\MyDev\TESTING\gate1_vocoder"
 # orig 跑在上游仓库树里(它的 DsModelCheckpoint 断言 cwd 是 work_dir 的祖先,见 run_orig 头注)
-ORIG_LOGS = os.path.join(r"D:\MyDev\SingingVocoders\experiments\gate1_voc",
-                         "lightning_logs", "lastest")
+ORIG_EXP = r"D:\MyDev\SingingVocoders\experiments\gate1_voc"
+ORIG_LOGS = os.path.join(ORIG_EXP, "lightning_logs", "lastest")
 OURS_LOGS = os.path.join(GATE_ROOT, "ours", "gate1_voc", "lightning_logs", "lastest")
 TOL = 1e-7
 
@@ -70,10 +69,12 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig logs", ORIG_LOGS), ("ours logs", OURS_LOGS)])
-    # ⚠ 身份记在 prepare 造的 GATE/{orig,ours} 里 —— 而 orig 侧的 **expdir** 在上游树
-    #   (`SingingVocoders\experiments\gate1_voc`,由 run_orig 自清),两者不是一个地方。
-    G1.say_input_identity([("orig", os.path.join(GATE_ROOT, "orig")),
-                           ("ours", os.path.join(GATE_ROOT, "ours"))])
+    # ⛔ S140:orig 侧的身份改从**这条臂真正的 expdir** 读(= ORIG_LOGS 的祖父目录,
+    #    `SingingVocoders\experiments\gate1_voc`),由 `gate1_vocoder_run_orig.py`
+    #    在它自清之后从 prepare 那里搬过去。此前读的是 `GATE_ROOT/orig` ——
+    #    一个原版臂从头到尾不碰的空壳(实测 0 件)⇒ 那行 `[INPUT-ID] orig` 与被读的数据
+    #    **没有任何因果链**,而一个指着无关目录的身份比没有身份更坏。
+    G1.say_input_identity([("orig", ORIG_EXP), ("ours", os.path.join(GATE_ROOT, "ours"))])
 
     exp = G1.EXPECT[CHAIN]
     if len(REQUIRED_TAGS) != exp["tags"]:
@@ -94,6 +95,17 @@ def main():
     G1._say("[COVERAGE] 两侧都带齐了登记的 %d 个 tag(9 training + 2 validation)"
             % len(REQUIRED_TAGS))
 
+    # ⛔ S140:补回 S139 重写时**被删掉且没记账**的那半条 —— 两臂 tag 集合必须相等。
+    #    今天的 `tb_scalars` 只判「每一臂各自 ⊇ 登记名单」,对「**单侧**多出一个标量」零信号。
+    set_a, set_b = G1.tb_tag_set(ORIG_LOGS), G1.tb_tag_set(OURS_LOGS)
+    if set_a != set_b:
+        raise G1.GateUnrunnable(
+            "两臂的标量 tag 集合**不同**:只在 orig %s;只在 ours %s\n"
+            "       ⇒ 一侧比另一侧多 log 了东西 ⇒ 两侧写出来的不是同一组量,不构成对拍。\n"
+            "       (⚠ 这与「两侧同时改名」那条是**两件事**:登记名单挡的是同源同改,"
+            "这一条挡的是单侧新增。两条都要在。)"
+            % (sorted(set_a - set_b)[:8], sorted(set_b - set_a)[:8]))
+
     for tag in REQUIRED_TAGS:
         want = exp["train_points"] if tag.startswith("training/") else exp["val_points"]
         pa, pb = a[tag], b[tag]
@@ -105,20 +117,21 @@ def main():
         if sorted(pa) != sorted(pb):
             raise G1.GateUnrunnable(
                 "%s: 两侧步轴不同 orig=%s ours=%s" % (tag, sorted(pa)[:8], sorted(pb)[:8]))
-        worst = 0.0
-        for s in sorted(pa):
-            va, vb = pa[s], pb[s]
-            # 审查修复(S40 起):python max() 会静默丢掉 NaN 操作数 ——
-            # 任何一侧的非有限值必须 FAIL,绝不许消失进一个绿色的 max_rel
-            if not (math.isfinite(va) and math.isfinite(vb)):
-                failures.append("%s@%d 非有限(%r vs %r)" % (tag, s, va, vb))
-                continue
-            worst = max(worst, abs(va - vb) / max(abs(va), abs(vb), 1e-12))
-        ok = worst <= TOL
-        G1._say("[%s] %-28s %2d 点, max_rel %.3e <= %.0e"
-                % ("PASS" if ok else "FAIL", tag, len(pa), worst, TOL))
-        if not ok:
-            failures.append(tag)
+        # ⛔ S140:这一段(S40 就写对了的那条非有限判据)已经搬进
+        #    `gate1_guard.compare_pairs`,五条 compare 现在共用同一个实现 ——
+        #    孪生的 diff / sovits_v2 四个月来一直是纯 python 的 `max()` / `if r > worst`,
+        #    **静默丢 NaN**。⛔ 别在这里再留第二份。
+        # ⛔ 同批修掉一条它自己的:原来打印的是 `len(pa)`(送进来的点数),
+        #    而某个 tag 全非有限时它会打 **`[PASS] … 15 点, max_rel 0.000e+00`**
+        #    ——`failures` 里同时躺着 15 条,最终 rc 是对的,**但那一行在说谎**,
+        #    而且把覆盖面高报成 15(实际比过 0)。现在打的是**真比过的对数**。
+        r = G1.compare_pairs(tag, [(s, tag, pa[s], pb[s]) for s in sorted(pa)],
+                             TOL, floor=1e-12, symmetric=True, min_cmp=want)
+        ok = not r["failures"]
+        G1._say("[%s] %-28s %2d 点真比过(送进 %d), max_rel %.3e @step %s <= %.0e"
+                % ("PASS" if ok else "FAIL", tag, r["n_cmp"], len(pa),
+                   r["worst"], r["worst_step"], TOL))
+        failures.extend(r["failures"])
 
     G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 

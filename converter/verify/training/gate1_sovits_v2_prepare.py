@@ -42,15 +42,43 @@ def main():
     assert cfg["train"]["num_workers"] == 0, "gate 需要双侧 num_workers=0"
     cfg["train"]["log_interval"] = 1
     cfg["train"]["eval_interval"] = 1000
-    with open(GATE_CFG, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     # filelist sanity: absolute paths must exist (batch composition = line order + seed)
+    # ⛔ S140:裸 `assert` 走 `G1.run` 的 `except Exception` 兜底 ⇒ 退 3 但措辞是
+    #    「闸自己炸了 —— 下面是转录」,而它说的其实是「输入不合法 / gate0 没跑过」。
+    #    一条红两种归因,正是 S129 铁律要拆开的。同批里 rvc 与 diff 早就换成 GateUnrunnable 了。
     for key in ("training_filelist", "validation_filelist"):
         with open(cfg["data"][key], encoding="utf-8") as f:
             for line in f:
                 p = line.strip()
-                assert not p or os.path.exists(p), "filelist 路径缺失: %s" % p
+                if p and not os.path.exists(p):
+                    raise G1.GateUnrunnable(
+                        "gate1/sovits_v2:filelist(%s)里的路径不在盘上:%s\n"
+                        "       ⇒ gate0(v2)的产物缺件 ⇒ 这一轮不构成一次对拍。" % (key, p))
+
+    # ⛔⛔ S140:底模断言与输入身份**必须排在下面那段 33 次 copyfile 之前**。
+    #    S139 这一笔的主题就是「全部前置断言前移到第一句破坏之前」,而这个文件**没做干净**:
+    #    原顺序是 写 GATE_CFG → 33 次 copyfile 写进 **gate0 的池** → 算身份 → 才查底模
+    #    ⇒ 底模缺席时判 UNRUNNABLE,而 **gate0 的池已经被改过了**(纯新增,而 S137 刚买回
+    #      「`assert_pool_intact` 从不算新增的文件」⇒ gate0 侧的完整性判据对它结构上是瞎的)。
+    for n in ("G_0.pth", "D_0.pth"):
+        if not os.path.isfile(os.path.join(BASE_DIR, n)):
+            raise G1.GateUnrunnable("底模缺 %s:%s" % (n, BASE_DIR))
+
+    spk_dir = os.path.join(GATE0_EXP, "dataset_44k", "gate")
+    # ⛔ S140 输入身份 —— **算在我们自己往这棵树里写 .mel.npy 之前**,而且用后缀白名单
+    #    把 `.mel.npy` 排除在外。两条理由:
+    #    ⑴ 算在写之后 ⇒ 身份描述的是「一棵被本次 prepare 改过的树」,它答不了
+    #       「这是哪一棵 gate0 树」这个它自称要答的问题;
+    #    ⑵ `.mel.npy` 是 prepare 自己造的**副本**,不是 gate0 的产物 ⇒ 把它算进去会让
+    #       同一棵 gate0 树在「第一次跑」与「第二次跑」得到两个不同的 sha(132 vs 165)。
+    #    真值(2026-08-12 实测):33 .wav + 33 .aam80.npy + 33 .f0.npy + 33 .soft.pt = 132。
+    ID_SUFFIXES = (".wav", ".aam80.npy", ".f0.npy", ".soft.pt")
+    ident = G1.src_identity("gate1/sovits_v2 的输入(gate0 v2 的 dataset_44k/gate,不含我们造的 .mel.npy)",
+                            spk_dir, [""], min_files=132, suffixes=list(ID_SUFFIXES))
+
+    with open(GATE_CFG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     # upstream lazy-mel cache: duplicate .aam80.npy -> .mel.npy (see header)
     #
@@ -62,7 +90,6 @@ def main():
     # The copy is cheap (33 files) and this is a prepare step, so: copy UNCONDITIONALLY and report
     # fresh vs overwritten separately, so "0 new / 33 refreshed" reads as the normal steady state
     # and "0 / 0" reads as "gate0 has not run" instead of hiding under the same number.
-    spk_dir = os.path.join(GATE0_EXP, "dataset_44k", "gate")
     fresh = refreshed = 0
     for n in os.listdir(spk_dir):
         if n.endswith(".aam80.npy"):
@@ -72,19 +99,14 @@ def main():
             else:
                 fresh += 1
             shutil.copyfile(os.path.join(spk_dir, n), dst)
-    assert fresh + refreshed > 0, (
-        "no .aam80.npy under %s — gate0 (v2) has not produced anything, so the upstream lazy-mel "
-        "cache would be whatever an older run left behind" % spk_dir
-    )
-    print("aam80 -> mel.npy for the upstream lazy cache: %d new, %d refreshed" % (fresh, refreshed))
-
-    # ⛔ S139 输入身份:这条链的输入是 gate0(v2)的 dataset_44k/gate ——
-    #    见 gate1_guard 的「输入身份」一段。**必须在 rmtree 之前算**。
-    ident = G1.src_identity("gate1/sovits_v2 的输入(gate0 v2 的 dataset_44k/gate)",
-                            spk_dir, [""], min_files=10)
-    for n in ("G_0.pth", "D_0.pth"):
-        if not os.path.isfile(os.path.join(BASE_DIR, n)):
-            raise G1.GateUnrunnable("底模缺 %s:%s" % (n, BASE_DIR))
+    if fresh + refreshed == 0:
+        raise G1.GateUnrunnable(
+            "gate1/sovits_v2:%s 下一个 .aam80.npy 都没有 ⇒ gate0(v2)什么也没产出,\n"
+            "       而上游的 lazy-mel 缓存就会是更早一轮留下的任何东西。" % spk_dir)
+    # ⚠ S140 预期读数:今天该目录 `.mel.npy` = **0 个**(08-11 17:53 gate0 v2 重跑把上一轮的清了)
+    #    ⇒ 这一跑应当打 **33 new, 0 refreshed**。打出 refreshed>0 说明有一轮没清干净的陈 mel,
+    #    当场停下来查(S134 那次打的是 0 new / 33 refreshed,那是它自己上一跑留下的)。
+    G1._say("aam80 -> mel.npy for the upstream lazy cache: %d new, %d refreshed" % (fresh, refreshed))
 
     for exp in (ORIG_EXP, OURS_EXP):
         if os.path.isdir(exp):

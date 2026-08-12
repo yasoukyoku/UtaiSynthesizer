@@ -29,6 +29,23 @@ OURS_EXP = os.path.join(TESTING, "gate1_ours")
 
 SUBDIRS = ["0_gt_wavs", "2a_f0", "2b-f0nsf", "3_feature768", "mute"]
 
+# ⛔⛔ S140:身份/断言那一侧**必须用展开过的这一份**,不能直接喂 SUBDIRS。
+#    `mute` 是**目录套目录**(mute/0_gt_wavs/mute48k.wav 等四件全在下一层),而
+#    `gate0_guard.collect` 是**非递归**的(:186-190 `if not os.path.isfile(p): continue`)
+#    ⇒ `src_identity` 的 `empty_subs` 会把 `mute` 判成空子目录并抛 GateUnrunnable
+#    ⇒ rvc 这条链在 prepare 的第一句断言上退 3,跑器退 6。**实测复现过。**
+#    而拷贝端 `copy_artifacts` 用的是**递归**的 `shutil.copytree` ⇒ 两边口径不一致。
+#    ⚠ 这条分支自 S139 写下起从没在真夹具上执行过(S139 §7-A 亲口写着本场没跑任何 prepare),
+#      而它的自检夹具是**扁平**目录,结构上盖不到这一形。
+#    ⛔ **不许把 `mute` 从名单里删掉**:它是 filelist 53 条里的 2 条,删掉等于让输入身份
+#      对**真参与训练的样本**装瞎。⛔ 也不许改 `collect`(它是 gate0 dirhash 的地基)。
+ID_SUBS = ["0_gt_wavs", "2a_f0", "2b-f0nsf", "3_feature768",
+           "mute/0_gt_wavs", "mute/2a_f0", "mute/2b-f0nsf", "mute/3_feature768"]
+# 真值(2026-08-12 实测):51×4 + 1×4 = 208。⛔ 地板必须是**这条链的真值**,
+# 不是一个与真值无关的常数 —— 那正是 `gate1_guard.py:93-96` 立的纪律,而 S139
+# 自己在这五个调用点上写的是 200/10/10/10/5(另外四条比真值低 4~26 倍)。
+ID_MIN_FILES = 208
+
 
 def copy_artifacts(dst):
     if os.path.isdir(dst):
@@ -66,8 +83,8 @@ def main():
     #    FileNotFoundError,留下「参照侧已经删了、只重建了一半」的残局(S139 实测:
     #    只缺 `3_feature768` ⇒ 退 1,而原版侧落点已残留 12 件 / 5 个子目录只建了 3 个)。
     #    ⚠ 五个 prepare 里只有 `gate1_diff_prepare.py` 原本就把断言放在 rmtree 之前。
-    ident = G1.src_identity("gate1/rvc 的输入(= gate0 的 rvc_ours)", SRC, SUBDIRS,
-                            min_files=200)
+    ident = G1.src_identity("gate1/rvc 的输入(= gate0 的 rvc_ours)", SRC, ID_SUBS,
+                            min_files=ID_MIN_FILES)
     for extra in ("filelist.txt", "config.json"):
         if not os.path.isfile(os.path.join(SRC, extra)):
             raise G1.GateUnrunnable("gate1/rvc 的输入缺 %s:%s" % (extra, SRC))

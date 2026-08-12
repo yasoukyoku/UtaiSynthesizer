@@ -53,6 +53,7 @@ S139 实测、这个模块要挡住的六种事故(全部在真代码上复现�
 
 自检:`python gate1_guard.py --selftest`
 """
+import math
 import os
 import sys
 
@@ -175,6 +176,22 @@ def tb_scalars(label, logdir, tags, t0, frozen_why=None):
     return {t: {e.step: e.value for e in acc.Scalars(t)} for t in tags}
 
 
+def tb_tag_set(logdir):
+    """这一侧 TB 里**全部**标量 tag 的集合(不是被登记名单过滤之后的那一份)。
+
+    ⛔ S140:S139 重写 `gate1_vocoder_compare` 时**把「两臂 tag 集合相等」那条判据删掉了,
+       而没有人记账**。老版判的是两侧集合相等;今天 `tb_scalars:169-174` 只算
+       `missing = want - have`,即**每一臂各自 ⊇ 登记名单**,两臂之间再也不比
+       ⇒ 「一侧多出一个标量」(= 我方多 log 了一个量 / 上游新增了一个)现在**零信号**。
+       净账:对「同源同改名」的覆盖上去了(那是 S139 买的),对「单侧新增」的覆盖下去了,
+       而**只有前半句被写进了文件头**。两条并存才是全的,这个函数补的是后半句。
+    """
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    acc = EventAccumulator(logdir, size_guidance={"scalars": 0})
+    acc.Reload()
+    return set(acc.Tags()["scalars"])
+
+
 def tb_all_scalars(label, logdir, t0, prefixes, frozen_why=None):
     """声码器那条用:tag 名不预先知道,按前缀取。⛔ 但**前缀本身要当判据**(见头注 ⑶)。"""
     scal = tb_scalars(label, logdir, [], t0, frozen_why=frozen_why)  # 先过前四道
@@ -237,6 +254,109 @@ def require_no_none(label, steps, keys):
         return ["%s: %d 个分量是 None(= 非有限值,protocol 的 _clean 写成 None)⇒ **发散**:%s"
                 % (label, len(bad), head)]
     return []
+
+
+def compare_pairs(label, items, line, floor=1e-6, symmetric=False, min_cmp=1):
+    """逐对求相对差 —— 五条 compare 唯一的比较实现。
+
+    `items` = [(step, tag, a, b)],a = 参照侧,b = 我方侧。
+    返回 dict(worst, worst_tag, worst_step, mean, n_cmp, n_bad, failures)。
+
+    ⛔⛔ 立项理由(S140 实测,三条各对着一次真事故):
+    ⑴ **非有限值必须红并点名,绝不许消失进一个绿色的 max_rel。**
+       python 的 `max()` 与 `if rel > worst` 对 NaN 的**一切**比较都是 False ⇒
+       前者在 NaN 不落在首位时静默丢掉它,后者**连首位都丢**。实测:
+         · `gate1_sovits_v2_compare.py:89-96` 的滚动式 —— 九个分量在所有步全是 NaN 时,
+           打 `max_rel=0.000e+00 ( @ step -1)` 并 **PASS**;
+         · `gate1_diff_compare.py:90/:110` 的内置 `max(生成器)` —— NaN 在中间就 PASS,
+           在首位才 FAIL ⇒ **同一份数据,结论取决于步的顺序**。
+       而 **NaN 正是这台闸的立项理由**(头注 ⑸)。
+       ⚠ 这条 `gate1_vocoder_compare.py:111-112` 早在 **S40** 就修好并写下了原话
+         (「python max() 会静默丢掉 NaN 操作数」)—— 修在孪生脚本、**四个月零回移**。
+         与 `gate0_guard` 头注 ⑴ 记的 S68 那段(判 major、在孪生脚本修好、从没回移、开了
+         25 天)是**同一个形状的第三次**。这次收成一处,别再分叉。
+    ⑵ **判据一律写成否定式** `not (rel <= line)`:NaN 落在 failures 那一侧,
+       而不是靠 `rel > line` 恰好为 False 混过去。
+    ⑶ **打印的点数必须是真正比过的对数**,不是 `len(pa)`。实测:某个 tag 全非有限时,
+       `gate1_vocoder_compare.py:118` 会打 `[PASS] … 15 点, max_rel 0.000e+00`,
+       而 failures 里同时躺着 15 条 —— 码是对的,**那一行在说谎**(S134 §5.1 的镜像版)。
+
+    `symmetric=False` ⇒ 分母 `max(|a|, floor)`(以**参照侧**为基准,四条链的口径);
+    `symmetric=True`  ⇒ 分母 `max(|a|, |b|, floor)`(声码器那条的口径)。
+    """
+    failures = []
+    worst, worst_tag, worst_step = 0.0, None, None
+    total, n_cmp = 0.0, 0
+    for step, tag, a, b in items:
+        if not (isinstance(a, (int, float)) and isinstance(b, (int, float))
+                and math.isfinite(a) and math.isfinite(b)):
+            # ⛔ 点名两侧各是什么 —— 「哪一侧发散了」决定归因(参照物坏了 vs 被测的东西不对)
+            failures.append("%s %s@step %s **非有限**(orig=%r ours=%r)" % (label, tag, step, a, b))
+            continue
+        den = max(abs(a), abs(b), floor) if symmetric else max(abs(a), floor)
+        rel = abs(a - b) / den
+        n_cmp += 1
+        total += rel
+        if rel > worst:
+            worst, worst_tag, worst_step = rel, tag, step
+    # ⛔⛔ **地板写在循环体外** —— 本仓已连续三场买到「地板写在循环体内 ⇒ 零轮时没有地板」
+    #    (S136 / S137 / S139)。这里是第四次出现同一个位置的机会,提前堵上:
+    #    如果一条路上一个可比的对都没有(全被 clamp 吃掉 / 两侧都空),
+    #    那是**这一路本轮零覆盖**,不是「max_rel = 0.0 所以通过」。
+    # ⛔⛔ 但**顺序是承重的**:非有限值也会把 n_cmp 压到 0,而那时的真相是
+    #    「被测的东西发散了」(exit 1),不是「零覆盖」(exit 3)。先判 failures 再判地板 ——
+    #    反过来写就会用一条 exit 3 掩盖掉一条真红,而 NaN 正是这台闸的立项理由。
+    #    (S139 §6-2 记过同族:发现 None 之后没立刻收尾 ⇒ TypeError 被归成「闸炸了」。)
+    if (not failures) and n_cmp < min_cmp:
+        raise GateUnrunnable(
+            "%s: 真正比过的对数是 %d,下限 %d(送进来 %d 对)\n"
+            "       ⇒ 这一路本轮**零覆盖 / 覆盖不足**,不构成一次判定。\n"
+            "       ⚠ 别读成「max_rel=0 所以通过」—— 零轮的 max 恒等于初值。"
+            % (label, n_cmp, min_cmp, len(items)))
+    # ⛔ 否定式:NaN 永远进不到这里(上面已拦),但同一条纪律要写在判据本身上
+    if not (worst <= line):
+        failures.append("%s %s@step %s max_rel=%.3e > 线 %.0e" % (label, worst_tag, worst_step, worst, line))
+    return {"worst": worst, "worst_tag": worst_tag, "worst_step": worst_step,
+            "mean": (total / n_cmp) if n_cmp else 0.0,
+            "n_cmp": n_cmp, "n_bad": len(failures), "failures": failures}
+
+
+def require_components(chain, n, what="PAIRS"):
+    """把 `EXPECT[chain]["components"]` 从一个**零读者的登记数**变成一条判据。
+
+    ⛔ S140 实测:`components`(rvc 5 / sovits 6 / sovits_v2 9)全仓**只有定义处、没有读出处**
+       ⇒ 「这一跑比了几个分量」这件事今天由 `PAIRS` 自己说了算 = 自证。
+       从 `gate1_compare.PAIRS` 里删掉 `loss/g/kl`,这一跑只比 4 个分量,
+       每行照打 `[PASS]`、`finish` 照打 `ALL PASS` 退 0,**转录上没有任何数字会变**。
+    ⭐ 正确形状本来就在同一层:`gate1_vocoder_compare.py:79-82` 的
+       「两份登记必须自洽」交叉判死。这里把它推广到另外三条。
+    """
+    want = EXPECT[chain].get("components")
+    if want is None:
+        raise GateUnrunnable("EXPECT[%s] 没有登记 components ⇒ 这条链说不出它该比几个分量" % chain)
+    if n != want:
+        raise GateUnrunnable(
+            "闸自己的两份登记对不上:%s 有 %d 条,而 EXPECT[%s][components]=%d\n"
+            "       ⇒ 有人加/删了一个被比较的分量,而没有同时改登记值。\n"
+            "         这不是「数值不一致」,是**这一跑到底比了什么**变了。" % (what, n, chain, want))
+    _say("[COVERAGE] %s: 比 %d 个分量,与登记值相等" % (chain, n))
+
+
+def require_same_step_set(label, mapping, steps, tag):
+    """每个 tag 的步集都要与主判据的步集相同。
+
+    ⛔ S140 实测:三条链**只有一个 tag** 的步集被 `require_exact_steps` 覆盖,
+       其余 4/5/8 个 tag 一个都没判 —— 少点时是 `KeyError` 兜底(被 `run()` 归成
+       「闸自己炸了」exit 3,**码对措辞错**),**多点时完全静默**。
+       ⚠ 别用 try/except KeyError 兜:那只会把「多点」那一半继续藏着。
+    """
+    got = set(mapping)
+    want = set(steps)
+    if got != want:
+        raise GateUnrunnable(
+            "%s / %s 的步集与主判据不同(各 %d/%d 步):只在它 %s;只在主判据 %s\n"
+            "       ⇒ 这一路与主 tag 对不齐 ⇒ 不构成一次对拍(⚠ 少点会被读成闸炸了,多点今天完全静默)。"
+            % (label, tag, len(got), len(want), sorted(got - want)[:8], sorted(want - got)[:8]))
 
 
 # ────────────────────────────────────────────────────────────────── 覆盖判据
@@ -367,7 +487,22 @@ def src_identity(label, root, subs, min_files, suffixes=None):
     if empty_subs:
         raise GateUnrunnable(
             "%s: 源树的这些子目录**是空的**:%s(root=%s)\n"
-            "       ⇒ 合计件数够不代表每一类都在。" % (label, empty_subs, root))
+            "       ⇒ 合计件数够不代表每一类都在。\n"
+            "       ⚠ 若那个子目录其实是**目录套目录**(里面只有下一层),那不是「空」——\n"
+            "         `gate0_guard.collect` 是**非递归**的(:186-190 `if not isfile: continue`),\n"
+            "         而拷贝端 `shutil.copytree` 是递归的 ⇒ 两边口径不一致。\n"
+            "         正确修法是在**调用点**把那一层展开成 `父/子` 形式的 subs,\n"
+            "         ⛔ 不许改 `collect` 本身(它同时是 gate0 的 dirhash / require_fresh 的地基)。"
+            % (label, empty_subs, root))
+    # ⛔ S140:`suffixes=None` 时 `collect` **不过滤任何东西** ⇒ 一个下载了一半的 `.part`
+    #    会同时顶满件数下限、并静默进 dirhash(变成一条「身份变了但没人说得出为什么」的红)。
+    #    gate0 那一层有对应断言(`run_gate0_chain.py:156-182`),gate1 此前一条都没有。
+    junk = sorted(p for p, _m in items if p.endswith((".part", ".tmp", ".crdownload")))
+    if junk:
+        raise GateUnrunnable(
+            "%s: 源树里有 %d 个未完成/临时文件(.part/.tmp):%s\n"
+            "       ⇒ 它们会同时顶满件数下限并进入身份指纹 ⇒ 先清理再跑。"
+            % (label, len(junk), junk[:5]))
     import time as _t
     sha = dirhash(root, subs, suffixes)
     total = sum(os.path.getsize(p) for p, _m in items)
@@ -447,11 +582,24 @@ def say_input_identity(exp_dirs):
     """把「这一轮的输入是哪一次 gate0 产的」打进读数头。
 
     ⛔ 缺席时**响亮说明**,不许安静 —— 「没有记录」和「记录说一切正常」必须长得不一样。
+
+    ⛔⛔ **这条判据今天能回答的比它的名字小,写清楚别当成它不是的东西**(S140 实测):
+       五个 prepare 都是**算一次 `ident`、再在同一个 for 循环里写给两侧**
+       (`gate1_prepare.py:69`→`:75-82` 与另外四处同形)⇒ 下面那条
+       「两侧 sha 不同 ⇒ 红」在生产链上**结构上不可能成立**,只有 prepare 半途崩掉才可能。
+       ⇒ 它今天回答的是「**同一次 prepare 有没有完整跑完**」,
+         **不是**「今天这棵树还是不是 S134 吃的那棵」。后者要的是
+         `gate0_guard.declare_frozen(expect_sha=...)` 那个形状,而登记值只能由
+         第一次真跑写下来 —— 在那之前,**缺席必须记账,不许只打一行字**。
+    ⇒ S140 起:任何一侧缺席都走 `note_uncovered` ⇒ 默认落在 exit 3 / PASS-WITH-GAPS,
+       要干净的绿必须显式 `--allow-uncovered`。⛔「打印是汇报不是判据」
+       (`gate0_guard.py:269-273` 的原话)。
     """
-    seen = []
+    seen, absent = [], []
     for label, d in exp_dirs:
         ident = read_input_identity(d)
         if ident is None:
+            absent.append(label)
             _say("  [NO-INPUT-ID] %-10s 这一侧没有输入身份记录(它由 prepare 写;"
                  "本轮或上一轮没跑 prepare)⇒ **说不出这份产物是哪一棵 gate0 树喂出来的**"
                  % label)
@@ -460,6 +608,13 @@ def say_input_identity(exp_dirs):
                  % (label, ident.get("dirhash_sha256", "?")[:16], ident.get("files", -1),
                     ident.get("src_newest_mtime", "?"), ident.get("recorded_at", "?")))
             seen.append((label, ident.get("dirhash_sha256")))
+    if absent:
+        # ⛔ 不是一行打印就算数:走记账 ⇒ finish 默认 exit 3(gate0_guard.py:332-341)
+        note_uncovered(
+            "输入身份缺席(%s)" % ", ".join(absent),
+            "这一轮说不出这些产物是哪一棵 gate0 树喂出来的 ⇒ 一条数值红分不清"
+            "「代码变了」还是「夹具变了」。⚠ 七月那批基线产出时这套机制还不存在(S139 才建),"
+            "所以历史侧的身份在物理上不可知。")
     if len(seen) == 2 and seen[0][1] != seen[1][1]:
         raise GateUnrunnable(
             "两侧的输入身份**不同**:%s=%s vs %s=%s\n"

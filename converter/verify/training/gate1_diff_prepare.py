@@ -94,8 +94,9 @@ def main():
             "(重定向/管道下它自己会 UnicodeEncodeError),而退出码同样是 1 = 真红的码。" % DATA)
     # ⛔ S139 输入身份 —— 见 gate1_guard 的「输入身份」一段。
     #    ⭐ 这条链是五个 prepare 里**唯一原本就把断言排在 rmtree 之前**的,别把它改坏。
+    # ⛔ S140:地板从与真值无关的 10 改成实测真值 264(见 gate1_prepare.py 的 ID_MIN_FILES 注释)。
     ident = G1.src_identity("gate1/diff 的输入(gate0 的 diff_ours/gate)", DATA, [""],
-                            min_files=10)
+                            min_files=264)
     if not os.path.isfile(BASE):
         raise G1.GateUnrunnable("底模缺:%s" % BASE)
 

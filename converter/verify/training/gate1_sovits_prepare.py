@@ -48,8 +48,15 @@ def main():
             p = line.strip()
             if p:
                 paths.append(p)
-    ident = G1.src_identity_files("gate1/sovits 的输入(filelist 指向的 gate0 产物)",
-                                  paths, min_files=10)
+    # ⛔ S140:地板 10 是一个**与真值无关的常数**,而真值是 33(31 train + 2 val,实测)——
+    #    正是 `gate1_guard.py:93-96` 立的纪律在它自己同一场的新代码里被违反。
+    #    一棵掉了 70% 文件的 gate0 树照样过这道断言 ⇒ prepare 照常 rmtree 3.34 GB 再拿残树重建。
+    # ⚠ 这道断言只覆盖 filelist 里那 31+2 个 **.wav**;真正喂训练的 `.spec.pt`/`.soft.pt`
+    #   (同目录 132 件)**不在指纹里** —— 而 S140 实测正是那 66 件在 08-11 20:25 被 gate0
+    #   重算过、而 wav 一个没变。⇒ 这条身份对今天唯一真实的输入漂移是**瞎的**,别当它不瞎。
+    #   (改成对整个 dataset_44k/gate 算指纹是对的做法,但那会同时改掉 sha 的定义 ⇒ 单独一笔。)
+    ident = G1.src_identity_files("gate1/sovits 的输入(filelist 指向的 gate0 产物 .wav)",
+                                  paths, min_files=33)
     for n in ("G_0.pth", "D_0.pth"):
         if not os.path.isfile(os.path.join(OURS_G0, n)):
             raise G1.GateUnrunnable("底模缺 %s:%s" % (n, OURS_G0))

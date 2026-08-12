@@ -28,8 +28,6 @@ stdout 只有 3 位小数),我方侧取协议 JSONL。
 import os
 import sys
 
-import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate1_guard as G1                                        # noqa: E402
 
@@ -37,6 +35,11 @@ CHAIN = "rvc"
 GATE = "GATE1 (RVC)"
 ORIG_TB_DIR = r"D:\MyDev\RVC\RVC20240604Nvidia\logs\gate1"
 OURS_JSONL = r"D:\MyDev\TESTING\utai-v2-testing\gate1_ours_steps.jsonl"
+# ⛔ S140:身份目录必须是**模块常量**,不是内联字面量 —— 内联的那一份让
+#    `gate1_negctl` 的合成夹具够不着它,于是阴性对照跑的时候读的是**真夹具**的身份,
+#    而工装与真夹具形状不同这件事本身就是 S140 侦察点名的一条(「健康那条对照臂
+#    验的是一个盘上不存在的形状」)。
+OURS_EXP = r"D:\MyDev\TESTING\utai-v2-testing\gate1_ours"
 
 PAIRS = [  # (TB tag, ours key, clamp)
     ("loss/g/total", "g_total", None),
@@ -55,8 +58,7 @@ def main():
     G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
     # ⛔ 「这一轮的输入是哪一次 gate0 产的」—— 由 prepare 记下,这里读出来并**两侧对拍**。
     #    缺席时响亮说明(见 gate1_guard.say_input_identity)。
-    G1.say_input_identity([("orig", ORIG_TB_DIR),
-                           ("ours", r"D:\MyDev\TESTING\utai-v2-testing\gate1_ours")])
+    G1.say_input_identity([("orig", ORIG_TB_DIR), ("ours", OURS_EXP)])
 
     orig = G1.tb_scalars(
         "orig/TB", ORIG_TB_DIR, [t for t, _k, _c in PAIRS], t0,
@@ -80,8 +82,15 @@ def main():
     if failures:
         G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
+    # ⛔ S140:让 `EXPECT[rvc]["components"]` 从一个**零读者的登记数**变成判据 ——
+    #    否则从 PAIRS 里删掉一个分量,每行照打 [PASS]、总判照打 ALL PASS,转录上没有任何数字会变。
+    G1.require_components(CHAIN, len(PAIRS))
+
     for tag, key, clamp in PAIRS:
-        rels, effective, clamped = [], [], []
+        # ⛔ S140:此前只有 loss/g/total 那一个 tag 的步集被判过(:72-73 的 other=),
+        #    另外四个一个都没判 —— 少点是 KeyError 被归成「闸自己炸了」,**多点完全静默**。
+        G1.require_same_step_set("orig/TB", orig[tag], steps, tag)
+        items, clamped = [], []
         for s in steps:
             a = orig[tag][s]
             b = ours[s][key]
@@ -90,21 +99,23 @@ def main():
                 continue
             if clamp is not None:
                 b = min(b, clamp)
-            rels.append(abs(a - b) / max(abs(a), 1e-6))
-            effective.append(s)
+            items.append((s, tag, a, b))
         if clamp is not None:
             # ⛔ 登记式记账,不是 note_uncovered:见 gate1_guard.check_clamped 的头注
             G1.check_clamped("%s(%s)" % (tag, key), clamped, len(steps),
                              G1.EXPECT[CHAIN]["clamped"].get(tag, 0))
-        arr = np.array(rels)
-        worst = effective[int(arr.argmax())]
-        ok = arr.max() <= MAX_REL
-        G1._say("[%s] %14s vs %7s: max_rel=%.3e @step %d, mean_rel=%.3e  (%d/%d 步可比%s)"
-                % ("PASS" if ok else "FAIL", tag, key, arr.max(), worst, arr.mean(),
-                   len(rels), len(steps),
+        # ⛔ S140:五条 compare 的比较实现收成 `gate1_guard.compare_pairs` 一处。
+        #    这条链原本走 numpy(`np.array(rels).max()` 传播 NaN)所以**侥幸**安全,
+        #    但它不点名是哪一步非有限,而孪生的 diff / sovits_v2 用纯 python 的
+        #    `max()` / `if r > worst` ⇒ **静默丢 NaN**。一个实现,四种写法,收掉。
+        r = G1.compare_pairs("ours/JSONL", items, MAX_REL, floor=1e-6,
+                             min_cmp=len(steps) - len(clamped))
+        ok = not r["failures"]
+        G1._say("[%s] %14s vs %7s: max_rel=%.3e @step %s, mean_rel=%.3e  (%d/%d 步可比%s)"
+                % ("PASS" if ok else "FAIL", tag, key, r["worst"], r["worst_step"], r["mean"],
+                   r["n_cmp"], len(steps),
                    ",%d 步被夹取致盲" % len(clamped) if clamped else ""))
-        if not ok:
-            failures.append(tag)
+        failures.extend(r["failures"])
 
     G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 

@@ -21,7 +21,6 @@ sovits/train.py。
 import os
 import sys
 
-import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate1_guard as G1                                        # noqa: E402
@@ -30,6 +29,8 @@ CHAIN = "sovits"
 GATE = "GATE1 SOVITS"
 ORIG_TB_DIR = r"D:\MyDev\so-vits-svc\so-vits-svc\logs\gate1_sovits"
 OURS_JSONL = r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours_steps.jsonl"
+# ⛔ S140:见 gate1_compare.py 同名常量的注释(内联字面量让阴性对照够不着它)
+OURS_EXP = r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours"
 
 PAIRS = [  # (TB tag, ours key) — NO clamps (upstream writes raw values)
     ("loss/g/total", "g_total"),
@@ -47,8 +48,7 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
-    G1.say_input_identity([("orig", ORIG_TB_DIR),
-                           ("ours", r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_ours")])
+    G1.say_input_identity([("orig", ORIG_TB_DIR), ("ours", OURS_EXP)])
 
     orig = G1.tb_scalars(
         "orig/TB", ORIG_TB_DIR, [t for t, _k in PAIRS], t0,
@@ -68,16 +68,19 @@ def main():
     if failures:
         G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
+    # ⛔ S140:登记的分量数变成判据(此前 EXPECT[sovits][components]=6 零读者)
+    G1.require_components(CHAIN, len(PAIRS))
+
     for tag, key in PAIRS:
-        rels = [abs(orig[tag][s] - ours[s][key]) / max(abs(orig[tag][s]), 1e-6) for s in steps]
-        arr = np.array(rels)
-        worst = steps[int(arr.argmax())]
-        ok = arr.max() <= MAX_REL
-        G1._say("[%s] %14s vs %7s: max_rel=%.3e @step %d, mean_rel=%.3e  (%d/%d 步可比)"
-                % ("PASS" if ok else "FAIL", tag, key, arr.max(), worst, arr.mean(),
-                   len(rels), len(steps)))
-        if not ok:
-            failures.append(tag)
+        # ⛔ S140:逐 tag 判步集 —— 此前只有 loss/g/total 那一个被覆盖
+        G1.require_same_step_set("orig/TB", orig[tag], steps, tag)
+        items = [(s, tag, orig[tag][s], ours[s][key]) for s in steps]
+        r = G1.compare_pairs("ours/JSONL", items, MAX_REL, floor=1e-6, min_cmp=len(steps))
+        ok = not r["failures"]
+        G1._say("[%s] %14s vs %7s: max_rel=%.3e @step %s, mean_rel=%.3e  (%d/%d 步可比)"
+                % ("PASS" if ok else "FAIL", tag, key, r["worst"], r["worst_step"], r["mean"],
+                   r["n_cmp"], len(steps)))
+        failures.extend(r["failures"])
 
     G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 

@@ -87,11 +87,17 @@ def main():
     G1.require_exact_steps("orig/train_loss", CHAIN, a, exp["steps"])
     steps = G1.require_exact_steps("ours/train_loss", CHAIN, b, exp["steps"],
                                    other=a, other_label="orig/train_loss")
-    worst = max(abs(a[s] - b[s]) / max(abs(a[s]), 1e-12) for s in steps)
-    G1._say("[%s] train/loss: %d 步对齐, max_rel %.3e (线 %.0e)"
-            % ("PASS" if worst <= REL_LINE else "FAIL", len(steps), worst, REL_LINE))
-    if worst > REL_LINE:
-        failures.append("train/loss")
+    # ⛔⛔ S140:原来这里是内置 `max(生成器)`,而 `nan > x` 恒为 False ⇒ **NaN 不在首位就被
+    #    静默丢掉**(实测:NaN 在中间 ⇒ PASS,NaN 在首位 ⇒ FAIL —— **同一份数据两种结论**)。
+    #    而这条链**两侧都是 TB**,`require_no_none` 那副药它一口没吃到 ⇒ 今天完全裸奔。
+    #    ⚠ `gate1_vocoder_compare.py:111-112` 早在 **S40** 就修好并写下了原话
+    #      「python max() 会静默丢掉 NaN 操作数」—— 修在孪生脚本、四个月零回移。
+    r = G1.compare_pairs("train/loss", [(s, "train/loss", a[s], b[s]) for s in steps],
+                         REL_LINE, floor=1e-12, min_cmp=exp["steps"])
+    G1._say("[%s] train/loss: %d 步对齐(%d 对真比过), max_rel %.3e @step %s (线 %.0e)"
+            % ("PASS" if not r["failures"] else "FAIL", len(steps), r["n_cmp"],
+               r["worst"], r["worst_step"], REL_LINE))
+    failures.extend(r["failures"])
 
     # ── validation/loss:我方侧要**恰好** exp["val_boundaries"] 个边界;
     #    orig 允许少最后一个(它从不关 SummaryWriter,最后一个标量会卡在未 flush 的缓冲里,
@@ -107,11 +113,14 @@ def main():
     if len(inter) < 2:
         raise G1.GateUnrunnable(
             "validation 只有 %d 个共同边界(要 ≥2 才能证明对齐【过】了第一个 RNG 边界)" % len(inter))
-    vworst = max(abs(va[s] - vb[s]) / max(abs(va[s]), 1e-12) for s in inter)
-    G1._say("[%s] validation/loss: %d 个共同边界, max_rel %.3e"
-            % ("PASS" if vworst <= REL_LINE else "FAIL", len(inter), vworst))
-    if vworst > REL_LINE:
-        failures.append("validation/loss")
+    # ⛔ 同上:内置 max 的 NaN 盲,这里是第二处。
+    rv = G1.compare_pairs("validation/loss",
+                          [(s, "validation/loss", va[s], vb[s]) for s in inter],
+                          REL_LINE, floor=1e-12, min_cmp=2)
+    G1._say("[%s] validation/loss: %d 个共同边界(%d 对真比过), max_rel %.3e @step %s"
+            % ("PASS" if not rv["failures"] else "FAIL", len(inter), rv["n_cmp"],
+               rv["worst"], rv["worst_step"]))
+    failures.extend(rv["failures"])
 
     # ── 兜底神谕:只有真的缺点时才动它,而动它之前先判它是不是本轮的
     missing = sorted(set(vb) - set(va))

@@ -36,6 +36,8 @@ GATE = "GATE1 SOVITS_V2"
 SOVITS_V2 = r"D:\MyDev\TESTING\SoVITS-4.0_v2\src\so-vits-svc"
 ORIG_TB_DIR = os.path.join(SOVITS_V2, "logs", "gate1_sovits_v2")
 OURS_JSONL = r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours_steps.jsonl"
+# ⛔ S140:见 gate1_compare.py 同名常量的注释(内联字面量让阴性对照够不着它)
+OURS_EXP = r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours"
 
 PAIRS = [
     ("loss/total", "g_total"),
@@ -56,8 +58,7 @@ def main():
     t0 = G1.read_t0(GATE)
     orig_frozen = "orig" in G1.skipped_stages()
     G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
-    G1.say_input_identity([("orig", ORIG_TB_DIR),
-                           ("ours", r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours")])
+    G1.say_input_identity([("orig", ORIG_TB_DIR), ("ours", OURS_EXP)])
 
     orig = G1.tb_scalars(
         "orig/TB", ORIG_TB_DIR, [t for t, _k in PAIRS], t0,
@@ -86,19 +87,26 @@ def main():
             "       ⇒ 我方侧没有发出该发的字段 ⇒ 这一轮不构成一次对拍。"
             % (len(missing), missing[:8]))
 
-    worst = (0.0, "", -1)
-    for s in steps:
-        for tag, key in PAIRS:
-            a, b = orig[tag][s], ours[s][key]
-            rel = abs(a - b) / max(abs(a), 1e-6)
-            if rel > worst[0]:
-                worst = (rel, tag, s)
-    ok = worst[0] <= MAX_REL
-    if not ok:
-        failures.append(worst[1])
-    G1._say("[%s] %s: %d 步 × %d 分量, max_rel=%.3e (%s @ step %d), 线=%.0e"
-            % ("PASS" if ok else "FAIL", GATE, len(steps), len(PAIRS),
-               worst[0], worst[1], worst[2], MAX_REL))
+    # ⛔ S140:登记的分量数变成判据(此前 EXPECT[sovits_v2][components]=9 零读者)。
+    #    ⚠ 顺带钉住一个口径:我方 jsonl 每步发 **10** 个键,而这里比 **9** 个 ——
+    #      不比的那个是 `d_total`。「14 步 × 9 分量」这句话里**不含判别器总损失**。
+    G1.require_components(CHAIN, len(PAIRS))
+    for tag, _k in PAIRS:
+        G1.require_same_step_set("orig/TB", orig[tag], steps, tag)
+
+    # ⛔⛔ S140:原来这里是 `worst=(0.0,"",-1)` + `if rel > worst[0]` 的**滚动比较**,
+    #    而 NaN 的一切比较都是 False ⇒ **无论 NaN 落在哪一步都被丢掉**。
+    #    实测:九个分量在所有步全是 NaN 时,它打 `max_rel=0.000e+00 ( @ step -1)` 并 **PASS**
+    #    —— 而参照(TB)那一侧**没有任何有限性判据**(`require_no_none` 只吃我方 JSONL),
+    #    所以这条路今天就是活的。⇒ 全部改走 `gate1_guard.compare_pairs`(否定式 + 点名)。
+    items = [(s, tag, orig[tag][s], ours[s][key]) for s in steps for tag, key in PAIRS]
+    r = G1.compare_pairs("ours/JSONL", items, MAX_REL, floor=1e-6,
+                         min_cmp=len(steps) * len(PAIRS))
+    ok = not r["failures"]
+    failures.extend(r["failures"])
+    G1._say("[%s] %s: %d 步 × %d 分量 = %d 对真比过, max_rel=%.3e (%s @ step %s), 线=%.0e"
+            % ("PASS" if ok else "FAIL", GATE, len(steps), len(PAIRS), r["n_cmp"],
+               r["worst"], r["worst_tag"], r["worst_step"], MAX_REL))
 
     G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
