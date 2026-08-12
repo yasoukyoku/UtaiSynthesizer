@@ -4319,12 +4319,18 @@ mod tests {
     /// `AppState` has no `data_dir` field, so two consumers each re-derive the root by walking UP
     /// from a dir they were handed: `effective_data_root` takes `cache_dir.parent()`, and the three
     /// `g2p::set_dict_dir` call sites take `models.models_dir().parent()`. Nothing asserted they
-    /// agree, and nothing constructs `AppState` anywhere in the test suite. If they ever disagree the
+    /// agree before this test. If they ever disagree the
     /// render leaks one dictionary directory while the bake signature carries the hash of another —
     /// silent, and permanent for the session because `set_dict_dir` is first-call-wins.
     ///
     /// Kept deliberately small: it does not test `lib.rs` (the text gate above does that), only that
     /// GIVEN the layout lib.rs builds, the two derivations land on the same directory.
+    ///
+    /// ⚠ S141 correction: this doc used to say "nothing constructs `AppState` anywhere in the test
+    /// suite" — a sentence its own body refutes nine lines below. It was read as a constraint and
+    /// cost a round: the §E2E-M2 survey concluded `check_in_training_root` could not be driven and
+    /// downgraded that gate to a source-text check. `AppState::new` is a plain `pub fn` whose four
+    /// members are pure in-memory constructors, so ANY test can build one against a temp dir.
     #[test]
     fn data_root_derivations_agree() {
         let root = std::env::temp_dir().join(format!("utai_dataroot_{}", std::process::id()));

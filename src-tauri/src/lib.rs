@@ -16,6 +16,10 @@ pub mod pyenv;
 pub mod separation;
 pub mod training;
 pub mod util;
+/// Test-only: the shared parts of the source-reading "wiring gates". Six hand-rolled comment
+/// strippers already live in as many test modules; new gates use this one instead of a seventh.
+#[cfg(test)]
+mod wiring_gate;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};

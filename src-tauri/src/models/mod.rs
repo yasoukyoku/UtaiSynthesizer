@@ -2305,60 +2305,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Strip comments before asking "is this identifier wired in".
-    ///
-    /// ⛔ S119 blood lesson, and the reason this helper exists at all: a bare
-    /// `src.contains("enable_version_counter=False")` stayed GREEN when the probe commented that
-    /// line out — the substring lives in the corpse too. A wiring assertion that cannot tell code
-    /// from a comment is not an assertion.
-    ///
-    /// Full-line `//` goes; a trailing `//` goes only on lines with no `"` (so a `//` inside a
-    /// string literal is never mistaken for a comment). That is deliberately conservative: the
-    /// mutation this must survive is "comment the call out", which always produces a full-line
-    /// comment.
-    fn strip_comments_for_wiring(src: &str) -> String {
-        src.lines()
-            .map(|l| {
-                let t = l.trim_start();
-                if t.starts_with("//") {
-                    return "";
-                }
-                if !l.contains('"') {
-                    if let Some(i) = l.find("//") {
-                        return &l[..i];
-                    }
-                }
-                l
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Split a Rust source into (fn name, fn body-ish chunk) pairs by `fn` headers.
-    /// Crude on purpose: a chunk runs to the next `fn` header, which is all a wiring check needs.
-    fn split_by_fn(code: &str) -> Vec<(String, String)> {
-        const HEADS: [&str; 5] = ["fn ", "pub fn ", "pub(crate) fn ", "async fn ", "pub async fn "];
-        let mut out: Vec<(String, String)> = Vec::new();
-        let mut name = String::from("<preamble>");
-        let mut body = String::new();
-        for line in code.lines() {
-            let t = line.trim_start();
-            if HEADS.iter().any(|h| t.starts_with(h)) {
-                out.push((std::mem::take(&mut name), std::mem::take(&mut body)));
-                let after = t.split("fn ").nth(1).unwrap_or("");
-                name = after
-                    .split(|c| c == '(' || c == '<')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            }
-            body.push_str(line);
-            body.push('\n');
-        }
-        out.push((name, body));
-        out
-    }
+    /// ⛔ S141: `strip_comments_for_wiring` and `split_by_fn` used to be defined right here,
+    /// private to this test module. They moved to `crate::wiring_gate` unchanged when the audition
+    /// tripwire needed the same two — this repo was already carrying six hand-rolled comment
+    /// strippers, and a seventh copy is the drift, not the convenience. Their blood lessons (S119:
+    /// a substring lives in the corpse too) moved with them.
+    use crate::wiring_gate::{split_by_fn, strip_comments_for_wiring};
 
     /// ★★S120 §F9 — the defect this round found, turned into a gate instead of a sentence.
     ///

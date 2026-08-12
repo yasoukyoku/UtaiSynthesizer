@@ -1465,4 +1465,178 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// ⛔ §E2E-M2 (S141) — the tripwire ANSWERS, and it answers with the right CODE.
+    ///
+    /// The test above drives `workspace_is_a_slot` and asserts a **bool**. Nothing drove
+    /// `check_in_training_root` itself, so nothing ever saw the two things that function actually
+    /// decides: WHICH refusal fires, and WHAT STRING the frontend gets. Each CODE literal appears
+    /// exactly once in Rust (`AUDITION_WORKSPACE_OUTSIDE_ROOT` at the containment refusal,
+    /// `AUDITION_WORKSPACE_IS_A_SLOT` at the tripwire) — so inverting the `if` under the tripwire,
+    /// or swapping the two strings, left the whole suite green. That is what §E2E-M2 asked for
+    /// ("传槽路径 ⇒ 必得该 CODE"), and it had no judgement of any kind.
+    ///
+    /// Each arm below is a shape ONLY it reaches (S107: a guard whose negatives are all eaten by
+    /// an earlier guard can be deleted whole and stay green):
+    ///  * the tripwire, INSIDE the root — a migrated slot;
+    ///  * the two shapes that must stay usable — a run, and an unmigrated flat slot;
+    ///  * containment, which had zero coverage — outside the root;
+    ///  * **both arms of the canonicalize match, in both directions**. The comment at the match
+    ///    says in prose that canonicalizing only the side that exists puts a Windows `\\?\`
+    ///    verbatim prefix on one side and not the other, turning every legitimate path into a
+    ///    bogus "escaped the root". The only sample that can catch that is a path which does NOT
+    ///    exist yet but IS inside the root — i.e. a workspace nobody has rendered into. Without
+    ///    it, the (missing, inside) cell is untested and that mutation survives;
+    ///  * the ORDER of the two guards: a slot-shaped path outside the root must answer
+    ///    `OUTSIDE_ROOT`, not `IS_A_SLOT`. "This path is not ours at all" is the more fundamental
+    ///    refusal and must win; asserting it also proves the two guards are distinguishable
+    ///    rather than one guard reached twice.
+    #[test]
+    fn the_audition_tripwire_answers_with_a_code_not_just_a_bool() {
+        let base = std::env::temp_dir().join(format!("utai_aud_code_{}", uuid::Uuid::new_v4()));
+        let data = base.join("data");
+        let models = data.join("models");
+        let root = crate::training::tproject::training_root(&data);
+        let slot = root.join("p1_aaaabbbb").join("rvc");
+        let run = crate::training::trun::runs_root(&slot).join("rfeedfacefeed");
+        let flat = root.join("p2_ccccdddd").join("sovits");
+        std::fs::create_dir_all(run.join("audition")).unwrap();
+        std::fs::create_dir_all(flat.join("audition")).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+
+        let state = AppState::new(
+            base.join("app"),
+            data.join("cache"),
+            models,
+            Arc::new(crate::logging::LogBuffer::new(8)),
+        );
+        // Fixture self-check: the check derives the data root by walking UP from the models dir,
+        // so if that derivation is not the one this fixture built, every arm below is asking about
+        // some other directory and the whole test is vacuous (S92p).
+        assert_eq!(
+            state.models.models_dir().parent(),
+            Some(data.as_path()),
+            "fixture is vacuous — `check_in_training_root` reads models_dir().parent()"
+        );
+
+        let ask = |p: &Path| check_in_training_root(&p.to_string_lossy(), &state);
+        const IS_A_SLOT: &str = "AUDITION_WORKSPACE_IS_A_SLOT";
+        const OUTSIDE: &str = "AUDITION_WORKSPACE_OUTSIDE_ROOT";
+
+        // ── the tripwire, and the CODE it must answer with ────────────────────────────────
+        assert_eq!(
+            ask(&slot),
+            Err(IS_A_SLOT.to_string()),
+            "a migrated slot must be refused BY NAME. Two of these commands DELETE; handed a slot \
+             path they build a second cache tree at the slot root and it is read back later as \
+             this run's, because a cache hit is `model.json` existing and nothing else."
+        );
+        assert_eq!(
+            ask(&run),
+            Ok(()),
+            "a run must stay usable — the tripwire is not a blanket ban on training paths"
+        );
+        assert_eq!(
+            ask(&flat),
+            Ok(()),
+            "an unmigrated slot IS its own run: the absence of a runs/ container is the normal \
+             state today, not a defect. Refusing it would break every workspace on disk."
+        );
+
+        // ── containment: (exists × inside/outside) and (missing × inside/outside) ─────────
+        let outside_real = base.join("elsewhere");
+        std::fs::create_dir_all(&outside_real).unwrap();
+        assert_eq!(
+            ask(&outside_real),
+            Err(OUTSIDE.to_string()),
+            "a real directory outside the training root must be refused — this is the half that \
+             stops a derivation bug from rendering and DELETING anywhere on disk"
+        );
+
+        let outside_missing = base.join("elsewhere_not_on_disk");
+        assert!(!outside_missing.exists());
+        assert_eq!(
+            ask(&outside_missing),
+            Err(OUTSIDE.to_string()),
+            "the fallback arm (neither side canonicalizes) must refuse too, or a path that simply \
+             does not exist becomes a way around containment"
+        );
+
+        let inside_missing = root.join("p3_eeeeffff").join("vocoder");
+        assert!(!inside_missing.exists());
+        assert_eq!(
+            ask(&inside_missing),
+            Ok(()),
+            "⛔ a workspace inside the root that has not been created yet MUST pass. This is the \
+             only sample that catches 'canonicalize just the one side that exists': on Windows the \
+             root would come back as \\\\?\\C:\\… while this path stays C:\\… and `starts_with` \
+             goes false for every legitimate path."
+        );
+
+        // ── order: containment wins over the tripwire ─────────────────────────────────────
+        let outside_slot = base.join("elsewhere_slot");
+        std::fs::create_dir_all(crate::training::trun::runs_root(&outside_slot)).unwrap();
+        assert_eq!(
+            ask(&outside_slot),
+            Err(OUTSIDE.to_string()),
+            "a slot-shaped path outside the root must answer OUTSIDE_ROOT, not IS_A_SLOT — \
+             'this is not our directory at all' is the stronger statement, and the user-facing \
+             message differs. Reordering the two guards must be visible."
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ⛔ §E2E-M2, second half (S141) — EVERY audition command that is handed a workspace asks.
+    ///
+    /// The behaviour test above proves the function answers correctly. It cannot prove anyone
+    /// CALLS it, and that is where the defect this tripwire exists for actually lives: today there
+    /// are six call sites and nothing enumerated them, so deleting one line was green. The vocoder
+    /// hint has had exactly this gate since S120 (`models/mod.rs`); the audition family did not.
+    ///
+    /// ⚠ Honest boundary: this reads SOURCE. It proves the identifier appears in the function's
+    /// code (comments are stripped first — S119: the substring lives in the corpse too). It does
+    /// NOT prove the call is on a reachable path, and it keys on the literal parameter
+    /// `workspace: String` — a command that took the same string under another name, or folded it
+    /// into a struct payload, would slip past. The behaviour half is the other pincer.
+    #[test]
+    fn every_audition_command_that_takes_a_workspace_asks_the_tripwire() {
+        static SRC: &str = include_str!("audition.rs");
+        let cut = SRC.find("#[cfg(test)]").expect(
+            "commands/audition.rs lost its #[cfg(test)] marker — this gate reads production code \
+             only, and without the cut its own fixtures would satisfy it",
+        );
+        let code = crate::wiring_gate::strip_comments_for_wiring(&SRC[..cut]);
+        let fns = crate::wiring_gate::split_by_fn(&code);
+        // Parser self-check FIRST: a splitter that returned nothing would make the loop below
+        // vacuously true (S105/S116 — a classifier that has never seen a positive says nothing).
+        assert!(
+            fns.len() >= 20,
+            "split_by_fn parsed only {} chunks out of commands/audition.rs — the check below \
+             would pass by not looking. Fix the splitter, do not relax the assertion.",
+            fns.len()
+        );
+
+        let mut asked = 0usize;
+        for (name, body) in &fns {
+            if !crate::wiring_gate::signature_of(body).contains("workspace: String") {
+                continue;
+            }
+            asked += 1;
+            assert!(
+                body.contains("check_in_training_root("),
+                "`{name}` takes a `workspace` string straight from the frontend but never asks \
+                 `check_in_training_root` about it.\n\
+                 That string is a UI-side derivation (S76 made it a two-segment \
+                 <project>/<family> path), and these commands RENDER and DELETE under it. A route \
+                 that skips the check is the whole reason the check exists.\n\
+                 ⚠ Do NOT satisfy this by naming it in a comment — comments are stripped first."
+            );
+        }
+        assert!(
+            asked >= 6,
+            "only {asked} audition commands were seen to take `workspace: String` (there are six \
+             today) — the signature match broke, so this gate stopped checking anything."
+        );
+    }
 }
