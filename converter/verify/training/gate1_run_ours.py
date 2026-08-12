@@ -10,6 +10,12 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 sys.path.insert(0, os.path.join(REPO, "training"))
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # CPU 确定性（注意 Windows 空值=删除变量）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ⛔ S139: **运行期**确认 CPU-only 真的生效 —— 十个 gate1 跑器里此前只有 `gate1_run_orig.py`
+#    有这条硬拒绝，而那是唯一一个**不是被测对象**的臂。只写 stderr（stdout 是协议流）。
+import gate1_guard as _G1  # noqa: E402
+_G1.assert_cpu_only(__file__)
 
 from utai_train.protocol import Reporter
 from utai_train.stopfile import StopFlag

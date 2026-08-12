@@ -12,6 +12,12 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ⛔ S139: **运行期**确认 CPU-only 真的生效 —— 十个 gate1 跑器里此前只有 `gate1_run_orig.py`
+#    有这条硬拒绝，而那是唯一一个**不是被测对象**的臂。只写 stderr（stdout 是协议流）。
+import gate1_guard as _G1  # noqa: E402
+_G1.assert_cpu_only(__file__)
 
 APP = pathlib.Path(r"D:\MyDev\Utai_v2-dev")
 GATE = pathlib.Path(r"D:\MyDev\TESTING\gate1_vocoder")

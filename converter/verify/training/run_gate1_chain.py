@@ -291,7 +291,11 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=Fa
         rc, _dt, log = step(chain, name, c["py"], c[kind], out, t0, flags, extra)
         if kind == "orig" and rc in c.get("orig_ok", (0,)):
             continue
-        if rc == G.EXIT_UNRUNNABLE and kind == "compare":
+        # ⛔ S139:UNRUNNABLE 对**每一段**都成立,不只 compare —— 照 `run_gate0_chain.py:204-209`。
+        #    起因是 `gate1_run_orig.py` 那三处 `sys.exit(<字符串>)`:CPython 对字符串参数退 **1**,
+        #    而 1 在 orig 段会被这里读成 `ORIG-FAILED`(参照物没跑起来)—— 可它自己说的是
+        #    「这是【闸没准备好】,不是被测对象的问题」。**一条红,两种归因**,正是 S129 铁律要拆开的。
+        if rc == G.EXIT_UNRUNNABLE:
             G._say("VERDICT UNRUNNABLE (读数不可归因,这不是一次判定) — %s" % log)
             for ln in _tail(log, 8):
                 G._say("   " + ln)
@@ -476,7 +480,11 @@ def _selftest():
     scenario("原版侧失败", dict(ok, orig=9), EXIT_ORIG)
     scenario("我方侧抛了", dict(ok, ours=9), EXIT_OURS)
     scenario("compare 判负", dict(ok, compare=1), EXIT_COMPARE)
-    scenario("compare 判不可归因", dict(ok, compare=G.EXIT_UNRUNNABLE), EXIT_UNRUNNABLE)
+    # ⛔ 「不可归因」对**每一段**都成立,不只 compare —— 起因是 `gate1_run_orig.py` 那三条
+    #    前置(它们自称「闸没准备好」,而退 1 会被读成「参照物没跑起来」)。逐段各触发一次。
+    for kind in ("prepare", "orig", "ours", "compare"):
+        scenario("%s 判不可归因(退 3)" % kind, dict(ok, **{kind: G.EXIT_UNRUNNABLE}),
+                 EXIT_UNRUNNABLE)
     # ⛔ 上游 RVC 正常完训:配了 orig_ok 要放行,没配要判 ORIG-FAILED —— 两条一起才是判据
     scenario("上游 2333333 + orig_ok", dict(ok, orig=2333333), 0, orig_ok=(0, 2333333))
     scenario("上游 2333333 无 orig_ok", dict(ok, orig=2333333), EXIT_ORIG)

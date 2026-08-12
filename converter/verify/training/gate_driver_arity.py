@@ -8,7 +8,14 @@ new `pool_dir` parameter. The production call sites were all updated. The seven 
 `converter/verify/training/` were not — and nothing noticed for four months, because:
 
   * the gate scripts are not imported by anything (no tsc/cargo/vitest reaches them),
-  * `converter/verify/training/README.md:598` still claims "既有阶段函数签名零改动",
+  * `converter/verify/training/README.md` claimed "既有阶段函数签名零改动" — that line is at
+    :762 today and has been struck through since S134 (`1c3cc52`, 2026-08-11), with the
+    reason spelled out right under it. ⛔ S139: this docstring said ":598 still claims",
+    and BOTH the line number and the tense were stale — a recon agent copied it verbatim
+    into an action list, i.e. an expired citation walked two people into a no-op.
+    A gate whose WHY section rots without anything reporting it is the same family as
+    S138's "the antidote built for 'the hook exists but nobody reads it' could never
+    speak on this machine".
   * and the failure only shows up when somebody actually runs a gate — which is exactly the
     moment when a `TypeError` reads like "the training side is broken".
 

@@ -467,6 +467,37 @@ def say_input_identity(exp_dirs):
             % (seen[0][0], seen[0][1][:16], seen[1][0], seen[1][1][:16]))
 
 
+def assert_cpu_only(where):
+    """⛔ **运行期**确认这一跑真的落在 CPU 上。
+
+    S134 的对抗核验者写下过这条的要害:「确定性前提悄悄消失,而**红伪装成数值不一致**」——
+    但那副药只喂给了**参照臂**:十个 gate1 跑器里,只有 `gate1_run_orig.py` 有运行期的
+    `torch.cuda.is_available()` 硬拒绝;另外九个(**包括全部五条 `*_run_ours.py`**)
+    只设了 `os.environ["CUDA_VISIBLE_DEVICES"] = "-1"` 就往下走。
+    ⇒ 药落在了唯一一个**不是被测对象**的臂上。这里补给被测臂。
+
+    ⛔ **只写 stderr**:`*_run_ours.py` 的 **stdout 是协议 JSONL 流的独占通道**
+       (`protocol.py` 头注;S138 实测往它里面多打一行会让父进程那侧解析崩掉)。
+    """
+    try:
+        import torch
+    except Exception:                                   # noqa: BLE001
+        return
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if torch.cuda.is_available():
+        sys.stderr.write(
+            "%s: 闸跑不起来 / 读数不可归因(exit %d)\n"
+            "  CUDA 仍然可见(CUDA_VISIBLE_DEVICES=%r,device_count=%d)——\n"
+            "  gate1 的两侧必须都在 fp32 CPU 上跑,否则逐 step 对拍的确定性前提不成立,\n"
+            "  而那种红会**伪装成数值不一致**。\n"
+            % (where, EXIT_UNRUNNABLE, vis, torch.cuda.device_count()))
+        sys.stderr.flush()
+        sys.exit(EXIT_UNRUNNABLE)
+    sys.stderr.write("[CPU-ONLY] %s: CUDA_VISIBLE_DEVICES=%r,torch.cuda.is_available()=False\n"
+                     % (where, vis))
+    sys.stderr.flush()
+
+
 def header(gate_name, chain, sides):
     """读数头 —— ⛔ 绿必须自陈它这一轮到底量了什么(gate0_guard.finish 的同一条纪律)。"""
     _say("=" * 72)
@@ -643,6 +674,40 @@ def _selftest():
         # ⛔ 缺席必须**响亮但不抛**:它是「今天没有记录」而不是「记录说出了问题」
         expect_ok("say_input_identity(缺席 ⇒ 响亮说明,不抛)",
                   lambda: say_input_identity([("orig", os.path.join(tmp, "nope"))]))
+
+        # 8) assert_cpu_only 的两条分支 —— ⛔ 必须在**子进程**里测:它是 sys.exit 的,
+        #    而「退出码真的传出去了」正是这条判据的全部内容。
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        probe = (
+            "import sys, os\n"
+            "sys.path.insert(0, r'%s')\n"
+            "import gate1_guard as G\n"
+            "import torch\n"
+            "if %s:\n"
+            "    torch.cuda.is_available = lambda: True\n"
+            "    torch.cuda.device_count = lambda: 1\n"
+            "G.assert_cpu_only('selftest')\n"
+            "sys.stdout.write('WENT-THROUGH\\n')\n"
+        )
+        for name, force_gpu, want, needle in (
+                ("assert_cpu_only(CPU ⇒ 放行且只写 stderr)", "False", 0, "WENT-THROUGH"),
+                ("assert_cpu_only(CUDA 可见 ⇒ exit 3)", "True", EXIT_UNRUNNABLE, "伪装成数值不一致"),
+        ):
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CUDA_VISIBLE_DEVICES": "-1"}
+            p = subprocess.run([sys.executable, "-c", probe % (here, force_gpu)],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", env=env, timeout=300)
+            body = (p.stdout or "") + (p.stderr or "")
+            if p.returncode == want and needle in body:
+                # ⛔ 顺带钉住「只写 stderr」:stdout 是协议 JSONL 的独占通道
+                if want == 0 and "[CPU-ONLY]" in (p.stdout or ""):
+                    fails.append("assert_cpu_only 把说明写进了 stdout —— 那是协议流的独占通道")
+                else:
+                    _say("  ok   %s -> exit %d" % (name, p.returncode))
+            else:
+                fails.append("%s:exit=%d(期望 %d),转录:%s"
+                             % (name, p.returncode, want, body.strip()[-200:]))
     finally:
         os.environ.pop("GATE0_T0", None)
         if old_t0 is not None:

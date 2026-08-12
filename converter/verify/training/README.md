@@ -69,19 +69,49 @@ training\.venv\Scripts\python.exe converter\verify\training\gate0_compare.py
 
 ## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 原版 train.py）
 
+> ### ⛔⛔⛔ 先读这一段(S139 重写) —— 下面五节 gate1 共用
+>
+> **⑴ 一律用跑器,别手敲各段。**
+> ```
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py rvc
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py all
+> training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py --selftest
+> ```
+> 理由:五条 compare **现在要求跑器钉的 `GATE1_T0`**(新鲜度)。没有它会响亮判 **exit 3
+> (不可归因)**,而不是给你一个没有意义的绿 —— S139 实测:拿一份 **2026-07-07** 的 jsonl
+> 喂给八月的参照,旧版打出的 `ALL PASS (30 steps compared)` 与 S134 的转录**逐字符相同**。
+>
+> **⑵ ⛔ 默认【不跑】 `*_prepare.py`,而这份 README 以前的第一行正是叫你跑它。**
+> 它们首句就是 `shutil.rmtree` 双侧 expdir:rvc = `RVC\logs\gate1`(**1.39 GB**)+
+> `gate1_ours`(**2.93 GB**);声码器那条 = `SingingVocoders\experiments\gate1_voc`
+> (**3.66 GB**,S134 声码器我方侧**唯一**证据)+ `TESTING\gate1_vocoder`(**5.54 GB**)。
+> 要重建夹具:`--rebuild-fixtures` **且** 环境变量 `GATE1_ALLOW_REBUILD=1`,
+> 跑器会先把每条要删的路径 + 件数 + 体积逐行打出来。
+> ⚠ 这条与本文件末尾「⛔ 绝不许调任何 `*_prepare.py`」是**同一条**;此前两处相隔 746 行、
+> 分属不同标题,而**前面那条在教人做后面那条禁止的事**。
+>
+> **⑶ 出口码(与 `run_gate0_chain.py` 同一张表):**
+> `0` PASS · `1` **compare 判负(★ 只有这一种是「被测的东西不对」)** · `2` prepare 失败 ·
+> `3` 原版侧失败 · `4` 我方侧失败 · `5` 用法/夹具缺件 · `6` 读数不可归因。
+>
+> **⑷ ⚠ torch 轴:下面各节写的「双方同 torch(2.5.1)」是【陈货】。**
+> 经跑器跑时 rvc / sovits / diff / vocoder 用的是 `envs\s42_staging_nv_cu130`
+> (**torch 2.11.0+cu130**,= 出货 runtime pack 的版本),只有 sovits_v2 用 `.venv`(2.5.1)。
+> **两侧仍然是同一个**(代码轴照样隔离)。S134 §3 记过这件事,四个月没改到文件里;
+> 现在实际版本由 `gate1_guard.header` **每一跑打进转录**,别再靠这几行散文。
+
 同一份预处理产物（关卡0 的 rvc_ours）+ 同 filelist 行序 + 同 seed(1234) + 同底模
-(f0G48k/f0D48k v2) + **双方 fp32 CPU（确定性）** + 同一个 torch(2.5.1，我们的 venv 里
-跑原版脚本 —— 隔离代码轴)。原版侧读 tensorboard events（stdout 只有 3 位小数）。
+(f0G48k/f0D48k v2) + **双方 fp32 CPU（确定性）** + 两侧同一个 torch（见上面 ⑷）。
+原版侧读 tensorboard events（stdout 只有 3 位小数）。
 
 ```
-training\.venv\Scripts\python.exe converter\verify\training\gate1_prepare.py
-# 原版侧（cwd=RVC 根；USE_LIBUV=0 是 torch≥2.4 Windows 的 TCPStore 必需）：
-USE_LIBUV=0 <utai>\training\.venv\Scripts\python.exe infer\modules\train\train.py ^
-  -e gate1 -sr 48k -f0 1 -bs 4 -g -1 -te 2 -se 1 -pg <f0G48k> -pd <f0D48k> -l 1 -c 0 -sw 0 -v v2
-# 我方侧 + 对拍：
-training\.venv\Scripts\python.exe converter\verify\training\gate1_run_ours.py > gate1_ours_steps.jsonl
-training\.venv\Scripts\python.exe converter\verify\training\gate1_compare.py
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py rvc
 ```
+⚠ 原版侧现在由仓内的 `gate1_run_orig.py` 驱动。**此前这里写的是一行手拼命令**
+（`USE_LIBUV=0 ... -e gate1 -sr 48k ... -pg <f0G48k> ...`），而 S134 建那个驱动时
+逐字写下了它跑不通的两个理由:① `USE_LIBUV=0 <cmd>` 是 **bash 前缀语法**,PowerShell/cmd
+下不是合法命令;② 参数里全是 `<f0G48k>` 这种占位符,而**人手拼参数正是「跑出来的红说不清
+是闸还是被测对象」的高发区**(S129 铁律)。⇒ 那一行已删。
 
 **S37 实测读数（全 PASS，30/30 step 对齐）：**
 
@@ -100,6 +130,13 @@ training\.venv\Scripts\python.exe converter\verify\training\gate1_compare.py
   tostring_rgb`，mpl≥3.8 删除；我们 vendored 版已换 `buffer_rgba` 双兼容）。
 - 原版 train.py 正常完训是 `os._exit(2333333)`；我们的 runner 在发完协议 `done`
   之后 `os._exit(0)`（DataLoader spawn worker 在 Windows 上会吊死解释器退出）。
+  ⛔ **这个数在两个地方读出来【不一样】,而两处此前各只写了一个**(S139 实测):
+  `subprocess.run(...).returncode` 拿到的是 **2333333**;shell(`$?` / `$LASTEXITCODE`)
+  拿到的是 **2333333 & 0xFF = 149**。⇒ `run_gate1_chain.py` 是 python,它的
+  `orig_ok=(0, 2333333)` 认前者;谁按本 README 末尾那句写一个 `if ($LASTEXITCODE -ne 149)`
+  的 PowerShell 包装,就会把 python 侧的 2333333 判成失败 —— 那正是 S134 亲口记下的
+  「第一版跑器把这次**成功**报成了 ORIG-FAILED」的第二次发作,而那条被它自己称作
+  **S129 铁律的反面教材**。
 - 协议 stdout 一律 UTF-8（Reporter 构造时 reconfigure —— 本机是 cp932 控制台，
   没这条中文 message 直接 UnicodeEncodeError）。
 - 两侧数据顺序由 filelist 行序+seed 决定，与路径字符串无关（gate1_prepare 校验
@@ -171,6 +208,9 @@ pretrain/rmvpe.pt 补入（双方同一权重文件）。
 ## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 原版 train.py）
 
 ```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py sovits
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
 training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_prepare.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_orig.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_run_ours.py ^
@@ -263,6 +303,9 @@ training\.venv\Scripts\python.exe converter\verify\training\gate0_sovits_v2_comp
 ## 关卡1 —— 训练等价（逐 step loss 轨迹 vs 上游原生 cpurun）
 
 ```bat
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py sovits_v2
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
 training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_prepare.py
 # 双侧同 torch 2.5.1（隔离代码轴）；上游 CUDA 被藏 → main() 自然落原生 cpurun：
 training\.venv\Scripts\python.exe converter\verify\training\gate1_sovits_v2_run_orig.py
@@ -330,6 +373,9 @@ aug_seed=1234)（random.Random(1234) 与全局 random.seed(1234) 同 MT19937 流
 ## gate1_diff —— 训练等价（逐 step loss 轨迹 vs 原版 train_diff.py）
 
 ```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py diff
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— prepare 会 rmtree 双侧 expdir。
 training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_prepare.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_orig.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_diff_run_ours.py
@@ -455,6 +501,10 @@ wav2spec）f0 = 404.25Hz = 440×44100/48000——上游 mel 用重采样后音�
 ## gate1 — 训练 loss 轨迹对拍（fp32 CPU）
 
 ```
+⛔ 先读「关卡1」那一节开头的 S139 告示(用跑器 / prepare 默认不跑 / 出口码 / torch 轴)。
+training\.venv\Scripts\python.exe converter\verify\training\run_gate1_chain.py vocoder
+# ⛔ 下面这几行是**各段的实际内容**,不是操作指示 —— 这条 prepare 的 rmtree 面是全仓最大的
+#    (`SingingVocoders\experiments\gate1_voc` 3.66 GB + `TESTING\gate1_vocoder` 5.54 GB)。
 training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_prepare.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_run_orig.py
 training\.venv\Scripts\python.exe converter\verify\training\gate1_vocoder_run_ours.py
@@ -818,8 +868,17 @@ sovits(dirty 混合, 剔除消息实证)→sovits_diff(同工作区继承)→rvc
 
 ## 两条容易踩的
 
-* ⛔ **上游「正常完训」是 `os._exit(2333333)`** ⇒ `rc = 2333333 & 0xFF = 149`,**不是 0**。
+* ⛔ **上游「正常完训」是 `os._exit(2333333)`**。⚠ **这个数在两个地方读出来不一样**(S139 实测):
+  **shell**(`$?` / `$LASTEXITCODE`)拿到 `2333333 & 0xFF = **149**`;
+  **python** 的 `subprocess.run(...).returncode` 拿到 **2333333**。
+  本段是给写 shell 包装的人的 ⇒ 用 149;`run_gate1_chain.py` 是 python ⇒ 它的 `orig_ok` 写 2333333。
+  两边各自都对,**但都必须说出自己的适用面**,否则就是 S134 那条「把成功报成 ORIG-FAILED」的第二次发作。
   判成功**不看 rc**,看日志里有没有够数的 `====> Epoch:` 行。
 * ⛔ **绝不许调任何 `*_prepare.py`**:`gate1_prepare.py` 第一句就是 `shutil.rmtree(dst)`,
   两个 dst 是 `RVC\logs\gate1`(1.39 GB)与 `gate1_ours`(2.93 GB)—— S134 花一整笔跑通的两侧夹具。
+  ⚠ 声码器那条更大:`SingingVocoders\experiments\gate1_voc`(3.66 GB)+
+  `TESTING\gate1_vocoder`(5.54 GB)= **9.20 GB**(S139 实测,记忆里此前只记了前一半)。
+  ⇒ **S139 起这条已经落进代码**:`run_gate1_chain.py` 默认不跑 prepare,要跑得给
+  `--rebuild-fixtures` **且** `GATE1_ALLOW_REBUILD=1`,并且先把体积逐条打出来。
+  ⚠ 而本文件「关卡1」那五节此前**第一行就是叫你跑 prepare** —— 一份文件里的自相矛盾,已修。
   速度闸的 arena **自己铺**(`speed_arena_setup.py`)。
