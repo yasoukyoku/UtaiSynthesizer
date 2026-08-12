@@ -481,6 +481,7 @@
     "modelVersionMismatchBody": "A model named \"{{name}}\" ({{old}}) already exists and there is no resumable workspace. {{new}} is selected — training starts from scratch; importing under the same name afterwards replaces the existing model.",
     "noWorkspaceBody": "A model named \"{{name}}\" already exists but there is no resumable training workspace — training starts from scratch; importing under the same name afterwards replaces the existing model.",
     "confirmExistBody": "\"{{name}}\" already exists. Resume continues from the last checkpoint; Retrain starts a NEW run from scratch and leaves the existing one untouched.",
+    "retrainIntentResumeWarn": "\n⚠ You came here through Retrain and already named a new run. Choosing Resume (or continuing from the best checkpoint) here ABANDONS that new run and continues the existing one instead — the new name will not take effect, and the existing run keeps its own name.",
     "resume": "Resume",
     "resumeFromBest": "Continue from the best checkpoint (step {{step}})",
     "retrain": "Retrain",

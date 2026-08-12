@@ -2282,7 +2282,15 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
           : [];
       const choice = await showConfirm({
         title: t("training.confirmExistTitle"),
-        body: t("training.confirmExistBody", { name }) + diffWarn,
+        // ⛔ S141(实机第一次开窗口买回来的):带着「再训一个」的意图和一个**已经起好的新名字**
+        // 走到这里,选「续训 / 从最佳存档继续」是一个**放弃新 run** 的决定 —— 而屏幕上此前
+        // 一个字都没说。用户实机走的正是这条:起名 `run2-rvc` → 选了从最佳存档继续 ⇒ 没铸新 run,
+        // 而那个新名字曾经被写进**旧 run** 的 run.json(后端那一半已在 `name_to_persist` 修掉)。
+        // 两半都要:后端保证**不毁东西**,这里保证**用户知道自己在选什么**。
+        body:
+          t("training.confirmExistBody", { name }) +
+          (wantsRetrain ? t("training.retrainIntentResumeWarn") : "") +
+          diffWarn,
         buttons: wantsRetrain
           ? [
               { id: "retrain", label: t("training.retrain"), kind: "danger" as const },

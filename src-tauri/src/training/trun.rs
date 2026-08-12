@@ -1850,8 +1850,29 @@ mod tests {
     }
 
     /// The walk: every project, every family, and nothing that is not a project.
+    ///
+    /// ⛔⛔ S141 —— **这条测试静默依赖「这台机器上没有活着的实例」,而它此前不说。**
+    /// `migrate_all` 的第一件事是 `crashlog::other_instance_alive()`,为真就整个 postpone。
+    /// 于是维护者只要开着 dev build,这条测试就红在下面那句 `layout == 3` 上 ——
+    /// 而那句话读起来是「迁移坏了」,不是「这台机器现在答不了这个问题」。
+    ///
+    /// 我为此付过一次账:实机开着窗口时它红了,我先怀疑自己刚落的那一笔,`git stash` 做了一次
+    /// 「决定性」A/B —— **而那次 stash 跑碰巧落在心跳窗口外、绿了**,于是那个假信号把环境问题
+    /// 定罪成了代码问题。⇒ S98 那条(审查从来只读 diff 与源码,没有一次去看**这台机器本身**)
+    /// 在测试层的形态:**一条 A/B 只有在环境是常量时才是决定性的。**
+    ///
+    /// ⇒ 现在**先问、再判**,并且用一句说得清的话把它与真红分开(S129 铁律:一条闸的红必须
+    /// 能被归因)。⚠ 这不是把它调松:被跳过时它**明说自己什么也没证明**。
     #[test]
     fn migrate_all_folds_every_slot_of_every_project() {
+        if crate::crashlog::other_instance_alive() {
+            eprintln!(
+                "[trun] SKIPPED migrate_all_folds_every_slot_of_every_project — 这台机器上有一个\
+                 活着的实例(dev build?),而 `migrate_all` 对此的正确反应就是 postpone。\
+                 ⇒ 本次运行**什么也没证明**:关掉 app 再跑一次。"
+            );
+            return;
+        }
         let data = tmp_data("all");
         for id in ["pone_11111111", "ptwo_22222222"] {
             write_meta(&data, &ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() })

@@ -1455,6 +1455,32 @@ fn effective_artifact_slug(
     tproject::run_artifact_slug(run).unwrap_or_else(|| slugify(&req.model_name))
 }
 
+/// 这次 start 该把哪个名字写进 `run.json`。
+///
+/// ⛔⛔ S141 —— **一次 start 绝不许改掉一个【已经有名字的】run 的名字。**
+///
+/// 名字是**标签**(§F2⒝ ④b 把产物身份冻进了 `run.json[model_slug]`),而标签有它自己的入口
+/// 与自己的三道闸:`rename_training_run` 拒运行中改、拒空名、拒另一个实例在动同一棵树。
+/// 一次 start 顺手把请求里的名字盖上去,等于**绕过那三道闸**。
+///
+/// ⚠ 它不是理论问题,是实机第一次开窗口就撞上的:用户走「再训一个」、给新 run 起名
+/// `run2-rvc`,然后在下一屏的对话框里改主意选了「从最佳存档继续」⇒ 没有铸新 run,而那个新
+/// 名字被写进了**旧 run** 的 `run.json`。此后卡片上写着 `run2-rvc`,而 `model_slug` 与
+/// `weights/<slug>*` 全是第一个 run 的 `test-rvc_ea3c92d9` —— **屏幕与产物指着两个不同的 run,
+/// 而全程没有任何东西说过一句话。**
+///
+/// ⇒ 规则只有一条,而且不需要知道这次 start 铸不铸新 run:**已经有名字的就保留它**。
+/// 铸新臂天然安全 —— 那是一个全新的目录,`run.json` 还不存在 ⇒ `existing` 是 `None`。
+/// 首次训练同理(那个 run 还没有名字,这时候写下去正是它该被命名的时刻)。
+fn name_to_persist(existing: Option<&str>, requested: &str) -> String {
+    match existing {
+        // ⚠ 原样保留,连 trim 都不做:这条规则是「一次 start **不改**这个字段」,而不是
+        // 「一次 start 把它规范化一下」—— 后者仍然是一次没人同意过的改名。
+        Some(kept) if !kept.trim().is_empty() => kept.to_string(),
+        _ => requested.to_string(),
+    }
+}
+
 /// The `(display name, slug)` this run must use for each co-trained speaker.
 ///
 /// Fresh run ⇒ derive from the names. RESUME of a slot that already froze a speaker set ⇒ REUSE
@@ -3126,7 +3152,9 @@ fn run_worker(
         "run_has_main_model": run_has_main_model,
         "dataset_dir": dataset_dir,
         "model_slug": slug,
-        "model_name": req.model_name,
+        // ⛔ S141 —— **不是** `req.model_name`。一次 start 不许改掉一个已经有名字的 run 的名字;
+        // 改名有它自己的命令与自己的三道闸。全部机理在 `name_to_persist` 的头注。
+        "model_name": name_to_persist(tproject::run_model_name(&run).as_deref(), &req.model_name),
         "sample_rate": req.sample_rate,
         "version": req.version,
         "total_epoch": req.total_epoch,
@@ -4606,6 +4634,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// ⛔⛔S141(实机第一次开窗口买回来的)—— **一次 start 不许改掉一个已经有名字的 run 的名字。**
+    ///
+    /// 复现过的那一条链:用户点「再训一个」→ 给新 run 起名 `run2-rvc` → 下一屏那个对话框
+    /// (**它才是决定 fresh 的地方**)改主意选了「从最佳存档继续」⇒ `fresh=false` ⇒ 不铸新 run
+    /// ⇒ 而 `req.model_name` 仍然被无条件写进了**旧 run** 的 `run.json`。
+    /// 结果:卡片显示 `run2-rvc`,`model_slug` 与 `weights/<slug>*` 却全是第一个 run 的
+    /// `test-rvc_ea3c92d9`。**屏幕与产物指着两个不同的 run,而没有任何东西说过一句话。**
+    ///
+    /// ⚠ 这一格分得开三种输入,而它们的正确答案不同 —— 少任何一条,`name_to_persist` 都可以被
+    /// 写成一个更简单、也更错的东西:
+    #[test]
+    fn a_start_never_renames_a_run_that_already_has_one() {
+        // ⑴ 已经有名字 ⇒ **保留**。这是实机撞到的那一格,也是唯一会毁数据的那一格。
+        assert_eq!(
+            name_to_persist(Some("test-rvc"), "run2-rvc"),
+            "test-rvc",
+            "一次 start 把已有 run 改了名 —— 那是 `rename_training_run` 的活,它有三道闸,这里没有"
+        );
+        // ⑵ 还没有名字 ⇒ 这时候写下去正是它该被命名的时刻(首次训练,或刚铸出的新 run:
+        //    那是一个全新目录,`run.json` 还不存在)。写反成「一律保留」会让新 run 永远无名。
+        assert_eq!(name_to_persist(None, "run2-rvc"), "run2-rvc");
+        // ⑶ 空 / 全空白**不算**有名字 —— 否则一个写坏成 `""` 的 `run.json` 会把那个 run
+        //    永久锁在无名状态,而它连改名入口都进不去(前端按名字判「起过名没有」)。
+        assert_eq!(name_to_persist(Some(""), "x"), "x");
+        assert_eq!(name_to_persist(Some("   "), "x"), "x");
+        // ⑷ 保留的是**原样**,连 trim 都不做:规则是「不改」,不是「顺手规范化一下」——
+        //    后者仍然是一次没人同意过的改名,而且它会让产物名与显示名开始各走各的。
+        assert_eq!(name_to_persist(Some("  歌姫  "), "x"), "  歌姫  ");
+    }
+
     /// ⛔★★S141 §E2E-M23 —— **铸一个新 run 不许抹掉旧 run 的任何东西。**
     ///
     /// ④e 之前,`try_start` 的重训分支是一句 `remove_dir_all_robust(&workspace)` —— **整个槽**,
@@ -4655,6 +4713,21 @@ mod tests {
         // ⛔ 钉的是**那个调用点收到的实参**,不是「`mints_fresh_run` 这个词出现过」——
         // 后者是 R3 那条已知的弱点(钉文本不钉值):实测把 `migrate_one_slot` 的守卫塌回
         // `req.fresh` 之后,标识符仍然在别处出现,那条弱断言**照样绿**(探针 V5 第一版)。
+        // ⛔ S141 实机第一次开窗口就撞到的那一条:名字也是「旧 run 的东西」。
+        // ⚠ 它住在 `run_worker`(写 `run.json` 的那个),不是 `try_start` —— 第一版打在
+        // `try_start` 上,当场红。锚点找错会让一条闸**指着一个空的地方说话**。
+        let (_, worker) = fns
+            .iter()
+            .find(|(n, _)| n == "run_worker")
+            .expect("`run_worker` 不见了 —— 写 `run.json` 的那个函数被改名了,重新确认这条性质再改锚点");
+        assert!(
+            worker.contains("name_to_persist("),
+            "`run.json` 的 `model_name` 又直接取 `req.model_name` 了。一次 start 不许改掉一个\
+             **已经有名字**的 run 的名字 —— 改名有它自己的命令和它自己的三道闸(运行中 / 空名 / \
+             双开)。实机复现过一次:走「再训一个」起了新名字、下一屏改主意选了续训 ⇒ 没铸新 run,\
+             而新名字盖到了旧 run 头上,`model_slug` 与 `weights/<slug>*` 仍是旧的 ⇒ \
+             屏幕与产物指着两个不同的 run,全程无声。"
+        );
         assert!(
             body.contains("run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)"),
             "`run_dir_for_start` 不再收 `mints_fresh_run`。**这个实参决定这次 start 往哪个目录写**:\

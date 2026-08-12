@@ -253,6 +253,31 @@ describe("archive rows resolve their identity per row", () => {
     ).toBeGreaterThanOrEqual(3);
   });
 
+  it("★ S141 —— 带着「再训一个」的新名字走到开始对话框时,续训那一档必须先说清它放弃了什么", async () => {
+    // 实机第一次开窗口撞到的那一条:用户点「再训一个」、给新 run 起名 `run2-rvc`,然后在这个
+    // 对话框里改主意选了「从最佳存档继续」⇒ **没有铸出新 run**,而那个新名字被写进了**旧 run**
+    // 的 run.json(后端那一半已由 `training::name_to_persist` 修掉)。
+    // 这道闸守的是另一半:**那个决定必须在屏幕上说出来**。它是源码闸,因为这段活在组件的
+    // async 闭包里,vitest 驱不动 —— 而「文案在不在」恰恰是 i18n 那两道结构闸看不见的东西。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(FILE, "utf8"));
+    const at = code.indexOf('t("training.confirmExistBody"');
+    expect(at, "开始训练那个「已存在」对话框的锚点漂了").toBeGreaterThan(0);
+    // 只看这次 showConfirm 调用的正文构造,别一路扫到下一个对话框去(W1 那条血训)。
+    const window = code.slice(at, code.indexOf("buttons:", at));
+    expect(window.length, "正文窗口长得不像一次调用").toBeLessThan(800);
+    expect(
+      window,
+      "续训那一档不再对「刚起了新名字」的情况说明它会放弃那个新 run —— 用户点下去之后,\
+       屏幕上唯一的变化是名字,而产物仍然是旧 run 的",
+    ).toContain("retrainIntentResumeWarn");
+    expect(
+      window,
+      "那句提醒不再受「是不是从再训一个进来的」约束 —— 无条件挂上去会让普通续训也读到一句\
+       与它无关的警告,而一条到处都亮的警告等于没有警告",
+    ).toContain("wantsRetrain");
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();
