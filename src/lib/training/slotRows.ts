@@ -115,6 +115,41 @@ export function prepPoolLine(slot: SlotDetail | undefined): PrepPoolLine {
   return { show: count > 0, count, bytes: slot?.prepPoolBytes ?? 0 };
 }
 
+/** 超过这么多条 run 才开始折叠。 */
+export const RUN_ROWS_BEFORE_FOLD = 2;
+
+export interface RunRowFold {
+  /** 这一次要画出来的行。 */
+  rows: RunDetail[];
+  /** 被收起来的条数;0 = 没有折叠,连那行「还有 N 个」都不该出现。 */
+  hidden: number;
+}
+
+/**
+ * ★S141(用户实机提的)—— run 多了之后那一长条怎么收。
+ *
+ * 每个 run 行是「名字+改名 / 事实 / 三颗按钮」三段,五个 run 就是一根很长的柱子;而
+ * `.tproj-slots` 是两列 grid,一个高卡片会把**同一行那个空槽**也拉成同样高(那半边已经在
+ * CSS 里治了:`align-items: start`)。
+ *
+ * ⛔ 用户的原话是「现在这样直接显示确实很清楚」⇒ **少量 run 时必须逐像素保持今天的样子**,
+ * 只有真的变多才收。所以阈值判据是 `rows.length > limit`,不是「永远只画一条 + 管理入口」。
+ *
+ * ⚠ **诚实边界**:这里不认识「哪个 run 正在跑」—— `ProjectDetail` today 不订阅实时快照,
+ * 而 run 的顺序是后端的 id 字典序。所以正在训练的那个**可能**落在折叠里。要改成「正在跑的
+ * 永远展开」得先把实时 run 的身份穿到这一层(那是 B2-⑤ 的面),不在这一笔里假装做到了。
+ */
+export function foldRunRows(
+  rows: readonly RunDetail[],
+  expanded: boolean,
+  limit: number = RUN_ROWS_BEFORE_FOLD,
+): RunRowFold {
+  if (expanded || rows.length <= limit) {
+    return { rows: [...rows], hidden: 0 };
+  }
+  return { rows: rows.slice(0, limit), hidden: rows.length - limit };
+}
+
 /** 「再训一个」那个新名字有什么毛病;`null` = 可以用。 */
 export type NewRunNameProblem = "empty" | "taken" | null;
 

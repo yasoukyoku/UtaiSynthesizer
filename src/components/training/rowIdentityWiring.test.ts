@@ -207,9 +207,16 @@ describe("archive rows resolve their identity per row", () => {
     }
 
     // 兜底:决策整个消失(不是被写回,而是被删掉/改名)也要红。
-    for (const fn of ["visibleRuns(", "slotStarted(", "pickDiffHost(", "prepPoolLine("]) {
+    for (const fn of ["visibleRuns(", "slotStarted(", "pickDiffHost(", "prepPoolLine(", "foldRunRows("]) {
       expect(code, `${fn} 的调用点不见了`).toContain(fn);
     }
+    // ⛔ S141:折叠是**纯观感**,不许改变「这个槽开始过没有」。`slotStarted` 必须吃**全部**
+    // 过滤后的行,而不是折叠之后剩下的那几行 —— 否则收起来之后卡片会写「尚未开始」,
+    // 而它下面明明还挂着 run(④e 修掉的正是这类自相矛盾的一屏)。
+    expect(
+      /slotStarted\(runs\)/.test(code),
+      "`slotStarted` 不再吃全部行 —— 折叠一旦影响到它,收起来的槽会自称「尚未开始」",
+    ).toBe(true);
   });
 
   it("★ S141 §E2E-M6/M7 —— 三条导入路的 toast 决策留在纯模块里,不许再长回闭包", async () => {

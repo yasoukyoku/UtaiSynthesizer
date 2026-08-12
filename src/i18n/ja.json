@@ -487,6 +487,8 @@
     "needData": "先に学習データを取り込んでください",
     "needName": "先にモデル名を入力してください",
     "archiveTitle": "このアーキテクチャのアーカイブ（{{count}}）",
+    "runsFoldMore": "他に {{count}} 個の run",
+    "runsFoldLess": "折りたたむ",
     "archivePageTitle": "トレーニング保存",
     "archiveOpen": "トレーニング保存を開く",
     "archiveEmpty": "このアーキテクチャにはまだ保存がありません。",

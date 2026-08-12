@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RunDetail, SlotDetail, WorkspaceInfo } from "../../store/training";
 import {
+  foldRunRows,
   newRunNameProblem,
   pickDiffHost,
   prepPoolLine,
@@ -209,6 +210,47 @@ describe("prepPoolLine(§E2E-M5 的渲染那一跳)", () => {
 
   it("槽不存在 ⇒ 不画,而不是画一行「0 份」", () => {
     expect(prepPoolLine(undefined)).toEqual({ show: false, count: 0, bytes: 0 });
+  });
+});
+
+describe("foldRunRows(S141:run 多了才收)", () => {
+  const runs = (n: number) => Array.from({ length: n }, (_, i) => mkRun(`r${i}`));
+
+  it("★ 少量 run 时必须逐条照画 —— 用户原话「现在这样直接显示确实很清楚」", () => {
+    // 阈值以内一条都不许收,连那行「还有 N 个」都不该出现(它自己也占一行)。
+    for (const n of [0, 1, 2]) {
+      const f = foldRunRows(runs(n), false);
+      expect(f.rows.length, `${n} 条时不该折`).toBe(n);
+      expect(f.hidden).toBe(0);
+    }
+  });
+
+  it("★ 超过阈值才收,而且【收起来的条数要说得出来】", () => {
+    const f = foldRunRows(runs(5), false);
+    expect(f.rows.map((r) => r.id)).toEqual(["r0", "r1"]);
+    expect(f.hidden, "「还有 N 个」的那个 N 必须是真的被收起来的条数").toBe(3);
+  });
+
+  it("展开之后一条不少 —— 折叠不许变成「看不见的行」", () => {
+    const f = foldRunRows(runs(5), true);
+    expect(f.rows.length).toBe(5);
+    expect(f.hidden, "展开态还报 hidden>0,那行「还有 N 个」会和已经展开的行同时出现").toBe(0);
+  });
+
+  it("画出来的 + 收起来的 == 全部(任何 n 与 limit)", () => {
+    // ⛔ 这条是防「切片切错一位」:off-by-one 不会让上面任何一条红,但会静默丢掉一个 run。
+    for (let n = 0; n <= 8; n++) {
+      for (let limit = 1; limit <= 4; limit++) {
+        const f = foldRunRows(runs(n), false, limit);
+        expect(f.rows.length + f.hidden, `n=${n} limit=${limit}`).toBe(n);
+      }
+    }
+  });
+
+  it("不改动传进来的数组(它是 store 里的那一份)", () => {
+    const src = runs(5);
+    foldRunRows(src, false);
+    expect(src.length).toBe(5);
   });
 });
 

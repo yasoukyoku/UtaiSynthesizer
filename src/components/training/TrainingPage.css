@@ -922,7 +922,11 @@
   margin-top: var(--space-md);
 }
 
-.training-archive-toggle {
+/* ⛔ S141:槽卡片里那条「还有 N 个 run」的折叠行**加进这一组**,不另起一份。
+   UI 铁律的 PROCESS RULE:加任何交互元素前先 grep 现有样式并**并进它的选择器组**(单一真源);
+   这颗按钮与存档区那颗是同一种东西(无边框、次要色、Unicode chevron),没有理由长两份。 */
+.training-archive-toggle,
+.tproj-runs-toggle {
   background: none;
   border: none;
   color: var(--text-secondary);
@@ -932,8 +936,16 @@
   font-family: inherit;
 }
 
-.training-archive-toggle:hover {
+.training-archive-toggle:hover,
+.tproj-runs-toggle:hover {
   color: var(--text-primary);
+}
+
+/* 折叠行读起来要是「这个槽下面还有」,而不是一颗孤立按钮 ⇒ 与 run 行同一条左竖线对齐。 */
+.tproj-runs-toggle {
+  align-self: flex-start;
+  padding: 0 0 0 var(--space-sm);
+  font-size: var(--font-size-xs);
 }
 
 .training-archive-row {

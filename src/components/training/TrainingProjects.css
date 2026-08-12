@@ -203,6 +203,14 @@
   /* 与 `.training-backend-cards` 同款:固定列数把 step 栏填满,不跟着内容抖 */
   grid-template-columns: repeat(2, 1fr);
   gap: var(--space-md);
+  /* ⛔ S141(用户实机)—— grid 的默认 `align-items: stretch` 会让同一行的卡片被**最高的那张**
+     拉齐。④e 之前每个槽恒一行 run,四张卡片高度差不多,拉齐反而整齐;而「再训一个」真的能铸出
+     第二、第三个 run 之后,一个有五个 run 的槽会把它旁边那个**空槽**也拉成同样高,
+     于是那张空卡片里只有标题和一大片空白。⇒ 每张卡片按自己的内容高。
+     ⚠ 顺带治好第二个症状:`.tproj-slot-actions` 的 `margin-top: auto` 是为了让几张卡片的
+     「开始训练」横向对齐,而卡片被拉长之后它就把按钮顶到了空白的最底下 —— 高度自然之后
+     那条 auto 没有多余空间可分,按钮回到内容正下方。 */
+  align-items: start;
 }
 
 .tproj-slot {

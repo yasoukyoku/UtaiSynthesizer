@@ -36,6 +36,7 @@ import {
 } from "../../store/training";
 import { formForSlot } from "../../lib/training/formForSlot";
 import {
+  foldRunRows,
   newRunNameProblem,
   pickDiffHost,
   prepPoolLine,
@@ -92,6 +93,9 @@ export function ProjectDetail() {
     return d.dataset.entries.some((e) => prefix + e.rel === path);
   });
   const [busy, setBusy] = useState(false);
+  /** ★S141:每个槽的 run 列表展开状态(family -> 展开?)。默认收起 —— 折叠只在超过阈值时
+   *  才有东西可收,所以「默认收起」对少量 run 的槽是 no-op。 */
+  const [runsOpen, setRunsOpen] = useState<Record<string, boolean>>({});
 
   /** Does anything in this project depend on the current data? Deleting or adding then costs a
    *  full re-extraction on the next run — worth one confirmation. With nothing trained yet it is
@@ -701,11 +705,16 @@ export function ProjectDetail() {
             /** ⛔★★§F2⒝ ④e —— 画哪几行。机理与「为什么真 run 一律画、只有 `id === ""` 的
              *  伪造行按练没练过滤」的全部说明在 `lib/training/slotRows.ts`(S141 §E2E-M3 把它
              *  搬出组件体:写在这里的表达式没有导出,vitest 结构上够不着,变异会存活)。 */
-            const rows = visibleRuns(runs);
+            const allRows = visibleRuns(runs);
             // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
             // 同时「尚未开始」的自相矛盾。
+            // ⛔ 它跟的是**过滤后**的全部行,不是折叠后剩下的那几行 —— 折叠是纯观感,
+            //    不许改变「这个槽开始过没有」这个事实(否则收起来之后卡片会写「尚未开始」)。
             const started = slotStarted(runs);
             const prepPools = prepPoolLine(slot);
+            /** ★S141(用户实机提的):run 多了才收。少量 run 时逐条照画,与今天逐像素相同。 */
+            const fold = foldRunRows(allRows, !!runsOpen[f]);
+            const rows = fold.rows;
             return (
               <div key={f} className={`tproj-slot ${started ? "started" : ""}`}>
                 <div className="tproj-slot-head">
@@ -812,6 +821,21 @@ export function ProjectDetail() {
                     </div>
                   </div>
                 ))}
+                {/* ★S141(用户实机提的)—— run 变多之后那一长条的收口。
+                    ⛔ 只在真的超过阈值时才出现:用户原话「现在这样直接显示确实很清楚」,
+                    所以少量 run 时这一行连出现都不该出现(它自己也占一行)。
+                    样式并进 `.training-archive-toggle` 那一组(UI 铁律:先 grep 现有样式再加控件),
+                    chevron 用 Unicode 字形而不是 emoji。 */}
+                {(fold.hidden > 0 || runsOpen[f]) && (
+                  <button
+                    className="tproj-runs-toggle"
+                    onClick={() => setRunsOpen((m) => ({ ...m, [f]: !m[f] }))}
+                  >
+                    {runsOpen[f]
+                      ? `▾ ${t("training.runsFoldLess")}`
+                      : `▸ ${t("training.runsFoldMore", { count: fold.hidden })}`}
+                  </button>
+                )}
                 {/* ★§F2⒝ — the accumulating half of the layout change, made visible where the
                     slot's other sizes already are. A preprocessing parameter change no longer
                     deletes the previous products, so without this line the disk would simply
