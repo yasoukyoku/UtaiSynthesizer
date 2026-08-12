@@ -662,6 +662,37 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   });
 });
 
+// ── ★S141 §E2E-D4 —— 词典指纹还没到达之前,存量 bake 不许被判脏 ─────────────────────
+describe("isVocalDirty — the dictionary-fingerprint shield (§E2E-D4)", () => {
+  const vp: VocalTrackParams = { backend: "sovits", speakerId: 49, langId: 2, transpose: 0, formant: 0, transition: DEFAULT_TRANSITION, breathToken: "AP" };
+  const seg: Segment = {
+    id: "s", startTick: 0, durationTicks: 480,
+    content: { type: "notes", notes: [mkNote("a", 0, 240, 60)] },
+  };
+  const track: Track = { id: "t", name: "V", trackType: "vocal", segments: [seg], volumeDb: 0, pan: 0, muted: false, solo: false, expanded: true, laneControls: {}, voiceModel: "V", vocalParams: vp };
+
+  it("★ 指纹为 null 时短路成【不脏】;拿到指纹之后才照常判", async () => {
+    // ⛔ `dictionarySig` 是**模块级环境状态**,而本文件顶层第 18 行就 `setDictionarySig("d0")`
+    //    了 —— 所以 null 那一臂在这个文件里**结构上到不了**,得拿一个全新的模块实例。
+    //    (§E2E-D4 的侦察把这条阴性对照的落点写成了 `vocalRender.ts:566-569`,而那段是**文档块**;
+    //     真正的短路在 `isVocalDirty` 体内。打在注释上的变异是空变异 —— 会「不红」然后被读成
+    //     「判据太弱」。所以这里钉的是**行为**,不是行号。)
+    vi.resetModules();
+    const fresh = await import("./vocalRender");
+    // 夹具必须能分辨两个世界:这一段**本来是脏的**(压根没渲染过,没有 bake)。
+    // 拿一段本来就干净的来测,盾生效与不生效会返回同一个答案 —— 那就是空判据。
+    expect(
+      fresh.isVocalDirty(track, seg, 120),
+      "指纹还没到就把存量 bake 判脏 = 每次开机整个工程重渲染;S101 定的安全方向是先答「不脏」",
+    ).toBe(false);
+    fresh.setDictionarySig("d0");
+    expect(
+      fresh.isVocalDirty(track, seg, 120),
+      "指纹到了之后这一段仍然判「不脏」—— 那面盾没有解除,存量 bake 从此永远不会因为换词典而重渲染",
+    ).toBe(true);
+  });
+});
+
 // ── S91: a new/emptied ENGLISH note on an alias track must start out LEGAL in that convention. The
 //    language default `a` is not an ARPABET symbol, so on an ARPAsing track the pen tool would mint
 //    notes that hard-fail the whole segment render with VOCAL_ALIAS (review S91). ──

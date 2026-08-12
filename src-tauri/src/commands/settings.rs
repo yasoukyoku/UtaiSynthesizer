@@ -2004,7 +2004,13 @@ pub fn spawn_pending_data_dir_delete(app_dir: std::path::PathBuf, active_data_di
 /// Reclaim a single queued old root (sync stragglers → delete MIGRATED_SUBTREES → rmdir-if-empty).
 /// Returns true when the entry is PROCESSED (drop from queue), false to keep it queued for a
 /// later boot (drive unmounted).
-fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path, old: &str) -> bool {
+///
+/// ⛔ `pub` only so `tests/dictionary_two_writers.rs` can drive it (S141 §E2E-D3): the dangerous
+/// half of S109 is the ORDER of the two dictionary writers, and pinning it at the loader needs its
+/// own process — `set_dict_dir` is first-call-wins and the lib test binary already claimed it.
+/// Production callers are all in this module; `sync_bundled_dictionaries` and
+/// `dictionary_fingerprint_for` are `pub` for the same reason.
+pub fn reclaim_one_root(app_dir: &std::path::Path, active_data_dir: &std::path::Path, old: &str) -> bool {
     let old_p = std::path::PathBuf::from(old);
     if !old_p.exists() {
         // "Already deleted" vs "its DRIVE isn't mounted": an old root on a removable/USB or
@@ -3932,9 +3938,25 @@ mod tests {
 
         const FRESH: &str = "abstenir\ta p s t ə n i ʁ\n"; // post-D6, what the install ships
         const STALE: &str = "abstenir\ta p s t ə ɲ i ʁ\n"; // pre-D6, what an old root still holds
-        // Written FIRST so the active copy ends up with the newer mtime: that removes the
-        // `src newer` clause from play and leaves the SIZE clause — which is exactly the shape the
-        // real world has, because `fs::copy` preserves mtimes on Windows.
+        // ⛔⛔ S141 CORRECTION — this fixture used to write the old root FIRST, with the comment
+        // "so the active copy ends up with the newer mtime: that removes the `src newer` clause
+        // from play and leaves the SIZE clause". **That reads `needs_copy` backwards.** Its FIRST
+        // arm is `dm > sm => false` — a newer destination returns immediately and the size clause
+        // is never reached. So in that shape the copy was blocked by `needs_copy`, NOT by the skip
+        // list, and assertion 1 below was protected by the wrong thing.
+        //
+        // Measured: the same M1 mutation (`skip_top_names = &[]`) run twice went red on DIFFERENT
+        // assertions — once on 1, once on 5 — because whether the two `fs::write` calls land in the
+        // same clock tick decides whether `needs_copy` falls through to the size clause at all.
+        // A judgement that is only sometimes reachable is worse than one that is never reachable:
+        // it looks like coverage.
+        //
+        // ⇒ The old root is now written LAST and forced strictly newer, so `needs_copy` returns
+        // true and **the skip list is the only thing standing between the stale bytes and the
+        // active root**. (The `.syncing` straggler in assertion 5 was always deterministic — it
+        // does not exist in the active root at all, so `(Ok, Err) => true`.)
+        std::fs::write(install_dicts.join("fr.tsv"), FRESH).unwrap();
+        std::fs::write(active.join("dictionaries").join("fr.tsv"), FRESH).unwrap();
         std::fs::write(old.join("dictionaries").join("fr.tsv"), STALE).unwrap();
         std::fs::write(old.join("dictionaries").join("notes.txt"), "user parked this here").unwrap();
         // S110 (assertion 5): what a previous boot's TORN dictionary sync leaves in a root — the
@@ -3944,10 +3966,27 @@ mod tests {
         // path the sync stages through in the ACTIVE root.
         std::fs::write(old.join("dictionaries").join("fr.tsv.syncing"), b"torn temp from a previous boot").unwrap();
         std::fs::write(old.join("cache").join("straggler.bin"), b"written after the migration").unwrap();
-        std::fs::write(install_dicts.join("fr.tsv"), FRESH).unwrap();
-        std::fs::write(active.join("dictionaries").join("fr.tsv"), FRESH).unwrap();
         // The two arms must actually differ, or every assertion below is vacuous (S92p).
-        assert_ne!(STALE.len(), FRESH.len(), "fixture is vacuous: the size clause could never fire");
+        assert_ne!(STALE.len(), FRESH.len(), "fixture is vacuous: the two arms are indistinguishable");
+        // …and the SOURCE must be strictly newer, or `needs_copy`'s first arm blocks the copy and
+        // assertion 1 stops testing the skip list. The clock granularity can put two writes in one
+        // tick, so this is forced rather than assumed, and then ASSERTED — a fixture precondition
+        // that is only usually true is how a judgement goes quietly vacuous.
+        let stale_fr = old.join("dictionaries").join("fr.tsv");
+        let fresh_fr = active.join("dictionaries").join("fr.tsv");
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        for _ in 0..200 {
+            if mtime(&stale_fr) > mtime(&fresh_fr) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::fs::write(&stale_fr, STALE).unwrap();
+        }
+        assert!(
+            mtime(&stale_fr) > mtime(&fresh_fr),
+            "fixture is vacuous: `needs_copy` returns false for a newer destination BEFORE it ever \
+             looks at the size, so the skip list would not be the thing under test here"
+        );
 
         let processed = super::reclaim_one_root(&app, &active, old.to_str().unwrap());
 
@@ -3990,6 +4029,19 @@ mod tests {
              temp path the bundled sync stages through, so the two writers can collide on one file. \
              The skip list must name the `.syncing` twin of every bundled TSV, not just the TSV."
         );
+
+        // ⚠ S141 §E2E-D3 的口径更正,写在这里免得下一个人重走一遍:
+        //    D-3 那一格写「判据要落在唱出来的音素而不是盘上的文件」,S134 的侦察据此判定这条
+        //    测试「差正好一跳」。**那一跳不该补在这里**:上面第 1 条钉的是 `fr.tsv` 的**逐字节
+        //    全等**,而且是在 reclaim 返回的**那一刻**取的 —— 字节全等就蕴含了音素相同,再补
+        //    一条「喂进解析层唱一遍」是**被它蕴含的装饰性判据**(实测:任何能让音素变的坏法,
+        //    第 1 条都会先红,那条新断言一个字也说不上)。
+        //    「唱出来」真正不可替代的地方是**载入器的缓存**能与盘不一致(`set_dict_dir` 是
+        //    first-call-wins、词典 `Box::leak` 到进程生命周期)。那一层
+        //    `tests/dictionary_distribution.rs` 步骤 4+5 早就有了(还带 `UTAI_MUTANT_STALE_INSTALL`
+        //    这个「文件都拷对了、程序仍唱旧的」变异钩)。
+        //    ⇒ 真正没人测的是**两个写者的先后顺序**:`lib.rs` 先 spawn 回收线程、再同步调 sync,
+        //    所以回收可能落在 sync **之后**。那条腿在 `tests/dictionary_two_writers.rs`。
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -188,6 +188,95 @@ fn migrated_data_root_gets_the_new_dictionary_and_the_render_sings_it() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// ★S141 §E2E-D4 —— **一次落地失败之后,盘上和戳上都不许留下痕迹。**
+///
+/// `sync_bundled_dictionaries` 的落地是 copy 到 `<name>.syncing` 再 rename 过去,失败分支
+/// 有一句 `let _ = std::fs::remove_file(&tmp);`。**那条失败分支此前一次都没被执行过** ——
+/// 而它扫的正是这个仓库反复买过账的东西:一个被遗弃的 `fr.tsv.syncing` 躺在活动根里,
+/// 是两个写者会撞在一起的那条路径(`settings.rs` 的第 5 条断言、以及 S110 那一整段)。
+///
+/// 怎么造一次失败:把目标路径变成一个**目录** ⇒ rename 必然失败。本仓已经用过这一招
+/// (`tpool::the_pool_identity_lands_through_a_temp_file`),不依赖任何平台细节。
+///
+/// ⚠ **诚实边界**(免得下一个人把它读大):
+/// * 「戳没有前进」这一条是**由构造成立**的 —— `dictionary_fingerprint_for` 是活动根的纯函数,
+///   按需算,没有可以「先跑一步」的缓存。它钉在这里,是为了让将来任何一次「顺手改成读 install
+///   目录 / 提前缓存 install 的值」的改动有东西会红,**不是**因为今天有洞。
+/// * 真正带缓存的是 `#[tauri::command] dictionary_fingerprint` 的 `OnceLock`(每个会话只读一次),
+///   而它吃 `State`,仓内任何测试都驱不动;它那一半的口径写在 `settings.rs:1317` 的 doc 里。
+/// * 文件层 only:`set_dict_dir` 是 first-call-wins,本二进制里已被第一条测试占掉。
+#[test]
+fn a_failed_landing_leaves_neither_a_torn_temp_nor_an_advanced_stamp() {
+    let shipped = repo_dictionaries();
+    if !shipped.join("fr.tsv").is_file() {
+        eprintln!("[dict-dist] SKIPPED — no shipped dictionaries");
+        return;
+    }
+    let base = tmp_root("failed_sync");
+    let _ = std::fs::remove_dir_all(&base);
+    let app_dir = base.join("install");
+    let data_dir = base.join("data");
+    let install_dicts = app_dir.join("data").join("dictionaries");
+    let root_dicts = data_dir.join("dictionaries");
+    std::fs::create_dir_all(&install_dicts).unwrap();
+    std::fs::create_dir_all(&root_dicts).unwrap();
+    for name in SHIPPED {
+        std::fs::copy(shipped.join(name), install_dicts.join(name)).unwrap();
+    }
+    let fresh_fr = std::fs::read_to_string(install_dicts.join("fr.tsv")).unwrap();
+    let stale_fr = fresh_fr.replace(" n i", " \u{0272} i");
+    for name in SHIPPED {
+        if name != "fr.tsv" {
+            std::fs::copy(shipped.join(name), root_dicts.join(name)).unwrap();
+        }
+    }
+    // fr.tsv 在活动根里是一个**目录** ⇒ 落地那一步的 rename 必然失败。
+    std::fs::create_dir_all(root_dicts.join("fr.tsv")).unwrap();
+    std::fs::write(root_dicts.join("fr.tsv").join("inside"), &stale_fr).unwrap();
+
+    let fp_before = dictionary_fingerprint_for(&root_dicts);
+    let fp_install = dictionary_fingerprint_for(&install_dicts);
+    // 前置自检:两个戳本来就不同,否则下面那条断言在任何实现下都成立(S92p)。
+    assert_ne!(fp_before, fp_install, "前置不成立:活动根与 install 的戳本来就一样");
+
+    sync_bundled_dictionaries(&app_dir, &data_dir);
+
+    // 前置自检之二:这一跑**真的失败了**。少了它,「戳没前进」可能只是因为 sync 压根没跑。
+    assert!(
+        root_dicts.join("fr.tsv").is_dir(),
+        "夹具没能造出一次落地失败 —— 那条挡路的目录不见了,这条判据什么也没测"
+    );
+
+    // ★ 这一条是本测试真正买到的东西:失败分支的清扫此前**一次都没被执行过**。
+    let leftovers: Vec<String> = std::fs::read_dir(&root_dicts)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("syncing"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "一次落地失败在活动根里留下了 {leftovers:?}。那正是两个写者会撞在一起的路径:\
+         下一次同步经过同一个 `.syncing` 名字,而数据根回收线程也可能把同名文件搬进来 —— \
+         S110 为这件事在 `settings.rs` 里加过一整条断言,而这里是产生它的那一端。"
+    );
+
+    // 下面两条按上面写的诚实边界读:它们钉的是「戳是活动根的纯函数」,是给未来的改动用的守卫。
+    assert_ne!(
+        dictionary_fingerprint_for(&root_dicts),
+        fp_install,
+        "文件没落地,戳却已经等于 install 的那个值 ⇒ 每个存量 bake 都会认为词典更新过了,\
+         而盘上还是旧的:用户唱着旧音素,并且再也不会因为换词典重渲染"
+    );
+    assert_eq!(
+        dictionary_fingerprint_for(&root_dicts),
+        fp_before,
+        "落地失败时活动根的戳变了 —— 它必须与这次失败之前逐字节相同,下一次启动才会再试一次"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The OTHER stuck population: a legacy AppData root has never had a `dictionaries` directory at
 /// all (nothing but `migrate_data_dir` ever created one), so those installs do not sing a stale
 /// French — they fail the render outright with VOCAL_DICT_MISSING. The sync has to CREATE the
