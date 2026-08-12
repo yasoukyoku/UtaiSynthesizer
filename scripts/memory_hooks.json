@@ -6,9 +6,12 @@
   "areas": [
     {
       "id": "gate",
-      "match": ["converter/verify/training/"],
+      "match": [
+        "converter/verify/training/"
+      ],
       "headline": "你在动训练侧的【关卡】。这套闸的绿曾经不代表任何事。",
       "must_read": [
+        "project_v2_session140.md",
         "project_v2_session139.md",
         "project_v2_session138.md",
         "project_v2_session135.md",
@@ -22,12 +25,20 @@
         "⛔ S139:gate1 五条 compare 现在**要求跑器钉的 `GATE1_T0`**(新鲜度)—— 手敲会得 exit 3,那是对的,用 `run_gate1_chain.py`。⛔ 它**默认不跑 prepare**(rvc 4.33 GB / vocoder 9.20 GB),要重建得 `--rebuild-fixtures` **且** `GATE1_ALLOW_REBUILD=1`。⛔ 别跑 `TESTING\\s134_f7\\run_gate1_chain.py` 那份旧副本 —— 它会截掉 S134 自己的转录。",
         "⛔ S139:这一层的每一条判据都要能说出**它红的理由**。本场我自己造了五个洞、三个是同一形状:『判据红了,但它红的理由不是我以为的那个』(过滤器写错 ⇒ 新鲜度永远匹配 0 件,而自检因此而绿)。⇒ 自检的断言要钉到**理由**上(`expect_unrunnable(..., because=)`),不只是异常类型。",
         "⛔ 别用 reporter.stage 的 done 计数当判据 —— 它在 skip 之前汇报,全跳过也走满。",
-        "⛔ 五条链的 gate0 两侧解释器**天生不同**(原版侧 = RVC 整合包 runtime),不许改成 gate1 那种『两侧同一个』。"
+        "⛔ 五条链的 gate0 两侧解释器**天生不同**(原版侧 = RVC 整合包 runtime),不许改成 gate1 那种『两侧同一个』。",
+        "⛔⛔ S140:**「一条从没在真夹具上执行过的断言」与「一条从没被执行过的错误分支」一样,都是空判据。** 实测:S139 前移到 rmtree 之前的那条输入身份断言,把 `rvc_ours\\mute` 判成空子目录 ⇒ **笔 G 的第一条链当场退 6**。根因是 `mute` 是**目录套目录**而 `gate0_guard.collect` **非递归**,而拷贝端 `copytree` 是递归的 —— 两边口径不一致;而它的自检夹具是**扁平**目录,**结构上盖不到这一形**。⇒ 给闸写自检夹具时,**先去看真夹具长什么样**(嵌套?末行空 losses?同一 step 出现两次?),别照着脑子里的形状造。",
+        "⛔⛔ S140:**NaN 在纯 python 里是隐形的。** `max(生成器)` 与 `if rel > worst` 对 NaN 的**一切**比较都是 False ⇒ 前者在 NaN 不落首位时静默丢掉、后者**连首位都丢**(实测:v2 九分量全 NaN 时打 `max_rel=0.000e+00 @ step -1` 并 **PASS**)。⇒ 判据一律写成**否定式** `if not (rel <= line)`,并对两侧逐点 `math.isfinite` 点名;打印的必须是**真比过的对数**,不是送进去的点数。⚠ 这条 `gate1_vocoder_compare` 早在 **S40** 就修好并写下过原话,**四个月零回移** —— 与 gate0_guard 头注记的 S68 那段 25 天**同形第三次**。⇒ 修一个洞时,**先 grep 它的孪生**。",
+        "⛔⛔ S140:**汇总层会把归因吃掉。** `run_gate1_chain all` 的退出码此前取「第一条非零」(而变量名叫 `worst`)⇒ 一条 exit 6(语义「重跑一次就好」)会把后面任何一条真红盖住;而这套码的全部价值就在于 `1` 被单列为「只有这一种是被测的东西不对」。⇒ 现在按**严重度** 1>7>4>2>3>5>6,并打 `EXIT=n 因为 <哪条链>`。⛔ 跑完**别只看 `$LASTEXITCODE`**,逐条读汇总的五个 rc,并**逐条打开 `1_prepare.log`** ——exit 6 在「prepare 拒绝(盘上什么都没删)」与「compare 不构成判定(夹具已换过一轮)」之间是复用的。",
+        "⛔⛔ S140:**联锁只挡住它看得见的那条路。** `run_gate1_chain.py vocoder` **不加任何参数**就会删掉 3.66 GB(S134 声码器**原版侧**唯一在盘证据)—— `gate1_vocoder_run_orig.py` 在 import 期无条件 rmtree,而 `report_wipes` + `GATE1_ALLOW_REBUILD` 只在 `if rebuild:` 里 ⇒ **那道锁是装饰**。⇒ 加联锁时先问:**这条路上还有谁会删东西**(上游驱动?上游 `data_utils` 的 lazy cache?),别只挡 prepare。同族:只报「删」不报「**覆盖**」的账目只有半个。",
+        "⛔ S140:**登记值必须是量出来的,而且要和判据的口径逐字对齐。** 本场唯一一次真红是我登记 `expect_sha` 时只算了 events 文件,而 `declare_frozen(..., [\"\"])` 无后缀过滤、算的是**整目录**(同目录还有个 3 字节的 `hparams.yaml`)—— **闸是对的,错的是登记值**。⇒ 登记之前先用**判据自己会走的那条代码路径**把值算出来。⚠ 同族:`EXPECT[*]` 里任何**零读者**的登记数都会在下一个人手里变成一条错的判据。",
+        "⛔ S140:长任务(gate1 五条链 ≈ 16 分 29 秒)**别用带 timeout 的后台命令跑** —— 工具上限是 10 分钟,会在中途把它杀掉。用 `Start-Process` 起**真正脱离**的进程 + Monitor 盯结论行。⚠ 这一场因此白跑了一次(损失为零:备份完整、后四条链一步没动)。"
       ]
     },
     {
       "id": "training-py",
-      "match": ["training/utai_train/"],
+      "match": [
+        "training/utai_train/"
+      ],
       "headline": "你在动 python 训练侧的生产代码。",
       "must_read": [
         "reference_training_workspace_layout.md",
@@ -43,7 +54,9 @@
     },
     {
       "id": "training-rs",
-      "match": ["src-tauri/src/training/"],
+      "match": [
+        "src-tauri/src/training/"
+      ],
       "headline": "你在动 Rust 训练侧(槽 / run / 池 / 锁表 / 导出账本)。",
       "must_read": [
         "reference_training_workspace_layout.md",
@@ -59,7 +72,11 @@
     },
     {
       "id": "training-ui",
-      "match": ["src/components/training/", "src/lib/training/", "src/store/training"],
+      "match": [
+        "src/components/training/",
+        "src/lib/training/",
+        "src/store/training"
+      ],
       "headline": "你在动训练侧前端。",
       "must_read": [
         "project_v2_devserver_and_e2e_backlog.md",
@@ -73,7 +90,11 @@
     },
     {
       "id": "dictline",
-      "match": ["converter/architectures/", "scripts/g2p_rulers/", "src/lib/vocal/"],
+      "match": [
+        "converter/architectures/",
+        "scripts/g2p_rulers/",
+        "src/lib/vocal/"
+      ],
       "headline": "你在动词典线 / G2P / 人声轨那一块 —— 它的 session 行 S83-S113 在 S135 被整块搬出 MEMORY.md 了。",
       "must_read": [
         "memory_dictline_sessions_index.md"
@@ -86,7 +107,10 @@
     },
     {
       "id": "release",
-      "match": ["scripts/release.ps1", "src-tauri/tauri.conf.json"],
+      "match": [
+        "scripts/release.ps1",
+        "src-tauri/tauri.conf.json"
+      ],
       "headline": "你在动发版链。",
       "must_read": [
         "reference_release_signing_and_publishing.md",
