@@ -141,23 +141,28 @@ def _fmt(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
 
 
-def read_t0(gate_name):
-    """本轮起始时刻(epoch 秒),由跑器通过环境变量 GATE0_T0 传进来。
+def read_t0(gate_name, env=None):
+    """本轮起始时刻(epoch 秒),由跑器通过环境变量传进来(gate0 用 `GATE0_T0`)。
 
     ⛔ 没有它就没有新鲜度判据 ⇒ 分不出产物是今天算的还是七月的
        ⇒ 这一轮不构成一次判定。响亮地判 UNRUNNABLE,不给默认值。
+
+    ⚠ S139:`env` 可以换名 —— gate1 那一层用 `GATE1_T0`(`gate1_guard.T0_ENV`)。
+      **必须分层**:同一个 shell 里先跑 gate0 会话再跑 gate1,复用同一个变量名会让
+      gate1 读到几小时前的 t0,而这种失效静默、且只会让判据**变宽**。
     """
-    raw = os.environ.get(T0_ENV)
+    env = env or T0_ENV
+    raw = os.environ.get(env)
     if not raw:
         raise GateUnrunnable(
             "没有 %s ⇒ 无法判断读到的产物是不是本轮算的 ⇒ 这一轮的读数不可归因。\n"
-            "       用 run_gate0_chain.py 跑,或手动 set %s=<epoch 秒>。\n"
-            "       (%s)" % (T0_ENV, T0_ENV, gate_name)
+            "       用对应的 run_gate*_chain.py 跑,或手动 set %s=<epoch 秒>。\n"
+            "       (%s)" % (env, env, gate_name)
         )
     try:
         val = float(raw)
     except ValueError:
-        raise GateUnrunnable("%s=%r 不是一个 epoch 秒" % (T0_ENV, raw))
+        raise GateUnrunnable("%s=%r 不是一个 epoch 秒" % (env, raw))
     # ⛔ S139:`float()` 过得去 ≠ 是一个合法的 t0。三种退化值各有各的伤,而**最阴的是 0**:
     #    `t0=0` ⇒ 1970-01-01 ⇒ 盘上任何陈货都 `mtime >= t0` ⇒ 新鲜度判据整体失效,
     #    而它打出来的是一行**格式完全合格的绿**(`[FRESH] ... t0=1970-01-01T08:00:00`),
@@ -169,7 +174,7 @@ def read_t0(gate_name):
         raise GateUnrunnable(
             "%s=%r 不是一个合法的 t0(要求有限且 > 0)。\n"
             "       ⛔ t0=0 会让【任何】陈货都通过新鲜度判据,而且打出来的是一行格式合格的绿;\n"
-            "         负数 / nan / inf 会让 stale 判据静默失效再炸在打印上。" % (T0_ENV, raw)
+            "         负数 / nan / inf 会让 stale 判据静默失效再炸在打印上。" % (env, raw)
         )
     return val
 

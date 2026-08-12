@@ -84,6 +84,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gate0_guard as G        # noqa: E402  —— 只借 _say / EXIT_UNRUNNABLE 与它的编码修复
+import gate1_guard as G1       # noqa: E402  —— 环境变量名是**它**的,别在这里抄第二份
 
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 GT = HERE
@@ -97,7 +98,10 @@ RUNS_DEFAULT = r"D:\MyDev\TESTING\gate1_runs"
 STAGING = os.path.join(TESTING, "envs", "s42_staging_nv_cu130", "Scripts", "python.exe")
 VENV = os.path.join(REPO, "training", ".venv", "Scripts", "python.exe")
 
-T0_ENV = "GATE1_T0"
+# ⛔ 两个环境变量名的**唯一真源是 `gate1_guard`**(消费者在那边)。这里只转引,
+#    别抄第二份 —— 抄了之后哪天改一边就是一条静默失效的新鲜度判据。
+T0_ENV = G1.T0_ENV
+SKIPPED_ENV = G1.SKIPPED_ENV
 SESSION_MAX_AGE = 6 * 3600.0
 ALLOW_REBUILD_ENV = "GATE1_ALLOW_REBUILD"
 
@@ -180,7 +184,7 @@ def report_wipes(chain, cfg):
     return grand
 
 
-def step(chain, name, py, script, out_dir, t0, flags):
+def step(chain, name, py, script, out_dir, t0, flags, extra_args=()):
     """跑一段。返回 (rc, 秒数, 日志路径)。
 
     stdout_to 非空时 stdout 走【临时文件】再落位 —— 直接 `>` 会在脚本失败前就把历史产物
@@ -194,24 +198,28 @@ def step(chain, name, py, script, out_dir, t0, flags):
                 "          (S139:一份能被下一次运行静默改写、而且能半新半旧的转录不满足"
                 "『失败时必须留下能查的转录』)" % log)
     tmp = log + ".stdout.tmp"
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", T0_ENV: "%.3f" % t0}
+    # ⛔ `GATE1_SKIPPED` 把「这一跑故意跳过了哪几段」透传给 compare —— 被跳过那一侧的产物
+    #    **本来就不是本轮的**,它该走 declare_frozen + note_uncovered(结论是
+    #    PASS-WITH-GAPS 或 exit 3),而不是被新鲜度判据当成一条陈货红。
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", T0_ENV: "%.3f" % t0,
+           SKIPPED_ENV: ",".join(flags)}
     env.pop("UTAI_DIAGNOSTICS", None)  # 诊断模式会往 .log 里多打行,让日志面不可比
+    cmd = [py, "-u", os.path.join(GT, script)] + list(extra_args)
     t_start = time.time()
     with open(log, "w", encoding="utf-8", errors="replace") as fh:
         # 照 run_gate0_chain.py:177 —— 转录必须自陈它是谁在什么条件下产的
-        fh.write("$ %s -u %s\n  cwd=%s\n  %s=%.3f (%s)\n  flags=%s\n\n"
-                 % (py, os.path.join(GT, script), REPO, T0_ENV, t0,
+        fh.write("$ %s\n  cwd=%s\n  %s=%.3f (%s)\n  %s=%s\n\n"
+                 % (" ".join(cmd), REPO, T0_ENV, t0,
                     time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0)),
-                    ",".join(flags) or "(none)"))
+                    SKIPPED_ENV, ",".join(flags) or "(none)"))
         fh.flush()
         if stdout_to:
             with open(tmp, "w", encoding="utf-8", errors="replace") as so:
-                rc = subprocess.run([py, "-u", os.path.join(GT, script)], cwd=REPO,
-                                    stdout=so, stderr=fh, text=True, env=env).returncode
+                rc = subprocess.run(cmd, cwd=REPO, stdout=so, stderr=fh,
+                                    text=True, env=env).returncode
         else:
-            rc = subprocess.run([py, "-u", os.path.join(GT, script)], cwd=REPO,
-                                stdout=fh, stderr=subprocess.STDOUT, text=True,
-                                env=env).returncode
+            rc = subprocess.run(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT,
+                                text=True, env=env).returncode
     dt = time.time() - t_start
     if stdout_to:
         if rc == 0:
@@ -230,7 +238,7 @@ def _tail(log, n=10):
     return body[-n:]
 
 
-def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags):
+def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags, allow_uncovered=False):
     c = CHAINS[chain]
     G._say("\n===== chain %s  python=%s =====" % (chain, c["py"]))
 
@@ -277,7 +285,10 @@ def run_chain(chain, out, t0, rebuild, skip_orig, dry, flags):
         plan.insert(0, ("1_prepare", "prepare"))
 
     for name, kind in plan:
-        rc, _dt, log = step(chain, name, c["py"], c[kind], out, t0, flags)
+        # ⛔ `--allow-uncovered` 只透传给 compare —— 它是「我知道这一轮有缺口,仍然接受」的
+        #    显式表态,而 gate0_guard.finish 的默认是**有缺口就 exit 3**。
+        extra = ("--allow-uncovered",) if (kind == "compare" and allow_uncovered) else ()
+        rc, _dt, log = step(chain, name, c["py"], c[kind], out, t0, flags, extra)
         if kind == "orig" and rc in c.get("orig_ok", (0,)):
             continue
         if rc == G.EXIT_UNRUNNABLE and kind == "compare":
@@ -352,6 +363,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--t0", type=float, default=None)
     ap.add_argument("--new-session", action="store_true")
+    ap.add_argument("--allow-uncovered", action="store_true",
+                    help="接受这一轮的零覆盖缺口(透传给 compare)—— ⛔ 有缺口的默认是 exit 3")
     ap.add_argument("--selftest", action="store_true",
                     help="阴性对照:用桩脚本把每一档出口码真触发一次")
     args = ap.parse_args(argv)
@@ -378,7 +391,8 @@ def main(argv=None):
     worst, results = 0, []
     for c in chains:
         out = os.path.join(args.runs, c, stamp)
-        rc = run_chain(c, out, t0, args.rebuild_fixtures, args.skip_orig, args.dry_run, flags)
+        rc = run_chain(c, out, t0, args.rebuild_fixtures, args.skip_orig, args.dry_run,
+                       flags, args.allow_uncovered)
         results.append((c, rc))
         if rc != 0 and worst == 0:
             worst = rc

@@ -1,21 +1,40 @@
-"""关卡1 对拍：逐 step loss 轨迹 —— 原版 train.py vs 我们 vendored train()。
+# -*- coding: utf-8 -*-
+"""关卡1 对拍(RVC):逐 step loss 轨迹 —— 原版 train.py vs 我们 vendored train()。
 
-    training/.venv/Scripts/python.exe converter/verify/training/gate1_compare.py
+    training/.venv/Scripts/python.exe converter/verify/training/run_gate1_chain.py rvc
 
-两侧同 torch(2.5.1)/同数据/同序(1234)/同底模/fp32 CPU（确定性）。原版侧取
-tensorboard events（全精度；stdout 只有 3 位小数），我方侧取协议 JSONL。
-注意原版把 mel>75 / kl>9 夹到上限后才写 TB —— 比较时对我方值施加同一夹取。
-结构性移植错误（损失权重/数据顺序/模型接线）会造成 O(0.1~1) 的相对差；
-通过线设在 max 相对差 ≤1e-3（实测期望 ~1e-6 级）。
+⛔ **别再直接手敲这个脚本**:它现在要求跑器钉的 `GATE1_T0`(新鲜度),没有它会
+   响亮地判 exit 3(不可归因)而不是给你一个没有意义的绿。理由见 `gate1_guard` 头注 ⑴。
+
+两侧同数据/同序(1234)/同底模/fp32 CPU(确定性)。原版侧取 tensorboard events(全精度;
+stdout 只有 3 位小数),我方侧取协议 JSONL。
+⚠ **torch 轴**:文件头此前写着「双方同 torch(2.5.1)」——**那是陈货**。经 `run_gate1_chain.py`
+   跑时这条链用的是 `envs\\s42_staging_nv_cu130`(**torch 2.11.0+cu130**,也正好是出货 runtime
+   pack 的版本),两侧同一个。S134 §3 就记过这件事,四个月没改到文件头里。
+   ⇒ 现在实际版本由 `gate1_guard.header` 打进转录,别再靠这段散文。
+
+结构性移植错误(损失权重/数据顺序/模型接线)会造成 O(0.1~1) 的相对差;
+通过线设在 max 相对差 ≤1e-3(实测期望 ~1e-6 级)。
+
+⛔ **夹取(clamp)是这条链特有的一条致盲**,S139 实测,写清楚别当没有:
+   原版把 mel>75 / kl>9 夹到上限**之后**才写 TB,所以比较时必须对我方值施加同一夹取。
+   后果:凡是**原版侧已顶到上限**的 step,判据退化成 `min(ours, 9.0) vs 9.0`
+   ⇒ 我方值只要 ≥9,相对差**恒等于 0**,无论真值是 9.001 还是 1e9(实测:改成 1e9 仍 ALL PASS)。
+   而今天盘上的真夹具里 **kl 有 2/30 步顶满,其中包括 step 0** —— 而 step 0 恰恰是
+   初始化/底模装载/第一次前向这类错误表现得最赤裸的一步。
+   ⛔ **不许「去掉 clamp」**:两个神谕(TB 与 orig stdout)存的都是**夹过的值**,
+      去掉会把它变成一条必红的假判据。⇒ 唯一诚实的做法是**逐分量记账**(见下)。
 """
-import json
 import os
 import sys
 
 import numpy as np
 
-sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
 
+CHAIN = "rvc"
+GATE = "GATE1 (RVC)"
 ORIG_TB_DIR = r"D:\MyDev\RVC\RVC20240604Nvidia\logs\gate1"
 OURS_JSONL = r"D:\MyDev\TESTING\utai-v2-testing\gate1_ours_steps.jsonl"
 
@@ -26,66 +45,65 @@ PAIRS = [  # (TB tag, ours key, clamp)
     ("loss/g/mel", "mel", 75.0),
     ("loss/g/kl", "kl", 9.0),
 ]
-
-
-def load_orig():
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-    acc = EventAccumulator(ORIG_TB_DIR, size_guidance={"scalars": 0})
-    acc.Reload()
-    out = {}
-    for tag, _, _ in PAIRS:
-        out[tag] = {e.step: e.value for e in acc.Scalars(tag)}
-    return out
-
-
-def load_ours():
-    steps = {}
-    with open(OURS_JSONL, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            if obj.get("type") == "step" and "g_total" in obj.get("losses", {}):
-                steps[obj["step"]] = obj["losses"]
-    return steps
+MAX_REL = 1e-3
 
 
 def main():
-    orig = load_orig()
-    ours = load_ours()
-    common = sorted(set(orig["loss/g/total"]) & set(ours))
-    print(f"orig steps={len(orig['loss/g/total'])} ours steps={len(ours)} common={len(common)}")
-    if len(common) < 10:
-        print("GATE1: FAIL — 对齐步数不足")
-        sys.exit(1)
+    allow_uncovered = "--allow-uncovered" in sys.argv
+    t0 = G1.read_t0(GATE)
+    orig_frozen = "orig" in G1.skipped_stages()
+    G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
 
-    failures = []
+    orig = G1.tb_scalars(
+        "orig/TB", ORIG_TB_DIR, [t for t, _k, _c in PAIRS], t0,
+        frozen_why=("--skip-orig:参照侧本轮**故意没有重跑**,按冻结参照记账"
+                    if orig_frozen else None))
+    if orig_frozen:
+        G1.note_uncovered("参照侧未重跑(--skip-orig)",
+                          "这一轮只证明了我方侧与**上一次**跑出来的参照一致")
+
+    ours, _nones = G1.jsonl_steps("ours/JSONL", OURS_JSONL, "g_total", t0)
+
+    exp = G1.EXPECT[CHAIN]["steps"]
+    steps = G1.require_exact_steps("ours/JSONL", CHAIN, ours, exp,
+                                   other=orig["loss/g/total"], other_label="orig/TB")
+
+    # ⛔ None = protocol 的 _clean 把非有限值写成的 ⇒ **发散**,而发散正是这台闸要抓的东西。
+    #    ⚠ 发现 None 就**立刻收尾**,不许往下走进算术 —— 否则 `min(b, clamp)` 会拿
+    #      float 和 None 比大小,抛 TypeError,被 run() 归到「闸自己炸了」(exit 3),
+    #      而真相是**被测的东西发散了**(exit 1)。这条是 gate1_negctl 抓住的。
+    failures = G1.require_no_none("ours/JSONL", ours, [k for _t, k, _c in PAIRS])
+    if failures:
+        G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
+
     for tag, key, clamp in PAIRS:
-        rels = []
-        for s in common:
+        rels, effective, clamped = [], [], []
+        for s in steps:
             a = orig[tag][s]
             b = ours[s][key]
+            if clamp is not None and a >= clamp * (1 - 1e-9):
+                clamped.append(s)          # 原版顶满 ⇒ 这一步在数值上不可证伪
+                continue
             if clamp is not None:
                 b = min(b, clamp)
-            denom = max(abs(a), 1e-6)
-            rels.append(abs(a - b) / denom)
-        rels = np.array(rels)
-        worst = common[int(rels.argmax())]
-        ok = rels.max() <= 1e-3
-        print(
-            f"[{'PASS' if ok else 'FAIL'}] {tag:>14} vs {key:>7}: max_rel={rels.max():.3e} @step {worst}, mean_rel={rels.mean():.3e}"
-        )
+            rels.append(abs(a - b) / max(abs(a), 1e-6))
+            effective.append(s)
+        if clamp is not None:
+            # ⛔ 登记式记账,不是 note_uncovered:见 gate1_guard.check_clamped 的头注
+            G1.check_clamped("%s(%s)" % (tag, key), clamped, len(steps),
+                             G1.EXPECT[CHAIN]["clamped"].get(tag, 0))
+        arr = np.array(rels)
+        worst = effective[int(arr.argmax())]
+        ok = arr.max() <= MAX_REL
+        G1._say("[%s] %14s vs %7s: max_rel=%.3e @step %d, mean_rel=%.3e  (%d/%d 步可比%s)"
+                % ("PASS" if ok else "FAIL", tag, key, arr.max(), worst, arr.mean(),
+                   len(rels), len(steps),
+                   ",%d 步被夹取致盲" % len(clamped) if clamped else ""))
         if not ok:
             failures.append(tag)
 
-    print()
-    if failures:
-        print("GATE1: FAIL —", ", ".join(failures))
-        sys.exit(1)
-    print(f"GATE1: ALL PASS ({len(common)} steps compared)")
+    G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
 
 if __name__ == "__main__":
-    main()
+    G1.run(GATE, main)

@@ -1,20 +1,41 @@
-"""SoVITS 4.0-v2 关卡1 对拍：原版 tensorboard events vs 我方 JSONL 步流。
-九分量（v2 的 TB tag → 我方 losses 键），无 clamp（上游 TB 写原始值）。
-结构性移植错误 = O(0.1~1) 的 rel；期望 ~1e-6 级（同 torch/CPU/fp32/seed/RNG 流）。
-对齐步数 < 10 直接 FAIL（防空交集假 PASS，红队 A11）。
+# -*- coding: utf-8 -*-
+"""SoVITS 4.0-v2 关卡1 对拍:原版 tensorboard events vs 我方 JSONL 步流。
 
-    training/.venv/Scripts/python.exe converter/verify/training/gate1_sovits_v2_compare.py
+    training/.venv/Scripts/python.exe converter/verify/training/run_gate1_chain.py sovits_v2
+
+九分量(v2 的 TB tag → 我方 losses 键),无 clamp(上游 TB 写原始值)。
+结构性移植错误 = O(0.1~1) 的 rel;期望 ~1e-6 级(同 torch/CPU/fp32/seed/RNG 流)。
+⚠ 这条链是五条里**唯一**用 `training\\.venv`(torch 2.5.1)的 —— 它的历史基线是那个解释器
+   产的,所以它的文件头此前**没有**陈货问题。实际版本仍由 header 打进转录。
+
+⛔⛔ **S139 修掉的那条,是这五条链里最贵的一条**:
+   原来筛步用的是 `losses.get("g_total") is not None` ——
+   **值为 None 的那一整步根本不进 `ours`**,于是:
+     · 下面那条「缺分量 ⇒ FAIL」的分支**永远到不了**(实测);
+     · 而 `protocol.py` 的 `_clean` 正是把**非有限值(nan/inf)写成 None** 的
+       ⇒ **发散的那几步整个从判据里消失**;
+     · 剩下的步照样对得上 ⇒ 打印 `aligned: 12` 并 **[PASS] 退 0**。
+   实测两条:g_total 单独 null@step9 ⇒ `aligned: 13` [PASS];
+             九个分量**全** null@steps 9,10(真发散形状)⇒ `aligned: 12` [PASS]。
+   ⚠ 而 **NaN 正是这台闸存在的理由**(§F5「续训崩溃」那条未结案卷宗、`gate_numerics_guard`
+      的全部立项理由都是它)。
+   ⇒ 现在:筛步一律用「**键在不在**」(`gate1_guard.jsonl_steps`),
+      值为 None ⇒ `require_no_none` **立刻红并点名 step/分量**;
+      步数不足则由 `require_exact_steps` 判 exit 3(闸没跑成),不是 exit 1。
+   ⛔ 旧的「对齐步数 < 10 ⇒ FAIL」也一起换掉:那个 10 与这条链的真值(**14**)无关,
+      丢 4 步仍然打 [PASS]。
 """
-import json
 import os
 import sys
 
-TESTING = r"D:\MyDev\TESTING\utai-v2-testing"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate1_guard as G1                                        # noqa: E402
+
+CHAIN = "sovits_v2"
+GATE = "GATE1 SOVITS_V2"
 SOVITS_V2 = r"D:\MyDev\TESTING\SoVITS-4.0_v2\src\so-vits-svc"
 ORIG_TB_DIR = os.path.join(SOVITS_V2, "logs", "gate1_sovits_v2")
-OURS_JSONL = os.path.join(TESTING, "gate1_sovits_v2_ours_steps.jsonl")
-
-sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+OURS_JSONL = r"D:\MyDev\TESTING\utai-v2-testing\gate1_sovits_v2_ours_steps.jsonl"
 
 PAIRS = [
     ("loss/total", "g_total"),
@@ -31,49 +52,54 @@ MAX_REL = 1e-3
 
 
 def main():
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    allow_uncovered = "--allow-uncovered" in sys.argv
+    t0 = G1.read_t0(GATE)
+    orig_frozen = "orig" in G1.skipped_stages()
+    G1.header(GATE, CHAIN, [("orig TB", ORIG_TB_DIR), ("ours JSONL", OURS_JSONL)])
 
-    acc = EventAccumulator(ORIG_TB_DIR, size_guidance={"scalars": 0})
-    acc.Reload()
-    orig = {}
-    for tag, _ in PAIRS:
-        for ev in acc.Scalars(tag):
-            orig.setdefault(ev.step, {})[tag] = ev.value
+    orig = G1.tb_scalars(
+        "orig/TB", ORIG_TB_DIR, [t for t, _k in PAIRS], t0,
+        frozen_why=("--skip-orig:参照侧本轮**故意没有重跑**,按冻结参照记账"
+                    if orig_frozen else None))
+    if orig_frozen:
+        G1.note_uncovered("参照侧未重跑(--skip-orig)",
+                          "这一轮只证明了我方侧与**上一次**跑出来的参照一致")
 
-    ours = {}
-    with open(OURS_JSONL, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            msg = json.loads(line)
-            if msg.get("type") == "step" and msg.get("losses", {}).get("g_total") is not None:
-                ours[msg["step"]] = msg["losses"]
+    ours, _nones = G1.jsonl_steps("ours/JSONL", OURS_JSONL, "g_total", t0)
+    exp = G1.EXPECT[CHAIN]["steps"]
+    steps = G1.require_exact_steps("ours/JSONL", CHAIN, ours, exp,
+                                   other=orig["loss/total"], other_label="orig/TB")
+    # ⛔ 发现 None 就**立刻收尾**,不许往下走进算术(否则 `a - b` 拿 float 减 None,
+    #    抛 TypeError 被归到「闸自己炸了」exit 3,而真相是**发散了** exit 1)。
+    failures = G1.require_no_none("ours/JSONL", ours, [k for _t, k in PAIRS])
+    if failures:
+        G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
-    steps = sorted(set(orig) & set(ours))
-    print("orig steps: %d, ours steps: %d, aligned: %d" % (len(orig), len(ours), len(steps)))
-    if len(steps) < 10:
-        print("[FAIL] 对齐步数 < 10 —— 空交集假 PASS 防线")
-        sys.exit(1)
+    # ⛔ 分量缺席(键根本不在)与分量为 None(发散)是**两件事**,要分开报:
+    #    前者是「我方侧没发出这个字段」= 闸没跑成;后者是真的红。
+    missing = [(s, k) for s in steps for _t, k in PAIRS if k not in ours[s]]
+    if missing:
+        raise G1.GateUnrunnable(
+            "ours/JSONL: %d 处**缺分量**(键根本不在,不是 None):%s\n"
+            "       ⇒ 我方侧没有发出该发的字段 ⇒ 这一轮不构成一次对拍。"
+            % (len(missing), missing[:8]))
 
     worst = (0.0, "", -1)
     for s in steps:
         for tag, key in PAIRS:
-            a = orig[s].get(tag)
-            b = ours[s].get(key)
-            if a is None or b is None:
-                print("[FAIL] step %d 缺分量 %s/%s" % (s, tag, key))
-                sys.exit(1)
+            a, b = orig[tag][s], ours[s][key]
             rel = abs(a - b) / max(abs(a), 1e-6)
             if rel > worst[0]:
                 worst = (rel, tag, s)
     ok = worst[0] <= MAX_REL
-    print(
-        "[%s] GATE1 SOVITS_V2: %d steps x %d 分量, max_rel=%.3e (%s @ step %d), 线=%.0e"
-        % ("PASS" if ok else "FAIL", len(steps), len(PAIRS), worst[0], worst[1], worst[2], MAX_REL)
-    )
-    sys.exit(0 if ok else 1)
+    if not ok:
+        failures.append(worst[1])
+    G1._say("[%s] %s: %d 步 × %d 分量, max_rel=%.3e (%s @ step %d), 线=%.0e"
+            % ("PASS" if ok else "FAIL", GATE, len(steps), len(PAIRS),
+               worst[0], worst[1], worst[2], MAX_REL))
+
+    G1.finish(GATE, failures, allow_uncovered=allow_uncovered)
 
 
 if __name__ == "__main__":
-    main()
+    G1.run(GATE, main)
