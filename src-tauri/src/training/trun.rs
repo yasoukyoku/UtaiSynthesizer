@@ -516,6 +516,48 @@ pub fn pool_of_run(run: &RunDir) -> Option<String> {
     v["pool_id"].as_str().filter(|s| !s.is_empty()).map(String::from)
 }
 
+/// WHICH run a resolved [`RunDir`] is — `""` when the slot root IS the run (layout ≤ 2).
+///
+/// ★§F2⒝-B2-⑤ / §E2E-M25 — the frontend needs to say 「这个 run 正在训练」 about one ROW, and the
+/// only thing the live snapshot could point at was a path. This is the one place that turns the
+/// resolved directory back into the id the row carries.
+///
+/// ## ⛔ It is NOT a second derivation, and that is the entire design
+///
+/// The answer is handed to [`run_id_in_rel`] — the function whose doc already says a second
+/// derivation of 「which run is this path in」 would be *a second chance to disagree with the ledger
+/// about the same string*. The only work done here is rebuilding the project-relative shape that
+/// function reads: `<family>/runs/<id>/…`. The trailing `_` is not decoration — `run_id_in_rel`
+/// requires a component AFTER the id so that the container listing itself can never be named as a
+/// run, and a run DIRECTORY is exactly that bare shape.
+///
+/// ## The empty answer is a POSITIVE FACT, not a failure
+///
+/// Same contract as [`resolve_run_dir`] and [`run_id_in_rel`]: `""` means「the slot root holds this
+/// run's products」, which is what an unmigrated slot looks like and what `RunDetail.id` carries for
+/// its single row. ⛔ The frontend must therefore never use `""` as「没有 run 在跑」 — that question
+/// is answered by the snapshot's `state`, and conflating the two makes an unmigrated slot's only
+/// row read as「正在训练」forever, idle included.
+///
+/// ⚠ A `run` that is not under `slot` also answers `""`. That is not a case production can reach
+/// (every `RunDir` comes from a resolver that was handed this same slot), and answering loudly here
+/// would mean an error type on a pure string function that four screens read — but it does mean
+/// this function must never be used to VALIDATE the pairing, only to name it.
+///
+/// ⛔ **There is deliberately no `if tail.is_empty()` short-circuit for the slot-root case.** The
+/// first draft had one, and a mutation probe showed it was DEAD: an empty tail formats to
+/// `<family>//_`, which does not carry the `<family>/runs/` prefix, so the delegate already answers
+/// `""` — the same positive fact, decided in the same one place. A branch that no input can
+/// distinguish reads as a guard while guarding nothing, and this file has paid for that shape
+/// before. The property it looked like it was protecting is covered by the ⑴ case of
+/// `a_resolved_run_can_be_named_back_into_the_id_its_row_carries` instead.
+pub fn run_id_of(slot: &Path, family: &str, run: &RunDir) -> String {
+    let Ok(tail) = run.path().strip_prefix(slot) else {
+        return String::new();
+    };
+    run_id_in_rel(&format!("{family}/{}/_", tail.to_string_lossy()), family)
+}
+
 impl std::ops::Deref for RunDir {
     type Target = Path;
     fn deref(&self) -> &Path {
@@ -1321,6 +1363,71 @@ mod tests {
         let new = format!("rvc/{RUNS_DIR}/{id}/weights/m.pth");
         assert_eq!(run_id_in_rel(&old, "rvc"), "");
         assert_eq!(run_id_in_rel(&new, "rvc"), id);
+    }
+
+    /// ★§F2⒝-B2-⑤ / §E2E-M25 —— naming a RESOLVED run back into the id its ROW carries.
+    ///
+    /// ## Why this is driven through the real resolvers
+    ///
+    /// The whole value of [`run_id_of`] is that the string it produces has to equal the one the
+    /// frontend already has on that row, which comes from [`list_runs`]. Hand-building a `RunDir`
+    /// and asserting against a hand-written id would prove that this function can split a path —
+    /// something nobody doubted — while saying nothing about the only property that matters. So
+    /// every case below resolves a real directory and compares against `list_runs`' own answer.
+    ///
+    /// ⛔ The `""` cases are the load-bearing ones: `""` is a POSITIVE answer here (「the slot root
+    /// holds the run」), and it is also what `RunDetail.id` carries for an unmigrated slot's single
+    /// row. A frontend that reads it as「没有 run 在跑」marks that row as training forever.
+    #[test]
+    fn a_resolved_run_can_be_named_back_into_the_id_its_row_carries() {
+        let data = tmp_data("nameback");
+
+        // ⑴ layout ≤2 — the slot root IS the run, and both sides say so with the same string.
+        let flat = project_dir(&data, "p_44444444").join("rvc");
+        touch(&flat.join("G_2333333.pth"));
+        let flat_run = run_dir_for_start(&flat, "rvc", None, false).unwrap();
+        assert_eq!(flat_run.path(), flat, "夹具前提:未迁移槽解析出来的就是槽根");
+        assert_eq!(
+            run_id_of(&flat, "rvc", &flat_run),
+            "",
+            "未迁移槽的答案必须是空串 —— 它是【肯定事实】,与 `RunDetail.id` 给那一行的值同一个串"
+        );
+        assert!(list_runs(&flat).unwrap().is_empty(), "夹具前提:它还没有 runs/ 容器");
+
+        // ⑵ layout ≥3 — the id must be the one the LISTING reports, not merely「some segment」.
+        let slot = project_dir(&data, "p_55555555").join("sovits");
+        let a = legacy_run_id("sovits");
+        touch(&runs_root(&slot).join(&a).join("G_2333333.pth"));
+        let resumed = run_dir_for_start(&slot, "sovits", Some(&a), false).unwrap();
+        assert_eq!(run_id_of(&slot, "sovits", &resumed), a);
+
+        // ⑶ a MINTED run — the id is not a pure function of the family here, so a naming bug that
+        //    「happens to work」 on the legacy id is visible only on this shape.
+        let minted = run_dir_for_start(&slot, "sovits", Some(&a), true).unwrap();
+        let minted_id = run_id_of(&slot, "sovits", &minted);
+        assert_ne!(minted_id, a, "铸出来的 run 被叫成了旧 run 的名字");
+        assert!(run_id_is_usable(&minted_id), "叫出来的 id 必须还是一个合法 id: {minted_id}");
+
+        // ⑷ ★ the property, stated once against the listing: EVERY run of the slot is named back
+        //   into exactly the id `list_runs` carries. This is what makes the frontend's
+        //   `row.id === liveRunId` comparison a fact rather than a hope.
+        let listed = list_runs(&slot).unwrap();
+        assert_eq!(listed.len(), 2, "夹具前提:这个槽有两个 run(否则下面的循环退化成一格)");
+        for info in &listed {
+            let resolved = resolve_run_dir(&slot, Some(&info.id)).unwrap();
+            assert_eq!(
+                run_id_of(&slot, "sovits", &resolved),
+                info.id,
+                "叫出来的 id 与列表里那一行的 id 不是同一个串"
+            );
+        }
+
+        // ⑸ ⚠ 诚实边界,写成断言而不是注释:一个不在这个槽下面的 run 答的是空串,
+        //    而空串在这里是【槽根就是那个 run】。⇒ 这个函数**只能用来命名,不能用来校验配对**。
+        let alien = project_dir(&data, "p_55555555").join("rvc");
+        assert_eq!(run_id_of(&alien, "rvc", &resumed), "");
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

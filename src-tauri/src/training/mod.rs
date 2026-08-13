@@ -560,6 +560,29 @@ pub struct TrainingSnapshot {
     /// ⚠ NOT the same value as the `workspace` key in the sidecar's run config: that one is the
     /// SLOT, because python resolves its preprocessing pool relative to it.
     pub workspace: String,
+    /// ★§F2⒝-B2-⑤ / §E2E-M25: WHICH run this is, as the id the project page's rows carry.
+    ///
+    /// Derived from `workspace` by [`trun::run_id_of`] at the same place and from the same binding,
+    /// so the two can never name different runs. The frontend needs it because `RunDetail` has no
+    /// path field: without this, 「这一行是不是正在跑的那个」 is unanswerable on the project page
+    /// (the archive segment answers it by comparing `workspace` against a per-row export context —
+    /// an async probe per row, which a card wall cannot pay for).
+    ///
+    /// ## ⛔ Three states, and two of them are the SAME string
+    ///
+    /// * **`""` while idle** — `Default`. Says nothing; `state` is what answers 「有没有 run 在跑」.
+    /// * **`""` while running** — a POSITIVE fact: the slot root IS this run (layout ≤ 2), which is
+    ///   also exactly what `RunDetail.id` carries for that slot's single row.
+    /// * **non-empty** — the run id, byte-identical to the one `trun::list_runs` reports.
+    ///
+    /// ⇒ A consumer MUST gate on `state` before comparing this to a row id. Reading `""` as 「没有」
+    /// makes an unmigrated slot's only row read as 「正在训练」 forever, idle included — the same
+    /// absence-inference `rowIdentity.ts` bans in its header, wearing different clothes.
+    ///
+    /// ⚠ Not cleared when a run ENDS: only `reset_display` clears the snapshot, and the user
+    /// triggers that with 「清空结果」. `state` is the liveness; this is only the identity.
+    #[serde(default)]
+    pub run_id: String,
     pub total_epochs: u32,
     pub stage: Option<StageInfo>,
     pub step: Option<StepInfo>,
@@ -2343,6 +2366,12 @@ impl TrainingManager {
         // pipeline opens with `os.makedirs(run_dir)`, so a wrong path there is not an error, it is a
         // brand-new directory with a full training run inside it that nothing ever scans.
         let run = trun::run_dir_for_start(&workspace, &family, req_run, mints_fresh_run)?;
+        // ★§F2⒝-B2-⑤ / §E2E-M25 — named HERE, off the binding the snapshot's `workspace` is taken
+        // from, and not one line later. `try_start` holds TWO `run` bindings 250 lines apart (the
+        // pre-guard `resolve_run_dir` one above, and this one), and both are `RunDir` — so the
+        // newtype cannot catch picking the wrong one. Adjacency is what makes 「the id and the path
+        // name the same run」 true by construction rather than by review; a ratchet below pins it.
+        let run_id = trun::run_id_of(&workspace, &family, &run);
         let manifest_path = run.join("run_manifest.json");
         // ★★§F2⒝ ④e — a minted run inherits NOTHING.
         //
@@ -2539,6 +2568,7 @@ impl TrainingManager {
                 model_slug: slug.clone(),
                 project_id: project.id.clone(),
                 workspace: run.to_string_lossy().into_owned(),
+                run_id: run_id.clone(),
                 total_epochs: req.total_epoch,
                 // ①c: freeze the run's speaker names (id order) for the audition picker; empty
                 // for a single-speaker run (len ≤ 1) so nothing changes there.
@@ -5834,6 +5864,40 @@ mod tests {
         // the needle is the resolver call, not the literal `None` it used to pass. The anchor was
         // deliberately NOT loosened to just `resolve_run_dir` — that substring also matches the two
         // calls inside the dataset pre-check above, and this assertion is about THIS one.
+        // ★★§F2⒝-B2-⑤ / §E2E-M25 — the snapshot's `run_id` must be named off the SAME `run` the
+        // snapshot's `workspace` is taken from.
+        //
+        // ⛔ Why this needs a ratchet at all, when `RunDir` is a newtype precisely so that「which of
+        // two identical-looking paths did I pass」stops being a review question: BOTH bindings here
+        // are `RunDir`. The pre-guard `resolve_run_dir` one (above) and the post-mint
+        // `run_dir_for_start` one (below) are 250 lines apart, same name, same type — so the
+        // compiler cannot tell them apart, and on a 「再训一个」 they point at DIFFERENT runs.
+        // Naming the id off the wrong one gives a snapshot whose path says「the new run」and whose
+        // id says「the old run」, and the frontend's four consumers (fold / badge / disable / sort)
+        // would then all point at the row the user is training AWAY from — silently, and looking
+        // exactly like a correct answer.
+        //
+        // ⇒ The property pinned is ADJACENCY: the naming sits between the mint and any further
+        // `run` rebinding. That is checkable, and「read the two lines and see they agree」is not.
+        let name_run = at("let run_id = trun::run_id_of(&workspace, &family, &run);");
+        assert!(
+            resolve < name_run,
+            "the snapshot's run id is named BEFORE the start resolves which run it writes into — \
+             on a 「再训一个」 that names the run being left behind"
+        );
+        assert!(
+            code[resolve..name_run].matches("let run = ").count() == 0,
+            "a second `let run = ` binding slipped between the mint and the naming — the id and \
+             the workspace in the snapshot would then be about two different runs, and nothing \
+             about the resulting screen would look wrong"
+        );
+        // …and both fields really are read off that binding in the snapshot literal.
+        assert!(
+            code.contains("workspace: run.to_string_lossy().into_owned(),\n                run_id: run_id.clone(),"),
+            "the snapshot no longer takes its path and its id from the same `run` — these two \
+             lines are deliberately adjacent so that the pair cannot drift apart unnoticed"
+        );
+
         let guard_resolve = at("let run = trun::resolve_run_dir(&workspace, req_run)?;");
         assert!(
             guard_resolve < resolve,

@@ -222,7 +222,14 @@ export interface RunDetail {
 /** Mirror of Rust `commands::training::SlotDetail`. */
 export interface SlotDetail {
   family: string;
-  /** 这个槽的每个 run,按 id 排序。今天恒为 1 条。 */
+  /** 这个槽的每个 run,**后端按 id 字典序**给(`trun::list_runs` 收尾就是 `a.id.cmp(&b.id)`)。
+   *
+   *  ⛔ 那个顺序对用户是**没有含义的**:run id 是 sha256 派生的(`trun::minted_run_id` 的 doc 亲口
+   *  写着「Not sortable, deliberately」)⇒ 它既不是创建序也不是任何可解释的序。
+   *  ⇒ **展示序由前端决定**(§E2E-M25:按名字 + 正在跑的置顶,见 `slotRows.sortRunRows`);
+   *  这里给的是后端序,**不许**把它当成「用户看到的顺序」。
+   *
+   *  ⚠ 原文写的是「今天恒为 1 条」—— **S132 的 flip(「再训一个」真的铸第二个 run)之后那是假的**。 */
   runs: RunDetail[];
   bytes: number;
   /** 槽**总计**(逐 run 求和)—— 「这个架构占多大」是槽问题,不是 run 问题。 */
@@ -495,9 +502,25 @@ export interface TrainingSnapshot {
   model_slug: string;
   /** S76: the training PROJECT this run belongs to ("" while idle). */
   project_id: string;
-  /** The run's family SLOT dir (`<data>/training/<project>/<family>`) — the pre-S76
-   *  workspace root, so audition/weights paths keep their shape. */
+  /** ⛔ The **RUN** directory of this run (`<slot>/runs/<id>`, or the slot root at layout ≤ 2) —
+   *  where `weights/` and the audition cache live.
+   *
+   *  ⚠ 这里原本写的是「the run's family SLOT dir」,而**那句话在 §F2⒝ 批 2 之后就是假的**:
+   *  Rust 的赋值是 `workspace: run.to_string_lossy()`(`training/mod.rs` 的 `try_start`,`run` 来自
+   *  `trun::run_dir_for_start`),struct 上的 doc 也写着 RUN directory。照那句旧话读会得出
+   *  「快照说不出是哪个 run ⇒ 只能做槽级高亮」这个**方向相反**的结论。
+   *
+   *  ⚠ 与 sidecar 的 run config 里那个同名的 `workspace` **不是一个值**:那一个是**槽**,
+   *  因为 python 要相对它解析预处理池。 */
   workspace: string;
+  /** ★§F2⒝-B2-⑤ / §E2E-M25:**哪个 run** —— 与项目页每一行 `RunDetail.id` 同一个串。
+   *
+   *  ⛔ **三态,而其中两态是同一个空串**:idle 时是 `""`(什么也没说)· 运行中是 `""` 表示
+   *  **槽根就是这个 run**(未迁移槽的肯定事实)· 非空则是 run id。
+   *  ⇒ **必须先用 `state` 判「有没有在跑」再拿它比行 id**。把 `""` 读成「没有」会让未迁移槽的
+   *  唯一那一行永远显示成「正在训练」,空闲时也是 —— 那正是 `rowIdentity.ts` 头注禁掉的缺席推断。
+   *  ⇒ 别自己写这个判断,用 `lib/training/liveRun.ts`。 */
+  run_id: string;
   total_epochs: number;
   stage?: StageInfo | null;
   step?: StepInfo | null;
@@ -614,6 +637,7 @@ export const IDLE_SNAPSHOT: TrainingSnapshot = {
   model_slug: "",
   project_id: "",
   workspace: "",
+  run_id: "",
   total_epochs: 0,
   ckpts: [],
   stop_requested: false,

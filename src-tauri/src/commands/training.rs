@@ -368,9 +368,22 @@ pub async fn training_delete_slot(
 ///   `fresh` 擦整槽(理由已随 flip 死掉);这里只删一个 run,收窄到 run 语义更对而且安全:
 ///   匹配是 `Path::starts_with`(按**路径分量**比),兄弟 run 的 id 定长同构,谁也不是谁的前缀;
 ///   漏卸只会让 rename 响亮失败,不会静默毁数据。
-/// * ⚠ 粒度:进程级(`ensure_idle_for_package_delete` 问的是「有没有训练在跑」,不问是哪个 run)。
-///   过严、安全;前端可以更精确地禁用按钮(`resolveRowIdentity` 已经能判「这一行是不是正在跑的
-///   那个 run」),但后端这道保险不许因此放宽。
+/// * ⚠ 粒度:进程级,而且**比「有没有训练在跑」还宽** —— `ensure_idle_for_package_delete` 走
+///   `running_tasks_of`,它把 training / separation / render / audition / 全部 `active_tasks`
+///   一起算(那个函数的 doc 明写 `Deliberately FAIL-CLOSED and coarse`)。⛔ 这道保险不许放宽。
+///
+///   ⛔⛔ **这里原本写着「前端可以更精确地禁用按钮(`resolveRowIdentity` 已经能判这一行是不是
+///   正在跑的那个 run)」—— 那句话是假的,而 §E2E-M25 差点照着它做**:
+///   * `resolveRowIdentity` 的 `LiveRunIdentity` **没有 `state`**,它只比工作区路径是否相等 ⇒
+///     一个 `completed` / `stopped` 的 run **照样**答 `source: "live"`(快照只有用户点「清空结果」
+///     才清)。拿它当「这一行正在训练」用,做出来的是**跑完之后按钮永久禁死**的界面。
+///   * 它还需要 `get_slot_export_context` 的返回值 —— 那是**每一行一次 async invoke**,
+///     项目页那面卡片墙付不起。
+///
+///   ⇒ 前端今天的正确接法(S143 落地):**两个正交谓词**,都在 `lib/training/liveRun.ts` 里。
+///   「删除此 run」跟**这道闸同粒度**的全局谓词走(镜像它,而不是比它更细 —— 更细就等于
+///   在最常见的那一格〔同槽兄弟 run / 试听在飞〕上仍然让用户白点一次);per-run 身份
+///   (`TrainingSnapshot.run_id`,§E2E-M25 笔 0 加的)只用来**解释为什么**。
 #[tauri::command]
 pub async fn training_delete_run(
     state: State<'_, Arc<AppState>>,
