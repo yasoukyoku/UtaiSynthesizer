@@ -6,6 +6,7 @@ import {
   pickDiffHost,
   prepPoolLine,
   slotStarted,
+  sortRunRows,
   startedRun,
   visibleRuns,
 } from "./slotRows";
@@ -249,9 +250,156 @@ describe("foldRunRows(S141:run 多了才收)", () => {
   });
 
   it("不改动传进来的数组(它是 store 里的那一份)", () => {
+    // ⛔ S143:这一条原本只断言 `src.length` —— 那是一条**装饰性判据**:一次原地 `sort()`
+    //    **不改长度**,从它底下原样穿过去。而 `slot.runs` 同时被 `pickDiffHost`(读 `runs[0]`
+    //    当回落)与 store 里那一份共用 ⇒ 原地排会静默改掉浅扩散训练进哪个 run 目录。
+    //    ⇒ 断言改成**顺序与元素身份**。
     const src = runs(5);
+    const before = src.map((r) => r.id);
     foldRunRows(src, false);
-    expect(src.length).toBe(5);
+    expect(src.map((r) => r.id), "入参被改动了").toEqual(before);
+  });
+});
+
+describe("§E2E-M25 ⑴ —— 折叠不许藏起正在跑的那条(复合:sortRunRows → foldRunRows)", () => {
+  /** ⛔⛔ 这一格的形状是承重的,而且它是 S143 侦察的对抗核验者点名的那条:
+   *
+   *  ⑴ 单独喂 `foldRunRows` 一份**已排序**的行去断言「正在跑的还在」是一句**恒真的话**——
+   *     排序器已经把它放在 index 0 了,把折叠的 `slice` 换成任何取头部的写法它都绿,
+   *     甚至把置顶整个删掉也绿(因为夹具是排完序才喂进来的)。那是 S128 的 L9 同族。
+   *  ⑵ 所以输入必须是**未排序**的,而且正在跑的那一行要落在 `limit` **之后** ——
+   *     这样「排序没做」与「折叠切错了」两种坏法都会让它红。
+   *  ⑶ 而且要**成对**断言:其余行仍然被折起来(`hidden` 正确)。只断言「它在里面」的话,
+   *     一个「有 liveRunId 就整段展开」的实现会通过,而那等于把折叠功能静默删掉。 */
+  const unsorted = () => [
+    mkRun("ra1", { modelName: "alpha" }),
+    mkRun("rb2", { modelName: "beta" }),
+    mkRun("rc3", { modelName: "gamma" }),
+    mkRun("rd4", { modelName: "zzz-live" }), // 名字排**最后**,而且 index 3 > limit(=2)
+  ];
+
+  it("★★★ 正在跑的那一行,在一份【未排序】且它排在折叠线之后的输入上,仍然被画出来", () => {
+    const rows = unsorted();
+    // 夹具前提:不排序时它确实会被切掉(否则这条判据从出生就没有分辨力)。
+    expect(foldRunRows(rows, false).rows.map((r) => r.id), "夹具前提:不排序时它会被折进去")
+      .not.toContain("rd4");
+
+    const fold = foldRunRows(sortRunRows(rows, "rd4"), false);
+    expect(fold.rows.map((r) => r.id), "正在跑的那一行被折叠藏起来了").toContain("rd4");
+    // ⑶ 成对:其余的仍然收着 —— 否则「有人在跑就整段展开」也能通过。
+    expect(fold.hidden, "折叠功能被静默删掉了(什么都没收起来)").toBe(2);
+    expect(fold.rows.length).toBe(2);
+    // 而它必须在**第一位**(它是这一屏最该看见的东西)。
+    expect(fold.rows[0]?.id).toBe("rd4");
+  });
+
+  it("★ 没有 run 在跑时,折叠逐字节回到今天的样子", () => {
+    // 用户拍板「阈值以内逐像素不变」;这一条把它扩到「没人在跑时,排序也不许改变可见的那两行」。
+    const rows = unsorted();
+    const fold = foldRunRows(sortRunRows(rows, null), false);
+    expect(fold.rows.map((r) => r.id)).toEqual(["ra1", "rb2"]);
+    expect(fold.hidden).toBe(2);
+  });
+});
+
+describe("sortRunRows(§E2E-M25 ⑷:正在跑的置顶,其余按名字)", () => {
+  /** ⛔ 名字序与 id 序**故意相反**:全部同名(现成的 `runs(n)` 工装 `modelName` 恒 `""`)时,
+   *  「按名字排」是一个**恒等映射**,`rows => rows` 也能通过。这份语料是让那件事有分辨力的
+   *  最小形状 —— 而它正是 S143 侦察的对抗核验者点名的那一格。 */
+  const zoo = () => [
+    mkRun("ra1", { modelName: "zeta" }),
+    mkRun("rb2", { modelName: "alpha" }),
+    mkRun("rc3", { modelName: "mid" }),
+  ];
+
+  it("★★ 按名字排 —— 而这份语料的名字序与 id 序正好相反", () => {
+    // 期望是**手写的字面数组**,不是拿实现的比较器算出来的(S108:对拍的两边必须有一边
+    // 是我改不动的东西)。
+    expect(sortRunRows(zoo(), null).map((r) => r.id)).toEqual(["rb2", "rc3", "ra1"]);
+  });
+
+  it("★★ 正在跑的置顶 —— 而它的名字排在**最后**", () => {
+    // ⛔ 承重:若夹具里 live run 的名字本来就排第一,「置顶」与「按名字」给出同一个答案,
+    //    一个**完全没有置顶逻辑**的实现照样通过。
+    expect(sortRunRows(zoo(), "ra1").map((r) => r.id)).toEqual(["ra1", "rb2", "rc3"]);
+    // …反方向也要有一格能杀:一个只置顶、不排序的实现在这里会给 ["rb2","ra1","rc3"]。
+    expect(sortRunRows(zoo(), "rb2").map((r) => r.id)).toEqual(["rb2", "rc3", "ra1"]);
+  });
+
+  it("★★ 未迁移槽:`\"\"` 是一个合法 id,置顶要认它", () => {
+    // 真值判断(`liveRunId && a.id === liveRunId`)在这一格上会静默失效。
+    const rows = [mkRun("ra1", { modelName: "zeta" }), mkRun("", { modelName: "zzz" })];
+    expect(sortRunRows(rows, "").map((r) => r.id)).toEqual(["", "ra1"]);
+    // 而 `null`(没人在跑)时它就是一条普通的行,按名字走。
+    expect(sortRunRows(rows, null).map((r) => r.id)).toEqual(["ra1", ""]);
+  });
+
+  it("★ 没起过名的排在后面(它还没练完过,不是用户在找的东西)", () => {
+    const rows = [mkRun("ra1"), mkRun("rb2", { modelName: "alpha" }), mkRun("rc3")];
+    expect(sortRunRows(rows, null).map((r) => r.id)).toEqual(["rb2", "ra1", "rc3"]);
+  });
+
+  it("★ 同名时按 id —— 同名是**可达状态**(改名那条路今天没有同名闸)", () => {
+    // ⛔ 没有这条 tie-break,两条同名 run 的先后就靠 `Array#sort` 的稳定性,
+    //    而那是一条没人声明过的巧合;输入顺序一变答案就变。
+    const a = [mkRun("rz9", { modelName: "same" }), mkRun("ra1", { modelName: "same" })];
+    const b = [mkRun("ra1", { modelName: "same" }), mkRun("rz9", { modelName: "same" })];
+    expect(sortRunRows(a, null).map((r) => r.id)).toEqual(["ra1", "rz9"]);
+    expect(sortRunRows(b, null).map((r) => r.id)).toEqual(["ra1", "rz9"]);
+  });
+
+  it("★ 数字按人读的方式排(run2 在 run10 前面)", () => {
+    const rows = [mkRun("ra1", { modelName: "run10" }), mkRun("rb2", { modelName: "run2" })];
+    expect(sortRunRows(rows, null).map((r) => r.id)).toEqual(["rb2", "ra1"]);
+  });
+
+  it("★★ 不改动传进来的数组 —— 断言的是**顺序**,不是长度", () => {
+    // ⛔ 这一条是全场最容易写成装饰件的:`expect(src.length)` 对原地 `sort()` 完全瞎,
+    //    而原地排会同时污染 `pickDiffHost` 读的那一份与 store 里那一份。
+    const src = zoo();
+    const before = src.map((r) => r.id);
+    const out = sortRunRows(src, "ra1");
+    expect(src.map((r) => r.id), "入参被原地排序了").toEqual(before);
+    expect(out).not.toBe(src);
+    // …而且返回的是**同一批对象**(不是复制品):行的身份要能被 `=== r.id` 之外的东西认出来。
+    expect(new Set(out).size).toBe(3);
+    for (const r of out) expect(src).toContain(r);
+  });
+
+  it("★★★ 把排过序的行喂给 `pickDiffHost` **会**换掉浅扩散的宿主 —— 这条钉的是那个危险是真的", () => {
+    // ⛔⛔ 这一条第一版我写的是「排序不改变 pickDiffHost 的答案」,而**它当场红了,红得对**:
+    //    排序确实会换掉宿主(ra1 → rc3)。⇒ 那个期望是我自己编的(S128 §4⒞ 那一族)。
+    //
+    //    真正该钉的是**反过来的那件事**:这个危险是**真的**,所以
+    //    `rowIdentityWiring` 里那道「`pickDiffHost(` 的实参必须是后端原序那一份」的源码闸
+    //    **不是装饰**。一条声称「两者同解」的判据反而会给人一个安全的错觉,而且它在
+    //    `withMainProgress <= 1` 的夹具上恒真 —— 那正是本仓反复买过的空判据形状。
+    //
+    //    ⚠ 后果不是观感:宿主决定**浅扩散训练写进哪个 run 目录**、用谁的名字
+    //    (`askRunName` → `hps.name` → `weights/<slug>*`)、还原谁的表单(`formForSlot` 的
+    //    `k_step_max`/`aug`)—— 三条都要几小时后才看得出来,而全程无声。
+    const rows = [
+      mkRun("ra1", { modelName: "zeta", info: { has_main_progress: true } }),
+      mkRun("rb2", { modelName: "alpha" }),
+      mkRun("rc3", { modelName: "mid", info: { has_main_progress: true } }),
+    ];
+    const raw = pickDiffHost(mkSlot(rows));
+    expect(raw.withMainProgress, "夹具前提:必须两个都有主模型,一个的话 find 与 [0] 同解").toBe(2);
+    expect(raw.host?.id, "夹具前提:后端原序下宿主是 ra1").toBe("ra1");
+
+    const sorted = pickDiffHost(mkSlot(sortRunRows(rows, "rb2")));
+    expect(
+      sorted.host?.id,
+      "排序后喂进去竟然给同一个宿主 —— 那条源码闸就成了装饰件,这份夹具失去了分辨力",
+    ).not.toBe(raw.host?.id);
+
+    // …而只要**不**把排序结果喂给它(今天的接线),它逐位不变。这一半是那道源码闸守的。
+    expect(pickDiffHost(mkSlot(rows)).host?.id).toBe("ra1");
+    expect(rows.map((r) => r.id), "排序把入参改了 —— 那会静默污染这一份").toEqual([
+      "ra1",
+      "rb2",
+      "rc3",
+    ]);
   });
 });
 

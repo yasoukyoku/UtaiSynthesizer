@@ -557,6 +557,36 @@ describe("archive rows resolve their identity per row", () => {
     }
   });
 
+  it("★★★ S143 §E2E-M25 ⑷ —— 排序落在对的那一跳,而浅扩散宿主**不跟它走**", async () => {
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    // ⑴ 排序发生在 `visibleRuns` 之后、`foldRunRows` 之前 —— 这是唯一安全的插入点:
+    //    折叠取的是**头部** limit 条,置顶排在它后面等于没排。
+    expect(code, "展示序不再由 sortRunRows 决定").toContain(
+      "sortRunRows(visibleRuns(runs), liveRow)",
+    );
+    const sortAt = code.indexOf("sortRunRows(visibleRuns(runs), liveRow)");
+    const foldAt = code.indexOf("foldRunRows(allRows");
+    expect(foldAt, "foldRunRows 的调用点找不到了 —— 这条闸的锚点漂了").toBeGreaterThan(0);
+    expect(sortAt, "排序排在折叠**之后** —— 置顶的那一行照样会被 slice 掉").toBeLessThan(foldAt);
+
+    // ⑵ ⛔⛔ 承重:`pickDiffHost` 的**实参**必须还是顶层那个原序的 slot。
+    //    slotRows.test.ts 里钉了一条事实:把排过序的行喂给它**会换掉宿主**(ra1 → rc3)——
+    //    所以这不是洁癖,后果是浅扩散训练写进另一个 run 目录、用另一个名字、还原另一份表单,
+    //    三条都要几小时后才看得出来,而全仓其余判据一条都看不见(那 6 条 pickDiffHost 腿全部
+    //    自造 slot,够不到组件里的这一跳)。
+    expect(code, "浅扩散宿主的实参被换掉了 —— 它必须吃后端原序那一份").toContain(
+      "pickDiffHost(sovitsSlot)",
+    );
+    for (const bad of ["pickDiffHost(sortRunRows", "pickDiffHost({ ...sovitsSlot"]) {
+      expect(code, `浅扩散宿主开始跟着展示序走了(${bad})`).not.toContain(bad);
+    }
+    // …而 `slotStarted` 必须继续吃**原始 runs**(S141 的 Y3:折叠/排序都是纯观感,
+    // 不许改变「这个槽开始过没有」)。这一条与上面那条 `/slotStarted\(runs\)/` 是一对。
+    expect(code, "slotStarted 开始吃排过序/折叠后的行了").not.toContain("slotStarted(allRows");
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();

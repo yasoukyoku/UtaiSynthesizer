@@ -115,6 +115,60 @@ export function prepPoolLine(slot: SlotDetail | undefined): PrepPoolLine {
   return { show: count > 0, count, bytes: slot?.prepPoolBytes ?? 0 };
 }
 
+/**
+ * ★★§F2⒝-B2-⑤ / §E2E-M25 ⑷ —— run 行的**展示序**:正在跑的置顶,其余按名字。
+ *
+ * ## 为什么要排,以及为什么后端那个顺序不值得保
+ *
+ * 后端 `trun::list_runs` 以 `a.id.cmp(&b.id)` 收尾,而 run id 是 **sha256 派生**的
+ * (`minted_run_id` 的 doc 亲口写着「Not sortable, deliberately: sha256 destroys the ordering
+ * of its seed」)⇒ 今天用户看到的行序**既不是创建序也不是任何可解释的序**,它是随机的。
+ * 折叠(`foldRunRows`)取的又是**头部** `limit` 条 ⇒ 被收起来的是一个**任意**子集。
+ * ⇒ ⑷ 是把一个随机序换成一个可解释序,不是改一个既有约定。
+ *
+ * ⚠ **按更新日期排不做**(用户 2026-08-13 拍板):`RunDetail` 两侧都没有时间字段,加它要动
+ * IPC 与 Rust 的 run 列举,而收益是纯观感 ⇒ 等有人真要的那天再加载体。
+ *
+ * ## ⛔ 三条硬约束(每一条都有判据,别当成风格)
+ *
+ * 1. **不许把排序塞进 `visibleRuns`**。那个函数有一条 S141 留下的**差分对拍**
+ *    (2000 次随机槽 vs 搬家前原样抄下来的 `legacyVisibleRuns`),它证明的是「纯提取、行为
+ *    逐位不变」。排序是**新行为** ⇒ 塞进去会打红它,而「顺手改 legacy 那一半」就把那条证据
+ *    变成了自证。⇒ 新开一个导出函数,`visibleRuns` 与 legacy 保持逐位相等。
+ * 2. **必须返回新数组**。`slot.runs` 同时被 `pickDiffHost`(它读 `runs[0]` 当回落)与 store
+ *    里那一份(`setProjectInfo(d)`)共用 ⇒ 一次原地 `sort()` 会**静默改掉浅扩散训练进哪个 run
+ *    目录**、用谁的名字、还原谁的表单,而三条后果都要几小时之后才看得出来。
+ *    ⚠ 判据必须断言**入参的顺序**逐位不变,不是 `length` —— 原地排序不改长度。
+ * 3. **`pickDiffHost` 不跟排序走**。它吃的是组件顶层那个 `SlotDetail`(在 `FAMILIES.map` 之外),
+ *    与这里排的是两条不相交的链。所以「排序前后 `pickDiffHost` 给同一个答案」写成单测是一句
+ *    **恒真的话**;真正要钉的是**它的实参**,那是一道源码闸(见 `rowIdentityWiring`)。
+ *
+ * ## 排序规则(逐条都有一格判据)
+ *
+ * ⑴ 正在跑的那一行置顶(`liveRunId` 逐字节相等;⛔ `""` 是合法 id,不许用真值判断);
+ * ⑵ 起过名的排在没起名的前面 —— 没起名 = 这个 run 还没练完过,它不是用户在找的东西;
+ * ⑶ 按名字(`numeric` ⇒ `run2` 在 `run10` 前面,那是人读数字的方式);
+ * ⑷ 同名时按 id —— **同名是可达状态**(改名那条路今天没有同名闸),没有这一条,两条同名 run
+ *    的先后就靠 `Array#sort` 的稳定性,而那是一条没人声明过的巧合。
+ */
+export function sortRunRows(
+  rows: readonly RunDetail[],
+  liveRunId: string | null,
+): RunDetail[] {
+  const named = (r: RunDetail) => (r.modelName ?? "").trim();
+  return [...rows].sort((a, b) => {
+    const aLive = liveRunId !== null && a.id === liveRunId;
+    const bLive = liveRunId !== null && b.id === liveRunId;
+    if (aLive !== bLive) return aLive ? -1 : 1;
+    const an = named(a);
+    const bn = named(b);
+    if (!an !== !bn) return an ? -1 : 1;
+    const byName = an.localeCompare(bn, undefined, { numeric: true, sensitivity: "base" });
+    if (byName !== 0) return byName;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 /** 超过这么多条 run 才开始折叠。 */
 export const RUN_ROWS_BEFORE_FOLD = 2;
 
@@ -135,9 +189,21 @@ export interface RunRowFold {
  * ⛔ 用户的原话是「现在这样直接显示确实很清楚」⇒ **少量 run 时必须逐像素保持今天的样子**,
  * 只有真的变多才收。所以阈值判据是 `rows.length > limit`,不是「永远只画一条 + 管理入口」。
  *
- * ⚠ **诚实边界**:这里不认识「哪个 run 正在跑」—— `ProjectDetail` today 不订阅实时快照,
- * 而 run 的顺序是后端的 id 字典序。所以正在训练的那个**可能**落在折叠里。要改成「正在跑的
- * 永远展开」得先把实时 run 的身份穿到这一层(那是 B2-⑤ 的面),不在这一笔里假装做到了。
+ * ## ★★§E2E-M25 ⑴ —— 「折叠不许藏起正在跑的那条」由**复合**保证,这里一个字都不用改
+ *
+ * ⚠ 原文这里写着「这里不认识哪个 run 正在跑 …… 所以正在训练的那个**可能**落在折叠里。要改成
+ * 『正在跑的永远展开』得先把实时 run 的身份穿到这一层(那是 B2-⑤ 的面)」。**身份穿过来了**
+ * (`TrainingSnapshot.run_id` → `liveRunIdFor`),而那句话的**结论**不再成立,理由与当初设想的
+ * 不一样:调用点现在喂进来的是 [`sortRunRows`] 的输出,**正在跑的那一行恒在 index 0**,
+ * 而这里取的是**头部** `limit` 条(`limit >= 1`)⇒ 它必然被画出来。
+ *
+ * ⛔ **所以这里没有 `keepId` 参数,那是有意的。** 加一个「保底把它捞回来」的分支,在今天的接线上
+ * **没有任何输入走得到**:它会是一条读起来像守卫、而任何变异都杀不掉的死分支(本轮在
+ * `trun::run_id_of` 上刚删过一条同形的)。⇒ 保证写成**复合判据**
+ * (`sortRunRows → foldRunRows` 一口气驱动,输入是**未排序**且 live 落在 `limit` 之后),
+ * 顺序由 `rowIdentityWiring` 那道「排序排在折叠之前」的源码闸守。
+ * ⚠ 那条复合判据是这条性质**唯一**的看守:单独喂 `foldRunRows` 一份**已排序**的行去断言
+ * 「正在跑的还在」是一句恒真的话(S128 的 L9 同族),它绿的理由与折叠无关。
  */
 export function foldRunRows(
   rows: readonly RunDetail[],

@@ -41,6 +41,7 @@ import {
   pickDiffHost,
   prepPoolLine,
   slotStarted,
+  sortRunRows,
   startedRun,
   visibleRuns,
 } from "../../lib/training/slotRows";
@@ -785,10 +786,19 @@ export function ProjectDetail() {
             /** ⛔★★§F2⒝ ④e —— 画哪几行。机理与「为什么真 run 一律画、只有 `id === ""` 的
              *  伪造行按练没练过滤」的全部说明在 `lib/training/slotRows.ts`(S141 §E2E-M3 把它
              *  搬出组件体:写在这里的表达式没有导出,vitest 结构上够不着,变异会存活)。 */
-            const allRows = visibleRuns(runs);
             /** ★★§E2E-M25 ⑵ —— 这个槽里**哪一行**正在训练。`null` = 没有;⛔ 空串是一个
              *  合法答案(未迁移槽的槽根就是那个 run),所以比较必须是 `=== r.id` 而不是真值判断。 */
             const liveRow = liveRunIdFor(liveFacts, projectId, f);
+            /** ★★§E2E-M25 ⑷ —— **展示序**:正在跑的置顶,其余按名字。
+             *  ⛔ 插在这里(`visibleRuns` 之后、`foldRunRows` 之前)是唯一安全的落点:
+             *  `slotStarted` 吃的是**原始 `runs`**(下面那一行),与这条链不相交;而折叠取的是
+             *  **头部** `limit` 条,所以置顶必须发生在它**之前**,否则 `slice(0, 2)` 照样能
+             *  把正在跑的那条切掉。
+             *  ⛔ 而 `pickDiffHost` 吃的是**顶层那个 `SlotDetail`**(`FAMILIES.map` 之外),
+             *  **不许**把这里的结果喂给它:那会静默换掉浅扩散训练进哪个 run 目录、用谁的名字、
+             *  还原谁的表单 —— 三条都要几小时后才看得出来。判据在 `slotRows.test.ts` 里钉了
+             *  「喂进去确实会换宿主」,接线由 `rowIdentityWiring` 的源码闸守。 */
+            const allRows = sortRunRows(visibleRuns(runs), liveRow);
             // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
             // 同时「尚未开始」的自相矛盾。
             // ⛔ 它跟的是**过滤后**的全部行,不是折叠后剩下的那几行 —— 折叠是纯观感,
