@@ -5,6 +5,7 @@ import { useProjectStore } from "../../store/project";
 import { useAppStore } from "../../store/app";
 import { routeUndo, routeRedo, routeCanUndo, routeCanRedo } from "../../store/history";
 import { useTrainingStore } from "../../store/training";
+import { isRunningState } from "../../lib/training/liveRun";
 import { useTranslation } from "react-i18next";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { newProjectFile, openProjectFile, saveProjectFile, saveProjectFileAs } from "../../lib/project/projectFile";
@@ -49,7 +50,7 @@ export function Titlebar() {
     { label: t("help.repo"), onClick: () => void openUrl(HELP_LINKS.repo).catch(() => {}) },
   ];
 
-  const isTraining = trainingState === "running" || trainingState === "starting";
+  const isTraining = isRunningState(trainingState);
 
   const fileItems: MenuItem[] = [
     { label: t("menu.new"), shortcut: "Ctrl+N", onClick: () => void newProjectFile() },

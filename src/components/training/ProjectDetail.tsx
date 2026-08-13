@@ -44,6 +44,12 @@ import {
   startedRun,
   visibleRuns,
 } from "../../lib/training/slotRows";
+import {
+  gateReasonKey,
+  runRowActions,
+  trainingIsLive,
+  type RowGate,
+} from "../../lib/training/liveRun";
 import { backendErrorMessage } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
@@ -75,6 +81,17 @@ export function ProjectDetail() {
   const projectId = useTrainingStore((s) => s.route.projectId);
   const setRoute = useTrainingStore((s) => s.setRoute);
   const updateConfig = useTrainingStore((s) => s.updateConfig);
+  /** ★★§E2E-M25 —— 这一页此前**完全不订阅实时快照**(只有上面那三个 selector),所以训练
+   *  开始/结束时它连重渲染都不会发生。
+   *
+   *  ⛔ 每一条都必须是**标量** selector:`training-step` 每来一步就换一个新的 snapshot 对象,
+   *  订 `s.snapshot` 会让整片卡片墙按训练步频率重渲染(而 `pickDiffHost` / `slots` 的 useMemo
+   *  与整棵 `FAMILIES.map` 都挂在这次渲染上,它们此前每屏只算一次)。 */
+  const liveState = useTrainingStore((s) => s.snapshot.state);
+  const liveProject = useTrainingStore((s) => s.snapshot.project_id);
+  const liveBackend = useTrainingStore((s) => s.snapshot.backend);
+  const liveRunId = useTrainingStore((s) => s.snapshot.run_id);
+  const pendingStart = useTrainingStore((s) => s.starting);
 
   const [detail, setDetail] = useState<ProjectDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -266,6 +283,40 @@ export function ProjectDetail() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /** ★★§E2E-M25 ⑶ —— 「此刻有没有**任何**长任务在跑」,后端 `running_tasks_of` 的镜像。
+   *
+   *  ⛔ 为什么不是「有没有训练在跑」:删除与改名的后端前置(`ensure_safe_to_delete` /
+   *  `ensure_idle_for_run_rename`)走的都是 `running_tasks_of`,它把 training / separation /
+   *  render / **audition** / 全部 `active_tasks` 一起算(那个函数的 doc 明写
+   *  「Deliberately FAIL-CLOSED and coarse」)。只按训练禁,前端就比后端**更宽** ——
+   *  用户在同一个训练页里试听一段存档、顺手点删除,照样吃一条拒绝。
+   *
+   *  ⚠ 它只能轮询:这几个标志没有事件推到前端(`running_tasks` 是一条普通命令,仓里另外两个
+   *  消费点 `exitFlow.ts` 与 `Settings.tsx` 都是一次性取)。⇒ **诚实边界**:这个布尔最多晚
+   *  一个 tick;晚的方向是「刚闲下来还灰着」(顶多多等两秒)与「刚忙起来还亮着」(点下去被
+   *  后端拒,与今天一样)。训练那一支不受这个延迟影响 —— 它由下面的 `trainingLive` 直接短路,
+   *  走的是事件驱动的快照。 */
+  const [tasksBusy, setTasksBusy] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      invoke<string[]>("running_tasks")
+        .then((ts) => {
+          if (alive) setTasksBusy(ts.length > 0);
+        })
+        .catch(() => {
+          /* best-effort:探针失败时不谎报「闲着」,保持上一次的读数 */
+        });
+    };
+    tick();
+    const h = setInterval(tick, 2000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+    // 训练状态一变就立刻重取一次,免得那一档也要等满一个 tick。
+  }, [liveState, pendingStart]);
 
   const slots = useMemo(() => {
     const by = new Map<string, SlotDetail>();
@@ -520,6 +571,33 @@ export function ProjectDetail() {
   // A flagged project is refused by `resolve_or_create` before anything can start, so its
   // actions are dead ends dressed as buttons.
   const blocked = !!detail.needsAttention;
+  /** ★★§E2E-M25 —— 决策全部在 `lib/training/liveRun.ts`,这里只搬事实。
+   *  ⛔ 两个谓词的作用域是**相反**的(全局 vs 本项目本槽),合成一个必然错一边;
+   *  为什么、以及每一格夹具挡的是哪个错法,写在那个模块的头注与它的判据里。 */
+  const liveFacts = {
+    state: liveState,
+    project_id: liveProject,
+    backend: liveBackend,
+    run_id: liveRunId,
+  };
+  const trainingLive = trainingIsLive(liveFacts, pendingStart);
+  // 训练那一支**短路**轮询:它是事件驱动的,不该跟着 2 秒的 tick 走。
+  const anyTaskLive = trainingLive || tasksBusy;
+  /** 禁用原因要**上屏**(tooltip),不是给日志看的 —— 一颗禁着而不说为什么的按钮,
+   *  与一颗点下去被拒的按钮相比只是把困惑换了个位置。键由 `gateReasonKey` 那张表给。 */
+  /** 槽级 / 浅扩散卡上的「开始训练」—— 与 run 行的「继续 / 再训一个」是**同一条规则**
+   *  (后端 `TRAINING_ALREADY_RUNNING` 是进程级单槽),只是它不针对某一行。 */
+  const slotStart = runRowActions({
+    blocked,
+    inFlight: busy,
+    trainingLive,
+    anyTaskLive,
+    hasRunId: true,
+  }).cont;
+  const gateTitle = (g: RowGate, fallback?: string): string | undefined => {
+    const k = gateReasonKey(g.reason);
+    return k ? t(k) : fallback;
+  };
   const sovitsSlot = slots.get("sovits");
   /** ★§F2⒝ 批 2 ④ —— 浅扩散跑在**主模型那个 run** 里(`runs/<主 run>/diffusion/`),所以这张
    *  卡问的是「哪个 run 里有主模型」。决策与它的全部说明在 `lib/training/slotRows.ts`;
@@ -732,7 +810,18 @@ export function ProjectDetail() {
                   </div>
                 )}
                 {/* ── 每个 run 一行 ─────────────────────────────────────────── */}
-                {rows.map((r) => (
+                {rows.map((r) => {
+                  /** ★★§E2E-M25 ⑶ —— 这一行每颗按钮该不该禁、以及**为什么**。
+                   *  ⛔ 决策不许写回这里:四颗按钮跟的不是同一个谓词,而把它们塌成一个布尔
+                   *  会让判据分不开那两条规则(极性写反不会被任何后端判据抓到)。 */
+                  const gates = runRowActions({
+                    blocked,
+                    inFlight: busy,
+                    trainingLive,
+                    anyTaskLive,
+                    hasRunId: r.id !== "",
+                  });
+                  return (
                   <div key={r.id} className="tproj-run">
                     <div className="tproj-run-head">
                       <span className="tproj-run-name">
@@ -743,8 +832,8 @@ export function ProjectDetail() {
                             与项目改名一致(UI 铁律:方角复古、不用 emoji)。 */}
                         <button
                           className="tproj-run-rename"
-                          disabled={blocked}
-                          title={t("training.runRename")}
+                          disabled={gates.rename.disabled}
+                          title={gateTitle(gates.rename, t("training.runRename"))}
                           onClick={() => void renameRun(f, r)}
                         >
                           ✎
@@ -793,14 +882,16 @@ export function ProjectDetail() {
                     <div className="tproj-slot-actions">
                       <button
                         className="training-btn small primary"
-                        disabled={blocked}
+                        disabled={gates.cont.disabled}
+                        title={gateTitle(gates.cont)}
                         onClick={() => void startFamily(f, r)}
                       >
                         {t("training.slotContinue")}
                       </button>
                       <button
                         className="training-btn small"
-                        disabled={blocked}
+                        disabled={gates.retrain.disabled}
+                        title={gateTitle(gates.retrain)}
                         onClick={() => void retrainFamily(f, r)}
                       >
                         {t("training.slotRetrain")}
@@ -812,7 +903,8 @@ export function ProjectDetail() {
                       {r.id !== "" && (
                         <button
                           className="training-btn small danger"
-                          disabled={blocked || busy}
+                          disabled={gates.del.disabled}
+                          title={gateTitle(gates.del)}
                           onClick={() => void deleteRun(f, r)}
                         >
                           {t("training.runDelete")}
@@ -820,7 +912,8 @@ export function ProjectDetail() {
                       )}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
                 {/* ★S141(用户实机提的)—— run 变多之后那一长条的收口。
                     ⛔ 只在真的超过阈值时才出现:用户原话「现在这样直接显示确实很清楚」,
                     所以少量 run 时这一行连出现都不该出现(它自己也占一行)。
@@ -852,7 +945,11 @@ export function ProjectDetail() {
                   </div>
                 )}
                 {/* 槽级动作 = 「开始」。「继续 / 重训」挂在**每个 run 的那一行**上,因为它们
-                    问的是「这一个 run」;放在槽上就必须替用户挑一个,而那正是被判死的规则。 */}
+                    问的是「这一个 run」;放在槽上就必须替用户挑一个,而那正是被判死的规则。
+                    ★★§E2E-M25 ⑶ —— 它们与 run 行上那两颗走的是**同一条路**(updateConfig →
+                    setRoute → 运行段),所以门禁也必须是同一个:有训练在跑时,预启动卡结构上
+                    根本不渲染(它在 `snapshot.state === "idle"` 里面),用户会落在**另一个 run
+                    的实时进度**上,没有开始按钮、没有任何解释。 */}
                 {!started && (
                   <div className="tproj-slot-actions">
                     {f === "sovits" ? (
@@ -862,7 +959,8 @@ export function ProjectDetail() {
                         <button
                           key={v}
                           className="training-btn small"
-                          disabled={blocked}
+                          disabled={slotStart.disabled}
+                          title={gateTitle(slotStart)}
                           onClick={() => void startFamily("sovits", runs[0], v)}
                         >
                           {t("training.slotStartVersion", { version: v })}
@@ -871,7 +969,8 @@ export function ProjectDetail() {
                     ) : (
                       <button
                         className="training-btn small primary"
-                        disabled={blocked}
+                        disabled={slotStart.disabled}
+                        title={gateTitle(slotStart)}
                         onClick={() => void startFamily(f, runs[0])}
                       >
                         {t("training.slotStart")}
@@ -903,7 +1002,8 @@ export function ProjectDetail() {
               {sovitsVersionPinned ? (
                 <button
                   className="training-btn small primary"
-                  disabled={blocked}
+                  disabled={slotStart.disabled}
+                  title={gateTitle(slotStart)}
                   onClick={() => void startDiff(sovitsVersionPinned, diffHost)}
                 >
                   {diffSteps > 0 ? t("training.slotContinue") : t("training.slotStart")}
@@ -915,7 +1015,8 @@ export function ProjectDetail() {
                   <button
                     key={v}
                     className="training-btn small"
-                    disabled={blocked}
+                    disabled={slotStart.disabled}
+                    title={gateTitle(slotStart)}
                     onClick={() => void startDiff(v, diffHost)}
                   >
                     {t("training.slotStartVersion", { version: v })}

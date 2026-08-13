@@ -46,6 +46,7 @@ import {
   indexWarningCode,
 } from "../../lib/training/indexPath";
 import { resolveRowIdentity } from "../../lib/training/rowIdentity";
+import { isRunningState, trainingIsLive } from "../../lib/training/liveRun";
 import {
   attachToasts,
   batchImportToast,
@@ -180,7 +181,7 @@ export function TrainingPage() {
     };
   }, [route.projectId]);
 
-  const running = snapshot.state === "starting" || snapshot.state === "running";
+  const running = isRunningState(snapshot.state);
 
   // 训练中打开训练页 = 直接落到运行段。
   //
@@ -232,8 +233,7 @@ export function TrainingPage() {
       .onDragDropEvent((event) => {
         const p = event.payload;
         const liveNow = () => {
-          const s = useTrainingStore.getState().snapshot.state;
-          return s === "starting" || s === "running";
+          return isRunningState(useTrainingStore.getState().snapshot.state);
         };
         // ①c: with ≥2 singers a drop lands on the singer CARD under the cursor,
         // else the FIRST singer (the fallback) — returning that id means the
@@ -1439,9 +1439,9 @@ function RunStep({ archiveOnly = false }: { archiveOnly?: boolean } = {}) {
    *  Liveness stays keyed on the LIVE snapshot (`anyRunning`): a run in another project still
    *  blocks starting one here, and pretending otherwise would just move the refusal to Rust. */
   const snapshot = liveSnapshot.project_id === route.projectId ? liveSnapshot : IDLE_SNAPSHOT;
-  const anyRunning = liveSnapshot.state === "starting" || liveSnapshot.state === "running";
+  const anyRunning = trainingIsLive(liveSnapshot, starting);
 
-  const running = snapshot.state === "starting" || snapshot.state === "running";
+  const running = isRunningState(snapshot.state);
   const finished = snapshot.state === "completed" || snapshot.state === "stopped";
   // Which architecture this segment is ACTING on. A displayed run owns the question; with no
   // run to show (idle after「清空结果」/ a restart) it is the form's current pick. S78: the

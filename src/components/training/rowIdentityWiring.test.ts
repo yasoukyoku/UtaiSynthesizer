@@ -413,6 +413,95 @@ describe("archive rows resolve their identity per row", () => {
       .toContain("training.confirmExistBody");
   });
 
+  it("★★ S143 §E2E-M25 ⑶ —— 四颗 per-run 按钮的 disabled 真的接到了那个决策上", async () => {
+    // ⛔ 这一条是这一笔的**第一条判据**,而且它必须是存在性/接线闸,不是分支覆盖:
+    //    纯模块那 17 条腿吃的是参数,它们对「组件根本没在用这个函数」零分辨力;而 S142 刚为
+    //    同一个形状付过账(整段代价提示可以被删光而全仓零红)。
+    //
+    // ⛔ 它读的是 `PROJECT_DETAIL` 不是 `FILE` —— 照 S142 那道 M10 闸的形状抄一份会写出一条
+    //    读**错文件**的闸,它会因为「TrainingPage 里当然没有这些新形状」而以错误的理由绿。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    expect(code, "决策模块不再被引用 —— 四颗按钮又变回裸的布尔了").toContain(
+      'from "../../lib/training/liveRun"',
+    );
+    expect(code, "行级门禁不再被调用").toContain("runRowActions({");
+
+    // ★ 逐颗按钮:`disabled=` 里必须出现它自己那一档,而不是任何一个裸标志。
+    //   期望是**由那四个字段名推出来的**,不是手抄一串 —— 手抄的那一份打错字会两边一起绿。
+    for (const which of ["cont", "retrain", "del", "rename"] as const) {
+      expect(code, `${which} 那颗按钮的 disabled 没有接到 runRowActions 上`).toContain(
+        `disabled={gates.${which}.disabled}`,
+      );
+      // …而且它得说出为什么(一颗禁着却不解释的按钮只是把困惑换了个位置)。
+      expect(code, `${which} 那颗按钮禁着却不说为什么`).toContain(`gateTitle(gates.${which}`);
+    }
+
+    // ⛔ 被换掉的那个**具体**写法不许回来:删除按钮此前是 `blocked || busy`,而那个 `busy`
+    //    是「本页有一次 invoke 在飞」,与「有没有东西在跑」毫无关系 —— 它读起来完全像一道
+    //    忙碌保护,实际只防重复点击。
+    // ⚠ 这里**没有**写成「run 行里不许出现任何 `disabled={blocked}`」:第一版就是那样,而它
+    //    当场红了,红得对 —— 同一行里的「存档 X GB」是一条只读导航,`blocked` 对它是正确的。
+    //    ⇒ 诚实边界:这条闸看得见「四颗按钮被改回裸标志」,看不见「有人新加了第五颗按钮而忘了
+    //    给它门禁」。后者今天没有便宜的判据,写在这里免得下一个人以为它被盖住了。
+    expect(code, "删除按钮又变回了 `blocked || busy` —— 那个 busy 只防重复点击,不是「有东西在跑」")
+      .not.toContain("disabled={blocked || busy}");
+
+    // ★★ 死路的另外两个入口:槽级「开始训练」与浅扩散卡。它们与 run 行那两颗走**同一条路**
+    //    (updateConfig → setRoute → 运行段),而有训练在跑时预启动卡结构上根本不渲染
+    //    (它整块在 `snapshot.state === "idle"` 里面)⇒ 用户会落在**另一个 run 的实时进度**上,
+    //    没有开始按钮、没有解释,而且要等那个 run 跑完再点「清空结果」才回得去。
+    //    ⇒ 五颗按钮必须同一条门禁;只堵 run 行那两颗 = 把同一条死路留了三个入口。
+    const starts = [...code.matchAll(/disabled=\{slotStart\.disabled\}/g)];
+    expect(
+      starts.length,
+      "槽级/浅扩散的「开始训练」没有全部接到同一条门禁上 —— 那条死路还留着入口",
+    ).toBe(4);
+
+    // ★ 订阅本身:载体接进来了、而这一页仍然收不到快照变化 ⇒ 徽章/禁用会对着一份挂载时的
+    //   旧数据工作,**而所有纯模块判据照绿**。这是这一笔唯一能看见「它有没有真的活起来」的地方。
+    expect(code, "这一页又不订阅实时快照了 —— 训练开始/结束时它连重渲染都不会发生").toContain(
+      "useTrainingStore((s) => s.snapshot.state)",
+    );
+    // ⛔ 而且必须是**标量** selector:订整个 snapshot 会让整片卡片墙按训练步频率重渲染。
+    expect(code, "订了整个 snapshot 对象 —— store 每一步都换一个新对象").not.toMatch(
+      /useTrainingStore\(\(s\) => s\.snapshot\)/,
+    );
+
+    // ★ 「有没有任何长任务在跑」必须真的去问后端那份清单(镜像 `running_tasks_of` 的粗粒度);
+    //   只按训练禁 = 前端比后端更宽,而那正好落空在最常见的一格上。
+    expect(code, "删除/改名不再镜像后端那份长任务清单").toContain('invoke<string[]>("running_tasks")');
+  });
+
+  it("★★ S143 §E2E-M25 ⑶ —— 那四句禁用文案三语齐全,而且真的被显示出来", async () => {
+    // ⛔ 为什么这条必须存在:`training.*` **没有死键闭合**(parity.test.ts 那道闸硬编只扫
+    //    `backend.*`),而全仓没有任何东西把源码里的 `t("...")` 与键集合对上 ⇒ 把 key 打错一个
+    //    字母,界面上会原样显示那串 key,而 vitest / cargo / M20 全绿。
+    const fs = await importFs();
+    // 期望**由那张表推出**,不是手抄字面串(手抄 = 同一个串在两边各写一遍,打错两遍一起绿)。
+    const { GATE_REASON_KEYS } = await import("../../lib/training/liveRun");
+    expect(GATE_REASON_KEYS.length, "禁用原因表读空了").toBe(4);
+
+    for (const lang of ["zh", "en", "ja"]) {
+      const json = JSON.parse(fs.readFileSync(`src/i18n/${lang}.json`, "utf8")) as Record<
+        string,
+        Record<string, string>
+      >;
+      for (const key of GATE_REASON_KEYS) {
+        const [ns, k] = key.split(".") as [string, string];
+        const v = json[ns]?.[k];
+        expect(typeof v, `${lang}.json 缺 ${key}`).toBe("string");
+        expect((v ?? "").length, `${lang}.json 的 ${key} 是空串`).toBeGreaterThan(1);
+      }
+    }
+
+    // …而且它们真的走到了屏幕上:决策层给键、组件层显示它。
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+    expect(code, "禁用原因没有被翻译成文案 —— 那四个键会以「三语齐全但没人用」的姿态活着")
+      .toContain("gateReasonKey(g.reason)");
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();

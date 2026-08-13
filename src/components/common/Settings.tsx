@@ -12,6 +12,7 @@ import { useProjectStore } from "../../store/project";
 import { useAudioStore } from "../../store/audio";
 import { useWorkflowStore } from "../../store/workflow";
 import { useTrainingStore, type DeleteReport } from "../../store/training";
+import { isRunningState } from "../../lib/training/liveRun";
 import { useVoiceModelStore } from "../../store/voice-models";
 import { applyMirror, applyGhMirror, hfBaseForMirror } from "../../lib/models/msst-catalog";
 import { stretchedArtifactPaths, stretchInFlight } from "../../lib/audio/stretchCache";
@@ -586,7 +587,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const isPlaying = useAudioStore((s) => s.isPlaying);
   const vocalRenderActive = useAppStore((s) => s.vocalRenderActive);
   const anyWorkflowRunning = useWorkflowStore((s) => Object.values(s.executions).some((e) => e.status === "running"));
-  const trainingBusy = useTrainingStore((s) => s.snapshot.state === "running" || s.snapshot.state === "starting");
+  const trainingBusy = useTrainingStore((s) => isRunningState(s.snapshot.state));
   const midiExtracting = useAppStore((s) => Object.keys(s.midiExtracting).length > 0);
   const rangeTesting = useVoiceModelStore((s) => Object.keys(s.rangeTesting).length > 0);
   const decoding = useAudioStore((s) => s.loadingPaths.length > 0); // in-flight decode writes audio_cache
