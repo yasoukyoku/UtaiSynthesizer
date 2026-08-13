@@ -156,6 +156,10 @@ describe("★棘轮:锁表 ↔ 表单字段", () => {
     const probes: Record<string, { info: Partial<WorkspaceInfo>; expect: unknown }> = {
       loudnorm: { info: { loudnorm: true }, expect: true },
       augCopies: { info: { aug_copies: 3, has_main_progress: false }, expect: 3 },
+      // ★S144 —— ⚠ 必须显式写一个**在值域里**的采样率:`ws()` 的默认是 `"44k"`,而
+      // `formForSlot` 的 rvc 臂只认 `"32k"|"40k"|"48k"` ⇒ 用默认值探针会得到 `undefined`,
+      // 而那条红说的是「声明了却没还原」——一句与被测性质无关的假话。
+      sampleRate: { info: { sample_rate: "40k" }, expect: "40k" },
     };
     for (const backend of ALL_BACKENDS) {
       for (const [id, field] of Object.entries(POOL_FORM_FIELDS[backend])) {

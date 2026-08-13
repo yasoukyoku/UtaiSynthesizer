@@ -1085,15 +1085,23 @@ function ParamsStep() {
             {locked.has("sampleRate") ? (
               fixed(config.sampleRate)
             ) : (
-              <Dropdown
-                value={config.sampleRate}
-                options={[
-                  { value: "48k", label: "48k" },
-                  { value: "40k", label: "40k" },
-                  { value: "32k", label: "32k" },
-                ]}
-                onChange={(v) => updateConfig({ sampleRate: v })}
-              />
+              // ★S144 §E2E-M10-⒜′ —— 提示挂在**可编辑那一臂里面**。
+              // ⛔ 挂在三元之外(或挂进下一行控件)三种写法都过得了源码闸,而后两种会在
+              //    **续训锁定**档下把这句话贴在一行只读文字旁边 —— 让用户去做一件他此刻
+              //    做不到的事。`locked` 与 `poolAtStake` 可以同时为真(在有池的槽上续训),
+              //    所以这不是理论形状。
+              <>
+                <Dropdown
+                  value={config.sampleRate}
+                  options={[
+                    { value: "48k", label: "48k" },
+                    { value: "40k", label: "40k" },
+                    { value: "32k", label: "32k" },
+                  ]}
+                  onChange={(v) => updateConfig({ sampleRate: v })}
+                />
+                {costlyNote("sampleRate")}
+              </>
             )}
           </div>
           <div className="training-form-row">

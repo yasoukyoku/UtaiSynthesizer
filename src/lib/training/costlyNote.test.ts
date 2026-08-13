@@ -19,8 +19,8 @@
  *    重复了两千次。
  */
 import { describe, expect, it } from "vitest";
-import { poolAtStake, poolCostFieldIds, poolCostIdsIn } from "./costlyNote";
-import { lockedFieldIds, poolInvalidatingIds, resumeLockedFields, resumeWouldBeGuarded, type LockedField } from "../resumeLock";
+import { EDITABLE_POOL_FIELDS, poolAtStake, poolCostFieldIds, poolCostIdsIn } from "./costlyNote";
+import { lockedFieldIds, poolInvalidatingIds, resumeLockedFields, resumeWouldBeGuarded, scopeInvalidatesPool, type LockedField } from "../resumeLock";
 import type { TrainingBackend, WorkspaceInfo } from "../../store/training";
 
 /** 一个**跑过**的槽(与 `formForSlot.test.ts` 同形)。 */
@@ -193,8 +193,11 @@ describe("poolCostIdsIn —— 只按 scope 说话(唯一能驱动那一半的�
 });
 
 describe("poolCostFieldIds —— 槽里没有池就一个都不挂", () => {
-  it("有池 ⇒ 逐 backend 给出该 backend 的 costly 池级集合", () => {
-    expect(ids(poolCostFieldIds("rvc", true))).toEqual(["augCopies", "dataset"]);
+  // ⛔ 这五行是**手写常量**,而那是有意的:上面/下面每一条别的判据的期望都由同一批函数
+  //    推出来,只有这里的数字是独立说出来的 ⇒ 谓词整体走样时,唯一会红的是这一条。
+  //    ★S144 起 rvc 多了 `sampleRate`(它 tier=locked,来自 `EDITABLE_POOL_FIELDS`)。
+  it("有池 ⇒ 逐 backend 给出该 backend 的池级集合(costly 档 + 参数页真的改得动的 locked 档)", () => {
+    expect(ids(poolCostFieldIds("rvc", true))).toEqual(["augCopies", "dataset", "sampleRate"]);
     expect(ids(poolCostFieldIds("sovits", true))).toEqual(["augCopies", "dataset", "loudnorm"]);
     expect(ids(poolCostFieldIds("sovits_v2", true))).toEqual(["augCopies", "dataset", "loudnorm"]);
     expect(ids(poolCostFieldIds("sovits_diff", true))).toEqual(["augCopies", "dataset"]);
@@ -205,6 +208,52 @@ describe("poolCostFieldIds —— 槽里没有池就一个都不挂", () => {
   //   一个恒返回空集的实现也全绿。分开它们的是同一个 backend 的两个 poolAtStake 取值。
   it("★ 没池 ⇒ 每个 backend 都是空集", () => {
     for (const b of ALL_BACKENDS) expect(poolCostFieldIds(b, false).size, b).toBe(0);
+  });
+
+  // ── ★★S144 §E2E-M10-⒜′ ────────────────────────────────────────────────────────────
+  it("★ rvc 的 sampleRate 只在**有池**时挂,而别的 backend 一个都不挂", () => {
+    // 用户可见的那一格:rvc 的采样率 `scope: "both"` ⇒ 改了必然换池、整份预处理重跑,
+    // 而参数页那个 Dropdown 旁边此前什么都没有。
+    expect(poolCostFieldIds("rvc", true).has("sampleRate")).toBe(true);
+    expect(poolCostFieldIds("rvc", false).has("sampleRate")).toBe(false);
+    for (const b of ALL_BACKENDS.filter((x) => x !== "rvc")) {
+      // ⛔ 它们的锁表里 `sampleRate` 同样写着 `scope: "both"` —— 那是**假设性**的
+      //    (44.1k 是常量,参数页上没有控件)。一个「locked ∧ 作废池」的谓词会把这四格
+      //    一起算进来,而屏幕上没有地方挂那句话。
+      expect(poolCostFieldIds(b, true).has("sampleRate"), b).toBe(false);
+    }
+  });
+
+  it("★★「参数页上有控件」**不是**这条规则 —— 三个可编辑但不换池的字段必须不在集合里", () => {
+    // ⛔ 这三个都在参数页上、都可编辑,而 `scope: "run"` ⇒ 改它们**不换池**:
+    //    rvc 的 `version`(同一个池里重跑 ContentVec)· sovits 的 `volEmbedding` ·
+    //    浅扩散的 `kStepMax`。把规则写成「有控件就挂」会让屏幕对这三个说一句假话,
+    //    而 rvc 的 version 就在 sampleRate **上面一行**,用户会把两者当对照读。
+    expect(poolCostFieldIds("rvc", true).has("version")).toBe(false);
+    expect(poolCostFieldIds("sovits", true).has("volEmbedding")).toBe(false);
+    expect(poolCostFieldIds("sovits_diff", true).has("kStepMax")).toBe(false);
+  });
+
+  it("★ EDITABLE_POOL_FIELDS 的内容是**手写**的,改它必须是一次有意的改动", () => {
+    // 它是一条**独立的事实**(这个 family 的参数页上真的改得动这个池级字段),不许从
+    // tier/scope 推、也不许从 POOL_FORM_FIELDS 推(理由都在那张表的头注里)。
+    // ⇒ 那么它自己就需要一条会红的判据,否则「悄悄多一行/少一行」没有任何看守。
+    expect(Object.fromEntries(Object.entries(EDITABLE_POOL_FIELDS).map(([k, v]) => [k, [...v]]))).toEqual({
+      rvc: ["sampleRate"],
+      sovits: [],
+      sovits_v2: [],
+      sovits_diff: [],
+      vocoder: [],
+    });
+    // 每一条都必须在这个 backend 的锁表里**真的作废池**(否则这张表在替屏幕撒谎)
+    for (const [backend, fields] of Object.entries(EDITABLE_POOL_FIELDS)) {
+      const rows = resumeLockedFields(backend as TrainingBackend);
+      for (const id of fields) {
+        const row = rows.find((f) => f.id === id);
+        expect(row, `${backend}.${id} 根本不在锁表里`).toBeTruthy();
+        expect(scopeInvalidatesPool(row!.scope), `${backend}.${id} 的 scope 不作废池`).toBe(true);
+      }
+    }
   });
 });
 
@@ -307,12 +356,21 @@ describe("★ 笔 3 到底改了什么:新旧逐个输入对拍", () => {
       const now = poolCostFieldIds(s.backend, poolAtStake(s.info));
       const before = legacyCostly(s.backend, s.info, s.retrainIntent);
       const why = JSON.stringify({ backend: s.backend, retrainIntent: s.retrainIntent, info: s.info });
+      // ★S144 —— 参照臂多了一项:`EDITABLE_POOL_FIELDS[backend]`(今天只有 rvc 的 sampleRate)。
+      // ⛔ 诚实边界,写清楚这条对拍此后**杀得掉什么、杀不掉什么**:
+      //   * 杀得掉:`poolAtStake` 那一跳走样(它仍然是两臂唯一的分歧来源)· 并集**不再受
+      //     「有没有池」约束**(没池那一格期望是 `[]`)· tier/scope 那一半被改坏;
+      //   * 杀不掉:`EDITABLE_POOL_FIELDS` **表本身**改了 —— 参照臂用的就是它 ⇒ 那一项是
+      //     恒等的。表的看守是上面那条**手写常量**(`["augCopies","dataset","sampleRate"]`)
+      //     与「表内容逐字对拍」那一条。⛔ 别把那两条当重复删掉,它们是这里的补集。
+      const editable = (b: TrainingBackend) => [...EDITABLE_POOL_FIELDS[b]];
+      const withEditable = (base: string[]) => [...new Set([...base, ...editable(s.backend)])].sort();
       if (legacyPoolAtStake(s.info, s.retrainIntent) === poolAtStake(s.info)) {
-        expect(ids(now), why).toEqual(ids(before));
+        expect(ids(now), why).toEqual(poolAtStake(s.info) ? withEditable(ids(before)) : ids(before));
       } else {
         // 分歧格:新答案完全由「盘上有没有池」决定,与 manifest / retrainIntent 无关。
         expect(ids(now), why).toEqual(
-          poolAtStake(s.info) ? ids(poolCostIdsIn(resumeLockedFields(s.backend))) : [],
+          poolAtStake(s.info) ? withEditable(ids(poolCostIdsIn(resumeLockedFields(s.backend)))) : [],
         );
         expect(ids(now), why).not.toEqual(ids(before));
       }

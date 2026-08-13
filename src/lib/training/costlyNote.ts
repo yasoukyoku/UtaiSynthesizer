@@ -59,16 +59,69 @@ export function poolCostIdsIn(rows: readonly LockedField[]): Set<string> {
 }
 
 /**
+ * 这个 backend 的参数页上**真的改得动**的池级字段 —— ★S144 §E2E-M10-⒜′。
+ *
+ * ## ⛔ 为什么这是一张手写的表,而不是从锁表推出来的
+ *
+ * 仓里**已经写下过这条警告**,而它正好挡在最诱人的那条路上 ——
+ * `src-tauri/tests/pool_identity_formula.rs`:「rvc 的 `sampleRate` 是 `Locked` 不是
+ * `Costly`,所以上面那条按 tier 过滤的循环**看不见它** …… ⚠ 不能靠把 Locked 也拉进那条
+ * 循环来补:`LockScope` 对「这个 family 恒定不变的项」填的是**假设性**答案(sovits 家的
+ * 44k、vocoder 的 version 都写着 `Both`/`Run` 却根本改不动),拉进去就会要求给一堆永远不会
+ * 变的常量各发一个 token。」
+ * ⇒ 「locked ∧ 作废池」会把**四个 backend 的 `sampleRate`** 一起算进来,而参数页上
+ * 结构性地没有它们的控件(全文 `locked.has(` 只有四处,`updateConfig({ sampleRate` 只有一处)。
+ *
+ * ⛔ 也**不许**改成「`POOL_FORM_FIELDS[backend]` 里有没有这个键」:那张表是
+ * `rowIdentityWiring` 那道逐 backend 逐字段闸的**期望来源** —— 集合一旦按它定义,
+ * 那条断言就恒真,而它是这一面**唯一**的存在性看守。⚠ 这不是推理:S144 实测过一次
+ * ——把整段提示改成不渲染,全仓 437 条判据**一条都不红**。
+ *
+ * ⇒ 所以这里是一条**独立的事实**:这个 family 的参数页上有一个控件承载它,而且这个 family
+ * 真的改得动它。加一行的代价是 `formForSlot.test.ts` 的棘轮②会要求一条 probe。
+ *
+ * ## 今天为什么只有 rvc 一行(四条边界,写出来是为了下一个人不必重推)
+ *
+ * * **rvc `sampleRate`** —— `scope: "both"` ⇒ 改了必然换池、整份预处理重跑(还多一道 16k
+ *   重采样),而参数页**主栅格**里就是一个可编辑 Dropdown。这是这一格唯一的净收益。
+ * * **另外四个 backend 的 `sampleRate`** —— 锁表同样写 `Both`,但那是**假设性**的:
+ *   44.1k 是常量,参数页上只有只读展示,没有控件。
+ * * **sovits 家的 `version`** —— 它**确实**是池级(`resume_lock.rs` 的 `pool_ids("sovits")`
+ *   含 `version`),但选择发生在**项目页的对话框**里,参数页上只有一行只读文字。
+ *   这张表管的是**参数页**,所以它不在这里。⚠ 写出来是因为下一个人读 `pool_ids("sovits")`
+ *   会以为提示已经覆盖了它 —— 没有,那一格只能靠眼睛(devServer 清单)。
+ * * **rvc 的 `version`**(就在 sampleRate 上面一行、同样可编辑)—— `scope: "run"`:换它
+ *   **不换池**,而是在**同一个池里**重跑一遍 ContentVec(`3_feature256` ↔ `3_feature768`)。
+ *   `resumeCostlyTip` 那句「会换到另一份预处理产物上」对它是**假的** ⇒ 它需要的是另一句话,
+ *   不是这一句。⛔ 别顺手把它加进来:那会让屏幕说一句不成立的话,而两个控件紧挨着。
+ */
+export const EDITABLE_POOL_FIELDS: Record<TrainingBackend, readonly string[]> = {
+  rvc: ["sampleRate"],
+  sovits: [],
+  sovits_v2: [],
+  sovits_diff: [],
+  vocoder: [],
+};
+
+/**
  * 这个 backend 上,此刻要挂代价提示的那些字段。
  *
  * @param poolAtStake 这个槽里有没有一份**会被换掉**的预处理池。没有就一个都不挂:
  *   一个从没跑过预处理的槽,改什么都不需要付第二遍。
+ *
+ * ★S144 —— 返回的是**两个来源的并集**:⑴ 锁表里 tier=costly ∧ 作废池的那些(上面那条,
+ * 与 backend 无关地按 rows 算)⑵ [`EDITABLE_POOL_FIELDS`] 里这个 backend 明写的那些。
+ * ⛔ 并集只发生在**这一层**:`poolCostIdsIn` 的函数头规矩(「不认识 backend、不回头查任何
+ * 别的表」)是阴性对照③唯一的入口,不许为了少写一行而破掉它。
  */
 export function poolCostFieldIds(
   backend: TrainingBackend,
   poolAtStake: boolean,
 ): Set<string> {
-  return poolAtStake ? poolCostIdsIn(resumeLockedFields(backend)) : new Set<string>();
+  if (!poolAtStake) return new Set<string>();
+  const out = poolCostIdsIn(resumeLockedFields(backend));
+  for (const id of EDITABLE_POOL_FIELDS[backend]) out.add(id);
+  return out;
 }
 
 /**

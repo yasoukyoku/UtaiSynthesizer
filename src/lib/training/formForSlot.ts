@@ -48,7 +48,12 @@ import type { TrainingBackend, TrainingFormConfig, WorkspaceInfo } from "../../s
  * 有宿主时 Rust 的 `eff_aug_copies` 从 manifest 继承,参数页连输入框都不渲染。见 [`formForSlot`]。
  */
 export const POOL_FORM_FIELDS: Record<TrainingBackend, Record<string, keyof TrainingFormConfig>> = {
-  rvc: { augCopies: "augCopies" },
+  // ★S144 —— `sampleRate` 不是 costly 而是 **locked**(改了不会被拒,但会换池),所以它
+  // **进不了**上面那条按 `lockedFieldIds(b, "costly")` 走的棘轮①;它的落点由
+  // `costlyNote.EDITABLE_POOL_FIELDS` 声明,而这里给它表单字段是为了让代价提示那道
+  // 逐 backend 逐字段闸(`rowIdentityWiring`)能把 id 翻成控件。⛔ 反过来不成立:
+  // 集合**不许**按「这张表里有没有键」定义,那会让那道闸恒真(理由写在 EDITABLE_POOL_FIELDS)。
+  rvc: { augCopies: "augCopies", sampleRate: "sampleRate" },
   sovits: { loudnorm: "sovitsLoudnorm", augCopies: "sovitsAugCopies" },
   // v2 与 sovits **共用** sovits* 那组表单字段(两张卡不同时存在),而它同样送 loudnorm 且
   // 同样折进 fp_text ⇒ 它的池身份也由这两个值决定。
