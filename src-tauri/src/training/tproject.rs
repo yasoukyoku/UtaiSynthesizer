@@ -582,8 +582,32 @@ pub fn run_artifact_slug(run: &crate::training::trun::RunDir) -> Option<String> 
 /// The write is atomic (temp + rename) because `run.json` is the file `try_start`'s guards and
 /// python's five chains both read: a kill mid-write would strand a truncated one, and the readers
 /// treat "unparseable" as「这个 run 还没起过名」— an absence, not an error.
-pub fn rename_run(run: &crate::training::trun::RunDir, name: &str) -> Result<()> {
+pub fn rename_run(
+    slot: &Path,
+    run: &crate::training::trun::RunDir,
+    name: &str,
+) -> Result<()> {
     let fail = |e: String| UtaiError::Training(format!("RUN_RENAME_FAILED: {e}"));
+    // ★★S143 §E2E-M25 笔 5 —— 同槽内两个 run **不许同名**。
+    //
+    // ⛔ 这道闸此前只存在于「再训一个」那条路上(前端的 `newRunNameProblem`),而**改名这条路
+    // 前后端都只判空** ⇒「起两个不同名字,再把其中一个改成另一个的名字」是一条用户按得出来的
+    // 路径,而同名的后果是数据级的:同名 ⇒ 同 slug ⇒ `plan_cleanup` 的 `installed_stem` 按
+    // file_stem 判「还装着」,于是会把**另一个** run 的快照也判成 `StillInstalled` 永久保留;
+    // 存档页两行同名也从此分不开。
+    //
+    // ⚠ 放在这一层而不是只放前端:它是**数据完整性**的闸,不是「不让白点一次」。前端那一份
+    // 是让用户在打字时就知道,不是唯一的守卫。
+    // ⚠ 比较前两边都 `trim`(S141 §E2E-M24 买到的那条:只 trim 一边等于没判)。
+    let want = name.trim();
+    for other in crate::training::trun::run_dirs(slot)? {
+        if other.path() == run.path() {
+            continue;
+        }
+        if run_model_name(&other).is_some_and(|n| n.trim() == want) {
+            return Err(UtaiError::Training("TRAINING_NAME_TAKEN".into()));
+        }
+    }
     let path = run.join("run.json");
     // A run that never started has no `run.json` — and no artifacts to label either. It is not a
     // failure of the rename, it is a run whose name has not been asked for yet.
@@ -593,9 +617,13 @@ pub fn rename_run(run: &crate::training::trun::RunDir, name: &str) -> Result<()>
     let obj = v
         .as_object_mut()
         .ok_or_else(|| fail("run.json is not an object".to_string()))?;
+    // ⚠ 写的是 **trim 过**的那一份。此前写的是原样 `name`,而上面那道同名闸比的是 `trim()`
+    // ⇒ 「  X  」在有兄弟叫 X 时被拒、没兄弟时却会被原样存进去 —— 同一个函数对同一个输入
+    // 有两种口径。生产上看不见(命令层 `rename_training_run` 已经先 trim 了),而一个
+    // `pub fn` 的两种口径是下一个调用点的陷阱。
     obj.insert(
         "model_name".to_string(),
-        serde_json::Value::String(name.to_string()),
+        serde_json::Value::String(want.to_string()),
     );
     let tmp = run.join("run.json.tmp");
     let bytes = serde_json::to_vec_pretty(&v).map_err(|e| fail(e.to_string()))?;
@@ -3472,7 +3500,9 @@ mod tests {
         std::fs::write(ws.join("run.json"), serde_json::to_vec_pretty(&before).unwrap()).unwrap();
         let run = crate::training::trun::RunDir::for_test(ws.clone());
 
-        rename_run(&run, "改了个名字").unwrap();
+        // ⚠ 这个夹具的槽根就是 run 目录(未迁移形状)⇒ `run_dirs` 答 `[slot]` = 它自己,
+        //   没有兄弟可撞。同名那一格由下面单独一条驱动。
+        rename_run(&ws, &run, "改了个名字").unwrap();
 
         assert_eq!(run_model_name(&run).as_deref(), Some("改了个名字"));
         assert_eq!(
@@ -3501,11 +3531,86 @@ mod tests {
         let fresh = tmp_root("runrename2");
         let empty = crate::training::trun::RunDir::for_test(training_root(&fresh).join("never"));
         std::fs::create_dir_all(empty.path()).unwrap();
-        let e = rename_run(&empty, "x").unwrap_err().to_string();
+        let e = rename_run(empty.path(), &empty, "x").unwrap_err().to_string();
         assert!(e.contains("RUN_NEVER_NAMED"), "got {e}");
 
         let _ = std::fs::remove_dir_all(data);
         let _ = std::fs::remove_dir_all(fresh);
+    }
+
+    /// ★★S143 §E2E-M25 笔 5 —— 同槽两个 run **不许同名**,而这条路此前前后端都只判空。
+    ///
+    /// ## 为什么它是数据完整性而不是整洁
+    ///
+    /// 同名 ⇒ 同 slug ⇒ `plan_cleanup` 的 `installed_stem` 按 file_stem 判「这个存档还装着」,
+    /// 于是**另一个** run 的快照也会被判成 `StillInstalled` 而永久保留;存档页两行同名也从此
+    /// 分不开。「再训一个」那条路早就有这道闸(前端 `newRunNameProblem`),**改名这条路没有** ——
+    /// 「起两个不同名字,再把其中一个改成另一个的名字」是用户按得出来的路径。
+    ///
+    /// ⛔ 夹具必须造出**两个 run 且名字互不相同**:每槽一个 run 时,「跳过自己」与「谁也不跳」
+    /// 给出同一个答案,那条 `continue` 结构上不可见(本仓这一族已经付过好几次账)。
+    #[test]
+    fn two_runs_in_one_slot_may_not_carry_the_same_name() {
+        let data = tmp_root("dupname");
+        let slot = training_root(&data).join("rvc");
+        let mk = |id: &str, name: &str| {
+            let dir = crate::training::trun::runs_root(&slot).join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("run.json"),
+                format!(r#"{{"model_name":"{name}"}}"#),
+            )
+            .unwrap();
+            crate::training::trun::RunDir::for_test(dir)
+        };
+        let a = mk("ra11111111a1", "初号机");
+        let b = mk("rb22222222b2", "零号机");
+        assert_eq!(
+            crate::training::trun::run_dirs(&slot).unwrap().len(),
+            2,
+            "夹具前提:两个 run —— 一个的话「跳过自己」那一半没有分辨力"
+        );
+
+        // ⑴ 撞上兄弟的名字 ⇒ 响亮拒绝,而且**盘上一个字节都没动**。
+        // ⚠ 用 `expect_err` 而不是 `unwrap_err`:闸整条不见时,`unwrap_err` 的 panic 说的是
+        //   「called `Result::unwrap_err()` on an `Ok` value」—— 一句与被测性质无关的话,
+        //   而探针要能按**措辞**分辨「红在这一条」与「红在别的断言」(S142 那条规矩)。
+        let before = std::fs::read(b.join("run.json")).unwrap();
+        let e = rename_run(&slot, &b, "初号机")
+            .expect_err("同名闸不见了 —— 改名接受了兄弟 run 的名字")
+            .to_string();
+        assert!(e.contains("TRAINING_NAME_TAKEN"), "同名闸报的不是那个 CODE: {e}");
+        assert_eq!(
+            std::fs::read(b.join("run.json")).unwrap(),
+            before,
+            "拒绝之前已经把盘改了 —— 拒绝必须是拒绝"
+        );
+
+        // ⑵ 两边都 trim(S141 §E2E-M24:只 trim 一边等于没判)。
+        // ⛔ 两个方向各一格,而**存量那一侧**必须单独造:`rename_run` 现在写的是 trim 过的名字,
+        //    所以「盘上存着一个带空白的名字」只能来自旧数据(`try_start` 直接写 `req.model_name`)。
+        //    不造这一格,`n.trim()` 那一半就是**没有输入分辨得出来**的(实测:去掉它照样全绿)。
+        assert!(rename_run(&slot, &b, "  初号机  ")
+            .expect_err("同名闸没有 trim 输入那一侧")
+            .to_string()
+            .contains("TAKEN"));
+        let legacy = mk("rc33333333c3", "  参号机  "); // 旧数据:盘上存着带空白的名字
+        assert!(rename_run(&slot, &b, "参号机")
+            .expect_err("同名闸没有 trim **盘上那一侧** —— 存量 run.json 里带空白的名字撞不上")
+            .to_string()
+            .contains("TAKEN"));
+        let _ = legacy;
+        rename_run(&slot, &a, "  初号机  ").expect("改成自己名字的空白变体被自己挡住了");
+        assert_eq!(run_model_name(&a).as_deref(), Some("初号机"));
+
+        // ⑶ ★ 承重:**自己**那一行要被跳过 —— 否则改名会被自己挡住,而单 run 的夹具看不见。
+        rename_run(&slot, &b, "零号机").expect("改成自己已有的名字被自己挡住了");
+
+        // ⑷ 别的名字照常通过。
+        rename_run(&slot, &b, "贰号机").unwrap();
+        assert_eq!(run_model_name(&b).as_deref(), Some("贰号机"));
+
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[test]

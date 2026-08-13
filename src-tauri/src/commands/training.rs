@@ -886,7 +886,7 @@ pub async fn rename_training_run(
     let run =
         crate::training::trun::resolve_run_dir(&slot, opt_run_id(run_id.as_deref().unwrap_or("")))
             .map_err(|e| e.to_string())?;
-    crate::training::tproject::rename_run(&run, name).map_err(|e| e.to_string())
+    crate::training::tproject::rename_run(&slot, &run, name).map_err(|e| e.to_string())
 }
 
 /// Import audio INTO the project's shared dataset, independent of any training run.

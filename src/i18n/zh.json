@@ -987,6 +987,7 @@
     "TRAINING_KILL_FAILED": "终止训练进程失败",
     "TRAINING_MULTI_BACKEND": "多歌手共训暂仅支持 SoVITS 与 RVC",
     "TRAINING_NAME_EMPTY": "模型名不能为空",
+    "TRAINING_NAME_TAKEN": "这个架构下已经有一个同名的 run 了 —— 换一个名字",
     "TRAINING_NO_SHARED_POOL": "该模型没有可复用的主训练工作区数据——请先导入训练数据",
     "TRAINING_PROCESS_CRASHED": "训练进程异常退出。常见原因：显存/内存不足(OOM)、被杀毒软件终止、训练环境损坏。详细日志见训练工作区 train.log；最近输出已附在状态面板。",
     "TRAINING_PYTHON_SPAWN_FAILED": "启动训练 Python 失败（训练环境未配置？）",

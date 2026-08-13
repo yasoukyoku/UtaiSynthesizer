@@ -53,7 +53,7 @@ import {
   trainingIsLive,
   type RowGate,
 } from "../../lib/training/liveRun";
-import { backendErrorMessage } from "../../lib/backendError";
+import { backendErrorMessage, isBusyError } from "../../lib/backendError";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
 import { AUDIO_EXTENSIONS, fmtSize } from "../../lib/constants";
 import { PreviewFileRow, useFilePreview } from "./PreviewFileRow";
@@ -113,6 +113,17 @@ export function ProjectDetail() {
     return d.dataset.entries.some((e) => prefix + e.rel === path);
   });
   const [busy, setBusy] = useState(false);
+  /** ★S143 §E2E-M25 笔 5 —— 一条**互锁**拒绝该显示成 info,不是 error。
+   *
+   *  ⛔ `backendError.ts` 的约定写得很清楚:`busy: true` 标的是「另一个任务占着闸,待会儿再试」
+   *  这一类可重试的拒绝,漏斗把它们显示成 INFO、其余显示成 error;而这一页的四处 catch
+   *  **一律写死 `"error"`**,import 块里连 `isBusyError` 都没有 ⇒ 用户在试听/渲染/分离在飞时
+   *  删一个 run,吃到的是一条红色「错误」。
+   *  ⚠ `maybeShowErrorModal` 不管这件事:它只处理 modal 那一档(`isModalError`),不看 busy。
+   *  ⚠ 笔 1 的禁用做完之后这条路会变冷,但它同时是 `import_project_dataset` /
+   *  `delete_project_dataset_files` 的档位,而那两条**不**在禁用范围里 —— 所以这一行还得对。
+   *  `store/training.ts` 里那两处早就是这个写法;这里是把它补齐,不是新发明。 */
+  const toastLevel = (e: unknown): "info" | "error" => (isBusyError(e) ? "info" : "error");
   /** ★S141:每个槽的 run 列表展开状态(family -> 展开?)。默认收起 —— 折叠只在超过阈值时
    *  才有东西可收,所以「默认收起」对少量 run 的槽是 no-op。 */
   const [runsOpen, setRunsOpen] = useState<Record<string, boolean>>({});
@@ -142,7 +153,7 @@ export function ProjectDetail() {
       await load();
     } catch (e) {
       const msg = backendErrorMessage(e) ?? String(e);
-      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, toastLevel(e));
     } finally {
       setBusy(false);
     }
@@ -172,7 +183,19 @@ export function ProjectDetail() {
       ],
       input: {
         initial: run.modelName ?? "",
-        invalid: (v) => (v.trim() ? null : t("backend.TRAINING_NAME_EMPTY")),
+        // ★★S143 §E2E-M25 笔 5 —— 同槽两个 run 不许同名。此前这里**只判空**,而「再训一个」
+        // 那条路早就走 `newRunNameProblem` ⇒「起两个不同名字,再把其中一个改成另一个的名字」
+        // 是一条用户按得出来的路径,而后果是数据级的(同名 ⇒ 同 slug ⇒ `plan_cleanup` 会把
+        // 另一个 run 的快照判成 StillInstalled 永久保留)。
+        // ⛔ 第三个实参是**排除自己**:不传的话,「改成自己已有的名字」会被自己挡住。
+        //    后端 `tproject::rename_run` 有同一道闸(`TRAINING_NAME_TAKEN`)—— 这一份是让用户
+        //    在打字时就知道,不是唯一的守卫。
+        invalid: (v) => {
+          const problem = newRunNameProblem(v, slots.get(family)?.runs ?? [], run.id);
+          if (problem === "empty") return t("backend.TRAINING_NAME_EMPTY");
+          if (problem === "taken") return t("backend.TRAINING_NAME_TAKEN");
+          return null;
+        },
       },
     });
     if (!typed || typed === "__cancel") return;
@@ -188,7 +211,7 @@ export function ProjectDetail() {
       await load();
     } catch (e) {
       const msg = backendErrorMessage(e) ?? String(e);
-      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, toastLevel(e));
     } finally {
       setBusy(false);
     }
@@ -232,7 +255,7 @@ export function ProjectDetail() {
       await load();
     } catch (e) {
       const msg = backendErrorMessage(e) ?? String(e);
-      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, toastLevel(e));
     } finally {
       setBusy(false);
     }
@@ -258,7 +281,7 @@ export function ProjectDetail() {
       await load();
     } catch (e) {
       const msg = backendErrorMessage(e) ?? String(e);
-      if (!maybeShowErrorModal(e, msg)) showToast(msg, "error");
+      if (!maybeShowErrorModal(e, msg)) showToast(msg, toastLevel(e));
     } finally {
       setBusy(false);
     }

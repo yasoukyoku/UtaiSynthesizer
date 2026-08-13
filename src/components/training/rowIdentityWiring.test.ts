@@ -587,6 +587,28 @@ describe("archive rows resolve their identity per row", () => {
     expect(code, "slotStarted 开始吃排过序/折叠后的行了").not.toContain("slotStarted(allRows");
   });
 
+  it("★★ S143 笔 5 —— 改名那条路也有同名闸,而互锁拒绝不再显示成「错误」", async () => {
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    // ⑴ 改名对话框走同一个纯函数,并**排除自己那一行**。
+    //    ⛔ 此前它只判空(`v.trim() ? null : …`),而「再训一个」那条路早就有闸 ⇒
+    //    「起两个不同名字,再把其中一个改成另一个的名字」是用户按得出来的路径。
+    expect(code, "改名对话框又变回只判空了").toContain(
+      "newRunNameProblem(v, slots.get(family)?.runs ?? [], run.id)",
+    );
+    expect(code, "改名撞名时没有话说").toContain('t("backend.TRAINING_NAME_TAKEN")');
+    // 两条路都必须用这个纯函数(改名 + 再训一个),一条都不许退回内联校验。
+    expect([...code.matchAll(/newRunNameProblem\(/g)].length, "两条起名路不是都走纯函数").toBe(2);
+
+    // ⑵ 四处 catch 的档位:`busy: true` 的 CODE 是**可重试的互锁**,约定显示成 info。
+    //    ⛔ 此前四处一律写死 `"error"`,import 块里连 `isBusyError` 都没有。
+    expect(code, "互锁拒绝又被显示成「错误」了").not.toContain('showToast(msg, "error")');
+    expect([...code.matchAll(/showToast\(msg, toastLevel\(e\)\)/g)].length, "四处 catch 不是都用同一个档位判断")
+      .toBe(4);
+    expect(code, "档位判断没有走 isBusyError").toContain("isBusyError(e)");
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();

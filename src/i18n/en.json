@@ -987,6 +987,7 @@
     "TRAINING_KILL_FAILED": "Failed to kill the training process",
     "TRAINING_MULTI_BACKEND": "Multi-singer co-training currently supports only SoVITS and RVC",
     "TRAINING_NAME_EMPTY": "Model name must not be empty",
+    "TRAINING_NAME_TAKEN": "Another run of this architecture already uses that name — pick a different one",
     "TRAINING_NO_SHARED_POOL": "This model has no reusable main-training workspace data — import training data first",
     "TRAINING_PROCESS_CRASHED": "The training process exited abnormally. Common causes: out of VRAM/RAM (OOM), killed by antivirus, or a corrupted training environment. See train.log in the training workspace; recent output is shown in the status panel.",
     "TRAINING_PYTHON_SPAWN_FAILED": "Failed to start the training Python (training environment not set up?)",

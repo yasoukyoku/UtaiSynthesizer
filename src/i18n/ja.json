@@ -987,6 +987,7 @@
     "TRAINING_KILL_FAILED": "トレーニングプロセスの強制終了に失敗しました",
     "TRAINING_MULTI_BACKEND": "複数歌手の共同トレーニングは現在 SoVITS と RVC のみ対応です",
     "TRAINING_NAME_EMPTY": "モデル名を入力してください",
+    "TRAINING_NAME_TAKEN": "このアーキテクチャには同じ名前の run が既にあります。別の名前にしてください",
     "TRAINING_NO_SHARED_POOL": "このモデルには再利用可能なメイントレーニングデータがありません。先にトレーニングデータをインポートしてください",
     "TRAINING_PROCESS_CRASHED": "トレーニングプロセスが異常終了しました。主な原因：VRAM/メモリ不足（OOM）、ウイルス対策ソフトによる強制終了、トレーニング環境の破損。詳細はワークスペースの train.log を参照してください。直近の出力はステータスパネルに表示されています。",
     "TRAINING_PYTHON_SPAWN_FAILED": "トレーニング用 Python の起動に失敗しました（トレーニング環境が未設定？）",

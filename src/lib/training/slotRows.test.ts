@@ -403,6 +403,37 @@ describe("sortRunRows(§E2E-M25 ⑷:正在跑的置顶,其余按名字)", () => 
   });
 });
 
+describe("newRunNameProblem 的『排除自己』那一档(§E2E-M25 笔 5 · 改名)", () => {
+  /** ⛔ 这一档是给**改名**用的:不排除自己的话,「把名字改成它自己已有的那个」会被自己挡住。
+   *  而夹具必须**两个 run、名字互不相同** —— 每槽一个 run 时,「跳过自己」与「谁也不跳」
+   *  给出同一个答案,那半个条件结构上不可见。 */
+  const two = () => [
+    mkRun("ra1", { modelName: "初号机" }),
+    mkRun("rb2", { modelName: "零号机" }),
+  ];
+
+  it("★ 改成自己已有的名字 ⇒ 放行;撞上兄弟 ⇒ 拒", () => {
+    expect(newRunNameProblem("初号机", two(), "ra1")).toBeNull();
+    expect(newRunNameProblem("初号机", two(), "rb2")).toBe("taken");
+    // 不传第三个参数(「再训一个」那条路)⇒ 谁的名字都不许撞,包括这两个。
+    expect(newRunNameProblem("初号机", two())).toBe("taken");
+  });
+
+  it("★★ `\"\"` 是一个合法 run id —— 拿它当「不排除」会让未迁移槽的唯一那一行被跳过", () => {
+    // 未迁移槽:唯一那一行的 id 就是空串。改它自己的名字必须放行。
+    const rows = [mkRun("", { modelName: "初号机" })];
+    expect(newRunNameProblem("初号机", rows, "")).toBeNull();
+    // …而 `null`(不排除任何人)时它就是一个占用中的名字。
+    expect(newRunNameProblem("初号机", rows, null)).toBe("taken");
+    expect(newRunNameProblem("初号机", rows)).toBe("taken");
+  });
+
+  it("★ 两边都 trim(S141 §E2E-M24 买到的那条)", () => {
+    expect(newRunNameProblem("  初号机  ", two(), "rb2")).toBe("taken");
+    expect(newRunNameProblem("  初号机  ", two(), "ra1")).toBeNull();
+  });
+});
+
 describe("newRunNameProblem(§E2E-M24)", () => {
   const named = (id: string, modelName: string) => mkRun(id, { modelName });
 

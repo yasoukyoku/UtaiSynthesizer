@@ -368,6 +368,9 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   TRAINING_HOST_MEMORY_EXHAUSTED: { key: "backend.TRAINING_HOST_MEMORY_EXHAUSTED" },
   TRAINING_NO_PROGRESS: { key: "backend.TRAINING_NO_PROGRESS" },
   TRAINING_NAME_EMPTY: { key: "backend.TRAINING_NAME_EMPTY" },
+  // ★S143 §E2E-M25 笔 5 —— 同槽两个 run 同名 ⇒ 同 slug ⇒ `plan_cleanup` 会把另一个 run 的
+  // 快照永久保留。改名那条路此前前后端都只判空,而「再训一个」那条早有闸。
+  TRAINING_NAME_TAKEN: { key: "backend.TRAINING_NAME_TAKEN" },
   TRAINING_NO_DATA: { key: "training.needData" },
   TRAINING_NO_SHARED_POOL: { key: "backend.TRAINING_NO_SHARED_POOL" },
   TRAINING_PROCESS_CRASHED: { key: "backend.TRAINING_PROCESS_CRASHED" },

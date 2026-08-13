@@ -232,9 +232,21 @@ export type NewRunNameProblem = "empty" | "taken" | null;
  * ⚠ 没有名字的 run(铸了但没练成)不占名额:它的 `modelName` 是 `""`,而空名字走的是
  * `"empty"` 那一档。这条过滤是防御性的,不是由某条判据买回来的 —— 说清楚免得下一个人以为它有。
  */
-export function newRunNameProblem(raw: string, runs: readonly RunDetail[]): NewRunNameProblem {
+export function newRunNameProblem(
+  raw: string,
+  runs: readonly RunDetail[],
+  /** ★S143 §E2E-M25 笔 5 —— 改名时**排除这一行自己**(不然改成自己已有的名字会被自己挡住)。
+   *  ⛔ 类型是 `string | null` 而不是 `string`:`""` 是一个**合法 run id**(未迁移槽的槽根就是
+   *  那个 run),用 `""` 当「不排除」会让那种槽的唯一一行永远被跳过。`null` = 不排除。 */
+  exceptId: string | null = null,
+): NewRunNameProblem {
   const name = raw.trim();
   if (!name) return "empty";
-  const taken = new Set(runs.map((r) => r.modelName?.trim()).filter((n): n is string => !!n));
+  const taken = new Set(
+    runs
+      .filter((r) => exceptId === null || r.id !== exceptId)
+      .map((r) => r.modelName?.trim())
+      .filter((n): n is string => !!n),
+  );
   return taken.has(name) ? "taken" : null;
 }
