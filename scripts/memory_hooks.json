@@ -67,7 +67,9 @@
       "hard_rules": [
         "⛔ 危险不在把权重挪个位置,而在于**八条承重谓词同时变假,五条静默毁数据**(S123)。",
         "⛔ 房规 `opt_run_id(\"\")→None` ⇒ 照抄 rename 那一行会做出**伪装成删 run 的删槽**(S133)。",
-        "⛔ 训练侧的 i18n:权威表是 `backendError.ts` 的 `CODE_KEYS`,json 里有文案不算数;动 i18n 一律**文本行插入**(json 往返会整体重排序)。"
+        "⛔ 训练侧的 i18n:权威表是 `backendError.ts` 的 `CODE_KEYS`,json 里有文案不算数;动 i18n 一律**文本行插入**(json 往返会整体重排序)。",
+        "⛔★S144:`run_dir_for_start` 的「0 个 run + layout≥3」臂**铸新 id**(不再是 family 纯函数 `legacy_run_id`)—— 它同时服务**两个人群**(被删光 run 的槽 + 迁移过但从没训过的槽),而**盘上没有信号分得开**。改它之前先读那个函数头上那段 ⛔(S144 推翻的正是它),并记住:`legacy_run_id` 本身**不许**改成随机(迁移崩溃点回滚靠它确定)。⚠ 账本那三处「删光再练造出逐字节相同 rel」的理由**已经改写**;`settings.rs` 那两处**仍然成立**(它的同 id 来自 `migrate_data_dir` 复制整棵树),别顺手改。",
+        "⛔★S144:给 `run_slot` 那类夹具选 family 时注意 **rvc 的 3→4 折叠要从切片读采样率**(`POOL_SAMPLE_RATE_UNKNOWN`)⇒ 只铺 `1_16k_wavs` 的夹具在 rvc 上折不动。⚠ 而「夹具直接建在 layout 4」会让「删完之后在 layout 4」这条前置断言**恒真**(装饰件)。"
       ]
     },
     {
@@ -94,7 +96,9 @@
         "⛔★★ S143:「哪个 run 正在跑」的载体是 `TrainingSnapshot.run_id`,而它的 `\"\"` 有**两种含义** —— idle 时是「什么也没说」,运行中是「**槽根就是这个 run**」这个**肯定事实**(未迁移槽,与 `RunDetail.id` 给那一行的值同一个串)。⇒ **必须先用 `state` 判在不在跑,再拿它比行 id**;类型一律 `string | null`,别用 `\"\"` 当哨兵。把它读成「没有」会让未迁移槽的唯一那一行永远显示成「正在训练」,空闲时也是 —— 那是 `rowIdentity.ts` 头注禁掉的**缺席推断**换了件衣服。⛔ 别自己写这个判断,用 `lib/training/liveRun.ts`。",
         "⛔★★ S143:「能不能动这一行」是**两个正交谓词**,合成一个必错一边 —— **继续/再训/开始**跟「有训练在跑」(**跨项目、不许按 project_id 过滤**:后端是进程级单槽);**删除/改名**跟「有**任何**长任务在跑」(后端 `running_tasks_of` 含 separation/render/**audition**,doc 明写 fail-closed and coarse)。禁得比后端窄 = 用户在最常见的那一格照样白点一次;禁得比后端严 = 试听一段音频就开不了训。⛔ 而「正在跑」**不是** `state !== \"idle\"`:快照不在训练结束时清(只有「清空结果」清),照那个写法做出来的是**跑完之后按钮永久禁死**的界面,而任何只造 running 形状的夹具都杀不掉它(仓里有两份现成抄本会诱你抄:`runIsHere` / `isLiveRun`)。",
         "⛔★ S143:`sovits_diff` **不是一个 family**,它跑在 sovits 槽的 run 目录里 ⇒ 匹配一律走 `backendFamily(snap.backend)`。写成 `snap.backend === family` 在**所有单 backend 的夹具上与正确写法同值**,只有浅扩散那一格分得开 —— 而浅扩散一跑就是几小时,那正是最需要它的一屏。⇒ 语料自检必须显式要求见过 `backend != family` 那一格。",
-        "⛔★ S143:`npm test`(= `vitest run`)**不做类型检查**,`tsc -b` 只在 `scripts/release.ps1` 跑 ⇒ 给一个既有函数**插**参数(而不是追加在末尾)会让既有用例把实参喂错位置而**仍然全绿**,失败消息里那些插值变成假话。⇒ 加参数一律**追加在末尾**;验收时把 tsc 列成**独立一档**,别只看 vitest。"
+        "⛔★ S143:`npm test`(= `vitest run`)**不做类型检查**,`tsc -b` 只在 `scripts/release.ps1` 跑 ⇒ 给一个既有函数**插**参数(而不是追加在末尾)会让既有用例把实参喂错位置而**仍然全绿**,失败消息里那些插值变成假话。⇒ 加参数一律**追加在末尾**;验收时把 tsc 列成**独立一档**,别只看 vitest。",
+        "⛔★S144:`visibleRuns`/`slotStarted` 吃 `liveRunId`,而**两半必须收到同一个实参** —— 只喂一半的两种坏法都在屏幕上(徽章与「未开始」同屏 / 说开始过了却一行不画),而纯模块判据对它零分辨力(它们各自都对)。⚠ 新槽第一次训练时 `snapshot.run_id` 是 `\"\"`,那是**肯定事实**(槽根就是那个 run),比较必须逐字节相等。",
+        "⛔★S144:参数页「代价提示」该挂在哪些字段,由 `costlyNote.EDITABLE_POOL_FIELDS` 这张**手写表**说了算。⛔ 不许改成从 tier/scope 推(`tests/pool_identity_formula.rs` 明写 `LockScope` 对 family 恒定项是**假设性**答案),也不许改成从 `POOL_FORM_FIELDS` 推(会让 `rowIdentityWiring` 唯一的存在性断言恒真)。⚠ 整段提示今天**删光了全仓也不会红**(S144 实测),所以那道逐字段闸是它唯一的看守。"
       ]
     },
     {
