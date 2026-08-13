@@ -12,6 +12,9 @@
  * 字面量的注释都会替真正的调用点满足断言(同一条教训在 Rust 侧的源序棘轮上刚修过)。
  */
 import { describe, it, expect } from "vitest";
+import { poolCostFieldIds } from "../../lib/training/costlyNote";
+import { NO_FORM_CONTROL, POOL_FORM_FIELDS } from "../../lib/training/formForSlot";
+import type { TrainingBackend } from "../../store/training";
 
 type NodeFs = { readFileSync(p: string, enc: string): string };
 const importFs = (): Promise<NodeFs> => {
@@ -258,6 +261,66 @@ describe("archive rows resolve their identity per row", () => {
       [...code.matchAll(/collectWarningCodes\(/g)].length,
       "collectWarningCodes 的调用点少于三处 —— 三条导入路里有一条又不走同一个漏斗了",
     ).toBeGreaterThanOrEqual(3);
+  });
+
+  it("★ S142 §E2E-M10 —— 代价提示还在屏幕上,而且每个控件都挂着它自己的那一条", async () => {
+    // ⛔ 这条排在纯模块判据**之前**的理由:在它之前,把整段 costly 提示删光,全仓一条判据都
+    // 不会红 —— i18n 的对拍闸只钉结构(三语键集合/占位符/非空串),死键闭合只管 `backend.*`,
+    // 所以 `training.resumeCostly` 会以「三语齐全但没有人用」的姿态活下去;而 vitest.config.ts
+    // 明写不做渲染。⇒ 先给这个功能一条**存在性**判据,再谈它的分支覆盖。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(FILE, "utf8"));
+
+    expect(code, "TrainingPage 不再从 lib/training/costlyNote 取决策").toContain(
+      "lib/training/costlyNote",
+    );
+
+    // 具体形状排前面(S108):「被写回组件体了」是诊断,「调用点不见了」只是症状。
+    const reInlined: [RegExp, string][] = [
+      [
+        /lockedFieldIds\([^)]*"costly"/,
+        "costly 那一档的集合又在组件体里现算了 —— 而那一跳的判据(尤其 scope 那一半)全在纯模块上",
+      ],
+      [
+        /poolInvalidatingIds\(/,
+        "又直接调 poolInvalidatingIds 了 —— 两半分开求交正是 S128 那条等价变异能藏身的形状",
+      ],
+    ];
+    for (const [re, why] of reInlined) {
+      expect(re.test(code), why).toBe(false);
+    }
+
+    // ★ 逐 backend、逐字段:**这个控件与下一个控件之间**必须挂着它自己的那一条提示。
+    //   期望完全由锁表 + `POOL_FORM_FIELDS` 推出来 —— 锁表哪天多一行 costly+pool 的可编辑
+    //   字段,这里会点名说「哪个 backend 的哪个控件没挂」,而那正是今天没有任何东西看得见的坏法。
+    const backends: TrainingBackend[] = ["rvc", "sovits", "sovits_v2", "sovits_diff", "vocoder"];
+    const wantedKeys = new Set<string>();
+    for (const backend of backends) {
+      for (const id of poolCostFieldIds(backend, true)) {
+        if (NO_FORM_CONTROL.has(id)) continue; // `dataset` 归数据页,参数页没有控件代表它
+        const key = POOL_FORM_FIELDS[backend][id];
+        expect(key, `${backend}/${id} 在 POOL_FORM_FIELDS 里没有表单字段`).toBeTruthy();
+        wantedKeys.add(key as string);
+
+        const at = code.indexOf(`updateConfig({ ${key}`);
+        expect(at, `${backend}/${id}:找不到写 ${key} 的控件 —— 锚点漂了,这条闸什么也没看`).toBeGreaterThan(0);
+        const rest = code.slice(at + 1);
+        const next = rest.indexOf("updateConfig({");
+        const window = rest.slice(0, next < 0 ? rest.length : next);
+        expect(window.length, `${backend}/${id}:窗口是空的`).toBeGreaterThan(20);
+        expect(
+          window,
+          `${backend}/${id}:${key} 这个控件旁边没有代价提示 —— 改它会静默换池、重跑整份预处理`,
+        ).toContain(`costlyNote("${id}")`);
+      }
+    }
+
+    // 反过来:多出来的挂点也要有人问一句(挂在一个**不**换池的字段上 = 屏幕在撒谎)。
+    // 期望值由上面那张表推出,不是手写的常量。
+    expect(
+      [...code.matchAll(/\{costlyNote\("/g)].length,
+      "costlyNote 的挂点数与锁表推出来的控件数对不上",
+    ).toBe(wantedKeys.size);
   });
 
   it("★ S141 —— 「再训一个」这条路不许再弹第三个对话框问「模型已存在」", async () => {

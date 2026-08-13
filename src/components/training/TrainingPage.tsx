@@ -52,8 +52,9 @@ import {
   collectWarningCodes,
   importToast,
 } from "../../lib/training/importToast";
+import { poolAtStake, poolCostFieldIds } from "../../lib/training/costlyNote";
 import { maybeShowErrorModal } from "../../lib/errorDisplay";
-import { lockedFieldIds, poolInvalidatingIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
+import { lockedFieldIds, resumeWouldBeGuarded } from "../../lib/resumeLock";
 import { runCandidateRangeTest, midiName } from "../../lib/vocal/rangeTest";
 import { Dropdown } from "../common/Dropdown";
 import { preview } from "../common/previewPlayer";
@@ -869,19 +870,13 @@ function ParamsStep() {
   // ★§F2⒝ 批 2 ④d —— costly 档头一次在屏幕上有东西。`resume_lock.rs` 的档位文档写着
   // 「Costly … These are NOT refused; the UI says what it will cost」,而在此之前那句话是空的:
   // `lockedFieldIds(_, "costly")` 全仓零调用点,i18n 里也没有一条 costly 串。
-  // ⚠ 判据与 locked 那一档**不同,而且必须不同**:locked 问「这个值有没有被烧进已有产物」
-  // (扩散那条链问的是扩散自己的进度),costly 问的是「这个**槽**里有没有一份预处理池会被
-  // 换掉」—— 与哪条链在练无关。manifest 写在 worker 开始预处理**之前**,所以它一存在就说明
-  // 这个槽已经付过那笔时间。「再训一个」会清空整槽,那时不存在「换池」这回事。
-  const slotHasPreprocessing =
-    !retrainIntent && !!slotInfo?.exists && (slotInfo.version !== "" || slotInfo.sample_rate !== "");
-  // ⛔ 交集,不是 tier 一个人说了算:tier=costly 说的是「不会被拒」,而屏幕上这句话说的是
-  // 「会重跑预处理」—— 那是 scope 回答的。两者今天恰好等价,而「恰好等价」不是能写进渲染
-  // 逻辑的理由(锁表加一行 costly 但 run 级的字段,这里就会开始撒谎)。
-  const poolIds = poolInvalidatingIds(config.backend);
-  const costly = slotHasPreprocessing
-    ? new Set([...lockedFieldIds(config.backend, "costly")].filter((id) => poolIds.has(id)))
-    : new Set<string>();
+  // ★S142(§E2E-M10):这三行整段搬进了 `lib/training/costlyNote.ts`。搬的理由不是整洁 ——
+  // 它此前是组件体内的内联表达式,vitest **结构上**够不着,所以那一跳的任何变异都会存活
+  // (S128 的 L9 就是那么活下来的),而整段提示今天可以被删光而全仓零红。
+  // ⛔ 判据是 **scope 不是 tier**,而两者今天恰好等价 ⇒ 那一半只有喂一张合成锁表才验得到;
+  // ⛔ `poolAtStake` 的两条**已知偏窄**(重训路径 / diff-first 槽)写在那个文件的函数头上,
+  //    别在这里凭「它读起来对」重新判断一遍。
+  const costly = poolCostFieldIds(config.backend, poolAtStake(slotInfo, retrainIntent));
   /** costly 项的代价标记:改它合法,但下一次运行会落到**另一个**预处理池上,切片与特征全部重跑。 */
   const costlyNote = (id: string) =>
     costly.has(id) ? (

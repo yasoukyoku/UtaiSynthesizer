@@ -74,8 +74,12 @@ export const NO_FORM_CONTROL: ReadonlySet<string> = new Set(["dataset"]);
  *
  * 反过来,槽**没跑过**时必须一个字段都不还原:那时 `aug_copies` 是 0、`loudnorm` 是 null,
  * 「还原」它们等于把用户刚在参数页填好的值清掉。
+ *
+ * ★S142:导出了。此前 `TrainingPage.tsx` 的参数页把同一条规则**又手抄了一份**(第三份 ——
+ * `resumeWouldBeGuarded` 的非 diff 臂是第二份),而三份里只有这一份带着上面那段理由。
+ * 代价提示那一层现在经 `costlyNote.ts` 转调它。
  */
-function hasManifest(info: WorkspaceInfo | null | undefined): info is WorkspaceInfo {
+export function hasManifest(info: WorkspaceInfo | null | undefined): info is WorkspaceInfo {
   return !!info && info.exists && (info.version !== "" || info.sample_rate !== "");
 }
 
