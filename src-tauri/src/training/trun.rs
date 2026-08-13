@@ -746,7 +746,11 @@ pub fn run_dirs(slot: &Path) -> Result<Vec<RunDir>> {
 /// * **no runs, layout ≥ 3** — the marker asserts the container is where runs live, so MINT one
 ///   rather than writing beside it. This is what keeps "layout ≥ 3 ⟹ products under `runs/`" true
 ///   for a slot that had nothing to move at migration time, and for one whose runs were all
-///   deleted;
+///   deleted. ★S144 — the id is a FRESH one ([`minted_run_id`]), **not** the family-pure
+///   [`legacy_run_id`] this arm used to reuse: 「删光再训一次」 would otherwise land the new
+///   training on the deleted run's exact `runs/<id>/` path, which is where the export ledger's
+///   `from_ckpt_rel` strings come from (see [`tproject::ExportedModel::source_deleted_ms`] — its
+///   first job exists because those strings used to come back byte-identical);
 /// * **several runs** — answer the one the request names; refuse if it named none.
 ///
 /// ## ★★§F2⒝ ④e — `mint`
@@ -762,10 +766,17 @@ pub fn run_dirs(slot: &Path) -> Result<Vec<RunDir>> {
 /// right run) and the training would land on top of it, with `run_is_fresh: true` in `run.json` and
 /// nothing to notice it — the whole failure S126's critic wrote up in five links.
 ///
-/// ⛔ Minting does NOT happen for a slot that holds nothing yet: a first training keeps today's
-/// answer (the slot root at layout ≤ 2, a first `runs/<id>/` above it), byte for byte. The caller
-/// is what decides — see `training::try_start`, which also runs the on-demand fold before the mint
-/// so that a slot can never grow its SECOND run while still below layout 4.
+/// ⛔ Below layout 3 minting still does NOT happen: a first training on an unmigrated slot keeps
+/// today's answer (the slot root), byte for byte, and no `runs/` container appears.
+///
+/// ⚠ **Above it, S144 widened this on purpose, and the rule that used to be here said the
+/// opposite** (「a first training keeps … a first `runs/<id>/` above it, byte for byte」). The
+/// `0 =>` arm serves TWO populations and **nothing on disk tells them apart** — a slot whose runs
+/// were all deleted, and a migrated slot that has never trained. Only the first was costing
+/// anything (the ledger collision above); the second merely gets a different NAME for a directory
+/// that was empty either way, so the widening is priced at exactly that. The caller still decides
+/// the rest — see `training::try_start`, which runs the on-demand fold before the mint so that a
+/// slot can never grow its SECOND run while still below layout 4.
 pub fn run_dir_for_start(
     slot: &Path,
     family: &str,
@@ -782,12 +793,7 @@ pub fn run_dir_for_start(
             if !tpool::read_slot_meta(slot).is_some_and(|m| m.layout >= SLOT_LAYOUT_RUNS) {
                 return Ok(RunDir(slot.to_path_buf()));
             }
-            let id = legacy_run_id(family);
-            debug_assert!(run_id_is_usable(&id));
-            let dir = runs_root(slot).join(&id);
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| UtaiError::Training(format!("RUN_CREATE_FAILED: {e}")))?;
-            Ok(RunDir(dir))
+            mint_run_dir(slot, &minted_run_id(family))
         }
         // ★§F2⒝ ④e — several runs is a normal shape now, so the resolver answers the one the
         // request named rather than refusing outright. `None` still refuses: picking between runs
@@ -1779,7 +1785,16 @@ mod tests {
         // second run appears beside it — the products at the root leave `run_dirs`' view entirely.
         std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
         let r = run_dir_for_start(&slot, "rvc", None, false).unwrap();
-        assert_eq!(r.path(), runs_root(&slot).join(legacy_run_id("rvc")));
+        // ★S144 — 铸的是一个**新** id,不是 family 的纯函数 `legacy_run_id`。两半都承重:
+        // ⑴ 否定的那半钉的是「删光再训一次」不许落回被删那个 run 的路径(代价在导出账本上,
+        //    机理见 `tproject::delete_run` 与那条 delete→start 的行为腿);
+        // ⑵ 肯定的那半钉的是「铸出来的 id 必须是 `list_runs` 看得见的那个」—— 只写 ⑴ 的话,
+        //    一个铸出任意字符串的实现照样绿,而那是几 GB 谁也扫不到、清不掉、存档页看不见。
+        assert_ne!(r.path(), runs_root(&slot).join(legacy_run_id("rvc")), "id 不许是 family 的纯函数");
+        assert_eq!(r.path().parent(), Some(runs_root(&slot).as_path()), "它必须住在 runs/ 容器里");
+        let listed = list_runs(&slot).unwrap();
+        assert_eq!(listed.len(), 1, "铸完之后 list_runs 只该看见这一个");
+        assert_eq!(run_id_of(&slot, "rvc", &r), listed[0].id, "铸出来的 id 与 list_runs 那一行对不上");
         assert!(r.is_dir(), "it must CREATE it — run.json is written before python is spawned");
         assert_eq!(run_dirs(&slot).unwrap(), vec![r.clone()], "and the plural reader must see it");
 

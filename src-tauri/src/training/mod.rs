@@ -5465,10 +5465,12 @@ mod tests {
     /// per-run question can now be ASKED of a named run — so the only assertion that means
     /// anything is one where the two runs would give DIFFERENT answers, and each is asked its own.
     ///
-    /// The slot below cannot be produced through the app yet (both minting paths use
-    /// `legacy_run_id`, which is a pure function of the family) — it is built on disk on purpose,
-    /// because that is exactly the state the NEXT batch creates and this is the shape that has to
-    /// be right BEFORE it does.
+    /// The slot below is built on disk on purpose rather than through the app: when this test was
+    /// written 「同槽两个 run」 could not be produced at all, because both minting paths reused
+    /// `legacy_run_id` (a pure function of the family). ⚠ **That sentence is stale twice over** —
+    /// ④e (S132) gave 「再训一个」 a real `minted_run_id`, and S144 gave the 0-run arm one too, so
+    /// today the app does produce this shape. Building it here anyway keeps the assertions
+    /// independent of every guard between the button and the directory.
     #[test]
     fn each_run_answers_for_itself_and_the_unnamed_question_refuses() {
         let data = tmp_ws("tworuns");

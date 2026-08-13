@@ -114,10 +114,15 @@ pub struct ExportedModel {
     /// But the row has two OTHER jobs that a deleted source invalidates, and both of them are
     /// load-bearing:
     /// * it is the sole source of `KeptReason::Exported` (`scan_project_ckpts` → `imported`).
-    ///   `trun::legacy_run_id` is a pure function of the FAMILY, so deleting the last run and
-    ///   training again re-creates the SAME `runs/<id>/` path — and with the same training name
-    ///   and step count the new checkpoint's `from_ckpt_rel` is byte-identical to this row's.
-    ///   A stale row would then hand delete-protection to a snapshot nobody ever exported;
+    ///   Two different trainings' `from_ckpt_rel` strings really can collide byte for byte, and a
+    ///   stale row would then hand delete-protection to a snapshot nobody ever exported.
+    ///   ⚠ **S144 closed the cheapest way in, and this reason used to be written the other way
+    ///   round**: `trun::run_dir_for_start` reused `trun::legacy_run_id` (a pure function of the
+    ///   FAMILY) once the last run was deleted, so 「删光再训一次」 with the same training name and
+    ///   step count re-created this row's exact path. It mints a fresh id now — but the row still
+    ///   has to retire, because the collision is not gone: a restored backup or a data-root
+    ///   reclaim brings the same `runs/<legacy id>/` back (which is why
+    ///   `settings::sync_dir_delta` refuses to MERGE two runs that share an id);
     /// * it feeds `cleanup_snapshots`' stale tripwire, which fires when NO scoped row matches a
     ///   file on disk ⇒ that slot's 「清理未导入的快照」 becomes a permanent hard modal.
     ///
@@ -725,9 +730,11 @@ pub fn scan_project_ckpts(data_dir: &Path, id: &str, only: Option<&str>) -> Vec<
     let proj = project_dir(data_dir, id);
     // ★§F2⒝ ④e — rows whose SOURCE was deliberately deleted are excluded here and only here-ish
     // (the other consumer is the stale tripwire; the DISPLAY list keeps them). See
-    // [`ExportedModel::source_deleted_ms`]: `legacy_run_id` is a pure function of the family, so a
-    // deleted-then-retrained slot re-creates byte-identical `from_ckpt_rel` strings, and a stale
-    // row would hand `KeptReason::Exported` to a snapshot nobody ever exported.
+    // [`ExportedModel::source_deleted_ms`]: two different trainings can end up with byte-identical
+    // `from_ckpt_rel` strings, and a stale row would hand `KeptReason::Exported` to a snapshot
+    // nobody ever exported. ⚠ S144 closed the start path (a deleted-then-retrained slot used to
+    // re-create the deleted run's exact directory; `run_dir_for_start` mints now), but a restored
+    // backup or a data-root reclaim still brings the same `runs/<legacy id>/` back.
     let exported: Vec<String> = read_meta(data_dir, id)
         .map(|m| {
             m.exported
@@ -1329,8 +1336,9 @@ pub fn delete_slot(data_dir: &Path, id: &str, family: &str) -> Result<DeleteRepo
 ///    `audition::workspace_is_a_slot`,它是一道**响亮拒绝**(`AUDITION_WORKSPACE_IS_A_SLOT`),
 ///    守着六个试听命令入口 —— 删掉容器就是亲手把那道闸拆了,而它拦的正是「有人还攥着旧的槽
 ///    路径」这种错误。⚠ 交接里那句「下一个真 run 会读到别人的转换权重和音域」**无条件形式
-///    证不成**(铸新 run 走的是 `runs/<legacy>/audition`,与槽根不是同一个路径),所以理由按
-///    上面这条写,别按那条。
+///    证不成**(下一个 run 走的是 `runs/<它自己的 id>/audition`,与槽根不是同一个路径),
+///    所以理由按上面这条写,别按那条。★S144 起那个 id 是**铸的**,不再是删掉那个的重名
+///    (见 `trun::run_dir_for_start` 的 `0 =>` 臂)—— 这条理由因此比当年更硬,不是更软。
 pub fn delete_run(data_dir: &Path, id: &str, family: &str, run_id: &str) -> Result<DeleteReport> {
     if !FAMILIES.contains(&family) {
         return Err(UtaiError::Training(format!("TRAINING_BAD_FAMILY: {family}")));
@@ -2998,9 +3006,11 @@ mod tests {
     /// 「盘上对得上」的证据。三件事必须同时成立,少一件都会咬人:
     ///
     /// ⑴ **行还在**(`导出过` 是历史;模型是独立副本,还装在资源管理器里);
-    /// ⑵ 它不再给快照发 `KeptReason::Exported` —— `legacy_run_id` 是 family 的纯函数,删光
-    ///    再练一次会造出**逐字节相同**的 `from_ckpt_rel`,一条陈行会把删除保护发给一个从没
-    ///    导出过的快照;
+    /// ⑵ 它不再给快照发 `KeptReason::Exported` —— 两次不同的训练**能**造出逐字节相同的
+    ///    `from_ckpt_rel`,而一条陈行会把删除保护发给一个从没导出过的快照。
+    ///    ⚠ S144 改口径:当年这条理由写的是「`legacy_run_id` 是 family 的纯函数,删光再练一次
+    ///    就撞上」,而那条路已经堵掉(`run_dir_for_start` 现在铸新 id);今天它仍然成立的理由是
+    ///    **还原备份 / 数据根回收**会把同一个 `runs/<legacy id>/` 带回来;
     /// ⑶ 它不再喂 `PROJECT_LEDGER_STALE` —— 否则第一次删完,那个槽的「清理未导入的快照」
     ///    就变成永久硬模态,而存储页(直接调 `plan_cleanup`,绕过三道闸)照样在旁边写着
     ///    「可清理 N GB」。
@@ -3237,6 +3247,83 @@ mod tests {
         std::fs::remove_dir_all(crate::training::trun::runs_root(&slot3).join("r0000000000dd")).unwrap();
         let stuck = crate::training::migrate_one_slot(&data, id3, "sovits").unwrap_err();
         assert!(stuck.to_string().contains("SLOT_NOT_MIGRATABLE"), "{stuck}");
+
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    /// ⛔★★S144 §E2E-M25-⒜ —— 「把一个槽的 run 删光,再训一次」不许拿到**被删那个 run 的目录**。
+    ///
+    /// 这一整条链此前**零覆盖**,而两侧各自都有判据:`delete_run` 那侧停在「删完之后槽还折得动」
+    /// (上一条测试),`run_dir_for_start` 那侧的夹具是手写 `{"layout":3}` 的空槽 —— 中间那一跳
+    /// (删到零 → 下一次 start 落在哪个目录)没有人驱过,而它正是 `legacy_run_id` 那个
+    /// **family 纯函数**咬人的地方。
+    ///
+    /// ⚠ 夹具用**真的** `delete_run` 删到零,不是手 `remove_dir_all`:后者跳过 ⒝ 那次折叠,
+    /// 造出来的是一个现实里不存在的形状(生产上删完之后槽在 layout **4**),而那种夹具会让这条
+    /// 测试为一个错的理由红或绿(S133 血训)。
+    #[test]
+    fn training_again_after_deleting_every_run_never_reuses_the_deleted_ones_id() {
+        let data = tmp_root("delstart");
+        let id = "run_1234abcd";
+        // ⚠ 夹具从 layout **3** 起步,不是 4:那样下面那条「删完之后在 layout 4」才**驱得动**
+        //   `delete_run` 的 ⒝(无条件先折)。直接建在 4 的话它恒真 —— 一条装饰性断言
+        //   (本轮变异 R4 就是这么抓出来的:注释掉 `migrate_one_slot` 照样全绿)。
+        let slot = run_slot(&data, id, "sovits", &["r0000000000ee"],
+                            crate::training::trun::SLOT_LAYOUT_RUNS);
+        let runs_dir = crate::training::trun::RUNS_DIR;
+        let deleted_rel = format!("sovits/{runs_dir}/r0000000000ee/weights/r0000000000ee_e1_s100.pth");
+        write_meta(
+            &data,
+            &ProjectMeta {
+                id: id.into(),
+                name: "n".into(),
+                export_ledger_since_ms: 1,
+                exported: vec![ExportedModel {
+                    name: "a".into(),
+                    model_type: "sovits".into(),
+                    from_ckpt_rel: deleted_rel.clone(),
+                    at_ms: 1,
+                    source_deleted_ms: 0,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        delete_run(&data, id, "sovits", "r0000000000ee").unwrap();
+        assert!(crate::training::trun::list_runs(&slot).unwrap().is_empty());
+        assert_eq!(
+            crate::training::tpool::read_slot_meta(&slot).map(|m| m.layout),
+            Some(crate::training::tpool::SLOT_LAYOUT_POOL_ID),
+            "夹具前提:生产上删完之后这个槽在 layout 4(delete_run 无条件先折)"
+        );
+
+        // ── 再训一次。⚠ 0 个 run 时 `mint` 那条快捷路要求 `!runs.is_empty()` ⇒ fresh 与续训
+        //    落的是**同一条臂**,所以 `false` 就是这条用户路径,不是在测一个特例。
+        let a = crate::training::trun::run_dir_for_start(&slot, "sovits", None, false).unwrap();
+        let a_id = crate::training::trun::run_id_of(&slot, "sovits", &a);
+        assert_ne!(a_id, "r0000000000ee", "新 run 落回了被删那个 run 的目录");
+        let listed = crate::training::trun::list_runs(&slot).unwrap();
+        assert_eq!(listed.len(), 1, "铸完之后槽里只该有这一个 run");
+        assert_eq!(listed[0].id, a_id, "铸出来的 id 与项目页那一行读的 `list_runs` 对不上");
+
+        // ★ 代价落在哪里:账本那一行仍然退役着,而新 run 的产物**不再**落进它的前缀 ⇒
+        //   `KeptReason::Exported` 不会被交给一个谁也没导出过的快照。
+        let m = read_meta(&data, id).unwrap();
+        assert!(!m.exported[0].source_live(), "被删 run 的账本行没有退役");
+        let new_prefix = format!("sovits/{runs_dir}/{a_id}/");
+        assert!(
+            !deleted_rel.starts_with(&new_prefix),
+            "新 run 的产物路径落回了退役那一行的前缀"
+        );
+
+        // ── ⭐ 决定性的那一条:再删一次、再训一次 ⇒ 两次的 id 必须不同。
+        //    ⛔ 上面那条 `assert_ne!` 单独**不足以**杀掉「改回 legacy」以外的坏法,而这一条杀得掉
+        //    「换成另一个确定性函数」:legacy 与任何 family 纯函数在这里都会给出同一个答案两次。
+        delete_run(&data, id, "sovits", &a_id).unwrap();
+        let b = crate::training::trun::run_dir_for_start(&slot, "sovits", None, false).unwrap();
+        let b_id = crate::training::trun::run_id_of(&slot, "sovits", &b);
+        assert_ne!(a_id, b_id, "两次「删光再训」拿到了同一个 run 目录");
 
         let _ = std::fs::remove_dir_all(data);
     }
