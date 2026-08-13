@@ -44,7 +44,6 @@
  */
 
 import { resumeLockedFields, scopeInvalidatesPool, type LockedField } from "../resumeLock";
-import { hasManifest } from "./formForSlot";
 import type { TrainingBackend, WorkspaceInfo } from "../../store/training";
 
 /**
@@ -73,30 +72,28 @@ export function poolCostFieldIds(
 }
 
 /**
- * 今天用来回答「这个槽里有没有一份会被换掉的预处理池」的谓词。
+ * 这个槽里有没有一份**会被换掉**的预处理池。
  *
- * ⛔⛔ **它是一个近似,而且已知偏窄 —— 钉住它不是因为它对。**
+ * ★S142 笔 3 —— 它现在直接问盘:`WorkspaceInfo.has_preprocessing` 由 Rust 的
+ * `training::slot_has_preprocessing` 算出,与**擦除同意闸**问的是同一个谓词。
  *
- * 真正的问题是「这个**槽**有没有池」,而 `WorkspaceInfo` 今天不带任何池字段
- * (盘上那个事实是有的:Rust 的 `tpool::slot_has_pool`,以及项目页那条
- * `SlotDetail.prepPoolCount` —— 只是都没走到参数页够得着的对象上)。于是这里退而用
- * 「这个 **run** 的 manifest 说它跑过」来近似,而那个近似在两处偏窄:
+ * ⛔⛔ **在此之前这里是一个近似,而那个近似有两处是错的**(留在这里是因为它们解释了
+ * 为什么这个字段值得跨一次 IPC):
+ * ⒜ 旧式子的第一个合取项是 `!retrainIntent`,理由写着「再训一个会清空整槽,那时不存在
+ *    换池这回事」——**S132 的 flip 之后那句话是假的**:旧 run 原样留着,而池是**槽级、
+ *    内容寻址、跨 run 共享**的 ⇒ 重训路径上改 `augCopies` 照样铸新池、整份预处理重跑,
+ *    而屏幕上一个字都没有。
+ * ⒝ 旧式子的第二个合取项是「这个 **run** 的 manifest 说它跑过」,而 manifest 写在预处理
+ *    **之前** ⇒ 一个刚起步就被杀掉的 run 会答「跑过」而盘上其实没有池;反过来,一个
+ *    diff-first 的槽(进度记在 `diff_steps` 上、manifest 两键为空)已经有池却答「没跑过」。
  *
- * ⒜ **重训路径**(`retrainIntent`)—— 这一臂的原始理由是「再训一个会清空整槽,那时不存在
- *    换池这回事」。**S132 的 flip 之后那句话是假的**:旧 run 原样留着,而池是**槽级、
- *    内容寻址、跨 run 共享**的。所以在重训路径上改 `augCopies` / `sampleRate` 照样铸新池、
- *    整份预处理重跑,而屏幕上一个字都没有 —— 并且同一个标志还把 `locked` 那一档
- *    (里面装着 `scope: "both"` 的 `sampleRate`)一起关掉了,也就是说**唯一被设计成可以改
- *    这些字段的那条路,恰好是两档提示同时消失的那条**。
- * ⒝ **diff-first 的槽** —— `version` / `sample_rate` 来自 manifest,而扩散的进度记在
- *    `diff_steps` 上 ⇒ 一个已经跑过、已经有池的 diff-first 槽在这里读起来像「从没跑过」。
- *
- * ⇒ 单测把这两格**钉在今天的答案上**(双向 pin,S110 的形状):不是宣布它们对,而是让
- * 「改它」必须是一次**自觉的**改动,而不是一次谁也没注意到的漂移。修法与判据记在队列。
+ * ⚠ **保留的取舍(不是疏漏)**:探针失败时 `info` 是 `null`(组件的 catch 把它吞成 null),
+ * 这里答 `false` ⇒ 提示整体消失,静默,而代价是几小时。这一跳**对它结构上是瞎的**
+ * (返回空集正是它的正确行为)⇒ 真正的判据必须在「探针失败要留下可见的 CODE」那一侧,
+ * 记在队列 §E2E-M10-⒞。
+ * ⚠ 反过来,Rust 那一侧是 **fail-closed** 的:`pools/` 读不动时答「有」,理由写在
+ * `slot_has_preprocessing` 的函数头上(不确定时**说出代价**比**静默**安全)。
  */
-export function poolAtStake(
-  info: WorkspaceInfo | null | undefined,
-  retrainIntent: boolean,
-): boolean {
-  return !retrainIntent && hasManifest(info);
+export function poolAtStake(info: WorkspaceInfo | null | undefined): boolean {
+  return !!info && info.has_preprocessing;
 }

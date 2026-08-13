@@ -721,6 +721,19 @@ pub struct WorkspaceInfo {
     /// a reusable shared slice pool exists (prior completed import): diff runs
     /// may start WITHOUT re-importing data when this is true (S41 共享池模式)
     pub has_dataset: bool,
+    /// ★S142 §E2E-M10-⒜ — does THIS SLOT hold preprocessing ([`slot_has_preprocessing`])?
+    ///
+    /// ⛔ **与上面那个 `has_dataset` 是两件事,别混**:`has_dataset` 问的是**项目**导入过音频没有
+    /// (`tproject::has_dataset`,槽还没跑过也可以为真);这一条问的是**这个槽**已经把那些音频
+    /// 切过片、抽过 f0 与特征没有 —— 也就是「改一个池级字段要不要再付一遍那几个小时」。
+    /// ⛔⛔ 也**别**读成 `commands::storage::WorkspaceUsage::has_pool` —— 那个同名字段的赋值是
+    /// `tproject::has_dataset(..)`,也就是这里的 `has_dataset`,**正好是另一件事**。名字里带
+    /// `preprocessing` 就是为了让这两个名字不可能被顺手抄错(仓里已经为 `poolCount` 付过一次账)。
+    ///
+    /// 它存在的理由:参数页的「改这一项会重跑预处理」此前拿**这个 run 的 manifest**当近似,
+    /// 而那份近似在**重训路径**上是错的(S132 的 flip 之后重训不再清空整槽,池是槽级、内容
+    /// 寻址、跨 run 共享的 ⇒ 池还在、代价还在,而提示消失了)。
+    pub has_preprocessing: bool,
     /// ①c resume config-diff: manifest vol_embedding (SoVITS main model) — None when absent /
     /// not sovits. Surfaced so the resume dialog can show a mismatch BEFORE start (the Rust guard
     /// rejects it otherwise, but only after the dialog already promised 续训).
@@ -839,20 +852,40 @@ pub(crate) fn slot_holds_work(slot: &Path) -> bool {
             // only resume point is a snapshot be wiped with no dialog at all.
             || diffusion_progress_step(run).unwrap_or(0) > 0
     })
-        // Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR
-        // part of a training run, and a slot that has it but no checkpoint yet is the normal
-        // state of「刚开始练」. `dataset.fingerprint` is the one artifact every family writes
-        // (python does it on ENTERING preprocessing — `utai_train/pool.py`), which makes it
-        // the single portable judge. Without this the wipe-consent guard would let a
-        // half-trained slot be erased with no dialog, and the shared-dataset guard would not
-        // recognise a sibling slot as "using this data".
-        // ★§F2⒝ — that judge now lives INSIDE the pool. Both arms are kept on purpose: the
-        // second is not a fallback, it is the shape of a slot that has not been through the
-        // layout migration (and `tproject::empty_shell` still depends on it for pre-S76 trees).
-        // Dropping it would make an unmigrated slot read as「无活」and wipeable with no dialog.
         // ⚠ These three are per-SLOT questions and stay on the slot: the pool is shared by every
-        // run of it, which is the entire point of layout 2.
-        || tpool::slot_has_pool(slot)
+        // run of it, which is the entire point of layout 2. ★S142 — they moved into
+        // [`slot_has_preprocessing`] because the params page needs to ask the SAME question.
+        || slot_has_preprocessing(slot)
+}
+
+/// Does this slot hold PREPROCESSING — i.e. would changing a pool-level field cost hours again?
+///
+/// Preprocessing counts as work: slicing + f0 + feature extraction is the multi-HOUR part of a
+/// training run, and a slot that has it but no checkpoint yet is the normal state of「刚开始练」.
+/// `dataset.fingerprint` is the one artifact every family writes (python does it on ENTERING
+/// preprocessing — `utai_train/pool.py`), which makes it the single portable judge. Without this
+/// the wipe-consent guard would let a half-trained slot be erased with no dialog, and the
+/// shared-dataset guard would not recognise a sibling slot as "using this data".
+///
+/// ★§F2⒝ — that judge now lives INSIDE the pool. All three arms are kept on purpose: the second
+/// is not a fallback, it is the shape of a slot that has not been through the layout migration
+/// (and `tproject::empty_shell` still depends on it for pre-S76 trees). Dropping it would make an
+/// unmigrated slot read as「无活」and wipeable with no dialog.
+///
+/// ★S142 §E2E-M10-⒜ — it became its own function because it has a SECOND consumer now:
+/// `slot_info` sends it to the params page as `has_pool`, so the「改这一项会重跑预处理」hint asks
+/// the same question the wipe guard asks. Before that the page手抄了一份近似 ——「这个 **run** 的
+/// manifest 说它跑过」—— and that approximation is WRONG on the retrain path, where the pool is
+/// still there (S132 的 flip 之后重训不再清空整槽) while the hint disappeared.
+/// ⛔ 不许再手抄第四份:池是**槽级**的,而「有没有池」只有这一个答案。
+///
+/// ⛔⛔ **失败语义:读不动 ⇒ 答 true。** 这一条到 S142 为止的理由是「它的两个消费者都是**拒绝**」
+/// (`tpool::slot_has_pool` 的注释与 S132 的判断都这么写),而 `has_pool` 是**第三个消费者、
+/// 而且它不是拒绝**——它只是屏幕上的一句话。答案仍然一样,但**理由变了,必须写下来**:
+/// 不确定时**说出代价**比**静默**安全(静默的代价是几小时,而说错的代价是一句多余的提示)。
+/// ⇒ 将来若有人给它加一个「不确定时应该沉默」的消费者,这里必须分叉,而不是改这个默认值。
+pub(crate) fn slot_has_preprocessing(slot: &Path) -> bool {
+    tpool::slot_has_pool(slot)
         || slot.join(tpool::FINGERPRINT).is_file()
         // pre-S76 shape only (dataset/ used to be a sibling of the checkpoints); still true
         // for a directory the migration has not folded yet.
@@ -945,6 +978,10 @@ pub fn slot_info(
         // S76: the reusable pool is the PROJECT's dataset, shared by every slot — not a
         // sibling of this slot's checkpoints any more.
         has_dataset: tproject::has_dataset(data_dir, project_id),
+        // ★S142 §E2E-M10-⒜ — the SLOT's own preprocessing, asked through the SAME predicate the
+        // wipe-consent guard uses. ⚠ `ws` here is the slot (see `exists` above), which is the
+        // right granularity: the pool is shared by every run of it.
+        has_preprocessing: slot_has_preprocessing(&ws),
         vol_embedding: manifest["vol_embedding"].as_bool(),
         n_speakers: manifest["n_speakers"].as_u64().unwrap_or(1),
         speakers,
@@ -5492,6 +5529,50 @@ mod tests {
     ///    子串探针答错的串上**拒绝作答**;
     /// ⒝ `slot_info` 的三态,而且三态各自有**方向**:manifest 的 `false` ≠ 没说 · 池答得上来时
     ///    要采纳池 · 池不唯一时答 `None` 而不是挑一个。
+    /// ⛔★S142 §E2E-M10-⒜ —— **这个槽有没有预处理**这个事实,真的上了线。
+    ///
+    /// 在这条之前,把 `slot_info` 里那一行赋值硬编成 `false`,**cargo 全绿** —— 全仓没有一处
+    /// 测试读过 `slot_info(..).has_preprocessing`,而 TS 那道跨语言对拍按设计只比**字段名**,
+    /// 不比值。整条 ⒜ 的收益会全部押在一行没人验过的赋值上。
+    ///
+    /// ★ 它同时是「读错邻居字段」的唯一看守:`has_dataset` 就在同一个 struct 里隔几行,而
+    /// 全仓每一份前端夹具里这两个字段**取值恰好相同** ⇒ 把 `has_preprocessing` 写成
+    /// `has_dataset` 在那一侧一条判据都杀不掉。这里的夹具**故意**让两者相反。
+    #[test]
+    fn slot_info_reports_the_slots_own_preprocessing_not_the_projects_dataset() {
+        let data = tmp_ws("haspre");
+        std::fs::create_dir_all(data.join("training")).unwrap();
+        let id = "pre_11112222";
+        tproject::write_meta(
+            &data,
+            &tproject::ProjectMeta { id: id.into(), name: "n".into(), ..Default::default() },
+        )
+        .unwrap();
+        let slot = tproject::family_dir(&data, id, "rvc");
+        let run = trun::runs_root(&slot).join("r0123456789ab");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(slot.join(tpool::SLOT_META), br#"{"layout":3}"#).unwrap();
+        std::fs::write(run.join("run_manifest.json"), br#"{"version":"v2"}"#).unwrap();
+        let ask = || slot_info(&data, id, "rvc", None).unwrap();
+
+        // 先证明缺口是真的:没有任何池 ⇒ false。少了这一句,下面那条「有池 ⇒ true」会被一个
+        // 恒返回 true 的实现满足。
+        assert!(!ask().has_preprocessing, "没有池 ⇒ 这个槽还没付过那笔时间");
+
+        // ★ 一个**指纹丢了**的池 —— 产物在盘上,而且它是代价最大的一格(谁也匹配不上 ⇒
+        //   下一次运行必然铸兄弟池、整份重跑)。这一格同时是 `slot_has_pool` 第一条臂在
+        //   mod.rs 这一侧的**唯一**覆盖。
+        let pool = tpool::pools_root(&slot).join("p0000000000000");
+        std::fs::create_dir_all(pool.join("0_gt_wavs")).unwrap();
+        std::fs::write(pool.join("0_gt_wavs").join("000.wav"), b"x").unwrap();
+        assert!(ask().has_preprocessing, "池目录里有产物 ⇒ 改池级字段要再付一遍");
+
+        // ★★ 与邻居**反向**:这个项目从来没导入过音频 ⇒ `has_dataset` 必须是 false,
+        //    而 `has_preprocessing` 是 true。读错字段的实现在这一格上一定翻车。
+        assert!(!ask().has_dataset, "夹具前提:项目没有数据集,两个字段必须相反");
+        let _ = std::fs::remove_dir_all(data);
+    }
+
     #[test]
     fn the_loudnorm_a_pool_was_built_with_is_readable_and_may_answer_unknown() {
         // ⒜ 与旧探针逐串对拍。这七条覆盖四条公式的全部形状:sovits(带/不带)· sovits_v2 的

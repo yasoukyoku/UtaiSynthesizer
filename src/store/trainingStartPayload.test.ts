@@ -93,6 +93,7 @@ function ws(over: Partial<WorkspaceInfo> = {}): WorkspaceInfo {
     //   于是 loudnorm 与 vol_embedding 两个布尔在断言上分不开。
     loudnorm: null,
     has_dataset: true,
+    has_preprocessing: true,
     vol_embedding: false,
     n_speakers: 1,
     speakers: [],

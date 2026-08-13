@@ -873,10 +873,12 @@ function ParamsStep() {
   // ★S142(§E2E-M10):这三行整段搬进了 `lib/training/costlyNote.ts`。搬的理由不是整洁 ——
   // 它此前是组件体内的内联表达式,vitest **结构上**够不着,所以那一跳的任何变异都会存活
   // (S128 的 L9 就是那么活下来的),而整段提示今天可以被删光而全仓零红。
-  // ⛔ 判据是 **scope 不是 tier**,而两者今天恰好等价 ⇒ 那一半只有喂一张合成锁表才验得到;
-  // ⛔ `poolAtStake` 的两条**已知偏窄**(重训路径 / diff-first 槽)写在那个文件的函数头上,
-  //    别在这里凭「它读起来对」重新判断一遍。
-  const costly = poolCostFieldIds(config.backend, poolAtStake(slotInfo, retrainIntent));
+  // ⛔ 判据是 **scope 不是 tier**,而两者今天恰好等价 ⇒ 那一半只有喂一张合成锁表才验得到。
+  // ★S142 笔 3:`poolAtStake` 现在直接问盘(`WorkspaceInfo.has_preprocessing`,与擦除同意闸
+  // 同一个谓词),不再用「不是重训 ∧ 这个 run 的 manifest 说它跑过」那个近似 —— 那个近似
+  // 在重训路径上是错的(池是槽级共享的,重训不再清空整槽),在 diff-first 的槽上也是错的。
+  // ⛔ 它对「探针失败 ⇒ info=null」仍然是**静默**的,那条取舍写在那个文件的函数头上。
+  const costly = poolCostFieldIds(config.backend, poolAtStake(slotInfo));
   /** costly 项的代价标记:改它合法,但下一次运行会落到**另一个**预处理池上,切片与特征全部重跑。 */
   const costlyNote = (id: string) =>
     costly.has(id) ? (

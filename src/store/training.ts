@@ -340,6 +340,14 @@ export interface WorkspaceInfo {
   loudnorm: boolean | null;
   /** a reusable shared slice pool exists — diff may start without importing */
   has_dataset: boolean;
+  /** ★S142 §E2E-M10-⒜ — 这个**槽**里有没有预处理产物(切片 / f0 / 特征)。
+   *  ⛔ 与上面那个 `has_dataset` 是两件事:那条问「**项目**导入过音频没有」,这条问
+   *  「**这个槽**已经把它们切过片、抽过特征没有」= 「改一个池级字段要不要再付一遍几小时」。
+   *  ⛔⛔ 也别与 `Settings.tsx` 的 `WorkspaceUsage.has_pool` 混:那个同名字段的值来自
+   *  `tproject::has_dataset`,也就是上面那条 —— **正好是另一件事**。名字里带 `preprocessing`
+   *  就是为了让这两个名字不可能被顺手抄错。
+   *  代价提示读它;此前那一跳拿「这个 run 的 manifest 说它跑过」当近似,而那在重训路径上是错的。 */
+  has_preprocessing: boolean;
   /** ①c resume config-diff: manifest vol_embedding (SoVITS); null when absent/not-sovits */
   vol_embedding: boolean | null;
   /** ①c: manifest n_speakers (multi-speaker); 1 when single-speaker */

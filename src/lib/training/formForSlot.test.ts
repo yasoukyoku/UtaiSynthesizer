@@ -29,6 +29,8 @@ function ws(over: Partial<WorkspaceInfo> = {}): WorkspaceInfo {
     aug_copies: 0,
     loudnorm: null,
     has_dataset: true,
+    // 一个**跑过**的槽必然已经有池 —— 这份夹具的主题就是「盘上有东西回答」。
+    has_preprocessing: true,
     vol_embedding: null,
     n_speakers: 1,
     speakers: [],

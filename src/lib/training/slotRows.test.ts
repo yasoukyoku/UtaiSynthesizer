@@ -37,6 +37,7 @@ const INFO: WorkspaceInfo = {
   aug_copies: 0,
   loudnorm: null,
   has_dataset: false,
+  has_preprocessing: false,
   vol_embedding: null,
   n_speakers: 1,
   speakers: [],

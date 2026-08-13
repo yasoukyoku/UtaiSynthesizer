@@ -356,8 +356,16 @@ pub fn list_pools(slot: &Path) -> Result<Vec<PoolInfo>> {
 pub fn slot_has_pool(slot: &Path) -> bool {
     // ⛔ S132 — an unreadable `pools/` answers YES. The consumer is `training::slot_holds_work`,
     // i.e. a refusal: 「no pool」 there is what lets an unconfirmed wipe through.
+    // ⛔★S142 — ANY pool directory counts, **not** just one that still has a readable identity.
+    // The filter used to be `!p.fp_text.is_empty()`, which asks 「is there a pool something could
+    // MATCH」 — a different question from the one in this doc. A pool whose `dataset.fingerprint`
+    // is missing still holds every slice and every derived feature (that is exactly why
+    // `list_pools` keeps listing it, see `PoolInfo::fp_text`), and it is the case that costs the
+    // MOST: nothing can match it, so the next run mints a sibling and re-preprocesses in full.
+    // Both consumers want 「yes」 there — the wipe guard because those bytes are work, and the
+    // params page because that cost is the one it exists to announce.
     match list_pools(slot) {
-        Ok(pools) => pools.iter().any(|p| !p.fp_text.is_empty()),
+        Ok(pools) => !pools.is_empty(),
         Err(e) => {
             tracing::error!(
                 "cannot list the pools of {} ({e}) — answering 「has a pool」 so the wipe-consent                  guard in front of hours of preprocessing stays closed",
@@ -2218,8 +2226,32 @@ mod tests {
         touch(&slot.join("run.json"));
         assert_eq!(migrate_slot(&slot, "sovits").unwrap(), SlotOutcome::Committed);
         assert!(read_slot_meta(&slot).unwrap().layout >= SLOT_LAYOUT);
-        assert!(!slot_has_pool(&slot), "no fingerprint ⇒ no pool");
+        // ⚠S142:措辞改了。这个槽**连 `pools/` 都没有**,所以它在新旧两种语义下都答 false ——
+        // 原来那句「no fingerprint ⇒ no pool」描述的是旧实现的过滤条件,而不是这个夹具的形状。
+        assert!(!slot_has_pool(&slot), "没有任何池目录 ⇒ 这个槽没预处理过");
         assert!(slot.join("run.json").is_file());
+        let _ = std::fs::remove_dir_all(slot);
+    }
+
+    /// ⛔★S142 §E2E-M10-⒜ —— 一个**装满产物但指纹丢了**的池,照样算「这个槽预处理过」。
+    ///
+    /// 这是**唯一**分得开新旧两种语义的形状:旧实现用 `!fp_text.is_empty()` 过滤,于是对它
+    /// 答 false —— 而它恰恰是代价**最大**的一格(没有指纹 ⇒ 谁也匹配不上 ⇒ 下一次运行必然
+    /// 铸一个兄弟池、整份重跑)。
+    /// ⚠ 另外三条既有用例在**两种**语义下都是绿的(空槽根本没有 `pools/`,而有指纹的池两边
+    /// 都算数),所以少了这一条,那次改判据**没有任何判据看着**。
+    #[test]
+    fn a_pool_that_lost_its_fingerprint_still_counts_as_preprocessing() {
+        let slot = tmp_slot("fp_lost");
+        let pool = pools_root(&slot).join("p0000000000000");
+        touch(&pool.join("0_gt_wavs").join("000_000.wav"));
+        assert!(!pool.join(FINGERPRINT).exists(), "夹具前提:指纹确实不在盘上");
+
+        assert!(slot_has_pool(&slot), "产物在盘上,那笔时间就得再付一遍 —— 指纹丢了不改变这一点");
+
+        // 阴性对照:把那个池整个拿走 ⇒ 必须答 false,否则上面那句对任何输入都成立。
+        std::fs::remove_dir_all(pools_root(&slot)).unwrap();
+        assert!(!slot_has_pool(&slot));
         let _ = std::fs::remove_dir_all(slot);
     }
 

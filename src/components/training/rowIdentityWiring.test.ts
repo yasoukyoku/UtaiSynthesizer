@@ -323,6 +323,14 @@ describe("archive rows resolve their identity per row", () => {
         /poolInvalidatingIds\(/,
         "又直接调 poolInvalidatingIds 了 —— 两半分开求交正是 S128 那条等价变异能藏身的形状",
       ],
+      [
+        // ★S142 笔 3:代价提示不许再被「这是不是重训」门住。池是**槽级、跨 run 共享**的,
+        // 重训不清空整槽(S132 的 flip)⇒ 那道门一关,唯一能改这些字段的那条路上代价就没人说了。
+        // ⚠ 这句只有源码闸说得出来:`poolAtStake` 不再收 `retrainIntent`,是**类型层**的事实,
+        // 单测对它一个字也说不上(变异 C4 当场证明了那条单测是装饰件)。
+        /poolAtStake\([^)]*retrainIntent/,
+        "代价提示又被 retrainIntent 门住了 —— 重训路径上池还在、代价还在,而屏幕会重新变哑",
+      ],
     ];
     for (const [re, why] of reInlined) {
       expect(re.test(code), why).toBe(false);
