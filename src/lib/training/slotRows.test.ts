@@ -116,6 +116,33 @@ describe("visibleRuns / slotStarted(§E2E-M3)", () => {
     expect(visibleRuns([mkRun("", { info: { has_main_progress: true } })]).length).toBe(1);
   });
 
+  it("★★S144 —— 正在跑的那一行永远画得出来:新槽第一次训练时它是【唯一】的证据", () => {
+    // 机理逐条可查:新槽整场会话都是 layout 0(建槽没人写 slot.json、`migrate_layouts` 只在
+    // 开机跑)⇒ `run_dir_for_start` 答**槽根**、不建 `runs/` ⇒ `list_runs` 恒空 ⇒ 后端补
+    // `id: ""` 的伪造行,而 `snapshot.run_id` 同样是 `""`(`run_id_of` 对槽根就这么答)。
+    // 第一个 `G_*.pth` 落盘要几十分钟,在那之前两个条件都假 ⇒ 这一行此前被过滤掉,
+    // 而训练**正在跑** ⇒ 屏幕上是「未开始」+ 一颗槽级「开始训练」。
+    const rows = [mkRun("")];
+    expect(visibleRuns(rows, "")).toHaveLength(1);
+    expect(slotStarted(rows, "")).toBe(true);
+    // 阴性对照 ⑴ 没有训练在跑(`liveRunIdFor` 答 null)⇒ 逐字节回到今天的行为
+    expect(visibleRuns(rows, null)).toEqual([]);
+    expect(slotStarted(rows, null)).toBe(false);
+    // 阴性对照 ⑵ 跑的是**别的** run ⇒ 不许拿它救这一行。
+    // ⛔ 这一格是「`=== liveRunId`」与「liveRunId 非 null 就放行」之间**唯一**分得开的输入。
+    expect(visibleRuns(rows, "rbbb")).toEqual([]);
+    expect(slotStarted(rows, "rbbb")).toBe(false);
+  });
+
+  it("★ 那条豁免是**并集**:真 run 不许因为 liveRunId 而变得不画", () => {
+    // ⛔ 防的是把新加的 `||` 写成 `&&` 那一族 —— 它在上面那条用例上完全不可见
+    //    (伪造行两半都假时 `&&` 与 `||` 给同一个答案)。
+    const real = [mkRun("raaa")];
+    expect(visibleRuns(real, null).map((r) => r.id)).toEqual(["raaa"]);
+    expect(visibleRuns(real, "rzzz").map((r) => r.id)).toEqual(["raaa"]);
+    expect(visibleRuns(real, "raaa").map((r) => r.id)).toEqual(["raaa"]);
+  });
+
   it("startedRun 的两个条件各自成立就够(它们不是同一件事)", () => {
     expect(startedRun(mkRun("r", { hasResumePoint: true }))).toBe(true);
     expect(startedRun(mkRun("r", { info: { has_main_progress: true } }))).toBe(true);
@@ -518,6 +545,11 @@ describe("★ 搬家前后逐个输入对拍(纯提取的证据形状)", () => {
       expect(got.pinnedVersion).toBe(legacyPinned(want));
       expect(got.steps).toBe(legacyDiffSteps(want));
 
+      // ⚠★S144 诚实边界:这两条对拍钉的是**默认那一档**(`liveRunId` 缺省 = `null`)。
+      //   S144 给两个函数追加的「正在跑的那一行永远画」是**新行为**,搬家前的表达式里没有它,
+      //   所以它结构上在这条差分的**覆盖之外** —— 它的判据是上面那两条专门的用例。
+      //   ⛔ 别为了「让差分也盖住它」去改 `legacy*`:那会把纯提取的证据变成自证(sortRunRows
+      //   头注的硬约束 1 是同一条)。
       expect(visibleRuns(runs)).toEqual(legacyVisibleRuns(runs));
       expect(slotStarted(runs)).toBe(legacyStarted(runs));
       for (const r of runs) expect(startedRun(r)).toBe(legacyStartedRun(r));

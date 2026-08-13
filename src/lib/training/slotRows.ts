@@ -38,9 +38,28 @@ export function startedRun(r: RunDetail): boolean {
  * 的形状(`run_manifest.json` 在 spawn 之前就写好,随后的切片/f0/特征要跑几小时)。
  * 只有 `id === ""` 那条**伪造行**(后端在**零 run** 时补的,寻址槽根)仍然按
  * 「练出过东西」过滤 —— 那种槽本来就没有 run 可挑。
+ *
+ * ## ★★S144 §E2E-M25-⒜ —— `liveRunId`:正在跑的那一行**永远画得出来**
+ *
+ * ⛔ 上面那条过滤有一个**每天都会发生**的漏网形状,而它不是理论上的:
+ * **一个新槽的第一次训练**。新槽在整个首场会话里都是 layout 0(建槽时没有人写 `slot.json`,
+ * 而 `migrate_layouts` 只在开机跑),于是 `trun::run_dir_for_start` 答**槽根**、
+ * **不建 `runs/` 容器** ⇒ `list_runs` 恒空 ⇒ 后端补那条 `id: ""` 的伪造行,
+ * 而 `snapshot.run_id` 同样是 `""`(`run_id_of` 对槽根就是这么答的)。
+ * 此时 `hasResumePoint` 与 `has_main_progress` 都还是假(第一个 `G_*.pth` 要几十分钟),
+ * 于是这一行被过滤掉 ⇒ **训练正在跑,而卡片写着「未开始」、下面还画着槽级「开始训练」**。
+ *
+ * ⇒ 一个**正在跑的 run** 是「这个槽开始过了」最硬的证据,比盘上有没有 `G_*.pth` 更硬。
+ * ⛔ 比较必须是**逐字节相等**:`""` 是合法 id,`liveRunId` 用真值判断会让这条豁免
+ * 在**唯一需要它的那一格**上失效(见 `liveRunIdFor` 的 `string | null`)。
+ * ⚠ `liveRunId` 必须是**这个槽**的答案(`liveRunIdFor` 已经比过 `project_id` 与 family):
+ * 传一个别处的 run id 进来,这里就会用它去救一行与它无关的伪造行。
  */
-export function visibleRuns(runs: readonly RunDetail[]): RunDetail[] {
-  return runs.filter((r) => r.id !== "" || startedRun(r));
+export function visibleRuns(
+  runs: readonly RunDetail[],
+  liveRunId: string | null = null,
+): RunDetail[] {
+  return runs.filter((r) => r.id !== "" || startedRun(r) || r.id === liveRunId);
 }
 
 /**
@@ -48,9 +67,15 @@ export function visibleRuns(runs: readonly RunDetail[]): RunDetail[] {
  *
  * ⚠ 它必须由 `visibleRuns` 定义,不是由 `runs`：两者一分家就会出现「有一行 run」同时
  * 「尚未开始」的自相矛盾,而那是这条决策存在的全部理由。
+ * ⛔ S144 起这条「同一个定义」多了一个具体的落法:两半**必须收到同一个 `liveRunId`**。
+ * 只给上面那半传、这半不传,屏幕上就会同时出现「一行带『训练中』徽章的 run」与「未开始」
+ * ——正是这条函数当初要消灭的那种自相矛盾,只是换了个入口(接线由 `rowIdentityWiring` 守)。
  */
-export function slotStarted(runs: readonly RunDetail[]): boolean {
-  return visibleRuns(runs).length > 0;
+export function slotStarted(
+  runs: readonly RunDetail[],
+  liveRunId: string | null = null,
+): boolean {
+  return visibleRuns(runs, liveRunId).length > 0;
 }
 
 /** 浅扩散挂在哪个 run 上,以及**这个答案是怎么来的**。 */

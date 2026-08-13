@@ -821,12 +821,15 @@ export function ProjectDetail() {
              *  **不许**把这里的结果喂给它:那会静默换掉浅扩散训练进哪个 run 目录、用谁的名字、
              *  还原谁的表单 —— 三条都要几小时后才看得出来。判据在 `slotRows.test.ts` 里钉了
              *  「喂进去确实会换宿主」,接线由 `rowIdentityWiring` 的源码闸守。 */
-            const allRows = sortRunRows(visibleRuns(runs), liveRow);
+            const allRows = sortRunRows(visibleRuns(runs, liveRow), liveRow);
             // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
             // 同时「尚未开始」的自相矛盾。
             // ⛔ 它跟的是**过滤后**的全部行,不是折叠后剩下的那几行 —— 折叠是纯观感,
             //    不许改变「这个槽开始过没有」这个事实(否则收起来之后卡片会写「尚未开始」)。
-            const started = slotStarted(runs);
+            // ⛔★★S144 —— 这两行**必须收到同一个 `liveRow`**。只给上面那半传,新槽第一次训练时
+            //    屏幕上会同时出现一行带「训练中」徽章的 run 和一句「未开始」;只给下面那半传,
+            //    卡片说开始过了却一行也不画。机理在 `slotRows.ts` 的 `visibleRuns` 头注。
+            const started = slotStarted(runs, liveRow);
             const prepPools = prepPoolLine(slot);
             /** ★S141(用户实机提的):run 多了才收。少量 run 时逐条照画,与今天逐像素相同。 */
             const fold = foldRunRows(allRows, !!runsOpen[f]);

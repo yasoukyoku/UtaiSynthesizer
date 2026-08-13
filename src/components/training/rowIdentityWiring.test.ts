@@ -216,8 +216,11 @@ describe("archive rows resolve their identity per row", () => {
     // ⛔ S141:折叠是**纯观感**,不许改变「这个槽开始过没有」。`slotStarted` 必须吃**全部**
     // 过滤后的行,而不是折叠之后剩下的那几行 —— 否则收起来之后卡片会写「尚未开始」,
     // 而它下面明明还挂着 run(④e 修掉的正是这类自相矛盾的一屏)。
+    // ⚠★S144 锚点从 `slotStarted(runs)` 放宽到 `slotStarted(runs,` —— 这一笔给它追加了
+    //    `liveRunId`。放宽之前逐条复核过它钉的性质**没变**:第一个实参仍然必须是原始 `runs`
+    //    (`allRows` 那条禁令在下面那道闸里,两条是一对)。
     expect(
-      /slotStarted\(runs\)/.test(code),
+      /slotStarted\(runs,/.test(code),
       "`slotStarted` 不再吃全部行 —— 折叠一旦影响到它,收起来的槽会自称「尚未开始」",
     ).toBe(true);
   });
@@ -563,10 +566,11 @@ describe("archive rows resolve their identity per row", () => {
 
     // ⑴ 排序发生在 `visibleRuns` 之后、`foldRunRows` 之前 —— 这是唯一安全的插入点:
     //    折叠取的是**头部** limit 条,置顶排在它后面等于没排。
+    //    ⚠★S144 锚点里多了一个 `liveRow`:`visibleRuns` 也吃它了(见下面那条新闸)。
     expect(code, "展示序不再由 sortRunRows 决定").toContain(
-      "sortRunRows(visibleRuns(runs), liveRow)",
+      "sortRunRows(visibleRuns(runs, liveRow), liveRow)",
     );
-    const sortAt = code.indexOf("sortRunRows(visibleRuns(runs), liveRow)");
+    const sortAt = code.indexOf("sortRunRows(visibleRuns(runs, liveRow), liveRow)");
     const foldAt = code.indexOf("foldRunRows(allRows");
     expect(foldAt, "foldRunRows 的调用点找不到了 —— 这条闸的锚点漂了").toBeGreaterThan(0);
     expect(sortAt, "排序排在折叠**之后** —— 置顶的那一行照样会被 slice 掉").toBeLessThan(foldAt);
@@ -585,6 +589,30 @@ describe("archive rows resolve their identity per row", () => {
     // …而 `slotStarted` 必须继续吃**原始 runs**(S141 的 Y3:折叠/排序都是纯观感,
     // 不许改变「这个槽开始过没有」)。这一条与上面那条 `/slotStarted\(runs\)/` 是一对。
     expect(code, "slotStarted 开始吃排过序/折叠后的行了").not.toContain("slotStarted(allRows");
+  });
+
+  it("★★★ S144 §E2E-M25-⒜ —— 「画哪几行」与「开始过没有」必须收到**同一个** liveRow", async () => {
+    // 这一笔修的是一条**每天都会发生**的自相矛盾:新槽第一次训练时槽是 layout 0 ⇒ 后端补的
+    // 那条 `id: ""` 伪造行没练出东西 ⇒ 被 `visibleRuns` 过滤掉 ⇒ 训练正在跑而卡片写「未开始」、
+    // 下面还画着槽级「开始训练」。修法是把「正在跑的那一行永远画」加进 `visibleRuns`,
+    // 而 `slotStarted` 由它定义 ⇒ **两半必须喂同一个实参**。
+    //
+    // ⛔ 只喂一半的两种坏法都在屏幕上,而纯模块的判据一条都看不见(它们各自都对):
+    //    只喂上面那半 ⇒ 一行带「训练中」徽章的 run + 一句「未开始」;
+    //    只喂下面那半 ⇒ 卡片说开始过了,却一行也不画。
+    //    ⇒ 这是 S142 M10 那条「两半必须读同一份 rows」的原样复发,换了个入口。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    expect(code, "`visibleRuns` 不再知道哪一行正在跑").toContain("visibleRuns(runs, liveRow)");
+    expect(code, "`slotStarted` 不再知道哪一行正在跑").toContain("slotStarted(runs, liveRow)");
+    // 反面:任何一半退回单参形式都要红(默认值 `null` 会让它静默恢复成修之前的行为)。
+    for (const bad of ["visibleRuns(runs)", "slotStarted(runs)"]) {
+      expect(code, `${bad} —— 有一半退回了不认识实时 run 的旧形式`).not.toContain(bad);
+    }
+    // ⚠ 诚实边界:这道闸钉的是**两个调用点的文本**。「`liveRow` 真的是这个槽的答案」由
+    //    `liveRunIdFor`(比 state / project_id / family)保证,它有自己的单测;
+    //    而「屏幕上那一行长什么样」仍然只有眼睛能判(devServer 清单里的 E-M25)。
   });
 
   it("★★ S143 笔 5 —— 改名那条路也有同名闸,而互锁拒绝不再显示成「错误」", async () => {
