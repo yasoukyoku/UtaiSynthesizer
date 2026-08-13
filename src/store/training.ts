@@ -485,7 +485,17 @@ export function trainingDataOk(
    *  merely raw audio (`diffPoolReady`). */
   diffInfo: WorkspaceInfo | null,
 ): boolean {
-  if (backend === "sovits_diff") return diffPoolReady(backend, diffInfo);
+  // ★★S144(用户实机报的)—— `diffPoolReady` 是一条**捷径**(宿主槽已经有缓存切片 ⇒ 这一步
+  // 不必导入),**不是浅扩散的唯一入口**。此前这里写的是 `return diffPoolReady(...)`,而那让
+  // **「没有主模型先训扩散」(diff-first)在界面上结构性地做不到**:
+  //   `diffPoolReady` 要求 `info.family === "sovits"`,那个字段来自 **run manifest** ⇒ 一个
+  //   从没训练过的槽恒 `""` ⇒ 谓词恒假;而**路由、向导、数据页的下一步、开始按钮四处用的是
+  //   同一个谓词** ⇒ 点浅扩散的「开始训练」被扔进数据段,**再导入多少音频也出不来**。
+  // ⛔ 后端一侧 diff-first 是**明写受支持的形状**(`training/mod.rs` 的 `run_has_main_model`
+  //   那段 doc:「diff-first, which is a supported shape」;`gate_pool_table` 的 check(6) 也
+  //   逐条钉着它)⇒ 这是前端比后端**更严**,而不是一条后端约束的转述。
+  // ⇒ 捷径优先,不成立时**回落到通用规则**:项目有音频,且(浅扩散不支持多歌手 ⇒)数据集是平铺的。
+  if (diffPoolReady(backend, diffInfo)) return true;
   if (!ds || ds.files === 0) return false;
   // A flat dataset feeds any backend. A per-singer one only feeds the co-training backends —
   // python's fingerprint hard-fails on a subdirectory for the flat ones, so offering to start
