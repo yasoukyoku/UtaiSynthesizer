@@ -263,6 +263,44 @@ describe("archive rows resolve their identity per row", () => {
     ).toBeGreaterThanOrEqual(3);
   });
 
+  it("★ S142 §E2E-M11 —— 每一条走进参数页的路,都必须先把表单放回这个 run 已经在的地方", async () => {
+    // §E2E-M11 那条腿(`store/trainingStartPayload.test.ts`)钉的是
+    // `formForSlot → updateConfig → start_training 的载荷`,而它自己**写了**那第一行 ——
+    // 组件哪天改成内联一份,腿照样全绿。这道闸就是那一半。
+    //
+    // ⛔ 坏法是可判定的:不还原 costly 那一档**不会被拒**,而是静默换池、把切片与全部伴生
+    // 特征重跑一遍(几小时),并把 manifest 里的记录一起覆盖掉。S128 笔 0 修的正是它。
+    const fs = await importFs();
+    const code = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+
+    expect(code, "ProjectDetail 不再从 lib/training/formForSlot 取决策").toContain(
+      "lib/training/formForSlot",
+    );
+
+    // 具体形状排前面(S108):「同一条规则的第五份副本又长回来了」是诊断。
+    expect(
+      /diff_steps\s*>\s*0/.test(code),
+      "ProjectDetail 又自己写了一份 `diff_steps > 0` —— 那正是 S128 收编掉的第五份副本",
+    ).toBe(false);
+
+    // ★ 三条路(继续训练 / 再训一个 / 浅扩散)都以 `setRoute({ seg: nextSegFor(` 收尾,
+    //   而它**前面最近的那个** `updateConfig({` 里必须摊开 formFor —— 少一条就是那条路上
+    //   的表单被打回出厂默认。
+    const hops = [...code.matchAll(/setRoute\(\{ seg: nextSegFor\(/g)];
+    expect(hops.length, "进参数页的路一条都没找到 —— 锚点漂了,这条闸什么也没看").toBe(3);
+    for (const h of hops) {
+      const before = code.slice(0, h.index);
+      const at = before.lastIndexOf("updateConfig({");
+      expect(at, "这条路上根本没有 updateConfig —— 表单没有被放回任何地方").toBeGreaterThan(0);
+      const window = before.slice(at);
+      expect(window.length, "窗口是空的").toBeGreaterThan(20);
+      expect(
+        window,
+        "这条进参数页的路没有摊开 formFor —— costly 那一档会被打回默认,下一次运行静默换池重跑",
+      ).toContain("...formFor");
+    }
+  });
+
   it("★ S142 §E2E-M10 —— 代价提示还在屏幕上,而且每个控件都挂着它自己的那一条", async () => {
     // ⛔ 这条排在纯模块判据**之前**的理由:在它之前,把整段 costly 提示删光,全仓一条判据都
     // 不会红 —— i18n 的对拍闸只钉结构(三语键集合/占位符/非空串),死键闭合只管 `backend.*`,
