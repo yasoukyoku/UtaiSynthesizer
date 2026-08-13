@@ -85,6 +85,17 @@ export function liveRunIdFor(snap: LiveFacts, projectId: string, family: string)
   return snap.run_id;
 }
 
+/**
+ * 浅扩散那张卡在不在跑 —— 它**不是一个 family**,所以要单独问一次。
+ *
+ * `liveRunIdFor(..., "sovits")` 对浅扩散答的是「sovits 那个槽有 run 在跑」(对的:它就住在那个
+ * run 目录里),但那条答案分不开「主模型在练」与「浅扩散在练」。这一格要分开,因为两张卡是
+ * 两张卡:主模型在练时给浅扩散卡贴徽章,说的是一句假话。
+ */
+export function diffusionIsLive(snap: LiveFacts, projectId: string): boolean {
+  return snap.backend === "sovits_diff" && liveRunIdFor(snap, projectId, "sovits") !== null;
+}
+
 /** 一行 run 上,某颗按钮为什么不能点。空串 = 能点。 */
 export type RowGateReason =
   | ""

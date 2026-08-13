@@ -239,6 +239,28 @@
   color: var(--accent-primary);
 }
 
+/* ★★§E2E-M25 ⑵ —— 「这一行正在训练」。与版本号同一组(UI 铁律:加控件前先 grep 现有样式,
+   并进它的选择器组而不是另起一份);差别只有一个**方角**小块与更强的强调色。
+   ⛔ 有意**不**复用页头那对 `.training-live` / `.pulse-dot`:它们住在另外两份样式表里
+   (TrainingPage.css / Titlebar.css),而这个文件只 import 了 TrainingProjects.css ——
+   跨表拉过来靠的是「页面外壳恰好也加载了那两份」这个隐式依赖;而 `.pulse-dot` 还带
+   `border-radius: 50%`,与卡片这一层的方角复古不是一路。 */
+.tproj-run-live {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-success);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.tproj-run-live::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  background: var(--color-success);
+}
+
 .tproj-slot-desc,
 .tproj-slot-facts,
 .tproj-slot-run,

@@ -502,6 +502,61 @@ describe("archive rows resolve their identity per row", () => {
       .toContain("gateReasonKey(g.reason)");
   });
 
+  it("★★ S143 §E2E-M25 ⑵ —— 屏幕真的说出了「正在跑的是哪一个」", async () => {
+    const fs = await importFs();
+    const pd = codeOnly(fs.readFileSync(PROJECT_DETAIL, "utf8"));
+    const tp = codeOnly(fs.readFileSync(FILE, "utf8"));
+
+    // ⑴ run 行:哪一行在跑,是**逐 family** 问出来的。
+    expect(pd, "run 行不再问「这个槽里哪一行在跑」").toContain(
+      "liveRunIdFor(liveFacts, projectId, f)",
+    );
+    // ⛔⛔ 比较必须是 `=== r.id`,**不能**是真值判断:`""` 是一个合法答案(未迁移槽的槽根
+    //    就是那个 run),写成 `liveRow && …` 会让那种槽的唯一一行**永远不亮**,
+    //    而所有 `r0/r1` 形状的夹具都看不见这一点。
+    expect(pd, "徽章的条件不是逐字节比对 run id —— 空串那一档会被真值判断吃掉").toContain(
+      "liveRow === r.id",
+    );
+    expect(pd, "徽章用了真值判断(`liveRow &&`)—— 未迁移槽那一行会永远不亮").not.toMatch(
+      /liveRow\s*&&/,
+    );
+    // ⛔ 计数,不是 `toContain`:这个串有**两个**挂点(run 行 + 浅扩散卡),而 `toContain`
+    //    分不出是哪一个 —— 删掉 run 行那个徽章、留下浅扩散那个,它照样绿(实测:探针 D3
+    //    第一版正是这样如实存活的)。
+    const badges = [...pd.matchAll(/t\("training\.runTraining"\)/g)];
+    expect(
+      badges.length,
+      "「训练中」徽章的挂点不是两个(run 行 + 浅扩散卡)—— 有一处被删了或多长了一处",
+    ).toBe(2);
+
+    // ⑵ 浅扩散卡自己问一次 —— 它不是一个 family,而主模型在练时给它贴徽章是一句假话。
+    expect(pd, "浅扩散卡没有单独问 —— 它会跟着主模型一起亮").toContain("diffusionIsLive(");
+
+    // ⑶ 页头那盏灯:它此前只写「训练中」且**不比 project_id**。
+    expect(tp, "页头那盏灯又变回了不说是哪个的「训练中」").toContain("training.activeNamed");
+    expect(tp, "页头没有区分「别的项目在训练」").toContain("training.activeOther");
+    expect(tp, "页头那盏灯不再比 project_id —— 站在项目 B 时它会为项目 A 亮着而不说").toContain(
+      "snapshot.project_id !== route.projectId",
+    );
+
+    // ⑷ 三条新文案三语齐全(`training.*` 没有死键闭合,打错一个字母会原样显示 key)。
+    for (const lang of ["zh", "en", "ja"]) {
+      const json = JSON.parse(fs.readFileSync(`src/i18n/${lang}.json`, "utf8")) as Record<
+        string,
+        Record<string, string>
+      >;
+      for (const k of ["runTraining", "activeNamed", "activeOther"]) {
+        expect(typeof json.training?.[k], `${lang}.json 缺 training.${k}`).toBe("string");
+      }
+      // 带插值的那两条必须真的带着占位符 —— 少了它,「说出是哪一个」就没说。
+      for (const k of ["activeNamed", "activeOther"]) {
+        expect(json.training?.[k], `${lang}.json 的 training.${k} 没有 {{name}} 占位符`).toContain(
+          "{{name}}",
+        );
+      }
+    }
+  });
+
   it("the wiring probe can actually see the file it claims to scan", async () => {
     // ⚠ 自检:一个读不到文件、或把整份源码都抹成空白的探针,上面两条会**为错误的原因**变绿。
     const fs = await importFs();

@@ -45,7 +45,9 @@ import {
   visibleRuns,
 } from "../../lib/training/slotRows";
 import {
+  diffusionIsLive,
   gateReasonKey,
+  liveRunIdFor,
   runRowActions,
   trainingIsLive,
   type RowGate,
@@ -784,6 +786,9 @@ export function ProjectDetail() {
              *  伪造行按练没练过滤」的全部说明在 `lib/training/slotRows.ts`(S141 §E2E-M3 把它
              *  搬出组件体:写在这里的表达式没有导出,vitest 结构上够不着,变异会存活)。 */
             const allRows = visibleRuns(runs);
+            /** ★★§E2E-M25 ⑵ —— 这个槽里**哪一行**正在训练。`null` = 没有;⛔ 空串是一个
+             *  合法答案(未迁移槽的槽根就是那个 run),所以比较必须是 `=== r.id` 而不是真值判断。 */
+            const liveRow = liveRunIdFor(liveFacts, projectId, f);
             // 「尚未开始」与槽级「开始」按钮跟着**看得见的行**走,否则会出现「有一行 run」
             // 同时「尚未开始」的自相矛盾。
             // ⛔ 它跟的是**过滤后**的全部行,不是折叠后剩下的那几行 —— 折叠是纯观感,
@@ -840,6 +845,11 @@ export function ProjectDetail() {
                         </button>
                       </span>
                       {r.info.version && <span className="tproj-slot-ver">{r.info.version}</span>}
+                      {/* ★★§E2E-M25 ⑵ —— 说出正在跑的是**哪一个 run**。此前屏幕上唯一说这件事
+                          的地方是页头那盏灯,而它不分项目、也不分 run。 */}
+                      {liveRow === r.id && (
+                        <span className="tproj-run-live">{t("training.runTraining")}</span>
+                      )}
                     </div>
                     <div className="tproj-slot-facts">
                       <span>
@@ -991,6 +1001,13 @@ export function ProjectDetail() {
               )}
             </div>
             <div className="tproj-slot-desc">{t("training.backendDiffDesc")}</div>
+            {/* ⛔ 浅扩散**不是一个 family**,所以它自己问一次:主模型在练时给这张卡贴徽章
+                是一句假话,而两者跑在同一个 run 目录里、`liveRunIdFor` 对它们答案相同。 */}
+            {diffusionIsLive(liveFacts, projectId) && (
+              <div className="tproj-slot-facts">
+                <span className="tproj-run-live">{t("training.runTraining")}</span>
+              </div>
+            )}
             <div className="tproj-slot-facts">
               {diffSteps > 0 ? (
                 <span>{t("training.slotResume", { step: diffSteps })}</span>

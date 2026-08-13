@@ -182,6 +182,14 @@ export function TrainingPage() {
   }, [route.projectId]);
 
   const running = isRunningState(snapshot.state);
+  /** ★★§E2E-M25 ⑵ —— 这盏灯此前只写「训练中」,而它读的是**全局**快照、不比 `project_id`:
+   *  站在项目 B 的详情页、项目 A 在训练时,它照样亮着 —— 而同一屏上运行段那一层特意做了项目
+   *  过滤(`snapshot` 在那里被换成 IDLE),于是两句话说的不是一件事。
+   *  ⇒ ⑵ 的真正内容不是「从无到有加一句话」,是**把这句已经在说的含糊话收窄成「是哪个」**。
+   *  ⚠ 收窄成「只在本项目时才亮」是**错的方向**:那会让「有训练在跑」在别的页面上**消失**,
+   *  而它恰恰是「为什么这里的按钮是灰的」的答案(§E2E-M25 ⑶)。⇒ 亮,但说清是别的项目。 */
+  const liveName = snapshot.model_name || t("training.runUnnamed");
+  const liveElsewhere = !!route.projectId && snapshot.project_id !== route.projectId;
 
   // 训练中打开训练页 = 直接落到运行段。
   //
@@ -377,7 +385,9 @@ export function TrainingPage() {
         {running && (
           <span className="training-live">
             <span className="pulse-dot" />
-            {t("training.active")}
+            {liveElsewhere
+              ? t("training.activeOther", { name: liveName })
+              : t("training.activeNamed", { name: liveName })}
           </span>
         )}
         <div className="training-header-spacer" />

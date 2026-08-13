@@ -19,6 +19,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  diffusionIsLive,
   isRunningState,
   liveRunIdFor,
   runRowActions,
@@ -111,6 +112,24 @@ describe("liveRunIdFor(本项目、本槽、逐行)", () => {
   });
 });
 
+describe("diffusionIsLive(浅扩散不是一个 family,要单独问)", () => {
+  it("★★ 主模型在练**不算**浅扩散在练 —— 而它们跑在同一个 run 目录里", () => {
+    // ⛔ 这一格是这个函数存在的全部理由:`liveRunIdFor(..., "sovits")` 对两者答案相同
+    //    (浅扩散就住在那个 sovits run 里),而两张卡是两张卡 —— 主模型在练时给浅扩散卡
+    //    贴「训练中」是一句假话。
+    expect(diffusionIsLive(snap({ backend: "sovits_diff" }), PID)).toBe(true);
+    expect(diffusionIsLive(snap({ backend: "sovits" }), PID)).toBe(false);
+    // …而槽那一层对两者都答「有 run 在跑」,这正是分不开的那一半。
+    expect(liveRunIdFor(snap({ backend: "sovits_diff" }), PID, "sovits")).not.toBeNull();
+    expect(liveRunIdFor(snap({ backend: "sovits" }), PID, "sovits")).not.toBeNull();
+  });
+
+  it("别的项目 / 跑完了 ⇒ 不算", () => {
+    expect(diffusionIsLive(snap({ backend: "sovits_diff", project_id: "p_9" }), PID)).toBe(false);
+    expect(diffusionIsLive(snap({ backend: "sovits_diff", state: "completed" }), PID)).toBe(false);
+  });
+});
+
 describe("runRowActions(四颗按钮跟的不是同一个谓词)", () => {
   const base = {
     blocked: false,
@@ -158,7 +177,7 @@ describe("runRowActions(四颗按钮跟的不是同一个谓词)", () => {
   });
 
   it("★ 项目被标记时,报的是「被标记」而不是「有训练在跑」", () => {
-    // 顺序是承热的:说「有训练在跑」会把人引去等一场永远等不到的训练。
+    // 顺序是承重的:说「有训练在跑」会把人引去等一场永远等不到的训练。
     const g = runRowActions({ ...base, blocked: true, trainingLive: true, anyTaskLive: true });
     expect([g.cont.reason, g.retrain.reason, g.del.reason, g.rename.reason]).toEqual([
       "flagged",
