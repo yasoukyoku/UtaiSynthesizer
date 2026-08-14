@@ -1364,9 +1364,18 @@ fn mg_render_rvc_oversampled() {
 #[ignore]
 fn mg_cover_range_replay() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    // ⛔ The old default pointed inside the repo at a file that has never existed there (the
+    // models live under D:\MyDev\TESTING\UtaiSynth2\models\), so running this probe without the
+    // env var panicked on a missing file and read as "the probe is broken" (S145). Say what to
+    // set instead.
     let model_json = std::env::var("UTAI_MG_RANGE_JSON").unwrap_or_else(|_| {
-        r"D:\MyDev\Utai_v2-dev\data\models\sovits\Sovits4.1东雪莲主模型.json".into()
+        r"D:\MyDev\TESTING\UtaiSynth2\models\sovits\Sovits4.1东雪莲主模型.json".into()
     });
+    assert!(
+        Path::new(&model_json).is_file(),
+        "UTAI_MG_RANGE_JSON=<模型 .json 路径> — 缺省指向 {model_json},盘上没有。\
+         设成一个带 vocal_range sidecar 的模型 json 再跑。"
+    );
     let f0_shift: f32 = std::env::var("UTAI_MG_COVER_F0SHIFT")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -1838,17 +1838,22 @@ pub async fn render_vocal_segment(
                         "range-extend(score/dead-only): '{}' — {} dead group(s), {} unfixable (usable [{:.0},{:.0}], speaker {})",
                         voice_name, plan.len(), unfixable.len(), r.usable.0, r.usable.1, speaker
                     );
+                    // The verdict is taken on `eff = written + transpose`, so printing the WRITTEN
+                    // MIDI alone put two coordinate systems in one line and made the log
+                    // unreconstructable after the fact whenever transpose != 0 (S145). Print both.
+                    let tp = options.transpose;
                     for g in &plan {
                         let hi = (g.start..=g.end).map(|k| nn[k]).max().unwrap_or(0);
                         tracing::info!(
-                            "range-extend(score/dead-only):   group notes[{}..={}] (top MIDI {hi}) renders at {:+} st",
-                            g.start, g.end, g.shift
+                            "range-extend(score/dead-only):   group notes[{}..={}] (top MIDI {hi} written, {} effective @ transpose {:+}) renders at {:+} st",
+                            g.start, g.end, hi + tp, tp, g.shift
                         );
                     }
                     for &(a, b) in &unfixable {
                         let hi = (a..=b).map(|k| nn[k]).max().unwrap_or(0);
                         tracing::warn!(
-                            "range-extend(score/dead-only):   notes[{a}..={b}] (top MIDI {hi}) has NO landing within ±24 st — rendered broken as written"
+                            "range-extend(score/dead-only):   notes[{a}..={b}] (top MIDI {hi} written, {} effective @ transpose {:+}) has NO landing within ±24 st — rendered broken as written",
+                            hi + tp, tp
                         );
                     }
                 }
@@ -2009,7 +2014,11 @@ pub async fn render_vocal_segment(
                 // 每个 donor 占 1/(1+K) 进度区间(审查 S85)。
                 if !range_windows.is_empty() {
                     let sr = result.sample_rate;
-                    let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
+                    // `.max(0)` matches the other two call sites (:1391, :1720). A negative
+                    // `frames` would otherwise shorten the total and slide every splice window
+                    // left of where the decision layer put it — silently, and only on the
+                    // rescued phrases (S145 spotted the divergence).
+                    let total_frames: i64 = score_ref.iter().map(|n| n.frames.max(0)).sum();
                     let pass = std::cell::Cell::new(0usize);
                     // match_levels=true:render_score_* 每渲各自 peak_normalize(0.92) → 全曲
                     // active-RMS 对齐消归一台阶(S85 major;cover 无逐渲归一走 false)。
@@ -2093,7 +2102,11 @@ pub async fn render_vocal_segment(
                 // S85 dead-only(镜像 SoVits 臂,机理注释见彼处)。
                 if !range_windows.is_empty() {
                     let sr = result.sample_rate;
-                    let total_frames: i64 = score_ref.iter().map(|n| n.frames).sum();
+                    // `.max(0)` matches the other two call sites (:1391, :1720). A negative
+                    // `frames` would otherwise shorten the total and slide every splice window
+                    // left of where the decision layer put it — silently, and only on the
+                    // rescued phrases (S145 spotted the divergence).
+                    let total_frames: i64 = score_ref.iter().map(|n| n.frames.max(0)).sum();
                     let pass = std::cell::Cell::new(0usize);
                     crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, true, |s| {
                         pass.set(pass.get() + 1);

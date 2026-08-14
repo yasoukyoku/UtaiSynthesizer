@@ -614,15 +614,56 @@ pub fn apply_dead_only_windows(
 }
 
 /// κ — how much of the inverse's pitch move the FORMANTS follow:
-///   κ=0  formants stay where the model put them — the source timbre, dark/covered on big
-///        down-shifts (engine-native `setFormantSemitones` with pitch compensation);
+///   κ=0  formants stay where the model put them — the source timbre. Under TD-PSOLA this is
+///        free: the algorithm cannot move the spectral envelope at all, it only re-spaces
+///        pitch periods.
 ///   κ=1  formants move with the pitch (the plain spectral transpose) — bright/chipmunk.
 /// Default 0 is the configuration the user A/B'd on real songs and accepted
-/// ("干净了…共振腔相对来讲保持的甚至还挺好"); κ=1 is audibly a chipmunk. Since the 1.3.2
-/// vendor upgrade the whole policy runs INSIDE Signalsmith — no external formant_warp pass,
-/// no 918 Hz lifter ceiling, no overshoot guard — and κ=1 skips the formant machinery
-/// entirely (zero extra cost).
+/// ("干净了…共振腔相对来讲保持的甚至还挺好").
+///
+/// ⚠ The old note here claimed κ=0's cost was "dark/covered". That was backwards, and it cost a
+/// session: on the S142 real-song render the user heard the opposite — κ=0 was audibly BRIGHT,
+/// a chipmunk. S145 found why: Signalsmith's "envelope" is a morphological closing whose
+/// smoothing width is set solely by the base f0 we feed it (`signalsmith-stretch.h:985`), so the
+/// higher the note the coarser the estimate and the closer the compensation gets to the identity
+/// — and range extension only ever rescues high notes. On real material κ=0 leaked +2.40
+/// semitones of formant rise out of a possible 6.00. That is the whole reason the engine changed.
+///
+/// ⚠ Until S146 this constant had ZERO readers on the production paths: `RvcOptions::default()`
+/// and `SovitsOptions::default()` each wrote a bare `0.0`, so "the default κ" had four
+/// independent definitions (here, those two, and `voiceDefaults.ts`) and nothing tying them
+/// together. The two Rust ones now read this constant. `voiceDefaults.ts` still declares its own
+/// — the frontend cannot see a Rust const, and inventing a codegen step for one number is worse
+/// than the drift it prevents; but it IS a second source of truth and it is written down here.
 pub const DEFAULT_FORMANT_KAPPA: f32 = 0.0;
+
+/// Which engine executes the inverse.
+///
+/// TD-PSOLA is the default since S146: on the user's own material (炉心融解 bars 28-44 ×
+/// 东雪莲, the two rescued phrases) it leaks +0.30 semitones of formant rise where Signalsmith
+/// κ=0 leaks +2.40 — and the user picked it in a blind A/B (two versions × two copies, "sort
+/// these into two pairs", plus a blank control that came back "sounds the same", correctly).
+///
+/// The Signalsmith arm stays reachable so the A/B can be re-rendered from one tree
+/// (`UTAI_RANGE_ENGINE=signalsmith`). ⛔ That env var is a **rendering affordance for
+/// comparisons, not a product setting** — "a temporary measure must never ship as the default"
+/// is a rule this line already broke once (S81's D-group external warp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InverseEngine {
+    /// utai_dsp::psola — formants preserved by construction.
+    Psola,
+    /// The 1.3.2 phase vocoder with engine-native formant compensation (the pre-S146 default).
+    Signalsmith,
+}
+
+/// `UTAI_RANGE_ENGINE=signalsmith` re-selects the old arm; anything else (including unset) is
+/// TD-PSOLA.
+pub fn inverse_engine() -> InverseEngine {
+    match std::env::var("UTAI_RANGE_ENGINE").as_deref() {
+        Ok("signalsmith") => InverseEngine::Signalsmith,
+        _ => InverseEngine::Psola,
+    }
+}
 
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
@@ -688,35 +729,100 @@ pub fn apply_inverse(
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
 ) -> Result<Vec<f32>, String> {
+    apply_inverse_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0)
+}
+
+/// [`apply_inverse`] with the engine named explicitly — the A/B arm and the tests take this door.
+/// (Selecting the engine through the process environment inside a test would race the other
+/// tests in the same binary.)
+pub fn apply_inverse_with(
+    engine: InverseEngine,
+    audio: Vec<f32>,
+    sample_rate: u32,
+    shift: i64,
+    kappa: f32,
+    fed_f0: Option<(&[f32], usize)>,
+) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
         return Ok(audio);
     }
+    let k = kappa.clamp(0.0, 1.0);
+    let semis = -(shift as f64); // semitones the AUDIO moves = inverse of the model-side shift
+    let n = audio.len();
     // One-time engine anchor so an A/B can prove what actually ran (a stale render cache
     // otherwise reads as "no difference").
     static ENGINE_LOG: std::sync::Once = std::sync::Once::new();
-    ENGINE_LOG.call_once(|| {
-        tracing::info!("range-extend: inverse engine = signalsmith-stretch 1.3.2 (native formant control, streaming base)");
+    ENGINE_LOG.call_once(|| match engine {
+        InverseEngine::Psola => tracing::info!(
+            "range-extend: inverse engine = utai-dsp TD-PSOLA (formants preserved by construction)"
+        ),
+        InverseEngine::Signalsmith => tracing::info!(
+            "range-extend: inverse engine = signalsmith-stretch 1.3.2 (native formant control, streaming base) [UTAI_RANGE_ENGINE override]"
+        ),
     });
-    let k = kappa.clamp(0.0, 1.0);
-    let semis = -(shift as f64); // semitones the AUDIO moves = inverse of the model-side shift
-    let schedule =
-        fed_f0.and_then(|(f0, hop)| formant_base_track(f0, hop, sample_rate));
-    // κ=1 is the plain transpose: skip the formant machinery entirely (zero extra cost).
-    let formant = ((1.0 - k) > 1e-3).then(|| utai_stretch::FormantPin {
-        semitones: f64::from(k) * semis,
-        base_hz: schedule.as_ref().map_or(&[][..], |(t, _)| t.as_slice()),
-        base_step: schedule.as_ref().map_or(0, |(_, s)| *s),
-    });
-    tracing::debug!(
-        "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base schedule {} pts",
-        schedule.as_ref().map_or(0, |(t, _)| t.len())
-    );
-    let n = audio.len();
-    let mut y = utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, semis, formant)?;
+
+    let mut y = match engine {
+        InverseEngine::Psola => {
+            // The fed f0 goes in RAW. ⛔ Not through `formant_base_track`: that schedule exists
+            // for Signalsmith's per-block analysis (100 ms medians, sticky through unvoiced
+            // stretches because a mid-stream 0 would restart its noise-chasing auto-detector).
+            // Every one of those properties is wrong here — PSOLA needs the 0s to tell voiced
+            // from unvoiced, and it needs the per-frame resolution to seed the mark search.
+            let (f0, hop) = fed_f0.ok_or_else(|| "RANGE_INVERSE_NO_PITCH".to_string())?;
+            if hop == 0 || !f0.iter().any(|v| *v > 0.0) {
+                // Silently handing back un-inverted audio is the one outcome this whole function
+                // exists to prevent: it is a wrong-pitched render that nothing downstream can see.
+                return Err("RANGE_INVERSE_NO_PITCH".into());
+            }
+            let (out, diag) = utai_dsp::psola::psola_shift_formant(
+                &audio,
+                sample_rate,
+                semis,
+                f64::from(k) * semis,
+                f0,
+                hop,
+            );
+            if diag.islands == 0 {
+                return Err("RANGE_INVERSE_NO_PITCH".into());
+            }
+            tracing::debug!(
+                "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
+                 {} marks, cola gap {:.1}% (w median {:.3})",
+                diag.islands,
+                diag.marks,
+                diag.cola_gap_frac * 100.0,
+                diag.cola_w_median
+            );
+            out
+        }
+        InverseEngine::Signalsmith => {
+            let schedule = fed_f0.and_then(|(f0, hop)| formant_base_track(f0, hop, sample_rate));
+            // κ=1 is the plain transpose: skip the formant machinery entirely (zero extra cost).
+            let formant = ((1.0 - k) > 1e-3).then(|| utai_stretch::FormantPin {
+                semitones: f64::from(k) * semis,
+                base_hz: schedule.as_ref().map_or(&[][..], |(t, _)| t.as_slice()),
+                base_step: schedule.as_ref().map_or(0, |(_, s)| *s),
+            });
+            // The base-schedule count is only meaningful when a pin was actually built — printing
+            // it under κ=1 (where `formant` is None and the schedule never reaches the engine)
+            // made the audit line claim work that did not happen (S145).
+            tracing::debug!(
+                "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base schedule {}",
+                match (formant.is_some(), schedule.as_ref()) {
+                    (true, Some((t, _))) => format!("{} pts", t.len()),
+                    (true, None) => "auto-detect".to_string(),
+                    (false, _) => "not used (kappa=1)".to_string(),
+                }
+            );
+            utai_stretch::stretch_interleaved(&audio, 1, sample_rate, 1.0, semis, formant)?
+        }
+    };
     if y.len() != n {
-        // exact-length contract guard, not a fix
+        // Exact-length contract guard, not a fix. ⚠ Because it is here, every downstream
+        // "the output length equals the input length" assertion is structurally true — the real
+        // length gate is `utai_dsp::psola`'s own unit test, which has no such net under it.
         tracing::warn!(
-            "range-extend: stretch returned {} samples for {n} — padded/truncated to contract",
+            "range-extend: engine returned {} samples for {n} — padded/truncated to contract",
             y.len()
         );
         y.resize(n, 0.0);
@@ -1114,31 +1220,137 @@ mod tests {
     }
 
 
+    fn inverse_probe_tone(sr: u32, secs: f32) -> Vec<f32> {
+        let n = (sr as f32 * secs) as usize;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+            })
+            .collect()
+    }
+
     #[test]
     fn the_inverse_honours_the_exact_length_contract() {
         // Every caller's trim/pad arithmetic depends on len(out) == len(in); shift 0 must be
         // the untouched passthrough (tier 1/2 bit-parity).
+        // ⚠ This assertion is weak ON PURPOSE-ADJACENT grounds: apply_inverse resizes to the
+        // contract itself, so nothing here could ever fail on length. The load-bearing length
+        // gate is `utai_dsp::psola`'s own test, which runs with no such net.
         let sr = 44100u32;
-        let n = sr as usize; // 1 s
-        let mut x = vec![0.0f32; n];
-        for (i, v) in x.iter_mut().enumerate() {
-            let t = i as f32 / sr as f32;
-            *v = (0.4 * (2.0 * std::f32::consts::PI * 220.0 * t).sin())
-                + (0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
-        }
+        let x = inverse_probe_tone(sr, 1.0);
         let untouched =
             apply_inverse(x.clone(), sr, 0, DEFAULT_FORMANT_KAPPA, None).expect("shift 0");
         assert_eq!(untouched, x);
         let fed: Vec<f32> = vec![220.0; 101];
-        for (shift, kappa, fed_f0) in [
-            (-3i64, 0.0f32, None),
-            (5, 0.0, Some((fed.as_slice(), sr as usize / 100))),
-            (-7, 1.0, None),
-        ] {
-            let y = apply_inverse(x.clone(), sr, shift, kappa, fed_f0).expect("inverse");
-            assert_eq!(y.len(), x.len(), "shift={shift} kappa={kappa}");
-            assert!(y.iter().all(|v| v.is_finite()));
+        let hop = sr as usize / 100;
+        for engine in [InverseEngine::Psola, InverseEngine::Signalsmith] {
+            for (shift, kappa) in [(-3i64, 0.0f32), (5, 0.0), (-7, 1.0), (12, 0.5)] {
+                let y = apply_inverse_with(
+                    engine,
+                    x.clone(),
+                    sr,
+                    shift,
+                    kappa,
+                    Some((fed.as_slice(), hop)),
+                )
+                .unwrap_or_else(|e| panic!("{engine:?} shift={shift} kappa={kappa}: {e}"));
+                assert_eq!(y.len(), x.len(), "{engine:?} shift={shift} kappa={kappa}");
+                assert!(y.iter().all(|v| v.is_finite()));
+            }
         }
+    }
+
+    #[test]
+    fn the_inverse_refuses_loudly_when_it_has_no_pitch_to_work_from() {
+        // TD-PSOLA cannot place a single grain without knowing where the periods are. The failure
+        // mode this guards is NOT a crash — it is `Ok(un-inverted audio)`: a render at the wrong
+        // pitch that every downstream length/finiteness check passes and no cache tag can see.
+        // Production always supplies the fed f0 (score 50 fps, cover 100 fps); anything that does
+        // not must be told, not quietly served the model's un-shifted take.
+        let sr = 44100u32;
+        let x = inverse_probe_tone(sr, 0.5);
+        let hop = sr as usize / 100;
+        for (name, fed) in [
+            ("no track at all", None),
+            ("empty track", Some(Vec::new())),
+            ("all-unvoiced track", Some(vec![0.0f32; 51])),
+        ] {
+            let arg = fed.as_ref().map(|v| (v.as_slice(), hop));
+            let got = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, arg);
+            assert_eq!(
+                got.err().as_deref(),
+                Some("RANGE_INVERSE_NO_PITCH"),
+                "{name} must fail loudly, got Ok(..) or the wrong CODE"
+            );
+        }
+        // …and a zero hop is the same class of "I cannot locate the periods".
+        let fed = vec![220.0f32; 51];
+        assert_eq!(
+            apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, 0)))
+                .err()
+                .as_deref(),
+            Some("RANGE_INVERSE_NO_PITCH")
+        );
+        // Negative control: the same call WITH pitch must succeed — otherwise the assertions
+        // above would pass on a function that always fails.
+        assert!(
+            apply_inverse_with(InverseEngine::Psola, x, sr, -6, 0.0, Some((&fed, hop))).is_ok(),
+            "with a voiced fed f0 the inverse must succeed"
+        );
+    }
+
+    /// `apply_inverse` is documented as THE single execution point so engine policy can never
+    /// drift between the score and cover paths (S85 paid a night for that rule). Nothing in the
+    /// tree enforced it — a future call site could reach an engine directly and inherit none of
+    /// the loud-failure, κ or diagnostics policy, and every existing test would stay green.
+    /// This is a wiring gate, not a behaviour test: it reads the sibling sources.
+    #[test]
+    fn the_inverse_keeps_exactly_one_execution_point() {
+        const CONSUMERS: [(&str, &str); 3] = [
+            ("score2svc.rs", include_str!("score2svc.rs")),
+            ("sovits.rs", include_str!("sovits.rs")),
+            ("rvc.rs", include_str!("rvc.rs")),
+        ];
+        for (name, src) in CONSUMERS {
+            assert!(
+                src.contains("vocal_range::apply_inverse"),
+                "{name} no longer routes through the single execution point"
+            );
+            for direct in ["psola_shift", "stretch_interleaved"] {
+                assert!(
+                    !src.contains(direct),
+                    "{name} calls the engine ({direct}) directly, bypassing apply_inverse's \
+                     loud-failure / kappa / diagnostics policy"
+                );
+            }
+        }
+        // …and this module really is the only place that names an engine.
+        let me = include_str!("vocal_range.rs");
+        assert!(me.contains("utai_dsp::psola::psola_shift_formant"));
+        assert!(me.contains("utai_stretch::stretch_interleaved"));
+    }
+
+    #[test]
+    fn the_two_engines_are_both_reachable_and_actually_different() {
+        // The A/B arm has to stay alive: if `UTAI_RANGE_ENGINE=signalsmith` silently ran PSOLA,
+        // every future comparison would compare a thing with itself and report "no difference" —
+        // the exact shape of false negative RANGE_ALGO_VERSION exists to prevent.
+        let sr = 44100u32;
+        let x = inverse_probe_tone(sr, 0.5);
+        let fed = vec![220.0f32; 51];
+        let hop = sr as usize / 100;
+        let a = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, Some((&fed, hop)))
+            .expect("psola");
+        let b =
+            apply_inverse_with(InverseEngine::Signalsmith, x.clone(), sr, -6, 0.0, Some((&fed, hop)))
+                .expect("signalsmith");
+        assert_eq!(a.len(), b.len());
+        let diff = a.iter().zip(b.iter()).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        assert!(diff > 1e-3, "the two engines produced the same audio (max |Δ| {diff})");
+        // and the default really is PSOLA
+        assert_eq!(inverse_engine(), InverseEngine::Psola);
     }
 
     #[test]

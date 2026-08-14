@@ -312,6 +312,10 @@ export const CODE_KEYS: Record<string, CodeEntry> = {
   SHARED_POOL_REUSED: { key: "backend.SHARED_POOL_REUSED" },
   SOVITS_NO_OUTPUT: { key: "backend.SOVITS_NO_OUTPUT" },
   SOVITS_VOL_FRAMES_MISMATCH: { key: "backend.SOVITS_VOL_FRAMES_MISMATCH" },
+  // S146: the range-extension inverse is TD-PSOLA, which cannot place a single grain without
+  // knowing where the pitch periods are. Refusing loudly beats the alternative — returning the
+  // model's UN-shifted take, i.e. a render at the wrong pitch that nothing downstream can detect.
+  RANGE_INVERSE_NO_PITCH: { key: "backend.RANGE_INVERSE_NO_PITCH" },
   SPEECH_ENCODER_UNSUPPORTED: { key: "backend.SPEECH_ENCODER_UNSUPPORTED" },
   SPK_MIX_DIFFUSION: { key: "vocalEditor.render.spkMixDiffusion" },
   STORAGE_JOIN: { key: "backend.STORAGE_JOIN" },

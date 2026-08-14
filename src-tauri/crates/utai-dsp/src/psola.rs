@@ -279,6 +279,7 @@ fn add_bell(
     t_pos: f64,
     lw: f64,
     rw: f64,
+    formant_rate: f64,
 ) {
     let n = x.len() as isize;
     let d = t_pos.round() as isize - s_pos.round() as isize;
@@ -291,7 +292,7 @@ fn add_bell(
         let len = (i1 - i0) as f64;
         for i in i0..i1 {
             let ti = i + d;
-            if i < 0 || i >= n || ti < 0 || ti >= n {
+            if ti < 0 || ti >= n {
                 continue;
             }
             let ph = ((i - i0) as f64 + 0.5) / len * std::f64::consts::PI;
@@ -300,7 +301,25 @@ fn add_bell(
             } else {
                 0.5 * (1.0 + ph.cos())
             };
-            acc[ti as usize] += f64::from(x[i as usize]) * w;
+            // κ = 0 (formant_rate == 1) keeps the whole-sample path: no interpolation at all, so
+            // the ratio-1.0 identity stays bit-exact. Only a non-zero formant move reads the
+            // source at a stride, which is what scales the spectral envelope by that stride.
+            let v = if formant_rate == 1.0 {
+                if i < 0 || i >= n {
+                    continue;
+                }
+                f64::from(x[i as usize])
+            } else {
+                let sp = s_pos + (i as f64 - s_pos) * formant_rate;
+                if sp < 0.0 || sp >= (n - 1) as f64 {
+                    continue;
+                }
+                let k = sp.floor();
+                let f = sp - k;
+                let k = k as usize;
+                f64::from(x[k]) * (1.0 - f) + f64::from(x[k + 1]) * f
+            };
+            acc[ti as usize] += v * w;
             wsum[ti as usize] += w;
         }
     }
@@ -327,6 +346,26 @@ pub fn psola_shift_diag(
     f0_hz: &[f32],
     f0_hop: usize,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_formant(x, sample_rate, semitones, 0.0, f0_hz, f0_hop)
+}
+
+/// As [`psola_shift_diag`], but the formant envelope is additionally moved by
+/// `formant_semitones` **relative to the input** — the same convention the Signalsmith arm used
+/// (`FormantPin::semitones`), so the κ slider keeps its meaning across the engine change:
+/// `formant_semitones = κ · semitones`, κ=0 keeps the source timbre (the default, and the arm
+/// the user A/B'd), κ=1 makes the formants follow the pitch (the plain transpose / chipmunk).
+///
+/// Keeping the whole κ range inside ONE engine is deliberate: routing κ>0 to a second engine
+/// would put a cliff in the middle of a user-facing slider and two engines on a shared surface
+/// (`apply_inverse` serves score and cover, S85: "fixing A ≠ leaving B unharmed").
+pub fn psola_shift_formant(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     // NOTE: deliberately no `semitones == 0 => return x` shortcut. That shortcut would make the
@@ -338,6 +377,18 @@ pub fn psola_shift_diag(
     let sr = f64::from(sample_rate);
     let ratio = 2f64.powf(semitones / 12.0);
     if !(ratio.is_finite() && ratio > 0.0) {
+        return (x.to_vec(), diag);
+    }
+    if !formant_semitones.is_finite() {
+        return (x.to_vec(), diag);
+    }
+    // Exactly 1.0 for κ=0 so the whole-sample (bit-exact) grain path is taken.
+    let formant_rate = if formant_semitones == 0.0 {
+        1.0
+    } else {
+        2f64.powf(formant_semitones / 12.0)
+    };
+    if !(formant_rate.is_finite() && formant_rate > 0.0) {
         return (x.to_vec(), diag);
     }
     let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
@@ -393,7 +444,7 @@ pub fn psola_shift_diag(
             if lw <= 1.0 || rw <= 1.0 || lw > max_period || rw > max_period {
                 continue;
             }
-            add_bell(x, &mut acc, &mut wsum, src[k], tm, lw, rw);
+            add_bell(x, &mut acc, &mut wsum, src[k], tm, lw, rw, formant_rate);
         }
     }
 
@@ -564,6 +615,59 @@ mod tests {
                 "{st} st: period {got} samples, expected ≈{expect:.0} (input {base})"
             );
         }
+    }
+
+    #[test]
+    fn the_formant_knob_is_a_no_op_at_zero_and_moves_the_spectrum_without_the_pitch() {
+        // κ is a user-facing slider (0..1). Two things must hold or the slider is a lie:
+        //   κ=0 must be BIT-identical to the plain path (otherwise the default arm — the only one
+        //        the user actually A/B'd — silently changed), and
+        //   a non-zero formant move must actually change the audio while leaving the pitch alone
+        //        (an "it compiles" wiring would satisfy neither).
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+
+        let plain = psola_shift(&x, sr, 6.0, &f0, hop);
+        let kappa0 = psola_shift_formant(&x, sr, 6.0, 0.0, &f0, hop).0;
+        assert_eq!(plain, kappa0, "κ=0 must be bit-identical to the plain shift");
+
+        // formant-only: pitch must not move, timbre must.
+        let warped = psola_shift_formant(&x, sr, 0.0, 6.0, &f0, hop).0;
+        assert_eq!(warped.len(), x.len());
+        let inner = sr as usize / 10..x.len() - sr as usize / 10;
+        assert_eq!(
+            dominant_period(&x[inner.clone()], 40, 800),
+            dominant_period(&warped[inner.clone()], 40, 800),
+            "a formant-only move must not touch the pitch"
+        );
+        let diff = x
+            .iter()
+            .zip(warped.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff > 1e-3, "a formant move of +6 st must change the audio, got max |Δ| {diff}");
+
+        // and the spectral centre of mass must rise (that IS the formant move)
+        let centroid = |v: &[f32]| -> f64 {
+            let seg = &v[inner.clone()];
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for (i, w) in seg.windows(2).enumerate() {
+                let d = f64::from(w[1] - w[0]).abs(); // crude HF-weighted energy proxy
+                num += d * i as f64;
+                den += d;
+            }
+            let _ = num;
+            den / seg.len() as f64 // mean |Δ| ∝ spectral centroid × amplitude
+        };
+        assert!(
+            centroid(&warped) > centroid(&x) * 1.05,
+            "formants moved up ⇒ the high-frequency content must rise ({} vs {})",
+            centroid(&warped),
+            centroid(&x)
+        );
     }
 
     #[test]

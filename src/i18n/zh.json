@@ -949,6 +949,7 @@
     "SHARED_POOL_REUSED": "复用共享切片池（未重新导入）",
     "SOVITS_NO_OUTPUT": "SoVITS 模型没有返回输出",
     "SOVITS_VOL_FRAMES_MISMATCH": "vol 帧数异常",
+    "RANGE_INVERSE_NO_PITCH": "音域扩展的逆变换拿不到音高信息，无法还原音高——本次渲染已中止（若持续出现请重启应用）",
     "SPEECH_ENCODER_UNSUPPORTED": "不支持的 speech_encoder（仅支持 vec768l12 / vec256l9）",
     "STORAGE_JOIN": "存储任务失败",
     "STRETCH_ENGINE_FAILED": "音频引擎(变速/变调)处理失败——请重试;若持续出现请重启应用",

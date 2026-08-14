@@ -1931,6 +1931,42 @@ mod tests {
         assert!(hz12.iter().all(|&h| (h - 880.0).abs() < 1.0), "A4+12st → 880, got {:?}", hz12);
     }
 
+    /// `range_shift != 0` had ZERO coverage in the whole Rust tree (S145). That matters because
+    /// S145's headline finding rests on `transpose_eff = transpose + range_shift`: the pitch the
+    /// model is fed — and therefore the f0 the inverse is later handed — is the SHIFTED one. If a
+    /// refactor quietly dropped `range_shift` from that sum, the inverse would be seeded with the
+    /// written pitch instead of the sung one, the mark search would hunt in the wrong band, and
+    /// 601 cargo tests would all stay green. This is the cheap existence gate for that identity.
+    /// Pure arithmetic — no model, no render.
+    #[test]
+    fn the_range_shift_really_reaches_the_pitch_the_model_is_fed() {
+        let score = [("あ", 69, 4), ("い", 76, 4)];
+        let evts = ja_evts(&score);
+        let arr = daw_ja(&score);
+        let base = build_note_hz(&arr, &evts, 0, None);
+        for shift in [-6i64, -1, 3, 12] {
+            // transpose_eff = transpose + range_shift, and transpose is 0 here, so a lone
+            // range_shift must land as a pure ratio on every voiced frame.
+            let moved = build_note_hz(&arr, &evts, shift, None);
+            assert_eq!(moved.len(), base.len());
+            let want = 2f32.powf(shift as f32 / 12.0);
+            let mut voiced = 0;
+            for (b, m) in base.iter().zip(moved.iter()) {
+                if *b <= 0.0 {
+                    assert_eq!(*m, 0.0, "an unvoiced frame must stay unvoiced under a shift");
+                    continue;
+                }
+                voiced += 1;
+                let got = m / b;
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "range_shift {shift}: frame ratio {got} != {want} ({b} Hz → {m} Hz)"
+                );
+            }
+            assert!(voiced >= 4, "the fixture must carry voiced frames, got {voiced}");
+        }
+    }
+
     #[test]
     fn build_note_hz_option_a_samples_cents() {
         // f0 comes from the DAW cents curve, NOT the note's own pitch (note is 60, curve is A4=6900¢).

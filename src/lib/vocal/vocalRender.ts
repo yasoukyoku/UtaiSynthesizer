@@ -619,8 +619,22 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  s85e = windowed donors (cover donors render only dead-region neighbourhoods ±1.5 s instead
  *  of K whole-song passes — the 5-6 min render regression) + level-match now scoped to the
  *  score path only (cover has no per-render normalization; a global RMS pull was measuring
- *  climax loudness against whole-song average). Audition tag bumps in lockstep (_s85e_). */
-export const RANGE_ALGO_VERSION = "s85e";
+ *  climax loudness against whole-song average). Audition tag bumps in lockstep (_s85e_);
+ *  s146p = the INVERSE ENGINE changed: Signalsmith's phase vocoder → utai-dsp TD-PSOLA. Its
+ *  "envelope" was a morphological closing whose smoothing width is set solely by the base f0 we
+ *  feed it, so the higher the note the closer its formant compensation gets to the identity — and
+ *  range extension only ever rescues high notes. Measured on the user's own render (炉心融解 ×
+ *  东雪莲, the two rescued phrases): κ=0 leaked +2.05..+2.40 semitones of formant rise out of
+ *  6.00; TD-PSOLA leaks +0.30..+0.50. The user picked TD-PSOLA blind (two versions × two copies,
+ *  "sort into two pairs", with a blank control that correctly came back "sounds the same").
+ *  Every dead-only rescue in every existing project therefore sounds different — which is the
+ *  point, and exactly why this term has to move. Audition tag bumps in lockstep (_s146p_), and
+ *  `rangeAlgoLockstep.test.ts` now holds those two together mechanically.
+ *  ⚠ NOT bumped: the `_s2r` key in commands/audio.rs. That one caches the TEMPO SLIDER's
+ *  time-stretch (time_factor only — it never reaches apply_inverse), so bumping it would
+ *  invalidate unrelated work. The memory rule "three cache versions move together" is imprecise:
+ *  only two of the three sit on this path. */
+export const RANGE_ALGO_VERSION = "s146p";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and

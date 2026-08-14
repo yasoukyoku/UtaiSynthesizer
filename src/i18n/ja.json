@@ -949,6 +949,7 @@
     "SHARED_POOL_REUSED": "共有スライスプールを再利用（再インポートなし）",
     "SOVITS_NO_OUTPUT": "SoVITS モデルが出力を返しませんでした",
     "SOVITS_VOL_FRAMES_MISMATCH": "音量フレーム数が不正です",
+    "RANGE_INVERSE_NO_PITCH": "音域拡張の逆変換にピッチ情報がなく、音高を戻せませんでした——このレンダリングは中止されました（続く場合はアプリを再起動してください）",
     "SPEECH_ENCODER_UNSUPPORTED": "未対応の speech_encoder です（vec768l12 / vec256l9 のみ対応）",
     "STORAGE_JOIN": "ストレージタスクが失敗しました",
     "STRETCH_ENGINE_FAILED": "オーディオエンジン(タイムストレッチ/ピッチ)の処理に失敗しました——再試行してください。解決しない場合はアプリを再起動してください",

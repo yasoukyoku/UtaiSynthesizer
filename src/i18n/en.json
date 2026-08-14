@@ -949,6 +949,7 @@
     "SHARED_POOL_REUSED": "Reusing the shared slice pool (no re-import)",
     "SOVITS_NO_OUTPUT": "The SoVITS model returned no output",
     "SOVITS_VOL_FRAMES_MISMATCH": "Volume frame count mismatch",
+    "RANGE_INVERSE_NO_PITCH": "The range-extension inverse had no pitch track to work from and could not restore the pitch — this render was aborted (restart the app if it persists)",
     "SPEECH_ENCODER_UNSUPPORTED": "Unsupported speech_encoder (only vec768l12 / vec256l9)",
     "STORAGE_JOIN": "Storage task failed",
     "STRETCH_ENGINE_FAILED": "The audio engine (time-stretch / pitch) failed to process this render — try again; if it persists, restart the app",
