@@ -1001,11 +1001,25 @@ function rangeRecordSig(track: Track): string {
   if (vp.rangeExtend !== true || !track.voiceModel) return ""; // S62c: extension is opt-in (absent = OFF)
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   const rec = (entry?.config as {
-    vocal_range?: { speakers?: Record<string, { usable?: unknown; comfort?: unknown; semitones?: unknown }> };
+    vocal_range?: {
+      speakers?: Record<
+        string,
+        { usable?: unknown; comfort?: unknown; semitones?: unknown; semitones_onset?: unknown }
+      >;
+    };
   } | undefined)?.vocal_range;
   if (!rec?.speakers) return "";
+  // ⛔ EVERY term the decision reads has to be in here. `semitones_onset` (S146b — the second,
+  // singing-shaped probe pass that vetoes unsafe LANDING slots) moves the rescue DEPTH, so a
+  // record that gains it while this signature ignores it produces the one failure this whole
+  // constant exists to prevent: the fix ships, the cached audio does not move, and it reads as
+  // "I changed it and the user hears nothing". (The audition side is already covered — its tag
+  // hashes the PARSED slot_flags, which the veto moves.)
   const body = Object.entries(rec.speakers)
-    .map(([id, sp]) => `${id}=${JSON.stringify(sp?.usable)}~${JSON.stringify(sp?.comfort)}~${hash32(JSON.stringify(sp?.semitones ?? null))}`)
+    .map(
+      ([id, sp]) =>
+        `${id}=${JSON.stringify(sp?.usable)}~${JSON.stringify(sp?.comfort)}~${hash32(JSON.stringify(sp?.semitones ?? null))}~${hash32(JSON.stringify(sp?.semitones_onset ?? null))}`,
+    )
     .sort()
     .join(",");
   return `v${RANGE_ALGO_VERSION}|${body}`;

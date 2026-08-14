@@ -38,6 +38,16 @@ export const RANGE_MIDI_HI = 96; // C8
  *  measured. Everything downstream reads spans, so this is the only place the duration lives. */
 const NOTE_FRAMES = 20; // 400 ms @ 50 fps
 const REST_FRAMES = 6;
+/** S146b — the second pass. The 400 ms 「あ」 above is the EASIEST thing a model ever sings: no
+ *  onset consonant, and long enough to reach steady state (which is exactly why S81 lengthened
+ *  it — that reason still stands, so this is an ADDITIONAL pass, not a replacement).
+ *  What it cannot see is the attack. Measured on akiko at MIDI 80 — same pitch, same duration,
+ *  only the onset differs: 「ま」(voiced) −0.2 dB / voiced 1.00 vs 「か」(voiceless) −7.9 dB /
+ *  voiced 0.33. The song agrees at scale (unrescued MIDI 80, n=45: voiceless onset 64% unvoiced,
+ *  voiced 23%, none 8%; the entire low register 0/548). Only the LANDING grade reads this pass —
+ *  a rescue must not aim at a slot that only survives when nothing has to start it. */
+const ONSET_PROBE_LYRIC = "か";
+const ONSET_PROBE_FRAMES = 9; // 180 ms — the duration the failing notes in real songs have
 /** rmvpe legally disagrees by octaves on note-edge frames — erode each note's measured span. */
 const EDGE_ERODE_100FPS = 2;
 
@@ -63,6 +73,12 @@ export interface SpeakerRangeRecord {
    *  (S81+). Readers MUST tolerate the 2-tuple: old records stay usable by design, they just
    *  cannot contribute the timbre dimension (§user 2026-07-25). */
   semitones: Record<string, [number, number] | [number, number, number, number]>;
+  /** S146b — the SECOND probe pass, shaped like real singing (short note + voiceless onset):
+   *  midi → [errCents, voicedRatio]. Absent on every pre-S146b record, and the Rust reader
+   *  treats absent as "no veto", so old sidecars decide exactly as they did.
+   *  ⛔ It may only ever NARROW the landing band (see vocal_range.rs::speaker_range) — the dead
+   *  set is decided by `semitones` alone, so a second pass can never rescue an extra note. */
+  semitones_onset?: Record<string, [number, number]>;
   tested_at: string;
   /** Scan format/probe version. Absent = pre-S81 (120 ms probe, f0-only). Bump whenever the
    *  probe conditions or the stored dimensions change, so the UI can say "worth re-testing"
@@ -70,21 +86,31 @@ export interface SpeakerRangeRecord {
   scan_version?: number;
 }
 
-/** Current probe + scan format. */
-export const SCAN_VERSION = 2;
+/** Current probe + scan format.
+ *  2 = S81 F1: 400 ms probe + the timbre pair (rmsDb, lowRatio).
+ *  3 = S146b: a SECOND pass with a singing-shaped probe (「か」, 180 ms, voiceless onset) whose
+ *      readings land in `semitones_onset` and may veto unsafe LANDING slots. Every record made
+ *      before this carries no such pass, so it keeps the 「あ」-only landing verdict — correct,
+ *      but it means the fix does not reach a model until it is re-tested. Bumping is how the user
+ *      finds that out: `MsstModelManager` marks `scan_version < SCAN_VERSION` as stale and the
+ *      batch collector picks those models up. */
+export const SCAN_VERSION = 3;
 
 // ── pure pieces (vitest) ──────────────────────────────────────────────────────
 
-/** The scale score: leading rest, then per semitone 「あ」(6f) + rest(6f). Spans are each
+/** The scale score: leading rest, then per semitone one probe note + rest. Spans are each
  *  note's frame window at 100 fps (2× the 50 fps grid) for the detect_f0 alignment. */
-export function buildScaleScore(): { triples: ScoreTriple[]; spans: { midi: number; start100: number; end100: number }[] } {
+export function buildScaleScore(
+  lyric: string = "あ",
+  frames: number = NOTE_FRAMES,
+): { triples: ScoreTriple[]; spans: { midi: number; start100: number; end100: number }[] } {
   const triples: ScoreTriple[] = [{ lyric: "R", note_num: 0, frames: REST_FRAMES, lang: 2 }];
   const spans: { midi: number; start100: number; end100: number }[] = [];
   let cursor50 = REST_FRAMES;
   for (let midi = RANGE_MIDI_LO; midi <= RANGE_MIDI_HI; midi++) {
-    triples.push({ lyric: "あ", note_num: midi, frames: NOTE_FRAMES, lang: 2 });
-    spans.push({ midi, start100: cursor50 * 2, end100: (cursor50 + NOTE_FRAMES) * 2 });
-    cursor50 += NOTE_FRAMES;
+    triples.push({ lyric, note_num: midi, frames, lang: 2 });
+    spans.push({ midi, start100: cursor50 * 2, end100: (cursor50 + frames) * 2 });
+    cursor50 += frames;
     triples.push({ lyric: "R", note_num: 0, frames: REST_FRAMES, lang: 2 });
     cursor50 += REST_FRAMES;
   }
@@ -334,53 +360,95 @@ export async function runRangeTest(
   useAppStore.getState().setVocalRenderActive(true);
   useVoiceModelStore.getState().setRangeTesting(name, 0);
   const nodeId = `range-test:${name}:${runSeq++}`;
+  // S146b: two probe passes now share this node id, so the bar maps each render into its own
+  // window instead of replaying 0→0.85 twice (a bar that visibly restarts reads as "it hung and
+  // started over" — the same观感 complaint S85e's windowed donors produced).
+  const win = { lo: 0, hi: 0.5 };
   const unlisten = await listen<{ node_id: string; progress: number }>("voice-progress", (e) => {
     if (e.payload.node_id === nodeId) {
-      useVoiceModelStore.getState().setRangeTesting(name, e.payload.progress * 0.85);
+      useVoiceModelStore
+        .getState()
+        .setRangeTesting(name, win.lo + e.payload.progress * (win.hi - win.lo));
     }
   });
   try {
-    const { triples, spans } = buildScaleScore();
     // S66/O5: the render writes the probe wav Rust-side — compute the path up front.
     const dir = (await invoke<string>("ensure_cache_dir", { segmentId: "range_test" })).replace(/\\/g, "/");
-    const wavPath = `${dir}/scale_${Date.now().toString(36)}.wav`;
-    await invoke<{ path: string; sample_rate: number }>("render_vocal_segment", {
-      voiceName: name,
-      modelPath,
-      nodeId,
-      score: triples,
-      f0Cents: [],
-      f0Voiced: [],
-      loudnessEnv: [],
-      formantEnv: [],
-      outputPath: wavPath,
-      options: {
-        backend,
-        cv_speaker_id: 49,
-        lang_id: 2,
-        transpose: 0,
-        range_extend: false, // measuring the RAW model — never shift the probe itself
-        sovits: { ...SOVITS_DEFAULTS, speaker_id: speakerId },
-        rvc: { ...RVC_DEFAULTS, speaker_id: speakerId },
-      },
-    });
-    useVoiceModelStore.getState().setRangeTesting(name, 0.88);
-    const f0 = await invoke<number[]>("detect_f0", { audioPath: wavPath });
-    useVoiceModelStore.getState().setRangeTesting(name, 0.93);
-    // S81 F1: the timbre dimension the f0 criteria are structurally blind to. Measured from the
-    // SAME probe wav, so it can never disagree with the f0 stats about what was rendered.
-    const quality = await invoke<[number, number][]>("analyze_scale_quality", {
-      audioPath: wavPath,
-      spans: spans.map((s) => [s.start100, s.end100]),
-      expectedHz: spans.map((s) => midiToHz(s.midi)),
-    });
-    useVoiceModelStore.getState().setRangeTesting(name, 0.96);
 
-    const record = buildSpeakerRecord(classifySemitones(f0, spans, quality));
+    /** One probe pass: render the scale, measure it, classify. The two passes differ ONLY in the
+     *  probe note (lyric + length) — same render command, same f0 detector, same analyzer, so
+     *  they can never disagree about anything except what was sung. */
+    const pass = async (
+      lyric: string,
+      frames: number,
+      lo: number,
+      hi: number,
+      withQuality: boolean,
+    ): Promise<SemitoneStat[]> => {
+      const { triples, spans } = buildScaleScore(lyric, frames);
+      win.lo = lo;
+      win.hi = hi;
+      const wavPath = `${dir}/scale_${Date.now().toString(36)}.wav`;
+      await invoke<{ path: string; sample_rate: number }>("render_vocal_segment", {
+        voiceName: name,
+        modelPath,
+        nodeId,
+        score: triples,
+        f0Cents: [],
+        f0Voiced: [],
+        loudnessEnv: [],
+        formantEnv: [],
+        outputPath: wavPath,
+        options: {
+          backend,
+          cv_speaker_id: 49,
+          lang_id: 2,
+          transpose: 0,
+          range_extend: false, // measuring the RAW model — never shift the probe itself
+          sovits: { ...SOVITS_DEFAULTS, speaker_id: speakerId },
+          rvc: { ...RVC_DEFAULTS, speaker_id: speakerId },
+        },
+      });
+      const f0 = await invoke<number[]>("detect_f0", { audioPath: wavPath });
+      // S81 F1: the timbre dimension the f0 criteria are structurally blind to. Measured from the
+      // SAME probe wav, so it can never disagree with the f0 stats about what was rendered.
+      // The onset pass does not need it — it only ever feeds the f0-axes LANDING veto.
+      const quality = withQuality
+        ? await invoke<[number, number][]>("analyze_scale_quality", {
+            audioPath: wavPath,
+            spans: spans.map((s) => [s.start100, s.end100]),
+            expectedHz: spans.map((s) => midiToHz(s.midi)),
+          })
+        : undefined;
+      return classifySemitones(f0, spans, quality);
+    };
+
+    const record = buildSpeakerRecord(await pass("あ", NOTE_FRAMES, 0, 0.5, true));
     if (!record) {
       useAppStore.getState().showToast(t("rangeTest.noUsable"), "error");
       return;
     }
+    // S146b second pass — shaped like real singing. It can only ever narrow the landing band
+    // (the Rust reader never SETS the bit from this map), so a failure here is not worth aborting
+    // a finished scan over: the record simply keeps the pre-S146b landing verdict.
+    try {
+      const onset = await pass(ONSET_PROBE_LYRIC, ONSET_PROBE_FRAMES, 0.5, 0.95, false);
+      const map: NonNullable<SpeakerRangeRecord["semitones_onset"]> = {};
+      for (const st of onset) {
+        map[String(st.midi)] = [
+          Number.isFinite(st.errCents) ? Math.round(st.errCents) : 9999,
+          Math.round(st.voicedRatio * 100) / 100,
+        ];
+      }
+      record.semitones_onset = map;
+    } catch (e) {
+      void logToBackend(
+        "warn",
+        `range test: onset probe pass failed, keeping the 「あ」-only landing verdict: ${String(e)}`,
+      );
+    }
+    useVoiceModelStore.getState().setRangeTesting(name, 0.97);
+
     // merge into the existing record (other speakers' entries survive)
     const entry = useVoiceModelStore.getState().models[backend]?.find((m) => m.name === name);
     const existing = (entry?.config as { vocal_range?: { speakers?: Record<string, unknown> } } | undefined)?.vocal_range;

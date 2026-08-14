@@ -244,6 +244,44 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         }
         (seen >= 2).then_some(d)
     });
+    // S146b: a SECOND probe pass, shaped like real singing (short note + voiceless onset),
+    // may narrow the LANDING band. Why this exists: the scan's only probe is a 400 ms 「あ」
+    // with no onset consonant (rangeTest.ts), and that is the easiest thing a model ever has
+    // to sing. Measured on akiko at MIDI 80 — same pitch, same duration, only the onset
+    // differs: 「ま」(voiced onset) −0.2 dB / voiced 1.00, 「か」(voiceless onset) −7.9 dB /
+    // voiced **0.33**. The song agrees at scale (unrescued MIDI 80, n=45: voiceless onset 64%
+    // unvoiced, voiced onset 23%, no onset 8%; the whole low register 0/548). So a rescue that
+    // lands a dead note on a slot the 「あ」 probe called comfortable can still come out mute —
+    // which is exactly what the user heard: 「おもうううう」 WAS rescued to 79 and う@85→79 still
+    // measured voiced 0.17.
+    //
+    // ⛔ This can only ever CLEAR the bit, never set it: the extra probe is allowed to say
+    // "that landing is not safe after all", never "…is safe after all". Consequences:
+    //   * the set of DEAD notes is untouched (SLOT_SINGABLE is not read here) ⇒ this change
+    //     rescues exactly the same notes as before, just lands them somewhere the model can
+    //     actually phonate. Zero extra notes dragged through the inverse — which matters,
+    //     because widening the dead set is a move the user has already rejected by ear
+    //     (S145: 「反而没那么自然」), and it measured 1 real rescue per 15 healthy notes dragged.
+    //   * a record without this key behaves byte-identically to before (old records keep working).
+    if let Some(m) = sp.get("semitones_onset").and_then(|m| m.as_object()) {
+        for (k, v) in m {
+            let Ok(midi) = k.parse::<i64>() else { continue };
+            let slot = midi - DAMAGE_LO_MIDI as i64;
+            if !(0..DAMAGE_SLOTS as i64).contains(&slot) {
+                continue;
+            }
+            let Some(a) = v.as_array() else { continue };
+            let (Some(err), Some(voiced)) = (
+                a.first().and_then(|x| x.as_f64()),
+                a.get(1).and_then(|x| x.as_f64()),
+            ) else {
+                continue;
+            };
+            if !(err <= 50.0 && voiced >= 0.9) {
+                flags[slot as usize] &= !SLOT_LANDING;
+            }
+        }
+    }
     let slot_flags = damage.is_some().then_some(flags);
     Some(SpeakerRange { usable, comfort, damage, slot_flags })
 }
@@ -1306,6 +1344,133 @@ mod tests {
     /// tree enforced it — a future call site could reach an engine directly and inherit none of
     /// the loud-failure, κ or diagnostics policy, and every existing test would stay green.
     /// This is a wiring gate, not a behaviour test: it reads the sibling sources.
+    /// Fixture shaped like a real record: slot 80 passes the 「あ」 probe at LANDING grade
+    /// (err 2, voiced 0.97) while the onset probe says it does not (voiced 0.33) — the exact
+    /// pair measured on akiko. 78 passes both. Everything else is healthy filler so the record
+    /// has ≥2 tested slots (below that `speaker_range` returns a bounds-only record).
+    fn onset_probe_record(with_onset: bool) -> ModelConfig {
+        let mut semis = serde_json::Map::new();
+        let mut onset = serde_json::Map::new();
+        for midi in 60..=80 {
+            // 80 mirrors akiko's real sidecar: err 2 / voiced 0.69 ⇒ SINGABLE but NOT landing.
+            // That is why the plan lands 85 on 79 today — and 79 is the slot that came back
+            // voiced 0.17 on the real render.
+            let a_voiced = if midi == 80 { 0.69 } else { 0.97 };
+            semis.insert(midi.to_string(), serde_json::json!([2, a_voiced, -3.0, 0.4]));
+            // the hard probe agrees everywhere except 79/80 (akiko: 79 → 0.78, 80 → 0.33)
+            let voiced = match midi {
+                80 => 0.33,
+                79 => 0.78,
+                _ => 1.0,
+            };
+            onset.insert(midi.to_string(), serde_json::json!([2, voiced]));
+        }
+        let mut sp = serde_json::json!({
+            "usable": [60, 80], "comfort": [60, 80], "semitones": semis
+        });
+        if with_onset {
+            sp["semitones_onset"] = serde_json::Value::Object(onset);
+        }
+        config_with(sp)
+    }
+
+    #[test]
+    fn the_onset_probe_narrows_the_landing_band_and_leaves_the_dead_set_alone() {
+        // ⭐ THE discriminating shape. Anything weaker is satisfiable by a one-line change that
+        // has nothing to do with probes: lowering `usable`'s top from 80 to 79 covers 20/20 of
+        // the notes measured dead on the user's own render — the same coverage as an elaborate
+        // per-probe table. So "slot 80 is now judged dead" proves nothing. What only a
+        // second-probe implementation can produce is: **same slot, same record, LANDING flips
+        // while SINGABLE does not**.
+        let before = speaker_range(&onset_probe_record(false), 0).expect("record");
+        let after = speaker_range(&onset_probe_record(true), 0).expect("record");
+
+        assert!(before.slot_landing_ok(79), "the 「あ」 probe calls 79 a good landing");
+        assert!(!after.slot_landing_ok(79), "the onset probe must veto 79 as a landing (0.78)");
+        assert!(after.slot_landing_ok(78), "78 passes both probes — the veto must be per-slot");
+        // 80 was already not landing-grade on 「あ」 (voiced 0.69) — the veto must not disturb
+        // slots it agrees with, in either direction.
+        assert!(!before.slot_landing_ok(80) && !after.slot_landing_ok(80));
+
+        // …and the dead set is untouched: this change must not rescue one extra note.
+        for midi in 60..=80 {
+            assert_eq!(
+                before.slot_singable(midi),
+                after.slot_singable(midi),
+                "slot {midi}: the onset probe must not move SLOT_SINGABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn the_onset_probe_can_only_narrow_never_widen() {
+        // The invariant that makes this change safe to ship: an extra probe may say "that
+        // landing is not safe after all", never "…is safe after all". Without it, a bad second
+        // scan could widen the landing band and land rescues somewhere nothing has ever tested.
+        let mut semis = serde_json::Map::new();
+        let mut onset = serde_json::Map::new();
+        for midi in 60..=80 {
+            // 「あ」 says NOT landing-grade anywhere (voiced 0.6 < 0.9) but still singable
+            semis.insert(midi.to_string(), serde_json::json!([2, 0.6]));
+            // the onset probe says everything is perfect — it must NOT be believed
+            onset.insert(midi.to_string(), serde_json::json!([0, 1.0]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [60, 80], "comfort": [60, 80],
+                "semitones": semis, "semitones_onset": onset
+            })),
+            0,
+        )
+        .expect("record");
+        for midi in 60..=80 {
+            assert!(r.slot_singable(midi), "slot {midi} stays singable");
+            assert!(!r.slot_landing_ok(midi), "slot {midi}: a second probe must never ADD landing");
+        }
+    }
+
+    #[test]
+    fn a_record_without_the_onset_probe_is_byte_identical_to_before() {
+        // Every existing sidecar on disk lacks the new key; they must decide exactly as they did.
+        let r = speaker_range(&onset_probe_record(false), 0).expect("record");
+        let flags = r.slot_flags.expect("scan present");
+        for midi in 60..=80 {
+            let slot = (midi - DAMAGE_LO_MIDI as i64) as usize;
+            let want = if midi == 80 { SLOT_SINGABLE } else { SLOT_SINGABLE | SLOT_LANDING };
+            assert_eq!(flags[slot], want, "slot {midi} must keep the pre-S146b verdict");
+        }
+        // …and a malformed onset map must degrade to that same verdict rather than to nothing.
+        let junk = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [60, 80], "comfort": [60, 80],
+                "semitones": { "60": [2, 0.97], "61": [2, 0.97] },
+                "semitones_onset": { "60": "not-an-array", "61": [], "999": [0, 0.0] }
+            })),
+            0,
+        )
+        .expect("record");
+        assert!(junk.slot_landing_ok(60) && junk.slot_landing_ok(61));
+    }
+
+    #[test]
+    fn the_narrowed_landing_pushes_the_rescue_deeper() {
+        // The behavioural payoff, on the user's own phrase: notes[186..=191] of 炉心融解 are
+        // [75, 76, 85, 83, 81, 80]. With the 「あ」-only record the plan lands the dead notes on
+        // 79 (shift −6) — and on the real render う@85→79 came back voiced 0.17. With 79/80
+        // vetoed as landings the same group must go deeper, and the dead set must not change.
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let before = speaker_range(&onset_probe_record(false), 0).expect("record");
+        let after = speaker_range(&onset_probe_record(true), 0).expect("record");
+        let s_before = minimal_rescue_shift(&[85, 83, 81], &nn, &before).expect("a landing exists");
+        let s_after = minimal_rescue_shift(&[85, 83, 81], &nn, &after).expect("a landing exists");
+        assert_eq!(s_before, -6, "before: 85 lands on 79, the shallowest landing-grade slot");
+        assert!(
+            s_after < s_before,
+            "the veto must push the rescue deeper, got {s_after} (was {s_before})"
+        );
+        assert_eq!(s_after, -7, "78 is the deepest slot both probes still call landable");
+    }
+
     #[test]
     fn the_inverse_keeps_exactly_one_execution_point() {
         const CONSUMERS: [(&str, &str); 3] = [
