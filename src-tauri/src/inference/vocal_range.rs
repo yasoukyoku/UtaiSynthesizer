@@ -1332,6 +1332,76 @@ mod tests {
         assert!(me.contains("utai_stretch::stretch_interleaved"));
     }
 
+    /// Apply ONLY the inverse to a wav on disk, through the production entry point.
+    ///
+    /// Why this exists rather than "render each arm and compare": the SVC render is **not**
+    /// bit-reproducible (measured S146 — two identical `mg_render_sovits` runs differ by 1.47
+    /// peak, the same order as the engine effect itself). Rendering one arm per engine therefore
+    /// hands a listener two different takes and asks them to attribute the difference to the
+    /// engine. Feeding both engines the SAME rendered wav removes that confound entirely: the
+    /// only difference left in the pair IS the engine.
+    ///
+    /// ```powershell
+    /// $env:UTAI_INV_IN="…\arm_raw.wav"; $env:UTAI_INV_F0="…\f0.f32"; $env:UTAI_INV_HOP="882"
+    /// $env:UTAI_INV_SHIFT="-6"; $env:UTAI_INV_KAPPA="0"; $env:UTAI_INV_ENGINE="psola|signalsmith"
+    /// $env:UTAI_INV_OUT="…\arm.wav"
+    /// cargo test --lib inference::vocal_range::tests::inverse_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "probe: needs a wav + f0 track on disk (set UTAI_INV_*)"]
+    fn inverse_probe() {
+        let inp = std::env::var("UTAI_INV_IN").expect("UTAI_INV_IN");
+        let out = std::env::var("UTAI_INV_OUT").expect("UTAI_INV_OUT");
+        let f0p = std::env::var("UTAI_INV_F0").expect("UTAI_INV_F0");
+        let hop: usize = std::env::var("UTAI_INV_HOP").expect("UTAI_INV_HOP").parse().unwrap();
+        let shift: i64 = std::env::var("UTAI_INV_SHIFT").expect("UTAI_INV_SHIFT").parse().unwrap();
+        let kappa: f32 =
+            std::env::var("UTAI_INV_KAPPA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let engine = match std::env::var("UTAI_INV_ENGINE").as_deref() {
+            Ok("signalsmith") => InverseEngine::Signalsmith,
+            _ => InverseEngine::Psola,
+        };
+
+        let mut rd = hound::WavReader::open(&inp).expect("open");
+        let spec = rd.spec();
+        let x: Vec<f32> = rd
+            .samples::<i32>()
+            .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+            .collect();
+        let x: Vec<f32> = if spec.channels > 1 {
+            x.chunks(spec.channels as usize).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect()
+        } else {
+            x
+        };
+        let f0: Vec<f32> = std::fs::read(&f0p)
+            .expect("f0")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let n = x.len();
+        let y = apply_inverse_with(engine, x, spec.sample_rate, shift, kappa, Some((&f0, hop)))
+            .expect("inverse");
+        assert_eq!(y.len(), n, "exact-length contract");
+        let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+        let g = 0.92 / peak;
+        let mut w = hound::WavWriter::create(
+            &out,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: spec.sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .expect("create");
+        for v in &y {
+            w.write_sample((((v * g).clamp(-1.0, 1.0)) * 32767.0).round() as i16).unwrap();
+        }
+        w.finalize().unwrap();
+        println!("inverse_probe: {engine:?} {shift:+} st kappa {kappa} -> {out}");
+    }
+
     #[test]
     fn the_two_engines_are_both_reachable_and_actually_different() {
         // The A/B arm has to stay alive: if `UTAI_RANGE_ENGINE=signalsmith` silently ran PSOLA,
