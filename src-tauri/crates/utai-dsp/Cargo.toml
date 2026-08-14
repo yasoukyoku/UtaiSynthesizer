@@ -7,3 +7,9 @@ license = "AGPL-3.0-only"
 [dependencies]
 ndarray = "0.16"
 rustfft = "6.2"
+
+# Test-only: the `#[ignore]`d psola probe writes a wav so `scripts/range_rulers/compare.py` can
+# measure THIS implementation on real renders. Structural unit tests cannot judge quality
+# (synthetic periodic material systematically flatters PSOLA-class algorithms — S81).
+[dev-dependencies]
+hound = "3.5"

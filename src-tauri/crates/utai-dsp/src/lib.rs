@@ -15,6 +15,7 @@
 pub mod demucs;
 pub mod formant;
 pub mod mdx;
+pub mod psola;
 pub mod stft;
 pub mod tempo;
 pub mod vr;
