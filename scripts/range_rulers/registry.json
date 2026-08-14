@@ -1,0 +1,150 @@
+{
+  "_why": "预注册。g2p_rulers/README.md 第 3 条:期望答案在跑之前写死,每条带『凭什么它不容争辩』。这里分两类,⛔ 不许混着引用:predictions = 与本工装无关就能知道的真值(尺子错了才会不过);fingerprints = 本工装在 S145 夹具上量出来的数,只用来查漂移(它们不是真值,是指纹)。",
+  "_provenance": "S145(2026-08-14)炉心融解 bars28-44 × Sovits4.1东雪莲主模型;工装复现于 S146(2026-08-14),读数与 project_v2_session145 §A3 的表逐位相同。",
+
+  "calibration": {
+    "_why": "口径闸。变异测试实测(S146):把包络尺的对数轴从 200-9000 改成 300-6000,**A 档零红**,而真素材上 k0 从 +2.40 变成 +3.15。⇒ 『尺子还能量出正确答案』与『尺子还是同一把尺子』是两件事,后者需要单独一条判据。⚠ 同一次实测也说明:排序(psola 0.30/0.40 ≪ k0 2.40/3.15)对轴不敏感,但**绝对数只在同一口径下可比**。",
+    "rulers.FLO": 200.0,
+    "rulers.FHI": 9000.0,
+    "rulers.CENTS_PER_BIN": 10.0,
+    "rulers.MAXLAG": 90,
+    "rulers.NAX": 659,
+    "rulers.FRAME_PERIOD_MS": 5.0,
+    "rulers.F0_FLOOR": 80.0,
+    "rulers.F0_CEIL": 1500.0,
+    "rulers.NFFT": 1024,
+    "rulers.HOP": 220,
+    "rulers.FLUX_LO": 2000.0,
+    "rulers.FLUX_HI": 11000.0,
+    "rulers.SMEAR_SECONDS": 0.002,
+    "rulers.HNR_TIME_STEP": 0.01,
+    "rulers.HNR_MIN_PITCH": 75.0,
+    "arms.PRAAT_TIME_STEP": 0.01,
+    "arms.PRAAT_PITCH_FLOOR": 75.0,
+    "arms.PRAAT_PITCH_CEILING": 1400.0
+  },
+
+  "fixtures": {
+    "dir_env": "UTAI_RANGE_FIXTURES",
+    "dir_default": "D:\\MyDev\\TESTING\\s145_range_color\\lch",
+    "_note": "夹具在仓库外(体积)。指纹不符 ⇒ 退 3【跑不起来】,不许退 1,更不许当通过 —— 换过夹具的读数与登记值不构成比较(g2p_rulers 第 8 条)。",
+    "sample_rate": 44100,
+    "samples": 1635328,
+    "sha256": {
+      "arm_raw.wav": "8989c5302a7b707a6a4b79b7af10c9b175d0ffb40aebac2014040598133364e1",
+      "arm_k0.wav": "222d1232cd349b295b19b85bac80e25f994361afa961042ef9de98d76894e986",
+      "arm_k1.wav": "befd3da24702d875b3cdc666c302237a89bce98c394b0b4dd30939021ea5505f",
+      "arm_world.wav": "090d33a51c95f60225cf9443b26d8ac4c8e9c625419923daeebe5121d10eba0b",
+      "arm_psola.wav": "fca51cda1fb1f934c32699878b5235553866fba8af58d6fabd38bd0a7712f141",
+      "arm_off.wav": "45e5eedd040a21b1b712bed02be80e58ed94b38075a6cd06b0154a382b8b558c"
+    }
+  },
+
+  "window": {
+    "spans": [[396924, 458668], [910279, 972023]],
+    "shift_st": 6.0,
+    "_provenance": "生产 dead_group_windows 在这一片上产出的两条被救乐句窗:notes[186..191] 与 notes[234..239],音高均 [75,76,85,83,81,80],各 1.40 s。⛔ 登记成字面量而不是在尺子里再复刻一遍生产逻辑 —— 那会造出第二份 dead_group_windows 并慢慢漂开。",
+    "_identity": "notes[186..191] 与整曲 2911 base 点已与用户 S142 实机日志逐字对上(project_v2_session145 §1)。"
+  },
+
+  "predictions": [
+    {
+      "id": "env-neg",
+      "ruler": "envelope_shift",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {"median_st": [-0.05, 0.05], "peak_corr": [0.999, 1.001]},
+      "why_incontestable": "同一个文件与自己比,包络位移只能是 0 —— 不依赖任何关于引擎的假设。"
+    },
+    {
+      "id": "env-pos",
+      "ruler": "envelope_shift",
+      "arm": "arm_k1.wav",
+      "expect": {"median_st": [5.5, 6.5]},
+      "why_incontestable": "κ=1 按代码定义 formant=None = 纯移调(vocal_range.rs:704-709)⇒ 共振峰必然整体上移 +6.00 半音。真值是免费的。队列 §E13 笔 0 写的判据就是这一条(+6.00±0.5)。",
+      "_note_measured_5_50": "实测 +5.50 落在下沿:估计器在 +6 处系统性低估 ~0.5 st。这是尺子的已知偏差,不是引擎的。⇒ 读任何候选的位移时,真值 6.00 那一端要按 5.5 校准。"
+    },
+    {
+      "id": "flux-neg",
+      "ruler": "transient_flux",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {"median_db": [-0.01, 0.01]},
+      "why_incontestable": "同一条通量序列与自己取比,恒 0。"
+    },
+    {
+      "id": "flux-pos",
+      "ruler": "transient_flux",
+      "arm": "smear(arm_raw.wav, 2 ms)",
+      "expect": {"median_db": [-1000.0, -30.0]},
+      "why_incontestable": "2 ms 移动平均把 2-11 kHz 的陡升物理性地抹掉 ⇒ 正向通量必然坍塌。队列 §E13 笔 0 写的判据是「人为抹平 ≤ −30 dB」。",
+      "_note": "⚠ 平滑核是 **2 ms**。S145 脚本注释写的「20 ms」是错的(代码是 int(sr*0.002));登记的 −33 dB 属于 2 ms 那一档。"
+    },
+    {
+      "id": "hnr-neg",
+      "ruler": "hnr",
+      "arm": "arm_raw.wav vs arm_raw.wav",
+      "expect": {"delta_db": [-0.01, 0.01]},
+      "why_incontestable": "同一段音频的 HNR 与自己相减,恒 0。"
+    },
+    {
+      "id": "hnr-pos",
+      "ruler": "hnr",
+      "arm": "arm_raw.wav + 白噪 @ 20 dB / 10 dB SNR",
+      "expect": {"delta_db_20": [-6.0, -1.5], "delta_db_10": [-16.0, -6.0], "monotonic": true},
+      "why_incontestable": "注入已知功率的白噪必然降低谐噪比,且 10 dB SNR 必须比 20 dB 掉得更多。⇒ 尺子的符号与单调性都被钉住。"
+    },
+    {
+      "id": "f0-neg",
+      "ruler": "f0_error",
+      "arm": "arm_raw.wav vs arm_raw.wav @ ratio 2^(6/12)",
+      "expect": {"median_cents": [-620.0, -580.0]},
+      "why_incontestable": "拿没移调的音频去比『应当上移 6 半音』的期望,误差必然恰好是 −600 cents。⇒ 这条同时证明 f0 尺的符号是对的。"
+    }
+  ],
+
+  "fingerprints": {
+    "_what": "本工装 2026-08-14 在上面那组夹具上量出的数。⛔ 它们不是真值:它们只回答『尺子/夹具有没有从那天漂开』。与 project_v2_session145 §A3 的公开表逐位相同。",
+    "tolerance": {"envelope_st": 0.15, "peak_corr": 0.01, "flux_db": 0.5, "hnr_db": 0.3},
+    "arms": {
+      "arm_raw.wav":   {"envelope_shift_st": 0.00, "peak_corr": 1.000, "flux_median_db": 0.00, "hnr_delta_db": 0.00, "voiced_survival": 1.0000},
+      "arm_k1.wav":    {"envelope_shift_st": 5.50, "peak_corr": 0.951, "flux_median_db": 1.32, "hnr_delta_db": 0.22, "voiced_survival": 1.0000},
+      "arm_k0.wav":    {"envelope_shift_st": 2.40, "peak_corr": 0.961, "flux_median_db": -5.25, "hnr_delta_db": 1.34, "voiced_survival": 0.9873},
+      "arm_world.wav": {"envelope_shift_st": 0.20, "peak_corr": 0.981, "flux_median_db": 1.26, "hnr_delta_db": 0.87, "voiced_survival": 0.9909},
+      "arm_psola.wav": {"envelope_shift_st": 0.30, "peak_corr": 0.983, "flux_median_db": 0.53, "hnr_delta_db": -1.44, "voiced_survival": 0.9457}
+    },
+    "ref_hnr_db": 23.68,
+    "ref_f0_median_hz": 610.0
+  },
+
+  "known_blind_spots": [
+    {
+      "ruler": "transient_flux",
+      "blind_to": "WORLD 塌清塞音(用户两次耳判「つつまれてきれい 的 き」破/失声)",
+      "evidence": "S145 专门造的这把尺子读 WORLD 只 −0.37 dB 中位 / −1.30 dB 峰值,而它对人为抹平能读 −33 dB。逐 note 电平/浊音率上 WORLD 的き反而略高(−12.5 dB/0.93 vs off −13.0/0.80)。",
+      "rule": "⛔ 该轴唯一仪器是耳朵。不许硬编一条看不见它的判据充数。"
+    },
+    {
+      "ruler": "transient_flux",
+      "blind_to": "跨【共振峰策略】比较时读数被混淆",
+      "evidence": "本工装实测:k0 = −5.25 dB 而 k1 = +1.32 dB。κ=0 把共振峰钉在低位 ⇒ 2-11 kHz 的能量本来就更少 ⇒ 通量比自然更低。这不构成『Signalsmith 抹平了瞬态』的证据。",
+      "rule": "⛔ 瞬态尺只在【共振峰策略相同】的两条臂之间有判决力(例如:我们的 PSOLA vs praat 的 PSOLA)。跨策略读它只能当描述,不能当判据。"
+    },
+    {
+      "ruler": "envelope_shift",
+      "blind_to": "OLA 相位不连续 / 重合成的嗡嗡声",
+      "evidence": "PSOLA 由构造保持共振峰 ⇒ 哪怕合成端相位全错,这把尺子照样读 ~0。2026-07 那份坏实现正是这一形状(音高对、共振峰对、HNR 掉 5.15~8.57 dB)。",
+      "rule": "⇒ 必须与 HNR 尺一起读。"
+    },
+    {
+      "ruler": "f0_error",
+      "blind_to": "音色 / 纹理 / 响度 —— 即用户实际抱怨的一切",
+      "evidence": "2026-07-26 的 psola_ab.rs 只量音高,放行了一份 HNR 掉 5-8 dB 的实现,把一个正确的方向关了四个月。",
+      "rule": "⛔ 永远不许单独出现在任何验收里。"
+    },
+    {
+      "ruler": "*",
+      "blind_to": "「哪个更好听」",
+      "evidence": "S145:放宽 dead 判据那条结论只有耳朵没有仪器 ⇒ 塌了;染色那条有仪器 ⇒ 扛住了盲测。",
+      "rule": "凡结论只有耳朵没有仪器,先标【未定】;而凡结论只有仪器没有耳朵,承重之前要过一次盲测。"
+    }
+  ]
+}
