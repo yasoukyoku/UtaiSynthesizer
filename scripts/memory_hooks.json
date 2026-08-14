@@ -138,15 +138,25 @@
       "id": "range-extend",
       "match": [
         "src-tauri/src/inference/vocal_range.rs",
-        "src-tauri/crates/utai-stretch/"
+        "src-tauri/crates/utai-stretch/",
+        "src-tauri/crates/utai-dsp/src/psola.rs",
+        "scripts/range_rulers/"
       ],
-      "headline": "你在动【音域扩展的逆变换】。S145 已经把两个症状都查到根因,别重推;而这条线上有一个正确的方向曾经被我们自己关了四个月。",
+      "headline": "你在动【音域扩展的逆变换】。S145 定的根因、S146 已经把引擎换成 TD-PSOLA 了,别重推;而这条线上有一个正确的方向曾经被我们自己关了四个月。",
       "must_read": [
+        "project_v2_session146.md",
         "project_v2_session145.md",
         "project_v2_range_extend_quality.md",
         "project_v2_session85.md"
       ],
       "hard_rules": [
+        "⭐⭐⭐ S146:**「ratio == 1.0 必须是恒等变换」是这条线上最便宜、最不可能自证的判据**,而它必须打在 `utai_dsp::psola` 内核上 —— `apply_inverse` 在 `shift == 0` 提前 return,打在那里是恒真的空判据。2026-07 删掉的那份实现**在 ratio 1.000 上就掉 5-9 dB HNR**(它自己的注释写着),⇒ 病是「过一遍重合成」的固定税。这条判据在 S146 当场否决了我已经写下去的**三个**设计(独立相位积分的目标脉冲 / 搬运用去 DC 的信号 / 照 praat 那样按相关门限拒绝 mark),每一个都是「看起来对、跑起来红」。",
+        "⛔⛔ S146:**只量【上移】就上线 = 又一次判据够不着症状轴**。`MAX_RANGE_SHIFT = 24` 且 `cover_dead_plan` 会产出 **+22**(音频下移 22 半音)。实测:窗宽若不被源邻距裁短,−12 半音时**输出与输入逐位相同** —— 而包络位移 +0.00 / 峰值相关 1.000 / ΔHNR +0.00 / 浊帧存活 100%,**三把尺子全读「完美」**,只有那把登记成「必要不充分」的 **f0 尺**读出 +1200 cents。⇒ 验收必须双向,且**那把 f0 尺不许拿掉**。",
+        "⛔⛔ S146:**SVC 渲染不是逐位可复现的** —— 同一条 `mg_render_sovits` 命令跑两次逐样本最大差 **1.47**,与「换引擎」这个效应(1.50)同量级。⇒ ⑴ 渲染产物上的**任何逐样本对拍都不成立**(盲测的空白对照必须用**同一个文件的副本**);⑵ 做 A/B 时两条臂要**喂同一个已渲染的 wav**(用 `vocal_range::tests::inverse_probe`),否则耳朵听到的差别里混着模型的随机波动。⚠ 尺子对这条噪声是稳的(离散 0.05 半音 / 0.11 dB),所以仪器结论不受影响。⚠ 仓里早就知道:`mg_cover_deadonly_smoke` 自己就在量 run-to-run noise 并按「噪声底 ×8」定容差。",
+        "⛔ S146:**「与 praat 标记的一致率」是无效代理** —— `absmax` 检测器一致率最高(67%)而 ΔHNR 最差(−5.94)、浊帧只剩 52%。便宜的代理指标在这条线上指反了方向。**只用 `scripts/range_rulers/` 的四把尺子判。**",
+        "⛔ S146:**|shift| > 6 时 praat 不是有效参照**(pitch ceiling 1400 Hz 被撞穿:+12 上它自己读包络 +2.70 / 相关 0.661 / 浊帧 41.1%,比被测者还差)。`arms.py` 里登记了 `PRAAT_USABLE_SHIFT_ST = 6.0`。",
+        "⛔ S146 更正记忆里的一条:**「三处缓存版本成对 bump」不精确** —— `commands/audio.rs` 的 `_s2r` 是**速度滑条**的时间伸缩缓存(key 里只有 time_factor),永远不经过 `apply_inverse`。这条路上**只有两处**:`RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而它们现在由 `src/lib/vocal/rangeAlgoLockstep.test.ts` 机械联锁。",
+        "⚠ S146:**cover/sovits 那条路只做了结构性验证**(接线闸 + 与 cover/rvc 逐字同形的调用),**没有行为验证** —— 仓里本来就没有 sovits 的 cover 冒烟(`mg_cover_deadonly_smoke` 是 RVC-only)。要动 cover 侧的执行层之前,先把这条欠账补上。",
         "⛔⛔ 染色的根因**已定**(S145,四路收敛):Signalsmith 的「包络」不是真包络,是对原始能量谱做的**形态学闭运算**,衰减常数 `decay = 1 - 1/(freqEstimate*0.5+1)`(`signalsmith-stretch.h:985`),而 `freqEstimate` **全文件只有这一个使用点**、由 `setFormantBase` 唯一决定 ⇒ **平滑宽度 ∝ 我们喂的 base f0** ⇒ **f0 越高「包络」越粗、`E(f)/E(f·M)` 越接近 1、补偿退化成恒等**。剂量曲线(MIDI 64→85)= 残余 **+0.30 → +4.70 半音**;真素材上现行漏 **+2.40**,praat TD-PSOLA 只漏 **+0.30**。**别再去查 κ 或 base track —— 那两条都已被证伪**(κ=0 确实完全钉住;base 喂的确实是移调后的 f0,`vocal_range.rs:636` 有明写契约)。",
         "⛔⛔ **「我们试过 X,X 输了」必须先问:输的是【算法】还是【我们的实现】。** 2026-07-26 删掉 psola.rs 的理由是「PSOLA 脏」,而 S145 实测 **praat 的 TD-PSOLA 是本轮胜者**;仓里早就记着「praat 透明(ΔHNR −0.12~+2.68 dB),**我们旧 Rust 实现掉 5.15~8.57 dB = 实现缺陷非算法固有**」。守它的 `psola_ab.rs` **只量音高** ⇒ 实现缺陷结构上溜过去,**一个正确的方向被关了四个月**。⇒ **写 PSOLA 之前先做尺子和 praat 参照臂**(队列 §E13 笔 0)。",
         "⛔⛔ `apply_inverse` 是 **score / cover / audition 三消费者的单一执行点** —— S85 血训「为 A 修 ≠ 对 B 无害」,**逐路径分别做行为验证,一个不落**。",
