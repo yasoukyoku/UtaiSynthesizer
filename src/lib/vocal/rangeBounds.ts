@@ -46,7 +46,13 @@ export function clampBounds(sp: SpeakerRangeRecord, usable: Bounds, comfort: Bou
     else if (hi + (MIN_COMFORT_SPAN - (hi - lo)) <= aHi) hi = lo + MIN_COMFORT_SPAN;
     else lo = hi - MIN_COMFORT_SPAN;
   }
-  return { usable: [lo, hi], comfort: clampComfort([lo, hi], [Math.round(comfort[0]), Math.round(comfort[1])]) };
+  // ⛔ S146f: comfort is clamped into the SCAN's band, **not** into the edited `usable`.
+  // The old clamp had a concrete cost the user hit: dragging the ceiling to 74 silently pulled
+  // their comfort from 79 down to 74, after which no landing could ever reach it and the knob
+  // stopped doing anything (every rescue logged the fallback). The two knobs are orthogonal now
+  // — `usable` says WHICH notes to rescue, `comfort` says WHERE they land — so neither may move
+  // the other. The backend agrees (validate_range_record bounds comfort by usable_auto ∪ usable).
+  return { usable: [lo, hi], comfort: clampComfort([aLo, aHi], [Math.round(comfort[0]), Math.round(comfort[1])]) };
 }
 
 /** 构造一次 `set_model_vocal_range` 的完整 speaker 记录。

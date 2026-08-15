@@ -18,23 +18,26 @@ function rec(over: Partial<SpeakerRangeRecord> = {}): SpeakerRangeRecord {
   } as SpeakerRangeRecord;
 }
 
-describe("后端那道闸(comfort ⊆ usable)永远满足", () => {
-  // ⛔ 这一族存在的理由:validate_range_record 违反时抛 RANGE_INVALID,而那条错误今天在
-  // UI 上完全不可见(无 catch、无文案)⇒ 用户看到的是一次静默失败。
-  it("收窄可用上界会把舒适区一起拖进来", () => {
-    const e = clampBounds(rec(), [36, 60], [36, 79]);
+describe("后端那道闸(comfort ⊆ 扫描量出来的可用域)永远满足", () => {
+  // ⛔ S146f:这道闸从「comfort ⊆ usable」改成了「comfort ⊆ usable_auto ∪ usable」。
+  // 改口的理由是一次真实退化:用户把可用上限拖到 74,旧夹取**把他的 comfort 从 79 一起
+  // 拖到 74**,此后没有任何落点够得着它 ⇒ 那个旋钮悄悄不做事了(每一组都在打回退行)。
+  // 拆分之后两者正交:usable 说「哪些音要救」,comfort 说「落点去哪」,谁也不许动谁。
+  it("⭐ 收窄可用上界【不再】把舒适区一起拖下去", () => {
+    const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
+    const e = clampBounds(sp, [36, 60], [36, 79]);
     expect(e.usable).toEqual([36, 60]);
-    expect(e.comfort[1]).toBeLessThanOrEqual(60);
-    expect(e.comfort[0]).toBeGreaterThanOrEqual(36);
+    expect(e.comfort).toEqual([36, 79]);
   });
 
-  it("抬高可用下界也一样", () => {
-    const e = clampBounds(rec(), [60, 80], [36, 79]);
-    expect(e.comfort[0]).toBeGreaterThanOrEqual(60);
+  it("抬高可用下界同样不动舒适区", () => {
+    const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
+    expect(clampBounds(sp, [60, 80], [36, 79]).comfort).toEqual([36, 79]);
   });
 
-  it("穷举:任何一对提议都产出后端收得下的形状", () => {
-    const sp = rec();
+  it("穷举:任何一对提议都产出后端收得下的形状(comfort ⊆ 扫描带)", () => {
+    const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
+    const [aLo, aHi] = autoUsable(sp);
     for (let ul = 20; ul <= 100; ul += 7)
       for (let uh = 20; uh <= 100; uh += 11)
         for (let cl = 20; cl <= 100; cl += 13)
@@ -42,16 +45,26 @@ describe("后端那道闸(comfort ⊆ usable)永远满足", () => {
             const e = clampBounds(sp, [ul, uh], [cl, ch]);
             expect(e.usable[0]).toBeLessThanOrEqual(e.usable[1]);
             expect(e.comfort[0]).toBeLessThanOrEqual(e.comfort[1]);
-            expect(e.comfort[0]).toBeGreaterThanOrEqual(e.usable[0]);
-            expect(e.comfort[1]).toBeLessThanOrEqual(e.usable[1]);
+            expect(e.comfort[0]).toBeGreaterThanOrEqual(aLo);
+            expect(e.comfort[1]).toBeLessThanOrEqual(aHi);
+            expect(e.usable[0]).toBeGreaterThanOrEqual(aLo);
+            expect(e.usable[1]).toBeLessThanOrEqual(aHi);
           }
   });
 
-  it("退化的可用域被撑到放得下一个合法舒适区,而不是产出逃出去的 comfort", () => {
-    const e = clampBounds(rec(), [70, 70], [36, 79]);
+  it("退化的可用域被撑到最小跨度,而舒适区不受牵连", () => {
+    const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
+    const e = clampBounds(sp, [70, 70], [36, 79]);
     expect(e.usable[1] - e.usable[0]).toBeGreaterThanOrEqual(MIN_COMFORT_SPAN);
-    expect(e.comfort[0]).toBeGreaterThanOrEqual(e.usable[0]);
-    expect(e.comfort[1]).toBeLessThanOrEqual(e.usable[1]);
+    expect(e.comfort).toEqual([36, 79]);
+  });
+
+  it("舒适区可以【高于】救援线 —— 这正是拆分之后要允许的组合", () => {
+    // 「74 以上的音都救,但落点别高过 79」是一句合法且有用的话。
+    const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
+    const e = clampBounds(sp, [36, 74], [36, 79]);
+    expect(e.usable[1]).toBe(74);
+    expect(e.comfort[1]).toBe(79);
   });
 });
 
@@ -80,7 +93,7 @@ describe("落盘载荷", () => {
   it("两个边界在同一份载荷里,而且顺带补上 usable_auto", () => {
     const p = boundsPayload(rec(), [36, 60], [36, 79]) as SpeakerRangeRecord & { usable_auto: [number, number] };
     expect(p.usable).toEqual([36, 60]);
-    expect(p.comfort[1]).toBeLessThanOrEqual(60);
+    expect(p.comfort).toEqual([36, 79]); // S146f: 不再被 usable 拖走
     expect(p.usable_auto).toEqual([36, 80]);
   });
 

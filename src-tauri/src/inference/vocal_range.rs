@@ -93,6 +93,12 @@ pub struct SpeakerRange {
     /// monotone: lowering it only ADDS rescues, it never makes an existing one worse.
     /// ⇒ 用户 2026-08-15 拍板:「可用上限」只管「哪些音要救」。
     pub reach: (f32, f32),
+    /// S146f: the user deliberately moved `comfort` (it is neither `comfort_auto` nor
+    /// `comfort_auto` clamped into `usable`). Only then may the landing search spend depth to
+    /// honour it — the escape hatch for "the record says 78 is fine and it is not".
+    /// ⛔ Gating on this is not politeness: without it, yuyuko's untouched comfort would move
+    /// its real rescues from −3/−1 to −7/−5/−4, a four-semitone recolour nobody has heard.
+    pub comfort_explicit: bool,
     /// S81 (E): per-semitone damage derived from the record's RAW scan, MIDI 36..=96,
     /// quantized 0..DAMAGE_MAX. `None` = the record predates the scan (or carries none) — the
     /// decision then falls back to the pre-S81 four-step usable/comfort ladder verbatim.
@@ -123,7 +129,7 @@ const RMS_FREE_DB: f64 = -6.0;
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
-        Self { usable, comfort, reach: usable, damage: None, slot_flags: None }
+        Self { usable, comfort, reach: usable, comfort_explicit: false, damage: None, slot_flags: None }
     }
 
     /// S85 dead-only: can the model produce a pitch AT ALL at this (integer) MIDI slot?
@@ -287,10 +293,36 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
     if usable.1 - usable.0 < MIN_COMFORT_SPAN {
         return None;
     }
+    // S146f: comfort is bounded by `reach`, NOT by the user's `usable`. Before the split those
+    // were the same number and "the landing band lives inside the usable band" was right; after
+    // it, `usable` is a score-side rescue line while comfort describes LANDINGS, which `reach`
+    // governs. Keeping the old bound had a concrete cost: narrowing the ceiling to 74 dragged
+    // the user's comfort from 79 down to 74 (the UI clamp), after which no landing could ever
+    // reach it and the knob silently stopped doing anything — every group logged the fallback.
     let comfort = [pair("comfort"), pair("comfort_auto"), Some(usable)]
         .into_iter()
         .flatten()
-        .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= usable.0 && c.1 <= usable.1)?;
+        .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= reach.0 && c.1 <= reach.1)?;
+    // S146f: did the user actually MOVE comfort, or is this just the auto value (possibly
+    // dragged down by the old clamp)? Only a deliberate edit may spend extra depth to be
+    // honoured — see `minimal_rescue_shift`.
+    //
+    // ⛔ The comparison is against comfort_auto **clamped into `usable`**, which is precisely the
+    // inverse of the operation that produced the artefact: akiko on disk reads comfort [36,74]
+    // / comfort_auto [36,79] / usable [36,74] purely because the editor clamped it, and treating
+    // that as intent would move the user's own rescues from −2/−5/−7 to −4/−6/−9/−11.
+    // Measured on the eight installed records: with this gate, 8/8 decide exactly as today;
+    // without it, akiko AND yuyuko both move (yuyuko −3/−1 → −7/−5/−4, unheard by anyone).
+    //
+    // ⚠ No `comfort_auto` column ⇒ NOT explicit. Intent is undecidable there (the record predates
+    // S60d), and the conservative reading is the one that cannot spend depth nobody asked for.
+    let comfort_explicit = match (pair("comfort"), pair("comfort_auto")) {
+        (Some(c), Some(auto)) => {
+            let dragged = (auto.0.max(usable.0), auto.1.min(usable.1));
+            c != auto && c != dragged
+        }
+        _ => false,
+    };
     // S81 (E): fold the raw per-semitone scan into a damage curve. Absent/garbage scan ⇒ None
     // ⇒ every consumer falls back to the pre-S81 ladder (old records keep working untouched).
     // S85: the same pass derives per-slot f0-axes flags for the score dead-only plan.
@@ -380,7 +412,7 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         }
     }
     let slot_flags = damage.is_some().then_some(flags);
-    Some(SpeakerRange { usable, comfort, reach, damage, slot_flags })
+    Some(SpeakerRange { usable, comfort, reach, comfort_explicit, damage, slot_flags })
 }
 
 /// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
@@ -399,7 +431,13 @@ pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
         };
         let (u_lo, u_hi) = pair("usable").ok_or("RANGE_INVALID")?;
         let (c_lo, c_hi) = pair("comfort").ok_or("RANGE_INVALID")?;
-        if !(u_lo <= u_hi && c_lo <= c_hi && c_lo >= u_lo && c_hi <= u_hi) {
+        // S146f: comfort is bounded by the SCAN's band (`usable_auto` ∪ `usable`), not by the
+        // user's rescue line. `usable` narrows to say "rescue more notes"; landings are governed
+        // by what the model can voice, so a comfort target above the rescue line is a legal and
+        // useful thing to ask for ("land no higher than 79 even though I want 74+ rescued").
+        // Records written before S146e carry no `usable_auto`, so this stays the old check there.
+        let (r_lo, r_hi) = pair("usable_auto").map_or((u_lo, u_hi), |(a, b)| (a.min(u_lo), b.max(u_hi)));
+        if !(u_lo <= u_hi && c_lo <= c_hi && c_lo >= r_lo && c_hi <= r_hi) {
             return Err("RANGE_INVALID".to_string());
         }
     }
@@ -550,7 +588,41 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
     // Sovits4.1东雪莲主模型 (15 slots at low_ratio > 0.7 scattered over 53-79) the unbounded rule
     // picks −10..−24 where it used to pick −6/−4 — and a −24 whole-song recolour is the exact
     // outcome the user identified by ear as a catastrophe (S85b, dev log A/B 23:24 vs 23:44).
-    let shallowest = qualifying.iter().copied().min_by_key(|s| s.abs())?;
+    // S146f, the escape hatch. The user asked: 「如果我们的算法误判了 比如它移调到 78 附近效果
+    // 并不好 用户还是想往下压 那岂不是彻底没办法了」— and after the S146f split they were right,
+    // nothing expressed that any more. A DELIBERATELY moved comfort is that control: the search
+    // may spend whatever depth reaching it costs, instead of only ±LANDING_MAX_EXTRA_DEPTH.
+    //
+    // Two things keep this from becoming the catastrophe S146c-hotfix removed:
+    //   * it needs an explicit edit (`comfort_explicit`) — an untouched record behaves as today;
+    //   * it still DEGRADES rather than vetoes: an unreachable band falls through to the normal
+    //     budget below, audited, instead of refusing to rescue (东雪莲's [36,52] against a
+    //     phrase at 75-85 would otherwise take it from 10 groups rescued to 0).
+    // Sweep on the user's own song (akiko, usable 74): comfort 79/78 → −1/−2/−5/−7 (today's
+    // answer), 77 → −1/−3/−6/−8, 76 → −1/−2/−4/−7/−9, 74 → −1/−4/−6/−9/−11. Monotone and
+    // legible — which is the whole point of putting it on a slider the user can see.
+    let anchor: Option<i64> = if range.comfort_explicit {
+        let reachable: Vec<i64> = qualifying
+            .iter()
+            .copied()
+            .filter(|&s| dead.iter().all(|&p| range.slot_landing_preferred(p + s)))
+            .collect();
+        if reachable.is_empty() {
+            tracing::info!(
+                "range: dead {:?} cannot reach the comfort band [{:.0},{:.0}] the user set at any \
+                 depth — falling back to the normal budget",
+                dead,
+                range.comfort.0,
+                range.comfort.1
+            );
+            None
+        } else {
+            reachable.into_iter().min_by_key(|s| s.abs())
+        }
+    } else {
+        None
+    };
+    let shallowest = anchor.or_else(|| qualifying.iter().copied().min_by_key(|s| s.abs()))?;
     let mut pool: Vec<i64> = qualifying
         .into_iter()
         .filter(|s| s.abs() <= shallowest.abs() + LANDING_MAX_EXTRA_DEPTH)
@@ -1679,6 +1751,124 @@ mod tests {
         .expect("record")
     }
 
+    /// akiko's record with an explicitly chosen comfort band (comfort ≠ comfort_auto and ≠
+    /// comfort_auto clamped into usable) — i.e. the user actually dragged the landing ceiling.
+    fn akiko_comfort_target(usable: (i64, i64), comfort: (i64, i64), comfort_auto: (i64, i64)) -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for midi in 60..=84 {
+            let v = match midi {
+                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                _ => serde_json::json!([1, 1, -1.0, 0.25]),
+            };
+            semis.insert(midi.to_string(), v);
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [usable.0, usable.1],
+                "usable_auto": [36, 80],
+                "comfort": [comfort.0, comfort.1],
+                "comfort_auto": [comfort_auto.0, comfort_auto.1],
+                "semitones": semis
+            })),
+            0,
+        )
+        .expect("record")
+    }
+
+    #[test]
+    fn a_deliberately_lowered_comfort_ceiling_pushes_the_landing_down() {
+        // ⭐ S146f, the escape hatch the user asked for: 「如果我们的算法误判了 比如它移调到 78
+        // 附近效果并不好 用户还是想往下压 那岂不是彻底没办法了」. After the usable split, this
+        // is the only control that expresses it — so it has to actually work.
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let dead: Vec<i64> = vec![85, 83, 81];
+
+        let auto = akiko_comfort_target((36, 80), (36, 79), (36, 79));
+        let base = minimal_rescue_shift(&dead, &nn, &auto).expect("a landing exists");
+        assert!(!auto.comfort_explicit, "an untouched comfort must not read as intent");
+
+        let pushed = akiko_comfort_target((36, 80), (36, 74), (36, 79));
+        assert!(pushed.comfort_explicit, "a dragged comfort IS intent");
+        let deeper = minimal_rescue_shift(&dead, &nn, &pushed).expect("a landing exists");
+        assert!(
+            deeper < base,
+            "dragging the landing ceiling 79→74 must go deeper than {base}, got {deeper}"
+        );
+        // …and land where the user asked, not merely "somewhere lower".
+        for p in &dead {
+            assert!(
+                (p + deeper) as f32 <= pushed.comfort.1,
+                "note {p} landed on {}, above the ceiling the user set",
+                p + deeper
+            );
+        }
+    }
+
+    #[test]
+    fn a_comfort_that_only_the_old_clamp_moved_is_not_treated_as_intent() {
+        // ⛔ THE migration trap, measured on the user's own disk: akiko reads comfort [36,74] /
+        // comfort_auto [36,79] / usable [36,74] purely because the pre-S146f editor clamped
+        // comfort into usable. Reading that as "the user wants landings ≤74" moves their real
+        // rescues from −2/−5/−7 to −4/−6/−9/−11 — a version they have already rejected by ear.
+        let artefact = akiko_comfort_target((36, 74), (36, 74), (36, 79));
+        assert!(
+            !artefact.comfort_explicit,
+            "comfort == comfort_auto clamped into usable is the clamp's doing, not the user's"
+        );
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let dead: Vec<i64> = vec![85, 83, 81];
+        let untouched = akiko_comfort_target((36, 74), (36, 79), (36, 79));
+        assert_eq!(
+            minimal_rescue_shift(&dead, &nn, &artefact),
+            minimal_rescue_shift(&dead, &nn, &untouched),
+            "the clamp artefact must decide exactly as an untouched record does"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_explicit_comfort_still_degrades_instead_of_refusing() {
+        // 东雪莲's shape again, now as an explicit edit: no depth within ±MAX_RANGE_SHIFT can put
+        // a 75-85 phrase inside [36,52] while keeping every note voiceable. It must fall back to
+        // the normal budget, not stop rescuing.
+        let nope = akiko_comfort_target((36, 80), (36, 52), (36, 79));
+        assert!(nope.comfort_explicit);
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let dead: Vec<i64> = vec![85, 83, 81];
+        assert!(
+            minimal_rescue_shift(&dead, &nn, &nope).is_some(),
+            "an out-of-reach explicit comfort must degrade, never turn the rescue off"
+        );
+    }
+
+    #[test]
+    fn comfort_may_sit_above_the_users_rescue_line() {
+        // "rescue everything above 74, but never land higher than 79" is a legal sentence now
+        // that the two knobs are orthogonal. Before S146f the read side healed it away.
+        let r = akiko_comfort_target((36, 74), (36, 79), (36, 76));
+        assert_eq!(r.comfort, (36.0, 79.0), "comfort above usable must survive the read side");
+        assert_eq!(r.usable, (36.0, 74.0));
+    }
+
+    #[test]
+    fn the_write_gate_accepts_comfort_above_usable_but_never_outside_the_scan() {
+        let ok = serde_json::json!({"speakers": {"0": {
+            "usable": [36, 74], "usable_auto": [36, 80], "comfort": [36, 79]
+        }}});
+        assert!(validate_range_record(&ok).is_ok(), "comfort above the rescue line is legal");
+        let outside = serde_json::json!({"speakers": {"0": {
+            "usable": [36, 74], "usable_auto": [36, 80], "comfort": [36, 88]
+        }}});
+        assert!(validate_range_record(&outside).is_err(), "…but not above the scan");
+        // A pre-S146e record (no usable_auto) keeps the old, stricter check verbatim.
+        let legacy = serde_json::json!({"speakers": {"0": {
+            "usable": [36, 74], "comfort": [36, 79]
+        }}});
+        assert!(validate_range_record(&legacy).is_err(), "no scan column ⇒ old bound");
+    }
+
     #[test]
     fn the_onset_probe_vetoes_a_landing_the_model_can_pitch_but_cannot_voice() {
         // ⛔ THE counterexample, measured off the user's own disk: akiko's 「か」 probe at MIDI 80
@@ -1916,6 +2106,9 @@ mod tests {
         let dead: Vec<i64> = vec![80];
         let r = akiko_like_with((36, 78), (36, 72));
 
+        // ⚠ S146f: this fixture carries no `comfort_auto`, so the record reads as NOT explicit —
+        // which is the path this test is about (the automatic preference, bounded by the depth
+        // budget). The deliberate-edit path is `a_deliberately_lowered_comfort_ceiling_...`.
         // ⛔ The positive control the first version of this test lacked, which made it vacuous:
         // with comfort at 66 no QUALIFYING shift could reach comfort at all (70 would fall out of
         // the scanned band), so the rejected implementation and this one agreed and the mutation

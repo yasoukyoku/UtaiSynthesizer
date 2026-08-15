@@ -14,9 +14,11 @@ import type { VoiceType } from "../../store/voice-models";
  *     undo** ⇒ 直接复用它,拖一次滑条 = 几十次磁盘写 + 几十次 `fetchModels()` 全量重扫,
  *     外加 undo 栈里一串什么都撤销不了的空事务。
  *
- *  ⒝ **两个边界一次写完**(`setVocalRangeBounds`)。后端 `validate_range_record` 要求
- *     comfort ⊆ usable;收窄 usable 时若 comfort 还在外面就是 `RANGE_INVALID`,而那条
- *     错误今天在 UI 上完全不可见。
+ *  ⒝ **两个边界一次写完**(`setVocalRangeBounds`)。后端 `validate_range_record` 会拒绝
+ *     逃出扫描带的组合(`RANGE_INVALID`),而那条错误今天在 UI 上完全不可见。
+ *     ⛔ S146f 起两个旋钮**正交**:`usable` 说「哪些音要救」,`comfort` 说「落点去哪」,
+ *     comfort 由**扫描带**约束而不是由 usable 约束,谁也不许动谁 —— 旧夹取把用户的
+ *     comfort 从 79 跟着拖到 74,此后落点永远够不着它,那个旋钮就悄悄不做事了。
  *
  *  ⒞ **必须写出歌手名**。侧栏拿的是 `governingSpeakerId`(spk_mix 里权重最大的那位),
  *     用户从没显式选过它 —— 不标注就是无声地改错人。
@@ -86,16 +88,16 @@ export function RangeBoundsEditor({
       <ParamSlider
         label={t18({ zh: "舒适下限", en: "Comfort low", ja: "快適域 下限" }, lang)}
         title={t18({
-          zh: "渲染实际瞄准的区间。被救的音会优先落在这里面——但只在既定的移调深度之内,它不会为了够到舒适区而把整段拉得更低。",
-          en: "The zone the render aims at. Rescued notes prefer to land inside it — but only within the existing shift-depth budget; it will not dive deeper just to reach comfort.",
-          ja: "レンダリングが実際に狙う範囲。救済された音は優先的にこの中へ着地しますが、既定の移調深度の範囲内に限られ、快適域に届かせるために更に深く下げることはありません。",
+          zh: "被救的音落在哪里。你**主动**改过它之后,它就是硬目标——算法判某个落点没问题而你听着不行时,把上限往下拖,救援就会落得更低(够不着则退回自动落点,日志里会说)。没动过时它只是个偏好。",
+          en: "Where rescued notes land. Once YOU move it, it becomes a hard target — when the algorithm calls a landing fine and your ears disagree, drag the ceiling down and rescues follow (unreachable ⇒ it falls back to the automatic landing, and says so in the log). Untouched, it is only a preference.",
+          ja: "救済された音の着地先。ユーザーが自分で動かすと硬い目標になります——アルゴリズムが問題ないと判定した着地先が耳に合わないときは上限を下げれば救済もそれに従います(届かない場合は自動の着地先に戻り、ログに記録されます)。動かしていなければ単なる優先指定です。",
         }, lang)}
-        min={preview.usable[0]} max={preview.usable[1]} step={1} value={preview.comfort[0]}
+        min={auto.usable[0]} max={auto.usable[1]} step={1} value={preview.comfort[0]}
         onChange={(v) => setCLo(v)} format={midiName}
       />
       <ParamSlider
         label={t18({ zh: "舒适上限", en: "Comfort high", ja: "快適域 上限" }, lang)}
-        min={preview.usable[0]} max={preview.usable[1]} step={1} value={preview.comfort[1]}
+        min={auto.usable[0]} max={auto.usable[1]} step={1} value={preview.comfort[1]}
         onChange={(v) => setCHi(v)} format={midiName}
       />
       <div className="rbe-actions">
