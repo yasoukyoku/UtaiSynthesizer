@@ -23,14 +23,14 @@ describe("后端那道闸(comfort ⊆ 扫描量出来的可用域)永远满足",
   // 改口的理由是一次真实退化:用户把可用上限拖到 74,旧夹取**把他的 comfort 从 79 一起
   // 拖到 74**,此后没有任何落点够得着它 ⇒ 那个旋钮悄悄不做事了(每一组都在打回退行)。
   // 拆分之后两者正交:usable 说「哪些音要救」,comfort 说「落点去哪」,谁也不许动谁。
-  it("⭐ 收窄可用上界【不再】把舒适区一起拖下去", () => {
+  it("⭐ 收窄可用上界【不再】把目标范围一起拖下去", () => {
     const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
     const e = clampBounds(sp, [36, 60], [36, 79]);
     expect(e.usable).toEqual([36, 60]);
     expect(e.comfort).toEqual([36, 79]);
   });
 
-  it("抬高可用下界同样不动舒适区", () => {
+  it("抬高可用下界同样不动目标范围", () => {
     const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
     expect(clampBounds(sp, [60, 80], [36, 79]).comfort).toEqual([36, 79]);
   });
@@ -52,14 +52,14 @@ describe("后端那道闸(comfort ⊆ 扫描量出来的可用域)永远满足",
           }
   });
 
-  it("退化的可用域被撑到最小跨度,而舒适区不受牵连", () => {
+  it("退化的可用范围被撑到最小跨度,而目标范围不受牵连", () => {
     const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
     const e = clampBounds(sp, [70, 70], [36, 79]);
     expect(e.usable[1] - e.usable[0]).toBeGreaterThanOrEqual(MIN_COMFORT_SPAN);
     expect(e.comfort).toEqual([36, 79]);
   });
 
-  it("舒适区可以【高于】救援线 —— 这正是拆分之后要允许的组合", () => {
+  it("目标范围可以【高于】救援线 —— 这正是拆分之后要允许的组合", () => {
     // 「74 以上的音都救,但落点别高过 79」是一句合法且有用的话。
     const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
     const e = clampBounds(sp, [36, 74], [36, 79]);
@@ -126,7 +126,7 @@ describe("「已被手动改过」的判定", () => {
     expect(boundsAreEdited(boundsPayload(rec(), [36, 60], [36, 58]))).toBe(true);
   });
 
-  it("只动舒适区也算改过", () => {
+  it("只动目标范围也算改过", () => {
     expect(boundsAreEdited(boundsPayload(rec(), [36, 80], [50, 70]))).toBe(true);
   });
 

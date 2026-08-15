@@ -1361,30 +1361,30 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
       <span
         className="rm-range-text"
         title={t18({
-          zh: `舒适区 = 渲染实际瞄准的区间（音准 + 浊音 + 音色三项达标）。可用区 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} 只表示"还出得了声"，其上沿通常已经很勉强。`,
-          en: `Comfort is the zone the render actually targets (pitch + voicing + timbre all pass). Usable ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} only means "still makes a pitched sound"; its top edge is typically already strained.`,
-          ja: `快適域＝レンダリングが実際に狙う範囲（音程・有声・音色の三項目を満たす）。使用可能域 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} は「まだ声が出る」だけで、その上端はたいてい既に苦しい。`,
+          zh: `目标范围 = 被救的音落在哪里。初值由扫描给出（音准 + 浊音 + 音色三项达标的区间），之后以你设的为准。可用范围 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} 决定哪些音要救，其上沿通常已经很勉强。`,
+          en: `Target is where rescued notes land (seeded by the scan — pitch + voicing + timbre all pass — and yours to override). Usable ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} decides WHICH notes get rescued; its top edge is typically already strained.`,
+          ja: `目標範囲＝救済された音の着地先。初期値は測定値（音程・有声・音色の三項目を満たす範囲）で、以後はユーザー設定が優先されます。使用可能域 ${midiName(sp.usable[0])}–${midiName(sp.usable[1])} はどの音を救済するかを決めます。`,
         }, lang)}
       >
         {/* S81: the headline is COMFORT. Leading with `usable` advertised a range whose top few
             semitones measurably sing badly — the number the user reads should be the one the
             render aims at. Usable stays available in the tooltip. */}
-        {t18({ zh: "舒适区", en: "Comfort", ja: "快適域" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
+        {t18({ zh: "目标范围", en: "Target", ja: "目標範囲" }, lang)} {midiName(shown![0])}–{midiName(shown![1])}
       </span>
       {stale && (
         <span
           className="rm-range-missing"
           title={t18({
-            zh: "这条记录是在加入音色检测之前测的，仍然可用；重测一次会让舒适区更准。",
-            en: "This record predates the timbre measurement. It still works; re-testing makes the comfort zone more accurate.",
-            ja: "この記録は音色測定の追加前に取得されたものです。引き続き使用できますが、再測定すると快適域がより正確になります。",
+            zh: "这条记录是在加入音色检测之前测的，仍然可用；重测一次会让目标范围更准。",
+            en: "This record predates the timbre measurement. It still works; re-testing makes the target range more accurate.",
+            ja: "この記録は音色測定の追加前に取得されたものです。引き続き使用できますが、再測定すると目標範囲がより正確になります。",
           }, lang)}
         >
           {t18({ zh: "建议重测", en: "re-test suggested", ja: "再測定推奨" }, lang)}
         </span>
       )}
       {editing ? (
-        // S146e: 四个滑条(可用域 + 舒适区)现在都在共用编辑器里 —— 人声侧栏挂的是**同一个**
+        // S146e: 四个滑条(可用范围 + 目标范围)现在都在共用编辑器里 —— 人声侧栏挂的是**同一个**
         // 组件。⛔ 别在这里重写一份:两个入口的夹取规则一旦分叉,一边写出去的记录另一边
         // 读起来就是错的,而这条 UI 线**零渲染测试**接得住。
         <span className="rm-range-edit">
@@ -1402,7 +1402,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
         <>
           <button
             className="rm-range-btn"
-            title={t18({ zh: "调整可用域与舒适区（MIDI 音号）", en: "Adjust the usable and comfort bounds (MIDI numbers)", ja: "使用可能域と快適域を調整（MIDI 番号）" }, lang)}
+            title={t18({ zh: "调整可用范围与目标范围（MIDI 音号）", en: "Adjust the usable and target ranges (MIDI numbers)", ja: "使用可能域と目標範囲を調整（MIDI 番号）" }, lang)}
             onClick={() => setEditing(true)}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}

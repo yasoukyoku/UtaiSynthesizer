@@ -5,7 +5,11 @@ import { autoBounds, boundsAreEdited, clampBounds } from "../../lib/vocal/rangeB
 import { effectiveComfort, midiName, setVocalRangeBounds, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import type { VoiceType } from "../../store/voice-models";
 
-/** S146e —— 「可用域 / 舒适区」编辑器,资源管理器与人声侧栏**共用这一份**。
+/** S146e —— 「可用范围 / 目标范围」编辑器,资源管理器与人声侧栏**共用这一份**。
+ *
+ *  ⭐ S146f 术语:磁盘键名仍是 `usable` / `comfort`(改键名会作废所有现存记录),但 UI 上
+ *  叫「可用范围」与「目标范围」。「舒适区」这个旧词是**误导**的 —— 它听起来是描述性的
+ *  (模型哪儿舒服),而它已经是**指令性**的:被救的音落在哪里,以用户设的为准。
  *
  *  ⛔ 三条形状是从 S146e 侦察量出来的坑,别改回去:
  *
@@ -86,17 +90,17 @@ export function RangeBoundsEditor({
         onChange={(v) => setUHi(v)} format={midiName}
       />
       <ParamSlider
-        label={t18({ zh: "舒适下限", en: "Comfort low", ja: "快適域 下限" }, lang)}
+        label={t18({ zh: "目标下限", en: "Target low", ja: "目標範囲 下限" }, lang)}
         title={t18({
-          zh: "被救的音落在哪里。你**主动**改过它之后,它就是硬目标——算法判某个落点没问题而你听着不行时,把上限往下拖,救援就会落得更低(够不着则退回自动落点,日志里会说)。没动过时它只是个偏好。",
-          en: "Where rescued notes land. Once YOU move it, it becomes a hard target — when the algorithm calls a landing fine and your ears disagree, drag the ceiling down and rescues follow (unreachable ⇒ it falls back to the automatic landing, and says so in the log). Untouched, it is only a preference.",
-          ja: "救済された音の着地先。ユーザーが自分で動かすと硬い目標になります——アルゴリズムが問題ないと判定した着地先が耳に合わないときは上限を下げれば救済もそれに従います(届かない場合は自動の着地先に戻り、ログに記録されます)。動かしていなければ単なる優先指定です。",
+          zh: "被救的音落在这个范围里。算法判某个落点没问题而你听着不行时,把上限往下拖,救援就会落得更低——这里写的永远说了算。够不着则退回自动落点,日志里会说。「还原」回到扫描量出来的值。",
+          en: "Rescued notes land inside this range — what you set here is always obeyed. When the algorithm calls a landing fine and your ears disagree, drag the ceiling down and the rescues follow. Out of reach ⇒ it falls back to the automatic landing and says so in the log. Reset returns it to the scanned value.",
+          ja: "救済された音はこの範囲に着地します——ここで指定した値が常に優先されます。アルゴリズムが問題ないと判定した着地先が耳に合わないときは上限を下げれば救済もそれに従います。届かない場合は自動の着地先に戻り、ログに記録されます。「リセット」で測定値に戻ります。",
         }, lang)}
         min={auto.usable[0]} max={auto.usable[1]} step={1} value={preview.comfort[0]}
         onChange={(v) => setCLo(v)} format={midiName}
       />
       <ParamSlider
-        label={t18({ zh: "舒适上限", en: "Comfort high", ja: "快適域 上限" }, lang)}
+        label={t18({ zh: "目标上限", en: "Target high", ja: "目標範囲 上限" }, lang)}
         min={auto.usable[0]} max={auto.usable[1]} step={1} value={preview.comfort[1]}
         onChange={(v) => setCHi(v)} format={midiName}
       />

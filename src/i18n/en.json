@@ -41,7 +41,7 @@
   "rangeTest": {
     "busy": "A render is in flight — try the range test later",
     "noUsable": "Range test found no usable zone — the model may be undertrained",
-    "done": "Range test done, comfort zone",
+    "done": "Range test complete, target",
     "failed": "Range test failed"
   },
   "clipboard": {
@@ -508,7 +508,7 @@
     "dropHint": "Drop here to add as training data",
     "pausePreview": "Pause",
     "loadingPreview": "Loading…",
-    "ckptRangeTip": "Auto range-test result (comfort zone) — auditions transpose the high-skewed clip into this zone and back",
+    "ckptRangeTip": "Automatic range-test result (target range) — training auditions transpose a too-high excerpt into it and back",
     "gateFlagged": "This project is flagged as needing attention — resolve that first.",
     "gateTraining": "A training run is in progress (possibly in another project). Only one can run at a time — wait for it or stop it first.",
     "gateTasks": "A long task is in progress (training / separation / rendering / audition) — wait for it before changing this run.",
@@ -722,12 +722,12 @@
       "vib_easeInMs": "Fade in",
       "vib_easeOutMs": "Fade out",
       "rangeExtend": "Range extend",
-      "rangeExtendTip": "Out-of-comfort phrases render transposed into the singer's comfort zone, then shift back in the audio domain (needs a range record from the Resource Manager; in-range renders are untouched)",
+      "rangeExtendTip": "Phrases the singer cannot voice are rendered transposed into the model's target range, then shifted back in the audio domain (needs a range test in the model manager; phrases inside the range are untouched)",
       "rangeExtendNoRecord": "This singer has no range record yet, so the switch has no effect for now. Run a range test on the model in the Resource Manager and it takes effect automatically.",
       "rangeFormant": "Formant follow",
       "rangeFormantTip": "How much the formants follow the pitch when a range-extended phrase is shifted back: 0 = keep the singer's timbre as sung (default), 1 = follow fully (cartoonish). Only audible on phrases that actually get shifted",
       "rangeBounds": "Adjust range bounds",
-      "rangeBoundsTip": "Usable = the hard bound on what the model can voice (narrow it → range extension fires in more places). Comfort = where rescued notes prefer to land. ⚠ Both belong to the model itself: changes apply to every track using it and are not saved with the project.",
+      "rangeBoundsTip": "Usable = which notes get rescued (narrow it → range extension fires in more places, without deepening the landings you already have). Target = where rescued notes land (what you set is obeyed). ⚠ Both belong to the model itself: changes apply to every track using it and are not saved with the project.",
       "autotune": "Auto pitch tuning",
       "autotuneFollow": "Auto follow",
       "autotuneFollowTip": "Untuned notes are tuned automatically (manual parameters and drawn pitch lines are never touched)",

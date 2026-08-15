@@ -109,9 +109,9 @@ export function RvcNode(props: NodeProps) {
             {voiceHasRangeRecord(selected, governingSpeakerId(speakerId, spkMix)) && (
             <div className="sep-param-row">
               <label title={t18({
-                zh: "超出模型舒适区的乐句先移调到舒适区推理，再在音频域移回（需先在资源管理器测过音域；区间内完全不受影响）",
-                en: "Out-of-comfort phrases infer transposed into the model's comfort zone, then shift back in the audio domain (needs a range record; in-range chunks are untouched)",
-                ja: "快適域を超えるフレーズは快適域に移調して推論し、オーディオ領域で戻します（音域測定が必要。域内には影響しません）",
+                zh: "唱不上去的乐句先移调到模型的目标范围里推理，再在音频域移回（需先在资源管理器测过音域；范围内完全不受影响）",
+                en: "Phrases the model cannot voice infer transposed into its target range, then shift back in the audio domain (needs a range record; in-range chunks are untouched)",
+                ja: "歌えないフレーズはモデルの目標範囲へ移調して推論し、オーディオ領域で戻します（音域測定が必要。範囲内には影響しません）",
               }, lang)}>
                 {t18({ zh: "音域扩展", en: "Range extend", ja: "音域拡張" }, lang)}
               </label>
