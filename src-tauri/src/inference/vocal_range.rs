@@ -296,7 +296,8 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
     let comfort = [pair("comfort"), pair("comfort_auto"), Some(usable)]
         .into_iter()
         .flatten()
-        .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN && c.0 >= reach.0 && c.1 <= reach.1)?;
+        .find(|c| c.1 - c.0 >= MIN_COMFORT_SPAN
+            && band_fits((c.0 as f64, c.1 as f64), (reach.0 as f64, reach.1 as f64)))?;
     // S81 (E): fold the raw per-semitone scan into a damage curve. Absent/garbage scan ⇒ None
     // ⇒ every consumer falls back to the pre-S81 ladder (old records keep working untouched).
     // S85: the same pass derives per-slot f0-axes flags for the score dead-only plan.
@@ -389,6 +390,16 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
     Some(SpeakerRange { usable, comfort, reach, damage, slot_flags })
 }
 
+/// 一个区间在参照系里站不站得住 —— **读侧愈合与写侧闸共用的唯一判据**。
+///
+/// ⛔ `within` 永远是 `reach`(扫描量出来的带),不是用户的 `usable`:S146f 起两个边界正交,
+/// `usable` 说「哪些音要救」而目标范围说「落点去哪」,后者归扫描管。把这条写成两份的代价
+/// 已经兑现过一次 —— 前端那份镜像(`rangeBounds.ts::fitsIn`)当时漏改,用户存进去 79、
+/// 读回来 74。⚠ 那份镜像仍然存在(前端要在写盘前预览后端会不会收),改这条**必须两边一起改**。
+fn band_fits(band: (f64, f64), within: (f64, f64)) -> bool {
+    band.0 <= band.1 && band.0 >= within.0 && band.1 <= within.1
+}
+
 /// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
 /// Rejects shapes no honest tester or clamped UI could produce (unordered bounds, comfort
 /// escaping usable). Deliberately does NOT enforce MIN_COMFORT_SPAN — a narrow auto-test
@@ -411,7 +422,7 @@ pub fn validate_range_record(record: &serde_json::Value) -> Result<(), String> {
         // useful thing to ask for ("land no higher than 79 even though I want 74+ rescued").
         // Records written before S146e carry no `usable_auto`, so this stays the old check there.
         let (r_lo, r_hi) = pair("usable_auto").map_or((u_lo, u_hi), |(a, b)| (a.min(u_lo), b.max(u_hi)));
-        if !(u_lo <= u_hi && c_lo <= c_hi && c_lo >= r_lo && c_hi <= r_hi) {
+        if !(u_lo <= u_hi && band_fits((c_lo, c_hi), (r_lo, r_hi))) {
             return Err("RANGE_INVALID".to_string());
         }
     }
@@ -1634,49 +1645,86 @@ mod tests {
 
     /// akiko's real record, the shape that matters: damage 0.000 flat up to 78, 0.592 at 79
     /// (low_ratio 0.629 — the last slot before the comfort cliff), saturated at 80+.
-    fn akiko_like() -> SpeakerRange {
-        let mut semis = serde_json::Map::new();
-        for midi in 60..=84 {
-            // [err, voiced, rms_db, low_ratio] — the four columns the damage curve integrates.
-            let v = match midi {
-                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
-                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
-                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
-                79 => serde_json::json!([1, 1, -1.3, 0.629]),
-                _ => serde_json::json!([1, 1, -1.0, 0.25]),
-            };
-            semis.insert(midi.to_string(), v);
-        }
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [36, 80], "comfort": [36, 79], "semitones": semis
-            })),
-            0,
-        )
-        .expect("record")
+    /// ⭐ THE fixture. akiko's real scan — damage 0.000 flat to 78, 0.592 at 79 (the last slot
+    /// before the cliff), saturated at 80+ — with every knob a test might need to move.
+    ///
+    /// ⛔ One builder on purpose. Five near-identical ones is how the `usable_auto` trap got in:
+    /// a fixture that omits it makes `reach == usable`, which turns every S146f split assertion
+    /// into a tautology. Here the column is always written, so that cannot happen silently.
+    struct Rec {
+        usable: (i64, i64),
+        comfort: (i64, i64),
+        comfort_auto: (i64, i64),
+        scan: (i64, i64),
+        /// midi → the onset pass's tuple. Absent map ⇒ no `semitones_onset` key at all.
+        onset: Option<Vec<(i64, serde_json::Value)>>,
     }
 
-    /// `akiko_like()` with the two knobs moved AND the scan's own bounds recorded — i.e. the
-    /// shape every record written since S146e has, and the only shape in which the S146f split
-    /// is observable at all.
-    /// ⛔ A fixture without `usable_auto` makes `reach == usable`, which silently turns every
-    /// split assertion into a tautology. That is why this exists separately.
-    fn akiko_like_edited(usable: (i64, i64), comfort: (i64, i64), auto: (i64, i64)) -> SpeakerRange {
+    impl Default for Rec {
+        fn default() -> Self {
+            Self {
+                usable: (36, 80),
+                comfort: (36, 79),
+                comfort_auto: (36, 79),
+                scan: (36, 80),
+                onset: None,
+            }
+        }
+    }
+
+    impl Rec {
+        fn build(self) -> SpeakerRange {
+            let mut semis = serde_json::Map::new();
+            for midi in 60..=84 {
+                // [err, voiced, rms_db, low_ratio] — the four columns the damage curve integrates.
+                semis.insert(
+                    midi.to_string(),
+                    match midi {
+                        80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                        81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                        82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                        79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                        _ => serde_json::json!([1, 1, -1.0, 0.25]),
+                    },
+                );
+            }
+            let mut sp = serde_json::json!({
+                "usable": [self.usable.0, self.usable.1],
+                "usable_auto": [self.scan.0, self.scan.1],
+                "comfort": [self.comfort.0, self.comfort.1],
+                "comfort_auto": [self.comfort_auto.0, self.comfort_auto.1],
+                "semitones": semis,
+            });
+            if let Some(rows) = self.onset {
+                let mut m = serde_json::Map::new();
+                for (midi, v) in rows {
+                    m.insert(midi.to_string(), v);
+                }
+                sp["semitones_onset"] = serde_json::Value::Object(m);
+            }
+            speaker_range(&config_with(sp), 0).expect("record")
+        }
+    }
+
+    /// The pre-S146e shape: no `usable_auto` column, so `reach == usable`.
+    /// ⚠ Only for tests that are ABOUT that legacy shape — the split is invisible on it.
+    fn legacy_rec(usable: (i64, i64), comfort: (i64, i64)) -> SpeakerRange {
         let mut semis = serde_json::Map::new();
         for midi in 60..=84 {
-            let v = match midi {
-                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
-                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
-                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
-                79 => serde_json::json!([1, 1, -1.3, 0.629]),
-                _ => serde_json::json!([1, 1, -1.0, 0.25]),
-            };
-            semis.insert(midi.to_string(), v);
+            semis.insert(
+                midi.to_string(),
+                match midi {
+                    80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                    81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                    82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                    79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                    _ => serde_json::json!([1, 1, -1.0, 0.25]),
+                },
+            );
         }
         speaker_range(
             &config_with(serde_json::json!({
                 "usable": [usable.0, usable.1],
-                "usable_auto": [auto.0, auto.1],
                 "comfort": [comfort.0, comfort.1],
                 "semitones": semis
             })),
@@ -1685,76 +1733,20 @@ mod tests {
         .expect("record")
     }
 
-    /// `akiko_like()` with the two knobs moved — the only thing the user can actually change.
-    /// ⚠ No `usable_auto` ⇒ this is the PRE-S146e shape (reach == usable). Use
-    /// `akiko_like_edited` for anything that exercises the split.
-    fn akiko_like_with(usable: (i64, i64), comfort: (i64, i64)) -> SpeakerRange {
-        let mut semis = serde_json::Map::new();
-        for midi in 60..=84 {
-            let v = match midi {
-                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
-                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
-                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
-                79 => serde_json::json!([1, 1, -1.3, 0.629]),
-                _ => serde_json::json!([1, 1, -1.0, 0.25]),
-            };
-            semis.insert(midi.to_string(), v);
-        }
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [usable.0, usable.1],
-                "comfort": [comfort.0, comfort.1],
-                "semitones": semis
-            })),
-            0,
-        )
-        .expect("record")
-    }
-
-    /// A record whose onset pass carries the S146f level column.
-    fn with_onset_level(midi: i64, err: f64, voiced: f64, rms_db: f64) -> SpeakerRange {
-        let mut semis = serde_json::Map::new();
-        let mut onset = serde_json::Map::new();
-        for m in 60..=84 {
-            semis.insert(m.to_string(), serde_json::json!([1, 1, -1.0, 0.25]));
-            onset.insert(m.to_string(), serde_json::json!([1, 1, -0.5, 0.25]));
-        }
-        onset.insert(midi.to_string(), serde_json::json!([err, voiced, rms_db, 0.25]));
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [36, 84], "comfort": [36, 84],
-                "semitones": semis, "semitones_onset": onset
-            })),
-            0,
-        )
-        .expect("record")
-    }
-
-    /// akiko's record with an explicitly chosen comfort band (comfort ≠ comfort_auto and ≠
-    /// comfort_auto clamped into usable) — i.e. the user actually dragged the landing ceiling.
-    fn akiko_comfort_target(usable: (i64, i64), comfort: (i64, i64), comfort_auto: (i64, i64)) -> SpeakerRange {
-        let mut semis = serde_json::Map::new();
-        for midi in 60..=84 {
-            let v = match midi {
-                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
-                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
-                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
-                79 => serde_json::json!([1, 1, -1.3, 0.629]),
-                _ => serde_json::json!([1, 1, -1.0, 0.25]),
-            };
-            semis.insert(midi.to_string(), v);
-        }
-        speaker_range(
-            &config_with(serde_json::json!({
-                "usable": [usable.0, usable.1],
-                "usable_auto": [36, 80],
-                "comfort": [comfort.0, comfort.1],
-                "comfort_auto": [comfort_auto.0, comfort_auto.1],
-                "semitones": semis
-            })),
-            0,
-        )
-        .expect("record")
+    /// An onset pass that is healthy everywhere except one slot, whose columns are given.
+    fn onset_rows(midi: i64, err: f64, voiced: f64, rms_db: f64) -> Vec<(i64, serde_json::Value)> {
+        (60..=84)
+            .map(|m| {
+                (
+                    m,
+                    if m == midi {
+                        serde_json::json!([err, voiced, rms_db, 0.25])
+                    } else {
+                        serde_json::json!([1, 1, -0.5, 0.25])
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -1765,10 +1757,10 @@ mod tests {
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
 
-        let auto = akiko_comfort_target((36, 80), (36, 79), (36, 79));
+        let auto = Rec { usable: (36, 80), comfort: (36, 79), comfort_auto: (36, 79), ..Default::default() }.build();
         let base = minimal_rescue_shift(&dead, &nn, &auto).expect("a landing exists");
 
-        let pushed = akiko_comfort_target((36, 80), (36, 74), (36, 79));
+        let pushed = Rec { usable: (36, 80), comfort: (36, 74), comfort_auto: (36, 79), ..Default::default() }.build();
         let deeper = minimal_rescue_shift(&dead, &nn, &pushed).expect("a landing exists");
         assert!(
             deeper < base,
@@ -1794,10 +1786,10 @@ mod tests {
         // scan, not by `usable`), so a stored 74 now means the user asked for 74 — and it is
         // obeyed. What this pins is that the two records are NOT the same setting: a target of
         // 74 must land deeper than a target of 79, because that is the whole point of the knob.
-        let artefact = akiko_comfort_target((36, 74), (36, 74), (36, 79));
+        let artefact = Rec { usable: (36, 74), comfort: (36, 74), comfort_auto: (36, 79), ..Default::default() }.build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
-        let untouched = akiko_comfort_target((36, 74), (36, 79), (36, 79));
+        let untouched = Rec { usable: (36, 74), comfort: (36, 79), comfort_auto: (36, 79), ..Default::default() }.build();
         assert!(
             minimal_rescue_shift(&dead, &nn, &artefact).unwrap()
                 < minimal_rescue_shift(&dead, &nn, &untouched).unwrap(),
@@ -1810,7 +1802,7 @@ mod tests {
         // 东雪莲's shape again, now as an explicit edit: no depth within ±MAX_RANGE_SHIFT can put
         // a 75-85 phrase inside [36,52] while keeping every note voiceable. It must fall back to
         // the normal budget, not stop rescuing.
-        let nope = akiko_comfort_target((36, 80), (36, 52), (36, 79));
+        let nope = Rec { usable: (36, 80), comfort: (36, 52), comfort_auto: (36, 79), ..Default::default() }.build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
         assert!(
@@ -1823,7 +1815,7 @@ mod tests {
     fn comfort_may_sit_above_the_users_rescue_line() {
         // "rescue everything above 74, but never land higher than 79" is a legal sentence now
         // that the two knobs are orthogonal. Before S146f the read side healed it away.
-        let r = akiko_comfort_target((36, 74), (36, 79), (36, 76));
+        let r = Rec { usable: (36, 74), comfort: (36, 79), comfort_auto: (36, 76), ..Default::default() }.build();
         assert_eq!(r.comfort, (36.0, 79.0), "comfort above usable must survive the read side");
         assert_eq!(r.usable, (36.0, 74.0));
     }
@@ -1847,25 +1839,30 @@ mod tests {
 
     #[test]
     fn the_onset_probe_vetoes_a_landing_the_model_can_pitch_but_cannot_voice() {
-        // ⛔ THE counterexample, measured off the user's own disk: akiko's 「か」 probe at MIDI 80
-        // renders at rms −12.27 dB relative to that scale's own peak — all but mute — while its
-        // f0 columns read perfect. The stored tuple was `[3, 1]` and LANDING stayed set.
+        // ⛔ THE counterexample, measured off the user's own disk: akiko's 「か」 probe renders at
+        // **rms −12.27 dB** relative to that scale's own peak — all but mute — while its f0
+        // columns read perfect, and the stored tuple was `[3, 1]` with LANDING left set.
         //
-        // This is S81's lesson repeating: that session established the f0 pair cannot see a
+        // This is S81's lesson repeating: that session established the f0 pair CANNOT see a
         // level/timbre collapse, and S146b then built the entire second probe on that pair.
-        let mute = with_onset_level(80, 3.0, 1.0, -12.27);
+        //
+        // ⚠ The slot under test is **78**, not the 80 the reading came from: on akiko's real scan
+        // 80 already fails the main pass (voiced 0.69 < 0.9), so LANDING is never set there and
+        // the onset veto could not be the thing acting. 78 is where the 「あ」 pass says
+        // "comfortable" and only this veto can disagree — i.e. where the test can actually fail.
+        let mute = Rec { onset: Some(onset_rows(78, 3.0, 1.0, -12.27)), ..Default::default() }.build();
         assert!(
-            !mute.slot_landing_ok(80),
+            !mute.slot_landing_ok(78),
             "a slot the onset probe measured at −12.27 dB must not be a landing"
         );
-        // …and the f0 columns alone must NOT have been what rejected it — otherwise this test
-        // would pass on the build that throws the level away.
-        let f0_only = with_onset_level(80, 3.0, 1.0, -0.5);
-        assert!(f0_only.slot_landing_ok(80), "err 3 / voiced 1.00 is a passing f0 reading");
-        // Neighbours are untouched: the veto is per slot, not a band.
-        assert!(mute.slot_landing_ok(79) && mute.slot_landing_ok(81));
-        // And it never touches the DEAD set — the onset pass may only ever narrow landings.
-        assert!(mute.slot_singable(80), "the onset probe must not change which notes get rescued");
+
+        // …and the f0 columns alone must NOT be what rejected it — otherwise this test would
+        // stay green on the build that throws the level away.
+        let f0_only = Rec { onset: Some(onset_rows(78, 3.0, 1.0, -0.5)), ..Default::default() }.build();
+        assert!(f0_only.slot_landing_ok(78), "err 3 / voiced 1.00 is a passing f0 reading");
+
+        assert!(mute.slot_landing_ok(77) && mute.slot_landing_ok(76), "the veto is per slot");
+        assert!(mute.slot_singable(78), "the onset probe must not change which notes get rescued");
     }
 
     #[test]
@@ -1891,7 +1888,9 @@ mod tests {
             (-6.7, false), // slot 80 — the one that measurably dies
         ] {
             assert_eq!(
-                with_onset_level(75, 1.0, 1.0, rms).slot_landing_ok(75),
+                Rec { onset: Some(onset_rows(75, 1.0, 1.0, rms)), ..Default::default() }
+                    .build()
+                    .slot_landing_ok(75),
                 want_landing,
                 "onset rms {rms} dB should {} land",
                 if want_landing { "" } else { "NOT" }
@@ -1938,8 +1937,8 @@ mod tests {
         // ⛔ 目标范围两臂必须**相同**(都是 79):只动 usable 才测得到「天花板不加深落点」。
         // 旧版把 tight 的目标也设成 76,那是旧编辑器夹取的形状 —— 在两个旋钮正交之后,
         // 那样测的是两个旋钮的合力,而 76 那个目标本来就【应该】让落点变深。
-        let wide = akiko_like_edited((36, 80), (36, 79), (36, 80));
-        let tight = akiko_like_edited((36, 76), (36, 79), (36, 80));
+        let wide = Rec { usable: (36, 80), comfort: (36, 79), comfort_auto: (36, 79), scan: (36, 80), ..Default::default() }.build();
+        let tight = Rec { usable: (36, 76), comfort: (36, 79), comfort_auto: (36, 79), scan: (36, 80), ..Default::default() }.build();
         let nn: Vec<i64> = vec![70, 78, 85];
 
         let (pw, _) = dead_only_plan(&nn, 0, &wide);
@@ -1971,7 +1970,7 @@ mod tests {
     fn the_reach_bounds_fall_back_to_usable_when_the_record_has_no_usable_auto() {
         // Every pre-S146e record on disk lacks the column, and for those `usable` IS the scan's
         // answer (nothing could edit it then) ⇒ the split must be a no-op there, not a widening.
-        let r = akiko_like_with((36, 78), (36, 78));
+        let r = legacy_rec((36, 78), (36, 78));
         assert_eq!(r.reach, r.usable);
         for midi in 36..=96 {
             assert_eq!(
@@ -2008,8 +2007,8 @@ mod tests {
         // The raw-scan arm of `slot_singable` read `slot_flags` only, so dragging the ceiling
         // changed the stored record, correctly invalidated the render — and produced the same
         // audio. 78 is a slot the scan calls fine (damage 0.000); the knob must still veto it.
-        let wide = akiko_like_with((36, 80), (36, 79));
-        let tight = akiko_like_with((36, 76), (36, 76));
+        let wide = legacy_rec((36, 80), (36, 79));
+        let tight = legacy_rec((36, 76), (36, 76));
         assert!(wide.slot_singable(78), "78 is scan-clean — the fixture must start here");
         assert!(!tight.slot_singable(78), "the ceiling at 76 must veto 78");
         assert!(tight.slot_singable(76), "the ceiling is inclusive");
@@ -2027,10 +2026,10 @@ mod tests {
     fn the_usable_knob_can_only_take_slots_away_never_add_them() {
         // Direction guard: a knob that could ADD singable slots would let the user talk the model
         // into singing something the scan measured as dead — the exact "自证" shape.
-        let wide = akiko_like_with((36, 96), (36, 96));
+        let wide = legacy_rec((36, 96), (36, 96));
         for midi in 30..=100 {
             for &(lo, hi) in &[(36i64, 80i64), (60, 76), (36, 60), (70, 90)] {
-                let narrow = akiko_like_with((lo, hi), (lo, hi.min(hi)));
+                let narrow = legacy_rec((lo, hi), (lo, hi));
                 if narrow.slot_singable(midi) {
                     assert!(
                         wide.slot_singable(midi),
@@ -2049,8 +2048,8 @@ mod tests {
         // −2's landing (78) uncomfortable and −3's (77) comfortable — the pick must follow.
         let nn: Vec<i64> = vec![70, 80];
         let dead: Vec<i64> = vec![80];
-        let open = akiko_like_with((36, 78), (36, 78));
-        let tight = akiko_like_with((36, 78), (36, 77));
+        let open = legacy_rec((36, 78), (36, 78));
+        let tight = legacy_rec((36, 78), (36, 77));
         assert_eq!(minimal_rescue_shift(&dead, &nn, &open), Some(-2), "baseline");
         assert_eq!(
             minimal_rescue_shift(&dead, &nn, &tight),
@@ -2063,7 +2062,7 @@ mod tests {
     fn an_unreachable_comfort_band_degrades_instead_of_killing_the_rescue() {
         // 东雪莲's real shape: comfort [36,52] against a phrase at 75-85. A hard AND would take
         // it from "10 groups rescued" to "0 rescued / 10 unsolvable" — the knob as kill switch.
-        let r = akiko_like_with((36, 80), (36, 52));
+        let r = legacy_rec((36, 80), (36, 52));
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
         assert_eq!(
@@ -2085,7 +2084,7 @@ mod tests {
         // before 80 reaches 66. The answer must stay at the ungoverned −2.
         let nn: Vec<i64> = vec![70, 80];
         let dead: Vec<i64> = vec![80];
-        let r = akiko_like_with((36, 78), (36, 66));
+        let r = legacy_rec((36, 78), (36, 66));
 
         let reachable: Vec<i64> = (-24..=-1)
             .filter(|&s| {
@@ -2106,7 +2105,7 @@ mod tests {
     fn the_rescue_lands_where_the_record_says_the_model_is_fine_not_at_the_gate() {
         // The user's own phrase and model. Before: −6 puts the top dead note on 79, the last slot
         // that passes the binary LANDING gate — and the real render measured voiced 0.17 there.
-        let r = akiko_like();
+        let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
         let s = minimal_rescue_shift(&dead, &nn, &r).expect("a landing exists");
@@ -2133,7 +2132,7 @@ mod tests {
         // ⛔ NOT "always deeper": once the damage floor is reached, extra depth buys nothing and
         // costs colouring, so the shallowest floor-level shift wins. Without this the rule would
         // happily walk to −24.
-        let r = akiko_like();
+        let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let s = minimal_rescue_shift(&[85, 83, 81], &nn, &r).expect("a landing exists");
         assert_eq!(s, -7);
@@ -2200,7 +2199,7 @@ mod tests {
         // The safety property: ranking happens INSIDE the qualifying set, so the dead set and the
         // set of rescued groups are untouched. Asserted against the same plan the decision layer
         // builds, not against the ranking function alone.
-        let r = akiko_like();
+        let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
         let fr: Vec<i64> = vec![9; nn.len()];
         let (plan, unfixable) = dead_only_plan(&nn, 0, &r);

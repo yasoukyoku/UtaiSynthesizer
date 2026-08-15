@@ -13,15 +13,11 @@ import {
   collectRangeTestTargets,
   SCAN_VERSION,
   buildSpeakerRecord,
-  clampComfort,
-  effectiveComfort,
   midiToHz,
   midiName,
-  MIN_COMFORT_SPAN,
   RANGE_MIDI_LO,
   RANGE_MIDI_HI,
   type SemitoneStat,
-  type SpeakerRangeRecord,
 } from "./rangeTest";
 
 function stat(midi: number, errCents: number, voicedRatio: number): SemitoneStat {
@@ -133,28 +129,6 @@ describe("deriveRanges noise bridging (S60d)", () => {
     }
     const r = deriveRanges(stats)!;
     expect(r.usable).toEqual([42, 70]); // the island at 76-79 stays a separate (losing) run
-  });
-});
-
-describe("comfort guards (S60d)", () => {
-  it("clampComfort enforces the minimum span within usable", () => {
-    // the field disaster verbatim: both sliders at the usable floor
-    expect(clampComfort([42, 70], [42, 42])).toEqual([42, 42 + MIN_COMFORT_SPAN]);
-    // span enforced against the ceiling too
-    expect(clampComfort([42, 70], [70, 70])).toEqual([70 - MIN_COMFORT_SPAN, 70]);
-    // honest wide zones pass through (sorted + clamped only)
-    expect(clampComfort([42, 70], [60, 50])).toEqual([50, 60]);
-    // usable narrower than the minimum → the whole usable zone
-    expect(clampComfort([60, 63], [61, 61])).toEqual([60, 63]);
-  });
-
-  it("effectiveComfort mirrors the Rust read-side healing chain", () => {
-    const rec = (comfort: [number, number], auto: [number, number]): SpeakerRangeRecord => ({
-      usable: [42, 70], comfort, comfort_auto: auto, semitones: {}, tested_at: "2026-07-12",
-    });
-    expect(effectiveComfort(rec([42, 42], [42, 70]))).toEqual([42, 70]); // degenerate → auto
-    expect(effectiveComfort(rec([42, 42], [50, 52]))).toEqual([42, 70]); // auto degenerate → usable
-    expect(effectiveComfort(rec([45, 60], [42, 70]))).toEqual([45, 60]); // healthy stored value wins
   });
 });
 

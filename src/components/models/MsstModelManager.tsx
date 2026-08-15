@@ -36,7 +36,8 @@ import {
   type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
-import { runRangeTest, runRangeTestBatch, collectRangeTestTargets, midiName, effectiveComfort, deriveCautionZones, SCAN_VERSION, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { runRangeTest, runRangeTestBatch, collectRangeTestTargets, midiName, deriveCautionZones, SCAN_VERSION, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { targetRange } from "../../lib/vocal/rangeBounds";
 import { preview } from "../common/previewPlayer";
 import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
 import { readFile } from "@tauri-apps/plugin-fs";
@@ -735,6 +736,9 @@ function VoiceModelsTab({ lang }: { lang: string }) {
   const [voiceType, setVoiceType] = useState<VoiceType>("rvc");
   const [showImport, setShowImport] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  // S146f: 音域边界编辑器展开时,四条滑条会占满整行 —— 试听按钮与它挤在同一行里视觉重叠
+  // (用户实机报的)。编辑态提到这一层,让同排的动作按钮能让位。
+  const [rangeEditing, setRangeEditing] = useState<string | null>(null);
   // Shared store — the SAME list the RVC/SoVITS workflow nodes read (one source of truth).
   const models = useVoiceModelStore((s) => s.models[voiceType]);
   const voiceError = useVoiceModelStore((s) => s.error);
@@ -1023,11 +1027,15 @@ function VoiceModelsTab({ lang }: { lang: string }) {
                     lang={lang}
                     spk={spk}
                     onSpk={(id) => setVoiceSpk((s) => ({ ...s, [m.name]: id }))}
+                    editing={rangeEditing === m.name}
+                    onEditing={(on) => setRangeEditing(on ? m.name : null)}
                   />
                 )}
               </div>
-              {!isVocoder && <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} spk={spk} />}
-              <VoiceExportButton m={m} voiceType={voiceType} lang={lang} />
+              {!isVocoder && rangeEditing !== m.name && (
+                <VoiceAuditionButton m={m} voiceType={voiceType as "rvc" | "sovits"} lang={lang} spk={spk} />
+              )}
+              {rangeEditing !== m.name && <VoiceExportButton m={m} voiceType={voiceType} lang={lang} />}
               {deleteConfirm === m.name ? (
                 <div className="model-confirm-delete">
                   <button className="danger" onClick={() => handleDelete(m.name)}>{lang === "zh" ? "确认" : "OK"}</button>
@@ -1290,9 +1298,14 @@ function RangeBatchRow({ lang }: { lang: string }) {
 // ─── S60-2: per-model vocal-range row (v1 session20/21 UX: auto label + comfort editor
 // clamped inside usable + Reset + retest; missing record → 补做 button) ───
 
-function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string; spk: number; onSpk: (id: number) => void }) {
+function VoiceRangeRow({ m, voiceType, lang, spk, onSpk, editing, onEditing }: {
+  m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string; spk: number;
+  onSpk: (id: number) => void;
+  /** S146f: 受控 —— 编辑态住在 tab 层,因为同排的试听/导出按钮要跟着让位。 */
+  editing: boolean;
+  onEditing: (on: boolean) => void;
+}) {
   const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
-  const [editing, setEditing] = useState(false);
   // S81: the record is keyed PER SPEAKER on every read side (Rust speaker_range, the node
   // gates, the vocal sidebar) but only speaker 0 was ever writable here, so a multi-speaker
   // model's other singers could never get a record — and their range-extend toggle stayed
@@ -1306,7 +1319,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
   // 16px chip matching the row rhythm (a full-height select dwarfed the xs lines = the
   // crowding, §user round 2). Switching speaker closes an open comfort edit: the lo/hi
   // sliders were seeded from the previous singer's record.
-  useEffect(() => setEditing(false), [spk]);
+  useEffect(() => onEditing(false), [spk]); // eslint-disable-line react-hooks/exhaustive-deps
   const speakers = voiceSpeakerOptions(m);
   const speakerPicker = speakers.length > 1 && (
     <select
@@ -1328,10 +1341,10 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
   const sp = rec?.speakers?.[String(spk)];
   // what the render layer will actually target (degenerate stored comfort heals to
   // comfort_auto/usable — mirror of the Rust read side); display + slider seed use THIS
-  const shown = sp ? effectiveComfort(sp) : null;
+  const shown = sp ? targetRange(sp) : null;
   // model-quirk chips from the stored scan: artifact zones + in-range weak notes, so a
   // weird render at those pitches reads as the MODEL's doing (§user S60d2)
-  const caution = sp ? deriveCautionZones(sp.semitones ?? {}, sp.usable, effectiveComfort(sp)) : null;
+  const caution = sp ? deriveCautionZones(sp.semitones ?? {}, sp.usable, targetRange(sp)) : null;
   // S81 F1: a record measured before the timbre dimension existed still WORKS (its damage curve
   // just can't see timbre), so this is an invitation, never a rejection.
   const stale = sp !== undefined && (sp.scan_version ?? 0) < SCAN_VERSION;
@@ -1395,7 +1408,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
             speakerId={spk}
             speakerLabel={speakers.find((s) => s.id === spk)?.label}
             lang={lang}
-            onClose={() => setEditing(false)}
+            onClose={() => onEditing(false)}
           />
         </span>
       ) : (
@@ -1403,7 +1416,7 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
           <button
             className="rm-range-btn"
             title={t18({ zh: "调整可用范围与目标范围（MIDI 音号）", en: "Adjust the usable and target ranges (MIDI numbers)", ja: "使用可能域と目標範囲を調整（MIDI 番号）" }, lang)}
-            onClick={() => setEditing(true)}
+            onClick={() => onEditing(true)}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>

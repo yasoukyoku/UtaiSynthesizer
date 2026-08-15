@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { ParamSlider } from "../workflow/nodes/ParamSlider";
 import { t18 } from "../../lib/models/msst-catalog";
-import { autoBounds, boundsAreEdited, clampBounds } from "../../lib/vocal/rangeBounds";
-import { effectiveComfort, midiName, setVocalRangeBounds, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { autoBounds, boundsAreEdited, clampBounds, targetRange } from "../../lib/vocal/rangeBounds";
+import { midiName, setVocalRangeBounds, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import type { VoiceType } from "../../store/voice-models";
 
 /** S146e —— 「可用范围 / 目标范围」编辑器,资源管理器与人声侧栏**共用这一份**。
@@ -42,11 +42,11 @@ export function RangeBoundsEditor({
   onClose?: () => void;
 }) {
   const auto = autoBounds(sp);
-  const shownComfort = effectiveComfort(sp);
+  const shownTarget = targetRange(sp);
   const [uLo, setULo] = useState(sp.usable[0]);
   const [uHi, setUHi] = useState(sp.usable[1]);
-  const [cLo, setCLo] = useState(shownComfort[0]);
-  const [cHi, setCHi] = useState(shownComfort[1]);
+  const [cLo, setCLo] = useState(shownTarget[0]);
+  const [cHi, setCHi] = useState(shownTarget[1]);
   const [busy, setBusy] = useState(false);
 
   // 换歌手 / 换模型 = 换记录 ⇒ 重新播种,否则四个滑条还停在上一位歌手的数字上,
@@ -54,7 +54,7 @@ export function RangeBoundsEditor({
   useEffect(() => {
     setULo(sp.usable[0]);
     setUHi(sp.usable[1]);
-    const c = effectiveComfort(sp);
+    const c = targetRange(sp);
     setCLo(c[0]);
     setCHi(c[1]);
   }, [modelName, backend, speakerId, sp]);

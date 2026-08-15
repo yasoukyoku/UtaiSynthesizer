@@ -21,7 +21,6 @@ import { useAppStore } from "../../store/app";
 import {
   useVoiceModelStore,
   voiceSpeakerOptions,
-  MIN_COMFORT_SPAN,
   type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
@@ -190,7 +189,6 @@ const BRIDGE_MAX_GAP = 2;
 /** Minimum comfort span the UI lets the user commit — the constant now lives in
  *  voice-models.ts (the range-record gate needs it and rangeTest already imports that store;
  *  re-exported here so existing consumers keep their import path). */
-export { MIN_COMFORT_SPAN };
 
 /** Pass-flags with interior fail-gaps of ≤ BRIDGE_MAX_GAP (flanked by passes) bridged. */
 function bridgedFlags(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): boolean[] {
@@ -220,17 +218,6 @@ function longestRun(stats: SemitoneStat[], flag: (s: SemitoneStat) => boolean): 
     }
   }
   return best === null ? null : [stats[best[0]]!.midi, stats[best[1]]!.midi];
-}
-
-/** The comfort zone the RENDER layer will actually target — mirrors the Rust read-side
- *  healing in vocal_range.rs::speaker_range (degenerate comfort → comfort_auto → usable).
- *  UI display and slider seeding must show THIS, not the raw stored value. */
-export function effectiveComfort(sp: SpeakerRangeRecord): [number, number] {
-  const wide = (c: [number, number]) =>
-    c[1] - c[0] >= MIN_COMFORT_SPAN && c[0] >= sp.usable[0] && c[1] <= sp.usable[1];
-  if (wide(sp.comfort)) return sp.comfort;
-  if (wide(sp.comfort_auto)) return sp.comfort_auto;
-  return sp.usable;
 }
 
 /** usable = longest contiguous usable run; comfort = longest contiguous comfort run WITHIN it
@@ -604,18 +591,6 @@ export async function runCandidateRangeTest(
   return { usable: record.usable, comfort: record.comfort };
 }
 
-/** Clamp a requested comfort pair into `usable` and enforce MIN_COMFORT_SPAN (expanding
- *  around the requested low bound; a usable zone narrower than the minimum becomes the whole
- *  usable zone). Pure — the single source for commit-time comfort sanitation (vitest). */
-export function clampComfort(usable: [number, number], comfort: [number, number]): [number, number] {
-  let lo = Math.max(usable[0], Math.min(usable[1], Math.min(comfort[0], comfort[1])));
-  let hi = Math.max(usable[0], Math.min(usable[1], Math.max(comfort[0], comfort[1])));
-  if (hi - lo < MIN_COMFORT_SPAN) {
-    hi = Math.min(usable[1], lo + MIN_COMFORT_SPAN);
-    lo = Math.max(usable[0], hi - MIN_COMFORT_SPAN);
-  }
-  return [lo, hi];
-}
 
 /* S146e: `setComfortRange`(只写 comfort 一个边界)已被下面的 `setVocalRangeBounds` 取代并
    删除 —— 它的唯一调用点是资源管理器那个编辑器,而那个编辑器现在与人声侧栏共用

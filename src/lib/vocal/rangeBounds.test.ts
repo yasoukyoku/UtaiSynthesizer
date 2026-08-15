@@ -4,8 +4,9 @@
  *  include 只收 `*.test.ts`),所以放进 TSX 的逻辑一条都验不到。凡是这两个旋钮的规则,
  *  必须落在 rangeBounds.ts 里,并在这里被钉住。 */
 import { describe, it, expect } from "vitest";
-import { autoBounds, autoUsable, boundsAreEdited, boundsPayload, clampBounds } from "./rangeBounds";
-import { MIN_COMFORT_SPAN, type SpeakerRangeRecord } from "./rangeTest";
+import { MIN_COMFORT_SPAN, autoBounds, boundsAreEdited, boundsPayload, clampBounds, scanBand, targetRange } from "./rangeBounds";
+import type { SpeakerRangeRecord } from "./rangeTest";
+import type { Bounds } from "./rangeBounds";
 
 function rec(over: Partial<SpeakerRangeRecord> = {}): SpeakerRangeRecord {
   return {
@@ -37,7 +38,7 @@ describe("后端那道闸(comfort ⊆ 扫描量出来的可用域)永远满足",
 
   it("穷举:任何一对提议都产出后端收得下的形状(comfort ⊆ 扫描带)", () => {
     const sp = rec({ usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
-    const [aLo, aHi] = autoUsable(sp);
+    const [aLo, aHi] = scanBand(sp);
     for (let ul = 20; ul <= 100; ul += 7)
       for (let uh = 20; uh <= 100; uh += 11)
         for (let cl = 20; cl <= 100; cl += 13)
@@ -76,12 +77,12 @@ describe("可用域夹在扫描量出来的范围之内", () => {
   });
 
   it("老记录(没有 usable_auto)拿今天的 usable 当扫描答案", () => {
-    expect(autoUsable(rec())).toEqual([36, 80]);
+    expect(scanBand(rec())).toEqual([36, 80]);
   });
 
   it("已经被压低过的记录,还原回的是扫描值而不是当前值", () => {
     const sp = rec({ usable: [36, 60], comfort: [36, 58], usable_auto: [36, 80] } as Partial<SpeakerRangeRecord>);
-    expect(autoUsable(sp)).toEqual([36, 80]);
+    expect(scanBand(sp)).toEqual([36, 80]);
     expect(autoBounds(sp).usable).toEqual([36, 80]);
     // ⛔ 反向对照:没有 usable_auto 时「还原」只能回到当前值 —— 这正是必须补这一列的理由。
     const legacy = rec({ usable: [36, 60], comfort: [36, 58] });
@@ -134,5 +135,53 @@ describe("「已被手动改过」的判定", () => {
     const edited = boundsPayload(rec(), [36, 60], [36, 58]);
     const a = autoBounds(edited);
     expect(boundsAreEdited(boundsPayload(edited, a.usable, a.comfort))).toBe(false);
+  });
+});
+
+describe("targetRange —— 读侧愈合(镜像 Rust 的 speaker_range)", () => {
+  // ⛔ 用户实测撞上的那个 bug 就在这条上:把可用上限拖到 D5(74)、目标上限设到 G5(79),
+  // 存盘完全正确,但读回来时旧判据拿 `usable` 判有效性 ⇒ 79 被判「逃出可用域」⇒ 退回
+  // comfort_auto(也超)⇒ 兜底成 usable ⇒ 显示与下一次 OK 全变成 74。**存对了、读错了**。
+  it("⭐ 目标范围高于可用范围时,读回来必须原样活着", () => {
+    const sp = rec({
+      usable: [36, 74], comfort: [36, 79], comfort_auto: [36, 79], usable_auto: [36, 80],
+    } as Partial<SpeakerRangeRecord>);
+    expect(targetRange(sp)).toEqual([36, 79]);
+  });
+
+  it("站不住的存值退回 comfort_auto,再退回整条扫描带", () => {
+    const mk = (comfort: Bounds, auto: Bounds) =>
+      rec({ usable: [42, 70], comfort, comfort_auto: auto } as Partial<SpeakerRangeRecord>);
+    expect(targetRange(mk([42, 42], [42, 70]))).toEqual([42, 70]); // 退化 → auto
+    expect(targetRange(mk([42, 42], [50, 52]))).toEqual([42, 70]); // auto 也退化 → 扫描带
+    expect(targetRange(mk([45, 60], [42, 70]))).toEqual([45, 60]); // 站得住的存值胜出
+  });
+
+  it("参照系是扫描带,不是 usable —— 换个说法钉同一条", () => {
+    const legacy = rec({ usable: [42, 70], comfort: [45, 60], comfort_auto: [42, 70] } as Partial<SpeakerRangeRecord>);
+    expect(scanBand(legacy)).toEqual([42, 70]); // 无 usable_auto ⇒ 参照系 = usable,行为逐字照旧
+    const split = rec({
+      usable: [42, 55], comfort: [45, 68], comfort_auto: [42, 70], usable_auto: [42, 70],
+    } as Partial<SpeakerRangeRecord>);
+    expect(targetRange(split)).toEqual([45, 68]); // 目标可以整段落在 usable 之外
+  });
+});
+
+describe("最小跨度", () => {
+  it("退化的区间被撑开到最小跨度,且不越出参照系", () => {
+    // ⚠ 参照系是 usable_auto ∪ usable,所以两列都得钉住,否则量的是别的区间。
+    const sp = rec({ usable: [42, 70], usable_auto: [42, 70] } as Partial<SpeakerRangeRecord>);
+    expect(clampBounds(sp, [42, 42], [42, 42]).comfort).toEqual([42, 42 + MIN_COMFORT_SPAN]);
+    expect(clampBounds(sp, [70, 70], [70, 70]).comfort).toEqual([70 - MIN_COMFORT_SPAN, 70]);
+  });
+
+  it("提议写反了会被排序,而不是被拒绝", () => {
+    const sp = rec({ usable: [42, 70], usable_auto: [42, 70] } as Partial<SpeakerRangeRecord>);
+    expect(clampBounds(sp, [60, 50], [60, 50]).usable).toEqual([50, 60]);
+  });
+
+  it("参照系本身就比最小跨度窄时照抄它,不造假", () => {
+    const sp = rec({ usable: [60, 63], comfort: [61, 61], usable_auto: [60, 63] } as Partial<SpeakerRangeRecord>);
+    expect(clampBounds(sp, [61, 61], [61, 61]).comfort).toEqual([60, 63]);
   });
 });
