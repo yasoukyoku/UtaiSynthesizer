@@ -443,12 +443,36 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
             .map(|&p| range.damage_at((p + s) as f32).unwrap_or(DAMAGE_MAX))
             .fold(0.0f32, f32::max)
     };
-    let best = qualifying.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
-    qualifying
+    // ⛔ The ranking is bounded to a neighbourhood of the shallowest qualifying shift. Without
+    // this bound the rule walks as deep as the damage curve rewards, and on a model whose curve
+    // is poor through its MIDDLE register that is very deep indeed: measured on
+    // Sovits4.1东雪莲主模型 (15 slots at low_ratio > 0.7 scattered over 53-79) the unbounded rule
+    // picks −10..−24 where it used to pick −6/−4 — and a −24 whole-song recolour is the exact
+    // outcome the user identified by ear as a catastrophe (S85b, dev log A/B 23:24 vs 23:44).
+    let shallowest = qualifying.iter().copied().min_by_key(|s| s.abs())?;
+    let pool: Vec<i64> = qualifying
         .into_iter()
+        .filter(|s| s.abs() <= shallowest.abs() + LANDING_MAX_EXTRA_DEPTH)
+        .collect();
+    let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
+    pool.into_iter()
         .filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS)
         .min_by_key(|s| s.abs())
 }
+
+/// How far past the shallowest qualifying shift the damage ranking may look. **One semitone.**
+///
+/// Chosen from the eight installed records, not from taste — what each value does to the rescue
+/// depths on 炉心融解:
+///   * 0  = the pre-S146c rule (always shallowest) — stops ON the cliff, which is the thing the
+///          user heard as broken (akiko lands 85 on 79, damage 0.592, rendered voiced 0.17);
+///   * 1  = akiko −6→−7 (the depth the user confirmed by ear as a clear improvement) and
+///          东雪莲 −6→−7; **the other six models do not move at all**;
+///   * ≥2 = starts walking yuyuko deeper (−3→−5→−6) with no measured benefit;
+///   * ∞  = 东雪莲 −24/−16/−13/−11/−10, yachiyo gains a −10. See the ⛔ above.
+/// The structural reason 1 is enough: the cliff at the top of a model's range is ONE slot wide
+/// (akiko: damage 0.000 flat to 78, 0.592 at 79, saturated at 80). Clearing it needs one step.
+const LANDING_MAX_EXTRA_DEPTH: i64 = 1;
 
 /// How much worse than the best reachable landing still counts as "the same". `damage` is stored
 /// quantized to a u8 over 0..=DAMAGE_MAX, so one stored step is 3/255 ≈ 0.0118 — this is four of
@@ -1482,6 +1506,50 @@ mod tests {
         assert!(
             r.damage_at((85 - 8) as f32).unwrap() <= LANDING_DAMAGE_EPS,
             "−8 is also at the floor — the rule must have rejected it for depth, not quality"
+        );
+    }
+
+    #[test]
+    fn the_landing_rule_will_not_walk_into_the_basement_for_a_better_score() {
+        // ⛔ The regression this pins, measured on Sovits4.1东雪莲主模型: its damage curve is poor
+        // through the MIDDLE of its range (15 slots at low_ratio > 0.7 scattered over 53-79), so an
+        // UNBOUNDED "land where damage is lowest" walks the rescue from −6 down to −24 — and S85
+        // recorded a −24 whole-song recolour as a catastrophe the user identified by ear.
+        // Fixture: a basement that is genuinely better AND genuinely reachable within ±24.
+        // ⚠ The first version of this test was VACUOUS — it kept the dragged notes in the group,
+        // and they pinned the worst-damage at the bad-band value for every candidate, so the rule
+        // returned the shallowest shift no matter how large the cap was. Mutating the constant to
+        // 99 left it green. A single dead note with no passengers is what exercises the bound.
+        let mut semis = serde_json::Map::new();
+        for midi in 40..=70 {
+            let v = match midi {
+                40..=49 => serde_json::json!([1, 1, -1.0, 0.20]), // basement: damage 0
+                50..=64 => serde_json::json!([1, 1, -1.0, 0.85]), // landable but damaged
+                _ => serde_json::json!([9999, 0, -22.0, 0.5]),    // dead
+            };
+            semis.insert(midi.to_string(), v);
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [40, 64], "comfort": [40, 64], "semitones": semis
+            })),
+            0,
+        )
+        .expect("record");
+        assert!(
+            r.damage_at(49.0).unwrap() + 1.0 < r.damage_at(64.0).unwrap(),
+            "fixture must offer a MUCH better landing far below, or this test proves nothing"
+        );
+        assert!(!r.slot_singable(65) && r.slot_landing_ok(64), "65 dead, 64 landable");
+        let s = minimal_rescue_shift(&[65], &[65], &r).expect("a landing exists");
+        // ⛔ The bound is a LITERAL, deliberately. Writing it as `-1 - LANDING_MAX_EXTRA_DEPTH`
+        // makes the assertion move with the constant it is guarding, and the test can then never
+        // fail — the second vacuous version of this test did exactly that and stayed green with
+        // the constant mutated to 99 (which returns −16 here).
+        assert!(
+            s >= -3,
+            "the rule must stay near the shallowest qualifying shift (−1), got {s} — \
+             unbounded it dives to −16 to reach the basement"
         );
     }
 
