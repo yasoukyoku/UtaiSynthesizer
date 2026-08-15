@@ -22,6 +22,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+import arms  # noqa: E402
 import rulers  # noqa: E402
 
 try:
@@ -127,7 +128,22 @@ def main():
             raise SystemExit("--cand 要写成 name=path")
         n, p = c.split("=", 1)
         cands.append((n, p))
+    # ⛔ 量程护栏(S146f)。`arms.PRAAT_USABLE_SHIFT_ST` 那条 ⛔ 规矩此前只写在注释里,
+    # 而 `--shift` 没有任何检查 ⇒ `--shift 8` 会**静默**打出一列已被登记为无效的 praat 读数,
+    # 而生产今天跑的正是 −7/−8。一条读不出真假的数字比没有数字更糟。
+    # ⇒ 超量程时:不禁止运行(被测臂的读数仍然有效),但**明说参照臂无效**,并让 JSON 带上标记。
+    over = abs(a.shift) > arms.PRAAT_USABLE_SHIFT_ST
+    if over:
+        print()
+        print(f"⛔ |shift| = {abs(a.shift):g} > {arms.PRAAT_USABLE_SHIFT_ST:g}"
+              f" —— **praat 参照臂在这一档不是有效参照**(ceiling 1400 Hz 被撞穿,")
+        print("   S146 实测它比被测者还差)。praat 那一列只是记录,不许当判据;")
+        print("   要在这一档做对拍,先抬 ceiling 并重新标定 registry.json 的 window.shift_st。")
+        print()
     res = measure(a.ref, cands, a.shift, parse_window(a.window))
+    # ⚠ 必须挂在 `_ref` 里:`render()` 只跳过 `_` 开头的顶层键,顶层多一个普通键会被
+    # 当成一条臂去格式化然后当场崩(我刚踩过一次)。
+    res["_ref"]["praat_reference_valid"] = not over
     render(res)
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:

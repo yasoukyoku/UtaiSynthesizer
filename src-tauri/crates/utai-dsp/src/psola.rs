@@ -60,6 +60,17 @@ pub struct PsolaDiagnostics {
     pub cola_gap_frac: f32,
     /// Median window sum over the covered span (1.0 = exact COLA).
     pub cola_w_median: f32,
+    /// Window-sum p01 / p99 over the covered span, and the fraction above 1.05.
+    ///
+    /// ⛔ Why these exist: the three fields above were all computed from a **clamped** window sum,
+    /// so `cola_w_median` was structurally ≤ 1.000 and the overlap SURPLUS — the thing that only
+    /// appears when shifting UP, i.e. the production direction — could not be read at all. A
+    /// diagnostic that cannot express the failure it is watching for is an empty criterion
+    /// (S129). The clamp is still applied where it is *used* (the dry-fill gain below); only the
+    /// statistics moved to the raw sum, so the audio is bit-identical.
+    pub cola_w_p01: f32,
+    pub cola_w_p99: f32,
+    pub cola_over_frac: f32,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -453,28 +464,41 @@ pub fn psola_shift_formant(
     let mut ws: Vec<f64> = Vec::new();
     let mut out = vec![0.0f32; n];
     for i in 0..n {
-        let w = wsum[i].clamp(0.0, 1.0);
+        // ⛔ Statistics read the RAW sum; the clamp below is only what the dry-fill gain needs.
+        // Clamping first made the surplus (w > 1) unreadable — see PsolaDiagnostics.
+        let raw = wsum[i];
+        let w = raw.clamp(0.0, 1.0);
         if covered[i] {
             cov_n += 1;
-            if w < 0.9 {
+            if raw < 0.9 {
                 gap += 1;
             }
-            ws.push(w);
+            ws.push(raw);
             out[i] = acc[i] as f32;
         } else {
             // copyFlat: outside the synthesized span the un-shifted input rides the window-sum
             // ramp, which IS the crossfade. Inside it, a shortfall is a defect and must not be
             // papered over with un-shifted audio (that is beating, not repair).
+            // ⚠ The clamp on `w` here is DEFENSIVE, not load-bearing: measured across every
+            // fixture in this file, zero uncovered samples ever carry wsum > 1 (a surplus needs
+            // overlapping bells, and overlapping bells mean covered). Feeding the raw sum instead
+            // is bit-identical on real input — so do not expect a test to catch that swap.
             out[i] = (acc[i] + (1.0 - w) * f64::from(x[i])) as f32;
         }
     }
     diag.cola_gap_frac = if cov_n > 0 { gap as f32 / cov_n as f32 } else { 0.0 };
-    diag.cola_w_median = if ws.is_empty() {
-        1.0
+    if ws.is_empty() {
+        diag.cola_w_median = 1.0;
+        diag.cola_w_p01 = 1.0;
+        diag.cola_w_p99 = 1.0;
     } else {
+        diag.cola_over_frac = ws.iter().filter(|&&w| w > 1.05).count() as f32 / ws.len() as f32;
         ws.sort_by(f64::total_cmp);
-        ws[ws.len() / 2] as f32
-    };
+        let at = |q: f64| ws[(((ws.len() - 1) as f64) * q).round() as usize] as f32;
+        diag.cola_w_median = at(0.50);
+        diag.cola_w_p01 = at(0.01);
+        diag.cola_w_p99 = at(0.99);
+    }
     (out, diag)
 }
 
@@ -566,6 +590,44 @@ mod tests {
             worst.0,
             worst.1
         );
+    }
+
+    #[test]
+    fn the_window_sum_diagnostics_can_see_a_surplus_not_only_a_shortfall() {
+        // ⛔ The empty criterion this replaces: the stats were computed from a **clamped** window
+        // sum, so `cola_w_median` was structurally ≤ 1.000 and the overlap SURPLUS — which only
+        // occurs when shifting UP, i.e. the direction production actually runs — could not be
+        // expressed at all. A diagnostic that cannot represent the failure it watches for tells
+        // you nothing when it reads "fine".
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32); // 空 f0 轨 ⇒ 零 island,那样测不到任何东西
+        let (_, up) = psola_shift_diag(&x, sr, 7.0, &f0t, hop);
+        assert!(up.islands > 0, "the fixture must actually be voiced");
+
+        // ⛔ STRICTLY ordered. `p01 <= median <= p99` survives a p99 that has silently collapsed
+        // onto the median (mutation-checked: that version went green on the loose form), so the
+        // three readouts have to be shown to be three readouts.
+        assert!(
+            up.cola_w_p01 < up.cola_w_median && up.cola_w_median < up.cola_w_p99,
+            "p01/median/p99 = {}/{}/{} — these must be three distinct readouts",
+            up.cola_w_p01,
+            up.cola_w_median,
+            up.cola_w_p99
+        );
+        assert!(
+            up.cola_w_p99 > 1.0,
+            "p99 {} — a clamped statistic can never exceed 1.0, which is exactly the bug",
+            up.cola_w_p99
+        );
+        assert!(up.cola_w_p99 < 2.0, "…but a surplus this large would be a real defect");
+        assert!((0.0..=1.0).contains(&up.cola_over_frac));
+
+        // And the audio is untouched by this: identity still holds bit-for-bit.
+        let (id, _) = psola_shift_diag(&x, sr, 0.0, &f0t, hop);
+        assert_eq!(id, x, "ratio 1.0 must remain the identity");
     }
 
     #[test]

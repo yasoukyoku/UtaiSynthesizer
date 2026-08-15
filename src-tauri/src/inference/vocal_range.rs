@@ -1113,7 +1113,7 @@ pub fn apply_inverse_with(
             // The base-schedule count is only meaningful when a pin was actually built — printing
             // it under κ=1 (where `formant` is None and the schedule never reaches the engine)
             // made the audit line claim work that did not happen (S145).
-            tracing::debug!(
+            tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, base schedule {}",
                 match (formant.is_some(), schedule.as_ref()) {
                     (true, Some((t, _))) => format!("{} pts", t.len()),
