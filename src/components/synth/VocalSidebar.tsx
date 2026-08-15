@@ -17,7 +17,9 @@ import { VolumeFader } from "../common/VolumeFader";
 import { useProjectStore } from "../../store/project";
 import { useHistoryStore } from "../../store/history";
 import { useAppStore } from "../../store/app";
-import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, type VoiceModelEntry } from "../../store/voice-models";
+import { useVoiceModelStore, voiceHasDiffusion, voiceHasRangeRecord, vocalTrackSpeakerId, voiceSpeakerOptions, type VoiceModelEntry } from "../../store/voice-models";
+import { speakerRecordOf } from "../../lib/vocal/rangeBounds";
+import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
 import { effTransition } from "../../lib/f0eval";
 import { DEFAULT_CONSONANT_EMPHASIS_DB, DEFAULT_CONSONANT_VALLEY, DEFAULT_BREATH_TOKEN, DEFAULT_REST_TOKEN } from "../../lib/vocalNotes";
 import { VOCAL_LANGUAGES, langById } from "../../lib/vocal/languages";
@@ -95,6 +97,25 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
   // Pick a singer → the SHARED single pick path (voiceModel + backend, one undo step) — the track-header
   // singer popup uses the same function (S58, NO-dup).
   const pickVoice = (m: VoiceModelEntry) => pickVoiceForTrack(trackId, m);
+
+  // S146e — which (model, speaker) record the 音域扩展栏's bound knobs edit.
+  // ⛔ The speaker here is `vocalTrackSpeakerId` = the max-weight blend entry, which the user
+  // never explicitly chose; `speakerLabel` is therefore mandatory, not decoration (S146e recon).
+  const [boundsOpen, setBoundsOpen] = useState(false);
+  const rangeRecordForTrack = useMemo(() => {
+    if (!selectedVoice) return null;
+    const speakerId = vocalTrackSpeakerId(vocalParams);
+    const sp = speakerRecordOf(selectedVoice.config, speakerId);
+    if (!sp) return null;
+    const opts = voiceSpeakerOptions(selectedVoice);
+    return {
+      sp,
+      name: selectedVoice.name,
+      backend: backendOf(selectedVoice) as "rvc" | "sovits",
+      speakerId,
+      speakerLabel: opts.length > 1 ? opts.find((s) => s.id === speakerId)?.label : undefined,
+    };
+  }, [selectedVoice, vocalParams]);
 
   // The selection = the notes to edit; the FIRST is the display anchor (its values fill the sliders; edits
   // apply to ALL selected). Recomputed only when the ids/notes change.
@@ -332,6 +353,36 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
               rvc: { ...(vocalParams.rvc ?? {}), range_formant_follow: v },
             })}
           />
+        )}
+        {/* S146e — 两个边界旋钮在这里镜像一份。用户原话:「这两个旋钮仿佛还挺重要/挺常用的,
+            得做好来回调的准备」,而它们此前只在资源管理器里,每调一次都要开一次浮动面板。
+            ⛔ 三条不许改回去的形状(全在 RangeBoundsEditor 的注释里,连同量出它们的那次侦察):
+              ⒜ 本地暂存 + 显式 OK —— 直接接侧栏的 `Slider` 会每帧写盘 + 开一串空历史事务;
+              ⒝ 两个边界一次写完 —— 否则后端 RANGE_INVALID,而那条错误在 UI 上不可见;
+              ⒞ 必须写出歌手名 —— 这里的歌手是 spk_mix 里权重最大的那位,用户没显式选过。
+            ⚠ 折叠着:这是模型级(全机)设置,放在 per-track 面板里,默认不该看起来像轨道属性。 */}
+        {vocalParams.rangeExtend === true && rangeRecordForTrack && (
+          <div className="vsb-inline vsb-range-bounds">
+            {!boundsOpen ? (
+              <button
+                className="rm-range-btn"
+                title={t("vocalEditor.sidebar.rangeBoundsTip")}
+                onClick={() => setBoundsOpen(true)}
+              >
+                {t("vocalEditor.sidebar.rangeBounds")}
+              </button>
+            ) : (
+              <RangeBoundsEditor
+                sp={rangeRecordForTrack.sp}
+                modelName={rangeRecordForTrack.name}
+                backend={rangeRecordForTrack.backend}
+                speakerId={rangeRecordForTrack.speakerId}
+                speakerLabel={rangeRecordForTrack.speakerLabel}
+                lang={i18n.language}
+                onClose={() => setBoundsOpen(false)}
+              />
+            )}
+          </div>
         )}
         </>)}
       </div>

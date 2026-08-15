@@ -36,9 +36,9 @@ import {
   type VoiceModelEntry,
   type VoiceType,
 } from "../../store/voice-models";
-import { runRangeTest, runRangeTestBatch, collectRangeTestTargets, setComfortRange, midiName, effectiveComfort, deriveCautionZones, MIN_COMFORT_SPAN, SCAN_VERSION, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
+import { runRangeTest, runRangeTestBatch, collectRangeTestTargets, midiName, effectiveComfort, deriveCautionZones, SCAN_VERSION, type SpeakerRangeRecord } from "../../lib/vocal/rangeTest";
 import { preview } from "../common/previewPlayer";
-import { ParamSlider } from "../workflow/nodes/ParamSlider";
+import { RangeBoundsEditor } from "../vocal/RangeBoundsEditor";
 import { readFile } from "@tauri-apps/plugin-fs";
 import "./MsstModelManager.css";
 
@@ -1293,8 +1293,6 @@ function RangeBatchRow({ lang }: { lang: string }) {
 function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry; voiceType: "rvc" | "sovits"; lang: string; spk: number; onSpk: (id: number) => void }) {
   const progress = useVoiceModelStore((s) => s.rangeTesting[m.name]);
   const [editing, setEditing] = useState(false);
-  const [lo, setLo] = useState(0);
-  const [hi, setHi] = useState(0);
   // S81: the record is keyed PER SPEAKER on every read side (Rust speaker_range, the node
   // gates, the vocal sidebar) but only speaker 0 was ever writable here, so a multi-speaker
   // model's other singers could never get a record — and their range-extend toggle stayed
@@ -1337,11 +1335,6 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
   // S81 F1: a record measured before the timbre dimension existed still WORKS (its damage curve
   // just can't see timbre), so this is an invitation, never a rejection.
   const stale = sp !== undefined && (sp.scan_version ?? 0) < SCAN_VERSION;
-  const commit = async () => {
-    if (!sp) { setEditing(false); return; }
-    await setComfortRange(m.name, voiceType, spk, [lo, hi]); // clampComfort enforces span
-    setEditing(false);
-  };
   if (progress !== undefined) {
     return (
       <span className="rm-range-row rm-range-testing">
@@ -1391,34 +1384,26 @@ function VoiceRangeRow({ m, voiceType, lang, spk, onSpk }: { m: VoiceModelEntry;
         </span>
       )}
       {editing ? (
+        // S146e: 四个滑条(可用域 + 舒适区)现在都在共用编辑器里 —— 人声侧栏挂的是**同一个**
+        // 组件。⛔ 别在这里重写一份:两个入口的夹取规则一旦分叉,一边写出去的记录另一边
+        // 读起来就是错的,而这条 UI 线**零渲染测试**接得住。
         <span className="rm-range-edit">
-          <ParamSlider
-            label={t18({ zh: "下限", en: "Low", ja: "下限" }, lang)}
-            min={sp.usable[0]} max={sp.usable[1]} step={1} value={lo}
-            onChange={(v) => setLo(Math.max(sp.usable[0], Math.min(v, hi - MIN_COMFORT_SPAN)))}
-            format={(v) => midiName(v)}
+          <RangeBoundsEditor
+            sp={sp}
+            modelName={m.name}
+            backend={voiceType}
+            speakerId={spk}
+            speakerLabel={speakers.find((s) => s.id === spk)?.label}
+            lang={lang}
+            onClose={() => setEditing(false)}
           />
-          <ParamSlider
-            label={t18({ zh: "上限", en: "High", ja: "上限" }, lang)}
-            min={sp.usable[0]} max={sp.usable[1]} step={1} value={hi}
-            onChange={(v) => setHi(Math.min(sp.usable[1], Math.max(v, lo + MIN_COMFORT_SPAN)))}
-            format={(v) => midiName(v)}
-          />
-          <button className="rm-range-btn" onClick={() => void commit()}>OK</button>
-          <button
-            className="rm-range-btn"
-            title={t18({ zh: "还原为自动检测值", en: "Reset to the detected value", ja: "自動検出値に戻す" }, lang)}
-            onClick={() => { void setComfortRange(m.name, voiceType, spk, sp.comfort_auto).then(() => setEditing(false)); }}
-          >
-            {t18({ zh: "还原", en: "Reset", ja: "リセット" }, lang)}
-          </button>
         </span>
       ) : (
         <>
           <button
             className="rm-range-btn"
-            title={t18({ zh: "在可用区间内微调舒适区（MIDI 音号）", en: "Adjust the comfort zone within usable (MIDI numbers)", ja: "使用可能域の中で快適域を調整（MIDI 番号）" }, lang)}
-            onClick={() => { setLo(shown![0]); setHi(shown![1]); setEditing(true); }}
+            title={t18({ zh: "调整可用域与舒适区（MIDI 音号）", en: "Adjust the usable and comfort bounds (MIDI numbers)", ja: "使用可能域と快適域を調整（MIDI 番号）" }, lang)}
+            onClick={() => setEditing(true)}
           >
             {t18({ zh: "调整", en: "Adjust", ja: "調整" }, lang)}
           </button>

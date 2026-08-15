@@ -275,3 +275,14 @@
   outline: none;
   border-color: var(--accent-primary);
 }
+
+/* S146e — 音域边界编辑器(可用域 / 舒适区)在侧栏里的容器。RangeBoundsEditor 自身的四条
+   滑条复用 NodeShell.css 的 `sep-*` 类(与资源管理器里的那一份逐字相同,NO-dup),这里只
+   负责让它在窄侧栏里排得下:纵向堆叠、缩小行距,并给那行「这是模型级设置」的说明一个
+   低对比度的注脚样式。 */
+.vsb-range-bounds { display: block; }
+.vsb-range-bounds .rbe .sep-param-row { display: flex; align-items: center; gap: 4px; margin: 2px 0; }
+.vsb-range-bounds .rbe .sep-param-row > label { flex: 0 0 62px; font-size: 11px; }
+.vsb-range-bounds .rbe .sep-overlap { flex: 1 1 auto; min-width: 0; }
+.rbe-actions { display: flex; gap: 4px; margin-top: 4px; }
+.rbe-note { margin-top: 4px; font-size: 10px; line-height: 1.35; opacity: 0.62; }

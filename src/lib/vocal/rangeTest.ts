@@ -27,6 +27,7 @@ import {
 } from "../../store/voice-models";
 import { SOVITS_DEFAULTS, RVC_DEFAULTS } from "../workflow/voiceDefaults";
 import { VOCAL_RENDER_BUSY, type ScoreTriple } from "./vocalRender";
+import { boundsPayload, type RangeBoundsEdit } from "./rangeBounds";
 
 const t = (k: string) => i18n.t(k);
 
@@ -69,6 +70,10 @@ export interface SpeakerRangeRecord {
   usable: [number, number];
   comfort: [number, number];
   comfort_auto: [number, number];
+  /** S146e — 扫描量出来的可用域,与 `comfort_auto` 对称。缺列 = S146e 之前的记录,那时
+   *  `usable` 就**是**扫描的答案(没有任何 UI 改得动它)⇒ 读侧拿 `usable` 顶替。
+   *  存在的理由:可用上界成了一个用户要来回调的旋钮,没有它就调不回去。 */
+  usable_auto?: [number, number];
   /** midi → [errCents, voicedRatio] (pre-S81) or [errCents, voicedRatio, rmsDb, lowRatio]
    *  (S81+). Readers MUST tolerate the 2-tuple: old records stay usable by design, they just
    *  cannot contribute the timbre dimension (§user 2026-07-25). */
@@ -258,6 +263,9 @@ export function buildSpeakerRecord(stats: SemitoneStat[]): SpeakerRangeRecord | 
     usable: ranges.usable,
     comfort: ranges.comfort,
     comfort_auto: ranges.comfort,
+    // S146e: the scan's own answer, kept so the user's usable knob has a "还原" to go back to.
+    // A re-test overwrites it, which is right — it IS the new measurement.
+    usable_auto: ranges.usable,
     semitones,
     tested_at: new Date().toISOString().slice(0, 10),
     ...(measured ? { scan_version: SCAN_VERSION } : {}),
@@ -592,22 +600,36 @@ export function clampComfort(usable: [number, number], comfort: [number, number]
   return [lo, hi];
 }
 
-/** Persist a user-adjusted comfort range (clamped inside usable, minimum span enforced —
- *  S60d: a degenerate committed zone centered whole songs onto a single MIDI note). */
-export async function setComfortRange(
+/* S146e: `setComfortRange`(只写 comfort 一个边界)已被下面的 `setVocalRangeBounds` 取代并
+   删除 —— 它的唯一调用点是资源管理器那个编辑器,而那个编辑器现在与人声侧栏共用
+   `RangeBoundsEditor`。留着一个「只写一半」的写入口是主动的危险:收窄 usable 那一半单独
+   落盘时 comfort 还在外面 ⇒ 后端 RANGE_INVALID,而那条错误在 UI 上完全不可见。 */
+
+/** S146e — 一次写下 usable **与** comfort 两个边界。
+ *
+ *  ⛔ 不许拆成两次调用:后端 `validate_range_record` 要求 comfort ⊆ usable,而收窄 usable
+ *  的那一半单独落盘时 comfort 还在外面 ⇒ 当场 `RANGE_INVALID`,而这条错误今天在 UI 上
+ *  完全不可见(无 catch、无文案)。夹取在 `boundsPayload` 里,后端只是最后一道闸。
+ *
+ *  返回真正落盘的那一对,让调用方可以把本地暂存对齐到被夹取后的值(否则滑条会弹回)。 */
+export async function setVocalRangeBounds(
   name: string,
   backend: Exclude<VoiceType, "vocoder">,
   speakerId: number,
+  usable: [number, number],
   comfort: [number, number],
-): Promise<void> {
+): Promise<RangeBoundsEdit | null> {
   const entry = useVoiceModelStore.getState().models[backend]?.find((m) => m.name === name);
   const existing = (entry?.config as { vocal_range?: { speakers?: Record<string, SpeakerRangeRecord> } } | undefined)
     ?.vocal_range;
   const sp = existing?.speakers?.[String(speakerId)];
-  if (!sp) return;
-  const merged = {
-    speakers: { ...existing!.speakers, [String(speakerId)]: { ...sp, comfort: clampComfort(sp.usable, comfort) } },
-  };
-  await invoke("set_model_vocal_range", { name, modelType: backend, record: merged });
+  if (!sp) return null;
+  const next = boundsPayload(sp, usable, comfort);
+  await invoke("set_model_vocal_range", {
+    name,
+    modelType: backend,
+    record: { speakers: { ...existing!.speakers, [String(speakerId)]: next } },
+  });
   await useVoiceModelStore.getState().fetchModels();
+  return { usable: next.usable, comfort: next.comfort };
 }
