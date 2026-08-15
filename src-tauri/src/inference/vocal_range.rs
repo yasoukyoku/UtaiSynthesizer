@@ -407,11 +407,57 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
     } else {
         (1..=MAX_RANGE_SHIFT).flat_map(|m| [-m, m]).collect()
     };
-    candidates.into_iter().find(|&s| {
-        dead.iter().all(|&p| range.slot_landing_ok(p + s))
-            && all.iter().all(|&p| range.slot_singable(p + s))
-    })
+    let qualifying: Vec<i64> = candidates
+        .into_iter()
+        .filter(|&s| {
+            dead.iter().all(|&p| range.slot_landing_ok(p + s))
+                && all.iter().all(|&p| range.slot_singable(p + s))
+        })
+        .collect();
+    // Bounds-only record (no raw scan) ⇒ there is nothing to rank by; keep the historical
+    // "shallowest that qualifies" verbatim.
+    if range.damage.is_none() {
+        return qualifying.into_iter().next();
+    }
+    // S146c: among the shifts that QUALIFY, land where the record says the model is actually
+    // fine — not on the first slot that merely passes the gate.
+    //
+    // Why this changed: LANDING is a binary gate (err ≤ 50¢ ∧ voiced ≥ 0.9), so "shallowest that
+    // qualifies" lands, by construction, on the WORST slot that still passes. Measured on the
+    // user's own model and phrase (akiko, notes[186..=191] = [75,76,85,83,81,80]): damage is
+    // 0.000 flat across 66-78, 0.592 at 79, saturated 3.000 at 80+. Today's −6 puts the top dead
+    // note on **79** — the last slot before the cliff — and the render came back voiced 0.17
+    // there. One semitone deeper lands the whole group at damage 0.000.
+    //
+    // The trade this reverses is explicit: depth was minimised because every extra semitone cost
+    // audible chipmunk (S85). S146 replaced the inverse engine with TD-PSOLA and that cost fell
+    // from 2.00 semitones of formant leak to 0.30 — so "as shallow as possible" is no longer the
+    // right objective. ⛔ It is NOT "always deeper" either: the record decides, and S145 measured
+    // 东雪莲's slot 78 getting 3.8 dB WORSE one semitone down.
+    //
+    // ⚠ This cannot rescue an extra note: `qualifying` is computed with the untouched predicates,
+    // so the dead set and the set of rescued groups are exactly what they were.
+    let worst = |s: i64| -> f32 {
+        dead.iter()
+            .chain(all.iter())
+            .map(|&p| range.damage_at((p + s) as f32).unwrap_or(DAMAGE_MAX))
+            .fold(0.0f32, f32::max)
+    };
+    let best = qualifying.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
+    qualifying
+        .into_iter()
+        .filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS)
+        .min_by_key(|s| s.abs())
 }
+
+/// How much worse than the best reachable landing still counts as "the same". `damage` is stored
+/// quantized to a u8 over 0..=DAMAGE_MAX, so one stored step is 3/255 ≈ 0.0118 — this is four of
+/// those, i.e. wide enough that the rule never chases quantization noise into a deeper shift.
+/// ⚠ Deliberately NOT a tuning knob: on the measured record every value from 0.00 to 0.20 picks
+/// the same shift, because the damage cliff at the top of a model's range is ~0.6 tall. If a
+/// future model makes this constant matter, that is the signal to look at the record, not to
+/// tune the constant.
+const LANDING_DAMAGE_EPS: f32 = 0.05;
 
 /// S85 七轮:COVER(音频轨/audition)的 dead-only 计划 — `dead_only_plan` 的帧域版,同一
 /// 死亡判据(slot_singable)与同一落点搜索(minimal_rescue_shift),两轨哲学统一:整曲平移
@@ -1372,6 +1418,95 @@ mod tests {
             sp["semitones_onset"] = serde_json::Value::Object(onset);
         }
         config_with(sp)
+    }
+
+    /// akiko's real record, the shape that matters: damage 0.000 flat up to 78, 0.592 at 79
+    /// (low_ratio 0.629 — the last slot before the comfort cliff), saturated at 80+.
+    fn akiko_like() -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for midi in 60..=84 {
+            // [err, voiced, rms_db, low_ratio] — the four columns the damage curve integrates.
+            let v = match midi {
+                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                _ => serde_json::json!([1, 1, -1.0, 0.25]),
+            };
+            semis.insert(midi.to_string(), v);
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 80], "comfort": [36, 79], "semitones": semis
+            })),
+            0,
+        )
+        .expect("record")
+    }
+
+    #[test]
+    fn the_rescue_lands_where_the_record_says_the_model_is_fine_not_at_the_gate() {
+        // The user's own phrase and model. Before: −6 puts the top dead note on 79, the last slot
+        // that passes the binary LANDING gate — and the real render measured voiced 0.17 there.
+        let r = akiko_like();
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let dead: Vec<i64> = vec![85, 83, 81];
+        let s = minimal_rescue_shift(&dead, &nn, &r).expect("a landing exists");
+        assert_eq!(s, -7, "must clear the cliff, not stop on it");
+
+        // …and the reason, stated as a measurement rather than a belief: every landing is at the
+        // damage floor, while the shift it used to pick was not.
+        for p in dead.iter().chain(nn.iter()) {
+            assert!(
+                r.damage_at((p + s) as f32).unwrap() <= LANDING_DAMAGE_EPS,
+                "note {p} lands on {} with damage {:?}",
+                p + s,
+                r.damage_at((p + s) as f32)
+            );
+        }
+        assert!(
+            r.damage_at((85 - 6) as f32).unwrap() > LANDING_DAMAGE_EPS,
+            "the old landing (79) must be the thing this test is rejecting"
+        );
+    }
+
+    #[test]
+    fn the_landing_rule_stays_as_shallow_as_the_record_allows() {
+        // ⛔ NOT "always deeper": once the damage floor is reached, extra depth buys nothing and
+        // costs colouring, so the shallowest floor-level shift wins. Without this the rule would
+        // happily walk to −24.
+        let r = akiko_like();
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let s = minimal_rescue_shift(&[85, 83, 81], &nn, &r).expect("a landing exists");
+        assert_eq!(s, -7);
+        assert!(
+            r.damage_at((85 - 8) as f32).unwrap() <= LANDING_DAMAGE_EPS,
+            "−8 is also at the floor — the rule must have rejected it for depth, not quality"
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_scan_keeps_the_shallowest_qualifying_shift() {
+        // Bounds-only records have no damage curve to rank by; their behaviour must not move.
+        let r = SpeakerRange::bounds((36.0, 80.0), (36.0, 79.0));
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        assert_eq!(minimal_rescue_shift(&[85, 83, 81], &nn, &r), Some(-6));
+    }
+
+    #[test]
+    fn the_landing_rule_never_changes_WHICH_notes_get_rescued() {
+        // The safety property: ranking happens INSIDE the qualifying set, so the dead set and the
+        // set of rescued groups are untouched. Asserted against the same plan the decision layer
+        // builds, not against the ranking function alone.
+        let r = akiko_like();
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
+        let fr: Vec<i64> = vec![9; nn.len()];
+        let (plan, unfixable) = dead_only_plan(&nn, 0, &r);
+        assert_eq!(unfixable.len(), 0);
+        assert_eq!(plan.len(), 1, "exactly one dead phrase, as before");
+        assert_eq!((plan[0].start, plan[0].end), (0, 5), "the same note span as before");
+        assert_eq!(plan[0].shift, -7, "…only the depth moved");
+        let _ = fr;
     }
 
     #[test]
