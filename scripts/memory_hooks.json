@@ -140,7 +140,9 @@
         "src-tauri/src/inference/vocal_range.rs",
         "src-tauri/crates/utai-stretch/",
         "src-tauri/crates/utai-dsp/src/psola.rs",
-        "scripts/range_rulers/"
+        "scripts/range_rulers/",
+        "rangeBounds.ts",
+        "RangeBoundsEditor.tsx"
       ],
       "headline": "你在动【音域扩展的逆变换】。S145 定的根因、S146 已经把引擎换成 TD-PSOLA 了,别重推;而这条线上有一个正确的方向曾经被我们自己关了四个月。",
       "must_read": [
@@ -170,7 +172,11 @@
         "⛔ **别把 sidecar 的 timbre 两列(`low_ratio`/`rms_db`)接回 `slot_singable`** —— 东雪莲身上已经翻过车(S85 三轮:70-79 全能唱却被 low_ratio>0.7 误杀),接回去会制造更多不必要的救援 ⇒ 把染色做得更糟。(`damage_at` 今天零调用点,是有原因的。)",
         "⛔ **耳判 A/B 的协议**(S145 实证,照抄):承重那一问**同场只放两个候选**(放一个很烂的会产生**顺序/锚定效应**,用户实测被它骗过一次);每组 **4 个文件 = 两版各两份**,任务是**「分成两对」**;必配**空白对照**(选一段两版**逐位相同**的音频,⛔ 发之前 assert 最大逐样本差 == 0);文件名由内容 sha1 定序,KEY 单独一份。⇒ **凡结论只有耳朵没有仪器,先标【未定】。**",
         "▶ **零成本复现整条实验链**(全是现成 env,每臂 9-12 s wall):`UTAI_MG_UST` → `dump_mg_notes` → `UTAI_MG_DUMP=1 UTAI_MG_NOTES/UTAI_MG_OUT` → `mgScoreDump.test.ts` → `UTAI_MG_SCORE/UTAI_MG_SLICE/UTAI_MG_SHIFT/UTAI_MG_INVERSE/UTAI_MG_KAPPA` → `mg_render_sovits`。⚠ 产物落**鹅妈妈** `probe\\`、文件名**不带谱标识** ⇒ **渲完立刻拷走**。素材与全部读数在 `D:\\MyDev\\TESTING\\s145_range_color\\`。",
-        "⚠ **`range_shift != 0` 在整个 Rust 树里零测试覆盖** —— S145 证伪的「base 喂错」明天可以由一次无辜重构重新变成真的,而 601 条 cargo 一条都不会红。存在性闸的写法:同一 score 用 `range_shift=0` 与 `-6` 各调一次 `build_note_hz`,断言后者每个浊帧 = 前者 × 2^(-6/12)(纯函数,不用跑模型)。"
+        "⚠ **`range_shift != 0` 在整个 Rust 树里零测试覆盖** —— S145 证伪的「base 喂错」明天可以由一次无辜重构重新变成真的,而 601 条 cargo 一条都不会红。存在性闸的写法:同一 score 用 `range_shift=0` 与 `-6` 各调一次 `build_note_hz`,断言后者每个浊帧 = 前者 × 2^(-6/12)(纯函数,不用跑模型)。",
+        "⛔⛔ 【usable / comfort 两个旋钮的接法是量出来的,不是想出来的(S146e)】。usable = 硬边界,在 `slot_singable` 里 AND 进去(单向:只可能把格子拿掉)。comfort = **已定深度预算之内**的偏好 —— 显然的写法(先把合格集合收进 comfort、再取最浅)会在更小的集合上重算 `shallowest`,深度上限从更深的锚点起算:yuyuko 的真实救援会从 −3/−1 走到 −7/−5/−4,四个半音的整段变色。而且 comfort **必须降级不许否决**:东雪莲 comfort [36,52] 对上住在 75-85 的旋律,硬 AND = 「10 组被救」变「0 组被救」,旋钮成了关机键。⇒ 改这一族之前先跑 `scratchpad/twopass.py`(8 份装机记录 × 803 triples),判据是【今天的输出一位不变】。",
+        "⛔ 【两个边界只能在同一个载荷里一次写完】(`setVocalRangeBounds`)。后端 `validate_range_record` 要求 comfort ⊆ usable;收窄 usable 那一半单独落盘时 comfort 还在外面 ⇒ RANGE_INVALID,而**这条错误今天在 UI 上完全不可见**(无 catch、无文案)。只写一半的 `setComfortRange` 已删,别复活它。",
+        "⛔ 【这条 UI 线零渲染测试】:`vitest.config.ts` 是 node 环境、include 只收 `*.test.ts` ⇒ 放进 TSX 的逻辑一条判据都不会红,新写 `*.test.tsx` 还会被**静默不收集**。⇒ 规则必须落在 `lib/vocal/rangeBounds.ts`,TSX 只做壳。资源管理器与人声侧栏共用 `RangeBoundsEditor`,别在任一边重写夹取。",
+        "⚠ 侧栏的歌手是 `governingSpeakerId`(spk_mix 里权重最大的那位),用户**从没显式选过它** ⇒ 任何改这份记录的 UI 都必须写出歌手名,否则是无声地改错人。而 usable/comfort 是模型的**磁盘 sidecar**:全局于整台机器、不进 .usp、不进 undo。"
       ]
     }
   ]
