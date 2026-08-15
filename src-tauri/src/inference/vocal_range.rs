@@ -100,13 +100,31 @@ impl SpeakerRange {
     /// With a raw scan = the usable-grade f0 criterion per slot (窗外/未测 = false — "never
     /// tested" must never read as "fine"); bounds-only records fall back to the usable bounds.
     fn slot_singable(&self, midi: i64) -> bool {
+        // S146e: the `usable` bounds are ANDed in on BOTH arms — they are the user's knob, and
+        // until now the raw-scan arm ignored them completely. That is the bug the user reported
+        // as "调节那个可用范围没用,比如我想让高音用舒适的办法去唱也做不到": narrowing the upper
+        // bound in the model manager changed the stored record, `rangeRecordSig` correctly
+        // invalidated the render — and the render came back IDENTICAL, because every predicate
+        // downstream read `slot_flags` only.
+        //
+        // ⚠ Direction check: this can only ever REMOVE slots from singable, i.e. mark MORE notes
+        // dead ⇒ more phrases handed to the rescue. It cannot silently start singing something.
+        //
+        // ⚠ Zero-change today, live tomorrow: measured across all eight installed records
+        // (scratchpad/knob_feasibility.py, 炉心融解 803 triples), `∧usable` moves nothing — the
+        // scan derives `usable` from the same per-slot data, so the bounds are already implied by
+        // the flags. The AND only bites once the user drags the slider, which is exactly the
+        // property wanted: it cannot regress today's output, and it gives the knob teeth.
+        if !(self.usable.0..=self.usable.1).contains(&(midi as f32)) {
+            return false;
+        }
         match &self.slot_flags {
             Some(f) => {
                 let slot = midi - DAMAGE_LO_MIDI as i64;
                 (0..DAMAGE_SLOTS as i64).contains(&slot)
                     && f[slot as usize] & SLOT_SINGABLE != 0
             }
-            None => (self.usable.0..=self.usable.1).contains(&(midi as f32)),
+            None => true, // bounds-only record: the bounds check above IS the whole predicate
         }
     }
 
@@ -120,6 +138,18 @@ impl SpeakerRange {
             }
             None => (self.comfort.0..=self.comfort.1).contains(&(midi as f32)),
         }
+    }
+
+    /// S146e: the PREFERRED landing — landing-grade *and* inside the user's comfort band.
+    ///
+    /// ⛔ Deliberately NOT folded into `slot_landing_ok` as a hard AND. Measured on the eight
+    /// installed records: 东雪莲's stored comfort is [36,52] while the phrase lives at 75-85, so a
+    /// hard AND takes it from "10 groups rescued / 0 unsolvable" to "0 rescued / 10 unsolvable" —
+    /// i.e. the knob would silently switch range extension OFF for that model. `comfort` is a
+    /// *preference* (where the model sounds good), `usable` is a *bound* (where it can sing at
+    /// all); only the latter can be load-bearing. See `minimal_rescue_shift`'s two passes.
+    fn slot_landing_preferred(&self, midi: i64) -> bool {
+        self.slot_landing_ok(midi) && (self.comfort.0..=self.comfort.1).contains(&(midi as f32))
     }
 
     /// Damage at a (possibly fractional) MIDI pitch, linearly interpolated between slots.
@@ -450,10 +480,46 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
     // picks −10..−24 where it used to pick −6/−4 — and a −24 whole-song recolour is the exact
     // outcome the user identified by ear as a catastrophe (S85b, dev log A/B 23:24 vs 23:44).
     let shallowest = qualifying.iter().copied().min_by_key(|s| s.abs())?;
-    let pool: Vec<i64> = qualifying
+    let mut pool: Vec<i64> = qualifying
         .into_iter()
         .filter(|s| s.abs() <= shallowest.abs() + LANDING_MAX_EXTRA_DEPTH)
         .collect();
+
+    // S146e, the comfort knob: inside the depth budget already fixed above, prefer landings that
+    // sit in the user's comfort band. This is the "让高音用舒适的办法去唱" request.
+    //
+    // ⛔ It is a preference INSIDE the budget, never a new budget — and that placement is the
+    // whole design, measured rather than assumed. The obvious implementation (restrict the
+    // qualifying set to comfort, THEN take the shallowest) recomputes `shallowest` over a smaller
+    // set, so the depth cap starts counting from a deeper anchor: on yuyuko (usable [36,82],
+    // comfort [37,79]) it moves the real 炉心融解 rescues from −3/−1 to −7/−5/−4 — a four-semitone
+    // recolour nobody has heard, which is precisely the failure S146c-hotfix just removed.
+    // As written, all eight installed records render byte-identically today
+    // (scratchpad/twopass.py, 803 triples × 8 models), and the knob bites the moment it is moved.
+    //
+    // ⛔ And it must degrade, not veto: 东雪莲 stores comfort [36,52] for a phrase living at
+    // 75-85. A hard AND would take it from "10 groups rescued" to "0 rescued / 10 unsolvable" —
+    // the knob would be a kill switch for range extension on that model.
+    let in_comfort: Vec<i64> = pool
+        .iter()
+        .copied()
+        .filter(|&s| dead.iter().all(|&p| range.slot_landing_preferred(p + s)))
+        .collect();
+    if in_comfort.is_empty() {
+        // Audited per group. A silent relaxation of the user's own setting is exactly the
+        // "验证本身是空的" shape — the knob would look connected and quietly not be.
+        tracing::info!(
+            "range: dead {:?} has no landing inside comfort [{:.0},{:.0}] within the depth budget \
+             (shallowest {shallowest}, +{LANDING_MAX_EXTRA_DEPTH}) — using landing-grade slots {:?}",
+            dead,
+            range.comfort.0,
+            range.comfort.1,
+            pool
+        );
+    } else {
+        pool = in_comfort;
+    }
+
     let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
     pool.into_iter()
         .filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS)
@@ -1466,6 +1532,136 @@ mod tests {
             0,
         )
         .expect("record")
+    }
+
+    /// `akiko_like()` with the two knobs moved — the only thing the user can actually change.
+    fn akiko_like_with(usable: (i64, i64), comfort: (i64, i64)) -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for midi in 60..=84 {
+            let v = match midi {
+                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                _ => serde_json::json!([1, 1, -1.0, 0.25]),
+            };
+            semis.insert(midi.to_string(), v);
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [usable.0, usable.1],
+                "comfort": [comfort.0, comfort.1],
+                "semitones": semis
+            })),
+            0,
+        )
+        .expect("record")
+    }
+
+    #[test]
+    fn narrowing_the_usable_ceiling_actually_marks_more_notes_dead() {
+        // S146e, the user's report: "调节那个可用范围没用…我想让高音用舒适的办法去唱也做不到".
+        // The raw-scan arm of `slot_singable` read `slot_flags` only, so dragging the ceiling
+        // changed the stored record, correctly invalidated the render — and produced the same
+        // audio. 78 is a slot the scan calls fine (damage 0.000); the knob must still veto it.
+        let wide = akiko_like_with((36, 80), (36, 79));
+        let tight = akiko_like_with((36, 76), (36, 76));
+        assert!(wide.slot_singable(78), "78 is scan-clean — the fixture must start here");
+        assert!(!tight.slot_singable(78), "the ceiling at 76 must veto 78");
+        assert!(tight.slot_singable(76), "the ceiling is inclusive");
+
+        // …and the veto has to reach the thing the user hears: the phrase plan.
+        let nn: Vec<i64> = vec![70, 78];
+        let (plan_wide, _) = dead_only_plan(&nn, 0, &wide);
+        let (plan_tight, _) = dead_only_plan(&nn, 0, &tight);
+        assert!(plan_wide.is_empty(), "nothing is dead at the wide ceiling");
+        assert_eq!(plan_tight.len(), 1, "the tight ceiling must hand this phrase to the rescue");
+        assert!(plan_tight[0].shift < 0, "and pull it down, got {}", plan_tight[0].shift);
+    }
+
+    #[test]
+    fn the_usable_knob_can_only_take_slots_away_never_add_them() {
+        // Direction guard: a knob that could ADD singable slots would let the user talk the model
+        // into singing something the scan measured as dead — the exact "自证" shape.
+        let wide = akiko_like_with((36, 96), (36, 96));
+        for midi in 30..=100 {
+            for &(lo, hi) in &[(36i64, 80i64), (60, 76), (36, 60), (70, 90)] {
+                let narrow = akiko_like_with((lo, hi), (lo, hi.min(hi)));
+                if narrow.slot_singable(midi) {
+                    assert!(
+                        wide.slot_singable(midi),
+                        "usable [{lo},{hi}] made {midi} singable when the open record does not"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_comfort_knob_prefers_a_comfortable_landing_inside_the_depth_budget() {
+        // Ceiling 78 ⇒ 80 is dead and −1 is not available (79 stops being singable), so the
+        // shallowest landing is −2 and the budget covers {−2, −3}. Damage is flat at 0.000 across
+        // both, so today's rule breaks the tie by depth and answers −2. Moving comfort to 77 makes
+        // −2's landing (78) uncomfortable and −3's (77) comfortable — the pick must follow.
+        let nn: Vec<i64> = vec![70, 80];
+        let dead: Vec<i64> = vec![80];
+        let open = akiko_like_with((36, 78), (36, 78));
+        let tight = akiko_like_with((36, 78), (36, 77));
+        assert_eq!(minimal_rescue_shift(&dead, &nn, &open), Some(-2), "baseline");
+        assert_eq!(
+            minimal_rescue_shift(&dead, &nn, &tight),
+            Some(-3),
+            "comfort ending at 77 must pull the landing off 78 and onto 77"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_comfort_band_degrades_instead_of_killing_the_rescue() {
+        // 东雪莲's real shape: comfort [36,52] against a phrase at 75-85. A hard AND would take
+        // it from "10 groups rescued" to "0 rescued / 10 unsolvable" — the knob as kill switch.
+        let r = akiko_like_with((36, 80), (36, 52));
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
+        let dead: Vec<i64> = vec![85, 83, 81];
+        assert_eq!(
+            minimal_rescue_shift(&dead, &nn, &r),
+            Some(-7),
+            "an out-of-reach comfort band must fall back to today's answer, not refuse"
+        );
+    }
+
+    #[test]
+    fn the_comfort_preference_never_spends_more_depth_than_the_budget_allows() {
+        // ⛔ The regression this pins is one I measured and rejected: restricting the qualifying
+        // set to comfort BEFORE taking the shallowest re-anchors the depth cap, and on yuyuko
+        // (usable [36,82], comfort [37,79]) that walks the real rescues from −3 to −7.
+        // Here: comfort tops out at 72 while the budget covers only {−2, −3}. A comfortable
+        // landing IS reachable (−8, −9, −10 all qualify and all land 80 inside comfort) — the
+        // rule must decline to spend that depth and stay at −2.
+        let nn: Vec<i64> = vec![70, 80];
+        let dead: Vec<i64> = vec![80];
+        let r = akiko_like_with((36, 78), (36, 72));
+
+        // ⛔ The positive control the first version of this test lacked, which made it vacuous:
+        // with comfort at 66 no QUALIFYING shift could reach comfort at all (70 would fall out of
+        // the scanned band), so the rejected implementation and this one agreed and the mutation
+        // came back green. Assert the temptation exists before asserting it was resisted.
+        let reachable: Vec<i64> = (-24..=-1)
+            .filter(|&s| {
+                dead.iter().all(|&p| r.slot_landing_preferred(p + s))
+                    && nn.iter().all(|&p| r.slot_singable(p + s))
+            })
+            .collect();
+        assert!(
+            !reachable.is_empty(),
+            "no comfortable landing is reachable ⇒ this test cannot distinguish the two rules"
+        );
+
+        let s = minimal_rescue_shift(&dead, &nn, &r).expect("a landing exists");
+        assert_eq!(s, -2, "must not dive to reach comfort, got {s} (reachable: {reachable:?})");
+        assert!(
+            !r.slot_landing_preferred(80 + s),
+            "the test is only meaningful if the chosen landing is genuinely outside comfort"
+        );
     }
 
     #[test]
