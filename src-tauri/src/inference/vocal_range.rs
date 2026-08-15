@@ -71,9 +71,28 @@ const SLOT_LANDING: u8 = 1 << 1; // landing-grade: err ≤ 50¢ && voiced ≥ 0.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpeakerRange {
-    /// MIDI bounds, inclusive.
+    /// MIDI bounds, inclusive. ⚠ S146f: this is the USER's line — "which score notes should be
+    /// rescued" — and it is NOT a bound on what the model may be asked to sing. See
+    /// `reach` below and `slot_reachable`.
     pub usable: (f32, f32),
     pub comfort: (f32, f32),
+    /// S146f: the SCAN's own usable bounds (record key `usable_auto`; absent ⇒ = `usable`,
+    /// which is a statement of fact for pre-S146e records — nothing could edit `usable` then).
+    ///
+    /// ⛔ Why this is a separate field, measured rather than assumed: `usable` was being used for
+    /// two jobs whose correct response to the user narrowing it is OPPOSITE.
+    ///   ⑴ "is this score note dead (⇒ rescue it)" — narrowing MUST bite; that is the knob.
+    ///   ⑵ "after moving the phrase by s, can every note still be voiced" — this asks about the
+    ///      MODEL's physical ability, not the user's intent, and narrowing must NOT bite.
+    /// Sharing one predicate made ⑵ tighten with ⑴, which pushed every existing landing deeper:
+    /// measured on the user's own model and song (akiko, 炉心融解), dropping the ceiling 79→77
+    /// moved every rescue from −2/−5/−7 to −3/−6/−8, and 79→74 took it to −6/−9/−11 (dose
+    /// 251 → 523 semitone·seconds) — while the group count and rescued seconds stayed IDENTICAL.
+    /// The user heard that as "把可用上限往下调 反而是负效果". With the split, the same sweep
+    /// holds the landings at −1/−2/−5/−7 all the way down (dose 256-258) and the knob becomes
+    /// monotone: lowering it only ADDS rescues, it never makes an existing one worse.
+    /// ⇒ 用户 2026-08-15 拍板:「可用上限」只管「哪些音要救」。
+    pub reach: (f32, f32),
     /// S81 (E): per-semitone damage derived from the record's RAW scan, MIDI 36..=96,
     /// quantized 0..DAMAGE_MAX. `None` = the record predates the scan (or carries none) — the
     /// decision then falls back to the pre-S81 four-step usable/comfort ladder verbatim.
@@ -93,7 +112,7 @@ pub struct SpeakerRange {
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
-        Self { usable, comfort, damage: None, slot_flags: None }
+        Self { usable, comfort, reach: usable, damage: None, slot_flags: None }
     }
 
     /// S85 dead-only: can the model produce a pitch AT ALL at this (integer) MIDI slot?
@@ -118,13 +137,28 @@ impl SpeakerRange {
         if !(self.usable.0..=self.usable.1).contains(&(midi as f32)) {
             return false;
         }
+        self.slot_voiceable(midi)
+    }
+
+    /// S146f: can the MODEL voice this slot at all — the scan's verdict, with the scan's own
+    /// bounds. Deliberately blind to the user's `usable` line.
+    ///
+    /// ⛔ This is the predicate for "after moving the phrase, does every note still come out",
+    /// which is a question about the model, not about what the user wants rescued. Folding the
+    /// user's line into it is what made the ceiling knob non-monotone in quality (see `reach`).
+    fn slot_reachable(&self, midi: i64) -> bool {
+        (self.reach.0..=self.reach.1).contains(&(midi as f32)) && self.slot_voiceable(midi)
+    }
+
+    /// The scan's per-slot f0 verdict alone (no bounds of any kind).
+    fn slot_voiceable(&self, midi: i64) -> bool {
         match &self.slot_flags {
             Some(f) => {
                 let slot = midi - DAMAGE_LO_MIDI as i64;
                 (0..DAMAGE_SLOTS as i64).contains(&slot)
                     && f[slot as usize] & SLOT_SINGABLE != 0
             }
-            None => true, // bounds-only record: the bounds check above IS the whole predicate
+            None => true, // bounds-only record: the caller's bounds check IS the whole predicate
         }
     }
 
@@ -232,6 +266,13 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         (lo <= hi).then_some((lo, hi))
     };
     let usable = pair("usable")?;
+    // S146f: the scan's own bounds. Absent ⇒ = `usable` (a fact for pre-S146e records: nothing
+    // could edit it then). ⚠ A hand-poisoned sidecar could hold a `usable_auto` NARROWER than
+    // `usable`; union them so the split can only ever widen what the drag check accepts, never
+    // secretly narrow it below what today's build already allows.
+    let reach = pair("usable_auto")
+        .map(|a| (a.0.min(usable.0), a.1.max(usable.1)))
+        .unwrap_or(usable);
     if usable.1 - usable.0 < MIN_COMFORT_SPAN {
         return None;
     }
@@ -313,7 +354,7 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         }
     }
     let slot_flags = damage.is_some().then_some(flags);
-    Some(SpeakerRange { usable, comfort, damage, slot_flags })
+    Some(SpeakerRange { usable, comfort, reach, damage, slot_flags })
 }
 
 /// Structural write-side gate for a full `vocal_range` record (`{ speakers: { id: {...} } }`).
@@ -440,8 +481,12 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
     let qualifying: Vec<i64> = candidates
         .into_iter()
         .filter(|&s| {
+            // ⛔ `slot_reachable`, NOT `slot_singable`: this asks whether the MODEL can voice the
+            // moved phrase, so it must read the scan's bounds — never the user's rescue line
+            // (S146f; using `slot_singable` here made every landing walk deeper as the user
+            // lowered the ceiling, which is the regression they reported by ear).
             dead.iter().all(|&p| range.slot_landing_ok(p + s))
-                && all.iter().all(|&p| range.slot_singable(p + s))
+                && all.iter().all(|&p| range.slot_reachable(p + s))
         })
         .collect();
     // Bounds-only record (no raw scan) ⇒ there is nothing to rank by; keep the historical
@@ -1534,7 +1579,38 @@ mod tests {
         .expect("record")
     }
 
+    /// `akiko_like()` with the two knobs moved AND the scan's own bounds recorded — i.e. the
+    /// shape every record written since S146e has, and the only shape in which the S146f split
+    /// is observable at all.
+    /// ⛔ A fixture without `usable_auto` makes `reach == usable`, which silently turns every
+    /// split assertion into a tautology. That is why this exists separately.
+    fn akiko_like_edited(usable: (i64, i64), comfort: (i64, i64), auto: (i64, i64)) -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for midi in 60..=84 {
+            let v = match midi {
+                80 => serde_json::json!([3, 0.69, -6.7, 0.93]),
+                81 => serde_json::json!([9, 0.22, -13.3, 0.449]),
+                82..=84 => serde_json::json!([9999, 0, -22.0, 0.5]),
+                79 => serde_json::json!([1, 1, -1.3, 0.629]),
+                _ => serde_json::json!([1, 1, -1.0, 0.25]),
+            };
+            semis.insert(midi.to_string(), v);
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [usable.0, usable.1],
+                "usable_auto": [auto.0, auto.1],
+                "comfort": [comfort.0, comfort.1],
+                "semitones": semis
+            })),
+            0,
+        )
+        .expect("record")
+    }
+
     /// `akiko_like()` with the two knobs moved — the only thing the user can actually change.
+    /// ⚠ No `usable_auto` ⇒ this is the PRE-S146e shape (reach == usable). Use
+    /// `akiko_like_edited` for anything that exercises the split.
     fn akiko_like_with(usable: (i64, i64), comfort: (i64, i64)) -> SpeakerRange {
         let mut semis = serde_json::Map::new();
         for midi in 60..=84 {
@@ -1556,6 +1632,83 @@ mod tests {
             0,
         )
         .expect("record")
+    }
+
+    #[test]
+    fn the_ceiling_knob_adds_rescues_without_deepening_the_ones_already_there() {
+        // ⭐⭐ S146f, the regression the user reported by ear: "把音域上限往下调 反而是负效果…
+        // 之前报的那几处高音直接就炸了". Measured on their own model and song (akiko, 炉心融解):
+        // dropping the ceiling 79→77 kept the group count and the rescued seconds IDENTICAL but
+        // moved every landing one semitone deeper (−2/−5/−7 → −3/−6/−8), and 79→74 took it to
+        // −6/−9/−11 — dose 251 → 523 semitone·seconds. The cause was one predicate doing two
+        // jobs; see `SpeakerRange::reach`.
+        //
+        // This test is the whole point of the split, so it asserts BOTH halves: the knob must
+        // still bite (more dead), and it must stop making existing rescues worse (same shift).
+        // Both arms carry the SAME scan (`usable_auto` = [36,80], akiko's real value); the only
+        // difference is where the user put the line.
+        let wide = akiko_like_edited((36, 80), (36, 79), (36, 80));
+        let tight = akiko_like_edited((36, 76), (36, 76), (36, 80));
+        let nn: Vec<i64> = vec![70, 78, 85];
+
+        let (pw, _) = dead_only_plan(&nn, 0, &wide);
+        let (pt, _) = dead_only_plan(&nn, 0, &tight);
+        assert_eq!(pw.len(), 1);
+        assert_eq!(pt.len(), 1);
+        assert_eq!(
+            pt[0].shift, pw[0].shift,
+            "the ceiling moved 80→76 and the landing must NOT follow it down (got {} vs {})",
+            pt[0].shift, pw[0].shift
+        );
+
+        // …and the knob is not merely inert: at the tight ceiling 78 IS dead, at the wide one it
+        // is not. Without this half the test would pass on a build that ignored the knob entirely.
+        assert!(wide.slot_singable(78) && !tight.slot_singable(78), "the knob must still bite");
+
+        // The landing itself may sit above the user's line — that is exactly the semantic the
+        // user chose (2026-08-15): the ceiling says WHICH NOTES to rescue, not what the model
+        // may be asked to sing. Pin it, because it is the surprising half.
+        let land = 85 + pt[0].shift;
+        assert!(
+            land as f32 > tight.usable.1,
+            "expected the rescue to land above the user's line (got {land})"
+        );
+        assert!(tight.slot_reachable(land), "…but never outside what the scan says is voiceable");
+    }
+
+    #[test]
+    fn the_reach_bounds_fall_back_to_usable_when_the_record_has_no_usable_auto() {
+        // Every pre-S146e record on disk lacks the column, and for those `usable` IS the scan's
+        // answer (nothing could edit it then) ⇒ the split must be a no-op there, not a widening.
+        let r = akiko_like_with((36, 78), (36, 78));
+        assert_eq!(r.reach, r.usable);
+        for midi in 36..=96 {
+            assert_eq!(
+                r.slot_singable(midi),
+                r.slot_reachable(midi),
+                "slot {midi} must behave identically when the record predates usable_auto"
+            );
+        }
+    }
+
+    #[test]
+    fn a_poisoned_usable_auto_can_only_widen_the_reach_never_narrow_it() {
+        // Defensive: a hand-edited sidecar could hold a `usable_auto` NARROWER than `usable`.
+        // The union in `speaker_range` must keep the drag check at least as permissive as the
+        // build without the split — otherwise a bad file silently removes rescues.
+        let mut semis = serde_json::Map::new();
+        for midi in 60..=84 {
+            semis.insert(midi.to_string(), serde_json::json!([1, 1, -1.0, 0.25]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 80], "usable_auto": [50, 70], "comfort": [36, 79],
+                "semitones": semis
+            })),
+            0,
+        )
+        .expect("record");
+        assert_eq!(r.reach, (36.0, 80.0), "reach must be the UNION, got {:?}", r.reach);
     }
 
     #[test]
