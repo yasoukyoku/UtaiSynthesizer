@@ -79,11 +79,12 @@ export interface SpeakerRangeRecord {
    *  cannot contribute the timbre dimension (§user 2026-07-25). */
   semitones: Record<string, [number, number] | [number, number, number, number]>;
   /** S146b — the SECOND probe pass, shaped like real singing (short note + voiceless onset):
-   *  midi → [errCents, voicedRatio]. Absent on every pre-S146b record, and the Rust reader
+   *  midi → [errCents, voicedRatio] (scan_version 3) or [errCents, voicedRatio, rmsDb, lowRatio]
+   *  (S146f, scan_version 4+). Absent on every pre-S146b record, and the Rust reader
    *  treats absent as "no veto", so old sidecars decide exactly as they did.
    *  ⛔ It may only ever NARROW the landing band (see vocal_range.rs::speaker_range) — the dead
    *  set is decided by `semitones` alone, so a second pass can never rescue an extra note. */
-  semitones_onset?: Record<string, [number, number]>;
+  semitones_onset?: Record<string, [number, number] | [number, number, number, number]>;
   tested_at: string;
   /** Scan format/probe version. Absent = pre-S81 (120 ms probe, f0-only). Bump whenever the
    *  probe conditions or the stored dimensions change, so the UI can say "worth re-testing"
@@ -98,8 +99,13 @@ export interface SpeakerRangeRecord {
  *      before this carries no such pass, so it keeps the 「あ」-only landing verdict — correct,
  *      but it means the fix does not reach a model until it is re-tested. Bumping is how the user
  *      finds that out: `MsstModelManager` marks `scan_version < SCAN_VERSION` as stale and the
- *      batch collector picks those models up. */
-export const SCAN_VERSION = 3;
+ *      batch collector picks those models up.
+ *  4 = S146f: that second pass now STORES what it measures. It ran with `withQuality: false`,
+ *      so it kept only [err, voiced] — the exact pair S81 proved cannot see a level/timbre
+ *      collapse — which made it an empty criterion for the failure it was built to catch
+ *      (「か」@MIDI 80 measures rms −12.27 dB, all but mute, and was recorded as `[3, 1]`).
+ *      A v3 record is not wrong, just blind on that axis; re-testing is what fixes it. */
+export const SCAN_VERSION = 4;
 
 // ── pure pieces (vitest) ──────────────────────────────────────────────────────
 
@@ -440,13 +446,24 @@ export async function runRangeTest(
     // (the Rust reader never SETS the bit from this map), so a failure here is not worth aborting
     // a finished scan over: the record simply keeps the pre-S146b landing verdict.
     try {
-      const onset = await pass(ONSET_PROBE_LYRIC, ONSET_PROBE_FRAMES, 0.5, 0.95, false);
+      // S146f: `withQuality: true`. The pass measured level and timbre all along and then threw
+      // them away — which made this whole probe an empty criterion for exactly the failure it
+      // was built to catch. S81 established that [err, voiced] cannot see a level collapse;
+      // S146b then stored only [err, voiced]. Measured on disk: 「か」@MIDI 80 = rms −12.27 dB
+      // (all but mute) recorded as `[3, 1]` — perfect. See vocal_range.rs's onset veto.
+      const onset = await pass(ONSET_PROBE_LYRIC, ONSET_PROBE_FRAMES, 0.5, 0.95, true);
       const map: NonNullable<SpeakerRangeRecord["semitones_onset"]> = {};
       for (const st of onset) {
-        map[String(st.midi)] = [
+        const head: [number, number] = [
           Number.isFinite(st.errCents) ? Math.round(st.errCents) : 9999,
           Math.round(st.voicedRatio * 100) / 100,
         ];
+        // 4-tuple only when the quality pass actually produced numbers — a partial tuple must
+        // never look like a measurement (the Rust reader treats a missing column as "no veto").
+        map[String(st.midi)] =
+          Number.isFinite(st.rmsDb) && Number.isFinite(st.lowRatio)
+            ? [...head, Math.round(st.rmsDb! * 10) / 10, Math.round(st.lowRatio! * 1000) / 1000]
+            : head;
       }
       record.semitones_onset = map;
     } catch (e) {

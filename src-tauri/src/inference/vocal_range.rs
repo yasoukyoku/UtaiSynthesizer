@@ -109,6 +109,17 @@ pub struct SpeakerRange {
     pub slot_flags: Option<[u8; DAMAGE_SLOTS]>,
 }
 
+/// Level (dB below the probe scale's own loudest note) at which `damage_from_scan` starts
+/// counting loss, and — since S146f — the cut at which the onset probe vetoes a LANDING.
+///
+/// ⚠ Deliberately ONE constant for both, and deliberately not a new number: `rms_db` is measured
+/// relative to each probe's own peak (`commands/inference.rs:1210-1215`), so the two passes are
+/// on the same scale and the threshold that already means "damage" for one means it for the
+/// other. Calibration on the user's own record (akiko, 「あ」 pass over its usable band):
+/// 72 −0.7 · 73 −0.5 · 76 −3.0 · 77 −1.4 · 78 −0.3 · 79 −1.3 · **80 −6.7** — only the slot that
+/// is actually collapsing crosses it.
+const RMS_FREE_DB: f64 = -6.0;
+
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
@@ -240,7 +251,7 @@ fn damage_from_scan(err_cents: f64, voiced: f64, timbre: Option<(f64, f64)>) -> 
     let (thin, quiet) = match timbre {
         Some((rms_db, low_ratio)) => (
             (((low_ratio - 0.55) / 0.40).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
-            (((-6.0 - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
+            (((RMS_FREE_DB - rms_db) / 12.0).clamp(0.0, 1.0) as f32) * DAMAGE_MAX,
         ),
         None => (0.0, 0.0),
     };
@@ -348,7 +359,22 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
             ) else {
                 continue;
             };
-            if !(err <= 50.0 && voiced >= 0.9) {
+            // S146f: the level column, when the record carries it. Why this had to be added:
+            // S81 spent a whole session establishing that the f0 pair CANNOT see a timbre/level
+            // collapse — and S146b then built this second probe on exactly that pair. Measured
+            // counterexample straight off disk: akiko's 「か」 probe at MIDI 80 renders at
+            // **rms −12.27 dB** (its own scale's peak as 0) with HNR 12.44 against a 24.34
+            // neighbour mean — i.e. all but mute — and the stored tuple was `[3, 1]`: perfect
+            // pitch, perfect voicing, LANDING left set.
+            //
+            // ⚠ Only the LEVEL column is consumed. `low_ratio` is stored from this pass too, but
+            // vetoing on it needs a distribution nobody has yet (no record on disk has ever
+            // carried onset-pass timbre columns), and akiko's 「あ」 pass already sits at 0.629 at
+            // slot 79 — above `damage_from_scan`'s 0.55 free point — so a naive AND there would
+            // move real landings on a guess. Decide it from data after the first re-scan.
+            let onset_rms = a.get(2).and_then(|x| x.as_f64());
+            let level_ok = onset_rms.map_or(true, |r| r >= RMS_FREE_DB);
+            if !(err <= 50.0 && voiced >= 0.9 && level_ok) {
                 flags[slot as usize] &= !SLOT_LANDING;
             }
         }
@@ -1632,6 +1658,102 @@ mod tests {
             0,
         )
         .expect("record")
+    }
+
+    /// A record whose onset pass carries the S146f level column.
+    fn with_onset_level(midi: i64, err: f64, voiced: f64, rms_db: f64) -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        let mut onset = serde_json::Map::new();
+        for m in 60..=84 {
+            semis.insert(m.to_string(), serde_json::json!([1, 1, -1.0, 0.25]));
+            onset.insert(m.to_string(), serde_json::json!([1, 1, -0.5, 0.25]));
+        }
+        onset.insert(midi.to_string(), serde_json::json!([err, voiced, rms_db, 0.25]));
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 84], "comfort": [36, 84],
+                "semitones": semis, "semitones_onset": onset
+            })),
+            0,
+        )
+        .expect("record")
+    }
+
+    #[test]
+    fn the_onset_probe_vetoes_a_landing_the_model_can_pitch_but_cannot_voice() {
+        // ⛔ THE counterexample, measured off the user's own disk: akiko's 「か」 probe at MIDI 80
+        // renders at rms −12.27 dB relative to that scale's own peak — all but mute — while its
+        // f0 columns read perfect. The stored tuple was `[3, 1]` and LANDING stayed set.
+        //
+        // This is S81's lesson repeating: that session established the f0 pair cannot see a
+        // level/timbre collapse, and S146b then built the entire second probe on that pair.
+        let mute = with_onset_level(80, 3.0, 1.0, -12.27);
+        assert!(
+            !mute.slot_landing_ok(80),
+            "a slot the onset probe measured at −12.27 dB must not be a landing"
+        );
+        // …and the f0 columns alone must NOT have been what rejected it — otherwise this test
+        // would pass on the build that throws the level away.
+        let f0_only = with_onset_level(80, 3.0, 1.0, -0.5);
+        assert!(f0_only.slot_landing_ok(80), "err 3 / voiced 1.00 is a passing f0 reading");
+        // Neighbours are untouched: the veto is per slot, not a band.
+        assert!(mute.slot_landing_ok(79) && mute.slot_landing_ok(81));
+        // And it never touches the DEAD set — the onset pass may only ever narrow landings.
+        assert!(mute.slot_singable(80), "the onset probe must not change which notes get rescued");
+    }
+
+    #[test]
+    fn the_onset_level_veto_fires_exactly_at_the_documented_cut() {
+        // ⛔ LITERALS, and specifically the ones measured off the user's own record — NOT
+        // `RMS_FREE_DB`. An assertion that references the constant under test moves with it and
+        // can never catch a drift; that shape has already produced two empty criteria this
+        // session. These numbers are akiko's real 「あ」 pass across its usable band, where the
+        // only slot that is actually collapsing is 80.
+        // The record's own values leave a gap between −3.0 and −6.7, so the literals below can
+        // only catch a LOOSENING. Pin the number itself for the other direction — this is a
+        // "changing it must be deliberate" guard, not an expected value computed FROM it.
+        assert_eq!(
+            RMS_FREE_DB, -6.0,
+            "calibrated against measured records (akiko's healthy band bottoms out at −3.0, its \
+             collapsing slot at −6.7); moving it needs new measurements, not a nudge"
+        );
+        for (rms, want_landing) in [
+            (-0.3, true),  // slot 78
+            (-1.3, true),  // slot 79
+            (-1.4, true),  // slot 77
+            (-3.0, true),  // slot 76 — the quietest healthy slot on this model
+            (-6.7, false), // slot 80 — the one that measurably dies
+        ] {
+            assert_eq!(
+                with_onset_level(75, 1.0, 1.0, rms).slot_landing_ok(75),
+                want_landing,
+                "onset rms {rms} dB should {} land",
+                if want_landing { "" } else { "NOT" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_column_onset_record_decides_exactly_as_it_did_before() {
+        // Every record on disk today is scan_version 3 (f0 columns only). Reading a missing
+        // level column as "collapsed" would silently un-land half of everyone's models.
+        let mut semis = serde_json::Map::new();
+        let mut onset = serde_json::Map::new();
+        for m in 60..=84 {
+            semis.insert(m.to_string(), serde_json::json!([1, 1, -1.0, 0.25]));
+            onset.insert(m.to_string(), serde_json::json!([1, 1]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 84], "comfort": [36, 84],
+                "semitones": semis, "semitones_onset": onset
+            })),
+            0,
+        )
+        .expect("record");
+        for m in 60..=84 {
+            assert!(r.slot_landing_ok(m), "slot {m} must keep its pre-S146f landing verdict");
+        }
     }
 
     #[test]
