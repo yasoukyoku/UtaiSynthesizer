@@ -109,7 +109,8 @@
       "arm_k1.wav":    {"envelope_shift_st": 5.50, "peak_corr": 0.951, "flux_median_db": 1.32, "hnr_delta_db": 0.22, "voiced_survival": 1.0000},
       "arm_k0.wav":    {"envelope_shift_st": 2.40, "peak_corr": 0.961, "flux_median_db": -5.25, "hnr_delta_db": 1.34, "voiced_survival": 0.9873},
       "arm_world.wav": {"envelope_shift_st": 0.20, "peak_corr": 0.981, "flux_median_db": 1.26, "hnr_delta_db": 0.87, "voiced_survival": 0.9909},
-      "arm_psola.wav": {"envelope_shift_st": 0.30, "peak_corr": 0.983, "flux_median_db": 0.53, "hnr_delta_db": -1.44, "voiced_survival": 0.9457}
+      "arm_psola.wav": {"envelope_shift_st": 0.30, "peak_corr": 0.983, "flux_median_db": 0.53, "hnr_delta_db": -1.44, "voiced_survival": 0.9457,
+        "_MISLABEL": "⛔⛔ 这一行是 **praat** 的臂,不是我们的引擎。实证:`arm_psola.wav` 与 `arm_praat_p6.wav` 的 sha256 **逐位相同**(fca51cda…)。我们自己的引擎在**同一口径**下读 **+0.50 / −1.66**(见 utai-dsp/src/psola.rs 头注,S146)。⇒ 拿这一行当「我们引擎的基线」会让下一次换引擎对拍**偏乐观约 0.4 dB**。发版前要么重生成一份真正属于我们的臂并改名,要么把这一行改名为 arm_praat_p6。S146g 侦察发现。"}
     },
     "ref_hnr_db": 23.68,
     "ref_f0_median_hz": 610.0

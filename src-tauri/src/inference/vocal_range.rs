@@ -972,6 +972,19 @@ pub fn inverse_engine() -> InverseEngine {
     }
 }
 
+/// S146g — carry the sub-sample transport residual instead of dropping it. **Default off.**
+///
+/// The measurement is unambiguous (whole-sample transport discards a residual whose RMS is
+/// exactly 0 at ratio 1.0 and a flat ≈0.41 samples everywhere else — the shape of the fixed toll
+/// we could not explain), and carrying it recovers ~80-85% of that toll on the production
+/// caliber. What is NOT settled is whether it sounds better: on the registered fixture ΔHNR
+/// ranks the praat gold standard BELOW two arms the user already rejected by ear, and the
+/// carrying arm reads ABOVE gold — ΔHNR > 0 means "more periodic than the input", which is what
+/// WORLD bought by collapsing unvoiced plosives. ⇒ blind test first, flip after (S146 protocol).
+pub fn frac_transport() -> bool {
+    matches!(std::env::var("UTAI_PSOLA_FRAC").as_deref(), Ok("1"))
+}
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -1081,24 +1094,36 @@ pub fn apply_inverse_with(
                 // exists to prevent: it is a wrong-pitched render that nothing downstream can see.
                 return Err("RANGE_INVERSE_NO_PITCH".into());
             }
-            let (out, diag) = utai_dsp::psola::psola_shift_formant(
+            let frac = frac_transport();
+            let (out, diag) = utai_dsp::psola::psola_shift_opts(
                 &audio,
                 sample_rate,
                 semis,
                 f64::from(k) * semis,
                 f0,
                 hop,
+                frac,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
             }
-            tracing::debug!(
+            // ⭐ info!, not debug!: when a bad render is reported, these are the numbers that say
+            // whether the inverse did its job — and at debug level they were absent from every
+            // log we have ever been handed. `transport_residual` is the S146g readout: 0.000 at
+            // ratio 1.0, ≈0.41 for whole-sample transport, 0 once it is carried.
+            tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
-                 {} marks, cola gap {:.1}% (w median {:.3})",
+                 {} marks, cola gap {:.2}% (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
+                 transport residual {:.4}{}",
                 diag.islands,
                 diag.marks,
                 diag.cola_gap_frac * 100.0,
-                diag.cola_w_median
+                diag.cola_w_p01,
+                diag.cola_w_median,
+                diag.cola_w_p99,
+                diag.cola_over_frac * 100.0,
+                diag.transport_residual_rms,
+                if frac { " (sub-sample transport ON)" } else { "" }
             );
             out
         }
