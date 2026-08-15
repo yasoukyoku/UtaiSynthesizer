@@ -71,6 +71,10 @@ pub struct PsolaDiagnostics {
     pub cola_w_p01: f32,
     pub cola_w_p99: f32,
     pub cola_over_frac: f32,
+    /// RMS(样本) of the sub-sample transport residual **that was discarded**.
+    /// ⭐ 0.0000 at ratio 1.0 · ≈0.41 for whole-sample transport at any other ratio ·
+    /// 0 once `frac_transport` carries it. See `add_bell`.
+    pub transport_residual_rms: f32,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -80,6 +84,66 @@ const CORR_WIN_PERIODS: f64 = 3.0;
 const SEARCH_LO: f64 = 0.8;
 const SEARCH_HI: f64 = 1.25;
 const MIN_ISLAND_SECONDS: f64 = 0.02;
+
+/// Half-width of the windowed-sinc used to carry the sub-sample transport residual.
+///
+/// ⚠ 32 taps is what S146g measured with; the cost is real but bounded (37.1 s of audio went
+/// 159 ms → 1592 ms = still 23× realtime), and the recovered quality is ~80-85% of the whole
+/// fixed toll. ⛔ **Never substitute linear interpolation here**: it reads BETTER on the HNR
+/// ruler (+0.43…+2.23 dB) purely because it low-passes, and a same-construction control that
+/// only low-passes reads +0.40 on its own — i.e. the ruler is being paid, not the ear.
+const TRANSPORT_SINC_HALF: isize = 16;
+
+/// Read `x` at a fractional position with a Blackman-windowed sinc.
+/// Integer `pos` returns the sample itself to within f64 rounding (sinc(k) = 0 for k ≠ 0).
+fn sinc_read(x: &[f32], pos: f64) -> f64 {
+    let n = x.len() as isize;
+    let c = pos.floor() as isize;
+    let frac = pos - c as f64;
+    let mut acc = 0.0;
+    for k in (-TRANSPORT_SINC_HALF + 1)..=TRANSPORT_SINC_HALF {
+        let idx = c + k;
+        if idx < 0 || idx >= n {
+            continue;
+        }
+        let t = k as f64 - frac; // distance from the tap to the read position
+        let s = if t.abs() < 1e-12 {
+            1.0
+        } else {
+            let pt = std::f64::consts::PI * t;
+            pt.sin() / pt
+        };
+        // Blackman window over the tap span, so the kernel dies smoothly at the edges.
+        let ph = std::f64::consts::PI * (t / (TRANSPORT_SINC_HALF as f64) + 1.0);
+        let w = 0.42 - 0.5 * ph.cos() + 0.08 * (2.0 * ph).cos();
+        acc += f64::from(x[idx as usize]) * s * w;
+    }
+    acc
+}
+
+/// Running RMS of the transport residual that was **discarded** (0 when it is carried).
+/// ⭐ This is a direct, non-vacuous readout of the quantity the fix is about: it is exactly
+/// 0.0000 at ratio 1.0, ≈0.41 samples for whole-sample transport at any other ratio, and 0 once
+/// the residual is carried. A diagnostic that reports the defect itself cannot go quietly stale.
+#[derive(Default)]
+struct ResidualStat {
+    sq: f64,
+    n: usize,
+}
+
+impl ResidualStat {
+    fn push(&mut self, v: f64) {
+        self.sq += v * v;
+        self.n += 1;
+    }
+    fn rms(&self) -> f32 {
+        if self.n == 0 {
+            0.0
+        } else {
+            (self.sq / self.n as f64).sqrt() as f32
+        }
+    }
+}
 
 /// Sub-sample peak of a parabola through three samples.
 fn parabolic(l: f64, m: f64, r: f64) -> f64 {
@@ -280,8 +344,31 @@ fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize,
 }
 
 /// One grain: rising half-cosine into `t_pos`, falling half out of it, cut from `x` around
-/// `s_pos`. Transport is by whole samples — praat does the same, and fractional delay would
-/// destroy the ratio-1.0 identity.
+/// `s_pos`.
+///
+/// ⛔⛔ **The comment that used to live here was wrong, and it was load-bearing.** It read
+/// "Transport is by whole samples — praat does the same, and fractional delay would destroy the
+/// ratio-1.0 identity", and it kept the single largest quality fix out of this file for four
+/// months (S146 → S146g). The identity is **structural**, not a consequence of integer transport:
+/// at ratio 1.0 the target pulses ARE the source marks, so `t_pos == s_pos` exactly and the
+/// residual is identically zero however it is transported. Measured with both `frac == 0`
+/// short-circuits removed: worst |Δ| = 5.5e-18 on synthetic and on real material.
+///
+/// ⭐ What integer transport actually costs (S146g, three independent measurements agreeing on
+/// one signature): `d` is a difference of TWO independent roundings, so every grain discards a
+/// sub-sample residual δ. RMS(δ) is **exactly 0.0000 at ratio 1.0** and jumps to **0.41 samples**
+/// the instant the ratio leaves 1.0 — then stays there regardless of depth (+1 → 0.4139,
+/// +6 → 0.4129, +8 → 0.4121). That is precisely the shape of the toll we could not explain:
+/// −0.59 dB HNR for entering the process once, and only −0.37 more from +7 to +8. Depth changes
+/// the grain COUNT, not the rate.
+/// ⚠ The discriminating control: at +12 (ratio 2.0) half the grains land on integer deltas, so
+/// jitter halves while duplicate grains rise to 50%. "Duplicate grains are the problem" predicts
+/// the toll keeps worsening; "jitter is the problem" predicts a plateau. Measured: **plateau**.
+///
+/// `frac_transport` = carry that residual with a windowed-sinc read instead of dropping it.
+/// ⚠ Additive: production still runs the whole-sample path until a blind test says otherwise
+/// (S146's protocol — the rulers cannot settle this, see `TRANSPORT_SINC_TAPS`).
+#[allow(clippy::too_many_arguments)]
 fn add_bell(
     x: &[f32],
     acc: &mut [f64],
@@ -291,9 +378,25 @@ fn add_bell(
     lw: f64,
     rw: f64,
     formant_rate: f64,
+    frac_transport: bool,
+    residual: &mut ResidualStat,
 ) {
     let n = x.len() as isize;
-    let d = t_pos.round() as isize - s_pos.round() as isize;
+    // The true displacement, and the part of it the integer index can express.
+    let delta = t_pos - s_pos;
+    // ⚠ `delta.round()` vs `round(t) − round(s)` on the carrying arm is **conditioning, not
+    // correctness**: either choice leaves `si = i − frac` at the same source position, it only
+    // changes how big `frac` gets (≤0.5 vs ≤1.0) and therefore how far off-centre the sinc read
+    // sits. Don't write a test asserting this line — it would be asserting a preference.
+    let d = if frac_transport {
+        delta.round() as isize
+    } else {
+        t_pos.round() as isize - s_pos.round() as isize
+    };
+    // What is left on the table. `frac_transport` applies it below, so it only accumulates into
+    // the diagnostic when we are actually throwing it away.
+    let frac = delta - d as f64;
+    residual.push(if frac_transport { 0.0 } else { delta - (t_pos.round() - s_pos.round()) });
     for (w0, w1, rise) in [(-lw, 0.0, true), (0.0, rw, false)] {
         let i0 = (s_pos + w0).round() as isize;
         let i1 = (s_pos + w1).round() as isize;
@@ -315,13 +418,27 @@ fn add_bell(
             // κ = 0 (formant_rate == 1) keeps the whole-sample path: no interpolation at all, so
             // the ratio-1.0 identity stays bit-exact. Only a non-zero formant move reads the
             // source at a stride, which is what scales the spectral envelope by that stride.
+            // The source position that maps onto output `ti`. Integer transport reads `i`;
+            // carrying the residual reads `i - frac` (⇒ `frac == 0` collapses to the same read,
+            // which is why ratio 1.0 stays bit-exact either way).
+            let si = i as f64 - if frac_transport { frac } else { 0.0 };
             let v = if formant_rate == 1.0 {
-                if i < 0 || i >= n {
-                    continue;
+                if frac == 0.0 || !frac_transport {
+                    // ⚠ Fast path kept for bit-exactness, NOT for speed. Removing it leaves the
+                    // identity intact to 5.5e-18 (measured), but `assert_eq!` is a stronger gate
+                    // than an epsilon and this line is what lets us keep it.
+                    if i < 0 || i >= n {
+                        continue;
+                    }
+                    f64::from(x[i as usize])
+                } else {
+                    sinc_read(x, si)
                 }
-                f64::from(x[i as usize])
             } else {
-                let sp = s_pos + (i as f64 - s_pos) * formant_rate;
+                // κ ≠ 1 scales the read stride about `s_pos`, which is what moves the spectral
+                // envelope. The residual composes INSIDE that map — correcting it afterwards
+                // would be corrected by the wrong factor.
+                let sp = s_pos + (si - s_pos) * formant_rate;
                 if sp < 0.0 || sp >= (n - 1) as f64 {
                     continue;
                 }
@@ -377,8 +494,25 @@ pub fn psola_shift_formant(
     f0_hz: &[f32],
     f0_hop: usize,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_opts(x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, false)
+}
+
+/// Same, with the S146g sub-sample transport switch.
+/// ⚠ `frac_transport = false` is byte-for-byte the pre-S146g behaviour — production still runs
+/// that arm until a blind test settles it (the rulers cannot: `TRANSPORT_SINC_HALF`).
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_opts(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
+    let mut residual = ResidualStat::default();
     // NOTE: deliberately no `semitones == 0 => return x` shortcut. That shortcut would make the
     // ratio-1.0 identity gate vacuously true, which is the exact shape of gate that let the 2026-07
     // implementation through. The caller (`vocal_range::apply_inverse`) owns the shift==0 fast path.
@@ -455,7 +589,10 @@ pub fn psola_shift_formant(
             if lw <= 1.0 || rw <= 1.0 || lw > max_period || rw > max_period {
                 continue;
             }
-            add_bell(x, &mut acc, &mut wsum, src[k], tm, lw, rw, formant_rate);
+            add_bell(
+                x, &mut acc, &mut wsum, src[k], tm, lw, rw, formant_rate, frac_transport,
+                &mut residual,
+            );
         }
     }
 
@@ -486,6 +623,7 @@ pub fn psola_shift_formant(
             out[i] = (acc[i] + (1.0 - w) * f64::from(x[i])) as f32;
         }
     }
+    diag.transport_residual_rms = residual.rms();
     diag.cola_gap_frac = if cov_n > 0 { gap as f32 / cov_n as f32 } else { 0.0 };
     if ws.is_empty() {
         diag.cola_w_median = 1.0;
@@ -628,6 +766,179 @@ mod tests {
         // And the audio is untouched by this: identity still holds bit-for-bit.
         let (id, _) = psola_shift_diag(&x, sr, 0.0, &f0t, hop);
         assert_eq!(id, x, "ratio 1.0 must remain the identity");
+    }
+
+    #[test]
+    fn the_discarded_transport_residual_is_zero_at_ratio_one_and_flat_everywhere_else() {
+        // ⭐ S146g's load-bearing measurement, as a criterion. Whole-sample transport takes
+        // `round(t) − round(s)` — a difference of TWO independent roundings — so every grain
+        // drops a sub-sample residual. Its RMS is the shape of the toll we could not explain:
+        // exactly 0 at ratio 1.0, and then a CONSTANT ≈0.41 samples at any other ratio.
+        // That constant is why entering the process once costs −0.59 dB while +7→+8 adds only
+        // −0.37: depth changes the grain count, not the rate.
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+
+        let (_, id) = psola_shift_diag(&x, sr, 0.0, &f0t, hop);
+        assert_eq!(
+            id.transport_residual_rms, 0.0,
+            "ratio 1.0 discards nothing — the identity is structural, not a short-circuit"
+        );
+
+        // ⚠ The residual is `(t − round(t)) − (s − round(s))` — the difference of two independent
+        // rounding errors. If those were uniform and independent the RMS would be the triangular
+        // value √(2/12) = 0.408, which is exactly what S146g read on the registered material
+        // (0.4139 / 0.4129 / 0.4121 at +1 / +6 / +8). This synthetic fixture has a near-constant
+        // period, so its two fractional parts are correlated and it reads higher (~0.52-0.60).
+        // ⇒ **The criterion is the SHAPE, not the constant.** Pinning the constant here would be
+        // over-fitting to one fixture; pinning the shape is what the diagnosis rests on.
+        let mut seen = vec![];
+        for st in [1.0, 3.0, 6.0, 8.0] {
+            let (_, d) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            seen.push(d.transport_residual_rms);
+            assert!(
+                (0.25..0.75).contains(&d.transport_residual_rms),
+                "{st} st: a two-rounding residual has to land near √(2/12)=0.41, got {}",
+                d.transport_residual_rms
+            );
+        }
+        // ⛔ FLAT, not growing. A depth-proportional residual would mean the toll compounds, and
+        // then both the diagnosis and the fix are aimed at the wrong thing. (+8 vs +1 measures
+        // 1.14× here; anything approaching proportionality would be several ×.)
+        let (lo, hi) = seen.iter().fold((f32::MAX, 0.0f32), |(a, b), &v| (a.min(v), b.max(v)));
+        assert!(hi / lo < 1.5, "residual must not track depth, got {seen:?}");
+    }
+
+    #[test]
+    fn carrying_the_residual_removes_it_without_touching_the_identity() {
+        // ⛔⛔ THE criterion the recon insisted on, and the reason it exists: the existing
+        // identity gate is **structurally blind** to this code. At ratio 1.0 the fractional
+        // branch executes ZERO times (delta ≡ 0 ⇒ the fast path takes it), so
+        // `ratio_one_is_the_identity` would stay green on a completely broken interpolator —
+        // the same shape as putting a gate on `apply_inverse`, which returns early at shift 0.
+        // ⇒ assert the interpolator itself, and assert the residual is actually gone.
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+
+        // ⑴ The interpolator at an integer position IS the sample (this is what makes the
+        //    identity survive even with the fast path removed — measured 5.5e-18 by S146g).
+        for i in [40usize, 137, 4096, 9999] {
+            assert!(
+                (sinc_read(&x, i as f64) - f64::from(x[i])).abs() < 1e-9,
+                "sinc_read at integer {i} must return the sample itself"
+            );
+        }
+
+        // ⑵ Carrying the residual zeroes the thing it is meant to zero…
+        for st in [1.0, 6.0, 8.0] {
+            let (_, off) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, false);
+            let (_, on) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, true);
+            assert!(off.transport_residual_rms > 0.25, "{st} st: baseline must drop a residual");
+            assert_eq!(on.transport_residual_rms, 0.0, "{st} st: carried ⇒ nothing discarded");
+            assert_eq!(on.islands, off.islands, "{st} st: the mark layer must not move");
+        }
+
+        // ⑶ …and ratio 1.0 stays BIT-exact on both arms.
+        for frac in [false, true] {
+            let (y, _) = psola_shift_opts(&x, sr, 0.0, 0.0, &f0t, hop, frac);
+            assert_eq!(y, x, "ratio 1.0 must be the identity with frac_transport = {frac}");
+        }
+    }
+
+    #[test]
+    fn the_fractional_arm_is_opt_in_and_production_is_byte_for_byte_unchanged() {
+        // ⚠ Additive, per S146's protocol: the rulers cannot settle whether this SOUNDS better
+        // (S146g measured ΔHNR ranking the praat gold standard BELOW two arms already condemned
+        // by ear), so nothing the user hears may move until a blind test says so.
+        let sr = 44_100;
+        let f0 = 260.0;
+        let x = voiced(sr, 0.4, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-6.0, -1.0, 1.0, 6.0, 8.0] {
+            let (legacy, _) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, false);
+            let (via_public, _) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            assert_eq!(legacy, via_public, "{st} st: the default entry must be the legacy arm");
+            let (frac, _) = psola_shift_opts(&x, sr, st, 0.0, &f0t, hop, true);
+            assert_ne!(frac, legacy, "{st} st: …and the opt-in arm must actually differ");
+        }
+    }
+
+
+    #[test]
+    fn the_interpolator_reproduces_a_known_signal_between_samples() {
+        // ⛔ THE gate that stops `sinc_read` being quietly swapped for linear interpolation —
+        // which S146g specifically warned about, because linear reads BETTER on the HNR ruler
+        // purely by low-passing (+0.43…+2.23 dB, and a pure-low-pass control gets +0.40 on its
+        // own). Ground truth is analytic, so no ruler and no taste is involved.
+        let sr = 44_100u32;
+        for fq in [1000.0f64, 5000.0, 8000.0] {
+            let x: Vec<f32> = (0..4096)
+                .map(|i| (2.0 * std::f64::consts::PI * fq * f64::from(i) / f64::from(sr)).sin() as f32)
+                .collect();
+            let mut worst = 0.0f64;
+            for i in 100..3900 {
+                for f in [0.25, 0.5, 0.75] {
+                    let want =
+                        (2.0 * std::f64::consts::PI * fq * (f64::from(i) + f) / f64::from(sr)).sin();
+                    worst = worst.max((sinc_read(&x, f64::from(i) + f) - want).abs());
+                }
+            }
+            // Measured 1.1e-5 (1k) · 1.0e-5 (5k) · 3.1e-5 (8k). Linear interpolation at 8 kHz is
+            // off by ~1e-1 — three to four orders of magnitude, so this bound is not delicate.
+            assert!(worst < 1e-3, "{fq} Hz: interpolation error {worst:.6} is not band-limited");
+        }
+    }
+
+    #[test]
+    fn the_grain_is_actually_read_at_the_fractional_position() {
+        // ⛔⛔ The wiring gate. Without it, `si = i as f64` (residual computed, interpolator
+        // present, and simply not used) stays GREEN on every other criterion here — measured:
+        // the output still differs from the legacy arm, because `d` changes too. "Different"
+        // is not "correct", and this is the shape that mutation exposed.
+        //
+        // One bell maps each source index to exactly one output index, so `acc/wsum` at a covered
+        // output sample IS the value that was read for it — comparable against ground truth.
+        let x: Vec<f32> = (0..600)
+            .map(|i| (f64::from(i) * 0.037).sin() as f32 * 0.5 + (f64::from(i) * 0.31).cos() as f32 * 0.2)
+            .collect();
+        let (s_pos, t_pos) = (300.0f64, 300.5f64);
+        let delta = t_pos - s_pos;
+
+        for frac_transport in [false, true] {
+            let mut acc = vec![0.0f64; x.len()];
+            let mut wsum = vec![0.0f64; x.len()];
+            let mut res = ResidualStat::default();
+            add_bell(&x, &mut acc, &mut wsum, s_pos, t_pos, 12.0, 12.0, 1.0, frac_transport, &mut res);
+
+            let ti = 305usize; // inside the bell, away from its zero-weight edges
+            assert!(wsum[ti] > 1e-3, "the probe index must be covered");
+            let got = acc[ti] / wsum[ti];
+            if frac_transport {
+                let want = sinc_read(&x, f64::from(ti as u32) - delta);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "carrying arm must read the source at {} — got {got}, want {want}",
+                    f64::from(ti as u32) - delta
+                );
+                // …and that read must NOT be the whole-sample one, or the arm does nothing.
+                assert!(
+                    (got - f64::from(x[ti - 1])).abs() > 1e-6,
+                    "the fractional offset was computed and then ignored"
+                );
+            } else {
+                assert!(
+                    (got - f64::from(x[ti - 1])).abs() < 1e-9,
+                    "legacy arm must read whole samples — got {got}"
+                );
+            }
+        }
     }
 
     #[test]
