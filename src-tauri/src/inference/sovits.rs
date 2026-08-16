@@ -411,6 +411,8 @@ pub fn run_pipeline(
     Ok(SynthesisResult {
         audio: audio_out,
         sample_rate: m.sample_rate,
+        // cover 路不做逐渲归一(电平差 = 模型对移调的真实响应)⇒ 没有这个峰。
+        pre_norm_peak: None,
     })
 }
 

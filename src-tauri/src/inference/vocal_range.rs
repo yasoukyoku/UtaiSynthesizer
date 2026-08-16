@@ -1947,6 +1947,35 @@ mod tests {
     }
 
     #[test]
+    fn match_levels_off_splices_the_donor_exactly_as_rendered() {
+        // S147 笔 1:donor 与 base 现在共用一个归一标量 ⇒ 拼接层**不许**再自己调增益。
+        // 这条钉的是 `match_levels=false` 那一臂真的什么都不做 —— 它是「共用标量」成立的前提。
+        let base = vec![0.5f32; 4410];
+        let jobs = [DeadJob { start: 10, end: 40, shift: -2 }];
+
+        let mut off = base.clone();
+        apply_dead_only_windows(&mut off, 44100, 100, &jobs, false, |_| Ok(vec![0.25f32; 4410]))
+            .expect("splice");
+        let mut on = base.clone();
+        apply_dead_only_windows(&mut on, 44100, 100, &jobs, true, |_| Ok(vec![0.25f32; 4410]))
+            .expect("splice");
+
+        // 窗心(淡化之外)= 纯 donor。false 臂应当原样是 0.25;true 臂会被 RMS 比值拉回 ~0.5。
+        let mid = ((10 + 40) / 2) as f64 / 100.0 * 4410.0;
+        let mid = mid as usize;
+        assert!(
+            (off[mid] - 0.25).abs() < 1e-4,
+            "match_levels=false 必须原样拼入,got {}",
+            off[mid]
+        );
+        assert!(
+            (on[mid] - 0.5).abs() < 0.05,
+            "…而 true 臂必须仍然在调增益,否则这条判据两边都恒真,got {}",
+            on[mid]
+        );
+    }
+
+    #[test]
     fn the_ceiling_knob_adds_rescues_without_deepening_the_ones_already_there() {
         // ⭐⭐ S146f, the regression the user reported by ear: "把音域上限往下调 反而是负效果…
         // 之前报的那几处高音直接就炸了". Measured on their own model and song (akiko, 炉心融解):

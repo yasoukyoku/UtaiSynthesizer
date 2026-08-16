@@ -943,7 +943,8 @@ fn mg_render_rvc() {
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
-    )
+    
+                    None,)
     .unwrap();
     let mut audio = r.audio;
     if f0shift != 0 && inverse {
@@ -1124,7 +1125,8 @@ fn mg_render_sovits() {
         },
         tp, rs,
         Some(&vf0), None, None, &no_cancel, &no_prog,
-    )
+    
+                    None,)
     .unwrap();
     let mut audio = r.audio;
     if f0shift != 0 && inverse {

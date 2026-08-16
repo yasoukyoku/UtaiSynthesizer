@@ -684,6 +684,12 @@ pub fn render_score_sovits(
     formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
+    // S147: normalize against THIS peak instead of this render's own. `None` = today's
+    // behaviour (self-normalize). The dead-only splice hands every donor the BASE render's
+    // pre-norm peak so both sides end up on one scalar — see `peak_normalize_to`.
+    // ⛔ Appended at the end on purpose (additive-then-flip): every existing call site gets
+    // `None` and stays byte-identical, and the compiler names each one instead of me guessing.
+    norm_peak_target: Option<f32>,
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展: the model RENDERS at transpose+range_shift (inside its comfort zone);
@@ -816,7 +822,8 @@ pub fn render_score_sovits(
     let t0 = std::time::Instant::now();
     audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
     let t_inverse = t0.elapsed().as_secs_f64();
-    peak_normalize(&mut audio, 0.92);
+    let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    peak_normalize_to(&mut audio, 0.92, norm_peak_target);
 
     let wall = t_render.elapsed().as_secs_f64();
     let secs = audio.len() as f64 / f64::from(m.sample_rate);
@@ -829,7 +836,7 @@ pub fn render_score_sovits(
         100.0 * t_inverse / wall.max(1e-9),
         (wall - t_s2cv - t_decode - t_inverse).max(0.0),
     );
-    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
 }
 
 // ─── score → RVC render (Item-1: reuses the SHARED cover-path `vc_decode` tail) ───────────────────
@@ -889,6 +896,12 @@ pub fn render_score_rvc(
     formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
+    // S147: normalize against THIS peak instead of this render's own. `None` = today's
+    // behaviour (self-normalize). The dead-only splice hands every donor the BASE render's
+    // pre-norm peak so both sides end up on one scalar — see `peak_normalize_to`.
+    // ⛔ Appended at the end on purpose (additive-then-flip): every existing call site gets
+    // `None` and stays byte-identical, and the compiler names each one instead of me guessing.
+    norm_peak_target: Option<f32>,
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
@@ -983,8 +996,9 @@ pub fn render_score_rvc(
         audio = apply_formant_env(audio, fc);
     }
     audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
-    peak_normalize(&mut audio, 0.92);
-    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
+    let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    peak_normalize_to(&mut audio, 0.92, norm_peak_target);
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
 }
 
 // ─── S73e 休止零化(rest gate)────────────────────────────────────────────────────────────────────
@@ -1472,8 +1486,24 @@ fn apply_range_inverse(
 
 
 /// `w *= peak / (max|w| + 1e-9)` — render_ust.render_song's final output normalization.
-fn peak_normalize(w: &mut [f32], peak: f32) {
+/// Normalize to `peak`; returns the peak the buffer had **before** the scaling.
+fn peak_normalize(w: &mut [f32], peak: f32) -> f32 {
     let m = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    peak_normalize_to(w, peak, None);
+    m
+}
+
+/// S147: normalize to `peak`, but measure against `target` (the BASE render's pre-norm peak)
+/// instead of this buffer's own.
+///
+/// ⛔ `target = Some(p)` is what makes base and donor share one scalar. Using each buffer's own
+/// peak was fine while every donor rendered the whole song; it stops being fine the moment a
+/// donor renders a subset, because "the loudest sample" then depends on **which chunks happened
+/// to be kept** — measured pre-norm peaks moved 1.303 → 0.922 (+3.00 dB) on one shift and
+/// 1.287 → 1.289 (nothing) on another, purely by where the maximum lived. There is no bound on
+/// that error, which is why this is a shared scalar and not a corrective ratio.
+fn peak_normalize_to(w: &mut [f32], peak: f32, target: Option<f32>) {
+    let m = target.unwrap_or_else(|| w.iter().fold(0.0f32, |a, &v| a.max(v.abs())));
     let g = peak / (m + 1e-9);
     for v in w.iter_mut() {
         *v *= g;
@@ -1496,6 +1526,45 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S147 归一口径 ───────────────────────────────────────────────────────────────
+    #[test]
+    fn a_shared_normalization_target_preserves_the_relative_level_of_two_renders() {
+        // ⭐ THE property this change exists for. base and each donor used to normalize to their
+        // own peak, so they arrived on different absolute scales and the splice layer had to
+        // guess the difference back with a whole-song `active_rms` ratio — a guess that breaks
+        // the moment a donor renders less than the whole song (measured: +0.618 dB on the
+        // rescued phrases, 8.7× the per-chunk level floor).
+        let mut base = vec![0.5f32, -0.25, 0.10];
+        let mut donor = vec![0.25f32, -0.125, 0.05]; // 与 base 逐样本差 6 dB
+        let base_peak = peak_normalize(&mut base, 0.92);
+        assert!((base_peak - 0.5).abs() < 1e-6, "must report the PRE-norm peak, got {base_peak}");
+
+        peak_normalize_to(&mut donor, 0.92, Some(base_peak));
+        // 共用标量 ⇒ 6 dB 的相对关系原样保留。自归一会把它抹平成 0 dB。
+        let rel = 20.0 * (donor[0] / base[0]).log10();
+        assert!((rel + 6.0206).abs() < 0.01, "relative level must survive, got {rel:+.4} dB");
+
+        // 阴性对照:同一个 donor 自归一时,那 6 dB **消失** —— 这正是旧口径要用 RMS 猜回来的东西。
+        let mut solo = vec![0.25f32, -0.125, 0.05];
+        peak_normalize_to(&mut solo, 0.92, None);
+        assert!(
+            (20.0 * (solo[0] / base[0]).log10()).abs() < 0.01,
+            "self-normalization must flatten it — otherwise this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn passing_no_target_is_byte_identical_to_self_normalization() {
+        // 全部老调用点都传 `None` ⇒ 它们必须逐位不变(additive-then-flip 的前提)。
+        let src: Vec<f32> = (0..64).map(|i| ((i as f32) * 0.37).sin() * 0.8).collect();
+        let (mut a, mut b) = (src.clone(), src.clone());
+        peak_normalize(&mut a, 0.92);
+        peak_normalize_to(&mut b, 0.92, None);
+        assert_eq!(a, b, "None must be exactly the old behaviour");
+        assert!((a.iter().fold(0.0f32, |m, &v| m.max(v.abs())) - 0.92).abs() < 1e-6);
+    }
+
     use crate::inference::g2p_alias::PhonemeSet;
     use super::super::score2cv::{build_arrays, ArticulationTiming, NoDicts}; // Phase-1c parity entry (rest-capped)
     use super::super::score2cv_tables::parity_ref as pr;
@@ -2407,16 +2476,16 @@ mod tests {
         // akiko 4.0 / 256 (vol-free — cleanest audible on the 256 path)
         let akiko = engine.load_model_with(&sov.join("akiko_320000.onnx"), false).unwrap();
         let am = sov_model(&engine, &akiko, &cv256, &rmvpe, &rmvpe_mel, 256, false);
-        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
-        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_akiko256_main", &render_score_sovits(&am, &s2cv256, &ja_evts(pr::SCORE), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
+        save("p2_akiko256_demo_legato", &render_score_sovits(&am, &s2cv256, &ja_evts(LEGATO), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
+        save("p2_akiko256_demo_rest", &render_score_sovits(&am, &s2cv256, &ja_evts(REST), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
+        save("p2_akiko256_demo_sustain_same", &render_score_sovits(&am, &s2cv256, &ja_evts(SUSTAIN), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
+        save("p2_akiko256_demo_reartic_same", &render_score_sovits(&am, &s2cv256, &ja_evts(REARTIC), 256, 49, &NoDicts, &sopts, 0.0, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
 
         // 东雪莲 4.1 / 768 (SAME voice as the Python reference; vol_embedding → flat placeholder vol)
         let dx = engine.load_model_with(&sov.join("Sovits4.1东雪莲主模型.onnx"), false).unwrap();
         let dm = sov_model(&engine, &dx, &cv768, &rmvpe, &rmvpe_mel, 768, true);
-        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_dongxuelian768_main", &render_score_sovits(&dm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &sopts, 0.1, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
 
         // RVC v2 lengv2 / 768 (100 fps grid; no Python A/B reference — audible + glue self-consistency)
         let leng = engine.load_model_with(&rvcd.join("lengv2.3.onnx"), false).unwrap();
@@ -2425,7 +2494,7 @@ mod tests {
             mel_filters: &rmvpe_mel, index: None, sample_rate: 48000, features_dim: 768, spk_mix: None,
             noise_channels: 192, min_frames: 12,
         };
-        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog).unwrap());
+        save("p2_rvc_lengv2_main", &render_score_rvc(&rm, &s2cv768, &ja_evts(pr::SCORE), 768, 49, &NoDicts, &ropts, baseline_shaping, 0, 0, None, None, None, &no_cancel, &no_prog, None).unwrap());
 
         drop(save); // release the &mut wrote borrow before reading it back
         eprintln!("\n[P2/Tier2] wrote {} wavs to {}", wrote.len(), out.display());

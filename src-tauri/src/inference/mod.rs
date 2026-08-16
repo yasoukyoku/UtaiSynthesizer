@@ -308,6 +308,21 @@ impl Default for SovitsOptions {
 pub struct SynthesisResult {
     pub audio: Vec<f32>,
     pub sample_rate: u32,
+    /// S147: the peak this render had **before** its own `peak_normalize`.
+    ///
+    /// ⛔ Why it has to leave the renderer: base and each donor used to normalize independently,
+    /// so they came out on different absolute scales and the splice layer had to guess the
+    /// difference back with a whole-song `active_rms` ratio. That guess is content-dependent —
+    /// the instant a donor renders less than the whole song (S147 B2), the two RMSs stop covering
+    /// the same material and the rescued phrases land **+0.618 dB** off (measured, 8.7× the
+    /// per-chunk level floor). Handing the base's raw peak to the donors makes them multiply by
+    /// the SAME scalar, and the whole guess disappears instead of getting a better heuristic.
+    /// ⚠ `None` = **this lane does not per-render normalize** (the cover pipeline: level
+    /// differences there are the model's real response to transposition and must not be
+    /// flattened — `vocal_range.rs` passes `match_levels=false` for exactly that reason).
+    /// Option, not a magic 0.0, so misusing it on that lane is a type error rather than a
+    /// silently-wrong gain.
+    pub pre_norm_peak: Option<f32>,
 }
 
 /// Command-boundary result for the voice render commands (S66 / O5): the pipeline's samples

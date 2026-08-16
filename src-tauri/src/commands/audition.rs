@@ -1329,7 +1329,7 @@ pub async fn render_candidate_scale(
                     // no per-track context here — the production defaults ARE the audition contract
                     // (audition_cache_tag pins them; see this file's tag constants).
                     crate::inference::score2svc::ScoreShaping::default(),
-                    0, 0, None, None, None, &cancel, &progress,
+                    0, 0, None, None, None, &cancel, &progress, None,
                 )
                 .map_err(|e| e.to_string())?
             }
@@ -1372,7 +1372,7 @@ pub async fn render_candidate_scale(
                     // no per-track context here — see the RVC arm above.
                     crate::inference::score2svc::ScoreShaping::default(),
                     0, 0, None, None, None,
-                    &cancel, &progress,
+                    &cancel, &progress, None,
                 )
                 .map_err(|e| e.to_string())?
             }

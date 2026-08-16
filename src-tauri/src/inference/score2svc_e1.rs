@@ -177,7 +177,7 @@ fn e1_render_sovits(
         cv_cursor += chunk.t;
     }
     peak_normalize(&mut audio, 0.92);
-    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: None })
 }
 
 /// B/C 通用 RVC 渲染:render_score_rvc 的逐行镜像(中性参数路径),cv/f0 可换源。
@@ -258,7 +258,7 @@ fn e1_render_rvc(
         cv_cursor += chunk.t;
     }
     peak_normalize(&mut audio, 0.92);
-    Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
+    Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: None })
 }
 
 fn read_sidecar(model: &Path) -> serde_json::Value {
@@ -510,7 +510,7 @@ fn e1_cross_probe() {
                 let r = render_score_sovits(
                     &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
                     NEUTRAL_SHAPING, 0, 0,
-                    Some(&vf0), None, None, &no_cancel, &noop,
+                    Some(&vf0), None, None, &no_cancel, &noop, None,
                 )
                 .unwrap();
                 save(arm("D_s2cv_paramF0"), &r);
@@ -532,8 +532,8 @@ fn e1_cross_probe() {
                     let r = render_score_sovits(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &sopts, flat_vol,
                         NEUTRAL_SHAPING, 0, 0,
-                        Some(vk), None, None, &no_cancel, &noop,
-                    )
+                        Some(vk), None, None, &no_cancel, &noop, None,
+                )
                     .unwrap();
                     save(arm(&karm), &r);
                     eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());
@@ -607,7 +607,7 @@ fn e1_cross_probe() {
                 let t0 = Instant::now();
                 let r = render_score_rvc(
                     &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, NEUTRAL_SHAPING, 0, 0, Some(&vf0), None,
-                    None, &no_cancel, &noop,
+                    None, &no_cancel, &noop, None,
                 )
                 .unwrap();
                 save(arm("D_s2cv_paramF0"), &r);
@@ -626,8 +626,8 @@ fn e1_cross_probe() {
                     let t0 = Instant::now();
                     let r = render_score_rvc(
                         &m, s2cv_sid, &evts, dim, CV_SPEAKER, &NoDicts, &ropts, NEUTRAL_SHAPING, 0, 0, Some(vk),
-                        None, None, &no_cancel, &noop,
-                    )
+                        None, None, &no_cancel, &noop, None,
+                )
                     .unwrap();
                     save(arm(&karm), &r);
                     eprintln!("[e1]     ({:.1}s)", t0.elapsed().as_secs_f64());

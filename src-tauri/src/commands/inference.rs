@@ -2013,7 +2013,7 @@ pub async fn render_vocal_segment(
                 let base_progress = |p: f32| progress(p / range_passes as f32);
                 let mut result = score2svc::render_score_sovits(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                    VOCAL_FLAT_VOL, shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
+                    VOCAL_FLAT_VOL, shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress, None,
                 )
                 .map_err(|e| e.to_string())?;
                 // S85 dead-only: donor 全曲渲染在 range_shift=s(函数内部逆变换回写谱位 +
@@ -2027,15 +2027,26 @@ pub async fn render_vocal_segment(
                     // rescued phrases (S145 spotted the divergence).
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames.max(0)).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    // match_levels=true:render_score_* 每渲各自 peak_normalize(0.92) → 全曲
-                    // active-RMS 对齐消归一台阶(S85 major;cover 无逐渲归一走 false)。
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, true, |s| {
+                    // S147: donor 与 base **共用 base 的归一前峰** ⇒ 两边乘同一个标量,
+                    // 于是 `match_levels` 那个「用全曲 active-RMS 比值把台阶猜回来」的启发式
+                    // 整个不需要了 ⇒ 传 **false**。
+                    // ⛔ 为什么不是「把 RMS 的统计区域对齐」:两种对齐法都实测判死 ——
+                    // 窗内对齐时 base 在救援窗里**正是那段坏渲染**(shift −7 读 −4.7 dB);
+                    // 保留区对齐 pooled mean −0.829 dB,而且**对完整 donor 一样坏**。
+                    // ⛔ 也不是「donor 干脆不归一」:那会把 `clamp(0.25,4.0)` 这个 ±12 dB 安全笼
+                    // 变成**承重件**(实测 dxl41 g=2.69,离上限只剩 3.5 dB),而响度泳道
+                    // (`apply_gain_env`,合法量程 ±12 dB)是第二个绝对电平搬运工。
+                    // ⚠ 这一笔**会改今天的输出**:逐 shift 一个常数(实测 −0.114/+0.064/−0.280/
+                    // −0.056 dB),低于 ~1 dB 的电平 JND 但高于逐 chunk 电平地板 0.004 dB 二十倍。
+                    let base_peak = result.pre_norm_peak;
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_sovits(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
-                            VOCAL_FLAT_VOL, shaping, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                            VOCAL_FLAT_VOL, shaping, transpose, s, f0.as_ref(), loud, formant, &cancel,
+                            &donor_progress, base_peak,
                         )
                         .map(|r| r.audio)
                     })
@@ -2107,7 +2118,7 @@ pub async fn render_vocal_segment(
                 let base_progress = |p: f32| progress(p / range_passes as f32);
                 let mut result = score2svc::render_score_rvc(
                     &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                    shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress,
+                    shaping, transpose, 0, f0.as_ref(), loud, formant, &cancel, &base_progress, None,
                 )
                 .map_err(|e| e.to_string())?;
                 // S85 dead-only(镜像 SoVits 臂,机理注释见彼处)。
@@ -2119,13 +2130,17 @@ pub async fn render_vocal_segment(
                     // rescued phrases (S145 spotted the divergence).
                     let total_frames: i64 = score_ref.iter().map(|n| n.frames.max(0)).sum();
                     let pass = std::cell::Cell::new(0usize);
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, true, |s| {
+                    // S147:与 SoVits 臂同一口径(机理注释见彼处)—— donor 共用 base 的归一前峰,
+                    // `match_levels` 因此不再需要。
+                    let base_peak = result.pre_norm_peak;
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_rvc(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
-                            shaping, transpose, s, f0.as_ref(), loud, formant, &cancel, &donor_progress,
+                            shaping, transpose, s, f0.as_ref(), loud, formant, &cancel,
+                            &donor_progress, base_peak,
                         )
                         .map(|r| r.audio)
                     })
