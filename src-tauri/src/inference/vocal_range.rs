@@ -998,6 +998,28 @@ pub fn frac_transport() -> bool {
     matches!(std::env::var("UTAI_PSOLA_FRAC").as_deref(), Ok("1"))
 }
 
+/// S148 — `UTAI_PSOLA_WSOLA=<frac>` turns on the source-side waveform-similarity search in
+/// `utai_dsp::psola`. **Default 0.0 = off = byte-for-byte the pre-S148 arm.**
+///
+/// Why it exists: measured at +7 st on the akiko donor (production caliber), **4.80 % of voiced
+/// frames come out more than 4 dB below the input**, against praat's **0.80 %** on the same input
+/// at the same ratio. The window sum is intact where those notches are (`cola_gap` 0.0 %,
+/// `cola_w_median` 1.000) ⇒ the level is lost to **grain-to-grain phase cancellation**, and the
+/// structural reason is that `max_correlation` is used only when placing the *marks* — the
+/// synthesis pass adds every grain blindly. Turning this on takes the notch rate to **0.38 %**
+/// (radius 0.15), i.e. below the gold standard.
+///
+/// ⛔ **Do not flip the default on that number.** The knob is a monotone trade, not a fix:
+/// 0 / 0.06 / 0.10 / 0.15 / 0.30 read notch 4.80/3.81/1.92/0.38/0.01 % against ΔHNR
+/// −0.15/−1.12/−1.48/−2.23/−4.70 dB, while **praat sits off that curve entirely** (0.80 % *and*
+/// +0.27 dB). So there is ~2 dB of headroom that this particular knob cannot reach, and switching
+/// it on trades a 4.8 % notch rate for a 2 dB ΔHNR loss — two known quantities whose relative
+/// audibility nobody has measured. That is exactly the shape only ears can settle (S146 protocol:
+/// blind test first, flip after), and the notch axis has never had an audibility calibration at all.
+pub fn wsola_frac() -> f64 {
+    std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(0.0)
+}
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -1108,7 +1130,8 @@ pub fn apply_inverse_with(
                 return Err("RANGE_INVERSE_NO_PITCH".into());
             }
             let frac = frac_transport();
-            let (out, diag) = utai_dsp::psola::psola_shift_opts(
+            let wsola = wsola_frac();
+            let (out, diag) = utai_dsp::psola::psola_shift_wsola(
                 &audio,
                 sample_rate,
                 semis,
@@ -1116,6 +1139,7 @@ pub fn apply_inverse_with(
                 f0,
                 hop,
                 frac,
+                wsola,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -1136,7 +1160,13 @@ pub fn apply_inverse_with(
                 diag.cola_w_p99,
                 diag.cola_over_frac * 100.0,
                 diag.transport_residual_rms,
-                if frac { " (sub-sample transport ON)" } else { "" }
+                // ⛔ 打出**真的移了几个颗粒**,不只是「开着」:一个从不移动的搜索会产出逐位
+                // 相同的音频,与关掉不可分辨(S147 那次「收益静默减半」的同族)。
+                if wsola > 0.0 {
+                    format!(" (wsola {wsola} — moved {} grains)", diag.wsola_moved)
+                } else {
+                    String::new()
+                }
             );
             out
         }
