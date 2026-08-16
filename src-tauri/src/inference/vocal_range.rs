@@ -860,13 +860,21 @@ fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
 /// (高潮区必偏响 → 误衰减),所以 cover 恒 false。
 /// 帧→样本映射 = base.len()/total_frames 实测每帧样本数(端点精确;SoVITS hop 网格取整的
 /// 累积漂移被线性吸收,RVC 网格下与名义值相等)。
+///
+/// ⛔⛔ S148:闭包的第二个参数是**这一遍自己的窗**,而不是全部窗 —— 这个参数存在的唯一理由
+/// 是 S147 的那次 hotfix。当时两个调用点各自在闭包里写了一遍
+/// `jobs.iter().filter(|j| j.shift == s)`,而第一版**漏掉了那个 filter**、把全部位移的窗的并集
+/// 传给每一遍 ⇒ 四个 donor 渲同一批 chunk,**功能正确、收益静默减半**;单元测试、长度契约、
+/// 音频秒数全部正常,唯一暴露它的是「四个不同位移的 `skipped` 完全相同」这个指纹。
+/// ⇒ 那个 filter 现在**只存在于这里一处**,调用点拿到什么就用什么,没有再写错的余地。
+/// 判据见 `donor_render_gets_only_its_own_windows`(附「同样的窗给同样答案」的阴性对照)。
 pub fn apply_dead_only_windows(
     base: &mut [f32],
     sample_rate: u32,
     total_frames: i64,
     jobs: &[DeadJob],
     match_levels: bool,
-    mut donor_render: impl FnMut(i64) -> crate::Result<Vec<f32>>,
+    mut donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
         return Ok(());
@@ -878,7 +886,12 @@ pub fn apply_dead_only_windows(
     shifts.sort_unstable();
     shifts.dedup();
     for s in shifts {
-        let mut donor = donor_render(s)?;
+        // 这一遍**自己**的窗。⛔ 同一个 filter 下面 :896 还要用一次(音频域拼接),两处必须
+        // 是同一个谓词 —— 那正是 S147 hotfix 的形状:闭包那一侧漏了它,拼接这一侧没漏,
+        // 于是「渲多了但拼对了」= 功能正确、收益减半。
+        let own: Vec<(i64, i64)> =
+            jobs.iter().filter(|j| j.shift == s).map(|j| (j.start, j.end)).collect();
+        let mut donor = donor_render(s, &own)?;
         if donor.len().abs_diff(base.len()) > spf.ceil() as usize {
             tracing::warn!(
                 "range-extend(dead-only): donor {} samples vs base {} — windows clamped",
@@ -1251,7 +1264,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let mut base = vec![0.5f32; 1_008_000]; // 2100 帧 @48k
         let mut seen = Vec::new();
-        apply_dead_only_windows(&mut base, 48000, 2100, &jobs, false, |s| {
+        apply_dead_only_windows(&mut base, 48000, 2100, &jobs, false, |s, _own| {
             seen.push(s);
             Ok(vec![0.5f32; 1_008_000])
         })
@@ -1282,7 +1295,7 @@ mod tests {
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
         let mut calls = 0usize;
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |s| {
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |s, _own| {
             calls += 1;
             assert_eq!(s, -6);
             Ok(donor.clone())
@@ -1298,13 +1311,66 @@ mod tests {
         assert_eq!(base[48000 / 2], 0.0, "窗后回到 base");
     }
 
+    /// ⛔⛔ S147 那次 hotfix 欠的判据 —— 它当时**一条都没有**,所以缺陷是靠我顺手打进 `[perf]`
+    /// 的一个数字(「四个位移的 `skipped` 完全相同」)才暴露的。
+    ///
+    /// 缺陷形状:donor 打洞的第一版把**全部位移的窗的并集**传给每一遍 ⇒ 四个 donor 渲同一批
+    /// chunk。**功能正确、收益静默减半**;单元测试、长度契约、音频秒数**全部正常**。
+    /// 那个 filter 现在只存在于 `apply_dead_only_windows` 内部一处,而这条判据守住它。
+    ///
+    /// 两条断言缺一不可:
+    /// ⑴ 不同的位移必须拿到**不同**的窗 —— 否则「传并集」那种写法照样过;
+    /// ⑵ **阴性对照**:窗本来就相同的两个位移必须拿到**相同**的答案 —— 否则 ⑴ 有可能是靠
+    ///    「总是给点不一样的东西」蒙过去的,而那种实现同样是错的。
+    /// ⚠ 期望值写**字面量**,不是从 `jobs` 现算(S146f 一场犯四次:把被测的东西写进断言 = 恒真)。
+    #[test]
+    fn donor_render_gets_only_its_own_windows() {
+        let jobs = [
+            DeadJob { shift: -7, start: 10, end: 20 },
+            DeadJob { shift: -2, start: 30, end: 40 },
+            DeadJob { shift: -7, start: 44, end: 48 },
+        ];
+        let mut base = vec![0.0f32; 48000];
+        let mut seen: Vec<(i64, Vec<(i64, i64)>)> = Vec::new();
+        apply_dead_only_windows(&mut base, 48000, 50, &jobs, false, |s, own| {
+            seen.push((s, own.to_vec()));
+            Ok(vec![1.0f32; 48000])
+        })
+        .unwrap();
+        seen.sort_by_key(|(s, _)| *s);
+        assert_eq!(
+            seen,
+            vec![(-7i64, vec![(10i64, 20i64), (44, 48)]), (-2i64, vec![(30i64, 40i64)])],
+            "每一遍只该拿到属于它自己那个位移的窗(传并集 ⇒ 这里两行会相同)"
+        );
+        assert_ne!(seen[0].1, seen[1].1, "不同的位移必须给出不同的保留集");
+
+        // 阴性对照:同样的窗 ⇒ 同样的答案。
+        let same = [
+            DeadJob { shift: -7, start: 10, end: 20 },
+            DeadJob { shift: -2, start: 10, end: 20 },
+        ];
+        let mut base2 = vec![0.0f32; 48000];
+        let mut seen2: Vec<Vec<(i64, i64)>> = Vec::new();
+        apply_dead_only_windows(&mut base2, 48000, 50, &same, false, |_, own| {
+            seen2.push(own.to_vec());
+            Ok(vec![1.0f32; 48000])
+        })
+        .unwrap();
+        assert_eq!(
+            seen2,
+            vec![vec![(10i64, 20i64)], vec![(10i64, 20i64)]],
+            "窗本来就相同时两遍必须拿到相同的答案 —— 否则上一条只是在测「总是不同」"
+        );
+    }
+
     #[test]
     fn dead_only_splice_matches_donor_level_to_base() {
         // 审查 S85 major 的钉子:base/donor 独立归一 → 拼接窗响度台阶;donor 按全曲
         // active-RMS 对齐 base。base 恒 0.5、donor 恒 0.25 ⇒ g=2 ⇒ 窗心 ≈0.5。
         let mut base = vec![0.5f32; 48000];
         let donor = vec![0.25f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], true, |_, _| Ok(donor.clone()))
             .unwrap();
         assert!((base[(0.3 * 48000.0) as usize] - 0.5).abs() < 1e-3, "donor 缩放到 base 电平");
         assert!((base[0] - 0.5).abs() < 1e-6, "窗外不动");
@@ -1315,7 +1381,7 @@ mod tests {
         // 1 帧窗收缩淡化宽度仍拿到 donor 内容,绝不静默丢弃(曾静默 continue+审计谎报)。
         let mut base = vec![0.0f32; 48000];
         let donor = vec![1.0f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 11 }], true, |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 11 }], true, |_, _| Ok(donor.clone()))
             .unwrap();
         let mid = (10.5 / 50.0 * 48000.0) as usize;
         assert!(base[mid] > 0.9, "1 帧窗仍拿到 donor 内容(微淡化)");
@@ -1329,7 +1395,7 @@ mod tests {
         // 真实响应)——窗口化 donor 缓冲大半为零,全曲 RMS 对比会误衰减,必须可关。
         let mut base = vec![0.5f32; 48000];
         let donor = vec![0.25f32; 48000];
-        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], false, |_| Ok(donor.clone()))
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], false, |_, _| Ok(donor.clone()))
             .unwrap();
         assert!((base[(0.3 * 48000.0) as usize] - 0.25).abs() < 1e-6, "false ⇒ donor 电平不动");
     }
@@ -1954,10 +2020,10 @@ mod tests {
         let jobs = [DeadJob { start: 10, end: 40, shift: -2 }];
 
         let mut off = base.clone();
-        apply_dead_only_windows(&mut off, 44100, 100, &jobs, false, |_| Ok(vec![0.25f32; 4410]))
+        apply_dead_only_windows(&mut off, 44100, 100, &jobs, false, |_, _| Ok(vec![0.25f32; 4410]))
             .expect("splice");
         let mut on = base.clone();
-        apply_dead_only_windows(&mut on, 44100, 100, &jobs, true, |_| Ok(vec![0.25f32; 4410]))
+        apply_dead_only_windows(&mut on, 44100, 100, &jobs, true, |_, _| Ok(vec![0.25f32; 4410]))
             .expect("splice");
 
         // 窗心(淡化之外)= 纯 donor。false 臂应当原样是 0.25;true 臂会被 RMS 比值拉回 ~0.5。

@@ -346,7 +346,9 @@ pub fn run_pipeline(
             total_frames,
             &range_jobs,
             false, // cover 无逐渲归一——电平=模型对移调的真实响应,不全局拉平
-            |s| {
+            // ⚠ cover 侧不吃 `_own`(第二个参数):它要的是**样本域**、带 pad、已合并的跨度,
+            // 由 `donor_slice_spans` 从同一批 jobs 现算 —— 那是另一种口径,不是这一份的重复。
+            |s, _own| {
                 let spans =
                     super::vocal_range::donor_slice_spans(&range_jobs, s, spf, base_len, pad);
                 tracing::info!(

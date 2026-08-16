@@ -978,6 +978,142 @@ fn mg_render_rvc() {
     );
 }
 
+/// S148 —— sovits 探针的装载脚手架:ORT + 四个 session + sidecar 解出来的整套规格。
+///
+/// **存在的唯一理由**:`mg_render_score_deadonly` 需要与 `mg_render_sovits` **完全相同**的装载,
+/// 而把这 40 行抄第二遍就是本仓最贵的那一类缺陷(两份实现慢慢漂开,而它们的差别只会在
+/// 读数里表现成一条看起来像信号的东西)。字段全部 owned;`model()` 现借出一个 `SovitsModel<'_>`。
+/// ⚠ CPU EP —— 与历史全部 mg 探针一致(注释原文「deterministic + no GPU setup in a test」,
+/// ⛔ 其中「deterministic」是**不成立的**:同配置两跑实测 corr 0.99996 而非逐位相同)。
+struct MgSovitsRig {
+    engine: OnnxEngine,
+    s2cv: String,
+    cv: String,
+    rmvpe: String,
+    voice: String,
+    mel: Array2<f32>,
+    sidecar: serde_json::Value,
+    dim: usize,
+    sample_rate: u32,
+    hop_size: usize,
+    min_frames: usize,
+    has_vol: bool,
+    has_uv: bool,
+    mtag: String,
+}
+
+impl MgSovitsRig {
+    /// `UTAI_MG_MODEL` = sovits onnx(必填),同名 `.json` 为 sidecar。
+    fn load() -> Self {
+        let model_path = std::path::PathBuf::from(
+            std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL (sovits onnx) required"),
+        );
+        let sc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(model_path.with_extension("json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sc["type"].as_str(), Some("sovits"), "sovits arm wants a sovits sidecar");
+        let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
+        let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
+        let hop_size = sc["hop_size"].as_u64().unwrap_or(512) as usize;
+        let min_frames = sc["min_frames"].as_u64().unwrap_or(6) as usize;
+        let inputs: Vec<&str> = sc["inputs"]
+            .as_array()
+            .map(|l| l.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let has_vol = inputs.contains(&"vol");
+        let has_uv = inputs.contains(&"uv");
+        let stem = model_path.file_stem().unwrap().to_string_lossy().to_string();
+        let mtag = if stem.contains("东雪莲") { "dxl41".to_string() } else { stem };
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+        if let Ok(bld) = ort::init_from(&dll) {
+            let _ = bld.commit();
+        }
+        let engine = OnnxEngine::new();
+        engine.set_device(DeviceConfig::Cpu);
+        let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+        let s2cv = engine
+            .load_model_with(
+                &aux.join(if dim == 768 { "score2cv_768.onnx" } else { "score2cv_256.onnx" }),
+                false,
+            )
+            .unwrap();
+        let cv = engine
+            .load_model_with(
+                &aux.join(if dim == 768 {
+                    "contentvec_768l12.onnx"
+                } else {
+                    "contentvec_256l9.onnx"
+                }),
+                false,
+            )
+            .unwrap();
+        let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+        let mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+        let voice = engine.load_model_with(&model_path, false).unwrap();
+        Self {
+            engine,
+            s2cv,
+            cv,
+            rmvpe,
+            voice,
+            mel,
+            sidecar: sc,
+            dim,
+            sample_rate,
+            hop_size,
+            min_frames,
+            has_vol,
+            has_uv,
+            mtag,
+        }
+    }
+
+    fn model(&self) -> sovits::SovitsModel<'_> {
+        let sc = &self.sidecar;
+        sovits::SovitsModel {
+            engine: &self.engine,
+            voice_session: &self.voice,
+            contentvec_session: &self.cv,
+            rmvpe_session: &self.rmvpe,
+            mel_filters: &self.mel,
+            cluster: None,
+            diffusion: None,
+            vocoder: None,
+            f0_predictor_session: None,
+            sample_rate: self.sample_rate,
+            hop_size: self.hop_size,
+            features_dim: self.dim,
+            vol_embedding: self.has_vol,
+            phase_bins: sc["phase"]["phase_input"]
+                .as_array()
+                .and_then(|x| x.get(1))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            f0d_cond_channels: sc["f0d_cond"]["input"]
+                .as_array()
+                .and_then(|x| x.get(1))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize),
+            feed_uv: self.has_uv,
+            spk_mix: None,
+            unit_interpolate_mode: sc["unit_interpolate_mode"]
+                .as_str()
+                .unwrap_or("left")
+                .to_string(),
+            noise_channels: sc["noise"]["noise_input"]
+                .as_array()
+                .and_then(|x| x.get(1))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(192) as usize,
+            min_frames: self.min_frames,
+        }
+    }
+}
+
 /// S85 SoVITS score 臂(sidecar 驱动配置,e1 姿势;东雪莲 4.1 / chika_v2 v2 实测目标):
 /// UTAI_MG_MODEL=sovits onnx 必填;UTAI_MG_SLICE/SHIFT/INVERSE/KAPPA 语义同 RVC 臂;
 /// cluster/diffusion/vocoder/auto-f0 全 None(score 生产默认口径;缺 cluster 资产时生产同样 skip)。
@@ -1013,82 +1149,10 @@ fn mg_render_sovits() {
         None => vf0,
     };
 
-    let model_path = std::path::PathBuf::from(
-        std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL (sovits onnx) required"),
-    );
-    let sc: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(model_path.with_extension("json")).unwrap())
-            .unwrap();
-    assert_eq!(sc["type"].as_str(), Some("sovits"), "sovits arm wants a sovits sidecar");
-    let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
-    let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
-    let hop_size = sc["hop_size"].as_u64().unwrap_or(512) as usize;
-    let min_frames = sc["min_frames"].as_u64().unwrap_or(6) as usize;
-    let inputs: Vec<&str> = sc["inputs"]
-        .as_array()
-        .map(|l| l.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    let stem = model_path.file_stem().unwrap().to_string_lossy().to_string();
-    let mtag = if stem.contains("东雪莲") { "dxl41".to_string() } else { stem };
-
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let dll = root.join("../runtime/ort/onnxruntime.dll");
-    assert!(dll.exists(), "ORT dll missing at {}", dll.display());
-    if let Ok(bld) = ort::init_from(&dll) {
-        let _ = bld.commit();
-    }
-    let engine = OnnxEngine::new();
-    engine.set_device(DeviceConfig::Cpu);
-    let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
-    let s2cv = engine
-        .load_model_with(
-            &aux.join(if dim == 768 { "score2cv_768.onnx" } else { "score2cv_256.onnx" }),
-            false,
-        )
-        .unwrap();
-    let cv = engine
-        .load_model_with(
-            &aux.join(if dim == 768 { "contentvec_768l12.onnx" } else { "contentvec_256l9.onnx" }),
-            false,
-        )
-        .unwrap();
-    let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
-    let rmvpe_mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
-    let voice = engine.load_model_with(&model_path, false).unwrap();
-    let m = sovits::SovitsModel {
-        engine: &engine,
-        voice_session: &voice,
-        contentvec_session: &cv,
-        rmvpe_session: &rmvpe,
-        mel_filters: &rmvpe_mel,
-        cluster: None,
-        diffusion: None,
-        vocoder: None,
-        f0_predictor_session: None,
-        sample_rate,
-        hop_size,
-        features_dim: dim,
-        vol_embedding: inputs.contains(&"vol"),
-        phase_bins: sc["phase"]["phase_input"]
-            .as_array()
-            .and_then(|x| x.get(1))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize),
-        f0d_cond_channels: sc["f0d_cond"]["input"]
-            .as_array()
-            .and_then(|x| x.get(1))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize),
-        feed_uv: inputs.contains(&"uv"),
-        spk_mix: None,
-        unit_interpolate_mode: sc["unit_interpolate_mode"].as_str().unwrap_or("left").to_string(),
-        noise_channels: sc["noise"]["noise_input"]
-            .as_array()
-            .and_then(|x| x.get(1))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(192) as usize,
-        min_frames,
-    };
+    // S148:装载搬进 `MgSovitsRig`(与 `mg_render_score_deadonly` 共用同一份,免得两处漂开)。
+    let rig = MgSovitsRig::load();
+    let (dim, mtag) = (rig.dim, rig.mtag.clone());
+    let m = rig.model();
     let emph: f32 = std::env::var("UTAI_MG_EMPH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1132,7 +1196,7 @@ fn mg_render_sovits() {
         windows: &donor_windows,
     });
     let r = render_score_sovits(
-        &m, &s2cv, &evts, dim, cvspk, &super::g2p::GlobalDicts, &sopts,
+        &m, &rig.s2cv, &evts, dim, cvspk, &super::g2p::GlobalDicts, &sopts,
         crate::commands::inference::VOCAL_FLAT_VOL,
         ScoreShaping {
             consonant_emphasis_db: emph,
@@ -1168,6 +1232,237 @@ fn mg_render_sovits() {
         audio.len() as f32 / r.sample_rate as f32,
         t0.elapsed().as_secs_f64()
     );
+}
+
+/// S148 —— **生产口径**的「带救援计划的整曲渲染」,headless。这是本仓第一条能在命令行上
+/// 跑出「今天用户听到的那个东西」的 score 路。
+///
+/// ## 为什么必须有它(三条,每条都是实测)
+/// ⑴ **真机渲染与 CLI 探针渲染在波形域不可比**:同一首歌、都不带救援,真机 `vocal.wav` 与
+///    `F_full_s0.wav` 的**逐样本相关 = 0.0097**(全局对齐也救不回来:最佳 lag −241,对齐后
+///    仍 −0.01/+0.03),而**包络相关 0.9965**、整体 RMS 差 0.12 dB —— 同一段演唱的不同相位
+///    实现。⇒ 「A 臂用真机那份、B/C 臂用探针渲」量到的每一个逐样本读数都是**路线差**,
+///    而且它长得像真信号。**三条臂必须同路。**
+/// ⑵ `mg_render_sovits` 只吃一个**全局位移**:`dead_only_plan` / `dead_group_windows` /
+///    `apply_dead_only_windows` **一行都不经过** ⇒ 它渲不出今天的生产输出。
+/// ⑶ 记忆里明写的债:「`range_shift != 0` 的**端到端渲染**仍然零覆盖 —— S145 证伪过的
+///    『base 喂错』明天可以由一次无辜重构重新变成真的,而全仓 cargo 一条都不会红」。
+///
+/// ## 它不复刻什么
+/// ⛔ 每一个容易错的决定都在库里,这里只提供「怎么渲一遍」:
+/// 哪些音要救 = `dead_only_plan` · 窗 = `dead_group_windows` · 哪一遍拿哪些窗 / `match_levels` /
+/// `spf` / 交叉淡化 = `apply_dead_only_windows` · 「哪些歌词是静音」= `plan_note_num`。
+/// ⚠ **仍然与生产不同的地方**(登记在这里,别当成等价):CPU EP(生产 Auto→CUDA)·
+/// `SovitsOptions` 钉死 `seed 0 / noise_scale 0.4`(生产读工程)· 响度与共振腔泳道传 `None`
+/// (生产传工程的泳道)· NSF 增强器关(生产由用户旋钮决定)。
+/// ⇒ 臂与臂之间这些全部相同 ⇒ **臂间比较有效**;而「探针 ≈ 生产」是另一个命题,要单独量。
+///
+/// ## env
+/// * `UTAI_MG_MODEL` sovits onnx(必填)· `UTAI_MG_SCORE` 谱(默认鹅妈妈 dump)
+/// * `UTAI_MG_ARM` 产物标签(**必填**)—— 探针输出目录是硬编码常量且文件名不带谱标识,
+///   不带标签会让三条臂互相覆盖(钩子里记的「产物落地陷阱」)。
+/// * `UTAI_MG_SPEAKER`(默认 0)· `UTAI_MG_TRANSPOSE`(默认 0)· `UTAI_MG_KAPPA`(默认生产 κ)
+/// * `UTAI_MG_PLAN="a:b:s,a:b:s,…"` —— **覆盖**救援计划(三元组下标闭区间 + 半音)。
+///   不设 ⇒ 走 `dead_only_plan` 算出来的那份。⚠ 它只存在于 `#[cfg(test)]`,发布二进制读不到。
+///
+/// 产物:`probe\mg_deadonly_{arm}_{model}.wav` + 同名 `.plan.json`(**计划的可复现出处** ——
+/// 上一场 24 个分析脚本各自硬编码了一份 27 组的 PLAN 字面量,而实机日志是 25 组)。
+#[test]
+#[ignore]
+fn mg_render_score_deadonly() {
+    // S147:没有订阅者的话渲染路径每条 `info!` 都被静默吞掉 —— 包括 `[perf]` 与救援审计行。
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let arm = std::env::var("UTAI_MG_ARM")
+        .expect("UTAI_MG_ARM=<tag> required — 输出目录硬编码且文件名不带谱标识,不带标签会互相覆盖");
+    assert!(
+        std::env::var("UTAI_MG_SLICE").is_err(),
+        "dead-only 臂必须整曲渲:计划与窗都是全曲三元组坐标,切片会让它们指到别的音上"
+    );
+    let sj = load_score();
+    let triples = &sj.triples[..];
+    let evts = to_evts(triples);
+    let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
+
+    let rig = MgSovitsRig::load();
+    let m = rig.model();
+
+    // ── 决策层:与生产同一条链、同一批函数 ──────────────────────────────
+    let cfg: crate::models::ModelConfig = serde_json::from_value(rig.sidecar.clone())
+        .expect("sidecar 解不成 ModelConfig —— 生产读的就是这个类型");
+    let speaker: u32 =
+        std::env::var("UTAI_MG_SPEAKER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let transpose: i64 =
+        std::env::var("UTAI_MG_TRANSPOSE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let range = super::super::vocal_range::speaker_range(&cfg, speaker).expect(
+        "这个模型的 sidecar 里没有可用的 vocal_range 记录 —— 生产在这种情况下整个不做扩展",
+    );
+    let set = mg_phoneme_set();
+    let nn: Vec<i64> = triples
+        .iter()
+        .map(|t| crate::commands::inference::plan_note_num(&t.lyric, t.note_num, set))
+        .collect();
+    let fr: Vec<i64> = triples.iter().map(|t| t.frames).collect();
+    let (auto_plan, unfixable) =
+        super::super::vocal_range::dead_only_plan(&nn, transpose, &range);
+    let plan = match std::env::var("UTAI_MG_PLAN") {
+        Ok(spec) if !spec.trim().is_empty() => mg_parse_plan_override(&spec, &nn),
+        _ => auto_plan.clone(),
+    };
+
+    eprintln!(
+        "[mg] dead-only arm '{arm}': speaker {speaker} · usable [{:.0},{:.0}] · transpose {transpose:+}",
+        range.usable.0, range.usable.1
+    );
+    eprintln!(
+        "[mg]   算出来的计划: {} 组 / {} 无解;实际使用: {} 组{}",
+        auto_plan.len(),
+        unfixable.len(),
+        plan.len(),
+        if plan == auto_plan { "" } else { "  ⚠ 被 UTAI_MG_PLAN 覆盖" }
+    );
+    for g in &plan {
+        let hi = (g.start..=g.end).map(|k| nn[k]).max().unwrap_or(0);
+        eprintln!(
+            "[mg]     notes[{}..={}] (top MIDI {hi} written, {} effective) renders at {:+} st",
+            g.start,
+            g.end,
+            hi + transpose,
+            g.shift
+        );
+    }
+
+    let jobs = super::super::vocal_range::dead_group_windows(&nn, &fr, &plan);
+    let total_frames: i64 = fr.iter().map(|f| (*f).max(0)).sum();
+
+    // ── 执行层:base 一遍 + 每个 distinct shift 一遍 donor,拼接由库函数编排 ──
+    let (_shift_unused, _inv_unused, kappa) = mg_shift_envs();
+    let emph: f32 = std::env::var("UTAI_MG_EMPH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_VOICELESS_ONSET_EMPHASIS_DB);
+    let valley: f32 = std::env::var("UTAI_MG_VALLEY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CONSONANT_VALLEY_SCALE);
+    let clarity: bool =
+        std::env::var("UTAI_MG_CLARITY").ok().and_then(|s| s.parse().ok()).unwrap_or(true);
+    let sopts = SovitsOptions {
+        seed: 0,
+        noise_scale: 0.4,
+        range_formant_follow: kappa,
+        speaker_id: Some(speaker),
+        ..Default::default()
+    };
+    let shaping = ScoreShaping {
+        consonant_emphasis_db: emph,
+        consonant_valley_scale: valley,
+        vowel_clarity: clarity,
+        consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
+    };
+    let no_cancel = || false;
+    let no_prog = |_: f32| {};
+    let cvspk = mg_cvspk_env();
+    let t0 = Instant::now();
+
+    let mut result = render_score_sovits(
+        &m, &rig.s2cv, &evts, rig.dim, cvspk, &super::g2p::GlobalDicts, &sopts,
+        crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, 0,
+        Some(&vf0), None, None, &no_cancel, &no_prog, None,
+    )
+    .unwrap();
+    let sr = result.sample_rate;
+    let base_peak = result.pre_norm_peak;
+    super::super::vocal_range::apply_dead_only_windows(
+        &mut result.audio,
+        sr,
+        total_frames,
+        &jobs,
+        false, // 与生产同:donor 共用 base 的归一前峰 ⇒ 不需要 active-RMS 猜台阶
+        |s, own| {
+            render_score_sovits(
+                &m, &rig.s2cv, &evts, rig.dim, cvspk, &super::g2p::GlobalDicts, &sopts,
+                crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, s,
+                Some(&vf0), None, None, &no_cancel, &no_prog,
+                base_peak.map(|p| super::DonorCtx { norm_peak_target: p, windows: own }),
+            )
+            .map(|r| r.audio)
+        },
+    )
+    .unwrap();
+
+    let out_dir = Path::new(WORK).join("probe");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let stem = format!("mg_deadonly_{arm}_{}", rig.mtag);
+    write_wav16(&out_dir.join(format!("{stem}.wav")), &result.audio, sr);
+    // 计划的可复现出处 —— 下游分析脚本一律读它,别再各自硬编码一份字面量。
+    let dump = serde_json::json!({
+        "arm": arm,
+        "model": rig.mtag,
+        "speaker": speaker,
+        "transpose": transpose,
+        "usable": [range.usable.0, range.usable.1],
+        "overridden": plan != auto_plan,
+        "auto_groups": auto_plan.iter().map(|g| [g.start as i64, g.end as i64, g.shift]).collect::<Vec<_>>(),
+        "groups": plan.iter().map(|g| [g.start as i64, g.end as i64, g.shift]).collect::<Vec<_>>(),
+        "unfixable": unfixable.iter().map(|&(a, b)| [a as i64, b as i64]).collect::<Vec<_>>(),
+        "windows_frames": jobs.iter().map(|j| [j.shift, j.start, j.end]).collect::<Vec<_>>(),
+        "total_frames": total_frames,
+        "samples": result.audio.len(),
+        "sample_rate": sr,
+    });
+    std::fs::write(
+        out_dir.join(format!("{stem}.plan.json")),
+        serde_json::to_string_pretty(&dump).unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "[mg] dead-only '{arm}': {:.2}s audio, {} 组 / {} 个 donor 遍, {:.1}s wall -> probe\\{stem}.wav",
+        result.audio.len() as f32 / sr as f32,
+        plan.len(),
+        jobs.iter().map(|j| j.shift).collect::<std::collections::BTreeSet<_>>().len(),
+        t0.elapsed().as_secs_f64()
+    );
+}
+
+/// `UTAI_MG_PLAN="a:b:s,…"` → `Vec<DeadGroup>`,**响亮校验**。
+///
+/// ⛔ 下游一条都不会替你查:`dead_group_windows` 在 `end + 1 > len` 时**直接 panic**(cum 索引),
+/// 而 `start > end` 只会让 `apply_dead_only_windows` 打一条 warn 然后**静默丢掉整个窗** ——
+/// 后者长得就跟「这一臂听不出差别」一模一样。
+fn mg_parse_plan_override(
+    spec: &str,
+    nn: &[i64],
+) -> Vec<super::super::vocal_range::DeadGroup> {
+    use super::super::vocal_range::{DeadGroup, MAX_RANGE_SHIFT};
+    let mut out: Vec<DeadGroup> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let f: Vec<&str> = part.split(':').collect();
+        assert_eq!(f.len(), 3, "UTAI_MG_PLAN 的每一项都是 a:b:s(三元组下标闭区间 + 半音),收到 {part:?}");
+        let start: usize = f[0].parse().unwrap_or_else(|_| panic!("start 不是数字: {part:?}"));
+        let end: usize = f[1].parse().unwrap_or_else(|_| panic!("end 不是数字: {part:?}"));
+        let shift: i64 = f[2].parse().unwrap_or_else(|_| panic!("shift 不是数字: {part:?}"));
+        assert!(start <= end, "start > end: {part:?}");
+        assert!(end < nn.len(), "end {end} 越界(谱只有 {} 个三元组): {part:?}", nn.len());
+        assert!(
+            shift != 0 && shift.abs() <= MAX_RANGE_SHIFT,
+            "shift {shift} 必须非零且 |s| <= {MAX_RANGE_SHIFT}: {part:?}"
+        );
+        assert!(
+            (start..=end).all(|k| nn[k] > 0),
+            "组 {part:?} 里含休止(note_num<=0)—— `dead_only_plan` 按休止分组,\
+             跨休止的组不是它产得出来的形状,窗也会盖住休止"
+        );
+        if let Some(prev) = out.last() {
+            assert!(
+                prev.end < start,
+                "组必须按下标升序且互不重叠:{:?} 之后又来了 {part:?}",
+                (prev.start, prev.end)
+            );
+        }
+        out.push(DeadGroup { start, end, shift });
+    }
+    assert!(!out.is_empty(), "UTAI_MG_PLAN 非空却解析出 0 组");
+    out
 }
 
 /// S84 E 刀原型(用户 UTAU 类比「渲染长音素再缩短」;diagnostic,零生产改动):快段元音在

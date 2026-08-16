@@ -420,7 +420,8 @@ pub fn run_pipeline(
             out_frames as i64,
             &range_jobs,
             false, // cover 无逐渲归一——电平=模型对移调的真实响应,不全局拉平
-            |s| {
+            // ⚠ 同 sovits cover 臂:第二个参数用不上,cover 要的是样本域带 pad 的合并跨度。
+            |s, _own| {
                 let spans =
                     super::vocal_range::donor_slice_spans(&range_jobs, s, spf, base_len, pad);
                 tracing::info!(

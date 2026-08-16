@@ -1475,16 +1475,25 @@ pub struct ScoreNote {
 /// hand the range planner a pitch for a silent note, or zero for a sung one — the S88 bug this
 /// function was written to fix, in the other direction.
 fn plan_note_nums(score: &[ScoreNote], set: crate::inference::g2p_alias::PhonemeSet) -> Vec<i64> {
-    score
-        .iter()
-        .map(|n| {
-            if crate::inference::g2p::is_silent_token(&n.lyric, set) {
-                0
-            } else {
-                n.note_num
-            }
-        })
-        .collect()
+    score.iter().map(|n| plan_note_num(&n.lyric, n.note_num, set)).collect()
+}
+
+/// The per-note half of [`plan_note_nums`], as ONE predicate.
+///
+/// S148: the headless dead-only probe (`score2svc_mg::mg_render_score_deadonly`) has to build the
+/// same list from its own score JSON, and it must not re-derive the rule — a second copy of "which
+/// lyrics are silent" would drift and the probe would then plan over a DIFFERENT phrase split than
+/// production, which is precisely the thing that probe exists to rule out.
+pub(crate) fn plan_note_num(
+    lyric: &str,
+    note_num: i64,
+    set: crate::inference::g2p_alias::PhonemeSet,
+) -> i64 {
+    if crate::inference::g2p::is_silent_token(lyric, set) {
+        0
+    } else {
+        note_num
+    }
 }
 
 /// Wire-contract options for render_vocal_segment — mirrored by src\lib\vocal\vocalRender.ts (VocalRenderOptions).
@@ -2040,14 +2049,9 @@ pub async fn render_vocal_segment(
                     // −0.056 dB),低于 ~1 dB 的电平 JND 但高于逐 chunk 电平地板 0.004 dB 二十倍。
                     let base_peak = result.pre_norm_peak;
 
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
-                        let shift_windows: Vec<(i64, i64)> = range_windows
-                            .iter()
-                            .filter(|j| j.shift == s)
-                            .map(|j| (j.start, j.end))
-                            .collect();
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_sovits(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
@@ -2056,13 +2060,14 @@ pub async fn render_vocal_segment(
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
                                 // S147 B2:只渲**这一遍**会被拼回去的那些 chunk。
-                                // ⛔ 窗必须按**本遍的位移**过滤:`apply_dead_only_windows` 每个
-                                // distinct shift 调一次闭包,而每个 job 只属于其中一个位移。
-                                // 第一版传了**全部窗的并集** ⇒ 每一遍都在渲别人的窗,四个位移的
-                                // `skipped` 全是 12/25。功能正确,收益少了一大半 —— 而
-                                // **「不同位移跳过数完全相同」这个指纹是唯一暴露它的东西**。
+                                // ⛔ S148:这个列表现在由 `apply_dead_only_windows` 传进来,
+                                // 因为它必须与那边拼接时用的 filter 是**同一个谓词**。以前这里
+                                // 自己写了一遍(rvc 臂再写一遍),而第一版漏了 `.filter(shift == s)`
+                                // ⇒ 每一遍都在渲别人的窗,四个位移的 `skipped` 全是 12/25:
+                                // 功能正确、收益少一大半,而**唯一暴露它的是「不同位移跳过数完全
+                                // 相同」这个指纹**。
                                 // ⚠ 窗本身仍然只来自决策层(`dead_group_windows`),这里不复刻。
-                                windows: &shift_windows,
+                                windows: own_windows,
                             }),
                         )
                         .map(|r| r.audio)
@@ -2151,14 +2156,9 @@ pub async fn render_vocal_segment(
                     // `match_levels` 因此不再需要。
                     let base_peak = result.pre_norm_peak;
 
-                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
+                    crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
-                        let shift_windows: Vec<(i64, i64)> = range_windows
-                            .iter()
-                            .filter(|j| j.shift == s)
-                            .map(|j| (j.start, j.end))
-                            .collect();
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_rvc(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
@@ -2166,14 +2166,11 @@ pub async fn render_vocal_segment(
                             &donor_progress,
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
-                                // S147 B2:只渲**这一遍**会被拼回去的那些 chunk。
-                                // ⛔ 窗必须按**本遍的位移**过滤:`apply_dead_only_windows` 每个
-                                // distinct shift 调一次闭包,而每个 job 只属于其中一个位移。
-                                // 第一版传了**全部窗的并集** ⇒ 每一遍都在渲别人的窗,四个位移的
-                                // `skipped` 全是 12/25。功能正确,收益少了一大半 —— 而
-                                // **「不同位移跳过数完全相同」这个指纹是唯一暴露它的东西**。
-                                // ⚠ 窗本身仍然只来自决策层(`dead_group_windows`),这里不复刻。
-                                windows: &shift_windows,
+                                // S147 B2 / S148:同 SoVits 臂 —— 这一遍自己的窗由
+                                // `apply_dead_only_windows` 传进来,与它拼接时用的是同一个谓词。
+                                // 机理与那次 hotfix 的血训写在 SoVits 臂与 `apply_dead_only_windows`
+                                // 的文档注释里,别在这里再复述一遍(两份会漂)。
+                                windows: own_windows,
                             }),
                         )
                         .map(|r| r.audio)
