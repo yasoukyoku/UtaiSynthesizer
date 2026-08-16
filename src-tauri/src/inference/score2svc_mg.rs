@@ -984,6 +984,11 @@ fn mg_render_rvc() {
 #[test]
 #[ignore]
 fn mg_render_sovits() {
+    // S147: without a subscriber the probe silently swallows every `info!` on the render path —
+    // including `[perf]` and the range-extend audit lines. That made a working stopwatch look
+    // broken (the log line simply never appeared), which is the same shape as a criterion that
+    // cannot fail: absence of output read as absence of the thing.
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let sj = load_score();
     let slice = std::env::var("UTAI_MG_SLICE").unwrap_or_default();
     let (a, b) = if slice.is_empty() {

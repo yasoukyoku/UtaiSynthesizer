@@ -1947,8 +1947,15 @@ pub async fn render_vocal_segment(
             let cv_sid = app.inference.ensure_aux_loaded_on(&cv_path, sv.gpu_extract).map_err(|e| e.to_string())?;
             let rmvpe_sid = app.inference.ensure_aux_loaded_on(&rmvpe_path, sv.gpu_extract).map_err(|e| e.to_string())?;
             let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
-            // ScoreToCV is the self-sing CONTENT workhorse (net_g already runs on the global device) and the
-            // #1 render-time cost. Unlike ContentVec — whose whole-song activations peaked ~9 GB (S35) so it
+            // ScoreToCV is the self-sing CONTENT workhorse (net_g already runs on the global device).
+            // ⛔ S147 corrects this comment: it used to claim ScoreToCV was "the #1 render-time cost".
+            // **Measured, production caliber (enhancer on): s2cv 4.1%, net_g 54.7%, vocoder 41.3%,
+            // ALL CPU-side work 1.1%.** net_g alone is 13-20× ScoreToCV (24-28× on the CPU EP), and the
+            // `[perf]` line in score2svc.rs now prints the split on every render so this cannot go stale
+            // again. ⚠ The DECISION below is still right — the number behind it was not.
+            // ⚠ And do NOT read this as "s2cv could move back to CPU": measured CUDA 2.0-2.5s vs CPU
+            // 4.0-7.2s, i.e. +2~5s per pass (×(1+K)), and it would change the output (TF32 vs fp32 on an
+            // ear-validated path). Unlike ContentVec — whose whole-song activations peaked ~9 GB (S35) so it
             // stays pinned to CPU — ScoreToCV is chunked (sidecar chunk_max_frames ≤400 as a SOFT cut at
             // SPs; rest-less passages exceed it, and the S84 vowel-clarity twin inflates fast-run chunks
             // ~1.3-1.5× — still small next to ContentVec, hard-bounded by the twin's 8000-frame fallback).
@@ -2055,7 +2062,11 @@ pub async fn render_vocal_segment(
             let mel = app.inference.load_npy(&mel_path).map_err(|e| e.to_string())?;
             // ScoreToCV on the GLOBAL device (on_gpu=true = FOLLOW the device preference; the default Auto
             // falls back CUDA→DirectML→CPU, so no GPU-less crash) instead of forced-CPU — it's the self-sing
-            // content workhorse + #1 render cost, chunked so VRAM-bounded. See the SoVits arm for full rationale.
+            // content workhorse, chunked so VRAM-bounded. See the SoVits arm for full rationale.
+            // ⛔ S147: the "#1 render cost" claim that used to be here is removed. It was never measured on
+            // THIS arm — the RVC render path has no per-stage timing at all (the `[perf]` line lives in the
+            // sovits arm of score2svc.rs), and on the sovits arm the same claim measured 4.1%. Do not
+            // reinstate it, on either arm, without a reading.
             let s2cv_sid = app.inference.ensure_aux_loaded_on(&s2cv_path, true).map_err(|e| e.to_string())?;
             let handle = app.inference.voice_handle(&voice_name).map_err(|e| e.to_string())?;
 

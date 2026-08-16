@@ -729,11 +729,18 @@ pub fn render_score_sovits(
     let noop = |_: f32| {}; // decode_features' internal sub-progress is ignored (per-chunk coarse below)
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
+    // S147 秒表(纯 tracing,零行为改动)。⛔ 存在的理由:在此之前 score 渲染这条路上
+    // `Instant::now` **一处都没有**,追速度时只能靠外部采样,而每换一个口径读数就不可比了
+    // (实测:开/关增强器两个口径下同一笔改动的收益差 1.81 倍)。累加器只在**段边界**取时间,
+    // 不进任何逐样本循环 ⇒ 开销可忽略,而且**不打 per-chunk 日志**(25 chunk × 5 段 = 125 行噪声)。
+    let t_render = std::time::Instant::now();
+    let (mut t_s2cv, mut t_decode) = (0f64, 0f64);
     for (ci, chunk) in chunks.iter().enumerate() {
         if cancel() {
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
         // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
+        let t0 = std::time::Instant::now();
         let cv = if shaping.vowel_clarity {
             run_score2cv_vowel_clarity(
                 m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
@@ -742,6 +749,7 @@ pub fn render_score_sovits(
         } else {
             run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?
         };
+        t_s2cv += t0.elapsed().as_secs_f64();
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         // S69: cv expand uses the model's sidecar mode, same as the cover path (only_diffusion is
         // disallowed for the score path, so the diffusion-yaml override branch never applies).
@@ -766,10 +774,12 @@ pub fn render_score_sovits(
         let padded_t = feed.t_tgt;
         // score has no source wav → wav_m is `&[]` (only read by only_diffusion + no-vol, which the
         // command layer disallows for the score path).
+        let t0 = std::time::Instant::now();
         let mut wav = decode_features(
             m, feed.cv, feed.f0, feed.uv, vol, &[], ci as u64, padded_t, has_diff, p_vits, options,
             &noop, cancel,
         )?;
+        t_decode += t0.elapsed().as_secs_f64();
         if padded_t > real_t {
             wav.truncate((real_t * m.hop_size).min(wav.len())); // drop the pad samples
         }
@@ -803,8 +813,22 @@ pub fn render_score_sovits(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
+    let t0 = std::time::Instant::now();
     audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
+    let t_inverse = t0.elapsed().as_secs_f64();
     peak_normalize(&mut audio, 0.92);
+
+    let wall = t_render.elapsed().as_secs_f64();
+    let secs = audio.len() as f64 / f64::from(m.sample_rate);
+    tracing::info!(
+        "[perf] score/sovits {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks ·          s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g+voc) {t_decode:.2}s ({:.0}%) ·          inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+}",
+        if secs > 0.0 { wall / secs } else { 0.0 },
+        chunks.len(),
+        100.0 * t_s2cv / wall.max(1e-9),
+        100.0 * t_decode / wall.max(1e-9),
+        100.0 * t_inverse / wall.max(1e-9),
+        (wall - t_s2cv - t_decode - t_inverse).max(0.0),
+    );
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate })
 }
 
