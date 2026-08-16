@@ -682,6 +682,8 @@
       "q_kstep": "扩散步数",
       "q_speedup": "加速倍数",
       "q_enhancer": "NSF增强器",
+      "q_enhancerTip": "用 NSF-HiFiGAN 声码器重新合成波形(整段替换,不是叠加)。音质取舍因人而异,但代价是确定的:每遍全曲渲染约 +75% 时间,而且与音域扩展的遍数相乘。",
+      "q_enhancerCost": "⚠ 渲染约 +75%/遍;开着音域扩展时按救援遍数相乘",
       "q_index": "检索占比",
       "q_protect": "清辅音保护",
       "breathToken": "呼吸标记",

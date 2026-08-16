@@ -682,6 +682,8 @@
       "q_kstep": "Diffusion steps",
       "q_speedup": "Speedup",
       "q_enhancer": "NSF enhancer",
+      "q_enhancerTip": "Re-synthesises the waveform through the NSF-HiFiGAN vocoder (it REPLACES the audio, it does not layer on it). Whether it sounds better is your call; the cost is not — about +75% per full-song pass, multiplied by the number of range-extension passes.",
+      "q_enhancerCost": "⚠ ~+75% render time per pass; multiplied by the rescue passes when range extension is on",
       "q_index": "Index ratio",
       "q_protect": "Consonant protect",
       "breathToken": "Breath token",

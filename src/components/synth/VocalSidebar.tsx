@@ -501,8 +501,17 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
                 <Slider label={t("vocalEditor.sidebar.q_speedup")} value={svGet("diffusion_speedup")} cfg={{ min: 1, max: 100, step: 1, unit: "×", bipolar: false }} onChange={(v) => setSv({ diffusion_speedup: v })} />
               </>
             )}
+            {/* S147: 这个开关此前**连提示都没有**,而它是整条渲染链上最贵的单项 ——
+                实测每遍全曲 +25.7s(≈ +75%),而且与音域扩展的 (1+K) 遍**相乘**:用户那首曲子
+                K=4 时,323 秒里有 128 秒是它。⇒ 不替用户关掉(它改变每一个采样,是取舍不是缺陷),
+                但把代价摆出来。开着时才显示那行注脚 —— 关着时它不欠解释。 */}
             {!diffusionOn && (
-              <ToggleRow label={t("vocalEditor.sidebar.q_enhancer")} checked={!!svGet("nsf_enhance")} onChange={(c) => setSv({ nsf_enhance: c })} />
+              <div title={t("vocalEditor.sidebar.q_enhancerTip")}>
+                <ToggleRow label={t("vocalEditor.sidebar.q_enhancer")} checked={!!svGet("nsf_enhance")} onChange={(c) => setSv({ nsf_enhance: c })} />
+                {!!svGet("nsf_enhance") && (
+                  <div className="vsb-note">{t("vocalEditor.sidebar.q_enhancerCost")}</div>
+                )}
+              </div>
             )}
             {/* fine-tuned NSF-HiFiGAN vocoder — meaningful only on the mel→audio paths (shallow diffusion /
                 enhancer). Backend already honors vocoder_name for the ② render (resolve_sovits_quality). */}
