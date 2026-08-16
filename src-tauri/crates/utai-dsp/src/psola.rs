@@ -1108,6 +1108,69 @@ mod tests {
     /// $env:UTAI_PSOLA_HOP="220"; $env:UTAI_PSOLA_ST="6"; $env:UTAI_PSOLA_OUT="…\arm_rust.wav"
     /// cargo test -p utai-dsp psola_probe -- --ignored --nocapture
     /// ```
+    /// S148 —— 把**分析标记**倒出来,因为外面看不见它。
+    ///
+    /// 为什么要这个:6 半音上我们在浊音帧的 **2.4%** 上挖出 >4 dB 的电平陷波,而 praat 在同一段
+    /// 输入、同一个比值上只有 **0.2%**;那些位置在 5/6/7 半音之间**高度稳定**(三者共有 57 帧),
+    /// 而**输入自身的性质一条都分不开它们**(f0 匹配对照之后:周期性 NCC 差 −0.001、f0 抖动
+    /// +0.001、电平斜率 −1.1 dB/s、到最近清音帧 +15 帧)。
+    /// ⇒ 排除法把病因指向**我们自己的内部状态**,而唯一看不见的内部状态就是标记。
+    ///
+    /// ⚠ 这里**只重跑分析一路**(`voiced_islands` + `analysis_marks`,两个纯函数),
+    /// 合成一行都不碰 —— 它们不吃 ratio,所以任何深度下标记都是同一套。
+    /// 输出:每行 `island_a island_b mark_sample`(制表分隔),给 `UTAI_PSOLA_MARKS` 指路。
+    #[test]
+    #[ignore = "probe: dumps analysis marks (set UTAI_PSOLA_IN/F0/HOP/MARKS)"]
+    fn psola_marks_dump() {
+        let path = std::env::var("UTAI_PSOLA_IN").expect("UTAI_PSOLA_IN");
+        let f0p = std::env::var("UTAI_PSOLA_F0").expect("UTAI_PSOLA_F0");
+        let out = std::env::var("UTAI_PSOLA_MARKS").expect("UTAI_PSOLA_MARKS");
+        let hop: usize = std::env::var("UTAI_PSOLA_HOP").expect("UTAI_PSOLA_HOP").parse().unwrap();
+
+        let mut rd = hound::WavReader::open(&path).expect("open in");
+        let spec = rd.spec();
+        let x: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => rd.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => rd
+                .samples::<i32>()
+                .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+                .collect(),
+        };
+        let x: Vec<f32> = if spec.channels > 1 {
+            x.chunks(spec.channels as usize).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect()
+        } else {
+            x
+        };
+        let raw = std::fs::read(&f0p).expect("read f0");
+        let f0: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // 与 psola_shift_opts 同一条前处理:标记跑在去 DC 的信号上(设计注 2)。
+        let n = x.len();
+        let sr = f64::from(spec.sample_rate);
+        let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+        let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
+
+        let mut s = String::new();
+        let mut islands = 0usize;
+        let mut marks = 0usize;
+        for (a, b) in voiced_islands(&f0, hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+            let src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b);
+            if src.len() < 3 {
+                continue;
+            }
+            islands += 1;
+            marks += src.len();
+            for m in &src {
+                s.push_str(&format!("{a}\t{b}\t{m:.4}\n"));
+            }
+        }
+        std::fs::write(&out, s).expect("write marks");
+        eprintln!("[mg] marks: {islands} islands, {marks} marks -> {out}");
+    }
+
     #[test]
     #[ignore = "probe: needs a wav + f0 track on disk (set UTAI_PSOLA_*)"]
     fn psola_probe() {
