@@ -1,7 +1,6 @@
 {
   "_why": "预注册。g2p_rulers/README.md 第 3 条:期望答案在跑之前写死,每条带『凭什么它不容争辩』。这里分两类,⛔ 不许混着引用:predictions = 与本工装无关就能知道的真值(尺子错了才会不过);fingerprints = 本工装在 S145 夹具上量出来的数,只用来查漂移(它们不是真值,是指纹)。",
   "_provenance": "S145(2026-08-14)炉心融解 bars28-44 × Sovits4.1东雪莲主模型;工装复现于 S146(2026-08-14),读数与 project_v2_session145 §A3 的表逐位相同。",
-
   "calibration": {
     "_why": "口径闸。变异测试实测(S146):把包络尺的对数轴从 200-9000 改成 300-6000,**A 档零红**,而真素材上 k0 从 +2.40 变成 +3.15。⇒ 『尺子还能量出正确答案』与『尺子还是同一把尺子』是两件事,后者需要单独一条判据。⚠ 同一次实测也说明:排序(psola 0.30/0.40 ≪ k0 2.40/3.15)对轴不敏感,但**绝对数只在同一口径下可比**。",
     "rulers.FLO": 200.0,
@@ -23,7 +22,6 @@
     "arms.PRAAT_PITCH_FLOOR": 75.0,
     "arms.PRAAT_PITCH_CEILING": 1400.0
   },
-
   "fixtures": {
     "dir_env": "UTAI_RANGE_FIXTURES",
     "dir_default": "D:\\MyDev\\TESTING\\s145_range_color\\lch",
@@ -39,27 +37,48 @@
       "arm_off.wav": "45e5eedd040a21b1b712bed02be80e58ed94b38075a6cd06b0154a382b8b558c"
     }
   },
-
   "window": {
-    "spans": [[396924, 458668], [910279, 972023]],
+    "spans": [
+      [
+        396924,
+        458668
+      ],
+      [
+        910279,
+        972023
+      ]
+    ],
     "shift_st": 6.0,
     "_provenance": "生产 dead_group_windows 在这一片上产出的两条被救乐句窗:notes[186..191] 与 notes[234..239],音高均 [75,76,85,83,81,80],各 1.40 s。⛔ 登记成字面量而不是在尺子里再复刻一遍生产逻辑 —— 那会造出第二份 dead_group_windows 并慢慢漂开。",
     "_identity": "notes[186..191] 与整曲 2911 base 点已与用户 S142 实机日志逐字对上(project_v2_session145 §1)。"
   },
-
   "predictions": [
     {
       "id": "env-neg",
       "ruler": "envelope_shift",
       "arm": "arm_raw.wav vs arm_raw.wav",
-      "expect": {"median_st": [-0.05, 0.05], "peak_corr": [0.999, 1.001]},
+      "expect": {
+        "median_st": [
+          -0.05,
+          0.05
+        ],
+        "peak_corr": [
+          0.999,
+          1.001
+        ]
+      },
       "why_incontestable": "同一个文件与自己比,包络位移只能是 0 —— 不依赖任何关于引擎的假设。"
     },
     {
       "id": "env-pos",
       "ruler": "envelope_shift",
       "arm": "arm_k1.wav",
-      "expect": {"median_st": [5.5, 6.5]},
+      "expect": {
+        "median_st": [
+          5.5,
+          6.5
+        ]
+      },
       "why_incontestable": "κ=1 按代码定义 formant=None = 纯移调(vocal_range.rs:704-709)⇒ 共振峰必然整体上移 +6.00 半音。真值是免费的。队列 §E13 笔 0 写的判据就是这一条(+6.00±0.5)。",
       "_note_measured_5_50": "实测 +5.50 落在下沿:估计器在 +6 处系统性低估 ~0.5 st。这是尺子的已知偏差,不是引擎的。⇒ 读任何候选的位移时,真值 6.00 那一端要按 5.5 校准。"
     },
@@ -67,14 +86,24 @@
       "id": "flux-neg",
       "ruler": "transient_flux",
       "arm": "arm_raw.wav vs arm_raw.wav",
-      "expect": {"median_db": [-0.01, 0.01]},
+      "expect": {
+        "median_db": [
+          -0.01,
+          0.01
+        ]
+      },
       "why_incontestable": "同一条通量序列与自己取比,恒 0。"
     },
     {
       "id": "flux-pos",
       "ruler": "transient_flux",
       "arm": "smear(arm_raw.wav, 2 ms)",
-      "expect": {"median_db": [-1000.0, -30.0]},
+      "expect": {
+        "median_db": [
+          -1000.0,
+          -30.0
+        ]
+      },
       "why_incontestable": "2 ms 移动平均把 2-11 kHz 的陡升物理性地抹掉 ⇒ 正向通量必然坍塌。队列 §E13 笔 0 写的判据是「人为抹平 ≤ −30 dB」。",
       "_note": "⚠ 平滑核是 **2 ms**。S145 脚本注释写的「20 ms」是错的(代码是 int(sr*0.002));登记的 −33 dB 属于 2 ms 那一档。"
     },
@@ -82,40 +111,93 @@
       "id": "hnr-neg",
       "ruler": "hnr",
       "arm": "arm_raw.wav vs arm_raw.wav",
-      "expect": {"delta_db": [-0.01, 0.01]},
+      "expect": {
+        "delta_db": [
+          -0.01,
+          0.01
+        ]
+      },
       "why_incontestable": "同一段音频的 HNR 与自己相减,恒 0。"
     },
     {
       "id": "hnr-pos",
       "ruler": "hnr",
       "arm": "arm_raw.wav + 白噪 @ 20 dB / 10 dB SNR",
-      "expect": {"delta_db_20": [-6.0, -1.5], "delta_db_10": [-16.0, -6.0], "monotonic": true},
+      "expect": {
+        "delta_db_20": [
+          -6.0,
+          -1.5
+        ],
+        "delta_db_10": [
+          -16.0,
+          -6.0
+        ],
+        "monotonic": true
+      },
       "why_incontestable": "注入已知功率的白噪必然降低谐噪比,且 10 dB SNR 必须比 20 dB 掉得更多。⇒ 尺子的符号与单调性都被钉住。"
     },
     {
       "id": "f0-neg",
       "ruler": "f0_error",
       "arm": "arm_raw.wav vs arm_raw.wav @ ratio 2^(6/12)",
-      "expect": {"median_cents": [-620.0, -580.0]},
+      "expect": {
+        "median_cents": [
+          -620.0,
+          -580.0
+        ]
+      },
       "why_incontestable": "拿没移调的音频去比『应当上移 6 半音』的期望,误差必然恰好是 −600 cents。⇒ 这条同时证明 f0 尺的符号是对的。"
     }
   ],
-
   "fingerprints": {
     "_what": "本工装 2026-08-14 在上面那组夹具上量出的数。⛔ 它们不是真值:它们只回答『尺子/夹具有没有从那天漂开』。与 project_v2_session145 §A3 的公开表逐位相同。",
-    "tolerance": {"envelope_st": 0.15, "peak_corr": 0.01, "flux_db": 0.5, "hnr_db": 0.3},
+    "tolerance": {
+      "envelope_st": 0.15,
+      "peak_corr": 0.01,
+      "flux_db": 0.5,
+      "hnr_db": 0.3
+    },
     "arms": {
-      "arm_raw.wav":   {"envelope_shift_st": 0.00, "peak_corr": 1.000, "flux_median_db": 0.00, "hnr_delta_db": 0.00, "voiced_survival": 1.0000},
-      "arm_k1.wav":    {"envelope_shift_st": 5.50, "peak_corr": 0.951, "flux_median_db": 1.32, "hnr_delta_db": 0.22, "voiced_survival": 1.0000},
-      "arm_k0.wav":    {"envelope_shift_st": 2.40, "peak_corr": 0.961, "flux_median_db": -5.25, "hnr_delta_db": 1.34, "voiced_survival": 0.9873},
-      "arm_world.wav": {"envelope_shift_st": 0.20, "peak_corr": 0.981, "flux_median_db": 1.26, "hnr_delta_db": 0.87, "voiced_survival": 0.9909},
-      "arm_psola.wav": {"envelope_shift_st": 0.30, "peak_corr": 0.983, "flux_median_db": 0.53, "hnr_delta_db": -1.44, "voiced_survival": 0.9457,
-        "_MISLABEL": "⛔⛔ 这一行是 **praat** 的臂,不是我们的引擎。实证:`arm_psola.wav` 与 `arm_praat_p6.wav` 的 sha256 **逐位相同**(fca51cda…)。我们自己的引擎在**同一口径**下读 **+0.50 / −1.66**(见 utai-dsp/src/psola.rs 头注,S146)。⇒ 拿这一行当「我们引擎的基线」会让下一次换引擎对拍**偏乐观约 0.4 dB**。发版前要么重生成一份真正属于我们的臂并改名,要么把这一行改名为 arm_praat_p6。S146g 侦察发现。"}
+      "arm_raw.wav": {
+        "envelope_shift_st": 0.0,
+        "peak_corr": 1.0,
+        "flux_median_db": 0.0,
+        "hnr_delta_db": 0.0,
+        "voiced_survival": 1.0
+      },
+      "arm_k1.wav": {
+        "envelope_shift_st": 5.5,
+        "peak_corr": 0.951,
+        "flux_median_db": 1.32,
+        "hnr_delta_db": 0.22,
+        "voiced_survival": 1.0
+      },
+      "arm_k0.wav": {
+        "envelope_shift_st": 2.4,
+        "peak_corr": 0.961,
+        "flux_median_db": -5.25,
+        "hnr_delta_db": 1.34,
+        "voiced_survival": 0.9873
+      },
+      "arm_world.wav": {
+        "envelope_shift_st": 0.2,
+        "peak_corr": 0.981,
+        "flux_median_db": 1.26,
+        "hnr_delta_db": 0.87,
+        "voiced_survival": 0.9909
+      },
+      "arm_psola.wav": {
+        "envelope_shift_st": 0.3,
+        "peak_corr": 0.983,
+        "flux_median_db": 0.53,
+        "hnr_delta_db": -1.44,
+        "voiced_survival": 0.9457,
+        "_MISLABEL": "⛔⛔ 这一行是 **praat** 的臂,不是我们的引擎。实证:`arm_psola.wav` 与 `arm_praat_p6.wav` 的 sha256 **逐位相同**(fca51cda…)。我们自己的引擎在**同一口径**下读 **+0.50 / −1.66**(见 utai-dsp/src/psola.rs 头注,S146)。⇒ 拿这一行当「我们引擎的基线」会让下一次换引擎对拍**偏乐观约 0.4 dB**。发版前要么重生成一份真正属于我们的臂并改名,要么把这一行改名为 arm_praat_p6。S146g 侦察发现。"
+      }
     },
     "ref_hnr_db": 23.68,
     "ref_f0_median_hz": 610.0
   },
-
   "known_blind_spots": [
     {
       "ruler": "transient_flux",
@@ -146,6 +228,7 @@
       "blind_to": "「哪个更好听」",
       "evidence": "S145:放宽 dead 判据那条结论只有耳朵没有仪器 ⇒ 塌了;染色那条有仪器 ⇒ 扛住了盲测。",
       "rule": "凡结论只有耳朵没有仪器,先标【未定】;而凡结论只有仪器没有耳朵,承重之前要过一次盲测。"
-    }
+    },
+    "⛔ **ΔHNR 的量级校准(S146g 盲测,2026-08-16)**:把 PSOLA 的亚样本搬运抖动拿掉,ΔHNR 改善 **+1.05 dB**(生产口径)、f0 p90 从 132 降到 24 cents —— 而**用户在 8 对承重对比上一对都听不出**(三个包、含 3 个空白对照、电平对齐到 ±0.000 dB、两臂喂同一个已渲染 wav;素材含用户自己点名的 169 小节 −7 与 189-192 小节 −5)。⭐ 该设置有历史正对照:同一听者同一流程在 S146 换引擎时**两个承重组都分对**。⇒ **~1 dB 级的 ΔHNR 变化在这条线上不构成可闻收益**;引用 ΔHNR 改善时必须同时说明它是否越过了这个量级,否则是在拿一个已知听不见的数字做决策。"
   ]
 }

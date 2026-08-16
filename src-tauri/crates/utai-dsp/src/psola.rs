@@ -366,8 +366,26 @@ fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize,
 /// the toll keeps worsening; "jitter is the problem" predicts a plateau. Measured: **plateau**.
 ///
 /// `frac_transport` = carry that residual with a windowed-sinc read instead of dropping it.
-/// ⚠ Additive: production still runs the whole-sample path until a blind test says otherwise
-/// (S146's protocol — the rulers cannot settle this, see `TRANSPORT_SINC_TAPS`).
+///
+/// ⛔⛔ **BLIND TEST SAYS NO (2026-08-16). Leave it OFF and do not reopen this without new
+/// material.** Three packages, **8 load-bearing pairs + 3 blank controls**, level-matched to
+/// ±0.000 dB, both arms fed the SAME rendered wav: the user could not tell them apart anywhere —
+/// 东雪莲 at +6, akiko at +7, and the two spots they had themselves named as still-improvable
+/// (bars 169 「たらああ」 at −7, the deepest shift in the song, and bars 189-192 「いだあああ」).
+/// ⭐ The null is load-bearing, not a shrug: the same listener and the same protocol **got both
+/// load-bearing groups right** when S146 swapped the engine, so the setup is demonstrably
+/// sensitive to a real perceptual difference.
+///
+/// What that means, stated so nobody re-derives it: **removing this jitter is worth ~+1.05 dB
+/// ΔHNR and f0 p90 132→24 cents, and NONE of it is audible on this material.** The measurement
+/// was right; the inference "better number ⇒ better sound" was not. Keep the arm — the defect it
+/// removes is real and may matter for other material (deeper shifts, other languages, the cover
+/// lane) — but the burden of proof for turning it on is a blind test that PASSES, not a ruler.
+///
+/// ⚠ Residual difference between the arms, measured: −22.2 dB relative, correlation 0.9970,
+/// worst |Δ| 0.19 — i.e. **an order of magnitude smaller than re-rendering the same command
+/// twice** (worst |Δ| 1.47, SVC is not bit-reproducible). Predicting "inaudible" from that alone
+/// would have been fair; the blind test is what makes it a fact.
 #[allow(clippy::too_many_arguments)]
 fn add_bell(
     x: &[f32],
