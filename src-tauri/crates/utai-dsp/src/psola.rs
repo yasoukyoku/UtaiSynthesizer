@@ -75,6 +75,12 @@ pub struct PsolaDiagnostics {
     /// ⭐ 0.0000 at ratio 1.0 · ≈0.41 for whole-sample transport at any other ratio ·
     /// 0 once `frac_transport` carries it. See `add_bell`.
     pub transport_residual_rms: f32,
+    /// S148 — how many grains the WSOLA search actually moved off `src[k]`.
+    /// ⛔ It is the difference between "the arm is on" and "the arm did something": a search that
+    /// never moves a grain produces byte-identical audio, which is indistinguishable from the arm
+    /// being off unless this number is printed. (S147 shipped a change whose benefit was silently
+    /// halved and the only thing that exposed it was a count in a log line.)
+    pub wsola_moved: usize,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -293,6 +299,66 @@ fn max_correlation(x: &[f32], t1: f64, period: f64, lo: f64, hi: f64) -> (f64, f
         0.0
     };
     (best_i as f64 + off, best_c.max(0.0))
+}
+
+/// S148 — pick the SOURCE read position for one grain by waveform similarity with what has
+/// already accumulated (WSOLA). Returns `s0` unchanged unless some offset in `±radius` beats it.
+///
+/// The comparison window is the grain's LEFT half — that is exactly the span where this grain will
+/// overlap the previous one, i.e. the only place where a phase mismatch can cancel. `acc` there is
+/// the previous grain's windowed right half; both sides are normalised, so the previous grain's
+/// window taper does not bias the score.
+///
+/// ⛔ `MARGIN` is not cosmetic: at ratio 1.0 the accumulator **is** the windowed input at this very
+/// position, so offset 0 is the true maximum — but the correlation surface is flat around it and
+/// floating-point noise could hand the win to a neighbour, which would break the identity gate
+/// (`ratio_one_is_the_identity`) that this whole module is built on. Requiring a strict improvement
+/// keeps 0 the winner whenever nothing is actually better.
+fn wsola_pick(x: &[f32], acc: &[f64], s0: f64, tm: f64, lw: f64, radius: f64) -> f64 {
+    const MARGIN: f64 = 1e-4;
+    let r = radius.round() as isize;
+    let n = lw.round() as usize;
+    if r < 1 || n < 8 {
+        return s0;
+    }
+    let ti = tm.round() as isize - n as isize;
+    if ti < 0 || ti as usize + n > acc.len() {
+        return s0;
+    }
+    let a = &acc[ti as usize..ti as usize + n];
+    let anorm = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if anorm <= 0.0 {
+        return s0;
+    }
+    let score = |off: isize| -> f64 {
+        let si = s0.round() as isize - n as isize + off;
+        if si < 0 || si as usize + n > x.len() {
+            return f64::NEG_INFINITY;
+        }
+        let b = &x[si as usize..si as usize + n];
+        let bn = b.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>().sqrt();
+        if bn <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        let dot: f64 = a.iter().zip(b).map(|(p, q)| p * f64::from(*q)).sum();
+        dot / (anorm * bn)
+    };
+    let mut best = 0isize;
+    let mut bestv = score(0);
+    if !bestv.is_finite() {
+        return s0;
+    }
+    for off in -r..=r {
+        if off == 0 {
+            continue;
+        }
+        let v = score(off);
+        if v > bestv + MARGIN {
+            bestv = v;
+            best = off;
+        }
+    }
+    s0 + best as f64
 }
 
 /// Pitch marks inside one voiced island: seed at the island's midpoint extremum, then recurse
@@ -528,6 +594,52 @@ pub fn psola_shift_opts(
     f0_hop: usize,
     frac_transport: bool,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_wsola(x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, 0.0)
+}
+
+/// S148 — additive: an optional **bounded waveform-similarity search on the SOURCE side** (WSOLA).
+///
+/// ## What it is for
+///
+/// Measured on real material at +7 st (akiko donor, the production caliber): **3.9–4.3 % of voiced
+/// frames come out more than 4 dB below the input**, while praat on the *same input at the same
+/// ratio* does that on **0.2 %** — a 20× gap, so it is not inherent to TD-PSOLA. Five candidate
+/// causes were each killed by measurement: the input's own properties (f0-matched controls: every
+/// difference ≈ 0), the analysis marks (99.82 % of spacings within 0.7–1.3 × the f0 period, **0.0 %
+/// anomaly rate at the notch frames**), the grain displacement δ (`corr(Δlevel, |δ|) = +0.07`), the
+/// fed-f0 source (score-parametric vs measured: 3.91 % vs 4.29 % — measured is no better), and the
+/// island count (272 vs 88 islands, same notch rate).
+///
+/// What the diagnostics say is that **the window sum is intact where the notches are**
+/// (`cola_gap_frac` = 0.0 %, `cola_w_median` = 1.000 on both arms) ⇒ the level is not lost to a
+/// COLA hole, it is lost to **grain-to-grain signal cancellation**.
+///
+/// And there is a structural asymmetry behind that: [`max_correlation`] is used **only in the
+/// analysis pass** (to place the marks). The synthesis pass places every grain *blindly* at
+/// `src[k]` — nothing ever checks that the grain about to be added is in phase with what has
+/// already accumulated. `wsola_frac > 0` adds exactly that check.
+///
+/// ## Contract
+///
+/// * `wsola_frac` is the search radius **as a fraction of the grain's left half-width**, so it is
+///   always < one period and cannot alias onto the neighbouring pitch pulse.
+/// * ⛔ **Only the SOURCE read position moves.** The synthesis pulse `tm` is untouched, so the
+///   output pitch and the exact-length contract are structurally unaffected — moving `tm` instead
+///   would jitter the pitch by the search radius.
+/// * The search must **beat the unshifted position by a margin** to move, so ratio 1.0 (where the
+///   accumulator already *is* the windowed input at that position) keeps `s == src[k]` and the
+///   identity gate stays honest. `wsola_frac = 0.0` is byte-for-byte the pre-S148 behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_wsola(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -607,8 +719,17 @@ pub fn psola_shift_opts(
             if lw <= 1.0 || rw <= 1.0 || lw > max_period || rw > max_period {
                 continue;
             }
+            // S148 WSOLA(默认 0 = 关,生产逐位不变):只挪【源】读点,不挪合成脉冲 tm。
+            let s_pos = if wsola_frac > 0.0 && i > 0 {
+                wsola_pick(x, &acc, src[k], tm, lw, wsola_frac * lw)
+            } else {
+                src[k]
+            };
+            if s_pos != src[k] {
+                diag.wsola_moved += 1;
+            }
             add_bell(
-                x, &mut acc, &mut wsum, src[k], tm, lw, rw, formant_rate, frac_transport,
+                x, &mut acc, &mut wsum, s_pos, tm, lw, rw, formant_rate, frac_transport,
                 &mut residual,
             );
         }
@@ -1200,12 +1321,16 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        let (y, d) = psola_shift_diag(&x, spec.sample_rate, st, &f0, hop);
+        // S148:`UTAI_PSOLA_WSOLA=<frac>` 打开源侧波形相似度搜索(默认 0 = 关,逐位同旧)。
+        let wsola: f64 =
+            std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let (y, d) =
+            psola_shift_wsola(&x, spec.sample_rate, st, 0.0, &f0, hop, false, wsola);
         println!(
             "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
-             islands {} marks {} cola_gap {:.1}% w_median {:.3}",
+             islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {}",
             x.len(), spec.sample_rate, f0.len(), d.islands, d.marks,
-            d.cola_gap_frac * 100.0, d.cola_w_median
+            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved
         );
         assert_eq!(y.len(), x.len(), "exact-length contract");
 
