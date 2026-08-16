@@ -110,6 +110,19 @@ def main(spec_path):
                 seg_c *= g
                 gain_db = 20.0 * np.log10(g)
 
+        # ⛔ 每一段都必须**真的有人在唱**。S148 实测踩过:按「这段没有救援窗」挑出来的对照段
+        #    是**数字静音**(峰 0.000)⇒ 「两边一样」这个答案不需要任何听力,对照是**空的**
+        #    —— 它既证明不了听者认真听了,也证明不了这一轮的判断可信。
+        #    ⚠ 对**空白对照**尤其致命:它存在的全部意义就是「能分辨的人在这里必须分不出」。
+        hop = max(int(sr * 0.02), 1)
+        nfr = len(seg_r) // hop
+        voiced = (np.mean([20 * np.log10(max(float(np.sqrt(np.mean(seg_r[i*hop:(i+1)*hop] ** 2))), 1e-9)) > -50.0
+                           for i in range(nfr)]) if nfr else 0.0)
+        peak = float(np.max(np.abs(seg_r))) if len(seg_r) else 0.0
+        if peak < 1e-4 or voiced < 0.5:
+            die(f"{label}: 这一段基本没有声音(峰 {peak:.4f} · 有声帧 {voiced*100:.1f}%)—— "
+                f"⛔ 拿它当素材是空判据;{'空白对照' if blank else '承重组'}尤其不许。")
+
         if blank:
             # ⑴ 空白对照必须逐位相同
             d = float(np.max(np.abs(seg_r - seg_c))) if len(seg_r) else 0.0
