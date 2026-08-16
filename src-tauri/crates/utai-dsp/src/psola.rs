@@ -368,7 +368,7 @@ fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize,
 /// `frac_transport` = carry that residual with a windowed-sinc read instead of dropping it.
 ///
 /// ⛔⛔ **BLIND TEST SAYS NO (2026-08-16). Leave it OFF and do not reopen this without new
-/// material.** Three packages, **8 load-bearing pairs + 3 blank controls**, level-matched to
+/// material.** Three packages, **7 load-bearing pairs + 3 blank controls**, level-matched to
 /// ±0.000 dB, both arms fed the SAME rendered wav: the user could not tell them apart anywhere —
 /// 东雪莲 at +6, akiko at +7, and the two spots they had themselves named as still-improvable
 /// (bars 169 「たらああ」 at −7, the deepest shift in the song, and bars 189-192 「いだあああ」).
