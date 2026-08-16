@@ -1,208 +1,217 @@
 {
-  "_why": "把记忆里的『动 X 前必读 Y』从【我该记得读的文本】变成【碰到那个文件时工具链打给我的东西】。起因:用户 2026-08-11 —— 『钩子存在但是不读 这个问题你也想想办法吧... 每次出这个问题的后果都挺灾难』。这已经发生过两次:S120(没读 MEMORY.md 明写的『动训练侧前必读 S75+S76』),S135(拿『某一场已经销过账』顶替了『去读核验经验』)。记忆层解决不了它 —— 失效点不在『我不知道规矩』,而在【动手那一刻没有任何东西拦我】。",
-  "_how": "PreToolUse 钩子在 Edit/Write 触到下面任一 match 前缀时打出该区的必读清单。⛔ 每个 session × 每个区**只打一次**(打多了必然被调成噪音、然后被无视)。",
-  "_maintenance": "新增一个区之前先问:它的『必读』真的会改变我要写的代码吗?不会就别加 —— 这份清单的价值与它的长度成反比。",
-  "memory_dir": "C:\\Users\\admin\\.claude\\projects\\D--MyDev-Utai-v2-dev\\memory",
-  "areas": [
-    {
-      "id": "gate",
-      "match": [
-        "converter/verify/training/"
-      ],
-      "headline": "你在动训练侧的【关卡】。这套闸的绿曾经不代表任何事。",
-      "must_read": [
-        "project_v2_session140.md",
-        "project_v2_session139.md",
-        "project_v2_session138.md",
-        "project_v2_session135.md",
-        "project_v2_session134.md"
-      ],
-      "hard_rules": [
-        "⛔ 凡是量【时间】的判据:这台机器有三条会凭空造出『速度差』的状态,全部实测过(S138)—— ⑴ **冷卡**:GPU 空闲后第一次跑只有 780 MHz(不是 2010),step 慢 1.85 倍,而 **preflight 结构上挡不住它**,只有【运行中采样】看得见;⑵ **会话内系统漂移 3.19%**,而被测效应也是 3.1% ⇒ **AAA/BBB 的跑法会凭空造出一个恰好等于真实效应大小的结果** ⇒ 必须 A/B/A/B 交替;⑶ **写盘瞬态 45-56% 的持久档位迁移**。⇒ 统计量用**配对比值 + SEM**,⛔ 不许用极差(它把噪声高估 2.6 倍,3σ 从 0.80% 变成 16.6%)。",
-        "⛔ 用户 2026-08-11 拍板的三条判据(别自己发明别的):⑴ gate 有没有【自证陷阱】 ⑵ gate 覆不覆盖【全部】训练架构 ⑶ 今天的 gate【至少和以前版本一样严谨】。三条成立就『问题不大』。",
-        "⛔ 跑验证之前**先去看以前版本时候是怎么做的**(用户 2026-08-11 立的常驻规矩)—— 有没有可借鉴的经验或启发。S75/S76/S78/S79 是训练侧的坑单与做法;S37-S41 是这套 gate 建立时的方法论(README.md 里有)。**不许拿『某一场已经销过账』当替代:销账是结论,经验是做法。**",
-        "⛔ 删目录 = 正确地红,清空目录 = 假 PASS(compare 的守卫只看 isdir)。⚠ S139 在 gate1 上又抓到两条同形的,而且更狠:`gate1_vocoder_compare` **不需要「空」** —— 两侧写满 15 点、数值差 1000 倍,只要 tag 前缀**同时**改名就退 0(两侧吃同一份 yaml ⇒ 改名天生对称 ⇒ 它对「同源同改」结构上是瞎的)。**地板写在循环体内 ⇒ 零轮时没有地板** 这个形状本仓已连续三场买到(S136/S137/S139)。",
-        "⛔ S139:gate1 五条 compare 现在**要求跑器钉的 `GATE1_T0`**(新鲜度)—— 手敲会得 exit 3,那是对的,用 `run_gate1_chain.py`。⛔ 它**默认不跑 prepare**(rvc 4.33 GB / vocoder 9.20 GB),要重建得 `--rebuild-fixtures` **且** `GATE1_ALLOW_REBUILD=1`。⛔ 别跑 `TESTING\\s134_f7\\run_gate1_chain.py` 那份旧副本 —— 它会截掉 S134 自己的转录。",
-        "⛔ S139:这一层的每一条判据都要能说出**它红的理由**。本场我自己造了五个洞、三个是同一形状:『判据红了,但它红的理由不是我以为的那个』(过滤器写错 ⇒ 新鲜度永远匹配 0 件,而自检因此而绿)。⇒ 自检的断言要钉到**理由**上(`expect_unrunnable(..., because=)`),不只是异常类型。",
-        "⛔ 别用 reporter.stage 的 done 计数当判据 —— 它在 skip 之前汇报,全跳过也走满。",
-        "⛔ 五条链的 gate0 两侧解释器**天生不同**(原版侧 = RVC 整合包 runtime),不许改成 gate1 那种『两侧同一个』。",
-        "⛔⛔ S140:**「一条从没在真夹具上执行过的断言」与「一条从没被执行过的错误分支」一样,都是空判据。** 实测:S139 前移到 rmtree 之前的那条输入身份断言,把 `rvc_ours\\mute` 判成空子目录 ⇒ **笔 G 的第一条链当场退 6**。根因是 `mute` 是**目录套目录**而 `gate0_guard.collect` **非递归**,而拷贝端 `copytree` 是递归的 —— 两边口径不一致;而它的自检夹具是**扁平**目录,**结构上盖不到这一形**。⇒ 给闸写自检夹具时,**先去看真夹具长什么样**(嵌套?末行空 losses?同一 step 出现两次?),别照着脑子里的形状造。",
-        "⛔⛔ S140:**NaN 在纯 python 里是隐形的。** `max(生成器)` 与 `if rel > worst` 对 NaN 的**一切**比较都是 False ⇒ 前者在 NaN 不落首位时静默丢掉、后者**连首位都丢**(实测:v2 九分量全 NaN 时打 `max_rel=0.000e+00 @ step -1` 并 **PASS**)。⇒ 判据一律写成**否定式** `if not (rel <= line)`,并对两侧逐点 `math.isfinite` 点名;打印的必须是**真比过的对数**,不是送进去的点数。⚠ 这条 `gate1_vocoder_compare` 早在 **S40** 就修好并写下过原话,**四个月零回移** —— 与 gate0_guard 头注记的 S68 那段 25 天**同形第三次**。⇒ 修一个洞时,**先 grep 它的孪生**。",
-        "⛔⛔ S140:**汇总层会把归因吃掉。** `run_gate1_chain all` 的退出码此前取「第一条非零」(而变量名叫 `worst`)⇒ 一条 exit 6(语义「重跑一次就好」)会把后面任何一条真红盖住;而这套码的全部价值就在于 `1` 被单列为「只有这一种是被测的东西不对」。⇒ 现在按**严重度** 1>7>4>2>3>5>6,并打 `EXIT=n 因为 <哪条链>`。⛔ 跑完**别只看 `$LASTEXITCODE`**,逐条读汇总的五个 rc,并**逐条打开 `1_prepare.log`** ——exit 6 在「prepare 拒绝(盘上什么都没删)」与「compare 不构成判定(夹具已换过一轮)」之间是复用的。",
-        "⛔⛔ S140:**联锁只挡住它看得见的那条路。** `run_gate1_chain.py vocoder` **不加任何参数**就会删掉 3.66 GB(S134 声码器**原版侧**唯一在盘证据)—— `gate1_vocoder_run_orig.py` 在 import 期无条件 rmtree,而 `report_wipes` + `GATE1_ALLOW_REBUILD` 只在 `if rebuild:` 里 ⇒ **那道锁是装饰**。⇒ 加联锁时先问:**这条路上还有谁会删东西**(上游驱动?上游 `data_utils` 的 lazy cache?),别只挡 prepare。同族:只报「删」不报「**覆盖**」的账目只有半个。",
-        "⛔ S140:**登记值必须是量出来的,而且要和判据的口径逐字对齐。** 本场唯一一次真红是我登记 `expect_sha` 时只算了 events 文件,而 `declare_frozen(..., [\"\"])` 无后缀过滤、算的是**整目录**(同目录还有个 3 字节的 `hparams.yaml`)—— **闸是对的,错的是登记值**。⇒ 登记之前先用**判据自己会走的那条代码路径**把值算出来。⚠ 同族:`EXPECT[*]` 里任何**零读者**的登记数都会在下一个人手里变成一条错的判据。",
-        "⛔ S140:长任务(gate1 五条链 ≈ 16 分 29 秒)**别用带 timeout 的后台命令跑** —— 工具上限是 10 分钟,会在中途把它杀掉。用 `Start-Process` 起**真正脱离**的进程 + Monitor 盯结论行。⚠ 这一场因此白跑了一次(损失为零:备份完整、后四条链一步没动)。"
-      ]
-    },
-    {
-      "id": "training-py",
-      "match": [
-        "training/utai_train/"
-      ],
-      "headline": "你在动 python 训练侧的生产代码。",
-      "must_read": [
-        "reference_training_workspace_layout.md",
-        "project_v2_session75.md",
-        "project_v2_session76.md",
-        "project_v2_session78.md"
-      ],
-      "hard_rules": [
-        "⛔ S75/S76 的原文有 3 条已被后来的设计**有意换掉**,照原文『补回来』会当场制造新拒绝:loudnorm/aug_copies 被 S78 从必锁降为 Costly · 『一 family 一槽、重训清空该架构』被 S132 的 flip 整条换掉 · 『续训起点只读呈现』被 §F2⒜ 换成 latest/best 两选。",
-        "⛔ additive-then-flip:会让 N 个调用点同时失效的改动,**删除留到最后一笔**(S121 血训)。",
-        "⛔ 改了阶段函数的签名 ⇒ 仓内**和仓外**的驱动都要跟上。跑 `gate_driver_arity.py` 核一遍(S134 那七个调用点漂了四个月;S135 又在仓外抓到两个)。"
-      ]
-    },
-    {
-      "id": "training-rs",
-      "match": [
-        "src-tauri/src/training/"
-      ],
-      "headline": "你在动 Rust 训练侧(槽 / run / 池 / 锁表 / 导出账本)。",
-      "must_read": [
-        "reference_training_workspace_layout.md",
-        "project_v2_session133.md",
-        "project_v2_session132.md",
-        "project_v2_session129.md"
-      ],
-      "hard_rules": [
-        "⛔ 危险不在把权重挪个位置,而在于**八条承重谓词同时变假,五条静默毁数据**(S123)。",
-        "⛔ 房规 `opt_run_id(\"\")→None` ⇒ 照抄 rename 那一行会做出**伪装成删 run 的删槽**(S133)。",
-        "⛔ 训练侧的 i18n:权威表是 `backendError.ts` 的 `CODE_KEYS`,json 里有文案不算数;动 i18n 一律**文本行插入**(json 往返会整体重排序)。",
-        "⛔★S144:`run_dir_for_start` 的「0 个 run + layout≥3」臂**铸新 id**(不再是 family 纯函数 `legacy_run_id`)—— 它同时服务**两个人群**(被删光 run 的槽 + 迁移过但从没训过的槽),而**盘上没有信号分得开**。改它之前先读那个函数头上那段 ⛔(S144 推翻的正是它),并记住:`legacy_run_id` 本身**不许**改成随机(迁移崩溃点回滚靠它确定)。⚠ 账本那三处「删光再练造出逐字节相同 rel」的理由**已经改写**;`settings.rs` 那两处**仍然成立**(它的同 id 来自 `migrate_data_dir` 复制整棵树),别顺手改。",
-        "⛔★S144:给 `run_slot` 那类夹具选 family 时注意 **rvc 的 3→4 折叠要从切片读采样率**(`POOL_SAMPLE_RATE_UNKNOWN`)⇒ 只铺 `1_16k_wavs` 的夹具在 rvc 上折不动。⚠ 而「夹具直接建在 layout 4」会让「删完之后在 layout 4」这条前置断言**恒真**(装饰件)。"
-      ]
-    },
-    {
-      "id": "training-ui",
-      "match": [
-        "src/components/training/",
-        "src/lib/training/",
-        "src/store/training"
-      ],
-      "headline": "你在动训练侧前端。",
-      "must_read": [
-        "project_v2_session143.md",
-        "project_v2_session141.md",
-        "project_v2_devserver_and_e2e_backlog.md",
-        "project_v2_session128.md"
-      ],
-      "hard_rules": [
-        "⛔ devServer **只查观感**,不是行为验证手段。行为一律做程序化验证。",
-        "⛔ 决策写在组件体内联表达式里 ⇒ vitest 结构上够不着。**先抽成 `src/lib/training/` 下的纯模块**(M1 已示范;S141 又照它做了 slotRows / importToast 两个)。",
-        "⚠ 记忆里 M4/M7 的阴性对照**写错过**,以 devserver backlog 的『S134 §2』与『S141』两节为准。⛔ 尤其 M7 那条「无 warning 时不弹」是**假的** —— 三条路都弹一条,判据要落在**档位与追加行**。",
-        "⛔ S141:声明「纯提取、行为逐位不变」时该给的证据形状是**差分模糊**(把搬家前的表达式原样抄成 legacy,随机输入逐个对拍),不是「我读了代码」。而且要配**语料自检** —— 生成器走不到有分辨力的形状时,跑一万次也只是把同一格重复了一万次。",
-        "⛔ S141:抽完之后**还欠一道接线闸**(组件必须在用那个函数)。纯模块的判据全绿而屏幕已经不再经过它 —— 这一对实测过:同一个变异,接线闸红、纯模块 13 条全绿。",
-        "⛔ S141:一个**只往测试里加东西**的改动照样会弄坏别处的判据 —— 在测试里写 `#[cfg(test)]` 字面串,让 mod.rs 的计数从 1 变成 3,当场打红三条既有的源序棘轮。切生产区用本模块**已有的** `production_part`,别自己再写一遍。",
-        "⛔★★ S143:「哪个 run 正在跑」的载体是 `TrainingSnapshot.run_id`,而它的 `\"\"` 有**两种含义** —— idle 时是「什么也没说」,运行中是「**槽根就是这个 run**」这个**肯定事实**(未迁移槽,与 `RunDetail.id` 给那一行的值同一个串)。⇒ **必须先用 `state` 判在不在跑,再拿它比行 id**;类型一律 `string | null`,别用 `\"\"` 当哨兵。把它读成「没有」会让未迁移槽的唯一那一行永远显示成「正在训练」,空闲时也是 —— 那是 `rowIdentity.ts` 头注禁掉的**缺席推断**换了件衣服。⛔ 别自己写这个判断,用 `lib/training/liveRun.ts`。",
-        "⛔★★ S143:「能不能动这一行」是**两个正交谓词**,合成一个必错一边 —— **继续/再训/开始**跟「有训练在跑」(**跨项目、不许按 project_id 过滤**:后端是进程级单槽);**删除/改名**跟「有**任何**长任务在跑」(后端 `running_tasks_of` 含 separation/render/**audition**,doc 明写 fail-closed and coarse)。禁得比后端窄 = 用户在最常见的那一格照样白点一次;禁得比后端严 = 试听一段音频就开不了训。⛔ 而「正在跑」**不是** `state !== \"idle\"`:快照不在训练结束时清(只有「清空结果」清),照那个写法做出来的是**跑完之后按钮永久禁死**的界面,而任何只造 running 形状的夹具都杀不掉它(仓里有两份现成抄本会诱你抄:`runIsHere` / `isLiveRun`)。",
-        "⛔★ S143:`sovits_diff` **不是一个 family**,它跑在 sovits 槽的 run 目录里 ⇒ 匹配一律走 `backendFamily(snap.backend)`。写成 `snap.backend === family` 在**所有单 backend 的夹具上与正确写法同值**,只有浅扩散那一格分得开 —— 而浅扩散一跑就是几小时,那正是最需要它的一屏。⇒ 语料自检必须显式要求见过 `backend != family` 那一格。",
-        "⛔★ S143:`npm test`(= `vitest run`)**不做类型检查**,`tsc -b` 只在 `scripts/release.ps1` 跑 ⇒ 给一个既有函数**插**参数(而不是追加在末尾)会让既有用例把实参喂错位置而**仍然全绿**,失败消息里那些插值变成假话。⇒ 加参数一律**追加在末尾**;验收时把 tsc 列成**独立一档**,别只看 vitest。",
-        "⛔★S144:`visibleRuns`/`slotStarted` 吃 `liveRunId`,而**两半必须收到同一个实参** —— 只喂一半的两种坏法都在屏幕上(徽章与「未开始」同屏 / 说开始过了却一行不画),而纯模块判据对它零分辨力(它们各自都对)。⚠ 新槽第一次训练时 `snapshot.run_id` 是 `\"\"`,那是**肯定事实**(槽根就是那个 run),比较必须逐字节相等。",
-        "⛔★S144:参数页「代价提示」该挂在哪些字段,由 `costlyNote.EDITABLE_POOL_FIELDS` 这张**手写表**说了算。⛔ 不许改成从 tier/scope 推(`tests/pool_identity_formula.rs` 明写 `LockScope` 对 family 恒定项是**假设性**答案),也不许改成从 `POOL_FORM_FIELDS` 推(会让 `rowIdentityWiring` 唯一的存在性断言恒真)。⚠ 整段提示今天**删光了全仓也不会红**(S144 实测),所以那道逐字段闸是它唯一的看守。"
-      ]
-    },
-    {
-      "id": "dictline",
-      "match": [
-        "converter/architectures/",
-        "scripts/g2p_rulers/",
-        "src/lib/vocal/"
-      ],
-      "headline": "你在动词典线 / G2P / 人声轨那一块 —— 它的 session 行 S83-S113 在 S135 被整块搬出 MEMORY.md 了。",
-      "must_read": [
-        "memory_dictline_sessions_index.md"
-      ],
-      "hard_rules": [
-        "⛔ 那 31 行里的钩子**全部仍然有效**(G2P/各语词典 · syllabify/onset/接缝 · allocate_in_note/借帧/PHONE_DUR_PRIORS · 音域扩展 donor · UTAU 别名 · restToken/吸附 · 反投影尺子)。去那篇 grep 你要动的模块名。",
-        "⛔ 造新尺子/改判据前先读 `scripts/g2p_rulers/README.md` 的 8 条硬规矩。",
-        "⚠ 收到某个词唱错的反馈:意语先读 it_troncamento_open_costs 的判定流程,德语先 grep de_glide_open_costs。"
-      ]
-    },
-    {
-      "id": "release",
-      "match": [
-        "scripts/release.ps1",
-        "src-tauri/tauri.conf.json"
-      ],
-      "headline": "你在动发版链。",
-      "must_read": [
-        "reference_release_signing_and_publishing.md",
-        "project_v2_release_bundle.md"
-      ],
-      "hard_rules": [
-        "⛔ minisign 私钥丢了 = 更新链死。",
-        "⛔ `cargo test` 必须带 `--workspace`(S134:裸 cargo test 漏跑 utai-dsp + utai-stretch 共 38 条,而它从来没红过)。"
-      ]
-    },
-    {
-      "id": "range-extend",
-      "match": [
-        "src-tauri/src/inference/vocal_range.rs",
-        "src-tauri/crates/utai-stretch/",
-        "src-tauri/crates/utai-dsp/src/psola.rs",
-        "scripts/range_rulers/",
-        "rangeBounds.ts",
-        "RangeBoundsEditor.tsx",
-        "rangeTest.ts",
-        "MsstModelManager.tsx",
-        "score2svc.rs",
-        "score2cv.rs",
-        "commands/inference.rs"
-      ],
-      "headline": "你在动【音域扩展的逆变换】。S145 定的根因、S146 已经把引擎换成 TD-PSOLA 了,别重推;而这条线上有一个正确的方向曾经被我们自己关了四个月。",
-      "must_read": [
-        "project_v2_session146f.md",
-        "project_v2_range_scan_probe_shape.md",
-        "project_v2_session146.md",
-        "project_v2_session145.md",
-        "project_v2_range_extend_quality.md",
-        "project_v2_session85.md"
-      ],
-      "hard_rules": [
-        "⚠ 【拿 akiko 做对照前先跑 `scratchpad/doctor_akiko.py status`】。S146d 那份「80 判死」的实验态**早已还原**(S146e),但备份 `.s146d-backup` 与工装都还在,而盘上那份被重扫过 (`scan_version 4`,带 onset 电平列)。⛔ 别再用 `doctor_akiko.py apply` 复现「80 判死」:今天把**可用上限**拖到 79 就是同一件事。",
-        "⛔⛔ S146c:**救援落点规则已从「最浅合格」改成「在合格集合内按 damage 最小、平局取最浅」**,而它**必须带深度上限**(`LANDING_MAX_EXTRA_DEPTH = 1`)—— 无上限时东雪莲会走到 **−24**(它中段有 15 格 low_ratio>0.7),而 S85 记着 −24 整曲重着色是用户耳判的灾难。⛔ 那条判据**写了三版才有牙**:①夹具留着被拖走的音 ⇒ 它们把 worst-damage 钉死 ⇒ 变异不红(要用**没有乘客的单个死音**);②**断言里引用了被测的常量** ⇒ 永远不可能红(**边界必须写字面量**)。",
-        "⭐⭐⭐ S146:**「ratio == 1.0 必须是恒等变换」是这条线上最便宜、最不可能自证的判据**,而它必须打在 `utai_dsp::psola` 内核上 —— `apply_inverse` 在 `shift == 0` 提前 return,打在那里是恒真的空判据。2026-07 删掉的那份实现**在 ratio 1.000 上就掉 5-9 dB HNR**(它自己的注释写着),⇒ 病是「过一遍重合成」的固定税。这条判据在 S146 当场否决了我已经写下去的**三个**设计(独立相位积分的目标脉冲 / 搬运用去 DC 的信号 / 照 praat 那样按相关门限拒绝 mark),每一个都是「看起来对、跑起来红」。",
-        "⛔⛔ S146:**只量【上移】就上线 = 又一次判据够不着症状轴**。`MAX_RANGE_SHIFT = 24` 且 `cover_dead_plan` 会产出 **+22**(音频下移 22 半音)。实测:窗宽若不被源邻距裁短,−12 半音时**输出与输入逐位相同** —— 而包络位移 +0.00 / 峰值相关 1.000 / ΔHNR +0.00 / 浊帧存活 100%,**三把尺子全读「完美」**,只有那把登记成「必要不充分」的 **f0 尺**读出 +1200 cents。⇒ 验收必须双向,且**那把 f0 尺不许拿掉**。",
-        "⛔⛔ S146:**SVC 渲染不是逐位可复现的** —— 同一条 `mg_render_sovits` 命令跑两次逐样本最大差 **1.47**,与「换引擎」这个效应(1.50)同量级。⇒ ⑴ 渲染产物上的**任何逐样本对拍都不成立**(盲测的空白对照必须用**同一个文件的副本**);⑵ 做 A/B 时两条臂要**喂同一个已渲染的 wav**(用 `vocal_range::tests::inverse_probe`),否则耳朵听到的差别里混着模型的随机波动。⚠ 尺子对这条噪声是稳的(离散 0.05 半音 / 0.11 dB),所以仪器结论不受影响。⚠ 仓里早就知道:`mg_cover_deadonly_smoke` 自己就在量 run-to-run noise 并按「噪声底 ×8」定容差。",
-        "⛔ S146:**「与 praat 标记的一致率」是无效代理** —— `absmax` 检测器一致率最高(67%)而 ΔHNR 最差(−5.94)、浊帧只剩 52%。便宜的代理指标在这条线上指反了方向。**只用 `scripts/range_rulers/` 的四把尺子判。**",
-        "⛔ S146:**|shift| > 6 时 praat 不是有效参照**(pitch ceiling 1400 Hz 被撞穿:+12 上它自己读包络 +2.70 / 相关 0.661 / 浊帧 41.1%,比被测者还差)。`arms.py` 里登记了 `PRAAT_USABLE_SHIFT_ST = 6.0`。",
-        "⛔ S146 更正记忆里的一条:**「三处缓存版本成对 bump」不精确** —— `commands/audio.rs` 的 `_s2r` 是**速度滑条**的时间伸缩缓存(key 里只有 time_factor),永远不经过 `apply_inverse`。这条路上**只有两处**:`RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而它们现在由 `src/lib/vocal/rangeAlgoLockstep.test.ts` 机械联锁。",
-        "⚠ S146:**cover/sovits 那条路只做了结构性验证**(接线闸 + 与 cover/rvc 逐字同形的调用),**没有行为验证** —— 仓里本来就没有 sovits 的 cover 冒烟(`mg_cover_deadonly_smoke` 是 RVC-only)。要动 cover 侧的执行层之前,先把这条欠账补上。",
-        "⛔⛔ 染色的根因**已定**(S145,四路收敛):Signalsmith 的「包络」不是真包络,是对原始能量谱做的**形态学闭运算**,衰减常数 `decay = 1 - 1/(freqEstimate*0.5+1)`(`signalsmith-stretch.h:985`),而 `freqEstimate` **全文件只有这一个使用点**、由 `setFormantBase` 唯一决定 ⇒ **平滑宽度 ∝ 我们喂的 base f0** ⇒ **f0 越高「包络」越粗、`E(f)/E(f·M)` 越接近 1、补偿退化成恒等**。剂量曲线(MIDI 64→85)= 残余 **+0.30 → +4.70 半音**;真素材上现行漏 **+2.40**,praat TD-PSOLA 只漏 **+0.30**。**别再去查 κ 或 base track —— 那两条都已被证伪**(κ=0 确实完全钉住;base 喂的确实是移调后的 f0,`vocal_range.rs:636` 有明写契约)。",
-        "⛔⛔ **「我们试过 X,X 输了」必须先问:输的是【算法】还是【我们的实现】。** 2026-07-26 删掉 psola.rs 的理由是「PSOLA 脏」,而 S145 实测 **praat 的 TD-PSOLA 是本轮胜者**;仓里早就记着「praat 透明(ΔHNR −0.12~+2.68 dB),**我们旧 Rust 实现掉 5.15~8.57 dB = 实现缺陷非算法固有**」。守它的 `psola_ab.rs` **只量音高** ⇒ 实现缺陷结构上溜过去,**一个正确的方向被关了四个月**。⇒ **写 PSOLA 之前先做尺子和 praat 参照臂**(队列 §E13 笔 0)。",
-        "⛔⛔ `apply_inverse` 是 **score / cover / audition 三消费者的单一执行点** —— S85 血训「为 A 修 ≠ 对 B 无害」,**逐路径分别做行为验证,一个不落**。",
-        "⛔⛔ 【改引擎参数/引擎本身,缓存版本必须成对 bump】:`RANGE_ALGO_VERSION`(`src/lib/vocal/vocalRender.ts`)↔ `audition_cache_tag`(`src-tauri/src/commands/audition.rs`),判据 = `rangeAlgoLockstep.test.ts`。⚠ **`commands/audio.rs` 的 `_s2r` 不在这条路上** —— 它是**速度滑条**的时间伸缩缓存(key 里没有 shift/kappa/range 任何一项),记忆里「三处成对」那句话不精确。⛔ **cover(workflow)车道至今没有缓存版本载体** ⇒ 换引擎后会一直播旧音频直到手动重跑。",
-        "⛔ **WORLD 出局**:它塌清塞音(用户两次耳判「つつまれてきれい 的 き」),⚠ 而**两把带阴阳对照的仪器都看不见这个失效**(瞬态尺只读 −0.37 dB,而它对人为抹平能读 −33 dB)⇒ **该轴唯一仪器是耳朵**,不许硬编一条看不见它的判据充数。",
-        "⛔ **放宽 dead 判据(把 `SINGABLE∖LANDING` 那一格也救)= 负收益** —— 用户耳判「反而没那么自然」,而仪器事先也只给 +1.8 dB。**别再提。**",
-        "⛔ 【别把 timbre 两列(`low_ratio`/`rms_db`)接回 `slot_singable`】—— 东雪莲身上翻过车(S85 三轮:70-79 会被整片判死)。⚠ **与 S146f 不矛盾**:那一笔把 onset 遍的**电平列**接的是 `SLOT_LANDING` 的**否决**(只许收窄落点、永不改变哪些音被救),而这条说的是 `SLOT_SINGABLE`。两者是不同的闸,别合并。",
-        "⛔ **耳判 A/B 的协议**(S145 实证,照抄):承重那一问**同场只放两个候选**(放一个很烂的会产生**顺序/锚定效应**,用户实测被它骗过一次);每组 **4 个文件 = 两版各两份**,任务是**「分成两对」**;必配**空白对照**(选一段两版**逐位相同**的音频,⛔ 发之前 assert 最大逐样本差 == 0);文件名由内容 sha1 定序,KEY 单独一份。⇒ **凡结论只有耳朵没有仪器,先标【未定】。**",
-        "▶ **零成本复现整条实验链**(全是现成 env,每臂 9-12 s wall):`UTAI_MG_UST` → `dump_mg_notes` → `UTAI_MG_DUMP=1 UTAI_MG_NOTES/UTAI_MG_OUT` → `mgScoreDump.test.ts` → `UTAI_MG_SCORE/UTAI_MG_SLICE/UTAI_MG_SHIFT/UTAI_MG_INVERSE/UTAI_MG_KAPPA` → `mg_render_sovits`。⚠ 产物落**鹅妈妈** `probe\\`、文件名**不带谱标识** ⇒ **渲完立刻拷走**。素材与全部读数在 `D:\\MyDev\\TESTING\\s145_range_color\\`。",
-        "⚠ 【`range_shift != 0` 的**端到端渲染**仍然零覆盖】。S146e/f 给计划/落点/边界那一层加了十几条判据(且十一条变异零空判据),但「真的带着 shift 渲一遍」这条路上没有闸 —— S145 证伪过的「base 喂错」明天可以由一次无辜重构重新变成真的,而全仓 cargo 一条都不会红。",
-        "⛔ 【两个边界只能在同一个载荷里一次写完】(`setVocalRangeBounds`)。`validate_range_record` 同时校验两者(S146f 起判据是 **comfort ⊆ reach**,即 `usable_auto ∪ usable`,**不是** ⊆ usable),只写一半会 `RANGE_INVALID` —— 而这条错误今天在 UI 上**完全不可见**(无 catch、无文案)。",
-        "⛔ 【这条 UI 线零渲染测试】:`vitest.config.ts` 是 node 环境、include 只收 `*.test.ts` ⇒ 放进 TSX 的逻辑一条判据都不会红,新写 `*.test.tsx` 还会被**静默不收集**。⇒ 规则必须落在 `lib/vocal/rangeBounds.ts`,TSX 只做壳。资源管理器与人声侧栏共用 `RangeBoundsEditor`,别在任一边重写夹取。",
-        "⚠ 侧栏的歌手是 `governingSpeakerId`(spk_mix 里权重最大的那位),用户**从没显式选过它** ⇒ 任何改这份记录的 UI 都必须写出歌手名,否则是无声地改错人。而 usable/comfort 是模型的**磁盘 sidecar**:全局于整台机器、不进 .usp、不进 undo。",
-        "⭐⭐⭐ 【两个旋钮是正交的,别再把它们绑起来(S146f 用户拍板)】。**可用范围** = 哪些音要救(在它之内的照谱直接唱);**目标范围**(磁盘键名仍是 `comfort`)= 被救的音落在哪里,**存的值就是目标**,没有任何「是不是真的动过」的启发式。⛔ 语义上 `usable` 只管死亡判定,**拖拽可行性必须读 `reach`(= `usable_auto`)** —— 共用一个谓词会让「压天花板」把每一处已有落点都顶深(实测 79→77 剂量 251→319,→72 是 801,而组数几乎不动)。⛔ 目标范围由**扫描带**约束、不由 usable 约束:旧约束会让收窄 usable 把目标一起拖走,此后落点永远够不着它、旋钮悄悄不做事。",
-        "⛔ 【够不着时降级,不是否决】。目标范围是硬目标,但够不着必须退回正常预算并**逐组打审计行**。东雪莲存的 `[36,52]` 对上住在 75-85 的旋律,硬否决会把它从「10 组被救」变成 **0 组** —— 旋钮成了音域扩展的关机键。",
-        "⛔⛔ 【同一条规则写在两个文件里,代价一定会兑现】。S146f 把「目标范围由扫描带约束」在 `clampBounds` 改了、读侧 `targetRange` 漏了 ⇒ 用户存进去 79、读回来 74。⇒ 前端边界逻辑**只在 `lib/vocal/rangeBounds.ts` 一个文件里**(读/夹/写/还原共用 `fitsIn` + `clampInto`),Rust 侧两处合成 `band_fits`。⚠ 前后端那份镜像是架构决定的(前端要在写盘前预览后端收不收),**消不掉但必须两边一起改**,两处注释互相点名。",
-        "⛔⛔ 【把被测的常量写进断言 = 空判据】。S146f 一场犯了**四次**。正确形状:断言写**实测字面量**;若要防「门限悄悄收紧」这种字面量抓不到的方向,**另加一条直接钉常量值的守卫** —— 那与「拿常量算期望值」不是一回事(前者恒真,后者是「改它必须是有意的」)。同族:**近乎相同的测试夹具是陷阱温床**(漏写 `usable_auto` 会让 `reach == usable`,把每条断言变成恒真)⇒ 这一族只许有一个 `Rec{..Default::default()}`。",
-        "⛔ 【优化器的目标函数不能当独立读数】。我拿 `damage 0.000` 断言「两个落点一样好」⇒ 而 `damage` **就是**落点规则自己的目标函数。真正独立的读数(逆变换**之前**的原始 donor 渲染)说反了:顶音 `low_ratio` 0.849(落 78)→ **0.916**(落 77)。⭐ 至今**唯一与耳朵同向**的轴就是「在原始 donor 上量 `low_ratio`」;四把尺子对 6:1 压缩全过、对硬削波 ×4 **读成变好**。",
-        "⚠ 【提速不许拿音质换】(用户 2026-08-15:「快和好都是有意义的」)。渲染速度的大头 = **donor 全曲重渲**(`range_passes = 1 + K`,K = distinct shift 个数;实测 K=4 ⇒ 5 遍全曲推理而只用得上 21%)。任何提速结论必须分【不改输出】/【会改输出】两组,后者配耳判窗口。⛔ **SVC 渲染不逐位可复现** ⇒ A/B 只能喂同一个已渲染 wav,且必须先跑阴性对照定噪声地板。",
-        "⭐⭐⭐ 【PSOLA 的固定过路费 = `add_bell` 的 `round(t)−round(s)`】(S146g)。**两次独立取整**,每颗粒扔掉一个亚样本残差;RMS 在 ratio 1.0 **恰好 0**、一离开就跳到 **0.41 且与深度无关**(理论 √(2/12)=0.408)⇒ 这就是「进一次工序 −0.59 dB 而 +7→+8 只多 −0.37」的机理。⛔⛔ **挡住它四个月的是仓里一句【明写的、错的】注释**(「fractional delay would destroy the ratio-1.0 identity」)—— 恒等是**结构性**的,与搬运方式无关。⇒ 见到「我们试过 X 输了」的注释,先问**输的是算法还是我们的实现**,并且**连注释一起改**,否则下一个人照它再关一次门。⚠ 这次的形状是**反过来的**:不是「看起来对、跑起来红」,是「看起来错、跑起来绿」。",
-        "⛔⛔ 【`UTAI_PSOLA_FRAC` 已盲测判负(2026-08-16),保持默认关,别再开这条线】。三个包、**8 对承重 + 3 个空白对照**、电平对齐 ±0.000 dB、两臂喂同一个已渲染 wav,含用户**自己点名**的 169 小节 −7 与 189-192 小节 −5 —— **一对都听不出**。⭐ null 有分量:同一听者同一流程在 S146 换引擎时**两个承重组都分对**。⭐⭐ **顺带校准了 ΔHNR 的量级:~1 dB 级的改善不构成可闻收益** ⇒ 以后引用 ΔHNR 必须说明越没越过这个量级。⛔ 代码留着(缺陷是真的,别的素材可能用得上),但**开它的举证责任是一次通过的盲测,不是尺子**。⛔ 不许换线性插值(HNR 读得高纯粹因为低通)。",
-        "⭐⭐ 【渲染速度:99% 在两张 ONNX 图里,CPU 侧只有 1.1%】(S147 秒表,一遍全曲 63.7s)。net_g 54.7% · **NSF 声码器 41.3%** · ScoreToCV **4.1%**(⛔ `commands/inference.rs:1951` 的注释写着它是「the #1 render-time cost」—— **错的,net_g 是它的 13-20 倍**;RVC 臂同句 unmeasured)。⇒ **别往 G2P/帧分配/特征拼接优化**。代价模型 `≈ 2.5 + (1+K)×[33.6+25.4+2.5+0.7] + K×2.2`(与真机对到 2%)。⭐ **量最大的一刀是【用户旋钮】**:NSF 增强器 +25.7s/遍 × (1+K),K=4 时 323s→194s;它**改变每一个采样** ⇒ 是用户的取舍,产品面的正确做法多半是**把代价标在 UI 上**。",
-        "⛔⛔ 【donor 窗口化(B2)的三个坑,照旧口径做必错】:⑴ 落法是在现有循环里 `continue` **跳过 chunk**,**不是切 score** —— 切片会让 `chunk_at_sp` 的 `cf` 计数器从切点重置、**相位错开**,并改掉 23/25 个 chunk 的 `seg_idx`;⑵ 必须同时把**三条全曲尾段操作**改成传整曲标量(`active_rms` 电平匹配实测偏 **+1.02/+1.15 dB** = 9-10 倍地板 · `peak_normalize` 全曲峰实测偏响 **−0.648 dB** 符号 22/22 · 整曲 PSOLA unmeasured);⑶ 「零跨 chunk 上下文」是**假的** —— 至少 4 条每次渲染都开火(`ci` 进 RNG · `seam_fade` **反向写回上一 chunk 的尾巴** · 全曲归一 · 整曲逆变换)。⚠ 验收:**逐样本/波形 A/B 一律作废**(同命令两跑 corr 0.896-0.974),用 40 带对数谱 rms + 逐 chunk 电平 sd + 整曲 active_rms,各自的地板已登记。",
-        "⛔ 【替换/搬运脚本必须断言它改到了东西】。`03a1e34` 我说「两条审计行一起抬到 info!」,实际只抬了一条 —— 另一条的替换**没匹配上而脚本没有断言**,diff 只有 1 行也没看出来。「没匹配上」与「不需要改」在输出上长得一模一样。",
-        "⚠ 【登记夹具 `arm_psola.wav` 贴错标】:它与 `arm_praat_p6.wav` **sha256 逐位相同** ⇒ registry 里挂在 psola 名下的 +0.30/−1.44 是 **praat 的**指纹;我们自己同口径是 **+0.50/−1.66**。拿它当基线,换引擎对拍会**偏乐观约 0.4 dB**。已在 registry 里标 `_MISLABEL`,真修法(重生成属于我们的臂)是发版前的账。",
-        "⛔⛔⛔ 【一笔可以「功能正确、收益静默减半」而所有常规判据全绿】(S147 hotfix)。donor 打洞第一版把**全部位移的窗的并集**传给每一遍 ⇒ 四个 donor 渲同一批 chunk;单元测试、长度契约、音频秒数**全部正常**。**唯一暴露它的是「四个不同位移的 `skipped` 完全相同」这个指纹,而那个数字是顺手打进 `[perf]` 的**。⇒ 凡是「按某个键分组、每组做一次」的循环,**判据里必须有一条断言【不同的键给出不同的结果】**;凡是提速改动,**把「省了多少」打进日志**,否则静默无效与生效长得一模一样。",
-        "⭐⭐ 【渲染速度的形状(S147 秒表实测)】:**单遍已经 9.8× 实时,比翻唱(约 4×)快一倍多** ⇒ 瓶颈**全在 (1+K) 遍这个结构**,不在单遍。net_g 54.7% + NSF 声码器 41.3% + s2cv 4.1% + **CPU 侧全部 1.1%**。B2(donor 只渲相交 chunk)把 285s → 69.6s = 4.1×,但**减不掉遍数**。⇒ 下一步是**每 chunk 自带位移、一遍搞定**(~30s),⛔ 代价:移调与逆变换今天都是**全曲级**,且 `apply_dead_only_windows` 同时是「电平对齐 + 交叉淡化」的载体,一遍出结果后那两件事要另找地方。",
-        "⛔ 【base 与 donor 必须共用一个归一标量】(S147 B2 笔 1)。各自 `peak_normalize` ⇒ 拼接层只能用全曲 `active_rms` 比值**猜**回台阶,而那个猜测**依赖内容**:donor 一渲得比整曲少就偏 **+0.618 dB**(逐 chunk 地板的 8.7 倍)。⛔ 三个「自然」的修法全被实测判死:窗内对齐(base 在窗里正是坏渲染,−7 读 −4.7 dB)· 保留区对齐(−0.829,对完整 donor 也坏)· donor 不归一(把 ±12 dB 笼变成承重件,实测 g=2.69,而响度泳道是第二个绝对电平搬运工)。",
-        "⭐⭐⭐ 【「哑/破音」这条轴的第一个可见信号 —— 是用户用眼睛在波形上找到的】(S147,**未收线**)。`[753]`と(−7)与 `[685]`ぴゃ(−5)在「起音脉冲 = 前 30ms 峰 / 中段 RMS」上是**全曲 175 个音的第 1 与第 2**(15.60 / 14.59 dB,−7 组中位 7.96);而 `[785]`(2.18s 长音)那把尺子**完全看不见** ⇒ 大概率是**第二个病**。⭐ 强线索:**两个坏例都是各自救援组的【第一个音】**,而拼接缝每条实测亏 −1.25 dB、其 10 ms 淡化**在前面没有休止时正落在被救乐句第一个音节的起音上**。⇒ 复现脚本 `scratchpad/waveform_lead.py`,坐标与读数在 [[project_v2_session146f]] §10。",
-        "⭐⭐⭐ 【`dead_only_plan` 按休止分隔【整句一个位移】,把域内音也拖下水】(S147 侦察)。实测:`[753] と` 是 **note=75、在 usable[36,76] 之内、根本不需要救**,而它所在那组 10 个音里 **6 个是域内音**,全为了一个 note=85 被整体压了 7 个半音。代价可量:辅音 preroll 按深度 **0/−1/−2/−7 = −0.11/−0.09/+2.94/+15.07 dB**。⛔ `minimal_rescue_shift` 的 `all.iter().all(slot_reachable)` **只是可行性闸,没有任何「拖着走的健康音要付多少代价」的项**。⇒ 要动就动这里(加代价项 / 允许在 rest 以外切组),⚠ 会改输出且**新增组内缝**(缝的代价 unmeasured)。",
-        "⛔⛔ 【用户在波形上看到的是【相对量】,不是绝对量】。`[753]` 的绝对起音几乎没变(15.475 → 15.600),但**全曲排名 11/175 → 1/175**、邻域突出度 +5.08 → +7.01 dB —— **救援把整句压下去了而它没被压**。⇒ 凡是「某处听/看起来突兀」的反馈,先问**它的邻域有没有被整体改变**,再去查它自己。⛔ 同族:我那条「拼接缝落在起音上」的假说被一条**整曲 −7、无组无窗无淡化**的臂证伪(同处差 +0.00 dB)。",
-        "⛔⛔ 【新造的尺子必须先证明它不是在量音高/时长/剂量】(S147:ASR/EDR 两把全栽在这上面)。判据:把同样的音拿到一条**处理一次都没跑**的渲染上(`UTAI_MG_SHIFT=0` ⇒ `apply_inverse` 提前 return)复算排名 —— 若排名原样重现(实测 Spearman **+0.929**),那把尺子量的不是「坏」。⇒ **绝对排名一律作废,只有【逐音配对 Δ】可用**(音高/音素/乐句/位置全钉死)。⚠ 「自比 Δ=0.000」是**恒等式不是阴性对照**(纯函数喂逐位相同入参)。",
-        "⚠ 【落点深度上有一条【仪器 vs 耳朵】的真冲突,别单方面听一边】。仪器:`[785]` 的 donor 周期性 **−3 就饱和**(NCC 0.986),−7 多出的 4 个半音只买到 PSOLA 代价。而 **S146c 把落点从「最浅」改成「按 damage 排」正是因为用户耳判「刚好及格那一格更差」**。⇒ **只有盲测能裁**;在裁定之前两边都不许单方面改。⛔ 也**别动 `psola.rs:605-606`**(grain 半宽截到目标周期 ⇒ 谐波相位误差 ⇒ ~0.5-1 Hz 拍):机理只是 **inferred**,改它改所有输出,而今天**没有任何一把过了可听性验收的尺子**。",
-        "⚠ 【跨模型验证是判「模型特性 vs 我们的代码」的最便宜一刀】(S147,用户自己做的)。「に 之后的伪影」在 akiko 上**三次渲染全排 1/93**、在 yachiyo 上排 **42/93** ⇒ **模型特性**,`REST_GATE_FADE_MS` **别动**(它只是通道不是病因)。而「结尾几段波形异常 + 撕裂」**两个模型都有** ⇒ 普遍问题、优先级最高。⇒ 收到「某处不对」的反馈时,**换一个模型渲同一份谱**往往比读代码更快定性。"
-      ]
-    }
-  ]
+ "_why": "把记忆里的『动 X 前必读 Y』从【我该记得读的文本】变成【碰到那个文件时工具链打给我的东西】。起因:用户 2026-08-11 —— 『钩子存在但是不读 这个问题你也想想办法吧... 每次出这个问题的后果都挺灾难』。这已经发生过两次:S120(没读 MEMORY.md 明写的『动训练侧前必读 S75+S76』),S135(拿『某一场已经销过账』顶替了『去读核验经验』)。记忆层解决不了它 —— 失效点不在『我不知道规矩』,而在【动手那一刻没有任何东西拦我】。",
+ "_how": "PreToolUse 钩子在 Edit/Write 触到下面任一 match 前缀时打出该区的必读清单。⛔ 每个 session × 每个区**只打一次**(打多了必然被调成噪音、然后被无视)。",
+ "_maintenance": "新增一个区之前先问:它的『必读』真的会改变我要写的代码吗?不会就别加 —— 这份清单的价值与它的长度成反比。",
+ "memory_dir": "C:\\Users\\admin\\.claude\\projects\\D--MyDev-Utai-v2-dev\\memory",
+ "areas": [
+  {
+   "id": "gate",
+   "match": [
+    "converter/verify/training/"
+   ],
+   "headline": "你在动训练侧的【关卡】。这套闸的绿曾经不代表任何事。",
+   "must_read": [
+    "project_v2_session140.md",
+    "project_v2_session139.md",
+    "project_v2_session138.md",
+    "project_v2_session135.md",
+    "project_v2_session134.md"
+   ],
+   "hard_rules": [
+    "⛔ 凡是量【时间】的判据:这台机器有三条会凭空造出『速度差』的状态,全部实测过(S138)—— ⑴ **冷卡**:GPU 空闲后第一次跑只有 780 MHz(不是 2010),step 慢 1.85 倍,而 **preflight 结构上挡不住它**,只有【运行中采样】看得见;⑵ **会话内系统漂移 3.19%**,而被测效应也是 3.1% ⇒ **AAA/BBB 的跑法会凭空造出一个恰好等于真实效应大小的结果** ⇒ 必须 A/B/A/B 交替;⑶ **写盘瞬态 45-56% 的持久档位迁移**。⇒ 统计量用**配对比值 + SEM**,⛔ 不许用极差(它把噪声高估 2.6 倍,3σ 从 0.80% 变成 16.6%)。",
+    "⛔ 用户 2026-08-11 拍板的三条判据(别自己发明别的):⑴ gate 有没有【自证陷阱】 ⑵ gate 覆不覆盖【全部】训练架构 ⑶ 今天的 gate【至少和以前版本一样严谨】。三条成立就『问题不大』。",
+    "⛔ 跑验证之前**先去看以前版本时候是怎么做的**(用户 2026-08-11 立的常驻规矩)—— 有没有可借鉴的经验或启发。S75/S76/S78/S79 是训练侧的坑单与做法;S37-S41 是这套 gate 建立时的方法论(README.md 里有)。**不许拿『某一场已经销过账』当替代:销账是结论,经验是做法。**",
+    "⛔ 删目录 = 正确地红,清空目录 = 假 PASS(compare 的守卫只看 isdir)。⚠ S139 在 gate1 上又抓到两条同形的,而且更狠:`gate1_vocoder_compare` **不需要「空」** —— 两侧写满 15 点、数值差 1000 倍,只要 tag 前缀**同时**改名就退 0(两侧吃同一份 yaml ⇒ 改名天生对称 ⇒ 它对「同源同改」结构上是瞎的)。**地板写在循环体内 ⇒ 零轮时没有地板** 这个形状本仓已连续三场买到(S136/S137/S139)。",
+    "⛔ S139:gate1 五条 compare 现在**要求跑器钉的 `GATE1_T0`**(新鲜度)—— 手敲会得 exit 3,那是对的,用 `run_gate1_chain.py`。⛔ 它**默认不跑 prepare**(rvc 4.33 GB / vocoder 9.20 GB),要重建得 `--rebuild-fixtures` **且** `GATE1_ALLOW_REBUILD=1`。⛔ 别跑 `TESTING\\s134_f7\\run_gate1_chain.py` 那份旧副本 —— 它会截掉 S134 自己的转录。",
+    "⛔ S139:这一层的每一条判据都要能说出**它红的理由**。本场我自己造了五个洞、三个是同一形状:『判据红了,但它红的理由不是我以为的那个』(过滤器写错 ⇒ 新鲜度永远匹配 0 件,而自检因此而绿)。⇒ 自检的断言要钉到**理由**上(`expect_unrunnable(..., because=)`),不只是异常类型。",
+    "⛔ 别用 reporter.stage 的 done 计数当判据 —— 它在 skip 之前汇报,全跳过也走满。",
+    "⛔ 五条链的 gate0 两侧解释器**天生不同**(原版侧 = RVC 整合包 runtime),不许改成 gate1 那种『两侧同一个』。",
+    "⛔⛔ S140:**「一条从没在真夹具上执行过的断言」与「一条从没被执行过的错误分支」一样,都是空判据。** 实测:S139 前移到 rmtree 之前的那条输入身份断言,把 `rvc_ours\\mute` 判成空子目录 ⇒ **笔 G 的第一条链当场退 6**。根因是 `mute` 是**目录套目录**而 `gate0_guard.collect` **非递归**,而拷贝端 `copytree` 是递归的 —— 两边口径不一致;而它的自检夹具是**扁平**目录,**结构上盖不到这一形**。⇒ 给闸写自检夹具时,**先去看真夹具长什么样**(嵌套?末行空 losses?同一 step 出现两次?),别照着脑子里的形状造。",
+    "⛔⛔ S140:**NaN 在纯 python 里是隐形的。** `max(生成器)` 与 `if rel > worst` 对 NaN 的**一切**比较都是 False ⇒ 前者在 NaN 不落首位时静默丢掉、后者**连首位都丢**(实测:v2 九分量全 NaN 时打 `max_rel=0.000e+00 @ step -1` 并 **PASS**)。⇒ 判据一律写成**否定式** `if not (rel <= line)`,并对两侧逐点 `math.isfinite` 点名;打印的必须是**真比过的对数**,不是送进去的点数。⚠ 这条 `gate1_vocoder_compare` 早在 **S40** 就修好并写下过原话,**四个月零回移** —— 与 gate0_guard 头注记的 S68 那段 25 天**同形第三次**。⇒ 修一个洞时,**先 grep 它的孪生**。",
+    "⛔⛔ S140:**汇总层会把归因吃掉。** `run_gate1_chain all` 的退出码此前取「第一条非零」(而变量名叫 `worst`)⇒ 一条 exit 6(语义「重跑一次就好」)会把后面任何一条真红盖住;而这套码的全部价值就在于 `1` 被单列为「只有这一种是被测的东西不对」。⇒ 现在按**严重度** 1>7>4>2>3>5>6,并打 `EXIT=n 因为 <哪条链>`。⛔ 跑完**别只看 `$LASTEXITCODE`**,逐条读汇总的五个 rc,并**逐条打开 `1_prepare.log`** ——exit 6 在「prepare 拒绝(盘上什么都没删)」与「compare 不构成判定(夹具已换过一轮)」之间是复用的。",
+    "⛔⛔ S140:**联锁只挡住它看得见的那条路。** `run_gate1_chain.py vocoder` **不加任何参数**就会删掉 3.66 GB(S134 声码器**原版侧**唯一在盘证据)—— `gate1_vocoder_run_orig.py` 在 import 期无条件 rmtree,而 `report_wipes` + `GATE1_ALLOW_REBUILD` 只在 `if rebuild:` 里 ⇒ **那道锁是装饰**。⇒ 加联锁时先问:**这条路上还有谁会删东西**(上游驱动?上游 `data_utils` 的 lazy cache?),别只挡 prepare。同族:只报「删」不报「**覆盖**」的账目只有半个。",
+    "⛔ S140:**登记值必须是量出来的,而且要和判据的口径逐字对齐。** 本场唯一一次真红是我登记 `expect_sha` 时只算了 events 文件,而 `declare_frozen(..., [\"\"])` 无后缀过滤、算的是**整目录**(同目录还有个 3 字节的 `hparams.yaml`)—— **闸是对的,错的是登记值**。⇒ 登记之前先用**判据自己会走的那条代码路径**把值算出来。⚠ 同族:`EXPECT[*]` 里任何**零读者**的登记数都会在下一个人手里变成一条错的判据。",
+    "⛔ S140:长任务(gate1 五条链 ≈ 16 分 29 秒)**别用带 timeout 的后台命令跑** —— 工具上限是 10 分钟,会在中途把它杀掉。用 `Start-Process` 起**真正脱离**的进程 + Monitor 盯结论行。⚠ 这一场因此白跑了一次(损失为零:备份完整、后四条链一步没动)。"
+   ]
+  },
+  {
+   "id": "training-py",
+   "match": [
+    "training/utai_train/"
+   ],
+   "headline": "你在动 python 训练侧的生产代码。",
+   "must_read": [
+    "reference_training_workspace_layout.md",
+    "project_v2_session75.md",
+    "project_v2_session76.md",
+    "project_v2_session78.md"
+   ],
+   "hard_rules": [
+    "⛔ S75/S76 的原文有 3 条已被后来的设计**有意换掉**,照原文『补回来』会当场制造新拒绝:loudnorm/aug_copies 被 S78 从必锁降为 Costly · 『一 family 一槽、重训清空该架构』被 S132 的 flip 整条换掉 · 『续训起点只读呈现』被 §F2⒜ 换成 latest/best 两选。",
+    "⛔ additive-then-flip:会让 N 个调用点同时失效的改动,**删除留到最后一笔**(S121 血训)。",
+    "⛔ 改了阶段函数的签名 ⇒ 仓内**和仓外**的驱动都要跟上。跑 `gate_driver_arity.py` 核一遍(S134 那七个调用点漂了四个月;S135 又在仓外抓到两个)。"
+   ]
+  },
+  {
+   "id": "training-rs",
+   "match": [
+    "src-tauri/src/training/"
+   ],
+   "headline": "你在动 Rust 训练侧(槽 / run / 池 / 锁表 / 导出账本)。",
+   "must_read": [
+    "reference_training_workspace_layout.md",
+    "project_v2_session133.md",
+    "project_v2_session132.md",
+    "project_v2_session129.md"
+   ],
+   "hard_rules": [
+    "⛔ 危险不在把权重挪个位置,而在于**八条承重谓词同时变假,五条静默毁数据**(S123)。",
+    "⛔ 房规 `opt_run_id(\"\")→None` ⇒ 照抄 rename 那一行会做出**伪装成删 run 的删槽**(S133)。",
+    "⛔ 训练侧的 i18n:权威表是 `backendError.ts` 的 `CODE_KEYS`,json 里有文案不算数;动 i18n 一律**文本行插入**(json 往返会整体重排序)。",
+    "⛔★S144:`run_dir_for_start` 的「0 个 run + layout≥3」臂**铸新 id**(不再是 family 纯函数 `legacy_run_id`)—— 它同时服务**两个人群**(被删光 run 的槽 + 迁移过但从没训过的槽),而**盘上没有信号分得开**。改它之前先读那个函数头上那段 ⛔(S144 推翻的正是它),并记住:`legacy_run_id` 本身**不许**改成随机(迁移崩溃点回滚靠它确定)。⚠ 账本那三处「删光再练造出逐字节相同 rel」的理由**已经改写**;`settings.rs` 那两处**仍然成立**(它的同 id 来自 `migrate_data_dir` 复制整棵树),别顺手改。",
+    "⛔★S144:给 `run_slot` 那类夹具选 family 时注意 **rvc 的 3→4 折叠要从切片读采样率**(`POOL_SAMPLE_RATE_UNKNOWN`)⇒ 只铺 `1_16k_wavs` 的夹具在 rvc 上折不动。⚠ 而「夹具直接建在 layout 4」会让「删完之后在 layout 4」这条前置断言**恒真**(装饰件)。"
+   ]
+  },
+  {
+   "id": "training-ui",
+   "match": [
+    "src/components/training/",
+    "src/lib/training/",
+    "src/store/training"
+   ],
+   "headline": "你在动训练侧前端。",
+   "must_read": [
+    "project_v2_session143.md",
+    "project_v2_session141.md",
+    "project_v2_devserver_and_e2e_backlog.md",
+    "project_v2_session128.md"
+   ],
+   "hard_rules": [
+    "⛔ devServer **只查观感**,不是行为验证手段。行为一律做程序化验证。",
+    "⛔ 决策写在组件体内联表达式里 ⇒ vitest 结构上够不着。**先抽成 `src/lib/training/` 下的纯模块**(M1 已示范;S141 又照它做了 slotRows / importToast 两个)。",
+    "⚠ 记忆里 M4/M7 的阴性对照**写错过**,以 devserver backlog 的『S134 §2』与『S141』两节为准。⛔ 尤其 M7 那条「无 warning 时不弹」是**假的** —— 三条路都弹一条,判据要落在**档位与追加行**。",
+    "⛔ S141:声明「纯提取、行为逐位不变」时该给的证据形状是**差分模糊**(把搬家前的表达式原样抄成 legacy,随机输入逐个对拍),不是「我读了代码」。而且要配**语料自检** —— 生成器走不到有分辨力的形状时,跑一万次也只是把同一格重复了一万次。",
+    "⛔ S141:抽完之后**还欠一道接线闸**(组件必须在用那个函数)。纯模块的判据全绿而屏幕已经不再经过它 —— 这一对实测过:同一个变异,接线闸红、纯模块 13 条全绿。",
+    "⛔ S141:一个**只往测试里加东西**的改动照样会弄坏别处的判据 —— 在测试里写 `#[cfg(test)]` 字面串,让 mod.rs 的计数从 1 变成 3,当场打红三条既有的源序棘轮。切生产区用本模块**已有的** `production_part`,别自己再写一遍。",
+    "⛔★★ S143:「哪个 run 正在跑」的载体是 `TrainingSnapshot.run_id`,而它的 `\"\"` 有**两种含义** —— idle 时是「什么也没说」,运行中是「**槽根就是这个 run**」这个**肯定事实**(未迁移槽,与 `RunDetail.id` 给那一行的值同一个串)。⇒ **必须先用 `state` 判在不在跑,再拿它比行 id**;类型一律 `string | null`,别用 `\"\"` 当哨兵。把它读成「没有」会让未迁移槽的唯一那一行永远显示成「正在训练」,空闲时也是 —— 那是 `rowIdentity.ts` 头注禁掉的**缺席推断**换了件衣服。⛔ 别自己写这个判断,用 `lib/training/liveRun.ts`。",
+    "⛔★★ S143:「能不能动这一行」是**两个正交谓词**,合成一个必错一边 —— **继续/再训/开始**跟「有训练在跑」(**跨项目、不许按 project_id 过滤**:后端是进程级单槽);**删除/改名**跟「有**任何**长任务在跑」(后端 `running_tasks_of` 含 separation/render/**audition**,doc 明写 fail-closed and coarse)。禁得比后端窄 = 用户在最常见的那一格照样白点一次;禁得比后端严 = 试听一段音频就开不了训。⛔ 而「正在跑」**不是** `state !== \"idle\"`:快照不在训练结束时清(只有「清空结果」清),照那个写法做出来的是**跑完之后按钮永久禁死**的界面,而任何只造 running 形状的夹具都杀不掉它(仓里有两份现成抄本会诱你抄:`runIsHere` / `isLiveRun`)。",
+    "⛔★ S143:`sovits_diff` **不是一个 family**,它跑在 sovits 槽的 run 目录里 ⇒ 匹配一律走 `backendFamily(snap.backend)`。写成 `snap.backend === family` 在**所有单 backend 的夹具上与正确写法同值**,只有浅扩散那一格分得开 —— 而浅扩散一跑就是几小时,那正是最需要它的一屏。⇒ 语料自检必须显式要求见过 `backend != family` 那一格。",
+    "⛔★ S143:`npm test`(= `vitest run`)**不做类型检查**,`tsc -b` 只在 `scripts/release.ps1` 跑 ⇒ 给一个既有函数**插**参数(而不是追加在末尾)会让既有用例把实参喂错位置而**仍然全绿**,失败消息里那些插值变成假话。⇒ 加参数一律**追加在末尾**;验收时把 tsc 列成**独立一档**,别只看 vitest。",
+    "⛔★S144:`visibleRuns`/`slotStarted` 吃 `liveRunId`,而**两半必须收到同一个实参** —— 只喂一半的两种坏法都在屏幕上(徽章与「未开始」同屏 / 说开始过了却一行不画),而纯模块判据对它零分辨力(它们各自都对)。⚠ 新槽第一次训练时 `snapshot.run_id` 是 `\"\"`,那是**肯定事实**(槽根就是那个 run),比较必须逐字节相等。",
+    "⛔★S144:参数页「代价提示」该挂在哪些字段,由 `costlyNote.EDITABLE_POOL_FIELDS` 这张**手写表**说了算。⛔ 不许改成从 tier/scope 推(`tests/pool_identity_formula.rs` 明写 `LockScope` 对 family 恒定项是**假设性**答案),也不许改成从 `POOL_FORM_FIELDS` 推(会让 `rowIdentityWiring` 唯一的存在性断言恒真)。⚠ 整段提示今天**删光了全仓也不会红**(S144 实测),所以那道逐字段闸是它唯一的看守。"
+   ]
+  },
+  {
+   "id": "dictline",
+   "match": [
+    "converter/architectures/",
+    "scripts/g2p_rulers/",
+    "src/lib/vocal/"
+   ],
+   "headline": "你在动词典线 / G2P / 人声轨那一块 —— 它的 session 行 S83-S113 在 S135 被整块搬出 MEMORY.md 了。",
+   "must_read": [
+    "memory_dictline_sessions_index.md"
+   ],
+   "hard_rules": [
+    "⛔ 那 31 行里的钩子**全部仍然有效**(G2P/各语词典 · syllabify/onset/接缝 · allocate_in_note/借帧/PHONE_DUR_PRIORS · 音域扩展 donor · UTAU 别名 · restToken/吸附 · 反投影尺子)。去那篇 grep 你要动的模块名。",
+    "⛔ 造新尺子/改判据前先读 `scripts/g2p_rulers/README.md` 的 8 条硬规矩。",
+    "⚠ 收到某个词唱错的反馈:意语先读 it_troncamento_open_costs 的判定流程,德语先 grep de_glide_open_costs。"
+   ]
+  },
+  {
+   "id": "release",
+   "match": [
+    "scripts/release.ps1",
+    "src-tauri/tauri.conf.json"
+   ],
+   "headline": "你在动发版链。",
+   "must_read": [
+    "reference_release_signing_and_publishing.md",
+    "project_v2_release_bundle.md"
+   ],
+   "hard_rules": [
+    "⛔ minisign 私钥丢了 = 更新链死。",
+    "⛔ `cargo test` 必须带 `--workspace`(S134:裸 cargo test 漏跑 utai-dsp + utai-stretch 共 38 条,而它从来没红过)。"
+   ]
+  },
+  {
+   "id": "range-extend",
+   "match": [
+    "src-tauri/src/inference/vocal_range.rs",
+    "src-tauri/crates/utai-stretch/",
+    "src-tauri/crates/utai-dsp/src/psola.rs",
+    "scripts/range_rulers/",
+    "rangeBounds.ts",
+    "RangeBoundsEditor.tsx",
+    "rangeTest.ts",
+    "MsstModelManager.tsx",
+    "score2svc.rs",
+    "score2cv.rs",
+    "commands/inference.rs",
+    "score2svc_mg.rs"
+   ],
+   "headline": "你在动【音域扩展的逆变换】。S145 定的根因、S146 已经把引擎换成 TD-PSOLA 了,别重推;而这条线上有一个正确的方向曾经被我们自己关了四个月。",
+   "must_read": [
+    "project_v2_session146f.md",
+    "project_v2_range_scan_probe_shape.md",
+    "project_v2_session146.md",
+    "project_v2_session145.md",
+    "project_v2_range_extend_quality.md",
+    "project_v2_session85.md"
+   ],
+   "hard_rules": [
+    "⚠ 【拿 akiko 做对照前先跑 `scratchpad/doctor_akiko.py status`】。S146d 那份「80 判死」的实验态**早已还原**(S146e),但备份 `.s146d-backup` 与工装都还在,而盘上那份被重扫过 (`scan_version 4`,带 onset 电平列)。⛔ 别再用 `doctor_akiko.py apply` 复现「80 判死」:今天把**可用上限**拖到 79 就是同一件事。",
+    "⛔⛔ S146c:**救援落点规则已从「最浅合格」改成「在合格集合内按 damage 最小、平局取最浅」**,而它**必须带深度上限**(`LANDING_MAX_EXTRA_DEPTH = 1`)—— 无上限时东雪莲会走到 **−24**(它中段有 15 格 low_ratio>0.7),而 S85 记着 −24 整曲重着色是用户耳判的灾难。⛔ 那条判据**写了三版才有牙**:①夹具留着被拖走的音 ⇒ 它们把 worst-damage 钉死 ⇒ 变异不红(要用**没有乘客的单个死音**);②**断言里引用了被测的常量** ⇒ 永远不可能红(**边界必须写字面量**)。",
+    "⭐⭐⭐ S146:**「ratio == 1.0 必须是恒等变换」是这条线上最便宜、最不可能自证的判据**,而它必须打在 `utai_dsp::psola` 内核上 —— `apply_inverse` 在 `shift == 0` 提前 return,打在那里是恒真的空判据。2026-07 删掉的那份实现**在 ratio 1.000 上就掉 5-9 dB HNR**(它自己的注释写着),⇒ 病是「过一遍重合成」的固定税。这条判据在 S146 当场否决了我已经写下去的**三个**设计(独立相位积分的目标脉冲 / 搬运用去 DC 的信号 / 照 praat 那样按相关门限拒绝 mark),每一个都是「看起来对、跑起来红」。",
+    "⛔⛔ S146:**只量【上移】就上线 = 又一次判据够不着症状轴**。`MAX_RANGE_SHIFT = 24` 且 `cover_dead_plan` 会产出 **+22**(音频下移 22 半音)。实测:窗宽若不被源邻距裁短,−12 半音时**输出与输入逐位相同** —— 而包络位移 +0.00 / 峰值相关 1.000 / ΔHNR +0.00 / 浊帧存活 100%,**三把尺子全读「完美」**,只有那把登记成「必要不充分」的 **f0 尺**读出 +1200 cents。⇒ 验收必须双向,且**那把 f0 尺不许拿掉**。",
+    "⛔⛔ S146:**SVC 渲染不是逐位可复现的** —— 同一条 `mg_render_sovits` 命令跑两次逐样本最大差 **1.47**,与「换引擎」这个效应(1.50)同量级。⇒ ⑴ 渲染产物上的**任何逐样本对拍都不成立**(盲测的空白对照必须用**同一个文件的副本**);⑵ 做 A/B 时两条臂要**喂同一个已渲染的 wav**(用 `vocal_range::tests::inverse_probe`),否则耳朵听到的差别里混着模型的随机波动。⚠ 尺子对这条噪声是稳的(离散 0.05 半音 / 0.11 dB),所以仪器结论不受影响。⚠ 仓里早就知道:`mg_cover_deadonly_smoke` 自己就在量 run-to-run noise 并按「噪声底 ×8」定容差。",
+    "⛔ S146:**「与 praat 标记的一致率」是无效代理** —— `absmax` 检测器一致率最高(67%)而 ΔHNR 最差(−5.94)、浊帧只剩 52%。便宜的代理指标在这条线上指反了方向。**只用 `scripts/range_rulers/` 的四把尺子判。**",
+    "⛔ S146:**|shift| > 6 时 praat 不是有效参照**(pitch ceiling 1400 Hz 被撞穿:+12 上它自己读包络 +2.70 / 相关 0.661 / 浊帧 41.1%,比被测者还差)。`arms.py` 里登记了 `PRAAT_USABLE_SHIFT_ST = 6.0`。",
+    "⛔ S146 更正记忆里的一条:**「三处缓存版本成对 bump」不精确** —— `commands/audio.rs` 的 `_s2r` 是**速度滑条**的时间伸缩缓存(key 里只有 time_factor),永远不经过 `apply_inverse`。这条路上**只有两处**:`RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而它们现在由 `src/lib/vocal/rangeAlgoLockstep.test.ts` 机械联锁。",
+    "⚠ S146:**cover/sovits 那条路只做了结构性验证**(接线闸 + 与 cover/rvc 逐字同形的调用),**没有行为验证** —— 仓里本来就没有 sovits 的 cover 冒烟(`mg_cover_deadonly_smoke` 是 RVC-only)。要动 cover 侧的执行层之前,先把这条欠账补上。",
+    "⛔⛔ 染色的根因**已定**(S145,四路收敛):Signalsmith 的「包络」不是真包络,是对原始能量谱做的**形态学闭运算**,衰减常数 `decay = 1 - 1/(freqEstimate*0.5+1)`(`signalsmith-stretch.h:985`),而 `freqEstimate` **全文件只有这一个使用点**、由 `setFormantBase` 唯一决定 ⇒ **平滑宽度 ∝ 我们喂的 base f0** ⇒ **f0 越高「包络」越粗、`E(f)/E(f·M)` 越接近 1、补偿退化成恒等**。剂量曲线(MIDI 64→85)= 残余 **+0.30 → +4.70 半音**;真素材上现行漏 **+2.40**,praat TD-PSOLA 只漏 **+0.30**。**别再去查 κ 或 base track —— 那两条都已被证伪**(κ=0 确实完全钉住;base 喂的确实是移调后的 f0,`vocal_range.rs:636` 有明写契约)。",
+    "⛔⛔ **「我们试过 X,X 输了」必须先问:输的是【算法】还是【我们的实现】。** 2026-07-26 删掉 psola.rs 的理由是「PSOLA 脏」,而 S145 实测 **praat 的 TD-PSOLA 是本轮胜者**;仓里早就记着「praat 透明(ΔHNR −0.12~+2.68 dB),**我们旧 Rust 实现掉 5.15~8.57 dB = 实现缺陷非算法固有**」。守它的 `psola_ab.rs` **只量音高** ⇒ 实现缺陷结构上溜过去,**一个正确的方向被关了四个月**。⇒ **写 PSOLA 之前先做尺子和 praat 参照臂**(队列 §E13 笔 0)。",
+    "⛔⛔ `apply_inverse` 是 **score / cover / audition 三消费者的单一执行点** —— S85 血训「为 A 修 ≠ 对 B 无害」,**逐路径分别做行为验证,一个不落**。",
+    "⛔⛔ 【改引擎参数/引擎本身,缓存版本必须成对 bump】:`RANGE_ALGO_VERSION`(`src/lib/vocal/vocalRender.ts`)↔ `audition_cache_tag`(`src-tauri/src/commands/audition.rs`),判据 = `rangeAlgoLockstep.test.ts`。⚠ **`commands/audio.rs` 的 `_s2r` 不在这条路上** —— 它是**速度滑条**的时间伸缩缓存(key 里没有 shift/kappa/range 任何一项),记忆里「三处成对」那句话不精确。⛔ **cover(workflow)车道至今没有缓存版本载体** ⇒ 换引擎后会一直播旧音频直到手动重跑。",
+    "⛔ **WORLD 出局**:它塌清塞音(用户两次耳判「つつまれてきれい 的 き」),⚠ 而**两把带阴阳对照的仪器都看不见这个失效**(瞬态尺只读 −0.37 dB,而它对人为抹平能读 −33 dB)⇒ **该轴唯一仪器是耳朵**,不许硬编一条看不见它的判据充数。",
+    "⛔ **放宽 dead 判据(把 `SINGABLE∖LANDING` 那一格也救)= 负收益** —— 用户耳判「反而没那么自然」,而仪器事先也只给 +1.8 dB。**别再提。**",
+    "⛔ 【别把 timbre 两列(`low_ratio`/`rms_db`)接回 `slot_singable`】—— 东雪莲身上翻过车(S85 三轮:70-79 会被整片判死)。⚠ **与 S146f 不矛盾**:那一笔把 onset 遍的**电平列**接的是 `SLOT_LANDING` 的**否决**(只许收窄落点、永不改变哪些音被救),而这条说的是 `SLOT_SINGABLE`。两者是不同的闸,别合并。",
+    "⛔ **耳判 A/B 的协议**(S145 实证,照抄):承重那一问**同场只放两个候选**(放一个很烂的会产生**顺序/锚定效应**,用户实测被它骗过一次);每组 **4 个文件 = 两版各两份**,任务是**「分成两对」**;必配**空白对照**(选一段两版**逐位相同**的音频,⛔ 发之前 assert 最大逐样本差 == 0);文件名由内容 sha1 定序,KEY 单独一份。⇒ **凡结论只有耳朵没有仪器,先标【未定】。**",
+    "▶ **零成本复现整条实验链**(全是现成 env,每臂 9-12 s wall):`UTAI_MG_UST` → `dump_mg_notes` → `UTAI_MG_DUMP=1 UTAI_MG_NOTES/UTAI_MG_OUT` → `mgScoreDump.test.ts` → `UTAI_MG_SCORE/UTAI_MG_SLICE/UTAI_MG_SHIFT/UTAI_MG_INVERSE/UTAI_MG_KAPPA` → `mg_render_sovits`。⚠ 产物落**鹅妈妈** `probe\\`、文件名**不带谱标识** ⇒ **渲完立刻拷走**。素材与全部读数在 `D:\\MyDev\\TESTING\\s145_range_color\\`。",
+    "⚠ 【`range_shift != 0` 的**端到端渲染**仍然零覆盖】。S146e/f 给计划/落点/边界那一层加了十几条判据(且十一条变异零空判据),但「真的带着 shift 渲一遍」这条路上没有闸 —— S145 证伪过的「base 喂错」明天可以由一次无辜重构重新变成真的,而全仓 cargo 一条都不会红。",
+    "⛔ 【两个边界只能在同一个载荷里一次写完】(`setVocalRangeBounds`)。`validate_range_record` 同时校验两者(S146f 起判据是 **comfort ⊆ reach**,即 `usable_auto ∪ usable`,**不是** ⊆ usable),只写一半会 `RANGE_INVALID` —— 而这条错误今天在 UI 上**完全不可见**(无 catch、无文案)。",
+    "⛔ 【这条 UI 线零渲染测试】:`vitest.config.ts` 是 node 环境、include 只收 `*.test.ts` ⇒ 放进 TSX 的逻辑一条判据都不会红,新写 `*.test.tsx` 还会被**静默不收集**。⇒ 规则必须落在 `lib/vocal/rangeBounds.ts`,TSX 只做壳。资源管理器与人声侧栏共用 `RangeBoundsEditor`,别在任一边重写夹取。",
+    "⚠ 侧栏的歌手是 `governingSpeakerId`(spk_mix 里权重最大的那位),用户**从没显式选过它** ⇒ 任何改这份记录的 UI 都必须写出歌手名,否则是无声地改错人。而 usable/comfort 是模型的**磁盘 sidecar**:全局于整台机器、不进 .usp、不进 undo。",
+    "⭐⭐⭐ 【两个旋钮是正交的,别再把它们绑起来(S146f 用户拍板)】。**可用范围** = 哪些音要救(在它之内的照谱直接唱);**目标范围**(磁盘键名仍是 `comfort`)= 被救的音落在哪里,**存的值就是目标**,没有任何「是不是真的动过」的启发式。⛔ 语义上 `usable` 只管死亡判定,**拖拽可行性必须读 `reach`(= `usable_auto`)** —— 共用一个谓词会让「压天花板」把每一处已有落点都顶深(实测 79→77 剂量 251→319,→72 是 801,而组数几乎不动)。⛔ 目标范围由**扫描带**约束、不由 usable 约束:旧约束会让收窄 usable 把目标一起拖走,此后落点永远够不着它、旋钮悄悄不做事。",
+    "⛔ 【够不着时降级,不是否决】。目标范围是硬目标,但够不着必须退回正常预算并**逐组打审计行**。东雪莲存的 `[36,52]` 对上住在 75-85 的旋律,硬否决会把它从「10 组被救」变成 **0 组** —— 旋钮成了音域扩展的关机键。",
+    "⛔⛔ 【同一条规则写在两个文件里,代价一定会兑现】。S146f 把「目标范围由扫描带约束」在 `clampBounds` 改了、读侧 `targetRange` 漏了 ⇒ 用户存进去 79、读回来 74。⇒ 前端边界逻辑**只在 `lib/vocal/rangeBounds.ts` 一个文件里**(读/夹/写/还原共用 `fitsIn` + `clampInto`),Rust 侧两处合成 `band_fits`。⚠ 前后端那份镜像是架构决定的(前端要在写盘前预览后端收不收),**消不掉但必须两边一起改**,两处注释互相点名。",
+    "⛔⛔ 【把被测的常量写进断言 = 空判据】。S146f 一场犯了**四次**。正确形状:断言写**实测字面量**;若要防「门限悄悄收紧」这种字面量抓不到的方向,**另加一条直接钉常量值的守卫** —— 那与「拿常量算期望值」不是一回事(前者恒真,后者是「改它必须是有意的」)。同族:**近乎相同的测试夹具是陷阱温床**(漏写 `usable_auto` 会让 `reach == usable`,把每条断言变成恒真)⇒ 这一族只许有一个 `Rec{..Default::default()}`。",
+    "⛔ 【优化器的目标函数不能当独立读数】。我拿 `damage 0.000` 断言「两个落点一样好」⇒ 而 `damage` **就是**落点规则自己的目标函数。真正独立的读数(逆变换**之前**的原始 donor 渲染)说反了:顶音 `low_ratio` 0.849(落 78)→ **0.916**(落 77)。⭐ 至今**唯一与耳朵同向**的轴就是「在原始 donor 上量 `low_ratio`」;四把尺子对 6:1 压缩全过、对硬削波 ×4 **读成变好**。",
+    "⚠ 【提速不许拿音质换】(用户 2026-08-15:「快和好都是有意义的」)。渲染速度的大头 = **donor 全曲重渲**(`range_passes = 1 + K`,K = distinct shift 个数;实测 K=4 ⇒ 5 遍全曲推理而只用得上 21%)。任何提速结论必须分【不改输出】/【会改输出】两组,后者配耳判窗口。⛔ **SVC 渲染不逐位可复现** ⇒ A/B 只能喂同一个已渲染 wav,且必须先跑阴性对照定噪声地板。",
+    "⭐⭐⭐ 【PSOLA 的固定过路费 = `add_bell` 的 `round(t)−round(s)`】(S146g)。**两次独立取整**,每颗粒扔掉一个亚样本残差;RMS 在 ratio 1.0 **恰好 0**、一离开就跳到 **0.41 且与深度无关**(理论 √(2/12)=0.408)⇒ 这就是「进一次工序 −0.59 dB 而 +7→+8 只多 −0.37」的机理。⛔⛔ **挡住它四个月的是仓里一句【明写的、错的】注释**(「fractional delay would destroy the ratio-1.0 identity」)—— 恒等是**结构性**的,与搬运方式无关。⇒ 见到「我们试过 X 输了」的注释,先问**输的是算法还是我们的实现**,并且**连注释一起改**,否则下一个人照它再关一次门。⚠ 这次的形状是**反过来的**:不是「看起来对、跑起来红」,是「看起来错、跑起来绿」。",
+    "⛔⛔ 【`UTAI_PSOLA_FRAC` 已盲测判负(2026-08-16),保持默认关,别再开这条线】。三个包、**8 对承重 + 3 个空白对照**、电平对齐 ±0.000 dB、两臂喂同一个已渲染 wav,含用户**自己点名**的 169 小节 −7 与 189-192 小节 −5 —— **一对都听不出**。⭐ null 有分量:同一听者同一流程在 S146 换引擎时**两个承重组都分对**。⭐⭐ **顺带校准了 ΔHNR 的量级:~1 dB 级的改善不构成可闻收益** ⇒ 以后引用 ΔHNR 必须说明越没越过这个量级。⛔ 代码留着(缺陷是真的,别的素材可能用得上),但**开它的举证责任是一次通过的盲测,不是尺子**。⛔ 不许换线性插值(HNR 读得高纯粹因为低通)。",
+    "⭐⭐ 【渲染速度:99% 在两张 ONNX 图里,CPU 侧只有 1.1%】(S147 秒表,一遍全曲 63.7s)。net_g 54.7% · **NSF 声码器 41.3%** · ScoreToCV **4.1%**(⛔ `commands/inference.rs:1951` 的注释写着它是「the #1 render-time cost」—— **错的,net_g 是它的 13-20 倍**;RVC 臂同句 unmeasured)。⇒ **别往 G2P/帧分配/特征拼接优化**。代价模型 `≈ 2.5 + (1+K)×[33.6+25.4+2.5+0.7] + K×2.2`(与真机对到 2%)。⭐ **量最大的一刀是【用户旋钮】**:NSF 增强器 +25.7s/遍 × (1+K),K=4 时 323s→194s;它**改变每一个采样** ⇒ 是用户的取舍,产品面的正确做法多半是**把代价标在 UI 上**。",
+    "⛔⛔ 【donor 窗口化(B2)的三个坑,照旧口径做必错】:⑴ 落法是在现有循环里 `continue` **跳过 chunk**,**不是切 score** —— 切片会让 `chunk_at_sp` 的 `cf` 计数器从切点重置、**相位错开**,并改掉 23/25 个 chunk 的 `seg_idx`;⑵ 必须同时把**三条全曲尾段操作**改成传整曲标量(`active_rms` 电平匹配实测偏 **+1.02/+1.15 dB** = 9-10 倍地板 · `peak_normalize` 全曲峰实测偏响 **−0.648 dB** 符号 22/22 · 整曲 PSOLA unmeasured);⑶ 「零跨 chunk 上下文」是**假的** —— 至少 4 条每次渲染都开火(`ci` 进 RNG · `seam_fade` **反向写回上一 chunk 的尾巴** · 全曲归一 · 整曲逆变换)。⚠ 验收:**逐样本/波形 A/B 一律作废**(同命令两跑 corr 0.896-0.974),用 40 带对数谱 rms + 逐 chunk 电平 sd + 整曲 active_rms,各自的地板已登记。",
+    "⛔ 【替换/搬运脚本必须断言它改到了东西】。`03a1e34` 我说「两条审计行一起抬到 info!」,实际只抬了一条 —— 另一条的替换**没匹配上而脚本没有断言**,diff 只有 1 行也没看出来。「没匹配上」与「不需要改」在输出上长得一模一样。",
+    "⚠ 【登记夹具 `arm_psola.wav` 贴错标】:它与 `arm_praat_p6.wav` **sha256 逐位相同** ⇒ registry 里挂在 psola 名下的 +0.30/−1.44 是 **praat 的**指纹;我们自己同口径是 **+0.50/−1.66**。拿它当基线,换引擎对拍会**偏乐观约 0.4 dB**。已在 registry 里标 `_MISLABEL`,真修法(重生成属于我们的臂)是发版前的账。",
+    "⛔⛔⛔ 【一笔可以「功能正确、收益静默减半」而所有常规判据全绿】(S147 hotfix)。donor 打洞第一版把**全部位移的窗的并集**传给每一遍 ⇒ 四个 donor 渲同一批 chunk;单元测试、长度契约、音频秒数**全部正常**。**唯一暴露它的是「四个不同位移的 `skipped` 完全相同」这个指纹,而那个数字是顺手打进 `[perf]` 的**。⇒ 凡是「按某个键分组、每组做一次」的循环,**判据里必须有一条断言【不同的键给出不同的结果】**;凡是提速改动,**把「省了多少」打进日志**,否则静默无效与生效长得一模一样。",
+    "⭐⭐ 【渲染速度的形状(S147 秒表实测)】:**单遍已经 9.8× 实时,比翻唱(约 4×)快一倍多** ⇒ 瓶颈**全在 (1+K) 遍这个结构**,不在单遍。net_g 54.7% + NSF 声码器 41.3% + s2cv 4.1% + **CPU 侧全部 1.1%**。B2(donor 只渲相交 chunk)把 285s → 69.6s = 4.1×,但**减不掉遍数**。⇒ 下一步是**每 chunk 自带位移、一遍搞定**(~30s),⛔ 代价:移调与逆变换今天都是**全曲级**,且 `apply_dead_only_windows` 同时是「电平对齐 + 交叉淡化」的载体,一遍出结果后那两件事要另找地方。",
+    "⛔ 【base 与 donor 必须共用一个归一标量】(S147 B2 笔 1)。各自 `peak_normalize` ⇒ 拼接层只能用全曲 `active_rms` 比值**猜**回台阶,而那个猜测**依赖内容**:donor 一渲得比整曲少就偏 **+0.618 dB**(逐 chunk 地板的 8.7 倍)。⛔ 三个「自然」的修法全被实测判死:窗内对齐(base 在窗里正是坏渲染,−7 读 −4.7 dB)· 保留区对齐(−0.829,对完整 donor 也坏)· donor 不归一(把 ±12 dB 笼变成承重件,实测 g=2.69,而响度泳道是第二个绝对电平搬运工)。",
+    "⭐⭐⭐ 【「哑/破音」这条轴的第一个可见信号 —— 是用户用眼睛在波形上找到的】(S147,**未收线**)。`[753]`と(−7)与 `[685]`ぴゃ(−5)在「起音脉冲 = 前 30ms 峰 / 中段 RMS」上是**全曲 175 个音的第 1 与第 2**(15.60 / 14.59 dB,−7 组中位 7.96);而 `[785]`(2.18s 长音)那把尺子**完全看不见** ⇒ 大概率是**第二个病**。⭐ 强线索:**两个坏例都是各自救援组的【第一个音】**,而拼接缝每条实测亏 −1.25 dB、其 10 ms 淡化**在前面没有休止时正落在被救乐句第一个音节的起音上**。⇒ 复现脚本 `scratchpad/waveform_lead.py`,坐标与读数在 [[project_v2_session146f]] §10。",
+    "⭐⭐⭐ 【`dead_only_plan` 按休止分隔【整句一个位移】,把域内音也拖下水】(S147 侦察)。实测:`[753] と` 是 **note=75、在 usable[36,76] 之内、根本不需要救**,而它所在那组 10 个音里 **6 个是域内音**,全为了一个 note=85 被整体压了 7 个半音。代价可量:辅音 preroll 按深度 **0/−1/−2/−7 = −0.11/−0.09/+2.94/+15.07 dB**。⛔ `minimal_rescue_shift` 的 `all.iter().all(slot_reachable)` **只是可行性闸,没有任何「拖着走的健康音要付多少代价」的项**。⇒ 要动就动这里(加代价项 / 允许在 rest 以外切组),⚠ 会改输出且**新增组内缝**(缝的代价 unmeasured)。",
+    "⛔⛔ 【用户在波形上看到的是【相对量】,不是绝对量】。`[753]` 的绝对起音几乎没变(15.475 → 15.600),但**全曲排名 11/175 → 1/175**、邻域突出度 +5.08 → +7.01 dB —— **救援把整句压下去了而它没被压**。⇒ 凡是「某处听/看起来突兀」的反馈,先问**它的邻域有没有被整体改变**,再去查它自己。⛔ 同族:我那条「拼接缝落在起音上」的假说被一条**整曲 −7、无组无窗无淡化**的臂证伪(同处差 +0.00 dB)。",
+    "⛔⛔ 【新造的尺子必须先证明它不是在量音高/时长/剂量】(S147:ASR/EDR 两把全栽在这上面)。判据:把同样的音拿到一条**处理一次都没跑**的渲染上(`UTAI_MG_SHIFT=0` ⇒ `apply_inverse` 提前 return)复算排名 —— 若排名原样重现(实测 Spearman **+0.929**),那把尺子量的不是「坏」。⇒ **绝对排名一律作废,只有【逐音配对 Δ】可用**(音高/音素/乐句/位置全钉死)。⚠ 「自比 Δ=0.000」是**恒等式不是阴性对照**(纯函数喂逐位相同入参)。",
+    "⚠ 【落点深度上有一条【仪器 vs 耳朵】的真冲突,别单方面听一边】。仪器:`[785]` 的 donor 周期性 **−3 就饱和**(NCC 0.986),−7 多出的 4 个半音只买到 PSOLA 代价。而 **S146c 把落点从「最浅」改成「按 damage 排」正是因为用户耳判「刚好及格那一格更差」**。⇒ **只有盲测能裁**;在裁定之前两边都不许单方面改。⛔ 也**别动 `psola.rs:605-606`**(grain 半宽截到目标周期 ⇒ 谐波相位误差 ⇒ ~0.5-1 Hz 拍):机理只是 **inferred**,改它改所有输出,而今天**没有任何一把过了可听性验收的尺子**。",
+    "⚠ 【跨模型验证是判「模型特性 vs 我们的代码」的最便宜一刀】(S147,用户自己做的)。「に 之后的伪影」在 akiko 上**三次渲染全排 1/93**、在 yachiyo 上排 **42/93** ⇒ **模型特性**,`REST_GATE_FADE_MS` **别动**(它只是通道不是病因)。而「结尾几段波形异常 + 撕裂」**两个模型都有** ⇒ 普遍问题、优先级最高。⇒ 收到「某处不对」的反馈时,**换一个模型渲同一份谱**往往比读代码更快定性。",
+    "⭐⭐⭐ 【拆组已被盲测背书,深度不许动】(S148,两轮对照都通过)。**r1:`[753..762]` 拆组 3/3**(那句的 6 个音 MIDI 75-76 在 `usable[36,76]` 之内、根本不需要救;字母**逐组独立**按内容 sha1 定序,用户三次都翻了过来)⚠ 纯掷硬币 p **0.125**,不到常规显著 —— 分量来自机理+仪器+对照三者同向。**r2:`LANDING_MAX_EXTRA_DEPTH = 1` 不动**(顶死音落 **78 vs 79**;1 明确 + 1 平 + 1 弱反)。⛔ 推广 r1 时**不能照抄那次手写的拆法**:它只验了一个实例;`[685..693]` 的死音是**组首**,裁到死音跨度会把 8 个乘客切出去并**新增组内缝**(缝的代价 unmeasured)。先算爆炸半径,再决定要不要再走一轮盲测。",
+    "⭐⭐⭐ 【`low_ratio` 第一次被【盲测】背书】(S148)。用户在盲的条件下听到「能听出来的破音」的那一格,正是 `low_ratio` **0.388 → 0.628** 的那一格(`78=[1,1,-0.3,0.388]` damage 0.000 vs `79=[1,1,-1.3,0.628]` damage 0.585)。⇒ 「破音」那一格从 S145 起的空白**有了第一个带标签的样本**,而 `low_ratio` 从「唯一与耳朵同向」升格成「有一次盲测证据」。⚠ 用户同时说「A 更好但**还是有点虚**」「那一段**仍然还有提高空间**」⇒ **深度不是那个杠杆**。⭐ 线索:**更深的落点 `low_ratio` 反而更干净**(78=0.388 / 76=0.211 / 74=0.121),⛔ 但不许直接放开预算(东雪莲无上限会走到 −24,S85 判过灾难),要做就做成**按 low_ratio 的定向搜索**。",
+    "⛔⛔ 【真机渲染与 CLI 探针渲染在波形域不可比】(S148 实测)。同一首、都不带救援:真机 `vocal.wav` 与 `F_full_s0.wav` **逐样本相关 0.0097**(最佳全局 lag −241,对齐后仍 −0.01/+0.03),而**包络相关 0.9965**、整体 RMS 差 0.12 dB ⇒ 同一段演唱的不同相位实现。**「一条臂用真机、另一条用探针」量到的每一个逐样本读数都是路线差,而且它长得像真信号。** ⇒ 三条臂必须**同路**。⭐ 现在有 `mg_render_score_deadonly`(`#[ignore]`)可以 headless 渲**生产口径带救援的整曲**,env `UTAI_MG_PLAN=a:b:s,...` 覆盖计划(只在 `cfg(test)`,解析带响亮校验),产物带 `.plan.json`。验收指纹 = 与真机 `skipped` **18/21/17/23 逐个相同**。",
+    "⛔⛔ 【拿错模型路径会【静默】做出错的臂】(S148)。TESTING\\UtaiSynth2 下那份 `akiko_320000.json` 是 **7-26 的旧记录**(`usable [36,80]` / `scan_version 2` / 无 `usable_auto`)⇒ 渲出 **10 组**而不是 25 组;而且那份 `.onnx` 与仓内 `data/models/sovits/` 的**大小相同但 sha256 不同**(两次不同的导出)。**生产(dev build)用的是仓内那份**,而它的日志在 com.utaisynthesizer.app\\logs\\ 下(**不是** UtaiSynthesizer\\logs\\)。⭐ 抓到它的是探针里那行「打印本次用的 usable 与组数」的审计输出 —— 凡是靠磁盘状态决策的探针,**必须把它读到的那个状态打出来**。",
+    "⛔⛔ 【逐音窗必须取 `phones[]`,而起音的锚点是【音符边界】】(S148 实测)。窗外能量占比:`notes[]` **1.246%** vs `phones[]` **0.160%**;而锚点若放在窗起点,`[753]` 的 attack_db 会从 **+14.22 变 −38.06**(preroll 最长 7 帧,辅音爆发在它的**后段**)。⭐ 顺带证伪:「音频比谱面栅格早约 2 帧」是**用 `notes[]` 量出来的假象**,换 `phones[]` 后最佳 offset 就是 0 ⇒ **别给尺子加全局对齐补偿**。⛔ `phones[].zero_frames` 清的是 `note_hz` **不是音频**:`[753]` 的 /t/ 在那 5 个 zeroed 帧里**峰值 −1.00 dBFS**。工具:`scripts/range_rulers/note_delta.py`(七档判据,`--selfcheck` 先跑)。",
+    "⛔ 【整曲两跑的地板比切片两跑大 487 倍,而且重尾】(S148)。切片(5.8 s 单 chunk)|Δrms| max **0.016**,整曲 max **7.80** —— 多了 25 个 chunk 的累积 + 全曲 `peak_normalize` 的全局峰。而且 p50 只有 **0.0013**:那个 max 几乎全部来自 `[512] が` 一个 0.18 s 的短音(模型两跑之间偶发掉 8 dB)。⇒ **判据一律用 p50/p90**。⚠ 这条是实测抓出来的:我第一次看到 A vs B 在 `[512]` 上差 7.93 dB 时以为是计划泄漏,而 A vs A2 在同一个音上差 7.80。",
+    "⛔ 【盲测:两种问法要两种设计,而历史脚本的「内容哈希」注释是假的】(S148,README 8a)。「有没有差别」= 4 文件分成两对;「哪个更好」= 2 文件 + **必须允许「听不出」**(那是空白对照的**正确**答案)。⛔ `s145_blind.py` / `make_blind.py` 的注释写「文件名由**内容** sha1 定序」而实际哈希的是**版本标签**与**组名** ⇒ **复用组名就是泄题**(同一个名字下一轮给出逐字相同的答案)。用仓里的 `scripts/range_rulers/blind_pack.py`,它只按文件内容定序并把三条规矩做成 assert。",
+    "⭐ 【一条未验证的线索:清辅音起音强调 × 深位移】(S148,别当结论)。用户点名的 `[753]と` 与 `[685]ぴゃ` **都带 `emphasis=True` 的清辅音起音**,判正常的对照 `[490]ら` 不带,第三处 `[785]あ` **压根没有起音辅音**。全曲 228 个 emphasis phone 全 voiceless,`|shift| >= 5` 的有 **26 个** ⇒ **必要不充分**。代码顺序:`emphasis_gain`(score2svc.rs:777/999)在渲染**之前**,`apply_range_inverse`(:901/:1075)在**之后** ⇒ 强调过的爆发是在 −7 位渲出来再整段 PSOLA 上移。现成旋钮:探针 env `UTAI_MG_EMPH`(全曲级)。⛔ attack 的**绝对排名**已被证共线,只能用**逐音配对 Δ**。"
+   ]
+  }
+ ]
 }
