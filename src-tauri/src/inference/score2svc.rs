@@ -51,6 +51,17 @@ use utai_dsp::formant_warp;
 
 /// ScoreToCV frame rate (score2cv sidecar `fps`). The per-phone `phone_dur` frames are 20 ms.
 const CV_FPS: f64 = 50.0;
+
+/// S147 B2 — margin (in 50 fps frames) around a rescue window when deciding which chunks a donor
+/// must render.
+///
+/// ⛔ Not caution — measurement. The splice layer maps frames to samples with a **linear** ratio
+/// (`spf` in `vocal_range::apply_dead_only_windows`), while real chunk boundaries land wherever
+/// `sovits_grid_len`'s rounding puts them: measured divergence up to **458.8 samples (10.4 ms)**,
+/// against a tightest real margin of **262 samples (5.9 ms)** in the current plan. Intersecting
+/// with no margin therefore splices the window's own 10 ms cross-fade tail into digital zero.
+/// Two frames = 40 ms covers both the divergence and the fade itself.
+const DONOR_WINDOW_MARGIN_FRAMES: i64 = 2;
 /// so-vits-svc 4.x default output geometry (== the Python reference `synth_sovits` CV_FPS/SOVITS_HOP).
 /// A future non-44100/512 SoVITS export would carry these in its sidecar; 4.x is always this.
 pub const SOVITS_SR: u32 = 44100;
@@ -537,6 +548,56 @@ pub fn sovits_grid_len(t50: usize, sr: u32, hop: usize) -> usize {
     round_half_even(t50 as f64 * (sr as f64 / hop as f64) / CV_FPS)
 }
 
+/// S147 — what makes a render a DONOR pass rather than a base pass.
+///
+/// Both fields exist only because a donor is spliced into a base, and both would be wrong to set
+/// on a base render, so they travel together instead of as two independent `Option`s that could
+/// disagree.
+#[derive(Clone, Copy)]
+pub struct DonorCtx<'a> {
+    /// Normalize against the BASE render's pre-norm peak so the two share one scalar
+    /// (S147 笔 1 — replaces the whole-song `active_rms` guess).
+    pub norm_peak_target: f32,
+    /// The rescue windows this donor will actually be spliced into, as (start, end) frames on the
+    /// score grid. Chunks that do not intersect any window are **not rendered** — they are the
+    /// 76% of every donor pass that gets thrown away today (measured: 285.2s → 130.0s wall).
+    pub windows: &'a [(i64, i64)],
+}
+
+/// Which chunks a donor must actually render.
+///
+/// ⛔ Every rule here is a measurement, not a design instinct:
+/// * **Margin.** The window→sample map (`spf`, used by the splice layer) is a LINEAR frame→sample
+///   ratio, while real chunk boundaries land wherever `sovits_grid_len` rounding puts them —
+///   measured divergence up to **458.8 samples (10.4 ms)**, against a tightest real margin of
+///   **262 samples (5.9 ms)**. Intersecting in the frame domain with no margin therefore splices
+///   the window's 10 ms cross-fade tail into digital zero.
+/// * **`hard_seam` neighbours.** A hard seam is by definition a language cut that does NOT land in
+///   silence (`score2cv.rs`), i.e. mid-voiced. Putting a hole edge there re-phases the whole PSOLA
+///   island downstream (measured worst +2.9 dB, correlation gone). Single-language scores carry
+///   `hard_seam == false` throughout, so this rule costs them exactly nothing.
+fn donor_keep_mask(chunks: &[Chunk], windows: &[(i64, i64)], margin_frames: i64) -> Vec<bool> {
+    let mut keep = vec![false; chunks.len()];
+    let mut fstart = 0i64;
+    for (i, c) in chunks.iter().enumerate() {
+        let fend = fstart + c.t as i64;
+        keep[i] = windows
+            .iter()
+            .any(|&(a, b)| fstart < b + margin_frames && a - margin_frames < fend);
+        fstart = fend;
+    }
+    // hard_seam 落在浊音正中 ⇒ 它两侧都不许是洞边。
+    for i in 0..chunks.len() {
+        if chunks[i].hard_seam && (keep[i] || i > 0 && keep[i - 1]) {
+            keep[i] = true;
+            if i > 0 {
+                keep[i - 1] = true;
+            }
+        }
+    }
+    keep
+}
+
 /// The SVC net_g input feed for one chunk on the SoVITS hop grid.
 pub struct SovitsFeed {
     /// cv resampled to the hop grid, `[t_tgt, dim]`.
@@ -684,12 +745,9 @@ pub fn render_score_sovits(
     formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
-    // S147: normalize against THIS peak instead of this render's own. `None` = today's
-    // behaviour (self-normalize). The dead-only splice hands every donor the BASE render's
-    // pre-norm peak so both sides end up on one scalar — see `peak_normalize_to`.
-    // ⛔ Appended at the end on purpose (additive-then-flip): every existing call site gets
-    // `None` and stays byte-identical, and the compiler names each one instead of me guessing.
-    norm_peak_target: Option<f32>,
+    // S147: donor-pass context. `None` = a normal (base) render, byte-identical to before —
+    // which is what all 19 existing call sites pass. See `DonorCtx`.
+    donor: Option<DonorCtx<'_>>,
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展: the model RENDERS at transpose+range_shift (inside its comfort zone);
@@ -741,7 +799,22 @@ pub fn render_score_sovits(
     // 不进任何逐样本循环 ⇒ 开销可忽略,而且**不打 per-chunk 日志**(25 chunk × 5 段 = 125 行噪声)。
     let t_render = std::time::Instant::now();
     let (mut t_s2cv, mut t_decode) = (0f64, 0f64);
+    // S147 B2: a donor only has to render the chunks it will be spliced FROM. `None` (base pass)
+    // ⇒ every chunk kept ⇒ byte-identical to before.
+    let keep: Option<Vec<bool>> =
+        donor.map(|d| donor_keep_mask(&chunks, d.windows, DONOR_WINDOW_MARGIN_FRAMES));
+    let mut skipped = 0usize;
     for (ci, chunk) in chunks.iter().enumerate() {
+        if keep.as_ref().is_some_and(|k| !k[ci]) {
+            // ⛔ Equal-length ZEROS, sized by `sovits_grid_len` — the splice layer indexes `audio`
+            // by absolute sample, so the buffer's length contract is load-bearing. Using
+            // `chunk.t * sr / 50` instead is off by 124 samples per chunk on akiko's hop.
+            audio.resize(audio.len() + sovits_grid_len(chunk.t, m.sample_rate, m.hop_size) * m.hop_size, 0.0);
+            cv_cursor += chunk.t; // ⚠ must advance even when skipped: note_hz slices are absolute
+            skipped += 1;
+            progress(p_vits * (ci + 1) as f32 / n_chunks as f32);
+            continue;
+        }
         if cancel() {
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
@@ -756,6 +829,11 @@ pub fn render_score_sovits(
             run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?
         };
         t_s2cv += t0.elapsed().as_secs_f64();
+        // ⛔ S147 B2 的铺零公式(跳过分支)用 `chunk.t` 算样本数,而真正决定长度的是
+        // `sovits_grid_len(cv.nrows(), …)`。两者相等是**读出来的**(clarity_resample 把过采样
+        // 的 cv 重采样回 chunk.phone_dur),不是被守卫的 —— 一旦谁改了那个重采样契约,
+        // 跳过的 chunk 就会铺错长度,而拼接层用绝对样本下标 ⇒ 之后每个窗静默滑位。
+        debug_assert_eq!(cv.nrows(), chunk.t, "cv rows must equal chunk.t — the zero-fill depends on it");
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         // S69: cv expand uses the model's sidecar mode, same as the cover path (only_diffusion is
         // disallowed for the score path, so the diffusion-yaml override branch never applies).
@@ -823,18 +901,20 @@ pub fn render_score_sovits(
     audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
     let t_inverse = t0.elapsed().as_secs_f64();
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-    peak_normalize_to(&mut audio, 0.92, norm_peak_target);
+    peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
 
     let wall = t_render.elapsed().as_secs_f64();
     let secs = audio.len() as f64 / f64::from(m.sample_rate);
     tracing::info!(
-        "[perf] score/sovits {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks ·          s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g+voc) {t_decode:.2}s ({:.0}%) ·          inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+}",
+        "[perf] score/sovits {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks ·          s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g+voc) {t_decode:.2}s ({:.0}%) ·          inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+} \
+         · skipped {skipped}/{}",
         if secs > 0.0 { wall / secs } else { 0.0 },
         chunks.len(),
         100.0 * t_s2cv / wall.max(1e-9),
         100.0 * t_decode / wall.max(1e-9),
         100.0 * t_inverse / wall.max(1e-9),
         (wall - t_s2cv - t_decode - t_inverse).max(0.0),
+        chunks.len(),
     );
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
 }
@@ -896,12 +976,9 @@ pub fn render_score_rvc(
     formant: Option<&[f32]>,
     cancel: &(dyn Fn() -> bool + Sync),
     progress: &dyn Fn(f32),
-    // S147: normalize against THIS peak instead of this render's own. `None` = today's
-    // behaviour (self-normalize). The dead-only splice hands every donor the BASE render's
-    // pre-norm peak so both sides end up on one scalar — see `peak_normalize_to`.
-    // ⛔ Appended at the end on purpose (additive-then-flip): every existing call site gets
-    // `None` and stays byte-identical, and the compiler names each one instead of me guessing.
-    norm_peak_target: Option<f32>,
+    // S147: donor-pass context. `None` = a normal (base) render, byte-identical to before —
+    // which is what all 19 existing call sites pass. See `DonorCtx`.
+    donor: Option<DonorCtx<'_>>,
 ) -> Result<SynthesisResult> {
     let mut arr = build_arrays_daw(score, dicts, shaping.articulation_timing())?;
     // S60-2 音域扩展 — same recipe as the SoVITS render: sing at transpose+range_shift, shift back below.
@@ -997,7 +1074,7 @@ pub fn render_score_rvc(
     }
     audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-    peak_normalize_to(&mut audio, 0.92, norm_peak_target);
+    peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
 }
 
@@ -1526,6 +1603,110 @@ mod mg_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ── S147 B2:donor 打洞 ─────────────────────────────────────────────────────────
+    fn kmask_chunks(lens: &[usize], hard: &[usize]) -> Vec<Chunk> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, &t)| Chunk {
+                start: 0,
+                end: 0,
+                phonemes: vec![],
+                note_pitch: vec![],
+                phone_dur: vec![],
+                note_dur: vec![],
+                note_to_phone: vec![],
+                t,
+                lang_id: 2,
+                hard_seam: hard.contains(&i),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_donor_keeps_only_the_chunks_its_windows_touch() {
+        // 帧轴:chunk 0 = 0..100 · 1 = 100..200 · 2 = 200..300 · 3 = 300..400
+        let chunks = kmask_chunks(&[100, 100, 100, 100], &[]);
+        let keep = donor_keep_mask(&chunks, &[(210, 240)], 0);
+        assert_eq!(keep, vec![false, false, true, false]);
+        // ⛔ 存在性闸:必须真的跳过了东西,否则下面每一条断言都可能在恒真格上
+        assert!(keep.iter().any(|&k| !k), "no chunk skipped ⇒ this test proves nothing");
+    }
+
+    #[test]
+    fn the_margin_pulls_in_the_neighbour_a_window_only_just_misses() {
+        // ⛔ 这条钉的是那 458.8 样本(10.4 ms)的映射偏差:窗**帧域上**刚好不碰 chunk 1,
+        // 但拼接层的线性 spf 会把它的 10 ms 淡出算到那边去 ⇒ 没有边距就会拼进数字零。
+        let chunks = kmask_chunks(&[100, 100, 100], &[]);
+        assert_eq!(
+            donor_keep_mask(&chunks, &[(201, 250)], 0),
+            vec![false, false, true],
+            "零边距时只保留 chunk 2 —— 这是被修的那个行为"
+        );
+        assert_eq!(
+            donor_keep_mask(&chunks, &[(201, 250)], DONOR_WINDOW_MARGIN_FRAMES),
+            vec![false, true, true],
+            "有边距时必须把左邻也拉进来"
+        );
+    }
+
+    #[test]
+    fn a_hard_seam_is_never_left_on_the_edge_of_a_hole() {
+        // hard_seam 按定义落在**浊音正中**(score2cv:语言切点不落在静音上)⇒ 洞边落那儿会让
+        // PSOLA 的整条岛重新定相(实测最坏 +2.9 dB、完全去相关)。
+        let chunks = kmask_chunks(&[100, 100, 100, 100], &[2]);
+        let keep = donor_keep_mask(&chunks, &[(210, 240)], 0);
+        assert_eq!(keep, vec![false, true, true, false], "hard_seam 的左邻必须一起保留");
+
+        // ⛔ 阴性对照必须能抓住「无条件保留 hard_seam」这个错法:chunk 0 是 hard_seam 但
+        // **离任何窗都很远**,它不该被保留。(上一版的对照用的是「没有 hard_seam」的谱,
+        // 那种谱上错法与正法给出同一个答案 ⇒ 恒真。)
+        let far = kmask_chunks(&[100, 100, 100, 100], &[0, 2]);
+        assert_eq!(
+            donor_keep_mask(&far, &[(210, 240)], 0),
+            vec![false, true, true, false],
+            "远离窗的 hard_seam 不许被保留;只有洞边上的那些才要"
+        );
+        // 单语谱 hard_seam 恒 false ⇒ 规则零代价
+        let plain = kmask_chunks(&[100, 100, 100, 100], &[]);
+        assert_eq!(
+            donor_keep_mask(&plain, &[(210, 240)], 0),
+            vec![false, false, true, false],
+            "没有 hard_seam 时规则不许多留任何 chunk"
+        );
+    }
+
+    #[test]
+    fn a_base_pass_keeps_every_chunk_and_a_full_window_skips_nothing() {
+        // 两条退化格,都必须是 no-op —— 它们是「这一笔对 base 逐位不变」的前提。
+        let chunks = kmask_chunks(&[100, 100, 100], &[]);
+        assert_eq!(donor_keep_mask(&chunks, &[(0, 300)], 0), vec![true; 3]);
+        // 空窗集:一个 chunk 都不留(调用方保证 windows 非空;这里钉行为不钉期望)
+        assert_eq!(donor_keep_mask(&chunks, &[], 0), vec![false; 3]);
+    }
+
+    #[test]
+    fn the_zero_fill_uses_the_hop_grid_not_the_cv_grid() {
+        // ⛔ 拼接层用**绝对样本下标**,所以跳过的 chunk 铺多少零是承重的。
+        // 用 `chunk.t * sr / 50` 代替 `sovits_grid_len` 在 akiko 的口径上单 chunk 差 124 样本
+        // ⇒ 之后每个窗都会滑位,而日志只会说 "clamped"。
+        let (sr, hop) = (44100u32, 512usize);
+        for t in [1usize, 7, 100, 400, 401] {
+            let grid = sovits_grid_len(t, sr, hop) * hop;
+            let naive = t * sr as usize / 50;
+            assert!(
+                grid.abs_diff(naive) <= 512,
+                "t={t}: grid {grid} vs naive {naive} —— 差得离谱说明我算错了口径"
+            );
+        }
+        // 而在真实 chunk 长度上,两者**确实不同** —— 否则这条判据没有意义
+        let t = 400usize;
+        assert_ne!(
+            sovits_grid_len(t, sr, hop) * hop,
+            t * sr as usize / 50,
+            "两个口径必须真的不同,否则这条判据是恒真的"
+        );
+    }
+
 
     // ── S147 归一口径 ───────────────────────────────────────────────────────────────
     #[test]

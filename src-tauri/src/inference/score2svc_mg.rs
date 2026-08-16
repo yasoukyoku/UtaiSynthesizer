@@ -942,9 +942,8 @@ fn mg_render_rvc() {
             consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
         },
         tp, rs,
-        Some(&vf0), None, None, &no_cancel, &no_prog,
-    
-                    None,)
+        Some(&vf0), None, None, &no_cancel, &no_prog, None,
+    )
     .unwrap();
     let mut audio = r.audio;
     if f0shift != 0 && inverse {
@@ -1114,6 +1113,24 @@ fn mg_render_sovits() {
     let no_prog = |_: f32| {};
     let t0 = Instant::now();
     let cvspk = mg_cvspk_env();
+    // S147 B2:UTAI_MG_DONOR_WINDOWS="a:b,c:d"(帧域)⇒ 走 donor 打洞那条路。
+    // 没有它 ⇒ None ⇒ 与今天逐位相同。
+    let donor_windows: Vec<(i64, i64)> = std::env::var("UTAI_MG_DONOR_WINDOWS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (a, b) = p.split_once(':').expect("UTAI_MG_DONOR_WINDOWS=a:b,c:d");
+            (a.parse().unwrap(), b.parse().unwrap())
+        })
+        .collect();
+    let donor_ctx = (!donor_windows.is_empty()).then(|| super::DonorCtx {
+        norm_peak_target: std::env::var("UTAI_MG_PEAK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0),
+        windows: &donor_windows,
+    });
     let r = render_score_sovits(
         &m, &s2cv, &evts, dim, cvspk, &super::g2p::GlobalDicts, &sopts,
         crate::commands::inference::VOCAL_FLAT_VOL,
@@ -1124,9 +1141,8 @@ fn mg_render_sovits() {
             consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
         },
         tp, rs,
-        Some(&vf0), None, None, &no_cancel, &no_prog,
-    
-                    None,)
+        Some(&vf0), None, None, &no_cancel, &no_prog, donor_ctx,
+    )
     .unwrap();
     let mut audio = r.audio;
     if f0shift != 0 && inverse {
