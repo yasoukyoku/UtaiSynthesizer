@@ -2039,11 +2039,15 @@ pub async fn render_vocal_segment(
                     // ⚠ 这一笔**会改今天的输出**:逐 shift 一个常数(实测 −0.114/+0.064/−0.280/
                     // −0.056 dB),低于 ~1 dB 的电平 JND 但高于逐 chunk 电平地板 0.004 dB 二十倍。
                     let base_peak = result.pre_norm_peak;
-                    let window_frames: Vec<(i64, i64)> =
-                        range_windows.iter().map(|j| (j.start, j.end)).collect();
+
                     crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
+                        let shift_windows: Vec<(i64, i64)> = range_windows
+                            .iter()
+                            .filter(|j| j.shift == s)
+                            .map(|j| (j.start, j.end))
+                            .collect();
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_sovits(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
@@ -2051,10 +2055,14 @@ pub async fn render_vocal_segment(
                             &donor_progress,
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
-                                // S147 B2:只渲会被拼回去的那些 chunk。窗是**决策层算好的**
-                                // (`dead_group_windows`),这里不许再复刻一份 —— registry 里
-                                // 已经写过为什么(第二份会慢慢漂开)。
-                                windows: &window_frames,
+                                // S147 B2:只渲**这一遍**会被拼回去的那些 chunk。
+                                // ⛔ 窗必须按**本遍的位移**过滤:`apply_dead_only_windows` 每个
+                                // distinct shift 调一次闭包,而每个 job 只属于其中一个位移。
+                                // 第一版传了**全部窗的并集** ⇒ 每一遍都在渲别人的窗,四个位移的
+                                // `skipped` 全是 12/25。功能正确,收益少了一大半 —— 而
+                                // **「不同位移跳过数完全相同」这个指纹是唯一暴露它的东西**。
+                                // ⚠ 窗本身仍然只来自决策层(`dead_group_windows`),这里不复刻。
+                                windows: &shift_windows,
                             }),
                         )
                         .map(|r| r.audio)
@@ -2142,11 +2150,15 @@ pub async fn render_vocal_segment(
                     // S147:与 SoVits 臂同一口径(机理注释见彼处)—— donor 共用 base 的归一前峰,
                     // `match_levels` 因此不再需要。
                     let base_peak = result.pre_norm_peak;
-                    let window_frames: Vec<(i64, i64)> =
-                        range_windows.iter().map(|j| (j.start, j.end)).collect();
+
                     crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
+                        let shift_windows: Vec<(i64, i64)> = range_windows
+                            .iter()
+                            .filter(|j| j.shift == s)
+                            .map(|j| (j.start, j.end))
+                            .collect();
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
                         score2svc::render_score_rvc(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
@@ -2154,10 +2166,14 @@ pub async fn render_vocal_segment(
                             &donor_progress,
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
-                                // S147 B2:只渲会被拼回去的那些 chunk。窗是**决策层算好的**
-                                // (`dead_group_windows`),这里不许再复刻一份 —— registry 里
-                                // 已经写过为什么(第二份会慢慢漂开)。
-                                windows: &window_frames,
+                                // S147 B2:只渲**这一遍**会被拼回去的那些 chunk。
+                                // ⛔ 窗必须按**本遍的位移**过滤:`apply_dead_only_windows` 每个
+                                // distinct shift 调一次闭包,而每个 job 只属于其中一个位移。
+                                // 第一版传了**全部窗的并集** ⇒ 每一遍都在渲别人的窗,四个位移的
+                                // `skipped` 全是 12/25。功能正确,收益少了一大半 —— 而
+                                // **「不同位移跳过数完全相同」这个指纹是唯一暴露它的东西**。
+                                // ⚠ 窗本身仍然只来自决策层(`dead_group_windows`),这里不复刻。
+                                windows: &shift_windows,
                             }),
                         )
                         .map(|r| r.audio)

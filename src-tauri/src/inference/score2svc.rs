@@ -1676,6 +1676,27 @@ mod tests {
     }
 
     #[test]
+    fn two_shifts_with_different_windows_must_keep_different_chunks() {
+        // ⛔ 真机抓到的 bug 的判据。第一版把**全部位移的窗的并集**传给每一遍 ⇒ 四个 donor
+        // 渲同一批 chunk,`skipped` 全是 12/25。功能是对的(渲多了不会错),收益少了一大半,
+        // 而**唯一暴露它的就是「不同位移的跳过数完全相同」这个指纹**。
+        // ⇒ 这条判据直接钉那个指纹:窗不同 ⇒ 保留集必须不同。
+        let chunks = kmask_chunks(&[100, 100, 100, 100], &[]);
+        let early = donor_keep_mask(&chunks, &[(10, 40)], 0);
+        let late = donor_keep_mask(&chunks, &[(310, 340)], 0);
+        assert_eq!(early, vec![true, false, false, false]);
+        assert_eq!(late, vec![false, false, false, true]);
+        assert_ne!(early, late, "不同的窗必须给出不同的保留集");
+
+        // 阴性对照:两遍的窗**相同**时保留集当然该相同 —— 否则上面那条可能是别的原因红的
+        assert_eq!(
+            donor_keep_mask(&chunks, &[(10, 40)], 0),
+            early,
+            "同样的窗必须给出同样的答案(不然这把尺子自己不稳)"
+        );
+    }
+
+    #[test]
     fn a_base_pass_keeps_every_chunk_and_a_full_window_skips_nothing() {
         // 两条退化格,都必须是 no-op —— 它们是「这一笔对 base 逐位不变」的前提。
         let chunks = kmask_chunks(&[100, 100, 100], &[]);
