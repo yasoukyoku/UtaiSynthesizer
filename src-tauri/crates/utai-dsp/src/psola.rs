@@ -476,6 +476,30 @@ fn wsola_pick(x: &[f32], acc: &[f64], s0: f64, tm: f64, lw: f64, radius: f64) ->
 /// landing energy collapses to **−22.12 dB** (against −10.87 here and −10.98 for praat) and
 /// spacing jitter quadruples. ⇒ the ruler separates "anchored" from "anchored on the pulse" by
 /// 20×, and the claim survives its own control.
+///
+/// ## ⛔ How to check this for octave errors, and how NOT to
+///
+/// The in-loop arm above does not merely change the mark count — on some notes it lays down an
+/// **alternating long-short spacing**, which is period doubling written into the mark train
+/// itself. Two things about finding it:
+///
+/// * **Per note, never per song.** The same criterion on the same arm reads 34.6% over the two
+///   broken notes, 3.4% over 23 notes and **0.78% over all voiced frames** — diluted 44×. A
+///   whole-song f0 average cannot see a defect that lives on 2 notes out of 23. (S148 already
+///   paid for this once: the r4 positive control only reads its 24.25% inside the right window.)
+/// * **The mark train tells you before the audio does**, and without trusting any pitch tracker —
+///   which matters, because on those notes pyworld and praat disagree. Take the local spacing
+///   ratio `d[i] / median(d[i±10])` and correlate its deviation with itself at lag 1: alternating
+///   long-short shows up as a strongly NEGATIVE lag-1. ⚠ A plain "bad spacing rate" with ±0.5 T
+///   thresholds is structurally blind here — the alternation is 0.7 T / 1.3 T, i.e. *inside* the
+///   band.
+///
+/// Measured, worst note per arm (lag-1 of the spacing deviation / worst-note low-octave rate from
+/// a per-note dio+stonemask pass, positive control = drop every other mark ⇒ 100%):
+/// baseline **−0.259 / 0.00%** · **this arm −0.345 / 0.00%** · praat's marks −0.369 / 0.00% ·
+/// in-loop 0.15 **−0.562** · in-loop 0.45 **−0.654**. ⇒ this arm's worst note sits between the
+/// baseline and the praat-marks arm, and no arm here except the deliberate positive control shows
+/// an octave error at +7 or +12. ⚠ Honest cost: spacing jitter p90 0.054 against praat's 0.012.
 fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
     if radius_periods <= 0.0 || marks.len() < 3 {
         return 0;
