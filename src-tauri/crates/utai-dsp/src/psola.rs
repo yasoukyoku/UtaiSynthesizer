@@ -301,6 +301,29 @@ fn max_correlation(x: &[f32], t1: f64, period: f64, lo: f64, hi: f64) -> (f64, f
     (best_i as f64 + off, best_c.max(0.0))
 }
 
+/// S148 — per-grain trace for the "spindle" investigation (test-only, env-gated, no production
+/// path). The user named the defect from the waveform: a sustained rescued note breaks into a
+/// string of lens shapes. `cola_w_median` is 1.000 there, so it is not a window-sum gap — it has
+/// to be coherent addition between overlapping grains. What decides that is how far each grain's
+/// own pulse sits from where it is being placed:
+///
+/// ```text
+/// u = j / ratio ;  tgt[j] = interp(src, u)   (smooth)
+///                  ks[j]  = round(u)          (quantised)  <- the only lossy step
+///                  delta  = tgt[j] - src[round(u)]
+/// ```
+///
+/// ⛔ Do not derive the modulation rate from `ratio` on paper — I tried, and the arithmetic
+/// matched the −7 arm (~0.68 s) while missing the −5 arm by 3.5×. Dump it and measure.
+#[cfg(test)]
+static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 7]>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn grain_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("UTAI_PSOLA_GRAIN_DUMP").is_ok())
+}
+
 /// S148 — pick the SOURCE read position for one grain by waveform similarity with what has
 /// already accumulated (WSOLA). Returns `s0` unchanged unless some offset in `±radius` beats it.
 ///
@@ -727,6 +750,19 @@ pub fn psola_shift_wsola(
             };
             if s_pos != src[k] {
                 diag.wsola_moved += 1;
+            }
+            #[cfg(test)]
+            if grain_trace_on() {
+                let t_src = if k + 1 < src.len() { src[k + 1] - src[k] } else { src_l };
+                GRAIN_TRACE.lock().unwrap().push([
+                    tm,                       // 这颗粒被放在哪(样本)
+                    s_pos,                    // 从哪读的
+                    tm - s_pos,               // δ:自身脉冲点与放置点的偏差
+                    t_src,                    // 该处的源周期
+                    (tm - s_pos) / t_src,     // δ 归一到周期 = 相位误差
+                    lw,
+                    k as f64,
+                ]);
             }
             add_bell(
                 x, &mut acc, &mut wsum, s_pos, tm, lw, rw, formant_rate, frac_transport,
@@ -1324,8 +1360,13 @@ mod tests {
         // S148:`UTAI_PSOLA_WSOLA=<frac>` 打开源侧波形相似度搜索(默认 0 = 关,逐位同旧)。
         let wsola: f64 =
             std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        // S148 —— `frac_transport` 以前在这里写死成 false,于是 `UTAI_PSOLA_FRAC` 对这条探针**完全无效**:
+        // 开与不开的输出 sha256 逐位相同。我差点把那读成「亚样本搬运对包络起伏没用」。
+        // ⛔「臂开着」与「臂做了事」是两件事 —— 现在它由 env 控,并且把实际取值打出来。
+        let frac = std::env::var("UTAI_PSOLA_FRAC").ok().is_some_and(|v| v != "0" && v != "false");
         let (y, d) =
-            psola_shift_wsola(&x, spec.sample_rate, st, 0.0, &f0, hop, false, wsola);
+            psola_shift_wsola(&x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola);
+        println!("  arms: frac_transport={frac} wsola={wsola}");
         println!(
             "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
              islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {}",
@@ -1333,6 +1374,23 @@ mod tests {
             d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved
         );
         assert_eq!(y.len(), x.len(), "exact-length contract");
+
+        // S148 —— 逐颗粒轨迹(只在 `UTAI_PSOLA_GRAIN_DUMP` 设了的时候写)。
+        // ⛔ 空文件与「没开」必须分得开:开了就一定有行,一行都没有说明循环根本没跑到,
+        //    那是「跑不起来」不是「测出来没有」。
+        if let Ok(p) = std::env::var("UTAI_PSOLA_GRAIN_DUMP") {
+            let rows = GRAIN_TRACE.lock().unwrap();
+            assert!(!rows.is_empty(), "grain dump 开着却一行都没有 —— 合成循环没跑到,读数无效");
+            let mut s = String::from("tm\tsrc\tdelta\tt_src\tphase\tlw\tk\n");
+            for r in rows.iter() {
+                s.push_str(&format!(
+                    "{:.3}\t{:.3}\t{:.4}\t{:.4}\t{:.6}\t{:.3}\t{}\n",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6] as i64
+                ));
+            }
+            std::fs::write(&p, s).expect("write grain dump");
+            println!("  grain dump: {} 行 -> {p}", rows.len());
+        }
 
         let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
         let g = 0.92 / peak; // same normalization the S145 arms used, so levels are comparable
