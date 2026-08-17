@@ -438,6 +438,44 @@ fn wsola_pick(x: &[f32], acc: &[f64], s0: f64, tm: f64, lw: f64, radius: f64) ->
 /// * ⛔ **"Agreement with praat's marks" is NOT a criterion** — S146 measured an `absmax`
 ///   detector with the *highest* agreement (67%) and the *worst* ΔHNR (−5.94) and voiced survival
 ///   (52%). The criteria are the rulers in `scripts/range_rulers/` plus f0.
+///
+/// ## Why local energy, and why post-hoc — both measured, neither chosen by taste
+///
+/// **The feature.** praat's own marks sit at the argmax of `E(T/8)` — or, indistinguishably, of
+/// `|x|` — for **62%** of marks against a **9.4%** random floor (jitter praat's marks ±0.5 T and
+/// every feature collapses to 9-10%). Ours manage 35%. The textbook glottal-closure detectors do
+/// *worse*: LPC residual **26%**, `|dx/dt|` **19%**. ⇒ the cheap feature is the right one here;
+/// do not port the literature over that measurement. (praat also actively *avoids* zero crossings:
+/// 4.2% against a 19.7% floor.)
+///
+/// **The shape.** The error is **cumulative, not per-step noise**: per-step median 0.0024 of a
+/// period against an accumulated median of 0.0695 (p90 0.40, worst 3.31), lag-1 autocorrelation
+/// +0.9897, growing monotonically with distance from the seed (0.009 within 2 steps → 0.177 beyond
+/// 80). praat is not cleverer — its search is *weaker* than ours (1-period window vs our 3) — it
+/// re-anchors on every voiced interval while we anchor **once per island**, and our islands run to
+/// 2580 marks. ⇒ That argues for locking *inside* the walk, and it was implemented and measured:
+///
+/// | arm | marks | landing energy | spacing var | Σ\|depth − upper\| | w_p01 at −7 |
+/// |---|---|---|---|---|---|
+/// | today | 61523 | −11.83 | 0.0013 | 18.94 | 0.2915 |
+/// | in-loop α=0.15 | 61518 | −10.91 | 0.0061 | 0.54 | 0.2851 |
+/// | in-loop α=0.45 | **57077** | −10.79 | 0.0062 | 0.54 | 0.2554 |
+/// | **this (post-hoc α=0.45 + smoothing)** | **61523** | −10.87 | **0.0028** | **0.45** | **0.2882** |
+/// | upper bound (praat's marks) | 58777 | −10.98 | 0.0021 | 0.02 | 0.2905 |
+///
+/// In-loop fights the walk's mandatory forward-progress check and **changes the mark count**
+/// (−4446 = −7.2% at 0.45), which is a design-note-3 violation — those stretches synthesize at
+/// double the period. Post-hoc keeps the count exact by construction, and once the correction is
+/// median-smoothed it also wins on spacing jitter (2×) and on the downshift window-sum floor.
+/// ⚠ Recorded honestly: with **no** smoothing, post-hoc is the worse of the two — the smoothing is
+/// what makes this choice correct, not the post-hoc-ness.
+///
+/// **The negative control that had to be run.** "Depth went down" does not by itself mean "the
+/// marks found the pulses" — any consistent absolute anchor stops the accumulation. So the same
+/// mechanism was run snapping to the energy **minimum**: Σ 18.94 → **9.56** (it does help) but
+/// landing energy collapses to **−22.12 dB** (against −10.87 here and −10.98 for praat) and
+/// spacing jitter quadruples. ⇒ the ruler separates "anchored" from "anchored on the pulse" by
+/// 20×, and the claim survives its own control.
 fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
     if radius_periods <= 0.0 || marks.len() < 3 {
         return 0;
@@ -1551,10 +1589,16 @@ mod tests {
     fn ratio_one_stays_the_identity_with_the_phase_lock_on() {
         // The cheapest, least fakeable gate this module has — and it must be re-asserted for every
         // arm, because it is what caught three "obviously correct" designs in S146.
-        // ⚠ Stated honestly: this gate is **structurally blind to where the marks are** (at ratio
-        // 1.0 the target pulses ARE the source marks, so any mark set reproduces the input). It
-        // proves the lock did not break the synthesis path; it proves nothing about placement.
-        // That is what the rulers in `scripts/range_rulers/` and the ear are for.
+        // ⚠ Stated honestly, and now MEASURED rather than reasoned: this gate is **structurally
+        // blind to where the marks are**. Replacing `analysis_marks` wholesale with a 137-sample
+        // uniform grid — no f0, no waveform, nothing — still produces a whole-song ST=0 output
+        // that is **bit-identical** to the baseline (sha256 1565ff95…). Every mark set whose
+        // spacings land in (1.0, 882] samples passes, because at r=1 `tgt[j] == src[j]` ⇒ `d == 0`
+        // and the rising/falling half-cosines sum to exactly 1 on the same span.
+        // ⇒ It proves the lock did not break the synthesis path; it proves **nothing** about
+        // placement. Before this commit, NO test in this file could see a mark-placement change:
+        // a realistic phase lock altered the +7 fixture audio by max |Δ| = 0.978 (peak 0.9) and
+        // all 14 tests stayed green. That is what the four gates above exist for.
         let sr = 44_100;
         let x = voiced(sr, 0.5, 220.0);
         let hop = sr as usize / 200;
