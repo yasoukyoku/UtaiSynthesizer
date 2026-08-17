@@ -75,6 +75,10 @@ pub struct PsolaDiagnostics {
     /// ⭐ 0.0000 at ratio 1.0 · ≈0.41 for whole-sample transport at any other ratio ·
     /// 0 once `frac_transport` carries it. See `add_bell`.
     pub transport_residual_rms: f32,
+    /// S150 — how many analysis marks the phase lock actually moved.
+    /// ⛔ Same reason as `wsola_moved`: "the arm is on" and "the arm did something" are two
+    /// different facts, and only the second one is visible in the audio.
+    pub marks_locked: usize,
     /// S148 — how many grains the WSOLA search actually moved off `src[k]`.
     /// ⛔ It is the difference between "the arm is on" and "the arm did something": a search that
     /// never moves a grain produces byte-identical audio, which is indistinguishable from the arm
@@ -90,6 +94,15 @@ const CORR_WIN_PERIODS: f64 = 3.0;
 const SEARCH_LO: f64 = 0.8;
 const SEARCH_HI: f64 = 1.25;
 const MIN_ISLAND_SECONDS: f64 = 0.02;
+
+/// S150 — phase locking. Half-width of the energy window used to find the pulse, in periods.
+/// Measured on the akiko donor at +7 (Σ|depth − upper bound| over the 5 registered notes):
+/// T/16 → 1.88 · **T/8 → 1.23** · T/4 → 0.83 · T/2 → 12.03. The T/2 collapse is the tell that
+/// this is a real optimum and not a flat knob: a window that wide stops resolving the pulse.
+const LOCK_ENERGY_HALF: f64 = 0.125;
+/// Median width over the phase correction. 5 and 9 measure the same on the correction itself
+/// (0.48 dB) while 9 halves the jitter it costs; 1 (= off) triples the `cola_gap` at +1 st.
+const LOCK_SMOOTH: usize = 9;
 
 /// Half-width of the windowed-sinc used to carry the sub-sample transport residual.
 ///
@@ -384,6 +397,153 @@ fn wsola_pick(x: &[f32], acc: &[f64], s0: f64, tm: f64, lw: f64, radius: f64) ->
     s0 + best as f64
 }
 
+/// S150 — **phase locking**: pull each analysis mark onto the nearest glottal pulse.
+/// Returns how many marks actually moved. `radius_periods == 0` ⇒ no-op, marks untouched.
+///
+/// ## Why this exists (S148 root cause, measured — do not re-derive)
+///
+/// The walk in [`analysis_marks`] steps by *correlation*, so its **period is right and its phase
+/// is not**: the step size is accurate (measured spacing median 120.00 samples against praat's
+/// 119.75, and our spacing is actually *smoother* — 0.0013 vs 0.0021 relative variation) while
+/// nothing ever re-anchors the marks to the waveform after the seed. The phase error therefore
+/// accumulates: our marks scatter **±0.42 of a period** around praat's and land where the local
+/// energy is **2.3–4.4 dB lower**.
+///
+/// That costs exactly what the user named by eye ("a string of lens shapes" in a sustained
+/// rescued note): a mark that sits off the pulse makes the `T_out`-wide grain window cut a
+/// different slice of the pulse every period, which writes an envelope modulation that was not in
+/// the input. ⭐ The decisive single-variable experiment: swapping **only** the marks for praat's
+/// reproduced praat's readings on 5 notes × 2 metrics to within 0.02 dB (`[785]` 9.49 → 3.45
+/// against praat's own 3.47) ⇒ the synthesis rules are already correct; 100% of the injected
+/// modulation comes from mark placement. ⭐ And the note that never grows the defect at any shift
+/// (`[86]`) is the one whose marks are already accurate (0.33 dB) — the strongest internal
+/// consistency this chain has.
+///
+/// ## Contract (each clause is a defect that was measured, not a preference)
+///
+/// * **Every mark survives.** Design note 3: Φ(m_k) = k needs one mark per period. Locking only
+///   ever *moves* marks — never adds, drops or merges them.
+/// * **The radius is the LOCAL period, not the island's.** An island can run 2580 marks (≈7 s)
+///   with the pitch moving inside it, so a median-derived radius can exceed half of a locally
+///   shorter period and snap onto the *neighbouring* pulse — which is how you manufacture period
+///   doubling. Using `min(gap_left, gap_right)` makes overshoot structurally impossible.
+///   ⛔ This is not hypothetical caution: S148's WSOLA arm was killed by a blind test precisely
+///   for manufacturing an exact −1200 cent period doubling.
+/// * **Marks may not cross or collapse** (the same guard, enforced sequentially).
+/// * **The correction is median-smoothed over `LOCK_SMOOTH` marks.** The phase error is slow
+///   (it accumulates one step at a time) while the per-mark argmax noise is fast, so smoothing the
+///   *correction* keeps the fix and drops the jitter. Measured: relative spacing variation
+///   0.0060 → 0.0028 (praat 0.0021) and `cola_gap` at +1 st 1.46% → 0.27%, at **no cost** to the
+///   correction itself (Σ|depth − upper bound| 0.50 → 0.48 dB).
+/// * ⛔ **"Agreement with praat's marks" is NOT a criterion** — S146 measured an `absmax`
+///   detector with the *highest* agreement (67%) and the *worst* ΔHNR (−5.94) and voiced survival
+///   (52%). The criteria are the rulers in `scripts/range_rulers/` plus f0.
+fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
+    if radius_periods <= 0.0 || marks.len() < 3 {
+        return 0;
+    }
+    let n = x.len();
+    // Local energy in `[i-h, i+h)`, clipped at the buffer edges (a shrinking window there is
+    // fine — it only ever competes against its own neighbours a sample away).
+    let energy = |c: isize, h: isize| -> f64 {
+        let lo = c.saturating_sub(h).max(0) as usize;
+        let hi = ((c + h).max(0) as usize).min(n);
+        if hi <= lo {
+            return 0.0;
+        }
+        x[lo..hi].iter().map(|v| f64::from(*v) * f64::from(*v)).sum()
+    };
+    let mut off = vec![0.0f64; marks.len()];
+    let mut prev = f64::NEG_INFINITY;
+    for i in 0..marks.len() {
+        // LOCAL period: the smaller of the two neighbour gaps ⇒ the search can never reach the
+        // next pulse even where the pitch is rising steeply inside the island.
+        let gl = if i > 0 { marks[i] - marks[i - 1] } else { marks[1] - marks[0] };
+        let gr = if i + 1 < marks.len() {
+            marks[i + 1] - marks[i]
+        } else {
+            marks[i] - marks[i - 1]
+        };
+        let t = gl.min(gr);
+        if !(t > 2.0) {
+            prev = marks[i];
+            continue;
+        }
+        let r = ((radius_periods * t).round() as isize).max(1);
+        let h = ((LOCK_ENERGY_HALF * t).round() as isize).max(2);
+        let c0 = marks[i].floor() as isize - r;
+        let c1 = marks[i].floor() as isize + r;
+        let (mut best, mut best_v, mut best_i) = (marks[i], f64::NEG_INFINITY, -1isize);
+        let (mut vm1, mut vp1) = (f64::NAN, f64::NAN);
+        let mut last = f64::NAN;
+        for c in c0..=c1 {
+            if c < 0 || c as usize >= n {
+                last = f64::NAN;
+                continue;
+            }
+            // No crossing: a candidate must clear the previous locked mark by half a period.
+            if (c as f64) <= prev + 0.5 * t {
+                last = f64::NAN;
+                continue;
+            }
+            let v = energy(c, h);
+            if best_i >= 0 && c == best_i + 1 {
+                vp1 = v;
+            }
+            if v > best_v {
+                best_v = v;
+                best = c as f64;
+                best_i = c;
+                vm1 = last;
+                vp1 = f64::NAN;
+            }
+            last = v;
+        }
+        if best_i < 0 {
+            prev = marks[i];
+            continue;
+        }
+        // Sub-sample refinement — the same parabola the rest of this module uses. Without it the
+        // integer grid alone puts ±0.5 samples of jitter into every mark, which lands straight in
+        // the synthesis pulse positions (measured: spacing variation 0.0013 → 0.0093).
+        if vm1.is_finite() && vp1.is_finite() {
+            let d = parabolic(vm1, best_v, vp1);
+            if d.is_finite() {
+                best += d.clamp(-1.0, 1.0);
+            }
+        }
+        off[i] = best - marks[i];
+        prev = best;
+    }
+    // Median-smooth the CORRECTION (not the marks): keep the slow phase fix, drop the fast noise.
+    let mut sm = vec![0.0f64; off.len()];
+    let k = LOCK_SMOOTH / 2;
+    let mut buf = [0.0f64; LOCK_SMOOTH];
+    for i in 0..off.len() {
+        for (j, slot) in buf.iter_mut().enumerate() {
+            let idx = (i + j).saturating_sub(k).min(off.len() - 1);
+            *slot = off[idx];
+        }
+        buf.sort_by(f64::total_cmp);
+        sm[i] = buf[LOCK_SMOOTH / 2];
+    }
+    let mut moved = 0usize;
+    let mut last = f64::NEG_INFINITY;
+    for i in 0..marks.len() {
+        let v = marks[i] + sm[i];
+        // Strictly increasing is a load-bearing invariant of Φ(m_k) = k, so it is enforced here
+        // rather than assumed: smoothing a monotone sequence usually keeps it monotone, and
+        // "usually" is not a criterion.
+        let v = if v > last { v } else { last + 1e-6 };
+        if v != marks[i] {
+            moved += 1;
+        }
+        marks[i] = v;
+        last = v;
+    }
+    moved
+}
+
 /// Pitch marks inside one voiced island: seed at the island's midpoint extremum, then recurse
 /// outward maximizing correlation with the previous mark's neighbourhood.
 fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize, b: usize) -> Vec<f64> {
@@ -663,6 +823,54 @@ pub fn psola_shift_wsola(
     frac_transport: bool,
     wsola_frac: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_locked(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac, 0.0,
+    )
+}
+
+/// S150 — additive: **phase-lock the analysis marks** onto the glottal pulses before synthesis.
+///
+/// `phase_lock` is the search radius in periods; **0.0 = off = byte-for-byte the pre-S150 arm**,
+/// which is what production still runs until a blind test says otherwise (S146 protocol: blind
+/// test first, flip after — and S148's WSOLA is why that protocol is not negotiable).
+///
+/// ## What it buys, measured
+///
+/// The defect is the one the user named from the waveform, and S148 traced it to a single input:
+/// our marks have the right period and the wrong phase (see [`lock_phase`]). Locking them at
+/// `0.45` closes essentially the whole gap to the "upper bound" arm (= our synthesis fed praat's
+/// marks, the arm that won a blind group in S148's u1):
+///
+/// | | `[785]` | `[685]` | `[800]` | `[791]` | `[86]` |
+/// |---|---|---|---|---|---|
+/// | today | 9.49 | 5.38 | 5.25 | 4.99 | 1.14 |
+/// | **locked 0.45** | **3.51** | **0.80** | **0.85** | **1.26** | 0.95 |
+/// | upper bound (praat's marks) | 3.45 | 0.83 | 0.69 | 1.20 | 1.13 |
+///
+/// Population, not just the 5 registered notes — all 23 non-rest notes ≥0.8 s, "modulation this
+/// process ADDED to the input", median/p90: today **+2.09 / +5.94 dB**, locked **+0.00 / +0.26**,
+/// praat's marks **+0.02 / +0.35**. It holds across the whole shift range in both directions
+/// (−7 −5 −2 +1 +3 +5 +7) and on a second material (the registered 东雪莲 fixture at +6, where
+/// praat *is* a valid reference: injection +2.86 → +0.88 against praat's own +1.49).
+///
+/// The four registered rulers agree (goose +7, all 23 windows): envelope shift +0.30 → +0.20
+/// (praat +0.20), peak correlation 0.976 → **0.981** (praat 0.979), voiced survival 87.4% →
+/// **89.4%** (praat 89.5%), ΔHNR −1.58 → **−1.34** (praat −0.94), >4 kHz share unchanged.
+///
+/// ⚠ What is NOT settled: **whether it is audible**. The depth ruler has exactly one audibility
+/// data point (S148 u1: ~2.7 dB heard, ≤0.46 dB not), from a single load-bearing group.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_locked(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -698,10 +906,12 @@ pub fn psola_shift_wsola(
     let max_period = MAX_PERIOD_SECONDS * sr;
 
     for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
-        let src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b);
+        let mut src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b);
         if src.len() < 3 {
             continue;
         }
+        // S150 — marks are found on the DC-free signal, so they are locked on it too.
+        diag.marks_locked += lock_phase(&dc_free, &mut src, phase_lock);
         diag.islands += 1;
         diag.marks += src.len();
         let last = (src.len() - 1) as f64;
@@ -1117,6 +1327,252 @@ mod tests {
         }
     }
 
+    /// A pulse train with a controllable per-pulse gain: pulse `i` gets `gain(i)`.
+    /// ⛔ Deliberately NOT the `voiced()` fixture — that one is a sum of cosines whose marks are
+    /// already on the pulses, so it cannot express "the mark is off the pulse", which is the whole
+    /// subject here. Ground truth (where the pulses are) is by construction.
+    /// `f0(k)` lets the period MOVE inside the island — a constant-period fixture cannot tell a
+    /// local radius from an island-wide one, and a mutation swapping them then goes green.
+    fn pulses(
+        sr: u32,
+        secs: f64,
+        f0: impl Fn(usize) -> f64,
+        gain: impl Fn(usize) -> f64,
+    ) -> (Vec<f32>, Vec<f64>) {
+        let n = (f64::from(sr) * secs) as usize;
+        let mut y = vec![0.0f32; n];
+        let mut at = Vec::new();
+        let mut c = f64::from(sr) / f0(0) * 0.5;
+        let mut k = 0usize;
+        loop {
+            let p = f64::from(sr) / f0(k);
+            if c as usize + 2 * p as usize >= n {
+                break;
+            }
+            at.push(c);
+            let g = gain(k);
+            // A damped ring evaluated at the FRACTIONAL distance from the pulse, so the true peak
+            // sits between samples. ⛔ An integer-aligned fixture makes the sub-sample refinement
+            // invisible (mutation ⑤ went green on one).
+            for i in 0..(p * 0.9) as usize {
+                let idx = c as usize + i;
+                let t = idx as f64 - c;
+                if t < 0.0 || idx >= n {
+                    continue;
+                }
+                let v = g * (-t / (p * 0.12)).exp() * (2.0 * std::f64::consts::PI * 3.5 * t / p).sin();
+                y[idx] += v as f32;
+            }
+            c += p;
+            k += 1;
+        }
+        (y, at)
+    }
+
+    #[test]
+    fn the_phase_lock_pulls_marks_onto_the_pulses_and_keeps_every_one() {
+        // ⭐ THE criterion for S150. The defect it fixes is not "the period is wrong" (ours is
+        // right: spacing median 120.00 against praat's 119.75) but "the marks sit at the wrong
+        // PHASE inside the period" (measured scatter ±0.42 of a period, landing energy 2.3-4.4 dB
+        // below praat's). So the assertion has to be about phase, against ground truth.
+        let sr = 44_100u32;
+        let (x, truth) = pulses(sr, 0.5, |_| 300.0, |_| 1.0);
+        let p = f64::from(sr) / 300.0;
+
+        // Marks with the right PERIOD and a drifting PHASE — exactly the shape the correlation
+        // walk produces (it steps by one period and never re-anchors).
+        let mut marks: Vec<f64> = truth
+            .iter()
+            .enumerate()
+            .map(|(i, t)| t + p * (0.30 - 0.02 * i as f64).clamp(-0.42, 0.42))
+            .collect();
+        let before: Vec<f64> = marks.clone();
+
+        // ⛔ Negative control FIRST: radius 0 must be a no-op, and must say so.
+        let mut untouched = marks.clone();
+        assert_eq!(lock_phase(&x, &mut untouched, 0.0), 0, "radius 0 must move nothing");
+        assert_eq!(untouched, before, "radius 0 must leave the marks bit-identical");
+
+        let moved = lock_phase(&x, &mut marks, 0.45);
+        assert!(moved > truth.len() / 2, "the lock must actually move marks, moved {moved}");
+        assert_eq!(marks.len(), before.len(), "design note 3: no mark may be added or dropped");
+        assert!(marks.windows(2).all(|w| w[1] > w[0]), "marks must stay strictly increasing");
+
+        let err = |m: &[f64]| -> f64 {
+            let mut e: Vec<f64> = m.iter().zip(&truth).map(|(a, b)| (a - b).abs() / p).collect();
+            e.sort_by(f64::total_cmp);
+            e[e.len() / 2]
+        };
+        let (b0, a0) = (err(&before), err(&marks));
+        assert!(b0 > 0.15, "the fixture must actually be off-phase to begin with, got {b0}");
+        assert!(a0 < 0.05, "phase error must collapse onto the pulses: {b0:.3} -> {a0:.3} periods");
+
+        // ⭐ Sub-sample resolution, asserted as SPREAD rather than as distance-to-truth.
+        // ⚠ Written this way after the naive version failed at 18.7 samples: the feature is local
+        // ENERGY, and a glottal-like pulse is one-sided (sharp onset, decaying ring), so the
+        // energy-maximising window centre sits *after* the onset by roughly its own half-width.
+        // That is a BIAS, and a constant bias is harmless here — every mark gets the same one, and
+        // what this module needs is a consistent phase reference, not the glottal closure instant.
+        // What is NOT harmless is per-mark scatter, because that lands straight in the synthesis
+        // pulse positions. The fixture's period is 44100/313 = 140.9 samples, so the pulses fall
+        // between samples and an integer-grid argmax must scatter by ~±0.5.
+        let (xf, tf) = pulses(sr, 0.4, |_| 313.0, |_| 1.0);
+        let mut mf: Vec<f64> = tf.iter().map(|t| t + 6.0).collect();
+        lock_phase(&xf, &mut mf, 0.45);
+        let mut res: Vec<f64> = mf.iter().zip(&tf).map(|(a, b)| a - b).collect();
+        res.sort_by(f64::total_cmp);
+        let mid = res[res.len() / 2];
+        let mut dev: Vec<f64> = res.iter().map(|v| (v - mid).abs()).collect();
+        dev.sort_by(f64::total_cmp);
+        // ⚠ The bound is MEASURED, not guessed: with the refinement the scatter is **0.005**
+        // samples, with it removed **0.045** (the median smoothing hides most of the quantisation,
+        // which is why a 0.15 bound went green on the mutant — that version of this assertion was
+        // an empty criterion). 0.02 sits 4× above the real value and 2× below the mutant.
+        assert!(
+            dev[dev.len() / 2] < 0.02,
+            "residual scatter {:.3} samples around its median — that is integer-grid quantisation, \
+             the sub-sample refinement is not doing its job",
+            dev[dev.len() / 2]
+        );
+    }
+
+    #[test]
+    fn the_phase_lock_cannot_reach_the_neighbouring_pulse() {
+        // ⛔⛔ THE structural gate, and the reason the radius is derived from the LOCAL period.
+        // Alternating loud/quiet pulses is the classic period-doubling bait: a per-mark "snap to
+        // the biggest thing nearby" would drag every quiet-pulse mark onto its loud neighbour,
+        // halving the mark count in effect and writing an exact octave-down subharmonic. That is
+        // not a hypothetical — S148's WSOLA arm was killed by a blind test for manufacturing
+        // exactly that (−1200 cents, 1.47 s, "it even sounds solid"), and its four acceptance
+        // criteria contained no pitch measurement at all.
+        //
+        // ⚠ The fixture has to be hostile on BOTH counts or the guard goes untested: alternating
+        // gains supply the bait, and a **glissando** (250 → 450 Hz across the island) is what
+        // separates a LOCAL radius from an island-wide one. On a constant-period fixture the two
+        // are numerically identical, and a mutation swapping them went green.
+        let sr = 44_100u32;
+        let (x, truth) = pulses(
+            sr,
+            0.4,
+            |k| 250.0 + 4.0 * k as f64,
+            |i| if i % 2 == 0 { 1.0 } else { 0.25 },
+        );
+        let mut marks = truth.clone();
+        lock_phase(&x, &mut marks, 0.45);
+
+        assert!(marks.windows(2).all(|w| w[1] > w[0]), "marks must stay strictly increasing");
+        // Ground truth is per-pulse now, so the tolerance is per-pulse too.
+        let mut worst = 0.0f64;
+        for i in 1..truth.len() - 1 {
+            let p = (truth[i + 1] - truth[i]).min(truth[i] - truth[i - 1]);
+            worst = worst.max((marks[i] - truth[i]).abs() / p);
+        }
+        assert!(worst < 0.5, "no mark may travel to a neighbouring pulse, worst {worst:.3} periods");
+        // …and the spacing must not have collapsed anywhere (that is what doubling looks like in
+        // the mark train itself, before any audio is synthesized).
+        for i in 1..marks.len() {
+            let want = truth[i] - truth[i - 1];
+            let got = marks[i] - marks[i - 1];
+            assert!(
+                got > 0.5 * want && got < 1.5 * want,
+                "spacing at {i} is {got:.1} against a true period of {want:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_marks_may_not_collapse_onto_the_same_pulse() {
+        // ⛔ The crossing guard needs its own fixture: the two tests above cannot go red for it,
+        // because with evenly-spaced marks nothing ever converges. The failure it prevents is
+        // subtle and silent — two marks landing on ONE pulse leaves the count intact (so design
+        // note 3 still "passes") and the monotonic fixup at the end turns the collapse into a
+        // 1e-6 gap, i.e. it looks fine everywhere except in the audio, where that stretch now
+        // synthesizes at double the period.
+        // ⇒ assert the SPACING, not the ordering. (Written after noticing the guard was
+        // uncovered; the ordering assert alone went green on a version with the guard removed.)
+        let sr = 44_100u32;
+        let (x, truth) = pulses(sr, 0.3, |_| 250.0, |_| 1.0);
+        let p = f64::from(sr) / 250.0;
+        // Adversarial: a pair of marks only 0.6 periods apart, both within reach of one pulse.
+        let mut marks: Vec<f64> = Vec::new();
+        for (i, t) in truth.iter().enumerate() {
+            if i % 3 == 0 {
+                marks.push(t - 0.25 * p);
+                marks.push(t + 0.35 * p);
+            } else {
+                marks.push(*t);
+            }
+        }
+        marks.sort_by(f64::total_cmp);
+        marks.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        let n_before = marks.len();
+        lock_phase(&x, &mut marks, 0.45);
+        assert_eq!(marks.len(), n_before, "no mark may be dropped");
+        let min_gap = marks
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f64::MAX, f64::min);
+        assert!(
+            min_gap > 0.4 * p,
+            "two marks collapsed onto one pulse: min gap {min_gap:.1} samples vs period {p:.1}"
+        );
+    }
+
+    #[test]
+    fn the_phase_lock_is_opt_in_and_the_default_arm_is_byte_for_byte_unchanged() {
+        // ⚠ Additive, per the S146 protocol: nothing the user hears may move until a blind test
+        // says so. S148's WSOLA is why that is not negotiable — it read better on the ruler it was
+        // built for and was 3/3 rejected by ear.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 300.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 300.0);
+
+        for st in [-6.0, -1.0, 1.0, 6.0] {
+            let (base, d0) = psola_shift_diag(&x, sr, st, &f0, hop);
+            let (off, d1) =
+                psola_shift_locked(&x, sr, st, 0.0, &f0, hop, false, 0.0, 0.0);
+            assert_eq!(base, off, "{st} st: phase_lock 0.0 must be the legacy arm, bit for bit");
+            assert_eq!(d0.marks_locked, 0, "…and it must report that it moved nothing");
+            assert_eq!(d1.marks_locked, 0);
+
+            let (on, d2) = psola_shift_locked(&x, sr, st, 0.0, &f0, hop, false, 0.0, 0.45);
+            // ⛔ "the arm is on" and "the arm did something" are two different facts — a lock that
+            // never moved a mark would produce byte-identical audio and be indistinguishable from
+            // off unless this count is asserted (S147: a change whose benefit was silently halved).
+            assert!(d2.marks_locked > 0, "the lock must actually move marks when enabled");
+            assert_eq!(d2.marks, d0.marks, "locking must not change the mark COUNT (design note 3)");
+            assert_eq!(d2.islands, d0.islands);
+            assert_ne!(on, base, "{st} st: …and the opt-in arm must actually change the audio");
+        }
+    }
+
+    #[test]
+    fn ratio_one_stays_the_identity_with_the_phase_lock_on() {
+        // The cheapest, least fakeable gate this module has — and it must be re-asserted for every
+        // arm, because it is what caught three "obviously correct" designs in S146.
+        // ⚠ Stated honestly: this gate is **structurally blind to where the marks are** (at ratio
+        // 1.0 the target pulses ARE the source marks, so any mark set reproduces the input). It
+        // proves the lock did not break the synthesis path; it proves nothing about placement.
+        // That is what the rulers in `scripts/range_rulers/` and the ear are for.
+        let sr = 44_100;
+        let x = voiced(sr, 0.5, 220.0);
+        let hop = sr as usize / 200;
+        let f0 = flat_f0(x.len(), hop, 220.0);
+        for lock in [0.0, 0.25, 0.45] {
+            let (y, d) = psola_shift_locked(&x, sr, 0.0, 0.0, &x_f0(&f0), hop, false, 0.0, lock);
+            assert_eq!(y, x, "ratio 1.0 must be the identity with phase_lock = {lock}");
+            if lock > 0.0 {
+                assert!(d.marks_locked > 0, "…and the lock must have been live while proving it");
+            }
+        }
+    }
+
+    /// Identity helper so the call above reads as one line (the f0 track is not the subject).
+    fn x_f0(f0: &[f32]) -> Vec<f32> {
+        f0.to_vec()
+    }
+
     #[test]
     fn the_length_contract_holds_in_both_directions() {
         let sr = 44_100;
@@ -1311,22 +1767,34 @@ mod tests {
         let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
         let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
 
+        // S150 —— `UTAI_PSOLA_LOCK=<periods>` 打开相位锁定(默认 0 = 关,与生产同一套标记)。
+        // ⭐ 有了它,「Rust 的标记」与「Python 原型的标记」可以**逐个对拍**,
+        //    候选在离线上量到的每一个数才真的属于将要上线的那份实现。
+        let lock: f64 =
+            std::env::var("UTAI_PSOLA_LOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
         let mut s = String::new();
         let mut islands = 0usize;
         let mut marks = 0usize;
+        let mut locked = 0usize;
         for (a, b) in voiced_islands(&f0, hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
-            let src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b);
+            let mut src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b);
             if src.len() < 3 {
                 continue;
             }
+            locked += lock_phase(&dc_free, &mut src, lock);
             islands += 1;
             marks += src.len();
             for m in &src {
-                s.push_str(&format!("{a}\t{b}\t{m:.4}\n"));
+                // ⛔ 全精度,不是 `{m:.4}`。S150 实测:4 位小数的截断会让 12 个颗粒的
+                // `round(tm) − round(s_pos)`(或窗端点 `round(s±w)`)翻到 .5 的另一侧,
+                // 于是拿这份 dump 离线重放出来的波形与 Rust 自己渲的差最多 **3814 LSB**。
+                // ⚠ 12 段位置是**事前**从「到 .5 边界的距离 < 5e-5」预测出来的,12/12 命中 ——
+                // 所以这是精度问题,不是合成路径问题。f64 的 `{}` 是最短往返表示。
+                s.push_str(&format!("{a}\t{b}\t{m}\n"));
             }
         }
         std::fs::write(&out, s).expect("write marks");
-        eprintln!("[mg] marks: {islands} islands, {marks} marks -> {out}");
+        eprintln!("[mg] marks: {islands} islands, {marks} marks, lock {lock} moved {locked} -> {out}");
     }
 
     #[test]
@@ -1365,14 +1833,18 @@ mod tests {
         // 开与不开的输出 sha256 逐位相同。我差点把那读成「亚样本搬运对包络起伏没用」。
         // ⛔「臂开着」与「臂做了事」是两件事 —— 现在它由 env 控,并且把实际取值打出来。
         let frac = std::env::var("UTAI_PSOLA_FRAC").ok().is_some_and(|v| v != "0" && v != "false");
+        // S150 —— `UTAI_PSOLA_LOCK=<periods>`(默认 0 = 关)。
+        let lock: f64 =
+            std::env::var("UTAI_PSOLA_LOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
         let (y, d) =
-            psola_shift_wsola(&x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola);
-        println!("  arms: frac_transport={frac} wsola={wsola}");
+            psola_shift_locked(&x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock);
+        println!("  arms: frac_transport={frac} wsola={wsola} phase_lock={lock}");
         println!(
             "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
-             islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {}",
+             islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {} \
+             lock {lock} moved {}",
             x.len(), spec.sample_rate, f0.len(), d.islands, d.marks,
-            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved
+            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved, d.marks_locked
         );
         assert_eq!(y.len(), x.len(), "exact-length contract");
 

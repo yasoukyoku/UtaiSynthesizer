@@ -1020,6 +1020,35 @@ pub fn wsola_frac() -> f64 {
     std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(0.0)
 }
 
+/// S150 — `UTAI_PSOLA_LOCK=<periods>` phase-locks the analysis marks onto the glottal pulses.
+/// **Default 0.0 = off = byte-for-byte the pre-S150 arm.**
+///
+/// This is the fix for the defect the user named from the waveform ("the second half turns into a
+/// string of lens shapes" in sustained rescued notes). S148 traced it to a single input: our marks
+/// have the **right period and the wrong phase** — spacing median 120.00 samples against praat's
+/// 119.75, but scattered ±0.42 of a period inside it, landing where the local energy is 2.3-4.4 dB
+/// lower. Feeding praat's marks into our own synthesis reproduced praat's readings to 0.02 dB on
+/// 5 notes × 2 metrics, so mark placement is 100 % of the gap. See `utai_dsp::psola::lock_phase`.
+///
+/// Measured with the lock at 0.45 (goose donor +7, all 23 non-rest notes ≥0.8 s — "modulation this
+/// process ADDED", median/p90): today **+2.09 / +5.94 dB**, locked **+0.04 / +0.32**, praat's own
+/// marks **+0.02 / +0.35**. Holds at −7 −5 −2 +1 +3 +5 +7 and on the registered 东雪莲 fixture at
+/// +6. The four registered rulers all move toward praat (peak correlation 0.976 → 0.981, ΔHNR
+/// −1.58 → −1.34, voiced survival 87.4 → 89.4 %, >4 kHz unchanged).
+///
+/// ⛔ **Why it is still off by default.** The rulers cannot promote it — that is the whole lesson
+/// of S148: WSOLA read 4.80 % → 0.38 % on the ruler it was built for and was 3/3 rejected by ear
+/// (it was manufacturing an octave-down subharmonic that the ruler counted as a repair). The
+/// audibility scale for THIS axis has exactly one data point (S148 u1: ~2.7 dB heard, ≤0.46 dB
+/// not, from a single load-bearing group, p = 0.5). ⇒ blind test first, flip after (S146 protocol).
+pub fn phase_lock() -> f64 {
+    std::env::var("UTAI_PSOLA_LOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| *v > 0.0)
+        .unwrap_or(0.0)
+}
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -1131,7 +1160,8 @@ pub fn apply_inverse_with(
             }
             let frac = frac_transport();
             let wsola = wsola_frac();
-            let (out, diag) = utai_dsp::psola::psola_shift_wsola(
+            let lock = phase_lock();
+            let (out, diag) = utai_dsp::psola::psola_shift_locked(
                 &audio,
                 sample_rate,
                 semis,
@@ -1140,6 +1170,7 @@ pub fn apply_inverse_with(
                 hop,
                 frac,
                 wsola,
+                lock,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -1162,8 +1193,12 @@ pub fn apply_inverse_with(
                 diag.transport_residual_rms,
                 // ⛔ 打出**真的移了几个颗粒**,不只是「开着」:一个从不移动的搜索会产出逐位
                 // 相同的音频,与关掉不可分辨(S147 那次「收益静默减半」的同族)。
-                if wsola > 0.0 {
-                    format!(" (wsola {wsola} — moved {} grains)", diag.wsola_moved)
+                if wsola > 0.0 || lock > 0.0 {
+                    // ⛔ 同一条规矩:打出**真的动了几个**,不只是「开着」。
+                    format!(
+                        " (wsola {wsola} — moved {} grains; phase lock {lock} — moved {} marks)",
+                        diag.wsola_moved, diag.marks_locked
+                    )
                 } else {
                     String::new()
                 }
