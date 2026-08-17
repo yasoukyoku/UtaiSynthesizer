@@ -100,9 +100,24 @@ const MIN_ISLAND_SECONDS: f64 = 0.02;
 /// T/16 → 1.88 · **T/8 → 1.23** · T/4 → 0.83 · T/2 → 12.03. The T/2 collapse is the tell that
 /// this is a real optimum and not a flat knob: a window that wide stops resolving the pulse.
 const LOCK_ENERGY_HALF: f64 = 0.125;
-/// Median width over the phase correction. 5 and 9 measure the same on the correction itself
-/// (0.48 dB) while 9 halves the jitter it costs; 1 (= off) triples the `cola_gap` at +1 st.
-const LOCK_SMOOTH: usize = 9;
+/// Width of the **moving-average** low-pass over the phase correction.
+///
+/// ⛔⛔ This was a MEDIAN of 9 when S150 first shipped the arm, and that shipped an audible defect:
+/// the user reported clicks. A median is a **rank** filter — it passes a step through unchanged,
+/// and a step is exactly what happens here, because the peak the snap latches onto is nearly
+/// degenerate (measured runner-up/winner energy ratio p50 0.72-0.99), so the winner flips between
+/// two sub-features for a run of marks. Measured at the six coordinates where the clicks were
+/// localised, spectral flux: baseline 20.6 → median-9 arm **84.6** → moving average **27.9**.
+/// ⇒ The correction has to be genuinely LOW-PASSED, not de-spiked.
+const LOCK_SMOOTH: usize = 31;
+/// Hard ceiling on how fast the phase correction may change, in periods per mark.
+///
+/// This is the constraint stated in the units of the defect: the spacing between two marks is
+/// `original spacing + (off[i+1] − off[i])`, so bounding `|Δoff|` **is** bounding the spacing
+/// perturbation — and jittered spacing is what makes consecutive grains fail to line up, which is
+/// the click. Measured local spacing jitter p99: baseline 0.1377 · median-9 arm **0.3457** ·
+/// this (moving average + slew) **0.1385**, i.e. back to the untouched engine.
+const LOCK_MAX_SLEW: f64 = 0.02;
 
 /// Half-width of the windowed-sinc used to carry the sub-sample transport residual.
 ///
@@ -577,17 +592,27 @@ fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
         off[i] = best - marks[i];
         prev = best;
     }
-    // Median-smooth the CORRECTION (not the marks): keep the slow phase fix, drop the fast noise.
+    // Low-pass the CORRECTION (not the marks): keep the slow phase fix, drop the fast noise.
+    // ⛔ A moving AVERAGE, not a median — see `LOCK_SMOOTH`. The failure this replaces was audible.
     let mut sm = vec![0.0f64; off.len()];
     let k = LOCK_SMOOTH / 2;
-    let mut buf = [0.0f64; LOCK_SMOOTH];
     for i in 0..off.len() {
-        for (j, slot) in buf.iter_mut().enumerate() {
-            let idx = (i + j).saturating_sub(k).min(off.len() - 1);
-            *slot = off[idx];
+        let mut acc = 0.0;
+        for j in 0..LOCK_SMOOTH {
+            acc += off[(i + j).saturating_sub(k).min(off.len() - 1)];
         }
-        buf.sort_by(f64::total_cmp);
-        sm[i] = buf[LOCK_SMOOTH / 2];
+        sm[i] = acc / LOCK_SMOOTH as f64;
+    }
+    // …and then a hard slew limit, applied in BOTH directions so it is symmetric (a one-way pass
+    // would drag the whole correction toward whichever end it started from).
+    let mut gaps: Vec<f64> = marks.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_by(f64::total_cmp);
+    let lim = LOCK_MAX_SLEW * gaps[gaps.len() / 2];
+    for i in 1..sm.len() {
+        sm[i] = sm[i].clamp(sm[i - 1] - lim, sm[i - 1] + lim);
+    }
+    for i in (0..sm.len().saturating_sub(1)).rev() {
+        sm[i] = sm[i].clamp(sm[i + 1] - lim, sm[i + 1] + lim);
     }
     let mut moved = 0usize;
     let mut last = f64::NEG_INFINITY;
@@ -1540,6 +1565,57 @@ mod tests {
                 "spacing at {i} is {got:.1} against a true period of {want:.1}"
             );
         }
+    }
+
+    #[test]
+    fn the_phase_lock_may_not_jitter_the_spacing_when_the_peak_choice_is_ambiguous() {
+        // ⛔⛔ THE gate this file was missing, and the user paid for that: the first S150 arm was
+        // shipped with every criterion green and it **clicked**. The mechanism, once localised:
+        // real voiced material has a second energy lobe inside each period (formant ringing), the
+        // two are nearly tied (measured runner-up/winner ratio p50 0.72-0.99), so a per-mark argmax
+        // flips between them for a *run* of marks. Consecutive grains then sit at 0.7 T / 1.3 T
+        // instead of T, stop lining up, and each mismatch is a broadband transient.
+        // ⚠ Note what did NOT catch it: mark count (unchanged), `cola_gap` (0.003%), the identity
+        // gate, the depth ruler (it got *better*), the per-note octave gate, and the whole-song f0
+        // gate. The defect lives in the SPACING, so the criterion has to be the spacing.
+        let sr = 44_100u32;
+        let p = f64::from(sr) / 260.0;
+        // Two lobes per period, with gains that cross over every few periods ⇒ the argmax winner
+        // genuinely alternates. This is the fixture the naive version fails on.
+        let (main, truth) = pulses(sr, 0.5, |_| 260.0, |_| 1.0);
+        let (second, _) = pulses(sr, 0.5, |_| 260.0, |i| 0.92 + 0.16 * ((i as f64) / 3.0).sin());
+        let shift = (0.30 * p) as usize;
+        let mut x = main.clone();
+        for i in shift..x.len() {
+            x[i] += second[i - shift];
+        }
+
+        let mut marks: Vec<f64> = truth.iter().map(|t| t + 0.12 * p).collect();
+        let jitter = |m: &[f64]| -> f64 {
+            let d: Vec<f64> = m.windows(2).map(|w| w[1] - w[0]).collect();
+            let mut s = d.clone();
+            s.sort_by(f64::total_cmp);
+            let med = s[s.len() / 2];
+            let mut r: Vec<f64> = d.iter().map(|v| (v / med - 1.0).abs()).collect();
+            r.sort_by(f64::total_cmp);
+            r[(r.len() as f64 * 0.99) as usize % r.len()]
+        };
+        let before = jitter(&marks);
+        lock_phase(&x, &mut marks, 0.45);
+        let after = jitter(&marks);
+        // Calibrated by taking the two defences out, one at a time (fixture jitter p99):
+        //   low-pass + slew (shipping)  0.0095   ← 5× under the bound
+        //   median + slew               0.0200   (the slew alone holds it)
+        //   low-pass, no slew           0.0095   (the low-pass alone holds it)
+        //   **median, no slew**         **0.2931** ← the arm that shipped the clicks, 31× worse
+        // ⇒ the two are redundant on purpose, and this bound sits between the two regimes.
+        // ⚠ On real material the same statistic reads 0.1377 (untouched engine) / 0.3457 (clicky
+        // arm) / 0.1385 (shipping) — the fixture reproduces the magnitude, not just the direction.
+        assert!(
+            after < 0.05,
+            "locking jittered the spacing: p99 of |d/median − 1| went {before:.4} → {after:.4} — \
+             that is what a click sounds like"
+        );
     }
 
     #[test]
