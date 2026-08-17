@@ -316,7 +316,7 @@ fn max_correlation(x: &[f32], t1: f64, period: f64, lo: f64, hi: f64) -> (f64, f
 /// ⛔ Do not derive the modulation rate from `ratio` on paper — I tried, and the arithmetic
 /// matched the −7 arm (~0.68 s) while missing the −5 arm by 3.5×. Dump it and measure.
 #[cfg(test)]
-static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 7]>> = std::sync::Mutex::new(Vec::new());
+static GRAIN_TRACE: std::sync::Mutex<Vec<[f64; 8]>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn grain_trace_on() -> bool {
@@ -761,6 +761,7 @@ pub fn psola_shift_wsola(
                     t_src,                    // 该处的源周期
                     (tm - s_pos) / t_src,     // δ 归一到周期 = 相位误差
                     lw,
+                    rw,                       // ⚠ 重放 OLA 必须要它:窗是 [s−lw, s) ∪ [s, s+rw)
                     k as f64,
                 ]);
             }
@@ -1381,11 +1382,11 @@ mod tests {
         if let Ok(p) = std::env::var("UTAI_PSOLA_GRAIN_DUMP") {
             let rows = GRAIN_TRACE.lock().unwrap();
             assert!(!rows.is_empty(), "grain dump 开着却一行都没有 —— 合成循环没跑到,读数无效");
-            let mut s = String::from("tm\tsrc\tdelta\tt_src\tphase\tlw\tk\n");
+            let mut s = String::from("tm\tsrc\tdelta\tt_src\tphase\tlw\trw\tk\n");
             for r in rows.iter() {
                 s.push_str(&format!(
-                    "{:.3}\t{:.3}\t{:.4}\t{:.4}\t{:.6}\t{:.3}\t{}\n",
-                    r[0], r[1], r[2], r[3], r[4], r[5], r[6] as i64
+                    "{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.6}\t{:.4}\t{:.4}\t{}\n",
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7] as i64
                 ));
             }
             std::fs::write(&p, s).expect("write grain dump");
