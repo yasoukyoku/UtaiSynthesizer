@@ -1050,12 +1050,38 @@ pub fn wsola_frac() -> f64 {
 /// audibility scale for THIS axis has exactly one data point (S148 u1: ~2.7 dB heard, ≤0.46 dB
 /// not, from a single load-bearing group, p = 0.5). ⇒ blind test first, flip after (S146 protocol).
 pub fn phase_lock() -> f64 {
-    std::env::var("UTAI_PSOLA_LOCK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|v: &f64| *v > 0.0)
-        .unwrap_or(0.0)
+    parse_phase_lock(std::env::var("UTAI_PSOLA_LOCK").ok().as_deref())
 }
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+/// ⚠ Unlike `wsola_frac`, an explicit **0 turns it OFF** — the A/B that promoted this default
+/// needs a way to render the old arm from the same binary, and "the knob only goes on" is how you
+/// end up unable to reproduce the arm a user is complaining about.
+fn parse_phase_lock(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+        .unwrap_or(PHASE_LOCK_DEFAULT)
+}
+
+/// S150 — **ON by default since the blind test passed** (user 2026-08-17: "翻吧").
+///
+/// The protocol this satisfies is S146's, and it is the only thing that may promote a default on
+/// this line: **a blind test that passes, not a ruler**. Three rounds, same listener, same
+/// protocol, and the first two are why this number is 0.30 and not something else:
+/// * **v1** — correct-the-marks-afterwards with a *median* smoother: rejected, "clicks".
+/// * **v2** — same shape with a real low-pass: rejected, "continuous now, but short seams", and
+///   the listener also named the cause (the un-locked engine's scattered phase was *dithering*
+///   the seam). Measured: a coherent 10 Hz sawtooth from the bounded correction.
+/// * **v3** — this arm (a phase-locked loop, β = 0.1): **2/2 load-bearing groups preferred it,
+///   both controls called correctly (one of them bit-identical), and both artifacts gone by ear.**
+///
+/// ⛔ Honest strength: two load-bearing groups is p = 0.25 by coin flip. The weight comes from
+/// four things agreeing — both groups, both controls, a mechanism chain measured end to end, and
+/// instruments that agree the two introduced artifacts are gone. ⚠ One prediction did NOT land:
+/// the group the depth ruler expected to differ most (Q3) came back "no obvious difference" ⇒
+/// **a bigger depth delta does not imply audibility**; do not use depth as a linear proxy.
+/// ⚠ Still only measured on ONE model (akiko) and one song; yachiyo remains untested (S148 §7③).
+const PHASE_LOCK_DEFAULT: f64 = 0.30;
 
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
@@ -1691,6 +1717,27 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn the_phase_lock_is_on_by_default_and_an_explicit_zero_still_turns_it_off() {
+        // ⛔ The gate for the FLIP itself (S150, user 2026-08-17). Without it, "we turned it on"
+        // and "we forgot to turn it on" look identical from every other test in this repo — the
+        // library entry points still default to 0.0 on purpose, so nothing else here can see it.
+        assert!(
+            parse_phase_lock(None) > 0.0,
+            "production must run WITH the phase lock now that the blind test passed"
+        );
+        assert_eq!(parse_phase_lock(None), PHASE_LOCK_DEFAULT);
+        // …and the old arm must stay renderable from the same binary, or a user complaint about
+        // it cannot be reproduced.
+        assert_eq!(parse_phase_lock(Some("0")), 0.0);
+        assert_eq!(parse_phase_lock(Some("0.45")), 0.45);
+        // Garbage must fall back to the default rather than silently disabling the arm.
+        assert_eq!(parse_phase_lock(Some("")), PHASE_LOCK_DEFAULT);
+        assert_eq!(parse_phase_lock(Some("nonsense")), PHASE_LOCK_DEFAULT);
+        assert_eq!(parse_phase_lock(Some("-1")), PHASE_LOCK_DEFAULT);
+        assert_eq!(parse_phase_lock(Some("NaN")), PHASE_LOCK_DEFAULT);
+    }
     fn inverse_probe_tone(sr: u32, secs: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;
         (0..n)

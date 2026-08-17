@@ -634,7 +634,7 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  time-stretch (time_factor only — it never reaches apply_inverse), so bumping it would
  *  invalidate unrelated work. The memory rule "three cache versions move together" is imprecise:
  *  only two of the three sit on this path. */
-export const RANGE_ALGO_VERSION = "s146p";
+export const RANGE_ALGO_VERSION = "s150l";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and
