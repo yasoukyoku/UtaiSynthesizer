@@ -1030,11 +1030,19 @@ pub fn wsola_frac() -> f64 {
 /// lower. Feeding praat's marks into our own synthesis reproduced praat's readings to 0.02 dB on
 /// 5 notes × 2 metrics, so mark placement is 100 % of the gap. See `utai_dsp::psola::lock_phase`.
 ///
-/// Measured with the lock at 0.45 (goose donor +7, all 23 non-rest notes ≥0.8 s — "modulation this
-/// process ADDED", median/p90): today **+2.09 / +5.94 dB**, locked **+0.04 / +0.32**, praat's own
-/// marks **+0.02 / +0.35**. Holds at −7 −5 −2 +1 +3 +5 +7 and on the registered 东雪莲 fixture at
-/// +6. The four registered rulers all move toward praat (peak correlation 0.976 → 0.981, ΔHNR
-/// −1.58 → −1.34, voiced survival 87.4 → 89.4 %, >4 kHz unchanged).
+/// Measured with the lock at **0.30** (goose donor +7, all 23 non-rest notes ≥0.8 s — "modulation
+/// this process ADDED", median): today **+2.09 dB**, locked **−0.01**, praat's own marks +0.02.
+/// Holds at −7 −5 −2 +1 +3 +5 +7 and on the registered 东雪莲 fixture at +6. The four registered
+/// rulers all move toward praat (peak correlation 0.976 → 0.981, ΔHNR −1.58 → −1.34, voiced
+/// survival 87.4 → 89.4 %, >4 kHz unchanged).
+///
+/// ⛔⛔ **The value is a loop gain, not a correction — and that took two rejected arms to learn.**
+/// The user's ear killed both of the obvious formulations, each with its own artifact:
+/// *correcting the marks afterwards* clicks (the bounded correction sawtooths across the search
+/// window: coherent 10 Hz modulation peak, 44-74× the median), and *snapping greedily* roughens
+/// (the near-tied peak choice alternates: spacing lag-1 −0.538, transient flux 50.4 vs 20.6).
+/// ⭐ The user also diagnosed *why* the un-locked engine sounded smoother than either: its
+/// scattered phase was **dithering** the seam. See `utai_dsp::psola::LOCK_BETA`.
 ///
 /// ⛔ **Why it is still off by default.** The rulers cannot promote it — that is the whole lesson
 /// of S148: WSOLA read 4.80 % → 0.38 % on the ruler it was built for and was 3/3 rejected by ear
