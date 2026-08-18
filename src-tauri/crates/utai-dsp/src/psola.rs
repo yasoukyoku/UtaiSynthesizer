@@ -105,6 +105,44 @@ pub struct PsolaDiagnostics {
     /// S150 calibrated this engine only over `|shift| ≤ 7`; the user's 2026-08-18 run reached −14.
     /// ⚠ It is a coverage number, not an audibility one — there is no ear datum on this axis yet.
     pub src_uncovered_frac: f32,
+    /// S152 — the share of the OUTPUT's energy that sits below ~50 Hz, **before** any removal.
+    ///
+    /// ⭐ This process **manufactures** it. The donor going in carries 0.001 % there; the output
+    /// carries, per note (goose +7 × akiko, 174 notes with ≥0.3 s of body, median):
+    /// −9 st (ratio 1.68) **10.8 %** · −12 (2.00) **25.5 %** · −14 (2.24) **33.7 %**
+    /// (p90 39.5 / 64.6 / 72.1 %). On the production render the notes that went through a rescue
+    /// group read p50 0.558 % against p50 0.002 % for the ones that did not — a 279× separation.
+    ///
+    /// **Mechanism** — `the_manufactured_baseline_is_the_narrowed_grain_window_s_own_mean`:
+    /// on an up-shift both half-widths collapse to `T_src / ratio` (`:1027-1028` takes the min of
+    /// the target and source spacings), so every grain reads a window **narrower than one period,
+    /// centred on the mark** — and S150's phase lock puts the marks on the energy peaks. The
+    /// bell-weighted mean of a sub-period window centred on a peak is not zero; `wsum ≈ 1` then
+    /// lays that same mean down under every grain. The gate predicts the baseline from that window
+    /// alone and matches the measured value within 3× at +4/+8/+12/+16 st.
+    ///
+    /// ⛔ **A wrong mechanism was written here first and the gate killed it on its first run.**
+    /// The claim was "it needs an ASYMMETRIC waveform (a glottal pulse); a symmetric source
+    /// produces none" — measured: a plain sine at +4 st injects **more** than the asymmetric pulse
+    /// train (0.195 vs 0.104 by |mean|/RMS). Symmetry is not the variable; *being centred on a
+    /// peak with a sub-period window* is the whole of it. ⚠ Keep this paragraph: this file has
+    /// history with confidently-worded wrong comments (one of them kept TD-PSOLA out for four
+    /// months).
+    ///
+    /// ⚠⚠ **Two collars that must travel with this number, or it reads as an emergency:**
+    /// 1. **It is inaudible.** 97 % of it is below 5 Hz; 20-50 Hz holds ≤0.26 %.
+    /// 2. **It does not eat headroom.** Removing everything under 50 Hz moves the whole-song peak
+    ///    by **−0.008 dB** (a locally-measured note peak moves ~0.34 dB).
+    ///
+    /// ⭐ What it *does* cost: it is inside every RMS-domain ruler we own, so S150/S151's `rms` /
+    /// `depth` / `ripple` readings on rescued notes carry up to a third of their energy in
+    /// infrasound; and it is the shape behind the user's "波形甚是诡异" (registry `user_coordinates`
+    /// points at `[685]`, the note whose waveform rides a wandering baseline).
+    pub infrasonic_frac: f32,
+    /// S152 — how much of that the removal arm actually took out (`before − after`), 0.0 when off.
+    /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
+    /// something" are different facts and only the second one is visible in the audio.
+    pub infrasonic_removed: f32,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -748,6 +786,46 @@ fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize,
 /// twice** (worst |Δ| 1.47, SVC is not bit-reproducible). Predicting "inaudible" from that alone
 /// would have been fair; the blind test is what makes it a fact.
 #[allow(clippy::too_many_arguments)]
+/// S152 — half-width of the moving average used to isolate the infrasonic baseline, in ms.
+/// Two passes of a box of this length = a triangular window, whose first null sits at
+/// `1000 / INFRASONIC_MA_MS` Hz and whose stop-band then falls as 1/f².
+///
+/// ⛔ 20 ms is **measured, not chosen**: on a real production output (goose +7 × akiko, −14 st,
+/// the worst ratio on the score) the resulting high-pass reads
+/// 0-5 Hz **−41.3 dB** · 5-20 −19.3 · 20-50 −2.9 · 50-100 **−0.20** · 100-200 **−0.08** ·
+/// ≥200 Hz **−0.01 dB**. That is the whole point of the two-pass form: a single box leaves
+/// −13 dB side-lobes that would put ±0.4 dB of ripple on the fundamental, and the fundamental of
+/// a donor is 150-500 Hz — the one band this must not touch.
+const INFRASONIC_MA_MS: f64 = 20.0;
+
+/// Box filter with a running prefix sum; the window shrinks at the two ends rather than
+/// zero-padding (zero-padding would manufacture a step exactly where the buffer starts).
+fn box_average(x: &[f64], half: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut pre = Vec::with_capacity(n + 1);
+    let mut s = 0.0f64;
+    pre.push(0.0);
+    for v in x {
+        s += *v;
+        pre.push(s);
+    }
+    (0..n)
+        .map(|i| {
+            let a = i.saturating_sub(half);
+            let b = (i + half + 1).min(n);
+            (pre[b] - pre[a]) / (b - a) as f64
+        })
+        .collect()
+}
+
+/// The infrasonic baseline of `x` — two box passes = a triangular low-pass. See
+/// [`INFRASONIC_MA_MS`] for the measured response.
+fn infrasonic_baseline(x: &[f32], sample_rate: u32) -> Vec<f64> {
+    let half = (((f64::from(sample_rate) * INFRASONIC_MA_MS / 1000.0) as usize) / 2).max(1);
+    let v: Vec<f64> = x.iter().map(|s| f64::from(*s)).collect();
+    box_average(&box_average(&v, half), half)
+}
+
 fn add_bell(
     x: &[f32],
     acc: &mut [f64],
@@ -983,6 +1061,57 @@ pub fn psola_shift_locked(
     wsola_frac: f64,
     phase_lock: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_infra(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, false,
+    )
+}
+
+/// S152 — additive: optionally **subtract the infrasonic baseline this process manufactures**.
+///
+/// `remove_infrasonic = false` is byte-for-byte the pre-S152 arm and is what production runs
+/// until a blind test settles it (S146 protocol; S148's WSOLA is why that protocol is not
+/// negotiable — it read 4.80 % → 0.38 % on its own ruler and was 3/3 rejected by ear).
+///
+/// ## What it is for
+///
+/// See [`PsolaDiagnostics::infrasonic_frac`] for the measurement and the mechanism. Short form:
+/// an up-shift narrows every grain's read window to less than one period while keeping it centred
+/// on a (phase-locked, i.e. peak-aligned) mark, that window's own mean is not zero, and
+/// `wsum ≈ 1` lays it down as a wandering baseline — up to a third of a rescued note's energy at
+/// −14 st. ⚠ It is NOT a property of asymmetric waveforms; a sine does it too (see the gate).
+///
+/// ## ⚠ What this is NOT
+///
+/// It is **not** an audibility fix: 97 % of the injected energy is below 5 Hz and removing all of
+/// it moves the whole-song peak by −0.008 dB. Its two real payoffs are that every RMS-domain
+/// ruler we own stops carrying it, and that the output stops riding a wandering baseline (which
+/// is the shape the user named "波形甚是诡异" on `[685]`).
+///
+/// ## Contract
+///
+/// * The removal is a **linear, zero-phase, band-limited** subtraction — see
+///   [`INFRASONIC_MA_MS`] for the measured response (≥100 Hz moves by ≤0.08 dB).
+/// * It runs on the whole buffer, covered and pass-through alike, so it cannot manufacture a
+///   discontinuity at the covered/uncovered boundary.
+/// * ⛔ It is **not** bit-exact at ratio 1.0 — a linear filter never is. That is exactly why it
+///   is off by default: `ratio_one_is_the_identity` is the cheapest non-self-certifying gate on
+///   this whole line (it killed three designs in S146 that "looked right"), and it must keep
+///   asserting `assert_eq!` on the production arm. The honest gate for the arm being ON is
+///   `the_infrasonic_arm_leaves_everything_above_the_fundamental_alone`.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_infra(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    remove_infrasonic: bool,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -1138,6 +1267,35 @@ pub fn psola_shift_locked(
             // overlapping bells, and overlapping bells mean covered). Feeding the raw sum instead
             // is bit-identical on real input — so do not expect a test to catch that swap.
             out[i] = (acc[i] + (1.0 - w) * f64::from(x[i])) as f32;
+        }
+    }
+    // S152 —— **读数无条件算,修法才由旋钮控**。这样今天的生产日志里就能看见它,而输出逐位不变。
+    // ⛔ 这一条是从 S147 那次「收益静默减半」学来的:一个只在改动打开时才存在的读数,
+    // 没法用来判断「改动之前是什么样」。
+    {
+        /// 输出里 <~50 Hz 的能量占比。
+        fn infra_frac(y: &[f32], sample_rate: u32) -> f64 {
+            let lf = infrasonic_baseline(y, sample_rate);
+            let (mut e_lf, mut e_all) = (0.0f64, 0.0f64);
+            for (o, l) in y.iter().zip(lf.iter()) {
+                e_all += f64::from(*o) * f64::from(*o);
+                e_lf += l * l;
+            }
+            if e_all > 0.0 {
+                e_lf / e_all
+            } else {
+                0.0
+            }
+        }
+        let before = infra_frac(&out, sample_rate);
+        diag.infrasonic_frac = before as f32;
+        if remove_infrasonic {
+            let lf = infrasonic_baseline(&out, sample_rate);
+            for (o, l) in out.iter_mut().zip(lf.iter()) {
+                *o = (f64::from(*o) - *l) as f32;
+            }
+            // 报「真的拿掉了多少」而不是「开着」—— 与 `wsola_moved` / `marks_locked` 同一条规矩。
+            diag.infrasonic_removed = (before - infra_frac(&out, sample_rate)) as f32;
         }
     }
     diag.transport_residual_rms = residual.rms();
@@ -1420,6 +1578,214 @@ mod tests {
         }
     }
 
+
+    /// |mean| / RMS — an **independent** proxy for the manufactured baseline.
+    /// ⛔ Deliberately not `infrasonic_baseline`: measuring a filter with itself is the shape of a
+    /// criterion that cannot fail. On a stationary fixture the injection is essentially pure DC,
+    /// so the plain mean reads it exactly and owes nothing to the implementation.
+    /// ⚠ An earlier version of this helper used the RMS of 20 ms block means and had a **24 %
+    /// floor** on a 220 Hz fixture (a block holds a non-integer number of periods), i.e. it could
+    /// not have failed for the right reason. Kept as a note because that floor looked like a
+    /// finding for about a minute.
+    fn baseline_rms(x: &[f32], _sr: u32) -> f64 {
+        (x.iter().map(|v| f64::from(*v)).sum::<f64>() / x.len().max(1) as f64).abs()
+    }
+
+    /// A glottal-pulse-like **asymmetric** source whose every period integrates to exactly zero:
+    /// an instantaneous jump followed by an exponential decay, minus that period's own mean.
+    /// ⇒ any baseline in the OUTPUT was manufactured by the process, not carried in.
+    fn asym_pulses(sr: u32, secs: f64, period: usize) -> Vec<f32> {
+        let p = period.max(8);
+        // ⛔ Whole periods only. 44100 samples of a 200-sample period is 220.5 of them, and that
+        // half period puts a mean of 0.0014 into the FIXTURE — which is exactly the quantity the
+        // test is about, so it has to be zero by construction, not by luck.
+        let n = ((f64::from(sr) * secs) as usize / p) * p;
+        let mut cycle: Vec<f64> =
+            (0..p).map(|i| (-(i as f64) / (p as f64 * 0.15)).exp()).collect();
+        let m = cycle.iter().sum::<f64>() / p as f64;
+        for v in cycle.iter_mut() {
+            *v -= m;
+        }
+        (0..n).map(|i| cycle[i % p] as f32).collect()
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        (x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / x.len().max(1) as f64).sqrt()
+    }
+
+    /// Magnitude of a single frequency (a Goertzel-style projection), normalised by length.
+    fn tone_mag(x: &[f32], sr: u32, f: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * f / f64::from(sr);
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, v) in x.iter().enumerate() {
+            let p = w * i as f64;
+            re += f64::from(*v) * p.cos();
+            im += f64::from(*v) * p.sin();
+        }
+        (re * re + im * im).sqrt() / x.len() as f64
+    }
+
+    /// A pure sine — the SYMMETRIC control. Every period integrates to zero and so does every
+    /// window centred anywhere in it, so this source must NOT produce the baseline.
+    fn sine(sr: u32, secs: f64, f0: f64) -> Vec<f32> {
+        let n = (f64::from(sr) * secs) as usize;
+        (0..n)
+            .map(|i| {
+                (2.0 * std::f64::consts::PI * f0 * i as f64 / f64::from(sr)).sin() as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_infrasonic_arm_is_opt_in_and_the_default_arm_is_byte_for_byte_unchanged() {
+        // S146 protocol, same as `frac_transport` / `wsola` / `phase_lock` before it: nothing the
+        // user hears moves until a blind test says so. ⚠ Both directions — a criterion that only
+        // covers the up-shift is how a −12 st arm once returned its input bit-for-bit while four
+        // rulers read "perfect" (S146).
+        let sr = 44_100;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-12.0, -7.0, -1.0, 1.0, 7.0, 12.0, 14.0] {
+            let (legacy, dl) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (via_deep, dd) =
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+            assert_eq!(legacy, via_deep, "{st} st: the 9-arg entry must stay the legacy arm");
+            assert_eq!(dl, dd, "{st} st: …diagnostics included");
+            // ⛔ And the readout must EXIST on the arm that is off — otherwise "what does it look
+            // like today" is unanswerable without shipping the change (S147's silent-halving).
+            assert!(
+                dl.infrasonic_frac.is_finite(),
+                "{st} st: the readout must be computed unconditionally"
+            );
+            assert_eq!(dl.infrasonic_removed, 0.0, "{st} st: nothing removed while off");
+
+            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, true);
+            assert_ne!(on, legacy, "{st} st: …and the opt-in arm must actually differ");
+            assert!(
+                don.infrasonic_removed > 0.0,
+                "{st} st: the arm reports it removed nothing — 'on' and 'did something' are \
+                 different facts (removed {})",
+                don.infrasonic_removed
+            );
+        }
+    }
+
+    #[test]
+    fn the_manufactured_baseline_is_the_narrowed_grain_window_s_own_mean() {
+        // ⭐ The mechanism, on synthetic material where the answer is computable in closed form.
+        //
+        // ⛔ This test started life asserting something ELSE — "it needs an asymmetric pulse, a
+        // symmetric source produces none" — and killed it on the first run: a plain sine at the
+        // same ratio injects **more** (0.195 vs 0.104). Asymmetry is not the variable. What is:
+        // on an up-shift both half-widths collapse to `T_src / ratio` (`:1027-1028` takes the
+        // min of target and source spacing), so every grain reads a window **narrower than one
+        // period, centred on the mark** — and the marks are phase-locked onto the energy peaks.
+        // The bell-weighted mean of a sub-period window centred on a peak is not zero, `wsum ≈ 1`
+        // lays that same mean down under every grain, and the result is a baseline. Symmetric or
+        // not is irrelevant; being centred on a peak is the whole of it.
+        let sr = 44_100;
+        let period = 200usize; // 220.5 Hz — an integer period so "zero mean per period" is exact
+        let f0 = f64::from(sr) / period as f64;
+        let hop = sr as usize / 200;
+        let asym = asym_pulses(sr, 1.0, period);
+        let sym: Vec<f32> = sine(sr, 1.0, f0)[..asym.len()].to_vec();
+        let f0t = flat_f0(asym.len(), hop, f0 as f32);
+
+        // Ratio 1.0 is the identity ⇒ the window IS a whole period ⇒ nothing added.
+        let (id, _) = psola_shift_locked(&asym, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30);
+        assert_eq!(id, asym, "ratio 1.0 must still be the identity");
+        let src_ratio = baseline_rms(&asym, sr) / rms(&asym);
+        assert!(
+            src_ratio < 1e-5,
+            "the fixture itself carries a baseline ({src_ratio:.7}) — then nothing below can be              attributed to the process"
+        );
+
+        for (name, x, peak) in [("asym", &asym, 0usize), ("sine", &sym, period / 4)] {
+            let mut last = 0.0f64;
+            for st in [4.0f64, 8.0, 12.0, 16.0] {
+                let (out, diag) = psola_shift_locked(x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+                let got = baseline_rms(&out, sr) / rms(&out);
+                assert!(
+                    got > last,
+                    "{name} +{st} st: the injection must grow with the ratio ({last:.5} → {got:.5})"
+                );
+                last = got;
+                assert!(
+                    diag.infrasonic_frac > 0.001,
+                    "{name} +{st} st: the readout should see it (read {})",
+                    diag.infrasonic_frac
+                );
+
+                // ⭐ THE mechanism gate: predict the baseline from the narrowed window alone.
+                // Half-width `T_src / ratio`, Hann rise on the left of the mark and Hann fall on
+                // the right — exactly `add_bell`'s window — over the source centred on the peak.
+                let half = period as f64 / 2f64.powf(st / 12.0);
+                let h = half.round() as isize;
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for j in -h..h {
+                    let len = half;
+                    let ph = ((if j < 0 { j + h } else { j } as f64) + 0.5) / len
+                        * std::f64::consts::PI;
+                    let w = if j < 0 { 0.5 * (1.0 - ph.cos()) } else { 0.5 * (1.0 + ph.cos()) };
+                    let idx = (peak as isize + j).rem_euclid(period as isize) as usize;
+                    num += f64::from(x[idx]) * w;
+                    den += w;
+                }
+                let want = (num / den).abs() / rms(x);
+                assert!(
+                    (got / want.max(1e-9)).max(want.max(1e-9) / got) < 3.0,
+                    "{name} +{st} st: measured baseline {got:.5} vs the grain window's own mean                      {want:.5} — off by more than 3× means the cause is NOT the narrowed window                      and the note on `infrasonic_frac` is wrong"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental() {
+        // The honest gate for the arm being ON. It cannot be `assert_eq!` at ratio 1.0 — a linear
+        // filter is never bit-exact — so the contract it must meet instead is stated as a bound
+        // on where it is allowed to act: **below the fundamental and nowhere else.**
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-12.0f64, -7.0, 7.0, 12.0, 14.0] {
+            let (off, doff) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, true);
+
+            let b_off = baseline_rms(&off, sr) / rms(&off);
+            let b_on = baseline_rms(&on, sr) / rms(&on);
+            assert!(
+                b_on < b_off * 0.25,
+                "{st} st: the baseline should be mostly gone ({b_off:.5} → {b_on:.5})"
+            );
+            assert!(
+                don.infrasonic_frac <= doff.infrasonic_frac + 1e-6,
+                "{st} st: the BEFORE readout must not depend on the arm"
+            );
+
+            // ⛔ THE bound that makes this safe: the fundamental and its first harmonics are the
+            // one band a low-cut must not reach, and a donor's f0 is 150-500 Hz — close enough to
+            // 50 Hz that "obviously fine" is not an argument.
+            let out_f0 = f0 * 2f64.powf(st / 12.0);
+            for h in [1.0f64, 2.0, 3.0] {
+                let f = out_f0 * h;
+                if f >= f64::from(sr) / 2.0 {
+                    continue;
+                }
+                let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
+                let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+                assert!(
+                    d.abs() < 0.15,
+                    "{st} st: harmonic {h} at {f:.0} Hz moved {d:+.3} dB — the removal is \
+                     supposed to be band-limited well below it"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_interpolator_reproduces_a_known_signal_between_samples() {

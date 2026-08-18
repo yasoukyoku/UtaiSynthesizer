@@ -1488,6 +1488,33 @@ fn parse_phase_lock(v: Option<&str>) -> f64 {
 /// ⚠ Still only measured on ONE model (akiko) and one song; yachiyo remains untested (S148 §7③).
 const PHASE_LOCK_DEFAULT: f64 = 0.30;
 
+/// S152 — `UTAI_PSOLA_HP=1` subtracts the infrasonic baseline TD-PSOLA manufactures on an
+/// up-shift. **Off by default** ⇒ production is byte-for-byte unchanged.
+///
+/// See `utai_dsp::psola::PsolaDiagnostics::infrasonic_frac` for the measurement and the mechanism.
+/// ⛔ Why it is not simply on: it is **inaudible** (97 % of the injected energy is below 5 Hz;
+/// the whole-song peak moves −0.008 dB), so there is nothing for an ear to promote it *with* —
+/// and this line's rule is that only a blind test may flip a default. What it does buy is that
+/// our own RMS-domain rulers stop carrying up to a third of a rescued note's energy as
+/// infrasound, and that the waveform stops riding a wandering baseline. ⇒ the case for flipping
+/// it is a **correctness** case, and it has to be argued as one, not smuggled in as a quality fix.
+pub fn infrasonic_hp() -> bool {
+    parse_infrasonic_hp(std::env::var("UTAI_PSOLA_HP").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_infrasonic_hp(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(s.trim(), "1" | "true" | "on" | "yes"),
+        None => INFRASONIC_HP_DEFAULT,
+    }
+}
+
+/// ⛔ Flipping this to `true` changes the audio ⇒ it must bump `RANGE_ALGO_VERSION` **and**
+/// `audition_cache_tag` in the same commit (S150: missing one of the pair makes the user hear a
+/// stale cache and read it as "the change did nothing").
+const INFRASONIC_HP_DEFAULT: bool = false;
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -1600,7 +1627,8 @@ pub fn apply_inverse_with(
             let frac = frac_transport();
             let wsola = wsola_frac();
             let lock = phase_lock();
-            let (out, diag) = utai_dsp::psola::psola_shift_locked(
+            let hp = infrasonic_hp();
+            let (out, diag) = utai_dsp::psola::psola_shift_infra(
                 &audio,
                 sample_rate,
                 semis,
@@ -1610,6 +1638,7 @@ pub fn apply_inverse_with(
                 frac,
                 wsola,
                 lock,
+                hp,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -1631,7 +1660,7 @@ pub fn apply_inverse_with(
             tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
                  {} marks, cola gap {:.2}% (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
-                 src uncovered {:.2}%, transport residual {:.4}{}",
+                 src uncovered {:.2}%, infrasonic {:.2}%{}, transport residual {:.4}{}",
                 diag.islands,
                 diag.marks,
                 diag.cola_gap_frac * 100.0,
@@ -1640,6 +1669,14 @@ pub fn apply_inverse_with(
                 diag.cola_w_p99,
                 diag.cola_over_frac * 100.0,
                 diag.src_uncovered_frac * 100.0,
+                // S152 —— 这一项**无条件**算,所以「今天是什么样」在生产日志里就能读到,
+                // 不必等改动打开。打开时再补一句「真的拿掉了多少」。
+                diag.infrasonic_frac * 100.0,
+                if hp {
+                    format!(" (hp on — removed {:.2} pts)", diag.infrasonic_removed * 100.0)
+                } else {
+                    String::new()
+                },
                 diag.transport_residual_rms,
                 // ⛔ 打出**真的移了几个颗粒**,不只是「开着」:一个从不移动的搜索会产出逐位
                 // 相同的音频,与关掉不可分辨(S147 那次「收益静默减半」的同族)。
@@ -2503,6 +2540,24 @@ mod tests {
         assert_eq!(parse_phase_lock(Some("nonsense")), PHASE_LOCK_DEFAULT);
         assert_eq!(parse_phase_lock(Some("-1")), PHASE_LOCK_DEFAULT);
         assert_eq!(parse_phase_lock(Some("NaN")), PHASE_LOCK_DEFAULT);
+    }
+
+    #[test]
+    fn the_infrasonic_removal_is_off_by_default_and_only_an_explicit_yes_turns_it_on() {
+        // ⛔ 与 `parse_phase_lock` 同一条规矩:**默认值本身要有判据**。没有它,「我们还没翻」与
+        // 「我们忘了翻」在别的每一条测试上长得一模一样(库入口本来就默认 false)。
+        assert!(
+            !parse_infrasonic_hp(None),
+            "生产必须仍然是关的 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+        );
+        assert_eq!(parse_infrasonic_hp(None), INFRASONIC_HP_DEFAULT);
+        for on in ["1", "true", "on", "yes", " 1 "] {
+            assert!(parse_infrasonic_hp(Some(on)), "{on:?} 应当打开");
+        }
+        // 垃圾一律退回默认,不许静默打开(那是「用户以为没开却开着」的形状)。
+        for off in ["", "0", "false", "off", "no", "nonsense", "2"] {
+            assert_eq!(parse_infrasonic_hp(Some(off)), INFRASONIC_HP_DEFAULT, "{off:?}");
+        }
     }
     fn inverse_probe_tone(sr: u32, secs: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;
