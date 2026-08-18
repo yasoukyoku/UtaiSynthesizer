@@ -2226,14 +2226,14 @@ mod tests {
     /// two phrases into one scan window — and the rescue shift then drags the healthy か down with it.
     #[test]
     fn a_written_rest_delimits_phrases_like_a_gap() {
-        use crate::inference::vocal_range::{dead_only_plan_with, SpeakerRange};
+        use crate::inference::vocal_range::{dead_only_plan_with, RescueTuning, SpeakerRange};
         let range = SpeakerRange::bounds((48.0, 79.0), (55.0, 74.0));
         let score = [note("か", 60), note("R", 71), note("き", 85)];
 
         let nn = plan_note_nums(&score, crate::inference::g2p_alias::PhonemeSet::Words);
         // ⛔ 显式 `None` = 卸乘客关掉的那条臂:这条判据问的是「静音记号会不会把两句焊成一句」,
         // 它不许随另一个旋钮的默认值一起翻(S150 血训:测试读进程环境 = 静默通过)。
-        let (plan, unfixable) = dead_only_plan_with(&nn, &[50; 3], 0, &range, None);
+        let (plan, unfixable) = dead_only_plan_with(&nn, &[50; 3], 0, &range, RescueTuning::today());
         assert!(unfixable.is_empty(), "the dead phrase has a landing — nothing should be unfixable");
         assert_eq!(plan.len(), 1, "one dead phrase ⇒ one group");
         assert_eq!(
@@ -2244,7 +2244,7 @@ mod tests {
 
         // The pre-fix input, for contrast: the same score with the drawn pitch left in place.
         let raw: Vec<i64> = score.iter().map(|n| n.note_num).collect();
-        let (welded, _) = dead_only_plan_with(&raw, &[50; 3], 0, &range, None);
+        let (welded, _) = dead_only_plan_with(&raw, &[50; 3], 0, &range, RescueTuning::today());
         assert_ne!(plan, welded, "reading a silence's drawn pitch changes the range decision");
         assert!(
             welded.first().is_none_or(|g| g.start == 0),

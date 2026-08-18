@@ -107,6 +107,18 @@ pub struct SpeakerRange {
     /// plan. `None` = no raw scan — dead_only_plan then falls back to usable/comfort bounds.
     /// Fixed array keeps the struct `Copy` (same reasoning as `damage`).
     pub slot_flags: Option<[u8; DAMAGE_SLOTS]>,
+    /// S151: the scan's RAW `low_ratio` per slot (×255), i.e. how much of the note's energy sits
+    /// below 1.5·f0 — "sings the note, has no voice left".
+    ///
+    /// ⛔ Why it cannot be read off `damage`: `damage_from_scan` gives `low_ratio` a **free zone
+    /// below 0.55**, so on akiko the six slots 73..78 (0.100 / 0.121 / 0.181 / 0.211 / 0.276 /
+    /// 0.388) are all exactly 0 damage — the landing rule is structurally blind to a 4× spread in
+    /// the one axis that has ever agreed with the user's ear. Measured on the user's own two
+    /// renders: notes the model was actually asked to sing at **77-78** develop an in-note
+    /// envelope wobble **30 %** of the time against **7 %** at ≤76 (Fisher p = 0.0026), and inside
+    /// one fixed shift the vowel collapses −2.74 dB at landings > 73 against −0.95 at ≤73
+    /// (p = 4.2e-10). See [`landing_extra_depth`].
+    pub thin: Option<[u8; DAMAGE_SLOTS]>,
 }
 
 /// Level (dB below the probe scale's own loudest note) at which `damage_from_scan` starts
@@ -123,7 +135,7 @@ const RMS_FREE_DB: f64 = -6.0;
 impl SpeakerRange {
     /// Bounds-only record (no raw scan) — the pre-S81 shape.
     pub fn bounds(usable: (f32, f32), comfort: (f32, f32)) -> Self {
-        Self { usable, comfort, reach: usable, damage: None, slot_flags: None }
+        Self { usable, comfort, reach: usable, damage: None, slot_flags: None, thin: None }
     }
 
     /// S85 dead-only: can the model produce a pitch AT ALL at this (integer) MIDI slot?
@@ -195,6 +207,18 @@ impl SpeakerRange {
     /// all); only the latter can be load-bearing. See `minimal_rescue_shift`'s two passes.
     fn slot_landing_preferred(&self, midi: i64) -> bool {
         self.slot_landing_ok(midi) && (self.comfort.0..=self.comfort.1).contains(&(midi as f32))
+    }
+
+    /// S151: the scan's raw `low_ratio` at an integer slot. `None` = no scan, or off the scanned
+    /// window — and OUTSIDE the window it must read as the WORST possible value, never as "fine"
+    /// (the same rule `damage_at` already follows).
+    fn thinness(&self, midi: i64) -> Option<f32> {
+        let t = self.thin.as_ref()?;
+        let slot = midi - DAMAGE_LO_MIDI as i64;
+        Some(match (0..DAMAGE_SLOTS as i64).contains(&slot) {
+            true => t[slot as usize] as f32 / 255.0,
+            false => 1.0,
+        })
     }
 
     /// Damage at a (possibly fractional) MIDI pitch, linearly interpolated between slots.
@@ -302,6 +326,7 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
     // ⇒ every consumer falls back to the pre-S81 ladder (old records keep working untouched).
     // S85: the same pass derives per-slot f0-axes flags for the score dead-only plan.
     let mut flags = [0u8; DAMAGE_SLOTS]; // untested slot = no flags = dead & unlandable
+    let mut thin = [255u8; DAMAGE_SLOTS]; // untested slot = maximally thin, never "fine"
     let damage = sp.get("semitones").and_then(|m| m.as_object()).and_then(|m| {
         let mut d = [255u8; DAMAGE_SLOTS]; // untested slot = fully damaged, never "fine"
         let mut seen = 0usize;
@@ -327,6 +352,9 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
             d[slot as usize] = (damage_from_scan(err, voiced, timbre) / DAMAGE_MAX * 255.0)
                 .round()
                 .clamp(0.0, 255.0) as u8;
+            if let Some((_, low_ratio)) = timbre {
+                thin[slot as usize] = (low_ratio * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
             flags[slot as usize] = (if err < 100.0 && voiced > 0.5 { SLOT_SINGABLE } else { 0 })
                 | (if err <= 50.0 && voiced >= 0.9 { SLOT_LANDING } else { 0 });
             seen += 1;
@@ -387,7 +415,7 @@ pub fn speaker_range(config: &ModelConfig, speaker_id: u32) -> Option<SpeakerRan
         }
     }
     let slot_flags = damage.is_some().then_some(flags);
-    Some(SpeakerRange { usable, comfort, reach, damage, slot_flags })
+    Some(SpeakerRange { usable, comfort, reach, damage, slot_flags, thin: damage.map(|_| thin) })
 }
 
 /// 一个区间在参照系里站不站得住 —— **读侧愈合与写侧闸共用的唯一判据**。
@@ -488,7 +516,40 @@ pub fn dead_only_plan(
     transpose: i64,
     range: &SpeakerRange,
 ) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
-    dead_only_plan_with(note_nums, frames, transpose, range, trim_freed_ms())
+    dead_only_plan_with(note_nums, frames, transpose, range, RescueTuning::from_env())
+}
+
+/// The two S151 knobs, passed by value so **no test ever reaches the process environment**
+/// (a test that does changes answer depending on what the machine has exported, and it fails in
+/// the direction that hurts — it passes SILENTLY; S150 paid for that on the phase lock).
+/// [`RescueTuning::today`] is by definition the shipped behaviour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RescueTuning {
+    /// `(head_ms, tail_ms)` a cut must free before it is worth its seam; `None` = no trimming.
+    pub trim: Option<(f32, f32)>,
+    /// `None` = today's landing rule verbatim. `Some(n)` = the S151 arm: the depth budget widens
+    /// to `shallowest + n` **and** the ranking gains a `low_ratio` tier.
+    /// ⛔ 两件事必须由**同一个开关**控制:只放宽预算而不换排序,等于让「最浅优先」把死音停得更
+    /// 靠上;只换排序而不放宽预算,在 akiko 上也已经会改今天的落点(78 → 77)。
+    pub landing: Option<i64>,
+}
+
+impl RescueTuning {
+    /// Exactly what ships today.
+    pub fn today() -> Self {
+        Self { trim: TRIM_DEFAULT, landing: None }
+    }
+
+    pub fn new(trim: Option<(f32, f32)>, landing: Option<i64>) -> Self {
+        Self { trim, landing }
+    }
+
+    pub fn from_env() -> Self {
+        Self {
+            trim: parse_trim(std::env::var("UTAI_RANGE_TRIM").ok().as_deref()),
+            landing: parse_landing(std::env::var("UTAI_RANGE_LANDING").ok().as_deref()),
+        }
+    }
 }
 
 /// [`dead_only_plan`] with the passenger-trim thresholds passed in instead of read from the
@@ -503,8 +564,9 @@ pub fn dead_only_plan_with(
     frames: &[i64],
     transpose: i64,
     range: &SpeakerRange,
-    trim: Option<(f32, f32)>,
+    tune: RescueTuning,
 ) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
+    let trim = tune.trim;
     let eff = |n: i64| (n + transpose).clamp(1, 127); // mirror transpose_note_pitch's clamp
     let ms = |from: usize, to: usize| -> f32 {
         let f: i64 = (from..to).map(|k| frames.get(k).copied().unwrap_or(0).max(0)).sum();
@@ -541,7 +603,7 @@ pub fn dead_only_plan_with(
             // this knife: it changes which notes get sung differently, so it needs its own
             // decision and its own blind test. Bundling it would make any A/B unattributable.
             // Pinned by `trimming_may_not_turn_an_unfixable_phrase_into_a_rescue`.
-            let Some(whole_shift) = minimal_rescue_shift(&dead, &whole, range) else {
+            let Some(whole_shift) = minimal_rescue_shift(&dead, &whole, range, tune.landing) else {
                 unfixable.push((i, j));
                 i = j + 1;
                 continue;
@@ -573,7 +635,7 @@ pub fn dead_only_plan_with(
                 // × 炉心融解 (and its +7 stress case): this moves **no** group. Audited rather
                 // than assumed, because a moved landing is a change nobody has heard.
                 let kept: Vec<i64> = (a..=b).map(|k| eff(note_nums[k])).collect();
-                let s = minimal_rescue_shift(&dead, &kept, range).unwrap_or(whole_shift);
+                let s = minimal_rescue_shift(&dead, &kept, range, tune.landing).unwrap_or(whole_shift);
                 if s != whole_shift {
                     tracing::info!(
                         "range: notes[{a}..={b}] landing moved {whole_shift:+} → {s:+} st once its \
@@ -624,10 +686,6 @@ pub fn dead_only_plan_with(
 /// ⛔ Deliberately NOT promoted by these numbers: the instrument cannot tell whether a seam is
 /// audible, and this line has been wrong in exactly that way twice (S148 WSOLA, S150 v1/v2).
 /// Blind test first, flip after — the S146 protocol.
-pub fn trim_freed_ms() -> Option<(f32, f32)> {
-    parse_trim(std::env::var("UTAI_RANGE_TRIM").ok().as_deref())
-}
-
 /// The env parse as a pure function, so it can be asserted without touching process state
 /// (reading the real environment in a test both races the other tests and passes SILENTLY on a
 /// machine where someone exported the variable — S150 paid for that lesson on `parse_phase_lock`).
@@ -650,12 +708,61 @@ fn parse_trim(v: Option<&str>) -> Option<(f32, f32)> {
     }
 }
 
+/// S151 —— `UTAI_RANGE_LANDING=<semitones>`:落点排序**可以往深里多看几个半音**。
+/// 缺省 = [`LANDING_MAX_EXTRA_DEPTH`] = 今天那条臂。
+///
+/// 存在的理由在 `minimal_rescue_shift` 里 `LANDING_THIN_EPS` 那段注释(两把独立的尺子同时
+/// 指认「落点音高」是这条线上的主杠杆)。⛔ 它**不是**放开预算:排序仍然先过 damage,
+/// 预算仍然由这个数封顶 —— S148 记着无上限时东雪莲会一路走到 **−24**,那是用户耳判过的灾难。
+/// ⚠ 只接**谱面路**;cover/audition 那一路仍然用常数(它的素材与判据是另一套)。
+fn parse_landing(v: Option<&str>) -> Option<i64> {
+    match v.map(str::trim) {
+        None | Some("") => LANDING_DEFAULT,
+        Some("0") => None, // 显式关得掉 —— 抱怨某条臂时要能用同一个二进制渲旧臂
+        Some(x) => match x.parse::<i64>() {
+            Ok(n) if (1..=MAX_RANGE_SHIFT).contains(&n) => Some(n),
+            _ => LANDING_DEFAULT,
+        },
+    }
+}
+
+/// ⛔ 与 [`TRIM_DEFAULT`] 同理:仪器不许给它翻默认,盲测过了才翻,翻的时候
+/// `RANGE_ALGO_VERSION` ↔ `audition_cache_tag` 必须成对 bump。
+///
+/// **翻的时候用 3**,理由是离线扫的(四份装机记录 × 炉心融解,`TESTING\s151_knives`,
+/// 计划已过实机忠实度闸)——「死音落在 77-78 的比例 / 全曲最深位移」:
+///
+/// | 记录 | 今天 | +2 | **+3** | +4 |
+/// |---|---|---|---|---|
+/// | akiko(用户的模型) | 51 % / −7 | 48 % / −8 | **11 % / −9** | 11 % / −9 |
+/// | akiko 谱面 +7 | 30 % / −14 | 26 % / −15 | **12 % / −16** | 12 % / −16 |
+/// | yachiyo(RVC) | 59 % / −7 | 0 % / −9 | 0 % / −10 | 0 % / −10 |
+/// | 东雪莲 | 40 % / −7 | 40 % / −7 | 40 % / −7 | 4 % / −10 |
+/// | yuyuko(RVC) | 53 % / −7 | 53 % / −7 | 53 % / −7 | 6 % / −10 |
+///
+/// ⚠ 两条要一起读:⑴ **东雪莲在这条轴上救不了** —— 它的落点 `low_ratio` p50 是 **0.865**,
+/// 上面那一片全是薄的,所以这一刀在它身上只会换来更深而换不到更干净;
+/// ⑵ 深度的代价是**真的**(S150:乘客的 4-11 kHz 非谐波 24.0 → 29.2 → 39.2 % @ 0/−3/−7)
+/// ⇒ 这一刀必须和**卸乘客**一起看,不能单独放大预算。
+const LANDING_DEFAULT: Option<i64> = None;
+
 /// ⛔ Off until a blind test says otherwise — flipping this changes what every rescued phrase
 /// sounds like, so it also needs `RANGE_ALGO_VERSION` ↔ `audition_cache_tag` bumped IN PAIR
 /// (S150: missing one of those is not an error, it is the user hearing a stale cache).
 const TRIM_DEFAULT: Option<(f32, f32)> = None;
-/// A head cut puts the fade on an onset — 8× the ripple of a tail cut, so it must buy more.
-const TRIM_HEAD_MS: f32 = 1000.0;
+/// ⛔⛔ **头裁已被盲测判负 —— 这个值是「关」,不是一个门限。**
+///
+/// S151 r1(5 组 × 2 文件,`level_match: none`,两个对照都答对):
+/// * `[685..=693]` **尾裁**,放掉 2.56 s ⇒ 用户选**改动版** ✅
+/// * `[796..=802]` **头裁**,放掉 4.36 s(全曲最大的一刀)⇒ 用户选**今天** ❌
+/// * `[612..=624]` **头裁**,放掉 3.44 s ⇒ 「区别不是很大」⚪
+///
+/// 三组按**裁哪一侧**干净地分开,而这正好压在 S148 独立量到的缝代价上:裁头的缝 Δripple
+/// p50 **0.258** / p90 **1.452** dB,裁尾 **0.033** / **0.407**(同处地板 0.060)—— **8 倍**,
+/// 因为 10 ms 淡入压在**起音**上。⚠ 每侧只有 1 个数据点 ⇒ 这是「机理 + 一个同向数据点」,
+/// 不是判决;要复活头裁,举证责任是**一次通过的盲测**,不是把这个数调小。
+/// (想扫参数仍然可以:`UTAI_RANGE_TRIM=<head_ms>:<tail_ms>`。)
+const TRIM_HEAD_MS: f32 = f32::INFINITY;
 const TRIM_TAIL_MS: f32 = 500.0;
 
 /// THE single landing search for both tracks (score phrases / cover regions): the minimal |s|
@@ -664,7 +771,12 @@ const TRIM_TAIL_MS: f32 = 500.0;
 /// INTERIOR dead (a bridged-weak slot inside usable — a legal record form the write side
 /// produces on purpose, rangeTest.ts longestRun) has no inherent direction and tries both,
 /// down first at each magnitude. Dead on both sides is untranslatable ⇒ None.
-fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Option<i64> {
+fn minimal_rescue_shift(
+    dead: &[i64],
+    all: &[i64],
+    range: &SpeakerRange,
+    landing: Option<i64>,
+) -> Option<i64> {
     let above = dead.iter().any(|&p| p as f32 > range.usable.1);
     let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
     let candidates: Vec<i64> = if above && below {
@@ -762,9 +874,10 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
         }
     };
     let shallowest = anchor.or_else(|| qualifying.iter().copied().min_by_key(|s| s.abs()))?;
+    let budget = landing.unwrap_or(LANDING_MAX_EXTRA_DEPTH).max(0);
     let mut pool: Vec<i64> = qualifying
         .into_iter()
-        .filter(|s| s.abs() <= shallowest.abs() + LANDING_MAX_EXTRA_DEPTH)
+        .filter(|s| s.abs() <= shallowest.abs() + budget)
         .collect();
 
     // S146e, the comfort knob: inside the depth budget already fixed above, prefer landings that
@@ -792,7 +905,7 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
         // "验证本身是空的" shape — the knob would look connected and quietly not be.
         tracing::info!(
             "range: dead {:?} has no landing inside comfort [{:.0},{:.0}] within the depth budget \
-             (shallowest {shallowest}, +{LANDING_MAX_EXTRA_DEPTH}) — using landing-grade slots {:?}",
+             (shallowest {shallowest}, +{budget}) — using landing-grade slots {:?}",
             dead,
             range.comfort.0,
             range.comfort.1,
@@ -803,10 +916,40 @@ fn minimal_rescue_shift(dead: &[i64], all: &[i64], range: &SpeakerRange) -> Opti
     }
 
     let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
-    pool.into_iter()
-        .filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS)
+    let tied: Vec<i64> = pool.into_iter().filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS).collect();
+
+    // S151 —— **在 damage 打平的那一批里,按扫描的原始 `low_ratio` 排**,平了才取最浅。
+    //
+    // ⛔ 为什么这一层非加不可:`damage_from_scan` 给 `low_ratio` 留了 **0.55 以下全免费**,
+    // 于是 akiko 的 73..78 六格(0.100 / 0.121 / 0.181 / 0.211 / 0.276 / 0.388)在目标函数里
+    // **完全等价**,而「最浅优先」就把死音停在这六格里最差的那一格。实测(用户 2026-08-18
+    // 那两条实机渲染,逐音):+0 那跑 85 个死音里 **43 个(51%)落在 77-78**;而 donor 被要求
+    // 唱在 77-78 时音内包络起伏率 **30%**,≤76 只有 **7%**(Fisher p = 0.0026)。
+    // 另一把独立的尺子给出同向读数:**同一个位移**下,落点 >73 的元音塌 −2.74 dB,
+    // ≤73 只塌 −0.95(p = 4.2e-10)。⇒ 这一格是这条线上第一个被两把独立尺子同时指认的杠杆。
+    //
+    // ⛔ 但它**只在 damage 已经打平的候选之间**做选择,而且预算仍然由 `extra` 封顶 ——
+    // S148 记着无上限的 damage 排序会把东雪莲一路走到 **−24**,那是用户耳判过的灾难。
+    let thinner = |s: i64| -> f32 {
+        dead.iter().map(|&p| range.thinness(p + s).unwrap_or(1.0)).fold(0.0f32, f32::max)
+    };
+    if landing.is_none() {
+        // 默认臂:到此为止,与 S151 之前逐字相同。
+        return tied.into_iter().min_by_key(|s| s.abs());
+    }
+    let best_thin = tied.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
+    tied.into_iter()
+        .filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS)
         .min_by_key(|s| s.abs())
 }
+
+/// How much better a deeper landing's raw `low_ratio` must be before it is preferred over a
+/// shallower one. `low_ratio` is stored quantized to a u8 over 0..1, so one stored step is
+/// 1/255 ≈ 0.004 — this is ten of those, i.e. wide enough that the rule never chases quantization
+/// noise, narrow enough that akiko's 0.388 → 0.211 (78 → 76) still counts as an improvement.
+/// ⚠ Deliberately not a tuning knob: on the four installed records every value from 0.01 to 0.10
+/// picks the same landing, because the steps that matter on this axis are 0.06-0.24 wide.
+const LANDING_THIN_EPS: f32 = 0.04;
 
 /// How far past the shallowest qualifying shift the damage ranking may look. **One semitone.**
 ///
@@ -899,7 +1042,7 @@ pub fn cover_dead_plan(
             .collect();
         let dead: Vec<i64> =
             pitches.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
-        match minimal_rescue_shift(&dead, &pitches, range) {
+        match minimal_rescue_shift(&dead, &pitches, range, None) {
             Some(s) => out.push(DeadJob { shift: s, start: a as i64, end: (b + 1) as i64 }),
             None => unfixable.push((a as i64, (b + 1) as i64)),
         }
@@ -1784,7 +1927,7 @@ mod tests {
         // のう(85,73) between rests: 85 dead → minimal landing 79(80 半浊不合格)⇒ -6;
         // 前面的健康 73 短语原位不动 —— 用户耳判通过的 t23 臂逐字。
         let nn = [0, 73, 73, 0, 85, 73, 0];
-        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 4, end: 5, shift: -6 }]);
     }
@@ -1794,14 +1937,14 @@ mod tests {
         // 三轮核心:comfort [36,52] 说 64-78 全「越界」,但 f0 判据说能唱 → 一律原位。
         // (二轮 per-note 把整段搬走 = 用户判「灾难」的那台机器,这里钉死不再回来。)
         let nn = [0, 64, 66, 0, 73, 78, 0];
-        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
         assert!(plan.is_empty() && unfix.is_empty());
     }
 
     #[test]
     fn dead_only_transpose_folds_into_the_verdict() {
         let nn = [0, 73, 0]; // written 73 + transpose 12 = 85 → 同款 -6 救援
-        let (plan, _) = dead_only_plan_with(&nn, &secs(nn.len()), 12, &dxl_like(), None);
+        let (plan, _) = dead_only_plan_with(&nn, &secs(nn.len()), 12, &dxl_like(), RescueTuning::today());
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
     }
 
@@ -1809,7 +1952,7 @@ mod tests {
     fn dead_only_dragged_neighbours_must_stay_singable() {
         // 短语 [85, 40]:-6 把 40 拖到 34(窗外=死)→ 无解,必须响亮计数而非静默跳过。
         let nn = [0, 85, 40, 0];
-        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
         assert!(plan.is_empty());
         assert_eq!(unfix, vec![(1, 2)], "无解组带位置(审查 S85:取证要「在哪」)");
     }
@@ -1818,10 +1961,10 @@ mod tests {
     fn dead_only_bounds_record_falls_back_to_bounds() {
         // 无扫描旧记录:dead=出 usable,落点=进 comfort。88→79 = -9;40→52 = +12。
         let r = SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0));
-        let (plan, unfix) = dead_only_plan_with(&[0, 88, 0], &secs(3), 0, &r, None);
+        let (plan, unfix) = dead_only_plan_with(&[0, 88, 0], &secs(3), 0, &r, RescueTuning::today());
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -9 }]);
         assert!(unfix.is_empty());
-        let (plan, _) = dead_only_plan_with(&[0, 40, 0], &secs(3), 0, &r, None);
+        let (plan, _) = dead_only_plan_with(&[0, 40, 0], &secs(3), 0, &r, RescueTuning::today());
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: 12 }]);
     }
 
@@ -1842,7 +1985,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let (plan, unfix) = dead_only_plan_with(&[0, 78, 0], &secs(3), 0, &r, None);
+        let (plan, unfix) = dead_only_plan_with(&[0, 78, 0], &secs(3), 0, &r, RescueTuning::today());
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -1 }]);
     }
@@ -1855,13 +1998,13 @@ mod tests {
     fn a_rescue_group_sheds_the_passengers_that_pay_for_their_own_seam() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 25, 25, 25, 40, 20, 20, 10]; // 头 75 帧 = 1.50 s;尾 40 帧 = 0.80 s
-        let (whole, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
+        let (whole, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
         assert_eq!(
             whole,
             vec![DeadGroup { start: 1, end: 6, shift: -6 }],
             "关掉时必须是 S150 之前那条整句臂"
         );
-        let (trimmed, unfix) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        let (trimmed, unfix) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
         assert!(unfix.is_empty());
         assert_eq!(
             trimmed,
@@ -1875,7 +2018,7 @@ mod tests {
     fn a_cut_that_frees_almost_nothing_is_not_worth_the_seam_it_makes() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 10, 10, 10, 40, 7, 7, 10]; // 头 30 帧 = 0.60 s;尾 14 帧 = 0.28 s
-        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
         assert_eq!(
             plan,
             vec![DeadGroup { start: 1, end: 6, shift: -6 }],
@@ -1889,7 +2032,7 @@ mod tests {
     fn the_head_cut_has_to_buy_more_than_the_tail_cut() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 12, 12, 11, 40, 18, 17, 10]; // 头 35 帧 = 0.70 s;尾 35 帧 = 0.70 s
-        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
         assert_eq!(
             plan,
             vec![DeadGroup { start: 1, end: 4, shift: -6 }],
@@ -1914,8 +2057,8 @@ mod tests {
             v.sort_unstable();
             v
         };
-        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &r, None);
-        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &r, Some((1000.0, 500.0)));
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(Some((1000.0, 500.0)), None));
         assert_eq!(dead_of(&off), dead_of(&on), "被救的死音一个不许多、一个不许少");
         assert_eq!(unfix_off, unfix_on, "无解的乐句也不许因为裁剪而改变");
         assert_eq!(unfix_on, vec![(15, 16)], "…而这份夹具里确实有一个(85 拖着 40 出窗)");
@@ -1932,17 +2075,128 @@ mod tests {
     fn trimming_may_not_turn_an_unfixable_phrase_into_a_rescue() {
         let nn = [0, 85, 40, 0];
         let fr = [10, 40, 100, 10]; // 尾部乘客 2.0 s —— 回收量远超门限,唯一拦住它的只能是规则
-        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
-        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
         assert!(off.is_empty() && on.is_empty(), "两条臂都必须放弃这一句");
         assert_eq!(unfix_off, vec![(1, 2)]);
         assert_eq!(unfix_on, vec![(1, 2)], "卸乘客不许把无解句变成被救句");
         // 阳性对照:同一句,乘客换成一个不挡路的音 ⇒ 两条臂都救,且开着的那条真的裁了。
         let nn = [0, 85, 73, 0];
-        let (off, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
-        let (on, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        let (off, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
+        let (on, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
         assert_eq!(off, vec![DeadGroup { start: 1, end: 2, shift: -6 }]);
         assert_eq!(on, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
+    }
+
+    /// akiko 的形状(照盘上那份记录简化):73..79 的 `low_ratio` 从 0.10 一路爬到 0.63,
+    /// 而 `damage_from_scan` 对 0.55 以下**全免费** ⇒ 73..78 六格在今天的目标函数里**完全等价**。
+    /// ⛔ 数值写字面量,不引用被测的常量。
+    fn akiko_like() -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=72i64 {
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, 0.20]));
+        }
+        for (m, lr) in [(73, 0.10), (74, 0.12), (75, 0.18), (76, 0.21), (77, 0.28), (78, 0.39), (79, 0.63)] {
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        semis.insert("80".into(), serde_json::json!([3, 0.67, -6.7, 0.93]));
+        for m in 81..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.80]));
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 76], "usable_auto": [36, 80], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap()
+    }
+
+    /// S151 主刀:落点排序在 damage 打平之后**再看一眼扫描的原始 `low_ratio`**。
+    /// 出处是两把独立的尺子(用户 2026-08-18 那两条实机渲染):donor 被要求唱在 77-78 时
+    /// 音内包络起伏率 30% vs ≤76 的 7%(p=0.0026);同一位移下落点 >73 的元音塌 −2.74 dB
+    /// vs ≤73 的 −0.95(p=4.2e-10)。
+    #[test]
+    fn the_landing_arm_lands_where_the_scan_says_the_voice_is_still_there() {
+        let nn = [0, 80, 0];
+        let fr = secs(3);
+        let r = akiko_like();
+        let (today, _) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
+        assert_eq!(
+            today,
+            vec![DeadGroup { start: 1, end: 1, shift: -2 }],
+            "今天:预算 +1 ⇒ 停在 78(low_ratio 0.39),因为 73..78 在 damage 上全是 0"
+        );
+        let (deep, _) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(
+            deep,
+            vec![DeadGroup { start: 1, end: 1, shift: -4 }],
+            "开着:同样的合格集合里挑 low_ratio 更低的那一格(76 = 0.21),而不是最浅的"
+        );
+        // ⛔ 预算仍然封顶 —— 无上限的排序正是 S148 记着的那台「东雪莲 −24」的机器。
+        let (cap, _) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, Some(1)));
+        assert_eq!(cap[0].shift, -2, "预算 +1 时它够不到 76,必须老老实实停在 78");
+        // ⭐ 这一对是**变异逼出来的**:上面那三条在「排序被默认打开」时**全是绿的**,
+        // 因为在那个夹具上 damage 已经把候选筛到只剩一个。要让「默认臂没被动过」这件事
+        // 有判据,必须构造一个**默认预算内就有两个 damage 打平、但 low_ratio 不同**的局面:
+        // 死音 79 ⇒ 落点 78(0.39)与 77(0.28),两个 damage 都是 0。
+        let (near_today, _) = dead_only_plan_with(&[0, 79, 0], &fr, 0, &r, RescueTuning::today());
+        assert_eq!(near_today[0].shift, -1, "默认臂:damage 打平就取最浅 ⇒ 停在 78");
+        let (near_on, _) = dead_only_plan_with(&[0, 79, 0], &fr, 0, &r, RescueTuning::new(None, Some(1)));
+        assert_eq!(near_on[0].shift, -2, "开着:同一个预算内也要挑 low_ratio 更低的 77");
+        // 阴性对照:一个 low_ratio 平坦的记录上,开与关必须给出**同一个**落点。
+        let flat = dxl_like();
+        let (a, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::today());
+        let (b, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::new(None, Some(3)));
+        assert_eq!(a, b, "没有 low_ratio 可排时,这一刀必须什么也不做");
+    }
+
+    /// 与卸乘客同一条定义域:它只决定**落在哪**,不许改**哪些音被救**。
+    #[test]
+    fn the_landing_arm_never_changes_which_notes_get_rescued() {
+        let nn = [0, 73, 80, 73, 0, 60, 0, 85, 40, 0];
+        let fr = secs(nn.len());
+        let r = akiko_like();
+        let (a, ua) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
+        let (b, ub) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, Some(3)));
+        let dead_of = |p: &[DeadGroup]| {
+            let mut v: Vec<usize> = p.iter().flat_map(|g| g.start..=g.end)
+                .filter(|&k| nn[k] > 0 && !r.slot_singable(nn[k])).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(dead_of(&a), dead_of(&b), "被救的死音一个不许多、一个不许少");
+        assert_eq!(ua, ub, "无解的乐句也不许变");
+        assert!(a.iter().zip(&b).any(|(x, y)| x.shift != y.shift), "…但落点必须真的动过");
+    }
+
+    #[test]
+    fn the_landing_knob_is_off_by_default_and_parses() {
+        assert!(parse_landing(None).is_none(), "默认必须是今天那条臂");
+        assert!(parse_landing(Some("")).is_none());
+        assert!(parse_landing(Some("0")).is_none(), "显式关得掉 —— 抱怨时要能用同一个二进制渲旧臂");
+        assert_eq!(parse_landing(Some("3")), Some(3));
+        assert_eq!(parse_landing(Some(" 4 ")), Some(4));
+        for junk in ["x", "-1", "999", "1.5", ""] {
+            assert!(parse_landing(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认");
+        }
+    }
+
+    /// ⛔ 盲测把**头裁**判负(见 `TRIM_HEAD_MS`)⇒ 出厂那一档必须**只裁尾**。
+    /// 这条判据钉的是「`=1` 到底给出什么」,不是常量等于常量:它构造一个头尾都够本的乐句,
+    /// 断言出厂档**只切了尾巴**。
+    #[test]
+    fn the_shipped_trim_only_ever_cuts_the_tail() {
+        let on = parse_trim(Some("1")).expect("`1` = 出厂那一档");
+        let nn = [0, 73, 73, 73, 85, 73, 73, 0];
+        let fr = [10, 100, 100, 100, 40, 100, 100, 10]; // 头 6.0 s、尾 4.0 s,都远超任何门限
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some(on), None));
+        assert_eq!(
+            plan,
+            vec![DeadGroup { start: 1, end: 4, shift: -6 }],
+            "出厂档:尾巴放掉、组头一个音不许动(头裁的缝贵 8 倍,而且盲测输了)"
+        );
     }
 
     /// 旋钮本身:**默认关**,而且解析是纯函数(测试里读进程环境既会被并行污染,
@@ -1954,7 +2208,8 @@ mod tests {
         assert!(parse_trim(Some("0")).is_none(), "显式关得掉 —— 用户抱怨时要能用同一个二进制渲旧臂");
         let on = parse_trim(Some("1")).expect("`1` = 用登记的两个常量");
         assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS));
-        assert!(on.0 > on.1, "裁头的缝贵 8 倍 ⇒ 它必须买到更多才动手");
+        assert!(on.0.is_infinite(), "头裁被盲测判负 ⇒ 出厂档必须够不到它");
+        assert!(on.1.is_finite() && on.1 > 0.0, "…而尾裁是那一轮唯一赢了的一刀");
         assert_eq!(parse_trim(Some("800:300")), Some((800.0, 300.0)), "扫参数用");
         assert_eq!(parse_trim(Some(" 800 : 300 ")), Some((800.0, 300.0)));
         for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
@@ -2337,10 +2592,10 @@ mod tests {
         let dead: Vec<i64> = vec![85, 83, 81];
 
         let auto = Rec { usable: (36, 80), comfort: (36, 79), comfort_auto: (36, 79), ..Default::default() }.build();
-        let base = minimal_rescue_shift(&dead, &nn, &auto).expect("a landing exists");
+        let base = minimal_rescue_shift(&dead, &nn, &auto, None).expect("a landing exists");
 
         let pushed = Rec { usable: (36, 80), comfort: (36, 74), comfort_auto: (36, 79), ..Default::default() }.build();
-        let deeper = minimal_rescue_shift(&dead, &nn, &pushed).expect("a landing exists");
+        let deeper = minimal_rescue_shift(&dead, &nn, &pushed, None).expect("a landing exists");
         assert!(
             deeper < base,
             "dragging the landing ceiling 79→74 must go deeper than {base}, got {deeper}"
@@ -2370,8 +2625,8 @@ mod tests {
         let dead: Vec<i64> = vec![85, 83, 81];
         let untouched = Rec { usable: (36, 74), comfort: (36, 79), comfort_auto: (36, 79), ..Default::default() }.build();
         assert!(
-            minimal_rescue_shift(&dead, &nn, &artefact).unwrap()
-                < minimal_rescue_shift(&dead, &nn, &untouched).unwrap(),
+            minimal_rescue_shift(&dead, &nn, &artefact, None).unwrap()
+                < minimal_rescue_shift(&dead, &nn, &untouched, None).unwrap(),
             "a stored target is believed as-is — no intent heuristic decides for the user"
         );
     }
@@ -2385,7 +2640,7 @@ mod tests {
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
         assert!(
-            minimal_rescue_shift(&dead, &nn, &nope).is_some(),
+            minimal_rescue_shift(&dead, &nn, &nope, None).is_some(),
             "an out-of-reach explicit comfort must degrade, never turn the rescue off"
         );
     }
@@ -2549,8 +2804,8 @@ mod tests {
         let tight = Rec { usable: (36, 76), comfort: (36, 79), comfort_auto: (36, 79), scan: (36, 80), ..Default::default() }.build();
         let nn: Vec<i64> = vec![70, 78, 85];
 
-        let (pw, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, None);
-        let (pt, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, None);
+        let (pw, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, RescueTuning::today());
+        let (pt, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, RescueTuning::today());
         assert_eq!(pw.len(), 1);
         assert_eq!(pt.len(), 1);
         assert_eq!(
@@ -2623,8 +2878,8 @@ mod tests {
 
         // …and the veto has to reach the thing the user hears: the phrase plan.
         let nn: Vec<i64> = vec![70, 78];
-        let (plan_wide, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, None);
-        let (plan_tight, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, None);
+        let (plan_wide, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, RescueTuning::today());
+        let (plan_tight, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, RescueTuning::today());
         assert!(plan_wide.is_empty(), "nothing is dead at the wide ceiling");
         assert_eq!(plan_tight.len(), 1, "the tight ceiling must hand this phrase to the rescue");
         assert!(plan_tight[0].shift < 0, "and pull it down, got {}", plan_tight[0].shift);
@@ -2658,9 +2913,9 @@ mod tests {
         let dead: Vec<i64> = vec![80];
         let open = legacy_rec((36, 78), (36, 78));
         let tight = legacy_rec((36, 78), (36, 77));
-        assert_eq!(minimal_rescue_shift(&dead, &nn, &open), Some(-2), "baseline");
+        assert_eq!(minimal_rescue_shift(&dead, &nn, &open, None), Some(-2), "baseline");
         assert_eq!(
-            minimal_rescue_shift(&dead, &nn, &tight),
+            minimal_rescue_shift(&dead, &nn, &tight, None),
             Some(-3),
             "comfort ending at 77 must pull the landing off 78 and onto 77"
         );
@@ -2674,7 +2929,7 @@ mod tests {
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
         assert_eq!(
-            minimal_rescue_shift(&dead, &nn, &r),
+            minimal_rescue_shift(&dead, &nn, &r, None),
             Some(-7),
             "an out-of-reach comfort band must fall back to today's answer, not refuse"
         );
@@ -2705,7 +2960,7 @@ mod tests {
             "the band must genuinely be unreachable or this test proves nothing (got {reachable:?})"
         );
 
-        let s = minimal_rescue_shift(&dead, &nn, &r).expect("a landing exists");
+        let s = minimal_rescue_shift(&dead, &nn, &r, None).expect("a landing exists");
         assert_eq!(s, -2, "an unreachable target must degrade, not dive");
     }
 
@@ -2716,7 +2971,7 @@ mod tests {
         let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let dead: Vec<i64> = vec![85, 83, 81];
-        let s = minimal_rescue_shift(&dead, &nn, &r).expect("a landing exists");
+        let s = minimal_rescue_shift(&dead, &nn, &r, None).expect("a landing exists");
         assert_eq!(s, -7, "must clear the cliff, not stop on it");
 
         // …and the reason, stated as a measurement rather than a belief: every landing is at the
@@ -2742,7 +2997,7 @@ mod tests {
         // happily walk to −24.
         let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
-        let s = minimal_rescue_shift(&[85, 83, 81], &nn, &r).expect("a landing exists");
+        let s = minimal_rescue_shift(&[85, 83, 81], &nn, &r, None).expect("a landing exists");
         assert_eq!(s, -7);
         assert!(
             r.damage_at((85 - 8) as f32).unwrap() <= LANDING_DAMAGE_EPS,
@@ -2782,7 +3037,7 @@ mod tests {
             "fixture must offer a MUCH better landing far below, or this test proves nothing"
         );
         assert!(!r.slot_singable(65) && r.slot_landing_ok(64), "65 dead, 64 landable");
-        let s = minimal_rescue_shift(&[65], &[65], &r).expect("a landing exists");
+        let s = minimal_rescue_shift(&[65], &[65], &r, None).expect("a landing exists");
         // ⛔ The bound is a LITERAL, deliberately. Writing it as `-1 - LANDING_MAX_EXTRA_DEPTH`
         // makes the assertion move with the constant it is guarding, and the test can then never
         // fail — the second vacuous version of this test did exactly that and stayed green with
@@ -2799,7 +3054,7 @@ mod tests {
         // Bounds-only records have no damage curve to rank by; their behaviour must not move.
         let r = SpeakerRange::bounds((36.0, 80.0), (36.0, 79.0));
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
-        assert_eq!(minimal_rescue_shift(&[85, 83, 81], &nn, &r), Some(-6));
+        assert_eq!(minimal_rescue_shift(&[85, 83, 81], &nn, &r, None), Some(-6));
     }
 
     #[test]
@@ -2810,7 +3065,7 @@ mod tests {
         let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
         let fr: Vec<i64> = vec![9; nn.len()];
-        let (plan, unfixable) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, None);
+        let (plan, unfixable) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, RescueTuning::today());
         assert_eq!(unfixable.len(), 0);
         assert_eq!(plan.len(), 1, "exactly one dead phrase, as before");
         assert_eq!((plan[0].start, plan[0].end), (0, 5), "the same note span as before");
@@ -2905,8 +3160,8 @@ mod tests {
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80];
         let before = speaker_range(&onset_probe_record(false), 0).expect("record");
         let after = speaker_range(&onset_probe_record(true), 0).expect("record");
-        let s_before = minimal_rescue_shift(&[85, 83, 81], &nn, &before).expect("a landing exists");
-        let s_after = minimal_rescue_shift(&[85, 83, 81], &nn, &after).expect("a landing exists");
+        let s_before = minimal_rescue_shift(&[85, 83, 81], &nn, &before, None).expect("a landing exists");
+        let s_after = minimal_rescue_shift(&[85, 83, 81], &nn, &after, None).expect("a landing exists");
         assert_eq!(s_before, -6, "before: 85 lands on 79, the shallowest landing-grade slot");
         assert!(
             s_after < s_before,
