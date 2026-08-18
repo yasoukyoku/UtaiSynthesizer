@@ -1262,6 +1262,30 @@ pub fn apply_dead_only_windows(
     total_frames: i64,
     jobs: &[DeadJob],
     match_levels: bool,
+    donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
+) -> crate::Result<()> {
+    apply_dead_only_windows_with(
+        base,
+        sample_rate,
+        total_frames,
+        jobs,
+        match_levels,
+        join_rests_enabled(),
+        donor_render,
+    )
+}
+
+/// 同上,但「异位移短休止接上」由参数给 —— ⛔ 判据不许读进程环境(`dead_only_plan_with`
+/// 同一个模式)。**这条路径存在的理由不是好看**:走 env 的那一版让「片段余量不够 ⇒ 静默
+/// 退回今天的行为」这条分支在变异里全绿,也就是收益可以被悄悄砍掉而没有任何东西会红。
+#[allow(clippy::too_many_arguments)]
+pub fn apply_dead_only_windows_with(
+    base: &mut [f32],
+    sample_rate: u32,
+    total_frames: i64,
+    jobs: &[DeadJob],
+    match_levels: bool,
+    join_enabled: bool,
     mut donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -1273,6 +1297,10 @@ pub fn apply_dead_only_windows(
     let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
     shifts.sort_unstable();
     shifts.dedup();
+    // S152 —— 每一遍 donor 在**它自己的窗 ± 余量**上的样本,留到全部渲完之后再拼。
+    // ⛔ 为什么要留:窗边该放在休止的哪一点,只有**同时看得见两侧那两条 donor** 才决定得了
+    // (见 `join_rests`)。留的是片段不是整条:全曲窗覆盖约 56 %,实测这首歌约 30 MB。
+    let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
     for s in shifts {
         // 这一遍**自己**的窗。⛔ 同一个 filter 下面 :896 还要用一次(音频域拼接),两处必须
         // 是同一个谓词 —— 那正是 S147 hotfix 的形状:闭包那一侧漏了它,拼接这一侧没漏,
@@ -1294,11 +1322,74 @@ pub fn apply_dead_only_windows(
             }
         }
         let n = base.len().min(donor.len());
-        for j in jobs.iter().filter(|j| j.shift == s) {
-            let (fa, fb) = (j.start, j.end);
-            let a = ((fa.max(0) as f64 * spf) as usize).min(n);
-            let b = ((fb.max(0) as f64 * spf) as usize).min(n);
+        // S152 —— 留片段,拼接推迟到全部 donor 渲完(见 `kept` 的注释)。余量 = 桥接上限,
+        // 因为窗边最远只会挪到相邻休止的另一头。
+        let margin = (MERGE_BRIDGE_FRAMES as f64 * spf) as usize;
+        for (ji, j) in jobs.iter().enumerate().filter(|(_, j)| j.shift == s) {
+            let a = ((j.start.max(0) as f64 * spf) as usize).min(n);
+            let b = ((j.end.max(0) as f64 * spf) as usize).min(n);
+            let (lo, hi) = (a.saturating_sub(margin), (b + margin).min(n));
+            if hi > lo {
+                kept.push((ji as i64, lo, donor[lo..hi].to_vec()));
+            }
+        }
+    }
+    splice_kept(base, sample_rate, spf, jobs, &kept, xf, join_enabled)
+}
+
+/// S152 —— 拼接层,从 `apply_dead_only_windows` 拆出来:它现在拿到的是**全部**位移的 donor
+/// 片段,所以窗边可以由音频决定(`join_rests`),而不是只能由帧数规则决定。
+fn splice_kept(
+    base: &mut [f32],
+    sample_rate: u32,
+    spf: f64,
+    jobs: &[DeadJob],
+    kept: &[(i64, usize, Vec<f32>)],
+    xf: usize,
+    join_enabled: bool,
+) -> crate::Result<()> {
+    // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
+    let n = base.len();
+    // ⛔ 时间序,不是位移序。窗互不重叠时两者等价(实测这首歌 0 对重叠),但**接上之后
+    // 相邻两窗会重叠一个淡化宽度**,而那一次淡化的意义正是「从上一条 donor 淡到下一条」——
+    // 顺序错了就会淡回 base,也就是这一刀本来要消灭的那个洞。
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&i| (jobs[i].start, jobs[i].end));
+    let join = join_rests(base, sample_rate, spf, jobs, kept, &order, xf, join_enabled);
+    for (oi, &ji) in order.iter().enumerate() {
+        let j = &jobs[ji];
+        // ⛔ 片段一次找完,不许放进逐样本的循环 —— 那是 53 × 12.8 M 次线性扫。
+        let Some((_, seg_lo, seg)) = kept.iter().find(|(i, _, _)| *i == ji as i64) else {
+            continue;
+        };
+        let (fa, fb) = (j.start, j.end);
+        let mut a = ((fa.max(0) as f64 * spf) as usize).min(n);
+        let mut b = ((fb.max(0) as f64 * spf) as usize).min(n);
+        // 被接上的一对:左窗伸到切换点(不淡出),右窗从切换点【往前】一个淡化宽度开始
+        // ⇒ 那一次淡化两侧都是 donor,base 一个样本都不参与。
+        let mut hard_end = false;
+        if let Some(t) = join.get(&oi).copied() {
+            b = t.min(n);
+            hard_end = true;
+        }
+        if oi > 0 {
+            if let Some(t) = join.get(&(oi - 1)).copied() {
+                // ⛔ 赋值而不是 `min` —— 切换点可能**晚于**今天的窗起点(46 s 那处的正解就是),
+                // 只往前挪的话那一半永远够不着。
+                a = t.saturating_sub(xf).min(n);
+            }
+        }
             // 窗短于双淡化 → 收缩淡化宽度;完全空窗才放弃,响亮。
+            // 写入范围必须落在留下来的片段里。今天由构造一定成立(余量 = 桥接上限),
+            // 但「窗边被挪出片段」是一条会静默出错的路 ⇒ 夹紧并响亮。
+            let (sa, sb) = (*seg_lo, *seg_lo + seg.len());
+            if a < sa || b > sb {
+                tracing::warn!(
+                    "range-extend(dead-only): window {a}..{b} escapes its donor segment {sa}..{sb} — clamped"
+                );
+            }
+            let a = a.max(sa);
+            let b = b.min(sb);
             let xfw = xf.min((b.saturating_sub(a)) / 2);
             if b <= a || xfw == 0 {
                 tracing::warn!(
@@ -1314,7 +1405,7 @@ pub fn apply_dead_only_windows(
             // (measured on 炉心融解/akiko: group `[796..=802]`, note 802 = MIDI 81, dead).
             // ⚠ 这一条改的是**今天的**输出(结尾那 10 ms),所以它跟着 `RANGE_ALGO_VERSION` 一起 bump。
             let fade_in = a > 0;
-            let fade_out = b < n;
+            let fade_out = b < n && !hard_end;
             // S151d ⛔ **一条被干预判负的假说,记下来免得下一个人再走一遍**:
             // 用户报「咚」之后我怀疑这里的等增益淡化 —— `base` 与 `donor` 是两次独立渲染,
             // 相位不相关,等增益在淡化中点保幅度不保功率,理论上掉 3 dB,而 10 ms 的幅度凹坑
@@ -1331,12 +1422,225 @@ pub fn apply_dead_only_windows(
                 } else {
                     1.0
                 };
-                base[k] = base[k] * (1.0 - w) + donor[k] * w;
+                base[k] = base[k] * (1.0 - w) + seg[k - *seg_lo] * w;
+            }
+        }
+    Ok(())
+}
+
+/// S152 —— **窗边该放在休止的哪一点,只有音频知道。**
+///
+/// ## 缺陷
+/// 两个相邻、**位移不同**、中间只隔一段休止的窗,今天被 `dead_group_windows` 的
+/// `pre = min(4, gap/2)` / `post = min(2, gap/2)` 切成「donor_L / base / donor_R」三段,
+/// 两侧各留一个电平台阶。S151 笔5 只合并**同位移**的窗,异位移这一族被规则**按设计放过了**
+/// —— 全曲还剩 **31 条**。
+///
+/// ## ⛔⛔ 这把刀**没有耳朵背书,而且它最初瞄的那个靶子是个非事件**
+/// 我一开始把它当成「用户 2026-08-18 在 46 秒『ま』与『さ』之间听到的那个杂音」的解药,
+/// 对抗核验把这条打掉了,两条都要记住:
+/// * **46.041 s 那条桥的桥内是 −240 dBFS 的数字静音**(base / donor_L / donor_R 三条全是)
+///   ⇒ 那里根本没有洞,它在我第一版排序里排第 2 是**尺子的问题**;
+/// * 用户耳朵指的那一处是 **46.401 s**(合并**之前**那一版的同位移桥,在 41 条桥里
+///   `Δnotch` 排 **1/41**),而 S151 笔5 已经把它合并掉了 —— 可用户说三条整曲臂**都还听得到**,
+///   ⇒ **那个杂音的真凶仍然没找到**,别把这一刀读成「46 s 修好了」。
+/// ⚠ 现存证据只支持一句话:**它把接缝从「在 −29 dBFS 处切换」挪到「在 −240 / −52 dBFS 处切换」**,
+/// 那是一个客观更安全的位置,仅此而已。翻默认前必须盲测。
+///
+/// ## 为什么必须由音频决定(离线扫过,`edge_sweep.py`)
+/// 31 对这样的窗,把切换点放在休止里逐 5 ms 扫,台阶(两侧 20 ms 电平差):
+///
+/// | 方案(切换点两侧 20 ms 的电平差) | p50 | p90 | max |
+/// |---|---|---|---|
+/// | 今天(中间留 base) | 6.59 | 12.97 | 17.25 dB |
+/// | 接上,切换点取**中点** | 2.67 | **24.27** | **165.65 dB** |
+/// | 接上,切换点**按音频搜** | **0.03** | **0.77** | 6.41 dB |
+///
+/// ⇒ ⛔ **固定常数比今天还差**,而按音频搜几乎把台阶消灭。最优点离中点的偏移从 −100 到
+/// +95 ms 都有 ⇒ 没有任何固定偏移能替代搜索。这就是这一刀不能写成「post 从 2 改成 4」的原因。
+///
+/// ## ⛔ 判据本身被自己的分辨率骗过一次
+/// 第一版按「两侧电平**差**最小」搜、窗 20 ms。46 s 那段休止里其实有 **15 ms 的真数字静音**
+/// (base / donor_L / donor_R 三条全是 −240 dBFS)—— 在那里切换是零风险的,而
+/// **10 / 20 / 40 ms 的窗全部错过它**(分别落在 46.040 / 46.102 / 46.115),只有 5 ms 窗找得到。
+/// ⇒ 判据改成「**两条里较响的那条最安静**」+ 5 ms 窗:它自动同时满足「都安静」与「差不多」,
+/// 并且在有静音的休止里直接落到 −240。31 对里 **19 对**的休止有这样的静音。
+///
+/// ## 返回
+/// `{order 下标 → 切换点样本}` —— 键是**时间序**里的位置,因为拼接就是按那个顺序做的。
+fn join_rests(
+    base: &[f32],
+    sample_rate: u32,
+    spf: f64,
+    jobs: &[DeadJob],
+    kept: &[(i64, usize, Vec<f32>)],
+    order: &[usize],
+    xf: usize,
+    enabled: bool,
+) -> std::collections::HashMap<usize, usize> {
+    // ⛔ `enabled` 是参数不是 `std::env` —— 判据不许读进程环境(S151 笔1 的规矩:
+    // 一个读 env 的纯函数在 CI 上和在别人 export 过变量的机器上会给出不同答案)。
+    let mut out = std::collections::HashMap::new();
+    if !enabled {
+        return out;
+    }
+    // ⛔ 5 ms,不是 20 ms。第一版用 20 ms 的窗找「两侧电平最接近的点」,在 46 s 那处**漏掉了
+    // 正确答案**:那段休止里有 15 ms 的**真数字静音**(三条信号全 −240 dBFS),5 ms 窗找得到,
+    // 10 / 20 / 40 ms 窗全部错过(分别落在 46.040 / 46.102 / 46.115)。
+    let w = (sample_rate as usize / 200).max(8); // 5 ms
+    let step = (sample_rate as usize / 400).max(1); // 2.5 ms
+    let seg = |ji: usize| kept.iter().find(|(i, _, _)| *i == ji as i64);
+    let rms_db = |buf: &[f32], lo: usize, a: usize, b: usize| -> Option<f32> {
+        let (a, b) = (a.checked_sub(lo)?, b.checked_sub(lo)?);
+        if b <= a || b > buf.len() {
+            return None;
+        }
+        let m: f64 = buf[a..b].iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+            / (b - a) as f64;
+        Some(20.0 * (m.sqrt().max(1e-12)).log10() as f32)
+    };
+    let cell = (sample_rate as usize / 100).max(8); // 10 ms —— 打分格
+    for oi in 0..order.len().saturating_sub(1) {
+        let (li, ri) = (order[oi], order[oi + 1]);
+        let (l, r) = (&jobs[li], &jobs[ri]);
+        // 同位移的那一族是 S151 笔5 的事(它在计划层就合并了),这里只管异位移。
+        if l.shift == r.shift || r.start <= l.end {
+            continue;
+        }
+        let gap = r.start - l.end;
+        if gap <= 0 || gap > MERGE_BRIDGE_FRAMES {
+            continue;
+        }
+        let (Some((_, llo, lbuf)), Some((_, rlo, rbuf))) = (seg(li), seg(ri)) else { continue };
+        // ⭐ 搜索范围是**整段休止**,不只是今天那两条边之间。今天的窗把休止切成
+        // `post(≤2 帧) / gap / pre(≤4 帧)`,所以整段休止 = `[l.end − min(2,gap), r.start + min(4,gap)]`
+        // (`min` 保证任何休止长度下都不会越进唱音)。
+        // ⛔ 必须允许 T **晚于**今天的右窗起点 —— 46 s 那处的正解就在那边:今天窗在音前 80 ms
+        // 就开了,而右 donor 在其后 40 ms 里是静音,于是 base 的辅音预卷被换成了一个 26 dB 的洞。
+        let f2s = |f: i64| (f.max(0) as f64 * spf) as usize;
+        let lo = f2s(l.end - gap.min(2)).max(*llo + w).max(w);
+        let hi = f2s(r.start + gap.min(4))
+            .min(base.len().saturating_sub(w))
+            .min(rlo + rbuf.len() - w);
+        if hi <= lo {
+            continue;
+        }
+        // 整段休止上的 base 电平(10 ms 一格)—— 「洞」就是相对它挖下去的那部分。
+        let cells: Vec<(usize, f32)> = (lo..hi)
+            .step_by(cell)
+            .filter_map(|u| rms_db(base, 0, u, u + cell).map(|v| (u, v)))
+            .collect();
+        // ⭐ 参照 = **今天**在同一段休止上挖出来的洞。今天的分法是「L 到 l.end / base / R 从
+        // r.start 起」,所以它自己也有一个 dip;这一刀只有**比今天更浅**才值得动。
+        // ⛔ 用绝对门限是错的:今天在两条边之间放的就是 base(dip 恒 0),绝对门限会把
+        // 「今天已经很好」的那些也一起接上(离线扫的 128.9 s 就是这一类)。
+        let e_l = f2s(l.end);
+        let e_r = f2s(r.start);
+        // ⛔ dip 只在**两种分法真的不同**的那一段上算 —— `[min(t,e_l), max(t,e_r)]`。
+        // 第一版在整段休止上算,于是「左窗内部那几格」(两种分法完全相同)把最大值钉死,
+        // 今天与候选读出**一模一样的 24.44**,判据当场变空。
+        let dip_in = |a: usize, b: usize, pick: &dyn Fn(usize) -> Option<f32>| -> f32 {
+            let mut d = 0.0f32;
+            for &(u, bl) in &cells {
+                if u < a || u + cell > b {
+                    continue;
+                }
+                if let Some(c) = pick(u) {
+                    d = d.max(bl - c);
+                }
+            }
+            d
+        };
+        let today_pick = |u: usize| {
+            if u + cell <= e_l {
+                rms_db(lbuf, *llo, u, u + cell)
+            } else if u >= e_r {
+                rms_db(rbuf, *rlo, u, u + cell)
+            } else {
+                rms_db(base, 0, u, u + cell) // 今天这一段就是 base ⇒ 自己减自己 = 0
+            }
+        };
+        let mut best: Option<((f32, f32), usize)> = None;
+        let mut t = lo;
+        while t <= hi {
+            let (Some(la), Some(rb)) =
+                (rms_db(lbuf, *llo, t - w, t), rms_db(rbuf, *rlo, t, t + w))
+            else {
+                t += step;
+                continue;
+            };
+            // ⭐ 主判据 = **拼出来的信号相对 base 最深挖下去多少 dB**(只算负的那一侧)。
+            // 用户听到的就是这个洞;而「最安静的切换点」那条判据会把洞**加深**
+            // (46 s 那处它选 46.05,洞 24.5 dB;选 46.16 时只有 2.1 dB)。
+            // ⛔ 区域**固定**为整段休止,不许随候选缩放。第一版按 `[min(t,e_l), max(t,e_r)]`
+            // 取,于是候选把「切换点之后的那个洞」挤出了区域 —— 它靠**藏起自己的缺陷**拿高分。
+            let dip = dip_in(lo, hi, &|u: usize| {
+                if u + cell <= t {
+                    rms_db(lbuf, *llo, u, u + cell)
+                } else if u >= t {
+                    rms_db(rbuf, *rlo, u, u + cell)
+                } else {
+                    None // 跨切换点那一格不算,两侧各半没有意义
+                }
+            });
+            // 收益 = 今天在**同一段**上的洞 − 候选的洞。⇒ 判据自校准,不需要绝对门限。
+            let gain = dip_in(lo, hi, &today_pick) - dip;
+            // 平局(比如两侧都安静的休止)时退回「切在最安静处」。
+            let sc = (-gain, la.max(rb));
+            if best.is_none_or(|(bs, _): ((f32, f32), usize)| {
+                sc.0 < bs.0 - 0.05 || ((sc.0 - bs.0).abs() <= 0.05 && sc.1 < bs.1)
+            }) {
+                best = Some((sc, t));
+            }
+            t += step;
+        }
+        if let Some(((neg_gain, _q), t)) = best {
+            // 只有**比今天浅一大截**才动。⛔ 不设这一条,「今天已经很好」的那些也会被接上,
+            // 而离线扫里正好有一个反例(128.9 s:今天 1.12 dB,强行接上是 6.41)。
+            if -neg_gain >= JOIN_MIN_GAIN_DB && t > xf {
+                out.insert(oi, t);
             }
         }
     }
-    Ok(())
+    out
 }
+
+/// 切换点必须安静到这个程度才接 —— 找不到就别动,今天那条边(中间留 base)照旧。
+///
+/// ⛔ **门限是从分布里长出来的,不是挑的**(`edge_sweep.py`,31 对真窗、5 ms 窗):
+/// * 今天切换处 `max(左, 右)` 的 p50 = −54.5、**p90 = −29.1**、最坏 −21.8 dBFS;
+/// * 按这个判据搜到的最优 p50 = **−240**(19/31 对的休止里有一段真数字静音)、p90 = −52.0;
+/// * 落在 −50 dBFS 以下的有 **29/31**。
+/// ⇒ −50 落在两个分布之间那 20 dB 宽的平台中间。
+const JOIN_QUIET_DBFS: f32 = -50.0;
+
+/// 要动这条边,新的洞必须比**今天**的浅至少这么多 dB。
+///
+/// ⛔ 6 dB 是从**用户点名的那一处**读出来的,不是挑的:46 s 那段休止里,今天(以及用户的实机
+/// 渲染)在 46.11-46.14 有一个 **26 dB** 的洞 —— donor −9 在那 40 ms 里是静音,而 base 有
+/// −36 dB 的 /m/ 预卷,窗却在音前 80 ms(`pre = 4` 帧)就开了。把切换点挪到 46.16 之后,
+/// 同一段的最大负偏差只剩 **2.1 dB**。⇒ 收益 24 dB,门限取 6 是保守的两倍余量。
+/// ⚠⚠ 这个洞**三条整曲探针臂 + 用户的实机渲染上全都有**(实测 46.13 处:实机 −62.6 dB vs
+/// 扩展全关 −36.4),而在 S152 之前**没有任何判据看得见它** —— 包括我自己这一场先写的
+/// 「电平台阶」与「最安静切换点」两把,它们都会把这个洞**加深**。
+const JOIN_MIN_GAIN_DB: f32 = 6.0;
+
+/// `UTAI_RANGE_JOIN=1` 打开「异位移短休止按音频接上」。**默认关 ⇒ 生产逐位不变。**
+/// ⛔ 翻它必须成对 bump `RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而且要盲测过
+/// (S146 protocol;⚠ 改窗集合会让每条 donor 的 chunk 选择变、整条换一个相位实现,
+/// 所以那次 A/B **必须带同臂两跑的地板**)。
+pub fn join_rests_enabled() -> bool {
+    parse_join_rests(std::env::var("UTAI_RANGE_JOIN").ok().as_deref())
+}
+
+fn parse_join_rests(v: Option<&str>) -> bool {
+    match v {
+        Some(s) => matches!(s.trim(), "1" | "true" | "on" | "yes"),
+        None => JOIN_RESTS_DEFAULT,
+    }
+}
+
+const JOIN_RESTS_DEFAULT: bool = false;
 
 /// κ — how much of the inverse's pitch move the FORMANTS follow:
 ///   κ=0  formants stay where the model put them — the source timbre. Under TD-PSOLA this is
@@ -1882,6 +2186,351 @@ mod tests {
     /// ⑵ **阴性对照**:窗本来就相同的两个位移必须拿到**相同**的答案 —— 否则 ⑴ 有可能是靠
     ///    「总是给点不一样的东西」蒙过去的,而那种实现同样是错的。
     /// ⚠ 期望值写**字面量**,不是从 `jobs` 现算(S146f 一场犯四次:把被测的东西写进断言 = 恒真)。
+    /// 拼接的**独立参照实现**(照 S151 的语义直写:位移序、窗内 10 ms 余弦、
+    /// 缓冲区边界不淡化)。⛔ 它存在的唯一理由是 S152 把拼接拆成了两阶段 ——
+    /// 「重构没改行为」这句话必须由一份**不是从被测代码抄来**的实现来证。
+    fn reference_splice(
+        base: &mut [f32],
+        spf: f64,
+        xf: usize,
+        jobs: &[DeadJob],
+        donor_of: impl Fn(i64) -> Vec<f32>,
+    ) {
+        let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
+        shifts.sort_unstable();
+        shifts.dedup();
+        for s in shifts {
+            let donor = donor_of(s);
+            let n = base.len().min(donor.len());
+            for j in jobs.iter().filter(|j| j.shift == s) {
+                let a = ((j.start.max(0) as f64 * spf) as usize).min(n);
+                let b = ((j.end.max(0) as f64 * spf) as usize).min(n);
+                let xfw = xf.min(b.saturating_sub(a) / 2);
+                if b <= a || xfw == 0 {
+                    continue;
+                }
+                let (fi, fo) = (a > 0, b < n);
+                for k in a..b {
+                    let w = if fi && k < a + xfw {
+                        0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
+                    } else if fo && k >= b - xfw {
+                        0.5 - 0.5 * (std::f32::consts::PI * (b - k) as f32 / xfw as f32).cos()
+                    } else {
+                        1.0
+                    };
+                    base[k] = base[k] * (1.0 - w) + donor[k] * w;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_phase_splice_is_byte_for_byte_the_one_pass_one_it_replaced() {
+        // ⭐ S152 的承重判据。拼接从「渲一条→立刻拼→丢掉」改成「全部渲完→统一拼」,
+        // 唯一的理由是窗边要由**两侧的 donor** 一起决定;而在那把刀关着的时候,
+        // 输出必须**逐位**不变。⛔ 参照实现是独立写的,不是从被测代码抄的。
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize; // spf = 480
+        let mk = |seed: u32, f: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / sr as f32;
+                    ((t * f + seed as f32 * 0.37).sin() * 0.4 + (t * f * 2.1).sin() * 0.2) as f32
+                })
+                .collect()
+        };
+        let jobs = vec![
+            DeadJob { shift: -14, start: 20, end: 60 },
+            DeadJob { shift: -9, start: 63, end: 120 },
+            DeadJob { shift: -2, start: 150, end: 200 },
+            DeadJob { shift: -9, start: 260, end: 330 },
+            DeadJob { shift: -14, start: 333, end: 399 },
+        ];
+        let donor_of = |s: i64| mk((s.unsigned_abs() as u32) * 7 + 1, 300.0 + s as f32 * 11.0);
+
+        let mut got = mk(0, 220.0);
+        apply_dead_only_windows(&mut got, sr, total, &jobs, false, |s, _own| Ok(donor_of(s)))
+            .unwrap();
+
+        let mut want = mk(0, 220.0);
+        reference_splice(&mut want, n as f64 / total as f64, (sr as usize / 100).max(2), &jobs, donor_of);
+
+        assert_eq!(got.len(), want.len());
+        let bad = got.iter().zip(&want).position(|(a, b)| a != b);
+        assert!(
+            bad.is_none(),
+            "两阶段拼接与参照实现在样本 {:?} 就分开了(got {:?} want {:?})",
+            bad,
+            bad.map(|i| got[i]),
+            bad.map(|i| want[i])
+        );
+    }
+
+    /// ⭐ 46 s 那处的**真形状**,三条判据共用一份。
+    ///
+    /// 谱:窗 L = 帧 20..100(样本 9600..48000)· 休止 · 窗 R = 帧 110..380(52800..)。
+    /// 休止在 base 里是 47040..54000(= `l.end − post`,窗本来就伸进休止 2 帧)(⚠ **比 R 的窗起点还长** —— 今天 `pre = 4 帧` 让窗在
+    /// 音前 80 ms 就开了,这正是缺陷的几何)。
+    /// * `base` 在休止里有内容(残响 / 辅音预卷,−26 dBFS),别处很响。
+    ///   ⚠ 它取**负值**:RMS 不看符号,但「淡化淡回了 base」会在输出里留下负号
+    ///   —— 那是「接上时仍然淡出到 base」这条变异唯一抓得住的把柄(正值夹具上它全绿)。
+    /// * **右 donor 在 53760 之前是静音** ⇒ 今天 52800 开窗就把 base 那 960 样本(20 ms)
+    ///   换成一个洞;
+    /// * 左 donor 在整段休止里都有内容(−24 dBFS)⇒ 把切换点挪到 53760 之后,洞就没了。
+    /// ⚠ 53760 落在打分格(10 ms)的边界上,这是**故意**的:洞若不占满整格,判据的分辨率
+    ///   就读不出它 —— 那条限制本身写在 `the_rest_join_moves_...` 的断言里。
+    fn join_fixture(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let base = (0..n)
+            .map(|i| if (47_040..54_000).contains(&i) { -0.05f32 } else { -1.0 })
+            .collect();
+        let left = (0..n)
+            .map(|i| if (47_000..56_000).contains(&i) { 0.06f32 } else { 0.5 })
+            .collect();
+        let right = (0..n)
+            .map(|i| if (46_000..53_760).contains(&i) { 0.0f32 } else { 0.25 })
+            .collect();
+        (base, left, right)
+    }
+
+    fn join_jobs() -> Vec<DeadJob> {
+        // ⛔ 左窗位移 −9、右窗 −14 —— 时间序与位移序**相反**。同向的话「拼接按位移序」
+        // 那条变异是等价的(实测全绿),而顺序错了正好会让淡化淡回 base。
+        vec![
+            DeadJob { shift: -9, start: 20, end: 100 },
+            DeadJob { shift: -14, start: 110, end: 380 },
+        ]
+    }
+
+    #[test]
+    fn the_rest_join_moves_the_switch_to_where_the_hole_stops_and_refuses_when_there_is_no_hole() {
+        // ⭐ 这一刀的核心判据。⛔ 判据本身被自己的两版口径判负过两次,都记在 `join_rests` 的
+        // 文档里:①「两侧电平差最小」+ 20 ms 窗 —— 漏掉了 46 s 那 15 ms 的真数字静音;
+        // ②「切在最安静处」—— 它会把洞**加深**(46 s 那处它选 46.05,洞 24.5 dB)。
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize;
+        let spf = spf_of(n, total);
+        let xf = (sr as usize / 100).max(2);
+        let jobs = join_jobs();
+        let (base, left, right) = join_fixture(n);
+        let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left.clone()), (1, 0, right.clone())];
+
+        // 关着 ⇒ 一条都不接(默认,也是「生产逐位不变」的来源)
+        assert!(
+            join_rests(&base, sr, spf, &jobs, &kept, &[0, 1], xf, false).is_empty(),
+            "默认必须什么也不做"
+        );
+
+        let on = join_rests(&base, sr, spf, &jobs, &kept, &[0, 1], xf, true);
+        let t = *on.get(&0).expect("今天在休止里挖了个洞,挪一挪就能补上 ⇒ 必须接");
+        // ⚠ 打分格是 10 ms,所以分辨率到此为止:它挪过洞的主体(52800→53280)而不是精确
+        // 落在 53500。这条限制写在这里,免得下一个人把 `t == 53500` 当成期望值。
+        // ⚠ 分辨率:打分格 10 ms,而跨切换点那一格不计分 ⇒ 它挪过洞的主体而不是精确到边界。
+        // 这条限制写在这里,免得下一个人把某个精确值当期望。
+        assert!(
+            t >= 53_280,
+            "切换点 {t} 必须挪过那个洞的主体(今天是 52800 就开窗,洞是 52800-53760)"
+        );
+
+        // ⛔ 阴性对照 ①:右 donor 在整段休止里都有内容 ⇒ 今天就没有洞 ⇒ **不许动**。
+        let ok_right: Vec<f32> = (0..n).map(|i| if i < 46_000 { 0.25f32 } else { 0.06 }).collect();
+        assert!(
+            join_rests(&base, sr, spf, &jobs, &[(0, 0, left.clone()), (1, 0, ok_right)],
+                       &[0, 1], xf, true).is_empty(),
+            "今天已经没有洞了就不许动(离线扫的 128.9 s 就是这一类:今天 1.12 dB,接上反而 6.41)"
+        );
+        // ⛔ 阴性对照 ②:左 donor 在休止里也是静音 ⇒ 挪过去补不上 ⇒ **不许动**。
+        let dead_left: Vec<f32> = (0..n).map(|i| if i < 47_000 { 0.5f32 } else { 0.0 }).collect();
+        assert!(
+            join_rests(&base, sr, spf, &jobs, &[(0, 0, dead_left), (1, 0, right)],
+                       &[0, 1], xf, true).is_empty(),
+            "两条 donor 都补不上那个洞时必须放弃"
+        );
+    }
+
+    #[test]
+    fn joining_a_rest_puts_no_base_in_the_crossfade() {
+        // 接上之后那一次淡化的两侧**都是 donor**;base 一个样本都不许参与 ——
+        // 否则这一刀又把它本来要消灭的那个洞画了回去(只是窄了一点)。
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize;
+        let spf = spf_of(n, total);
+        let xf = (sr as usize / 100).max(2);
+        let jobs = join_jobs();
+        let (base, left, right) = join_fixture(n);
+        let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
+
+        let mut off = base.clone();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false).unwrap();
+        let mut on = base.clone();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true).unwrap();
+
+        // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
+        assert!(
+            off[53_300..53_700].iter().all(|v| v.abs() < 1e-6),
+            "关着的时候这一段必须是右 donor 的静音(那就是用户听到的洞)"
+        );
+        // ⓑ ⭐ 打开 ⇒ 今天放 base 的那一段改由**左 donor** 铺满(0.06 而不是 0.05)。
+        assert!(
+            off[49_000..52_700].iter().all(|v| (*v + 0.05).abs() < 1e-6),
+            "阴性对照:关着的时候这一段是 base"
+        );
+        let bad: Vec<usize> =
+            (49_000..52_900).filter(|&k| (on[k] - 0.06).abs() > 1e-3).collect();
+        assert!(
+            bad.is_empty(),
+            "这一段还剩 {} 个样本不是左 donor(第一个在 {:?},值 {:?})",
+            bad.len(),
+            bad.first(),
+            bad.first().map(|&k| on[k])
+        );
+        // ⓒ 洞必须**变短**(不必消失:切换点受打分格 10 ms 的分辨率限制;
+        // 这份夹具实测 481 → 361 个静音样本,即 10 ms 的 960 样本洞缩到 7.5 ms)。
+        let zeros = |x: &[f32]| x[52_800..53_760].iter().filter(|v| v.abs() < 1e-6).count();
+        assert!(
+            zeros(&on) + 100 < zeros(&off),
+            "洞没怎么变短:关 {} 个静音样本 → 开 {} 个",
+            zeros(&off),
+            zeros(&on)
+        );
+        // ⓓ base 不许出现在切换区里 —— 它是负的,两条 donor 都是正的。
+        assert!(
+            on[48_500..53_900].iter().all(|v| *v > -1e-6),
+            "切换区里出现了 base(负值)⇒ 淡化淡回了 base"
+        );
+        // ⓔ 而且窗外仍是 base、窗内是 donor(证明上面几条不是恒真的)。
+        assert_eq!(on[0], -1.0, "窗外必须仍然是 base");
+        assert!((on[30_000] - 0.5).abs() < 1e-6, "左窗内必须是左 donor");
+        assert!((on[60_000] - 0.25).abs() < 1e-6, "右窗内必须是右 donor");
+    }
+
+    #[test]
+    fn the_join_refuses_the_three_things_it_is_not_for() {
+        // ⛔ 三条**错误分支**,写完必须真触发一次 —— 一条从没被执行过的分支就是一条空判据
+        // (S129)。变异实测:不补这三条,「同位移也接」「不限桥接上限」「越界不夹紧」全绿。
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize;
+        let spf = spf_of(n, total);
+        let xf = (sr as usize / 100).max(2);
+        let (base, left, right) = join_fixture(n);
+        let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left.clone()), (1, 0, right.clone())];
+        let diff = join_jobs();
+
+        // 先钉住阴性对照:这份夹具在异位移下**必须**接得上,否则下面三条都是恒真的。
+        assert!(
+            !join_rests(&base, sr, spf, &diff, &kept, &[0, 1], xf, true).is_empty(),
+            "阴性对照:这份夹具本来就该接得上"
+        );
+
+        // ⓐ **同位移**:那是 S151 笔5 在计划层合并的事,这里必须放过。
+        let same = vec![
+            DeadJob { shift: -9, start: 20, end: 100 },
+            DeadJob { shift: -9, start: 110, end: 380 },
+        ];
+        assert!(
+            join_rests(&base, sr, spf, &same, &kept, &[0, 1], xf, true).is_empty(),
+            "同位移的一对不归这一刀管"
+        );
+
+        // ⓑ **长休止**:桥接上限之外不许接。
+        // ⛔ 夹具必须是「不设守卫就一定会接」的那种 —— 否则这条守卫是等价变异(实测全绿)。
+        let far = vec![
+            DeadJob { shift: -9, start: 20, end: 100 },
+            DeadJob { shift: -14, start: 100 + MERGE_BRIDGE_FRAMES + 1, end: 380 },
+        ];
+        let far_base: Vec<f32> = (0..n)
+            .map(|i| if (47_040..62_000).contains(&i) { -0.05f32 } else { -1.0 })
+            .collect();
+        let far_kept: Vec<(i64, usize, Vec<f32>)> = vec![
+            (0, 0, (0..n).map(|i| if (47_000..63_000).contains(&i) { 0.06f32 } else { 0.5 }).collect()),
+            (1, 0, (0..n).map(|i| if (46_000..61_000).contains(&i) { 0.0f32 } else { 0.25 }).collect()),
+        ];
+        // 先证它「本来会接」:把同一份夹具的间隙缩到上限之内。
+        let near = vec![
+            DeadJob { shift: -9, start: 20, end: 100 },
+            DeadJob { shift: -14, start: 100 + MERGE_BRIDGE_FRAMES, end: 380 },
+        ];
+        assert!(
+            !join_rests(&far_base, sr, spf, &near, &far_kept, &[0, 1], xf, true).is_empty(),
+            "阴性对照:同一份夹具在上限之内必须接得上"
+        );
+        assert!(
+            join_rests(&far_base, sr, spf, &far, &far_kept, &[0, 1], xf, true).is_empty(),
+            "休止比桥接上限还长 ⇒ 不许接"
+        );
+
+        // ⓒ **片段不够长**:右片段从 53_000 才开始 ⇒ 右窗要从 `t − xf` 起,越出片段 ⇒
+        // 必须响亮夹紧,不许越界索引(不夹紧 ⇒ `seg[k - seg_lo]` 下溢 panic,变异实测)。
+        let short: Vec<(i64, usize, Vec<f32>)> = vec![
+            (0, 0, left[..56_000].to_vec()),
+            (1, 53_000, right[53_000..(380 * 480)].to_vec()),
+        ];
+        let mut out = base.clone();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true).unwrap();
+        assert_eq!(out[0], -1.0, "窗外仍是 base");
+        assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
+    }
+
+    #[test]
+    fn the_donor_render_margin_covers_everything_the_join_can_reach() {
+        // ⛔⛔ 这两个常量是**一对**,而它们住在两个模块里 —— 正是「改一个忘了另一个」最容易
+        // 发生的形状,而且后果是**静默的**:窗边被挪进一个没渲的 chunk ⇒ 拼进去的是铺零 ⇒
+        // 一个新的洞,形状与这一刀要修的那个一模一样,任何现存判据都看不见。
+        //
+        // 这一刀最远能把窗边挪到 `l.end + gap + min(gap, 4)`,而 `gap ≤ MERGE_BRIDGE_FRAMES`。
+        let reach = MERGE_BRIDGE_FRAMES + 4;
+        assert!(
+            crate::inference::score2svc::DONOR_WINDOW_MARGIN_FRAMES >= reach,
+            "donor 只渲了窗 ±{} 帧,而拼接层够得到 ±{reach} 帧 —— 中间那段会是铺零",
+            crate::inference::score2svc::DONOR_WINDOW_MARGIN_FRAMES
+        );
+    }
+
+    #[test]
+    fn the_join_survives_the_whole_pipeline_and_needs_the_segment_margin() {
+        // ⭐ 端到端:从 `apply_dead_only_windows_with` 进,donor 由闭包给。
+        // ⛔ 它守的是**收益不许被静默砍掉** —— 变异实测:把 `margin` 改成 0 之后,每条 donor
+        // 的片段只覆盖窗本身,搜索窗左右两半就永远凑不齐,这一刀悄悄什么也不做,而所有
+        // 只用手工 `kept` 的单元测试**全绿**。S147 那次「收益静默减半」是同一个形状。
+        // ⚠ 这条测试本身被我删过一次(重写三条 join 判据时连带删掉),而 `margin` 的变异
+        //   当场就变绿了 —— 留着这句,提醒下一个人别再删。
+        let sr = 48_000u32;
+        let total = 400i64;
+        let n = 400 * 480usize;
+        let jobs = join_jobs();
+        let (base0, left, right) = join_fixture(n);
+        let run = |join: bool| {
+            let mut b = base0.clone();
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, false, join, |s, _| {
+                Ok(if s == -9 { left.clone() } else { right.clone() })
+            })
+            .unwrap();
+            b
+        };
+        let off = run(false);
+        let on = run(true);
+        assert_ne!(off, on, "打开与关闭必须真的不同");
+        assert!(
+            off[49_000..52_700].iter().all(|v| (*v + 0.05).abs() < 1e-6),
+            "关着的时候那一段仍是 base"
+        );
+        let bad: Vec<usize> =
+            (49_000..52_900).filter(|&k| (on[k] - 0.06).abs() > 1e-3).collect();
+        assert!(
+            bad.is_empty(),
+            "走完整条管线之后那一段还剩 {} 个样本不是左 donor(第一个 {:?})",
+            bad.len(),
+            bad.first()
+        );
+    }
+
+    fn spf_of(n: usize, total: i64) -> f64 {
+        n as f64 / total as f64
+    }
+
     #[test]
     fn donor_render_gets_only_its_own_windows() {
         let jobs = [

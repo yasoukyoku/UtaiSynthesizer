@@ -63,7 +63,15 @@ pub(crate) const CV_FPS: f64 = 50.0;
 /// against a tightest real margin of **262 samples (5.9 ms)** in the current plan. Intersecting
 /// with no margin therefore splices the window's own 10 ms cross-fade tail into digital zero.
 /// Two frames = 40 ms covers both the divergence and the fade itself.
-const DONOR_WINDOW_MARGIN_FRAMES: i64 = 2;
+///
+/// ⛔⛔ **S152 把它从 2 提到 29,而那是一条正确性修复,不是余量加保险。**
+/// `vocal_range::join_rests` 会在拼接阶段(donor 早就渲完之后)把一条窗边**挪到休止的另一头**
+/// —— 最远 `MERGE_BRIDGE_FRAMES(25) + 4 = 29` 帧。若那一段落在一个**没被渲的 chunk** 里,
+/// 拼进去的就是铺零 = **一个新的洞**,而且形状与它要修的那个一模一样。
+/// ⇒ 渲染侧的余量必须**覆盖拼接侧够得到的最远处**;这两个数字从此是一对,改一个必须改另一个。
+/// ⚠ 代价可忽略:chunk 长约 11.6 s(整曲 291 s / 25 个),580 ms 的余量只在窗正好压在
+/// chunk 边界上时才多渲一个。
+pub(crate) const DONOR_WINDOW_MARGIN_FRAMES: i64 = 29;
 /// so-vits-svc 4.x default output geometry (== the Python reference `synth_sovits` CV_FPS/SOVITS_HOP).
 /// A future non-44100/512 SoVITS export would carry these in its sidecar; 4.x is always this.
 pub const SOVITS_SR: u32 = 44100;
