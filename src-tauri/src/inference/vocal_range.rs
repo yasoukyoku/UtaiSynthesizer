@@ -1122,6 +1122,11 @@ pub fn dead_group_windows(
     merge_same_shift_across_rests(note_nums, plan, raw)
 }
 
+/// 能被桥接的休止上限,50 fps 帧(= 0.5 s)。缺陷本身只有 60 ms;这个数是「够宽到覆盖所有
+/// 乐句间的短休止,窄到不会把窗撑过整段间奏」——实测把 63 个窗合成 50 个(覆盖 +12.6 s),
+/// 而**渲染耗时与逐遍 skipped 一个数都不变**。
+const MERGE_BRIDGE_FRAMES: i64 = 25;
+
 /// S151d —— **位移相同、中间只隔休止的两个窗必须合并成一个。**
 ///
 /// ⛔ 这是用户 2026-08-18 在 46 秒「ま」与「さ」之间听到的那个杂音,取证如下(炉心融解 +7,
@@ -1144,6 +1149,10 @@ fn merge_same_shift_across_rests(
             (Some(last), Some(pe)) => {
                 last.shift == j.shift
                     && ((pe + 1)..g.start).all(|k| note_nums.get(k).copied().unwrap_or(0) <= 0)
+                    // ⛔ 只桥**短**休止:我修的是一个 60 ms 的洞,而不设上限时这条规则会跨过
+                    // 长休止把窗撑到 18.6 s(实测),那是**把结论推到证据之外**。
+                    // 桥不过去的长休止本来也没有「收尾被切」的问题 —— 那里两条臂都是静音。
+                    && (j.start - last.end) <= MERGE_BRIDGE_FRAMES
             }
             _ => false,
         };
@@ -2346,6 +2355,9 @@ mod tests {
             DeadGroup { start: 3, end: 3, shift: -6 },
         ];
         assert_eq!(dead_group_windows(&nn3, &fr, &plan3).len(), 2, "跨过唱音不许合并");
+        // ⛔ 长休止不许桥:缺陷只有 60 ms,不设上限时窗会被撑到 18.6 s(实测)。
+        let fr_long = [10i64, 20, 200, 20, 10];
+        assert_eq!(dead_group_windows(&nn, &fr_long, &plan).len(), 2, "4 秒的休止不许桥");
     }
 
     #[test]
