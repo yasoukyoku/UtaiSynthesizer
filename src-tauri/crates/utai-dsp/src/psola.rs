@@ -129,15 +129,23 @@ pub struct PsolaDiagnostics {
     /// history with confidently-worded wrong comments (one of them kept TD-PSOLA out for four
     /// months).
     ///
-    /// ⚠⚠ **Two collars that must travel with this number, or it reads as an emergency:**
-    /// 1. **It is inaudible.** 97 % of it is below 5 Hz; 20-50 Hz holds ≤0.26 %.
-    /// 2. **It does not eat headroom.** Removing everything under 50 Hz moves the whole-song peak
-    ///    by **−0.008 dB** (a locally-measured note peak moves ~0.34 dB).
+    /// ⛔⛔ **"It is inaudible" was written here first and it is only half true.** By *energy* it
+    /// is: 97 % sits below 5 Hz. But the thing that matters is not the steady share, it is the
+    /// **steps** — the baseline jumps, and a step is broadband with a 1/f tail. Measured at the
+    /// four largest jumps (±40 ms), against the ext-off arm: **20-60 Hz is +16 to +24 dB**, and
+    /// that band is audible. Whole song, voiced cells: 1-20 Hz **+28.2 dB**, **20-60 Hz +7.9 dB**,
+    /// 60-200 Hz −1.0, 200-800 Hz +0.3.
+    /// ⇒ the collar that survives is only: **it does not eat headroom** (removing everything under
+    /// 50 Hz moves the whole-song peak by −0.008 dB).
     ///
-    /// ⭐ What it *does* cost: it is inside every RMS-domain ruler we own, so S150/S151's `rms` /
-    /// `depth` / `ripple` readings on rescued notes carry up to a third of their energy in
-    /// infrasound; and it is the shape behind the user's "波形甚是诡异" (registry `user_coordinates`
-    /// points at `[685]`, the note whose waveform rides a wandering baseline).
+    /// ⭐ How big the steps are: |Δbaseline| per 5 ms, normalised by the ext-off arm's local RMS —
+    /// ext-off has **6** cells over 20 %, today has **1295**, and the worst reads **238 %**
+    /// (at 133.44 s the baseline jumps 0 → **+0.235** while the waveform peaks at 0.5).
+    /// ⭐ It is also visible: the waveform sits off-centre. The user diagnosed it from Audition —
+    /// vertical low-frequency bands in the spectrogram at exactly the places he had been calling
+    /// "seams" / "clicks", plus five-track waveforms where only the ext-off and the HP arm looked
+    /// symmetric. Every ruler in this repo had missed it, because they are all RMS-domain and
+    /// **RMS does not see a DC offset as a defect — it just counts it as signal.**
     pub infrasonic_frac: f32,
     /// S152 — how much of that the removal arm actually took out (`before − after`), 0.0 when off.
     /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
@@ -790,13 +798,49 @@ fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize,
 /// Two passes of a box of this length = a triangular window, whose first null sits at
 /// `1000 / INFRASONIC_MA_MS` Hz and whose stop-band then falls as 1/f².
 ///
-/// ⛔ 20 ms is **measured, not chosen**: on a real production output (goose +7 × akiko, −14 st,
-/// the worst ratio on the score) the resulting high-pass reads
-/// 0-5 Hz **−41.3 dB** · 5-20 −19.3 · 20-50 −2.9 · 50-100 **−0.20** · 100-200 **−0.08** ·
-/// ≥200 Hz **−0.01 dB**. That is the whole point of the two-pass form: a single box leaves
-/// −13 dB side-lobes that would put ±0.4 dB of ripple on the fundamental, and the fundamental of
-/// a donor is 150-500 Hz — the one band this must not touch.
-const INFRASONIC_MA_MS: f64 = 20.0;
+/// ## ⛔⛔ This number was picked twice against a **broken reference** before it was picked right
+///
+/// The question is "how much of the low band did this process ADD", so it needs a reference that
+/// is the same performance minus the process. Two wrong answers came first:
+/// 1. **20 ms**, chosen because 97 % of the injected *energy* is below 5 Hz ⇒ "inaudible".
+///    That reasoning is about the steady share, and the audible part is the **steps**.
+/// 2. **12 ms**, chosen by matching the **ext-off** arm. ⛔ The user caught this one:
+///    *"无扩在很多地方都失声了毫无参考意义"* — the un-rescued arm is silent on exactly the notes
+///    that get rescued, so part of "today is +7.9 dB louder in 20-60 Hz" is simply
+///    **the rescue giving those notes a voice**, which is not a defect. Same trap this session's
+///    adversarial pass had already written down as a rule, and it caught me anyway.
+///
+/// ## The reference that works: the donor against **itself**
+///
+/// `mg_render_sovits` with `UTAI_MG_INVERSE=0` vs `=1` is the same render with and without this
+/// process. Band RMS over voiced 50 ms cells, after aligning the two arms on 400-4000 Hz (each
+/// gets its own `peak_normalize`, which is a fake difference otherwise). ⚠ Judge on **20-60 Hz
+/// only**: a voice's f0 cannot live there (that is MIDI 24-34), while 60-150 Hz really does carry
+/// the raw arm's fundamental (it is the whole song transposed down) and is therefore not
+/// comparable.
+///
+/// | cut | −9 st | −12 st | −14 st | cost at 400-4k |
+/// |---|---|---|---|---|
+/// | injected (no removal) | +13.2 | +14.5 | +14.7 | — |
+/// | 20 ms | +10.8 | +12.2 | +12.3 | −0.002 dB |
+/// | 12 ms | +6.0 | +7.4 | +7.6 | −0.005 |
+/// | **8 ms** | **+0.6** | **+2.0** | **+2.2** | **−0.013** |
+/// | 6 ms | −3.7 | −2.4 | −2.2 (now cutting real signal) | −0.021 |
+///
+/// ⇒ 8 ms lands on the target at all three ratios and costs 0.013 dB where the voice actually is.
+///
+/// ## ⚠ The assumption this carries
+///
+/// The first null is at **125 Hz**, so this is safe only while the OUTPUT fundamental stays well
+/// above it. Production is an up-shift onto notes the model could not reach (output f0 830-1480 Hz
+/// on the calibration song) so it is far away. ⛔ But `cover_dead_plan` can emit **+22** (audio
+/// shifted DOWN 22 semitones) and `MAX_RANGE_SHIFT = 24`; at an output f0 of 110 Hz this filter
+/// takes **−0.38 dB** off the fundamental. That is measured, not hypothetical — see
+/// `the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental`, which asserts the
+/// analytic response rather than pretending the effect is zero.
+/// ⇒ if this arm is ever turned on for the cover path, the width has to follow f0 (≈ 3 periods)
+/// instead of being a constant.
+const INFRASONIC_MA_MS: f64 = 8.0;
 
 /// Box filter with a running prefix sum; the window shrinks at the two ends rather than
 /// zero-padding (zero-padding would manufacture a step exactly where the buffer starts).
@@ -821,7 +865,15 @@ fn box_average(x: &[f64], half: usize) -> Vec<f64> {
 /// The infrasonic baseline of `x` — two box passes = a triangular low-pass. See
 /// [`INFRASONIC_MA_MS`] for the measured response.
 fn infrasonic_baseline(x: &[f32], sample_rate: u32) -> Vec<f64> {
-    let half = (((f64::from(sample_rate) * INFRASONIC_MA_MS / 1000.0) as usize) / 2).max(1);
+    infrasonic_baseline_ms(x, sample_rate, INFRASONIC_MA_MS)
+}
+
+/// Same, with the width given explicitly — the constant has to be **scannable by a criterion**,
+/// or "someone widened it back to 20 ms" and "the arm works" look identical from every test here.
+/// (Measured: with the width hard-coded, changing 8 → 20 ms left the whole file green while the
+/// benefit halved. That is the S147 silent-halving shape.)
+fn infrasonic_baseline_ms(x: &[f32], sample_rate: u32, ms: f64) -> Vec<f64> {
+    let half = (((f64::from(sample_rate) * ms / 1000.0) as usize) / 2).max(1);
     let v: Vec<f64> = x.iter().map(|s| f64::from(*s)).collect();
     box_average(&box_average(&v, half), half)
 }
@@ -1081,12 +1133,15 @@ pub fn psola_shift_locked(
 /// `wsum ≈ 1` lays it down as a wandering baseline — up to a third of a rescued note's energy at
 /// −14 st. ⚠ It is NOT a property of asymmetric waveforms; a sine does it too (see the gate).
 ///
-/// ## ⚠ What this is NOT
+/// ## What it buys
 ///
-/// It is **not** an audibility fix: 97 % of the injected energy is below 5 Hz and removing all of
-/// it moves the whole-song peak by −0.008 dB. Its two real payoffs are that every RMS-domain
-/// ruler we own stops carrying it, and that the output stops riding a wandering baseline (which
-/// is the shape the user named "波形甚是诡异" on `[685]`).
+/// ⛔ The first version of this paragraph said "it is not an audibility fix". That was wrong for
+/// the reason spelled out on [`PsolaDiagnostics::infrasonic_frac`]: the energy share is
+/// inaudible, but the **steps** put **+16 to +24 dB into 20-60 Hz** at exactly the moments the
+/// user calls seams. With the cut at 12 ms this arm puts that band back within **0.4 dB** of the
+/// un-rescued render while moving the fundamental by **0.02 dB**.
+/// It also stops every RMS-domain ruler we own from silently counting a DC offset as signal, and
+/// stops the waveform riding off-centre (the shape the user named "波形甚是诡异" on `[685]`).
 ///
 /// ## Contract
 ///
@@ -1743,6 +1798,70 @@ mod tests {
     }
 
     #[test]
+    fn the_cut_is_wide_enough_to_reach_the_audible_part_of_what_this_process_injects() {
+        // ⛔⛔ THE criterion for the constant itself. Without it, widening 8 ms back to 20 ms
+        // leaves this whole file green while the benefit halves — measured, and it is the exact
+        // shape S147 shipped once ("silent halving").
+        //
+        // What it pins: the injection is **not** confined to the inaudible band. Whole-song
+        // measurement against the donor's own pre-PSOLA arm (the only reference that is the same
+        // performance minus this process) says 20-60 Hz runs **+13.2 / +14.5 / +14.7 dB** at
+        // −9 / −12 / −14 st, and the cut has to reach it: 20 ms leaves +10.8/+12.2/+12.3,
+        // 8 ms leaves **+0.6/+2.0/+2.2**.
+        // ⚠ The synthetic fixture here is not the song — the numbers differ — so what is asserted
+        // is the ORDERING and a floor, not the song's dB values.
+        let sr = 44_100;
+        let period = 200usize;
+        let f0 = f64::from(sr) / period as f64;
+        let hop = sr as usize / 200;
+        let x = asym_pulses(sr, 1.0, period);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        // Energy in 20-60 Hz, sampled analytically so no filter of our own is involved.
+        let low = |y: &[f32]| -> f64 {
+            [25.0f64, 35.0, 45.0, 55.0].iter().map(|f| tone_mag(y, sr, *f).powi(2)).sum::<f64>()
+        };
+        let (out, _) = psola_shift_locked(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30);
+        let injected = low(&out);
+        assert!(
+            injected > low(&x) * 10.0,   // 实测 25×
+            "the fixture must actually show the injection first ({:.3e} vs {:.3e})",
+            injected,
+            low(&x)
+        );
+        let after = |ms: f64| -> f64 {
+            let lf = infrasonic_baseline_ms(&out, sr, ms);
+            let y: Vec<f32> =
+                out.iter().zip(&lf).map(|(o, l)| (f64::from(*o) - *l) as f32).collect();
+            low(&y)
+        };
+        let cur = after(INFRASONIC_MA_MS);
+        let wide = after(20.0);
+        assert!(
+            cur < injected * 0.10,
+            "the shipped cut must take out ≥90 % of the 20-60 Hz injection, got {:.1} %",
+            100.0 * cur / injected
+        );
+        assert!(
+            wide > cur * 3.0,
+            "…and a 20 ms cut must NOT (it reaches only the inaudible half): 20 ms leaves              {:.1} % vs the shipped {:.1} % — if these are close the constant is unpinned",
+            100.0 * wide / injected,
+            100.0 * cur / injected
+        );
+        // ⚠ and the other side: it must not be so narrow that it eats the voice. Checked at
+        // **882 Hz** (the 2nd harmonic here), i.e. inside production's real output-f0 band of
+        // 830-1480 Hz. ⛔ Not at 441 Hz: the triangular window's response is oscillatory and
+        // still costs 0.07 dB there — that is the documented, analytic behaviour (the other gate
+        // asserts it exactly), not a defect, and pinning zero at 441 would force the cut back to
+        // a width that only reaches the inaudible half.
+        let lf = infrasonic_baseline_ms(&out, sr, INFRASONIC_MA_MS);
+        let y: Vec<f32> = out.iter().zip(&lf).map(|(o, l)| (f64::from(*o) - *l) as f32).collect();
+        let fp = f0 * 2f64.powf(12.0 / 12.0) * 2.0;
+        let d =
+            20.0 * (tone_mag(&y, sr, fp).max(1e-12) / tone_mag(&out, sr, fp).max(1e-12)).log10();
+        assert!(d.abs() < 0.03, "{fp:.0} Hz (production's band) moved {d:+.3} dB");
+    }
+
+    #[test]
     fn the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental() {
         // The honest gate for the arm being ON. It cannot be `assert_eq!` at ratio 1.0 — a linear
         // filter is never bit-exact — so the contract it must meet instead is stated as a bound
@@ -1767,10 +1886,17 @@ mod tests {
                 "{st} st: the BEFORE readout must not depend on the arm"
             );
 
-            // ⛔ THE bound that makes this safe: the fundamental and its first harmonics are the
-            // one band a low-cut must not reach, and a donor's f0 is 150-500 Hz — close enough to
-            // 50 Hz that "obviously fine" is not an argument.
+            // ⛔⛔ THE bound, and it is **not** "the fundamental does not move". An earlier
+            // version asserted exactly that, and it became a lie the moment the cut went from
+            // 20 ms to 8 ms: at an output f0 of 110 Hz (a −12 st arm on this 220 Hz fixture) the
+            // fundamental really does drop 0.18 dB. Asserting zero there would have pinned the
+            // constant to a value that only fixes the half nobody can hear.
+            // ⇒ what is asserted instead: the arm **is exactly the filter it documents** (two box
+            // passes = a triangular window, analytic), plus a hard zero-cost bound over the band
+            // production actually lives in.
             let out_f0 = f0 * 2f64.powf(st / 12.0);
+            let half = (((f64::from(sr) * INFRASONIC_MA_MS / 1000.0) as usize) / 2).max(1);
+            let l = (2 * half + 1) as f64;
             for h in [1.0f64, 2.0, 3.0] {
                 let f = out_f0 * h;
                 if f >= f64::from(sr) / 2.0 {
@@ -1778,11 +1904,26 @@ mod tests {
                 }
                 let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
                 let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+                // Dirichlet kernel of one box, squared for the two passes; high-pass = 1 - D^2.
+                let ph = std::f64::consts::PI * f / f64::from(sr);
+                let dk = if ph.abs() < 1e-12 { 1.0 } else { (ph * l).sin() / (l * ph.sin()) };
+                let want = 20.0 * (1.0 - dk * dk).abs().max(1e-12).log10();
                 assert!(
-                    d.abs() < 0.15,
-                    "{st} st: harmonic {h} at {f:.0} Hz moved {d:+.3} dB — the removal is \
-                     supposed to be band-limited well below it"
+                    (d - want).abs() < 0.10,
+                    "{st} st: {f:.0} Hz moved {d:+.3} dB but the triangular window predicts \
+                     {want:+.3} — then this arm is not the filter it documents"
                 );
+                // …and over the band production actually uses, the cost must be nil.
+                // ⚠ 800 Hz, not 250: the triangular window's response is oscillatory, and at
+                // 330 Hz it still costs 0.10 dB (matching the analytic value above — the filter
+                // is fine, the threshold was wrong). Production's output f0 is 830-1480 Hz.
+                if f >= 800.0 {
+                    assert!(
+                        d.abs() < 0.03,
+                        "{st} st: {f:.0} Hz moved {d:+.3} dB — production's output f0 is \
+                         830-1480 Hz and the cost has to be nil there"
+                    );
+                }
             }
         }
     }
