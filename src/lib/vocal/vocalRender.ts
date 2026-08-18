@@ -641,8 +641,16 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  `[796..=802]`, note 802 = MIDI 81, dead). A fade exists to hide a donor↔base discontinuity;
  *  at the edge of the buffer there is none to hide. Everything else about the decision is
  *  unchanged, so only scores whose final phrase is rescued differ, and only in their last 10 ms.
- *  (The S151 passenger trim itself is env-gated and OFF, so it does not move this term yet.) */
-export const RANGE_ALGO_VERSION = "s151x";
+ *  (The S151 passenger trim itself is env-gated and OFF, so it does not move this term yet.)
+ *  s151y = two rescue windows at the SAME shift with only a rest between them are now ONE window.
+ *  They came from one continuous donor render, and cutting them apart punched a 60 ms hole that
+ *  was filled with `base` — i.e. with the take this feature exists to replace. Measured on
+ *  炉心融解 +7 (the user reported it by ear as a noise between 「ま」 and 「さ」 at 46 s): the window
+ *  expired at 46.40 s while the donor's 「ま」 was still sounding at **−18 dBFS**, and the 10 ms
+ *  cross-fade took it to **−56 dB** (the rest's digital silence in base) inside 30 ms — an abrupt
+ *  truncation of the note's release. 10 such holes in that render, 3 in the untransposed one.
+ *  Only rests may be bridged: merging across a SUNG note would drag a passenger into the rescue. */
+export const RANGE_ALGO_VERSION = "s151y";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and

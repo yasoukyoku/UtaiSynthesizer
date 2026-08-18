@@ -1085,7 +1085,8 @@ pub fn dead_group_windows(
         acc += f.max(0);
         cum.push(acc);
     }
-    plan.iter()
+    let raw: Vec<DeadJob> = plan
+        .iter()
         .map(|g| {
             let mut k = g.start;
             while k > 0 && note_nums[k - 1] <= 0 {
@@ -1117,7 +1118,44 @@ pub fn dead_group_windows(
             };
             DeadJob { shift: g.shift, start: cum[g.start] - pre, end: cum[g.end + 1] + post }
         })
-        .collect()
+        .collect();
+    merge_same_shift_across_rests(note_nums, plan, raw)
+}
+
+/// S151d —— **位移相同、中间只隔休止的两个窗必须合并成一个。**
+///
+/// ⛔ 这是用户 2026-08-18 在 46 秒「ま」与「さ」之间听到的那个杂音,取证如下(炉心融解 +7,
+/// 逐 10 ms RMS):窗在 **46.40 s** 到期,而那一刻 donor 的「ま」**还在 −18 dB 上响着**;
+/// 交叉淡化把它在 30 ms 内砍到 **−56 dB**(= 同处 base 的电平,那是休止的数字静音),
+/// 60 ms 之后下一个窗再淡进来。⇒ **音的收尾被硬切**,而且切它的理由根本不存在 ——
+/// 两侧位移**一样**,那 60 ms 本来就在**同一条 donor** 上,是我们自己把它挖掉换成 base 的。
+///
+/// 判据:`两个同位移的窗之间只有休止时必须合成一个窗`。⚠ 只在**中间全是休止**时合并:
+/// 跨过一个唱音去合并,等于把一个乘客悄悄拖进救援(那是另一把刀的事,不许在这里发生)。
+fn merge_same_shift_across_rests(
+    note_nums: &[i64],
+    plan: &[DeadGroup],
+    raw: Vec<DeadJob>,
+) -> Vec<DeadJob> {
+    let mut out: Vec<DeadJob> = Vec::with_capacity(raw.len());
+    let mut prev_end_note: Option<usize> = None;
+    for (g, j) in plan.iter().zip(raw) {
+        let mergeable = match (out.last(), prev_end_note) {
+            (Some(last), Some(pe)) => {
+                last.shift == j.shift
+                    && ((pe + 1)..g.start).all(|k| note_nums.get(k).copied().unwrap_or(0) <= 0)
+            }
+            _ => false,
+        };
+        if mergeable {
+            let last = out.last_mut().expect("checked");
+            last.end = j.end.max(last.end);
+        } else {
+            out.push(j);
+        }
+        prev_end_note = Some(g.end);
+    }
+    out
 }
 
 /// How far a rescue window may reach into a **sung** neighbour so the splicer's 10 ms cross-fade
@@ -2279,6 +2317,35 @@ mod tests {
         for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
             assert!(parse_trim(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认,不是静默乱开");
         }
+    }
+
+    /// S151d:同位移、中间只隔休止的两个窗必须合成一个 —— 否则我们会在**同一条 donor** 上
+    /// 挖一个洞、把 base 填进去,而 donor 的收尾正响着(实测 46.40 s:−18 dB 被 30 ms 内砍到 −56)。
+    #[test]
+    fn two_windows_at_the_same_shift_with_only_a_rest_between_them_become_one() {
+        let nn = [0, 85, 0, 85, 0];
+        let fr = [10i64, 20, 3, 20, 10];
+        let plan = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 3, end: 3, shift: -6 },
+        ];
+        let w = dead_group_windows(&nn, &fr, &plan);
+        assert_eq!(w.len(), 1, "同一条 donor 上不许挖洞");
+        assert_eq!(w[0].shift, -6);
+        assert_eq!((w[0].start, w[0].end), (6, 55), "合并后的窗要盖住两段与中间那个休止");
+        // ⛔ 位移不同 ⇒ 必须**不**合并(那两侧本来就是两条不同的 donor)。
+        let plan2 = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 3, end: 3, shift: -7 },
+        ];
+        assert_eq!(dead_group_windows(&nn, &fr, &plan2).len(), 2, "位移不同不许合并");
+        // ⛔ 中间夹着一个**唱音** ⇒ 必须不合并(合了等于把乘客偷偷拖进救援)。
+        let nn3 = [0, 85, 73, 85, 0];
+        let plan3 = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 3, end: 3, shift: -6 },
+        ];
+        assert_eq!(dead_group_windows(&nn3, &fr, &plan3).len(), 2, "跨过唱音不许合并");
     }
 
     #[test]
