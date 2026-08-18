@@ -633,8 +633,16 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  ⚠ NOT bumped: the `_s2r` key in commands/audio.rs. That one caches the TEMPO SLIDER's
  *  time-stretch (time_factor only — it never reaches apply_inverse), so bumping it would
  *  invalidate unrelated work. The memory rule "three cache versions move together" is imprecise:
- *  only two of the three sit on this path. */
-export const RANGE_ALGO_VERSION = "s150l";
+ *  only two of the three sit on this path.
+ *  s151x = the splice's 10 ms cross-fade is no longer drawn where there is nothing to fade back
+ *  into. It is painted INSIDE the window, so at a window edge the donor weight starts at 0 — and
+ *  on the LAST group of a score `gap_next == 0` ⇒ `post == 0` ⇒ those 10 ms landed on the last
+ *  RESCUED note, handing it back to the broken take (measured on 炉心融解 × akiko: group
+ *  `[796..=802]`, note 802 = MIDI 81, dead). A fade exists to hide a donor↔base discontinuity;
+ *  at the edge of the buffer there is none to hide. Everything else about the decision is
+ *  unchanged, so only scores whose final phrase is rescued differ, and only in their last 10 ms.
+ *  (The S151 passenger trim itself is env-gated and OFF, so it does not move this term yet.) */
+export const RANGE_ALGO_VERSION = "s151x";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and

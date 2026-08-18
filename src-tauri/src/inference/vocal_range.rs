@@ -934,14 +934,43 @@ pub fn dead_group_windows(
                 k += 1;
             }
             let gap_next = cum[k] - cum[g.end + 1];
-            DeadJob {
-                shift: g.shift,
-                start: cum[g.start] - 4.min(gap_prev / 2),
-                end: cum[g.end + 1] + 2.min(gap_next / 2),
-            }
+            // S151 护栏 —— 一条窗边落在**唱音**上时,把窗多伸进那个乘客,好让拼接器的 10 ms
+            // 交叉淡化压在**它**身上而不是压在被救的死音上。见 `GUARD_FRAMES`。
+            // ⚠ 有休止可用时一个字不改(`gap_prev/gap_next > 0` 走原来那条路),所以
+            // **今天的计划逐帧不变** —— 这条只有裁剪/拆组产生的乐句内部边界才会走到。
+            let pre = if gap_prev > 0 {
+                4.min(gap_prev / 2)
+            } else if g.start > 0 {
+                GUARD_FRAMES.min((cum[g.start] - cum[g.start - 1]) / 2)
+            } else {
+                0
+            };
+            let post = if gap_next > 0 {
+                2.min(gap_next / 2)
+            } else if g.end + 1 < note_nums.len() {
+                GUARD_FRAMES.min((cum[g.end + 2] - cum[g.end + 1]) / 2)
+            } else {
+                0
+            };
+            DeadJob { shift: g.shift, start: cum[g.start] - pre, end: cum[g.end + 1] + post }
         })
         .collect()
 }
+
+/// How far a rescue window may reach into a **sung** neighbour so the splicer's 10 ms cross-fade
+/// lands on the passenger instead of on the rescued note. Two frames = 40 ms at the score's
+/// 50 fps grid, i.e. 4× the fade, and the same roll today's rests already get.
+///
+/// ⛔ Why this is not cosmetic. `apply_dead_only_windows` draws the fade **inside** the window:
+/// at the window's first and last sample the donor weight is 0, so those 10 ms are (mostly) BASE
+/// — and on a rescued note base is precisely the broken render this whole feature exists to
+/// replace. As long as every window edge sat in a rest (pre ≤4 / post ≤2 frames of silence) that
+/// was harmless. Trimming and splitting move edges into the middle of a phrase, and without this
+/// the trim would hand back up to 10 ms of the defect at **both ends of every cut group** — while
+/// every counter (group count, passenger count, donor passes, shift set) and every unit test
+/// stayed green. Measured cost of the guard itself: 40 ms of one passenger is rendered from the
+/// donor instead of base, at the same written pitch (the inverse already put it back).
+const GUARD_FRAMES: i64 = 2;
 
 /// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
 /// need rendered. `spf` MUST be the same samples-per-frame map the splicer uses
@@ -1067,10 +1096,19 @@ pub fn apply_dead_only_windows(
                 );
                 continue;
             }
+            // S151 —— **只在另一侧真的有东西可以淡回去的时候才淡**。A fade exists to hide the
+            // donor↔base discontinuity; at the very edge of the buffer there is no continuation
+            // to hide, and fading there simply hands the last 10 ms back to base. That is not
+            // hypothetical: on every score whose final phrase is rescued the last group gets
+            // `gap_next == 0` ⇒ `post == 0` ⇒ the fade-out lands ON the last rescued note
+            // (measured on 炉心融解/akiko: group `[796..=802]`, note 802 = MIDI 81, dead).
+            // ⚠ 这一条改的是**今天的**输出(结尾那 10 ms),所以它跟着 `RANGE_ALGO_VERSION` 一起 bump。
+            let fade_in = a > 0;
+            let fade_out = b < n;
             for k in a..b {
-                let w = if k < a + xfw {
+                let w = if fade_in && k < a + xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (k - a) as f32 / xfw as f32).cos()
-                } else if k >= b - xfw {
+                } else if fade_out && k >= b - xfw {
                     0.5 - 0.5 * (std::f32::consts::PI * (b - k) as f32 / xfw as f32).cos()
                 } else {
                     1.0
@@ -1920,6 +1958,54 @@ mod tests {
         let fr = [5i64, 4, 10, 13, 5, 8];
         let plan = [DeadGroup { start: 2, end: 3, shift: -6 }];
         assert_eq!(dead_group_windows(&nn, &fr, &plan), vec![DeadJob { shift: -6, start: 5, end: 34 }]);
+    }
+
+    /// S151 护栏:窗边落在**唱音**上时,窗要多伸进那个乘客,好让 10 ms 淡化压在它身上。
+    /// ⛔ 有休止可用时一个字不许变 —— 那条期望值就是上面那个测试,原样。
+    #[test]
+    fn a_window_edge_on_a_sung_note_keeps_its_cross_fade_off_the_rescued_note() {
+        // 一整句 [1..=5](无休止),被裁成只救中间那个音 [3..=3]。
+        // cum = [0,5,15,25,35,45,55];前邻 note2 = 10 帧 ⇒ pre = min(2, 5) = 2;后邻同理 post = 2。
+        let nn = [0, 73, 73, 85, 73, 73, 0];
+        let fr = [5i64, 10, 10, 10, 10, 10, 10];
+        let plan = [DeadGroup { start: 3, end: 3, shift: -6 }];
+        assert_eq!(
+            dead_group_windows(&nn, &fr, &plan),
+            vec![DeadJob { shift: -6, start: 25 - 2, end: 35 + 2 }],
+            "窗必须伸进两侧的乘客,否则淡化压在被救的死音上"
+        );
+        // 封顶:邻居只有 2 帧 ⇒ 只能伸 1 帧(半个音),窗永远不许吃掉整个邻居。
+        let fr = [5i64, 10, 2, 10, 2, 10, 10];
+        assert_eq!(
+            dead_group_windows(&nn, &fr, &plan),
+            vec![DeadJob { shift: -6, start: 17 - 1, end: 27 + 1 }],
+            "护栏以半个邻居封顶"
+        );
+    }
+
+    /// S151:窗边贴着缓冲区边界时**不许淡化** —— 另一侧没有东西可以淡回去,淡了就等于把
+    /// 最后 10 ms 还给那条坏渲染。这一格今天每首「最后一句被救」的歌都在发生。
+    #[test]
+    fn a_window_that_touches_the_end_of_the_take_does_not_fade_back_into_it() {
+        let mut base = vec![0.0f32; 48000];
+        let donor = vec![1.0f32; 48000];
+        // 窗一直到最后一帧(end == total_frames)⇒ 尾部不淡;起点在 0 ⇒ 头部也不淡。
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 0, end: 50 }], false, |_s, _o| Ok(donor.clone()))
+            .unwrap();
+        assert_eq!(base[0], 1.0, "缓冲区起点:没有「之前」可以淡回去");
+        assert_eq!(base[47999], 1.0, "缓冲区终点:被救的最后 10 ms 不许还给 base");
+        // 阴性对照:同样的窗放在中间,两头照旧淡化(否则上面两条什么也没验到)。
+        let mut base = vec![0.0f32; 48000];
+        apply_dead_only_windows(&mut base, 48000, 50, &[DeadJob { shift: -6, start: 10, end: 20 }], false, |_s, _o| Ok(donor.clone()))
+            .unwrap();
+        let (a, b) = ((10.0 / 50.0 * 48000.0) as usize, (20.0 / 50.0 * 48000.0) as usize);
+        assert!(base[a] < 0.01, "窗心之外的边界仍然从 0 起淡");
+        assert!((base[a + 240] - 0.5).abs() < 0.01);
+        // ⭐ 这两行是**变异逼出来的**:把 `fade_out` 写死成 false,上面全部照绿 ——
+        // 仓里**从来没有一条判据说过淡出必须存在**(连 S85 那条 `..._blends_only_the_windows`
+        // 都只验了淡入)。「没有淡出」正是拼接器最容易出的那种缺陷。
+        assert!(base[b - 1] < 0.01, "窗尾必须淡回 base,否则拼接处是硬切");
+        assert!((base[b - 240] - 0.5).abs() < 0.01, "淡出也是 10 ms 余弦半程");
     }
 
     #[test]
