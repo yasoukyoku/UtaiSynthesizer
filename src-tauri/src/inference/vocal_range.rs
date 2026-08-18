@@ -1400,10 +1400,20 @@ pub fn apply_inverse_with(
             // whether the inverse did its job — and at debug level they were absent from every
             // log we have ever been handed. `transport_residual` is the S146g readout: 0.000 at
             // ratio 1.0, ≈0.41 for whole-sample transport, 0 once it is carried.
+            // ⚠⚠ S151 —— **这一行的统计样本大半可能来自数字静音**,别把它读成「被救的那段音频健康」。
+            // S147 之后 donor 只渲相交 chunk、其余铺零(`score2svc.rs` 的 `audio.resize(.., 0.0)`);
+            // 去 DC 把零变成常数偏置,而 `analysis_marks` 的相关搜索在常数上处处相关 = 1.0,
+            // 走位照样一路铺标记。实测(S151 侦察,`pymarks.py` 与 Rust 逐位等价):把一个 4.06 s
+            // 的浊音岛整段铺零,该岛标记数 1363 → **1439**(比真音频还密),间距恒为 90.00 样本。
+            // ⇒ `marks` / `cola_*` / `w_p01` 在 `skipped` 高的那几遍里主要是零区的统计。
+            // ⚠ **音频本身没错**(颗粒仍从原始 x 上切,零区仍出零)—— 坏的是仪器。
+            // 修它要么在零区跳过铺标记(会动输出),要么把两类样本分开计数;两者都还没做,
+            // 所以先把这条限制写在读数旁边,免得下一个人拿它当健康证明。
+            // ⭐ `src uncovered` 不吃这条限制:零区的读窗照样相接,贡献 0。
             tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
                  {} marks, cola gap {:.2}% (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
-                 transport residual {:.4}{}",
+                 src uncovered {:.2}%, transport residual {:.4}{}",
                 diag.islands,
                 diag.marks,
                 diag.cola_gap_frac * 100.0,
@@ -1411,6 +1421,7 @@ pub fn apply_inverse_with(
                 diag.cola_w_median,
                 diag.cola_w_p99,
                 diag.cola_over_frac * 100.0,
+                diag.src_uncovered_frac * 100.0,
                 diag.transport_residual_rms,
                 // ⛔ 打出**真的移了几个颗粒**,不只是「开着」:一个从不移动的搜索会产出逐位
                 // 相同的音频,与关掉不可分辨(S147 那次「收益静默减半」的同族)。

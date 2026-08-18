@@ -85,6 +85,26 @@ pub struct PsolaDiagnostics {
     /// being off unless this number is printed. (S147 shipped a change whose benefit was silently
     /// halved and the only thing that exposed it was a count in a log line.)
     pub wsola_moved: usize,
+    /// S151 — the fraction of the analysed source span that **no grain ever reads**.
+    ///
+    /// Each grain reads `[s_pos − lw, s_pos + rw)`, and on an UP-shift both half-widths collapse
+    /// to the *target* spacing (`:1027-1028` takes `min(target, source)`), i.e. `T_src / ratio`.
+    /// So the read windows around consecutive source marks stop touching the moment
+    /// **`ratio > 2`, which is exactly `|shift| > 12` semitones**, and from there a slice of every
+    /// pitch period — the low-energy middle, i.e. the formant ring-down, since the locked marks
+    /// sit on the energy peaks — is simply never used. Computed from the real mark train
+    /// (61523 marks, goose donor −7): +7 → 0.00 %, +11 → 0.00 %, **+12 → 0.00 %**, +13 → 4.9 %,
+    /// **+14 → 10.2 %**, +16 → 20.0 %.
+    ///
+    /// ⛔ Why it had to become a field rather than a note: **nothing else can see this.**
+    /// `cola_gap_frac` / `cola_w_*` are computed in the OUTPUT domain where the half-windows equal
+    /// the target spacing by construction (measured 0.00 % / 1.000 at every shift from +7 to +16);
+    /// the in-note envelope-depth ruler reads p50 −0.01 dB at +14; the per-note octave gate reads
+    /// 0.00 % with its positive control at 100 %; and every mark-layer ruler is **ratio-invariant**
+    /// by construction — `analysis_marks` and `lock_phase` do not take `ratio` at all. S148 and
+    /// S150 calibrated this engine only over `|shift| ≤ 7`; the user's 2026-08-18 run reached −14.
+    /// ⚠ It is a coverage number, not an audibility one — there is no ear datum on this axis yet.
+    pub src_uncovered_frac: f32,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -515,18 +535,32 @@ fn snap_to_pulse(x: &[f32], pos: f64, t: f64, radius_periods: f64) -> f64 {
 ///
 /// * **Every mark survives.** Design note 3: Φ(m_k) = k needs one mark per period. Locking only
 ///   ever *moves* marks — never adds, drops or merges them.
-/// * **The radius is the LOCAL period, not the island's.** An island can run 2580 marks (≈7 s)
-///   with the pitch moving inside it, so a median-derived radius can exceed half of a locally
-///   shorter period and snap onto the *neighbouring* pulse — which is how you manufacture period
-///   doubling. Using `min(gap_left, gap_right)` makes overshoot structurally impossible.
+/// * **The radius is the LOCAL step, not the island's median.** An island can run 2580 marks
+///   (≈7 s) with the pitch moving inside it, so a median-derived radius can exceed half of a
+///   locally shorter period and snap onto the *neighbouring* pulse — which is how you manufacture
+///   period doubling. The code therefore uses `t = steps[i - 1]`, the walk's own local step.
 ///   ⛔ This is not hypothetical caution: S148's WSOLA arm was killed by a blind test precisely
 ///   for manufacturing an exact −1200 cent period doubling.
+///   ⛔⛔ **S151 correction — the previous sentence here was wrong, and wrong in the direction
+///   that matters.** It claimed the radius used `min(gap_left, gap_right)` and that this made
+///   overshoot "structurally impossible". Only the LEFT gap is read (`:601`), and the geometry
+///   does not close: snapping one period late needs `0.30·t ≥ 2T − t`, i.e. `t ≥ 1.538·T`, while
+///   the walk's own band (`SEARCH_LO`/`SEARCH_HI` = 0.8/1.25) only bounds consecutive steps to
+///   `t/T ≤ 1.5625`. That is a **1.6 % overlap, not a proof.** What actually makes a bad snap
+///   harmless is [`LOCK_BETA`]: a mark that snaps to the wrong pulse still moves only
+///   `0.1 · 0.30 · t` = **3 % of a period**. Measured end to end on the shipped arm (the two mark
+///   dumps S150 left in `TESTING\s150_marks\work`, 61523 marks / 272 islands): per-island span
+///   ratio locked/unlocked p50 0.999819 = **−0.31 cents**, p05/p95 −3.7/+2.9 cents, and exactly
+///   **1 island of 272** past ±10 cents. ⇒ the claim (no octave manufacture) survives; the reason
+///   given for it did not. Written down because a wrong-but-confident comment in this very file
+///   is what kept TD-PSOLA shut out for four months (`scripts/range_rulers/README.md`).
 /// * **Marks may not cross or collapse** (the same guard, enforced sequentially).
-/// * **The correction is median-smoothed over `LOCK_SMOOTH` marks.** The phase error is slow
-///   (it accumulates one step at a time) while the per-mark argmax noise is fast, so smoothing the
-///   *correction* keeps the fix and drops the jitter. Measured: relative spacing variation
-///   0.0060 → 0.0028 (praat 0.0021) and `cola_gap` at +1 st 1.46% → 0.27%, at **no cost** to the
-///   correction itself (Σ|depth − upper bound| 0.50 → 0.48 dB).
+/// * **The correction is a first-order loop, not a smoother.** `cur = pred + β·(snap − pred)`,
+///   `β =` [`LOCK_BETA`]. ⛔ **S151 correction:** this bullet used to describe a **median smoother
+///   over `LOCK_SMOOTH` marks`** — that constant has not existed since the PLL replaced that arm
+///   (`grep LOCK_SMOOTH` hits this comment and nothing else), and the arm it describes is one of
+///   the two the user's ear rejected. Its readings are kept below, **labelled as the rejected
+///   arm**, because the comparison is what forced this shape.
 /// * ⛔ **"Agreement with praat's marks" is NOT a criterion** — S146 measured an `absmax`
 ///   detector with the *highest* agreement (67%) and the *worst* ΔHNR (−5.94) and voiced survival
 ///   (52%). The criteria are the rulers in `scripts/range_rulers/` plus f0.
@@ -552,15 +586,16 @@ fn snap_to_pulse(x: &[f32], pos: f64, t: f64, radius_periods: f64) -> f64 {
 /// | today | 61523 | −11.83 | 0.0013 | 18.94 | 0.2915 |
 /// | in-loop α=0.15 | 61518 | −10.91 | 0.0061 | 0.54 | 0.2851 |
 /// | in-loop α=0.45 | **57077** | −10.79 | 0.0062 | 0.54 | 0.2554 |
-/// | **this (post-hoc α=0.45 + smoothing)** | **61523** | −10.87 | **0.0028** | **0.45** | **0.2882** |
+/// | post-hoc α=0.45 + smoothing (**rejected by ear**) | **61523** | −10.87 | **0.0028** | **0.45** | **0.2882** |
 /// | upper bound (praat's marks) | 58777 | −10.98 | 0.0021 | 0.02 | 0.2905 |
 ///
-/// In-loop fights the walk's mandatory forward-progress check and **changes the mark count**
-/// (−4446 = −7.2% at 0.45), which is a design-note-3 violation — those stretches synthesize at
-/// double the period. Post-hoc keeps the count exact by construction, and once the correction is
-/// median-smoothed it also wins on spacing jitter (2×) and on the downshift window-sum floor.
-/// ⚠ Recorded honestly: with **no** smoothing, post-hoc is the worse of the two — the smoothing is
-/// what makes this choice correct, not the post-hoc-ness.
+/// ⛔ **None of the three candidate rows above is what ships** — the shipped arm is the PLL, and
+/// its own numbers are in [`LOCK_BETA`]. This table is kept because it is the evidence that killed
+/// the two obvious formulations: in-loop fights the walk's mandatory forward-progress check and
+/// **changes the mark count** (−4446 = −7.2% at 0.45), a design-note-3 violation — those stretches
+/// synthesize at double the period; and the post-hoc row, which looked best here on every
+/// instrument, was the one the user's ear returned as **clicks** (v1) and then as a **short seam**
+/// every ~100 ms (v2). ⇒ ⭐ this table IS the "instruments all green, ear says no" sample.
 ///
 /// **The negative control that had to be run.** "Depth went down" does not by itself mean "the
 /// marks found the pulses" — any consistent absolute anchor stops the accumulation. So the same
@@ -981,6 +1016,8 @@ pub fn psola_shift_locked(
     let mut wsum = vec![0.0f64; n];
     let mut covered = vec![false; n];
     let max_period = MAX_PERIOD_SECONDS * sr;
+    // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
+    let (mut uncovered, mut span) = (0.0f64, 0.0f64);
 
     for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
         let mut src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b);
@@ -993,6 +1030,7 @@ pub fn psola_shift_locked(
         diag.marks += src.len();
         let last = (src.len() - 1) as f64;
         let count = (last * ratio) as usize;
+        let (mut island_first, mut cover_end) = (f64::NAN, f64::NAN);
         let mut tgt: Vec<f64> = Vec::with_capacity(count + 1);
         let mut ks: Vec<usize> = Vec::with_capacity(count + 1);
         for j in 0..=count {
@@ -1052,10 +1090,26 @@ pub fn psola_shift_locked(
                     k as f64,
                 ]);
             }
+            // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
+            // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
+            // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
+            // 的源波形。见 `SRC_UNCOVERED` 的注释:这是唯一直接看得见它的读数。
+            let (rs, re) = (s_pos - lw, s_pos + rw);
+            if cover_end.is_nan() {
+                island_first = rs;
+                cover_end = rs;
+            }
+            if rs > cover_end {
+                uncovered += rs - cover_end;
+            }
+            cover_end = cover_end.max(re);
             add_bell(
                 x, &mut acc, &mut wsum, s_pos, tm, lw, rw, formant_rate, frac_transport,
                 &mut residual,
             );
+        }
+        if !cover_end.is_nan() {
+            span += (cover_end - island_first).max(0.0);
         }
     }
 
@@ -1087,6 +1141,7 @@ pub fn psola_shift_locked(
         }
     }
     diag.transport_residual_rms = residual.rms();
+    diag.src_uncovered_frac = if span > 0.0 { (uncovered / span) as f32 } else { 0.0 };
     diag.cola_gap_frac = if cov_n > 0 { gap as f32 / cov_n as f32 } else { 0.0 };
     if ws.is_empty() {
         diag.cola_w_median = 1.0;
@@ -1191,6 +1246,38 @@ mod tests {
             worst.0,
             worst.1
         );
+    }
+
+    /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
+    /// 在这条判据之前**没有任何东西看得见它**:`cola_*` 是在输出域算的(半窗按构造等于目标
+    /// 邻距,实测 +7..+16 全是 0.00% / 1.000),标记层的尺子全部 ratio 不变量。
+    /// 阈值不是估的:读窗半宽 = `T_src/ratio`,相邻源标记相距 `T_src` ⇒ `ratio > 2` 才留缝。
+    #[test]
+    fn nothing_reads_part_of_the_source_once_the_shift_passes_an_octave() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let x = voiced(sr, 0.5, f0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let frac = |st: f64| {
+            let (_, d) = psola_shift_diag(&x, sr, st, &f0t, hop);
+            assert!(d.islands > 0, "夹具必须真的是浊音");
+            d.src_uncovered_frac
+        };
+        // 阴性对照(两条,缺一条这条判据就可能只是「一个恒为正的数」):
+        // ⚠ 判据用 1e-9 而不是 == 0.0:ratio ≤ 2 时相邻读窗**正好相接**,读数是浮点噪声
+        // (实测 0 / 0 / 1.06e-15),不是真的缝。阈值仍然比阳性那一档小 8 个数量级。
+        for st in [0.0, 7.0, 12.0] {
+            let f = frac(st);
+            assert!(f < 1e-9, "{st:+} st 上读窗必须铺满源,读到 {f}");
+        }
+        // 阳性:用户 2026-08-18 实机真的跑到了 −14 ⇒ 逆变换 +14。
+        let f14 = frac(14.0);
+        assert!(
+            (0.05..0.20).contains(&f14),
+            "+14 上必须读出一段没人读过的源(实测真素材 10.2%),读到 {f14}"
+        );
+        assert!(frac(16.0) > f14, "越深漏得越多");
     }
 
     #[test]
