@@ -874,7 +874,22 @@ fn minimal_rescue_shift(
         }
     };
     let shallowest = anchor.or_else(|| qualifying.iter().copied().min_by_key(|s| s.abs()))?;
-    let budget = landing.unwrap_or(LANDING_MAX_EXTRA_DEPTH).max(0);
+    // S151 —— **可选的深度不许花到「合成开始丢源」那条线之外**。
+    // 笔 3 量到:上移时颗粒读窗半宽塌成 `T_src/ratio`,`ratio > 2`(= |位移| > 12 半音)之后
+    // 每个基音周期都有一段**永远不进任何颗粒**(+14 实测 10.2%,+16 约 20%)。
+    // 于是:**必须**走那么深才够得着落点的组照走不误(那是救与不救的问题),
+    // 但**为了更干净的落点而多花的那几个半音**,到 `LANDING_RATIO_TWO_ST` 为止。
+    // ⛔ 没有这一条,这一刀在「谱面写高 7」那种压力工况上会把最深从 −14 推到 −16。
+    let budget = match landing {
+        None => LANDING_MAX_EXTRA_DEPTH,
+        Some(extra) => {
+            // ⛔ **护栏只封「多花的」那部分,永远不许比今天更小** —— 第一版写成 `min(room)`,
+            // 于是已经越过那条线的组连今天本来就有的 +1 都被收走了,落到 damage 更差的一格上
+            // (实测:谱面 +7 的深组从 −14 变成 −13)。护栏是上限,不是替代品。
+            let room = (LANDING_RATIO_TWO_ST - shallowest.abs()).max(0);
+            extra.max(0).min(room).max(LANDING_MAX_EXTRA_DEPTH)
+        }
+    };
     let mut pool: Vec<i64> = qualifying
         .into_iter()
         .filter(|s| s.abs() <= shallowest.abs() + budget)
@@ -942,6 +957,11 @@ fn minimal_rescue_shift(
         .filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS)
         .min_by_key(|s| s.abs())
 }
+
+/// `ratio = 2` — the shift at which the synthesis stops reading part of every pitch period
+/// (see `utai_dsp::psola::PsolaDiagnostics::src_uncovered_frac`: +12 → 0.00 %, +14 → 10.2 %,
+/// +16 → 20.0 %, measured on the real mark train). Optional depth is never spent past it.
+const LANDING_RATIO_TWO_ST: i64 = 12;
 
 /// How much better a deeper landing's raw `low_ratio` must be before it is preferred over a
 /// shallower one. `low_ratio` is stored quantized to a u8 over 0..1, so one stored step is
@@ -2169,6 +2189,42 @@ mod tests {
         assert_eq!(dead_of(&a), dead_of(&b), "被救的死音一个不许多、一个不许少");
         assert_eq!(ua, ub, "无解的乐句也不许变");
         assert!(a.iter().zip(&b).any(|(x, y)| x.shift != y.shift), "…但落点必须真的动过");
+    }
+
+    /// ⛔ 可选的深度不许把合成推过 `ratio = 2` —— 那之后每个基音周期都有一段永远不被读到
+    /// (笔 3 的 `src_uncovered_frac`:+12 → 0.00%,+14 → 10.2%,+16 → 20.0%)。
+    /// ⚠ 但**必须**走那么深才够得着的组照走不误:那是「救不救得了」,不是「落得干不干净」。
+    #[test]
+    fn optional_depth_stops_where_the_synthesis_starts_dropping_the_source() {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=79i64 {
+            // 76 以下明显不薄 ⇒ 排序想往下走;⛔ 台阶要比 `LANDING_THIN_EPS` 大得多,
+            // 否则「打平」会把这条判据变成一句空话(第一版就是这么写坏的:台阶 0.008 < eps)。
+            let lr = if m >= 77 { 0.50 } else if m == 76 { 0.30 } else { 0.20 };
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        for m in 80..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.90]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 79], "usable_auto": [36, 79], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap();
+        // 够得着的组(最浅 −4)⇒ 可以多花到 −7
+        let (near, _) = dead_only_plan_with(&[0, 83, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(near[0].shift, -7, "还没到 ratio=2,那三个半音可以花");
+        // 已经在线上的组(最浅 −13)⇒ 一个半音都不许多花
+        let (deep_today, _) = dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::today());
+        let (deep_on, _) = dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(deep_today[0].shift, -13, "这个音本来就要 −13 才够得着");
+        assert_eq!(
+            deep_on[0].shift, -13,
+            "已经越过 ratio=2 的组:救援照做,但**不许为了更干净的落点再往下花**"
+        );
     }
 
     #[test]
