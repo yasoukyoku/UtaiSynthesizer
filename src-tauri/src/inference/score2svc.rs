@@ -50,7 +50,9 @@ use crate::{Result, UtaiError};
 use utai_dsp::formant_warp;
 
 /// ScoreToCV frame rate (score2cv sidecar `fps`). The per-phone `phone_dur` frames are 20 ms.
-const CV_FPS: f64 = 50.0;
+/// ⚠ `pub(crate)` since S151: `vocal_range::dead_only_plan` turns a triple's `frames` into
+/// milliseconds and must not carry a second copy of this number (feedback_no_duplication_drift).
+pub(crate) const CV_FPS: f64 = 50.0;
 
 /// S147 B2 — margin (in 50 fps frames) around a rescue window when deciding which chunks a donor
 /// must render.

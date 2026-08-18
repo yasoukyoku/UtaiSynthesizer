@@ -478,12 +478,38 @@ pub struct DeadGroup {
 /// dead-containing phrase with NO landing (dead on both sides, or nothing within
 /// ±MAX_RANGE_SHIFT); the caller logs each LOUDLY so a skipped broken climax never reads as
 /// "handled" (审查 S85: positions, not just a count — cover 侧富审计的对等物).
+///
+/// `frames` is the per-triple duration on the score's 50 fps grid (same slice the splicer's
+/// `dead_group_windows` reads) — it exists only for [`trim_freed_ms`], which needs to know how
+/// much sung material a cut would actually free.
 pub fn dead_only_plan(
     note_nums: &[i64],
+    frames: &[i64],
     transpose: i64,
     range: &SpeakerRange,
 ) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
+    dead_only_plan_with(note_nums, frames, transpose, range, trim_freed_ms())
+}
+
+/// [`dead_only_plan`] with the passenger-trim thresholds passed in instead of read from the
+/// environment — the shape `apply_inverse`/`apply_inverse_with` already uses here.
+///
+/// ⛔ Why the split exists: a test that reaches the env is a test that changes answer depending on
+/// what the *machine* has exported, and it fails in the direction that hurts — it passes SILENTLY
+/// (S150 paid for this on the phase lock). Every test in this file pins its arm explicitly;
+/// `None` is by definition the pre-S151 behaviour.
+pub fn dead_only_plan_with(
+    note_nums: &[i64],
+    frames: &[i64],
+    transpose: i64,
+    range: &SpeakerRange,
+    trim: Option<(f32, f32)>,
+) -> (Vec<DeadGroup>, Vec<(usize, usize)>) {
     let eff = |n: i64| (n + transpose).clamp(1, 127); // mirror transpose_note_pitch's clamp
+    let ms = |from: usize, to: usize| -> f32 {
+        let f: i64 = (from..to).map(|k| frames.get(k).copied().unwrap_or(0).max(0)).sum();
+        f as f32 * 1000.0 / super::score2svc::CV_FPS as f32
+    };
     let mut out = Vec::new();
     let mut unfixable = Vec::new();
     let mut i = 0usize;
@@ -496,18 +522,141 @@ pub fn dead_only_plan(
         while j + 1 < note_nums.len() && note_nums[j + 1] > 0 {
             j += 1;
         }
-        let sung: Vec<i64> = (i..=j).map(|k| eff(note_nums[k])).collect();
-        let dead: Vec<i64> = sung.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
-        if !dead.is_empty() {
-            match minimal_rescue_shift(&dead, &sung, range) {
-                Some(shift) => out.push(DeadGroup { start: i, end: j, shift }),
-                None => unfixable.push((i, j)),
+        let dead_at: Vec<usize> =
+            (i..=j).filter(|&k| !range.slot_singable(eff(note_nums[k]))).collect();
+        if !dead_at.is_empty() {
+            // S151: the rescued span. Default = the whole phrase (pre-S151, bit-for-bit); with the
+            // knob on, each SIDE is cut back to the dead run when doing so frees enough sung
+            // material to be worth the seam it creates. ⛔ The DEAD set is untouched by
+            // construction — every dead note lies inside [first_dead, last_dead] — so this cannot
+            // change which notes get rescued, only who rides along.
+            let dead: Vec<i64> = dead_at.iter().map(|&k| eff(note_nums[k])).collect();
+            let whole: Vec<i64> = (i..=j).map(|k| eff(note_nums[k])).collect();
+            // ⛔⛔ WHICH phrases get rescued is decided on the WHOLE phrase, before any trimming,
+            // i.e. exactly as it was decided before S151. Dropping passengers also drops their
+            // `slot_reachable` constraints, so a phrase that has no landing today CAN acquire one
+            // the moment its passengers leave — measured, not hypothesised: `[85, 40]` against
+            // dxl_like is unfixable as a phrase (−6 puts 40 outside the scanned window) and
+            // rescuable the moment the 40 is dropped. That is a real improvement and it is NOT
+            // this knife: it changes which notes get sung differently, so it needs its own
+            // decision and its own blind test. Bundling it would make any A/B unattributable.
+            // Pinned by `trimming_may_not_turn_an_unfixable_phrase_into_a_rescue`.
+            let Some(whole_shift) = minimal_rescue_shift(&dead, &whole, range) else {
+                unfixable.push((i, j));
+                i = j + 1;
+                continue;
+            };
+            let (first_dead, last_dead) = (dead_at[0], *dead_at.last().unwrap());
+            let (mut a, mut b) = (i, j);
+            if let Some((head_ms, tail_ms)) = trim {
+                let (freed_head, freed_tail) = (ms(i, first_dead), ms(last_dead + 1, j + 1));
+                if freed_head >= head_ms {
+                    a = first_dead;
+                }
+                if freed_tail >= tail_ms {
+                    b = last_dead;
+                }
+                if (a, b) != (i, j) {
+                    tracing::info!(
+                        "range: phrase notes[{i}..={j}] rescued as [{a}..={b}] — dropped {:.2}s of \
+                         passengers at the head, {:.2}s at the tail",
+                        if a > i { freed_head } else { 0.0 } / 1000.0,
+                        if b < j { freed_tail } else { 0.0 } / 1000.0,
+                    );
+                }
             }
+            let shift = if (a, b) == (i, j) {
+                whole_shift
+            } else {
+                // The landing is re-solved against the notes that ACTUALLY ride along — the
+                // dropped ones no longer constrain it. Measured across the four installed records
+                // × 炉心融解 (and its +7 stress case): this moves **no** group. Audited rather
+                // than assumed, because a moved landing is a change nobody has heard.
+                let kept: Vec<i64> = (a..=b).map(|k| eff(note_nums[k])).collect();
+                let s = minimal_rescue_shift(&dead, &kept, range).unwrap_or(whole_shift);
+                if s != whole_shift {
+                    tracing::info!(
+                        "range: notes[{a}..={b}] landing moved {whole_shift:+} → {s:+} st once its \
+                         passengers were dropped"
+                    );
+                }
+                s
+            };
+            out.push(DeadGroup { start: a, end: b, shift });
         }
         i = j + 1;
     }
     (out, unfixable)
 }
+
+/// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
+/// **`None` = 关 = 今天的整句组,逐位不变**;`UTAI_RANGE_TRIM=0` 关 · `=1` 用下面两个常量 ·
+/// `=<head_ms>:<tail_ms>` 扫参数。
+///
+/// **Why this knife exists at all.** S148 measured the toll: a passenger pays it for *entering*
+/// the process, not for how deep it goes — `corr(Δrms, |shift|) = −0.172` across 154 passengers,
+/// while merely passing through PSOLA costs p50 0.7-2.0 dB against a 0.001 floor. S150 then found
+/// a second, independent bill on the vocoder side, and that one IS dose-shaped: the non-harmonic
+/// 4-11 kHz fraction of in-range notes goes 24.0 % (untouched) → 29.2 % (−3) → 39.2 % (−7).
+/// ⇒ the only two ways to cut the bill are "let fewer notes in" (this) and "make the toll
+/// smaller" (S150's phase lock). The user's verdict on the direction: 「乘客卸载我觉得可以先做了」.
+///
+/// **Why it is conditional rather than always-on.** The blind test that endorsed the aggressive
+/// version (S148 r3, arm D = cut every group to its dead run) only came back clearly better on
+/// the ONE segment where the recovery was large (three notes getting back 5.36/5.33/3.70 dB); the
+/// listener called the other two 「区别不是特别大」. And every cut buys its material with a new
+/// seam in the middle of a phrase, which is not free: Δripple at a cut **head** is p50 0.258 /
+/// p90 1.452 dB against a 0.060 floor, at a cut **tail** 0.033 / 0.407 — an **8×** asymmetry,
+/// because a head cut lands the 10 ms fade-in on a note's ONSET.
+///
+/// **The numbers.** Offline sweep over the four installed records × 炉心融解 (the user's own
+/// project, 803 triples), reproduced from the production plans in the 2026-08-18 log to the group
+/// (`TESTING\s151_knives\gate_fidelity.py`). Recoverable material per cut on akiko is bimodal —
+/// {0.18, 0.36, 0.38} then {1.08, 1.10, 1.28, 1.44, 1.46, 1.82, 2.56, 3.44, 4.36} seconds — so
+/// **every threshold in (0.38, 1.08] picks exactly the same 10 head + 7 tail cuts**, and these
+/// two values sit inside that plateau rather than on its edge. What it buys on akiko: 154 → 46
+/// passengers if both sides always cut (33.0 s of passenger audio), 28.6 s of that at these
+/// thresholds, for 17 new seams instead of 34. ⭐ The one cut the user has already endorsed by
+/// ear (S148 r1, `notes[753..=762]`, 3/3) frees **1.82 s** and is comfortably inside.
+/// ⚠ Not a plateau everywhere: on the +7 stress case the same records give 14 head / 13 tail at
+/// 750 ms and 5 / 9 at 1000 ms, i.e. that song IS threshold-sensitive. Re-measure before moving.
+///
+/// ⛔ Deliberately NOT promoted by these numbers: the instrument cannot tell whether a seam is
+/// audible, and this line has been wrong in exactly that way twice (S148 WSOLA, S150 v1/v2).
+/// Blind test first, flip after — the S146 protocol.
+pub fn trim_freed_ms() -> Option<(f32, f32)> {
+    parse_trim(std::env::var("UTAI_RANGE_TRIM").ok().as_deref())
+}
+
+/// The env parse as a pure function, so it can be asserted without touching process state
+/// (reading the real environment in a test both races the other tests and passes SILENTLY on a
+/// machine where someone exported the variable — S150 paid for that lesson on `parse_phase_lock`).
+fn parse_trim(v: Option<&str>) -> Option<(f32, f32)> {
+    let ok = |x: f32| x.is_finite() && x >= 0.0;
+    match v.map(str::trim) {
+        None | Some("") => TRIM_DEFAULT,
+        Some("0") => None,
+        Some("1") => Some((TRIM_HEAD_MS, TRIM_TAIL_MS)),
+        Some(s) => {
+            let mut it = s.split(':');
+            match (it.next().map(str::trim), it.next().map(str::trim), it.next()) {
+                (Some(h), Some(t), None) => match (h.parse::<f32>(), t.parse::<f32>()) {
+                    (Ok(h), Ok(t)) if ok(h) && ok(t) => Some((h, t)),
+                    _ => TRIM_DEFAULT,
+                },
+                _ => TRIM_DEFAULT,
+            }
+        }
+    }
+}
+
+/// ⛔ Off until a blind test says otherwise — flipping this changes what every rescued phrase
+/// sounds like, so it also needs `RANGE_ALGO_VERSION` ↔ `audition_cache_tag` bumped IN PAIR
+/// (S150: missing one of those is not an error, it is the user hearing a stale cache).
+const TRIM_DEFAULT: Option<(f32, f32)> = None;
+/// A head cut puts the fade on an onset — 8× the ripple of a tail cut, so it must buy more.
+const TRIM_HEAD_MS: f32 = 1000.0;
+const TRIM_TAIL_MS: f32 = 500.0;
 
 /// THE single landing search for both tracks (score phrases / cover regions): the minimal |s|
 /// that lands every DEAD pitch on a landing-grade slot while every dragged pitch stays
@@ -1282,6 +1431,13 @@ mod tests {
         SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0))
     }
 
+    /// One second per triple on the score's 50 fps grid. `frames` only ever feeds the
+    /// passenger-trim threshold, and every test below that is not ABOUT the trim pins its arm to
+    /// `None`, so the value is deliberately uniform — a varied one would look load-bearing.
+    fn secs(n: usize) -> Vec<i64> {
+        vec![50; n]
+    }
+
     // ── S85 七轮: cover_dead_plan(帧域 dead-only;旧整曲优化器的耳锚精神迁移在此)──
 
     fn hz(m: f32) -> f32 {
@@ -1579,7 +1735,7 @@ mod tests {
         // のう(85,73) between rests: 85 dead → minimal landing 79(80 半浊不合格)⇒ -6;
         // 前面的健康 73 短语原位不动 —— 用户耳判通过的 t23 臂逐字。
         let nn = [0, 73, 73, 0, 85, 73, 0];
-        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 4, end: 5, shift: -6 }]);
     }
@@ -1589,14 +1745,14 @@ mod tests {
         // 三轮核心:comfort [36,52] 说 64-78 全「越界」,但 f0 判据说能唱 → 一律原位。
         // (二轮 per-note 把整段搬走 = 用户判「灾难」的那台机器,这里钉死不再回来。)
         let nn = [0, 64, 66, 0, 73, 78, 0];
-        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
         assert!(plan.is_empty() && unfix.is_empty());
     }
 
     #[test]
     fn dead_only_transpose_folds_into_the_verdict() {
         let nn = [0, 73, 0]; // written 73 + transpose 12 = 85 → 同款 -6 救援
-        let (plan, _) = dead_only_plan(&nn, 12, &dxl_like());
+        let (plan, _) = dead_only_plan_with(&nn, &secs(nn.len()), 12, &dxl_like(), None);
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
     }
 
@@ -1604,7 +1760,7 @@ mod tests {
     fn dead_only_dragged_neighbours_must_stay_singable() {
         // 短语 [85, 40]:-6 把 40 拖到 34(窗外=死)→ 无解,必须响亮计数而非静默跳过。
         let nn = [0, 85, 40, 0];
-        let (plan, unfix) = dead_only_plan(&nn, 0, &dxl_like());
+        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), None);
         assert!(plan.is_empty());
         assert_eq!(unfix, vec![(1, 2)], "无解组带位置(审查 S85:取证要「在哪」)");
     }
@@ -1613,10 +1769,10 @@ mod tests {
     fn dead_only_bounds_record_falls_back_to_bounds() {
         // 无扫描旧记录:dead=出 usable,落点=进 comfort。88→79 = -9;40→52 = +12。
         let r = SpeakerRange::bounds((48.0, 84.0), (52.0, 79.0));
-        let (plan, unfix) = dead_only_plan(&[0, 88, 0], 0, &r);
+        let (plan, unfix) = dead_only_plan_with(&[0, 88, 0], &secs(3), 0, &r, None);
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -9 }]);
         assert!(unfix.is_empty());
-        let (plan, _) = dead_only_plan(&[0, 40, 0], 0, &r);
+        let (plan, _) = dead_only_plan_with(&[0, 40, 0], &secs(3), 0, &r, None);
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: 12 }]);
     }
 
@@ -1637,9 +1793,124 @@ mod tests {
             0,
         )
         .unwrap();
-        let (plan, unfix) = dead_only_plan(&[0, 78, 0], 0, &r);
+        let (plan, unfix) = dead_only_plan_with(&[0, 78, 0], &secs(3), 0, &r, None);
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 1, end: 1, shift: -1 }]);
+    }
+
+    // ── S151 卸乘客 ─────────────────────────────────────────────────────────────────────
+    // ⛔ 阈值一律写**字面量**:引用被测的常量会让判据永远不可能红(这一区 S146c 的血训)。
+
+    /// 乐句 = 3 个健康音 · 1 个死音 · 2 个健康音。头 1.5 s、尾 0.8 s 都够本 ⇒ 两边都裁掉。
+    #[test]
+    fn a_rescue_group_sheds_the_passengers_that_pay_for_their_own_seam() {
+        let nn = [0, 73, 73, 73, 85, 73, 73, 0];
+        let fr = [10, 25, 25, 25, 40, 20, 20, 10]; // 头 75 帧 = 1.50 s;尾 40 帧 = 0.80 s
+        let (whole, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
+        assert_eq!(
+            whole,
+            vec![DeadGroup { start: 1, end: 6, shift: -6 }],
+            "关掉时必须是 S150 之前那条整句臂"
+        );
+        let (trimmed, unfix) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        assert!(unfix.is_empty());
+        assert_eq!(
+            trimmed,
+            vec![DeadGroup { start: 4, end: 4, shift: -6 }],
+            "5 个乘客白白过一遍 PSOLA + 一遍移调声码器,而它们值一条缝"
+        );
+    }
+
+    /// 同样的形状,但乘客只有 0.60 s / 0.28 s —— 造一条缝去救这么点材料是亏的。
+    #[test]
+    fn a_cut_that_frees_almost_nothing_is_not_worth_the_seam_it_makes() {
+        let nn = [0, 73, 73, 73, 85, 73, 73, 0];
+        let fr = [10, 10, 10, 10, 40, 7, 7, 10]; // 头 30 帧 = 0.60 s;尾 14 帧 = 0.28 s
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        assert_eq!(
+            plan,
+            vec![DeadGroup { start: 1, end: 6, shift: -6 }],
+            "回收量在门限之下 ⇒ 整句不动,与关掉时一模一样"
+        );
+    }
+
+    /// 头尾各 0.70 s:**尾裁、头不裁**。S148 实测裁头的缝 Δripple p50 0.258 / p90 1.452 dB,
+    /// 裁尾 0.033 / 0.407(地板 0.060)—— 8 倍,因为 10 ms 淡入压在**起音**上。
+    #[test]
+    fn the_head_cut_has_to_buy_more_than_the_tail_cut() {
+        let nn = [0, 73, 73, 73, 85, 73, 73, 0];
+        let fr = [10, 12, 12, 11, 40, 18, 17, 10]; // 头 35 帧 = 0.70 s;尾 35 帧 = 0.70 s
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        assert_eq!(
+            plan,
+            vec![DeadGroup { start: 1, end: 4, shift: -6 }],
+            "同样的回收量:尾边够本、头边不够本"
+        );
+    }
+
+    /// ⭐ 这一刀的**定义域**:它只决定谁陪着走,永远不许改「哪些音被救」。
+    /// (数学上也成立:死音集合与裁剪无关,而裁掉被拖拽音只会**放松** `minimal_rescue_shift`
+    /// 的约束 ⇒ 合格集合只增不减。这条判据把那个方向钉在实测上。)
+    #[test]
+    fn trimming_can_never_lose_a_rescue() {
+        let nn = [0, 73, 73, 85, 73, 0, 60, 62, 0, 73, 85, 83, 73, 73, 0, 85, 40, 0];
+        let fr = vec![30i64; nn.len()];
+        let r = dxl_like();
+        let dead_of = |plan: &[DeadGroup]| -> Vec<usize> {
+            let mut v: Vec<usize> = plan
+                .iter()
+                .flat_map(|g| g.start..=g.end)
+                .filter(|&k| nn[k] > 0 && !r.slot_singable(nn[k]))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &r, None);
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &r, Some((1000.0, 500.0)));
+        assert_eq!(dead_of(&off), dead_of(&on), "被救的死音一个不许多、一个不许少");
+        assert_eq!(unfix_off, unfix_on, "无解的乐句也不许因为裁剪而改变");
+        assert_eq!(unfix_on, vec![(15, 16)], "…而这份夹具里确实有一个(85 拖着 40 出窗)");
+        assert!(on.iter().zip(&off).all(|(a, b)| a.shift == b.shift), "本夹具上落点不动");
+        assert!(on.iter().zip(&off).any(|(a, b)| (a.start, a.end) != (b.start, b.end)),
+                "…但至少有一组真的被裁过(否则上面三条都是空的)");
+    }
+
+    /// ⭐ **实测发现的一格,不是设计出来的**:`[85, 40]` 这句今天无解(−6 把 40 拖到 34,
+    /// 出了扫描窗),而**一旦把乘客 40 卸掉,它就有落点了** —— 挡路的正是那个乘客。
+    /// 那是一条真的改善,但它改的是【哪些音被救】而不是【谁陪着走】⇒ **不许搭这一刀的车**:
+    /// 混在一起,任何 A/B 的结果都归因不到人。留作单独一笔 + 单独一次盲测。
+    #[test]
+    fn trimming_may_not_turn_an_unfixable_phrase_into_a_rescue() {
+        let nn = [0, 85, 40, 0];
+        let fr = [10, 40, 100, 10]; // 尾部乘客 2.0 s —— 回收量远超门限,唯一拦住它的只能是规则
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        assert!(off.is_empty() && on.is_empty(), "两条臂都必须放弃这一句");
+        assert_eq!(unfix_off, vec![(1, 2)]);
+        assert_eq!(unfix_on, vec![(1, 2)], "卸乘客不许把无解句变成被救句");
+        // 阳性对照:同一句,乘客换成一个不挡路的音 ⇒ 两条臂都救,且开着的那条真的裁了。
+        let nn = [0, 85, 73, 0];
+        let (off, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), None);
+        let (on, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), Some((1000.0, 500.0)));
+        assert_eq!(off, vec![DeadGroup { start: 1, end: 2, shift: -6 }]);
+        assert_eq!(on, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
+    }
+
+    /// 旋钮本身:**默认关**,而且解析是纯函数(测试里读进程环境既会被并行污染,
+    /// 又会在别人 export 了变量时**静默通过** —— S150 在 `parse_phase_lock` 上付过这笔学费)。
+    #[test]
+    fn the_passenger_trim_is_off_by_default_and_the_knob_parses() {
+        assert!(parse_trim(None).is_none(), "默认必须是今天那条臂(逐位不变)");
+        assert!(parse_trim(Some("")).is_none());
+        assert!(parse_trim(Some("0")).is_none(), "显式关得掉 —— 用户抱怨时要能用同一个二进制渲旧臂");
+        let on = parse_trim(Some("1")).expect("`1` = 用登记的两个常量");
+        assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS));
+        assert!(on.0 > on.1, "裁头的缝贵 8 倍 ⇒ 它必须买到更多才动手");
+        assert_eq!(parse_trim(Some("800:300")), Some((800.0, 300.0)), "扫参数用");
+        assert_eq!(parse_trim(Some(" 800 : 300 ")), Some((800.0, 300.0)));
+        for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
+            assert!(parse_trim(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认,不是静默乱开");
+        }
     }
 
     #[test]
@@ -2181,8 +2452,8 @@ mod tests {
         let tight = Rec { usable: (36, 76), comfort: (36, 79), comfort_auto: (36, 79), scan: (36, 80), ..Default::default() }.build();
         let nn: Vec<i64> = vec![70, 78, 85];
 
-        let (pw, _) = dead_only_plan(&nn, 0, &wide);
-        let (pt, _) = dead_only_plan(&nn, 0, &tight);
+        let (pw, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, None);
+        let (pt, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, None);
         assert_eq!(pw.len(), 1);
         assert_eq!(pt.len(), 1);
         assert_eq!(
@@ -2255,8 +2526,8 @@ mod tests {
 
         // …and the veto has to reach the thing the user hears: the phrase plan.
         let nn: Vec<i64> = vec![70, 78];
-        let (plan_wide, _) = dead_only_plan(&nn, 0, &wide);
-        let (plan_tight, _) = dead_only_plan(&nn, 0, &tight);
+        let (plan_wide, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, None);
+        let (plan_tight, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, None);
         assert!(plan_wide.is_empty(), "nothing is dead at the wide ceiling");
         assert_eq!(plan_tight.len(), 1, "the tight ceiling must hand this phrase to the rescue");
         assert!(plan_tight[0].shift < 0, "and pull it down, got {}", plan_tight[0].shift);
@@ -2442,7 +2713,7 @@ mod tests {
         let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
         let fr: Vec<i64> = vec![9; nn.len()];
-        let (plan, unfixable) = dead_only_plan(&nn, 0, &r);
+        let (plan, unfixable) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, None);
         assert_eq!(unfixable.len(), 0);
         assert_eq!(plan.len(), 1, "exactly one dead phrase, as before");
         assert_eq!((plan[0].start, plan[0].end), (0, 5), "the same note span as before");

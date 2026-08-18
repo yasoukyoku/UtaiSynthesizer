@@ -1303,7 +1303,7 @@ fn mg_render_score_deadonly() {
         .collect();
     let fr: Vec<i64> = triples.iter().map(|t| t.frames).collect();
     let (auto_plan, unfixable) =
-        super::super::vocal_range::dead_only_plan(&nn, transpose, &range);
+        super::super::vocal_range::dead_only_plan(&nn, &fr, transpose, &range);
     let plan = match std::env::var("UTAI_MG_PLAN") {
         Ok(spec) if !spec.trim().is_empty() => mg_parse_plan_override(&spec, &nn),
         _ => auto_plan.clone(),
