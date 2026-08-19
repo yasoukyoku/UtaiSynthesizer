@@ -1886,6 +1886,51 @@ const INFRASONIC_HP_DEFAULT: bool = true;
 /// 0 = the adaptive width (one period of the lowest fundamental). See [`infrasonic_fixed_ms`].
 const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 
+/// S155 — `UTAI_PSOLA_WIN=<periods>` widens TD-PSOLA's **read window** to that many source
+/// periods per side. **0 = off = byte-for-byte the pre-S155 arm**, which reads
+/// `min(T_out, T_src)` per side, i.e. `2/ratio` source periods in total (measured per grain:
+/// −9 st → 1.189, −12 → **1.000**, −14 → **0.891**). Textbook TD-PSOLA is ±1 period = 2.000.
+///
+/// ## What it is for
+///
+/// The user's second defect, reported 2026-08-19: 「高音(ぴゃ)的高次共振峰坍塌」.
+/// TD-PSOLA's whole selling point is that formants survive by construction — it moves time-domain
+/// segments — so the falsifiable claim is **the output's spectral envelope should equal the
+/// donor's**. It does not, and the loss is in exactly the bands he named. Cepstrally-smoothed
+/// envelope contrast, measured against the donor (⭐ the ruler's zero is verified: on the ratio-1.0
+/// arm, where `out ≡ x` bit-for-bit, it reads 0.000 in every band):
+///
+/// | | 2-4 kHz | 4-6 kHz | 6-8 kHz | 8-12 kHz |
+/// |---|---|---|---|---|
+/// | today, ratio 2.0 | −0.834 | −0.666 | −0.606 | −0.866 |
+/// | half-width 1.0 period | **−0.360** | **−0.209** | **−0.189** | **−0.277** |
+/// | today's width + divide by wsum | −0.949 | −0.673 | −0.577 | −0.871 |
+///
+/// ⭐ That last row isolates the degree of freedom: **dividing by wsum does nothing on its own —
+/// it is the width.** And it is an intervention on the same audio, the same grains and the same
+/// ratio, so it is a mechanism, not the correlation `formant.py` first found across arms.
+///
+/// ## ⛔ Why it is off by default
+///
+/// It is a **trade, not a win**: on the same three arms the inter-harmonic noise in 300-2500 Hz
+/// goes from −7.77 / −2.78 / −6.40 dB to −7.05 / **−0.86** / −5.33, i.e. 1-2 dB worse — and
+/// 300-2500 Hz is the band the "click" lived in. S154 measured the same direction independently.
+/// ⇒ this is exactly the shape only ears can settle, and this line's rule is that only a blind
+/// test (or the user's own spectral analysis on a whole-song render) may promote such a default.
+pub fn win_periods() -> f64 {
+    parse_win_periods(std::env::var("UTAI_PSOLA_WIN").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_win_periods(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 4.0)
+        .unwrap_or(WIN_PERIODS_DEFAULT)
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const WIN_PERIODS_DEFAULT: f64 = 0.0;
+
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -2096,6 +2141,7 @@ pub fn apply_inverse_with(
             let hp = infrasonic();
             let envfix = env_restore_ms();
             let bridge = bridge_unvoiced_ms();
+            let win = win_periods();
             let (out, diag) = utai_dsp::psola::psola_shift_env(
                 &audio,
                 sample_rate,
@@ -2109,6 +2155,7 @@ pub fn apply_inverse_with(
                 hp,
                 envfix,
                 bridge,
+                win,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -3455,7 +3502,7 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 7] = [
+        let want: [(&str, f64); 8] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
@@ -3463,6 +3510,7 @@ mod tests {
             ("UTAI_PSOLA_HP_MS", parse_infrasonic_ms(None)),
             ("UTAI_PSOLA_ENVFIX", parse_env_restore_ms(None)),
             ("UTAI_PSOLA_BRIDGE", parse_bridge_unvoiced_ms(None)),
+            ("UTAI_PSOLA_WIN", parse_win_periods(None)),
         ];
         let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
         assert_eq!(
@@ -3480,6 +3528,22 @@ mod tests {
                 "{key}:探针默认 {probe} ≠ 生产默认 {production} —— \
                  照脚本跑出来的「今天」其实是另一条臂"
             );
+        }
+    }
+
+    /// S155 —— 读窗旋钮:默认 0 = 今天,显式值覆盖,垃圾与越界退回默认。
+    #[test]
+    fn the_read_window_defaults_to_todays_and_only_an_explicit_value_widens_it() {
+        assert_eq!(
+            parse_win_periods(None),
+            0.0,
+            "生产必须仍然是今天那个窗 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+        );
+        assert_eq!(parse_win_periods(None), WIN_PERIODS_DEFAULT);
+        assert_eq!(parse_win_periods(Some("1")), 1.0);
+        assert_eq!(parse_win_periods(Some(" 1.5 ")), 1.5);
+        for bad in ["", "nonsense", "-1", "NaN", "5"] {
+            assert_eq!(parse_win_periods(Some(bad)), WIN_PERIODS_DEFAULT, "{bad:?}");
         }
     }
 

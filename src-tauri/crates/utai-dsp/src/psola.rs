@@ -881,17 +881,32 @@ fn analysis_marks(
 ///
 /// ⇒ 8 ms lands on the target at all three ratios and costs 0.013 dB where the voice actually is.
 ///
-/// ## ⚠ The assumption this carries
+/// ## ⚠⚠ S155 — this constant is now a **RULER, not the cut**
 ///
-/// The first null is at **125 Hz**, so this is safe only while the OUTPUT fundamental stays well
-/// above it. Production is an up-shift onto notes the model could not reach (output f0 830-1480 Hz
-/// on the calibration song) so it is far away. ⛔ But `cover_dead_plan` can emit **+22** (audio
-/// shifted DOWN 22 semitones) and `MAX_RANGE_SHIFT = 24`; at an output f0 of 110 Hz this filter
-/// takes **−0.38 dB** off the fundamental. That is measured, not hypothetical — see
-/// `the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental`, which asserts the
-/// analytic response rather than pretending the effect is zero.
-/// ⇒ if this arm is ever turned on for the cover path, the width has to follow f0 (≈ 3 periods)
-/// instead of being a constant.
+/// The removal's width is [`Infrasonic::PerPeriod`], derived per buffer from the f0 track. This
+/// 8 ms stays as the fixed width of the *reading* [`PsolaDiagnostics::infrasonic_frac`], and that
+/// is deliberate: every historical number on this line (S152's 10.8/25.5/33.7 %, S154's tables,
+/// S155's 8.84/23.00/17.27 %) was taken with this ruler, and a ruler whose scale follows the
+/// knob is not a ruler.
+///
+/// ## ⛔ Two corrections to what this doc used to say
+///
+/// 1. It claimed «at an output f0 of 110 Hz this filter takes **−0.38 dB** off the fundamental.
+///    That is measured, not hypothetical». **It is the 12 ms number.** Re-measured: 12 ms costs
+///    −0.3673 dB at 110 Hz, the shipped 8 ms costs **−0.1540**. The sentence survived the
+///    12 → 8 ms change with its number attached — the exact shape of stale doc this repo has
+///    been burned by before, and it was caught by a forensic pass, not by a test.
+/// 2. It said the up-shift path is "far away" from trouble. It is (score path: lowest output f0
+///    on six installed records × the calibration song is MIDI 61 = **277 Hz**). ⛔ But
+///    `cover_dead_plan` emits a **positive** shift (audio moved DOWN) and every installed record
+///    has `usable.0 == 36`, i.e. the dead notes are at the **bottom** ⇒ output f0 below
+///    **65.41 Hz**, where a fixed 8 ms cut takes **−3.98 dB** off the fundamental, and the
+///    structural floor (MIDI 12 = 16.35 Hz) reaches **−25.18 dB**.
+///    ⚠ Also: the response is oscillatory ABOVE the first null — 178.69 Hz (MIDI 53.4, the middle
+///    of a male range) still costs −0.42 dB.
+///    ⇒ this is why the width had to become adaptive before the default could be flipped, and
+///    why "≈ 3 periods" from the old note became **exactly one period of the lowest fundamental**
+///    (measured: over 31.7-830 Hz the adaptive rule costs the fundamental −0.0000…−0.0005 dB).
 const INFRASONIC_MA_MS: f64 = 8.0;
 
 /// S155 — the narrowest and widest the adaptive cut is allowed to get, in ms.
@@ -991,7 +1006,7 @@ fn infrasonic_width_ms(f0_hz: &[f32], ratio: f64) -> f64 {
 /// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
-pub const PROBE_ARM_DEFAULTS: [(&str, f64); 7] = [
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 8] = [
     ("UTAI_PSOLA_FRAC", 0.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
     ("UTAI_PSOLA_LOCK", 0.30),
@@ -999,6 +1014,7 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 7] = [
     ("UTAI_PSOLA_HP_MS", 0.0),
     ("UTAI_PSOLA_ENVFIX", 0.0),
     ("UTAI_PSOLA_BRIDGE", 30.0),
+    ("UTAI_PSOLA_WIN", 0.0),
 ];
 
 /// Box filter with a running prefix sum; the window shrinks at the two ends rather than
@@ -1556,7 +1572,7 @@ pub fn psola_shift_infra(
 ) -> (Vec<f32>, PsolaDiagnostics) {
     psola_shift_env(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
-        phase_lock, infrasonic, 0.0, 0.0,
+        phase_lock, infrasonic, 0.0, 0.0, 0.0,
     )
 }
 
@@ -1583,6 +1599,7 @@ pub fn psola_shift_env(
     infrasonic: Infrasonic,
     env_restore_ms: f64,
     bridge_unvoiced_ms: f64,
+    win_periods: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -1688,9 +1705,33 @@ pub fn psola_shift_env(
             let k = ks[i].min(src.len() - 1);
             let src_l = if k > 0 { src[k] - src[k - 1] } else { tm - tl };
             let src_r = if k + 1 < src.len() { src[k + 1] - src[k] } else { tr - tm };
-            let lw = (tm - tl).min(src_l);
-            let rw = (tr - tm).min(src_r);
-            if lw <= 1.0 || rw <= 1.0 || lw > max_period || rw > max_period {
+            // S155 —— 读窗。**今天** `lw = rw = min(T_out, T_src)`,而上移时 `T_out = T_src/ratio`
+            // ⇒ 读窗总宽 = **2/ratio 个源周期**(逐颗粒实测 p05-p95:位移 −9 → 1.189、
+            // −12 → **1.000**、−14 → **0.891**)。教科书 TD-PSOLA 是 ±1 个源周期 = 总宽 **2.000**。
+            //
+            // ⭐ 这个自由度是**高次共振峰**那条线的头号候选,而且是被**干预**证明的,不是相关:
+            //   同一段音频、同一批颗粒、同一个比值,只改窗宽(离线台子,自检 −85…−93 dB),
+            //   谱包络对比度相对 donor 的损失(dB,越接近 0 越好):
+            //
+            //   | ratio 2.0 (ぴゃ 那一档) | 2-4 kHz | 4-6 kHz | 6-8 kHz | 8-12 kHz |
+            //   |---|---|---|---|---|
+            //   | 今天(半宽 0.50) | −0.834 | −0.666 | −0.606 | −0.866 |
+            //   | 教科书(半宽 1.00) | **−0.360** | **−0.209** | **−0.189** | **−0.277** |
+            //   | 今天窗宽 + 除 wsum | −0.949 | −0.673 | −0.577 | −0.871 |
+            //
+            //   ⭐ 最后一行是把自由度分离开的那条对照:**「除 wsum」单独什么也不做,是窗宽**。
+            // ⛔ 但它是**取舍不是纯赚**:同一组臂上谐波间噪声(300-2500 Hz)从 −2.78 掉到 −0.86 dB
+            //   (三条臂 +1…+2 dB),而 300-2500 Hz 正是「咔哒」那条带。
+            //   ⇒ 这种取舍只有耳朵能裁(S146 协议),所以这里**默认 0 = 今天**,逐位不变。
+            let (lw, rw) = if win_periods > 0.0 {
+                (win_periods * src_l, win_periods * src_r)
+            } else {
+                ((tm - tl).min(src_l), (tr - tm).min(src_r))
+            };
+            // ⚠ 上界要跟着窗宽走,否则宽窗臂会**静默地把颗粒全部跳过** —— 那是「干预没生效」
+            //   被读成「干预无效」的形状(S148 的 `frac_transport` 写死成 false 是同一族)。
+            let wmax = max_period * win_periods.max(1.0);
+            if lw <= 1.0 || rw <= 1.0 || lw > wmax || rw > wmax {
                 continue;
             }
             // S148 WSOLA(默认 0 = 关,生产逐位不变):只挪【源】读点,不挪合成脉冲 tm。
@@ -1754,7 +1795,10 @@ pub fn psola_shift_env(
                 gap += 1;
             }
             ws.push(raw);
-            out[i] = acc[i] as f32;
+            // S155 —— 窗一旦超过邻距,半余弦就不再天然求和为 1 ⇒ 必须除 wsum(教科书写法)。
+            // ⚠ 这时 `cola_w_median` / `cola_over_frac` 读的是**原始**重叠系数(≈ 2·win·ratio),
+            //   不再是「COLA 有没有破」的读数 —— 别把它读成红。`cola_gap_frac` 仍然有意义。
+            out[i] = if win_periods > 0.0 { (acc[i] / raw.max(1e-9)) as f32 } else { acc[i] as f32 };
         } else {
             // copyFlat: outside the synthesized span the un-shifted input rides the window-sum
             // ramp, which IS the crossfade. Inside it, a shortfall is a defect and must not be
@@ -2004,6 +2048,73 @@ mod tests {
         let (y, _) =
             psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
         assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
+    }
+
+    /// S155 —— 读窗旋钮:**默认逐位同旧**,而打开时**必须真的生效**。
+    ///
+    /// ⛔ 后半句才是贵的那条。这个旋钮有一条现成的静默失败路径:颗粒循环里有
+    /// `if lw > max_period { continue; }`,而 `max_period` 是**按今天那个窄窗**定的
+    /// (0.02 s)⇒ 宽窗臂会把颗粒**一颗颗跳过**,输出照样有声(岛外透传 + 剩下的颗粒),
+    /// 而「干预没生效」会被读成「干预无效」。S148 的 `frac_transport` 写死成 `false`
+    /// 就是同一族,那次差点把一条真实的修法判死。
+    ///
+    /// ⇒ 这里同时钉住三件:⑴ 0 = 逐位同旧;⑵ 打开之后输出**变了**;
+    /// ⑶ 打开之后**源覆盖率变好**(那是窗变宽的结构性后果,而且今天这个读数本来就在
+    ///    `src_uncovered_frac` 上 —— ratio > 2 时相邻读窗之间会留下永远没人读的源波形)。
+    #[test]
+    fn the_wide_read_window_is_off_by_default_and_actually_bites_when_it_is_on() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        // ratio > 2 ⇒ 今天的读窗窄于一个源周期 ⇒ 源上真的有没人读的段落
+        for st in [7.0f64, 14.0] {
+            let (a, da) = psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0,
+            );
+            let (b, db) = psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0,
+            );
+            assert_ne!(a, b, "{st} st: 宽窗臂与今天逐位相同 —— 颗粒多半被 max_period 静默跳过了");
+            assert_eq!(da.islands, db.islands, "{st} st: 窗宽不该改变岛的数目");
+            assert!(
+                db.marks >= da.marks / 2,
+                "{st} st: 宽窗臂的标记数塌了({} → {})—— 那是被跳过,不是被加宽",
+                da.marks,
+                db.marks
+            );
+            assert!(
+                db.src_uncovered_frac <= da.src_uncovered_frac + 1e-6,
+                "{st} st: 窗加宽了源覆盖率反而变差({:.4} → {:.4})",
+                da.src_uncovered_frac,
+                db.src_uncovered_frac
+            );
+            // ⛔⛔ ⑷ **电平**。这不是「输出不许是垃圾」的兜底,它是这条臂**已知的代价**:
+            //   除 wsum 归一的是**窗**,而相邻颗粒读的是同一个源脉冲错开 T_out 的副本,
+            //   在脉冲中心之外**不同相** ⇒ 求和的幅度小于单颗粒 ⇒ 除完 wsum 电平必然掉。
+            //   真素材实测(离线台子,岛内 rms 相对今天):半宽 1.0 时 **−4.29 / −5.53 / −5.82 dB**;
+            //   这个合成夹具上 −6.7 dB。
+            //   ⭐ 这就是这条臂**默认关**、而且**不许拿它去做耳判**的原因 —— 轻 5 dB 的臂
+            //     在任何 A/B 里都会被响度污染(S152 那条 +0.582 dB 就已经污染过一次结论)。
+            //   ⇒ 断言钉的是「代价在已知区间内」,而不是「没有代价」。
+            let (ra, rb) = (rms(&a), rms(&b));
+            let drop = 20.0 * (rb / ra).log10();
+            assert!(
+                (-9.0..=1.0).contains(&drop),
+                "{st} st: 宽窗臂的电平变了 {drop:+.2} dB —— 实测代价是 −4.3…−6.7 dB,                 跑出这个区间说明 wsum 没除、除错了、或者颗粒被静默跳过了"
+            );
+        }
+        // ⭐ 阴性对照:ratio > 2 时今天的读窗**必然**漏掉源(见 `src_uncovered_frac`),
+        //    所以上面那条覆盖率断言不是恒真的。
+        let (_, d14) = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0,
+        );
+        assert!(
+            d14.src_uncovered_frac > 0.01,
+            "+14 st 上今天就没漏源({:.4})⇒ 上面那条覆盖率判据是空的",
+            d14.src_uncovered_frac
+        );
     }
 
     /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
@@ -2339,7 +2450,7 @@ mod tests {
             let (off, doff) =
                 psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
             let (via, dvia) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0);
             assert_eq!(off, via, "{st} st: env_restore_ms = 0 must be the legacy arm");
             assert_eq!(doff, dvia, "{st} st: …diagnostics included");
             // ⛔ The readout has to exist while the arm is OFF, or "what does it look like today"
@@ -2351,7 +2462,7 @@ mod tests {
             assert_eq!(doff.env_dev_after_db, 0.0, "{st} st: nothing restored while off");
 
             let (on, don) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0);
             assert_ne!(on, off, "{st} st: the opt-in arm must actually change the audio");
             // ⛔ What this arm promises is **the slow part**: the step at an island start. It does
             // not promise to shrink a 5 ms median that is already down in the period-scale noise,
@@ -2407,7 +2518,7 @@ mod tests {
 
         let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
         let (via, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0);
         assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
 
         // ⛔⛔ **The island count must survive ANY width.** This is the guard the goose regression
@@ -2428,7 +2539,7 @@ mod tests {
         assert_eq!(d[d.len() - 1], f0t[f0t.len() - 1]);
 
         let (on, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0, 0.0);
         assert_ne!(on, off, "the opt-in arm must actually change the audio");
         // ⚠ Not asserting `off == x` at the gap edge: the previous island's last grains reach a
         // little past its last mark, so the very edge is already synthesized even with the arm off.
@@ -2458,7 +2569,7 @@ mod tests {
             let f0t = flat_f0(x.len(), hop, f0 as f32);
             for ms in [2.0, 5.0, 20.0] {
                 let (y, _d) =
-                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0);
+                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0, 0.0);
                 assert_eq!(y, x, "f0 {f0}, envfix {ms} ms: ratio 1.0 must be the identity");
             }
         }
@@ -2485,7 +2596,7 @@ mod tests {
             *v = 0.0;
         }
         let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
-        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0);
+        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0);
         // The first and last eighth are comfortably inside the unvoiced pass-through.
         let e = x.len() / 8;
         assert_eq!(off[..e], on[..e], "the arm reached into the leading pass-through");
@@ -3454,6 +3565,8 @@ mod tests {
         // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来。
         // ⚠ 这里的 fallback 是 [`PROBE_ARM_DEFAULTS`](= 生产默认),**不是 0** —— 见那份文档。
         let bridge: f64 = probe_arm("UTAI_PSOLA_BRIDGE");
+        // S155 —— `UTAI_PSOLA_WIN=<periods>` 读窗半宽(源周期);0 = 今天。
+        let win: f64 = probe_arm("UTAI_PSOLA_WIN");
         // S155 —— `UTAI_PSOLA_HP=0/1` 去次声;`UTAI_PSOLA_HP_MS=<ms>` 强制固定宽度(0 = 自适应)。
         // ⛔⛔ 它以前在这里**写死成 `false`**,于是这条探针上「开」与「关」的输出**逐位相同** ——
         //    和 S148 那次 `frac_transport` 写死成 false 一模一样的形状,而那次差点被读成
@@ -3465,10 +3578,10 @@ mod tests {
             (true, _) => Infrasonic::PerPeriod,
         };
         let (y, d) = psola_shift_env(
-            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge,
+            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge, win,
         );
         println!(
-            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?}"
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?} win={win}"
         );
         // ⛔ 「这条探针跑的是不是生产口径」必须**当场看得见**。S154 之后生产默认是
         //    `bridge=30 / lock=0.30`,而这条探针以前对这两个都默认 0 ⇒ 照旧脚本跑出来的
