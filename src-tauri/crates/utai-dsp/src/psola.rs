@@ -1323,10 +1323,53 @@ fn infrasonic_baseline(x: &[f32], sample_rate: u32) -> Vec<f64> {
 /// (Measured: with the width hard-coded, changing 8 → 20 ms left the whole file green while the
 /// benefit halved. That is the S147 silent-halving shape.)
 fn infrasonic_baseline_ms(x: &[f32], sample_rate: u32, ms: f64) -> Vec<f64> {
-    let half = (((f64::from(sample_rate) * ms / 1000.0) as usize) / 2).max(1);
-    let v: Vec<f64> = x.iter().map(|s| f64::from(*s)).collect();
-    box_average(&box_average(&v, half), half)
+    infrasonic_baseline_passes(x, sample_rate, ms, RULER_BOX_PASSES)
 }
+
+/// S155 笔5 —— **几遍盒**。`RULER_BOX_PASSES` 是那把**尺子**([`PsolaDiagnostics::infrasonic_frac`])
+/// 的遍数,永远是 2;[`CUT_BOX_PASSES`] 是**刀**的遍数。
+///
+/// ## ⛔⛔ 为什么刀非得是 4 遍(用户听出来的,而且我事先量到过又照样上线)
+///
+/// 差分式 `out -= LP(out) − LP(in)` 里的 `+LP(in)` 是**一份低通过的 donor**,而 donor 唱得更低。
+/// 两遍盒的**第一个旁瓣只有 −27 dB**,所以只要被救的那个音的基频落在旁瓣上,
+/// 它就会被原样加回输出 ⇒ 输出里多出**第二个音高** ⇒ 用户 2026-08-19 的原话:
+/// 「f0 附近偏下多了一道有点时长的共振峰伪影,听起来甚至有一点**合唱感**」。
+///
+/// ⭐ 排序是他先听出来的,仪器完全对上(用户点名的 244.9-245.96 s,落在 −12 窗 ⇒
+/// donor 基频 = f_out/2 = 310.6 Hz;该带能量相对各自 400-4000 Hz):
+///
+/// | 臂 | f_out/2 附近 |
+/// |---|---|
+/// | 无扩展(根本没有这道工序) | −48.7 dB |
+/// | 不开这把刀 | −42.8 |
+/// | 固定 8 ms | −33.8 |
+/// | **自适应 4.36 ms(shipped)** | **−25.7** |
+///
+/// 渲染地板(同设置两跑)只有 **0.19 dB**。解析对拍:两遍盒在 310.6 Hz 上
+/// 4.36 ms 读 −27.05 dB、8.0 ms 读 −35.73 dB ⇒ 预言两臂差 **+8.68 dB**,实测 **+8.10**。
+///
+/// ⛔ **根因不是宽度选错了**:宽度规则把第一个零点放在**这段缓冲里最低**的基频上,而**被救的
+/// 那个音**的基频比它高 ⇒ 落在旁瓣里。旁瓣有多深是滤波器的性质,不是宽度的性质。
+/// ⇒ 4 遍盒把「被救音的基频高 1.5 倍」这一档从 **−26.8 dB** 压到 **−53.6 dB**(解析),
+/// 零地板探针上实测:s14 不加刀 −41.42 → 2 遍 **−34.31**(漏了 +7.1)→ 4 遍 **−41.44**(漏没了)。
+/// ⚠ 代价:同宽度下拿掉量少 **2-3 dB**(20-125 Hz)。⭐ 但用户已经确认那条底部亮带在
+/// 拿掉量更少的「固定 8 ms」臂上就已经消失了 ⇒ 余量充足,而合唱感是他明确说更糟的那一条。
+fn infrasonic_baseline_passes(x: &[f32], sample_rate: u32, ms: f64, passes: usize) -> Vec<f64> {
+    let half = (((f64::from(sample_rate) * ms / 1000.0) as usize) / 2).max(1);
+    let mut v: Vec<f64> = x.iter().map(|s| f64::from(*s)).collect();
+    for _ in 0..passes {
+        v = box_average(&v, half);
+    }
+    v
+}
+
+/// The **ruler**'s box passes. ⛔ Never change it: every historical `infrasonic_frac` on this line
+/// (S152's 10.8/25.5/33.7 %, S154's tables, S155's 8.84/23.00/17.27 %) was taken with 2 passes,
+/// and a ruler whose shape follows the knob is not a ruler.
+const RULER_BOX_PASSES: usize = 2;
+/// The **knife**'s box passes. See [`infrasonic_baseline_passes`] for why it is 4 and not 2.
+const CUT_BOX_PASSES: usize = 4;
 
 fn add_bell(
     x: &[f32],
@@ -1931,8 +1974,8 @@ pub fn psola_shift_env(
             // ⭐ 顺带,它在**岛外**也自动 ≈ 0(那里 `out ≡ x` 逐位相同)⇒ 那段没被移调的原始
             //     donor 不再被这把刀削低频,而且不需要写 mask —— mask 会在岛边界造台阶,
             //     那正是 S154 刚修掉的那一类缺陷。
-            let lo_out = infrasonic_baseline_ms(&out, sample_rate, ms);
-            let lo_in = infrasonic_baseline_ms(x, sample_rate, ms);
+            let lo_out = infrasonic_baseline_passes(&out, sample_rate, ms, CUT_BOX_PASSES);
+            let lo_in = infrasonic_baseline_passes(x, sample_rate, ms, CUT_BOX_PASSES);
             // ⛔⛔ **护栏:这把刀永远不许往低频里加东西。**
             //
             // 差分式把 `LP(in)` 加回输出,而**低频不是被移调守恒的**:下移时输出的脉冲密度
@@ -2113,6 +2156,84 @@ mod tests {
         let (y, _) =
             psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
         assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
+    }
+
+    /// S155 笔5 —— ⛔⛔⛔ **这把刀不许把【输入自己的基频】加回输出。**
+    ///
+    /// 这是用户 2026-08-19 听出来的那条缺陷的判据,而它本该在笔1 就存在。
+    /// 差分式 `out -= LP(out) − LP(in)` 里的 `+LP(in)` 是**一份低通过的输入**,
+    /// 而输入(donor)唱得比输出低 ⇒ 只要 LP 在输入的基频上没压干净,
+    /// 输出里就多出**第二个音高**。用户的原话:「f0 附近偏下多了一道有点时长的共振峰伪影,
+    /// 听起来甚至有一点**合唱感**」,而且他给出的强弱排序(无扩展 < 不开刀 < 固定 8 ms <
+    /// 自适应)与仪器**完全一致**。
+    ///
+    /// ## ⛔ 为什么这个夹具必须有**两个**音高
+    ///
+    /// 宽度规则把低通的第一个零点放在**这段缓冲里最低**的基频上。若夹具只有一个音高,
+    /// 那个音高就正好坐在零点上 ⇒ 漏为 0 ⇒ **判据恒真**。真实情况是:缓冲里有更低的音
+    /// (它们设定了宽度),而**真正被救的那个音**的基频更高 ⇒ 落在**旁瓣**里。
+    /// 两遍盒的第一个旁瓣只有 **−27 dB**,四遍是 **−53 dB** —— 这就是笔5 改的东西。
+    /// ⇒ 夹具:前半段 200 Hz(定宽度),后半段落在第一个旁瓣峰上(≈1.43/W)。
+    #[test]
+    fn the_cut_never_puts_the_inputs_own_pitch_back_into_the_output() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f_low = 200.0f64;
+        // 第一个旁瓣峰在 f·W ≈ 1.43,而 W ≈ 1/f_low ⇒ f ≈ 1.43·f_low。
+        let f_hi = 1.43 * f_low;
+        let (a, _) = pulses(sr, 0.5, |_| f_low, |_| 1.0);
+        let (b, _) = pulses(sr, 0.5, |_| f_hi, |_| 1.0);
+        let mut x = a.clone();
+        x.extend_from_slice(&b);
+        let frames = x.len().div_ceil(hop);
+        let half = frames / 2;
+        let mut f0t = vec![f_low as f32; frames];
+        for f in f0t.iter_mut().skip(half) {
+            *f = f_hi as f32;
+        }
+        let (off, _) = psola_shift_env(
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0,
+        );
+        let (on, don) = psola_shift_env(
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0,
+        );
+        assert!(don.infrasonic_ma_ms > 0.0, "臂开着却没报出宽度");
+        // 只看后半段(那里输入唱 f_hi,而输出被搬到 2·f_hi ⇒ f_hi 上本该什么都没有)
+        let k = x.len() / 2;
+        let leak_off = tone_mag(&off[k..], sr, f_hi);
+        let leak_on = tone_mag(&on[k..], sr, f_hi);
+        let d = 20.0 * (leak_on.max(1e-15) / leak_off.max(1e-15)).log10();
+
+        // ⛔ 阈值不许是拍脑袋的数。参照 = **2 遍盒那条**(= shipped 时的实现)在同一份材料、
+        //    同一个宽度上漏多少;判据 = 今天这把必须比它好 ≥18 dB。
+        //    ⭐ 这样它随 `CUT_BOX_PASSES` 自校准,而且它测的正是「改这个常数买到了什么」。
+        //    实测:2 遍 **+22.70 dB** · 4 遍 **+1.64** · 6 遍与 8 遍都在 +1.0 以下。
+        let ms = f64::from(don.infrasonic_ma_ms);
+        let two = {
+            let lo_o = infrasonic_baseline_passes(&off, sr, ms, 2);
+            let lo_i = infrasonic_baseline_passes(&x, sr, ms, 2);
+            let y: Vec<f32> = off
+                .iter()
+                .enumerate()
+                .map(|(i, o)| (f64::from(*o) - (lo_o[i] - lo_i[i])) as f32)
+                .collect();
+            20.0 * (tone_mag(&y[k..], sr, f_hi).max(1e-15) / leak_off.max(1e-15)).log10()
+        };
+        assert!(
+            two - d >= 18.0,
+            "这把刀在输入自己的基频 {f_hi:.0} Hz 上加了 {d:+.2} dB,而 2 遍盒那条参照加 {two:+.2} \
+             —— 只好了 {:.1} dB。那是把 donor 的音高塞回输出(用户听成「合唱感」)。\
+             宽度 {ms:.2} ms,盒 {CUT_BOX_PASSES} 遍",
+            two - d
+        );
+        // ⛔ 参照本身必须**真的坏**,否则上面那条是拿两个都干净的东西相减。
+        assert!(
+            two > 10.0,
+            "2 遍盒的参照只漏了 {two:+.2} dB —— 这个夹具没把缺陷造出来,判据是空的\
+             (被救音的基频必须落在旁瓣上,见这条测试的文档)"
+        );
+        // ⛔ 阴性对照:这条臂**必须真的动了东西**,否则上面那条是「什么也没做」的恒真。
+        assert_ne!(on, off, "刀开着却逐位没动 —— 上面那条判据是空的");
     }
 
     /// S155 笔3 —— ⛔⛔ **宽度只许由这一段缓冲里【真的有音频】的那些帧决定。**
@@ -2926,14 +3047,18 @@ mod tests {
                 }
                 let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
                 let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
-                // Dirichlet kernel of one box, squared for the two passes; high-pass = 1 - D^2.
+                // Dirichlet kernel of one box, raised to the number of passes the CUT uses;
+                // high-pass = 1 - D^K. ⚠ S155 笔5 把 K 从 2 改成 4(见
+                // `infrasonic_baseline_passes`),而这一行是唯一把「这条臂到底是不是它文档里
+                // 那条滤波器」钉住的地方 —— 它当场红了,拦得对。
                 let ph = std::f64::consts::PI * f / f64::from(sr);
                 let dk = if ph.abs() < 1e-12 { 1.0 } else { (ph * l).sin() / (l * ph.sin()) };
-                let want = 20.0 * (1.0 - dk * dk).abs().max(1e-12).log10();
+                let want =
+                    20.0 * (1.0 - dk.powi(CUT_BOX_PASSES as i32)).abs().max(1e-12).log10();
                 assert!(
                     (d - want).abs() < 0.10,
-                    "{st} st: {f:.0} Hz moved {d:+.3} dB but the triangular window predicts \
-                     {want:+.3} — then this arm is not the filter it documents"
+                    "{st} st: {f:.0} Hz moved {d:+.3} dB but the {CUT_BOX_PASSES}-pass box \
+                     predicts {want:+.3} — then this arm is not the filter it documents"
                 );
                 // …and over the band production actually uses, the cost must be nil.
                 // ⚠ 800 Hz, not 250: the triangular window's response is oscillatory, and at
