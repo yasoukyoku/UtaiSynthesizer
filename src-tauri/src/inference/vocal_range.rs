@@ -1704,7 +1704,13 @@ pub fn inverse_engine() -> InverseEngine {
 /// carrying arm reads ABOVE gold — ΔHNR > 0 means "more periodic than the input", which is what
 /// WORLD bought by collapsing unvoiced plosives. ⇒ blind test first, flip after (S146 protocol).
 pub fn frac_transport() -> bool {
-    matches!(std::env::var("UTAI_PSOLA_FRAC").as_deref(), Ok("1"))
+    parse_frac_transport(std::env::var("UTAI_PSOLA_FRAC").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state
+/// (and so `the_probe_defaults_are_the_production_defaults` can read the default off it).
+fn parse_frac_transport(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
 }
 
 /// S148 — `UTAI_PSOLA_WSOLA=<frac>` turns on the source-side waveform-similarity search in
@@ -1726,7 +1732,14 @@ pub fn frac_transport() -> bool {
 /// audibility nobody has measured. That is exactly the shape only ears can settle (S146 protocol:
 /// blind test first, flip after), and the notch axis has never had an audibility calibration at all.
 pub fn wsola_frac() -> f64 {
-    std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(0.0)
+    parse_wsola_frac(std::env::var("UTAI_PSOLA_WSOLA").ok().as_deref())
+}
+
+/// The env parse, as a pure function — same reason as [`parse_frac_transport`].
+/// ⚠ Unlike `parse_phase_lock`, an explicit 0 is indistinguishable from "off" here, which is fine
+/// only because the default *is* off.
+fn parse_wsola_frac(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(0.0)
 }
 
 /// S150 — `UTAI_PSOLA_LOCK=<periods>` phase-locks the analysis marks onto the glottal pulses.
@@ -3335,6 +3348,42 @@ mod tests {
         // 垃圾与越界一律退回默认,不许静默改变行为。
         for bad in ["", "nonsense", "-1", "NaN", "501"] {
             assert_eq!(parse_bridge_unvoiced_ms(Some(bad)), BRIDGE_UNVOICED_MS_DEFAULT, "{bad:?}");
+        }
+    }
+
+    /// S155 —— **探针的默认口径 = 生产的默认口径**,由这一条绑住。
+    ///
+    /// ⛔⛔ 为什么需要它:`psola_probe` 以前对每个臂都硬编码 `0.0` 作为回落值。那在「所有生产
+    /// 默认都是 0」的时代是对的,而 S150 翻了 `phase_lock`、S154 翻了 `bridge` 之后就**静默地**
+    /// 不对了 —— 照旧脚本跑一遍探针,拿到的是**改动之前的臂**,而没有任何一行输出会说破。
+    /// 这条线上每一场的结论都建立在探针上,所以那是一个能污染整条线的静默失败。
+    /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
+    #[test]
+    fn the_probe_defaults_are_the_production_defaults() {
+        let want: [(&str, f64); 6] = [
+            ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
+            ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
+            ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
+            ("UTAI_PSOLA_HP", f64::from(u8::from(parse_infrasonic_hp(None)))),
+            ("UTAI_PSOLA_ENVFIX", parse_env_restore_ms(None)),
+            ("UTAI_PSOLA_BRIDGE", parse_bridge_unvoiced_ms(None)),
+        ];
+        let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
+        assert_eq!(
+            table.len(),
+            want.len(),
+            "加了一个臂旋钮却没加进探针的默认表 —— 探针会对它硬编码地跑另一条臂"
+        );
+        for (key, production) in want {
+            let (_, probe) = table
+                .iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("{key} 不在 PROBE_ARM_DEFAULTS 里"));
+            assert_eq!(
+                *probe, production,
+                "{key}:探针默认 {probe} ≠ 生产默认 {production} —— \
+                 照脚本跑出来的「今天」其实是另一条臂"
+            );
         }
     }
 

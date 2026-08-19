@@ -887,6 +887,32 @@ fn analysis_marks(
 /// instead of being a constant.
 const INFRASONIC_MA_MS: f64 = 8.0;
 
+/// S155 — what `psola_probe` runs when an arm's env var is **unset**: the production defaults.
+///
+/// ## ⛔⛔ Why this table exists
+///
+/// The probe used to hard-code `0.0` for every arm. That was fine while every production default
+/// *was* zero, and it silently stopped being fine the moment one was flipped: after S154 the
+/// production arm is `bridge = 30 ms` and `phase_lock = 0.30`, so anyone re-running the S154 probe
+/// script today would get **the pre-S154 arm** and file it as "today" — with no line of output
+/// saying otherwise. Same family as the two hard-coded `false`s this probe already shipped
+/// (`frac_transport`, S148; `remove_infrasonic`, S155): *the arm is wired* and *the arm carries
+/// production's value* are different facts.
+///
+/// ⛔ This is a **mirror**, so it can drift. `vocal_range`'s `the_probe_defaults_are_the_production
+/// _defaults` binds it to the real knobs — flip a default there without touching this table and
+/// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
+///
+/// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 6] = [
+    ("UTAI_PSOLA_FRAC", 0.0),
+    ("UTAI_PSOLA_WSOLA", 0.0),
+    ("UTAI_PSOLA_LOCK", 0.30),
+    ("UTAI_PSOLA_HP", 0.0),
+    ("UTAI_PSOLA_ENVFIX", 0.0),
+    ("UTAI_PSOLA_BRIDGE", 30.0),
+];
+
 /// Box filter with a running prefix sum; the window shrinks at the two ends rather than
 /// zero-padding (zero-padding would manufacture a step exactly where the buffer starts).
 fn box_average(x: &[f64], half: usize) -> Vec<f64> {
@@ -3057,6 +3083,28 @@ mod tests {
         eprintln!("[mg] marks: {islands} islands, {marks} marks, lock {lock} moved {locked} -> {out}");
     }
 
+    /// 一个臂旋钮的取值:env 里有就用 env,没有就用 [`PROBE_ARM_DEFAULTS`](= **生产默认**)。
+    ///
+    /// ⛔ 解析不了就 **panic**,不许静默回落到默认值。这条探针存在的全部意义是「输出属于哪个
+    /// 口径」可查,而 `UTAI_PSOLA_BRIDGE=30ms`(带单位)这种手滑在旧写法下会**读成 0**、
+    /// 打印成 0、然后被当成一条正常的臂记进档案里 —— 那正是「跑不起来被读成通过」。
+    fn probe_arm(key: &str) -> f64 {
+        let (_, want) = PROBE_ARM_DEFAULTS
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("{key} 不在 PROBE_ARM_DEFAULTS 里 —— 加旋钮要连表一起加"));
+        match std::env::var(key) {
+            Err(_) => *want,
+            Ok(v) => match v.trim() {
+                "true" | "on" | "yes" => 1.0,
+                "false" | "off" | "no" => 0.0,
+                s => s.parse::<f64>().unwrap_or_else(|_| {
+                    panic!("{key}={v:?} 解析不了 —— 探针不许把它当成默认值悄悄跑过去")
+                }),
+            },
+        }
+    }
+
     #[test]
     #[ignore = "probe: needs a wav + f0 track on disk (set UTAI_PSOLA_*)"]
     fn psola_probe() {
@@ -3086,28 +3134,48 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // S148:`UTAI_PSOLA_WSOLA=<frac>` 打开源侧波形相似度搜索(默认 0 = 关,逐位同旧)。
-        let wsola: f64 =
-            std::env::var("UTAI_PSOLA_WSOLA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        // S148:`UTAI_PSOLA_WSOLA=<frac>` 打开源侧波形相似度搜索。
+        let wsola: f64 = probe_arm("UTAI_PSOLA_WSOLA");
         // S148 —— `frac_transport` 以前在这里写死成 false,于是 `UTAI_PSOLA_FRAC` 对这条探针**完全无效**:
         // 开与不开的输出 sha256 逐位相同。我差点把那读成「亚样本搬运对包络起伏没用」。
         // ⛔「臂开着」与「臂做了事」是两件事 —— 现在它由 env 控,并且把实际取值打出来。
-        let frac = std::env::var("UTAI_PSOLA_FRAC").ok().is_some_and(|v| v != "0" && v != "false");
-        // S150 —— `UTAI_PSOLA_LOCK=<periods>`(默认 0 = 关)。
-        let lock: f64 =
-            std::env::var("UTAI_PSOLA_LOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        // S154 —— `UTAI_PSOLA_ENVFIX=<ms>` 打开振幅包络还原(默认 0 = 关 = 逐位同旧)。
-        let envfix: f64 =
-            std::env::var("UTAI_PSOLA_ENVFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来(默认 0 = 关 = 逐位同旧)。
-        let bridge: f64 =
-            std::env::var("UTAI_PSOLA_BRIDGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let frac = probe_arm("UTAI_PSOLA_FRAC") != 0.0;
+        // S150 —— `UTAI_PSOLA_LOCK=<periods>`。
+        let lock: f64 = probe_arm("UTAI_PSOLA_LOCK");
+        // S154 —— `UTAI_PSOLA_ENVFIX=<ms>` 打开振幅包络还原。
+        let envfix: f64 = probe_arm("UTAI_PSOLA_ENVFIX");
+        // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来。
+        // ⚠ 这里的 fallback 是 [`PROBE_ARM_DEFAULTS`](= 生产默认),**不是 0** —— 见那份文档。
+        let bridge: f64 = probe_arm("UTAI_PSOLA_BRIDGE");
+        // S155 —— `UTAI_PSOLA_HP=1` 去次声。
+        // ⛔⛔ 它以前在这里**写死成 `false`**,于是这条探针上「开」与「关」的输出**逐位相同** ——
+        //    和 S148 那次 `frac_transport` 写死成 false 一模一样的形状,而那次差点被读成
+        //    「亚样本搬运对包络起伏没用」。⇒ 现在由 env 控,并且实际取值打出来。
+        let hp = probe_arm("UTAI_PSOLA_HP") != 0.0;
         let (y, d) = psola_shift_env(
-            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, false, envfix, bridge,
+            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge,
         );
         println!(
-            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge}"
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp}"
         );
+        // ⛔ 「这条探针跑的是不是生产口径」必须**当场看得见**。S154 之后生产默认是
+        //    `bridge=30 / lock=0.30`,而这条探针以前对这两个都默认 0 ⇒ 照旧脚本跑出来的
+        //    「今天」其实是**改动之前的臂**,而没有任何一行输出会说破这件事。
+        let drift: Vec<String> = PROBE_ARM_DEFAULTS
+            .iter()
+            .filter_map(|(k, want)| {
+                let got = probe_arm(k);
+                (got != *want).then(|| format!("{k}={got} (生产 {want})"))
+            })
+            .collect();
+        if drift.is_empty() {
+            println!("  口径 = 生产默认");
+        } else {
+            println!("  ⛔ 口径**不是**生产默认:{}", drift.join(" · "));
+        }
+        if hp {
+            println!("  hp: 拿掉了 {:.2} 个百分点的次声份额", d.infrasonic_removed * 100.0);
+        }
         println!(
             "  env dev p50 {:.3} dB{}",
             d.env_dev_p50_db,
@@ -3137,6 +3205,27 @@ mod tests {
             }
             std::fs::write(&p, s).expect("write grain dump");
             println!("  grain dump: {} 行 -> {p}", rows.len());
+        }
+
+        // S155 —— `UTAI_PSOLA_DUMP_F32=<prefix>` 倒出 `<prefix>_in.f32` 与 `<prefix>_out.f32`
+        // (裸 little-endian f32,与 `UTAI_PSOLA_F0` 同一种格式)。
+        //
+        // ⛔⛔ 为什么需要它:下面那个 writer 是 **16 bit + 按峰值归一**。两件事都会伪造差:
+        // ⑴ 归一让「臂 A vs 臂 B」各自拿到**不同的增益**(HP 只要把峰值动 0.008 dB,整条臂就
+        //    带上一个全局增益差)—— S152 那条「emphasis 臂带 +0.582 dB ⇒『更舒服』被响度污染」
+        //    就是这个形状;⑵ 16 bit 的量化底噪 ≈ −96 dBFS,而这一场要量的是**去次声之后**
+        //    的残量,它可能就在那个量级附近。
+        // ⇒ 凡是拿探针做「加了多少 / 还剩多少」的题,一律读这两个 f32,别读那个 wav。
+        if let Ok(prefix) = std::env::var("UTAI_PSOLA_DUMP_F32") {
+            for (suffix, buf) in [("_in.f32", &x), ("_out.f32", &y)] {
+                let mut bytes = Vec::with_capacity(buf.len() * 4);
+                for v in buf.iter() {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let p = format!("{prefix}{suffix}");
+                std::fs::write(&p, &bytes).unwrap_or_else(|e| panic!("write {p}: {e}"));
+                println!("  f32 dump: {} 个样本 -> {p}", buf.len());
+            }
         }
 
         let peak = y.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
