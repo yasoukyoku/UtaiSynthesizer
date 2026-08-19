@@ -883,8 +883,10 @@ fn analysis_marks(
 ///
 /// ## ⚠⚠ S155 — this constant is now a **RULER, not the cut**
 ///
-/// The removal's width is [`Infrasonic::PerPeriod`], derived per buffer from the f0 track. This
-/// 8 ms stays as the fixed width of the *reading* [`PsolaDiagnostics::infrasonic_frac`], and that
+/// The removal's width is [`Infrasonic::PerPeriod`], derived **per voiced island** from the
+/// source periods of the grains actually synthesised there (⛔ **not** from the f0 track — see
+/// that function for why that was wrong twice), and it uses [`CUT_BOX_PASSES`] box passes, not 2.
+/// This 8 ms stays as the fixed width of the *reading* [`PsolaDiagnostics::infrasonic_frac`], and that
 /// is deliberate: every historical number on this line (S152's 10.8/25.5/33.7 %, S154's tables,
 /// S155's 8.84/23.00/17.27 %) was taken with this ruler, and a ruler whose scale follows the
 /// knob is not a ruler.
@@ -905,8 +907,9 @@ fn analysis_marks(
 ///    ⚠ Also: the response is oscillatory ABOVE the first null — 178.69 Hz (MIDI 53.4, the middle
 ///    of a male range) still costs −0.42 dB.
 ///    ⇒ this is why the width had to become adaptive before the default could be flipped, and
-///    why "≈ 3 periods" from the old note became **exactly one period of the lowest fundamental**
-///    (measured: over 31.7-830 Hz the adaptive rule costs the fundamental −0.0000…−0.0005 dB).
+///    why "≈ 3 periods" from the old note became **one period of the lowest fundamental in each
+///    island** (measured: over 31.7-830 Hz the adaptive rule costs the fundamental
+///    −0.0000…−0.0005 dB).
 const INFRASONIC_MA_MS: f64 = 8.0;
 
 /// S155 — the narrowest and widest the adaptive cut is allowed to get, in ms.
@@ -928,19 +931,30 @@ const INFRASONIC_MS_MAX: f64 = 50.0;
 /// |---|---|---|---|---|
 /// | none | +42.0 | +22.8 | +14.6 | +3.6 |
 /// | fixed 8 ms | +1.7 | **+8.9** | **+11.6** | **+3.3** |
-/// | [`Infrasonic::PerPeriod`] (2.9 ms here) | −0.5 | +0.1 | +2.1 | +0.8 |
+/// | a 2.9 ms cut (2-pass) | −0.5 | +0.1 | +2.1 | +0.8 |
+///
+/// ⚠ **That table is the 10 s PROBE, 2 box passes, one width for the whole buffer** — i.e. the
+/// first thing S155 shipped, not what runs today. Two things changed after it, both because the
+/// user heard/saw something the table cannot show:
+/// * the cut is **4 box passes** (`CUT_BOX_PASSES`) — 2 passes leak the donor's own pitch through
+///   the −27 dB first sidelobe, which he reported as 「合唱感」;
+/// * the width is **per island**, not per buffer.
+/// ⇒ for what production actually does, read the whole-song numbers in
+///   `TESTING/s155_knives/au_s155e/看哪里.md`. ⛔ Do not quote this table as "today".
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Infrasonic {
     /// Off — byte-for-byte the arm without this step.
     Off,
-    /// Width = **one period of the lowest fundamental present anywhere in this buffer**, input or
-    /// output. See [`infrasonic_width_ms`] for why that is the right width and what it protects.
+    /// Width = **one period of the lowest fundamental in each voiced island**, input or output,
+    /// taken from the grains actually synthesised there. See [`infrasonic_width_ms`] for why that
+    /// is the right width, why it must be per island, and where the f0 must NOT come from.
     PerPeriod,
     /// A fixed width in ms — for A/B renders and for reproducing an older arm.
     FixedMs(f64),
 }
 
-/// S155 — the cut's width for one buffer: **one period of the lowest fundamental in it**.
+/// S155 — the cut's width for **one island**: one period of the lowest fundamental *in that
+/// island*, measured from the source periods of the grains actually synthesised there.
 ///
 /// ## What picks this number
 ///
@@ -960,21 +974,36 @@ pub enum Infrasonic {
 /// output f0 of 110 Hz a fixed 3 ms cut takes **−10.1 dB** off the fundamental (measured,
 /// `s155_knives/width_sweep.py`).
 ///
-/// ## Measured
+/// ## ⛔⛔ Where the f0 must NOT come from (this cost two commits)
 ///
-/// Probe, production caliber, three shifts. "optimum" = the width that minimises the residual
-/// low band subject to the donor leak staying under 1 dB:
+/// **The f0 track is not the pitch content of this buffer.** Production hands the whole song's
+/// `note_hz_full` to every rescue pass, while `score2svc.rs` zero-fills the audio of every chunk
+/// that pass does not intersect — and it **never masks the f0 track** (the S151 note in
+/// `vocal_range.rs` was written about exactly this asymmetry). A percentile over the raw track is
+/// therefore a percentile over **notes that are digital silence here**, and those are never the
+/// notes being rescued. Measured: at −14 st the raw p01 gives **6.03 ms** where the rescued notes
+/// call for **2.70**, leaving **+8.5…+9.6 dB** standing in 50-125 Hz and removing **0.16 dB** in
+/// 125-200 Hz — i.e. nothing, in the exact band the user reported.
 ///
-/// | arm | donor f0 (p05) | measured optimum | `1000/f0` |
-/// |---|---|---|---|
-/// | −9 st | 370.0 Hz | 3 ms | **2.70** |
-/// | −12 st | 233.6 Hz | 4 ms | **4.28** |
-/// | −14 st | 349.2 Hz | 3 ms | **2.86** |
+/// ⛔ **And no reading showed it**: `infrasonic_frac` is the fixed 8 ms ruler whose energy is
+/// 99.4 % below 20 Hz, so 6.03 ms and 8.00 ms read the same "removed 18.8 pts". Only
+/// [`PsolaDiagnostics::infrasonic_ma_ms`] differed, and nobody compared it to the width the
+/// decision had been made on. **That is the S147 silent-halving shape, entering through a door
+/// this function's own doc comment described.**
 ///
-/// ⚠ **p01, not the minimum.** One bad frame in the f0 track would otherwise widen the cut for
-/// the whole buffer and halve the benefit silently — the S147 shape. The chosen width is reported
-/// in [`PsolaDiagnostics::infrasonic_ma_ms`] precisely so that a silent widening is visible.
-/// ⚠ The failure direction of a too-low f0 estimate is *less removal*, never damage.
+/// Masking the track by "this frame's audio is not silence" was still not enough: a *rendered*
+/// chunk also carries the notes this pass does **not** rescue, and they are lower. ⇒ the only
+/// quantity that needs no outside knowledge of "which notes get rescued" is the **source period
+/// of each grain this process actually laid down**, per island.
+///
+/// ## Measured (whole song, per-island, production)
+///
+/// Median island width per pass: **1.98 / 3.09 / 2.70 ms** at −9 / −12 / −14 — and 2.70 is
+/// exactly what an independent derivation from "only the 62 notes actually rescued at −14" gives.
+///
+/// ⚠ The chosen width is reported in [`PsolaDiagnostics::infrasonic_ma_ms`] (the median over
+/// islands) precisely so that a silent widening stays visible.
+/// ⚠ The failure direction of a too-low estimate is *less removal*, never damage.
 fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64 {
     // S155 笔4 —— 用**真的被合成出来的颗粒自己的源周期**,而不是 f0 轨的分位数。
     //
@@ -985,8 +1014,6 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
     //    的周期。它逐颗粒都在手边(`src_l`),而且它本来就是这把刀要保护的那个基频。
     // ⚠ 收集端还要再挡一次静音:S151 实测**铺零区照样会被铺满标记**(去 DC 之后常数上处处
     //    相关 = 1.0,间距恒为标称周期),所以按**这一颗粒的源读窗里有没有音频**过滤。
-    //
-    // p99 而不是 max:一颗坏标记不该把整段的刀变宽(失败方向仍然是「少削一点」,不是损伤)。
     if src_periods.is_empty() {
         return INFRASONIC_MS_MAX;
     }
@@ -1003,51 +1030,6 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
     return (1000.0 / lowest.max(1.0)).clamp(INFRASONIC_MS_MIN, INFRASONIC_MS_MAX);
 }
 
-#[allow(dead_code)]
-fn infrasonic_width_ms_from_track(x: &[f32], f0_hz: &[f32], f0_hop: usize, ratio: f64) -> f64 {
-    // ⛔⛔ **The f0 track is NOT the pitch content of this buffer.** Production hands the whole
-    // song's `note_hz_full` to every rescue pass, while `score2svc.rs` zero-fills the audio of
-    // every chunk that pass does not intersect — and it never masks the f0 track (the S151 note
-    // in `vocal_range.rs` was written about exactly this asymmetry). So a percentile over the raw
-    // track is a percentile over **notes that are digital silence here**, and those are never the
-    // notes being rescued.
-    //
-    // Measured, and this is not a corner case — it is what shipped for a few hours on 2026-08-19:
-    // on the calibration song at −14 st the raw p01 is 165.4 Hz ⇒ **6.03 ms**, while the p01 over
-    // the notes actually in this buffer is 370.0 Hz ⇒ **2.70 ms**. The cut then leaves
-    // **+8.5…+9.6 dB** standing in 50-125 Hz instead of ~+2, and removes **0.16 dB** in
-    // 125-200 Hz, i.e. nothing — in the exact band the user reported.
-    // ⛔ And no reading showed it: `infrasonic_frac` is the fixed-8 ms ruler whose energy is
-    // 99.4 % below 20 Hz, so 6.03 ms and 8.00 ms read the same "removed 18.8 pts". The only
-    // number that differed was `infrasonic_ma_ms` itself, and nobody compared it to the width the
-    // decision was made on. **That is the S147 silent-halving shape, entering through a door this
-    // function's own doc comment describes.**
-    // ⇒ mask by "this frame's audio is not digital silence", which is what "present in this
-    //   buffer" meant all along.
-    let mut v: Vec<f64> = Vec::new();
-    for (i, f) in f0_hz.iter().enumerate() {
-        if !f.is_finite() || *f <= 30.0 {
-            continue;
-        }
-        let a = i.saturating_mul(f0_hop);
-        if a >= x.len() {
-            break;
-        }
-        let b = (a + f0_hop).min(x.len());
-        if x[a..b].iter().any(|s| s.abs() > 1e-7) {
-            v.push(f64::from(*f));
-        }
-    }
-    if v.is_empty() {
-        // No pitch anywhere ⇒ nothing was transposed ⇒ be conservative rather than clever.
-        return INFRASONIC_MS_MAX;
-    }
-    v.sort_by(f64::total_cmp);
-    let p01 = v[((v.len() - 1) as f64 * 0.01).round() as usize];
-    // Up-shift ⇒ the input is the lower one; down-shift ⇒ the output is.
-    let lowest = p01 * ratio.min(1.0);
-    (1000.0 / lowest.max(1.0)).clamp(INFRASONIC_MS_MIN, INFRASONIC_MS_MAX)
-}
 
 /// S155 — what `psola_probe` runs when an arm's env var is **unset**: the production defaults.
 ///
@@ -1316,7 +1298,8 @@ fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
     }
 }
 
-/// The infrasonic baseline of `x` — two box passes = a triangular low-pass. See
+/// The infrasonic baseline of `x` at the **ruler's** shape (2 box passes = a triangular
+/// low-pass). ⛔ The **cut** uses [`CUT_BOX_PASSES`]; see [`infrasonic_baseline_passes`]. See
 /// [`INFRASONIC_MA_MS`] for the measured response.
 fn infrasonic_baseline(x: &[f32], sample_rate: u32) -> Vec<f64> {
     infrasonic_baseline_ms(x, sample_rate, INFRASONIC_MA_MS)

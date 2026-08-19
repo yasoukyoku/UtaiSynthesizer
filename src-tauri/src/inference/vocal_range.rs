@@ -1827,7 +1827,12 @@ const PHASE_LOCK_DEFAULT: f64 = 0.30;
 ///    **71 Hz**. That leftover is what the user reported on 2026-08-19 as
 ///    「很多地方的 200 以下还造出了极低频的伪影」, with his own negative control attached
 ///    (the donor singing the same words 14 semitones lower is clean down there).
-///    S155's width is one period of the lowest fundamental in the buffer ⇒ residual ≤ 2.1 dB.
+///    S155's width is one period of the lowest fundamental **in each voiced island** ⇒ on the
+///    whole song the median widths are 1.98 / 3.09 / 2.70 ms at −9 / −12 / −14.
+/// 3. ⛔ **The low-pass itself was too sloppy.** Two box passes have a **−27 dB first sidelobe**,
+///    and the rescued note's own fundamental lands in it ⇒ the differential form's `+LP(in)` put
+///    **the donor's pitch back into the output**, which the user reported as 「合唱感」.
+///    Four passes (−53 dB) fixed it; the width rule did not change.
 ///
 /// ## What promotes it
 ///
@@ -1883,7 +1888,8 @@ fn parse_infrasonic_hp(v: Option<&str>) -> bool {
 /// bumped `s154a` → `s155a` in the same commit.
 const INFRASONIC_HP_DEFAULT: bool = true;
 
-/// 0 = the adaptive width (one period of the lowest fundamental). See [`infrasonic_fixed_ms`].
+/// 0 = the adaptive width (one period of the lowest fundamental **per island**).
+/// See [`infrasonic_fixed_ms`].
 const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 
 /// S155 — `UTAI_PSOLA_WIN=<periods>` widens TD-PSOLA's **read window** to that many source
