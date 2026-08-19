@@ -975,9 +975,40 @@ pub enum Infrasonic {
 /// the whole buffer and halve the benefit silently — the S147 shape. The chosen width is reported
 /// in [`PsolaDiagnostics::infrasonic_ma_ms`] precisely so that a silent widening is visible.
 /// ⚠ The failure direction of a too-low f0 estimate is *less removal*, never damage.
-fn infrasonic_width_ms(f0_hz: &[f32], ratio: f64) -> f64 {
-    let mut v: Vec<f64> =
-        f0_hz.iter().filter(|f| f.is_finite() && **f > 30.0).map(|f| f64::from(*f)).collect();
+fn infrasonic_width_ms(x: &[f32], f0_hz: &[f32], f0_hop: usize, ratio: f64) -> f64 {
+    // ⛔⛔ **The f0 track is NOT the pitch content of this buffer.** Production hands the whole
+    // song's `note_hz_full` to every rescue pass, while `score2svc.rs` zero-fills the audio of
+    // every chunk that pass does not intersect — and it never masks the f0 track (the S151 note
+    // in `vocal_range.rs` was written about exactly this asymmetry). So a percentile over the raw
+    // track is a percentile over **notes that are digital silence here**, and those are never the
+    // notes being rescued.
+    //
+    // Measured, and this is not a corner case — it is what shipped for a few hours on 2026-08-19:
+    // on the calibration song at −14 st the raw p01 is 165.4 Hz ⇒ **6.03 ms**, while the p01 over
+    // the notes actually in this buffer is 370.0 Hz ⇒ **2.70 ms**. The cut then leaves
+    // **+8.5…+9.6 dB** standing in 50-125 Hz instead of ~+2, and removes **0.16 dB** in
+    // 125-200 Hz, i.e. nothing — in the exact band the user reported.
+    // ⛔ And no reading showed it: `infrasonic_frac` is the fixed-8 ms ruler whose energy is
+    // 99.4 % below 20 Hz, so 6.03 ms and 8.00 ms read the same "removed 18.8 pts". The only
+    // number that differed was `infrasonic_ma_ms` itself, and nobody compared it to the width the
+    // decision was made on. **That is the S147 silent-halving shape, entering through a door this
+    // function's own doc comment describes.**
+    // ⇒ mask by "this frame's audio is not digital silence", which is what "present in this
+    //   buffer" meant all along.
+    let mut v: Vec<f64> = Vec::new();
+    for (i, f) in f0_hz.iter().enumerate() {
+        if !f.is_finite() || *f <= 30.0 {
+            continue;
+        }
+        let a = i.saturating_mul(f0_hop);
+        if a >= x.len() {
+            break;
+        }
+        let b = (a + f0_hop).min(x.len());
+        if x[a..b].iter().any(|s| s.abs() > 1e-7) {
+            v.push(f64::from(*f));
+        }
+    }
     if v.is_empty() {
         // No pitch anywhere ⇒ nothing was transposed ⇒ be conservative rather than clever.
         return INFRASONIC_MS_MAX;
@@ -1850,7 +1881,7 @@ pub fn psola_shift_env(
         diag.infrasonic_frac = before as f32;
         let ms = match infrasonic {
             Infrasonic::Off => 0.0,
-            Infrasonic::PerPeriod => infrasonic_width_ms(f0_hz, ratio),
+            Infrasonic::PerPeriod => infrasonic_width_ms(x, f0_hz, f0_hop, ratio),
             Infrasonic::FixedMs(ms) => {
                 if ms.is_finite() && ms > 0.0 { ms } else { 0.0 }
             }
@@ -2048,6 +2079,60 @@ mod tests {
         let (y, _) =
             psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
         assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
+    }
+
+    /// S155 笔3 —— ⛔⛔ **宽度只许由这一段缓冲里【真的有音频】的那些帧决定。**
+    ///
+    /// 这条判据是**对抗复核**送回来的,而它抓的是本场刚上线的东西:生产喂给每一遍救援的是
+    /// **整首歌**的 f0 轨,而 `score2svc.rs` 会把不相交的 chunk 的**音频铺成零**却**从不掩 f0**。
+    /// ⇒ 分位数落在**在这条缓冲里是数字静音**的音上,而那些音从来不是被救援的音。
+    /// 实测:−14 那一遍生产选了 **6.03 ms**,而按真正被救的音应当是 **2.70 ms**,
+    /// 于是 50-125 Hz 还站着 **+8.5…+9.6 dB**、125-200 Hz 只拿掉 **0.16 dB**。
+    ///
+    /// ⛔ **为什么必须是一条【结构】判据而不是一个读数**:`infrasonic_frac` 是固定 8 ms 的尺子,
+    /// 99.4% 的能量在 20 Hz 以下 ⇒ 6.03 ms 与 8.00 ms 在它上面**读同一个数**。
+    /// 唯一露馅的是 `infrasonic_ma_ms`,而它露的时候没有任何东西会红。
+    ///
+    /// ⚠ 现有的 `the_infrasonic_arm_costs_nothing_over_productions_output_band` 挡不住这个:
+    /// 它用 `flat_f0`(一条恒定的轨)⇒ 对「在一条跨两个八度的轨上取分位数」**结构上失明**。
+    #[test]
+    fn the_cut_width_ignores_f0_frames_whose_audio_is_digital_silence() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;   // 5 ms
+        // 后半段是真音频(440 Hz),前半段是**数字静音**但 f0 轨仍然写着一个很低的音。
+        let (voiced, _) = pulses(sr, 0.5, |_| 440.0, |_| 1.0);
+        let mut x = vec![0.0f32; voiced.len()];
+        x.extend_from_slice(&voiced);
+        let frames = x.len().div_ceil(hop);
+        let half = frames / 2;
+        let mut f0t = vec![110.0f32; frames];        // 静音那半:一个低八度的假音
+        for f in f0t.iter_mut().skip(half) {
+            *f = 440.0;
+        }
+        let (_, d) = psola_shift_env(
+            &x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0,
+        );
+        let want = 1000.0 / 440.0;
+        assert!(
+            (f64::from(d.infrasonic_ma_ms) - want).abs() < 0.15,
+            "宽度 {} ms —— 它应当是**有音频那半**的一个周期({want:.2} ms)。\
+             读到 {:.2} ms 说明分位数又落回了铺零区那条假 f0(110 Hz ⇒ 9.09 ms)",
+            d.infrasonic_ma_ms,
+            d.infrasonic_ma_ms
+        );
+        // ⛔ 阴性对照:把那半段的音频也填上,宽度**必须**跟着变宽 ——
+        //    否则上面那条断言可能只是「这个实现从来不看 f0 轨」。
+        let mut x2 = voiced.clone();
+        x2.extend_from_slice(&voiced);
+        let (_, d2) = psola_shift_env(
+            &x2, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0,
+        );
+        assert!(
+            f64::from(d2.infrasonic_ma_ms) > f64::from(d.infrasonic_ma_ms) * 1.5,
+            "把静音那半填上音频之后宽度没跟着变({} → {} ms)⇒ 上面那条判据是空的",
+            d.infrasonic_ma_ms,
+            d2.infrasonic_ma_ms
+        );
     }
 
     /// S155 —— 读窗旋钮:**默认逐位同旧**,而打开时**必须真的生效**。
