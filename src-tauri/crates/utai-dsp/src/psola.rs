@@ -151,6 +151,31 @@ pub struct PsolaDiagnostics {
     /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
     /// something" are different facts and only the second one is visible in the audio.
     pub infrasonic_removed: f32,
+    /// S154 — |20·log10(env(out) / env(in))| median over the covered span, 5 ms RMS window, dB.
+    ///
+    /// **This process is a pitch transform. It has no business changing the amplitude envelope.**
+    /// It does: measured on the probe (donor −14, 10 s, same buffer in and out, so the reading is
+    /// the process and nothing else) **p50 1.14 dB · p90 2.05 · max 10.83**, while the same
+    /// reading outside the voiced islands is **exactly 0.00** (there `out ≡ in` by construction —
+    /// that zero is the control that makes the rest of the number mean something).
+    ///
+    /// ⭐ Where it lives: **at the island start**, i.e. the vowel onset. Step across the first
+    /// 20 ms of each island, s14 segment: **−0.49 / −1.76 / −6.09 / −0.48 dB** (4 islands).
+    /// S153 §4k had already found the same concentration from the other side (worst 15 violations
+    /// whole-song: 14 of them within ±35 ms of a vowel onset).
+    ///
+    /// ⛔⛔ **Why it was dropped once, and why that was wrong.** S153 filed it as "real but not the
+    /// click" because it could not rank the user's six annotated points. That inference does not
+    /// hold: *a ruler failing to rank six points* is a fact about **our measurement**, not about
+    /// the world — and the user had reported this very defect from the **waveform** ("波形在进入
+    /// 稳定的长音之前有一个非常突兀的波形尖峰") back in S152, where it was measured as ruler ⑦
+    /// (起音过冲) and dropped for the same reason. Two independent drops of the user's own
+    /// first-hand observation, both because a ranking test failed. ⇒ **Never write "a ruler could
+    /// not separate the marks" as "the phenomenon is not there".**
+    pub env_dev_p50_db: f32,
+    /// S154 — the same median **after** the restoration arm ran, 0.0 when the arm is off.
+    /// ⛔ "The arm is on" vs "the arm did something", same rule as `infrasonic_removed`.
+    pub env_dev_after_db: f32,
 }
 
 const MAX_PERIOD_SECONDS: f64 = 0.02;
@@ -704,9 +729,29 @@ fn lock_phase(x: &[f32], marks: &mut [f64], radius_periods: f64) -> usize {
 
 /// Pitch marks inside one voiced island: seed at the island's midpoint extremum, then recurse
 /// outward maximizing correlation with the previous mark's neighbourhood.
-fn analysis_marks(x: &[f32], sample_rate: u32, f0: &[f32], hop: usize, a: usize, b: usize) -> Vec<f64> {
+/// `seed_at`: where to plant the first mark. `None` = the island midpoint, which is what this has
+/// always done.
+///
+/// ⛔⛔ **Why it had to become a parameter (S154).** The seed decides the phase of the *entire* mark
+/// train (everything else walks outward from it), so anything that moves the island edges moves
+/// every grain in that island. Measured when the island-dilation arm first landed: the whole-song
+/// difference against today was **p50 +1.2 dB relative — larger than the signal — in 73 % of voiced
+/// cells**, against a render floor of −28.1 dB. That is a complete re-synthesis, not an edge fix.
+/// ⇒ two things were changing at once: the boundary coverage (what we wanted) and a re-roll of
+/// every note's mark phase (a lottery — S148/S150 are entirely about how much mark placement
+/// matters). Seeding from the **undilated** island keeps the marks put, so the arm changes only
+/// what it is supposed to.
+fn analysis_marks(
+    x: &[f32],
+    sample_rate: u32,
+    f0: &[f32],
+    hop: usize,
+    a: usize,
+    b: usize,
+    seed_at: Option<f64>,
+) -> Vec<f64> {
     let sr = f64::from(sample_rate);
-    let mid = (a + b) as f64 * 0.5;
+    let mid = seed_at.unwrap_or((a + b) as f64 * 0.5);
     let f_mid = f0_at(f0, hop, mid);
     if !(f_mid > 0.0) {
         return Vec::new();
@@ -860,6 +905,215 @@ fn box_average(x: &[f64], half: usize) -> Vec<f64> {
             (pre[b] - pre[a]) / (b - a) as f64
         })
         .collect()
+}
+
+/// S154 — **bridge short unvoiced gaps in the fed f0 so the islands cover the whole note.**
+///
+/// ## The defect this exists for
+///
+/// This process only shifts **inside voiced islands**; outside them the input is passed through
+/// *bit for bit* (measured on the probe: residual −341 … −385 dB, i.e. float noise). The fed f0
+/// is zeroed on unvoiced phones, so the island boundary lands **exactly on the vowel onset** —
+/// and the join between the two is **0.25 … 3 ms** wide (measured: the residual against the input
+/// collapses from −13 dB to −348 dB within 1 ms of the edge).
+///
+/// ⇒ every rescued note keeps a fragment of **un-shifted, 9-14 semitones too low** audio at each
+/// end, butted against the shifted body across a sub-millisecond join. In the spectrogram every
+/// harmonic **steps** at that instant — which is a broadband vertical line — and in the waveform
+/// the attack stands off from the body as an abrupt spike.
+///
+/// ⭐ How much leaks, at the notes the user annotated (outside-island peak ÷ inside-island peak,
+/// and outside/inside energy): 698 "normal" **0.30× / −22.8 dB** · ぴゃ "no line here" **0.27× /
+/// −21.5** · 719 "abnormal" **0.65× / −16.9** · 781 "abnormal" **1.35×** · 753 "abnormal"
+/// **2.09× / −1.06**. ⇒ **the first quantity on this line that orders the user's labels**, and it
+/// separates *within* a single shift (698 vs 719, both −9), so it is not just a ratio proxy.
+///
+/// ⭐ It also matches every negative control the user gave by ear: signalsmith has **no islands**
+/// (it shifts the whole stream) ⇒ no boundary ⇒ no defect; the donor that never went through
+/// PSOLA has no boundary either; the defect is at note heads **and** tails (an island has two
+/// ends) and **never in the middle of a note** (there is no boundary there).
+///
+/// ## What the knob does
+///
+/// Fill zero runs **shorter than `max_ms`, and interior only**, by interpolating the neighbouring
+/// voiced values, before the islands are cut. A real rest is longer than the bound and stays a
+/// rest. `0.0 = off = byte-for-byte the pre-S154 arm.`
+///
+/// ⚠ It moves `analysis_marks`' seed (that function seeds at the island **midpoint**), so the
+/// whole mark train shifts phase. S153 rejected a whole-track version of this for exactly that
+/// reason — but that rejection was about comparing the island **interiors**; the **boundary** is
+/// what this is for, and it is the one thing that comparison can answer cleanly.
+fn bridge_unvoiced(f0: &[f32], hop: usize, sample_rate: u32, max_ms: f64) -> Vec<f32> {
+    // ⛔⛔ The first version of this only filled zero runs *between* two voiced runs, bounded by
+    // `max_ms`. Measured on the real material: it changed **nothing** — island count 7→7 and 5→5
+    // at 40 / 80 ms, 7→6 at 150 ms. The gaps between islands here are **longer than 150 ms**, i.e.
+    // the un-shifted attack is not a short consonant wedged between two islands, it sits inside a
+    // long unvoiced stretch that belongs to the note itself.
+    // ⇒ what the defect actually needs is a **dilation**: grow every voiced run outward by
+    // `max_ms`, holding the nearest voiced value, so the island covers the note's own onset and
+    // release. Two runs closer than `2 * max_ms` merge, which subsumes the bridging case.
+    // ⚠ Kept deliberately as one knob: "bridge a gap" and "cover the onset" are the same operation
+    // seen from two sides, and having two would invite tuning them against each other.
+    let ext = if hop == 0 {
+        0
+    } else {
+        ((max_ms / 1000.0) * f64::from(sample_rate) / hop as f64).round().max(0.0) as usize
+    };
+    if ext == 0 {
+        return f0.to_vec();
+    }
+    let n = f0.len();
+    // Nearest voiced frame to the left / right of each frame, capped at `ext`.
+    let mut left: Vec<Option<usize>> = vec![None; n];
+    let mut last: Option<usize> = None;
+    for i in 0..n {
+        if f0[i] > 0.0 {
+            last = Some(i);
+        }
+        left[i] = last.filter(|k| i - k <= ext);
+    }
+    let mut out = f0.to_vec();
+    let mut next: Option<usize> = None;
+    for i in (0..n).rev() {
+        if f0[i] > 0.0 {
+            next = Some(i);
+        }
+        if f0[i] > 0.0 {
+            continue;
+        }
+        let r = next.filter(|k| k - i <= ext);
+        out[i] = match (left[i], r) {
+            (Some(a), Some(b)) => {
+                // Interior gap short enough to be closed from both sides: interpolate, so a
+                // consonant between two different notes does not step.
+                let t = (i - a) as f64 / (b - a) as f64;
+                (f64::from(f0[a]) + (f64::from(f0[b]) - f64::from(f0[a])) * t) as f32
+            }
+            // Edge of a note: hold the run's own value outward. ⛔ Never invent a value where
+            // there is no voiced frame within `ext` on either side.
+            (Some(a), None) => f0[a],
+            (None, Some(b)) => f0[b],
+            (None, None) => 0.0,
+        };
+    }
+    out
+}
+
+/// S154 — the midpoint of the **undilated** island that a dilated island grew out of, so the mark
+/// train keeps the phase it had before. `None` (no raw islands, i.e. the arm is off, or no overlap)
+/// falls back to the dilated island's own midpoint = the legacy behaviour.
+///
+/// ⚠ Overlap, not containment: a dilated island can swallow more than one raw island (that is the
+/// bridging case). Seed from the **first** one — arbitrary but stable, and stability is the whole
+/// point of this function.
+fn seed_mid(raw: &[(usize, usize)], a: usize, b: usize) -> Option<f64> {
+    raw.iter().find(|(ra, rb)| *rb > a && *ra < b).map(|(ra, rb)| (*ra + *rb) as f64 * 0.5)
+}
+
+/// S154 — the window the **readout** [`PsolaDiagnostics::env_dev_p50_db`] uses, in ms.
+/// Fixed so the number is comparable across runs and knob settings; the *fix* takes its own width.
+const ENV_READ_MS: f64 = 5.0;
+
+/// S154 — how far the restoration gain may ever move a sample, dB. A guard rail, not a parameter:
+/// a real envelope violation on this line is 0.5-11 dB, so ±12 only ever catches a division by an
+/// envelope that has collapsed (silence, a mis-detected island edge) — the case where a corrective
+/// gain would otherwise explode.
+const ENV_RESTORE_CLAMP_DB: f64 = 12.0;
+
+/// Short-time RMS envelope, window `2*half+1` samples, shrinking at the two ends.
+/// Prefix-sum, so it is O(n) and — unlike a per-sample loop over a slice — does not change cost
+/// with the window width.
+fn rms_envelope(x: &[f32], half: usize) -> Vec<f64> {
+    let n = x.len();
+    let mut c = vec![0.0f64; n + 1];
+    for i in 0..n {
+        let v = f64::from(x[i]);
+        c[i + 1] = c[i] + v * v;
+    }
+    let mut e = vec![0.0f64; n];
+    for (i, slot) in e.iter_mut().enumerate() {
+        let a = i.saturating_sub(half);
+        let b = (i + half + 1).min(n);
+        *slot = ((c[b] - c[a]) / (b - a) as f64).max(0.0).sqrt();
+    }
+    e
+}
+
+/// Median |env(out) / env(in)| in dB over `covered`, ignoring anything more than 40 dB under the
+/// input's peak (there the ratio is noise-on-noise and says nothing).
+fn env_dev_p50_db(ey: &[f64], ex: &[f64], covered: &[bool]) -> f64 {
+    let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    let floor = peak * 10f64.powf(-40.0 / 20.0);
+    let mut v: Vec<f64> = Vec::new();
+    for i in 0..ey.len().min(ex.len()).min(covered.len()) {
+        if covered[i] && ex[i] > floor && ey[i] > 0.0 {
+            v.push((20.0 * (ey[i] / ex[i]).log10()).abs());
+        }
+    }
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// S154 — **make the process keep the amplitude envelope it was given.**
+///
+/// Inside the covered span only, rescale the output so its short-time RMS envelope matches the
+/// input's. Outside it the samples are not touched at all, so the covered/uncovered boundary
+/// cannot be moved by this arm (that boundary is where the defect lives, so it matters that the
+/// fix does not manufacture a second one).
+///
+/// ⚠ **What this must not do**: a gain that varies fast IS a modulation, and if the window is
+/// short enough to track individual source periods the division re-injects the *donor's* f0 into
+/// the output. Measured on the probe (donor-f0 leakage, harmonics of `f0_don` that do not
+/// coincide with `f0_out`): today −34.7 dB, and after restoration at 2 / 5 / 10 / 20 ms
+/// **−31.6 / −32.8 / −34.1 / −34.3** ⇒ under about 10 ms the cost starts to show. Pick the width
+/// with that in mind; the knob is in milliseconds precisely so the trade is explicit.
+/// ⛔⛔ **Two things here are not decoration, they are what makes the arm not backfire.**
+///
+/// 1. **The gain is smoothed before it is applied.** `env(g·y) == g·env(y)` only holds while `g`
+///    is constant across the window; a raw per-sample `ex/ey` is not, so applying it lands
+///    somewhere near — but not at — the target, and the miss is a *new* fast amplitude wobble.
+/// 2. **Two passes.** One pass leaves the residue from (1). Measured on the very fixture that
+///    caught this: at +1 st, where the violation is only 0.37 dB to begin with, a single
+///    unsmoothed pass made the deviation **worse** (0.37 → 1.05 dB). ⇒ a corrective arm has to be
+///    tested at the shifts where there is almost nothing to correct, not just where the defect is
+///    big — otherwise "it helps" is only ever measured where it cannot lose.
+fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
+    let ex = rms_envelope(x, half);
+    let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
+    if peak <= 0.0 {
+        return;
+    }
+    let floor = peak * 10f64.powf(-60.0 / 20.0);
+    let lo = 10f64.powf(-ENV_RESTORE_CLAMP_DB / 20.0);
+    let hi = 10f64.powf(ENV_RESTORE_CLAMP_DB / 20.0);
+    for _pass in 0..2 {
+        let ey = rms_envelope(out, half);
+        let raw: Vec<f64> = (0..out.len())
+            .map(|i| {
+                if covered[i] && ex[i] > floor && ey[i] > floor {
+                    (ex[i] / ey[i]).clamp(lo, hi)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        // ⛔ The gain is smoothed **wider than the measurement window** on purpose: it may only
+        // carry the SLOW part of the correction. A step at an island start is 10-40 ms wide;
+        // anything faster than that is period-scale, and a gain that tracked it would be
+        // re-injecting the donor's fundamental (see the leakage numbers on this function).
+        let g = box_average(&raw, half * 4);
+        for i in 0..out.len() {
+            if covered[i] {
+                out[i] = (f64::from(out[i]) * g[i]) as f32;
+            }
+        }
+    }
 }
 
 /// The infrasonic baseline of `x` — two box passes = a triangular low-pass. See
@@ -1167,6 +1421,36 @@ pub fn psola_shift_infra(
     phase_lock: f64,
     remove_infrasonic: bool,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_env(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, remove_infrasonic, 0.0, 0.0,
+    )
+}
+
+/// S154 — additive: optionally **restore the amplitude envelope** the process was handed.
+///
+/// `env_restore_ms = 0.0` is byte-for-byte the pre-S154 arm and is what production runs.
+/// See [`PsolaDiagnostics::env_dev_p50_db`] for what it is for and [`restore_envelope`] for the
+/// contract and the measured cost of a too-short window.
+///
+/// ⛔ Why it is a **width in milliseconds** and not a bool: the width is the whole trade. Too long
+/// and it cannot follow an attack (which is where the violation is); too short and the gain starts
+/// tracking individual source periods, which puts the donor's fundamental back into the output.
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_env(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    remove_infrasonic: bool,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -1196,6 +1480,22 @@ pub fn psola_shift_infra(
     let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
     let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
 
+    // S154 —— 岛的划法。⛔ 默认 0 = 不膨胀 = 逐位同旧;见 `bridge_unvoiced` 的说明。
+    // `islands_raw` 是**膨胀前**的岛,只用来给标记播种(见 `analysis_marks` 的 `seed_at`)。
+    let min_island = (MIN_ISLAND_SECONDS * sr) as usize;
+    let islands_raw: Vec<(usize, usize)> = if bridge_unvoiced_ms > 0.0 {
+        voiced_islands(f0_hz, f0_hop, n, min_island)
+    } else {
+        Vec::new()
+    };
+    let bridged: Vec<f32>;
+    let f0_hz: &[f32] = if bridge_unvoiced_ms > 0.0 {
+        bridged = bridge_unvoiced(f0_hz, f0_hop, sample_rate, bridge_unvoiced_ms);
+        &bridged
+    } else {
+        f0_hz
+    };
+
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
     let mut covered = vec![false; n];
@@ -1204,7 +1504,10 @@ pub fn psola_shift_infra(
     let (mut uncovered, mut span) = (0.0f64, 0.0f64);
 
     for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
-        let mut src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b);
+        // S154 —— 播种点用**没膨胀**的岛的中点(见 `analysis_marks` 的说明):
+        // 膨胀只该改「哪些样本被移调」,不该把每个音的标记相位重掷一次。
+        let seed = seed_mid(&islands_raw, a, b);
+        let mut src = analysis_marks(&dc_free, sample_rate, f0_hz, f0_hop, a, b, seed);
         if src.len() < 3 {
             continue;
         }
@@ -1213,6 +1516,12 @@ pub fn psola_shift_infra(
         diag.islands += 1;
         diag.marks += src.len();
         let last = (src.len() - 1) as f64;
+        // ⚠ S154 —— 一条**试过并且没成的**修法,留着免得下一个人再试一遍:
+        // 给合成栅格加一个常数相位、让它仍然穿过膨胀前的种子标记 —— **做不到保住岛内**。
+        // 原因是结构性的:岛变长 ⇒ 合成脉冲**多了几颗** ⇒ 整条脉冲串的相位必然跟着走,
+        // 除非「多出来的颗数 × ratio」正好是整数。⇒ 「只改边界、岛内逐位不变」在这条路上不存在。
+        // ⭐ 但**分析标记**是保住了的(见 `analysis_marks` 的 `seed_at`),动的只有合成栅格的相位,
+        //    而脉冲串的绝对相位听不见 —— 判据应当是「远离岛边处**包络**变没变」,不是「波形变没变」。
         let count = (last * ratio) as usize;
         let (mut island_first, mut cover_end) = (f64::NAN, f64::NAN);
         let mut tgt: Vec<f64> = Vec::with_capacity(count + 1);
@@ -1322,6 +1631,22 @@ pub fn psola_shift_infra(
             // overlapping bells, and overlapping bells mean covered). Feeding the raw sum instead
             // is bit-identical on real input — so do not expect a test to catch that swap.
             out[i] = (acc[i] + (1.0 - w) * f64::from(x[i])) as f32;
+        }
+    }
+    // S154 —— **振幅包络守恒**。读数无条件算(S152 那条规矩),修法由 `env_restore_ms` 控。
+    // ⛔ 顺序:排在次声之前,因为次声那一刀是全缓冲的线性滤波,而这一刀只动岛内 ——
+    //    反过来做会让次声读数里混进这一刀改的那部分。
+    {
+        let half = ((ENV_READ_MS * sr / 1000.0) as usize).max(4);
+        let ey = rms_envelope(&out, half);
+        let ex = rms_envelope(x, half);
+        diag.env_dev_p50_db = env_dev_p50_db(&ey, &ex, &covered) as f32;
+        if env_restore_ms > 0.0 {
+            let h = ((env_restore_ms * sr / 1000.0) as usize).max(4);
+            restore_envelope(&mut out, x, &covered, h);
+            let ey2 = rms_envelope(&out, half);
+            // 报「真的把它拉回了多少」而不是「开着」—— 与 `infrasonic_removed` 同一条规矩。
+            diag.env_dev_after_db = env_dev_p50_db(&ey2, &ex, &covered) as f32;
         }
     }
     // S152 —— **读数无条件算,修法才由旋钮控**。这样今天的生产日志里就能看见它,而输出逐位不变。
@@ -1725,6 +2050,170 @@ mod tests {
                 don.infrasonic_removed
             );
         }
+    }
+
+    /// S154 — the envelope-restoration arm: opt-in, readout unconditional, and it must do something.
+    ///
+    /// ⚠ The material matters here. A constant-amplitude pulse train has no envelope to violate,
+    /// so it would let a no-op arm pass; this fixture **ramps the amplitude** the way an attack
+    /// does, which is where the violation actually lives.
+    #[test]
+    fn the_envelope_arm_is_opt_in_and_the_readout_exists_while_it_is_off() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        // A 40 ms attack ramp into a steady body — the shape the defect lives on.
+        // `gain` is indexed by PULSE, not by time: at 220 Hz the first 9 pulses are ~40 ms.
+        let (x, _) = pulses(sr, 1.0, |_| f0, |k| {
+            if k < 9 {
+                0.25 + 0.75 * (k as f64) / 9.0
+            } else {
+                1.0
+            }
+        });
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [-12.0, -7.0, 1.0, 7.0, 14.0] {
+            let (off, doff) =
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+            let (via, dvia) =
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 0.0);
+            assert_eq!(off, via, "{st} st: env_restore_ms = 0 must be the legacy arm");
+            assert_eq!(doff, dvia, "{st} st: …diagnostics included");
+            // ⛔ The readout has to exist while the arm is OFF, or "what does it look like today"
+            // cannot be answered without shipping the change (S147's silent halving).
+            assert!(
+                doff.env_dev_p50_db.is_finite(),
+                "{st} st: the readout must be computed unconditionally"
+            );
+            assert_eq!(doff.env_dev_after_db, 0.0, "{st} st: nothing restored while off");
+
+            let (on, don) =
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false, 5.0, 0.0);
+            assert_ne!(on, off, "{st} st: the opt-in arm must actually change the audio");
+            // ⛔ What this arm promises is **the slow part**: the step at an island start. It does
+            // not promise to shrink a 5 ms median that is already down in the period-scale noise,
+            // and it must not be allowed to pretend otherwise — so the contract is split in two:
+            //   · where there is a real violation to fix (≥ 1 dB), it has to fall;
+            //   · everywhere else it may not make things meaningfully worse.
+            // ⚠ The second half is the one that caught a real defect: the first implementation
+            // (raw per-sample gain, one pass) turned 0.37 dB into 1.05 dB at +1 st.
+            if don.env_dev_p50_db >= 1.0 {
+                assert!(
+                    don.env_dev_after_db < don.env_dev_p50_db,
+                    "{st} st: the arm did not reduce a real violation ({} -> {})",
+                    don.env_dev_p50_db,
+                    don.env_dev_after_db
+                );
+            }
+            assert!(
+                don.env_dev_after_db <= don.env_dev_p50_db + 0.05,
+                "{st} st: the arm made the deviation WORSE ({} -> {})",
+                don.env_dev_p50_db,
+                don.env_dev_after_db
+            );
+            eprintln!(
+                "  [envfix] {st:+5} st: env dev {:.3} -> {:.3} dB",
+                don.env_dev_p50_db, don.env_dev_after_db
+            );
+        }
+    }
+
+    /// S154 — the unvoiced-bridge arm: opt-in, and when on it must actually shrink the un-shifted
+    /// leak at the island edges (which is the whole point of it).
+    ///
+    /// ⚠ The fixture has to have an **unvoiced gap inside a note**, because that gap is the defect.
+    /// A fully-voiced fixture would let a no-op pass.
+    #[test]
+    fn the_unvoiced_bridge_is_opt_in_and_closes_the_gap_it_exists_for() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        // Voiced, then a 40 ms unvoiced gap in the middle, then voiced again — one note with a
+        // consonant in it, which is exactly the shape the fed f0 has on a rescued 「と」.
+        let mut f0t = flat_f0(x.len(), hop, f0 as f32);
+        let g0 = f0t.len() * 4 / 10;
+        let g1 = (g0 + ((0.040 * f64::from(sr)) as usize / hop).max(1)).min(f0t.len());
+        for v in f0t.iter_mut().take(g1).skip(g0) {
+            *v = 0.0;
+        }
+        let islands_of = |t: &[f32]| {
+            voiced_islands(t, hop, x.len(), (MIN_ISLAND_SECONDS * f64::from(sr)) as usize).len()
+        };
+        assert_eq!(islands_of(&f0t), 2, "fixture must actually have two islands");
+
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+        let (via, _) =
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 0.0);
+        assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
+
+        // ⛔ A bound far shorter than the gap must NOT close it — otherwise the bound is decoration.
+        let short = bridge_unvoiced(&f0t, hop, sr, 5.0);
+        assert_eq!(islands_of(&short), 2, "a 5 ms dilation may not close a 40 ms gap");
+        // Dilation reaches from both sides, so 25 ms each closes 40 ms.
+        let long = bridge_unvoiced(&f0t, hop, sr, 25.0);
+        assert_eq!(islands_of(&long), 1, "25 ms from each side must close a 40 ms gap");
+
+        let (on, _) =
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 80.0);
+        assert_ne!(on, off, "the opt-in arm must actually change the audio");
+        // The gap was passed through un-shifted before; with the islands merged it is synthesized.
+        let a = (g0 * hop) + hop;
+        let b = (g1 * hop).min(x.len()) - hop;
+        let same_off = off[a..b] == x[a..b];
+        let same_on = on[a..b] == x[a..b];
+        assert!(same_off, "before: the gap is the un-shifted input, bit for bit");
+        assert!(!same_on, "after: the gap must no longer be the un-shifted input");
+    }
+
+    /// S154 — ⛔ the cheapest non-self-certifying gate on this whole line, applied to the new arm.
+    ///
+    /// At ratio 1.0 the target pulses ARE the source marks, so the output equals the input and the
+    /// two envelopes are identical ⇒ every corrective gain is exactly 1.0. If this ever fails, the
+    /// restoration is reaching outside the covered span or the envelope is being computed on
+    /// different buffers than it claims.
+    #[test]
+    fn ratio_one_stays_the_identity_with_the_envelope_arm_on() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        for f0 in [110.0, 220.0, 440.0] {
+            let (x, _) = pulses(sr, 0.5, |_| f0, |k| if k < 10 { 0.3 } else { 1.0 });
+            let f0t = flat_f0(x.len(), hop, f0 as f32);
+            for ms in [2.0, 5.0, 20.0] {
+                let (y, _d) =
+                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, ms, 0.0);
+                assert_eq!(y, x, "f0 {f0}, envfix {ms} ms: ratio 1.0 must be the identity");
+            }
+        }
+    }
+
+    /// S154 — the restoration may not reach **outside** the voiced islands.
+    ///
+    /// That boundary is exactly where the defect lives, so a fix that moved it would be trading one
+    /// discontinuity for another. Unvoiced stretches pass through untouched in the legacy arm; they
+    /// must still pass through untouched with the arm on.
+    #[test]
+    fn the_envelope_arm_never_touches_the_unvoiced_pass_through() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let f0 = 220.0;
+        let (x, _) = pulses(sr, 1.2, |_| f0, |_| 1.0);
+        // Voiced only in the middle third; the two ends are pass-through.
+        let mut f0t = flat_f0(x.len(), hop, f0 as f32);
+        let n = f0t.len();
+        for v in f0t.iter_mut().take(n / 3) {
+            *v = 0.0;
+        }
+        for v in f0t.iter_mut().skip(2 * n / 3) {
+            *v = 0.0;
+        }
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 5.0, 0.0);
+        // The first and last eighth are comfortably inside the unvoiced pass-through.
+        let e = x.len() / 8;
+        assert_eq!(off[..e], on[..e], "the arm reached into the leading pass-through");
+        assert_eq!(off[x.len() - e..], on[x.len() - e..], "…into the trailing pass-through");
+        assert_ne!(off, on, "…and it still has to have done something in the middle");
     }
 
     #[test]
@@ -2524,7 +3013,7 @@ mod tests {
         let mut marks = 0usize;
         let mut locked = 0usize;
         for (a, b) in voiced_islands(&f0, hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
-            let mut src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b);
+            let mut src = analysis_marks(&dc_free, spec.sample_rate, &f0, hop, a, b, None);
             if src.len() < 3 {
                 continue;
             }
@@ -2583,9 +3072,23 @@ mod tests {
         // S150 —— `UTAI_PSOLA_LOCK=<periods>`(默认 0 = 关)。
         let lock: f64 =
             std::env::var("UTAI_PSOLA_LOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        let (y, d) =
-            psola_shift_locked(&x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock);
-        println!("  arms: frac_transport={frac} wsola={wsola} phase_lock={lock}");
+        // S154 —— `UTAI_PSOLA_ENVFIX=<ms>` 打开振幅包络还原(默认 0 = 关 = 逐位同旧)。
+        let envfix: f64 =
+            std::env::var("UTAI_PSOLA_ENVFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来(默认 0 = 关 = 逐位同旧)。
+        let bridge: f64 =
+            std::env::var("UTAI_PSOLA_BRIDGE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let (y, d) = psola_shift_env(
+            &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, false, envfix, bridge,
+        );
+        println!(
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge}"
+        );
+        println!(
+            "  env dev p50 {:.3} dB{}",
+            d.env_dev_p50_db,
+            if envfix > 0.0 { format!(" -> {:.3} dB", d.env_dev_after_db) } else { String::new() }
+        );
         println!(
             "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
              islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {} \

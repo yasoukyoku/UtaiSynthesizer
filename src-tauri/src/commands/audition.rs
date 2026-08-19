@@ -365,6 +365,10 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             }
             // s85d: cover/audition switched to dead-only (whole-clip shift retired; the
             // pipelines own the policy) — a decision change, so the tag moves in lockstep.
+            // s154a: the voiced islands the inverse works inside are now dilated 30 ms at both
+            // ends, so every rescued note's head and tail are shifted instead of being passed
+            // through at the donor's (9-14 semitones too low) pitch. That changes the audio of
+            // every rescued note ⇒ the tag moves in lockstep with RANGE_ALGO_VERSION.
             // s146p: the inverse ENGINE changed (Signalsmith → TD-PSOLA). Every cached audition
             // whose model has a range record was rendered by the old engine; without this bump a
             // listener would compare the new engine against audio the old one produced and hear
@@ -373,7 +377,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // and accepted cost of a version term (unlike the recurring mis-scoping the header
             // above was written to stop, this fires exactly once per engine change).
             format!(
-                "_s151y_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s154a_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

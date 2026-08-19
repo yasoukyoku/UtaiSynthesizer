@@ -649,8 +649,21 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  expired at 46.40 s while the donor's 「ま」 was still sounding at **−18 dBFS**, and the 10 ms
  *  cross-fade took it to **−56 dB** (the rest's digital silence in base) inside 30 ms — an abrupt
  *  truncation of the note's release. 10 such holes in that render, 3 in the untransposed one.
- *  Only rests may be bridged: merging across a SUNG note would drag a passenger into the rescue. */
-export const RANGE_ALGO_VERSION = "s151y";
+ *  Only rests may be bridged: merging across a SUNG note would drag a passenger into the rescue.
+ *  s154a = the voiced islands PSOLA works inside are now dilated by 30 ms at both ends.
+ *  ⭐ This is the fix for the defect the user had been reporting since S152 — a vertical line in
+ *  the spectrogram at note onsets, an abrupt spike in the waveform before the note settles, and a
+ *  click. Root cause: PSOLA only shifts INSIDE the voiced islands and passes everything else
+ *  through bit for bit, while the fed f0 is zeroed on unvoiced phones — so the island boundary sat
+ *  exactly on the vowel onset, and every rescued note kept a fragment of un-shifted, 9-14 semitones
+ *  too low audio at each end, butted against the shifted body across a 0.25-3 ms join. Every
+ *  harmonic STEPS at that instant, which is what draws the line.
+ *  ⭐ Confirmed by the user by ear AND on the spectrogram at both 30 and 60 ms ("岛外扩是对的").
+ *  30 over 60: whole song, 96 islands, 30 ms merges NONE of them (min inter-island gap 100.1 →
+ *  20.3 ms) while 60 merges 2 and 100 collapses 96 → 43; residual un-shifted leak at the worst
+ *  annotated note 14.7 % → 2.8 % (30) → 0.2 % (60), i.e. 30 removes ~80 % of it for none of the
+ *  risk. Audition tag bumps in lockstep (_s154a_). */
+export const RANGE_ALGO_VERSION = "s154a";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and

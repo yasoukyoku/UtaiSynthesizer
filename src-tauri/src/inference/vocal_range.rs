@@ -1819,6 +1819,101 @@ fn parse_infrasonic_hp(v: Option<&str>) -> bool {
 /// stale cache and read it as "the change did nothing").
 const INFRASONIC_HP_DEFAULT: bool = false;
 
+/// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
+/// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
+///
+/// ## What it is for
+///
+/// A pitch transform has no business changing the amplitude envelope, and this one does — see
+/// `utai_dsp::psola::PsolaDiagnostics::env_dev_p50_db` for the numbers and the control that makes
+/// them mean something (outside the islands the deviation is *exactly* 0.00 dB, because there the
+/// output is the input).
+///
+/// ⭐ The user reported this defect from the **waveform**, twice, before any of our rulers found
+/// it: *"波形在进入稳定的长音之前有一个非常突兀的波形尖峰"*. On the probe it is a step at the
+/// island start — −0.49 / −1.76 / −6.09 / −0.48 dB across the four islands of the −14 segment —
+/// and restoring the envelope offline removes the step from the waveform (median |deviation|
+/// 1.14 → 0.24 dB).
+///
+/// ⛔⛔ **It had been measured and dropped twice** (S152 ruler ⑦ 起音过冲, S153 §4k), both times
+/// because the reading could not rank the user's six annotated points. That inference is invalid
+/// and it cost this line two sessions: *a ruler failing to rank* is a fact about the measurement,
+/// not about the world.
+///
+/// ⚠ **It is not the whole defect.** The user's position, and the honest one: the envelope step is
+/// a *symptom*; it does not by itself explain why the spectrum is messy in the same places. This
+/// arm exists so that an arm with the envelope violation removed can be rendered and looked at —
+/// if the spectrum is still messy, the two are cleanly separated.
+///
+/// ⚠ Width is the whole trade-off (see `restore_envelope`): under ~10 ms the corrective gain
+/// starts tracking individual source periods and puts the donor's fundamental back in
+/// (measured leakage −34.7 dB today → −31.6 / −32.8 / −34.1 / −34.3 at 2 / 5 / 10 / 20 ms).
+pub fn env_restore_ms() -> f64 {
+    parse_env_restore_ms(std::env::var("UTAI_PSOLA_ENVFIX").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_env_restore_ms(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 200.0)
+        .unwrap_or(ENV_RESTORE_MS_DEFAULT)
+}
+
+/// ⛔ Same pairing rule as `INFRASONIC_HP_DEFAULT`: making this non-zero changes the audio ⇒ it
+/// must bump `RANGE_ALGO_VERSION` **and** `audition_cache_tag` in the same commit.
+const ENV_RESTORE_MS_DEFAULT: f64 = 0.0;
+
+/// S154 — `UTAI_PSOLA_BRIDGE=<ms>` bridges short unvoiced gaps in the fed f0 so the voiced islands
+/// cover the whole rescued note. **0 = off = byte-for-byte the pre-S154 arm.**
+///
+/// See `utai_dsp::psola::bridge_unvoiced` for the mechanism, the measured leak at the user's
+/// annotated notes, and the five independent things it accounts for. Short form: PSOLA only shifts
+/// **inside** the islands and passes everything else through **bit for bit**, the fed f0 is zeroed
+/// on unvoiced phones, so the island boundary sits exactly on the vowel onset and every rescued
+/// note keeps a fragment of un-shifted, 9-14 semitones too low audio at each end, joined across
+/// **0.25-3 ms**. That join is a step in every harmonic — a broadband vertical line.
+///
+/// ⚠ This is the *root* candidate; `UTAI_PSOLA_ENVFIX` addresses the same boundary's **symptom**
+/// (the amplitude step) without removing the pitch discontinuity underneath it. If the boundary is
+/// really the cause, this knob should do what that one could not.
+pub fn bridge_unvoiced_ms() -> f64 {
+    parse_bridge_unvoiced_ms(std::env::var("UTAI_PSOLA_BRIDGE").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_bridge_unvoiced_ms(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 500.0)
+        .unwrap_or(BRIDGE_UNVOICED_MS_DEFAULT)
+}
+
+/// S154 — **ON by default at 30 ms since the user confirmed it (2026-08-19).**
+///
+/// > 「无论是 30ms 还是 60ms 都无论是听起来还是看频谱都把问题解决了(而且这次也和你那边看到的
+/// >  结果对上了);**岛外扩是对的**」
+///
+/// This is the first fix on this line confirmed by ear **and** on the spectrogram, and it closes a
+/// defect the user had been reporting since S152 (vertical line at note onsets / abrupt waveform
+/// spike / click). ⭐ It was found by taking his waveform observation literally after two earlier
+/// sessions had filed the same observation away as "a ruler could not rank the six marks".
+///
+/// ## Why 30 and not 60
+///
+/// Both were confirmed indistinguishable by ear, so the tie is broken on risk, measured whole-song
+/// (96 islands, −9 and −14):
+/// * **30 ms merges no islands at all** (smallest inter-island gap 100.1 → 20.3 ms); 60 ms merges
+///   2; 100 ms collapses 96 → **43**, which would drag neighbouring notes into one rescue.
+/// * Residual un-shifted leak in the 60 ms before the worst annotated onset: **14.7 % → 2.8 %**
+///   (30) → 0.2 % (60) ⇒ 30 removes ~80 % of it for none of the merge risk.
+/// * Away from island edges the change is **phase, not quality**: the waveform is completely
+///   different (−0.6 … +5.0 dB relative) while the short-time envelope moves by only
+///   **0.02-0.52 dB p50**. ⇒ judge this axis on the ENVELOPE; a waveform residual reads "broken"
+///   for something inaudible (it cost two false alarms while this was being built).
+///
+/// ⚠ Only measured on **akiko × 炉心融解 +7**. yachiyo / 东雪莲 / goose are untested on this arm.
+/// ⚠ 45-60 ms is the next notch if the line ever comes back — it removes the remaining ~20 %.
+const BRIDGE_UNVOICED_MS_DEFAULT: f64 = 30.0;
+
 /// Sticky ~100 ms formant-base schedule from a fed-f0 track (S82b/S82c streaming base): per
 /// window the voiced (> 20 Hz) median, UNquantized — an earlier semitone quantization (meant
 /// to merge windows into coarse runs) lost the user's 8-vs-9 A/B to the smooth track, whose
@@ -1932,7 +2027,9 @@ pub fn apply_inverse_with(
             let wsola = wsola_frac();
             let lock = phase_lock();
             let hp = infrasonic_hp();
-            let (out, diag) = utai_dsp::psola::psola_shift_infra(
+            let envfix = env_restore_ms();
+            let bridge = bridge_unvoiced_ms();
+            let (out, diag) = utai_dsp::psola::psola_shift_env(
                 &audio,
                 sample_rate,
                 semis,
@@ -1943,6 +2040,8 @@ pub fn apply_inverse_with(
                 wsola,
                 lock,
                 hp,
+                envfix,
+                bridge,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -1964,7 +2063,8 @@ pub fn apply_inverse_with(
             tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
                  {} marks, cola gap {:.2}% (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
-                 src uncovered {:.2}%, infrasonic {:.2}%{}, transport residual {:.4}{}",
+                 src uncovered {:.2}%, infrasonic {:.2}%{}, env dev p50 {:.3} dB{}, \
+                 transport residual {:.4}{}",
                 diag.islands,
                 diag.marks,
                 diag.cola_gap_frac * 100.0,
@@ -1978,6 +2078,15 @@ pub fn apply_inverse_with(
                 diag.infrasonic_frac * 100.0,
                 if hp {
                     format!(" (hp on — removed {:.2} pts)", diag.infrasonic_removed * 100.0)
+                } else {
+                    String::new()
+                },
+                // S154 —— 同样**无条件**算:这道工序改了多少振幅包络,今天的生产日志里就读得到。
+                diag.env_dev_p50_db,
+                if envfix > 0.0 {
+                    format!(" (envfix {envfix} ms — 拉回到 {:.3} dB)", diag.env_dev_after_db)
+                } else if bridge > 0.0 {
+                    format!(" (bridge {bridge} ms)")
                 } else {
                     String::new()
                 },
@@ -3208,6 +3317,27 @@ mod tests {
             assert_eq!(parse_infrasonic_hp(Some(off)), INFRASONIC_HP_DEFAULT, "{off:?}");
         }
     }
+    #[test]
+    fn the_island_dilation_defaults_to_thirty_ms_and_garbage_never_silently_disables_it() {
+        // ⛔ 与 `parse_phase_lock` / `parse_infrasonic_hp` 同一条规矩:**默认值本身要有判据**。
+        // 这一条尤其重要,因为这个臂是**开着**的:没有它,「我们翻了」与「有人把它翻回去了」
+        // 在别的每一条测试上长得一模一样。
+        assert_eq!(
+            parse_bridge_unvoiced_ms(None),
+            30.0,
+            "生产默认必须是 30 ms —— 改它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+        );
+        assert_eq!(parse_bridge_unvoiced_ms(None), BRIDGE_UNVOICED_MS_DEFAULT);
+        // 显式的 0 必须能关掉它 —— 用户报「新版不对」时要渲得出旧臂(S150 那条)。
+        assert_eq!(parse_bridge_unvoiced_ms(Some("0")), 0.0);
+        assert_eq!(parse_bridge_unvoiced_ms(Some("60")), 60.0);
+        assert_eq!(parse_bridge_unvoiced_ms(Some(" 45 ")), 45.0);
+        // 垃圾与越界一律退回默认,不许静默改变行为。
+        for bad in ["", "nonsense", "-1", "NaN", "501"] {
+            assert_eq!(parse_bridge_unvoiced_ms(Some(bad)), BRIDGE_UNVOICED_MS_DEFAULT, "{bad:?}");
+        }
+    }
+
     fn inverse_probe_tone(sr: u32, secs: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;
         (0..n)
