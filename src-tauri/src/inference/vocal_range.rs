@@ -1955,7 +1955,10 @@ fn parse_xgrain(v: Option<&str>) -> f64 {
 }
 
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
-const XGRAIN_DEFAULT: f64 = 0.0;
+///
+/// **S156:翻成 1.0**(同上)。它存在的理由是抵消宽读窗带来的 `0.5·f_out` 泄漏,
+/// ⚠ 而它的代价落在**所有**被救音上 —— 见 [`xgrain`] 的 doc 末尾那条登记。
+const XGRAIN_DEFAULT: f64 = 1.0;
 
 pub fn win_periods() -> f64 {
     parse_win_periods(std::env::var("UTAI_PSOLA_WIN").ok().as_deref())
@@ -1969,7 +1972,10 @@ fn parse_win_periods(v: Option<&str>) -> f64 {
 }
 
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
-const WIN_PERIODS_DEFAULT: f64 = 0.0;
+///
+/// **S156:翻成 1.0 = 教科书宽度**(用户 2026-08-20 听完整曲五条臂之后拍板)。
+/// 收益与代价见 [`win_periods`] 的 doc;⛔ 显式 `UTAI_PSOLA_WIN=0` 仍然能渲出旧臂。
+const WIN_PERIODS_DEFAULT: f64 = 1.0;
 
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
@@ -3574,35 +3580,51 @@ mod tests {
         }
     }
 
-    /// S155 —— 读窗旋钮:默认 0 = 今天,显式值覆盖,垃圾与越界退回默认。
+    /// S156 —— 读窗旋钮:**默认 1.0 = 教科书宽度**,显式 `0` 仍能渲出旧臂,垃圾与越界退回默认。
+    ///
+    /// ⛔ 后半句是 S155 血训 #2 的直接落点:**翻一个默认时,所有「垃圾值往哪边倒」的分支都要
+    /// 跟着翻一遍。**默认关的时代,垃圾读成 0 = 「不许静默打开一个没被耳判过的臂」是对的;
+    /// 默认开之后同一行变成「垃圾静默**关掉**一个已经上线的修法」。这里的写法让垃圾退回
+    /// **默认**(= 已上线的那条),而**显式的 0** 仍然能把它关掉 —— 两边都有牙。
     #[test]
-    fn the_read_window_defaults_to_todays_and_only_an_explicit_value_widens_it() {
+    fn the_read_window_defaults_to_the_wide_window_and_only_an_explicit_zero_narrows_it() {
         assert_eq!(
             parse_win_periods(None),
-            0.0,
-            "生产必须仍然是今天那个窗 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+            1.0,
+            "生产默认必须是教科书宽度 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
         );
         assert_eq!(parse_win_periods(None), WIN_PERIODS_DEFAULT);
-        assert_eq!(parse_win_periods(Some("1")), 1.0);
+        assert_eq!(parse_win_periods(Some("0")), 0.0, "显式 0 必须仍能渲出旧臂");
         assert_eq!(parse_win_periods(Some(" 1.5 ")), 1.5);
         for bad in ["", "nonsense", "-1", "NaN", "5"] {
-            assert_eq!(parse_win_periods(Some(bad)), WIN_PERIODS_DEFAULT, "{bad:?}");
+            assert_eq!(
+                parse_win_periods(Some(bad)),
+                WIN_PERIODS_DEFAULT,
+                "{bad:?} 退回的必须是【已上线的默认】,不是 0"
+            );
+            assert_ne!(parse_win_periods(Some(bad)), 0.0, "{bad:?} 竟然静默关掉了上线的修法");
         }
     }
 
-    /// S156 —— xgrain 旋钮:默认 0 = 今天,显式值覆盖,垃圾与越界退回默认。
+    /// S156 —— xgrain 旋钮:**默认 1.0**,显式 `0` 仍能渲出最近邻那条臂,垃圾与越界退回默认。
+    /// ⛔ 垃圾值的方向与读窗那条同理,见它的 doc。
     #[test]
-    fn the_grain_interpolation_defaults_to_todays_nearest_pulse() {
+    fn the_grain_interpolation_is_on_by_default_and_an_explicit_zero_turns_it_off() {
         assert_eq!(
             parse_xgrain(None),
-            0.0,
-            "生产必须仍然是最近邻 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+            1.0,
+            "生产默认必须是相邻源脉冲插值 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
         );
         assert_eq!(parse_xgrain(None), XGRAIN_DEFAULT);
-        assert_eq!(parse_xgrain(Some("1")), 1.0);
+        assert_eq!(parse_xgrain(Some("0")), 0.0, "显式 0 必须仍能渲出最近邻那条臂");
         assert_eq!(parse_xgrain(Some(" 0.5 ")), 0.5);
         for bad in ["", "nonsense", "-1", "NaN", "1.5"] {
-            assert_eq!(parse_xgrain(Some(bad)), XGRAIN_DEFAULT, "{bad:?}");
+            assert_eq!(
+                parse_xgrain(Some(bad)),
+                XGRAIN_DEFAULT,
+                "{bad:?} 退回的必须是【已上线的默认】,不是 0"
+            );
+            assert_ne!(parse_xgrain(Some(bad)), 0.0, "{bad:?} 竟然静默关掉了上线的修法");
         }
     }
 

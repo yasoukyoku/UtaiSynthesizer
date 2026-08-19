@@ -1056,8 +1056,8 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 9] = [
     ("UTAI_PSOLA_HP_MS", 0.0),
     ("UTAI_PSOLA_ENVFIX", 0.0),
     ("UTAI_PSOLA_BRIDGE", 30.0),
-    ("UTAI_PSOLA_WIN", 0.0),
-    ("UTAI_PSOLA_XGRAIN", 0.0),
+    ("UTAI_PSOLA_WIN", 1.0),
+    ("UTAI_PSOLA_XGRAIN", 1.0),
 ];
 
 /// Box filter with a running prefix sum; the window shrinks at the two ends rather than
@@ -1921,9 +1921,17 @@ pub fn psola_shift_env(
             // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
             // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
             // 的源波形。见 `SRC_UNCOVERED` 的注释:这是唯一直接看得见它的读数。
-            // ⚠ xgrain 开着时真的读了两段 ⇒ 覆盖率必须算**并集**,否则这只眼睛会低报。
-            let (rs, re) = if g1 > 0.0 {
+            // ⚠ xgrain 开着时真的读了两段 ⇒ 覆盖率算**并集**,否则这只眼睛会低报。
+            // ⛔⛔ 但**只算权重 ≥ 0.5 的那些读点**,否则它会灌水:`p1 = p0 + T_src`,于是权重
+            //   0.001 的第二个读点也会让整整一个源周期被记成「读过了」⇒ **窄窗也能读出零漏源**。
+            //   这不是假想 —— S156 翻默认时,新加的那条生产口径判据就是被这样骗过去的
+            //   (把 `WIN` 退回 0,`src_uncovered_frac` 照样是 0,判据当场变空)。
+            //   ⇒ 门限取 0.5:一颗粒最多只有一个读点能过(`fr == 0.5` 时两个都是 0.5,那是真并集),
+            //   于是这只眼睛**永远不会比 xgrain 关着时更乐观**。
+            let (rs, re) = if g1 >= 0.5 && g0 >= 0.5 {
                 (p0.min(p1) - lw, p0.max(p1) + rw)
+            } else if g1 >= 0.5 {
+                (p1 - lw, p1 + rw)
             } else {
                 (p0 - lw, p0 + rw)
             };
@@ -2513,7 +2521,8 @@ mod tests {
         );
     }
 
-    /// S155 —— 读窗旋钮:**默认逐位同旧**,而打开时**必须真的生效**。
+    /// S155/S156 —— 读窗旋钮。**S156 把它翻成了生产默认(1.0)**,所以这条判据钉的不再是
+    /// 「默认关」,而是⑴ 显式 `0` 仍然渲得出旧臂、⑵ 两条臂**真的不同**、⑶ 打开时不被静默跳过。
     ///
     /// ⛔ 后半句才是贵的那条。这个旋钮有一条现成的静默失败路径:颗粒循环里有
     /// `if lw > max_period { continue; }`,而 `max_period` 是**按今天那个窄窗**定的
@@ -2525,7 +2534,7 @@ mod tests {
     /// ⑶ 打开之后**源覆盖率变好**(那是窗变宽的结构性后果,而且今天这个读数本来就在
     ///    `src_uncovered_frac` 上 —— ratio > 2 时相邻读窗之间会留下永远没人读的源波形)。
     #[test]
-    fn the_wide_read_window_is_off_by_default_and_actually_bites_when_it_is_on() {
+    fn the_wide_read_window_bites_and_the_old_arm_is_still_reachable() {
         let sr = 44_100;
         let f0 = 220.0;
         let hop = sr as usize / 200;
@@ -2652,7 +2661,7 @@ mod tests {
     /// ⑷ ⭐ **承重那条**:宽窗臂上 `0.5·f_out` 的泄漏必须被压下去,
     ///    **而且要断言参照本身真的漏**(否则是拿两个都干净的东西相减 —— S155 笔5 那条判据的形状)。
     #[test]
-    fn the_grain_interpolation_is_opt_in_and_takes_the_donors_own_pitch_back_out() {
+    fn the_grain_interpolation_bites_and_zero_is_still_the_nearest_pulse_arm() {
         let sr = 44_100;
         let f0 = 220.0;
         let hop = sr as usize / 200;
@@ -2749,6 +2758,102 @@ mod tests {
             // ⭐ 两者必须差出量级来,否则「空操作」与「生效」是同一个读数(实测差 144 dB)。
             assert!(diff - same > 60.0, "{st} st: 空操作档与生效档分不开({same:.1} vs {diff:.1})");
         }
+    }
+
+    /// S156 —— ⛔⛔ **这条线上第一条跑【生产口径】的判据。**
+    ///
+    /// 缺口是结构性的,而且它当场自证过:把 `WIN_PERIODS_DEFAULT` / `XGRAIN_DEFAULT` 从 0 翻成 1
+    /// (= 换掉每一个被救音的音频),`psola.rs` 里 **68 条测试一条都没红** —— 因为它们**全部**
+    /// 显式传旋钮,没有一条读生产默认。⇒ 「改了默认」与「改了行为」在这份文件里是分开的两件事,
+    /// 而那正是 S155 笔0 在探针上修掉的同一族缺陷(探针对旋钮硬编码回落值,照旧脚本跑出来的
+    /// 「今天」其实是改动之前的臂)。
+    ///
+    /// ⇒ 这里从 [`PROBE_ARM_DEFAULTS`](= 生产默认,由 `vocal_range` 的
+    /// `the_probe_defaults_are_the_production_defaults` 绑住)把参数读出来跑,钉三件:
+    /// ⑴ ratio 1.0 在**全套生产默认**下仍然 `assert_eq!` 恒等;
+    /// ⑵ +14 上**源覆盖率必须是 0**(教科书宽度把 `ratio > 2` 那段没人读的源补上了)——
+    ///    ⛔ 这一条就是「默认真的翻了」的指纹:退回 `WIN = 0` 它当场读 ≈0.108;
+    /// ⑶ 生产臂与旧臂**逐位不同**(否则默认没生效)。
+    #[test]
+    fn the_production_default_arm_is_actually_what_runs() {
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let hp = if g("UTAI_PSOLA_HP") != 0.0 {
+            if g("UTAI_PSOLA_HP_MS") > 0.0 {
+                Infrasonic::FixedMs(g("UTAI_PSOLA_HP_MS"))
+            } else {
+                Infrasonic::PerPeriod
+            }
+        } else {
+            Infrasonic::Off
+        };
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let prod = |st: f64| {
+            psola_shift_env(
+                &x,
+                sr,
+                st,
+                0.0,
+                &f0t,
+                hop,
+                g("UTAI_PSOLA_FRAC") != 0.0,
+                g("UTAI_PSOLA_WSOLA"),
+                g("UTAI_PSOLA_LOCK"),
+                hp,
+                g("UTAI_PSOLA_ENVFIX"),
+                g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"),
+                g("UTAI_PSOLA_XGRAIN"),
+            )
+        };
+        // ⑴ 全套生产默认下的恒等 —— 这条线上最便宜、最不可能自证的那道闸。
+        assert_eq!(prod(0.0).0, x, "ratio 1.0 在生产默认下不是恒等变换");
+        // ⑵ 教科书宽度把 ratio > 2 时那段「永远没人读的源」补上了。
+        let (y14, d14) = prod(14.0);
+        assert!(
+            d14.src_uncovered_frac < 1e-9,
+            "+14 st 生产臂仍然漏源 {:.4} —— 宽读窗没生效(退回 WIN=0 这里读 ≈0.108)",
+            d14.src_uncovered_frac
+        );
+        // ⑶ ⭐⭐ **每一个被翻成默认的旋钮,单独退回 0 都必须改变输出。**
+        //   ⛔ 这一条是被变异测试逼出来的:第一版只有 ⑴⑵,而把 `PROBE_ARM_DEFAULTS` 里的
+        //   `WIN` 退回 0 之后它**照样绿** —— 因为 xgrain 的第二个读点把源覆盖率灌满了
+        //   (见颗粒循环里那段门限的说明)。⇒ 「默认翻了」必须逐个旋钮证,不能靠一条综合读数。
+        let one_off = |win: f64, xg: f64| {
+            psola_shift_env(
+                &x,
+                sr,
+                14.0,
+                0.0,
+                &f0t,
+                hop,
+                g("UTAI_PSOLA_FRAC") != 0.0,
+                g("UTAI_PSOLA_WSOLA"),
+                g("UTAI_PSOLA_LOCK"),
+                hp,
+                g("UTAI_PSOLA_ENVFIX"),
+                g("UTAI_PSOLA_BRIDGE"),
+                win,
+                xg,
+            )
+            .0
+        };
+        assert_ne!(y14, one_off(0.0, g("UTAI_PSOLA_XGRAIN")), "把 WIN 单独退回 0,输出没变");
+        assert_ne!(y14, one_off(g("UTAI_PSOLA_WIN"), 0.0), "把 XGRAIN 单独退回 0,输出没变");
+        // 旧臂(两个都退回 0)在 +14 上**必须**漏源,否则 ⑵ 是空的。
+        let (_, dold) = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, hp, 0.0, 30.0, 0.0, 0.0,
+        );
+        assert!(
+            dold.src_uncovered_frac > 0.01,
+            "旧臂在 +14 上竟然不漏源({:.4})⇒ ⑵ 那条判据是空的",
+            dold.src_uncovered_frac
+        );
     }
 
     /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
