@@ -975,7 +975,32 @@ pub enum Infrasonic {
 /// the whole buffer and halve the benefit silently — the S147 shape. The chosen width is reported
 /// in [`PsolaDiagnostics::infrasonic_ma_ms`] precisely so that a silent widening is visible.
 /// ⚠ The failure direction of a too-low f0 estimate is *less removal*, never damage.
-fn infrasonic_width_ms(x: &[f32], f0_hz: &[f32], f0_hop: usize, ratio: f64) -> f64 {
+fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64 {
+    // S155 笔4 —— 用**真的被合成出来的颗粒自己的源周期**,而不是 f0 轨的分位数。
+    //
+    // ⛔ 笔3 先用「这一帧的音频不是数字静音」掩 f0 轨,那挡掉了铺零的 chunk
+    //    (−14 上 6.03 → 5.41 ms),但**没到位**:S147 之后 donor 只渲相交的 chunk,而一个被渲
+    //    的 chunk 里同样有**这一遍不救**的低音 —— 它们的音频是真的、f0 也是真的。
+    // ⇒ 唯一不需要「哪些音会被救」这条外部知识的量,就是**这道工序此刻真的在搬的那段波形**
+    //    的周期。它逐颗粒都在手边(`src_l`),而且它本来就是这把刀要保护的那个基频。
+    // ⚠ 收集端还要再挡一次静音:S151 实测**铺零区照样会被铺满标记**(去 DC 之后常数上处处
+    //    相关 = 1.0,间距恒为标称周期),所以按**这一颗粒的源读窗里有没有音频**过滤。
+    //
+    // p99 而不是 max:一颗坏标记不该把整段的刀变宽(失败方向仍然是「少削一点」,不是损伤)。
+    if src_periods.is_empty() {
+        return INFRASONIC_MS_MAX;
+    }
+    let mut v = src_periods.to_vec();
+    v.sort_by(f64::total_cmp);
+    let t = v[((v.len() - 1) as f64 * 0.99).round() as usize];
+    let f_src = f64::from(sample_rate) / t.max(1.0);
+    // Up-shift ⇒ 源更低;down-shift ⇒ 输出更低。
+    let lowest = f_src * ratio.min(1.0);
+    return (1000.0 / lowest.max(1.0)).clamp(INFRASONIC_MS_MIN, INFRASONIC_MS_MAX);
+}
+
+#[allow(dead_code)]
+fn infrasonic_width_ms_from_track(x: &[f32], f0_hz: &[f32], f0_hop: usize, ratio: f64) -> f64 {
     // ⛔⛔ **The f0 track is NOT the pitch content of this buffer.** Production hands the whole
     // song's `note_hz_full` to every rescue pass, while `score2svc.rs` zero-fills the audio of
     // every chunk that pass does not intersect — and it never masks the f0 track (the S151 note
@@ -1680,6 +1705,8 @@ pub fn psola_shift_env(
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
     let mut covered = vec![false; n];
+    // S155 笔4 —— 每颗粒的源周期,只收**读窗里真的有音频**的那些。见 `infrasonic_width_ms`。
+    let mut src_periods: Vec<f64> = Vec::new();
     let max_period = MAX_PERIOD_SECONDS * sr;
     // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
     let (mut uncovered, mut span) = (0.0f64, 0.0f64);
@@ -1801,6 +1828,13 @@ pub fn psola_shift_env(
                 uncovered += rs - cover_end;
             }
             cover_end = cover_end.max(re);
+            {
+                let a = (s_pos - lw).round().max(0.0) as usize;
+                let b = ((s_pos + rw).round().max(0.0) as usize).min(n);
+                if a < b && x[a..b].iter().any(|v| v.abs() > 1e-7) {
+                    src_periods.push(src_l.max(src_r));
+                }
+            }
             add_bell(
                 x, &mut acc, &mut wsum, s_pos, tm, lw, rw, formant_rate, frac_transport,
                 &mut residual,
@@ -1881,7 +1915,7 @@ pub fn psola_shift_env(
         diag.infrasonic_frac = before as f32;
         let ms = match infrasonic {
             Infrasonic::Off => 0.0,
-            Infrasonic::PerPeriod => infrasonic_width_ms(x, f0_hz, f0_hop, ratio),
+            Infrasonic::PerPeriod => infrasonic_width_ms(&src_periods, sample_rate, ratio),
             Infrasonic::FixedMs(ms) => {
                 if ms.is_finite() && ms > 0.0 { ms } else { 0.0 }
             }
@@ -2876,6 +2910,13 @@ mod tests {
             // 顺带这就成了 `infrasonic_ma_ms` 自己的判据:报了个假数,下面的解析对拍就红。
             let used_ms = f64::from(don.infrasonic_ma_ms);
             assert!(used_ms > 0.0, "{st} st: 臂开着却没报出宽度");
+            // ⛔ 只有**真的出手了**才去对拍解析响应。护栏(`e_out >= e_in`)在没有注入的位移上
+            //    会让这把刀整个跳过 ⇒ 那时输出必须**逐位**同关掉时,而不是「符合某条滤波器曲线」。
+            //    第一版没分这两种情况,于是在 −7 st 上拿一条**根本没运行**的滤波器的预测去比 0.000。
+            if on == off {
+                assert_eq!(don.infrasonic_removed, 0.0, "{st} st: 空操作却报拿掉了东西");
+                continue;
+            }
             let half = (((f64::from(sr) * used_ms / 1000.0) as usize) / 2).max(1);
             let l = (2 * half + 1) as f64;
             for h in [1.0f64, 2.0, 3.0] {
