@@ -1923,6 +1923,40 @@ const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 /// 300-2500 Hz is the band the "click" lived in. S154 measured the same direction independently.
 /// ⇒ this is exactly the shape only ears can settle, and this line's rule is that only a blind
 /// test (or the user's own spectral analysis on a whole-song render) may promote such a default.
+/// S156 —— `UTAI_PSOLA_XGRAIN=<0..1>`:颗粒**内容**在相邻两个源脉冲之间的插值深度。
+/// **0 = 今天 = 最近邻 `k = round(u)` = 逐位不变**;1 = 完全线性插值。
+///
+/// ## 它修的是什么
+///
+/// `k = round(u)` 是一条**阶梯**:上移时相邻若干颗输出颗粒读**同一个源标记**(ratio 2.0 时
+/// 正好成对)⇒ 输出带着周期 `2·T_out = T_src` 的结构 ⇒ **donor 自己的音高**出现在 `0.5·f_out`。
+/// 那正是用户在 S155 笔5 亲耳听成**「合唱感」**的那一维。
+/// 探针实测(s12 = 位移 +12,`0.5·f_out` 带能量相对各自 400-4000 Hz):
+/// donor 输入自己(结构地板)−45.5 · 今天 −37.9 · **宽读窗 −33.6** · 宽读窗 + xgrain **−38.7** ·
+/// 今天 + xgrain −42.6。⇒ 宽读窗自己带来 +4.3 dB,而这个旋钮拿掉 5.1 dB。
+///
+/// ## ⛔ 为什么它默认关
+///
+/// 它是**取舍**:混合相邻两颗源脉冲同时是一次「跨周期的低通」,同一组读数里
+/// 8-12 kHz 相对 300-1 kHz 的倾斜从 −1.07 变成 −1.44(≈0.4 dB 的高频损失)。
+/// ⇒ 这种取舍只有耳朵能裁(S146 协议),而这条线的裁法是**整曲渲染交给用户自己做频谱分析**。
+/// ⛔ 收益那一面**没有判据盯着**(仓里没有真素材);`psola.rs` 里那条
+/// `the_grain_interpolation_is_exactly_a_no_op_when_the_neighbouring_pulses_are_identical`
+/// 钉的是**语义**(只许混合、不许多做),不是收益。理由写在那条判据的 doc 里。
+pub fn xgrain() -> f64 {
+    parse_xgrain(std::env::var("UTAI_PSOLA_XGRAIN").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_xgrain(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(XGRAIN_DEFAULT)
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const XGRAIN_DEFAULT: f64 = 0.0;
+
 pub fn win_periods() -> f64 {
     parse_win_periods(std::env::var("UTAI_PSOLA_WIN").ok().as_deref())
 }
@@ -2148,6 +2182,7 @@ pub fn apply_inverse_with(
             let envfix = env_restore_ms();
             let bridge = bridge_unvoiced_ms();
             let win = win_periods();
+            let xg = xgrain();
             let (out, diag) = utai_dsp::psola::psola_shift_env(
                 &audio,
                 sample_rate,
@@ -2162,6 +2197,7 @@ pub fn apply_inverse_with(
                 envfix,
                 bridge,
                 win,
+                xg,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -3508,7 +3544,7 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 8] = [
+        let want: [(&str, f64); 9] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
@@ -3517,6 +3553,7 @@ mod tests {
             ("UTAI_PSOLA_ENVFIX", parse_env_restore_ms(None)),
             ("UTAI_PSOLA_BRIDGE", parse_bridge_unvoiced_ms(None)),
             ("UTAI_PSOLA_WIN", parse_win_periods(None)),
+            ("UTAI_PSOLA_XGRAIN", parse_xgrain(None)),
         ];
         let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
         assert_eq!(
@@ -3550,6 +3587,22 @@ mod tests {
         assert_eq!(parse_win_periods(Some(" 1.5 ")), 1.5);
         for bad in ["", "nonsense", "-1", "NaN", "5"] {
             assert_eq!(parse_win_periods(Some(bad)), WIN_PERIODS_DEFAULT, "{bad:?}");
+        }
+    }
+
+    /// S156 —— xgrain 旋钮:默认 0 = 今天,显式值覆盖,垃圾与越界退回默认。
+    #[test]
+    fn the_grain_interpolation_defaults_to_todays_nearest_pulse() {
+        assert_eq!(
+            parse_xgrain(None),
+            0.0,
+            "生产必须仍然是最近邻 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+        );
+        assert_eq!(parse_xgrain(None), XGRAIN_DEFAULT);
+        assert_eq!(parse_xgrain(Some("1")), 1.0);
+        assert_eq!(parse_xgrain(Some(" 0.5 ")), 0.5);
+        for bad in ["", "nonsense", "-1", "NaN", "1.5"] {
+            assert_eq!(parse_xgrain(Some(bad)), XGRAIN_DEFAULT, "{bad:?}");
         }
     }
 
