@@ -1942,6 +1942,9 @@ pub fn psola_shift_env(
                     this_island_periods.push(src_l.max(src_r));
                 }
             }
+            // ⚠ xgrain 开着时这里会放**两颗**颗粒 ⇒ `transport_residual` 每个合成标记记两笔
+            //   (两次读点各有各的亚样本残差)。那是如实记账,不是缺陷 —— 但引用那个读数时
+            //   要知道 xgrain 那条臂的样本数是别的臂的两倍。`xgrain == 0` 时逐位不变。
             for (pp, gg) in [(p0, g0), (p1, g1)] {
                 if gg <= 0.0 {
                     continue;
