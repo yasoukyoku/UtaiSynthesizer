@@ -1814,6 +1814,26 @@ pub fn psola_shift_env(
             // ⛔ 但它是**取舍不是纯赚**:同一组臂上谐波间噪声(300-2500 Hz)从 −2.78 掉到 −0.86 dB
             //   (三条臂 +1…+2 dB),而 300-2500 Hz 正是「咔哒」那条带。
             //   ⇒ 这种取舍只有耳朵能裁(S146 协议),所以这里**默认 0 = 今天**,逐位不变。
+            //
+            // ⭐⭐ S156 用一把**零插值**的判据把上面两条都重量了一遍(位移 +12 ⇒ ratio 恰好 2.0
+            //   ⇒ 输出第 k 根谐波与 donor 第 2k 根**逐根重合**,不需要倒谱平滑也不需要 lifter;
+            //   ⛔ S155 那把尺子的 lifter 是按各自 f0 取的,而它的「零点验过」是 ratio 1.0 那条臂 ——
+            //   那里 f_out == f_in ⇒ 那条偏置在结构上恰好为 0,所以那个零点根本没检验过它;
+            //   合成夹具上实测偏置 −1.0…−5.4 dB,与它报的「损失」同量级同方向):
+            //
+            //   | 臂 | 形状 rms(2-12k) | 8-12k 相对 300-1k 的倾斜 | 岛内 rms | 0.5·f_out |
+            //   |---|---|---|---|---|
+            //   | 今天 | 3.87 | **−5.14** | 0.00 | −37.9 |
+            //   | 半宽 1.0 **不除 wsum** | **0.83** | **−1.07** | **+0.49** | −33.6 |
+            //   | 半宽 1.0 除 wsum | 0.83 | −1.07 | **−5.53** | −33.5 |
+            //
+            //   ⇒ ⑴ 收益比 S155 记的大得多(形状偏差 4.7×,而不是「拉回 57-69%」);
+            //   ⑵ **「除 wsum」与「不除」的谱形状读数一模一样,只差 20log10(ratio) 的常数**
+            //      ⇒ 那 −5.53 dB 是**除 wsum 的代价**,不是宽窗的代价 ⇒ S156 改成不除(见下面输出合成那段);
+            //   ⑶ 剩下的真代价是 **0.5·f_out 上多出来的 +4.3 dB = donor 自己的音高**
+            //      —— 正是用户在 S155 笔5 听成「合唱感」的那一条。机理:ratio 2.0 时相邻两颗输出颗粒
+            //      读**同一个源标记**(`k = round(j/ratio)`)⇒ 颗粒成对 ⇒ 输出带着周期 `2·T_out = T_src`
+            //      的结构。⇒ 这就是 `xgrain`(相邻源脉冲线性插值)存在的理由,见下面 `xgrain` 那一段。
             let (lw, rw) = if win_periods > 0.0 {
                 (win_periods * src_l, win_periods * src_r)
             } else {
@@ -1887,10 +1907,21 @@ pub fn psola_shift_env(
     let mut cov_n = 0usize;
     let mut ws: Vec<f64> = Vec::new();
     let mut out = vec![0.0f32; n];
+    // S156 —— **稳态窗和**。半宽 `W` 个源周期的半余弦,以邻距 `T_out = T_src/ratio` 铺开
+    // ⇒ Σw ≡ `W·ratio`(离线台子实测:W = 0.75/1.00/1.25/1.50 上读到 1.5000/2.0000/2.5000/3.0000,
+    // 四档全中,见 `s156_knives/run_arms3.py`)。今天(`win_periods == 0`)窗宽 = 邻距 ⇒ `W̄ = 1`。
+    //
+    // ⛔ `.max(1.0)` 不是保险丝,它是**下移臂的恒等条件**:下移时 `lw = rw = T_src`(两个 `min` 取源
+    //    周期),`W·ratio = ratio < 1`,而今天在那里用的就是 `clamp(raw, 0, 1)` ⇒ 不夹住的话
+    //    「颗粒逐位相同、只有干填料变了」,`win_periods = 1.0` 在下移上就不再等于今天。
+    let wbar = if win_periods > 0.0 { (win_periods * ratio).max(1.0) } else { 1.0 };
     for i in 0..n {
         // ⛔ Statistics read the RAW sum; the clamp below is only what the dry-fill gain needs.
         // Clamping first made the surplus (w > 1) unreadable — see PsolaDiagnostics.
-        let raw = wsum[i];
+        // S156 —— 读数与干填料都按 `W̄` 归一,所以 `cola_*` 在宽窗臂上仍然是「COLA 有没有破」的
+        // 读数,而不是重叠系数。`win_periods == 0` 时 `W̄ = 1.0`,除以 1.0 在 IEEE 下逐位精确
+        // ⇒ 这一整段对今天**逐位不变**。
+        let raw = wsum[i] / wbar;
         let w = raw.clamp(0.0, 1.0);
         if covered[i] {
             cov_n += 1;
@@ -1898,10 +1929,14 @@ pub fn psola_shift_env(
                 gap += 1;
             }
             ws.push(raw);
-            // S155 —— 窗一旦超过邻距,半余弦就不再天然求和为 1 ⇒ 必须除 wsum(教科书写法)。
-            // ⚠ 这时 `cola_w_median` / `cola_over_frac` 读的是**原始**重叠系数(≈ 2·win·ratio),
-            //   不再是「COLA 有没有破」的读数 —— 别把它读成红。`cola_gap_frac` 仍然有意义。
-            out[i] = if win_periods > 0.0 { (acc[i] / raw.max(1e-9)) as f32 } else { acc[i] as f32 };
+            // ⛔⛔ S156 —— **不除 wsum**,连宽窗臂也不除。S155 那一版除了,而那正是它「要付
+            // −4.3…−5.8 dB 电平」的**唯一**来源:离线台子上「除 wsum」与「不除」的逐带谱形状读数
+            // **一模一样**,只差一个 20log10(ratio) = +6.02 dB 的常数(s12,ratio 2.0)。
+            // ⇒ 那笔代价不是宽窗的代价,是**选择除 wsum** 的代价,而且它是个与频率无关的标量。
+            // ⇒ 而下游**吸收不了它**:`restore_envelope` 默认关、`peak_normalize_to` 给 donor 传的是
+            //   base 的峰值(与 donor 内容无关)、`match_levels` 五个调用点全传 false = 死代码,
+            //   cover 路连峰值归一都没有 ⇒ 掉多少全额落到被救的那几个音上。
+            out[i] = acc[i] as f32;
         } else {
             // copyFlat: outside the synthesized span the un-shifted input rides the window-sum
             // ramp, which IS the crossfade. Inside it, a shortfall is a defect and must not be
@@ -2460,19 +2495,38 @@ mod tests {
                 da.src_uncovered_frac,
                 db.src_uncovered_frac
             );
-            // ⛔⛔ ⑷ **电平**。这不是「输出不许是垃圾」的兜底,它是这条臂**已知的代价**:
-            //   除 wsum 归一的是**窗**,而相邻颗粒读的是同一个源脉冲错开 T_out 的副本,
-            //   在脉冲中心之外**不同相** ⇒ 求和的幅度小于单颗粒 ⇒ 除完 wsum 电平必然掉。
-            //   真素材实测(离线台子,岛内 rms 相对今天):半宽 1.0 时 **−4.29 / −5.53 / −5.82 dB**;
-            //   这个合成夹具上 −6.7 dB。
-            //   ⭐ 这就是这条臂**默认关**、而且**不许拿它去做耳判**的原因 —— 轻 5 dB 的臂
-            //     在任何 A/B 里都会被响度污染(S152 那条 +0.582 dB 就已经污染过一次结论)。
-            //   ⇒ 断言钉的是「代价在已知区间内」,而不是「没有代价」。
+            // ⛔⛔ ⑷ **电平**。S155 在这里钉的是 `(-9.0..=1.0)`,而 S156 发现那个区间宽到
+            //   **分不出「除 wsum」与「不除」** —— 把实现从「除」改成「不除」(那是一次真实的
+            //   语义改动,电平差 20log10(ratio) ≈ 6 dB),这条断言**照样绿**。⇒ 它对自己声称
+            //   钉住的那件事接近一条空判据。S156 把它收紧到能分开为止。
+            //
+            //   今天的实现**不除 wsum**(见输出合成那一段的说明):离线台子上「除」与「不除」的
+            //   逐带谱形状读数**一模一样**,只差一个 20log10(ratio) 的常数 ⇒ 那 −4.3…−5.8 dB 不是
+            //   宽窗的代价,是**除 wsum** 的代价;而下游没有任何东西吸收得了它
+            //   (`restore_envelope` 默认关 · `peak_normalize_to` 给 donor 传 base 的峰值 ·
+            //    `match_levels` 五个调用点全 false)⇒ 那 5 dB 会全额落到被救的那几个音上。
+            //   实测:这个合成夹具 **+0.220 / +0.266 dB**;真素材(s12,+12)**+0.49 dB**。
+            //   ⛔ 变异验过(2026-08-20 真跑,不是估的):把 `out[i] = acc[i]` 改回
+            //      `acc[i] / wsum[i]` ⇒ +7 st 读 **−3.28 dB** ⇒ 这条断言当场红。
             let (ra, rb) = (rms(&a), rms(&b));
             let drop = 20.0 * (rb / ra).log10();
             assert!(
-                (-9.0..=1.0).contains(&drop),
-                "{st} st: 宽窗臂的电平变了 {drop:+.2} dB —— 实测代价是 −4.3…−6.7 dB,                 跑出这个区间说明 wsum 没除、除错了、或者颗粒被静默跳过了"
+                (-1.5..=1.5).contains(&drop),
+                "{st} st: 宽窗臂的电平变了 {drop:+.2} dB —— 不除 wsum 时实测只有 +0.2…+0.5 dB。\
+                 跑出这个区间说明 wsum 又被除了、或者颗粒被静默跳过了"
+            );
+            // ⭐ ⑸ **`cola_w_median` 在宽窗臂上必须仍然是「COLA 有没有破」的读数**。
+            //   窗一放宽,原始重叠系数就变成 ≈ `win·ratio`(实测 1.5/2.0/2.5/3.0 四档全中),
+            //   而 S156 让读数与干填料都按稳态窗和 `W̄` 归一 ⇒ 它回到 1。
+            //   ⛔ 没有这条,`cola_w_median` / `cola_gap_frac` 在这条臂上会静默地读别的东西
+            //   (S155 的注释当时就是这样写的:「别把它读成红」= 把一只眼睛关掉)。
+            //   ⛔ 变异验过(2026-08-20 真跑):去掉 `wbar` 那个除法 ⇒ +7 st 读 **1.4982**,
+            //      而 `win·ratio = 1.0 × 1.4983` ⇒ 解析式与实测对到 1e-4,判据当场红。
+            assert!(
+                (db.cola_w_median - 1.0).abs() < 0.02,
+                "{st} st: 宽窗臂的 cola_w_median = {:.4} —— 它应当按 W̄ 归一后回到 1,\
+                 读到 ≈win·ratio 说明归一没做",
+                db.cola_w_median
             );
         }
         // ⭐ 阴性对照:ratio > 2 时今天的读窗**必然**漏掉源(见 `src_uncovered_frac`),
@@ -2485,6 +2539,49 @@ mod tests {
             "+14 st 上今天就没漏源({:.4})⇒ 上面那条覆盖率判据是空的",
             d14.src_uncovered_frac
         );
+    }
+
+    /// S156 —— ⛔⛔ **宽窗臂的 ratio-1.0 恒等**。这条判据在 S155 是**不存在**的,而它的缺席
+    /// 不是疏忽,是结构性的:这条线上所有恒等闸都经由 `psola_shift_diag` / `_locked` / `_infra`
+    /// 进来,而那三个包装器把最后三个参数**写死成 `0.0`** ⇒ `win_periods` 恒为 0
+    /// ⇒ 宽窗臂在这条线上**最便宜、最不可能自证**的那道闸底下,一寸覆盖都没有。
+    /// ⇒ 「把 `UTAI_PSOLA_WIN` 的默认翻开」这个改动,本来可以在 `psola.rs` 一条测试都不红的
+    ///    情况下把恒等悄悄弄坏(S155 那一版会:它在 `win_periods > 0` 时无条件 `acc / raw`,
+    ///    而 `raw` 只是**近似** 1.0 —— 取整余量会直接进输出)。
+    ///
+    /// 为什么 `win_periods = 1.0` 上它**结构上**成立:ratio 1.0 时 `u = j` 是整数
+    /// ⇒ `tgt[j] ≡ src[j]` ⇒ 目标邻距 ≡ 源周期 ⇒ `1.0 * src_l` 与今天那两个 `min` 给出的
+    /// **是同一个数**;而 `W̄ = (1.0 × 1.0).max(1.0) = 1.0`,除以 1.0 在 IEEE 下逐位精确
+    /// ⇒ 干填料那条也一字不差。⇒ 这里用 `assert_eq!` 而不是 epsilon。
+    ///
+    /// ⛔ **双向**:下移臂上两个 `min` 取的是**源周期**,`win = 1.0` 给的是同一个数,
+    ///    但 `win·ratio < 1` —— `W̄` 那个 `.max(1.0)` 就是为这一侧写的。
+    ///    ⛔ 变异验过:把 `.max(1.0)` 去掉 ⇒ 下移那两档当场红(干填料被除小 ⇒ 岛外的透传被削)。
+    ///
+    /// ⛔ 阴性对照:`win = 0.5` 与 `win = 1.5` 在 ratio 1.0 上**必须不恒等**(前者窗比邻距窄 ⇒ 留缝,
+    ///    后者宽 ⇒ 重叠)。没有它,上面那条可能只是「这个实现根本不看 `win_periods`」。
+    #[test]
+    fn the_wide_read_window_is_still_the_identity_at_ratio_one() {
+        let sr = 44_100;
+        let f0 = 220.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win,
+            )
+            .0
+        };
+        assert_eq!(run(0.0, 1.0), x, "ratio 1.0 上 win=1.0 的宽窗臂不是恒等变换");
+        // 下移侧:两个 `min` 取的是源周期,win=1.0 给的是同一个窗 ⇒ 必须与今天**逐位**相同。
+        for st in [-5.0f64, -12.0] {
+            assert_eq!(run(st, 1.0), run(st, 0.0), "{st} st: 下移时 win=1.0 应当与今天逐位相同");
+        }
+        // 阴性对照:这两档在 ratio 1.0 上**必须**破恒等,否则上面那条是空的。
+        for win in [0.5f64, 1.5] {
+            assert_ne!(run(0.0, win), x, "ratio 1.0 上 win={win} 竟然也恒等 ⇒ 上面那条判据是空的");
+        }
     }
 
     /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
