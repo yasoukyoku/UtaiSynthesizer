@@ -992,7 +992,11 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
     }
     let mut v = src_periods.to_vec();
     v.sort_by(f64::total_cmp);
-    let t = v[((v.len() - 1) as f64 * 0.99).round() as usize];
+    // ⛔ p90 而不是 p99/max:S155 笔6 改成**逐岛**之后,一个岛只有几十颗粒,
+    // p99 实际上就是 max —— 而岛首尾那两颗粒的邻距是**外推**出来的、偏大。
+    // 实测:200 Hz 与 400 Hz 两个岛的夹具上,p99 给出 6.31 ms(= 158 Hz),两个都不对。
+    // ⚠ 失败方向仍然安全:偏窄只会少削一点或多漏一点,而 4 遍盒把漏压在 −53 dB 以下。
+    let t = v[((v.len() - 1) as f64 * 0.90).round() as usize];
     let f_src = f64::from(sample_rate) / t.max(1.0);
     // Up-shift ⇒ 源更低;down-shift ⇒ 输出更低。
     let lowest = f_src * ratio.min(1.0);
@@ -1748,8 +1752,11 @@ pub fn psola_shift_env(
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
     let mut covered = vec![false; n];
-    // S155 笔4 —— 每颗粒的源周期,只收**读窗里真的有音频**的那些。见 `infrasonic_width_ms`。
-    let mut src_periods: Vec<f64> = Vec::new();
+    // S155 笔4/笔6 —— 每颗粒的源周期,只收**读窗里真的有音频**的那些,而且**逐岛分开收**。
+    // 见 `infrasonic_width_ms`(为什么用颗粒的周期)与去次声那一段(为什么必须逐岛)。
+    // 每条 = (岛的覆盖起点, 覆盖终点, 该岛所有颗粒的源周期)。
+    let mut islands_periods: Vec<(usize, usize, Vec<f64>)> = Vec::new();
+    let mut this_island_periods: Vec<f64> = Vec::new();
     let max_period = MAX_PERIOD_SECONDS * sr;
     // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
     let (mut uncovered, mut span) = (0.0f64, 0.0f64);
@@ -1875,7 +1882,7 @@ pub fn psola_shift_env(
                 let a = (s_pos - lw).round().max(0.0) as usize;
                 let b = ((s_pos + rw).round().max(0.0) as usize).min(n);
                 if a < b && x[a..b].iter().any(|v| v.abs() > 1e-7) {
-                    src_periods.push(src_l.max(src_r));
+                    this_island_periods.push(src_l.max(src_r));
                 }
             }
             add_bell(
@@ -1885,6 +1892,11 @@ pub fn psola_shift_env(
         }
         if !cover_end.is_nan() {
             span += (cover_end - island_first).max(0.0);
+        }
+        if !this_island_periods.is_empty() {
+            islands_periods.push((c0, c1, std::mem::take(&mut this_island_periods)));
+        } else {
+            this_island_periods.clear();
         }
     }
 
@@ -1956,9 +1968,33 @@ pub fn psola_shift_env(
         //    S152/S154 的所有历史读数都是这把尺子量的,让它跟着宽度走 = 每换一次宽度就换一次刻度。
         let before = infra_frac(&out, sample_rate);
         diag.infrasonic_frac = before as f32;
+        // S155 笔6 —— **逐岛各用各的宽度**。
+        //
+        // ⛔ 为什么不能一个缓冲一个宽度:生产里一遍救援的 donor 缓冲**不止装被救的那些音** ——
+        // 这一遍不救的音同样有真音频、同样生成颗粒(它们的输出后面会被窗丢掉),而它们的基频更低
+        // ⇒ 分位数被它们拉下去 ⇒ 刀比该有的宽。实测:−14 那一遍整曲选 **4.96 ms**,
+        // 而只算**真正被救的那 62 个音**应当是 **2.70 ms**,50-125 Hz 因此少削约 **5 dB**。
+        //
+        // ⭐ 形式上用 `d = out − x` 而不是「LP(out) − LP(x)」分开算,是因为 **d 在岛外逐位为零**:
+        //   把每个岛那一段的 d 单独低通再累加,每一项都在岛外**平滑衰减到 0** ⇒ 不需要 mask、
+        //   不会在岛边界造台阶(mask 造台阶正是 S154 花一场修掉的那类缺陷),
+        //   而 ratio 1.0 上 d ≡ 0 ⇒ 每一项恒为 0 ⇒ **恒等仍然自动成立**。
+        // ⚠ `FixedMs` 仍然是**整缓冲一个宽度**:它存在的意义就是从同一个二进制渲出旧臂。
+        let per_island: Vec<(usize, usize, f64)> = match infrasonic {
+            Infrasonic::PerPeriod => islands_periods
+                .iter()
+                .map(|(a, b, p)| (*a, *b, infrasonic_width_ms(p, sample_rate, ratio)))
+                .collect(),
+            _ => Vec::new(),
+        };
         let ms = match infrasonic {
             Infrasonic::Off => 0.0,
-            Infrasonic::PerPeriod => infrasonic_width_ms(&src_periods, sample_rate, ratio),
+            Infrasonic::PerPeriod => {
+                // 报一个代表值(中位)—— 它是 S147「收益静默减半」的那只眼睛。
+                let mut w: Vec<f64> = per_island.iter().map(|(_, _, m)| *m).collect();
+                w.sort_by(f64::total_cmp);
+                if w.is_empty() { 0.0 } else { w[w.len() / 2] }
+            }
             Infrasonic::FixedMs(ms) => {
                 if ms.is_finite() && ms > 0.0 { ms } else { 0.0 }
             }
@@ -1974,8 +2010,42 @@ pub fn psola_shift_env(
             // ⭐ 顺带,它在**岛外**也自动 ≈ 0(那里 `out ≡ x` 逐位相同)⇒ 那段没被移调的原始
             //     donor 不再被这把刀削低频,而且不需要写 mask —— mask 会在岛边界造台阶,
             //     那正是 S154 刚修掉的那一类缺陷。
-            let lo_out = infrasonic_baseline_passes(&out, sample_rate, ms, CUT_BOX_PASSES);
-            let lo_in = infrasonic_baseline_passes(x, sample_rate, ms, CUT_BOX_PASSES);
+            // 逐岛:把这一岛那一段的 out 与 x 各自单独低通(岛外补 0),再相减。
+            // 与整缓冲版在数学上等价,只是每个岛可以有自己的宽度。
+            let (lo_out, lo_in) = if per_island.is_empty() {
+                (
+                    infrasonic_baseline_passes(&out, sample_rate, ms, CUT_BOX_PASSES),
+                    infrasonic_baseline_passes(x, sample_rate, ms, CUT_BOX_PASSES),
+                )
+            } else {
+                let (mut acc_o, mut acc_i) = (vec![0.0f64; n], vec![0.0f64; n]);
+                for (a, b, w) in &per_island {
+                    let (a, b) = (*a, (*b).min(n));
+                    if a >= b {
+                        continue;
+                    }
+                    // 支撑:K 遍盒各半宽 ⇒ 总支撑 ≈ K·W/2 每侧。留两倍余量。
+                    let half = ((f64::from(sample_rate) * *w / 1000.0) as usize / 2).max(1);
+                    let pad = half * CUT_BOX_PASSES + 1;
+                    let (s0, s1) = (a.saturating_sub(pad), (b + pad).min(n));
+                    let mo: Vec<f32> =
+                        (s0..s1).map(|i| if i >= a && i < b { out[i] } else { 0.0 }).collect();
+                    let mi: Vec<f32> =
+                        (s0..s1).map(|i| if i >= a && i < b { x[i] } else { 0.0 }).collect();
+                    let fo = infrasonic_baseline_passes(&mo, sample_rate, *w, CUT_BOX_PASSES);
+                    let fi = infrasonic_baseline_passes(&mi, sample_rate, *w, CUT_BOX_PASSES);
+                    // ⛔ 护栏也逐岛:这一岛的输出基线不比输入的大 ⇒ 没有「多出来的」⇒ 不动。
+                    let (eo, ei): (f64, f64) =
+                        (fo.iter().map(|v| v * v).sum(), fi.iter().map(|v| v * v).sum());
+                    if eo >= ei {
+                        for (k, i) in (s0..s1).enumerate() {
+                            acc_o[i] += fo[k];
+                            acc_i[i] += fi[k];
+                        }
+                    }
+                }
+                (acc_o, acc_i)
+            };
             // ⛔⛔ **护栏:这把刀永远不许往低频里加东西。**
             //
             // 差分式把 `LP(in)` 加回输出,而**低频不是被移调守恒的**:下移时输出的脉冲密度
@@ -2156,6 +2226,83 @@ mod tests {
         let (y, _) =
             psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
         assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
+    }
+
+    /// S155 笔6 —— ⭐ **每个岛用它自己的基频定宽度,而不是整条缓冲一个宽度。**
+    ///
+    /// ⛔ 为什么这条判据非有不可:生产里一遍救援的 donor 缓冲**不止装被救的那些音**。
+    /// 这一遍不救的音同样有真音频、同样生成颗粒(输出后面会被窗丢掉),而它们的基频更低
+    /// ⇒ 分位数被它们拉下去 ⇒ 刀比该有的宽。实测:−14 那一遍整曲选 **4.96 ms**,
+    /// 而只算真正被救的那 62 个音应当是 **2.70 ms** ⇒ 50-125 Hz 少削约 **5 dB**。
+    /// ⇒ 没有这条判据,「改成逐岛」与「改了但没生效」在别的每一条测试上长得一模一样。
+    ///
+    /// 夹具:低音岛(200 Hz)+ 空档 + 高音岛(400 Hz)。整缓冲的规则会选 1000/200 = 5 ms;
+    /// 逐岛应当给高音岛 1000/400 = 2.5 ms。⇒ **高音岛里逐岛臂必须比定宽 5 ms 那条削得更干净**,
+    /// 而**低音岛里两者必须几乎一样**(那是阴性对照 —— 否则「更干净」可能只是整体多削了)。
+    #[test]
+    fn each_island_gets_its_own_cut_width() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        let (lo_isl, _) = pulses(sr, 0.35, |_| 200.0, |_| 1.0);
+        let (hi_isl, _) = pulses(sr, 0.35, |_| 400.0, |_| 1.0);
+        let gap = vec![0.0f32; sr as usize / 5]; // 200 ms 空档 ⇒ 两个岛分得开
+        let mut x = lo_isl.clone();
+        x.extend_from_slice(&gap);
+        let a2 = x.len();
+        x.extend_from_slice(&hi_isl);
+        let frames = x.len().div_ceil(hop);
+        let mut f0t = vec![0.0f32; frames];
+        for (i, f) in f0t.iter_mut().enumerate() {
+            let t = i * hop;
+            *f = if t < lo_isl.len() {
+                200.0
+            } else if t < a2 {
+                0.0
+            } else {
+                400.0
+            };
+        }
+        let arm = |inf| {
+            psola_shift_env(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, inf, 0.0, 0.0, 0.0)
+        };
+        let (off, doff) = arm(Infrasonic::Off);
+        let (per, dper) = arm(Infrasonic::PerPeriod);
+        // 整缓冲的规则会拿最低的那个基频 ⇒ 1000/200 = 5 ms
+        let (fix, _) = arm(Infrasonic::FixedMs(5.0));
+        assert!(doff.islands >= 2, "夹具没造出两个岛(islands = {})", doff.islands);
+        assert!(dper.infrasonic_ma_ms > 0.0, "臂开着却没报出宽度");
+
+        // 「削得多干净」= 岛内**还剩多少【多出来的】低频**,不是低频总能量。
+        // ⛔ 第一版量的是总能量,读出「两条臂差 +0.01 dB」——**尺子坏了**:
+        //    这个夹具是单极性脉冲串,自带很大的直流,而差分式**按设计保留输入自己的低频**
+        //    ⇒ 总能量被那份直流主导,两条臂当然一样。⇒ 必须减掉输入自己的那一份。
+        // 尺子本身与刀无关:8 ms 两遍盒(`RULER_BOX_PASSES`),这条线的历史尺子。
+        let low = |y: &[f32], a: usize, b: usize| -> f64 {
+            let ly = infrasonic_baseline_ms(&y[a..b], sr, INFRASONIC_MA_MS);
+            let lx = infrasonic_baseline_ms(&x[a..b], sr, INFRASONIC_MA_MS);
+            ly.iter().zip(lx.iter()).map(|(u, v)| (u - v) * (u - v)).sum()
+        };
+        let (hi_a, hi_b) = (a2, x.len());
+        let (lo_a, lo_b) = (0usize, lo_isl.len());
+        let d = |num: f64, den: f64| 10.0 * (num.max(1e-300) / den.max(1e-300)).log10();
+
+        // ⭐ 承重:高音岛里,逐岛臂必须比定宽 5 ms 明显更干净
+        let gain_hi = d(low(&fix, hi_a, hi_b), low(&per, hi_a, hi_b));
+        assert!(
+            gain_hi > 3.0,
+            "高音岛里逐岛臂只比定宽 5 ms 好 {gain_hi:+.2} dB —— 逐岛宽度没生效\
+             (报出来的中位宽度 {} ms)",
+            dper.infrasonic_ma_ms
+        );
+        // ⛔ 阴性对照:低音岛里两者应当几乎一样(那里两条臂本来就是同一个宽度)
+        let gain_lo = d(low(&fix, lo_a, lo_b), low(&per, lo_a, lo_b));
+        assert!(
+            gain_lo.abs() < 1.5,
+            "低音岛里两者差了 {gain_lo:+.2} dB —— 那说明上面那条「更干净」不是逐岛买来的,\
+             而是整体多削了"
+        );
+        // ⛔ 而且这把刀在两个岛上都必须真的动过东西
+        assert_ne!(per, off, "逐岛臂逐位没动");
     }
 
     /// S155 笔5 —— ⛔⛔⛔ **这把刀不许把【输入自己的基频】加回输出。**
