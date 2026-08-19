@@ -1805,32 +1805,86 @@ fn parse_phase_lock(v: Option<&str>) -> f64 {
 /// ⚠ Still only measured on ONE model (akiko) and one song; yachiyo remains untested (S148 §7③).
 const PHASE_LOCK_DEFAULT: f64 = 0.30;
 
-/// S152 — `UTAI_PSOLA_HP=1` subtracts the infrasonic baseline TD-PSOLA manufactures on an
-/// up-shift. **Off by default** ⇒ production is byte-for-byte unchanged.
+/// S152 — `UTAI_PSOLA_HP=0` turns OFF the removal of the infrasonic baseline TD-PSOLA
+/// manufactures. **ON by default since S155**; `UTAI_PSOLA_HP_MS=<ms>` forces a fixed width
+/// instead of the adaptive one.
 ///
-/// See `utai_dsp::psola::PsolaDiagnostics::infrasonic_frac` for the measurement and the mechanism.
-/// ⛔ Why it is not simply on: it is **inaudible** (97 % of the injected energy is below 5 Hz;
-/// the whole-song peak moves −0.008 dB), so there is nothing for an ear to promote it *with* —
-/// and this line's rule is that only a blind test may flip a default. What it does buy is that
-/// our own RMS-domain rulers stop carrying up to a third of a rescued note's energy as
-/// infrasound, and that the waveform stops riding a wandering baseline. ⇒ the case for flipping
-/// it is a **correctness** case, and it has to be argued as one, not smuggled in as a quality fix.
-pub fn infrasonic_hp() -> bool {
-    parse_infrasonic_hp(std::env::var("UTAI_PSOLA_HP").ok().as_deref())
-}
-
-/// The env parse, as a pure function so it can be asserted without touching process state.
-fn parse_infrasonic_hp(v: Option<&str>) -> bool {
-    match v {
-        Some(s) => matches!(s.trim(), "1" | "true" | "on" | "yes"),
-        None => INFRASONIC_HP_DEFAULT,
+/// See `utai_dsp::psola::PsolaDiagnostics::infrasonic_frac` for the measurement and the
+/// mechanism, and `utai_dsp::psola::Infrasonic` for what the width buys.
+///
+/// ## Why it was off, and what changed (S155)
+///
+/// Two things blocked it, and neither was taste:
+/// 1. ⛔ **It cost the ratio-1.0 identity gate.** `out -= LP(out)` is a linear filter, and a
+///    linear filter is never bit-exact — so turning it on would have downgraded
+///    `ratio_one_is_the_identity` (the cheapest non-self-certifying gate on this line; it killed
+///    three designs in S146) to an epsilon test. S155 changed the removal to the **differential**
+///    form `out -= LP(out) − LP(in)`, which is exactly 0 at ratio 1.0 by construction ⇒
+///    `ratio_one_is_the_identity_even_with_the_infrasonic_arm_on` asserts `assert_eq!`.
+/// 2. ⛔ **The fixed 8 ms width only removed the half nobody can hear.** Measured on the probe
+///    (zero render floor), residual against the input's own low band at −14 st: 8 ms leaves
+///    **+8.9 dB at 20-50 Hz and +11.6 dB at 50-125 Hz** standing, with the residual peaking at
+///    **71 Hz**. That leftover is what the user reported on 2026-08-19 as
+///    「很多地方的 200 以下还造出了极低频的伪影」, with his own negative control attached
+///    (the donor singing the same words 14 semitones lower is clean down there).
+///    S155's width is one period of the lowest fundamental in the buffer ⇒ residual ≤ 2.1 dB.
+///
+/// ## What promotes it
+///
+/// ⛔ Not a ruler — this line's rule is that only ears may promote a *quality* default. This one
+/// is promoted as a **correctness** change plus an explicit instruction: the user named it on
+/// 2026-08-19 (「次声应该得去」) on evidence he read off the **waveform** — it is the only arm
+/// that puts the waveform back near the centre line, and the arms without it drift visibly at
+/// e.g. 4:05. The measurements above say what it does; they are not what says to ship it.
+pub fn infrasonic() -> utai_dsp::psola::Infrasonic {
+    use utai_dsp::psola::Infrasonic;
+    if !parse_infrasonic_hp(std::env::var("UTAI_PSOLA_HP").ok().as_deref()) {
+        return Infrasonic::Off;
+    }
+    match parse_infrasonic_ms(std::env::var("UTAI_PSOLA_HP_MS").ok().as_deref()) {
+        ms if ms > 0.0 => Infrasonic::FixedMs(ms),
+        _ => Infrasonic::PerPeriod,
     }
 }
 
-/// ⛔ Flipping this to `true` changes the audio ⇒ it must bump `RANGE_ALGO_VERSION` **and**
+/// S155 — `UTAI_PSOLA_HP_MS=<ms>` pins the cut to a fixed width. **0 = adaptive** (the default).
+///
+/// ⛔ It exists so an older arm can be rendered from the same binary — "the knob only goes one
+/// way" is how you end up unable to reproduce the arm a user is complaining about (S150).
+pub fn infrasonic_fixed_ms() -> f64 {
+    parse_infrasonic_ms(std::env::var("UTAI_PSOLA_HP_MS").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_infrasonic_ms(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v <= 200.0)
+        .unwrap_or(INFRASONIC_MS_DEFAULT)
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+///
+/// ⛔⛔ **翻默认把一个失败方向翻了过来,而旧的写法没跟着翻。**旧版是
+/// `matches!(s.trim(), "1"|"true"|"on"|"yes")`,任何看不懂的值都读成 `false`:
+/// 默认关的时候那是对的(垃圾不许**静默打开**一个未经耳判的臂),默认开之后它变成了
+/// 「垃圾**静默关掉**一个已经上线的修法」—— 用户会拿到一条自己没要求的旧臂,而且没有任何
+/// 一行输出会说破。⇒ 现在三分:明确的开、明确的关、其余一律**退回默认**。
+fn parse_infrasonic_hp(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => INFRASONIC_HP_DEFAULT,
+    }
+}
+
+/// ⛔ Changing this changes the audio ⇒ it must bump `RANGE_ALGO_VERSION` **and**
 /// `audition_cache_tag` in the same commit (S150: missing one of the pair makes the user hear a
-/// stale cache and read it as "the change did nothing").
-const INFRASONIC_HP_DEFAULT: bool = false;
+/// stale cache and read it as "the change did nothing"). S155 flipped it false → **true** and
+/// bumped `s154a` → `s155a` in the same commit.
+const INFRASONIC_HP_DEFAULT: bool = true;
+
+/// 0 = the adaptive width (one period of the lowest fundamental). See [`infrasonic_fixed_ms`].
+const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
@@ -2039,7 +2093,7 @@ pub fn apply_inverse_with(
             let frac = frac_transport();
             let wsola = wsola_frac();
             let lock = phase_lock();
-            let hp = infrasonic_hp();
+            let hp = infrasonic();
             let envfix = env_restore_ms();
             let bridge = bridge_unvoiced_ms();
             let (out, diag) = utai_dsp::psola::psola_shift_env(
@@ -2089,10 +2143,16 @@ pub fn apply_inverse_with(
                 // S152 —— 这一项**无条件**算,所以「今天是什么样」在生产日志里就能读到,
                 // 不必等改动打开。打开时再补一句「真的拿掉了多少」。
                 diag.infrasonic_frac * 100.0,
-                if hp {
-                    format!(" (hp on — removed {:.2} pts)", diag.infrasonic_removed * 100.0)
-                } else {
+                if hp == utai_dsp::psola::Infrasonic::Off {
                     String::new()
+                } else {
+                    // ⛔ 宽度也要打出来:它现在是从 f0 轨推出来的,一个坏帧就能把它变宽、
+                    //    于是收益静默减半而别的读数全绿(S147 那个形状)。
+                    format!(
+                        " (hp {:.2} ms — removed {:.2} pts)",
+                        diag.infrasonic_ma_ms,
+                        diag.infrasonic_removed * 100.0
+                    )
                 },
                 // S154 —— 同样**无条件**算:这道工序改了多少振幅包络,今天的生产日志里就读得到。
                 diag.env_dev_p50_db,
@@ -3314,21 +3374,56 @@ mod tests {
     }
 
     #[test]
-    fn the_infrasonic_removal_is_off_by_default_and_only_an_explicit_yes_turns_it_on() {
-        // ⛔ 与 `parse_phase_lock` 同一条规矩:**默认值本身要有判据**。没有它,「我们还没翻」与
-        // 「我们忘了翻」在别的每一条测试上长得一模一样(库入口本来就默认 false)。
+    fn the_infrasonic_removal_is_on_by_default_and_only_an_explicit_no_turns_it_off() {
+        // ⛔ 与 `parse_phase_lock` 同一条规矩:**默认值本身要有判据**。这一条在 S155 翻默认
+        // 之后尤其重要,因为这个臂现在是**开着**的:没有它,「我们翻了」与「有人把它翻回去了」
+        // 在别的每一条测试上长得一模一样(库入口 `Infrasonic::Off` 本来就是合法值)。
         assert!(
-            !parse_infrasonic_hp(None),
-            "生产必须仍然是关的 —— 翻它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
+            parse_infrasonic_hp(None),
+            "生产必须是开着的(S155 翻的)—— 再改它要成对 bump RANGE_ALGO_VERSION 与 audition_cache_tag"
         );
         assert_eq!(parse_infrasonic_hp(None), INFRASONIC_HP_DEFAULT);
         for on in ["1", "true", "on", "yes", " 1 "] {
             assert!(parse_infrasonic_hp(Some(on)), "{on:?} 应当打开");
         }
-        // 垃圾一律退回默认,不许静默打开(那是「用户以为没开却开着」的形状)。
-        for off in ["", "0", "false", "off", "no", "nonsense", "2"] {
-            assert_eq!(parse_infrasonic_hp(Some(off)), INFRASONIC_HP_DEFAULT, "{off:?}");
+        // 显式的 0 必须能关掉它 —— 用户报「新版不对」时要渲得出旧臂(S150 那条)。
+        for off in ["0", "false", "off", "no", " 0 "] {
+            assert!(!parse_infrasonic_hp(Some(off)), "{off:?} 应当关掉");
         }
+        // ⛔ 垃圾一律退回默认,**不许静默关掉**。默认关的时候这条是反的(不许静默打开),
+        //    翻默认时这个方向必须跟着翻 —— 第一版没跟着翻,是这条判据抓出来的。
+        for junk in ["", "nonsense", "2", "-1", "ON!"] {
+            assert_eq!(parse_infrasonic_hp(Some(junk)), INFRASONIC_HP_DEFAULT, "{junk:?}");
+        }
+    }
+
+    /// S155 —— 宽度旋钮:0 = 自适应(出厂),显式的 ms 覆盖它,垃圾退回默认。
+    #[test]
+    fn the_infrasonic_width_defaults_to_adaptive_and_an_explicit_ms_pins_it() {
+        use utai_dsp::psola::Infrasonic;
+        assert_eq!(parse_infrasonic_ms(None), 0.0, "出厂必须是自适应");
+        assert_eq!(parse_infrasonic_ms(None), INFRASONIC_MS_DEFAULT);
+        assert_eq!(parse_infrasonic_ms(Some("8")), 8.0);
+        assert_eq!(parse_infrasonic_ms(Some(" 2.5 ")), 2.5);
+        for bad in ["", "nonsense", "-1", "NaN", "201"] {
+            assert_eq!(parse_infrasonic_ms(Some(bad)), INFRASONIC_MS_DEFAULT, "{bad:?}");
+        }
+        // ⛔ 三个取值必须真的能被组合出来,否则 `Infrasonic` 那三支里有一支是死代码。
+        //    (env 是进程状态,所以这里只走纯函数那一层的组合。)
+        let build = |on: bool, ms: f64| -> Infrasonic {
+            if !on {
+                Infrasonic::Off
+            } else if ms > 0.0 {
+                Infrasonic::FixedMs(ms)
+            } else {
+                Infrasonic::PerPeriod
+            }
+        };
+        assert_eq!(build(false, 0.0), Infrasonic::Off);
+        assert_eq!(build(true, 0.0), Infrasonic::PerPeriod);
+        assert_eq!(build(true, 8.0), Infrasonic::FixedMs(8.0));
+        assert_eq!(build(parse_infrasonic_hp(None), parse_infrasonic_ms(None)), Infrasonic::PerPeriod,
+                   "出厂口径必须是 PerPeriod");
     }
     #[test]
     fn the_island_dilation_defaults_to_thirty_ms_and_garbage_never_silently_disables_it() {
@@ -3360,11 +3455,12 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 6] = [
+        let want: [(&str, f64); 7] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
             ("UTAI_PSOLA_HP", f64::from(u8::from(parse_infrasonic_hp(None)))),
+            ("UTAI_PSOLA_HP_MS", parse_infrasonic_ms(None)),
             ("UTAI_PSOLA_ENVFIX", parse_env_restore_ms(None)),
             ("UTAI_PSOLA_BRIDGE", parse_bridge_unvoiced_ms(None)),
         ];

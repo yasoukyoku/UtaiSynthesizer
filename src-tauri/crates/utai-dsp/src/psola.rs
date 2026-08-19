@@ -151,6 +151,13 @@ pub struct PsolaDiagnostics {
     /// ⛔ Same reason as `wsola_moved` / `marks_locked`: "the arm is on" and "the arm did
     /// something" are different facts and only the second one is visible in the audio.
     pub infrasonic_removed: f32,
+    /// S155 — the width the cut actually used on this buffer, in ms (0.0 when off).
+    ///
+    /// ⛔ This is not decoration. With [`Infrasonic::PerPeriod`] the width is derived from the f0
+    /// track, so a single bad frame can widen it and **halve the benefit with every other reading
+    /// still green** — that is precisely the S147 silent-halving shape, and this number is the
+    /// only thing that shows it. See [`infrasonic_width_ms`].
+    pub infrasonic_ma_ms: f32,
     /// S154 — |20·log10(env(out) / env(in))| median over the covered span, 5 ms RMS window, dB.
     ///
     /// **This process is a pitch transform. It has no business changing the amplitude envelope.**
@@ -887,6 +894,86 @@ fn analysis_marks(
 /// instead of being a constant.
 const INFRASONIC_MA_MS: f64 = 8.0;
 
+/// S155 — the narrowest and widest the adaptive cut is allowed to get, in ms.
+///
+/// The narrow end is a backstop against an f0 track that reports something absurd; the wide end
+/// is where the cut stops doing anything useful anyway (a null at 20 Hz).
+const INFRASONIC_MS_MIN: f64 = 1.0;
+const INFRASONIC_MS_MAX: f64 = 50.0;
+
+/// S155 — how (and whether) to subtract the infrasonic baseline this process manufactures.
+///
+/// ⛔ Why this is an enum and not the `bool` it replaced: the width **is** the whole question.
+/// A fixed 8 ms removes the part that only shows up in the waveform (the ride off-centre) and
+/// leaves **+9 dB at 20-50 Hz and +12 dB at 50-125 Hz** of manufactured energy standing — which
+/// is the band the user reported seeing as "200 Hz 以下的极低频亮带". Measured on the probe
+/// (zero render floor), s14 residual against the input's own low band:
+///
+/// | cut | 0.5-20 Hz | 20-50 | 50-125 | 125-200 |
+/// |---|---|---|---|---|
+/// | none | +42.0 | +22.8 | +14.6 | +3.6 |
+/// | fixed 8 ms | +1.7 | **+8.9** | **+11.6** | **+3.3** |
+/// | [`Infrasonic::PerPeriod`] (2.9 ms here) | −0.5 | +0.1 | +2.1 | +0.8 |
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Infrasonic {
+    /// Off — byte-for-byte the arm without this step.
+    Off,
+    /// Width = **one period of the lowest fundamental present anywhere in this buffer**, input or
+    /// output. See [`infrasonic_width_ms`] for why that is the right width and what it protects.
+    PerPeriod,
+    /// A fixed width in ms — for A/B renders and for reproducing an older arm.
+    FixedMs(f64),
+}
+
+/// S155 — the cut's width for one buffer: **one period of the lowest fundamental in it**.
+///
+/// ## What picks this number
+///
+/// The removal is `out -= LP(out) − LP(in)`, so `LP` is applied to the *input* too. That is what
+/// keeps ratio 1.0 bit-exact (see [`psola_shift_env`]), and it is also the whole risk: whatever
+/// `LP` passes of the **input** gets added into the output — and the input is the donor singing
+/// the same words 9-14 semitones lower. Feeding a low-passed copy of *that* into a rescued note
+/// is the same family of defect as the un-transposed attack S154 spent a session removing.
+///
+/// ⇒ the width must put the low-pass's **first null on the donor's own fundamental**, so the
+/// filter structurally cannot carry the voice. Two boxes of `L` ms have their first null at
+/// `1000/L` Hz ⇒ `L = 1000 / f0_lowest`.
+///
+/// ⛔ **Which f0.** On an up-shift the input is the lower one; on a down-shift (the cover path,
+/// `cover_dead_plan` emits +22 ⇒ audio moved DOWN 22 semitones) the *output* is. Taking the
+/// minimum of the two is what makes one rule safe on both, and it is not hypothetical: at an
+/// output f0 of 110 Hz a fixed 3 ms cut takes **−10.1 dB** off the fundamental (measured,
+/// `s155_knives/width_sweep.py`).
+///
+/// ## Measured
+///
+/// Probe, production caliber, three shifts. "optimum" = the width that minimises the residual
+/// low band subject to the donor leak staying under 1 dB:
+///
+/// | arm | donor f0 (p05) | measured optimum | `1000/f0` |
+/// |---|---|---|---|
+/// | −9 st | 370.0 Hz | 3 ms | **2.70** |
+/// | −12 st | 233.6 Hz | 4 ms | **4.28** |
+/// | −14 st | 349.2 Hz | 3 ms | **2.86** |
+///
+/// ⚠ **p01, not the minimum.** One bad frame in the f0 track would otherwise widen the cut for
+/// the whole buffer and halve the benefit silently — the S147 shape. The chosen width is reported
+/// in [`PsolaDiagnostics::infrasonic_ma_ms`] precisely so that a silent widening is visible.
+/// ⚠ The failure direction of a too-low f0 estimate is *less removal*, never damage.
+fn infrasonic_width_ms(f0_hz: &[f32], ratio: f64) -> f64 {
+    let mut v: Vec<f64> =
+        f0_hz.iter().filter(|f| f.is_finite() && **f > 30.0).map(|f| f64::from(*f)).collect();
+    if v.is_empty() {
+        // No pitch anywhere ⇒ nothing was transposed ⇒ be conservative rather than clever.
+        return INFRASONIC_MS_MAX;
+    }
+    v.sort_by(f64::total_cmp);
+    let p01 = v[((v.len() - 1) as f64 * 0.01).round() as usize];
+    // Up-shift ⇒ the input is the lower one; down-shift ⇒ the output is.
+    let lowest = p01 * ratio.min(1.0);
+    (1000.0 / lowest.max(1.0)).clamp(INFRASONIC_MS_MIN, INFRASONIC_MS_MAX)
+}
+
 /// S155 — what `psola_probe` runs when an arm's env var is **unset**: the production defaults.
 ///
 /// ## ⛔⛔ Why this table exists
@@ -904,11 +991,12 @@ const INFRASONIC_MA_MS: f64 = 8.0;
 /// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
-pub const PROBE_ARM_DEFAULTS: [(&str, f64); 6] = [
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 7] = [
     ("UTAI_PSOLA_FRAC", 0.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
     ("UTAI_PSOLA_LOCK", 0.30),
-    ("UTAI_PSOLA_HP", 0.0),
+    ("UTAI_PSOLA_HP", 1.0),
+    ("UTAI_PSOLA_HP_MS", 0.0),
     ("UTAI_PSOLA_ENVFIX", 0.0),
     ("UTAI_PSOLA_BRIDGE", 30.0),
 ];
@@ -1405,7 +1493,7 @@ pub fn psola_shift_locked(
 ) -> (Vec<f32>, PsolaDiagnostics) {
     psola_shift_infra(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
-        phase_lock, false,
+        phase_lock, Infrasonic::Off,
     )
 }
 
@@ -1433,17 +1521,26 @@ pub fn psola_shift_locked(
 /// It also stops every RMS-domain ruler we own from silently counting a DC offset as signal, and
 /// stops the waveform riding off-centre (the shape the user named "波形甚是诡异" on `[685]`).
 ///
-/// ## Contract
+/// ## Contract (S155 rewrote this section — the two ⛔ lines below used to say the opposite)
 ///
-/// * The removal is a **linear, zero-phase, band-limited** subtraction — see
-///   [`INFRASONIC_MA_MS`] for the measured response (≥100 Hz moves by ≤0.08 dB).
-/// * It runs on the whole buffer, covered and pass-through alike, so it cannot manufacture a
-///   discontinuity at the covered/uncovered boundary.
-/// * ⛔ It is **not** bit-exact at ratio 1.0 — a linear filter never is. That is exactly why it
-///   is off by default: `ratio_one_is_the_identity` is the cheapest non-self-certifying gate on
-///   this whole line (it killed three designs in S146 that "looked right"), and it must keep
-///   asserting `assert_eq!` on the production arm. The honest gate for the arm being ON is
-///   `the_infrasonic_arm_leaves_everything_above_the_fundamental_alone`.
+/// * The removal is `out -= LP(out) - LP(in)`: **differential**, not `out -= LP(out)`.
+///   Linear, zero-phase, band-limited; width per [`Infrasonic`].
+/// * ⭐ It **is** bit-exact at ratio 1.0. The earlier version of this paragraph said a linear
+///   filter never is, and that was true of the non-differential form — which is why the arm was
+///   off by default and why `ratio_one_is_the_identity` (the cheapest non-self-certifying gate on
+///   this line; it killed three designs in S146 that "looked right") could not survive turning it
+///   on. The differential form settles it structurally instead of by exemption: at ratio 1.0
+///   `out ≡ x`, so `LP(out)` and `LP(x)` are the same bytes through the same code and the
+///   correction is **exactly 0.0**. ⛔ Note what this is NOT: a `semitones == 0` short-circuit.
+///   That shortcut would make the gate vacuously true, which is the exact shape that let the
+///   2026-07 implementation through (see the note at the top of [`psola_shift_env`]).
+/// * ⭐ Outside the voiced islands the correction is ≈0 for the same reason (`out ≡ x` there,
+///   bit-for-bit), so the un-transposed pass-through donor keeps its own low end — and it gets
+///   that **without a mask**, which would put a step at the island boundary, i.e. exactly the
+///   defect S154 spent a session removing.
+/// * The gate for the arm being ON is still
+///   `the_infrasonic_arm_leaves_everything_above_the_fundamental_alone`, and it is now joined by
+///   `ratio_one_is_the_identity_even_with_the_infrasonic_arm_on`.
 #[allow(clippy::too_many_arguments)]
 pub fn psola_shift_infra(
     x: &[f32],
@@ -1455,11 +1552,11 @@ pub fn psola_shift_infra(
     frac_transport: bool,
     wsola_frac: f64,
     phase_lock: f64,
-    remove_infrasonic: bool,
+    infrasonic: Infrasonic,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     psola_shift_env(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
-        phase_lock, remove_infrasonic, 0.0, 0.0,
+        phase_lock, infrasonic, 0.0, 0.0,
     )
 }
 
@@ -1483,7 +1580,7 @@ pub fn psola_shift_env(
     frac_transport: bool,
     wsola_frac: f64,
     phase_lock: f64,
-    remove_infrasonic: bool,
+    infrasonic: Infrasonic,
     env_restore_ms: f64,
     bridge_unvoiced_ms: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
@@ -1703,15 +1800,57 @@ pub fn psola_shift_env(
                 0.0
             }
         }
+        // ⛔ 读数**永远**用出厂的固定 8 ms,即使修法用的是自适应宽度。它是一把**尺子**不是刀:
+        //    S152/S154 的所有历史读数都是这把尺子量的,让它跟着宽度走 = 每换一次宽度就换一次刻度。
         let before = infra_frac(&out, sample_rate);
         diag.infrasonic_frac = before as f32;
-        if remove_infrasonic {
-            let lf = infrasonic_baseline(&out, sample_rate);
-            for (o, l) in out.iter_mut().zip(lf.iter()) {
-                *o = (f64::from(*o) - *l) as f32;
+        let ms = match infrasonic {
+            Infrasonic::Off => 0.0,
+            Infrasonic::PerPeriod => infrasonic_width_ms(f0_hz, ratio),
+            Infrasonic::FixedMs(ms) => {
+                if ms.is_finite() && ms > 0.0 { ms } else { 0.0 }
             }
-            // 报「真的拿掉了多少」而不是「开着」—— 与 `wsola_moved` / `marks_locked` 同一条规矩。
-            diag.infrasonic_removed = (before - infra_frac(&out, sample_rate)) as f32;
+        };
+        diag.infrasonic_ma_ms = ms as f32;
+        if ms > 0.0 {
+            // S155 —— **差分式**:只减掉这道工序**多出来的**那条基线,不是输出自己的低频。
+            //
+            // ⭐⭐ 这一行是 ratio 1.0 恒等判据能活下来的全部原因:ratio 1.0 时 `out ≡ x`
+            //     ⇒ 两条基线走同一段代码、同一份数据 ⇒ 逐位相同 ⇒ 修正项**恒为 0.0**
+            //     ⇒ 恒等仍然是 `assert_eq!`,不需要任何 `if semitones == 0` 的短路
+            //     (那种短路正是让 2026-07 那份实现混过去的形状,见 `psola_shift_env` 顶部)。
+            // ⭐ 顺带,它在**岛外**也自动 ≈ 0(那里 `out ≡ x` 逐位相同)⇒ 那段没被移调的原始
+            //     donor 不再被这把刀削低频,而且不需要写 mask —— mask 会在岛边界造台阶,
+            //     那正是 S154 刚修掉的那一类缺陷。
+            let lo_out = infrasonic_baseline_ms(&out, sample_rate, ms);
+            let lo_in = infrasonic_baseline_ms(x, sample_rate, ms);
+            // ⛔⛔ **护栏:这把刀永远不许往低频里加东西。**
+            //
+            // 差分式把 `LP(in)` 加回输出,而**低频不是被移调守恒的**:下移时输出的脉冲密度
+            // 减半 ⇒ `LP(out) ≈ LP(in)/2` ⇒ 「减掉 LP(out) 再加回 LP(in)」净效果是**加**了
+            // 半份进去。合成夹具上实测到了:−12 st 时基线 0.175 → **0.335**。
+            // ⚠ 真素材上碰不到(donor 的低频本来就 −50 dB,而下移根本不注入:实测 −12/−7 的
+            //   次声份额 0.01%/0.00%)—— 但「真素材上碰不到」是**拿阴性对照当不在场证明**,
+            //   这条线已经因为它丢过一次。⇒ 用一条结构性的判据挡住,而不是靠素材挡。
+            //
+            // ⭐ 判据本身就是这把刀的语义:**只拿掉这道工序【多出来】的那部分**。
+            //    输出的基线不比输入的大 ⇒ 没有「多出来的」⇒ 不动。
+            // ⭐ ratio 1.0 时两边逐位相同 ⇒ 走 else 分支 ⇒ 恒等,而且**即使走 if 分支也恒等**
+            //    (修正项恒为 0.0)⇒ 这条护栏不是恒等性的依据,只是多一道锁。
+            let e_out: f64 = lo_out.iter().map(|v| v * v).sum();
+            let e_in: f64 = lo_in.iter().map(|v| v * v).sum();
+            // ⛔⛔ `>=` 而不是 `>`,而这一个字符是被**变异测试**逼出来的:
+            //    写 `>` 的时候 ratio 1.0 上两边逐位相等 ⇒ 护栏跳过 ⇒ 恒等是**护栏**给的,
+            //    不是差分式给的 ⇒ 把差分式改回「减输出自己的低频」,那条恒等判据**照样绿**。
+            //    那就是一条空判据。⇒ `>=` 让 ratio 1.0 **真的走进**下面这个分支,
+            //    于是恒等重新由「修正项恒为 0.0」承担,而变异当场红。
+            if e_out >= e_in {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = (f64::from(*o) - (lo_out[i] - lo_in[i])) as f32;
+                }
+                // 报「真的拿掉了多少」而不是「开着」—— 与 `wsola_moved` / `marks_locked` 同一条规矩。
+                diag.infrasonic_removed = (before - infra_frac(&out, sample_rate)) as f32;
+            }
         }
     }
     diag.transport_residual_rms = residual.rms();
@@ -1820,6 +1959,51 @@ mod tests {
             worst.0,
             worst.1
         );
+    }
+
+    /// S155 —— ⭐⭐ **ratio 1.0 在这把刀【开着】的时候仍然是逐位恒等。**
+    ///
+    /// 这一条是差分式(`out -= LP(out) - LP(in)`)存在的**全部理由**,而它换掉的那句话就写在
+    /// `psola_shift_infra` 的契约里:「a linear filter is never bit-exact at ratio 1.0,
+    /// that is exactly why it is off by default」。⇒ 在这条判据出现之前,把默认翻开就等于
+    /// 把这条线上**最便宜、最不可能自证**的那道闸(它在 S146 一口气杀掉三个「看起来对」的设计)
+    /// 降级成 epsilon 判据。
+    ///
+    /// ⛔ 注意它**不是**靠 `if semitones == 0` 的短路换来的 —— 那种短路会让这道闸变成恒真的
+    /// 空判据,而那正是让 2026-07 那份实现混过去的形状(见 `psola_shift_env` 顶部那段注释)。
+    /// 它是结构性的:ratio 1.0 时 `out ≡ x` ⇒ 两条基线是**同一段字节走同一段代码** ⇒ 修正项
+    /// 恒为 `0.0` ⇒ `assert_eq!` 而不是 `< 1e-5`。
+    ///
+    /// ⚠ 顺带钉住另一件事:`psola_shift_env` 顶部那句「deliberately no `semitones == 0`
+    /// shortcut」必须继续成立。若有人为了让这条测试变绿而加短路,`the_infrasonic_arm_*` 那两条
+    /// 会在别的位移上红,因为短路只挡 0。
+    #[test]
+    fn ratio_one_is_the_identity_even_with_the_infrasonic_arm_on() {
+        let sr = 44_100;
+        let hop = sr as usize / 200;
+        // 两种源:一条纯浊音,一条带**直流**的脉冲串 —— 后者是关键,因为差分式唯一可能出事的
+        // 地方就是输入自己带低频,而非差分式在这里一定会把那份直流减掉、于是恒等当场失败。
+        let a = voiced(sr, 0.5, 220.0);
+        let (b, _) = pulses(sr, 0.5, |_| 220.0, |_| 1.0);
+        for (name, x) in [("voiced", a), ("pulses(带直流)", b)] {
+            let f0t = flat_f0(x.len(), hop, 220.0);
+            for arm in [Infrasonic::PerPeriod, Infrasonic::FixedMs(8.0), Infrasonic::FixedMs(2.0)] {
+                let (y, d) =
+                    psola_shift_infra(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, arm);
+                assert_eq!(
+                    y, x,
+                    "{name} / {arm:?}:ratio 1.0 必须**逐位**恒等 —— 差分式的修正项在这里应当恒为 0"
+                );
+                assert_eq!(d.infrasonic_removed, 0.0, "{name} / {arm:?}:恒等却报拿掉了东西");
+            }
+        }
+        // ⛔ 阴性对照:同一段代码在**非** 1.0 的比值上必须**不是**恒等 ——
+        //    否则上面那六条 `assert_eq!` 只是在证明「这把刀什么都没做」。
+        let x = voiced(sr, 0.5, 220.0);
+        let f0t = flat_f0(x.len(), hop, 220.0);
+        let (y, _) =
+            psola_shift_infra(&x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
+        assert_ne!(y, x, "+9 st 上也逐位相同 ⇒ 上面那组恒等断言是空的");
     }
 
     /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
@@ -2063,10 +2247,11 @@ mod tests {
         let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
         let hop = sr as usize / 200;
         let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let (mut n_inject, mut n_quiet) = (0usize, 0usize);
         for st in [-12.0, -7.0, -1.0, 1.0, 7.0, 12.0, 14.0] {
             let (legacy, dl) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
             let (via_deep, dd) =
-                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
             assert_eq!(legacy, via_deep, "{st} st: the 9-arg entry must stay the legacy arm");
             assert_eq!(dl, dd, "{st} st: …diagnostics included");
             // ⛔ And the readout must EXIST on the arm that is off — otherwise "what does it look
@@ -2077,15 +2262,57 @@ mod tests {
             );
             assert_eq!(dl.infrasonic_removed, 0.0, "{st} st: nothing removed while off");
 
-            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, true);
-            assert_ne!(on, legacy, "{st} st: …and the opt-in arm must actually differ");
+            let (on, don) = psola_shift_infra(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod,
+            );
+            // S155 —— 「臂开着就一定做了事」**不能无条件断言**,而这不是把判据放软:
+            //   下移**根本不注入**。真素材实测(探针,同一条 donor,同一段音频):
+            //   +9 / +14 的次声份额 7.12% / 17.27%,而 −7 / −12 是 **0.00% / 0.01%**。
+            //   ⇒ 在下移上要求「必须拿掉东西」= 要求这把刀去动一个不存在的缺陷。
+            // ⇒ 判据改成与机理同形,而且**两侧都有牙**:
+            //     注入了 ⇒ 必须拿掉;没注入 ⇒ 必须是**逐位空操作**。
+            //   后半句才是贵的那条:差分式会把输入自己的低频加回输出,而低频**不被移调守恒**
+            //   (下移时输出脉冲密度减半 ⇒ 加回来的比拿掉的多)。合成夹具上实测到过
+            //   基线 0.175 → **0.335**,这条断言就是把那个失败模式钉死成红。
+            // ⛔ 判据必须用**和护栏同一个**谓词,否则中间地带必然打架(第一版在这里写了
+            //    一个 0.01 的魔法阈值,+1 st 的注入是 0.0076 ⇒ 护栏动了而判据说不该动)。
+            //    护栏是:输出那条基线的**能量**大于输入那条 ⇒ 才出手。
+            let ms = f64::from(don.infrasonic_ma_ms);
+            let e = |y: &[f32]| -> f64 {
+                infrasonic_baseline_ms(y, sr, ms).iter().map(|v| v * v).sum()
+            };
+            let (e_off, e_in) = (e(&legacy), e(&x));
+            let inj = baseline_rms(&legacy, sr) / rms(&legacy) - baseline_rms(&x, sr) / rms(&x);
+            if e_off >= e_in {
+                n_inject += 1;
+                assert_ne!(on, legacy, "{st} st: 注入了 {inj:.4} 却一个样本都没动");
+                assert!(
+                    don.infrasonic_removed > 0.0,
+                    "{st} st: the arm reports it removed nothing — 'on' and 'did something' are \
+                     different facts (removed {})",
+                    don.infrasonic_removed
+                );
+            } else {
+                n_quiet += 1;
+                assert_eq!(
+                    on, legacy,
+                    "{st} st: 没有注入(基线差 {inj:+.4})⇒ 这把刀必须**逐位**空操作"
+                );
+                assert_eq!(don.infrasonic_removed, 0.0, "{st} st: 空操作却报拿掉了东西");
+            }
+            // ⛔ 无论走哪个分支,**永不变差**:这把刀不许让基线比不开它的时候更大。
+            //    这一条覆盖上面那个二分的**中间地带**(注入很小的位移),
+            //    也是差分式在下移上唯一可能出事的方向。
+            let b_off = baseline_rms(&legacy, sr) / rms(&legacy);
+            let b_on = baseline_rms(&on, sr) / rms(&on);
             assert!(
-                don.infrasonic_removed > 0.0,
-                "{st} st: the arm reports it removed nothing — 'on' and 'did something' are \
-                 different facts (removed {})",
-                don.infrasonic_removed
+                b_on <= b_off + 1e-6,
+                "{st} st: 开了这把刀之后基线**变大**了({b_off:.5} → {b_on:.5})"
             );
         }
+        // 一条从没被执行过的分支就是一条空判据 —— 两侧都必须真的走到过。
+        assert!(n_inject >= 2, "没有一个位移触发注入分支 ⇒ 上面那半条判据是空的");
+        assert!(n_quiet >= 2, "没有一个位移触发空操作分支 ⇒ 护栏那半条判据是空的");
     }
 
     /// S154 — the envelope-restoration arm: opt-in, readout unconditional, and it must do something.
@@ -2110,9 +2337,9 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         for st in [-12.0, -7.0, 1.0, 7.0, 14.0] {
             let (off, doff) =
-                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+                psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
             let (via, dvia) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0);
             assert_eq!(off, via, "{st} st: env_restore_ms = 0 must be the legacy arm");
             assert_eq!(doff, dvia, "{st} st: …diagnostics included");
             // ⛔ The readout has to exist while the arm is OFF, or "what does it look like today"
@@ -2124,7 +2351,7 @@ mod tests {
             assert_eq!(doff.env_dev_after_db, 0.0, "{st} st: nothing restored while off");
 
             let (on, don) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, false, 5.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0);
             assert_ne!(on, off, "{st} st: the opt-in arm must actually change the audio");
             // ⛔ What this arm promises is **the slow part**: the step at an island start. It does
             // not promise to shrink a 5 ms median that is already down in the period-scale noise,
@@ -2178,9 +2405,9 @@ mod tests {
         };
         assert_eq!(islands_of(&f0t), 2, "fixture must actually have two islands");
 
-        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false);
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
         let (via, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 0.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0);
         assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
 
         // ⛔⛔ **The island count must survive ANY width.** This is the guard the goose regression
@@ -2201,7 +2428,7 @@ mod tests {
         assert_eq!(d[d.len() - 1], f0t[f0t.len() - 1]);
 
         let (on, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 80.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0);
         assert_ne!(on, off, "the opt-in arm must actually change the audio");
         // ⚠ Not asserting `off == x` at the gap edge: the previous island's last grains reach a
         // little past its last mark, so the very edge is already synthesized even with the arm off.
@@ -2231,7 +2458,7 @@ mod tests {
             let f0t = flat_f0(x.len(), hop, f0 as f32);
             for ms in [2.0, 5.0, 20.0] {
                 let (y, _d) =
-                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, ms, 0.0);
+                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0);
                 assert_eq!(y, x, "f0 {f0}, envfix {ms} ms: ratio 1.0 must be the identity");
             }
         }
@@ -2257,8 +2484,8 @@ mod tests {
         for v in f0t.iter_mut().skip(2 * n / 3) {
             *v = 0.0;
         }
-        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false);
-        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 5.0, 0.0);
+        let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
+        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0);
         // The first and last eighth are comfortably inside the unvoiced pass-through.
         let e = x.len() / 8;
         assert_eq!(off[..e], on[..e], "the arm reached into the leading pass-through");
@@ -2402,9 +2629,13 @@ mod tests {
 
     #[test]
     fn the_infrasonic_arm_removes_the_baseline_without_touching_the_fundamental() {
-        // The honest gate for the arm being ON. It cannot be `assert_eq!` at ratio 1.0 — a linear
-        // filter is never bit-exact — so the contract it must meet instead is stated as a bound
-        // on where it is allowed to act: **below the fundamental and nowhere else.**
+        // The honest gate for the arm being ON: a bound on **where it is allowed to act** —
+        // below the fundamental and nowhere else.
+        // ⚠ S155 rewrote the first assertion. It used to read "the baseline should be mostly
+        // gone", which silently assumed the input had none of its own. The differential form's
+        // real contract is **"bring the output's baseline down to the input's, and never below
+        // it"** — strictly stronger, because it also fails when the arm OVER-removes, and
+        // over-removing is the same action that costs ratio 1.0 its bit-exact identity.
         let sr = 44_100;
         let f0 = 220.0;
         let hop = sr as usize / 200;
@@ -2412,13 +2643,24 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         for st in [-12.0f64, -7.0, 7.0, 12.0, 14.0] {
             let (off, doff) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
-            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, true);
+            let (on, don) = psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod);
 
             let b_off = baseline_rms(&off, sr) / rms(&off);
             let b_on = baseline_rms(&on, sr) / rms(&on);
+            let b_in = baseline_rms(&x, sr) / rms(&x);
+            if b_off > b_in + 0.01 {
+                assert!(
+                    b_on < b_in + (b_off - b_in) * 0.25,
+                    "{st} st: 注入的基线没被拿掉(输入 {b_in:.5} · 关 {b_off:.5} → 开 {b_on:.5})"
+                );
+            }
+            // 另一侧,而且这一侧是差分式**特有**的:不许把基线压到**输入自己**之下。
+            // 非差分式会(它减的是输出自己的低频)—— 而那正是「ratio 1.0 不再是恒等变换」
+            // 的同一个动作,这条线上最便宜的那道判据就是被它顶掉的。
             assert!(
-                b_on < b_off * 0.25,
-                "{st} st: the baseline should be mostly gone ({b_off:.5} → {b_on:.5})"
+                b_on >= b_in * 0.5 || b_in < 1e-4,
+                "{st} st: 基线被压到输入自己之下(输入 {b_in:.5} → 开 {b_on:.5})—— \
+                 那说明它在减输出自己的低频,不是减这道工序多出来的那部分"
             );
             assert!(
                 don.infrasonic_frac <= doff.infrasonic_frac + 1e-6,
@@ -2434,7 +2676,11 @@ mod tests {
             // passes = a triangular window, analytic), plus a hard zero-cost bound over the band
             // production actually lives in.
             let out_f0 = f0 * 2f64.powf(st / 12.0);
-            let half = (((f64::from(sr) * INFRASONIC_MA_MS / 1000.0) as usize) / 2).max(1);
+            // S155 —— 宽度现在是**自适应**的 ⇒ 这里必须读诊断里报出来的那个值。
+            // 顺带这就成了 `infrasonic_ma_ms` 自己的判据:报了个假数,下面的解析对拍就红。
+            let used_ms = f64::from(don.infrasonic_ma_ms);
+            assert!(used_ms > 0.0, "{st} st: 臂开着却没报出宽度");
+            let half = (((f64::from(sr) * used_ms / 1000.0) as usize) / 2).max(1);
             let l = (2 * half + 1) as f64;
             for h in [1.0f64, 2.0, 3.0] {
                 let f = out_f0 * h;
@@ -2457,13 +2703,74 @@ mod tests {
                 // 330 Hz it still costs 0.10 dB (matching the analytic value above — the filter
                 // is fine, the threshold was wrong). Production's output f0 is 830-1480 Hz.
                 if f >= 800.0 {
+                    // ⚠ S155 —— 这个上界从 0.03 放到 **0.12**,而理由不是「让它变绿」:
+                    //   宽度现在是自适应的,这个夹具 f0 = 220 Hz ⇒ 宽 4.5 ms ⇒ 989 Hz 落在
+                    //   三角窗响应的第 4-5 个旁瓣上,**解析值本来就是 −0.04 dB** —— 上面那条
+                    //   ±0.10 的解析对拍已经把单点量级钉死了,这里管的只是上界。
+                    //   依据:S148 的可闻性标定是「~2.7 dB 听得出 / ≤0.46 dB 听不出」
+                    //   ⇒ 0.12 dB 仍有近 4 倍余量。
+                    // ⛔ 单点上界不是这里该看的东西 —— 真正该看的是**生产口径**下整条输出
+                    //   基频带的平均代价,那条判据单独写在下面。
                     assert!(
-                        d.abs() < 0.03,
-                        "{st} st: {f:.0} Hz moved {d:+.3} dB — production's output f0 is \
-                         830-1480 Hz and the cost has to be nil there"
+                        d.abs() < 0.12,
+                        "{st} st: {f:.0} Hz moved {d:+.3} dB — 超过了这把刀允许的上界"
                     );
                 }
             }
+        }
+    }
+
+    /// S155 —— **生产口径**下这把刀的代价:整条输出基频带的平均,而不是某一个点。
+    ///
+    /// ⛔ 为什么单开一条:上一条用的夹具是 f0 = 220 Hz,而生产里 donor 的基频是 **350-880 Hz**
+    /// (探针实测 p05/p50/p95 = 370/559/877 · 234/381/740 · 349/440/659)。自适应宽度
+    /// = 一个源周期 ⇒ 生产是 2.7-4.3 ms,夹具是 4.5 ms —— **不是同一条滤波器**,拿夹具上的
+    /// 单点读数去论证生产的代价是一次口径偷换。
+    ///
+    /// 判据:输出基频带 830-1480 Hz 上逐 50 Hz 取点,**平均** |Δ| < 0.05 dB、**最大** < 0.15 dB。
+    /// (探针整曲实测,差分式 3 ms:三条臂的带内代价 0.006 / 0.040 / 0.001 dB。)
+    #[test]
+    fn the_infrasonic_arm_costs_nothing_over_productions_output_band() {
+        let sr = 44_100;
+        let f0 = 400.0; // donor 的量级,不是 220
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 1.0, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        for st in [9.0f64, 12.0, 14.0] {
+            let (off, _) = psola_shift_locked(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30);
+            let (on, don) = psola_shift_infra(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod,
+            );
+            assert!(
+                (f64::from(don.infrasonic_ma_ms) - 1000.0 / f0).abs() < 0.05,
+                "{st} st: 宽度应当是一个源周期 {:.2} ms,报的是 {} ms",
+                1000.0 / f0,
+                don.infrasonic_ma_ms
+            );
+            // The frequencies have to be the output's OWN harmonics. The first version of this
+            // swept 830..1480 in 50 Hz steps on a 400 Hz pulse train, i.e. it read `tone_mag` at
+            // frequencies where the fixture has no energy at all — the ratio of two leakage
+            // floors, which is not a cost. Same family as every other ruler on this line that
+            // kept reading past the point where it still meant something.
+            let out_f0 = f0 * 2f64.powf(st / 12.0);
+            let (mut acc, mut worst, mut k) = (0.0f64, 0.0f64, 0usize);
+            for h in 1..=24u32 {
+                let f = out_f0 * f64::from(h);
+                if f < 800.0 || f > f64::from(sr) * 0.4 {
+                    continue;
+                }
+                let (a, b) = (tone_mag(&off, sr, f), tone_mag(&on, sr, f));
+                let d = 20.0 * (b.max(1e-12) / a.max(1e-12)).log10();
+                acc += d.abs();
+                worst = worst.max(d.abs());
+                k += 1;
+            }
+            assert!(k >= 8, "{st} st: 只找到 {k} 个谐波点 —— 判据太薄");
+            let mean = acc / k as f64;
+            assert!(
+                mean < 0.05 && worst < 0.15,
+                "{st} st: 生产带内代价 平均 {mean:.4} dB / 最大 {worst:.4} dB(n={k})"
+            );
         }
     }
 
@@ -3147,16 +3454,21 @@ mod tests {
         // S154 —— `UTAI_PSOLA_BRIDGE=<ms>` 把音内短的清音空档桥接起来。
         // ⚠ 这里的 fallback 是 [`PROBE_ARM_DEFAULTS`](= 生产默认),**不是 0** —— 见那份文档。
         let bridge: f64 = probe_arm("UTAI_PSOLA_BRIDGE");
-        // S155 —— `UTAI_PSOLA_HP=1` 去次声。
+        // S155 —— `UTAI_PSOLA_HP=0/1` 去次声;`UTAI_PSOLA_HP_MS=<ms>` 强制固定宽度(0 = 自适应)。
         // ⛔⛔ 它以前在这里**写死成 `false`**,于是这条探针上「开」与「关」的输出**逐位相同** ——
         //    和 S148 那次 `frac_transport` 写死成 false 一模一样的形状,而那次差点被读成
         //    「亚样本搬运对包络起伏没用」。⇒ 现在由 env 控,并且实际取值打出来。
-        let hp = probe_arm("UTAI_PSOLA_HP") != 0.0;
+        let hp_ms = probe_arm("UTAI_PSOLA_HP_MS");
+        let hp = match (probe_arm("UTAI_PSOLA_HP") != 0.0, hp_ms) {
+            (false, _) => Infrasonic::Off,
+            (true, m) if m > 0.0 => Infrasonic::FixedMs(m),
+            (true, _) => Infrasonic::PerPeriod,
+        };
         let (y, d) = psola_shift_env(
             &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge,
         );
         println!(
-            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp}"
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?}"
         );
         // ⛔ 「这条探针跑的是不是生产口径」必须**当场看得见**。S154 之后生产默认是
         //    `bridge=30 / lock=0.30`,而这条探针以前对这两个都默认 0 ⇒ 照旧脚本跑出来的
@@ -3173,9 +3485,21 @@ mod tests {
         } else {
             println!("  ⛔ 口径**不是**生产默认:{}", drift.join(" · "));
         }
-        if hp {
-            println!("  hp: 拿掉了 {:.2} 个百分点的次声份额", d.infrasonic_removed * 100.0);
-        }
+        // ⛔ 「注入了多少」与「拿掉了多少」是两个数,只打第二个会让 0.00 有两种读法
+        //    (本来就没有 / 刀没生效)。S152 那条规矩:读数无条件算,修法才由旋钮控。
+        println!(
+            "  次声份额 {:.2}%{}",
+            d.infrasonic_frac * 100.0,
+            if hp == Infrasonic::Off {
+                String::new()
+            } else {
+                format!(
+                    " — hp(宽 {:.2} ms)拿掉了 {:.2} 个百分点",
+                    d.infrasonic_ma_ms,
+                    d.infrasonic_removed * 100.0
+                )
+            }
+        );
         println!(
             "  env dev p50 {:.3} dB{}",
             d.env_dev_p50_db,
