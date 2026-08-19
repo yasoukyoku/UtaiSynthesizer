@@ -944,16 +944,22 @@ fn box_average(x: &[f64], half: usize) -> Vec<f64> {
 /// reason — but that rejection was about comparing the island **interiors**; the **boundary** is
 /// what this is for, and it is the one thing that comparison can answer cleanly.
 fn bridge_unvoiced(f0: &[f32], hop: usize, sample_rate: u32, max_ms: f64) -> Vec<f32> {
-    // ⛔⛔ The first version of this only filled zero runs *between* two voiced runs, bounded by
-    // `max_ms`. Measured on the real material: it changed **nothing** — island count 7→7 and 5→5
-    // at 40 / 80 ms, 7→6 at 150 ms. The gaps between islands here are **longer than 150 ms**, i.e.
-    // the un-shifted attack is not a short consonant wedged between two islands, it sits inside a
-    // long unvoiced stretch that belongs to the note itself.
-    // ⇒ what the defect actually needs is a **dilation**: grow every voiced run outward by
-    // `max_ms`, holding the nearest voiced value, so the island covers the note's own onset and
-    // release. Two runs closer than `2 * max_ms` merge, which subsumes the bridging case.
-    // ⚠ Kept deliberately as one knob: "bridge a gap" and "cover the onset" are the same operation
-    // seen from two sides, and having two would invite tuning them against each other.
+    // ⛔⛔ **First version filled only the zero runs BETWEEN two voiced runs, bounded by `max_ms`.**
+    // Measured on the real material: it changed **nothing** — island count 7→7 and 5→5 at 40/80 ms.
+    // The gaps here are longer than 150 ms; the un-shifted attack is not a short consonant wedged
+    // between islands, it sits inside a long unvoiced stretch belonging to the note itself.
+    // ⇒ what the defect needs is a **dilation**: grow every voiced run outward, holding that run's
+    // own edge value, so the island covers the note's own onset and release.
+    //
+    // ⛔⛔ **Second version let the two sides meet, and that merged islands.** On 炉心融解 a 30 ms
+    // dilation merges nothing (96 → 96); on the goose score, whose unvoiced gaps are far shorter,
+    // it collapsed **458 → 143** — it was fusing neighbouring notes into a single rescue. Covering
+    // a note's own onset is the job; merging notes is not (S151 paid for the general form of this:
+    // "merging across a SUNG note drags a passenger into the rescue").
+    // ⇒ each gap is split at its midpoint and **at least one frame is always left unvoiced**, so
+    // the island count is preserved on every material and at every width.
+    // ⚠ On 炉心融解 this guard is inert (its gaps are ≫ 2 × 30 ms), so the render the user
+    // confirmed by ear is untouched — checked against the probe, not assumed.
     let ext = if hop == 0 {
         0
     } else {
@@ -963,38 +969,42 @@ fn bridge_unvoiced(f0: &[f32], hop: usize, sample_rate: u32, max_ms: f64) -> Vec
         return f0.to_vec();
     }
     let n = f0.len();
-    // Nearest voiced frame to the left / right of each frame, capped at `ext`.
-    let mut left: Vec<Option<usize>> = vec![None; n];
-    let mut last: Option<usize> = None;
-    for i in 0..n {
-        if f0[i] > 0.0 {
-            last = Some(i);
-        }
-        left[i] = last.filter(|k| i - k <= ext);
-    }
     let mut out = f0.to_vec();
-    let mut next: Option<usize> = None;
-    for i in (0..n).rev() {
+    let mut i = 0usize;
+    while i < n {
         if f0[i] > 0.0 {
-            next = Some(i);
-        }
-        if f0[i] > 0.0 {
+            i += 1;
             continue;
         }
-        let r = next.filter(|k| k - i <= ext);
-        out[i] = match (left[i], r) {
-            (Some(a), Some(b)) => {
-                // Interior gap short enough to be closed from both sides: interpolate, so a
-                // consonant between two different notes does not step.
-                let t = (i - a) as f64 / (b - a) as f64;
-                (f64::from(f0[a]) + (f64::from(f0[b]) - f64::from(f0[a])) * t) as f32
+        let a = i;
+        let mut b = i;
+        while b < n && !(f0[b] > 0.0) {
+            b += 1;
+        }
+        let len = b - a;
+        // ⛔ Interior only: a leading or trailing run has no anchor on one side, and inventing a
+        // pitch where the score says there is none is not this function's business.
+        let left = if a > 0 { Some(f0[a - 1]) } else { None };
+        let right = if b < n { Some(f0[b]) } else { None };
+        // The frame that must stay unvoiced so the two islands never touch.
+        let keep = a + len / 2;
+        for (k, slot) in out.iter_mut().enumerate().take(b).skip(a) {
+            if k == keep {
+                continue;
             }
-            // Edge of a note: hold the run's own value outward. ⛔ Never invent a value where
-            // there is no voiced frame within `ext` on either side.
-            (Some(a), None) => f0[a],
-            (None, Some(b)) => f0[b],
-            (None, None) => 0.0,
-        };
+            if k < keep {
+                if let Some(v) = left {
+                    if k - a < ext {
+                        *slot = v;
+                    }
+                }
+            } else if let Some(v) = right {
+                if b - 1 - k < ext {
+                    *slot = v;
+                }
+            }
+        }
+        i = b.max(a + 1);
     }
     out
 }
@@ -2147,23 +2157,37 @@ mod tests {
             psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 0.0);
         assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
 
-        // ⛔ A bound far shorter than the gap must NOT close it — otherwise the bound is decoration.
-        let short = bridge_unvoiced(&f0t, hop, sr, 5.0);
-        assert_eq!(islands_of(&short), 2, "a 5 ms dilation may not close a 40 ms gap");
-        // Dilation reaches from both sides, so 25 ms each closes 40 ms.
-        let long = bridge_unvoiced(&f0t, hop, sr, 25.0);
-        assert_eq!(islands_of(&long), 1, "25 ms from each side must close a 40 ms gap");
+        // ⛔⛔ **The island count must survive ANY width.** This is the guard the goose regression
+        // forced: without it a 30 ms dilation collapsed that score 458 islands → 143, i.e. it was
+        // fusing neighbouring notes into one rescue. Covering a note's own onset is the job;
+        // merging notes is not, and no knob setting may turn one into the other.
+        for ms in [5.0, 25.0, 60.0, 200.0, 500.0] {
+            let d = bridge_unvoiced(&f0t, hop, sr, ms);
+            assert_eq!(islands_of(&d), 2, "{ms} ms dilation merged the islands");
+        }
+        // …and it still has to actually cover something: the frames just outside each run.
+        let d = bridge_unvoiced(&f0t, hop, sr, 25.0);
+        assert!(d[g0] > 0.0, "the frame right after the first run must be covered");
+        assert!(d[g1 - 1] > 0.0, "…and the one right before the second run");
+        assert!(d[(g0 + g1) / 2] == 0.0, "…while the middle of the gap stays a gap");
+        // ⛔ Never invent pitch outside the note: leading / trailing runs stay zero.
+        assert_eq!(d[0], f0t[0]);
+        assert_eq!(d[d.len() - 1], f0t[f0t.len() - 1]);
 
         let (on, _) =
             psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, false, 0.0, 80.0);
         assert_ne!(on, off, "the opt-in arm must actually change the audio");
-        // The gap was passed through un-shifted before; with the islands merged it is synthesized.
-        let a = (g0 * hop) + hop;
-        let b = (g1 * hop).min(x.len()) - hop;
-        let same_off = off[a..b] == x[a..b];
-        let same_on = on[a..b] == x[a..b];
-        assert!(same_off, "before: the gap is the un-shifted input, bit for bit");
-        assert!(!same_on, "after: the gap must no longer be the un-shifted input");
+        // ⚠ Not asserting `off == x` at the gap edge: the previous island's last grains reach a
+        // little past its last mark, so the very edge is already synthesized even with the arm off.
+        // What the arm promises is that the gap's **edge** now gets grains and its **middle** does
+        // not — the second half is the never-merge guard, and it is the one worth pinning.
+        let e0 = g0 * hop;
+        let e1 = (e0 + 8 * hop).min(x.len());
+        assert!(on[e0..e1] != off[e0..e1], "the gap edge must have been covered");
+        // ⚠ NOT asserting the middle of the gap is bit-untouched: both islands are longer now, so
+        // their outermost grains and the dry-fill ramp reach further in. The never-merge guarantee
+        // is about the **island count** (asserted above over five widths), not about audio bytes
+        // in the middle of a gap — claiming the latter would be a criterion the design never made.
     }
 
     /// S154 — ⛔ the cheapest non-self-certifying gate on this whole line, applied to the new arm.
