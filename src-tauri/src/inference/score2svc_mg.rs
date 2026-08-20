@@ -1424,6 +1424,107 @@ fn mg_render_score_deadonly() {
     );
 }
 
+/// S158 —— **计划台**:同一条决策链、同一批函数,**只出计划、不渲染**(秒级,不碰 ONNX)。
+///
+/// ⛔ 为什么不复用离线复刻件。S157 写过一份 `minimal_rescue_shift` 的 Python 复刻
+/// (`TESTING\s157_knives\landing157.py`),当时**四道对拍全过**(63/63 × 4 条臂,
+/// 其中一道是渲染前落盘的预测)。而它今天已经是**陈货**:里面写死
+/// `LANDING_RATIO_TWO_ST = 12`,而 S157 笔2 已经把那个常量改成 **14**。
+/// ⭐ 形状:**一份对拍过的复刻件漂移之后,长得和对拍那天一模一样** —— 它不会告诉你
+/// 它过期了,而「它当时对过拍」正好是让人不再复查它的那句话。
+/// ⇒ 凡是要扫计划层参数,走**生产函数本身**。
+///
+/// ⛔ 它**不读** `UTAI_RANGE_TRIM` / `UTAI_RANGE_LANDING`:每条臂的旋钮写在下面的表里。
+/// 读进程环境的判据会随着机器上导出了什么而改答案,而且是**静默**改
+/// (S150 在 `parse_phase_lock` 上付过这个学费)。要量「今天出厂的是什么」就看
+/// `RescueTuning::today()` 那一行。
+///
+/// env:`UTAI_MG_MODEL`(必填,同名 `.json` 是 sidecar)· `UTAI_MG_SCORE` ·
+/// `UTAI_MG_TRANSPOSE` · `UTAI_MG_SPEAKER` · `UTAI_MG_PLANDUMP=<path>`(落盘;不设只打印)。
+#[test]
+#[ignore]
+fn mg_dump_plan_arms() {
+    use super::super::vocal_range::{dead_only_plan_with, RescueTuning};
+    let sj = load_score();
+    let triples = &sj.triples[..];
+    // sidecar 直接读 —— 这正是 `MgSovitsRig::load` 读的那一份,但不用把 ONNX 也拖起来。
+    let model_path = std::path::PathBuf::from(
+        std::env::var("UTAI_MG_MODEL").expect("UTAI_MG_MODEL (sovits onnx) required"),
+    );
+    let sc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_path.with_extension("json")).unwrap())
+            .unwrap();
+    let cfg: crate::models::ModelConfig =
+        serde_json::from_value(sc).expect("sidecar 解不成 ModelConfig —— 生产读的就是这个类型");
+    let speaker: u32 =
+        std::env::var("UTAI_MG_SPEAKER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let transpose: i64 =
+        std::env::var("UTAI_MG_TRANSPOSE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let range = super::super::vocal_range::speaker_range(&cfg, speaker)
+        .expect("这个模型的 sidecar 里没有可用的 vocal_range 记录");
+    let set = mg_phoneme_set();
+    let nn: Vec<i64> = triples
+        .iter()
+        .map(|t| crate::commands::inference::plan_note_num(&t.lyric, t.note_num, set))
+        .collect();
+    let fr: Vec<i64> = triples.iter().map(|t| t.frames).collect();
+
+    let today = RescueTuning::today();
+    // (标签, trim) —— landing 一律用今天出厂的那个,这一台扫的是**卸乘客**那一维。
+    let inf = f32::INFINITY;
+    let arms: Vec<(String, Option<(f32, f32)>)> = {
+        let mut v: Vec<(String, Option<(f32, f32)>)> =
+            vec![("今天(出厂)".to_string(), today.trim)];
+        for t in [0.0f32, 250.0, 500.0, 750.0, 1000.0, 1500.0] {
+            v.push((format!("只裁尾 {t:.0}ms"), Some((inf, t))));
+            v.push((format!("头尾都裁 {t:.0}ms"), Some((t, t))));
+        }
+        v
+    };
+
+    let mut dumped: Vec<serde_json::Value> = Vec::new();
+    for (label, trim) in &arms {
+        let (plan, unfixable) =
+            dead_only_plan_with(&nn, &fr, transpose, &range, RescueTuning::new(*trim, today.landing));
+        let riders: usize = plan.iter().map(|g| g.end - g.start + 1).sum();
+        let shifts: std::collections::BTreeSet<i64> = plan.iter().map(|g| g.shift).collect();
+        eprintln!(
+            "[plan] {label:<18} {:>3} 组 / {:>4} 个音进工序 / {} 个不同位移 / {} 无解",
+            plan.len(),
+            riders,
+            shifts.len(),
+            unfixable.len()
+        );
+        dumped.push(serde_json::json!({
+            "label": label,
+            "head_ms": trim.map(|t| if t.0.is_finite() { t.0 } else { -1.0 }),
+            "tail_ms": trim.map(|t| if t.1.is_finite() { t.1 } else { -1.0 }),
+            "groups": plan.iter().map(|g| [g.start as i64, g.end as i64, g.shift]).collect::<Vec<_>>(),
+            "unfixable": unfixable.iter().map(|&(a, b)| [a as i64, b as i64]).collect::<Vec<_>>(),
+            "riders": riders,
+            "distinct_shifts": shifts.iter().copied().collect::<Vec<_>>(),
+        }));
+    }
+
+    let dump = serde_json::json!({
+        "score": std::env::var("UTAI_MG_SCORE").unwrap_or_default(),
+        "model": model_path.file_stem().map(|s| s.to_string_lossy().to_string()),
+        "speaker": speaker,
+        "transpose": transpose,
+        "usable": [range.usable.0, range.usable.1],
+        "today_trim": today.trim.map(|t| [t.0, t.1]),
+        "today_landing": today.landing,
+        "notes": nn.iter().zip(fr.iter()).enumerate()
+            .map(|(k, (n, f))| serde_json::json!({ "k": k, "note": n, "frames": f }))
+            .collect::<Vec<_>>(),
+        "arms": dumped,
+    });
+    if let Ok(p) = std::env::var("UTAI_MG_PLANDUMP") {
+        std::fs::write(&p, serde_json::to_string(&dump).unwrap()).unwrap();
+        eprintln!("[plan] -> {p}");
+    }
+}
+
 /// `UTAI_MG_PLAN="a:b:s,…"` → `Vec<DeadGroup>`,**响亮校验**。
 ///
 /// ⛔ 下游一条都不会替你查:`dead_group_windows` 在 `end + 1 > len` 时**直接 panic**(cum 索引),
