@@ -2066,6 +2066,45 @@ fn parse_xgrain(v: Option<&str>) -> f64 {
 /// ⚠ 而它的代价落在**所有**被救音上 —— 见 [`xgrain`] 的 doc 末尾那条登记。
 const XGRAIN_DEFAULT: f64 = 1.0;
 
+/// S157b —— `UTAI_PSOLA_LPC=<order>`:**LP-PSOLA** —— 颗粒搬运挪进**残差域**。
+/// `0` = 关 = 今天,逐位不变。
+///
+/// ## 为什么(机理 + 实测的余量)
+///
+/// `ratio` 不是整数时相邻两颗输出颗粒读**同一个源标记**却放在不同相位上 ⇒ 被复制的不是一个
+/// 脉冲,而是「脉冲 ⊛ 声道冲激响应」的一整条长尾 ⇒ 尾巴之间非相干叠加 ⇒ **谐波之间出现噪声**。
+/// 残差几乎就是一串脉冲,复制它是良性的。全文在 `utai_dsp::psola` 的 LP-PSOLA 那一段。
+///
+/// ⭐ 余量是量出来的(S157b,**真 ぴゃ donor**,f0 659 Hz,同一段音频只改 ratio,
+/// 1000-2100 Hz 上 **PSOLA 自己加的**谐波间噪声):ratio 2.0000 **+7.68 dB** ·
+/// 2.1189 +10.28 · 2.2449 **+12.53** · 2.3784 +15.40 ⇒ **每个半音约 +2.5 dB**。
+/// 而同一场的 2×2 取证:模型在 MIDI 76 上给的 donor 比 78 那档干净 **9.1 dB**(同一带),
+/// 这道工序却在 ratio 2.2449 上加了 **12.75 dB** ⇒ **把模型给的好处全还回去了**
+/// —— 这正是用户 2026-08-20 看到的「合唱感又回来了、而且不止一条」。
+///
+/// ⚠ **阶数不是常数是旋钮**:Roebel & Rodet 2005 明写「一旦移调不是整数倍,变换后的声音就带
+/// whistling artifacts」,根因是**高音上谐波稀疏 ⇒ 全极点去拟合谐波而不是包络**
+/// ⇒ 阶数要按素材扫,别写死。
+pub fn lpc_order() -> usize {
+    parse_lpc_order(std::env::var("UTAI_PSOLA_LPC").ok().as_deref())
+}
+
+/// The env parse, as a pure function — same reason as [`parse_frac_transport`].
+/// ⚠ 上限 64:阶数超过它就不再是「包络」了,而且格型的每样本代价与阶数成正比。
+fn parse_lpc_order(v: Option<&str>) -> usize {
+    match v.map(str::trim) {
+        None | Some("") => LPC_ORDER_DEFAULT,
+        Some("0") => 0, // 显式关得掉 —— 抱怨某条臂时要能用同一个二进制渲旧臂
+        Some(x) => match x.parse::<usize>() {
+            Ok(n) if (1..=64).contains(&n) => n,
+            _ => LPC_ORDER_DEFAULT,
+        },
+    }
+}
+
+/// ⛔ 见 [`lpc_order`]。翻它必须成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`。
+const LPC_ORDER_DEFAULT: usize = 0;
+
 pub fn win_periods() -> f64 {
     parse_win_periods(std::env::var("UTAI_PSOLA_WIN").ok().as_deref())
 }
@@ -2295,6 +2334,7 @@ pub fn apply_inverse_with(
             let bridge = bridge_unvoiced_ms();
             let win = win_periods();
             let xg = xgrain();
+            let lpc = lpc_order();
             let (out, diag) = utai_dsp::psola::psola_shift_env(
                 &audio,
                 sample_rate,
@@ -2310,6 +2350,7 @@ pub fn apply_inverse_with(
                 bridge,
                 win,
                 xg,
+                lpc,
             );
             if diag.islands == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
@@ -3887,7 +3928,7 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 9] = [
+        let want: [(&str, f64); 10] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
@@ -3897,6 +3938,7 @@ mod tests {
             ("UTAI_PSOLA_BRIDGE", parse_bridge_unvoiced_ms(None)),
             ("UTAI_PSOLA_WIN", parse_win_periods(None)),
             ("UTAI_PSOLA_XGRAIN", parse_xgrain(None)),
+            ("UTAI_PSOLA_LPC", parse_lpc_order(None) as f64),
         ];
         let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
         assert_eq!(

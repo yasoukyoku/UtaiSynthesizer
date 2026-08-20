@@ -1048,7 +1048,7 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
 /// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
-pub const PROBE_ARM_DEFAULTS: [(&str, f64); 9] = [
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
     ("UTAI_PSOLA_FRAC", 0.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
     ("UTAI_PSOLA_LOCK", 0.30),
@@ -1058,7 +1058,157 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 9] = [
     ("UTAI_PSOLA_BRIDGE", 30.0),
     ("UTAI_PSOLA_WIN", 1.0),
     ("UTAI_PSOLA_XGRAIN", 1.0),
+    // S157b —— LP-PSOLA 的阶数。⚠ 它是 f64 只因为这张表是 f64;读的时候取整。
+    ("UTAI_PSOLA_LPC", 0.0),
 ];
+
+// ── S157b —— LP-PSOLA:把颗粒搬运挪进【残差域】 ───────────────────────────────
+//
+// ## 为什么(机理 + 实测的余量)
+//
+// `ratio` 不是整数时,相邻两颗输出颗粒会读**同一个源标记**却放在不同的相位上
+// (`k = round(j/ratio)`)⇒ 被复制的不是一个脉冲,而是「脉冲 ⊛ 声道冲激响应」的**一整条长尾**
+// ⇒ 尾巴之间非相干叠加 ⇒ **谐波之间出现噪声**。而**残差**几乎就是一串脉冲(尾巴被 `A(z)`
+// 拿走了),复制/插值它是良性的 —— 这正是 Moulines & Charpentier 1990 自己给的答案。
+//
+// ⭐ 余量是量出来的(S157b,**真 ぴゃ donor**,f0 659 Hz,`TESTING\s157_knives\probe_pya.sh`;
+// 同一段音频只改 ratio,1000-2100 Hz 上 **PSOLA 自己加的**谐波间噪声):
+//
+// | ratio | 2.0000 | 2.1189 | **2.2449** | 2.3784 | 2.5198 |
+// |---|---|---|---|---|---|
+// | 加了 | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+//
+// ⇒ **每个半音约 +2.5 dB**,而用户 2026-08-20 正是在这条带上看见「合唱感又回来了、
+// 而且不止一条」。同一场的 2×2 取证:模型在 MIDI 76 上给的 donor 比 78 那档干净 **9.1 dB**
+// (同一带),而这道工序在 ratio 2.2449 上加了 **12.75 dB** ⇒ **把模型给的好处全还回去了**。
+//
+// ## ⭐ 恒等是**结构性**的,不是短路
+//
+// 接线写成**差分式**:`y = x + Synth(OLA(r) − r)`。
+// ratio 1.0 上 `OLA(r) ≡ r`(与今天 `OLA(x) ≡ x` 是同一段代码同一条路径,那条 `assert_eq!`
+// 已经证过)⇒ 差**恒为 0** ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。与 S155 的差分式去次声同构。
+// ⛔ 它顺带解决了**岛边界的滤波器状态**:差在岛外恒为 0,合成滤波器不会从边界抖出东西来。
+//
+// ## ⚠ 三件故意不做的
+//
+// 1. **标记仍然在【语音】上找**(`analysis_marks` 读的还是 `dc_free(x)`)。S156 §8 担心的
+//    「残差的峰比语音尖得多 ⇒ `LOCK` 与 `T/8` 要重标定」因此**不成立**:这一笔只换
+//    **搬什么**,不换**搬到哪**。
+// 2. **用格型(lattice)而不是直接型**:反射系数 `|k| < 1` ⇒ 合成滤波器**必然稳定**,
+//    而且逐样本**线性插值 `k`** 仍然满足 `|k| < 1`(插值直接型系数会失稳,这是经典坑)。
+//    ⭐ 而且分析格型与合成格型在同一条 `k` 轨迹上是**逐样本精确互逆**的。
+// 3. **阶数是旋钮不是常数**:Roebel & Rodet 2005 明写「一旦移调不是整数倍,变换后的声音
+//    就带 whistling artifacts」,根因是**高音上谐波稀疏 ⇒ 全极点去拟合谐波而不是包络**。
+//    ⇒ 阶数要按素材扫,别写死。
+
+/// LPC 分析帧:窗 30 ms / 跳 5 ms。⚠ 这两个数不是调出来的,是语音 LPC 的教科书值;
+/// 若将来发现它们要紧,那说明该去看素材,不是去调它们。
+const LPC_FRAME_MS: f64 = 30.0;
+const LPC_HOP_MS: f64 = 5.0;
+
+/// 每帧的反射系数(Levinson-Durbin)。`|k| < 1` 由正定自相关保证 ⇒ 合成必然稳定。
+///
+/// ⚠ 自相关加了 `1e-6 · r[0]` 的白噪底(经典 ridge):没有它,一段数字静音或一段
+/// 严格周期信号会让 Levinson 除零 —— 而这两种输入在本文件的夹具里都有。
+fn lpc_reflections(x: &[f32], sample_rate: u32, order: usize) -> (Vec<Vec<f64>>, usize) {
+    let sr = f64::from(sample_rate);
+    let win = ((LPC_FRAME_MS * sr / 1000.0) as usize).max(order * 2 + 2);
+    let hop = ((LPC_HOP_MS * sr / 1000.0) as usize).max(1);
+    let nframes = x.len().div_ceil(hop) + 1;
+    let w: Vec<f64> = (0..win)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / win as f64).cos())
+        .collect();
+    let mut out = Vec::with_capacity(nframes);
+    let mut buf = vec![0.0f64; win];
+    for f in 0..nframes {
+        // 帧心对齐到 `f * hop`,两边各取半窗(越界补零 —— 端点的包络本来就没有定义)。
+        let c = f * hop;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let p = c as isize + i as isize - (win / 2) as isize;
+            *b = if p >= 0 && (p as usize) < x.len() { f64::from(x[p as usize]) * w[i] } else { 0.0 };
+        }
+        let mut r = vec![0.0f64; order + 1];
+        for (lag, rv) in r.iter_mut().enumerate() {
+            *rv = buf[lag..].iter().zip(buf.iter()).map(|(a, b)| a * b).sum();
+        }
+        let mut k = vec![0.0f64; order];
+        if r[0] > 1e-30 {
+            r[0] *= 1.0 + 1e-6;
+            let mut a = vec![0.0f64; order + 1];
+            let mut e = r[0];
+            for m in 1..=order {
+                let mut acc = r[m];
+                for j in 1..m {
+                    acc -= a[j] * r[m - j];
+                }
+                let km = if e > 1e-30 { acc / e } else { 0.0 };
+                // 数值安全带:理论上 |k| < 1,但一段病态输入不许让合成滤波器爆掉。
+                let km = km.clamp(-0.999_999, 0.999_999);
+                k[m - 1] = km;
+                let prev = a.clone();
+                a[m] = km;
+                for j in 1..m {
+                    a[j] = prev[j] - km * prev[m - j];
+                }
+                e *= 1.0 - km * km;
+                if e <= 1e-30 {
+                    break;
+                }
+            }
+        }
+        out.push(k);
+    }
+    (out, hop)
+}
+
+/// 某个样本位置上的反射系数(帧间**线性插值**)。见上面第 2 条:插的是 `k` 不是直接型系数。
+#[inline]
+fn lpc_k_at(ks: &[Vec<f64>], hop: usize, i: usize, m: usize) -> f64 {
+    let t = i as f64 / hop as f64;
+    let f0 = (t as usize).min(ks.len() - 1);
+    let f1 = (f0 + 1).min(ks.len() - 1);
+    let a = t - f0 as f64;
+    (1.0 - a) * ks[f0][m] + a * ks[f1][m]
+}
+
+/// 分析格型:`x → 残差`。FIR,恒稳。
+fn lattice_analyse(x: &[f32], ks: &[Vec<f64>], hop: usize, order: usize) -> Vec<f32> {
+    let mut g = vec![0.0f64; order + 1]; // 上一样本的后向误差
+    let mut out = vec![0.0f32; x.len()];
+    let mut gn = vec![0.0f64; order + 1];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut f = f64::from(x[i]);
+        gn[0] = f;
+        for m in 1..=order {
+            let k = lpc_k_at(ks, hop, i, m - 1);
+            let fm = f - k * g[m - 1];
+            gn[m] = g[m - 1] - k * f;
+            f = fm;
+        }
+        g.copy_from_slice(&gn);
+        *o = f as f32;
+    }
+    out
+}
+
+/// 合成格型:`残差 → 信号`。与 [`lattice_analyse`] 在同一条 `k` 轨迹上逐样本精确互逆。
+fn lattice_synthesise(r: &[f32], ks: &[Vec<f64>], hop: usize, order: usize) -> Vec<f32> {
+    let mut g = vec![0.0f64; order + 1];
+    let mut gn = vec![0.0f64; order + 1];
+    let mut out = vec![0.0f32; r.len()];
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut f = f64::from(r[i]);
+        for m in (1..=order).rev() {
+            let k = lpc_k_at(ks, hop, i, m - 1);
+            f += k * g[m - 1];
+            gn[m] = g[m - 1] - k * f;
+        }
+        gn[0] = f;
+        g.copy_from_slice(&gn);
+        *o = f as f32;
+    }
+    out
+}
 
 /// Box filter with a running prefix sum; the window shrinks at the two ends rather than
 /// zero-padding (zero-padding would manufacture a step exactly where the buffer starts).
@@ -1662,7 +1812,7 @@ pub fn psola_shift_infra(
 ) -> (Vec<f32>, PsolaDiagnostics) {
     psola_shift_env(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
-        phase_lock, infrasonic, 0.0, 0.0, 0.0, 0.0)
+        phase_lock, infrasonic, 0.0, 0.0, 0.0, 0.0, 0)
 }
 
 /// S154 — additive: optionally **restore the amplitude envelope** the process was handed.
@@ -1693,6 +1843,9 @@ pub fn psola_shift_env(
     // `0.0` = 今天 = 最近邻 `k = round(u)` = 逐位不变;`1.0` = 完全线性插值。
     // 它存在的理由与它为什么在 ratio 1.0 上对任何深度都恒等,写在主循环里那一段。
     xgrain: f64,
+    // S157b —— **LP-PSOLA 的阶数**。`0` = 关 = 今天,逐位不变;`>0` = 颗粒搬运挪进残差域。
+    // 机理、实测余量、以及「恒等为什么是结构性的」写在文件上方 LP-PSOLA 那一段。
+    lpc_order: usize,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -1722,6 +1875,19 @@ pub fn psola_shift_env(
     }
     let mean = x.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
     let dc_free: Vec<f32> = x.iter().map(|v| (f64::from(*v) - mean) as f32).collect();
+
+    // S157b —— LP-PSOLA。⛔ `lpc_order == 0` 时 `carry` 就是 `x`,下面每一处都逐位同旧。
+    // ⚠ 残差在**整个缓冲**上算(不是逐岛):`A(z)` 的估计要连续,而差分式接线保证岛外的差
+    //    恒为 0,所以「整缓冲」不会把岛外的东西带进来。
+    let (lpc_ks, lpc_hop) = if lpc_order > 0 {
+        let (k, h) = lpc_reflections(x, sample_rate, lpc_order);
+        (Some(k), h)
+    } else {
+        (None, 1)
+    };
+    let lpc_resid: Option<Vec<f32>> =
+        lpc_ks.as_ref().map(|k| lattice_analyse(x, k, lpc_hop, lpc_order));
+    let carry: &[f32] = lpc_resid.as_deref().unwrap_or(x);
 
     // S154 —— 岛的划法。⛔ 默认 0 = 不膨胀 = 逐位同旧;见 `bridge_unvoiced` 的说明。
     // `islands_raw` 是**膨胀前**的岛,只用来给标记播种(见 `analysis_marks` 的 `seed_at`)。
@@ -1957,8 +2123,10 @@ pub fn psola_shift_env(
                 if gg <= 0.0 {
                     continue;
                 }
+                // S157b —— **搬的是 `carry`**:LPC 关着时它就是 `x`(逐位不变),
+                // 开着时是残差。标记 / 岛 / 相位锁定读的仍然是 `x`,见 LPC 那一段第 1 条。
                 add_bell(
-                    x, &mut acc, &mut wsum, pp, tm, lw, rw, formant_rate, frac_transport, gg,
+                    carry, &mut acc, &mut wsum, pp, tm, lw, rw, formant_rate, frac_transport, gg,
                     &mut residual,
                 );
             }
@@ -2015,7 +2183,18 @@ pub fn psola_shift_env(
             // fixture in this file, zero uncovered samples ever carry wsum > 1 (a surplus needs
             // overlapping bells, and overlapping bells mean covered). Feeding the raw sum instead
             // is bit-identical on real input — so do not expect a test to catch that swap.
-            out[i] = (acc[i] + (1.0 - w) * f64::from(x[i])) as f32;
+            // S157b —— 干填料也用 `carry`(LPC 关着时它就是 `x`)。⛔ 必须与颗粒同域,
+            // 否则「岛外原样透传」在残差域里就变成了「往残差里掺语音」。
+            out[i] = (acc[i] + (1.0 - w) * f64::from(carry[i])) as f32;
+        }
+    }
+    // S157b —— **差分式接线**:`y = x + Synth(OLA(r) − r)`。见文件上方 LP-PSOLA 那一段。
+    // ⛔ ratio 1.0 上 `OLA(r) ≡ r` ⇒ 差恒为 0 ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。
+    if let (Some(ks), Some(r)) = (&lpc_ks, &lpc_resid) {
+        let d: Vec<f32> = out.iter().zip(r.iter()).map(|(o, ri)| o - ri).collect();
+        let s = lattice_synthesise(&d, ks, lpc_hop, lpc_order);
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = x[i] + s[i];
         }
     }
     // S154 —— **振幅包络守恒**。读数无条件算(S152 那条规矩),修法由 `env_restore_ms` 控。
@@ -2351,7 +2530,7 @@ mod tests {
             };
         }
         let arm = |inf| {
-            psola_shift_env(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, inf, 0.0, 0.0, 0.0, 0.0)
+            psola_shift_env(&x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, inf, 0.0, 0.0, 0.0, 0.0, 0)
         };
         let (off, doff) = arm(Infrasonic::Off);
         let (per, dper) = arm(Infrasonic::PerPeriod);
@@ -2427,9 +2606,9 @@ mod tests {
             *f = f_hi as f32;
         }
         let (off, _) = psola_shift_env(
-            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0);
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
         let (on, don) = psola_shift_env(
-            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0);
+            &x, sr, 12.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
         assert!(don.infrasonic_ma_ms > 0.0, "臂开着却没报出宽度");
         // 只看后半段(那里输入唱 f_hi,而输出被搬到 2·f_hi ⇒ f_hi 上本该什么都没有)
         let k = x.len() / 2;
@@ -2498,7 +2677,7 @@ mod tests {
             *f = 440.0;
         }
         let (_, d) = psola_shift_env(
-            &x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0);
+            &x, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
         let want = 1000.0 / 440.0;
         assert!(
             (f64::from(d.infrasonic_ma_ms) - want).abs() < 0.15,
@@ -2512,7 +2691,7 @@ mod tests {
         let mut x2 = voiced.clone();
         x2.extend_from_slice(&voiced);
         let (_, d2) = psola_shift_env(
-            &x2, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0);
+            &x2, sr, 9.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::PerPeriod, 0.0, 0.0, 0.0, 0.0, 0);
         assert!(
             f64::from(d2.infrasonic_ma_ms) > f64::from(d.infrasonic_ma_ms) * 1.5,
             "把静音那半填上音频之后宽度没跟着变({} → {} ms)⇒ 上面那条判据是空的",
@@ -2543,9 +2722,9 @@ mod tests {
         // ratio > 2 ⇒ 今天的读窗窄于一个源周期 ⇒ 源上真的有没人读的段落
         for st in [7.0f64, 14.0] {
             let (a, da) = psola_shift_env(
-                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0);
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
             let (b, db) = psola_shift_env(
-                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0, 0.0);
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0, 0.0, 0);
             assert_ne!(a, b, "{st} st: 宽窗臂与今天逐位相同 —— 颗粒多半被 max_period 静默跳过了");
             assert_eq!(da.islands, db.islands, "{st} st: 窗宽不该改变岛的数目");
             assert!(
@@ -2597,7 +2776,7 @@ mod tests {
         // ⭐ 阴性对照:ratio > 2 时今天的读窗**必然**漏掉源(见 `src_uncovered_frac`),
         //    所以上面那条覆盖率断言不是恒真的。
         let (_, d14) = psola_shift_env(
-            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0);
+            &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
         assert!(
             d14.src_uncovered_frac > 0.01,
             "+14 st 上今天就没漏源({:.4})⇒ 上面那条覆盖率判据是空的",
@@ -2633,7 +2812,7 @@ mod tests {
         let f0t = flat_f0(x.len(), hop, f0 as f32);
         let run = |st: f64, win: f64| {
             psola_shift_env(
-                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win, 0.0)
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0)
             .0
         };
         assert_eq!(run(0.0, 1.0), x, "ratio 1.0 上 win=1.0 的宽窗臂不是恒等变换");
@@ -2671,7 +2850,7 @@ mod tests {
         let run = |st: f64, win: f64, xg: f64| {
             psola_shift_env(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, win, xg,
-            )
+                0)
             .0
         };
         // ⑵ ratio 1.0:任何深度都必须是**逐位**恒等。
@@ -2725,7 +2904,7 @@ mod tests {
             let f0t = flat_f0(x.len(), hop, f0 as f32);
             psola_shift_env(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 1.0, xg,
-            )
+                0)
             .0
         };
         // 周期 = 200 个整样本 ⇒ 相邻源脉冲逐位相同 ⇒ 混合它们必须逐位空操作。
@@ -2809,7 +2988,7 @@ mod tests {
                 g("UTAI_PSOLA_BRIDGE"),
                 g("UTAI_PSOLA_WIN"),
                 g("UTAI_PSOLA_XGRAIN"),
-            )
+                0)
         };
         // ⑴ 全套生产默认下的恒等 —— 这条线上最便宜、最不可能自证的那道闸。
         assert_eq!(prod(0.0).0, x, "ratio 1.0 在生产默认下不是恒等变换");
@@ -2840,7 +3019,7 @@ mod tests {
                 g("UTAI_PSOLA_BRIDGE"),
                 win,
                 xg,
-            )
+                0)
             .0
         };
         assert_ne!(y14, one_off(0.0, g("UTAI_PSOLA_XGRAIN")), "把 WIN 单独退回 0,输出没变");
@@ -2848,7 +3027,7 @@ mod tests {
         // 旧臂(两个都退回 0)在 +14 上**必须**漏源,否则 ⑵ 是空的。
         let (_, dold) = psola_shift_env(
             &x, sr, 14.0, 0.0, &f0t, hop, false, 0.0, 0.30, hp, 0.0, 30.0, 0.0, 0.0,
-        );
+            0);
         assert!(
             dold.src_uncovered_frac > 0.01,
             "旧臂在 +14 上竟然不漏源({:.4})⇒ ⑵ 那条判据是空的",
@@ -2861,6 +3040,87 @@ mod tests {
     /// 邻距,实测 +7..+16 全是 0.00% / 1.000),标记层的尺子全部 ratio 不变量。
     /// 阈值不是估的:读窗半宽 = `T_src/ratio`,相邻源标记相距 `T_src` ⇒ `ratio > 2` 才留缝。
     #[test]
+    /// S157b —— 格型分析/合成**必须是逐样本精确互逆**。整条 LP-PSOLA 的恒等都挂在这上面。
+    /// ⛔ 阴性对照两条,缺一条这条判据就可能只是「两条都很小」:
+    /// ⑴ 用**另一条 `k` 轨迹**合成 ⇒ 必须恢复不了(否则说明 `k` 根本没参与);
+    /// ⑵ 残差本身必须**真的比输入白**(否则「搬残差」与「搬语音」是同一件事)。
+    #[test]
+    fn the_lattice_pair_is_an_exact_inverse() {
+        let sr = 44_100u32;
+        let x = voiced(sr, 0.4, 220.0);
+        for order in [8usize, 16, 24, 32] {
+            let (ks, hop) = lpc_reflections(&x, sr, order);
+            let r = lattice_analyse(&x, &ks, hop, order);
+            let y = lattice_synthesise(&r, &ks, hop, order);
+            let err = x
+                .iter()
+                .zip(&y)
+                .map(|(a, b)| f64::from(a - b).abs())
+                .fold(0.0f64, f64::max);
+            let peak = x.iter().map(|v| f64::from(*v).abs()).fold(0.0f64, f64::max);
+            assert!(
+                err < peak * 1e-4,
+                "order {order}: 往返误差 {err:.3e} 相对峰值 {peak:.3} 太大 —— 格型对不互逆"
+            );
+            // ⑴ 换一条 k 轨迹 ⇒ 必须恢复不了
+            let bogus: Vec<Vec<f64>> = ks.iter().map(|k| k.iter().map(|v| -0.5 * v).collect()).collect();
+            let y2 = lattice_synthesise(&r, &bogus, hop, order);
+            let err2 = x.iter().zip(&y2).map(|(a, b)| f64::from(a - b).abs()).fold(0.0f64, f64::max);
+            assert!(
+                err2 > peak * 1e-2,
+                "order {order}: 换了 k 竟然照样恢复出来({err2:.3e})⇒ 上面那条是空的"
+            );
+            // ⑵ 残差必须更白:一阶自相关系数的绝对值必须显著变小
+            let ac1 = |v: &[f32]| -> f64 {
+                let m: f64 = v.iter().map(|a| f64::from(*a)).sum::<f64>() / v.len() as f64;
+                let (mut num, mut den) = (0.0f64, 0.0f64);
+                for i in 1..v.len() {
+                    num += (f64::from(v[i]) - m) * (f64::from(v[i - 1]) - m);
+                    den += (f64::from(v[i]) - m).powi(2);
+                }
+                if den > 0.0 { num / den } else { 0.0 }
+            };
+            assert!(
+                ac1(&r).abs() < ac1(&x).abs() * 0.5,
+                "order {order}: 残差(lag-1 {:.3})并不比输入(lag-1 {:.3})白 —— 逆滤波没生效",
+                ac1(&r),
+                ac1(&x)
+            );
+        }
+    }
+
+    /// S157b —— ⭐⭐ **LP-PSOLA 的恒等是结构性的**:`y = x + Synth(OLA(r) − r)`,
+    /// ratio 1.0 上 `OLA(r) ≡ r` ⇒ 差恒为 0 ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。
+    ///
+    /// ⛔ 这条必须对**每一个阶数**成立,而不是某一个 —— 它是接线的性质,不是参数的性质。
+    /// ⛔ 阴性对照:同一批阶数在 +14 上必须**真的改变输出**,否则「恒等」可能只是「旋钮没接上」。
+    #[test]
+    fn lp_psola_is_bit_identical_at_ratio_one_and_actually_bites_elsewhere() {
+        let sr = 44_100u32;
+        let x = voiced(sr, 0.4, 220.0);
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, 220.0);
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let run = |st: f64, order: usize| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop,
+                g("UTAI_PSOLA_FRAC") != 0.0, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
+                Infrasonic::PerPeriod, g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"), g("UTAI_PSOLA_XGRAIN"), order,
+            )
+            .0
+        };
+        let base14 = run(14.0, 0);
+        for order in [8usize, 16, 24, 32] {
+            assert_eq!(run(0.0, order), x, "order {order}: ratio 1.0 上 LP-PSOLA 不是恒等变换");
+            assert_ne!(run(14.0, order), base14, "order {order}: +14 上打开它输出没变 —— 旋钮没接上");
+        }
+        // ⛔ 阶数 0 那一档必须与今天逐位相同(否则这一整笔改了默认臂)。
+        assert_eq!(run(14.0, 0), base14);
+    }
+
     fn nothing_reads_part_of_the_source_once_the_shift_passes_an_octave() {
         let sr = 44_100;
         let f0 = 220.0;
@@ -3189,7 +3449,7 @@ mod tests {
             let (off, doff) =
                 psola_shift_infra(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
             let (via, dvia) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
             assert_eq!(off, via, "{st} st: env_restore_ms = 0 must be the legacy arm");
             assert_eq!(doff, dvia, "{st} st: …diagnostics included");
             // ⛔ The readout has to exist while the arm is OFF, or "what does it look like today"
@@ -3201,7 +3461,7 @@ mod tests {
             assert_eq!(doff.env_dev_after_db, 0.0, "{st} st: nothing restored while off");
 
             let (on, don) =
-                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0);
+                psola_shift_env(&x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0, 0);
             assert_ne!(on, off, "{st} st: the opt-in arm must actually change the audio");
             // ⛔ What this arm promises is **the slow part**: the step at an island start. It does
             // not promise to shrink a 5 ms median that is already down in the period-scale noise,
@@ -3257,7 +3517,7 @@ mod tests {
 
         let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
         let (via, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 0.0, 0.0, 0.0, 0);
         assert_eq!(off, via, "bridge_unvoiced_ms = 0 must be the legacy arm");
 
         // ⛔⛔ **The island count must survive ANY width.** This is the guard the goose regression
@@ -3278,7 +3538,7 @@ mod tests {
         assert_eq!(d[d.len() - 1], f0t[f0t.len() - 1]);
 
         let (on, _) =
-            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0, 0.0, 0.0);
+            psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 0.0, 80.0, 0.0, 0.0, 0);
         assert_ne!(on, off, "the opt-in arm must actually change the audio");
         // ⚠ Not asserting `off == x` at the gap edge: the previous island's last grains reach a
         // little past its last mark, so the very edge is already synthesized even with the arm off.
@@ -3308,7 +3568,7 @@ mod tests {
             let f0t = flat_f0(x.len(), hop, f0 as f32);
             for ms in [2.0, 5.0, 20.0] {
                 let (y, _d) =
-                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0, 0.0, 0.0);
+                    psola_shift_env(&x, sr, 0.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, ms, 0.0, 0.0, 0.0, 0);
                 assert_eq!(y, x, "f0 {f0}, envfix {ms} ms: ratio 1.0 must be the identity");
             }
         }
@@ -3335,7 +3595,7 @@ mod tests {
             *v = 0.0;
         }
         let (off, _) = psola_shift_infra(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off);
-        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0);
+        let (on, _) = psola_shift_env(&x, sr, 7.0, 0.0, &f0t, hop, false, 0.0, 0.30, Infrasonic::Off, 5.0, 0.0, 0.0, 0.0, 0);
         // The first and last eighth are comfortably inside the unvoiced pass-through.
         let e = x.len() / 8;
         assert_eq!(off[..e], on[..e], "the arm reached into the leading pass-through");
@@ -4322,6 +4582,8 @@ mod tests {
         let win: f64 = probe_arm("UTAI_PSOLA_WIN");
         // S156 —— `UTAI_PSOLA_XGRAIN=<0..1>` 颗粒内容在相邻两个源脉冲之间的插值深度;0 = 今天。
         let xgrain: f64 = probe_arm("UTAI_PSOLA_XGRAIN");
+        // S157b —— `UTAI_PSOLA_LPC=<order>` LP-PSOLA 的阶数;0 = 今天。
+        let lpc: usize = probe_arm("UTAI_PSOLA_LPC") as usize;
         // S155 —— `UTAI_PSOLA_HP=0/1` 去次声;`UTAI_PSOLA_HP_MS=<ms>` 强制固定宽度(0 = 自适应)。
         // ⛔⛔ 它以前在这里**写死成 `false`**,于是这条探针上「开」与「关」的输出**逐位相同** ——
         //    和 S148 那次 `frac_transport` 写死成 false 一模一样的形状,而那次差点被读成
@@ -4334,9 +4596,10 @@ mod tests {
         };
         let (y, d) = psola_shift_env(
             &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge, win,
-            xgrain,);
+            xgrain, lpc,
+        );
         println!(
-            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?} win={win} xgrain={xgrain}"
+            "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?} win={win} xgrain={xgrain} lpc={lpc}"
         );
         // ⛔ 「这条探针跑的是不是生产口径」必须**当场看得见**。S154 之后生产默认是
         //    `bridge=30 / lock=0.30`,而这条探针以前对这两个都默认 0 ⇒ 照旧脚本跑出来的
