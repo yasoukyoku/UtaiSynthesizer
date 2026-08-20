@@ -1106,6 +1106,11 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
 const LPC_FRAME_MS: f64 = 30.0;
 const LPC_HOP_MS: f64 = 5.0;
 
+/// 滞后加窗的带宽,Hz。见 `lpc_reflections` 里那一段:没有它这把刀在高音 donor 上是负结果。
+/// ⚠ 60 Hz 是语音 LPC 的教科书值(等价于给每个极点 60 Hz 的最小带宽);
+/// ⛔ 它**不是**调出来的 —— 若发现它要紧,那说明该去看素材(或改用 true envelope),不是调它。
+const LPC_LAG_WINDOW_HZ: f64 = 60.0;
+
 /// 每帧的反射系数(Levinson-Durbin)。`|k| < 1` 由正定自相关保证 ⇒ 合成必然稳定。
 ///
 /// ⚠ 自相关加了 `1e-6 · r[0]` 的白噪底(经典 ridge):没有它,一段数字静音或一段
@@ -1130,6 +1135,19 @@ fn lpc_reflections(x: &[f32], sample_rate: u32, order: usize) -> (Vec<Vec<f64>>,
         let mut r = vec![0.0f64; order + 1];
         for (lag, rv) in r.iter_mut().enumerate() {
             *rv = buf[lag..].iter().zip(buf.iter()).map(|(a, b)| a * b).sum();
+        }
+        // S157b —— **滞后加窗**(lag windowing):自相关按 `exp(−½(2π·F_BW·lag/sr)²)` 衰减,
+        // 等价于把每个极点的带宽撑开 `F_BW` Hz。
+        //
+        // ⛔ 没有它这一整刀是**负结果**,而且负得很难看:实测(真 ぴゃ donor,f0 659 Hz,+14,
+        // 1000-2100 Hz 上 PSOLA 自己加的谐波间噪声)order 0 = +12.53 dB,而
+        // 8/12/16/20/24/32 = +15.73/+16.69/+16.44/+15.43/+13.44/+15.05,**order 48 = +51.20**。
+        // ⭐ 那正是 Roebel & Rodet 2005 点名的失效模式,也是 S156 §8 寄存这条候选时就写下的风险:
+        // **高音上谐波稀疏 ⇒ 全极点去拟合【谐波】而不是【包络】** ⇒ 合成滤波器的极点尖到会振铃,
+        // 而那些极点钉在 **donor 的**谐波上,移调之后与输出谐波对不齐 ⇒ 谐波之间全是它。
+        for (lag, rv) in r.iter_mut().enumerate() {
+            let w = (2.0 * std::f64::consts::PI * LPC_LAG_WINDOW_HZ * lag as f64 / sr).powi(2);
+            *rv *= (-0.5 * w).exp();
         }
         let mut k = vec![0.0f64; order];
         if r[0] > 1e-30 {
