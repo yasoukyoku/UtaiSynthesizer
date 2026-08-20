@@ -684,7 +684,7 @@ pub fn dead_only_plan_with(
     (out, unfixable)
 }
 
-/// ⚙ 出厂默认 = None —— 卸乘客**关**(S158 翻过又撤了,理由见 [`TRIM_DEFAULT`]);`=1` 开
+/// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = **只裁尾**(S158d;`=0` 渲旧臂)
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
 /// **S158 起这是出厂默认(只裁尾)**;`UTAI_RANGE_TRIM=0` 关(渲旧臂)· `=1` 用下面两个常量 ·
 /// `=<head_ms>:<tail_ms>` 扫参数。
@@ -732,7 +732,8 @@ pub fn dead_only_plan_with(
 /// ⚠ Not a plateau everywhere: on the +7 stress case the same records give 14 head / 13 tail at
 /// 750 ms and 5 / 9 at 1000 ms, i.e. that song IS threshold-sensitive. Re-measure before moving.
 ///
-/// ⛔⛔⛔ **S158 把这个默认翻开过,当天又撤了。撤的理由是这条线上最贵的一课,原样记在这里。**
+/// ⛔⛔⛔ **S158 在这个默认上翻了三次(开 → 撤 → 开)。三次的理由都留在这里,因为**
+/// **中间那次撤销正好是这条线上最典型的一种错误,而它差点把一把好刀关掉。**
 ///
 /// ## 翻的时候我拿的是什么(每个数都是真的,而且都不相干)
 ///
@@ -770,8 +771,47 @@ pub fn dead_only_plan_with(
 /// ⚠ S147 笔1 判死过三种「自然」的做法(窗内对齐 / 保留区对齐 / donor 不归一),但那三种
 /// 对齐的是**整条窗**;这里要的是**只在缝那几十毫秒上**对齐,是另一件事,没人试过。
 ///
-/// ⇒ 在那件事做完之前:**默认关**。旋钮留着(`UTAI_RANGE_TRIM=1`),因为这一刀拿掉的东西
-/// 是真的(60 个音回到它们本来正确的那一版),缺的只是**它造出来的缝还没法做到便宜**。
+/// ## ⛔⛔⛔ 然后用户听了,而我那个「代价」是**自己贴上去的符号**
+///
+/// 用户听完原 key 那四条臂:「**卸掉乘客的那个版本我没听出来什么特别奇怪的东西,反倒是低音那边
+/// 因为被卸了反而还能更自然一点**」。⇒ 我把那 3 dB 叫做「代价」,而 S148 血训第 55 条逐字写着
+/// **「Δ 量的是【变化】不是【好坏】,给它贴符号要另有依据」** —— 我没有那个依据。
+///
+/// 结构上一看就明白,而我当时没看:**那 7 条边【全部落在音符边界上】**
+/// (`[180]み→[181]い` 这一类),而音符边界本来就该有电平与音色的变化;
+/// 而且换过去的那一侧是 **base = 那个音本来正确的渲染**。
+/// ⇒ 「跨音符边界的电平关系变了 3 dB」**不是接缝瑕疵**,那就是唱歌。
+///
+/// ## ⭐⭐⭐ 而收益那一侧,我用的栏目**结构上分不出好坏**
+///
+/// 我第一轮那份分析脚本报的是 **|Δ| 绝对值**(p50/p90)。绝对值把方向抹掉了 ⇒
+/// 「被卸掉的音动了 100 倍地板」这句话里,**没有一个字说的是【往哪边动】**。
+/// 换成**有符号中位数**、并换到这条线上唯一被盲测背书过、且与耳朵同向的那条轴
+/// (`low_ratio`,S148 r1),原 key 上:
+///
+/// | 类 | n | Δlow_ratio 中位(有符号) | 同批地板 |
+/// |---|---|---|---|
+/// | **被卸掉的** | 26 | **−0.1254** | +0.0000 |
+/// | 仍在车上的 | 213 | −0.0000 | −0.0000 |
+/// | 从没被碰过(阴性) | 467 | +0.0000 | +0.0000 |
+///
+/// 逐音:`[231]た 0.445→0.098` · `[442]と 0.565→0.249` · `[686]か 0.584→0.272` ·
+/// `[693]に 0.973→0.728`。⭐ **S148 那次盲测里用户听到「破音」的那一格正是 `low_ratio`
+/// 0.388 → 0.628** ⇒ 这批音是在**反方向跨过同一条带,而且跨得更多**。
+/// ⇒ **耳朵与这条线上最有背书的那把尺子指同一个方向**,而它们都不同意我那条「缝的代价」。
+///
+/// ⇒ ⭐ **默认 = 只裁尾**(S158d 翻回来)。旋钮 `UTAI_RANGE_TRIM=0` 仍能渲旧臂。
+/// ⛔ **头裁仍然关**:S151 盲测判负,而 S158 的边界尺子在两份谱上也读出它更贵
+/// (原 key 头缝台阶 p50 1.019 / p90 7.257,尾缝 3.023 / 3.609 —— p90 差 2 倍)。
+///
+/// ## ⚠ 那把边界尺子没有作废,但它的**结论口径**要写清楚
+///
+/// `TESTING\s158_knives\seam158.py` 量到的是**真的**:这一刀确实把窗边从休止搬进乐句中间,
+/// 并在那里留下几 dB 的电平/谱台阶(而 base 与 donor 只共用一个**全曲**归一标量,
+/// S147 笔1 ⇒ 局部本来就能差几 dB)。它**不能**回答那一下听不听得出来。
+/// ⭐⭐ 而这一轮顺带给了这条轴**第一个可闻性刻度**:
+/// **落在音符边界上的 3.0 dB 电平台阶 + 7.9 dB 谱跳变,用户专门去听也听不出来。**
+/// ⇒ 将来做「拆句」时,这个刻度是可以用的 —— 但要注意拆句的边**不一定落在音符边界上**。
 /// The env parse as a pure function, so it can be asserted without touching process state
 /// (reading the real environment in a test both races the other tests and passes SILENTLY on a
 /// machine where someone exported the variable — S150 paid for that lesson on `parse_phase_lock`).
@@ -842,7 +882,7 @@ const LANDING_DEFAULT: Option<i64> = Some(3);
 /// **标签跟的是音频不是场次**,撤完之后输出与 s157a 逐位相同。
 /// ⛔ 开着它渲:`UTAI_RANGE_TRIM=1`,同一个二进制。
 /// ⚠ 只影响**谱面轨**:`cover_dead_plan`(音频轨/audition)是另一份分组逻辑,里面没有裁剪。
-const TRIM_DEFAULT: Option<(f32, f32)> = None;
+const TRIM_DEFAULT: Option<(f32, f32)> = Some((TRIM_HEAD_MS, TRIM_TAIL_MS));
 /// ⛔⛔ **头裁已被盲测判负 —— 这个值是「关」,不是一个门限。**
 ///
 /// S151 r1(5 组 × 2 文件,`level_match: none`,两个对照都答对):
@@ -3281,14 +3321,15 @@ mod tests {
             dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::new(None, land));
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 4, end: 5, shift: -6 }]);
-        // ⭐ 出厂默认今天**不卸乘客** ⇒ `today()` 必须与上面那条臂给出同一份计划。
-        let (shipped, _) =
-            dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
-        assert_eq!(shipped, plan, "出厂默认 = 不裁 ⇒ 与显式 `None` 那条臂逐字相同");
-        // ⭐ 而**旋钮开着**时它把那个尾乘客放掉,死音与落点一个字不变(这一条与默认无关)。
+        // ⭐ **旋钮开着**时它把那个尾乘客放掉,而死音与落点一个字不变。
         let (knob_on, _) =
             dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), trim_arms(Some((f32::INFINITY, 500.0))).1);
         assert_eq!(knob_on, vec![DeadGroup { start: 4, end: 4, shift: -6 }]);
+        // ⭐ 而出厂默认(S158d 起 = 只裁尾)必须**就是**那一档 —— 这一行是「默认往哪边」的判据,
+        //    上面那一行是「这一刀做什么」的判据,两件事分开钉。
+        let (shipped, _) =
+            dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
+        assert_eq!(shipped, knob_on, "出厂默认 = 只裁尾 ⇒ 与显式开着那条臂逐字相同");
     }
 
     #[test]
@@ -3858,10 +3899,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=None landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
+            "trim=Some((inf, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s157a";
+        const TAG: &str = "s158a";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -4001,22 +4042,24 @@ mod tests {
         );
     }
 
-    /// 旋钮本身:**默认关**(S158 翻过又撤了 —— 理由在 [`TRIM_DEFAULT`]),而且解析是纯函数
-    /// (测试里读进程环境既会被并行污染,又会在别人 export 了变量时**静默通过** ——
-    /// S150 在 `parse_phase_lock` 上付过学费)。
+    /// 旋钮本身:**默认开 = 只裁尾**(S158d;当中翻过、撤过、又翻回来,全过程在
+    /// [`TRIM_DEFAULT`] 的 doc 里),而且解析是纯函数(测试里读进程环境既会被并行污染,
+    /// 又会在别人 export 了变量时**静默通过** —— S150 在 `parse_phase_lock` 上付过学费)。
     #[test]
-    fn the_passenger_trim_is_off_by_default_and_the_knob_parses() {
+    fn the_passenger_trim_is_tail_only_by_default_and_the_knob_parses() {
         // ⛔ 边界写**字面量**:原来写的 `assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS))` 是
         //    「常量等于自己」⇒ 把 500 改成 100 或 3000 都不会红(S158 盘点时点名的空判据)。
         assert_eq!(parse_trim(Some("1")), Some((f32::INFINITY, 500.0)), "`1` 档 = 不裁头 / 尾 500 ms");
-        assert!(parse_trim(None).is_none(), "默认必须是不卸乘客那条臂(逐位不变)");
-        assert!(parse_trim(Some("")).is_none());
-        assert!(parse_trim(Some("0")).is_none(), "显式关得掉");
-        // ⛔ 默认**关**的时候,垃圾往「关」倒是对的 —— 不许静默打开一个没验过的臂。
-        //    ⚠ 哪天真的翻了默认,这一族必须跟着翻方向(S155 在 `parse_infrasonic_hp` 上踩过);
-        //    S158 翻默认时改过一次,撤默认时又改回来 —— **这两次都必须是有意的**。
+        assert_eq!(parse_trim(None), parse_trim(Some("1")), "⭐ 默认必须**就是**出厂那一档");
+        assert_eq!(parse_trim(Some("")), parse_trim(Some("1")));
+        assert!(parse_trim(Some("0")).is_none(), "显式关得掉 —— 抱怨时要能用同一个二进制渲旧臂");
+        // ⛔⛔ 默认**开**之后,「垃圾往哪边倒」必须跟着翻:默认关的年代「垃圾 ⇒ 关」是对的
+        //    (不许静默打开一个没验过的臂);默认开之后同一行变成「垃圾 ⇒ **静默关掉**一条
+        //    已上线的修法」,而用户拿到的是一条他没要的旧臂,且没有任何一行输出会说破。
+        //    (S155 在 `parse_infrasonic_hp` 上原样踩过。)
         for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
-            assert!(parse_trim(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认,不是静默乱开");
+            assert_eq!(parse_trim(Some(junk)), parse_trim(Some("1")),
+                       "垃圾 {junk} 必须回落到**默认**,不是静默关掉");
         }
         assert_eq!(parse_trim(Some("800:300")), Some((800.0, 300.0)), "扫参数用");
         assert_eq!(parse_trim(Some(" 800 : 300 ")), Some((800.0, 300.0)));
