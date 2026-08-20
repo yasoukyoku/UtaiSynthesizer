@@ -4373,12 +4373,21 @@ mod tests {
             d.env_dev_p50_db,
             if envfix > 0.0 { format!(" -> {:.3} dB", d.env_dev_after_db) } else { String::new() }
         );
+        // S157 —— ⛔ **`src_uncovered_frac` 以前不在这行里**,而它是 `vocal_range.rs` 的
+        //   `LANDING_RATIO_TWO_ST = 12` **唯一引用的读数**,那条 doc 还写着
+        //   "measured on the real mark train"。⇒ 一个承重常数的证据,在唯一一条跑真素材的
+        //   探针上**读不出来** —— 那等于它的出处今天没有人复现得了。
+        //   ⚠ 仓里另一条断言(`the_production_default_arm_is_actually_what_runs`)读的是
+        //   **合成脉冲串**,与那张表换了两个变量,不能互相顶替。
         println!(
             "psola_probe: {} samples @{} Hz, {st:+} st, f0 frames {} hop {hop}\n  \
              islands {} marks {} cola_gap {:.1}% w_median {:.3} wsola {wsola} moved {} \
-             lock {lock} moved {}",
+             lock {lock} moved {}\n  \
+             src_uncovered {:.4}% (ratio {:.4})",
             x.len(), spec.sample_rate, f0.len(), d.islands, d.marks,
-            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved, d.marks_locked
+            d.cola_gap_frac * 100.0, d.cola_w_median, d.wsola_moved, d.marks_locked,
+            d.src_uncovered_frac * 100.0,
+            2f64.powf(st / 12.0)
         );
         assert_eq!(y.len(), x.len(), "exact-length contract");
 
