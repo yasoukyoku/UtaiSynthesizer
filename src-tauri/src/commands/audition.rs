@@ -377,7 +377,7 @@ fn audition_cache_tag(range: &Option<crate::inference::vocal_range::SpeakerRange
             // and accepted cost of a version term (unlike the recurring mis-scoping the header
             // above was written to stop, this fires exactly once per engine change).
             format!(
-                "_s158a_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
+                "_s158b_ru{:.0}-{:.0}c{:.0}-{:.0}d{:x}",
                 r.usable.0, r.usable.1, r.comfort.0, r.comfort.1, h
             )
         }

@@ -2246,8 +2246,12 @@ mod tests {
         );
 
         // The pre-fix input, for contrast: the same score with the drawn pitch left in place.
+        // ⛔⛔ S158f:这条臂原来写的是 `RescueTuning::today()` —— **对比的两条臂用了不同的旋钮**,
+        //    于是「静音的画笔音高会不会把两句焊成一句」这个对比,可以被一个**无关的默认**抹掉:
+        //    头裁一开,焊进来的那个乘客当场被裁掉,两条臂给出**逐字相同**的计划,断言当场红。
+        //    ⇒ 两条臂必须同旋钮,自变量只许是 `nn` 与 `raw`(这一族第三次踩同一个病)。
         let raw: Vec<i64> = score.iter().map(|n| n.note_num).collect();
-        let (welded, _) = dead_only_plan_with(&raw, &[50; 3], 0, &range, RescueTuning::today());
+        let (welded, _) = dead_only_plan_with(&raw, &[50; 3], 0, &range, RescueTuning::new(None, None));
         assert_ne!(plan, welded, "reading a silence's drawn pitch changes the range decision");
         assert!(
             welded.first().is_none_or(|g| g.start == 0),

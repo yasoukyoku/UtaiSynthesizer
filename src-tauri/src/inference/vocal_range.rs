@@ -684,7 +684,7 @@ pub fn dead_only_plan_with(
     (out, unfixable)
 }
 
-/// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = **只裁尾**(S158d;`=0` 渲旧臂)
+/// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = **头尾都裁 500 ms**(S158f;`=0` 渲旧臂)
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
 /// **S158 起这是出厂默认(只裁尾)**;`UTAI_RANGE_TRIM=0` 关(渲旧臂)· `=1` 用下面两个常量 ·
 /// `=<head_ms>:<tail_ms>` 扫参数。
@@ -884,19 +884,27 @@ const LANDING_DEFAULT: Option<i64> = Some(3);
 /// ⛔ 开着它渲:`UTAI_RANGE_TRIM=1`,同一个二进制。
 /// ⚠ 只影响**谱面轨**:`cover_dead_plan`(音频轨/audition)是另一份分组逻辑,里面没有裁剪。
 const TRIM_DEFAULT: Option<(f32, f32)> = Some((TRIM_HEAD_MS, TRIM_TAIL_MS));
-/// ⛔⛔ **头裁已被盲测判负 —— 这个值是「关」,不是一个门限。**
+/// ⭐ **S158f 起头裁也开着(500 ms)。**这个值在 S151-S158e 之间一直是 `f32::INFINITY`
+/// (= 关),下面是它被关掉、又被打开的完整理由 —— 两边都留着,因为它们**都是真的**。
 ///
-/// S151 r1(5 组 × 2 文件,`level_match: none`,两个对照都答对):
+/// ## 关掉它的那次(S151 r1,5 组 × 2 文件,`level_match: none`,两个对照都答对)
 /// * `[685..=693]` **尾裁**,放掉 2.56 s ⇒ 用户选**改动版** ✅
 /// * `[796..=802]` **头裁**,放掉 4.36 s(全曲最大的一刀)⇒ 用户选**今天** ❌
 /// * `[612..=624]` **头裁**,放掉 3.44 s ⇒ 「区别不是很大」⚪
+/// ⚠ **每侧只有 1 个数据点**,纯掷硬币 p = 0.5 —— 当时就写着「这是机理 + 一个同向数据点,
+/// 不是判决」。而它当时靠的那条机理(「8 倍,因为 10 ms 淡入压在**起音**上」)
+/// **已经被 S158b 证伪**:护栏把淡入挪到被卸乘客身上并不改变代价,见 [`parse_trim`]。
 ///
-/// 三组按**裁哪一侧**干净地分开,而这正好压在 S148 独立量到的缝代价上:裁头的缝 Δripple
-/// p50 **0.258** / p90 **1.452** dB,裁尾 **0.033** / **0.407**(同处地板 0.060)—— **8 倍**,
-/// 因为 10 ms 淡入压在**起音**上。⚠ 每侧只有 1 个数据点 ⇒ 这是「机理 + 一个同向数据点」,
-/// 不是判决;要复活头裁,举证责任是**一次通过的盲测**,不是把这个数调小。
-/// (想扫参数仍然可以:`UTAI_RANGE_TRIM=<head_ms>:<tail_ms>`。)
-const TRIM_HEAD_MS: f32 = f32::INFINITY;
+/// ## 打开它的那次(S158f,用户听完 `TESTING\s158_knivesu_s158k0_头尾都裁.wav`)
+/// > 「我是没听出来什么区别来,或者至少『头尾都裁』应该是没让它变坏,
+/// >   而换来的更多能卸掉的那应该是收益」
+/// 边界尺子在**原 key** 上读到的也同向:头边电平台阶 p50 **1.019** dB,而尾边是 **3.023**
+/// ——**中位数上头边反而更便宜**,只有最坏那几条更贵(p90 7.257 vs 3.609)。
+/// 账:原 key 上头乘客是最大的一块(**76 个 / 20.36 s**),而只裁尾只够得到 26 个。
+///
+/// ⚠ 仍然登记着的风险:p90 那几条(−8/−9/−7 的深位移头刀)只过了一次耳朵,没有单独承重。
+/// 想关回去:`UTAI_RANGE_TRIM=inf:500` 或直接 `=0`。
+const TRIM_HEAD_MS: f32 = 500.0;
 const TRIM_TAIL_MS: f32 = 500.0;
 
 /// THE single landing search for both tracks (score phrases / cover regions): the minimal |s|
@@ -3948,10 +3956,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=Some((inf, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s158a";
+        const TAG: &str = "s158b";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -4075,30 +4083,31 @@ mod tests {
         }
     }
 
-    /// ⛔ 盲测把**头裁**判负(见 `TRIM_HEAD_MS`)⇒ 出厂那一档必须**只裁尾**。
-    /// 这条判据钉的是「`=1` 到底给出什么」,不是常量等于常量:它构造一个头尾都够本的乐句,
-    /// 断言出厂档**只切了尾巴**。
+    /// 出厂那一档到底给出什么(⚠ **不是**常量等于常量):构造一个头尾都够本的乐句,
+    /// 断言它**两侧都切**。⭐ S158f 之前这条叫 `the_shipped_trim_only_ever_cuts_the_tail`,
+    /// 期望是 `{1, 4}`(只切尾)—— 用户听完 `04_头尾都裁` 之后头裁也翻开了,理由在 `TRIM_HEAD_MS`。
     #[test]
-    fn the_shipped_trim_only_ever_cuts_the_tail() {
+    fn the_shipped_trim_cuts_both_sides() {
         let on = parse_trim(Some("1")).expect("`1` = 出厂那一档");
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 100, 100, 100, 40, 100, 100, 10]; // 头 6.0 s、尾 4.0 s,都远超任何门限
         let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), trim_arms(Some(on)).1);
         assert_eq!(
             plan,
-            vec![DeadGroup { start: 1, end: 4, shift: -6 }],
-            "出厂档:尾巴放掉、组头一个音不许动(头裁的缝贵 8 倍,而且盲测输了)"
+            vec![DeadGroup { start: 4, end: 4, shift: -6 }],
+            "出厂档:两侧的乘客都放掉,只留死音本身"
         );
     }
 
-    /// 旋钮本身:**默认开 = 只裁尾**(S158d;当中翻过、撤过、又翻回来,全过程在
-    /// [`TRIM_DEFAULT`] 的 doc 里),而且解析是纯函数(测试里读进程环境既会被并行污染,
-    /// 又会在别人 export 了变量时**静默通过** —— S150 在 `parse_phase_lock` 上付过学费)。
+    /// 旋钮本身:**默认开 = 头尾都裁 500 ms**(S158f;当中翻过、撤过、又翻回来、再放开头裁,
+    /// 全过程在 [`TRIM_DEFAULT`] 与 [`TRIM_HEAD_MS`] 的 doc 里),而且解析是纯函数
+    /// (测试里读进程环境既会被并行污染,又会在别人 export 了变量时**静默通过** ——
+    /// S150 在 `parse_phase_lock` 上付过学费)。
     #[test]
-    fn the_passenger_trim_is_tail_only_by_default_and_the_knob_parses() {
+    fn the_passenger_trim_is_on_by_default_and_the_knob_parses() {
         // ⛔ 边界写**字面量**:原来写的 `assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS))` 是
         //    「常量等于自己」⇒ 把 500 改成 100 或 3000 都不会红(S158 盘点时点名的空判据)。
-        assert_eq!(parse_trim(Some("1")), Some((f32::INFINITY, 500.0)), "`1` 档 = 不裁头 / 尾 500 ms");
+        assert_eq!(parse_trim(Some("1")), Some((500.0, 500.0)), "`1` 档 = 头 500 / 尾 500 ms");
         assert_eq!(parse_trim(None), parse_trim(Some("1")), "⭐ 默认必须**就是**出厂那一档");
         assert_eq!(parse_trim(Some("")), parse_trim(Some("1")));
         assert!(parse_trim(Some("0")).is_none(), "显式关得掉 —— 抱怨时要能用同一个二进制渲旧臂");

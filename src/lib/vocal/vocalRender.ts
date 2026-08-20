@@ -663,7 +663,7 @@ export function resolveTrackVoice(track: Track): { name: string; path: string } 
  *  20.3 ms) while 60 merges 2 and 100 collapses 96 → 43; residual un-shifted leak at the worst
  *  annotated note 14.7 % → 2.8 % (30) → 0.2 % (60), i.e. 30 removes ~80 % of it for none of the
  *  risk. Audition tag bumps in lockstep (_s154a_). */
-export const RANGE_ALGO_VERSION = "s158a";
+export const RANGE_ALGO_VERSION = "s158b";
 
 /** Version of the LYRIC → PHONE layer (g2p.rs / score2cv.rs). Bump it whenever the phones a given
  *  lyric resolves to change — otherwise every already-baked segment keeps its OLD audio forever and

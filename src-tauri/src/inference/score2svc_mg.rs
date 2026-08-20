@@ -1472,6 +1472,19 @@ fn mg_dump_plan_arms() {
     let today = RescueTuning::today();
     // (标签, trim) —— landing 一律用今天出厂的那个,这一台扫的是**卸乘客**那一维。
     let inf = f32::INFINITY;
+    // ⭐ S158f:先扫**落点**那一维 —— donor 遍数 = 1 + distinct shift 数,而渲染时间几乎
+    // 全在遍数上(S147 秒表:99% 在两张 ONNX 图里,CPU 侧只有 1.1%)。翻落点默认有没有
+    // 让遍数变多,是一条**能静默发生的速度退化**,必须有地方读得出来。
+    for (label, land) in [("落点关(S157c 之前)", None), ("落点=1", Some(1)), ("落点=3(今天)", Some(3))] {
+        for (t, trim) in [("trim 关", None), ("trim 今天", today.trim)] {
+            let (plan, _) = dead_only_plan_with(&nn, &fr, transpose, &range,
+                                                RescueTuning::new(trim, land));
+            let sh: std::collections::BTreeSet<i64> = plan.iter().map(|g| g.shift).collect();
+            eprintln!("[pass] {label:<18} {t:<10} {} 组 · {} 个不同位移 ⇒ **donor 遍数 = {}**",
+                      plan.len(), sh.len(), 1 + sh.len());
+        }
+    }
+
     let arms: Vec<(String, Option<(f32, f32)>)> = {
         // ⛔ S158:**「trim 关」这条臂必须永远在表里**,而且要写死 `None` ——
         // 不能靠「今天(出厂)」当基线。翻默认那一秒基线就从台子上消失了(实测:S158 翻完
