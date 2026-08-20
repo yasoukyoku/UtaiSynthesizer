@@ -1473,8 +1473,14 @@ fn mg_dump_plan_arms() {
     // (标签, trim) —— landing 一律用今天出厂的那个,这一台扫的是**卸乘客**那一维。
     let inf = f32::INFINITY;
     let arms: Vec<(String, Option<(f32, f32)>)> = {
-        let mut v: Vec<(String, Option<(f32, f32)>)> =
-            vec![("今天(出厂)".to_string(), today.trim)];
+        // ⛔ S158:**「trim 关」这条臂必须永远在表里**,而且要写死 `None` ——
+        // 不能靠「今天(出厂)」当基线。翻默认那一秒基线就从台子上消失了(实测:S158 翻完
+        // `TRIM_DEFAULT` 之后,13 条臂里再也读不出「一个都不卸」是多少个音),
+        // 而「卸掉了几个」这个数**只有相对基线才有意义**。
+        let mut v: Vec<(String, Option<(f32, f32)>)> = vec![
+            ("⑴ trim 关(基线)".to_string(), None),
+            ("⑵ 今天(出厂)".to_string(), today.trim),
+        ];
         for t in [0.0f32, 250.0, 500.0, 750.0, 1000.0, 1500.0] {
             v.push((format!("只裁尾 {t:.0}ms"), Some((inf, t))));
             v.push((format!("头尾都裁 {t:.0}ms"), Some((t, t))));
