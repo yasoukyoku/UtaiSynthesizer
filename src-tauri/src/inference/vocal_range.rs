@@ -1271,6 +1271,22 @@ fn merge_same_shift_across_rests(
         let mergeable = match (out.last(), prev_end_note) {
             (Some(last), Some(pe)) => {
                 last.shift == j.shift
+                    // ⛔⛔ S158 —— **先证明这一对在音符序上真的是「前一组之后」的。**
+                    // 少了它,非升序的计划会让下面两条守卫**同时**退化成恒真:`g.start <= pe`
+                    // 时 `((pe + 1)..g.start)` 是**空区间**而空区间的 `.all()` 是 `true`
+                    // (于是「中间只隔休止」通过了,尽管中间隔着前面一整段歌),同时
+                    // `j.start - last.end` 变成**负数**而永远 ≤ 上限 ⇒ 合并发生,
+                    // 而 `last.end = j.end.max(last.end)` 把这一条救援**整个丢掉**。
+                    // S157 实测:计划 `[(685,693,-12),(174,184,-12)]` 会让 `174..184` 消失,
+                    // 而组数日志、`plan.json`、单测**全绿**。
+                    //
+                    // ⚠ 今天的唯一生产者 `dead_only_plan_with` 由构造升序 ⇒ 这一条**逐位不改
+                    // 今天的输出**;它挡的是下一个 planner(裁剪/拆句会重排组)。
+                    // ⛔ 只加这一条,**不许**再加「窗不许重叠」:乐句**内部**拆出来的相邻两组,
+                    // 窗由构造就是重叠的(护栏从同一条边界向两侧各伸 `GUARD_FRAMES`),而
+                    // 「同位移拆分被这里重新合并成逐位相同的窗」正是拆句那把刀现成的阴性对照。
+                    // 判据:`merging_never_deletes_a_rescue_*` 的第三段。
+                    && g.start > pe
                     && ((pe + 1)..g.start).all(|k| note_nums.get(k).copied().unwrap_or(0) <= 0)
                     // ⛔ 只桥**短**休止:我修的是一个 60 ms 的洞,而不设上限时这条规则会跨过
                     // 长休止把窗撑到 18.6 s(实测),那是**把结论推到证据之外**。
@@ -1281,6 +1297,9 @@ fn merge_same_shift_across_rests(
         };
         if mergeable {
             let last = out.last_mut().expect("checked");
+            // ⚠ S158 变异实测:`.max()` 这一半**杀不掉**(去掉它整个模块 91 条全绿)——
+            // 有了上面的 `g.start > pe`,输入按音符序升序,而窗随音符序单调 ⇒ `j.end >= last.end`
+            // 由构造成立。留着是防御,**别把它的绿读成「被覆盖了」**。
             last.end = j.end.max(last.end);
         } else {
             out.push(j);
@@ -3781,6 +3800,84 @@ mod tests {
         // ⛔ 长休止不许桥:缺陷只有 60 ms,不设上限时窗会被撑到 18.6 s(实测)。
         let fr_long = [10i64, 20, 200, 20, 10];
         assert_eq!(dead_group_windows(&nn, &fr_long, &plan).len(), 2, "4 秒的休止不许桥");
+    }
+
+    /// ⛔⛔ S158:**这一刀在非升序的计划上会【静默吞掉一整条救援】。**
+    ///
+    /// 取证(S157 实测,`UTAI_MG_PLAN="685:693:-12,174:184:-12"`):`174..184` 那条窗
+    /// **整个消失**,而组数日志、`plan.json`、以及上面那一条单测**全绿** —— 因为它们量的
+    /// 都是「合并该不该发生」,没有一条量「合并之后还剩几条救援」。
+    ///
+    /// 机理是两条守卫**同时**在降序上退化成恒真:
+    /// * `((pe + 1)..g.start)` 在 `g.start <= pe` 时是**空区间**,而空区间的 `.all()` 是 `true`
+    ///   ⇒ 「中间只隔休止」这一条通过了,尽管中间隔着的是**前面一整段歌**;
+    /// * `j.start - last.end` 变成**负数** ⇒ 「只桥短休止」那条上限也通过了。
+    ///
+    /// ⇒ 判据钉的是**不许丢**:合并只允许发生在「按音符序真的紧邻、且窗不重叠」的一对上。
+    /// ⚠ 今天的唯一生产者 [`dead_only_plan_with`] 由构造升序不重叠 ⇒ 这条修法**逐位不改**
+    /// 今天的输出;它挡的是**下一个 planner**(裁剪/拆句会重排组)。
+    #[test]
+    fn merging_never_deletes_a_rescue_whatever_order_the_plan_arrives_in() {
+        let nn = [0, 85, 0, 85, 0];
+        let fr = [10i64, 20, 3, 20, 10];
+        let asc = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 3, end: 3, shift: -6 },
+        ];
+        // 升序:这两条**本来就该**合并成一条 —— 上面那条测试钉的就是它,这里只取它的窗。
+        let merged = dead_group_windows(&nn, &fr, &asc);
+        assert_eq!(merged, vec![DeadJob { shift: -6, start: 6, end: 55 }]);
+
+        // ⭐ 同一批组,**降序**喂进来。两段音频还在原处,所以救援也必须还是两条。
+        let desc = [
+            DeadGroup { start: 3, end: 3, shift: -6 },
+            DeadGroup { start: 1, end: 1, shift: -6 },
+        ];
+        let got = dead_group_windows(&nn, &fr, &desc);
+        assert_eq!(
+            got.len(),
+            2,
+            "降序输入把一条救援吞掉了 —— 每条组都必须在输出里留下自己的窗(拿到的是 {got:?})"
+        );
+        let mut spans: Vec<(i64, i64)> = got.iter().map(|j| (j.start, j.end)).collect();
+        spans.sort();
+        assert_eq!(
+            spans,
+            vec![(6, 31), (32, 55)],
+            "两条窗必须各自还在原来的位置上(合并只许发生在真正紧邻的一对上)"
+        );
+
+        // ⛔ 阴性对照 ①:**位移不同**的降序对同样不许合并 —— 这一条今天就是对的,
+        //    它在这里是为了证明上面那条红不是「降序一律不合并」这句话本身造出来的。
+        let desc2 = [
+            DeadGroup { start: 3, end: 3, shift: -6 },
+            DeadGroup { start: 1, end: 1, shift: -7 },
+        ];
+        assert_eq!(dead_group_windows(&nn, &fr, &desc2).len(), 2);
+
+        // ⭐⭐ 阴性对照 ②(**下一把刀的地基,别拆**):乐句**内部**同位移拆开的两组,
+        // 必须被这里重新合并成**与不拆时逐位相同**的那一个窗。
+        // 机理:两组之间没有休止 ⇒ 前一组的 `post` 与后一组的 `pre` 从**同一条边界**
+        // 向两侧各伸 `GUARD_FRAMES` ⇒ 两个窗**由构造重叠** ⇒ 任何「窗不许重叠」式的
+        // 守卫都会在这里把它们劈开,凭空造出一条本来不存在的缝。
+        // ⇒ 拆句那条线因此有一条**按构造的阴性对照**:同位移拆分的臂必须与今天逐样本相同。
+        let nn_in = [0, 85, 85, 0];
+        let fr_in = [10i64, 20, 20, 10];
+        let whole = [DeadGroup { start: 1, end: 2, shift: -6 }];
+        let split = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 2, end: 2, shift: -6 },
+        ];
+        assert_eq!(
+            dead_group_windows(&nn_in, &fr_in, &split),
+            dead_group_windows(&nn_in, &fr_in, &whole),
+            "同位移拆分必须重新合并成与不拆时逐位相同的窗"
+        );
+        assert_eq!(
+            dead_group_windows(&nn_in, &fr_in, &whole),
+            vec![DeadJob { shift: -6, start: 6, end: 52 }],
+            "⛔ 期望值写字面量:拿被测函数自己算期望值 = 恒真"
+        );
     }
 
     #[test]
