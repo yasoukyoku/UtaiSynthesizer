@@ -810,7 +810,8 @@ pub fn dead_only_plan_with(
 /// 并在那里留下几 dB 的电平/谱台阶(而 base 与 donor 只共用一个**全曲**归一标量,
 /// S147 笔1 ⇒ 局部本来就能差几 dB)。它**不能**回答那一下听不听得出来。
 /// ⭐⭐ 而这一轮顺带给了这条轴**第一个可闻性刻度**:
-/// **落在音符边界上的 3.0 dB 电平台阶 + 7.9 dB 谱跳变,用户专门去听也听不出来。**
+/// **落在音符边界上的 3.0 dB 电平台阶 + 7.9 dB 谱跳变:用户仔细找**能在频谱上看到它**,
+/// 但听感上「不奇怪到可以忽略」。**⇒ 刻度是「可忽略」,不是「不存在」——别把它记成后者。
 /// ⇒ 将来做「拆句」时,这个刻度是可以用的 —— 但要注意拆句的边**不一定落在音符边界上**。
 /// The env parse as a pure function, so it can be asserted without touching process state
 /// (reading the real environment in a test both races the other tests and passes SILENTLY on a
@@ -3579,6 +3580,54 @@ mod tests {
         let (a, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::new(None, None));
         let (b, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::new(None, Some(3)));
         assert_eq!(a, b, "没有 low_ratio 可排时,这一刀必须什么也不做");
+    }
+
+    /// ⛔⛔ S158d —— **cover / audition 那一轨拿不到谱面轨的旋钮,而这件事到今天为止
+    /// 没有任何判据钉着。**S157c 翻了 `LANDING_DEFAULT`、S158d 翻了 `TRIM_DEFAULT`,
+    /// **两次都只到了谱面轨**:`cover_dead_plan` 里没有裁剪那一段,`landing` 也是硬传 `None`。
+    /// ⇒ 用户在音频轨/试听上听到的救援,与谱面轨渲出来的**已经是两条不同的规则**,
+    /// 而没有一行输出说破。
+    ///
+    /// ⭐ 顺带写清楚一件容易读反的事:**cover 轨从来就只覆盖死音区间本身**
+    /// (按死帧成区 + `GAP_TOL_MS` 桥接),它**根本不拖乘客** —— 也就是说它一直是
+    /// 「头尾都裁」的。S158d 这一刀是让**谱面轨往它那边走了半步**(只裁尾)。
+    ///
+    /// ⛔ 这条判据**不主张「应该接上」** —— 那是另一笔要单独定价的账(cover 的素材、
+    /// 判据、以及「一整段音频而不是一个乐句」这个前提都不一样)。它只要求这件事
+    /// **是有意的、而且被写下来了**:先用阳性对照证明旋钮在谱面轨上真的咬人,
+    /// 再钉住 cover 轨给的是**旋钮之前**那个答案。哪天有人把它接上,这条会红,
+    /// 而那时候红的是「你改了一条用户听得见的规则」,不是「测试碍事」。
+    #[test]
+    fn the_cover_lane_deliberately_does_not_get_the_score_lane_knobs() {
+        let r = akiko_like();
+        let fr = secs(3);
+        // ⓐ 阳性对照:同一个死音,`landing` 在**谱面轨**上必须真的换落点。
+        //    (没有这一条,下面那条断言可能只是「这个夹具上旋钮本来就不咬人」。)
+        let (off, _) = dead_only_plan_with(&[0, 80, 0], &fr, 0, &r, RescueTuning::new(None, None));
+        let (on, _) = dead_only_plan_with(&[0, 80, 0], &fr, 0, &r, RescueTuning::today());
+        assert_eq!(off[0].shift, -2, "旋钮之前:预算 +1 ⇒ 停在 78");
+        assert_eq!(on[0].shift, -4, "阳性对照:出厂默认在谱面轨上把它带到 76");
+        // ⓑ 而 cover 轨对同一个音高给出的是**旋钮之前**那个答案。
+        let f0 = vec![hz(80.0); 200]; // 2 s @ 100 fps,远超 MIN_VIOLATION_MS
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &r);
+        assert!(unfix.is_empty());
+        assert_eq!(jobs.len(), 1, "一整段 80 应当成一个区域");
+        assert_eq!(
+            jobs[0].shift, -2,
+            "cover 轨拿不到 LANDING_DEFAULT —— 若这里变成 -4,说明有人把谱面轨的旋钮接到了              音频轨上,那是用户听得见的改动,必须是有意的并且要单独定价"
+        );
+        // ⓒ 而「裁剪」在 cover 轨上**结构性地不存在**:它覆盖的就是死音区间本身。
+        //    这里用一段「前后都是唱得动的材料、中间一段死音」来钉住这个形状。
+        let mut f0b = vec![hz(60.0); 200];
+        f0b.extend(vec![hz(80.0); 200]);
+        f0b.extend(vec![hz(60.0); 200]);
+        let (jobs2, _) = cover_dead_plan(&f0b, 100.0, &r);
+        assert_eq!(jobs2.len(), 1);
+        assert!(
+            jobs2[0].start >= 195 && jobs2[0].end <= 405,
+            "cover 轨只覆盖死音那一段(拿到的是 {:?})—— 它没有乘客可卸,             所以 `TRIM_DEFAULT` 对它是空操作",
+            (jobs2[0].start, jobs2[0].end)
+        );
     }
 
     /// 与卸乘客同一条定义域:它只决定**落在哪**,不许改**哪些音被救**。
