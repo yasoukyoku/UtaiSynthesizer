@@ -826,8 +826,16 @@ fn analysis_marks(
 ///
 /// `frac_transport` = carry that residual with a windowed-sinc read instead of dropping it.
 ///
-/// ⛔⛔ **BLIND TEST SAYS NO (2026-08-16). Leave it OFF and do not reopen this without new
-/// material.** Three packages, **7 load-bearing pairs + 3 blank controls**, level-matched to
+/// ⚠⚠ **S157c 把它翻成了生产默认 `true`(`vocal_range.rs` 的 `FRAC_TRANSPORT_DEFAULT`)。**
+/// 下面这段是 2026-08-16 写的,**每一个字都仍然成立**,只是它覆盖不到重开的那条轴:
+/// 它测的是 **~1 dB 的 ΔHNR**、在**窄读窗 + 浅位移**的年代;而 S157c 量的是
+/// **基频附近的谐波间噪声**上的 **10-16 dB**、在 **ratio 2.2449 + 宽读窗**上,
+/// 而且用户先用眼睛报了症状(根因 = 颗粒被放在整数样本上,而 `T_src = 66.89` 不是整数)。
+/// ⇒ ⭐ 重开一条判过负的刀,要证明的是**「这一次不在那次的覆盖面里」**,
+/// 不是「那次判错了」 —— 把一条真实的负结果说成「记错了」是最差的重开理由。
+///
+/// ⛔⛔ **BLIND TEST SAID NO (2026-08-16) —— 对它测过的那条轴,这条结论至今没被推翻。**
+/// Three packages, **7 load-bearing pairs + 3 blank controls**, level-matched to
 /// ±0.000 dB, both arms fed the SAME rendered wav: the user could not tell them apart anywhere —
 /// 东雪莲 at +6, akiko at +7, and the two spots they had themselves named as still-improvable
 /// (bars 169 「たらああ」 at −7, the deepest shift in the song, and bars 189-192 「いだあああ」).

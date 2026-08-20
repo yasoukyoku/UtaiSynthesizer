@@ -508,8 +508,10 @@ pub struct DeadGroup {
 /// "handled" (审查 S85: positions, not just a count — cover 侧富审计的对等物).
 ///
 /// `frames` is the per-triple duration on the score's 50 fps grid (same slice the splicer's
-/// `dead_group_windows` reads) — it exists only for [`trim_freed_ms`], which needs to know how
-/// much sung material a cut would actually free.
+/// `dead_group_windows` reads) — it exists only for the trim block inside
+/// [`dead_only_plan_with`](the `ms(..)` closure), which needs to know how much sung material a
+/// cut would actually free. ⚠ S158:这里原来指向一个叫 `trim_freed_ms` 的函数,**全仓没有**
+/// —— doc 指向一个不存在的符号,读的人只会以为是自己没找到。
 pub fn dead_only_plan(
     note_nums: &[i64],
     frames: &[i64],
@@ -682,6 +684,7 @@ pub fn dead_only_plan_with(
     (out, unfixable)
 }
 
+/// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = 只裁尾(S158 翻);`UTAI_RANGE_TRIM=0` 渲旧臂
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
 /// **S158 起这是出厂默认(只裁尾)**;`UTAI_RANGE_TRIM=0` 关(渲旧臂)· `=1` 用下面两个常量 ·
 /// `=<head_ms>:<tail_ms>` 扫参数。
@@ -761,6 +764,7 @@ fn parse_trim(v: Option<&str>) -> Option<(f32, f32)> {
     }
 }
 
+/// ⚙ 出厂默认 = Some(3) —— 落点可以往深里多看 3 个半音(S157c 翻)
 /// S151 —— `UTAI_RANGE_LANDING=<semitones>`:落点排序**可以往深里多看几个半音**。
 /// 缺省 = [`LANDING_MAX_EXTRA_DEPTH`] = 今天那条臂。
 ///
@@ -1003,7 +1007,9 @@ fn minimal_rescue_shift(
 
     // ⛔⛔ 默认臂(`landing == None`)到此为止,**与 S151 之前逐字相同**:先按
     // `worst`(死音 ∪ 乘客)取最小,再在容差内取最浅。下面 S157 那一支只有旋钮开着才走,
-    // 而 `cover_dead_plan` 硬传 `None`(见 `:1065`)⇒ **cover 轨结构上不受任何影响**。
+    // 而 `cover_dead_plan` 硬传 `None`(⚠ 别写行号:那句原来指 `:1065`,今天那个函数在 `:1190`
+    //  —— 行号引用会随着任何一次编辑变成假的,而它看起来和真的一模一样)
+    // ⇒ **cover 轨结构上不受任何影响**。
     if landing.is_none() {
         let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
         return pool
@@ -1110,8 +1116,9 @@ fn minimal_rescue_shift(
 /// 但 −14 那一档**今天本来就有 62 个音**在上面 ⇒ 这一刀不往那里新增暴露的音,
 /// 只是把已经在 −12 的一小批挪过去。⚠ 这条是**取舍**不是物理常数,重定价要拿新数据。
 ///
-/// ⚠ 它今天在生产里**不生效**:`budget` 那个 `match` 只在 `landing == Some(_)` 时读它,
-/// 而 [`LANDING_DEFAULT`] 是 `None`。翻那个默认才会把这条接上。
+/// ⚠⚠ **S157c 起它【生效了】**:`budget` 那个 `match` 只在 `landing == Some(_)` 时读它,
+/// 而 [`LANDING_DEFAULT`] 今天是 `Some(3)` ⇒ 这条护栏正在生产里封顶。
+/// (这一行以前写的是「今天不生效」,S157c 翻默认时漏改 —— S158 修。)
 ///
 /// ## ⛔⛔ S157c 更正：上面那张表是 **`FRAC` 关着**时量的，已经不描述今天这条臂
 ///
@@ -1814,6 +1821,7 @@ const JOIN_QUIET_DBFS: f32 = -50.0;
 /// 「电平台阶」与「最安静切换点」两把,它们都会把这个洞**加深**。
 const JOIN_MIN_GAIN_DB: f32 = 6.0;
 
+/// ⚙ 出厂默认 = false —— 关
 /// `UTAI_RANGE_JOIN=1` 打开「异位移短休止按音频接上」。**默认关 ⇒ 生产逐位不变。**
 /// ⛔ 翻它必须成对 bump `RANGE_ALGO_VERSION` 与 `audition_cache_tag`,而且要盲测过
 /// (S146 protocol;⚠ 改窗集合会让每条 donor 的 chunk 选择变、整条换一个相位实现,
@@ -1883,7 +1891,8 @@ pub fn inverse_engine() -> InverseEngine {
     }
 }
 
-/// S146g — carry the sub-sample transport residual instead of dropping it. **Default off.**
+/// ⚙ 出厂默认 = true —— 亚样本搬运 = 开(S157c 翻)
+/// S146g — carry the sub-sample transport residual instead of dropping it.
 ///
 /// The measurement is unambiguous (whole-sample transport discards a residual whose RMS is
 /// exactly 0 at ratio 1.0 and a flat ≈0.41 samples everywhere else — the shape of the fixed toll
@@ -1892,6 +1901,14 @@ pub fn inverse_engine() -> InverseEngine {
 /// ranks the praat gold standard BELOW two arms the user already rejected by ear, and the
 /// carrying arm reads ABOVE gold — ΔHNR > 0 means "more periodic than the input", which is what
 /// WORLD bought by collapsing unvoiced plosives. ⇒ blind test first, flip after (S146 protocol).
+///
+/// ⚠⚠ **S157c 翻成了默认 `true`,而上面那段是翻之前写的 —— 两件事都成立,别读串:**
+/// S146g 的盲测(8 对承重 + 3 个空白对照,一对都听不出)**是真的**,而且它顺带标定了
+/// 一个量级:**~1 dB 级的 ΔHNR 在这条线上不构成可闻收益**。S157c 能重开**不是因为那次判错**,
+/// 是因为【量的轴与量级都换了】:那次测 ~1 dB 的 ΔHNR、在窄读窗 + 浅位移的年代;
+/// 这次是**基频附近的谐波间噪声**上的 10-16 dB、在 ratio 2.2449 + 宽读窗上,
+/// 而且用户先用眼睛报了症状。⇒ ⭐ **「我们试过 X 输了」要连【哪条轴、多大量级、什么条件】
+/// 一起记;重开时要证明的是「这一次不在那次的覆盖面里」,不是「那次错了」。**
 pub fn frac_transport() -> bool {
     parse_frac_transport(std::env::var("UTAI_PSOLA_FRAC").ok().as_deref())
 }
@@ -1943,6 +1960,7 @@ fn parse_wsola_frac(v: Option<&str>) -> f64 {
     v.and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(0.0)
 }
 
+/// ⚙ 出厂默认 = 0.30 —— 相位锁定 = 开(S150 盲测通过之后翻)
 /// S150 — `UTAI_PSOLA_LOCK=<periods>` phase-locks the analysis marks onto the glottal pulses.
 /// **Default 0.0 = off = byte-for-byte the pre-S150 arm.**
 ///
@@ -1967,7 +1985,8 @@ fn parse_wsola_frac(v: Option<&str>) -> f64 {
 /// ⭐ The user also diagnosed *why* the un-locked engine sounded smoother than either: its
 /// scattered phase was **dithering** the seam. See `utai_dsp::psola::LOCK_BETA`.
 ///
-/// ⛔ **Why it is still off by default.** The rulers cannot promote it — that is the whole lesson
+/// ⛔ **Why the rulers alone could not promote it**(S150 之前;它已经在盲测通过之后翻成默认)。
+/// The rulers cannot promote it — that is the whole lesson
 /// of S148: WSOLA read 4.80 % → 0.38 % on the ruler it was built for and was 3/3 rejected by ear
 /// (it was manufacturing an octave-down subharmonic that the ruler counted as a repair). The
 /// audibility scale for THIS axis has exactly one data point (S148 u1: ~2.7 dB heard, ≤0.46 dB
@@ -2006,6 +2025,7 @@ fn parse_phase_lock(v: Option<&str>) -> f64 {
 /// ⚠ Still only measured on ONE model (akiko) and one song; yachiyo remains untested (S148 §7③).
 const PHASE_LOCK_DEFAULT: f64 = 0.30;
 
+/// ⚙ 出厂默认 = true —— 去次声 = 开(S155 翻)
 /// S152 — `UTAI_PSOLA_HP=0` turns OFF the removal of the infrasonic baseline TD-PSOLA
 /// manufactures. **ON by default since S155**; `UTAI_PSOLA_HP_MS=<ms>` forces a fixed width
 /// instead of the adaptive one.
@@ -2053,6 +2073,7 @@ pub fn infrasonic() -> utai_dsp::psola::Infrasonic {
     }
 }
 
+/// ⚙ 出厂默认 = 0.0 —— 0 = 用自适应宽度,不写死
 /// S155 — `UTAI_PSOLA_HP_MS=<ms>` pins the cut to a fixed width. **0 = adaptive** (the default).
 ///
 /// ⛔ It exists so an older arm can be rendered from the same binary — "the knob only goes one
@@ -2093,6 +2114,7 @@ const INFRASONIC_HP_DEFAULT: bool = true;
 /// See [`infrasonic_fixed_ms`].
 const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 
+/// ⚙ 出厂默认 = 1.0 —— 颗粒插值 = 开(S156 翻)
 /// S155 — `UTAI_PSOLA_WIN=<periods>` widens TD-PSOLA's **read window** to that many source
 /// periods per side. **0 = off = byte-for-byte the pre-S155 arm**, which reads
 /// `min(T_out, T_src)` per side, i.e. `2/ratio` source periods in total (measured per grain:
@@ -2136,7 +2158,7 @@ const INFRASONIC_MS_DEFAULT: f64 = 0.0;
 /// donor 输入自己(结构地板)−45.5 · 今天 −37.9 · **宽读窗 −33.6** · 宽读窗 + xgrain **−38.7** ·
 /// 今天 + xgrain −42.6。⇒ 宽读窗自己带来 +4.3 dB,而这个旋钮拿掉 5.1 dB。
 ///
-/// ## ⛔ 为什么它默认关
+/// ## ⛔ 它是一笔取舍(⚠ S156 已经翻成默认开 —— 下面这段是翻之前写的理由,保留)
 ///
 /// 它是**取舍**:混合相邻两颗源脉冲同时是一次「跨周期的低通」,同一组读数里
 /// 8-12 kHz 相对 300-1 kHz 的倾斜从 −1.07 变成 −1.44(≈0.4 dB 的高频损失)。
@@ -2161,6 +2183,7 @@ fn parse_xgrain(v: Option<&str>) -> f64 {
 /// ⚠ 而它的代价落在**所有**被救音上 —— 见 [`xgrain`] 的 doc 末尾那条登记。
 const XGRAIN_DEFAULT: f64 = 1.0;
 
+/// ⚙ 出厂默认 = 0 —— LP-PSOLA = 关(S157b 判负,旋钮留着)
 /// S157b —— `UTAI_PSOLA_LPC=<order>`:**LP-PSOLA** —— 颗粒搬运挪进**残差域**。
 /// `0` = 关 = 今天,逐位不变。
 ///
@@ -2200,6 +2223,11 @@ fn parse_lpc_order(v: Option<&str>) -> usize {
 /// ⛔ 见 [`lpc_order`]。翻它必须成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`。
 const LPC_ORDER_DEFAULT: usize = 0;
 
+/// ⚙ 出厂默认 = 1.0 —— 教科书宽读窗 = 开(S156 翻)
+///
+/// `UTAI_PSOLA_WIN=<周期数>` —— 颗粒**读**窗的半宽是几个**源**周期。
+/// ⛔ 显式 `0` 仍然渲得出旧臂(S156 之前那条 `2/ratio` 的窄窗)。
+/// 机理、收益与那笔电平代价见 [`WIN_PERIODS_DEFAULT`] 与 `utai_dsp::psola` 的 `win_periods`。
 pub fn win_periods() -> f64 {
     parse_win_periods(std::env::var("UTAI_PSOLA_WIN").ok().as_deref())
 }
@@ -2217,6 +2245,7 @@ fn parse_win_periods(v: Option<&str>) -> f64 {
 /// 收益与代价见 [`win_periods`] 的 doc;⛔ 显式 `UTAI_PSOLA_WIN=0` 仍然能渲出旧臂。
 const WIN_PERIODS_DEFAULT: f64 = 1.0;
 
+/// ⚙ 出厂默认 = 0.0 —— 0 = 关
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -2261,6 +2290,7 @@ fn parse_env_restore_ms(v: Option<&str>) -> f64 {
 /// must bump `RANGE_ALGO_VERSION` **and** `audition_cache_tag` in the same commit.
 const ENV_RESTORE_MS_DEFAULT: f64 = 0.0;
 
+/// ⚙ 出厂默认 = 30.0 —— 桥接清音 30 ms
 /// S154 — `UTAI_PSOLA_BRIDGE=<ms>` bridges short unvoiced gaps in the fed f0 so the voiced islands
 /// cover the whole rescued note. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -3804,6 +3834,102 @@ mod tests {
             au.contains(&format!("\"_{TAG}_ru")),
             "audition.rs 的 cache tag 没跟着 bump 到 _{TAG}_"
         );
+    }
+
+    /// ⛔⛔ S158 —— **每一个出厂默认,必须在它自己那段 doc 的【第一行】写明白。**
+    ///
+    /// 起因是一次盘点:三个已经翻过的默认,它们**常量那一侧的 doc 改对了**,而**访问函数
+    /// 那一侧的 doc 留在原地说反话** —— 而后者才是读代码的人第一眼看到的东西:
+    /// * `frac_transport()` 写着「**Default off.** … blind test first, flip after」,
+    ///   而 `FRAC_TRANSPORT_DEFAULT = true`(S157c 翻的);
+    /// * `xgrain()` 写着「## ⛔ **为什么它默认关**」,而 `XGRAIN_DEFAULT = 1.0`(S156 翻的);
+    /// * `phase_lock()` 写着「⛔ **Why it is still off by default.**」,而
+    ///   `PHASE_LOCK_DEFAULT = 0.30`(S150 翻的)。
+    /// 三次翻默认,三次同样的漏 ⇒ 这不是手滑,是**没有任何东西盯着散文**。
+    ///
+    /// ⛔ 而 `changing_a_production_default_forces_a_paired_version_bump` 结构上看不见它:
+    /// 那条钉的是**值**(指纹 + 两个版本字面量),散文改不改它都绿。
+    ///
+    /// ⇒ 这条判据要求每个 `*_DEFAULT` 的访问函数,doc 的**第一行**是
+    /// `⚙ 出厂默认 = <常量初始化式逐字>`(后面可以接人话)。它不保证下面的散文不过期,
+    /// 但它把「翻默认」和「改那段 doc」**焊在同一次编辑里**,而且把结论顶到第一行 ——
+    /// 底下万一还有陈货,读者第一眼就看得见矛盾。
+    /// ⚠ 同时它要求这张表**覆盖本文件里每一个 `*_DEFAULT`**,新加一个默认却不登记会红。
+    #[test]
+    fn every_shipped_default_is_declared_at_the_top_of_its_own_doc() {
+        const PAIRS: &[(&str, &str)] = &[
+            ("LANDING_DEFAULT", "fn parse_landing("),
+            ("TRIM_DEFAULT", "fn parse_trim("),
+            ("JOIN_RESTS_DEFAULT", "pub fn join_rests_enabled("),
+            ("FRAC_TRANSPORT_DEFAULT", "pub fn frac_transport("),
+            ("PHASE_LOCK_DEFAULT", "pub fn phase_lock("),
+            ("INFRASONIC_HP_DEFAULT", "pub fn infrasonic("),
+            ("INFRASONIC_MS_DEFAULT", "pub fn infrasonic_fixed_ms("),
+            ("XGRAIN_DEFAULT", "pub fn xgrain("),
+            ("LPC_ORDER_DEFAULT", "pub fn lpc_order("),
+            ("WIN_PERIODS_DEFAULT", "pub fn win_periods("),
+            ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
+            ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
+        ];
+        let src = include_str!("vocal_range.rs");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // ⓐ 覆盖面:本文件顶层的每一个 `const *_DEFAULT` 都必须登记在上表里。
+        let mut found: Vec<&str> = Vec::new();
+        for l in &lines {
+            if let Some(rest) = l.strip_prefix("const ") {
+                if let Some(name) = rest.split(':').next().map(str::trim) {
+                    if name.ends_with("_DEFAULT") {
+                        found.push(name);
+                    }
+                }
+            }
+        }
+        for name in &found {
+            assert!(
+                PAIRS.iter().any(|(c, _)| c == name),
+                "新加了默认 `{name}` 却没登记到 `every_shipped_default_is_declared_*` 的表里 \
+                 —— 那条默认此后没有任何东西盯着它的 doc"
+            );
+        }
+        assert_eq!(found.len(), PAIRS.len(), "表与文件里的默认数量对不上:{found:?}");
+
+        // ⓑ 逐条:doc 第一行必须逐字带上常量的初始化式。
+        for (konst, sig) in PAIRS {
+            let decl = lines
+                .iter()
+                .find(|l| l.starts_with(&format!("const {konst}")))
+                .unwrap_or_else(|| panic!("找不到 `const {konst}`"));
+            let expr = decl
+                .split_once('=')
+                .and_then(|(_, r)| r.rsplit_once(';'))
+                .map(|(v, _)| v.trim())
+                .unwrap_or_else(|| panic!("`const {konst}` 的初始化式解析不出来"));
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(sig))
+                .unwrap_or_else(|| panic!("找不到 `{sig}` —— 表里的锚点过期了"));
+            // 往上收一段连续的 doc(跳过属性行)
+            let mut top = at;
+            while top > 0 {
+                let p = lines[top - 1].trim_start();
+                if p.starts_with("///") || p.starts_with("#[") {
+                    top -= 1;
+                } else {
+                    break;
+                }
+            }
+            let first = lines[top..at]
+                .iter()
+                .find(|l| l.trim_start().starts_with("///"))
+                .unwrap_or_else(|| panic!("`{sig}` 头上一行 doc 都没有"));
+            let want = format!("/// ⚙ 出厂默认 = {expr}");
+            assert!(
+                first.trim_start().starts_with(&want),
+                "`{sig}` 的 doc 第一行必须是 `{want}`(后面可以接人话),实际是:\n  {first}\n\
+                 ⇒ 翻默认时那段 doc 没跟着改。三个已经翻过的默认都在这一处漏过(见本判据的 doc)。"
+            );
+        }
     }
 
     #[test]
