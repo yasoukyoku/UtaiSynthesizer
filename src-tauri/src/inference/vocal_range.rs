@@ -754,7 +754,7 @@ fn parse_landing(v: Option<&str>) -> Option<i64> {
 /// 上面那一片全是薄的,所以这一刀在它身上只会换来更深而换不到更干净;
 /// ⑵ 深度的代价是**真的**(S150:乘客的 4-11 kHz 非谐波 24.0 → 29.2 → 39.2 % @ 0/−3/−7)
 /// ⇒ 这一刀必须和**卸乘客**一起看,不能单独放大预算。
-const LANDING_DEFAULT: Option<i64> = None;
+const LANDING_DEFAULT: Option<i64> = Some(3);
 
 /// ⛔ Off until a blind test says otherwise — flipping this changes what every rescued phrase
 /// sounds like, so it also needs `RANGE_ALGO_VERSION` ↔ `audition_cache_tag` bumped IN PAIR
@@ -1816,8 +1816,20 @@ pub fn frac_transport() -> bool {
 /// The env parse, as a pure function so it can be asserted without touching process state
 /// (and so `the_probe_defaults_are_the_production_defaults` can read the default off it).
 fn parse_frac_transport(v: Option<&str>) -> bool {
-    matches!(v, Some("1"))
+    // ⛔⛔ S157c 翻默认时**必须同时改这里**:旧写法是 `matches!(v, Some("1"))`,任何看不懂的值
+    //    都读成 `false`。默认关的时候那是对的(垃圾不许**静默打开**一个未经验的臂),
+    //    默认开之后它变成「垃圾值**静默关掉**一个已经上线的修法」—— 用户会拿到一条自己没要求的
+    //    旧臂,而且没有任何一行输出会说破。⇒ 三分:明确开、明确关、其余一律**退回默认**。
+    //    (S155 在 `parse_infrasonic_hp` 上原样踩过一次。)
+    match v.map(str::trim) {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => FRAC_TRANSPORT_DEFAULT,
+    }
 }
+
+/// ⛔ S157c 翻成 **true**。翻它必须成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`。
+const FRAC_TRANSPORT_DEFAULT: bool = true;
 
 /// S148 — `UTAI_PSOLA_WSOLA=<frac>` turns on the source-side waveform-similarity search in
 /// `utai_dsp::psola`. **Default 0.0 = off = byte-for-byte the pre-S148 arm.**
@@ -3307,7 +3319,8 @@ mod tests {
         let nn = [0, 80, 0];
         let fr = secs(3);
         let r = akiko_like();
-        let (today, _) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
+        // ⛔ S157c:`today()` 已经翻成 `Some(3)` ⇒ 要「S151 之前那条臂」必须**显式**写。
+        let (today, _) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, None));
         assert_eq!(
             today,
             vec![DeadGroup { start: 1, end: 1, shift: -2 }],
@@ -3326,13 +3339,14 @@ mod tests {
         // 因为在那个夹具上 damage 已经把候选筛到只剩一个。要让「默认臂没被动过」这件事
         // 有判据,必须构造一个**默认预算内就有两个 damage 打平、但 low_ratio 不同**的局面:
         // 死音 79 ⇒ 落点 78(0.39)与 77(0.28),两个 damage 都是 0。
-        let (near_today, _) = dead_only_plan_with(&[0, 79, 0], &fr, 0, &r, RescueTuning::today());
+        let (near_today, _) =
+            dead_only_plan_with(&[0, 79, 0], &fr, 0, &r, RescueTuning::new(None, None));
         assert_eq!(near_today[0].shift, -1, "默认臂:damage 打平就取最浅 ⇒ 停在 78");
         let (near_on, _) = dead_only_plan_with(&[0, 79, 0], &fr, 0, &r, RescueTuning::new(None, Some(1)));
         assert_eq!(near_on[0].shift, -2, "开着:同一个预算内也要挑 low_ratio 更低的 77");
         // 阴性对照:一个 low_ratio 平坦的记录上,开与关必须给出**同一个**落点。
         let flat = dxl_like();
-        let (a, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::today());
+        let (a, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::new(None, None));
         let (b, _) = dead_only_plan_with(&[0, 85, 0], &fr, 0, &flat, RescueTuning::new(None, Some(3)));
         assert_eq!(a, b, "没有 low_ratio 可排时,这一刀必须什么也不做");
     }
@@ -3343,7 +3357,7 @@ mod tests {
         let nn = [0, 73, 80, 73, 0, 60, 0, 85, 40, 0];
         let fr = secs(nn.len());
         let r = akiko_like();
-        let (a, ua) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
+        let (a, ua) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, None));
         let (b, ub) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(None, Some(3)));
         let dead_of = |p: &[DeadGroup]| {
             let mut v: Vec<usize> = p.iter().flat_map(|g| g.start..=g.end)
@@ -3389,7 +3403,8 @@ mod tests {
         let (near, _) = dead_only_plan_with(&[0, 83, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
         assert_eq!(near[0].shift, -7, "还没到 ratio=2,那三个半音可以花");
         // 已经在线上的组(最浅 −13)⇒ 一个半音都不许多花
-        let (deep_today, _) = dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::today());
+        let (deep_today, _) =
+            dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::new(None, None));
         let (deep_on, _) = dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
         assert_eq!(deep_today[0].shift, -13, "这个音本来就要 −13 才够得着");
         assert_eq!(
@@ -3466,7 +3481,8 @@ mod tests {
         let r = pya_like();
 
         // ⑴ 默认臂 = 生产实测的那一档(用户听到的就是它):落点 78。
-        let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::today());
+        // ⛔ S157c:`today()` 已翻成 `Some(3)` ⇒ 「S151 之前那条臂」必须显式写。
+        let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, None));
         assert_eq!(
             today,
             vec![DeadGroup { start: 1, end: 9, shift: -12 }],
@@ -3623,15 +3639,64 @@ mod tests {
         assert_eq!(RescueTuning::today(), RescueTuning::new(TRIM_DEFAULT, LANDING_DEFAULT));
     }
 
+    /// ⛔⛔ S157c —— **改了生产默认却没 bump 版本,在这之前是【零红】**,
+    /// 而那不是一个错误、是用户听到一条陈缓存(S150 的原话)。
+    /// ⇒ 把「今天的生产默认」压成一个指纹字符串写死在这里,并且**同一条判据**去核对
+    /// 两个版本字面量(`RANGE_ALGO_VERSION` 在 TS 里、`audition_cache_tag` 在 Rust 里)。
+    /// 谁动了任何一个默认,这条当场红,而红的措辞直接告诉他要改哪三处。
+    ///
+    /// ⭐ 用 `include_str!` 读那两份源码 —— 与本仓已有的那几处零漂移技巧同款
+    /// (`commands/inference.rs` 读 `vocalNotes.ts`、`commands/settings.rs` 读 `Settings.tsx`)。
+    #[test]
+    fn changing_a_production_default_forces_a_paired_version_bump() {
+        let fp = format!(
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={}",
+            TRIM_DEFAULT,
+            LANDING_DEFAULT,
+            LANDING_RATIO_TWO_ST,
+            LANDING_MAX_EXTRA_DEPTH,
+            parse_frac_transport(None),
+            parse_win_periods(None),
+            parse_xgrain(None),
+            parse_lpc_order(None),
+            parse_infrasonic_hp(None),
+            parse_infrasonic_ms(None),
+            parse_env_restore_ms(None),
+            parse_bridge_unvoiced_ms(None),
+            parse_phase_lock(None),
+            DEFAULT_FORMANT_KAPPA,
+            parse_join_rests(None),
+        );
+        assert_eq!(
+            fp,
+            "trim=None landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
+            "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
+        );
+        const TAG: &str = "s157a";
+        let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
+        assert!(
+            ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
+            "vocalRender.ts 的 RANGE_ALGO_VERSION 没跟着 bump 到 {TAG}"
+        );
+        let au = include_str!("../commands/audition.rs");
+        assert!(
+            au.contains(&format!("\"_{TAG}_ru")),
+            "audition.rs 的 cache tag 没跟着 bump 到 _{TAG}_"
+        );
+    }
+
     #[test]
     fn the_landing_knob_is_off_by_default_and_parses() {
-        assert!(parse_landing(None).is_none(), "默认必须是今天那条臂");
-        assert!(parse_landing(Some("")).is_none());
+        // S157c —— **默认已经翻成 Some(3)**(整曲实测:薄区落点 30%→12%、ぴゃ 落点 78→76)。
+        assert_eq!(parse_landing(None), LANDING_DEFAULT, "空环境必须给出默认");
+        assert_eq!(LANDING_DEFAULT, Some(3), "边界写字面量,别引用被测的常量");
+        assert_eq!(parse_landing(Some("")), LANDING_DEFAULT);
         assert!(parse_landing(Some("0")).is_none(), "显式关得掉 —— 抱怨时要能用同一个二进制渲旧臂");
+        // ⛔⛔ 翻默认之后「垃圾值往哪边倒」必须跟着翻:垃圾不许**静默关掉**一个已上线的修法。
         assert_eq!(parse_landing(Some("3")), Some(3));
         assert_eq!(parse_landing(Some(" 4 ")), Some(4));
         for junk in ["x", "-1", "999", "1.5", ""] {
-            assert!(parse_landing(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认");
+            assert_eq!(parse_landing(Some(junk)), LANDING_DEFAULT, "垃圾 {junk} 必须回落到默认");
         }
     }
 

@@ -1049,7 +1049,8 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
 pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
-    ("UTAI_PSOLA_FRAC", 0.0),
+    // S157c —— 翻成默认开:整曲实测被救高音的谐波间噪声 −7.0 dB(1000-2100 Hz,地板 0.13)。
+    ("UTAI_PSOLA_FRAC", 1.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
     ("UTAI_PSOLA_LOCK", 0.30),
     ("UTAI_PSOLA_HP", 1.0),
@@ -3021,6 +3022,15 @@ mod tests {
         //   ⛔ 这一条是被变异测试逼出来的:第一版只有 ⑴⑵,而把 `PROBE_ARM_DEFAULTS` 里的
         //   `WIN` 退回 0 之后它**照样绿** —— 因为 xgrain 的第二个读点把源覆盖率灌满了
         //   (见颗粒循环里那段门限的说明)。⇒ 「默认翻了」必须逐个旋钮证,不能靠一条综合读数。
+        // S157c —— `FRAC` 也翻成默认了 ⇒ 它必须进这张「逐个旋钮单独退回」的名单,
+        //   否则「改了默认」与「改了行为」又变成两件事(S156 那条形状)。
+        let no_frac = psola_shift_env(
+            &x, sr, 14.0, 0.0, &f0t, hop, false, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"), hp,
+            g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"), g("UTAI_PSOLA_WIN"),
+            g("UTAI_PSOLA_XGRAIN"), g("UTAI_PSOLA_LPC") as usize,
+        )
+        .0;
+        assert_ne!(y14, no_frac, "把 FRAC 单独退回 0,输出没变");
         let one_off = |win: f64, xg: f64| {
             psola_shift_env(
                 &x,
@@ -3107,7 +3117,8 @@ mod tests {
         }
     }
 
-    /// S157b —— ⭐⭐⭐ **这道工序在谐波【之间】加的噪声随 ratio 单调上升,而且它是结构性的。**
+    /// S157b/c —— ⭐⭐⭐ **这道工序在谐波【之间】加的噪声随 ratio 单调上升,而且它是结构性的**
+    /// (零抖动的完美源上就成立)—— ⭐⭐ **而 `frac_transport` 把它整条压掉了,S157c 已翻成默认。**
     ///
     /// 用户 2026-08-20 在落点 78 → 76 那条臂上看见「合唱感又回来了、而且不止一条,
     /// 高阶共振峰之间也多了噪音」。归因做完之后,能站住的只有这一条 —— 而它在一个
@@ -3115,8 +3126,17 @@ mod tests {
     ///
     /// | ratio | 2.0000 | 2.1189 | 2.2449 | 2.3784 | 2.5198 |
     /// |---|---|---|---|---|---|
-    /// | 理想夹具 | +5.07 | +5.49 | **+6.28** | +7.57 | **+9.75** |
-    /// | 真 ぴゃ donor(f0 659) | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+    /// | 合成夹具,`FRAC` **关** | +15.60 | +19.25 | **+21.72** | +24.17 | **+25.83** |
+    /// | 合成夹具,`FRAC` **开** | **−4.44** | +0.01 | **+4.68** | +5.41 | +7.92 |
+    /// | 真 ぴゃ donor(f0 659),`FRAC` 关 | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+    /// | 真 ぴゃ donor,`FRAC` **开** | **−2.24** | −1.93 | **−1.24** | −0.62 | +1.46 |
+    ///
+    /// ⛔⛔ **第一版的那张表是在一个【脏夹具】上量的**(python 版把脉冲放在 `int(round(p))` 上,
+    /// 而 `T_src = 66.89` 样本 ⇒ 相邻间距在 66/67 之间跳 = **自带 ±0.5 样本抖动,正是被测的那个量**;
+    /// 它自己的谐波间噪声比 −28.60,**比真 donor 的 −39.32 还脏**)。修成亚样本放脉冲之后读 −47.84。
+    /// ⭐ 抓到它的是这条判据自己的阴性对照:`XGRAIN=0` 在严格周期源上按构造是空操作,
+    /// 却读出 +1.0 dB 的差 ⇒ 夹具不干净。**仓里的 `pulses()` 本来就是亚样本精确的**
+    /// (它的注释明写「整数对齐的夹具会让亚样本细化变得不可见」)—— 那份 wav 版没跟上。
     ///
     /// ⛔⛔ **四条假说被自己的阴性对照判死,别再重推**:
     /// ⑴ 「`f_out/p` 的梳」—— 谱自相关否掉(峰值只有 0.13,那是在噪声里认图案);
@@ -3157,10 +3177,10 @@ mod tests {
         let g = |k: &str| {
             PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
         };
-        let run = |st: f64| {
+        let run = |st: f64, frac: bool| {
             psola_shift_env(
                 &x, sr, st, 0.0, &f0t, hop,
-                g("UTAI_PSOLA_FRAC") != 0.0, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
+                frac, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
                 Infrasonic::PerPeriod, g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"),
                 g("UTAI_PSOLA_WIN"), g("UTAI_PSOLA_XGRAIN"), g("UTAI_PSOLA_LPC") as usize,
             )
@@ -3200,16 +3220,31 @@ mod tests {
             10.0 * (off.max(1e-300) / on.max(1e-300)).log10()
         };
         let base = ihr(&x, f0, 1000.0 / 2.2449, 2100.0 / 2.2449);
-        let add = |st: f64| {
+        let add = |st: f64, frac: bool| {
             let r = 2f64.powf(st / 12.0);
-            ihr(&run(st), f0 * r, 1000.0, 2100.0) - ihr(&x, f0, 1000.0 / r, 2100.0 / r)
+            ihr(&run(st, frac), f0 * r, 1000.0, 2100.0) - ihr(&x, f0, 1000.0 / r, 2100.0 / r)
         };
-        let (a12, a14, a16) = (add(12.0), add(14.0), add(16.0));
+        // ⛔ 阴性对照 = **把 `frac_transport` 显式关掉**(= S157c 之前那条臂):缺陷必须回来,
+        //    而且必须随 ratio 单调 —— 没有这一半,下面「修好了」那几条可能只是「本来就没病」。
+        let (o12, o14, o16) = (add(12.0, false), add(14.0, false), add(16.0, false));
         // ⛔ 边界写字面量,不许引用被测的东西(S146c 那条判据写了三版才有牙)。
-        assert!(a12 > 2.0, "ratio 2.0 上这道工序竟然几乎不加噪声({a12:.2} dB)⇒ 这条判据是空的");
-        assert!(a14 > a12 + 0.4, "+14 没有比 +12 更脏({a12:.2} → {a14:.2})⇒ 单调性没了");
-        assert!(a16 > a14 + 0.4, "+16 没有比 +14 更脏({a14:.2} → {a16:.2})");
-        assert!(base < a12, "夹具本身({base:.2})就比过一遍工序还脏 ⇒ 这个夹具不干净");
+        assert!(o12 > 2.0, "关掉亚样本搬运,ratio 2.0 上竟然几乎不加噪声({o12:.2} dB)⇒ 判据是空的");
+        assert!(o14 > o12 + 0.4, "关掉之后 +14 没有比 +12 更脏({o12:.2} → {o14:.2})⇒ 单调性没了");
+        assert!(o16 > o14 + 0.4, "关掉之后 +16 没有比 +14 更脏({o14:.2} → {o16:.2})");
+        assert!(base < o12, "夹具本身({base:.2})就比过一遍工序还脏 ⇒ 这个夹具不干净");
+        // ⭐ 承重:**生产默认**(亚样本搬运开着)必须把它整条压下去,而且在每一档上都压。
+        // ⛔⛔ 这里**必须从 `PROBE_ARM_DEFAULTS` 读**,不许写 `true` —— 第一版写死了 `true`,
+        //   于是把 `FRAC_TRANSPORT_DEFAULT` 翻回 `false` 这条判据**照样绿**(变异 M1 当场抓到)。
+        //   那正是 S156 在这份文件里抓到的同一条:**「改了默认」与「改了行为」是两件事。**
+        let prod_frac = g("UTAI_PSOLA_FRAC") != 0.0;
+        assert!(prod_frac, "生产默认里亚样本搬运是关的 —— 那这条判据钉的就不是出厂那条臂");
+        for st in [12.0f64, 14.0, 16.0] {
+            let (on, off) = (add(st, prod_frac), add(st, false));
+            assert!(
+                on < off - 5.0,
+                "+{st} st:生产默认({on:.2})没有比关掉亚样本搬运({off:.2})干净 5 dB 以上"
+            );
+        }
     }
 
     /// S157b —— ⭐⭐ **LP-PSOLA 的恒等是结构性的**:`y = x + Synth(OLA(r) − r)`,
