@@ -621,11 +621,32 @@ pub fn dead_only_plan_with(
             let (first_dead, last_dead) = (dead_at[0], *dead_at.last().unwrap());
             let (mut a, mut b) = (i, j);
             if let Some((head_ms, tail_ms)) = trim {
+                // ⛔⛔ S158 —— **一刀只有在它自己造出来的那条缝落得下去的时候才许下。**
+                //
+                // 机理:`dead_group_windows` 的 `GUARD_FRAMES` 会让窗**倒着伸进被卸掉的
+                // 那个乘客** `GUARD_FRAMES` 帧,好让 10 ms 交叉淡化压在它身上而不是压在
+                // 被救音的起音上。那 40 ms 因此是**由 donor 渲的**(在 `shift` 位),
+                // 可它从来没过 `minimal_rescue_shift` 的 `slot_reachable` —— 那个检查只看
+                // `all`(裁剪前)或 `kept`(裁剪后),两边都不含窗外那一个音。
+                //
+                // 今天这是死代码(`TRIM_DEFAULT` 之前是 `None`);S158 翻默认的那一秒它就活了。
+                // ⚠ 实测:炉心融解 +7 × akiko,13 条 trim 臂里被拖进窗的乘客一共 39 个,
+                // **0 个够不着**(reach = [36,80],最深的 −14 也只把 MIDI 60 拖到 46)。
+                // ⇒ 这一条今天**一个字节都不改输出**,它挡的是别的模型/别的谱。
+                //
+                // 退法选「不裁那一侧」而不是「不伸护栏」:后者会把淡化重新压回被救音的起音,
+                // 而那正是护栏存在的理由 —— 用一个已知的坏去换另一个已知的坏是没有意义的。
+                let guard_ok = |k: Option<usize>, s: i64| -> bool {
+                    match k.and_then(|k| note_nums.get(k).copied()) {
+                        Some(n) if n > 0 => range.slot_reachable(eff(n) + s),
+                        _ => true, // 没有邻音 / 那边是休止 ⇒ 护栏伸不进任何唱音
+                    }
+                };
                 let (freed_head, freed_tail) = (ms(i, first_dead), ms(last_dead + 1, j + 1));
-                if freed_head >= head_ms {
+                if freed_head >= head_ms && guard_ok(first_dead.checked_sub(1), whole_shift) {
                     a = first_dead;
                 }
-                if freed_tail >= tail_ms {
+                if freed_tail >= tail_ms && guard_ok(Some(last_dead + 1), whole_shift) {
                     b = last_dead;
                 }
                 if (a, b) != (i, j) {
@@ -662,7 +683,7 @@ pub fn dead_only_plan_with(
 }
 
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
-/// **`None` = 关 = 今天的整句组,逐位不变**;`UTAI_RANGE_TRIM=0` 关 · `=1` 用下面两个常量 ·
+/// **S158 起这是出厂默认(只裁尾)**;`UTAI_RANGE_TRIM=0` 关(渲旧臂)· `=1` 用下面两个常量 ·
 /// `=<head_ms>:<tail_ms>` 扫参数。
 ///
 /// **Why this knife exists at all.** S148 measured the toll: a passenger pays it for *entering*
@@ -678,8 +699,20 @@ pub fn dead_only_plan_with(
 /// the ONE segment where the recovery was large (three notes getting back 5.36/5.33/3.70 dB); the
 /// listener called the other two 「区别不是特别大」. And every cut buys its material with a new
 /// seam in the middle of a phrase, which is not free: Δripple at a cut **head** is p50 0.258 /
-/// p90 1.452 dB against a 0.060 floor, at a cut **tail** 0.033 / 0.407 — an **8×** asymmetry,
-/// because a head cut lands the 10 ms fade-in on a note's ONSET.
+/// p90 1.452 dB against a 0.060 floor, at a cut **tail** 0.033 / 0.407 — an **8×** asymmetry.
+///
+/// ⚠⚠ **S158 更正了这段的两处**(实测,见 `TESTING\s158_knives\读数_渲染之后.md`):
+/// ⑴ 那个 8× 是在**没有 `GUARD_FRAMES` 的 S148 二进制**上量的,而且样本被污染
+///    (21 头 / 13 尾里有 5 个是同一个音,被裁成单音组两侧同时开缝)。
+/// ⑵ ⛔ **「因为裁头把 10 ms 淡入压在音的【起音】上」这句归因解释不了今天的读数。**
+///    今天护栏在 22/22 个头刀与 17/17 个尾刀上**都拿满 2 帧 = 40 ms**(一次都没有被
+///    前后邻音的时长封顶)⇒ 淡入结构上落在**被卸掉的那个乘客**的最后 40 ms 里,
+///    离被救音的起音还有 30 ms —— 而代价**原样还在**:出厂二进制上、被暴露的那个
+///    被救音的 |Δripple| p50 **头 0.267 / 尾 0.005**(同处地板 0.004 / 0.006),
+///    最坏两条头缝 `[543]け 2.312` · `[156]で 2.004` dB,已经顶到这条轴唯一的
+///    可闻刻度门口(S148 u1:~2.7 dB 听得出 / ≤0.46 dB 听不出)。
+/// ⇒ **头缝贵的真原因今天仍然未知**,而「拆句」会造 43 条头缝
+///    ⇒ **在找到它之前拆句不许开工**。
 ///
 /// **The numbers.** Offline sweep over the four installed records × 炉心融解 (the user's own
 /// project, 803 triples), reproduced from the production plans in the 2026-08-18 log to the group
@@ -693,9 +726,19 @@ pub fn dead_only_plan_with(
 /// ⚠ Not a plateau everywhere: on the +7 stress case the same records give 14 head / 13 tail at
 /// 750 ms and 5 / 9 at 1000 ms, i.e. that song IS threshold-sensitive. Re-measure before moving.
 ///
-/// ⛔ Deliberately NOT promoted by these numbers: the instrument cannot tell whether a seam is
-/// audible, and this line has been wrong in exactly that way twice (S148 WSOLA, S150 v1/v2).
-/// Blind test first, flip after — the S146 protocol.
+/// ⛔ S151-S157 时这里写的是「Deliberately NOT promoted by these numbers ⇒ blind test first」。
+/// **S158 翻了,而且理由不是「仪器说好听」** —— 仪器答不了那一问,今天也一样。翻的理由是
+/// **这一刀被证明【只做它该做的那一件事】**:整曲四条臂(同一二进制,`render_guard` 量过身份)
+/// 上逐音配对,只裁尾那条臂里
+/// * **被卸掉的 60 个音**:|Δrms| p50 **0.667** / p90 1.696 dB(同批地板 0.004/0.031)
+///   ⇒ 它们真的下车了 —— 而「下车」= 回到基线渲染,那是它们**本来正确**的那一版;
+/// * **其余每一类都落在渲染地板里**:仍被救的死音 0.006/0.037(地板 0.005/0.032)·
+///   仍在车上的乘客 0.005/0.019 · 结构上不该动的 128 个音 0.004/0.006;
+/// * **16 条新尾缝**在被暴露的那个被救音上最坏只有 **−0.093 dB** Δripple,其余全是 0.00x;
+/// * 渲染耗时 442.0 → 438.7 s,计划层 63 组 / 0 无解 / 8 个不同位移 / **落点一组没动**。
+/// ⇒ 也就是说:**它新造出来的唯一一样东西(缝)量不出来,而它拿掉的那样东西量得出来。**
+/// ⛔ 仍然成立的那一半:仪器不许给**头裁**翻案(见 [`TRIM_HEAD_MS`]),也不许拿这些数字
+/// 去论证「拆句」。⚠ 承重仍然要过耳朵 —— 交付物是整曲渲染(S154 起的口径)。
 /// The env parse as a pure function, so it can be asserted without touching process state
 /// (reading the real environment in a test both races the other tests and passes SILENTLY on a
 /// machine where someone exported the variable — S150 paid for that lesson on `parse_phase_lock`).
@@ -756,10 +799,12 @@ fn parse_landing(v: Option<&str>) -> Option<i64> {
 /// ⇒ 这一刀必须和**卸乘客**一起看,不能单独放大预算。
 const LANDING_DEFAULT: Option<i64> = Some(3);
 
-/// ⛔ Off until a blind test says otherwise — flipping this changes what every rescued phrase
-/// sounds like, so it also needs `RANGE_ALGO_VERSION` ↔ `audition_cache_tag` bumped IN PAIR
-/// (S150: missing one of those is not an error, it is the user hearing a stale cache).
-const TRIM_DEFAULT: Option<(f32, f32)> = None;
+/// ⛔ **S158 翻成「只裁尾」**(理由与实测在 [`dead_only_plan_with`] 上面那段 doc 里)。
+/// 翻它必须成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`
+/// (S150:漏掉一个不是错误,是用户听到一条陈缓存)。
+/// ⛔ 想渲旧臂:`UTAI_RANGE_TRIM=0`,同一个二进制。
+/// ⚠ 只影响**谱面轨**:`cover_dead_plan`(音频轨/audition)是另一份分组逻辑,里面没有裁剪。
+const TRIM_DEFAULT: Option<(f32, f32)> = Some((TRIM_HEAD_MS, TRIM_TAIL_MS));
 /// ⛔⛔ **头裁已被盲测判负 —— 这个值是「关」,不是一个门限。**
 ///
 /// S151 r1(5 组 × 2 文件,`level_match: none`,两个对照都答对):
@@ -3161,10 +3206,21 @@ mod tests {
     fn dead_only_rescues_the_climax_note_minimally() {
         // のう(85,73) between rests: 85 dead → minimal landing 79(80 半浊不合格)⇒ -6;
         // 前面的健康 73 短语原位不动 —— 用户耳判通过的 t23 臂逐字。
+        // ⛔ S158:这条钉的是**裁剪之前**那条臂,所以 trim 必须写死成 `None`。
+        //    以前它借 `RescueTuning::today()`,而 S158 把 `TRIM_DEFAULT` 翻成「只裁尾」的
+        //    那一秒它就换了臂(实测当场红:`{4,5}` 变 `{4,4}`)。⭐ 这次它红得响,
+        //    但同一族里 `trimming_can_never_lose_a_rescue` 那种「off 与 on 必须一致」的判据
+        //    换臂之后是**照绿**的 —— 所以借 `today()` 这件事本身就不许再有。
         let nn = [0, 73, 73, 0, 85, 73, 0];
-        let (plan, unfix) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
+        let land = RescueTuning::today().landing;
+        let (plan, unfix) =
+            dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::new(None, land));
         assert!(unfix.is_empty());
         assert_eq!(plan, vec![DeadGroup { start: 4, end: 5, shift: -6 }]);
+        // ⭐ 出厂那一档(只裁尾)在同一句上把那个乘客放掉,而**死音与落点一个字不变**。
+        let (shipped, _) =
+            dead_only_plan_with(&nn, &secs(nn.len()), 0, &dxl_like(), RescueTuning::today());
+        assert_eq!(shipped, vec![DeadGroup { start: 4, end: 4, shift: -6 }]);
     }
 
     #[test]
@@ -3228,18 +3284,43 @@ mod tests {
     // ── S151 卸乘客 ─────────────────────────────────────────────────────────────────────
     // ⛔ 阈值一律写**字面量**:引用被测的常量会让判据永远不可能红(这一区 S146c 的血训)。
 
+    /// S158 —— 这一族 A/B 的两条臂,**只许差一个自由度**。
+    ///
+    /// ⛔⛔ 它们原来一边写 `RescueTuning::today()`、另一边写
+    /// `RescueTuning::new(Some((1000.0, 500.0)), None)` ⇒ trim **和** landing 同时不同,
+    /// 每一条 A/B 的归因都是坏的。今天读不出差别,**只因为** `dxl_like()` 的 `low_ratio`
+    /// 是平的 ⇒ landing 臂在它上面选不出别的落点 —— 也就是说这几条判据的「单变量」
+    /// 是**夹具的巧合**,不是设计。
+    ///
+    /// ⛔ 而更糟的一半是:关臂借的是 `today()`。S158 把 `TRIM_DEFAULT` 翻成「只裁尾」的
+    /// 那一秒,那一边会**静默变成开臂**,`trimming_can_never_lose_a_rescue` 这种
+    /// 「off 与 on 必须一致」的判据会**照绿**,而它此后什么都没在测。
+    ///
+    /// ⇒ 两条臂的 landing 取**同一个值**,而且从 `today()` 取(不写字面量 ⇒ 将来翻 landing
+    /// 也不会让这一族悄悄变成双变量);trim 那一维由调用方给,是**唯一**的自变量。
+    fn trim_arms(trim: Option<(f32, f32)>) -> (RescueTuning, RescueTuning) {
+        let land = RescueTuning::today().landing;
+        (RescueTuning::new(None, land), RescueTuning::new(trim, land))
+    }
+
+    /// 机理夹具用的**有限**头门限。⚠ 出厂那一档的头门限是 `f32::INFINITY`(= 永不裁头,
+    /// 盲测判负 + S158 实测复现),所以「头裁到底怎么算」只能用这个**从未出厂**的值来测机理;
+    /// 出厂那一档由 `the_shipped_trim_only_ever_cuts_the_tail` 单独钉。
+    const MECH_HEAD_MS: f32 = 1000.0;
+
     /// 乐句 = 3 个健康音 · 1 个死音 · 2 个健康音。头 1.5 s、尾 0.8 s 都够本 ⇒ 两边都裁掉。
     #[test]
     fn a_rescue_group_sheds_the_passengers_that_pay_for_their_own_seam() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 25, 25, 25, 40, 20, 20, 10]; // 头 75 帧 = 1.50 s;尾 40 帧 = 0.80 s
-        let (whole, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
+        let (off_arm, on_arm) = trim_arms(Some((MECH_HEAD_MS, 500.0)));
+        let (whole, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), off_arm);
         assert_eq!(
             whole,
             vec![DeadGroup { start: 1, end: 6, shift: -6 }],
             "关掉时必须是 S150 之前那条整句臂"
         );
-        let (trimmed, unfix) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (trimmed, unfix) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), on_arm);
         assert!(unfix.is_empty());
         assert_eq!(
             trimmed,
@@ -3253,7 +3334,7 @@ mod tests {
     fn a_cut_that_frees_almost_nothing_is_not_worth_the_seam_it_makes() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 10, 10, 10, 40, 7, 7, 10]; // 头 30 帧 = 0.60 s;尾 14 帧 = 0.28 s
-        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), trim_arms(Some((MECH_HEAD_MS, 500.0))).1);
         assert_eq!(
             plan,
             vec![DeadGroup { start: 1, end: 6, shift: -6 }],
@@ -3267,7 +3348,7 @@ mod tests {
     fn the_head_cut_has_to_buy_more_than_the_tail_cut() {
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 12, 12, 11, 40, 18, 17, 10]; // 头 35 帧 = 0.70 s;尾 35 帧 = 0.70 s
-        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), trim_arms(Some((MECH_HEAD_MS, 500.0))).1);
         assert_eq!(
             plan,
             vec![DeadGroup { start: 1, end: 4, shift: -6 }],
@@ -3292,8 +3373,9 @@ mod tests {
             v.sort_unstable();
             v
         };
-        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::today());
-        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &r, RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (off_arm, on_arm) = trim_arms(Some((MECH_HEAD_MS, 500.0)));
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &r, off_arm);
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &r, on_arm);
         assert_eq!(dead_of(&off), dead_of(&on), "被救的死音一个不许多、一个不许少");
         assert_eq!(unfix_off, unfix_on, "无解的乐句也不许因为裁剪而改变");
         assert_eq!(unfix_on, vec![(15, 16)], "…而这份夹具里确实有一个(85 拖着 40 出窗)");
@@ -3310,15 +3392,16 @@ mod tests {
     fn trimming_may_not_turn_an_unfixable_phrase_into_a_rescue() {
         let nn = [0, 85, 40, 0];
         let fr = [10, 40, 100, 10]; // 尾部乘客 2.0 s —— 回收量远超门限,唯一拦住它的只能是规则
-        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
-        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (off_arm, on_arm) = trim_arms(Some((MECH_HEAD_MS, 500.0)));
+        let (off, unfix_off) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), off_arm);
+        let (on, unfix_on) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), on_arm);
         assert!(off.is_empty() && on.is_empty(), "两条臂都必须放弃这一句");
         assert_eq!(unfix_off, vec![(1, 2)]);
         assert_eq!(unfix_on, vec![(1, 2)], "卸乘客不许把无解句变成被救句");
         // 阳性对照:同一句,乘客换成一个不挡路的音 ⇒ 两条臂都救,且开着的那条真的裁了。
         let nn = [0, 85, 73, 0];
-        let (off, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::today());
-        let (on, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some((1000.0, 500.0)), None));
+        let (off, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), off_arm);
+        let (on, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), on_arm);
         assert_eq!(off, vec![DeadGroup { start: 1, end: 2, shift: -6 }]);
         assert_eq!(on, vec![DeadGroup { start: 1, end: 1, shift: -6 }]);
     }
@@ -3707,10 +3790,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=None landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
+            "trim=Some((inf, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s157a";
+        const TAG: &str = "s158a";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -3746,7 +3829,7 @@ mod tests {
         let on = parse_trim(Some("1")).expect("`1` = 出厂那一档");
         let nn = [0, 73, 73, 73, 85, 73, 73, 0];
         let fr = [10, 100, 100, 100, 40, 100, 100, 10]; // 头 6.0 s、尾 4.0 s,都远超任何门限
-        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), RescueTuning::new(Some(on), None));
+        let (plan, _) = dead_only_plan_with(&nn, &fr, 0, &dxl_like(), trim_arms(Some(on)).1);
         assert_eq!(
             plan,
             vec![DeadGroup { start: 1, end: 4, shift: -6 }],
@@ -3754,22 +3837,25 @@ mod tests {
         );
     }
 
-    /// 旋钮本身:**默认关**,而且解析是纯函数(测试里读进程环境既会被并行污染,
-    /// 又会在别人 export 了变量时**静默通过** —— S150 在 `parse_phase_lock` 上付过这笔学费)。
+    /// 旋钮本身:**S158 起默认开(只裁尾)**,而且解析是纯函数(测试里读进程环境既会被并行
+    /// 污染,又会在别人 export 了变量时**静默通过** —— S150 在 `parse_phase_lock` 上付过学费)。
     #[test]
-    fn the_passenger_trim_is_off_by_default_and_the_knob_parses() {
-        assert!(parse_trim(None).is_none(), "默认必须是今天那条臂(逐位不变)");
-        assert!(parse_trim(Some("")).is_none());
+    fn the_passenger_trim_is_tail_only_by_default_and_the_knob_parses() {
+        // ⛔ 边界写**字面量**:`assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS))` 是「常量等于自己」
+        //    ⇒ 把 500 改成 100 或 3000 都不会红(S158 盘点时点名的空判据)。
+        assert_eq!(parse_trim(Some("1")), Some((f32::INFINITY, 500.0)), "出厂档 = 不裁头 / 尾 500 ms");
+        assert_eq!(parse_trim(None), parse_trim(Some("1")), "⭐ 默认必须**就是**出厂那一档");
+        assert_eq!(parse_trim(Some("")), parse_trim(Some("1")));
         assert!(parse_trim(Some("0")).is_none(), "显式关得掉 —— 用户抱怨时要能用同一个二进制渲旧臂");
-        let on = parse_trim(Some("1")).expect("`1` = 用登记的两个常量");
-        assert_eq!(on, (TRIM_HEAD_MS, TRIM_TAIL_MS));
-        assert!(on.0.is_infinite(), "头裁被盲测判负 ⇒ 出厂档必须够不到它");
-        assert!(on.1.is_finite() && on.1 > 0.0, "…而尾裁是那一轮唯一赢了的一刀");
+        // ⛔⛔ 翻默认之后「垃圾值往哪边倒」必须跟着翻(S155 在 `parse_infrasonic_hp` 上踩过):
+        //    默认关的时候「垃圾 ⇒ 关」是对的(不许静默打开一个没验过的臂);默认开之后
+        //    同一行变成「垃圾 ⇒ 静默关掉一条已上线的修法」,而用户拿到的是一条他没要的旧臂。
+        for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
+            assert_eq!(parse_trim(Some(junk)), parse_trim(Some("1")),
+                       "垃圾 {junk} 必须回落到**默认**,不是静默关掉");
+        }
         assert_eq!(parse_trim(Some("800:300")), Some((800.0, 300.0)), "扫参数用");
         assert_eq!(parse_trim(Some(" 800 : 300 ")), Some((800.0, 300.0)));
-        for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
-            assert!(parse_trim(Some(junk)).is_none(), "垃圾 {junk} 必须回落到默认,不是静默乱开");
-        }
     }
 
     /// S151d:同位移、中间只隔休止的两个窗必须合成一个 —— 否则我们会在**同一条 donor** 上
@@ -4899,11 +4985,30 @@ mod tests {
         let r = Rec::default().build();
         let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
         let fr: Vec<i64> = vec![9; nn.len()];
-        let (plan, unfixable) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, RescueTuning::today());
+        // ⛔ S158: trim 写死成 `None` —— 这条钉的是**落点规则**,而 `RescueTuning::today()`
+        //    从 S158 起自带「只裁尾」,会把乐句尾巴上的乘客切掉、把 span 从 (0,5) 变成 (0,4)。
+        //    那不是落点规则改了,是这条判据被换了臂。
+        let land = RescueTuning::today().landing;
+        let (plan, unfixable) =
+            dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, RescueTuning::new(None, land));
         assert_eq!(unfixable.len(), 0);
         assert_eq!(plan.len(), 1, "exactly one dead phrase, as before");
         assert_eq!((plan[0].start, plan[0].end), (0, 5), "the same note span as before");
         assert_eq!(plan[0].shift, -7, "…only the depth moved");
+        // ⭐ 而这条判据真正的安全性质(「哪些音被救」不许变)在**出厂臂**上也必须成立:
+        //    裁剪只放掉乘客,死音集合与落点一个字不动。
+        let (shipped, unfix_s) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, RescueTuning::today());
+        let dead_of = |p: &[DeadGroup]| -> Vec<i64> {
+            let mut v: Vec<i64> =
+                p.iter().flat_map(|g| g.start..=g.end).filter(|&k| nn[k] > 0 && !r.slot_singable(nn[k]))
+                    .map(|k| nn[k]).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(unfix_s, unfixable, "裁剪不许改无解集合");
+        assert_eq!(dead_of(&shipped), dead_of(&plan), "裁剪不许改被救的死音");
+        assert_eq!(shipped[0].shift, -7, "裁剪不许改落点");
+        assert_eq!((shipped[0].start, shipped[0].end), (0, 4), "…它改的只有『谁陪着走』");
         let _ = fr;
     }
 
