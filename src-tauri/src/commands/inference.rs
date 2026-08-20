@@ -2233,7 +2233,10 @@ mod tests {
         let nn = plan_note_nums(&score, crate::inference::g2p_alias::PhonemeSet::Words);
         // ⛔ 显式 `None` = 卸乘客关掉的那条臂:这条判据问的是「静音记号会不会把两句焊成一句」,
         // 它不许随另一个旋钮的默认值一起翻(S150 血训:测试读进程环境 = 静默通过)。
-        let (plan, unfixable) = dead_only_plan_with(&nn, &[50; 3], 0, &range, RescueTuning::today());
+        // ⚠ S157:上面这句话原来配的是 `RescueTuning::today()` —— **注释说「显式 None」而代码
+        // 跟着默认走**,两者今天恰好同值所以看不出来。既然要的是「S151 之前那条臂」,就写死它。
+        let (plan, unfixable) =
+            dead_only_plan_with(&nn, &[50; 3], 0, &range, RescueTuning::new(None, None));
         assert!(unfixable.is_empty(), "the dead phrase has a landing — nothing should be unfixable");
         assert_eq!(plan.len(), 1, "one dead phrase ⇒ one group");
         assert_eq!(
