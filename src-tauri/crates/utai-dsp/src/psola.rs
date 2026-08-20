@@ -3107,6 +3107,111 @@ mod tests {
         }
     }
 
+    /// S157b —— ⭐⭐⭐ **这道工序在谐波【之间】加的噪声随 ratio 单调上升,而且它是结构性的。**
+    ///
+    /// 用户 2026-08-20 在落点 78 → 76 那条臂上看见「合唱感又回来了、而且不止一条,
+    /// 高阶共振峰之间也多了噪音」。归因做完之后,能站住的只有这一条 —— 而它在一个
+    /// **严格周期、零抖动、共振峰恒定**的合成夹具上就能复现:
+    ///
+    /// | ratio | 2.0000 | 2.1189 | 2.2449 | 2.3784 | 2.5198 |
+    /// |---|---|---|---|---|---|
+    /// | 理想夹具 | +5.07 | +5.49 | **+6.28** | +7.57 | **+9.75** |
+    /// | 真 ぴゃ donor(f0 659) | +7.68 | +10.28 | **+12.53** | +15.40 | +15.43 |
+    ///
+    /// ⛔⛔ **四条假说被自己的阴性对照判死,别再重推**:
+    /// ⑴ 「`f_out/p` 的梳」—— 谱自相关否掉(峰值只有 0.13,那是在噪声里认图案);
+    /// ⑵ 「donor 自己的整条谐波列漏出来」—— 把栅格整体挪 ±37 Hz 读数只差 1-2 dB
+    ///    ⇒ 那把尺子量的是「那一带有多少能量」,不是漏出;
+    /// ⑶ 「颗粒**内容**:复制了脉冲的长尾」—— **LP-PSOLA 实测不改变它**
+    ///    (order 8/12/16/20/24/32 在这一带全部 ≥ order 0,见 [`lpc_reflections`]);
+    /// ⑷ 「源标记**抖动**」—— 同一个滤波器、加 2% 周期抖动,只差 **+0.65 dB**。
+    /// ⇒ ⭐ 剩下的嫌疑集中在**颗粒的摆放**上(`k = round(u)` 的复用 / 目标栅格 / 窗形),
+    ///    而它在零抖动的完美源上就成立 ⇒ **下一次重开这条轴,从这个夹具开始,别再从整曲开始。**
+    #[test]
+    fn the_inter_harmonic_noise_this_stage_adds_grows_with_the_ratio() {
+        let sr = 44_100u32;
+        let f0 = 659.27; // = 1480 / 2^(14/12):用户报的那个音的 donor 基频
+        // ⛔ **必须过一遍共振峰滤波器**:裸脉冲串的谐波之间只有数值底,那个比值量的是
+        //    浮点噪声,不是这道工序的账(第一版就是这么写的,读出 +25 / −1 的乱数)。
+        //    ⇒ 四个极点对(500/1500/2500/3500 Hz,带宽 80/90/120/140)= 一个元音的形状。
+        let (imp, _) = pulses(sr, 2.0, |_| f0, |_| 1.0);
+        let x: Vec<f32> = {
+            let mut y: Vec<f64> = imp.iter().map(|v| f64::from(*v)).collect();
+            for (f, bw) in [(500.0f64, 80.0f64), (1500.0, 90.0), (2500.0, 120.0), (3500.0, 140.0)] {
+                let r = (-std::f64::consts::PI * bw / f64::from(sr)).exp();
+                let th = 2.0 * std::f64::consts::PI * f / f64::from(sr);
+                let (a1, a2) = (-2.0 * r * th.cos(), r * r);
+                let (mut z1, mut z2) = (0.0f64, 0.0f64);
+                for v in y.iter_mut() {
+                    let o = *v - a1 * z1 - a2 * z2;
+                    z2 = z1;
+                    z1 = o;
+                    *v = o;
+                }
+            }
+            let peak = y.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
+            y.iter().map(|v| (0.3 * v / peak) as f32).collect()
+        };
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let run = |st: f64| {
+            psola_shift_env(
+                &x, sr, st, 0.0, &f0t, hop,
+                g("UTAI_PSOLA_FRAC") != 0.0, g("UTAI_PSOLA_WSOLA"), g("UTAI_PSOLA_LOCK"),
+                Infrasonic::PerPeriod, g("UTAI_PSOLA_ENVFIX"), g("UTAI_PSOLA_BRIDGE"),
+                g("UTAI_PSOLA_WIN"), g("UTAI_PSOLA_XGRAIN"), g("UTAI_PSOLA_LPC") as usize,
+            )
+            .0
+        };
+        // 谐波之间 / 谐波上(dB)。⛔ 是**比值**,所以对「不除 wsum ⇒ 电平随 ratio 走」免疫。
+        let ihr = |y: &[f32], fg: f64, lo: f64, hi: f64| -> f64 {
+            let nfft = 1usize << 14;
+            let w: Vec<f64> = (0..nfft)
+                .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / nfft as f64).cos())
+                .collect();
+            let (mut on, mut off) = (0.0f64, 0.0f64);
+            let mut i = 0usize;
+            while i + nfft <= y.len() {
+                let mut re = vec![0.0f64; nfft];
+                for (j, r) in re.iter_mut().enumerate() {
+                    *r = f64::from(y[i + j]) * w[j];
+                }
+                let spec = {
+                    use rustfft::{num_complex::Complex, FftPlanner};
+                    let mut buf: Vec<Complex<f64>> =
+                        re.iter().map(|v| Complex::new(*v, 0.0)).collect();
+                    FftPlanner::new().plan_fft_forward(nfft).process(&mut buf);
+                    buf[..nfft / 2 + 1].iter().map(|c| c.norm_sqr()).collect::<Vec<f64>>()
+                };
+                let bin = f64::from(sr) / nfft as f64;
+                for (b, p) in spec.iter().enumerate() {
+                    let f = b as f64 * bin;
+                    if f < lo || f >= hi {
+                        continue;
+                    }
+                    let near = ((f / fg).round() * fg - f).abs() <= 0.06 * fg;
+                    if near { on += p } else { off += p }
+                }
+                i += nfft / 2;
+            }
+            10.0 * (off.max(1e-300) / on.max(1e-300)).log10()
+        };
+        let base = ihr(&x, f0, 1000.0 / 2.2449, 2100.0 / 2.2449);
+        let add = |st: f64| {
+            let r = 2f64.powf(st / 12.0);
+            ihr(&run(st), f0 * r, 1000.0, 2100.0) - ihr(&x, f0, 1000.0 / r, 2100.0 / r)
+        };
+        let (a12, a14, a16) = (add(12.0), add(14.0), add(16.0));
+        // ⛔ 边界写字面量,不许引用被测的东西(S146c 那条判据写了三版才有牙)。
+        assert!(a12 > 2.0, "ratio 2.0 上这道工序竟然几乎不加噪声({a12:.2} dB)⇒ 这条判据是空的");
+        assert!(a14 > a12 + 0.4, "+14 没有比 +12 更脏({a12:.2} → {a14:.2})⇒ 单调性没了");
+        assert!(a16 > a14 + 0.4, "+16 没有比 +14 更脏({a14:.2} → {a16:.2})");
+        assert!(base < a12, "夹具本身({base:.2})就比过一遍工序还脏 ⇒ 这个夹具不干净");
+    }
+
     /// S157b —— ⭐⭐ **LP-PSOLA 的恒等是结构性的**:`y = x + Synth(OLA(r) − r)`,
     /// ratio 1.0 上 `OLA(r) ≡ r` ⇒ 差恒为 0 ⇒ 零输入零初值 ⇒ `y ≡ x` **逐位**。
     ///
