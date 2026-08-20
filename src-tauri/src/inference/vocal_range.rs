@@ -536,8 +536,18 @@ pub struct RescueTuning {
 
 impl RescueTuning {
     /// Exactly what ships today.
+    ///
+    /// ⛔⛔ S157:`landing` 这里原来写的是**字面量 `None`**,而不是 [`LANDING_DEFAULT`]。
+    /// 两个值今天恰好相同,所以它是一条**没有人核验过的 doc**:哪一天翻了 `LANDING_DEFAULT`,
+    /// 经它取臂的那一批判据会**继续静默地测旧臂**,而「Exactly what ships today」这句话
+    /// 一个字都不用改就变成假的。
+    /// ⭐ 这正是 S156 在 `psola.rs` 上抓到的那条形状(「改了默认」与「改了行为」在测试文件里
+    /// 可以是完全分开的两件事),换了个文件又长了一次。
+    /// ⇒ 现在两个字段都从常量取,并由
+    /// `the_today_tuning_is_literally_the_shipped_defaults` 钉住。
+    /// ⚠ 要「S151 之前那条臂」的判据请显式写 `RescueTuning::new(None, None)`,别借 `today()`。
     pub fn today() -> Self {
-        Self { trim: TRIM_DEFAULT, landing: None }
+        Self { trim: TRIM_DEFAULT, landing: LANDING_DEFAULT }
     }
 
     pub fn new(trim: Option<(f32, f32)>, landing: Option<i64>) -> Self {
@@ -930,9 +940,6 @@ fn minimal_rescue_shift(
         pool = in_comfort;
     }
 
-    let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
-    let tied: Vec<i64> = pool.into_iter().filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS).collect();
-
     // S151 —— **在 damage 打平的那一批里,按扫描的原始 `low_ratio` 排**,平了才取最浅。
     //
     // ⛔ 为什么这一层非加不可:`damage_from_scan` 给 `low_ratio` 留了 **0.55 以下全免费**,
@@ -948,20 +955,100 @@ fn minimal_rescue_shift(
     let thinner = |s: i64| -> f32 {
         dead.iter().map(|&p| range.thinness(p + s).unwrap_or(1.0)).fold(0.0f32, f32::max)
     };
+
+    // ⛔⛔ 默认臂(`landing == None`)到此为止,**与 S151 之前逐字相同**:先按
+    // `worst`(死音 ∪ 乘客)取最小,再在容差内取最浅。下面 S157 那一支只有旋钮开着才走,
+    // 而 `cover_dead_plan` 硬传 `None`(见 `:1065`)⇒ **cover 轨结构上不受任何影响**。
     if landing.is_none() {
-        // 默认臂:到此为止,与 S151 之前逐字相同。
-        return tied.into_iter().min_by_key(|s| s.abs());
+        let best = pool.iter().map(|&s| worst(s)).fold(f32::INFINITY, f32::min);
+        return pool
+            .into_iter()
+            .filter(|&s| worst(s) <= best + LANDING_DAMAGE_EPS)
+            .min_by_key(|s| s.abs());
     }
-    let best_thin = tied.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
-    tied.into_iter()
-        .filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS)
-        .min_by_key(|s| s.abs())
+
+    // S157 —— **键序改成「死音 damage → 死音 low_ratio → 乘客 damage → 最浅」。**
+    //
+    // ⛔ 今天的 `worst` 对 **死音 ∪ 乘客** 取 max,于是**一个乘客的 damage 可以否决死音的落点**。
+    // 这不是假想:用户 2026-08-20 报的 ぴゃ(notes[685],MIDI 90,组 685..=693)就卡在这里 ——
+    // 走 −14 时三个死音落在 76 / 66 / 64(damage **全 0**,而且 76 的 `low_ratio` 0.211 比
+    // 今天落点 78 的 0.388 好将近一倍),可两个**乘客**落到 MIDI 61 与 54,
+    // 它们的 `low_ratio` 是 **0.572 / 0.573** —— **刚刚越过 `damage_from_scan` 那条 0.55 免费线**
+    // ⇒ damage 0.165 / 0.1725 > [`LANDING_DAMAGE_EPS`](0.05)⇒ −14 被踢出 `tied` ⇒ 停在 −12。
+    // ⇒ 用一个**中音区乘客的微小瑕疵**,否决掉**顶音本身**的一次大改善。
+    //
+    // ⭐ 为什么是「挪一把键」而不是「加一个权重」:这里**没有引进任何新常数**。
+    // `thin` 是这条轴上**唯一有耳证**的一维(上面那两个 p 值),而「乘客落点的 damage」
+    // 一条耳证也没有 —— 它今天却排在 `thin` **上面**。这一笔只是把它挪到下面,
+    // 让它继续当**平局的最后一把尺子**。
+    //
+    // ⚠ 它与「卸乘客」(`trim`)是**两笔独立的账**,S156 交接把它们混成了一件:
+    // 那把刀省的是**过路费**(每个乘客进一次 PSOLA 的 0.7-2.0 dB),要靠裁剪/拆句、会造新缝;
+    // 而这一笔省的是**落点**,一条缝都不造。离线穷举(63 组 × 四份装机记录 × 炉心融解+7,
+    // 复刻件对生产计划 63/63 对拍):把乘客从落点约束里**整个**拿掉,今天的臂与 `landing=3`
+    // 都是 **0 / 63 组会动** —— **卸乘客一个落点都改不了**。
+    //
+    // 实测这一笔 +(护栏 14)之后,薄区(落点 77-79)的死音占比:
+    // akiko 30% → **12%** · yachiyo 34% → **3%** · 东雪莲 30% → 30%(**一个字节不动**)·
+    // yuyuko 36% → 36%(同上)⇒ 拿不到好处的两份记录**也拿不到坏处**,
+    // 而四份记录的**最深位移全部仍然是 14**(= 今天的最深)。
+    let worst_dead = |s: i64| -> f32 {
+        dead.iter()
+            .map(|&p| range.damage_at((p + s) as f32).unwrap_or(DAMAGE_MAX))
+            .fold(0.0f32, f32::max)
+    };
+    let best_dead = pool.iter().map(|&s| worst_dead(s)).fold(f32::INFINITY, f32::min);
+    let t1: Vec<i64> =
+        pool.into_iter().filter(|&s| worst_dead(s) <= best_dead + LANDING_DAMAGE_EPS).collect();
+    let best_thin = t1.iter().copied().map(thinner).fold(f32::INFINITY, f32::min);
+    let t2: Vec<i64> =
+        t1.into_iter().filter(|&s| thinner(s) <= best_thin + LANDING_THIN_EPS).collect();
+    // 乘客的 damage 仍然在,只是降到最后一把:同样干净的落点之间,选对乘客更友善的那个。
+    let best_all = t2.iter().copied().map(worst).fold(f32::INFINITY, f32::min);
+    t2.into_iter().filter(|&s| worst(s) <= best_all + LANDING_DAMAGE_EPS).min_by_key(|s| s.abs())
 }
 
-/// `ratio = 2` — the shift at which the synthesis stops reading part of every pitch period
-/// (see `utai_dsp::psola::PsolaDiagnostics::src_uncovered_frac`: +12 → 0.00 %, +14 → 10.2 %,
-/// +16 → 20.0 %, measured on the real mark train). Optional depth is never spent past it.
-const LANDING_RATIO_TWO_ST: i64 = 12;
+/// **可选**深度的上限,单位半音。⛔ 它封的只是「为了更干净的落点而多花的那几个半音」——
+/// 真的非走那么深才够得着落点的组照走不误(那是救与不救的问题,见 `budget` 那个 `match`)。
+///
+/// ## ⛔⛔ S157:它原来的理由**已经死了**,这个数是按**新证据**重新定价的
+///
+/// 原文写的是「`ratio = 2` —— 合成开始漏读源波形的那条线
+/// (`src_uncovered_frac`:+12 → 0.00 % / +14 → 10.2 % / +16 → 20.0 %,**real mark train**)」。
+/// 而 S156 把 `UTAI_PSOLA_WIN` 翻成了生产默认 1.0,读窗半宽从此 = `win_periods * src_l`
+/// = **源侧邻距**(`utai-dsp/src/psola.rs:1849-1851`),**与 ratio 无关** ⇒ 结构上不再留缝。
+///
+/// ⭐ 这不是推理,是量出来的(S157,`TESTING\s157_knives\probe_ratio2.sh`,**真标记序列**、
+/// **三份素材**、生产默认口径 —— 而且为此先给 `psola_probe` 补上了这个读数,
+/// 它以前**根本不打**,即「一个承重常数的出处没有人复现得了」):
+///
+/// | 位移 | ratio | 旧臂 `WIN=0` | **今天(生产默认)** |
+/// |---|---|---|---|
+/// | +12 | 2.000 | 0.00 % | 0.00 % |
+/// | +14 | 2.245 | **10.69 / 10.78 / 10.71 %** | **0.0000 %** |
+/// | +16 | 2.520 | **20.38 / 20.48 / 20.40 %** | **0.0000 %** |
+///
+/// 阳性对照(旧臂)精确复现了原文那张表;阴性对照(+12 两条臂都读 0)证明
+/// 「新臂读 0」不是一个恒为 0 的空读数。
+///
+/// ## ⭐ 而**另一个从没被写进这条 doc 的理由是活的**,这个数按它定
+///
+/// `ratio ≥ 2` 时相邻输出颗粒读**同一个源标记**(`psola.rs:1845-1848`)⇒ **donor 自己的音高**
+/// 出现在 `0.5·f_out` 上 —— 就是用户 S155 笔5 亲耳听成**「合唱感」**的那一维。
+/// 同一批探针实测(相对各自 400-4000 Hz,三份素材,**单调**):
+/// +12 −40.2 / −38.6 / −35.1 → +16 **−36.1 / −34.4 / −30.3** ⇒ **每深一个半音约 +1 dB**。
+/// ⇒ 这条线上确实有一个随深度走的真代价,只是它**不是**原文写的那个,而且**没有拐点**——
+/// 是剂量不是悬崖,所以这个常数只能按取舍定,定不出「物理正确值」。
+///
+/// **为什么是 14。**四份装机记录 × 炉心融解+7 离线穷举(复刻件对生产计划 63/63 对拍):
+/// 14 是让最需要它的那一组(ぴゃ,`notes[685..=693]`,`|shallowest| = 11`)够得着落点 76
+/// 的**最小值**,而且四份记录在 14 上的**最深位移仍然全部是 14 = 今天的最深**
+/// ⇒ **不新增任何一个比今天更深的音,亚谐波零新增暴露**。
+/// 放到 16 / 24 只多买 0-3 个百分点的薄区落点,却把最深推到 **16**(亚谐波 +4 dB)。
+///
+/// ⚠ 它今天在生产里**不生效**:`budget` 那个 `match` 只在 `landing == Some(_)` 时读它,
+/// 而 [`LANDING_DEFAULT`] 是 `None`。翻那个默认才会把这条接上。
+const LANDING_RATIO_TWO_ST: i64 = 14;
 
 /// How much better a deeper landing's raw `low_ratio` must be before it is preferred over a
 /// shallower one. `low_ratio` is stored quantized to a u8 over 0..1, so one stored step is
@@ -3209,9 +3296,15 @@ mod tests {
         assert!(a.iter().zip(&b).any(|(x, y)| x.shift != y.shift), "…但落点必须真的动过");
     }
 
-    /// ⛔ 可选的深度不许把合成推过 `ratio = 2` —— 那之后每个基音周期都有一段永远不被读到
-    /// (笔 3 的 `src_uncovered_frac`:+12 → 0.00%,+14 → 10.2%,+16 → 20.0%)。
-    /// ⚠ 但**必须**走那么深才够得着的组照走不误:那是「救不救得了」,不是「落得干不干净」。
+    /// ⛔ 可选的深度有上限([`LANDING_RATIO_TWO_ST`]);**必须**走那么深才够得着的组照走不误
+    /// —— 那是「救不救得了」,不是「落得干不干净」。
+    ///
+    /// ⚠ S157 更正:这条判据原来的题头写的是「不许推过 `ratio = 2`,那之后每个基音周期都有
+    /// 一段永远不被读到」。**那个理由已经死了**(S156 把宽读窗翻成默认之后,
+    /// +12/+14/+16 的 `src_uncovered_frac` 实测**全是 0.0000%**,三份素材、带阳性阴性对照)。
+    /// 今天这个上限按**另一条**证据定价,全文在 [`LANDING_RATIO_TWO_ST`] 的 doc 里。
+    /// ⚠ 这条判据只钉「上限存在且会咬」,**钉不住它的值** —— 值由
+    /// `the_optional_depth_cap_is_worth_exactly_what_the_ear_line_paid_for` 钉。
     #[test]
     fn optional_depth_stops_where_the_synthesis_starts_dropping_the_source() {
         let mut semis = serde_json::Map::new();
@@ -3243,6 +3336,231 @@ mod tests {
             deep_on[0].shift, -13,
             "已经越过 ratio=2 的组:救援照做,但**不许为了更干净的落点再往下花**"
         );
+    }
+
+    /// S157 的夹具 —— **用户 2026-08-20 报的那个音的微缩版**,逐格照 akiko 盘上的记录抄。
+    ///
+    /// 乐句 = `notes[685..=693]` 的真实音高 `[90, 80, 78, 75, 68, 71, 70, 71, 80]`
+    /// (usable 上限 76 ⇒ 死音 = 90 / 80 / 78 / 80,中间五个是乘客)。三件必须照抄的细节:
+    /// * **MIDI 54 与 61 的 `low_ratio` = 0.573 / 0.572** —— 刚越过 `damage_from_scan`
+    ///   那条 0.55 免费线 ⇒ damage 0.1725 / 0.165。它们正是**两个乘客在 −14 上的落点**,
+    ///   而在 −12 上乘客落到 63 / 56 / 59 / 58(全都干净)⇒ 这就是「乘客否决落点」的全部机理。
+    ///   ⛔ 不许把整条中音区都写成薄的:那样两条臂都被否决,判据当场变空(第一版就是)。
+    /// * **MIDI 65 的 onset 通道电平 −9.9 dB**(< [`RMS_FREE_DB`])⇒ 它的 LANDING 位被清掉
+    ///   ⇒ −13 不合格。少了这一格,今天的臂会停在 −13 而不是生产实测的 −12。
+    /// * 73..79 的 `low_ratio` 阶梯 0.10/0.12/0.18/**0.21**/0.28/**0.39**/0.63 —— 落点
+    ///   78 与 76 的差(0.39 → 0.21)就是这一刀要买的东西。
+    fn pya_like() -> SpeakerRange {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=72i64 {
+            let lr = match m {
+                54 => 0.573, // ⭐ 乘客 68 在 −14 上的落点
+                61 => 0.572, // ⭐ 乘客 75 在 −14 上的落点
+                _ => 0.20,
+            };
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        for (m, lr) in
+            [(73, 0.10), (74, 0.12), (75, 0.18), (76, 0.21), (77, 0.28), (78, 0.39), (79, 0.63)]
+        {
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        semis.insert("80".into(), serde_json::json!([3, 0.67, -6.7, 0.93]));
+        for m in 81..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.80]));
+        }
+        speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 76], "usable_auto": [36, 80], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis),
+                // 盘上的原值是 [5, 1, -9.9, 0.73] —— 只有电平那一列会否决落点。
+                "semitones_onset": { "65": [5, 1.0, -9.9, 0.73] }
+            })),
+            0,
+        )
+        .unwrap()
+    }
+
+    /// ⭐⭐ S157 主刀 —— **一个乘客的 damage 不许否决死音的落点**。
+    ///
+    /// 今天的 `worst` 对 **死音 ∪ 乘客** 取 max,于是用户听出问题的那个音卡在落点 78:
+    /// 走 −14 时三个死音落在 76/66/64(damage 全 0,而 76 的 `low_ratio` 0.21 比 78 的 0.39
+    /// 好将近一倍),可两个乘客落到 MIDI 61 / 54(`low_ratio` 0.572 / 0.573,**刚过 0.55**)
+    /// ⇒ damage 0.165 / 0.1725 > [`LANDING_DAMAGE_EPS`] ⇒ −14 被踢出候选。
+    ///
+    /// ⛔ **三条阴性对照,少一条这条判据就可能是「恒真」而不是「有牙」**:
+    /// ⑴ 默认臂(`landing == None`)必须**仍然是 −12** —— 键序那一笔不许泄进今天的臂;
+    /// ⑵ 被救的音一个不许多、一个不许少;
+    /// ⑶ 把两个乘客换成落点干净的音高之后,开与关必须给出**同一个**答案
+    ///    (否则「赢」可能来自这一刀之外的任何东西)。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过):
+    /// * 键序改回「`worst`(死音∪乘客)排在 `thinner` 前面」⇒ 读 −12,**红**;
+    /// * [`LANDING_RATIO_TWO_ST`] 退回 12 或 13 ⇒ 读 −12 / −13,**红**;
+    /// * 把 MIDI 54/61 的 `low_ratio` 降到 0.20(= 拿掉被测机理)⇒ 开与关都读 −14,
+    ///   ⑶ 那条阴性对照当场**红** ⇒ 说明它真的在盯着「乘客否决」这件事。
+    #[test]
+    fn a_passenger_may_not_veto_the_landing_the_dead_note_needs() {
+        let phrase = [0, 90, 80, 78, 75, 68, 71, 70, 71, 80, 0];
+        let fr = secs(phrase.len());
+        let r = pya_like();
+
+        // ⑴ 默认臂 = 生产实测的那一档(用户听到的就是它):落点 78。
+        let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::today());
+        assert_eq!(
+            today,
+            vec![DeadGroup { start: 1, end: 9, shift: -12 }],
+            "默认臂必须逐字是今天:顶音 90 停在落点 78"
+        );
+
+        // ⭐ 旋钮开着:同样一批合格落点里,死音自己的 `low_ratio` 说话 ⇒ 顶音落到 76。
+        let (on, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(
+            on,
+            vec![DeadGroup { start: 1, end: 9, shift: -14 }],
+            "开着:顶音必须够得着 76(low_ratio 0.21),而不是被两个乘客的 0.17 damage 挡在 78"
+        );
+        assert_eq!(90 + on[0].shift, 76, "落点写死成字面量 —— 边界不许引用被测的常量");
+
+        // ⑵ 这一刀只决定**落在哪**,不许改**哪些音被救**。
+        let dead_of = |p: &[DeadGroup]| {
+            let mut v: Vec<usize> = p
+                .iter()
+                .flat_map(|g| g.start..=g.end)
+                .filter(|&k| phrase[k] > 0 && !r.slot_singable(phrase[k]))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(dead_of(&today), dead_of(&on), "被救的死音一个不许多、一个不许少");
+        assert_eq!(dead_of(&on), vec![1, 2, 3, 9], "而且就是那四个(90 / 80 / 78 / 80)");
+
+        // ⑶ ⛔⛔ **夹具有效性** —— 少了这一段,上面那个 −14 可能只是「−12 从来没被谁挡过」。
+        //    这里直接把被测机理量出来:同一个 `damage_at`,同一批音高。
+        let worst = |set: &[i64], s: i64| -> f32 {
+            set.iter().map(|&p| r.damage_at((p + s) as f32).unwrap_or(DAMAGE_MAX)).fold(0.0, f32::max)
+        };
+        let pax = [75i64, 68, 71, 70, 71];
+        let dead = [90i64, 80, 78, 80];
+        assert_eq!(worst(&pax, -12), 0.0, "−12 上五个乘客必须全都干净");
+        assert!(
+            worst(&pax, -14) > LANDING_DAMAGE_EPS,
+            "−14 上乘客的 damage 必须真的越过容差(读到 {:.4},容差 {LANDING_DAMAGE_EPS}),\
+             否则这条判据钉的不是「乘客否决」",
+            worst(&pax, -14)
+        );
+        assert_eq!(worst(&dead, -12), worst(&dead, -14), "死音在两档上一样干净 ⇒ 差别只来自乘客");
+        assert!(
+            r.thinness(76).unwrap() < r.thinness(78).unwrap() - LANDING_THIN_EPS,
+            "而顶音自己的 low_ratio 必须真的更好(76 = {:.3} vs 78 = {:.3}),否则没什么可赢的",
+            r.thinness(76).unwrap(),
+            r.thinness(78).unwrap()
+        );
+
+        // ⑷ ⛔ **乘客那把键只是降级了,没有被删掉。**
+        //    构造一个「死音 damage 与 low_ratio 在几档上全都打平、只有乘客不同」的局面:
+        //    死音 84(落点 79..76 的 low_ratio 在这个夹具里是阶梯,所以换一个平坦的记录),
+        //    见 `the_passenger_key_still_breaks_a_tie_it_is_just_no_longer_the_first_key`。
+    }
+
+    /// ⛔ 与 [`a_passenger_may_not_veto_the_landing_the_dead_note_needs`] 成对:那一笔把
+    /// 「乘客 damage」这把键从 `thin` 上面挪到了下面,**而不是删掉它**。少了这一条,
+    /// 「降级」与「删掉」在仓里读出来是同一个东西。
+    ///
+    /// 局面:死音的 `low_ratio` 在候选落点上**完全平坦**(每一档都一样干净)⇒ 前两把键全部打平
+    /// ⇒ 只剩乘客那把说话。它必须选**对乘客更友善**的那一档,而不是最浅的那一档。
+    /// ⛔ 变异:把最后那一层 `worst` 过滤删掉 ⇒ 读 −5(最浅),**红**。
+    #[test]
+    fn the_passenger_key_still_breaks_a_tie_it_is_just_no_longer_the_first_key() {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=79i64 {
+            // 死音的落点(79..76)与绝大多数音高一样干净;只有 **55** 是薄的,
+            // 而 55 恰好是那个乘客在**最浅**那一档上的落点。
+            let lr = if m == 55 { 0.60 } else { 0.20 };
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        for m in 80..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.90]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 79], "usable_auto": [36, 79], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap();
+        // 死音 84 ⇒ 最浅 −5(落点 79);预算 3 ⇒ 候选 −5..−8,死音那两把键在四档上全平。
+        // 乘客 60:−5 落到 **55**(薄),−6/−7/−8 落到 54/53/52(干净)。
+        let (on, _) =
+            dead_only_plan_with(&[0, 84, 60, 0], &secs(4), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(
+            on[0].shift, -6,
+            "死音两把键全平之后,乘客那把仍然要说话:−5 把乘客扔在薄槽 55 上 ⇒ 走 −6"
+        );
+        // 阴性对照:把乘客挪到一个在四档上都不薄的音高 ⇒ 必须回到最浅那一档。
+        let (flat, _) =
+            dead_only_plan_with(&[0, 84, 61, 0], &secs(4), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(flat[0].shift, -5, "乘客不薄时三把键全平 ⇒ 取最浅,否则上面那条不是乘客给的");
+    }
+
+    /// ⭐ S157 —— [`LANDING_RATIO_TWO_ST`] 的**值**,上下两侧都钉。
+    ///
+    /// ⛔ 为什么单独一条:`optional_depth_stops_where_the_synthesis_starts_dropping_the_source`
+    /// 只钉「上限存在」,把这个常数从 12 一路改到 15 它**全绿**(S157 扫过)。而这个数刚被
+    /// 重新定过价(12 → 14),再让它躺在一条读不出它的判据下面,就等于没有记录。
+    ///
+    /// 下侧(≥14 才咬得住)由 `a_passenger_may_not_veto_the_landing_the_dead_note_needs` 钉;
+    /// 这里钉**上侧**:一个 `|最浅| = 13` 的组,预算只剩 `14 − 13 = 1`,
+    /// 于是哪怕 `low_ratio` 一路奖励更深,它也只许多花一个半音。
+    /// ⛔ 变异:常数改成 16 ⇒ 预算变 3 ⇒ 读 −16,**红**。
+    #[test]
+    fn the_optional_depth_cap_is_worth_exactly_what_the_ear_line_paid_for() {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=79i64 {
+            // 越低越不薄 ⇒ 排序想一路往下走;台阶远大于 `LANDING_THIN_EPS`,否则「打平」
+            // 会把这条判据变成一句空话(S151 就这么写坏过一次)。
+            let lr = match m {
+                m if m >= 79 => 0.60, // 唯一一格越过 0.55 ⇒ 它是 damage 上就该被跳过的那一档
+                78 => 0.45,
+                77 => 0.35,
+                _ => 0.20,
+            };
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, lr]));
+        }
+        for m in 80..=96i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.90]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 79], "usable_auto": [36, 79], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap();
+        // 死音 92,落点上限 79 ⇒ 最浅 −13;预算 = 14 − 13 = 1 ⇒ 只许走到 −14。
+        let (on, _) = dead_only_plan_with(&[0, 92, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(on[0].shift, -14, "|最浅| = 13 时预算只剩 1 ⇒ 到 −14 为止(常数 16 会读 −16)");
+        assert_eq!(92 + on[0].shift, 78, "落点写死成字面量");
+        // 阳性对照:同一个记录、同一个旋钮,一个最浅只有 −4 的组必须真的花掉那三个半音,
+        // 否则上面那条「只走到 −14」可能只是「预算从来没起过作用」。
+        let (shallow, _) =
+            dead_only_plan_with(&[0, 83, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
+        assert_eq!(shallow[0].shift, -7, "够得着的组要花满 3 个半音,不然预算这条线是空的");
+    }
+
+    /// ⛔⛔ S157 —— `RescueTuning::today()` 的 doc 说「Exactly what ships today」,
+    /// 而它的 `landing` 原来是**字面量 `None`**,不是 [`LANDING_DEFAULT`]。两个值今天恰好相同,
+    /// 所以那是一条**没有人核验过的话**:翻默认的那天,经它取臂的十几条判据会**继续静默地测旧臂**。
+    /// ⭐ 与 S156 在 `psola.rs` 上抓到的是同一条形状,换了个文件又长了一次。
+    /// ⚠ 这条判据今天**读不出差别**(两个常量都是 `None`)—— 它是一条**机械联系**:
+    ///    谁把 `today()` 再写死一次,它当场红。
+    #[test]
+    fn the_today_tuning_is_literally_the_shipped_defaults() {
+        assert_eq!(RescueTuning::today().trim, TRIM_DEFAULT, "trim 必须从常量取");
+        assert_eq!(RescueTuning::today().landing, LANDING_DEFAULT, "landing 必须从常量取");
+        assert_eq!(RescueTuning::today(), RescueTuning::new(TRIM_DEFAULT, LANDING_DEFAULT));
     }
 
     #[test]
