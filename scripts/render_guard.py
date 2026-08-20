@@ -17,9 +17,14 @@
 
 用法(shell)::
 
-    M=$(python scripts/render_guard.py begin --label s157) || exit 5
-    trap 'python scripts/render_guard.py end --marker "$M"' EXIT
-    python scripts/render_guard.py stamp --marker "$M" --tag pre
+    # ⛔ `$GUARD` **必须是绝对路径**:渲染脚本几乎都会 `cd src-tauri`(workspace 在那儿),
+    #    而 trap 是在【退出时的 cwd】里跑的。S157 第一次用它就踩了:相对路径 ⇒ EXIT 时
+    #    python 报 "can't open file" ⇒ **标记没撤、身份没量**,而脚本自己打的是「ALL DONE」。
+    #    ⇒ trap 里还要带一条 `|| echo`,否则 end 的非零退出会被 shell 吞掉。
+    GUARD=/d/MyDev/Utai_v2-dev/scripts/render_guard.py
+    M=$(python "$GUARD" begin --label s157) || exit 5
+    trap 'python "$GUARD" end --marker "$M" || echo "⛔⛔ 身份没通过,读数不可比"' EXIT
+    python "$GUARD" stamp --marker "$M" --tag pre
     ... 渲第一条臂 ...
     python scripts/render_guard.py stamp --marker "$M" --tag armA --log "$L/render_armA.log"
     ... 渲第二条臂 ...
