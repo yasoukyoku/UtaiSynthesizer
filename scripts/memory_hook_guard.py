@@ -41,8 +41,10 @@
 import io
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 
 # ① ⛔ 必须是模块里的第一件事。本机控制台是 cp932,而这个钩子的全部产出都是中文。
 for _s in (sys.stdout, sys.stderr):
@@ -57,15 +59,29 @@ CONF = os.path.join(HERE, "memory_hooks.json")
 STATE_ROOT = os.path.join(tempfile.gettempdir(), "claude_memory_hook_fired")
 
 
-def _emit(context=None, note=None):
+def _emit(context=None, note=None, deny=None):
     """fail-open:永远退出 0,永远不挡工具调用。
 
     ⛔ S138:这个函数**此前有一条能抛异常的路径**,而它是本模块唯一的出口 ——
        cp932 的 stdout 写不出中文 ⇒ UnicodeEncodeError ⇒ 退出码 1 ⇒
        「fail-open」这句承诺不成立,而且是**静默**不成立(工具照常跑,清单不出现)。
        ⇒ 现在写出去这一步有三级退路,而且**最后一定 `os._exit(0)`**。
+
+    ⚠ `deny=` 是**唯一**一条会挡住工具的路(S157 的在途渲染闸)。
+       「fail-open」这个词在这里仍然成立:出错的时候走的是 `context`/`note` 那两条,
+       只有**确认有一个活着的在途标记**时才会 deny。
     """
     out = {}
+    if deny:
+        out["hookSpecificOutput"] = {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": deny,
+        }
+        out["systemMessage"] = note or "⛔ 有渲染在途 —— 这一笔编辑会毁掉臂之间的二进制身份"
+        _write_json(out)
+        sys.stdout.flush()
+        os._exit(0)
     if context:
         out["hookSpecificOutput"] = {
             "hookEventName": "PreToolUse",
@@ -121,6 +137,125 @@ def match_area(rel, areas):
     return None
 
 
+# ── S157:在途渲染闸 ──────────────────────────────────────────────────────────
+#
+# ⛔ 与上面那七个「必读区」**不是一回事**,三处都不同:
+#   ⑴ 它**每次都打**(必读区每个 session 每区只打一次);
+#   ⑵ 它是 **deny**,不是提醒 —— 它挡的不是「你可能没读过某篇」,而是
+#      「你正在毁掉一个几小时才能重来一次、而且已经跑掉一半的东西」;
+#   ⑶ 它也管 **Bash**(bypass 模式下我大部分改动是 sed/heredoc 走的,
+#      只挡 Edit/Write 等于挡了个寂寞 —— 那正是「一条闸在它最常被绕过的路上失明」)。
+#
+# 标记由 `scripts/render_guard.py begin` 写、`end` 撤;配置在 `memory_hooks.json`
+# 的 `render_in_flight` 段。
+
+#: Bash 命令里出现这些 = 有写意图。⚠ 故意**不**收裸的 `>` / `>>`(整天在往日志重定向),
+#: 只收重定向到受保护前缀的那种。
+_WRITEISH = [
+    r"\bsed\s+-i\b", r"\btee\b", r"\bcp\b", r"\bmv\b", r"\brm\b", r"\bpatch\b",
+    r"\btouch\b", r"\btruncate\b", r"\bdd\b", r"\bninja\b", r"\bcargo\s+fix\b",
+    r"\bopen\s*\(", r"\.write\s*\(", r"\bwritelines\b", r"\bwrite_text\b",
+    r"Set-Content", r"Out-File", r"Add-Content", r"New-Item",
+    r">>?\s*[\"']?(?:\./)?(?:src-tauri|src)/",
+]
+
+#: 在途时**无条件**拒的 Bash 命令(不用提到任何受保护文件也一样危险)。
+_ALWAYS_DENY = r"\bgit\s+(checkout|restore|apply|stash|reset|clean|revert|merge|rebase|pull|cherry-pick|switch)\b"
+
+_PATH_TOKEN = re.compile(r"[A-Za-z0-9_./\\:-]+")
+
+
+def flight_conf(conf):
+    return conf.get("render_in_flight") or {}
+
+
+def flight_dir(conf):
+    d = flight_conf(conf).get("dir") or "../TESTING/RENDER_IN_FLIGHT"
+    return os.path.normpath(os.path.join(REPO, d))
+
+
+def live_markers(conf):
+    """[(路径, dict, 年龄小时)] —— 陈标记也返回,由调用方决定读法。"""
+    out = []
+    try:
+        names = sorted(os.listdir(flight_dir(conf)))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        p = os.path.join(flight_dir(conf), n)
+        try:
+            m = json.loads(io.open(p, encoding="utf-8").read())
+        except Exception:                               # noqa: BLE001
+            m = {"label": "<读不动>"}
+        try:
+            age = (time.time() - os.path.getmtime(p)) / 3600.0
+        except OSError:
+            age = 0.0
+        out.append((p, m, age))
+    return out
+
+
+def is_guarded(rel, conf):
+    """这个仓库相对路径改了会不会让 cargo 重编。`rel` 已经过 `_rel()`(小写、正斜杠)。"""
+    for g in flight_conf(conf).get("guarded", []):
+        pre = (g.get("prefix") or "").lower()
+        if not pre or not rel.startswith(pre):
+            continue
+        sufs = [s.lower() for s in (g.get("suffixes") or [])]
+        if not sufs or any(rel.endswith(s) for s in sufs):
+            return True
+    return False
+
+
+def flight_hits(tool, payload, conf):
+    """在途时这一笔工具调用碰到了什么。返回 (原因串, [受保护路径])(没碰到 ⇒ (None, []))。"""
+    if tool == "Bash":
+        cmd = (payload.get("tool_input") or {}).get("command") or ""
+        if re.search(_ALWAYS_DENY, cmd):
+            return ("这条命令会动工作树/HEAD", [])
+        hits = []
+        for t in _PATH_TOKEN.findall(cmd):
+            r = _rel(t.strip("\"'"))
+            if is_guarded(r, conf) and r not in hits:
+                hits.append(r)
+        if not hits:
+            return (None, [])
+        for pat in _WRITEISH:
+            if re.search(pat, cmd):
+                return ("这条命令看起来要写 " + ", ".join(hits[:3]), hits)
+        return (None, hits)     # 只是读它 —— 放行
+    fp = (payload.get("tool_input") or {}).get("file_path") or ""
+    r = _rel(fp)
+    return (("要改 " + r, [r]) if is_guarded(r, conf) else (None, []))
+
+
+def render_flight(reason, live, conf):
+    stale = float(flight_conf(conf).get("stale_hours") or 12)
+    lines = ["⛔⛔ 有整曲渲染在途,而 " + reason + " —— 改它会让 cargo 重编,",
+             "   于是**这几条臂就不再是同一个二进制**,已经跑掉的部分全部作废。",
+             "   (S156 血训 #6:那次是「在等后台渲染的时候顺手加了一行注释」。",
+             "    ⭐ 失效点不是不知道规矩,是后台任务让人忘了它还在跑。)",
+             ""]
+    for p, m, age in live:
+        n = len(m.get("stamps") or [])
+        tail = "   ⚠ 已经 %.1f h,超过 %.0f h 的陈标记线 —— 很可能是上一次渲染没收干净" % (age, stale) \
+            if age > stale else ""
+        lines.append("   在途:label=%s pid=%s 起于 %s 已跑 %.2f h stamps=%d%s"
+                     % (m.get("label"), m.get("pid"), m.get("started"), age, n, tail))
+    lines += [
+        "",
+        "**要么等它跑完,要么先确认它已经死了再撤标记**:",
+        "   python scripts/render_guard.py status",
+        "   python scripts/render_guard.py end --marker \"<上面那个路径>\"   # 正常收工(会顺便量二进制身份)",
+        "   rm \"<上面那个路径>\"                                            # 确认渲染已死时才用",
+        "",
+        "⛔ 别把这条读成噪音:它只在有活标记时出现,而 `end` 一跑它立刻消失。",
+    ]
+    return "\n".join(lines)
+
+
 def render(area, memory_dir):
     lines = []
     lines.append("⛔ 记忆钩子 [%s] —— %s" % (area["id"], area.get("headline", "")))
@@ -153,17 +288,30 @@ def main():
         _emit(note="记忆钩子读不动 stdin(%s)—— 已放行,但它今天没在保护你" % e)
 
     tool = payload.get("tool_name", "")
-    if tool not in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
-        _emit()
-
-    fp = (payload.get("tool_input") or {}).get("file_path") or ""
-    if not fp:
+    # ⚠ Bash 只走「在途渲染闸」那一段:那七个必读区是按 file_path 登记的,
+    #   而在途闸恰恰必须管 Bash(bypass 模式下大部分改动是 sed / heredoc 走的)。
+    if tool not in ("Edit", "Write", "NotebookEdit", "MultiEdit", "Bash"):
         _emit()
 
     try:
         conf = json.loads(io.open(CONF, encoding="utf-8").read())
     except Exception as e:                              # noqa: BLE001
         _emit(note="记忆钩子读不动 %s(%s)—— 已放行,但它今天没在保护你" % (CONF, e))
+
+    # ⛔⛔ 在途渲染闸(S157)—— 排在必读区之前,而且它是唯一一条会 deny 的路。
+    live = live_markers(conf)
+    if live:
+        reason, _hits = flight_hits(tool, payload, conf)
+        if reason:
+            _emit(deny=render_flight(reason, live, conf),
+                  note="⛔⛔ 有整曲渲染在途:%s —— 已拒。撤标记的命令在正文里" % reason)
+
+    if tool == "Bash":
+        _emit()
+
+    fp = (payload.get("tool_input") or {}).get("file_path") or ""
+    if not fp:
+        _emit()
 
     area = match_area(_rel(fp), conf.get("areas", []))
     if area is None:
@@ -249,6 +397,103 @@ def _selftest():
             print("  ok   stdout=%-6s 下 emit 仍然成功(%d 字节)" % (enc, len(payload)))
         except Exception as e:                          # noqa: BLE001
             fails.append("stdout=%s 下 emit 失败:%s: %s" % (enc, type(e).__name__, e))
+
+    # ⛔⛔ S157 在途渲染闸 —— **整条走子进程**,因为这条闸唯一的失效方式是
+    #    「JSON 的形状不对 ⇒ 宿主读不出 deny ⇒ 什么都没发生」,而那在进程内测不到。
+    #    ⇒ 这里真的把钩子当钩子跑一遍(stdin 喂 payload,stdout 收 JSON)。
+    import subprocess
+
+    ME = os.path.abspath(__file__)
+    fdir = flight_dir(conf)
+    marker = os.path.join(fdir, "selftest_%d.json" % os.getpid())
+    had_dir = os.path.isdir(fdir)
+
+    def hook(payload):
+        p = subprocess.run([sys.executable, ME], input=json.dumps(payload),
+                           capture_output=True, text=True, encoding="utf-8")
+        if p.returncode != 0:
+            return {"__rc": p.returncode, "__err": p.stderr[-300:]}
+        try:
+            return json.loads(p.stdout) if p.stdout.strip() else {}
+        except Exception as e:                          # noqa: BLE001
+            return {"__badjson": str(e), "__raw": p.stdout[:300]}
+
+    def denied(out):
+        return ((out.get("hookSpecificOutput") or {}).get("permissionDecision")) == "deny"
+
+    def ed(path):
+        return {"tool_name": "Edit", "session_id": "selftest", "tool_input": {"file_path": path}}
+
+    def sh(cmd):
+        return {"tool_name": "Bash", "session_id": "selftest", "tool_input": {"command": cmd}}
+
+    GUARDED = "src-tauri/src/inference/vocal_range.rs"
+    try:
+        # ⑴ 阴性对照:**没有**在途标记时,同一笔编辑必须放行。
+        #    (缺这条,「命中就 deny」可能只是「永远 deny」。)
+        if denied(hook(ed(GUARDED))):
+            fails.append("⛔ 没有在途标记时也 deny 了 —— 这条闸恒真,等于把编辑关死")
+        else:
+            print("  ok   在途闸:没有标记时放行")
+
+        os.makedirs(fdir, exist_ok=True)
+        io.open(marker, "w", encoding="utf-8").write(json.dumps(
+            {"label": "selftest", "pid": os.getpid(), "started": "selftest", "stamps": []}))
+
+        cases = [
+            (ed(GUARDED), True, "Edit 受保护的 .rs"),
+            (ed(os.path.join(REPO, "src-tauri", "Cargo.toml")), True, "Edit 绝对路径的 Cargo.toml"),
+            (ed("src/lib/vocalNotes.ts"), True, "Edit 被 include_str! 编进去的 .ts"),
+            (ed("README.md"), False, "Edit 一个编不进二进制的文件"),
+            (ed("scripts/render_guard.py"), False, "Edit scripts 下的 python"),
+            (sh("grep -n add_bell src-tauri/crates/utai-dsp/src/psola.rs"), False, "只读地 grep"),
+            (sh("sed -i 's/a/b/' " + GUARDED), True, "sed -i 改它"),
+            (sh("cat > %s <<'EOF'\nx\nEOF" % GUARDED), True, "重定向覆盖它"),
+            (sh("git checkout -- ."), True, "动工作树(没提任何受保护路径)"),
+            (sh("python x.py > /tmp/out.txt"), False, "重定向到无关文件"),
+            (sh("cargo test -p utai --lib"), False, "跑测试本身不该被拦"),
+        ]
+        for payload, want, why in cases:
+            out = hook(payload)
+            if "__rc" in out or "__badjson" in out:
+                fails.append("在途闸子进程异常(%s):%s" % (why, out))
+                continue
+            got = denied(out)
+            if got != want:
+                fails.append("⛔ 在途闸 %s —— 期望 deny=%s 实际 %s" % (why, want, got))
+            else:
+                print("  ok   在途闸:%-34s deny=%s" % (why, got))
+
+        # ⑵ 变异:把 guarded 前缀改成一个不存在的目录 ⇒ 承重那条必须变绿(= 判据不空)
+        mutated = json.loads(io.open(CONF, encoding="utf-8").read())
+        mutated["render_in_flight"]["guarded"] = [{"prefix": "no/such/dir/", "suffixes": [".rs"]}]
+        bak = io.open(CONF, encoding="utf-8").read()
+        try:
+            io.open(CONF, "w", encoding="utf-8").write(json.dumps(mutated, ensure_ascii=False))
+            if denied(hook(ed(GUARDED))):
+                fails.append("⛔⛔ 把 guarded 名单换成一个假目录之后照样 deny —— "
+                             "说明 deny 不是名单给的,这条闸是空的")
+            else:
+                print("  ok   在途闸变异:名单换假目录 ⇒ 不再 deny(判据不空)")
+        finally:
+            io.open(CONF, "w", encoding="utf-8").write(bak)
+
+        # ⑶ deny 的正文必须真的写着怎么撤标记(否则第二天一定被人 rm -rf 整个目录)
+        body = (hook(ed(GUARDED)).get("hookSpecificOutput") or {}).get("permissionDecisionReason", "")
+        if "render_guard.py" not in body or "selftest" not in body:
+            fails.append("⛔ deny 正文里既要有撤标记的命令、也要点名是哪个标记")
+        else:
+            print("  ok   在途闸:deny 正文带撤标记命令 + 点名标记")
+    finally:
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        if not had_dir:
+            try:
+                os.rmdir(fdir)
+            except OSError:
+                pass
 
     print()
     if fails:

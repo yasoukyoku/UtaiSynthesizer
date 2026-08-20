@@ -3,6 +3,42 @@
  "_how": "PreToolUse 钩子在 Edit/Write 触到下面任一 match 前缀时打出该区的必读清单。⛔ 每个 session × 每个区**只打一次**(打多了必然被调成噪音、然后被无视)。",
  "_maintenance": "新增一个区之前先问:它的『必读』真的会改变我要写的代码吗?不会就别加 —— 这份清单的价值与它的长度成反比。",
  "memory_dir": "C:\\Users\\admin\\.claude\\projects\\D--MyDev-Utai-v2-dev\\memory",
+ "render_in_flight": {
+  "_why": "S156 血训 #6:多条臂的整曲渲染在后台跑,我在等它的时候顺手给 psola.rs 加了一行注释 —— 注释也会让 cargo 重编,那就破坏了『N 条臂同一个二进制』这个契约。失效点不是『我不知道规矩』,而是后台任务让我忘了它还在跑 ⇒ 药只能下在动手那一刻。",
+  "_how": "scripts/render_guard.py begin 会在 dir 里写一个 <label>_<pid>.json;只要它在,PreToolUse 就把对下面这些文件的编辑【拒掉】(不是提醒),并给出撤标记的命令。end 会把它撤掉。⛔ 与那七个『必读区』不同:这一条【每次都打】,而且它是 deny 不是提醒 —— 它挡的是一个正在流失的、几小时才能重来一次的东西。",
+  "dir": "../TESTING/RENDER_IN_FLIGHT",
+  "stale_hours": 12,
+  "guarded": [
+   {
+    "prefix": "src-tauri/",
+    "suffixes": [
+     ".rs",
+     ".toml",
+     ".lock"
+    ]
+   },
+   {
+    "prefix": "src/",
+    "suffixes": [
+     ".ts",
+     ".tsx"
+    ]
+   },
+   {
+    "prefix": "src-tauri/tauri.conf.json",
+    "suffixes": []
+   },
+   {
+    "prefix": "src-tauri/dictionaries.sha256",
+    "suffixes": []
+   },
+   {
+    "prefix": "scripts/release.ps1",
+    "suffixes": []
+   }
+  ],
+  "_guarded_why": "凡是能让 cargo 重编的输入。src-tauri 下的 .rs/.toml/.lock 是显然的;src/**.ts(x) 与 tauri.conf.json / dictionaries.sha256 / scripts/release.ps1 是因为它们被 include_str! 编了进去(grep include_str! 可查),改了同样会重编。"
+ },
  "areas": [
   {
    "id": "gate",
@@ -160,6 +196,7 @@
     "project_v2_session85.md"
    ],
    "hard_rules": [
+    "⭐ S157 **长时渲染有闸了,别再靠记性**:`python scripts/render_guard.py begin --label sNNN` 写在途标记 ⇒ 只要它在,PreToolUse 就把对 `src-tauri/**.rs` / `src/**.ts(x)` 等**能让 cargo 重编**的编辑(含 Bash 的 sed/重定向、以及任何 `git checkout/stash/reset`)**直接拒掉**;`stamp --tag <臂>` 逐臂记产物指纹、`end` 收工时**量一次二进制身份**并撤标记。⛔ 为什么是量不是论证:S156 那次事后用「HEAD 没变 + 树干净」收场,而那个检查**看不见「改了又改回去」**(dirty 回到 0、HEAD 没动,cargo 已经重编过)。⇒ 判据改成只看产物 `target/debug/deps/utai*.exe` 的 (名, 字节, mtime_ns) 全集。",
     "⚠ 【拿 akiko 做对照前先跑 `scratchpad/doctor_akiko.py status`】。S146d 那份「80 判死」的实验态**早已还原**(S146e),但备份 `.s146d-backup` 与工装都还在,而盘上那份被重扫过 (`scan_version 4`,带 onset 电平列)。⛔ 别再用 `doctor_akiko.py apply` 复现「80 判死」:今天把**可用上限**拖到 79 就是同一件事。",
     "⛔⛔ S146c:**救援落点规则已从「最浅合格」改成「在合格集合内按 damage 最小、平局取最浅」**,而它**必须带深度上限**(`LANDING_MAX_EXTRA_DEPTH = 1`)—— 无上限时东雪莲会走到 **−24**(它中段有 15 格 low_ratio>0.7),而 S85 记着 −24 整曲重着色是用户耳判的灾难。⛔ 那条判据**写了三版才有牙**:①夹具留着被拖走的音 ⇒ 它们把 worst-damage 钉死 ⇒ 变异不红(要用**没有乘客的单个死音**);②**断言里引用了被测的常量** ⇒ 永远不可能红(**边界必须写字面量**)。",
     "⭐⭐⭐ S146:**「ratio == 1.0 必须是恒等变换」是这条线上最便宜、最不可能自证的判据**,而它必须打在 `utai_dsp::psola` 内核上 —— `apply_inverse` 在 `shift == 0` 提前 return,打在那里是恒真的空判据。2026-07 删掉的那份实现**在 ratio 1.000 上就掉 5-9 dB HNR**(它自己的注释写着),⇒ 病是「过一遍重合成」的固定税。这条判据在 S146 当场否决了我已经写下去的**三个**设计(独立相位积分的目标脉冲 / 搬运用去 DC 的信号 / 照 praat 那样按相关门限拒绝 mark),每一个都是「看起来对、跑起来红」。",
