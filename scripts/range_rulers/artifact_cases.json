@@ -1,0 +1,51 @@
+{
+ "_doc": [
+  "S159u —— **用户确认过的病例台账**。每一条 = 一个『他听见/看见了、我事后能用判据读出来』的位置。",
+  "⛔ 它存在的理由:『竖线』那一族被追了三个 session、修好之后又回来了 —— 而当时**没有把它钉成案例**,",
+  "   所以没有任何东西会在它回来的那一刻变红。⇒ 凡是用户确认过的缺陷,一律进这份台账。",
+  "⛔ 每条必须有 negative:同一把判据在**哪条臂/哪个模型**上读到干净值。没有阴性对照的条目不作数。",
+  "用法:python scripts/range_rulers/artifact_sheet.py --check <这个文件> --wav <新渲染> [--case-id ...]"
+ ],
+ "cases": [
+  {
+   "id": "s159t_click_yachiyo_plus7",
+   "reported": "2026-08-21 用户:『咔哒声/竖直条纹又回来了』",
+   "detector": "digital_silence_in_note",
+   "material": "lch_score.json × yachiyo_runami × transpose +7(谱面轨)",
+   "expect": "唱音内的绝对数字静音 **0 个**",
+   "observed_bad": "实机导出 export2.wav:**10 个**(38.30/49.90/60.82/122.62/126.46/127.56/197.93/198.26/244.44/244.80 s)",
+   "negative": "同素材 akiko:**0 个**",
+   "notes": "9/10 落在救援组内;5 个挤在距组首 0.26-0.30 s。含用户点名的 [685]「ぴゃ」(组 −15)。"
+  },
+  {
+   "id": "s159t_subfund_yachiyo_plus7",
+   "reported": "2026-08-21 用户:『43.929、44.0 之类的地方有频率较低但明显的竖线』",
+   "detector": "sub_fundamental_sheet",
+   "material": "同上",
+   "expect": "该处不进入全曲最高 5% 分位",
+   "observed_bad": "43.93 / 44.05 s 读 **−7.0 dB**,全曲**最高 0.8%**;128.83 s 读 −14.6 dB(最高 4.8%)",
+   "negative": "全曲 p50 = −42.2 dB",
+   "notes": "= donor 基频漏出(−12/−15 时落在 400-600 Hz)= S157b 修过的「合唱感」在深位移上回来。"
+  },
+  {
+   "id": "s159t_subfund_akiko_plus7",
+   "reported": "2026-08-21 用户:『akiko 4:30 在基频以下还有明显的面状伪影』",
+   "detector": "sub_fundamental_sheet",
+   "material": "lch_score.json × akiko × transpose +7(谱面轨)",
+   "expect": "该处不进入全曲最高 5% 分位",
+   "observed_bad": "270.30 s 读 **+2.5 dB**,全曲**最高 0.1%**;269.9-270.0 s 读 −21.4(最高 9.7%)",
+   "negative": "全曲 p50 = −37.4 dB",
+   "notes": "⚠ akiko 在『数字静音』那一族上是干净的(0 个)⇒ 两族缺陷互相独立,别混为一谈。"
+  },
+  {
+   "id": "s159e_seam_yachiyo_orig_key",
+   "reported": "2026-08-21 用户:『4:49.5 有接缝』『4:23.2 确实有缝』(原 key)",
+   "detector": "junction_collapse(谱心塌陷)",
+   "material": "lch_score.json × yachiyo × 原 key,可用/目标范围 D#5",
+   "expect": "[799]→[800] 谱心塌陷不超过 base 地板(~8%)",
+   "observed_bad": "1.85 dB / **28.7%**(翻默认前);S159i 之后 1.11 dB / 28.5%",
+   "negative": "可用范围抬到 F5 ⇒ **0.91 dB / 4.2%**;base↔base 交界地板 p50 0.9 dB / 8%",
+   "notes": "⭐ 谱心那一半是 donor 渲染自己的,不是 PSOLA;电平那一半 S159i 已修掉。"
+  }
+ ]
+}
