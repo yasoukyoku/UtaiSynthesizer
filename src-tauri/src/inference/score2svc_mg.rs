@@ -836,6 +836,9 @@ fn mg_cv_cond_grid() {
 #[test]
 #[ignore]
 fn mg_render_rvc() {
+    // S159b —— ⛔ 没有订阅者的话渲染路径每条 `info!` 都被静默吞掉,包括新加的 `[perf] score/rvc`
+    // (S147 就为这件事付过一次学费)。这条臂本来一行秒表都没有,所以它以前也不需要订阅者。
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
     let sj = load_score();
     let slice = std::env::var("UTAI_MG_SLICE").unwrap_or_default();
     let (a, b) = if slice.is_empty() {

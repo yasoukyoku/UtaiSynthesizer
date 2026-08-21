@@ -616,6 +616,23 @@ fn donor_keep_mask(chunks: &[Chunk], windows: &[(i64, i64)], margin_frames: i64)
     keep
 }
 
+/// S159b —— 一个 chunk 在 **RVC 臂**上产出多少样本。
+///
+/// ⛔ 它必须与那一行 `wav.truncate((real_t * (m.sample_rate / 100)).min(wav.len()))` 用**同一个
+/// 信念**:100 fps 的每一帧对应 `sr/100` 个输出样本,而 `real_t = 2·chunk.t`(`rvc_feed_100` 把
+/// 50 fps 的 cv 复制成 100 fps 的音高栅格)。`min_frames` 的 pad 只影响喂进去的长度,**输出**那一侧
+/// 已经被上面那行截回 `real_t`,所以这里不看它。
+///
+/// ⛔⛔ 为什么这个数是承重的:donor 跳过的 chunk 要**铺同样长的零**,而拼接层按**绝对样本**索引
+/// `audio`。差一个样本,这一遍之后的每一条救援窗都跟着滑走 —— 而组数 / 乘客数 / donor 遍数 /
+/// 位移集 / 音频秒数**全部正常**。SoVITS 臂上正是在这里踩过:用 `chunk.t * sr / 50` 在 akiko 的
+/// hop 上每个 chunk 差 **124** 个样本(见 `sovits_grid_len` 那一行的注释)。
+/// ⇒ 这条公式**不许推**,它由 `the_rvc_hole_is_exactly_what_a_chunk_produces` 钉住,
+/// 而且真渲出来的每个 chunk 都会与它对一次(对不上就进 `[perf]` 的 `len!=` 计数,见那一行)。
+pub(crate) fn rvc_out_len(t50: usize, sample_rate: u32) -> usize {
+    t50 * 2 * (sample_rate as usize / 100)
+}
+
 /// The SVC net_g input feed for one chunk on the SoVITS hop grid.
 pub struct SovitsFeed {
     /// cv resampled to the hop grid, `[t_tgt, dim]`.
@@ -1040,11 +1057,34 @@ pub fn render_score_rvc(
     let idx_weights = fast_index_weights(&arr);
     let mut audio: Vec<f32> = Vec::new();
     let mut cv_cursor = 0usize;
+    // S159b —— **秒表**。RVC 谱面臂到今天为止**一行都没有**,所以「这条臂慢在哪」在日志里
+    // 读不出来(S159 那次是按日志时间戳手算出 182 s vs SoVITS 78.6 s 的)。
+    // ⛔ 与 SoVITS 臂同款:只在段边界取时间,不进任何逐样本循环,且不打 per-chunk 日志。
+    let t_render = std::time::Instant::now();
+    let (mut t_s2cv, mut t_decode) = (0f64, 0f64);
+    // S159b —— **B2 移植**:一遍 donor 只需要渲它会被拼回去的那些 chunk。
+    // ⛔ 这一刀 S147 只做在 SoVITS 臂上,RVC 谱面臂一直每遍渲整曲(实测同曲 182 s vs 78.6 s)。
+    // 谓词、余量、`hard_seam` 两侧必保这三条全部复用 `donor_keep_mask` —— ⛔ 不许在这里重写一份:
+    // S147 那次「渲多了但拼对了 = 功能正确、收益静默减半」正是因为同一个谓词写了两遍。
+    let keep: Option<Vec<bool>> =
+        donor.map(|d| donor_keep_mask(&chunks, d.windows, DONOR_WINDOW_MARGIN_FRAMES));
+    let (mut skipped, mut len_mismatch) = (0usize, 0usize);
     for (ci, chunk) in chunks.iter().enumerate() {
+        // ⛔ 铺零的长度必须与真渲出来的一样(见 `rvc_out_len` 的 doc:差一个样本,这一遍之后
+        //    的每一条救援窗都静默滑走)。
+        let want = rvc_out_len(chunk.t, m.sample_rate);
+        if keep.as_ref().is_some_and(|k| !k[ci]) {
+            audio.resize(audio.len() + want, 0.0);
+            cv_cursor += chunk.t; // ⚠ 必须照样前进:note_hz / idx_weights 的切片是绝对下标
+            skipped += 1;
+            progress((ci + 1) as f32 / n_chunks as f32);
+            continue;
+        }
         if cancel() {
             return Err(UtaiError::Inference("CANCELLED".into()));
         }
         // S84 E 刀: vowel-clarity oversampling (off / no qualifying nucleus = the plain call).
+        let t0 = std::time::Instant::now();
         let cv = if shaping.vowel_clarity {
             run_score2cv_vowel_clarity(
                 m.engine, score2cv_session, chunk, &arr.phon[chunk.start..chunk.end],
@@ -1053,17 +1093,27 @@ pub fn render_score_rvc(
         } else {
             run_score2cv(m.engine, score2cv_session, chunk, dim, cv_speaker_id, chunk.lang_id)?
         };
+        t_s2cv += t0.elapsed().as_secs_f64();
         let note_hz = &note_hz_full[cv_cursor..(cv_cursor + chunk.t).min(note_hz_full.len())];
         let (cv_p, pitch, pitchf, real_t) = rvc_feed_100(cv, note_hz, m.min_frames);
         // chunk 权重切片(min_frames pad 出的行由 vc_decode 的 unwrap_or(1.0) 兜=不加权)。
         let w_chunk = &idx_weights[cv_cursor..(cv_cursor + chunk.t).min(idx_weights.len())];
+        let t1 = std::time::Instant::now();
         let mut wav = vc_decode(
             m, cv_p, &pitch, &pitchf, sid, spk_mix_dense.as_deref(), options, ci as u64, usize::MAX,
             Some(w_chunk),
         )?;
+        t_decode += t1.elapsed().as_secs_f64();
         if pitchf.len() > real_t {
             // RVC net_g emits ~ p_len·(sr/100) samples; keep only the pre-pad span.
             wav.truncate((real_t * (m.sample_rate as usize / 100)).min(wav.len()));
+        }
+        // S159b —— ⛔ 那个「~」必须变成一条会响的检查:`rvc_out_len` 是**跳过的 chunk 铺多少零**
+        // 的唯一依据,而它与上面那行截断共用同一个信念(每 100 fps 帧 = `sr/100` 个样本)。
+        // 对不上就意味着「洞」的长度是错的 ⇒ 这一遍之后每条救援窗都滑走,而所有计数器全绿。
+        // ⇒ 计数进 `[perf]`(与 `skipped` 同一行)—— 那正是 S147 那次静默减半唯一被抓到的方式。
+        if wav.len() != want {
+            len_mismatch += 1;
         }
         // S73e: 真休止(SP)窗零化(RVC 症状最轻但同样受益;AP 呼吸不动)
         let sp_wins = chunk_sp_windows(chunk, wav.len());
@@ -1085,6 +1135,20 @@ pub fn render_score_rvc(
         cv_cursor += chunk.t;
         progress((ci + 1) as f32 / n_chunks as f32);
     }
+    // ⛔⛔ S159b —— **整条缓冲的长度必须与「每个 chunk 都渲」时一模一样**,而且要在**循环刚结束**
+    // 处量(`apply_formant_env` 之后再量会把它自己的长度变化算进来 = 假警报)。
+    // `len!=` 只看**真渲出来的** chunk,铺零那一侧它一个字都看不见 —— 而铺零正是这一刀新加的那条路。
+    // 少铺 / 多铺一个样本,之后每条救援窗都滑走;而 `apply_dead_only_windows` 的
+    // 「donor N vs base M — clamped」那条 warn 只在差超过一整帧(≈960 样本)时才响
+    // ⇒ 20 个洞各差 1 个样本**够不着它**。
+    let want_total: usize = chunks.iter().map(|c| rvc_out_len(c.t, m.sample_rate)).sum();
+    let total_delta = audio.len() as i64 - want_total as i64;
+    if total_delta != 0 {
+        tracing::warn!(
+            "score/rvc: the decoded buffer is {total_delta:+} samples off what the chunk grid says              ({} vs {want_total}) — every rescue window after the first hole would slide",
+            audio.len()
+        );
+    }
     // Post-decode (§M-defer order 响度增益 → 共振腔 → 归一化): RVC has no net_g vol port, so loudness is an
     // absolute gain envelope; formant warps the timbre. Both no-op when their env is None/flat.
     if let Some(lc) = &loud_cv {
@@ -1093,12 +1157,33 @@ pub fn render_score_rvc(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
+    let t0 = std::time::Instant::now();
     audio = apply_range_inverse(
         audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full,
         donor.map_or(&[][..], |d| d.keep_samples),
     )?;
+    let t_inverse = t0.elapsed().as_secs_f64();
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
+
+    // S159b —— RVC 谱面臂到今天为止**一行秒表都没有**,所以「这条臂慢在哪」在日志里读不出来
+    // (S159 那次只能按日志时间戳手算)。⛔ `skipped` 与 `len!=` 与 `skipped` 同行:前者是
+    // S147 那次「收益静默减半」唯一被抓到的指纹,后者是「洞的长度算错了」唯一会露头的地方。
+    let wall = t_render.elapsed().as_secs_f64();
+    let secs = audio.len() as f64 / f64::from(m.sample_rate);
+    tracing::info!(
+        "[perf] score/rvc {secs:.1}s audio in {wall:.2}s (RTF {:.3}) · {} chunks · \
+         s2cv {t_s2cv:.2}s ({:.0}%) · decode(net_g) {t_decode:.2}s ({:.0}%) · \
+         inverse {t_inverse:.2}s ({:.0}%) · other {:.2}s · range_shift {range_shift:+} \
+         · skipped {skipped}/{} · len!= {len_mismatch} · total{total_delta:+}",
+        if secs > 0.0 { wall / secs } else { 0.0 },
+        chunks.len(),
+        100.0 * t_s2cv / wall.max(1e-9),
+        100.0 * t_decode / wall.max(1e-9),
+        100.0 * t_inverse / wall.max(1e-9),
+        (wall - t_s2cv - t_decode - t_inverse).max(0.0),
+        chunks.len(),
+    );
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
 }
 
@@ -1756,6 +1841,57 @@ mod tests {
             t * sr as usize / 50,
             "两个口径必须真的不同,否则这条判据是恒真的"
         );
+    }
+
+    /// S159b —— ⛔⛔ **RVC 臂上「洞」的长度**。同一条理由:拼接层按绝对样本索引,
+    /// 差一个样本这一遍之后每条救援窗都滑走,而所有计数器全绿。
+    ///
+    /// ⚠ SoVITS 那一侧的坑是 hop 栅格取整;RVC 这一侧的坑是**那句「~」** ——
+    /// 截断行的注释写着「RVC net_g emits **~** p_len·(sr/100) samples」,而跳过的 chunk 要铺的零
+    /// 用的就是这个信念。⇒ 这条判据钉住公式本身(**期望值写字面量**),
+    /// 而**真渲出来的每个 chunk 都会与它对一次** —— 对不上就进 `[perf]` 的 `len!=` 计数。
+    /// ⭐ S159b 拿 yachiyo(48 kHz)在 `mg_render_rvc` 上实跑,`len!= 0` ⇒ 这个信念**被证伪过一次机会**。
+    #[test]
+    fn the_rvc_hole_is_exactly_what_a_chunk_produces() {
+        // 48 kHz:100 fps 的每一帧 = 480 个样本,而 `rvc_feed_100` 把 50 fps 的 cv 复制成 100 fps
+        // ⇒ 一个 50 fps 帧 = 960 个样本。⛔ 期望值写死,不许拿被测的公式算。
+        assert_eq!(rvc_out_len(1, 48_000), 960);
+        assert_eq!(rvc_out_len(400, 48_000), 384_000);
+        assert_eq!(rvc_out_len(0, 48_000), 0);
+        // 40 kHz / 32 kHz 的 RVC 导出(仓里支持的另外两档)
+        assert_eq!(rvc_out_len(1, 40_000), 800);
+        assert_eq!(rvc_out_len(1, 32_000), 640);
+        // ⭐ 它必须与**截断那一行**是同一个信念:`real_t * (sr/100)`,而 `real_t = 2·t50`。
+        for (t, sr) in [(1usize, 48_000u32), (7, 40_000), (400, 32_000), (401, 48_000)] {
+            let real_t = t * 2;
+            assert_eq!(rvc_out_len(t, sr), real_t * (sr as usize / 100), "t={t} sr={sr}");
+        }
+        // ⛔ 阴性对照:它与 SoVITS 那一侧的公式**不是**一回事(照抄过去会差出量级)。
+        assert_ne!(rvc_out_len(400, 44_100), sovits_grid_len(400, 44_100, 512) * 512);
+    }
+
+    /// S159b —— **接线闸:两条谱面臂都必须问 `donor_keep_mask` 该渲哪些 chunk。**
+    ///
+    /// ⛔ 为什么需要它:S147 的 B2 当年**只做在 SoVITS 臂上**,RVC 谱面臂就这样每遍渲整曲
+    /// 渲了十二场 —— 而它「功能完全正确」,只是慢一倍(实测同曲 182 s vs 78.6 s)。
+    /// 没有任何判据看得见「一条臂没接这一刀」,因为**不接也是对的**。
+    ///
+    /// ⚠ 这是文本闸,只证明那一行在;它证明不了参数对(那是上面那几条 `donor_keep_mask` 的行为
+    /// 判据的事)。⛔ 期望的符号用 `concat!` 拼 —— `include_str!(自己)` 会把断言自己读进来,
+    /// 断言里出现的字面量一定命中(S159 在 `vocal_range.rs` 上刚踩过这条)。
+    #[test]
+    fn both_score_arms_ask_donor_keep_mask_which_chunks_to_render() {
+        let me = include_str!("score2svc.rs");
+        let call = concat!("donor_keep", "_mask(&chunks, d.windows, DONOR_WINDOW_MARGIN_FRAMES)");
+        assert_eq!(
+            me.matches(call).count(),
+            2,
+            "谱面轨的两条臂(SoVITS / RVC)必须各问一次 —— 少一条 = 那条臂每遍 donor 都渲整曲,\
+             而功能完全正确、没有任何计数器会红"
+        );
+        // 阴性对照:两条臂各自的洞也必须各用各的长度公式,而它们不同。
+        assert_eq!(me.matches(concat!("rvc_out", "_len(chunk.t, m.sample_rate)")).count(), 1);
+        assert_eq!(me.matches(concat!("sovits_grid", "_len(chunk.t, m.sample_rate, m.hop_size)")).count(), 1);
     }
 
 
