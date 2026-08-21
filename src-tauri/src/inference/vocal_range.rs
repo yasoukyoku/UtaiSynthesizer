@@ -664,47 +664,32 @@ pub fn dead_only_plan_with(
                         _ => true, // 没有邻音 / 那边是休止 ⇒ 护栏伸不进任何唱音
                     }
                 };
-                // ⛔⛔⛔ S159e —— **裁剪不许跨过一个【小音程】的接点。**用户 2026-08-21 的真病例。
+                // ⛔⛔⛔ S159f / S159g —— **别再往这里加「按接点音程决定裁不裁」的规矩。**
                 //
-                // 机理是两层的,而且是被数据分开的:
-                // ⑴ **来源**:`dead_only_plan` 按休止分乐句 ⇒ **没被裁过的组,两条边按构造都落在
-                //    休止里**(S158 实测原 key 50/50、+7 126/126)。裁剪是唯一把边搬到唱音上的东西
-                //    (实测那一版 25 组里 9 条头边在唱音上,**全部**被裁过头;没被裁头的 16 组 **0 条**)。
-                // ⑵ **台阶多大** ← donor 的 PSOLA 深度:同一条边在位移 −7 与 −8 上,base 与 donor 的
-                //    谐波间噪声差 **0.6 dB → 12.2 dB**。⛔ 而「位移越深台阶越大」**是错的** ——
-                //    全 9 条边实测 `corr(|位移|, 台阶) = −0.11`;台阶只在**那一组的位移变了**时才变。
-                // ⑶ ⭐⭐⭐ **听不听得见** ← **接点的音程**:7 条落在 +12 / +9 半音大跳上的边,台阶
-                //    12-29 dB **一条都没被察觉**;2 条落在 **+1 半音**接点上的(同一个元音、连续上行),
-                //    台阶 12.2 / 16.7 dB **两条都被听到**。音色变化在大跳里有东西可以藏,在一度级进里没有。
-                //    ⭐ 这条结论的分量来自**先预测再证实**:按它点名的第二条缝(用户没提过的那条)
-                //    经用户复听**确实存在**。
+                // S159f 加过一条(`TRIM_MIN_JOINT_INTERVAL = 5`:裁剪暴露出来的接点音程 < 5 半音
+                // 就不裁那一侧)。用户实机一听**更糟**:同一句里能听出缝的音从 1 个变成 3-4 个。
+                // 撤掉之前把现场量清楚了,四条读数:
                 //
-                // ⚠ **电平只差 2.25 dB** ⇒ S158b 登记的「缝处的局部**电平**匹配」治不了这一类,
-                //    它是**音色**台阶。⇒ 今天唯一有依据的做法是**别把边放在那种接点上**。
+                // ⑴ 用户听到的「缝」**不是拼接缝**,是 **donor 那一路自己在音符交界处的塌陷** ——
+                //    5 ms 包络上一个 ~40 ms 宽、电平掉 2-4 dB、**谱心塌掉 20-30%** 的坑。
+                //    同一条交界([799]→[800])在「裁了」与「没裁」两遍里读数**完全相同**
+                //    (1.85 dB / 28.7%):拼接点落在它前面约 20 ms,坑的两侧本来就都取自 donor。
+                // ⑵ 它**随位移深度走**(同一批音、同一份谱、只有位移不同的几遍真渲染):
+                //    [801] −7 → 1.42 dB,−8 → 2.94 dB;[761] −9 → 3.36,−10 → 4.47;
+                //    [762] −9 → 0.38,−10 → 2.48。base↔base 的元音交界地板是 p50 0.9 dB / 8%。
+                // ⑶ ⛔ **不是 PSOLA 把干净音频弄坏的**:同一段 base 音频过一遍生产口径的
+                //    `psola_shift_env` +8,交界塌陷 1.11-1.43 dB —— 与没过 PSOLA 的原始几乎相同。
+                // ⑷ ⛔ 也**不是「喂进去的是阶梯基频、音频却是滑音」**(交界处两者差到 146 音分):
+                //    换成从音频自己测出来的滑音轨再跑一遍,逐个交界读数几乎不动(1.12 / 1.26 / 1.46)。
                 //
-                // ⚠ 退法与 `guard_ok` 一致:不裁那一侧(乘客多过一遍 PSOLA 的过路费是已量过的、
-                //    温和的;而一条可闻的缝不是)。
-                let joint_ok = |lo: Option<usize>, hi: Option<usize>| -> bool {
-                    let g = |k: Option<usize>| k.and_then(|k| note_nums.get(k).copied()).filter(|n| *n > 0);
-                    match (g(lo), g(hi)) {
-                        (Some(x), Some(y)) => (eff(x) - eff(y)).abs() >= TRIM_MIN_JOINT_INTERVAL,
-                        // ⚠ S159e:这条臂**今天够不着**(变异实测:改成 `false` 没有任何判据变红)——
-                        // 一侧是休止就意味着 `first_dead == i` / `last_dead == j`,那一侧本来就不会被裁
-                        // (`freed_* = 0 < *_ms`)。留着它是防御,不是活路径;⛔ 别把它当「休止臂已验过」。
-                        _ => true,
-                    }
-                };
+                // ⇒ 裁剪的真实作用是**减少落在 donor 里的音符交界数**。挡掉裁剪 = 把 4 个乘客
+                //    连同它们的 3 个交界一起拖进 donor ⇒ 多出 2 个可闻的坑。**方向是反的。**
+                // ⇒ 今天:该裁就裁,不看接点音程。真正要修的是 ⑴ 那个塌陷本身(还没定位到层)。
                 let (freed_head, freed_tail) = (ms(i, first_dead), ms(last_dead + 1, j + 1));
-                if freed_head >= head_ms
-                    && guard_ok(first_dead.checked_sub(1), whole_shift)
-                    && joint_ok(first_dead.checked_sub(1), Some(first_dead))
-                {
+                if freed_head >= head_ms && guard_ok(first_dead.checked_sub(1), whole_shift) {
                     a = first_dead;
                 }
-                if freed_tail >= tail_ms
-                    && guard_ok(Some(last_dead + 1), whole_shift)
-                    && joint_ok(Some(last_dead), Some(last_dead + 1))
-                {
+                if freed_tail >= tail_ms && guard_ok(Some(last_dead + 1), whole_shift) {
                     b = last_dead;
                 }
                 if (a, b) != (i, j) {
@@ -1563,22 +1548,6 @@ fn merge_same_shift_across_rests(
 /// stayed green. Measured cost of the guard itself: 40 ms of one passenger is rendered from the
 /// donor instead of base, at the same written pitch (the inverse already put it back).
 const GUARD_FRAMES: i64 = 2;
-
-/// S159e —— 裁剪暴露出来的那个接点,**最小可接受的旋律音程**(半音)。小于它就不裁那一侧。
-///
-/// ## ⛔ 它不是品味,是一条用户耳判 + 一次成功预测钉出来的线
-/// 同一首歌、同一版计划,9 条被裁剪暴露出来的头边:
-/// * 7 条落在 **+12 / +9 半音**的大跳上 —— base↔donor 的音色台阶 **12-29 dB**,用户**一条都没察觉**;
-/// * 2 条落在 **+1 半音**的接点上(M75→M76,同一个元音「あ」,连续上行)—— 台阶 **12.2 / 16.7 dB**,
-///   **两条都被听到**。而第二条是**按这个模型预测出来、再经用户复听证实**的,不是事后解释。
-///
-/// ⇒ 决定可闻性的不是台阶多大,是**接点本身有没有东西可以藏**。
-///
-/// ## ⚠ 这个数字只有两档实测:**1 可闻 · 9 / 12 不可闻;2-8 未测**
-/// 取 5(纯四度)是那个区间的中点。⛔ 失败方向是**少裁一点** —— 乘客多过一遍 PSOLA 的过路费
-/// 是已经量过的、温和的(S148:那是「进一次工序的过路费」,不按深度收);而一条可闻的缝不是。
-/// ⇒ 哪天有 2-8 那一档的耳判,回来改这个数,并把读数写在这里。
-const TRIM_MIN_JOINT_INTERVAL: i64 = 5;
 
 /// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
 /// need rendered. `spf` MUST be the same samples-per-frame map the splicer uses
@@ -4458,7 +4427,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={} joint={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -4478,14 +4447,13 @@ mod tests {
             //    (理由与那三条承重判据写在 `windowed_inverse()` 的 doc 里)。
             //    进指纹的意义是「下一个人翻它的时候必须来这里改一行,于是不得不读那段 doc」。
             parse_windowed_inverse(None),
-            TRIM_MIN_JOINT_INTERVAL,
         );
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true joint=5",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159a";
+        const TAG: &str = "s159b";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -5836,11 +5804,7 @@ mod tests {
         // set of rescued groups are untouched. Asserted against the same plan the decision layer
         // builds, not against the ranking function alone.
         let r = Rec::default().build();
-        // ⛔ S159e:尾巴上那个乘客原来是 **80**,而 81→80 是**一度**接点 ——
-        //    新规矩(`TRIM_MIN_JOINT_INTERVAL`)不许在那里落边,于是尾裁不再发生、span 停在 (0,5),
-        //    这条判据就测不到「裁剪只改谁陪着走」那件事了。⇒ 换成一个**大跳**的乘客(81→70 = 11 半音),
-        //    让裁剪照旧发生;小音程那一侧由 `a_trim_may_not_expose_a_small_melodic_joint` 单独钉。
-        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 70, 0, 70, 71];
+        let nn: Vec<i64> = vec![75, 76, 85, 83, 81, 80, 0, 70, 71];
         let fr: Vec<i64> = vec![9; nn.len()];
         // ⛔ S158: trim 写死成 `None` —— 这条钉的是**落点规则**,而 `RescueTuning::today()`
         //    从 S158 起自带「只裁尾」,会把乐句尾巴上的乘客切掉、把 span 从 (0,5) 变成 (0,4)。
@@ -5870,15 +5834,17 @@ mod tests {
         let _ = fr;
     }
 
-    /// S159e —— ⛔⛔⛔ **裁剪不许把窗边放在一个【小音程】的接点上。**用户 2026-08-21 的真病例。
+    /// S159g —— ⛔⛔⛔ **反向守卫:接点音程小,不是不裁的理由。**
     ///
-    /// 机理与读数写在 [`TRIM_MIN_JOINT_INTERVAL`] 的 doc 里。这里钉三件:
-    /// ⑴ **小音程接点 ⇒ 不裁**(哪怕回收量远超门限);
-    /// ⑵ **大跳接点 ⇒ 照裁** —— 没有这一条,上面那条可以由「干脆不裁」满足,而那会把 S148 r3
-    ///    盲测背书过的收益整个扔掉;
-    /// ⑶ **另一侧是休止 ⇒ 照裁**(边落在休止里本来就没有代价,这是这条规矩的适用边界)。
+    /// S159f 真的按「小音程不裁」发过一版,用户实机判负(能听出缝的音 1 → 3-4 个)。
+    /// 机理与四条读数写在 `dead_only_plan_with` 里 trim 那一段的注释上。这里钉两件:
+    /// ⑴ **一度接点照裁** —— 这是被推翻的那条规矩留下的坑,写成判据免得有人凭「听起来有道理」
+    ///    再加一次;
+    /// ⑵ **大跳接点也照裁** —— 光有 ⑴ 会被「干脆全都不裁」满足,那会把 S148 r3 盲测背书过的
+    ///    收益整个扔掉。两条一起才把「裁剪与接点音程无关」钉死。
+    /// ⑶ 头尾两侧各钉一次(只钉一侧的话,另一侧再被加上规矩不会有判据变红)。
     #[test]
-    fn a_trim_may_not_expose_a_small_melodic_joint() {
+    fn a_small_melodic_joint_does_not_block_the_trim() {
         let r = Rec::default().build();
         let secs9 = |n: usize| vec![50i64; n]; // 每音 1 s ⇒ 回收量远超 500 ms 的门限
         let arm = RescueTuning::new(Some((500.0, 500.0)), RescueTuning::today().landing);
@@ -5888,25 +5854,17 @@ mod tests {
             (p[0].start, p[0].end)
         };
         // ⚠ `Rec::default()` 的 usable 是 (36, 80) ⇒ 死音必须 **≥81**,乘客必须 ≤80。
-        // ⑴ 乘客 80、第一个死音 81 ⇒ 接点 **1 度** ⇒ 不许裁头。
-        //    ⛔ 边界写字面量,不许拿 `TRIM_MIN_JOINT_INTERVAL` 算期望值。
-        assert_eq!(span(&vec![74, 80, 81, 83]), (0, 3), "一度接点上不许落边");
-        // 四度(77→81)同样不许(阈值 5 的下方)
-        assert_eq!(span(&vec![74, 77, 81, 83]), (0, 3), "四度接点上仍然不许落边");
-        // ⑵ 大跳(69→81 = 12 度)⇒ 照裁,收益一分不少。
-        assert_eq!(span(&vec![74, 69, 81, 83]), (2, 3), "大跳接点上必须照裁");
-        // 恰好等于阈值的那一格必须**算大跳**(`>=`,不是 `>`)
-        assert_eq!(span(&vec![74, 76, 81, 83]), (2, 3), "正好 5 度必须照裁");
-        // ⑶ **尾侧同样受这条规矩管**(头尾两侧各写了一次 `joint_ok`,漏一侧不会被 ⑴⑵ 抓到)。
-        //    83→74 = 9 度大跳 ⇒ 照裁;83→80 = 3 度 ⇒ 不裁。
+        // ⑴ 乘客 80、第一个死音 81 ⇒ 接点 **1 度**,照裁。
+        assert_eq!(span(&vec![74, 80, 81, 83]), (2, 3), "一度接点不许挡住裁剪");
+        // ⑵ 大跳(69→81 = 12 度)⇒ 同样照裁 —— 两条一起才说明「裁剪与音程无关」。
+        assert_eq!(span(&vec![74, 69, 81, 83]), (2, 3), "大跳接点照裁");
+        // ⑶ 尾侧同样:83→80 是 3 度,照裁。
         let tail = |nn: &Vec<i64>| {
             let p = dead_only_plan_with(nn, &secs9(nn.len()), 0, &r, arm).0;
             (p[0].start, p[0].end)
         };
-        assert_eq!(tail(&vec![85, 83, 74, 0, 70]), (0, 1), "尾侧大跳 ⇒ 照裁");
-        assert_eq!(tail(&vec![85, 83, 80, 0, 70]), (0, 2), "尾侧三度 ⇒ 不许裁");
-        // ⚠ `joint_ok` 的「有一侧是休止」那条臂**今天够不着**(见它旁边的注释):一侧是休止就意味着
-        //    那一侧本来就不会被裁。⇒ 这条判据**不覆盖**它,别以为覆盖了。
+        assert_eq!(tail(&vec![85, 83, 80, 0, 70]), (0, 1), "尾侧三度不许挡住裁剪");
+        assert_eq!(tail(&vec![85, 83, 74, 0, 70]), (0, 1), "尾侧大跳照裁");
     }
 
     #[test]
