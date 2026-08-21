@@ -1665,7 +1665,8 @@ fn apply_range_inverse(
     // note_hz is the FED (already range-shifted) parametric pitch on the 50 fps cv grid — it
     // drives the inverse's streaming formant base (S82b anti-pop; vocal_range folds it into
     // a sticky schedule).
-    super::vocal_range::apply_inverse_windowed(
+    dump_donor_buffer("pre", range_shift, &audio, note_hz);
+    let out = super::vocal_range::apply_inverse_windowed(
         audio,
         sample_rate,
         range_shift,
@@ -1673,7 +1674,52 @@ fn apply_range_inverse(
         Some((note_hz, (sample_rate as usize / 50).max(1))),
         keep,
     )
-    .map_err(UtaiError::Inference)
+    .map_err(UtaiError::Inference);
+    if let Ok(y) = &out {
+        dump_donor_buffer("post", range_shift, y, note_hz);
+    }
+    out
+}
+
+/// S159g —— `UTAI_RANGE_DUMP_DONOR=<dir>`:把逆变换**前后**的缓冲各落一份裸 f32(小端),
+/// 外加那一遍喂进去的 `note_hz`。文件名 `donor_<pre|post>_<shift>.f32`。
+///
+/// ⛔ 为什么需要一个新出口:S159g 已经把 donor 那一路在**音符交界处**的塌陷
+/// (~40 ms 宽 · 电平 −2…−4 dB · 谱心 −20…−30%)量清楚了,并且逐条排除了
+/// **PSOLA 本身**(同一段 base 音频过生产口径 +8 ⇒ 1.11-1.43 dB ≈ 不过 PSOLA 的原始)、
+/// **喂进去的阶梯基频轨**(换成实测滑音轨读数几乎不动)、以及 **decode 之后那几把逐 chunk 的刀**
+/// (它们对 base 与 donor 施加逐样本相同的乘性包络)。
+/// 剩下的嫌疑只在**逆变换的输入**上,而在这条转储之前,**没有任何出口能看到它** ——
+/// 「看不见的地方」正是上一轮我把归因搞错的地方。
+///
+/// ⚠ 只在 env 存在时写盘;写不动只 `warn!`,不许让渲染失败。
+/// ⚠ 它**不是**生产路径上的开销:`var_os` 每次都读,但没设时立刻返回。
+fn dump_donor_buffer(tag: &str, shift: i64, buf: &[f32], note_hz: &[f32]) {
+    let Some(dir) = std::env::var_os("UTAI_RANGE_DUMP_DONOR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("range dump: cannot create {}: {e}", dir.display());
+        return;
+    }
+    let mut bytes = Vec::with_capacity(buf.len() * 4);
+    for v in buf {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let p = dir.join(format!("donor_{tag}_{shift:+}.f32"));
+    match std::fs::write(&p, &bytes) {
+        Ok(()) => tracing::info!("range dump: {} samples -> {}", buf.len(), p.display()),
+        Err(e) => tracing::warn!("range dump: {} failed: {e}", p.display()),
+    }
+    if tag == "pre" {
+        let mut hz = Vec::with_capacity(note_hz.len() * 4);
+        for v in note_hz {
+            hz.extend_from_slice(&v.to_le_bytes());
+        }
+        let p = dir.join(format!("donor_f0_{shift:+}.f32"));
+        if let Err(e) = std::fs::write(&p, &hz) {
+            tracing::warn!("range dump: {} failed: {e}", p.display());
+        }
+    }
 }
 
 
