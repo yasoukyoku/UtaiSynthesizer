@@ -1600,7 +1600,24 @@ fn env_restore_half(
     h.clamp(4, cap)
 }
 
-fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
+/// S159za —— `give_up`:**需要的校正超过 [`ENV_RESTORE_CLAMP_DB`] 时,干脆不动这个样本**
+/// (增益取 1.0),而不是像今天这样抬满 +12 dB。
+///
+/// ⛔ 为什么:用户 2026-08-22 报的咔哒是唱音内部 **20-70 dB** 的凹陷。这把刀够不着它们
+/// (夹子 ±12 dB、谷底 −60 dB 以下直接跳过、校正被平滑到 12-28 ms 而凹陷宽 2-40 ms),
+/// 却会在坑**附近**把增益抬满 —— 把残留的毛刺一起放大。
+/// 实测(S159za,炉心融解 +7 × yachiyo,只改这一个旋钮):整把关掉 envfix 之后
+/// 咔哒点读 92.6 → 76.6、深窗候选 149 → 143、泄漏深 p90 −22.98 → −27.12(阴性对照不动),
+/// **但音符交界塌陷从 9.85 恶化到 13.21 dB** —— 那是这把刀原本买到的东西。
+/// ⇒ `give_up` 想两头都要:交界塌陷只有 2-4 dB(远在夹子以内)⇒ 照修;
+///   深坑需要 20-70 dB ⇒ 超出夹子 ⇒ 不动。
+fn restore_envelope_with(
+    out: &mut [f32],
+    x: &[f32],
+    covered: &[bool],
+    half: usize,
+    give_up: bool,
+) {
     let ex = rms_envelope(x, half);
     let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
     if peak <= 0.0 {
@@ -1614,7 +1631,13 @@ fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
         let raw: Vec<f64> = (0..out.len())
             .map(|i| {
                 if covered[i] && ex[i] > floor && ey[i] > floor {
-                    (ex[i] / ey[i]).clamp(lo, hi)
+                    let r = ex[i] / ey[i];
+                    // S159za —— 修不动就别硬修(见 `restore_envelope_with` 的 doc)。
+                    if give_up && (r > hi || r < lo) {
+                        1.0
+                    } else {
+                        r.clamp(lo, hi)
+                    }
                 } else {
                     1.0
                 }
@@ -1631,6 +1654,22 @@ fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
             }
         }
     }
+}
+
+/// S159za —— 今天的行为(`give_up = false`),保留给所有既有调用点与判据。
+fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
+    restore_envelope_with(out, x, covered, half, env_give_up());
+}
+
+/// S159za —— `UTAI_PSOLA_ENVGIVEUP=0/1`。**默认 0 = 与今天逐位相同。**
+fn env_give_up() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("UTAI_PSOLA_ENVGIVEUP").ok().as_deref().map(str::trim),
+            Some("1" | "true" | "on" | "yes")
+        )
+    })
 }
 
 /// The infrasonic baseline of `x` at the **ruler's** shape (2 box passes = a triangular
