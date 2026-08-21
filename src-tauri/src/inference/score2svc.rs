@@ -822,6 +822,10 @@ pub fn render_score_sovits(
     } else {
         0.0
     };
+    // S159zb —— **donor 那一遍**把辅音谷推迟到逆变换之后(见 `valley_after_inverse`)。
+    // ⛔ `range_shift == 0` 时不推迟 ⇒ 未开扩展的渲染逐位不变。
+    let defer_valley = range_shift != 0 && valley_after_inverse();
+    let mut deferred_valley: Vec<Vec<(usize, usize, f32)>> = Vec::new();
     let n_chunks = chunks.len().max(1);
     let has_diff = m.diffusion.is_some();
     let p_vits = if has_diff { 0.5 } else { 0.95 };
@@ -913,7 +917,17 @@ pub fn render_score_sovits(
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
             let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
-            apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+            if defer_valley {
+                // S159zb —— 攒起来,等 `apply_range_inverse` 之后再刻(见 `valley_after_inverse`)。
+                // ⛔ 偏移取**扩展之前**的 `audio.len()`:`seam_fade` 只做淡化、不改两侧长度,
+                //    而 TD-PSOLA 不改时长 ⇒ 绝对下标在逆变换之后仍然有效。
+                let base = audio.len();
+                deferred_valley.extend(val_cls.into_iter().map(|cl| {
+                    cl.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect::<Vec<_>>()
+                }));
+            } else {
+                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+            }
         }
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
@@ -938,6 +952,10 @@ pub fn render_score_sovits(
         donor.map_or(&[][..], |d| d.keep_samples),
     )?;
     let t_inverse = t0.elapsed().as_secs_f64();
+    // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
+    if !deferred_valley.is_empty() {
+        apply_valley(&mut audio, &deferred_valley, valley_scale, emphasis_fade_samples(m.sample_rate));
+    }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
 
@@ -1047,6 +1065,10 @@ pub fn render_score_rvc(
     } else {
         0.0
     };
+    // S159zb —— **donor 那一遍**把辅音谷推迟到逆变换之后(见 `valley_after_inverse`)。
+    // ⛔ `range_shift == 0` 时不推迟 ⇒ 未开扩展的渲染逐位不变。
+    let defer_valley = range_shift != 0 && valley_after_inverse();
+    let mut deferred_valley: Vec<Vec<(usize, usize, f32)>> = Vec::new();
     let n_chunks = chunks.len().max(1);
     let sid = options.speaker_id.unwrap_or(0) as i64;
     // ①c: a genuine multi-speaker RVC export takes a dense spk_mix blend in place of scalar sid.
@@ -1126,7 +1148,17 @@ pub fn render_score_rvc(
         // S84 C 刀: carve the chain-internal syllable-boundary valleys (measured class depths × scale)
         if valley_scale > 0.0 {
             let val_cls = chunk_valley_clusters(chunk, wav.len(), &valley_depths[chunk.start..chunk.end]);
-            apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+            if defer_valley {
+                // S159zb —— 攒起来,等 `apply_range_inverse` 之后再刻(见 `valley_after_inverse`)。
+                // ⛔ 偏移取**扩展之前**的 `audio.len()`:`seam_fade` 只做淡化、不改两侧长度,
+                //    而 TD-PSOLA 不改时长 ⇒ 绝对下标在逆变换之后仍然有效。
+                let base = audio.len();
+                deferred_valley.extend(val_cls.into_iter().map(|cl| {
+                    cl.into_iter().map(|(a, b, d)| (base + a, base + b, d)).collect::<Vec<_>>()
+                }));
+            } else {
+                apply_valley(&mut wav, &val_cls, valley_scale, emphasis_fade_samples(m.sample_rate));
+            }
         }
         if chunk.hard_seam {
             seam_fade(&mut audio, &mut wav, m.sample_rate); // S58: mid-voiced language cut → micro-fade
@@ -1163,6 +1195,10 @@ pub fn render_score_rvc(
         donor.map_or(&[][..], |d| d.keep_samples),
     )?;
     let t_inverse = t0.elapsed().as_secs_f64();
+    // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
+    if !deferred_valley.is_empty() {
+        apply_valley(&mut audio, &deferred_valley, valley_scale, emphasis_fade_samples(m.sample_rate));
+    }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
 
@@ -1497,6 +1533,39 @@ fn apply_coda_lift(
     for (s, e, gain) in wins {
         apply_emphasis(audio, &[(s, e)], gain, fade);
     }
+}
+
+/// S159zb —— `UTAI_MG_VALLEY_AFTER=0/1`:**donor 那一遍**的辅音谷改在
+/// [`apply_range_inverse`] **之后**施加。**默认 0 = 与今天逐位相同。**
+///
+/// ## ⛔ 为什么(实测的三级串联,S159za/zb)
+///
+/// 用户 2026-08-22 点名的 12 处「咔哒 + 面状」,根因是**三级串联**,每一级都在自己的上界之内:
+/// ⑴ [`apply_valley`] 在 **donor 上**刻一个 11.4(鼻/边)/ 11.7(塞)dB 的辅音谷;
+/// ⑵ **TD-PSOLA 是一台凹陷放大器**,而且在 `ratio 2.0`(= |位移| 12 半音)处上台阶
+///    —— 实测把「已经存在」的凹陷再加深:浅窗 −3/−5/−7 只有 **−0.94 / −1.00 / −1.47 dB**,
+///    深窗 −12/−17 是 **−4.34 / −4.16**(最坏 −17.3 / −20.3);
+/// ⑶ 导出 PCM_16 把最深的那个削成精确零。
+///
+/// 单变量消融(六条臂 `.plan.json` 逐字段相同,独立重渲的噪声地板 ≤0.5 dB):
+/// `UTAI_MG_VALLEY=0` 让那 6 处凹陷变浅 **+13.2 / +9.1 / +9.4 / +25.3 / +200 / +11.8 dB(6/6 同号)**,
+/// 而 9-13 dB **正好等于 `valley_depth_db` 的 11.4 / 11.7**。
+///
+/// ## 为什么是「挪到之后」而不是「关掉」或「调浅」
+///
+/// ⛔ 用户明确要求**不许直接关掉**:这把刀是为咬字做的(S84,mix−render 的实测差)。
+/// ⭐ 而 [`apply_valley`] 自己的 doc 写着它是 **an output-domain gain valley**
+///    —— 输出域的乘性包络。**今天它却被施加在 PSOLA 之前**,于是 PSOLA 把它当成信号去放大。
+/// ⇒ 挪到逆变换之后:**咬字收益一分不少**(同样的窗、同样的深度、同样的时间位置,
+///    因为 TD-PSOLA 不改时长),而 PSOLA **再也看不到那个谷**。
+///
+/// ⚠ 只在 **donor 那一遍**(`range_shift != 0`)改;base 那一遍的逆变换是恒等,
+///    保持在循环里施加 ⇒ 未开扩展的渲染**逐位不变**。
+fn valley_after_inverse() -> bool {
+    matches!(
+        std::env::var("UTAI_MG_VALLEY_AFTER").ok().as_deref().map(str::trim),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 /// Chunk-relative CLUSTERS of contiguous depth>0 phones, each member keeping its OWN class depth.
