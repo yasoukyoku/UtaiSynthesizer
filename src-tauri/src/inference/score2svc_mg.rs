@@ -1603,6 +1603,97 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     );
 }
 
+/// S159k —— **cover 车道的离线台子**(`rvc::run_pipeline`,= 音频轨推理走的那条)。
+///
+/// ⛔ 为什么要补它:用户 2026-08-21 报「cover 打开音域扩展会高音破音/炸」,而这条车道
+/// **今天没有任何离线入口**。和 S159h 补 RVC 腿之前是同一种缺口 ——「那半个车道上发生的事
+/// 没有离线复现手段」—— 而上一轮正是这种缺口让我把机理判错了一次(拿 akiko 近似用户的 RVC 病例)。
+///
+/// ⚠ 两条车道**只共用引擎**(`apply_inverse*` / `SpeakerRange`):计划器是 `cover_dead_plan`
+/// (逐帧 f0 过线)不是 `dead_only_plan`(音符/乐句),拼接是 `run_pipeline` **自递归**
+/// 不是 `apply_dead_only_windows`。⇒ 在这里量到的东西**不能**直接搬去谱面轨,反之亦然。
+///
+/// ```powershell
+/// $env:UTAI_MG_MODEL="…\yachiyo_runami.onnx"      # 同名 .json 是 sidecar,.npy 是索引
+/// $env:UTAI_COVER_IN="…\SV_RENDER.wav"            # 推理源
+/// $env:UTAI_COVER_OUT="…\cover_on.wav"
+/// $env:UTAI_COVER_RANGE="1"                        # 1 = 开音域扩展;0 = 关(默认关,与生产同)
+/// $env:UTAI_COVER_F0SHIFT="0"                      # 用户的移调旋钮(半音)
+/// cargo test --lib inference::score2svc::mg_tests::mg_cover_rvc -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "probe: cover lane on a real wav (needs UTAI_COVER_IN + an rvc model)"]
+fn mg_cover_rvc() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let inp = std::env::var("UTAI_COVER_IN").expect("UTAI_COVER_IN=<wav> required");
+    let out = std::env::var("UTAI_COVER_OUT").expect("UTAI_COVER_OUT=<wav> required");
+    // ⛔ 解析不了就 panic,不许静默回落 —— 与 `probe_arm` 同一条规矩:
+    //    「臂开着」与「臂做了事」必须可查,而 `UTAI_COVER_RANGE=on` 手滑读成 0 会伪造一条阴性臂。
+    let want_range = match std::env::var("UTAI_COVER_RANGE").as_deref() {
+        Err(_) | Ok("0") => false,
+        Ok("1") => true,
+        Ok(v) => panic!("UTAI_COVER_RANGE={v:?} —— 只认 0 / 1"),
+    };
+    let f0_shift: f32 = std::env::var("UTAI_COVER_F0SHIFT")
+        .ok()
+        .map(|v| v.parse().unwrap_or_else(|_| panic!("UTAI_COVER_F0SHIFT={v:?} 解析不了")))
+        .unwrap_or(0.0);
+
+    let rig = MgRvcRig::load();
+    let m = rig.model();
+    let cfg: crate::models::ModelConfig = serde_json::from_value(rig.sidecar.clone())
+        .expect("sidecar 解不成 ModelConfig");
+    let speaker = mg_deadonly_speaker();
+    let range = if want_range {
+        Some(
+            super::super::vocal_range::speaker_range(&cfg, speaker)
+                .expect("开了扩展但 sidecar 里没有 vocal_range 记录"),
+        )
+    } else {
+        None
+    };
+
+    let mut rd = hound::WavReader::open(&inp).expect("open cover input");
+    let spec = rd.spec();
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => rd.samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Int => rd
+            .samples::<i32>()
+            .map(|s| s.unwrap() as f32 / (1i32 << (spec.bits_per_sample - 1)) as f32)
+            .collect(),
+    };
+    let audio = crate::audio::AudioBuffer {
+        samples: raw,
+        sample_rate: spec.sample_rate,
+        channels: spec.channels,
+    };
+    let opts = RvcOptions {
+        seed: 0,
+        speaker_id: Some(speaker),
+        f0_shift,
+        range_extend: want_range,
+        index_ratio: std::env::var("UTAI_MG_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0.75),
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let r = rvc::run_pipeline(&m, &audio, &opts, range, &|_| {}, &|| false).expect("cover pipeline");
+    let peak = r.audio.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    eprintln!(
+        "[mg] cover: range_extend={want_range} f0_shift={f0_shift:+} · {:.2}s in {:.1}s wall · sr {} · 峰值 {peak:.4}",
+        r.audio.len() as f32 / r.sample_rate as f32,
+        t0.elapsed().as_secs_f64(),
+        r.sample_rate
+    );
+    write_wav16(std::path::Path::new(&out), &r.audio, r.sample_rate);
+    // ⛔ 16 bit + 归一化会伪造差(S155 那条):要做「加了多少 / 还剩多少」的题就读这份裸 f32。
+    let mut bytes = Vec::with_capacity(r.audio.len() * 4);
+    for v in &r.audio {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(format!("{out}.f32"), &bytes).expect("write raw f32");
+    eprintln!("[mg] cover -> {out} (+ .f32)");
+}
+
 /// S158 —— **计划台**:同一条决策链、同一批函数,**只出计划、不渲染**(秒级,不碰 ONNX)。
 ///
 /// ⛔ 为什么不复用离线复刻件。S157 写过一份 `minimal_rescue_shift` 的 Python 复刻
