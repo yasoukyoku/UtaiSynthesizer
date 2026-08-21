@@ -954,7 +954,22 @@ pub fn render_score_sovits(
     let t_inverse = t0.elapsed().as_secs_f64();
     // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
     if !deferred_valley.is_empty() {
-        apply_valley(&mut audio, &deferred_valley, valley_scale, emphasis_fade_samples(m.sample_rate));
+        let cls = if valley_adaptive() {
+            // S159zb ⑵ —— **量了再补差额**(与 `apply_coda_lift` 同一条;见 `valley_adaptive`)。
+            deferred_valley
+                .iter()
+                .map(|cl| {
+                    let (s0, e1) = (cl[0].0, cl[cl.len() - 1].1);
+                    let have = measured_valley_db(&audio, s0, e1);
+                    cl.iter()
+                        .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            deferred_valley.clone()
+        };
+        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate));
     }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
@@ -1197,7 +1212,22 @@ pub fn render_score_rvc(
     let t_inverse = t0.elapsed().as_secs_f64();
     // S159zb —— 攒下来的辅音谷在这里刻(见 `valley_after_inverse`)。
     if !deferred_valley.is_empty() {
-        apply_valley(&mut audio, &deferred_valley, valley_scale, emphasis_fade_samples(m.sample_rate));
+        let cls = if valley_adaptive() {
+            // S159zb ⑵ —— **量了再补差额**(与 `apply_coda_lift` 同一条;见 `valley_adaptive`)。
+            deferred_valley
+                .iter()
+                .map(|cl| {
+                    let (s0, e1) = (cl[0].0, cl[cl.len() - 1].1);
+                    let have = measured_valley_db(&audio, s0, e1);
+                    cl.iter()
+                        .map(|&(a, b, d)| (a, b, (d - have / valley_scale.max(1e-6)).clamp(0.0, d)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            deferred_valley.clone()
+        };
+        apply_valley(&mut audio, &cls, valley_scale, emphasis_fade_samples(m.sample_rate));
     }
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
@@ -1561,6 +1591,83 @@ fn apply_coda_lift(
 ///
 /// ⚠ 只在 **donor 那一遍**(`range_shift != 0`)改;base 那一遍的逆变换是恒等,
 ///    保持在循环里施加 ⇒ 未开扩展的渲染**逐位不变**。
+/// S159zb —— `UTAI_MG_VALLEY_ADAPT=0/1`:辅音谷改成**刻到目标深度**,而不是固定衰减。
+/// **默认 0 = 与今天逐位相同。**⚠ 只在 [`valley_after_inverse`] 也开着时才有意义(要量成品)。
+///
+/// ## ⛔ 为什么:深窗里我们在【重复计数】
+///
+/// [`apply_valley`] 是**加法式**的固定衰减(`valley_depth_db`:鼻/边 11.4、塞 11.7 dB),
+/// 而它当年(S84)是在**没有移调**的渲染上标定的 —— 那时「模型自己的辅音凹陷 + 这一刀」
+/// 正好落在实测的 mix−render 参照上。
+///
+/// ⭐ 但在深位移的 donor 上,**模型自己的凹陷已经更深了**。实测(炉心融解 +7 × yachiyo,
+/// 用户点名的 6 处,2 ms 包络的局部中位 − 谷底,中位):
+///
+/// | | 谷深 |
+/// |---|---|
+/// | 出厂(有 valley) | **27.2 dB** |
+/// | `UTAI_MG_VALLEY=0` | **16.6 dB** |
+/// | 差 = 这一刀贡献的 | **10.6 dB** ≈ 设计值 11.4/11.7 |
+///
+/// ⇒ ⭐ **辅音谷是线性穿过 PSOLA 的(没被放大)**,但**总深度 27.2 dB 远超 S84 的参照(11-15 dB)**
+///   —— 因为那 16.6 dB 里已经有模型自己的凹陷 + PSOLA 对它的放大(S159zb 的 M2:深窗 4-20 dB)。
+///   **同一个谷被算了两次。**
+///
+/// ## 形状:与 [`apply_coda_lift`] 同一条(量了再补差额)
+///
+/// `want = clamp(target − measured, 0, target)`。
+/// * `measured` = 该簇内 2 ms 包络的**局部中位 − 谷底**(与上面那张表同一把尺子);
+/// * `target` = 该簇成员的类深度(`valley_depth_db`,不变);
+/// * 已经够深的地方 `want → 0` ⇒ **一个字节都不动**。
+///
+/// ⛔ 这不是「把刀调浅」:在没移调的渲染上 `measured` 很小 ⇒ `want ≈ target` ⇒ 行为与今天一样。
+///   它只在**已经过深**的地方收手 —— 也就是深救援窗里的鼻音/浊塞音,正是用户报缺陷的地方。
+fn valley_adaptive() -> bool {
+    matches!(
+        std::env::var("UTAI_MG_VALLEY_ADAPT").ok().as_deref().map(str::trim),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// S159zb —— 一个簇里**已经有多深的谷**(2 ms RMS 包络:局部中位 − 谷底,dB)。
+/// ⚠ 与 `TESTING\s159za_*` 那批读数用的是同一把尺子,所以 doc 里的表可以直接对上。
+fn measured_valley_db(audio: &[f32], s: usize, e: usize) -> f32 {
+    let (s, e) = (s.min(audio.len()), e.min(audio.len()));
+    if e <= s {
+        return 0.0;
+    }
+    // 局部参照取簇两侧各 60 ms(够长到跨过整个辅音,够短到跟得上乐句的强弱)。
+    // 参照窗：簇两侧各 ~60 ms（48k 下 2880 样本）。⚠ 写成常数而不是按 sr 算，是因为它只决定参照窗多宽。
+    const PAD: usize = 2880;
+    let pad = PAD.min(audio.len());
+    let (a0, b0) = (s.saturating_sub(pad), (e + pad).min(audio.len()));
+    // 2 ms @48k（44.1k 下 2.18 ms）—— 与 TESTING\s159za_* 那批读数同一个窗宽。
+    const H: usize = 96;
+    let h = H;
+    let db = |from: usize, to: usize| -> Vec<f32> {
+        let mut v = Vec::new();
+        let mut i = from;
+        while i + h <= to {
+            let r = (audio[i..i + h].iter().map(|x| x * x).sum::<f32>() / h as f32).sqrt();
+            v.push(20.0 * (r + 1e-12).log10());
+            i += h;
+        }
+        v
+    };
+    let mut ref_v = db(a0, b0);
+    if ref_v.len() < 3 {
+        return 0.0;
+    }
+    ref_v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = ref_v[ref_v.len() / 2];
+    let floor = db(s, e).into_iter().fold(f32::INFINITY, f32::min);
+    if floor.is_finite() {
+        (med - floor).max(0.0)
+    } else {
+        0.0
+    }
+}
+
 fn valley_after_inverse() -> bool {
     matches!(
         std::env::var("UTAI_MG_VALLEY_AFTER").ok().as_deref().map(str::trim),
