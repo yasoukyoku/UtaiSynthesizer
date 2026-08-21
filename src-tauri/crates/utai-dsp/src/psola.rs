@@ -54,6 +54,36 @@ pub struct PsolaDiagnostics {
     pub islands: usize,
     /// Total analysis marks placed.
     pub marks: usize,
+    /// S159 —— `voiced_islands` 划出来的**候选**岛数(窗过滤**之前**)。
+    ///
+    /// ⛔ 它与 [`islands`](Self::islands) 不是同一个数,而这个区别是**承重**的:
+    /// `islands == 0` 今天让 `vocal_range::apply_inverse` 整条渲染响亮报错
+    /// (`RANGE_INVERSE_NO_PITCH`)。加了窗之后「窗切不到任何岛」也会让 `islands` 变 0,
+    /// 而那**不是**错误 —— 那一遍本来就没东西要救。⇒ 报错的判据必须改看这个数:
+    /// `islands_seen == 0` 才是「真的没有音高」。
+    /// (S129 铁律:「跑不起来」与「被测的东西不对」不许报成同一种红。)
+    pub islands_seen: usize,
+    /// S159 —— 被窗过滤掉的岛数。`keep` 为空(= 整条缓冲)时恒为 0。
+    ///
+    /// ⛔ 它存在的唯一理由是 S147 那次「收益静默减半」:一个**永远不跳岛**的窗谓词
+    /// 会产出逐位相同的音频,与「窗根本没接上」不可分辨。⇒ 这个数必须打进生产日志。
+    pub islands_skipped: usize,
+    /// S159 —— `keep` 覆盖的样本占整条缓冲的比例;`keep` 为空时 1.0。这一刀能省多少的分母。
+    pub keep_frac: f32,
+    /// S159 —— 窗被**忽略**了(见 `psola_shift_win` 的前置条件:LP-PSOLA / WSOLA /
+    /// 包络复原任一开着时,跳岛在数学上不成立 ⇒ 整条缓冲照跑)。
+    ///
+    /// ⛔ 为什么是降级不是报错:那三个旋钮是 A/B 臂用的,拿它们渲一条臂的人要的是**正确的音频**,
+    /// 不是一条红。但降级必须**响**:静默降级 = 收益静默归零而一切读数正常。
+    pub keep_ignored: bool,
+    /// S159 —— 去次声那把刀的**总闸余量**,`10·log10(e_out / e_in)` dB。刀关着时 0.0。
+    ///
+    /// ⛔ 这是「窗内逆变换」唯一一条**不是结构性**的耦合的眼睛。那个闸(`e_out >= e_in`)是在
+    /// **全缓冲**累加之后算的:被跳掉的岛对**修正量**的贡献恒为 0(那一段 `out ≡ x` ⇒ `fo ≡ fi`),
+    /// 但两个能量和是「和的模」而不是「模的和」,岛与岛的支撑重叠时交叉项原则上能把它推翻面 ——
+    /// 而翻面会让窗**内**的低频修正整块开/关。
+    /// ⇒ 余量打出来,就能一眼看出「离翻面还有多远」;写在 doc 里而没有读数 = 没被记录(S148 血训)。
+    pub infrasonic_gate_db: f32,
     /// Fraction of covered samples whose overlap-add window sum fell below 0.9. Structurally ~0
     /// when shifting up; on the way down the source-width clipping (see 4 above) makes it large —
     /// that is the amplitude ripple, and it is the number to watch when a down-shift sounds wobbly.
@@ -345,6 +375,71 @@ fn voiced_islands(f0: &[f32], hop: usize, n: usize, min_samples: usize) -> Vec<(
         i = b + STRIDE;
     }
     out
+}
+
+/// S159 —— 去次声**逐岛**滤波向岛外撑出去的支撑,单位样本。
+///
+/// `K` 遍盒滤波各半宽 `half` ⇒ 总支撑 ≈ `K·half`;这里按 `half·CUT_BOX_PASSES + 1` 取,
+/// 与去次声那一段**是同一个表达式**(S159 把它提成函数,免得护栏与刀两处各写一遍再漂开)。
+fn infrasonic_pad_samples(w_ms: f64, sample_rate: u32) -> usize {
+    let half = ((f64::from(sample_rate) * w_ms / 1000.0) as usize / 2).max(1);
+    half * CUT_BOX_PASSES + 1
+}
+
+/// S159 —— 一个岛**能写到岛外多远**(样本)= 窗内逆变换的护栏。
+///
+/// ⛔⛔ **跳岛的判据是「这个岛能写到哪」,不是「这个岛在哪」。**三项之和,每一项都是**上界**:
+/// 1. **标记外走**:`analysis_marks` 最多走出岛外一个本地周期([`island_reach`]);
+/// 2. **颗粒钟形窗**:半宽 ≤ `wmax`(更宽的颗粒被 `lw > wmax ⇒ continue` 整颗跳过)——
+///    ⛔ 传进来的必须是主循环用的**那一个** `wmax`,不许在这里重写一遍表达式;
+/// 3. **去次声逐岛滤波的支撑**:按宽度上限那一档取([`infrasonic_pad_samples`])。
+///
+/// ⚠ 第 3 项在**上移**臂(生产方向)上恒被前两项盖住(`per ≥ T_src` 且 `T_src ≤ wmax`
+/// ⇒ `per + wmax ≥ 2·T_src` = 该臂的支撑),在**下移**臂上才会绑定 —— 而下移时去次声的总闸
+/// 通常把整刀关掉。⇒ 它是给将来的余量;钉住它的是
+/// `the_window_guard_is_the_sum_of_three_measured_bounds`(断言写字面量,不许重算)。
+fn island_guard(
+    f0_hz: &[f32],
+    f0_hop: usize,
+    a: usize,
+    b: usize,
+    sample_rate: u32,
+    wmax: f64,
+) -> usize {
+    island_reach(f0_hz, f0_hop, a, b, f64::from(sample_rate))
+        .saturating_add(wmax.max(0.0) as usize)
+        .saturating_add(infrasonic_pad_samples(INFRASONIC_MS_MAX, sample_rate))
+}
+
+/// S159 —— 一个岛的**标记**最远能走到岛外多少个样本。
+///
+/// `analysis_marks` 的外走判据是 `lo < a − per || hi > b + per`,`per = sr / f0_at(cur)` ⇒
+/// 标记集合 ⊆ `[a − per_max, b + per_max]`,而 `per_max` 由该岛 f0 轨上**最低**的那个
+/// 有声帧决定。返回的是那个 `per_max`(样本),**不含**颗粒窗与去次声的支撑 —— 那两项由
+/// 调用方按各自的上界另加(见 `psola_shift_win` 里 `reach` 那一段)。
+///
+/// ⛔ 为什么不写成一个常数:`f0_hz` 是**谱面的**参数化音高,而且喂进来的时候已经被移调过 ——
+/// 深位移的 donor 上它可以低到几十赫兹(−14 半音把 MIDI 36 压到 22 ⇒ 29 Hz ⇒ 一个周期 34 ms)。
+/// 一个「20 ms 应该够了」的常数会**恰好在最需要它的那一档**失效,而症状是窗边几十毫秒变了样,
+/// 整曲里听不出来。
+/// ⛔ 取不到周期时返回一个**大到永远相交**的数(= 不跳这个岛):失败方向必须是「多做」。
+fn island_reach(f0_hz: &[f32], f0_hop: usize, a: usize, b: usize, sr: f64) -> usize {
+    const NEVER_SKIP: usize = usize::MAX / 4;
+    if f0_hop == 0 || f0_hz.is_empty() {
+        return NEVER_SKIP;
+    }
+    let k0 = (a / f0_hop).min(f0_hz.len());
+    let k1 = (b / f0_hop + 2).min(f0_hz.len());
+    let lowest = f0_hz[k0..k1]
+        .iter()
+        .map(|v| f64::from(*v))
+        .filter(|v| *v > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    if lowest.is_finite() && lowest > 0.0 {
+        (sr / lowest).ceil() as usize
+    } else {
+        NEVER_SKIP
+    }
 }
 
 /// Absolute extremum in `[i0, i1)`, polarity-independent, refined to sub-sample.
@@ -1874,6 +1969,69 @@ pub fn psola_shift_env(
     // 机理、实测余量、以及「恒等为什么是结构性的」写在文件上方 LP-PSOLA 那一段。
     lpc_order: usize,
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_win(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
+        &[],
+    )
+}
+
+/// S159 —— [`psola_shift_env`] 再加一条:**只把与 `keep` 相交的浊音岛送进工序**,其余岛原样透传。
+///
+/// `keep` = 一批**输出样本区间**(半开,可乱序、可重叠),空 = 整条缓冲 = [`psola_shift_env`]
+/// = **逐位同今天**。
+///
+/// ## ⛔ 它为什么存在
+/// 生产里一遍 donor 只有 1-30% 的音频会被拼回去(`vocal_range::apply_dead_only_windows` 只从
+/// donor 上切走「窗 ± 余量」那几段),而 S147 B2 之后**其余的 chunk 是铺零的** —— 可
+/// 喂给这里的 f0 是**整曲**的谱面音高,与音频无关 ⇒ `voiced_islands` 在铺零区照样划岛、
+/// `analysis_marks` 照样铺标记、颗粒照样合成。实测(S151 侦察):把一个 4.06 s 的浊音岛整段
+/// 铺零,该岛标记数 **1363 → 1439**(比真音频还密)。⇒ 这一整块工作量的产物**在拼接层被丢掉**。
+///
+/// ## ⛔⛔ 为什么是「逐岛 continue」而不是「把 buffer 切出来」
+/// 切 buffer 会同时改掉两族**全缓冲**量,而它们都是承重的:
+/// * `mean` / `dc_free` —— 标记是在去 DC 的信号上找的,DC 一变**全曲每一个标记**都会挪;
+/// * `x.len()` —— `find_extremum` / `max_correlation` / `analysis_marks` / `add_bell` 里五处
+///   边界判定挂在它上面,切口附近会**静默换分支**。
+///
+/// ## 保证与它的边界
+/// **保证**:`keep` 里的每一个样本与 `keep` 为空时**逐位相同**。
+/// **不保证**:`keep` 之外的样本(那里输出的是未移调的原始 donor)、以及**每一个诊断读数**
+/// (`islands` / `marks` / `cola_*` / `src_uncovered_frac` / `infrasonic_*` / `env_dev_*` 全部
+/// 换了统计样本集 ⇒ 会变,而且多半会「变好看」—— ⛔ 那是少做了工序,不是修好了什么)。
+///
+/// ## ⛔ 前置条件(任一不满足 ⇒ 忽略 `keep`,整条缓冲照跑,并置 `diag.keep_ignored`)
+/// 三条跨岛耦合会让「跳岛」在窗内**不再逐位相同**,而它们今天都靠出厂默认关着:
+/// 1. `lpc_order > 0` —— `lattice_synthesise` 是**全缓冲的 IIR 递归**,被跳掉的岛在今天会往
+///    激励里写东西,那条激励的振铃尾会传进后面的岛(岛外 `d` 恒为 0,但**零输入不等于零输出**);
+/// 2. `wsola_frac > 0` —— `wsola_pick` 读的是**已经累加的 `acc`** = 跨岛状态;
+/// 3. `env_restore_ms > 0` —— `restore_envelope` 的增益经 `box_average(raw, half*4)` **跨样本抹平**,
+///    而 `raw` 在非 `covered` 处是 1.0 ⇒ 跳岛会改变邻近样本的增益。
+///
+/// ⚠ **还剩一条不是结构性的**:去次声的总闸 `e_out >= e_in` 是在**全缓冲**累加之后算的。
+/// 被跳掉的岛对**修正量**的贡献恒为 0(它那一段 `out ≡ x` ⇒ `fo ≡ fi`),但两个能量和是
+/// 「和的模」不是「模的和」,交叉项原则上能把这个闸推翻面,而那会让窗内的低频修正**整块**开/关。
+/// ⇒ 余量已作为 `diag.infrasonic_gate_db` 打进日志(生产口径上实测的余量见 S159 记录),
+/// 判据 `the_window_keeps_the_infrasonic_correction_bit_identical_inside` 盯着它。
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_win(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+    win_periods: f64,
+    xgrain: f64,
+    lpc_order: usize,
+    keep: &[(usize, usize)],
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -1941,10 +2099,53 @@ pub fn psola_shift_env(
     let mut islands_periods: Vec<(usize, usize, Vec<f64>)> = Vec::new();
     let mut this_island_periods: Vec<f64> = Vec::new();
     let max_period = MAX_PERIOD_SECONDS * sr;
+    // 颗粒钟形窗半宽的上界(超过它的颗粒被整颗跳过)。⛔ 与 `island_guard` 共用同一个数。
+    let wmax = max_period * win_periods.max(1.0);
     // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
     let (mut uncovered, mut span) = (0.0f64, 0.0f64);
 
+    // ── S159 窗内逆变换:`keep` 的归一化与前置条件 ────────────────────────────────
+    // 见 `psola_shift_win` 的 doc。⛔ 三条跨岛耦合任一活着 ⇒ 忽略窗(整条照跑),而且**要响**。
+    let keep_blocked = lpc_order > 0 || wsola_frac > 0.0 || env_restore_ms > 0.0;
+    diag.keep_ignored = !keep.is_empty() && keep_blocked;
+    let keep: Vec<(usize, usize)> = if keep.is_empty() || keep_blocked {
+        Vec::new()
+    } else {
+        // 夹进缓冲、丢掉空区间、排序合并 —— 后面每个岛都要扫一遍它,先做小。
+        let mut v: Vec<(usize, usize)> =
+            keep.iter().map(|&(s, e)| (s.min(n), e.min(n))).filter(|(s, e)| e > s).collect();
+        v.sort_unstable();
+        let mut m: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+        for (s, e) in v {
+            match m.last_mut() {
+                Some((_, pe)) if s <= *pe => *pe = (*pe).max(e),
+                _ => m.push((s, e)),
+            }
+        }
+        m
+    };
+    diag.keep_frac = if keep.is_empty() {
+        1.0
+    } else {
+        (keep.iter().map(|(s, e)| e - s).sum::<usize>() as f64 / n as f64) as f32
+    };
+
     for (a, b) in voiced_islands(f0_hz, f0_hop, n, (MIN_ISLAND_SECONDS * sr) as usize) {
+        diag.islands_seen += 1;
+        // ── S159 —— 这个岛**能写到哪**,而不是「这个岛在哪」。三项全部是上界,不是估计:
+        //   ⑴ 标记最多走出岛外**一个本地周期**(`analysis_marks`:`lo < a − per || hi > b + per`);
+        //   ⑵ 颗粒的钟形窗半宽 ≤ `wmax`(更宽的颗粒被 `continue` 整颗跳过);
+        //   ⑶ 去次声逐岛滤波的支撑 = `half·CUT_BOX_PASSES + 1`。
+        // ⛔ 用「岛与窗相交」而不是这个,窗边最多 20 ms(颗粒)到 100 ms(去次声)会变,
+        //    而那一段**恰好落在拼接的 10 ms 交叉淡化区里** —— 耳朵在整曲里几乎抓不到。
+        if !keep.is_empty() {
+            let reach = island_guard(f0_hz, f0_hop, a, b, sample_rate, wmax);
+            let (lo, hi) = (a.saturating_sub(reach), b.saturating_add(reach));
+            if !keep.iter().any(|&(s, e)| lo < e && s < hi) {
+                diag.islands_skipped += 1;
+                continue;
+            }
+        }
         // S154 —— 播种点用**没膨胀**的岛的中点(见 `analysis_marks` 的说明):
         // 膨胀只该改「哪些样本被移调」,不该把每个音的标记相位重掷一次。
         let seed = seed_mid(&islands_raw, a, b);
@@ -2054,7 +2255,8 @@ pub fn psola_shift_env(
             };
             // ⚠ 上界要跟着窗宽走,否则宽窗臂会**静默地把颗粒全部跳过** —— 那是「干预没生效」
             //   被读成「干预无效」的形状(S148 的 `frac_transport` 写死成 false 是同一族)。
-            let wmax = max_period * win_periods.max(1.0);
+            // S159 —— `wmax` 提到循环外了(它与岛无关),因为**窗的护栏必须用同一个数**:
+            //   两处各写一遍这个表达式 = 一处改了另一处不改,而症状是窗边几十毫秒静默变样。
             if lw <= 1.0 || rw <= 1.0 || lw > wmax || rw > wmax {
                 continue;
             }
@@ -2327,8 +2529,7 @@ pub fn psola_shift_env(
                         continue;
                     }
                     // 支撑:K 遍盒各半宽 ⇒ 总支撑 ≈ K·W/2 每侧。留两倍余量。
-                    let half = ((f64::from(sample_rate) * *w / 1000.0) as usize / 2).max(1);
-                    let pad = half * CUT_BOX_PASSES + 1;
+                    let pad = infrasonic_pad_samples(*w, sample_rate);
                     let (s0, s1) = (a.saturating_sub(pad), (b + pad).min(n));
                     let mo: Vec<f32> =
                         (s0..s1).map(|i| if i >= a && i < b { out[i] } else { 0.0 }).collect();
@@ -2363,6 +2564,14 @@ pub fn psola_shift_env(
             //    (修正项恒为 0.0)⇒ 这条护栏不是恒等性的依据,只是多一道锁。
             let e_out: f64 = lo_out.iter().map(|v| v * v).sum();
             let e_in: f64 = lo_in.iter().map(|v| v * v).sum();
+            // S159 —— 余量打出来(见 `PsolaDiagnostics::infrasonic_gate_db`):这是「窗内逆变换」
+            // 唯一一条不结构性的耦合,离翻面有多远必须看得见。⚠ `e_in == 0` 时(ratio 1.0 的
+            // 恒等臂,两边都恒 0)读 0.0 —— 那时闸走 `>=` 的 true 臂而修正项恒为 0,无所谓余量。
+            diag.infrasonic_gate_db = if e_in > 0.0 && e_out > 0.0 {
+                (10.0 * (e_out / e_in).log10()) as f32
+            } else {
+                0.0
+            };
             // ⛔⛔ `>=` 而不是 `>`,而这一个字符是被**变异测试**逼出来的:
             //    写 `>` 的时候 ratio 1.0 上两边逐位相等 ⇒ 护栏跳过 ⇒ 恒等是**护栏**给的,
             //    不是差分式给的 ⇒ 把差分式改回「减输出自己的低频」,那条恒等判据**照样绿**。
@@ -3079,11 +3288,308 @@ mod tests {
         );
     }
 
-    /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
-    /// 在这条判据之前**没有任何东西看得见它**:`cola_*` 是在输出域算的(半窗按构造等于目标
-    /// 邻距,实测 +7..+16 全是 0.00% / 1.000),标记层的尺子全部 ratio 不变量。
-    /// 阈值不是估的:读窗半宽 = `T_src/ratio`,相邻源标记相距 `T_src` ⇒ `ratio > 2` 才留缝。
+    // ── S159 窗内逆变换 ────────────────────────────────────────────────────────────
+
+    /// S159 —— 窗内逆变换的夹具:一串**互相分开的**浊音岛,岛之间是真休止(f0 = 0)。
+    ///
+    /// ⛔ 岛间距必须**大于**桥接上限(`BRIDGE` 生产默认 30 ms),否则 `bridge_unvoiced` 会把
+    /// 相邻两岛合并成一个,于是「跳掉一个岛」这件事在夹具上**结构上不可能发生** —— 判据全绿
+    /// 而什么都没测。返回 `(x, f0 轨, hop, 每个岛的 (起, 止) 样本)`。
+    fn island_train(sr: u32, isl_ms: f64, gap_ms: f64, f0: f64, count: usize) -> (Vec<f32>, Vec<f32>, usize, Vec<(usize, usize)>) {
+        let hop = sr as usize / 200; // 5 ms —— 与生产喂进来的 f0 网格同量级
+        let isl = (f64::from(sr) * isl_ms / 1000.0) as usize;
+        let gap = (f64::from(sr) * gap_ms / 1000.0) as usize;
+        let n = gap + count * (isl + gap);
+        let mut x = vec![0.0f32; n];
+        let mut f0t = vec![0.0f32; n / hop + 2];
+        let mut spans = Vec::new();
+        for k in 0..count {
+            let a = gap + k * (isl + gap);
+            let b = (a + isl).min(n);
+            for (i, v) in voiced(sr, isl_ms / 1000.0, f0).iter().enumerate() {
+                if a + i < b {
+                    x[a + i] = *v;
+                }
+            }
+            // f0 只在岛**内部**写(留一帧余量),这样探到的岛边不会跑到 [a, b] 外面去。
+            for fi in (a / hop + 1)..(b / hop) {
+                if fi < f0t.len() {
+                    f0t[fi] = f0 as f32;
+                }
+            }
+            spans.push((a, b));
+        }
+        (x, f0t, hop, spans)
+    }
+
+    /// S159 —— 生产默认的那一套旋钮,从 [`PROBE_ARM_DEFAULTS`] 读(S156 立的规矩:
+    /// 判据不许把默认写成字面量,否则钉的是机理不是默认)。
+    fn prod_knobs() -> (bool, f64, f64, Infrasonic, f64, f64, f64, f64, usize) {
+        let g = |k: &str| {
+            PROBE_ARM_DEFAULTS.iter().find(|(n, _)| *n == k).unwrap_or_else(|| panic!("{k}")).1
+        };
+        let hp = if g("UTAI_PSOLA_HP") != 0.0 {
+            if g("UTAI_PSOLA_HP_MS") > 0.0 {
+                Infrasonic::FixedMs(g("UTAI_PSOLA_HP_MS"))
+            } else {
+                Infrasonic::PerPeriod
+            }
+        } else {
+            Infrasonic::Off
+        };
+        (
+            g("UTAI_PSOLA_FRAC") != 0.0,
+            g("UTAI_PSOLA_WSOLA"),
+            g("UTAI_PSOLA_LOCK"),
+            hp,
+            g("UTAI_PSOLA_ENVFIX"),
+            g("UTAI_PSOLA_BRIDGE"),
+            g("UTAI_PSOLA_WIN"),
+            g("UTAI_PSOLA_XGRAIN"),
+            g("UTAI_PSOLA_LPC") as usize,
+        )
+    }
+
+    /// S159 —— ⭐⭐⭐ **这一刀的承重判据:`keep` 里的每一个样本必须与整条臂【逐位】相同。**
+    ///
+    /// 生产里这条性质就是全部的验收:donor 遍只有 `keep` 那几段会被拼回歌里
+    /// (`vocal_range::apply_dead_only_windows` 只切走「窗 ± 余量」),窗外渲的是什么无关紧要。
+    ///
+    /// ## ⛔ 夹具是**设计过的**,不是随手造的
+    /// 五个岛、岛长 300 ms、岛间 60 ms 休止(> 桥接上限 30 ms ⇒ 不会被合并),窗盖住中间那个岛,
+    /// 而且窗的**左边缘故意伸进休止里**,离前一个岛的岛尾只有 6 ms。
+    /// ⇒ 前一个岛按构造**能写进窗里**(标记外走一个周期 9.1 ms · 颗粒半宽 4.5 ms ·
+    /// 去次声逐岛滤波的支撑 18 ms),所以「护栏够不够宽」这件事在这个夹具上**测得到**。
+    /// ⛔ 若把窗放在岛正中央、离邻岛半秒远,这条判据会照绿,而护栏写成 0 也照绿 = 空判据。
+    ///
+    /// ## 变异(逐条实跑过)
+    /// * 把 `reach` 里的三项去掉任一项(退成「岛与窗相交」)⇒ 前一个岛被跳掉 ⇒ 窗头几毫秒变 ⇒ **红**;
+    /// * 把 keep 谓词写成恒 `true`(永不跳岛)⇒ 逐位判据照绿,而**阴性对照** `islands_skipped` ⇒ **红**;
+    /// * 把 `continue` 挪到 `diag.islands += 1` 之后 ⇒ 输出对、收益对,而计数器读 0 ⇒ **红**。
     #[test]
+    fn the_window_keeps_every_sample_inside_it_bit_identical() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        // 110 Hz:周期 9.1 ms ⇒ 岛外溢的三项都是毫秒量级、都跨得过下面那 6 ms 的窗边余量。
+        let (x, f0t, hop, spans) = island_train(sr, 300.0, 60.0, 110.0, 5);
+        let arm = |keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 12.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc,
+                keep,
+            )
+        };
+        let (full, dfull) = arm(&[]);
+        assert_eq!(dfull.islands_seen, 5, "夹具没造出 5 个岛 —— 下面每一条断言都失去意义");
+        assert_eq!(dfull.islands_skipped, 0, "空 keep 必须一个岛都不跳");
+        assert_eq!(dfull.keep_frac, 1.0, "空 keep 的覆盖率必须报 1.0");
+
+        // 窗:中间那个岛,左边缘伸进休止、离前一个岛的岛尾只有 6 ms(见上面 doc)。
+        let ms = |v: f64| (f64::from(sr) * v / 1000.0) as usize;
+        let (m0, m1) = spans[2];
+        let keep = [(spans[1].1 + ms(6.0), m1 + ms(6.0))];
+        assert!(keep[0].0 < m0, "窗的左边缘必须落在休止里,否则护栏那一项测不到");
+        let (winy, dwin) = arm(&keep);
+
+        // ⭐ 承重:窗内逐位相同。
+        assert_eq!(
+            &winy[keep[0].0..keep[0].1],
+            &full[keep[0].0..keep[0].1],
+            "窗内不是逐位相同 —— 护栏不够宽,或者有一条跨岛耦合没被前置条件挡住"
+        );
+        // ⛔ 阴性对照 ①:真的跳掉了岛。没有这条,上面那条只证明了「窗什么也没做」。
+        assert_eq!(
+            dwin.islands_skipped, 2,
+            "应当只跳掉最远的两个岛(邻岛在护栏之内 ⇒ 必须保留),实际跳了 {}",
+            dwin.islands_skipped
+        );
+        assert_eq!(dwin.islands_seen, 5, "候选岛数不该受窗影响");
+        assert_eq!(dwin.islands, 3, "被处理的岛数 = 5 − 2");
+        // ⛔ 阴性对照 ②:窗**外**必须真的不一样(否则「跳岛」是个空操作)。
+        assert_ne!(winy, full, "整条逐位相同 ⇒ 跳掉的那两个岛本来就没产出任何东西");
+        assert_ne!(
+            &winy[..spans[0].0], &full[..spans[0].0],
+            "第一个岛之前那段都没变 —— 那说明被跳掉的岛在整条臂上也没写过东西"
+        );
+        // ⛔ 去次声那条**不结构性**的耦合:两条臂的总闸必须落在同一边(见 `infrasonic_gate_db`)。
+        assert_eq!(
+            dfull.infrasonic_gate_db >= 0.0,
+            dwin.infrasonic_gate_db >= 0.0,
+            "去次声总闸在两条臂上翻了面(整条 {:+.2} dB vs 窗臂 {:+.2} dB)—— \
+             窗内的低频修正会整块开/关",
+            dfull.infrasonic_gate_db,
+            dwin.infrasonic_gate_db
+        );
+        // 覆盖率读数要能当分母用。
+        let want = (keep[0].1 - keep[0].0) as f32 / x.len() as f32;
+        assert!((dwin.keep_frac - want).abs() < 1e-6, "keep_frac {} ≠ {want}", dwin.keep_frac);
+    }
+
+    /// S159 —— 护栏里的**去次声那一项**:钉的是不等式「护栏 ≥ 逐岛滤波的支撑」,不是一段音频。
+    ///
+    /// ## ⛔ 为什么这一条**不能**用音频钉(实测,不是省事)
+    /// 变异台 `m3`(把 `infra_guard` 整项删掉)在两种夹具上**都是绿的**,而两条原因各自成立:
+    /// * **上移臂**(生产方向)上它被前两项结构性地盖住:逐岛宽度 `w = 1000/f_src` ms
+    ///   ⇒ 支撑 `= 2·T_src + 1` 样本;而护栏的前两项 `= per + wmax`,其中 `per ≥ T_src`
+    ///   (`island_reach` 取的是岛内**最低**的 f0 = 最长周期),又因为颗粒门限
+    ///   `lw > wmax ⇒ continue` 保证参与的 `T_src ≤ wmax` ⇒ `per + wmax ≥ 2·T_src`。**恒成立。**
+    /// * **下移臂**上它才会绑定(`w` 被 `1/ratio` 放大),可那时去次声的总闸 `e_out >= e_in`
+    ///   通常把**整刀关掉**(下移让脉冲密度变稀 ⇒ 输出的低频基线比输入小)⇒ 修正项恒为 0,
+    ///   跳不跳岛都一样。
+    /// ⇒ 这一项是**给将来准备的余量**(比如有人把 `CUT_BOX_PASSES` 调大、或者放宽总闸)。
+    /// 而「一个被写进文档的风险,没有判据盯着就等于没被记录」⇒ 它至少要有这条**结构**判据。
+    ///
+    /// ## 它钉什么 —— ⛔ **断言写字面量,而且读的是生产那个函数**
+    /// 第一版我让判据**自己重新算了一遍**那三项,于是把生产那一行改成宽度**下限**、
+    /// 或者把支撑公式里的遍数删掉,它**照样绿**(变异台 `m3` / `m3b` 实测)——
+    /// 两边同步变,断言当然还成立。那是「断言里引用被测量」的镜像形态,同样是空判据。
+    /// ⇒ 只许调 [`island_guard`] 本人,期望值写**实测出来的整数**。
+    #[test]
+    fn the_window_guard_is_the_sum_of_three_measured_bounds() {
+        // 44.1 kHz、岛内最低 110 Hz、win = 1.0(生产默认):
+        //   标记外走 ceil(44100/110) = 401 · 颗粒窗 0.02·44100 = 882 · 去次声 50 ms 那一档 4409
+        //   ⇒ 5692 样本 = 129.1 ms
+        let sr = 44_100u32;
+        let hop = sr as usize / 200;
+        let f0t = flat_f0(sr as usize, hop, 110.0);
+        let wmax = MAX_PERIOD_SECONDS * f64::from(sr) * 1.0;
+        assert_eq!(
+            island_guard(&f0t, hop, 0, sr as usize, sr, wmax),
+            5692,
+            "护栏不是那三项之和了 —— 逐项:标记 {} · 颗粒 {} · 去次声 {}",
+            island_reach(&f0t, hop, 0, sr as usize, f64::from(sr)),
+            wmax as usize,
+            infrasonic_pad_samples(INFRASONIC_MS_MAX, sr)
+        );
+        // ⑵ 三项**各自**都要能单独看得见 —— 否则上面那个和可以由错误的组合凑出来。
+        assert_eq!(island_reach(&f0t, hop, 0, sr as usize, f64::from(sr)), 401);
+        assert_eq!(wmax as usize, 882);
+        assert_eq!(infrasonic_pad_samples(INFRASONIC_MS_MAX, sr), 4409);
+        // ⑶ 去次声那一项必须是宽度**上限**那一档:任何合法宽度的支撑都不许超过它。
+        let widest = infrasonic_pad_samples(INFRASONIC_MS_MAX, sr);
+        for w in [INFRASONIC_MS_MIN, 2.0, 5.0, 8.0, 16.7, 33.0, INFRASONIC_MS_MAX] {
+            assert!(
+                infrasonic_pad_samples(w, sr) <= widest,
+                "宽度 {w} ms 的支撑超过了护栏用的那一档"
+            );
+        }
+        // ⑷ 低音岛要真的把护栏推宽(标记那一项随 f0 走,不是常数)。
+        let low = flat_f0(sr as usize, hop, 55.0);
+        assert_eq!(island_reach(&low, hop, 0, sr as usize, f64::from(sr)), 802);
+        assert!(
+            island_guard(&low, hop, 0, sr as usize, sr, wmax)
+                > island_guard(&f0t, hop, 0, sr as usize, sr, wmax),
+            "把基频减半没有把护栏推宽 —— 标记那一项写死了"
+        );
+        // ⑸ 取不到周期时必须**不跳岛**(失败方向是「多做」)。
+        assert_eq!(island_reach(&[0.0f32; 8], hop, 0, 100, f64::from(sr)), usize::MAX / 4);
+    }
+
+    /// S159 —— **全覆盖的窗必须一个岛都不跳,而且逐位等于「不给窗」。**
+    ///
+    /// ⛔ 它盯的是「opt-in」这半边:今天出厂的每一条路(cover / audition / 探针 / 单测)都不给窗,
+    /// 而这一刀**不许**改它们一个字节。`psola_shift_env` 只是转发 `&[]`,所以拿它对拍是恒真的
+    /// (自己跟自己比);真正非空的对照是 **`[(0, n)]`** —— 它走的是过滤那条路,只是每个岛都留下。
+    #[test]
+    fn a_window_covering_everything_skips_nothing_and_is_byte_for_byte_today() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        let (x, f0t, hop, _) = island_train(sr, 200.0, 60.0, 160.0, 3);
+        let arm = |keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc,
+                keep,
+            )
+        };
+        let (none, dnone) = arm(&[]);
+        let (all, dall) = arm(&[(0, x.len())]);
+        assert_eq!(none, all, "全覆盖的窗改变了输出 —— 过滤那条路本身不是无损的");
+        assert_eq!(dall.islands_skipped, 0, "全覆盖却跳了岛");
+        assert_eq!(dall.islands, dnone.islands);
+        // 阴性对照:同一条路上,一个**真的窄**的窗必须改变输出(否则上面那条只是「窗没接上」)。
+        let narrow = [(x.len() / 2, x.len() / 2 + sr as usize / 20)];
+        let (nar, dnar) = arm(&narrow);
+        assert!(dnar.islands_skipped > 0, "窄窗一个岛都没跳 —— 窗根本没接上");
+        assert_ne!(nar, none, "窄窗与整条臂逐位相同 —— 窗根本没接上");
+    }
+
+    /// S159 —— ⛔⛔ **三条跨岛耦合任一开着时,窗必须被【忽略】,而且要报出来。**
+    ///
+    /// 「跳岛在窗内逐位安全」这条性质**挂在三个出厂默认上**(`LPC = 0` · `WSOLA = 0` ·
+    /// `ENVFIX = 0`)。它们各自的机理写在 `psola_shift_win` 的 doc 里,共同点是**跨岛携带状态**:
+    /// 全缓冲的 IIR 递归 / 读共享的 `acc` / 跨样本抹平的增益。
+    /// ⇒ 哪天有人翻其中任何一个,这一刀必须**自己退回整条缓冲**,而不是静默产出错的窗边。
+    ///
+    /// ⛔ 变异:把 `keep_blocked` 里的任一项去掉 ⇒ 那条臂的窗生效 ⇒ 输出与整条臂不同 ⇒ **红**。
+    #[test]
+    fn a_cross_island_knob_makes_the_window_degrade_loudly_instead_of_lying() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, _envfix, bridge, win, xg, _lpc) = prod_knobs();
+        let (x, f0t, hop, spans) = island_train(sr, 200.0, 60.0, 160.0, 4);
+        let keep = [(spans[1].0, spans[1].1)];
+        // 三条臂,每条只把一个跨岛旋钮打开。⛔ 参数从生产默认起步、只动一个自由度
+        // (S158 血训:A/B 判据两条臂只许差一个自由度)。
+        for (name, wso, envf, lp) in
+            [("LPC", wsola, 0.0, 16usize), ("WSOLA", 0.25, 0.0, 0), ("ENVFIX", wsola, 5.0, 0)]
+        {
+            let arm = |k: &[(usize, usize)]| {
+                psola_shift_win(
+                    &x, sr, 9.0, 0.0, &f0t, hop, frac, wso, lock, hp, envf, bridge, win, xg, lp, k,
+                )
+            };
+            let (full, dfull) = arm(&[]);
+            let (winy, dwin) = arm(&keep);
+            assert!(dwin.keep_ignored, "{name} 开着,窗却没有被忽略 —— 窗内会出错而没有任何东西会红");
+            assert!(!dfull.keep_ignored, "{name}:没给窗的时候不该报「窗被忽略」");
+            assert_eq!(winy, full, "{name} 开着时窗臂必须逐位等于整条臂");
+            assert_eq!(dwin.islands_skipped, 0, "{name}:被忽略的窗不许跳岛");
+        }
+        // ⛔ 阴性对照:同一个窗、同一份夹具,在**生产默认**下必须真的跳岛
+        //    —— 否则上面那三条「相同」只是因为这个窗本来就不做事。
+        let (_, dprod) = psola_shift_win(
+            &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, 0.0, bridge, win, xg, 0, &keep,
+        );
+        assert!(!dprod.keep_ignored, "生产默认下窗不该被忽略");
+        assert!(dprod.islands_skipped > 0, "生产默认下这个窗一个岛都没跳 —— 阴性对照是空的");
+    }
+
+    /// S159 —— **「窗切不到任何岛」与「根本没有音高」必须是两件事。**
+    ///
+    /// `vocal_range::apply_inverse` 在 `islands == 0` 时让整条渲染响亮失败
+    /// (`RANGE_INVERSE_NO_PITCH`)。加了窗之后 `islands == 0` 多了一个**正常**的来源:
+    /// 这一遍的窗全落在休止里。⇒ 引擎必须把两者分开报,否则「窗算错了」与「模型没给 f0」
+    /// 会报成同一种红(S129 铁律,而这条线上同一条红被判「假红」已经出过两次)。
+    #[test]
+    fn a_window_that_touches_no_island_is_not_the_same_as_having_no_pitch() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, envfix, bridge, win, xg, lpc) = prod_knobs();
+        // ⚠ 休止要够长:护栏本身就有 126 ms(周期 6 ms + 颗粒 20 ms + 去次声 100 ms),
+        //   休止短于它的时候「窗切不到任何岛」这件事**结构上不可能发生**,夹具就是假的。
+        let (x, f0t, hop, spans) = island_train(sr, 200.0, 700.0, 160.0, 3);
+        let run = |f0: &[f32], keep: &[(usize, usize)]| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, f0, hop, frac, wsola, lock, hp, envfix, bridge, win, xg, lpc, keep,
+            )
+            .1
+        };
+        // ⑴ 窗落在两个岛之间那段休止的正中(两侧各留 300 ms > 护栏)⇒ 有音高,但这一遍无事可做。
+        let ms = |v: f64| (f64::from(sr) * v / 1000.0) as usize;
+        let tail = [(spans[0].1 + ms(300.0), spans[1].0 - ms(300.0))];
+        assert!(tail[0].1 > tail[0].0, "夹具的休止不够长");
+        let d = run(&f0t, &tail);
+        assert!(d.islands_seen > 0, "夹具里必须有岛");
+        assert_eq!(d.islands, 0, "这个窗不该处理任何岛");
+        assert!(d.islands_skipped > 0, "岛全被跳掉了,却报 skipped = 0");
+        // ⑵ 真的没有音高 —— 两个计数都是 0,这才是那条错误该说的话。
+        let silent = vec![0.0f32; f0t.len()];
+        let d0 = run(&silent, &[]);
+        assert_eq!((d0.islands_seen, d0.islands, d0.islands_skipped), (0, 0, 0));
+        // ⇒ 判据 = `islands_seen`,不是 `islands`。
+        assert_ne!(
+            d.islands_seen, d0.islands_seen,
+            "两种情形在 `islands_seen` 上也分不开 ⇒ 上游没法归因,那条红就会被耸肩带过"
+        );
+    }
+
     /// S157b —— 格型分析/合成**必须是逐样本精确互逆**。整条 LP-PSOLA 的恒等都挂在这上面。
     /// ⛔ 阴性对照两条,缺一条这条判据就可能只是「两条都很小」:
     /// ⑴ 用**另一条 `k` 轨迹**合成 ⇒ 必须恢复不了(否则说明 `k` 根本没参与);
@@ -3295,6 +3801,19 @@ mod tests {
         assert_eq!(run(14.0, 0), base14);
     }
 
+    /// S151 —— 上移超过一个八度时,源波形有一整段**从来不被任何颗粒读到**,而仓里
+    /// 在这条判据之前**没有任何东西看得见它**:`cola_*` 是在输出域算的(半窗按构造等于目标
+    /// 邻距,实测 +7..+16 全是 0.00% / 1.000),标记层的尺子全部 ratio 不变量。
+    /// 阈值不是估的:读窗半宽 = `T_src/ratio`,相邻源标记相距 `T_src` ⇒ `ratio > 2` 才留缝。
+    ///
+    /// ⛔⛔ **S159:这条判据从 S157b 起到今天为止【一次都没有跑过】。**S157b 在它上面插入
+    /// LP-PSOLA 那条判据时,把 `#[test]` 连同这段 doc 一起留在了原地,于是属性落到了
+    /// `the_lattice_pair_is_an_exact_inverse` 头上(那个函数因此挂了**两个** `#[test]`),
+    /// 而这个函数变成了 `mod tests` 里一个没人调用的私有函数。
+    /// ⭐ **两条编译器警告一直在喊**(`duplicated attribute` + `function ... is never used`),
+    /// 而「717 条全绿」把它们盖住了 —— 一条判据消失,测试总数只是少 1,没有任何东西变红。
+    /// ⇒ 这就是「验证本身是空的」在**属性层**的形状:判据的正文一个字没错,它只是不再运行。
+    #[test]
     fn nothing_reads_part_of_the_source_once_the_shift_passes_an_octave() {
         let sr = 44_100;
         let f0 = 220.0;
