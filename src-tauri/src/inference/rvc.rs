@@ -292,6 +292,20 @@ pub fn run_pipeline(
     let range_jobs: Vec<super::vocal_range::DeadJob> = match &range {
         Some(r) => {
             let pf_out = &pitchf[pad_f..(pad_f + out_frames).min(pitchf.len())];
+            // S159l —— `UTAI_RANGE_DUMP_COVER_F0=<path>`:把**计划器真正看到的那条 f0**落一份裸 f32。
+            // ⛔ 为什么需要它:S159l 的「边外扩到清音帧」在真素材上 96 段里有 68 段**一动没动**,
+            // 而我用声学方法量出来的「边到最近清音」是 p50 10 ms —— 两个数对不上,
+            // 说明**计划器眼里的清音**(`pitchf == 0`)与我量的不是一回事。没有这条出口就只能猜。
+            if let Ok(p) = std::env::var("UTAI_RANGE_DUMP_COVER_F0") {
+                let mut bytes = Vec::with_capacity(pf_out.len() * 4);
+                for v in pf_out {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                match std::fs::write(&p, &bytes) {
+                    Ok(()) => tracing::info!("cover f0 dump: {} frames -> {p}", pf_out.len()),
+                    Err(e) => tracing::warn!("cover f0 dump {p} failed: {e}"),
+                }
+            }
             let (jobs, unfixable) = super::vocal_range::cover_dead_plan(pf_out, 100.0, r);
             // 审计恒打印(S83 承诺):无死区也是一个判决;无解区域响亮带位置。
             if jobs.is_empty() && unfixable.is_empty() {
