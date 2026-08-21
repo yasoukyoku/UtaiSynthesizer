@@ -1378,6 +1378,42 @@ const COVER_MIN_RESCUE_DEPTH: i64 = 3;
 /// 而不是「扩到上限为止」—— 那只会把缝挪个位置,还白搭一堆乘客。
 const COVER_EDGE_SEEK_MS: f32 = 300.0;
 
+/// ⚙ 出厂默认 = 800.0 —— S159n:**相邻两段位移相同**且间隔不超过这么久 ⇒ 合并成一段。
+///
+/// ⛔ 为什么只合并**同位移**:合并本身能直接减少边的条数(边才是用户听到的那个台阶),
+/// 而「位移相同」这一条让它**深度上一分不花** —— 没有任何一段会被拖得比它自己需要的更深。
+/// ⚠ 允许深度差之后能收掉的边多得多(实测:差 ≤1 度 / 0.5 s ⇒ 107 → 82 段),
+/// 但那要付「把浅段拖深」的钱,而**那笔钱没有量过** ⇒ 不在这里花。
+///
+/// ## 定价(用户 2026-08-21 的真素材,107 段)
+/// | 门限 | 段数 | 边数 | 覆盖 | 被拖深 |
+/// |---|---|---|---|---|
+/// | 0(今天) | 107 | 214 | 69.6 s | — |
+/// | 0.5 s | 101 | 202 | 71.0 | **0** |
+/// | **0.8 s** | **99** | **198** | **72.1** | **0** |
+/// | 1.2 s 及以上 | 99 | 198 | 72.1 | 0 |
+/// ⇒ 0.8 s 之后曲线就平了(再远的同位移邻段本来就不存在)⇒ 停在 0.8。
+const COVER_MERGE_SAME_SHIFT_MS: f32 = 800.0;
+
+/// S159n —— `UTAI_COVER_PHRASE_GAP_MS=<ms>`:**按乐句整段救**(0 = 关 = 出厂默认)。
+///
+/// ## ⛔ 为什么它今天是旋钮而不是默认
+/// 它是唯一能让**台阶不存在**的路子(一个乐句内部不再有 native↔donor 的切换),而且
+/// 边数直接腰斩:实测 214 → **132**(门限 100 ms)/ **76**(150 ms),而且每条边按构造
+/// 都落在一条 ≥ 门限的真空档里。
+/// ⚠ 但代价是**结构性的**:覆盖从 23.8% 涨到 **58-62%**,donor 里的最低音从 MIDI 70.7
+/// 掉到 **60.9**(150 ms 时 59.6)。⭐ 好消息:实测**没有任何乐句会掉到 MIDI 48 以下**
+/// (该模型的下界)⇒ 不会出现唱不出来的帧。
+/// ⛔⛔ **净效果预测不了**:今天的区段里根本没有 MIDI 70 以下的素材,那一档的开/关差
+/// 从来没量过。⇒ 先挂旋钮、渲一遍量,**别在量之前翻默认**。
+fn cover_phrase_gap_ms() -> f32 {
+    std::env::var("UTAI_COVER_PHRASE_GAP_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 5000.0)
+        .unwrap_or(0.0)
+}
+
 /// S85 七轮:COVER(音频轨/audition)的 dead-only 计划 — `dead_only_plan` 的帧域版,同一
 /// 死亡判据(slot_singable)与同一落点搜索(minimal_rescue_shift),两轨哲学统一:整曲平移
 /// 退役,只有模型「连音高都发不出」的**持续**区域被局部救援;深度由该区域自己的最小落点
@@ -1484,10 +1520,57 @@ pub fn cover_dead_plan(
             i
         }
     };
+    // S159n —— 乐句模式(旋钮):区段直接取**包住它的那条乐句**(被 ≥ 门限的清音连段分开的
+    // 有声区间)⇒ 边按构造落在真空档里。⛔ 死帧长度门(`MIN_VIOLATION_MS`)照旧先过一遍,
+    // 幻影岛铁律(S62b)不因为换了分段方式就失效。
+    let phrase_gap = cover_phrase_gap_ms();
+    let phrase_of = |i: usize| -> (usize, usize) {
+        let g = frames_for(phrase_gap, fps) as usize;
+        let (mut a, mut b) = (i, i);
+        // 往回:走到一条长度 ≥ g 的清音连段的**右端**为止。
+        while a > 0 {
+            if !voiced(a - 1) {
+                let mut k = a - 1;
+                let mut run = 0usize;
+                while k > 0 && !voiced(k) {
+                    run += 1;
+                    k -= 1;
+                }
+                if !voiced(k) {
+                    run += 1;
+                }
+                if run >= g {
+                    break;
+                }
+            }
+            a -= 1;
+        }
+        while b + 1 < f0_hz.len() {
+            if !voiced(b + 1) {
+                let mut k = b + 1;
+                let mut run = 0usize;
+                while k < f0_hz.len() && !voiced(k) {
+                    run += 1;
+                    k += 1;
+                }
+                if run >= g {
+                    break;
+                }
+            }
+            b += 1;
+        }
+        (a, b)
+    };
     // (外扩起, 外扩止, 它是由哪些原始组扩出来的)
     let mut spans: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
     for &(a, b, _) in &groups {
-        let (ea, eb) = (back(a), fwd(b));
+        let (ea, eb) = if phrase_gap > 0.0 {
+            let (pa, _) = phrase_of(a);
+            let (_, pb) = phrase_of(b);
+            (pa, pb)
+        } else {
+            (back(a), fwd(b))
+        };
         // ⛔ 外扩之后两段可能撞上(同一条岛上有两处过线)—— 不合并的话拼接器会把同一段贴两次。
         match spans.last_mut() {
             Some((_, pe, orig)) if ea <= *pe + 1 => {
@@ -1539,7 +1622,22 @@ pub fn cover_dead_plan(
             }
         }
     }
-    (out, unfixable)
+
+    // ── S159n ⑴ —— **同位移的相邻段合并**(深度免费,见 `COVER_MERGE_SAME_SHIFT_MS`)。
+    // ⛔ 放在最后做:合并要看的是**落点算完之后**的位移,而不是分组时的形状。
+    // ⚠ 合并会让两段之间那截材料也进 donor(乘客),实测这一步只多 2.5 s。
+    let merge_gap = frames_for(COVER_MERGE_SAME_SHIFT_MS, fps) as i64;
+    out.sort_by_key(|j| (j.start, j.end));
+    let mut merged: Vec<DeadJob> = Vec::with_capacity(out.len());
+    for j in out {
+        match merged.last_mut() {
+            Some(p) if p.shift == j.shift && j.start - p.end <= merge_gap => {
+                p.end = p.end.max(j.end);
+            }
+            _ => merged.push(j),
+        }
+    }
+    (merged, unfixable)
 }
 
 /// S85: dead-group 短语窗(50fps 帧域)——短语区间的帧窗向两侧休止扩展(pre ≤4 帧吃借帧
@@ -3232,6 +3330,57 @@ mod tests {
         let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
         assert_eq!(jobs.len(), 1, "外扩之后撞上的两段没有合并 ⇒ 拼接器会贴两次:{jobs:?}");
         assert_eq!((jobs[0].start, jobs[0].end), (50, 110));
+    }
+
+    /// S159n ⑴ —— **位移相同的相邻段合并**(深度免费)。读数在 [`COVER_MERGE_SAME_SHIFT_MS`] 的 doc 里。
+    ///
+    /// ⛔ 三件一起钉,少一件就能被「干脆全合并」或者「根本没合并」满足:
+    /// ⑴ 同位移 + 间隔够近 ⇒ **合并**;⑵ **位移不同 ⇒ 绝不合并**(否则就是在把浅段拖深,
+    ///    而那笔钱没量过);⑶ 同位移但**隔得太远 ⇒ 不合并**(否则门限形同虚设)。
+    #[test]
+    fn adjacent_cover_regions_with_the_same_shift_are_merged() {
+        let r = SpeakerRange::bounds((48.0, 84.0), (48.0, 84.0));
+        // 两段都需要 −4(88 → 84),中间隔 40 帧 = 400 ms < 800 ms 门限。
+        let mut same = vec![0.0f32; 20];
+        same.extend(vec![hz(88.0); 40]);
+        same.extend(vec![0.0; 40]);
+        same.extend(vec![hz(88.0); 40]);
+        same.extend(vec![0.0; 20]);
+        let (jobs, _) = cover_dead_plan(&same, 100.0, &r);
+        assert_eq!(jobs.len(), 1, "同位移的两段没有合并:{jobs:?}");
+        assert_eq!((jobs[0].start, jobs[0].end, jobs[0].shift), (20, 140, -4));
+
+        // ⑵ ⛔ 阴性对照:位移不同(−4 与 −8)⇒ 必须还是两段。
+        let mut diff = vec![0.0f32; 20];
+        diff.extend(vec![hz(88.0); 40]);
+        diff.extend(vec![0.0; 40]);
+        diff.extend(vec![hz(92.0); 40]);
+        diff.extend(vec![0.0; 20]);
+        let (jobs2, _) = cover_dead_plan(&diff, 100.0, &r);
+        assert_eq!(jobs2.len(), 2, "位移不同的两段被合并了 —— 那是在把浅段拖深:{jobs2:?}");
+        assert_eq!((jobs2[0].shift, jobs2[1].shift), (-4, -8));
+
+        // ⑶ ⛔ 同位移但隔了 1.2 s(> 门限)⇒ 不合并。
+        let mut far = vec![0.0f32; 20];
+        far.extend(vec![hz(88.0); 40]);
+        far.extend(vec![0.0; 120]);
+        far.extend(vec![hz(88.0); 40]);
+        far.extend(vec![0.0; 20]);
+        let (jobs3, _) = cover_dead_plan(&far, 100.0, &r);
+        assert_eq!(jobs3.len(), 2, "隔了 1.2 s 还合并 ⇒ 门限形同虚设:{jobs3:?}");
+    }
+
+    /// S159n ⑶ —— **按乐句整段救**(`UTAI_COVER_PHRASE_GAP_MS`,出厂 = 0 = 关)。
+    ///
+    /// ⛔ 这条判据只钉**旋钮关着时行为不变**这一件 —— 那是它今天唯一的承诺。
+    /// 旋钮开着的形状(边落在真空档里)由离线台子在真素材上量,不在这里断言:
+    /// 净效果**还没量**(今天的区段里根本没有 MIDI 70 以下的素材),
+    /// ⛔ 在量出来之前谁也不许把它翻成默认。
+    #[test]
+    fn the_phrase_mode_knob_is_off_by_default_and_inert() {
+        // ⛔ 不读进程 env(会随机器上导出了什么改答案,S150 在 `parse_phase_lock` 上付过这个学费)——
+        //    这里钉的是**函数的出厂值**。
+        assert_eq!(cover_phrase_gap_ms(), 0.0, "乐句模式的出厂默认必须是关");
     }
 
     #[test]
