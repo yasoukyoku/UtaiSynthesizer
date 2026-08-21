@@ -155,6 +155,16 @@ pub struct RvcModel<'a> {
     pub min_frames: usize,
 }
 
+/// S159q —— `UTAI_COVER_DONOR_PAD_MS=<ms>`:donor 切片两侧各加多少真实上下文(0 = 关 = 出厂)。
+/// 机理与出处写在使用点上(`run_pipeline` 里 donor 那一段)。⛔ 出厂 0 ⇒ 输出逐位不变。
+fn cover_donor_pad_ms() -> f32 {
+    std::env::var("UTAI_COVER_DONOR_PAD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 5000.0)
+        .unwrap_or(0.0)
+}
+
 pub fn run_pipeline(
     m: &RvcModel,
     audio: &AudioBuffer,
@@ -462,13 +472,37 @@ pub fn run_pipeline(
                     if ib <= ia {
                         continue;
                     }
+                    // S159q —— `UTAI_COVER_DONOR_PAD_MS=<ms>`(0 = 关 = 今天):给 donor 的切片
+                    // **两侧各加一段真实上下文**,渲完再切回来。
+                    //
+                    // ⛔ 为什么怀疑这里:用户 2026-08-21 指出「谱面轨 +7 渲得出来 ⇒ 模型做得到,
+                    // 不存在硬阻碍」。两条车道在 donor 上的差别正是:谱面轨**整曲**移调重渲
+                    // (完整上下文),cover **逐小片**递归跑整条 `run_pipeline` —— 那一片里会
+                    // **重新 16k 重采样 + 重新抽 ContentVec + 重新跑 RMVPE**,而实测切片中位只有
+                    // 0.50 s、53 段短于 0.5 s。RMVPE / ContentVec 在那种长度上远不如整曲可靠。
+                    // ⚠ 这条能同时解释用户报的三件事:谐波碎 · 「ぴゃ」糊成一团 · **跳八度**。
+                    // ⛔ 出厂 0 = 逐位不变;先量,别在量出来之前翻默认。
+                    let pad_in = ((cover_donor_pad_ms() as f64 / 1000.0) * in_sr as f64) as usize;
+                    let ja = ia.saturating_sub(pad_in);
+                    let jb = (ib + pad_in).min(mono.samples.len());
                     let slice_in = crate::audio::AudioBuffer::new_mono(
-                        mono.samples[ia..ib].to_vec(),
+                        mono.samples[ja..jb].to_vec(),
                         in_sr,
                     );
                     let mut donor_opts = options.clone();
                     donor_opts.f0_shift += s as f32;
                     let donor = run_pipeline(m, &slice_in, &donor_opts, None, &dp, cancel)?;
+                    // 余量渲完就切掉:输出侧的前缀 = (ia − ja) 换算到 `final_sr`。
+                    let donor = if pad_in == 0 {
+                        donor
+                    } else {
+                        let r = donor.sample_rate as f64 / in_sr as f64;
+                        let cut = ((ia - ja) as f64 * r).round() as usize;
+                        let want = ((ib - ia) as f64 * r).round() as usize;
+                        let lo = cut.min(donor.audio.len());
+                        let hi = (cut + want).min(donor.audio.len());
+                        SynthesisResult { audio: donor.audio[lo..hi].to_vec(), ..donor }
+                    };
                     // fed f0 取同帧段(100fps;±1 帧取整偏移 ≪ 100ms sticky base 窗)
                     let fa = ((a as f64 / spf) as usize).min(pf_shift.len());
                     let fb = (((b as f64 / spf).ceil() as usize) + 1).min(pf_shift.len());
