@@ -141,7 +141,7 @@ impl SpeakerRange {
     /// S85 dead-only: can the model produce a pitch AT ALL at this (integer) MIDI slot?
     /// With a raw scan = the usable-grade f0 criterion per slot (窗外/未测 = false — "never
     /// tested" must never read as "fine"); bounds-only records fall back to the usable bounds.
-    fn slot_singable(&self, midi: i64) -> bool {
+    pub(crate) fn slot_singable(&self, midi: i64) -> bool {
         // S146e: the `usable` bounds are ANDed in on BOTH arms — they are the user's knob, and
         // until now the raw-scan arm ignored them completely. That is the bug the user reported
         // as "调节那个可用范围没用,比如我想让高音用舒适的办法去唱也做不到": narrowing the upper
@@ -212,7 +212,7 @@ impl SpeakerRange {
     /// S151: the scan's raw `low_ratio` at an integer slot. `None` = no scan, or off the scanned
     /// window — and OUTSIDE the window it must read as the WORST possible value, never as "fine"
     /// (the same rule `damage_at` already follows).
-    fn thinness(&self, midi: i64) -> Option<f32> {
+    pub(crate) fn thinness(&self, midi: i64) -> Option<f32> {
         let t = self.thin.as_ref()?;
         let slot = midi - DAMAGE_LO_MIDI as i64;
         Some(match (0..DAMAGE_SLOTS as i64).contains(&slot) {
@@ -534,6 +534,22 @@ pub struct RescueTuning {
     /// ⛔ 两件事必须由**同一个开关**控制:只放宽预算而不换排序,等于让「最浅优先」把死音停得更
     /// 靠上;只换排序而不放宽预算,在 akiko 上也已经会改今天的落点(78 → 77)。
     pub landing: Option<i64>,
+    /// S159 —— [`LANDING_RATIO_TWO_ST`] 的**可扫版本**(出厂 = 那个常量本身)。
+    ///
+    /// ⛔ 它**不是**新旋钮:`new()` / `today()` / `from_env()` 一律填常量,生产上没有第二条路。
+    /// 它存在的唯一理由是 S157 就登记、至今没做的那件事 —— **给 14 重新定价**:
+    /// 那个常量是私有 `const`、**没有任何运行期缝**,扫它只能「改常量 + 重编译」,一个值一遍,
+    /// 而且一改 `changing_a_production_default_forces_a_paired_version_bump` 当场红。
+    /// ⇒ 加一个**只有计划台会动**的自由度(`with_cap`),让一次 0.04 s 的跑出整张表。
+    /// ⚠ 要动它当默认,改的仍然是 [`LANDING_RATIO_TWO_ST`]。
+    pub cap: i64,
+}
+
+impl RescueTuning {
+    /// S159 —— 只换深度上限的那一条臂(计划台专用)。
+    pub fn with_cap(self, cap: i64) -> Self {
+        Self { cap, ..self }
+    }
 }
 
 impl RescueTuning {
@@ -549,17 +565,19 @@ impl RescueTuning {
     /// `the_today_tuning_is_literally_the_shipped_defaults` 钉住。
     /// ⚠ 要「S151 之前那条臂」的判据请显式写 `RescueTuning::new(None, None)`,别借 `today()`。
     pub fn today() -> Self {
-        Self { trim: TRIM_DEFAULT, landing: LANDING_DEFAULT }
+        Self { trim: TRIM_DEFAULT, landing: LANDING_DEFAULT, cap: LANDING_RATIO_TWO_ST }
     }
 
     pub fn new(trim: Option<(f32, f32)>, landing: Option<i64>) -> Self {
-        Self { trim, landing }
+        Self { trim, landing, cap: LANDING_RATIO_TWO_ST }
     }
 
     pub fn from_env() -> Self {
         Self {
             trim: parse_trim(std::env::var("UTAI_RANGE_TRIM").ok().as_deref()),
             landing: parse_landing(std::env::var("UTAI_RANGE_LANDING").ok().as_deref()),
+            // ⛔ 深度上限**没有** env 缝:生产只有 `LANDING_RATIO_TWO_ST` 一条路。
+            cap: LANDING_RATIO_TWO_ST,
         }
     }
 }
@@ -615,7 +633,9 @@ pub fn dead_only_plan_with(
             // this knife: it changes which notes get sung differently, so it needs its own
             // decision and its own blind test. Bundling it would make any A/B unattributable.
             // Pinned by `trimming_may_not_turn_an_unfixable_phrase_into_a_rescue`.
-            let Some(whole_shift) = minimal_rescue_shift(&dead, &whole, range, tune.landing) else {
+            let Some(whole_shift) =
+                minimal_rescue_shift_capped(&dead, &whole, range, tune.landing, tune.cap)
+            else {
                 unfixable.push((i, j));
                 i = j + 1;
                 continue;
@@ -668,7 +688,8 @@ pub fn dead_only_plan_with(
                 // × 炉心融解 (and its +7 stress case): this moves **no** group. Audited rather
                 // than assumed, because a moved landing is a change nobody has heard.
                 let kept: Vec<i64> = (a..=b).map(|k| eff(note_nums[k])).collect();
-                let s = minimal_rescue_shift(&dead, &kept, range, tune.landing).unwrap_or(whole_shift);
+                let s = minimal_rescue_shift_capped(&dead, &kept, range, tune.landing, tune.cap)
+                    .unwrap_or(whole_shift);
                 if s != whole_shift {
                     tracing::info!(
                         "range: notes[{a}..={b}] landing moved {whole_shift:+} → {s:+} st once its \
@@ -919,6 +940,18 @@ fn minimal_rescue_shift(
     range: &SpeakerRange,
     landing: Option<i64>,
 ) -> Option<i64> {
+    minimal_rescue_shift_capped(dead, all, range, landing, LANDING_RATIO_TWO_ST)
+}
+
+/// S159 —— [`minimal_rescue_shift`],但深度上限由参数给。⛔ 生产永远传 [`LANDING_RATIO_TWO_ST`];
+/// 这条门存在的唯一理由是让计划台一次跑出「上限 × 预算」那张二维表(见 `RescueTuning::cap`)。
+fn minimal_rescue_shift_capped(
+    dead: &[i64],
+    all: &[i64],
+    range: &SpeakerRange,
+    landing: Option<i64>,
+    ratio_two_cap: i64,
+) -> Option<i64> {
     let above = dead.iter().any(|&p| p as f32 > range.usable.1);
     let below = dead.iter().any(|&p| (p as f32) < range.usable.0);
     let candidates: Vec<i64> = if above && below {
@@ -1028,7 +1061,7 @@ fn minimal_rescue_shift(
             // ⛔ **护栏只封「多花的」那部分,永远不许比今天更小** —— 第一版写成 `min(room)`,
             // 于是已经越过那条线的组连今天本来就有的 +1 都被收走了,落到 damage 更差的一格上
             // (实测:谱面 +7 的深组从 −14 变成 −13)。护栏是上限,不是替代品。
-            let room = (LANDING_RATIO_TWO_ST - shallowest.abs()).max(0);
+            let room = (ratio_two_cap - shallowest.abs()).max(0);
             extra.max(0).min(room).max(LANDING_MAX_EXTRA_DEPTH)
         }
     };
@@ -1216,9 +1249,43 @@ fn minimal_rescue_shift(
 ///    原文那条源覆盖率的理由被 S156 的宽读窗打掉，
 ///    而我自己换上的这条被 S157c 的亚样本搬运打掉。
 ///
-/// ⇒ **14 这个值今天没有被重新定价过。**它仍然满足「不新增比今天更深的音」
-/// （四份装机记录在 14 上的最深位移仍然全部是 14），
-/// 而**放宽它的理由现在比之前更强** —— 下一次动这条线时值得重扫。
+/// ## ✅ S159 —— **重新定价做了,结论是【14 不动】**(它推翻了上一段自己写的期待)
+///
+/// 上一段写着「**放宽它的理由现在比之前更强** —— 下一次动这条线时值得重扫」。扫过了,不成立。
+///
+/// 台子 = `mg_dump_plan_arms` 的 `[cap]` 二维表(`cap ∈ {12,13,14,15,16,18,20,24}` ×
+/// `extra ∈ 1..=5`,**走生产函数** `dead_only_plan_with`,0.04 s 一跑,不碰 ONNX)。
+/// ⛔ **必须是二维**:`budget = clamp(extra, LANDING_MAX_EXTRA_DEPTH, max(0, cap − |最浅|))`,
+/// 出厂 `extra = 3` ⇒ **`|最浅| ≤ cap − 3` 的组根本碰不到 cap**。只扫 cap 一维会读出一张
+/// 「几乎全平」的表,并把「14 没问题」写成结论 —— 那正是 S157 记的「一条只在窄区间上采样的
+/// 曲线,读出来的单调性是【那个区间】的性质,不是曲线的」。判据
+/// [`tests::the_depth_cap_only_bites_once_the_shallowest_landing_is_already_deep`] 钉住这条算术。
+///
+/// **原 key 炉心融解**(25 组):`cap` 从 12 到 24,**每一行逐字相同** —— 组数 25 / donor 遍数 /
+/// Σ|位移| / lr_worst / lr_p50 / 位移集合全部不变。⇒ 用户实际用的那份谱上,这个常数**是惰性的**。
+///
+/// **+7 压力谱**(93 组,`|最浅|` 能到 21,cap 真的咬得到)—— `extra = 3` 那一列:
+///
+/// | cap | donor 遍 | Σ\|位移\| | lr_worst | lr_p50 | 最深 |
+/// |---|---|---|---|---|---|
+/// | 12–16 | 15 | 7888–7896 | 0.627 | 0.212 | −21 |
+/// | 18 | 15 | 8098 | 0.627 | 0.212 | −21(新引入 −17)|
+/// | 20 | 15 | 8106 | 0.627 | 0.212 | −21(新引入 −20)|
+/// | **24** | **17** | 8239 | **0.573** | 0.212 | **−23** |
+///
+/// ⇒ ⭐ **12–16 之间没有任何可测的差别**;18/20 **改了计划却在 `low_ratio` 上一分钱没买到**,
+/// 只是把剂量抬了 2.6%;24 买到 lr_worst **0.054**,代价是 **+2 遍 donor** 与一个 **−23**
+/// —— 正好**违反 S157 当初定 14 时用的那条准入判据**(「不新增任何一个比今天更深的音」)。
+/// ⇒ **这个区间里没有哪个值在任何一条量得到的轴上比 14 好。**
+///
+/// ⚠⚠ 三条限制,别把上面读成比它本身更强的结论:
+/// 1. 这是**计划层**的读数,它**一个字都没听**。它说的是「计划不会朝任何仪器叫得出好的方向变」,
+///    不是「深一点不会更好听」。
+/// 2. 只扫了 akiko 这一份 sidecar 的两份谱。别的歌手/谱上 `|最浅|` 的分布不同,cap 可能咬得到。
+/// 3. ⭐ **S159 顺带改变了它的经济账**:窗内逆变换之后一遍 donor 的逆变换从 ~25 s 掉到 2-6 s,
+///    ⇒ 「多一遍」这个代价小了很多。**即便如此**,24 那一档买到的东西仍然是 0.054。
+///
+/// ⇒ **14 不动;真正在动的那一维是 [`LANDING_DEFAULT`](`extra`),不是这个上限。**
 const LANDING_RATIO_TWO_ST: i64 = 14;
 
 /// How much better a deeper landing's raw `low_ratio` must be before it is preferred over a
@@ -4262,6 +4329,55 @@ mod tests {
         let (shallow, _) =
             dead_only_plan_with(&[0, 83, 0], &secs(3), 0, &r, RescueTuning::new(None, Some(3)));
         assert_eq!(shallow[0].shift, -7, "够得着的组要花满 3 个半音,不然预算这条线是空的");
+    }
+
+    /// S159 —— ⛔⛔ **深度上限只在「最浅落点本来就很深」时才咬 —— 所以只扫它一维必然读出一张平表。**
+    ///
+    /// `budget = clamp(extra, LANDING_MAX_EXTRA_DEPTH, max(0, cap − |最浅|))`。
+    /// 出厂 `extra = 3` ⇒ 只要 `|最浅| ≤ cap − 3`,`room ≥ extra`,**cap 一个字节都不改结果**。
+    /// 这就是 S159 给 `LANDING_RATIO_TWO_ST` 重新定价时那张表的形状:
+    /// **原 key 炉心融解上 cap 从 12 扫到 24 每一行逐字相同**(那份谱的 `|最浅|` 全 ≤ 11)。
+    ///
+    /// ⇒ ⛔ **别把「扫了没变」读成「这个值是对的」** —— 要先证明那个区间里它**够得着**。
+    /// 这与 S157 记的那条同族:「一条只在窄区间上采样的曲线,读出来的单调性是**那个区间**的性质」。
+    ///
+    /// ⛔ 变异:`room` 那一行改成 `(ratio_two_cap - shallowest.abs()).max(3)`(= 让 cap 永不咬)
+    /// ⇒ 下面第二组断言红;把 `.max(LANDING_MAX_EXTRA_DEPTH)` 去掉 ⇒ 第三组红。
+    #[test]
+    fn the_depth_cap_only_bites_once_the_shallowest_landing_is_already_deep() {
+        let mut semis = serde_json::Map::new();
+        for m in 36..=79i64 {
+            // 一路往下越来越不薄 ⇒ 排序永远想走到预算的最深处 ⇒ 读出来的就是预算本身。
+            semis.insert(m.to_string(), serde_json::json!([1, 1.0, -1.0, 0.60 - 0.01 * (79 - m) as f64]));
+        }
+        for m in 80..=110i64 {
+            semis.insert(m.to_string(), serde_json::json!([9999, 0.0, -21.0, 0.90]));
+        }
+        let r = speaker_range(
+            &config_with(serde_json::json!({
+                "usable": [36, 79], "usable_auto": [36, 79], "comfort": [36, 79],
+                "semitones": serde_json::Value::Object(semis)
+            })),
+            0,
+        )
+        .unwrap();
+        let depth = |note: i64, cap: i64| -> i64 {
+            let t = RescueTuning::new(None, Some(3)).with_cap(cap);
+            dead_only_plan_with(&[0, note, 0], &secs(3), 0, &r, t).0[0].shift
+        };
+        // ⑴ **够不着 cap 的那一档:换 cap 一个字节都不动。**死音 83 ⇒ 最浅 −4,`room = cap − 4 ≥ 3`。
+        for cap in [12i64, 14, 16, 20, 24] {
+            assert_eq!(depth(83, cap), -7, "cap {cap}:|最浅| = 4 时 cap 不该起作用");
+        }
+        // ⑵ **咬得到的那一档:落点随 cap 一格一格走。**死音 92 ⇒ 最浅 −13。
+        //    边界写实测字面量(⛔ 不许拿被测的常量算期望值 —— 那是恒真)。
+        assert_eq!(depth(92, 14), -14, "cap 14 ⇒ room 1");
+        assert_eq!(depth(92, 15), -15, "cap 15 ⇒ room 2");
+        assert_eq!(depth(92, 16), -16, "cap 16 ⇒ room 3(= extra,到此为止)");
+        assert_eq!(depth(92, 20), -16, "cap 再大也被 extra = 3 封住");
+        // ⑶ **护栏是下限不是替代品**:`|最浅| ≥ cap` 时仍然保留 `LANDING_MAX_EXTRA_DEPTH` 那一格。
+        assert_eq!(depth(92, 13), -14, "cap 13 < |最浅| ⇒ room 0,但护栏保底 1 格");
+        assert_eq!(depth(92, 5), -14, "cap 荒谬地小也不许比今天更浅");
     }
 
     /// ⛔⛔ S157 —— `RescueTuning::today()` 的 doc 说「Exactly what ships today」,

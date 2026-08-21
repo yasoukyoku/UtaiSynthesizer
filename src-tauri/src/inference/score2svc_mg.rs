@@ -1496,6 +1496,58 @@ fn mg_dump_plan_arms() {
         }
     }
 
+    // ⭐⭐ S159 —— **给 `LANDING_RATIO_TWO_ST` 重新定价用的二维表**(S157 就登记、至今没做)。
+    //
+    // ⛔ 为什么必须是二维:`budget = clamp(extra, LANDING_MAX_EXTRA_DEPTH, max(0, cap − |最浅|))`,
+    //   而出厂 `extra = 3` ⇒ **`|最浅| ≤ 11` 的组根本碰不到 cap**(room 已经 ≥ 3)。只扫 cap 一维
+    //   会读出一张「几乎全平」的表,并把「14 没问题」写成结论 —— 那正是 S157 记的
+    //   「一条只在窄区间上采样的曲线,读出来的单调性是【那个区间】的性质,不是曲线的」。
+    //
+    // 每一行四个数,各自独立:
+    //   · 组数            —— 救不救得动(cap 收得太紧会让组掉出去)
+    //   · **donor 遍数**  —— `1 + distinct shift`,渲染时间的**结构性**大头
+    //   · 最深位移        —— 「有没有新增比今天更深的音」,S157 定 14 时的那条准入判据
+    //   · worst dead low_ratio —— 唯一有盲测背书、与耳朵同向的那条轴(`SpeakerRange::thinness`,
+    //     **走生产函数**,⛔ 不许在这里复刻一份 `thin[]` 的算法)
+    eprintln!("[cap] ── LANDING_RATIO_TWO_ST × landing 二维扫描(trim = 今天出厂)──");
+    eprintln!("[cap] {:>4} {:>5} {:>4} {:>6} {:>6} {:>8} {:>8} {:>6}  {}",
+              "cap", "extra", "组数", "donor遍", "Σ|位移|", "lr_worst", "lr_p50", "变组", "位移集合");
+    // 参照 = 同一个 cap 下 `extra = 1`(= 护栏 `LANDING_MAX_EXTRA_DEPTH` 那一档)。
+    // ⛔ 不拿「今天出厂」当参照:翻默认那一秒参照就从台子上消失了(S158 的 `None` 基线臂同理)。
+    let dead_lr = |plan: &[super::super::vocal_range::DeadGroup]| -> (f32, f32, i64) {
+        let mut v: Vec<f32> = Vec::new();
+        let mut dose = 0i64;
+        for g in plan {
+            dose += g.shift.abs() * (g.end as i64 - g.start as i64 + 1);
+            for k in g.start..=g.end {
+                let p = (nn[k] + transpose).clamp(1, 127);
+                if !range.slot_singable(p) {
+                    v.push(range.thinness(p + g.shift).unwrap_or(1.0));
+                }
+            }
+        }
+        v.sort_by(f32::total_cmp);
+        let worst = v.last().copied().unwrap_or(0.0);
+        let p50 = if v.is_empty() { 0.0 } else { v[v.len() / 2] };
+        (worst, p50, dose)
+    };
+    for cap in [12i64, 13, 14, 15, 16, 18, 20, 24] {
+        let base: Vec<i64> = dead_only_plan_with(&nn, &fr, transpose, &range,
+            RescueTuning::new(today.trim, Some(1)).with_cap(cap)).0.iter().map(|g| g.shift).collect();
+        for extra in [1i64, 2, 3, 4, 5] {
+            let tune = RescueTuning::new(today.trim, Some(extra)).with_cap(cap);
+            let (plan, unfix) = dead_only_plan_with(&nn, &fr, transpose, &range, tune);
+            let sh: std::collections::BTreeSet<i64> = plan.iter().map(|g| g.shift).collect();
+            let (worst, p50, dose) = dead_lr(&plan);
+            let moved = plan.iter().zip(base.iter()).filter(|(g, b)| g.shift != **b).count();
+            let set: Vec<String> = sh.iter().map(|s| format!("{s}")).collect();
+            eprintln!("[cap] {cap:>4} {extra:>5} {:>4} {:>6} {dose:>6} {worst:>8.3} {p50:>8.3} {moved:>6}  {}{}",
+                      plan.len(), 1 + sh.len(), set.join(","),
+                      if unfix.is_empty() { String::new() } else { format!("  ⚠ {} 组无解", unfix.len()) });
+        }
+    }
+    eprintln!("[cap] ⇒ 今天出厂 = cap {} × extra {:?}", today.cap, today.landing);
+
     let arms: Vec<(String, Option<(f32, f32)>)> = {
         // ⛔ S158:**「trim 关」这条臂必须永远在表里**,而且要写死 `None` ——
         // 不能靠「今天(出厂)」当基线。翻默认那一秒基线就从台子上消失了(实测:S158 翻完
