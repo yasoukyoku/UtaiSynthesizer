@@ -1158,7 +1158,7 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
     ("UTAI_PSOLA_LOCK", 0.30),
     ("UTAI_PSOLA_HP", 1.0),
     ("UTAI_PSOLA_HP_MS", 0.0),
-    ("UTAI_PSOLA_ENVFIX", 0.0),
+    ("UTAI_PSOLA_ENVFIX", 3.0),
     ("UTAI_PSOLA_BRIDGE", 30.0),
     ("UTAI_PSOLA_WIN", 1.0),
     ("UTAI_PSOLA_XGRAIN", 1.0),
@@ -1538,6 +1538,68 @@ fn env_dev_p50_db(ey: &[f64], ex: &[f64], covered: &[bool]) -> f64 {
 ///    unsmoothed pass made the deviation **worse** (0.37 → 1.05 dB). ⇒ a corrective arm has to be
 ///    tested at the shifts where there is almost nothing to correct, not just where the defect is
 ///    big — otherwise "it helps" is only ever measured where it cannot lose.
+/// S159i —— 包络还原的窗宽**以 donor 的周期计,不是毫秒**,而且**逐岛**算。
+///
+/// ## ⛔ 为什么不能是一个毫秒常数(这条是量出来的,不是设计出来的)
+/// 真素材上 donor 的参数化基频(yachiyo/RVC,生产计划,四个位移)最低到 **123-185 Hz**
+/// ⇒ 一个周期 **5.4-8.1 ms**。而窗宽与代价的关系整条是**按周期**走的
+/// (真 donor 缓冲 + 生产 f0 的扫描,`TESTING\s159i_knob\`):
+///
+/// | 宽度 | 交界坑 dB(目标 = donor 自己的 1.00 / 2.05) | donor 基频泄漏 |
+/// |---|---|---|
+/// | 关 | 4.63 / 3.78 | −48.8 / −46.9 |
+/// | 0.2 ms(≈0.07 周期) | 1.01 / 2.25 | **−16.6 / −16.1** |
+/// | 1 ms(≈0.35 周期) | 0.92 / 2.07 | −40.7 / −34.4 |
+/// | 2 ms(≈0.70 周期) | 0.91 / 2.02 | −45.6 / −46.9 |
+/// | **3-5 ms(1.0-1.7 周期)** | **0.93-0.95 / 2.03-2.10** | **−48.8 / −46.8**(= 关掉时同档) |
+/// | 8 / 10 / 20 ms(2.8-7 周期) | 1.47 / 2.33 / **5.00** | 同上 |
+///
+/// ⇒ 甜区 ≈ **1-2 个 donor 周期**:再窄开始漏 donor 基频,再宽收益迅速掉光(20 ms 比**关掉还差**)。
+/// ⚠ 一个固定 5 ms 在 123 Hz 的 donor 上只有 **0.62 个周期** —— 正好落在泄漏区。
+/// ⚠ S154 的 doc 写「10 ms 以下代价就开始显」,在这份素材上**偏保守**:拐点在 ~2 ms。
+///   两处口径不同(那次是 659 Hz 的 ぴゃ donor),⇒ 两个读数都留着,别互相覆盖。
+///
+/// ## ⛔ 为什么必须逐岛
+/// 用**整条缓冲**里最低的那个 f0 定宽,等于让全曲最低的一个音把每个岛的窗都撑宽:
+/// 上表里 12 ms 只剩 3.30 dB(收益掉了七成)。而末句那个岛自己的最低 donor 基频是 262 Hz
+/// ⇒ 1.5 周期 = 5.7 ms,正好在甜区。
+///
+/// ⭐ 顺带,逐岛**也是**这一刀能和窗内逆变换共存的原因:增益不再跨岛抹平
+/// (见 `psola_shift_win` 的前置条件那一段)。
+const ENV_RESTORE_PERIODS: f64 = 1.5;
+
+/// 逐岛窗宽的上限(毫秒)—— 防病态,不是调音旋钮。
+const ENV_RESTORE_MS_CAP: f64 = 30.0;
+
+/// 这个岛的包络还原窗半宽(样本):`max(floor, ENV_RESTORE_PERIODS / f0_min(岛))`,封顶。
+///
+/// ⛔ 取不到周期时**退回 floor**(而不是「不做」):这一刀只在 `covered` 上乘一个被夹住的增益,
+/// 做过头的失败方向是收益变小,不是产出新的东西。
+fn env_restore_half(
+    f0_hz: &[f32],
+    f0_hop: usize,
+    a: usize,
+    b: usize,
+    sr: f64,
+    floor: usize,
+) -> usize {
+    let cap = ((ENV_RESTORE_MS_CAP * sr / 1000.0) as usize).max(4);
+    let mut h = floor;
+    if f0_hop > 0 && !f0_hz.is_empty() {
+        let k0 = (a / f0_hop).min(f0_hz.len());
+        let k1 = (b / f0_hop + 2).min(f0_hz.len());
+        let lowest = f0_hz[k0..k1]
+            .iter()
+            .map(|v| f64::from(*v))
+            .filter(|v| *v > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if lowest.is_finite() && lowest > 0.0 {
+            h = h.max((ENV_RESTORE_PERIODS * sr / lowest) as usize);
+        }
+    }
+    h.clamp(4, cap)
+}
+
 fn restore_envelope(out: &mut [f32], x: &[f32], covered: &[bool], half: usize) {
     let ex = rms_envelope(x, half);
     let peak = ex.iter().fold(0.0f64, |m, v| m.max(*v));
@@ -2001,12 +2063,18 @@ pub fn psola_shift_env(
 /// 换了统计样本集 ⇒ 会变,而且多半会「变好看」—— ⛔ 那是少做了工序,不是修好了什么)。
 ///
 /// ## ⛔ 前置条件(任一不满足 ⇒ 忽略 `keep`,整条缓冲照跑,并置 `diag.keep_ignored`)
-/// 三条跨岛耦合会让「跳岛」在窗内**不再逐位相同**,而它们今天都靠出厂默认关着:
+/// 两条跨岛耦合会让「跳岛」在窗内**不再逐位相同**,而它们今天都靠出厂默认关着:
 /// 1. `lpc_order > 0` —— `lattice_synthesise` 是**全缓冲的 IIR 递归**,被跳掉的岛在今天会往
 ///    激励里写东西,那条激励的振铃尾会传进后面的岛(岛外 `d` 恒为 0,但**零输入不等于零输出**);
 /// 2. `wsola_frac > 0` —— `wsola_pick` 读的是**已经累加的 `acc`** = 跨岛状态;
-/// 3. `env_restore_ms > 0` —— `restore_envelope` 的增益经 `box_average(raw, half*4)` **跨样本抹平**,
-///    而 `raw` 在非 `covered` 处是 1.0 ⇒ 跳岛会改变邻近样本的增益。
+///
+/// ⭐ **S159i:曾经的第三条(`env_restore_ms > 0`)已经不在这张表上。**当时它跨岛,是因为
+/// `restore_envelope` 在**整条缓冲**上算增益、再经 `box_average(raw, half*4)` 跨样本抹平,
+/// 而 `raw` 在非 `covered` 处是 1.0 ⇒ 跳掉一个岛会改变邻岛边上的增益。
+/// 现在它**逐岛**做(每个岛只看自己那一段 `out`/`x`/`covered`,窗宽由该岛自己的最低 donor
+/// 基频定,见 [`ENV_RESTORE_PERIODS`])⇒ 增益不再跨岛,窗与它可以同时开着。
+/// ⛔ 判据 `envelope_restore_is_per_island_and_therefore_window_safe` 盯着这条性质;
+///    ⚠ 别把它读成「跨岛耦合可以将就」—— 另外两条仍然是硬的。
 ///
 /// ⚠ **还剩一条不是结构性的**:去次声的总闸 `e_out >= e_in` 是在**全缓冲**累加之后算的。
 /// 被跳掉的岛对**修正量**的贡献恒为 0(它那一段 `out ≡ x` ⇒ `fo ≡ fi`),但两个能量和是
@@ -2103,10 +2171,14 @@ pub fn psola_shift_win(
     let wmax = max_period * win_periods.max(1.0);
     // S151 源覆盖率的累加器(见 `PsolaDiagnostics::src_uncovered_frac`)。
     let (mut uncovered, mut span) = (0.0f64, 0.0f64);
+    // S159i —— **真的跑过**的岛(不是 `voiced_islands` 给的全部):包络还原逐岛做,
+    // 而「哪些岛跑过」正是窗决定的那件事。⛔ 用 `voiced_islands` 会把被跳掉的岛也还原一遍,
+    // 那等于把窗跳过的工序又做了回来。
+    let mut restored: Vec<(usize, usize)> = Vec::new();
 
     // ── S159 窗内逆变换:`keep` 的归一化与前置条件 ────────────────────────────────
     // 见 `psola_shift_win` 的 doc。⛔ 三条跨岛耦合任一活着 ⇒ 忽略窗(整条照跑),而且**要响**。
-    let keep_blocked = lpc_order > 0 || wsola_frac > 0.0 || env_restore_ms > 0.0;
+    let keep_blocked = lpc_order > 0 || wsola_frac > 0.0;
     diag.keep_ignored = !keep.is_empty() && keep_blocked;
     let keep: Vec<(usize, usize)> = if keep.is_empty() || keep_blocked {
         Vec::new()
@@ -2157,6 +2229,7 @@ pub fn psola_shift_win(
         diag.marks_locked += lock_phase(&dc_free, &mut src, phase_lock);
         diag.islands += 1;
         diag.marks += src.len();
+        restored.push((a, b));
         let last = (src.len() - 1) as f64;
         // ⚠ S154 —— 一条**试过并且没成的**修法,留着免得下一个人再试一遍:
         // 给合成栅格加一个常数相位、让它仍然穿过膨胀前的种子标记 —— **做不到保住岛内**。
@@ -2443,8 +2516,15 @@ pub fn psola_shift_win(
         let ex = rms_envelope(x, half);
         diag.env_dev_p50_db = env_dev_p50_db(&ey, &ex, &covered) as f32;
         if env_restore_ms > 0.0 {
-            let h = ((env_restore_ms * sr / 1000.0) as usize).max(4);
-            restore_envelope(&mut out, x, &covered, h);
+            // S159i —— **逐岛**:窗宽 = `max(旋钮给的毫秒下限, 1.5 个 donor 周期)`,由该岛自己的
+            // 最低基频定(见 [`ENV_RESTORE_PERIODS`])。`env_restore_ms` 从「宽度」降级成「开关 + 下限」。
+            let floor = ((env_restore_ms * sr / 1000.0) as usize).max(4);
+            for &(ia, ib) in &restored {
+                let h = env_restore_half(f0_hz, f0_hop, ia, ib, sr, floor);
+                let mut seg: Vec<f32> = out[ia..ib].to_vec();
+                restore_envelope(&mut seg, &x[ia..ib], &covered[ia..ib], h);
+                out[ia..ib].copy_from_slice(&seg);
+            }
             let ey2 = rms_envelope(&out, half);
             // 报「真的把它拉回了多少」而不是「开着」—— 与 `infrasonic_removed` 同一条规矩。
             diag.env_dev_after_db = env_dev_p50_db(&ey2, &ex, &covered) as f32;
@@ -3512,11 +3592,13 @@ mod tests {
         assert_ne!(nar, none, "窄窗与整条臂逐位相同 —— 窗根本没接上");
     }
 
-    /// S159 —— ⛔⛔ **三条跨岛耦合任一开着时,窗必须被【忽略】,而且要报出来。**
+    /// S159 —— ⛔⛔ **两条跨岛耦合任一开着时,窗必须被【忽略】,而且要报出来。**
     ///
-    /// 「跳岛在窗内逐位安全」这条性质**挂在三个出厂默认上**(`LPC = 0` · `WSOLA = 0` ·
-    /// `ENVFIX = 0`)。它们各自的机理写在 `psola_shift_win` 的 doc 里,共同点是**跨岛携带状态**:
-    /// 全缓冲的 IIR 递归 / 读共享的 `acc` / 跨样本抹平的增益。
+    /// 「跳岛在窗内逐位安全」这条性质**挂在两个出厂默认上**(`LPC = 0` · `WSOLA = 0`)。
+    /// 它们各自的机理写在 `psola_shift_win` 的 doc 里,共同点是**跨岛携带状态**:
+    /// 全缓冲的 IIR 递归 / 读共享的 `acc`。
+    /// ⚠ S159i 之前这里还有第三条 `ENVFIX` —— 它已经被改成逐岛,不再跨岛,
+    ///   由 `envelope_restore_is_per_island_and_therefore_window_safe` 从**反面**钉着。
     /// ⇒ 哪天有人翻其中任何一个,这一刀必须**自己退回整条缓冲**,而不是静默产出错的窗边。
     ///
     /// ⛔ 变异:把 `keep_blocked` 里的任一项去掉 ⇒ 那条臂的窗生效 ⇒ 输出与整条臂不同 ⇒ **红**。
@@ -3529,7 +3611,7 @@ mod tests {
         // 三条臂,每条只把一个跨岛旋钮打开。⛔ 参数从生产默认起步、只动一个自由度
         // (S158 血训:A/B 判据两条臂只许差一个自由度)。
         for (name, wso, envf, lp) in
-            [("LPC", wsola, 0.0, 16usize), ("WSOLA", 0.25, 0.0, 0), ("ENVFIX", wsola, 5.0, 0)]
+            [("LPC", wsola, 0.0, 16usize), ("WSOLA", 0.25, 0.0, 0)]
         {
             let arm = |k: &[(usize, usize)]| {
                 psola_shift_win(
@@ -3550,6 +3632,143 @@ mod tests {
         );
         assert!(!dprod.keep_ignored, "生产默认下窗不该被忽略");
         assert!(dprod.islands_skipped > 0, "生产默认下这个窗一个岛都没跳 —— 阴性对照是空的");
+    }
+
+    /// S159i —— ⛔⛔ **包络还原【逐岛】做,所以它和窗内逆变换可以同时开着。**
+    ///
+    /// 这条判据是 S159i 那笔改动的承重面。它钉四件,少一件就能被「这条臂没接上」满足:
+    /// ⑴ 开着包络还原时,窗**不再被忽略**(`keep_ignored == false`);
+    /// ⑵ 这个窗**真的跳了岛**(否则 ⑶ 只是因为窗本来就不做事);
+    /// ⑶ ⭐ **窗内的样本与整条臂逐位相同** —— 这才是「逐岛之后不再跨岛」那句话的内容;
+    /// ⑷ ⛔ **阴性对照**:包络还原开与关的输出必须**不同**,否则 ⑶ 可以由「这一刀什么都没做」满足。
+    ///
+    /// ⚠⚠ **如实登记:⑶ 那条在这份合成夹具上【抓不住】「改回整条缓冲还原」那个变异。**
+    /// 试过 37 / 8 / 4 / 2 / 1.5 Hz 四档幅度起伏,变异全绿 —— 稳态合成音上 PSOLA 把包络还得太准
+    /// (`ex/ey ≈ 1`)⇒ 跨岛耦合没东西可跨。⇒ **机理由
+    /// `the_whole_buffer_envelope_restore_is_cross_island_and_slicing_is_what_fixes_it` 直接钉**,
+    /// 那一条是对 `restore_envelope` 本身构造局面,不经过合成音。
+    /// ⛔ 别把这条读成「⑶ 是多余的」:它仍然是**接线闸**(`keep_ignored` / 跳岛 / 长度),
+    /// 只是不承担「逐岛 vs 整条」那个自由度。
+    #[test]
+    fn envelope_restore_is_per_island_and_therefore_window_safe() {
+        let sr = 44_100u32;
+        let (frac, wsola, lock, hp, _envfix, bridge, win, xg, lpc) = prod_knobs();
+        let (mut x, f0t, hop, spans) = island_train(sr, 200.0, 60.0, 160.0, 4);
+        // ⛔⛔ **夹具必须给这一刀留下【可修的东西】。**第一版直接用 `island_train` 的稳态音,
+        // 变异「改回整条缓冲还原」是**绿的** —— 稳态正弦上 PSOLA 本来就把包络还得很准
+        // (`ex/ey ≈ 1`)⇒ `raw ≈ 1` ⇒ 跳不跳岛都一样 ⇒ 跨岛耦合**没东西可跨**。
+        // ⇒ 每个岛加一段快幅度起伏(37 Hz、深 0.75),颗粒叠加会把它抹掉一部分,
+        //    于是 `ex/ey` 真的偏离 1,跨岛抹平才有可观测的后果。
+        for &(a, b) in &spans {
+            for i in a..b {
+                let t = (i - a) as f64 / f64::from(sr);
+                x[i] = (f64::from(x[i])
+                    * (1.0 - 0.85 * (2.0 * std::f64::consts::PI * 37.0 * t).sin().abs()))
+                    as f32;
+            }
+        }
+        let keep = [(spans[1].0, spans[1].1)];
+        let arm = |k: &[(usize, usize)], envf: f64| {
+            psola_shift_win(
+                &x, sr, 9.0, 0.0, &f0t, hop, frac, wsola, lock, hp, envf, bridge, win, xg, lpc, k,
+            )
+        };
+        // ⛔⛔ **20 ms 这一档不是随手挑的,它是这条判据的承重面。**
+        // 第一版写的是 3 ms,变异「改回整条缓冲还原」**是绿的** —— 因为增益的抹平半宽是 `h*4`,
+        // 3 ms 时总反应距离 ≈ 5h ≈ 47 ms,**够不到夹具里 60 ms 的岛间距**,跨岛耦合根本没发生。
+        // 一条「测不到被测机理」的判据就是空判据(S159 血训)。20 ms ⇒ 5h ≈ 100 ms > 60 ms ⇒ 真的跨岛。
+        // ⚠ 生产宽度由周期定(≈1.5 个周期),3 ms 那一档一起测,是为了钉「窄档也安全」。
+        for envf in [3.0f64, 20.0] {
+            let (full, dfull) = arm(&[], envf);
+            let (winy, dwin) = arm(&keep, envf);
+            assert!(!dwin.keep_ignored, "{envf} ms:包络还原开着,窗却被忽略 —— 它不该再是跨岛耦合");
+            assert!(!dfull.keep_ignored, "{envf} ms:没给窗的时候不该报「窗被忽略」");
+            assert!(dwin.islands_skipped > 0, "{envf} ms:窗一个岛都没跳 —— 判据是空的");
+            for i in keep[0].0..keep[0].1 {
+                assert_eq!(winy[i], full[i], "{envf} ms:窗内第 {i} 个样本与整条臂不同 —— 增益还在跨岛");
+            }
+            // ⑷ 阴性对照 —— 这一刀必须真的动了输出。
+            let (off, _) = arm(&[], 0.0);
+            assert_ne!(full, off, "{envf} ms:包络还原开与关输出逐位相同 —— 这条臂根本没接上");
+        }
+    }
+
+    /// S159i —— ⛔⛔⛔ **证明「整条缓冲还原」确实跨岛,而逐岛切片确实不跨。**
+    ///
+    /// 这条判据存在的理由:上面那条走 `psola_shift_win` 的判据**抓不住**这次改动 ——
+    /// 变异「改回整条缓冲还原」在合成夹具上是**绿的**(试过 37 / 8 / 4 / 2 / 1.5 Hz 四档幅度起伏,
+    /// 全绿),因为稳态合成音上 PSOLA 把包络还得太准,`ex/ey ≈ 1` ⇒ 跨岛耦合**没东西可跨**。
+    /// ⛔ 一条「测不到被测机理」的判据就是空判据,所以这里改成**直接对 `restore_envelope` 本身**
+    /// 构造那个机理:手工喂一个「邻段有包络误差」的局面,看它会不会渗进本段。
+    ///
+    /// ⑴ **整条缓冲**:邻段标成 `covered` 与不标,本段内的输出**必须不同** ⇒ 它确实跨岛;
+    /// ⑵ **逐岛切片**(只喂本段那一片):两种情况下**必须逐位相同** ⇒ 这就是 S159i 改法的全部内容。
+    #[test]
+    fn the_whole_buffer_envelope_restore_is_cross_island_and_slicing_is_what_fixes_it() {
+        let (i0, i1) = (0usize, 1000usize); // 邻段
+        let (j0, j1) = (1200usize, 2200usize); // 本段
+        let n = 2400usize;
+        let half = 300usize; // ⇒ 增益抹平半宽 = 4·half = 1200,刚好从本段起点够回邻段
+        let x: Vec<f32> = (0..n)
+            .map(|i| {
+                if (i0..i1).contains(&i) || (j0..j1).contains(&i) {
+                    (i as f32 * 0.37).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // `out` = `x`,但**两段中间各**有一处被压掉 —— 这就是「PSOLA 在那儿把包络弄坏了」。
+        // ⚠ 本段那一处是**阴性对照 ⑶ 需要的**:第一版只在邻段挖坑,于是切片里根本没有可修的东西,
+        //    ⑶「逐岛还原改变了本段」当场变红 —— 那不是代码错,是对照写错了。
+        let mut out0: Vec<f32> = x.clone();
+        for v in out0.iter_mut().take(600).skip(400) {
+            *v *= 0.5;
+        }
+        for v in out0.iter_mut().take(1700).skip(1500) {
+            *v *= 0.6;
+        }
+        let both: Vec<bool> = (0..n).map(|i| (i0..i1).contains(&i) || (j0..j1).contains(&i)).collect();
+        let only: Vec<bool> = (0..n).map(|i| (j0..j1).contains(&i)).collect();
+
+        // ⑴ 整条缓冲:两种 `covered` 下,**本段**内的结果不同。
+        let (mut a, mut b) = (out0.clone(), out0.clone());
+        restore_envelope(&mut a, &x, &both, half);
+        restore_envelope(&mut b, &x, &only, half);
+        assert_ne!(
+            a[j0..j1],
+            b[j0..j1],
+            "整条缓冲还原下,邻段被不被处理竟然不影响本段 —— 那这条判据没测到跨岛耦合"
+        );
+
+        // ⑵ 逐岛切片:同样两种 `covered`,本段逐位相同。
+        let mut c: Vec<f32> = out0[j0..j1].to_vec();
+        let mut d: Vec<f32> = out0[j0..j1].to_vec();
+        restore_envelope(&mut c, &x[j0..j1], &both[j0..j1], half);
+        restore_envelope(&mut d, &x[j0..j1], &only[j0..j1], half);
+        assert_eq!(c, d, "逐岛切片之后本段还是被邻段影响了 —— 切片没起作用");
+        // ⛔ 阴性对照:切片这条路本身不是「什么都不做」。
+        assert_ne!(c[..], out0[j0..j1], "逐岛还原没有改变本段 —— 这一刀根本没接上");
+    }
+
+    /// S159i —— **窗宽以 donor 的周期计,不是毫秒。**读数与机理在 [`ENV_RESTORE_PERIODS`] 的 doc 里。
+    ///
+    /// ⛔ 期望值写**字面量**,不许拿 `ENV_RESTORE_PERIODS` 反算 —— 那样改常量时判据会跟着改答案,
+    /// 就是 S159 记过的「判据自己重算被测值 = 空判据」。
+    #[test]
+    fn the_envelope_restore_window_is_measured_in_donor_periods() {
+        let sr = 48_000.0;
+        // 真素材里 donor 最低 123.4 Hz ⇒ 1.5 个周期 = 583 样本 = 12.2 ms。
+        assert_eq!(env_restore_half(&vec![123.4f32; 200], 480, 0, 48_000, sr, 4), 583);
+        // 末句那个岛自己的最低值 ≈ 262 Hz ⇒ 274 样本 = 5.7 ms(甜区)。
+        assert_eq!(env_restore_half(&vec![261.6f32; 200], 480, 0, 48_000, sr, 4), 275);
+        // 高音上由**下限**接管(1.5 个周期只有 80 样本)。
+        assert_eq!(env_restore_half(&vec![900.0f32; 200], 480, 0, 48_000, sr, 144), 144);
+        // ⛔ 取不到周期 ⇒ 退回下限,不许变成 0 或者「不做」。
+        assert_eq!(env_restore_half(&vec![0.0f32; 200], 480, 0, 48_000, sr, 144), 144);
+        assert_eq!(env_restore_half(&[], 480, 0, 48_000, sr, 144), 144);
+        // 封顶 30 ms:一个 20 Hz 的病态 f0 不许把窗撑到 75 ms。
+        assert_eq!(env_restore_half(&vec![20.0f32; 200], 480, 0, 48_000, sr, 4), 1440);
     }
 
     /// S159 —— **「窗切不到任何岛」与「根本没有音高」必须是两件事。**
@@ -5287,9 +5506,27 @@ mod tests {
             (true, m) if m > 0.0 => Infrasonic::FixedMs(m),
             (true, _) => Infrasonic::PerPeriod,
         };
-        let (y, d) = psola_shift_env(
+        // S159i —— `UTAI_PSOLA_KEEP="a:b,c:d"`(**样本**下标)⇒ 走窗内入口 `psola_shift_win`。
+        // ⛔ 为什么探针需要它:窗内逆变换的「跳岛不改窗内样本」这条性质,在合成夹具上
+        // 测不到跨岛耦合(见 `envelope_restore_is_per_island_and_therefore_window_safe` 的登记),
+        // 而在整曲渲染上又被 decode 的不可复现盖住(地板 −34.9 dB)。
+        // ⇒ 唯一能做**逐位**对拍的地方,就是拿同一份 donor 缓冲在这里跑两遍。
+        let keep: Vec<(usize, usize)> = std::env::var("UTAI_PSOLA_KEEP")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| {
+                        let (a, b) = p.split_once(':').expect("UTAI_PSOLA_KEEP=a:b,c:d(样本下标)");
+                        (a.trim().parse().expect("keep start"), b.trim().parse().expect("keep end"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!("  keep: {} 段", keep.len());
+        let (y, d) = psola_shift_win(
             &x, spec.sample_rate, st, 0.0, &f0, hop, frac, wsola, lock, hp, envfix, bridge, win,
-            xgrain, lpc,
+            xgrain, lpc, &keep,
         );
         println!(
             "  arms: frac_transport={frac} wsola={wsola} phase_lock={lock} envfix={envfix}              bridge={bridge} hp={hp:?} win={win} xgrain={xgrain} lpc={lpc}"

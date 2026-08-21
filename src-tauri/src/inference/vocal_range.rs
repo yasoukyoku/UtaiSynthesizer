@@ -2521,7 +2521,8 @@ fn parse_win_periods(v: Option<&str>) -> f64 {
 /// 收益与代价见 [`win_periods`] 的 doc;⛔ 显式 `UTAI_PSOLA_WIN=0` 仍然能渲出旧臂。
 const WIN_PERIODS_DEFAULT: f64 = 1.0;
 
-/// ⚙ 出厂默认 = 0.0 —— 0 = 关
+/// ⚙ 出厂默认 = 3.0 —— **开着**;这 3 ms 只是**下限**,真实窗宽逐岛按 donor 周期定
+/// (`utai_dsp::psola` 的 `ENV_RESTORE_PERIODS` = 1.5 个周期)。`0` 才是关。
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -2562,9 +2563,21 @@ fn parse_env_restore_ms(v: Option<&str>) -> f64 {
         .unwrap_or(ENV_RESTORE_MS_DEFAULT)
 }
 
+/// ⚙ 出厂默认 = 3.0 —— 包络还原**开着**;这 3 ms 只是**下限**,真实窗宽由 donor 周期定
+///
+/// S159i 起它从「窗宽」降级成「开关 + 下限」:引擎逐岛取
+/// `max(这个下限, 1.5 个 donor 周期)`(`utai_dsp::psola` 的 `ENV_RESTORE_PERIODS`)。
+/// ⛔ 别再把它当宽度调:真素材上 donor 基频低到 123 Hz(周期 8.1 ms),一个固定 5 ms
+/// 在那儿只有 0.62 个周期 —— 正落在把 donor 基频漏回来的那一档。
+///
+/// ## 为什么翻开(宽度曲线与泄漏读数在引擎那边 `ENV_RESTORE_PERIODS` 的 doc 里)
+/// donor 那一路在音符交界处会塌谱形,而 PSOLA 把它**放大成电平坑**:真素材上
+/// pre 1.00 dB → post 4.63 dB。逐岛包络还原把它按回 **0.93 / 0.95 dB** = donor 自己那一档,
+/// 而 donor 基频泄漏与关掉时**同档**(−48.8 dB),「本来就没坑」的那条交界纹丝不动(0.50 → 0.52)。
+///
 /// ⛔ Same pairing rule as `INFRASONIC_HP_DEFAULT`: making this non-zero changes the audio ⇒ it
 /// must bump `RANGE_ALGO_VERSION` **and** `audition_cache_tag` in the same commit.
-const ENV_RESTORE_MS_DEFAULT: f64 = 0.0;
+const ENV_RESTORE_MS_DEFAULT: f64 = 3.0;
 
 /// ⚙ 出厂默认 = 30.0 —— 桥接清音 30 ms
 /// S154 — `UTAI_PSOLA_BRIDGE=<ms>` bridges short unvoiced gaps in the fed f0 so the voiced islands
@@ -4450,10 +4463,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=3 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159b";
+        const TAG: &str = "s159c";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
