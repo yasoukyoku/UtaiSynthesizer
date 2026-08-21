@@ -181,7 +181,7 @@ export function vocalParamsSig(p?: VocalTrackParams, forRender = false): string 
   const bt = breathTokenKey(p.breathToken);
   const rt = restTokenKey(p.restToken);
   const tok = (bt ? `|bt:${bt}` : "") + (rt ? `|rt:${rt}` : "");
-  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend === true ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${tok}`;
+  return `${p.backend},${p.speakerId},${p.langId},${p.transpose},${p.formant ?? 0},${tr}|sv:${sigOpts(p.sovits as Record<string, unknown> | undefined)}|rv:${sigOpts(p.rvc as Record<string, unknown> | undefined)}|re:${p.rangeExtend !== false ? 1 : 0}${at}${ce}${cvl}${vcl}${cpr}${ps}${tok}`;
 }
 
 function laneSig(lc: Record<string, LaneControl>, mutes?: Record<string, boolean>): string {

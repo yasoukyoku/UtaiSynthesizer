@@ -392,7 +392,8 @@ export function sanitizeVocalParams(p: VocalTrackParams | undefined): VocalTrack
     // it here keeps the stored value comparable (and bounded) without changing which notes classify.
     breathToken: sanitizeToken(p.breathToken, DEFAULT_BREATH_TOKEN),
     restToken: sanitizeToken(p.restToken, DEFAULT_REST_TOKEN),
-    ...(p.rangeExtend === true ? { rangeExtend: true } : {}),
+    // S159 极性翻了(absent = ON)⇒ 只序列化 `false`,与 autoTuneFollow / vowelClarity 同款。
+    ...(p.rangeExtend === false ? { rangeExtend: false } : {}),
     // S73b/c 自动音高:follow 只存 false(absent≡true=默认常开);表现力 0–4 默认 2、
     // 颤音 0–2 默认 1(S73c 用户拍板:双乘后 4×4 太恐怖)。
     ...(p.autoTuneFollow === false ? { autoTuneFollow: false } : {}),

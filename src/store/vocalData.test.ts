@@ -122,10 +122,17 @@ describe("Phase 3 — .usp save/load round-trips every vocal field (GATE C)", ()
     expect(loaded.tracks[0]!.segments[0]!.content).toEqual(rich.segments[0]!.content);
   });
 
-  it("S73:rangeExtend=true 存读不再被 sanitize 丢弃(存量 bug 修复)", () => {
-    const t = { ...rich, vocalParams: { ...rich.vocalParams!, rangeExtend: true as const } };
+  // ⭐ S159 极性翻了(absent = ON)⇒ 这条判据跟着翻到**关**那一侧:`false` 才是要存住的值。
+  // ⛔ 保留原意:S73 修的是「sanitize 把用户的显式选择丢了」——那个 bug 在新极性下的形状
+  // 就是「用户关掉了扩展,存读一趟之后又变回开」,一样致命,而且**默认那一侧测不到它**。
+  it("S73/S159:rangeExtend 的显式【非默认】值存读不丢(存量 bug 修复,S159 随极性翻面)", () => {
+    const t = { ...rich, vocalParams: { ...rich.vocalParams!, rangeExtend: false as const } };
     const loaded = parseLoadedBundle(buildAutosaveJson("P", [t], 120, [4, 4]), "C:/proj.usp");
-    expect(loaded.tracks[0]!.vocalParams?.rangeExtend).toBe(true);
+    expect(loaded.tracks[0]!.vocalParams?.rangeExtend).toBe(false);
+    // 阴性对照:默认那一侧折成 ABSENCE(否则 close/autosave 的字节对比会假脏)。
+    const on = { ...rich, vocalParams: { ...rich.vocalParams!, rangeExtend: true as const } };
+    const l2 = parseLoadedBundle(buildAutosaveJson("P", [on], 120, [4, 4]), "C:/proj.usp");
+    expect(l2.tracks[0]!.vocalParams?.rangeExtend).toBeUndefined();
   });
 
   it("load→serialize is byte-identical (autosave form)", () => {
@@ -496,7 +503,7 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     // Comparing vocalParamsSig(x) with vocalParamsSig(y) only pins internal consistency: a mutation that
     // appends `|rt:R` to BOTH sides stays green while every shipped bake's signature moves (a review
     // caught exactly that hole). A literal is the only assertion that fails for such a mutation.
-    expect(vocalParamsSig(sigBase, true)).toBe("sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0");
+    expect(vocalParamsSig(sigBase, true)).toBe("sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1");
   });
 
   it("★ every trigger spelling that classifies IDENTICALLY hashes identically (no false-dirty)", () => {
@@ -527,7 +534,7 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
     // The default (ON) must hash byte-for-byte like the pre-switch string — otherwise adding this knob
     // silently invalidates every bake that ships today. Pinned against the LITERAL for the same reason
     // the rest-token case is: a mutation that appends `|cpr:1` to BOTH sides survives a self-comparison.
-    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0";
+    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1";
     expect(vocalParamsSig(sigBase, true)).toBe(pinned);
     expect(vocalParamsSig({ ...sigBase, consonantPreroll: true }, true)).toBe(pinned);
     // …and OFF is a real re-render (the phone layout genuinely changes)
@@ -540,7 +547,7 @@ describe("Phase 5 — property sidebar data-layer (transition override / vibrato
   it("★ phonemeSet folds OUT at its default and each convention is its OWN signature", () => {
     // Same literal discipline: the default (words = ABSENT) must hash byte-for-byte like the pre-S91
     // string, or adding the setting re-renders every bake that ships today for nothing.
-    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0";
+    const pinned = "sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1";
     expect(vocalParamsSig(sigBase, true)).toBe(pinned);
     // …and every convention is a genuinely different render (it changes what each English note SINGS)
     const sigs = new Set([pinned]);

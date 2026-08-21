@@ -356,9 +356,22 @@ export interface VocalTrackParams {
    *  aliases are also real English words. Rust: `inference/g2p_alias.rs`. */
   phonemeSet?: PhonemeSetId;
   /** S60-2 音域扩展: out-of-comfort parts render translated into the singer's tested comfort zone and are
-   *  shifted back (Signalsmith inverse; needs a vocal_range record on the model — else a no-op). ABSENT = OFF (S62c: the
-   *  whole-render recolor tradeoff is OPT-IN; the default is stored as absence — canonical write in
-   *  setVocalParams); `true` = the user turned it on. */
+   *  shifted back (TD-PSOLA inverse; needs a vocal_range record on the model — else a no-op).
+   *
+   *  ⭐⭐ **S159:极性翻过来了 —— ABSENT = ON**,`false` = 用户关掉了它。折叠规则跟着翻:
+   *  canonical write(`setVocalParams`)把 `true` 折成 ABSENCE,`vocalNotes` 只序列化 `false`。
+   *  与 `autoTuneFollow` / `vowelClarity` 同款(默认开的那一族)。
+   *
+   *  ⛔⛔ **S62c 那句「OPT-IN」为什么作废了**:当时它是 opt-in,因为整条渲染的重着色是一笔
+   *  没有量清的取舍。S145-S159 把这条线量完了 —— 引擎换成 TD-PSOLA、根因定案、五个默认逐个
+   *  盲测翻开、S159 把逆变换做进窗内(实机 186.6 → 78.6 s)。用户 2026-08-21 拍板默认打开。
+   *
+   *  ⚠⚠ **翻这个极性会改掉【已存工程】的行为,而且没有版本号能挡**:`.usp` 里没有 format
+   *  version,而「关」在 S62c-S158 之间存的就是**缺省**。⇒ 老工程打开之后音域扩展是**开**的。
+   *  影响面:模型没有 `vocal_range` 记录 ⇒ 空操作;有记录且有超域的音 ⇒ 那些音会被救(输出变),
+   *  并且 `rangeRecordSig` 从 `""` 变成记录指纹 ⇒ **那条轨会重渲一次**。
+   *  ⚠ 有记录但没有超域的音时,重渲出来的东西**逐位相同** —— 那正是 `audition_cache_tag` 的 doc
+   *  点名的「a re-render where nothing changed」。这是翻极性的一次性代价,不是缺陷。 */
   rangeExtend?: boolean;
   /** S73b 自动音高常开(SynthV Sing 模式同构):true/absent = AutoTuneWatcher 对未调教/机器调教音符
    *  持续跟随(松手级提交后 debounce 静默刷新);false = 手动模式(只有侧栏按钮触发)。 */

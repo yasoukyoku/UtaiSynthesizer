@@ -333,14 +333,14 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
         <div title={t("vocalEditor.sidebar.rangeExtendTip")}>
           <ToggleRow
             label={t("vocalEditor.sidebar.rangeExtend")}
-            checked={vocalParams.rangeExtend === true}
+            checked={vocalParams.rangeExtend !== false}
             onChange={(c) => setVocalParams(trackId, { rangeExtend: c })}
           />
         </div>
         {/* S82 κ — formant-follow of the shift-back inverse. Stored in BOTH backend option bags
             (one per-track knob; switching backend must not change the formant policy). Hidden
             while the extension is off — it only affects actually-shifted phrases. */}
-        {vocalParams.rangeExtend === true && (
+        {vocalParams.rangeExtend !== false && (
           <Slider
             label={t("vocalEditor.sidebar.rangeFormant")}
             tip={t("vocalEditor.sidebar.rangeFormantTip")}
@@ -361,7 +361,7 @@ export function VocalSidebar({ trackId, segmentId, notes, selectedIds, trackTran
               ⒝ 两个边界一次写完 —— 否则后端 RANGE_INVALID,而那条错误在 UI 上不可见;
               ⒞ 必须写出歌手名 —— 这里的歌手是 spk_mix 里权重最大的那位,用户没显式选过。
             ⚠ 折叠着:这是模型级(全机)设置,放在 per-track 面板里,默认不该看起来像轨道属性。 */}
-        {vocalParams.rangeExtend === true && rangeRecordForTrack && (
+        {vocalParams.rangeExtend !== false && rangeRecordForTrack && (
           <div className="vsb-inline vsb-range-bounds">
             {!boundsOpen ? (
               <button

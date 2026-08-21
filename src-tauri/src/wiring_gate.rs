@@ -92,6 +92,79 @@ pub(crate) fn signature_of(body: &str) -> String {
     sig
 }
 
+/// S159 —— **日志字面量里不许出现 CJK。**
+///
+/// 返回 `(相对路径, 行号, 命中的那几个汉字)`。`roots` 是要扫的目录。
+///
+/// ## ⛔ 它为什么是一条闸而不是一条规矩
+/// 仓里早就有「Rust 不硬编用户可见串」这条规矩,而日志这一族**一直是英文的** ——
+/// 全后端只有 4 处例外,其中 3 处是同一场(S159)一口气写进去的。⇒ 失效点不在「不知道规矩」,
+/// 在**动手那一刻没有任何东西拦我**(与记忆钩子那条血训同形)。
+///
+/// ## 边界(明写,别当它比实际强)
+/// * 它只看 `info!/warn!/error!/debug!/trace!`(含 `tracing::` 前缀)这五个宏;
+/// * 判据是**注释剥掉之后**的宏体 —— 中文**注释**照写不误,那正是这个仓的风格;
+/// * 它证明不了英文写得好,只证明没有汉字。
+fn cjk_in_log_macros(roots: &[std::path::PathBuf]) -> Vec<(String, usize, String)> {
+    const MACROS: [&str; 5] = ["info!(", "warn!(", "error!(", "debug!(", "trace!("];
+    let mut hits = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    for r in roots {
+        walk(r, &mut files);
+    }
+    files.sort();
+    for f in files {
+        let Ok(raw) = std::fs::read_to_string(&f) else { continue };
+        let code = strip_comments_for_wiring(&raw);
+        let lines: Vec<&str> = code.lines().collect();
+        let mut i = 0usize;
+        while i < lines.len() {
+            let t = lines[i].trim_start();
+            let is_macro = MACROS.iter().any(|m| {
+                t.starts_with(m) || t.starts_with(&format!("tracing::{m}"))
+            });
+            if !is_macro {
+                i += 1;
+                continue;
+            }
+            // 吃到括号配平为止 —— 这些宏几乎全是多行的。
+            let (mut open, mut close, mut j) = (0usize, 0usize, i);
+            let mut body = String::new();
+            loop {
+                open += lines[j].matches('(').count();
+                close += lines[j].matches(')').count();
+                body.push_str(lines[j]);
+                body.push('\n');
+                if open <= close || j + 1 >= lines.len() {
+                    break;
+                }
+                j += 1;
+            }
+            let han: String = body.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).collect();
+            if !han.is_empty() {
+                let rel = f.file_name().map_or_else(|| f.display().to_string(), |n| {
+                    format!("{}/{}", f.parent().and_then(|p| p.file_name()).map_or(String::new(), |p| p.to_string_lossy().into()), n.to_string_lossy())
+                });
+                hits.push((rel, i + 1, han.chars().take(24).collect()));
+            }
+            i = j + 1;
+        }
+    }
+    hits
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +243,60 @@ fn beta(a: u8) -> u8 { a }";
         assert!(!alpha.contains("#[tauri::command]"));
         // A one-line body must not swallow the next function.
         assert!(fns.iter().any(|(n, b)| n == "beta" && b.contains("-> u8 { a }")));
+    }
+
+    /// S159 —— ⛔ **后端日志里不许出现汉字。**
+    ///
+    /// 全后端本来只有 **1 处**例外(`tpool.rs` 的「续训」),而 S159 一场就写进去 **3 处** ——
+    /// 因为这条规矩只活在一份记忆文件里,**动手那一刻没有任何东西拦我**(与「钩子存在但是不读」
+    /// 那条血训同形:失效点不在知不知道)。
+    ///
+    /// ⚠ 边界写在 [`cjk_in_log_macros`] 的 doc 里:它只看那五个宏、只看**注释剥掉之后**的宏体
+    /// (中文**注释**是这个仓的风格,照写),而且它证明不了英文写得好,只证明没有汉字。
+    #[test]
+    fn no_chinese_in_backend_log_lines() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let hits = cjk_in_log_macros(&[root.join("src"), root.join("crates")]);
+        assert!(
+            hits.is_empty(),
+            "日志宏里出现了汉字({} 处)—— 后端日志一律英文,中文只写在注释里:\n{}",
+            hits.len(),
+            hits.iter()
+                .map(|(f, n, h)| format!("  {f}:{n}  {h}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// ⛔ 上面那条的**非空性**:它得真的分得出「宏体里的汉字」与「注释里的汉字」,
+    /// 否则「零命中」既可能是干净、也可能是这把尺子瞎。
+    ///
+    /// ⚠ 用临时目录而不是硬编一段字符串对着私有函数跑 —— 那个函数吃的是**路径**,
+    /// 拿字符串测等于测了另一个东西。
+    #[test]
+    fn the_chinese_log_gate_can_tell_a_log_line_from_a_comment() {
+        let dir = std::env::temp_dir().join(format!("utai_cjk_gate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ⑴ 阴性:汉字全在注释里 + 一条纯英文日志 ⇒ 必须零命中。
+        std::fs::write(
+            dir.join("clean.rs"),
+            "// 这一行是中文注释,照写不误\nfn a() {\n    tracing::info!(\"range-extend: all good\");\n}\n",
+        )
+        .unwrap();
+        assert!(
+            cjk_in_log_macros(&[dir.clone()]).is_empty(),
+            "注释里的汉字被当成了日志 —— 这把尺子会把整个仓库判红"
+        );
+        // ⑵ 阳性:一条**跨行**的日志宏里塞汉字 ⇒ 必须抓到(生产里那三处正是多行的)。
+        std::fs::write(
+            dir.join("dirty.rs"),
+            "fn b() {\n    tracing::warn!(\n        \"range-extend: 窗被忽略 {}\",\n        1\n    );\n}\n",
+        )
+        .unwrap();
+        let hits = cjk_in_log_macros(&[dir.clone()]);
+        assert_eq!(hits.len(), 1, "跨行的日志宏没被抓到:{hits:?}");
+        assert!(hits[0].2.contains('窗'), "抓到了但没报出是哪几个字:{hits:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1146,7 +1146,7 @@ fn repoint_resume_sidecars(slot: &Path, steps: &[PoolStep]) -> usize {
         Err(e) => {
             tracing::warn!(
                 "cannot enumerate the runs of {} ({e}) — no resume sidecar was re-pointed, so the \
-                 next 续训 of each run may report a spurious TRAINING_RESUME_DATASET_CHANGED",
+                 next resume of each run may report a spurious TRAINING_RESUME_DATASET_CHANGED",
                 slot.display()
             );
             return 0;

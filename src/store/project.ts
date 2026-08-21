@@ -934,10 +934,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       tracks: s.tracks.map((t) => {
         if (t.id !== trackId) return t;
         const vp = { ...(t.vocalParams ?? DEFAULT_VOCAL_PARAMS), ...updates };
-        // canonical write (sig↔serialize, S48 Phase 3): rangeExtend's default (OFF since S62c —
-        // extension is opt-in) is stored as ABSENCE — an explicit `false` would false-dirty the
-        // close/autosave byte-compare without an undo step (vocalParamsSig folds it either way).
-        if (vp.rangeExtend === false) delete vp.rangeExtend;
+        // canonical write (sig↔serialize, S48 Phase 3): rangeExtend 的默认(**S159 起 = ON**,
+        // 见 `VocalTrackParams.rangeExtend` 的 doc)存成 ABSENCE —— 显式写一个 `true` 会让
+        // close/autosave 的字节对比假脏而没有对应的 undo 步(vocalParamsSig 两边同折)。
+        if (vp.rangeExtend === true) delete vp.rangeExtend;
         // S73b autoTuneFollow 极性相反(默认=开):true 折为 ABSENCE(sanitize/sig 双侧同折,
         // 否则 关→开 往返后 serialize 带 concrete true = close/autosave 字节假脏,审查)。
         if (vp.autoTuneFollow === true) delete vp.autoTuneFollow;

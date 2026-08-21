@@ -1027,7 +1027,7 @@ export function hash32(s: string): string {
  *  the track opted out. */
 function rangeRecordSig(track: Track): string {
   const vp = track.vocalParams ?? DEFAULT_VOCAL_PARAMS;
-  if (vp.rangeExtend !== true || !track.voiceModel) return ""; // S62c: extension is opt-in (absent = OFF)
+  if (vp.rangeExtend === false || !track.voiceModel) return ""; // S159: absent = ON (opt-OUT)
   const entry = useVoiceModelStore.getState().models[vp.backend]?.find((m) => m.name === track.voiceModel);
   const rec = (entry?.config as {
     vocal_range?: {
@@ -1148,8 +1148,9 @@ export function vocalRenderOptions(vp: VocalTrackParams): VocalRenderOptions {
     cv_speaker_id: vp.speakerId,
     lang_id: vp.langId,
     transpose: vp.transpose,
-    // S60-2: absent = ON (no-op until the model carries a vocal_range record)
-    range_extend: vp.rangeExtend === true, // S62c: opt-in (absent = OFF)
+    // S159 —— **absent = ON**(极性见 `VocalTrackParams.rangeExtend` 的 doc:S62c 的 opt-in
+    // 在 S145-S159 把这条线量完之后由用户拍板翻掉)。模型没有 vocal_range 记录时它仍是空操作。
+    range_extend: vp.rangeExtend !== false,
     consonant_emphasis_db: vp.consonantEmphasis ?? DEFAULT_CONSONANT_EMPHASIS_DB,
     consonant_valley: vp.consonantValley ?? DEFAULT_CONSONANT_VALLEY,
     vowel_clarity: vp.vowelClarity !== false,

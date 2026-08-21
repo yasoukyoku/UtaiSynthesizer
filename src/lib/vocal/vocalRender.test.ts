@@ -640,7 +640,7 @@ describe("vocalTrackSig — the version terms are present and literal", () => {
   // move together); that failure mode has no cheap test, only the review checklist.
   it("has exactly this shape — a change here invalidates every stored bake", () => {
     expect(vocalTrackSig(track, 120)).toBe(
-      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:0|vm:V|bpm:120|rr:|g2p:s113b|st:s97c|dict:d0",
+      "vp:sovits,49,2,0,0,0,100,70,15,15,200|sv:|rv:|re:1|vm:V|bpm:120|rr:|g2p:s113b|st:s97c|dict:d0",
     );
   });
 
@@ -747,7 +747,7 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
     const o = vocalRenderOptions(base());
     expect({ ...o, sovits: "…", rvc: "…" }).toEqual({
       backend: "sovits", cv_speaker_id: 49, lang_id: 2, transpose: 0,
-      range_extend: false, consonant_emphasis_db: 2.5, consonant_valley: 1,
+      range_extend: true, consonant_emphasis_db: 2.5, consonant_valley: 1,
       vowel_clarity: true, consonant_preroll: true, phoneme_set: null,
       sovits: "…", rvc: "…",
     });
@@ -755,7 +755,10 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
 
   it("★ each knob changes its own field (a dropped one is a switch that silently does nothing)", () => {
     const cases: Array<[Partial<import("../../types/project").VocalTrackParams>, keyof ReturnType<typeof vocalRenderOptions>, unknown]> = [
-      [{ rangeExtend: true }, "range_extend", true],
+      // ⛔ S159:这一行原来写的是 `{ rangeExtend: true } → true`。极性翻成「absent = ON」之后
+      //    那就是**空判据** —— 默认已经是 true,把它设成 true 证明不了「旋钮接上了」,
+      //    而这张表的全部意义就是「掉了的旋钮 = 无声不做事」。⇒ 一律测**非默认**那一侧。
+      [{ rangeExtend: false }, "range_extend", false],
       [{ consonantEmphasis: 0 }, "consonant_emphasis_db", 0],
       [{ consonantValley: 0 }, "consonant_valley", 0],
       [{ vowelClarity: false }, "vowel_clarity", false],
@@ -768,5 +771,29 @@ describe("vocalRenderOptions — every per-track knob must actually reach the wi
     for (const [patch, field, want] of cases) {
       expect(vocalRenderOptions({ ...base(), ...patch })[field], `${field}`).toEqual(want);
     }
+  });
+
+  /** S159 —— ⛔⛔ **音域扩展的默认极性:ABSENT = ON。**
+   *
+   *  S62c 到 S158 之间它是 opt-in(absent = OFF)。用户 2026-08-21 拍板翻过来,因为这条线
+   *  已经量完了(引擎换成 TD-PSOLA、根因定案、五个默认逐个盲测翻开、S159 把逆变换做进窗内)。
+   *
+   *  这条判据钉三件,每件都对应一个**会静默出错**的地方:
+   *  ⑴ 三态(absent / true / false)各自映射到什么 —— 极性写反了一半会照绿;
+   *  ⑵ `rangeRecordSig` 跟着同一个极性走 —— 它要是留在旧极性,**关掉扩展的轨仍然会因为
+   *     模型记录变化而重渲**,而**开着的轨反而不重渲**(缓存键与渲染行为脱钩,S150 的形状);
+   *  ⑶ 折叠方向:canonical write 把 `true` 折成 ABSENCE。折反了会让每次开关都字节假脏。
+   *
+   *  ⚠⚠ 这一翻**没有版本号能挡**:`.usp` 里没有 format version,而 S62c-S158 期间「关」存的
+   *  就是缺省 ⇒ 老工程打开之后是**开**的。代价与理由写在 `VocalTrackParams.rangeExtend` 的 doc 里。
+   */
+  it("★ S159 音域扩展的默认是 ON,而且三态各自到位", () => {
+    expect(vocalRenderOptions(base()).range_extend, "absent 必须是 ON").toBe(true);
+    expect(vocalRenderOptions({ ...base(), rangeExtend: true }).range_extend).toBe(true);
+    expect(vocalRenderOptions({ ...base(), rangeExtend: false }).range_extend, "显式 false 必须关掉").toBe(false);
+    // ⛔ 阴性对照:两态必须真的不同 —— 否则上面三条可能只是「这个字段恒为 true」。
+    expect(vocalRenderOptions({ ...base(), rangeExtend: false }).range_extend).not.toBe(
+      vocalRenderOptions(base()).range_extend,
+    );
   });
 });

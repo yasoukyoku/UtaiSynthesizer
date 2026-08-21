@@ -2780,16 +2780,18 @@ pub fn apply_inverse_windowed_with(
             if diag.keep_ignored {
                 // 降级必须**响**:静默降级 = 收益静默归零而每一个读数都正常(S147 那个形状)。
                 tracing::warn!(
-                    "range-extend: inverse {semis:+.0} st —— 窗被忽略(lpc {lpc} / wsola {wsola} / \
-                     envfix {envfix} 里有一个不是 0 ⇒ 跳岛在窗内不再逐位安全)⇒ 整条缓冲照跑,\
-                     这一遍拿不到窗内逆变换的提速"
+                    "range-extend: inverse {semis:+.0} st — WINDOW IGNORED (one of lpc {lpc} / \
+                     wsola {wsola} / envfix {envfix} is non-zero, so skipping islands would no \
+                     longer be sample-exact inside the window) — running the whole buffer; this \
+                     pass gets none of the windowed-inverse speedup"
                 );
             }
             if diag.islands == 0 {
                 // 不是错误:这一遍的窗没碰到任何浊音岛 ⇒ 没东西要救。原样返回,并且**说出来**。
                 tracing::info!(
-                    "range-extend: inverse {semis:+.0} st —— 窗(占缓冲 {:.1}%)没有碰到任何浊音岛,\
-                     {} 个候选岛全被跳过 ⇒ 这一遍原样返回",
+                    "range-extend: inverse {semis:+.0} st — the window ({:.1}% of the buffer) \
+                     touches no voiced island; all {} candidates skipped, returning this pass \
+                     unchanged (this is NOT the no-pitch failure)",
                     f64::from(diag.keep_frac) * 100.0,
                     diag.islands_seen
                 );
@@ -2816,7 +2818,7 @@ pub fn apply_inverse_windowed_with(
             // 它们会变小、会「变好看」—— 那是少做了工序,不是修好了什么,别当健康证明。
             tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
-                 {} marks (窗内 {}/{} 岛 · keep {:.1}%{}), cola gap {:.2}% \
+                 {} marks ({}/{} islands in window, keep {:.1}%{}), cola gap {:.2}% \
                  (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
                  src uncovered {:.2}%, infrasonic {:.2}%{}, env dev p50 {:.3} dB{}, \
                  transport residual {:.4}{}, hp gate {:+.1} dB",
@@ -2825,7 +2827,7 @@ pub fn apply_inverse_windowed_with(
                 diag.islands_seen - diag.islands_skipped,
                 diag.islands_seen,
                 f64::from(diag.keep_frac) * 100.0,
-                if diag.keep_ignored { " ⚠ 窗被忽略" } else { "" },
+                if diag.keep_ignored { " WINDOW IGNORED" } else { "" },
                 diag.cola_gap_frac * 100.0,
                 diag.cola_w_p01,
                 diag.cola_w_median,
@@ -2849,7 +2851,7 @@ pub fn apply_inverse_windowed_with(
                 // S154 —— 同样**无条件**算:这道工序改了多少振幅包络,今天的生产日志里就读得到。
                 diag.env_dev_p50_db,
                 if envfix > 0.0 {
-                    format!(" (envfix {envfix} ms — 拉回到 {:.3} dB)", diag.env_dev_after_db)
+                    format!(" (envfix {envfix} ms — pulled back to {:.3} dB)", diag.env_dev_after_db)
                 } else if bridge > 0.0 {
                     format!(" (bridge {bridge} ms)")
                 } else {
