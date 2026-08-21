@@ -1274,10 +1274,187 @@ fn mg_render_sovits() {
 /// 产物:`probe\mg_deadonly_{arm}_{model}.wav` + 同名 `.plan.json`(**计划的可复现出处** ——
 /// 上一场 24 个分析脚本各自硬编码了一份 27 组的 PLAN 字面量,而实机日志是 25 组)。
 #[test]
-#[ignore]
+#[ignore = "probe: renders the whole song through the production dead-only path (needs a model)"]
 fn mg_render_score_deadonly() {
-    // S147:没有订阅者的话渲染路径每条 `info!` 都被静默吞掉 —— 包括 `[perf]` 与救援审计行。
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let rig = MgSovitsRig::load();
+    let m = rig.model();
+    let (_shift_unused, _inv_unused, kappa) = mg_shift_envs();
+    let opts = SovitsOptions {
+        seed: 0,
+        noise_scale: 0.4,
+        range_formant_follow: kappa,
+        speaker_id: Some(mg_deadonly_speaker()),
+        ..Default::default()
+    };
+    let voice = MgVoice::Sovits { m: &m, s2cv: &rig.s2cv, dim: rig.dim, opts };
+    mg_deadonly_body(&rig.sidecar, &rig.mtag, &voice);
+}
+
+/// S159g —— 同一个台子的 **RVC 腿**。用户 2026-08-21 那条「起音处有缝」的病例走的就是
+/// RVC 谱面臂(日志 `[perf] score/rvc`),而在这条腿存在之前,这个台子**只有 SoVITS**。
+///
+/// ⛔ 这不是「顺手多支持一个后端」。上一轮我只能拿 akiko(SoVITS)去近似用户那条病例,
+/// 而 akiko 的素材比用户那份吵 —— 它自己的 base 在同一条交界上就有 7.08 dB / 37.8% 的坑,
+/// 六条交界里只有两条能清楚复现「donor 明显差于 base」。**台子少一条腿 = 用户那半个后端上
+/// 发生的事没有离线复现手段**,而「看不见的那一层」正是我上一轮把机理判错的地方。
+///
+/// env 与 SoVITS 腿完全一致(`UTAI_MG_ARM` 必填 · `UTAI_MG_SCORE` · `UTAI_MG_SPEAKER` ·
+/// `UTAI_MG_TRANSPOSE` · `UTAI_MG_PLAN` · `UTAI_RANGE_DUMP_DONOR`),模型走
+/// `UTAI_MG_MODEL` / `UTAI_MG_INDEXFILE`(= `mg_render_rvc` 那一套)。
+#[test]
+#[ignore = "probe: same台子, RVC leg (needs an rvc onnx + npy index)"]
+fn mg_render_score_deadonly_rvc() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    let rig = MgRvcRig::load();
+    let m = rig.model();
+    let (_shift_unused, _inv_unused, kappa) = mg_shift_envs();
+    let opts = RvcOptions {
+        seed: 0,
+        index_ratio: std::env::var("UTAI_MG_INDEX").ok().and_then(|s| s.parse().ok()).unwrap_or(0.75),
+        protect: std::env::var("UTAI_MG_PROTECT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| RvcOptions::default().protect),
+        range_formant_follow: kappa,
+        speaker_id: Some(mg_deadonly_speaker()),
+        ..Default::default()
+    };
+    let voice = MgVoice::Rvc { m: &m, s2cv: &rig.s2cv, dim: rig.dim, opts };
+    mg_deadonly_body(&rig.sidecar, &rig.mtag, &voice);
+}
+
+/// `UTAI_MG_SPEAKER`(默认 0)—— 台身与两条腿的选项**必须读同一个数**,所以它只有这一处。
+fn mg_deadonly_speaker() -> u32 {
+    std::env::var("UTAI_MG_SPEAKER").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// 台子上「一次渲染」的两种叫法。两条腿只差这一处;决策层、窗、拼接、落盘全部共用。
+enum MgVoice<'a> {
+    Sovits { m: &'a sovits::SovitsModel<'a>, s2cv: &'a str, dim: usize, opts: SovitsOptions },
+    Rvc { m: &'a rvc::RvcModel<'a>, s2cv: &'a str, dim: usize, opts: RvcOptions },
+}
+
+impl MgVoice<'_> {
+    fn tag(&self) -> &'static str {
+        match self {
+            MgVoice::Sovits { .. } => "sovits",
+            MgVoice::Rvc { .. } => "rvc",
+        }
+    }
+
+    fn render(
+        &self,
+        evts: &[ScoreEvt<'_>],
+        vf0: &VocalF0<'_>,
+        cvspk: i64,
+        shaping: ScoreShaping,
+        transpose: i64,
+        range_shift: i64,
+        donor: Option<super::DonorCtx<'_>>,
+    ) -> crate::Result<super::SynthesisResult> {
+        let no_cancel = || false;
+        let no_prog = |_: f32| {};
+        match self {
+            MgVoice::Sovits { m, s2cv, dim, opts } => render_score_sovits(
+                m, s2cv, evts, *dim, cvspk, &super::g2p::GlobalDicts, opts,
+                crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, range_shift,
+                Some(vf0), None, None, &no_cancel, &no_prog, donor,
+            ),
+            MgVoice::Rvc { m, s2cv, dim, opts } => render_score_rvc(
+                m, s2cv, evts, *dim, cvspk, &super::g2p::GlobalDicts, opts,
+                shaping, transpose, range_shift, Some(vf0), None, None,
+                &no_cancel, &no_prog, donor,
+            ),
+        }
+    }
+}
+
+/// `UTAI_MG_MODEL`(rvc onnx)+ 同名 `.json` sidecar + `UTAI_MG_INDEXFILE`(默认同名 `.npy`)。
+struct MgRvcRig {
+    engine: OnnxEngine,
+    s2cv: String,
+    cv: String,
+    rmvpe: String,
+    voice: String,
+    mel: Array2<f32>,
+    index: rvc::RvcIndex,
+    sidecar: serde_json::Value,
+    dim: usize,
+    sample_rate: u32,
+    min_frames: usize,
+    noise_channels: usize,
+    mtag: String,
+}
+
+impl MgRvcRig {
+    fn load() -> Self {
+        let (model_path, index_path, mtag) = mg_model_envs();
+        let sc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(model_path.with_extension("json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sc["type"].as_str(), Some("rvc"), "rvc arm wants an rvc sidecar");
+        let dim = sc["features_dim"].as_u64().expect("features_dim") as usize;
+        let sample_rate = sc["sample_rate"].as_u64().expect("sample_rate") as u32;
+        let min_frames = sc["min_frames"].as_u64().unwrap_or(12) as usize;
+        let noise_channels = sc["noise_channels"].as_u64().unwrap_or(192) as usize;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dll = root.join("../runtime/ort/onnxruntime.dll");
+        assert!(dll.exists(), "ORT dll missing at {}", dll.display());
+        if let Ok(bld) = ort::init_from(&dll) {
+            let _ = bld.commit();
+        }
+        let engine = OnnxEngine::new();
+        engine.set_device(DeviceConfig::Cpu);
+        let aux = root.join("../data/models").join(crate::models::AUX_DIR_NAME);
+        let s2cv = engine
+            .load_model_with(
+                &aux.join(if dim == 768 { "score2cv_768.onnx" } else { "score2cv_256.onnx" }),
+                false,
+            )
+            .unwrap();
+        let cv = engine
+            .load_model_with(
+                &aux.join(if dim == 768 {
+                    "contentvec_768l12.onnx"
+                } else {
+                    "contentvec_256l9.onnx"
+                }),
+                false,
+            )
+            .unwrap();
+        let rmvpe = engine.load_model_with(&aux.join("rmvpe_e2e.onnx"), false).unwrap();
+        let mel: Array2<f32> = ndarray_npy::read_npy(&aux.join("rmvpe_mel_filters.npy")).unwrap();
+        let voice = engine.load_model_with(&model_path, false).unwrap();
+        let index = rvc::RvcIndex::load(&index_path).unwrap();
+        Self {
+            engine, s2cv, cv, rmvpe, voice, mel, index,
+            sidecar: sc, dim, sample_rate, min_frames, noise_channels, mtag,
+        }
+    }
+
+    fn model(&self) -> rvc::RvcModel<'_> {
+        rvc::RvcModel {
+            engine: &self.engine,
+            voice_session: &self.voice,
+            contentvec_session: &self.cv,
+            rmvpe_session: &self.rmvpe,
+            mel_filters: &self.mel,
+            index: Some(&self.index),
+            sample_rate: self.sample_rate,
+            features_dim: self.dim,
+            spk_mix: None,
+            noise_channels: self.noise_channels,
+            min_frames: self.min_frames,
+        }
+    }
+}
+
+/// 台身 —— 决策层(计划/窗)、执行层(base 一遍 + 每个 distinct shift 一遍 donor)、
+/// 拼接编排与落盘。两条腿共用,**一行都不许各自复制一份**。
+fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>) {
     let arm = std::env::var("UTAI_MG_ARM")
         .expect("UTAI_MG_ARM=<tag> required — 输出目录硬编码且文件名不带谱标识,不带标签会互相覆盖");
     assert!(
@@ -1289,14 +1466,10 @@ fn mg_render_score_deadonly() {
     let evts = to_evts(triples);
     let vf0 = VocalF0 { cents: &sj.f0_cents, voiced: &sj.f0_voiced };
 
-    let rig = MgSovitsRig::load();
-    let m = rig.model();
-
     // ── 决策层:与生产同一条链、同一批函数 ──────────────────────────────
-    let cfg: crate::models::ModelConfig = serde_json::from_value(rig.sidecar.clone())
+    let cfg: crate::models::ModelConfig = serde_json::from_value(sidecar.clone())
         .expect("sidecar 解不成 ModelConfig —— 生产读的就是这个类型");
-    let speaker: u32 =
-        std::env::var("UTAI_MG_SPEAKER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let speaker = mg_deadonly_speaker();
     let transpose: i64 =
         std::env::var("UTAI_MG_TRANSPOSE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let range = super::super::vocal_range::speaker_range(&cfg, speaker).expect(
@@ -1316,8 +1489,10 @@ fn mg_render_score_deadonly() {
     };
 
     eprintln!(
-        "[mg] dead-only arm '{arm}': speaker {speaker} · usable [{:.0},{:.0}] · transpose {transpose:+}",
-        range.usable.0, range.usable.1
+        "[mg] dead-only arm '{arm}' ({}): speaker {speaker} · usable [{:.0},{:.0}] · transpose {transpose:+}",
+        voice.tag(),
+        range.usable.0,
+        range.usable.1
     );
     eprintln!(
         "[mg]   算出来的计划: {} 组 / {} 无解;实际使用: {} 组{}",
@@ -1341,7 +1516,6 @@ fn mg_render_score_deadonly() {
     let total_frames: i64 = fr.iter().map(|f| (*f).max(0)).sum();
 
     // ── 执行层:base 一遍 + 每个 distinct shift 一遍 donor,拼接由库函数编排 ──
-    let (_shift_unused, _inv_unused, kappa) = mg_shift_envs();
     let emph: f32 = std::env::var("UTAI_MG_EMPH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1352,30 +1526,16 @@ fn mg_render_score_deadonly() {
         .unwrap_or(DEFAULT_CONSONANT_VALLEY_SCALE);
     let clarity: bool =
         std::env::var("UTAI_MG_CLARITY").ok().and_then(|s| s.parse().ok()).unwrap_or(true);
-    let sopts = SovitsOptions {
-        seed: 0,
-        noise_scale: 0.4,
-        range_formant_follow: kappa,
-        speaker_id: Some(speaker),
-        ..Default::default()
-    };
     let shaping = ScoreShaping {
         consonant_emphasis_db: emph,
         consonant_valley_scale: valley,
         vowel_clarity: clarity,
         consonant_preroll: mg_timing_env() == ArticulationTiming::Auto,
     };
-    let no_cancel = || false;
-    let no_prog = |_: f32| {};
     let cvspk = mg_cvspk_env();
     let t0 = Instant::now();
 
-    let mut result = render_score_sovits(
-        &m, &rig.s2cv, &evts, rig.dim, cvspk, &super::g2p::GlobalDicts, &sopts,
-        crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, 0,
-        Some(&vf0), None, None, &no_cancel, &no_prog, None,
-    )
-    .unwrap();
+    let mut result = voice.render(&evts, &vf0, cvspk, shaping, transpose, 0, None).unwrap();
     let sr = result.sample_rate;
     let base_peak = result.pre_norm_peak;
     // S159 —— 见生产那两处:帧→样本的分母只有这里有。
@@ -1389,29 +1549,34 @@ fn mg_render_score_deadonly() {
         |s, own| {
             // S159 —— 与生产同一条:保留区间由**拥有帧→样本地图的人**算,闭包只把 `own` 传进去。
             let keep = super::super::vocal_range::donor_keep_samples(own, base_len, total_frames);
-            render_score_sovits(
-                &m, &rig.s2cv, &evts, rig.dim, cvspk, &super::g2p::GlobalDicts, &sopts,
-                crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, s,
-                Some(&vf0), None, None, &no_cancel, &no_prog,
-                base_peak.map(|p| super::DonorCtx {
-                    norm_peak_target: p,
-                    windows: own,
-                    keep_samples: &keep,
-                }),
-            )
-            .map(|r| r.audio)
+            voice
+                .render(
+                    &evts,
+                    &vf0,
+                    cvspk,
+                    shaping,
+                    transpose,
+                    s,
+                    base_peak.map(|p| super::DonorCtx {
+                        norm_peak_target: p,
+                        windows: own,
+                        keep_samples: &keep,
+                    }),
+                )
+                .map(|r| r.audio)
         },
     )
     .unwrap();
 
     let out_dir = Path::new(WORK).join("probe");
     std::fs::create_dir_all(&out_dir).unwrap();
-    let stem = format!("mg_deadonly_{arm}_{}", rig.mtag);
+    let stem = format!("mg_deadonly_{arm}_{mtag}");
     write_wav16(&out_dir.join(format!("{stem}.wav")), &result.audio, sr);
     // 计划的可复现出处 —— 下游分析脚本一律读它,别再各自硬编码一份字面量。
     let dump = serde_json::json!({
         "arm": arm,
-        "model": rig.mtag,
+        "backend": voice.tag(),
+        "model": mtag,
         "speaker": speaker,
         "transpose": transpose,
         "usable": [range.usable.0, range.usable.1],
