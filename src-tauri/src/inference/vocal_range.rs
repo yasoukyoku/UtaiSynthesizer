@@ -1340,6 +1340,44 @@ const LANDING_MAX_EXTRA_DEPTH: i64 = 1;
 /// tune the constant.
 const LANDING_DAMAGE_EPS: f32 = 0.05;
 
+/// S159k —— cover 区段**最小救援深度**(半音)。比它浅的区段干脆不救。
+///
+/// ## ⛔ 这是量出来的,不是品味
+/// 用户 2026-08-21 的真素材(+7 SV 渲染 × yachiyo RVC,107 段),开/关两臂同一二进制:
+/// 区段内 2613 个浊音帧的谐波间噪声,按**该段的位移深度**分组看逐帧改善(负 = 变干净):
+///
+/// | 深度 | Δ 中位 | 该档里**变脏**(> +3 dB)的帧 |
+/// |---|---|---|
+/// | **−2 st** | **−1.02 dB** | **21.7%** |
+/// | −3 st | −5.55 | 8.4% |
+/// | −4 st | −7.06 | 9.5% |
+/// | −5…−10 st | −12…−44 | 1-4% |
+///
+/// ⇒ **−2 那一档几乎什么也没买到,却照样付两条边界的代价**(见 [`cover_dead_plan`] 的
+/// 「边界」那一段:每段两条边,而边界台阶正是用户听到的破音)。⇒ 门槛设在 3。
+/// ⚠ −3/−4 那两档买到的是 5-7 dB,不算大但是正的,而且变脏比例已经掉到个位数 ⇒ 留着。
+const COVER_MIN_RESCUE_DEPTH: i64 = 3;
+
+/// S159k —— 把区段的边往外找清音帧时,**最多找这么远**(毫秒)。找不到就**不外扩**。
+///
+/// ## ⛔ 上限是量出来的,而且「找不到就不动」是它的另一半
+/// 第一版没有上限 —— 判据当场抓住了:一条 20 s 的连唱会被整条吞进 donor
+/// (`cover_plan_rescues_a_sustained_dead_climax_locally` / `..._bridges_consonant_gaps_...`)。
+/// 于是去量用户那份真素材(292 s,214 条边,100 fps 网格上判有声):
+///
+/// | | |
+/// |---|---|
+/// | 有声连段时长 | p50 **135 ms** · p90 765 · max 4340 |
+/// | 边到最近清音帧 | p25 **0 ms** · p50 **10** · p75 158 · p90 866 · p95 1758 |
+/// | 上限 100 / 150 / 200 ms | 能挪进清音的边 72.4% / 74.8% / **78.5%** |
+/// | 上限 **300** / 500 / 800 / 1200 ms | **82.2%** / 85.5% / 89.3% / 92.1% |
+///
+/// ⇒ 300 ms 之后**收益递减而代价线性涨**(外扩的每一帧都是被拖进 donor 的乘客,
+/// 而实测把低处拖进 donor 会脏 25 dB,见 [`cover_dead_plan`] 里那一段)。
+/// ⛔ **失败方向:找不到清音就把边留在原处**(= 今天的行为,不更差),
+/// 而不是「扩到上限为止」—— 那只会把缝挪个位置,还白搭一堆乘客。
+const COVER_EDGE_SEEK_MS: f32 = 300.0;
+
 /// S85 七轮:COVER(音频轨/audition)的 dead-only 计划 — `dead_only_plan` 的帧域版,同一
 /// 死亡判据(slot_singable)与同一落点搜索(minimal_rescue_shift),两轨哲学统一:整曲平移
 /// 退役,只有模型「连音高都发不出」的**持续**区域被局部救援;深度由该区域自己的最小落点
@@ -1397,9 +1435,72 @@ pub fn cover_dead_plan(
         }
     }
     groups.retain(|&(_, _, c)| c >= min_run);
+
+    // ── S159k —— **边界只许落在清音帧上。**用户 2026-08-21 的真病例(cover 开扩展「高音破音/炸」)。
+    //
+    // ⛔ 机理是量出来的,而且**第一个假说被自己的数据打掉了**:先怀疑「一个瞬时峰把整段拖下去」,
+    //    量 107 段的「过度压低」= `|位移| − (最高音 − 可用顶)` ⇒ 中位 **−0.2 半音**,只有 1 段 > 4,
+    //    **没有任何一段的中位音高落在可用范围内** ⇒ 上面那段分组逻辑是对的,不是它的错。
+    //
+    // ⭐⭐ 真正的缺陷:分组是**逐帧按 f0 过线**做的,所以区段的边**必然落在「音高穿过那条线」的地方**
+    //    —— 而那正是一个长音的中间。实测 214 条边里 **125 条(58%)两侧都在唱**;同一批边界位置上的
+    //    音色台阶(开/关两臂,唯一变量是扩展):**关 p50 15.38 / p90 30.31 / >30 dB 共 11 条**
+    //    → **开 p50 19.18 / p90 37.78 / max 55.26 / 共 32 条**(大台阶**翻三倍**)。
+    //    最大的几条是 **−8 → −62 dB** 再切回来 = 一个长音中间,嗓子在「模型硬唱(脏)」与
+    //    「救援(干净)」之间来回切,一段两次、107 段。**这就是用户听到的「炸」。**
+    //
+    // ⭐ 而扩展本身是**大幅净赚**的(同一批帧:谐波间噪声 −26.35 → −46.49 dB,2068 帧变干净、
+    //    只有 188 帧变脏;MIDI 81-83 改善 42.9 dB)⇒ ⛔ **别把「关掉扩展」当解法。**
+    //
+    // ⇒ 把谱面轨的**结构性质**搬过来(它按休止分乐句,边天然落在休止里):一帧过线,就把**整条浊音岛**
+    //   一起收进来。⭐ 这在**深度上是免费的** —— 外扩不会抬高该段的最高音。
+    // ⚠ 但它**不是**零代价:外扩会把岛上低的那一头也拖进 donor,而实测区段里 MIDI 72-74 的低处帧
+    //   读 −11.52 dB、同音高的非扩展帧读 −36.89(拖低会脏 25 dB)。⇒ 代价由 `minimal_rescue_shift`
+    //   对「死音 ∪ 乘客」取 max 那条自己兜:乘客太低就找不到落点,那时**退回未外扩的区段**(见下)。
+    let voiced = |i: usize| matches!(f0_hz.get(i), Some(v) if *v > 0.0);
+    let seek = frames_for(COVER_EDGE_SEEK_MS, fps) as usize;
+    // 往外找 ≤ `seek` 帧内的第一个清音帧;⛔ 找不到就**原地不动**(见 `COVER_EDGE_SEEK_MS`)。
+    let back = |a: usize| -> usize {
+        let stop = a.saturating_sub(seek);
+        let mut i = a;
+        while i > stop && voiced(i - 1) {
+            i -= 1;
+        }
+        if i > 0 && voiced(i - 1) {
+            a
+        } else {
+            i
+        }
+    };
+    let fwd = |b: usize| -> usize {
+        let stop = (b + seek).min(f0_hz.len().saturating_sub(1));
+        let mut i = b;
+        while i < stop && voiced(i + 1) {
+            i += 1;
+        }
+        if i + 1 < f0_hz.len() && voiced(i + 1) {
+            b
+        } else {
+            i
+        }
+    };
+    // (外扩起, 外扩止, 它是由哪些原始组扩出来的)
+    let mut spans: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
+    for &(a, b, _) in &groups {
+        let (ea, eb) = (back(a), fwd(b));
+        // ⛔ 外扩之后两段可能撞上(同一条岛上有两处过线)—— 不合并的话拼接器会把同一段贴两次。
+        match spans.last_mut() {
+            Some((_, pe, orig)) if ea <= *pe + 1 => {
+                *pe = (*pe).max(eb);
+                orig.push((a, b));
+            }
+            _ => spans.push((ea, eb, vec![(a, b)])),
+        }
+    }
+
     let mut out = Vec::new();
     let mut unfixable = Vec::new();
-    for &(a, b, _) in &groups {
+    let collect = |a: usize, b: usize| -> (Vec<i64>, Vec<i64>) {
         let pitches: Vec<i64> = idx
             .iter()
             .zip(midi.iter())
@@ -1408,9 +1509,34 @@ pub fn cover_dead_plan(
             .collect();
         let dead: Vec<i64> =
             pitches.iter().copied().filter(|&p| !range.slot_singable(p)).collect();
+        (pitches, dead)
+    };
+    // ⛔ 深度门与「无解」是**两件事**,报法必须分开(S129 铁律:一条红要能被归因)。
+    let mut push = |s: i64, a: usize, b: usize| {
+        if s.abs() >= COVER_MIN_RESCUE_DEPTH {
+            out.push(DeadJob { shift: s, start: a as i64, end: (b + 1) as i64 });
+        }
+    };
+    for (ea, eb, orig) in spans {
+        let (pitches, dead) = collect(ea, eb);
         match minimal_rescue_shift(&dead, &pitches, range, None) {
-            Some(s) => out.push(DeadJob { shift: s, start: a as i64, end: (b + 1) as i64 }),
-            None => unfixable.push((a as i64, (b + 1) as i64)),
+            Some(s) => push(s, ea, eb),
+            None => {
+                // 外扩把乘客拖得太低 ⇒ 这一整条岛没有落点。**退回未外扩的原始组**:边会落回
+                // 长音中间(今天的行为),但至少不比今天差。⛔ 必须响 —— 这是降级不是正常路径。
+                tracing::warn!(
+                    "range-extend(cover): island [{ea},{eb}] has no landing once extended to \
+                     unvoiced edges — falling back to {} un-extended region(s) (audible seams likely)",
+                    orig.len()
+                );
+                for &(a, b) in &orig {
+                    let (p, d) = collect(a, b);
+                    match minimal_rescue_shift(&d, &p, range, None) {
+                        Some(s) => push(s, a, b),
+                        None => unfixable.push((a as i64, (b + 1) as i64)),
+                    }
+                }
+            }
         }
     }
     (out, unfixable)
@@ -3020,6 +3146,94 @@ mod tests {
         assert_eq!(jobs[0].end, 1082);
     }
 
+    /// S159k ⑴ —— ⛔⛔ **区段的边只许落在清音帧上。**用户 2026-08-21 的真病例
+    /// (cover 开扩展「高音破音/炸」)。机理与读数写在 `cover_dead_plan` 里那一段注释上。
+    ///
+    /// ⚠ 注意上面那 8 条老判据**碰不到这条规则** —— 它们的夹具全程有声,外扩按设计不会发生。
+    /// (第一版没有上限时它们**红过**,正是它们抓出「会吞掉整段连唱」。)
+    #[test]
+    fn a_cover_region_edge_walks_out_to_the_nearest_unvoiced_frame() {
+        // 50 帧静音 │ 20 帧 60 │ **5 帧清音** │ 25 帧 60 │ 40 帧 88(死)│ 静音
+        let mut f0 = vec![0.0f32; 50];
+        f0.extend(vec![hz(60.0); 20]);
+        f0.extend(vec![0.0; 5]);
+        f0.extend(vec![hz(60.0); 25]);
+        f0.extend(vec![hz(88.0); 40]);
+        f0.extend(vec![0.0; 50]);
+        let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &range());
+        assert!(unfix.is_empty());
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        // 死区本来是 [100,140);边往回走 25 帧撞到 74 那条清音隙 ⇒ 起点 75。
+        assert_eq!(jobs[0].start, 75, "边没有走到清音处");
+        assert_eq!(jobs[0].end, 140, "尾边本来就贴着静音,不该动");
+        // ⭐ 承重:边的**外侧**必须是清音 —— 这才是「缝落在听不见的地方」那句话的内容。
+        assert_eq!(f0[jobs[0].start as usize - 1], 0.0, "起点外侧不是清音");
+        assert_eq!(f0[jobs[0].end as usize], 0.0, "终点外侧不是清音");
+        // ⛔ 阴性对照:外扩不许改变**深度**(它不抬高该段最高音)。
+        assert_eq!(jobs[0].shift, -9, "外扩改了落点 —— 那就不是「深度上免费」了");
+    }
+
+    /// S159k ⑴ 的另一半 —— **够不着清音就原地不动**(失败方向 = 今天的行为,不更差)。
+    #[test]
+    fn a_cover_region_edge_stays_put_when_no_gap_is_within_reach() {
+        // 60 帧 60(= 600 ms,远超 COVER_EDGE_SEEK_MS 的 300 ms)紧贴死区,中间没有清音。
+        let mut f0 = vec![0.0f32; 50];
+        f0.extend(vec![hz(60.0); 60]);
+        f0.extend(vec![hz(88.0); 40]);
+        f0.extend(vec![0.0; 50]);
+        let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].start, 110, "够不着清音时不许外扩(那只会白搭一堆乘客)");
+        assert_eq!(jobs[0].end, 150);
+    }
+
+    /// S159k ⑵ —— **只需要一两个半音的区段,不救。**
+    ///
+    /// 读数在 [`COVER_MIN_RESCUE_DEPTH`] 的 doc 里:−2 那一档逐帧改善只有 −1.02 dB,
+    /// 而该档里 **21.7% 的帧反而变脏**,却照样付两条边界的代价。
+    /// ⛔ 光钉「浅的不救」会被「干脆全都不救」满足 ⇒ 阴性对照必须钉「够深的照救」。
+    #[test]
+    fn a_cover_region_that_only_needs_one_or_two_semitones_is_left_alone() {
+        // usable 顶 = comfort 顶 = 84 ⇒ 一个 85 的死区只需要 −1。
+        let r = SpeakerRange::bounds((48.0, 84.0), (48.0, 84.0));
+        let mut shallow = vec![0.0f32; 20];
+        shallow.extend(vec![hz(85.0); 40]);
+        shallow.extend(vec![0.0; 20]);
+        let (jobs, unfix) = cover_dead_plan(&shallow, 100.0, &r);
+        assert!(jobs.is_empty(), "只需要 1 个半音的区段不该进工序:{jobs:?}");
+        assert!(unfix.is_empty(), "⛔「太浅所以不救」不是「无解」—— 两者必须分开报");
+        // ⛔ 阴性对照:同一份记录、同一个夹具形状,够深的照救。
+        let mut deep = vec![0.0f32; 20];
+        deep.extend(vec![hz(88.0); 40]);
+        deep.extend(vec![0.0; 20]);
+        let (jobs2, _) = cover_dead_plan(&deep, 100.0, &r);
+        assert_eq!(jobs2.len(), 1, "够深的区段被门槛误伤了:{jobs2:?}");
+        assert_eq!(jobs2[0].shift, -4);
+        // ⛔ **恰好等于门槛的那一格**:87 需要 −3,必须算「够深」(`>=` 不是 `>`)。
+        //    变异实测:少了这一条,把 `>=` 改成 `>` 全绿。
+        let mut edge = vec![0.0f32; 20];
+        edge.extend(vec![hz(87.0); 40]);
+        edge.extend(vec![0.0; 20]);
+        let (jobs3, _) = cover_dead_plan(&edge, 100.0, &r);
+        assert_eq!(jobs3.len(), 1, "恰好 3 个半音必须照救:{jobs3:?}");
+        assert_eq!(jobs3[0].shift, -3);
+    }
+
+    /// S159k ⑴ 的边界情形 —— **同一条岛上的两个死区,外扩之后撞上了必须合并。**
+    /// ⛔ 不合并的话拼接器会把同一段贴两次(`apply_dead_only_windows` 按 job 逐个贴)。
+    #[test]
+    fn two_cover_regions_that_extend_into_the_same_island_are_merged() {
+        // 静音 │ 30 帧 88(死)│ 5 帧 60 │ 25 帧 88(死)│ 静音 —— 死帧间隔 5 > GAP_TOL ⇒ 本是两组。
+        let mut f0 = vec![0.0f32; 50];
+        f0.extend(vec![hz(88.0); 30]);
+        f0.extend(vec![hz(60.0); 5]);
+        f0.extend(vec![hz(88.0); 25]);
+        f0.extend(vec![0.0; 50]);
+        let (jobs, _) = cover_dead_plan(&f0, 100.0, &range());
+        assert_eq!(jobs.len(), 1, "外扩之后撞上的两段没有合并 ⇒ 拼接器会贴两次:{jobs:?}");
+        assert_eq!((jobs[0].start, jobs[0].end), (50, 110));
+    }
+
     #[test]
     fn cover_plan_counts_unfixable_regions_loudly() {
         // 拖拽守卫:死亡高潮里混着够不着的低音 ⇒ 无解 ⇒ 响亮报位置而非静默跳过。
@@ -4050,15 +4264,17 @@ mod tests {
     /// ⇒ 用户在音频轨/试听上听到的救援,与谱面轨渲出来的**已经是两条不同的规则**,
     /// 而没有一行输出说破。
     ///
-    /// ⭐ 顺带写清楚一件容易读反的事:**cover 轨从来就只覆盖死音区间本身**
-    /// (按死帧成区 + `GAP_TOL_MS` 桥接),它**根本不拖乘客** —— 也就是说它一直是
-    /// 「头尾都裁」的。S158d 这一刀是让**谱面轨往它那边走了半步**(只裁尾)。
+    /// ⚠⚠ **S159k 改掉了这条 doc 原来的一半,原文照录以便对账**:
+    /// 「cover 轨从来就只覆盖死音区间本身(按死帧成区 + `GAP_TOL_MS` 桥接),它**根本不拖乘客**
+    ///   —— 也就是说它一直是『头尾都裁』的。S158d 这一刀是让谱面轨往它那边走了半步(只裁尾)。」
+    /// 那句话当时还写着「这条判据**不主张『应该接上』** —— 那是另一笔**要单独定价的账**」。
+    /// ⇒ S159k **把那笔账定价了**,然后接上了半步:cover 现在会把边**外扩到最近的清音帧**
+    /// (上限 `COVER_EDGE_SEEK_MS`),因此**它开始拖乘客了**。定价见 `cover_dead_plan` 里
+    /// 那一段注释(用户真病例:边界大台阶 11 条 → 32 条,最大 −8 → −62 dB)。
     ///
-    /// ⛔ 这条判据**不主张「应该接上」** —— 那是另一笔要单独定价的账(cover 的素材、
-    /// 判据、以及「一整段音频而不是一个乐句」这个前提都不一样)。它只要求这件事
-    /// **是有意的、而且被写下来了**:先用阳性对照证明旋钮在谱面轨上真的咬人,
-    /// 再钉住 cover 轨给的是**旋钮之前**那个答案。哪天有人把它接上,这条会红,
-    /// 而那时候红的是「你改了一条用户听得见的规则」,不是「测试碍事」。
+    /// ⛔ **仍然故意不给的**:谱面轨的 `landing` / `trim` 旋钮。这条判据钉的就是这一件 ——
+    /// 先用阳性对照证明旋钮在谱面轨上真的咬人,再钉住 cover 轨给的是**旋钮之前**那个答案。
+    /// 哪天有人把它接上,这条会红,而那时候红的是「你改了一条用户听得见的规则」,不是「测试碍事」。
     #[test]
     fn the_cover_lane_deliberately_does_not_get_the_score_lane_knobs() {
         let r = akiko_like();
@@ -4070,26 +4286,47 @@ mod tests {
         assert_eq!(off[0].shift, -2, "旋钮之前:预算 +1 ⇒ 停在 78");
         assert_eq!(on[0].shift, -4, "阳性对照:出厂默认在谱面轨上把它带到 76");
         // ⓑ 而 cover 轨对同一个音高给出的是**旋钮之前**那个答案。
-        let f0 = vec![hz(80.0); 200]; // 2 s @ 100 fps,远超 MIN_VIOLATION_MS
+        // ⚠ S159k:原来这里用的是 80,而 80 只需要 −2 —— 已被 `COVER_MIN_RESCUE_DEPTH` 挡掉。
+        //    换成 83(够深,门槛碰不到它),ⓐ 的阳性对照也跟着换成同一个音高。
+        let (off3, _) = dead_only_plan_with(&[0, 83, 0], &fr, 0, &r, RescueTuning::new(None, None));
+        let (on3, _) = dead_only_plan_with(&[0, 83, 0], &fr, 0, &r, RescueTuning::today());
+        assert_eq!(off3[0].shift, -5, "旋钮之前:83 停在 78");
+        assert_eq!(on3[0].shift, -7, "阳性对照:出厂默认在谱面轨上把它带到 76");
+        let f0 = vec![hz(83.0); 200]; // 2 s @ 100 fps,远超 MIN_VIOLATION_MS
         let (jobs, unfix) = cover_dead_plan(&f0, 100.0, &r);
         assert!(unfix.is_empty());
-        assert_eq!(jobs.len(), 1, "一整段 80 应当成一个区域");
+        assert_eq!(jobs.len(), 1, "一整段 83 应当成一个区域");
         assert_eq!(
-            jobs[0].shift, -2,
-            "cover 轨拿不到 LANDING_DEFAULT —— 若这里变成 -4,说明有人把谱面轨的旋钮接到了              音频轨上,那是用户听得见的改动,必须是有意的并且要单独定价"
+            jobs[0].shift, -5,
+            "cover 轨拿不到 LANDING_DEFAULT —— 若这里变成 -7,说明有人把谱面轨的旋钮接到了              音频轨上,那是用户听得见的改动,必须是有意的并且要单独定价"
         );
-        // ⓒ 而「裁剪」在 cover 轨上**结构性地不存在**:它覆盖的就是死音区间本身。
-        //    这里用一段「前后都是唱得动的材料、中间一段死音」来钉住这个形状。
+        // ⓒ **S159k 之后**:cover 会把边外扩到最近的清音帧,但**上限 `COVER_EDGE_SEEK_MS`**,
+        //    而且**够不着就原地不动**。这里用「前后都是唱得动的材料、中间一段死音」钉住那个上限:
+        //    前后各 200 帧(2 s)全程有声、中间没有任何清音隙 ⇒ **一帧都不许外扩**。
+        //    ⛔ 这一条是 S159k 的护栏:第一版没有上限,它会把整整 6 秒连唱吞进 donor。
         let mut f0b = vec![hz(60.0); 200];
-        f0b.extend(vec![hz(80.0); 200]);
+        f0b.extend(vec![hz(83.0); 200]);
         f0b.extend(vec![hz(60.0); 200]);
         let (jobs2, _) = cover_dead_plan(&f0b, 100.0, &r);
         assert_eq!(jobs2.len(), 1);
-        assert!(
-            jobs2[0].start >= 195 && jobs2[0].end <= 405,
-            "cover 轨只覆盖死音那一段(拿到的是 {:?})—— 它没有乘客可卸,             所以 `TRIM_DEFAULT` 对它是空操作",
-            (jobs2[0].start, jobs2[0].end)
+        assert_eq!(
+            (jobs2[0].start, jobs2[0].end),
+            (200, 400),
+            "够不着清音时 cover 的边必须原地不动 —— 没有上限的话这里会变成 (0, 600)"
         );
+        // ⛔ 阴性对照:同一份材料,只要**够得着**清音,边就必须真的走过去
+        //    (否则上面那条可以由「外扩根本没接上」满足)。
+        // ⚠ 第一版这条对照写错过:只在死区**前面**放了清音,却去断言**尾边**会走 —— 当场红,
+        //    而红的是对照不是代码。⇒ 清音要放在**被断言的那一侧**。
+        let mut f0c = vec![hz(60.0); 200];
+        f0c.extend(vec![hz(83.0); 200]);
+        f0c.extend(vec![hz(60.0); 20]);
+        f0c.push(0.0); // 死区之后 20 帧(200 ms < 上限)有一条清音隙
+        f0c.extend(vec![hz(60.0); 179]);
+        let (jobs3, _) = cover_dead_plan(&f0c, 100.0, &r);
+        assert_eq!(jobs3[0].start, 200, "头边够不着清音 ⇒ 原地不动");
+        assert_eq!(jobs3[0].end, 420, "尾边够得着 ⇒ 必须走到那条清音隙");
+        assert_eq!(f0c[420], 0.0, "断言里的 420 得真的是那条清音隙");
     }
 
     /// 与卸乘客同一条定义域:它只决定**落在哪**,不许改**哪些音被救**。
