@@ -572,6 +572,14 @@ pub struct DonorCtx<'a> {
     /// score grid. Chunks that do not intersect any window are **not rendered** — they are the
     /// 76% of every donor pass that gets thrown away today (measured: 285.2s → 130.0s wall).
     pub windows: &'a [(i64, i64)],
+    /// S159 —— 同一批窗的**样本**坐标(含渲染侧余量,已合并),交给逆变换。空 = 整条 = 今天。
+    ///
+    /// ⛔ 为什么不在这里从 `windows` 现算:帧→样本的比例 `spf = base.len() / total_frames`
+    /// 里的 `total_frames` 是**谱面帧**的和(`commands/inference.rs` 算的),而这个函数内部
+    /// 只有 `note_hz_full.len()`(= Σ `phone_dur`,cv 网格)。两者只在「帧守恒」时相等,
+    /// 而本文件 :245-250 自己就列了三类不守恒的例外。⇒ 由**拥有那份地图的人**算好传下来,
+    /// 与 `windows` 同一条理由(见 S148 在 `apply_dead_only_windows` 上写的那段)。
+    pub keep_samples: &'a [(usize, usize)],
 }
 
 /// Which chunks a donor must actually render.
@@ -908,7 +916,10 @@ pub fn render_score_sovits(
         audio = apply_formant_env(audio, fc);
     }
     let t0 = std::time::Instant::now();
-    audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
+    audio = apply_range_inverse(
+        audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full,
+        donor.map_or(&[][..], |d| d.keep_samples),
+    )?;
     let t_inverse = t0.elapsed().as_secs_f64();
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
@@ -1082,7 +1093,10 @@ pub fn render_score_rvc(
     if let Some(fc) = &formant_cv {
         audio = apply_formant_env(audio, fc);
     }
-    audio = apply_range_inverse(audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full)?;
+    audio = apply_range_inverse(
+        audio, m.sample_rate, range_shift, options.range_formant_follow, &note_hz_full,
+        donor.map_or(&[][..], |d| d.keep_samples),
+    )?;
     let pre_norm_peak = audio.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
     peak_normalize_to(&mut audio, 0.92, donor.map(|d| d.norm_peak_target));
     Ok(SynthesisResult { audio, sample_rate: m.sample_rate, pre_norm_peak: Some(pre_norm_peak) })
@@ -1548,12 +1562,17 @@ fn seam_fade(audio: &mut [f32], wav: &mut [f32], sample_rate: u32) {
 /// execution point vocal_range::apply_inverse (Signalsmith — no f0 guide needed). shift 0 /
 /// empty ⇒ untouched (tier 1/2: in-comfort renders NEVER pass through here — bit-parity by
 /// construction).
+///
+/// S159 —— `keep` = 这一遍的 donor 里**会被拼回歌里**的那几段样本(空 = 整条 = 今天)。
+/// 逆变换只在这些段上跑,其余的岛原样透传 —— 因为那些样本在拼接层一个也读不到。
+/// ⛔ 它不在这里从 `DonorCtx.windows` 现算,理由写在 `DonorCtx::keep_samples` 的 doc 里。
 fn apply_range_inverse(
     audio: Vec<f32>,
     sample_rate: u32,
     range_shift: i64,
     kappa: f32,
     note_hz: &[f32],
+    keep: &[(usize, usize)],
 ) -> crate::Result<Vec<f32>> {
     if range_shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -1561,12 +1580,13 @@ fn apply_range_inverse(
     // note_hz is the FED (already range-shifted) parametric pitch on the 50 fps cv grid — it
     // drives the inverse's streaming formant base (S82b anti-pop; vocal_range folds it into
     // a sticky schedule).
-    super::vocal_range::apply_inverse(
+    super::vocal_range::apply_inverse_windowed(
         audio,
         sample_rate,
         range_shift,
         kappa,
         Some((note_hz, (sample_rate as usize / 50).max(1))),
+        keep,
     )
     .map_err(UtaiError::Inference)
 }

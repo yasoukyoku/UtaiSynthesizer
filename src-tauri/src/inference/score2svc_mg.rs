@@ -1194,6 +1194,9 @@ fn mg_render_sovits() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1.0),
         windows: &donor_windows,
+        // ⛔ 这条探针臂**不给窗内逆变换**:它把整条输出写成 wav 拿去听/量,窗外不是被丢掉的。
+        // 空 = 整条缓冲 = 逐位同今天,与 `psola_shift_win` 的默认同一条理由。
+        keep_samples: &[],
     });
     let r = render_score_sovits(
         &m, &rig.s2cv, &evts, dim, cvspk, &super::g2p::GlobalDicts, &sopts,
@@ -1372,6 +1375,8 @@ fn mg_render_score_deadonly() {
     .unwrap();
     let sr = result.sample_rate;
     let base_peak = result.pre_norm_peak;
+    // S159 —— 见生产那两处:帧→样本的分母只有这里有。
+    let base_len = result.audio.len();
     super::super::vocal_range::apply_dead_only_windows(
         &mut result.audio,
         sr,
@@ -1379,11 +1384,17 @@ fn mg_render_score_deadonly() {
         &jobs,
         false, // 与生产同:donor 共用 base 的归一前峰 ⇒ 不需要 active-RMS 猜台阶
         |s, own| {
+            // S159 —— 与生产同一条:保留区间由**拥有帧→样本地图的人**算,闭包只把 `own` 传进去。
+            let keep = super::super::vocal_range::donor_keep_samples(own, base_len, total_frames);
             render_score_sovits(
                 &m, &rig.s2cv, &evts, rig.dim, cvspk, &super::g2p::GlobalDicts, &sopts,
                 crate::commands::inference::VOCAL_FLAT_VOL, shaping, transpose, s,
                 Some(&vf0), None, None, &no_cancel, &no_prog,
-                base_peak.map(|p| super::DonorCtx { norm_peak_target: p, windows: own }),
+                base_peak.map(|p| super::DonorCtx {
+                    norm_peak_target: p,
+                    windows: own,
+                    keep_samples: &keep,
+                }),
             )
             .map(|r| r.audio)
         },

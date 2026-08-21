@@ -1498,6 +1498,113 @@ pub fn donor_slice_spans(
     merged
 }
 
+/// S159 —— 一条窗在 donor 上对应的**样本**区间,含余量。**帧→样本的唯一公式。**
+///
+/// `spf` = `base.len() / total_frames`(线性,端点精确;SoVITS hop 网格的取整漂移被它吸收)。
+/// `margin` 用哪一个由调用方给,而今天只有两个合法值,各有各的理由:
+/// * [`MERGE_BRIDGE_FRAMES`](25) —— **拼接层**真的会从 donor 上切走的那一段;
+/// * [`crate::inference::score2svc::DONOR_WINDOW_MARGIN_FRAMES`](29 = 25 + 4)——
+///   **渲染侧**的余量,取自「`join_rests` 名义上能把窗边挪到 `l.end + gap + min(gap,4)`」。
+///
+/// ⭐ S159 实测更正一句会被引用错的话:**拼接层能读到的硬上界其实是 25 帧,不是 29。**
+/// `join_rests` 的候选切换点还要能在**左右两条 `kept` 片段**里各取到一个 5 ms 的读窗,
+/// 而片段只有 ±25 帧 ⇒ `rms_db` 在越界时返回 `None`、那些候选被 `continue` 掉;
+/// 实测(gap 取满 25 时)`hi` 名义上是 `l.end + 29` 帧,而真正能落到的最远处**正好是**
+/// `l.end + 25` 帧。⇒ 「窗内逆变换」用 29 是**有余量的超集**,不是刚好够。
+/// ⛔ 但仍然用 29 而不是 25:它是仓里已经登记的那个「渲染侧必须覆盖拼接侧够得到的最远处」
+/// 的常数(`score2svc.rs:74`,doc 明写「这两个数字从此是一对」),而这一刀是**第三个**
+/// 吃同一个余量的消费者。少一帧的代价是「拼进一段没被逆变换过的 donor」——
+/// 那是比目标高/低 N 个半音的音频,而组数/乘客数/donor 遍数/位移集**全绿**。
+fn donor_read_span(j: &DeadJob, spf: f64, n: usize, margin_frames: i64) -> Option<(usize, usize)> {
+    let margin = (margin_frames.max(0) as f64 * spf) as usize;
+    let a = ((j.start.max(0) as f64 * spf) as usize).min(n);
+    let b = ((j.end.max(0) as f64 * spf) as usize).min(n);
+    let (lo, hi) = (a.saturating_sub(margin), (b + margin).min(n));
+    (hi > lo).then_some((lo, hi))
+}
+
+/// S159 —— 交给 [`apply_inverse_windowed`] 的保留区间:这一遍**自己**的窗,按渲染侧余量取,
+/// 合并重叠。空 = 整条缓冲 = 今天。
+///
+/// `own_windows` 必须是 [`apply_dead_only_windows`] 的闭包收到的**第二个参数** ——
+/// 那是全仓唯一一处按 `shift` 过滤的地方(S148 把它收成一处的理由写在那个函数的 doc 里)。
+/// ⛔ 别在调用点自己再写一遍 `jobs.iter().filter(|j| j.shift == s)`:那是 S147 那次
+/// 「渲多了但拼对了 = 功能正确、收益静默减半」的形状,而它当时只被一个指纹抓到。
+pub fn donor_keep_samples(
+    own_windows: &[(i64, i64)],
+    base_len: usize,
+    total_frames: i64,
+) -> Vec<(usize, usize)> {
+    donor_keep_samples_with(own_windows, base_len, total_frames, windowed_inverse())
+}
+
+/// ⚙ 出厂默认 = true —— 开
+///
+/// S159 —— **窗内逆变换**:donor 遍的 TD-PSOLA 只跑「会被拼回歌里」的那几段
+/// (见 [`donor_keep_samples`] 与 `utai_dsp::psola::psola_shift_win`)。
+/// `UTAI_RANGE_WINDOWED_INVERSE=0` 关掉 = 整条缓冲照跑 = S158 及以前的行为。
+///
+/// ## ⛔ 它为什么**不**跟着 `RANGE_ALGO_VERSION` 一起 bump
+/// 这条线上每一个旋钮到今天为止都是「换音质」的,所以「翻默认必须成对 bump 缓存版本」
+/// 是条铁律。**这一个不是**:窗内的输出与整条臂**逐位相同**,而窗外的样本拼接层一个也读不到
+/// ⇒ 出厂音频一个字节不变,变的只有秒数。
+/// ⇒ bump 它只会让每一条已经烤好的救援白重渲一遍 —— `audition_cache_tag` 的 doc 明写
+/// 那是「用户直接叫 bug 的那一件事」。
+/// ⚠ **但这条结论是被证明的,不是被假设的**,它整个挂在下面这几条上:
+/// `psola.rs::the_window_keeps_every_sample_inside_it_bit_identical`(引擎侧逐位)·
+/// [`tests::the_inverse_window_covers_every_sample_the_splice_reads`](拼接侧只读窗内)·
+/// [`tests::the_window_reaches_the_engine_and_an_empty_window_is_not_an_error`](这条路真的通)。
+/// 哪一条塌了,这个「不 bump」的决定就跟着塌。
+///
+/// ## 它存在的第二个理由
+/// 速度 A/B 必须**同一个二进制**(S146:两条臂不同路时,量到的每一个读数里都混着路线差)。
+pub fn windowed_inverse() -> bool {
+    parse_windowed_inverse(std::env::var("UTAI_RANGE_WINDOWED_INVERSE").ok().as_deref())
+}
+
+fn parse_windowed_inverse(v: Option<&str>) -> bool {
+    match v {
+        Some(s) if !s.trim().is_empty() => !matches!(s.trim(), "0" | "false" | "off" | "no"),
+        _ => WINDOWED_INVERSE_DEFAULT,
+    }
+}
+
+const WINDOWED_INVERSE_DEFAULT: bool = true;
+
+/// [`donor_keep_samples`],但开关由参数给 —— ⛔ 判据不许读进程环境(S151 笔1:
+/// 一个读 env 的纯函数在 CI 上与在别人 export 过变量的机器上会给出不同答案)。
+pub fn donor_keep_samples_with(
+    own_windows: &[(i64, i64)],
+    base_len: usize,
+    total_frames: i64,
+    enabled: bool,
+) -> Vec<(usize, usize)> {
+    if !enabled || own_windows.is_empty() || base_len == 0 || total_frames <= 0 {
+        return Vec::new();
+    }
+    let spf = base_len as f64 / total_frames as f64;
+    let mut v: Vec<(usize, usize)> = own_windows
+        .iter()
+        .filter_map(|&(start, end)| {
+            donor_read_span(
+                &DeadJob { shift: 0, start, end },
+                spf,
+                base_len,
+                crate::inference::score2svc::DONOR_WINDOW_MARGIN_FRAMES,
+            )
+        })
+        .collect();
+    v.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some((_, e)) if a <= *e => *e = (*e).max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
 /// Active RMS (50 ms windows above -40 dBFS mean) — the dead-only donor level match. Silence /
 /// no active window ⇒ None (caller skips matching rather than amplifying noise).
 fn active_rms(x: &[f32], sample_rate: u32) -> Option<f32> {
@@ -1603,12 +1710,10 @@ pub fn apply_dead_only_windows_with(
         let n = base.len().min(donor.len());
         // S152 —— 留片段,拼接推迟到全部 donor 渲完(见 `kept` 的注释)。余量 = 桥接上限,
         // 因为窗边最远只会挪到相邻休止的另一头。
-        let margin = (MERGE_BRIDGE_FRAMES as f64 * spf) as usize;
+        // S159 —— 区间的算法搬进 [`donor_read_span`],因为「窗内逆变换」要用**同一个**公式:
+        // 那一刀保住的样本区间必须 ⊇ 这里切走的片段,而两处各写一遍 = 一处改了另一处不改。
         for (ji, j) in jobs.iter().enumerate().filter(|(_, j)| j.shift == s) {
-            let a = ((j.start.max(0) as f64 * spf) as usize).min(n);
-            let b = ((j.end.max(0) as f64 * spf) as usize).min(n);
-            let (lo, hi) = (a.saturating_sub(margin), (b + margin).min(n));
-            if hi > lo {
+            if let Some((lo, hi)) = donor_read_span(j, spf, n, MERGE_BRIDGE_FRAMES) {
                 kept.push((ji as i64, lo, donor[lo..hi].to_vec()));
             }
         }
@@ -2492,6 +2597,29 @@ pub fn apply_inverse(
     apply_inverse_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0)
 }
 
+/// S159 —— [`apply_inverse`],但只保证 `keep` 那几段**样本**是逆变换过的;窗外原样透传。
+///
+/// `keep` 空 = 整条 = [`apply_inverse`] = **逐位同今天**。⛔ 默认必须是「整条」而不是「什么都不做」:
+/// 一个漏传窗的调用点在前者上只是慢一点,在后者上会**静默产出一整条没被搬回原音高的音频**,
+/// 而长度契约、有限性、秒数、每一个计数器全部正常(S147「收益静默减半」的同一形状,只是更贵)。
+///
+/// ## 谁可以用它
+/// 只有**窗外必然被丢掉**的消费者:谱面轨的 donor 遍(`apply_dead_only_windows` 只从 donor 上
+/// 切走「窗 ± 余量」几段,`match_levels` 全传 false,归一标量来自 base)。
+/// ⛔ 探针那两条(`mg_cvfix_inverse` / `mg_render_cover`)整条输出就是拿去听的东西 —— 不许给窗。
+///
+/// 传什么见 [`donor_keep_samples`];引擎侧的保证与前置条件见 `utai_dsp::psola::psola_shift_win`。
+pub fn apply_inverse_windowed(
+    audio: Vec<f32>,
+    sample_rate: u32,
+    shift: i64,
+    kappa: f32,
+    fed_f0: Option<(&[f32], usize)>,
+    keep: &[(usize, usize)],
+) -> Result<Vec<f32>, String> {
+    apply_inverse_windowed_with(inverse_engine(), audio, sample_rate, shift, kappa, fed_f0, keep)
+}
+
 /// [`apply_inverse`] with the engine named explicitly — the A/B arm and the tests take this door.
 /// (Selecting the engine through the process environment inside a test would race the other
 /// tests in the same binary.)
@@ -2502,6 +2630,20 @@ pub fn apply_inverse_with(
     shift: i64,
     kappa: f32,
     fed_f0: Option<(&[f32], usize)>,
+) -> Result<Vec<f32>, String> {
+    apply_inverse_windowed_with(engine, audio, sample_rate, shift, kappa, fed_f0, &[])
+}
+
+/// [`apply_inverse_windowed`] with the engine named explicitly — **the single execution point**.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_inverse_windowed_with(
+    engine: InverseEngine,
+    audio: Vec<f32>,
+    sample_rate: u32,
+    shift: i64,
+    kappa: f32,
+    fed_f0: Option<(&[f32], usize)>,
+    keep: &[(usize, usize)],
 ) -> Result<Vec<f32>, String> {
     if shift == 0 || audio.is_empty() {
         return Ok(audio);
@@ -2543,7 +2685,7 @@ pub fn apply_inverse_with(
             let win = win_periods();
             let xg = xgrain();
             let lpc = lpc_order();
-            let (out, diag) = utai_dsp::psola::psola_shift_env(
+            let (out, diag) = utai_dsp::psola::psola_shift_win(
                 &audio,
                 sample_rate,
                 semis,
@@ -2559,9 +2701,32 @@ pub fn apply_inverse_with(
                 win,
                 xg,
                 lpc,
+                keep,
             );
-            if diag.islands == 0 {
+            // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
+            // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
+            // 两者若报成同一条红,「窗算错了」与「模型没给 f0」就分不开 —— 而这条线上
+            // 同一条红被判成「假红」已经出过两次(S129 铁律)。
+            if diag.islands_seen == 0 {
                 return Err("RANGE_INVERSE_NO_PITCH".into());
+            }
+            if diag.keep_ignored {
+                // 降级必须**响**:静默降级 = 收益静默归零而每一个读数都正常(S147 那个形状)。
+                tracing::warn!(
+                    "range-extend: inverse {semis:+.0} st —— 窗被忽略(lpc {lpc} / wsola {wsola} / \
+                     envfix {envfix} 里有一个不是 0 ⇒ 跳岛在窗内不再逐位安全)⇒ 整条缓冲照跑,\
+                     这一遍拿不到窗内逆变换的提速"
+                );
+            }
+            if diag.islands == 0 {
+                // 不是错误:这一遍的窗没碰到任何浊音岛 ⇒ 没东西要救。原样返回,并且**说出来**。
+                tracing::info!(
+                    "range-extend: inverse {semis:+.0} st —— 窗(占缓冲 {:.1}%)没有碰到任何浊音岛,\
+                     {} 个候选岛全被跳过 ⇒ 这一遍原样返回",
+                    f64::from(diag.keep_frac) * 100.0,
+                    diag.islands_seen
+                );
+                return Ok(audio);
             }
             // ⭐ info!, not debug!: when a bad render is reported, these are the numbers that say
             // whether the inverse did its job — and at debug level they were absent from every
@@ -2577,13 +2742,23 @@ pub fn apply_inverse_with(
             // 修它要么在零区跳过铺标记(会动输出),要么把两类样本分开计数;两者都还没做,
             // 所以先把这条限制写在读数旁边,免得下一个人拿它当健康证明。
             // ⭐ `src uncovered` 不吃这条限制:零区的读窗照样相接,贡献 0。
+            // S159 —— ⛔ 「省了多少」必须打出来。一个算错的窗(比如只省了 10% 而不是 90%)与一个
+            // 算对的窗在**音频上逐位相同**,只有这几个数看得见差别 —— 那正是 S147 B2 那次
+            // 「功能正确、收益静默减半」唯一被抓到的方式(当时是 `skipped`)。
+            // ⚠ 同时:`islands` / `marks` / `cola_*` / `src uncovered` 现在统计的是**被保留的那批岛**。
+            // 它们会变小、会「变好看」—— 那是少做了工序,不是修好了什么,别当健康证明。
             tracing::info!(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
-                 {} marks, cola gap {:.2}% (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
+                 {} marks (窗内 {}/{} 岛 · keep {:.1}%{}), cola gap {:.2}% \
+                 (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
                  src uncovered {:.2}%, infrasonic {:.2}%{}, env dev p50 {:.3} dB{}, \
-                 transport residual {:.4}{}",
+                 transport residual {:.4}{}, hp gate {:+.1} dB",
                 diag.islands,
                 diag.marks,
+                diag.islands_seen - diag.islands_skipped,
+                diag.islands_seen,
+                f64::from(diag.keep_frac) * 100.0,
+                if diag.keep_ignored { " ⚠ 窗被忽略" } else { "" },
                 diag.cola_gap_frac * 100.0,
                 diag.cola_w_p01,
                 diag.cola_w_median,
@@ -2624,7 +2799,10 @@ pub fn apply_inverse_with(
                     )
                 } else {
                     String::new()
-                }
+                },
+                // S159 —— 去次声总闸的余量。它是「窗内逆变换」唯一一条不结构性的耦合
+                // (全缓冲能量比,抽掉几个岛原则上能把它推翻面),所以离翻面有多远必须看得见。
+                diag.infrasonic_gate_db
             );
             out
         }
@@ -3161,6 +3339,179 @@ mod tests {
 
     fn spf_of(n: usize, total: i64) -> f64 {
         n as f64 / total as f64
+    }
+
+    /// S159 —— ⭐⭐⭐ **拼接层读到的每一个 donor 样本,都必须落在交给逆变换的保留区间里。**
+    ///
+    /// 这是「窗内逆变换」在**接线层**的承重判据,而且它是**行为**判据不是文本判据:
+    /// donor 闭包按 [`donor_keep_samples`] 把缓冲染成两种值(窗内 +1 / 窗外 **−1**),
+    /// 拼完之后 base 里只要出现负数,就说明拼接读到了一段**没有被逆变换过**的音频。
+    ///
+    /// ## ⛔ 它挡的是什么样的错
+    /// 生产里那段「窗外」是 donor 在 `shift` 位渲出来的原始音频 —— 比目标高/低好几个半音。
+    /// 少给一点余量,它会顺着 10 ms 交叉淡化混进被救乐句的边上;而**组数、乘客数、donor 遍数、
+    /// 位移集、音频秒数、长度契约全部正常**,耳朵在整曲里也几乎抓不到。
+    /// 形状与 S152 修掉的那个洞、以及 S147 那次「渲多了但拼对了」完全同族。
+    ///
+    /// ## 两条臂都要跑
+    /// `join_rests` **关**着是今天的出厂,但它一开就会把窗边挪到相邻休止的另一头
+    /// (最远 `MERGE_BRIDGE_FRAMES + 4` 帧)—— 那正是余量必须取 29 而不是 25 的理由。
+    /// ⇒ 只跑默认臂的话,这条余量在判据上是**空的**。
+    ///
+    /// ⛔ 变异:`donor_keep_samples` 的余量改成 `MERGE_BRIDGE_FRAMES` 或 0 ⇒ 红(见下面的阴性对照,
+    /// 它证明这条断言真的分得出「够」与「不够」)。
+    #[test]
+    fn the_inverse_window_covers_every_sample_the_splice_reads() {
+        const SR: u32 = 48_000;
+        const TOTAL_FRAMES: i64 = 600; // 12 s @ 50 fps
+        let base_len = (TOTAL_FRAMES as usize) * (SR as usize) / 50;
+        // 三组、两个位移。⛔ 前两组**必须**异位移、间隔 `0 < gap ≤ MERGE_BRIDGE_FRAMES`,
+        // 否则 `join_rests` 的那个 `continue` 会让它一次都不执行 ⇒ 余量在判据上是空的。
+        // ⚠ gap 取 10 而不是取满 25:切换点还要能在**左片段**里取到读窗,而左片段只到
+        //   `l.end + 25` 帧 —— gap 取满时那正好等于 `r.start`,一个候选都过不去(实测)。
+        let jobs = [
+            DeadJob { shift: -6, start: 80, end: 140 },
+            DeadJob { shift: -9, start: 150, end: 210 }, // gap = 10 帧
+            DeadJob { shift: -6, start: 420, end: 470 },
+        ];
+        let spf = base_len as f64 / TOTAL_FRAMES as f64;
+        // ⛔ `join_rests` 有一条 `JOIN_MIN_GAIN_DB = 6` 的门限:只有「今天那条边挖了个洞、
+        // 而换个切换点能填上」时才动。常数信号上它**一次都不开火** —— 所以夹具要照 S152 那个
+        // 真实病例造:base 在休止里有微弱预卷,而右 donor 在自己窗口的头 60 ms 是**静音**。
+        let hole = ((jobs[1].start as f64 * spf) as usize, ((jobs[1].start as f64 * spf) as usize) + SR as usize * 60 / 1000);
+        // 窗内 +1 / 窗外 **−1** 的 donor;`margin` 由参数给,好做阴性对照。
+        let paint = |own: &[(i64, i64)], margin: i64, shift: i64| -> Vec<f32> {
+            let mut d = vec![-1.0f32; base_len];
+            for &(start, end) in own {
+                let j = DeadJob { shift: 0, start, end };
+                if let Some((a, b)) = donor_read_span(&j, spf, base_len, margin) {
+                    for v in d[a..b].iter_mut() {
+                        *v = 1.0;
+                    }
+                }
+            }
+            if shift == jobs[1].shift {
+                for v in d[hole.0..hole.1.min(base_len)].iter_mut() {
+                    *v = 0.0; // 洞在**窗内**,所以它不会被误读成「读到了保留区之外」
+                }
+            }
+            d
+        };
+        for join in [false, true] {
+            let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, false, join, |s, own| {
+                // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
+                let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
+                let mut d = vec![-1.0f32; base_len];
+                for &(a, b) in &keep {
+                    for v in d[a..b].iter_mut() {
+                        *v = 1.0;
+                    }
+                }
+                if s == jobs[1].shift {
+                    for v in d[hole.0..hole.1.min(base_len)].iter_mut() {
+                        *v = 0.0;
+                    }
+                }
+                Ok(d)
+            })
+            .expect("splice");
+            let bad = base.iter().position(|v| *v < 0.0);
+            assert!(
+                bad.is_none(),
+                "join={join}:拼接读到了保留区间之外的 donor 样本(第 {} 个)—— \
+                 生产里那一段是没被搬回原音高的音频",
+                bad.unwrap_or(0)
+            );
+            // ⛔ 阴性对照:拼接**真的**发生过(否则上面那条只是「什么都没拼」)。
+            assert!(base.iter().any(|v| *v > 0.5), "join={join}:一个 donor 样本都没拼进来");
+
+            // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
+            let mut tight = vec![0.02f32; base_len];
+            apply_dead_only_windows_with(
+                &mut tight, SR, TOTAL_FRAMES, &jobs, false, join,
+                |s, own| Ok(paint(own, 0, s)),
+            )
+            .expect("splice");
+            let leaks = tight.iter().any(|v| *v < 0.0);
+            if join {
+                assert!(
+                    leaks,
+                    "join 开着时余量取 0 竟然也没漏 —— 那说明 `DONOR_WINDOW_MARGIN_FRAMES` 这 29 帧\
+                     在判据上是**空的**,而它正是这条余量存在的全部理由"
+                );
+            } else {
+                // ⭐⭐ 这不是「判据弱」,是一条要记住的事实:**今天的出厂默认(join 关)下,
+                // 拼接只读窗本身** —— `splice_kept` 写的就是 `[start·spf, end·spf]`,
+                // 那 25/29 帧余量一个样本都用不上。
+                // ⇒ 只跑默认臂的话,余量取 0 / 25 / 29 **产出逐位相同的歌**,这条余量结构上测不到。
+                // 那正是为什么上面要多跑一条 `join = true`;也是为什么翻 `JOIN_RESTS_DEFAULT`
+                // 之前必须回来看这条判据。
+                assert!(
+                    !leaks,
+                    "join 关着时拼接竟然读到了窗外 —— `splice_kept` 的读取范围变了,\
+                     上面那句「今天只读窗本身」的注释已经过期"
+                );
+            }
+        }
+    }
+
+    /// S159 —— **接线闸**:谱面轨的 donor 遍必须真的要窗。
+    ///
+    /// ⛔ 为什么需要一条这么笨的判据:这一刀「不接」与「接了」在**音频上逐位相同**,
+    /// 上面那些判据一条都不会红,渲染照样出得来、秒数照样有 —— 只是慢一倍。
+    /// S142 记过同一族的形状:整段代价提示当时可以删光而全仓零红 ⇒ 那种地方**第一条判据是
+    /// 存在性/接线闸**。运行期的那只眼睛是 `[perf]` 旁边那行 `窗内 N/M 岛 · keep x%`。
+    ///
+    /// ⚠ 它只钉「有没有接」,不钉「接得对不对」—— 后者是上面那两条行为判据的事。
+    #[test]
+    fn the_score_donor_passes_actually_ask_for_the_window() {
+        let cmd = include_str!("../commands/inference.rs");
+        assert_eq!(
+            cmd.matches(concat!("donor_keep", "_samples(")).count(),
+            2,
+            "谱面轨的两条臂(SoVITS / RVC)必须各自算一次保留区间 —— 少一条 = 那条臂静默退回全曲逆变换"
+        );
+        let s2s = include_str!("score2svc.rs");
+        assert!(
+            s2s.contains(concat!("d.keep", "_samples")),
+            "`apply_range_inverse` 没有把 `DonorCtx::keep_samples` 传下去 —— 窗算了却没人用"
+        );
+        // base 遍(`donor == None`)必须拿到空窗 = 整条 = 今天。⛔ 反过来会让 base 遍
+        // 一个岛都不处理,而 base 遍本来就 `range_shift == 0`、根本不进逆变换 —— 那种错
+        // 在音频上看不见,只会在将来某次重构里变成真的。
+        assert!(
+            s2s.contains("donor.map_or(&[][..], |d| d.keep_samples)"),
+            "base 遍的默认必须是「整条」而不是「什么都不做」"
+        );
+    }
+
+    /// S159 —— 渲染侧的余量必须**严格**盖过拼接侧真正切走的那一段(29 > 25),
+    /// 而且两者用的是**同一个**帧→样本公式。
+    ///
+    /// ⛔ 这条与上面那条是两件事:上面钉「拼接读到的都在保留区内」,这条钉「保留区比拼接层
+    /// 自己留的片段还宽」—— 因为 `join_rests` 能把窗边挪出片段(`splice_kept` 那时只会打一条
+    /// warn 然后夹紧),而被夹掉的那一段今天不会有任何判据看见。
+    #[test]
+    fn the_render_side_margin_strictly_covers_the_splice_side_slice() {
+        const SR_FRAMES: i64 = 600;
+        let base_len = 600usize * 960;
+        let spf = base_len as f64 / SR_FRAMES as f64;
+        let j = DeadJob { shift: -6, start: 200, end: 260 };
+        let splice = donor_read_span(&j, spf, base_len, MERGE_BRIDGE_FRAMES).unwrap();
+        let render = donor_keep_samples_with(&[(j.start, j.end)], base_len, SR_FRAMES, true);
+        assert_eq!(render.len(), 1);
+        let (ra, rb) = render[0];
+        assert!(ra <= splice.0 && rb >= splice.1, "渲染侧 {ra}..{rb} 没盖住拼接侧 {splice:?}");
+        assert!(ra < splice.0 && rb > splice.1, "两侧余量一样宽 —— join_rests 挪出去那一段没人管");
+        // 边界写字面量(⛔ 不许拿被测的常量算期望值):25 帧 = 24000 样本,29 帧 = 27840 样本。
+        assert_eq!(splice, (200 * 960 - 24_000, 260 * 960 + 24_000));
+        assert_eq!((ra, rb), (200 * 960 - 27_840, 260 * 960 + 27_840));
+        // 空窗 ⇒ 空保留区 ⇒ 整条缓冲 = 今天(⛔ 失败方向必须是「多做」)。
+        assert!(donor_keep_samples_with(&[], base_len, SR_FRAMES, true).is_empty());
+        // 相邻/重叠的窗必须合并(引擎那边每个岛都要扫一遍这张表)。
+        let merged = donor_keep_samples_with(&[(100, 160), (170, 220)], base_len, SR_FRAMES, true);
+        assert_eq!(merged.len(), 1, "隔 10 帧(< 2×29)的两条窗没有被合并:{merged:?}");
     }
 
     #[test]
@@ -3937,7 +4288,7 @@ mod tests {
     #[test]
     fn changing_a_production_default_forces_a_paired_version_bump() {
         let fp = format!(
-            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={}",
+            "trim={:?} landing={:?} ratio2={} depth={} frac={} win={} xgrain={} lpc={}              hp={} hp_ms={} envfix={} bridge={} lock={} kappa={} join={} wininv={}",
             TRIM_DEFAULT,
             LANDING_DEFAULT,
             LANDING_RATIO_TWO_ST,
@@ -3953,10 +4304,14 @@ mod tests {
             parse_phase_lock(None),
             DEFAULT_FORMANT_KAPPA,
             parse_join_rests(None),
+            // S159 —— ⚠ 这一个进指纹,但它**不该**触发版本 bump:它不改音频,只改秒数
+            //    (理由与那三条承重判据写在 `windowed_inverse()` 的 doc 里)。
+            //    进指纹的意义是「下一个人翻它的时候必须来这里改一行,于是不得不读那段 doc」。
+            parse_windowed_inverse(None),
         );
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
         const TAG: &str = "s158b";
@@ -4006,6 +4361,7 @@ mod tests {
             ("WIN_PERIODS_DEFAULT", "pub fn win_periods("),
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
+            ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -4555,6 +4911,67 @@ mod tests {
                     + 0.2 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
             })
             .collect()
+    }
+
+    /// S159 —— ⭐⭐ **窗真的穿过了生产那道门,而且「窗切不到岛」不许被报成一条红。**
+    ///
+    /// 三件,每件都对应一个会静默出错的地方:
+    /// ⑴ **接线**:`apply_inverse_windowed` 给了窄窗,输出必须与整条臂**不同** ——
+    ///    否则 `keep` 在某一层被丢掉了,而结果是「音频完全正确、只是慢一倍」,
+    ///    上面每一条判据都照绿(S142 那族:第一条判据必须是存在性/接线闸);
+    /// ⑵ **窗内逐位**:同一批样本必须与整条臂逐位相同(引擎那侧已经钉过,这里钉的是**这条路**);
+    /// ⑶ **归因**:窗落在没有岛的地方 ⇒ 必须 `Ok(原样)` 而**不是**
+    ///    `Err(RANGE_INVERSE_NO_PITCH)`。⛔ 那条错误是给「模型没给 f0」留的;两者报成同一条红,
+    ///    第二次出现一定被耸肩带过(S129,而这条线上已经出过两次)。
+    ///    ⚠ 这条新分支是**真的被触发过一次**的,不是写完就放着(S129 同一条:一条从没被执行过的
+    ///    错误分支就是一条空判据)。
+    #[test]
+    fn the_window_reaches_the_engine_and_an_empty_window_is_not_an_error() {
+        let sr = 44_100u32;
+        let hop = sr as usize / 100;
+        // 两段浊音,中间 0.4 s 真休止(f0 = 0)——「窗切不到任何岛」才有地方落脚。
+        let seg = inverse_probe_tone(sr, 0.30);
+        let gap = vec![0.0f32; (sr as f64 * 0.40) as usize];
+        let mut x = seg.clone();
+        x.extend_from_slice(&gap);
+        let isl2 = x.len();
+        x.extend_from_slice(&seg);
+        let mut f0 = vec![0.0f32; x.len() / hop + 2];
+        for (i, v) in f0.iter_mut().enumerate() {
+            let s = i * hop;
+            if s < seg.len().saturating_sub(hop) || (s >= isl2 + hop && s + hop < x.len()) {
+                *v = 220.0;
+            }
+        }
+        let fed = Some((f0.as_slice(), hop));
+        let full = apply_inverse_with(InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed)
+            .expect("整条臂必须成功");
+        // ⑴ + ⑵ —— 窗只盖第一段。
+        let keep = [(0usize, seg.len())];
+        let win = apply_inverse_windowed_with(
+            InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed, &keep,
+        )
+        .expect("窗臂必须成功");
+        assert_ne!(win, full, "窄窗与整条臂逐位相同 —— `keep` 在某一层被丢掉了,提速是假的");
+        assert_eq!(&win[..seg.len()], &full[..seg.len()], "窗内不是逐位相同");
+        // ⑶ —— 窗落在休止正中(离两段浊音都够远),必须 Ok 且**原样返回**。
+        let mid = seg.len() + gap.len() / 2;
+        let empty = apply_inverse_windowed_with(
+            InverseEngine::Psola, x.clone(), sr, -6, 0.0, fed,
+            &[(mid, mid + hop)],
+        );
+        assert_eq!(empty.as_deref(), Ok(x.as_slice()), "窗切不到岛时必须原样返回,而不是报错");
+        // ⛔ 阴性对照:同一条路上「真的没有音高」仍然必须响亮失败 —— 否则 ⑶ 只是把那条闸拆了。
+        let silent = vec![0.0f32; f0.len()];
+        assert_eq!(
+            apply_inverse_windowed_with(
+                InverseEngine::Psola, x, sr, -6, 0.0, Some((&silent, hop)), &keep,
+            )
+            .err()
+            .as_deref(),
+            Some("RANGE_INVERSE_NO_PITCH"),
+            "没有 f0 的时候必须还是那条红 —— 两种失败不许合并"
+        );
     }
 
     #[test]
@@ -5396,9 +5813,20 @@ mod tests {
             }
         }
         // …and this module really is the only place that names an engine.
+        //
+        // ⛔⛔ S159 —— **这两行以前有一行是恒真的。**`include_str!("vocal_range.rs")` 把断言
+        // **自己**读了进来,所以只要断言里写着那个字面量,`contains` 就一定成立。当时写的是
+        // `psola_shift_formant`,而全文件里那个名字**只出现在断言自己那一行**(真正的调用是
+        // `psola_shift_win`)—— 也就是说:把引擎调用整个删掉,这条判据照绿。
+        // ⇒ 期望的符号用 `concat!` 拼出来,源码里就不存在那个字面量,自证的路被堵死。
+        // ⚠ 同族提醒:凡是 `include_str!(自己)` 的判据,断言里出现的每一个字面量都要这样处理。
         let me = include_str!("vocal_range.rs");
-        assert!(me.contains("utai_dsp::psola::psola_shift_formant"));
-        assert!(me.contains("utai_stretch::stretch_interleaved"));
+        for want in [
+            concat!("utai_dsp::psola::psola_shift", "_win("),
+            concat!("utai_stretch::stretch", "_interleaved("),
+        ] {
+            assert!(me.contains(want), "vocal_range 里找不到引擎调用 {want} —— 执行点被搬走了?");
+        }
     }
 
     /// Apply ONLY the inverse to a wav on disk, through the production entry point.

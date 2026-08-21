@@ -2048,17 +2048,26 @@ pub async fn render_vocal_segment(
                     // ⚠ 这一笔**会改今天的输出**:逐 shift 一个常数(实测 −0.114/+0.064/−0.280/
                     // −0.056 dB),低于 ~1 dB 的电平 JND 但高于逐 chunk 电平地板 0.004 dB 二十倍。
                     let base_peak = result.pre_norm_peak;
+                    // S159 —— 帧→样本的地图只有这里有(`total_frames` = Σ 谱面帧),所以保留区间
+                    // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
+                    let base_len = result.audio.len();
 
                     crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
+                        let keep_samples = crate::inference::vocal_range::donor_keep_samples(
+                            own_windows, base_len, total_frames,
+                        );
                         score2svc::render_score_sovits(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &sv,
                             VOCAL_FLAT_VOL, shaping, transpose, s, f0.as_ref(), loud, formant, &cancel,
                             &donor_progress,
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
+                                // S159 窗内逆变换:与 `windows` 同一批窗、同一个 filter 的产物,
+                                // 换算成样本并加上渲染侧余量。见 `donor_keep_samples`。
+                                keep_samples: &keep_samples,
                                 // S147 B2:只渲**这一遍**会被拼回去的那些 chunk。
                                 // ⛔ S148:这个列表现在由 `apply_dead_only_windows` 传进来,
                                 // 因为它必须与那边拼接时用的 filter 是**同一个谓词**。以前这里
@@ -2155,17 +2164,26 @@ pub async fn render_vocal_segment(
                     // S147:与 SoVits 臂同一口径(机理注释见彼处)—— donor 共用 base 的归一前峰,
                     // `match_levels` 因此不再需要。
                     let base_peak = result.pre_norm_peak;
+                    // S159 —— 帧→样本的地图只有这里有(`total_frames` = Σ 谱面帧),所以保留区间
+                    // 在这里算好传下去;渲染函数内部拿不到分母,现算一遍就是造第二份地图。
+                    let base_len = result.audio.len();
 
                     crate::inference::vocal_range::apply_dead_only_windows(&mut result.audio, sr, total_frames, &range_windows, false, |s, own_windows| {
                         pass.set(pass.get() + 1);
                         let off = pass.get() as f32;
                         let donor_progress = |p: f32| progress((off + p) / range_passes as f32);
+                        let keep_samples = crate::inference::vocal_range::donor_keep_samples(
+                            own_windows, base_len, total_frames,
+                        );
                         score2svc::render_score_rvc(
                             &model, &s2cv_sid, &score_ref, dim, cv_speaker_id, &g2p::GlobalDicts, &rv,
                             shaping, transpose, s, f0.as_ref(), loud, formant, &cancel,
                             &donor_progress,
                             base_peak.map(|p| score2svc::DonorCtx {
                                 norm_peak_target: p,
+                                // S159 窗内逆变换:与 `windows` 同一批窗、同一个 filter 的产物,
+                                // 换算成样本并加上渲染侧余量。见 `donor_keep_samples`。
+                                keep_samples: &keep_samples,
                                 // S147 B2 / S148:同 SoVits 臂 —— 这一遍自己的窗由
                                 // `apply_dead_only_windows` 传进来,与它拼接时用的是同一个谓词。
                                 // 机理与那次 hotfix 的血训写在 SoVits 臂与 `apply_dead_only_windows`
