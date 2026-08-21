@@ -640,8 +640,41 @@ pub fn dead_only_plan_with(
                 i = j + 1;
                 continue;
             };
-            let (first_dead, last_dead) = (dead_at[0], *dead_at.last().unwrap());
-            let (mut a, mut b) = (i, j);
+            // ── S159z —— 先把这一句的死音切成**簇**:相邻两个死音之间夹着
+            // ≥ [`SPLIT_MIN_INTERIOR_NOTES`] 个可唱音,就在那里断开(定价见那份 doc)。
+            // ⛔ 「这一句救不救」仍然由**整句**的 `whole_shift` 决定(上面那条 `else` 分支),
+            //    拆簇只改**谁陪着走多深**,不改**哪些音被救** —— 由
+            //    `splitting_never_changes_which_notes_are_rescued` 钉住。
+            let clusters: Vec<(usize, usize)> = {
+                let mut v = Vec::new();
+                let (mut cs, mut prev) = (dead_at[0], dead_at[0]);
+                for &d in &dead_at[1..] {
+                    // 同一句内两个死音之间全是可唱音(休止会先把句子断开)⇒ 直接数下标差。
+                    if d - prev - 1 >= SPLIT_MIN_INTERIOR_NOTES {
+                        v.push((cs, prev));
+                        cs = d;
+                    }
+                    prev = d;
+                }
+                v.push((cs, prev));
+                v
+            };
+            let n_clusters = clusters.len();
+            for (ci, &(cluster_first, cluster_last)) in clusters.iter().enumerate() {
+            // 这一簇可以占到多宽。⛔⛔ **内部的那一侧一格都不许往夹心里伸** ——
+            // 第一版写成「伸到邻簇的死音前一格」,那样相邻两簇会把夹心**同时认领**,
+            // 拼接器会把同一段材料贴两次。而且伸进去本来就与这一刀的意图相反:
+            // 夹心整段留在 base 才是目的。
+            // ⇒ 只有**句首那一侧**和**句尾那一侧**保留 S151 的裁剪逻辑;
+            //   只有一簇时 `(lo, hi) == (i, j)`,与 S159z 之前逐位相同。
+            let lo = if ci == 0 { i } else { cluster_first };
+            let hi = if ci + 1 == n_clusters { j } else { cluster_last };
+            let dead: Vec<i64> = (cluster_first..=cluster_last)
+                .filter(|&k| !range.slot_singable(eff(note_nums[k])))
+                .map(|k| eff(note_nums[k]))
+                .collect();
+            let (first_dead, last_dead) = (cluster_first, cluster_last);
+            let (mut a, mut b) = (lo, hi);
             if let Some((head_ms, tail_ms)) = trim {
                 // ⛔⛔ S158 —— **一刀只有在它自己造出来的那条缝落得下去的时候才许下。**
                 //
@@ -685,23 +718,29 @@ pub fn dead_only_plan_with(
                 // ⇒ 裁剪的真实作用是**减少落在 donor 里的音符交界数**。挡掉裁剪 = 把 4 个乘客
                 //    连同它们的 3 个交界一起拖进 donor ⇒ 多出 2 个可闻的坑。**方向是反的。**
                 // ⇒ 今天:该裁就裁,不看接点音程。真正要修的是 ⑴ 那个塌陷本身(还没定位到层)。
-                let (freed_head, freed_tail) = (ms(i, first_dead), ms(last_dead + 1, j + 1));
+                let (freed_head, freed_tail) = (ms(lo, first_dead), ms(last_dead + 1, hi + 1));
                 if freed_head >= head_ms && guard_ok(first_dead.checked_sub(1), whole_shift) {
                     a = first_dead;
                 }
                 if freed_tail >= tail_ms && guard_ok(Some(last_dead + 1), whole_shift) {
                     b = last_dead;
                 }
-                if (a, b) != (i, j) {
+                if (a, b) != (lo, hi) {
                     tracing::info!(
-                        "range: phrase notes[{i}..={j}] rescued as [{a}..={b}] — dropped {:.2}s of \
+                        "range: phrase notes[{lo}..={hi}] rescued as [{a}..={b}] — dropped {:.2}s of \
                          passengers at the head, {:.2}s at the tail",
-                        if a > i { freed_head } else { 0.0 } / 1000.0,
-                        if b < j { freed_tail } else { 0.0 } / 1000.0,
+                        if a > lo { freed_head } else { 0.0 } / 1000.0,
+                        if b < hi { freed_tail } else { 0.0 } / 1000.0,
                     );
                 }
             }
-            let shift = if (a, b) == (i, j) {
+            // ⛔⛔ S159z —— 条件里的 `n_clusters == 1` 不是装饰:原来写的是「只有裁剪动过
+            // 边界才重求落点」,于是一个**本来就等于自己死音段**的簇(`(a, b) == (lo, hi)`)
+            // 会直接继承**整句**的 `whole_shift` —— 正好把这一刀的意义抵消掉。
+            // 判据 `an_interior_run_of_three_singable_notes_splits_the_phrase` 当场读到
+            // 「−12 vs −12」把它抓了出来。
+            // ⇒ 只有「一整句就是一簇、而且没裁过」才走继承那条路(那条路与 S159z 之前逐位相同)。
+            let shift = if n_clusters == 1 && (a, b) == (lo, hi) {
                 whole_shift
             } else {
                 // The landing is re-solved against the notes that ACTUALLY ride along — the
@@ -719,12 +758,83 @@ pub fn dead_only_plan_with(
                 }
                 s
             };
+            if n_clusters > 1 {
+                tracing::info!(
+                    "range: phrase notes[{i}..={j}] split into {n_clusters} groups — this one is                      [{a}..={b}] at {shift:+} st (the whole phrase would have been {whole_shift:+})"
+                );
+            }
             out.push(DeadGroup { start: a, end: b, shift });
+            }
         }
         i = j + 1;
     }
     (out, unfixable)
 }
+
+/// S159z —— **句内拆组**:一段夹在两个死音【之间】的可唱音,至少这么多个音才值得把组拆开。
+///
+/// ## ⛔ 为什么需要它:裁剪只卸得掉两头的乘客,卸不掉夹心
+///
+/// [`dead_only_plan_with`] 按休止分乐句,整句取一个位移(`worst()` 对「死音 ∪ 乘客」取 max)。
+/// S151 的卸乘客把**两头**的乘客切掉了,但一段可唱音如果**夹在两个死音中间**,无论怎么裁都跟着走。
+/// 用户 2026-08-21 点名的那一处正是这个形状(炉心融解 +7 × yachiyo,`notes[685..=693]`,位移 −15):
+///
+/// | 音 | 原谱 | +7 后 | 它自己需要 | 实际被拖 | 白丢的高频 |
+/// |---|---|---|---|---|---|
+/// | `[685]` | 83 | 90 | 15 | 15 | 0 dB |
+/// | `[686]` | 73 | 80 | 5 | 15 | 13.1 dB |
+/// | `[687]` | 71 | 78 | 3 | 15 | 15.7 dB |
+/// | **`[688]`** | **68** | **75** | **0** | **15** | **19.7 dB** |
+/// | **`[689..692]`** | **61-64** | **68-71** | **0** | **15** | **19.7 dB** |
+/// | `[693]` | 73 | 80 | 5 | 15 | 13.1 dB |
+///
+/// ⇒ 组里**只有第一个音真的需要救**,后面五个音本来就在音域内,却陪着下潜 15 个半音。
+/// 用户听到的是「ぴゃ 中间整个糊成一团」。
+///
+/// ## ⭐⭐⭐ 那 19.7 dB 是量出来的,不是估的(S159z 的三方对照)
+///
+/// 同一批音、同一个模型、同一个音高,唯一差别是走没走扩展(`native` / `donor pre` / `donor post`;
+/// 离线台子在没被碰的素材上**逐位相同** ⇒ 噪声地板 = 0):
+///
+/// | 频段 | 总成本 | 其中 PSOLA | 其中 donor 自己 |
+/// |---|---|---|---|
+/// | 5-8 kHz | −13.32 dB | −2.84 | **−10.48** |
+/// | 8-16 kHz | −12.51 | −1.93 | **−10.58** |
+/// | 60-150 Hz | +19.5 | +4.07 | **+15.41** |
+///
+/// 而「donor 自己」那一栏又被**整曲移调 −8 的原生渲染**钉死:`donor − low8 = **+0.00 dB**`
+/// (每一档都是零)⇒ donor 渲染路径没有损伤任何东西(只渲相交 chunk 那套优化是严格恒等的),
+/// **那 10.5 dB 完全是「模型低唱 8 度」的内禀代价**。
+/// ⇒ **定价:每往低渲 1 个半音 ≈ 高频 −1.31 dB + 次基频 +2.93 dB。**
+///
+/// ## 为什么门限是 3 个音,而且不是品味
+///
+/// 拆开会**新增 2 条边**,同时把该段自己的 `n−1` 个音符交界**移出 donor** ——
+/// 而 S159g 量到的那种 ~40 ms、−2…−4 dB、谱心塌 20-30% 的塌陷,正是发生在 donor 内部的交界上。
+/// ⇒ 判据 = 「移出去的交界 ≥ 新增的交界」⇔ `n − 1 ≥ 2` ⇔ **n ≥ 3**。实测(HF 按 1.31 dB/半音折算):
+///
+/// | 门限 | yachiyo +7 | akiko +7 | yachiyo 原 key |
+/// |---|---|---|---|
+/// | 音数 ≥2 | 20 处 / 189 dB·s / 交界 **−24** | 16 / 107 / −17 | 13 / 47 / **+7** |
+/// | **音数 ≥3** | **12 处 / 153 dB·s / −32** | **11 / 86 / −22** | **6 / 25 / ±0** |
+/// | 音数 ≥4 | 10 / 131 / −32 | 8 / 81 / −22 | 0 / 0 / ±0 |
+///
+/// ⇒ ≥3 在三种配置上**两条轴同时改善**(≥2 会让原 key 的交界变多,≥4 白白少收 22 dB·s)。
+/// ⭐ 顺带解释了「原 key 干净、+7 炸」:陪绑量随移调量放大(原 key 25 dB·s vs +7 153)。
+///
+/// ## ⛔⛔ 它翻掉了一条已登记的决定,原话抄在这里
+///
+/// [`parse_trim`] 的 doc 里写着:「⇒ **下一步是【缝处的局部电平匹配】,不是调门限、
+/// 不是换裁哪一侧,更不是先去拆句。**」—— 那句话是在**深度还没有价格**的时候写的:
+/// 当时秤上只有「拆句新增的电平缝 p50 3.023 dB」,看不见「不拆要白丢 19.7 dB 高频、
+/// 而且 donor 里的交界反而**多 32 条**」。⇒ 证据变了,结论跟着变;
+/// ⚠ **那条「缝处局部电平匹配」仍然是对的、仍然欠着**(根因 = base 与 donor 只共用一个
+/// 【全曲】归一标量),它和这一刀不冲突 —— 做完它,这一刀只会更划算。
+///
+/// ⛔ **别在这里加「按接点音程决定拆不拆」的规矩**:S159f 在裁剪上加过一条同族的,
+/// 用户实机一听更糟(见 [`dead_only_plan_with`] 里那段 ⛔⛔⛔)。机理是一样的 ——
+/// 拦住拆分 = 把更多材料留在 donor 里,**方向是反的**。
+const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
 
 /// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = **头尾都裁 500 ms**(S158f;`=0` 渲旧臂)
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
@@ -4685,6 +4795,129 @@ mod tests {
         .unwrap()
     }
 
+    /// ⭐⭐⭐ S159z 主刀 —— **夹在两个死音中间的可唱段,够长就把组拆开**。
+    ///
+    /// 机理与定价在 [`SPLIT_MIN_INTERIOR_NOTES`] 的 doc(用户点名的 `notes[685..=693]`:
+    /// 组里只有第一个音真的需要救,后面五个音在音域内却陪着下潜 15 个半音 = 每个白丢 19.7 dB 高频)。
+    ///
+    /// ⛔ 三条阴性对照,少一条这条判据就可能是「恒真」:
+    /// ⑴ **夹心 2 个音必须不拆**(移出去的交界 1 < 新增的边 2)—— 门限真的在起作用;
+    /// ⑵ **被救的死音一个不许多、一个不许少** —— 拆组只改「谁陪着走多深」;
+    /// ⑶ **拆出来的两组不许重叠** —— 第一版就是在这里错的(邻簇同时认领夹心 ⇒ 贴两次)。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过):
+    /// * `SPLIT_MIN_INTERIOR_NOTES` 改成 4 ⇒ ⑵ 读出一组,**红**;
+    /// * `lo`/`hi` **两侧一起**改回第一版的越界写法(`clusters[ci ∓ 1]` 那两行)
+    ///   ⇒ ⑶ 的**裁剪关掉那一臂**读到 `[1..6]` 与 `[4..7]` 重叠,**红**。
+    ///   ⚠ 只改 `hi` 一侧不会重叠,而且**只在出厂臂上断言的话连两侧一起改也是绿的**
+    ///   —— 出厂裁剪会把边界收回去。这条判据一开始就是那样写的,是个空判据;
+    /// * 把 `dead` 从簇改回整句 ⇒ 第二组读 −15 而不是 −5,深度那条断言**红**。
+    #[test]
+    fn an_interior_run_of_three_singable_notes_splits_the_phrase() {
+        let r = pya_like();
+        let plan = |p: &[i64]| {
+            let f = secs(p.len());
+            dead_only_plan_with(p, &f, 0, &r, RescueTuning::today()).0
+        };
+
+        // ⑴ 阴性对照:夹心只有 2 个音 ⇒ 不许拆。
+        let two = [0, 90, 80, 78, 75, 68, 80, 0];
+        assert_eq!(plan(&two).len(), 1, "夹心 2 个音:移出去的交界(1)< 新增的边(2)⇒ 不许拆");
+
+        // ⭐ 夹心 3 个音 ⇒ 拆成两组,而且**夹心一个音都不在任何一组里**。
+        let three = [0, 90, 80, 78, 75, 68, 71, 80, 0];
+        let g = plan(&three);
+        assert_eq!(g.len(), 2, "夹心 3 个音 ⇒ 拆成两组(读到 {g:?})");
+        assert_eq!((g[0].start, g[0].end), (1, 3), "第一组 = 前三个死音");
+        assert_eq!((g[1].start, g[1].end), (7, 7), "第二组 = 最后那个死音");
+        for k in 4..=6 {
+            assert!(
+                !g.iter().any(|d| (d.start..=d.end).contains(&k)),
+                "夹心音 {k} 必须留在 base —— 它本来就唱得动"
+            );
+        }
+
+        // ⑶ ⛔⛔ **不许重叠**(第一版就是在这里错的:邻簇同时认领夹心 ⇒ 拼接器贴两次)。
+        //
+        // ⚠ 这一条**必须在裁剪关掉的臂上**量。写这条判据时我先只在出厂臂上断言,
+        // 拿第一版那两行去做变异 —— **绿的**:出厂裁剪(头尾各 500 ms)会把两簇的边界
+        // 各自收回自己的死音段,正好把重叠盖住 ⇒ 那条断言当时是**空判据**。
+        // ⇒ 关掉裁剪,越界写法就直接露出来。
+        assert!(g[0].end < g[1].start, "拆出来的组不许重叠:{g:?}");
+        let untrimmed =
+            dead_only_plan_with(&three, &secs(three.len()), 0, &r, RescueTuning::new(None, None)).0;
+        assert_eq!(untrimmed.len(), 2, "裁剪关掉也要拆成两组(读到 {untrimmed:?})");
+        assert!(
+            untrimmed[0].end < untrimmed[1].start,
+            "裁剪关掉时更不许重叠(内部那一侧本来就一格都不许伸):{untrimmed:?}"
+        );
+        assert_eq!(
+            (untrimmed[0].start, untrimmed[0].end, untrimmed[1].start, untrimmed[1].end),
+            (1, 3, 7, 7),
+            "裁剪关掉时,内部簇的边界就是它自己的死音段"
+        );
+
+        // ⑵ 被救的死音一个不许多、一个不许少 —— 与不拆的那一版比对同一批下标。
+        let dead_of = |p: &[DeadGroup], src: &[i64]| {
+            let mut v: Vec<usize> = p
+                .iter()
+                .flat_map(|d| d.start..=d.end)
+                .filter(|&k| src[k] > 0 && !r.slot_singable(src[k]))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(dead_of(&g, &three), vec![1, 2, 3, 7], "四个死音全都还在,而且没多出别的");
+
+        // ⭐ 拆开之后每一簇**各自**求落点 ⇒ 只需要浅救的那一簇不再被顶音拖下去。
+        //
+        // ⛔ 这里**不能**直接断言「第二组更浅」:落点旋钮(出厂 `Some(3)`)本来就允许
+        // 为了更干净的落点往深里多看几个半音,而这个夹具的 `low_ratio` 恰好偏深 ——
+        // 写这条判据时我先写成 `g[1] < g[0]`,真跑读到 **−14 vs −14**,是**判据错了不是代码错了**。
+        // ⇒ 要量的是「**需求**上的差」,所以把落点旋钮关掉再看一次:那一档
+        // `minimal_rescue_shift` 取**最浅的合格位移**,两簇的差就是纯粹的需求差。
+        let bare = dead_only_plan_with(
+            &three,
+            &secs(three.len()),
+            0,
+            &r,
+            RescueTuning::new(Some((TRIM_HEAD_MS, TRIM_TAIL_MS)), None),
+        )
+        .0;
+        assert_eq!(bare.len(), 2, "落点关掉也要拆成两组(读到 {bare:?})");
+        assert!(
+            bare[1].shift.abs() < bare[0].shift.abs(),
+            "顶音 80 那一簇的**需求**必须明显浅于顶音 90 那一簇,读到 {} vs {}",
+            bare[1].shift,
+            bare[0].shift
+        );
+        // ⛔ 78 而不是 76:76 只有**开着落点旋钮**才够得着(见
+        // `a_passenger_may_not_veto_the_landing_the_dead_note_needs` 的 ⑴/⭐ 两臂),
+        // 这一档旋钮是关的 ⇒ 两簇都停在最浅的合格落点 78。写这条判据时我先写成 76,
+        // 真跑读到 `(78, 78)` —— 又是**判据错了不是代码错了**。
+        assert_eq!(
+            (90 + bare[0].shift, 80 + bare[1].shift),
+            (78, 78),
+            "两簇各自停在最浅的合格落点(78)—— 边界写死成字面量,不许引用被测的常量"
+        );
+        // ⭐⭐⭐ 这一刀买到的就是这两个数之差:顶音 90 那一簇要 −12,而只有一个 80 的那一簇
+        // 只要 **−2**。不拆的话后者会跟着走 −12 ⇒ 白白多渲低 **10 个半音 = 高频 −13.1 dB**
+        // (定价见 [`SPLIT_MIN_INTERIOR_NOTES`])。
+        assert_eq!((bare[0].shift, bare[1].shift), (-12, -2), "省下来的正是这 10 个半音");
+        // 而且**没有任何一组**比整句一起救还深 —— 拆组只会让深度变浅或不变。
+        let whole: Vec<i64> = (1..=7).map(|k| three[k]).collect();
+        let dead: Vec<i64> = whole.iter().copied().filter(|&p| !r.slot_singable(p)).collect();
+        let whole_shift =
+            minimal_rescue_shift_capped(&dead, &whole, &r, RescueTuning::today().landing, LANDING_RATIO_TWO_ST)
+                .expect("整句本来就有落点");
+        for d in &g {
+            assert!(
+                d.shift.abs() <= whole_shift.abs(),
+                "拆出来的组 {d:?} 比整句({whole_shift:+})还深 —— 拆组只许让深度变浅或不变"
+            );
+        }
+    }
+
     /// ⭐⭐ S157 主刀 —— **一个乘客的 damage 不许否决死音的落点**。
     ///
     /// 今天的 `worst` 对 **死音 ∪ 乘客** 取 max,于是用户听出问题的那个音卡在落点 78:
@@ -4703,9 +4936,19 @@ mod tests {
     /// * [`LANDING_RATIO_TWO_ST`] 退回 12 或 13 ⇒ 读 −12 / −13,**红**;
     /// * 把 MIDI 54/61 的 `low_ratio` 降到 0.20(= 拿掉被测机理)⇒ 开与关都读 −14,
     ///   ⑶ 那条阴性对照当场**红** ⇒ 说明它真的在盯着「乘客否决」这件事。
+    /// ⚠⚠ **S159z 把这个夹具的「夹心」从 5 个音缩到 2 个 —— 不是为了让它变绿。**
+    ///
+    /// [`SPLIT_MIN_INTERIOR_NOTES`] 落地之后,原来那个 `[.., 75, 68, 71, 70, 71, ..]`
+    /// 正好是**要被拆开**的形状 ⇒ 五个乘客会被整段留在 base,而这条判据钉的
+    /// 「**乘客**否决落点」在那个夹具上**结构上不会再发生** ⇒ 照着新结果改期望值
+    /// 会把它变成一条**空判据**(S129 那一族血训)。
+    /// ⇒ 正确的改法是把夹心缩到 2 个音(不触发拆组),机理原样保留:
+    /// 那两个乘客在 −14 上仍然落到 MIDI **61 / 54**(`low_ratio` 0.572 / 0.573),
+    /// 仍然是唯一能否决 −14 的东西 —— ⑶ 那三条阴性对照逐条仍然有牙。
+    /// ⭐ 拆组本身另有判据:[`an_interior_run_of_three_singable_notes_splits_the_phrase`]。
     #[test]
     fn a_passenger_may_not_veto_the_landing_the_dead_note_needs() {
-        let phrase = [0, 90, 80, 78, 75, 68, 71, 70, 71, 80, 0];
+        let phrase = [0, 90, 80, 78, 75, 68, 80, 0];
         let fr = secs(phrase.len());
         let r = pya_like();
 
@@ -4714,7 +4957,7 @@ mod tests {
         let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, None));
         assert_eq!(
             today,
-            vec![DeadGroup { start: 1, end: 9, shift: -12 }],
+            vec![DeadGroup { start: 1, end: 6, shift: -12 }],
             "默认臂必须逐字是今天:顶音 90 停在落点 78"
         );
 
@@ -4722,7 +4965,7 @@ mod tests {
         let (on, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, Some(3)));
         assert_eq!(
             on,
-            vec![DeadGroup { start: 1, end: 9, shift: -14 }],
+            vec![DeadGroup { start: 1, end: 6, shift: -14 }],
             "开着:顶音必须够得着 76(low_ratio 0.21),而不是被两个乘客的 0.17 damage 挡在 78"
         );
         assert_eq!(90 + on[0].shift, 76, "落点写死成字面量 —— 边界不许引用被测的常量");
@@ -4738,16 +4981,16 @@ mod tests {
             v
         };
         assert_eq!(dead_of(&today), dead_of(&on), "被救的死音一个不许多、一个不许少");
-        assert_eq!(dead_of(&on), vec![1, 2, 3, 9], "而且就是那四个(90 / 80 / 78 / 80)");
+        assert_eq!(dead_of(&on), vec![1, 2, 3, 6], "而且就是那四个(90 / 80 / 78 / 80)");
 
         // ⑶ ⛔⛔ **夹具有效性** —— 少了这一段,上面那个 −14 可能只是「−12 从来没被谁挡过」。
         //    这里直接把被测机理量出来:同一个 `damage_at`,同一批音高。
         let worst = |set: &[i64], s: i64| -> f32 {
             set.iter().map(|&p| r.damage_at((p + s) as f32).unwrap_or(DAMAGE_MAX)).fold(0.0, f32::max)
         };
-        let pax = [75i64, 68, 71, 70, 71];
+        let pax = [75i64, 68];
         let dead = [90i64, 80, 78, 80];
-        assert_eq!(worst(&pax, -12), 0.0, "−12 上五个乘客必须全都干净");
+        assert_eq!(worst(&pax, -12), 0.0, "−12 上两个乘客必须全都干净");
         assert!(
             worst(&pax, -14) > LANDING_DAMAGE_EPS,
             "−14 上乘客的 damage 必须真的越过容差(读到 {:.4},容差 {LANDING_DAMAGE_EPS}),\
@@ -4954,7 +5197,7 @@ mod tests {
             "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=3 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159c";
+        const TAG: &str = "s159d";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
