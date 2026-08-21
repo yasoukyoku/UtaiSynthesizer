@@ -1382,6 +1382,9 @@ const COVER_EDGE_SEEK_MS: f32 = 300.0;
 ///
 /// ⛔ 为什么只合并**同位移**:合并本身能直接减少边的条数(边才是用户听到的那个台阶),
 /// 而「位移相同」这一条让它**深度上一分不花** —— 没有任何一段会被拖得比它自己需要的更深。
+/// ⚠⚠ **S159p 收窄**:上面那句对**段**成立,对**两段之间那截被吞进来的材料**不成立 ——
+/// 它们从来没有被任何谓词看过。⇒ 合并现在还要过 `bridge_ok`(中间不含无解区间 +
+/// 中间每个浊帧移位后仍 `slot_reachable`),详见 `cover_dead_plan` 里那一段。
 /// ⚠ 允许深度差之后能收掉的边多得多(实测:差 ≤1 度 / 0.5 s ⇒ 107 → 82 段),
 /// 但那要付「把浅段拖深」的钱,而**那笔钱没有量过** ⇒ 不在这里花。
 ///
@@ -1623,15 +1626,47 @@ pub fn cover_dead_plan(
         }
     }
 
-    // ── S159n ⑴ —— **同位移的相邻段合并**(深度免费,见 `COVER_MERGE_SAME_SHIFT_MS`)。
+    // ── S159n ⑴ —— **同位移的相邻段合并**(见 `COVER_MERGE_SAME_SHIFT_MS`)。
     // ⛔ 放在最后做:合并要看的是**落点算完之后**的位移,而不是分组时的形状。
-    // ⚠ 合并会让两段之间那截材料也进 donor(乘客),实测这一步只多 2.5 s。
+    //
+    // ⛔⛔⛔ **S159p:第一版漏了护栏,而谱面轨的同款函数本来就有。**
+    // `merge_same_shift_across_rests`(本文件)只在**中间全是休止**时才合并
+    // (`((pe + 1)..g.start).all(|k| note_nums[k] <= 0)`)—— 它靠「只跨休止」躲开了下面这件事。
+    // cover 没有休止的概念,于是第一版只比了位移与帧距,**把两段之间那截材料直接吞进 donor
+    // 而从不重算一次落点**。那截材料**从来没有被任何谓词看过**,后果有两种,都被独立审计
+    // 逐行核验过:
+    // ⑴ 中间那截的乘客移位之后可能掉出 `slot_reachable` —— 合并做出了**计划器本人会判「无解」
+    //    的窗**。反例(fps=100,`bounds((48,84),(52,79))`):
+    //    `[0]*20 + hz(88)*40 + hz(50)*30 + hz(88)*40 + [0]*20` ⇒ 两组各 −9、相距 30 帧 ⇒ 合并成
+    //    `{-9, 20, 130}`,而中间 30 帧 MIDI 50 被渲成 **41**,usable 底是 48。
+    // ⑵ 中间那截可能正是一段刚被判 `unfixable` 的区间。被盖住之后,审计还在打
+    //    「has NO landing … rendered broken as-is」,而拼接器实际按邻居的位移渲了它 ——
+    //    **日志那句话是假的**。⛔ 这正是「一条闸的红必须能被归因 / 跑不起来不许被读成通过」要挡的形状。
+    // ⚠ 顺带:`back`/`fwd` 在同一份材料上是**明确拒绝**吞掉这截的(seek 上限 + 够不着就不动),
+    //    而第一版的合并无条件吞掉 800 ms —— 两把刀的方向是相反的。
+    // ⇒ 合并前必须过两道:中间不许含无解区间,且中间每一个浊帧移位后都得 `slot_reachable`。
     let merge_gap = frames_for(COVER_MERGE_SAME_SHIFT_MS, fps) as i64;
     out.sort_by_key(|j| (j.start, j.end));
+    let bridge_ok = |p_end: i64, j_start: i64, shift: i64| -> bool {
+        // ⑵ 中间盖住了一段「无解」⇒ 不许合并(否则那条审计行就是假的)。
+        if unfixable.iter().any(|&(ua, ub)| ua < j_start && p_end < ub) {
+            return false;
+        }
+        // ⑴ 中间每一个浊帧,移位之后都必须仍在模型够得着的范围里 —— 与
+        //    `minimal_rescue_shift` 对窗内材料用的是**同一条**谓词。
+        idx.iter()
+            .zip(midi.iter())
+            .filter(|(&i, _)| (i as i64) >= p_end && (i as i64) < j_start)
+            .all(|(_, &m)| range.slot_reachable(m.round() as i64 + shift))
+    };
     let mut merged: Vec<DeadJob> = Vec::with_capacity(out.len());
     for j in out {
         match merged.last_mut() {
-            Some(p) if p.shift == j.shift && j.start - p.end <= merge_gap => {
+            Some(p)
+                if p.shift == j.shift
+                    && j.start - p.end <= merge_gap
+                    && bridge_ok(p.end, j.start, j.shift) =>
+            {
                 p.end = p.end.max(j.end);
             }
             _ => merged.push(j),
@@ -3368,6 +3403,71 @@ mod tests {
         far.extend(vec![0.0; 20]);
         let (jobs3, _) = cover_dead_plan(&far, 100.0, &r);
         assert_eq!(jobs3.len(), 2, "隔了 1.2 s 还合并 ⇒ 门限形同虚设:{jobs3:?}");
+    }
+
+    /// S159p —— ⛔⛔⛔ **合并不许把「没人看过的材料」吞进 donor。**
+    ///
+    /// 独立审计逐行核出来的两条(我写第一版时漏了护栏,而**谱面轨的同款
+    /// `merge_same_shift_across_rests` 本来就有** —— 它靠「只跨休止合并」躲开了这件事):
+    /// ⑴ 中间那截的乘客移位之后可能掉出 `slot_reachable` ⇒ 合并做出**计划器本人会判无解的窗**;
+    /// ⑵ 中间那截可能正是一段刚被判 `unfixable` 的区间 ⇒ 审计还在打「rendered broken as-is」,
+    ///    而拼接器实际按邻居的位移渲了它。
+    ///
+    /// ⚠ **上面那条 `adjacent_cover_regions_with_the_same_shift_are_merged` 抓不到这两件事** ——
+    /// 它的夹具中间是**静音**,只测了安全的那一侧。这条补的就是危险的那一侧。
+    #[test]
+    fn a_cover_merge_never_swallows_material_no_predicate_has_looked_at() {
+        let r = range();
+        // ⑴ 中间是**唱得动**但移位后够不着的材料:88 需要 −9,而 50 − 9 = 41 < usable 底 48。
+        let mut low = vec![0.0f32; 20];
+        low.extend(vec![hz(88.0); 40]);
+        low.extend(vec![hz(50.0); 30]);
+        low.extend(vec![hz(88.0); 40]);
+        low.extend(vec![0.0; 20]);
+        let (jobs, _) = cover_dead_plan(&low, 100.0, &r);
+        assert_eq!(jobs.len(), 2, "把移位后够不着的乘客吞进了 donor:{jobs:?}");
+        for j in &jobs {
+            assert!(j.end <= 60 || j.start >= 90, "job {j:?} 盖住了中间那 30 帧");
+        }
+        // ⛔ 阴性对照:同样的形状、同样的间距,中间换成**移位后够得着**的材料 ⇒ 必须合并。
+        //    (没有这一条,上面那条可以由「护栏一刀切、根本不合并」满足。)
+        let mut okm = vec![0.0f32; 20];
+        okm.extend(vec![hz(88.0); 40]);
+        okm.extend(vec![hz(70.0); 30]);
+        okm.extend(vec![hz(88.0); 40]);
+        okm.extend(vec![0.0; 20]);
+        let (jobs2, _) = cover_dead_plan(&okm, 100.0, &r);
+        assert_eq!(jobs2.len(), 1, "够得着的乘客也不合并 ⇒ 护栏过紧:{jobs2:?}");
+
+        // ⑵ 中间是一段**无解**区间(96 太高、30 太低,同一组里上下都死 ⇒ 没有落点)。
+        //
+        // ⚠⚠ **如实登记:这一半没有独立覆盖到「无解」那道检查。**变异「把 `unfixable` 那一问
+        //    去掉」在这个夹具上是**绿**的 —— 因为中间那 30 帧在邻居的 −9 上是**够不着**的
+        //    (96 − 9 = 87 > usable 顶 84),所以先被 ⑴ 那道可达性拦住了,轮不到 ⑵。
+        // ⛔ 试过造「**可达但无解**」的局面(邻居 −6 · 中间 88+56):被**死帧长度门**
+        //    (`MIN_VIOLATION_MS` = 25 帧)与 `median5` 一起挡住 —— 要让低音落在死音组**内部**,
+        //    它就得短到 ≤3 帧(`GAP_TOL_MS` 的桥接上限),而那个长度会被中值抹掉。
+        // ⇒ 「无解」那道检查今天是**防御**,不是活路径;它守的是**审计行的真实性**
+        //    (不许一边打『rendered broken as-is』一边把它渲进 donor),一行的代价,留着。
+        //    ⛔ 别把这条读成「已经验过了」。
+        let mut unf = vec![0.0f32; 20];
+        unf.extend(vec![hz(88.0); 40]);
+        unf.extend(vec![0.0; 10]);
+        unf.extend(vec![hz(96.0); 15]);
+        unf.extend(vec![hz(30.0); 15]);
+        unf.extend(vec![0.0; 10]);
+        unf.extend(vec![hz(88.0); 40]);
+        unf.extend(vec![0.0; 20]);
+        let (jobs3, unfix3) = cover_dead_plan(&unf, 100.0, &r);
+        assert_eq!(unfix3.len(), 1, "夹具没造出无解区间,这一半是空的:{unfix3:?}");
+        let (ua, ub) = unfix3[0];
+        assert_eq!(jobs3.len(), 2, "合并盖住了一段刚被判无解的区间:{jobs3:?}");
+        for j in &jobs3 {
+            assert!(
+                j.end <= ua || j.start >= ub,
+                "job {j:?} 盖住了无解区间 ({ua},{ub}) —— 审计行会说『原样渲坏』而实际不是"
+            );
+        }
     }
 
     /// S159n ⑶ —— **按乐句整段救**(`UTAI_COVER_PHRASE_GAP_MS`,出厂 = 0 = 关)。
