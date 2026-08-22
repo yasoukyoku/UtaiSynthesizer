@@ -2104,14 +2104,19 @@ pub fn dead_group_windows(
             // 交叉淡化压在**它**身上而不是压在被救的死音上。见 `GUARD_FRAMES`。
             // ⚠ 有休止可用时一个字不改(`gap_prev/gap_next > 0` 走原来那条路),所以
             // **今天的计划逐帧不变** —— 这条只有裁剪/拆组产生的乐句内部边界才会走到。
-            let pre = if gap_prev > 0 {
+            // S159zw —— 短休止一格都不许伸(见 [`SHORT_REST_NO_EXTEND_FRAMES`])。
+            let pre = if gap_prev > 0 && gap_prev <= SHORT_REST_NO_EXTEND_FRAMES {
+                0
+            } else if gap_prev > 0 {
                 4.min(gap_prev / 2)
             } else if g.start > 0 {
                 GUARD_FRAMES.min((cum[g.start] - cum[g.start - 1]) / 2)
             } else {
                 0
             };
-            let post = if gap_next > 0 {
+            let post = if gap_next > 0 && gap_next <= SHORT_REST_NO_EXTEND_FRAMES {
+                0
+            } else if gap_next > 0 {
                 2.min(gap_next / 2)
             } else if g.end + 1 < note_nums.len() {
                 GUARD_FRAMES.min((cum[g.end + 2] - cum[g.end + 1]) / 2)
@@ -2203,6 +2208,41 @@ fn merge_same_shift_across_rests(
 /// every counter (group count, passenger count, donor passes, shift set) and every unit test
 /// stayed green. Measured cost of the guard itself: 40 ms of one passenger is rendered from the
 /// donor instead of base, at the same written pitch (the inverse already put it back).
+/// ⚙ 出厂默认 = 3 帧(60 ms)—— **比这更短的休止,两侧的窗一格都不许伸进去。**
+///
+/// ## ⭐⭐⭐ 用户 2026-08-23 点名的 3:35.888 那声咔哒
+///
+/// 那处的休止(音[1153])只有 **3 帧 = 60 ms**,而两侧的窗按下面那两行各伸进 **1 帧**
+/// (`pre = min(4, gap/2)` / `post = min(2, gap/2)`,`gap = 3` ⇒ 各 1)
+/// ⇒ **3 帧里 2 帧被 donor 占了,中间只剩 1 帧 base**。
+///
+/// ⇒ 那个休止实际长这样:**20 ms 响 donor / 20 ms 静 base / 20 ms 响 donor** ——
+/// **一个休止里两声突起,那就是「咔哒」**。实测(整曲渲染,相对同一处的 base):
+/// 前 20 ms **+13.5 dB** · 中段 **−0.2 dB(窗外,与 base 逐字相同)** · 末 20 ms **+12.7 dB**。
+///
+/// ⚠ 用户还给了一条**深度依赖**的旁证:同一处在落点预算 3 上「很浅、听不出」,在预算 5 上
+/// 「清楚」—— 因为落点变深之后 donor 把那个音唱得更饱满(MIDI 74 舒服 vs 78 又薄又闷),
+/// 它的收尾进到休止里更响。
+///
+/// ## ⛔ 为什么不能指望 [`join_rests`] 收拾它
+///
+/// 那把刀就是为「两个异位移的窗夹一段休止」造的,但它**在这里没有可搜的余地**:
+/// 它只在「两种分法真的不同」的区间上比较凹陷,而窗已经把休止吃到只剩 **1 帧(2 个打分格)**。
+/// ⇒ 实测(拼接探针,**同一份 base + donor**,只翻 `UTAI_RANGE_JOIN`):
+/// **那一处开与关逐字相同**;全曲 43 处这类休止上它也只买到中位 **−1.6 dB**、43 中 10 处变好。
+/// ⇒ 先把余地留出来,才轮得到它。
+///
+/// ## 代价与覆盖面
+///
+/// 全曲只有 **4 个窗**受影响(鹅妈妈 +7 × 东雪莲,落点预算 5),改动 **0.510 %** 的样本。
+/// 实测(拼接探针)那两段回到 base 的电平:前 20 ms −36.6 → **−39.1**(base −39.4)、
+/// 末 20 ms −24.9 → **−27.9**(base −27.9)。
+///
+/// ⚠ 代价:交叉淡化从「休止里」挪回**音的边缘**。⛔ 那正是 `GUARD_FRAMES` 想避开的事 ——
+/// 但那条只管 `gap == 0`(**根本没有休止**)的情形;这里有休止,只是太短,
+/// 而「淡化压在音边」与「休止里两声突起」相比,后者是用户**真的听见**的那一个。
+const SHORT_REST_NO_EXTEND_FRAMES: i64 = 3;
+
 const GUARD_FRAMES: i64 = 2;
 
 /// S85e windowed donors: the merged, padded, clamped OUTPUT-sample spans one shift's jobs
@@ -6071,7 +6111,7 @@ mod tests {
             "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159i";
+        const TAG: &str = "s159j";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -6301,6 +6341,67 @@ mod tests {
     /// ⇒ 判据钉的是**不许丢**:合并只允许发生在「按音符序真的紧邻、且窗不重叠」的一对上。
     /// ⚠ 今天的唯一生产者 [`dead_only_plan_with`] 由构造升序不重叠 ⇒ 这条修法**逐位不改**
     /// 今天的输出;它挡的是**下一个 planner**(裁剪/拆句会重排组)。
+
+    /// ⭐⭐⭐ S159zw —— **短休止两侧的窗一格都不许伸进去**(用户 2026-08-23 点名的 3:35.888)。
+    ///
+    /// 机理、取证与代价在 [`SHORT_REST_NO_EXTEND_FRAMES`] 的 doc。这条判据钉四件:
+    /// ⑴ 休止 = 3 帧(命中门限)⇒ 两侧 `pre`/`post` 都是 **0**,窗正好停在音界上;
+    /// ⑵ ⛔ **阴性对照**:休止 = 4 帧(刚过门限)⇒ 照旧伸出(`pre = min(4,2) = 2` / `post = min(2,2) = 2`);
+    /// ⑶ ⛔ **`gap == 0`(根本没有休止)那一条不许被这一刀碰** —— 那是 `GUARD_FRAMES` 的地盘;
+    /// ⑷ 短休止那一对窗**不许重叠**,而且中间必须整段留给 base。
+    ///
+    /// ⛔ 变异(逐个真跑过):
+    /// * `SHORT_REST_NO_EXTEND_FRAMES` 改成 0 ⇒ ⑴ 读回 `pre/post = 1`,**红**;
+    /// * 改成 4 ⇒ ⑵ 的 4 帧休止也被吃掉,**红**;
+    /// * 把 `gap_prev > 0 &&` 那个前置条件去掉(让它也管 `gap == 0`)⇒ ⑶ **红**。
+    #[test]
+    fn a_short_rest_keeps_both_windows_out_of_it() {
+        let nn = [0i64, 85, 0, 85, 0];
+        // ⑴ 中间休止 3 帧 = 门限 ⇒ 两侧都不许伸。
+        let three = [10i64, 20, 3, 20, 10];
+        let g = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 3, end: 3, shift: -7 }, // ⛔ 位移不同 ⇒ 不会被同位移合并掩盖
+        ];
+        let w = dead_group_windows(&nn, &three, &g);
+        assert_eq!(w.len(), 2, "两条组必须各自有窗(读到 {w:?})");
+        assert_eq!(
+            (w[0].start, w[0].end, w[1].start, w[1].end),
+            (6, 30, 33, 55),
+            "3 帧休止 ⇒ 内侧两条边正好停在音界上 30 / 33(外侧那两条 10 帧休止照常伸出)(读到 {w:?})"
+        );
+        // ⑷ 不许重叠,而且中间整段留给 base。
+        assert!(w[0].end < w[1].start, "两条窗不许重叠");
+        assert_eq!(w[1].start - w[0].end, 3, "整段 3 帧休止必须留给 base(读到 {})", w[1].start - w[0].end);
+
+        // ⑵ ⛔ 阴性对照:4 帧休止(刚过门限)⇒ 照旧伸出。
+        let four = [10i64, 20, 4, 20, 10];
+        let w4 = dead_group_windows(&nn, &four, &g);
+        assert_eq!(
+            (w4[0].start, w4[0].end, w4[1].start, w4[1].end),
+            (6, 32, 32, 56),
+            "4 帧休止不该命中这一刀:`post = min(2,2) = 2` / `pre = min(4,2) = 2`(读到 {w4:?})"
+        );
+        assert!(
+            w4[1].start - w4[0].end < 4,
+            "阴性对照有效性:4 帧那一档必须**真的**伸进休止,否则 ⑵ 是恒真的"
+        );
+
+        // ⑶ ⛔ `gap == 0` 是 `GUARD_FRAMES` 的地盘,这一刀不许碰。
+        let nn0 = [0i64, 85, 85, 0];
+        let fr0 = [10i64, 20, 20, 10];
+        let g0 = [
+            DeadGroup { start: 1, end: 1, shift: -6 },
+            DeadGroup { start: 2, end: 2, shift: -7 },
+        ];
+        let w0 = dead_group_windows(&nn0, &fr0, &g0);
+        assert_eq!(w0.len(), 2);
+        assert!(
+            w0[0].end > 30 && w0[1].start < 30,
+            "没有休止时护栏必须照常向两侧各伸 GUARD_FRAMES(读到 {w0:?})"
+        );
+    }
+
     #[test]
     fn merging_never_deletes_a_rescue_whatever_order_the_plan_arrives_in() {
         let nn = [0, 85, 0, 85, 0];
@@ -6326,11 +6427,16 @@ mod tests {
         );
         let mut spans: Vec<(i64, i64)> = got.iter().map(|j| (j.start, j.end)).collect();
         spans.sort();
+        // ⚠ S159zw —— 坐标从 `(6, 31), (32, 55)` 变成了 `(6, 30), (33, 55)`:这个夹具中间那段
+        //    休止**正好 3 帧**,命中 [`SHORT_REST_NO_EXTEND_FRAMES`] ⇒ 两侧的窗不再各伸进 1 帧。
+        //    ⛔ 这条判据钉的是「**降序输入不许吞掉一条救援**」(上面那条 `got.len() == 2`),
+        //    坐标只是它的载体;**新坐标仍然是「各自在原处、互不重叠」**,不变量一个字没变。
         assert_eq!(
             spans,
-            vec![(6, 31), (32, 55)],
+            vec![(6, 30), (33, 55)],
             "两条窗必须各自还在原来的位置上(合并只许发生在真正紧邻的一对上)"
         );
+        assert!(spans[0].1 < spans[1].0, "两条窗不许重叠");
 
         // ⛔ 阴性对照 ①:**位移不同**的降序对同样不许合并 —— 这一条今天就是对的,
         //    它在这里是为了证明上面那条红不是「降序一律不合并」这句话本身造出来的。
