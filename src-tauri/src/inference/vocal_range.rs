@@ -2892,8 +2892,33 @@ fn parse_win_periods(v: Option<&str>) -> f64 {
 /// 收益与代价见 [`win_periods`] 的 doc;⛔ 显式 `UTAI_PSOLA_WIN=0` 仍然能渲出旧臂。
 const WIN_PERIODS_DEFAULT: f64 = 1.0;
 
-/// ⚙ 出厂默认 = 3.0 —— **开着**;这 3 ms 只是**下限**,真实窗宽逐岛按 donor 周期定
-/// (`utai_dsp::psola` 的 `ENV_RESTORE_PERIODS` = 1.5 个周期)。`0` 才是关。
+/// ⚙ 出厂默认 = 0.0 —— **关**(S159i 曾翻成 3.0,**S159zc 因用户对照 S158 判定为退化而退回**)
+/// 非零时那个数是**下限**,真实窗宽逐岛按 donor 周期定(`utai_dsp::psola` 的 `ENV_RESTORE_PERIODS` = 1.5 个周期)。
+///
+/// ## ⛔⛔ S159zc —— 它为什么被退回(用户 2026-08-22 拿 S158 的产物当对照)
+///
+/// 用户点名 `TESTING\s158_knivesu_s158_头尾都裁.wav`(同素材:炉心融解 +7 × akiko × 291.1 s)
+/// 「听起来比我们现在的产出还自然」。逐项对拍之后:
+///
+/// | 全曲长时平均谱(按 rms 归一 ⇒ 只比形状),相对 S158 | 60-150 | 150-300 | 3-5k | 5-8k | 8-16k |
+/// |---|---|---|---|---|---|
+/// | 今天出厂(envfix 3 ms) | **+4.16** | **+5.61** | **+3.13** | +1.99 | +1.79 |
+/// | **`UTAI_PSOLA_ENVFIX=0`** | **+0.04** | **+0.32** | **+0.18** | +0.18 | +0.12 |
+///
+/// ⇒ **关掉它,全曲谱形状逐档回到 S158 的 ±0.32 dB 以内**;开着它是一条真实的全曲染色
+/// (用户早先的原话:「像被上了一个很奇怪的 EQ……不饱满,有点电话声」)。
+/// ⭐ 频谱图上更直接:用户点名的面状伪影(基频以下 0-1 kHz 的一片亮区)在**开着时存在、关掉时不存在**,
+/// 而 S158 那一版也不存在。⇒ **那片「面状伪影」是这把刀造出来的。**
+/// ⚠ 机理:它在浊音岛内**跑两遍**、每遍夹 ±[`ENV_RESTORE_CLAMP_DB`] = 12 dB ⇒ 最多把塌陷处抬 **24 dB**,
+/// 而被抬的是一段**结构已经坏掉**的信号 —— 连同它的次基频残留与毛刺一起放大。
+/// 实测:用户点名的 5 处中位电平 出厂 **−16.62** vs S158 **−29.07** vs `ENVFIX=0` **−29.08 dB**。
+///
+/// ⛔⛔ **血训:我一度用「关掉它电平掉了 16-22 dB ⇒ 那只是变安静,不算修好」把它筛掉了。**
+/// 但用户耳朵认可的 S158 **就在那个更安静的电平上** —— **「更安静」在这里正是【正确】,不是【回避】。**
+/// ⇒ 「变安静不算修好」这条规矩只在**没有参照臂**时成立;**一旦有一条耳朵认可的参照,就以参照为准**。
+///
+/// ⚠ 它原本买到的东西(S159i 登记):音符交界处的塌陷 pre 1.00 → post 4.63 dB,被它按回 0.93/0.95;
+/// 实测关掉之后那条轴从 9.85 恶化到 13.21 dB。**这笔代价是真的,但用户耳判压过它**(交界塌陷用户从未点名)。
 /// S154 — `UTAI_PSOLA_ENVFIX=<ms>` makes the inverse **keep the amplitude envelope it was given**,
 /// inside the voiced islands only. **0 = off = byte-for-byte the pre-S154 arm.**
 ///
@@ -2934,7 +2959,38 @@ fn parse_env_restore_ms(v: Option<&str>) -> f64 {
         .unwrap_or(ENV_RESTORE_MS_DEFAULT)
 }
 
-/// ⚙ 出厂默认 = 3.0 —— 包络还原**开着**;这 3 ms 只是**下限**,真实窗宽由 donor 周期定
+/// ⛔⛔⛔ **S159za 把它退回 0.0(默认关)。S159i 翻开它是错的,理由逐条写在这里。**
+///
+/// ## 翻开它时我拿的读数,以及那个读数为什么不管用
+///
+/// S159i 看的是渲染日志里的 `env dev p50`(PSOLA 对包络改动的**中位**):
+/// 位移 +6 → 0.789 dB · +7 → 0.912 · +10 → 1.770 · +12 → 2.696 · +15 → 3.277 · **+17 → 3.622**,
+/// 而 envfix 把它拉回 **0.113-0.271 dB**。数字很漂亮,方向也对。
+///
+/// ⛔ 但用户 2026-08-22 听到的是**尾巴**不是中位:唱音内部 **20-70 dB** 的凹陷。
+///    而这把刀在结构上**够不着那条尾巴**,三条硬理由都在 `utai_dsp::psola::restore_envelope` 里:
+///    ⑴ [`ENV_RESTORE_CLAMP_DB`] = **12.0** —— 校正增益最多只能挪 ±12 dB;
+///    ⑵ `ey[i] > floor`(floor = 输入峰值 −60 dB)—— 输出塌得最深的样本**直接跳过、增益取 1.0**;
+///    ⑶ `box_average(&raw, half * 4)` —— 校正被平滑到 12-28 ms,而凹陷宽 **2-40 ms** ⇒ 被抹平。
+///    ⇒ 它修不了那些坑,却在坑**附近**把增益抬上去(最多 12 dB),把残留的毛刺一起放大。
+///
+/// ## 实测(S159za 消融扫描,炉心融解 +7 × yachiyo,只改这一个旋钮)
+///
+/// 判据是两把**在用户 ground truth 上验过阳性**的尺子(`scripts/range_rulers/`):
+///
+/// | | 用户点名 6 处合计 | 深窗内候选 >6 dB | 泄漏 深窗 p90 | ⛔ 窗外对照 |
+/// |---|---|---|---|---|
+/// | 出厂(envfix 3 ms) | 92.6 | 149 | −22.98 dB | 1.34 / −21.94 |
+/// | **envfix 关** | **76.6** | **143** | **−27.12** | 1.35 / −22.04(**不动**) |
+///
+/// ⇒ **两族同时改善,而阴性对照纹丝不动** —— 这是这一轮里唯一一条干净的。
+/// ⚠ 对照:`VALLEY=0` 的点读更低(54.1),但它把**窗外**也动了(1.34 → 1.18)⇒ 那不是这个缺陷,不算数。
+/// ⚠ 对照:`XGRAIN=0` 让深窗候选 149 → **235**、泄漏恶化 **8.2 dB** ⇒ `xgrain` 在扛大梁,别碰。
+///
+/// ⭐ **留着这把刀本身**(它仍然由旋钮可开、判据仍然钉着它的逐岛性质);
+///    退的只是**默认值**。要重新翻开它,先解决上面 ⑴⑵⑶ 那三条结构限制,
+///    并且拿**尾巴**(不是中位)的判据重新量。
+/// ⚙ 出厂默认 = 0.0(**S159za 退回**;S159i 曾翻成 3.0)—— 那 3 ms 是**下限**,真实窗宽由 donor 周期定
 ///
 /// S159i 起它从「窗宽」降级成「开关 + 下限」:引擎逐岛取
 /// `max(这个下限, 1.5 个 donor 周期)`(`utai_dsp::psola` 的 `ENV_RESTORE_PERIODS`)。
@@ -2948,7 +3004,7 @@ fn parse_env_restore_ms(v: Option<&str>) -> f64 {
 ///
 /// ⛔ Same pairing rule as `INFRASONIC_HP_DEFAULT`: making this non-zero changes the audio ⇒ it
 /// must bump `RANGE_ALGO_VERSION` **and** `audition_cache_tag` in the same commit.
-const ENV_RESTORE_MS_DEFAULT: f64 = 3.0;
+const ENV_RESTORE_MS_DEFAULT: f64 = 0.0;
 
 /// ⚙ 出厂默认 = 30.0 —— 桥接清音 30 ms
 /// S154 — `UTAI_PSOLA_BRIDGE=<ms>` bridges short unvoiced gaps in the fed f0 so the voiced islands
@@ -5194,10 +5250,10 @@ mod tests {
         );
         assert_eq!(
             fp,
-            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=3 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
+            "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159d";
+        const TAG: &str = "s159e";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),

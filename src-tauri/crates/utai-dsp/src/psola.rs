@@ -1158,7 +1158,7 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
     ("UTAI_PSOLA_LOCK", 0.30),
     ("UTAI_PSOLA_HP", 1.0),
     ("UTAI_PSOLA_HP_MS", 0.0),
-    ("UTAI_PSOLA_ENVFIX", 3.0),
+    ("UTAI_PSOLA_ENVFIX", 0.0),
     ("UTAI_PSOLA_BRIDGE", 30.0),
     ("UTAI_PSOLA_WIN", 1.0),
     ("UTAI_PSOLA_XGRAIN", 1.0),
