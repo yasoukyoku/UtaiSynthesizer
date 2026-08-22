@@ -2401,6 +2401,8 @@ pub fn apply_dead_only_windows(
         jobs,
         match_levels,
         join_rests_enabled(),
+        // S159zm —— env 只在这一个入口读一次(见 [`seam_align_ms`])。
+        (seam_align_ms() * f64::from(sample_rate) / 1000.0).round() as usize,
         donor_render,
     )
 }
@@ -2416,6 +2418,9 @@ pub fn apply_dead_only_windows_with(
     jobs: &[DeadJob],
     match_levels: bool,
     join_enabled: bool,
+    // S159zm —— 拼接前的对齐半径(**样本**)。⛔ 与 `join_enabled` 同一条理由:
+    // `_with` 变体的旋钮一律是**参数**,判据才关得掉(S151 笔1)。
+    align: usize,
     mut donor_render: impl FnMut(i64, &[(i64, i64)]) -> crate::Result<Vec<f32>>,
 ) -> crate::Result<()> {
     if jobs.is_empty() || base.is_empty() || total_frames <= 0 {
@@ -2423,9 +2428,6 @@ pub fn apply_dead_only_windows_with(
     }
     let spf = base.len() as f64 / total_frames as f64;
     let xf = (sample_rate as usize / 100).max(2); // 10 ms
-    // S159zm —— 拼接前的对齐半径(见 [`SEAM_ALIGN_MS_DEFAULT`])。
-    // ⛔ env 只在这一个入口读一次,`splice_kept` 拿的是参数(S151 笔1:判据不许读进程环境)。
-    let align = (seam_align_ms() * f64::from(sample_rate) / 1000.0).round() as usize;
     let base_rms = if match_levels { active_rms(base, sample_rate) } else { None };
     let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
     shifts.sort_unstable();
@@ -2472,9 +2474,9 @@ pub fn apply_dead_only_windows_with(
 /// 片段,所以窗边可以由音频决定(`join_rests`),而不是只能由帧数规则决定。
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`。
 /// 机理、实测与为什么它不是 S151d 那条判负,全在 [`seam_align_ms`] 的 doc。
-const SEAM_ALIGN_MS_DEFAULT: f64 = 0.0;
+const SEAM_ALIGN_MS_DEFAULT: f64 = 2.0;
 
-/// ⚙ 出厂默认 = 0.0 —— `UTAI_RANGE_SEAM_ALIGN=<ms>` 在**拼接之前先把两条臂对齐**。
+/// ⚙ 出厂默认 = 2.0 —— `UTAI_RANGE_SEAM_ALIGN=<ms>` 在**拼接之前先把两条臂对齐**。
 ///
 /// ## ⭐⭐⭐ 缺陷:我们从来没对齐过,而两条臂其实是同一条波形错开了 0.2 ms
 ///
@@ -2508,6 +2510,37 @@ const SEAM_ALIGN_MS_DEFAULT: f64 = 0.0;
 /// ⛔ 与 S151d 那条判负**不是一回事**:那次换的是淡化的**形状**(等增益 → √功率),
 /// 整曲读数一个字没动。这一条动的是**对齐**,而上面那张表说的正是「形状再怎么换,
 /// ρ = −0.139 的两条臂淡出来都是梳状」。
+///
+/// ## ✅ 实测(S159zm,`splice_probe`:**同一份 base + donor 缓冲**,只翻这个旋钮)
+///
+/// ⛔ 为什么必须是那个台子:「渲两遍整曲再比」被 donor 路径的跨进程不可复现性淹没
+/// (实测两遍差 **85 %** 样本)。⇒ 把 base 与每一遍 donor 落盘一次,所有臂喂同一份输入。
+///
+/// ⚠ **验收轴换过一次,而且第一把是错的**:先用「缝前 20 ms vs 后 20 ms 的谱形跳变」量,
+/// 读到 **−0.04 dB** = 没效果。**那把尺子对相位不敏感** —— 两条臂的**频谱**本来就相似,
+/// 对齐改的是**波形连续性**。(而且我第一版的「对照」写错了,读数与被测臂逐字相同。)
+/// ⇒ 换成时域轴:淡化那 10 ms 的 **一阶差 p99.5 / 局部 RMS**,地板 = **窗心**(那里没有淡化)。
+///
+/// | 半径 | 一阶差 | 超出地板 | 淡化区电平 vs 两侧 |
+/// |---|---|---|---|
+/// | 0(今天之前)| 0.3731 | **0.0185** | **−0.63 dB** |
+/// | 0.5 ms | 0.3680 | 0.0134 | +0.22 |
+/// | 1 ms | 0.3680 | 0.0134 | +0.40 |
+/// | **2 ms(出厂)** | 0.3622 | **0.0076** | **+0.28** |
+/// | 4 ms | 0.3515 | −0.0030 | +0.31 |
+/// | 8 ms | 0.3478 | −0.0068 | +0.40 |
+/// | ⛔ 地板(窗心,无淡化)| 0.3546 | 0 | −0.04 |
+///
+/// ⇒ **超出地板那部分少了 59 %**,而 **−0.63 dB 的凹陷消失**(逐窗 78/112 改善,p90 +1.52 dB)。
+/// 实机 131 个窗里 **94 个**拿到非零偏移,ρ 抬得很猛(实测三例:−0.714 → **0.959** ·
+/// −0.648 → **0.991** · 0.536 → **0.989**)。
+///
+/// ## 为什么是 2.0 而不是 4/8
+///
+/// 4 ms 起读数掉到**地板以下** —— 那是尺子饱和的指纹,不是更好。而观测到的滞后基本是
+/// **一个基音周期的整数倍**,对齐只需要够到**半个周期**:2 ms ≥ 半周期 ⇔ f0 ≥ 250 Hz,
+/// 把 donor 的整个音域(实测 370-740 Hz)都覆盖了。⇒ 再大只是给整窗多加时移,没有声学收益。
+/// ⚠ 代价如实记:命中的窗整条挪 ≤2 ms。**这一条没有耳朵背书** —— 承重之前该过一次耳判。
 ///
 /// ⛔ 判据不许读这个 env(S151 笔1)——`splice_kept` 拿的是**参数**,
 /// 由 `apply_dead_only_windows` 在唯一的入口读一次。
@@ -4348,9 +4381,23 @@ mod tests {
         ];
         let donor_of = |s: i64| mk((s.unsigned_abs() as u32) * 7 + 1, 300.0 + s as f32 * 11.0);
 
+        // ⚠⚠ S159zm —— **显式关掉拼接前的对齐**([`SEAM_ALIGN_MS_DEFAULT`],出厂 2.0 ms)。
+        // 这条判据钉的是「两阶段拼接 == 一遍式参照实现」,而参照实现里没有对齐;
+        // 两把刀一起开时它读到样本 9601 就分开(−0.18398008 vs −0.18397935)。
+        // ⛔ 正确的隔离是**关掉另一把刀**,不是给参照实现也抄一份对齐 ——
+        //    那样参照就不再是「独立写的」,这条判据的全部价值就没了。
         let mut got = mk(0, 220.0);
-        apply_dead_only_windows(&mut got, sr, total, &jobs, false, |s, _own| Ok(donor_of(s)))
-            .unwrap();
+        apply_dead_only_windows_with(
+            &mut got,
+            sr,
+            total,
+            &jobs,
+            false,
+            join_rests_enabled(),
+            0, // ⛔ 关掉对齐:见上面那段
+            |s, _own| Ok(donor_of(s)),
+        )
+        .unwrap();
 
         let mut want = mk(0, 220.0);
         reference_splice(&mut want, n as f64 / total as f64, (sr as usize / 100).max(2), &jobs, donor_of);
@@ -4603,7 +4650,7 @@ mod tests {
         let (base0, left, right) = join_fixture(n);
         let run = |join: bool| {
             let mut b = base0.clone();
-            apply_dead_only_windows_with(&mut b, sr, total, &jobs, false, join, |s, _| {
+            apply_dead_only_windows_with(&mut b, sr, total, &jobs, false, join, 0, |s, _| {
                 Ok(if s == -9 { left.clone() } else { right.clone() })
             })
             .unwrap();
@@ -4688,7 +4735,7 @@ mod tests {
         };
         for join in [false, true] {
             let mut base = vec![0.02f32; base_len]; // −34 dBFS 的底,好让「洞」量得出来
-            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, false, join, |s, own| {
+            apply_dead_only_windows_with(&mut base, SR, TOTAL_FRAMES, &jobs, false, join, 0, |s, own| {
                 // ⭐ 生产走的就是 `donor_keep_samples` 这一个函数,判据不许自己再拼一遍公式。
                 let keep = donor_keep_samples_with(own, base_len, TOTAL_FRAMES, true);
                 let mut d = vec![-1.0f32; base_len];
@@ -4718,7 +4765,7 @@ mod tests {
             // ⛔ 阴性对照 ②:余量给不够时会怎样 —— 而**两条臂的答案不一样,那正是这条判据的重点**。
             let mut tight = vec![0.02f32; base_len];
             apply_dead_only_windows_with(
-                &mut tight, SR, TOTAL_FRAMES, &jobs, false, join,
+                &mut tight, SR, TOTAL_FRAMES, &jobs, false, join, 0,
                 |s, own| Ok(paint(own, 0, s)),
             )
             .expect("splice");
@@ -6024,7 +6071,7 @@ mod tests {
             "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159g";
+        const TAG: &str = "s159h";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -7607,6 +7654,69 @@ mod tests {
         ] {
             assert!(me.contains(want), "vocal_range 里找不到引擎调用 {want} —— 执行点被搬走了?");
         }
+    }
+
+
+    /// S159zm —— **只跑拼接**的探针:同一份 base + donor 缓冲,只翻对齐旋钮。
+    ///
+    /// ⛔ 为什么必须有它:「渲两遍整曲再比」被 donor 路径的**跨进程不可复现性**淹没 ——
+    /// 实测两遍差 **85 %** 的样本,而且全曲长时平均谱六档均匀 −0.45 dB(那是**增益差**,
+    /// 不是频谱效应)。⇒ 一个只改「两端爬坡」或「淡化对齐」的旋钮,在那种台子上**量不出来**。
+    /// ⇒ 把 base 与每一遍 donor 落盘一次,之后所有臂都喂**同一份**输入,
+    /// 唯一的差别就是被测的那件事(与 [`inverse_probe`] 同一条理由)。
+    ///
+    /// ```powershell
+    /// $env:UTAI_SPLICE_DIR="…\donor"      # 含 base.f32 / donor_post_<±s>.f32 / total_frames.txt
+    /// $env:UTAI_SPLICE_PLAN="…\x.plan.json"
+    /// $env:UTAI_SPLICE_ALIGN="2"; $env:UTAI_SPLICE_OUT="…\out.wav"
+    /// cargo test --lib inference::vocal_range::tests::splice_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "probe: needs dumped base + donor buffers (set UTAI_SPLICE_*)"]
+    fn splice_probe() {
+        let dir = std::path::PathBuf::from(std::env::var("UTAI_SPLICE_DIR").expect("UTAI_SPLICE_DIR"));
+        let out = std::env::var("UTAI_SPLICE_OUT").expect("UTAI_SPLICE_OUT");
+        let planp = std::env::var("UTAI_SPLICE_PLAN").expect("UTAI_SPLICE_PLAN");
+        let rd = |p: &std::path::Path| -> Vec<f32> {
+            std::fs::read(p)
+                .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let mut base = rd(&dir.join("base.f32"));
+        let total_frames: i64 =
+            std::fs::read_to_string(dir.join("total_frames.txt")).unwrap().trim().parse().unwrap();
+        let plan: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&planp).unwrap()).unwrap();
+        let jobs_src = plan["windows_frames"].as_array().expect("windows_frames");
+        let jobs: Vec<DeadJob> = jobs_src
+            .iter()
+            .map(|v| DeadJob {
+                shift: v[0].as_i64().unwrap(),
+                start: v[1].as_i64().unwrap(),
+                end: v[2].as_i64().unwrap(),
+            })
+            .collect();
+        let sr: u32 = plan["sample_rate"].as_u64().unwrap() as u32;
+        eprintln!("[splice] {} jobs · base {} · sr {sr} · UTAI_RANGE_SEAM_ALIGN = {} ms",
+                  jobs.len(), base.len(), seam_align_ms());
+        apply_dead_only_windows_with(&mut base, sr, total_frames, &jobs, false, join_rests_enabled(), (seam_align_ms() * f64::from(sr) / 1000.0).round() as usize, |s, _own| {
+            Ok(rd(&dir.join(format!("donor_post_{s:+}.f32"))))
+        })
+        .unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: sr,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(&out, spec).unwrap();
+        for v in &base {
+            w.write_sample(*v).unwrap();
+        }
+        w.finalize().unwrap();
+        eprintln!("[splice] -> {out}");
     }
 
     /// Apply ONLY the inverse to a wav on disk, through the production entry point.

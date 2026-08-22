@@ -1540,6 +1540,22 @@ fn mg_deadonly_body(sidecar: &serde_json::Value, mtag: &str, voice: &MgVoice<'_>
     let base_peak = result.pre_norm_peak;
     // S159 —— 见生产那两处:帧→样本的分母只有这里有。
     let base_len = result.audio.len();
+    // S159zm —— **拼接之前的 base 也落一份**。没有它,「只翻拼接旋钮」的 A/B 就只能靠
+    // 「渲两遍整曲」,而那被 donor 路径的跨进程不可复现性淹没(实测两遍差 85 % 样本)。
+    if let Some(dir) = std::env::var_os("UTAI_RANGE_DUMP_DONOR") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let mut bytes = Vec::with_capacity(base_len * 4);
+        for v in &result.audio {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let p = dir.join("base.f32");
+        match std::fs::write(&p, &bytes) {
+            Ok(()) => eprintln!("[dump] base {} samples -> {}", base_len, p.display()),
+            Err(e) => eprintln!("[dump] base failed: {e}"),
+        }
+        let _ = std::fs::write(dir.join("total_frames.txt"), total_frames.to_string());
+    }
     super::super::vocal_range::apply_dead_only_windows(
         &mut result.audio,
         sr,
