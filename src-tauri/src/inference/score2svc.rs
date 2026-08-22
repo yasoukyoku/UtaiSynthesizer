@@ -384,6 +384,23 @@ fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default:
 /// **1 帧 × 141** · 2 帧 × 97 · 3 帧 × 14 · 4 帧 × 1 · 5 帧 × 1 ⇒ 这一刀只碰最左边那一列(**56 %**)。
 /// ⭐ 密度相关性(用户观察的直接复现):1:05-1:08(7.7 音/s)**3.0 个/s** · 3:44-3:47(3.3 音/s)**0.0 个/s**。
 ///
+/// ## ✅ 实测(鹅妈妈 +7 × 东雪莲,整曲 A/B,`UTAI_MG_FILL1` 两档)
+///
+/// f0 层面:唱音内孤立单帧 0 **153 → 4**(剩下的 4 个是 `anchor_voiced_phone_f0` 之后又冒出来的边界情形)。
+/// 音频层面,那 **153 个洞位**在基频附近相对前后两帧的能量:
+///
+/// | | 洞位(153)| ⛔ 阴性对照(音内**无洞**的随机帧,610)|
+/// |---|---|---|
+/// | 关 | **−8.37 dB** | +0.15 |
+/// | 开 | **−3.59 dB** | +0.16 |
+/// | 改善 | **+4.78 dB**(131/153 变好)| **+0.01** |
+///
+/// ⚠ 如实记三件:⑴ **洞只是浅了一半,没消失** —— 音素内容本身仍是清音,模型照样把那一帧渲弱;
+/// ⑵ 用户点名的五处改善偏小(+0.21…+1.63),而 **3:21.998 反而 −1.71**
+///(单点读数受两次独立渲染的噪声影响,承重的是那 153 个的中位数与那条干净的对照);
+/// ⑶ 全曲长时平均谱各档 **−0.19…−0.46 dB**,在两次渲染的台面噪声内。
+/// ⛔ **这一刀没有耳朵背书**,承重之前该过一次耳判。
+///
 /// ⛔ 关掉:`UTAI_MG_FILL1=0`。改它要成对 bump `RANGE_ALGO_VERSION` 与 `audition_cache_tag`。
 pub fn fill_isolated_unvoiced() -> bool {
     parse_fill1(std::env::var("UTAI_MG_FILL1").ok().as_deref())
@@ -398,7 +415,7 @@ fn parse_fill1(v: Option<&str>) -> bool {
 }
 
 /// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
-const FILL_ISOLATED_UV_DEFAULT: bool = false;
+const FILL_ISOLATED_UV_DEFAULT: bool = true;
 
 /// 把 `note_hz` 里**只有一帧**、而且两侧都是浊音的 0 填成两侧的均值。
 ///
@@ -2847,11 +2864,11 @@ mod tests {
     ///    谓词要求两侧都浊,而两连零的第一个 0 右邻还是 0 ⇒ 不成立 ⇒ 不会级联。
     ///    ⇒ `fill_isolated_uv` 里那句「先收集再写」是**防御性**的,没有判据背书。
     /// ⑶ 首尾的 0(没有一侧的锚)不许动;
-    /// ⑷ 出厂默认是**关**的 ⇒ 今天的输出逐位不变。
+    /// ⑷ 出厂默认(S159zp 起 = **开**);⛔ 旋钮两个方向都要认,垃圾值退回默认不许静默开启。
     ///
     /// ⛔ 变异(逐个真跑过):
     /// * `1..n - 1` 改成 `0..n`(也填首尾)⇒ ⑶ **红**;
-    /// * [`FILL_ISOLATED_UV_DEFAULT`] 翻成 `true` ⇒ ⑷ **红**;
+    /// * [`FILL_ISOLATED_UV_DEFAULT`] 翻回 `false` ⇒ ⑷ **红**;
     /// * ⚠ **「先收集再写」改成边扫边写 ⇒ 绿** —— 见 ⑵ 那段:它挡的那件事**结构上不会发生**。
     #[test]
     fn only_a_single_frame_unvoiced_hole_between_voiced_frames_gets_filled() {
@@ -2875,10 +2892,14 @@ mod tests {
         );
 
         // ⑷ 出厂默认关 ⇒ 生产路径今天逐位不变。
-        assert!(!FILL_ISOLATED_UV_DEFAULT, "出厂默认必须是关的(翻它要成对 bump 版本载体)");
-        assert!(!parse_fill1(None), "没设 env 时跟随出厂默认");
+        assert!(FILL_ISOLATED_UV_DEFAULT, "S159zp 已翻默认为开(实测洞浅 4.78 dB,对照 +0.01)");
+        assert_eq!(parse_fill1(None), FILL_ISOLATED_UV_DEFAULT, "没设 env 时跟随出厂默认");
         assert!(parse_fill1(Some("1")) && !parse_fill1(Some("0")), "旋钮两个方向都要认");
-        assert!(!parse_fill1(Some("垃圾")), "垃圾值退回出厂默认,不许静默开启");
+        assert_eq!(
+            parse_fill1(Some("垃圾")),
+            FILL_ISOLATED_UV_DEFAULT,
+            "垃圾值退回出厂默认,不许静默翻向任何一边"
+        );
 
         // ⑸ ⛔ 阴性对照:一条**全是浊音**的轨,这把刀必须一个字节都不动。
         let mut voiced = vec![100.0f32, 200.0, 300.0, 400.0];
