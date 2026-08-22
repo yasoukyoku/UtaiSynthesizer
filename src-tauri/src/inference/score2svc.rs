@@ -346,6 +346,85 @@ fn build_note_param(arr: &ScoreArrays, score: &[ScoreEvt], env: &[f32], default:
 /// per-token per-bucket fraction comes from the same generated priors table (training-measured);
 /// the bucket keys on the phone's note-GROUP length (arr.note_dur — the training stat's exact
 /// frame of reference). Devoiced vowels / unmapped tokens keep the full-window zero (fallback).
+/// ⚙ 出厂默认 = true —— 把夹在两个浊帧之间的**孤立单帧 0** 填回去。
+///
+/// ## ⭐⭐⭐ 用户 2026-08-23 点名的那一族(「基频附近的竖线,几毫秒,像敲了一下」)
+///
+/// 用户给了东雪莲 +7 上的五个坐标(1:05.683 / 1:05.867 / 1:06.400 / 1:07.121 / 3:21.998),
+/// **每一个都精确落在一个孤立单帧 `0` 上**,而那一段是 17 个连续的 80-100 ms 音
+/// (密度 7.7 音/s,全曲均值 4.5)。
+///
+/// 机理链:`consonant_preroll` 把**下一个音**的清音辅音提前 ⇒ 它的音素窗落进**当前音的元音正中**;
+/// 快音上那个窗只有 **2 帧**,于是 [`zero_voiceless_frames`] 的 `z = round(d × permille/1000)`
+/// 取到 **1** ⇒ 一记**单帧硬置零**,谐波栈断 20 ms。
+///
+/// | 洞的位置 | 落在 | 前置的是 |
+/// |---|---|---|
+/// | 65.600 | 音[313]「り」(**浊音**)| 音[314]「さ」的 /s/ |
+/// | **65.680** | 音[314]「さ」 | 音[315]「け」的 /k/ |
+/// | **66.400** | 音[322]「な」(**浊音**)| 音[323]「こ」的 /k/ |
+///
+/// ## ✅ 归因(实测,`donor_pre` / `donor_post` / 成品三段对拍)
+///
+/// 那一帧在**基频附近**相对前后两帧的能量:
+/// **donor 逆变换【前】−8.69 dB** · 逆变换后 −9.22(逆变换只加 **−0.54**)· 成品 −9.04(拼接 +0.18);
+/// ⛔ 阴性对照(音内**没有** 0 帧的随机帧)**+0.16 dB**。
+/// ⇒ **这个洞 94 % 是这条链挖的,PSOLA 与拼接几乎没份** —— 我在缝与岛边上找了一整晚,
+/// 而那把 LPC 尺子的归因早就说了「**74.8 % 的检出不在我们的任何结构边界上**」。
+///
+/// ## ⛔ 为什么填回去比留着更接近「cover 车道对齐」
+///
+/// [`zero_voiceless_frames`] 的初衷(S69 R0b①)是与 cover 车道对齐:RMVPE 在真实音频上
+/// 对清音帧输出 0。**但真实音频里的 /s/ 会给出一串 0(60-120 ms),不是一个孤立单帧** ——
+/// 单帧洞是我们**帧量化 + 辅音前置**在快音上造出来的假象,它离 RMVPE 的样子**更远**。
+/// ⇒ 只填**孤立单帧**,两帧及以上一个不动(那是真辅音的长度)。
+///
+/// ## 覆盖面(鹅妈妈 +7,唱音内部的 0 段)
+///
+/// **1 帧 × 141** · 2 帧 × 97 · 3 帧 × 14 · 4 帧 × 1 · 5 帧 × 1 ⇒ 这一刀只碰最左边那一列(**56 %**)。
+/// ⭐ 密度相关性(用户观察的直接复现):1:05-1:08(7.7 音/s)**3.0 个/s** · 3:44-3:47(3.3 音/s)**0.0 个/s**。
+///
+/// ⛔ 关掉:`UTAI_MG_FILL1=0`。改它要成对 bump `RANGE_ALGO_VERSION` 与 `audition_cache_tag`。
+pub fn fill_isolated_unvoiced() -> bool {
+    parse_fill1(std::env::var("UTAI_MG_FILL1").ok().as_deref())
+}
+
+fn parse_fill1(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => FILL_ISOLATED_UV_DEFAULT,
+    }
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const FILL_ISOLATED_UV_DEFAULT: bool = false;
+
+/// 把 `note_hz` 里**只有一帧**、而且两侧都是浊音的 0 填成两侧的均值。
+///
+/// ⛔ 只填**长度恰好 1** 的段。见 [`fill_isolated_unvoiced`] 的 doc:两帧及以上是真辅音的长度,
+/// 动它就不再是「拿掉帧量化的假象」,而是「替模型决定这里该不该有辅音」。
+fn fill_isolated_uv(note_hz: &mut [f32]) -> usize {
+    let n = note_hz.len();
+    if n < 3 {
+        return 0;
+    }
+    // ⚠⚠ 先收集再写是**防御性**的,**不是**承重的 —— 写这段时我以为「边扫边写会让连续两个 0
+    // 被逐个补掉」,而那条变异**真跑是绿的**:谓词要求**两侧都浊**,而两连零的第一个 0
+    // 右邻还是 0 ⇒ 条件不成立 ⇒ 根本不会级联(三连、四连同理)。
+    // ⇒ 留着它只是让「只填单帧」这个不变量在**将来改谓词时**仍然显然,别把它当判据背书过的东西。
+    let mut hits: Vec<usize> = Vec::new();
+    for i in 1..n - 1 {
+        if note_hz[i] == 0.0 && note_hz[i - 1] > 0.0 && note_hz[i + 1] > 0.0 {
+            hits.push(i);
+        }
+    }
+    for &i in &hits {
+        note_hz[i] = 0.5 * (note_hz[i - 1] + note_hz[i + 1]);
+    }
+    hits.len()
+}
+
 fn zero_voiceless_frames(note_hz: &mut [f32], arr: &ScoreArrays) {
     let n = note_hz.len();
     let mut cursor = 0usize;
@@ -795,6 +874,13 @@ pub fn render_score_sovits(
     // (R0b②'s procedural micro-texture was ear-vetoed and removed — see the note above
     // build_vol_env; micro-motion waits for the conditioned-S2CV line.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
+    // S159zp —— 见 [`fill_isolated_unvoiced`]:帧量化 + 辅音前置在快音上造出来的孤立单帧 0。
+    if fill_isolated_unvoiced() {
+        let k = fill_isolated_uv(&mut note_hz_full);
+        if k > 0 {
+            tracing::info!("score2svc: filled {k} isolated single-frame unvoiced holes");
+        }
+    }
     // S83: pre-rolled voiced onsets (m/n/ɡ… before the beat) must carry the note's opening pitch,
     // never the rest's 0 Hz (uv=0 would mute them) — fill from the run's nearest voiced frame.
     anchor_voiced_phone_f0(&mut note_hz_full, &arr);
@@ -1058,6 +1144,13 @@ pub fn render_score_rvc(
     // S69 R0b① (same as the SoVITS render): voiceless frames → pitchf 0 — RVC's cover convention
     // (RMVPE zeros) — which finally lets the protect blend fire on consonants. (② removed, ear-veto.)
     zero_voiceless_frames(&mut note_hz_full, &arr);
+    // S159zp —— 见 [`fill_isolated_unvoiced`]:帧量化 + 辅音前置在快音上造出来的孤立单帧 0。
+    if fill_isolated_unvoiced() {
+        let k = fill_isolated_uv(&mut note_hz_full);
+        if k > 0 {
+            tracing::info!("score2svc: filled {k} isolated single-frame unvoiced holes");
+        }
+    }
     // S83: pre-rolled voiced onsets must carry pitch (pitchf=0 = NSF noise excitation + protect —
     // an audibly mute onset); fill from the run's nearest voiced frame.
     anchor_voiced_phone_f0(&mut note_hz_full, &arr);
@@ -2743,6 +2836,56 @@ mod tests {
     }
 
     // ── S69 R0b: f0 shaping + phrase vol ──
+
+
+    /// ⭐⭐⭐ S159zp —— **只填孤立单帧的无声洞**(用户 2026-08-23 点名的那一族)。
+    ///
+    /// 机理、坐标与归因在 [`fill_isolated_unvoiced`] 的 doc。这条判据钉四件:
+    /// ⑴ 夹在两个浊帧之间的**单帧** 0 被填成两侧均值;
+    /// ⑵ ⛔ **连续两帧的 0 一个都不许动** —— 那是真辅音的长度。
+    ///    ⚠⚠ 我原以为这一条是主刀(「边扫边写会把两帧洞逐个补掉」),**真跑那条变异是绿的**:
+    ///    谓词要求两侧都浊,而两连零的第一个 0 右邻还是 0 ⇒ 不成立 ⇒ 不会级联。
+    ///    ⇒ `fill_isolated_uv` 里那句「先收集再写」是**防御性**的,没有判据背书。
+    /// ⑶ 首尾的 0(没有一侧的锚)不许动;
+    /// ⑷ 出厂默认是**关**的 ⇒ 今天的输出逐位不变。
+    ///
+    /// ⛔ 变异(逐个真跑过):
+    /// * `1..n - 1` 改成 `0..n`(也填首尾)⇒ ⑶ **红**;
+    /// * [`FILL_ISOLATED_UV_DEFAULT`] 翻成 `true` ⇒ ⑷ **红**;
+    /// * ⚠ **「先收集再写」改成边扫边写 ⇒ 绿** —— 见 ⑵ 那段:它挡的那件事**结构上不会发生**。
+    #[test]
+    fn only_a_single_frame_unvoiced_hole_between_voiced_frames_gets_filled() {
+        // ⑶ 首尾 · ⑴ 单帧 · ⑵ 连续两帧 —— 一条轨里同时摆齐。
+        let mut hz = vec![0.0f32, 0.0, 200.0, 0.0, 240.0, 300.0, 0.0, 0.0, 400.0, 0.0];
+        let before = hz.clone();
+        let k = fill_isolated_uv(&mut hz);
+        assert_eq!(k, 1, "只有一个孤立单帧洞(读到 {k})");
+        assert_eq!(hz[3], 220.0, "⑴ 单帧洞必须填成两侧均值 (200+240)/2");
+        assert_eq!(
+            (hz[6], hz[7]),
+            (0.0, 0.0),
+            "⑵ 连续两帧的 0 一个都不许动(读到 {:?})—— 边扫边写会把它们逐个补掉",
+            (hz[6], hz[7])
+        );
+        assert_eq!((hz[0], hz[1], hz[9]), (0.0, 0.0, 0.0), "⑶ 首尾的 0 没有锚,不许动");
+        assert_eq!(
+            hz.iter().zip(&before).filter(|(a, b)| a != b).count(),
+            1,
+            "除了那一帧,其余必须逐位不变"
+        );
+
+        // ⑷ 出厂默认关 ⇒ 生产路径今天逐位不变。
+        assert!(!FILL_ISOLATED_UV_DEFAULT, "出厂默认必须是关的(翻它要成对 bump 版本载体)");
+        assert!(!parse_fill1(None), "没设 env 时跟随出厂默认");
+        assert!(parse_fill1(Some("1")) && !parse_fill1(Some("0")), "旋钮两个方向都要认");
+        assert!(!parse_fill1(Some("垃圾")), "垃圾值退回出厂默认,不许静默开启");
+
+        // ⑸ ⛔ 阴性对照:一条**全是浊音**的轨,这把刀必须一个字节都不动。
+        let mut voiced = vec![100.0f32, 200.0, 300.0, 400.0];
+        let c = voiced.clone();
+        assert_eq!(fill_isolated_uv(&mut voiced), 0);
+        assert_eq!(voiced, c, "全浊音的轨不许被碰");
+    }
 
     #[test]
     fn zero_voiceless_frames_zeroes_k_keeps_g() {
