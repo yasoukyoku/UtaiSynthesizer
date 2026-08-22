@@ -2423,6 +2423,9 @@ pub fn apply_dead_only_windows_with(
     }
     let spf = base.len() as f64 / total_frames as f64;
     let xf = (sample_rate as usize / 100).max(2); // 10 ms
+    // S159zm —— 拼接前的对齐半径(见 [`SEAM_ALIGN_MS_DEFAULT`])。
+    // ⛔ env 只在这一个入口读一次,`splice_kept` 拿的是参数(S151 笔1:判据不许读进程环境)。
+    let align = (seam_align_ms() * f64::from(sample_rate) / 1000.0).round() as usize;
     let base_rms = if match_levels { active_rms(base, sample_rate) } else { None };
     let mut shifts: Vec<i64> = jobs.iter().map(|j| j.shift).collect();
     shifts.sort_unstable();
@@ -2462,11 +2465,62 @@ pub fn apply_dead_only_windows_with(
             }
         }
     }
-    splice_kept(base, sample_rate, spf, jobs, &kept, xf, join_enabled)
+    splice_kept(base, sample_rate, spf, jobs, &kept, xf, join_enabled, align)
 }
 
 /// S152 —— 拼接层,从 `apply_dead_only_windows` 拆出来:它现在拿到的是**全部**位移的 donor
 /// 片段,所以窗边可以由音频决定(`join_rests`),而不是只能由帧数规则决定。
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`。
+/// 机理、实测与为什么它不是 S151d 那条判负,全在 [`seam_align_ms`] 的 doc。
+const SEAM_ALIGN_MS_DEFAULT: f64 = 0.0;
+
+/// ⚙ 出厂默认 = 0.0 —— `UTAI_RANGE_SEAM_ALIGN=<ms>` 在**拼接之前先把两条臂对齐**。
+///
+/// ## ⭐⭐⭐ 缺陷:我们从来没对齐过,而两条臂其实是同一条波形错开了 0.2 ms
+///
+/// 用户 2026-08-22 给的那条判据(它比任何指标都硬):
+/// 「**没有缝这件事做不到,所以缝不是问题;问题是【我们的缝会响】。**UTAU 那种拼接引擎
+/// 每个音两条缝、动不动用声码器移二三十个半音,却既没有咔哒也没有竖条纹、共振峰还保得很好
+/// ⇒ 这件事存在解法,不是物理必然。」
+///
+/// 实测(鹅妈妈 +7 × 东雪莲,S159zk 之后 30 条 **donor↔donor** 的缝;交叉淡化那 ±10 ms 上
+/// 两条臂的**归一互相关**):
+///
+/// | | 值 |
+/// |---|---|
+/// | **零滞后 ρ**(= 今天硬淡用的那个)| **−0.139** —— 基本无关 |
+/// | **最佳滞后处 \|ρ\|** | **0.928**(p90 0.975)|
+/// | 最佳滞后 | 中位 **8 样本 = 0.18 ms** |
+///
+/// ⇒ **两条臂几乎是同一条波形,只是错开了 0.18 ms。**不对齐就硬淡 = 把信号与它自己
+/// 延迟 0.18 ms 的副本相加 ⇒ **梳状陷波第一个零点落在 ~2.8 kHz**,而且它在 10 ms 里
+/// 出现又消失 ⇒ **宽带瞬态 = 谱图上那条竖线**。
+/// ⭐ 这正是 UTAU 那件事的结构差:它两侧来自**同一份录音**、交叠放在音源作者挑的稳定段
+/// ⇒ **天然对齐**;我们是两次**独立的 SVC 渲染**,而且**一次都没对过**。
+///
+/// ## 做什么
+///
+/// 淡入区上按互相关搜一个整数样本偏移 `d`(|d| ≤ 这个旋钮给的毫秒数),让进来的那条臂
+/// 与 `base` 里**已经写好的内容**对齐,然后整窗按 `d` 读。
+/// ⚠ 整窗一起挪 ⇒ 时序漂移 ≤ 这个旋钮的毫秒数(出厂候选 2 ms);窗的**另一头**有它自己
+/// 那条缝,会在轮到它时相对**挪过之后的** base 再对一次 ⇒ 自洽。
+///
+/// ⛔ 与 S151d 那条判负**不是一回事**:那次换的是淡化的**形状**(等增益 → √功率),
+/// 整曲读数一个字没动。这一条动的是**对齐**,而上面那张表说的正是「形状再怎么换,
+/// ρ = −0.139 的两条臂淡出来都是梳状」。
+///
+/// ⛔ 判据不许读这个 env(S151 笔1)——`splice_kept` 拿的是**参数**,
+/// 由 `apply_dead_only_windows` 在唯一的入口读一次。
+pub fn seam_align_ms() -> f64 {
+    parse_seam_align(std::env::var("UTAI_RANGE_SEAM_ALIGN").ok().as_deref())
+}
+
+fn parse_seam_align(v: Option<&str>) -> f64 {
+    v.and_then(|v| v.trim().parse().ok())
+        .filter(|x: &f64| x.is_finite() && *x >= 0.0 && *x <= 20.0)
+        .unwrap_or(SEAM_ALIGN_MS_DEFAULT)
+}
+
 fn splice_kept(
     base: &mut [f32],
     sample_rate: u32,
@@ -2475,6 +2529,7 @@ fn splice_kept(
     kept: &[(i64, usize, Vec<f32>)],
     xf: usize,
     join_enabled: bool,
+    align: usize,
 ) -> crate::Result<()> {
     // ⛔ `join_enabled` 是参数不是 env —— 判据不许读进程环境(S151 笔1)。
     let n = base.len();
@@ -2510,6 +2565,48 @@ fn splice_kept(
             // 窗短于双淡化 → 收缩淡化宽度;完全空窗才放弃,响亮。
             // 写入范围必须落在留下来的片段里。今天由构造一定成立(余量 = 桥接上限),
             // 但「窗边被挪出片段」是一条会静默出错的路 ⇒ 夹紧并响亮。
+            // ── S159zm —— **先对齐,再淡。**淡入区上按互相关搜一个整数样本偏移 `d`,
+            // 让进来的这条臂与 `base` 里**已经写好的内容**对齐。实测两条臂的 |ρ| 从 0.139
+            // 抬到 0.928(见 [`SEAM_ALIGN_MS_DEFAULT`] 的那张表)。
+            // ⛔ 只在**真的要淡入**的时候搜(`a > 0`);缓冲头上没有可对齐的东西。
+            // ⚠ 整窗一起挪 ⇒ 时序漂移 ≤ 旋钮的毫秒数;窗的另一头有它自己那条缝,
+            //   会在轮到它时相对**挪过之后的** base 再对一次 ⇒ 自洽。
+            let d: isize = if align > 0 && a > 0 && a >= *seg_lo {
+                let w = xf.min(b.saturating_sub(a));
+                let r = align as isize;
+                let dot = |off: isize| -> f64 {
+                    let lo = a as isize + off - *seg_lo as isize;
+                    if lo < 0 || (lo as usize) + w > seg.len() || a + w > n {
+                        return f64::NEG_INFINITY;
+                    }
+                    let (u, v) = (&base[a..a + w], &seg[lo as usize..lo as usize + w]);
+                    let (mut num, mut du, mut dv) = (0.0f64, 0.0f64, 0.0f64);
+                    for i in 0..w {
+                        let (x, y) = (f64::from(u[i]), f64::from(v[i]));
+                        num += x * y;
+                        du += x * x;
+                        dv += y * y;
+                    }
+                    if du <= 0.0 || dv <= 0.0 {
+                        return f64::NEG_INFINITY;
+                    }
+                    num / (du * dv).sqrt()
+                };
+                // ⛔ 与 `0` 比而不是与 `NEG_INFINITY` 比:一个够不着的偏移不许赢过「不挪」。
+                let base_score = dot(0);
+                let mut best = (0isize, base_score);
+                if w >= 8 && base_score.is_finite() {
+                    for off in -r..=r {
+                        let sc = dot(off);
+                        if sc > best.1 {
+                            best = (off, sc);
+                        }
+                    }
+                }
+                best.0
+            } else {
+                0
+            };
             let (sa, sb) = (*seg_lo, *seg_lo + seg.len());
             if a < sa || b > sb {
                 tracing::warn!(
@@ -2550,7 +2647,9 @@ fn splice_kept(
                 } else {
                     1.0
                 };
-                base[k] = base[k] * (1.0 - w) + seg[k - *seg_lo] * w;
+                // S159zm —— 带上对齐偏移 `d`;越界时退回 0(不挪),而不是 panic。
+                let si = (k as isize - *seg_lo as isize + d).clamp(0, seg.len() as isize - 1);
+                base[k] = base[k] * (1.0 - w) + seg[si as usize] * w;
             }
         }
     Ok(())
@@ -4066,6 +4165,91 @@ mod tests {
 
     // ── 共享拼接器(两轨+audition 唯一执行点;审查 S85d:搬家丢测已补钉)──
 
+
+    /// ⭐⭐⭐ S159zm —— **拼接前先对齐**:缝两侧其实是同一条波形,只是错开了零点几毫秒。
+    ///
+    /// 机理与实测在 [`SEAM_ALIGN_MS_DEFAULT`] 的 doc(30 条 donor↔donor 的缝:
+    /// 零滞后 ρ **−0.139**、最佳滞后处 |ρ| **0.928**、最佳滞后中位 **8 样本 = 0.18 ms**)。
+    ///
+    /// 这条判据钉三件:
+    /// ⑴ **旋钮关着时逐位不变**(出厂默认 0.0 ⇒ 今天的输出一个样本都不许动);
+    /// ⑵ 开着时**真的找到那个偏移** —— donor 是 base **延迟 k 个样本**的副本,
+    ///    对齐之后淡化区必须与 base 逐样本一致(误差 < 1e-6);
+    /// ⑶ **半径不够时不许乱挪** —— 把半径设成小于真实偏移,输出不许比不挪更差。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
+    #[test]
+    fn the_splicer_aligns_the_two_arms_before_it_crossfades() {
+        const SR: u32 = 48_000;
+        const N: usize = 48_000;
+        const LAG: usize = 13; // 0.27 ms —— 与实测中位(8 样本)同一个量级
+        // 一段**逐样本都在变**的材料:等值常量会让「对齐」这件事恒真。
+        let wave = |i: usize| -> f32 {
+            let t = i as f64 / f64::from(SR);
+            ((2.0 * std::f64::consts::PI * 220.0 * t).sin()
+                + 0.5 * (2.0 * std::f64::consts::PI * 517.0 * t).sin()) as f32
+        };
+        let base0: Vec<f32> = (0..N).map(wave).collect();
+        // donor = base 延迟 LAG 个样本 ⇒ 正确的对齐偏移就是 −LAG(往回读)。
+        let donor: Vec<f32> = (0..N).map(|i| if i < LAG { 0.0 } else { wave(i - LAG) }).collect();
+        let jobs = [DeadJob { shift: -6, start: 20, end: 60 }];
+
+        let run = |align_ms: f64| -> Vec<f32> {
+            let mut b = base0.clone();
+            let align = (align_ms * f64::from(SR) / 1000.0).round() as usize;
+            let spf = b.len() as f64 / 100.0;
+            let mut kept: Vec<(i64, usize, Vec<f32>)> = Vec::new();
+            if let Some((lo, hi)) = donor_read_span(&jobs[0], spf, b.len(), MERGE_BRIDGE_FRAMES) {
+                kept.push((0, lo, donor[lo..hi].to_vec()));
+            }
+            let xf = (SR as usize / 100).max(2);
+            splice_kept(&mut b, SR, spf, &jobs, &kept, xf, false, align).unwrap();
+            b
+        };
+
+        // ⑴ 关着 = 今天,逐位。
+        let off = run(0.0);
+        assert_eq!(off, run(0.0), "同一档两次跑必须逐位相同(纯函数)");
+
+        // ⑵ 开着必须找到那个偏移 —— 对齐之后 donor 与 base 逐样本一致 ⇒ 淡化区就是 base。
+        let on = run(1.0); // 半径 48 样本 > LAG
+        assert_ne!(on, off, "对齐开着却逐位相同 ⇒ 它没生效");
+        let a = (20.0 * (N as f64 / 100.0)) as usize; // 窗起点(样本)
+        let xf = (SR as usize / 100).max(2);
+        let err = |y: &[f32], lo: usize, hi: usize| -> f64 {
+            (lo..hi).map(|i| (f64::from(y[i]) - f64::from(base0[i])).abs()).fold(0.0, f64::max)
+        };
+        assert!(
+            err(&on, a, a + xf) < 1e-6,
+            "对齐之后淡化区必须与 base 一致(最大逐样本差 {})",
+            err(&on, a, a + xf)
+        );
+        assert!(
+            err(&off, a, a + xf) > 0.05,
+            "阴性对照:不对齐时淡化区必须**明显**偏离 base(读到 {}),否则 ⑵ 是恒真的",
+            err(&off, a, a + xf)
+        );
+
+        // ⑶ ⭐ **旋钮真的在限半径**:0.1 ms = 5 样本 < LAG(13)⇒ 它**够不着**那个偏移,
+        //    误差必须仍然在「不挪」的量级上(而不是被修好)。
+        // ⛔ 写这条判据时我先写的是「不许比不挪更差」,而变异(把 `r` 从 `align` 换成 `xf`)
+        //    **照绿** —— 半径变大之后它照样找得到,「不更差」当然成立。
+        //    ⇒ 要盯的是**上界**,断言必须是「够不着」而不是「不更差」。
+        let small = run(0.1);
+        assert!(
+            err(&small, a, a + xf) > 0.5 * err(&off, a, a + xf),
+            "半径 5 样本竟然把 13 样本的偏移修好了 ⇒ 旋钮没在限半径({} vs 不挪 {})",
+            err(&small, a, a + xf),
+            err(&off, a, a + xf)
+        );
+        assert!(
+            err(&small, a, a + xf) <= err(&off, a, a + xf) + 1e-9,
+            "半径不够时反而比不挪更差({} vs {})",
+            err(&small, a, a + xf),
+            err(&off, a, a + xf)
+        );
+    }
+
     #[test]
     fn dead_only_splice_blends_only_the_windows() {
         // 窗外逐位不动、窗心=donor、缘上 10ms 余弦 ramp 半程=0.5。
@@ -4278,9 +4462,9 @@ mod tests {
         let kept: Vec<(i64, usize, Vec<f32>)> = vec![(0, 0, left), (1, 0, right)];
 
         let mut off = base.clone();
-        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false).unwrap();
+        splice_kept(&mut off, sr, spf, &jobs, &kept, xf, false, 0).unwrap();
         let mut on = base.clone();
-        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true).unwrap();
+        splice_kept(&mut on, sr, spf, &jobs, &kept, xf, true, 0).unwrap();
 
         // ⓐ 关着 ⇒ 那个洞必须还在:52800 开窗之后是右 donor 的静音。
         assert!(
@@ -4384,7 +4568,7 @@ mod tests {
             (1, 53_000, right[53_000..(380 * 480)].to_vec()),
         ];
         let mut out = base.clone();
-        splice_kept(&mut out, sr, spf, &diff, &short, xf, true).unwrap();
+        splice_kept(&mut out, sr, spf, &diff, &short, xf, true, 0).unwrap();
         assert_eq!(out[0], -1.0, "窗外仍是 base");
         assert!((out[30_000] - 0.5).abs() < 1e-6, "左窗内仍是左 donor");
     }
@@ -5888,6 +6072,7 @@ mod tests {
             ("LPC_ORDER_DEFAULT", "pub fn lpc_order("),
             ("WIN_PERIODS_DEFAULT", "pub fn win_periods("),
             ("EDGE_FILL_DEFAULT", "pub fn edge_fill("),
+            ("SEAM_ALIGN_MS_DEFAULT", "pub fn seam_align_ms("),
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
