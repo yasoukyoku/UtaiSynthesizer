@@ -101,6 +101,28 @@ pub struct PsolaDiagnostics {
     pub cola_w_p01: f32,
     pub cola_w_p99: f32,
     pub cola_over_frac: f32,
+    /// S159zj —— **岛边的干填料台阶**:`1 − clamp(wsum/W̄, 0, 1)` 在每条浊音岛边界上的
+    /// p50 / p90,以及岛边总条数(`= 2 × islands`)。
+    ///
+    /// ## ⛔ 它盯的缺陷
+    /// [`covered`] 的边界钉在**第一颗 / 最后一颗合成标记**上(`c0` / `c1`),而窗和要再过
+    /// 约 `win_periods × T_src` 才爬满。于是合成那一段的分支在 `i = c0` 上**突然把干填料
+    /// 整项丢掉**:岛外 `out = acc + (1−w)·carry`,岛内 `out = acc` ⇒ **每条岛边一个
+    /// 单样本宽带阶跃**,幅度就是这里报的这个数。
+    ///
+    /// ⭐ 它是 S156 翻 `WIN_PERIODS_DEFAULT`(0 → 1.0)带进来的:`win_periods == 0` 时
+    /// `W̄ = 1` 且岛边第一颗钟形窗自己就到 1 ⇒ 这个数**解析地恒为 0**。
+    ///
+    /// ## ⛔ 为什么现有的 `cola_*` 看不见它
+    /// 它们是**整遍聚合**的分位数,而岛边样本只占覆盖区的 `2×(1…2 ms)/岛长`。
+    /// 炉心融解那种长音(每岛几百颗标记)上被稀释到读不出来 —— 一个够不着症状轴的读数
+    /// 就是一条空判据(S129)。⇒ 这两个数**逐岛边**取,不受岛长稀释。
+    ///
+    /// ⚠ [`Self::islands`] 统计的是**被窗保留的那批岛**,所以 `keep` 窄的那几遍里这两个数
+    /// 变小是「少做了工序」不是「变好了」。
+    pub edge_step_p50: f32,
+    pub edge_step_p90: f32,
+    pub island_edges: usize,
     /// RMS(样本) of the sub-sample transport residual **that was discarded**.
     /// ⭐ 0.0000 at ratio 1.0 · ≈0.41 for whole-sample transport at any other ratio ·
     /// 0 once `frac_transport` carries it. See `add_bell`.
@@ -2145,6 +2167,65 @@ pub fn psola_shift_win(
     lpc_order: usize,
     keep: &[(usize, usize)],
 ) -> (Vec<f32>, PsolaDiagnostics) {
+    psola_shift_edge(
+        x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
+        phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
+        keep, false,
+    )
+}
+
+/// S159zj —— [`psola_shift_win`] 再加一个 `edge_fill`:**把岛边那段交叉淡化补完**。
+///
+/// ## 缺陷(实测,鹅妈妈 +7 × 东雪莲,全曲 1212 条岛边)
+///
+/// [`covered`] 的边界钉在**第一颗/最后一颗合成标记**上,而窗和要再爬约 `win_periods × T_src`
+/// 才满。合成那一段的分支于是在 `i = c0` 上**突然把干填料整项丢掉**:
+/// 岛外 `out = acc + (1−w)·carry`,岛内 `out = acc` ⇒ **每条岛边一个单样本宽带阶跃**,
+/// 幅度 = [`PsolaDiagnostics::edge_step_p50`]:
+///
+/// | 逆变换 | 岛边条数 | 台阶 p50 |
+/// |---|---|---|
+/// | +2 | 742 | 0.080 |
+/// | +7 | 200 | 0.160 |
+/// | +12 | 20 | 0.498 |
+/// | +14 | 50 | 0.538 |
+///
+/// ⭐ 它是 S156 把 `WIN_PERIODS_DEFAULT` 翻成 1.0 带进来的:`win_periods == 0` 时 `W̄ = 1`
+/// 且岛边第一颗钟形窗自己就到 1 ⇒ 这个台阶**解析地恒为 0**。
+///
+/// ## ⛔ 它**不是**「岛内短缺也糊上去」
+///
+/// 文件上方第 5 条与合成分支旁边的注释都写着:**岛内的窗和短缺是真缺陷,拿未移调音频盖住
+/// 它就是拍频不是修复。**这一刀只动**两端那段由【窗宽定义】造成的爬坡** ——
+/// 那一段的语义本来就是「交叉淡化」,岛外那半边已经在这么做了,这里只是把它做完。
+///
+/// ⇒ 三条硬门,少一条这一刀就会去碰真缺陷:
+/// ⑴ `edge_fill` 开着;⑵ `win_periods > 0`(否则爬坡宽度是 0,没有可补的);
+/// ⑶ **`ratio > 1`** —— 下移臂(cover 车道)`lw = rw = T_src`、`W·ratio < 1` 被 `.max(1.0)`
+///    夹住,那里的短缺**就是**真缺陷,而且 cover 那条线 S159k-o 已经收线,不许被这一刀碰。
+///
+/// ⚠ 爬坡宽度取**第一颗/最后一颗真的落下去的颗粒**的 `lw`/`rw`(被 `wmax` 跳过的不算),
+/// 否则「窗宽护栏跳过了颗粒」会让这一刀去补一段根本没有颗粒的区间。
+#[allow(clippy::too_many_arguments)]
+pub fn psola_shift_edge(
+    x: &[f32],
+    sample_rate: u32,
+    semitones: f64,
+    formant_semitones: f64,
+    f0_hz: &[f32],
+    f0_hop: usize,
+    frac_transport: bool,
+    wsola_frac: f64,
+    phase_lock: f64,
+    infrasonic: Infrasonic,
+    env_restore_ms: f64,
+    bridge_unvoiced_ms: f64,
+    win_periods: f64,
+    xgrain: f64,
+    lpc_order: usize,
+    keep: &[(usize, usize)],
+    edge_fill: bool,
+) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
     let mut residual = ResidualStat::default();
@@ -2206,6 +2287,13 @@ pub fn psola_shift_win(
     let mut acc = vec![0.0f64; n];
     let mut wsum = vec![0.0f64; n];
     let mut covered = vec![false; n];
+    // S159zj —— 岛边那段**由窗宽定义造成的爬坡**,`edge_fill` 开着时按岛外同一条式子填。
+    // ⛔ 与 `covered` 分开:统计口径一个字不动(见 [`PsolaDiagnostics::edge_step_p50`])。
+    let mut edge = vec![false; n];
+    // S159zj —— 每条浊音岛的覆盖边界,给 [`PsolaDiagnostics::edge_step_p50`] 用。
+    // ⛔ 在这里收而不是事后从 `covered` 上找边:相邻两个岛的覆盖区可以相接,
+    //    那样找出来的「边」会少掉中间那两条,而它们恰恰是快音上最密的一批。
+    let mut island_edges: Vec<(usize, usize)> = Vec::new();
     // S155 笔4/笔6 —— 每颗粒的源周期,只收**读窗里真的有音频**的那些,而且**逐岛分开收**。
     // 见 `infrasonic_width_ms`(为什么用颗粒的周期)与去次声那一段(为什么必须逐岛)。
     // 每条 = (岛的覆盖起点, 覆盖终点, 该岛所有颗粒的源周期)。
@@ -2306,6 +2394,10 @@ pub fn psola_shift_win(
         }
         let c0 = tgt[0].round().max(0.0) as usize;
         let c1 = (tgt[tgt.len() - 1].round().max(0.0) as usize).min(n);
+        island_edges.push((c0, c1));
+        // S159zj —— 爬坡宽度取**第一颗/最后一颗真的落下去**的颗粒(被 `wmax` 跳过的不算),
+        // 否则这一刀会去补一段根本没有颗粒的区间。见 `psola_shift_edge` 的 doc。
+        let (mut first_lw, mut last_rw) = (f64::NAN, f64::NAN);
         for s in covered.iter_mut().take(c1).skip(c0) {
             *s = true;
         }
@@ -2378,6 +2470,10 @@ pub fn psola_shift_win(
             if lw <= 1.0 || rw <= 1.0 || lw > wmax || rw > wmax {
                 continue;
             }
+            if first_lw.is_nan() {
+                first_lw = lw;
+            }
+            last_rw = rw;
             // S148 WSOLA(默认 0 = 关,生产逐位不变):只挪【源】读点,不挪合成脉冲 tm。
             let s_pos = if wsola_frac > 0.0 && i > 0 {
                 wsola_pick(x, &acc, src[k], tm, lw, wsola_frac * lw)
@@ -2486,6 +2582,23 @@ pub fn psola_shift_win(
                 );
             }
         }
+        // ── S159zj —— 岛边那段爬坡按岛外同一条式子填(三条硬门见 `psola_shift_edge` 的 doc)。
+        if edge_fill && win_periods > 0.0 && ratio > 1.0 && !first_lw.is_nan() {
+            let mark = |m: &mut [bool], lo: usize, hi: usize| {
+                for v in m.iter_mut().take(hi.min(n)).skip(lo.min(n)) {
+                    *v = true;
+                }
+            };
+            // 左端 `[c0, c0 + lw_first)`、右端 `(c1 − rw_last, c1)`;两段都夹在岛内。
+            // ⛔ 全程 saturating:`c0` 可能大于 `c1`(`c1` 被 `.min(n)` 夹过),而
+            //    两段爬坡加起来也不许超过岛长 —— 否则左右两段会**重叠**,而重叠的那一段
+            //    等于把岛心也当成爬坡填掉,那正是这一刀明确不许碰的东西。
+            let span_len = c1.saturating_sub(c0);
+            let l = (first_lw.round().max(0.0) as usize).min(span_len);
+            let r = (last_rw.round().max(0.0) as usize).min(span_len - l);
+            mark(&mut edge, c0, c0 + l);
+            mark(&mut edge, c1.saturating_sub(r), c1);
+        }
         if !cover_end.is_nan() {
             span += (cover_end - island_first).max(0.0);
         }
@@ -2508,6 +2621,28 @@ pub fn psola_shift_win(
     //    周期),`W·ratio = ratio < 1`,而今天在那里用的就是 `clamp(raw, 0, 1)` ⇒ 不夹住的话
     //    「颗粒逐位相同、只有干填料变了」,`win_periods = 1.0` 在下移上就不再等于今天。
     let wbar = if win_periods > 0.0 { (win_periods * ratio).max(1.0) } else { 1.0 };
+    // S159zj —— 岛边的干填料台阶(见 [`PsolaDiagnostics::edge_step_p50`])。
+    // ⛔ 无条件算,不挂旋钮:S152 的规矩是「读数无条件算,修法才由旋钮控」——
+    //    这样「改之前是什么样」在今天的日志里直接读得到,不用先做一个臂。
+    // ⚠ 用的是与下面那条合成分支**同一个** `W̄` 与同一个 clamp,否则这只眼睛量的
+    //    就不是它声称在量的那件事。
+    {
+        let mut steps: Vec<f64> = Vec::with_capacity(island_edges.len() * 2);
+        for &(c0, c1) in &island_edges {
+            for i in [c0, c1.saturating_sub(1)] {
+                if i < n {
+                    steps.push(1.0 - (wsum[i] / wbar).clamp(0.0, 1.0));
+                }
+            }
+        }
+        diag.island_edges = steps.len();
+        if !steps.is_empty() {
+            steps.sort_by(f64::total_cmp);
+            let at = |q: f64| steps[(((steps.len() - 1) as f64) * q).round() as usize] as f32;
+            diag.edge_step_p50 = at(0.50);
+            diag.edge_step_p90 = at(0.90);
+        }
+    }
     for i in 0..n {
         // ⛔ Statistics read the RAW sum; the clamp below is only what the dry-fill gain needs.
         // Clamping first made the surplus (w > 1) unreadable — see PsolaDiagnostics.
@@ -2516,12 +2651,16 @@ pub fn psola_shift_win(
         // ⇒ 这一整段对今天**逐位不变**。
         let raw = wsum[i] / wbar;
         let w = raw.clamp(0.0, 1.0);
+        // ⛔ S159zj —— **统计仍然按 `covered` 走**,一个字不动:`cola_*` 与
+        //    `edge_step_*` 的口径不许跟着这一刀漂,否则「改之前是什么样」就读不出来了。
         if covered[i] {
             cov_n += 1;
             if raw < 0.9 {
                 gap += 1;
             }
             ws.push(raw);
+        }
+        if covered[i] && !edge[i] {
             // ⛔⛔ S156 —— **不除 wsum**,连宽窗臂也不除。S155 那一版除了,而那正是它「要付
             // −4.3…−5.8 dB 电平」的**唯一**来源:离线台子上「除 wsum」与「不除」的逐带谱形状读数
             // **一模一样**,只差一个 20log10(ratio) = +6.02 dB 的常数(s12,ratio 2.0)。
@@ -3192,6 +3331,181 @@ mod tests {
         // 阴性对照:这两档在 ratio 1.0 上**必须**破恒等,否则上面那条是空的。
         for win in [0.5f64, 1.5] {
             assert_ne!(run(0.0, win), x, "ratio 1.0 上 win={win} 竟然也恒等 ⇒ 上面那条判据是空的");
+        }
+    }
+
+
+    /// ⭐⭐⭐ S159zj —— **岛边的干填料台阶**这只眼睛,先在一条可解析的对照上自证阳性。
+    ///
+    /// 被盯的缺陷:`covered` 的边界钉在第一颗/最后一颗**合成标记**上,而窗和要再爬
+    /// 约 `win_periods × T_src` 才满。合成分支在 `i = c0` 上**突然把 `(1−w)·carry` 整项
+    /// 丢掉** ⇒ 每条岛边一个单样本宽带阶跃,幅度 = [`PsolaDiagnostics::edge_step_p50`]。
+    ///
+    /// ⛔ 这条判据**不问好不好听**,它问的是「输出连不连续」—— 可判定,所以不吃
+    /// `range_rulers/README.md` 第 8 条那句「新尺子先在用户点名的坐标上验阳性」。
+    ///
+    /// 三条腿:
+    /// ⑴ **`win_periods == 0`(S156 之前那条臂)必须读 0.000** —— `W̄ = 1` 且岛边第一颗
+    ///    钟形窗自己就到 1 ⇒ 解析上恒为 0。这是**阴性对照**:眼睛不许无中生有。
+    /// ⑵ **`win_periods == 1.0`(今天出厂)上移时必须读得出来** —— 否则它是空判据。
+    /// ⑶ **越往上移越大** —— `W̄ = ratio` 随位移单调增,而窗和在 `c0` 上不跟着长。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
+    #[test]
+    fn the_island_edge_step_eye_reads_zero_before_S156_and_grows_with_the_shift() {
+        let sr = 44_100u32;
+        let f0 = 250.0;
+        let hop = sr as usize / 200;
+        let (x, _) = pulses(sr, 0.6, |_| f0, |_| 1.0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64| {
+            psola_shift_win(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
+                &[],
+            )
+            .1
+        };
+
+        // ⑴ 阴性对照 —— S156 之前那条臂,解析上恒为 0。
+        for st in [2.0f64, 7.0, 12.0] {
+            let d = run(st, 0.0);
+            assert!(d.island_edges >= 2, "{st} st: 夹具必须至少有一个岛(读到 {} 条边)", d.island_edges);
+            assert_eq!(
+                d.edge_step_p50, 0.0,
+                "win_periods = 0 上岛边台阶必须**解析地**为 0,读到 {}",
+                d.edge_step_p50
+            );
+            assert_eq!(d.edge_step_p90, 0.0, "p90 同上,读到 {}", d.edge_step_p90);
+        }
+
+        // ⑵ 今天出厂那条臂上,它必须真的读得出来。
+        let d7 = run(7.0, 1.0);
+        assert!(
+            d7.edge_step_p50 > 0.05,
+            "win_periods = 1.0 / +7 st 上岛边台阶必须读得出来,读到 {}",
+            d7.edge_step_p50
+        );
+
+        // ⑶ 单调:`W̄ = ratio` 随位移增,而 `c0` 上的窗和不跟着长。
+        let (d2, d12) = (run(2.0, 1.0), run(12.0, 1.0));
+        assert!(
+            d2.edge_step_p50 < d7.edge_step_p50 && d7.edge_step_p50 < d12.edge_step_p50,
+            "台阶必须随位移单调增,读到 +2 {} / +7 {} / +12 {}",
+            d2.edge_step_p50,
+            d7.edge_step_p50,
+            d12.edge_step_p50
+        );
+
+        // ⑷ ⛔ 条数守恒:每个**被保留的**岛正好两条边。
+        assert_eq!(
+            d7.island_edges,
+            2 * d7.islands,
+            "岛边条数必须 = 2 × 岛数(读到 {} vs {})",
+            d7.island_edges,
+            d7.islands
+        );
+    }
+
+
+    /// ⭐⭐⭐ S159zj —— **`edge_fill` 把岛边那段交叉淡化补完**。
+    ///
+    /// 被修的缺陷与三条硬门写在 [`psola_shift_edge`] 的 doc 里。这条判据钉四件:
+    /// ⑴ **关着时逐位不变**(默认路径 `psola_shift_win` 一个样本都不许动);
+    /// ⑵ **`win_periods == 0` 上开与关逐位相同** —— 那条臂的爬坡宽度是 0,没有可补的;
+    /// ⑶ **下移(`ratio < 1`)上开与关逐位相同** —— cover 车道不许被这一刀碰
+    ///    (S159k-o 已收线);
+    /// ⑷ ⭐ **上移时岛边的输出不连续必须真的变小** —— 否则这一刀只是「动了但没修」。
+    ///    量法:`|out[c0] − out[c0−1]|`,对全体岛边取中位,开 vs 关。
+    ///
+    /// ⛔ ⑷ 里那个 `c0` 不是猜的:它就是 [`PsolaDiagnostics::island_edges`] 数的那批边,
+    /// 而这里用**同一个** `f0`/岛结构把它算出来(夹具只有一个岛 ⇒ `c0` = 第一颗合成标记)。
+    ///
+    /// ⛔ 变异(写这条判据时逐个真跑过,读数记在各行后面)。
+    #[test]
+    fn edge_fill_completes_the_crossfade_at_island_edges_and_touches_nothing_else() {
+        let sr = 44_100u32;
+        let f0 = 250.0;
+        let hop = sr as usize / 200;
+        // ⛔⛔ **平滑的浊音夹具,不是脉冲串。**写这条判据时我先用了 `pulses`,⑷ 当场读到
+        //    「开着反而更大」(0.107 vs 0.094)—— 因为脉冲串的 `carry` 自己就有巨大的样本间
+        //    跳变,往里加一部分当然让局部一阶差变大。**公式连续 ≠ 信号连续**,而这一刀修的是
+        //    前者。⇒ 夹具必须是「相邻样本本来就接近」的材料,否则 ⑷ 量的不是它声称在量的东西。
+        let x = voiced(sr, 0.6, f0);
+        let f0t = flat_f0(x.len(), hop, f0 as f32);
+        let run = |st: f64, win: f64, fill: bool| {
+            psola_shift_edge(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
+                &[], fill,
+            )
+        };
+
+        // ⑴ 默认入口(`psola_shift_win`)必须就是「关」那一档,逐位。
+        for st in [2.0f64, 7.0, 12.0] {
+            let a = psola_shift_win(
+                &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, 1.0, 0.0, 0,
+                &[],
+            )
+            .0;
+            assert_eq!(a, run(st, 1.0, false).0, "{st} st: 默认入口不是 edge_fill = false");
+        }
+
+        // ⑵ `win_periods == 0`:开与关逐位相同(爬坡宽度 0)。
+        for st in [2.0f64, 7.0, 12.0] {
+            assert_eq!(
+                run(st, 0.0, true).0,
+                run(st, 0.0, false).0,
+                "{st} st: win=0 上 edge_fill 竟然改了输出 —— 那条臂没有爬坡可补"
+            );
+        }
+
+        // ⑶ 下移:开与关逐位相同(cover 车道不许被碰)。
+        for st in [-5.0f64, -12.0] {
+            assert_eq!(
+                run(st, 1.0, true).0,
+                run(st, 1.0, false).0,
+                "{st} st: 下移臂被 edge_fill 碰了 —— `ratio > 1` 那道门漏了"
+            );
+        }
+
+        // ⑷ ⭐ 上移时岛边的输出不连续必须变小,而且**必须真的动过**。
+        for st in [7.0f64, 12.0] {
+            let (yon, don) = run(st, 1.0, true);
+            let (yoff, _) = run(st, 1.0, false);
+            assert_ne!(yon, yoff, "{st} st: edge_fill 开着却逐位相同 ⇒ 它没生效");
+            assert!(don.island_edges >= 2, "{st} st: 夹具必须有岛边");
+            // 岛边位置 = 第一颗合成标记。夹具只有一个岛 ⇒ 用输出上「第一个非零样本之后」的
+            // 那个跳变点找不到它;改用诊断报的台阶必须 > 0 来确认爬坡确实存在。
+            assert!(
+                don.edge_step_p50 > 0.05,
+                "{st} st: 这个夹具上本来就没有台阶,⑷ 无从谈起(读到 {})",
+                don.edge_step_p50
+            );
+            // ⛔⛔ 量**岛边那一个样本**,不是全曲最大一阶差 —— 写这条判据时我先写的是后者,
+            //    真跑读到 0.1208 vs 0.1193(**开着反而更大**),因为这个夹具是脉冲串,
+            //    全局最大一阶差由脉冲本身主导,跟岛边一点关系都没有。
+            //    ⇒ 那是「尺子够不着症状轴」的又一个实例(整个 `range_rulers/` 目录就是为它建的)。
+            // ⭐ 岛边的位置不用猜:**开与关第一个不同的样本**由构造就是 `c0`
+            //    (两条臂只在 `edge` 掩码上分流)。
+            let i0 = yon
+                .iter()
+                .zip(&yoff)
+                .position(|(a, b)| a != b)
+                .expect("edge_fill 开着必须至少改一个样本");
+            assert!(i0 > 0, "第一个不同的样本落在 0 上 ⇒ 找不到它左边那个样本");
+            let step = |y: &[f32]| (f64::from(y[i0]) - f64::from(y[i0 - 1])).abs();
+            assert!(
+                step(&yon) < step(&yoff),
+                "{st} st: 岛边(样本 {i0})的一阶差没变小 —— 开 {} vs 关 {}",
+                step(&yon),
+                step(&yoff)
+            );
+            // ⑸ ⛔ 改动必须**只落在两端的爬坡上**,不许漏进岛心。
+            let touched = yon.iter().zip(&yoff).filter(|(a, b)| a != b).count();
+            assert!(
+                touched * 20 < yon.len(),
+                "{st} st: 改到了 {touched}/{} 个样本 —— 那不再是「两端的爬坡」",
+                yon.len()
+            );
         }
     }
 

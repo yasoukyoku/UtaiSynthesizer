@@ -3118,6 +3118,57 @@ fn parse_lpc_order(v: Option<&str>) -> usize {
 /// ⛔ 见 [`lpc_order`]。翻它必须成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`。
 const LPC_ORDER_DEFAULT: usize = 0;
 
+/// ⚙ 出厂默认 = false —— `UTAI_PSOLA_EDGEFILL=1` 把**岛边那段交叉淡化补完**。
+///
+/// ## 它修什么(S159zj 实测,鹅妈妈 +7 × 东雪莲,全曲 **1212 条岛边**)
+///
+/// `psola.rs` 的 `covered` 边界钉在**第一颗/最后一颗合成标记**上,而窗和要再爬约
+/// `win_periods × T_src` 才满。合成分支于是在 `i = c0` 上**突然把干填料整项丢掉**:
+/// 岛外 `out = acc + (1−w)·carry`,岛内 `out = acc`。
+///
+/// | 逆变换 | 岛边条数 | 台阶 `1−w` p50 | ≈ |
+/// |---|---|---|---|
+/// | +2 | **742** | 0.080 | −22 dB |
+/// | +7 | 200 | 0.160 | −16 dB |
+/// | +12 | 20 | 0.498 | **−6 dB** |
+/// | +14 | 50 | 0.538 | −5.4 dB |
+///
+/// ⭐ 它是 S156 把 [`WIN_PERIODS_DEFAULT`] 翻成 1.0 带进来的:`win_periods == 0` 时
+/// `W̄ = 1` ⇒ 这个台阶**解析地恒为 0**。⇒ 「音头音尾竖直条纹」这一族在 S156 之前
+/// 结构上不存在,这是它的一条**可证伪的**出处。
+///
+/// ## ⛔ 它**不是**「岛内短缺也糊上去」
+///
+/// `psola.rs` 文件头第 5 条与合成分支旁边的注释都写着:**岛内的窗和短缺是真缺陷,
+/// 拿未移调音频盖住它是拍频不是修复。**这一刀只动两端那段由**窗宽定义**造成的爬坡 ——
+/// 那一段的语义本来就是交叉淡化,岛外那半边已经在这么做,这里只是把它做完。
+/// 三条硬门(`edge_fill` / `win_periods > 0` / **`ratio > 1`**)见 `psola_shift_edge`。
+///
+/// ## ⚠ 为什么默认先关
+///
+/// 合成夹具上**证不出它更好**:`pulses` 那种脉冲串里 `carry` 自己就有巨大的样本间跳变,
+/// 补进去反而让局部一阶差变大(实测 0.107 vs 0.094)—— **公式连续 ≠ 信号连续**。
+/// 换成平滑浊音夹具才读到变小。⇒ 合成夹具只能钉**结构**(逐位不变的三条门 + 改动只落在
+/// 两端),**好不好**必须在真素材上量,而那一步用的是
+/// 「岛边 vs 岛内的单样本一阶差 / 局部 RMS」,逆变换**前**的 donor 当阴性对照
+/// (S159zi 在那把尺子上读到岛边 +2.52 dB 而 donor 侧只有 +0.17)。
+/// ⛔ 翻默认要成对 bump [`RANGE_ALGO_VERSION`] 与 `audition_cache_tag`。
+pub fn edge_fill() -> bool {
+    parse_edge_fill(std::env::var("UTAI_PSOLA_EDGEFILL").ok().as_deref())
+}
+
+/// The env parse, as a pure function so it can be asserted without touching process state.
+fn parse_edge_fill(v: Option<&str>) -> bool {
+    match v.map(str::trim) {
+        Some("1" | "true" | "on" | "yes") => true,
+        Some("0" | "false" | "off" | "no") => false,
+        _ => EDGE_FILL_DEFAULT,
+    }
+}
+
+/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
+const EDGE_FILL_DEFAULT: bool = false;
+
 /// ⚙ 出厂默认 = 1.0 —— 教科书宽读窗 = 开(S156 翻)
 ///
 /// `UTAI_PSOLA_WIN=<周期数>` —— 颗粒**读**窗的半宽是几个**源**周期。
@@ -3460,8 +3511,9 @@ pub fn apply_inverse_windowed_with(
             let bridge = bridge_unvoiced_ms();
             let win = win_periods();
             let xg = xgrain();
+            let fill = edge_fill();
             let lpc = lpc_order();
-            let (out, diag) = utai_dsp::psola::psola_shift_win(
+            let (out, diag) = utai_dsp::psola::psola_shift_edge(
                 &audio,
                 sample_rate,
                 semis,
@@ -3478,6 +3530,7 @@ pub fn apply_inverse_windowed_with(
                 xg,
                 lpc,
                 keep,
+                fill,
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
@@ -3529,6 +3582,7 @@ pub fn apply_inverse_windowed_with(
                 "range-extend: inverse {semis:+.0} st, formant kappa {k:.2}, psola {} islands / \
                  {} marks ({}/{} islands in window, keep {:.1}%{}), cola gap {:.2}% \
                  (w p01/median/p99 {:.3}/{:.3}/{:.3}, over 1.05 {:.2}%), \
+                 edge step p50/p90 {:.3}/{:.3} over {} island edges, \
                  src uncovered {:.2}%, infrasonic {:.2}%{}, env dev p50 {:.3} dB{}, \
                  transport residual {:.4}{}, hp gate {:+.1} dB",
                 diag.islands,
@@ -3542,6 +3596,12 @@ pub fn apply_inverse_windowed_with(
                 diag.cola_w_median,
                 diag.cola_w_p99,
                 diag.cola_over_frac * 100.0,
+                // S159zj —— **岛边的干填料台阶**(见 `PsolaDiagnostics::edge_step_p50`)。
+                // ⛔ 无条件打:它盯的缺陷今天**就在出厂臂上**,而上面那几个 `cola_*` 是整遍
+                //    聚合的分位数,岛边样本被岛长稀释掉 ⇒ 结构上看不见它。
+                diag.edge_step_p50,
+                diag.edge_step_p90,
+                diag.island_edges,
                 diag.src_uncovered_frac * 100.0,
                 // S152 —— 这一项**无条件**算,所以「今天是什么样」在生产日志里就能读到,
                 // 不必等改动打开。打开时再补一句「真的拿掉了多少」。
@@ -5667,6 +5727,7 @@ mod tests {
             ("XGRAIN_DEFAULT", "pub fn xgrain("),
             ("LPC_ORDER_DEFAULT", "pub fn lpc_order("),
             ("WIN_PERIODS_DEFAULT", "pub fn win_periods("),
+            ("EDGE_FILL_DEFAULT", "pub fn edge_fill("),
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
@@ -7197,7 +7258,10 @@ mod tests {
         // ⚠ 同族提醒:凡是 `include_str!(自己)` 的判据,断言里出现的每一个字面量都要这样处理。
         let me = include_str!("vocal_range.rs");
         for want in [
-            concat!("utai_dsp::psola::psola_shift", "_win("),
+            // ⚠ S159zj —— 入口从 `psola_shift_win` 换成了 `psola_shift_edge`(多一个 `edge_fill`)。
+            // 这条闸盯的是「vocal_range 里到底还有没有那一处引擎调用」,所以它必须跟着改名走;
+            // 忘了改它会红,而那正是它该做的事。
+            concat!("utai_dsp::psola::psola_shift", "_edge("),
             concat!("utai_stretch::stretch", "_interleaved("),
         ] {
             assert!(me.contains(want), "vocal_range 里找不到引擎调用 {want} —— 执行点被搬走了?");
