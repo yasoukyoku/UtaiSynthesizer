@@ -969,7 +969,18 @@ const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
 /// (reading the real environment in a test both races the other tests and passes SILENTLY on a
 /// machine where someone exported the variable — S150 paid for that lesson on `parse_phase_lock`).
 fn parse_trim(v: Option<&str>) -> Option<(f32, f32)> {
-    let ok = |x: f32| x.is_finite() && x >= 0.0;
+    // ⛔⛔ S159ze —— `+inf` **必须放行**,因为 [`TRIM_HEAD_MS`] 的 doc 就是这么教人关掉单侧的
+    // (「想关回去:`UTAI_RANGE_TRIM=inf:500`」)。而 `is_finite()` 会把它判成垃圾 ⇒ 落到下面那条
+    // `_ => TRIM_DEFAULT` ⇒ **拿到的是头裁【开着】的出厂臂**,而且**没有任何一行输出会说破**。
+    //
+    // ⇒ 这正是本文件反复警告的那一族:「臂开着」与「臂做了事」是两件事
+    // (S148 的 `frac_transport`、S155 的 `parse_infrasonic_hp` 都在这上面栽过)。
+    // ⚠ 而它比那两次更隐蔽:那两次是**写死成 false**,这次是**doc 教的用法本身就无效** ——
+    //   照着 doc 渲出来的「关掉头裁」对照臂,其实是出厂臂。**凡引用过 `inf:` 臂的读数一律作废。**
+    //
+    // 语义上 `+inf` 正好就是「这一侧永不裁」:门是 `freed_ms >= head_ms`,而 `freed >= inf` 恒假。
+    // ⇒ 放行它不需要任何额外分支。⛔ 但 `-inf` 与 `NaN` 仍然是垃圾(前者会让门恒真 = 静默全裁)。
+    let ok = |x: f32| (x.is_finite() || x == f32::INFINITY) && x >= 0.0;
     match v.map(str::trim) {
         None | Some("") => TRIM_DEFAULT,
         Some("0") => None,
@@ -5410,10 +5421,18 @@ mod tests {
         //    (不许静默打开一个没验过的臂);默认开之后同一行变成「垃圾 ⇒ **静默关掉**一条
         //    已上线的修法」,而用户拿到的是一条他没要的旧臂,且没有任何一行输出会说破。
         //    (S155 在 `parse_infrasonic_hp` 上原样踩过。)
-        for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1"] {
+        // ⛔ S159ze —— `-inf` 必须当垃圾:门是 `freed_ms >= head_ms`,`freed >= -inf` **恒真**
+        //    ⇒ 放行它等于**静默把那一侧全裁**,方向与 `inf`(永不裁)正好相反。
+        for junk in ["x", "800", "800:", "800:x", "-1:0", "1:2:3", "nan:1", "-inf:500", "inf:nan"] {
             assert_eq!(parse_trim(Some(junk)), parse_trim(Some("1")),
                        "垃圾 {junk} 必须回落到**默认**,不是静默关掉");
         }
+        // ⛔⛔ S159ze —— `inf` 是 [`TRIM_HEAD_MS`] 的 doc 教的「关掉单侧」写法,**必须真的关掉**。
+        //    在这条断言之前它落到 `_ => TRIM_DEFAULT` ⇒ 拿到头裁**开着**的出厂臂,而且一行都不响。
+        //    ⚠ 变异:把 `|| x == f32::INFINITY` 去掉 ⇒ 这两条当场红。
+        assert_eq!(parse_trim(Some("inf:500")), Some((f32::INFINITY, 500.0)), "inf = 这一侧永不裁");
+        assert_eq!(parse_trim(Some("500:inf")), Some((500.0, f32::INFINITY)));
+        assert_ne!(parse_trim(Some("inf:500")), TRIM_DEFAULT, "它绝不许静默回落到出厂臂");
         assert_eq!(parse_trim(Some("800:300")), Some((800.0, 300.0)), "扫参数用");
         assert_eq!(parse_trim(Some(" 800 : 300 ")), Some((800.0, 300.0)));
     }
