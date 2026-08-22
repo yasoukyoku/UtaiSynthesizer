@@ -543,12 +543,29 @@ pub struct RescueTuning {
     /// ⇒ 加一个**只有计划台会动**的自由度(`with_cap`),让一次 0.04 s 的跑出整张表。
     /// ⚠ 要动它当默认,改的仍然是 [`LANDING_RATIO_TWO_ST`]。
     pub cap: i64,
+    /// S159zi —— [`SPLIT_MIN_COST_DEFAULT`] 的**可扫版本**(出厂 = 那个常量本身)。
+    ///
+    /// ⛔ 与 [`Self::cap`] 同一个形状、同一条理由,**不是新旋钮**:`new()`/`today()`/`from_env()`
+    /// 一律填常量,生产上没有第二条路。它存在是因为那个门槛**是我拍的、不是量出来的**,
+    /// 而用户报的两处(S159ze 的 480 ms vs 门 500;S159zi 的 5760 vs 门 6000)**连着两次
+    /// 卡在门外一点点** —— 那是「门的数值没有出处」的指纹,不是巧合。
+    /// ⇒ 给计划台一个自由度,让一次跑出整张定价表(`with_split_cost`)。
+    ///
+    /// ⭐ 它还是**判据的隔离手段**:一级拆([`SPLIT_MIN_INTERIOR_NOTES`])那几条判据的夹具
+    /// 正好也是二级那一刀的形状,两级同时开火时它们的阴性对照会失效。⇒ 那些判据显式写
+    /// `with_split_cost(f32::INFINITY)` 把二级关掉 —— **隔离,而不是照新结果改期望值**。
+    pub split_cost: f32,
 }
 
 impl RescueTuning {
     /// S159 —— 只换深度上限的那一条臂(计划台专用)。
     pub fn with_cap(self, cap: i64) -> Self {
         Self { cap, ..self }
+    }
+
+    /// S159zi —— 只换拆组门槛的那一条臂(计划台与判据隔离用,见 [`Self::split_cost`])。
+    pub fn with_split_cost(self, split_cost: f32) -> Self {
+        Self { split_cost, ..self }
     }
 }
 
@@ -565,19 +582,25 @@ impl RescueTuning {
     /// `the_today_tuning_is_literally_the_shipped_defaults` 钉住。
     /// ⚠ 要「S151 之前那条臂」的判据请显式写 `RescueTuning::new(None, None)`,别借 `today()`。
     pub fn today() -> Self {
-        Self { trim: TRIM_DEFAULT, landing: LANDING_DEFAULT, cap: LANDING_RATIO_TWO_ST }
+        Self {
+            trim: TRIM_DEFAULT,
+            landing: LANDING_DEFAULT,
+            cap: LANDING_RATIO_TWO_ST,
+            split_cost: SPLIT_MIN_COST_DEFAULT,
+        }
     }
 
     pub fn new(trim: Option<(f32, f32)>, landing: Option<i64>) -> Self {
-        Self { trim, landing, cap: LANDING_RATIO_TWO_ST }
+        Self { trim, landing, cap: LANDING_RATIO_TWO_ST, split_cost: SPLIT_MIN_COST_DEFAULT }
     }
 
     pub fn from_env() -> Self {
         Self {
             trim: parse_trim(std::env::var("UTAI_RANGE_TRIM").ok().as_deref()),
             landing: parse_landing(std::env::var("UTAI_RANGE_LANDING").ok().as_deref()),
-            // ⛔ 深度上限**没有** env 缝:生产只有 `LANDING_RATIO_TWO_ST` 一条路。
+            // ⛔ 深度上限与拆组门槛**都没有** env 缝:生产各只有一条路。
             cap: LANDING_RATIO_TWO_ST,
+            split_cost: SPLIT_MIN_COST_DEFAULT,
         }
     }
 }
@@ -657,7 +680,56 @@ pub fn dead_only_plan_with(
                     prev = d;
                 }
                 v.push((cs, prev));
-                v
+                // ── S159zi —— 第二级:按**深度差**再拆(见 [`SPLIT_MIN_COST_DEFAULT`])。
+                // 一级只看「唱不唱得动」,而 3:16 那一处三个音**全是死音**,它看不见。
+                let need = |cf: usize, cl: usize| -> Option<i64> {
+                    let d: Vec<i64> = (cf..=cl)
+                        .filter(|&k| !range.slot_singable(eff(note_nums[k])))
+                        .map(|k| eff(note_nums[k]))
+                        .collect();
+                    let all: Vec<i64> = (cf..=cl).map(|k| eff(note_nums[k])).collect();
+                    minimal_rescue_shift_capped(&d, &all, range, tune.landing, tune.cap)
+                };
+                let mut todo: Vec<(usize, usize)> = v;
+                todo.reverse();
+                let mut fine: Vec<(usize, usize)> = Vec::new();
+                while let Some((cf, cl)) = todo.pop() {
+                    // 这一簇里的死音下标 —— 断点只许落在**它们之间**(见那份 doc 的不变量)。
+                    let ds: Vec<usize> = (cf..=cl)
+                        .filter(|&k| !range.slot_singable(eff(note_nums[k])))
+                        .collect();
+                    let here = match need(cf, cl) {
+                        Some(h) if ds.len() >= 2 => h,
+                        _ => {
+                            fine.push((cf, cl));
+                            continue;
+                        }
+                    };
+                    let mut best: Option<(usize, usize, f32)> = None;
+                    for w in 1..ds.len() {
+                        let (p, q) = (ds[w - 1], ds[w]);
+                        let (Some(ls), Some(rs)) = (need(cf, p), need(q, cl)) else { continue };
+                        // ⛔ 只算两侧,不算夹心 —— 夹心是一级那一刀的账(doc)。
+                        let gain = ms(cf, p + 1) * (here.abs() - ls.abs()).max(0) as f32
+                            + ms(q, cl + 1) * (here.abs() - rs.abs()).max(0) as f32;
+                        if best.is_none_or(|(_, _, g)| gain > g) {
+                            best = Some((p, q, gain));
+                        }
+                    }
+                    match best {
+                        Some((p, q, gain)) if gain >= tune.split_cost => {
+                            tracing::info!(
+                                "range: cluster notes[{cf}..={cl}] at {here:+} st split at \
+                                 [{p}|{q}] — {gain:.0} ms·st of chaperone depth freed"
+                            );
+                            todo.push((q, cl));
+                            todo.push((cf, p));
+                        }
+                        _ => fine.push((cf, cl)),
+                    }
+                }
+                fine.sort_unstable();
+                fine
             };
             let n_clusters = clusters.len();
             for (ci, &(cluster_first, cluster_last)) in clusters.iter().enumerate() {
@@ -862,6 +934,102 @@ pub fn dead_only_plan_with(
 /// 用户实机一听更糟(见 [`dead_only_plan_with`] 里那段 ⛔⛔⛔)。机理是一样的 ——
 /// 拦住拆分 = 把更多材料留在 donor 里,**方向是反的**。
 const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
+
+/// ⚙ 出厂默认 = 3000.0 —— 拆簇的**第二级**门:按**深度差**而不是按「唱不唱得动」(ms·半音)
+///
+/// ## ⛔ 一级拆看不见的那一半
+///
+/// [`SPLIT_MIN_INTERIOR_NOTES`] 断在「两个死音之间夹着 ≥3 个**可唱音**」的地方。
+/// ⇒ 一整串**全是死音**、但各自需要的深度差着十几度的音,它**结构上看不见**。
+///
+/// 用户 2026-08-22 报的不为人所知的鹅妈妈童谣 +7 × 东雪莲(`usable = [36, 79]`)3:16.060-3:16.461
+/// 就是这个形状 —— ⚠ 而且我一开始把坐标读成了前一个音,拿五把尺子量了一个**干净的音**:
+///
+/// | 音 | +7 后 | 自己需要 | 同簇被拖 | 白丢 |
+/// |---|---|---|---|---|
+/// | `[1033]う` | 92 | **−13** | −14 | 1 |
+/// | `[1034]た` | 80(高出 usable 顶 **1** 度)| **−1** | **−14** | **13** |
+/// | `[1035]で` | 80 | **−1** | **−14** | **13** |
+///
+/// 三个**都是死音** ⇒ 一级不断 ⇒ `worst()` 取 max ⇒ 后两个多渲低 13 度。
+/// 按 S159z 的定价(每半音 ≈ 高频 −1.31 dB / 次基频 +2.93 dB)那是 **高频 −17 dB**。
+/// 实测对上了:`[1034]` 的**紧贴谐波裙边**(±0.06…0.15·f0 相对谐波峰)= **−6.4 dB**,
+/// 是全曲 MIDI 80 / −14 那一档 19 个音里**最脏的一个**(该档中位 −17.0)。
+///
+/// ## 判据:`Σ 时长 × (簇深 − 自己深)`,单位 ms·半音,门 = **3000(量出来的,见下表)**
+///
+/// ⛔ **只算两侧、不算夹心。**夹心(被断开之后整段留在 base)省下的其实更多,但那是
+/// [`SPLIT_MIN_INTERIOR_NOTES`] 那一刀的账;两边都算会让同一份收益被记两次,而
+/// **这是一个门不是一本账**(同 [`TRIM_MIN_COST_DEFAULT`] 的措辞,理由也一样)。
+///
+/// ⛔ 断点只许落在**两个死音之间** ⇒ 每一簇的两端仍然是死音,`(first_dead, last_dead)`
+/// 与 `lo`/`hi` 那两行的不变量一个字不用改。
+///
+/// ⚠ 收益用「子串自己重解出来的位移」估,而**最终**位移要等裁剪定完 `a..b` 之后才算得出来
+/// (见下面那条 `let shift = if n_clusters == 1 …`)。⇒ 这个估计**只会高估**(裁剪只会让
+/// |s| 更浅),和 [`TRIM_MIN_COST_DEFAULT`] 一样往「少拆」那侧偏。
+///
+/// ## ⛔ 与原 key 的关系:**这一条我没有构造性论证,只有实测**
+///
+/// [`TRIM_MIN_COST_DEFAULT`] 那条能证明原 key 够不着(它的新支路要求 `d > 12`,而四份装机
+/// 记录在原 key 上最深只有 −10)。**这一条不能**:它的门只要求「某一侧 ≥600 ms 且深度差
+/// ≥10」,原 key 的 −10 理论上够得着。⇒ **改完必须逐份 dump 原 key 的计划对拍**,
+/// 不许拿上一条的论证套过来。⚠ 这正是 S159z 血训「一条只在窄区间上采样的曲线,
+/// 读出来的单调性是【那个区间】的性质」的同族:**别把一条论证的适用域悄悄扩大。**
+///
+/// ## ⭐⭐⭐ 3000 是**夹**出来的,不是拍的
+///
+/// ⛔ 我第一版拍了 6000(= 500 ms × 12,借 [`TRIM_MIN_COST_DEFAULT`] 的形状),而用户点名的
+/// 那一处实测 `480 ms × 12 st = 5760` —— **差 4% 没够着**。⚠ 那是**第二次**:S159ze 卸乘客
+/// 那条门是 500 ms 而乘客总长 **480.0 ms**,差整整一帧。
+/// ⭐ **「用户报的病例总是差一点点够不着」是【门槛没有出处】的指纹,不是巧合。**
+/// ⇒ 加了 [`RescueTuning::split_cost`],一次跑出整张表(`mg_dump_plan_arms` 的 `split_scan`,
+/// 秒级、不碰 ONNX)。**8 份装机记录 × 6 张谱 × 移调 {0,2,5,7} = 192 份**,每份内部扫 10 档:
+///
+/// | 门 | t+0(原 key)| t+2 | t+5 | t+7 | 用户点名的 `[1034][1035]` |
+/// |---|---|---|---|---|---|
+/// | 12000 | 0/48 | 0/48 | 0/48 | 1/48 | −14(没够着)|
+/// | 6000 | 0/48 | 0/48 | 3/48 | 7/48 | **−14 —— 没够着** |
+/// | 4500 | 0/48 | 1/48 | 4/48 | 11/48 | dx/ak 脱出,**yachiyo 仍 −14** |
+/// | **3000(出厂)** | **0/48** | 1/48 | 4/48 | 14/48 | **三份记录全部脱出** |
+/// | 2000 | **1/48** | 2/48 | 6/48 | 15/48 | 脱出 |
+///
+/// (表里的分数 = 「计划与**不拆**那一臂不同」的份数。)
+///
+/// ⇒ **下界**(原 key 逐字节不变;东雪莲 × 鹅妈妈在 2000 上 23→29 组)= **≥ 3000**;
+///    **上界**(必须打中用户点名的病例;yachiyo_v2 要到 3000 才开火)= **≤ 3000**。
+///    ⇒ **只有 3000 同时满足。**
+/// ⚠ 这不是「调参调到过」:两条边界来自**两个不同的判据**,而它们正好在这一点相交。
+/// ⛔ 哪天任一装机记录变了,这个数**必须重扫** —— 别把它当常量供起来。
+/// ⚠ t+2 上有 1/48 变了(东雪莲 × 鹅妈妈 54→60 组);那一处也是净赚
+/// (陪绑 101.9 → 70.3 s·半音 = **−31%**,代价 12 条新缝)。
+///
+/// ## 代价:句内拆**必然**造缝,而这些缝几乎是免费的(实测,而且推翻了我自己的预期)
+///
+/// 东雪莲 +7,窗边落在唱音内的条数 67 →(门 6000)105 →(门 3000)127。⚠ 我一开始把这当成
+/// 这一刀的主要代价。**实测把它推翻了**(谱形跳变 = 边两侧各 20 ms、500-8000 Hz 对数谱
+/// 去均值 RMS 差):
+///
+/// | | 谱形跳变中位 | 电平台阶 dB 中位 |
+/// |---|---|---|
+/// | 拆组**前**就有的 67 条老缝 | 11.74 | 1.90 |
+/// | **拆组新增的 38 条** | **9.77** | 1.87 |
+/// | ⭐ **同样是音-音交界、但没有缝**(972 处,关键对照)| **9.03** | **2.90** |
+/// | 音内随机位置(阴性对照,2082 处)| 8.19 | 0.89 |
+///
+/// ⇒ 新缝落在**音与音的交界**上(乐句内部没有休止可放),而那里本来就有一个 9.03 dB 的跳变
+/// (S159zi 量到起音比稳态脏 ~11 dB,连没进扩展的音也一样)⇒ **缝只加了 0.74 dB,
+/// 而且电平台阶反而比普通交界还小。**
+/// ⛔ 别把这条读成「缝不要紧」:**老缝**比交界高 **2.71 dB**,而那笔账(「缝处局部电平匹配」,
+/// 根因 = `apply_dead_only_windows_with` 的 `match_levels` 只给**每个位移一个全曲标量**)
+/// **仍然欠着**。
+///
+/// ⭐ 造对照臂用字段而不是 `git stash`:S143 在 `stash` 的假信号上给自己的代码定过一次罪。
+/// ⛔⛔ 也别用「改源码 + 重编译」的循环脚本扫参数 —— S159zi 那样干了一次,脚本**扛过了 kill**、
+/// 在我跑测试与渲染的同时把这个常量来回改,最后还把整份源文件**还原**掉了。
+/// 抓出它的是 `every_shipped_default_is_declared_at_the_top_of_its_own_doc`(doc↔常量一致性闸),
+/// 而它当初瞄的根本不是这件事。
+const SPLIT_MIN_COST_DEFAULT: f32 = 3000.0;
 
 /// ⚙ 出厂默认 = 6000.0 —— 卸乘客的**第二条**门:按**代价**而不是按时长(单位 ms·半音)
 ///
@@ -4931,6 +5099,107 @@ mod tests {
         .unwrap()
     }
 
+    /// ⭐⭐⭐ S159zi —— **一整串全是死音、但各自需要的深度差很多时,也要拆开**。
+    ///
+    /// [`an_interior_run_of_three_singable_notes_splits_the_phrase`] 钉的是**一级**拆
+    /// (夹心是**可唱音**);这一条钉的是**二级**(见 [`SPLIT_MIN_COST_DEFAULT`]):
+    /// 用户 2026-08-22 报的 3:16 那一处三个音**全是死音**,一级结构上看不见。
+    ///
+    /// ⛔ 三条阴性对照,少一条这条判据就可能是「恒真」:
+    /// ⑴ **深度差小就不许拆**(`[83, 81, 81]`:差 2 度 × 2000 ms = 4000 < 6000)——
+    ///    门限真的在起作用,而不是「只要有死音就拆」;
+    /// ⑵ **同一批音,只把时长改短就不许拆**(2 × 100 ms × 11 度 = 2200 < 6000)——
+    ///    判据真的是 **ms·半音**,而不是偷偷退化成「只看深度差」;
+    /// ⑶ **被救的死音一个不许多、一个不许少**,而且拆出来的组不许重叠、不许比整句更深。
+    ///
+    /// ⛔ 变异(写这条判据时逐个**真跑过**,下面记的是**实测读数**——
+    /// ⚠ 其中两条我先写下的预测**是错的**,按实测改了过来:
+    /// 「去掉门」与「取最差断点」我都以为会**少拆**,实测两条都**多拆**成了三组):
+    /// * [`SPLIT_MIN_COST_DEFAULT`] 改成 30000 ⇒ 读 `[1..3] −13` 一组,**红**;
+    /// * 把 `gain >= SPLIT_MIN_COST_DEFAULT` 换成 `>= 0.0` ⇒ 读
+    ///   `[1..1] −13, [2..2] −2, [3..3] −2` —— 连**没有任何收益**的那一刀也切,**红**
+    ///   (⇒ 那条门挡的不只是「不划算」,还有「切完两侧位移一模一样」的纯浪费);
+    /// * `need(q, cl)` 改成 `need(cf, cl)`(右侧永远拿整簇的深度)⇒ `gain` 恒 0 ⇒
+    ///   读一组,**红**;
+    /// * `best` 的比较从 `gain > g` 改成 `gain < g`(取最差的断点)⇒ 读三组,**红**
+    ///   —— 机理不是我以为的「gain 0 所以不拆」,而是**先切在最差处、剩下的再递归切开**。
+    #[test]
+    fn a_run_of_dead_notes_splits_where_the_depth_requirement_drops() {
+        let r = dxl_like(); // usable [36,80];81 起是死音,落点只到 79 ⇒ 81 要 −2、92 要 −13
+        let plan = |p: &[i64], f: &[i64]| dead_only_plan_with(p, f, 0, &r, RescueTuning::today()).0;
+
+        // ⑷ ⭐ 主臂 —— 3:16 的形状:顶音要 −13,后面两个只高出 usable 顶 1 度、只要 −2。
+        let deep = [0i64, 92, 81, 81, 0];
+        let g = plan(&deep, &secs(deep.len()));
+        assert_eq!(
+            g,
+            vec![
+                DeadGroup { start: 1, end: 1, shift: -13 },
+                DeadGroup { start: 2, end: 3, shift: -2 },
+            ],
+            "全是死音也要按深度拆开(读到 {g:?})"
+        );
+        // ⭐⭐⭐ 这一刀买到的就是这 11 个半音 × 2 s:不拆的话那两个音会跟着走 −13,
+        // 按 S159z 的定价 ≈ 每个白丢 **高频 14.4 dB**。
+        assert_eq!(g[0].shift.abs() - g[1].shift.abs(), 11, "省下来的正是这 11 个半音");
+
+        // ⑴ 阴性对照 A —— 深度差小就不许拆(**1** 度 × 2000 ms = 2000 < 3000)。
+        // ⚠ S159zi:门从 6000 降到 3000(定价见 [`SPLIT_MIN_COST_DEFAULT`])之后,原来那个
+        //    `[83, 81, 81]`(差 2 度 = 4000)**够得着了** ⇒ 阴性对照会当场失效。
+        //    ⛔ 正确的改法是把夹具挪到新门限的下方(83 → 82),而不是把期望值改成「拆」——
+        //    这条对照要证的是「门限真的在起作用」,改期望值就把它证没了。
+        let shallow = [0i64, 82, 81, 81, 0];
+        let gs = plan(&shallow, &secs(shallow.len()));
+        assert_eq!(
+            gs,
+            vec![DeadGroup { start: 1, end: 3, shift: -3 }],
+            "深度差只有 1 度 ⇒ 不值一条新缝,不许拆(读到 {gs:?})"
+        );
+
+        // ⑵ 阴性对照 B —— **同一批音高**,只把浅的那一侧改成 100 ms ⇒ 2200 ms·半音 < 6000。
+        let short = plan(&deep, &[50, 50, 5, 5, 50]);
+        assert_eq!(
+            short,
+            vec![DeadGroup { start: 1, end: 3, shift: -13 }],
+            "判据是 ms·半音:同样 11 度的差,只有 200 ms 就不许拆(读到 {short:?})"
+        );
+
+        // ⑸ 断点必须落在**深度真的掉下去**的那一处,不是第一处可断的地方。
+        let four = [0i64, 92, 92, 81, 81, 0];
+        let g4 = plan(&four, &secs(four.len()));
+        assert_eq!(
+            g4,
+            vec![
+                DeadGroup { start: 1, end: 2, shift: -13 },
+                DeadGroup { start: 3, end: 4, shift: -2 },
+            ],
+            "断点要断在 [2|3] 而不是 [1|2](读到 {g4:?})"
+        );
+
+        // ⑶ 被救的死音一个不许多、一个不许少;不许重叠;不许比整句更深。
+        for (p, gg) in [(&deep[..], &g), (&four[..], &g4)] {
+            let got: Vec<usize> = gg
+                .iter()
+                .flat_map(|d| d.start..=d.end)
+                .filter(|&k| p[k] > 0 && !r.slot_singable(p[k]))
+                .collect();
+            let want: Vec<usize> = (0..p.len()).filter(|&k| p[k] > 0 && !r.slot_singable(p[k])).collect();
+            assert_eq!(got, want, "拆组只改「谁陪着走多深」,不许改「哪些音被救」");
+            for w in gg.windows(2) {
+                assert!(w[0].end < w[1].start, "拆出来的组不许重叠:{gg:?}");
+            }
+            let whole: Vec<i64> = p.iter().copied().filter(|&x| x > 0).collect();
+            let dead: Vec<i64> = whole.iter().copied().filter(|&x| !r.slot_singable(x)).collect();
+            let ws = minimal_rescue_shift_capped(
+                &dead, &whole, &r, RescueTuning::today().landing, LANDING_RATIO_TWO_ST,
+            )
+            .expect("整句本来就有落点");
+            for d in gg {
+                assert!(d.shift.abs() <= ws.abs(), "{d:?} 比整句({ws:+})还深 —— 拆组只许变浅或不变");
+            }
+        }
+    }
+
     /// ⭐⭐⭐ S159z 主刀 —— **夹在两个死音中间的可唱段,够长就把组拆开**。
     ///
     /// 机理与定价在 [`SPLIT_MIN_INTERIOR_NOTES`] 的 doc(用户点名的 `notes[685..=693]`:
@@ -4951,9 +5220,15 @@ mod tests {
     #[test]
     fn an_interior_run_of_three_singable_notes_splits_the_phrase() {
         let r = pya_like();
+        // ⚠⚠ S159zi —— **显式关掉二级拆**([`SPLIT_MIN_COST_DEFAULT`])。这条判据钉的是**一级**
+        // (夹心是可唱音),而 ⑴ 那条阴性对照(夹心 2 个音 ⇒ 不许拆)会被二级拆开
+        // ⇒ 它就不再是「一级的门限真的在起作用」的探针了。
+        // ⛔ 隔离要靠关掉另一把刀,不是照新结果改期望值,也不是去改夹具的时长
+        //    (那是绕路,而且下次一调门槛它还会再断一次)。
+        let one_level = RescueTuning::today().with_split_cost(f32::INFINITY);
         let plan = |p: &[i64]| {
             let f = secs(p.len());
-            dead_only_plan_with(p, &f, 0, &r, RescueTuning::today()).0
+            dead_only_plan_with(p, &f, 0, &r, one_level).0
         };
 
         // ⑴ 阴性对照:夹心只有 2 个音 ⇒ 不许拆。
@@ -4980,8 +5255,14 @@ mod tests {
         // 各自收回自己的死音段,正好把重叠盖住 ⇒ 那条断言当时是**空判据**。
         // ⇒ 关掉裁剪,越界写法就直接露出来。
         assert!(g[0].end < g[1].start, "拆出来的组不许重叠:{g:?}");
-        let untrimmed =
-            dead_only_plan_with(&three, &secs(three.len()), 0, &r, RescueTuning::new(None, None)).0;
+        let untrimmed = dead_only_plan_with(
+            &three,
+            &secs(three.len()),
+            0,
+            &r,
+            RescueTuning::new(None, None).with_split_cost(f32::INFINITY),
+        )
+        .0;
         assert_eq!(untrimmed.len(), 2, "裁剪关掉也要拆成两组(读到 {untrimmed:?})");
         assert!(
             untrimmed[0].end < untrimmed[1].start,
@@ -5017,7 +5298,7 @@ mod tests {
             &secs(three.len()),
             0,
             &r,
-            RescueTuning::new(Some((TRIM_HEAD_MS, TRIM_TAIL_MS)), None),
+            RescueTuning::new(Some((TRIM_HEAD_MS, TRIM_TAIL_MS)), None).with_split_cost(f32::INFINITY),
         )
         .0;
         assert_eq!(bare.len(), 2, "落点关掉也要拆成两组(读到 {bare:?})");
@@ -5086,11 +5367,17 @@ mod tests {
     fn a_passenger_may_not_veto_the_landing_the_dead_note_needs() {
         let phrase = [0, 90, 80, 78, 75, 68, 80, 0];
         let fr = secs(phrase.len());
+        // ⚠⚠ S159zi —— **显式关掉二级拆**([`SPLIT_MIN_COST_DEFAULT`])。
+        // 这个夹具正好也是二级那一刀的形状(顶音 90 要 −12,后面五个只要 −4)⇒ 两级同时开火时
+        // 这条判据钉的「**乘客**否决落点」**结构上不会再发生**(乘客被拆到自己那一组里去了)
+        // ⇒ 照新结果改期望值 = 又一条空判据。⛔ 正确的隔离是**关掉另一把刀**。
+        // ⭐ 二级本身另有判据:[`a_run_of_dead_notes_splits_where_the_depth_requirement_drops`]。
+        let iso = |t: RescueTuning| t.with_split_cost(f32::INFINITY);
         let r = pya_like();
 
         // ⑴ 默认臂 = 生产实测的那一档(用户听到的就是它):落点 78。
         // ⛔ S157c:`today()` 已翻成 `Some(3)` ⇒ 「S151 之前那条臂」必须显式写。
-        let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, None));
+        let (today, _) = dead_only_plan_with(&phrase, &fr, 0, &r, iso(RescueTuning::new(None, None)));
         assert_eq!(
             today,
             vec![DeadGroup { start: 1, end: 6, shift: -12 }],
@@ -5098,7 +5385,7 @@ mod tests {
         );
 
         // ⭐ 旋钮开着:同样一批合格落点里,死音自己的 `low_ratio` 说话 ⇒ 顶音落到 76。
-        let (on, _) = dead_only_plan_with(&phrase, &fr, 0, &r, RescueTuning::new(None, Some(3)));
+        let (on, _) = dead_only_plan_with(&phrase, &fr, 0, &r, iso(RescueTuning::new(None, Some(3))));
         assert_eq!(
             on,
             vec![DeadGroup { start: 1, end: 6, shift: -14 }],
@@ -5333,7 +5620,7 @@ mod tests {
             "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159f";
+        const TAG: &str = "s159g";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -5371,6 +5658,7 @@ mod tests {
             ("LANDING_DEFAULT", "fn parse_landing("),
             ("TRIM_DEFAULT", "fn parse_trim("),
             ("TRIM_MIN_COST_DEFAULT", "const TRIM_MIN_COST_DEFAULT"),
+            ("SPLIT_MIN_COST_DEFAULT", "const SPLIT_MIN_COST_DEFAULT"),
             ("JOIN_RESTS_DEFAULT", "pub fn join_rests_enabled("),
             ("FRAC_TRANSPORT_DEFAULT", "pub fn frac_transport("),
             ("PHASE_LOCK_DEFAULT", "pub fn phase_lock("),
@@ -6436,12 +6724,28 @@ mod tests {
 
         let (pw, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &wide, RescueTuning::today());
         let (pt, _) = dead_only_plan_with(&nn, &secs(nn.len()), 0, &tight, RescueTuning::today());
-        assert_eq!(pw.len(), 1);
-        assert_eq!(pt.len(), 1);
+        // ⚠ S159zi —— tight 臂现在**被二级拆开**([`SPLIT_MIN_COST_DEFAULT`]):把上限压到 76
+        // 之后 78 也成了死音,而它只要 −2、85 要 −9 ⇒ 1 s × 7 st = 14000 ms·st ⇒ 拆。
+        // ⛔ 这条判据钉的不变量**一个字没变**(「天花板不许把【已经在救的那个音】的落点带深」),
+        // 变的只是它要去哪一组里读那个落点 ⇒ 按**救 85 的那一组**比,而不是按 `[0]` 比。
+        // ⛔ 不许改成「比最深的一组」——那样 tight 拆出来的浅组会被自动跳过,判据会退化成恒真。
+        assert_eq!(pw.len(), 1, "wide 臂只有 85 是死音 ⇒ 二级无处可拆(读到 {pw:?})");
+        let g85 = |p: &[DeadGroup], who: &str| -> DeadGroup {
+            *p.iter().find(|d| (d.start..=d.end).contains(&2)).unwrap_or_else(|| panic!("{who} 必须救 85:{p:?}"))
+        };
+        let (w, t) = (g85(&pw, "wide"), g85(&pt, "tight"));
         assert_eq!(
-            pt[0].shift, pw[0].shift,
+            t.shift, w.shift,
             "the ceiling moved 80→76 and the landing must NOT follow it down (got {} vs {})",
-            pt[0].shift, pw[0].shift
+            t.shift, w.shift
+        );
+        // ⭐ 而且拆出来的那一组必须**更浅** —— 否则「拆了」等于没拆,这条判据也就白改了。
+        assert_eq!(pt.len(), 2, "tight 臂必须被二级拆成两组(读到 {pt:?})");
+        let other = pt.iter().find(|d| !(d.start..=d.end).contains(&2)).expect("另一组");
+        assert!(
+            other.shift.abs() < t.shift.abs(),
+            "只需要浅救的那一组必须真的更浅,读到 {} vs {}",
+            other.shift, t.shift
         );
 
         // …and the knob is not merely inert: at the tight ceiling 78 IS dead, at the wide one it
@@ -6451,7 +6755,10 @@ mod tests {
         // The landing itself may sit above the user's line — that is exactly the semantic the
         // user chose (2026-08-15): the ceiling says WHICH NOTES to rescue, not what the model
         // may be asked to sing. Pin it, because it is the surprising half.
-        let land = 85 + pt[0].shift;
+        // ⚠ S159zi —— `t` 而不是 `pt[0]`:二级拆之后 `pt[0]` 是**浅的那一组**(70/78 走 −2),
+        //    照旧读会算出 85−2 = 83,而 83 在 scan(36,80)之外 ⇒ 下面那条当场红。
+        //    ⭐ 它红得响,正是因为它盯的是「落点必须在 scan 之内」这件真事。
+        let land = 85 + t.shift;
         assert!(
             land as f32 > tight.usable.1,
             "expected the rescue to land above the user's line (got {land})"
@@ -6699,8 +7006,12 @@ mod tests {
         //    从 S158 起自带「只裁尾」,会把乐句尾巴上的乘客切掉、把 span 从 (0,5) 变成 (0,4)。
         //    那不是落点规则改了,是这条判据被换了臂。
         let land = RescueTuning::today().landing;
+        // ⚠ S159zi —— 显式关掉二级拆:这条钉的是**落点规则**,而二级会把这一句按深度需求断成
+        //    两组(85 要 −7、80/81 只要 −1/−2)⇒ `plan.len() == 1` 不再是「落点规则没改
+        //    哪些音被救」的探针。⛔ 隔离,不改期望值。
+        let iso = |t: RescueTuning| t.with_split_cost(f32::INFINITY);
         let (plan, unfixable) =
-            dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, RescueTuning::new(None, land));
+            dead_only_plan_with(&nn, &secs(nn.len()), 0, &r, iso(RescueTuning::new(None, land)));
         assert_eq!(unfixable.len(), 0);
         assert_eq!(plan.len(), 1, "exactly one dead phrase, as before");
         assert_eq!((plan[0].start, plan[0].end), (0, 5), "the same note span as before");
@@ -6708,7 +7019,7 @@ mod tests {
         // ⭐ 而这条判据真正的安全性质(「哪些音被救」不许变)在**旋钮开着**时也必须成立:
         //    裁剪只放掉乘客,死音集合与落点一个字不动。(出厂默认今天是关的。)
         let (shipped, unfix_s) = dead_only_plan_with(
-            &nn, &secs(nn.len()), 0, &r, trim_arms(Some((f32::INFINITY, 500.0))).1);
+            &nn, &secs(nn.len()), 0, &r, iso(trim_arms(Some((f32::INFINITY, 500.0))).1));
         let dead_of = |p: &[DeadGroup]| -> Vec<i64> {
             let mut v: Vec<i64> =
                 p.iter().flat_map(|g| g.start..=g.end).filter(|&k| nn[k] > 0 && !r.slot_singable(nn[k]))
@@ -6736,7 +7047,10 @@ mod tests {
     fn a_small_melodic_joint_does_not_block_the_trim() {
         let r = Rec::default().build();
         let secs9 = |n: usize| vec![50i64; n]; // 每音 1 s ⇒ 回收量远超 500 ms 的门限
-        let arm = RescueTuning::new(Some((500.0, 500.0)), RescueTuning::today().landing);
+        // ⚠ S159zi —— 显式关掉二级拆:这条钉的是**裁剪与接点音程无关**,
+        //    而它的夹具 `[74, 80, 81, 83]` 正好也是二级那一刀的形状(83 要 −3、81 只要 −1)。
+        let arm = RescueTuning::new(Some((500.0, 500.0)), RescueTuning::today().landing)
+            .with_split_cost(f32::INFINITY);
         let span = |nn: &Vec<i64>| {
             let p = dead_only_plan_with(nn, &secs9(nn.len()), 0, &r, arm).0;
             assert_eq!(p.len(), 1, "夹具必须只有一条死乐句:{p:?}");

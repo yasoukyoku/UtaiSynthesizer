@@ -1847,7 +1847,39 @@ fn mg_dump_plan_arms() {
         }));
     }
 
+    // ⭐⭐ S159zi —— **给 `SPLIT_MIN_COST_DEFAULT` 定价的一维表**。
+    //
+    // ⛔ 为什么必须扫而不是拍:那个门槛今天是我拍的,而用户报的两处**连着两次卡在门外
+    // 一点点**(S159ze 卸乘客 480 ms vs 门 500;S159zi 拆组 5760 vs 门 6000)。
+    // 「用户报的病例总是差一点点够不着」是**门槛没有出处**的指纹,不是巧合。
+    // ⇒ 每一档落一份完整组表,陪绑总量/缝数/命中与否全部在离线侧按同一份数据算,
+    //    这样「省了多少深度」与「多造了几条缝」是**同一次跑**里的两列,不会各自漂。
+    // ⚠ 每一档都用 `today()` 的其余字段 ⇒ 扫的是**这一个**自由度。
+    let split_scan: Vec<serde_json::Value> = [
+        f32::INFINITY, 12000.0, 9000.0, 6000.0, 4500.0, 3000.0, 2000.0, 1200.0, 600.0, 0.0,
+    ]
+    .iter()
+    .map(|&c| {
+        let (plan, _) = dead_only_plan_with(&nn, &fr, transpose, &range, today.with_split_cost(c));
+        let sh: std::collections::BTreeSet<i64> = plan.iter().map(|g| g.shift).collect();
+        serde_json::json!({
+            "split_cost": if c.is_finite() { c } else { -1.0 },
+            "groups": plan.iter().map(|g| [g.start as i64, g.end as i64, g.shift]).collect::<Vec<_>>(),
+            "n_groups": plan.len(),
+            "distinct_shifts": sh.len(),
+        })
+    })
+    .collect();
+    for a in &split_scan {
+        eprintln!("[split] 门 {:>9} ⇒ {:>4} 组 · {} 个不同位移(donor 遍数 {})",
+                  a["split_cost"].as_f64().unwrap_or(-1.0),
+                  a["n_groups"].as_u64().unwrap_or(0),
+                  a["distinct_shifts"].as_u64().unwrap_or(0),
+                  1 + a["distinct_shifts"].as_u64().unwrap_or(0));
+    }
+
     let dump = serde_json::json!({
+        "split_scan": split_scan,
         "score": std::env::var("UTAI_MG_SCORE").unwrap_or_default(),
         "model": model_path.file_stem().map(|s| s.to_string_lossy().to_string()),
         "speaker": speaker,
