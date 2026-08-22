@@ -1761,7 +1761,9 @@ fn mg_dump_plan_arms() {
     // ⭐ S158f:先扫**落点**那一维 —— donor 遍数 = 1 + distinct shift 数,而渲染时间几乎
     // 全在遍数上(S147 秒表:99% 在两张 ONNX 图里,CPU 侧只有 1.1%)。翻落点默认有没有
     // 让遍数变多,是一条**能静默发生的速度退化**,必须有地方读得出来。
-    for (label, land) in [("落点关(S157c 之前)", None), ("落点=1", Some(1)), ("落点=3(今天)", Some(3))] {
+    for (label, land) in [("落点关(S157c 之前)", None), ("落点=1", Some(1)), ("落点=3(今天)", Some(3)),
+                          ("落点=5", Some(5)), ("落点=7", Some(7)), ("落点=9", Some(9)),
+                          ("落点=12", Some(12)), ("落点=99", Some(99))] {
         for (t, trim) in [("trim 关", None), ("trim 今天", today.trim)] {
             let (plan, _) = dead_only_plan_with(&nn, &fr, transpose, &range,
                                                 RescueTuning::new(trim, land));
@@ -1871,6 +1873,18 @@ fn mg_dump_plan_arms() {
     // ⇒ 每一档落一份完整组表,陪绑总量/缝数/命中与否全部在离线侧按同一份数据算,
     //    这样「省了多少深度」与「多造了几条缝」是**同一次跑**里的两列,不会各自漂。
     // ⚠ 每一档都用 `today()` 的其余字段 ⇒ 扫的是**这一个**自由度。
+    // S159zs —— 落点预算扫描(临时:给「顶端落点」定价用)
+    let land_scan: Vec<serde_json::Value> = [1i64, 3, 5, 7, 9, 12]
+        .iter()
+        .map(|&e| {
+            let (plan, _) = dead_only_plan_with(&nn, &fr, transpose, &range,
+                RescueTuning::new(today.trim, Some(e)));
+            serde_json::json!({
+                "landing": e,
+                "groups": plan.iter().map(|g| [g.start as i64, g.end as i64, g.shift]).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let split_scan: Vec<serde_json::Value> = [
         f32::INFINITY, 12000.0, 9000.0, 6000.0, 4500.0, 3000.0, 2000.0, 1200.0, 600.0, 0.0,
     ]
@@ -1895,6 +1909,7 @@ fn mg_dump_plan_arms() {
     }
 
     let dump = serde_json::json!({
+        "land_scan": land_scan,
         "split_scan": split_scan,
         "score": std::env::var("UTAI_MG_SCORE").unwrap_or_default(),
         "model": model_path.file_stem().map(|s| s.to_string_lossy().to_string()),
