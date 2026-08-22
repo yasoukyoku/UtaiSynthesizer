@@ -691,9 +691,24 @@ pub fn dead_only_plan_with(
                 //
                 // 退法选「不裁那一侧」而不是「不伸护栏」:后者会把淡化重新压回被救音的起音,
                 // 而那正是护栏存在的理由 —— 用一个已知的坏去换另一个已知的坏是没有意义的。
+                // ⛔⛔ S159ze —— 它**必须响**。今天它静默返回 false,于是「护栏拦下的一刀」与
+                // 「本来就不该裁的一刀」在输出上**一模一样**(铁律:一条闸的红必须能被归因)。
+                // ⚠ 而且它的承重刚刚变大了:下面那条按代价的门**恰恰只在大 |s| 上加刀**,
+                //    而 `eff(n)+s` 掉出 `reach` 的概率随 |s| **单调上升**。
                 let guard_ok = |k: Option<usize>, s: i64| -> bool {
                     match k.and_then(|k| note_nums.get(k).copied()) {
-                        Some(n) if n > 0 => range.slot_reachable(eff(n) + s),
+                        Some(n) if n > 0 => {
+                            let ok = range.slot_reachable(eff(n) + s);
+                            if !ok {
+                                tracing::warn!(
+                                    "range: guard blocked a trim — note[{}] eff {} at {s:+} st is \
+                                     outside the scanned window; keeping it aboard",
+                                    k.unwrap_or(0),
+                                    eff(n),
+                                );
+                            }
+                            ok
+                        }
                         _ => true, // 没有邻音 / 那边是休止 ⇒ 护栏伸不进任何唱音
                     }
                 };
@@ -719,10 +734,22 @@ pub fn dead_only_plan_with(
                 //    连同它们的 3 个交界一起拖进 donor ⇒ 多出 2 个可闻的坑。**方向是反的。**
                 // ⇒ 今天:该裁就裁,不看接点音程。真正要修的是 ⑴ 那个塌陷本身(还没定位到层)。
                 let (freed_head, freed_tail) = (ms(lo, first_dead), ms(last_dead + 1, hi + 1));
-                if freed_head >= head_ms && guard_ok(first_dead.checked_sub(1), whole_shift) {
+                // S159ze —— 第二条门:**按代价**(见 [`TRIM_MIN_COST_DEFAULT`])。
+                // ⛔ OR,不是替换:它只**加刀**,永远不撤掉今天在裁的任何一刀。
+                // ⛔⛔ `bar.is_finite()` 不是保险丝,它是**语义**:`+inf` 的意思是
+                // 「**这一侧永不裁**」(见 [`TRIM_HEAD_MS`] 的 doc 与 `parse_trim` 对 `inf` 的处理)。
+                // 少了它,按代价的支路会**绕过那个显式关闭** —— 判据
+                // `the_landing_rule_never_changes_WHICH_notes_get_rescued` 当场把它抓了出来
+                // (那条用 `(INFINITY, 500.0)` 当「只裁尾」的臂,span 从 (0,4) 被改成 (2,4))。
+                let worth = |freed: f32, bar: f32| {
+                    bar.is_finite()
+                        && (freed >= bar
+                            || freed * whole_shift.unsigned_abs() as f32 >= TRIM_MIN_COST_DEFAULT)
+                };
+                if worth(freed_head, head_ms) && guard_ok(first_dead.checked_sub(1), whole_shift) {
                     a = first_dead;
                 }
-                if freed_tail >= tail_ms && guard_ok(Some(last_dead + 1), whole_shift) {
+                if worth(freed_tail, tail_ms) && guard_ok(Some(last_dead + 1), whole_shift) {
                     b = last_dead;
                 }
                 if (a, b) != (lo, hi) {
@@ -835,6 +862,48 @@ pub fn dead_only_plan_with(
 /// 用户实机一听更糟(见 [`dead_only_plan_with`] 里那段 ⛔⛔⛔)。机理是一样的 ——
 /// 拦住拆分 = 把更多材料留在 donor 里,**方向是反的**。
 const SPLIT_MIN_INTERIOR_NOTES: usize = 3;
+
+/// ⚙ 出厂默认 = 6000.0 —— 卸乘客的**第二条**门:按**代价**而不是按时长(单位 ms·半音)
+///
+/// ## ⛔ 为什么需要它:今天的判据里没有任何一项含【位移深度】
+///
+/// [`TRIM_HEAD_MS`] / [`TRIM_TAIL_MS`] 只问「回收多少**毫秒**」。⇒ **480 ms 被拖 3 度和被拖 17 度,
+/// 在那行代码眼里一模一样。**
+///
+/// 用户 2026-08-22 报的那一处(不为人所知的鹅妈妈童谣 +7,3:16.060-3:16.461)正是这个形状:
+///
+/// | 音 | 原谱 | +7 后 | 自己需要 | 实际被拖 | 陪绑 |
+/// |---|---|---|---|---|---|
+/// | `[1033]う` | 85 | **92** | 12-16 | 14-17 | 0-2(**顶音,真需要**)|
+/// | `[1034]た` | 73 | 80 | **0**(东雪莲)/ 3-4 | **14-17** | **10-14** |
+/// | `[1035]で` | 73 | 80 | **0** / 3-4 | **14-17** | **10-14** |
+///
+/// 而尾部乘客总时长 = 140 + 340 = **480.0 ms 整**(7 + 17 = 24 帧 × 20 ms,不是浮点舍入),
+/// 门是 **500.0** ⇒ **差整整一帧没触发**。⇒ 480 ms 的音白白多渲低 10-14 个半音,
+/// 按 S159z 的定价(每半音 ≈ 高频 −1.31 dB)那是 **13-18 dB 的高频**。
+///
+/// ## 判据的形状:`freed_ms × |位移|`,单位 ms·半音
+///
+/// ⭐ 能塌成这么简单是因为**被裁掉的音自己需要 0 半音**:被裁的只可能落在 `lo..first_dead` 或
+/// `last_dead+1..=hi`,而 `dead_at` 的定义保证这两段里**每个音都过了 [`SpeakerRange::slot_singable`]**。
+/// ⇒ 「省下的陪绑」= `freed_ms × |whole_shift|`,不需要逐音求解。
+///
+/// ⛔⛔ **必须用 `whole_shift` 而不是重解之后的 `shift`** —— 后者要到边界定完之后才算得出来。
+/// ⚠ 这会**高估**收益(重解只会让 |s| 变浅),而 `guard_ok` 也用 `whole_shift` ⇒ 两边都往安全侧偏。
+/// **别把这个式子当精确,它是个门不是账。**
+///
+/// ## 为什么 6000,以及为什么原 key 逐位不变(**构造性论证,不是测量**)
+///
+/// 新支路要生效必须同时满足 `freed < 500`(否则老支路已经命中)与 `freed × d ≥ 6000`
+/// ⇒ **`d > 12`**。而 [`parse_landing`] 的 doc 里记着四份装机记录在**原 key** 上的全曲最深位移:
+/// akiko −9 · yachiyo −10 · 东雪莲 −7 · yuyuko −7 ⇒ **原 key 这条支路一次都够不着**
+/// ⇒ 用户 S158f 已经耳判背书过的那条臂**逐位不变**(S121 的 additive-then-flip)。
+/// ⭐ 6000 = 500 ms × 12 半音:**它就是「老门限在临界深度上的等价物」**,不是调出来的。
+///
+/// ⛔ **只许 OR,不许替换掉老门限。**纯替换的等效门限是 `T/d`,会随深度滑动,而 S151 那次
+/// 平台读数(`(0.38, 1.08] s` 给同一刀集)是在**当时的刀集**上量的,S157c 的落点与 S159z 的拆组之后
+/// 平台可能已经漂了 —— 那份 doc 自己也写着「⚠ +7 谱是 threshold-sensitive,Re-measure before moving」。
+const TRIM_MIN_COST_DEFAULT: f32 = 6000.0;
 
 /// ⚙ 出厂默认 = Some((TRIM_HEAD_MS, TRIM_TAIL_MS)) —— 卸乘客 = **头尾都裁 500 ms**(S158f;`=0` 渲旧臂)
 /// S151 卸乘客 —— 一刀要**回收多少毫秒**的活音才值得它造出来的那条缝,`(裁头, 裁尾)`。
@@ -5264,7 +5333,7 @@ mod tests {
             "trim=Some((500.0, 500.0)) landing=Some(3) ratio2=14 depth=1 frac=true win=1 xgrain=1 lpc=0              hp=true hp_ms=0 envfix=0 bridge=30 lock=0.3 kappa=0 join=false wininv=true",
             "⛔ 生产默认变了。必须同时改三处:①这条判据里的指纹              ②`src/lib/vocal/vocalRender.ts` 的 `RANGE_ALGO_VERSION`              ③`src-tauri/src/commands/audition.rs` 的 `_sNNNx_` cache tag ——              漏掉后两个不是错误,是用户听到一条陈缓存(S150)。"
         );
-        const TAG: &str = "s159e";
+        const TAG: &str = "s159f";
         let ts = include_str!("../../../src/lib/vocal/vocalRender.ts");
         assert!(
             ts.contains(&format!("RANGE_ALGO_VERSION = \"{TAG}\"")),
@@ -5301,6 +5370,7 @@ mod tests {
         const PAIRS: &[(&str, &str)] = &[
             ("LANDING_DEFAULT", "fn parse_landing("),
             ("TRIM_DEFAULT", "fn parse_trim("),
+            ("TRIM_MIN_COST_DEFAULT", "const TRIM_MIN_COST_DEFAULT"),
             ("JOIN_RESTS_DEFAULT", "pub fn join_rests_enabled("),
             ("FRAC_TRANSPORT_DEFAULT", "pub fn frac_transport("),
             ("PHASE_LOCK_DEFAULT", "pub fn phase_lock("),
