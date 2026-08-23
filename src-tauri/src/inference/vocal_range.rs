@@ -3038,6 +3038,29 @@ const FRAC_TRANSPORT_DEFAULT: bool = true;
 /// S148 — `UTAI_PSOLA_WSOLA=<frac>` turns on the source-side waveform-similarity search in
 /// `utai_dsp::psola`. **Default 0.0 = off = byte-for-byte the pre-S148 arm.**
 ///
+/// # ⛔⛔ S159zze —— **这个旋钮在它自己 doc 写明的工作点上把移调整个抵消掉。别再开它。**
+///
+/// 实测(鹅妈妈 +7 × 东雪莲的 −14 donor 喂 `inverse_probe`,逐音自相关测 f0,
+/// 相对目标音高的中位误差 / 偏离 >50 cents 的音占比):
+///
+/// | radius | f0 误差 | >50 c |
+/// |---|---|---|
+/// | 0(出厂) | **−9.8 c** | 13 % |
+/// | 0.06 | −13.7 c | 34 % |
+/// | **0.15**(下面那段推荐的工作点) | **−1228 c** | **89 %** |
+/// | 0.30 | −1294 c | 100 % |
+/// | 0.50 | −1410 c | 100 % |
+///
+/// **−1228…−1410 cents ≈ −13…−14 个半音 = 正好把 ratio 2.24 抵消回去。**
+/// 机理是构造性的:`wsola_pick` 找「与累加器最像」的源读点,而**最像的就是源自己的下一个周期**
+/// ⇒ 半径一旦够得着一个周期,搜索就把 PSOLA 退化成**恒等变换**。
+///
+/// ⭐⭐ 下面那段 S148 的取舍表(陷波率 4.80 → 0.38 %,ΔHNR −0.15 → −4.70)**作废** ——
+/// 那两把尺子**都看不见音高**,于是一个「静默关掉移调」的旋钮被登记成了「一笔单调取舍」。
+/// 这正是 `scripts/range_rulers/README.md` 开篇那次四个月事故的**镜像**:
+/// 那次是闸**只**量音高,这次是闸**唯独不**量音高。
+/// ⇒ 凡在这条线上评一把刀,**先过音高闸**(`inverse_probe` 现在无条件打印它)。
+///
 /// Why it exists: measured at +7 st on the akiko donor (production caliber), **4.80 % of voiced
 /// frames come out more than 4 dB below the input**, against praat's **0.80 %** on the same input
 /// at the same ratio. The window sum is intact where those notches are (`cola_gap` 0.0 %,
@@ -6777,6 +6800,56 @@ mod tests {
         }
     }
 
+    /// ⛔⛔ S159zze —— **音高闸:这一遍到底有没有真的把音高移过去。**
+    ///
+    /// 用喂进去的 f0 轨当真值:每个浊音帧上,把输出在**目标周期** `sr/(f0·ratio)` 与
+    /// **输入周期** `sr/f0` 两处的归一化自相关比一比。移调成功 ⇒ 目标那边赢。
+    ///
+    /// 它存在的理由是一次真实事故:`UTAI_PSOLA_WSOLA=0.15`(它自己 doc 推荐的工作点)
+    /// 把移调**整个抵消**掉了 —— 输出逐音低了 **−1228 cents ≈ −13 个半音**,
+    /// 而当年守它的两把尺子(陷波率、ΔHNR)**都看不见音高**,于是那个旋钮被登记成
+    /// 「一笔单调取舍」。⇒ 这条**无条件打印**,而且打的是**两边的相关**而不是一个标量,
+    /// 因为「量不出来」和「移调没发生」必须分得开(S129 铁律)。
+    fn probe_pitch_gate(y: &[f32], f0: &[f32], hop: usize, sr: u32, semis: f64) -> (f64, usize) {
+        let ratio = 2f64.powf(semis / 12.0);
+        let ac = |c: usize, lag: usize, w: usize| -> f64 {
+            if lag == 0 || c + w + lag >= y.len() {
+                return f64::NAN;
+            }
+            let (mut num, mut ea, mut eb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..w {
+                let a = f64::from(y[c + i]);
+                let b = f64::from(y[c + i + lag]);
+                num += a * b;
+                ea += a * a;
+                eb += b * b;
+            }
+            if ea <= 0.0 || eb <= 0.0 { f64::NAN } else { num / (ea * eb).sqrt() }
+        };
+        let (mut win, mut seen) = (0usize, 0usize);
+        for (i, &f) in f0.iter().enumerate() {
+            if f <= 20.0 {
+                continue;
+            }
+            let c = i * hop;
+            let want = (f64::from(sr) / (f64::from(f) * ratio)).round() as usize;
+            let orig = (f64::from(sr) / f64::from(f)).round() as usize;
+            if want == orig {
+                continue;
+            }
+            let w = (orig * 3).min(4096);
+            let (a, b) = (ac(c, want, w), ac(c, orig, w));
+            if !a.is_finite() || !b.is_finite() {
+                continue;
+            }
+            seen += 1;
+            if a > b {
+                win += 1;
+            }
+        }
+        (if seen == 0 { f64::NAN } else { win as f64 / seen as f64 }, seen)
+    }
+
     fn inverse_probe_tone(sr: u32, secs: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;
         (0..n)
@@ -7842,6 +7915,7 @@ mod tests {
     /// ```
     #[test]
     #[ignore = "probe: needs a wav + f0 track on disk (set UTAI_INV_*)"]
+
     fn inverse_probe() {
         // S159zzb —— 引擎的诊断(`cola_w_*` / `edge_step_*` / `src_uncovered_frac`)是 tracing::info,
         // 而这个探针以前不装 subscriber ⇒ **每一遍都把它们扔了**。量 OLA 窗和抖不抖要靠它们。
@@ -7904,7 +7978,20 @@ mod tests {
             w.write_sample((((v * g).clamp(-1.0, 1.0)) * 32767.0).round() as i16).unwrap();
         }
         w.finalize().unwrap();
-        println!("inverse_probe: {engine:?} {shift:+} st kappa {kappa} -> {out}");
+        let (frac, seen) = probe_pitch_gate(&y, &f0, hop, spec.sample_rate, -(shift as f64));
+        println!(
+            "inverse_probe: {engine:?} {shift:+} st kappa {kappa} -> {out}\n\
+             inverse_probe PITCH GATE: 目标周期赢 {:.1}% / {seen} 帧 \
+             ({})",
+            frac * 100.0,
+            if !frac.is_finite() {
+                "⛔ 量不出来(没有可比的浊音帧)—— 这不是通过"
+            } else if frac >= 0.80 {
+                "✅ 移调发生了"
+            } else {
+                "⛔⛔ 移调【没有】发生 —— 这条臂的其余读数一律作废"
+            }
+        );
     }
 
     #[test]
