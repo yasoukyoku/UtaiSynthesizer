@@ -3287,63 +3287,6 @@ fn parse_xgrain(v: Option<&str>) -> f64 {
 /// ⚠ 而它的代价落在**所有**被救音上 —— 见 [`xgrain`] 的 doc 末尾那条登记。
 const XGRAIN_DEFAULT: f64 = 1.0;
 
-/// ⚙ 出厂默认 = 0 = 关 —— `UTAI_PSOLA_SPREAD=<q>`:把一个源周期的 `ratio` 次复用
-/// **摊到相邻 `q` 个源周期上**。机理、实测的 ZOH 指纹、以及为什么 `xgrain` 修不了它,
-/// 全在 `utai_dsp::psola::spread_offset` 的 doc 里(**别在这里再写一份**)。
-///
-/// ⛔ 翻它要成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`,而且**必须先过盲测**:
-/// 它的已知代价(逐周期抖动)只有耳朵能裁。
-pub fn spread_grains() -> usize {
-    parse_spread(std::env::var("UTAI_PSOLA_SPREAD").ok().as_deref())
-}
-
-/// ⚙ 出厂默认 = 0.0 = 关 —— `UTAI_PSOLA_SPREADMIX=<w>`:摊开的**强度**(抽头交叉淡化权重)。
-///
-/// ⭐ 靶子不是「调制最小」,是「**谐波梳回到原生**」—— 那是设计原则那句「让 donor→逆变换
-/// 尽量是只改音高的恒等变换」的字面执行,而且它**自校准**:出厂 PSOLA 的梳比原生**深 5.58 dB**
-/// (它把噪声抹掉了),`w = 1` 则浅 7.45 dB(填过头了),中间必有一个零点。
-///
-/// 实测(`envmod`,同一份 donor 喂 `inverse_probe` ⇒ 零渲染噪声;`spread = 4`):
-///
-/// | w | 深 −14 调制 Δ | 变脏% | 梳 vs 原生 | 浅 −6 调制 Δ | 变脏% | 梳 vs 原生 |
-/// |---|---|---|---|---|---|---|
-/// | 0.00 | +0.00 | 0% | +5.58 | +0.00 | 0% | +5.19 |
-/// | 0.25 | −0.45 | 3% | +3.41 | −0.40 | 9% | +3.17 |
-/// | **0.44** | **−0.96** | **3%** | **−0.23** | **−0.60** | **10%** | **+0.46** |
-/// | 0.60 | −1.36 | 2% | −2.70 | −0.74 | 12% | −1.34 |
-/// | 1.00 | −2.16 | 3% | −7.45 | −0.51 | 25% | −5.47 |
-///
-/// ⇒ **w ≈ 0.44 在两个深度上都把梳压回原生**,而且是这条线上第一把「收益大、而且几乎不
-/// 拆东墙补西墙」的刀:此前最好的 `win0` 是 −0.57 dB / **41% 的音变差**,`wsola 0.15` 是
-/// −0.89 / **28%**;这一刀 −0.96 / **3%**。
-///
-/// ⛔ 但它**只买回膝盖代价的 ~20%**(−14 那档总成本 +4.87 dB),别当成解决了。
-/// ⛔⛔ **没有耳判背书**,而且已知代价是逐周期抖动 ⇒ 翻默认之前必须过盲测
-/// (`scripts/range_rulers/README.md` 第 8 条),并成对 bump `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`。
-pub fn spread_mix() -> f64 {
-    parse_spread_mix(std::env::var("UTAI_PSOLA_SPREADMIX").ok().as_deref())
-}
-
-/// The env parse, as a pure function so it can be asserted without touching process state.
-fn parse_spread_mix(v: Option<&str>) -> f64 {
-    v.and_then(|v| v.trim().parse().ok())
-        .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
-        .unwrap_or(SPREAD_MIX_DEFAULT)
-}
-
-/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
-const SPREAD_MIX_DEFAULT: f64 = 0.0;
-
-/// The env parse, as a pure function so it can be asserted without touching process state.
-fn parse_spread(v: Option<&str>) -> usize {
-    v.and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| (0..=8).contains(v))
-        .map_or(SPREAD_DEFAULT, |v| v as usize)
-}
-
-/// ⛔ Changing this changes the audio ⇒ pair-bump `RANGE_ALGO_VERSION` and `audition_cache_tag`.
-const SPREAD_DEFAULT: usize = 0;
-
 /// ⚙ 出厂默认 = 0 —— LP-PSOLA = 关(S157b 判负,旋钮留着)
 /// S157b —— `UTAI_PSOLA_LPC=<order>`:**LP-PSOLA** —— 颗粒搬运挪进**残差域**。
 /// `0` = 关 = 今天,逐位不变。
@@ -3823,8 +3766,6 @@ pub fn apply_inverse_windowed_with(
                 lpc,
                 keep,
                 fill,
-                spread_grains(),
-                spread_mix(),
             );
             // ⛔⛔ S159 —— 判据是 `islands_seen`(窗过滤**之前**的候选岛数),不是 `islands`。
             // 加了窗之后 `islands == 0` 多了一个**正常**的来源:这一遍的窗全落在休止里。
@@ -6222,8 +6163,6 @@ mod tests {
             ("ENV_RESTORE_MS_DEFAULT", "pub fn env_restore_ms("),
             ("BRIDGE_UNVOICED_MS_DEFAULT", "pub fn bridge_unvoiced_ms("),
             ("WINDOWED_INVERSE_DEFAULT", "pub fn windowed_inverse("),
-            ("SPREAD_DEFAULT", "pub fn spread_grains("),
-            ("SPREAD_MIX_DEFAULT", "pub fn spread_mix("),
         ];
         let src = include_str!("vocal_range.rs");
         let lines: Vec<&str> = src.lines().collect();
@@ -6284,21 +6223,6 @@ mod tests {
                  ⇒ 翻默认时那段 doc 没跟着改。三个已经翻过的默认都在这一处漏过(见本判据的 doc)。"
             );
         }
-    }
-
-    /// ⭐⭐ S159zzc —— 摊开那两个旋钮的**出厂值与解析**。读数表在 [`spread_mix`] 的 doc。
-    #[test]
-    fn the_spread_knobs_are_off_by_default_and_parse() {
-        assert_eq!(SPREAD_DEFAULT, 0, "出厂必须是关的");
-        assert_eq!(SPREAD_MIX_DEFAULT, 0.0, "出厂必须是关的");
-        assert_eq!(parse_spread(None), 0);
-        assert_eq!(parse_spread(Some("4")), 4);
-        assert_eq!(parse_spread(Some("9")), 0, "越界退回出厂,不许静默夹住");
-        assert_eq!(parse_spread(Some("垃圾")), 0);
-        assert_eq!(parse_spread_mix(None), 0.0);
-        assert!((parse_spread_mix(Some("0.44")) - 0.44).abs() < 1e-12);
-        assert_eq!(parse_spread_mix(Some("1.5")), 0.0, "越界退回出厂");
-        assert_eq!(parse_spread_mix(Some("nan")), 0.0, "NaN 不许通过");
     }
 
     #[test]
@@ -6774,7 +6698,7 @@ mod tests {
     /// ⇒ 表在 `utai_dsp::psola::PROBE_ARM_DEFAULTS`,这一条让「改了默认却没改表」变成红。
     #[test]
     fn the_probe_defaults_are_the_production_defaults() {
-        let want: [(&str, f64); 12] = [
+        let want: [(&str, f64); 10] = [
             ("UTAI_PSOLA_FRAC", f64::from(u8::from(parse_frac_transport(None)))),
             ("UTAI_PSOLA_WSOLA", parse_wsola_frac(None)),
             ("UTAI_PSOLA_LOCK", parse_phase_lock(None)),
@@ -6785,8 +6709,6 @@ mod tests {
             ("UTAI_PSOLA_WIN", parse_win_periods(None)),
             ("UTAI_PSOLA_XGRAIN", parse_xgrain(None)),
             ("UTAI_PSOLA_LPC", parse_lpc_order(None) as f64),
-            ("UTAI_PSOLA_SPREAD", parse_spread(None) as f64),
-            ("UTAI_PSOLA_SPREADMIX", parse_spread_mix(None)),
         ];
         let table = utai_dsp::psola::PROBE_ARM_DEFAULTS;
         assert_eq!(
