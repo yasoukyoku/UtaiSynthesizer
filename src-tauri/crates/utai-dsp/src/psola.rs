@@ -1173,7 +1173,67 @@ fn infrasonic_width_ms(src_periods: &[f64], sample_rate: u32, ratio: f64) -> f64
 /// that test goes red. (Same shape as `RANGE_ALGO_VERSION` ↔ `audition_cache_tag`.)
 ///
 /// Booleans are 0.0 / 1.0; the rest are the knob's own unit (ms, periods, fraction).
-pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
+/// S159zzc —— **把一个源周期的 `ratio` 次复用摊到【相邻的几个】源周期上。**`0`/`1` = 关 = 今天,逐位不变。
+///
+/// ## 机理(S159zzb 排掉五个候选之后剩下的那一个;证据链在下面,别重推)
+///
+/// `k = round(j/ratio)` 让**同一个源周期被连续复用 ~`ratio` 次**。谐波那一半无所谓
+/// (它本来就该是周期的),但浊音在 **2-4 kHz** 上主要是**气声噪声** —— 它被这样一复用,
+/// 就等于对噪声的幅度起伏做了一次**零阶保持**,保持率 = `F_src = F_out / ratio`。
+/// ZOH 的响应是 sinc,**第一个零点正好落在 `F_src`**,于是全部四条指纹一次对齐:
+///
+/// * 起伏能量在 `F_src/2` 以上被压掉、总功率守恒 ⇒ **挤进 20-200 Hz 的占比上升**;
+/// * 噪声被「谐波化」⇒ **谐波梳更深**;只在噪声主导的**高频**;**稳态**不是瞬态;
+/// * 随 `ratio` **单调**;**没有拍频**(ZOH 不产生拍频)。
+///
+/// 实测(`scripts/range_rulers/envmod.py`,52 音、**同一个输出音高**、零音高混杂;
+/// 过量调制谱 = 10·log10(救完/原生),按调制频率分档,dB):
+///
+/// | 深度 | F_src/2 | 16 Hz | 32 | 64 | 128 | **256** | 512 |
+/// |---|---|---|---|---|---|---|---|
+/// | −2 | 311 | +0.6 | −0.0 | −1.1 | +1.5 | **−2.4** | −1.2 |
+/// | −6 | 247 | +0.4 | +0.5 | −0.6 | −0.4 | **−4.1** | −4.3 |
+/// | −10 | 196 | +0.6 | +1.2 | +1.2 | +3.7 | **−6.5** | −0.8 |
+/// | −12 | 175 | +2.7 | +3.7 | +4.2 | +5.8 | **−5.7** | +1.5 |
+/// | −14 | 156 | +2.7 | +3.8 | +5.3 | +5.3 | **−8.2** | −0.7 |
+///
+/// ⇒ 能量从 200 Hz 以上被搬到 128 Hz 以下,搬的量随 `ratio` 涨 —— 这就是 ZOH 的指纹。
+/// 同一批音的谐波梳深度:**原生 +26.0 → 救完 +30.9…+34.4**(更深 3.8-7.6 dB)。
+///
+/// ## ⛔ 为什么 `xgrain` 修不了它(别再想着调它)
+///
+/// `xgrain` 在相邻两个源脉冲之间**线性插值** ⇒ 把 ZOH 换成一阶保持(sinc²)⇒ 高调制率被压得
+/// **更狠**,不是更松;实测 `xgrain=0` 反而好 0.13 dB。**插值造不出不存在的信息**:
+/// 源里每秒只有 `F_src` 个周期,输出要 `F_out` 个,缺的那段起伏是**结构性缺失**。
+///
+/// ## 这一刀做什么
+///
+/// 噪声是噪声 —— 用**相邻**周期的噪声在统计上等价;而**每个源标记都钉在脉冲上**,所以
+/// 任何一个源颗粒放到任何一个输出标记上,**脉冲都落得准**。⇒ 让那 `ratio` 次复用各取一个
+/// **不同的**相邻源周期:脉冲照样对齐,噪声却**每个输出周期都换一次** ⇒ ZOH 消失。
+///
+/// `spread = q` ⇒ 第 `i` 颗输出颗粒的读点整体挪 `d = (i % q) − (q−1)/2` 个源周期,
+/// 一个周期内取遍 **q 个相邻的源周期**(越界按**岛内**标记夹住)。
+///
+/// ⚠ **偶数 `q` 上它不对称**:`q = 4` 给 `−1, 0, 1, 2`,一周期的和是 **+2**,即平均超前
+/// **半个源周期**。那是一个**常数超前**,不是漂移(读点始终落在标记上,而且不累积)——
+/// 但别把 doc 写成「对称」:写这条 doc 时我就写错了,是判据当场抓出来的。
+/// ⛔ **不许为了对称去改这个公式**:S159zzc 的整张读数表都是在这个公式上量的。
+///
+/// ⛔ **只挪读【点】,不碰几何**:`src_l` / `src_r` / `wmax` / `lw` / `rw` 全部仍按原来的 `k` 算
+/// ⇒ 窗宽与跳粒规则一个字节不动,爆炸半径只有「颗粒内容取自哪一段源波形」。
+///
+/// ⚠ 已知代价(登记在案):相邻源周期之间本来就有轻微幅度/音色差,摊开之后它变成**逐周期抖动**
+/// —— 那正是真人声的 jitter/shimmer,但也可能被听成粗糙。
+/// **这一刀没有耳判背书**,翻默认之前必须过盲测(`scripts/range_rulers/README.md` 第 8 条)。
+fn spread_offset(i: usize, q: usize) -> i64 {
+    if q < 2 {
+        return 0;
+    }
+    (i % q) as i64 - ((q - 1) / 2) as i64
+}
+
+pub const PROBE_ARM_DEFAULTS: [(&str, f64); 12] = [
     // S157c —— 翻成默认开:整曲实测被救高音的谐波间噪声 −7.0 dB(1000-2100 Hz,地板 0.13)。
     ("UTAI_PSOLA_FRAC", 1.0),
     ("UTAI_PSOLA_WSOLA", 0.0),
@@ -1186,6 +1246,10 @@ pub const PROBE_ARM_DEFAULTS: [(&str, f64); 10] = [
     ("UTAI_PSOLA_XGRAIN", 1.0),
     // S157b —— LP-PSOLA 的阶数。⚠ 它是 f64 只因为这张表是 f64;读的时候取整。
     ("UTAI_PSOLA_LPC", 0.0),
+    // S159zzc —— 复用摊开的宽度(源周期数)。0/1 = 关。
+    ("UTAI_PSOLA_SPREAD", 0.0),
+    // S159zzc —— 摊开的强度(抽头交叉淡化权重)。0 = 关。
+    ("UTAI_PSOLA_SPREADMIX", 0.0),
 ];
 
 // ── S157b —— LP-PSOLA:把颗粒搬运挪进【残差域】 ───────────────────────────────
@@ -2170,7 +2234,7 @@ pub fn psola_shift_win(
     psola_shift_edge(
         x, sample_rate, semitones, formant_semitones, f0_hz, f0_hop, frac_transport, wsola_frac,
         phase_lock, infrasonic, env_restore_ms, bridge_unvoiced_ms, win_periods, xgrain, lpc_order,
-        keep, false,
+        keep, false, 0, 0.0,
     )
 }
 
@@ -2225,6 +2289,10 @@ pub fn psola_shift_edge(
     lpc_order: usize,
     keep: &[(usize, usize)],
     edge_fill: bool,
+    // S159zzc —— 复用摊开的宽度(源周期数)与**强度**。`spread_mix == 0` = 关 = 逐位不变。
+    // 见 [`spread_offset`]:强度是抽头交叉淡化的权重,靶子是「谐波梳回到原生」。
+    spread: usize,
+    spread_mix: f64,
 ) -> (Vec<f32>, PsolaDiagnostics) {
     let n = x.len();
     let mut diag = PsolaDiagnostics::default();
@@ -2534,6 +2602,14 @@ pub fn psola_shift_edge(
             } else {
                 (s_pos, 1.0, 0.0, 0.0)
             };
+            // S159zzc —— 每个抽头是从**哪个源标记**读的(摊开要按源周期整格挪,见 [`spread_offset`])。
+            // ⚠ xgrain 关着时也必须摊,否则这一刀会**静默地只在 xgrain 开着时生效** ——
+            //   那正是「干预没生效被读成干预无效」的形状(S148 `frac_transport` 写死成 false 那族)。
+            let (i0, i1) = if xgrain > 0.0 {
+                ((us[i] as usize).min(src.len() - 1), ((us[i] as usize) + 1).min(src.len() - 1))
+            } else {
+                (k, k)
+            };
             // S151 —— **源覆盖率**:这一颗粒从源上读的是 `[s_pos − lw, s_pos + rw)`。上移时
             // `lw = rw = T_src / ratio`(上面那两个 `min` 取的是目标邻距),所以一旦
             // `ratio > 2`(= |位移| > 12 半音),相邻两个读窗之间就留下一段**永远不进任何颗粒**
@@ -2570,7 +2646,25 @@ pub fn psola_shift_edge(
             // ⚠ xgrain 开着时这里会放**两颗**颗粒 ⇒ `transport_residual` 每个合成标记记两笔
             //   (两次读点各有各的亚样本残差)。那是如实记账,不是缺陷 —— 但引用那个读数时
             //   要知道 xgrain 那条臂的样本数是别的臂的两倍。`xgrain == 0` 时逐位不变。
-            for (pp, gg) in [(p0, g0), (p1, g1)] {
+            // S159zzc —— 摊开 = 在原抽头旁边再挂一份**整格挪过的**同权重抽头,两者交叉淡化。
+            // ⛔ `spread_mix == 0` 时下面这张表逐字等于今天的 `[(p0, g0), (p1, g1)]`
+            //    (后两项权重 0,循环第一行就 `continue`)⇒ **逐位不变,不依赖任何浮点等价**。
+            let sm = if spread >= 2 { spread_mix.clamp(0.0, 1.0) } else { 0.0 };
+            let shifted = |idx: usize, pp: f64| -> f64 {
+                let j = (idx as i64 + spread_offset(i, spread)).clamp(0, src.len() as i64 - 1);
+                pp + (src[j as usize] - src[idx])
+            };
+            let taps = if sm > 0.0 {
+                [
+                    (p0, g0 * (1.0 - sm)),
+                    (p1, g1 * (1.0 - sm)),
+                    (shifted(i0, p0), g0 * sm),
+                    (shifted(i1, p1), g1 * sm),
+                ]
+            } else {
+                [(p0, g0), (p1, g1), (0.0, 0.0), (0.0, 0.0)]
+            };
+            for (pp, gg) in taps {
                 if gg <= 0.0 {
                     continue;
                 }
@@ -3435,7 +3529,7 @@ mod tests {
         let run = |st: f64, win: f64, fill: bool| {
             psola_shift_edge(
                 &x, sr, st, 0.0, &f0t, hop, false, 0.0, 0.0, Infrasonic::Off, 0.0, 0.0, win, 0.0, 0,
-                &[], fill,
+                &[], fill, 0, 0.0,
             )
         };
 
@@ -3578,6 +3672,77 @@ mod tests {
     /// 夹具:`f0 = 44100/200 = 220.5 Hz` ⇒ 周期**恰好 200 个整样本** ⇒ `pulses` 的落点全是整数
     /// ⇒ 每个脉冲的采样波形逐位相同。⛔ 阳性对照用 220.0 Hz(周期 200.4545 样本,落点带小数)
     /// —— 那时 xgrain **必须**改变输出,否则这条判据只是「这个实现根本不看 xgrain」。
+    /// ⭐⭐⭐ S159zzc —— **摊开那一刀:关着逐位不变,开着真的换了源周期,而且【是个交叉淡化】。**
+    ///
+    /// 机理与实测表在 [`spread_offset`] 的 doc。这条判据钉五件,每件都对应一种会静默出错的地方:
+    /// ⑴ `spread_mix == 0` ⇒ 与今天**逐位相同**(抽头表退回两抽头,不依赖任何浮点等价);
+    /// ⑵ `spread < 2` ⇒ 也逐位相同(宽度不够就没得摊);
+    /// ⑶ 开着 ⇒ 输出**必须变**(⛔ 接线闸:env 拼错的臂会与出厂逐位相同,而那与「这一刀无效」同形);
+    /// ⑷ ⭐ `mix` 是**线性**的:`out(w) == (1−w)·out(0) + w·out(1)` —— 这条是承重的,
+    ///    因为 S159zzc 的整张读数表是**离线把两条臂按 w 混出来的**,而那张表只有在这条成立时才算数;
+    /// ⑸ `spread_offset` 对称 ⇒ 一个周期内的偏移**和为零**,不会有系统性漂移。
+    ///
+    /// ⛔ 变异(逐个真跑过):把 ⑴ 的抽头表改成 `[(p0, g0*(1.0-sm)), ...]` 无条件走 ⇒ ⑴ **红**
+    /// (`sm == 0` 时 `g*(1-0)` 与 `g` 在 IEEE 下相同,但第三、四抽头的 `shifted()` 仍被求值,
+    /// 而 `src` 越界夹取会在岛边改变读点 —— 这正是「逐位不变靠的是分支不是浮点」那条)。
+    #[test]
+    fn spreading_the_reuse_is_off_by_default_and_is_a_linear_crossfade() {
+        let sr = 44_100u32;
+        let hop = sr as usize / 100;
+        let n = (sr as f64 * 0.5) as usize;
+        // 一段有噪声的浊音:纯正弦上摊开是恒等的(相邻周期逐字相同),量不到这一刀。
+        let mut x = vec![0.0f32; n];
+        let mut seed = 12_345u64;
+        for (i, v) in x.iter_mut().enumerate() {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let noise = ((seed >> 33) as f64 / (1u64 << 31) as f64 - 1.0) * 0.05;
+            let t = i as f64 / f64::from(sr);
+            *v = (0.4 * (2.0 * std::f64::consts::PI * 220.0 * t).sin() + noise) as f32;
+        }
+        let f0 = vec![220.0f32; n / hop + 2];
+        let go = |spread: usize, mix: f64| {
+            psola_shift_edge(
+                &x, sr, 12.0, 0.0, &f0, hop, true, 0.0, 0.30, Infrasonic::Off, 0.0, 30.0, 1.0, 1.0,
+                0, &[], false, spread, mix,
+            )
+            .0
+        };
+        let today = go(0, 0.0);
+        assert_eq!(go(4, 0.0), today, "⑴ mix = 0 必须逐位不变");
+        assert_eq!(go(1, 1.0), today, "⑵ spread < 2 必须逐位不变");
+        let full = go(4, 1.0);
+        assert_ne!(full, today, "⑶ 接线闸:开着却与出厂逐位相同 —— 参数没送到引擎");
+
+        // ⑷ 线性。⚠ 容差按**信号幅度**给,不是绝对值:这是 f32 累加的舍入,不是别的。
+        let half = go(4, 0.5);
+        let peak = today.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+        let worst = half
+            .iter()
+            .zip(today.iter().zip(full.iter()))
+            .map(|(h, (a, b))| (f64::from(*h) - 0.5 * (f64::from(*a) + f64::from(*b))).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst < 1e-5 * f64::from(peak),
+            "⑷ mix 不是线性的(最坏 {worst:.3e},峰 {peak:.3}) ——              S159zzc 那张按 w 离线混出来的读数表就不算数了"
+        );
+
+        // ⑸ 一个周期内的偏移和为零。
+        for q in 2..=8usize {
+            let mut d: Vec<i64> = (0..q).map(|i| spread_offset(i, q)).collect();
+            let lo = *d.iter().min().unwrap();
+            d.sort_unstable();
+            d.dedup();
+            assert_eq!(d.len(), q, "q = {q} 没有取遍 q 个不同的源周期");
+            assert_eq!(
+                d,
+                (lo..lo + q as i64).collect::<Vec<_>>(),
+                "q = {q} 取的不是一段【相邻】的源周期"
+            );
+            assert!(lo <= 0 && lo + q as i64 - 1 > 0, "q = {q} 的偏移必须跨过 0");
+        }
+        assert_eq!(spread_offset(3, 1), 0, "q < 2 必须恒为 0");
+    }
+
     #[test]
     fn the_grain_interpolation_is_exactly_a_no_op_when_the_neighbouring_pulses_are_identical() {
         let sr = 44_100;
